@@ -38,6 +38,21 @@ class Optimizer(BaseOptimizer):
     """
     swap_optimizer_times: int = 16
 
+    """
+    Whether to apply virtual optimizer.
+    This feature will offload the optimizer states to the host (CPU) during the forward and backward passes.
+    More info (in Chinese): https://gitcode.com/Ascend/MindSpeed/blob/master/docs/zh/features/virtual-optimizer.md
+    """
+    virtual_optimizer: bool = False
+
+    """
+    virtual_optimizer_size configures the swap memory size for optimizer momentum in each pipeline
+    parallelism (PP) stage.
+    It accepts all, a single numeric value, or a list of values to enable full momentum swapping,
+    uniform swap allocation across all stages, and stage-specific differentiated swap allocation respectively.
+    """
+    virtual_optimizer_size: float | list[float] | str | None = None
+
     # Muon-specific parameters (used when name is "Muon")
     """
     Learning rate for Muon optimizer. If None, falls back to lr.

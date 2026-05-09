@@ -20,6 +20,8 @@ def _apply_patches():
     # patching optimizer before importing torchtitan.models
     from .patches.optimizer import swap_optimizer  # noqa: F401 # usort:skip
 
+    from .patches.optimizer import virtual_optimizer  # noqa: F401 # usort:skip
+
     import torchtitan.models as titan_models
 
     # patching torchtitan
