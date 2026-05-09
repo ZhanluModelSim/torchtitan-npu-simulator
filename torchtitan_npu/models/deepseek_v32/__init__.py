@@ -59,12 +59,12 @@ deepseekv32_args = {
     ),
     "tinymodel": DeepSeekV32ModelArgs(
         vocab_size=129280,
-        dim=256,
+        dim=128,
         inter_dim=512,
         moe_inter_dim=256,
         n_layers=1,
         n_dense_layers=1,
-        n_heads=4,
+        n_heads=64,
         moe_args=MoEArgs(
             num_experts=4,
             num_shared_experts=1,
