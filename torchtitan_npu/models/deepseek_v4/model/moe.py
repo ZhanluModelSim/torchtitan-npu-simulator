@@ -42,6 +42,29 @@ def _softplus_stable(x: torch.Tensor) -> torch.Tensor:
     return torch.log1p(torch.exp(-x.abs())) + torch.relu(x)
 
 
+def _build_hash_routing_table(
+    vocab_size: int,
+    num_experts: int,
+    top_k: int,
+    *,
+    device: torch.device | str | None = None,
+    chunk_size: int = 8192,
+) -> torch.Tensor:
+    """Build ``tid2eid`` with top_k distinct expert ids for each token id."""
+    if top_k > num_experts:
+        raise ValueError(f"top_k ({top_k}) must be <= num_experts ({num_experts})")
+
+    tid2eid = torch.empty((vocab_size, top_k), dtype=torch.long, device=device)
+    for start in range(0, vocab_size, chunk_size):
+        end = min(start + chunk_size, vocab_size)
+        tid2eid[start:end] = (
+            torch.rand((end - start, num_experts), device=device)
+            .topk(top_k, dim=-1)
+            .indices
+        )
+    return tid2eid
+
+
 class TokenChoiceTopKRouter(TokenChoiceTopKRouter):
     def __init__(
         self,
@@ -79,15 +102,11 @@ class TokenChoiceTopKRouter(TokenChoiceTopKRouter):
         self.hash = layer_id < args.n_hash_layers
         self.vocab_size = vocab_size
         if self.hash:
-            tid2eid = nn.Parameter(
-                torch.stack(
-                    [torch.randperm(self.top_k) for _ in range(self.vocab_size)]
-                ),
-                requires_grad=False,
-            )
             self.register_buffer(
                 "tid2eid",
-                tid2eid,
+                _build_hash_routing_table(
+                    self.vocab_size, self.num_experts, self.top_k
+                ),
                 persistent=True,
             )
 
@@ -157,11 +176,13 @@ class TokenChoiceTopKRouter(TokenChoiceTopKRouter):
 
     def init_weights(self, init_std: float):
         nn.init.trunc_normal_(self.gate.weight, mean=0.0, std=init_std)
-        with torch.device(self.gate.weight.device):
-            if self.hash:
-                self.tid2eid = torch.stack(
-                    [torch.randperm(self.top_k) for _ in range(self.vocab_size)]
-                )
+        if self.hash:
+            self.tid2eid = _build_hash_routing_table(
+                self.vocab_size,
+                self.num_experts,
+                self.top_k,
+                device=self.gate.weight.device,
+            )
 
 
 class MoE(MoE):
