@@ -1,6 +1,6 @@
-# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
-# This file is derived from MindSpeed,
+# Adapted from
 # https://gitcode.com/Ascend/MindSpeed/blob/master/mindspeed/core/optimizer/swap_optimizer/swap_optimizer.py
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,37 +15,33 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import functools
 import logging
-from typing import Any, TypeVar
+from dataclasses import dataclass, fields, replace
+from typing import ClassVar, TypeVar
 
 import torch
 import torch.nn as nn
-import torchtitan
-import torchtitan.components.optimizer
+import torchtitan.components.optimizer as tt_optimizer
 from torch.distributed.tensor import DTensor
 from torch.optim import Optimizer
 from torch.optim.optimizer import _use_grad_for_differentiable
 from torchtitan.components.optimizer import OptimizersContainer
 from torchtitan.tools.utils import get_device_info
 
-from torchtitan_npu.patches.optimizer.muon_optimizer import build_muon_hybrid_optimizers
-
 
 logger = logging.getLogger(__name__)
 
 
 T = TypeVar("T", bound=Optimizer)
-_original_build_optimizers = torchtitan.components.optimizer.build_optimizers
+
+_original_build_optimizers = getattr(tt_optimizer, "build_optimizers", None)
 
 
 def get_torch_device():
-    # get torch.device
     return get_device_info()[1]
 
 
 def unwrap_dtensor(tensor):
-    """get normal tensor"""
     if isinstance(tensor, DTensor):
         return tensor.to_local()
     return tensor
@@ -72,18 +68,57 @@ class SwapOptimizersContainer(OptimizersContainer):
 
     state_keys = ["exp_avg", "exp_avg_sq", "max_exp_avg_sq"]
 
+    @dataclass(kw_only=True, slots=True)
+    class Config(OptimizersContainer.Config):
+        _owner: ClassVar[type | None] = None
+        swap_optimizer: bool = False
+        swap_optimizer_times: int = 16
+
+        def build(self, **kwargs):
+            if self._owner is None:
+                raise NotImplementedError(
+                    f"{type(self).__name__} has no owner class. "
+                    "Define Config inside a Configurable subclass."
+                )
+            if not kwargs:
+                return self._owner(config=replace(self))
+            config_fields = {f.name for f in fields(self)}
+            overlap = config_fields & kwargs.keys()
+            if overlap:
+                raise ValueError(
+                    f"build() kwargs {overlap} overlap with config fields. "
+                    "Put these values in the Config, not in build() kwargs."
+                )
+            return self._owner(config=replace(self), **kwargs)
+
     def __init__(
         self,
+        config: Config,
+        *,
         model_parts: list[nn.Module],
-        optimizer_cls: type[T],
-        optimizer_kwargs: dict[str, Any],
-        swap_optimizer_times: int,
     ) -> None:
-        super().__init__(model_parts, optimizer_cls, optimizer_kwargs)
+        optimizer_cls = self._resolve_optimizer_cls(config.name)
+        optimizer_kwargs = self._build_optimizer_kwargs(config)
+        all_params = []
+        self.optimizers = []
+        self.model_parts = model_parts
+        for model in self.model_parts:
+            params = [p for p in model.parameters() if p.requires_grad]
+            self.optimizers.append(optimizer_cls(params, **optimizer_kwargs))
+            all_params.extend(params)
+        self._validate_length(len(self.model_parts))
+        self._post_init(all_params, optimizer_kwargs)
+
+        # patch optimizer step functions for swap optimizer
+        torch.optim.AdamW.step = swap_optimizer_step
+        torch.optim.Adam.step = swap_optimizer_step
+        logger.info("[SwapOptimizer] Patched AdamW.step and Adam.step")
 
         # create streams for swapping
         if SwapOptimizersContainer.swap_to_device_stream is None:
+            # pyrefly: ignore [missing-attribute]
             SwapOptimizersContainer.swap_to_device_stream = get_torch_device().Stream()
+            # pyrefly: ignore [missing-attribute]
             SwapOptimizersContainer.swap_to_host_stream = get_torch_device().Stream()
 
         # initialize states and cpu counterparts for each device param
@@ -99,7 +134,7 @@ class SwapOptimizersContainer(OptimizersContainer):
                     for group in optim.param_groups
                 ]
             )
-            optim.swap_numel = swap_num // swap_optimizer_times
+            optim.swap_numel = swap_num // config.swap_optimizer_times
             logger.info(
                 f"Swap param numel for optimizer_{idx}: {optim.swap_numel} / {swap_num}\n"
             )
@@ -150,7 +185,10 @@ class SwapOptimizersContainer(OptimizersContainer):
                 local_state.copy_(cpu_state[key], non_blocking=True)
 
         cls.swap_to_device_events_map[param] = (
-            get_torch_device().current_stream().record_event()
+            # pyrefly: ignore [missing-attribute]
+            get_torch_device()
+            .current_stream()
+            .record_event()
         )
 
     @classmethod
@@ -169,13 +207,17 @@ class SwapOptimizersContainer(OptimizersContainer):
                 local_state.untyped_storage().resize_(0)
 
         cls.swap_to_host_events_map[param] = (
-            get_torch_device().current_stream().record_event()
+            # pyrefly: ignore [missing-attribute]
+            get_torch_device()
+            .current_stream()
+            .record_event()
         )
 
     @classmethod
     def wait_swap_to_device_event(cls, param):
         event = cls.swap_to_device_events_map.get(param, None)
         if event is not None:
+            # pyrefly: ignore [missing-attribute]
             get_torch_device().current_stream().wait_event(event)
             cls.swap_to_device_events_map[param] = None
 
@@ -183,6 +225,7 @@ class SwapOptimizersContainer(OptimizersContainer):
     def wait_param_update_event(cls, param):
         event = cls.param_update_events_map.get(param, None)
         if event is not None:
+            # pyrefly: ignore [missing-attribute]
             get_torch_device().current_stream().wait_event(event)
             cls.param_update_events_map[param] = None
 
@@ -213,11 +256,14 @@ def param_update(param, state, param_group):
 
 def pipeline_load_param(swap_numel, params_list, start_index, current_swap_count):
     torch_device = get_torch_device()
+    # pyrefly: ignore [missing-attribute]
     torch_device.current_stream().wait_stream(
         SwapOptimizersContainer.swap_to_host_stream
     )
 
+    # pyrefly: ignore [missing-attribute]
     with torch_device.stream(SwapOptimizersContainer.swap_to_device_stream):
+        # pyrefly: ignore [missing-attribute]
         torch_device.current_stream().wait_stream(
             SwapOptimizersContainer.swap_to_host_stream
         )
@@ -261,6 +307,7 @@ def swap_optimizer_step(self, closure=None):
             group["step"] = torch.tensor(
                 1,
                 dtype=torch.int64,
+                # pyrefly: ignore [missing-attribute]
                 device=get_torch_device().current_device(),
             )
 
@@ -304,9 +351,13 @@ def swap_optimizer_step(self, closure=None):
         SwapOptimizersContainer.wait_swap_to_device_event(param)
         param_update(param, state, group)
         SwapOptimizersContainer.param_update_events_map[param] = (
-            get_torch_device().current_stream().record_event()
+            # pyrefly: ignore [missing-attribute]
+            get_torch_device()
+            .current_stream()
+            .record_event()
         )
         # offload
+        # pyrefly: ignore [missing-attribute]
         with get_torch_device().stream(SwapOptimizersContainer.swap_to_host_stream):
             SwapOptimizersContainer.wait_param_update_event(param)
             swap_count -= unwrap_dtensor(param).numel()
@@ -315,65 +366,31 @@ def swap_optimizer_step(self, closure=None):
     return loss
 
 
-@functools.wraps(_original_build_optimizers)
-def _build_optimizers_wrapper(
-    model_parts, optimizer_config, parallel_dims, ft_manager=None
-):
-    if getattr(optimizer_config, "name", None) == "Muon":
-        # Muon optimizer does not currently support multi-device.
-        is_distributed = torch.distributed.is_initialized()
-        world_size = torch.distributed.get_world_size() if is_distributed else 1
-        if world_size > 1:
-            raise NotImplementedError(
-                "Muon optimizer currently only support single device"
+_OWNER_ATTR = "_owner"
+setattr(SwapOptimizersContainer.Config, _OWNER_ATTR, SwapOptimizersContainer)
+
+
+def build_optimizers(model_parts, optimizer_config, parallel_dims, ft_manager=None):
+    if not getattr(optimizer_config, "swap_optimizer", False):
+        if _original_build_optimizers is not None:
+            return _original_build_optimizers(
+                model_parts, optimizer_config, parallel_dims, ft_manager
             )
-        # Muon optimizer does not currently support swap optimizer.
-        if getattr(optimizer_config, "swap_optimizer", False):
-            raise ValueError(
-                "Muon optimizer does not support swap_optimizer. "
-                "Please set swap_optimizer=false in your config."
-            )
-        return build_muon_hybrid_optimizers(
-            model_parts, optimizer_config, parallel_dims, ft_manager
-        )
+        return OptimizersContainer(config=optimizer_config, model_parts=model_parts)
 
-    if getattr(optimizer_config, "swap_optimizer", False):
-        # patch optimizer step functions
-        torch.optim.AdamW.step = swap_optimizer_step
-        torch.optim.Adam.step = swap_optimizer_step
+    if getattr(optimizer_config, "name", "") not in ("Adam", "AdamW"):
+        raise NotImplementedError(f"Optimizer {optimizer_config.name} not added.")
 
-        optimizer_classes = {
-            "Adam": torch.optim.Adam,
-            "AdamW": torch.optim.AdamW,
-        }
-
-        name = optimizer_config.name
-        if name not in optimizer_classes:
-            raise NotImplementedError(f"Optimizer {name} not added.")
-        optimizer_cls = optimizer_classes[name]
-
-        optimizer_kwargs = {
-            "lr": optimizer_config.lr,
-            "betas": (optimizer_config.beta1, optimizer_config.beta2),
-            "eps": optimizer_config.eps,
-            "weight_decay": optimizer_config.weight_decay,
-            "fused": optimizer_config.implementation == "fused",
-            "foreach": optimizer_config.implementation == "foreach",
-        }
-
-        logger.info(f"[Patch] Building SwapOptimizersContainer with {name}")
-        return SwapOptimizersContainer(
-            model_parts,
-            optimizer_cls,
-            optimizer_kwargs,
-            optimizer_config.swap_optimizer_times,
-        )
-
-    # original optimizers
-    return _original_build_optimizers(
-        model_parts, optimizer_config, parallel_dims, ft_manager
-    )
+    return SwapOptimizersContainer(config=optimizer_config, model_parts=model_parts)
 
 
-# patch build_optimizers function
-torchtitan.components.optimizer.build_optimizers = _build_optimizers_wrapper
+def patch_optimizer_step():
+    """Patch optimizer step functions for swap optimizer support."""
+    torch.optim.AdamW.step = swap_optimizer_step
+    torch.optim.Adam.step = swap_optimizer_step
+    logger.info("[SwapOptimizer] Patched AdamW.step and Adam.step")
+
+
+if _original_build_optimizers is None:
+    tt_optimizer.build_optimizers = build_optimizers  # type: ignore[assignment]
+    logger.info("[SwapOptimizer] Installed build_optimizers compatibility shim")

@@ -6,7 +6,7 @@
 import os
 from functools import wraps
 
-from torchtitan.config import Comm as CommConfig
+from torchtitan.config import CommConfig
 from torchtitan.distributed import utils as distributed_utils
 from torchtitan.distributed.utils import init_distributed
 from torchtitan.tools.logging import logger

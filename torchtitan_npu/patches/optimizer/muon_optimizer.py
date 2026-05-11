@@ -1,4 +1,4 @@
-# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
@@ -7,7 +7,8 @@ import functools
 import logging
 import math
 from collections.abc import Callable, Iterator
-from typing import Any
+from dataclasses import dataclass, fields, replace
+from typing import Any, ClassVar
 
 import torch
 import torch.nn as nn
@@ -18,15 +19,11 @@ from torch.distributed.checkpoint.state_dict import (
 )
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LambdaLR
-
-from torchtitan.components.ft import FTManager
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.optimizer import OptimizersContainer
-from torchtitan.config import (
-    LRScheduler as LRSchedulerConfig,
-    Optimizer as OptimizerConfig,
-)
 from torchtitan.distributed import ParallelDims
+
+from torchtitan.experiments.ft import FTManager
 
 logger = logging.getLogger("torchtitan")
 
@@ -72,59 +69,30 @@ def _split_parameters_for_muon(
     return muon_params, muon_param_names, adamw_params, adamw_param_names
 
 
-def _get_muon_lr_config(
-    optimizer_config: OptimizerConfig,
-    base_lr: float,
-) -> tuple[float, str | None]:
-    """Calculate Muon's effective learning rate and adjustment mode.
-
-    Returns:
-        Tuple of (muon_lr, muon_adjust_lr_fn)
-    """
-    muon_adjust_lr_fn = (
-        optimizer_config.muon_adjust_lr_fn  # pyrefly: ignore[missing-attribute]
-    )
-    muon_lr = getattr(optimizer_config, "muon_lr", None)
-
-    if muon_adjust_lr_fn == "original" and muon_lr is not None:
-        return float(muon_lr), muon_adjust_lr_fn
-
-    if muon_adjust_lr_fn == "match_rms_adamw" and muon_lr is not None:
-        logger.warning(
-            f"[Muon] muon_lr={muon_lr} is ignored when "
-            f"muon_adjust_lr_fn='match_rms_adamw'. Using base lr={base_lr} instead."
-        )
-    return base_lr, muon_adjust_lr_fn
-
-
 def _build_muon_kwargs(
     muon_lr: float,
     weight_decay: float,
-    optimizer_config: OptimizerConfig,
+    config: "MuonHybridOptimizersContainer.Config",
     muon_adjust_lr_fn: str | None,
 ) -> dict[str, Any]:
-    """Build kwargs for torch.optim.Muon constructor."""
     muon_kwargs = {
         "lr": muon_lr,
         "weight_decay": weight_decay,
-        "momentum": optimizer_config.muon_momentum,  # pyrefly: ignore[missing-attribute]
-        "nesterov": optimizer_config.muon_enable_nesterov,  # pyrefly: ignore[missing-attribute]
-        "ns_steps": optimizer_config.muon_ns_steps,  # pyrefly: ignore[missing-attribute]
+        "momentum": config.muon_momentum,
+        "nesterov": config.muon_enable_nesterov,
+        "ns_steps": config.muon_ns_steps,
     }
     if muon_adjust_lr_fn:
-        muon_kwargs[
-            "adjust_lr_fn"
-        ] = muon_adjust_lr_fn  # pyrefly: ignore[bad-typed-dict-key]
+        muon_kwargs["adjust_lr_fn"] = muon_adjust_lr_fn
     return muon_kwargs
 
 
 def _build_adamw_kwargs(
     lr: float,
     weight_decay: float,
-    optimizer_config: OptimizerConfig,
+    config: "MuonHybridOptimizersContainer.Config",
 ) -> dict[str, Any]:
-    """Build kwargs for torch.optim.AdamW constructor."""
-    optim_implementation = optimizer_config.implementation
+    optim_implementation = config.implementation
     if optim_implementation not in ["fused", "foreach", "for-loop"]:
         raise ValueError(
             f"Invalid implementation '{optim_implementation}'. "
@@ -132,51 +100,12 @@ def _build_adamw_kwargs(
         )
     return {
         "lr": lr,
-        "betas": (optimizer_config.beta1, optimizer_config.beta2),
-        "eps": optimizer_config.eps,
+        "betas": (config.beta1, config.beta2),
+        "eps": config.eps,
         "weight_decay": weight_decay,
         "fused": optim_implementation == "fused",
         "foreach": optim_implementation == "foreach",
     }
-
-
-def build_muon_hybrid_optimizers(
-    model_parts: list[nn.Module],
-    optimizer_config: OptimizerConfig,
-    parallel_dims: ParallelDims,
-    ft_manager: FTManager | None = None,
-) -> OptimizersContainer:
-    """Build Muon hybrid optimizer: Muon (for 2D params) + AdamW (for non-2D params)."""
-    lr = optimizer_config.lr
-    weight_decay = optimizer_config.weight_decay
-
-    muon_lr, muon_adjust_lr_fn = _get_muon_lr_config(optimizer_config, lr)
-
-    (
-        muon_params,
-        muon_param_names,
-        adamw_params,
-        adamw_param_names,
-    ) = _split_parameters_for_muon(model_parts)
-
-    logger.info(
-        f"[MuonAdamW] Muon optimizer parameters ({len(muon_param_names)}): {muon_param_names}"
-    )
-    logger.info(
-        f"[MuonAdamW] AdamW optimizer parameters ({len(adamw_param_names)}): {adamw_param_names}"
-    )
-
-    muon_kwargs = _build_muon_kwargs(
-        muon_lr, weight_decay, optimizer_config, muon_adjust_lr_fn
-    )
-    adamw_kwargs = _build_adamw_kwargs(lr, weight_decay, optimizer_config)
-
-    muon = torch.optim.Muon(muon_params, **muon_kwargs)
-    adamw = torch.optim.AdamW(adamw_params, **adamw_kwargs)
-
-    return MuonHybridOptimizersContainer(
-        model_parts, [muon, adamw], muon_adjust_lr_fn=muon_adjust_lr_fn
-    )
 
 
 class MuonHybridOptimizersContainer(OptimizersContainer):
@@ -198,15 +127,94 @@ class MuonHybridOptimizersContainer(OptimizersContainer):
     DCP APIs automatically filter to only process params managed by each optimizer.
     """
 
+    @dataclass(kw_only=True, slots=True)
+    class Config(OptimizersContainer.Config):
+        """Config for Muon hybrid optimizer.
+
+        Extends OptimizersContainer.Config with Muon-specific parameters.
+        When name == "Muon", enables Muon + AdamW hybrid optimization.
+        """
+
+        _owner: ClassVar[type | None] = None
+
+        # Muon-specific parameters
+        muon_lr: float | None = None
+        muon_momentum: float = 0.9
+        muon_enable_nesterov: bool = False
+        muon_ns_steps: int = 5
+        muon_adjust_lr_fn: str = "match_rms_adamw"
+
+        def build(self, **kwargs):
+            """Build MuonHybridOptimizersContainer instance.
+
+            Note: Unlike standard OptimizersContainer, Muon requires parallel_dims
+            for validation (single-device check). This is passed via kwargs.
+            """
+            if self._owner is None:
+                raise NotImplementedError(
+                    f"{type(self).__name__} has no owner class. "
+                    "Define Config inside a Configurable subclass."
+                )
+            if self.name != "Muon":
+                raise ValueError(
+                    f"MuonHybridOptimizersContainer.Config.name must be 'Muon', "
+                    f"got '{self.name}'"
+                )
+            config_fields = {f.name for f in fields(self)}
+            overlap = config_fields & kwargs.keys()
+            if overlap:
+                raise ValueError(
+                    f"build() kwargs {overlap} overlap with config fields. "
+                    "Put these values in the Config, not in build() kwargs."
+                )
+            return self._owner(config=replace(self), **kwargs)
+
     def __init__(
         self,
+        config: Config,
+        *,
         model_parts: list[nn.Module],
-        optimizers: list[Optimizer],
-        muon_adjust_lr_fn: str | None = None,
+        parallel_dims: ParallelDims | None = None,
+        ft_manager: FTManager | None = None,
     ) -> None:
+        # Validate single-device constraint
+        is_distributed = torch.distributed.is_initialized()
+        world_size = torch.distributed.get_world_size() if is_distributed else 1
+        if world_size > 1:
+            raise NotImplementedError(
+                "Muon optimizer currently only support single device"
+            )
+
+        lr = config.lr
+        weight_decay = config.weight_decay
+        muon_lr, muon_adjust_lr_fn = self._get_muon_lr_config(config, lr)
+
+        (
+            muon_params,
+            muon_param_names,
+            adamw_params,
+            adamw_param_names,
+        ) = _split_parameters_for_muon(model_parts)
+
+        logger.info(
+            f"[MuonAdamW] Muon optimizer parameters ({len(muon_param_names)}): {muon_param_names}"
+        )
+        logger.info(
+            f"[MuonAdamW] AdamW optimizer parameters ({len(adamw_param_names)}): {adamw_param_names}"
+        )
+
+        muon_kwargs = _build_muon_kwargs(
+            muon_lr, weight_decay, config, muon_adjust_lr_fn
+        )
+        adamw_kwargs = _build_adamw_kwargs(lr, weight_decay, config)
+
+        muon = torch.optim.Muon(muon_params, **muon_kwargs)
+        adamw = torch.optim.AdamW(adamw_params, **adamw_kwargs)
+
         self.model_parts = model_parts
-        self.optimizers = optimizers
+        self.optimizers = [muon, adamw]
         self.muon_adjust_lr_fn = muon_adjust_lr_fn
+
         all_params = []
         for model in model_parts:
             all_params.extend(p for p in model.parameters() if p.requires_grad)
@@ -229,6 +237,31 @@ class MuonHybridOptimizersContainer(OptimizersContainer):
     def adamw_optimizer(self) -> Optimizer:
         """Get the AdamW optimizer."""
         return self.optimizers[1]
+
+    @staticmethod
+    def _get_muon_lr_config(
+        config: Config,
+        base_lr: float,
+    ) -> tuple[float, str | None]:
+        """Calculate Muon's effective learning rate and adjustment mode.
+
+        Returns:
+            Tuple of (muon_lr, muon_adjust_lr_fn)
+        """
+        muon_adjust_lr_fn = config.muon_adjust_lr_fn
+        muon_lr = config.muon_lr
+
+        if muon_adjust_lr_fn == "original" and muon_lr is not None:
+            return float(muon_lr), muon_adjust_lr_fn
+
+        if muon_adjust_lr_fn == "match_rms_adamw" and muon_lr is not None:
+            logger.warning(
+                "[Muon] muon_lr=%s is ignored when "
+                "muon_adjust_lr_fn='match_rms_adamw'. Using base lr=%s instead.",
+                muon_lr,
+                base_lr,
+            )
+        return base_lr, muon_adjust_lr_fn
 
     def step(self, *args, **kwargs) -> None:
         for optimizer in self.optimizers:
@@ -278,6 +311,94 @@ class MuonLRSchedulersContainer:
     lr curve, only differing in base_lr.
     """
 
+    @dataclass(kw_only=True, slots=True)
+    class Config(LRSchedulersContainer.Config):
+        _owner: ClassVar[type | None] = None
+
+        def build(self, *, optimizers, training_steps):
+            """Build LR scheduler for Muon hybrid optimizers.
+
+            Routes to different scheduler types based on optimizer's muon_adjust_lr_fn:
+            - "original": MuonLRSchedulersContainer (different base_lr for Muon and AdamW)
+            - Other: Standard LRSchedulersContainer (same base_lr for both)
+            """
+            if self._owner is None:
+                raise NotImplementedError(
+                    f"{type(self).__name__} has no owner class. "
+                    "Define Config inside a Configurable subclass."
+                )
+
+            total_steps = (
+                self.total_steps if self.total_steps is not None else training_steps
+            )
+
+            warmup_steps = int(self.warmup_steps)
+
+            if warmup_steps > total_steps:
+                logger.warning(
+                    f"Warmup steps ({warmup_steps}) exceed total steps ({total_steps}). "
+                    f"Adjusting warmup steps to {total_steps}."
+                )
+                warmup_steps = total_steps
+
+            if self.decay_ratio is not None:
+                decay_steps = round(total_steps * self.decay_ratio)
+                if warmup_steps + decay_steps > total_steps:
+                    decay_steps = total_steps - warmup_steps
+            else:
+                decay_steps = total_steps - warmup_steps
+
+            stable_steps = total_steps + 1 - warmup_steps - decay_steps
+            lr_decay_type = self.decay_type
+            min_lr_factor = self.min_lr_factor
+
+            def linear_warmup_stable_decay(
+                current_step: int,
+                warmup_steps: int,
+                stable_steps: int,
+                decay_steps: int,
+                lr_decay_type: str,
+                min_lr_factor: float,
+            ):
+                warmup_stable_steps = warmup_steps + stable_steps
+                if current_step < warmup_steps:
+                    current_step += 1
+                    curr_adjustment = float(current_step / warmup_steps)
+                elif current_step < warmup_stable_steps:
+                    curr_adjustment = 1.0
+                else:
+                    current_step += 1
+                    progress = float(current_step - warmup_stable_steps) / decay_steps
+                    if lr_decay_type == "linear":
+                        curr_adjustment = 1 - progress
+                    elif lr_decay_type == "sqrt":
+                        curr_adjustment = 1 - math.sqrt(progress)
+                    elif lr_decay_type == "cosine":
+                        curr_adjustment = 0.5 * (1.0 + math.cos(math.pi * progress))
+                    else:
+                        raise ValueError(f"Unknown lr_decay_type: {lr_decay_type}")
+                    curr_adjustment = (
+                        min_lr_factor + (1 - min_lr_factor) * curr_adjustment
+                    )
+                return curr_adjustment
+
+            lr_lambda = functools.partial(
+                linear_warmup_stable_decay,
+                warmup_steps=warmup_steps,
+                stable_steps=stable_steps,
+                decay_steps=decay_steps,
+                lr_decay_type=lr_decay_type,
+                min_lr_factor=min_lr_factor,
+            )
+
+            if (
+                isinstance(optimizers, MuonHybridOptimizersContainer)
+                and optimizers.muon_adjust_lr_fn == "original"
+            ):
+                return self._owner(optimizers, lr_lambda)
+            else:
+                return LRSchedulersContainer(optimizers, lr_lambda)
+
     def __init__(
         self,
         optimizers: MuonHybridOptimizersContainer,
@@ -288,7 +409,6 @@ class MuonLRSchedulersContainer:
                 f"MuonHybridOptimizersContainer must have 2 optimizers, got {len(optimizers)}"
             )
 
-        # Create independent LambdaLR for Muon and AdamW
         self.schedulers = [
             LambdaLR(optimizers.muon_optimizer, lr_lambda),
             LambdaLR(optimizers.adamw_optimizer, lr_lambda),
@@ -311,24 +431,13 @@ class MuonLRSchedulersContainer:
         return len(self.schedulers)
 
     def step(self) -> None:
-        """Step all schedulers synchronously."""
         for scheduler in self.schedulers:
             scheduler.step()
 
     def state_dict(self) -> dict[str, Any]:
-        """Save only the first scheduler's state (last_epoch is shared)."""
         return self.schedulers[0].state_dict()
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
-        """Load last_epoch for all schedulers without overwriting base_lrs.
-
-        Critical: Only load last_epoch, do not overwrite base_lrs.
-        base_lrs are set from each optimizer during LambdaLR construction.
-        Muon and AdamW have different base_lrs that must remain independent.
-
-        PyTorch LambdaLR.load_state_dict would overwrite base_lrs, so we
-        manually set last_epoch instead of calling load_state_dict.
-        """
         last_epoch = state_dict["last_epoch"]
         for scheduler in self.schedulers:
             scheduler.last_epoch = last_epoch
@@ -339,94 +448,43 @@ class MuonLRSchedulersContainer:
             ]
 
 
-def _build_lr_lambda_from_config(
-    lr_scheduler_config: LRSchedulerConfig,
-    training_steps: int,
-) -> Callable:
-    """Build lr_lambda function from scheduler config.
+_OWNER_ATTR = "_owner"
+setattr(
+    MuonHybridOptimizersContainer.Config, _OWNER_ATTR, MuonHybridOptimizersContainer
+)
+setattr(MuonLRSchedulersContainer.Config, _OWNER_ATTR, MuonLRSchedulersContainer)
 
-    Extracted from build_muon_lr_schedulers to avoid code duplication.
+
+def build_muon_hybrid_optimizers(
+    model_parts: list[nn.Module],
+    optimizer_config: OptimizersContainer.Config,
+    parallel_dims: ParallelDims,
+    ft_manager: FTManager | None = None,
+) -> MuonHybridOptimizersContainer:
+    """Build Muon hybrid optimizer (backward-compatible entry point).
+
+    This function provides backward compatibility for the old API.
+    New code should use MuonHybridOptimizersContainer.Config.build() instead.
     """
-    warmup_steps = int(lr_scheduler_config.warmup_steps)
-
-    if warmup_steps > training_steps:
-        logger.warning(
-            f"Warmup steps ({warmup_steps}) exceed total training steps ({training_steps}). "
-            f"Adjusting warmup steps to {training_steps}."
-        )
-        warmup_steps = training_steps
-
-    if lr_scheduler_config.decay_ratio is not None:
-        decay_steps = round(training_steps * lr_scheduler_config.decay_ratio)
-        if warmup_steps + decay_steps > training_steps:
-            decay_steps = training_steps - warmup_steps
-    else:
-        decay_steps = training_steps - warmup_steps
-
-    stable_steps = training_steps + 1 - warmup_steps - decay_steps
-    lr_decay_type = lr_scheduler_config.decay_type
-    min_lr_factor = lr_scheduler_config.min_lr_factor
-
-    def linear_warmup_stable_decay(
-        current_step: int,
-        warmup_steps: int,
-        stable_steps: int,
-        decay_steps: int,
-        lr_decay_type: str,
-        min_lr_factor: float,
-    ):
-        warmup_stable_steps = warmup_steps + stable_steps
-        if current_step < warmup_steps:
-            current_step += 1
-            curr_adjustment = float(current_step / warmup_steps)
-        elif current_step < warmup_stable_steps:
-            curr_adjustment = 1.0
-        else:
-            current_step += 1
-            progress = float(current_step - warmup_stable_steps) / decay_steps
-            if lr_decay_type == "linear":
-                curr_adjustment = 1 - progress
-            elif lr_decay_type == "sqrt":
-                curr_adjustment = 1 - math.sqrt(progress)
-            elif lr_decay_type == "cosine":
-                curr_adjustment = 0.5 * (1.0 + math.cos(math.pi * progress))
-            else:
-                raise ValueError(f"Unknown lr_decay_type: {lr_decay_type}")
-            curr_adjustment = min_lr_factor + (1 - min_lr_factor) * curr_adjustment
-        return curr_adjustment
-
-    return functools.partial(
-        linear_warmup_stable_decay,
-        warmup_steps=warmup_steps,
-        stable_steps=stable_steps,
-        decay_steps=decay_steps,
-        lr_decay_type=lr_decay_type,
-        min_lr_factor=min_lr_factor,
+    config = MuonHybridOptimizersContainer.Config(
+        name="Muon",
+        lr=optimizer_config.lr,
+        beta1=optimizer_config.beta1,
+        beta2=optimizer_config.beta2,
+        eps=optimizer_config.eps,
+        weight_decay=optimizer_config.weight_decay,
+        implementation=optimizer_config.implementation,
+        muon_lr=getattr(optimizer_config, "muon_lr", None),
+        muon_momentum=getattr(optimizer_config, "muon_momentum", 0.9),
+        muon_enable_nesterov=getattr(optimizer_config, "muon_enable_nesterov", False),
+        muon_ns_steps=getattr(optimizer_config, "muon_ns_steps", 5),
+        muon_adjust_lr_fn=getattr(
+            optimizer_config, "muon_adjust_lr_fn", "match_rms_adamw"
+        ),
     )
-
-
-def build_muon_lr_schedulers(
-    optimizers: MuonHybridOptimizersContainer,
-    lr_scheduler_config: LRSchedulerConfig,
-    training_steps: int,
-) -> MuonLRSchedulersContainer | Any:
-    """Build LR scheduler for MuonHybridOptimizersContainer.
-
-    Routes to different scheduler types based on muon_adjust_lr_fn:
-    - "original": MuonLRSchedulersContainer (different base_lr for Muon and AdamW)
-    - Other: Standard LRSchedulersContainer (same base_lr for both)
-
-    Args:
-        optimizers: MuonHybridOptimizersContainer instance
-        lr_scheduler_config: LR scheduler configuration
-        training_steps: Total training steps
-
-    Returns:
-        MuonLRSchedulersContainer or LRSchedulersContainer
-    """
-    lr_lambda = _build_lr_lambda_from_config(lr_scheduler_config, training_steps)
-
-    if optimizers.muon_adjust_lr_fn == "original":
-        return MuonLRSchedulersContainer(optimizers, lr_lambda)
-    else:
-        return LRSchedulersContainer(optimizers, lr_lambda)
+    return MuonHybridOptimizersContainer(
+        config=config,
+        model_parts=model_parts,
+        parallel_dims=parallel_dims,
+        ft_manager=ft_manager,
+    )

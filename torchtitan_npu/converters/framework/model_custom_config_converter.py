@@ -7,9 +7,9 @@ import logging
 
 import torch.nn as nn
 
-from torchtitan.config.job_config import JobConfig
 from torchtitan.distributed import ParallelDims
 from torchtitan.protocols.model_converter import ModelConverter
+from torchtitan.trainer import Trainer
 
 from torchtitan_npu.converters.model_custom_interface import ModelCustomConfig
 from torchtitan_npu.converters.npu_registry import get_using_train_spec
@@ -24,10 +24,10 @@ class ModelCustomConfigConverter(ModelConverter):
 
     _model_config: ModelCustomConfig
 
-    def __init__(self, job_config: JobConfig, parallel_dims: ParallelDims):
-        self.job_config = job_config
+    def __init__(self, trainer_config: Trainer.Config, parallel_dims: ParallelDims):
+        self.trainer_config = trainer_config
         self.parallel_dims = parallel_dims
-        self.model_name = job_config.model.name
+        self.model_name = trainer_config.model_spec.name
 
     def convert(self, model: nn.Module):
         try:
@@ -43,7 +43,7 @@ class ModelCustomConfigConverter(ModelConverter):
 
             model_converter = self._model_config.model_converter
             if model_converter is not None:
-                model_converter(self.job_config, self.parallel_dims).convert(model)
+                model_converter(self.trainer_config, self.parallel_dims).convert(model)
                 logger.info(f"[ModelCustomConfigConverter] Applied {model_converter}.")
 
             parallelize_plan_updater = self._model_config.parallelize_plan_updater

@@ -1,25 +1,37 @@
-# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
-# This file is derived from torchtitan,
-# https://github.com/pytorch/torchtitan/blob/v0.2.2/torchtitan/hf_datasets/text_datasets.py
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+"""
+Patch for torchtitan/hf_datasets/text_datasets.py
+
+1. Registers extra datasets (enwiki-eod, alpaca) into DATASETS.
+2. Wraps HuggingFaceTextDataLoader.__init__ to extend `seq_len` by
+   `num_mtp_modules` for deepseek_v32 / deepseek_v4 when Multi-Token
+   Prediction is enabled.
+
+The active Trainer.Config is recovered via `_trainer_config_stash` (shared
+with the loss patch). Upstream TrainingConfig has no `num_mtp_modules`
+field, so the seq_len wrapper is a no-op when the npu-side Training subclass
+that introduces this field is not in use.
+"""
+
+import functools
+
 from datasets import load_dataset
-from torchtitan.hf_datasets import text_datasets as text_datasets_utils
+from torchtitan.hf_datasets import DatasetConfig
 from torchtitan.hf_datasets.text_datasets import (
     _process_c4_text,
-    build_text_dataloader,
-    DatasetConfig,
     DATASETS,
+    HuggingFaceTextDataLoader,
 )
 from torchtitan.tools.logging import init_logger, logger
 
+from ._trainer_config_stash import get_active_trainer_config
+
 init_logger()
 
-# Define new dataset configurations
 new_datasets = {
     "enwiki-eod": DatasetConfig(
         path="tests/assets/enwiki",
@@ -33,19 +45,19 @@ new_datasets = {
     ),
 }
 
-# Adding Datasets in Batches
 added_datasets = []
-for name, config in new_datasets.items():
+for name, ds_config in new_datasets.items():
     if name not in DATASETS:
-        DATASETS[name] = config
+        DATASETS[name] = ds_config
         added_datasets.append(name)
         logger.info(
-            f"[Dataset Patch] Successfully added dataset config: {name} (path: {config.path})"
+            "[Dataset Patch] Successfully added dataset config: %s (path: %s)",
+            name,
+            ds_config.path,
         )
     else:
-        logger.warning(f"[Dataset Patch] Dataset {name} already exists, skip adding")
+        logger.warning("[Dataset Patch] Dataset %s already exists, skip adding", name)
 
-# Summary print
 if added_datasets:
     logger.info(
         f"[Dataset Patch] Added {len(added_datasets)} datasets in total: {added_datasets}"
@@ -57,32 +69,57 @@ else:
     )
 
 
-def mtp_build_text_dataloader(
+_MTP_ALLOWED_MODELS = frozenset({"deepseek_v32", "deepseek_v4"})
+
+
+def _mtp_seq_len_delta() -> int:
+    """Return the MTP seq_len bump for the active Trainer.Config, or 0.
+
+    Raises ValueError if MTP is enabled on a model outside _MTP_ALLOWED_MODELS.
+    """
+    trainer_config = get_active_trainer_config()
+    if trainer_config is None:
+        return 0
+    num_mtp_modules = getattr(trainer_config.training, "num_mtp_modules", 0)
+    if num_mtp_modules <= 0:
+        return 0
+    model_spec = getattr(trainer_config, "model_spec", None)
+    model_name = getattr(model_spec, "name", None) if model_spec is not None else None
+    if model_name not in _MTP_ALLOWED_MODELS:
+        raise ValueError(
+            "Multi Token Prediction Module only can be used for "
+            f"{sorted(_MTP_ALLOWED_MODELS)} model now, "
+            f"got model_spec.name={model_name!r}."
+        )
+    return num_mtp_modules
+
+
+_orig_hf_text_init = HuggingFaceTextDataLoader.__init__
+
+
+@functools.wraps(_orig_hf_text_init)
+def _hf_text_init_with_mtp(
+    self,
+    config,
+    *,
     dp_world_size,
     dp_rank,
     tokenizer,
-    job_config,
-    infinite: bool = True,
+    seq_len,
+    local_batch_size,
+    **kwargs,
 ):
-    if (
-        hasattr(job_config.training, "num_mtp_modules")
-        and job_config.training.num_mtp_modules > 0
-    ):
-        if job_config.model.name in ["deepseek_v32", "deepseek_v4"]:
-            job_config.training.seq_len += job_config.training.num_mtp_modules
-            result = build_text_dataloader(
-                dp_world_size, dp_rank, tokenizer, job_config, infinite
-            )
-            job_config.training.seq_len -= job_config.training.num_mtp_modules
-        else:
-            raise AssertionError(
-                "Multi Token Prediction Module only can be used for deepseek_v32 and deepseek_v4 model now!"
-            )
-    else:
-        result = build_text_dataloader(
-            dp_world_size, dp_rank, tokenizer, job_config, infinite
-        )
-    return result
+    seq_len = seq_len + _mtp_seq_len_delta()
+    _orig_hf_text_init(
+        self,
+        config,
+        dp_world_size=dp_world_size,
+        dp_rank=dp_rank,
+        tokenizer=tokenizer,
+        seq_len=seq_len,
+        local_batch_size=local_batch_size,
+        **kwargs,
+    )
 
 
-text_datasets_utils.build_text_dataloader = mtp_build_text_dataloader
+HuggingFaceTextDataLoader.__init__ = _hf_text_init_with_mtp

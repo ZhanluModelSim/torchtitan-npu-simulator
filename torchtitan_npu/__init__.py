@@ -1,9 +1,9 @@
-# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-__version__ = "0.2.2.post1"
+__version__ = "0.2.2.post2"
 
 import sys
 
@@ -20,32 +20,26 @@ def _apply_patches():
     # patching optimizer before importing torchtitan.models
     from .patches.optimizer import swap_optimizer  # noqa: F401 # usort:skip
 
-    from .patches.optimizer import virtual_optimizer  # noqa: F401 # usort:skip
-
-    import torchtitan.models as titan_models
-
     # patching torchtitan
     from torchtitan_npu.patches.torchtitan import (  # noqa: F401
         activation_checkpoint,
+        expert_parallel,
         hf_datasets,
         loss,
     )
 
-    # patching context_parallel utils
-    from .patches.distributed import (  # noqa: F401, F811 # usort:skip
-        mtp_context_parallel,
-        cp_input_sharding,
-        custom_context_parallel,
-        utils,
-    )
+    # patching ops
+    from . import converters, ops  # noqa: F401  # noqa: F401
 
     # patching mxfp8/hif8
     from .converters import quant_converter  # noqa: F401
 
-    # patching models
-    from .models import deepseek_v3  # noqa: F401
-
-    from .models.deepseek_v3.infra import parallelize  # noqa: F401
+    # patching context_parallel utils
+    from .patches.distributed import (  # noqa: F401  # noqa: F401, F811
+        cp_input_sharding,
+        custom_context_parallel,
+        utils,
+    )
 
     # patching step timing
     from .patches.tools import metrics  # noqa: F401
@@ -62,23 +56,6 @@ def _apply_patches():
 
     # patching tools
     from .tools import flight_recorder, profiling  # noqa: F401
-
-    new_set = set(titan_models._supported_models)
-    new_set.add("deepseek_v32")
-    new_set.add("deepseek_v4")
-    titan_models._supported_models = frozenset(new_set)
-
-    # patching ops
-    from . import ops  # noqa: F401
-
-    # module injection
-    from .models import deepseek_v32, deepseek_v4  # noqa: F401
-
-    _inject_module("torchtitan.models.deepseek_v32", deepseek_v32)
-    _inject_module("torchtitan.models.deepseek_v4", deepseek_v4)
-
-    # patching model_converter
-    from . import converters  # noqa: F401
 
 
 def _inject_module(module_path: str, replacement_module):

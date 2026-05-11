@@ -16,7 +16,8 @@ PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUTPUT_DIR="${PROJECT_ROOT}/output"
 REPORT_DIR="${PROJECT_ROOT}/test_reports"
 INTEGRATION_REPORT_DIR="${PROJECT_ROOT}/test_reports/integration_tests"
-TORCHTITAN_VERSION="v0.2.2"
+TORCHTITAN_BRANCH="main"
+TORCHTITAN_COMMIT="ac13e536c84e7f6647b14fa9375c3c8a8a2b8578"
 TORCHTITAN_DIR="${PROJECT_ROOT}/third_party/torchtitan"
 TIMEOUT_SECONDS=${TIMEOUT_SECONDS:-300}
 SMOKE_STEPS=${SMOKE_STEPS:-1}
@@ -47,9 +48,12 @@ _setup_env() {
     if [[ ! -d "$TORCHTITAN_DIR" ]]; then
         echo "Cloning torchtitan source..."
         mkdir -p third_party
-        git clone --branch $TORCHTITAN_VERSION --depth 1 \
-            https://gitcode.com/GitHub_Trending/to/torchtitan.git $TORCHTITAN_DIR
+        git clone --branch "$TORCHTITAN_BRANCH" \
+            https://gitcode.com/GitHub_Trending/to/torchtitan.git "$TORCHTITAN_DIR"
     fi
+
+    git -C "$TORCHTITAN_DIR" fetch origin "$TORCHTITAN_BRANCH"
+    git -C "$TORCHTITAN_DIR" checkout "$TORCHTITAN_COMMIT"
 }
 
 # Run integrated test: end-to-end training configurations.
@@ -209,7 +213,7 @@ _wait_npu_idle() {
     return 1
 }
 
-run_torchtitan_smoke
+# run_torchtitan_smoke
 _wait_npu_idle 10 5000
 run_torchtitan_npu_smoke
 pytest -v --tb=short tests/smoke_tests

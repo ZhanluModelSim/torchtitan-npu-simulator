@@ -11,15 +11,15 @@ import torch.nn as nn
 
 from torch.distributed.tensor.parallel.style import ParallelStyle
 
-from torchtitan.config.job_config import JobConfig
 from torchtitan.distributed import ParallelDims
+from torchtitan.trainer import Trainer
 
 
 class ModelCustomConverter(ABC):
-    def __init__(self, job_config: JobConfig, parallel_dims: ParallelDims):
-        self.job_config = job_config
+    def __init__(self, trainer_config: Trainer.Config, parallel_dims: ParallelDims):
+        self.trainer_config = trainer_config
         self.parallel_dims = parallel_dims
-        self.model_name = job_config.model.name
+        self.model_name = trainer_config.model_spec.name
 
     @abstractmethod
     def convert(self, model: nn.Module):

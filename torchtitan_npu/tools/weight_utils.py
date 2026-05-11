@@ -1,4 +1,4 @@
-# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
@@ -203,41 +203,24 @@ def _split_w13_for_mapping(state_dict: dict[str, Any]) -> dict[str, Any]:
         if ".moe.experts.w13" in key:
             base_key = key.replace(".w13", "")
 
-            # Create placeholders w1 and w3
-            # For DTensor, the shape needs to be adjusted.
             if isinstance(value, DTensor):
+                local_val = value.to_local()
+                chunks = torch.chunk(local_val, 2, dim=1)
+                w1_local = chunks[0].clone()
+                w3_local = chunks[1].clone()
+                del chunks, local_val
 
-                shape = value.shape
-                new_shape = (shape[0], shape[1] // 2, shape[2])
-
-                from torch.distributed.tensor import zeros as dt_zeros
-
-                w1 = dt_zeros(
-                    new_shape,
-                    device_mesh=value.device_mesh,
-                    placements=value.placements,
+                w1 = DTensor.from_local(
+                    w1_local, device_mesh=value.device_mesh, placements=value.placements
                 )
-                w3 = dt_zeros(
-                    new_shape,
-                    device_mesh=value.device_mesh,
-                    placements=value.placements,
+                w3 = DTensor.from_local(
+                    w3_local, device_mesh=value.device_mesh, placements=value.placements
                 )
             else:
-                half = value.shape[1] // 2
-                w1 = torch.empty(
-                    value.shape[0],
-                    half,
-                    value.shape[2],
-                    dtype=value.dtype,
-                    device=value.device,
-                )
-                w3 = torch.empty(
-                    value.shape[0],
-                    half,
-                    value.shape[2],
-                    dtype=value.dtype,
-                    device=value.device,
-                )
+                chunks = torch.chunk(value, 2, dim=1)
+                w1 = chunks[0].clone()
+                w3 = chunks[1].clone()
+                del chunks
 
             result[base_key + ".w1"] = w1
             result[base_key + ".w3"] = w3

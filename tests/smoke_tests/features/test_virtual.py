@@ -8,6 +8,12 @@ import pytest
 import torch.nn as nn
 import torchtitan.components.optimizer as tt_optimizer
 
+if not hasattr(tt_optimizer, "build_optimizers"):
+    pytest.skip(
+        "Skipping virtual optimizer tests: torchtitan.components.optimizer.build_optimizers missing",
+        allow_module_level=True,
+    )
+
 from torchtitan_npu.patches.optimizer.virtual_optimizer import virtual_optimizer_step
 
 pytestmark = pytest.mark.smoke

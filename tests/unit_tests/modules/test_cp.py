@@ -22,7 +22,7 @@ from torchtitan_npu.distributed.context_parallel.ulysses_cp import (
     AllToAll,
     patch_ulysses_for_context_parallel,
 )
-from torchtitan_npu.models.deepseek_v32.model.model import DSV32_SDPA
+from torchtitan_npu.models.deepseek_v32.model import DSV32_SDPA
 from torchtitan_npu.patches.distributed.custom_context_parallel import (
     validate_ulysses_configs,
 )

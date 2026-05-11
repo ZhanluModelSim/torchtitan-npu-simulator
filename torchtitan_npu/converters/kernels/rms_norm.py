@@ -1,4 +1,4 @@
-# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
@@ -9,6 +9,8 @@ import torch
 import torch.nn as nn
 
 import torch_npu
+
+from torchtitan.protocols.module import Module
 
 from ..base_converter import BaseConverter
 from ..convert_utils import replace_modules
@@ -25,9 +27,6 @@ class NPURMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Matches the default implementation of nn.RMSNorm:
-        # - Use user-provided eps if it exists.
-        # - Otherwise, use the machine epsilon of the current input `x`.
         resolved_eps = self.eps if self.eps is not None else torch.finfo(x.dtype).eps
         return torch_npu.npu_rms_norm(x, self.weight, resolved_eps)[0]
 
@@ -36,6 +35,9 @@ class NPURMSNorm(nn.Module):
 
     def extra_repr(self) -> str:
         return f"dim={self.dim}, eps={self.eps}"
+
+
+NPURMSNormModule = Module.from_nn_module(NPURMSNorm)
 
 
 def _get_eps(module: nn.Module) -> float | None:
@@ -47,11 +49,10 @@ def _get_eps(module: nn.Module) -> float | None:
 
 
 def _create_npu_rms_norm(old: nn.Module) -> nn.Module:
-    # pyrefly: ignore [bad-index]
     dim = old.weight.shape[-1]
     eps = _get_eps(old)
-    # pyrefly: ignore [bad-argument-type]
-    new = NPURMSNorm(dim, eps=eps)
+    new = NPURMSNormModule(dim, eps=eps)
+    new.weight = old.weight
     return new
 
 

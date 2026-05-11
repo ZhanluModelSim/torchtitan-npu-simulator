@@ -1,9 +1,6 @@
-# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
-# This file is derived from PyTorch,
+# Adapted from
 # https://github.com/pytorch/pytorch/blob/v2.10.0/torch/nn/utils/clip_grad.py
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
 
 """
 NPU Async-Tp integration for Inductor.
@@ -145,9 +142,9 @@ def install_npu_tp_patches():
 _orig_maybe_enable_async_tp = _tp_mod.maybe_enable_async_tp
 
 
-def _enable_async_tp_wrapper(job_config, tp_mesh):
-    _orig_maybe_enable_async_tp(job_config, tp_mesh)
-    if getattr(job_config.parallelism, "enable_async_tensor_parallel", False):
+def _enable_async_tp_wrapper(parallelism, compile_config, tp_mesh):
+    _orig_maybe_enable_async_tp(parallelism, compile_config, tp_mesh)
+    if getattr(parallelism, "enable_async_tensor_parallel", False):
         install_npu_tp_patches()
 
 

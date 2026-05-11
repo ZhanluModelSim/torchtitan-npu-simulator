@@ -17,6 +17,8 @@ import torch.nn as nn
 
 import torchtitan.distributed.context_parallel as titan_cp
 from torch.distributed.device_mesh import DeviceMesh
+from torchtitan.models.common.attention import ScaledDotProductAttention
+from torchtitan.tools.logging import logger
 
 
 _orig_apply_cp_to_attention_module = titan_cp.apply_cp_to_attention_module
@@ -96,34 +98,50 @@ def validate_ulysses_configs(
             )
 
 
-def validate_dsa_converters(*, job_config: object | None) -> None:
-    if job_config is None:
-        raise ValueError(
-            '[dsa] attention_type="dsa" requires job_config (with model.converters) '
-            "to be passed into apply_cp_to_attention_module."
+def validate_dsa_converters(
+    *,
+    job_config: object | None,
+    converters: list[str] | tuple[str, ...] | None = None,
+) -> None:
+    resolved_converters = converters
+    if resolved_converters is None and job_config is not None:
+        model_cfg = getattr(job_config, "model", None)
+        resolved_converters = (
+            getattr(model_cfg, "converters", None) if model_cfg is not None else None
         )
-    model_cfg = getattr(job_config, "model", None)
-    converters = (
-        getattr(model_cfg, "converters", None) if model_cfg is not None else None
-    )
-    if not converters or "npu_dsa" not in converters:
+    if not resolved_converters or "npu_dsa" not in resolved_converters:
         raise ValueError(
-            '[dsa] attention_type="dsa" requires "npu_dsa" in job_config.model.converters. '
-            f"Got converters={converters!r}."
+            '[dsa] attention_type="dsa" requires "npu_dsa" in converters. '
+            f"Got converters={resolved_converters!r}."
         )
 
 
 def apply_cp_to_attention_module(
     attention_modules: Sequence[nn.Module],
     cp_mesh: DeviceMesh,
-    attention_type: str,
     *,
+    attention_type: str | None = None,
     job_config: object | None = None,
     model_args: object | None = None,
     tp_mesh: DeviceMesh | None = None,
+    converters: list[str] | tuple[str, ...] | None = None,
 ) -> None:
+    """Patched ``apply_cp_to_attention_module`` with NPU-only routing.
+
+    Upstream signature is ``(attention_modules, cp_mesh)`` — ``attention_type``
+    is inferred from the module class. To preserve compatibility with that
+    contract while still letting NPU paths (``dsa`` / ``ulysses``) opt in to
+    custom CP backends, ``attention_type`` is keyword-only with default
+    ``None``; when unset we delegate straight to the upstream implementation.
+    """
+    first_module = attention_modules[0] if attention_modules else None
+    module_name = type(first_module).__name__ if first_module is not None else "None"
+
     if attention_type == "dsa":
-        validate_dsa_converters(job_config=job_config)
+        validate_dsa_converters(job_config=job_config, converters=converters)
+        logger.info(
+            f"CP router selected route=dsa module={module_name} cp_degree={cp_mesh.size()}"
+        )
 
         from torchtitan_npu.distributed.context_parallel.dsa_cp import (
             patch_dsa_for_context_parallel,
@@ -133,8 +151,18 @@ def apply_cp_to_attention_module(
             cp_mesh=cp_mesh, model_args=model_args, tp_mesh=tp_mesh
         )
     elif attention_type == "ulysses":
+        if first_module is not None and not isinstance(
+            first_module, ScaledDotProductAttention
+        ):
+            raise ValueError(
+                "[ulysses] expected ScaledDotProductAttention modules, "
+                f"got {type(first_module).__name__}."
+            )
         validate_ulysses_configs(
             job_config=job_config, model_args=model_args, cp_mesh=cp_mesh
+        )
+        logger.info(
+            f"CP router selected route=ulysses module={module_name} cp_degree={cp_mesh.size()}"
         )
 
         from torchtitan_npu.distributed.context_parallel.ulysses_cp import (
@@ -143,10 +171,15 @@ def apply_cp_to_attention_module(
 
         patch_ulysses_for_context_parallel(cp_mesh=cp_mesh)
     else:
+        logger.info(
+            f"CP router selected route=upstream module={module_name} cp_degree={cp_mesh.size()}"
+        )
+        # ``attention_type is None`` (upstream-style call) or any other value
+        # falls back to the upstream implementation, which infers the CP
+        # plan from the first module's class.
         _orig_apply_cp_to_attention_module(
             attention_modules=attention_modules,
             cp_mesh=cp_mesh,
-            attention_type=attention_type,
         )
     return None
 

@@ -1,14 +1,15 @@
-# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
 import logging
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch.nn as nn
 
-from torchtitan.config.job_config import JobConfig
+from torchtitan.config import Configurable
 from torchtitan.distributed import ParallelDims
 from torchtitan.protocols.model_converter import ModelConverter
 
@@ -18,18 +19,30 @@ if TYPE_CHECKING:
     from .base_converter import BaseConverter
 
 
-class NPUConverter(ModelConverter):
+class NPUConverter(Configurable, ModelConverter):
+    """NPU Converter wrapper that follows the Configurable pattern."""
 
     _patch_cls: type["BaseConverter"] | None = None
     _patch_name: str | None = None
     _supported_models: set[str] | None = None
 
-    def __init__(self, job_config: JobConfig, parallel_dims: ParallelDims):
-        self.job_config = job_config
+    @dataclass(kw_only=True, slots=True)
+    class Config(Configurable.Config):
+        pass
+
+    def __init__(
+        self,
+        config: Config,
+        *,
+        parallel_dims: ParallelDims,
+        model_compile_enabled: bool,
+    ):
         self.parallel_dims = parallel_dims
-        self.model_name = job_config.model.name
+        self.model_compile_enabled = model_compile_enabled
+        self.model_name = "unknown"
 
     def convert(self, model: nn.Module) -> nn.Module:  # pyrefly: ignore [bad-override]
+        self.model_name = self._infer_model_name(model)
         self._validate_compatibility()
 
         try:
@@ -51,10 +64,17 @@ class NPUConverter(ModelConverter):
     def post_optimizer_hook(self, model: nn.Module | list[nn.Module]):
         pass
 
+    def _infer_model_name(self, model: nn.Module) -> str:
+        module = model.__class__.__module__
+        for name in ("deepseek_v32", "deepseek_v3", "qwen3", "llama4", "llama3"):
+            if name in module:
+                return name
+        return "unknown"
+
     def _validate_compatibility(self):
         if self._patch_cls is None:
             raise RuntimeError("Missing patch class for NPUConverter")
-        if not self._patch_cls.is_compatible(self.job_config, self.model_name):
+        if not self._patch_cls.is_compatible(None, self.model_name):
             raise ValueError(
                 f"Patch '{self._patch_name}' is NOT compatible with model '{self.model_name}' \n"
                 f"Supported models: {self._supported_models}"

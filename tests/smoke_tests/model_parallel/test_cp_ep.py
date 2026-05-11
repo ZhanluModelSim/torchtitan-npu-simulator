@@ -214,7 +214,7 @@ def test_memory_efficiency_parallel(npu_device):
 
 def test_valid_parallel_config():
     try:
-        from torchtitan_npu.config.custom_config import Parallelism
+        from torchtitan_npu.config.configs import ParallelismConfig
 
         valid_configs = [
             {"enable_custom_context_parallel": False},
@@ -222,8 +222,8 @@ def test_valid_parallel_config():
         ]
 
         for config in valid_configs:
-            parallelism = Parallelism(**config)
+            parallelism = ParallelismConfig(**config)
             assert parallelism is not None
 
     except ImportError:
-        pytest.skip("Custom config module not available")
+        pytest.skip("NPU config module not available")

@@ -130,7 +130,7 @@ def triton_hc_head_forward(self, x, hc_fn, hc_scale, hc_base):
 @register_npu_converter("npu_mhc_pre")
 class MHCPREKernel(BaseConverter):
 
-    TARGET_PACKAGE = "torchtitan_npu.models.deepseek_v4.model.model"
+    TARGET_PACKAGE = "torchtitan_npu.models.deepseek_v4.model"
     TARGET_CLASS = "HcPre"
 
     @classmethod
@@ -153,7 +153,7 @@ class MHCPREKernel(BaseConverter):
 @register_npu_converter("npu_mhc_post")
 class MHCPOSTKernel(BaseConverter):
 
-    TARGET_PACKAGE = "torchtitan_npu.models.deepseek_v4.model.model"
+    TARGET_PACKAGE = "torchtitan_npu.models.deepseek_v4.model"
     TARGET_CLASS = ["HcPost", "HcHead"]
 
     @classmethod

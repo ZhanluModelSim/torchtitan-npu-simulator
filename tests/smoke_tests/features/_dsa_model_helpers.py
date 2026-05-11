@@ -2,16 +2,27 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
+"""Shared helpers for DSA-related smoke tests.
+
+Builds a minimal, single-layer v32 Attention plus the auxiliary tensors
+its sparse kernels expect (``query_indexer`` / ``key_indexer`` / ``weights``
+/ ``topk_indices`` / softmax stats) so individual op-level tests can exercise
+the Lightning Indexer and sparse flash attention in isolation.
+
+The helper used to depend on the legacy flat ``DeepSeekV32ModelArgs`` +
+upstream ``precompute_freqs_cis``. Both are gone in the new Config tree;
+this version drives everything from ``Attention.Config`` (built via
+``_make_dsv32_attn_config``) and a stand-alone ``RoPE`` instance for the
+freqs_cis cache.
+"""
 from dataclasses import dataclass
 
 import torch
 import torch_npu
+from torchtitan.models.common.rope import RoPE
 
-from torchtitan.models.deepseek_v3.model.model import precompute_freqs_cis
-from torchtitan.models.moe.moe import MoEArgs
-
-from torchtitan_npu.models.deepseek_v32.model.args import DeepSeekV32ModelArgs
-from torchtitan_npu.models.deepseek_v32.model.model import apply_rotary_emb, Attention
+from torchtitan_npu.models.deepseek_v32 import _make_dsv32_attn_config
+from torchtitan_npu.models.deepseek_v32.model import apply_rotary_emb, Attention
 
 
 @dataclass
@@ -38,24 +49,12 @@ class DsaKernelInputs:
     key_rope: torch.Tensor
 
 
-def _build_dsa_args(seq_len):
-    args = DeepSeekV32ModelArgs(
-        vocab_size=129280,
+def _build_attn_config(seq_len: int):
+    """Build a v32 ``Attention.Config`` sized to match the legacy DSA smoke args."""
+    cfg = _make_dsv32_attn_config(
+        layer_id=0,
         dim=256,
-        inter_dim=512,
-        moe_inter_dim=256,
-        n_layers=1,
-        n_dense_layers=1,
         n_heads=64,
-        moe_args=MoEArgs(
-            num_experts=4,
-            num_shared_experts=1,
-            top_k=2,
-            score_func="sigmoid",
-            route_norm=True,
-            score_before_experts=False,
-            use_grouped_mm=False,
-        ),
         q_lora_rank=1536,
         kv_lora_rank=512,
         qk_nope_head_dim=128,
@@ -65,35 +64,34 @@ def _build_dsa_args(seq_len):
         index_head_dim=128,
         index_topk=2048,
     )
-    args.max_seq_len = max(args.max_seq_len, seq_len)
-    return args
+    # Push the rope cache out far enough to cover the requested ``seq_len``.
+    cfg.rope_max_seq_len = max(cfg.rope_max_seq_len, seq_len)
+    return cfg
 
 
-def _build_attention_tensors(attention, args, batch_size, seq_len, device):
-    x = torch.zeros(batch_size, seq_len, args.dim, dtype=torch.bfloat16, device=device)
-    freqs_cis = precompute_freqs_cis(args).to(device)[:seq_len]
-    qr = attention.pre_attention.q_norm(attention.pre_attention.wq_a(x))
-    q = attention.pre_attention.wq_b(qr).view(
-        batch_size, seq_len, -1, attention.pre_attention.qk_head_dim
-    )
-    q_nope, q_pe = torch.split(
-        q,
-        [
-            attention.pre_attention.qk_nope_head_dim,
-            attention.pre_attention.qk_rope_head_dim,
-        ],
-        dim=-1,
-    )
+def _build_freqs_cis(cfg, device) -> torch.Tensor:
+    """Replicates the old ``precompute_freqs_cis`` helper for the rope range
+    used by v32 attention; returns a host tensor on ``device``."""
+    rope = RoPE.Config(
+        dim=cfg.qk_rope_head_dim,
+        max_seq_len=cfg.rope_max_seq_len,
+        theta=10000.0,
+        backend="complex",
+    ).build()
+    rope.init_states(buffer_device=device)
+    return rope.cache.to(device)
+
+
+def _build_attention_tensors(attention, cfg, batch_size, seq_len, device):
+    pre = attention.pre_attention
+    x = torch.zeros(batch_size, seq_len, cfg.dim, dtype=torch.bfloat16, device=device)
+    freqs_cis = _build_freqs_cis(cfg, device)[:seq_len]
+    qr = pre.q_norm(pre.wq_a(x))
+    q = pre.wq_b(qr).view(batch_size, seq_len, -1, pre.qk_head_dim)
+    q_nope, q_pe = torch.split(q, [pre.qk_nope_head_dim, pre.qk_rope_head_dim], dim=-1)
     q_pe = apply_rotary_emb(q_pe, freqs_cis)
-    kv = attention.pre_attention.wkv_a(x)
-    kv, k_pe = torch.split(
-        kv,
-        [
-            attention.pre_attention.kv_lora_rank,
-            attention.pre_attention.qk_rope_head_dim,
-        ],
-        dim=-1,
-    )
+    kv = pre.wkv_a(x)
+    kv, k_pe = torch.split(kv, [pre.kv_lora_rank, pre.qk_rope_head_dim], dim=-1)
     k_pe = apply_rotary_emb(k_pe.unsqueeze(2), freqs_cis)
     return AttentionTensorState(
         x=x,
@@ -101,18 +99,19 @@ def _build_attention_tensors(attention, args, batch_size, seq_len, device):
         qr=qr,
         q_nope=q_nope,
         q_pe=q_pe,
-        kv=attention.pre_attention.kv_norm(kv),
+        kv=pre.kv_norm(kv),
         k_pe=k_pe,
     )
 
 
 def _build_query_key_tensors(attention, attention_state):
-    wkv_b_weight = attention.pre_attention.wkv_b.weight.reshape(
+    pre = attention.pre_attention
+    wkv_b_weight = pre.wkv_b.weight.reshape(
         -1,
-        attention.pre_attention.qk_nope_head_dim + attention.pre_attention.v_head_dim,
-        attention.pre_attention.kv_lora_rank,
+        pre.qk_nope_head_dim + pre.v_head_dim,
+        pre.kv_lora_rank,
     )
-    w_uk = wkv_b_weight[:, : attention.pre_attention.qk_nope_head_dim, :]
+    w_uk = wkv_b_weight[:, : pre.qk_nope_head_dim, :]
     query = torch.einsum("bshq,hqr->bshr", attention_state.q_nope, w_uk)
     key = attention_state.kv.unsqueeze(2)
     value = attention_state.kv.unsqueeze(2)
@@ -124,7 +123,8 @@ def _build_query_key_tensors(attention, attention_state):
 
 
 def _build_indexer_outputs(attention, attention_state):
-    query_indexer, weights, key_indexer, _ = attention.pre_attention.indexer(
+    pre = attention.pre_attention
+    query_indexer, weights, key_indexer, _ = pre.indexer(
         attention_state.x.detach(),
         attention_state.qr.detach(),
         0,
@@ -139,7 +139,7 @@ def _build_indexer_outputs(attention, attention_state):
         actual_seq_lengths_key=None,
         layout_query="BSND",
         layout_key="BSND",
-        sparse_count=attention.pre_attention.indexer.index_topk,
+        sparse_count=pre.indexer.index_topk,
         sparse_mode=3,
         return_value=True,
     )
@@ -211,11 +211,15 @@ def run_lightning_indexer_smoke(npu_device, *, batch_size=1, seq_len=128):
 def build_model_backed_dsa_inputs(
     device, *, batch_size=1, seq_len=2048, requires_grad=False
 ):
-    args = _build_dsa_args(seq_len)
-    attention = Attention(args).to(device=device, dtype=torch.bfloat16)
+    cfg = _build_attn_config(seq_len)
+    # ``num_total_layers=1`` keeps PostAttention's loss tracker sized for a
+    # single layer (the helper exercises one Attention in isolation).
+    attention = Attention(cfg, num_total_layers=1).to(
+        device=device, dtype=torch.bfloat16
+    )
     attention.eval()
     attention_state = _build_attention_tensors(
-        attention, args, batch_size, seq_len, device
+        attention, cfg, batch_size, seq_len, device
     )
     query, key, value = _build_query_key_tensors(attention, attention_state)
     kernel_inputs = _build_indexer_outputs(attention, attention_state)

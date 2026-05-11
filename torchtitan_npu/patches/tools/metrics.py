@@ -74,13 +74,13 @@ def _patched_metrics_processor_log(
     tps = self.ntokens_since_last_log / (
         time_delta * self.parallel_dims.non_data_parallel_size
     )
-    # model FLOPS utilization
-    # For its definition and calculation, please refer to the PaLM paper:
-    # https://arxiv.org/abs/2204.02311
-    mfu = 100 * self.num_flops_per_token * tps / self.gpu_peak_flops
     tflops = self.num_flops_per_token * tps / 1e12
+    if self.has_quantization:
+        mfu = None
+    else:
+        mfu = 100 * self.num_flops_per_token * tps / self.gpu_peak_flops
 
-    time_end_to_end = time_delta / self.job_config.metrics.log_freq
+    time_end_to_end = time_delta / self.config.log_freq
     time_data_loading = sum(self.data_loading_times) / len(self.data_loading_times)
     time_data_loading_pct = 100 * sum(self.data_loading_times) / time_delta
 
@@ -92,7 +92,6 @@ def _patched_metrics_processor_log(
         "grad_norm": grad_norm,
         "throughput(tps)": tps,
         "tflops": tflops,
-        "mfu(%)": mfu,
         "time_metrics/end_to_end(s)": time_end_to_end,
         "time_metrics/data_loading(s)": time_data_loading,
         "time_metrics/data_loading(%)": time_data_loading_pct,
@@ -103,6 +102,8 @@ def _patched_metrics_processor_log(
         "memory/num_alloc_retries": device_mem_stats.num_alloc_retries,
         "memory/num_ooms": device_mem_stats.num_ooms,
     }
+    if mfu is not None:
+        metrics["mfu(%)"] = mfu
 
     if extra_metrics:
         metrics.update(extra_metrics)
@@ -110,6 +111,7 @@ def _patched_metrics_processor_log(
     self.logger.log(metrics, step)
 
     color = self.color
+    mfu_str = f"{mfu:.2f}%" if mfu is not None else "N/A"
     logger.info(
         f"{color.red}step: {step:2}  "
         f"{color.green}loss: {global_avg_loss:8.5f}  "
@@ -118,7 +120,7 @@ def _patched_metrics_processor_log(
         f"({device_mem_stats.max_reserved_pct:.2f}%)  "
         f"{color.blue}tps: {round(tps):,}  "
         f"{color.cyan}tflops: {tflops:,.2f}  "
-        f"{color.magenta}mfu: {mfu:.2f}%  "
+        f"{color.magenta}mfu: {mfu_str}  "
         f"{color.yellow}elapsed_time_per_step: "
         f"{time_end_to_end:.3f}s{color.reset}"
     )

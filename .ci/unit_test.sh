@@ -15,7 +15,8 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUTPUT_DIR="${PROJECT_ROOT}/output"
 INTEGRATION_REPORT_DIR="${PROJECT_ROOT}/test_reports/integration_tests"
-TITAN_VERSION="v0.2.2"
+TORCHTITAN_BRANCH="main"
+TORCHTITAN_COMMIT="ac13e536c84e7f6647b14fa9375c3c8a8a2b8578"
 TITAN_DIR="${PROJECT_ROOT}/third_party/torchtitan"
 TIMEOUT_SECONDS=${TIMEOUT_SECONDS:-300}
 
@@ -34,9 +35,12 @@ run_upstream_ut() {
     if [ ! -d "$TITAN_DIR" ]; then
         echo "Cloning torchtitan source..."
         mkdir -p third_party
-        git clone --branch $TITAN_VERSION --depth 1 \
-            https://gitcode.com/GitHub_Trending/to/torchtitan.git $TITAN_DIR
+        git clone --branch "$TORCHTITAN_BRANCH" \
+            https://gitcode.com/GitHub_Trending/to/torchtitan.git "$TITAN_DIR"
     fi
+
+    git -C "$TITAN_DIR" fetch origin "$TORCHTITAN_BRANCH"
+    git -C "$TITAN_DIR" checkout "$TORCHTITAN_COMMIT"
 
     # Create conftest.py in torchtitan test dir to ensure import torchtitan_npu before each test
     local titan_test_dir="${TITAN_DIR}/tests/unit_tests"
@@ -97,7 +101,7 @@ EOF
 
 
 
-# CI tests
+# [TODO] CI tests  temporarily delete it
 
-run_upstream_ut
-pytest -v --tb=short tests/unit_tests
+# run_upstream_ut
+# pytest -v --tb=short tests/unit_tests

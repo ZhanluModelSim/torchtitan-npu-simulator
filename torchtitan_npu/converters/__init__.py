@@ -1,18 +1,12 @@
-# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
 
 __all__ = [
     "registry",
-    "register_model_converter",
     "register_npu_converter",
+    "get_npu_converter_config",
     "ConverterRegistry",
     "BaseConverter",
     "NPUConverter",
-    "ParallelizePlanUpdater",
-    "StateDictUpdater",
-    "ModelCustomConfig",
 ]
 
 import importlib
@@ -20,15 +14,14 @@ import pkgutil
 from pathlib import Path
 
 from .base_converter import BaseConverter
-from .model_custom_interface import (
-    ModelCustomConfig,
-    ParallelizePlanUpdater,
-    StateDictUpdater,
-)
 from .npu_converter import NPUConverter
-from .npu_registry import register_model_converter
 
-from .registry import ConverterRegistry, register_npu_converter, registry
+from .registry import (
+    ConverterRegistry,
+    get_npu_converter_config,
+    register_npu_converter,
+    registry,
+)
 
 
 def _auto_search_conveter():

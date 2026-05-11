@@ -6,26 +6,18 @@
 import pytest
 import torch
 
-from torchtitan.models.deepseek_v3.model.args import DeepSeekV3ModelArgs
-from torchtitan.models.deepseek_v3.model.model import (
-    apply_rotary_emb as deepseek_apply_rotary_emb,
-    precompute_freqs_cis as deepseek_precompute_freqs_cis,
-)
-from torchtitan.models.llama3.model.model import (
-    apply_rotary_emb as llama_apply_rotary_emb,
-    precompute_freqs_cis as llama_precompute_freqs_cis,
-)
-from torchtitan.models.qwen3.model.model import (
-    apply_rotary_emb as qwen_apply_rotary_emb,
-    precompute_rope_cache as qwen_precompute_rope_cache,
+from torchtitan.models.common.rope import (
+    apply_rotary_emb_complex as llama_apply_rotary_emb,
+    apply_rotary_emb_cos_sin as qwen_apply_rotary_emb,
+    apply_rotary_emb_single_complex as deepseek_apply_rotary_emb,
 )
 
 from tests.conftest import assert_tensor_finite, stable_randn
 
 from torchtitan_npu.converters.kernels.rope import (
-    npu_apply_rotary_emb_deepseek,
-    npu_apply_rotary_emb_llama,
-    npu_apply_rotary_emb_qwen,
+    npu_apply_rotary_emb_complex as npu_apply_rotary_emb_llama,
+    npu_apply_rotary_emb_cos_sin as npu_apply_rotary_emb_qwen,
+    npu_apply_rotary_emb_single_complex as npu_apply_rotary_emb_deepseek,
 )
 
 pytestmark = pytest.mark.smoke
@@ -85,7 +77,7 @@ def test_rope_qwen(npu_device):
 def test_npu_apply_rotary_emb_llama_precision(npu_device):
     xq = stable_randn(2, 128, 8, 64, dtype=torch.float32, device=npu_device)
     xk = stable_randn(2, 128, 8, 64, dtype=torch.float32, device=npu_device)
-    freqs_cis = llama_precompute_freqs_cis(64, 128).to(npu_device)
+    freqs_cis = _complex_freqs((128, 32), npu_device)
 
     expected_q, expected_k = llama_apply_rotary_emb(xq, xk, freqs_cis)
     actual_q, actual_k = npu_apply_rotary_emb_llama(xq, xk, freqs_cis)
@@ -103,7 +95,7 @@ def test_npu_apply_rotary_emb_llama_precision(npu_device):
 def test_npu_apply_rotary_emb_qwen_precision(npu_device):
     xq = stable_randn(2, 128, 8, 64, dtype=torch.float32, device=npu_device)
     xk = stable_randn(2, 128, 8, 64, dtype=torch.float32, device=npu_device)
-    rope_cache = qwen_precompute_rope_cache(64, 128).to(npu_device)
+    rope_cache = stable_randn(128, 128, dtype=torch.float32, device=npu_device)
 
     expected_q, expected_k = qwen_apply_rotary_emb(xq, xk, rope_cache)
     actual_q, actual_k = npu_apply_rotary_emb_qwen(xq, xk, rope_cache)
@@ -127,8 +119,7 @@ def test_npu_apply_rotary_emb_deepseek_precision(npu_device):
         dtype=torch.float32,
         device=npu_device,
     )
-    model_args = DeepSeekV3ModelArgs(max_seq_len=128, qk_rope_head_dim=64)
-    freqs_cis = deepseek_precompute_freqs_cis(model_args).to(npu_device)
+    freqs_cis = _complex_freqs((128, 32), npu_device)
 
     expected = deepseek_apply_rotary_emb(x, freqs_cis)
     actual = npu_apply_rotary_emb_deepseek(x, freqs_cis)

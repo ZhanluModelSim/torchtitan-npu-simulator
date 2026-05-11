@@ -26,7 +26,9 @@ from torch.distributed._tensor import DTensor
 
 logger = logging.getLogger(__name__)
 
-_original_build_optimizers = torchtitan.components.optimizer.build_optimizers
+_original_build_optimizers = getattr(
+    torchtitan.components.optimizer, "build_optimizers", None
+)
 
 OPTIMIZER_STATE_KEYS = ["exp_avg", "exp_avg_sq", "max_exp_avg_sq"]
 
@@ -420,7 +422,12 @@ def build_optimizers_with_virtual_optimizer(
     return optimizers
 
 
-# Apply final patch
-torchtitan.components.optimizer.build_optimizers = (
-    build_optimizers_with_virtual_optimizer  # type: ignore[assignment]
-)
+if _original_build_optimizers is not None:
+    torchtitan.components.optimizer.build_optimizers = (
+        build_optimizers_with_virtual_optimizer  # type: ignore[assignment]
+    )
+else:
+    logger.warning(
+        "Skipping virtual optimizer patch: build_optimizers is not available "
+        "in current torchtitan.components.optimizer API."
+    )

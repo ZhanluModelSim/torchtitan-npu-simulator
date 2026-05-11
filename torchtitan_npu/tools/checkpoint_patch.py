@@ -336,7 +336,7 @@ def patch_llama4_checkpoint_support():
     from torchtitan.components.checkpoint import CheckpointManager
     from torchtitan.protocols.train_spec import TrainSpec
 
-    from torchtitan_npu.models.llama4.model.state_dict_adapter import (
+    from torchtitan_npu.models.llama4.state_dict_adapter import (
         dcp_load,
         Llama4StateDictAdapterNpu,
     )

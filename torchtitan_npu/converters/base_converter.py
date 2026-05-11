@@ -1,14 +1,10 @@
-# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
 
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from typing import Any
 
 import torch.nn as nn
-from torchtitan.config.job_config import JobConfig
 
 
 class BaseConverter(ABC):
@@ -24,7 +20,7 @@ class BaseConverter(ABC):
         return cls.MODEL_IMPL.get("_default")
 
     @classmethod
-    def is_compatible(cls, job_config: JobConfig, model_name: str) -> bool:
+    def is_compatible(cls, job_config, model_name: str) -> bool:
         if "*" in cls.SUPPORTED_MODELS or model_name in cls.SUPPORTED_MODELS:
             return True
         return False
