@@ -320,21 +320,18 @@ def _build_optimizers_wrapper(
     model_parts, optimizer_config, parallel_dims, ft_manager=None
 ):
     if getattr(optimizer_config, "name", None) == "Muon":
-        # Muon optimizer does not currently support multi-device.
-        is_distributed = torch.distributed.is_initialized()
-        world_size = torch.distributed.get_world_size() if is_distributed else 1
-        if world_size > 1:
-            raise NotImplementedError(
-                "Muon optimizer currently only support single device"
-            )
-        # Muon optimizer does not currently support swap optimizer.
         if getattr(optimizer_config, "swap_optimizer", False):
             raise ValueError(
                 "Muon optimizer does not support swap_optimizer. "
                 "Please set swap_optimizer=false in your config."
             )
+        virtual_allocator = getattr(optimizer_config, "virtual_allocator", False)
         return build_muon_hybrid_optimizers(
-            model_parts, optimizer_config, parallel_dims, ft_manager
+            model_parts,
+            optimizer_config,
+            parallel_dims,
+            ft_manager,
+            virtual_allocator=virtual_allocator,
         )
 
     if getattr(optimizer_config, "swap_optimizer", False):

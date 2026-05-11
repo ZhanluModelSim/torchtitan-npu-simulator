@@ -39,6 +39,10 @@ class MuonOptimizerConfig:
     muon_enable_nesterov: bool = True
     muon_ns_steps: int = 5
     muon_adjust_lr_fn: str | None = None
+    muon_hybrid_ns: bool = False
+    virtual_optimizer: bool = False
+    swap_optimizer: bool = False
+    extra_param_group_split_rules: list[dict] | None = None
     beta1: float = 0.9
     beta2: float = 0.95
     eps: float = 1e-8
@@ -136,3 +140,15 @@ def single_rank_process_group():
     yield
     if dist.is_initialized():
         dist.destroy_process_group()
+
+
+@pytest.fixture
+def cpu_parallel_dims(single_rank_process_group):
+    from unittest.mock import patch
+
+    from tests.testing.parallel_dims import build_parallel_dims
+
+    with patch("torchtitan.distributed.parallel_dims.device_type", "cpu"):
+        pd = build_parallel_dims()
+        pd.build_mesh()
+    return pd

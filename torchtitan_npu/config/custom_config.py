@@ -68,12 +68,21 @@ class Optimizer(BaseOptimizer):
     """Number of Newton-Schulz iteration steps for Muon"""
     muon_ns_steps: int = 5
 
+    """Whether to use hybrid Newton-Schulz (8 primary + 2 secondary steps)"""
+    muon_hybrid_ns: bool = False
+
     """
     Learning rate adjustment function for Muon. Options:
     - None or "original": Use sqrt(max(1, A/B)) ratio (muon_lr is used if specified)
-    - "match_rms_adamw": Use 0.2 * sqrt(max(A, B)) ratio (muon_lr is ignored, uses base lr)
+    - "match_rms_adamw": Use 0.18 * sqrt(max(A, B)) ratio (muon_lr is ignored, uses base lr)
     """
     muon_adjust_lr_fn: Literal["original", "match_rms_adamw"] | None = "match_rms_adamw"
+
+    """Extra parameter group split rules for distributed Muon (list of dicts with str_match + overrides)"""
+    extra_param_group_split_rules: list[dict] | None = None
+
+    """Whether to enable virtual optimizer (swap optimizer states to CPU for Muon)"""
+    virtual_allocator: bool = False
 
 
 @dataclass

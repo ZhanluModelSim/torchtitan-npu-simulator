@@ -29,6 +29,7 @@ def _apply_patches():
         activation_checkpoint,
         hf_datasets,
         loss,
+        lr_scheduler,
     )
 
     # patching context_parallel utils
