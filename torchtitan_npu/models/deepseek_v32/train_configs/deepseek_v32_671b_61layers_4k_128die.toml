@@ -86,7 +86,6 @@ async_mode = "disabled"  # ["disabled", "async", "async_with_pinned_mem]"
 initial_load_path = "/data/model/DeepSeek-V3.2-bf16"
 initial_load_in_hf = true
 # initial_load_in_hf_quantized = true
-load_step = 0
 
 [activation_checkpoint]
 mode = "full"  # ["none", "selective", "full"]

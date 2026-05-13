@@ -84,7 +84,6 @@ async_mode = "disabled"  # ["disabled", "async", "async_with_pinned_mem]"
 initial_load_path = "/path/to/hf-weight"    # [TODO] model weight path
 initial_load_in_hf = true
 initial_load_in_hf_quantized = false
-load_step = 0
 
 [activation_checkpoint]
 mode = "full"  # ["none", "selective", "full"]

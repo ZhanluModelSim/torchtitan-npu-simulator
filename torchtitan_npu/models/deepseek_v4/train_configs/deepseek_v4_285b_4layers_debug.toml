@@ -60,7 +60,6 @@ context_parallel_degree = 1
 [checkpoint]
 enable = false
 folder = "checkpoint"
-load_step = 0
 # initial_load_in_hf = true
 # initial_load_path = "/data/models/DeepSeek-V4-bf16"
 interval = 500
