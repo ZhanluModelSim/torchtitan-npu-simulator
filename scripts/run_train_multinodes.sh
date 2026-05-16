@@ -19,6 +19,8 @@ export HCCL_EXEC_TIMEOUT=7200
 export ACL_DEVICE_SYNC_TIMEOUT=7200
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
+# When model is dsv4 pro, memory is not enough, can set PYTORCH_NPU_ALLOC_CONF as fellow
+# export PYTORCH_NPU_ALLOC_CONF=max_split_size_mb:32,garbage_collection_threshold:0.6
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export CPU_AFFINITY_CONF=1
 export TASK_QUEUE_ENABLE=2

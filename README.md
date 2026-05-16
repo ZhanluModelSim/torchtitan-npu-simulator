@@ -166,7 +166,7 @@ torchtitan-npu/
 System: Atlas 800T A3
 | Model              | Number of NPUs | Precision | GBS | Local BS | Sequence Length | FSDP | TP  | PP  | CP  | EP  | Throughput (tokens/p/s) | MFU |
 | :----------------- | :------------- | :-------- | :-- | :------- | :-------------- | :--- | :-- | :-- | :-- | :-- | :----------- | :-- |
-| [DeepSeek-V4-Flash](https://gitcode.com/cann/torchtitan-npu/blob/master/torchtitan_npu/models/deepseek_v4/train_configs/deepseek_v4_285b_43layers_4k_128die.toml) | 64             | BF16      | 1024  | 1       | 4096            | 128   | 1   | 1   | 1   | 128  | 1100          | 28.78% |
+| [DeepSeek-V4-Flash](https://gitcode.com/cann/torchtitan-npu/blob/master/torchtitan_npu/models/deepseek_v4/train_configs/deepseek_v4_285b_43layers_4k_128die.toml) | 64             | BF16      | 1024  | 1       | 4096            | 128   | 1   | 1   | 1   | 128  | 1056          | 27.67% |
 | [Deepseek-V3.2-671B](https://gitcode.com/cann/torchtitan-npu/blob/master/torchtitan_npu/models/deepseek_v32/train_configs/deepseek_v32_671b_61layers_32k_128die.toml) | 64             | BF16      | 128  | 1       | 32768           | 4    | 4   | 1   | 8  | 64  | 103           | / |
 | [Deepseek-V3.2-671B](https://gitcode.com/cann/torchtitan-npu/blob/master/torchtitan_npu/models/deepseek_v32/train_configs/deepseek_v32_671b_61layers_4k_128die.toml) | 64             | BF16      | 512  | 1        | 4096            | 32   | 4   | 1   | 1   | 64  | 146           | / |
 | [Deepseek-V3-671B](https://gitcode.com/cann/torchtitan-npu/blob/master/torchtitan_npu/models/deepseek_v3/train_configs/deepseek_v3_671b_61layers_4k_128die.toml)   | 64             | BF16      | 1024 | 1       | 4096            | 32   | 4   | 1   | 1   | 128  | 546          | / |
