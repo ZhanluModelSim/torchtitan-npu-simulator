@@ -34,6 +34,42 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T", bound=Optimizer)
 
 
+def _check_build_kwargs(config, kwargs):
+    config_fields = {f.name for f in fields(config)}
+    overlap = config_fields & kwargs.keys()
+    if overlap:
+        raise ValueError(
+            f"build() kwargs {overlap} overlap with config fields. "
+            "Put these values in the Config, not in build() kwargs."
+        )
+
+
+def _base_optimizer_config(config) -> OptimizersContainer.Config:
+    return OptimizersContainer.Config(
+        name=config.name,
+        lr=config.lr,
+        beta1=config.beta1,
+        beta2=config.beta2,
+        eps=config.eps,
+        weight_decay=config.weight_decay,
+        implementation=config.implementation,
+    )
+
+
+def _swap_config_from(config) -> "SwapOptimizersContainer.Config":
+    return SwapOptimizersContainer.Config(
+        name=config.name,
+        lr=config.lr,
+        beta1=config.beta1,
+        beta2=config.beta2,
+        eps=config.eps,
+        weight_decay=config.weight_decay,
+        implementation=config.implementation,
+        swap_optimizer=config.swap_optimizer,
+        swap_optimizer_times=config.swap_optimizer_times,
+    )
+
+
 def get_torch_device():
     return get_device_info()[1]
 
@@ -72,6 +108,12 @@ class SwapOptimizersContainer(OptimizersContainer):
         swap_optimizer_times: int = 16
 
         def build(self, **kwargs):
+            _check_build_kwargs(self, kwargs)
+            if not self.swap_optimizer:
+                return OptimizersContainer(
+                    config=_base_optimizer_config(self),
+                    **kwargs,
+                )
             if self._owner is None:
                 raise NotImplementedError(
                     f"{type(self).__name__} has no owner class. "
@@ -79,13 +121,6 @@ class SwapOptimizersContainer(OptimizersContainer):
                 )
             if not kwargs:
                 return self._owner(config=replace(self))
-            config_fields = {f.name for f in fields(self)}
-            overlap = config_fields & kwargs.keys()
-            if overlap:
-                raise ValueError(
-                    f"build() kwargs {overlap} overlap with config fields. "
-                    "Put these values in the Config, not in build() kwargs."
-                )
             return self._owner(config=replace(self), **kwargs)
 
     def __init__(
@@ -367,8 +402,21 @@ _OWNER_ATTR = "_owner"
 setattr(SwapOptimizersContainer.Config, _OWNER_ATTR, SwapOptimizersContainer)
 
 
+def _build_npu_optimizer_config(self, **kwargs):
+    return _swap_config_from(self).build(**kwargs)
+
+
+def _patch_npu_optimizer_config_build():
+    from torchtitan_npu.config.configs import OptimizerConfig
+
+    OptimizerConfig.build = _build_npu_optimizer_config
+
+
 def patch_optimizer_step():
     """Patch optimizer step functions for swap optimizer support."""
     torch.optim.AdamW.step = swap_optimizer_step
     torch.optim.Adam.step = swap_optimizer_step
     logger.info("[SwapOptimizer] Patched AdamW.step and Adam.step")
+
+
+_patch_npu_optimizer_config_build()

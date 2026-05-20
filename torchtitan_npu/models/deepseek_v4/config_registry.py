@@ -12,6 +12,7 @@ from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
 from torchtitan.protocols.model_converter import ModelConvertersContainer
 
 from torchtitan_npu.config.configs import (
+    OptimizerConfig,
     ParallelismConfig,
     ProfilingConfig,
     TrainerConfig,
@@ -19,7 +20,6 @@ from torchtitan_npu.config.configs import (
 )
 from torchtitan_npu.converters.npu_registry import get_model_converter_config
 from torchtitan_npu.converters.registry import get_npu_converter_config
-from torchtitan_npu.patches.optimizer.swap_optimizer import SwapOptimizersContainer
 
 from . import model_registry
 
@@ -46,7 +46,7 @@ def deepseek_v4_285b_debug_4_layers() -> TrainerConfig:
         ),
         metrics=MetricsProcessor.Config(log_freq=1),
         dataloader=HuggingFaceTextDataLoader.Config(dataset="c4_test"),
-        optimizer=SwapOptimizersContainer.Config(
+        optimizer=OptimizerConfig(
             name="AdamW",
             lr=1e-5,
             eps=1e-6,
@@ -104,7 +104,7 @@ def deepseek_v4_285b_43layers_4k_128die() -> TrainerConfig:
         ),
         metrics=MetricsProcessor.Config(log_freq=1),
         dataloader=HuggingFaceTextDataLoader.Config(dataset="c4_test"),
-        optimizer=SwapOptimizersContainer.Config(
+        optimizer=OptimizerConfig(
             name="AdamW",
             lr=1e-5,
             eps=1e-6,
@@ -168,7 +168,7 @@ def deepseek_v4_smoketest() -> TrainerConfig:
         model_converters=ModelConvertersContainer.Config(converters=[]),
         metrics=MetricsProcessor.Config(log_freq=1),
         dataloader=HuggingFaceTextDataLoader.Config(dataset="c4_test"),
-        optimizer=SwapOptimizersContainer.Config(
+        optimizer=OptimizerConfig(
             name="AdamW",
             lr=1e-5,
             eps=1e-6,

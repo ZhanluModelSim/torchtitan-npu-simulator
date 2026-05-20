@@ -12,13 +12,13 @@ from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
 from torchtitan.protocols.model_converter import ModelConvertersContainer
 
 from torchtitan_npu.config.configs import (
+    OptimizerConfig,
     ParallelismConfig,
     ProfilingConfig,
     TrainerConfig,
     TrainingConfig,
 )
 from torchtitan_npu.converters.npu_registry import get_model_converter_config
-from torchtitan_npu.patches.optimizer.swap_optimizer import SwapOptimizersContainer
 
 from . import model_registry
 
@@ -37,7 +37,7 @@ def deepseek_v3_671b_debug() -> TrainerConfig:
         ),
         metrics=MetricsProcessor.Config(log_freq=1),
         dataloader=HuggingFaceTextDataLoader.Config(dataset="c4_test"),
-        optimizer=SwapOptimizersContainer.Config(
+        optimizer=OptimizerConfig(
             name="AdamW",
             lr=2.2e-4,
             eps=1e-8,
@@ -99,7 +99,7 @@ def deepseek_v3_671b_16die_debug() -> TrainerConfig:
         model_spec=model_registry("671B_debug_16die"),
         metrics=MetricsProcessor.Config(log_freq=10),
         dataloader=HuggingFaceTextDataLoader.Config(dataset="c4_test"),
-        optimizer=SwapOptimizersContainer.Config(
+        optimizer=OptimizerConfig(
             name="AdamW",
             lr=2.2e-4,
             eps=1e-8,
@@ -155,7 +155,7 @@ def deepseek_v3_671b_61layers_4k_128die() -> TrainerConfig:
         model_spec=model_registry("671B_debug_128die"),
         metrics=MetricsProcessor.Config(log_freq=1),
         dataloader=HuggingFaceTextDataLoader.Config(dataset="enwiki-eod"),
-        optimizer=SwapOptimizersContainer.Config(
+        optimizer=OptimizerConfig(
             name="AdamW",
             lr=2.2e-4,
             eps=1e-8,
@@ -212,7 +212,7 @@ def deepseek_v3_smoketest() -> TrainerConfig:
         model_spec=model_registry("671B_debug"),
         metrics=MetricsProcessor.Config(log_freq=1),
         dataloader=HuggingFaceTextDataLoader.Config(dataset="c4_test"),
-        optimizer=SwapOptimizersContainer.Config(
+        optimizer=OptimizerConfig(
             name="AdamW",
             lr=2.2e-4,
             eps=1e-8,
