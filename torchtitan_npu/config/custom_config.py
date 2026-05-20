@@ -95,6 +95,13 @@ class Parallelism(BaseParallelism):
 
     enable_custom_context_parallel: bool = False
 
+    """
+    Load balancer type for context parallelism, defaults to None.
+    Override this due to inconvenience of specifying None in TOML.
+    """
+
+    context_parallel_load_balancer: str | None = None
+
 
 @dataclass
 class Training(BaseTraining):

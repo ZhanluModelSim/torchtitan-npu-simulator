@@ -29,6 +29,7 @@ SIG 例会：[sig-framework-adapter](https://meeting.osinfra.cn/cann?sig=sig-fra
 # 最新消息
 
 ---
+- [May. 2026]: 🚀 **DeepSeek-V4 支持CP序列切分**:基于 ParallelStyle 方式实现 DeepSeek-V4-Flash 模型 64K 序列切分功能支持。
 - [May. 2026]: 🚀 **[DeepSeek-V4-Pro 模型续训练支持](https://gitcode.com/cann/cann-recipes-train/blob/master/llm_pretrain/deepseekv4/README.md)**:基于纯FSDP + 大EP极简切分，使能AutoFuse特性，达成训练入图。
 - [Apr. 2026]: 🚀 **[DeepSeek-V4-Flash 续训练 0day 支持](https://gitcode.com/cann/cann-recipes-train/blob/master/llm_pretrain/deepseekv4/README.md)**:基于纯FSDP + 大EP极简切分，使能AutoFuse特性，达成训练入图，开箱即优。
 - [Apr. 2026]: 🚀 **【重要特性支持】算子自动融合**:基于AscendC AutoFuse的能力，支持torch.compile + Inductor后端的算子自动融合。
