@@ -300,12 +300,13 @@ class SparseLightningIndexerGradKLLossWrapper(torch.autograd.Function):
 
         bsz, slen, *_ = query.shape
         token_scale = 1 / (bsz * slen)
-        grad_scale = grad * token_scale
+        loss_scale = ctx.scale_value
+        grad_scale = grad * token_scale * loss_scale
 
         d_query_index = d_query_index * grad_scale
         d_key_index = d_key_index * grad_scale
         d_weights = d_weights * grad_scale
-        loss = loss * token_scale
+        loss = loss * token_scale * loss_scale
 
         ctx.loss_tracker(loss[0])
         return None, None, d_query_index, d_key_index, d_weights, *([None] * 10)
@@ -361,6 +362,9 @@ def li_loss_adapter(
     attention_masks,
     offset,
 ):
+    if sparse_indices.dtype != torch.int32:
+        sparse_indices = sparse_indices.to(torch.int32)
+
     return npu_sparse_lightning_indexer_grad_kl_loss(
         query,
         key.unsqueeze(2),
