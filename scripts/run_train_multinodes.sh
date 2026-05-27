@@ -9,7 +9,7 @@ ps -ef |grep -i ray |grep -i [name] |grep -v grep |awk '{print $2}' |xargs -t -I
 ps -ef |grep -i vllm |grep -i [name] |grep -v grep |awk '{print $2}' |xargs -t -I {} kill -9 {}
 
 # TODO change to your environment
-source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/cann/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
 # When enabling custom operators, you need to enable the following command
 # source /usr/local/Ascend/vendors/custom_transformer/bin/set_env.bash

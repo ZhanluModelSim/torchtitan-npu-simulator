@@ -7,7 +7,7 @@
 # [TODO]
 # current branch is not stable , please clone torchtitan and checkout ac13e536.
 
-source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/cann/set_env.sh
 source /usr/local/Ascend/cann/opp/vendors/custom_transformer/bin/set_env.bash
 
 NGPU=${NGPU:-"16"}
