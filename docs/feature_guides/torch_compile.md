@@ -37,14 +37,6 @@ export TORCHINDUCTOR_SIZE_ASSERTS=0
 bash run_train.sh
 ```
 
-## 支持范围
-torchtitan-npu 当前支持 DeepSeek-V3 模型的全流程编译。
-其他模型的 Codegen 处于待调试状态，启用 torch.compile时，需要引入补丁 `npu_bypass_triton_codegen` 以跳过 Codegen 流程：
-```toml
-[model]
-converters = [..., "npu_bypass_triton_codegen"]
-```
-
 ## 注意事项
 
 > ⚠️ **修改模型结构后，需要清理缓存重新 compile**
@@ -54,7 +46,4 @@ converters = [..., "npu_bypass_triton_codegen"]
 > ```bash
 > rm -rf /root/.cache
 > rm -rf /tmp/*
-> rm -rf ./torchinductor_root
-> rm -rf ./torch_compile_debug
-> rm -rf .npu_kernels_root
 > ```

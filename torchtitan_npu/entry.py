@@ -32,7 +32,7 @@ if __name__ == "__main__":
     _patch_torchtitan_model_reshape_for_broadcast()
 
     if config.compile.enable:
-        if config.model.name in ("deepseek_v3", "deepseek_v4"):
+        if config.model.name in ("deepseek_v3", "deepseek_v4", "deepseek_v32"):
             if config.model.name == "deepseek_v3":
                 # pyrefly: ignore [missing-import]
                 from torch_npu.op_plugin.meta._meta_registrations import (

@@ -15,11 +15,11 @@ from torch.distributed.tensor import DTensor
 
 logger = logging.getLogger(__name__)
 
+LOSS_SCALE = torch.tensor(1.0)
+
 
 class DSAIndexerLossAutoScaler(torch.autograd.Function):
     """An AutoScaler that triggers the backward pass and scales the grad for DSA indexer loss."""
-
-    main_loss_backward_scale: torch.Tensor | None = None
 
     @staticmethod
     # pyrefly: ignore [bad-override]
@@ -49,30 +49,20 @@ class DSAIndexerLossAutoScaler(torch.autograd.Function):
                                                gradient.
         """
         (loss,) = ctx.saved_tensors
-        if DSAIndexerLossAutoScaler.main_loss_backward_scale is None:
-            DSAIndexerLossAutoScaler.main_loss_backward_scale = torch.tensor(
-                1.0, device=loss.device
-            )
-        dsa_indexer_loss_backward_scale = (
-            DSAIndexerLossAutoScaler.main_loss_backward_scale
-        )
-        scaled_dsa_indexer_loss_grad = (
-            torch.ones_like(loss) * dsa_indexer_loss_backward_scale
-        )
+        LOSS_SCALE.to(device=loss.device)
+        scaled_dsa_indexer_loss_grad = torch.ones_like(loss) * LOSS_SCALE
         return grad_output, scaled_dsa_indexer_loss_grad
 
-    @staticmethod
-    def set_loss_scale(scale: torch.Tensor):
-        """set the scale of the indexer loss.
+    @classmethod
+    def set_loss_scale(cls, scale: torch.Tensor):
+        """Set the scale of the indexer loss.
 
         Args:
             scale (torch.Tensor): The scale value to set. Please ensure that the scale passed in
                                   matches the scale of the main_loss.
         """
-        if DSAIndexerLossAutoScaler.main_loss_backward_scale is None:
-            DSAIndexerLossAutoScaler.main_loss_backward_scale = scale
-        else:
-            DSAIndexerLossAutoScaler.main_loss_backward_scale.copy_(scale)
+        global LOSS_SCALE
+        LOSS_SCALE = scale
 
 
 class DSAIndexerLossLoggingHelper:
