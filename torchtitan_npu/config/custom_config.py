@@ -126,6 +126,8 @@ class Training(BaseTraining):
     """Weight of multi-token prediction loss term"""
     mtp_loss_weight: float = 0.3
 
+    dataset_type: Literal["pretrain", "sft"] = "pretrain"
+
 
 @dataclass
 class Profiling(BaseProfiling):

@@ -57,6 +57,31 @@ else:
     )
 
 
+def patch_build_text_dataloader(
+    dp_world_size,
+    dp_rank,
+    tokenizer,
+    job_config,
+    infinite: bool = True,
+):
+    dataloader = build_text_dataloader
+    if (
+        hasattr(job_config.training, "dataset_type")
+        and job_config.training.dataset_type == "sft"
+    ):
+        if job_config.model.name == "deepseek_v4":
+            from torchtitan_npu.models.deepseek_v4 import (
+                text_datasets as text_datasets_ds4,
+            )
+
+            dataloader = text_datasets_ds4.build_chat_dataloader
+        else:
+            raise ValueError(
+                f"SFT Training is not supported for Model[{job_config.model.name}]"
+            )
+    return dataloader(dp_world_size, dp_rank, tokenizer, job_config, infinite)
+
+
 def mtp_build_text_dataloader(
     dp_world_size,
     dp_rank,
@@ -70,7 +95,7 @@ def mtp_build_text_dataloader(
     ):
         if job_config.model.name in ["deepseek_v32", "deepseek_v4"]:
             job_config.training.seq_len += job_config.training.num_mtp_modules
-            result = build_text_dataloader(
+            result = patch_build_text_dataloader(
                 dp_world_size, dp_rank, tokenizer, job_config, infinite
             )
             job_config.training.seq_len -= job_config.training.num_mtp_modules
@@ -79,7 +104,7 @@ def mtp_build_text_dataloader(
                 "Multi Token Prediction Module only can be used for deepseek_v32 and deepseek_v4 model now!"
             )
     else:
-        result = build_text_dataloader(
+        result = patch_build_text_dataloader(
             dp_world_size, dp_rank, tokenizer, job_config, infinite
         )
     return result
