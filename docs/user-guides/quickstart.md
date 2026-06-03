@@ -5,7 +5,7 @@ torchtitan-npu。
 
 ## 数据准备
 
-1. 下载 Tokenizer [（以 DeepSeekV3.2 网络为例）](https://huggingface.co/deepseek-ai/DeepSeek-V3.2/tree/main)。
+1. 准备 Tokenizer [（以 DeepSeekV3.2 网络为例）](https://huggingface.co/deepseek-ai/DeepSeek-V3.2/tree/main)。
 
 新建 "deepseekv3.2-tokenizer" 目录，将 `tokenizer.json` 和 `tokenizer_config.json` 文件下载至该目录。
 
@@ -22,6 +22,12 @@ python scripts/download_hf_assets.py --repo_id deepseek-ai/DeepSeek-V3.2 --asset
 
 ```python
 hf_assets_path="./deepseekv3.2-tokenizer",
+```
+
+测试场景可直接使用项目预置在 `tests/assets/tokenizer/deepseekv3_tokenizer/` 的 tokenizer，无需重复下载：
+
+```bash
+bash scripts/run_train.sh --hf_assets_path ./tests/assets/tokenizer/deepseekv3_tokenizer
 ```
 
 2. 下载数据集。以 [enwiki 数据集](https://huggingface.co/datasets/lsb/enwiki20230101)
