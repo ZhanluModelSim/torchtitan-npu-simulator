@@ -236,7 +236,8 @@ class RMSNorm(TorchTitanRMSNorm):
         dtype = x.dtype
         x = x.float()
         var = x.pow(2).mean(-1, keepdim=True)
-        x = x * torch.rsqrt(var + self.eps)  # pyrefly: ignore [unsupported-operation]
+        inv_rms = torch.rsqrt(var + self.eps)  # pyrefly: ignore [unsupported-operation]
+        x = x * inv_rms
         return (self.weight * x).to(dtype)
 
     def reset_parameters(self):
@@ -786,12 +787,10 @@ class TransformerBlockV32(DeepSeekV3TransformerBlock):
         Returns:
             torch.Tensor: Output tensor with the same shape as the input.
         """
-        if residual is None:
-            x, residual = self.attention_norm(x), x
-        else:
+        if residual is not None:
             x = x + residual
-            residual = x
-            x = self.attention_norm(x)
+        residual = x
+        x = self.attention_norm(x)
         x = self.attention(x, freqs_cis, attention_masks, self.layer_id, positions)
         x = x + residual
         residual = x

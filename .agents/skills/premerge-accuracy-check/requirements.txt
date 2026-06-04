@@ -1,0 +1,5 @@
+# premerge-accuracy-check skill dependencies
+# Install: pip install -r .agents/skills/premerge-accuracy-check/requirements.txt
+matplotlib
+numpy
+weasyprint  # PDF generation (requires system fonts-noto-cjk for Chinese output)

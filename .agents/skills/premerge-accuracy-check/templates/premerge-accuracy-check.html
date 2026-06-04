@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>数值精度对比报告</title>
+<style>
+  @page { size: A4; margin: 2cm; }
+  body {
+    font-family: "Noto Sans CJK SC", "Noto Sans SC", sans-serif;
+    color: #1a1a1a;
+    line-height: 1.6;
+    max-width: 800px;
+    margin: 0 auto;
+  }
+  h1 {
+    text-align: center;
+    font-size: 22pt;
+    border-bottom: 2px solid #2563eb;
+    padding-bottom: 12px;
+    margin-bottom: 8px;
+  }
+  .subtitle {
+    text-align: center;
+    color: #666;
+    font-size: 10pt;
+    margin-bottom: 24px;
+  }
+  h2 {
+    font-size: 14pt;
+    border-bottom: 1px solid #ddd;
+    padding-bottom: 4px;
+    margin-top: 28px;
+    color: #2563eb;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 12px 0;
+    font-size: 9pt;
+  }
+  th, td {
+    border: 1px solid #ddd;
+    padding: 6px 10px;
+    text-align: left;
+  }
+  th {
+    background: #f0f4ff;
+    font-weight: 600;
+  }
+  tr:nth-child(even) { background: #fafafa; }
+  .metric-pass { color: #16a34a; font-weight: bold; }
+  .metric-fail { color: #dc2626; font-weight: bold; }
+  .verdict {
+    padding: 16px;
+    border-radius: 6px;
+    margin: 16px 0;
+    font-size: 12pt;
+    font-weight: bold;
+    text-align: center;
+  }
+  .verdict-pass { background: #dcfce7; border: 2px solid #16a34a; color: #16a34a; }
+  .verdict-fail { background: #fef2f2; border: 2px solid #dc2626; color: #dc2626; }
+  .plot-container {
+    text-align: center;
+    margin: 16px 0;
+    page-break-inside: avoid;
+  }
+  .plot-container img {
+    max-width: 640px;
+    width: 100%;
+    height: auto;
+  }
+  .footer {
+    text-align: center;
+    color: #999;
+    font-size: 8pt;
+    margin-top: 32px;
+    border-top: 1px solid #eee;
+    padding-top: 12px;
+  }
+  .summary-grid {
+    margin: 12px 0;
+  }
+  .summary-grid table {
+    width: auto;
+    border: none;
+  }
+  .summary-grid th {
+    background: #f0f4ff;
+    font-size: 8pt;
+    padding: 5px 10px;
+    text-align: center;
+  }
+  .summary-grid td {
+    font-size: 10pt;
+    font-weight: bold;
+    text-align: center;
+    padding: 5px 10px;
+    background: #f8fafc;
+  }
+  .repro-step { margin: 8px 0; }
+  .repro-step h4 { font-size: 10pt; color: #333; margin: 8px 0 4px; }
+  .repro-step pre { background: #f5f5f5; border: 1px solid #e0e0e0; border-radius: 4px; padding: 8px 12px; font-size: 8pt; overflow-x: auto; white-space: pre-wrap; word-break: break-all; }
+  .repro-step p { font-size: 9pt; color: #555; margin: 2px 0; }
+</style>
+</head>
+<body>
+
+<h1>数值精度对比报告</h1>
+<p class="subtitle">生成时间：{{timestamp}}</p>
+
+<h2>1. 环境信息</h2>
+<table>
+  <tr><th style="width: 160px;">项目</th><th>值</th></tr>
+  <tr><td>NPU 数量</td><td>{{npu_count}}</td></tr>
+  <tr><td>CANN 版本</td><td>{{cann_version}}</td></tr>
+  <tr><td>torch 版本</td><td>{{torch_version}}</td></tr>
+  <tr><td>torch_npu 版本</td><td>{{torch_npu_version}}</td></tr>
+</table>
+
+<h2>2. 运行参数</h2>
+<table>
+  <tr><th style="width: 160px;">参数</th><th>基线（分支 A）</th><th>候选（分支 B）</th></tr>
+  <tr><td>分支</td><td>{{baseline_branch}}</td><td>{{candidate_branch}}</td></tr>
+  <tr><td>Commit</td><td><code>{{baseline_commit}}</code></td><td><code>{{candidate_commit}}</code></td></tr>
+  <tr><td>模型</td><td colspan="2">{{model_name}}</td></tr>
+  <tr><td>Config</td><td colspan="2">{{config_name}}</td></tr>
+  <tr><td>训练步数</td><td colspan="2">{{training_steps}}</td></tr>
+  <tr><td>并行策略</td><td colspan="2">{{parallelism_summary}}</td></tr>
+  <tr><td>确定性设置</td><td colspan="2">seed=42, deterministic=True</td></tr>
+</table>
+
+<h2>3. 分支变更摘要</h2>
+<p style="font-size: 9pt; color: #666;">候选分支相对于基线分支的代码变更总结。以下变更为本次精度验证的测试对象。</p>
+<p style="font-size: 10pt; line-height: 1.8;">{{branch_diff}}</p>
+
+<h2>4. 复现步骤</h2>
+<p style="font-size: 9pt; color: #666;">以下步骤从零开始复现本次精度对比。每条命令自包含，可独立复制粘贴执行。</p>
+
+<div class="repro-step">
+  <h4>4.1 准备代码</h4>
+  <pre>git clone {{repo_url}} && cd torchtitan-npu
+git checkout {{baseline_commit}}  # 基线：{{baseline_branch}}
+
+# 将 infra_files.tar.gz（邮件附件）放到仓库根目录并解压：
+tar xzf ./infra_files.tar.gz
+
+# infra_files.tar.gz 内容说明：
+{{#infra_steps}}{{.}}
+{{/infra_steps}}</pre>
+</div>
+
+{{#training_runs}}
+<div class="repro-step">
+  <h4>{{label}}</h4>
+  <pre>git checkout {{branch}}  # {{label}}
+# 重新解压 infra 文件包（同 4.1）
+tar xzf ./infra_files.tar.gz
+
+{{command}}</pre>
+  <p>训练日志：<code>{{train_log}}</code></p>
+</div>
+{{/training_runs}}
+
+<div class="repro-step">
+  <h4>3.{{compare_section_num}} 精度对比</h4>
+  {{#compare_commands}}
+  <p><strong>{{label}}：</strong></p>
+  <pre>{{command}}</pre>
+  {{/compare_commands}}
+</div>
+
+<div class="repro-step">
+  <h4>3.{{results_section_num}} 结果文件</h4>
+  <p>所有输出文件位于 <code>./numerical_report/</code> 目录：</p>
+  <ul>
+    <li><code>report.json</code> — 结构化对比数据</li>
+    <li><code>diff_summary.csv</code> — 逐 step 差异明细</li>
+    <li><code>loss_comparison.png</code> — loss 曲线叠加图</li>
+    <li><code>grad_norm_comparison.png</code> — grad_norm 曲线叠加图</li>
+    <li><code>numerical_stability_report.pdf</code> — 本报告</li>
+    <li><code>*.log</code> — 各次训练的完整 stdout/stderr 日志</li>
+  </ul>
+</div>
+
+{{#cases}}
+<h2>5.{{case_index}}. Loss 对比 — {{label}}</h2>
+<div class="plot-container">
+  <img src="{{loss_plot_path}}" alt="Loss 曲线对比 — {{label}}">
+</div>
+
+<div class="summary-grid">
+  <table>
+    <tr>
+      <th>最大绝对误差</th>
+      <th>平均绝对误差</th>
+      <th>最大相对误差</th>
+      <th>共同步数</th>
+    </tr>
+    <tr>
+      <td class="{{loss_max_abs_diff_class}}">{{loss_max_abs_diff}}</td>
+      <td>{{loss_mean_abs_diff}}</td>
+      <td>{{loss_max_rel_diff}}</td>
+      <td>{{loss_common_steps}}</td>
+    </tr>
+  </table>
+</div>
+
+<h2>6.{{case_index}}. Grad Norm 对比 — {{label}}</h2>
+<div class="plot-container">
+  <img src="{{grad_norm_plot_path}}" alt="Grad Norm 对比 — {{label}}">
+</div>
+
+<div class="summary-grid">
+  <table>
+    <tr>
+      <th>最大绝对误差</th>
+      <th>平均绝对误差</th>
+      <th>最大相对误差</th>
+      <th>共同步数</th>
+    </tr>
+    <tr>
+      <td class="{{grad_norm_max_abs_diff_class}}">{{grad_norm_max_abs_diff}}</td>
+      <td>{{grad_norm_mean_abs_diff}}</td>
+      <td>{{grad_norm_max_rel_diff}}</td>
+      <td>{{grad_norm_common_steps}}</td>
+    </tr>
+  </table>
+</div>
+{{/cases}}
+
+<h2>{{diff_section_num}}. 差异汇总</h2>
+<table>
+  <tr><th>Case</th><th>指标</th><th>最大绝对误差</th><th>平均绝对误差</th><th>最大相对误差</th><th>平均相对误差</th><th>判定</th></tr>
+  {{#cases}}
+  <tr>
+    <td rowspan="2">{{label}}</td>
+    <td>loss</td>
+    <td>{{loss_max_abs_diff}}</td>
+    <td>{{loss_mean_abs_diff}}</td>
+    <td>{{loss_max_rel_diff}}</td>
+    <td>{{loss_mean_rel_diff}}</td>
+    <td class="{{loss_pass_class}}">{{loss_pass_text}}</td>
+  </tr>
+  <tr>
+    <td>grad_norm</td>
+    <td>{{grad_norm_max_abs_diff}}</td>
+    <td>{{grad_norm_mean_abs_diff}}</td>
+    <td>{{grad_norm_max_rel_diff}}</td>
+    <td>{{grad_norm_mean_rel_diff}}</td>
+    <td class="{{grad_norm_pass_class}}">{{grad_norm_pass_text}}</td>
+  </tr>
+  {{/cases}}
+</table>
+
+<p style="font-size: 9pt; color: #666; margin-top: 8px;">
+  判定标准：最大绝对误差 ≤ {{tolerance}} 为通过。
+</p>
+
+<h2>{{verdict_section_num}}. 结论</h2>
+
+<div class="verdict {{verdict_class}}">
+  {{verdict_text}}
+</div>
+
+{{#failed_details}}
+<h3>超标详情</h3>
+<table>
+  <tr><th>Case</th><th>指标</th><th>首次超标 Step</th><th>差值</th></tr>
+  {{#failed_items}}
+  <tr>
+    <td>{{case}}</td>
+    <td>{{tag}}</td>
+    <td>{{step}}</td>
+    <td>{{diff}}</td>
+  </tr>
+  {{/failed_items}}
+</table>
+{{/failed_details}}
+
+<h3>建议</h3>
+<ul>
+  {{#passed}}
+  <li>代码变更未引入数值精度回退，可以合并。</li>
+  <li>建议在合并前完成其他 PR 检查项（lint、测试、PR 描述）。</li>
+  {{/passed}}
+  {{#failed}}
+  <li>代码变更引入了数值精度差异，需要调查根因。</li>
+  <li>优先检查：dtype 变化、算子替换、并行策略变更、浮点运算顺序变化。</li>
+  <li>进一步诊断：使用 <code>accuracy-debug</code> 技能定位根因。</li>
+  <li>修复后重新运行本报告验证。</li>
+  {{/failed}}
+</ul>
+<p style="font-size: 9pt; color: #666;">完整训练 loss/grad_norm 数值和原始日志参见附件：<code>diff_summary.csv</code>（逐 step 明细）、<code>*_train.log</code>（训练 stdout/stderr 日志）。</p>
+
+<div class="footer">
+  本报告由 torchtitan-npu premerge-accuracy-check 技能自动生成<br>
+  基准：torchtitan-npu 数值验证规范（AGENTS.md）
+</div>
+
+</body>
+</html>
