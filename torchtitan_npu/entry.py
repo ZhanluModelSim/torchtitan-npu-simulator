@@ -16,6 +16,11 @@ import torchtitan_npu  # noqa: F401
 from torchtitan_npu.converters.registry import has_npu_converter
 from torchtitan_npu.distributed.determinism import setup_npu_deterministic_env
 
+from torchtitan_npu.train import (
+    _patch_for_garbage_collection_run,
+    _patch_for_parallel_dims_build_mesh,
+)
+
 _SKIP_FLEX_TO_SDPA_REWRITE_MODELS = {"vlm"}
 _INDUCTOR_NPU_EXT_MODELS = {"deepseek_v3", "deepseek_v4", "deepseek_v32", "vlm"}
 _BYPASS_TRITON_CODEGEN = "npu_bypass_triton_codegen"
@@ -45,6 +50,12 @@ def main() -> None:
     setup_npu_deterministic_env(config.debug)  # pyrefly: ignore [missing-attribute]
 
     trainer = None
+
+    comm_mode = os.getenv("COMM_MODE", None)
+    if comm_mode not in ("fake_backend", "local_tensor"):
+        # only when COMM_MODE is not set, patch is apply
+        _patch_for_garbage_collection_run()
+        _patch_for_parallel_dims_build_mesh()
 
     model_name = (
         config.model_spec.name  # pyrefly: ignore [missing-attribute]
