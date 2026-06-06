@@ -16,8 +16,9 @@ torch.compile 是 PyTorch 2.0 的核心特性。通过 JIT （即时编译），
 inductor_npu_ext 需要从源码安装。在运行环境内执行以下命令：
 ```bash
 git clone https://gitcode.com/Ascend/torchair.git
-cd torchair/experimental/_inductor_npu_ext/
-pip3 install -e ./python/
+cd torchair
+git checkout 3c9418c2
+pip3 install -e experimental/_inductor_npu_ext/python/
 cd -
 ```
 
@@ -45,5 +46,5 @@ bash run_train.sh
 >
 > ```bash
 > rm -rf /root/.cache
-> rm -rf /tmp/*
+> rm -rf /tmp/* /tmp/.[!.]*
 > ```
