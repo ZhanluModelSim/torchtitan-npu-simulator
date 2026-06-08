@@ -63,7 +63,7 @@ OverrideDefinitions(
 #### 新增测试用例步骤
 
 1. 打开 `tests/smoke_tests/integration_test.py`
-2. 在 `generate_smoke_tests()` 函数的 `smoke_cases` 列表中添加新配置：
+2. 在 `generate_smoke_tests()` 中，按用例类型将新配置添加到对应的分组函数（`_fake_backend_tests()` / `_base_tests()` / `_tp_tests()` / `_ep_tests()` / `_checkpoint_tests()`）的返回列表中（例如下面的 TP 用例加到 `_tp_tests()`）：
 ```python
 OverrideDefinitions(
     [
