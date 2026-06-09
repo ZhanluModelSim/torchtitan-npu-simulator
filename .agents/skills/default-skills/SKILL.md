@@ -1,31 +1,39 @@
 ---
 name: default-skills
-description: "用于安装或更新 torchtitan-npu 项目默认依赖的远程 GitCode skills（gitcode-pr、gitcode-pipeline）；仅当用户提到缺失/安装/更新这些 skills，或创建/推送 PR、按本仓 PR 模板生成描述、查看 PR 改动/评论、触发/查看/等待 GitCode CI pipeline 时发现本地缺少对应 skill 时使用。已安装时直接使用 gitcode-pr 或 gitcode-pipeline。"
+description: "用于安装或更新 torchtitan-npu 项目依赖的远程 skills；默认集为 GitCode 的 gitcode-pr、gitcode-pipeline，并支持按需安装 cann-operator-env-config（CANN 环境配置，来自 GitHub Ascend 仓，仅搭环境时需要）。仅当用户提到缺失/安装/更新这些 skills，或创建/推送 PR、按本仓 PR 模板生成描述、查看 PR 改动/评论、触发/查看/等待 GitCode CI pipeline、需要 CANN 环境配置 skill 时发现本地缺少对应 skill 时使用。已安装时直接使用对应 skill。"
 ---
 
-# 默认 GitCode Skills
+# 远程 Skills 安装
 
-本 skill 只管理通用远程 GitCode 工具；torchtitan-npu 专属 skills 仍维护在 `.agents/skills/`。
+本 skill 管理需要从外部仓库拉取的远程工具；torchtitan-npu 专属 skills 仍维护在 `.agents/skills/`。
 
-默认安装：
+默认集：
 
 - `gitcode-pr`
 - `gitcode-pipeline`
 
+按需安装：
+
+- `cann-operator-env-config`：CANN 环境配置 skill，由 `torchtitan-npu-env-setup` 在搭环境时触发安装。
+
 ## 安装流程
 
-1. 读取 `.agents/skills/default-skills/scripts/install-default-skills.sh`，确认 `DEFAULT_SKILLS` 列表。
+脚本支持按名安装：不带参数装默认集，带 skill 名则按需安装对应 skill（源仓库由脚本内 `skill_repo_url` 映射决定）。
+
+1. 读取 `.agents/skills/default-skills/scripts/install-default-skills.sh`，确认 `DEFAULT_SKILLS` 列表与 `skill_repo_url` 映射。
 2. 执行安装脚本：
 
 ```bash
+# 默认集（gitcode-pr、gitcode-pipeline）
 bash .agents/skills/default-skills/scripts/install-default-skills.sh
+
+# 按需安装（仅搭环境时）
+bash .agents/skills/default-skills/scripts/install-default-skills.sh cann-operator-env-config
 ```
 
-3. 检查以下结果：
-   - `.agents/skills/_remote/gitcode-pr/`
-   - `.agents/skills/_remote/gitcode-pipeline/`
-   - `.agents/skills/gitcode-pr -> _remote/gitcode-pr`
-   - `.agents/skills/gitcode-pipeline -> _remote/gitcode-pipeline`
+3. 检查以下结果（按实际安装的 skill 对应）：
+   - `.agents/skills/_remote/<skill>/`
+   - `.agents/skills/<skill> -> _remote/<skill>`
 4. 若 agent 侧入口未刷新，运行：
 
 ```bash

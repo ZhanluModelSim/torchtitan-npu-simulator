@@ -63,3 +63,4 @@ AGENTS.md
 .agents/skills/_remote/
 .agents/skills/gitcode-pr
 .agents/skills/gitcode-pipeline
+.agents/skills/cann-operator-env-config

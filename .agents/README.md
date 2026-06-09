@@ -13,3 +13,4 @@
 | `training-log-visualization` | 训练日志指标提取与 loss/grad_norm 曲线绘制，支持双日志对比 |
 | `torchtitan-npu-code-reviewer` | 本仓代码审查与 codecheck 失败定位 |
 | `default-skills` | 安装 GitCode PR 和 pipeline 等远程默认 skills |
+| `torchtitan-npu-env-setup` | 当开发者需要在 Ascend NPU 上按 torchtitan-npu 官方安装文档完成环境搭建，或排查安装步骤不一致导致的环境问题时使用。 |
