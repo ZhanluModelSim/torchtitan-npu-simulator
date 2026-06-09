@@ -59,7 +59,7 @@ tensor_parallel_degree = 1
 enable_async_tensor_parallel = false
 pipeline_parallel_degree = 1
 pipeline_parallel_schedule = "Interleaved1F1B"
-expert_parallel_degree = 128
+expert_parallel_degree = 64
 expert_tensor_parallel_degree = 1
 context_parallel_degree = 16
 
