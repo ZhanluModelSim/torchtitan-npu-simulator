@@ -2,6 +2,7 @@ torchtitan==0.2.2
 torch==2.10.0
 torch_npu==2.10.0
 pybind11
+ninja
 --extra-index-url https://triton-ascend.osinfra.cn/pypi/simple
 triton-ascend==3.2.1
 scipy
