@@ -182,8 +182,8 @@ def _split_w13_dtensor(w13: DTensor) -> tuple[DTensor, DTensor]:
     """split DTensor"""
     local_tensor = w13.to_local()
     chunks = torch.chunk(local_tensor, 2, dim=1)
-    local_w1 = chunks[0].clone()
-    local_w3 = chunks[1].clone()
+    local_w1 = chunks[0]
+    local_w3 = chunks[1]
     del chunks, local_tensor
     return (
         DTensor.from_local(
@@ -203,41 +203,10 @@ def _split_w13_for_mapping(state_dict: dict[str, Any]) -> dict[str, Any]:
         if ".moe.experts.w13" in key:
             base_key = key.replace(".w13", "")
 
-            # Create placeholders w1 and w3
-            # For DTensor, the shape needs to be adjusted.
             if isinstance(value, DTensor):
-
-                shape = value.shape
-                new_shape = (shape[0], shape[1] // 2, shape[2])
-
-                from torch.distributed.tensor import zeros as dt_zeros
-
-                w1 = dt_zeros(
-                    new_shape,
-                    device_mesh=value.device_mesh,
-                    placements=value.placements,
-                )
-                w3 = dt_zeros(
-                    new_shape,
-                    device_mesh=value.device_mesh,
-                    placements=value.placements,
-                )
+                w1, w3 = _split_w13_dtensor(value)
             else:
-                half = value.shape[1] // 2
-                w1 = torch.empty(
-                    value.shape[0],
-                    half,
-                    value.shape[2],
-                    dtype=value.dtype,
-                    device=value.device,
-                )
-                w3 = torch.empty(
-                    value.shape[0],
-                    half,
-                    value.shape[2],
-                    dtype=value.dtype,
-                    device=value.device,
-                )
+                w1, w3 = torch.chunk(value, 2, dim=1)
 
             result[base_key + ".w1"] = w1
             result[base_key + ".w3"] = w3
