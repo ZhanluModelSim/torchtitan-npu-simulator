@@ -21,6 +21,7 @@ from torchtitan_npu.converters.model_custom_interface import (
     ModelCustomConverter,
 )
 from torchtitan_npu.converters.registry import register_model_converter
+from torchtitan_npu.distributed.context_parallel import register_cp_mask_handler
 from torchtitan_npu.models.common import dsa_indexer_loss
 from torchtitan_npu.models.common.dsa_indexer_loss import DSAIndexerLossLoggingHelper
 from torchtitan_npu.models.deepseek_v4.model import (
@@ -47,6 +48,10 @@ class DeepSeekV4SMLAAttentionMasks(NamedTuple):
     cmp_residual_kv: dict[int, torch.Tensor]
     batch_size: int
     seq_len: int
+    # Per-rank q/k lengths under CP (q == local_s, k == (cp_rank + 1) * local_s);
+    # both equal ``seq_len`` without CP. See ``_smla_cp_mask_handler``.
+    q_seq_len: int = -1
+    kv_seq_len: int = -1
 
 
 class _SMLAAttentionConfig(NamedTuple):
@@ -109,7 +114,66 @@ def build_smla_attention_masks(
         },
         batch_size=batch_size,
         seq_len=seq_len,
+        q_seq_len=seq_len,
+        kv_seq_len=seq_len,
     )
+
+
+def _cp_smla_seq_lengths(seq_len: int, cp_degree: int, cp_rank: int) -> tuple[int, int]:
+    """Per-rank (query, key) sequence lengths under DeepSeek-V4 Context Parallel.
+
+    Mirrors ``CompressorAttentionCP._post_hook``: rank ``r`` has ``local_s =
+    seq_len // cp_degree`` query tokens and causally attends ``(r + 1) *
+    local_s`` keys. ``cp_degree == 1`` is the off-CP identity.
+    """
+    if cp_degree <= 1:
+        return seq_len, seq_len
+    if seq_len % cp_degree != 0:
+        raise ValueError(
+            f"DeepSeek-V4 SMLA+CP requires seq_len ({seq_len}) divisible by "
+            f"cp_degree ({cp_degree})."
+        )
+    local_s = seq_len // cp_degree
+    return local_s, (cp_rank + 1) * local_s
+
+
+def _smla_cp_mask_handler(attention_masks, cp_mesh):
+    """CP mask handler for DeepSeek-V4 SMLA varlen metadata.
+
+    SMLA masks are built before CP sharding, so they are sized to the full
+    ``seq_len``. Resize them to this rank's per-rank shapes and return them (so
+    ``cp_shard`` skips sequence-sharding); return ``None`` for other mask types.
+    """
+    if not isinstance(attention_masks, DeepSeekV4SMLAAttentionMasks):
+        return None
+    masks = attention_masks
+    cp_degree = cp_mesh.size()
+    if cp_degree <= 1:
+        return masks
+    q_len, kv_len = _cp_smla_seq_lengths(
+        masks.seq_len, cp_degree, cp_mesh.get_local_rank()
+    )
+    device = masks.actual_seq_qlen.device
+    batch_size = masks.batch_size
+    return masks._replace(
+        actual_seq_qlen=torch.full(
+            (batch_size,), q_len, dtype=torch.int32, device=device
+        ),
+        actual_seq_klen=torch.full(
+            (batch_size,), kv_len, dtype=torch.int32, device=device
+        ),
+        cmp_residual_kv={
+            ratio: torch.full(
+                (batch_size,), kv_len % ratio, dtype=torch.int32, device=device
+            )
+            for ratio in masks.cmp_residual_kv
+        },
+        q_seq_len=q_len,
+        kv_seq_len=kv_len,
+    )
+
+
+register_cp_mask_handler(_smla_cp_mask_handler)
 
 
 def _smla_get_attention_masks(
@@ -161,6 +225,9 @@ class SMLAMetadataBuildContext(NamedTuple):
     batch_size: int
     seq_len: int
     model_args: Any
+    # Per-rank query/key lengths under CP (== seq_len when CP is off).
+    q_seq_len: int = -1
+    kv_seq_len: int = -1
 
 
 class SMLAMetadataCache:
@@ -187,6 +254,8 @@ class SMLAMetadataCache:
                 batch_size=attention_masks.batch_size,
                 seq_len=attention_masks.seq_len,
                 model_args=self.model_args,
+                q_seq_len=attention_masks.q_seq_len,
+                kv_seq_len=attention_masks.kv_seq_len,
             )
             self._op_metadata[key] = builder(context, cmp_ratio)
         return self._op_metadata[key]
@@ -317,8 +386,8 @@ def _sparse_attention_metadata_kwargs(
     model_args = context.model_args
     return {
         "batch_size": context.batch_size,
-        "max_seqlen_q": context.seq_len,
-        "max_seqlen_kv": context.seq_len,
+        "max_seqlen_q": context.q_seq_len,
+        "max_seqlen_kv": context.kv_seq_len,
         "num_heads_q": model_args.n_heads,
         "num_heads_kv": 1,
         "head_dim": model_args.head_dim,
@@ -989,8 +1058,8 @@ class SparseFlashMLA(torch.autograd.Function):
         model_args = context.model_args
         return torch_npu.npu_sparse_lightning_indexer_klloss_grad_metadata(
             batch_size=context.batch_size,
-            max_seqlen_q=context.seq_len,
-            max_seqlen_k=context.seq_len,
+            max_seqlen_q=context.q_seq_len,
+            max_seqlen_k=context.kv_seq_len,
             num_heads_q=model_args.n_heads,
             num_heads_k=1,
             head_dim=model_args.head_dim,

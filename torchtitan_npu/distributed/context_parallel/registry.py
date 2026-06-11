@@ -12,6 +12,7 @@ Unmatched modules raise ``NotImplementedError``.
 """
 
 from collections.abc import Callable, Sequence
+from typing import Any
 
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
@@ -20,6 +21,11 @@ from torchtitan.tools.logging import logger
 _cp_strategies: list[
     tuple[Callable[[nn.Module], bool], Callable[[nn.Module, DeviceMesh], None]]
 ] = []
+
+# Handlers for attention-mask types that upstream ``cp_shard`` cannot
+# sequence-shard (e.g. DeepSeek-V4 SMLA varlen metadata). See
+# ``register_cp_mask_handler`` / ``adjust_cp_mask``.
+_cp_mask_handlers: list[Callable[[Any, DeviceMesh], Any | None]] = []
 
 
 def register_cp_strategy(
@@ -33,6 +39,35 @@ def register_cp_strategy(
         applier: Receives (module, cp_mesh), applies the CP parallelization.
     """
     _cp_strategies.append((detector, applier))
+
+
+def register_cp_mask_handler(
+    handler: Callable[[Any, DeviceMesh], Any | None],
+) -> None:
+    """Register a Context-Parallel attention-mask handler.
+
+    Some attention backends carry their CP metadata as a custom object that
+    upstream ``cp_shard`` cannot sequence-shard. A handler receives
+    ``(attention_masks, cp_mesh)`` and returns the per-rank-adjusted masks if it
+    owns this mask type, or ``None`` to defer to the next handler. This keeps
+    backend-specific logic out of the generic ``cp_shard`` patch.
+    """
+    _cp_mask_handlers.append(handler)
+
+
+def adjust_cp_mask(attention_masks: Any, cp_mesh: DeviceMesh) -> tuple[bool, Any]:
+    """Dispatch ``attention_masks`` to the registered CP mask handlers.
+
+    Returns ``(handled, masks)``. ``handled is True`` means a handler owns this
+    mask type: the masks must NOT be sequence-sharded and ``masks`` is the
+    per-rank replacement for this CP rank. Otherwise the masks are returned
+    unchanged for normal upstream handling.
+    """
+    for handler in _cp_mask_handlers:
+        adjusted = handler(attention_masks, cp_mesh)
+        if adjusted is not None:
+            return True, adjusted
+    return False, attention_masks
 
 
 def apply_cp_to_attention_module(

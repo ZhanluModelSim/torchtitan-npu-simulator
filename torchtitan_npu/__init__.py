@@ -53,7 +53,7 @@ def _apply_patches():
     # module injection: register NPU-only model variants
     from .models import deepseek_v32, deepseek_v4, vlm  # noqa: F401
 
-    from .patches.distributed import utils  # noqa: F401
+    from .patches.distributed import cp_shard_mask, utils  # noqa: F401
 
     # patching step timing
     from .patches.tools import metrics  # noqa: F401
