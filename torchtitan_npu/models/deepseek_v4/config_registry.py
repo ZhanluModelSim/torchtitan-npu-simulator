@@ -6,7 +6,12 @@
 
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import MetricsProcessor
-from torchtitan.config import ActivationCheckpointConfig, CompileConfig, DebugConfig
+from torchtitan.config import (
+    ActivationCheckpointConfig,
+    CommConfig,
+    CompileConfig,
+    DebugConfig,
+)
 from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
 from torchtitan.protocols.model_converter import ModelConvertersContainer
 
@@ -99,6 +104,7 @@ def deepseek_v4_285b_43layers_4k_128die() -> TrainerConfig:
         hf_assets_path="./tests/assets/tokenizer/deepseekv4_tokenizer",
         model_spec=model_registry("285B_debug_43_layers"),
         debug=DebugConfig(print_config=True),
+        comm=CommConfig(trace_buf_size=0),
         model_converters=ModelConvertersContainer.Config(
             converters=_default_converters()
         ),
@@ -235,6 +241,7 @@ def deepseek_v4_pro_debug_61_layers_4k_384die() -> TrainerConfig:
         hf_assets_path="./tests/assets/tokenizer/deepseek_v4_pro_tokenizer",
         model_spec=model_registry("v4_pro_debug_61_layers"),
         debug=DebugConfig(print_config=True, moe_force_load_balance=True),
+        comm=CommConfig(trace_buf_size=0),
         model_converters=ModelConvertersContainer.Config(
             converters=_default_converters()
         ),
