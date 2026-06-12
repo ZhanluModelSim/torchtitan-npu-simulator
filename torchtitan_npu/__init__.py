@@ -17,6 +17,9 @@ def _apply_patches():
         return
     _initialized = True
 
+    # patching MTP context-parallel, before importing torchtitan.trainer
+    from .patches.distributed import mtp_context_parallel  # noqa: F401
+
     # Must capture Trainer.init_distributed before any other patch
     # modifies it, so apply this first.
     from .patches.torchtitan.trainer_init_distributed import (

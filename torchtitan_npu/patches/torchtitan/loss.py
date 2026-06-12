@@ -25,7 +25,7 @@ from torchtitan.components import loss as loss_utils
 from torchtitan.components.loss import cross_entropy_loss
 from torchtitan.tools.logging import logger
 
-from ._trainer_config_stash import get_active_trainer_config
+from ._trainer_config_stash import get_trainer_config
 
 
 def multi_token_cross_entropy_loss(
@@ -51,7 +51,7 @@ def multi_token_cross_entropy_loss(
 def mtp_build_cross_entropy_loss(compile_config, **kwargs):
     del kwargs  # delete any unused arguments
 
-    trainer_config = get_active_trainer_config()
+    trainer_config = get_trainer_config()
     num_mtp_modules = 0
     mtp_loss_weight = 0.0
     if trainer_config is not None:

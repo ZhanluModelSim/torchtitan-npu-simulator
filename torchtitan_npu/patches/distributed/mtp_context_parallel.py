@@ -12,7 +12,6 @@ in a non-invasive way by monkey-patching the prepare_context_parallel_input func
 
 from __future__ import annotations
 
-import inspect
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -41,8 +40,17 @@ def prepare_context_parallel_input(
     global _cached_num_mtp_modules
 
     if _cached_num_mtp_modules is None:
-        job_config = _find_job_config_from_stack()
-        _cached_num_mtp_modules = getattr(job_config.training, "num_mtp_modules", 0) if job_config is not None else 0
+        # Imported lazily: a module-level import would pull in
+        # torchtitan.trainer before this patch installs its monkey-patch,
+        # defeating the import-order fix in torchtitan_npu/__init__.py.
+        from torchtitan_npu.patches.torchtitan._trainer_config_stash import (
+            get_trainer_config,
+        )
+
+        trainer_config = get_trainer_config()
+        _cached_num_mtp_modules = (
+            getattr(trainer_config.training, "num_mtp_modules", 0) if trainer_config is not None else 0
+        )
 
     if _cached_num_mtp_modules > 0:
         return _mtp_prepare_cp_input(
@@ -56,29 +64,6 @@ def prepare_context_parallel_input(
         )
 
     return _orig_prepare_cp_input(inputs, labels, extra_kwargs, cp_mesh, device, load_balancer_type)
-
-
-def _find_job_config_from_stack():
-    """Find job_config from call stack by iterating frames."""
-    for frame_info in inspect.stack():
-        job_config = _extract_job_config_from_frame(frame_info)
-        if job_config is not None:
-            return job_config
-    return None
-
-
-def _extract_job_config_from_frame(frame_info: inspect.FrameInfo) -> Any | None:
-    """Extract job_config from a single frame's local variables."""
-    local_vars = frame_info.frame.f_locals
-    if "self" not in local_vars:
-        return None
-
-    self_obj = local_vars["self"]
-    if not hasattr(self_obj, "job_config"):
-        return None
-
-    jc = getattr(self_obj, "job_config", None)
-    return jc if jc is not None else None
 
 
 def _mtp_prepare_cp_input(inputs, labels, extra_kwargs, cp_mesh, device, num_mtp_modules, load_balancer_type):

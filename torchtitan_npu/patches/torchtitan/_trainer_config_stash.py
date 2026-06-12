@@ -4,8 +4,8 @@
 # LICENSE file in the root directory of this source tree.
 #
 # Patch:
-#   torchtitan.trainer.Trainer.__init__ — stash the active Trainer.Config on a
-#   module-level variable for the duration of trainer construction.
+#   torchtitan.trainer.Trainer.__init__ — stash the Trainer.Config on a
+#   module-level variable so non-trainer patches can read it.
 #
 # Why:
 #   Upstream removed `JobConfig`. `Trainer.Config` is the new top-level config
@@ -13,25 +13,29 @@
 #   narrow Config slices and runtime objects through their `build()` calls,
 #   so npu patches that need MTP-related fields (`training.num_mtp_modules`,
 #   `training.mtp_loss_weight`, `model_spec.name`) have no other way to read
-#   them. This shared stash is consumed by the hf_datasets and loss patches.
+#   them. The config is kept after construction so training-loop patches
+#   (e.g. context-parallel input preparation) can read it too. This shared
+#   stash is consumed by the hf_datasets, loss and mtp_context_parallel patches.
 #
 # Idempotency:
 #   Importing this module installs the wrapper exactly once thanks to Python's
-#   module cache. Both hf_datasets and loss patches import from here.
+#   module cache.
 
 import functools
 
 from torchtitan.trainer import Trainer
 
-_active_trainer_config = None
+_trainer_config = None
 
 
-def get_active_trainer_config():
-    """Return the Trainer.Config currently being used to build a Trainer.
+def get_trainer_config():
+    """Return the most recently constructed Trainer.Config.
 
-    Returns ``None`` outside `Trainer.__init__`.
+    The config is stashed at the start of ``Trainer.__init__`` and kept
+    afterwards, so both init-time patches (dataloader, loss) and training-loop
+    patches (context-parallel input preparation) can read it.
     """
-    return _active_trainer_config
+    return _trainer_config
 
 
 _orig_trainer_init = Trainer.__init__
@@ -39,12 +43,9 @@ _orig_trainer_init = Trainer.__init__
 
 @functools.wraps(_orig_trainer_init)
 def _trainer_init_with_stash(self, config, *args, **kwargs):
-    global _active_trainer_config
-    _active_trainer_config = config
-    try:
-        _orig_trainer_init(self, config, *args, **kwargs)
-    finally:
-        _active_trainer_config = None
+    global _trainer_config
+    _trainer_config = config
+    _orig_trainer_init(self, config, *args, **kwargs)
 
 
 Trainer.__init__ = _trainer_init_with_stash

@@ -28,7 +28,7 @@ from torchtitan.hf_datasets.text_datasets import (
 )
 from torchtitan.tools.logging import init_logger, logger
 
-from ._trainer_config_stash import get_active_trainer_config
+from ._trainer_config_stash import get_trainer_config
 
 init_logger()
 
@@ -73,7 +73,7 @@ def _mtp_seq_len_delta() -> int:
 
     Raises ValueError if MTP is enabled on a model outside _MTP_ALLOWED_MODELS.
     """
-    trainer_config = get_active_trainer_config()
+    trainer_config = get_trainer_config()
     if trainer_config is None:
         return 0
     num_mtp_modules = getattr(trainer_config.training, "num_mtp_modules", 0)
