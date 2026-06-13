@@ -13,8 +13,8 @@ std::tuple<at::Tensor, at::Tensor> npu_lightning_indexer(
     int64_t sparse_mode, int64_t pre_tokens, int64_t next_tokens, int64_t cmp_ratio, bool return_values) {
   TORCH_CHECK(query.numel() > 0, "query is empty");
 
-  char *layout_q_ptr = const_cast<char *>(layout_q.data());
-  char *layout_k_ptr = const_cast<char *>(layout_k.data());
+  const char *layout_q_ptr = layout_q.c_str();
+  const char *layout_k_ptr = layout_k.c_str();
 
   auto q_sizes = query.sizes();
   int64_t B = q_sizes[0];

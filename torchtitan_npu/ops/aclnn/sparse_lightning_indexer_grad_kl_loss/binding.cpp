@@ -13,7 +13,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> npu_sparse_lightning_
     const c10::optional<at::Tensor> &key_rope, const c10::optional<std::vector<int64_t>> &actual_seq_lengths_query,
     const c10::optional<std::vector<int64_t>> &actual_seq_lengths_key, std::string layout, int64_t sparse_mode,
     int64_t pre_tokens, int64_t next_tokens, int64_t cmp_ratio, double scale_value, bool deterministic) {
-  char *layout_ptr = const_cast<char *>(layout.data());
+  const char *layout_ptr = layout.c_str();
 
   auto seq_q_tmp = actual_seq_lengths_query.value_or(std::vector<int64_t>{});
   auto seq_k_tmp = actual_seq_lengths_key.value_or(std::vector<int64_t>{});

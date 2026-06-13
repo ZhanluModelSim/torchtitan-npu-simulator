@@ -22,10 +22,6 @@ def build_op(name, sources, verbose=False):
     tnpu_path = os.path.dirname(os.path.abspath(torch_npu.__file__))
 
     cflags = [
-        "-fstack-protector-all",
-        "-Wl,-z,relro,-z,now,-z,noexecstack",
-        "-s",
-        "-fvisibility=hidden",
         "-D_FORTIFY_SOURCE=2",
         "-O2",
         f"-I{cwd}",

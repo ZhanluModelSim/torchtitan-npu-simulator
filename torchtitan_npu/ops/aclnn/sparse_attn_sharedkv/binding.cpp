@@ -13,8 +13,10 @@ at::Tensor npu_sparse_attn_sharedkv_metadata(
     int64_t batchSize, int64_t maxSeqLenQ, int64_t maxSeqLenKv, int64_t oriTopk, int64_t cmpTopk, int64_t cmpRatio,
     int64_t oriMaskMode, int64_t cmpMaskMode, int64_t oriWinLeft, int64_t oriWinRight,
     const c10::optional<std::string> layoutQ, const c10::optional<std::string> layoutKv, bool hasOriKv, bool hasCmpKv) {
-  char *layoutQPtr = const_cast<char *>(layoutQ.value_or("SBH").c_str());
-  char *layoutKvPtr = const_cast<char *>(layoutKv.value_or("SBH").c_str());
+  std::string layoutQStr = layoutQ.value_or("SBH");
+  std::string layoutKvStr = layoutKv.value_or("SBH");
+  const char *layoutQPtr = layoutQStr.c_str();
+  const char *layoutKvPtr = layoutKvStr.c_str();
   at::Tensor metadata = at::empty(1024, at::TensorOptions(torch_npu::utils::get_npu_device_type()).dtype(at::kInt));
   ACLNN_CMD(aclnnSparseAttnSharedkvMetadata, cuSeqLensQ, sequsedOriKv, sequsedCmpKv, sequsedQ, sequsedKv, numHeadsQ,
             numHeadsKv, headDim, batchSize, maxSeqLenQ, maxSeqLenKv, oriTopk, cmpTopk, cmpRatio, oriMaskMode,
@@ -34,8 +36,8 @@ std::tuple<at::Tensor, at::Tensor> npu_sparse_attn_sharedkv(
     const c10::optional<std::string> layoutQ, const c10::optional<std::string> layoutKv, bool returnSoftmaxLse) {
   std::string layoutq = layoutQ.value_or("SBH");
   std::string layoutkv = layoutKv.value_or("SBH");
-  char *layoutQPtr = const_cast<char *>(layoutq.c_str());
-  char *layoutKvPtr = const_cast<char *>(layoutkv.c_str());
+  const char *layoutQPtr = layoutq.c_str();
+  const char *layoutKvPtr = layoutkv.c_str();
 
   at::Tensor attnOutput = at::empty(query.sizes(), query.options());
   at::Tensor softmaxLseOut;
@@ -63,7 +65,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> npu_sparse_attn_share
     int64_t oriMaskMode, int64_t cmpMaskMode, int64_t oriWinLeft, int64_t oriWinRight,
     const c10::optional<std::string> layout) {
   std::string layoutValue = layout.value_or("SBH");
-  char *layoutPtr = const_cast<char *>(layoutValue.c_str());
+  const char *layoutPtr = layoutValue.c_str();
 
   at::Tensor dQuery = at::empty(query.sizes(), query.options());
   at::Tensor dOriKv = at::empty(oriKv.sizes(), oriKv.options());
