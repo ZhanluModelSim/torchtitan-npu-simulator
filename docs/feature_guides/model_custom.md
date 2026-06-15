@@ -2,7 +2,7 @@
 
 ## 1. 重构目的
 
-**基于 torchtitan 的 ModelConverter 机制，为 torchtitan_npu 提供了一套声明式、可组合的模型自定义框架，取代了原先 monkey-patch 方式**
+**基于 torchtitan 的 ModelConverter 机制，为 torchtitan-npu 提供了一套声明式、可组合的模型自定义框架，取代了原先 monkey-patch 方式**
 
 ## 2. 使用方法
 

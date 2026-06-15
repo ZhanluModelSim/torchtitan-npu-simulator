@@ -1,6 +1,6 @@
 # NPU 融合算子适配
 
-torchtitan_npu 在 `torchtitan_npu/converters/kernels` 下定义了多个 torchtitan ModelConverter 。在启动模型训练任务时，它们会根据用户配置，自动将模型中的原始模块替换为基于 NPU 融合算子的实现，从而实现模型在 NPU 平台上的亲和适配。
+torchtitan-npu 在 `torchtitan_npu/converters/kernels` 下定义了多个 torchtitan ModelConverter 。在启动模型训练任务时，它们会根据用户配置，自动将模型中的原始模块替换为基于 NPU 融合算子的实现，从而实现模型在 NPU 平台上的亲和适配。
 
 ## 如何配置
 NPU融合算子通过 `ModelConvertersContainer.Config` 的 `converters` 列表启用。

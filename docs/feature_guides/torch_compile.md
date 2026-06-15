@@ -1,5 +1,5 @@
 # torch.compile 支持
-torch.compile 是 PyTorch 2.0 的核心特性。通过 JIT （即时编译），将 PyTorch 代码转化为高度优化的融合算子，在几乎不改动原有代码的前提下显著提升性能。作为 PyTorch 原生的分布式训练框架，torchtitan 的一大优势便是可以便捷、充分地发挥 torch.compile 的性能收益。在此基础上，torchtitan_npu 结合 CANN 生态的编译能力，在 NPU 平台上的分布式训练任务中为 torch.compile 提供支持。
+torch.compile 是 PyTorch 2.0 的核心特性。通过 JIT （即时编译），将 PyTorch 代码转化为高度优化的融合算子，在几乎不改动原有代码的前提下显著提升性能。作为 PyTorch 原生的分布式训练框架，torchtitan 的一大优势便是可以便捷、充分地发挥 torch.compile 的性能收益。在此基础上，torchtitan-npu 结合 CANN 生态的编译能力，在 NPU 平台上的分布式训练任务中为 torch.compile 提供支持。
 
 ## NPU 上的 torch.compile
 
@@ -12,7 +12,7 @@ torch.compile 是 PyTorch 2.0 的核心特性。通过 JIT （即时编译），
 为了在 NPU 平台上充分利用 `torch.compile` 原生的编译能力，`torchtitan_npu` 在保留 Dynamo 与 Inductor 既有编译流程的基础上，接入了 Codegen 后端 [`inductor-npu-ext`](https://gitcode.com/Ascend/torchair/blob/master/experimental/_inductor_npu_ext/README.md)。该后端借助 [AutoFuse](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/900beta1/graph/graphguide/autofuse_1_0001.html) 的自动融合能力，从 Inductor IR 生成 AscendC 融合 Kernel。
 
 ## 支持范围
-torchtitan-npu 当前支持 `DeepSeek-V3、DeepSeek-V4` 模型的全流程编译。
+torchtitan-npu 当前支持 `DeepSeek-V3、DeepSeek-V3.2、DeepSeek-V4` 模型的全流程编译。
 
 其他模型的 Codegen 仍处于待调试状态。启用 `torch.compile` 时，需要在模型配置中启用
 `npu_bypass_triton_codegen`，跳过 Inductor Codegen 流程，仅保留 Dynamo / AOTAutograd
