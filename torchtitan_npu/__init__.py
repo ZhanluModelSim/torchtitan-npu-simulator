@@ -20,6 +20,10 @@ def _apply_patches():
     # patching MTP context-parallel, before importing torchtitan.trainer
     from .patches.distributed import mtp_context_parallel  # noqa: F401
 
+    # async_tp must be patched before importing NPU model modules because
+    # their parallelize files import maybe_enable_async_tp by value.
+    from .patches.torch import micro_pipeline_tp  # noqa: F401 # isort: off
+
     # Must capture Trainer.init_distributed before any other patch
     # modifies it, so apply this first.
     from .patches.torchtitan.trainer_init_distributed import (
@@ -66,7 +70,6 @@ def _apply_patches():
         checkpoint,
         clip_grad,
         distributed_tensor_api,
-        micro_pipeline_tp,
         pipelining,
     )
 
