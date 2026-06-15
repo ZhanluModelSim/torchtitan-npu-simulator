@@ -1,6 +1,6 @@
 # VLM NPU 支持
 
-本文档说明 `torchtitan_npu.models.vlm` 对上游 TorchTitan VLM debug model 的 NPU 适配范围。
+本文档说明 `torchtitan_npu.models.vlm` 对上游 torchtitan VLM debug model 的 NPU 适配范围。
 
 ## 支持内容
 

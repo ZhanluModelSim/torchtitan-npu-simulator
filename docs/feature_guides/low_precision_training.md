@@ -16,7 +16,7 @@
 
 | 文件路径 | 修改作用 |
 | --- | --- |
-| `torchtitan_npu/converters/quant_converter.py` | 对上游 `MXLinearConverter` 和 `MXGroupedMMConverter` 的初始化与转换逻辑进行 NPU 适配替换 |
+| `torchtitan_npu/converters/quant_converter.py` | 对上游 `MXFP8Converter` 的初始化与转换逻辑进行 NPU 适配替换 |
 | `torchtitan_npu/converters/kernels/quant_linear.py` | 实现低精度线性层 `MXLinear`，包含 MXFP8 和 HiFloat8 的前向/反向自定义算子 |
 | `torchtitan_npu/converters/kernels/quant_gmm.py` | 实现低精度分组矩阵乘法，包含 MXFP8 和 HiFloat8 的前向/反向自定义算子 |
 | `torchtitan_npu/patches/quantization/quant_config.py` | 定义量化配置数据类 `MXLinearConfig`、`MoETrainingConfig` 及对应的 recipe 枚举 |

@@ -38,7 +38,7 @@ pip install mindstudio-probe
 - 训练配置文件路径（TOML）。
 - 基线与异常代码的变更列表（commit 区间或改动文件）。
 - 失败/异常的训练日志。
-- 确定性设置是否已开启（`seed_all(seed=1234, mode=True)` 与 `CLOSE_MATMUL_K_SHIFT=1`）。
+- 确定性设置是否已开启（优先用 `--debug.seed=1234 --debug.deterministic`，与 premerge-accuracy-check 对齐；msprobe 流程再配 `seed_all(seed=1234, mode=True)` 与 `CLOSE_MATMUL_K_SHIFT=1`）。
 
 ## 工作流
 
@@ -52,7 +52,7 @@ pip install mindstudio-probe
 pip install mindstudio-probe
 ```
 
-在训练入口尽早加入（建议在模型/数据初始化之前）：
+确定性优先通过启动参数 `--debug.seed=1234 --debug.deterministic` 开启（与 premerge-accuracy-check 对齐）。若走 msprobe 流程，可在训练入口尽早加入以下配套设置（在模型/数据初始化之前）：
 
 ```python
 import os
@@ -151,7 +151,7 @@ PY
 ```
 
 - 若输出路径落在当前仓（例如 torchtitan 软链接到当前目录），就修改当前目录下对应文件。
-- 在 `def forward_backward_step(...)` 方法开头增加一层 `with torch.autograd.detect_anomaly():`，包裹该方法内原有前向/反向训练逻辑。
+- 在 `Trainer.forward_backward_step(...)` 类方法开头增加一层 `with torch.autograd.detect_anomaly():`，包裹该方法内原有前向/反向训练逻辑。
 
 在上面命令输出的实际文件中，定位 `forward_backward_step` 并修改。
 
@@ -274,7 +274,7 @@ msprobe compare -i compare.json -o ./compare_output_statistics
 
 - 加载相同的预训练权重（如使用了权重加载）。
 - 保持所有超参配置一致。
-- 关闭所有随机性（固定 seed，关闭 dropout，并保持 `seed_all(seed=1234, mode=True)` 与 `CLOSE_MATMUL_K_SHIFT=1` 一致）。
+- 关闭所有随机性（固定 seed，关闭 dropout，并保持 `--debug.seed=1234 --debug.deterministic`、必要时配 msprobe `seed_all` 与 `CLOSE_MATMUL_K_SHIFT=1` 一致）。
 - 使用相同的训练数据与数据顺序。
 
 #### 6.2 精度对齐指标

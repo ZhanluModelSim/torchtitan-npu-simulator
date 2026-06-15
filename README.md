@@ -36,7 +36,7 @@ SIG 例会：[sig-framework-adapter](https://meeting.osinfra.cn/cann?sig=sig-fra
 - [Apr. 2026]: 🚀 **torchtitan‑npu 正式开源**:在 NPU 上支持 4D 并行等 torchtitan 原生特性，并引入 Swap Optimizer 等 NPU 亲和优化。
 
 ***
-* [TorchTitan-NPU 0day支持DeepSeek-V4续训练，助力训练场景轻松入图，开箱即优](https://gitcode.com/cann/cann-recipes-train/blob/master/docs/llm_pretrain/deepseek-v4_torchtitan_npu_autofuse.md)
+* [torchtitan-npu 0day 支持 DeepSeek-V4 续训练，助力训练场景轻松入图，开箱即优](https://gitcode.com/cann/cann-recipes-train/blob/master/docs/llm_pretrain/deepseek-v4_torchtitan_npu_autofuse.md)
 
 # Roadmap
 
@@ -175,10 +175,10 @@ System: Atlas 800T A3
 | Model              | Number of NPUs | Precision | GBS | Local BS | Sequence Length | FSDP | TP  | PP  | CP  | EP  | Throughput (tokens/p/s) | MFU |
 | :----------------- | :------------- | :-------- | :-- | :------- | :-------------- | :--- | :-- | :-- | :-- | :-- | :----------- | :-- |
 | [DeepSeek-V4-Flash](https://gitcode.com/cann/torchtitan-npu/blob/8343a6efac598ce86c2cec5a974f187310fd2728/torchtitan_npu/models/deepseek_v4/config_registry.py#L100) | 64             | BF16      | 1024  | 1       | 4096            | 128   | 1   | 1   | 1   | 128  | 1056          | 27.67% |
-| [DeepSeek-V3.2-671B](https://gitcode.com/cann/torchtitan-npu/blob/8343a6efac598ce86c2cec5a974f187310fd2728/torchtitan_npu/models/deepseek_v32/config_registry.py#L101) | 64             | BF16      | 128  | 1       | 32768           | 4    | 4   | 1   | 8  | 64  | 103           | / |
-| [DeepSeek-V3.2-671B](https://gitcode.com/cann/torchtitan-npu/blob/8343a6efac598ce86c2cec5a974f187310fd2728/torchtitan_npu/models/deepseek_v32/config_registry.py#L156) | 64             | BF16      | 512  | 1        | 4096            | 32   | 4   | 1   | 1   | 64  | 146           | / |
+| [DeepSeek-V3.2-671B](https://gitcode.com/cann/torchtitan-npu/blob/8343a6efac598ce86c2cec5a974f187310fd2728/torchtitan_npu/models/deepseek_v32/config_registry.py#L156) | 64             | BF16      | 128  | 1       | 32768           | 4    | 4   | 1   | 8  | 64  | 103           | / |
+| [DeepSeek-V3.2-671B](https://gitcode.com/cann/torchtitan-npu/blob/8343a6efac598ce86c2cec5a974f187310fd2728/torchtitan_npu/models/deepseek_v32/config_registry.py#L101) | 64             | BF16      | 512  | 1        | 4096            | 32   | 4   | 1   | 1   | 64  | 146           | / |
 | [DeepSeek-V3-671B](https://gitcode.com/cann/torchtitan-npu/blob/8343a6efac598ce86c2cec5a974f187310fd2728/torchtitan_npu/models/deepseek_v3/config_registry.py#L156)   | 64             | BF16      | 1024 | 1       | 4096            | 32   | 4   | 1   | 1   | 128  | 546          | / |
-| [DeepSeek-V3-671B + compile(Autofuse)](https://gitcode.com/cann/torchtitan-npu/blob/8343a6efac598ce86c2cec5a974f187310fd2728/torchtitan_npu/models/deepseek_v3/config_registry.py#L156)   | 64             | BF16      | 1024 | 1       | 4096            | 32   | 4   | 1   | 1   | 128  |     576      | / |
+| [DeepSeek-V3-671B + compile(AutoFuse)](https://gitcode.com/cann/torchtitan-npu/blob/8343a6efac598ce86c2cec5a974f187310fd2728/torchtitan_npu/models/deepseek_v3/config_registry.py#L156)   | 64             | BF16      | 1024 | 1       | 4096            | 32   | 4   | 1   | 1   | 128  |     576      | / |
  > 注：以上MoE模型的性能数据均开启负载均衡配置moe_force_load_balance=true。
 
 # 免责声明

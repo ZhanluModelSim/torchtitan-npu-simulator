@@ -82,7 +82,7 @@ bash scripts/run_train.sh \
 
 ## Swap Optimizer 与 Checkpoint
 
-Swap Optimizer 已支持与 TorchTitan DCP checkpoint 组合使用。保存时会等待
+Swap Optimizer 已支持与 torchtitan DCP checkpoint 组合使用。保存时会等待
 pending swap/offload 完成，并从 CPU cache 保存真实 Adam/AdamW optimizer
 state；加载时会恢复 CPU cache 并重建 device 侧 zero-storage placeholder，
 用于继续训练。

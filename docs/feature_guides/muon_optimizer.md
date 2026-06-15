@@ -116,15 +116,7 @@ bash scripts/run_train.sh \
        )
    ```
 
-2. **与 Swap Optimizer 互斥**：Muon 优化器不支持与 Swap Optimizer 特性同时启用：
-
-   ```python
-   if getattr(optimizer_config, "swap_optimizer", False):
-       raise ValueError(
-           "Muon optimizer does not support swap_optimizer. "
-           "Please set swap_optimizer=false in your config."
-       )
-   ```
+2. **与 Swap Optimizer 互斥**：Muon 优化器不支持与 Swap Optimizer 特性同时启用。
 
 
 ## 参考文献

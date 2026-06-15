@@ -266,7 +266,8 @@ pytest tests/ -x
 
 当发现 CodeCheck 问题时，在 finding 中附加：
 
-```markdown   - 建议：包装上游模块时 `super().__init__()` 后再选择性复制 `_modules` / `_parameters` / `_buffers`；删掉只是同名透传、不增价值的 converter。
+```markdown
+  - 建议：包装上游模块时 `super().__init__()` 后再选择性复制 `_modules` / `_parameters` / `_buffers`；删掉只是同名透传、不增价值的 converter。
   CodeCheck 证据：<job/rule/severity/log line>
 ```
 
