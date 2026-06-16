@@ -29,7 +29,7 @@ def _make_moe_args() -> MoEArgs:
     )
 
 
-def _make_v4_pro_debug_moe_args() -> MoEArgs:
+def _make_single_node_eq_pruned_moe_args() -> MoEArgs:
     return MoEArgs(
         num_experts=16,
         num_shared_experts=1,
@@ -107,10 +107,10 @@ def _smoketest_model() -> DeepSeekV4Model.Config:
     )
 
 
-def _285b_debug_4_layers() -> DeepSeekV4Model.Config:
+def _v4_flash_debug_16_experts_43_layers() -> DeepSeekV4Model.Config:
     return DeepSeekV4Model.Config(
         vocab_size=129280,
-        n_layers=4,
+        n_layers=43,
         n_heads=64,
         max_batch_size=4,
         max_seq_len=4096,
@@ -122,8 +122,13 @@ def _285b_debug_4_layers() -> DeepSeekV4Model.Config:
         o_lora_rank=1024,
         o_groups=8,
         window_size=128,
-        compress_ratios=(1, 1, 4, 128),
-        moe_args=_make_moe_args(),
+        compress_ratios=(
+            1,
+            1,
+            4,
+        )
+        + (128, 4) * 20,
+        moe_args=_make_single_node_eq_pruned_moe_args(),
         hc_sinkhorn_iters=20,
         hc_mult=4,
         hc_eps=1e-6,
@@ -143,7 +148,7 @@ def _285b_debug_4_layers() -> DeepSeekV4Model.Config:
     )
 
 
-def _285b_debug_43_layers() -> DeepSeekV4Model.Config:
+def _v4_flash_debug_256_experts_43_layers() -> DeepSeekV4Model.Config:
     return DeepSeekV4Model.Config(
         vocab_size=129280,
         n_layers=43,
@@ -162,47 +167,8 @@ def _285b_debug_43_layers() -> DeepSeekV4Model.Config:
             1,
             1,
             4,
-            128,
-            4,
-            128,
-            4,
-            128,
-            4,
-            128,
-            4,
-            128,
-            4,
-            128,
-            4,
-            128,
-            4,
-            128,
-            4,
-            128,
-            4,
-            128,
-            4,
-            128,
-            4,
-            128,
-            4,
-            128,
-            4,
-            128,
-            4,
-            128,
-            4,
-            128,
-            4,
-            128,
-            4,
-            128,
-            4,
-            128,
-            4,
-            128,
-            4,
-        ),
+        )
+        + (128, 4) * 20,
         moe_args=_make_moe_args(),
         hc_sinkhorn_iters=20,
         hc_mult=4,
@@ -239,7 +205,7 @@ def _v4_pro_debug_16_layers() -> DeepSeekV4Model.Config:
         o_groups=16,
         window_size=128,
         compress_ratios=(128,) + (128, 4) * 30,
-        moe_args=_make_v4_pro_debug_moe_args(),
+        moe_args=_make_single_node_eq_pruned_moe_args(),
         hc_sinkhorn_iters=20,
         hc_mult=4,
         hc_eps=1e-6,
@@ -297,8 +263,8 @@ def _v4_pro_debug_61_layers() -> DeepSeekV4Model.Config:
 
 deepseekv4_configs = {
     "smoketest": _smoketest_model,
-    "285B_debug_4_layers": _285b_debug_4_layers,
-    "285B_debug_43_layers": _285b_debug_43_layers,
+    "v4_flash_debug_16_experts_43_layers": _v4_flash_debug_16_experts_43_layers,
+    "v4_flash_debug_256_experts_43_layers": _v4_flash_debug_256_experts_43_layers,
     "v4_pro_debug_16_layers": _v4_pro_debug_16_layers,
     "v4_pro_debug_61_layers": _v4_pro_debug_61_layers,
 }

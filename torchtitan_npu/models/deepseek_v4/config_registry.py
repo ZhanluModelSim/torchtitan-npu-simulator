@@ -41,12 +41,24 @@ def _default_converters() -> list:
     ]
 
 
-def deepseek_v4_285b_debug_4_layers() -> TrainerConfig:
+def _enable_all_converters() -> list:
+    return [
+        get_model_converter_config("npu_rms_norm"),
+        get_model_converter_config("npu_permute"),
+        get_model_converter_config("npu_gmm"),
+        get_model_converter_config("npu_rope"),
+        get_model_converter_config("npu_smla"),
+        get_model_converter_config("npu_mhc_pre"),
+        get_model_converter_config("npu_mhc_post"),
+    ]
+
+
+def deepseek_v4_flash_single_server_16_experts_43_layers_bf16() -> TrainerConfig:
     return TrainerConfig(
         hf_assets_path="./tests/assets/tokenizer/deepseekv4_tokenizer",
-        model_spec=model_registry("285B_debug_4_layers"),
+        model_spec=model_registry("v4_flash_debug_16_experts_43_layers"),
         debug=DebugConfig(print_config=True, moe_force_load_balance=True),
-        model_converters=ModelConvertersContainer.Config(converters=_default_converters()),
+        model_converters=ModelConvertersContainer.Config(converters=_enable_all_converters()),
         metrics=MetricsProcessor.Config(log_freq=1),
         dataloader=HuggingFaceTextDataLoader.Config(dataset="c4_test"),
         optimizer=OptimizerConfig(
@@ -66,7 +78,7 @@ def deepseek_v4_285b_debug_4_layers() -> TrainerConfig:
             seq_len=4096,
             max_norm=1.0,
             steps=20,
-            num_mtp_modules=0,
+            num_mtp_modules=1,
         ),
         parallelism=ParallelismConfig(
             data_parallel_replicate_degree=1,
@@ -76,7 +88,7 @@ def deepseek_v4_285b_debug_4_layers() -> TrainerConfig:
             enable_async_tensor_parallel=False,
             pipeline_parallel_degree=1,
             pipeline_parallel_schedule="1F1B",
-            expert_parallel_degree=16,
+            expert_parallel_degree=8,
             expert_tensor_parallel_degree=1,
             context_parallel_degree=1,
         ),
@@ -98,17 +110,17 @@ def deepseek_v4_285b_debug_4_layers() -> TrainerConfig:
     )
 
 
-def deepseek_v4_285b_debug_4_layers_mxfp8() -> TrainerConfig:
+def deepseek_v4_flash_single_server_16_experts_43_layers_mxfp8() -> TrainerConfig:
     return TrainerConfig(
         hf_assets_path="./tests/assets/tokenizer/deepseekv4_tokenizer",
-        model_spec=model_registry("285B_debug_4_layers"),
+        model_spec=model_registry("v4_flash_debug_16_experts_43_layers"),
         debug=DebugConfig(print_config=True, moe_force_load_balance=True),
         model_converters=ModelConvertersContainer.Config(
             converters=[
-                *_default_converters(),
+                *_enable_all_converters(),
                 MXFP8Converter.Config(
                     recipe_name="mxfp8",  # pyrefly: ignore [bad-argument-type]
-                    filter_fqns=["output", "router.gate"],  # pyrefly: ignore [unexpected-keyword]
+                    filter_fqns=["output", "router.gate", "compressor"],  # pyrefly: ignore [unexpected-keyword]
                 ),
             ]
         ),
@@ -131,7 +143,7 @@ def deepseek_v4_285b_debug_4_layers_mxfp8() -> TrainerConfig:
             seq_len=4096,
             max_norm=1.0,
             steps=20,
-            num_mtp_modules=0,
+            num_mtp_modules=1,
         ),
         parallelism=ParallelismConfig(
             data_parallel_replicate_degree=1,
@@ -141,7 +153,7 @@ def deepseek_v4_285b_debug_4_layers_mxfp8() -> TrainerConfig:
             enable_async_tensor_parallel=False,
             pipeline_parallel_degree=1,
             pipeline_parallel_schedule="1F1B",
-            expert_parallel_degree=16,
+            expert_parallel_degree=8,
             expert_tensor_parallel_degree=1,
             context_parallel_degree=1,
         ),
@@ -163,10 +175,10 @@ def deepseek_v4_285b_debug_4_layers_mxfp8() -> TrainerConfig:
     )
 
 
-def deepseek_v4_285b_43layers_4k_128die() -> TrainerConfig:
+def deepseek_v4_flash_43layers_4k_128die() -> TrainerConfig:
     return TrainerConfig(
         hf_assets_path="./tests/assets/tokenizer/deepseekv4_tokenizer",
-        model_spec=model_registry("285B_debug_43_layers"),
+        model_spec=model_registry("v4_flash_debug_256_experts_43_layers"),
         debug=DebugConfig(print_config=True),
         comm=CommConfig(trace_buf_size=0),
         model_converters=ModelConvertersContainer.Config(converters=_default_converters()),
