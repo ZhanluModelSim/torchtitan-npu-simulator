@@ -15,7 +15,6 @@ from scipy.linalg import hadamard
 from torch import nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from torchtitan.models.common.attention import AttentionMasksType
-from torchtitan.models.common.rmsnorm import RMSNorm as TorchTitanRMSNorm
 from torchtitan.models.common.rope import (
     _reshape_for_broadcast_complex as reshape_for_broadcast_complex,
 )
@@ -95,7 +94,7 @@ class DeepSeekV32ModelNpu(DeepSeekV3ModelNpu):
         self.tok_embeddings = config.tok_embeddings.build()
         self.rope = config.rope.build()
         self.register_buffer("freqs_cis", self.rope.cache, persistent=False)
-        self.norm = RMSNorm(config.dim)
+        self.norm = config.norm.build()
         self.output = config.output.build()
 
         n_total = len(config.layers)
@@ -201,35 +200,6 @@ def apply_rotary_emb(
     if not interleaved:
         y = torch.cat([y[..., 0::2], y[..., 1::2]], dim=-1)
     return y.to(dtype)
-
-
-class RMSNorm(TorchTitanRMSNorm):
-    def __init__(self, dim: int, eps: float = 1e-6):
-        nn.RMSNorm.__init__(
-            self,
-            dim,
-            eps=eps,
-            elementwise_affine=True,
-            dtype=torch.float32,
-        )
-        self.dim = dim
-
-    def forward(self, x: torch.Tensor):
-        dtype = x.dtype
-        x = x.float()
-        var = x.pow(2).mean(-1, keepdim=True)
-        inv_rms = torch.rsqrt(var + self.eps)  # pyrefly: ignore [unsupported-operation]
-        x = x * inv_rms
-        return (self.weight * x).to(dtype)
-
-    def reset_parameters(self):
-        if self.weight is not None:
-            nn.init.ones_(self.weight)
-
-    def _init_self_parameters(self) -> None:
-        # Bridge ``Module``'s default ``_param_init`` lookup to the legacy
-        # ``reset_parameters`` API used by this class.
-        self.reset_parameters()
 
 
 def hadamard_transform_ref(x, scale=1.0):
@@ -757,11 +727,10 @@ class MTPModule(TransformerBlockV32):
     ):
         super().__init__(config, layer_id, num_total_layers)
         self._dim = config.attention.dim
-        # Reuse the per-layer kv_norm eps so MTP norm matches main attention
-        # numerics; v32 historically picked 1e-6 here.
-        eps = config.attention.kv_norm.eps
-        self.enorm = RMSNorm(self._dim, eps=eps)
-        self.hnorm = RMSNorm(self._dim, eps=eps)
+        # enorm/hnorm normalize the model-dim stream like attention_norm, so
+        # reuse its config (same normalized_shape/eps/param_init).
+        self.enorm = config.attention_norm.build()
+        self.hnorm = config.attention_norm.build()
         self.eh_proj = _Linear(2 * self._dim, self._dim, bias=False)
 
     # pyrefly: ignore [bad-param-name-override]
@@ -801,12 +770,10 @@ class MTPModule(TransformerBlockV32):
         *,
         buffer_device: torch.device | None = None,
     ) -> None:
-        # ``Module.init_states`` recurses into Module children. v32 plain
-        # nn.Module submodules (enorm/hnorm/eh_proj) are walked but their
-        # leaf params are not initialized by the framework — handle them here.
+        # ``Module.init_states`` recurses into Module children, so enorm/hnorm
+        # are initialized via their config param_init. eh_proj only needs a
+        # custom init here (the framework default does not match).
         super().init_states(buffer_device=buffer_device)
-        for norm in (self.enorm, self.hnorm):
-            norm.reset_parameters()
         final_out_std = self._dim**-0.5
         cutoff_factor = 3
         nn.init.trunc_normal_(
