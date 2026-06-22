@@ -28,6 +28,11 @@ from torch.optim.optimizer import _use_grad_for_differentiable
 from torchtitan.components.optimizer import OptimizersContainer
 from torchtitan.tools.utils import get_device_info
 
+from torchtitan_npu.patches.optimizer.muon_optimizer import (
+    DistributedMuon,
+    MuonHybridOptimizersContainer,
+)
+
 try:
     from torch.distributed.checkpoint.state_dict import _get_fqns
 except ImportError:
@@ -125,6 +130,7 @@ class SwapOptimizersContainer(OptimizersContainer):
 
     state_keys = ["exp_avg", "exp_avg_sq", "max_exp_avg_sq"]
     _MISSING = object()
+    MISSING = _MISSING
 
     @dataclass(kw_only=True, slots=True)
     class Config(OptimizersContainer.Config):
@@ -289,6 +295,8 @@ class SwapOptimizersContainer(OptimizersContainer):
                 cpu_state[key] = None
             else:
                 local_param = unwrap_dtensor(param)
+                device_state[key] = torch.zeros_like(param, memory_format=torch.contiguous_format)
+                unwrap_dtensor(device_state[key]).untyped_storage().resize_(0)
                 cpu_state[key] = torch.zeros_like(local_param, pin_memory=True, device="cpu")
                 device_state[key] = cls._clone_loaded_state_for_device_placeholder(
                     param,
@@ -547,6 +555,21 @@ class SwapOptimizersContainer(OptimizersContainer):
             raise
         self._empty_device_cache()
 
+    # Public aliases for classmethods used by subclasses
+    fqns_by_param = _fqns_by_param
+    clone_to_cpu_cache = _clone_to_cpu_cache
+    state_step_for_state_dict = _state_step_for_state_dict
+    add_param_state_to_state_dict = _add_param_state_to_state_dict
+    add_param_group_to_state_dict = _add_param_group_to_state_dict
+    optimizer_state_dict = _optimizer_state_dict
+    wait_pending_swap_to_host = _wait_pending_swap_to_host
+    load_param_group = _load_param_group
+    load_param_state = _load_param_state
+    state_dict_value_for_fqns = _state_dict_value_for_fqns
+    clone_loaded_value = _clone_loaded_value
+    load_optimizer_state_dict = _load_optimizer_state_dict
+    empty_device_cache = _empty_device_cache
+
 
 def param_update(param, state, param_group):
     beta1, beta2 = param_group["betas"]
@@ -660,3 +683,410 @@ def patch_optimizer_step():
     torch.optim.AdamW.step = swap_optimizer_step
     torch.optim.Adam.step = swap_optimizer_step
     logger.info("[SwapOptimizer] Patched AdamW.step and Adam.step")
+
+
+# =============================================================================
+# Swap Muon optimizer: offloads Muon momentum_buffer to CPU and swaps on demand.
+# =============================================================================
+
+
+class SwapMuonState:
+    """Per-parameter swap state for Muon momentum_buffer."""
+
+    def __init__(self, param, device_module):
+        self.param = param
+        self.device_module = device_module
+        self._cpu_momentum = None
+        self._on_device = True
+        self._swap_event = None
+        self._optim_state: dict | None = None
+        self._buf_shape = None
+        self._buf_dtype = None
+
+    @property
+    def cpu_momentum(self):
+        return self._cpu_momentum
+
+    @cpu_momentum.setter
+    def cpu_momentum(self, value):
+        self._cpu_momentum = value
+
+    @property
+    def on_device(self):
+        return self._on_device
+
+    @on_device.setter
+    def on_device(self, value):
+        self._on_device = value
+
+    @property
+    def buf_shape(self):
+        return self._buf_shape
+
+    @buf_shape.setter
+    def buf_shape(self, value):
+        self._buf_shape = value
+
+    @property
+    def buf_dtype(self):
+        return self._buf_dtype
+
+    @buf_dtype.setter
+    def buf_dtype(self, value):
+        self._buf_dtype = value
+
+    @property
+    def optim_state(self):
+        return self._optim_state
+
+    @optim_state.setter
+    def optim_state(self, value):
+        self._optim_state = value
+
+    def init_from_momentum_buffer(self, momentum_buffer):
+        local_buf = unwrap_dtensor(momentum_buffer)
+        self._cpu_momentum = torch.zeros_like(local_buf, pin_memory=True, device="cpu")
+        self._cpu_momentum.copy_(local_buf, non_blocking=False)
+        self._buf_shape = local_buf.shape
+        self._buf_dtype = local_buf.dtype
+        self._set_momentum_buffer(None)
+        self._on_device = False
+
+    def swap_to_device(self, stream=None):
+        if self._cpu_momentum is None or self._on_device:
+            return
+        state = self._get_momentum_buffer()
+        cpu = self._cpu_momentum
+        if state is None:
+            if self._buf_shape is None or self._buf_dtype is None:
+                raise RuntimeError("SwapMuonState buffer metadata is not initialized.")
+            local_param = unwrap_dtensor(self.param)
+            local_state = torch.empty(
+                self._buf_shape,
+                dtype=self._buf_dtype,
+                device=local_param.device,
+            )
+            self._set_momentum_buffer(
+                wrap_like_param(local_state, self.param) if isinstance(self.param, DTensor) else local_state
+            )
+        local_state = unwrap_dtensor(self._get_momentum_buffer())
+        local_state.copy_(cpu, non_blocking=True)
+        self._on_device = True
+        if stream is not None:
+            self._swap_event = stream.record_event()
+        else:
+            self._swap_event = self.device_module.current_stream().record_event()
+
+    def swap_to_host(self, stream=None):
+        if self._cpu_momentum is None or not self._on_device:
+            return
+        state = self._get_momentum_buffer()
+        if state is not None:
+            local_state = unwrap_dtensor(state)
+            if local_state.untyped_storage().size() != 0:
+                self._cpu_momentum.copy_(local_state, non_blocking=True)
+            self._set_momentum_buffer(None)
+        self._on_device = False
+        if stream is not None:
+            self._swap_event = stream.record_event()
+        else:
+            self._swap_event = self.device_module.current_stream().record_event()
+
+    def wait_swap(self):
+        if self._swap_event is not None:
+            self.device_module.current_stream().wait_event(self._swap_event)
+            self._swap_event = None
+
+    def _get_momentum_buffer(self):
+        if self._optim_state is not None:
+            return self._optim_state.get("momentum_buffer")
+        return None
+
+    def _set_momentum_buffer(self, value):
+        if self._optim_state is not None:
+            self._optim_state["momentum_buffer"] = value
+
+
+class SwapMuonHybridOptimizersContainer(MuonHybridOptimizersContainer):
+    """Container for Muon + AdamW hybrid optimizers with swap support."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(MuonHybridOptimizersContainer.Config):
+        _owner: ClassVar[type | None] = None
+        swap_optimizer_times: int = 16
+        swap_merge_buckets: int = 1
+
+        def build(self, **kwargs):
+            model_parts = kwargs["model_parts"]
+            parallel_dims = kwargs.get("parallel_dims")
+            if parallel_dims is None:
+                from torchtitan_npu.patches.torchtitan._trainer_config_stash import get_active_parallel_dims
+
+                parallel_dims = get_active_parallel_dims()
+            ft_manager = kwargs.get("ft_manager")
+            base = MuonHybridOptimizersContainer.Config(
+                **{
+                    f.name: getattr(self, f.name)
+                    for f in fields(MuonHybridOptimizersContainer.Config)
+                    if hasattr(self, f.name)
+                },
+            ).build(model_parts=model_parts, parallel_dims=parallel_dims, ft_manager=ft_manager)
+            owner = self._owner
+            if owner is None:
+                raise RuntimeError("SwapMuonHybridOptimizersContainer.Config owner is not initialized.")
+            return owner(
+                model_parts,
+                base.optimizers,
+                muon_adjust_lr_fn=base.muon_adjust_lr_fn,
+                swap_optimizer_times=self.swap_optimizer_times,
+                swap_merge_buckets=self.swap_merge_buckets,
+            )
+
+    def __init__(
+        self,
+        model_parts: list[nn.Module],
+        optimizers: list[Optimizer],
+        muon_adjust_lr_fn: str | None = None,
+        swap_optimizer_times: int = 16,
+        swap_merge_buckets: int = 1,
+    ) -> None:
+        super().__init__(model_parts, optimizers, muon_adjust_lr_fn)
+        if swap_optimizer_times <= 0:
+            raise ValueError(f"swap_optimizer_times must be positive, got {swap_optimizer_times}")
+        if swap_merge_buckets <= 0:
+            raise ValueError(f"swap_merge_buckets must be positive, got {swap_merge_buckets}")
+        self._swap_optimizer_times = swap_optimizer_times
+        self._device_module = get_torch_device()
+        if SwapOptimizersContainer.swap_to_device_stream is None:
+            SwapOptimizersContainer.swap_to_device_stream = self._device_module.Stream()
+            SwapOptimizersContainer.swap_to_host_stream = self._device_module.Stream()
+        self._swap_to_device_stream = SwapOptimizersContainer.swap_to_device_stream
+        self._swap_to_host_stream = SwapOptimizersContainer.swap_to_host_stream
+        self._muon_swap_states: dict[int, SwapMuonState] = {}
+        muon_optim = self.optimizers[0]
+        if not isinstance(muon_optim, DistributedMuon):
+            raise TypeError(f"First optimizer must be DistributedMuon, got {type(muon_optim)}")
+        if not muon_optim.fsdp_enabled:
+            raise RuntimeError("Swap optimizer requires FSDP to be enabled; DDP is not supported")
+        muon_optim._swap_enabled = True
+        muon_optim._swap_container = self
+        muon_optim._swap_merge_buckets = swap_merge_buckets
+        muon_optim._device_module = self._device_module
+        muon_optim._swap_to_device_stream = self._swap_to_device_stream
+        muon_optim._swap_to_host_stream = self._swap_to_host_stream
+        self._enable_adamw_swap(swap_optimizer_times)
+        self._pre_init_swap_states()
+        logger.info(
+            f"[SwapMuon] Built SwapMuonHybridOptimizersContainer "
+            f"swap_optimizer_times={swap_optimizer_times} | "
+            f"swap_merge_buckets={swap_merge_buckets} | "
+            f"muon_swap_states={len(self._muon_swap_states)}"
+        )
+
+    @property
+    def muon_swap_states(self):
+        return self._muon_swap_states
+
+    def step(self, *args, **kwargs) -> None:
+        self.optimizers[0].step(*args, **kwargs)
+        if len(self.optimizers) > 1:
+            self.optimizers[1].step(*args, **kwargs)
+
+    def get_swap_state(self, param_id: int):
+        return self._muon_swap_states.get(param_id)
+
+    def state_dict(self) -> dict[str, Any]:
+        self._wait_pending_swap_to_host()
+        merged = {}
+        muon_optim = self.optimizers[0]
+        for model in self.model_parts:
+            merged.update(self._muon_state_dict_for_model(model, muon_optim))
+        adamw_optim = self.optimizers[1] if len(self.optimizers) > 1 else None
+        if adamw_optim is not None:
+            for model in self.model_parts:
+                merged.update(self._adamw_state_dict_for_model(model, adamw_optim))
+        return merged
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        muon_optim = self.optimizers[0]
+        if not self._muon_swap_states:
+            self._ensure_swap_states_initialized()
+        for model in self.model_parts:
+            self._load_muon_state_dict_for_model(model, muon_optim, state_dict)
+        adamw_optim = self.optimizers[1] if len(self.optimizers) > 1 else None
+        if adamw_optim is not None:
+            adamw_optim.param_to_group_map = {}
+            for model in self.model_parts:
+                self._load_adamw_state_dict_for_model(model, adamw_optim, state_dict)
+        SwapOptimizersContainer.empty_device_cache()
+
+    def _muon_state_dict_for_model(self, model, muon_optim):
+        merged = {}
+        fqns_by_param = SwapOptimizersContainer.fqns_by_param(model)
+        for group in muon_optim.param_groups:
+            self._serialize_group_state(group, fqns_by_param, muon_optim, merged)
+        return merged
+
+    def _serialize_group_state(self, group, fqns_by_param, muon_optim, merged):
+        for param in group["params"]:
+            if param not in fqns_by_param:
+                continue
+            fqn = fqns_by_param[param][0]
+            self._serialize_param_state(param, fqn, group, muon_optim, merged)
+
+    def _load_muon_state_dict_for_model(self, model, muon_optim, state_dict):
+        fqns_by_param = SwapOptimizersContainer.fqns_by_param(model)
+        for group in muon_optim.param_groups:
+            self._load_muon_group_state(group, fqns_by_param, muon_optim, state_dict)
+
+    def _load_muon_group_state(self, group, fqns_by_param, muon_optim, state_dict):
+        loaded_group = False
+        for param in group["params"]:
+            if param not in fqns_by_param:
+                continue
+            fqns = fqns_by_param[param]
+            if not loaded_group:
+                SwapOptimizersContainer.load_param_group(group, fqns, state_dict)
+                loaded_group = True
+            self._load_param_state(param, fqns, group, muon_optim, state_dict)
+
+    def _enable_adamw_swap(self, swap_optimizer_times: int):
+        adamw_optim = self.optimizers[1] if len(self.optimizers) > 1 else None
+        if adamw_optim is None:
+            return
+        adamw_optim.param_to_group_map = {}
+        for group in adamw_optim.param_groups:
+            for p in group["params"]:
+                adamw_optim.param_to_group_map[p] = group
+                SwapOptimizersContainer.param_state_initialization(p, adamw_optim)
+        swap_num = sum(unwrap_dtensor(p).numel() for group in adamw_optim.param_groups for p in group["params"])
+        adamw_optim.swap_numel = swap_num // swap_optimizer_times
+        adamw_optim.step = swap_optimizer_step.__get__(adamw_optim, type(adamw_optim))
+        adamw_param_count = len(adamw_optim.param_groups[0]["params"])
+        logger.info(f"[SwapMuon] AdamW swap enabled: {adamw_param_count} params | swap_numel={adamw_optim.swap_numel}")
+
+    def _pre_init_swap_states(self):
+        muon_optim = self.optimizers[0]
+        pre_init_count = 0
+        for group in muon_optim.param_groups:
+            for p in group["params"]:
+                if not p.requires_grad:
+                    continue
+                state = muon_optim.state.setdefault(p, {})
+                local_p = unwrap_dtensor(p)
+                zero_buf = torch.zeros_like(local_p)
+                if isinstance(p, DTensor):
+                    zero_buf = wrap_like_param(zero_buf, p)
+                state["momentum_buffer"] = zero_buf
+                swap_state = SwapMuonState(p, self._device_module)
+                swap_state.optim_state = state
+                swap_state.init_from_momentum_buffer(zero_buf)
+                self._muon_swap_states[id(p)] = swap_state
+                pre_init_count += 1
+        logger.info(
+            f"[SwapMuon] Pre-init swap states: {pre_init_count} momentum_buffers created (zeros) and offloaded to CPU"
+        )
+
+    def _serialize_param_state(self, param, fqn, group, muon_optim, merged):
+        merged[f"state.{fqn}.momentum_buffer"] = self._serialize_momentum_buffer(param, muon_optim)
+        state = muon_optim.state.get(param, {})
+        step = SwapOptimizersContainer.state_step_for_state_dict(muon_optim, param, state)
+        if step is not None:
+            merged[f"state.{fqn}.step"] = step
+        SwapOptimizersContainer.add_param_group_to_state_dict(merged, group, fqn)
+
+    def _serialize_momentum_buffer(self, param, muon_optim):
+        swap_state = self._muon_swap_states.get(id(param))
+        if swap_state is not None and swap_state.cpu_momentum is not None:
+            cpu_tensor = SwapOptimizersContainer.clone_to_cpu_cache(swap_state.cpu_momentum)
+            if isinstance(param, DTensor):
+                cpu_tensor = wrap_like_param_without_device_move(cpu_tensor, param)
+            return cpu_tensor
+        local_p = unwrap_dtensor(param)
+        placeholder = torch.zeros_like(local_p, device="cpu")
+        if isinstance(param, DTensor):
+            placeholder = wrap_like_param_without_device_move(placeholder, param)
+        return placeholder
+
+    def _load_param_state(self, param, fqns, group, muon_optim, state_dict):
+        swap_state = self._muon_swap_states.get(id(param))
+        if swap_state is not None:
+            value = SwapOptimizersContainer.state_dict_value_for_fqns(state_dict, "state", fqns, "momentum_buffer")
+            if value is not SwapOptimizersContainer.MISSING:
+                self._load_momentum_from_state_dict(swap_state, value, muon_optim, param)
+        self._load_step_from_state_dict(state_dict, fqns, group)
+
+    def _load_momentum_from_state_dict(self, swap_state, value, muon_optim, param):
+        swap_state.cpu_momentum = SwapOptimizersContainer.clone_to_cpu_cache(value)
+        if swap_state.cpu_momentum is not None:
+            swap_state.buf_shape = swap_state.cpu_momentum.shape
+            swap_state.buf_dtype = swap_state.cpu_momentum.dtype
+        state = muon_optim.state.get(param, {})
+        buf = state.get("momentum_buffer")
+        if buf is not None:
+            buf_local = buf.to_local() if isinstance(buf, DTensor) else buf
+            if buf_local.untyped_storage().size() != 0:
+                buf_local.zero_()
+        state["momentum_buffer"] = None
+        swap_state.on_device = False
+
+    def _load_step_from_state_dict(self, state_dict, fqns, group):
+        step = SwapOptimizersContainer.state_dict_value_for_fqns(state_dict, "state", fqns, "step")
+        if step is SwapOptimizersContainer.MISSING:
+            step = SwapOptimizersContainer.state_dict_value_for_fqns(state_dict, "param_groups", fqns, "step")
+        if step is not SwapOptimizersContainer.MISSING:
+            group["step"] = SwapOptimizersContainer.clone_loaded_value(step)
+
+    def _wait_pending_swap_to_host(self):
+        SwapOptimizersContainer.wait_pending_swap_to_host()
+
+    def _ensure_swap_states_initialized(self):
+        muon_optim = self.optimizers[0]
+        for group in muon_optim.param_groups:
+            for p in group["params"]:
+                if not p.requires_grad:
+                    continue
+                pid = id(p)
+                if pid in self._muon_swap_states:
+                    continue
+                state = muon_optim.state.setdefault(p, {})
+                if "momentum_buffer" not in state or state["momentum_buffer"] is None:
+                    local_p = unwrap_dtensor(p)
+                    cpu_buf = torch.zeros_like(local_p, pin_memory=True, device="cpu")
+                    state["momentum_buffer"] = None
+                    swap_state = SwapMuonState(p, self._device_module)
+                    swap_state.optim_state = state
+                    swap_state.cpu_momentum = cpu_buf
+                    swap_state.buf_shape = local_p.shape
+                    swap_state.buf_dtype = local_p.dtype
+                    swap_state.on_device = False
+                else:
+                    swap_state = SwapMuonState(p, self._device_module)
+                    swap_state.optim_state = state
+                self._muon_swap_states[pid] = swap_state
+
+    def _adamw_state_dict_for_model(self, model, optim):
+        fqns_by_param = SwapOptimizersContainer.fqns_by_param(model)
+        state_dict = {}
+        for group in optim.param_groups:
+            for param in group["params"]:
+                if param not in fqns_by_param:
+                    continue
+                fqn = fqns_by_param[param][0]
+                SwapOptimizersContainer.add_param_state_to_state_dict(state_dict, optim, param, fqn)
+                SwapOptimizersContainer.add_param_group_to_state_dict(state_dict, group, fqn)
+        return state_dict
+
+    def _load_adamw_state_dict_for_model(self, model, optim, state_dict):
+        fqns_by_param = SwapOptimizersContainer.fqns_by_param(model)
+        for group in optim.param_groups:
+            loaded_group = False
+            for param in group["params"]:
+                if param not in fqns_by_param:
+                    continue
+                optim.param_to_group_map[param] = group
+                fqns = fqns_by_param[param]
+                if not loaded_group:
+                    SwapOptimizersContainer.load_param_group(group, fqns, state_dict)
+                    loaded_group = True
+                SwapOptimizersContainer.load_param_state(optim, param, fqns, state_dict)

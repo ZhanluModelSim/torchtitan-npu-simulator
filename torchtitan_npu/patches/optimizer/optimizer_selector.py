@@ -12,53 +12,146 @@ from torchtitan.components.optimizer import OptimizersContainer
 logger = logging.getLogger(__name__)
 
 
+def _build_muon_config_kwargs(config: Any) -> dict[str, Any]:
+    return {
+        "name": config.name,
+        "lr": config.lr,
+        "beta1": config.beta1,
+        "beta2": config.beta2,
+        "eps": config.eps,
+        "weight_decay": config.weight_decay,
+        "implementation": config.implementation,
+        "muon_lr": getattr(config, "muon_lr", None),
+        "muon_momentum": getattr(config, "muon_momentum", 0.95),
+        "muon_enable_nesterov": getattr(config, "muon_enable_nesterov", True),
+        "muon_ns_steps": getattr(config, "muon_ns_steps", 5),
+        "muon_adjust_lr_fn": getattr(config, "muon_adjust_lr_fn", "match_rms_adamw"),
+        "muon_hybrid_ns": getattr(config, "muon_hybrid_ns", False),
+        "extra_param_group_split_rules": getattr(config, "extra_param_group_split_rules", None),
+    }
+
+
 class NpuOptimizerDispatcher:
     _virtual_patched = False
     _swap_patched = False
 
     @staticmethod
     def dispatch_build(self: Any, **kwargs) -> OptimizersContainer:
-        config_fields = {f.name for f in fields(self)}
-        overlap = config_fields & kwargs.keys()
-        if overlap:
-            raise ValueError(f"build() kwargs {overlap} overlap with config fields.")
+        NpuOptimizerDispatcher._check_build_kwargs(self, kwargs)
 
         is_virtual = getattr(self, "virtual_optimizer", False)
         is_swap = getattr(self, "swap_optimizer", False)
+        optimizer_name = getattr(self, "name", None)
 
         if is_virtual and is_swap:
             raise ValueError("Cannot enable both virtual_optimizer and swap_optimizer at the same time.")
 
+        # Muon optimizer routing
+        if optimizer_name == "Muon":
+            if is_virtual:
+                raise ValueError("Muon does not support virtual_optimizer. Use swap_optimizer for Muon.")
+            return NpuOptimizerDispatcher._build_muon_optimizer(self, is_swap, kwargs)
+
         if is_virtual:
-            logger.info("[OptimizerDispatcher] Using VirtualOptimizer")
+            return NpuOptimizerDispatcher._build_virtual_optimizer(self, kwargs)
 
-            from .virtual_optimizer import VirtualOptimizersContainer
+        if is_swap:
+            return NpuOptimizerDispatcher._build_swap_optimizer(self, kwargs)
 
-            NpuOptimizerDispatcher._apply_virtual_patch()
+        return NpuOptimizerDispatcher._build_standard_optimizer(self, kwargs)
 
-            return VirtualOptimizersContainer(config=replace(self), **kwargs)
+    @staticmethod
+    def _check_build_kwargs(config: Any, kwargs) -> None:
+        config_fields = {f.name for f in fields(config)}
+        overlap = config_fields & kwargs.keys()
+        if overlap:
+            raise ValueError(f"build() kwargs {overlap} overlap with config fields.")
 
-        elif is_swap:
-            logger.info("[OptimizerDispatcher] Using SwapOptimizer")
+    @staticmethod
+    def _resolve_parallel_dims(kwargs):
+        from torchtitan_npu.patches.torchtitan._trainer_config_stash import (
+            get_active_parallel_dims,
+        )
 
-            from .swap_optimizer import SwapOptimizersContainer
-
-            NpuOptimizerDispatcher._apply_swap_patch()
-
-            return SwapOptimizersContainer(config=replace(self), **kwargs)
-
-        else:
-            logger.info("[OptimizerDispatcher] Using standard Optimizer")
-            base_config = OptimizersContainer.Config(
-                name=self.name,
-                lr=self.lr,
-                beta1=self.beta1,
-                beta2=self.beta2,
-                eps=self.eps,
-                weight_decay=self.weight_decay,
-                implementation=self.implementation,
+        parallel_dims = kwargs.get("parallel_dims") or get_active_parallel_dims()
+        if parallel_dims is None:
+            raise RuntimeError(
+                "parallel_dims is required for Muon optimizer but not available. "
+                "Ensure Trainer.init_distributed() has been called before "
+                "config.optimizer.build()."
             )
-            return OptimizersContainer(config=base_config, **kwargs)
+        return parallel_dims
+
+    @staticmethod
+    def _build_muon_optimizer(config: Any, is_swap: bool, kwargs):
+        parallel_dims = NpuOptimizerDispatcher._resolve_parallel_dims(kwargs)
+        if is_swap:
+            return NpuOptimizerDispatcher._build_swap_muon_optimizer(config, parallel_dims, kwargs)
+
+        logger.info("[OptimizerDispatcher] Using MuonOptimizer")
+        from .muon_optimizer import MuonHybridOptimizersContainer
+
+        cfg = MuonHybridOptimizersContainer.Config(**_build_muon_config_kwargs(config))
+        return cfg.build(
+            model_parts=kwargs["model_parts"], parallel_dims=parallel_dims, ft_manager=kwargs.get("ft_manager")
+        )
+
+    @staticmethod
+    def _build_swap_muon_optimizer(config: Any, parallel_dims, kwargs):
+        logger.info("[OptimizerDispatcher] Using SwapMuonOptimizer")
+        from .swap_optimizer import SwapMuonHybridOptimizersContainer
+
+        cfg_kwargs = _build_muon_config_kwargs(config)
+        cfg_kwargs.update(
+            swap_optimizer_times=getattr(config, "swap_optimizer_times", 16),
+            swap_merge_buckets=getattr(config, "swap_merge_buckets", 1),
+        )
+        cfg = SwapMuonHybridOptimizersContainer.Config(
+            **cfg_kwargs,
+        )
+        return cfg.build(
+            model_parts=kwargs["model_parts"], parallel_dims=parallel_dims, ft_manager=kwargs.get("ft_manager")
+        )
+
+    @staticmethod
+    def _build_virtual_optimizer(config: Any, kwargs):
+        virtual_size = getattr(config, "virtual_optimizer_size", None)
+        if virtual_size is None:
+            raise ValueError("virtual_optimizer_size must be specified when virtual_optimizer is enabled.")
+
+        logger.info("[OptimizerDispatcher] Using VirtualOptimizer")
+
+        from .virtual_optimizer import VirtualOptimizersContainer
+
+        NpuOptimizerDispatcher._apply_virtual_patch()
+
+        container_kwargs = {k: v for k, v in kwargs.items() if k in ("model_parts",)}
+        return VirtualOptimizersContainer(config=replace(config), **container_kwargs)
+
+    @staticmethod
+    def _build_swap_optimizer(config: Any, kwargs):
+        logger.info("[OptimizerDispatcher] Using SwapOptimizer")
+
+        from .swap_optimizer import SwapOptimizersContainer
+
+        NpuOptimizerDispatcher._apply_swap_patch()
+
+        container_kwargs = {k: v for k, v in kwargs.items() if k in ("model_parts",)}
+        return SwapOptimizersContainer(config=replace(config), **container_kwargs)
+
+    @staticmethod
+    def _build_standard_optimizer(config: Any, kwargs):
+        logger.info("[OptimizerDispatcher] Using standard Optimizer")
+        base_config = OptimizersContainer.Config(
+            name=config.name,
+            lr=config.lr,
+            beta1=config.beta1,
+            beta2=config.beta2,
+            eps=config.eps,
+            weight_decay=config.weight_decay,
+            implementation=config.implementation,
+        )
+        return OptimizersContainer(config=base_config, **kwargs)
 
     @classmethod
     def _apply_virtual_patch(cls):

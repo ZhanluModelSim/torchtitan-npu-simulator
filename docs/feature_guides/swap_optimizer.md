@@ -89,3 +89,9 @@ state；加载时会恢复 CPU cache 并重建 device 侧 zero-storage placehold
 
 DTensor 参数会保留 device mesh、placements 和全局 shape/stride metadata，
 保存 checkpoint 时不会把 CPU cache tensor 回搬到 NPU。
+
+## Muon 联用说明
+
+当 `optimizer.name = "Muon"` 且 `swap_optimizer = true` 时，会走 Muon + Swap 的混合优化器分支。此时 Swap 仍然负责优化器状态的 CPU 卸载与按需换入，Muon 侧的 `momentum_buffer` 也会按同样的流水线处理。
+
+`swap_merge_buckets` 只影响 Muon momentum_buffer 的 H2D/D2H 合并粒度，不影响普通 AdamW Swap 的配置语义。

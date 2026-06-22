@@ -94,7 +94,27 @@ class OptimizerConfig(OptimizersContainer.Config):
     """
     Learning rate adjustment function for Muon. Options:
       - None or 'original': sqrt(max(1, A/B)) ratio (muon_lr is used if specified)
-      - 'match_rms_adamw': 0.2 * sqrt(max(A, B)) ratio (muon_lr ignored, uses base lr)
+      - 'match_rms_adamw': 0.18 * sqrt(max(A, B)) ratio (muon_lr ignored, uses base lr)
+    """
+
+    muon_hybrid_ns: bool = False
+    """
+    Whether to use hybrid Newton-Schulz iteration for Muon.
+    When True, uses 8 primary + 2 secondary NS steps instead of a single ns_steps count.
+    """
+
+    extra_param_group_split_rules: list[dict] | None = None
+    """
+    Extra parameter group split rules for Muon optimizer.
+    Each rule is a dict with 'str_match' (regex) and optional overrides
+    (lr, backend_steps, etc.) for matching parameter groups.
+    """
+
+    swap_merge_buckets: int = 1
+    """
+    (Muon only) Number of communication buckets to merge during swap optimizer step.
+    Higher values reduce the number of H2D/D2H roundtrips at the cost of
+    higher peak memory during the merge group.
     """
 
 
