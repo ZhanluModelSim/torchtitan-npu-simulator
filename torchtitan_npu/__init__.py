@@ -69,6 +69,7 @@ def _apply_patches():
     from .patches.torch import (  # noqa: F401
         checkpoint,
         clip_grad,
+        functional_collectives_p2p,
         pipelining,
     )
 

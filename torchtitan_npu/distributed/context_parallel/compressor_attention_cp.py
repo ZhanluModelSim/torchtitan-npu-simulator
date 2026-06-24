@@ -101,14 +101,20 @@ class _WindowExchange(torch.autograd.Function):
 
 
 def _allgather_seq(tensor: torch.Tensor, mesh: DeviceMesh, seq_dim: int = 1) -> torch.Tensor:
-    gathered = ft_c.all_gather_tensor_autograd(tensor.contiguous(), gather_dim=seq_dim, group=mesh.get_group())
+    group = mesh.get_group()
+    group_size = group.size()
+    # Gathering along seq_dim routes through torch._utils._maybe_view_chunk_cat,
+    # which is on Dynamo's MOD_SKIPLIST and cannot be traced under fullgraph
+    # compile. Gather on dim 0 instead (that path skips the helper), then move the
+    # result onto seq_dim with traceable chunk-then-cat ops of equivalent meaning.
+    gathered = ft_c.all_gather_tensor_autograd(tensor.contiguous(), gather_dim=0, group=group)
     if isinstance(gathered, ft_c.AsyncCollectiveTensor):
         # NOTE: Do NOT call gathered.wait(), as it returns inner elem tensor
         # which was detached by the autograd boundary (_wrap_tensor_autograd
         # or _FromTorchTensor) and therefore has requires_grad=False. Causing
         # broken backward gradient flow.
         gathered = torch.ops._c10d_functional.wait_tensor(gathered)
-    return gathered
+    return torch.cat(torch.chunk(gathered, group_size, dim=0), dim=seq_dim)
 
 
 class CompressorAttentionCP(ParallelStyle):
