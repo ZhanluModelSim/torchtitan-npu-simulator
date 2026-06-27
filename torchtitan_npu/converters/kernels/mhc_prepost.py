@@ -9,6 +9,7 @@ import logging
 import torch
 import torch_npu
 from torch import Tensor, nn
+from torch.distributed.tensor import DTensor
 
 from torchtitan_npu.converters.convert_utils import replace_module_with_name
 from torchtitan_npu.converters.model_custom_interface import (
@@ -25,6 +26,10 @@ logger = logging.getLogger(__name__)
 
 def _none_grads(count: int) -> tuple[None, ...]:
     return (None,) * count
+
+
+def _to_local_tensor(tensor: Tensor) -> Tensor:
+    return tensor.to_local() if isinstance(tensor, DTensor) else tensor
 
 
 class MHCPre(torch.autograd.Function):
@@ -321,13 +326,18 @@ class NpuHcHead(HcHead):
             y (torch.Tensor):
                 Weighted aggregated output of shape `[B, S, D]`.
         """
+        if isinstance(x, DTensor):
+            raise ValueError("NpuHcHead expects local tensor input; apply HcHeadParallelStyle with local TP input.")
         x = x.flatten(2)
+        hc_head_fn = _to_local_tensor(self.hc_head_fn)
+        hc_head_scale = _to_local_tensor(self.hc_head_scale)
+        hc_head_base = _to_local_tensor(self.hc_head_base)
 
         y = MHCPreOnlyTriton.apply(
             x,  # x
-            self.hc_head_fn,  # weight
-            self.hc_head_scale,  # branch_alpha
-            self.hc_head_base,  # branch_beta
+            hc_head_fn,  # weight
+            hc_head_scale,  # branch_alpha
+            hc_head_base,  # branch_beta
             None,  # norm_gamma
             False,  # mhc_use_gamma
             self.hc_eps,  # eps
