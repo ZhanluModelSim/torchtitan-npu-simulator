@@ -48,8 +48,7 @@ def _select_freqs_cis(
     first row. (Per-document positions under CP differ per row and are not
     supported by the fused op.)
     """
-    if freqs_cis_local.is_conj():
-        freqs_cis_local = freqs_cis_local.resolve_conj()
+    freqs_cis_local = freqs_cis_local.resolve_conj()
     if positions is None:
         return freqs_cis_local[0:seqlen]
     pos = positions[0] if positions.dim() > 1 else positions
