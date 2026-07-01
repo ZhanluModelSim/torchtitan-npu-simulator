@@ -358,3 +358,26 @@ def test_patch_registers_torch_meta_as_a_device_accessor_module():
         unpatch_device_type_to_meta()
         assert hasattr(torch, "meta") == had_meta_before
 
+
+def test_patch_redirects_torch_npu_module_to_meta_stub_when_present():
+    # Regression test for a real crash found via the 16-layer
+    # DeepSeek-V4-Pro smoke run (backward pass, FSDP2 finalize): torch_npu
+    # registers itself as `torch.npu` AND patches core PyTorch internals
+    # to call it directly, hardcoded -- e.g. torch_npu's own FSDP2 patch
+    # (torch_npu/distributed/fsdp/_add_fsdp_patch.py
+    # ::_patched_finalize_backward) calls
+    # `torch.npu.current_stream().wait_event(event)` unconditionally,
+    # bypassing every device_type/device_module indirection patched
+    # elsewhere and triggering a real aclInit() hardware init with no NPU
+    # device present. Skipped (not failed) when torch_npu (and therefore
+    # torch.npu) is not installed.
+    pytest.importorskip("torch_npu", reason="torch_npu-specific regression test")
+    had_npu_before = hasattr(torch, "npu")
+    try:
+        patch_device_type_to_meta()
+        assert torch.npu.current_stream().query() is True
+        assert torch.npu.current_device() == 0
+    finally:
+        unpatch_device_type_to_meta()
+        assert hasattr(torch, "npu") == had_npu_before
+

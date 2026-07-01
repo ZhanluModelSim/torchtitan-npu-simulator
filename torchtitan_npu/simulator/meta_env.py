@@ -489,6 +489,23 @@ def patch_device_type_to_meta() -> None:
     _original_values[("torch", "meta")] = getattr(torch, "meta", _MISSING)
     torch.meta = stub
 
+    # torch_npu registers itself as `torch.npu` (the real device-accessor
+    # module, e.g. `torch.npu.current_stream()`/`.current_device()`) and
+    # ALSO patches core PyTorch internals to call it directly, hardcoded,
+    # bypassing every device_type/device_module indirection above --
+    # e.g. torch_npu's own FSDP2 patch (`torch_npu/distributed/fsdp/
+    # _add_fsdp_patch.py::_patched_finalize_backward`) calls
+    # `torch.npu.current_stream().wait_event(event)` unconditionally
+    # during the backward pass, triggering a real aclInit() hardware
+    # init with no NPU device present. Redirecting `torch.npu` itself to
+    # the same meta stub (mirroring `torch.meta` above) covers this and
+    # any other such hardcoded `torch.npu.*` call generically. Only
+    # relevant when torch_npu is installed (`torch.npu` does not exist
+    # otherwise), but the sentinel-based save/restore logic in
+    # `unpatch_device_type_to_meta` handles the "did not exist" case too.
+    _original_values[("torch", "npu")] = getattr(torch, "npu", _MISSING)
+    torch.npu = stub
+
     _neutralize_torch_npu_optimizer_device_probe()
     _patch_swap_optimizer_get_device_info(stub)
     _patch_tensor_npu_method_to_meta()
