@@ -82,8 +82,8 @@ class _MetaDeviceModule:
     def is_initialized(self) -> bool:
         return True
 
-    def current_stream(self, *_args: Any, **_kwargs: Any) -> None:
-        return None
+    def current_stream(self, *_args: Any, **_kwargs: Any) -> "_MetaDeviceModule.Stream":
+        return _MetaDeviceModule.Stream()
 
     @contextmanager
     def stream(self, *_args: Any, **_kwargs: Any):
@@ -93,8 +93,16 @@ class _MetaDeviceModule:
         return ""
 
     class Event:
+        """Matches `torch.Event`'s generic API surface (`query`, `record`,
+        `synchronize`, `wait`, `elapsed_time`) -- FSDP2's collectives code
+        (`torch/distributed/fsdp/_fully_shard/_fsdp_collectives.py`) calls
+        these on the Event objects returned by `Stream.record_event()`."""
+
         def __init__(self, *_args: Any, **_kwargs: Any) -> None:
             pass
+
+        def query(self) -> bool:
+            return True
 
         def record(self, *_args: Any, **_kwargs: Any) -> None:
             return None
@@ -109,10 +117,29 @@ class _MetaDeviceModule:
             return 0.0
 
     class Stream:
+        """Matches `torch.Stream`'s generic API surface (`query`,
+        `record_event`, `synchronize`, `wait_event`, `wait_stream`) --
+        FSDP2's `foreach_all_gather`/`foreach_reduce` call these directly
+        on `device_module.Stream()`/`device_handle.current_stream()`
+        instances during every forward/backward pass, independent of the
+        `capture_fake_collectives()` interception layer (Task 10), which
+        only covers `torch.distributed`-level collective calls."""
+
         def __init__(self, *_args: Any, **_kwargs: Any) -> None:
             pass
 
+        def query(self) -> bool:
+            return True
+
+        def record_event(self, event: "_MetaDeviceModule.Event | None" = None) -> "_MetaDeviceModule.Event":
+            event = event or _MetaDeviceModule.Event()
+            event.record(self)
+            return event
+
         def synchronize(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        def wait_event(self, *_args: Any, **_kwargs: Any) -> None:
             return None
 
         def wait_stream(self, *_args: Any, **_kwargs: Any) -> None:

@@ -169,6 +169,19 @@ def test_patch_registers_torch_meta_as_a_device_accessor_module():
         event = torch.meta.Event()
         event.record()
         event.synchronize()
+
+        # FSDP2's foreach_all_gather/foreach_reduce (exercised on every
+        # forward/backward pass) construct Stream()s via device_handle
+        # (our torch.meta stub) with a `priority=` kwarg, then call
+        # record_event()/wait_event()/wait_stream() on them and
+        # device_handle.current_stream() directly -- found via the
+        # 16-layer DeepSeek-V4-Pro smoke run.
+        stream = torch.meta.Stream(priority=-1)
+        recorded_event = stream.record_event()
+        assert isinstance(recorded_event, torch.meta.Event)
+        stream.wait_event(recorded_event)
+        stream.wait_stream(torch.meta.current_stream())
+        assert torch.meta.current_stream().query() is True
     finally:
         unpatch_device_type_to_meta()
         assert hasattr(torch, "meta") == had_meta_before
