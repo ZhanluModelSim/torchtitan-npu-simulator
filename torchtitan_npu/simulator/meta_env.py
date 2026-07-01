@@ -162,6 +162,7 @@ _original_values: dict[tuple[str, str], Any] = {}
 _original_fsdp_validate_no_meta_params: Any = _MISSING
 _original_tensor_npu_method: Any = _MISSING
 _original_torch_full: Any = _MISSING
+_original_grouped_mm: Any = _MISSING
 _original_moe_token_dispatch: Any = _MISSING
 _patched = False
 
@@ -218,6 +219,38 @@ def _patch_torch_full_npu_device_literal() -> None:
         return _original_torch_full(*args, **kwargs)
 
     torch.full = _meta_safe_full
+
+
+def _patch_grouped_mm_offsets_dtype() -> None:
+    """`torchtitan_npu.converters.kernels.gmm._run_experts_grouped_mm`
+    computes MoE grouped-matmul offsets via
+    `torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int64)`, then
+    passes them to `torch._grouped_mm(..., offs=offsets)`. PyTorch's
+    generic meta-kernel registration for `_grouped_mm`
+    (`torch/_meta_registrations.py::meta_grouped_mm`) strictly requires
+    `offs.dtype == torch.int32` and raises otherwise -- a check the real
+    NPU kernel apparently does not enforce (this code path is presumably
+    exercised routinely in real, non-simulated training), so it only
+    surfaces once every op is forced through the generic meta-kernel
+    under this simulator. Wraps `torch._grouped_mm` to downcast an
+    `int64` `offs` kwarg to `int32` transparently; passes every other
+    call through unchanged. Values themselves are never read (this cast
+    is dtype-only, shape/value-preserving), so it is safe regardless of
+    whether the underlying tensor is on meta or a real device."""
+    global _original_grouped_mm
+    if not hasattr(torch, "_grouped_mm"):
+        return
+    if _original_grouped_mm is not _MISSING:
+        return
+    _original_grouped_mm = torch._grouped_mm
+
+    def _meta_safe_grouped_mm(*args: Any, **kwargs: Any) -> torch.Tensor:
+        offs = kwargs.get("offs")
+        if offs is not None and offs.dtype == torch.int64:
+            kwargs["offs"] = offs.to(torch.int32)
+        return _original_grouped_mm(*args, **kwargs)
+
+    torch._grouped_mm = _meta_safe_grouped_mm
 
 
 def _neutralize_torch_npu_optimizer_device_probe() -> None:
@@ -375,12 +408,13 @@ def patch_device_type_to_meta() -> None:
     why), neutralize `torch_npu`'s real-hardware optimizer device probe,
     swap-optimizer device stream construction, explicit
     `torch.Tensor.npu()` calls, a hardcoded `torch.full(...,
-    device="npu")` literal, and MoE dispatch's real-data-dependent
-    all-to-all split-size computation (see
-    `_neutralize_torch_npu_optimizer_device_probe`,
+    device="npu")` literal, a grouped-matmul offsets dtype mismatch, and
+    MoE dispatch's real-data-dependent all-to-all split-size computation
+    (see `_neutralize_torch_npu_optimizer_device_probe`,
     `_patch_swap_optimizer_get_device_info`,
     `_patch_tensor_npu_method_to_meta`,
-    `_patch_torch_full_npu_device_literal`, and
+    `_patch_torch_full_npu_device_literal`,
+    `_patch_grouped_mm_offsets_dtype`, and
     `_patch_moe_dispatch_to_avoid_meta_tensor_value_reads`), and disable
     FSDP2's meta-param validation (see
     `_neutralize_fsdp_meta_param_validation`)."""
@@ -405,6 +439,7 @@ def patch_device_type_to_meta() -> None:
     _patch_swap_optimizer_get_device_info(stub)
     _patch_tensor_npu_method_to_meta()
     _patch_torch_full_npu_device_literal()
+    _patch_grouped_mm_offsets_dtype()
     _patch_moe_dispatch_to_avoid_meta_tensor_value_reads()
     _neutralize_fsdp_meta_param_validation()
     _patched = True
@@ -413,7 +448,7 @@ def patch_device_type_to_meta() -> None:
 def unpatch_device_type_to_meta() -> None:
     """Restore the original device_type/device_module bindings (test-only helper)."""
     global _patched, _original_fsdp_validate_no_meta_params, _original_tensor_npu_method, _original_torch_full
-    global _original_moe_token_dispatch
+    global _original_moe_token_dispatch, _original_grouped_mm
     for (module_path, attr_name), original in _original_values.items():
         module = importlib.import_module(module_path)
         if original is _MISSING:
@@ -435,6 +470,10 @@ def unpatch_device_type_to_meta() -> None:
     if _original_torch_full is not _MISSING:
         torch.full = _original_torch_full
         _original_torch_full = _MISSING
+
+    if _original_grouped_mm is not _MISSING:
+        torch._grouped_mm = _original_grouped_mm
+        _original_grouped_mm = _MISSING
 
     if _original_moe_token_dispatch is not _MISSING:
         expert_parallel_cls, original_token_dispatch = _original_moe_token_dispatch

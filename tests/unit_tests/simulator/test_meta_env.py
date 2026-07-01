@@ -208,6 +208,32 @@ def test_patch_redirects_torch_full_npu_device_literal_to_meta():
         assert torch.full is original
 
 
+def test_patch_downcasts_grouped_mm_int64_offsets_to_int32():
+    # Regression test for a real crash found via the 16-layer
+    # DeepSeek-V4-Pro smoke run (MoE grouped-matmul forward):
+    # torchtitan_npu.converters.kernels.gmm._run_experts_grouped_mm builds
+    # offsets via torch.cumsum(..., dtype=torch.int64), but PyTorch's
+    # generic meta-kernel for torch._grouped_mm strictly requires
+    # offs.dtype == torch.int32 and raises otherwise -- a check the real
+    # NPU kernel apparently does not enforce. Pure PyTorch
+    # (torch._grouped_mm itself), so this test runs regardless of
+    # torch_npu availability.
+    if not hasattr(torch, "_grouped_mm"):
+        pytest.skip("torch._grouped_mm is not available in this torch build")
+    original = torch._grouped_mm
+    try:
+        patch_device_type_to_meta()
+        x = torch.randn(32, 16, dtype=torch.bfloat16, device="meta")
+        w = torch.randn(2, 32, 16, dtype=torch.bfloat16, device="meta")
+        offs_i64 = torch.tensor([16, 32], dtype=torch.int64, device="meta")
+        out = torch._grouped_mm(x, w.transpose(-2, -1), offs=offs_i64)
+        assert out.shape == (32, 32)
+        assert out.device.type == "meta"
+    finally:
+        unpatch_device_type_to_meta()
+        assert torch._grouped_mm is original
+
+
 def test_patch_moe_dispatch_avoids_meta_tensor_value_reads_when_fake():
     # Regression test for a real crash found via the 16-layer
     # DeepSeek-V4-Pro smoke run (MoE forward pass): NpuExpertParallel
