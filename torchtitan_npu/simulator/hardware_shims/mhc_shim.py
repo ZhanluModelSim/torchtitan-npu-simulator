@@ -12,8 +12,8 @@ their backward counterparts) into the active OpDispatchCapture, with analyticall
 from __future__ import annotations
 
 import torch
-import torch.nn as nn
 
+from torchtitan_npu.models.deepseek_v4.model import HcHead, HcPost, HcPre
 from torchtitan_npu.simulator.capture.dispatch_capture import get_active_capture
 
 
@@ -88,7 +88,7 @@ class _SimHcPreFn(torch.autograd.Function):
         return grad_x, grad_hc_fn, grad_branch_alpha, grad_branch_beta, None, None
 
 
-class SimHcPre(nn.Module):
+class SimHcPre(HcPre):
     """Drop-in simulator replacement for `NpuHcPre`/`NpuHcPreFused`
     (`torchtitan_npu.converters.kernels.mhc_prepost`). Same forward()
     signature; never runs real Triton/torch_npu, only records the real op
@@ -103,7 +103,7 @@ class SimHcPre(nn.Module):
     step reproduces both correctly without hardcoding `HcPre.Config`'s
     field names here."""
 
-    def __init__(self, parent: "HcPre") -> None:
+    def __init__(self, parent: HcPre) -> None:
         self.__dict__.update(parent.__dict__)
 
     def forward(self, x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor):
@@ -172,7 +172,7 @@ class _SimHcHeadFn(torch.autograd.Function):
         return grad_x, grad_hc_head_fn, grad_branch_alpha, grad_branch_beta, None, None
 
 
-class SimHcHead(nn.Module):
+class SimHcHead(HcHead):
     """Drop-in simulator replacement for `NpuHcHead`
     (`torchtitan_npu.converters.kernels.mhc_prepost`).
 
@@ -195,7 +195,7 @@ class SimHcHead(nn.Module):
     shape is `[hc_mult, hc_dim]`), not reference a nonexistent
     `self.hc_mult`."""
 
-    def __init__(self, parent: "HcHead") -> None:
+    def __init__(self, parent: HcHead) -> None:
         self.__dict__.update(parent.__dict__)
 
     def forward(self, x: torch.Tensor):
@@ -257,7 +257,7 @@ class _SimHcPostFn(torch.autograd.Function):
         return grad_x, grad_residual, grad_h_post, grad_h_res, None
 
 
-class SimHcPost(nn.Module):
+class SimHcPost(HcPost):
     """Drop-in simulator replacement for `NpuHcPost`
     (`torchtitan_npu.converters.kernels.mhc_prepost`). `__init__` mirrors
     `NpuHcPost.__init__(self, parent: HcPost)`'s `__dict__` shallow-copy
@@ -275,7 +275,7 @@ class SimHcPost(nn.Module):
     does the identical `y = y.view(dim_b, dim_s, dim_n, dim_d)` reshape
     at its very end (mhc_prepost.py:277) before returning to its caller."""
 
-    def __init__(self, parent: "HcPost") -> None:
+    def __init__(self, parent: HcPost) -> None:
         self.__dict__.update(parent.__dict__)
 
     def forward(self, x: torch.Tensor, residual: torch.Tensor, post: torch.Tensor, comb: torch.Tensor):
