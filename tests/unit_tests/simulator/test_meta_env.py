@@ -3,6 +3,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.nn as nn
@@ -204,6 +206,58 @@ def test_patch_redirects_torch_full_npu_device_literal_to_meta():
     finally:
         unpatch_device_type_to_meta()
         assert torch.full is original
+
+
+def test_patch_moe_dispatch_avoids_meta_tensor_value_reads_when_fake():
+    # Regression test for a real crash found via the 16-layer
+    # DeepSeek-V4-Pro smoke run (MoE forward pass): NpuExpertParallel
+    # ._token_dispatch (via _compute_all_to_all_splits) unconditionally
+    # calls `.to(torch.device("cpu"), ...)` then `.tolist()` on
+    # num_tokens_per_expert to compute all-to-all split sizes, even under
+    # a fake process group -- crashing with "Cannot copy out of meta
+    # tensor; no data!" since meta tensors have no real data. Per the
+    # user's original request, debug.moe_force_load_balance (forced True
+    # elsewhere) makes real routing perfectly uniform, so split sizes are
+    # statically derivable from shapes alone. Skipped (not failed) when
+    # torch_npu is not installed (this module directly imports torch_npu).
+    pytest.importorskip("torch_npu", reason="torch_npu-specific regression test")
+    import os
+
+    import torch.distributed as dist
+
+    import torchtitan_npu.converters.kernels.moe_dispatch as moe_dispatch_mod
+
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ["MASTER_PORT"] = "30513"
+    dist.init_process_group("fake", rank=0, world_size=8)
+    try:
+        patch_device_type_to_meta()
+
+        ep_degree = 8
+        num_experts = 16  # num_local_experts = 2
+        total_routed_tokens = 100  # deliberately NOT evenly divisible by ep_degree
+        hidden_dim = 4
+
+        fake_self = SimpleNamespace()
+        fake_device_mesh = SimpleNamespace(get_group=lambda: dist.group.WORLD, shape=(ep_degree,))
+        routed_input = torch.empty(total_routed_tokens, hidden_dim, device="meta")
+        num_tokens_per_expert = torch.empty(num_experts, dtype=torch.int64, device="meta")
+        routed_scores = torch.empty(total_routed_tokens, 1, device="meta")
+
+        result = moe_dispatch_mod.NpuExpertParallel._token_dispatch(
+            fake_self, None, (routed_input, num_tokens_per_expert, routed_scores), fake_device_mesh
+        )
+
+        out_routed_input, num_tokens_per_local_expert, out_routed_scores = result
+        assert out_routed_input.device.type == "meta"
+        assert sum(fake_self.output_splits) == total_routed_tokens
+        assert fake_self.input_splits == fake_self.output_splits
+        assert len(fake_self.output_splits) == ep_degree
+        assert num_tokens_per_local_expert.shape == (num_experts // ep_degree,)
+        assert out_routed_scores.device.type == "meta"
+    finally:
+        unpatch_device_type_to_meta()
+        dist.destroy_process_group()
 
 
 def test_patch_registers_torch_meta_as_a_device_accessor_module():

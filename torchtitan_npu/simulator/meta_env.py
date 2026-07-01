@@ -162,6 +162,7 @@ _original_values: dict[tuple[str, str], Any] = {}
 _original_fsdp_validate_no_meta_params: Any = _MISSING
 _original_tensor_npu_method: Any = _MISSING
 _original_torch_full: Any = _MISSING
+_original_moe_token_dispatch: Any = _MISSING
 _patched = False
 
 
@@ -268,6 +269,80 @@ def _patch_swap_optimizer_get_device_info(stub: _MetaDeviceModule) -> None:
     swap_optimizer_mod.get_device_info = lambda: ("meta", stub)
 
 
+def _patch_moe_dispatch_to_avoid_meta_tensor_value_reads() -> None:
+    """`NpuExpertParallel._token_dispatch` (via `_compute_all_to_all_splits`)
+    unconditionally calls `.to(torch.device("cpu"), ...)` then `.tolist()`
+    on `num_tokens_per_expert` (a real-data-dependent read of "how many
+    tokens were routed to each expert") to compute all-to-all split sizes
+    -- even under a fake process group, where `is_fake_process_group`
+    already skips the real communication itself but not this real-data
+    read. Meta tensors have no data (`NotImplementedError: Cannot copy out
+    of meta tensor; no data!`).
+
+    Per the user's original request ("MoE 路由分发策略等需要动态运行数据的，
+    默认采用打patch的方式进行强制负载均衡"): `debug.moe_force_load_balance`
+    (already forced True by `force_moe_load_balance`, Task 17) makes
+    real routing perfectly uniform, so the split sizes are staticly
+    derivable from `routed_input.shape[0]` (total routed tokens) and
+    `ep_degree` alone -- no tensor-value read is needed. Replaces
+    `_token_dispatch`'s fake-mode branch to compute
+    `input_splits`/`output_splits` analytically (only their *sum* is ever
+    consumed downstream, as `output_size=` for a `.repeat_interleave()`
+    call that -- verified empirically -- has a working meta kernel given
+    an explicit `output_size`), keeping every other op
+    (`torch_npu.npu_moe_token_permute`, `.sum(dim=...)` reductions that
+    stay as tensors) unchanged from the original implementation. Falls
+    back to the real, unpatched implementation whenever the process group
+    is not fake. No-op if torch_npu (and therefore this torchtitan_npu
+    submodule) is not importable.
+
+    Tracked separately from `_original_values` (a class attribute, not a
+    module attribute -- `importlib.import_module()` cannot resolve
+    `"...NpuExpertParallel"` as a module path, same reasoning as
+    `_neutralize_fsdp_meta_param_validation`)."""
+    global _original_moe_token_dispatch
+    try:
+        import torchtitan_npu.converters.kernels.moe_dispatch as moe_dispatch_mod
+    except Exception:  # best-effort guard: any failure here means "not available in this environment"
+        return
+
+    expert_parallel_cls = moe_dispatch_mod.NpuExpertParallel
+    if _original_moe_token_dispatch is not _MISSING:
+        return
+    original_token_dispatch = expert_parallel_cls._token_dispatch
+    _original_moe_token_dispatch = (expert_parallel_cls, original_token_dispatch)
+
+    is_fake_process_group = moe_dispatch_mod.is_fake_process_group
+    torch_npu = moe_dispatch_mod.torch_npu
+
+    def _meta_safe_token_dispatch(self, mod, inputs, device_mesh):  # noqa: ANN001
+        routed_input, num_tokens_per_expert, routed_scores = inputs
+        group = device_mesh.get_group()
+        if not is_fake_process_group(group):
+            return original_token_dispatch(self, mod, inputs, device_mesh)
+
+        ep_degree = device_mesh.shape[0]
+        num_local_experts = num_tokens_per_expert.shape[0] // ep_degree
+        total_routed_tokens = routed_input.shape[0]
+        base, remainder = divmod(total_routed_tokens, ep_degree)
+        output_splits = [base + 1 if i < remainder else base for i in range(ep_degree)]
+        self.input_splits = self.output_splits = output_splits
+
+        num_tokens_per_expert_group = num_tokens_per_expert
+        indices = (
+            torch.arange(num_local_experts, dtype=torch.int64, device=routed_input.device)
+            .repeat(ep_degree)
+            .repeat_interleave(num_tokens_per_expert_group.view(-1), output_size=sum(output_splits))
+        )
+        routed_input, self.permuted_indices = torch_npu.npu_moe_token_permute(routed_input, indices)
+        if routed_scores is not None:
+            routed_scores, _ = torch_npu.npu_moe_token_permute(routed_scores, indices)
+        num_tokens_per_local_expert = num_tokens_per_expert_group.view(ep_degree, -1).sum(0)
+        return (routed_input, num_tokens_per_local_expert, routed_scores)
+
+    expert_parallel_cls._token_dispatch = _meta_safe_token_dispatch
+
+
 def _neutralize_fsdp_meta_param_validation() -> None:
     """`FSDPParamGroup._lazy_init()` (triggered by the model's first
     forward call) unconditionally calls `_validate_no_meta_params()`,
@@ -299,13 +374,16 @@ def patch_device_type_to_meta() -> None:
     the same stub as `torch.meta` (see `_MetaDeviceModule`'s docstring for
     why), neutralize `torch_npu`'s real-hardware optimizer device probe,
     swap-optimizer device stream construction, explicit
-    `torch.Tensor.npu()` calls, and a hardcoded `torch.full(...,
-    device="npu")` literal (see
+    `torch.Tensor.npu()` calls, a hardcoded `torch.full(...,
+    device="npu")` literal, and MoE dispatch's real-data-dependent
+    all-to-all split-size computation (see
     `_neutralize_torch_npu_optimizer_device_probe`,
     `_patch_swap_optimizer_get_device_info`,
-    `_patch_tensor_npu_method_to_meta`, and
-    `_patch_torch_full_npu_device_literal`), and disable FSDP2's
-    meta-param validation (see `_neutralize_fsdp_meta_param_validation`)."""
+    `_patch_tensor_npu_method_to_meta`,
+    `_patch_torch_full_npu_device_literal`, and
+    `_patch_moe_dispatch_to_avoid_meta_tensor_value_reads`), and disable
+    FSDP2's meta-param validation (see
+    `_neutralize_fsdp_meta_param_validation`)."""
     global _patched
     if _patched:
         return
@@ -327,6 +405,7 @@ def patch_device_type_to_meta() -> None:
     _patch_swap_optimizer_get_device_info(stub)
     _patch_tensor_npu_method_to_meta()
     _patch_torch_full_npu_device_literal()
+    _patch_moe_dispatch_to_avoid_meta_tensor_value_reads()
     _neutralize_fsdp_meta_param_validation()
     _patched = True
 
@@ -334,6 +413,7 @@ def patch_device_type_to_meta() -> None:
 def unpatch_device_type_to_meta() -> None:
     """Restore the original device_type/device_module bindings (test-only helper)."""
     global _patched, _original_fsdp_validate_no_meta_params, _original_tensor_npu_method, _original_torch_full
+    global _original_moe_token_dispatch
     for (module_path, attr_name), original in _original_values.items():
         module = importlib.import_module(module_path)
         if original is _MISSING:
@@ -355,5 +435,10 @@ def unpatch_device_type_to_meta() -> None:
     if _original_torch_full is not _MISSING:
         torch.full = _original_torch_full
         _original_torch_full = _MISSING
+
+    if _original_moe_token_dispatch is not _MISSING:
+        expert_parallel_cls, original_token_dispatch = _original_moe_token_dispatch
+        expert_parallel_cls._token_dispatch = original_token_dispatch
+        _original_moe_token_dispatch = _MISSING
 
     _patched = False
