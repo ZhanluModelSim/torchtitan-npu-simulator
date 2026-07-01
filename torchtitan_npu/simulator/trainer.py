@@ -55,17 +55,20 @@ class SimulationTrainerConfig(Trainer.Config):
 #     between a Triton-JIT kernel and a fused NPU custom op gated behind
 #     "custom_ops"; the base HcPre/HcPost/HcSplitSinkhorn classes are
 #     pure PyTorch and meta-safe as-is.
-#   - npu_smla: NpuSMLAConverter's non-"A5" path builds a JIT-compiled
-#     aclnn extension (`sparse_attn_sharedkv`) whose meta/metadata kernel
-#     itself crashes the process (SIGABRT, "No NPUs are available") when
-#     called on meta tensors with no NPU device present -- a native C++
-#     crash unreachable from Python-level monkeypatching. The base
-#     SparseAttention/LiCompute classes are pure PyTorch (verified by
-#     reading their forward() methods) except for one hardcoded
-#     `device="npu"` literal in SparseAttention.forward's `index_mask`
-#     construction, redirected to "meta" by
-#     `meta_env._patch_torch_full_npu_device_literal`.
-_HARDWARE_DEPENDENT_CONVERTER_NAMES = frozenset({"npu_mhc_pre", "npu_mhc_post", "npu_smla"})
+# npu_smla is handled differently: NpuSMLAConverter's non-"A5" path
+# replaces THREE independent submodule types (SparseAttention, LiCompute,
+# LiLoss). Only SparseAttention's replacement (a JIT-compiled aclnn
+# extension, `sparse_attn_sharedkv`) crashes the process outright (SIGABRT,
+# "No NPUs are available", a native C++ crash unreachable from
+# Python-level monkeypatching); LiCompute/LiLoss's own custom ops
+# (`lightning_indexer`/`sparse_lightning_indexer_grad_kl_loss`) work fine
+# on meta tensors, while the *base* (pre-conversion) LiLoss class has its
+# own real, pre-existing shape bug in `_current_selected_attn_dist`'s
+# einsum (never exercised in real production, since production always
+# uses the NPU-converted LiLoss). So npu_smla is kept in the model's
+# converter list (NOT stripped here) and instead surgically patched --
+# see `meta_env._patch_npu_smla_converter_to_skip_sparse_attention`.
+_HARDWARE_DEPENDENT_CONVERTER_NAMES = frozenset({"npu_mhc_pre", "npu_mhc_post"})
 
 
 def _strip_hardware_dependent_model_converters(config: Any) -> None:

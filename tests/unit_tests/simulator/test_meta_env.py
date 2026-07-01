@@ -286,6 +286,34 @@ def test_patch_moe_dispatch_avoids_meta_tensor_value_reads_when_fake():
         dist.destroy_process_group()
 
 
+def test_patch_npu_smla_converter_skips_sparse_attention_only():
+    # Regression test for a real crash found via the 16-layer
+    # DeepSeek-V4-Pro smoke run (SMLA sparse attention forward):
+    # NpuSMLAConverter.convert()'s non-"A5" branch replaces
+    # SparseAttention with NpuSparseAttention, which builds a JIT-compiled
+    # aclnn extension (sparse_attn_sharedkv) whose meta/metadata kernel
+    # crashes the whole process (SIGABRT, "No NPUs are available") when
+    # called on meta tensors with no NPU device present. The patched
+    # convert() must leave SparseAttention modules un-replaced. Skipped
+    # (not failed) when torch_npu is not installed.
+    pytest.importorskip("torch_npu", reason="torch_npu-specific regression test")
+    import torchtitan_npu.converters.kernels.npu_smla as npu_smla_mod
+
+    original_convert = npu_smla_mod.NpuSMLAConverter.convert
+    try:
+        patch_device_type_to_meta()
+        assert npu_smla_mod.NpuSMLAConverter.convert is not original_convert
+
+        # A model with no LiCompute/LiLoss/SparseAttention submodules at
+        # all must not raise (the common "nothing to convert" case).
+        model = nn.Sequential(nn.Linear(2, 2, device="meta"))
+        converter = npu_smla_mod.NpuSMLAConverter(model_spec=SimpleNamespace(name="test"))
+        converter.convert(model)  # must not raise
+    finally:
+        unpatch_device_type_to_meta()
+        assert npu_smla_mod.NpuSMLAConverter.convert is original_convert
+
+
 def test_patch_registers_torch_meta_as_a_device_accessor_module():
     # Regression test for a real crash found via CANN-container validation:
     # torch.distributed.device_mesh._get_device_handle(device_type) does

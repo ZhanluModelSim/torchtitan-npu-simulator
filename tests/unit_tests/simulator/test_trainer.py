@@ -123,11 +123,15 @@ def test_strip_hardware_dependent_model_converters_removes_mhc_converters():
     # DeepSeek-V4-Pro smoke run: MHCPreConverter/MHCPostConverter each
     # require either a Triton-JIT kernel launch (real hardware required,
     # no meta mode exists) or a private "custom_ops" extension unavailable
-    # in this environment; NpuSMLAConverter's non-"A5" path builds a
-    # JIT-compiled aclnn extension whose meta-kernel itself crashes the
-    # process with no NPU device present. Stripping them from
-    # config.model_converters.converters leaves the model's affected
+    # in this environment. Stripping them from
+    # config.model_converters.converters leaves the model's HcPre/HcPost
     # submodules on their base (pure-PyTorch, meta-safe) implementation.
+    # npu_smla is deliberately NOT stripped here -- it is handled by a
+    # more surgical patch (meta_env
+    # ._patch_npu_smla_converter_to_skip_sparse_attention) since only its
+    # SparseAttention replacement is hardware-dependent; LiCompute/LiLoss
+    # conversion must stay active (their base, pre-conversion classes have
+    # a real, pre-existing shape bug never exercised in production).
     config = SimpleNamespace(
         model_converters=SimpleNamespace(
             converters=[
@@ -141,7 +145,7 @@ def test_strip_hardware_dependent_model_converters_removes_mhc_converters():
     )
     _strip_hardware_dependent_model_converters(config)
     remaining_names = {c._owner._model_config.name for c in config.model_converters.converters}
-    assert remaining_names == {"npu_rms_norm", "npu_gmm"}
+    assert remaining_names == {"npu_rms_norm", "npu_smla", "npu_gmm"}
 
 
 def test_strip_hardware_dependent_model_converters_handles_missing_or_empty_converters():
