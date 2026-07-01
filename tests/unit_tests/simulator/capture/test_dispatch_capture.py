@@ -87,3 +87,63 @@ def test_phase_provider_tags_every_node_and_defaults_to_forward():
     nodes = capture.build_nodes()
     phases = sorted({n.annotations["phase"] for n in nodes.values()})
     assert phases == ["backward", "forward"]
+
+
+def test_record_synthetic_op_creates_a_node_with_given_raw_op_type():
+    capture = OpDispatchCapture()
+    with capture:
+        a = torch.randn(2, 4, device="meta")
+        b = torch.empty(2, 4, device="meta")
+        capture.record_synthetic_op("triton.hc_pre_bmm_forward", inputs=[a], outputs=[b])
+    nodes = capture.build_nodes()
+    synthetic = [n for n in nodes.values() if n.annotations.get("raw_op_type") == "triton.hc_pre_bmm_forward"]
+    assert len(synthetic) == 1
+    assert synthetic[0].op_type == "unknown"  # not in OP_MAPPING -- expected, display_op_label handles it
+    assert [o.shape for o in synthetic[0].outputs] == [(2, 4)]
+
+
+def test_record_synthetic_op_wires_producer_consumer_edges():
+    capture = OpDispatchCapture()
+    with capture:
+        a = torch.randn(2, 4, device="meta")
+        mid = torch.empty(2, 4, device="meta")
+        capture.record_synthetic_op("triton.step_one", inputs=[a], outputs=[mid])
+        out = mid.relu()  # a REAL dispatched op consuming the synthetic op's output
+    nodes = capture.build_nodes()
+    synthetic_node = next(n for n in nodes.values() if n.annotations.get("raw_op_type") == "triton.step_one")
+    relu_node = next(n for n in nodes.values() if "relu" in n.annotations["raw_op_type"])
+    assert relu_node.predecessors == [synthetic_node.op_id]
+    assert synthetic_node.op_id in relu_node.predecessors
+    assert relu_node.op_id in synthetic_node.successors
+
+
+def test_record_synthetic_op_respects_phase_provider():
+    phase_box = {"value": "forward"}
+    capture = OpDispatchCapture(phase_provider=lambda: phase_box["value"])
+    with capture:
+        a = torch.randn(2, device="meta")
+        b = torch.empty(2, device="meta")
+        capture.record_synthetic_op("triton.fwd_step", inputs=[a], outputs=[b])
+        phase_box["value"] = "backward"
+        c = torch.empty(2, device="meta")
+        capture.record_synthetic_op("triton.bwd_step", inputs=[b], outputs=[c])
+    nodes = capture.build_nodes()
+    fwd_node = next(n for n in nodes.values() if n.annotations.get("raw_op_type") == "triton.fwd_step")
+    bwd_node = next(n for n in nodes.values() if n.annotations.get("raw_op_type") == "triton.bwd_step")
+    assert fwd_node.annotations["phase"] == "forward"
+    assert bwd_node.annotations["phase"] == "backward"
+
+
+def test_get_active_capture_returns_none_outside_context():
+    from torchtitan_npu.simulator.capture.dispatch_capture import get_active_capture
+
+    assert get_active_capture() is None
+
+
+def test_get_active_capture_returns_the_entered_instance():
+    from torchtitan_npu.simulator.capture.dispatch_capture import get_active_capture
+
+    capture = OpDispatchCapture()
+    with capture:
+        assert get_active_capture() is capture
+    assert get_active_capture() is None

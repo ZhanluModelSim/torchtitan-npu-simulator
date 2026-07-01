@@ -57,7 +57,7 @@ class _RawEvent:
 
 def _shape_signature(event: _RawEvent) -> tuple:
     return (
-        event.op_type,
+        event.raw_op_type,
         event.module_path,
         event.phase,
         tuple(tuple(i.shape) for i in event.inputs),
@@ -88,6 +88,7 @@ class OpDispatchCapture(TorchDispatchMode):
         self._events: list[_RawEvent] = []
         self._producer: dict[int, str] = {}
         self._last_signature: tuple | None = None
+        self._previous_active_capture: OpDispatchCapture | None = None
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):  # noqa: ANN001, ANN201
         kwargs = kwargs or {}
@@ -95,14 +96,39 @@ class OpDispatchCapture(TorchDispatchMode):
 
         flat_inputs = _flatten_tensors(args) + _flatten_tensors(tuple(kwargs.values()))
         flat_outputs = _flatten_tensors(result if isinstance(result, (tuple, list)) else (result,))
+        module_path = self.module_path_tracker.current_path() if self.module_path_tracker else ""
+        self._record_event(str(func), flat_inputs, flat_outputs, module_path)
 
+        return result
+
+    def record_synthetic_op(
+        self,
+        raw_op_type: str,
+        inputs: list[torch.Tensor],
+        outputs: list[torch.Tensor],
+        module_path: str = "",
+    ) -> None:
+        """Manually register one synthetic L0 event, as if `raw_op_type` had
+        gone through __torch_dispatch__ normally. Used by
+        torchtitan_npu.simulator.hardware_shims for ops that cannot execute
+        for real (raw Triton kernels / JIT-compiled extensions) but whose
+        real op name + output shape are known analytically. Participates in
+        the same producer/consumer id(tensor) wiring, repeat_count dedup,
+        and phase tagging as real dispatched events."""
+        self._record_event(raw_op_type, inputs, outputs, module_path)
+
+    def _record_event(
+        self,
+        raw_op_type: str,
+        flat_inputs: list[torch.Tensor],
+        flat_outputs: list[torch.Tensor],
+        module_path: str,
+    ) -> None:
         predecessors = sorted({self._producer[id(t)] for t in flat_inputs if id(t) in self._producer})
         input_metas = [to_tensor_meta(t, name=f"in_{i}") for i, t in enumerate(flat_inputs)]
         output_metas = [to_tensor_meta(t, name=f"out_{i}") for i, t in enumerate(flat_outputs)]
 
-        raw_op_type = str(func)
         op_type = to_canonical_op_type(raw_op_type)
-        module_path = self.module_path_tracker.current_path() if self.module_path_tracker else ""
         phase = self.phase_provider() if self.phase_provider else "forward"
 
         candidate = _RawEvent(
@@ -127,13 +153,20 @@ class OpDispatchCapture(TorchDispatchMode):
             self._events.append(candidate)
             self._last_signature = signature
 
-        # Always (re)bind producer ids to whichever event now represents this
-        # position, even when the event itself was deduped away, so later
-        # ops' predecessor lookups stay correct.
         for t in flat_outputs:
             self._producer[id(t)] = op_id
 
-        return result
+    def __enter__(self) -> "OpDispatchCapture":
+        super().__enter__()
+        global _active_capture
+        self._previous_active_capture = _active_capture
+        _active_capture = self
+        return self
+
+    def __exit__(self, exc_type: object, exc_val: object, exc_tb: object) -> None:
+        global _active_capture
+        _active_capture = self._previous_active_capture
+        super().__exit__(exc_type, exc_val, exc_tb)
 
     def build_nodes(self) -> dict[str, OpNode]:
         """Assemble captured events into OpNode objects with cost annotations."""
@@ -166,3 +199,17 @@ class OpDispatchCapture(TorchDispatchMode):
                 if pred_id in nodes:
                     nodes[pred_id].successors.append(op_id)
         return nodes
+
+
+_active_capture: "OpDispatchCapture | None" = None
+
+
+def get_active_capture() -> "OpDispatchCapture | None":
+    """Returns the `OpDispatchCapture` instance currently inside its `with`
+    block (there is at most one active at a time -- one step is captured at
+    a time), or `None` if no capture is active. Lets code that has no
+    direct reference to the capture instance (e.g. hardware_shims'
+    nn.Module replacements, which run deep inside a model's forward/backward
+    with no capture parameter threaded through) reach it to call
+    `record_synthetic_op`."""
+    return _active_capture
