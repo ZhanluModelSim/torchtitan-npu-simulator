@@ -357,6 +357,47 @@ model_config.build()</code>），但<strong>跳过</strong>其后的 <code>to_em
 <code>init_fake_mode</code>，见 §2 验证 #3），因此 <code>ParallelDims.build_mesh()</code> 不需要
 任何改动：384 的 world_size 在单进程下即可完整建立 mesh、划分
 dp/tp/pp/cp/ep 各维度子组。</p>
+<p><strong>补充验证（对照本仓 <code>requirements.txt</code> 锁定的 torchtitan commit
+<code>ac13e536c84e7f6647b14fa9375c3c8a8a2b8578</code> 源码逐行核实）</strong>：</p>
+<ol>
+<li><code>Trainer.__init__</code> 里 <code>self.device = torch.device(f"{device_type}:{LOCAL_RANK}")</code>
+   （<code>trainer.py:207</code>）。经验证 <code>torch.device("meta:0")</code> 与
+   <code>torch.device("meta")</code> 行为完全一致（张量 <code>.device</code> 归一化为
+   <code>meta</code>），因此<strong>只需要在 <code>Trainer.__init__</code> 执行前把
+   <code>torchtitan.tools.utils.device_type</code>/<code>device_module</code> 猴子补丁为
+   <code>"meta"</code> + 一个安全桩</strong>，<code>Trainer.__init__</code> 本身完全不用改——包括
+   <code>model.to_empty(device=init_device)</code> + <code>init_weights()</code>（<code>trainer.py:
+   407-411</code>，已验证 <code>nn.init.trunc_normal_/zeros_/normal_</code> 和
+   <code>Module.to_empty</code> 在 meta 张量上都能正常跑，不需要单独绕过）。这比最初
+   设想的"覆盖 Trainer 内触发物化的那一小段"更简单、更不依赖具体版本的行号。</li>
+<li><code>torchtitan.components.metrics</code> / <code>torchtitan.distributed.parallel_dims</code> /
+   <code>torchtitan.distributed.utils</code> 三个模块都在 import 时<strong>按值</strong>引入了
+   <code>device_type</code>/<code>device_module</code>（<code>from torchtitan.tools.utils import
+   device_type, device_module</code>），必须在这三处也做同名重绑定，否则它们
+   仍然持有 patch 前的旧引用。</li>
+<li><strong>新发现的两个 meta 崩溃点</strong>（均已用 pinned 源码 + 本地脚本复现确认）：</li>
+<li><code>torchtitan.distributed.utils.set_determinism()</code>：当 <code>world_size&gt;1</code>
+     且 <code>debug_config.seed is None</code> 时，会执行
+     <code>seed_tensor.to("cpu").view(torch.uint64).item()</code>
+     （<code>distributed/utils.py:159</code>）。已验证 <code>meta_tensor.to("cpu")</code> 直接
+     抛出 <code>NotImplementedError: Cannot copy out of meta tensor; no data!</code>。
+     <strong>修复</strong>：<code>SimulationTrainer</code> 强制 <code>config.debug.seed</code> 为一个固定整数
+     （如 <code>42</code>），这样 <code>if seed is None:</code> 分支（含那次广播+<code>.item()</code>）整个被
+     跳过，不需要碰 <code>set_determinism</code> 本身。</li>
+<li><code>Trainer.train_step()</code>（<code>trainer.py:719-</code>）在两处不安全：
+     ① <code>dist_utils.dist_sum(local_valid_tokens, batch_mesh)</code> 内部
+     <code>_dist_reduce()</code> 无条件调用 <code>.item()</code>（<code>distributed/utils.py:55,58</code>）；
+     ② 日志部分 <code>float(loss.detach().item())</code> / <code>float(grad_norm.item())</code>
+     （<code>trainer.py:807,818</code>）。<strong>修复</strong>：<code>SimulationTrainer</code> 不调用
+     <code>Trainer.train_step()</code>，而是直接调用 <code>forward_backward_step()</code>
+     （<code>trainer.py:653</code>，其 <code>global_valid_tokens</code> 参数在真实调用点其实传的
+     是 <code>dist_sum</code> 返回的 Python <code>float</code>，类型注解 <code>torch.Tensor</code>
+     只是历史遗留，与我们直接传入一个由静态配置算出的 Python
+     <code>float</code>——如 <code>local_batch_size * seq_len</code>——完全兼容），并跳过
+     <code>clip_grad_norm_</code>/日志，直接调用 <code>self.optimizers.step()</code> +
+     <code>self.lr_schedulers.step()</code>。这样一次 forward+backward+optimizer
+     step 全程不触发任何 <code>.item()</code>。</li>
+</ol>
 <h3 id="52-fake_collectivespy">5.2 集合通信拦截层（<code>fake_collectives.py</code>）</h3>
 <p>这是解决 §2 发现的核心矛盾（<code>c10d</code> 算子无 Meta 核）的关键组件。设计：</p>
 <ul>
@@ -472,14 +513,28 @@ EP rank 上也完全一致，通信模式天然对称。</p>
     <code>training.local_batch_size</code> 等已有配置读出，无需重新推断。</li>
 </ul>
 <h3 id="56-ranktablerank_tablepy">5.6 通信域（RankTable，<code>rank_table.py</code>）</h3>
-<p><code>ParallelDims.build_mesh()</code> 之后，<code>parallel_dims._meshes</code>/<code>world_mesh</code>
-持有每个命名维度（<code>pp/dp_replicate/dp_shard/cp/tp/ep/etp</code>...）的
-<code>DeviceMesh</code> 子网格对象。<code>rank_table.py</code> 遍历这些子网格，对每个维度：</p>
-<ul>
-<li>计算该维度下每个通信组的<strong>全局 rank 成员列表</strong>（<code>DeviceMesh.mesh</code>
-  展平后的 tensor 转 list）。</li>
-<li>为每个全局 rank 计算其在每个维度上的坐标（<code>rank -&gt; {dim_name: idx}</code>）。</li>
-</ul>
+<p><code>ParallelDims.build_mesh()</code> 之后，<code>parallel_dims._global_meshes</code>（<code>dataloading</code>/
+<code>dense</code>/<code>sparse</code> 等复合 <code>DeviceMesh</code>）持有多维 rank 布局张量。<code>rank_table.py</code>
+按<strong>数据驱动</strong>方式遍历（不是硬编码维度名列表——已用真实 <code>ParallelDims</code> +
+fake PG 在沙盒环境实测验证，见下）：对每个复合 mesh 的
+<code>mesh.mesh_dim_names</code>（如 <code>("pp", "dp_replicate", "efsdp", "ep")</code>），沿每个
+命名轴固定其余轴、切片出该轴的全部通信组：</p>
+<pre><code class="language-python"># 实测（world_size=16, dp_shard=16, ep=8）：
+# parallel_dims._global_meshes[&quot;sparse&quot;].mesh_dim_names == (&quot;pp&quot;,&quot;dp_replicate&quot;,&quot;efsdp&quot;,&quot;ep&quot;)
+# parallel_dims._global_meshes[&quot;sparse&quot;].mesh ==
+#   tensor([[[[0,1,2,3,4,5,6,7], [8,9,10,11,12,13,14,15]]]])
+# 沿 &quot;ep&quot; 轴固定 (pp=0, dp_replicate=0, efsdp=0/1) 后切片，
+# 精确得到两个 EP 组：[0..7] 和 [8..15]。
+</code></pre>
+<p>这比"从单个 rank 的 <code>get_optional_mesh(dim)</code> 反推所有其它 rank 的组"更可靠：
+<code>get_optional_mesh("ep")</code> 只返回<strong>当前 rank 自己所在的那一组</strong>（实测确认
+仅得到 <code>[0..7]</code>），必须用复合 mesh 的完整张量才能拿到全部分组。
+注意实际轴名是 <code>"fsdp"</code>（<code>dp_shard × cp</code> 合并轴，见 <code>dense</code> mesh）而非
+<code>"dp_shard"</code>——当验收配置 <code>context_parallel_degree=1</code> 时两者数值相同，
+<code>rank_table.py</code> 直接使用 mesh 里出现的真实轴名，不额外杜撰
+<code>"dp_shard"</code> 这个轴。torchtitan_npu 自身的 <code>_patch_for_parallel_dims_build_mesh</code>
+（<code>torchtitan_npu/train.py</code>）会把 <code>"etp"</code> 加入 <code>sparse</code> mesh 的轴名列表，
+数据驱动的遍历方式无需特殊处理就能自动纳入。</p>
 <p>产出一个 <code>RankTable</code> 结构（JSON 可序列化）：</p>
 <pre><code class="language-json">{
   &quot;world_size&quot;: 384,
@@ -651,6 +706,14 @@ COMM_MODE=fake_backend \
 <tr>
 <td><code>pipeline_parallel_degree &gt; 1</code> 时单一模板不足以代表所有 stage</td>
 <td>验收目标 <code>pp=1</code>，不受影响；设计已在 §5.5 明确"模板粒度=每 pipeline stage 一份"，多 stage 场景列为后续扩展（需要以不同 pp 坐标多次调用 <code>pipelining_fn</code> 切分逻辑分别捕获），不在本次实现范围内</td>
+</tr>
+<tr>
+<td><code>set_determinism()</code> 在 <code>world_size&gt;1</code> 且未设 seed 时对 meta 张量调用 <code>.to("cpu").item()</code> 崩溃（已用 pinned 源码复现）</td>
+<td><code>SimulationTrainer</code> 强制 <code>config.debug.seed</code> 为固定整数，规避该分支</td>
+</tr>
+<tr>
+<td><code>Trainer.train_step()</code> 的 <code>dist_sum</code>（token 计数）与日志代码对 meta 张量调用 <code>.item()</code> 崩溃（已用 pinned 源码确认调用点）</td>
+<td><code>SimulationTrainer</code> 不调用 <code>train_step()</code>，直接调用 <code>forward_backward_step()</code> 并手动提供 <code>global_valid_tokens</code>（纯 Python float，由配置静态算出），跳过 <code>clip_grad_norm_</code>/损失日志</td>
 </tr>
 </tbody>
 </table>
