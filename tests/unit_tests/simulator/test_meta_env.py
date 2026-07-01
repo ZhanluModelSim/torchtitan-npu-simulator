@@ -127,31 +127,6 @@ def test_patch_redirects_swap_optimizer_get_device_info_to_meta_stub():
         unpatch_device_type_to_meta()
 
 
-def test_patch_forces_mhc_converter_to_report_a5_device_type():
-    # Regression test for a real crash found via the 16-layer
-    # DeepSeek-V4-Pro smoke run (first forward pass reaching an mHC
-    # layer): MHCPreConverter/MHCPostConverter select a Triton-JIT kernel
-    # path unless get_npu_device_type() == "A5", and Triton kernels are
-    # JIT-compiled AND LAUNCHED on a real accelerator at call time (no
-    # meta-device mode exists for a Triton launch) -- crashing with a real
-    # aclInit() hardware-init error. Scoped to mhc_prepost's own
-    # by-value-imported name only (not the shared definition, and not
-    # other converters' own by-value imports of the same function), so
-    # other converters' already-working non-"A5" branches are undisturbed.
-    # Skipped (not failed) when torch_npu is not installed.
-    pytest.importorskip("torch_npu", reason="torch_npu-specific regression test")
-    import torchtitan_npu.converters.kernels.mhc_prepost as mhc_prepost_mod
-    import torchtitan_npu.tools.device as device_mod
-
-    try:
-        patch_device_type_to_meta()
-        assert mhc_prepost_mod.get_npu_device_type() == "A5"
-    finally:
-        unpatch_device_type_to_meta()
-        # the shared definition (used by npu_smla.py/mx_capability_check.py)
-        # must be untouched by this scoped patch
-        assert mhc_prepost_mod.get_npu_device_type is device_mod.get_npu_device_type
-
 
 def test_patch_neutralizes_fsdp_meta_param_validation():
     # Regression test for a real crash found via the 16-layer

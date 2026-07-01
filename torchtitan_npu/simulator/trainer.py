@@ -45,6 +45,45 @@ class SimulationTrainerConfig(Trainer.Config):
     simulation: SimulationConfig = field(default_factory=SimulationConfig)
 
 
+# Model converters that unconditionally require real accelerator hardware to
+# run their forward computation (a Triton-JIT kernel launch, or a private
+# "custom_ops" extension unavailable outside Huawei's internal build),
+# with no meta-device-compatible fallback other than the model's own base
+# (pre-conversion) module -- see `_strip_hardware_dependent_model_converters`.
+_HARDWARE_DEPENDENT_CONVERTER_NAMES = frozenset({"npu_mhc_pre", "npu_mhc_post"})
+
+
+def _strip_hardware_dependent_model_converters(config: Any) -> None:
+    """Remove `_HARDWARE_DEPENDENT_CONVERTER_NAMES` from
+    `config.model_converters.converters` so `model_converters.convert(model)`
+    never invokes them, leaving each affected submodule (`HcPre`/`HcPost`)
+    on its BASE class -- which, verified by reading
+    `torchtitan_npu.models.deepseek_v4.model.HcPre.forward`/`HcSplitSinkhorn
+    .forward`, is already a pure-PyTorch (no custom kernel, no Triton)
+    implementation that runs correctly on meta tensors. The NPU-optimized
+    replacements (`MHCPreConverter`/`MHCPostConverter`) instead select
+    between a Triton-JIT kernel (real hardware required to launch, no meta
+    mode exists) and a fused NPU custom op gated behind a private
+    `custom_ops` extension unavailable in this environment -- neither
+    works under meta simulation, so bypassing the conversion entirely (not
+    picking either alternative) is the only meta-safe option. Uses the
+    same `_owner`/`_model_config.name` introspection as this repo's own
+    `torchtitan_npu.converters.registry.has_npu_converter`."""
+    model_converters_config = getattr(config, "model_converters", None)
+    converters = getattr(model_converters_config, "converters", None) if model_converters_config else None
+    if not converters:
+        return
+
+    kept = []
+    for converter_config in converters:
+        owner = getattr(converter_config, "_owner", None) or converter_config
+        model_config = getattr(owner, "_model_config", None)
+        name = getattr(model_config, "name", None) if model_config is not None else None
+        if name not in _HARDWARE_DEPENDENT_CONVERTER_NAMES:
+            kept.append(converter_config)
+    model_converters_config.converters = kept
+
+
 def run_simulation_step(
     *,
     model_parts: list[nn.Module],
@@ -136,6 +175,7 @@ class SimulationTrainer(Trainer):
         force_deterministic_seed(config)
         config.compile.enable = False  # tracing needs eager dispatch, not a compiled graph
         config.comm.mode = "fake_backend"
+        _strip_hardware_dependent_model_converters(config)
         if hasattr(config.optimizer, "swap_optimizer"):
             # swap_optimizer (NPU-specific host/device state swapping to
             # save real memory during real training) is irrelevant to

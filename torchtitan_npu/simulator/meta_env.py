@@ -212,42 +212,6 @@ def _patch_swap_optimizer_get_device_info(stub: _MetaDeviceModule) -> None:
     swap_optimizer_mod.get_device_info = lambda: ("meta", stub)
 
 
-def _force_mhc_converter_to_fused_npu_kernel() -> None:
-    """`torchtitan_npu.converters.kernels.mhc_prepost`'s MHCPreConverter/
-    MHCPostConverter each choose between two mHC (multi-head connection)
-    kernel implementations based on `get_npu_device_type() == "A5"`:
-    the fused path (`MHCPre`/`MHCPost`, real NPU custom ops verified
-    elsewhere to have meta-kernel support) when true, else a Triton-JIT
-    path (`MHCPreTriton`/etc.). `get_npu_device_type()` queries real
-    hardware (`torch_npu.npu.get_device_name()`) and returns `"UNKNOWN"`
-    with none present, selecting the Triton path -- but Triton kernels are
-    JIT-compiled AND LAUNCHED on a real accelerator at call time (there is
-    no meta-device mode for a Triton kernel launch), crashing with a real
-    `aclInit()` hardware-init error the first time the model's forward
-    pass reaches an mHC layer.
-
-    Forces `mhc_prepost`'s own by-value-imported `get_npu_device_type` name
-    to report `"A5"` (this container's own "950"-series Ascend chip
-    generation, per `torchtitan_npu/tools/device.py`'s own marker table),
-    selecting the fused/meta-safe path -- scoped to this ONE module only
-    (not the shared `torchtitan_npu.tools.device.get_npu_device_type`
-    definition, and not `npu_smla.py`'s/`mx_capability_check.py`'s own
-    by-value imports of the same function) since other converters'
-    non-"A5" branches are already verified working under meta simulation
-    and must not be perturbed. No-op if torch_npu (and therefore this
-    torchtitan_npu submodule) is not importable."""
-    try:
-        import torchtitan_npu.converters.kernels.mhc_prepost as mhc_prepost_mod
-    except Exception:  # best-effort guard: any failure here means "not available in this environment"
-        return
-
-    key = ("torchtitan_npu.converters.kernels.mhc_prepost", "get_npu_device_type")
-    if key in _original_values:
-        return
-    _original_values[key] = mhc_prepost_mod.get_npu_device_type
-    mhc_prepost_mod.get_npu_device_type = lambda: "A5"
-
-
 def _neutralize_fsdp_meta_param_validation() -> None:
     """`FSDPParamGroup._lazy_init()` (triggered by the model's first
     forward call) unconditionally calls `_validate_no_meta_params()`,
@@ -280,9 +244,7 @@ def patch_device_type_to_meta() -> None:
     why), neutralize `torch_npu`'s real-hardware optimizer device probe and
     swap-optimizer device stream construction (see
     `_neutralize_torch_npu_optimizer_device_probe` and
-    `_patch_swap_optimizer_get_device_info`), force the mHC converter onto
-    its meta-safe fused-kernel path (see
-    `_force_mhc_converter_to_fused_npu_kernel`), and disable FSDP2's
+    `_patch_swap_optimizer_get_device_info`), and disable FSDP2's
     meta-param validation (see `_neutralize_fsdp_meta_param_validation`)."""
     global _patched
     if _patched:
@@ -303,7 +265,6 @@ def patch_device_type_to_meta() -> None:
 
     _neutralize_torch_npu_optimizer_device_probe()
     _patch_swap_optimizer_get_device_info(stub)
-    _force_mhc_converter_to_fused_npu_kernel()
     _neutralize_fsdp_meta_param_validation()
     _patched = True
 

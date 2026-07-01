@@ -4,13 +4,14 @@
 # LICENSE file in the root directory of this source tree.
 
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-from torchtitan_npu.simulator.trainer import run_simulation_step
+from torchtitan_npu.simulator.trainer import _strip_hardware_dependent_model_converters, run_simulation_step
 
 
 @pytest.fixture
@@ -104,3 +105,44 @@ def test_simulation_trainer_config_build_dispatches_to_simulation_trainer():
     from torchtitan_npu.simulator.trainer import SimulationTrainerConfig
 
     assert SimulationTrainerConfig._owner.__name__ == "SimulationTrainer"
+
+
+def _fake_converter_config(name: str):
+    # Mirrors the real `_owner`/`_model_config.name` shape read by both
+    # `torchtitan_npu.converters.registry.has_npu_converter` and
+    # `_strip_hardware_dependent_model_converters`: the dynamically
+    # generated converter class carries `_model_config` (whose `.name` is
+    # the registered patch name), and its Config carries `_owner` pointing
+    # back at that converter class.
+    owner = SimpleNamespace(_model_config=SimpleNamespace(name=name))
+    return SimpleNamespace(_owner=owner)
+
+
+def test_strip_hardware_dependent_model_converters_removes_mhc_converters():
+    # Regression test for a real crash found via the 16-layer
+    # DeepSeek-V4-Pro smoke run: MHCPreConverter/MHCPostConverter each
+    # require either a Triton-JIT kernel launch (real hardware required,
+    # no meta mode exists) or a private "custom_ops" extension unavailable
+    # in this environment. Stripping them from
+    # config.model_converters.converters leaves the model's HcPre/HcPost
+    # submodules on their base (pure-PyTorch, meta-safe) implementation.
+    config = SimpleNamespace(
+        model_converters=SimpleNamespace(
+            converters=[
+                _fake_converter_config("npu_rms_norm"),
+                _fake_converter_config("npu_mhc_pre"),
+                _fake_converter_config("npu_mhc_post"),
+                _fake_converter_config("npu_gmm"),
+            ]
+        )
+    )
+    _strip_hardware_dependent_model_converters(config)
+    remaining_names = {c._owner._model_config.name for c in config.model_converters.converters}
+    assert remaining_names == {"npu_rms_norm", "npu_gmm"}
+
+
+def test_strip_hardware_dependent_model_converters_handles_missing_or_empty_converters():
+    # must not raise when model_converters/converters is absent or empty
+    _strip_hardware_dependent_model_converters(SimpleNamespace())
+    _strip_hardware_dependent_model_converters(SimpleNamespace(model_converters=None))
+    _strip_hardware_dependent_model_converters(SimpleNamespace(model_converters=SimpleNamespace(converters=[])))
