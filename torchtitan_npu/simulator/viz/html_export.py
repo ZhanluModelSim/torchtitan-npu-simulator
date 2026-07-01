@@ -12,6 +12,7 @@ from __future__ import annotations
 import html
 import re
 
+from torchtitan_npu.simulator.capture.op_mapping import display_op_label
 from torchtitan_npu.simulator.ir.op_node import OpNode
 from torchtitan_npu.simulator.ir.step_graph import StepGraph
 from torchtitan_npu.simulator.ir.workload_graph import WorkloadGraph
@@ -45,9 +46,10 @@ def _render_op_row(op_id: str, node: OpNode) -> str:
     repeat = node.annotations.get("repeat_count", 1)
     repeat_suffix = f" (dedup x{repeat})" if repeat > 1 else ""
     unknown_suffix = " [cost unknown]" if node.annotations.get("cost_unknown") else ""
+    label = display_op_label(node.op_type, node.annotations)
     return (
         f"<li><code>{html.escape(op_id)}</code> "
-        f"<strong>{html.escape(node.op_type)}</strong>{repeat_suffix}{unknown_suffix} "
+        f"<strong>{html.escape(label)}</strong>{repeat_suffix}{unknown_suffix} "
         f"flops={node.flops} peak_mem={node.peak_mem} comm_bytes={node.comm_bytes}</li>"
     )
 

@@ -10,6 +10,7 @@ used by comparable trace tooling in this ecosystem (see design doc §5.9)."""
 
 from __future__ import annotations
 
+from torchtitan_npu.simulator.capture.op_mapping import display_op_label
 from torchtitan_npu.simulator.ir.workload_graph import WorkloadGraph
 
 _COMM_OP_TYPES = {"allreduce", "allgather", "reduce_scatter", "all_to_all"}
@@ -30,7 +31,7 @@ def export_dot(workload_graph: WorkloadGraph, path: str) -> None:
         lines.append(f'  subgraph "cluster_{step_id}" {{')
         lines.append(f'    label="{step_graph.step_type}";')
         for op_id, node in step_graph.nodes.items():
-            label = f"{node.op_type}"
+            label = display_op_label(node.op_type, node.annotations)
             if node.annotations.get("repeat_count", 1) > 1:
                 label += f" (x{node.annotations['repeat_count']})"
             lines.append(f'    "{op_id}" [label="{label}", style=filled, fillcolor={_node_color(node.op_type)}];')

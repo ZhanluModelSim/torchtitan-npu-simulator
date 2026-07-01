@@ -10,6 +10,7 @@ and §9's note about the sibling project's MockCostModel coverage gap)."""
 
 from __future__ import annotations
 
+from torchtitan_npu.simulator.capture.op_mapping import display_op_label
 from torchtitan_npu.simulator.ir.workload_graph import WorkloadGraph
 
 
@@ -29,7 +30,7 @@ def export_text_summary(workload_graph: WorkloadGraph) -> str:
         lines.append(f"  is_acyclic={step_graph.is_acyclic}")
         for node in step_graph.nodes.values():
             if node.annotations.get("cost_unknown"):
-                unknown_op_types.add(node.op_type if node.op_type != "unknown" else node.annotations.get("raw_op_type", "unknown"))
+                unknown_op_types.add(display_op_label(node.op_type, node.annotations))
         lines.append("")
 
     schedule = workload_graph.iteration.schedule

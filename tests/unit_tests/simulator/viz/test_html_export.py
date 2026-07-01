@@ -63,3 +63,22 @@ def test_export_html_writes_a_file():
         with open(path, encoding="utf-8") as f:
             content = f.read()
     assert content.startswith("<!DOCTYPE html>")
+
+
+def test_render_html_labels_unknown_ops_with_real_raw_op_type():
+    # Same real-op-name-fidelity requirement as the DOT exporter: "unknown"
+    # must never be the visible label when a real dispatcher name was
+    # captured in annotations["raw_op_type"].
+    node = OpNode(
+        op_id="op_0", op_type="unknown", inputs=[], outputs=[], attrs={}, predecessors=[], successors=[],
+        annotations={"module_path": "layers.0.mlp", "raw_op_type": "npu.npu_moe_token_unpermute_with_routing_map.default"},
+    )
+    template = StepGraph(step_id="tmpl", step_type="forward", nodes={"op_0": node})
+    schedule = ScheduleGraph(schedule_id="sched", workload_type="train", step_templates={"tmpl": template}, instances=[])
+    workload = WorkloadGraph(
+        workload_id="wl1", workload_type="train", step_templates={"tmpl": template},
+        iteration=IterationSpec(schedule=schedule, microbatch_count=1), num_iterations=1,
+    )
+    page = render_html(workload)
+    assert "npu.npu_moe_token_unpermute_with_routing_map.default" in page
+    assert "<strong>unknown</strong>" not in page

@@ -31,3 +31,26 @@ def test_export_dot_writes_valid_digraph_with_edges():
     assert '"a" -> "b"' in content
     assert "fillcolor=gold" in content  # allreduce is a comm op
     assert "fillcolor=lightblue" in content  # matmul is a compute op
+
+
+def test_export_dot_labels_unknown_ops_with_real_raw_op_type():
+    # An op_type of "unknown" must never render as the literal string
+    # "unknown" -- the real dispatcher op name must be shown instead so the
+    # graph stays reviewable against the real execution's op names.
+    node = OpNode(
+        op_id="a", op_type="unknown", inputs=[], outputs=[], attrs={}, predecessors=[], successors=[],
+        annotations={"raw_op_type": "aten.embedding.default"},
+    )
+    template = StepGraph(step_id="tmpl", step_type="forward", nodes={"a": node})
+    schedule = ScheduleGraph(schedule_id="sched", workload_type="train", step_templates={"tmpl": template}, instances=[])
+    workload = WorkloadGraph(
+        workload_id="wl1", workload_type="train", step_templates={"tmpl": template},
+        iteration=IterationSpec(schedule=schedule, microbatch_count=1), num_iterations=1,
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "graph.dot")
+        export_dot(workload, path)
+        with open(path, encoding="utf-8") as f:
+            content = f.read()
+    assert 'label="aten.embedding.default"' in content
+    assert 'label="unknown"' not in content

@@ -56,3 +56,16 @@ def to_canonical_op_type(raw_op_type: str) -> str:
     """Map a raw dispatcher op name (e.g. `str(func)` from
     `__torch_dispatch__`) to its canonical L0 op_type, or `"unknown"`."""
     return OP_MAPPING.get(raw_op_type, "unknown")
+
+
+def display_op_label(op_type: str, annotations: dict) -> str:
+    """Resolve the op label to show in human-facing output (graph
+    visualizations, text summaries). `op_type == "unknown"` must never be
+    shown verbatim: the *real* dispatcher op name is always available in
+    `annotations["raw_op_type"]` (captured by dispatch_capture.py
+    regardless of OP_MAPPING coverage), so falling back to it keeps every
+    node's displayed identity consistent with the real op that actually
+    ran, even for ops absent from the curated OP_MAPPING table."""
+    if op_type != "unknown":
+        return op_type
+    return annotations.get("raw_op_type", "unknown")
