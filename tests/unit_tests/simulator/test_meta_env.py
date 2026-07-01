@@ -102,6 +102,32 @@ def test_patch_neutralizes_torch_npu_optimizer_device_probe_when_torch_npu_prese
         npu_optim._device_name = original
 
 
+def test_patch_redirects_swap_optimizer_get_device_info_to_meta_stub():
+    # Regression test for a real crash found via the 16-layer
+    # DeepSeek-V4-Pro smoke run (SwapOptimizersContainer.__init__, used
+    # because the acceptance config sets optimizer.swap_optimizer=True):
+    # torchtitan_npu.patches.optimizer.swap_optimizer.get_torch_device()
+    # calls torchtitan.tools.utils.get_device_info() FRESH each time
+    # (independently re-detecting the "live" device via
+    # _get_available_device_type()), bypassing the module-level
+    # device_type/device_module globals patched above entirely -- so
+    # `get_torch_device().Stream()` resolved real torch.cuda.Stream(),
+    # which unconditionally requires real CUDA hardware. Skipped (not
+    # failed) when torch_npu is not installed.
+    pytest.importorskip("torch_npu", reason="torch_npu-specific regression test")
+    import torchtitan_npu.patches.optimizer.swap_optimizer as swap_optimizer_mod
+
+    try:
+        patch_device_type_to_meta()
+        device_type, device_module = swap_optimizer_mod.get_device_info()
+        assert device_type == "meta"
+        stream = device_module.Stream()
+        stream.synchronize()  # must not touch real hardware
+    finally:
+        unpatch_device_type_to_meta()
+
+
+
 def test_patch_registers_torch_meta_as_a_device_accessor_module():
     # Regression test for a real crash found via CANN-container validation:
     # torch.distributed.device_mesh._get_device_handle(device_type) does

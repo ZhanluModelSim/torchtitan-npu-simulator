@@ -157,12 +157,41 @@ def _neutralize_torch_npu_optimizer_device_probe() -> None:
         npu_optim._device_name = _DUMMY_NPU_DEVICE_NAME
 
 
+def _patch_swap_optimizer_get_device_info(stub: _MetaDeviceModule) -> None:
+    """`torchtitan_npu.patches.optimizer.swap_optimizer` imports
+    `get_device_info` BY VALUE (`from torchtitan.tools.utils import
+    get_device_info`) and calls it fresh inside `get_torch_device()` to
+    build `SwapOptimizersContainer.swap_to_device_stream = get_torch_device().Stream()`.
+    `get_device_info()` independently re-detects the "live" device
+    type/module via `_get_available_device_type()` every call -- bypassing
+    the module-level `device_type`/`device_module` globals patched above
+    entirely -- so under real torch_npu it resolves real `torch.cuda`
+    (compiled into every torch build regardless of GPU presence), whose
+    `.Stream()` unconditionally requires real CUDA hardware. Patches the
+    by-value-imported name directly on `swap_optimizer`'s own module
+    namespace; no-op if torch_npu (and therefore this torchtitan_npu
+    submodule) is not importable, e.g. this repo's CPU-only unit-test
+    sandbox."""
+    try:
+        import torchtitan_npu.patches.optimizer.swap_optimizer as swap_optimizer_mod
+    except ImportError:
+        return
+
+    key = ("torchtitan_npu.patches.optimizer.swap_optimizer", "get_device_info")
+    if key in _original_values:
+        return
+    _original_values[key] = swap_optimizer_mod.get_device_info
+    swap_optimizer_mod.get_device_info = lambda: ("meta", stub)
+
+
 def patch_device_type_to_meta() -> None:
     """Idempotently rebind `device_type="meta"` / `device_module=<stub>`
     across every module that imported them by value at load time, register
     the same stub as `torch.meta` (see `_MetaDeviceModule`'s docstring for
     why), and neutralize `torch_npu`'s real-hardware optimizer device probe
-    (see `_neutralize_torch_npu_optimizer_device_probe`)."""
+    and swap-optimizer device stream construction (see
+    `_neutralize_torch_npu_optimizer_device_probe` and
+    `_patch_swap_optimizer_get_device_info`)."""
     global _patched
     if _patched:
         return
@@ -181,6 +210,7 @@ def patch_device_type_to_meta() -> None:
     torch.meta = stub
 
     _neutralize_torch_npu_optimizer_device_probe()
+    _patch_swap_optimizer_get_device_info(stub)
     _patched = True
 
 
