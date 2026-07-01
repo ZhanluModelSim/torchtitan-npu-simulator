@@ -110,3 +110,84 @@ class SimHcPre(nn.Module):
         x = x.flatten(2)
         module_path = self.__class__.__name__
         return _SimHcPreFn.apply(x, hc_fn, hc_scale, hc_base, self.hc_mult, module_path)
+
+
+class _SimHcHeadFn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, hc_head_fn, hc_head_scale, hc_head_base, hc_mult, module_path):  # noqa: ANN001
+        # x arrives pre-flattened to [B,S,nD] by SimHcHead.forward, matching NpuHcHead.
+        B, S, nD = x.shape
+        D = nD // hc_mult
+        dtype = x.dtype
+
+        # NpuHcHead's real forward calls MHCPreOnlyTriton.apply(x, hc_head_fn, hc_head_scale,
+        # hc_head_base, ...) directly on the already-flattened x. Tracing MHCPreOnlyTriton.forward
+        # (ops/triton/mhc_triton.py): `weight = hc_head_fn.t()` transposes hc_head_fn's real shape
+        # `[hc_mult, hc_dim]` (HcHead.__init__, model.py:1064-1084) to `[hc_dim, hc_mult]`, so
+        # `x_proj = matmul(x_norm_mat[B,S,nD], weight[nD,hc_mult]) = [B,S,hc_mult]` -- the "mixes"
+        # last dim here is `hc_mult`, NOT `n*n+2*n` (that larger size is specific to the main
+        # HcPre/MHCPreTriton path in SimHcPre, which uses a differently-shaped hc_fn weight).
+        # hc_head_scale/hc_head_base are real HcHead parameters too: shape [1] and [hc_mult]
+        # respectively (NOT [3]/[n*n+2*n] like HcPre's hc_scale/hc_base) -- confirmed from
+        # HcHead.__init__'s actual nn.Parameter allocations.
+        mixes = _empty_like_shape((B, S, hc_mult), x)
+        h_pre = _empty_like_shape((B, S, hc_mult), x)
+        _record("triton.hc_pre_only_fwd", [mixes, hc_head_scale, hc_head_base], [h_pre], module_path)
+
+        x_unflatten = x.unflatten(dim=-1, sizes=(hc_mult, D))
+        y = torch.empty((B, S, D), dtype=dtype, device=x.device)
+        _record("triton.hc_pre_bmm_forward", [h_pre, x_unflatten], [y], module_path)
+
+        ctx.save_for_backward(x, hc_head_fn, hc_head_scale, hc_head_base, h_pre)
+        ctx.hc_mult, ctx.module_path = hc_mult, module_path
+        ctx.B, ctx.S, ctx.nD, ctx.D = B, S, nD, D
+        return y
+
+    @staticmethod
+    def backward(ctx, grad_y):  # noqa: ANN001
+        x, hc_head_fn, hc_head_scale, hc_head_base, h_pre = ctx.saved_tensors
+        B, S, nD, D, hc_mult = ctx.B, ctx.S, ctx.nD, ctx.D, ctx.hc_mult
+
+        grad_h_pre = _empty_like_shape((B, S, hc_mult), h_pre)
+        grad_x_direct = torch.empty((B, S, hc_mult, D), dtype=x.dtype, device=x.device)
+        _record(
+            "triton.hc_pre_bmm_backward",
+            [h_pre, x.unflatten(dim=-1, sizes=(hc_mult, D)), grad_y],
+            [grad_h_pre, grad_x_direct],
+            ctx.module_path,
+        )
+
+        grad_x_proj = _empty_like_shape((B, S, hc_mult), h_pre)
+        grad_branch_alpha = torch.empty_like(hc_head_scale)
+        grad_branch_beta = torch.empty_like(hc_head_base)
+        _record(
+            "triton.hc_pre_only_bwd",
+            [grad_h_pre, x, hc_head_scale, hc_head_base],
+            [grad_x_proj, grad_branch_alpha, grad_branch_beta],
+            ctx.module_path,
+        )
+
+        grad_x = torch.empty((B, S, nD), dtype=x.dtype, device=x.device)
+        grad_hc_head_fn = torch.empty_like(hc_head_fn)
+        return grad_x, grad_hc_head_fn, grad_branch_alpha, grad_branch_beta, None, None
+
+
+class SimHcHead(nn.Module):
+    """Drop-in simulator replacement for `NpuHcHead`
+    (`torchtitan_npu.converters.kernels.mhc_prepost`).
+
+    `__init__` mirrors `NpuHcHead.__init__(self, parent: HcHead)`'s exact
+    `__dict__` shallow-copy pattern -- **required**, not just style: unlike
+    `HcPre`/`HcPost`, `HcHead` owns real `nn.Parameter`s
+    (`hc_head_fn: [hc_mult,hc_dim]`, `hc_head_base: [hc_mult]`,
+    `hc_head_scale: [1]`, per `HcHead.__init__` in
+    `torchtitan_npu/models/deepseek_v4/model.py:1064-1084`) that must be
+    reused verbatim from `parent`, not recreated with a guessed shape."""
+
+    def __init__(self, parent: "HcHead") -> None:
+        self.__dict__.update(parent.__dict__)
+
+    def forward(self, x: torch.Tensor):
+        x = x.flatten(2)
+        module_path = self.__class__.__name__
+        return _SimHcHeadFn.apply(x, self.hc_head_fn, self.hc_head_scale, self.hc_head_base, self.hc_mult, module_path)
