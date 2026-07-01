@@ -11,15 +11,28 @@ ever allocated. See design doc §5.1 for the verification this relies on."""
 from __future__ import annotations
 
 import importlib
+from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Any
+
+import torch
+
+# Sentinel: distinguishes "attribute did not exist before patching" (must be
+# deleted on unpatch) from "attribute existed and was None" (must be restored
+# to None on unpatch).
+_MISSING = object()
 
 
 class _MetaDeviceModule:
     """Minimal stand-in for `torch.cuda`/`torch_npu`, covering every method
     actually called on `device_module` by `torchtitan.trainer`,
     `torchtitan.components.metrics`, and `torchtitan.distributed.utils`
-    (verified against the pinned torchtitan commit -- see design doc §5.1)."""
+    (verified against the pinned torchtitan commit -- see design doc §5.1),
+    plus the subset of the `torch.<device_type>` module API that
+    `torch.distributed.device_mesh._get_device_handle`/FSDP2 resolve via
+    `getattr(torch, device_type)` (`current_device`, `is_available`,
+    `is_initialized`, `current_stream`, `stream`, `memory_summary`,
+    `Event`, `Stream`)."""
 
     name = "Meta_Simulator"
 
@@ -54,6 +67,48 @@ class _MetaDeviceModule:
             "num_alloc_retries": 0,
             "num_ooms": 0,
         }
+
+    def is_available(self) -> bool:
+        return True
+
+    def is_initialized(self) -> bool:
+        return True
+
+    def current_stream(self, *_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    @contextmanager
+    def stream(self, *_args: Any, **_kwargs: Any):
+        yield
+
+    def memory_summary(self, *_args: Any, **_kwargs: Any) -> str:
+        return ""
+
+    class Event:
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            pass
+
+        def record(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        def synchronize(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        def wait(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        def elapsed_time(self, *_args: Any, **_kwargs: Any) -> float:
+            return 0.0
+
+    class Stream:
+        def __init__(self, *_args: Any, **_kwargs: Any) -> None:
+            pass
+
+        def synchronize(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        def wait_stream(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
 
 
 _PATCHED_MODULE_ATTRS: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -96,9 +151,10 @@ def _neutralize_torch_npu_optimizer_device_probe() -> None:
 
 def patch_device_type_to_meta() -> None:
     """Idempotently rebind `device_type="meta"` / `device_module=<stub>`
-    across every module that imported them by value at load time, and
-    neutralize `torch_npu`'s real-hardware optimizer device probe (see
-    `_neutralize_torch_npu_optimizer_device_probe`)."""
+    across every module that imported them by value at load time, register
+    the same stub as `torch.meta` (see `_MetaDeviceModule`'s docstring for
+    why), and neutralize `torch_npu`'s real-hardware optimizer device probe
+    (see `_neutralize_torch_npu_optimizer_device_probe`)."""
     global _patched
     if _patched:
         return
@@ -113,6 +169,9 @@ def patch_device_type_to_meta() -> None:
             value: Any = "meta" if attr_name == "device_type" else stub
             setattr(module, attr_name, value)
 
+    _original_values[("torch", "meta")] = getattr(torch, "meta", _MISSING)
+    torch.meta = stub
+
     _neutralize_torch_npu_optimizer_device_probe()
     _patched = True
 
@@ -122,6 +181,9 @@ def unpatch_device_type_to_meta() -> None:
     global _patched
     for (module_path, attr_name), original in _original_values.items():
         module = importlib.import_module(module_path)
-        setattr(module, attr_name, original)
+        if original is _MISSING:
+            delattr(module, attr_name)
+        else:
+            setattr(module, attr_name, original)
     _original_values.clear()
     _patched = False

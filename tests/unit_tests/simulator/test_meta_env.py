@@ -100,3 +100,30 @@ def test_patch_neutralizes_torch_npu_optimizer_device_probe_when_torch_npu_prese
     finally:
         unpatch_device_type_to_meta()
         npu_optim._device_name = original
+
+
+def test_patch_registers_torch_meta_as_a_device_accessor_module():
+    # Regression test for a real crash found via CANN-container validation:
+    # torch.distributed.device_mesh._get_device_handle(device_type) does
+    # `getattr(torch, device_type, None)` to resolve a device module (the
+    # same mechanism used for "cuda"/"npu"/"xpu"), and FSDP2's
+    # _get_device_from_mesh calls `.current_device()` on the result
+    # unconditionally for any non-"cpu" device_type -- including "meta",
+    # which torch does not register a module for by default, previously
+    # crashing with `AttributeError: 'NoneType' object has no
+    # attribute 'current_device'`.
+    had_meta_before = hasattr(torch, "meta")
+    try:
+        patch_device_type_to_meta()
+        assert torch.meta.current_device() == 0
+        assert torch.meta.is_available() is True
+        assert torch.meta.is_initialized() is True
+        with torch.meta.stream(None):
+            pass
+        event = torch.meta.Event()
+        event.record()
+        event.synchronize()
+    finally:
+        unpatch_device_type_to_meta()
+        assert hasattr(torch, "meta") == had_meta_before
+
