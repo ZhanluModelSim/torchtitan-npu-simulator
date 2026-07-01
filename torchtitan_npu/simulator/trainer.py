@@ -46,29 +46,37 @@ class SimulationTrainerConfig(Trainer.Config):
 
 
 # Model converters that unconditionally require real accelerator hardware to
-# run their forward computation (a Triton-JIT kernel launch, or a private
-# "custom_ops" extension unavailable outside Huawei's internal build),
-# with no meta-device-compatible fallback other than the model's own base
-# (pre-conversion) module -- see `_strip_hardware_dependent_model_converters`.
-_HARDWARE_DEPENDENT_CONVERTER_NAMES = frozenset({"npu_mhc_pre", "npu_mhc_post"})
+# run their forward computation (a Triton-JIT kernel launch or a JIT-compiled
+# aclnn extension, either gated behind a private "custom_ops" module
+# unavailable outside Huawei's internal build), with no meta-device-compatible
+# fallback other than the model's own base (pre-conversion) module -- see
+# `_strip_hardware_dependent_model_converters`.
+#   - npu_mhc_pre/npu_mhc_post: MHCPreConverter/MHCPostConverter select
+#     between a Triton-JIT kernel and a fused NPU custom op gated behind
+#     "custom_ops"; the base HcPre/HcPost/HcSplitSinkhorn classes are
+#     pure PyTorch and meta-safe as-is.
+#   - npu_smla: NpuSMLAConverter's non-"A5" path builds a JIT-compiled
+#     aclnn extension (`sparse_attn_sharedkv`) whose meta/metadata kernel
+#     itself crashes the process (SIGABRT, "No NPUs are available") when
+#     called on meta tensors with no NPU device present -- a native C++
+#     crash unreachable from Python-level monkeypatching. The base
+#     SparseAttention/LiCompute classes are pure PyTorch (verified by
+#     reading their forward() methods) except for one hardcoded
+#     `device="npu"` literal in SparseAttention.forward's `index_mask`
+#     construction, redirected to "meta" by
+#     `meta_env._patch_torch_full_npu_device_literal`.
+_HARDWARE_DEPENDENT_CONVERTER_NAMES = frozenset({"npu_mhc_pre", "npu_mhc_post", "npu_smla"})
 
 
 def _strip_hardware_dependent_model_converters(config: Any) -> None:
     """Remove `_HARDWARE_DEPENDENT_CONVERTER_NAMES` from
     `config.model_converters.converters` so `model_converters.convert(model)`
-    never invokes them, leaving each affected submodule (`HcPre`/`HcPost`)
-    on its BASE class -- which, verified by reading
-    `torchtitan_npu.models.deepseek_v4.model.HcPre.forward`/`HcSplitSinkhorn
-    .forward`, is already a pure-PyTorch (no custom kernel, no Triton)
-    implementation that runs correctly on meta tensors. The NPU-optimized
-    replacements (`MHCPreConverter`/`MHCPostConverter`) instead select
-    between a Triton-JIT kernel (real hardware required to launch, no meta
-    mode exists) and a fused NPU custom op gated behind a private
-    `custom_ops` extension unavailable in this environment -- neither
-    works under meta simulation, so bypassing the conversion entirely (not
-    picking either alternative) is the only meta-safe option. Uses the
-    same `_owner`/`_model_config.name` introspection as this repo's own
-    `torchtitan_npu.converters.registry.has_npu_converter`."""
+    never invokes them, leaving each affected submodule on its BASE class --
+    verified by reading their forward() methods to be pure-PyTorch (no
+    custom kernel, no Triton) implementations that run correctly on meta
+    tensors (module-level comment above has the per-converter detail).
+    Uses the same `_owner`/`_model_config.name` introspection as this
+    repo's own `torchtitan_npu.converters.registry.has_npu_converter`."""
     model_converters_config = getattr(config, "model_converters", None)
     converters = getattr(model_converters_config, "converters", None) if model_converters_config else None
     if not converters:
@@ -82,6 +90,7 @@ def _strip_hardware_dependent_model_converters(config: Any) -> None:
         if name not in _HARDWARE_DEPENDENT_CONVERTER_NAMES:
             kept.append(converter_config)
     model_converters_config.converters = kept
+
 
 
 def run_simulation_step(

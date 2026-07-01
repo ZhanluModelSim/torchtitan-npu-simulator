@@ -161,6 +161,7 @@ _DUMMY_NPU_DEVICE_NAME = "Ascend910B_Simulator"
 _original_values: dict[tuple[str, str], Any] = {}
 _original_fsdp_validate_no_meta_params: Any = _MISSING
 _original_tensor_npu_method: Any = _MISSING
+_original_torch_full: Any = _MISSING
 _patched = False
 
 
@@ -184,6 +185,38 @@ def _patch_tensor_npu_method_to_meta() -> None:
         return
     _original_tensor_npu_method = torch.Tensor.npu
     torch.Tensor.npu = lambda self, *_args, **_kwargs: self.to("meta")
+
+
+def _is_real_npu_device(device: Any) -> bool:
+    if device is None:
+        return False
+    if isinstance(device, torch.device):
+        return device.type == "npu"
+    return str(device) == "npu" or str(device).startswith("npu:")
+
+
+def _patch_torch_full_npu_device_literal() -> None:
+    """`torchtitan_npu.models.deepseek_v4.model.SparseAttention.forward`
+    (the model's BASE, pre-conversion attention class -- used under
+    simulation once `npu_smla` is stripped from
+    `config.model_converters.converters`, see
+    `torchtitan_npu.simulator.trainer._strip_hardware_dependent_model_converters`)
+    hardcodes `device="npu"` when building its `index_mask` via
+    `torch.full(...)`, independent of the `device_type`/`device_module`
+    globals patched above. Wraps `torch.full` to redirect a literal
+    `"npu"`/`"npu:N"` device (string or `torch.device`) to `"meta"`;
+    passes every other call through unchanged."""
+    global _original_torch_full
+    if _original_torch_full is not _MISSING:
+        return
+    _original_torch_full = torch.full
+
+    def _meta_safe_full(*args: Any, **kwargs: Any) -> torch.Tensor:
+        if _is_real_npu_device(kwargs.get("device")):
+            kwargs["device"] = "meta"
+        return _original_torch_full(*args, **kwargs)
+
+    torch.full = _meta_safe_full
 
 
 def _neutralize_torch_npu_optimizer_device_probe() -> None:
@@ -265,12 +298,14 @@ def patch_device_type_to_meta() -> None:
     across every module that imported them by value at load time, register
     the same stub as `torch.meta` (see `_MetaDeviceModule`'s docstring for
     why), neutralize `torch_npu`'s real-hardware optimizer device probe,
-    swap-optimizer device stream construction, and explicit
-    `torch.Tensor.npu()` calls (see
+    swap-optimizer device stream construction, explicit
+    `torch.Tensor.npu()` calls, and a hardcoded `torch.full(...,
+    device="npu")` literal (see
     `_neutralize_torch_npu_optimizer_device_probe`,
-    `_patch_swap_optimizer_get_device_info`, and
-    `_patch_tensor_npu_method_to_meta`), and disable FSDP2's meta-param
-    validation (see `_neutralize_fsdp_meta_param_validation`)."""
+    `_patch_swap_optimizer_get_device_info`,
+    `_patch_tensor_npu_method_to_meta`, and
+    `_patch_torch_full_npu_device_literal`), and disable FSDP2's
+    meta-param validation (see `_neutralize_fsdp_meta_param_validation`)."""
     global _patched
     if _patched:
         return
@@ -291,13 +326,14 @@ def patch_device_type_to_meta() -> None:
     _neutralize_torch_npu_optimizer_device_probe()
     _patch_swap_optimizer_get_device_info(stub)
     _patch_tensor_npu_method_to_meta()
+    _patch_torch_full_npu_device_literal()
     _neutralize_fsdp_meta_param_validation()
     _patched = True
 
 
 def unpatch_device_type_to_meta() -> None:
     """Restore the original device_type/device_module bindings (test-only helper)."""
-    global _patched, _original_fsdp_validate_no_meta_params, _original_tensor_npu_method
+    global _patched, _original_fsdp_validate_no_meta_params, _original_tensor_npu_method, _original_torch_full
     for (module_path, attr_name), original in _original_values.items():
         module = importlib.import_module(module_path)
         if original is _MISSING:
@@ -315,5 +351,9 @@ def unpatch_device_type_to_meta() -> None:
     if _original_tensor_npu_method is not _MISSING:
         torch.Tensor.npu = _original_tensor_npu_method
         _original_tensor_npu_method = _MISSING
+
+    if _original_torch_full is not _MISSING:
+        torch.full = _original_torch_full
+        _original_torch_full = _MISSING
 
     _patched = False

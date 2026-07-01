@@ -119,12 +119,14 @@ def _fake_converter_config(name: str):
 
 
 def test_strip_hardware_dependent_model_converters_removes_mhc_converters():
-    # Regression test for a real crash found via the 16-layer
+    # Regression test for real crashes found via the 16-layer
     # DeepSeek-V4-Pro smoke run: MHCPreConverter/MHCPostConverter each
     # require either a Triton-JIT kernel launch (real hardware required,
     # no meta mode exists) or a private "custom_ops" extension unavailable
-    # in this environment. Stripping them from
-    # config.model_converters.converters leaves the model's HcPre/HcPost
+    # in this environment; NpuSMLAConverter's non-"A5" path builds a
+    # JIT-compiled aclnn extension whose meta-kernel itself crashes the
+    # process with no NPU device present. Stripping them from
+    # config.model_converters.converters leaves the model's affected
     # submodules on their base (pure-PyTorch, meta-safe) implementation.
     config = SimpleNamespace(
         model_converters=SimpleNamespace(
@@ -132,6 +134,7 @@ def test_strip_hardware_dependent_model_converters_removes_mhc_converters():
                 _fake_converter_config("npu_rms_norm"),
                 _fake_converter_config("npu_mhc_pre"),
                 _fake_converter_config("npu_mhc_post"),
+                _fake_converter_config("npu_smla"),
                 _fake_converter_config("npu_gmm"),
             ]
         )

@@ -182,6 +182,30 @@ def test_patch_tensor_npu_is_noop_when_torch_npu_not_installed():
         unpatch_device_type_to_meta()
 
 
+def test_patch_redirects_torch_full_npu_device_literal_to_meta():
+    # Regression test for a real crash found via the 16-layer
+    # DeepSeek-V4-Pro smoke run: torchtitan_npu.models.deepseek_v4.model
+    # .SparseAttention.forward (the model's base, pre-conversion attention
+    # class, used once npu_smla is stripped from
+    # config.model_converters.converters) hardcodes device="npu" when
+    # building its index_mask via torch.full(...), independent of the
+    # device_type/device_module globals patched elsewhere. Pure PyTorch
+    # (torch.full itself), so this test runs regardless of torch_npu
+    # availability -- it only exercises the string-literal redirect, not a
+    # real "npu" device backend.
+    original = torch.full
+    try:
+        patch_device_type_to_meta()
+        t = torch.full((2, 3), 1.0, device="npu")
+        assert t.device.type == "meta"
+        # non-"npu" devices must pass through unaffected
+        t_cpu = torch.full((2, 3), 1.0, device="cpu")
+        assert t_cpu.device.type == "cpu"
+    finally:
+        unpatch_device_type_to_meta()
+        assert torch.full is original
+
+
 def test_patch_registers_torch_meta_as_a_device_accessor_module():
     # Regression test for a real crash found via CANN-container validation:
     # torch.distributed.device_mesh._get_device_handle(device_type) does
