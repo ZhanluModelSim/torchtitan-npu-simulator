@@ -58,7 +58,15 @@ class _MetaDeviceModule:
         return self.name
 
     def get_device_properties(self, *_args: Any, **_kwargs: Any) -> SimpleNamespace:
-        return SimpleNamespace(total_memory=0, name=self.name)
+        # total_memory must be non-zero: torchtitan's own
+        # DeviceMemoryMonitor._to_pct() unconditionally divides by it
+        # (`100 * memory / self.device_capacity`) when computing display
+        # percentages. Since `memory_stats()` below always reports 0 bytes
+        # under meta simulation (no real memory is ever allocated), the
+        # resulting percentage is always 0% regardless of this
+        # denominator's exact value -- it exists purely to avoid
+        # ZeroDivisionError, not to represent a real capacity.
+        return SimpleNamespace(total_memory=1, name=self.name)
 
     def memory_stats(self, *_args: Any, **_kwargs: Any) -> dict[str, int]:
         return {

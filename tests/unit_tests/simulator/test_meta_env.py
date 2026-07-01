@@ -60,7 +60,7 @@ def test_stub_device_module_methods_used_by_trainer_and_metrics_do_not_raise():
         stub.empty_cache()
         stub.reset_peak_memory_stats()
         props = stub.get_device_properties(torch.device("meta:0"))
-        assert props.total_memory == 0
+        assert props.total_memory > 0  # non-zero: avoids DeviceMemoryMonitor's ZeroDivisionError
         stats = stub.memory_stats(torch.device("meta:0"))
         assert stats["active_bytes.all.peak"] == 0
     finally:
