@@ -160,7 +160,30 @@ _DUMMY_NPU_DEVICE_NAME = "Ascend910B_Simulator"
 
 _original_values: dict[tuple[str, str], Any] = {}
 _original_fsdp_validate_no_meta_params: Any = _MISSING
+_original_tensor_npu_method: Any = _MISSING
 _patched = False
+
+
+def _patch_tensor_npu_method_to_meta() -> None:
+    """`torch_npu` registers `torch.Tensor.npu(device=None, non_blocking=False,
+    **kwargs)` (a `.cuda()`-style convenience alias) as a real device-move
+    call -- e.g. `torchtitan_npu.converters.kernels.npu_smla`'s sparse
+    attention forward uses `torch.tensor([]).npu()` as a placeholder
+    default, which crashes with a real `aclInit()` hardware-init error
+    with no NPU device present, completely independent of the
+    `device_type`/`device_module` globals patched above (this is an
+    explicit, hardcoded `.npu()` call, not a lookup through either of
+    those). Redirects it to `.to("meta")` (ignoring the requested device
+    index/non_blocking/kwargs -- under meta simulation everything lives on
+    meta regardless). No-op if torch_npu does not register this method
+    (e.g. this repo's CPU-only unit-test sandbox)."""
+    global _original_tensor_npu_method
+    if not hasattr(torch.Tensor, "npu"):
+        return
+    if _original_tensor_npu_method is not _MISSING:
+        return
+    _original_tensor_npu_method = torch.Tensor.npu
+    torch.Tensor.npu = lambda self, *_args, **_kwargs: self.to("meta")
 
 
 def _neutralize_torch_npu_optimizer_device_probe() -> None:
@@ -241,11 +264,13 @@ def patch_device_type_to_meta() -> None:
     """Idempotently rebind `device_type="meta"` / `device_module=<stub>`
     across every module that imported them by value at load time, register
     the same stub as `torch.meta` (see `_MetaDeviceModule`'s docstring for
-    why), neutralize `torch_npu`'s real-hardware optimizer device probe and
-    swap-optimizer device stream construction (see
-    `_neutralize_torch_npu_optimizer_device_probe` and
-    `_patch_swap_optimizer_get_device_info`), and disable FSDP2's
-    meta-param validation (see `_neutralize_fsdp_meta_param_validation`)."""
+    why), neutralize `torch_npu`'s real-hardware optimizer device probe,
+    swap-optimizer device stream construction, and explicit
+    `torch.Tensor.npu()` calls (see
+    `_neutralize_torch_npu_optimizer_device_probe`,
+    `_patch_swap_optimizer_get_device_info`, and
+    `_patch_tensor_npu_method_to_meta`), and disable FSDP2's meta-param
+    validation (see `_neutralize_fsdp_meta_param_validation`)."""
     global _patched
     if _patched:
         return
@@ -265,13 +290,14 @@ def patch_device_type_to_meta() -> None:
 
     _neutralize_torch_npu_optimizer_device_probe()
     _patch_swap_optimizer_get_device_info(stub)
+    _patch_tensor_npu_method_to_meta()
     _neutralize_fsdp_meta_param_validation()
     _patched = True
 
 
 def unpatch_device_type_to_meta() -> None:
     """Restore the original device_type/device_module bindings (test-only helper)."""
-    global _patched, _original_fsdp_validate_no_meta_params
+    global _patched, _original_fsdp_validate_no_meta_params, _original_tensor_npu_method
     for (module_path, attr_name), original in _original_values.items():
         module = importlib.import_module(module_path)
         if original is _MISSING:
@@ -285,5 +311,9 @@ def unpatch_device_type_to_meta() -> None:
 
         FSDPParamGroup._validate_no_meta_params = _original_fsdp_validate_no_meta_params
         _original_fsdp_validate_no_meta_params = _MISSING
+
+    if _original_tensor_npu_method is not _MISSING:
+        torch.Tensor.npu = _original_tensor_npu_method
+        _original_tensor_npu_method = _MISSING
 
     _patched = False

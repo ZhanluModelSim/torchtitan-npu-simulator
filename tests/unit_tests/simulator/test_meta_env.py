@@ -149,6 +149,39 @@ def test_patch_neutralizes_fsdp_meta_param_validation():
         assert FSDPParamGroup._validate_no_meta_params is original
 
 
+def test_patch_redirects_tensor_npu_method_to_meta_when_torch_npu_present():
+    # Regression test for a real crash found via the 16-layer
+    # DeepSeek-V4-Pro smoke run (SMLA sparse attention forward):
+    # torchtitan_npu.converters.kernels.npu_smla hardcodes
+    # `torch.tensor([]).npu()` as a placeholder default, an explicit,
+    # real-hardware-touching device-move call completely independent of
+    # the device_type/device_module globals patched elsewhere. Skipped
+    # (not failed) when torch_npu (and therefore torch.Tensor.npu) is not
+    # installed, e.g. this repo's CPU-only unit-test sandbox.
+    pytest.importorskip("torch_npu", reason="torch_npu-specific regression test")
+    original = torch.Tensor.npu
+    try:
+        patch_device_type_to_meta()
+        t = torch.tensor([1.0, 2.0]).npu()
+        assert t.device.type == "meta"
+    finally:
+        unpatch_device_type_to_meta()
+        assert torch.Tensor.npu is original
+
+
+def test_patch_tensor_npu_is_noop_when_torch_npu_not_installed():
+    # The counterpart to the test above: when torch.Tensor.npu is not
+    # registered at all (this repo's CPU-only sandbox), patching/unpatching
+    # must be a harmless no-op, not raise.
+    if hasattr(torch.Tensor, "npu"):
+        pytest.skip("torch.Tensor.npu is registered in this environment (torch_npu present)")
+    try:
+        patch_device_type_to_meta()
+        assert not hasattr(torch.Tensor, "npu")
+    finally:
+        unpatch_device_type_to_meta()
+
+
 def test_patch_registers_torch_meta_as_a_device_accessor_module():
     # Regression test for a real crash found via CANN-container validation:
     # torch.distributed.device_mesh._get_device_handle(device_type) does
