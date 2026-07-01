@@ -458,8 +458,8 @@ their backward counterparts) into the active OpDispatchCapture, with analyticall
 from __future__ import annotations
 
 import torch
-import torch.nn as nn
 
+from torchtitan_npu.models.deepseek_v4.model import HcHead, HcPost, HcPre
 from torchtitan_npu.simulator.capture.dispatch_capture import get_active_capture
 
 
@@ -471,6 +471,19 @@ def _record(raw_op_type: str, inputs: list[torch.Tensor], outputs: list[torch.Te
 
 def _empty_like_shape(shape: tuple[int, ...], ref: torch.Tensor) -> torch.Tensor:
     return torch.empty(shape, dtype=ref.dtype, device=ref.device)
+
+
+# **Found via real-container validation (Task 7):** `SimHcPre`/`SimHcHead`/`SimHcPost` must
+# subclass `HcPre`/`HcHead`/`HcPost` respectively (exactly like the real `NpuHcPre(HcPre)`/
+# `NpuHcHead(HcHead)`/`NpuHcPost(HcPost)` do) -- NOT plain `nn.Module`. torchtitan's
+# `BaseModel.verify_module_protocol()` (`torchtitan/protocols/model.py`) walks every submodule
+# and asserts `isinstance(mod, torchtitan.protocols.module.Module)`; `HcPre`/`HcHead`/`HcPost`
+# already satisfy this (they subclass `Module`), so subclassing them transitively satisfies it
+# too, with zero extra code -- confirmed by running the 16-layer smoke config, which failed with
+# `RuntimeError: The following modules do not satisfy the Module protocol: 'layers.0.hc_pre'
+# (SimHcPre), ...` before this fix. `__init__`'s `self.__dict__.update(parent.__dict__)` pattern
+# (no `super().__init__()` call) is unaffected by which class is subclassed -- it never relies on
+# the parent class chain's `__init__` running.
 
 
 class _SimHcPreFn(torch.autograd.Function):
@@ -534,7 +547,7 @@ class _SimHcPreFn(torch.autograd.Function):
         return grad_x, grad_hc_fn, grad_branch_alpha, grad_branch_beta, None, None
 
 
-class SimHcPre(nn.Module):
+class SimHcPre(HcPre):
     """Drop-in simulator replacement for `NpuHcPre`/`NpuHcPreFused`
     (`torchtitan_npu.converters.kernels.mhc_prepost`). Same forward()
     signature; never runs real Triton/torch_npu, only records the real op
@@ -699,7 +712,7 @@ class _SimHcHeadFn(torch.autograd.Function):
         return grad_x, grad_hc_head_fn, grad_branch_alpha, grad_branch_beta, None, None
 
 
-class SimHcHead(nn.Module):
+class SimHcHead(HcHead):
     """Drop-in simulator replacement for `NpuHcHead`
     (`torchtitan_npu.converters.kernels.mhc_prepost`).
 
@@ -872,7 +885,7 @@ class _SimHcPostFn(torch.autograd.Function):
         return grad_x, grad_residual, grad_h_post, grad_h_res
 
 
-class SimHcPost(nn.Module):
+class SimHcPost(HcPost):
     """Drop-in simulator replacement for `NpuHcPost`
     (`torchtitan_npu.converters.kernels.mhc_prepost`). `__init__` mirrors
     `NpuHcPost.__init__(self, parent: HcPost)`'s `__dict__` shallow-copy
