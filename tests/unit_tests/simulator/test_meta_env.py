@@ -127,6 +127,26 @@ def test_patch_redirects_swap_optimizer_get_device_info_to_meta_stub():
         unpatch_device_type_to_meta()
 
 
+def test_patch_neutralizes_fsdp_meta_param_validation():
+    # Regression test for a real crash found via the 16-layer
+    # DeepSeek-V4-Pro smoke run (first forward pass through an
+    # FSDP2-wrapped model): FSDPParamGroup._lazy_init() unconditionally
+    # calls _validate_no_meta_params(), which raises RuntimeError if any
+    # sharded parameter's device.type == "meta" -- always true under this
+    # simulator by design (every parameter lives on meta forever; no real
+    # memory is ever allocated). Pure PyTorch (torch.distributed.fsdp), so
+    # this test runs regardless of torch_npu availability.
+    from torch.distributed.fsdp._fully_shard._fsdp_param_group import FSDPParamGroup
+
+    original = FSDPParamGroup._validate_no_meta_params
+    try:
+        patch_device_type_to_meta()
+        # must not raise, regardless of self/sharded-param state:
+        FSDPParamGroup._validate_no_meta_params(None)
+    finally:
+        unpatch_device_type_to_meta()
+        assert FSDPParamGroup._validate_no_meta_params is original
+
 
 def test_patch_registers_torch_meta_as_a_device_accessor_module():
     # Regression test for a real crash found via CANN-container validation:

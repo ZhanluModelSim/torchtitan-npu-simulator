@@ -132,6 +132,7 @@ _PATCHED_MODULE_ATTRS: tuple[tuple[str, tuple[str, ...]], ...] = (
 _DUMMY_NPU_DEVICE_NAME = "Ascend910B_Simulator"
 
 _original_values: dict[tuple[str, str], Any] = {}
+_original_fsdp_validate_no_meta_params: Any = _MISSING
 _patched = False
 
 
@@ -184,14 +185,40 @@ def _patch_swap_optimizer_get_device_info(stub: _MetaDeviceModule) -> None:
     swap_optimizer_mod.get_device_info = lambda: ("meta", stub)
 
 
+def _neutralize_fsdp_meta_param_validation() -> None:
+    """`FSDPParamGroup._lazy_init()` (triggered by the model's first
+    forward call) unconditionally calls `_validate_no_meta_params()`,
+    which raises `RuntimeError` if ANY sharded parameter's
+    `.device.type == "meta"`. This check exists to catch real-training
+    user errors (forgetting to materialize a meta-constructed model onto
+    real hardware before training) -- but the simulator deliberately keeps
+    every parameter on the meta device forever (that is the entire point:
+    no real memory is ever allocated), so this defensive check is always a
+    false positive here. Neutralizing it is pure PyTorch (`torch.distributed
+    .fsdp`), not torchtitan/torchtitan_npu-specific, so this patch applies
+    (and is tested) regardless of torch_npu availability.
+
+    Tracked separately from `_original_values` (a class attribute, not a
+    module attribute -- `importlib.import_module()` cannot resolve
+    `"...FSDPParamGroup"` as a module path)."""
+    global _original_fsdp_validate_no_meta_params
+    from torch.distributed.fsdp._fully_shard._fsdp_param_group import FSDPParamGroup
+
+    if _original_fsdp_validate_no_meta_params is not _MISSING:
+        return
+    _original_fsdp_validate_no_meta_params = FSDPParamGroup._validate_no_meta_params
+    FSDPParamGroup._validate_no_meta_params = lambda self: None
+
+
 def patch_device_type_to_meta() -> None:
     """Idempotently rebind `device_type="meta"` / `device_module=<stub>`
     across every module that imported them by value at load time, register
     the same stub as `torch.meta` (see `_MetaDeviceModule`'s docstring for
-    why), and neutralize `torch_npu`'s real-hardware optimizer device probe
-    and swap-optimizer device stream construction (see
+    why), neutralize `torch_npu`'s real-hardware optimizer device probe and
+    swap-optimizer device stream construction (see
     `_neutralize_torch_npu_optimizer_device_probe` and
-    `_patch_swap_optimizer_get_device_info`)."""
+    `_patch_swap_optimizer_get_device_info`), and disable FSDP2's
+    meta-param validation (see `_neutralize_fsdp_meta_param_validation`)."""
     global _patched
     if _patched:
         return
@@ -211,12 +238,13 @@ def patch_device_type_to_meta() -> None:
 
     _neutralize_torch_npu_optimizer_device_probe()
     _patch_swap_optimizer_get_device_info(stub)
+    _neutralize_fsdp_meta_param_validation()
     _patched = True
 
 
 def unpatch_device_type_to_meta() -> None:
     """Restore the original device_type/device_module bindings (test-only helper)."""
-    global _patched
+    global _patched, _original_fsdp_validate_no_meta_params
     for (module_path, attr_name), original in _original_values.items():
         module = importlib.import_module(module_path)
         if original is _MISSING:
@@ -224,4 +252,11 @@ def unpatch_device_type_to_meta() -> None:
         else:
             setattr(module, attr_name, original)
     _original_values.clear()
+
+    if _original_fsdp_validate_no_meta_params is not _MISSING:
+        from torch.distributed.fsdp._fully_shard._fsdp_param_group import FSDPParamGroup
+
+        FSDPParamGroup._validate_no_meta_params = _original_fsdp_validate_no_meta_params
+        _original_fsdp_validate_no_meta_params = _MISSING
+
     _patched = False
