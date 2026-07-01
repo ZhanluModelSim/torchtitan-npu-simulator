@@ -117,7 +117,7 @@ def _build_sim_hc_post(n: int = 4, D: int = 8) -> tuple["SimHcPost", dict]:
     shim = SimHcPost(parent)
     tensors = {
         "x": torch.randn(2, 3, D, requires_grad=True),
-        "residual": torch.randn(2, 3, n * D, requires_grad=True),
+        "residual": torch.randn(2, 3, n, D, requires_grad=True),
         "post": torch.randn(2, 3, n, requires_grad=True),
         "comb": torch.randn(2, 3, n, n, requires_grad=True),
     }
@@ -127,7 +127,8 @@ def _build_sim_hc_post(n: int = 4, D: int = 8) -> tuple["SimHcPost", dict]:
 def test_sim_hc_post_forward_returns_correct_shape():
     shim, t = _build_sim_hc_post(n=4, D=8)
     y = shim(t["x"], t["residual"], t["post"], t["comb"])
-    assert y.shape == (2, 3, 4 * 8)  # [B,S,N*D] (matches production NpuHcPost.forward's return)
+    assert y.shape == (2, 3, 4, 8)  # [B,S,N,D] (matches production NpuHcPost.forward's return -- it
+    # reshapes MHCPostTriton's flat [B,S,N*D] output back to 4D before returning, mhc_prepost.py:277)
 
 
 def test_sim_hc_post_records_real_op_names():

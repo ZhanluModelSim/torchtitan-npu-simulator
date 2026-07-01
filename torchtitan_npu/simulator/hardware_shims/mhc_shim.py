@@ -250,11 +250,25 @@ class SimHcPost(nn.Module):
     (`torchtitan_npu.converters.kernels.mhc_prepost`). `__init__` mirrors
     `NpuHcPost.__init__(self, parent: HcPost)`'s `__dict__` shallow-copy
     pattern for consistency with `SimHcPre`/`SimHcHead`, even though
-    `HcPost` owns no extra parameters beyond base `Module`."""
+    `HcPost` owns no extra parameters beyond base `Module`.
+
+    `forward` mirrors `NpuHcPost.forward`'s exact wrapping (mhc_prepost.py:236-278),
+    which is a THIN WRAPPER around `MHCPostTriton.apply(...)` (mirrored here by
+    `_SimHcPostFn`): it takes `residual` as 4D `[B,S,N,D]`, flattens it to
+    `[B,S,N*D]` before calling the lower-level function (matching
+    `_SimHcPostFn`'s own `residual.view(B,S,N,D)` internal-unflatten
+    convention -- `_SimHcPostFn` expects an already-flattened `residual`,
+    exactly like `MHCPostTriton.forward` does), then reshapes the `[B,S,N*D]`
+    result back to 4D `[B,S,N,D]` before returning -- `NpuHcPost.forward`
+    does the identical `y = y.view(dim_b, dim_s, dim_n, dim_d)` reshape
+    at its very end (mhc_prepost.py:277) before returning to its caller."""
 
     def __init__(self, parent: "HcPost") -> None:
         self.__dict__.update(parent.__dict__)
 
     def forward(self, x: torch.Tensor, residual: torch.Tensor, post: torch.Tensor, comb: torch.Tensor):
+        dim_b, dim_s, dim_n, dim_d = residual.shape
+        residual_flat = residual.flatten(2)
         module_path = self.__class__.__name__
-        return _SimHcPostFn.apply(x, residual, post, comb, module_path)
+        y = _SimHcPostFn.apply(x, residual_flat, post, comb, module_path)
+        return y.view(dim_b, dim_s, dim_n, dim_d)
