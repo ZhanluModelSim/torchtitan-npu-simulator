@@ -17,6 +17,7 @@ from torch import nn
 from torch.distributed.tensor import DTensor
 from torchtitan.models.common.embedding import Embedding
 from torchtitan.models.common.linear import Linear
+from torchtitan.models.common.rmsnorm import RMSNorm
 from torchtitan.models.common.rope import apply_rotary_emb_single_complex
 from torchtitan.models.utils import get_dense_model_nparams_and_flops
 from torchtitan.protocols.model import BaseModel
@@ -34,6 +35,8 @@ if TYPE_CHECKING:
     from torchtitan.models.common.attention import AttentionMasksType
 
 logger = logging.getLogger()
+
+_NORM_INIT = {"weight": nn.init.ones_}
 
 
 def apply_rotary_emb(
@@ -88,44 +91,6 @@ def rotate_activation(x: torch.Tensor, hadamard_mat: torch.Tensor) -> torch.Tens
     return hadamard_transform_ref(x, hadamard_mat, scale=hidden_size**-0.5)
 
 
-class RMSNorm(Module):
-    """
-    Root Mean Square Layer Normalization (RMSNorm).
-
-    Args:
-        dim (int): Dimension of the input tensor.
-        eps (float): Epsilon value for numerical stability. Defaults to 1e-6.
-    """
-
-    @dataclass(kw_only=True, slots=True)
-    class Config(Module.Config):
-        dim: int
-        eps: float = 1e-6
-
-    def __init__(self, config: Config):
-        super().__init__()
-        self.dim = config.dim
-        self.eps = config.eps
-        # rmsnorm in the checkpoint is stored in bf16, while the parameter here is stored in fp32 for convenient.
-        self.weight = nn.Parameter(torch.ones(config.dim, dtype=torch.float32))
-
-    def forward(self, x: torch.Tensor):
-        """
-        Forward pass for RMSNorm.
-
-        Args:
-            x (torch.Tensor): Input tensor.
-
-        Returns:
-            torch.Tensor: Normalized tensor with the same shape as input.
-        """
-        dtype = x.dtype
-        x = x.float()
-        var = x.square().mean(-1, keepdim=True)
-        x = x * torch.rsqrt(var + self.eps)
-        return (self.weight * x).to(dtype)
-
-
 class Compressor(Module):
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
@@ -162,7 +127,7 @@ class Compressor(Module):
         ).build()
         self.wkv.to(torch.float32)
         self.wgate.to(torch.float32)
-        self.norm = RMSNorm.Config(dim=self.head_dim, eps=args.norm_eps).build()
+        self.norm = RMSNorm.Config(normalized_shape=self.head_dim, eps=args.norm_eps, param_init=_NORM_INIT).build()
         # If overlap is enabled, state[:, :ratio] for overlapping compression and state[:, ratio:] for normal compression.
 
     def overlap_transform(self, tensor: torch.Tensor, value=0):
@@ -582,7 +547,7 @@ class PreAttention(Module):
             out_features=self.q_lora_rank,
             bias=False,
         ).build()
-        self.q_norm = RMSNorm.Config(dim=self.q_lora_rank, eps=self.eps).build()
+        self.q_norm = RMSNorm.Config(normalized_shape=self.q_lora_rank, eps=self.eps, param_init=_NORM_INIT).build()
         self.wq_b = Linear.Config(
             in_features=self.q_lora_rank,
             out_features=self.n_heads * self.head_dim,
@@ -593,7 +558,7 @@ class PreAttention(Module):
             out_features=self.head_dim,
             bias=False,
         ).build()
-        self.kv_norm = RMSNorm.Config(dim=self.head_dim, eps=self.eps).build()
+        self.kv_norm = RMSNorm.Config(normalized_shape=self.head_dim, eps=self.eps, param_init=_NORM_INIT).build()
         if self.compress_ratio == 4:
             self.compressor = Compressor.Config(
                 args=args, compress_ratio=self.compress_ratio, head_dim=self.head_dim
@@ -958,8 +923,12 @@ class DeepSeekV4TransformerBlock(Module):
             layer_id=layer_id,
             vocab_size=model_args.vocab_size,
         ).build()
-        self.attention_norm = RMSNorm.Config(dim=model_args.dim, eps=self.norm_eps).build()
-        self.ffn_norm = RMSNorm.Config(dim=model_args.dim, eps=self.norm_eps).build()
+        self.attention_norm = RMSNorm.Config(
+            normalized_shape=model_args.dim, eps=self.norm_eps, param_init=_NORM_INIT
+        ).build()
+        self.ffn_norm = RMSNorm.Config(
+            normalized_shape=model_args.dim, eps=self.norm_eps, param_init=_NORM_INIT
+        ).build()
         self.hc_mult = hc_mult = model_args.hc_mult
         self.hc_sinkhorn_iters = model_args.hc_sinkhorn_iters
         self.hc_eps = model_args.hc_eps
@@ -1118,8 +1087,12 @@ class MTPModule(DeepSeekV4TransformerBlock):
     def __init__(self, config: Config):
         super().__init__(DeepSeekV4TransformerBlock.Config(layer_id=config.layer_id, model_args=config.model_args))
         model_args = config.model_args
-        self.enorm = RMSNorm.Config(dim=model_args.dim, eps=model_args.norm_eps).build()
-        self.hnorm = RMSNorm.Config(dim=model_args.dim, eps=model_args.norm_eps).build()
+        self.enorm = RMSNorm.Config(
+            normalized_shape=model_args.dim, eps=model_args.norm_eps, param_init=_NORM_INIT
+        ).build()
+        self.hnorm = RMSNorm.Config(
+            normalized_shape=model_args.dim, eps=model_args.norm_eps, param_init=_NORM_INIT
+        ).build()
         self.e_proj = Linear.Config(
             in_features=model_args.dim,
             out_features=model_args.dim,
@@ -1136,7 +1109,9 @@ class MTPModule(DeepSeekV4TransformerBlock):
             hc_mult=model_args.hc_mult,
             dim=model_args.dim,
         ).build()
-        self.mtp_norm = RMSNorm.Config(dim=model_args.dim, eps=model_args.norm_eps).build()
+        self.mtp_norm = RMSNorm.Config(
+            normalized_shape=model_args.dim, eps=model_args.norm_eps, param_init=_NORM_INIT
+        ).build()
 
     # pyrefly: ignore [bad-param-name-override]
     def forward(
@@ -1288,7 +1263,7 @@ class DeepSeekV4Model(BaseModel):
                 ).build()
             else:
                 self.layers[str(layer_id)] = MTPModule.Config(layer_id=layer_id, model_args=model_args).build()
-        self.norm = RMSNorm.Config(dim=model_args.dim, eps=self.norm_eps).build()
+        self.norm = RMSNorm.Config(normalized_shape=model_args.dim, eps=self.norm_eps, param_init=_NORM_INIT).build()
         self.hc_eps = model_args.hc_eps
         self.hc_mult = model_args.hc_mult
         # hc_head now lives inside the last main transformer layer (see
