@@ -25,7 +25,16 @@ from torchtitan_npu.simulator.trainer import SimulationConfig, SimulationTrainer
 
 def _to_simulation_config(base_config: object, output_dir: str) -> SimulationTrainerConfig:
     base_fields = {f.name: getattr(base_config, f.name) for f in dataclasses.fields(base_config)}
-    return SimulationTrainerConfig(**base_fields, simulation=SimulationConfig(output_dir=output_dir))
+    sim_config = SimulationTrainerConfig(**base_fields, simulation=SimulationConfig(output_dir=output_dir))
+    # `entry.py::main()` checks `config.compile.enable` BEFORE `config.build()`
+    # ever runs (and therefore before `SimulationTrainer.__init__`'s own
+    # `config.compile.enable = False` override takes effect), raising
+    # `RuntimeError: ... inductor_npu_ext is not available` for any base
+    # config with compile enabled (e.g. the 61-layer acceptance config) --
+    # found via the real 61-layer smoke run. Forcing it here, before the
+    # config is ever returned to `ConfigManager`, closes that gap.
+    sim_config.compile.enable = False
+    return sim_config
 
 
 def deepseek_v4_pro_simulate_61_layers() -> SimulationTrainerConfig:

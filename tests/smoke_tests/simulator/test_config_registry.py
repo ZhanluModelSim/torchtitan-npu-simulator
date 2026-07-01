@@ -25,6 +25,14 @@ def test_simulate_61_layers_config_matches_acceptance_target():
     assert sim_config.debug.moe_force_load_balance is True  # already True on the acceptance config
     assert sim_config.optimizer.swap_optimizer == base_config.optimizer.swap_optimizer
     assert sim_config.simulation.output_dir == "./simulator_output/deepseek_v4_pro_61_layers"
+    # base_config.compile.enable is True (real training uses inductor_npu_ext
+    # compilation), but entry.py::main() checks config.compile.enable BEFORE
+    # config.build() ever runs (and therefore before SimulationTrainer
+    # .__init__'s own override takes effect), raising a hard RuntimeError
+    # about a missing "inductor_npu_ext" module for any un-forced compiled
+    # config -- found via the real 61-layer smoke run.
+    assert base_config.compile.enable is True
+    assert sim_config.compile.enable is False
 
 
 def test_simulate_16_layers_config_is_a_smaller_variant():
