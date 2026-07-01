@@ -51,10 +51,10 @@ class SimMHCPostConverter(ModelCustomConverter):
 
 def apply_mhc_shims() -> None:
     """Patch MHCPrePostModelConfig.model_converter / MHCPostModelConfig.model_converter to
-    point at the Sim* converters above. Idempotent: calling twice in a row is safe (the second
-    call just re-saves the already-patched value as "original", which unapply_mhc_shims still
-    correctly restores to the value active before the *first* call, since SimulationTrainer only
-    ever calls apply once per process)."""
+    point at the Sim* converters above. Idempotent: the `is None` guards below mean only the
+    *first* call saves the pre-patch "original" value; every subsequent call is a no-op for
+    that bookkeeping, so unapply_mhc_shims() always restores the value active before the very
+    first apply_mhc_shims() call, regardless of how many times apply was called in between."""
     global _original_mhc_pre_converter, _original_mhc_post_converter
     if _original_mhc_pre_converter is None:
         _original_mhc_pre_converter = MHCPrePostModelConfig.model_converter
