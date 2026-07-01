@@ -191,3 +191,70 @@ class SimHcHead(nn.Module):
         x = x.flatten(2)
         module_path = self.__class__.__name__
         return _SimHcHeadFn.apply(x, self.hc_head_fn, self.hc_head_scale, self.hc_head_base, self.hc_mult, module_path)
+
+
+class _SimHcPostFn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, residual, h_post, h_res, module_path):  # noqa: ANN001
+        B, S, D = x.shape
+        N = h_post.shape[-1]
+        dtype = x.dtype
+
+        bmm1 = torch.empty((B, S, N, D), dtype=torch.float32, device=x.device)
+        _record("triton.hc_post_bmm1_forward", [x, h_post], [bmm1], module_path)
+
+        residual_unflat = residual.view(B, S, N, D)
+        bmm2 = torch.empty((B, S, N, D), dtype=torch.float32, device=x.device)
+        _record("triton.hc_post_bmm2_forward", [h_res, residual_unflat], [bmm2], module_path)
+
+        result_flat = torch.empty((B * S, N * D), dtype=torch.float32, device=x.device)
+        _record(
+            "triton.add_fwd",
+            [bmm1.reshape(B * S, -1), bmm2.reshape(B * S, -1)],
+            [result_flat],
+            module_path,
+        )
+
+        ctx.save_for_backward(x, residual, h_post, h_res)
+        ctx.module_path = module_path
+        ctx.B, ctx.S, ctx.D, ctx.N = B, S, D, N
+        return result_flat.view(B, S, N * D).to(dtype)
+
+    @staticmethod
+    def backward(ctx, grad_output):  # noqa: ANN001
+        x, residual, h_post, h_res = ctx.saved_tensors
+        B, S, D, N = ctx.B, ctx.S, ctx.D, ctx.N
+
+        grad_out_4d = grad_output.view(B, S, N, D).float()
+
+        grad_x = torch.empty((B, S, D), dtype=torch.float32, device=x.device)
+        grad_h_post = torch.empty((B, S, N), dtype=torch.float32, device=x.device)
+        _record("triton.hc_post_bmm1_backward", [x, h_post, grad_out_4d], [grad_x, grad_h_post], ctx.module_path)
+
+        residual_unflat = residual.view(B, S, N, D)
+        grad_h_res = torch.empty((B, S, N, N), dtype=torch.float32, device=x.device)
+        grad_residual_unflat = torch.empty((B, S, N, D), dtype=torch.float32, device=x.device)
+        _record(
+            "triton.hc_post_bmm2_backward",
+            [h_res, residual_unflat, grad_out_4d],
+            [grad_h_res, grad_residual_unflat],
+            ctx.module_path,
+        )
+        grad_residual = grad_residual_unflat.flatten(-2)
+
+        return grad_x, grad_residual, grad_h_post, grad_h_res, None
+
+
+class SimHcPost(nn.Module):
+    """Drop-in simulator replacement for `NpuHcPost`
+    (`torchtitan_npu.converters.kernels.mhc_prepost`). `__init__` mirrors
+    `NpuHcPost.__init__(self, parent: HcPost)`'s `__dict__` shallow-copy
+    pattern for consistency with `SimHcPre`/`SimHcHead`, even though
+    `HcPost` owns no extra parameters beyond base `Module`."""
+
+    def __init__(self, parent: "HcPost") -> None:
+        self.__dict__.update(parent.__dict__)
+
+    def forward(self, x: torch.Tensor, residual: torch.Tensor, post: torch.Tensor, comb: torch.Tensor):
+        module_path = self.__class__.__name__
+        return _SimHcPostFn.apply(x, residual, post, comb, module_path)

@@ -5,9 +5,9 @@
 
 import torch
 
-from torchtitan_npu.models.deepseek_v4.model import HcPre, HcHead
+from torchtitan_npu.models.deepseek_v4.model import HcPre, HcHead, HcPost
 from torchtitan_npu.simulator.capture.dispatch_capture import OpDispatchCapture
-from torchtitan_npu.simulator.hardware_shims.mhc_shim import SimHcPre, SimHcHead
+from torchtitan_npu.simulator.hardware_shims.mhc_shim import SimHcPre, SimHcHead, SimHcPost
 
 
 def _build_sim_hc_pre(n: int = 4, D: int = 8) -> tuple[SimHcPre, dict]:
@@ -110,3 +110,42 @@ def test_sim_hc_head_backward_propagates_gradient():
     y.sum().backward()
     assert t["x"].grad is not None
     assert t["x"].grad.shape == t["x"].shape
+
+
+def _build_sim_hc_post(n: int = 4, D: int = 8) -> tuple["SimHcPost", dict]:
+    parent = HcPost(HcPost.Config())
+    shim = SimHcPost(parent)
+    tensors = {
+        "x": torch.randn(2, 3, D, requires_grad=True),
+        "residual": torch.randn(2, 3, n * D, requires_grad=True),
+        "post": torch.randn(2, 3, n, requires_grad=True),
+        "comb": torch.randn(2, 3, n, n, requires_grad=True),
+    }
+    return shim, tensors
+
+
+def test_sim_hc_post_forward_returns_correct_shape():
+    shim, t = _build_sim_hc_post(n=4, D=8)
+    y = shim(t["x"], t["residual"], t["post"], t["comb"])
+    assert y.shape == (2, 3, 4 * 8)  # [B,S,N*D] (matches production NpuHcPost.forward's return)
+
+
+def test_sim_hc_post_records_real_op_names():
+    shim, t = _build_sim_hc_post(n=4, D=8)
+    capture = OpDispatchCapture()
+    with capture:
+        shim(t["x"], t["residual"], t["post"], t["comb"])
+    nodes = capture.build_nodes()
+    raw_names = {n.annotations.get("raw_op_type") for n in nodes.values()}
+    assert "triton.hc_post_bmm1_forward" in raw_names
+    assert "triton.hc_post_bmm2_forward" in raw_names
+    assert "triton.add_fwd" in raw_names
+
+
+def test_sim_hc_post_backward_propagates_gradient_to_all_inputs():
+    shim, t = _build_sim_hc_post(n=4, D=8)
+    y = shim(t["x"], t["residual"], t["post"], t["comb"])
+    y.sum().backward()
+    for key in ("x", "residual", "post", "comb"):
+        assert t[key].grad is not None, f"{key} did not receive a gradient"
+        assert t[key].grad.shape == t[key].shape
