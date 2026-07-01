@@ -118,18 +118,11 @@ def _fake_converter_config(name: str):
     return SimpleNamespace(_owner=owner)
 
 
-def test_strip_hardware_dependent_model_converters_removes_mhc_converters():
-    # Regression test for real crashes found via the 16-layer
-    # DeepSeek-V4-Pro smoke run: MHCPreConverter/MHCPostConverter each
-    # require either a Triton-JIT kernel launch (real hardware required,
-    # no meta mode exists) or a private "custom_ops" extension unavailable
-    # in this environment; NpuSMLAConverter's non-"A5" path builds THREE
-    # JIT-compiled aclnn extensions (SparseAttention/LiCompute/LiLoss
-    # replacements), all of which crash on meta tensors with no NPU device
-    # present. Stripping them from config.model_converters.converters
-    # leaves the model's affected submodules on their base (pure-PyTorch)
-    # implementation -- LiLoss's own real shape bug is handled separately
-    # by meta_env._patch_li_loss_to_skip_buggy_einsum.
+def test_strip_hardware_dependent_model_converters_only_removes_smla():
+    # Updated expectation (was: also strips npu_mhc_pre/npu_mhc_post). MHC is no longer
+    # stripped -- SimulationTrainer now installs SimMHCPreConverter/SimMHCPostConverter via
+    # apply_mhc_shims() instead (Task 5), so npu_mhc_pre/npu_mhc_post stay in the converters
+    # list and get a real (shim) implementation rather than being dropped to the base class.
     config = SimpleNamespace(
         model_converters=SimpleNamespace(
             converters=[
@@ -143,7 +136,7 @@ def test_strip_hardware_dependent_model_converters_removes_mhc_converters():
     )
     _strip_hardware_dependent_model_converters(config)
     remaining_names = {c._owner._model_config.name for c in config.model_converters.converters}
-    assert remaining_names == {"npu_rms_norm", "npu_gmm"}
+    assert remaining_names == {"npu_rms_norm", "npu_mhc_pre", "npu_mhc_post", "npu_gmm"}
 
 
 def test_strip_hardware_dependent_model_converters_handles_missing_or_empty_converters():
@@ -151,3 +144,10 @@ def test_strip_hardware_dependent_model_converters_handles_missing_or_empty_conv
     _strip_hardware_dependent_model_converters(SimpleNamespace())
     _strip_hardware_dependent_model_converters(SimpleNamespace(model_converters=None))
     _strip_hardware_dependent_model_converters(SimpleNamespace(model_converters=SimpleNamespace(converters=[])))
+
+
+def test_simulation_config_defaults_target_npu_device_type_to_non_a5():
+    from torchtitan_npu.simulator.trainer import SimulationConfig
+
+    config = SimulationConfig(output_dir="./out")
+    assert config.target_npu_device_type == "non_a5"

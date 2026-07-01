@@ -27,6 +27,7 @@ from torchtitan_npu.simulator.capture.workload_builder import build_workload_gra
 from torchtitan_npu.simulator.ir.workload_graph import WorkloadGraph
 from torchtitan_npu.simulator.meta_env import patch_device_type_to_meta
 from torchtitan_npu.simulator.moe_force_balance import force_deterministic_seed, force_moe_load_balance
+from torchtitan_npu.simulator.hardware_shims.mhc_converter import apply_mhc_shims
 from torchtitan_npu.simulator.rank_table import build_rank_table
 from torchtitan_npu.simulator.viz.dot_export import export_dot
 from torchtitan_npu.simulator.viz.html_export import export_html
@@ -38,6 +39,7 @@ from torchtitan_npu.simulator.viz.text_summary import write_text_summary
 class SimulationConfig:
     output_dir: str = "./simulator_output"
     output_formats: list[str] = field(default_factory=lambda: ["json", "dot", "text", "html"])
+    target_npu_device_type: str = "non_a5"
 
 
 @dataclass(kw_only=True, slots=True)
@@ -51,10 +53,10 @@ class SimulationTrainerConfig(Trainer.Config):
 # unavailable outside Huawei's internal build), with no meta-device-compatible
 # fallback other than the model's own base (pre-conversion) module -- see
 # `_strip_hardware_dependent_model_converters`.
-#   - npu_mhc_pre/npu_mhc_post: MHCPreConverter/MHCPostConverter select
-#     between a Triton-JIT kernel and a fused NPU custom op gated behind
-#     "custom_ops"; the base HcPre/HcPost/HcSplitSinkhorn classes are
-#     pure PyTorch and meta-safe as-is.
+# npu_mhc_pre/npu_mhc_post: no longer stripped -- SimulationTrainer.__init__
+# now calls apply_mhc_shims() (torchtitan_npu.simulator.hardware_shims.mhc_converter) to install
+# SimHcPre/SimHcHead/SimHcPost instead, preserving the real op names in the captured graph. See
+# docs/superpowers/specs/2026-07-01-mhc-real-op-name-capture-design.md.
 #   - npu_smla: NpuSMLAConverter's non-"A5" path replaces THREE independent
 #     submodule types (SparseAttention, LiCompute, LiLoss), each building
 #     its own JIT-compiled aclnn extension via build_op(...)
@@ -72,7 +74,7 @@ class SimulationTrainerConfig(Trainer.Config):
 #     `_current_selected_attn_dist`'s einsum (never exercised in real
 #     production, since production always uses the NPU-converted LiLoss);
 #     see `meta_env._patch_li_loss_to_skip_buggy_einsum` for that fix.
-_HARDWARE_DEPENDENT_CONVERTER_NAMES = frozenset({"npu_mhc_pre", "npu_mhc_post", "npu_smla"})
+_HARDWARE_DEPENDENT_CONVERTER_NAMES = frozenset({"npu_smla"})
 
 
 def _strip_hardware_dependent_model_converters(config: Any) -> None:
@@ -191,6 +193,7 @@ class SimulationTrainer(Trainer):
         force_deterministic_seed(config)
         config.compile.enable = False  # tracing needs eager dispatch, not a compiled graph
         config.comm.mode = "fake_backend"
+        apply_mhc_shims()
         _strip_hardware_dependent_model_converters(config)
         if hasattr(config.optimizer, "swap_optimizer"):
             # swap_optimizer (NPU-specific host/device state swapping to
