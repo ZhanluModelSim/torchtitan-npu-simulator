@@ -67,7 +67,14 @@ def run_simulation_step(
     device tensors, which raises under meta-device execution (see design
     doc §9) -- `global_valid_tokens` is instead supplied here as a plain
     Python float derived from the static input shape.
+
+    Calls `patch_device_type_to_meta()` unconditionally (idempotent) so
+    this function is safe to call standalone -- not just via
+    `SimulationTrainer.__init__` -- since `optimizer_step()` alone is
+    enough to trigger a real `torch_npu` hardware probe otherwise (see
+    `meta_env._neutralize_torch_npu_optimizer_device_probe`).
     """
+    patch_device_type_to_meta()
     global_valid_tokens = float(labels.numel())
 
     boundary = StepBoundaryTracker()

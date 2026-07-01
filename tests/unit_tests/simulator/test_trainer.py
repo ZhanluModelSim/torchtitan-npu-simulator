@@ -25,7 +25,9 @@ def fake_world():
 def _build_parallel_dims(world_size: int):
     from torchtitan.distributed.parallel_dims import ParallelDims
 
-    parallel_dims = ParallelDims(dp_replicate=1, dp_shard=world_size, cp=1, tp=1, pp=1, ep=1, world_size=world_size)
+    parallel_dims = ParallelDims(
+        dp_replicate=1, dp_shard=world_size, cp=1, tp=1, pp=1, ep=1, etp=1, world_size=world_size
+    )
     parallel_dims.build_mesh()
     return parallel_dims
 

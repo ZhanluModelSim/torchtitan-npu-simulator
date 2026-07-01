@@ -63,13 +63,42 @@ _PATCHED_MODULE_ATTRS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("torchtitan.distributed.utils", ("device_type", "device_module")),
 )
 
+# Any stable placeholder string works here: the only consumer is a string
+# comparison against fixed version-name literals (see
+# `torch_npu.utils._optim.patch_supported_devices`), never a real device query.
+_DUMMY_NPU_DEVICE_NAME = "Ascend910B_Simulator"
+
 _original_values: dict[tuple[str, str], Any] = {}
 _patched = False
 
 
+def _neutralize_torch_npu_optimizer_device_probe() -> None:
+    """Real `torch_npu` installs (found under a genuine CANN container)
+    monkeypatch `torch.optim.optimizer._get_foreach_kernels_supported_devices`
+    to lazily cache a real device name the first time any optimizer's
+    `.step()` runs `_default_to_fused_or_foreach()`. That cache-fill calls
+    `torch_npu.npu.current_device()`, which unconditionally calls
+    `torch_npu.npu._lazy_init()` -> `torch_npu._C._npu_init()` -- a real
+    `aclInit()` hardware call that raises (`"Failed to obtain the SOC
+    version"`) with no NPU device present. Pre-filling the module-level
+    cache (`torch_npu.utils._optim._device_name`) short-circuits that
+    lazy-init path entirely; harmless/no-op when `torch_npu` is not
+    installed (e.g. this repo's CPU-only unit-test sandbox)."""
+    try:
+        import torch_npu.utils._optim as npu_optim
+    except ImportError:
+        return
+
+    if npu_optim._device_name is None:
+        _original_values[("torch_npu.utils._optim", "_device_name")] = None
+        npu_optim._device_name = _DUMMY_NPU_DEVICE_NAME
+
+
 def patch_device_type_to_meta() -> None:
     """Idempotently rebind `device_type="meta"` / `device_module=<stub>`
-    across every module that imported them by value at load time."""
+    across every module that imported them by value at load time, and
+    neutralize `torch_npu`'s real-hardware optimizer device probe (see
+    `_neutralize_torch_npu_optimizer_device_probe`)."""
     global _patched
     if _patched:
         return
@@ -83,6 +112,8 @@ def patch_device_type_to_meta() -> None:
             _original_values[(module_path, attr_name)] = getattr(module, attr_name)
             value: Any = "meta" if attr_name == "device_type" else stub
             setattr(module, attr_name, value)
+
+    _neutralize_torch_npu_optimizer_device_probe()
     _patched = True
 
 

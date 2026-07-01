@@ -23,7 +23,7 @@ def fake_world():
 def test_build_rank_table_matches_real_parallel_dims_mesh(fake_world):
     from torchtitan.distributed.parallel_dims import ParallelDims
 
-    parallel_dims = ParallelDims(dp_replicate=1, dp_shard=16, cp=1, tp=1, pp=1, ep=8, world_size=16)
+    parallel_dims = ParallelDims(dp_replicate=1, dp_shard=16, cp=1, tp=1, pp=1, ep=8, etp=1, world_size=16)
     parallel_dims.build_mesh()
 
     table = build_rank_table(parallel_dims)
@@ -41,7 +41,7 @@ def test_build_rank_table_matches_real_parallel_dims_mesh(fake_world):
 def test_build_rank_table_every_rank_has_coordinates_for_every_group_dim(fake_world):
     from torchtitan.distributed.parallel_dims import ParallelDims
 
-    parallel_dims = ParallelDims(dp_replicate=1, dp_shard=16, cp=1, tp=1, pp=1, ep=8, world_size=16)
+    parallel_dims = ParallelDims(dp_replicate=1, dp_shard=16, cp=1, tp=1, pp=1, ep=8, etp=1, world_size=16)
     parallel_dims.build_mesh()
 
     table = build_rank_table(parallel_dims)
@@ -56,7 +56,7 @@ def test_rank_table_to_dict_is_json_serializable(fake_world):
 
     from torchtitan.distributed.parallel_dims import ParallelDims
 
-    parallel_dims = ParallelDims(dp_replicate=1, dp_shard=16, cp=1, tp=1, pp=1, ep=8, world_size=16)
+    parallel_dims = ParallelDims(dp_replicate=1, dp_shard=16, cp=1, tp=1, pp=1, ep=8, etp=1, world_size=16)
     parallel_dims.build_mesh()
 
     table = build_rank_table(parallel_dims)

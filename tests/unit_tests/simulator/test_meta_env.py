@@ -3,6 +3,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -76,3 +77,26 @@ def test_meta_device_materialization_pattern_used_by_trainer_init_weights():
         nn.init.trunc_normal_(module.weight, std=0.02)
         nn.init.zeros_(module.bias)
     assert module.weight.device.type == "meta"
+
+
+def test_patch_neutralizes_torch_npu_optimizer_device_probe_when_torch_npu_present():
+    # Regression test for a real crash found under genuine torch_npu (CANN
+    # container): torch_npu monkeypatches
+    # torch.optim.optimizer._get_foreach_kernels_supported_devices to cache
+    # a real device name the first time any optimizer runs
+    # _default_to_fused_or_foreach(); filling that cache calls
+    # torch_npu.npu.current_device(), which unconditionally runs a real
+    # aclInit() and raises with no NPU hardware present. Skipped (not
+    # failed) when torch_npu is not installed, e.g. this repo's CPU-only
+    # unit-test sandbox.
+    torch_npu = pytest.importorskip("torch_npu", reason="torch_npu-specific regression test")
+    import torch_npu.utils._optim as npu_optim
+
+    original = npu_optim._device_name
+    npu_optim._device_name = None
+    try:
+        patch_device_type_to_meta()
+        assert npu_optim._device_name is not None
+    finally:
+        unpatch_device_type_to_meta()
+        npu_optim._device_name = original
