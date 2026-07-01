@@ -286,32 +286,38 @@ def test_patch_moe_dispatch_avoids_meta_tensor_value_reads_when_fake():
         dist.destroy_process_group()
 
 
-def test_patch_npu_smla_converter_skips_sparse_attention_only():
-    # Regression test for a real crash found via the 16-layer
-    # DeepSeek-V4-Pro smoke run (SMLA sparse attention forward):
-    # NpuSMLAConverter.convert()'s non-"A5" branch replaces
-    # SparseAttention with NpuSparseAttention, which builds a JIT-compiled
-    # aclnn extension (sparse_attn_sharedkv) whose meta/metadata kernel
-    # crashes the whole process (SIGABRT, "No NPUs are available") when
-    # called on meta tensors with no NPU device present. The patched
-    # convert() must leave SparseAttention modules un-replaced. Skipped
-    # (not failed) when torch_npu is not installed.
+def test_patch_li_loss_skips_buggy_einsum_and_returns_placeholder_loss():
+    # Regression test for a real, pre-existing shape bug found via the
+    # 16-layer DeepSeek-V4-Pro smoke run: LiLoss._current_selected_attn_dist
+    # (the base, pre-conversion class -- used since npu_smla is stripped
+    # from config.model_converters.converters) concatenates kv/kv_compress
+    # (each (bsz, seq, head_dim), MLA-style KV shared across heads with no
+    # separate heads dim) then computes
+    # torch.einsum("bhsd,bkhd->bhsk", query, kv_states), whose equation
+    # expects kv_states to be 4-dimensional -- it is actually
+    # 3-dimensional, raising "the number of subscripts in the equation (4)
+    # does not match the number of dimensions (3)". Never exercised in
+    # real production (which always uses the NPU-converted LiLoss, itself
+    # also hardware-dependent under meta simulation). Skipped (not
+    # failed) when torch_npu is not installed.
     pytest.importorskip("torch_npu", reason="torch_npu-specific regression test")
-    import torchtitan_npu.converters.kernels.npu_smla as npu_smla_mod
+    import torchtitan_npu.models.deepseek_v4.model as model_mod
 
-    original_convert = npu_smla_mod.NpuSMLAConverter.convert
+    original_forward = model_mod.LiLoss.forward
     try:
         patch_device_type_to_meta()
-        assert npu_smla_mod.NpuSMLAConverter.convert is not original_convert
+        assert model_mod.LiLoss.forward is not original_forward
 
-        # A model with no LiCompute/LiLoss/SparseAttention submodules at
-        # all must not raise (the common "nothing to convert" case).
-        model = nn.Sequential(nn.Linear(2, 2, device="meta"))
-        converter = npu_smla_mod.NpuSMLAConverter(model_spec=SimpleNamespace(name="test"))
-        converter.convert(model)  # must not raise
+        li_loss = model_mod.LiLoss.Config(
+            n_heads=4, softmax_scale=0.125, compress_ratio=4, window_size=8, layer_id=0, n_layers=2,
+        ).build()
+        q = torch.empty(2, 8, 4, 16, device="meta")
+        loss = li_loss.forward(q, None, None, None, None, None, None, None, None, None, 0)
+        assert loss.device.type == "meta"
+        assert loss.shape == ()
     finally:
         unpatch_device_type_to_meta()
-        assert npu_smla_mod.NpuSMLAConverter.convert is original_convert
+        assert model_mod.LiLoss.forward is original_forward
 
 
 def test_patch_registers_torch_meta_as_a_device_accessor_module():

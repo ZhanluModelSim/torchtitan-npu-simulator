@@ -164,7 +164,7 @@ _original_tensor_npu_method: Any = _MISSING
 _original_torch_full: Any = _MISSING
 _original_grouped_mm: Any = _MISSING
 _original_moe_token_dispatch: Any = _MISSING
-_original_smla_convert: Any = _MISSING
+_original_li_loss_forward: Any = _MISSING
 _patched = False
 
 
@@ -377,75 +377,56 @@ def _patch_moe_dispatch_to_avoid_meta_tensor_value_reads() -> None:
     expert_parallel_cls._token_dispatch = _meta_safe_token_dispatch
 
 
-def _patch_npu_smla_converter_to_skip_sparse_attention() -> None:
-    """`NpuSMLAConverter.convert()`'s non-"A5" branch independently
-    replaces THREE submodule types: `SparseAttention` -> `NpuSparseAttention`
-    (builds the JIT-compiled aclnn extension `sparse_attn_sharedkv`, whose
-    meta/metadata kernel crashes the whole process with a real hardware
-    check -- SIGABRT, "No NPUs are available" -- unreachable from
-    Python-level monkeypatching, see
-    `torchtitan_npu.simulator.trainer`'s module-level comment),
-    `LiCompute` -> `NpuLiCompute`, and `LiLoss` -> `NpuLiLoss` (both
-    verified empirically to run correctly on meta tensors, unlike the
-    *base* pre-conversion `LiLoss._current_selected_attn_dist`, which has
-    its own real, pre-existing shape bug in its einsum -- never exercised
-    in real production, since production always uses the NPU-converted
-    `LiLoss`).
+def _patch_li_loss_to_skip_buggy_einsum() -> None:
+    """`LiLoss._current_selected_attn_dist` (the base, pre-conversion
+    class -- used under simulation since `npu_smla` is stripped from
+    `config.model_converters.converters`, see
+    `torchtitan_npu.simulator.trainer._strip_hardware_dependent_model_converters`)
+    has a real, pre-existing shape bug: it concatenates `kv`/`kv_compress`
+    (each shaped `(bsz, seq, head_dim)` -- MLA-style attention shares KV
+    across all heads, so there is no separate heads dimension) into
+    `kv_states`, then computes
+    `torch.einsum("bhsd,bkhd->bhsk", query, kv_states)`, whose equation
+    expects `kv_states` to be 4-dimensional (`bkhd`) -- it is actually
+    3-dimensional, raising `RuntimeError: the number of subscripts in the
+    equation (4) does not match the number of dimensions (3)`. This path
+    is never exercised in real production, which always uses the
+    NPU-converted `LiLoss` (whose own custom op computes this
+    auxiliary loss differently) -- but that NPU-converted form also
+    crashes under meta simulation (a real hardware "Invalid device ID"
+    check, unreachable from Python-level monkeypatching), which is why
+    `npu_smla` is stripped entirely rather than surgically patched.
 
-    Replaces `NpuSMLAConverter.convert` with a version that skips ONLY the
-    `SparseAttention` replacement (and its `build_op("sparse_attn_sharedkv"
-    , ...)` call) while keeping `LiCompute`/`LiLoss` conversion exactly as
-    upstream -- narrower than stripping the whole `"npu_smla"` model
-    converter (which would fall back to the buggy base `LiLoss`). Still
-    honors the real `get_npu_device_type() == "A5"` fused-kernel branch
-    unchanged (irrelevant under simulation, since `custom_ops` is
-    unavailable regardless -- if a real "A5"-class environment ever runs
-    this simulator, the fused path is used exactly as upstream intends).
-    No-op if torch_npu (and therefore this torchtitan_npu submodule) is
-    not importable.
-
-    Tracked separately from `_original_values` (a class attribute, not a
-    module attribute)."""
-    global _original_smla_convert
+    `LiLoss.forward`'s only consumer,
+    `InnerAttention.forward`, uses its return value purely as an
+    auxiliary loss term via `DSAIndexerLossAutoScaler.apply(o, loss)`,
+    whose own `forward()` returns `o` unchanged and only stashes `loss`
+    for the backward pass (`ctx.save_for_backward(aux_loss)`) -- so the
+    main attention output's shape is entirely unaffected by `loss`'s
+    exact value. Replaces `LiLoss.forward` with a version that skips the
+    buggy computation entirely, returning a zero-valued placeholder loss
+    (still calling `self.save_loss(...)` for parity with the original
+    logging side effect). No-op if torch_npu (and therefore this
+    torchtitan_npu submodule) is not importable."""
+    global _original_li_loss_forward
     try:
-        import torchtitan_npu.converters.kernels.npu_smla as npu_smla_mod
+        import torchtitan_npu.models.deepseek_v4.model as model_mod
     except Exception:  # best-effort guard: any failure here means "not available in this environment"
         return
 
-    converter_cls = npu_smla_mod.NpuSMLAConverter
-    if _original_smla_convert is not _MISSING:
+    li_loss_cls = model_mod.LiLoss
+    if _original_li_loss_forward is not _MISSING:
         return
-    original_convert = converter_cls.convert
-    _original_smla_convert = (converter_cls, original_convert)
+    original_forward = li_loss_cls.forward
+    _original_li_loss_forward = (li_loss_cls, original_forward)
 
-    LiCompute = npu_smla_mod.LiCompute
-    LiLoss = npu_smla_mod.LiLoss
-    NpuLiCompute = npu_smla_mod.NpuLiCompute
-    NpuLiLoss = npu_smla_mod.NpuLiLoss
-    replace_module_with_name = npu_smla_mod.replace_module_with_name
-    build_op = npu_smla_mod.build_op
-    logger = npu_smla_mod.logger
+    def _meta_safe_forward(self, q, kv, kv_compress, attn_sink, q_indexer, k_indexer, weights,  # noqa: ANN001
+                            compress_topk_idxs, index_score, attention_masks, offset):
+        loss = torch.zeros((), device=q.device, dtype=torch.float32)
+        self.save_loss(loss)
+        return loss
 
-    def _meta_safe_convert(self, model):  # noqa: ANN001
-        if npu_smla_mod.get_npu_device_type() == "A5":
-            return original_convert(self, model)
-
-        for name, module in list(model.named_modules()):
-            if isinstance(module, LiCompute):
-                npu_smla_mod._li_op = build_op("lightning_indexer", ["lightning_indexer/binding.cpp"])
-                replace_module_with_name(model, name, NpuLiCompute(module))
-                logger.info("[NpuSMLAConverter] [LiCompute forward] Applied.")
-
-            if isinstance(module, LiLoss):
-                npu_smla_mod._kl_op = build_op(
-                    "sparse_lightning_indexer_grad_kl_loss",
-                    ["sparse_lightning_indexer_grad_kl_loss/binding.cpp"],
-                )
-                replace_module_with_name(model, name, NpuLiLoss(module))
-                logger.info("[NpuSMLAConverter] [LiLoss forward] Applied.")
-            # SparseAttention deliberately left un-replaced (see docstring).
-
-    converter_cls.convert = _meta_safe_convert
+    li_loss_cls.forward = _meta_safe_forward
 
 
 def _neutralize_fsdp_meta_param_validation() -> None:
@@ -482,16 +463,15 @@ def patch_device_type_to_meta() -> None:
     `torch.Tensor.npu()` calls, a hardcoded `torch.full(...,
     device="npu")` literal, a grouped-matmul offsets dtype mismatch, MoE
     dispatch's real-data-dependent all-to-all split-size computation, and
-    the mHC/SMLA converter's hardware-dependent SparseAttention branch
-    (see `_neutralize_torch_npu_optimizer_device_probe`,
+    the base LiLoss class's real shape bug (see
+    `_neutralize_torch_npu_optimizer_device_probe`,
     `_patch_swap_optimizer_get_device_info`,
     `_patch_tensor_npu_method_to_meta`,
     `_patch_torch_full_npu_device_literal`,
     `_patch_grouped_mm_offsets_dtype`,
     `_patch_moe_dispatch_to_avoid_meta_tensor_value_reads`, and
-    `_patch_npu_smla_converter_to_skip_sparse_attention`), and disable
-    FSDP2's meta-param validation (see
-    `_neutralize_fsdp_meta_param_validation`)."""
+    `_patch_li_loss_to_skip_buggy_einsum`), and disable FSDP2's meta-param
+    validation (see `_neutralize_fsdp_meta_param_validation`)."""
     global _patched
     if _patched:
         return
@@ -515,7 +495,7 @@ def patch_device_type_to_meta() -> None:
     _patch_torch_full_npu_device_literal()
     _patch_grouped_mm_offsets_dtype()
     _patch_moe_dispatch_to_avoid_meta_tensor_value_reads()
-    _patch_npu_smla_converter_to_skip_sparse_attention()
+    _patch_li_loss_to_skip_buggy_einsum()
     _neutralize_fsdp_meta_param_validation()
     _patched = True
 
@@ -523,7 +503,7 @@ def patch_device_type_to_meta() -> None:
 def unpatch_device_type_to_meta() -> None:
     """Restore the original device_type/device_module bindings (test-only helper)."""
     global _patched, _original_fsdp_validate_no_meta_params, _original_tensor_npu_method, _original_torch_full
-    global _original_moe_token_dispatch, _original_grouped_mm, _original_smla_convert
+    global _original_moe_token_dispatch, _original_grouped_mm, _original_li_loss_forward
     for (module_path, attr_name), original in _original_values.items():
         module = importlib.import_module(module_path)
         if original is _MISSING:
@@ -555,9 +535,9 @@ def unpatch_device_type_to_meta() -> None:
         expert_parallel_cls._token_dispatch = original_token_dispatch
         _original_moe_token_dispatch = _MISSING
 
-    if _original_smla_convert is not _MISSING:
-        converter_cls, original_convert = _original_smla_convert
-        converter_cls.convert = original_convert
-        _original_smla_convert = _MISSING
+    if _original_li_loss_forward is not _MISSING:
+        li_loss_cls, original_forward = _original_li_loss_forward
+        li_loss_cls.forward = original_forward
+        _original_li_loss_forward = _MISSING
 
     _patched = False
