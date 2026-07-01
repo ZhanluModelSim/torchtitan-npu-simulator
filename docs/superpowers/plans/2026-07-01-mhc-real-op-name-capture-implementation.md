@@ -763,7 +763,7 @@ def _build_sim_hc_post(n: int = 4, D: int = 8) -> tuple["SimHcPost", dict]:
     shim = SimHcPost(parent)
     tensors = {
         "x": torch.randn(2, 3, D, requires_grad=True),
-        "residual": torch.randn(2, 3, n * D, requires_grad=True),
+        "residual": torch.randn(2, 3, n, D, requires_grad=True),
         "post": torch.randn(2, 3, n, requires_grad=True),
         "comb": torch.randn(2, 3, n, n, requires_grad=True),
     }
@@ -773,7 +773,8 @@ def _build_sim_hc_post(n: int = 4, D: int = 8) -> tuple["SimHcPost", dict]:
 def test_sim_hc_post_forward_returns_correct_shape():
     shim, t = _build_sim_hc_post(n=4, D=8)
     y = shim(t["x"], t["residual"], t["post"], t["comb"])
-    assert y.shape == (2, 3, 4 * 8)  # [B,S,N*D] (matches production NpuHcPost.forward's return)
+    assert y.shape == (2, 3, 4, 8)  # [B,S,N,D] (matches production NpuHcPost.forward's return -- it
+    # reshapes MHCPostTriton's flat [B,S,N*D] output back to 4D before returning, mhc_prepost.py:277)
 
 
 def test_sim_hc_post_records_real_op_names():
@@ -864,14 +865,28 @@ class SimHcPost(nn.Module):
     (`torchtitan_npu.converters.kernels.mhc_prepost`). `__init__` mirrors
     `NpuHcPost.__init__(self, parent: HcPost)`'s `__dict__` shallow-copy
     pattern for consistency with `SimHcPre`/`SimHcHead`, even though
-    `HcPost` owns no extra parameters beyond base `Module`."""
+    `HcPost` owns no extra parameters beyond base `Module`.
+
+    `forward` mirrors `NpuHcPost.forward`'s exact wrapping (mhc_prepost.py:236-278),
+    which is a THIN WRAPPER around `MHCPostTriton.apply(...)` (mirrored here by
+    `_SimHcPostFn`): it takes `residual` as 4D `[B,S,N,D]`, flattens it to
+    `[B,S,N*D]` before calling the lower-level function (matching
+    `_SimHcPostFn`'s own `residual.view(B,S,N,D)` internal-unflatten
+    convention -- `_SimHcPostFn` expects an already-flattened `residual`,
+    exactly like `MHCPostTriton.forward` does), then reshapes the `[B,S,N*D]`
+    result back to 4D `[B,S,N,D]` before returning -- `NpuHcPost.forward`
+    does the identical `y = y.view(dim_b, dim_s, dim_n, dim_d)` reshape
+    at its very end (mhc_prepost.py:277) before returning to its caller."""
 
     def __init__(self, parent: "HcPost") -> None:
         self.__dict__.update(parent.__dict__)
 
     def forward(self, x: torch.Tensor, residual: torch.Tensor, post: torch.Tensor, comb: torch.Tensor):
+        dim_b, dim_s, dim_n, dim_d = residual.shape
+        residual_flat = residual.flatten(2)
         module_path = self.__class__.__name__
-        return _SimHcPostFn.apply(x, residual, post, comb, module_path)
+        y = _SimHcPostFn.apply(x, residual_flat, post, comb, module_path)
+        return y.view(dim_b, dim_s, dim_n, dim_d)
 ```
 
 - [ ] **Step 4: Run test to verify it passes**
