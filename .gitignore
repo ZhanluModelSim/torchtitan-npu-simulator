@@ -69,3 +69,5 @@ tokenizer.json
 oat_reports/
 
 log/
+
+.worktrees/
