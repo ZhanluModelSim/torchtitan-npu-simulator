@@ -24,10 +24,10 @@ from torchtitan_npu.simulator.capture.module_path import ModulePathTracker
 from torchtitan_npu.simulator.capture.schedule_builder import build_schedule_graph
 from torchtitan_npu.simulator.capture.step_boundary import StepBoundaryTracker, build_step_graphs
 from torchtitan_npu.simulator.capture.workload_builder import build_workload_graph
+from torchtitan_npu.simulator.hardware_shims.mhc_converter import apply_mhc_shims
 from torchtitan_npu.simulator.ir.workload_graph import WorkloadGraph
 from torchtitan_npu.simulator.meta_env import patch_device_type_to_meta
 from torchtitan_npu.simulator.moe_force_balance import force_deterministic_seed, force_moe_load_balance
-from torchtitan_npu.simulator.hardware_shims.mhc_converter import apply_mhc_shims
 from torchtitan_npu.simulator.rank_table import build_rank_table
 from torchtitan_npu.simulator.viz.dot_export import export_dot
 from torchtitan_npu.simulator.viz.html_export import export_html
