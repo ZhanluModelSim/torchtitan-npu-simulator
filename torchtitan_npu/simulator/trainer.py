@@ -203,6 +203,16 @@ class SimulationTrainer(Trainer):
             # NPU device present. `hasattr` guards callers using a plain
             # (non-NPU) optimizer sub-config that has no such field.
             config.optimizer.swap_optimizer = False
+        if getattr(config.optimizer, "implementation", None) == "fused":
+            # torch.optim's fused implementation validates the parameter
+            # device against a hardcoded supported-device list (mps/cuda/
+            # xpu/hpu/cpu/mtia/npu) that does not include "meta", raising
+            # `RuntimeError: fused=True requires all the params to be
+            # floating point Tensors of supported devices` -- found via
+            # the 16-layer DeepSeek-V4-Pro smoke run's optimizer.step().
+            # "foreach" is the standard non-fused vectorized fallback,
+            # device-agnostic and meta-safe.
+            config.optimizer.implementation = "foreach"
 
         patch_device_type_to_meta()
         super().__init__(config)
