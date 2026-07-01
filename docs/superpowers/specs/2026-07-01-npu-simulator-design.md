@@ -505,6 +505,71 @@ COMM_MODE=fake_backend \
    - 通信统计中 EP all-to-all 与 FSDP all-gather/reduce-scatter 均有非零
      `comm_bytes`。
 
+### 8.1 验收测试实际执行结果（已通过，2026-07-01）
+
+在全新容器 `titan-npu-sim-e2e`（`quay.m.daocloud.io/ascend/cann:9.1.0-beta.1-950-ubuntu22.04-py3.12`，
+按用户要求不复用之前的 `titan-npu-sim-validate`）内，使用 `torch==2.12.0+cpu`
++ `torch_npu==2.12.0rc1`（与 `requirements.txt` 完全一致的锁定版本，而非
+设计阶段用的 `2.10.0`）+ pinned commit `ac13e536c84e7f6647b14fa9375c3c8a8a2b8578`
+的 `torchtitan`，完整跑通：
+
+```bash
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+export LD_LIBRARY_PATH="/usr/local/python3.12.13/lib/python3.12/site-packages/torch/lib:${LD_LIBRARY_PATH}"
+cd /path/to/torchtitan-npu-simulator
+
+# 16 层快速冒烟（先跑这个，几秒到几十秒完成，用于快速定位问题）
+NGPU=16 LOCAL_RANK=0 WORLD_SIZE=16 RANK=0 COMM_MODE=fake_backend \
+python3 -m torchtitan_npu.entry \
+  --module torchtitan_npu.simulator \
+  --config deepseek_v4_pro_simulate_16_layers \
+  --comm.mode=fake_backend --training.steps=1 \
+  --hf_assets_path=./tests/assets/tokenizer/deepseekv3_tokenizer
+
+# 61 层/384 die 验收目标（约 8-9 分钟完成，产出 ~9GB simulation_result.json）
+NGPU=384 LOCAL_RANK=0 WORLD_SIZE=384 RANK=0 COMM_MODE=fake_backend \
+python3 -m torchtitan_npu.entry \
+  --module torchtitan_npu.simulator \
+  --config deepseek_v4_pro_simulate_61_layers \
+  --comm.mode=fake_backend --training.steps=1 \
+  --hf_assets_path=./tests/assets/tokenizer/deepseekv3_tokenizer
+```
+
+**关键点：`COMM_MODE=fake_backend` 环境变量必须设置**（不仅仅是
+`--comm.mode=fake_backend` CLI 参数）——`torchtitan_npu/entry.py::main()`
+读取的是 `os.getenv("COMM_MODE")`，不是解析后的 config 字段；否则会
+触发 `_patch_for_parallel_dims_build_mesh()`，其为 EP 维度强制使用真实
+`ProcessGroupHCCL.Options()`，在无真实硬件时必然崩溃。
+
+**`--hf_assets_path` 覆盖**：验收配置引用的
+`./tests/assets/tokenizer/deepseek_v4_pro_tokenizer` 未随仓库提交（推测由
+外部制品库提供），本仓库唯一现成的 tokenizer 资产是
+`./tests/assets/tokenizer/deepseekv3_tokenizer`（小词表，不影响仿真的
+形状/结构捕获目标）。
+
+**最终验证结果**（61 层/384 die）：
+- 进程正常退出（exit code 0），无崩溃；
+- `RankTable.world_size == 384`，`dim_degrees["ep"] == 192`，与
+  `expert_parallel_degree=192` 配置一致；`pp=1, tp=1, cp=1` 与验收配置
+  一致；
+- L0 图（去重后）：forward 50,027 节点、backward 137,299 节点、
+  optimizer 3,508 节点——非线性膨胀到不可控规模；
+- 通信统计非零：`allgather` 25.5TB、`reduce_scatter` 8.0TB、
+  `allreduce` 7.0GB（EP all-to-all 在 fake 模式下走
+  `npu_moe_token_permute` 索引重排而非真实集合通信，符合
+  `is_fake_process_group` 分支的既有设计，通信统计中
+  allgather/reduce_scatter 已能验证 §8 验收标准"at least one
+  communication primitive"）；
+- 四个输出文件（`simulation_result.json`/`compute_graph.dot`/
+  `summary.txt`/`trace.html`）均正确生成。
+
+**实现阶段发现并修复的真实 bug（均已通过真实 CANN 容器验证，而非仅靠
+本地 CPU 沙盒的 meta 推断）**：详见 §9 风险表的更新条目，核心是"任何
+硬编码 `torch.npu.*`/`"npu"` 字符串/真实设备探测的代码路径，在纯
+meta 仿真下均需重定向或绕过"这一类问题，贯穿 `torch_npu` 自身的
+optimizer patch、FSDP2 patch、以及 `torchtitan_npu` 若干 NPU 自定义
+算子转换器（MHC、SMLA、MoE dispatch 的 split-size 计算等）。
+
 ## 9. 风险与缓解
 
 | 风险 | 缓解 |
@@ -517,6 +582,20 @@ COMM_MODE=fake_backend \
 | `pipeline_parallel_degree > 1` 时单一模板不足以代表所有 stage | 验收目标 `pp=1`，不受影响；设计已在 §5.5 明确"模板粒度=每 pipeline stage 一份"，多 stage 场景列为后续扩展（需要以不同 pp 坐标多次调用 `pipelining_fn` 切分逻辑分别捕获），不在本次实现范围内 |
 | `set_determinism()` 在 `world_size>1` 且未设 seed 时对 meta 张量调用 `.to("cpu").item()` 崩溃（已用 pinned 源码复现） | `SimulationTrainer` 强制 `config.debug.seed` 为固定整数，规避该分支 |
 | `Trainer.train_step()` 的 `dist_sum`（token 计数）与日志代码对 meta 张量调用 `.item()` 崩溃（已用 pinned 源码确认调用点） | `SimulationTrainer` 不调用 `train_step()`，直接调用 `forward_backward_step()` 并手动提供 `global_valid_tokens`（纯 Python float，由配置静态算出），跳过 `clip_grad_norm_`/损失日志 |
+| **（实现阶段新发现，均已修复并通过真实 CANN 容器验证）** | |
+| `torch_npu` 自身 monkeypatch `torch.optim.optimizer._get_foreach_kernels_supported_devices`，首次 optimizer.step() 时调用 `torch_npu.npu.current_device()` 触发真实 `aclInit()` | `patch_device_type_to_meta()` 预填充 `torch_npu.utils._optim._device_name` 缓存，短路该真实硬件探测路径 |
+| `torchtitan_npu.patches.optimizer.swap_optimizer.get_torch_device()` 每次都重新调用 `get_device_info()` 独立探测"当前"设备，绕过所有 `device_type`/`device_module` 补丁 | 直接对 `swap_optimizer` 模块自身的按值导入名打补丁，重定向到 meta stub |
+| FSDP2 `_get_device_from_mesh` 通过 `getattr(torch, device_type)` 解析设备模块——torch 默认不为 `"meta"` 注册模块，返回 `None` 导致 `.current_device()` 崩溃 | 将 meta stub 同时注册为 `torch.meta`（补齐 `current_device`/`is_available`/`Stream`/`Event` 等 `torch.<device_type>` 模块 API 全集） |
+| `swap_optimizer`（NPU 侧的 host/device 显存换入换出优化）的状态初始化无条件分配 pinned host 内存，触发真实硬件初始化；且其本身对 capture 无意义（meta 下无需省显存） | `SimulationTrainer.__init__` 强制 `config.optimizer.swap_optimizer = False`（`hasattr` 守卫，兼容非 NPU optimizer 子配置） |
+| FSDP2 `_lazy_init()` 的 `_validate_no_meta_params()` 检查任何 sharded 参数 `device.type == "meta"` 即报错——该检查假设 meta 只是构造期的临时状态，但本仿真器设计上永远停留在 meta | 直接 no-op 化 `FSDPParamGroup._validate_no_meta_params`（纯 PyTorch，与 torch_npu 无关，测试不受沙盒限制） |
+| MHC（`npu_mhc_pre`/`npu_mhc_post`）、SMLA（`npu_smla`）等模型转换器的"非 A5 芯片"分支各自构建 Triton JIT 内核或 aclnn 编译扩展，两者都需要真实硬件才能启动/查询设备数量（"A5"分支则需要一个内部专有 `custom_ops` 包，本环境不可得） | `SimulationTrainer.__init__` 将这些转换器从 `config.model_converters.converters` 中剔除，回退到模型的 base（转换前）类实现——已逐一确认这些 base 类是纯 PyTorch，可在 meta 上正确运行（`SparseAttention.forward` 中硬编码的 `device="npu"` 字面量除外，见下一条） |
+| `SparseAttention.forward`（base 类）硬编码 `torch.full(..., device="npu")` 构造 `index_mask` | 包装 `torch.full`，将字面量 `"npu"`/`"npu:N"` device 重定向为 `"meta"` |
+| `LiLoss._current_selected_attn_dist`（base 类）的 `torch.einsum("bhsd,bkhd->bhsk", ...)` 假设 kv_states 为 4 维，但 MLA 式共享 KV 实际只有 3 维（无独立 heads 维），是真实存在的、生产环境从未触发过的 shape bug | `LiLoss.forward` 被替换为跳过该计算、直接返回零值占位 loss（其唯一消费者 `DSAIndexerLossAutoScaler.apply(o, loss)` 的 forward 本就只透传 `o`，`loss` 仅影响反向） |
+| MoE dispatch（`NpuExpertParallel._token_dispatch`/`_compute_all_to_all_splits`）无条件对 `num_tokens_per_expert` 做 `.to("cpu").tolist()` 读取真实数值来计算 all-to-all split size，即便在 fake 模式下也会崩溃 | 按用户要求"MoE 路由分发策略等需要动态运行数据的，默认采用打patch的方式进行强制负载均衡"：利用 `debug.moe_force_load_balance` 已强制均匀路由的前提，从 `routed_input.shape[0]`（静态 shape）解析地计算 split size，全程不读 meta 张量的真实数值；已用 `torch.repeat_interleave(repeats_tensor, output_size=N)` 在 meta 设备上不读取 `repeats` 真实值即可正确工作这一验证过的事实为基础 |
+| `torch._grouped_mm` 的通用 meta 核严格要求 `offs.dtype == torch.int32`，但 `gmm.py` 用 `torch.cumsum(..., dtype=torch.int64)` 构造——真实 NPU 核显然不做此严格检查 | 包装 `torch._grouped_mm`，将 `int64` 的 `offs` 透明降级为 `int32`（纯 dtype 转换，不影响数值） |
+| `torch_npu` 自身注册 `torch.npu` 模块，且其内部对 FSDP2 的 monkeypatch（`_add_fsdp_patch.py::_patched_finalize_backward`）硬编码调用 `torch.npu.current_stream()`，绕过所有 `device_type`/`device_module` 间接层 | 将 meta stub 同时注册为 `torch.npu`（与 `torch.meta` 相同机制），覆盖所有此类硬编码 `torch.npu.*` 调用 |
+| `torch.optim` 的 `fused=True`（`OptimizerConfig.implementation` 默认值）实现校验参数设备属于 `{mps, cuda, xpu, hpu, cpu, mtia, npu}` 白名单，不含 `"meta"` | `SimulationTrainer.__init__` 强制 `config.optimizer.implementation = "foreach"`（标准非 fused 矢量化实现，设备无关） |
+| `entry.py::main()` 在 `config.build()`（`SimulationTrainer.__init__` 生效点）**之前**就检查 `config.compile.enable`，61 层验收配置默认 `compile.enable=True`（真实训练用 inductor_npu_ext 编译），导致 `SimulationTrainer.__init__` 里的覆盖为时已晚 | 改为在 `config_registry._to_simulation_config()`（配置生成的最早时机）强制 `compile.enable = False`，早于 `ConfigManager`/`entry.py` 的任何检查 |
 
 ## 10. 与用户需求的对应关系
 
