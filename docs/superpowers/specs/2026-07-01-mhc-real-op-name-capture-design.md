@@ -195,24 +195,37 @@ def _meta_like(shape: tuple[int, ...], dtype: torch.dtype, ref: torch.Tensor) ->
 `trainer.py`：
 
 ```python
-def _apply_mhc_shims(config: Any) -> None:
-    """Replace npu_mhc_pre/npu_mhc_post converter targets with the
-    simulator's shape-only shim classes (SimHcPre/SimHcHead/SimHcPost),
-    instead of stripping them out entirely -- keeps the captured op
-    sequence's real op names consistent with what the real converter
-    would have produced."""
+def apply_mhc_shims() -> None:
+    """Patch MHCPrePostModelConfig.model_converter / MHCPostModelConfig.model_converter to
+    point at SimMHCPreConverter/SimMHCPostConverter, instead of stripping npu_mhc_pre/
+    npu_mhc_post out entirely -- keeps the captured op sequence's real op names consistent
+    with what the real converter would have produced. Reversible via unapply_mhc_shims()."""
 ```
 
-`SimulationTrainer.__init__` 调用顺序改为：先调用 `_apply_mhc_shims(config)`（把
+`SimulationTrainer.__init__` 调用顺序改为：先调用 `apply_mhc_shims()`（把
 `npu_mhc_pre`/`npu_mhc_post` 转换器的目标类替换成 shim），再调用
 `_strip_hardware_dependent_model_converters(config)`（`_HARDWARE_DEPENDENT_CONVERTER_NAMES`
 收窄为只剩 `frozenset({"npu_smla"})`，MHC 不再被剥离）。
 
-替换转换器目标类的具体机制：复用 `ModelCustomConverter`/`register_model_converter` 已有的
-注册表模式，新增 `SimMHCPreConverter`/`SimMHCPostConverter`（继承现有 `MHCPreConverter`/
-`MHCPostConverter`，只重写要 `replace_module_with_name` 成的目标类为 `SimHcPre`/`SimHcHead`/
-`SimHcPost`），`_apply_mhc_shims` 用它们**替换**（不是删除）
-`config.model_converters.converters` 里对应的 converter 条目。
+替换转换器目标类的具体机制（**实现阶段相对本节初版的简化**：不是对
+`config.model_converters.converters` 列表做逐项替换，而是直接对已注册的
+`MHCPrePostModelConfig`/`MHCPostModelConfig` 类做**可逆的类属性 patch**——与
+`meta_env.py` 现有的"记录原值、patch、可对称 unpatch"约定完全一致，也更简单：不需要在
+`config` 实例层面重建兼容的 Config 对象）：新增 `SimMHCPreConverter`/`SimMHCPostConverter`
+（继承现有 `ModelCustomConverter`，`convert()` 里把 `HcPre`/`HcHead`/`HcPost` 替换成
+`SimHcPre`/`SimHcHead`/`SimHcPost`），`apply_mhc_shims()` 把
+`MHCPrePostModelConfig.model_converter`/`MHCPostModelConfig.model_converter` 这两个类属性
+直接指向它们（`unapply_mhc_shims()` 对称恢复原值）。
+
+**实现阶段发现的额外关键点（真实容器验证中确认，见 §8）**：
+- `SimHcPre`/`SimHcHead`/`SimHcPost` 必须继承 `HcPre`/`HcHead`/`HcPost`（与真实的
+  `NpuHcPre(HcPre)`/`NpuHcHead(HcHead)`/`NpuHcPost(HcPost)` 完全一致的继承方式），不能只继承
+  `nn.Module`——torchtitan 的 `BaseModel.verify_module_protocol()` 会检查每个子模块是否是
+  `torchtitan.protocols.module.Module` 的实例，纯 `nn.Module` 子类会导致模型构建时直接崩溃。
+  `HcPre`/`HcHead`/`HcPost` 本身已经是 `Module` 的子类，直接继承它们即可零成本满足这个检查。
+- `HcHead`（不同于 `HcPre`）并不把 `hc_mult` 存成实例属性——`HcHead.__init__` 只是把它当一个
+  局部变量用来决定 `hc_head_fn`/`hc_head_base` 的形状。`SimHcHead.forward` 必须从
+  `self.hc_head_fn.shape[0]` 现算 `hc_mult`，不能引用不存在的 `self.hc_mult`。
 
 ## 5. 测试与验证策略（先小后大，呼应最初"先小规模验证"的要求）
 
@@ -257,3 +270,46 @@ def _apply_mhc_shims(config: Any) -> None:
   `ops/triton/*.py` 里的真实函数名）保持一致，不再依赖"剥离转换器、退化成不同实现"的近似。
 - 不需要真实 NPU 硬件、不做真实内存分配：`record_synthetic_op` 全程只用
   `torch.empty(..., device="meta")` 构造影子输出，不调用任何真实 Triton kernel 或 aclnn 扩展。
+
+## 8. 验证结果（全新 CANN 容器 `titan-npu-sim-e2e`，与原 20 任务验收同一容器）
+
+实施阶段通过 subagent-driven-development 按 8 个任务逐一实现 + review，容器内真实验证过程中
+额外发现并修复了 2 个真实 bug（均已同步更新到本文档 §4 和实施计划文档）：
+
+1. `SimHcHead` 引用不存在的 `self.hc_mult`（`HcHead` 只在 `__init__` 里把它当局部变量用，从不
+   存成实例属性）——16 层冒烟跑到 `test_mhc_shim.py` 单元测试阶段就被抓到
+   （`AttributeError: 'HcHead' object has no attribute 'hc_mult'`），修复为从
+   `self.hc_head_fn.shape[0]` 现算。
+2. `SimHcPre`/`SimHcHead`/`SimHcPost` 只继承了 `nn.Module`，未继承 `HcPre`/`HcHead`/`HcPost`，
+   导致真实构建 16 层模型时 `torchtitan.protocols.model.BaseModel.verify_module_protocol()`
+   直接抛出 `RuntimeError`（17 个 `hc_pre` 子模块全部不满足 Module protocol）——单元测试测不出
+   这个问题（单元测试直接构造 `SimHcPre` 实例，不经过完整模型构建 + protocol 校验），只有真实
+   跑通 `torchtitan_npu.entry` 才会触发；改为继承 `HcPre`/`HcHead`/`HcPost`（与真实
+   `NpuHcPre(HcPre)` 等完全一致的继承方式）后解决。
+
+**16 层冒烟**（`deepseek_v4_pro_simulate_16_layers`，`--training.steps=1`）：`EXIT_CODE=0`，
+`compute_graph.dot` 中 `triton.hc_pre_fwd`/`triton.hc_pre_bmm_forward` 各出现 68 次，
+`triton.hc_pre_bwd`/`triton.hc_pre_bmm_backward` 各出现 34 次——replaces 掉了之前 base `HcPre`
+类的 `rsqrt`/`sigmoid`/`matmul` 等不相关算子序列。`summary.txt` 的 forward/backward/optimizer
+节点数（9136/18646/1006）、通信统计与去除 MHC 影响前后保持同一数量级，`is_acyclic=True`。
+
+**61 层/384 die 验收目标**（`deepseek_v4_pro_simulate_61_layers`）：`EXIT_CODE=0`（约 8-9
+分钟，与 MHC 修复前基本一致）。关键结果：
+- `RankTable`：`world_size=384`（`dp_degree=384`），`tp_degree=pp_degree=1`——与验收目标完全
+  一致，MHC shim 不影响并行拓扑。
+- 真实算子名验证：`compute_graph.dot` 中 `triton.hc_pre_fwd`/`triton.hc_pre_bmm_forward` 各
+  248 次，`triton.hc_pre_bwd`/`triton.hc_pre_bmm_backward` 各 124 次（相对 16 层的 68/34 按
+  61/16≈3.8 倍比例放大，与层数缩放关系一致）。
+- `summary.txt` 的"Unrecognized op types"列表（105 项）正确包含这 4 个 `triton.hc_pre_*`
+  合成算子名（预期行为：它们不在 `OP_MAPPING`/cost model 覆盖范围内，故成本估算标记为
+  "未知"，但真实算子名本身已正确捕获并可见——回应 §1 已修复的可视化标签兜底问题）。
+- forward/backward/optimizer 节点数：34250/68398/3571（相对 MHC 修复前的
+  50027/137299/3508 有差异，符合预期：MHC 真实算子序列与 base-class 回退序列的节点粒度本就
+  不同）；`is_acyclic=True`；通信统计（`allgather`/`allreduce`/`reduce_scatter`）与之前保持
+  同一数量级。
+- 四个产出文件（`simulation_result.json` ~8.8GB、`compute_graph.dot`、`summary.txt`、
+  `trace.html`）全部正确生成。
+
+**结论**：阶段一（MHC 真实算子名捕获）目标完全达成并通过真实容器验证；SMLA（阶段二）与 A5
+目标形状公式仍按 §6 保持未实现状态，留待后续任务。
+
