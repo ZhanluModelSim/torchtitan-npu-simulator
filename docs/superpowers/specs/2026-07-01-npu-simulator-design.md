@@ -155,6 +155,47 @@ model_config.build()`），但**跳过**其后的 `to_empty(device=init_device)`
 任何改动：384 的 world_size 在单进程下即可完整建立 mesh、划分
 dp/tp/pp/cp/ep 各维度子组。
 
+**补充验证（对照本仓 `requirements.txt` 锁定的 torchtitan commit
+`ac13e536c84e7f6647b14fa9375c3c8a8a2b8578` 源码逐行核实）**：
+
+1. `Trainer.__init__` 里 `self.device = torch.device(f"{device_type}:{LOCAL_RANK}")`
+   （`trainer.py:207`）。经验证 `torch.device("meta:0")` 与
+   `torch.device("meta")` 行为完全一致（张量 `.device` 归一化为
+   `meta`），因此**只需要在 `Trainer.__init__` 执行前把
+   `torchtitan.tools.utils.device_type`/`device_module` 猴子补丁为
+   `"meta"` + 一个安全桩**，`Trainer.__init__` 本身完全不用改——包括
+   `model.to_empty(device=init_device)` + `init_weights()`（`trainer.py:
+   407-411`，已验证 `nn.init.trunc_normal_/zeros_/normal_` 和
+   `Module.to_empty` 在 meta 张量上都能正常跑，不需要单独绕过）。这比最初
+   设想的"覆盖 Trainer 内触发物化的那一小段"更简单、更不依赖具体版本的行号。
+2. `torchtitan.components.metrics` / `torchtitan.distributed.parallel_dims` /
+   `torchtitan.distributed.utils` 三个模块都在 import 时**按值**引入了
+   `device_type`/`device_module`（`from torchtitan.tools.utils import
+   device_type, device_module`），必须在这三处也做同名重绑定，否则它们
+   仍然持有 patch 前的旧引用。
+3. **新发现的两个 meta 崩溃点**（均已用 pinned 源码 + 本地脚本复现确认）：
+   - `torchtitan.distributed.utils.set_determinism()`：当 `world_size>1`
+     且 `debug_config.seed is None` 时，会执行
+     `seed_tensor.to("cpu").view(torch.uint64).item()`
+     （`distributed/utils.py:159`）。已验证 `meta_tensor.to("cpu")` 直接
+     抛出 `NotImplementedError: Cannot copy out of meta tensor; no data!`。
+     **修复**：`SimulationTrainer` 强制 `config.debug.seed` 为一个固定整数
+     （如 `42`），这样 `if seed is None:` 分支（含那次广播+`.item()`）整个被
+     跳过，不需要碰 `set_determinism` 本身。
+   - `Trainer.train_step()`（`trainer.py:719-`）在两处不安全：
+     ① `dist_utils.dist_sum(local_valid_tokens, batch_mesh)` 内部
+     `_dist_reduce()` 无条件调用 `.item()`（`distributed/utils.py:55,58`）；
+     ② 日志部分 `float(loss.detach().item())` / `float(grad_norm.item())`
+     （`trainer.py:807,818`）。**修复**：`SimulationTrainer` 不调用
+     `Trainer.train_step()`，而是直接调用 `forward_backward_step()`
+     （`trainer.py:653`，其 `global_valid_tokens` 参数在真实调用点其实传的
+     是 `dist_sum` 返回的 Python `float`，类型注解 `torch.Tensor`
+     只是历史遗留，与我们直接传入一个由静态配置算出的 Python
+     `float`——如 `local_batch_size * seq_len`——完全兼容），并跳过
+     `clip_grad_norm_`/日志，直接调用 `self.optimizers.step()` +
+     `self.lr_schedulers.step()`。这样一次 forward+backward+optimizer
+     step 全程不触发任何 `.item()`。
+
 ### 5.2 集合通信拦截层（`fake_collectives.py`）
 
 这是解决 §2 发现的核心矛盾（`c10d` 算子无 Meta 核）的关键组件。设计：
@@ -280,13 +321,31 @@ EP rank 上也完全一致，通信模式天然对称。
 
 ### 5.6 通信域（RankTable，`rank_table.py`）
 
-`ParallelDims.build_mesh()` 之后，`parallel_dims._meshes`/`world_mesh`
-持有每个命名维度（`pp/dp_replicate/dp_shard/cp/tp/ep/etp`...）的
-`DeviceMesh` 子网格对象。`rank_table.py` 遍历这些子网格，对每个维度：
+`ParallelDims.build_mesh()` 之后，`parallel_dims._global_meshes`（`dataloading`/
+`dense`/`sparse` 等复合 `DeviceMesh`）持有多维 rank 布局张量。`rank_table.py`
+按**数据驱动**方式遍历（不是硬编码维度名列表——已用真实 `ParallelDims` +
+fake PG 在沙盒环境实测验证，见下）：对每个复合 mesh 的
+`mesh.mesh_dim_names`（如 `("pp", "dp_replicate", "efsdp", "ep")`），沿每个
+命名轴固定其余轴、切片出该轴的全部通信组：
 
-- 计算该维度下每个通信组的**全局 rank 成员列表**（`DeviceMesh.mesh`
-  展平后的 tensor 转 list）。
-- 为每个全局 rank 计算其在每个维度上的坐标（`rank -> {dim_name: idx}`）。
+```python
+# 实测（world_size=16, dp_shard=16, ep=8）：
+# parallel_dims._global_meshes["sparse"].mesh_dim_names == ("pp","dp_replicate","efsdp","ep")
+# parallel_dims._global_meshes["sparse"].mesh ==
+#   tensor([[[[0,1,2,3,4,5,6,7], [8,9,10,11,12,13,14,15]]]])
+# 沿 "ep" 轴固定 (pp=0, dp_replicate=0, efsdp=0/1) 后切片，
+# 精确得到两个 EP 组：[0..7] 和 [8..15]。
+```
+
+这比"从单个 rank 的 `get_optional_mesh(dim)` 反推所有其它 rank 的组"更可靠：
+`get_optional_mesh("ep")` 只返回**当前 rank 自己所在的那一组**（实测确认
+仅得到 `[0..7]`），必须用复合 mesh 的完整张量才能拿到全部分组。
+注意实际轴名是 `"fsdp"`（`dp_shard × cp` 合并轴，见 `dense` mesh）而非
+`"dp_shard"`——当验收配置 `context_parallel_degree=1` 时两者数值相同，
+`rank_table.py` 直接使用 mesh 里出现的真实轴名，不额外杜撰
+`"dp_shard"` 这个轴。torchtitan_npu 自身的 `_patch_for_parallel_dims_build_mesh`
+（`torchtitan_npu/train.py`）会把 `"etp"` 加入 `sparse` mesh 的轴名列表，
+数据驱动的遍历方式无需特殊处理就能自动纳入。
 
 产出一个 `RankTable` 结构（JSON 可序列化）：
 
@@ -456,6 +515,8 @@ COMM_MODE=fake_backend \
 | 384 个 `StepInstance` 若逐一深拷贝 OpNode 会内存爆炸 | `StepInstance` 只存 `step_ref`（模板引用）+ 坐标信息，不复制 OpNode；只有 rank 0 的模板做完整 L0/L1 展开 |
 | 集合通信 Python 层拦截可能遗漏某个内部调用路径（如 DTensor 内部直接调用 ProcessGroup 方法而不经过 public API） | 实现阶段用一次真实的 FSDP2+TP+EP 组合配置跑一遍，检查是否有未被拦截、直接触达 c10d 算子的调用；如发现遗漏，按需增加对应 Python 层拦截点（保持"Python 层拦截"这一统一模式，不引入 ATen 级 Meta 核 hack，因为 §2 验证 #4 已经证明后者容易撞到内部 Work 对象转换等更深的坑） |
 | `pipeline_parallel_degree > 1` 时单一模板不足以代表所有 stage | 验收目标 `pp=1`，不受影响；设计已在 §5.5 明确"模板粒度=每 pipeline stage 一份"，多 stage 场景列为后续扩展（需要以不同 pp 坐标多次调用 `pipelining_fn` 切分逻辑分别捕获），不在本次实现范围内 |
+| `set_determinism()` 在 `world_size>1` 且未设 seed 时对 meta 张量调用 `.to("cpu").item()` 崩溃（已用 pinned 源码复现） | `SimulationTrainer` 强制 `config.debug.seed` 为固定整数，规避该分支 |
+| `Trainer.train_step()` 的 `dist_sum`（token 计数）与日志代码对 meta 张量调用 `.item()` 崩溃（已用 pinned 源码确认调用点） | `SimulationTrainer` 不调用 `train_step()`，直接调用 `forward_backward_step()` 并手动提供 `global_valid_tokens`（纯 Python float，由配置静态算出），跳过 `clip_grad_norm_`/损失日志 |
 
 ## 10. 与用户需求的对应关系
 
