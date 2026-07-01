@@ -709,7 +709,18 @@ class SimHcHead(nn.Module):
     (`hc_head_fn: [hc_mult,hc_dim]`, `hc_head_base: [hc_mult]`,
     `hc_head_scale: [1]`, per `HcHead.__init__` in
     `torchtitan_npu/models/deepseek_v4/model.py:1064-1084`) that must be
-    reused verbatim from `parent`, not recreated with a guessed shape."""
+    reused verbatim from `parent`, not recreated with a guessed shape.
+
+    **Important, found via real-container validation (Task 7):** unlike
+    `HcPre`, `HcHead` does NOT store `hc_mult` as an instance attribute --
+    `HcHead.__init__` only uses it as a local variable to size
+    `hc_head_fn`/`hc_head_base` (`hc_dim = hc_mult * config.dim`), never
+    doing `self.hc_mult = ...`. So `self.__dict__.update(parent.__dict__)`
+    correctly carries over `hc_head_fn`/`hc_head_base`/`hc_head_scale`/
+    `hc_eps`/`norm_eps`, but there is no `self.hc_mult` to copy -- `forward`
+    must derive it from `self.hc_head_fn.shape[0]` (`hc_head_fn`'s real
+    shape is `[hc_mult, hc_dim]`), not reference a nonexistent
+    `self.hc_mult`."""
 
     def __init__(self, parent: "HcHead") -> None:
         self.__dict__.update(parent.__dict__)
@@ -717,7 +728,8 @@ class SimHcHead(nn.Module):
     def forward(self, x: torch.Tensor):
         x = x.flatten(2)
         module_path = self.__class__.__name__
-        return _SimHcHeadFn.apply(x, self.hc_head_fn, self.hc_head_scale, self.hc_head_base, self.hc_mult, module_path)
+        hc_mult = self.hc_head_fn.shape[0]
+        return _SimHcHeadFn.apply(x, self.hc_head_fn, self.hc_head_scale, self.hc_head_base, hc_mult, module_path)
 ```
 
 - [ ] **Step 4: Run test to verify it passes**
