@@ -136,6 +136,17 @@ class SimulationTrainer(Trainer):
         force_deterministic_seed(config)
         config.compile.enable = False  # tracing needs eager dispatch, not a compiled graph
         config.comm.mode = "fake_backend"
+        if hasattr(config.optimizer, "swap_optimizer"):
+            # swap_optimizer (NPU-specific host/device state swapping to
+            # save real memory during real training) is irrelevant to
+            # capture -- no real memory is ever allocated under meta
+            # simulation, so there is nothing to save -- and its
+            # host-state initialization unconditionally allocates pinned
+            # host memory (`torch.zeros_like(..., pin_memory=True)`),
+            # which triggers a real NPU hardware init that crashes with no
+            # NPU device present. `hasattr` guards callers using a plain
+            # (non-NPU) optimizer sub-config that has no such field.
+            config.optimizer.swap_optimizer = False
 
         patch_device_type_to_meta()
         super().__init__(config)
