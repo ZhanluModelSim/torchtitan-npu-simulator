@@ -25,30 +25,32 @@ def build_schedule_graph(
     num_micro_batches: int = 1,
     gradient_accumulation: int = 1,
 ) -> ScheduleGraph:
-    """Build one StepInstance per logical rank -- all ranks share the
-    single captured template when `pipeline_parallel_degree == 1` (the
-    acceptance config's case; see design doc §5.5 for the general
-    per-pipeline-stage template note, out of scope for this task) -- plus
-    one DataPass per communication-group member pair for every recorded
-    CommEvent whose `group_name` resolves to a known RankTable dimension.
+    """Build one StepInstance per logical rank per step template -- all
+    ranks share the captured templates (forward/backward/optimizer) when
+    `pipeline_parallel_degree == 1` (the acceptance config's case; see
+    design doc §5.5 for the general per-pipeline-stage template note, out
+    of scope for this task) -- plus one DataPass per communication-group
+    member pair for every recorded CommEvent whose `group_name` resolves
+    to a known RankTable dimension.
     """
-    template_id = next(iter(step_templates), "")
-    template_step_type = step_templates[template_id].step_type if template_id else "forward"
-
+    # Create instances for every step template (forward/backward/optimizer),
+    # not just the first one. Each rank gets one instance per template so
+    # the L2 schedule represents the full forward→backward→optimizer flow.
     instances: list[StepInstance] = []
     for rank in range(rank_table.world_size):
         coords = rank_table.rank_coordinates.get(rank, {})
-        instances.append(
-            StepInstance(
-                instance_id=f"rank{rank}",
-                step_ref=template_id,
-                step_type=template_step_type,
-                micro_batch_idx=0,
-                pipeline_stage=coords.get("pp", 0),
-                device_ids=[rank],
-                dp_group=coords.get("dp_replicate", 0),
+        for template_id, template in step_templates.items():
+            instances.append(
+                StepInstance(
+                    instance_id=f"rank{rank}_{template_id}",
+                    step_ref=template_id,
+                    step_type=template.step_type,
+                    micro_batch_idx=0,
+                    pipeline_stage=coords.get("pp", 0),
+                    device_ids=[rank],
+                    dp_group=coords.get("dp_replicate", 0),
+                )
             )
-        )
 
     data_passes: list[DataPass] = []
     for event in comm_events:

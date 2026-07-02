@@ -33,9 +33,18 @@ def _next_op_id() -> str:
 
 
 def _flatten_tensors(value: Any) -> list[torch.Tensor]:
+    """Recursively extract all tensors from nested lists/tuples/dicts.
+
+    PyTorch operator arguments can nest tensors inside dicts (e.g. some
+    custom ops pass ``{"mask": tensor}``), so we recurse into dict values
+    too -- otherwise those tensors are missed, breaking producer/consumer
+    edge construction and producing incomplete IR dependencies."""
     tensors: list[torch.Tensor] = []
     if isinstance(value, torch.Tensor):
         tensors.append(value)
+    elif isinstance(value, dict):
+        for item in value.values():
+            tensors.extend(_flatten_tensors(item))
     elif isinstance(value, (list, tuple)):
         for item in value:
             tensors.extend(_flatten_tensors(item))

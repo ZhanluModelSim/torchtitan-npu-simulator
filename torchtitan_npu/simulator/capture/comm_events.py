@@ -57,7 +57,7 @@ class CommEventRecorder:
 
     def record(self, comm_primitive: str, group: object, tensor: torch.Tensor) -> None:
         dtype_str = dtype_to_str(tensor.dtype)
-        world_size = dist.get_world_size(group) if dist.is_initialized() else 1  # type: ignore[arg-type]
+        world_size = _resolve_world_size(group)
         self.events.append(
             CommEvent(
                 event_id=f"comm_{next(_event_counter)}",
@@ -71,11 +71,60 @@ class CommEventRecorder:
         )
 
 
+def _resolve_world_size(group: object) -> int:
+    """Best-effort world-size extraction from any group type the functional
+    collectives API accepts: ProcessGroup, DeviceMesh, list of ranks, or
+    group-name string. Returns 1 if unresolvable (e.g. None or
+    dist not initialized)."""
+    if group is None:
+        return dist.get_world_size() if dist.is_initialized() else 1
+    # ProcessGroup
+    if hasattr(group, "size"):
+        try:
+            return int(group.size())
+        except (TypeError, RuntimeError):
+            pass
+    # DeviceMesh
+    if hasattr(group, "ndm"):
+        try:
+            return int(group.size())
+        except (TypeError, RuntimeError):
+            pass
+    # List of ranks
+    if isinstance(group, (list, tuple)):
+        return len(group)
+    # Group-name string
+    if isinstance(group, str) and dist.is_initialized():
+        try:
+            pg = dist.distributed_c10d._resolve_group_name(group, "")  # type: ignore[attr-defined]
+            return int(pg.size())
+        except Exception:
+            pass
+    return 1
+
+
 def _group_name(group: object) -> str:
+    """Extract a group-name string from any group type for RankTable
+    dimension attribution. Falls back to "default" when unresolvable."""
     if group is None:
         return "default"
+    # ProcessGroup
     name = getattr(group, "group_name", None)
-    return str(name) if name is not None else "default"
+    if name is not None:
+        return str(name)
+    # DeviceMesh -- try to get the underlying ProcessGroup's name
+    if hasattr(group, "get_group"):
+        try:
+            pg = group.get_group()
+            name = getattr(pg, "group_name", None)
+            if name is not None:
+                return str(name)
+        except Exception:
+            pass
+    # Group-name string itself
+    if isinstance(group, str):
+        return group
+    return "default"
 
 
 @contextmanager
@@ -156,48 +205,60 @@ def capture_fake_collectives() -> Iterator[CommEventRecorder]:
         return _NoOpWork() if async_op else None
 
     def patched_funcol_all_reduce(self_tensor, reduceOp, group, tag=""):  # noqa: ANN001, N803
-        recorder.record("allreduce", None, self_tensor)
+        recorder.record("allreduce", group, self_tensor)
         return self_tensor.clone()
 
     def patched_funcol_all_gather_tensor(self_tensor, gather_dim, group, tag=""):  # noqa: ANN001
-        recorder.record("allgather", None, self_tensor)
-        world_size = dist.get_world_size() if dist.is_initialized() else 1
+        recorder.record("allgather", group, self_tensor)
+        world_size = _resolve_world_size(group)
         out_shape = list(self_tensor.shape)
         out_shape[gather_dim] *= world_size
         return torch.empty(out_shape, dtype=self_tensor.dtype, device=self_tensor.device)
 
     def patched_funcol_reduce_scatter_tensor(self_tensor, reduceOp, scatter_dim, group, tag=""):  # noqa: ANN001, N803
-        recorder.record("reduce_scatter", None, self_tensor)
-        world_size = dist.get_world_size() if dist.is_initialized() else 1
+        recorder.record("reduce_scatter", group, self_tensor)
+        world_size = _resolve_world_size(group)
         out_shape = list(self_tensor.shape)
-        out_shape[scatter_dim] //= world_size
+        dim_size = out_shape[scatter_dim]
+        if world_size > 1 and dim_size % world_size != 0:
+            raise ValueError(
+                f"reduce_scatter: scatter_dim size {dim_size} is not divisible by "
+                f"world_size {world_size}; check parallelism config / tensor shapes"
+            )
+        out_shape[scatter_dim] = dim_size // world_size
         return torch.empty(out_shape, dtype=self_tensor.dtype, device=self_tensor.device)
 
     def patched_funcol_all_to_all_single(self_tensor, output_split_sizes, input_split_sizes, group, tag=""):  # noqa: ANN001
-        recorder.record("all_to_all", None, self_tensor)
+        recorder.record("all_to_all", group, self_tensor)
         out_shape = list(self_tensor.shape)
         if output_split_sizes:
             out_shape[0] = int(sum(output_split_sizes))
         return torch.empty(out_shape, dtype=self_tensor.dtype, device=self_tensor.device)
 
     def patched_funcol_all_gather_tensor_autograd(self_tensor, gather_dim, group, tag=""):  # noqa: ANN001
-        recorder.record("allgather", None, self_tensor)
-        world_size = dist.get_world_size() if dist.is_initialized() else 1
+        recorder.record("allgather", group, self_tensor)
+        world_size = _resolve_world_size(group)
         out_shape = list(self_tensor.shape)
         if gather_dim < len(out_shape):
             out_shape[gather_dim] *= world_size
         return torch.empty(out_shape, dtype=self_tensor.dtype, device=self_tensor.device)
 
     def patched_funcol_reduce_scatter_tensor_autograd(self_tensor, reduceOp, scatter_dim, group, tag=""):  # noqa: ANN001, N803
-        recorder.record("reduce_scatter", None, self_tensor)
-        world_size = dist.get_world_size() if dist.is_initialized() else 1
+        recorder.record("reduce_scatter", group, self_tensor)
+        world_size = _resolve_world_size(group)
         out_shape = list(self_tensor.shape)
         if scatter_dim < len(out_shape):
-            out_shape[scatter_dim] = max(1, out_shape[scatter_dim] // world_size)
+            dim_size = out_shape[scatter_dim]
+            if world_size > 1 and dim_size % world_size != 0:
+                raise ValueError(
+                    f"reduce_scatter: scatter_dim size {dim_size} is not divisible by "
+                    f"world_size {world_size}; check parallelism config / tensor shapes"
+                )
+            out_shape[scatter_dim] = dim_size // world_size
         return torch.empty(out_shape, dtype=self_tensor.dtype, device=self_tensor.device)
 
     def patched_funcol_all_to_all_single_autograd(self_tensor, output_split_sizes, input_split_sizes, group, tag=""):  # noqa: ANN001
-        recorder.record("all_to_all", None, self_tensor)
+        recorder.record("all_to_all", group, self_tensor)
         out_shape = list(self_tensor.shape)
         if output_split_sizes:
             out_shape[0] = int(sum(output_split_sizes))
