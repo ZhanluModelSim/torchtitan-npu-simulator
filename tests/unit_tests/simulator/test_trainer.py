@@ -118,11 +118,11 @@ def _fake_converter_config(name: str):
     return SimpleNamespace(_owner=owner)
 
 
-def test_strip_hardware_dependent_model_converters_only_removes_smla():
-    # Updated expectation (was: also strips npu_mhc_pre/npu_mhc_post). MHC is no longer
-    # stripped -- SimulationTrainer now installs SimMHCPreConverter/SimMHCPostConverter via
-    # apply_mhc_shims() instead (Task 5), so npu_mhc_pre/npu_mhc_post stay in the converters
-    # list and get a real (shim) implementation rather than being dropped to the base class.
+def test_strip_hardware_dependent_model_converters_removes_nothing():
+    # Updated expectation (was: strips npu_smla only). SMLA is no longer stripped either --
+    # SimulationTrainer now installs SimSMLAConverter via apply_smla_shims() instead (Task 4),
+    # so npu_smla stays in the converters list and gets a real (shim) implementation rather
+    # than being dropped to the base class. _HARDWARE_DEPENDENT_CONVERTER_NAMES is now empty.
     config = SimpleNamespace(
         model_converters=SimpleNamespace(
             converters=[
@@ -136,7 +136,7 @@ def test_strip_hardware_dependent_model_converters_only_removes_smla():
     )
     _strip_hardware_dependent_model_converters(config)
     remaining_names = {c._owner._model_config.name for c in config.model_converters.converters}
-    assert remaining_names == {"npu_rms_norm", "npu_mhc_pre", "npu_mhc_post", "npu_gmm"}
+    assert remaining_names == {"npu_rms_norm", "npu_mhc_pre", "npu_mhc_post", "npu_smla", "npu_gmm"}
 
 
 def test_strip_hardware_dependent_model_converters_handles_missing_or_empty_converters():

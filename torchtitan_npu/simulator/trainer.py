@@ -25,6 +25,7 @@ from torchtitan_npu.simulator.capture.schedule_builder import build_schedule_gra
 from torchtitan_npu.simulator.capture.step_boundary import StepBoundaryTracker, build_step_graphs
 from torchtitan_npu.simulator.capture.workload_builder import build_workload_graph
 from torchtitan_npu.simulator.hardware_shims.mhc_converter import apply_mhc_shims
+from torchtitan_npu.simulator.hardware_shims.smla_converter import apply_smla_shims
 from torchtitan_npu.simulator.ir.workload_graph import WorkloadGraph
 from torchtitan_npu.simulator.meta_env import patch_device_type_to_meta
 from torchtitan_npu.simulator.moe_force_balance import force_deterministic_seed, force_moe_load_balance
@@ -53,28 +54,15 @@ class SimulationTrainerConfig(Trainer.Config):
 # unavailable outside Huawei's internal build), with no meta-device-compatible
 # fallback other than the model's own base (pre-conversion) module -- see
 # `_strip_hardware_dependent_model_converters`.
-# npu_mhc_pre/npu_mhc_post: no longer stripped -- SimulationTrainer.__init__
-# now calls apply_mhc_shims() (torchtitan_npu.simulator.hardware_shims.mhc_converter) to install
+# npu_mhc_pre/npu_mhc_post: no longer stripped -- SimulationTrainer.__init__ calls
+# apply_mhc_shims() (torchtitan_npu.simulator.hardware_shims.mhc_converter) to install
 # SimHcPre/SimHcHead/SimHcPost instead, preserving the real op names in the captured graph. See
 # docs/superpowers/specs/2026-07-01-mhc-real-op-name-capture-design.md.
-#   - npu_smla: NpuSMLAConverter's non-"A5" path replaces THREE independent
-#     submodule types (SparseAttention, LiCompute, LiLoss), each building
-#     its own JIT-compiled aclnn extension via build_op(...)
-#     (`sparse_attn_sharedkv`, `lightning_indexer`,
-#     `sparse_lightning_indexer_grad_kl_loss`). ALL THREE crash on meta
-#     tensors with no NPU device present (SIGABRT/"No NPUs are available"
-#     for SparseAttention; "Invalid device ID"/LazySetDevice for
-#     LiCompute) -- real hardware checks unreachable from Python-level
-#     monkeypatching. Stripping the whole converter falls back to the
-#     base (pre-conversion) SparseAttention/LiCompute classes, which are
-#     pure PyTorch and meta-safe (verified by reading their forward()
-#     methods; SparseAttention's one hardcoded `device="npu"` literal is
-#     redirected by `meta_env._patch_torch_full_npu_device_literal`).
-#     The base LiLoss class has its OWN real, pre-existing shape bug in
-#     `_current_selected_attn_dist`'s einsum (never exercised in real
-#     production, since production always uses the NPU-converted LiLoss);
-#     see `meta_env._patch_li_loss_to_skip_buggy_einsum` for that fix.
-_HARDWARE_DEPENDENT_CONVERTER_NAMES = frozenset({"npu_smla"})
+# npu_smla: no longer stripped either -- SimulationTrainer.__init__ calls apply_smla_shims()
+# (torchtitan_npu.simulator.hardware_shims.smla_converter) to install SimNpuSparseAttention/
+# SimNpuLiCompute/SimNpuLiLoss instead. See
+# docs/superpowers/specs/2026-07-01-smla-real-op-name-capture-design.md.
+_HARDWARE_DEPENDENT_CONVERTER_NAMES = frozenset()
 
 
 def _strip_hardware_dependent_model_converters(config: Any) -> None:
@@ -194,6 +182,7 @@ class SimulationTrainer(Trainer):
         config.compile.enable = False  # tracing needs eager dispatch, not a compiled graph
         config.comm.mode = "fake_backend"
         apply_mhc_shims()
+        apply_smla_shims()
         _strip_hardware_dependent_model_converters(config)
         if hasattr(config.optimizer, "swap_optimizer"):
             # swap_optimizer (NPU-specific host/device state swapping to
