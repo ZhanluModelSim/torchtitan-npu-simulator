@@ -288,3 +288,40 @@ patch、对称恢复），patch 目标是已注册的 `NpuSMLAModelConfig.model_
 - 不需要真实 NPU 硬件、不做真实内存分配：`record_synthetic_op` 全程只用
   `torch.empty(..., device="meta")`/`torch.zeros(..., device="meta")` 构造影子输出，不调用
   任何真实 ACLNN 扩展。
+
+## 9. 验证结果（全新 CANN 容器 `titan-npu-sim-e2e`，与 MHC 阶段同一容器）
+
+实施阶段通过 subagent-driven-development 按 7 个任务逐一实现 + review，**全部 5 个任务的
+implementer + reviewer 均一次通过（零 Critical/Important 发现）**——与 MHC 阶段（发现 3 个
+真实 bug）相比，本阶段得益于更充分的前期源码核实（Task 1-4 全部逐行核对了真实 `.cpp` binding
+文件），实现质量显著更高。
+
+**16 层冒烟**（`deepseek_v4_pro_simulate_16_layers`，`--training.steps=1`）：`EXIT_CODE=0`，
+**第一次运行即完全成功**（未发现任何需要修复的 bug）。`compute_graph.dot` 中 5 个真实 ACLNN
+算子名全部出现：`aclnn.npu_sparse_attn_sharedkv`(34)、
+`aclnn.npu_sparse_attn_sharedkv_metadata`(34)、`aclnn.npu_sparse_attn_sharedkv_grad`(17)、
+`aclnn.npu_lightning_indexer`(14)、`aclnn.npu_sparse_lightning_indexer_grad_kl_loss`(7)。
+`summary.txt` 的"Unrecognized op types"列表中 `aten.einsum.default`（此前 base `LiCompute`
+手工实现的标志性算子）**完全消失**；`aten.topk.default` 仍有 1 处，经核实与 SMLA 无关（MoE
+路由分发逻辑的 topk，非 LiCompute 的）。forward/backward/optimizer 节点数
+（8150/18057/1090）、通信统计与阶段一（MHC）修改后保持同一数量级，`is_acyclic=True`。
+
+**61 层/384 die 验收目标**（`deepseek_v4_pro_simulate_61_layers`）：`EXIT_CODE=0`（约 8 分钟）。
+关键结果：
+- `RankTable`：`world_size=384`（`dp_degree=384`），`tp_degree=pp_degree=1`——与验收目标、以及
+  MHC 阶段的结果完全一致，SMLA shim 不影响并行拓扑。
+- 真实算子名验证：`compute_graph.dot` 中 5 个 `aclnn.*` 算子全部出现，且按层数比例放大（相对
+  16 层的 34/34/17/14/7，61 层为 124/124/62/60/30，约 61/16≈3.8 倍，与层数缩放关系一致）。
+- `summary.txt` 的"Unrecognized op types"（97 项）正确包含 3 个 `aclnn.*` 合成算子名（预期
+  行为：不在 `OP_MAPPING`/cost model 覆盖范围内，成本估算标记"未知"，但真实算子名本身已正确
+  捕获并可见）。
+- forward/backward/optimizer 节点数：30557/66687/3931（相对 MHC 阶段修改后的
+  34250/68398/3571 保持同一数量级）；`is_acyclic=True`；通信统计
+  （`allgather`/`allreduce`/`reduce_scatter`）与之前保持同一数量级。
+- 四个产出文件（`simulation_result.json` ~8.8GB、`compute_graph.dot`、`summary.txt`、
+  `trace.html`）全部正确生成。
+
+**结论**：阶段二（SMLA 真实算子名捕获）目标完全达成并通过真实容器验证。至此，MHC（阶段一）
++ SMLA（阶段二）两个用户报告的"融合算子未正确捕获"问题均已闭环：捕获图中不再有任何模块因
+硬件依赖被整体剥离退化为不同实现，`_HARDWARE_DEPENDENT_CONVERTER_NAMES` 已收窄为空集。A5
+目标形状公式仍按 §7 保持未实现状态，留待后续任务（当前无已知业务需求）。
