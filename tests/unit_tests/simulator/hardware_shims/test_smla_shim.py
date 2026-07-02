@@ -5,9 +5,9 @@
 
 import torch
 
-from torchtitan_npu.models.deepseek_v4.model import DeepSeekV4Model, LiCompute, SparseAttention
+from torchtitan_npu.models.deepseek_v4.model import DeepSeekV4Model, LiCompute, LiLoss, SparseAttention
 from torchtitan_npu.simulator.capture.dispatch_capture import OpDispatchCapture
-from torchtitan_npu.simulator.hardware_shims.smla_shim import SimNpuLiCompute, SimNpuSparseAttention
+from torchtitan_npu.simulator.hardware_shims.smla_shim import SimNpuLiCompute, SimNpuLiLoss, SimNpuSparseAttention
 
 
 def _build_sim_sparse_attention(B=2, S=3, N=4, D=8, R=4, K=5):
@@ -115,3 +115,57 @@ def test_sim_li_compute_backward_does_not_raise_and_returns_none_grad():
     # where index_score's actual gradient flows through the separate LiLoss path instead).
     index_score.float().sum().backward()
     assert t["q_indexer"].grad is None  # real non-A5 implementation has no gradient for this path
+
+
+def _build_sim_li_loss(B=2, S=8, N=4, D=8, N_i=4, D_i=8, K=5, ratio=4):
+    parent = LiLoss(LiLoss.Config(n_heads=N, softmax_scale=0.1, compress_ratio=ratio, window_size=2, layer_id=0, n_layers=1))
+    shim = SimNpuLiLoss(parent)
+    tensors = {
+        "q": torch.randn(B, S, N, D),
+        "kv": torch.randn(B, S, D),
+        "kv_compress": torch.randn(B, S // ratio, D),
+        "attn_sink": torch.randn(N),
+        "q_indexer": torch.randn(B, S, N_i, D_i, requires_grad=True),
+        "k_indexer": torch.randn(B, S // ratio, D_i, requires_grad=True),
+        "weights": torch.randn(B, S, N_i, requires_grad=True),
+        "sparse_indices": torch.randint(0, S, (B, S, K), dtype=torch.int32),
+        "indexer_score": torch.randn(B, S, K),
+    }
+    return shim, tensors
+
+
+def test_sim_li_loss_forward_returns_zero_scalar_with_no_recorded_op():
+    shim, t = _build_sim_li_loss()
+    capture = OpDispatchCapture()
+    with capture:
+        loss = shim(
+            t["q"], t["kv"], t["kv_compress"], t["attn_sink"], t["q_indexer"], t["k_indexer"],
+            t["weights"], t["sparse_indices"], t["indexer_score"], None, 0,
+        )
+    assert loss.shape == ()
+    assert loss.item() == 0.0
+    nodes = capture.build_nodes()
+    raw_names = {n.annotations.get("raw_op_type") for n in nodes.values()}
+    assert "aclnn.npu_sparse_lightning_indexer_grad_kl_loss" not in raw_names  # not fired during forward
+
+
+def test_sim_li_loss_backward_records_real_op_and_propagates_gradient():
+    shim, t = _build_sim_li_loss()
+    phase_box = {"value": "forward"}
+    capture = OpDispatchCapture(phase_provider=lambda: phase_box["value"])
+    with capture:
+        loss = shim(
+            t["q"], t["kv"], t["kv_compress"], t["attn_sink"], t["q_indexer"], t["k_indexer"],
+            t["weights"], t["sparse_indices"], t["indexer_score"], None, 0,
+        )
+        phase_box["value"] = "backward"
+        loss.backward()
+    assert t["q_indexer"].grad is not None
+    assert t["q_indexer"].grad.shape == t["q_indexer"].shape
+    assert t["k_indexer"].grad is not None
+    assert t["k_indexer"].grad.shape == t["k_indexer"].shape
+    assert t["weights"].grad is not None
+    assert t["weights"].grad.shape == t["weights"].shape
+    nodes = capture.build_nodes()
+    bwd_names = {n.annotations["raw_op_type"] for n in nodes.values() if n.annotations["phase"] == "backward"}
+    assert "aclnn.npu_sparse_lightning_indexer_grad_kl_loss" in bwd_names

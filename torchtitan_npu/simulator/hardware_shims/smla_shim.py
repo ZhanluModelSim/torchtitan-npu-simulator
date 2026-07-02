@@ -131,3 +131,60 @@ class SimNpuLiCompute(LiCompute):
         compress_topk_idxs, index_score = _SimLightningIndexerFn.apply(q_indexer, k_indexer, weights, self.index_topk, module_path)
         compress_topk_idxs = _add_offset_to_valid_sparse_indices(compress_topk_idxs, offset)
         return compress_topk_idxs, index_score
+
+
+class _SimLiLossFn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, query, key, query_index, key_index, weights, sparse_indices, module_path):  # noqa: ANN001
+        ctx.save_for_backward(query, key, query_index, key_index, weights, sparse_indices)
+        ctx.module_path = module_path
+        # Mirrors the real SparseLightningIndexerGradKLLossWrapper.forward exactly: no
+        # hardware call here, just a deferred zero placeholder -- the real kernel only fires
+        # in backward (npu_smla.py:1441: "Return dummy loss during fwd, real operation will
+        # be postponed to bwd, to avoid redundant computation ... in case where activation
+        # checkpointing is enabled").
+        return torch.zeros((), dtype=torch.float32, device=query.device)
+
+    @staticmethod
+    def backward(ctx, grad):  # noqa: ANN001
+        query, key, query_index, key_index, weights, sparse_indices = ctx.saved_tensors
+        d_query_index = torch.empty_like(query_index)
+        d_key_index = torch.empty_like(key_index)
+        d_weights = torch.empty_like(weights)
+        loss = torch.empty((1,), dtype=torch.float32, device=query.device)
+        _record(
+            "aclnn.npu_sparse_lightning_indexer_grad_kl_loss",
+            [query, key, query_index, key_index, weights, sparse_indices],
+            [d_query_index, d_key_index, d_weights, loss],
+            ctx.module_path,
+        )
+        return None, None, d_query_index, d_key_index, d_weights, None, None
+
+
+class SimNpuLiLoss(LiLoss):
+    """Drop-in simulator replacement for `NpuLiLoss`
+    (`torchtitan_npu.converters.kernels.npu_smla`). Real implementation is a "deferred
+    computation" pattern: forward returns a zero scalar immediately with no hardware call;
+    the real ACLNN kernel only fires in backward. `_SimLiLossFn` replicates this exactly.
+
+    Note: subclassing `LiLoss` and defining `forward` here means Python's MRO always resolves
+    a `SimNpuLiLoss` instance's `.forward()` to this method, never to the real base `LiLoss.
+    forward` (even though `meta_env._patch_li_loss_to_skip_buggy_einsum` patches that base
+    method elsewhere) -- no interaction or conflict with that existing patch."""
+
+    def __init__(self, parent: "LiLoss") -> None:
+        self.__dict__.update(parent.__dict__)
+
+    def forward(
+        self, q, kv, kv_compress, attn_sink, q_indexer, k_indexer, weights,
+        sparse_indices, indexer_score, attention_masks, offset,
+    ):
+        if sparse_indices.dtype != torch.int32:
+            sparse_indices = sparse_indices.to(torch.int32)
+        key = kv_compress.unsqueeze(2)
+        key_index = k_indexer.unsqueeze(2)
+        sparse_indices = sparse_indices.unsqueeze(2)
+        module_path = self.__class__.__name__
+        loss = _SimLiLossFn.apply(q, key, q_indexer, key_index, weights, sparse_indices, module_path)
+        self.save_loss(loss)
+        return loss
