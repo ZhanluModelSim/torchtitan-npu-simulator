@@ -91,3 +91,43 @@ class SimNpuSparseAttention(SparseAttention):
             query_states.contiguous(), ori_kv, cmp_kv, cmp_sparse_indices, attn_sink.float(), module_path
         )
         return result.contiguous()
+
+
+class _SimLightningIndexerFn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, query, key, weights, index_topk, module_path):  # noqa: ANN001
+        B, S, N_i, D_i = query.shape
+        K = index_topk
+        sparse_indices = torch.empty((B, S, 1, K), dtype=torch.int32, device=query.device)
+        sparse_values = torch.empty((B, S, 1, K), dtype=query.dtype, device=query.device)
+        _record("aclnn.npu_lightning_indexer", [query, key, weights], [sparse_indices, sparse_values], module_path)
+        return sparse_indices.squeeze(2), sparse_values.squeeze(2)
+
+    @staticmethod
+    def backward(ctx, grad_topk_idxs, grad_index_score):  # noqa: ANN001
+        # The real non-A5 npu_lightning_indexer call has no autograd kernel (see design doc
+        # §4.2): compress_topk_idxs is non-differentiable (int32), and index_score's real
+        # gradient flows through the separate LiLoss path via detached tensors, never back
+        # through LiCompute. Mirrors the A5 LightningIndexer.backward's all-None return.
+        return None, None, None, None, None
+
+
+class SimNpuLiCompute(LiCompute):
+    """Drop-in simulator replacement for `NpuLiCompute`
+    (`torchtitan_npu.converters.kernels.npu_smla`). The real non-A5 implementation calls
+    `_li_op.npu_lightning_indexer` directly with no `torch.autograd.Function` wrapper --
+    `_SimLightningIndexerFn` adds one here purely for gradient-graph connectivity and
+    consistent backward-phase tagging, matching the pattern established for `SimHcHead` in
+    the MHC plan."""
+
+    def __init__(self, parent: "LiCompute") -> None:
+        self.__dict__.update(parent.__dict__)
+
+    def forward(self, q_indexer: torch.Tensor, k_indexer: torch.Tensor, weights: torch.Tensor, seqlen: int, offset: int):
+        q_indexer = q_indexer.to(torch.bfloat16)
+        k_indexer = k_indexer.to(torch.bfloat16).unsqueeze(2)
+        weights = weights.to(torch.bfloat16)
+        module_path = self.__class__.__name__
+        compress_topk_idxs, index_score = _SimLightningIndexerFn.apply(q_indexer, k_indexer, weights, self.index_topk, module_path)
+        compress_topk_idxs = _add_offset_to_valid_sparse_indices(compress_topk_idxs, offset)
+        return compress_topk_idxs, index_score

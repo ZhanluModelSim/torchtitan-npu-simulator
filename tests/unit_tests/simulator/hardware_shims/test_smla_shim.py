@@ -5,9 +5,9 @@
 
 import torch
 
-from torchtitan_npu.models.deepseek_v4.model import DeepSeekV4Model, SparseAttention
+from torchtitan_npu.models.deepseek_v4.model import DeepSeekV4Model, LiCompute, SparseAttention
 from torchtitan_npu.simulator.capture.dispatch_capture import OpDispatchCapture
-from torchtitan_npu.simulator.hardware_shims.smla_shim import SimNpuSparseAttention
+from torchtitan_npu.simulator.hardware_shims.smla_shim import SimNpuLiCompute, SimNpuSparseAttention
 
 
 def _build_sim_sparse_attention(B=2, S=3, N=4, D=8, R=4, K=5):
@@ -77,3 +77,41 @@ def test_sim_sparse_attention_works_on_meta_device():
     assert y.device.type == "meta"
     y.sum().backward()
     assert meta_t["query_states"].grad is not None
+
+
+def _build_sim_li_compute(B=2, S=8, N_i=4, D_i=8, K=5, ratio=4):
+    parent = LiCompute(LiCompute.Config(ratio=ratio, index_topk=K))
+    shim = SimNpuLiCompute(parent)
+    tensors = {
+        "q_indexer": torch.randn(B, S, N_i, D_i, requires_grad=True),
+        "k_indexer": torch.randn(B, S // ratio, D_i, requires_grad=True),
+        "weights": torch.randn(B, S, N_i, requires_grad=True),
+    }
+    return shim, tensors
+
+
+def test_sim_li_compute_forward_returns_correct_shapes():
+    shim, t = _build_sim_li_compute(B=2, S=8, N_i=4, D_i=8, K=5, ratio=4)
+    compress_topk_idxs, index_score = shim(t["q_indexer"], t["k_indexer"], t["weights"], seqlen=8, offset=0)
+    assert compress_topk_idxs.shape == (2, 8, 5)
+    assert index_score.shape == (2, 8, 5)
+
+
+def test_sim_li_compute_records_real_op_name():
+    shim, t = _build_sim_li_compute()
+    capture = OpDispatchCapture()
+    with capture:
+        shim(t["q_indexer"], t["k_indexer"], t["weights"], seqlen=8, offset=0)
+    nodes = capture.build_nodes()
+    raw_names = {n.annotations.get("raw_op_type") for n in nodes.values()}
+    assert "aclnn.npu_lightning_indexer" in raw_names
+
+
+def test_sim_li_compute_backward_does_not_raise_and_returns_none_grad():
+    shim, t = _build_sim_li_compute()
+    compress_topk_idxs, index_score = shim(t["q_indexer"], t["k_indexer"], t["weights"], seqlen=8, offset=0)
+    # index_score is a real (non-detached) autograd node output -- summing and backpropagating
+    # through it must not raise, even though the real op has no gradient (mirrors production,
+    # where index_score's actual gradient flows through the separate LiLoss path instead).
+    index_score.float().sum().backward()
+    assert t["q_indexer"].grad is None  # real non-A5 implementation has no gradient for this path
