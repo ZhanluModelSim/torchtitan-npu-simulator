@@ -82,6 +82,17 @@ class _MetaDeviceModule:
     def is_initialized(self) -> bool:
         return True
 
+    def get_rng_state(self, *_args: Any, **_kwargs: Any) -> torch.Tensor:
+        # `torch.random.fork_rng` (used by pipeline schedule stage init)
+        # calls `device_mod.get_rng_state(device)`.  Returning the host RNG
+        # state is sufficient: meta simulation never relies on device RNG,
+        # fork_rng only needs a storable/restorable byte buffer.
+        return torch.get_rng_state()
+
+    def set_rng_state(self, state: torch.Tensor, *_args: Any, **_kwargs: Any) -> None:
+        # Pair with `get_rng_state`.  Ignore the restore under meta sim.
+        return None
+
     def current_stream(self, *_args: Any, **_kwargs: Any) -> "_MetaDeviceModule.Stream":
         return _MetaDeviceModule.Stream()
 
@@ -165,6 +176,14 @@ _original_torch_full: Any = _MISSING
 _original_grouped_mm: Any = _MISSING
 _original_moe_token_dispatch: Any = _MISSING
 _original_li_loss_forward: Any = _MISSING
+_original_pipeline_schedule_warmup_p2p: Any = _MISSING
+_original_window_exchange: tuple[Any, Any] | None = None
+_original_dtensor_meta_to_dtensor: Any = _MISSING
+_original_rowwise_prepare_output: Any = _MISSING
+_original_redistribute_local_tensor: Any = _MISSING
+_original_recv_object_list: Any = _MISSING
+_original_send_object_list: Any = _MISSING
+_original_torch_equal: Any = _MISSING
 _patched = False
 
 
@@ -454,6 +473,509 @@ def _neutralize_fsdp_meta_param_validation() -> None:
     FSDPParamGroup._validate_no_meta_params = lambda self: None
 
 
+def _patch_pipeline_schedule_warmup_for_meta() -> None:
+    """PyTorch's pipeline schedule `_warmup_p2p` runs a forward/backward
+    "vote" protocol to decide whether each stage operates in STATIC or
+    DYNAMIC shape mode.  The vote result is a tensor, and the decision is
+    made by calling `result.item() == 1`.  Under meta-device simulation the
+    vote tensor lives on the meta device and `.item()` raises
+    `RuntimeError: Tensor.item() cannot be called on meta tensors`.
+
+    The vote is only a shape-inference heuristic; under simulation input
+    shapes are statically known and the fake process group already bypasses
+    real communication.  Forcing STATIC mode for every stage avoids the
+    meta-tensor value read and lets the 1F1B/loop schedules proceed.  The
+    original vote path is preserved for non-meta tensors so this patch is
+    safe if ever exercised on a real device."""
+    global _original_pipeline_schedule_warmup_p2p
+    try:
+        from torch.distributed.pipelining.schedules import (
+            InferenceMode,
+            _PipelineSchedule,
+        )
+    except Exception:  # pipeline API may not exist in all torch builds
+        return
+
+    if _original_pipeline_schedule_warmup_p2p is not _MISSING:
+        return
+    _original_pipeline_schedule_warmup_p2p = _PipelineSchedule._warmup_p2p
+
+    def _meta_safe_warmup_p2p(self, stages, has_backward, p2p_done):  # noqa: ANN001
+        # Under fake PG, force STATIC mode for all stages.  DYNAMIC mode
+        # requires P2P metadata exchange between stages, which doesn't work
+        # in a single-process simulation (each process has only one stage).
+        # STATIC mode uses user-provided metadata; we populate it below in
+        # the _prepare_forward_infra / _prepare_backward_infra patches.
+        from torch.distributed.pipelining.stage import PipelineStage
+
+        for stage in stages:
+            if isinstance(stage, PipelineStage):
+                stage._inference_mode = InferenceMode.STATIC
+
+    _PipelineSchedule._warmup_p2p = _meta_safe_warmup_p2p
+
+
+def _patch_dtensor_meta_to_dtensor_for_meta() -> None:
+    """PyTorch's pipeline schedule metadata inference recreates DTensors from
+    `_DTensorMeta` using the recorded local shape and placements.  When a
+    previous stage produced a sequence-sharded DTensor, the recreated DTensor
+    must agree with the mesh size on the sharded dimension.  Under meta-device
+    simulation the local shapes seen by the first stage are sometimes smaller
+    than the placement implies (e.g. CP/TP interaction or microbatch splitting),
+    so redistribution inside `PrepareModuleInputOutput` fails with
+    ``narrow unexpectedly changed concrete size``.
+
+    For metadata inference only, we force the reconstructed DTensor to be
+    replicated with the global shape as its local shape.  The module's own
+    parallelize hooks then redistribute to the expected sharding, so the
+    forward computation (and the captured graph) still sees the correct
+    parallelism.  P2P buffer sizes are irrelevant under fake-process-group
+    simulation.  The patch only activates when the target device is meta."""
+    global _original_dtensor_meta_to_dtensor
+    try:
+        from torch.distributed.pipelining._utils import _DTensorMeta
+        from torch.distributed.tensor import Replicate
+    except Exception:
+        return
+
+    if _original_dtensor_meta_to_dtensor is not _MISSING:
+        return
+    _original_dtensor_meta_to_dtensor = _DTensorMeta.to_dtensor
+
+    def _meta_safe_to_dtensor(self, device, mesh):  # noqa: ANN001
+        if getattr(device, "type", str(device)) != "meta":
+            return _original_dtensor_meta_to_dtensor(self, device, mesh)
+        from torch.distributed.pipelining._utils import _make_tensor_from_meta
+        from torch.distributed.tensor import DTensor
+
+        local_tensor = _make_tensor_from_meta(
+            type(self)(
+                shape=self.global_shape,
+                stride=self.global_stride,
+                dtype=self.dtype,
+                requires_grad=self.requires_grad,
+                global_shape=self.global_shape,
+                global_stride=self.global_stride,
+                placements=tuple(Replicate() for _ in self.placements),
+                mesh_dim_names=self.mesh_dim_names,
+                mesh_layout=self.mesh_layout,
+            ),
+            device,
+        )
+        return DTensor.from_local(
+            local_tensor,
+            device_mesh=mesh,
+            placements=tuple(Replicate() for _ in self.placements),
+            shape=self.global_shape,
+            stride=self.global_stride,
+            run_check=False,
+        ).requires_grad_(self.requires_grad)
+
+    _DTensorMeta.to_dtensor = _meta_safe_to_dtensor
+
+
+def _patch_rowwise_parallel_output_for_meta() -> None:
+    """PyTorch's `RowwiseParallel` on `nn.Embedding` redistributes the partial
+    embedding output to the requested output layout (e.g. `Shard(1)` for
+    sequence parallelism).  Under meta-device simulation the local shape of the
+    redistributed DTensor can disagree with the mesh size on the sharded
+    dimension -- the sequence length appears divided by the world size instead
+    of the TP degree, causing downstream `PrepareModuleInputOutput` hooks to
+    fail with ``narrow unexpectedly changed concrete size``.
+
+    This patch intercepts `RowwiseParallel._prepare_output_fn` on the meta
+    device and, when the output layout shards the sequence dimension, reshapes
+    the local tensor so that `local_seq == global_seq // tp_mesh_size`.  Values
+    are irrelevant under meta simulation; only the shape matters for capturing
+    the correct compute graph."""
+    global _original_rowwise_prepare_output
+    try:
+        from torch.distributed.tensor.parallel.style import RowwiseParallel
+        from torch.distributed.tensor import DTensor, Shard
+    except Exception:
+        return
+
+    if _original_rowwise_prepare_output is not _MISSING:
+        return
+    _original_rowwise_prepare_output = RowwiseParallel._prepare_output_fn
+
+    @staticmethod
+    def _meta_safe_prepare_output_fn(output_layouts, use_local_output, mod, outputs, device_mesh):  # noqa: ANN001
+        result = _original_rowwise_prepare_output(
+            output_layouts, use_local_output, mod, outputs, device_mesh
+        )
+        if (
+            not isinstance(result, torch.Tensor)
+            or result.device.type != "meta"
+            or not isinstance(outputs, DTensor)
+        ):
+            return result
+
+        # Only fix Shard(1) (sequence-dim) layouts that are inconsistent.
+        mesh_size = device_mesh.size()
+        for placement in output_layouts:
+            if not isinstance(placement, Shard) or placement.dim != 1:
+                continue
+            global_seq = outputs.shape[1]
+            expected_local_seq = global_seq // mesh_size
+            if result.shape[1] == expected_local_seq:
+                continue
+            # Values are irrelevant under meta simulation; create a tensor with
+            # the correct local shape so downstream PrepareModuleInputOutput
+            # hooks see consistent DTensor metadata.
+            new_shape = list(result.shape)
+            new_shape[1] = expected_local_seq
+            result = torch.empty(
+                new_shape,
+                dtype=result.dtype,
+                device=result.device,
+                requires_grad=result.requires_grad,
+            )
+        return result
+
+    RowwiseParallel._prepare_output_fn = _meta_safe_prepare_output_fn
+
+
+def _patch_window_exchange_for_fake_pg() -> None:
+    """DeepSeek-V4's context-parallel attention uses `_WindowExchange`, an
+    autograd.Function that performs P2P `c10d.isend`/`irecv` between adjacent
+    CP ranks to slide a local attention window.  Under a fake process group
+    these P2P ops are not real sends, and more importantly DTensor has no
+    sharding strategy for `c10d.send.default`, so the call raises
+    `NotImplementedError`.  The simulator's `capture_fake_collectives()` only
+    intercepts collective ops, not P2P, so we short-circuit the exchange
+    analytically under fake PG: the tensor shape is still updated as if the
+    window tokens were received/sent, but no actual communication is issued.
+    Values are irrelevant under meta simulation.  Falls back to the real P2P
+    path for non-fake process groups."""
+    global _original_window_exchange
+    try:
+        from torchtitan_npu.distributed.context_parallel.compressor_attention_cp import (
+            _WindowExchange,
+        )
+        from torchtitan_npu.distributed.process_group import is_fake_process_group
+    except Exception:
+        return
+
+    if _original_window_exchange is not None:
+        return
+    _original_window_exchange = (_WindowExchange.forward, _WindowExchange.backward)
+
+    orig_forward = _WindowExchange.forward
+    orig_backward = _WindowExchange.backward
+
+    def _meta_safe_forward(ctx, tensor, window, group):  # noqa: ANN001
+        if not is_fake_process_group(group):
+            return orig_forward(ctx, tensor, window, group)
+
+        rank = group.rank()
+        world_size = group.size()
+        ctx.rank = rank
+        ctx.world_size = world_size
+        ctx.group = group
+        ctx.window = window
+        ctx.forward_sent = rank + 1 < world_size
+        ctx.forward_recvd = rank > 0
+
+        if ctx.forward_recvd:
+            recv_buf = torch.empty_like(tensor[:, -window:])
+            tensor = torch.cat([recv_buf, tensor], dim=1)
+        return tensor
+
+    def _meta_safe_backward(ctx, grad_output):  # noqa: ANN001
+        if not is_fake_process_group(ctx.group):
+            return orig_backward(ctx, grad_output)
+
+        window = ctx.window
+        if ctx.forward_sent:
+            grad_recv = torch.zeros_like(grad_output[:, :window])
+            grad_output[:, -window:] = grad_output[:, -window:] + grad_recv
+        if ctx.forward_recvd:
+            grad_output = grad_output[:, window:]
+        return grad_output, None, None
+
+    _WindowExchange.forward = _meta_safe_forward
+    _WindowExchange.backward = _meta_safe_backward
+
+
+def _patch_redistribute_local_tensor_for_meta() -> None:
+    """Under meta-device simulation, ``redistribute_local_tensor`` calls
+    ``funcol.all_gather_tensor`` / ``reduce_scatter_tensor`` etc. to transform
+    a DTensor's sharding.  The fake process group's all_gather does not
+    actually concatenate shards (it returns a tensor of the *local* shape),
+    so the subsequent ``_maybe_unpad_tensor`` sees a shape mismatch and raises
+    ``RuntimeError: narrow unexpectedly changed concrete size``.
+
+    Since values are irrelevant under meta simulation, we short-circuit the
+    entire redistribution: compute the correct *local* shape from the target
+    ``DTensorSpec`` and return an empty meta tensor with that shape.  This
+    preserves correct shape propagation for the captured compute graph while
+    avoiding all collective communication.  Falls back to the original for
+    non-meta tensors."""
+    global _original_redistribute_local_tensor
+    try:
+        from torch.distributed.tensor._redistribute import redistribute_local_tensor
+        from torch.distributed.tensor._dtensor_spec import DTensorSpec
+        from torch.distributed.tensor.placement_types import Shard, Partial, Replicate
+    except Exception:
+        return
+
+    if _original_redistribute_local_tensor is not _MISSING:
+        return
+    _original_redistribute_local_tensor = redistribute_local_tensor
+
+    def _meta_safe_redistribute(local_tensor, current_spec, target_spec, *, async_op=False, use_graph_based_transform=None, is_explicit=False):  # noqa: ANN001
+        # Only short-circuit on meta device tensors
+        if not isinstance(local_tensor, torch.Tensor) or local_tensor.device.type != "meta":
+            return _original_redistribute_local_tensor(
+                local_tensor, current_spec, target_spec,
+                async_op=async_op, use_graph_based_transform=use_graph_based_transform, is_explicit=is_explicit,
+            )
+
+        # Compute the correct local shape for the target spec.
+        # The target spec's .shape is the *global* (logical) shape; we need
+        # the local shape after applying target placements on the mesh.
+        global_shape = tuple(target_spec.shape)
+        mesh = target_spec.mesh
+        placements = target_spec.placements
+        local_shape = list(global_shape)
+        for mesh_dim, placement in enumerate(placements):
+            if isinstance(placement, Shard):
+                dim = placement.dim
+                mesh_size = mesh.size(mesh_dim)
+                if mesh_size > 1 and dim < len(local_shape):
+                    local_shape[dim] = max(1, global_shape[dim] // mesh_size)
+            # Partial -> local shape is same as global (each rank has full size)
+            # Replicate -> local shape is same as global
+        return torch.empty(
+            tuple(local_shape),
+            dtype=local_tensor.dtype,
+            device="meta",
+            requires_grad=local_tensor.requires_grad,
+        )
+
+    import torch.distributed.tensor._redistribute as _redistribute_module
+    _redistribute_module.redistribute_local_tensor = _meta_safe_redistribute
+
+
+def _patch_object_collectives_for_fake_pg() -> None:
+    """PyTorch's pipeline schedule exchanges stage metadata (tensor shapes,
+    dtypes, requires_grad) between stages via ``dist.recv_object_list`` /
+    ``dist.send_object_list``.  These functions internally broadcast a size
+    tensor and call ``.item()`` on it, which raises
+    ``RuntimeError: Tensor.item() cannot be called on meta tensors`` under
+    meta-device simulation.
+
+    Under a fake process group there is only one process (rank 0), so every
+    stage's metadata is already local -- the "send" and "recv" are no-ops.
+    We short-circuit both functions: ``send_object_list`` does nothing, and
+    ``recv_object_list`` leaves the caller-provided ``object_list`` unchanged
+    (the caller pre-fills it with placeholder metadata that the pipeline
+    schedule overwrites during its own inference).  Falls back to the real
+    implementation for non-fake process groups."""
+    global _original_recv_object_list, _original_send_object_list
+    try:
+        from torch.distributed.distributed_c10d import recv_object_list, send_object_list
+        from torchtitan_npu.distributed.process_group import is_fake_process_group
+    except Exception:
+        return
+
+    if _original_recv_object_list is not _MISSING:
+        return
+    _original_recv_object_list = recv_object_list
+    _original_send_object_list = send_object_list
+
+    def _meta_safe_recv_object_list(object_list, src=None, group=None, device=None, group_src=None, use_batch=False):  # noqa: ANN001
+        if not is_fake_process_group(group):
+            return _original_recv_object_list(object_list, src=src, group=group, device=device, group_src=group_src, use_batch=use_batch)
+        # Under fake PG, there is only one process.  The pipeline schedule
+        # pre-fills object_list with placeholder metadata; leave it as-is.
+        return 0
+
+    def _meta_safe_send_object_list(object_list, dst=None, group=None, device=None, group_dst=None, use_batch=False):  # noqa: ANN001
+        if not is_fake_process_group(group):
+            return _original_send_object_list(object_list, dst=dst, group=group, device=device, group_dst=group_dst, use_batch=use_batch)
+        # No-op under fake PG
+        return None
+
+    import torch.distributed as dist_mod
+    dist_mod.recv_object_list = _meta_safe_recv_object_list
+    dist_mod.send_object_list = _meta_safe_send_object_list
+
+
+def _patch_pipeline_stage_meta_exchange_for_fake_pg() -> None:
+    """PyTorch's pipeline schedule exchanges forward/backward metadata
+    (tensor shapes, dtypes, placements) between stages via
+    ``PipelineStage._send_meta`` / ``_recv_meta``, which use
+    ``dist.send_object_list`` / ``dist.recv_object_list`` under the hood.
+
+    Under a fake process group all stages run in the same process, but each
+    stage is assigned a different *group rank* (so ``_is_same_rank`` returns
+    False), causing the schedule to take the P2P metadata path.  Since
+    ``send_object_list`` / ``recv_object_list`` are no-ops under fake PG
+    (see ``_patch_object_collectives_for_fake_pg``), the recv would return
+    ``None`` instead of a ``_StageForwardMeta`` / ``_StageBackwardMeta``,
+    raising ``PipeliningMetadataError``.
+
+    This patch replaces ``_send_meta`` / ``_recv_meta`` with an in-process
+    shared dict so that sent metadata is immediately available to recv.
+    Falls back to the original for non-fake process groups."""
+    try:
+        from torch.distributed.pipelining.stage import PipelineStage
+        from torchtitan_npu.distributed.process_group import is_fake_process_group
+    except Exception:
+        return
+
+    if hasattr(PipelineStage, "_sim_shared_meta_buffer"):
+        return  # already patched
+
+    PipelineStage._sim_shared_meta_buffer = {}
+
+    orig_send_meta = PipelineStage._send_meta
+    orig_recv_meta = PipelineStage._recv_meta
+
+    def _sim_send_meta(self, meta, dst_stage):  # noqa: ANN001
+        if not is_fake_process_group(self.group):
+            return orig_send_meta(self, meta, dst_stage)
+        key = (self.stage_index, dst_stage)
+        PipelineStage._sim_shared_meta_buffer[key] = meta
+
+    def _sim_recv_meta(self, src_stage):  # noqa: ANN001
+        if not is_fake_process_group(self.group):
+            return orig_recv_meta(self, src_stage)
+        key = (src_stage, self.stage_index)
+        return PipelineStage._sim_shared_meta_buffer.get(key)
+
+    PipelineStage._send_meta = _sim_send_meta
+    PipelineStage._recv_meta = _sim_recv_meta
+
+    # In STATIC mode, _prepare_forward_infra reads _user_meta.inputs/outputs
+    # which are None because PipelineStage was created without explicit
+    # input_args/output_args (DSV4's pipeline_module_split doesn't provide
+    # them).  Patch _prepare_forward_infra to run a local forward pass on
+    # meta tensors to infer input/output shapes, then populate _stage_meta.
+    orig_prepare_forward = PipelineStage._prepare_forward_infra
+
+    def _sim_prepare_forward_infra(self, num_microbatches, args, kwargs=None, has_backward=False):  # noqa: ANN001
+        from torchtitan_npu.distributed.process_group import is_fake_process_group as _is_fake
+        if not _is_fake(self.group):
+            return orig_prepare_forward(self, num_microbatches, args, kwargs=kwargs, has_backward=has_backward)
+
+        # If user_meta.inputs is already set, use the original path
+        if self._user_meta.inputs is not None:
+            return orig_prepare_forward(self, num_microbatches, args, kwargs=kwargs, has_backward=has_backward)
+
+        # Run a local forward pass to infer input/output shapes
+        from torch.distributed.pipelining._utils import (
+            TensorMeta,
+            _StageForwardMeta,
+            extract_tensor_meta,
+        )
+
+        # Determine input tensors: first stage uses args, others use placeholder
+        if self.is_first:
+            if isinstance(args, _StageForwardMeta):
+                input_tensors = args.forward_metas
+            elif args is None:
+                input_tensors = ()
+            else:
+                input_tensors = args if isinstance(args, tuple) else (args,)
+        else:
+            # Non-first stage: create placeholder input from the shared buffer
+            fwd_meta = PipelineStage._sim_shared_meta_buffer.get((self.stage_index - 1, self.stage_index))
+            if fwd_meta is not None:
+                # Create empty tensors from the metadata
+                input_tensors = tuple(
+                    torch.empty(m.shape, dtype=getattr(torch, m.dtype) if isinstance(m.dtype, str) else m.dtype, device="meta")
+                    if isinstance(m, TensorMeta)
+                    else torch.empty((), device="meta")
+                    for m in fwd_meta.forward_metas
+                )
+            else:
+                input_tensors = ()
+
+        # Run forward to get outputs (no_grad not needed on meta device)
+        try:
+            outputs = self.submod(*input_tensors, **(kwargs or {}))
+        except Exception:
+            # If forward fails, use empty outputs
+            outputs = input_tensors
+
+        if not isinstance(outputs, tuple):
+            outputs = (outputs,) if outputs is not None else ()
+
+        # Populate _user_meta for STATIC mode (the original _prepare_forward_infra
+        # reads _user_meta.inputs/outputs in STATIC mode, not _stage_meta)
+        self._user_meta.inputs = tuple(extract_tensor_meta(t) for t in input_tensors)
+        self._user_meta.outputs = tuple(extract_tensor_meta(t) for t in outputs)
+
+        # Send forward metadata to next stage via shared buffer
+        if not self.is_last:
+            fwd_meta = _StageForwardMeta(forward_metas=self._user_meta.outputs)
+            PipelineStage._sim_shared_meta_buffer[(self.stage_index, self.stage_index + 1)] = fwd_meta
+
+        # Now run the original _prepare_forward_infra which will use _stage_meta
+        return orig_prepare_forward(self, num_microbatches, args, kwargs=kwargs, has_backward=has_backward)
+
+    PipelineStage._prepare_forward_infra = _sim_prepare_forward_infra
+
+    # Similarly patch _prepare_backward_infra to infer backward metadata
+    orig_prepare_backward = PipelineStage._prepare_backward_infra
+
+    def _sim_prepare_backward_infra(self, num_microbatches, loss_fn=None, target=None, received_grad_meta=None):  # noqa: ANN001
+        from torchtitan_npu.distributed.process_group import is_fake_process_group as _is_fake
+        if not _is_fake(self.group):
+            return orig_prepare_backward(self, num_microbatches, loss_fn=loss_fn, target=target, received_grad_meta=received_grad_meta)
+
+        if self._user_meta.input_grads is not None or self._user_meta.output_grads is not None:
+            return orig_prepare_backward(self, num_microbatches, loss_fn=loss_fn, target=target, received_grad_meta=received_grad_meta)
+
+        from torch.distributed.pipelining._utils import (
+            _StageBackwardMeta,
+            _derive_grad_metas,
+            extract_tensor_meta,
+        )
+
+        # Derive output_grads from outputs (gradient shape == output shape)
+        if self._user_meta.outputs is not None:
+            self._user_meta.output_grads = _derive_grad_metas(self._user_meta.outputs)
+        # Derive input_grads from inputs
+        if self._user_meta.inputs is not None:
+            self._user_meta.input_grads = _derive_grad_metas(self._user_meta.inputs)
+
+        # Send backward metadata to previous stage via shared buffer
+        if not self.is_first:
+            bwd_meta = _StageBackwardMeta(backward_metas=self._stage_meta.input_grads)
+            PipelineStage._sim_shared_meta_buffer[(self.stage_index, self.stage_index - 1)] = bwd_meta
+
+        return orig_prepare_backward(self, num_microbatches, loss_fn=loss_fn, target=target, received_grad_meta=received_grad_meta)
+
+    PipelineStage._prepare_backward_infra = _sim_prepare_backward_infra
+
+
+def _patch_torch_equal_for_meta() -> None:
+    """``torch.equal`` has no Meta kernel registered.  Under meta-device
+    simulation, DTensor's ``_partition_value`` (used by Partial placement
+    reduction) calls ``mask_buffer.materialize_mask`` which calls
+    ``torch.equal(self.data, mask)`` to check if the mask buffer needs
+    updating.  Since values are irrelevant under meta simulation, we
+    short-circuit ``torch.equal`` to return ``True`` when either operand is
+    a meta tensor.  Falls back to the original for non-meta tensors."""
+    global _original_torch_equal
+    if _original_torch_equal is not _MISSING:
+        return
+    _original_torch_equal = torch.equal
+
+    def _meta_safe_equal(a, b):  # noqa: ANN001
+        if (isinstance(a, torch.Tensor) and a.device.type == "meta") or (
+            isinstance(b, torch.Tensor) and b.device.type == "meta"
+        ):
+            return True
+        return _original_torch_equal(a, b)
+
+    torch.equal = _meta_safe_equal
+
+
 def patch_device_type_to_meta() -> None:
     """Idempotently rebind `device_type="meta"` / `device_module=<stub>`
     across every module that imported them by value at load time, register
@@ -514,13 +1036,22 @@ def patch_device_type_to_meta() -> None:
     _patch_moe_dispatch_to_avoid_meta_tensor_value_reads()
     _patch_li_loss_to_skip_buggy_einsum()
     _neutralize_fsdp_meta_param_validation()
+    _patch_pipeline_schedule_warmup_for_meta()
+    _patch_dtensor_meta_to_dtensor_for_meta()
+    _patch_rowwise_parallel_output_for_meta()
+    _patch_window_exchange_for_fake_pg()
+    _patch_redistribute_local_tensor_for_meta()
+    _patch_object_collectives_for_fake_pg()
+    _patch_pipeline_stage_meta_exchange_for_fake_pg()
+    _patch_torch_equal_for_meta()
     _patched = True
 
 
 def unpatch_device_type_to_meta() -> None:
     """Restore the original device_type/device_module bindings (test-only helper)."""
     global _patched, _original_fsdp_validate_no_meta_params, _original_tensor_npu_method, _original_torch_full
-    global _original_moe_token_dispatch, _original_grouped_mm, _original_li_loss_forward
+    global _original_moe_token_dispatch, _original_grouped_mm, _original_li_loss_forward, _original_pipeline_schedule_warmup_p2p
+    global _original_window_exchange, _original_dtensor_meta_to_dtensor, _original_rowwise_prepare_output
     for (module_path, attr_name), original in _original_values.items():
         module = importlib.import_module(module_path)
         if original is _MISSING:
@@ -556,5 +1087,49 @@ def unpatch_device_type_to_meta() -> None:
         li_loss_cls, original_forward = _original_li_loss_forward
         li_loss_cls.forward = original_forward
         _original_li_loss_forward = _MISSING
+
+    if _original_pipeline_schedule_warmup_p2p is not _MISSING:
+        from torch.distributed.pipelining.schedules import _PipelineSchedule
+
+        _PipelineSchedule._warmup_p2p = _original_pipeline_schedule_warmup_p2p
+        _original_pipeline_schedule_warmup_p2p = _MISSING
+
+    if _original_window_exchange is not None:
+        from torchtitan_npu.distributed.context_parallel.compressor_attention_cp import (
+            _WindowExchange,
+        )
+
+        _WindowExchange.forward, _WindowExchange.backward = _original_window_exchange
+        _original_window_exchange = None
+
+    if _original_dtensor_meta_to_dtensor is not _MISSING:
+        from torch.distributed.pipelining._utils import _DTensorMeta
+
+        _DTensorMeta.to_dtensor = _original_dtensor_meta_to_dtensor
+        _original_dtensor_meta_to_dtensor = _MISSING
+
+    if _original_rowwise_prepare_output is not _MISSING:
+        from torch.distributed.tensor.parallel.style import RowwiseParallel
+
+        RowwiseParallel._prepare_output_fn = _original_rowwise_prepare_output
+        _original_rowwise_prepare_output = _MISSING
+
+    if _original_redistribute_local_tensor is not _MISSING:
+        import torch.distributed.tensor._redistribute as _redistribute_module
+
+        _redistribute_module.redistribute_local_tensor = _original_redistribute_local_tensor
+        _original_redistribute_local_tensor = _MISSING
+
+    if _original_recv_object_list is not _MISSING:
+        import torch.distributed as dist_mod
+
+        dist_mod.recv_object_list = _original_recv_object_list
+        dist_mod.send_object_list = _original_send_object_list
+        _original_recv_object_list = _MISSING
+        _original_send_object_list = _MISSING
+
+    if _original_torch_equal is not _MISSING:
+        torch.equal = _original_torch_equal
+        _original_torch_equal = _MISSING
 
     _patched = False

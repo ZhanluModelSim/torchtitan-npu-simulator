@@ -111,6 +111,9 @@ def capture_fake_collectives() -> Iterator[CommEventRecorder]:
     orig_funcol_all_gather_tensor = funcol.all_gather_tensor
     orig_funcol_reduce_scatter_tensor = funcol.reduce_scatter_tensor
     orig_funcol_all_to_all_single = funcol.all_to_all_single
+    orig_funcol_all_gather_tensor_autograd = funcol.all_gather_tensor_autograd
+    orig_funcol_reduce_scatter_tensor_autograd = funcol.reduce_scatter_tensor_autograd
+    orig_funcol_all_to_all_single_autograd = funcol.all_to_all_single_autograd
 
     def patched_all_reduce(tensor, op=dist.ReduceOp.SUM, group=None, async_op=False):  # noqa: ANN001
         if not is_fake_process_group(group):
@@ -177,16 +180,88 @@ def capture_fake_collectives() -> Iterator[CommEventRecorder]:
             out_shape[0] = int(sum(output_split_sizes))
         return torch.empty(out_shape, dtype=self_tensor.dtype, device=self_tensor.device)
 
+    def patched_funcol_all_gather_tensor_autograd(self_tensor, gather_dim, group, tag=""):  # noqa: ANN001
+        recorder.record("allgather", None, self_tensor)
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
+        out_shape = list(self_tensor.shape)
+        if gather_dim < len(out_shape):
+            out_shape[gather_dim] *= world_size
+        return torch.empty(out_shape, dtype=self_tensor.dtype, device=self_tensor.device)
+
+    def patched_funcol_reduce_scatter_tensor_autograd(self_tensor, reduceOp, scatter_dim, group, tag=""):  # noqa: ANN001, N803
+        recorder.record("reduce_scatter", None, self_tensor)
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
+        out_shape = list(self_tensor.shape)
+        if scatter_dim < len(out_shape):
+            out_shape[scatter_dim] = max(1, out_shape[scatter_dim] // world_size)
+        return torch.empty(out_shape, dtype=self_tensor.dtype, device=self_tensor.device)
+
+    def patched_funcol_all_to_all_single_autograd(self_tensor, output_split_sizes, input_split_sizes, group, tag=""):  # noqa: ANN001
+        recorder.record("all_to_all", None, self_tensor)
+        out_shape = list(self_tensor.shape)
+        if output_split_sizes:
+            out_shape[0] = int(sum(output_split_sizes))
+        return torch.empty(out_shape, dtype=self_tensor.dtype, device=self_tensor.device)
+
     dist.all_reduce = patched_all_reduce
     dist.all_gather_into_tensor = patched_all_gather_into_tensor
     dist.reduce_scatter_tensor = patched_reduce_scatter_tensor
     dist.all_to_all_single = patched_all_to_all_single
     dist.broadcast = patched_broadcast
     dist.barrier = patched_barrier
+
+    # P2P operations used by pipeline parallelism for actual tensor passing
+    # (not just metadata).  Under fake PG these are no-ops: the tensor is
+    # already in the same process, so "sending" it does nothing and
+    # "receiving" it means using the pre-allocated buffer as-is.
+    orig_isend = dist.isend
+    orig_irecv = dist.irecv
+    orig_send = dist.send
+    orig_recv = dist.recv
+
+    def patched_isend(tensor, dst=None, group=None, tag=0, group_dst=None):  # noqa: ANN001
+        if not is_fake_process_group(group):
+            return orig_isend(tensor, dst=dst, group=group, tag=tag, group_dst=group_dst)
+        return _NoOpWork()
+
+    def patched_irecv(tensor, src=None, group=None, tag=0, group_src=None):  # noqa: ANN001
+        if not is_fake_process_group(group):
+            return orig_irecv(tensor, src=src, group=group, tag=tag, group_src=group_src)
+        return _NoOpWork()
+
+    def patched_send(tensor, dst=None, group=None, tag=0, group_dst=None):  # noqa: ANN001
+        if not is_fake_process_group(group):
+            return orig_send(tensor, dst=dst, group=group, tag=tag, group_dst=group_dst)
+        return None
+
+    def patched_recv(tensor, src=None, group=None, tag=0, group_src=None):  # noqa: ANN001
+        if not is_fake_process_group(group):
+            return orig_recv(tensor, src=src, group=group, tag=tag, group_src=group_src)
+        return 0
+
+    dist.isend = patched_isend
+    dist.irecv = patched_irecv
+    dist.send = patched_send
+    dist.recv = patched_recv
+
+    # P2POp.__new__ checks `op in [isend, irecv]` by identity, but we replaced
+    # dist.isend/irecv with wrappers.  Patch _check_op to accept our wrappers.
+    from torch.distributed.distributed_c10d import _check_op as _orig_check_op
+
+    def _patched_check_op(op):
+        if op in (patched_isend, patched_irecv, orig_isend, orig_irecv):
+            return
+        return _orig_check_op(op)
+
+    import torch.distributed.distributed_c10d as _c10d_mod
+    _c10d_mod._check_op = _patched_check_op
     funcol.all_reduce = patched_funcol_all_reduce
     funcol.all_gather_tensor = patched_funcol_all_gather_tensor
     funcol.reduce_scatter_tensor = patched_funcol_reduce_scatter_tensor
     funcol.all_to_all_single = patched_funcol_all_to_all_single
+    funcol.all_gather_tensor_autograd = patched_funcol_all_gather_tensor_autograd
+    funcol.reduce_scatter_tensor_autograd = patched_funcol_reduce_scatter_tensor_autograd
+    funcol.all_to_all_single_autograd = patched_funcol_all_to_all_single_autograd
 
     try:
         yield recorder
@@ -197,7 +272,14 @@ def capture_fake_collectives() -> Iterator[CommEventRecorder]:
         dist.all_to_all_single = orig_all_to_all_single
         dist.broadcast = orig_broadcast
         dist.barrier = orig_barrier
+        dist.isend = orig_isend
+        dist.irecv = orig_irecv
+        dist.send = orig_send
+        dist.recv = orig_recv
         funcol.all_reduce = orig_funcol_all_reduce
         funcol.all_gather_tensor = orig_funcol_all_gather_tensor
         funcol.reduce_scatter_tensor = orig_funcol_reduce_scatter_tensor
         funcol.all_to_all_single = orig_funcol_all_to_all_single
+        funcol.all_gather_tensor_autograd = orig_funcol_all_gather_tensor_autograd
+        funcol.reduce_scatter_tensor_autograd = orig_funcol_reduce_scatter_tensor_autograd
+        funcol.all_to_all_single_autograd = orig_funcol_all_to_all_single_autograd

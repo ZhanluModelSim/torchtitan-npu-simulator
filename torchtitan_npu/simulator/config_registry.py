@@ -50,3 +50,40 @@ def deepseek_v4_pro_simulate_16_layers() -> SimulationTrainerConfig:
     full 61-layer acceptance config (Task 20)."""
     base_config = deepseek_v4_pro_debug_16_layers()
     return _to_simulation_config(base_config, output_dir="./simulator_output/deepseek_v4_pro_16_layers")
+
+
+def deepseek_v4_pro_simulate_61_layers_pp16_tp8_cp4_ep128() -> SimulationTrainerConfig:
+    """Large-scale strategy: PP=16, TP=8, CP=4, EP=128, FSDP auto-shard.
+
+    With ``data_parallel_shard_degree=-1`` torchtitan resolves
+    ``dp_shard = world_size // (dp_replicate * cp * tp * pp)``.
+    Setting ``world_size=2048`` yields ``dp_shard=4`` and
+    ``efsdp = dp_shard * cp * tp // ep = 1``.  Total simulated dies = 2048.
+
+    DeepSeekV4 does not support MTP together with PP, so ``num_mtp_modules``
+    is forced to 0 for this PP-enabled strategy.
+    """
+    base_config = deepseek_v4_pro_debug_61_layers_4k_384die()
+    base_config = dataclasses.replace(
+        base_config,
+        training=dataclasses.replace(
+            base_config.training,
+            num_mtp_modules=0,
+            # PP=16 with microbatch_size=1 needs local_batch_size >= 16 so
+            # that the 1F1B schedule receives at least 16 microbatches.
+            # global_batch_size=384 remains divisible by (16 * dp_shard=4).
+            local_batch_size=16,
+        ),
+        parallelism=dataclasses.replace(
+            base_config.parallelism,
+            pipeline_parallel_degree=16,
+            tensor_parallel_degree=8,
+            context_parallel_degree=4,
+            expert_parallel_degree=128,
+            data_parallel_shard_degree=-1,
+        ),
+    )
+    return _to_simulation_config(
+        base_config,
+        output_dir="./simulator_output/deepseek_v4_pro_61_layers_pp16_tp8_cp4_ep128",
+    )

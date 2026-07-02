@@ -20,11 +20,14 @@ def _create_fake_pg(common_opts, backend_opts):
     for every collective. It should be used as a convenient tool when playing
     with distributed but don't care about the actual data.
     """
+    # torch_npu's _new_process_group_helper patch may pass HCCL-specific
+    # backend_opts even for the FAKE backend; FakeProcessGroup only accepts
+    # its own Options object, so create a fresh one and ignore backend_opts.
+    fake_opts = FakeProcessGroup.Options()
     return FakeProcessGroup._create_internal(
         common_opts.group_rank,
         common_opts.group_size,
-        # pyrefly: ignore [bad-argument-count]
-        backend_opts,
+        fake_opts,
     )
 
 
