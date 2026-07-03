@@ -313,7 +313,7 @@ class LiLoss(Module):
         kv_len = kv.size(1)
         query = q.transpose(1, 2).detach()
         kv_states = torch.cat([kv.detach(), kv_compress.detach()], dim=1)
-        attn_logits = torch.einsum("bhsd,bkhd->bhsk", query, kv_states) * self.softmax_scale
+        attn_logits = torch.matmul(query, kv_states.unsqueeze(1).transpose(2, 3)) * self.softmax_scale
 
         window_topk_idxs = self.get_window_topk_idxs(self.window_size, bsz, seqlen).to(q.device)
         cmp_topk_idxs = torch.where(compress_topk_idxs == -1, compress_topk_idxs, compress_topk_idxs + kv_len)
