@@ -138,8 +138,8 @@ profiling = ProfilingConfig(
 
 | 配置项 | 类型 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `profile_step_start` | int | 0 | 开始性能分析的步数。如果设置为大于 0 的值，将使用基于步数的分析模式。 |
-| `profile_step_end` | int | 0 | 结束性能分析的步数。如果设置为 0，将使用 `profile_step_start + profiler_active`。 |
+| `profile_step_start` | int | 0 | 开始性能分析的步数。需与 `profile_step_end` 同时设置为大于 0 的值，才使用基于步数的分析模式。 |
+| `profile_step_end` | int | 0 | 结束性能分析的步数。需与 `profile_step_start` 同时设置为大于 0 的值，才使用基于步数的分析模式。 |
 | `profile_ranks` | list[int] | [-1] | 需要进行性能分析的 rank 列表，例如 [0, 1, 2]。使用 [-1] 表示对所有 rank 进行分析。 |
 | `profile_record_shapes` | bool | true | 是否在性能分析期间记录张量形状。 |
 | `profile_with_memory` | bool | false | 是否在性能分析期间记录内存使用情况。 |

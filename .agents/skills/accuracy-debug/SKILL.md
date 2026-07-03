@@ -35,7 +35,8 @@ pip install mindstudio-probe
 
 - 基准环境描述（分支/commit、硬件、框架版本）。
 - 异常环境描述（分支/commit、硬件、框架版本）。
-- 训练配置文件路径（TOML）。
+- 模型模块（`--module`）、config 注册名（`--config`）和 CLI 覆盖参数。
+- 对应模型的 `torchtitan_npu/models/<model>/config_registry.py` 位置。
 - 基线与异常代码的变更列表（commit 区间或改动文件）。
 - 失败/异常的训练日志。
 - 确定性设置是否已开启（优先用 `--debug.seed=1234 --debug.deterministic`，与 premerge-accuracy-check 对齐；msprobe 流程再配 `seed_all(seed=1234, mode=True)` 与 `CLOSE_MATMUL_K_SHIFT=1`）。

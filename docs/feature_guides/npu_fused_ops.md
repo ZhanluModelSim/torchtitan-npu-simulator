@@ -155,7 +155,7 @@ get_model_converter_config("npu_moe_dispatch")
 ## RMSNorm
 RMSNorm 通过计算输入张量每个样本的平方均值的平方根来稳定深层网络的训练。
 
-本 ModelConverter 将模型中的 RmsNorm 操作替换为基于 `npu_rms_norm` 融合算子的实现。
+本 ModelConverter 将模型中的 RMSNorm 操作替换为基于 `npu_rms_norm` 融合算子的实现。
 
 **配置项**：`npu_rms_norm`\
 **配置示例**：
