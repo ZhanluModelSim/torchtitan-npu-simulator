@@ -94,7 +94,24 @@ cd /workspace && pip install -e .
 git checkout feat/npu-simulator
 ```
 
-### 2. 运行仿真
+### 2. 准备 Tokenizer
+
+DeepSeek-V4-Pro 仿真配置默认引用 `./tests/assets/tokenizer/deepseek_v4_pro_tokenizer`，该目录**未随仓库提交**。Simulator 只在 meta device 上运行，tokenizer 仅用于 dataloader 生成 token ID（不影响捕获的 shape/结构），因此可以用仓库内置的 `deepseekv3_tokenizer` 替代：
+
+```bash
+# 方式一：用 --hf_assets_path 覆盖（推荐，无需修改代码）
+# 在运行仿真命令时追加 --hf_assets_path ./tests/assets/tokenizer/deepseekv3_tokenizer
+
+# 方式二：创建软链接
+mkdir -p tests/assets/tokenizer/deepseek_v4_pro_tokenizer
+ln -s ../deepseekv3_tokenizer/tokenizer.json tests/assets/tokenizer/deepseek_v4_pro_tokenizer/
+ln -s ../deepseekv3_tokenizer/tokenizer_config.json tests/assets/tokenizer/deepseek_v4_pro_tokenizer/
+```
+
+> [!NOTE]
+> 仓库内置的 tokenizer 资产位于 `tests/assets/tokenizer/`，已 git 跟踪的有 `deepseekv3_tokenizer`、`qwen3-tokenizer`、`vlm_tokenizer`。Simulator 不关心词表内容（meta tensor 无数值），任何能正常 encode 的 tokenizer 均可使用。
+
+### 3. 运行仿真
 
 Simulator 复用现有的 `scripts/run_train.sh` 脚本和 `torchtitan_npu.entry` 入口，只需将 `MODULE` 改为 `torchtitan_npu.simulator`，`CONFIG` 改为对应的仿真配置函数名，并设置 `COMM_MODE=fake_backend`：
 
@@ -104,7 +121,7 @@ MODULE=torchtitan_npu.simulator \
 CONFIG=deepseek_v4_pro_simulate_16_layers \
 COMM_MODE=fake_backend \
 NGPU=384 \
-bash scripts/run_train.sh
+bash scripts/run_train.sh --hf_assets_path ./tests/assets/tokenizer/deepseekv3_tokenizer
 ```
 
 ```bash
@@ -113,7 +130,7 @@ MODULE=torchtitan_npu.simulator \
 CONFIG=deepseek_v4_pro_simulate_61_layers \
 COMM_MODE=fake_backend \
 NGPU=384 \
-bash scripts/run_train.sh
+bash scripts/run_train.sh --hf_assets_path ./tests/assets/tokenizer/deepseekv3_tokenizer
 ```
 
 ```bash
@@ -122,7 +139,7 @@ MODULE=torchtitan_npu.simulator \
 CONFIG=deepseek_v4_pro_simulate_61_layers_pp16_tp8_cp4_ep128 \
 COMM_MODE=fake_backend \
 NGPU=2048 \
-bash scripts/run_train.sh
+bash scripts/run_train.sh --hf_assets_path ./tests/assets/tokenizer/deepseekv3_tokenizer
 ```
 
 也可以直接用 `python3 -m` 调用（与 `run_train.sh` 中 `COMM_MODE` 分支等价）：
@@ -132,16 +149,18 @@ NGPU=384 LOCAL_RANK=0 python3 -m torchtitan_npu.entry \
     --module torchtitan_npu.simulator \
     --config deepseek_v4_pro_simulate_61_layers \
     --comm.mode=fake_backend \
-    --training.steps=1
+    --training.steps=1 \
+    --hf_assets_path ./tests/assets/tokenizer/deepseekv3_tokenizer
 ```
 
 > [!NOTE]
 > - `NGPU` 环境变量指定模拟的**总卡数**（world_size），必须与配置中的并行度乘积一致。
 > - `--comm.mode=fake_backend` 是必须的，启用 fake Process Group 实现单进程模拟全部 rank。
 > - `--training.steps=1` 是默认值，Simulator 只捕获一个 step。
+> - `--hf_assets_path` 指定 tokenizer 路径，用仓库内置的 `deepseekv3_tokenizer` 即可（见上一步说明）。
 > - 不需要 `torchrun`，单进程 `python3 -m` 即可运行。
 
-### 3. 获取输出文件
+### 4. 获取输出文件
 
 仿真输出默认写入项目目录下的 `simulator_output/<配置名>/`。由于启动容器时已将项目目录挂载到 `/workspace`，输出文件会直接同步到宿主机，无需额外拷贝：
 
@@ -286,6 +305,10 @@ torchtitan_npu/simulator/
 ```
 
 ## 常见问题
+
+### Q: 仿真报错 FileNotFoundError: tokenizer path 相关
+
+DeepSeek-V4-Pro 配置默认引用 `./tests/assets/tokenizer/deepseek_v4_pro_tokenizer`，该目录未随仓库提交。解决方法：运行时追加 `--hf_assets_path ./tests/assets/tokenizer/deepseekv3_tokenizer`，用仓库内置的 v3 tokenizer 替代（Simulator 在 meta device 上运行，不关心词表内容，详见"快速开始 → 准备 Tokenizer"章节）。
 
 ### Q: 仿真报错 "inductor_npu_ext is not available"
 
