@@ -30,6 +30,7 @@ from torchtitan_npu.simulator.ir.workload_graph import WorkloadGraph
 from torchtitan_npu.simulator.meta_env import patch_device_type_to_meta
 from torchtitan_npu.simulator.moe_force_balance import force_deterministic_seed, force_moe_load_balance
 from torchtitan_npu.simulator.rank_table import build_rank_table
+from torchtitan_npu.simulator.viz.csv_export import export_kernel_summary_csv
 from torchtitan_npu.simulator.viz.dot_export import export_dot
 from torchtitan_npu.simulator.viz.html_export import export_html
 from torchtitan_npu.simulator.viz.json_export import export_json
@@ -39,8 +40,9 @@ from torchtitan_npu.simulator.viz.text_summary import write_text_summary
 @dataclass(kw_only=True, slots=True)
 class SimulationConfig:
     output_dir: str = "./simulator_output"
-    output_formats: list[str] = field(default_factory=lambda: ["json", "dot", "text", "html"])
+    output_formats: list[str] = field(default_factory=lambda: ["json", "dot", "text", "html", "csv"])
     target_npu_device_type: str = "non_a5"
+    csv_max_ranks: int | None = None
 
 
 @dataclass(kw_only=True, slots=True)
@@ -248,3 +250,9 @@ class SimulationTrainer(Trainer):
             write_text_summary(self.workload_graph, os.path.join(out_dir, "summary.txt"))
         if "html" in formats:
             export_html(self.workload_graph, os.path.join(out_dir, "trace.html"))
+        if "csv" in formats:
+            export_kernel_summary_csv(
+                self.workload_graph,
+                os.path.join(out_dir, "kernel_summary.csv"),
+                max_ranks=self.simulation_config.csv_max_ranks,
+            )
