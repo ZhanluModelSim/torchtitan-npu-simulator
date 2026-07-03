@@ -16,29 +16,77 @@ Simulator 通过以下机制实现"零硬件捕获"：
 
 Simulator 需要 `torch` 和 `torch_npu`（用于 NPU 自定义算子的 meta 核注册），但**不需要真实 NPU 硬件**（`torch.npu.is_available()` 可以为 `False`）。
 
-### 方式一：使用 CANN 容器（推荐）
+### 方式一：使用预构建镜像（推荐）
+
+已将调试环境打包为容器镜像并上传至华为云 SWR，内含 CANN 9.1.0-beta.1-950、Python 3.12.13、torch 2.12.0+cpu、torch_npu 2.12.0.rc1、torchtitan 0.2.2、torchtitan_npu 0.2.2.post1，开箱即用。
 
 ```bash
-# 拉取 CANN 镜像
+# 1. 拉取镜像
+sudo docker pull swr.cn-north-4.myhuaweicloud.com/zhanlu/torchtitan-npu-simulator:v1.0
+
+# 2. 克隆项目代码（如已有可跳过）
+git clone https://github.com/ZhanluModelSim/torchtitan-npu-simulator.git
+cd torchtitan-npu-simulator
+git checkout feat/npu-simulator
+
+# 3. 启动容器，挂载项目目录
+sudo docker run -d --name titan-sim \
+  -v $(pwd):/workspace \
+  -w /workspace \
+  swr.cn-north-4.myhuaweicloud.com/zhanlu/torchtitan-npu-simulator:v1.0 \
+  sleep infinity
+
+# 4. 进入容器
+sudo docker exec -it titan-sim bash
+
+# 5. 加载 CANN 环境变量（每次进入容器都需要执行）
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+
+# 6. 验证环境
+python3 -c "import torch; import torch_npu; print('torch', torch.__version__); print('torch_npu', torch_npu.__version__); print('npu available', torch.npu.is_available())"
+# 预期输出：
+#   torch 2.12.0+cpu
+#   torch_npu 2.12.0.rc1
+#   npu available False   ← 正常，simulator 不需要真实硬件
+```
+
+> [!TIP]
+> 镜像约 24.5GB，首次拉取需要较长时间。如果网络较慢，可先用 `--quiet` 模式后台拉取。
+>
+> 每次重新进入容器都需要执行 `source /usr/local/Ascend/ascend-toolkit/set_env.sh` 加载 CANN 环境变量。也可以将其写入 `~/.bashrc` 一劳永逸：
+> ```bash
+> echo 'source /usr/local/Ascend/ascend-toolkit/set_env.sh 2>/dev/null' >> ~/.bashrc
+> ```
+
+### 方式二：使用基础 CANN 镜像手动搭建
+
+如果需要自定义环境，可从基础 CANN 镜像开始：
+
+```bash
+# 拉取基础 CANN 镜像
 docker pull quay.m.daocloud.io/ascend/cann:9.1.0-beta.1-950-ubuntu22.04-py3.12
 
-# 启动容器，挂载项目目录
+# 启动容器
 docker run -d --name titan-sim \
   -v $(pwd):/workspace \
   -w /workspace \
   quay.m.daocloud.io/ascend/cann:9.1.0-beta.1-950-ubuntu22.04-py3.12 \
   sleep infinity
 
-# 进入容器，加载 CANN 环境
+# 进入容器，加载 CANN 环境并安装依赖
 docker exec -it titan-sim bash
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
+pip install torch==2.12.0+cpu torch_npu==2.12.0.rc1 -f https://download.pytorch.org/whl/cpu/torch_stable.html
+cd /workspace && pip install -e .
 ```
 
-### 方式二：本地环境
+### 方式三：本地环境
 
 确保已安装 `torch` 和 `torch_npu`（版本以 `requirements.txt` 锁定为准），并已 source CANN 环境变量。
 
 ## 快速开始
+
+以下命令均在**容器内**执行（通过 `docker exec -it titan-sim bash` 进入后，先 `source /usr/local/Ascend/ascend-toolkit/set_env.sh`）。
 
 ### 1. 切换到 simulator 分支
 
@@ -92,6 +140,29 @@ NGPU=384 LOCAL_RANK=0 python3 -m torchtitan_npu.entry \
 > - `--comm.mode=fake_backend` 是必须的，启用 fake Process Group 实现单进程模拟全部 rank。
 > - `--training.steps=1` 是默认值，Simulator 只捕获一个 step。
 > - 不需要 `torchrun`，单进程 `python3 -m` 即可运行。
+
+### 3. 获取输出文件
+
+仿真输出默认写入项目目录下的 `simulator_output/<配置名>/`。由于启动容器时已将项目目录挂载到 `/workspace`，输出文件会直接同步到宿主机，无需额外拷贝：
+
+```bash
+# 在宿主机上直接查看（无需进入容器）
+ls simulator_output/deepseek_v4_pro_61_layers/
+# summary.txt  trace.html  compute_graph.dot  simulation_result.json
+
+# 查看摘要
+cat simulator_output/deepseek_v4_pro_61_layers/summary.txt
+
+# 在浏览器中打开可视化页面
+# macOS:  open simulator_output/deepseek_v4_pro_61_layers/trace.html
+# Linux:  xdg-open simulator_output/deepseek_v4_pro_61_layers/trace.html
+```
+
+> [!TIP]
+> 如果容器启动时未挂载项目目录（`-v` 参数），输出文件只在容器内。可通过 `docker cp` 拷出到宿主机：
+> ```bash
+> sudo docker cp titan-sim:/workspace/simulator_output ./simulator_output
+> ```
 
 ## 内置仿真配置
 
