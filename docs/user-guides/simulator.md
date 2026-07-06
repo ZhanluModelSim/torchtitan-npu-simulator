@@ -58,9 +58,48 @@ python3 -c "import torch; import torch_npu; print('torch', torch.__version__); p
 > echo 'source /usr/local/Ascend/ascend-toolkit/set_env.sh 2>/dev/null' >> ~/.bashrc
 > ```
 
-### 方式二：使用基础 CANN 镜像手动搭建
+### 方式二：使用 Dockerfile 自行构建镜像（支持 ARM64）
 
-如果需要自定义环境，可从基础 CANN 镜像开始：
+项目根目录提供 `Dockerfile`，可在 x86_64 和 ARM64（aarch64）架构下自行构建镜像。CANN 基础镜像、torch、torch_npu、triton-ascend 均已提供 ARM64 wheel，无需额外适配。
+
+```bash
+# 1. 克隆项目代码
+git clone https://github.com/ZhanluModelSim/torchtitan-npu-simulator.git
+cd torchtitan-npu-simulator
+git checkout feat/npu-simulator
+
+# 2. 构建镜像（自动识别当前架构）
+sudo docker build -t torchtitan-npu-simulator:v1.0 .
+
+# 3. 启动容器，挂载项目目录
+sudo docker run -d --name titan-sim \
+  -v $(pwd):/workspace \
+  -w /workspace \
+  torchtitan-npu-simulator:v1.0 \
+  sleep infinity
+
+# 4. 进入容器（CANN 环境变量已写入 bashrc，自动加载）
+sudo docker exec -it titan-sim bash
+
+# 5. 验证环境
+python3 -c "import torch; import torch_npu; print('torch', torch.__version__); print('torch_npu', torch_npu.__version__); print('npu available', torch.npu.is_available())"
+```
+
+> [!NOTE]
+> Dockerfile 会自动完成以下操作：
+> - 以 CANN 9.1.0-beta.1-950 镜像为基础（提供 `libhccl.so` 等 torch_npu 依赖库）
+> - 安装 `torch==2.12.0+cpu`（CPU 版，无需 GPU/NPU 硬件）
+> - 安装 `torch_npu==2.12.0rc1`（提供 NPU 算子 meta 核注册）
+> - 从 gitcode 拉取并安装 torchtitan（pinned commit `ac13e536`）
+> - 安装 `requirements.txt` 中的全部依赖（numpy、triton-ascend、scipy 等）
+> - 克隆并安装 torchtitan_npu（simulator 分支，editable 模式）
+> - 将 `source set_env.sh` 写入 `/etc/bash.bashrc`，进入容器自动加载 CANN 环境
+>
+> 构建耗时约 10-30 分钟（取决于网络速度），镜像约 25GB。
+
+### 方式三：使用基础 CANN 镜像手动搭建
+
+如果需要完全自定义环境，可从基础 CANN 镜像开始逐步安装：
 
 ```bash
 # 拉取基础 CANN 镜像
@@ -80,7 +119,7 @@ pip install torch==2.12.0+cpu torch_npu==2.12.0.rc1 -f https://download.pytorch.
 cd /workspace && pip install -e .
 ```
 
-### 方式三：本地环境
+### 方式四：本地环境
 
 确保已安装 `torch` 和 `torch_npu`（版本以 `requirements.txt` 锁定为准），并已 source CANN 环境变量。
 
