@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import itertools
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Iterator
 
 import torch
@@ -37,6 +37,9 @@ class CommEvent:
     tensor_shape: tuple[int, ...]
     dtype: str
     volume_bytes: int
+    op_id: str = ""  # L0 OpNode ID if this event was also recorded as a synthetic op
+    comm_dim: str = ""  # parallel dimension name (e.g. "tp", "ep", "fsdp")
+    comm_ranks: list[list[int]] = field(default_factory=list)  # groups of ranks in this comm domain, e.g. [[0,1,2,3],[4,5,6,7]]
 
 
 class _NoOpWork:
@@ -55,20 +58,32 @@ class CommEventRecorder:
     def __init__(self) -> None:
         self.events: list[CommEvent] = []
 
-    def record(self, comm_primitive: str, group: object, tensor: torch.Tensor) -> None:
+    def record(
+        self,
+        comm_primitive: str,
+        group: object,
+        tensor: torch.Tensor,
+        *,
+        comm_dim: str = "",
+        comm_ranks: list[list[int]] | None = None,
+    ) -> CommEvent:
+        """Record a communication event. Returns the CommEvent so the caller
+        can set ``op_id`` after optionally registering a synthetic L0 op."""
         dtype_str = dtype_to_str(tensor.dtype)
         world_size = _resolve_world_size(group)
-        self.events.append(
-            CommEvent(
-                event_id=f"comm_{next(_event_counter)}",
-                comm_primitive=comm_primitive,
-                group_name=_group_name(group),
-                world_size=world_size,
-                tensor_shape=tuple(int(d) for d in tensor.shape),
-                dtype=dtype_str,
-                volume_bytes=tensor_volume_bytes(tuple(tensor.shape), dtype_str),
-            )
+        event = CommEvent(
+            event_id=f"comm_{next(_event_counter)}",
+            comm_primitive=comm_primitive,
+            group_name=_group_name(group),
+            world_size=world_size,
+            tensor_shape=tuple(int(d) for d in tensor.shape),
+            dtype=dtype_str,
+            volume_bytes=tensor_volume_bytes(tuple(tensor.shape), dtype_str),
+            comm_dim=comm_dim,
+            comm_ranks=comm_ranks or [],
         )
+        self.events.append(event)
+        return event
 
 
 def _resolve_world_size(group: object) -> int:
@@ -127,6 +142,74 @@ def _group_name(group: object) -> str:
     return "default"
 
 
+def _resolve_comm_ranks(group: object) -> list[list[int]]:
+    """Best-effort extraction of the rank lists that belong to this
+    communication domain.  Returns a list of groups, where each group is a
+    list of global rank IDs (e.g. ``[[0,1,2,3],[4,5,6,7]]`` for two TP
+    groups of size 4).  Returns ``[]`` when unresolvable."""
+    if group is None:
+        ws = dist.get_world_size() if dist.is_initialized() else 1
+        return [list(range(ws))] if ws > 1 else []
+    # DeviceMesh: extract ranks from the mesh tensor
+    if hasattr(group, "mesh") and hasattr(group, "ndm"):
+        try:
+            mesh = group.mesh
+            if hasattr(mesh, "flatten"):
+                ranks = [int(r) for r in mesh.flatten().tolist()]
+                return [ranks] if len(ranks) > 1 else []
+        except Exception:
+            pass
+    # ProcessGroup: only know our own group's size, not all groups
+    if hasattr(group, "size"):
+        try:
+            ws = int(group.size())
+            rank = int(group.rank()) if hasattr(group, "rank") else 0
+            return [list(range(rank, rank + ws))]
+        except Exception:
+            pass
+    return []
+
+
+def _record_comm_with_l0(
+    recorder: CommEventRecorder,
+    comm_primitive: str,
+    group: object,
+    tensor: torch.Tensor,
+    output_tensor: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Record a CommEvent AND register a synthetic L0 OpNode for the
+    communication op, so it appears in the L0 compute graph and CSV.
+
+    Returns the output tensor (or the input if no output was provided)."""
+    from torchtitan_npu.simulator.capture.dispatch_capture import get_active_capture
+
+    comm_dim = _group_name(group)
+    comm_ranks = _resolve_comm_ranks(group)
+    event = recorder.record(
+        comm_primitive, group, tensor,
+        comm_dim=comm_dim, comm_ranks=comm_ranks,
+    )
+
+    out = output_tensor if output_tensor is not None else tensor
+    capture = get_active_capture()
+    if capture is not None:
+        capture.record_synthetic_op(
+            raw_op_type=f"comm.{comm_primitive}",
+            inputs=[tensor],
+            outputs=[out],
+        )
+        # Link the L0 op to this CommEvent and store comm metadata in annotations
+        if capture._events:
+            event.op_id = capture._events[-1].op_id
+            # Store comm_dim and comm_ranks in the L0 node's annotations
+            # so they appear in CSV and JSON exports
+            capture._events[-1].comm_dim = comm_dim
+            capture._events[-1].comm_ranks_str = ";".join(
+                ",".join(str(r) for r in g) for g in comm_ranks
+            )
+    return out
+
+
 @contextmanager
 def capture_fake_collectives() -> Iterator[CommEventRecorder]:
     """Monkeypatch the legacy (`torch.distributed.*`) and functional
@@ -167,19 +250,19 @@ def capture_fake_collectives() -> Iterator[CommEventRecorder]:
     def patched_all_reduce(tensor, op=dist.ReduceOp.SUM, group=None, async_op=False):  # noqa: ANN001
         if not is_fake_process_group(group):
             return orig_all_reduce(tensor, op=op, group=group, async_op=async_op)
-        recorder.record("allreduce", group, tensor)
+        _record_comm_with_l0(recorder, "allreduce", group, tensor)
         return _NoOpWork() if async_op else None
 
     def patched_all_gather_into_tensor(output_tensor, input_tensor, group=None, async_op=False):  # noqa: ANN001
         if not is_fake_process_group(group):
             return orig_all_gather_into_tensor(output_tensor, input_tensor, group=group, async_op=async_op)
-        recorder.record("allgather", group, input_tensor)
+        _record_comm_with_l0(recorder, "allgather", group, input_tensor, output_tensor)
         return _NoOpWork() if async_op else None
 
     def patched_reduce_scatter_tensor(output, input, op=dist.ReduceOp.SUM, group=None, async_op=False):  # noqa: ANN001
         if not is_fake_process_group(group):
             return orig_reduce_scatter_tensor(output, input, op=op, group=group, async_op=async_op)
-        recorder.record("reduce_scatter", group, input)
+        _record_comm_with_l0(recorder, "reduce_scatter", group, input, output)
         return _NoOpWork() if async_op else None
 
     def patched_all_to_all_single(  # noqa: ANN001
@@ -190,13 +273,13 @@ def capture_fake_collectives() -> Iterator[CommEventRecorder]:
                 output, input, output_split_sizes=output_split_sizes,
                 input_split_sizes=input_split_sizes, group=group, async_op=async_op,
             )
-        recorder.record("all_to_all", group, input)
+        _record_comm_with_l0(recorder, "all_to_all", group, input, output)
         return _NoOpWork() if async_op else None
 
     def patched_broadcast(tensor, src=0, group=None, async_op=False, group_src=None):  # noqa: ANN001
         if not is_fake_process_group(group):
             return orig_broadcast(tensor, src=src, group=group, async_op=async_op, group_src=group_src)
-        recorder.record("broadcast", group, tensor)
+        _record_comm_with_l0(recorder, "broadcast", group, tensor)
         return _NoOpWork() if async_op else None
 
     def patched_barrier(group=None, async_op=False, device_ids=None):  # noqa: ANN001
@@ -205,18 +288,17 @@ def capture_fake_collectives() -> Iterator[CommEventRecorder]:
         return _NoOpWork() if async_op else None
 
     def patched_funcol_all_reduce(self_tensor, reduceOp, group, tag=""):  # noqa: ANN001, N803
-        recorder.record("allreduce", group, self_tensor)
-        return self_tensor.clone()
+        out = self_tensor.clone()
+        return _record_comm_with_l0(recorder, "allreduce", group, self_tensor, out)
 
     def patched_funcol_all_gather_tensor(self_tensor, gather_dim, group, tag=""):  # noqa: ANN001
-        recorder.record("allgather", group, self_tensor)
         world_size = _resolve_world_size(group)
         out_shape = list(self_tensor.shape)
         out_shape[gather_dim] *= world_size
-        return torch.empty(out_shape, dtype=self_tensor.dtype, device=self_tensor.device)
+        out = torch.empty(out_shape, dtype=self_tensor.dtype, device=self_tensor.device)
+        return _record_comm_with_l0(recorder, "allgather", group, self_tensor, out)
 
     def patched_funcol_reduce_scatter_tensor(self_tensor, reduceOp, scatter_dim, group, tag=""):  # noqa: ANN001, N803
-        recorder.record("reduce_scatter", group, self_tensor)
         world_size = _resolve_world_size(group)
         out_shape = list(self_tensor.shape)
         dim_size = out_shape[scatter_dim]
@@ -226,25 +308,25 @@ def capture_fake_collectives() -> Iterator[CommEventRecorder]:
                 f"world_size {world_size}; check parallelism config / tensor shapes"
             )
         out_shape[scatter_dim] = dim_size // world_size
-        return torch.empty(out_shape, dtype=self_tensor.dtype, device=self_tensor.device)
+        out = torch.empty(out_shape, dtype=self_tensor.dtype, device=self_tensor.device)
+        return _record_comm_with_l0(recorder, "reduce_scatter", group, self_tensor, out)
 
     def patched_funcol_all_to_all_single(self_tensor, output_split_sizes, input_split_sizes, group, tag=""):  # noqa: ANN001
-        recorder.record("all_to_all", group, self_tensor)
         out_shape = list(self_tensor.shape)
         if output_split_sizes:
             out_shape[0] = int(sum(output_split_sizes))
-        return torch.empty(out_shape, dtype=self_tensor.dtype, device=self_tensor.device)
+        out = torch.empty(out_shape, dtype=self_tensor.dtype, device=self_tensor.device)
+        return _record_comm_with_l0(recorder, "all_to_all", group, self_tensor, out)
 
     def patched_funcol_all_gather_tensor_autograd(self_tensor, gather_dim, group, tag=""):  # noqa: ANN001
-        recorder.record("allgather", group, self_tensor)
         world_size = _resolve_world_size(group)
         out_shape = list(self_tensor.shape)
         if gather_dim < len(out_shape):
             out_shape[gather_dim] *= world_size
-        return torch.empty(out_shape, dtype=self_tensor.dtype, device=self_tensor.device)
+        out = torch.empty(out_shape, dtype=self_tensor.dtype, device=self_tensor.device)
+        return _record_comm_with_l0(recorder, "allgather", group, self_tensor, out)
 
     def patched_funcol_reduce_scatter_tensor_autograd(self_tensor, reduceOp, scatter_dim, group, tag=""):  # noqa: ANN001, N803
-        recorder.record("reduce_scatter", group, self_tensor)
         world_size = _resolve_world_size(group)
         out_shape = list(self_tensor.shape)
         if scatter_dim < len(out_shape):
@@ -255,14 +337,15 @@ def capture_fake_collectives() -> Iterator[CommEventRecorder]:
                     f"world_size {world_size}; check parallelism config / tensor shapes"
                 )
             out_shape[scatter_dim] = dim_size // world_size
-        return torch.empty(out_shape, dtype=self_tensor.dtype, device=self_tensor.device)
+        out = torch.empty(out_shape, dtype=self_tensor.dtype, device=self_tensor.device)
+        return _record_comm_with_l0(recorder, "reduce_scatter", group, self_tensor, out)
 
     def patched_funcol_all_to_all_single_autograd(self_tensor, output_split_sizes, input_split_sizes, group, tag=""):  # noqa: ANN001
-        recorder.record("all_to_all", group, self_tensor)
         out_shape = list(self_tensor.shape)
         if output_split_sizes:
             out_shape[0] = int(sum(output_split_sizes))
-        return torch.empty(out_shape, dtype=self_tensor.dtype, device=self_tensor.device)
+        out = torch.empty(out_shape, dtype=self_tensor.dtype, device=self_tensor.device)
+        return _record_comm_with_l0(recorder, "all_to_all", group, self_tensor, out)
 
     dist.all_reduce = patched_all_reduce
     dist.all_gather_into_tensor = patched_all_gather_into_tensor

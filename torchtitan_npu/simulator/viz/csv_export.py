@@ -105,6 +105,9 @@ def export_kernel_summary_csv(workload_graph: WorkloadGraph, path: str, *, max_r
         for topo_idx, op_id in enumerate(sorted_ids):
             node = nodes[op_id]
             ann = node.annotations
+            # Extract communication info from annotations (set by comm_events)
+            comm_dim = ann.get("comm_dim", "")
+            comm_ranks = ann.get("comm_ranks", "")
             rows.append([
                 step_graph.step_type,
                 tid,
@@ -123,6 +126,8 @@ def export_kernel_summary_csv(workload_graph: WorkloadGraph, path: str, *, max_r
                 ann.get("repeat_count", 1),
                 ann.get("module_path", ""),
                 ann.get("phase", ""),
+                comm_dim,
+                comm_ranks,
             ])
         template_rows[tid] = rows
 
@@ -138,6 +143,7 @@ def export_kernel_summary_csv(workload_graph: WorkloadGraph, path: str, *, max_r
         "inputs_dtype", "outputs_dtype",
         "flops", "peak_mem", "param_mem", "comm_bytes",
         "repeat_count", "module_path", "phase",
+        "comm_dim", "comm_ranks",
     ])
 
     BATCH_SIZE = 10000

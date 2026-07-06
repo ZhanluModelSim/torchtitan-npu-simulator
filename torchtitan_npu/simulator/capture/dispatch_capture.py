@@ -62,6 +62,8 @@ class _RawEvent:
     module_path: str = ""
     phase: str = "forward"
     repeat_count: int = 1
+    comm_dim: str = ""
+    comm_ranks_str: str = ""
 
 
 def _shape_signature(event: _RawEvent) -> tuple:
@@ -189,6 +191,10 @@ class OpDispatchCapture(TorchDispatchMode):
                 annotations["repeat_count"] = event.repeat_count
             if cost.unknown:
                 annotations["cost_unknown"] = True
+            if event.comm_dim:
+                annotations["comm_dim"] = event.comm_dim
+            if event.comm_ranks_str:
+                annotations["comm_ranks"] = event.comm_ranks_str
             nodes[event.op_id] = OpNode(
                 op_id=event.op_id,
                 op_type=event.op_type,

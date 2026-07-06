@@ -49,6 +49,12 @@ OP_MAPPING: dict[str, str] = {
     "aten.split_with_sizes.default": "split",
     # optimizer
     "aten._fused_adamw_.default": "adamw_step",
+    # communication (synthetic ops registered by comm_events.py)
+    "comm.allreduce": "allreduce",
+    "comm.allgather": "allgather",
+    "comm.reduce_scatter": "reduce_scatter",
+    "comm.all_to_all": "all_to_all",
+    "comm.broadcast": "broadcast",
 }
 
 

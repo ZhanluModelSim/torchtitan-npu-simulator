@@ -55,14 +55,22 @@ def build_schedule_graph(
     data_passes: list[DataPass] = []
     for event in comm_events:
         dim_name = rank_table.dim_by_group_name.get(event.group_name)
-        groups = rank_table.process_groups.get(dim_name, []) if dim_name else []
+        # Use the comm_dim from the event if available (more specific than
+        # the rank_table lookup, which may return None for group_name="default")
+        if not dim_name and event.comm_dim:
+            dim_name = event.comm_dim
+        # Determine which rank groups participate in this communication
+        if event.comm_ranks:
+            groups = event.comm_ranks
+        else:
+            groups = rank_table.process_groups.get(dim_name, []) if dim_name else []
         for group in groups:
             if len(group) < 2:
                 continue
             slot = TensorSlot(
                 name=f"{event.comm_primitive}_{event.event_id}",
-                src_exit_op="",
-                dst_entry_op="",
+                src_exit_op=event.op_id,
+                dst_entry_op=event.op_id,
                 shape=event.tensor_shape,
                 dtype=event.dtype,
                 volume_bytes=event.volume_bytes,
