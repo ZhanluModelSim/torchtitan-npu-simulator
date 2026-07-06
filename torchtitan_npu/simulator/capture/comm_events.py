@@ -39,7 +39,12 @@ class CommEvent:
     volume_bytes: int
     op_id: int = 0  # L0 OpNode ID if this event was also recorded as a synthetic op
     comm_dim: str = ""  # parallel dimension name (e.g. "tp", "ep", "fsdp")
-    comm_ranks: list[list[int]] = field(default_factory=list)  # groups of ranks in this comm domain, e.g. [[0,1,2,3],[4,5,6,7]]
+    comm_ranks: list[list[int]] = field(default_factory=list)  # groups of ranks in this comm domain
+    # P2P-specific fields (set by patched_isend/irecv for pipeline parallelism):
+    p2p_peer_rank: int = -1      # peer rank (isend's dst / irecv's src)
+    p2p_direction: str = ""      # "forward_send" / "forward_recv" / "backward_send" / "backward_recv"
+    p2p_mb_idx: int = -1         # microbatch index
+    p2p_stage: int = -1          # pipeline stage index
 
 
 class _NoOpWork:
@@ -176,11 +181,11 @@ def _record_comm_with_l0(
     group: object,
     tensor: torch.Tensor,
     output_tensor: torch.Tensor | None = None,
-) -> torch.Tensor:
+) -> CommEvent:
     """Record a CommEvent AND register a synthetic L0 OpNode for the
     communication op, so it appears in the L0 compute graph and CSV.
 
-    Returns the output tensor (or the input if no output was provided)."""
+    Returns the CommEvent (so P2P callers can set p2p_peer_rank etc.)."""
     from torchtitan_npu.simulator.capture.dispatch_capture import get_active_capture
 
     comm_dim = _group_name(group)
@@ -207,7 +212,7 @@ def _record_comm_with_l0(
             capture._events[-1].comm_ranks_str = ";".join(
                 ",".join(str(r) for r in g) for g in comm_ranks
             )
-    return out
+    return event
 
 
 @contextmanager
@@ -289,14 +294,14 @@ def capture_fake_collectives() -> Iterator[CommEventRecorder]:
 
     def patched_funcol_all_reduce(self_tensor, reduceOp, group, tag=""):  # noqa: ANN001, N803
         out = self_tensor.clone()
-        return _record_comm_with_l0(recorder, "allreduce", group, self_tensor, out)
+        _record_comm_with_l0(recorder, "allreduce", group, self_tensor, out); return out
 
     def patched_funcol_all_gather_tensor(self_tensor, gather_dim, group, tag=""):  # noqa: ANN001
         world_size = _resolve_world_size(group)
         out_shape = list(self_tensor.shape)
         out_shape[gather_dim] *= world_size
         out = torch.empty(out_shape, dtype=self_tensor.dtype, device=self_tensor.device)
-        return _record_comm_with_l0(recorder, "allgather", group, self_tensor, out)
+        _record_comm_with_l0(recorder, "allgather", group, self_tensor, out); return out
 
     def patched_funcol_reduce_scatter_tensor(self_tensor, reduceOp, scatter_dim, group, tag=""):  # noqa: ANN001, N803
         world_size = _resolve_world_size(group)
@@ -309,14 +314,14 @@ def capture_fake_collectives() -> Iterator[CommEventRecorder]:
             )
         out_shape[scatter_dim] = dim_size // world_size
         out = torch.empty(out_shape, dtype=self_tensor.dtype, device=self_tensor.device)
-        return _record_comm_with_l0(recorder, "reduce_scatter", group, self_tensor, out)
+        _record_comm_with_l0(recorder, "reduce_scatter", group, self_tensor, out); return out
 
     def patched_funcol_all_to_all_single(self_tensor, output_split_sizes, input_split_sizes, group, tag=""):  # noqa: ANN001
         out_shape = list(self_tensor.shape)
         if output_split_sizes:
             out_shape[0] = int(sum(output_split_sizes))
         out = torch.empty(out_shape, dtype=self_tensor.dtype, device=self_tensor.device)
-        return _record_comm_with_l0(recorder, "all_to_all", group, self_tensor, out)
+        _record_comm_with_l0(recorder, "all_to_all", group, self_tensor, out); return out
 
     def patched_funcol_all_gather_tensor_autograd(self_tensor, gather_dim, group, tag=""):  # noqa: ANN001
         world_size = _resolve_world_size(group)
@@ -324,7 +329,7 @@ def capture_fake_collectives() -> Iterator[CommEventRecorder]:
         if gather_dim < len(out_shape):
             out_shape[gather_dim] *= world_size
         out = torch.empty(out_shape, dtype=self_tensor.dtype, device=self_tensor.device)
-        return _record_comm_with_l0(recorder, "allgather", group, self_tensor, out)
+        _record_comm_with_l0(recorder, "allgather", group, self_tensor, out); return out
 
     def patched_funcol_reduce_scatter_tensor_autograd(self_tensor, reduceOp, scatter_dim, group, tag=""):  # noqa: ANN001, N803
         world_size = _resolve_world_size(group)
@@ -338,14 +343,14 @@ def capture_fake_collectives() -> Iterator[CommEventRecorder]:
                 )
             out_shape[scatter_dim] = dim_size // world_size
         out = torch.empty(out_shape, dtype=self_tensor.dtype, device=self_tensor.device)
-        return _record_comm_with_l0(recorder, "reduce_scatter", group, self_tensor, out)
+        _record_comm_with_l0(recorder, "reduce_scatter", group, self_tensor, out); return out
 
     def patched_funcol_all_to_all_single_autograd(self_tensor, output_split_sizes, input_split_sizes, group, tag=""):  # noqa: ANN001
         out_shape = list(self_tensor.shape)
         if output_split_sizes:
             out_shape[0] = int(sum(output_split_sizes))
         out = torch.empty(out_shape, dtype=self_tensor.dtype, device=self_tensor.device)
-        return _record_comm_with_l0(recorder, "all_to_all", group, self_tensor, out)
+        _record_comm_with_l0(recorder, "all_to_all", group, self_tensor, out); return out
 
     dist.all_reduce = patched_all_reduce
     dist.all_gather_into_tensor = patched_all_gather_into_tensor
@@ -366,21 +371,47 @@ def capture_fake_collectives() -> Iterator[CommEventRecorder]:
     def patched_isend(tensor, dst=None, group=None, tag=0, group_dst=None):  # noqa: ANN001
         if not is_fake_process_group(group):
             return orig_isend(tensor, dst=dst, group=group, tag=tag, group_dst=group_dst)
+        # Record P2P send with PP context
+        from torchtitan_npu.simulator.meta_env import _pp_context
+        event = _record_comm_with_l0(recorder, "p2p_send", group, tensor)
+        event.p2p_peer_rank = dst if dst is not None else (group_dst if group_dst is not None else -1)
+        event.p2p_direction = f"{_pp_context['phase']}_send"
+        event.p2p_mb_idx = int(_pp_context["mb_idx"])
+        event.p2p_stage = int(_pp_context["stage"])
         return _NoOpWork()
 
     def patched_irecv(tensor, src=None, group=None, tag=0, group_src=None):  # noqa: ANN001
         if not is_fake_process_group(group):
             return orig_irecv(tensor, src=src, group=group, tag=tag, group_src=group_src)
+        # Record P2P recv with PP context
+        from torchtitan_npu.simulator.meta_env import _pp_context
+        event = _record_comm_with_l0(recorder, "p2p_recv", group, tensor)
+        event.p2p_peer_rank = src if src is not None else (group_src if group_src is not None else -1)
+        event.p2p_direction = f"{_pp_context['phase']}_recv"
+        event.p2p_mb_idx = int(_pp_context["mb_idx"])
+        event.p2p_stage = int(_pp_context["stage"])
         return _NoOpWork()
 
     def patched_send(tensor, dst=None, group=None, tag=0, group_dst=None):  # noqa: ANN001
         if not is_fake_process_group(group):
             return orig_send(tensor, dst=dst, group=group, tag=tag, group_dst=group_dst)
+        from torchtitan_npu.simulator.meta_env import _pp_context
+        event = _record_comm_with_l0(recorder, "p2p_send", group, tensor)
+        event.p2p_peer_rank = dst if dst is not None else (group_dst if group_dst is not None else -1)
+        event.p2p_direction = f"{_pp_context['phase']}_send"
+        event.p2p_mb_idx = int(_pp_context["mb_idx"])
+        event.p2p_stage = int(_pp_context["stage"])
         return None
 
     def patched_recv(tensor, src=None, group=None, tag=0, group_src=None):  # noqa: ANN001
         if not is_fake_process_group(group):
             return orig_recv(tensor, src=src, group=group, tag=tag, group_src=group_src)
+        from torchtitan_npu.simulator.meta_env import _pp_context
+        event = _record_comm_with_l0(recorder, "p2p_recv", group, tensor)
+        event.p2p_peer_rank = src if src is not None else (group_src if group_src is not None else -1)
+        event.p2p_direction = f"{_pp_context['phase']}_recv"
+        event.p2p_mb_idx = int(_pp_context["mb_idx"])
+        event.p2p_stage = int(_pp_context["stage"])
         return 0
 
     dist.isend = patched_isend

@@ -32,3 +32,4 @@ class OpNode:
     param_mem: int = 0
     comm_bytes: int = 0
     annotations: dict[str, Any] = field(default_factory=dict)
+    seq_idx: int = 0

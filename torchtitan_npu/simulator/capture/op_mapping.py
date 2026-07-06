@@ -55,6 +55,8 @@ OP_MAPPING: dict[str, str] = {
     "comm.reduce_scatter": "reduce_scatter",
     "comm.all_to_all": "all_to_all",
     "comm.broadcast": "broadcast",
+    "comm.p2p_send": "p2p_send",
+    "comm.p2p_recv": "p2p_recv",
 }
 
 

@@ -11,7 +11,7 @@ from __future__ import annotations
 import uuid
 
 from torchtitan_npu.simulator.capture.comm_events import CommEvent
-from torchtitan_npu.simulator.ir.schedule_graph import DataPass, ScheduleGraph, StepInstance, TensorSlot
+from torchtitan_npu.simulator.ir.schedule_graph import DataPass, ScheduleGraph, StepInstance, TensorSlot, TimelineEntry
 from torchtitan_npu.simulator.ir.step_graph import StepGraph
 from torchtitan_npu.simulator.rank_table import RankTable
 
@@ -25,17 +25,10 @@ def build_schedule_graph(
     num_micro_batches: int = 1,
     gradient_accumulation: int = 1,
 ) -> ScheduleGraph:
-    """Build one StepInstance per logical rank per step template -- all
-    ranks share the captured templates (forward/backward/optimizer) when
-    `pipeline_parallel_degree == 1` (the acceptance config's case; see
-    design doc §5.5 for the general per-pipeline-stage template note, out
-    of scope for this task) -- plus one DataPass per communication-group
-    member pair for every recorded CommEvent whose `group_name` resolves
-    to a known RankTable dimension.
-    """
-    # Create instances for every step template (forward/backward/optimizer),
-    # not just the first one. Each rank gets one instance per template so
-    # the L2 schedule represents the full forward→backward→optimizer flow.
+    """Build L2 ScheduleGraph from captured L1 templates, RankTable, and
+    communication events.  All timeline information comes from capture
+    (seq_idx, P2P context), not from inference."""
+    # Create instances for every step template per rank
     instances: list[StepInstance] = []
     for rank in range(rank_table.world_size):
         coords = rank_table.rank_coordinates.get(rank, {})
@@ -52,42 +45,134 @@ def build_schedule_graph(
                 )
             )
 
+    # Build DataPasses from comm events
     data_passes: list[DataPass] = []
     for event in comm_events:
-        dim_name = rank_table.dim_by_group_name.get(event.group_name)
-        # Use the comm_dim from the event if available (more specific than
-        # the rank_table lookup, which may return None for group_name="default")
-        if not dim_name and event.comm_dim:
-            dim_name = event.comm_dim
-        # Determine which rank groups participate in this communication
-        if event.comm_ranks:
-            groups = event.comm_ranks
-        else:
-            groups = rank_table.process_groups.get(dim_name, []) if dim_name else []
-        for group in groups:
-            if len(group) < 2:
+        if event.comm_primitive in ("p2p_send", "p2p_recv"):
+            # P2P communication (pipeline parallelism): one-to-one transfer
+            # Only create a DataPass for p2p_send (avoid duplicating with p2p_recv)
+            if event.comm_primitive != "p2p_send":
                 continue
+            # Determine src and dst ranks from P2P context
+            # p2p_peer_rank is the destination (for send) or source (for recv)
+            # We need the sender's rank: it's the rank that issued the isend.
+            # Under fake PG all ranks run in one process, so the "sender" is
+            # the current rank (rank 0 in the fake PG).  The peer_rank is the
+            # destination.  For a more accurate model, we use the PP stage
+            # info: stage N sends to stage N+1 (forward) or N-1 (backward).
+            src_stage = event.p2p_stage
+            if "forward" in event.p2p_direction:
+                dst_stage = src_stage + 1
+            else:
+                dst_stage = src_stage - 1
+            # Find a representative rank for each stage
+            src_rank = -1
+            dst_rank = event.p2p_peer_rank
+            for r in range(rank_table.world_size):
+                coords = rank_table.rank_coordinates.get(r, {})
+                if coords.get("pp", -1) == src_stage:
+                    src_rank = r
+                    break
             slot = TensorSlot(
-                name=f"{event.comm_primitive}_{event.event_id}",
-                src_exit_op=event.op_id,
-                dst_entry_op=event.op_id,
+                name=f"p2p_{event.p2p_direction}_{event.event_id}",
                 shape=event.tensor_shape,
                 dtype=event.dtype,
                 volume_bytes=event.volume_bytes,
+                src_exit_op=event.op_id,
+                dst_entry_op=event.op_id,
             )
-            for i, src_rank in enumerate(group):
-                for dst_rank in group[i + 1 :]:
-                    data_passes.append(
-                        DataPass(
-                            src_instance=f"rank{src_rank}",
-                            dst_instance=f"rank{dst_rank}",
-                            slots=[slot],
-                            src_device=src_rank,
-                            dst_device=dst_rank,
-                            requires_communication=True,
-                            comm_primitive=event.comm_primitive,
+            data_passes.append(
+                DataPass(
+                    src_instance=f"rank{src_rank}",
+                    dst_instance=f"rank{dst_rank}",
+                    slots=[slot],
+                    src_device=src_rank,
+                    dst_device=dst_rank,
+                    requires_communication=True,
+                    comm_primitive=f"p2p_{event.p2p_direction}",
+                )
+            )
+        else:
+            # Collective communication (FSDP/TP/EP): all-to-all within group
+            dim_name = rank_table.dim_by_group_name.get(event.group_name)
+            if not dim_name and event.comm_dim:
+                dim_name = event.comm_dim
+            if event.comm_ranks:
+                groups = event.comm_ranks
+            else:
+                groups = rank_table.process_groups.get(dim_name, []) if dim_name else []
+            for group in groups:
+                if len(group) < 2:
+                    continue
+                slot = TensorSlot(
+                    name=f"{event.comm_primitive}_{event.event_id}",
+                    shape=event.tensor_shape,
+                    dtype=event.dtype,
+                    volume_bytes=event.volume_bytes,
+                    src_exit_op=event.op_id,
+                    dst_entry_op=event.op_id,
+                )
+                for i, src_rank in enumerate(group):
+                    for dst_rank in group[i + 1 :]:
+                        data_passes.append(
+                            DataPass(
+                                src_instance=f"rank{src_rank}",
+                                dst_instance=f"rank{dst_rank}",
+                                slots=[slot],
+                                src_device=src_rank,
+                                dst_device=dst_rank,
+                                requires_communication=True,
+                                comm_primitive=event.comm_primitive,
+                            )
                         )
-                    )
+
+    # Build execution_timeline from captured L0 OpNodes' seq_idx
+    # All ranks share the same template, so we use rank 0's seq_idx as
+    # the representative timeline.  For PP, the P2P events carry their
+    # own stage/mb context.
+    execution_timeline: list[TimelineEntry] = []
+    for template_id, template in step_templates.items():
+        for op_id, node in template.nodes.items():
+            ann = node.annotations
+            phase = ann.get("phase", template.step_type)
+            comm_type = ""
+            comm_peer = -1
+            # Check if this op is a communication op
+            raw = ann.get("raw_op_type", "")
+            if raw.startswith("comm."):
+                # Find the matching CommEvent for P2P info
+                for ev in comm_events:
+                    if ev.op_id == op_id:
+                        if ev.p2p_direction:
+                            comm_type = ev.p2p_direction
+                            comm_peer = ev.p2p_peer_rank
+                        else:
+                            comm_type = ev.comm_primitive
+                        break
+            execution_timeline.append(
+                TimelineEntry(
+                    seq_idx=node.seq_idx,
+                    op_id=op_id,
+                    rank=0,  # representative rank
+                    pipeline_stage=-1,  # filled from PP context if available
+                    micro_batch_idx=-1,
+                    phase=phase,
+                    comm_type=comm_type,
+                    comm_peer_rank=comm_peer,
+                )
+            )
+    # Sort by seq_idx (execution order)
+    execution_timeline.sort(key=lambda e: e.seq_idx)
+
+    # For P2P comm events, fill in pipeline_stage and micro_batch_idx
+    # from the CommEvent's captured PP context
+    for entry in execution_timeline:
+        if entry.comm_type:
+            for ev in comm_events:
+                if ev.op_id == entry.op_id and ev.p2p_direction:
+                    entry.pipeline_stage = ev.p2p_stage
+                    entry.micro_batch_idx = ev.p2p_mb_idx
+                    break
 
     dp_degree = rank_table.dim_degrees.get("dp_replicate", 1) * rank_table.dim_degrees.get(
         "fsdp", rank_table.dim_degrees.get("dp_shard", 1)
@@ -105,5 +190,6 @@ def build_schedule_graph(
         num_micro_batches=num_micro_batches,
         pipeline_schedule=pipeline_schedule,
         gradient_accumulation=gradient_accumulation,
+        execution_timeline=execution_timeline,
         annotations={"rank_table": rank_table.to_dict()},
     )

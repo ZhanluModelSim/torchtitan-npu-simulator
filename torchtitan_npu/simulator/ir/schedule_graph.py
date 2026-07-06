@@ -15,6 +15,20 @@ from torchtitan_npu.simulator.ir.step_graph import StepGraph
 
 
 @dataclass
+class TimelineEntry:
+    """One op's position in the execution timeline, captured (not inferred)."""
+
+    seq_idx: int           # global execution sequence number (from capture)
+    op_id: int             # L0 OpNode ID
+    rank: int              # which rank executed this op
+    pipeline_stage: int    # PP stage (-1 if not PP)
+    micro_batch_idx: int   # microbatch index (-1 if not PP)
+    phase: str             # "forward" / "backward" / "optimizer" / "comm"
+    comm_type: str = ""    # "fwd_send" / "fwd_recv" / "bwd_send" / "bwd_recv" / "allgather" / ...
+    comm_peer_rank: int = -1  # for P2P: peer rank
+
+
+@dataclass
 class StepInstance:
     """One concrete execution of a StepGraph template."""
 
@@ -75,6 +89,7 @@ class ScheduleGraph:
     gradient_accumulation: int = 1
     zero_stage: int = 0
     timeline: list = field(default_factory=list)
+    execution_timeline: list[TimelineEntry] = field(default_factory=list)
     annotations: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:

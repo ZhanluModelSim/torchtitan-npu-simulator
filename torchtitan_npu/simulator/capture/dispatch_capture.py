@@ -26,6 +26,7 @@ from torchtitan_npu.simulator.ir.op_node import OpNode
 from torchtitan_npu.simulator.ir.tensor_meta import TensorMeta
 
 _id_counter = itertools.count()
+_seq_counter = itertools.count()
 
 
 def _next_op_id() -> int:
@@ -64,6 +65,7 @@ class _RawEvent:
     repeat_count: int = 1
     comm_dim: str = ""
     comm_ranks_str: str = ""
+    seq_idx: int = 0
 
 
 def _shape_signature(event: _RawEvent) -> tuple:
@@ -151,6 +153,7 @@ class OpDispatchCapture(TorchDispatchMode):
             predecessors=predecessors,
             module_path=module_path,
             phase=phase,
+            seq_idx=next(_seq_counter),
         )
         signature = _shape_signature(candidate)
 
@@ -208,6 +211,7 @@ class OpDispatchCapture(TorchDispatchMode):
                 param_mem=cost.param_mem,
                 comm_bytes=cost.comm_bytes,
                 annotations=annotations,
+                seq_idx=event.seq_idx,
             )
         for op_id, node in nodes.items():
             for pred_id in node.predecessors:

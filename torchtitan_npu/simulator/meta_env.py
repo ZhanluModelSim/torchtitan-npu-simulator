@@ -184,7 +184,15 @@ _original_redistribute_local_tensor: Any = _MISSING
 _original_recv_object_list: Any = _MISSING
 _original_send_object_list: Any = _MISSING
 _original_torch_equal: Any = _MISSING
+_original_fwd_one_chunk: Any = _MISSING
+_original_bwd_one_chunk: Any = _MISSING
 _patched = False
+
+# Pipeline parallel execution context, updated by patched
+# PipelineStage.forward_one_chunk / backward_one_chunk so that
+# comm_events.py's P2P interceptors can attribute isend/irecv calls
+# to the correct microbatch, phase, and stage.
+_pp_context: dict[str, int | str] = {"mb_idx": 0, "phase": "forward", "stage": 0}
 
 
 def _patch_tensor_npu_method_to_meta() -> None:
@@ -976,6 +984,42 @@ def _patch_torch_equal_for_meta() -> None:
     torch.equal = _meta_safe_equal
 
 
+def _patch_pipeline_stage_for_pp_context() -> None:
+    """Patch PipelineStage.forward_one_chunk / backward_one_chunk to
+    update the global ``_pp_context`` dict with the current microbatch
+    index, phase (forward/backward), and stage index.  This lets
+    comm_events.py's P2P interceptors attribute isend/irecv calls to
+    the correct microbatch and phase without inspecting the call stack.
+
+    All PP schedule types (1F1B, GPipe, DualPipe, etc.) go through
+    these two methods, so one patch covers every schedule variant."""
+    global _original_fwd_one_chunk, _original_bwd_one_chunk
+    try:
+        from torch.distributed.pipelining.stage import PipelineStage
+    except Exception:
+        return
+
+    if _original_fwd_one_chunk is not _MISSING:
+        return
+    _original_fwd_one_chunk = PipelineStage.forward_one_chunk
+    _original_bwd_one_chunk = PipelineStage.backward_one_chunk
+
+    def _patched_fwd_one_chunk(self, mb_idx, *args, **kwargs):  # noqa: ANN001
+        _pp_context["mb_idx"] = mb_idx
+        _pp_context["phase"] = "forward"
+        _pp_context["stage"] = self.stage_index
+        return _original_fwd_one_chunk(self, mb_idx, *args, **kwargs)
+
+    def _patched_bwd_one_chunk(self, mb_idx, *args, **kwargs):  # noqa: ANN001
+        _pp_context["mb_idx"] = mb_idx
+        _pp_context["phase"] = "backward"
+        _pp_context["stage"] = self.stage_index
+        return _original_bwd_one_chunk(self, mb_idx, *args, **kwargs)
+
+    PipelineStage.forward_one_chunk = _patched_fwd_one_chunk
+    PipelineStage.backward_one_chunk = _patched_bwd_one_chunk
+
+
 def patch_device_type_to_meta() -> None:
     """Idempotently rebind `device_type="meta"` / `device_module=<stub>`
     across every module that imported them by value at load time, register
@@ -1043,6 +1087,7 @@ def patch_device_type_to_meta() -> None:
     _patch_redistribute_local_tensor_for_meta()
     _patch_object_collectives_for_fake_pg()
     _patch_pipeline_stage_meta_exchange_for_fake_pg()
+    _patch_pipeline_stage_for_pp_context()
     _patch_torch_equal_for_meta()
     _patched = True
 

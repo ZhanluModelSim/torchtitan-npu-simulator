@@ -56,7 +56,11 @@ class _SimHcPreFn(torch.autograd.Function):
         h_pre = _empty_like_shape((B, S, hc_mult), x_flat)
         h_post = _empty_like_shape((B, S, hc_mult), x_flat)
         h_res = _empty_like_shape((B, S, hc_mult, hc_mult), x_flat)
-        _record("triton.hc_pre_fwd", [x_proj, hc_scale, hc_base], [h_pre, h_post, h_res], module_path)
+        # The real hc_pre_fwd() calls two separate Triton kernels:
+        # 1) _triton_hc_prepost_fwd_kernel: computes pre/post (sigmoid)
+        # 2) _triton_hc_sinkhorn_comb_fwd_kernel: computes comb (sinkhorn)
+        _record("triton._triton_hc_prepost_fwd_kernel", [x_proj, hc_scale, hc_base], [h_pre, h_post], module_path)
+        _record("triton._triton_hc_sinkhorn_comb_fwd_kernel", [x_proj, hc_scale, hc_base], [h_res], module_path)
 
         x_unflatten = x.unflatten(dim=-1, sizes=(hc_mult, D))
         y = torch.empty((B, S, D), dtype=dtype, device=x.device)
@@ -85,10 +89,33 @@ class _SimHcPreFn(torch.autograd.Function):
         grad_x_proj = _empty_like_shape((B, S, total), h_pre)
         grad_branch_alpha = torch.empty_like(hc_scale)
         grad_branch_beta = torch.empty_like(hc_base)
+        # The real hc_pre_bwd() calls four Triton kernels:
+        # 1) _triton_hc_prepost_bwd_kernel: pre/post backward
+        # 2) _triton_hc_prepost_bwd_dst_reduce_kernel: reduce pre/post grads
+        # 3) _triton_hc_sinkhorn_comb_bwd_kernel: comb (sinkhorn) backward
+        # 4) _triton_hc_sinkhorn_comb_bwd_dst_reduce_kernel: reduce comb grads
         _record(
-            "triton.hc_pre_bwd",
+            "triton._triton_hc_prepost_bwd_kernel",
             [grad_h_pre, grad_h_post, grad_h_res, x, hc_scale, hc_base],
             [grad_x_proj, grad_branch_alpha, grad_branch_beta],
+            ctx.module_path,
+        )
+        _record(
+            "triton._triton_hc_prepost_bwd_dst_reduce_kernel",
+            [grad_branch_alpha, grad_branch_beta],
+            [grad_branch_alpha, grad_branch_beta],
+            ctx.module_path,
+        )
+        _record(
+            "triton._triton_hc_sinkhorn_comb_bwd_kernel",
+            [grad_h_res, grad_h_res, hc_scale, hc_base],
+            [grad_x_proj, grad_branch_alpha, grad_branch_beta],
+            ctx.module_path,
+        )
+        _record(
+            "triton._triton_hc_sinkhorn_comb_bwd_dst_reduce_kernel",
+            [grad_branch_alpha, grad_branch_beta],
+            [grad_branch_alpha, grad_branch_beta],
             ctx.module_path,
         )
 
@@ -141,7 +168,7 @@ class _SimHcHeadFn(torch.autograd.Function):
         # HcHead.__init__'s actual nn.Parameter allocations.
         mixes = _empty_like_shape((B, S, hc_mult), x)
         h_pre = _empty_like_shape((B, S, hc_mult), x)
-        _record("triton.hc_pre_only_fwd", [mixes, hc_head_scale, hc_head_base], [h_pre], module_path)
+        _record("triton._triton_hc_preonly_fwd_kernel", [mixes, hc_head_scale, hc_head_base], [h_pre], module_path)
 
         x_unflatten = x.unflatten(dim=-1, sizes=(hc_mult, D))
         y = torch.empty((B, S, D), dtype=dtype, device=x.device)
@@ -169,10 +196,19 @@ class _SimHcHeadFn(torch.autograd.Function):
         grad_x_proj = _empty_like_shape((B, S, hc_mult), h_pre)
         grad_branch_alpha = torch.empty_like(hc_head_scale)
         grad_branch_beta = torch.empty_like(hc_head_base)
+        # hc_pre_only_bwd calls two kernels:
+        # 1) _triton_hc_preonly_bwd_kernel: main backward
+        # 2) _triton_hc_preonly_bwd_dst_reduce_kernel: reduce grads
         _record(
-            "triton.hc_pre_only_bwd",
+            "triton._triton_hc_preonly_bwd_kernel",
             [grad_h_pre, x, hc_head_scale, hc_head_base],
             [grad_x_proj, grad_branch_alpha, grad_branch_beta],
+            ctx.module_path,
+        )
+        _record(
+            "triton._triton_hc_preonly_bwd_dst_reduce_kernel",
+            [grad_branch_alpha, grad_branch_beta],
+            [grad_branch_alpha, grad_branch_beta],
             ctx.module_path,
         )
 
@@ -222,11 +258,11 @@ class _SimHcPostFn(torch.autograd.Function):
         dtype = x.dtype
 
         bmm1 = torch.empty((B, S, N, D), dtype=torch.float32, device=x.device)
-        _record("triton.hc_post_bmm1_forward", [x, h_post], [bmm1], module_path)
+        _record("triton._triton_hc_post_bmm1_fwd_kernel", [x, h_post], [bmm1], module_path)
 
         residual_unflat = residual.view(B, S, N, D)
         bmm2 = torch.empty((B, S, N, D), dtype=torch.float32, device=x.device)
-        _record("triton.hc_post_bmm2_forward", [h_res, residual_unflat], [bmm2], module_path)
+        _record("triton._triton_hc_post_bmm2_fwd_kernel", [h_res, residual_unflat], [bmm2], module_path)
 
         result_flat = torch.empty((B * S, N * D), dtype=torch.float32, device=x.device)
         _record(
@@ -250,13 +286,19 @@ class _SimHcPostFn(torch.autograd.Function):
 
         grad_x = torch.empty((B, S, D), dtype=torch.float32, device=x.device)
         grad_h_post = torch.empty((B, S, N), dtype=torch.float32, device=x.device)
-        _record("triton.hc_post_bmm1_backward", [x, h_post, grad_out_4d], [grad_x, grad_h_post], ctx.module_path)
+        _record("triton._triton_hc_post_bmm1_bwd_fused_kernel", [x, h_post, grad_out_4d], [grad_x, grad_h_post], ctx.module_path)
 
         residual_unflat = residual.view(B, S, N, D)
         grad_h_res = torch.empty((B, S, N, N), dtype=torch.float32, device=x.device)
         grad_residual_unflat = torch.empty((B, S, N, D), dtype=torch.float32, device=x.device)
         _record(
-            "triton.hc_post_bmm2_backward",
+            "triton._triton_hc_post_bmm2_bwd_dx_kernel",
+            [h_res, residual_unflat, grad_out_4d],
+            [grad_h_res, grad_residual_unflat],
+            ctx.module_path,
+        )
+        _record(
+            "triton._triton_hc_post_bmm2_bwd_dh_kernel",
             [h_res, residual_unflat, grad_out_4d],
             [grad_h_res, grad_residual_unflat],
             ctx.module_path,
