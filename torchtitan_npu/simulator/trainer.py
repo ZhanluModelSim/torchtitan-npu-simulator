@@ -253,6 +253,6 @@ class SimulationTrainer(Trainer):
         if "csv" in formats:
             export_kernel_summary_csv(
                 self.workload_graph,
-                os.path.join(out_dir, "kernel_summary.csv"),
+                os.path.join(out_dir, "kernel_summary"),
                 max_ranks=self.simulation_config.csv_max_ranks,
             )

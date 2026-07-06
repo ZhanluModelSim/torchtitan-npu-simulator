@@ -248,11 +248,11 @@ cat simulator_output/deepseek_v4_pro_61_layers/summary.txt
 | `trace.html` | 自包含 HTML | 可视化页面：L3 卡片 + L2 RankTable 网格与调度泳道 + L1 步骤汇总 + L0 算子 DAG |
 | `compute_graph.dot` | Graphviz | 算子依赖图，可用 `dot -Tsvg compute_graph.dot -o graph.svg` 渲染 |
 | `simulation_result.json` | JSON | 完整四层 IR 结构化数据，供程序化消费 |
-| `kernel_summary.csv` | CSV | 按 Rank 拆分、按拓扑序排列的逐算子明细（见下文） |
+| `kernel_summary/` | CSV 目录 | 按 Rank 拆分为多个文件（`rank_0.csv`、`rank_1.csv`、...），每个文件按拓扑序排列该 rank 的全部算子（见下文） |
 
-### kernel_summary.csv 说明
+### kernel_summary/ 说明
 
-将 L0-L3 的所有图节点按 **Rank 拆分** → **拓扑序排列**（拓扑序相同时以 op_id 升序）后输出为 CSV，每行一个算子：
+将 L0-L3 的所有图节点按 **Rank 拆分为独立文件**（`rank_0.csv`、`rank_1.csv`、...），每个文件内按**拓扑序排列**（拓扑序相同时以 op_id 升序），每行一个算子：
 
 | 列 | 说明 |
 |----|------|
