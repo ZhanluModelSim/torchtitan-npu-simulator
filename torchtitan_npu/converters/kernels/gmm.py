@@ -10,10 +10,13 @@
 # LICENSE file in the root directory of this source tree.
 
 import logging
+from collections.abc import Callable
 
 import torch
 import torch_npu
 from torch import nn
+from torch._functorch.partitioners import default_partition
+from torch._inductor.custom_graph_pass import CustomPartitionerFn
 from torch.distributed.tensor import DTensor
 from torchtitan.models.common.moe import GroupedExperts
 
@@ -28,6 +31,8 @@ from torchtitan_npu.tools.weight_utils import _split_w13_for_mapping, fuse_exper
 
 logger = logging.getLogger(__name__)
 
+_GROUPED_MM_INT32_OFFSET_MAX = torch.iinfo(torch.int32).max
+
 # Calculate the number of experts and EP degree, which are used as parameters
 # when invoking operators during Hifloat8 low-precision training.
 group_size_params = {
@@ -35,6 +40,50 @@ group_size_params = {
     "expert_model_parallel_size": None,
     "g_size": None,
 }
+
+
+class _NpuGmmAotDefaultPartitioner(CustomPartitionerFn):
+    def __call__(
+        self,
+        gm,
+        joint_inputs,
+        *,
+        compiler=None,
+        static_lifetime_input_indices=None,
+        **kwargs,
+    ):
+        # AOTAutograd's default partition keeps clamp-gradient masks in backward;
+        # Inductor's min-cut partitioner may pull them into the forward GMM path.
+        return default_partition(
+            gm,
+            joint_inputs,
+            static_lifetime_input_indices=static_lifetime_input_indices,
+            **kwargs,
+        )
+
+    def uuid(self):
+        # Separate compile-cache entries from graphs built with another partitioner.
+        return "npu_gmm_aot_default_partition"
+
+
+def compile_grouped_mm(fn: Callable[..., torch.Tensor], *, backend: str) -> Callable[..., torch.Tensor]:
+    return torch.compile(
+        fn,
+        backend=backend,
+        fullgraph=True,
+        options={"custom_partitioner_fn": _NpuGmmAotDefaultPartitioner()},
+    )
+
+
+def _validate_grouped_mm_offsets_int32_range(x: torch.Tensor) -> None:
+    num_routed_tokens = x.shape[0]
+    if num_routed_tokens > _GROUPED_MM_INT32_OFFSET_MAX:
+        raise ValueError(
+            "npu_gmm compile requires int32 grouped_mm offsets; "
+            f"this rank has {num_routed_tokens} routed rows in one GMM call, "
+            f"above the int32 limit {_GROUPED_MM_INT32_OFFSET_MAX}. "
+            "Reduce the per-rank MoE workload."
+        )
 
 
 def _run_experts_grouped_mm(
@@ -46,7 +95,9 @@ def _run_experts_grouped_mm(
     swiglu_limit: float | None = None,
     routed_scores: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int64)
+    _validate_grouped_mm_offsets_int32_range(x)
+    # npu_gmm compile requires int32 offsets; the range check above prevents overflow.
+    offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
     if w13 is None:
         raise ValueError("w13 cannot be None for grouped_mm experts")
     h = torch._grouped_mm(x.bfloat16(), w13.bfloat16().transpose(-2, -1), offs=offsets)

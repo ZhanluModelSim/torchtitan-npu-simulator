@@ -44,7 +44,6 @@ from torchtitan.distributed.expert_parallel import (
 )
 from torchtitan.distributed.tensor_parallel import NoParallel, maybe_enable_async_tp
 from torchtitan.models.common import FlexAttention, VarlenAttention
-from torchtitan.models.common import moe as moe_module
 from torchtitan.models.llama3.parallelize import apply_replicate
 from torchtitan.models.llama4.parallelize import apply_fsdp
 
@@ -908,33 +907,44 @@ def _compile_children_except(
         )
 
 
+_NPU_GMM_COMPILED_ATTR = "_npu_gmm_compiled"
+_NPU_GMM_FN_ATTR = "_run_experts_grouped_mm"
+_TORCH_DYNAMO_ATTR = "_dynamo"
+
+
 def _patch_grouped_mm_compile(compile_config, ep_enabled: bool) -> None:
-    already_patched = "_run_experts_grouped_mm_dynamic" in moe_module._run_experts_grouped_mm.__qualname__
-    if already_patched:
+    from torchtitan_npu.converters.kernels import gmm as gmm_module
+
+    grouped_mm = getattr(gmm_module, _NPU_GMM_FN_ATTR)
+    if getattr(grouped_mm, _NPU_GMM_COMPILED_ATTR, False):
         return
 
-    moe_module._run_experts_grouped_mm = torch.compile(
-        moe_module._run_experts_grouped_mm,
-        backend=compile_config.backend,
-        fullgraph=True,
-    )
-    if not ep_enabled:
-        return
+    compiled_fn = gmm_module.compile_grouped_mm(grouped_mm, backend=compile_config.backend)
+    maybe_mark_dynamic = getattr(torch, _TORCH_DYNAMO_ATTR).maybe_mark_dynamic
 
-    compiled_fn = moe_module._run_experts_grouped_mm
-
-    # Keep function logic in sync with the `already_patched` check above.
-    def _run_experts_grouped_mm_dynamic(
-        w1: torch.Tensor,
+    def _run_experts_grouped_mm_compiled(
+        w13: torch.Tensor | None,
         w2: torch.Tensor,
-        w3: torch.Tensor,
+        _w3: torch.Tensor | None,
         x: torch.Tensor,
         num_tokens_per_expert: torch.Tensor,
+        swiglu_limit: float | None = None,
+        routed_scores: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        torch._dynamo.mark_dynamic(x, 0)
-        return compiled_fn(w1, w2, w3, x, num_tokens_per_expert)
+        if ep_enabled:
+            maybe_mark_dynamic(x, 0)
+        return compiled_fn(
+            w13,
+            w2,
+            _w3,
+            x,
+            num_tokens_per_expert,
+            swiglu_limit,
+            routed_scores,
+        )
 
-    moe_module._run_experts_grouped_mm = _run_experts_grouped_mm_dynamic
+    setattr(_run_experts_grouped_mm_compiled, _NPU_GMM_COMPILED_ATTR, True)
+    setattr(gmm_module, _NPU_GMM_FN_ATTR, _run_experts_grouped_mm_compiled)
 
 
 def apply_compile(model: nn.Module, compile_config, ep_enabled: bool):
