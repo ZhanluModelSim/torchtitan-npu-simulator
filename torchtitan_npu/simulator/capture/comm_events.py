@@ -37,7 +37,7 @@ class CommEvent:
     tensor_shape: tuple[int, ...]
     dtype: str
     volume_bytes: int
-    op_id: str = ""  # L0 OpNode ID if this event was also recorded as a synthetic op
+    op_id: int = 0  # L0 OpNode ID if this event was also recorded as a synthetic op
     comm_dim: str = ""  # parallel dimension name (e.g. "tp", "ep", "fsdp")
     comm_ranks: list[list[int]] = field(default_factory=list)  # groups of ranks in this comm domain, e.g. [[0,1,2,3],[4,5,6,7]]
 

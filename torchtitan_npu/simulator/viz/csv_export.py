@@ -26,7 +26,7 @@ from torchtitan_npu.simulator.capture.op_mapping import display_op_label
 from torchtitan_npu.simulator.ir.workload_graph import WorkloadGraph
 
 
-def _topo_sort(nodes: dict) -> list[str]:
+def _topo_sort(nodes: dict[int, OpNode]) -> list[int]:
     """Return op_ids in topological order (Kahn's algorithm).  Ties broken
     by op_id ascending.  External predecessors (not in ``nodes``) are
     treated as already-satisfied, mirroring ``_check_acyclic``."""

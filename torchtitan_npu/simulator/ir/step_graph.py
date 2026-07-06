@@ -14,7 +14,7 @@ from typing import Any
 from torchtitan_npu.simulator.ir.op_node import OpNode
 
 
-def _compute_entry_exit(nodes: dict[str, OpNode]) -> tuple[list[str], list[str]]:
+def _compute_entry_exit(nodes: dict[int, OpNode]) -> tuple[list[int], list[int]]:
     """Entry nodes have no predecessors *within this graph*. A predecessor
     absent from `nodes` is external to this StepGraph -- e.g. a
     backward-phase op referencing a forward-phase activation, or an
@@ -28,7 +28,7 @@ def _compute_entry_exit(nodes: dict[str, OpNode]) -> tuple[list[str], list[str]]
     return entry, exit_
 
 
-def _check_acyclic(nodes: dict[str, OpNode]) -> bool:
+def _check_acyclic(nodes: dict[int, OpNode]) -> bool:
     """Kahn's algorithm restricted to in-graph edges: a predecessor that is
     not itself a key of `nodes` is external to this StepGraph and is
     treated as an already-satisfied prerequisite (not counted toward
@@ -56,7 +56,7 @@ def _check_acyclic(nodes: dict[str, OpNode]) -> bool:
 class StepGraph:
     step_id: str
     step_type: str
-    nodes: dict[str, OpNode]
+    nodes: dict[int, OpNode]
     entry_nodes: list[str] = field(default_factory=list)
     exit_nodes: list[str] = field(default_factory=list)
     tensor_lifetimes: dict[str, int] = field(default_factory=dict)

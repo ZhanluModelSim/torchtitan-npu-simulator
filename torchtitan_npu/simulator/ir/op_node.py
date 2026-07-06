@@ -20,7 +20,7 @@ from torchtitan_npu.simulator.ir.tensor_meta import TensorMeta
 class OpNode:
     """A single normalized operator invocation captured during a train step."""
 
-    op_id: str
+    op_id: int
     op_type: str
     inputs: list[TensorMeta]
     outputs: list[TensorMeta]

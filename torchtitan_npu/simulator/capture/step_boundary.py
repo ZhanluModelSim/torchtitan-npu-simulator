@@ -85,7 +85,7 @@ class StepBoundaryTracker:
         self.current_phase = phase
 
 
-def build_step_graphs(nodes: dict[str, OpNode]) -> dict[str, StepGraph]:
+def build_step_graphs(nodes: dict[int, OpNode]) -> dict[str, StepGraph]:
     """Bucket OpNodes into forward/backward/optimizer StepGraphs using each
     node's `annotations["phase"]` (defaults to `"forward"` if the tag is
     missing, e.g. a node captured without a `phase_provider`)."""

@@ -25,6 +25,15 @@ def _record(raw_op_type: str, inputs: list[torch.Tensor], outputs: list[torch.Te
         capture.record_synthetic_op(raw_op_type, inputs=inputs, outputs=outputs, module_path=module_path)
 
 
+def _current_module_path() -> str:
+    """Get the current module path from the active capture's tracker,
+    falling back to empty string if no tracker is active."""
+    capture = get_active_capture()
+    if capture is not None and capture.module_path_tracker is not None:
+        return capture.module_path_tracker.current_path()
+    return ""
+
+
 class _SimSparseAttnFn(torch.autograd.Function):
     @staticmethod
     def forward(ctx, query, ori_kv, cmp_kv, cmp_sparse_indices, sinks, module_path):  # noqa: ANN001
@@ -86,7 +95,7 @@ class SimNpuSparseAttention(SparseAttention):
         ori_kv = kv_states.unsqueeze(2).contiguous()
         cmp_kv = kv_compress.unsqueeze(2).contiguous() if kv_compress is not None else None
         cmp_sparse_indices = compress_topk_idxs.unsqueeze(2).contiguous() if self.compress_ratio == 4 else None
-        module_path = self.__class__.__name__
+        module_path = _current_module_path()
         result = _SimSparseAttnFn.apply(
             query_states.contiguous(), ori_kv, cmp_kv, cmp_sparse_indices, attn_sink.float(), module_path
         )
@@ -127,7 +136,7 @@ class SimNpuLiCompute(LiCompute):
         q_indexer = q_indexer.to(torch.bfloat16)
         k_indexer = k_indexer.to(torch.bfloat16).unsqueeze(2)
         weights = weights.to(torch.bfloat16)
-        module_path = self.__class__.__name__
+        module_path = _current_module_path()
         compress_topk_idxs, index_score = _SimLightningIndexerFn.apply(q_indexer, k_indexer, weights, self.index_topk, module_path)
         compress_topk_idxs = _add_offset_to_valid_sparse_indices(compress_topk_idxs, offset)
         return compress_topk_idxs, index_score
@@ -184,7 +193,7 @@ class SimNpuLiLoss(LiLoss):
         key = kv_compress.unsqueeze(2)
         key_index = k_indexer.unsqueeze(2)
         sparse_indices = sparse_indices.unsqueeze(2)
-        module_path = self.__class__.__name__
+        module_path = _current_module_path()
         loss = _SimLiLossFn.apply(q, key, q_indexer, key_index, weights, sparse_indices, module_path)
         self.save_loss(loss)
         return loss

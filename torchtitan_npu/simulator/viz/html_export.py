@@ -42,7 +42,7 @@ def _normalize_module_path(path: str) -> str:
     return _NUMERIC_SEGMENT.sub(".N", path)
 
 
-def _topo_sort(nodes: dict[str, OpNode]) -> list[str]:
+def _topo_sort(nodes: dict[int, OpNode]) -> list[int]:
     in_degree = {op_id: sum(1 for p in node.predecessors if p in nodes) for op_id, node in nodes.items()}
     ready = sorted(op_id for op_id, deg in in_degree.items() if deg == 0)
     queue: deque[str] = deque(ready)
@@ -91,7 +91,7 @@ def _is_comm_op(ann: dict) -> bool:
     return ann.get("raw_op_type", "").startswith("comm.")
 
 
-def _render_l0_op_row(op_id: str, node: OpNode, topo_idx: int) -> str:
+def _render_l0_op_row(op_id: int, node: OpNode, topo_idx: int) -> str:
     ann = node.annotations
     label = display_op_label(node.op_type, ann)
     raw = ann.get("raw_op_type", "")
@@ -105,7 +105,7 @@ def _render_l0_op_row(op_id: str, node: OpNode, topo_idx: int) -> str:
     return (
         f"<tr class='{cls}'>"
         f"<td class='num'>{topo_idx}</td>"
-        f"<td><code>{html.escape(op_id)}</code></td>"
+        f"<td><code>{op_id}</code></td>"
         f"<td class='op-type'>{html.escape(label)}</td>"
         f"<td class='raw'>{html.escape(raw)}</td>"
         f"<td class='mono'>{html.escape(_shapes_str(node.inputs))}</td>"
@@ -171,8 +171,8 @@ def _render_l2_datapasses(schedule) -> str:
             f"<td>{html.escape(dp.src_instance)}</td>"
             f"<td>{html.escape(dp.dst_instance)}</td>"
             f"<td>{html.escape(dp.comm_primitive)}</td>"
-            f"<td><code>{html.escape(src_op)}</code></td>"
-            f"<td><code>{html.escape(dst_op)}</code></td>"
+            f"<td><code>{src_op}</code></td>"
+            f"<td><code>{dst_op}</code></td>"
             f"<td class='mono'>{slot_info}</td>"
             f"</tr>"
         )

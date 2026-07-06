@@ -33,11 +33,11 @@ class TensorSlot:
     """A named tensor transferred between two StepInstances."""
 
     name: str
-    src_exit_op: str
-    dst_entry_op: str
     shape: tuple[int | str, ...]
     dtype: str
     volume_bytes: int
+    src_exit_op: int = 0
+    dst_entry_op: int = 0
     is_incremental: bool = False
 
 

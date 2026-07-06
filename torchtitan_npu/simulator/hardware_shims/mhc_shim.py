@@ -23,6 +23,15 @@ def _record(raw_op_type: str, inputs: list[torch.Tensor], outputs: list[torch.Te
         capture.record_synthetic_op(raw_op_type, inputs=inputs, outputs=outputs, module_path=module_path)
 
 
+def _current_module_path() -> str:
+    """Get the current module path from the active capture's tracker,
+    falling back to empty string if no tracker is active."""
+    capture = get_active_capture()
+    if capture is not None and capture.module_path_tracker is not None:
+        return capture.module_path_tracker.current_path()
+    return ""
+
+
 def _empty_like_shape(shape: tuple[int, ...], ref: torch.Tensor) -> torch.Tensor:
     return torch.empty(shape, dtype=ref.dtype, device=ref.device)
 
@@ -108,7 +117,7 @@ class SimHcPre(HcPre):
 
     def forward(self, x: torch.Tensor, hc_fn: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor):
         x = x.flatten(2)
-        module_path = self.__class__.__name__
+        module_path = _current_module_path()
         return _SimHcPreFn.apply(x, hc_fn, hc_scale, hc_base, self.hc_mult, module_path)
 
 
@@ -200,7 +209,7 @@ class SimHcHead(HcHead):
 
     def forward(self, x: torch.Tensor):
         x = x.flatten(2)
-        module_path = self.__class__.__name__
+        module_path = _current_module_path()
         hc_mult = self.hc_head_fn.shape[0]
         return _SimHcHeadFn.apply(x, self.hc_head_fn, self.hc_head_scale, self.hc_head_base, hc_mult, module_path)
 
@@ -281,6 +290,6 @@ class SimHcPost(HcPost):
     def forward(self, x: torch.Tensor, residual: torch.Tensor, post: torch.Tensor, comb: torch.Tensor):
         dim_b, dim_s, dim_n, dim_d = residual.shape
         residual_flat = residual.flatten(2)
-        module_path = self.__class__.__name__
+        module_path = _current_module_path()
         y = _SimHcPostFn.apply(x, residual_flat, post, comb, module_path)
         return y.view(dim_b, dim_s, dim_n, dim_d)

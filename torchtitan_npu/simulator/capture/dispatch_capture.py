@@ -28,8 +28,8 @@ from torchtitan_npu.simulator.ir.tensor_meta import TensorMeta
 _id_counter = itertools.count()
 
 
-def _next_op_id() -> str:
-    return f"op_{next(_id_counter)}"
+def _next_op_id() -> int:
+    return next(_id_counter)
 
 
 def _flatten_tensors(value: Any) -> list[torch.Tensor]:
@@ -53,7 +53,7 @@ def _flatten_tensors(value: Any) -> list[torch.Tensor]:
 
 @dataclass
 class _RawEvent:
-    op_id: str
+    op_id: int
     raw_op_type: str
     op_type: str
     inputs: list[TensorMeta]
@@ -143,7 +143,7 @@ class OpDispatchCapture(TorchDispatchMode):
         phase = self.phase_provider() if self.phase_provider else "forward"
 
         candidate = _RawEvent(
-            op_id="",
+            op_id=0,
             raw_op_type=raw_op_type,
             op_type=op_type,
             inputs=input_metas,
