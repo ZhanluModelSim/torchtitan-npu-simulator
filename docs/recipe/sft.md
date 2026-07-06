@@ -8,8 +8,8 @@ torchtitan-npu 支持基于对话数据的指令微调（Supervised Fine-Tuning,
 |------|-------------|---------|------|------|-----------|--------|
 | Qwen3-30B-A3B | GSM8K | Jinja chat template | ✅ | — | — | `sft_qwen3_30ba3b_gsm8k` |
 | Qwen3-1.7B | Wordle | Jinja chat template | — | ✅ | — | `sft_qwen3_1_7b_wordle` |
-| DeepSeek-V4 | tau-bench | 自定义编码器 (encoding_dsv4.py) | — | ✅ | ✅ | `sft_deepseek_v4_flash_debug_256_experts_43_layers_tau` |
-| DeepSeek-V4 | GSM8K | 自定义编码器 (encoding_dsv4.py) | ✅ | — | — | `sft_deepseek_v4_flash_debug_256_experts_43_layers_gsm8k` |
+| DeepSeek-V4 | tau-bench | 自定义编码器 (encoding_dsv4.py) | — | ✅ | ✅ | `sft_deepseek_v4_flash_16k_128die_tau` |
+| DeepSeek-V4 | GSM8K | 自定义编码器 (encoding_dsv4.py) | ✅ | — | — | `sft_deepseek_v4_flash_1k_128die_gsm8k` |
 
 ## 架构概述
 
@@ -53,13 +53,17 @@ NGPU=1 MODULE=torchtitan_npu.models.qwen3 CONFIG=sft_qwen3_1_7b_wordle bash scri
 ### DeepSeek-V4 SFT（tau-bench 多轮 + Tool Call）
 
 ```bash
-MODULE=torchtitan_npu.models.deepseek_v4 CONFIG=sft_deepseek_v4_flash_debug_256_experts_43_layers_tau bash scripts/run_train.sh
+CONFIG=sft_deepseek_v4_flash_16k_128die_tau \
+DATASET_PATH=/data/dataset/tau-historical-sft/processed_clean \
+  bash examples/deepseek_v4/sft_deepseek_v4_flash_16k_A3.sh
 ```
 
 ### DeepSeek-V4 SFT（GSM8K 单轮）
 
 ```bash
-MODULE=torchtitan_npu.models.deepseek_v4 CONFIG=sft_deepseek_v4_flash_debug_256_experts_43_layers_gsm8k bash scripts/run_train.sh
+CONFIG=sft_deepseek_v4_flash_1k_128die_gsm8k \
+DATASET_PATH=/data/dataset/openai/gsm8k \
+  bash examples/deepseek_v4/sft_deepseek_v4_flash_16k_A3.sh
 ```
 
 ---

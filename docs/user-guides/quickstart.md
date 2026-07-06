@@ -77,7 +77,7 @@ bash scripts/run_train.sh \
 
 > [!NOTE]
 > * `MODULE`: 指定模型 Python 模块，默认 `torchtitan_npu.models.deepseek_v32`。切换模型时改为对应模块，例如 DeepSeek-V4 改为 `torchtitan_npu.models.deepseek_v4`。
-> * `CONFIG`: 指定 `config_registry.py` 中的配置函数，默认 `deepseek_v32_671b_4layers_debug`。需与 `MODULE` 对应同一模型，例如 DeepSeek-V4 改为 `deepseek_v4_flash_single_server_16_experts_43_layers_bf16`。
+> * `CONFIG`: 指定 `config_registry.py` 中的配置函数，默认 `deepseek_v32_671b_4layers_debug`。需与 `MODULE` 对应同一模型，例如 DeepSeek-V4 改为 `debug_deepseek_v4_flash_single_node`。
 > * `NGPU`: 指定单节点参与训练的 NPU 数量，`scripts/run_train.sh` 默认值为 16。
 > * `--training.steps` 与 `--training.global_batch_size`: 动态覆盖 registry 配置中的字段。
 
