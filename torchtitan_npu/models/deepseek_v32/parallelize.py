@@ -36,11 +36,6 @@ from torchtitan.config import (
 )
 from torchtitan.distributed import ParallelDims
 from torchtitan.distributed.activation_checkpoint import apply_ac
-from torchtitan.distributed.expert_parallel import (
-    DeepEPExpertParallel,
-    ExpertParallel,
-    TensorParallel,
-)
 from torchtitan.distributed.tensor_parallel import NoParallel, maybe_enable_async_tp
 from torchtitan.models.common import moe as moe_module
 from torchtitan.models.llama3.parallelize import apply_replicate
@@ -51,6 +46,9 @@ from torchtitan_npu.converters import has_npu_converter
 from torchtitan_npu.converters.kernels.dsa import SparseLightningIndexerKLLoss
 from torchtitan_npu.converters.kernels.rms_norm import NPURMSNorm
 from torchtitan_npu.models.common.dsa_indexer_loss import DSAIndexerLossLoggingHelper
+from torchtitan_npu.models.common.moe_parallelize import (
+    apply_sequence_sharded_moe_ep_tp as apply_moe_ep_tp,
+)
 from torchtitan_npu.models.deepseek_v32.model import Attention
 
 logger = logging.getLogger(__name__)
@@ -227,9 +225,9 @@ def parallelize_deepseekv32(
                 "Please set expert_tensor_parallel_degree=1 or use standard communication backend."
             )
 
-        use_deepep = True
+        comm_backend = "deepep"
     else:
-        use_deepep = False
+        comm_backend = "standard"
 
     if parallel_dims.tp_enabled or parallel_dims.ep_enabled:
         apply_moe_ep_tp(
@@ -238,7 +236,7 @@ def parallelize_deepseekv32(
             ep_mesh=parallel_dims.get_optional_mesh("ep"),
             etp_mesh=parallel_dims.get_optional_mesh("etp"),
             ep_etp_mesh=parallel_dims.get_optional_mesh(["ep", "etp"]),
-            use_deepep=use_deepep,
+            comm_backend=comm_backend,
         )
 
     model_compile_enabled = compile_config.enable and "model" in compile_config.components
@@ -514,88 +512,6 @@ def apply_non_moe_tp(
         )
 
     logger.info(f"Applied {'Float8 tensorwise ' if enable_float8_tensorwise_tp else ''}Tensor Parallelism to the model")
-
-
-def apply_moe_ep_tp(
-    model: nn.Module,
-    tp_mesh: DeviceMesh | None,
-    ep_mesh: DeviceMesh | None,
-    etp_mesh: DeviceMesh | None,
-    ep_etp_mesh: DeviceMesh | None,
-    use_deepep: bool = False,
-):
-    assert tp_mesh is not None or ep_mesh is not None, f"""
-        At least one of Tensor Parallel mesh (tp_mesh) or Expert Parallel mesh (ep_mesh) must be provided.
-        Current status: tp_mesh={tp_mesh}, ep_mesh={ep_mesh}
-        """
-
-    # pyrefly: ignore [not-callable]
-    for transformer_block in model.layers.values():
-        # pyrefly: ignore [missing-attribute]
-        if not transformer_block.moe_enabled:
-            continue
-
-        if tp_mesh is not None:
-            moe_layer_plan = {
-                # input / output sharding on the seqlen dim
-                "moe": PrepareModuleInputOutput(
-                    input_layouts=(Shard(1),),
-                    desired_input_layouts=(Shard(1),),
-                    use_local_input=True,
-                    output_layouts=(Shard(1),),
-                    desired_output_layouts=(Shard(1),),
-                ),
-                "moe.router.gate": SequenceParallel(sequence_dim=0, use_local_output=True),
-            }
-            # pyrefly: ignore [missing-attribute]
-            if transformer_block.moe.shared_experts is not None:
-                # input: sharded on fused batch-seq dimension (dim=0)
-                # all-gather for input, reduce-scatter for output
-                # pyrefly: ignore [no-matching-overload]
-                moe_layer_plan.update(
-                    {
-                        "moe.shared_experts": PrepareModuleInput(
-                            input_layouts=(Shard(0),),
-                            desired_input_layouts=(Replicate(),),
-                        ),
-                        "moe.shared_experts.w1": ColwiseParallel(),
-                        "moe.shared_experts.w2": RowwiseParallel(output_layouts=Shard(0)),
-                        "moe.shared_experts.w3": ColwiseParallel(),
-                    }
-                )
-            parallelize_module(
-                # pyrefly: ignore [bad-argument-type]
-                module=transformer_block,
-                device_mesh=tp_mesh,
-                # pyrefly: ignore [bad-argument-type]
-                parallelize_plan=moe_layer_plan,
-            )
-
-        # Currently only TP and TP extend EP are supported
-        experts_mesh, experts_plan = None, None
-        if ep_mesh is None:
-            experts_mesh = tp_mesh
-            experts_plan = TensorParallel()
-        elif tp_mesh is None or etp_mesh is None:
-            experts_mesh = ep_mesh
-            if use_deepep:
-                # pyrefly: ignore [missing-attribute]
-                score_before_experts = transformer_block.moe.score_before_experts
-                experts_plan = DeepEPExpertParallel(
-                    score_before_experts=score_before_experts,
-                )
-                logger.info("Applying DeepEP to MoE layer")
-            else:
-                experts_plan = ExpertParallel()
-        else:
-            raise NotImplementedError("ETP is not supported currently")
-
-        parallelize_module(
-            # pyrefly: ignore [missing-attribute]
-            module=transformer_block.moe.experts,
-            device_mesh=experts_mesh,
-            parallelize_plan=experts_plan,
-        )
 
 
 def apply_distributed_indexer_loss_tracking(parallel_dims: ParallelDims):

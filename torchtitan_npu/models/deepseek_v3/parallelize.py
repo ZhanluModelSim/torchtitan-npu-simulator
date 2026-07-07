@@ -15,6 +15,32 @@ from torchtitan.distributed import ParallelDims
 from torchtitan.models.deepseek_v3 import DeepSeekV3Model
 from torchtitan.protocols import ModelConvertersContainer
 
+from torchtitan_npu.models.common.moe_parallelize import (
+    apply_sequence_sharded_moe_ep_tp,
+)
+
+
+def apply_moe_ep_tp(
+    model,
+    tp_mesh,
+    ep_mesh,
+    etp_mesh,
+    ep_etp_mesh,
+    comm_backend: str = "standard",
+    hybridep_non_blocking_expert_capacity_factor: float | None = None,
+    pad_multiple: int | None = None,
+):
+    return apply_sequence_sharded_moe_ep_tp(
+        model,
+        tp_mesh=tp_mesh,
+        ep_mesh=ep_mesh,
+        etp_mesh=etp_mesh,
+        ep_etp_mesh=ep_etp_mesh,
+        comm_backend=comm_backend,
+        hybridep_non_blocking_expert_capacity_factor=hybridep_non_blocking_expert_capacity_factor,
+        pad_multiple=pad_multiple,
+    )
+
 
 def parallelize_deepseekv3(
     model: DeepSeekV3Model,
@@ -52,4 +78,5 @@ def parallelize_deepseekv3(
 
         titan_deepseekv3_parallelize.apply_cp_to_attention_module = apply_cp
 
+    titan_deepseekv3_parallelize.apply_moe_ep_tp = apply_moe_ep_tp
     return titan_deepseekv3_parallelize.parallelize_deepseekv3(model, **_upstream_kwargs)

@@ -51,66 +51,8 @@ def _flatten_moe_input(x: torch.Tensor) -> tuple[torch.Tensor, int, int, int, in
     return x, bs, slen, dim, x.shape[0]
 
 
-def _local_gate_scores(router, x: torch.Tensor) -> torch.Tensor:
-    gate = router.gate
-    gate_weight = gate.weight
-    gate_bias = getattr(gate, "bias", None)
-    if isinstance(gate_weight, DTensor):
-        gate_weight = gate_weight.to_local()
-    if gate_bias is not None and isinstance(gate_bias, DTensor):
-        gate_bias = gate_bias.to_local()
-
-    with torch.autocast(device_type=x.device.type, dtype=torch.float32):
-        return torch.nn.functional.linear(x, gate_weight, gate_bias)
-
-
-def _apply_score_func(scores: torch.Tensor, score_func: str) -> torch.Tensor:
-    if score_func == "sigmoid":
-        return torch.sigmoid(scores)
-    if score_func == "softmax":
-        return torch.nn.functional.softmax(scores, dim=1)
-    raise NotImplementedError(f"Unknown score function {score_func}")
-
-
-def _scores_for_expert_choice(self, scores: torch.Tensor) -> torch.Tensor:
-    expert_bias = self.expert_bias
-    scores_for_choice = scores if expert_bias is None else scores + expert_bias
-
-    if self.router.num_expert_groups is not None:
-        num_expert_groups = self.router.num_expert_groups
-        num_limited_groups = self.router.num_limited_groups
-        num_experts = self.router.num_experts
-        experts_per_group = num_experts // num_expert_groups
-        scores_grouped = scores_for_choice.view(-1, num_expert_groups, experts_per_group)
-        top2_scores_in_group, _ = scores_grouped.topk(2, dim=-1)
-        group_scores = top2_scores_in_group.sum(dim=-1)
-        _, group_idx = torch.topk(group_scores, k=num_limited_groups, dim=-1, sorted=False)
-        group_mask = torch.ones_like(group_scores, dtype=torch.bool)
-        group_mask.scatter_(1, group_idx, False)
-        scores_for_choice = scores_grouped.masked_fill(group_mask.unsqueeze(-1), float("-inf")).view(-1, num_experts)
-
-    return scores_for_choice
-
-
 def _select_standard_moe_experts(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    scores = _local_gate_scores(self.router, x)
-    scores = _apply_score_func(scores, self.router.score_func)
-    scores_for_choice = _scores_for_expert_choice(self, scores)
-    _, selected_experts_indices = torch.topk(scores_for_choice, k=self.router.top_k, dim=-1, sorted=False)
-    top_scores = scores.gather(dim=1, index=selected_experts_indices)
-
-    if self.router.route_norm:
-        denominator = top_scores.sum(dim=-1, keepdim=True) + 1e-20
-        top_scores = top_scores / denominator
-    top_scores = top_scores * self.router.route_scale
-
-    num_tokens_per_expert = torch.histc(
-        selected_experts_indices.view(-1),
-        bins=self.router.num_experts,
-        min=0,
-        max=self.router.num_experts,
-    )
-    return top_scores, selected_experts_indices, num_tokens_per_expert
+    return self.router(x, self.expert_bias)
 
 
 def _shared_expert_output(self, x: torch.Tensor) -> torch.Tensor:
