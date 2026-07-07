@@ -61,11 +61,11 @@ config_registry.py                       tnd_config.py
 
 | 文件 | 职责 |
 |------|------|
-| `models/common/npu_varlen_attention.py` | NPUVarlenAttention 类 + FA v3 forward |
-| `models/qwen3/tnd_config.py` | `_enable_npu_varlen_attention` + CP-Varlen bypass |
-| `models/qwen3/__init__.py` | NPU model registry（`parallelize_fn` 注入） |
-| `distributed/context_parallel/npu_varlen_cp.py` | UlyssesVarlenCP（all-to-all CP 策略 + mask handler） |
-| `models/qwen3/config_registry.py` | TND 配置注册 |
+| `torchtitan_npu/models/common/npu_varlen_attention.py` | NPUVarlenAttention 类 + FA v3 forward |
+| `torchtitan_npu/models/qwen3/tnd_config.py` | `_enable_npu_varlen_attention` + CP-Varlen bypass |
+| `torchtitan_npu/models/qwen3/__init__.py` | NPU model registry（`parallelize_fn` 注入） |
+| `torchtitan_npu/distributed/context_parallel/npu_varlen_cp.py` | UlyssesVarlenCP（all-to-all CP 策略 + mask handler） |
+| `torchtitan_npu/models/qwen3/config_registry.py` | TND 配置注册 |
 
 ## 4. 适配新模型（当前仅 Qwen3）
 

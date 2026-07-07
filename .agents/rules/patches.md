@@ -26,9 +26,10 @@ paths:
 - `patches/torchtitan/` — patch 上游 torchtitan 核心模块
 - `patches/torch/` — patch PyTorch 原生模块
 - `patches/torch_npu/` — patch torch_npu 模块
+- `patches/torchao_npu/` — patch torchao_npu 模块
 - `patches/distributed/` — patch 分布式相关工具
+- `patches/encoders/` — patch 数据编码相关模块
 - `patches/optimizer/` — patch 优化器
-- `patches/quantization/` — patch 量化模块
 - `patches/tools/` — patch 训练辅助工具
 
 新增 patch 时，放入对应的子目录。如果目标不属于上述任何类别，评估是否需要新建子目录。

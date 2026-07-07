@@ -125,7 +125,7 @@ bash scripts/run_train_multinodes.sh
 
 ```bash
 git clone https://github.com/pytorch/torchtitan.git
-git checkout ac13e536c84e7f6647b14fa9375c3c8a8a2b8578
+git -C torchtitan checkout ac13e536c84e7f6647b14fa9375c3c8a8a2b8578
 ```
 
 2. 将 torchtitan 源代码移动至 torchtitan-npu 项目中
