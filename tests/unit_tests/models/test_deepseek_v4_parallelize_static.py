@@ -42,7 +42,7 @@ class DeepSeekV4ParallelizeStaticTest(unittest.TestCase):
         self.assertIn("return _SMLALayerView(self)", smla_source)
         self.assertNotIn("__class__.__name__", parallelize_source)
         self.assertNotIn("_smla_metadata_cache", parallelize_source)
-
+        self.assertNotIn("._get_fsdp_state()", parallelize_source)
 
 if __name__ == "__main__":
     unittest.main()

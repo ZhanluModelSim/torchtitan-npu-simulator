@@ -8,6 +8,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import dataclasses
 import logging
 from typing import Any, cast
 
@@ -18,6 +19,7 @@ from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     CheckpointWrapper,
 )
 from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.fsdp import fully_shard
 from torch.distributed.tensor import (
     Replicate,
     Shard,
@@ -54,6 +56,8 @@ from torchtitan_npu.models.deepseek_v4.model import Attention
 from torchtitan_npu.models.deepseek_v4.model import MoE as DeepSeekV4MoE
 
 logger = logging.getLogger(__name__)
+
+FSDP_MP_POLICY_ATTR = "_mp_policy"
 
 
 # for selective op activation checkpointing
@@ -206,6 +210,45 @@ class HcHeadParallelStyle(ParallelStyle):
         return parallelize_module(module, device_mesh, self.io_plan)
 
 
+def _disable_lm_head_cast_forward_inputs(model: nn.Module) -> None:
+    """Keep LM head inputs in fp32 after data parallel wrapping.
+
+    DeepSeek V4 casts hidden states with ``self.output(h.float())`` before the
+    vocab projection. That cast is intentional because the large projection
+    with vocab_size=129280 is numerically fragile with bf16 inputs.
+
+    FSDP can cast forward inputs back to the mixed-precision parameter dtype.
+    On the MTP head, that changes the fp32 hidden states back to bf16, while
+    the main head still receives fp32. Disable only that input cast on the
+    ``[norm, output]`` group, so both heads run the LM projection from fp32
+    inputs.
+
+    This changes only ``FSDPState._mp_policy``. It leaves
+    ``FSDPParamGroup.mp_policy`` untouched, so the LM head parameters remain
+    bf16-sharded. The same state exists for both ``apply_fsdp`` and
+    ``apply_replicate`` because ``ReplicateModule`` inherits ``FSDPModule``.
+    """
+    # TODO(upstream sync): remove this once the pinned torchtitan baseline
+    # includes pytorch/torchtitan#2881 (merge 21c4913), which sets
+    # cast_forward_inputs=False natively. Until then, this workaround reaches
+    # into the FSDP2 internal FSDPState._mp_policy field from torch 2.12,
+    # accessed via getattr/setattr as a deliberate protected-member access;
+    # drop the indirection once upstream provides native support.
+    output = getattr(model, "output", None)
+    if output is None:
+        # No LM head on this (pipeline) stage, or data parallelism not applied.
+        return
+    fsdp_state = fully_shard.state(output)  # pyrefly: ignore [missing-attribute]
+    if fsdp_state is None:
+        return
+    mp_policy = getattr(fsdp_state, FSDP_MP_POLICY_ATTR)
+    setattr(
+        fsdp_state,
+        FSDP_MP_POLICY_ATTR,
+        dataclasses.replace(mp_policy, cast_forward_inputs=False),
+    )
+
+
 def parallelize_deepseek_v4(
     model: nn.Module,
     *,
@@ -339,6 +382,7 @@ def parallelize_deepseek_v4(
             edp_mesh=edp_mesh,
             gradient_divide_factor=parallel_dims.fsdp_gradient_divide_factor,
         )
+        _disable_lm_head_cast_forward_inputs(model)
 
         if parallel_dims.dp_replicate_enabled:
             logger.info("Applied HSDP to the model")
@@ -358,6 +402,7 @@ def parallelize_deepseek_v4(
             param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
             reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
         )
+        _disable_lm_head_cast_forward_inputs(model)
 
     return model
 
