@@ -122,6 +122,10 @@ def run_simulation_step(
     enough to trigger a real `torch_npu` hardware probe otherwise (see
     `meta_env._neutralize_torch_npu_optimizer_device_probe`).
     """
+    import time
+    timings: dict[str, float] = {}
+    t0 = time.perf_counter()
+
     patch_device_type_to_meta()
     global_valid_tokens = float(labels.numel())
 
@@ -153,6 +157,9 @@ def run_simulation_step(
 
     capture = OpDispatchCapture(module_path_tracker=module_path_tracker, phase_provider=_phase_provider)
 
+    t1 = time.perf_counter()
+    timings["setup"] = t1 - t0
+
     with capture_fake_collectives() as comm_recorder, boundary, module_path_tracker, capture:
         boundary.mark("forward")
         forward_backward_step(
@@ -160,13 +167,28 @@ def run_simulation_step(
             labels=labels,
             global_valid_tokens=global_valid_tokens,
         )
+        t2 = time.perf_counter()
+        timings["forward_backward"] = t2 - t1
+
         boundary.mark("optimizer")
         optimizer_step()
         lr_scheduler_step()
+        t3 = time.perf_counter()
+        timings["optimizer"] = t3 - t2
 
+    t4 = time.perf_counter()
     nodes = capture.build_nodes()
+    timings["build_nodes"] = time.perf_counter() - t4
+
+    t5 = time.perf_counter()
     step_templates = build_step_graphs(nodes)
+    timings["build_step_graphs"] = time.perf_counter() - t5
+
+    t6 = time.perf_counter()
     rank_table = build_rank_table(parallel_dims)
+    timings["build_rank_table"] = time.perf_counter() - t6
+
+    t7 = time.perf_counter()
     schedule_graph = build_schedule_graph(
         step_templates=step_templates,
         rank_table=rank_table,
@@ -175,13 +197,40 @@ def run_simulation_step(
         num_micro_batches=num_micro_batches,
         gradient_accumulation=gradient_accumulation,
     )
-    return build_workload_graph(
+    timings["build_schedule_graph"] = time.perf_counter() - t7
+
+    t8 = time.perf_counter()
+    wg = build_workload_graph(
         schedule_graph=schedule_graph,
         step_templates=step_templates,
         local_batch_size=local_batch_size,
         seq_len=seq_len,
         num_micro_batches=num_micro_batches,
     )
+    timings["build_workload_graph"] = time.perf_counter() - t8
+
+    timings["total"] = time.perf_counter() - t0
+
+    # Print timing table
+    print("\n" + "=" * 60)
+    print("Simulation Step Timing Breakdown")
+    print("=" * 60)
+    print(f"{'Stage':<30} {'Time (s)':>10} {'%':>8}")
+    print("-" * 60)
+    total = timings["total"]
+    for name in ["setup", "forward_backward", "optimizer", "build_nodes",
+                 "build_step_graphs", "build_rank_table", "build_schedule_graph",
+                 "build_workload_graph"]:
+        t = timings[name]
+        print(f"{name:<30} {t:>10.2f} {t/total*100:>7.1f}%")
+    print("-" * 60)
+    print(f"{'TOTAL':<30} {total:>10.2f} {'100.0%':>8}")
+    print("=" * 60)
+    print(f"Captured ops: {len(nodes)}, comm events: {len(comm_recorder.events)}")
+    print(f"Step templates: {list(step_templates.keys())}")
+    print()
+
+    return wg
 
 
 class SimulationTrainer(Trainer):
@@ -240,12 +289,17 @@ class SimulationTrainer(Trainer):
         self.workload_graph: WorkloadGraph | None = None
 
     def train(self) -> None:
+        import time
+        t0 = time.perf_counter()
+
         data_iterator = iter(self.dataloader)
         input_dict, labels = next(data_iterator)
         for key, value in list(input_dict.items()):
             if isinstance(value, torch.Tensor):
                 input_dict[key] = value.to(self.device)
         labels = labels.to(self.device)
+
+        t1 = time.perf_counter()
 
         self.workload_graph = run_simulation_step(
             model_parts=self.model_parts,
@@ -261,6 +315,9 @@ class SimulationTrainer(Trainer):
             num_micro_batches=self.gradient_accumulation_steps,
             gradient_accumulation=self.gradient_accumulation_steps,
         )
+
+        t2 = time.perf_counter()
+
         # In multi_proc_meta mode, each rank writes its IR to a per-rank
         # file; rank 0 merges them after all ranks finish.
         import torch.distributed as dist
@@ -277,6 +334,16 @@ class SimulationTrainer(Trainer):
         else:
             self._export()
 
+        t3 = time.perf_counter()
+
+        print(f"\n{'Stage':<30} {'Time (s)':>10}")
+        print("-" * 42)
+        print(f"{'dataloader':<30} {t1-t0:>10.2f}")
+        print(f"{'run_simulation_step':<30} {t2-t1:>10.2f}")
+        print(f"{'export':<30} {t3-t2:>10.2f}")
+        print(f"{'TOTAL train()':<30} {t3-t0:>10.2f}")
+        print()
+
     def _export_per_rank(self, rank: int) -> None:
         """Write this rank's IR to a per-rank JSON file."""
         assert self.workload_graph is not None
@@ -284,7 +351,14 @@ class SimulationTrainer(Trainer):
         per_rank_dir = os.path.join(out_dir, "per_rank")
         os.makedirs(per_rank_dir, exist_ok=True)
         # Serialize this rank's captured data
-        import json
+        try:
+            import orjson as _json
+            _dumps = lambda d: _json.dumps(d)
+            _mode = "wb"
+        except ImportError:
+            import json as _json
+            _dumps = lambda d: _json.dumps(d)
+            _mode = "w"
         schedule = self.workload_graph.iteration.schedule
         rank_data = {
             "rank": rank,
@@ -317,8 +391,8 @@ class SimulationTrainer(Trainer):
                         "phase": n.annotations.get("phase", ""),
                         "inputs_shape": [list(m.shape) for m in n.inputs],
                         "outputs_shape": [list(m.shape) for m in n.outputs],
-                        "inputs_dtype": [m.dtype for m in n.inputs],
-                        "outputs_dtype": [m.dtype for m in n.outputs],
+                        "inputs_dtype": [str(m.dtype) for m in n.inputs],
+                        "outputs_dtype": [str(m.dtype) for m in n.outputs],
                         "flops": n.flops,
                         "peak_mem": n.peak_mem,
                         "comm_bytes": n.comm_bytes,
@@ -329,22 +403,33 @@ class SimulationTrainer(Trainer):
                     for n in sg.nodes.values()
                 ],
             }
-        with open(os.path.join(per_rank_dir, f"rank_{rank}.json"), "w") as f:
-            json.dump(rank_data, f)
+        with open(os.path.join(per_rank_dir, f"rank_{rank}.json"), _mode) as f:
+            f.write(_dumps(rank_data))
 
     def _merge_per_rank_ir(self) -> None:
         """Merge all per-rank IR files into the final output."""
         out_dir = self.simulation_config.output_dir
         per_rank_dir = os.path.join(out_dir, "per_rank")
-        import json
         import glob
+
+        try:
+            import orjson as _json
+            _loads = _json.loads
+            _read_mode = "rb"
+        except ImportError:
+            import json as _json
+            _loads = _json.load
+            _read_mode = "r"
 
         rank_files = sorted(glob.glob(os.path.join(per_rank_dir, "rank_*.json")),
                             key=lambda p: int(p.split("rank_")[-1].split(".")[0]))
         all_ranks = []
         for f in rank_files:
-            with open(f) as fh:
-                all_ranks.append(json.load(fh))
+            with open(f, _read_mode) as fh:
+                if _read_mode == "rb":
+                    all_ranks.append(_loads(fh.read()))
+                else:
+                    all_ranks.append(_loads(fh))
 
         # Write merged summary
         with open(os.path.join(out_dir, "merged_summary.txt"), "w") as f:
@@ -384,24 +469,40 @@ class SimulationTrainer(Trainer):
         print(f"Merged {len(all_ranks)} PP stages' IR to {out_dir}")
 
     def _export(self) -> None:
+        import time
+        t0 = time.perf_counter()
         assert self.workload_graph is not None
         out_dir = self.simulation_config.output_dir
         os.makedirs(out_dir, exist_ok=True)
         formats = self.simulation_config.output_formats
+        export_timings: dict[str, float] = {}
+
         if "json" in formats:
+            t = time.perf_counter()
             export_json(self.workload_graph, os.path.join(out_dir, "simulation_result.json"))
+            export_timings["json"] = time.perf_counter() - t
         if "dot" in formats:
+            t = time.perf_counter()
             export_dot(self.workload_graph, os.path.join(out_dir, "compute_graph.dot"))
+            export_timings["dot"] = time.perf_counter() - t
         if "text" in formats:
+            t = time.perf_counter()
             write_text_summary(self.workload_graph, os.path.join(out_dir, "summary.txt"))
+            export_timings["text"] = time.perf_counter() - t
         if "html" in formats:
+            t = time.perf_counter()
             export_html(self.workload_graph, os.path.join(out_dir, "trace.html"))
+            export_timings["html"] = time.perf_counter() - t
         if "csv" in formats:
+            t = time.perf_counter()
             export_kernel_summary_csv(
                 self.workload_graph,
                 os.path.join(out_dir, "kernel_summary"),
                 max_ranks=self.simulation_config.csv_max_ranks,
             )
+            export_timings["csv_kernel_summary"] = time.perf_counter() - t
+
+            t = time.perf_counter()
             # Per-level IR export: scheduling relationships
             ir_dir = os.path.join(out_dir, "ir_export")
             os.makedirs(ir_dir, exist_ok=True)
@@ -415,3 +516,12 @@ class SimulationTrainer(Trainer):
             # L1: per-step L0 ops
             for tid, sg in self.workload_graph.step_templates.items():
                 sg.export_l0_csv(os.path.join(ir_dir, f"step_{sg.step_type}_l0_ops.csv"))
+            export_timings["csv_ir_export"] = time.perf_counter() - t
+
+        total_export = time.perf_counter() - t0
+        print(f"\n{'Export Stage':<30} {'Time (s)':>10}")
+        print("-" * 42)
+        for name, t in export_timings.items():
+            print(f"{name:<30} {t:>10.2f}")
+        print(f"{'TOTAL export':<30} {total_export:>10.2f}")
+        print()

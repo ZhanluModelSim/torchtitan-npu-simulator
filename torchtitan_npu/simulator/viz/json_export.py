@@ -12,7 +12,15 @@ serialize directly (tuples become JSON arrays)."""
 from __future__ import annotations
 
 import dataclasses
-import json
+
+try:
+    import orjson
+
+    _HAS_ORJSON = True
+except ImportError:
+    import json
+
+    _HAS_ORJSON = False
 
 from torchtitan_npu.simulator.ir.workload_graph import WorkloadGraph
 
@@ -22,5 +30,12 @@ def workload_graph_to_dict(workload_graph: WorkloadGraph) -> dict:
 
 
 def export_json(workload_graph: WorkloadGraph, path: str) -> None:
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(workload_graph_to_dict(workload_graph), f, indent=2, ensure_ascii=False)
+    data = workload_graph_to_dict(workload_graph)
+    if _HAS_ORJSON:
+        with open(path, "wb") as f:
+            f.write(orjson.dumps(data, option=orjson.OPT_INDENT_2 | orjson.OPT_NON_STR_KEYS))
+    else:
+        import json
+
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
