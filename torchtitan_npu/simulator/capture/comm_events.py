@@ -28,6 +28,20 @@ from torchtitan_npu.simulator.capture.tensor_utils import dtype_to_str, tensor_v
 _event_counter = itertools.count()
 
 
+def _should_intercept(group: object) -> bool:
+    """Check if communication should be intercepted (no-op + record).
+
+    Returns True when:
+    - ``_is_meta_simulation`` is True (set by SimulationTrainer for both
+      fake_backend and multi_proc_meta modes), OR
+    - the group is a FakeProcessGroup (legacy single-process mode)
+    """
+    from torchtitan_npu.simulator.meta_env import _is_meta_simulation
+    if _is_meta_simulation:
+        return True
+    return is_fake_process_group(group)
+
+
 @dataclass
 class CommEvent:
     event_id: str
@@ -253,19 +267,19 @@ def capture_fake_collectives() -> Iterator[CommEventRecorder]:
     orig_funcol_all_to_all_single_autograd = funcol.all_to_all_single_autograd
 
     def patched_all_reduce(tensor, op=dist.ReduceOp.SUM, group=None, async_op=False):  # noqa: ANN001
-        if not is_fake_process_group(group):
+        if not _should_intercept(group):
             return orig_all_reduce(tensor, op=op, group=group, async_op=async_op)
         _record_comm_with_l0(recorder, "allreduce", group, tensor)
         return _NoOpWork() if async_op else None
 
     def patched_all_gather_into_tensor(output_tensor, input_tensor, group=None, async_op=False):  # noqa: ANN001
-        if not is_fake_process_group(group):
+        if not _should_intercept(group):
             return orig_all_gather_into_tensor(output_tensor, input_tensor, group=group, async_op=async_op)
         _record_comm_with_l0(recorder, "allgather", group, input_tensor, output_tensor)
         return _NoOpWork() if async_op else None
 
     def patched_reduce_scatter_tensor(output, input, op=dist.ReduceOp.SUM, group=None, async_op=False):  # noqa: ANN001
-        if not is_fake_process_group(group):
+        if not _should_intercept(group):
             return orig_reduce_scatter_tensor(output, input, op=op, group=group, async_op=async_op)
         _record_comm_with_l0(recorder, "reduce_scatter", group, input, output)
         return _NoOpWork() if async_op else None
@@ -273,7 +287,7 @@ def capture_fake_collectives() -> Iterator[CommEventRecorder]:
     def patched_all_to_all_single(  # noqa: ANN001
         output, input, output_split_sizes=None, input_split_sizes=None, group=None, async_op=False
     ):
-        if not is_fake_process_group(group):
+        if not _should_intercept(group):
             return orig_all_to_all_single(
                 output, input, output_split_sizes=output_split_sizes,
                 input_split_sizes=input_split_sizes, group=group, async_op=async_op,
@@ -282,13 +296,13 @@ def capture_fake_collectives() -> Iterator[CommEventRecorder]:
         return _NoOpWork() if async_op else None
 
     def patched_broadcast(tensor, src=0, group=None, async_op=False, group_src=None):  # noqa: ANN001
-        if not is_fake_process_group(group):
+        if not _should_intercept(group):
             return orig_broadcast(tensor, src=src, group=group, async_op=async_op, group_src=group_src)
         _record_comm_with_l0(recorder, "broadcast", group, tensor)
         return _NoOpWork() if async_op else None
 
     def patched_barrier(group=None, async_op=False, device_ids=None):  # noqa: ANN001
-        if not is_fake_process_group(group):
+        if not _should_intercept(group):
             return orig_barrier(group=group, async_op=async_op, device_ids=device_ids)
         return _NoOpWork() if async_op else None
 
@@ -369,7 +383,7 @@ def capture_fake_collectives() -> Iterator[CommEventRecorder]:
     orig_recv = dist.recv
 
     def patched_isend(tensor, dst=None, group=None, tag=0, group_dst=None):  # noqa: ANN001
-        if not is_fake_process_group(group):
+        if not _should_intercept(group):
             return orig_isend(tensor, dst=dst, group=group, tag=tag, group_dst=group_dst)
         # Record P2P send with PP context
         from torchtitan_npu.simulator.meta_env import _pp_context
@@ -378,10 +392,12 @@ def capture_fake_collectives() -> Iterator[CommEventRecorder]:
         event.p2p_direction = f"{_pp_context['phase']}_send"
         event.p2p_mb_idx = int(_pp_context["mb_idx"])
         event.p2p_stage = int(_pp_context["stage"])
+        # No actual data transfer — meta tensors have no data.
+        # Shape inference is handled by DYNAMIC mode via _send_meta/_recv_meta.
         return _NoOpWork()
 
     def patched_irecv(tensor, src=None, group=None, tag=0, group_src=None):  # noqa: ANN001
-        if not is_fake_process_group(group):
+        if not _should_intercept(group):
             return orig_irecv(tensor, src=src, group=group, tag=tag, group_src=group_src)
         # Record P2P recv with PP context
         from torchtitan_npu.simulator.meta_env import _pp_context
@@ -390,10 +406,13 @@ def capture_fake_collectives() -> Iterator[CommEventRecorder]:
         event.p2p_direction = f"{_pp_context['phase']}_recv"
         event.p2p_mb_idx = int(_pp_context["mb_idx"])
         event.p2p_stage = int(_pp_context["stage"])
+        # No actual data transfer — meta tensors have no data.
+        # The recv buffer shape was already set by DYNAMIC mode's
+        # _setup_forward_recv_info using metadata from _recv_meta.
         return _NoOpWork()
 
     def patched_send(tensor, dst=None, group=None, tag=0, group_dst=None):  # noqa: ANN001
-        if not is_fake_process_group(group):
+        if not _should_intercept(group):
             return orig_send(tensor, dst=dst, group=group, tag=tag, group_dst=group_dst)
         from torchtitan_npu.simulator.meta_env import _pp_context
         event = _record_comm_with_l0(recorder, "p2p_send", group, tensor)
@@ -404,7 +423,7 @@ def capture_fake_collectives() -> Iterator[CommEventRecorder]:
         return None
 
     def patched_recv(tensor, src=None, group=None, tag=0, group_src=None):  # noqa: ANN001
-        if not is_fake_process_group(group):
+        if not _should_intercept(group):
             return orig_recv(tensor, src=src, group=group, tag=tag, group_src=group_src)
         from torchtitan_npu.simulator.meta_env import _pp_context
         event = _record_comm_with_l0(recorder, "p2p_recv", group, tensor)

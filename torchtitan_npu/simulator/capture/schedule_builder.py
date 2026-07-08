@@ -129,7 +129,8 @@ def build_schedule_graph(
     # Build execution_timeline from captured L0 OpNodes' seq_idx
     # All ranks share the same template, so we use rank 0's seq_idx as
     # the representative timeline.  For PP, the P2P events carry their
-    # own stage/mb context.
+    # own stage/mb context, and non-P2P ops get stage/mb from _pp_context
+    # via the phase_provider (which reads _pp_context["phase"]).
     execution_timeline: list[TimelineEntry] = []
     for template_id, template in step_templates.items():
         for op_id, node in template.nodes.items():
@@ -154,8 +155,8 @@ def build_schedule_graph(
                     seq_idx=node.seq_idx,
                     op_id=op_id,
                     rank=0,  # representative rank
-                    pipeline_stage=-1,  # filled from PP context if available
-                    micro_batch_idx=-1,
+                    pipeline_stage=-1,  # filled below
+                    micro_batch_idx=-1,  # filled below
                     phase=phase,
                     comm_type=comm_type,
                     comm_peer_rank=comm_peer,
@@ -173,6 +174,42 @@ def build_schedule_graph(
                     entry.pipeline_stage = ev.p2p_stage
                     entry.micro_batch_idx = ev.p2p_mb_idx
                     break
+
+    # For non-P2P ops, fill in pipeline_stage and micro_batch_idx from
+    # the captured _pp_context.  The _pp_context is updated by the patched
+    # forward_one_chunk / backward_one_chunk, so every op captured between
+    # two chunk calls has the correct stage/mb.  We reconstruct this by
+    # finding the nearest preceding P2P event with the same phase and
+    # using its stage/mb.
+    # Build a list of (seq_idx, stage, mb, phase) from P2P events as anchors
+    pp_anchors: list[tuple[int, int, int, str]] = []
+    for entry in execution_timeline:
+        if entry.comm_type and entry.pipeline_stage >= 0:
+            # Determine phase from comm_type: forward_send/recv -> forward, backward_send/recv -> backward
+            if "forward" in entry.comm_type:
+                anchor_phase = "forward"
+            elif "backward" in entry.comm_type:
+                anchor_phase = "backward"
+            else:
+                anchor_phase = entry.phase
+            pp_anchors.append((entry.seq_idx, entry.pipeline_stage, entry.micro_batch_idx, anchor_phase))
+    pp_anchors.sort(key=lambda x: x[0])
+
+    # For each non-P2P entry, find the nearest preceding anchor with
+    # matching phase and use its stage/mb
+    for entry in execution_timeline:
+        if entry.pipeline_stage >= 0:
+            continue  # already filled (P2P)
+        # Find nearest preceding anchor with matching phase
+        best_anchor = None
+        for a_seq, a_stage, a_mb, a_phase in pp_anchors:
+            if a_seq > entry.seq_idx:
+                break
+            if a_phase == entry.phase:
+                best_anchor = (a_stage, a_mb)
+        if best_anchor is not None:
+            entry.pipeline_stage = best_anchor[0]
+            entry.micro_batch_idx = best_anchor[1]
 
     dp_degree = rank_table.dim_degrees.get("dp_replicate", 1) * rank_table.dim_degrees.get(
         "fsdp", rank_table.dim_degrees.get("dp_shard", 1)

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import importlib
 from contextlib import contextmanager
+from datetime import timedelta
 from types import SimpleNamespace
 from typing import Any
 
@@ -186,6 +187,7 @@ _original_send_object_list: Any = _MISSING
 _original_torch_equal: Any = _MISSING
 _original_fwd_one_chunk: Any = _MISSING
 _original_bwd_one_chunk: Any = _MISSING
+_original_get_stage_indices: Any = _MISSING
 _patched = False
 
 # Pipeline parallel execution context, updated by patched
@@ -193,6 +195,11 @@ _patched = False
 # comm_events.py's P2P interceptors can attribute isend/irecv calls
 # to the correct microbatch, phase, and stage.
 _pp_context: dict[str, int | str] = {"mb_idx": 0, "phase": "forward", "stage": 0}
+
+# Global flag: when True, all collective/P2P communication is intercepted
+# as no-op (regardless of ProcessGroup type). Set by SimulationTrainer
+# when comm.mode is "fake_backend" or "multi_proc_meta".
+_is_meta_simulation: bool = False
 
 
 def _patch_tensor_npu_method_to_meta() -> None:
@@ -509,16 +516,31 @@ def _patch_pipeline_schedule_warmup_for_meta() -> None:
     _original_pipeline_schedule_warmup_p2p = _PipelineSchedule._warmup_p2p
 
     def _meta_safe_warmup_p2p(self, stages, has_backward, p2p_done):  # noqa: ANN001
-        # Under fake PG, force STATIC mode for all stages.  DYNAMIC mode
-        # requires P2P metadata exchange between stages, which doesn't work
-        # in a single-process simulation (each process has only one stage).
-        # STATIC mode uses user-provided metadata; we populate it below in
-        # the _prepare_forward_infra / _prepare_backward_infra patches.
+        # Under fake PG (single-process), force STATIC mode.
+        # Under multi_proc_meta (gloo, multi-process), use DYNAMIC mode
+        # so that non-first stages can receive shapes from previous
+        # stages via _send_meta/_recv_meta (gloo send/recv_object_list).
         from torch.distributed.pipelining.stage import PipelineStage
+        from torchtitan_npu.distributed.process_group import is_fake_process_group
 
         for stage in stages:
             if isinstance(stage, PipelineStage):
-                stage._inference_mode = InferenceMode.STATIC
+                if is_fake_process_group(stage.group):
+                    # Single-process fake PG: STATIC mode
+                    stage._inference_mode = InferenceMode.STATIC
+                else:
+                    # Multi-process gloo: DYNAMIC mode
+                    stage._inference_mode = InferenceMode.DYNAMIC
+
+        # In multi_proc_meta, the vote protocol uses dist.send/recv
+        # with int tensors (not meta). Our comm_events interceptors
+        # would no-op these, breaking the vote. So for multi_proc_meta,
+        # we skip the vote entirely and let DYNAMIC mode handle shape
+        # inference via _send_meta/_recv_meta (which use
+        # send_object_list/recv_object_list, not intercepted).
+        if stages and not is_fake_process_group(stages[0].group):
+            # Multi-process: skip vote, DYNAMIC mode will handle it
+            return
 
     _PipelineSchedule._warmup_p2p = _meta_safe_warmup_p2p
 
@@ -843,14 +865,31 @@ def _patch_pipeline_stage_meta_exchange_for_fake_pg() -> None:
     orig_recv_meta = PipelineStage._recv_meta
 
     def _sim_send_meta(self, meta, dst_stage):  # noqa: ANN001
-        if not is_fake_process_group(self.group):
+        if not is_fake_process_group(self.group) and not _is_meta_simulation:
             return orig_send_meta(self, meta, dst_stage)
+        # In multi_proc_meta mode (gloo PG), use real send_object_list
+        # to pass metadata between processes
+        if _is_meta_simulation and not is_fake_process_group(self.group):
+            # Real multi-process: use gloo send_object_list
+            import torch.distributed as dist
+            peer_global = self._resolve_peer_global_rank(dst_stage)
+            dist.send_object_list([meta], dst=peer_global, group=self.group)
+            return
+        # Single-process fake PG: use shared buffer
         key = (self.stage_index, dst_stage)
         PipelineStage._sim_shared_meta_buffer[key] = meta
 
     def _sim_recv_meta(self, src_stage):  # noqa: ANN001
-        if not is_fake_process_group(self.group):
+        if not is_fake_process_group(self.group) and not _is_meta_simulation:
             return orig_recv_meta(self, src_stage)
+        # In multi_proc_meta mode (gloo PG), use real recv_object_list
+        if _is_meta_simulation and not is_fake_process_group(self.group):
+            import torch.distributed as dist
+            peer_global = self._resolve_peer_global_rank(src_stage)
+            obj_list = [None]
+            dist.recv_object_list(obj_list, src=peer_global, group=self.group)
+            return obj_list[0]
+        # Single-process fake PG: use shared buffer
         key = (src_stage, self.stage_index)
         return PipelineStage._sim_shared_meta_buffer.get(key)
 
@@ -866,21 +905,31 @@ def _patch_pipeline_stage_meta_exchange_for_fake_pg() -> None:
 
     def _sim_prepare_forward_infra(self, num_microbatches, args, kwargs=None, has_backward=False):  # noqa: ANN001
         from torchtitan_npu.distributed.process_group import is_fake_process_group as _is_fake
-        if not _is_fake(self.group):
+        # In multi_proc_meta mode (gloo PG, not fake), DYNAMIC mode handles
+        # shape inference via _send_meta/_recv_meta (gloo send/recv_object_list).
+        # Let the original _prepare_forward_infra run — it will call
+        # _forward_metadata_inference which uses _recv_meta to get input
+        # shapes from the previous stage.
+        if not _is_fake(self.group) and not _is_meta_simulation:
+            return orig_prepare_forward(self, num_microbatches, args, kwargs=kwargs, has_backward=has_backward)
+
+        # For multi_proc_meta (gloo, not fake PG), let original handle it
+        # (DYNAMIC mode + _send_meta/_recv_meta via gloo)
+        if not _is_fake(self.group) and _is_meta_simulation:
             return orig_prepare_forward(self, num_microbatches, args, kwargs=kwargs, has_backward=has_backward)
 
         # If user_meta.inputs is already set, use the original path
         if self._user_meta.inputs is not None:
             return orig_prepare_forward(self, num_microbatches, args, kwargs=kwargs, has_backward=has_backward)
 
-        # Run a local forward pass to infer input/output shapes
+        # Single-process fake PG: run local forward to infer shapes
         from torch.distributed.pipelining._utils import (
             TensorMeta,
             _StageForwardMeta,
             extract_tensor_meta,
         )
 
-        # Determine input tensors: first stage uses args, others use placeholder
+        # Determine input tensors: first stage uses args
         if self.is_first:
             if isinstance(args, _StageForwardMeta):
                 input_tensors = args.forward_metas
@@ -889,10 +938,9 @@ def _patch_pipeline_stage_meta_exchange_for_fake_pg() -> None:
             else:
                 input_tensors = args if isinstance(args, tuple) else (args,)
         else:
-            # Non-first stage: create placeholder input from the shared buffer
-            fwd_meta = PipelineStage._sim_shared_meta_buffer.get((self.stage_index - 1, self.stage_index))
-            if fwd_meta is not None:
-                # Create empty tensors from the metadata
+            # Non-first stage in single-process fake PG: receive from shared buffer
+            fwd_meta = self._recv_meta(self.stage_index - 1)
+            if fwd_meta is not None and hasattr(fwd_meta, "forward_metas"):
                 input_tensors = tuple(
                     torch.empty(m.shape, dtype=getattr(torch, m.dtype) if isinstance(m.dtype, str) else m.dtype, device="meta")
                     if isinstance(m, TensorMeta)
@@ -932,6 +980,11 @@ def _patch_pipeline_stage_meta_exchange_for_fake_pg() -> None:
 
     def _sim_prepare_backward_infra(self, num_microbatches, loss_fn=None, target=None, received_grad_meta=None):  # noqa: ANN001
         from torchtitan_npu.distributed.process_group import is_fake_process_group as _is_fake
+        if not _is_fake(self.group) and not _is_meta_simulation:
+            return orig_prepare_backward(self, num_microbatches, loss_fn=loss_fn, target=target, received_grad_meta=received_grad_meta)
+
+        # For multi_proc_meta (gloo, not fake), DYNAMIC mode handles
+        # backward metadata via _send_meta/_recv_meta. Skip this patch.
         if not _is_fake(self.group):
             return orig_prepare_backward(self, num_microbatches, loss_fn=loss_fn, target=target, received_grad_meta=received_grad_meta)
 
@@ -1020,6 +1073,306 @@ def _patch_pipeline_stage_for_pp_context() -> None:
     PipelineStage.backward_one_chunk = _patched_bwd_one_chunk
 
 
+def _patch_get_stage_indices_for_fake_pg() -> None:
+    """Patch ``_get_stage_indices`` inside ``pipeline_module_split`` to
+    return ALL stage indices (not just the local PP rank's stages) when
+    running under a fake process group.
+
+    Under fake PG, only one process runs (pp_rank=0), so
+    ``_get_stage_indices`` normally returns ``[0]`` — only stage 0 is
+    created and executed.  Other PP stages (1..N-1) never run, so their
+    ops and P2P communication are never captured.
+
+    This patch makes ``_get_stage_indices`` return ``range(num_stages)``
+    (all stages) under fake PG, so all ``PipelineStage`` objects are
+    created in one process.  The PP schedule then runs all stages
+    sequentially, and we capture every stage's ops and P2P events.
+
+    Falls back to the original for non-fake process groups."""
+    global _original_get_stage_indices
+    try:
+        from torchtitan.distributed.pipeline_parallel import pipeline_module_split
+        from torchtitan_npu.distributed.process_group import is_fake_process_group
+    except Exception:
+        return
+
+    if _original_get_stage_indices is not _MISSING:
+        return
+
+    # _get_stage_indices is a nested function inside pipeline_module_split,
+    # so we cannot patch it directly.  Instead, we patch pipeline_module_split
+    # itself to override the stage indices when under fake PG.
+    import torchtitan.distributed.pipeline_parallel as pp_mod
+    _original_pms = pp_mod.pipeline_module_split
+    _original_get_stage_indices = _original_pms  # store for unpatch
+
+    def _patched_pipeline_module_split(model, pp_mesh, pp_schedule, device, module_names_per_stage):  # noqa: ANN001
+        """Wrapper that creates ALL PP stages under fake PG."""
+        # Check if we are under fake PG
+        try:
+            pg = pp_mesh.get_group("pp")
+            is_fake = is_fake_process_group(pg)
+        except Exception:
+            is_fake = False
+
+        if not is_fake:
+            return _original_pms(model, pp_mesh, pp_schedule, device, module_names_per_stage)
+
+        # Under fake PG: call the original, which will use _get_stage_indices
+        # to return only [0].  We then replicate the stage-creation loop
+        # for ALL indices by calling the original function's inner
+        # _build_stage_from_modules.  Since that's a nested function,
+        # we replicate the stage creation here.
+        import copy
+        import torch.nn as nn
+        from torch.distributed.pipelining.stage import PipelineStage
+
+        num_stages = len(module_names_per_stage)
+        whole_model = model
+        pp_group = pp_mesh.get_group("pp")
+
+        def _build_stage(stage_idx):
+            m = copy.deepcopy(whole_model)
+            modules_to_keep = set(module_names_per_stage[stage_idx])
+            for module_name, module_value in m.named_children():
+                if isinstance(module_value, (nn.ModuleDict, nn.ModuleList)):
+                    layers_to_keep = {
+                        name.split(".", 1)[1]
+                        for name in modules_to_keep
+                        if name.startswith(f"{module_name}.")
+                    }
+                    if layers_to_keep:
+                        if isinstance(module_value, nn.ModuleDict):
+                            for layer_name in list(module_value.keys()):
+                                if layer_name not in layers_to_keep:
+                                    del module_value[layer_name]
+                        elif isinstance(module_value, nn.ModuleList):
+                            indices_to_keep = {
+                                int(idx) for idx in layers_to_keep if idx.isdigit()
+                            }
+                            new_layers = nn.ModuleList(
+                                [layer for i, layer in enumerate(module_value) if i in indices_to_keep]
+                            )
+                            setattr(m, module_name, new_layers)
+                    else:
+                        if isinstance(module_value, nn.ModuleDict):
+                            setattr(m, module_name, nn.ModuleDict())
+                        elif isinstance(module_value, nn.ModuleList):
+                            setattr(m, module_name, nn.ModuleList())
+                elif module_name not in modules_to_keep:
+                    setattr(m, module_name, None)
+            stage = PipelineStage(m, stage_idx, num_stages, device, group=pp_group)
+            return stage, m
+
+        stages = []
+        models = []
+        for stage_idx in range(num_stages):
+            stage, model_chunk = _build_stage(stage_idx)
+            stages.append(stage)
+            models.append(model_chunk)
+
+        return stages, models
+
+    pp_mod.pipeline_module_split = _patched_pipeline_module_split
+
+
+def _patch_build_pipeline_schedule_for_fake_pg() -> None:
+    """Patch ``build_pipeline_schedule`` to use ``len(stages)`` as
+    ``num_total_stages`` when under fake PG.
+
+    Normally, ``num_total_stages = pp_degree * len(stages)`` because
+    each PP rank has ``len(stages)`` stages.  But when
+    ``_patch_get_stage_indices_for_fake_pg`` creates ALL stages in one
+    process, ``len(stages)`` already equals the total number of stages,
+    so multiplying by ``pp_degree`` gives an inflated count (e.g.
+    16 * 16 = 256 instead of 16).
+
+    This patch overrides ``num_total_stages`` to ``len(stages)`` under
+    fake PG by wrapping the schedule class constructor."""
+    try:
+        import torchtitan.distributed.pipeline_parallel as pp_mod
+        from torchtitan_npu.distributed.process_group import is_fake_process_group
+    except Exception:
+        return
+
+    if hasattr(pp_mod, "_sim_orig_build_pipeline_schedule"):
+        return
+    pp_mod._sim_orig_build_pipeline_schedule = pp_mod.build_pipeline_schedule
+
+    def _patched_build_pipeline_schedule(*args, **kwargs):  # noqa: ANN001
+        orig = pp_mod._sim_orig_build_pipeline_schedule
+        # Check if under fake PG by inspecting the stages' group
+        stages = kwargs.get("stages") or (args[0] if args else None)
+        is_fake = False
+        if stages:
+            try:
+                pg = stages[0].group
+                is_fake = is_fake_process_group(pg)
+            except Exception:
+                pass
+
+        if not is_fake:
+            return orig(*args, **kwargs)
+
+        # Under fake PG: all stages are in one process.
+        # Temporarily override parallelism.pipeline_parallel_degree to 1
+        # so that num_total_stages = 1 * len(stages) = len(stages)
+        parallelism = kwargs.get("parallelism")
+        if parallelism is not None and hasattr(parallelism, "pipeline_parallel_degree"):
+            orig_pp = parallelism.pipeline_parallel_degree
+            parallelism.pipeline_parallel_degree = 1
+            try:
+                result = orig(*args, **kwargs)
+            finally:
+                parallelism.pipeline_parallel_degree = orig_pp
+            return result
+
+        return orig(*args, **kwargs)
+
+    pp_mod.build_pipeline_schedule = _patched_build_pipeline_schedule
+
+
+def _patch_device_mesh_world_size_check() -> None:
+    """Patch DeviceMesh._setup_world_group_and_device to skip the
+    ``mesh > world_size`` check when using fake backend.
+
+    In multi_proc_meta mode, the mesh has 2048 ranks but gloo only
+    has 16 processes.  When we use fake backend for the mesh, the
+    check ``self._layout.numel() > world_size`` fails because
+    ``world_size`` is the gloo world_size (16), not the full
+    simulated world_size (2048)."""
+    try:
+        from torch.distributed.device_mesh import DeviceMesh
+    except Exception:
+        return
+
+    if hasattr(DeviceMesh, "_sim_orig_setup_world_group"):
+        return
+    DeviceMesh._sim_orig_setup_world_group = DeviceMesh._setup_world_group_and_device
+
+    def _patched_setup_world_group_and_device(self):  # noqa: ANN001
+        from torch.distributed.distributed_c10d import is_initialized, init_process_group, get_world_size, _get_default_group
+        default_initialized = is_initialized()
+        if not default_initialized:
+            init_process_group()
+
+        # Skip the mesh > world_size check when device_type is "fake"
+        # (the mesh was created with fake backend to simulate a larger
+        # world than the actual gloo world_size)
+        if self._device_type == "fake":
+            return _get_default_group()
+
+        # For non-fake backend, use the original logic
+        world_size = get_world_size()
+        if self._layout.numel() > world_size:
+            raise RuntimeError(
+                f"Mesh should not be bigger than default world size {world_size}, "
+                f"but found {self._layout.numel()} ranks!"
+            )
+        return DeviceMesh._sim_orig_setup_world_group(self)
+
+    DeviceMesh._setup_world_group_and_device = _patched_setup_world_group_and_device
+
+
+def _patch_parallel_dims_for_multi_proc(full_ws: int, gloo_ws: int) -> None:
+    """Patch ParallelDims to use gloo world_size for mesh creation
+    while keeping full_ws for validation.
+
+    In multi_proc_meta mode, we have gloo_ws (e.g. 16) real processes,
+    but want to simulate full_ws (e.g. 2048) ranks.  ParallelDims
+    validates that the product of all parallel degrees == world_size,
+    and build_mesh creates a DeviceMesh of size world_size.  But
+    init_device_mesh checks mesh size <= gloo world_size.
+
+    This patch:
+    1. Sets ParallelDims.world_size = full_ws (for validation)
+    2. Patches init_device_mesh to accept mesh > gloo_ws by using
+       fake backend for dimensions that exceed gloo_ws
+    """
+    try:
+        from torch.distributed.device_mesh import init_device_mesh as orig_init_mesh
+        import torch.distributed.device_mesh as dm_mod
+    except Exception:
+        return
+
+    if hasattr(dm_mod, "_sim_orig_init_device_mesh"):
+        return
+    dm_mod._sim_orig_init_device_mesh = orig_init_mesh
+
+    def _patched_init_device_mesh(device_type, mesh_shape, *, mesh_dim_names=None, **kwargs):  # noqa: ANN001
+        """Wrapper that allows mesh > world_size by using fake backend
+        for the oversized mesh."""
+        import torch.distributed as dist
+        gloo_ws = dist.get_world_size() if dist.is_initialized() else 1
+        mesh_size = 1
+        for d in mesh_shape:
+            mesh_size *= d
+
+        if mesh_size <= gloo_ws:
+            return orig_init_mesh(device_type, mesh_shape, mesh_dim_names=mesh_dim_names, **kwargs)
+
+        # Mesh is bigger than gloo world_size: use fake backend.
+        # Also patch DeviceMesh to skip the mesh > world_size check.
+        _patch_device_mesh_world_size_check()
+        return orig_init_mesh("fake", mesh_shape, mesh_dim_names=mesh_dim_names, **kwargs)
+
+    dm_mod.init_device_mesh = _patched_init_device_mesh
+
+    # Also patch the by-value import in torchtitan.distributed.parallel_dims
+    try:
+        import torchtitan.distributed.parallel_dims as pd_mod
+        pd_mod.init_device_mesh = _patched_init_device_mesh
+    except Exception:
+        pass
+
+
+def _patch_init_distributed_for_multi_proc_meta() -> None:
+    """Patch ``init_distributed`` to handle ``comm.mode=multi_proc_meta``.
+
+    In multi_proc_meta mode, we use ``gloo`` backend (real multi-process
+    rendezvous via torchrun) instead of ``fake`` backend.  All collective
+    and P2P communication is still intercepted by ``comm_events.py``
+    (via ``_is_meta_simulation`` flag), so gloo only handles the initial
+    ``init_process_group`` rendezvous -- no meta tensors ever reach gloo.
+
+    This patch adds a branch for ``multi_proc_meta`` mode that calls
+    ``init_process_group("gloo")`` and returns the world_size."""
+    try:
+        from torchtitan.distributed import utils as dist_utils
+    except Exception:
+        return
+
+    if hasattr(dist_utils, "_sim_orig_init_distributed"):
+        return
+    dist_utils._sim_orig_init_distributed = dist_utils.init_distributed
+
+    def _patched_init_distributed(comm_config, *args, **kwargs):  # noqa: ANN001
+        orig = dist_utils._sim_orig_init_distributed
+        if comm_config.mode != "multi_proc_meta":
+            return orig(comm_config, *args, **kwargs)
+
+        # Multi-process meta simulation: use gloo backend
+        import os
+        import torch.distributed as dist
+        from datetime import timedelta
+
+        dist.init_process_group(
+            backend="gloo",
+            timeout=timedelta(seconds=comm_config.init_timeout_seconds),
+        )
+        # In multi_proc_meta mode, gloo world_size = PP degree (e.g. 16).
+        # We return this as the world_size for ParallelDims validation.
+        # The full simulated world_size (e.g. 2048) is handled by the
+        # RankTable, which uses the config's parallel degrees to compute
+        # the full rank topology without needing a real 2048-rank mesh.
+        # The mesh will have 16 ranks (one per PP stage), and each rank's
+        # PP coordinate is its gloo rank. Other dimensions (DP/TP/CP/EP)
+        # are simulated by the comm_events interceptors.
+        return dist.get_world_size()
+
+    dist_utils.init_distributed = _patched_init_distributed
+
+
 def patch_device_type_to_meta() -> None:
     """Idempotently rebind `device_type="meta"` / `device_module=<stub>`
     across every module that imported them by value at load time, register
@@ -1089,6 +1442,9 @@ def patch_device_type_to_meta() -> None:
     _patch_pipeline_stage_meta_exchange_for_fake_pg()
     _patch_pipeline_stage_for_pp_context()
     _patch_torch_equal_for_meta()
+    _patch_init_distributed_for_multi_proc_meta()
+    global _is_meta_simulation
+    _is_meta_simulation = True
     _patched = True
 
 

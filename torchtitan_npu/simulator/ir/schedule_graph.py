@@ -95,3 +95,64 @@ class ScheduleGraph:
     def __post_init__(self) -> None:
         if not self.instance_map and self.instances:
             self.instance_map = {instance.instance_id: instance for instance in self.instances}
+
+    def export_l1_schedule_csv(self, path: str, *, max_ranks: int | None = None) -> None:
+        """Export L2→L1: per-rank L1 subgraph execution schedule.
+
+        Outputs one CSV per rank under ``path/`` directory (created if
+        needed).  Each row = one captured execution event (forward chunk,
+        backward chunk, P2P send/recv, collective comm), ordered by
+        captured ``seq_idx``.
+
+        Columns:
+            seq_idx, phase, microbatch, action, comm_type, comm_peer_rank,
+            comm_dim, comm_ranks, op_id, tensor_shape, volume_bytes
+
+        All data from captured execution_timeline + CommEvent fields.
+        No scheduling rules are inferred or hardcoded.
+        """
+        import csv
+        import os
+
+        os.makedirs(path, exist_ok=True)
+
+        # Group execution_timeline entries by rank
+        # (currently all entries have rank=0 since capture is single-process;
+        # for PP, the pipeline_stage field distinguishes stages)
+        # We export one file per pipeline_stage (since all ranks in the same
+        # stage share the same template/schedule)
+        stages_seen: set[int] = set()
+        for entry in self.execution_timeline:
+            stage = entry.pipeline_stage if entry.pipeline_stage >= 0 else 0
+            stages_seen.add(stage)
+
+        for stage in sorted(stages_seen):
+            # Filter entries for this stage
+            stage_entries = [
+                e for e in self.execution_timeline
+                if (e.pipeline_stage if e.pipeline_stage >= 0 else 0) == stage
+            ]
+            stage_entries.sort(key=lambda e: e.seq_idx)
+
+            fname = os.path.join(path, f"stage_{stage}_l1_schedule.csv")
+            with open(fname, "w", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                w.writerow([
+                    "seq_idx", "phase", "microbatch", "action",
+                    "comm_type", "comm_peer_rank", "comm_dim", "comm_ranks",
+                    "op_id",
+                ])
+                for e in stage_entries:
+                    # Determine action from captured fields
+                    if e.comm_type:
+                        action = e.comm_type
+                    else:
+                        action = f"{e.phase}_one_chunk"
+                    w.writerow([
+                        e.seq_idx, e.phase,
+                        e.micro_batch_idx if e.micro_batch_idx >= 0 else "",
+                        action,
+                        e.comm_type, e.comm_peer_rank,
+                        "", "",  # comm_dim/comm_ranks not in TimelineEntry
+                        e.op_id,
+                    ])

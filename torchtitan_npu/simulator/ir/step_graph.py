@@ -74,3 +74,58 @@ class StepGraph:
             self.entry_nodes, self.exit_nodes = _compute_entry_exit(self.nodes)
         if self.nodes:
             self.is_acyclic = _check_acyclic(self.nodes)
+
+    def export_l0_csv(self, path: str) -> None:
+        """Export L1→L0: all L0 OpNodes in this step, in topological order.
+
+        Columns: topo_order, op_id, seq_idx, op_type, raw_op_type, phase,
+        inputs_shape, outputs_shape, inputs_dtype, outputs_dtype,
+        flops, peak_mem, comm_bytes, repeat_count, module_path,
+        comm_dim, comm_ranks, predecessors, successors
+        """
+        import csv
+        from collections import deque
+
+        # Topological sort (Kahn's algorithm, ties by op_id ascending)
+        in_degree = {op_id: sum(1 for p in node.predecessors if p in self.nodes) for op_id, node in self.nodes.items()}
+        ready = sorted(op_id for op_id, deg in in_degree.items() if deg == 0)
+        queue: deque[int] = deque(ready)
+        sorted_ids: list[int] = []
+        while queue:
+            op_id = queue.popleft()
+            sorted_ids.append(op_id)
+            newly_ready = []
+            for succ in self.nodes[op_id].successors:
+                if succ in in_degree:
+                    in_degree[succ] -= 1
+                    if in_degree[succ] == 0:
+                        newly_ready.append(succ)
+            if newly_ready:
+                queue = deque(sorted(list(queue) + sorted(newly_ready)))
+
+        shapes = lambda metas: ";".join("[" + ",".join(str(d) for d in m.shape) + "]" for m in metas)
+        dtypes = lambda metas: ";".join(m.dtype for m in metas)
+
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow([
+                "topo_order", "op_id", "seq_idx", "op_type", "raw_op_type", "phase",
+                "inputs_shape", "outputs_shape", "inputs_dtype", "outputs_dtype",
+                "flops", "peak_mem", "comm_bytes", "repeat_count",
+                "module_path", "comm_dim", "comm_ranks",
+                "predecessors", "successors",
+            ])
+            for topo_idx, op_id in enumerate(sorted_ids):
+                node = self.nodes[op_id]
+                ann = node.annotations
+                w.writerow([
+                    topo_idx, op_id, node.seq_idx, node.op_type,
+                    ann.get("raw_op_type", ""), ann.get("phase", ""),
+                    shapes(node.inputs), shapes(node.outputs),
+                    dtypes(node.inputs), dtypes(node.outputs),
+                    node.flops, node.peak_mem, node.comm_bytes,
+                    ann.get("repeat_count", 1), ann.get("module_path", ""),
+                    ann.get("comm_dim", ""), ann.get("comm_ranks", ""),
+                    ";".join(str(p) for p in node.predecessors),
+                    ";".join(str(s) for s in node.successors),
+                ])

@@ -43,6 +43,7 @@ class SimulationConfig:
     output_formats: list[str] = field(default_factory=lambda: ["json", "dot", "text", "html", "csv"])
     target_npu_device_type: str = "non_a5"
     csv_max_ranks: int | None = None
+    simulated_parallel_degrees: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass(kw_only=True, slots=True)
@@ -126,7 +127,31 @@ def run_simulation_step(
 
     boundary = StepBoundaryTracker()
     module_path_tracker = ModulePathTracker(model_parts[0])
-    capture = OpDispatchCapture(module_path_tracker=module_path_tracker, phase_provider=lambda: boundary.current_phase)
+
+    # Phase provider: when PP is active, _pp_context["phase"] is updated by
+    # the patched forward_one_chunk / backward_one_chunk (which is called
+    # for every microbatch).  StepBoundaryTracker.current_phase is only
+    # updated by Tensor.backward / Optimizer.step hooks, but PP uses
+    # torch.autograd.backward (not Tensor.backward), so the tracker misses
+    # the backward phase.  Reading _pp_context["phase"] when it differs
+    # from the tracker gives us the correct phase for every captured op.
+    def _phase_provider() -> str:
+        from torchtitan_npu.simulator.meta_env import _pp_context
+        # When boundary says "optimizer" (set by boundary.mark("optimizer")),
+        # always return "optimizer" — _pp_context may still say "backward"
+        # from the last backward_one_chunk call.
+        if boundary.current_phase == "optimizer":
+            return "optimizer"
+        # During forward_backward_step, _pp_context is updated by the
+        # patched forward_one_chunk / backward_one_chunk.  Use it to
+        # detect backward phase (PP uses autograd.backward, which
+        # bypasses the Tensor.backward hook).
+        pp_phase = _pp_context.get("phase", "")
+        if pp_phase == "backward":
+            return "backward"
+        return boundary.current_phase
+
+    capture = OpDispatchCapture(module_path_tracker=module_path_tracker, phase_provider=_phase_provider)
 
     with capture_fake_collectives() as comm_recorder, boundary, module_path_tracker, capture:
         boundary.mark("forward")
@@ -182,7 +207,8 @@ class SimulationTrainer(Trainer):
         force_moe_load_balance(config)
         force_deterministic_seed(config)
         config.compile.enable = False  # tracing needs eager dispatch, not a compiled graph
-        config.comm.mode = "fake_backend"
+        # comm.mode is set by entry.py / config_registry; do not override here
+        # (fake_backend for single-process, multi_proc_meta for multi-process)
         apply_mhc_shims()
         apply_smla_shims()
         _strip_hardware_dependent_model_converters(config)
@@ -235,7 +261,127 @@ class SimulationTrainer(Trainer):
             num_micro_batches=self.gradient_accumulation_steps,
             gradient_accumulation=self.gradient_accumulation_steps,
         )
-        self._export()
+        # In multi_proc_meta mode, each rank writes its IR to a per-rank
+        # file; rank 0 merges them after all ranks finish.
+        import torch.distributed as dist
+        is_multi_proc = self.config.comm.mode == "multi_proc_meta"
+        if is_multi_proc and dist.is_initialized():
+            rank = dist.get_rank()
+            # Each rank writes its per-rank IR
+            self._export_per_rank(rank)
+            # Barrier to ensure all ranks have written
+            dist.barrier()
+            # Rank 0 merges all per-rank IRs
+            if rank == 0:
+                self._merge_per_rank_ir()
+        else:
+            self._export()
+
+    def _export_per_rank(self, rank: int) -> None:
+        """Write this rank's IR to a per-rank JSON file."""
+        assert self.workload_graph is not None
+        out_dir = self.simulation_config.output_dir
+        per_rank_dir = os.path.join(out_dir, "per_rank")
+        os.makedirs(per_rank_dir, exist_ok=True)
+        # Serialize this rank's captured data
+        import json
+        schedule = self.workload_graph.iteration.schedule
+        rank_data = {
+            "rank": rank,
+            "pipeline_stage": rank,  # In multi_proc_meta, rank == PP stage
+            "step_templates": {},
+            "execution_timeline": [
+                {
+                    "seq_idx": e.seq_idx,
+                    "op_id": e.op_id,
+                    "rank": rank,
+                    "pipeline_stage": rank,
+                    "micro_batch_idx": e.micro_batch_idx,
+                    "phase": e.phase,
+                    "comm_type": e.comm_type,
+                    "comm_peer_rank": e.comm_peer_rank,
+                }
+                for e in schedule.execution_timeline
+            ],
+        }
+        # Serialize step templates (L0 ops)
+        for tid, sg in self.workload_graph.step_templates.items():
+            rank_data["step_templates"][tid] = {
+                "step_type": sg.step_type,
+                "nodes": [
+                    {
+                        "op_id": n.op_id,
+                        "seq_idx": n.seq_idx,
+                        "op_type": n.op_type,
+                        "raw_op_type": n.annotations.get("raw_op_type", ""),
+                        "phase": n.annotations.get("phase", ""),
+                        "inputs_shape": [list(m.shape) for m in n.inputs],
+                        "outputs_shape": [list(m.shape) for m in n.outputs],
+                        "inputs_dtype": [m.dtype for m in n.inputs],
+                        "outputs_dtype": [m.dtype for m in n.outputs],
+                        "flops": n.flops,
+                        "peak_mem": n.peak_mem,
+                        "comm_bytes": n.comm_bytes,
+                        "module_path": n.annotations.get("module_path", ""),
+                        "comm_dim": n.annotations.get("comm_dim", ""),
+                        "comm_ranks": n.annotations.get("comm_ranks", ""),
+                    }
+                    for n in sg.nodes.values()
+                ],
+            }
+        with open(os.path.join(per_rank_dir, f"rank_{rank}.json"), "w") as f:
+            json.dump(rank_data, f)
+
+    def _merge_per_rank_ir(self) -> None:
+        """Merge all per-rank IR files into the final output."""
+        out_dir = self.simulation_config.output_dir
+        per_rank_dir = os.path.join(out_dir, "per_rank")
+        import json
+        import glob
+
+        rank_files = sorted(glob.glob(os.path.join(per_rank_dir, "rank_*.json")),
+                            key=lambda p: int(p.split("rank_")[-1].split(".")[0]))
+        all_ranks = []
+        for f in rank_files:
+            with open(f) as fh:
+                all_ranks.append(json.load(fh))
+
+        # Write merged summary
+        with open(os.path.join(out_dir, "merged_summary.txt"), "w") as f:
+            f.write(f"Merged IR from {len(all_ranks)} PP stages\n\n")
+            for r in all_ranks:
+                stage = r["pipeline_stage"]
+                templates = r["step_templates"]
+                timeline = r["execution_timeline"]
+                from collections import Counter
+                phases = Counter(e["phase"] for e in timeline)
+                f.write(f"[Stage {stage}] rank={r['rank']} phases={dict(phases)}\n")
+                for tid, sg in templates.items():
+                    f.write(f"  {tid}: {sg['step_type']}, {len(sg['nodes'])} nodes\n")
+                p2p = [e for e in timeline if e["comm_type"] and ("send" in e["comm_type"] or "recv" in e["comm_type"])]
+                f.write(f"  P2P events: {len(p2p)}\n")
+                for e in p2p[:5]:
+                    f.write(f"    seq={e['seq_idx']} mb={e['micro_batch_idx']} comm={e['comm_type']} peer={e['comm_peer_rank']}\n")
+                if len(p2p) > 5:
+                    f.write(f"    ... and {len(p2p)-5} more\n")
+                f.write("\n")
+
+        # Also export the rank 0's workload graph as the base, plus
+        # per-stage L0 CSVs
+        formats = self.simulation_config.output_formats
+        if "csv" in formats:
+            ir_dir = os.path.join(out_dir, "ir_export")
+            os.makedirs(ir_dir, exist_ok=True)
+            for r in all_ranks:
+                stage = r["pipeline_stage"]
+                for tid, sg in r["step_templates"].items():
+                    fname = os.path.join(ir_dir, f"stage_{stage}_{sg['step_type']}_l0_ops.csv")
+                    with open(fname, "w", encoding="utf-8") as f:
+                        f.write("topo_order,op_id,seq_idx,op_type,raw_op_type,phase,inputs_shape,outputs_shape,flops,peak_mem,comm_bytes,module_path,comm_dim,comm_ranks\n")
+                        for i, n in enumerate(sg["nodes"]):
+                            f.write(f"{i},{n['op_id']},{n['seq_idx']},{n['op_type']},{n['raw_op_type']},{n['phase']},{';'.join(str(s) for s in n['inputs_shape'])},{';'.join(str(s) for s in n['outputs_shape'])},{n['flops']},{n['peak_mem']},{n['comm_bytes']},{n['module_path']},{n['comm_dim']},{n['comm_ranks']}\n")
+
+        print(f"Merged {len(all_ranks)} PP stages' IR to {out_dir}")
 
     def _export(self) -> None:
         assert self.workload_graph is not None
@@ -256,3 +402,16 @@ class SimulationTrainer(Trainer):
                 os.path.join(out_dir, "kernel_summary"),
                 max_ranks=self.simulation_config.csv_max_ranks,
             )
+            # Per-level IR export: scheduling relationships
+            ir_dir = os.path.join(out_dir, "ir_export")
+            os.makedirs(ir_dir, exist_ok=True)
+            # L3: inter-rank schedule
+            self.workload_graph.export_schedule_csv(os.path.join(ir_dir, "rank_schedule.csv"))
+            # L2: per-stage L1 schedule
+            self.workload_graph.iteration.schedule.export_l1_schedule_csv(
+                os.path.join(ir_dir, "l1_schedule"),
+                max_ranks=self.simulation_config.csv_max_ranks,
+            )
+            # L1: per-step L0 ops
+            for tid, sg in self.workload_graph.step_templates.items():
+                sg.export_l0_csv(os.path.join(ir_dir, f"step_{sg.step_type}_l0_ops.csv"))

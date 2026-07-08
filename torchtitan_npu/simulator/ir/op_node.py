@@ -33,3 +33,30 @@ class OpNode:
     comm_bytes: int = 0
     annotations: dict[str, Any] = field(default_factory=dict)
     seq_idx: int = 0
+
+    def export_detail_csv(self, path: str) -> None:
+        """Export this single op's full details as a one-row CSV."""
+        import csv
+        ann = self.annotations
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow([
+                "op_id", "seq_idx", "op_type", "raw_op_type", "phase",
+                "inputs_shape", "outputs_shape", "inputs_dtype", "outputs_dtype",
+                "flops", "peak_mem", "param_mem", "comm_bytes",
+                "repeat_count", "module_path", "comm_dim", "comm_ranks",
+                "predecessors", "successors",
+            ])
+            shapes = lambda metas: ";".join("[" + ",".join(str(d) for d in m.shape) + "]" for m in metas)
+            dtypes = lambda metas: ";".join(m.dtype for m in metas)
+            w.writerow([
+                self.op_id, self.seq_idx, self.op_type,
+                ann.get("raw_op_type", ""), ann.get("phase", ""),
+                shapes(self.inputs), shapes(self.outputs),
+                dtypes(self.inputs), dtypes(self.outputs),
+                self.flops, self.peak_mem, self.param_mem, self.comm_bytes,
+                ann.get("repeat_count", 1), ann.get("module_path", ""),
+                ann.get("comm_dim", ""), ann.get("comm_ranks", ""),
+                ";".join(str(p) for p in self.predecessors),
+                ";".join(str(s) for s in self.successors),
+            ])

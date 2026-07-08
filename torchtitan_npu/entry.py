@@ -46,7 +46,10 @@ def main() -> None:
     trainer = None
 
     comm_mode = os.getenv("COMM_MODE", None)
-    if comm_mode not in ("fake_backend", "local_tensor"):
+    # For simulator configs, comm.mode is set in config_registry
+    if hasattr(config, "comm") and config.comm.mode in ("fake_backend", "local_tensor", "multi_proc_meta"):
+        comm_mode = config.comm.mode
+    if comm_mode not in ("fake_backend", "local_tensor", "multi_proc_meta"):
         # only when COMM_MODE is not set, patch is apply
         _patch_for_garbage_collection_run()
         _patch_for_parallel_dims_build_mesh()

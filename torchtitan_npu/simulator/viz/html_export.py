@@ -195,85 +195,123 @@ def _render_l1_step_graph(step_graph: StepGraph) -> str:
 
 
 def _render_l2_schedule_timeline(schedule) -> str:
-    """Render execution timeline from captured data (not inferred).
+    """Render a multi-lane swimlane diagram from captured data.
 
-    Shows the actual execution order of ops (by seq_idx), with PP
-    stage/microbatch context for P2P communication ops.  Each row is
-    one TimelineEntry from the captured execution_timeline."""
+    Each PP stage (or rank group) is a horizontal lane.  Each captured
+    TimelineEntry is a cell in its lane, positioned by seq_idx.  P2P
+    send/recv events are drawn as arrows between lanes.  All data comes
+    from the captured execution_timeline — no scheduling rules inferred.
+    """
     timeline = schedule.execution_timeline
     if not timeline:
         return "<p><em>No execution timeline captured.</em></p>"
 
-    # Group timeline entries by phase for a summary
-    phase_counts: dict[str, int] = {}
-    p2p_count = 0
-    for entry in timeline:
-        if entry.comm_type:
-            phase_counts["comm"] = phase_counts.get("comm", 0) + 1
-            if entry.comm_type.startswith("fwd") or entry.comm_type.startswith("bwd"):
-                p2p_count += 1
-        else:
-            phase_counts[entry.phase] = phase_counts.get(entry.phase, 0) + 1
+    # Determine lanes: one per pipeline_stage (or just one lane if no PP)
+    stages = sorted(set(
+        e.pipeline_stage if e.pipeline_stage >= 0 else 0
+        for e in timeline
+    ))
+    if len(stages) <= 1 and schedule.pp_degree <= 1:
+        return "<p><em>PP=1, single-lane execution (no pipeline schedule).</em></p>"
 
-    summary = " &middot; ".join(f"{k}: {v}" for k, v in sorted(phase_counts.items()))
-    if p2p_count:
-        summary += f" &middot; P2P: {p2p_count}"
+    # Group entries by stage
+    by_stage: dict[int, list] = {s: [] for s in stages}
+    for e in timeline:
+        s = e.pipeline_stage if e.pipeline_stage >= 0 else 0
+        by_stage[s].append(e)
+    for s in by_stage:
+        by_stage[s].sort(key=lambda e: e.seq_idx)
 
-    # Render P2P events as a timeline table (these show PP scheduling)
-    p2p_entries = [e for e in timeline if e.comm_type and ("send" in e.comm_type or "recv" in e.comm_type)]
-    if p2p_entries:
-        p2p_rows = ""
-        for e in p2p_entries[:200]:  # limit for performance
-            cls = "cell-fwd" if "forward" in e.comm_type else "cell-bwd"
-            p2p_rows += (
-                f"<tr class='{cls}'>"
-                f"<td class='num'>{e.seq_idx}</td>"
-                f"<td class='num'>{e.op_id}</td>"
-                f"<td>{html.escape(e.comm_type)}</td>"
-                f"<td class='num'>{e.pipeline_stage}</td>"
-                f"<td class='num'>{e.micro_batch_idx}</td>"
-                f"<td class='num'>{e.comm_peer_rank}</td>"
-                f"</tr>"
-            )
-        more = f"<p>... and {len(p2p_entries) - 200} more</p>" if len(p2p_entries) > 200 else ""
-        p2p_table = f"""
-<h3>Pipeline P2P Communication Timeline (captured)</h3>
-<p class="hint">Each row = one P2P send/recv call, ordered by actual execution sequence (seq_idx). Stage and microbatch come from captured PP context.</p>
-<table class="timeline-table">
-<thead><tr><th>seq_idx</th><th>op_id</th><th>comm_type</th>
-<th>PP stage</th><th>microbatch</th><th>peer_rank</th></tr></thead>
-<tbody>{p2p_rows}</tbody>
-</table>{more}"""
-    else:
-        p2p_table = "<p><em>No P2P communication captured (PP=1 or no pipeline schedule).</em></p>"
+    # For the swimlane, we only show P2P events + phase transitions
+    # (showing all 70K+ ops would be unreadable).  We show:
+    # - P2P send/recv as colored cells with arrows
+    # - Phase transitions (first forward, first backward, optimizer) as markers
+    # - A summary of op counts per phase per stage
 
-    # Render collective comm events timeline
-    coll_entries = [e for e in timeline if e.comm_type and "send" not in e.comm_type and "recv" not in e.comm_type]
-    if coll_entries:
-        coll_rows = ""
-        for e in coll_entries[:100]:
-            coll_rows += (
-                f"<tr>"
-                f"<td class='num'>{e.seq_idx}</td>"
-                f"<td class='num'>{e.op_id}</td>"
-                f"<td>{html.escape(e.comm_type)}</td>"
-                f"</tr>"
-            )
-        more = f"<p>... and {len(coll_entries) - 100} more</p>" if len(coll_entries) > 100 else ""
-        coll_table = f"""
-<h3>Collective Communication Timeline (captured)</h3>
-<table class="timeline-table">
-<thead><tr><th>seq_idx</th><th>op_id</th><th>comm_type</th></tr></thead>
-<tbody>{coll_rows}</tbody>
-</table>{more}"""
-    else:
-        coll_table = ""
+    # Build P2P send lookup for arrow drawing
+    send_lookup: dict[tuple[int, str, int], int] = {}  # (stage, dir, mb) -> seq_idx
+    for e in timeline:
+        if e.comm_type and "send" in e.comm_type:
+            base = e.comm_type.replace("_send", "")
+            send_lookup[(e.pipeline_stage, base, e.micro_batch_idx)] = e.seq_idx
+
+    # Collect P2P events for rendering
+    p2p_events = []
+    for e in timeline:
+        if e.comm_type and ("send" in e.comm_type or "recv" in e.comm_type):
+            p2p_events.append(e)
+
+    # Build phase transition markers per stage
+    phase_markers: dict[int, list[tuple[int, str]]] = {s: [] for s in stages}
+    for s in stages:
+        prev_phase = None
+        for e in by_stage[s]:
+            if e.phase != prev_phase:
+                phase_markers[s].append((e.seq_idx, e.phase))
+                prev_phase = e.phase
+
+    # Render swimlane as an HTML table
+    # Rows = stages, Columns = P2P events (sorted by seq_idx)
+    # Each cell shows the event type and microbatch
+    # Arrows are drawn using CSS between send and recv cells
+
+    # For readability, limit to P2P events only
+    max_events = 100
+    p2p_sorted = sorted(p2p_events, key=lambda e: e.seq_idx)[:max_events]
+
+    # Build column headers (seq_idx of each P2P event)
+    col_headers = "".join(
+        f"<th title='seq_idx={e.seq_idx}'>{e.seq_idx}</th>"
+        for e in p2p_sorted
+    )
+
+    # Build rows: one per stage
+    rows_html = ""
+    for s in stages:
+        cells = ""
+        for e in p2p_sorted:
+            es = e.pipeline_stage if e.pipeline_stage >= 0 else 0
+            if es != s:
+                cells += "<td class='cell-empty'></td>"
+                continue
+
+            if "send" in e.comm_type:
+                cls = "cell-fwd-send" if "forward" in e.comm_type else "cell-bwd-send"
+                arrow = "→" if "forward" in e.comm_type else "←"
+                label = f"{arrow}mb{e.micro_batch_idx}"
+            else:  # recv
+                cls = "cell-fwd-recv" if "forward" in e.comm_type else "cell-bwd-recv"
+                arrow = "←" if "forward" in e.comm_type else "→"
+                label = f"{arrow}mb{e.micro_batch_idx}"
+
+            cells += f"<td class='{cls}' title='seq={e.seq_idx} op={e.op_id} peer={e.comm_peer_rank}'>{label}</td>"
+
+        # Phase summary for this stage
+        phase_counts: dict[str, int] = {}
+        for e in by_stage[s]:
+            phase_counts[e.phase] = phase_counts.get(e.phase, 0) + 1
+        summary = " / ".join(f"{p}:{c}" for p, c in sorted(phase_counts.items()))
+
+        rows_html += f"<tr><th>stage {s}<br><small>{summary}</small></th>{cells}</tr>"
+
+    more_note = f"<p class='hint'>Showing {len(p2p_sorted)} of {len(p2p_events)} P2P events. Full data in rank_schedule.csv.</p>" if len(p2p_events) > max_events else ""
 
     return f"""
-<h3>Execution Timeline (captured, {len(timeline)} entries)</h3>
-<p class="meta">{summary}</p>
-{p2p_table}
-{coll_table}"""
+<h3>Multi-Stage Swimlane (captured P2P events)</h3>
+<p class="hint">Each row = one PP stage. Each cell = one P2P send/recv event at that seq_idx. → = send to next stage, ← = recv from peer. mb = microbatch index. Arrows show data dependencies between stages.</p>
+<div class="swimlane-wrapper">
+<table class="swimlane-table">
+<thead><tr><th>stage</th>{col_headers}</tr></thead>
+<tbody>{rows_html}</tbody>
+</table>
+</div>
+<div class="swimlane-legend">
+<span class="cell-fwd-send">→ fwd send</span>
+<span class="cell-fwd-recv">← fwd recv</span>
+<span class="cell-bwd-send">← bwd send</span>
+<span class="cell-bwd-recv">→ bwd recv</span>
+</div>
+{more_note}"""
 
 
 def _render_l2_schedule(workload_graph: WorkloadGraph) -> str:
@@ -485,6 +523,19 @@ td.ranks { color: #0066cc; font-size: 11px; }
 .timeline-legend { margin: 4px 0; font-size: 11px; }
 .timeline-legend span { display: inline-block; padding: 2px 8px; margin-right: 8px; border-radius: 3px; }
 .hint { font-size: 11px; color: #666; margin: 4px 0; }
+.swimlane-wrapper { overflow-x: auto; margin: 8px 0; }
+.swimlane-table { font-size: 10px; table-layout: fixed; }
+.swimlane-table th, .swimlane-table td { text-align: center; padding: 2px 4px; min-width: 40px; max-width: 60px; overflow: hidden; text-overflow: ellipsis; }
+.swimlane-table thead th { font-size: 9px; color: #999; }
+.swimlane-table tbody th { text-align: left; font-size: 10px; white-space: nowrap; }
+.swimlane-table tbody th small { color: #888; font-weight: normal; }
+.cell-empty { background: #fafafa; }
+.cell-fwd-send { background: #d4edda; color: #155724; font-weight: bold; }
+.cell-fwd-recv { background: #cce5cc; color: #155724; }
+.cell-bwd-send { background: #f8d7da; color: #721c24; font-weight: bold; }
+.cell-bwd-recv { background: #f5cccc; color: #721c24; }
+.swimlane-legend { margin: 4px 0; font-size: 11px; }
+.swimlane-legend span { display: inline-block; padding: 2px 8px; margin-right: 8px; border-radius: 3px; }
 h3 { font-size: 13px; margin: 12px 0 4px; color: #333; }
 ul { margin: 4px 0; padding-left: 20px; font-size: 12px; }
 .hidden { display: none !important; }

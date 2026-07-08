@@ -53,3 +53,78 @@ class WorkloadGraph:
     cross_iter_passes: list[DataPass] = field(default_factory=list)
     total_runtime_est: float = 0.0
     total_cost_est: float = 0.0
+
+    def export_schedule_csv(self, path: str) -> None:
+        """Export L3→L2: inter-rank scheduling relationships.
+
+        Outputs ``rank_schedule.csv`` showing how ranks (PP stages)
+        execute in parallel or serial, with P2P communication dependencies
+        between them.
+
+        Columns:
+            seq_idx, pipeline_stage, phase, microbatch, action,
+            comm_type, comm_peer_rank, depends_on_stage, depends_on_seq
+
+        All data from captured execution_timeline.  ``depends_on_stage``
+        and ``depends_on_seq`` are derived from P2P recv events: a recv's
+        peer_rank identifies the sending stage, and the matching send's
+        seq_idx is the dependency.  No scheduling rules are inferred.
+        """
+        import csv
+
+        schedule = self.iteration.schedule
+        timeline = schedule.execution_timeline
+
+        # Build a lookup: for each P2P send (stage S, direction fwd/bwd send,
+        # microbatch M), find its seq_idx.  Then a P2P recv with matching
+        # stage/direction/mb can look up the send's seq_idx as its dependency.
+        # send_key = (stage, direction_without_send/recv_suffix, mb_idx)
+        # Note: under single-process fake PG, only one PP stage is executed
+        # and captured.  Sends from other stages are not captured, so
+        # depends_on_seq may be empty — only depends_on_stage is filled
+        # from the captured peer_rank.
+        send_seq_lookup: dict[tuple[int, str, int], int] = {}
+        for entry in timeline:
+            if entry.comm_type and "send" in entry.comm_type:
+                base_dir = entry.comm_type.replace("_send", "")
+                key = (entry.pipeline_stage, base_dir, entry.micro_batch_idx)
+                send_seq_lookup[key] = entry.seq_idx
+
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow([
+                "seq_idx", "pipeline_stage", "phase", "microbatch", "action",
+                "comm_type", "comm_peer_rank",
+                "depends_on_stage", "depends_on_seq",
+            ])
+            for entry in sorted(timeline, key=lambda e: e.seq_idx):
+                depends_on_stage = ""
+                depends_on_seq = ""
+                if entry.comm_type and "recv" in entry.comm_type:
+                    # A recv depends on the matching send from the peer stage.
+                    # For forward_recv: send came from stage-1 (prev stage)
+                    # For backward_recv: send came from stage+1 (next stage)
+                    base_dir = entry.comm_type.replace("_recv", "")
+                    if "forward" in base_dir:
+                        send_stage = entry.pipeline_stage - 1
+                    else:
+                        send_stage = entry.pipeline_stage + 1
+                    depends_on_stage = send_stage
+                    key = (send_stage, base_dir, entry.micro_batch_idx)
+                    depends_on_seq = send_seq_lookup.get(key, "")
+
+                # For non-comm entries, use stage 0 as default (single-process
+                # capture only executes one stage)
+                stage = entry.pipeline_stage if entry.pipeline_stage >= 0 else 0
+                action = entry.comm_type if entry.comm_type else f"{entry.phase}_one_chunk"
+                w.writerow([
+                    entry.seq_idx,
+                    stage,
+                    entry.phase,
+                    entry.micro_batch_idx if entry.micro_batch_idx >= 0 else "",
+                    action,
+                    entry.comm_type,
+                    entry.comm_peer_rank if entry.comm_peer_rank >= 0 else "",
+                    depends_on_stage,
+                    depends_on_seq,
+                ])

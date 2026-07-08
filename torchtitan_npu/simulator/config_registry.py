@@ -23,17 +23,11 @@ from torchtitan_npu.models.deepseek_v4.config_registry import (
 from torchtitan_npu.simulator.trainer import SimulationConfig, SimulationTrainerConfig
 
 
-def _to_simulation_config(base_config: object, output_dir: str) -> SimulationTrainerConfig:
+def _to_simulation_config(base_config: object, output_dir: str, *, comm_mode: str = "fake_backend") -> SimulationTrainerConfig:
     base_fields = {f.name: getattr(base_config, f.name) for f in dataclasses.fields(base_config)}
     sim_config = SimulationTrainerConfig(**base_fields, simulation=SimulationConfig(output_dir=output_dir))
-    # `entry.py::main()` checks `config.compile.enable` BEFORE `config.build()`
-    # ever runs (and therefore before `SimulationTrainer.__init__`'s own
-    # `config.compile.enable = False` override takes effect), raising
-    # `RuntimeError: ... inductor_npu_ext is not available` for any base
-    # config with compile enabled (e.g. the 61-layer acceptance config) --
-    # found via the real 61-layer smoke run. Forcing it here, before the
-    # config is ever returned to `ConfigManager`, closes that gap.
     sim_config.compile.enable = False
+    sim_config.comm.mode = comm_mode
     return sim_config
 
 
@@ -69,9 +63,6 @@ def deepseek_v4_pro_simulate_61_layers_pp16_tp8_cp4_ep128() -> SimulationTrainer
         training=dataclasses.replace(
             base_config.training,
             num_mtp_modules=0,
-            # PP=16 with microbatch_size=1 needs local_batch_size >= 16 so
-            # that the 1F1B schedule receives at least 16 microbatches.
-            # global_batch_size=384 remains divisible by (16 * dp_shard=4).
             local_batch_size=16,
         ),
         parallelism=dataclasses.replace(
@@ -87,3 +78,53 @@ def deepseek_v4_pro_simulate_61_layers_pp16_tp8_cp4_ep128() -> SimulationTrainer
         base_config,
         output_dir="./simulator_output/deepseek_v4_pro_61_layers_pp16_tp8_cp4_ep128",
     )
+
+
+def deepseek_v4_pro_simulate_61_layers_pp16_tp8_cp4_ep128_multiproc() -> SimulationTrainerConfig:
+    """Multi-process version: uses gloo PG with 16 processes (one per PP stage).
+
+    Each process runs one PP stage with real 1F1B scheduling. All
+    communication is intercepted as no-op (meta device, no real data).
+    Each process captures its own L0-L3 IR; rank 0 merges them.
+
+    The mesh has 16 ranks (PP degree only). TP/CP/EP/DP are simulated
+    by the comm_events interceptors. The config's parallel degrees are
+    set to the full values (TP=8, CP=4, EP=128) for RankTable, but
+    ParallelDims uses pp=16, others=1 for mesh creation.
+
+    Run with: ``NGPU=2048 torchrun --nproc_per_node=16 -m torchtitan_npu.entry
+    --module torchtitan_npu.simulator
+    --config deepseek_v4_pro_simulate_61_layers_pp16_tp8_cp4_ep128_multiproc
+    --training.steps=1``
+    """
+    base_config = deepseek_v4_pro_debug_61_layers_4k_384die()
+    base_config = dataclasses.replace(
+        base_config,
+        training=dataclasses.replace(
+            base_config.training,
+            num_mtp_modules=0,
+            local_batch_size=16,
+        ),
+        parallelism=dataclasses.replace(
+            base_config.parallelism,
+            pipeline_parallel_degree=16,
+            # For mesh creation: only PP is real (16 procs).
+            # Other degrees are simulated by comm_events interceptors.
+            tensor_parallel_degree=1,
+            context_parallel_degree=1,
+            expert_parallel_degree=1,
+            data_parallel_shard_degree=1,
+        ),
+    )
+    sim_config = _to_simulation_config(
+        base_config,
+        output_dir="./simulator_output/deepseek_v4_pro_61_layers_pp16_tp8_cp4_ep128_multiproc",
+        comm_mode="multi_proc_meta",
+    )
+    # Store the "real" parallel degrees for RankTable computation
+    sim_config.simulation.simulated_parallel_degrees = {
+        "pp": 16, "tp": 8, "cp": 4, "ep": 128,
+        "dp_replicate": 1, "dp_shard": 4,
+        "etp": 1, "world_size": 2048,
+    }
+    return sim_config
