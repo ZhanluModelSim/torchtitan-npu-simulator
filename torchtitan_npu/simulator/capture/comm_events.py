@@ -255,6 +255,7 @@ def capture_fake_collectives() -> Iterator[CommEventRecorder]:
     orig_all_gather_into_tensor = dist.all_gather_into_tensor
     orig_reduce_scatter_tensor = dist.reduce_scatter_tensor
     orig_all_to_all_single = dist.all_to_all_single
+    orig_all_to_all = dist.all_to_all
     orig_broadcast = dist.broadcast
     orig_barrier = dist.barrier
 
@@ -293,6 +294,14 @@ def capture_fake_collectives() -> Iterator[CommEventRecorder]:
                 input_split_sizes=input_split_sizes, group=group, async_op=async_op,
             )
         _record_comm_with_l0(recorder, "all_to_all", group, input, output)
+        return _NoOpWork() if async_op else None
+
+    def patched_all_to_all(output_list, input_list, group=None, async_op=False):  # noqa: ANN001
+        if not _should_intercept(group):
+            return orig_all_to_all(output_list, input_list, group=group, async_op=async_op)
+        # Record using the first input tensor as representative
+        rep_tensor = input_list[0] if input_list else torch.empty(1, device="meta")
+        _record_comm_with_l0(recorder, "all_to_all", group, rep_tensor)
         return _NoOpWork() if async_op else None
 
     def patched_broadcast(tensor, src=0, group=None, async_op=False, group_src=None):  # noqa: ANN001
@@ -370,6 +379,7 @@ def capture_fake_collectives() -> Iterator[CommEventRecorder]:
     dist.all_gather_into_tensor = patched_all_gather_into_tensor
     dist.reduce_scatter_tensor = patched_reduce_scatter_tensor
     dist.all_to_all_single = patched_all_to_all_single
+    dist.all_to_all = patched_all_to_all
     dist.broadcast = patched_broadcast
     dist.barrier = patched_barrier
 
@@ -464,6 +474,7 @@ def capture_fake_collectives() -> Iterator[CommEventRecorder]:
         dist.all_gather_into_tensor = orig_all_gather_into_tensor
         dist.reduce_scatter_tensor = orig_reduce_scatter_tensor
         dist.all_to_all_single = orig_all_to_all_single
+        dist.all_to_all = orig_all_to_all
         dist.broadcast = orig_broadcast
         dist.barrier = orig_barrier
         dist.isend = orig_isend

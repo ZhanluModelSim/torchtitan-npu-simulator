@@ -80,7 +80,63 @@ def deepseek_v4_pro_simulate_61_layers_pp16_tp8_cp4_ep128() -> SimulationTrainer
     )
 
 
-def deepseek_v4_pro_simulate_61_layers_pp16_tp8_cp4_ep128_multiproc() -> SimulationTrainerConfig:
+def deepseek_v4_pro_simulate_16_layers_cp4() -> SimulationTrainerConfig:
+    """CP=4 variant for testing context parallel communication capture.
+
+    Uses the 16-layer model with CP=4 to verify that _WindowExchange
+    (P2P isend/irecv) and _allgather_seq (all_gather_tensor_autograd)
+    appear in the captured L0 graph.
+    """
+    base_config = deepseek_v4_pro_debug_16_layers()
+    base_config = dataclasses.replace(
+        base_config,
+        parallelism=dataclasses.replace(
+            base_config.parallelism,
+            context_parallel_degree=4,
+        ),
+    )
+    return _to_simulation_config(
+        base_config,
+        output_dir="./simulator_output/deepseek_v4_pro_16_layers_cp4",
+    )
+
+
+def deepseek_v4_pro_simulate_16_layers_pp4_cp4() -> SimulationTrainerConfig:
+    """PP=4 + CP=4 variant for multi-process CP capture.
+
+    Run with: ``NGPU=64 torchrun --nproc_per_node=4 -m torchtitan_npu.entry
+    --module torchtitan_npu.simulator
+    --config deepseek_v4_pro_simulate_16_layers_pp4_cp4
+    --training.steps=1``
+    """
+    base_config = deepseek_v4_pro_debug_16_layers()
+    base_config = dataclasses.replace(
+        base_config,
+        training=dataclasses.replace(
+            base_config.training,
+            num_mtp_modules=0,
+            local_batch_size=4,
+        ),
+        parallelism=dataclasses.replace(
+            base_config.parallelism,
+            pipeline_parallel_degree=4,
+            context_parallel_degree=4,
+            tensor_parallel_degree=1,
+            expert_parallel_degree=1,
+            data_parallel_shard_degree=1,
+        ),
+    )
+    sim_config = _to_simulation_config(
+        base_config,
+        output_dir="./simulator_output/deepseek_v4_pro_16_layers_pp4_cp4",
+        comm_mode="multi_proc_meta",
+    )
+    sim_config.simulation.simulated_parallel_degrees = {
+        "pp": 4, "tp": 1, "cp": 4, "ep": 1,
+        "dp_replicate": 1, "dp_shard": 4,
+        "etp": 1, "world_size": 64,
+    }
+    return sim_config
     """Multi-process version: uses gloo PG with 16 processes (one per PP stage).
 
     Each process runs one PP stage with real 1F1B scheduling. All

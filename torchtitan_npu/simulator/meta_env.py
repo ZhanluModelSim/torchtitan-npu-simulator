@@ -695,7 +695,7 @@ def _patch_window_exchange_for_fake_pg() -> None:
     orig_backward = _WindowExchange.backward
 
     def _meta_safe_forward(ctx, tensor, window, group):  # noqa: ANN001
-        if not is_fake_process_group(group):
+        if not is_fake_process_group(group) and not _is_meta_simulation:
             return orig_forward(ctx, tensor, window, group)
 
         rank = group.rank()
@@ -713,7 +713,7 @@ def _patch_window_exchange_for_fake_pg() -> None:
         return tensor
 
     def _meta_safe_backward(ctx, grad_output):  # noqa: ANN001
-        if not is_fake_process_group(ctx.group):
+        if not is_fake_process_group(ctx.group) and not _is_meta_simulation:
             return orig_backward(ctx, grad_output)
 
         window = ctx.window
