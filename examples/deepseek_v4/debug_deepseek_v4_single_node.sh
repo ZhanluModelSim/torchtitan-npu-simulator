@@ -10,17 +10,17 @@ DATASET="${DATASET:-c4_test}"
 HF_ASSETS_PATH="${HF_ASSETS_PATH:-/data/models/deepseek_v4_tokenizer_only}"
 
 EXTRA_ARGS=(
-  --hf-assets-path "${HF_ASSETS_PATH}"
+  --hf_assets_path "${HF_ASSETS_PATH}"
   --dataloader.dataset "${DATASET}"
-  # --profiling.enable-profiling
-  --profiling.no-enable-online-parse
-  --profiling.profile-ranks 0
-  --profiling.profile-step-start 6
-  --profiling.profile-step-end 7
-  --profiling.profile-record-shapes
-  --profiling.profile-with-memory
+  # --profiling.enable_profiling
+  --profiling.no_enable_online_parse
+  --profiling.profile_ranks 0
+  --profiling.profile_step_start 6
+  --profiling.profile_step_end 7
+  --profiling.profile_record_shapes
+  --profiling.profile_with_memory
   # --training.steps 20 # debug
-  # --lr-scheduler.warmup-steps 4 # debug
+  # --lr_scheduler.warmup_steps 4 # debug
 )
 
 MODULE="${MODULE:-torchtitan_npu.models.deepseek_v4}" \

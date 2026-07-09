@@ -12,21 +12,21 @@ CHECKPOINT_INITIAL_LOAD_PATH="${CHECKPOINT_INITIAL_LOAD_PATH:-/data/models/DeepS
 ENCODING_MODULE_PATH="${ENCODING_MODULE_PATH:-${HF_ASSETS_PATH}/encoding/encoding_dsv4.py}"
 
 EXTRA_ARGS=(
-  --hf-assets-path "${HF_ASSETS_PATH}"
-  --dataloader.dataset-path "${DATASET_PATH}"
-  # --checkpoint.no-enable # debug
-  --checkpoint.initial-load-path "${CHECKPOINT_INITIAL_LOAD_PATH}"
-  # --profiling.enable-profiling
-  --profiling.no-enable-online-parse
-  --profiling.profile-ranks 0
-  --profiling.profile-step-start 6
-  --profiling.profile-step-end 7
-  --profiling.profile-record-shapes
-  --profiling.profile-with-memory
-  dataloader.chat-encoder:dsv4-encoder-config
-  --dataloader.chat-encoder.encoding-module-path "${ENCODING_MODULE_PATH}"
+  --hf_assets_path "${HF_ASSETS_PATH}"
+  --dataloader.dataset_path "${DATASET_PATH}"
+  # --checkpoint.no_enable # debug
+  --checkpoint.initial_load_path "${CHECKPOINT_INITIAL_LOAD_PATH}"
+  # --profiling.enable_profiling
+  --profiling.no_enable_online_parse
+  --profiling.profile_ranks 0
+  --profiling.profile_step_start 6
+  --profiling.profile_step_end 7
+  --profiling.profile_record_shapes
+  --profiling.profile_with_memory
+  dataloader.chat_encoder:dsv4_encoder_config
+  --dataloader.chat_encoder.encoding_module_path "${ENCODING_MODULE_PATH}"
   # --training.steps 20 # debug
-  # --lr-scheduler.warmup-steps 4 # debug
+  # --lr_scheduler.warmup_steps 4 # debug
 )
 
 MODULE="${MODULE:-torchtitan_npu.models.deepseek_v4}" \

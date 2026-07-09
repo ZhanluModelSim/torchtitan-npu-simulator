@@ -11,21 +11,21 @@ HF_ASSETS_PATH="${HF_ASSETS_PATH:-/data/models/DeepSeek-V4-Pro-bf16}"
 CHECKPOINT_INITIAL_LOAD_PATH="${CHECKPOINT_INITIAL_LOAD_PATH:-/data/models/DeepSeek-V4-Pro-bf16}"
 
 EXTRA_ARGS=(
-  --hf-assets-path "${HF_ASSETS_PATH}"
+  --hf_assets_path "${HF_ASSETS_PATH}"
   --dataloader.dataset "${DATASET}"
-  # --checkpoint.no-enable # debug
-  --checkpoint.initial-load-path "${CHECKPOINT_INITIAL_LOAD_PATH}"
-  # --profiling.enable-profiling
-  --profiling.no-enable-online-parse
-  --profiling.profile-ranks 0
-  --profiling.profile-step-start 6
-  --profiling.profile-step-end 7
-  --profiling.profile-record-shapes
-  --profiling.profile-with-memory
-  --profiling.no-enable-memory-snapshot
-  --profiling.save-memory-snapshot-folder memory_snapshot
+  # --checkpoint.no_enable # debug
+  --checkpoint.initial_load_path "${CHECKPOINT_INITIAL_LOAD_PATH}"
+  # --profiling.enable_profiling
+  --profiling.no_enable_online_parse
+  --profiling.profile_ranks 0
+  --profiling.profile_step_start 6
+  --profiling.profile_step_end 7
+  --profiling.profile_record_shapes
+  --profiling.profile_with_memory
+  --profiling.no_enable_memory_snapshot
+  --profiling.save_memory_snapshot_folder memory_snapshot
   # --training.steps 20 # debug
-  # --lr-scheduler.warmup-steps 4 # debug
+  # --lr_scheduler.warmup_steps 4 # debug
 )
 
 MODULE="${MODULE:-torchtitan_npu.models.deepseek_v4}" \

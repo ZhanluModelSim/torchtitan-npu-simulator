@@ -29,11 +29,14 @@ Usage in npu config_registry functions:
         )
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Literal
 
 from torchtitan.components.checkpoint import CheckpointManager
+from torchtitan.components.lr_scheduler import LRSchedulersContainer
+from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.optimizer import OptimizersContainer
+from torchtitan.config import ActivationCheckpointConfig, CommConfig, DebugConfig
 from torchtitan.config import (
     ParallelismConfig as _BaseParallelismConfig,
 )
@@ -41,6 +44,7 @@ from torchtitan.config import (
     TrainingConfig as _BaseTrainingConfig,
 )
 from torchtitan.hf_datasets.text_datasets import ChatDataLoader as _ChatDataLoader
+from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
 from torchtitan.tools.profiling import ProfilingConfig as _BaseProfilingConfig
 from torchtitan.trainer import Trainer
 
@@ -243,3 +247,73 @@ class TrainerConfig(Trainer.Config):
     training: TrainingConfig = field(default_factory=TrainingConfig)  # type: ignore[assignment]
     profiling: ProfilingConfig = field(default_factory=ProfilingConfig)  # type: ignore[assignment]
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)  # type: ignore[assignment]
+
+
+def trainer_base_config() -> TrainerConfig:
+    return TrainerConfig(
+        debug=DebugConfig(print_config=True),
+        metrics=MetricsProcessor.Config(log_freq=1),
+        optimizer=OptimizerConfig(
+            lr=1e-5,
+            eps=1e-6,
+            swap_optimizer=True,
+        ),
+        lr_scheduler=LRSchedulersContainer.Config(
+            warmup_steps=200,
+            decay_ratio=0.8,
+            decay_type="cosine",
+            min_lr_factor=0.01,
+        ),
+        dataloader=HuggingFaceTextDataLoader.Config(),
+        training=TrainingConfig(
+            local_batch_size=1,
+            global_batch_size=-1,
+            seq_len=4096,
+            steps=10000,
+        ),
+        parallelism=ParallelismConfig(
+            fsdp_reshard_after_forward="always",
+        ),
+        activation_checkpoint=ActivationCheckpointConfig(mode="full"),
+    )
+
+
+def debug_single_node_eq_pruned_config(base: TrainerConfig) -> TrainerConfig:
+    return replace(
+        base,
+        debug=replace(base.debug, print_config=True, moe_force_load_balance=True),
+        lr_scheduler=replace(base.lr_scheduler, warmup_steps=4),
+        training=replace(base.training, global_batch_size=-1, steps=20),
+        checkpoint=replace(
+            base.checkpoint,
+            load_step=0,
+            load_only=True,
+        ),
+        compile=replace(base.compile, enable=False),
+    )
+
+
+def cpt_default_config(base: TrainerConfig) -> TrainerConfig:
+    return replace(
+        base,
+        comm=CommConfig(trace_buf_size=0),  # TODO: Check whether needed
+        lr_scheduler=replace(base.lr_scheduler, warmup_steps=400),
+        training=replace(base.training, steps=2000),
+        checkpoint=replace(
+            base.checkpoint,
+            enable=True,
+            load_step=0,
+            interval=10000,
+            load_only=True,
+            initial_load_in_hf=True,
+        ),
+    )
+
+
+def sft_default_config(base: TrainerConfig) -> TrainerConfig:
+    return replace(
+        base,
+        lr_scheduler=replace(base.lr_scheduler, warmup_steps=20),
+        training=replace(base.training, global_batch_size=-1, steps=100),
+        checkpoint=replace(base.checkpoint, interval=500, load_only=False, export_dtype="bfloat16"),
+    )
