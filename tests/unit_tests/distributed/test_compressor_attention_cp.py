@@ -5,7 +5,7 @@
 
 """Unit tests for DeepSeek-V4 Context Parallel implementation.
 
-Covers ``_allgather_seq``, ``_WindowExchange`` autograd function, and
+Covers ``_allgather_seq``, ``_WindowExchangeLocal`` / ``_window_exchange``, and
 ``_detect_dsv4`` / ``_apply_dsv4`` detection logic.
 
 Run with::
@@ -20,11 +20,13 @@ import pytest
 import torch
 import torch.distributed._functional_collectives as ft_c
 from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor import DTensor, Replicate, Shard
 
 from torchtitan_npu.distributed.context_parallel.compressor_attention_cp import (
     _allgather_seq,
     _detect_dsv4,
-    _WindowExchange,
+    _window_exchange,
+    _WindowExchangeLocal,
 )
 
 
@@ -72,19 +74,56 @@ class TestAllgatherSeq:
         gathered = _allgather_seq(x, mesh)
 
         assert type(gathered) is torch.Tensor, (
-            "_allgather_seq must return a plain torch.Tensor, not DTensor or AsyncCollectiveTensor"
+            "for a plain-tensor input (EP-only path), _allgather_seq must return "
+            "a plain torch.Tensor, not AsyncCollectiveTensor"
         )
         assert not isinstance(gathered, ft_c.AsyncCollectiveTensor)
 
+    @staticmethod
+    def test_dtensor_input_preserves_dtensor():
+        """With a DTensor input (TP enabled), _allgather_seq must re-wrap the
+        result as a DTensor with the same mesh / placements so the downstream
+        TP plan still sees the same contract — not silently downgrade to plain.
+        """
+        mesh = _make_cpu_mesh()
+        local = torch.randn(2, 128, 64, device="cpu", requires_grad=True)
+        dt = DTensor.from_local(local, mesh, [Replicate()], run_check=False)
+
+        gathered = _allgather_seq(dt, mesh)
+
+        assert isinstance(
+            gathered, DTensor
+        ), "_allgather_seq must return a DTensor when the input is a DTensor"
+        assert gathered.placements == (Replicate(),)
+        assert gathered.device_mesh == mesh
+        # single-rank all-gather is identity
+        assert torch.allclose(gathered.to_local(), local)
+
+        gathered.to_local().sum().backward()
+        assert local.grad is not None
+        assert torch.allclose(local.grad, torch.ones_like(local))
+
+    @staticmethod
+    def test_seq_sharded_dtensor_rejected():
+        """A DTensor sharded on the sequence dim must be rejected loudly: CP
+        manipulates that dim on the local tensor and cannot preserve Shard(seq).
+        """
+        mesh = _make_cpu_mesh()
+        local = torch.randn(2, 128, 64, device="cpu")
+        dt = DTensor.from_local(local, mesh, [Shard(1)], run_check=False)
+
+        with pytest.raises(ValueError, match="sharded on the sequence dim"):
+            _allgather_seq(dt, mesh)
+
 
 # ===========================================================================
-# _WindowExchange — single-rank (identity path)
+# _WindowExchangeLocal / _window_exchange — single-rank (identity path)
 # ===========================================================================
 
 
 @pytest.mark.usefixtures("single_rank_process_group")
 class TestWindowExchange:
-    """Single-rank tests for ``_WindowExchange`` (world_size=1 identity path)."""
+    """Single-rank tests for ``_WindowExchangeLocal`` / ``_window_exchange`` (world_size=1 identity path)."""
 
     @staticmethod
     def test_forward_identity():
@@ -92,7 +131,7 @@ class TestWindowExchange:
         group = mesh.get_group()
         tensor = torch.randn(2, 32, 4, device="cpu", requires_grad=True)
 
-        result = _WindowExchange.apply(tensor, 8, group)
+        result = _WindowExchangeLocal.apply(tensor, 8, group)
 
         assert result.shape == tensor.shape
         assert torch.allclose(result, tensor)
@@ -103,7 +142,7 @@ class TestWindowExchange:
         group = mesh.get_group()
         tensor = torch.randn(2, 32, 4, device="cpu", requires_grad=True)
 
-        result = _WindowExchange.apply(tensor, 8, group)
+        result = _WindowExchangeLocal.apply(tensor, 8, group)
         loss = result.sum()
         loss.backward()
 
@@ -119,9 +158,38 @@ class TestWindowExchange:
         x = torch.randn(2, 16, 2, dtype=torch.float64, device="cpu", requires_grad=True)
 
         def forward_fn(t):
-            return _WindowExchange.apply(t, window, group)
+            return _WindowExchangeLocal.apply(t, window, group)
 
         torch.autograd.gradcheck(forward_fn, x)
+
+    @staticmethod
+    def test_dtensor_forward_identity():
+        """DTensor input (world_size=1): forward is identity and the output is
+        re-wrapped as a DTensor with the same placements.
+        """
+        mesh = _make_cpu_mesh()
+        group = mesh.get_group()
+        local = torch.randn(2, 32, 4, device="cpu", requires_grad=True)
+        dt = DTensor.from_local(local, mesh, [Replicate()], run_check=False)
+
+        result = _window_exchange(dt, 8, group)
+
+        assert isinstance(result, DTensor)
+        assert result.placements == (Replicate(),)
+        assert torch.allclose(result.to_local(), local)
+
+    @staticmethod
+    def test_dtensor_backward_flows():
+        mesh = _make_cpu_mesh()
+        group = mesh.get_group()
+        local = torch.randn(2, 32, 4, device="cpu", requires_grad=True)
+        dt = DTensor.from_local(local, mesh, [Replicate()], run_check=False)
+
+        result = _window_exchange(dt, 8, group)
+        result.to_local().sum().backward()
+
+        assert local.grad is not None
+        assert torch.allclose(local.grad, torch.ones_like(local))
 
     @staticmethod
     def test_backward_nondiff_args_none():
@@ -137,7 +205,7 @@ class TestWindowExchange:
         ctx.forward_recvd = False
 
         grad_output = torch.randn(2, 32, 4)
-        grad_tensor, grad_window, grad_group = _WindowExchange.backward(ctx, grad_output)
+        grad_tensor, grad_window, grad_group = _WindowExchangeLocal.backward(ctx, grad_output)
 
         assert torch.allclose(grad_tensor, grad_output)
         assert grad_window is None

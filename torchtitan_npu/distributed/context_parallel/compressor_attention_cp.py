@@ -5,6 +5,7 @@
 
 """Context Parallel for DeepSeek-V4 Attention — ParallelStyle with hooks."""
 
+from collections.abc import Callable
 from functools import partial
 from typing import Any
 
@@ -17,15 +18,61 @@ from torch.distributed.tensor.parallel import ParallelStyle
 from .registry import register_cp_strategy
 
 
-class _WindowExchange(torch.autograd.Function):
-    """P2P exchange of a sequence window between adjacent CP ranks.
+def _assert_seq_not_sharded(placements, seq_dim: int, where: str) -> None:
+    """Reject a DTensor sharded on the sequence dim: CP manipulates that dim on the
+    local tensor and cannot preserve a ``Shard(seq)`` placement on re-wrap. Today
+    the activation is ``Replicate``; fails loudly if a future TP plan shards it.
+    """
+    from torch.distributed.tensor import Shard
 
-    Forward: each rank sends its last ``window`` tokens to rank+1 and
-    receives from rank-1.  Received tokens are prepended to the sequence.
+    for placement in placements:
+        if isinstance(placement, Shard) and placement.dim == seq_dim:
+            raise ValueError(
+                f"{where}: input DTensor is sharded on the sequence dim "
+                f"(Shard({seq_dim})); CP manipulates this dim on the local tensor "
+                f"and cannot preserve that placement (placements={placements})."
+            )
 
-    Backward: gradient of the prepended tokens is sent back to the sender;
-    gradient of the sent tokens is received from the receiver and added to
-    the local gradient at the same positions.
+
+def _call_local_fn(
+    tensor: torch.Tensor,
+    seq_dim: int,
+    where: str,
+    local_fn: Callable[[torch.Tensor], torch.Tensor],
+) -> torch.Tensor:
+    """Run ``local_fn`` on the local tensor, adapting a TP DTensor input
+    (``to_local -> local_fn -> from_local`` with the same mesh / placements). CP's
+    c10d / view ops have no DTensor sharding strategy, so the real work stays on the
+    local tensor; a ``Shard(seq)`` input is rejected (CP manipulates that dim and
+    cannot preserve it on re-wrap). Under autograd, ``from_local``'s backward
+    redistributes the gradient to the forward placements.
+    """
+    from torch.distributed.tensor import DTensor
+
+    if not isinstance(tensor, DTensor):
+        return local_fn(tensor)
+
+    _assert_seq_not_sharded(tensor.placements, seq_dim, where)
+    local = tensor.to_local(grad_placements=tensor.placements)
+    out = local_fn(local)
+    return DTensor.from_local(
+        out,
+        device_mesh=tensor.device_mesh,
+        placements=tensor.placements,
+        run_check=False,
+    )
+
+
+def _materialize_no_alias(tensor: torch.Tensor | None, seq_dim: int, where: str) -> torch.Tensor | None:
+    if tensor is None:
+        return None
+    return _call_local_fn(tensor, seq_dim, where, lambda local: local.contiguous())
+
+
+class _WindowExchangeLocal(torch.autograd.Function):
+    """P2P exchange of a sequence window between adjacent CP ranks on local tensors:
+    each rank sends its last ``window`` tokens to rank+1 and prepends those received
+    from rank-1. DTensor (TP) adaptation is handled by :func:`_window_exchange`.
     """
 
     @staticmethod
@@ -62,8 +109,7 @@ class _WindowExchange(torch.autograd.Function):
         if send_req is not None:
             send_req.wait()
 
-        if ctx.forward_recvd:
-            tensor = torch.cat([recv_buf, tensor], dim=1)
+        tensor = torch.cat([recv_buf, tensor], dim=1) if ctx.forward_recvd else tensor.clone()
 
         return tensor
 
@@ -100,21 +146,32 @@ class _WindowExchange(torch.autograd.Function):
         return grad_output, None, None
 
 
-def _allgather_seq(tensor: torch.Tensor, mesh: DeviceMesh, seq_dim: int = 1) -> torch.Tensor:
+def _window_exchange(tensor: torch.Tensor, window: int, group: c10d.ProcessGroup) -> torch.Tensor:
+    return _call_local_fn(
+        tensor,
+        1,
+        "_window_exchange",
+        lambda local: _WindowExchangeLocal.apply(local, window, group),
+    )
+
+
+def _allgather_seq_local(local_tensor: torch.Tensor, mesh: DeviceMesh, seq_dim: int = 1) -> torch.Tensor:
+    """All-gather a local tensor along the sequence dim across the CP mesh."""
     group = mesh.get_group()
     group_size = group.size()
-    # Gathering along seq_dim routes through torch._utils._maybe_view_chunk_cat,
-    # which is on Dynamo's MOD_SKIPLIST and cannot be traced under fullgraph
-    # compile. Gather on dim 0 instead (that path skips the helper), then move the
-    # result onto seq_dim with traceable chunk-then-cat ops of equivalent meaning.
-    gathered = ft_c.all_gather_tensor_autograd(tensor.contiguous(), gather_dim=0, group=group)
+    gathered = ft_c.all_gather_tensor_autograd(local_tensor.contiguous(), gather_dim=0, group=group)
     if isinstance(gathered, ft_c.AsyncCollectiveTensor):
-        # NOTE: Do NOT call gathered.wait(), as it returns inner elem tensor
-        # which was detached by the autograd boundary (_wrap_tensor_autograd
-        # or _FromTorchTensor) and therefore has requires_grad=False. Causing
-        # broken backward gradient flow.
-        gathered = torch.ops._c10d_functional.wait_tensor(gathered)
+        gathered = ft_c.wait_tensor(gathered)
     return torch.cat(torch.chunk(gathered, group_size, dim=0), dim=seq_dim)
+
+
+def _allgather_seq(tensor: torch.Tensor, mesh: DeviceMesh, seq_dim: int = 1) -> torch.Tensor:
+    return _call_local_fn(
+        tensor,
+        seq_dim,
+        "_allgather_seq",
+        lambda local: _allgather_seq_local(local, mesh, seq_dim),
+    )
 
 
 class CompressorAttentionCP(ParallelStyle):
@@ -153,7 +210,7 @@ class CompressorAttentionCP(ParallelStyle):
         rank = mesh.get_local_rank()
         W = self.window
 
-        x = _WindowExchange.apply(x, W, mesh.get_group())
+        x = _window_exchange(x, W, mesh.get_group())
 
         # Compute positions for the expanded window (including prepended tokens).
         #   rank=0: [0, local_s)                            -- no prepended tokens
@@ -212,7 +269,15 @@ class CompressorAttentionCP(ParallelStyle):
         if kv.size(1) < target_ori_len:
             kv = torch.nn.functional.pad(kv, (0, 0) * (kv.ndim - 2) + (target_ori_len - kv.size(1), 0))
 
-        return q, kv, kv_compress, q_indexer, k_indexer, weights
+        materialized = (
+            _materialize_no_alias(q, 1, "_post_hook.q"),
+            _materialize_no_alias(kv, 1, "_post_hook.kv"),
+            _materialize_no_alias(kv_compress, 1, "_post_hook.kv_compress"),
+            _materialize_no_alias(q_indexer, 1, "_post_hook.q_indexer"),
+            _materialize_no_alias(k_indexer, 1, "_post_hook.k_indexer"),
+            _materialize_no_alias(weights, 1, "_post_hook.weights"),
+        )
+        return materialized
 
 
 def _detect_dsv4(module: torch.nn.Module) -> bool:
