@@ -344,45 +344,54 @@ Schedule: 4096 instances, 3416184 data passes
 
 ## 四层 IR 结构
 
-输出遵循 [workload-model-platform spec](https://github.com/ZhanluModelSim/workload-model-platform/tree/master/spec) 定义的四层 IR。所有字段均来自**捕获数据**，不做推断或编码生成（详见 [L2 捕获方案设计](../design/schedule-capture-design.md)）。
+输出遵循 [workload-model-platform spec](https://github.com/ZhanluModelSim/workload-model-platform/tree/master/spec) 定义的四层 IR。通信算子按其语义归属不同层级（详见 [L0-L3 层级归属设计](../design/schedule-capture-design.md)）。
 
 | 层级 | 类名 | 文件 | 描述 |
 |------|------|------|------|
-| L0 | `OpNode` | `ir/op_node.py` | 单个算子调用：op_type、输入输出 TensorMeta、FLOPs/mem/comm_bytes 估算、前后依赖、`pp_stage`/`pp_mb_idx`（PP 上下文，captured） |
-| L1 | `StepGraph` | `ir/step_graph.py` | 一个 forward/backward/optimizer 步骤的 DAG（仅 MB 0 捕获）：节点集合、entry/exit 节点、拓扑校验 |
-| L2 | `ScheduleGraph` | `ir/schedule_graph.py` | 并行调度编排：StepInstance、DataPass（从 CommEvent 直接映射，不做 all-to-all 展开）、execution_timeline（含所有 microbatch 的调度时序） |
+| L0 | `OpNode` | `ir/op_node.py` | 纯计算算子调用：op_type、输入输出 TensorMeta、FLOPs/mem 估算、前后依赖、`pp_stage`/`pp_mb_idx`。**不含通信算子** |
+| L1 | `StepGraph` | `ir/step_graph.py` | 一个 microbatch 的一个 phase 的计算 DAG（仅 MB 0 捕获）。包含计算算子 + **CP 通信**（attention 内部的 P2P/allgather，作为内部 DataPass） |
+| L2 | `ScheduleGraph` | `ir/schedule_graph.py` | L1 StepGraph 间的调度依赖：microbatch 排队时序、**PP P2P**（stage 间传递）、**FSDP 通信**（unshard/reshard/allreduce）、依赖关系 |
 | L3 | `WorkloadGraph` | `ir/workload_graph.py` | 顶层容器：迭代语义、DataFlow（dataloader 输入）、跨迭代参数传递 |
+
+### 通信算子层级归属
+
+通信算子按**调用路径上下文**归属不同层级（不依赖名称匹配，详见 [L0-L3 层级归属设计](../design/schedule-capture-design.md)）：
+
+| 通信类型 | 调用入口 | 归属 | 原因 |
+|----------|----------|------|------|
+| CP P2P (`_WindowExchange`) | `CompressorAttentionCP._pre_hook` | **L1** | attention forward 的一部分 |
+| CP allgather (`_allgather_seq`) | `CompressorAttentionCP._post_hook` | **L1** | attention forward 的一部分 |
+| PP P2P (`forward_send/recv`) | `PipelineSchedule._step_microbatches` | **L2** | stage 间调度依赖 |
+| FSDP allgather (unshard) | `FSDPParamGroup.pre_forward` | **L2** | forward 前参数 unshard |
+| FSDP reduce_scatter (reshard) | `FSDPParamGroup.post_backward` | **L2** | backward 后参数 reshard |
+| FSDP allreduce | 梯度同步 | **L2** | optimizer 梯度同步 |
+
+判定方式：在 `meta_env.py` 中维护 `_comm_layer` 上下文变量，由各调用入口的 patch 设置（`"L1"` 表示模型计算内部，`"L2"` 表示框架调度层）。`_record_comm` 读取该变量为每个 CommEvent 标注层级。
 
 ### L2 execution_timeline 说明
 
-`execution_timeline` 是 L2 的核心数据结构，记录一个 train step 内所有执行事件的时序：
+`execution_timeline` 只包含 **L2 级别**的事件（不含 L0 计算算子和 CP 通信）：
 
 | 字段 | 说明 | 来源 |
 |------|------|------|
-| `seq_idx` | 全局执行序号（跨 microbatch 递增） | captured |
-| `op_id` | L0 OpNode ID（MB 0 有值，MB 1+ 为 -1） | captured |
-| `rank` | 进程 rank（gloo rank） | captured |
-| `pipeline_stage` | PP stage | captured (`_pp_context`) |
-| `micro_batch_idx` | microbatch 序号 | captured (`_pp_context`) |
+| `seq_idx` | 全局执行序号 | captured |
+| `op_id` | L0 OpNode ID（MB 0 的计算算子为 -1，因为 L0 不在 L2 timeline 中） | — |
+| `rank` | 进程 rank | captured |
+| `pipeline_stage` | PP stage | captured |
+| `micro_batch_idx` | microbatch 序号 | captured |
 | `phase` | forward / backward / optimizer | captured |
-| `action` | `compute` / `forward_one_chunk` / `backward_one_chunk` / `comm` | captured |
-| `comm_type` | 通信类型（如 `cp_forward_send`、`allgather`） | captured (CommEvent) |
-| `comm_peer_rank` | P2P peer rank | captured (CommEvent) |
-
-**MB 0 的 timeline**：每个 L0 op 都有一个 entry（`op_id` 有值，`action="compute"`），加上通信 op 的 entry。
-
-**MB 1+ 的 timeline**：只有调度级 entry（`op_id=-1`，`action="forward_one_chunk"`/`"backward_one_chunk"`），加上通信 op 的 entry。不展开到 L0 op 级别。
+| `action` | `forward_one_chunk` / `backward_one_chunk` / `comm` | captured |
+| `comm_type` | PP/FSDP 通信类型（如 `forward_send`、`allgather`、`reduce_scatter`） | captured |
+| `comm_peer_rank` | P2P peer rank | captured |
 
 ### L2 DataPass 说明
 
-DataPass 从 CommEvent **直接映射**，不做 all-to-all 展开：
+DataPass 只从 **PP/FSDP 通信**生成（CP 通信在 L1 内部）：
 
 | DataPass 类型 | src_instance | dst_instance | comm_group_ranks | 语义 |
 |---------------|-------------|-------------|------------------|------|
-| P2P (PP) | `rank{src_stage}` | `rank{dst_rank}` | `[]` | 一对一数据传输 |
-| 集合 (CP/TP/EP/FSDP) | `rank{caller}` | `group:{dim}` | `[[0,1,...],...]` | 一次集合通信调用 |
-
-`comm_group_ranks` 记录参与该次通信的 rank 组，消费者可自行展开为 rank-pair 级别的数据流。
+| PP P2P | `rank{src_stage}` | `rank{dst_rank}` | `[]` | stage 间数据传输 |
+| FSDP 集合 | `rank{caller}` | `group:{dim}` | `[[0,1,...],...]` | 参数 unshard/reshard/梯度同步 |
 
 ## 自定义仿真配置
 
