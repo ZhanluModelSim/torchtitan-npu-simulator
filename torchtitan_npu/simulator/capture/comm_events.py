@@ -60,6 +60,9 @@ class CommEvent:
     p2p_mb_idx: int = -1         # microbatch index
     p2p_stage: int = -1          # pipeline stage index
     seq_idx: int = 0             # global execution sequence number (shared with L0 ops)
+    comm_layer: str = ""         # "L1" (model compute) or "L2" (framework scheduling)
+    src_exit_op: int = 0         # L1 op that produced the data being communicated (0 = unknown)
+    dst_entry_op: int = 0        # L1 op that consumes the communicated data (0 = unknown)
 
 
 class _NoOpWork:
@@ -233,9 +236,18 @@ def _record_comm_with_l0(
     from torchtitan_npu.simulator.capture.dispatch_capture import _seq_counter
     event.seq_idx = next(_seq_counter)
 
+    # Record comm_layer from context (set by call-site patches)
+    from torchtitan_npu.simulator.meta_env import _comm_layer
+    event.comm_layer = _comm_layer
+
     out = output_tensor if output_tensor is not None else tensor
     capture = get_active_capture()
     if capture is not None:
+        # Resolve src_exit_op: find the L1 op that produced the input tensor
+        producer_op = capture._producer.get(id(tensor))
+        if producer_op is not None:
+            event.src_exit_op = producer_op
+
         capture.record_synthetic_op(
             raw_op_type=f"comm.{comm_primitive}",
             inputs=[tensor],
@@ -250,6 +262,16 @@ def _record_comm_with_l0(
             capture._events[-1].comm_ranks_str = ";".join(
                 ",".join(str(r) for r in g) for g in comm_ranks
             )
+
+        # Register pending link for dst_entry_op: if this comm produces
+        # an output tensor, the next L1 op that consumes it will be the
+        # dst_entry_op.  We register the tensor id → event mapping and
+        # resolve it lazily in _record_event when the consumer is captured.
+        if output_tensor is not None and id(output_tensor) != id(tensor):
+            capture._pending_comm_links[id(output_tensor)] = event
+        elif id(out) != id(tensor):
+            capture._pending_comm_links[id(out)] = event
+
     return event
 
 

@@ -51,11 +51,12 @@ def build_schedule_graph(
             )
         )
 
-    # 2. DataPass: from CommEvent directly (no all-to-all expansion)
+    # 2. DataPass: only from L2 comm events (PP/FSDP), not L1 (CP)
     data_passes: list[DataPass] = []
     for event in comm_events:
+        if event.comm_layer == "L1":
+            continue  # CP comm → L1 StepGraph internal, not L2 DataPass
         if event.comm_primitive in ("p2p_send", "p2p_recv"):
-            # P2P: only create DataPass for send (avoid duplicating with recv)
             if event.comm_primitive != "p2p_send":
                 continue
             src_stage = event.p2p_stage
@@ -65,8 +66,8 @@ def build_schedule_graph(
                 shape=event.tensor_shape,
                 dtype=event.dtype,
                 volume_bytes=event.volume_bytes,
-                src_exit_op=event.op_id,
-                dst_entry_op=event.op_id,
+                src_exit_op=event.src_exit_op or event.op_id,
+                dst_entry_op=event.dst_entry_op or event.op_id,
             )
             data_passes.append(
                 DataPass(
@@ -80,14 +81,14 @@ def build_schedule_graph(
                 )
             )
         else:
-            # Collective: one DataPass per call (no all-to-all expansion)
+            # FSDP collective: one DataPass per call
             slot = TensorSlot(
                 name=f"{event.comm_primitive}_{event.event_id}",
                 shape=event.tensor_shape,
                 dtype=event.dtype,
                 volume_bytes=event.volume_bytes,
-                src_exit_op=event.op_id,
-                dst_entry_op=event.op_id,
+                src_exit_op=event.src_exit_op or event.op_id,
+                dst_entry_op=event.dst_entry_op or event.op_id,
             )
             data_passes.append(
                 DataPass(
@@ -102,40 +103,40 @@ def build_schedule_graph(
                 )
             )
 
-    # 3. execution_timeline: merge L0 ops, timeline events, and comm events
+    # 3. execution_timeline: only L2-level events (no L0 compute, no L1 CP comm)
     execution_timeline: list[TimelineEntry] = []
 
-    # 3a. MB 0 L0 ops → timeline entries (op_id has value, action="compute")
+    # 3a. MB 0 L0 ops → only L2 comm ops appear in timeline (not compute ops)
     for template_id, template in step_templates.items():
         for op_id, node in template.nodes.items():
             ann = node.annotations
-            comm_type = ""
-            comm_peer = -1
             raw = ann.get("raw_op_type", "")
-            if raw.startswith("comm."):
-                for ev in comm_events:
-                    if ev.op_id == op_id:
-                        if ev.p2p_direction:
-                            comm_type = ev.p2p_direction
-                            comm_peer = ev.p2p_peer_rank
-                        else:
-                            comm_type = ev.comm_primitive
-                        break
-            execution_timeline.append(
-                TimelineEntry(
-                    seq_idx=node.seq_idx,
-                    op_id=op_id,
-                    rank=rank,
-                    pipeline_stage=ann.get("pp_stage", -1),
-                    micro_batch_idx=ann.get("pp_mb_idx", -1),
-                    phase=ann.get("phase", template.step_type),
-                    comm_type=comm_type,
-                    comm_peer_rank=comm_peer,
-                    action="compute" if not comm_type else "comm",
-                )
-            )
+            if not raw.startswith("comm."):
+                continue  # skip L0 compute ops in L2 timeline
+            # Find matching CommEvent
+            for ev in comm_events:
+                if ev.op_id == op_id:
+                    if ev.comm_layer == "L1":
+                        break  # skip L1 (CP) comm in L2 timeline
+                    # L2 comm: add to timeline
+                    comm_type = ev.p2p_direction or ev.comm_primitive
+                    comm_peer = ev.p2p_peer_rank if ev.p2p_direction else -1
+                    execution_timeline.append(
+                        TimelineEntry(
+                            seq_idx=node.seq_idx,
+                            op_id=op_id,
+                            rank=rank,
+                            pipeline_stage=ann.get("pp_stage", -1),
+                            micro_batch_idx=ann.get("pp_mb_idx", -1),
+                            phase=ann.get("phase", template.step_type),
+                            comm_type=comm_type,
+                            comm_peer_rank=comm_peer,
+                            action="comm",
+                        )
+                    )
+                    break
 
-    # 3b. MB 1+ timeline events (op_id=-1, action="forward_one_chunk"/etc.)
+    # 3b. MB 1+ timeline events (scheduling: forward_one_chunk/backward_one_chunk)
     if timeline_events:
         for ev in timeline_events:
             execution_timeline.append(
@@ -150,12 +151,13 @@ def build_schedule_graph(
                 )
             )
 
-    # 3c. Comm events that were NOT captured as L0 ops (MB 1+ pass-through)
+    # 3c. L2 comm events from MB 1+ (not captured as L0 ops)
     captured_op_ids = {e.op_id for e in execution_timeline if e.op_id > 0}
     for event in comm_events:
+        if event.comm_layer == "L1":
+            continue  # skip CP comm
         if event.op_id > 0 and event.op_id in captured_op_ids:
             continue  # already in timeline via L0 op
-        # This comm event happened during MB 1+ (no L0 op)
         execution_timeline.append(
             TimelineEntry(
                 seq_idx=event.seq_idx,

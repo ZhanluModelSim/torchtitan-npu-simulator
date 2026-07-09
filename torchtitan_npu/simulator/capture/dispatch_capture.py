@@ -105,6 +105,7 @@ class OpDispatchCapture(TorchDispatchMode):
         self._last_signature: tuple | None = None
         self._previous_active_capture: OpDispatchCapture | None = None
         self._capture_l0: bool = True  # pass-through when False (MB 1+)
+        self._pending_comm_links: dict[int, object] = {}  # id(tensor) → CommEvent for dst_entry_op resolution
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):  # noqa: ANN001, ANN201
         kwargs = kwargs or {}
@@ -182,6 +183,14 @@ class OpDispatchCapture(TorchDispatchMode):
             op_id = _next_op_id()
             candidate.op_id = op_id
             self._events.append(candidate)
+
+        # Resolve pending comm links: if any input tensor was produced by a
+        # comm op (e.g. recv/unshard), this op is the dst_entry_op consumer.
+        for t in flat_inputs:
+            tid = id(t)
+            if tid in self._pending_comm_links:
+                event = self._pending_comm_links.pop(tid)
+                event.dst_entry_op = op_id
             self._last_signature = signature
 
         for t in flat_outputs:

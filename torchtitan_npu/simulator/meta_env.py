@@ -201,6 +201,11 @@ _pp_context: dict[str, int | str] = {"mb_idx": 0, "phase": "forward", "stage": 0
 # when comm.mode is "fake_backend" or "multi_proc_meta".
 _is_meta_simulation: bool = False
 
+# Communication layer context: set by patches at call sites to indicate
+# whether a comm call originates from model compute ("L1") or framework
+# scheduling ("L2"). Read by _record_comm to classify CommEvent.
+_comm_layer: str = ""
+
 
 def _patch_tensor_npu_method_to_meta() -> None:
     """`torch_npu` registers `torch.Tensor.npu(device=None, non_blocking=False,
@@ -695,6 +700,8 @@ def _patch_window_exchange_for_fake_pg() -> None:
     orig_backward = _WindowExchange.backward
 
     def _meta_safe_forward(ctx, tensor, window, group):  # noqa: ANN001
+        global _comm_layer
+        _comm_layer = "L1"  # CP P2P is part of attention compute
         if not is_fake_process_group(group) and not _is_meta_simulation:
             return orig_forward(ctx, tensor, window, group)
 
@@ -733,6 +740,8 @@ def _patch_window_exchange_for_fake_pg() -> None:
         return tensor
 
     def _meta_safe_backward(ctx, grad_output):  # noqa: ANN001
+        global _comm_layer
+        _comm_layer = "L1"  # CP P2P backward is part of attention compute
         if not is_fake_process_group(ctx.group) and not _is_meta_simulation:
             return orig_backward(ctx, grad_output)
 
@@ -1585,6 +1594,84 @@ def _patch_dtensor_random_for_fake_mesh() -> None:
     rng_mod._resolve_device = _patched_resolve_device
 
 
+def _patch_comm_layer_context() -> None:
+    """Patch call sites to set ``_comm_layer`` context variable, so
+    ``_record_comm`` can classify each CommEvent as L1 (model compute)
+    or L2 (framework scheduling) based on the call path, not name patterns.
+
+    L1 (model compute):
+      - _WindowExchange (already patched in _patch_window_exchange_for_fake_pg)
+      - _allgather_seq (CompressorAttentionCP._post_hook)
+
+    L2 (framework scheduling):
+      - FSDPParamGroup.unshard / reshard
+      - PipelineSchedule._step_microbatches
+    """
+    global _comm_layer
+
+    # Patch _allgather_seq → L1
+    try:
+        from torchtitan_npu.distributed.context_parallel.compressor_attention_cp import (
+            _allgather_seq as _orig_allgather_seq,
+        )
+        import torchtitan_npu.distributed.context_parallel.compressor_attention_cp as _cp_mod
+
+        if not hasattr(_cp_mod, "_sim_orig_allgather_seq"):
+            _cp_mod._sim_orig_allgather_seq = _orig_allgather_seq
+
+            def _patched_allgather_seq(tensor, mesh, seq_dim=1):  # noqa: ANN001
+                _comm_layer = "L1"
+                return _orig_allgather_seq(tensor, mesh, seq_dim)
+
+            _cp_mod._allgather_seq = _patched_allgather_seq
+    except Exception:
+        pass
+
+    # Patch FSDPParamGroup.unshard/reshard → L2
+    try:
+        from torch.distributed.fsdp._fully_shard._fsdp_param_group import FSDPParamGroup
+
+        if not hasattr(FSDPParamGroup, "_sim_orig_unshard"):
+            FSDPParamGroup._sim_orig_unshard = FSDPParamGroup.unshard
+            FSDPParamGroup._sim_orig_reshard = FSDPParamGroup.reshard
+
+            def _patched_unshard(self, async_op=False):  # noqa: ANN001
+                _comm_layer = "L2"
+                return FSDPParamGroup._sim_orig_unshard(self, async_op)
+
+            def _patched_reshard(self):  # noqa: ANN001
+                _comm_layer = "L2"
+                return FSDPParamGroup._sim_orig_reshard(self)
+
+            FSDPParamGroup.unshard = _patched_unshard
+            FSDPParamGroup.reshard = _patched_reshard
+    except Exception:
+        pass
+
+    # Patch PipelineSchedule._step_microbatches → L2
+    try:
+        from torch.distributed.pipelining.schedules import _PipelineSchedule
+
+        if not hasattr(_PipelineSchedule, "_sim_orig_step_microbatches"):
+            _PipelineSchedule._sim_orig_step_microbatches = _PipelineSchedule._step_microbatches
+
+            def _patched_step_microbatches(self, *args, **kwargs):  # noqa: ANN001
+                _comm_layer = "L2"
+                return _PipelineSchedule._sim_orig_step_microbatches(self, *args, **kwargs)
+
+            _PipelineSchedule._step_microbatches = _patched_step_microbatches
+    except Exception:
+        pass
+
+    # Also set L1 in _WindowExchange (already patched, but set _comm_layer)
+    # The _meta_safe_forward/backward already set _comm_layer="L1" via
+    # the _WindowExchange patch. We add it here for clarity.
+    global _original_window_exchange
+    if _original_window_exchange is not None:
+        # Already patched, just ensure _comm_layer is set
+        pass
+
+
 def _patch_init_distributed_for_multi_proc_meta() -> None:
     """Patch ``init_distributed`` to handle ``comm.mode=multi_proc_meta``.
 
@@ -1718,6 +1805,7 @@ def patch_device_type_to_meta() -> None:
     _patch_init_distributed_for_multi_proc_meta()
     _patch_fsdp_get_device_from_mesh()
     _patch_dtensor_random_for_fake_mesh()
+    _patch_comm_layer_context()
     global _is_meta_simulation
     _is_meta_simulation = True
     _patched = True

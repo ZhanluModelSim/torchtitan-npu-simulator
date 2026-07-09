@@ -68,6 +68,7 @@ class StepGraph:
     is_acyclic: bool = True
     annotations: dict[str, Any] = field(default_factory=dict)
     fused_regions: list = field(default_factory=list)
+    internal_data_passes: list = field(default_factory=list)  # CP comm DataPasses within this StepGraph
 
     def __post_init__(self) -> None:
         if self.nodes and (not self.entry_nodes or not self.exit_nodes):
