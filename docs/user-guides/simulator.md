@@ -226,11 +226,14 @@ cat simulator_output/deepseek_v4_pro_61_layers/summary.txt
 
 所有仿真配置定义在 `torchtitan_npu/simulator/config_registry.py` 中，通过 `--config <函数名>` 选择：
 
-| 配置函数名 | 模型 | 层数 | 并行策略 | world_size | 说明 |
-|-----------|------|------|---------|------------|------|
-| `deepseek_v4_pro_simulate_16_layers` | DeepSeek-V4-Pro | 16 | PP=1/TP=1/CP=1/EP=16 | 384 | 快速验证 |
-| `deepseek_v4_pro_simulate_61_layers` | DeepSeek-V4-Pro | 61 | PP=1/TP=1/CP=1/EP=192 | 384 | 验收配置 |
-| `deepseek_v4_pro_simulate_61_layers_pp16_tp8_cp4_ep128` | DeepSeek-V4-Pro | 61 | PP=16/TP=8/CP=4/EP=128/FSDP=-1 | 2048 | 千卡规模 |
+| 配置函数名 | 模型 | 层数 | 并行策略 | world_size | 模式 | 说明 |
+|-----------|------|------|---------|------------|------|------|
+| `deepseek_v4_pro_simulate_16_layers` | DeepSeek-V4-Pro | 16 | PP=1/TP=1/CP=1/EP=16 | 384 | fake_backend | 快速验证 |
+| `deepseek_v4_pro_simulate_16_layers_cp4` | DeepSeek-V4-Pro | 16 | PP=1/CP=4/EP=16 | 16 | fake_backend | CP 通信捕获验证 |
+| `deepseek_v4_pro_simulate_16_layers_pp4_cp4` | DeepSeek-V4-Pro | 16 | PP=4/CP=4/DP=4 | 64 | multi_proc_meta | PP+CP+FSDP 全通信捕获 |
+| `deepseek_v4_pro_simulate_61_layers` | DeepSeek-V4-Pro | 61 | PP=1/TP=1/CP=1/EP=192 | 384 | fake_backend | 验收配置 |
+| `deepseek_v4_pro_simulate_61_layers_pp16_tp8_cp4_ep128` | DeepSeek-V4-Pro | 61 | PP=16/TP=8/CP=4/EP=128/FSDP=-1 | 2048 | fake_backend | 千卡规模（单进程） |
+| `deepseek_v4_pro_simulate_61_layers_pp16_tp8_cp4_ep128_multiproc` | DeepSeek-V4-Pro | 61 | PP=16/TP=8/CP=4/EP=128/FSDP=-1 | 2048 | multi_proc_meta | 千卡规模（多进程） |
 
 每个仿真配置内部复用对应的真实训练配置（如 `deepseek_v4_pro_debug_61_layers_4k_384die()`），原样继承 model_spec、并行度、optimizer 等全部字段，仅强制以下三项：
 
@@ -346,6 +349,106 @@ def my_model_simulate() -> SimulationTrainerConfig:
 - `world_size`（`NGPU` 环境变量）必须等于 `dp_replicate × dp_shard × cp × tp × pp`。`data_parallel_shard_degree=-1` 时由 torchtitan 自动计算。
 - `pipeline_parallel_degree > 1` 时，DeepSeek-V4 不支持 MTP，需设 `num_mtp_modules=0`。
 - `pipeline_parallel_degree > 1` 时，`local_batch_size` 需 ≥ `pp_degree`（1F1B 调度需要足够 microbatch）。
+
+## 多进程仿真模式（multi_proc_meta）
+
+### 背景：单进程模式的局限
+
+`fake_backend` 单进程模式通过 `FakeProcessGroup` 在一个进程内模拟全部 rank，能正确捕获 TP/CP/EP/FSDP 的集合通信，但 **PP（Pipeline Parallel）的调度逻辑无法真实复刻**——`PipelineScheduleSingle`（1F1B）要求每个进程只运行一个 stage，单进程内无法模拟多 stage 间的真实 P2P 调度时序。
+
+### 方案：PP 用真实多进程，其他维度用 Fake PG
+
+`multi_proc_meta` 模式的核心思路是**分层处理**：
+
+| 维度 | 处理方式 | 进程数 | ProcessGroup 类型 |
+|------|----------|--------|-------------------|
+| PP | 真实多进程 | PP degree（如 4） | gloo（真实 rendezvous） |
+| CP | Fake PG | — | FakeProcessGroup（size=cp_degree） |
+| FSDP | Fake PG | — | FakeProcessGroup（size=fsdp_degree） |
+| TP | Fake PG | — | FakeProcessGroup（size=tp_degree） |
+| EP | Fake PG | — | FakeProcessGroup（size=ep_degree） |
+
+具体来说：
+- 用 `torchrun --nproc_per_node=PP` 启动 PP 个 gloo 进程，每个进程运行一个 PP stage
+- `init_distributed` 返回**完整模拟 world_size**（如 PP=4, CP=4, DP=4 → 64），使 `ParallelDims._validate()` 通过
+- `init_device_mesh` 创建 size=64 的 world_mesh 时，因 64 > gloo_ws(4)，自动切换到 fake backend
+- world_mesh 的 default group 是一个 size=64 的 `FakeProcessGroup`
+- 从 world_mesh unflatten 出的子组（CP/FSDP/TP/EP）通过 `new_group(backend="fake")` 创建，各自有正确的 size 和 rank
+
+### 关键技术点
+
+#### 1. 绕过 `new_group` 的 size 检查
+
+PyTorch 的 `_new_group_with_tag` 检查 `group_world_size <= global_world_size`。当 gloo world_size=4 但需要创建 size=16 的 FSDP 子组时，此检查会失败。
+
+`_patch_new_group_for_fake_backend()` 在 `_is_meta_simulation=True` 时，检测到 `group_ws > gloo_ws` 或 `rank >= gloo_ws`，直接调用 `_new_process_group_helper` 创建 `FakeProcessGroup`，绕过 size/range 检查。FakeProcessGroup 不需要真实进程，只需正确的 rank/size。
+
+#### 2. Fake mesh 的 device handle
+
+当 `device_type="fake"` 时，`_get_device_handle("fake")` 返回 `getattr(torch, "fake", None)`。Simulator 将 `torch.fake` 指向与 `torch.meta` 相同的 `_MetaDeviceModule` stub，使 `device_count()`、`current_device()` 等调用返回安全默认值。
+
+同时 patch 了：
+- `DeviceMesh._setup_world_group_and_device`：对 fake mesh 返回 size=mesh_size 的 FakeProcessGroup（而非 gloo default group）
+- `FSDP._get_device_from_mesh`：对 fake mesh 返回 `torch.device("meta")`
+- `DTensor._random._resolve_device`：对 fake mesh 返回 `torch.device("meta")`
+
+#### 3. CP P2P 通信捕获
+
+DeepSeek-V4 的 CP 使用 `CompressorAttentionCP`，包含两类通信：
+- `_WindowExchange`：P2P `c10d.isend/irecv` 在相邻 CP rank 间交换序列窗口
+- `_allgather_seq`：`funcol.all_gather_tensor_autograd` 聚合压缩后的 KV
+
+`_meta_safe_forward` patch 在短路 P2P 前，通过 `get_active_recorder()` 获取当前 `CommEventRecorder`，调用 `_record_comm_with_l0()` 记录 `cp_forward_send/recv` 和 `cp_backward_send/recv` 事件，确保 CP P2P 通信出现在 L0 图中。
+
+#### 4. PP 元数据交换
+
+PP stage 间的 tensor shape/dtype 元数据通过 `PipelineStage._send_meta/_recv_meta` 交换。在 multi_proc 模式下，这些使用 gloo 的 `send_object_list/recv_object_list` 真实传递（不被 comm_events 拦截器 no-op），保证 DYNAMIC 模式的 shape 推断正确。
+
+### 运行方式
+
+```bash
+# PP=4 + CP=4 多进程仿真（4 个 gloo 进程，模拟 64 rank）
+NGPU=64 torchrun --nproc_per_node=4 --master_port=29500 \
+    -m torchtitan_npu.entry \
+    --module torchtitan_npu.simulator \
+    --config deepseek_v4_pro_simulate_16_layers_pp4_cp4 \
+    --training.steps=1 \
+    --hf_assets_path ./tests/assets/tokenizer/deepseekv3_tokenizer
+```
+
+> [!IMPORTANT]
+> - `--nproc_per_node` 必须等于 PP degree（如 PP=4 则 4 个进程）
+> - `NGPU` 必须等于完整模拟 world_size（如 PP=4 × CP=4 × DP=4 = 64）
+> - 配置中 `context_parallel_degree` 等设为真实值（非 1），`data_parallel_shard_degree=-1` 自动计算
+> - `simulated_parallel_degrees` 字典中的 `world_size` 用于设置 `TORCHTITAN_SIM_WORLD_SIZE` 环境变量
+
+### 输出
+
+每个 PP stage 进程独立捕获自己的 L0-L3 IR，写入 `per_rank/rank_N.json`。rank 0 在所有进程完成后合并为 `merged_summary.txt`，并导出各 stage 的 L0 CSV（`ir_export/stage_N_{phase}_l0_ops.csv`）。
+
+### 通信捕获验证
+
+PP=4+CP=4 配置下，每个 stage 的通信捕获情况：
+
+| 通信类型 | 来源 | 每 stage 数量 | 说明 |
+|----------|------|--------------|------|
+| CP allgather | `_allgather_seq` | 46-77 | kv_compress + k_indexer 的 all_gather |
+| CP P2P send/recv | `_WindowExchange` | 22-87 | 相邻 CP rank 间的序列窗口交换 |
+| FSDP allgather | FSDP2 unshard | 含在 allgather 中 | forward + pre-backward 参数 unshard |
+| FSDP reduce_scatter | FSDP2 reshard | 16-20 | post-backward 参数 reshard |
+| FSDP allreduce | 梯度同步 | 1 | optimizer 阶段梯度 allreduce |
+| PP P2P | 1F1B 调度 | 含在 P2P 中 | stage 间 activation/gradient 传递 |
+
+### 资源消耗
+
+| 配置 | 进程数 | 每进程内存 | 总内存 | 耗时 |
+|------|--------|-----------|--------|------|
+| PP=4, CP=4, 16层 | 4 | ~200MB | ~1GB | ~4s |
+| PP=16, 61层 | 16 | ~300MB | ~5GB | ~30s |
+| PP=16, TP=8, CP=4, EP=128, 61层 | 16 | ~500MB | ~8GB | ~2min |
+
+> [!TIP]
+> 模型全程在 meta device 上运行，零显存分配。内存主要消耗在 Python 对象（OpNode、CommEvent 等），与模型层数和 op 数量成正比。
 
 ## 工作目录结构
 

@@ -707,6 +707,26 @@ def _patch_window_exchange_for_fake_pg() -> None:
         ctx.forward_sent = rank + 1 < world_size
         ctx.forward_recvd = rank > 0
 
+        # Record CP P2P communication events before short-circuiting.
+        # This ensures _WindowExchange's isend/irecv appear in the captured IR.
+        from torchtitan_npu.simulator.capture.comm_events import get_active_recorder, _record_comm_with_l0
+        recorder = get_active_recorder()
+        if recorder is not None:
+            send_buf = tensor[:, -window:]
+            if ctx.forward_sent:
+                event = _record_comm_with_l0(recorder, "p2p_send", group, send_buf)
+                event.p2p_peer_rank = rank + 1
+                event.p2p_direction = "cp_forward_send"
+                event.p2p_mb_idx = -1
+                event.p2p_stage = rank
+            if ctx.forward_recvd:
+                recv_buf = torch.empty_like(send_buf)
+                event = _record_comm_with_l0(recorder, "p2p_recv", group, recv_buf)
+                event.p2p_peer_rank = rank - 1
+                event.p2p_direction = "cp_forward_recv"
+                event.p2p_mb_idx = -1
+                event.p2p_stage = rank
+
         if ctx.forward_recvd:
             recv_buf = torch.empty_like(tensor[:, -window:])
             tensor = torch.cat([recv_buf, tensor], dim=1)
@@ -717,6 +737,27 @@ def _patch_window_exchange_for_fake_pg() -> None:
             return orig_backward(ctx, grad_output)
 
         window = ctx.window
+        rank = ctx.rank
+
+        # Record CP P2P backward communication events.
+        from torchtitan_npu.simulator.capture.comm_events import get_active_recorder, _record_comm_with_l0
+        recorder = get_active_recorder()
+        if recorder is not None:
+            if ctx.forward_recvd:
+                grad_send = grad_output[:, :window]
+                event = _record_comm_with_l0(recorder, "p2p_send", ctx.group, grad_send)
+                event.p2p_peer_rank = rank - 1
+                event.p2p_direction = "cp_backward_send"
+                event.p2p_mb_idx = -1
+                event.p2p_stage = rank
+            if ctx.forward_sent:
+                grad_recv = torch.empty_like(grad_output[:, :window])
+                event = _record_comm_with_l0(recorder, "p2p_recv", ctx.group, grad_recv)
+                event.p2p_peer_rank = rank + 1
+                event.p2p_direction = "cp_backward_recv"
+                event.p2p_mb_idx = -1
+                event.p2p_stage = rank
+
         if ctx.forward_sent:
             grad_recv = torch.zeros_like(grad_output[:, :window])
             grad_output[:, -window:] = grad_output[:, -window:] + grad_recv
@@ -1260,7 +1301,18 @@ def _patch_device_mesh_world_size_check() -> None:
         # (the mesh was created with fake backend to simulate a larger
         # world than the actual gloo world_size)
         if self._device_type == "fake":
-            return _get_default_group()
+            # Create a FakeProcessGroup with the full mesh size as the
+            # "default group" for this mesh.  This allows new_group() to
+            # create subgroups up to mesh_size without hitting the
+            # group_world_size > global_world_size check.
+            mesh_size = self._layout.numel()
+            gloo_rank = get_world_size()  # just to ensure dist is initialized
+            import torch.distributed as dist
+            global_rank = dist.get_rank() if dist.is_initialized() else 0
+            from torch._C._distributed_c10d import FakeProcessGroup
+            opts = FakeProcessGroup.Options()
+            fake_pg = FakeProcessGroup._create_internal(global_rank, mesh_size, opts)
+            return fake_pg
 
         # For non-fake backend, use the original logic
         world_size = get_world_size()
@@ -1326,6 +1378,181 @@ def _patch_parallel_dims_for_multi_proc(full_ws: int, gloo_ws: int) -> None:
         pass
 
 
+def _patch_new_group_for_fake_backend() -> None:
+    """Patch ``_new_group_with_tag`` to skip the
+    ``group_world_size > global_world_size`` check when
+    ``backend="fake"``.
+
+    In multi_proc_meta mode, the gloo world_size is small (e.g. 4),
+    but we need to create fake process groups for larger dimensions
+    (e.g. FSDP=16, EP=128).  FakeProcessGroup doesn't need real
+    processes — it just stores rank/size — so the size check is
+    unnecessary for fake backend subgroups."""
+    try:
+        from torch.distributed import distributed_c10d as dc
+    except Exception:
+        return
+
+    if hasattr(dc, "_sim_orig_new_group_with_tag"):
+        return
+    dc._sim_orig_new_group_with_tag = dc._new_group_with_tag
+
+    orig = dc._new_group_with_tag
+
+    def _patched_new_group_with_tag(  # noqa: ANN001
+        ranks=None, timeout=None, backend=None, backend_options=None,
+        pg_tag=None, use_local_synchronization=False, group_desc=None,
+        device_id=None, sort_ranks=True,
+    ):
+        # In meta simulation mode, when group_world_size > gloo world_size
+        # or any rank >= gloo world_size, create a FakeProcessGroup directly
+        # (bypassing the size/range checks).  This happens for subgroups of
+        # a fake world_mesh whose rank IDs exceed the gloo process count.
+        if _is_meta_simulation and dc.is_initialized():
+            gloo_ws = dc.get_world_size()
+            group_ws = len(ranks) if ranks is not None else gloo_ws
+            needs_fake = group_ws > gloo_ws
+            if not needs_fake and ranks:
+                needs_fake = any(r >= gloo_ws for r in ranks)
+            if needs_fake:
+                # Bypass _new_group_with_tag's size check by calling
+                # _new_process_group_helper directly with backend="fake".
+                if sort_ranks and ranks is not None:
+                    ranks = sorted(ranks)
+                global_rank = dc.get_rank()
+                group_rank = ranks.index(global_rank) if ranks and global_rank in ranks else -1
+
+                if group_rank == -1:
+                    # This process is not in the subgroup.
+                    # Still need to call _new_process_group_helper for
+                    # collective consistency, but it returns NON_GROUP_MEMBER.
+                    pass
+
+                from torch.distributed.distributed_c10d import (
+                    _new_process_group_helper, _process_group_name, _world,
+                    Backend, PrefixStore, _get_default_timeout,
+                )
+                from datetime import timedelta
+                group_name = _process_group_name(
+                    ranks or [], use_hashed_name=use_local_synchronization,
+                )
+                group_desc = "undefined" if group_desc is None else group_desc
+                default_pg = dc._get_default_group()
+                _, default_store = _world.pg_map[default_pg]
+                if timeout is None:
+                    timeout = _get_default_timeout(Backend.FAKE)
+
+                pg, _ = _new_process_group_helper(
+                    group_size=group_ws,
+                    group_rank=group_rank if group_rank >= 0 else 0,
+                    global_ranks_in_group=ranks or [],
+                    backend=Backend.FAKE,
+                    store=default_store,
+                    group_name=group_name,
+                    backend_options=backend_options,
+                    timeout=timeout,
+                    pg_tag=pg_tag,
+                    device_id=device_id,
+                    group_desc=group_desc,
+                )
+
+                if group_rank == -1:
+                    return dc.GroupMember.NON_GROUP_MEMBER
+                return pg
+
+        return orig(
+            ranks, timeout, backend, backend_options, pg_tag,
+            use_local_synchronization, group_desc, device_id, sort_ranks,
+        )
+
+    dc._new_group_with_tag = _patched_new_group_with_tag
+    # Also patch the public new_group — it has a different signature than
+    # _new_group_with_tag (e.g. pg_options), so use **kwargs to forward.
+    def _patched_new_group(*args, **kwargs):  # noqa: ANN001
+        # Map new_group's kwargs to _new_group_with_tag's kwargs
+        return _patched_new_group_with_tag(
+            ranks=kwargs.get("ranks"),
+            timeout=kwargs.get("timeout"),
+            backend=kwargs.get("backend"),
+            backend_options=kwargs.get("pg_options"),  # new_group uses pg_options
+            pg_tag=None,
+            use_local_synchronization=kwargs.get("use_local_synchronization", False),
+            group_desc=kwargs.get("group_desc"),
+            device_id=kwargs.get("device_id"),
+            sort_ranks=kwargs.get("sort_ranks", True),
+        )
+    dc.new_group = _patched_new_group
+
+    # Patch by-value imports in device_mesh and torch.distributed
+    try:
+        import torch.distributed.device_mesh as dm_mod
+        dm_mod.new_group = dc.new_group
+    except Exception:
+        pass
+    try:
+        import torch.distributed as dist_mod
+        dist_mod.new_group = dc.new_group
+    except Exception:
+        pass
+
+
+def _patch_fsdp_get_device_from_mesh() -> None:
+    """Patch FSDP's ``_get_device_from_mesh`` to return a meta device when
+    the mesh was created with ``device_type="fake"`` (multi_proc_meta mode).
+
+    FSDP calls ``_get_device_from_mesh(mesh)`` during ``fully_shard()``
+    to determine the device for parameter sharding.  When the mesh uses
+    fake backend, ``_get_device_handle("fake")`` returns None, causing
+    an AttributeError.  This patch returns ``torch.device("meta")`` for
+    fake meshes, which is correct under meta simulation."""
+    try:
+        from torch.distributed.fsdp._fully_shard import _fsdp_init
+    except Exception:
+        return
+
+    if hasattr(_fsdp_init, "_sim_orig_get_device_from_mesh"):
+        return
+    _fsdp_init._sim_orig_get_device_from_mesh = _fsdp_init._get_device_from_mesh
+
+    def _patched_get_device_from_mesh(mesh):  # noqa: ANN001
+        if mesh.device_type == "fake":
+            return torch.device("meta")
+        return _fsdp_init._sim_orig_get_device_from_mesh(mesh)
+
+    _fsdp_init._get_device_from_mesh = _patched_get_device_from_mesh
+
+    # Also patch the by-value import in _fully_shard
+    try:
+        from torch.distributed.fsdp._fully_shard import _fully_shard as fs_mod
+        fs_mod._get_device_from_mesh = _patched_get_device_from_mesh
+    except Exception:
+        pass
+
+
+def _patch_dtensor_random_for_fake_mesh() -> None:
+    """Patch DTensor's ``_resolve_device`` in ``tensor._random`` to return
+    a meta device when the mesh uses ``device_type="fake"``.
+
+    ``_resolve_device`` calls ``torch.device(f"{device_type}:{device_idx}")``
+    which fails for "fake" because it's not a registered torch device type.
+    This patch returns ``torch.device("meta")`` for fake meshes."""
+    try:
+        from torch.distributed.tensor import _random as rng_mod
+    except Exception:
+        return
+
+    if hasattr(rng_mod, "_sim_orig_resolve_device"):
+        return
+    rng_mod._sim_orig_resolve_device = rng_mod._resolve_device
+
+    def _patched_resolve_device(device_mesh=None):  # noqa: ANN001
+        if device_mesh is not None and device_mesh.device_type == "fake":
+            return torch.device("meta")
+        return rng_mod._sim_orig_resolve_device(device_mesh=device_mesh)
+
+    rng_mod._resolve_device = _patched_resolve_device
+
+
 def _patch_init_distributed_for_multi_proc_meta() -> None:
     """Patch ``init_distributed`` to handle ``comm.mode=multi_proc_meta``.
 
@@ -1336,7 +1563,9 @@ def _patch_init_distributed_for_multi_proc_meta() -> None:
     ``init_process_group`` rendezvous -- no meta tensors ever reach gloo.
 
     This patch adds a branch for ``multi_proc_meta`` mode that calls
-    ``init_process_group("gloo")`` and returns the world_size."""
+    ``init_process_group("gloo")`` and returns the full simulated
+    world_size (from ``simulated_parallel_degrees``) so that
+    ``ParallelDims._validate()`` passes with the real parallel degrees."""
     try:
         from torchtitan.distributed import utils as dist_utils
     except Exception:
@@ -1360,14 +1589,18 @@ def _patch_init_distributed_for_multi_proc_meta() -> None:
             backend="gloo",
             timeout=timedelta(seconds=comm_config.init_timeout_seconds),
         )
-        # In multi_proc_meta mode, gloo world_size = PP degree (e.g. 16).
-        # We return this as the world_size for ParallelDims validation.
-        # The full simulated world_size (e.g. 2048) is handled by the
-        # RankTable, which uses the config's parallel degrees to compute
-        # the full rank topology without needing a real 2048-rank mesh.
-        # The mesh will have 16 ranks (one per PP stage), and each rank's
-        # PP coordinate is its gloo rank. Other dimensions (DP/TP/CP/EP)
-        # are simulated by the comm_events interceptors.
+
+        # Patch new_group to allow fake subgroups larger than gloo world_size
+        _patch_new_group_for_fake_backend()
+
+        # Return the full simulated world_size so ParallelDims validation
+        # passes with the real parallel degrees (e.g. PP=4, CP=4, DP=4 → 64).
+        # The gloo world_size is only PP degree (e.g. 4); the rest is
+        # simulated by FakeProcessGroup subgroups.
+        sim_ws = os.environ.get("TORCHTITAN_SIM_WORLD_SIZE")
+        if sim_ws:
+            return int(sim_ws)
+        # Fallback: return gloo world_size (PP degree only)
         return dist.get_world_size()
 
     dist_utils.init_distributed = _patched_init_distributed
@@ -1408,6 +1641,14 @@ def patch_device_type_to_meta() -> None:
     _original_values[("torch", "meta")] = getattr(torch, "meta", _MISSING)
     torch.meta = stub
 
+    # When multi_proc_meta mode creates a fake world_mesh (device_type="fake"),
+    # DTensor's sharding propagation calls _get_device_handle("fake") which
+    # does getattr(torch, "fake", None).  Without this, it returns None and
+    # crashes on device_count()/current_device().  Point torch.fake to the
+    # same meta stub so all device queries are no-ops.
+    _original_values[("torch", "fake")] = getattr(torch, "fake", _MISSING)
+    torch.fake = stub
+
     # torch_npu registers itself as `torch.npu` (the real device-accessor
     # module, e.g. `torch.npu.current_stream()`/`.current_device()`) and
     # ALSO patches core PyTorch internals to call it directly, hardcoded,
@@ -1443,6 +1684,8 @@ def patch_device_type_to_meta() -> None:
     _patch_pipeline_stage_for_pp_context()
     _patch_torch_equal_for_meta()
     _patch_init_distributed_for_multi_proc_meta()
+    _patch_fsdp_get_device_from_mesh()
+    _patch_dtensor_random_for_fake_mesh()
     global _is_meta_simulation
     _is_meta_simulation = True
     _patched = True

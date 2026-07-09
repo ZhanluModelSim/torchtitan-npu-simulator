@@ -102,12 +102,18 @@ def deepseek_v4_pro_simulate_16_layers_cp4() -> SimulationTrainerConfig:
 
 
 def deepseek_v4_pro_simulate_16_layers_pp4_cp4() -> SimulationTrainerConfig:
-    """PP=4 + CP=4 variant for multi-process CP capture.
+    """PP=4 + CP=4 variant for multi-process CP+FSDP capture.
 
     Run with: ``NGPU=64 torchrun --nproc_per_node=4 -m torchtitan_npu.entry
     --module torchtitan_npu.simulator
     --config deepseek_v4_pro_simulate_16_layers_pp4_cp4
     --training.steps=1``
+
+    Uses real parallel degrees (PP=4, CP=4, DP=4 → world_size=64).
+    The gloo PG has only 4 processes (one per PP stage); CP/FSDP/TP/EP
+    subgroups use FakeProcessGroup with the correct simulated size.
+    ``TORCHTITAN_SIM_WORLD_SIZE=64`` env var tells init_distributed to
+    return 64 (not gloo's 4) for ParallelDims validation.
     """
     base_config = deepseek_v4_pro_debug_16_layers()
     base_config = dataclasses.replace(
@@ -120,10 +126,13 @@ def deepseek_v4_pro_simulate_16_layers_pp4_cp4() -> SimulationTrainerConfig:
         parallelism=dataclasses.replace(
             base_config.parallelism,
             pipeline_parallel_degree=4,
-            context_parallel_degree=4,
+            # Real parallel degrees — ParallelDims validates
+            # dp_replicate * dp_shard * cp * tp * pp == world_size
+            # 1 * 4 * 4 * 1 * 4 = 64 == TORCHTITAN_SIM_WORLD_SIZE
             tensor_parallel_degree=1,
+            context_parallel_degree=4,
             expert_parallel_degree=1,
-            data_parallel_shard_degree=1,
+            data_parallel_shard_degree=-1,  # auto: 64 / (1*4*1*4) = 4
         ),
     )
     sim_config = _to_simulation_config(

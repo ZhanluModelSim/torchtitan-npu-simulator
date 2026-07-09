@@ -229,6 +229,14 @@ def _record_comm_with_l0(
     return event
 
 
+_active_recorder: CommEventRecorder | None = None
+
+
+def get_active_recorder() -> CommEventRecorder | None:
+    """Return the currently active CommEventRecorder, if any."""
+    return _active_recorder
+
+
 @contextmanager
 def capture_fake_collectives() -> Iterator[CommEventRecorder]:
     """Monkeypatch the legacy (`torch.distributed.*`) and functional
@@ -249,7 +257,9 @@ def capture_fake_collectives() -> Iterator[CommEventRecorder]:
     real and fake groups), the functional-collective patches always treat
     calls made while the context is active as fake, unconditionally.
     """
+    global _active_recorder
     recorder = CommEventRecorder()
+    _active_recorder = recorder
 
     orig_all_reduce = dist.all_reduce
     orig_all_gather_into_tensor = dist.all_gather_into_tensor
@@ -488,3 +498,4 @@ def capture_fake_collectives() -> Iterator[CommEventRecorder]:
         funcol.all_gather_tensor_autograd = orig_funcol_all_gather_tensor_autograd
         funcol.reduce_scatter_tensor_autograd = orig_funcol_reduce_scatter_tensor_autograd
         funcol.all_to_all_single_autograd = orig_funcol_all_to_all_single_autograd
+        _active_recorder = None

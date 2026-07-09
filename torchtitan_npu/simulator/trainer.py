@@ -284,6 +284,23 @@ class SimulationTrainer(Trainer):
             config.optimizer.implementation = "foreach"
 
         patch_device_type_to_meta()
+
+        # In multi_proc_meta mode, set TORCHTITAN_SIM_WORLD_SIZE so that
+        # _patched_init_distributed returns the full simulated world_size
+        # (not gloo's PP-only world_size) for ParallelDims validation.
+        if config.comm.mode == "multi_proc_meta":
+            import os
+            sim_degrees = config.simulation.simulated_parallel_degrees
+            if sim_degrees and "world_size" in sim_degrees:
+                os.environ["TORCHTITAN_SIM_WORLD_SIZE"] = str(sim_degrees["world_size"])
+            # Patch init_device_mesh to use fake backend for meshes larger
+            # than gloo world_size (e.g. world_mesh of size 64 with 4 gloo procs)
+            from torchtitan_npu.simulator.meta_env import _patch_parallel_dims_for_multi_proc
+            import torch.distributed as dist
+            gloo_ws = dist.get_world_size() if dist.is_initialized() else 1
+            full_ws = int(sim_degrees.get("world_size", gloo_ws)) if sim_degrees else gloo_ws
+            _patch_parallel_dims_for_multi_proc(full_ws, gloo_ws)
+
         super().__init__(config)
         self.simulation_config = config.simulation
         self.workload_graph: WorkloadGraph | None = None
