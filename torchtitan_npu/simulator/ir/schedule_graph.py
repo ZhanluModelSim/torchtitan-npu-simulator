@@ -19,13 +19,14 @@ class TimelineEntry:
     """One op's position in the execution timeline, captured (not inferred)."""
 
     seq_idx: int           # global execution sequence number (from capture)
-    op_id: int             # L0 OpNode ID
+    op_id: int             # L0 OpNode ID (-1 for MB 1+ pass-through)
     rank: int              # which rank executed this op
     pipeline_stage: int    # PP stage (-1 if not PP)
     micro_batch_idx: int   # microbatch index (-1 if not PP)
     phase: str             # "forward" / "backward" / "optimizer" / "comm"
     comm_type: str = ""    # "fwd_send" / "fwd_recv" / "bwd_send" / "bwd_recv" / "allgather" / ...
     comm_peer_rank: int = -1  # for P2P: peer rank
+    action: str = ""       # "compute" / "forward_one_chunk" / "backward_one_chunk" / "comm"
 
 
 @dataclass
@@ -67,6 +68,7 @@ class DataPass:
     dst_device: int | None = None
     requires_communication: bool = False
     comm_primitive: str = ""
+    comm_group_ranks: list[list[int]] = field(default_factory=list)
 
 
 @dataclass
@@ -143,11 +145,13 @@ class ScheduleGraph:
                     "op_id",
                 ])
                 for e in stage_entries:
-                    # Determine action from captured fields
-                    if e.comm_type:
+                    # Use captured action field directly
+                    if e.action:
+                        action = e.action
+                    elif e.comm_type:
                         action = e.comm_type
                     else:
-                        action = f"{e.phase}_one_chunk"
+                        action = "compute"
                     w.writerow([
                         e.seq_idx, e.phase,
                         e.micro_batch_idx if e.micro_batch_idx >= 0 else "",

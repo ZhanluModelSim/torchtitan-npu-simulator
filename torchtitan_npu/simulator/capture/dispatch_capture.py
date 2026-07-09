@@ -66,6 +66,8 @@ class _RawEvent:
     comm_dim: str = ""
     comm_ranks_str: str = ""
     seq_idx: int = 0
+    pp_stage: int = -1
+    pp_mb_idx: int = -1
 
 
 def _shape_signature(event: _RawEvent) -> tuple:
@@ -102,6 +104,7 @@ class OpDispatchCapture(TorchDispatchMode):
         self._producer: dict[int, str] = {}
         self._last_signature: tuple | None = None
         self._previous_active_capture: OpDispatchCapture | None = None
+        self._capture_l0: bool = True  # pass-through when False (MB 1+)
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):  # noqa: ANN001, ANN201
         kwargs = kwargs or {}
@@ -137,12 +140,24 @@ class OpDispatchCapture(TorchDispatchMode):
         flat_outputs: list[torch.Tensor],
         module_path: str,
     ) -> None:
+        if not self._capture_l0:
+            return  # pass-through: MB 1+ skips L0 capture
         predecessors = sorted({self._producer[id(t)] for t in flat_inputs if id(t) in self._producer})
         input_metas = [to_tensor_meta(t, name=f"in_{i}") for i, t in enumerate(flat_inputs)]
         output_metas = [to_tensor_meta(t, name=f"out_{i}") for i, t in enumerate(flat_outputs)]
 
         op_type = to_canonical_op_type(raw_op_type)
         phase = self.phase_provider() if self.phase_provider else "forward"
+
+        # Read PP context for this op's stage/mb attribution
+        pp_stage = -1
+        pp_mb_idx = -1
+        try:
+            from torchtitan_npu.simulator.meta_env import _pp_context
+            pp_stage = int(_pp_context.get("stage", -1))
+            pp_mb_idx = int(_pp_context.get("mb_idx", -1))
+        except Exception:
+            pass
 
         candidate = _RawEvent(
             op_id=0,
@@ -154,6 +169,8 @@ class OpDispatchCapture(TorchDispatchMode):
             module_path=module_path,
             phase=phase,
             seq_idx=next(_seq_counter),
+            pp_stage=pp_stage,
+            pp_mb_idx=pp_mb_idx,
         )
         signature = _shape_signature(candidate)
 
@@ -198,6 +215,10 @@ class OpDispatchCapture(TorchDispatchMode):
                 annotations["comm_dim"] = event.comm_dim
             if event.comm_ranks_str:
                 annotations["comm_ranks"] = event.comm_ranks_str
+            if event.pp_stage >= 0:
+                annotations["pp_stage"] = event.pp_stage
+            if event.pp_mb_idx >= 0:
+                annotations["pp_mb_idx"] = event.pp_mb_idx
             nodes[event.op_id] = OpNode(
                 op_id=event.op_id,
                 op_type=event.op_type,

@@ -1102,13 +1102,45 @@ def _patch_pipeline_stage_for_pp_context() -> None:
         _pp_context["mb_idx"] = mb_idx
         _pp_context["phase"] = "forward"
         _pp_context["stage"] = self.stage_index
-        return _original_fwd_one_chunk(self, mb_idx, *args, **kwargs)
+        # Control L0 capture: only MB 0 gets full L0, MB 1+ is pass-through
+        from torchtitan_npu.simulator.capture.dispatch_capture import get_active_capture
+        cap = get_active_capture()
+        if cap is not None:
+            cap._capture_l0 = (mb_idx == 0)
+        result = _original_fwd_one_chunk(self, mb_idx, *args, **kwargs)
+        # Record L2 timeline event (always, regardless of L0 capture)
+        from torchtitan_npu.simulator.capture.comm_events import get_active_recorder
+        recorder = get_active_recorder()
+        if recorder is not None:
+            recorder.record_timeline_event(
+                action="forward_one_chunk",
+                pp_stage=self.stage_index,
+                pp_mb_idx=mb_idx,
+                phase="forward",
+            )
+        return result
 
     def _patched_bwd_one_chunk(self, mb_idx, *args, **kwargs):  # noqa: ANN001
         _pp_context["mb_idx"] = mb_idx
         _pp_context["phase"] = "backward"
         _pp_context["stage"] = self.stage_index
-        return _original_bwd_one_chunk(self, mb_idx, *args, **kwargs)
+        # Control L0 capture: only MB 0 gets full L0, MB 1+ is pass-through
+        from torchtitan_npu.simulator.capture.dispatch_capture import get_active_capture
+        cap = get_active_capture()
+        if cap is not None:
+            cap._capture_l0 = (mb_idx == 0)
+        result = _original_bwd_one_chunk(self, mb_idx, *args, **kwargs)
+        # Record L2 timeline event
+        from torchtitan_npu.simulator.capture.comm_events import get_active_recorder
+        recorder = get_active_recorder()
+        if recorder is not None:
+            recorder.record_timeline_event(
+                action="backward_one_chunk",
+                pp_stage=self.stage_index,
+                pp_mb_idx=mb_idx,
+                phase="backward",
+            )
+        return result
 
     PipelineStage.forward_one_chunk = _patched_fwd_one_chunk
     PipelineStage.backward_one_chunk = _patched_bwd_one_chunk

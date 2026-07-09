@@ -59,6 +59,7 @@ class CommEvent:
     p2p_direction: str = ""      # "forward_send" / "forward_recv" / "backward_send" / "backward_recv"
     p2p_mb_idx: int = -1         # microbatch index
     p2p_stage: int = -1          # pipeline stage index
+    seq_idx: int = 0             # global execution sequence number (shared with L0 ops)
 
 
 class _NoOpWork:
@@ -76,6 +77,7 @@ class _NoOpWork:
 class CommEventRecorder:
     def __init__(self) -> None:
         self.events: list[CommEvent] = []
+        self.timeline_events: list[dict] = []  # L2 scheduling events (MB 1+ pass-through)
 
     def record(
         self,
@@ -103,6 +105,25 @@ class CommEventRecorder:
         )
         self.events.append(event)
         return event
+
+    def record_timeline_event(
+        self,
+        *,
+        action: str,
+        pp_stage: int,
+        pp_mb_idx: int,
+        phase: str,
+    ) -> None:
+        """Record an L2 scheduling-level timeline event (e.g. forward_one_chunk,
+        backward_one_chunk).  Used for MB 1+ when L0 capture is in pass-through."""
+        from torchtitan_npu.simulator.capture.dispatch_capture import _seq_counter
+        self.timeline_events.append({
+            "seq_idx": next(_seq_counter),
+            "action": action,
+            "pp_stage": pp_stage,
+            "pp_mb_idx": pp_mb_idx,
+            "phase": phase,
+        })
 
 
 def _resolve_world_size(group: object) -> int:
@@ -208,6 +229,9 @@ def _record_comm_with_l0(
         comm_primitive, group, tensor,
         comm_dim=comm_dim, comm_ranks=comm_ranks,
     )
+    # Assign a global seq_idx so comm events can be ordered in the timeline
+    from torchtitan_npu.simulator.capture.dispatch_capture import _seq_counter
+    event.seq_idx = next(_seq_counter)
 
     out = output_tensor if output_tensor is not None else tensor
     capture = get_active_capture()

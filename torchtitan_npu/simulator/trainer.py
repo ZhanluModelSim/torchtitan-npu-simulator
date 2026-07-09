@@ -107,6 +107,7 @@ def run_simulation_step(
     pipeline_schedule: str = "none",
     num_micro_batches: int = 1,
     gradient_accumulation: int = 1,
+    rank: int = 0,
 ) -> WorkloadGraph:
     """Run one forward+backward+optimizer step under full capture and
     return the resulting four-layer WorkloadGraph. Bypasses
@@ -171,6 +172,8 @@ def run_simulation_step(
         timings["forward_backward"] = t2 - t1
 
         boundary.mark("optimizer")
+        # Always capture L0 for optimizer phase (not controlled by microbatch)
+        capture._capture_l0 = True
         optimizer_step()
         lr_scheduler_step()
         t3 = time.perf_counter()
@@ -193,9 +196,11 @@ def run_simulation_step(
         step_templates=step_templates,
         rank_table=rank_table,
         comm_events=comm_recorder.events,
+        timeline_events=comm_recorder.timeline_events,
         pipeline_schedule=pipeline_schedule,
         num_micro_batches=num_micro_batches,
         gradient_accumulation=gradient_accumulation,
+        rank=rank,
     )
     timings["build_schedule_graph"] = time.perf_counter() - t7
 
@@ -318,6 +323,11 @@ class SimulationTrainer(Trainer):
 
         t1 = time.perf_counter()
 
+        # Determine rank for this process
+        import torch.distributed as dist
+        is_multi_proc = self.config.comm.mode == "multi_proc_meta"
+        rank = dist.get_rank() if (is_multi_proc and dist.is_initialized()) else 0
+
         self.workload_graph = run_simulation_step(
             model_parts=self.model_parts,
             parallel_dims=self.parallel_dims,
@@ -331,23 +341,15 @@ class SimulationTrainer(Trainer):
             pipeline_schedule=self.config.parallelism.pipeline_parallel_schedule,
             num_micro_batches=self.gradient_accumulation_steps,
             gradient_accumulation=self.gradient_accumulation_steps,
+            rank=rank,
         )
 
         t2 = time.perf_counter()
 
-        # In multi_proc_meta mode, each rank writes its IR to a per-rank
-        # file; rank 0 merges them after all ranks finish.
-        import torch.distributed as dist
-        is_multi_proc = self.config.comm.mode == "multi_proc_meta"
+        # Each rank exports independently to rank_N/ directory (no merge)
         if is_multi_proc and dist.is_initialized():
-            rank = dist.get_rank()
-            # Each rank writes its per-rank IR
-            self._export_per_rank(rank)
-            # Barrier to ensure all ranks have written
+            self._export(rank=rank)
             dist.barrier()
-            # Rank 0 merges all per-rank IRs
-            if rank == 0:
-                self._merge_per_rank_ir()
         else:
             self._export()
 
@@ -485,11 +487,16 @@ class SimulationTrainer(Trainer):
 
         print(f"Merged {len(all_ranks)} PP stages' IR to {out_dir}")
 
-    def _export(self) -> None:
+    def _export(self, rank: int = 0) -> None:
         import time
         t0 = time.perf_counter()
         assert self.workload_graph is not None
-        out_dir = self.simulation_config.output_dir
+        # In multi_proc mode, write to rank_N/ subdirectory; else top-level
+        base_dir = self.simulation_config.output_dir
+        if rank > 0 or self.config.comm.mode == "multi_proc_meta":
+            out_dir = os.path.join(base_dir, f"rank_{rank}")
+        else:
+            out_dir = base_dir
         os.makedirs(out_dir, exist_ok=True)
         formats = self.simulation_config.output_formats
         export_timings: dict[str, float] = {}
