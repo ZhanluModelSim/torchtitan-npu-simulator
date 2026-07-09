@@ -224,3 +224,186 @@ l2_timeline = [e for e in all_events if e.comm_layer != "L1" and not e.is_l0_com
 | 4 | `step_boundary.py` | `build_step_graphs` 关联 L1 通信到 StepGraph |
 | 5 | `schedule_graph.py` | StepGraph 增加 `internal_data_passes` 字段 |
 | 6 | 测试 | 验证 L1 只含 CP 通信、L2 只含 PP/FSDP 通信 |
+
+## 6. L2 DataPass 与 L1 StepGraph 的连接关系
+
+### 6.1 问题
+
+当前 DataPass 的 `src_exit_op` 和 `dst_entry_op` 都指向**通信算子自身的 op_id**（`src_exit_op == dst_entry_op`），没有建立与 L1 StepGraph 入口/出口算子的连接。回放时无法从 L2 顶层沿着 DataPass 链找到 L1 的具体入口/出口算子。
+
+### 6.2 需要的连接关系
+
+每条 L2 DataPass 应连接两个 L1 StepGraph 实例（或一个 L1 实例与一个通信端点）：
+
+```
+L1 StepGraph (src)  ──src_exit_op──▶  L2 DataPass  ──dst_entry_op──▶  L1 StepGraph (dst)
+   (出口算子)                              (通信)                          (入口算子)
+```
+
+| L2 通信类型 | src_exit_op 指向 | dst_entry_op 指向 | 语义 |
+|------------|-----------------|------------------|------|
+| FSDP unshard (allgather) | 通信算子自身 op_id | L1 forward 的**入口算子**（第一个消费 unshard 参数的算子） | unshard 后参数进入 forward 计算 |
+| FSDP reshard (reduce_scatter) | L1 backward 的**出口算子**（梯度产出算子） | 通信算子自身 op_id | backward 产出的梯度被 reshard |
+| FSDP allreduce | L1 optimizer 的**出口算子** | 通信算子自身 op_id | optimizer 产出的梯度被同步 |
+| PP forward_send | L1 forward 的**出口算子**（activation 产出算子） | 通信算子自身 op_id | forward 产出的 activation 被 send |
+| PP forward_recv | 通信算子自身 op_id | L1 forward 的**入口算子**（第一个消费 recv activation 的算子） | recv 的 activation 进入 forward 计算 |
+| PP backward_send | L1 backward 的**出口算子**（gradient 产出算子） | 通信算子自身 op_id | backward 产出的 gradient 被 send |
+| PP backward_recv | 通信算子自身 op_id | L1 backward 的**入口算子**（第一个消费 recv gradient 的算子） | recv 的 gradient 进入 backward 计算 |
+
+### 6.3 连接关系的方向性
+
+```
+                    ┌─────────────────────────────────────────┐
+                    │           L2 ScheduleGraph              │
+                    │                                         │
+  FSDP unshard ──▶  │  dst_entry_op → forward StepGraph entry  │
+                    │                      │                  │
+                    │                 (L1 compute)             │
+                    │                      │                  │
+  PP forward_send ◀│  src_exit_op ← forward StepGraph exit     │
+                    │                      │                  │
+                    │                 (PP P2P)                │
+                    │                      │                  │
+  PP forward_recv ─▶│  dst_entry_op → next stage forward entry│
+                    │                      │                  │
+                    │                 (L1 compute)             │
+                    │                      │                  │
+  FSDP reshard ◀│  src_exit_op ← backward StepGraph exit      │
+                    │                                         │
+                    └─────────────────────────────────────────┘
+```
+
+### 6.4 实现方案
+
+#### 6.4.1 捕获时记录连接点
+
+在 `_record_comm` 中，除了记录通信事件本身，还需要记录它与 L1 StepGraph 的连接关系。关键信息是：**通信发生时，当前 L1 计算图的入口/出口算子是什么**。
+
+**方案 A：基于 producer/consumer 关系（推荐）**
+
+`OpDispatchCapture` 已经维护了 `_producer` 字典（`id(tensor) → op_id`），记录每个张量由哪个算子产出。当通信算子被调用时：
+
+- **unshard（allgather）**：通信产出的张量被后续计算算子消费。`dst_entry_op` = 第一个消费通信产出张量的算子 op_id（通过 `_producer` 反查通信算子的消费者）。
+- **reshard（reduce_scatter）**：通信消费的张量由前序计算算子产出。`src_exit_op` = 产出通信输入张量的算子 op_id（通过 `_producer` 查找）。
+- **PP send**：通信消费的张量由 forward 计算产出。`src_exit_op` = 产出 send 输入张量的算子 op_id。
+- **PP recv**：通信产出的张量被后续计算消费。`dst_entry_op` = 第一个消费 recv 产出张量的算子 op_id。
+
+```python
+def _record_comm(recorder, comm_primitive, group, tensor, output_tensor=None):
+    ...
+    event = recorder.record(...)
+    
+    # Determine connection to L1 StepGraph
+    capture = get_active_capture()
+    if capture is not None:
+        if output_tensor is not None:
+            # Comm produces a tensor that will be consumed by L1 compute
+            # dst_entry_op will be set later when the consumer is captured
+            # For now, register a pending link
+            capture._pending_comm_links[id(output_tensor)] = event
+        else:
+            # Comm consumes a tensor produced by L1 compute
+            # src_exit_op = the producer of the input tensor
+            producer_op = capture._producer.get(id(tensor))
+            if producer_op is not None:
+                event.src_exit_op = producer_op
+    ...
+```
+
+**延迟解析 dst_entry_op**：通信产出的张量可能稍后才被计算算子消费。在 `_record_event` 中，当捕获一个新算子时，检查其输入张量是否有 pending comm link：
+
+```python
+def _record_event(self, raw_op_type, flat_inputs, ...):
+    ...
+    # Check if any input tensor was produced by a comm op (pending link)
+    for t in flat_inputs:
+        if id(t) in self._pending_comm_links:
+            event = self._pending_comm_links.pop(id(t))
+            event.dst_entry_op = op_id  # this op is the first consumer
+    ...
+```
+
+#### 6.4.2 StepInstance 标识
+
+DataPass 的 `src_instance` / `dst_instance` 需要标识具体的 L1 StepGraph 实例（哪个 rank、哪个 microbatch、哪个 phase）：
+
+```python
+# 当前: src_instance = "rank1" (只有 rank)
+# 改为: src_instance = "rank1_mb0_forward" (rank + microbatch + phase)
+```
+
+这需要从 `_pp_context` 获取 `mb_idx` 和 `phase`，在 `_record_comm` 时记录到 CommEvent。
+
+#### 6.4.3 DataPass 结构更新
+
+```python
+@dataclass
+class DataPass:
+    src_instance: str          # "rank1_mb0_forward" (rank + mb + phase)
+    dst_instance: str          # "rank2_mb0_forward" or "group:fsdp"
+    slots: list[TensorSlot]
+    src_device: int | None = None
+    dst_device: int | None = None
+    requires_communication: bool = False
+    comm_primitive: str = ""
+    comm_group_ranks: list[list[int]] = field(default_factory=list)
+    # 连接关系:
+    # src_exit_op: src_instance 的出口算子 op_id (产出被通信的数据)
+    # dst_entry_op: dst_instance 的入口算子 op_id (消费通信的数据)
+    # 如果指向通信算子自身，表示该端是通信端点（非 L1 计算端）
+```
+
+TensorSlot 的 `src_exit_op` / `dst_entry_op` 语义：
+
+| 字段 | 值 | 含义 |
+|------|-----|------|
+| `src_exit_op` | L1 计算算子 op_id | 数据由该 L1 算子产出，然后进入通信 |
+| `src_exit_op` | 通信算子 op_id | 数据由通信产出（如 recv/unshard），src 端是通信端点 |
+| `dst_entry_op` | L1 计算算子 op_id | 数据被该 L1 算子消费，通信后进入计算 |
+| `dst_entry_op` | 通信算子 op_id | 数据被通信消费（如 send/reshard），dst 端是通信端点 |
+
+### 6.5 回放路径示例
+
+以 PP=4, MB=0 的 forward 为例，回放路径：
+
+```
+1. L2: PP forward_recv (stage 1, MB 0)
+   └─ dst_entry_op → L1 forward StepGraph (stage 1, MB 0) 的入口算子
+
+2. L1: forward StepGraph (stage 1, MB 0) 内部按拓扑序回放
+   └─ exit_nodes → 出口算子
+
+3. L2: PP forward_send (stage 1, MB 0)
+   └─ src_exit_op → L1 forward StepGraph (stage 1, MB 0) 的出口算子
+   └─ dst_entry_op → 通信算子自身（send 端点）
+
+4. L2: PP forward_recv (stage 2, MB 0)
+   └─ dst_entry_op → L1 forward StepGraph (stage 2, MB 0) 的入口算子
+
+5. L1: forward StepGraph (stage 2, MB 0) 内部回放
+   ...
+```
+
+FSDP 的回放路径：
+
+```
+1. L2: FSDP unshard (allgather, rank 1, MB 0, forward)
+   └─ dst_entry_op → L1 forward StepGraph (rank 1, MB 0) 的入口算子
+
+2. L1: forward StepGraph 内部回放
+   └─ exit_nodes → 出口算子
+
+3. L2: FSDP reshard (reduce_scatter, rank 1, MB 0, backward)
+   └─ src_exit_op → L1 backward StepGraph (rank 1, MB 0) 的出口算子
+```
+
+### 6.6 实施补充
+
+在原实施计划基础上增加：
+
+| 步骤 | 文件 | 改动 |
+|------|------|------|
+| 7 | `dispatch_capture.py` | 增加 `_pending_comm_links` 字典；`_record_event` 中检查输入张量是否有 pending comm link，设置 `dst_entry_op` |
+| 8 | `comm_events.py` | `_record_comm` 中通过 `_producer` 查找 `src_exit_op`；注册 pending link for `dst_entry_op` |
+| 9 | `schedule_builder.py` | DataPass 的 `src_instance`/`dst_instance` 改为 `rank_mb_phase` 格式 |
+| 10 | 测试 | 验证 DataPass 的 `src_exit_op`/`dst_entry_op` 指向 L1 计算算子（非通信算子自身） |
