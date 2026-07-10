@@ -12,8 +12,8 @@
 
 NGPU=${NGPU:-"16"}
 export LOG_RANK=${LOG_RANK:-0}
-MODULE=${MODULE:-"torchtitan_npu.models.deepseek_v32"}
-CONFIG=${CONFIG:-"deepseek_v32_671b_4layers_debug"}
+MODULE=${MODULE:-"torchtitan_npu.models.qwen3"}
+CONFIG=${CONFIG:-"debug_qwen3_06b_single_node"}
 TRAIN_FILE=${TRAIN_FILE:-"torchtitan_npu.entry"}
 COMM_MODE=${COMM_MODE:-""}
 

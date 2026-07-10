@@ -15,7 +15,7 @@ def test_qwen3_save_load(tmp_path):
     run_save_load_test(
         tmp_path,
         module="torchtitan_npu.models.qwen3",
-        config="qwen3_06b_test",
+        config="debug_qwen3_06b_single_node",
         tokenizer_path="./tests/assets/tokenizer/qwen3-tokenizer",
         steps=1,
         seq_len=128,
