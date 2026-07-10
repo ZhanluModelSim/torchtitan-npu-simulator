@@ -57,6 +57,20 @@ def _make_v4_pro_61_layers_moe_args() -> MoEArgs:
     )
 
 
+def _make_v4_pro_20t_baseline_moe_args() -> MoEArgs:
+    return MoEArgs(
+        num_experts=2048,
+        num_shared_experts=1,
+        top_k=23,
+        score_func="sqrtsoftplus",
+        route_norm=True,
+        score_before_experts=False,
+        use_grouped_mm=True,
+        n_hash_layers=3,
+        swiglu_limit=10,
+    )
+
+
 def _make_smoke_moe_args() -> MoEArgs:
     return MoEArgs(
         num_experts=8,
@@ -246,12 +260,45 @@ def _v4_pro_debug_61_layers() -> DeepSeekV4Model.Config:
     )
 
 
+def _v4_pro_20t_baseline() -> DeepSeekV4Model.Config:
+    return DeepSeekV4Model.Config(
+        vocab_size=129280,
+        n_layers=96,
+        n_heads=192,
+        max_batch_size=4,
+        max_seq_len=4096,
+        dim=12288,
+        moe_inter_dim=2752,
+        head_dim=512,
+        rope_head_dim=64,
+        q_lora_rank=2304,
+        o_lora_rank=1536,
+        o_groups=16,
+        window_size=128,
+        compress_ratios=tuple([128, 4] * 47 + [128, 0]),
+        moe_args=_make_v4_pro_20t_baseline_moe_args(),
+        hc_sinkhorn_iters=24,
+        hc_mult=4,
+        hc_eps=1e-6,
+        compress_rope_theta=160000,
+        original_seq_len=65536,
+        rope_theta=10000,
+        rope_factor=16,
+        beta_fast=32,
+        beta_slow=1,
+        enable_indexer_loss=True,
+        index_n_heads=64,
+        index_head_dim=128,
+        index_topk=1024,
+    )
+
 deepseekv4_configs = {
     "smoketest": _smoketest_model,
     "v4_flash_debug_16_experts_43_layers": _v4_flash_debug_16_experts_43_layers,
     "v4_flash_debug_256_experts_43_layers": _v4_flash_debug_256_experts_43_layers,
     "v4_pro_debug_16_layers": _v4_pro_debug_16_layers,
     "v4_pro_debug_61_layers": _v4_pro_debug_61_layers,
+    "v4_pro_20t_baseline": _v4_pro_20t_baseline,
 }
 
 

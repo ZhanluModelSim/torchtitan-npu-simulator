@@ -44,6 +44,7 @@ class SimulationConfig:
     target_npu_device_type: str = "non_a5"
     csv_max_ranks: int | None = None
     simulated_parallel_degrees: dict[str, int] = field(default_factory=dict)
+    skip_export: bool = False
 
 
 @dataclass(kw_only=True, slots=True)
@@ -347,7 +348,9 @@ class SimulationTrainer(Trainer):
         t2 = time.perf_counter()
 
         # Each rank exports independently to rank_N/ directory (no merge)
-        if is_multi_proc and dist.is_initialized():
+        if self.simulation_config.skip_export:
+            print("Skipping export of simulation results (skip_export=True)")
+        elif is_multi_proc and dist.is_initialized():
             self._export(rank=rank)
             dist.barrier()
         else:

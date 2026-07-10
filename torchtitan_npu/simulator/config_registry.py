@@ -19,6 +19,7 @@ import dataclasses
 from torchtitan_npu.models.deepseek_v4.config_registry import (
     deepseek_v4_pro_debug_16_layers,
     deepseek_v4_pro_debug_61_layers_4k_384die,
+    deepseek_v4_pro_20t_baseline_fp8,
 )
 from torchtitan_npu.simulator.trainer import SimulationConfig, SimulationTrainerConfig
 
@@ -37,6 +38,16 @@ def deepseek_v4_pro_simulate_61_layers() -> SimulationTrainerConfig:
     docs/superpowers/specs/2026-07-01-npu-simulator-design.md."""
     base_config = deepseek_v4_pro_debug_61_layers_4k_384die()
     return _to_simulation_config(base_config, output_dir="./simulator_output/deepseek_v4_pro_61_layers")
+
+
+def deepseek_v4_pro_simulate_20t_baseline_fp8() -> SimulationTrainerConfig:
+    """20T baseline config with FP8 quantization enabled."""
+    base_config = deepseek_v4_pro_20t_baseline_fp8()
+    base_config = dataclasses.replace(
+        base_config,
+        hf_assets_path="./tests/assets/tokenizer/deepseekv3_tokenizer",
+    )
+    return _to_simulation_config(base_config, output_dir="./simulator_output/deepseek_v4_pro_20t_baseline_fp8")
 
 
 def deepseek_v4_pro_simulate_16_layers() -> SimulationTrainerConfig:
