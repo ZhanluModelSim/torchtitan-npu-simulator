@@ -109,7 +109,6 @@ def deepseek_v4_pro_simulate_61_layers_pp16_tp8_cp4_ep128() -> SimulationTrainer
         training=dataclasses.replace(
             base_config.training,
             num_mtp_modules=0,
-            local_batch_size=512,
             local_batch_size=16,
         ),
         parallelism=dataclasses.replace(
@@ -185,6 +184,7 @@ def deepseek_v4_pro_simulate_16_layers_pp4_cp4() -> SimulationTrainerConfig:
     sim_config = _to_simulation_config(
         base_config,
         output_dir="./simulator_output/deepseek_v4_pro_16_layers_pp4_cp4",
+        comm_mode="multi_proc_meta",
     )
     sim_config.simulation.simulated_parallel_degrees = {
         "pp": 4, "tp": 1, "cp": 4, "ep": 1,
