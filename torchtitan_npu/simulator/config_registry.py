@@ -46,6 +46,52 @@ def deepseek_v4_pro_simulate_16_layers() -> SimulationTrainerConfig:
     return _to_simulation_config(base_config, output_dir="./simulator_output/deepseek_v4_pro_16_layers")
 
 
+def deepseek_v4_pro_simulate_16_layers_mxfp8() -> SimulationTrainerConfig:
+    """16-layer with MXFP8 low-precision training enabled.
+
+    Adds MXFP8Converter to the model converters, enabling FP8 quantization
+    (npu_dynamic_mx_quant + npu_quant_matmul) for attention linear layers
+    and MoE expert layers. The simulator captures these as real NPU op
+    names in the L0 graph via SimMXFP8MM/SimMXFP8GroupedMM shims.
+
+    Run with: ``NGPU=16 LOCAL_RANK=0 python3 -m torchtitan_npu.entry
+    --module torchtitan_npu.simulator
+    --config deepseek_v4_pro_simulate_16_layers_mxfp8
+    --training.steps=1 --hf_assets_path ./tests/assets/tokenizer/deepseekv3_tokenizer``
+    """
+    import dataclasses
+    from torchtitan.components.quantization.mx import MXFP8Converter
+    from torchtitan_npu.converters import get_model_converter_config
+
+    base_config = deepseek_v4_pro_debug_16_layers()
+    # Add MXFP8 converter after existing NPU converters
+    converters = list(base_config.model_converters.converters)
+    converters.append(MXFP8Converter.Config(
+        recipe_name="mxfp8_rceil",
+        fqns=[
+            "pre_attention.wq_a",
+            "pre_attention.wq_b",
+            "pre_attention.wkv",
+            "pre_attention.indexer.wq_b",
+            "pre_attention.indexer.weights_proj",
+            "post_attention.wo_a",
+            "post_attention.wo_b",
+            "moe.experts",
+            "moe.shared_experts",
+        ],
+    ))
+    base_config = dataclasses.replace(
+        base_config,
+        model_converters=dataclasses.replace(
+            base_config.model_converters,
+            converters=converters,
+        ),
+    )
+    return _to_simulation_config(
+        base_config, output_dir="./simulator_output/deepseek_v4_pro_16_layers_mxfp8"
+    )
+
+
 def deepseek_v4_pro_simulate_61_layers_pp16_tp8_cp4_ep128() -> SimulationTrainerConfig:
     """Large-scale strategy: PP=16, TP=8, CP=4, EP=128, FSDP auto-shard.
 
