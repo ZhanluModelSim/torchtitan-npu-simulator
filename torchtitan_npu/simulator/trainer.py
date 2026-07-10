@@ -40,7 +40,7 @@ from torchtitan_npu.simulator.viz.text_summary import write_text_summary
 @dataclass(kw_only=True, slots=True)
 class SimulationConfig:
     output_dir: str = "./simulator_output"
-    output_formats: list[str] = field(default_factory=lambda: ["json", "dot", "text", "html", "csv"])
+    output_formats: list[str] = field(default_factory=lambda: [])
     target_npu_device_type: str = "non_a5"
     csv_max_ranks: int | None = None
     simulated_parallel_degrees: dict[str, int] = field(default_factory=dict)

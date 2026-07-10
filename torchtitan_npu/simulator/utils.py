@@ -27,21 +27,6 @@ def get_nproc_per_node(config: Any) -> int:
     2. config.parallelism.pipeline_parallel_degree           (config field)
     3. 1 (fallback for fake_backend / PP=1)
     """
-    # Check comm mode
-    comm_config = getattr(config, "comm", None)
-    comm_mode = getattr(comm_config, "mode", "fake_backend") if comm_config else "fake_backend"
-
-    if comm_mode != "multi_proc_meta":
-        return 1
-
-    # Try simulated_parallel_degrees first (most explicit)
-    sim_config = getattr(config, "simulation", None)
-    if sim_config is not None:
-        sim_degrees = getattr(sim_config, "simulated_parallel_degrees", {})
-        if sim_degrees and "pp" in sim_degrees:
-            return int(sim_degrees["pp"])
-
-    # Fall back to parallelism config
     parallelism = getattr(config, "parallelism", None)
     if parallelism is not None:
         pp = getattr(parallelism, "pipeline_parallel_degree", 1)
