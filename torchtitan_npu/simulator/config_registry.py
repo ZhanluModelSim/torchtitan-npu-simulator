@@ -193,7 +193,6 @@ def deepseek_v4_pro_simulate_16_layers_pp4_cp4() -> SimulationTrainerConfig:
     }
     return sim_config
 
-
 def deepseek_v4_pro_simulate_16_layers_pp4_cp4_ep4() -> SimulationTrainerConfig:
     """PP=4 + CP=4 + EP=4 variant for multi-process all_to_all capture.
 
@@ -236,52 +235,5 @@ def deepseek_v4_pro_simulate_16_layers_pp4_cp4_ep4() -> SimulationTrainerConfig:
         "pp": 4, "tp": 1, "cp": 4, "ep": 4,
         "dp_replicate": 1, "dp_shard": 2,
         "etp": 1, "world_size": 128,
-    }
-    return sim_config
-    """Multi-process version: uses gloo PG with 16 processes (one per PP stage).
-
-    Each process runs one PP stage with real 1F1B scheduling. All
-    communication is intercepted as no-op (meta device, no real data).
-    Each process captures its own L0-L3 IR; rank 0 merges them.
-
-    The mesh has 16 ranks (PP degree only). TP/CP/EP/DP are simulated
-    by the comm_events interceptors. The config's parallel degrees are
-    set to the full values (TP=8, CP=4, EP=128) for RankTable, but
-    ParallelDims uses pp=16, others=1 for mesh creation.
-
-    Run with: ``NGPU=2048 torchrun --nproc_per_node=16 -m torchtitan_npu.entry
-    --module torchtitan_npu.simulator
-    --config deepseek_v4_pro_simulate_61_layers_pp16_tp8_cp4_ep128_multiproc
-    --training.steps=1``
-    """
-    base_config = deepseek_v4_pro_debug_61_layers_4k_384die()
-    base_config = dataclasses.replace(
-        base_config,
-        training=dataclasses.replace(
-            base_config.training,
-            num_mtp_modules=0,
-            local_batch_size=16,
-        ),
-        parallelism=dataclasses.replace(
-            base_config.parallelism,
-            pipeline_parallel_degree=16,
-            # For mesh creation: only PP is real (16 procs).
-            # Other degrees are simulated by comm_events interceptors.
-            tensor_parallel_degree=1,
-            context_parallel_degree=1,
-            expert_parallel_degree=1,
-            data_parallel_shard_degree=1,
-        ),
-    )
-    sim_config = _to_simulation_config(
-        base_config,
-        output_dir="./simulator_output/deepseek_v4_pro_61_layers_pp16_tp8_cp4_ep128_multiproc",
-        comm_mode="multi_proc_meta",
-    )
-    # Store the "real" parallel degrees for RankTable computation
-    sim_config.simulation.simulated_parallel_degrees = {
-        "pp": 16, "tp": 8, "cp": 4, "ep": 128,
-        "dp_replicate": 1, "dp_shard": 4,
-        "etp": 1, "world_size": 2048,
     }
     return sim_config
