@@ -1708,6 +1708,82 @@ def _patch_comm_layer_context() -> None:
         pass
 
 
+def _patch_mxfp8_for_meta() -> None:
+    """Patch MXFP8 (torchao) for meta-device simulation.
+
+    Three problems are addressed:
+    1. ``has_mx_capability`` checks NPU hardware → return True in meta mode
+    2. ``NpuMXFP8MM`` calls ``npu_dynamic_mx_quant``/``npu_quant_matmul``
+       which need real data → replace with ``SimMXFP8MM`` shim
+    3. ``NpuMXFP8GroupedMM`` same → replace with ``SimMXFP8GroupedMM`` shim
+
+    The shims record the real NPU op names via ``record_synthetic_op``
+    while using standard ``torch.matmul`` for shape inference on meta
+    tensors."""
+    # 1. Bypass hardware capability check
+    try:
+        from torchtitan_npu.patches.torchao_npu import mx_capability_check
+        if not hasattr(mx_capability_check, "_sim_orig_has_mx_capability"):
+            mx_capability_check._sim_orig_has_mx_capability = mx_capability_check.has_mx_capability
+
+            def _meta_safe_has_mx_capability(major, minor):  # noqa: ANN001
+                if _is_meta_simulation:
+                    return True
+                return mx_capability_check._sim_orig_has_mx_capability(major, minor)
+
+            mx_capability_check.has_mx_capability = _meta_safe_has_mx_capability
+            # Patch the by-value import in torchtitan.tools.utils
+            try:
+                from torchtitan.tools import utils as tt_utils
+                tt_utils.has_cuda_capability = _meta_safe_has_mx_capability
+            except Exception:
+                pass
+            # Also patch the by-value import in MXFP8Converter's module
+            try:
+                import torchtitan.components.quantization.mx as mx_mod
+                mx_mod.has_cuda_capability = _meta_safe_has_mx_capability
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # 2. Replace MXFP8 linear matmul with meta-safe shim
+    try:
+        import torchao.prototype.mx_formats.mx_linear as mx_linear_mod
+        from torchtitan_npu.simulator.hardware_shims.mxfp8_shim import SimMXFP8MM
+
+        if not hasattr(mx_linear_mod, "_sim_orig_to_mxfp8_then_scaled_mm"):
+            mx_linear_mod._sim_orig_to_mxfp8_then_scaled_mm = mx_linear_mod._to_mxfp8_then_scaled_mm
+
+            def _meta_safe_to_mxfp8_then_scaled_mm(input_hp, weight_hp, **kwargs):  # noqa: ANN001
+                if not _is_meta_simulation:
+                    return mx_linear_mod._sim_orig_to_mxfp8_then_scaled_mm(input_hp, weight_hp, **kwargs)
+                return SimMXFP8MM.apply(input_hp, weight_hp)
+
+            mx_linear_mod._to_mxfp8_then_scaled_mm = _meta_safe_to_mxfp8_then_scaled_mm
+    except Exception:
+        pass
+
+    # 3. Replace MXFP8 grouped matmul with meta-safe shim
+    try:
+        import torchao.prototype.moe_training.mxfp8_grouped_mm as grouped_mm_mod
+        from torchtitan_npu.simulator.hardware_shims.mxfp8_shim import SimMXFP8GroupedMM
+
+        if not hasattr(grouped_mm_mod, "_sim_orig_to_mxfp8_then_scaled_grouped_mm"):
+            grouped_mm_mod._sim_orig_to_mxfp8_then_scaled_grouped_mm = (
+                grouped_mm_mod._to_mxfp8_then_scaled_grouped_mm
+            )
+
+            def _meta_safe_to_mxfp8_then_scaled_grouped_mm(A, B_t, offs, **kwargs):  # noqa: ANN001
+                if not _is_meta_simulation:
+                    return grouped_mm_mod._sim_orig_to_mxfp8_then_scaled_grouped_mm(A, B_t, offs, **kwargs)
+                return SimMXFP8GroupedMM.apply(A, B_t, offs)
+
+            grouped_mm_mod._to_mxfp8_then_scaled_grouped_mm = _meta_safe_to_mxfp8_then_scaled_grouped_mm
+    except Exception:
+        pass
+
+
 def _patch_init_distributed_for_multi_proc_meta() -> None:
     """Patch ``init_distributed`` to handle ``comm.mode=multi_proc_meta``.
 
@@ -1842,6 +1918,7 @@ def patch_device_type_to_meta() -> None:
     _patch_fsdp_get_device_from_mesh()
     _patch_dtensor_random_for_fake_mesh()
     _patch_comm_layer_context()
+    _patch_mxfp8_for_meta()
     global _is_meta_simulation
     _is_meta_simulation = True
     _patched = True
