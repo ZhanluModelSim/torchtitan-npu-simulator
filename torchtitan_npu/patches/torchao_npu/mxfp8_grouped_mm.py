@@ -44,7 +44,7 @@ class NpuMXFP8GroupedMM(torch.autograd.Function):
             bias=None,
             scale=[weight_scale],
             per_token_scale=[x_scale],
-            group_list=group_list,
+            group_list=group_list.to(torch.int64),  # npu_grouped_matmul requires group_list to have dtype int64
             group_type=0,
             output_dtype=x.dtype,
             group_list_type=0,
@@ -70,7 +70,7 @@ class NpuMXFP8GroupedMM(torch.autograd.Function):
             bias=None,
             scale=[rearrange(weight_scale, "n h f g -> n f h g")],
             per_token_scale=[grad_scale],
-            group_list=group_list,
+            group_list=group_list.to(torch.int64),  # npu_grouped_matmul requires group_list to have dtype int64
             group_type=0,
             output_dtype=grad.dtype,
             group_list_type=0,
@@ -80,14 +80,14 @@ class NpuMXFP8GroupedMM(torch.autograd.Function):
         )[0]
         x_mxfp8, x_scale = torch_npu.npu_grouped_dynamic_mx_quant(
             x,
-            group_list.to(torch.int32),
+            group_list.to(torch.int32),  # npu_grouped_dynamic_mx_quant requires group_list to have dtype int32
             round_mode="rint",
             dst_type=torch.float8_e4m3fn,
             blocksize=32,
         )
         grad_mxfp8, grad_scale = torch_npu.npu_grouped_dynamic_mx_quant(
             grad,
-            group_list.to(torch.int32),
+            group_list.to(torch.int32),  # npu_grouped_dynamic_mx_quant requires group_list to have dtype int32
             round_mode="rint",
             dst_type=torch.float8_e4m3fn,
             blocksize=32,
@@ -98,7 +98,7 @@ class NpuMXFP8GroupedMM(torch.autograd.Function):
             bias=None,
             scale=[grad_scale],
             per_token_scale=[rearrange(x_scale, "n h f -> h n f")],
-            group_list=group_list,
+            group_list=group_list.to(torch.int64),  # npu_grouped_matmul requires group_list to have dtype int64
             group_type=2,
             output_dtype=x.dtype,
             group_list_type=0,
