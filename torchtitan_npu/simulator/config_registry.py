@@ -146,6 +146,52 @@ def deepseek_v4_pro_simulate_16_layers_pp4_cp4() -> SimulationTrainerConfig:
         "etp": 1, "world_size": 64,
     }
     return sim_config
+
+
+def deepseek_v4_pro_simulate_16_layers_pp4_cp4_ep4() -> SimulationTrainerConfig:
+    """PP=4 + CP=4 + EP=4 variant for multi-process all_to_all capture.
+
+    Run with: ``NGPU=128 torchrun --nproc_per_node=4 -m torchtitan_npu.entry
+    --module torchtitan_npu.simulator
+    --config deepseek_v4_pro_simulate_16_layers_pp4_cp4_ep4
+    --training.steps=1``
+
+    Uses real parallel degrees (PP=4, CP=4, EP=4, DP=2 → world_size=128).
+    EP > 1 triggers ExpertParallel → NpuExpertParallel → all_to_all.
+    """
+    base_config = deepseek_v4_pro_debug_16_layers()
+    base_config = dataclasses.replace(
+        base_config,
+        training=dataclasses.replace(
+            base_config.training,
+            num_mtp_modules=0,
+            local_batch_size=4,
+        ),
+        parallelism=dataclasses.replace(
+            base_config.parallelism,
+            pipeline_parallel_degree=4,
+            # 1 * 2 * 4 * 1 * 4 = 128 == TORCHTITAN_SIM_WORLD_SIZE
+            tensor_parallel_degree=1,
+            context_parallel_degree=4,
+            expert_parallel_degree=4,
+            data_parallel_shard_degree=-1,  # auto: 128 / (1*4*1*4) = 8... wait
+        ),
+    )
+    # Fix: dp_shard = world_size / (dp_replicate * cp * tp * pp * ep * etp)
+    # = 128 / (1 * 4 * 1 * 4 * 4 * 1) = 2
+    # But ParallelDims computes: dp_shard = world_size / (cp * tp * pp * ep * etp)
+    # = 128 / (4 * 1 * 4 * 4 * 1) = 2
+    sim_config = _to_simulation_config(
+        base_config,
+        output_dir="./simulator_output/deepseek_v4_pro_16_layers_pp4_cp4_ep4",
+        comm_mode="multi_proc_meta",
+    )
+    sim_config.simulation.simulated_parallel_degrees = {
+        "pp": 4, "tp": 1, "cp": 4, "ep": 4,
+        "dp_replicate": 1, "dp_shard": 2,
+        "etp": 1, "world_size": 128,
+    }
+    return sim_config
     """Multi-process version: uses gloo PG with 16 processes (one per PP stage).
 
     Each process runs one PP stage with real 1F1B scheduling. All
