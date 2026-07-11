@@ -27,7 +27,7 @@ from .registry import (
 )
 
 
-def _auto_search_conveter():
+def _auto_search_converter():
     package_dir = Path(__file__).parent
 
     for subdir in ["kernels", "features"]:
@@ -45,4 +45,4 @@ def _auto_search_conveter():
                 importlib.import_module(f".{subdir}.{name}", package=__package__)
 
 
-_auto_search_conveter()
+_auto_search_converter()
