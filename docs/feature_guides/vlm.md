@@ -14,15 +14,10 @@ VLM NPU 目前仅支持 FSDP/HSDP 数据并行。
 
 ```bash
 PYTHONPATH=/path/to/torchtitan:$PWD:${PYTHONPATH:-} \
-NGPU=1 \
+NGPU=8 \
 MODULE=torchtitan_npu.models.vlm \
 CONFIG=vlm_debugmodel_npu \
-COMM_MODE=fake_backend \
-bash scripts/run_train.sh \
-  --training.local_batch_size 1 \
-  --training.seq_len 256 \
-  --dataloader.max_patches_per_image 64 \
-  --dataloader.max_images_per_batch 4
+bash scripts/run_train.sh
 ```
 
 ## 复用建议

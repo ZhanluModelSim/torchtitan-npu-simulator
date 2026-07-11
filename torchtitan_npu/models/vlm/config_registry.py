@@ -35,7 +35,11 @@ def vlm_debugmodel_npu() -> MultiModalTrainerConfig:
         model_spec=model_registry("debugmodel"),
         model_converters=ModelConvertersContainer.Config(converters=[get_model_converter_config("npu_vlm")]),
         metrics=MetricsProcessor.Config(log_freq=1),
-        dataloader=HuggingFaceMultiModalDataLoader.Config(dataset="cc12m-test"),
+        dataloader=HuggingFaceMultiModalDataLoader.Config(
+            dataset="cc12m-test",
+            max_patches_per_image=1024,
+            max_images_per_batch=64,
+        ),
         optimizer=OptimizersContainer.Config(
             name="AdamW",
             lr=8e-4,
@@ -48,9 +52,9 @@ def vlm_debugmodel_npu() -> MultiModalTrainerConfig:
             min_lr_factor=0.0,
         ),
         training=TrainingConfig(
-            local_batch_size=1,
-            seq_len=256,
-            steps=2,
+            local_batch_size=8,
+            seq_len=2048,
+            steps=10,
         ),
         parallelism=ParallelismConfig(
             data_parallel_replicate_degree=1,
