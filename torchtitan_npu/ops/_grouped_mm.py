@@ -37,6 +37,6 @@ def _(
         group_list_type=0,
         split_item=2,
         group_type=(2 if split_along_k else 0),
-        bias=bias,
+        bias=[bias] if bias is not None else None,
         output_dtype=out_dtype,
     )[0]
