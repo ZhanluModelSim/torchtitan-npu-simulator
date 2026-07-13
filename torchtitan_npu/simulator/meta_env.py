@@ -1837,6 +1837,44 @@ def _patch_init_distributed_for_multi_proc_meta() -> None:
     dist_utils.init_distributed = _patched_init_distributed
 
 
+def _patch_fused_adamw_for_meta() -> None:
+    """Patch ``torch._fused_adamw_`` for meta-device simulation.
+
+    In real NPU training, ``torch._fused_adamw_`` dispatches to
+    ``npu.npu_apply_adam_w`` (a fused NPU kernel). Under meta simulation,
+    ``fused=True`` raises RuntimeError (meta device not in supported list).
+
+    This patch replaces ``torch._fused_adamw_`` with a meta-safe shim that:
+    1. Records ``npu.npu_apply_adam_w.default`` via ``record_synthetic_op``
+    2. Executes standard foreach AdamW math for shape inference
+    3. Suppresses individual ``_foreach_*`` sub-op capture
+    """
+    if not _is_meta_simulation:
+        return
+    try:
+        from torchtitan_npu.simulator.hardware_shims.optimizer_shim import _meta_safe_fused_adamw
+        import torch
+
+        if not hasattr(torch, "_sim_orig_fused_adamw"):
+            torch._sim_orig_fused_adamw = torch._fused_adamw_
+
+            def _patched_fused_adamw(params, grads, exp_avgs, exp_avg_sqs,
+                                     max_exp_avg_sqs, state_steps, **kwargs):
+                if not _is_meta_simulation:
+                    return torch._sim_orig_fused_adamw(
+                        params, grads, exp_avgs, exp_avg_sqs,
+                        max_exp_avg_sqs, state_steps, **kwargs
+                    )
+                return _meta_safe_fused_adamw(
+                    params, grads, exp_avgs, exp_avg_sqs,
+                    max_exp_avg_sqs, state_steps, **kwargs
+                )
+
+            torch._fused_adamw_ = _patched_fused_adamw
+    except Exception:
+        pass
+
+
 def patch_device_type_to_meta() -> None:
     """Idempotently rebind `device_type="meta"` / `device_module=<stub>`
     across every module that imported them by value at load time, register
@@ -1919,6 +1957,7 @@ def patch_device_type_to_meta() -> None:
     _patch_dtensor_random_for_fake_mesh()
     _patch_comm_layer_context()
     _patch_mxfp8_for_meta()
+    _patch_fused_adamw_for_meta()
     global _is_meta_simulation
     _is_meta_simulation = True
     _patched = True
