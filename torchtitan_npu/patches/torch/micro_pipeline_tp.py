@@ -95,7 +95,7 @@ def _npu_kernel_fused_matmul_reduce_scatter(
     A_flat = A_moved.flatten(0, -2)
 
     hcom = _get_hccl_comm_name(group_name)
-    result = torch_npu.npu_mm_reduce_scatter_base(A_flat, B, hcom, world_size, reduce_op="sum")
+    result = torch_npu.npu_mm_reduce_scatter_base(A_flat, B, hcom, world_size, reduce_op=reduce_op)
 
     out_M = leading_dims_before_flat[0] // world_size
     if A.dim() > 2:
