@@ -308,11 +308,35 @@ def _neutralize_torch_npu_optimizer_device_probe() -> None:
     try:
         import torch_npu.utils._optim as npu_optim
     except Exception:  # best-effort guard: any failure here means "not available in this environment"
-        return
+        pass
+    else:
+        if npu_optim._device_name is None:
+            _original_values[("torch_npu.utils._optim", "_device_name")] = None
+            npu_optim._device_name = _DUMMY_NPU_DEVICE_NAME
 
-    if npu_optim._device_name is None:
-        _original_values[("torch_npu.utils._optim", "_device_name")] = None
-        npu_optim._device_name = _DUMMY_NPU_DEVICE_NAME
+    # Also patch _get_fused_kernels_supported_devices to include "meta"
+    # so that fused=True validation passes for meta tensors. Without this,
+    # torch.optim.AdamW.__init__ raises:
+    #   RuntimeError: `fused=True` requires all the params to be floating
+    #   point Tensors of supported devices: [...] but torch.float32 and meta
+    try:
+        import torch.optim.optimizer as opt_mod
+        if not hasattr(opt_mod, "_sim_orig_get_fused_kernels_supported_devices"):
+            opt_mod._sim_orig_get_fused_kernels_supported_devices = (
+                opt_mod._get_fused_kernels_supported_devices
+            )
+
+            def _meta_safe_get_fused_kernels_supported_devices():
+                devices = opt_mod._sim_orig_get_fused_kernels_supported_devices()
+                if _is_meta_simulation:
+                    devices = list(devices) + ["meta"]
+                return devices
+
+            opt_mod._get_fused_kernels_supported_devices = (
+                _meta_safe_get_fused_kernels_supported_devices
+            )
+    except Exception:
+        pass
 
 
 def _patch_swap_optimizer_get_device_info(stub: _MetaDeviceModule) -> None:
