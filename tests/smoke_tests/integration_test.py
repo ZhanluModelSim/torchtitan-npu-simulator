@@ -18,6 +18,7 @@ Usage:
     python tests/smoke_tests/integration_test.py ./outputs --test_name deepseek_v32_base
     python tests/smoke_tests/integration_test.py ./outputs --test_name deepseek_v3_tp
     python tests/smoke_tests/integration_test.py ./outputs --test_name deepseek_v4_tp
+    python tests/smoke_tests/integration_test.py ./outputs --test_name deepseek_v4_tp_compile_bypass
     python tests/smoke_tests/integration_test.py ./outputs --test_name deepseek_v32_tp
     python tests/smoke_tests/integration_test.py ./outputs --test_name deepseek_v4_fsdp_ep
     python tests/smoke_tests/integration_test.py ./outputs --test_name deepseek_v32_fsdp_ep
@@ -269,6 +270,25 @@ def _tp_tests() -> list[OverrideDefinitions]:
     ]
 
 
+def _tp_compile_tests() -> list[OverrideDefinitions]:
+    """Tensor Parallel + torch.compile smoke test without Inductor/NPU codegen."""
+    return [
+        OverrideDefinitions(
+            [
+                [
+                    f"--module {_DEEPSEEK_V4_MODULE}",
+                    f"--config {_DEEPSEEK_V4_CONFIG}",
+                    "--parallelism.tensor_parallel_degree 2",
+                    "--compile.enable",
+                ]
+            ],
+            "DeepSeek V4 TP + compile bypass codegen",
+            "deepseek_v4_tp_compile_bypass",
+            ngpu=2,
+        ),
+    ]
+
+
 def _ep_tests() -> list[OverrideDefinitions]:
     """Expert Parallel test."""
     return [
@@ -383,7 +403,7 @@ def _checkpoint_tests() -> list[OverrideDefinitions]:
 
 
 def generate_smoke_tests() -> list[OverrideDefinitions]:
-    return _fake_backend_tests() + _base_tests() + _tp_tests() + _ep_tests() + _checkpoint_tests()
+    return _tp_compile_tests() + _fake_backend_tests() + _base_tests() + _tp_tests() + _ep_tests() + _checkpoint_tests()
 
 
 # ============================================================================
@@ -399,7 +419,7 @@ def main():
     parser.add_argument(
         "--test_name",
         default="all",
-        help="Test name to run (for example, 'deepseek_v4_tp'). Use 'all' to run every test.",
+        help="Test name to run (for example, 'deepseek_v4_tp_compile_bypass'). Use 'all' to run every test.",
     )
     parser.add_argument("--ngpu", default=2, type=int, help="Maximum available GPU count")
     args = parser.parse_args()
