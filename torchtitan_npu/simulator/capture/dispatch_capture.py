@@ -41,7 +41,11 @@ def _flatten_tensors(value: Any) -> list[torch.Tensor]:
     too -- otherwise those tensors are missed, breaking producer/consumer
     edge construction and producing incomplete IR dependencies."""
     tensors: list[torch.Tensor] = []
-    if isinstance(value, torch.Tensor):
+
+    from torch.distributed.tensor import DTensor
+    if isinstance(value, DTensor):
+        tensors.append(value.to_local())
+    elif isinstance(value, torch.Tensor):
         tensors.append(value)
     elif isinstance(value, dict):
         for item in value.values():
