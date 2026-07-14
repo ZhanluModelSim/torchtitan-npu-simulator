@@ -245,9 +245,11 @@ def test_memory_plan_exports_compact_chrome_trace(tmp_path):
     assert any(item["ph"] == "i" and item["name"] == "peak active bytes" for item in events)
 
     export_memory_plan(plan, str(tmp_path))
-    assert (tmp_path / "memory_trace.json").is_file()
-    memory_events_header = (tmp_path / "memory_events.csv").read_text().splitlines()[0]
-    memory_timeline_header = (tmp_path / "memory_timeline.csv").read_text().splitlines()[0]
+    memory_dir = tmp_path / "memory"
+    assert (memory_dir / "memory_trace.json").is_file()
+    assert not (tmp_path / "memory_trace.json").exists()
+    memory_events_header = (memory_dir / "memory_events.csv").read_text().splitlines()[0]
+    memory_timeline_header = (memory_dir / "memory_timeline.csv").read_text().splitlines()[0]
     assert memory_events_header.startswith("event_id,seq_idx,phase,op_id")
     assert memory_timeline_header.startswith("seq_idx,phase,op_id,action")
 

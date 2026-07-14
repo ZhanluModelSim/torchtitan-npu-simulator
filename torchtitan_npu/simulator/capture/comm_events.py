@@ -79,7 +79,8 @@ class _NoOpWork:
 
 
 class CommEventRecorder:
-    def __init__(self) -> None:
+    def __init__(self, *, memory_tracking_enabled: bool = True) -> None:
+        self.memory_tracking_enabled = memory_tracking_enabled
         self.events: list[CommEvent] = []
         self.timeline_events: list[dict] = []  # L2 scheduling events (MB 1+ pass-through)
         self.fsdp_residency_events: list[FSDPResidencyEvent] = []
@@ -139,6 +140,9 @@ class CommEventRecorder:
         num_bytes: int,
         tensor_ids: tuple[int, ...],
     ) -> None:
+        if not self.memory_tracking_enabled:
+            return
+
         from torchtitan_npu.simulator.capture.dispatch_capture import _seq_counter
 
         self.fsdp_residency_events.append(
@@ -308,7 +312,7 @@ def get_active_recorder() -> CommEventRecorder | None:
 
 
 @contextmanager
-def capture_fake_collectives() -> Iterator[CommEventRecorder]:
+def capture_fake_collectives(*, memory_tracking_enabled: bool = True) -> Iterator[CommEventRecorder]:
     """Monkeypatch the legacy (`torch.distributed.*`) and functional
     (`torch.distributed._functional_collectives.*`) collective APIs for the
     duration of the context.
@@ -328,7 +332,7 @@ def capture_fake_collectives() -> Iterator[CommEventRecorder]:
     calls made while the context is active as fake, unconditionally.
     """
     global _active_recorder
-    recorder = CommEventRecorder()
+    recorder = CommEventRecorder(memory_tracking_enabled=memory_tracking_enabled)
     _active_recorder = recorder
 
     orig_all_reduce = dist.all_reduce

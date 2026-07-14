@@ -12,6 +12,13 @@ from typing import Any
 import torch
 
 
+def _memory_tracking_enabled() -> bool:
+    from torchtitan_npu.simulator.capture.comm_events import get_active_recorder
+
+    recorder = get_active_recorder()
+    return recorder is not None and recorder.memory_tracking_enabled
+
+
 def _to_local_tensor(value: object) -> torch.Tensor | None:
     try:
         from torch.distributed.tensor import DTensor
@@ -95,9 +102,10 @@ def install_fsdp_residency_hooks() -> None:
 
     def patched_wait_for_unshard(self):  # noqa: ANN001, ANN202
         was_unsharded = self.is_unsharded
-        _, sharded_tensors = _residency_metadata(self)
+        track_memory = _memory_tracking_enabled()
+        _, sharded_tensors = _residency_metadata(self) if track_memory else (0, ())
         result = FSDPParamGroup._sim_orig_wait_for_unshard(self)
-        if not was_unsharded and self.is_unsharded:
+        if track_memory and not was_unsharded and self.is_unsharded:
             num_bytes, full_tensors = _residency_metadata(self)
             tensors = tuple({id(tensor): tensor for tensor in (*sharded_tensors, *full_tensors)}.values())
             _record_residency(self, "alloc", (num_bytes, tensors))
@@ -107,7 +115,9 @@ def install_fsdp_residency_hooks() -> None:
         previous_comm_layer = meta_env._comm_layer
         meta_env._comm_layer = "L2"
         was_unsharded = self.is_unsharded
-        metadata: tuple[int, tuple[torch.Tensor, ...]] = _residency_metadata(self) if was_unsharded else (0, ())
+        metadata: tuple[int, tuple[torch.Tensor, ...]] = (
+            _residency_metadata(self) if was_unsharded and _memory_tracking_enabled() else (0, ())
+        )
         try:
             result = FSDPParamGroup._sim_orig_reshard(self)
         finally:

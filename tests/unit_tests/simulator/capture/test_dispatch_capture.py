@@ -117,6 +117,16 @@ def test_capture_keeps_uncollapsed_memory_events_for_liveness():
     assert len({e.seq_idx for e in relu_memory_events}) == 3
 
 
+def test_capture_can_disable_memory_event_recording_without_disabling_l0_capture():
+    capture = OpDispatchCapture(record_memory=False)
+    with capture:
+        x = torch.zeros(4, device="meta")
+        x.relu()
+
+    assert capture.build_nodes()
+    assert capture.memory_events() == []
+
+
 def test_capture_returns_stable_id_for_same_live_tensor():
     capture = OpDispatchCapture()
     tensor = torch.zeros(4, device="meta")

@@ -38,6 +38,14 @@ def test_unpatch_restores_original_device_type():
     assert utils_mod.device_type == original
 
 
+def test_unpatch_restores_torch_split():
+    original = torch.split
+    patch_device_type_to_meta()
+    assert torch.split is not original
+    unpatch_device_type_to_meta()
+    assert torch.split is original
+
+
 def test_patch_is_idempotent():
     import torchtitan.tools.utils as utils_mod
 
@@ -380,4 +388,3 @@ def test_patch_redirects_torch_npu_module_to_meta_stub_when_present():
     finally:
         unpatch_device_type_to_meta()
         assert hasattr(torch, "npu") == had_npu_before
-

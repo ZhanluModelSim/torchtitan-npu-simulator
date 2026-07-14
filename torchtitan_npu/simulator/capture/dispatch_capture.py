@@ -47,7 +47,8 @@ def _flatten_tensors(value: Any) -> list[torch.Tensor]:
 
     from torch.distributed.tensor import DTensor
     if isinstance(value, DTensor):
-        tensors.append(value.to_local())
+        local_tensor = getattr(value, "_local_tensor", None)
+        tensors.append(local_tensor if isinstance(local_tensor, torch.Tensor) else value.to_local())
     elif isinstance(value, torch.Tensor):
         tensors.append(value)
     elif isinstance(value, dict):
@@ -115,11 +116,13 @@ class OpDispatchCapture(TorchDispatchMode):
         cost_model: OpCostModel | None = None,
         module_path_tracker: ModulePathTracker | None = None,
         phase_provider: Callable[[], str] | None = None,
+        record_memory: bool = True,
     ) -> None:
         super().__init__()
         self.cost_model = cost_model or OpCostModel()
         self.module_path_tracker = module_path_tracker
         self.phase_provider = phase_provider
+        self.record_memory = record_memory
         self._events: list[_RawEvent] = []
         self._memory_events: list[RawMemoryEvent] = []
         self._producer: dict[int, int] = {}
@@ -209,27 +212,28 @@ class OpDispatchCapture(TorchDispatchMode):
             candidate.op_id = op_id
             self._events.append(candidate)
 
-        self._memory_events.append(
-            RawMemoryEvent(
-                event_id=next(_memory_event_counter),
-                op_id=op_id,
-                seq_idx=candidate.seq_idx,
-                raw_op_type=raw_op_type,
-                op_type=op_type,
-                phase=phase,
-                module_path=module_path,
-                inputs=tuple(
-                    _to_tensor_ref(tensor, name=f"in_{idx}", tensor_id=input_ids[idx])
-                    for idx, tensor in enumerate(flat_inputs)
-                ),
-                outputs=tuple(
-                    _to_tensor_ref(tensor, name=f"out_{idx}", tensor_id=output_ids[idx])
-                    for idx, tensor in enumerate(flat_outputs)
-                ),
-                pp_stage=pp_stage,
-                pp_mb_idx=pp_mb_idx,
+        if self.record_memory:
+            self._memory_events.append(
+                RawMemoryEvent(
+                    event_id=next(_memory_event_counter),
+                    op_id=op_id,
+                    seq_idx=candidate.seq_idx,
+                    raw_op_type=raw_op_type,
+                    op_type=op_type,
+                    phase=phase,
+                    module_path=module_path,
+                    inputs=tuple(
+                        _to_tensor_ref(tensor, name=f"in_{idx}", tensor_id=input_ids[idx])
+                        for idx, tensor in enumerate(flat_inputs)
+                    ),
+                    outputs=tuple(
+                        _to_tensor_ref(tensor, name=f"out_{idx}", tensor_id=output_ids[idx])
+                        for idx, tensor in enumerate(flat_outputs)
+                    ),
+                    pp_stage=pp_stage,
+                    pp_mb_idx=pp_mb_idx,
+                )
             )
-        )
 
         # Resolve pending comm links: if any input tensor was produced by a
         # comm op (e.g. recv/unshard), this op is the dst_entry_op consumer.

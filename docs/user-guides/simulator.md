@@ -256,6 +256,7 @@ cat simulator_output/deepseek_v4_pro_61_layers/summary.txt
 | `simulation_result.json` | JSON | 完整四层 IR 结构化数据 |
 | `kernel_summary/` | CSV 目录 | 按 Rank 拆分的算子汇总 |
 | `ir_export/` | CSV 目录 | 各层级 IR 导出（见下文） |
+| `memory/` | JSON/CSV 目录 | 内存摘要、Perfetto trace、事件时间线和 tensor 生命周期 |
 
 ### 多进程模式（multi_proc_meta）
 
@@ -268,6 +269,7 @@ simulator_output/<配置名>/
 │   ├── trace.html
 │   ├── simulation_result.json
 │   ├── kernel_summary/
+│   ├── memory/
 │   └── ir_export/
 │       ├── rank_schedule.csv          # L3: inter-rank schedule
 │       ├── l1_schedule/               # L2: per-stage L1 schedule
@@ -419,6 +421,7 @@ def my_model_simulate() -> SimulationTrainerConfig:
 
 关键约束：
 
+- 内存跟踪默认开启。可通过 CLI 设置 `--simulation.no-enable-memory-tracking` 关闭；关闭后不记录内存事件、tensor 生命周期和 FSDP 参数驻留，也不执行静态内存估算。内存结果统一输出到 `<output_dir>/memory/`。
 - `world_size`（`NGPU` 环境变量）必须等于 `dp_replicate × dp_shard × cp × tp × pp`。`data_parallel_shard_degree=-1` 时由 torchtitan 自动计算。
 - `pipeline_parallel_degree > 1` 时，DeepSeek-V4 不支持 MTP，需设 `num_mtp_modules=0`。
 - `pipeline_parallel_degree > 1` 时，`local_batch_size` 需 ≥ `pp_degree`（1F1B 调度需要足够 microbatch）。

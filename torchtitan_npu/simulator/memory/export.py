@@ -133,14 +133,15 @@ def memory_plan_to_chrome_trace(plan: MemoryPlan) -> dict:
 
 
 def export_memory_plan(plan: MemoryPlan, out_dir: str) -> None:
-    os.makedirs(out_dir, exist_ok=True)
-    with open(os.path.join(out_dir, "memory_summary.json"), "w", encoding="utf-8") as f:
+    memory_dir = os.path.join(out_dir, "memory")
+    os.makedirs(memory_dir, exist_ok=True)
+    with open(os.path.join(memory_dir, "memory_summary.json"), "w", encoding="utf-8") as f:
         json.dump(plan.to_summary_dict(), f, indent=2, ensure_ascii=False)
 
-    with open(os.path.join(out_dir, "memory_trace.json"), "w", encoding="utf-8") as f:
+    with open(os.path.join(memory_dir, "memory_trace.json"), "w", encoding="utf-8") as f:
         json.dump(memory_plan_to_chrome_trace(plan), f, indent=2, ensure_ascii=False)
 
-    with open(os.path.join(out_dir, "memory_events.csv"), "w", newline="", encoding="utf-8") as f:
+    with open(os.path.join(memory_dir, "memory_events.csv"), "w", newline="", encoding="utf-8") as f:
         fieldnames = [
             "event_id",
             "seq_idx",
@@ -175,7 +176,7 @@ def export_memory_plan(plan: MemoryPlan, out_dir: str) -> None:
                 "pp_mb_idx": event.pp_mb_idx,
             })
 
-    with open(os.path.join(out_dir, "memory_timeline.csv"), "w", newline="", encoding="utf-8") as f:
+    with open(os.path.join(memory_dir, "memory_timeline.csv"), "w", newline="", encoding="utf-8") as f:
         fieldnames = [
             "seq_idx",
             "phase",
@@ -192,7 +193,7 @@ def export_memory_plan(plan: MemoryPlan, out_dir: str) -> None:
         for event in plan.timeline_events:
             writer.writerow(asdict(event))
 
-    with open(os.path.join(out_dir, "tensor_lifetimes.csv"), "w", newline="", encoding="utf-8") as f:
+    with open(os.path.join(memory_dir, "tensor_lifetimes.csv"), "w", newline="", encoding="utf-8") as f:
         fieldnames = [
             "tensor_id",
             "kind",
@@ -221,7 +222,7 @@ def export_memory_plan(plan: MemoryPlan, out_dir: str) -> None:
             writer.writerow(row)
 
     if plan.unclassified_ops:
-        with open(os.path.join(out_dir, "unclassified_memory_ops.csv"), "w", newline="", encoding="utf-8") as f:
+        with open(os.path.join(memory_dir, "unclassified_memory_ops.csv"), "w", newline="", encoding="utf-8") as f:
             fieldnames = ["seq_idx", "op_id", "raw_op_type", "phase", "output_bytes"]
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()

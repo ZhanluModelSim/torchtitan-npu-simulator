@@ -43,6 +43,7 @@ from torchtitan_npu.simulator.viz.text_summary import write_text_summary
 class SimulationConfig:
     output_dir: str = "./simulator_output"
     output_formats: list[str] = field(default_factory=lambda: [])
+    enable_memory_tracking: bool = True
     target_npu_device_type: str = "non_a5"
     csv_max_ranks: int | None = None
     simulated_parallel_degrees: dict[str, int] = field(default_factory=dict)
@@ -110,6 +111,7 @@ def run_simulation_step(
     num_micro_batches: int = 1,
     gradient_accumulation: int = 1,
     rank: int = 0,
+    enable_memory_tracking: bool = True,
 ) -> WorkloadGraph:
     """Run one forward+backward+optimizer step under full capture and
     return the resulting four-layer WorkloadGraph. Bypasses
@@ -158,12 +160,18 @@ def run_simulation_step(
             return "backward"
         return boundary.current_phase
 
-    capture = OpDispatchCapture(module_path_tracker=module_path_tracker, phase_provider=_phase_provider)
+    capture = OpDispatchCapture(
+        module_path_tracker=module_path_tracker,
+        phase_provider=_phase_provider,
+        record_memory=enable_memory_tracking,
+    )
 
     t1 = time.perf_counter()
     timings["setup"] = t1 - t0
 
-    with capture_fake_collectives() as comm_recorder, boundary, module_path_tracker, capture:
+    with capture_fake_collectives(
+        memory_tracking_enabled=enable_memory_tracking
+    ) as comm_recorder, boundary, module_path_tracker, capture:
         boundary.mark("forward")
         forward_backward_step(
             input_dict=input_dict,
@@ -216,20 +224,22 @@ def run_simulation_step(
     )
     timings["build_workload_graph"] = time.perf_counter() - t8
 
-    t9 = time.perf_counter()
-    memory_plan = estimate_static_memory(
-        capture.memory_events(),
-        model_parts=model_parts,
-        comm_events=comm_recorder.events,
-        fsdp_residency_events=comm_recorder.fsdp_residency_events,
-    )
-    wg.iteration.schedule.annotations["memory_plan"] = memory_plan
-    wg.iteration.schedule.annotations["memory_summary"] = memory_plan.to_summary_dict()
-    for step_graph in wg.step_templates.values():
-        step_graph.param_mem = memory_plan.persistent_param_bytes
-        step_graph.peak_active_mem = memory_plan.peak_active_bytes
-        step_graph.annotations["memory_summary"] = memory_plan.to_summary_dict()
-    timings["estimate_memory"] = time.perf_counter() - t9
+    memory_plan = None
+    if enable_memory_tracking:
+        t9 = time.perf_counter()
+        memory_plan = estimate_static_memory(
+            capture.memory_events(),
+            model_parts=model_parts,
+            comm_events=comm_recorder.events,
+            fsdp_residency_events=comm_recorder.fsdp_residency_events,
+        )
+        wg.iteration.schedule.annotations["memory_plan"] = memory_plan
+        wg.iteration.schedule.annotations["memory_summary"] = memory_plan.to_summary_dict()
+        for step_graph in wg.step_templates.values():
+            step_graph.param_mem = memory_plan.persistent_param_bytes
+            step_graph.peak_active_mem = memory_plan.peak_active_bytes
+            step_graph.annotations["memory_summary"] = memory_plan.to_summary_dict()
+        timings["estimate_memory"] = time.perf_counter() - t9
 
     timings["total"] = time.perf_counter() - t0
 
@@ -243,6 +253,8 @@ def run_simulation_step(
     for name in ["setup", "forward_backward", "optimizer", "build_nodes",
                  "build_step_graphs", "build_rank_table", "build_schedule_graph",
                  "build_workload_graph", "estimate_memory"]:
+        if name not in timings:
+            continue
         t = timings[name]
         print(f"{name:<30} {t:>10.2f} {t/total*100:>7.1f}%")
     print("-" * 60)
@@ -250,12 +262,15 @@ def run_simulation_step(
     print("=" * 60)
     print(f"Captured ops: {len(nodes)}, comm events: {len(comm_recorder.events)}")
     print(f"Step templates: {list(step_templates.keys())}")
-    print(
-        "Static memory: "
-        f"persistent_param_bytes={memory_plan.persistent_param_bytes} "
-        f"active_bytes_peak={memory_plan.peak_active_bytes} "
-        f"peak_seq_idx={memory_plan.peak_seq_idx}"
-    )
+    if memory_plan is not None:
+        print(
+            "Static memory: "
+            f"persistent_param_bytes={memory_plan.persistent_param_bytes} "
+            f"active_bytes_peak={memory_plan.peak_active_bytes} "
+            f"peak_seq_idx={memory_plan.peak_seq_idx}"
+        )
+    else:
+        print("Static memory tracking: disabled")
     print()
 
     return wg
@@ -359,6 +374,7 @@ class SimulationTrainer(Trainer):
             num_micro_batches=self.gradient_accumulation_steps,
             gradient_accumulation=self.gradient_accumulation_steps,
             rank=rank,
+            enable_memory_tracking=self.simulation_config.enable_memory_tracking,
         )
 
         t2 = time.perf_counter()

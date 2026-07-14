@@ -181,6 +181,7 @@ _original_pipeline_schedule_warmup_p2p: Any = _MISSING
 _original_window_exchange: tuple[Any, Any] | None = None
 _original_dtensor_meta_to_dtensor: Any = _MISSING
 _original_rowwise_prepare_output: Any = _MISSING
+_original_torch_split: Any = _MISSING
 _original_redistribute_local_tensor: Any = _MISSING
 _original_recv_object_list: Any = _MISSING
 _original_send_object_list: Any = _MISSING
@@ -205,6 +206,25 @@ _is_meta_simulation: bool = False
 # whether a comm call originates from model compute ("L1") or framework
 # scheduling ("L2"). Read by _record_comm to classify CommEvent.
 _comm_layer: str = ""
+
+
+class _MetaLocalShape(torch.autograd.Function):
+    """Change a local meta tensor's shape without detaching autograd."""
+
+    @staticmethod
+    def forward(ctx, input_tensor, output_shape):  # noqa: ANN001
+        ctx.input_shape = tuple(input_tensor.shape)
+        ctx.input_dtype = input_tensor.dtype
+        return torch.empty(tuple(output_shape), dtype=input_tensor.dtype, device="meta")
+
+    @staticmethod
+    def backward(ctx, grad_output):  # noqa: ANN001
+        return torch.empty(ctx.input_shape, dtype=ctx.input_dtype, device="meta"), None
+
+
+def _local_tensor_for_shape(tensor: torch.Tensor) -> torch.Tensor:
+    local_tensor = getattr(tensor, "_local_tensor", None)
+    return local_tensor if isinstance(local_tensor, torch.Tensor) else tensor
 
 
 def _patch_tensor_npu_method_to_meta() -> None:
@@ -713,22 +733,65 @@ def _patch_rowwise_parallel_output_for_meta() -> None:
                 continue
             global_seq = outputs.shape[1]
             expected_local_seq = global_seq // mesh_size
-            if result.shape[1] == expected_local_seq:
+            local_result = _local_tensor_for_shape(result)
+            if local_result.shape[1] == expected_local_seq:
                 continue
             # Values are irrelevant under meta simulation; create a tensor with
             # the correct local shape so downstream PrepareModuleInputOutput
             # hooks see consistent DTensor metadata.
-            new_shape = list(result.shape)
+            new_shape = list(local_result.shape)
             new_shape[1] = expected_local_seq
-            result = torch.empty(
-                new_shape,
-                dtype=result.dtype,
-                device=result.device,
-                requires_grad=result.requires_grad,
-            )
+            corrected_local = _MetaLocalShape.apply(local_result, tuple(new_shape))
+            if isinstance(result, DTensor):
+                result = DTensor.from_local(
+                    corrected_local,
+                    device_mesh=result.device_mesh,
+                    placements=result.placements,
+                    shape=result.shape,
+                    stride=result.stride(),
+                    run_check=False,
+                )
+            else:
+                result = corrected_local
         return result
 
     RowwiseParallel._prepare_output_fn = _meta_safe_prepare_output_fn
+
+
+def _split_meta_dtensor(tensor: torch.Tensor, split_sizes: list[int] | tuple[int, ...], dim: int) -> tuple:
+    normalized_dim = dim if dim >= 0 else tensor.ndim + dim
+    outputs = []
+    start = 0
+    for size in split_sizes:
+        size = int(size)
+        outputs.append(tensor.narrow(normalized_dim, start, size))
+        start += size
+    return tuple(outputs)
+
+
+def _patch_torch_split_for_meta_dtensor() -> None:
+    """Avoid DTensor SplitWithSizesBackward mixing local and distributed grads."""
+    global _original_torch_split
+    if _original_torch_split is not _MISSING:
+        return
+    _original_torch_split = torch.split
+
+    def _meta_safe_split(tensor, split_size_or_sections, dim=0):  # noqa: ANN001
+        try:
+            from torch.distributed.tensor import DTensor
+
+            is_meta_dtensor = isinstance(tensor, DTensor) and tensor.device.type == "meta"
+        except Exception:
+            is_meta_dtensor = False
+        if not is_meta_dtensor or not isinstance(split_size_or_sections, (list, tuple)):
+            return _original_torch_split(tensor, split_size_or_sections, dim=dim)
+
+        normalized_dim = dim if dim >= 0 else tensor.ndim + dim
+        if sum(int(size) for size in split_size_or_sections) != tensor.shape[normalized_dim]:
+            return _original_torch_split(tensor, split_size_or_sections, dim=dim)
+        return _split_meta_dtensor(tensor, split_size_or_sections, dim)
+
+    torch.split = _meta_safe_split
 
 
 def _patch_window_exchange_for_fake_pg() -> None:
@@ -1957,6 +2020,7 @@ def patch_device_type_to_meta() -> None:
     _patch_pipeline_schedule_warmup_for_meta()
     _patch_dtensor_meta_to_dtensor_for_meta()
     _patch_rowwise_parallel_output_for_meta()
+    _patch_torch_split_for_meta_dtensor()
     _patch_window_exchange_for_fake_pg()
     _patch_redistribute_local_tensor_for_meta()
     _patch_object_collectives_for_fake_pg()
@@ -1979,6 +2043,9 @@ def unpatch_device_type_to_meta() -> None:
     global _patched, _original_fsdp_validate_no_meta_params, _original_tensor_npu_method, _original_torch_full
     global _original_moe_token_dispatch, _original_grouped_mm, _original_li_loss_forward, _original_pipeline_schedule_warmup_p2p
     global _original_window_exchange, _original_dtensor_meta_to_dtensor, _original_rowwise_prepare_output
+    global _original_torch_split
+    global _original_redistribute_local_tensor, _original_recv_object_list, _original_send_object_list
+    global _original_torch_equal
     for (module_path, attr_name), original in _original_values.items():
         module = importlib.import_module(module_path)
         if original is _MISSING:
@@ -2040,6 +2107,10 @@ def unpatch_device_type_to_meta() -> None:
 
         RowwiseParallel._prepare_output_fn = _original_rowwise_prepare_output
         _original_rowwise_prepare_output = _MISSING
+
+    if _original_torch_split is not _MISSING:
+        torch.split = _original_torch_split
+        _original_torch_split = _MISSING
 
     if _original_redistribute_local_tensor is not _MISSING:
         import torch.distributed.tensor._redistribute as _redistribute_module
