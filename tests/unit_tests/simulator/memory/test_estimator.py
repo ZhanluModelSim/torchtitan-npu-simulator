@@ -125,6 +125,9 @@ class FakeComm:
     op_id: int
     comm_primitive: str
     comm_dim: str
+    volume_bytes: int = 0
+    world_size: int = 1
+    dst_entry_op: int = 0
 
 
 def test_fsdp_allgather_output_is_classified_as_full_param_buffer():
@@ -136,6 +139,47 @@ def test_fsdp_allgather_output_is_classified_as_full_param_buffer():
     full_lifetime = next(item for item in plan.tensor_lifetimes if item.tensor_id == "tensor:2")
     assert full_lifetime.kind == "fsdp_full_param"
     assert full_lifetime.num_bytes == 128
+    assert not any(item.tensor_id.startswith("fsdp_full_param:") for item in plan.tensor_lifetimes)
+
+
+def test_fsdp_residency_plugin_synthesizes_missing_full_param_lifetime():
+    shard = tref(1, 32)
+    plan = estimate_static_memory(
+        [event(0, 10, "comm.allgather", inputs=[shard], outputs=[], op_type="allgather")],
+        comm_events=[FakeComm(op_id=10, comm_primitive="allgather", comm_dim="fsdp", volume_bytes=32, world_size=4)],
+    )
+
+    full_lifetime = next(item for item in plan.tensor_lifetimes if item.tensor_id == "fsdp_full_param:10")
+    assert full_lifetime.kind == "fsdp_full_param"
+    assert full_lifetime.num_bytes == 128
+    assert full_lifetime.birth_seq == 0
+    assert full_lifetime.death_seq == 0
+    assert "FSDP residency plugin synthesized 1 full-param lifetimes" in " ".join(plan.notes)
+
+
+def test_fsdp_residency_plugin_uses_comm_dst_entry_op_as_consumer():
+    shard = tref(1, 32)
+    x, y = tref(2, 16), tref(3, 16)
+    plan = estimate_static_memory(
+        [
+            event(0, 10, "comm.allgather", inputs=[shard], outputs=[], op_type="allgather"),
+            event(4, 20, "aten.mm.default", inputs=[x], outputs=[y]),
+        ],
+        comm_events=[
+            FakeComm(
+                op_id=10,
+                comm_primitive="allgather",
+                comm_dim="fsdp",
+                volume_bytes=32,
+                world_size=4,
+                dst_entry_op=20,
+            )
+        ],
+    )
+
+    full_lifetime = next(item for item in plan.tensor_lifetimes if item.tensor_id == "fsdp_full_param:10")
+    assert full_lifetime.death_seq == 4
+    assert full_lifetime.consumer_ops == [20]
 
 
 def test_parameter_bytes_are_persistent_and_counted():
@@ -162,3 +206,16 @@ def test_memory_plan_exports_compact_chrome_trace(tmp_path):
 
     export_memory_plan(plan, str(tmp_path))
     assert (tmp_path / "memory_trace.json").is_file()
+
+
+def test_chrome_trace_includes_fsdp_full_param_counter():
+    shard = tref(1, 32)
+    plan = estimate_static_memory(
+        [event(0, 10, "comm.allgather", inputs=[shard], outputs=[], op_type="allgather")],
+        comm_events=[FakeComm(op_id=10, comm_primitive="allgather", comm_dim="fsdp", volume_bytes=32, world_size=4)],
+    )
+
+    trace = memory_plan_to_chrome_trace(plan)
+    events = trace["traceEvents"]
+    assert any(item["ph"] == "M" and item["args"].get("name") == "fsdp full-param bytes" for item in events)
+    assert any(item["ph"] == "C" and item["name"] == "active_fsdp_full_param_bytes" for item in events)

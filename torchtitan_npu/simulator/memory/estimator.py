@@ -20,6 +20,8 @@ import torch.nn as nn
 
 from torchtitan_npu.simulator.capture.tensor_utils import dtype_to_str, tensor_volume_bytes
 from torchtitan_npu.simulator.memory.alias_rules import is_alias_event, is_mutation_event
+from torchtitan_npu.simulator.memory.fsdp_residency import FSDPFullParamResidencyPlugin
+from torchtitan_npu.simulator.memory.plugins import MemoryModelContext
 from torchtitan_npu.simulator.memory.records import (
     MemoryPlan,
     MemoryTimelineEvent,
@@ -222,6 +224,10 @@ def estimate_static_memory(
     alias_base_by_tensor_id: dict[int, int] = {}
     alias_lifetimes: list[TensorLifetime] = []
     unclassified_ops: list[dict[str, Any]] = []
+    notes = [
+        "P0 estimates active tensor bytes from static tensor metadata; it does not model allocator reserved/cache or kernel workspace.",
+        "Alias and mutation handling uses conservative op-name rules.",
+    ]
 
     for event in events:
         for ref in event.inputs:
@@ -261,7 +267,16 @@ def estimate_static_memory(
                 }
             )
 
-    lifetimes = [*param_lifetimes, *lifetimes_by_tensor_id.values(), *alias_lifetimes]
+    plugin_context = MemoryModelContext(
+        events=events,
+        comm_by_op=comm_by_op,
+        lifetimes_by_tensor_id=lifetimes_by_tensor_id,
+        param_ids=param_ids,
+        notes=notes,
+    )
+    plugin_lifetimes = FSDPFullParamResidencyPlugin().apply(plugin_context)
+
+    lifetimes = [*param_lifetimes, *lifetimes_by_tensor_id.values(), *alias_lifetimes, *plugin_lifetimes]
     for lifetime in lifetimes:
         _finalize_kind(lifetime)
 
@@ -275,9 +290,6 @@ def estimate_static_memory(
         tensor_lifetimes=sorted(lifetimes, key=lambda item: (item.birth_seq, item.tensor_id)),
         timeline_events=timeline,
         unclassified_ops=unclassified_ops,
-        notes=[
-            "P0 estimates active tensor bytes from static tensor metadata; it does not model allocator reserved/cache or kernel workspace.",
-            "Alias and mutation handling uses conservative op-name rules.",
-        ],
+        notes=notes,
     )
     return plan

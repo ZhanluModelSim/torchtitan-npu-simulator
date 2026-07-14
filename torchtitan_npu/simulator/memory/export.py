@@ -70,9 +70,13 @@ def memory_plan_to_chrome_trace(plan: MemoryPlan) -> dict:
         {"name": "process_name", "ph": "M", "pid": 1, "tid": 0, "args": {"name": "simulator memory"}},
         {"name": "thread_name", "ph": "M", "pid": 1, "tid": 1, "args": {"name": "active tensor bytes"}},
         {"name": "thread_name", "ph": "M", "pid": 1, "tid": 2, "args": {"name": "training phase"}},
+        {"name": "thread_name", "ph": "M", "pid": 1, "tid": 3, "args": {"name": "fsdp full-param bytes"}},
     ]
     trace_events.extend(_build_phase_spans(plan))
+    active_by_kind: dict[str, int] = {}
     for event in sorted(plan.timeline_events, key=lambda item: (item.seq_idx, item.action, item.tensor_id)):
+        delta = event.num_bytes if event.action == "alloc" else -event.num_bytes
+        active_by_kind[event.kind] = active_by_kind.get(event.kind, 0) + delta
         trace_events.append({
             "name": "active_bytes",
             "ph": "C",
@@ -86,6 +90,20 @@ def memory_plan_to_chrome_trace(plan: MemoryPlan) -> dict:
                 "phase": event.phase,
             },
         })
+        if event.kind == "fsdp_full_param":
+            trace_events.append({
+                "name": "active_fsdp_full_param_bytes",
+                "ph": "C",
+                "pid": 1,
+                "tid": 3,
+                "ts": _trace_ts(event.seq_idx),
+                "args": {
+                    "active_fsdp_full_param_bytes": active_by_kind.get("fsdp_full_param", 0),
+                    "action": event.action,
+                    "phase": event.phase,
+                    "reason": event.reason,
+                },
+            })
     trace_events.append({
         "name": "peak active bytes",
         "ph": "i",
