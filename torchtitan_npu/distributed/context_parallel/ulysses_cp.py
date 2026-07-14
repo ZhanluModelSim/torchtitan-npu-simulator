@@ -16,7 +16,8 @@ from functools import partial
 from typing import Any
 
 import torch
-import torch.distributed as dist
+import torch.distributed._functional_collectives as ft_c
+from torch._dynamo import allow_in_graph
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor.parallel import ParallelStyle, parallelize_module
 from torchtitan.models.common.attention import ScaledDotProductAttention
@@ -24,10 +25,25 @@ from torchtitan.models.common.attention import ScaledDotProductAttention
 from .registry import register_cp_strategy
 
 
+def _all_to_all_functional(input_tensor, mesh, scatter_dim, gather_dim):
+    world_size = mesh.size()
+    group = mesh.get_group()
+    chunks = [t.contiguous() for t in input_tensor.chunk(world_size, dim=scatter_dim)]
+    stacked = torch.stack(chunks, dim=0)
+    chunk_shape = stacked.shape[1:]
+    flat = stacked.reshape(world_size, -1)
+    out_flat = ft_c.all_to_all_single(flat, [1] * world_size, [1] * world_size, group=group)
+    out_flat = ft_c.wait_tensor(out_flat)
+    out_stacked = out_flat.reshape(world_size, *chunk_shape)
+    out_chunks = list(out_stacked.unbind(dim=0))
+    return torch.cat(out_chunks, dim=gather_dim)
+
+
+@allow_in_graph
 class AllToAll(torch.autograd.Function):
     """All-to-all with scatter on one dim and gather on another.
 
-    Forward:  ``chunk(scatter_dim)`` → ``dist.all_to_all`` → ``cat(gather_dim)``.
+    Forward:  ``chunk(scatter_dim)`` → ``all_to_all_single`` → ``cat(gather_dim)``.
     Backward: reverse — chunk on the forward's gather_dim, all-to-all in
               reverse direction, cat on the forward's scatter_dim.
     """
@@ -38,23 +54,12 @@ class AllToAll(torch.autograd.Function):
         ctx.mesh = mesh
         ctx.scatter_dim = scatter_dim
         ctx.gather_dim = gather_dim
-
-        world_size = mesh.size()
-        input_list = [t.contiguous() for t in list(input_tensor.chunk(world_size, dim=scatter_dim))]
-        output_list = [torch.empty_like(input_list[0]) for _ in range(world_size)]
-        dist.all_to_all(output_list, input_list, group=mesh.get_group())
-        output = torch.cat(output_list, dim=gather_dim)
-        return output
+        return _all_to_all_functional(input_tensor, mesh, scatter_dim, gather_dim)
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def backward(ctx, grad_output):
-        world_size = ctx.mesh.size()
-
-        grad_list = [t.contiguous() for t in list(grad_output.chunk(world_size, dim=ctx.gather_dim))]
-        grad_output_list = [torch.empty_like(grad_list[0]) for _ in range(world_size)]
-        dist.all_to_all(grad_output_list, grad_list, group=ctx.mesh.get_group())
-        grad_input = torch.cat(grad_output_list, dim=ctx.scatter_dim)
+        grad_input = _all_to_all_functional(grad_output, ctx.mesh, ctx.gather_dim, ctx.scatter_dim)
         return grad_input, None, None, None
 
 
