@@ -35,21 +35,79 @@ def build_schedule_graph(
     All timeline information comes from capture (seq_idx, _pp_context,
     CommEvent fields) — not from inference or RankTable traversal.
     """
-    # 1. StepInstance: one per template for this rank (captured, not generated)
+    # 1. StepInstance: one per captured compute chunk (microbatch × stage ×
+    #    comp_type). For PP steps every forward_one_chunk / backward_one_chunk /
+    #    backward_weight_one_chunk call produced a timeline_event carrying
+    #    (pp_mb_idx, pp_stage, comp_type) — including pass-through microbatches
+    #    whose L0 graph was deduped. Instantiate the matching template for each
+    #    so the L2 schedule reflects every microbatch, not just MB 0.
     instances: list[StepInstance] = []
     coords = rank_table.rank_coordinates.get(rank, {})
+    seen_instance_ids: set[str] = set()
+    # Map template_id -> (step_type, fsdp_state) for fallback when a chunk's
+    # comp_type has no captured template (e.g. only MB 1+ ran a class but MB 0
+    # ran a different one — rare; fall back to the matching comp_type template).
+    template_by_comp: dict[str, tuple[str, StepGraph]] = {}
     for template_id, template in step_templates.items():
+        template_by_comp[template.step_type] = (template_id, template)
+
+    def _make_instance(mb_idx: int, stage: int, comp_type: str, fsdp_state: str) -> None:
+        template_id = f"s{stage}_{comp_type}"
+        step_type = comp_type
+        # Fall back to whatever template exists for this comp_type if the exact
+        # stage's template wasn't captured (shouldn't normally happen).
+        if template_id not in step_templates and comp_type in template_by_comp:
+            template_id, _ = template_by_comp[comp_type]
+        instance_id = f"rank{rank}_s{stage}_mb{mb_idx}_{comp_type}"
+        if instance_id in seen_instance_ids:
+            return
+        seen_instance_ids.add(instance_id)
         instances.append(
             StepInstance(
-                instance_id=f"rank{rank}_{template_id}",
+                instance_id=instance_id,
                 step_ref=template_id,
-                step_type=template.step_type,
-                micro_batch_idx=0,
-                pipeline_stage=coords.get("pp", rank),
+                step_type=step_type,
+                micro_batch_idx=mb_idx,
+                pipeline_stage=stage,
                 device_ids=[rank],
                 dp_group=coords.get("dp_replicate", 0),
+                comp_type=comp_type,
+                fsdp_state=fsdp_state,
             )
         )
+
+    if timeline_events:
+        for ev in timeline_events:
+            comp_type = ev.get("comp_type") or ""
+            if not comp_type:
+                # Legacy timeline events (no comp_type): infer from action.
+                action = ev.get("action", "")
+                comp_type = "F" if "forward" in action else ("W" if "weight" in action else "B")
+            _make_instance(
+                ev.get("pp_mb_idx", 0),
+                ev.get("pp_stage", coords.get("pp", rank)),
+                comp_type,
+                "NA",
+            )
+    # For non-PP steps (no timeline_events) or any template without a chunk
+    # event, emit one MB 0 instance per captured template so the templates are
+    # still represented in the L2 graph.
+    if not instances:
+        for template_id, template in step_templates.items():
+            comp_type = template.step_type
+            instances.append(
+                StepInstance(
+                    instance_id=f"rank{rank}_{template_id}",
+                    step_ref=template_id,
+                    step_type=comp_type,
+                    micro_batch_idx=0,
+                    pipeline_stage=coords.get("pp", rank),
+                    device_ids=[rank],
+                    dp_group=coords.get("dp_replicate", 0),
+                    comp_type=comp_type,
+                )
+            )
+            seen_instance_ids.add(f"rank{rank}_{template_id}")
 
     # 2. DataPass: only from L2 comm events (PP/FSDP), not L1 (CP)
     data_passes: list[DataPass] = []
@@ -132,11 +190,17 @@ def build_schedule_graph(
                             comm_type=comm_type,
                             comm_peer_rank=comm_peer,
                             action="comm",
+                            comp_type=ann.get("comp_type", ""),
                         )
                     )
                     break
 
-    # 3b. MB 1+ timeline events (scheduling: forward_one_chunk/backward_one_chunk)
+    # 3b. every microbatch's compute chunks (scheduling:
+    # forward_one_chunk/backward_one_chunk/backward_weight_one_chunk). These
+    # cover ALL microbatches — MB 0's captured chunks plus the pass-through
+    # duplicates — so the L2 timeline reflects the full schedule, and each
+    # entry carries its comp_type so consumers can pair it with the right L1
+    # template.
     if timeline_events:
         for ev in timeline_events:
             execution_timeline.append(
@@ -148,6 +212,7 @@ def build_schedule_graph(
                     micro_batch_idx=ev["pp_mb_idx"],
                     phase=ev["phase"],
                     action=ev["action"],
+                    comp_type=ev.get("comp_type", ""),
                 )
             )
 
@@ -169,6 +234,7 @@ def build_schedule_graph(
                 comm_type=event.p2p_direction or event.comm_primitive,
                 comm_peer_rank=event.p2p_peer_rank,
                 action="comm",
+                comp_type=event.comp_type,
             )
         )
 

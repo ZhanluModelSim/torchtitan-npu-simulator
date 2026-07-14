@@ -63,6 +63,12 @@ class CommEvent:
     comm_layer: str = ""         # "L1" (model compute) or "L2" (framework scheduling)
     src_exit_op: int = 0         # L1 op that produced the data being communicated (0 = unknown)
     dst_entry_op: int = 0        # L1 op that consumes the communicated data (0 = unknown)
+    # Compute-graph class (mirrors _pp_context["comp_type"]) active when this
+    # comm op ran. Lets the L2 schedule attribute P2P/FSDP comm to the correct
+    # (microbatch, stage, comp_type) StepInstance instead of just the stage.
+    comp_type: str = ""
+    # FSDP sharding state active when this comm op ran.
+    fsdp_state: str = "NA"
 
 
 class _NoOpWork:
@@ -116,9 +122,14 @@ class CommEventRecorder:
         pp_stage: int,
         pp_mb_idx: int,
         phase: str,
+        comp_type: str = "",
     ) -> None:
         """Record an L2 scheduling-level timeline event (e.g. forward_one_chunk,
-        backward_one_chunk).  Used for MB 1+ when L0 capture is in pass-through."""
+        backward_one_chunk, backward_weight_one_chunk).  Used for every
+        microbatch's compute chunk — including pass-through ones whose L0 graph
+        was deduped against an already-captured (stage, comp_type) template —
+        so the L2 schedule can instantiate the right template for each
+        microbatch. ``comp_type`` carries the F/B/I/W class."""
         from torchtitan_npu.simulator.capture.dispatch_capture import _seq_counter
         self.timeline_events.append({
             "seq_idx": next(_seq_counter),
@@ -126,6 +137,7 @@ class CommEventRecorder:
             "pp_stage": pp_stage,
             "pp_mb_idx": pp_mb_idx,
             "phase": phase,
+            "comp_type": comp_type,
         })
 
 
@@ -237,8 +249,14 @@ def _record_comm_with_l0(
     event.seq_idx = next(_seq_counter)
 
     # Record comm_layer from context (set by call-site patches)
-    from torchtitan_npu.simulator.meta_env import _comm_layer
+    from torchtitan_npu.simulator.meta_env import _comm_layer, _pp_context
     event.comm_layer = _comm_layer
+    # Stamp the active compute-graph class + FSDP state so the L2 schedule can
+    # attribute this comm op to the correct (microbatch, stage, comp_type)
+    # StepInstance. Falls back to "" when no chunk is active (e.g. inter-chunk
+    # UNSHARD/RESHARD actions in runtime zero-bubble schedules).
+    event.comp_type = str(_pp_context.get("comp_type", ""))
+    event.fsdp_state = str(_pp_context.get("fsdp_state", "NA"))
 
     out = output_tensor if output_tensor is not None else tensor
     capture = get_active_capture()

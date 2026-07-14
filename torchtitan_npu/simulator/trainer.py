@@ -130,6 +130,16 @@ def run_simulation_step(
     patch_device_type_to_meta()
     global_valid_tokens = float(labels.numel())
 
+    # Default PP stage attribution: non-PP steps use stage 0 (the single
+    # stage); PP steps use -1 ("unattributed") so framework setup ops captured
+    # outside any compute chunk (FSDP _lazy_init / inter-chunk comm, which run
+    # before the first forward_one_chunk stamps the real stage) bucket into a
+    # clearly-labelled `s-1_*` template instead of masquerading as stage 0.
+    # `pp_enabled` (pp_degree > 1) is the real signal — the schedule string
+    # is "1F1B" even when PP degree is 1, so it cannot gate this.
+    from torchtitan_npu.simulator.meta_env import _pp_context
+    _pp_context["stage"] = -1 if parallel_dims.pp_enabled else 0
+
     boundary = StepBoundaryTracker()
     module_path_tracker = ModulePathTracker(model_parts[0])
 
@@ -385,6 +395,7 @@ class SimulationTrainer(Trainer):
                     "pipeline_stage": rank,
                     "micro_batch_idx": e.micro_batch_idx,
                     "phase": e.phase,
+                    "comp_type": e.comp_type,
                     "comm_type": e.comm_type,
                     "comm_peer_rank": e.comm_peer_rank,
                 }
@@ -402,6 +413,9 @@ class SimulationTrainer(Trainer):
                         "op_type": n.op_type,
                         "raw_op_type": n.annotations.get("raw_op_type", ""),
                         "phase": n.annotations.get("phase", ""),
+                        "comp_type": n.annotations.get("comp_type", ""),
+                        "fsdp_state": n.annotations.get("fsdp_state", "NA"),
+                        "pp_stage": n.annotations.get("pp_stage", -1),
                         "inputs_shape": [list(m.shape) for m in n.inputs],
                         "outputs_shape": [list(m.shape) for m in n.outputs],
                         "inputs_dtype": [str(m.dtype) for m in n.inputs],
@@ -475,9 +489,9 @@ class SimulationTrainer(Trainer):
                 for tid, sg in r["step_templates"].items():
                     fname = os.path.join(ir_dir, f"stage_{stage}_{sg['step_type']}_l0_ops.csv")
                     with open(fname, "w", encoding="utf-8") as f:
-                        f.write("topo_order,op_id,seq_idx,op_type,raw_op_type,phase,inputs_shape,outputs_shape,flops,peak_mem,comm_bytes,module_path,comm_dim,comm_ranks\n")
+                        f.write("topo_order,op_id,seq_idx,op_type,raw_op_type,phase,comp_type,fsdp_state,pp_stage,inputs_shape,outputs_shape,flops,peak_mem,comm_bytes,module_path,comm_dim,comm_ranks\n")
                         for i, n in enumerate(sg["nodes"]):
-                            f.write(f"{i},{n['op_id']},{n['seq_idx']},{n['op_type']},{n['raw_op_type']},{n['phase']},{';'.join(str(s) for s in n['inputs_shape'])},{';'.join(str(s) for s in n['outputs_shape'])},{n['flops']},{n['peak_mem']},{n['comm_bytes']},{n['module_path']},{n['comm_dim']},{n['comm_ranks']}\n")
+                            f.write(f"{i},{n['op_id']},{n['seq_idx']},{n['op_type']},{n['raw_op_type']},{n['phase']},{n.get('comp_type','')},{n.get('fsdp_state','NA')},{n.get('pp_stage',-1)},{';'.join(str(s) for s in n['inputs_shape'])},{';'.join(str(s) for s in n['outputs_shape'])},{n['flops']},{n['peak_mem']},{n['comm_bytes']},{n['module_path']},{n['comm_dim']},{n['comm_ranks']}\n")
 
         print(f"Merged {len(all_ranks)} PP stages' IR to {out_dir}")
 

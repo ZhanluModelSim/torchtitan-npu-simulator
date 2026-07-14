@@ -27,6 +27,10 @@ class TimelineEntry:
     comm_type: str = ""    # "fwd_send" / "fwd_recv" / "bwd_send" / "bwd_recv" / "allgather" / ...
     comm_peer_rank: int = -1  # for P2P: peer rank
     action: str = ""       # "compute" / "forward_one_chunk" / "backward_one_chunk" / "comm"
+    # Compute-graph class ("F"/"B"/"I"/"W"/"F_RECOMPUTE"/"OPTIMIZER") for this
+    # timeline entry. Lets L2 consumers distinguish input-grad vs weight-grad
+    # backward chunks and pick the correct L1 template per microbatch.
+    comp_type: str = ""
 
 
 @dataclass
@@ -41,6 +45,11 @@ class StepInstance:
     device_ids: list[int]
     dp_group: int
     estimated_runtime: float = 0.0
+    # Compute-graph class of the referenced template (mirrors step_type but
+    # kept on the instance for convenience).
+    comp_type: str = ""
+    # FSDP sharding state active during this instance's execution.
+    fsdp_state: str = "NA"
 
 
 @dataclass
@@ -140,7 +149,7 @@ class ScheduleGraph:
             with open(fname, "w", newline="", encoding="utf-8") as f:
                 w = csv.writer(f)
                 w.writerow([
-                    "seq_idx", "phase", "microbatch", "action",
+                    "seq_idx", "phase", "comp_type", "microbatch", "action",
                     "comm_type", "comm_peer_rank", "comm_dim", "comm_ranks",
                     "op_id",
                 ])
@@ -153,7 +162,7 @@ class ScheduleGraph:
                     else:
                         action = "compute"
                     w.writerow([
-                        e.seq_idx, e.phase,
+                        e.seq_idx, e.phase, e.comp_type,
                         e.micro_batch_idx if e.micro_batch_idx >= 0 else "",
                         action,
                         e.comm_type, e.comm_peer_rank,
