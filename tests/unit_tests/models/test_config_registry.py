@@ -249,7 +249,7 @@ def test_deepseek_v4_flash_cpt_config_applies_flash_and_cpt_overrides():
     trainer_config = config_registry.deepseek_v4_flash_4k_128die()
 
     assert trainer_config.model_spec.name == "deepseek_v4"
-    assert trainer_config.model_spec.flavor == "v4_flash_debug_256_experts_43_layers"
+    assert trainer_config.model_spec.flavor == "v4_flash_43layers_256experts"
     assert _converter_names(trainer_config) == [
         "npu_rms_norm",
         "npu_moe_dispatch",
@@ -278,7 +278,7 @@ def test_deepseek_v4_pro_cpt_config_only_overrides_pro_differences():
     pro_config = config_registry.deepseek_v4_pro_4k_384die()
 
     assert pro_config.model_spec.name == flash_config.model_spec.name
-    assert pro_config.model_spec.flavor == "v4_pro_debug_61_layers"
+    assert pro_config.model_spec.flavor == "v4_pro_61layers_384experts"
     assert pro_config.model_converters == flash_config.model_converters
     assert pro_config.comm == flash_config.comm
     assert pro_config.lr_scheduler == flash_config.lr_scheduler
@@ -296,7 +296,7 @@ def test_debug_single_node_config_applies_common_debug_semantics_without_cpt_com
     config_registry = _deepseek_v4_registry()
     trainer_config = config_registry.debug_deepseek_v4_flash_single_node()
 
-    assert trainer_config.model_spec.flavor == "v4_flash_debug_16_experts_43_layers"
+    assert trainer_config.model_spec.flavor == "v4_flash_43layers_16experts"
     assert _converter_names(trainer_config) == [
         "npu_rms_norm",
         "npu_moe_dispatch",
@@ -406,7 +406,7 @@ def test_deepseek_v4_pro_single_node_derives_from_flash_single_node_config():
     pro_config = config_registry.debug_deepseek_v4_pro_single_node()
 
     assert pro_config.model_spec.name == flash_config.model_spec.name
-    assert pro_config.model_spec.flavor == "v4_pro_debug_16_layers"
+    assert pro_config.model_spec.flavor == "v4_pro_16layers_16experts"
     assert pro_config.training == flash_config.training
     assert pro_config.checkpoint == flash_config.checkpoint
     assert pro_config.debug == flash_config.debug

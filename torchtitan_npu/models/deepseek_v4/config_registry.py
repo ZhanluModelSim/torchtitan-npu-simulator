@@ -60,7 +60,7 @@ def _flash_base() -> TrainerConfig:
     base = trainer_base_config()
     return replace(
         base,
-        model_spec=model_registry("v4_flash_debug_256_experts_43_layers"),
+        model_spec=model_registry("v4_flash_43layers_256experts"),
         model_converters=ModelConvertersContainer.Config(converters=_default_converters()),
         training=replace(base.training, num_mtp_modules=1),
     )
@@ -76,7 +76,7 @@ def deepseek_v4_flash_4k_128die() -> TrainerConfig:
 
 
 def deepseek_v4_pro_4k_384die() -> TrainerConfig:
-    base = replace(deepseek_v4_flash_4k_128die(), model_spec=model_registry("v4_pro_debug_61_layers"))
+    base = replace(deepseek_v4_flash_4k_128die(), model_spec=model_registry("v4_pro_61layers_384experts"))
     return replace(
         base,
         training=replace(base.training, global_batch_size=384),
@@ -89,7 +89,7 @@ def debug_deepseek_v4_flash_single_node() -> TrainerConfig:
     base = debug_single_node_eq_pruned_config(_flash_base())
     return replace(
         base,
-        model_spec=model_registry("v4_flash_debug_16_experts_43_layers"),
+        model_spec=model_registry("v4_flash_43layers_16experts"),
         model_converters=ModelConvertersContainer.Config(converters=_default_converters("npu_mhc_post")),
         parallelism=replace(base.parallelism, expert_parallel_degree=8),
     )
@@ -110,7 +110,7 @@ def debug_deepseek_v4_pro_single_node() -> TrainerConfig:
     base = debug_deepseek_v4_flash_single_node()
     return replace(
         base,
-        model_spec=model_registry("v4_pro_debug_16_layers"),
+        model_spec=model_registry("v4_pro_16layers_16experts"),
         model_converters=ModelConvertersContainer.Config(converters=_default_converters()),
         parallelism=replace(base.parallelism, expert_parallel_degree=16),
     )
