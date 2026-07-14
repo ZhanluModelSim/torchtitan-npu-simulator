@@ -76,6 +76,7 @@ class ScheduleAction:
     sub-actions); all other action types leave ``sub_actions`` None.
     """
 
+    id: int
     action_id: str
     rank: int
     stage: int                              # PP stage (-1 if non-stage action, e.g. OPTIMIZER)

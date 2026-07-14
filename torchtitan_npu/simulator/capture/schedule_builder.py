@@ -168,16 +168,18 @@ def build_schedule_plan(
         mb = int(mb) if mb is not None else -1
         if action_type == "OVERLAP_F_B" and getattr(a, "sub_actions", None):
             subs = [map_action(s, seq_hint) for s in a.sub_actions]
+            action_id = next(_action_seq)
             return ScheduleAction(
-                action_id=f"r{rank}_a{next(_action_seq)}", rank=rank, stage=-1, mb_idx=-1,
+                id=f"{action_id}", action_id=f"r{rank}_a{action_id}", rank=rank, stage=-1, mb_idx=-1,
                 action_type="OVERLAP_F_B", seq_idx=seq_hint, sub_actions=subs,
             )
         seq = seq_hint
         if action_type == "COMPUTE" and comp_type and stage >= 0 and mb >= 0:
             seq = tl_seq.get((stage, mb, comp_type), seq_hint)
         tmpl = f"s{stage}_{comp_type}" if (action_type == "COMPUTE" and comp_type) else ""
+        action_id = next(_action_seq)
         return ScheduleAction(
-            action_id=f"r{rank}_a{next(_action_seq)}", rank=rank, stage=stage, mb_idx=mb,
+            id=f"{action_id}", action_id=f"r{rank}_a{action_id}", rank=rank, stage=stage, mb_idx=mb,
             action_type=action_type, comp_type=comp_type, template_ref=tmpl, seq_idx=seq,
         )
 
@@ -198,8 +200,9 @@ def build_schedule_plan(
                 ct = "F" if "forward" in act else ("W" if "weight" in act else "B")
             stage = int(ev.get("pp_stage", rank))
             mb = int(ev.get("pp_mb_idx", 0))
+            action_id = next(_action_seq)
             actions.append(ScheduleAction(
-                action_id=f"r{rank}_a{next(_action_seq)}", rank=rank, stage=stage, mb_idx=mb,
+                id=f"{action_id}", action_id=f"r{rank}_a{action_id}", rank=rank, stage=stage, mb_idx=mb,
                 action_type="COMPUTE", comp_type=ct, template_ref=f"s{stage}_{ct}",
                 seq_idx=int(ev.get("seq_idx", 0)),
             ))
@@ -217,8 +220,9 @@ def build_schedule_plan(
                 atype = "RESHARD"
             else:
                 continue
+            action_id = next(_action_seq)
             actions.append(ScheduleAction(
-                action_id=f"r{rank}_a{next(_action_seq)}", rank=rank,
+                id=f"{action_id}", action_id=f"r{rank}_a{action_id}", rank=rank,
                 stage=int(ev.p2p_stage) if ev.p2p_stage >= 0 else rank,
                 mb_idx=int(ev.p2p_mb_idx) if ev.p2p_mb_idx >= 0 else -1,
                 action_type=atype, seq_idx=int(ev.seq_idx),
@@ -230,8 +234,9 @@ def build_schedule_plan(
             sg = step_templates[tid]
             ct = sg.step_type
             min_seq = min((n.seq_idx for n in sg.nodes.values()), default=0)
+            action_id = next(_action_seq)
             actions.append(ScheduleAction(
-                action_id=f"r{rank}_a{next(_action_seq)}", rank=rank, stage=rank, mb_idx=0,
+                id=f"{action_id}", action_id=f"r{rank}_a{action_id}", rank=rank, stage=rank, mb_idx=0,
                 action_type="COMPUTE" if ct != "OPTIMIZER" else "OPTIMIZER",
                 comp_type=ct, template_ref=tid, seq_idx=min_seq,
             ))
@@ -423,8 +428,9 @@ def build_schedule_plan(
         # already added in non-PP path; for PP add it now at the tail
         if not any(a.action_type == "OPTIMIZER" for a in actions):
             min_seq = min((n.seq_idx for n in opt_tmpl.nodes.values()), default=(len(actions)))
+            action_id = next(_action_seq)
             act = ScheduleAction(
-                action_id=f"r{rank}_a{next(_action_seq)}", rank=rank, stage=rank, mb_idx=-1,
+                id=f"{action_id}", action_id=f"r{rank}_a{action_id}", rank=rank, stage=rank, mb_idx=-1,
                 action_type="OPTIMIZER", comp_type="OPTIMIZER",
                 template_ref=f"s{rank}_OPTIMIZER", seq_idx=min_seq,
             )
