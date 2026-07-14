@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
+from torchtitan_npu.simulator.capture.dispatch_capture import OpDispatchCapture
 from torchtitan_npu.simulator.memory.estimator import estimate_static_memory
 from torchtitan_npu.simulator.memory.export import export_memory_plan, memory_plan_to_chrome_trace
 from torchtitan_npu.simulator.memory.records import RawMemoryEvent, TensorRef
@@ -91,6 +92,32 @@ def test_alias_output_has_zero_bytes():
     alias = next(item for item in plan.tensor_lifetimes if item.tensor_id == "alias:2")
     assert alias.kind == "alias"
     assert alias.num_bytes == 0
+
+
+def test_alias_consumer_extends_base_lifetime():
+    x, base, view, out = tref(1), tref(2, 64), tref(3, 64), tref(4)
+    plan = estimate_static_memory([
+        event(0, 10, "aten.relu.default", inputs=[x], outputs=[base]),
+        event(1, 11, "aten.view.default", inputs=[base], outputs=[view]),
+        event(5, 12, "aten.sum.default", inputs=[view], outputs=[out]),
+    ])
+    base_lifetime = next(item for item in plan.tensor_lifetimes if item.tensor_id == "tensor:2")
+    assert base_lifetime.death_seq == 5
+    assert base_lifetime.consumer_ops[-1] == 12
+
+
+def test_parameter_alias_is_not_counted_as_external_input():
+    model = nn.Linear(4, 8, device="meta")
+    capture = OpDispatchCapture()
+    x = torch.randn(2, 4, device="meta")
+    with capture:
+        model(x)
+
+    plan = estimate_static_memory(capture.memory_events(), model_parts=[model])
+    external_bytes = sum(item.num_bytes for item in plan.tensor_lifetimes if item.kind == "external_input")
+    # Only the model input should be external. The transposed weight alias
+    # consumed by addmm must resolve back to parameter_shard and remain zero.
+    assert external_bytes == 2 * 4 * 4
 
 
 @dataclass

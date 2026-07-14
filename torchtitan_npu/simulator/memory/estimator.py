@@ -135,6 +135,15 @@ def _comm_event_by_op(comm_events: Iterable[Any] | None) -> dict[int, Any]:
     return result
 
 
+def _resolve_alias(tensor_id: int, alias_base_by_tensor_id: dict[int, int]) -> int:
+    seen: set[int] = set()
+    current = tensor_id
+    while current in alias_base_by_tensor_id and current not in seen:
+        seen.add(current)
+        current = alias_base_by_tensor_id[current]
+    return current
+
+
 def _classify_output(event: RawMemoryEvent, comm_by_op: dict[int, Any]) -> tuple[str, str]:
     if event.op_id in comm_by_op or event.raw_op_type.startswith("comm."):
         comm = comm_by_op.get(event.op_id)
@@ -210,17 +219,19 @@ def estimate_static_memory(
 
     comm_by_op = _comm_event_by_op(comm_events)
     lifetimes_by_tensor_id: dict[int, TensorLifetime] = {}
+    alias_base_by_tensor_id: dict[int, int] = {}
     alias_lifetimes: list[TensorLifetime] = []
     unclassified_ops: list[dict[str, Any]] = []
 
     for event in events:
         for ref in event.inputs:
-            if ref.tensor_id in param_ids:
+            root_tensor_id = _resolve_alias(ref.tensor_id, alias_base_by_tensor_id)
+            if root_tensor_id in param_ids:
                 continue
-            lifetime = lifetimes_by_tensor_id.get(ref.tensor_id)
+            lifetime = lifetimes_by_tensor_id.get(root_tensor_id)
             if lifetime is None:
                 lifetime = _external_lifetime(ref, event)
-                lifetimes_by_tensor_id[ref.tensor_id] = lifetime
+                lifetimes_by_tensor_id[root_tensor_id] = lifetime
             lifetime.mark_consumer(event.op_id, event.seq_idx, event.phase)
 
         input_ids = {ref.tensor_id for ref in event.inputs}
@@ -232,7 +243,9 @@ def estimate_static_memory(
             if mutation and ref.tensor_id in input_ids:
                 continue
             if alias and event.inputs:
-                alias_lifetimes.append(_alias_lifetime(ref, event, event.inputs[0].tensor_id))
+                base_tensor_id = _resolve_alias(event.inputs[0].tensor_id, alias_base_by_tensor_id)
+                alias_base_by_tensor_id[ref.tensor_id] = base_tensor_id
+                alias_lifetimes.append(_alias_lifetime(ref, event, base_tensor_id))
                 continue
             kind, reason = _classify_output(event, comm_by_op)
             lifetimes_by_tensor_id[ref.tensor_id] = _output_lifetime(ref, event, kind, reason)
