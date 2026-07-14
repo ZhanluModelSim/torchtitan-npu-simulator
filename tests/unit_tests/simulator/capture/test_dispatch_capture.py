@@ -102,6 +102,21 @@ def test_record_synthetic_op_creates_a_node_with_given_raw_op_type():
     assert [o.shape for o in synthetic[0].outputs] == [(2, 4)]
 
 
+def test_capture_keeps_uncollapsed_memory_events_for_liveness():
+    capture = OpDispatchCapture()
+    with capture:
+        x = torch.zeros(4, device="meta")
+        for _ in range(3):
+            x = x.relu()
+    nodes = capture.build_nodes()
+    relu_nodes = [n for n in nodes.values() if "relu" in n.annotations["raw_op_type"]]
+    relu_memory_events = [e for e in capture.memory_events() if "relu" in e.raw_op_type]
+    assert len(relu_nodes) == 1
+    assert relu_nodes[0].annotations["repeat_count"] == 3
+    assert len(relu_memory_events) == 3
+    assert len({e.seq_idx for e in relu_memory_events}) == 3
+
+
 def test_record_synthetic_op_wires_producer_consumer_edges():
     capture = OpDispatchCapture()
     with capture:

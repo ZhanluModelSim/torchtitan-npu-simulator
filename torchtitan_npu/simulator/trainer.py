@@ -27,6 +27,8 @@ from torchtitan_npu.simulator.capture.workload_builder import build_workload_gra
 from torchtitan_npu.simulator.hardware_shims.mhc_converter import apply_mhc_shims
 from torchtitan_npu.simulator.hardware_shims.smla_converter import apply_smla_shims
 from torchtitan_npu.simulator.ir.workload_graph import WorkloadGraph
+from torchtitan_npu.simulator.memory.estimator import estimate_static_memory
+from torchtitan_npu.simulator.memory.export import export_memory_plan
 from torchtitan_npu.simulator.meta_env import patch_device_type_to_meta
 from torchtitan_npu.simulator.moe_force_balance import force_deterministic_seed, force_moe_load_balance
 from torchtitan_npu.simulator.rank_table import build_rank_table
@@ -214,6 +216,20 @@ def run_simulation_step(
     )
     timings["build_workload_graph"] = time.perf_counter() - t8
 
+    t9 = time.perf_counter()
+    memory_plan = estimate_static_memory(
+        capture.memory_events(),
+        model_parts=model_parts,
+        comm_events=comm_recorder.events,
+    )
+    wg.iteration.schedule.annotations["memory_plan"] = memory_plan
+    wg.iteration.schedule.annotations["memory_summary"] = memory_plan.to_summary_dict()
+    for step_graph in wg.step_templates.values():
+        step_graph.param_mem = memory_plan.persistent_param_bytes
+        step_graph.peak_active_mem = memory_plan.peak_active_bytes
+        step_graph.annotations["memory_summary"] = memory_plan.to_summary_dict()
+    timings["estimate_memory"] = time.perf_counter() - t9
+
     timings["total"] = time.perf_counter() - t0
 
     # Print timing table
@@ -225,7 +241,7 @@ def run_simulation_step(
     total = timings["total"]
     for name in ["setup", "forward_backward", "optimizer", "build_nodes",
                  "build_step_graphs", "build_rank_table", "build_schedule_graph",
-                 "build_workload_graph"]:
+                 "build_workload_graph", "estimate_memory"]:
         t = timings[name]
         print(f"{name:<30} {t:>10.2f} {t/total*100:>7.1f}%")
     print("-" * 60)
@@ -233,6 +249,12 @@ def run_simulation_step(
     print("=" * 60)
     print(f"Captured ops: {len(nodes)}, comm events: {len(comm_recorder.events)}")
     print(f"Step templates: {list(step_templates.keys())}")
+    print(
+        "Static memory: "
+        f"persistent_param_bytes={memory_plan.persistent_param_bytes} "
+        f"active_bytes_peak={memory_plan.peak_active_bytes} "
+        f"peak_seq_idx={memory_plan.peak_seq_idx}"
+    )
     print()
 
     return wg
@@ -507,6 +529,11 @@ class SimulationTrainer(Trainer):
             t = time.perf_counter()
             write_text_summary(self.workload_graph, os.path.join(out_dir, "summary.txt"))
             export_timings["text"] = time.perf_counter() - t
+        memory_plan = self.workload_graph.iteration.schedule.annotations.get("memory_plan")
+        if memory_plan is not None and ("json" in formats or "csv" in formats or "text" in formats):
+            t = time.perf_counter()
+            export_memory_plan(memory_plan, out_dir)
+            export_timings["memory"] = time.perf_counter() - t
         if "html" in formats:
             t = time.perf_counter()
             export_html(self.workload_graph, os.path.join(out_dir, "trace.html"))

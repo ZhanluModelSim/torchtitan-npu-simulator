@@ -20,13 +20,15 @@ from torch.utils._python_dispatch import TorchDispatchMode
 
 from torchtitan_npu.simulator.capture.module_path import ModulePathTracker
 from torchtitan_npu.simulator.capture.op_mapping import to_canonical_op_type
-from torchtitan_npu.simulator.capture.tensor_utils import to_tensor_meta
+from torchtitan_npu.simulator.capture.tensor_utils import dtype_to_str, tensor_volume_bytes, to_tensor_meta
 from torchtitan_npu.simulator.cost.op_cost_model import OpCostModel
 from torchtitan_npu.simulator.ir.op_node import OpNode
 from torchtitan_npu.simulator.ir.tensor_meta import TensorMeta
+from torchtitan_npu.simulator.memory.records import RawMemoryEvent, TensorRef
 
 _id_counter = itertools.count()
 _seq_counter = itertools.count()
+_memory_event_counter = itertools.count()
 
 
 def _next_op_id() -> int:
@@ -84,6 +86,19 @@ def _shape_signature(event: _RawEvent) -> tuple:
     )
 
 
+def _to_tensor_ref(tensor: torch.Tensor, name: str) -> TensorRef:
+    dtype = dtype_to_str(tensor.dtype)
+    shape = tuple(int(d) for d in tensor.shape)
+    return TensorRef(
+        tensor_id=id(tensor),
+        name=name,
+        shape=shape,
+        dtype=dtype,
+        device=str(tensor.device),
+        num_bytes=tensor_volume_bytes(shape, dtype),
+    )
+
+
 class OpDispatchCapture(TorchDispatchMode):
     """Records one L0 op stream. Usage::
 
@@ -105,7 +120,8 @@ class OpDispatchCapture(TorchDispatchMode):
         self.module_path_tracker = module_path_tracker
         self.phase_provider = phase_provider
         self._events: list[_RawEvent] = []
-        self._producer: dict[int, str] = {}
+        self._memory_events: list[RawMemoryEvent] = []
+        self._producer: dict[int, int] = {}
         self._last_signature: tuple | None = None
         self._previous_active_capture: OpDispatchCapture | None = None
         self._capture_l0: bool = True  # pass-through when False (MB 1+)
@@ -188,6 +204,22 @@ class OpDispatchCapture(TorchDispatchMode):
             candidate.op_id = op_id
             self._events.append(candidate)
 
+        self._memory_events.append(
+            RawMemoryEvent(
+                event_id=next(_memory_event_counter),
+                op_id=op_id,
+                seq_idx=candidate.seq_idx,
+                raw_op_type=raw_op_type,
+                op_type=op_type,
+                phase=phase,
+                module_path=module_path,
+                inputs=tuple(_to_tensor_ref(t, name=f"in_{i}") for i, t in enumerate(flat_inputs)),
+                outputs=tuple(_to_tensor_ref(t, name=f"out_{i}") for i, t in enumerate(flat_outputs)),
+                pp_stage=pp_stage,
+                pp_mb_idx=pp_mb_idx,
+            )
+        )
+
         # Resolve pending comm links: if any input tensor was produced by a
         # comm op (e.g. recv/unshard), this op is the dst_entry_op consumer.
         for t in flat_inputs:
@@ -195,7 +227,7 @@ class OpDispatchCapture(TorchDispatchMode):
             if tid in self._pending_comm_links:
                 event = self._pending_comm_links.pop(tid)
                 event.dst_entry_op = op_id
-            self._last_signature = signature
+        self._last_signature = signature
 
         for t in flat_outputs:
             self._producer[id(t)] = op_id
@@ -252,6 +284,10 @@ class OpDispatchCapture(TorchDispatchMode):
                 if pred_id in nodes:
                     nodes[pred_id].successors.append(op_id)
         return nodes
+
+    def memory_events(self) -> list[RawMemoryEvent]:
+        """Return the uncollapsed op stream used by static memory planning."""
+        return list(self._memory_events)
 
 
 _active_capture: "OpDispatchCapture | None" = None
