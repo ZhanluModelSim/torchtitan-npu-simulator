@@ -3,7 +3,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""CSV/JSON exports for static memory plans."""
+"""CSV/JSON/trace exports for static memory plans."""
 
 from __future__ import annotations
 
@@ -14,11 +14,109 @@ from dataclasses import asdict
 
 from torchtitan_npu.simulator.memory.records import MemoryPlan
 
+_TRACE_TS_SCALE_US = 1000
+_PHASES = {"forward", "backward", "optimizer"}
+
+
+def _trace_ts(seq_idx: int) -> int:
+    return int(seq_idx) * _TRACE_TS_SCALE_US
+
+
+def _build_phase_spans(plan: MemoryPlan) -> list[dict]:
+    spans: list[dict] = []
+    current_phase = ""
+    start_seq = 0
+    last_seq = 0
+
+    for event in sorted(plan.timeline_events, key=lambda item: (item.seq_idx, item.action)):
+        phase = event.phase if event.phase in _PHASES else ""
+        if phase != current_phase:
+            if current_phase:
+                spans.append({
+                    "name": current_phase,
+                    "ph": "X",
+                    "pid": 1,
+                    "tid": 2,
+                    "ts": _trace_ts(start_seq),
+                    "dur": max(_TRACE_TS_SCALE_US, _trace_ts(last_seq - start_seq + 1)),
+                    "args": {"phase": current_phase},
+                })
+            current_phase = phase
+            start_seq = event.seq_idx
+        last_seq = event.seq_idx
+
+    if current_phase:
+        spans.append({
+            "name": current_phase,
+            "ph": "X",
+            "pid": 1,
+            "tid": 2,
+            "ts": _trace_ts(start_seq),
+            "dur": max(_TRACE_TS_SCALE_US, _trace_ts(last_seq - start_seq + 1)),
+            "args": {"phase": current_phase},
+        })
+    return spans
+
+
+def memory_plan_to_chrome_trace(plan: MemoryPlan) -> dict:
+    """Build a compact Chrome Trace / Perfetto JSON payload.
+
+    The trace intentionally contains only coarse signals:
+    - active tensor bytes as a counter track;
+    - forward/backward/optimizer phase spans;
+    - one peak marker.
+    """
+    trace_events: list[dict] = [
+        {"name": "process_name", "ph": "M", "pid": 1, "tid": 0, "args": {"name": "simulator memory"}},
+        {"name": "thread_name", "ph": "M", "pid": 1, "tid": 1, "args": {"name": "active tensor bytes"}},
+        {"name": "thread_name", "ph": "M", "pid": 1, "tid": 2, "args": {"name": "training phase"}},
+    ]
+    trace_events.extend(_build_phase_spans(plan))
+    for event in sorted(plan.timeline_events, key=lambda item: (item.seq_idx, item.action, item.tensor_id)):
+        trace_events.append({
+            "name": "active_bytes",
+            "ph": "C",
+            "pid": 1,
+            "tid": 1,
+            "ts": _trace_ts(event.seq_idx),
+            "args": {
+                "active_bytes": event.active_bytes_after,
+                "action": event.action,
+                "kind": event.kind,
+                "phase": event.phase,
+            },
+        })
+    trace_events.append({
+        "name": "peak active bytes",
+        "ph": "i",
+        "s": "g",
+        "pid": 1,
+        "tid": 1,
+        "ts": _trace_ts(plan.peak_seq_idx),
+        "args": {
+            "active_bytes_peak": plan.peak_active_bytes,
+            "peak_phase": plan.peak_phase,
+        },
+    })
+    return {
+        "displayTimeUnit": "ms",
+        "traceEvents": trace_events,
+        "metadata": {
+            "metric": plan.metric,
+            "persistent_param_bytes": plan.persistent_param_bytes,
+            "active_bytes_peak": plan.peak_active_bytes,
+            "peak_seq_idx": plan.peak_seq_idx,
+        },
+    }
+
 
 def export_memory_plan(plan: MemoryPlan, out_dir: str) -> None:
     os.makedirs(out_dir, exist_ok=True)
     with open(os.path.join(out_dir, "memory_summary.json"), "w", encoding="utf-8") as f:
         json.dump(plan.to_summary_dict(), f, indent=2, ensure_ascii=False)
+
+    with open(os.path.join(out_dir, "memory_trace.json"), "w", encoding="utf-8") as f:
+        json.dump(memory_plan_to_chrome_trace(plan), f, indent=2, ensure_ascii=False)
 
     with open(os.path.join(out_dir, "memory_events.csv"), "w", newline="", encoding="utf-8") as f:
         fieldnames = [

@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 
 from torchtitan_npu.simulator.memory.estimator import estimate_static_memory
+from torchtitan_npu.simulator.memory.export import export_memory_plan, memory_plan_to_chrome_trace
 from torchtitan_npu.simulator.memory.records import RawMemoryEvent, TensorRef
 
 
@@ -115,3 +116,22 @@ def test_parameter_bytes_are_persistent_and_counted():
     plan = estimate_static_memory([], model_parts=[model])
     assert plan.persistent_param_bytes == 4 * 2 * 4
     assert plan.peak_active_bytes == plan.persistent_param_bytes
+
+
+def test_memory_plan_exports_compact_chrome_trace(tmp_path):
+    a, b, grad = tref(1, 32), tref(2, 32), tref(3, 32)
+    plan = estimate_static_memory([
+        event(0, 10, "aten.relu.default", inputs=[a], outputs=[b], phase="forward"),
+        event(5, 20, "aten.relu_backward.default", inputs=[b], outputs=[grad], phase="backward"),
+    ])
+
+    trace = memory_plan_to_chrome_trace(plan)
+    events = trace["traceEvents"]
+    assert trace["displayTimeUnit"] == "ms"
+    assert any(item["ph"] == "C" and item["name"] == "active_bytes" for item in events)
+    assert any(item["ph"] == "X" and item["name"] == "forward" for item in events)
+    assert any(item["ph"] == "X" and item["name"] == "backward" for item in events)
+    assert any(item["ph"] == "i" and item["name"] == "peak active bytes" for item in events)
+
+    export_memory_plan(plan, str(tmp_path))
+    assert (tmp_path / "memory_trace.json").is_file()
