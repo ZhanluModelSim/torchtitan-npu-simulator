@@ -163,6 +163,14 @@ class TrainingConfig(_BaseTrainingConfig):
     mtp_loss_weight: float = 0.3
     """Weight of the Multi-Token-Prediction loss term."""
 
+    allow_hf32: bool = True
+    """
+    Enable HF32 for the NPU matmul/conv/aclnn backends (sets
+    torch_npu.npu.{matmul,conv,aclnn}.allow_hf32), the NPU analogue of
+    torch.backends.cuda.matmul.allow_tf32. Applied post-parse in
+    torchtitan_npu.entry.main().
+    """
+
 
 @dataclass(kw_only=True, slots=True)
 class ProfilingConfig(_BaseProfilingConfig):

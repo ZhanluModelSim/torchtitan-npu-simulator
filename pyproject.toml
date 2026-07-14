@@ -125,6 +125,7 @@ fixable = ["ALL"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["torchtitan_npu", "tests"]
+known-third-party = ["torchtitan"]
 
 [tool.ruff.format]
 quote-style = "double"
