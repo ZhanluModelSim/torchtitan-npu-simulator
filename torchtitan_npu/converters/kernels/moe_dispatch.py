@@ -45,10 +45,11 @@ class _LocalExpertInputs(NamedTuple):
     dim: int
 
 
-def _flatten_moe_input(x: torch.Tensor) -> tuple[torch.Tensor, int, int, int, int]:
-    bs, slen, dim = x.shape
-    x = x.view(-1, dim)
-    return x, bs, slen, dim, x.shape[0]
+def _flatten_moe_input(x: torch.Tensor) -> tuple[torch.Tensor, torch.Size, int, int]:
+    original_shape = x.shape
+    dim = x.shape[-1]
+    x = x.reshape(-1, dim)
+    return x, original_shape, dim, x.shape[0]
 
 
 def _select_standard_moe_experts(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -95,7 +96,7 @@ def _run_local_experts(self, inputs: _LocalExpertInputs) -> torch.Tensor:
 def _npu_moe_forward(self, x: torch.Tensor) -> torch.Tensor:
     if isinstance(x, DTensor):
         x = x.to_local(grad_placements=(Partial(),))
-    x, bs, slen, dim, total_tokens = _flatten_moe_input(x)
+    x, original_shape, dim, total_tokens = _flatten_moe_input(x)
     top_scores, selected_experts_indices, num_tokens_per_expert = _select_standard_moe_experts(self, x)
     out = _shared_expert_output(self, x)
     _record_tokens_per_expert(self, num_tokens_per_expert)
@@ -103,7 +104,7 @@ def _npu_moe_forward(self, x: torch.Tensor) -> torch.Tensor:
         self,
         _LocalExpertInputs(x, top_scores, selected_experts_indices, num_tokens_per_expert, total_tokens, dim),
     )
-    return (out + expert_out).reshape(bs, slen, dim)
+    return (out + expert_out).reshape(original_shape)
 
 
 def _adopt_module_state(wrapper_type: type[nn.Module], source: nn.Module) -> nn.Module:
@@ -124,7 +125,7 @@ class NpuDeepSeekV4MoE(DeepSeekV4MoE):
 
 
 def _npu_moe_forward_for_dsv4(self, x, input_ids):
-    x, bs, slen, dim, total_tokens = _flatten_moe_input(x)
+    x, original_shape, dim, total_tokens = _flatten_moe_input(x)
     input_ids_flat = input_ids.flatten() if input_ids is not None else None
     bias = getattr(self, "expert_bias", None)
     top_scores, selected_experts_indices, num_tokens_per_expert = self.router(x, input_ids_flat, bias)
@@ -135,7 +136,7 @@ def _npu_moe_forward_for_dsv4(self, x, input_ids):
         _LocalExpertInputs(x, top_scores, selected_experts_indices, num_tokens_per_expert, total_tokens, dim),
     )
     out = _shared_expert_output(self, x)
-    return (out + expert_out).reshape(bs, slen, dim)
+    return (out + expert_out).reshape(original_shape)
 
 
 class NpuMoeDispatchConverter(ModelCustomConverter):

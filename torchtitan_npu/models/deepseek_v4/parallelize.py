@@ -249,6 +249,20 @@ def _disable_lm_head_cast_forward_inputs(model: nn.Module) -> None:
     )
 
 
+def _validate_deepseek_v4_parallelism(model_args, parallel_dims: ParallelDims) -> None:
+    if getattr(model_args, "use_global_tnd", False):
+        if parallel_dims.pp_enabled:
+            raise NotImplementedError(
+                "DeepSeekV4 global TND does not support PP yet. "
+                "Please disable npu_smla or MHC converters when PP is enabled."
+            )
+        if parallel_dims.cp_enabled:
+            raise NotImplementedError(
+                "DeepSeekV4 global TND does not support CP yet. "
+                "Please disable npu_smla or MHC converters when CP is enabled."
+            )
+
+
 def parallelize_deepseek_v4(
     model: nn.Module,
     *,
@@ -270,6 +284,7 @@ def parallelize_deepseek_v4(
 
     # patch the indexer loss tracking with distributed version to get the synchronized indexer loss metric
     model_args = cast("Any", model).model_args
+    _validate_deepseek_v4_parallelism(model_args, parallel_dims)
     apply_distributed_indexer_loss_tracking(parallel_dims, model_args.n_layers, model_args.compress_ratios)
 
     if parallel_dims.tp_enabled:
@@ -444,18 +459,23 @@ def apply_non_moe_tp(
     tok_embeddings = getattr(model, "tok_embeddings", None)
     norm = getattr(model, "norm", None)
     output = getattr(model, "output", None)
+    model_args = cast("Any", model).model_args
+    use_global_tnd = getattr(model_args, "use_global_tnd", False)
+    sequence_shard = Shard(0) if use_global_tnd else Shard(1)
+    attention_head_shard = Shard(1) if use_global_tnd else Shard(2)
+    sequence_parallel = SequenceParallel(sequence_dim=0) if use_global_tnd else SequenceParallel()
 
     root_parallelize_plan: dict[str, Any] = {}
     if tok_embeddings is not None:
         root_parallelize_plan["tok_embeddings"] = rowwise_parallel(
             input_layouts=Replicate(),
-            output_layouts=Shard(1),
+            output_layouts=sequence_shard,
         )
     if norm is not None:
-        root_parallelize_plan["norm"] = SequenceParallel()
+        root_parallelize_plan["norm"] = sequence_parallel
     if output is not None:
         root_parallelize_plan["output"] = colwise_parallel(
-            input_layouts=Shard(1),
+            input_layouts=sequence_shard,
             output_layouts=Shard(-1) if loss_parallel else Replicate(),
             use_local_output=not loss_parallel,
         )
@@ -469,37 +489,37 @@ def apply_non_moe_tp(
 
     attention_kernel_plan_ratio1 = PrepareModuleInputOutputWithBwdAllReduce(
         bwd_allreduce_inputs=(False, True, False, False, False),
-        input_layouts=(Shard(2), Replicate(), Shard(0), None, None),
-        desired_input_layouts=(Shard(2), Replicate(), Shard(0), None, None),
+        input_layouts=(attention_head_shard, Replicate(), Shard(0), None, None),
+        desired_input_layouts=(attention_head_shard, Replicate(), Shard(0), None, None),
         use_local_input=True,
-        output_layouts=(Shard(2)),
-        desired_output_layouts=(Shard(2)),
+        output_layouts=(attention_head_shard),
+        desired_output_layouts=(attention_head_shard),
         use_local_output=False,
     )
 
     attention_kernel_plan_ratio4 = PrepareModuleInputOutputWithBwdAllReduce(
         bwd_allreduce_inputs=(False, True, False, True, False),
-        input_layouts=(Shard(2), Replicate(), Shard(0), Replicate(), Replicate()),
+        input_layouts=(attention_head_shard, Replicate(), Shard(0), Replicate(), Replicate()),
         desired_input_layouts=(
-            Shard(2),
+            attention_head_shard,
             Replicate(),
             Shard(0),
             Replicate(),
             Replicate(),
         ),
         use_local_input=True,
-        output_layouts=(Shard(2)),
-        desired_output_layouts=(Shard(2)),
+        output_layouts=(attention_head_shard),
+        desired_output_layouts=(attention_head_shard),
         use_local_output=False,
     )
 
     attention_kernel_plan_ratio128 = PrepareModuleInputOutputWithBwdAllReduce(
         bwd_allreduce_inputs=(False, True, False, True, False),
-        input_layouts=(Shard(2), Replicate(), Shard(0), Replicate(), None),
-        desired_input_layouts=(Shard(2), Replicate(), Shard(0), Replicate(), None),
+        input_layouts=(attention_head_shard, Replicate(), Shard(0), Replicate(), None),
+        desired_input_layouts=(attention_head_shard, Replicate(), Shard(0), Replicate(), None),
         use_local_input=True,
-        output_layouts=(Shard(2)),
-        desired_output_layouts=(Shard(2)),
+        output_layouts=(attention_head_shard),
+        desired_output_layouts=(attention_head_shard),
         use_local_output=False,
     )
 
@@ -561,20 +581,20 @@ def apply_non_moe_tp(
     )
 
     hc_pre_plan = prepare_module_input_output(
-        input_layouts=(Shard(1), Replicate(), Replicate(), Replicate()),
+        input_layouts=(sequence_shard, Replicate(), Replicate(), Replicate()),
         desired_input_layouts=(Replicate(), Replicate(), Replicate(), Replicate()),
         use_local_input=True,
         output_layouts=(Replicate(), Replicate(), Replicate()),
-        desired_output_layouts=(Shard(1), Shard(1), Shard(1)),
+        desired_output_layouts=(sequence_shard, sequence_shard, sequence_shard),
         use_local_output=False,
     )
 
     hc_post_plan = prepare_module_input_output(
-        input_layouts=(Shard(1), Shard(1), Shard(1), Shard(1)),
+        input_layouts=(sequence_shard, sequence_shard, sequence_shard, sequence_shard),
         desired_input_layouts=(Replicate(), Replicate(), Replicate(), Replicate()),
         use_local_input=True,
         output_layouts=(Replicate()),
-        desired_output_layouts=(Shard(1)),
+        desired_output_layouts=(sequence_shard),
     )
 
     hc_pre_sinkhon_plan = prepare_module_input(
@@ -603,7 +623,7 @@ def apply_non_moe_tp(
 
     li_loss_plan = prepare_module_input(
         input_layouts=(
-            Shard(1),
+            sequence_shard,
             Replicate(),
             Replicate(),
             Shard(0),
@@ -631,7 +651,6 @@ def apply_non_moe_tp(
         use_local_output=True,
     )
 
-    model_args = cast("Any", model).model_args
     use_attention_masks = _model_uses_attention_masks(model_args)
 
     # Apply tensor + sequence parallelism to every transformer block
@@ -699,9 +718,9 @@ def apply_non_moe_tp(
             attention_kernel_plan = attention_kernel_plan_ratio128
 
         layer_plan: dict[str, ParallelStyle] = {
-            "attention_norm": SequenceParallel(),
+            "attention_norm": SequenceParallel(sequence_dim=0) if use_global_tnd else SequenceParallel(),
             "attention": prepare_module_input(
-                input_layouts=(Shard(1), Replicate(), None, None),
+                input_layouts=(sequence_shard, Replicate(), None, None),
                 desired_input_layouts=(Replicate(), Replicate(), None, None),
             ),
             "attention.inner_attention.sparse_attn.get_window_topk_idxs": get_window_topk_idxs_plan,
@@ -717,7 +736,7 @@ def apply_non_moe_tp(
             "attention.post_attention.wo_a": colwise_parallel(use_local_output=False),
             "attention.post_attention.wo_b": rowwise_parallel(
                 input_layouts=Shard(-1),
-                output_layouts=Shard(1),
+                output_layouts=sequence_shard,
                 use_local_output=False,
             ),
             "attention.inner_attention.sparse_attn": attention_kernel_plan,
@@ -725,7 +744,7 @@ def apply_non_moe_tp(
             "hc_post": hc_post_plan,
             "hc_pre": hc_pre_plan,
             "hc_pre.torch_hc_split_sinkhorn": hc_pre_sinkhon_plan,
-            "ffn_norm": SequenceParallel(),
+            "ffn_norm": SequenceParallel(sequence_dim=0) if use_global_tnd else SequenceParallel(),
         }
         if getattr(transformer_block, "is_last_layer", False):
             # hc_head runs at the end of this block's forward (input is the
@@ -788,11 +807,11 @@ def apply_non_moe_tp(
             layer_plan.update(
                 {
                     "feed_forward": prepare_module_input(
-                        input_layouts=(Shard(1),),
+                        input_layouts=(sequence_shard,),
                         desired_input_layouts=(Replicate(),),
                     ),
                     "feed_forward.w1": colwise_parallel(),
-                    "feed_forward.w2": safe_rowwise_parallel(output_layouts=Shard(1)),
+                    "feed_forward.w2": safe_rowwise_parallel(output_layouts=sequence_shard),
                     "feed_forward.w3": colwise_parallel(),
                 }
             )
@@ -833,6 +852,10 @@ def apply_moe_ep_tp(
         Current status: tp_mesh={tp_mesh}, ep_mesh={ep_mesh}
         """
 
+    model_args = cast("Any", model).model_args
+    use_global_tnd = getattr(model_args, "use_global_tnd", False)
+    sequence_shard = Shard(0) if use_global_tnd else Shard(1)
+
     # pyrefly: ignore [not-callable]
     for transformer_block in model.layers.values():
         # pyrefly: ignore [missing-attribute]
@@ -843,11 +866,11 @@ def apply_moe_ep_tp(
             moe_layer_plan = {
                 # input / output sharding on the seqlen dim
                 "moe": PrepareModuleInputOutput(
-                    input_layouts=(Shard(1), Replicate()),
-                    desired_input_layouts=(Shard(1), Shard(1)),
+                    input_layouts=(sequence_shard, Replicate()),
+                    desired_input_layouts=(sequence_shard, sequence_shard),
                     use_local_input=True,
-                    output_layouts=(Shard(1),),
-                    desired_output_layouts=(Shard(1),),
+                    output_layouts=(sequence_shard,),
+                    desired_output_layouts=(sequence_shard,),
                 ),
                 "moe.router.gate": SequenceParallel(sequence_dim=0, use_local_output=True),
             }
@@ -905,6 +928,7 @@ def apply_moe_ep_tp(
 def _compile_moe_transformer_block(
     transformer_block: nn.Module,
     compile_config,
+    use_global_tnd: bool = False,
 ) -> nn.Module:
     # MoE layers contain FSDP(GroupedExperts) hooks. Compile around those hooks so
     # activation checkpointing does not fall the whole graph back to eager.
@@ -916,10 +940,11 @@ def _compile_moe_transformer_block(
     for attr_name, submod in block.named_children():
         if getattr(block, attr_name) != getattr(transformer_block, attr_name):
             raise RuntimeError(f"Checkpoint-wrapped block child {attr_name!r} is not exposed on wrapper")
-        if attr_name in {"hc_pre"}:
+        if attr_name == "hc_pre" or (use_global_tnd and attr_name == "hc_post"):
             continue
         if isinstance(submod, Attention):
-            _compile_children_except(submod, {"inner_attention"}, compile_config)
+            skip_names = {"inner_attention", "pre_attention"} if use_global_tnd else {"inner_attention"}
+            _compile_children_except(submod, skip_names, compile_config)
         elif isinstance(submod, DeepSeekV4MoE):
             _compile_children_except(submod, {"experts"}, compile_config)
         elif isinstance(submod, NPURMSNorm):
@@ -1004,12 +1029,17 @@ def apply_compile(model: nn.Module, compile_config, ep_enabled: bool):
     # pyrefly: ignore [missing-attribute]
     torch._C._dynamo.eval_frame._set_lru_cache(False)
 
+    use_global_tnd = bool(getattr(cast("Any", model).model_args, "use_global_tnd", False))
     for (
         layer_id,
         transformer_block,
     ) in model.layers.named_children():  # pyrefly: ignore [missing-attribute]
         if transformer_block.moe_enabled:
-            transformer_block = _compile_moe_transformer_block(transformer_block, compile_config)
+            transformer_block = _compile_moe_transformer_block(
+                transformer_block,
+                compile_config,
+                use_global_tnd=use_global_tnd,
+            )
         else:
             transformer_block = torch.compile(
                 transformer_block,
@@ -1043,7 +1073,7 @@ def apply_distributed_indexer_loss_tracking(
     """
 
     # Pre-compute which layer indices have an indexer (compress_ratio == 4).
-    # This is static model structure info — same on every rank — so it can be
+    # This is static model structure info, same on every rank, so it can be
     # used as a safe early-return guard and as an index into the values tensor
     # without introducing any cross-rank divergence.
     valid_indices = [i for i in range(num_layers) if i < len(compress_ratios) and compress_ratios[i] == 4]
@@ -1057,7 +1087,7 @@ def apply_distributed_indexer_loss_tracking(
         return torch.zeros(num_layers, device=device)
 
     def distributed_track_dsa_indexer_metrics(total_acc_steps: int):
-        # valid_indices is derived from model config — identical on all ranks,
+        # valid_indices is derived from model config, identical on all ranks,
         # so this early return fires uniformly and cannot cause a hang.
         if not valid_indices:
             DSAIndexerLossLoggingHelper.clean_loss_in_tracker()

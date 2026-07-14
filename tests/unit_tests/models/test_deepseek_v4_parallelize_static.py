@@ -19,6 +19,7 @@ class DeepSeekV4ParallelizeStaticTest(unittest.TestCase):
         smla_source = (
             REPO_ROOT / "torchtitan_npu" / "converters" / "kernels" / "npu_smla.py"
         ).read_text(encoding="utf-8")
+        tnd_source = (DSV4_DIR / "tnd.py").read_text(encoding="utf-8")
 
         self.assertIn("if parallel_dims.tp_enabled:", parallelize_source)
         self.assertIn("apply_non_moe_tp(", parallelize_source)
@@ -38,11 +39,16 @@ class DeepSeekV4ParallelizeStaticTest(unittest.TestCase):
             '"attention.inner_attention.li_compute": li_compute_parallel_plan',
             parallelize_source,
         )
-        self.assertIn("VarlenAttention.Config()", smla_source)
-        self.assertIn("return _SMLALayerView(self)", smla_source)
+        self.assertIn("VarlenAttention.Config()", tnd_source)
+        self.assertIn("SimpleNamespace(inner_attention=inner_attention", tnd_source)
         self.assertNotIn("__class__.__name__", parallelize_source)
         self.assertNotIn("_smla_metadata_cache", parallelize_source)
         self.assertNotIn("._get_fsdp_state()", parallelize_source)
+        self.assertIn("num_heads_q = query.shape[-2]", smla_source)
+        self.assertIn("ctx.num_heads_q = num_heads_q", smla_source)
+        self.assertIn("indexer_q.shape[-2]", smla_source)
+        self.assertNotIn('"num_heads_q": model_args.n_heads', smla_source)
+
 
 if __name__ == "__main__":
     unittest.main()

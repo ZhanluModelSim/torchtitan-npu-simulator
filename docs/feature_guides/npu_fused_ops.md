@@ -66,7 +66,10 @@ get_model_converter_config("npu_dsa")
 ## SMLA (Sparse Flash MLA)
 
 `npu_smla` 面向 DeepSeek-V4 的稀疏 MLA 注意力路径。该 ModelConverter 会根据硬件类型选择实现：
-在 A5 上替换为 `torch_npu` 提供的 SMLA 融合算子路径，并将 SMLA 所需的 attention masks 接入 torchtitan 原生 `post_dataloading_process`；在非 A5 场景下继续使用兼容原有 DeepSeek-V4 sparse attention / LI / LI loss 的 NPU 实现。
+在 A5 上通过 [`cann_ops_transformer`](https://gitcode.com/cann/ops-transformer)
+提供的 `sparse_flash_mla`、`lightning_indexer` 及对应 metadata/反向算子执行；
+在非 A5 场景下继续使用兼容原有 DeepSeek-V4 sparse attention / LI / LI loss 的 NPU 实现。
+A5 路径要求 `cann_ops_transformer` 能够被 Python 导入，缺失时 converter 会直接报错并指出所缺依赖。
 
 **配置示例：**
 ```python
@@ -94,7 +97,7 @@ logging.getLogger("torchtitan_npu.converters.kernels.npu_smla").setLevel(
 
 ## MHCPre
 
-`npu_mhc_pre` 面向 DeepSeek-V4 的 MHC pre-processing 路径，将模型中的 `HcPre` 模块替换为 NPU 亲和实现。在 A5 上使用 `torch_npu.npu_hc_pre` 及其反向融合算子；在非 A5 场景下使用已有 Triton 实现。DeepSeek-V4 默认配置中已启用该 converter。
+`npu_mhc_pre` 面向 DeepSeek-V4 的 MHC pre-processing 路径，将模型中的 `HcPre` 模块替换为 NPU 亲和实现。在 A5 上使用 `cann_ops_transformer.ops.mhc_pre_sinkhorn` 及其反向融合算子；在非 A5 场景下使用已有 Triton 实现。DeepSeek-V4 默认配置中已启用该 converter。
 
 **配置示例**：
 ```python
@@ -107,7 +110,7 @@ get_model_converter_config("npu_mhc_pre")
 
 ## MHCPost
 
-`npu_mhc_post` 面向 DeepSeek-V4 的 MHC post-processing 路径，将模型中的 `HcPost` 模块替换为 NPU 亲和实现。在 A5 上使用 `torch_npu.npu_hc_post` 及其反向融合算子；在非 A5 场景下会走已有 Triton 实现并替换 `HcHead`。
+`npu_mhc_post` 面向 DeepSeek-V4 的 MHC post-processing 路径，将模型中的 `HcPost` 模块替换为 NPU 亲和实现。在 A5 上使用 `cann_ops_transformer.ops.mhc_post` 及其反向融合算子；在非 A5 场景下会走已有 Triton 实现并替换 `HcHead`。
 
 该 converter 当前未在 DeepSeek-V4 默认 `config_registry.py` 中打开，主要是出于性能考虑：A5 上建议按需打开以使用 MHC post 融合算子；A3 上建议保持关闭，继续使用默认模型路径，避免 converter 替换带来的额外开销或性能退化。
 

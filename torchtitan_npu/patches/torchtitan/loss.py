@@ -19,13 +19,41 @@ fields is not in use.
 """
 
 import functools
+from typing import Any, cast
 
 import torch
 from torchtitan.components import loss as loss_utils
-from torchtitan.components.loss import cross_entropy_loss
+from torchtitan.components.loss import IGNORE_INDEX, cross_entropy_loss
 from torchtitan.tools.logging import logger
 
 from ._trainer_config_stash import get_trainer_config
+
+
+def _prepare_labels_for_compact_logits(preds: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    labels = labels.reshape(-1)
+    if labels.numel() == preds.shape[0]:
+        return labels
+
+    compact_labels = labels[labels.ne(IGNORE_INDEX)]
+    if compact_labels.numel() != preds.shape[0]:
+        raise RuntimeError(
+            "Compact logits loss expects labels to match flattened logits: "
+            f"got logits T={preds.shape[0]}, labels={labels.numel()}, "
+            f"non-ignored labels={compact_labels.numel()}."
+        )
+    return compact_labels
+
+
+def compact_cross_entropy_loss(preds: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    if preds.dim() == 2:
+        labels = _prepare_labels_for_compact_logits(preds, labels)
+        return torch.nn.functional.cross_entropy(
+            preds.float(),
+            labels,
+            reduction="sum",
+            ignore_index=IGNORE_INDEX,
+        )
+    return cross_entropy_loss(preds, labels)
 
 
 def multi_token_cross_entropy_loss(
@@ -34,6 +62,22 @@ def multi_token_cross_entropy_loss(
     num_mtp_modules: int,
     mtp_loss_weight: float,
 ) -> torch.Tensor:
+    if preds[0].dim() == 2:
+        if labels.dim() != 2 or labels.shape[0] < len(preds):
+            raise RuntimeError(
+                "Compact logits MTP loss expects labels with shape [num_outputs, T], "
+                f"got labels={tuple(labels.shape)} for {len(preds)} prediction tensor(s)."
+            )
+        main_loss = compact_cross_entropy_loss(preds[0], labels[0])
+        mtp_loss = 0
+        for label_offset, pred in enumerate(  # pyrefly: ignore [bad-assignment]
+            preds[1:], 1
+        ):
+            loss = compact_cross_entropy_loss(pred, labels[label_offset])
+            loss = loss / num_mtp_modules
+            mtp_loss = mtp_loss + loss
+        return main_loss + mtp_loss * mtp_loss_weight
+
     seq_len = preds[0].shape[1]
     main_loss = cross_entropy_loss(preds[0], labels[:, :seq_len])
     mtp_loss = 0
@@ -66,7 +110,7 @@ def mtp_build_cross_entropy_loss(compile_config, **kwargs):
         )
         logger.info("Applying loss = main_loss + mtp_loss to the model")
     else:
-        loss_fn = cross_entropy_loss
+        loss_fn = compact_cross_entropy_loss
 
     if compile_config.enable and "loss" in compile_config.components:
         logger.info("Compiling the loss function with torch.compile")
@@ -74,4 +118,4 @@ def mtp_build_cross_entropy_loss(compile_config, **kwargs):
     return loss_fn
 
 
-loss_utils.build_cross_entropy_loss = mtp_build_cross_entropy_loss
+loss_utils.build_cross_entropy_loss = cast("Any", mtp_build_cross_entropy_loss)

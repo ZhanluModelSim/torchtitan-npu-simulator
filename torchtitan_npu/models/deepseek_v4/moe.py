@@ -323,8 +323,9 @@ class MoE(Module):
         Returns:
             torch.Tensor: Output tensor with shape ``(bs, slen, dim)``.
         """
-        bs, slen, dim = x.shape
-        x_flat = x.view(-1, dim)
+        original_shape = x.shape
+        dim = x.shape[-1]
+        x_flat = x.reshape(-1, dim)
         input_ids_flat = input_ids.flatten()
         bias = getattr(self, "expert_bias", None)
         top_scores, selected_experts_indices, num_tokens_per_expert = self.router(
@@ -370,9 +371,9 @@ class MoE(Module):
         )
 
         if shared_output is None:
-            output = out_experts.reshape(bs, slen, dim)
+            output = out_experts.reshape(original_shape)
         else:
-            output = (shared_output + out_experts).reshape(bs, slen, dim)
+            output = (shared_output + out_experts).reshape(original_shape)
 
         return output
 

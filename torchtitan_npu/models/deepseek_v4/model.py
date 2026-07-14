@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 from __future__ import annotations
 
+import importlib
 import logging
 import math
 from dataclasses import dataclass, field
@@ -28,8 +29,10 @@ from torchtitan_npu.models.common.dsa_indexer_loss import (
     DSAIndexerLossAutoScaler,
     DSAIndexerLossLoggingHelper,
 )
+from torchtitan_npu.tools.device import get_npu_device_type
 
 from .moe import MoE, MoEArgs
+from .tnd import smla_attn_type, smla_get_attention_masks, smla_layers
 
 if TYPE_CHECKING:
     from torchtitan.models.common.attention import AttentionMasksType
@@ -45,26 +48,26 @@ def apply_rotary_emb(
     inverse: bool = False,
     positions: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Apply rotary positional embeddings, delegating to the upstream kernel.
-
-    Args:
-        x: rope features, ``(B, S, H, D)`` or ``(B, S, D)``.
-        freqs_cis: complex rope cache ``(max_seqlen, D // 2)``.
-        inverse: if True, rotate by the conjugate (inverse rotation).
-        positions: absolute position indices for CP; ``None`` uses ``[0:S]``.
-
-    Returns:
-        torch.Tensor: Tensor with rotary embeddings applied.
-    """
-    squeezed = x.ndim == 3
-    if squeezed:
-        x = x.unsqueeze(2)  # (B, S, D) -> (B, S, 1, D); upstream assumes a 4D layout
+    """Apply RoPE while presenting TND tensors as fake-batch BSND to the shared helper."""
     if inverse:
         freqs_cis = freqs_cis.conj()
-    y = apply_rotary_emb_single_complex(x, freqs_cis, positions)
-    if squeezed:
-        y = y.squeeze(2)
-    return y
+
+    if positions is not None:
+        position_index = positions.squeeze(0) if positions.dim() > 1 and positions.size(0) == 1 else positions
+        if position_index.dim() == 1 and x.size(0) == position_index.numel():
+            positions = position_index.unsqueeze(0)
+            if x.ndim == 3:
+                return apply_rotary_emb_single_complex(x.unsqueeze(0), freqs_cis, positions).squeeze(0)
+            if x.ndim == 2:
+                return (
+                    apply_rotary_emb_single_complex(x.unsqueeze(0).unsqueeze(2), freqs_cis, positions)
+                    .squeeze(0)
+                    .squeeze(1)
+                )
+
+    if x.ndim == 3:
+        return apply_rotary_emb_single_complex(x.unsqueeze(2), freqs_cis, positions).squeeze(2)
+    return apply_rotary_emb_single_complex(x, freqs_cis, positions)
 
 
 def hadamard_transform_ref(x, hadamard_mat, scale=1.0):
@@ -91,6 +94,32 @@ def rotate_activation(x: torch.Tensor, hadamard_mat: torch.Tensor) -> torch.Tens
     return hadamard_transform_ref(x, hadamard_mat, scale=hidden_size**-0.5)
 
 
+def _tnd_full_block_starts_from_positions(positions: torch.Tensor, ratio: int) -> torch.Tensor:
+    """Return TND token offsets where a full compressor block stays inside one request."""
+    if positions.dim() == 1:
+        positions = positions.unsqueeze(0)
+    if positions.dim() != 2:
+        raise ValueError("DeepSeek-V4 TND compressor positions must be a [B, S] tensor.")
+
+    flat_positions = positions.reshape(-1)
+    if flat_positions.numel() == 0:
+        raise ValueError("DeepSeek-V4 TND compressor positions contain no tokens.")
+    flat_valid = flat_positions.ge(0)
+    token_indices = torch.arange(flat_positions.numel(), device=positions.device)
+    end_indices = token_indices + ratio - 1
+    end_in_range = end_indices < flat_positions.numel()
+    clamped_end_indices = end_indices.clamp_max(flat_positions.numel() - 1)
+    end_positions = flat_positions[clamped_end_indices]
+    block_starts = (
+        flat_valid
+        & flat_positions.remainder(ratio).eq(0)
+        & end_in_range
+        & flat_valid[clamped_end_indices]
+        & end_positions.eq(flat_positions + ratio - 1)
+    )
+    return torch.nonzero(block_starts, as_tuple=False).flatten()
+
+
 class Compressor(Module):
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
@@ -109,6 +138,7 @@ class Compressor(Module):
         self.compress_ratio = config.compress_ratio
         self.overlap = config.compress_ratio == 4
         self.rotate = config.rotate
+        self.use_tnd_metadata = False
         coff = 1 + self.overlap
         self.ape = nn.Parameter(torch.empty(config.compress_ratio, coff * self.head_dim, dtype=torch.float32))
         # wkv and wgate must stay in fp32: ``Compressor.forward`` upcasts ``x``
@@ -139,7 +169,7 @@ class Compressor(Module):
         new_tensor[:, 1:, :ratio] = tensor[:, :-1, :, :d]
         return new_tensor
 
-    def forward(
+    def _forward_bsnd(
         self,
         x: torch.Tensor,
         freqs_cis: torch.Tensor,
@@ -171,6 +201,67 @@ class Compressor(Module):
         kv_rot = apply_rotary_emb(kv[..., -self.rope_head_dim:], freqs_cis, positions=comp_positions)  # fmt: skip
         kv = torch.cat([kv[..., : -self.rope_head_dim], kv_rot], dim=-1)
         return kv
+
+    def _forward_tnd(
+        self,
+        x: torch.Tensor,
+        freqs_cis: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> torch.Tensor:
+        ratio, overlap = self.compress_ratio, self.overlap
+        dtype = x.dtype
+        flat_x = x.reshape(-1, x.shape[-1])
+        flat_positions = positions.reshape(-1)
+        block_starts = _tnd_full_block_starts_from_positions(positions, ratio)
+
+        block_offsets = torch.arange(ratio, device=x.device)
+        block_indices = block_starts.unsqueeze(1) + block_offsets.unsqueeze(0)
+        x_blocks = flat_x[block_indices].float()
+        kv = self.wkv(x_blocks)
+        score = self.wgate(x_blocks) + self.ape
+
+        if overlap:
+            overlap_start = self.head_dim
+            overlap_kv = kv.new_zeros((kv.shape[0], 2 * ratio, self.head_dim))
+            overlap_score = score.new_full((score.shape[0], 2 * ratio, self.head_dim), float("-inf"))
+            overlap_kv[:, ratio:] = kv[..., overlap_start:]
+            overlap_score[:, ratio:] = score[..., overlap_start:]
+            overlap_kv[1:, :ratio] = kv[:-1, :, : self.head_dim]
+            overlap_score[1:, :ratio] = score[:-1, :, : self.head_dim]
+
+            has_prev_block = flat_positions[block_starts].ge(ratio).view(-1, 1, 1)
+            overlap_kv[:, :ratio] = torch.where(
+                has_prev_block,
+                overlap_kv[:, :ratio],
+                overlap_kv[:, :ratio].new_zeros(overlap_kv[:, :ratio].shape),
+            )
+            overlap_score[:, :ratio] = torch.where(
+                has_prev_block,
+                overlap_score[:, :ratio],
+                overlap_score[:, :ratio].new_full(overlap_score[:, :ratio].shape, float("-inf")),
+            )
+            kv, score = overlap_kv, overlap_score
+
+        kv = (kv * score.softmax(dim=1)).sum(dim=1)
+        kv = self.norm(kv.to(dtype))
+        rope_start = -self.rope_head_dim
+        comp_positions = flat_positions[block_starts].unsqueeze(0)
+        kv_rot = apply_rotary_emb(
+            kv.unsqueeze(0)[..., rope_start:],
+            freqs_cis,
+            positions=comp_positions,
+        ).squeeze(0)
+        return torch.cat([kv[..., :rope_start], kv_rot], dim=-1)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        freqs_cis: torch.Tensor,
+        positions: torch.Tensor | None = None,
+    ):
+        if self.use_tnd_metadata and positions is not None:
+            return self._forward_tnd(x, freqs_cis, positions)
+        return self._forward_bsnd(x, freqs_cis, positions=positions)
 
     def init_weights(self, init_std: float):
         linear_list = [
@@ -225,10 +316,14 @@ class Indexer(Module):
         hadamard_mat: torch.Tensor,
         positions: torch.Tensor | None = None,
     ):
-        bsz, seqlen, _ = x.size()
+        is_tnd = x.dim() == 2
         rd = self.rope_head_dim
         q = self.wq_b(qr)
-        q = q.view(bsz, seqlen, self.n_heads, self.head_dim)
+        if is_tnd:
+            q = q.view(x.size(0), self.n_heads, self.head_dim)
+        else:
+            bsz, seqlen, _ = x.size()
+            q = q.view(bsz, seqlen, self.n_heads, self.head_dim)
         q = q.clone()
         q_nope, q_rope = torch.split(q, [self.head_dim - rd, rd], dim=-1)
         q_rope = apply_rotary_emb(q_rope, freqs_cis, positions=positions)
@@ -728,11 +823,17 @@ class PostAttention(Module):
         seqlen: int,
         n_local_groups: int,
         positions: torch.Tensor | None = None,
+        input_layout: str = "BSND",
     ):
         rd = self.rope_head_dim
         o_nope, o_rope = torch.split(o, [self.head_dim - rd, rd], dim=-1)
         o_rope = apply_rotary_emb(o_rope, freqs_cis, True, positions=positions)
         o = torch.cat([o_nope, o_rope], dim=-1)
+        if input_layout == "TND":
+            o = o.view(o.size(0), n_local_groups, -1)
+            wo_a = self.wo_a.weight.view(n_local_groups, self.o_lora_rank, -1)
+            o = torch.einsum("tgd,grd->tgr", o, wo_a)
+            return self.wo_b(o.reshape(o.size(0), -1))
         o = o.view(bsz, seqlen, n_local_groups, -1)
         wo_a = self.wo_a.weight.view(n_local_groups, self.o_lora_rank, -1)
         o = torch.einsum("bsgd,grd->bsgr", o, wo_a)
@@ -778,7 +879,16 @@ class Attention(Module):
         attention_masks: AttentionMasksType | None,
         positions: torch.Tensor | None = None,
     ):
-        bsz, seqlen, _ = x.size()
+        input_layout = "TND" if x.dim() == 2 else "BSND"
+        if input_layout == "TND":
+            if attention_masks is None:
+                raise RuntimeError("DeepSeekV4 TND attention requires SMLA attention_masks.")
+            smla_attention_masks = cast("Any", attention_masks)
+            bsz = smla_attention_masks.batch_size
+            cu_seqlens_q = smla_attention_masks.cu_seqlens_q
+            seqlen = int((cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item())
+        else:
+            bsz, seqlen, _ = x.size()
         freqs_cis = freqs_cis.to(x.device)
 
         q, kv, kv_compress, q_indexer, k_indexer, weights = self.pre_attention(
@@ -788,7 +898,8 @@ class Attention(Module):
             positions=positions,
         )
 
-        n_local_groups = self.n_groups // (self.n_heads // q.shape[2])
+        local_heads = q.shape[1] if input_layout == "TND" else q.shape[2]
+        n_local_groups = self.n_groups // (self.n_heads // local_heads)
 
         o, _compress_topk_idxs, _index_score = self.inner_attention(
             q,
@@ -801,7 +912,15 @@ class Attention(Module):
             attention_masks,
         )
 
-        x = self.post_attention(o, freqs_cis, bsz, seqlen, n_local_groups, positions=positions)
+        x = self.post_attention(
+            o,
+            freqs_cis,
+            bsz,
+            seqlen,
+            n_local_groups,
+            positions=positions,
+            input_layout=input_layout,
+        )
         return x
 
     def init_weights(self, init_std: float, buffer_device):
@@ -829,10 +948,13 @@ class HcSplitSinkhorn(Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         pre, post, comb = mixes.split([hc_mult, hc_mult, hc_mult * hc_mult], dim=-1)
         comb = comb.unflatten(-1, (hc_mult, hc_mult))
+        vector_shape = (1,) * (mixes.dim() - 1) + (hc_mult,)
+        matrix_shape = (1,) * (mixes.dim() - 1) + (hc_mult, hc_mult)
+        post_end = 2 * hc_mult
 
-        pre = F.sigmoid(pre * hc_scale[0] + hc_base[:hc_mult].unsqueeze(0).unsqueeze(0)) + eps
-        post = 2 * F.sigmoid(post * hc_scale[1] + hc_base[hc_mult : 2 * hc_mult].unsqueeze(0).unsqueeze(0))
-        comb = comb * hc_scale[2] + hc_base[2 * hc_mult :].view(hc_mult, hc_mult).unsqueeze(0).unsqueeze(0)
+        pre = F.sigmoid(pre * hc_scale[0] + hc_base[:hc_mult].view(vector_shape)) + eps
+        post = 2 * F.sigmoid(post * hc_scale[1] + hc_base[hc_mult:post_end].view(vector_shape))
+        comb = comb * hc_scale[2] + hc_base[post_end:].view(matrix_shape)
 
         comb = comb.softmax(-1) + eps
         col_sum = comb.sum(-2, keepdim=True)
@@ -860,7 +982,7 @@ class HcPost(Module):
         post: torch.Tensor,
         comb: torch.Tensor,
     ):
-        y = post.unsqueeze(-1) * x.unsqueeze(-2) + torch.sum(comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=2)
+        y = post.unsqueeze(-1) * x.unsqueeze(-2) + torch.sum(comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=-3)
         return y.type_as(x)
 
 
@@ -888,13 +1010,13 @@ class HcPre(Module):
         hc_base: torch.Tensor,
     ):
         shape, dtype = x.size(), x.dtype
-        x = x.flatten(2).float()
+        x = x.flatten(-2).float()
         rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + self.norm_eps)
         mixes = F.linear(x, hc_fn) * rsqrt
         pre, post, comb = self.torch_hc_split_sinkhorn(
             mixes, hc_scale, hc_base, self.hc_mult, self.hc_sinkhorn_iters, self.hc_eps
         )
-        y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=2)
+        y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=-2)
         return y.to(dtype), post, comb
 
 
@@ -1066,11 +1188,11 @@ class HcHead(Module):
         if isinstance(hc_head_scale, DTensor):
             hc_head_scale = hc_head_scale.to_local()
         shape, dtype = x.size(), x.dtype
-        x = x.flatten(2).float()
+        x = x.flatten(-2).float()
         rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + self.norm_eps)
         mixes = F.linear(x, hc_head_fn) * rsqrt
         pre = torch.sigmoid(mixes * hc_head_scale + hc_head_base) + self.hc_eps
-        y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=2)
+        y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=-2)
         return y.to(dtype)
 
 
@@ -1137,7 +1259,7 @@ class MTPModule(DeepSeekV4TransformerBlock):
         input_offset = self.enorm(input_offset)
         prev_embed = self.hnorm(prev_embed)
         x = self.e_proj(input_offset) + self.h_proj(prev_embed)
-        x = x.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
+        x = x.unsqueeze(1).repeat(1, self.hc_mult, 1) if x.dim() == 2 else x.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
         residual = x
         x, post, comb = self.hc_pre(x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
         x = self.attention_norm(x)
@@ -1201,6 +1323,7 @@ class DeepSeekV4Model(BaseModel):
         beta_slow: int = 1
         n_layers: int = 4
         use_smla: bool = False
+        use_global_tnd: bool = False
         num_mtp_modules: int = 0
         mtp_layer_compress_ratio: int = 1
 
@@ -1229,7 +1352,25 @@ class DeepSeekV4Model(BaseModel):
             # registry attaches to each Config.
             from torchtitan_npu.converters import has_npu_converter
 
-            self.use_smla = has_npu_converter(trainer_config.model_converters.converters, "npu_smla")
+            converters = trainer_config.model_converters.converters
+            self.use_smla = has_npu_converter(converters, "npu_smla")
+            use_mhc_pre = has_npu_converter(converters, "npu_mhc_pre")
+            use_mhc_post = has_npu_converter(converters, "npu_mhc_post")
+            use_a5 = get_npu_device_type() == "A5"
+            if use_a5 and self.use_smla and not (use_mhc_pre and use_mhc_post):
+                missing_converters = [
+                    name
+                    for name, enabled in (
+                        ("npu_mhc_pre", use_mhc_pre),
+                        ("npu_mhc_post", use_mhc_post),
+                    )
+                    if not enabled
+                ]
+                raise ValueError(
+                    "DeepSeekV4 A5 npu_smla requires npu_mhc_pre and npu_mhc_post "
+                    "to enable global TND; missing converter(s): " + ", ".join(missing_converters)
+                )
+            self.use_global_tnd = use_a5 and self.use_smla and use_mhc_pre and use_mhc_post
             self.num_mtp_modules = trainer_config.training.num_mtp_modules
             if trainer_config.parallelism.pipeline_parallel_degree > 1 and self.num_mtp_modules > 0:
                 raise NotImplementedError(
@@ -1297,6 +1438,7 @@ class DeepSeekV4Model(BaseModel):
         input_ids: torch.Tensor | None = None,
         attention_masks: AttentionMasksType | None = None,
         positions: torch.Tensor | None = None,
+        mtp_inputs: torch.Tensor | None = None,
     ):
         """
         Forward pass for the Transformer model.
@@ -1309,13 +1451,37 @@ class DeepSeekV4Model(BaseModel):
             torch.Tensor: Logits tensor of shape (batch_size, seq_len, vocab_size).
         """
         raw_tokens = None
+        use_global_tnd = self.model_args.use_global_tnd and positions is not None and self.tok_embeddings is not None
         if self.tok_embeddings is not None:
             raw_tokens = tokens
-            seq_len = tokens.shape[1] - self.model_args.num_mtp_modules
-            input_ids = tokens[:, :seq_len].detach().long()
-            h = self.tok_embeddings(tokens[:, :seq_len])
-            h = h.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
+            if use_global_tnd:
+                if tokens.dim() == 1:
+                    if positions.dim() != 1:
+                        raise RuntimeError("DeepSeekV4 global TND expects 1D positions with 1D tokens.")
+                    valid_tokens = positions.ge(0)
+                    tokens_tnd = tokens[valid_tokens]
+                    positions = positions[valid_tokens]
+                elif tokens.dim() == 2:
+                    if positions.dim() != 2:
+                        raise RuntimeError("DeepSeekV4 global TND expects positions with shape [B, S].")
+                    main_positions = positions[:, : tokens.shape[1]]
+                    valid_tokens = main_positions.ge(0)
+                    tokens_tnd = tokens[:, : main_positions.shape[1]][valid_tokens]
+                    positions = main_positions[valid_tokens]
+                else:
+                    raise RuntimeError("DeepSeekV4 global TND expects token inputs with shape [B, S] or [T].")
+                seq_len = int(tokens_tnd.numel())
+                input_ids = tokens_tnd.detach().long()
+                h = self.tok_embeddings(tokens_tnd)
+                h = h.unsqueeze(1).repeat(1, self.hc_mult, 1)
+            else:
+                seq_len = tokens.shape[1] - self.model_args.num_mtp_modules
+                input_ids = tokens[:, :seq_len].detach().long()
+                h = self.tok_embeddings(tokens[:, :seq_len])
+                h = h.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
         else:
+            if self.model_args.use_global_tnd:
+                raise NotImplementedError("DeepSeekV4 global TND does not support PP stages yet.")
             h = tokens
             input_ids = self._normalize_pp_input_ids(input_ids)
             seq_len = h.shape[1]
@@ -1351,11 +1517,25 @@ class DeepSeekV4Model(BaseModel):
             output_list = [None] * (1 + self.model_args.num_mtp_modules)
             # pyrefly: ignore [unsupported-operation]
             output_list[0] = output
+            if use_global_tnd:
+                if mtp_inputs is None:
+                    raise RuntimeError("DeepSeekV4 global TND with MTP requires compacted mtp_inputs.")
+                if mtp_inputs.shape[0] < self.model_args.num_mtp_modules or mtp_inputs.shape[1] != seq_len:
+                    raise RuntimeError(
+                        "DeepSeekV4 global TND mtp_inputs shape must be "
+                        f"[num_mtp_modules, T], got {tuple(mtp_inputs.shape)} and T={seq_len}."
+                    )
+
             # MTP module calculate
             for mtp_layer_id in range(self.model_args.num_mtp_modules):
-                token_offset_id = mtp_layer_id + 1
-                token_end_idx = token_offset_id + seq_len
-                token_offset = raw_tokens[:, token_offset_id:token_end_idx]
+                if use_global_tnd:
+                    if mtp_inputs is None:
+                        raise RuntimeError("DeepSeekV4 global TND with MTP requires compacted mtp_inputs.")
+                    token_offset = mtp_inputs[mtp_layer_id]
+                else:
+                    token_offset_id = mtp_layer_id + 1
+                    token_end_idx = token_offset_id + seq_len
+                    token_offset = raw_tokens[:, token_offset_id:token_end_idx]
                 input_offset = self.tok_embeddings(  # pyrefly: ignore [not-callable]
                     token_offset
                 )
@@ -1410,3 +1590,54 @@ class DeepSeekV4Model(BaseModel):
         if not isinstance(input_ids, torch.Tensor) or input_ids.ndim != 2:
             raise RuntimeError("DeepSeekV4 PP stage requires input_ids kwargs with shape [B, S].")
         return input_ids.detach().long()
+
+
+def _include_deepseek_v4_in_native_attention_mask_dispatch() -> None:
+    decoder_classes = []
+    try:
+        decoder_module = importlib.import_module("torchtitan.models.common.decoder")
+        decoder = getattr(decoder_module, "Decoder", None)
+        if decoder is not None:
+            decoder_classes.append(decoder)
+    except ImportError:
+        pass
+
+    for module_name in ("torchtitan.train", "torchtitan.trainer"):
+        try:
+            titan_module = importlib.import_module(module_name)
+        except ImportError:
+            continue
+
+        trainer = getattr(titan_module, "Trainer", None)
+        post_dataloading_process = getattr(trainer, "post_dataloading_process", None)
+        if post_dataloading_process is None:
+            continue
+
+        decoder = post_dataloading_process.__globals__.get("Decoder")
+        if decoder is not None:
+            decoder_classes.append(decoder)
+
+    for decoder in decoder_classes:
+        decoder_config = getattr(decoder, "Config", None)
+        if decoder_config is None:
+            continue
+
+        configs = decoder_config if isinstance(decoder_config, tuple) else (decoder_config,)
+        if DeepSeekV4Model.Config in configs:
+            continue
+
+        decoder.Config = (*configs, DeepSeekV4Model.Config)
+
+
+def enable_smla_varlen_attention_dispatch() -> None:
+    # Reuse TorchTitan's native VarlenAttention dispatch path for DeepSeek-V4
+    # global TND by presenting the DeepSeek-V4 config as varlen-capable.
+    DeepSeekV4Model.get_attention_masks = smla_get_attention_masks
+    config_cls = cast("Any", DeepSeekV4Model.Config)
+    if not getattr(config_cls, "npu_smla_attn_type_dispatch", False):
+        config_cls.attn_type = property(smla_attn_type)
+        config_cls.npu_smla_attn_type_dispatch = True
+    if not getattr(config_cls, "npu_smla_layers_dispatch", False):
+        config_cls.layers = property(smla_layers)
+        config_cls.npu_smla_layers_dispatch = True
+    _include_deepseek_v4_in_native_attention_mask_dispatch()

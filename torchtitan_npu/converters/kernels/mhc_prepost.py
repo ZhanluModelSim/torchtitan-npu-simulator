@@ -4,10 +4,11 @@
 # LICENSE file in the root directory of this source tree.
 
 
+import importlib
 import logging
+from typing import Any
 
 import torch
-import torch_npu
 from torch import Tensor, nn
 from torch.distributed.tensor import DTensor
 
@@ -23,118 +24,88 @@ from torchtitan_npu.tools.device import get_npu_device_type
 
 logger = logging.getLogger(__name__)
 
+_mhc_ops_module: Any | None = None
 
-def _none_grads(count: int) -> tuple[None, ...]:
-    return (None,) * count
+
+def _mhc_ops() -> Any:
+    global _mhc_ops_module
+    if _mhc_ops_module is None:
+        try:
+            module: Any = importlib.import_module("cann_ops_transformer")
+        except ImportError as exc:
+            raise RuntimeError("DeepSeekV4 A5 MHC fusion requires the cann_ops_transformer package.") from exc
+        _mhc_ops_module = module.ops
+    return _mhc_ops_module
 
 
 def _to_local_tensor(tensor: Tensor) -> Tensor:
     return tensor.to_local() if isinstance(tensor, DTensor) else tensor
 
 
-class MHCPre(torch.autograd.Function):
-    @staticmethod
-    # pyrefly: ignore [bad-override]
-    def forward(ctx, *args):
-        x, weight, hc_scale, hc_base, hc_mult, sinkhorn_iters, norm_eps, hc_eps = args
-        weight = weight.to(torch.float32)
-        hc_scale = hc_scale.to(torch.float32)
-        hc_base = hc_base.to(torch.float32)
-        (
-            y,
-            post,
-            comb_frag,
-            h_pre,
-            hc_before_norm,
-            inv_rms,
-            sum_out,
-            norm_out,
-        ) = torch_npu.npu_hc_pre(
-            x=x,
-            hc_fn=weight,
-            hc_scale=hc_scale,
-            hc_base=hc_base,
-            hc_mult=hc_mult,
-            hc_sinkhorn_iters=sinkhorn_iters,
-            norm_eps=norm_eps,
-            hc_eps=hc_eps,
-            need_grad=True,
-        )
+def _mhc_pre_sinkhorn(
+    x: Tensor,
+    weight: Tensor,
+    hc_scale: Tensor,
+    hc_base: Tensor,
+    hc_mult: int,
+    sinkhorn_iters: int,
+    norm_eps: float,
+    hc_eps: float,
+) -> tuple[Tensor, Tensor, Tensor]:
+    input_x = x
+    use_fake_batch = x.dim() == 3
+    if use_fake_batch:
+        x = x.unsqueeze(0)
+    elif x.dim() != 4:
+        raise RuntimeError(f"MHC fused kernel expects residual to be TND or BSND, got shape {tuple(x.shape)}.")
 
-        ctx.save_for_backward(
-            x,
-            weight,
-            hc_scale,
-            hc_base,
-            h_pre,
-            hc_before_norm,
-            inv_rms,
-            sum_out,
-            norm_out,
-        )
-        ctx.hc_eps = hc_eps
-        return y, post, comb_frag
-
-    @staticmethod
-    def backward(ctx, *grad_outputs):
-        grad_y, grad_h_post, grad_h_res = grad_outputs
-        (
-            x,
-            weight,
-            hc_scale,
-            hc_base,
-            h_pre,
-            hc_before_norm,
-            inv_rms,
-            sum_out,
-            norm_out,
-        ) = ctx.saved_tensors
-
-        grad_x, grad_phi, grad_alpha, grad_bias = torch_npu.npu_mhc_pre_sinkhorn_grad(
-            grad_hin=grad_y,
-            grad_h_post=grad_h_post,
-            grad_h_res=grad_h_res,
-            x=x,
-            phi=weight,
-            alpha=hc_scale,
-            bias=hc_base,
-            h_pre=h_pre,
-            hc_before_norm=hc_before_norm,
-            inv_rms=inv_rms,
-            sum_out=sum_out,
-            norm_out=norm_out,
-            hc_eps=ctx.hc_eps,
-        )
-
-        return grad_x, grad_phi, grad_alpha, grad_bias, *_none_grads(4)
+    outputs = _mhc_ops().mhc_pre_sinkhorn(
+        x.contiguous(),
+        weight.to(torch.float32),
+        hc_scale.to(torch.float32),
+        hc_base.to(torch.float32),
+        hc_mult,
+        sinkhorn_iters,
+        hc_eps,
+        norm_eps,
+    )
+    dim_b, dim_s, dim_n, _ = x.shape
+    h_in, h_post, h_res = outputs[:3]
+    h_in = h_in.view(dim_b, dim_s, h_in.shape[-1])
+    h_post = h_post.view(dim_b, dim_s, h_post.shape[-1])
+    h_res = h_res.view(dim_b, dim_s, dim_n, dim_n)
+    if use_fake_batch:
+        h_in = h_in.squeeze(0)
+        h_post = h_post.squeeze(0)
+    return h_in.type_as(input_x), h_post, h_res
 
 
-class MHCPost(torch.autograd.Function):
-    @staticmethod
-    # pyrefly: ignore [bad-override]
-    def forward(ctx, *args):
-        x, residual, h_post, h_res = args
-        y = torch_npu.npu_hc_post(
-            x=x,
-            residual=residual,
-            post=h_post,
-            comb=h_res,
-        )
-        ctx.save_for_backward(x, residual, h_post, h_res)
-        return y
+def _mhc_post(x: Tensor, residual: Tensor, post: Tensor, comb: Tensor) -> Tensor:
+    use_fake_batch = residual.dim() == 3
+    if use_fake_batch:
+        residual_bsnd = residual.unsqueeze(0)
+        x_bsd = x.unsqueeze(0)
+        post_bsn = post.unsqueeze(0)
+        comb_bsnn = comb if comb.dim() == 4 else comb.unsqueeze(0)
+    elif residual.dim() == 4:
+        residual_bsnd = residual
+        x_bsd = x
+        post_bsn = post
+        comb_bsnn = comb
+    else:
+        raise RuntimeError(f"MHC fused kernel expects residual to be TND or BSND, got shape {tuple(residual.shape)}.")
 
-    @staticmethod
-    def backward(ctx, *grad_outputs):
-        (grad_output,) = grad_outputs
-        x, residual, h_post, h_res = ctx.saved_tensors
-        grad_x, grad_residual, grad_h_post, grad_h_res = torch_npu.npu_mhc_post_grad(
-            comb_grad=grad_output,
-            F_out=x,
-            x_l=residual,
-            h_post=h_post,
-            h_res=h_res,
-        )
-        return grad_x, grad_residual, grad_h_post, grad_h_res
+    output = _mhc_ops().mhc_post(
+        residual_bsnd.contiguous(),
+        comb_bsnn.contiguous(),
+        x_bsd.contiguous(),
+        post_bsn.contiguous(),
+    )
+    if output.dim() == 3:
+        output = output.view_as(residual_bsnd)
+    if use_fake_batch:
+        output = output.squeeze(0)
+    return output.type_as(residual)
 
 
 class NpuHcPre(HcPre):
@@ -211,7 +182,7 @@ class NpuHcPreFused(HcPre):
         hc_scale: Tensor,
         hc_base: Tensor,
     ):
-        return MHCPre.apply(
+        return _mhc_pre_sinkhorn(
             x,
             hc_fn,
             hc_scale,
@@ -289,9 +260,7 @@ class NpuHcPostFused(HcPost):
         post: Tensor,
         comb: Tensor,
     ):
-        dim_b, dim_s, dim_n, dim_d = residual.shape
-        y = MHCPost.apply(x, residual, post, comb)
-        return y.view(dim_b, dim_s, dim_n, dim_d)
+        return _mhc_post(x, residual, post, comb).view_as(residual)
 
 
 class NpuHcHead(HcHead):
@@ -349,8 +318,7 @@ class MHCPreConverter(ModelCustomConverter):
     def convert(self, model: nn.Module):
         use_fused_kernel = get_npu_device_type() == "A5"
         if use_fused_kernel:
-            # pyrefly: ignore [missing-import]
-            import custom_ops  # noqa: F401
+            _mhc_ops()
 
         hc_pre_cls = NpuHcPreFused if use_fused_kernel else NpuHcPre
         for name, module in list(model.named_modules()):
@@ -368,8 +336,7 @@ class MHCPostConverter(ModelCustomConverter):
     def convert(self, model: nn.Module):
         use_fused_kernel = get_npu_device_type() == "A5"
         if use_fused_kernel:
-            # pyrefly: ignore [missing-import]
-            import custom_ops  # noqa: F401
+            _mhc_ops()
 
         hc_post_cls = NpuHcPostFused if use_fused_kernel else NpuHcPost
         for name, module in list(model.named_modules()):
