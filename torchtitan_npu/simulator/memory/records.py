@@ -36,6 +36,16 @@ class RawMemoryEvent:
     pp_mb_idx: int = -1
 
 
+@dataclass(frozen=True, slots=True)
+class FSDPResidencyEvent:
+    group_id: str
+    action: str
+    seq_idx: int
+    phase: str
+    num_bytes: int
+    tensor_ids: tuple[int, ...] = ()
+
+
 @dataclass(slots=True)
 class TensorLifetime:
     tensor_id: str
@@ -82,6 +92,7 @@ class MemoryPlan:
     peak_active_bytes: int = 0
     peak_seq_idx: int = 0
     peak_phase: str = ""
+    raw_events: list[RawMemoryEvent] = field(default_factory=list)
     tensor_lifetimes: list[TensorLifetime] = field(default_factory=list)
     timeline_events: list[MemoryTimelineEvent] = field(default_factory=list)
     unclassified_ops: list[dict[str, Any]] = field(default_factory=list)
@@ -94,6 +105,7 @@ class MemoryPlan:
             "active_bytes_peak": self.peak_active_bytes,
             "peak_seq_idx": self.peak_seq_idx,
             "peak_phase": self.peak_phase,
+            "raw_memory_event_count": len(self.raw_events),
             "tensor_lifetime_count": len(self.tensor_lifetimes),
             "timeline_event_count": len(self.timeline_events),
             "unclassified_op_count": len(self.unclassified_ops),

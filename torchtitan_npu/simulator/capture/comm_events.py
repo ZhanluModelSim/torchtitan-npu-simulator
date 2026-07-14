@@ -24,6 +24,7 @@ from torch.distributed import _functional_collectives as funcol
 
 from torchtitan_npu.distributed.process_group import is_fake_process_group
 from torchtitan_npu.simulator.capture.tensor_utils import dtype_to_str, tensor_volume_bytes
+from torchtitan_npu.simulator.memory.records import FSDPResidencyEvent
 
 _event_counter = itertools.count()
 
@@ -81,6 +82,7 @@ class CommEventRecorder:
     def __init__(self) -> None:
         self.events: list[CommEvent] = []
         self.timeline_events: list[dict] = []  # L2 scheduling events (MB 1+ pass-through)
+        self.fsdp_residency_events: list[FSDPResidencyEvent] = []
 
     def record(
         self,
@@ -127,6 +129,28 @@ class CommEventRecorder:
             "pp_mb_idx": pp_mb_idx,
             "phase": phase,
         })
+
+    def record_fsdp_residency(
+        self,
+        *,
+        group_id: str,
+        action: str,
+        phase: str,
+        num_bytes: int,
+        tensor_ids: tuple[int, ...],
+    ) -> None:
+        from torchtitan_npu.simulator.capture.dispatch_capture import _seq_counter
+
+        self.fsdp_residency_events.append(
+            FSDPResidencyEvent(
+                group_id=group_id,
+                action=action,
+                seq_idx=next(_seq_counter),
+                phase=phase,
+                num_bytes=num_bytes,
+                tensor_ids=tensor_ids,
+            )
+        )
 
 
 def _resolve_world_size(group: object) -> int:
@@ -244,7 +268,7 @@ def _record_comm_with_l0(
     capture = get_active_capture()
     if capture is not None:
         # Resolve src_exit_op: find the L1 op that produced the input tensor
-        producer_op = capture._producer.get(id(tensor))
+        producer_op = capture._producer.get(capture.tensor_id(tensor))
         if producer_op is not None:
             event.src_exit_op = producer_op
 
@@ -267,10 +291,10 @@ def _record_comm_with_l0(
         # an output tensor, the next L1 op that consumes it will be the
         # dst_entry_op.  We register the tensor id → event mapping and
         # resolve it lazily in _record_event when the consumer is captured.
-        if output_tensor is not None and id(output_tensor) != id(tensor):
-            capture._pending_comm_links[id(output_tensor)] = event
-        elif id(out) != id(tensor):
-            capture._pending_comm_links[id(out)] = event
+        tensor_id = capture.tensor_id(tensor)
+        output_id = capture.tensor_id(out)
+        if output_id != tensor_id:
+            capture._pending_comm_links[output_id] = event
 
     return event
 

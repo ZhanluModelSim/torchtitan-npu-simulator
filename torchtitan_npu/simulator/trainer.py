@@ -221,6 +221,7 @@ def run_simulation_step(
         capture.memory_events(),
         model_parts=model_parts,
         comm_events=comm_recorder.events,
+        fsdp_residency_events=comm_recorder.fsdp_residency_events,
     )
     wg.iteration.schedule.annotations["memory_plan"] = memory_plan
     wg.iteration.schedule.annotations["memory_summary"] = memory_plan.to_summary_dict()

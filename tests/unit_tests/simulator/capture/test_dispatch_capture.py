@@ -117,6 +117,13 @@ def test_capture_keeps_uncollapsed_memory_events_for_liveness():
     assert len({e.seq_idx for e in relu_memory_events}) == 3
 
 
+def test_capture_returns_stable_id_for_same_live_tensor():
+    capture = OpDispatchCapture()
+    tensor = torch.zeros(4, device="meta")
+
+    assert capture.tensor_id(tensor) == capture.tensor_id(tensor)
+
+
 def test_record_synthetic_op_wires_producer_consumer_edges():
     capture = OpDispatchCapture()
     with capture:

@@ -1689,22 +1689,9 @@ def _patch_comm_layer_context() -> None:
 
     # Patch FSDPParamGroup.unshard/reshard → L2
     try:
-        from torch.distributed.fsdp._fully_shard._fsdp_param_group import FSDPParamGroup
+        from torchtitan_npu.simulator.capture.fsdp_residency import install_fsdp_residency_hooks
 
-        if not hasattr(FSDPParamGroup, "_sim_orig_unshard"):
-            FSDPParamGroup._sim_orig_unshard = FSDPParamGroup.unshard
-            FSDPParamGroup._sim_orig_reshard = FSDPParamGroup.reshard
-
-            def _patched_unshard(self, async_op=False):  # noqa: ANN001
-                _comm_layer = "L2"
-                return FSDPParamGroup._sim_orig_unshard(self, async_op)
-
-            def _patched_reshard(self):  # noqa: ANN001
-                _comm_layer = "L2"
-                return FSDPParamGroup._sim_orig_reshard(self)
-
-            FSDPParamGroup.unshard = _patched_unshard
-            FSDPParamGroup.reshard = _patched_reshard
+        install_fsdp_residency_hooks()
     except Exception:
         pass
 

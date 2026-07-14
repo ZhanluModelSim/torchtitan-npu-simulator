@@ -19,7 +19,11 @@ _PHASES = {"forward", "backward", "optimizer"}
 
 
 def _trace_ts(seq_idx: int) -> int:
-    return int(seq_idx) * _TRACE_TS_SCALE_US
+    return max(0, int(seq_idx) + 1) * _TRACE_TS_SCALE_US
+
+
+def _shapes(refs: tuple) -> str:
+    return ";".join("[" + ",".join(str(dim) for dim in ref.shape) + "]" for ref in refs)
 
 
 def _build_phase_spans(plan: MemoryPlan) -> list[dict]:
@@ -137,6 +141,41 @@ def export_memory_plan(plan: MemoryPlan, out_dir: str) -> None:
         json.dump(memory_plan_to_chrome_trace(plan), f, indent=2, ensure_ascii=False)
 
     with open(os.path.join(out_dir, "memory_events.csv"), "w", newline="", encoding="utf-8") as f:
+        fieldnames = [
+            "event_id",
+            "seq_idx",
+            "phase",
+            "op_id",
+            "raw_op_type",
+            "op_type",
+            "module_path",
+            "input_bytes",
+            "output_bytes",
+            "input_shapes",
+            "output_shapes",
+            "pp_stage",
+            "pp_mb_idx",
+        ]
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for event in plan.raw_events:
+            writer.writerow({
+                "event_id": event.event_id,
+                "seq_idx": event.seq_idx,
+                "phase": event.phase,
+                "op_id": event.op_id,
+                "raw_op_type": event.raw_op_type,
+                "op_type": event.op_type,
+                "module_path": event.module_path,
+                "input_bytes": sum(ref.num_bytes for ref in event.inputs),
+                "output_bytes": sum(ref.num_bytes for ref in event.outputs),
+                "input_shapes": _shapes(event.inputs),
+                "output_shapes": _shapes(event.outputs),
+                "pp_stage": event.pp_stage,
+                "pp_mb_idx": event.pp_mb_idx,
+            })
+
+    with open(os.path.join(out_dir, "memory_timeline.csv"), "w", newline="", encoding="utf-8") as f:
         fieldnames = [
             "seq_idx",
             "phase",

@@ -12,6 +12,7 @@ no storage to alias-track, matching spec/L0-OpNode.md's "Meta tensor
 from __future__ import annotations
 
 import itertools
+import weakref
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -86,11 +87,11 @@ def _shape_signature(event: _RawEvent) -> tuple:
     )
 
 
-def _to_tensor_ref(tensor: torch.Tensor, name: str) -> TensorRef:
+def _to_tensor_ref(tensor: torch.Tensor, name: str, tensor_id: int) -> TensorRef:
     dtype = dtype_to_str(tensor.dtype)
     shape = tuple(int(d) for d in tensor.shape)
     return TensorRef(
-        tensor_id=id(tensor),
+        tensor_id=tensor_id,
         name=name,
         shape=shape,
         dtype=dtype,
@@ -122,6 +123,8 @@ class OpDispatchCapture(TorchDispatchMode):
         self._events: list[_RawEvent] = []
         self._memory_events: list[RawMemoryEvent] = []
         self._producer: dict[int, int] = {}
+        self._tensor_identities: dict[int, tuple[weakref.ReferenceType[torch.Tensor], int]] = {}
+        self._reused_tensor_ids = itertools.count(1)
         self._last_signature: tuple | None = None
         self._previous_active_capture: OpDispatchCapture | None = None
         self._capture_l0: bool = True  # pass-through when False (MB 1+)
@@ -163,7 +166,9 @@ class OpDispatchCapture(TorchDispatchMode):
     ) -> None:
         if not self._capture_l0:
             return  # pass-through: MB 1+ skips L0 capture
-        predecessors = sorted({self._producer[id(t)] for t in flat_inputs if id(t) in self._producer})
+        input_ids = [self.tensor_id(tensor) for tensor in flat_inputs]
+        output_ids = [self.tensor_id(tensor) for tensor in flat_outputs]
+        predecessors = sorted({self._producer[tensor_id] for tensor_id in input_ids if tensor_id in self._producer})
         input_metas = [to_tensor_meta(t, name=f"in_{i}") for i, t in enumerate(flat_inputs)]
         output_metas = [to_tensor_meta(t, name=f"out_{i}") for i, t in enumerate(flat_outputs)]
 
@@ -213,8 +218,14 @@ class OpDispatchCapture(TorchDispatchMode):
                 op_type=op_type,
                 phase=phase,
                 module_path=module_path,
-                inputs=tuple(_to_tensor_ref(t, name=f"in_{i}") for i, t in enumerate(flat_inputs)),
-                outputs=tuple(_to_tensor_ref(t, name=f"out_{i}") for i, t in enumerate(flat_outputs)),
+                inputs=tuple(
+                    _to_tensor_ref(tensor, name=f"in_{idx}", tensor_id=input_ids[idx])
+                    for idx, tensor in enumerate(flat_inputs)
+                ),
+                outputs=tuple(
+                    _to_tensor_ref(tensor, name=f"out_{idx}", tensor_id=output_ids[idx])
+                    for idx, tensor in enumerate(flat_outputs)
+                ),
                 pp_stage=pp_stage,
                 pp_mb_idx=pp_mb_idx,
             )
@@ -222,15 +233,24 @@ class OpDispatchCapture(TorchDispatchMode):
 
         # Resolve pending comm links: if any input tensor was produced by a
         # comm op (e.g. recv/unshard), this op is the dst_entry_op consumer.
-        for t in flat_inputs:
-            tid = id(t)
+        for tid in input_ids:
             if tid in self._pending_comm_links:
                 event = self._pending_comm_links.pop(tid)
                 event.dst_entry_op = op_id
         self._last_signature = signature
 
-        for t in flat_outputs:
-            self._producer[id(t)] = op_id
+        for tid in output_ids:
+            self._producer[tid] = op_id
+
+    def tensor_id(self, tensor: torch.Tensor) -> int:
+        raw_id = id(tensor)
+        identity = self._tensor_identities.get(raw_id)
+        if identity is not None and identity[0]() is tensor:
+            return identity[1]
+
+        stable_id = raw_id if identity is None else -next(self._reused_tensor_ids)
+        self._tensor_identities[raw_id] = (weakref.ref(tensor), stable_id)
+        return stable_id
 
     def __enter__(self) -> "OpDispatchCapture":
         super().__enter__()

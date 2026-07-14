@@ -9,9 +9,10 @@ import torch
 import torch.nn as nn
 
 from torchtitan_npu.simulator.capture.dispatch_capture import OpDispatchCapture
+from torchtitan_npu.simulator.memory import estimator
 from torchtitan_npu.simulator.memory.estimator import estimate_static_memory
 from torchtitan_npu.simulator.memory.export import export_memory_plan, memory_plan_to_chrome_trace
-from torchtitan_npu.simulator.memory.records import RawMemoryEvent, TensorRef
+from torchtitan_npu.simulator.memory.records import FSDPResidencyEvent, RawMemoryEvent, TensorRef
 
 
 def tref(tensor_id: int, num_bytes: int = 16) -> TensorRef:
@@ -128,6 +129,7 @@ class FakeComm:
     volume_bytes: int = 0
     world_size: int = 1
     dst_entry_op: int = 0
+    comm_layer: str = ""
 
 
 def test_fsdp_allgather_output_is_classified_as_full_param_buffer():
@@ -182,11 +184,49 @@ def test_fsdp_residency_plugin_uses_comm_dst_entry_op_as_consumer():
     assert full_lifetime.consumer_ops == [20]
 
 
+def test_fsdp_explicit_markers_replace_full_param_and_bound_staging_buffer():
+    shard, staging, full, out = tref(1, 32), tref(2, 128), tref(3, 128), tref(4, 16)
+    plan = estimate_static_memory(
+        [
+            event(0, 10, "comm.allgather", inputs=[shard], outputs=[staging], op_type="allgather"),
+            event(3, 20, "aten.mm.default", inputs=[full], outputs=[out]),
+            event(50, 30, "aten.sum.default", inputs=[staging], outputs=[tref(5)]),
+        ],
+        comm_events=[
+            FakeComm(op_id=10, comm_primitive="allgather", comm_dim="0", comm_layer="L2")
+        ],
+        fsdp_residency_events=[
+            FSDPResidencyEvent("layer0", "alloc", 2, "forward", 128, (full.tensor_id,)),
+            FSDPResidencyEvent("layer0", "free", 5, "forward", 128, (full.tensor_id,)),
+        ],
+    )
+
+    residency = next(item for item in plan.tensor_lifetimes if item.kind == "fsdp_full_param")
+    staging_lifetime = next(item for item in plan.tensor_lifetimes if item.tensor_id == "tensor:2")
+    assert (residency.birth_seq, residency.death_seq) == (2, 5)
+    assert staging_lifetime.death_seq == 2
+    assert staging_lifetime.reason == "fsdp_allgather_staging"
+    assert not any(item.tensor_id == "external:3" for item in plan.tensor_lifetimes)
+
+
 def test_parameter_bytes_are_persistent_and_counted():
     model = nn.Linear(4, 2, bias=False, device="meta")
     plan = estimate_static_memory([], model_parts=[model])
     assert plan.persistent_param_bytes == 4 * 2 * 4
     assert plan.peak_active_bytes == plan.persistent_param_bytes
+
+
+def test_parameter_snapshot_deduplicates_by_parameter_identity(monkeypatch):
+    model = nn.Sequential(
+        nn.Linear(4, 4, bias=False, device="meta"),
+        nn.Linear(4, 4, bias=False, device="meta"),
+    )
+    shared_local_tensor = torch.empty(4, 4, device="meta")
+    monkeypatch.setattr(estimator, "_to_local_tensor", lambda _param: shared_local_tensor)
+
+    plan = estimate_static_memory([], model_parts=[model])
+
+    assert plan.persistent_param_bytes == 2 * 4 * 4 * 4
 
 
 def test_memory_plan_exports_compact_chrome_trace(tmp_path):
@@ -206,6 +246,10 @@ def test_memory_plan_exports_compact_chrome_trace(tmp_path):
 
     export_memory_plan(plan, str(tmp_path))
     assert (tmp_path / "memory_trace.json").is_file()
+    memory_events_header = (tmp_path / "memory_events.csv").read_text().splitlines()[0]
+    memory_timeline_header = (tmp_path / "memory_timeline.csv").read_text().splitlines()[0]
+    assert memory_events_header.startswith("event_id,seq_idx,phase,op_id")
+    assert memory_timeline_header.startswith("seq_idx,phase,op_id,action")
 
 
 def test_chrome_trace_includes_fsdp_full_param_counter():
@@ -219,3 +263,15 @@ def test_chrome_trace_includes_fsdp_full_param_counter():
     events = trace["traceEvents"]
     assert any(item["ph"] == "M" and item["args"].get("name") == "fsdp full-param bytes" for item in events)
     assert any(item["ph"] == "C" and item["name"] == "active_fsdp_full_param_bytes" for item in events)
+
+
+def test_chrome_trace_starts_with_persistent_parameter_bytes():
+    model = nn.Linear(4, 2, device="meta")
+    plan = estimate_static_memory([], model_parts=[model])
+
+    counters = [
+        item for item in memory_plan_to_chrome_trace(plan)["traceEvents"]
+        if item["ph"] == "C" and item["name"] == "active_bytes" and item["ts"] == 0
+    ]
+
+    assert counters[-1]["args"]["active_bytes"] == plan.persistent_param_bytes

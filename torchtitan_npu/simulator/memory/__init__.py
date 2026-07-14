@@ -7,6 +7,7 @@
 
 from torchtitan_npu.simulator.memory.estimator import estimate_static_memory
 from torchtitan_npu.simulator.memory.records import (
+    FSDPResidencyEvent,
     MemoryPlan,
     MemoryTimelineEvent,
     RawMemoryEvent,
@@ -15,6 +16,7 @@ from torchtitan_npu.simulator.memory.records import (
 )
 
 __all__ = [
+    "FSDPResidencyEvent",
     "MemoryPlan",
     "MemoryTimelineEvent",
     "RawMemoryEvent",

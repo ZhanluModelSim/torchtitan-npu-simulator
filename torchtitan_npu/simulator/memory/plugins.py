@@ -15,7 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from torchtitan_npu.simulator.memory.records import RawMemoryEvent, TensorLifetime
+from torchtitan_npu.simulator.memory.records import FSDPResidencyEvent, RawMemoryEvent, TensorLifetime
 
 
 @dataclass(slots=True)
@@ -24,6 +24,7 @@ class MemoryModelContext:
     comm_by_op: dict[int, Any]
     lifetimes_by_tensor_id: dict[int, TensorLifetime]
     param_ids: set[int]
+    fsdp_residency_events: list[FSDPResidencyEvent] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
 

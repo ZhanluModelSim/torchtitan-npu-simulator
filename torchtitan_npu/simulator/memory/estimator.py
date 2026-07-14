@@ -23,6 +23,7 @@ from torchtitan_npu.simulator.memory.alias_rules import is_alias_event, is_mutat
 from torchtitan_npu.simulator.memory.fsdp_residency import FSDPFullParamResidencyPlugin
 from torchtitan_npu.simulator.memory.plugins import MemoryModelContext
 from torchtitan_npu.simulator.memory.records import (
+    FSDPResidencyEvent,
     MemoryPlan,
     MemoryTimelineEvent,
     RawMemoryEvent,
@@ -35,6 +36,9 @@ def _to_local_tensor(value: object) -> torch.Tensor | None:
     try:
         from torch.distributed.tensor import DTensor
         if isinstance(value, DTensor):
+            local_tensor = getattr(value, "_local_tensor", None)
+            if isinstance(local_tensor, torch.Tensor):
+                return local_tensor
             return value.to_local()
     except Exception:
         pass
@@ -45,18 +49,19 @@ def _to_local_tensor(value: object) -> torch.Tensor | None:
 
 def _snapshot_parameters(model_parts: Iterable[nn.Module]) -> tuple[list[TensorLifetime], set[int]]:
     lifetimes: list[TensorLifetime] = []
-    seen: set[int] = set()
+    seen_params: set[int] = set()
     param_ids: set[int] = set()
     for part_idx, model in enumerate(model_parts):
         for name, param in model.named_parameters(recurse=True):
+            param_id = id(param)
+            if param_id in seen_params:
+                continue
+            seen_params.add(param_id)
             tensor = _to_local_tensor(param)
             if tensor is None:
                 continue
             tid = id(tensor)
             param_ids.add(tid)
-            if tid in seen:
-                continue
-            seen.add(tid)
             dtype = dtype_to_str(tensor.dtype)
             shape = tuple(int(d) for d in tensor.shape)
             lifetimes.append(
@@ -212,6 +217,7 @@ def estimate_static_memory(
     *,
     model_parts: Iterable[nn.Module] | None = None,
     comm_events: Iterable[Any] | None = None,
+    fsdp_residency_events: Iterable[FSDPResidencyEvent] | None = None,
 ) -> MemoryPlan:
     events = sorted(raw_events, key=lambda event: event.seq_idx)
     param_lifetimes, param_ids = _snapshot_parameters(model_parts or [])
@@ -272,6 +278,7 @@ def estimate_static_memory(
         comm_by_op=comm_by_op,
         lifetimes_by_tensor_id=lifetimes_by_tensor_id,
         param_ids=param_ids,
+        fsdp_residency_events=list(fsdp_residency_events or []),
         notes=notes,
     )
     plugin_lifetimes = FSDPFullParamResidencyPlugin().apply(plugin_context)
@@ -287,6 +294,7 @@ def estimate_static_memory(
         peak_active_bytes=peak_event.active_bytes_after if peak_event else 0,
         peak_seq_idx=peak_event.seq_idx if peak_event else 0,
         peak_phase=peak_event.phase if peak_event else "",
+        raw_events=events,
         tensor_lifetimes=sorted(lifetimes, key=lambda item: (item.birth_seq, item.tensor_id)),
         timeline_events=timeline,
         unclassified_ops=unclassified_ops,
