@@ -88,6 +88,16 @@ class ScheduleAction:
     produces: list[str] = field(default_factory=list)   # DataSlot ids
     duration_est: float = 0.0
     sub_actions: list[ScheduleAction] | None = None     # OVERLAP_F_B
+    # For comm/FSDP actions: the L0 OpNode id that implements this action
+    # (the allgather/reduce_scatter/p2p synthetic op captured by comm_events).
+    # Set by build_schedule_plan; lookup via SchedulePlan.find_op_node().
+    # 0 = no captured L0 op (e.g. FSDP no-op when mesh size 1 -> is_noop=True).
+    comm_op_id: int = 0
+    # True when the plan action ran but produced no real comm (e.g. FSDP
+    # unshard/reshard with a 1-size mesh = no collective). The action is
+    # still recorded for schedule completeness, but there is no L0 op / no
+    # data transfer to replay.
+    is_noop: bool = False
     annotations: dict[str, Any] = field(default_factory=dict)
 
 
@@ -131,6 +141,29 @@ class SchedulePlan:
             elif a.action_type == "OVERLAP_F_B" and a.sub_actions:
                 out.extend(s for s in a.sub_actions if s.action_type == "COMPUTE")
         return out
+
+    def find_op_node(self, op_id: int) -> Any:
+        """Locate the L0 ``OpNode`` for a captured op_id (e.g. an action's
+        ``comm_op_id``) across all L1 step_templates. Returns the OpNode or
+        None. This is the entry point for simulation replay: given an
+        UNSHARD/RESHARD/SEND/RECV action, ``action.comm_op_id`` +
+        ``find_op_node(comm_op_id)`` yields the actual op (shape, comm_bytes,
+        flops, module_path, …) to replay."""
+        if not op_id:
+            return None
+        for sg in self.step_templates.values():
+            if op_id in sg.nodes:
+                return sg.nodes[op_id]
+        return None
+
+    def find_template_for_op(self, op_id: int) -> StepGraph | None:
+        """Which L1 template holds the given op_id (for replay navigation)."""
+        if not op_id:
+            return None
+        for sg in self.step_templates.values():
+            if op_id in sg.nodes:
+                return sg
+        return None
 
     def export_schedule_plan_csv(self, path: str) -> None:
         """One row per action: seq, action_type, stage, mb, comp_type,

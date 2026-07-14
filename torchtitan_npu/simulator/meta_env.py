@@ -1383,6 +1383,65 @@ def _patch_metadata_inference_skip() -> None:
     PipelineStage._compute_outputs = _patched_compute_outputs
 
 
+def _patch_pipeline_action_context() -> None:
+    """Patch ``schedules._get_profiler_function_name`` (called by
+    ``_PipelineScheduleRuntime._step_microbatches`` as
+    ``with record_function(_get_profiler_function_name(action))`` for EVERY
+    action in the lowered plan, including non-compute ones) to stamp the
+    correct ``_pp_context["stage"]`` / ``comp_type`` per action.
+
+    Problem: only ``forward_one_chunk`` / ``backward_one_chunk`` /
+    ``backward_weight_one_chunk`` (my patches) set ``_pp_context["stage"]``.
+    The non-compute plan actions — ``UNSHARD`` / ``RESHARD`` / ``SEND_F`` /
+    ``RECV_F`` / ``SEND_B`` / ``RECV_B`` / ``REDUCE_GRAD`` — run inside
+    ``_perform_action`` WITHOUT going through those chunk methods, so any L0
+    op they emit (e.g. the FSDP all-gather from ``unshard()``) is stamped
+    with the STALE ``stage`` (the last chunk's, or the default -1 before the
+    first chunk) and lands in the wrong template (the ``s-1_F`` "unattributed"
+    bucket). This patch stamps the real ``action.stage_index`` (and a
+    comm-specific ``comp_type``) right before each action's body runs, so
+    those comm ops bucket into ``s{stage}_UNSHARD`` / ``s{stage}_RESHARD``
+    etc. Compute actions (F/B/I/W/OVERLAP_F_B) are still overridden by the
+    chunk patches that run inside the body, so their attribution is
+    unaffected. Single-stage schedules (1F1B/GPipe) don't call this helper
+    (they use ``record_function(f"Forward {i}")``) and are unaffected — their
+    UNSHARD runs inside ``forward_one_chunk`` where the stage is already set.
+
+    This is the capture-side half of fixing the UNSHARD/RESHARD <-> L0
+    linkage gap; the build-side half (``build_schedule_plan`` linking the
+    action to its L0 comm op via ``comm_op_id``) lives in schedule_builder.
+    """
+    try:
+        from torch.distributed.pipelining import schedules as sch
+    except Exception:
+        return
+    if hasattr(sch, "_sim_orig_profiler_name"):
+        return
+    sch._sim_orig_profiler_name = sch._get_profiler_function_name
+
+    def _patched_profiler_name(action):  # noqa: ANN001
+        try:
+            _pp_context["stage"] = int(getattr(action, "stage_index", -1))
+            ct = getattr(getattr(action, "computation_type", None), "value", "")
+            # Comm actions get a dedicated comp_type so their L0 ops bucket
+            # into s{stage}_{UNSHARD|RESHARD|REDUCE_GRAD}; SEND/RECV inherit
+            # the forward/backward comp_type of the phase they belong to.
+            if ct in ("UNSHARD", "RESHARD", "REDUCE_GRAD"):
+                _pp_context["comp_type"] = ct
+            elif ct in ("SEND_F", "RECV_F"):
+                _pp_context["comp_type"] = "F"
+            elif ct in ("SEND_B", "RECV_B"):
+                _pp_context["comp_type"] = "B"
+            # compute actions (F/B/I/W/OVERLAP_F_B): leave comp_type to the
+            # chunk patch which runs inside the action body (it sets the
+            # correct F/B/I/W and the same stage).
+        except Exception:
+            pass
+        return sch._sim_orig_profiler_name(action)
+
+    sch._get_profiler_function_name = _patched_profiler_name
+
+
 def _patch_get_stage_indices_for_fake_pg() -> None:
     """Patch ``_get_stage_indices`` inside ``pipeline_module_split`` to
     return ALL stage indices (not just the local PP rank's stages) when
@@ -1848,6 +1907,7 @@ def _patch_comm_layer_context() -> None:
             _cp_mod._sim_orig_allgather_seq = _orig_allgather_seq
 
             def _patched_allgather_seq(tensor, mesh, seq_dim=1):  # noqa: ANN001
+                global _comm_layer
                 _comm_layer = "L1"
                 return _orig_allgather_seq(tensor, mesh, seq_dim)
 
@@ -1864,6 +1924,7 @@ def _patch_comm_layer_context() -> None:
             FSDPParamGroup._sim_orig_reshard = FSDPParamGroup.reshard
 
             def _patched_unshard(self, async_op=False):  # noqa: ANN001
+                global _comm_layer
                 _comm_layer = "L2"
                 # Record FSDP state transition for the currently-active PP
                 # stage (from _pp_context). Multiple FSDPParamGroup instances
@@ -1876,6 +1937,7 @@ def _patch_comm_layer_context() -> None:
                 return FSDPParamGroup._sim_orig_unshard(self, async_op)
 
             def _patched_reshard(self):  # noqa: ANN001
+                global _comm_layer
                 _comm_layer = "L2"
                 stage = _pp_context.get("stage", 0)
                 if isinstance(stage, int):
@@ -1895,6 +1957,7 @@ def _patch_comm_layer_context() -> None:
             _PipelineSchedule._sim_orig_step_microbatches = _PipelineSchedule._step_microbatches
 
             def _patched_step_microbatches(self, *args, **kwargs):  # noqa: ANN001
+                global _comm_layer
                 _comm_layer = "L2"
                 return _PipelineSchedule._sim_orig_step_microbatches(self, *args, **kwargs)
 
@@ -2155,6 +2218,7 @@ def patch_device_type_to_meta() -> None:
     _patch_pipeline_stage_meta_exchange_for_fake_pg()
     _patch_pipeline_stage_for_pp_context()
     _patch_metadata_inference_skip()
+    _patch_pipeline_action_context()
     _patch_torch_equal_for_meta()
     _patch_init_distributed_for_multi_proc_meta()
     _patch_fsdp_get_device_from_mesh()

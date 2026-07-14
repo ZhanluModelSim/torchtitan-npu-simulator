@@ -257,6 +257,16 @@ def _record_comm_with_l0(
     # UNSHARD/RESHARD actions in runtime zero-bubble schedules).
     event.comp_type = str(_pp_context.get("comp_type", ""))
     event.fsdp_state = str(_pp_context.get("fsdp_state", "NA"))
+    # For FSDP collective comm (allgather/reduce_scatter), record the active
+    # stage so build_schedule_plan can match the plan's UNSHARD/RESHARD action
+    # (by stage) to this CommEvent + its L0 op_id. (P2P events already set
+    # p2p_stage in patched_isend/irecv.) Requires _patch_pipeline_action_context
+    # to have stamped the real stage before the action ran.
+    if not event.p2p_direction:
+        try:
+            event.p2p_stage = int(_pp_context.get("stage", -1))
+        except (TypeError, ValueError):
+            pass
 
     out = output_tensor if output_tensor is not None else tensor
     capture = get_active_capture()

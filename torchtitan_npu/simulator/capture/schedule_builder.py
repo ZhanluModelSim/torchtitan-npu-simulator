@@ -96,15 +96,30 @@ def build_schedule_plan(
             continue
         base = d.replace("_send", "").replace("_recv", "")  # "forward" / "backward"
         p2p_by_key[(int(ev.p2p_stage), int(ev.p2p_mb_idx), base)] = ev
-    # stage -> [allgather CommEvents], stage -> [reduce_scatter CommEvents]
+    # stage -> [allgather CommEvents], stage -> [reduce_scatter CommEvents].
+    # Only keep CommEvents whose op_id resolves to a real `comm.*` L0 op — the
+    # allgather/reduce_scatter fired during DYNAMIC-mode metadata inference
+    # (framework shape-inference forward) also records a CommEvent but its
+    # op_id is stale (pointing at the last recorded aten op, since L0 capture
+    # is skipped during inference), which would mis-pair UNSHARD/RESHARD plan
+    # actions. Filtering by "op_id resolves to a comm.* op" drops those.
+    def _is_real_comm_event(ev: CommEvent) -> bool:
+        if not ev.op_id:
+            return False
+        for sg in step_templates.values():
+            n = sg.nodes.get(ev.op_id)
+            if n is not None:
+                return n.annotations.get("raw_op_type", "").startswith("comm.")
+        return False
+
     unshard_by_stage: dict[int, list[CommEvent]] = {}
     reshard_by_stage: dict[int, list[CommEvent]] = {}
     for ev in comm_events:
         if ev.comm_layer != "L2":
             continue
-        if ev.comm_primitive == "allgather":
+        if ev.comm_primitive == "allgather" and _is_real_comm_event(ev):
             unshard_by_stage.setdefault(int(ev.p2p_stage) if ev.p2p_stage >= 0 else rank, []).append(ev)
-        elif ev.comm_primitive == "reduce_scatter":
+        elif ev.comm_primitive == "reduce_scatter" and _is_real_comm_event(ev):
             reshard_by_stage.setdefault(int(ev.p2p_stage) if ev.p2p_stage >= 0 else rank, []).append(ev)
 
     # --- V-shape same-rank detection -----------------------------------------
@@ -308,52 +323,85 @@ def build_schedule_plan(
         add_slot(slot)
 
     # --- 4. DataSlots: FSDP unshard/reshard (param_full / param_shard) --------
+    # Order-match each UNSHARD/RESHARD plan action to the next captured
+    # allgather/reduce_scatter CommEvent on that stage (plan order ~= exec
+    # order ~= CommEvent capture order, so a per-stage FIFO pop is correct).
+    # This links the action to its L0 comm op (comm_op_id) + the L1 template
+    # holding it (template_ref), and fills the DataSlot shape/bytes. When no
+    # CommEvent exists (FSDP no-op, e.g. mesh size 1) the action is marked
+    # is_noop=True (schedule-completeness, no replay data).
+    unshard_iters: dict[int, int] = {s: 0 for s in unshard_by_stage}
+    reshard_iters: dict[int, int] = {s: 0 for s in reshard_by_stage}
+
+    def _template_holding(op_id: int) -> str:
+        if not op_id:
+            return ""
+        for tid, sg in step_templates.items():
+            if op_id in sg.nodes:
+                return tid
+        return ""
+
     for a in actions:
         if a.action_type != "UNSHARD":
             continue
         s = a.stage if a.stage >= 0 else rank
-        # producer = UNSHARD; consumer = next COMPUTE on that stage (any comp_type)
+        evs = unshard_by_stage.get(s, [])
+        idx = unshard_iters.get(s, 0)
+        ev = evs[idx] if idx < len(evs) else None
+        if ev is not None:
+            unshard_iters[s] = idx + 1
+            a.comm_op_id = ev.op_id
+            a.template_ref = _template_holding(ev.op_id)
+            shape, dtype, bytes_ = ev.tensor_shape, ev.dtype, ev.volume_bytes
+            comm = "allgather"
+            src_exit, dst_entry = ev.src_exit_op, ev.dst_entry_op
+        else:
+            a.is_noop = True
+            shape, dtype, bytes_, comm, src_exit, dst_entry = (), "", 0, "", 0, 0
+        # consumer = next COMPUTE on that stage after this unshard
         cons = None
         for ca in actions:
-            if ca.action_type == "COMPUTE" and ca.stage == s and a not in (ca,):
-                # earliest compute after this unshard by seq_idx
-                if cons is None or (ca.seq_idx < cons.seq_idx and ca.seq_idx >= a.seq_idx):
-                    if ca.seq_idx >= a.seq_idx:
-                        cons = ca
-        evs = unshard_by_stage.get(s, [])
-        shape = evs[0].tensor_shape if evs else ()
-        dtype = evs[0].dtype if evs else ""
-        bytes_ = evs[0].volume_bytes if evs else 0
+            if (ca.action_type == "COMPUTE" and ca.stage == s
+                    and ca.seq_idx >= a.seq_idx and ca is not a):
+                if cons is None or ca.seq_idx < cons.seq_idx:
+                    cons = ca
         slot = DataSlot(
             slot_id=_slot_id(), kind="param_full", shape=shape, dtype=dtype, volume_bytes=bytes_,
             producer_action_id=a.action_id,
             consumer_action_ids=[cons.action_id] if cons else [],
-            src_stage=s, dst_stage=s, comm_primitive="allgather" if evs else "",
-            src_exit_op=evs[0].src_exit_op if evs else 0,
-            dst_entry_op=evs[0].dst_entry_op if evs else 0,
+            src_stage=s, dst_stage=s, comm_primitive=comm,
+            src_exit_op=src_exit, dst_entry_op=dst_entry,
         )
         add_slot(slot)
     for a in actions:
         if a.action_type != "RESHARD":
             continue
         s = a.stage if a.stage >= 0 else rank
-        # producer = preceding backward COMPUTE on that stage; consumer = RESHARD
+        evs = reshard_by_stage.get(s, [])
+        idx = reshard_iters.get(s, 0)
+        ev = evs[idx] if idx < len(evs) else None
+        if ev is not None:
+            reshard_iters[s] = idx + 1
+            a.comm_op_id = ev.op_id
+            a.template_ref = _template_holding(ev.op_id)
+            shape, dtype, bytes_ = ev.tensor_shape, ev.dtype, ev.volume_bytes
+            comm = "reduce_scatter"
+        else:
+            a.is_noop = True
+            shape, dtype, bytes_, comm = (), "", 0, ""
+        # producer = preceding backward COMPUTE on that stage
         prod = None
         for ca in actions:
             if (ca.action_type == "COMPUTE" and ca.stage == s
                     and ca.comp_type in ("B", "I", "W") and ca.seq_idx <= a.seq_idx):
                 if prod is None or ca.seq_idx > prod.seq_idx:
                     prod = ca
-        evs = reshard_by_stage.get(s, [])
-        shape = evs[0].tensor_shape if evs else ()
-        dtype = evs[0].dtype if evs else ""
-        bytes_ = evs[0].volume_bytes if evs else 0
         slot = DataSlot(
             slot_id=_slot_id(), kind="param_shard", shape=shape, dtype=dtype, volume_bytes=bytes_,
             producer_action_id=prod.action_id if prod else "",
             consumer_action_ids=[a.action_id],
             src_stage=s, dst_stage=s, mb_idx=-1,
-            comm_primitive="reduce_scatter" if evs else "",
+            comm_primitive=comm,
         )
         add_slot(slot)
 
@@ -392,6 +440,10 @@ def build_schedule_plan(
     dp_degree = rank_table.dim_degrees.get("dp_replicate", 1) * rank_table.dim_degrees.get(
         "fsdp", rank_table.dim_degrees.get("dp_shard", 1)
     )
+    from collections import Counter as _Ctr
+    comm_summary = dict(_Ctr(
+        (ev.comm_primitive, ev.comm_layer, ev.p2p_stage) for ev in comm_events
+    ))
     return SchedulePlan(
         plan_id=uuid.uuid4().hex[:12],
         workload_type="train",
@@ -404,7 +456,7 @@ def build_schedule_plan(
         num_micro_batches=num_micro_batches,
         pipeline_schedule=pipeline_schedule,
         gradient_accumulation=gradient_accumulation,
-        annotations={"rank_table": rank_table.to_dict()},
+        annotations={"rank_table": rank_table.to_dict(), "comm_events_summary": comm_summary},
     )
 
 

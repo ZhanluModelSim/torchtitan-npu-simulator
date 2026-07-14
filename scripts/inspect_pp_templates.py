@@ -31,6 +31,8 @@ def _worker(rank, nproc, sim_ws, config_name, extra_args):
         print("step_templates:", list(wg.step_templates.keys()), flush=True)
         plan = wg.schedule_plan
         if plan is not None:
+            print("  comm_events_summary:", plan.annotations.get("comm_events_summary"), flush=True)
+        if plan is not None:
             at = Counter(a.action_type for a in plan.actions)
             # flatten OVERLAP_F_B sub_actions into the count
             at_flat = Counter()
@@ -48,6 +50,18 @@ def _worker(rank, nproc, sim_ws, config_name, extra_args):
             print(f"  flattened: {dict(at_flat)}", flush=True)
             print(f"  data_slots: {len(plan.data_slots)} kinds={dict(slot_kinds)} "
                   f"local={local} p2p={p2p}", flush=True)
+            # UNSHARD/RESHARD action linkage (template_ref / comm_op_id / is_noop)
+            for a in plan.actions:
+                if a.action_type in ("UNSHARD", "RESHARD"):
+                    op = plan.find_op_node(a.comm_op_id) if a.comm_op_id else None
+                    opinfo = ""
+                    if op is not None:
+                        m = op.outputs[0] if op.outputs else None
+                        opinfo = (f" -> OpNode#{op.op_id} raw={op.annotations.get('raw_op_type','')} "
+                                  f"shape={list(m.shape) if m else []} comm_bytes={op.comm_bytes}")
+                    print(f"    {a.action_type} s{a.stage} seq={a.seq_idx} "
+                          f"template_ref={a.template_ref or '(none)'} "
+                          f"comm_op_id={a.comm_op_id} is_noop={a.is_noop}{opinfo}", flush=True)
             # sample a few SEND_F / local activation slots
             for s in list(plan.data_slots.values())[:4]:
                 tag = "LOCAL" if s.is_local_transfer else s.comm_primitive
