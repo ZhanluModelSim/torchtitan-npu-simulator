@@ -11,7 +11,12 @@ import torch.distributed as dist
 from torch.distributed import _functional_collectives as funcol
 
 from torchtitan_npu.simulator.capture.comm_events import capture_fake_collectives
-from torchtitan_npu.simulator.meta_env import _local_tensor_for_shape, _split_meta_dtensor
+from torchtitan_npu.simulator.meta_env import (
+    _local_tensor_for_shape,
+    _split_meta_dtensor,
+    patch_device_type_to_meta,
+    unpatch_device_type_to_meta,
+)
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -100,6 +105,26 @@ def test_dtensor_shape_checks_use_local_shape():
 
     assert tensor.shape == (2, 16)
     assert _local_tensor_for_shape(tensor).shape == (2, 2)
+
+
+def test_hsdp_ep_mesh_info_uses_replicate_then_shard_axes():
+    from torch.distributed.device_mesh import DeviceMesh
+    from torch.distributed.fsdp._fully_shard._fsdp_common import HSDPMeshInfo
+    import torchtitan.models.llama4.parallelize as llama4_parallelize
+
+    mesh = DeviceMesh(
+        "meta",
+        torch.arange(8).reshape(2, 4),
+        mesh_dim_names=("dp_replicate", "fsdp"),
+    )
+    try:
+        patch_device_type_to_meta()
+        mesh_info = llama4_parallelize.FSDPMeshInfo(mesh, shard_mesh_dim=0)
+        assert isinstance(mesh_info, HSDPMeshInfo)
+        assert mesh_info.replicate_mesh_dim == 0
+        assert mesh_info.shard_mesh_dim == 1
+    finally:
+        unpatch_device_type_to_meta()
 
 
 def test_collectives_restored_after_context_exit():

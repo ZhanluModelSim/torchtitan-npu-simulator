@@ -158,7 +158,12 @@ class OpDispatchCapture(TorchDispatchMode):
         real op name + output shape are known analytically. Participates in
         the same producer/consumer id(tensor) wiring, repeat_count dedup,
         and phase tagging as real dispatched events."""
-        self._record_event(raw_op_type, inputs, outputs, module_path)
+        self._record_event(
+            raw_op_type,
+            _flatten_tensors(inputs),
+            _flatten_tensors(outputs),
+            module_path,
+        )
 
     def _record_event(
         self,

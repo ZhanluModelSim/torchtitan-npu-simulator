@@ -188,6 +188,8 @@ _original_send_object_list: Any = _MISSING
 _original_torch_equal: Any = _MISSING
 _original_fwd_one_chunk: Any = _MISSING
 _original_bwd_one_chunk: Any = _MISSING
+_original_fused_adamw: Any = _MISSING
+_original_llama4_fsdp_mesh_info: Any = _MISSING
 _original_get_stage_indices: Any = _MISSING
 _patched = False
 
@@ -1918,35 +1920,62 @@ def _patch_fused_adamw_for_meta() -> None:
     ``npu.npu_apply_adam_w`` (a fused NPU kernel). Under meta simulation,
     ``fused=True`` raises RuntimeError (meta device not in supported list).
 
-    This patch replaces ``torch._fused_adamw_`` with a meta-safe shim that:
-    1. Records ``npu.npu_apply_adam_w.default`` via ``record_synthetic_op``
-    2. Executes standard foreach AdamW math for shape inference
-    3. Suppresses individual ``_foreach_*`` sub-op capture
+    This patch replaces ``torch._fused_adamw_`` with a meta-safe shim that
+    records ``npu.npu_apply_adam_w.default`` without performing numerical
+    optimizer updates.
     """
-    if not _is_meta_simulation:
+    global _original_fused_adamw
+    if _original_fused_adamw is not _MISSING:
         return
     try:
         from torchtitan_npu.simulator.hardware_shims.optimizer_shim import _meta_safe_fused_adamw
         import torch
 
-        if not hasattr(torch, "_sim_orig_fused_adamw"):
-            torch._sim_orig_fused_adamw = torch._fused_adamw_
+        _original_fused_adamw = torch._fused_adamw_
 
-            def _patched_fused_adamw(params, grads, exp_avgs, exp_avg_sqs,
-                                     max_exp_avg_sqs, state_steps, **kwargs):
-                if not _is_meta_simulation:
-                    return torch._sim_orig_fused_adamw(
-                        params, grads, exp_avgs, exp_avg_sqs,
-                        max_exp_avg_sqs, state_steps, **kwargs
-                    )
-                return _meta_safe_fused_adamw(
+        def _patched_fused_adamw(params, grads, exp_avgs, exp_avg_sqs,
+                                 max_exp_avg_sqs, state_steps, **kwargs):
+            if not _is_meta_simulation:
+                return _original_fused_adamw(
                     params, grads, exp_avgs, exp_avg_sqs,
                     max_exp_avg_sqs, state_steps, **kwargs
                 )
+            return _meta_safe_fused_adamw(
+                params, grads, exp_avgs, exp_avg_sqs,
+                max_exp_avg_sqs, state_steps, **kwargs
+            )
 
-            torch._fused_adamw_ = _patched_fused_adamw
+        torch._fused_adamw_ = _patched_fused_adamw
     except Exception:
+        _original_fused_adamw = _MISSING
         pass
+
+
+def _patch_llama4_hsdp_ep_mesh_info() -> None:
+    """Preserve the replicate axis for llama4's HSDP+EP placement callback.
+
+    The pinned torchtitan ``llama4.apply_fsdp`` builds ``FSDPMeshInfo``
+    explicitly for per-parameter EP placement. On a 2D HSDP mesh that makes
+    dim 0 (``dp_replicate``) the shard axis, instead of replicating on dim 0
+    and sharding on dim 1 (``fsdp``). PyTorch's normal 2D fully_shard path
+    uses ``HSDPMeshInfo`` with the correct axes.
+    """
+    global _original_llama4_fsdp_mesh_info
+    if _original_llama4_fsdp_mesh_info is not _MISSING:
+        return
+
+    import torchtitan.models.llama4.parallelize as llama4_parallelize
+    from torch.distributed.fsdp._fully_shard._fsdp_common import HSDPMeshInfo
+
+    original = llama4_parallelize.FSDPMeshInfo
+    _original_llama4_fsdp_mesh_info = original
+
+    def _hsdp_aware_mesh_info(mesh, *args, **kwargs):  # noqa: ANN001, ANN202
+        if mesh.ndim == 2:
+            return HSDPMeshInfo(mesh, shard_mesh_dim=1, replicate_mesh_dim=0)
+        return original(mesh, *args, **kwargs)
+
+    llama4_parallelize.FSDPMeshInfo = _hsdp_aware_mesh_info
 
 
 def patch_device_type_to_meta() -> None:
@@ -2032,6 +2061,7 @@ def patch_device_type_to_meta() -> None:
     _patch_dtensor_random_for_fake_mesh()
     _patch_comm_layer_context()
     _patch_mxfp8_for_meta()
+    _patch_llama4_hsdp_ep_mesh_info()
     _patch_fused_adamw_for_meta()
     global _is_meta_simulation
     _is_meta_simulation = True
@@ -2040,12 +2070,15 @@ def patch_device_type_to_meta() -> None:
 
 def unpatch_device_type_to_meta() -> None:
     """Restore the original device_type/device_module bindings (test-only helper)."""
-    global _patched, _original_fsdp_validate_no_meta_params, _original_tensor_npu_method, _original_torch_full
+    global _patched, _is_meta_simulation
+    global _original_fsdp_validate_no_meta_params, _original_tensor_npu_method, _original_torch_full
     global _original_moe_token_dispatch, _original_grouped_mm, _original_li_loss_forward, _original_pipeline_schedule_warmup_p2p
     global _original_window_exchange, _original_dtensor_meta_to_dtensor, _original_rowwise_prepare_output
     global _original_torch_split
     global _original_redistribute_local_tensor, _original_recv_object_list, _original_send_object_list
     global _original_torch_equal
+    global _original_fused_adamw
+    global _original_llama4_fsdp_mesh_info
     for (module_path, attr_name), original in _original_values.items():
         module = importlib.import_module(module_path)
         if original is _MISSING:
@@ -2130,4 +2163,15 @@ def unpatch_device_type_to_meta() -> None:
         torch.equal = _original_torch_equal
         _original_torch_equal = _MISSING
 
+    if _original_fused_adamw is not _MISSING:
+        torch._fused_adamw_ = _original_fused_adamw
+        _original_fused_adamw = _MISSING
+
+    if _original_llama4_fsdp_mesh_info is not _MISSING:
+        import torchtitan.models.llama4.parallelize as llama4_parallelize
+
+        llama4_parallelize.FSDPMeshInfo = _original_llama4_fsdp_mesh_info
+        _original_llama4_fsdp_mesh_info = _MISSING
+
+    _is_meta_simulation = False
     _patched = False

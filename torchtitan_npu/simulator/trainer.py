@@ -317,8 +317,7 @@ class SimulationTrainer(Trainer):
             config.optimizer.swap_optimizer = False
         # Keep implementation="fused" — _patch_fused_adamw_for_meta in
         # meta_env.py patches torch._fused_adamw_ with a meta-safe shim
-        # that records npu.npu_apply_adam_w and uses standard foreach
-        # math for shape inference.
+        # that records npu.npu_apply_adam_w without numerical updates.
 
         patch_device_type_to_meta()
 
