@@ -21,7 +21,7 @@ from torchtitan.trainer import Trainer
 from torchtitan_npu.simulator.capture.comm_events import capture_fake_collectives
 from torchtitan_npu.simulator.capture.dispatch_capture import OpDispatchCapture
 from torchtitan_npu.simulator.capture.module_path import ModulePathTracker
-from torchtitan_npu.simulator.capture.schedule_builder import build_schedule_graph
+from torchtitan_npu.simulator.capture.schedule_builder import build_schedule_graph, build_schedule_plan
 from torchtitan_npu.simulator.capture.step_boundary import StepBoundaryTracker, build_step_graphs
 from torchtitan_npu.simulator.capture.workload_builder import build_workload_graph
 from torchtitan_npu.simulator.hardware_shims.mhc_converter import apply_mhc_shims
@@ -108,6 +108,7 @@ def run_simulation_step(
     num_micro_batches: int = 1,
     gradient_accumulation: int = 1,
     rank: int = 0,
+    pp_schedule: Any | None = None,
 ) -> WorkloadGraph:
     """Run one forward+backward+optimizer step under full capture and
     return the resulting four-layer WorkloadGraph. Bypasses
@@ -214,6 +215,20 @@ def run_simulation_step(
     )
     timings["build_schedule_graph"] = time.perf_counter() - t7
 
+    t7b = time.perf_counter()
+    schedule_plan = build_schedule_plan(
+        step_templates=step_templates,
+        rank_table=rank_table,
+        comm_events=comm_recorder.events,
+        timeline_events=comm_recorder.timeline_events,
+        pp_schedule_obj=pp_schedule,
+        pipeline_schedule=pipeline_schedule,
+        num_micro_batches=num_micro_batches,
+        gradient_accumulation=gradient_accumulation,
+        rank=rank,
+    )
+    timings["build_schedule_plan"] = time.perf_counter() - t7b
+
     t8 = time.perf_counter()
     wg = build_workload_graph(
         schedule_graph=schedule_graph,
@@ -221,6 +236,7 @@ def run_simulation_step(
         local_batch_size=local_batch_size,
         seq_len=seq_len,
         num_micro_batches=num_micro_batches,
+        schedule_plan=schedule_plan,
     )
     timings["build_workload_graph"] = time.perf_counter() - t8
 
@@ -235,7 +251,7 @@ def run_simulation_step(
     total = timings["total"]
     for name in ["setup", "forward_backward", "optimizer", "build_nodes",
                  "build_step_graphs", "build_rank_table", "build_schedule_graph",
-                 "build_workload_graph"]:
+                 "build_schedule_plan", "build_workload_graph"]:
         t = timings[name]
         print(f"{name:<30} {t:>10.2f} {t/total*100:>7.1f}%")
     print("-" * 60)
@@ -346,6 +362,7 @@ class SimulationTrainer(Trainer):
             num_micro_batches=self.gradient_accumulation_steps,
             gradient_accumulation=self.gradient_accumulation_steps,
             rank=rank,
+            pp_schedule=getattr(self, "pp_schedule", None),
         )
 
         t2 = time.perf_counter()
@@ -540,6 +557,11 @@ class SimulationTrainer(Trainer):
             os.makedirs(ir_dir, exist_ok=True)
             # L3: inter-rank schedule
             self.workload_graph.export_schedule_csv(os.path.join(ir_dir, "rank_schedule.csv"))
+            # L2: structured schedule plan (ordered ScheduleActions + DataSlots)
+            if self.workload_graph.schedule_plan is not None:
+                self.workload_graph.schedule_plan.export_schedule_plan_csv(
+                    os.path.join(ir_dir, "schedule_plan.csv")
+                )
             # L2: per-stage L1 schedule
             self.workload_graph.iteration.schedule.export_l1_schedule_csv(
                 os.path.join(ir_dir, "l1_schedule"),

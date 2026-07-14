@@ -29,13 +29,33 @@ def _worker(rank, nproc, sim_ws, config_name, extra_args):
         ct = Counter(e.comp_type for e in sch.execution_timeline)
         print(f"\n##### rank {rank} #####", flush=True)
         print("step_templates:", list(wg.step_templates.keys()), flush=True)
+        plan = wg.schedule_plan
+        if plan is not None:
+            at = Counter(a.action_type for a in plan.actions)
+            # flatten OVERLAP_F_B sub_actions into the count
+            at_flat = Counter()
+            for a in plan.actions:
+                if a.action_type == "OVERLAP_F_B" and a.sub_actions:
+                    at_flat["OVERLAP_F_B"] += 1
+                    for s in a.sub_actions:
+                        at_flat[f"{s.action_type}({s.comp_type})"] += 1
+                else:
+                    at_flat[a.action_type] += 1
+            slot_kinds = Counter(s.kind for s in plan.data_slots.values())
+            local = sum(1 for s in plan.data_slots.values() if s.is_local_transfer)
+            p2p = sum(1 for s in plan.data_slots.values() if s.comm_primitive == "p2p_send")
+            print(f"plan actions: {len(plan.actions)} types={dict(at)}", flush=True)
+            print(f"  flattened: {dict(at_flat)}", flush=True)
+            print(f"  data_slots: {len(plan.data_slots)} kinds={dict(slot_kinds)} "
+                  f"local={local} p2p={p2p}", flush=True)
+            # sample a few SEND_F / local activation slots
+            for s in list(plan.data_slots.values())[:4]:
+                tag = "LOCAL" if s.is_local_transfer else s.comm_primitive
+                print(f"    {s.slot_id}: {s.kind} s{s.src_stage}→s{s.dst_stage} mb{s.mb_idx} "
+                      f"{tag} bytes={s.volume_bytes} prod={s.producer_action_id[:10]} "
+                      f"cons={s.consumer_action_ids[:1]}", flush=True)
         for tid, sg in wg.step_templates.items():
-            hist = Counter(n.annotations.get("raw_op_type", "").split(".")[0]
-                            if "." in n.annotations.get("raw_op_type", "")
-                            else n.annotations.get("op_type", "") for n in sg.nodes.values())
-            stages = Counter(n.annotations.get("pp_stage", -1) for n in sg.nodes.values())
-            print(f"  {tid}: step_type={sg.step_type} nodes={len(sg.nodes)} "
-                  f"pp_stage_dist={dict(stages)} top_kinds={dict(hist.most_common(5))}", flush=True)
+            print(f"  {tid}: step_type={sg.step_type} nodes={len(sg.nodes)}", flush=True)
         print("instances:", [(i.instance_id, i.comp_type, i.micro_batch_idx, i.pipeline_stage)
                              for i in sch.instances], flush=True)
         print("timeline total:", len(sch.execution_timeline), "comp_type dist:", dict(ct), flush=True)

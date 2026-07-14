@@ -12,6 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from torchtitan_npu.simulator.ir.schedule_graph import DataPass, ScheduleGraph
+from torchtitan_npu.simulator.ir.schedule_plan import SchedulePlan
 from torchtitan_npu.simulator.ir.step_graph import StepGraph
 
 
@@ -51,6 +52,10 @@ class WorkloadGraph:
     data_inputs: list[DataFlow] = field(default_factory=list)
     data_outputs: list[DataFlow] = field(default_factory=list)
     cross_iter_passes: list[DataPass] = field(default_factory=list)
+    # Structured L2 scheduling view (ordered ScheduleActions + DataSlots).
+    # None only when build_workload_graph was called without a plan (e.g. a
+    # legacy caller); the flat ScheduleGraph remains on `iteration.schedule`.
+    schedule_plan: SchedulePlan | None = None
     total_runtime_est: float = 0.0
     total_cost_est: float = 0.0
 

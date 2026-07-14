@@ -11,12 +11,401 @@ See docs/design/schedule-capture-design.md for the design rationale."""
 
 from __future__ import annotations
 
+import itertools
 import uuid
+from typing import Any
 
 from torchtitan_npu.simulator.capture.comm_events import CommEvent
 from torchtitan_npu.simulator.ir.schedule_graph import DataPass, ScheduleGraph, StepInstance, TensorSlot, TimelineEntry
+from torchtitan_npu.simulator.ir.schedule_plan import DataSlot, ScheduleAction, SchedulePlan
 from torchtitan_npu.simulator.ir.step_graph import StepGraph
 from torchtitan_npu.simulator.rank_table import RankTable
+
+_slot_counter = itertools.count()
+
+
+def _slot_id() -> str:
+    return f"slot_{next(_slot_counter)}"
+
+
+# Map torch._ComputationType.value -> (action_type, comp_type)
+_CT_MAP: dict[str, tuple[str, str]] = {
+    "F": ("COMPUTE", "F"),
+    "B": ("COMPUTE", "B"),
+    "I": ("COMPUTE", "I"),
+    "W": ("COMPUTE", "W"),
+    "UNSHARD": ("UNSHARD", ""),
+    "RESHARD": ("RESHARD", ""),
+    "SEND_F": ("SEND_F", ""),
+    "RECV_F": ("RECV_F", ""),
+    "SEND_B": ("SEND_B", ""),
+    "RECV_B": ("RECV_B", ""),
+    "REDUCE_GRAD": ("REDUCE_GRAD", ""),
+    "OVERLAP_F_B": ("OVERLAP_F_B", ""),
+}
+
+
+def build_schedule_plan(
+    *,
+    step_templates: dict[str, StepGraph],
+    rank_table: RankTable,
+    comm_events: list[CommEvent],
+    timeline_events: list[dict] | None = None,
+    pp_schedule_obj: Any | None = None,
+    pipeline_schedule: str = "none",
+    num_micro_batches: int = 1,
+    gradient_accumulation: int = 1,
+    rank: int = 0,
+) -> SchedulePlan:
+    """Build the structured L2 SchedulePlan: an ordered action list +
+    the DataSlots flowing between actions.
+
+    The action skeleton comes from ``pp_schedule_obj.pipeline_order_with_comms``
+    (runtime zero-bubble schedules: ZBV/DualPipe/Interleaved/LoopedBFS) — the
+    lowered plan that already contains F/B/I/W + UNSHARD/RESHARD/SEND/RECV/
+    REDUCE_GRAD + OVERLAP_F_B in deadlock-safe order.  Single-stage
+    schedules (1F1B/GPipe) have no such plan; their skeleton is synthesized
+    from the captured timeline events.  Non-PP steps fall back to one action
+    per captured L1 template.
+
+    Capture enriches each action: COMPUTE seq_idx/template_ref from the
+    timeline, P2P/FSDP DataSlot shapes from CommEvents, and same-rank
+    adjacent-stage local transfers are synthesized (V-schedule
+    ``set_local_*_input`` produces no comm event).  OPTIMIZER/LR_SCHEDULER
+    are appended after the plan from the captured optimizer-phase nodes.
+    """
+    timeline_events = timeline_events or []
+    actions: list[ScheduleAction] = []
+    data_slots: dict[str, DataSlot] = {}
+    _action_seq = itertools.count()
+
+    # --- lookups from capture -------------------------------------------------
+    # (stage, mb, comp_type) -> seq_idx  (from timeline: forward/backward_*_one_chunk)
+    tl_seq: dict[tuple[int, int, str], int] = {}
+    for ev in timeline_events:
+        stage = int(ev.get("pp_stage", -1))
+        mb = int(ev.get("pp_mb_idx", -1))
+        ct = str(ev.get("comp_type", "") or "")
+        if stage >= 0 and mb >= 0 and ct:
+            tl_seq[(stage, mb, ct)] = int(ev.get("seq_idx", 0))
+    # (stage, mb, direction_base) -> CommEvent  (P2P)
+    p2p_by_key: dict[tuple[int, int, str], CommEvent] = {}
+    for ev in comm_events:
+        d = ev.p2p_direction or ""
+        if not d:
+            continue
+        base = d.replace("_send", "").replace("_recv", "")  # "forward" / "backward"
+        p2p_by_key[(int(ev.p2p_stage), int(ev.p2p_mb_idx), base)] = ev
+    # stage -> [allgather CommEvents], stage -> [reduce_scatter CommEvents]
+    unshard_by_stage: dict[int, list[CommEvent]] = {}
+    reshard_by_stage: dict[int, list[CommEvent]] = {}
+    for ev in comm_events:
+        if ev.comm_layer != "L2":
+            continue
+        if ev.comm_primitive == "allgather":
+            unshard_by_stage.setdefault(int(ev.p2p_stage) if ev.p2p_stage >= 0 else rank, []).append(ev)
+        elif ev.comm_primitive == "reduce_scatter":
+            reshard_by_stage.setdefault(int(ev.p2p_stage) if ev.p2p_stage >= 0 else rank, []).append(ev)
+
+    # --- V-shape same-rank detection -----------------------------------------
+    stage_to_rank: dict[int, int] = {}
+    if pp_schedule_obj is not None:
+        s2r = getattr(pp_schedule_obj, "stage_index_to_group_rank", None)
+        if isinstance(s2r, dict):
+            stage_to_rank = {int(k): int(v) for k, v in s2r.items()}
+
+    def same_rank(a: int, b: int) -> bool:
+        if a not in stage_to_rank or b not in stage_to_rank:
+            return False
+        return stage_to_rank[a] == stage_to_rank[b]
+
+    def find_compute(stage: int, mb: int, comp_type: str) -> ScheduleAction | None:
+        for a in actions:
+            if a.action_type == "COMPUTE" and a.stage == stage and a.mb_idx == mb and a.comp_type == comp_type:
+                return a
+            if a.action_type == "OVERLAP_F_B" and a.sub_actions:
+                for s in a.sub_actions:
+                    if s.action_type == "COMPUTE" and s.stage == stage and s.mb_idx == mb and s.comp_type == comp_type:
+                        return s
+        return None
+
+    def find_template_exit_shape(stage: int, comp_type: str) -> tuple[tuple, str, int]:
+        """Best-effort (shape, dtype, bytes) of a template's exit tensor."""
+        sg = step_templates.get(f"s{stage}_{comp_type}")
+        if not sg or not sg.nodes:
+            return (), "", 0
+        from torchtitan_npu.simulator.capture.tensor_utils import tensor_volume_bytes
+        # pick the last topological exit node's first output
+        for op_id in reversed(list(sg.nodes.keys())):
+            n = sg.nodes[op_id]
+            if n.outputs:
+                m = n.outputs[0]
+                return tuple(m.shape), str(m.dtype), tensor_volume_bytes(tuple(m.shape), str(m.dtype))
+        return (), "", 0
+
+    # --- map a torch _Action -> ScheduleAction --------------------------------
+    def map_action(a: Any, seq_hint: int) -> ScheduleAction:
+        ct_val = getattr(a, "computation_type", None)
+        ct = getattr(ct_val, "value", str(ct_val))
+        action_type, comp_type = _CT_MAP.get(ct, ("COMPUTE", ""))
+        stage = int(getattr(a, "stage_index", -1))
+        mb = getattr(a, "microbatch_index", None)
+        mb = int(mb) if mb is not None else -1
+        if action_type == "OVERLAP_F_B" and getattr(a, "sub_actions", None):
+            subs = [map_action(s, seq_hint) for s in a.sub_actions]
+            return ScheduleAction(
+                action_id=f"r{rank}_a{next(_action_seq)}", rank=rank, stage=-1, mb_idx=-1,
+                action_type="OVERLAP_F_B", seq_idx=seq_hint, sub_actions=subs,
+            )
+        seq = seq_hint
+        if action_type == "COMPUTE" and comp_type and stage >= 0 and mb >= 0:
+            seq = tl_seq.get((stage, mb, comp_type), seq_hint)
+        tmpl = f"s{stage}_{comp_type}" if (action_type == "COMPUTE" and comp_type) else ""
+        return ScheduleAction(
+            action_id=f"r{rank}_a{next(_action_seq)}", rank=rank, stage=stage, mb_idx=mb,
+            action_type=action_type, comp_type=comp_type, template_ref=tmpl, seq_idx=seq,
+        )
+
+    # --- 1. action skeleton ---------------------------------------------------
+    plan_obj = None
+    if pp_schedule_obj is not None:
+        plan_obj = getattr(pp_schedule_obj, "pipeline_order_with_comms", None)
+    if plan_obj and rank in plan_obj:
+        # runtime schedule: lower the plan for this rank
+        for i, a in enumerate(plan_obj[rank]):
+            actions.append(map_action(a, i))
+    elif timeline_events:
+        # single-stage PP (1F1B/GPipe): synthesize COMPUTE actions from timeline
+        for ev in sorted(timeline_events, key=lambda e: e.get("seq_idx", 0)):
+            ct = str(ev.get("comp_type", "") or "")
+            if not ct:
+                act = ev.get("action", "")
+                ct = "F" if "forward" in act else ("W" if "weight" in act else "B")
+            stage = int(ev.get("pp_stage", rank))
+            mb = int(ev.get("pp_mb_idx", 0))
+            actions.append(ScheduleAction(
+                action_id=f"r{rank}_a{next(_action_seq)}", rank=rank, stage=stage, mb_idx=mb,
+                action_type="COMPUTE", comp_type=ct, template_ref=f"s{stage}_{ct}",
+                seq_idx=int(ev.get("seq_idx", 0)),
+            ))
+        # comm actions (P2P + FSDP) from CommEvents
+        for ev in comm_events:
+            d = ev.p2p_direction or ""
+            if d:
+                base = d.replace("_send", "").replace("_recv", "")
+                atype = ("SEND_F" if "send" in d and base == "forward" else
+                         "RECV_F" if "recv" in d and base == "forward" else
+                         "SEND_B" if "send" in d else "RECV_B")
+            elif ev.comm_primitive == "allgather":
+                atype = "UNSHARD"
+            elif ev.comm_primitive == "reduce_scatter":
+                atype = "RESHARD"
+            else:
+                continue
+            actions.append(ScheduleAction(
+                action_id=f"r{rank}_a{next(_action_seq)}", rank=rank,
+                stage=int(ev.p2p_stage) if ev.p2p_stage >= 0 else rank,
+                mb_idx=int(ev.p2p_mb_idx) if ev.p2p_mb_idx >= 0 else -1,
+                action_type=atype, seq_idx=int(ev.seq_idx),
+            ))
+    else:
+        # non-PP: one action per captured template, ordered F < B < OPTIMIZER
+        order = {"F": 0, "B": 1, "OPTIMIZER": 2}
+        for tid in sorted(step_templates, key=lambda t: order.get(step_templates[t].step_type, 9)):
+            sg = step_templates[tid]
+            ct = sg.step_type
+            min_seq = min((n.seq_idx for n in sg.nodes.values()), default=0)
+            actions.append(ScheduleAction(
+                action_id=f"r{rank}_a{next(_action_seq)}", rank=rank, stage=rank, mb_idx=0,
+                action_type="COMPUTE" if ct != "OPTIMIZER" else "OPTIMIZER",
+                comp_type=ct, template_ref=tid, seq_idx=min_seq,
+            ))
+
+    # --- 2. DataSlots: P2P activations / grad_inputs -------------------------
+    def add_slot(slot: DataSlot) -> None:
+        data_slots[slot.slot_id] = slot
+        # wire producer/consumer action lists
+        if slot.producer_action_id:
+            pa = _lookup(slot.producer_action_id)
+            if pa and slot.slot_id not in pa.produces:
+                pa.produces.append(slot.slot_id)
+        for cid in slot.consumer_action_ids:
+            ca = _lookup(cid)
+            if ca and slot.slot_id not in ca.consumes:
+                ca.consumes.append(slot.slot_id)
+
+    def _lookup(aid: str) -> ScheduleAction | None:
+        for a in actions:
+            if a.action_id == aid:
+                return a
+            if a.sub_actions:
+                for s in a.sub_actions:
+                    if s.action_id == aid:
+                        return s
+        return None
+
+    # P2P forward_send: activation F(S) -> F(S+1)
+    for ev in comm_events:
+        d = ev.p2p_direction or ""
+        if "send" not in d:
+            continue
+        stage = int(ev.p2p_stage)
+        mb = int(ev.p2p_mb_idx)
+        if "forward" in d:
+            src_ct, dst_ct, dst_stage = "F", "F", stage + 1
+            kind = "activation"
+        else:  # backward_send: grad_input from I/B(S) -> B(S-1)
+            src_ct = "I"  # may be B for full backward; resolve below
+            dst_ct, dst_stage, kind = "B", stage - 1, "grad_input"
+        prod = find_compute(stage, mb, src_ct) or find_compute(stage, mb, "B")
+        cons = find_compute(dst_stage, mb, dst_ct)
+        slot = DataSlot(
+            slot_id=_slot_id(), kind=kind,
+            shape=ev.tensor_shape, dtype=ev.dtype, volume_bytes=ev.volume_bytes,
+            producer_action_id=prod.action_id if prod else "",
+            consumer_action_ids=[cons.action_id] if cons else [],
+            src_stage=stage, dst_stage=dst_stage, mb_idx=mb,
+            comm_primitive="p2p_send", is_local_transfer=False,
+            src_exit_op=ev.src_exit_op, dst_entry_op=ev.dst_entry_op,
+        )
+        add_slot(slot)
+
+    # --- 3. DataSlots: V-schedule local transfers (synthesized, no CommEvent) --
+    for a in list(actions):
+        if a.action_type != "COMPUTE" or a.comp_type != "F" or a.stage < 0 or a.mb_idx < 0:
+            continue
+        s, mb = a.stage, a.mb_idx
+        if not same_rank(s, s + 1):
+            continue  # cross-rank: already covered by P2P SEND_F
+        cons = find_compute(s + 1, mb, "F")
+        if not cons:
+            continue
+        shape, dtype, bytes_ = find_template_exit_shape(s, "F")
+        slot = DataSlot(
+            slot_id=_slot_id(), kind="activation", shape=shape, dtype=dtype, volume_bytes=bytes_,
+            producer_action_id=a.action_id, consumer_action_ids=[cons.action_id],
+            src_stage=s, dst_stage=s + 1, mb_idx=mb,
+            comm_primitive="", is_local_transfer=True,
+        )
+        add_slot(slot)
+    # local backward: I/B(S) -> B(S-1) same rank
+    for a in list(actions):
+        if a.action_type != "COMPUTE" or a.comp_type not in ("I", "B") or a.stage < 0 or a.mb_idx < 0:
+            continue
+        s, mb = a.stage, a.mb_idx
+        if not same_rank(s, s - 1):
+            continue
+        cons = find_compute(s - 1, mb, "B")
+        if not cons:
+            continue
+        shape, dtype, bytes_ = find_template_exit_shape(s, a.comp_type)
+        slot = DataSlot(
+            slot_id=_slot_id(), kind="grad_input", shape=shape, dtype=dtype, volume_bytes=bytes_,
+            producer_action_id=a.action_id, consumer_action_ids=[cons.action_id],
+            src_stage=s, dst_stage=s - 1, mb_idx=mb,
+            comm_primitive="", is_local_transfer=True,
+        )
+        add_slot(slot)
+
+    # --- 4. DataSlots: FSDP unshard/reshard (param_full / param_shard) --------
+    for a in actions:
+        if a.action_type != "UNSHARD":
+            continue
+        s = a.stage if a.stage >= 0 else rank
+        # producer = UNSHARD; consumer = next COMPUTE on that stage (any comp_type)
+        cons = None
+        for ca in actions:
+            if ca.action_type == "COMPUTE" and ca.stage == s and a not in (ca,):
+                # earliest compute after this unshard by seq_idx
+                if cons is None or (ca.seq_idx < cons.seq_idx and ca.seq_idx >= a.seq_idx):
+                    if ca.seq_idx >= a.seq_idx:
+                        cons = ca
+        evs = unshard_by_stage.get(s, [])
+        shape = evs[0].tensor_shape if evs else ()
+        dtype = evs[0].dtype if evs else ""
+        bytes_ = evs[0].volume_bytes if evs else 0
+        slot = DataSlot(
+            slot_id=_slot_id(), kind="param_full", shape=shape, dtype=dtype, volume_bytes=bytes_,
+            producer_action_id=a.action_id,
+            consumer_action_ids=[cons.action_id] if cons else [],
+            src_stage=s, dst_stage=s, comm_primitive="allgather" if evs else "",
+            src_exit_op=evs[0].src_exit_op if evs else 0,
+            dst_entry_op=evs[0].dst_entry_op if evs else 0,
+        )
+        add_slot(slot)
+    for a in actions:
+        if a.action_type != "RESHARD":
+            continue
+        s = a.stage if a.stage >= 0 else rank
+        # producer = preceding backward COMPUTE on that stage; consumer = RESHARD
+        prod = None
+        for ca in actions:
+            if (ca.action_type == "COMPUTE" and ca.stage == s
+                    and ca.comp_type in ("B", "I", "W") and ca.seq_idx <= a.seq_idx):
+                if prod is None or ca.seq_idx > prod.seq_idx:
+                    prod = ca
+        evs = reshard_by_stage.get(s, [])
+        shape = evs[0].tensor_shape if evs else ()
+        dtype = evs[0].dtype if evs else ""
+        bytes_ = evs[0].volume_bytes if evs else 0
+        slot = DataSlot(
+            slot_id=_slot_id(), kind="param_shard", shape=shape, dtype=dtype, volume_bytes=bytes_,
+            producer_action_id=prod.action_id if prod else "",
+            consumer_action_ids=[a.action_id],
+            src_stage=s, dst_stage=s, mb_idx=-1,
+            comm_primitive="reduce_scatter" if evs else "",
+        )
+        add_slot(slot)
+
+    # --- 5. REDUCE_GRAD -> OPTIMIZER (grad_reduced) ---------------------------
+    reduce_actions = [a for a in actions if a.action_type == "REDUCE_GRAD"]
+    grad_reduced_slots: list[str] = []
+    for a in reduce_actions:
+        slot = DataSlot(
+            slot_id=_slot_id(), kind="grad_reduced", shape=(), dtype="",
+            producer_action_id=a.action_id, consumer_action_ids=[],
+            src_stage=a.stage if a.stage >= 0 else rank, dst_stage=a.stage if a.stage >= 0 else rank,
+        )
+        add_slot(slot)
+        grad_reduced_slots.append(slot.slot_id)
+
+    # --- 6. OPTIMIZER action (from captured optimizer L1 template) -----------
+    opt_tmpl = step_templates.get(f"s{rank}_OPTIMIZER") or step_templates.get("s-1_OPTIMIZER")
+    if opt_tmpl:
+        # already added in non-PP path; for PP add it now at the tail
+        if not any(a.action_type == "OPTIMIZER" for a in actions):
+            min_seq = min((n.seq_idx for n in opt_tmpl.nodes.values()), default=(len(actions)))
+            act = ScheduleAction(
+                action_id=f"r{rank}_a{next(_action_seq)}", rank=rank, stage=rank, mb_idx=-1,
+                action_type="OPTIMIZER", comp_type="OPTIMIZER",
+                template_ref=f"s{rank}_OPTIMIZER", seq_idx=min_seq,
+            )
+            actions.append(act)
+        opt_action = next(a for a in actions if a.action_type == "OPTIMIZER")
+        for sid in grad_reduced_slots:
+            data_slots[sid].consumer_action_ids.append(opt_action.action_id)
+            if sid not in opt_action.consumes:
+                opt_action.consumes.append(sid)
+
+    # --- assemble -------------------------------------------------------------
+    actions.sort(key=lambda a: a.seq_idx)
+    dp_degree = rank_table.dim_degrees.get("dp_replicate", 1) * rank_table.dim_degrees.get(
+        "fsdp", rank_table.dim_degrees.get("dp_shard", 1)
+    )
+    return SchedulePlan(
+        plan_id=uuid.uuid4().hex[:12],
+        workload_type="train",
+        step_templates=step_templates,
+        actions=actions,
+        data_slots=data_slots,
+        pp_degree=rank_table.dim_degrees.get("pp", 1),
+        tp_degree=rank_table.dim_degrees.get("tp", 1),
+        dp_degree=dp_degree,
+        num_micro_batches=num_micro_batches,
+        pipeline_schedule=pipeline_schedule,
+        gradient_accumulation=gradient_accumulation,
+        annotations={"rank_table": rank_table.to_dict()},
+    )
 
 
 def build_schedule_graph(
