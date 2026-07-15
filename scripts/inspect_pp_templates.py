@@ -50,7 +50,15 @@ def _worker(rank, nproc, sim_ws, config_name, extra_args):
             print(f"  flattened: {dict(at_flat)}", flush=True)
             print(f"  data_slots: {len(plan.data_slots)} kinds={dict(slot_kinds)} "
                   f"local={local} p2p={p2p}", flush=True)
-            # UNSHARD/RESHARD action linkage (template_ref / comm_op_id / is_noop)
+            # P2P comm actions: direct CommDetail field (no 2-hop lookup)
+            for a in plan.actions:
+                if a.action_type in ("SEND_F", "RECV_F", "SEND_B", "RECV_B") and a.comm is not None:
+                    c = a.comm
+                    print(f"    {a.action_type} s{a.stage} mb{a.mb_idx} seq={a.seq_idx} "
+                          f"comm={c.primitive}/{c.role} {c.volume_bytes}B "
+                          f"s{c.src_stage}->s{c.dst_stage} peer={c.peer_rank} "
+                          f"op_id={c.comm_op_id} slot={c.slot_id}", flush=True)
+            # UNSHARD/RESHARD action linkage
             for a in plan.actions:
                 if a.action_type in ("UNSHARD", "RESHARD"):
                     op = plan.find_op_node(a.comm_op_id) if a.comm_op_id else None
