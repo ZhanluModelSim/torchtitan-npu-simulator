@@ -326,6 +326,50 @@ def build_schedule_plan(
             if slot.slot_id not in recv_act.consumes:
                 recv_act.consumes.append(slot.slot_id)
 
+    # P2P *_recv (cross-rank receive side): the SEND section above only matched
+    # *_send CommEvents and looked for a RECV action on stage+1 — but in PP the
+    # RECV_F/RECV_B action lives on the RECEIVING rank (a different process), so
+    # on this rank the SEND-side find_action_by(dst, mb, RECV_*) returns None
+    # and the RECV action got no comm. Each *_recv CommEvent IS captured on the
+    # receiving rank (patched_irecv records p2p_direction="*_recv",
+    # p2p_stage=receiving stage, p2p_peer_rank=sender), so process it here to
+    # attach the RECV action's CommDetail directly + wire a recv-side DataSlot
+    # (producer=RECV action, consumer=the local COMPUTE that consumes it).
+    for ev in comm_events:
+        d = ev.p2p_direction or ""
+        if "recv" not in d:
+            continue
+        recv_stage = int(ev.p2p_stage)
+        mb = int(ev.p2p_mb_idx)
+        if "forward" in d:
+            cons_ct, src_stage, kind, recv_at = "F", recv_stage - 1, "activation", "RECV_F"
+        else:  # backward_recv: grad_input consumed by B(recv_stage, mb)
+            cons_ct, src_stage, kind, recv_at = "B", recv_stage + 1, "grad_input", "RECV_B"
+        recv_act = find_action_by(recv_stage, mb, recv_at)
+        cons = find_compute(recv_stage, mb, cons_ct) or find_compute(recv_stage, mb, "B")
+        # a RECV action receives the tensor and feeds the local COMPUTE; model
+        # the recv-side slot with producer=RECV action, consumer=local COMPUTE.
+        slot = DataSlot(
+            slot_id=_slot_id(), kind=kind,
+            shape=ev.tensor_shape, dtype=ev.dtype, volume_bytes=ev.volume_bytes,
+            producer_action_id=recv_act.action_id if recv_act else "",
+            consumer_action_ids=[cons.action_id] if cons else [],
+            src_stage=src_stage, dst_stage=recv_stage, mb_idx=mb,
+            comm_primitive="p2p_send", is_local_transfer=False,
+            src_exit_op=ev.src_exit_op, dst_entry_op=ev.dst_entry_op,
+        )
+        add_slot(slot)
+        if recv_act is not None:
+            recv_act.comm = CommDetail(
+                primitive="p2p_send", role="recv", shape=ev.tensor_shape, dtype=ev.dtype,
+                volume_bytes=ev.volume_bytes, src_stage=src_stage, dst_stage=recv_stage,
+                mb_idx=mb, peer_rank=ev.p2p_peer_rank, comm_group_ranks=ev.comm_ranks,
+                src_exit_op=ev.src_exit_op, dst_entry_op=ev.dst_entry_op,
+                slot_id=slot.slot_id, comm_op_id=ev.op_id,
+            )
+            if slot.slot_id not in recv_act.produces:
+                recv_act.produces.append(slot.slot_id)
+
     # --- 3. DataSlots: V-schedule local transfers (synthesized, no CommEvent) --
     for a in list(actions):
         if a.action_type != "COMPUTE" or a.comp_type != "F" or a.stage < 0 or a.mb_idx < 0:
