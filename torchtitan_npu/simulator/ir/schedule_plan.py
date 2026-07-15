@@ -65,6 +65,36 @@ class DataSlot:
 
 
 @dataclass
+class CommDetail:
+    """Denormalized communication descriptor carried directly on a comm
+    ``ScheduleAction`` (SEND_F/RECV_F/SEND_B/RECV_B/UNSHARD/RESHARD/
+    REDUCE_GRAD) so consumers can read the comm volume / peer / shape without
+    a 2-hop lookup through ``data_slots``. Field set mirrors ``DataPass`` +
+    ``TensorSlot`` (shape/dtype/volume_bytes/src_exit_op/dst_entry_op/
+    comm_group_ranks) plus the L0 ``comm_op_id`` for replay and a ``slot_id``
+    back-ref into ``SchedulePlan.data_slots`` for the full producer/consumer
+    graph. ``None`` for non-comm actions (COMPUTE/OPTIMIZER/OVERLAP_F_B-parent).
+    """
+
+    primitive: str = ""               # p2p_send | allgather | reduce_scatter | allreduce | "" (local)
+    role: str = ""                    # send | recv | collective | ""
+    shape: tuple[int | str, ...] = ()
+    dtype: str = ""
+    volume_bytes: int = 0
+    src_stage: int = -1               # DataPass.src_device analogue (stage-level)
+    dst_stage: int = -1               # DataPass.dst_device analogue
+    mb_idx: int = -1
+    peer_rank: int = -1              # P2P peer rank (TimelineEntry.comm_peer_rank)
+    comm_group_ranks: list[list[int]] = field(default_factory=list)  # DataPass.comm_group_ranks
+    src_exit_op: int = 0             # L1 template exit op (producer side)
+    dst_entry_op: int = 0            # L1 template entry op (consumer side)
+    is_local_transfer: bool = False
+    slot_id: str = ""                # back-ref to the DataSlot this comm transports
+    comm_op_id: int = 0             # L0 comm OpNode id for replay (0 = no-op / not captured)
+    is_noop: bool = False           # FSDP mesh=1 etc: action ran but no real collective
+
+
+@dataclass
 class ScheduleAction:
     """One scheduled unit: a compute chunk, a comm op, an FSDP/optimizer op.
 
@@ -99,6 +129,12 @@ class ScheduleAction:
     # still recorded for schedule completeness, but there is no L0 op / no
     # data transfer to replay.
     is_noop: bool = False
+    # Direct comm descriptor for comm actions (SEND_F/RECV_F/SEND_B/RECV_B/
+    # UNSHARD/RESHARD/REDUCE_GRAD). None for COMPUTE/OPTIMIZER/OVERLAP_F_B
+    # parent. Carries the data-pass-level detail (shape/bytes/peer/group/
+    # src_exit_op/dst_entry_op) + comm_op_id for replay, so consumers don't
+    # need to cross-reference execution_timeline + data_passes.
+    comm: CommDetail | None = None
     annotations: dict[str, Any] = field(default_factory=dict)
 
 
@@ -181,8 +217,14 @@ class SchedulePlan:
                 "seq_idx", "action_id", "action_type", "stage", "mb_idx",
                 "comp_type", "template_ref", "rank",
                 "consumes", "produces", "sub_actions", "annotations",
+                # denormalized comm detail (direct, no 2-hop lookup)
+                "comm_primitive", "comm_role", "comm_bytes", "comm_shape",
+                "comm_src_stage", "comm_dst_stage", "comm_peer_rank",
+                "comm_group_ranks", "comm_src_exit_op", "comm_dst_entry_op",
+                "comm_op_id", "comm_is_noop",
             ])
             for a in sorted(self.actions, key=lambda x: x.seq_idx):
+                c = a.comm
                 w.writerow([
                     a.seq_idx, a.action_id, a.action_type, a.stage,
                     a.mb_idx if a.mb_idx >= 0 else "",
@@ -190,6 +232,13 @@ class SchedulePlan:
                     ";".join(a.consumes), ";".join(a.produces),
                     ";".join(s.action_id for s in (a.sub_actions or [])),
                     ";".join(f"{k}={v}" for k, v in a.annotations.items()),
+                    c.primitive if c else "", c.role if c else "",
+                    c.volume_bytes if c else "", list(c.shape) if c else "",
+                    c.src_stage if c else "", c.dst_stage if c else "",
+                    c.peer_rank if c else "",
+                    ";".join(",".join(str(r) for r in g) for g in c.comm_group_ranks) if c else "",
+                    c.src_exit_op if c else "", c.dst_entry_op if c else "",
+                    c.comm_op_id if c else "", int(c.is_noop) if c else "",
                 ])
             w.writerow(["# DataSlots", "", "", "", "", "", "", "", "", "", "", ""])
             w.writerow([
