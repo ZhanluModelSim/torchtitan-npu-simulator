@@ -35,6 +35,7 @@ def event(
     outputs: list[TensorRef] | None = None,
     phase: str = "forward",
     op_type: str = "elementwise",
+    module_path: str = "",
 ) -> RawMemoryEvent:
     return RawMemoryEvent(
         event_id=seq_idx,
@@ -43,7 +44,7 @@ def event(
         raw_op_type=raw_op_type,
         op_type=op_type,
         phase=phase,
-        module_path="",
+        module_path=module_path,
         inputs=tuple(inputs or []),
         outputs=tuple(outputs or []),
     )
@@ -83,6 +84,92 @@ def test_checkpoint_like_recompute_does_not_extend_original_forward_temp():
     y_lifetime = next(item for item in plan.tensor_lifetimes if item.tensor_id == "tensor:2")
     assert y_lifetime.kind == "temporary"
     assert y_lifetime.death_seq == 1
+
+
+def test_checkpoint_plugin_releases_internal_forward_tensor_before_backward():
+    x, internal, output, grad = tref(1), tref(2), tref(3), tref(4)
+    plan = estimate_static_memory([
+        event(
+            0,
+            10,
+            "aten.relu.default",
+            inputs=[x],
+            outputs=[internal],
+            module_path="layers.0._checkpoint_wrapped_module.norm",
+        ),
+        event(
+            1,
+            11,
+            "aten.add.Tensor",
+            inputs=[internal],
+            outputs=[output],
+            module_path="layers.0._checkpoint_wrapped_module",
+        ),
+        event(5, 20, "aten.relu_backward.default", inputs=[internal], outputs=[grad], phase="backward"),
+    ])
+
+    lifetime = next(item for item in plan.tensor_lifetimes if item.tensor_id == "tensor:2")
+    assert lifetime.kind == "checkpoint_recompute_temp"
+    assert lifetime.death_seq == 1
+
+
+def test_checkpoint_plugin_keeps_cross_scope_output_as_activation():
+    x, output, out, grad = tref(1), tref(2), tref(3), tref(4)
+    plan = estimate_static_memory([
+        event(
+            0,
+            10,
+            "aten.relu.default",
+            inputs=[x],
+            outputs=[output],
+            module_path="layers.0._checkpoint_wrapped_module",
+        ),
+        event(
+            1,
+            11,
+            "aten.add.Tensor",
+            inputs=[output],
+            outputs=[out],
+            module_path="layers.1._checkpoint_wrapped_module",
+        ),
+        event(5, 20, "aten.relu_backward.default", inputs=[output], outputs=[grad], phase="backward"),
+    ])
+
+    lifetime = next(item for item in plan.tensor_lifetimes if item.tensor_id == "tensor:2")
+    assert lifetime.kind == "activation"
+    assert lifetime.death_seq == 5
+
+
+def test_checkpoint_plugin_treats_pathless_collective_as_internal_transport():
+    x, internal, comm_out, grad = tref(1), tref(2), tref(3), tref(4)
+    plan = estimate_static_memory([
+        event(
+            0,
+            10,
+            "aten.relu.default",
+            inputs=[x],
+            outputs=[internal],
+            module_path="layers.0._checkpoint_wrapped_module.moe",
+        ),
+        event(1, 11, "comm.all_to_all", inputs=[internal], outputs=[comm_out]),
+        event(5, 20, "aten.relu_backward.default", inputs=[internal], outputs=[grad], phase="backward"),
+    ])
+
+    lifetime = next(item for item in plan.tensor_lifetimes if item.tensor_id == "tensor:2")
+    assert lifetime.kind == "checkpoint_recompute_temp"
+    assert lifetime.death_seq == 1
+
+
+def test_backward_output_consumed_by_optimizer_is_gradient_accumulator():
+    grad = tref(2, 64)
+    plan = estimate_static_memory([
+        event(0, 10, "aten.mm.default", outputs=[grad], phase="backward"),
+        event(5, 20, "optimizer.step", inputs=[grad], phase="optimizer"),
+    ])
+
+    lifetime = next(item for item in plan.tensor_lifetimes if item.tensor_id == "tensor:2")
+    assert lifetime.kind == "gradient_accumulator"
+    assert lifetime.death_seq == 5
 
 
 def test_alias_output_has_zero_bytes():
@@ -265,6 +352,18 @@ def test_chrome_trace_includes_fsdp_full_param_counter():
     events = trace["traceEvents"]
     assert any(item["ph"] == "M" and item["args"].get("name") == "fsdp full-param bytes" for item in events)
     assert any(item["ph"] == "C" and item["name"] == "active_fsdp_full_param_bytes" for item in events)
+
+
+def test_chrome_trace_includes_gradient_accumulator_counter():
+    grad = tref(2, 64)
+    plan = estimate_static_memory([
+        event(0, 10, "aten.mm.default", outputs=[grad], phase="backward"),
+        event(5, 20, "optimizer.step", inputs=[grad], phase="optimizer"),
+    ])
+
+    events = memory_plan_to_chrome_trace(plan)["traceEvents"]
+    assert any(item["ph"] == "M" and item["args"].get("name") == "gradient accumulator bytes" for item in events)
+    assert any(item["ph"] == "C" and item["name"] == "active_gradient_accumulator_bytes" for item in events)
 
 
 def test_chrome_trace_starts_with_persistent_parameter_bytes():

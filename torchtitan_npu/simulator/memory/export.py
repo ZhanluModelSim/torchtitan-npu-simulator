@@ -75,6 +75,7 @@ def memory_plan_to_chrome_trace(plan: MemoryPlan) -> dict:
         {"name": "thread_name", "ph": "M", "pid": 1, "tid": 1, "args": {"name": "active tensor bytes"}},
         {"name": "thread_name", "ph": "M", "pid": 1, "tid": 2, "args": {"name": "training phase"}},
         {"name": "thread_name", "ph": "M", "pid": 1, "tid": 3, "args": {"name": "fsdp full-param bytes"}},
+        {"name": "thread_name", "ph": "M", "pid": 1, "tid": 4, "args": {"name": "gradient accumulator bytes"}},
     ]
     trace_events.extend(_build_phase_spans(plan))
     active_by_kind: dict[str, int] = {}
@@ -103,6 +104,20 @@ def memory_plan_to_chrome_trace(plan: MemoryPlan) -> dict:
                 "ts": _trace_ts(event.seq_idx),
                 "args": {
                     "active_fsdp_full_param_bytes": active_by_kind.get("fsdp_full_param", 0),
+                    "action": event.action,
+                    "phase": event.phase,
+                    "reason": event.reason,
+                },
+            })
+        if event.kind == "gradient_accumulator":
+            trace_events.append({
+                "name": "active_gradient_accumulator_bytes",
+                "ph": "C",
+                "pid": 1,
+                "tid": 4,
+                "ts": _trace_ts(event.seq_idx),
+                "args": {
+                    "active_gradient_accumulator_bytes": active_by_kind.get("gradient_accumulator", 0),
                     "action": event.action,
                     "phase": event.phase,
                     "reason": event.reason,

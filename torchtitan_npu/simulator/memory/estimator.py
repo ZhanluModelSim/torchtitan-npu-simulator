@@ -19,6 +19,7 @@ import torch
 import torch.nn as nn
 
 from torchtitan_npu.simulator.capture.tensor_utils import dtype_to_str, tensor_volume_bytes
+from torchtitan_npu.simulator.memory.activation_checkpoint import ActivationCheckpointPlugin
 from torchtitan_npu.simulator.memory.alias_rules import is_alias_event, is_mutation_event
 from torchtitan_npu.simulator.memory.fsdp_residency import FSDPFullParamResidencyPlugin
 from torchtitan_npu.simulator.memory.plugins import MemoryModelContext
@@ -163,7 +164,19 @@ def _classify_output(event: RawMemoryEvent, comm_by_op: dict[int, Any]) -> tuple
 
 
 def _finalize_kind(lifetime: TensorLifetime) -> None:
-    if lifetime.kind in {"parameter_shard", "external_input", "alias", "comm_buffer", "fsdp_full_param"}:
+    if lifetime.kind in {
+        "parameter_shard",
+        "external_input",
+        "alias",
+        "fsdp_full_param",
+        "checkpoint_recompute_temp",
+    }:
+        return
+    if lifetime.producer_phase == "backward" and "optimizer" in lifetime.consumer_phases:
+        lifetime.kind = "gradient_accumulator"
+        lifetime.reason = "backward_to_optimizer"
+        return
+    if lifetime.kind == "comm_buffer":
         return
     if not lifetime.consumer_ops:
         lifetime.kind = "dead_temp_output"
@@ -282,6 +295,7 @@ def estimate_static_memory(
         notes=notes,
     )
     plugin_lifetimes = FSDPFullParamResidencyPlugin().apply(plugin_context)
+    ActivationCheckpointPlugin().apply(plugin_context)
 
     lifetimes = [*param_lifetimes, *lifetimes_by_tensor_id.values(), *alias_lifetimes, *plugin_lifetimes]
     for lifetime in lifetimes:
