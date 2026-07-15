@@ -21,7 +21,7 @@ from torchtitan.trainer import Trainer
 from torchtitan_npu.simulator.capture.comm_events import capture_fake_collectives
 from torchtitan_npu.simulator.capture.dispatch_capture import OpDispatchCapture
 from torchtitan_npu.simulator.capture.module_path import ModulePathTracker
-from torchtitan_npu.simulator.capture.schedule_builder import build_schedule_graph
+from torchtitan_npu.simulator.capture.schedule_builder import build_schedule_graph, build_schedule_plan
 from torchtitan_npu.simulator.capture.step_boundary import StepBoundaryTracker, build_step_graphs
 from torchtitan_npu.simulator.capture.workload_builder import build_workload_graph
 from torchtitan_npu.simulator.hardware_shims.mhc_converter import apply_mhc_shims
@@ -108,6 +108,7 @@ def run_simulation_step(
     num_micro_batches: int = 1,
     gradient_accumulation: int = 1,
     rank: int = 0,
+    pp_schedule: Any | None = None,
 ) -> WorkloadGraph:
     """Run one forward+backward+optimizer step under full capture and
     return the resulting four-layer WorkloadGraph. Bypasses
@@ -129,6 +130,16 @@ def run_simulation_step(
 
     patch_device_type_to_meta()
     global_valid_tokens = float(labels.numel())
+
+    # Default PP stage attribution: non-PP steps use stage 0 (the single
+    # stage); PP steps use -1 ("unattributed") so framework setup ops captured
+    # outside any compute chunk (FSDP _lazy_init / inter-chunk comm, which run
+    # before the first forward_one_chunk stamps the real stage) bucket into a
+    # clearly-labelled `s-1_*` template instead of masquerading as stage 0.
+    # `pp_enabled` (pp_degree > 1) is the real signal — the schedule string
+    # is "1F1B" even when PP degree is 1, so it cannot gate this.
+    from torchtitan_npu.simulator.meta_env import _pp_context
+    _pp_context["stage"] = -1 if parallel_dims.pp_enabled else 0
 
     boundary = StepBoundaryTracker()
     module_path_tracker = ModulePathTracker(model_parts[0])
@@ -204,6 +215,20 @@ def run_simulation_step(
     )
     timings["build_schedule_graph"] = time.perf_counter() - t7
 
+    t7b = time.perf_counter()
+    schedule_plan = build_schedule_plan(
+        step_templates=step_templates,
+        rank_table=rank_table,
+        comm_events=comm_recorder.events,
+        timeline_events=comm_recorder.timeline_events,
+        pp_schedule_obj=pp_schedule,
+        pipeline_schedule=pipeline_schedule,
+        num_micro_batches=num_micro_batches,
+        gradient_accumulation=gradient_accumulation,
+        rank=rank,
+    )
+    timings["build_schedule_plan"] = time.perf_counter() - t7b
+
     t8 = time.perf_counter()
     wg = build_workload_graph(
         schedule_graph=schedule_graph,
@@ -211,6 +236,7 @@ def run_simulation_step(
         local_batch_size=local_batch_size,
         seq_len=seq_len,
         num_micro_batches=num_micro_batches,
+        schedule_plan=schedule_plan,
     )
     timings["build_workload_graph"] = time.perf_counter() - t8
 
@@ -225,7 +251,7 @@ def run_simulation_step(
     total = timings["total"]
     for name in ["setup", "forward_backward", "optimizer", "build_nodes",
                  "build_step_graphs", "build_rank_table", "build_schedule_graph",
-                 "build_workload_graph"]:
+                 "build_schedule_plan", "build_workload_graph"]:
         t = timings[name]
         print(f"{name:<30} {t:>10.2f} {t/total*100:>7.1f}%")
     print("-" * 60)
@@ -336,6 +362,7 @@ class SimulationTrainer(Trainer):
             num_micro_batches=self.gradient_accumulation_steps,
             gradient_accumulation=self.gradient_accumulation_steps,
             rank=rank,
+            pp_schedule=getattr(self, "pp_schedule", None),
         )
 
         t2 = time.perf_counter()
@@ -385,6 +412,7 @@ class SimulationTrainer(Trainer):
                     "pipeline_stage": rank,
                     "micro_batch_idx": e.micro_batch_idx,
                     "phase": e.phase,
+                    "comp_type": e.comp_type,
                     "comm_type": e.comm_type,
                     "comm_peer_rank": e.comm_peer_rank,
                 }
@@ -402,6 +430,9 @@ class SimulationTrainer(Trainer):
                         "op_type": n.op_type,
                         "raw_op_type": n.annotations.get("raw_op_type", ""),
                         "phase": n.annotations.get("phase", ""),
+                        "comp_type": n.annotations.get("comp_type", ""),
+                        "fsdp_state": n.annotations.get("fsdp_state", "NA"),
+                        "pp_stage": n.annotations.get("pp_stage", -1),
                         "inputs_shape": [list(m.shape) for m in n.inputs],
                         "outputs_shape": [list(m.shape) for m in n.outputs],
                         "inputs_dtype": [str(m.dtype) for m in n.inputs],
@@ -475,9 +506,9 @@ class SimulationTrainer(Trainer):
                 for tid, sg in r["step_templates"].items():
                     fname = os.path.join(ir_dir, f"stage_{stage}_{sg['step_type']}_l0_ops.csv")
                     with open(fname, "w", encoding="utf-8") as f:
-                        f.write("topo_order,op_id,seq_idx,op_type,raw_op_type,phase,inputs_shape,outputs_shape,flops,peak_mem,comm_bytes,module_path,comm_dim,comm_ranks\n")
+                        f.write("topo_order,op_id,seq_idx,op_type,raw_op_type,phase,comp_type,fsdp_state,pp_stage,inputs_shape,outputs_shape,flops,peak_mem,comm_bytes,module_path,comm_dim,comm_ranks\n")
                         for i, n in enumerate(sg["nodes"]):
-                            f.write(f"{i},{n['op_id']},{n['seq_idx']},{n['op_type']},{n['raw_op_type']},{n['phase']},{';'.join(str(s) for s in n['inputs_shape'])},{';'.join(str(s) for s in n['outputs_shape'])},{n['flops']},{n['peak_mem']},{n['comm_bytes']},{n['module_path']},{n['comm_dim']},{n['comm_ranks']}\n")
+                            f.write(f"{i},{n['op_id']},{n['seq_idx']},{n['op_type']},{n['raw_op_type']},{n['phase']},{n.get('comp_type','')},{n.get('fsdp_state','NA')},{n.get('pp_stage',-1)},{';'.join(str(s) for s in n['inputs_shape'])},{';'.join(str(s) for s in n['outputs_shape'])},{n['flops']},{n['peak_mem']},{n['comm_bytes']},{n['module_path']},{n['comm_dim']},{n['comm_ranks']}\n")
 
         print(f"Merged {len(all_ranks)} PP stages' IR to {out_dir}")
 
@@ -526,6 +557,11 @@ class SimulationTrainer(Trainer):
             os.makedirs(ir_dir, exist_ok=True)
             # L3: inter-rank schedule
             self.workload_graph.export_schedule_csv(os.path.join(ir_dir, "rank_schedule.csv"))
+            # L2: structured schedule plan (ordered ScheduleActions + DataSlots)
+            if self.workload_graph.schedule_plan is not None:
+                self.workload_graph.schedule_plan.export_schedule_plan_csv(
+                    os.path.join(ir_dir, "schedule_plan.csv")
+                )
             # L2: per-stage L1 schedule
             self.workload_graph.iteration.schedule.export_l1_schedule_csv(
                 os.path.join(ir_dir, "l1_schedule"),

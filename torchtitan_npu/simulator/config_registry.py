@@ -247,3 +247,56 @@ def deepseek_v4_pro_simulate_16_layers_pp4_cp4_ep4() -> SimulationTrainerConfig:
         "etp": 1, "world_size": 128,
     }
     return sim_config
+
+
+def deepseek_v4_pro_simulate_16_layers_dualpipe() -> SimulationTrainerConfig:
+    """DualPipeV variant for exercising the OVERLAP_F_B composite action
+    and the V-shaped stage-to-rank mapping (two virtual stages per PP rank).
+
+    Run with: ``python3 scripts/run_simulator_spawn.py
+    --config deepseek_v4_pro_simulate_16_layers_dualpipe
+    --hf_assets_path ./tests/assets/tokenizer/deepseekv3_tokenizer``
+
+    PP=2, layers_per_stage=4 -> num_virtual_stages = PP * 2 = 4, n_local_stages=2
+    (DualPipeV requires exactly 2 stages per rank). DP=1, CP=1, TP=1 ->
+    world_size=2 (gloo nproc=PP=2). global_batch_size=4, local_batch_size=1,
+    dp=1 -> gradient_accumulation=num_microbatches=4 (>= num_stages=4, the
+    DualPipeV minimum).
+    """
+    base_config = deepseek_v4_pro_debug_16_layers()
+    base_config = dataclasses.replace(
+        base_config,
+        training=dataclasses.replace(
+            base_config.training,
+            num_mtp_modules=0,
+            # DualPipeV's n_microbatches = local_batch_size // microbatch_size
+            # (pipeline_parallel_microbatch_size, default 1). Need >= 4 (num
+            # virtual stages); local_batch_size=4 gives exactly 4.
+            local_batch_size=4,
+            global_batch_size=4,
+        ),
+        parallelism=dataclasses.replace(
+            base_config.parallelism,
+            pipeline_parallel_degree=2,
+            pipeline_parallel_schedule="DualPipeV",
+            pipeline_parallel_layers_per_stage=4,  # 16 layers / 4 = 4 virtual stages
+            pipeline_parallel_first_stage_less_layers=0,
+            pipeline_parallel_last_stage_less_layers=0,
+            tensor_parallel_degree=1,
+            context_parallel_degree=1,
+            expert_parallel_degree=1,
+            data_parallel_shard_degree=1,  # world_size / (1*1*1*2) = 1
+            data_parallel_replicate_degree=1,
+        ),
+    )
+    sim_config = _to_simulation_config(
+        base_config,
+        output_dir="./simulator_output/deepseek_v4_pro_16_layers_dualpipe",
+        comm_mode="multi_proc_meta",
+    )
+    sim_config.simulation.simulated_parallel_degrees = {
+        "pp": 2, "tp": 1, "cp": 1, "ep": 1,
+        "dp_replicate": 1, "dp_shard": 1,
+        "etp": 1, "world_size": 2,
+    }
+    return sim_config

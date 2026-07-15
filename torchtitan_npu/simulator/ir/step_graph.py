@@ -111,6 +111,7 @@ class StepGraph:
             w = csv.writer(f)
             w.writerow([
                 "topo_order", "op_id", "seq_idx", "op_type", "raw_op_type", "phase",
+                "comp_type", "fsdp_state",
                 "inputs_shape", "outputs_shape", "inputs_dtype", "outputs_dtype",
                 "flops", "peak_mem", "comm_bytes", "repeat_count",
                 "module_path", "comm_dim", "comm_ranks",
@@ -122,6 +123,7 @@ class StepGraph:
                 w.writerow([
                     topo_idx, op_id, node.seq_idx, node.op_type,
                     ann.get("raw_op_type", ""), ann.get("phase", ""),
+                    ann.get("comp_type", ""), ann.get("fsdp_state", "NA"),
                     shapes(node.inputs), shapes(node.outputs),
                     dtypes(node.inputs), dtypes(node.outputs),
                     node.flops, node.peak_mem, node.comm_bytes,

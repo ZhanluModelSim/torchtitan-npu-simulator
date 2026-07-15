@@ -86,17 +86,48 @@ class StepBoundaryTracker:
 
 
 def build_step_graphs(nodes: dict[int, OpNode]) -> dict[str, StepGraph]:
-    """Bucket OpNodes into forward/backward/optimizer StepGraphs using each
-    node's `annotations["phase"]` (defaults to `"forward"` if the tag is
-    missing, e.g. a node captured without a `phase_provider`)."""
-    buckets: dict[str, dict[str, OpNode]] = {phase: {} for phase in _PHASES}
+    """Bucket OpNodes into per-``(pp_stage, comp_type)`` StepGraphs.
+
+    ``comp_type`` (set by ``dispatch_capture._record_event`` from
+    ``_pp_context["comp_type"]``) is the fine-grained compute-graph class:
+    ``"F"`` forward, ``"B"`` full backward, ``"I"`` input-grad only,
+    ``"W"`` weight-grad only, ``"F_RECOMPUTE"`` recompute forward,
+    ``"OPTIMIZER"``. Bucketing by ``(stage, comp_type)`` — instead of the
+    coarse ``forward``/``backward``/``optimizer`` triple — restores the
+    distinct compute graphs that complex pipeline strategies (ZBV /
+    DualPipe / Interleaved zero-bubble) produce: an input-grad ("I") pass
+    and a weight-grad ("W") pass are two topologically different DAGs and
+    must NOT be merged into one ``"backward"`` StepGraph. Different PP
+    stages' forwards are likewise kept separate.
+
+    A node missing the ``comp_type`` tag (e.g. captured without a
+    ``phase_provider``) falls back to its ``phase`` annotation. The
+    template id is ``f"s{stage}_{comp_type}"`` (e.g. ``s0_I``, ``s2_W``)."""
+    buckets: dict[str, dict[str, OpNode]] = {}
     for op_id, node in nodes.items():
-        phase = node.annotations.get("phase", "forward")
-        buckets.setdefault(phase, {})[op_id] = node
+        ann = node.annotations
+        comp_type = ann.get("comp_type") or ann.get("phase", "forward")
+        # Map legacy phase values to comp_type for backward compatibility.
+        if comp_type == "forward":
+            comp_type = "F"
+        elif comp_type == "backward":
+            comp_type = "B"
+        elif comp_type == "optimizer":
+            comp_type = "OPTIMIZER"
+        stage = ann.get("pp_stage", -1)
+        try:
+            stage = int(stage)
+        except (TypeError, ValueError):
+            stage = -1
+        template_id = f"s{stage}_{comp_type}"
+        buckets.setdefault(template_id, {})[op_id] = node
 
     graphs: dict[str, StepGraph] = {}
-    for phase, phase_nodes in buckets.items():
-        if not phase_nodes:
-            continue
-        graphs[phase] = StepGraph(step_id=uuid.uuid4().hex[:12], step_type=phase, nodes=phase_nodes)
+    for template_id, phase_nodes in buckets.items():
+        # step_type is the comp_type (strip the "s{stage}_" prefix) so
+        # viz/exporters can group by compute-graph class.
+        step_type = template_id.split("_", 1)[1] if "_" in template_id else template_id
+        graphs[template_id] = StepGraph(
+            step_id=uuid.uuid4().hex[:12], step_type=step_type, nodes=phase_nodes
+        )
     return graphs

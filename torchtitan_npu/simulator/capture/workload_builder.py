@@ -12,6 +12,7 @@ from __future__ import annotations
 import uuid
 
 from torchtitan_npu.simulator.ir.schedule_graph import ScheduleGraph
+from torchtitan_npu.simulator.ir.schedule_plan import SchedulePlan
 from torchtitan_npu.simulator.ir.step_graph import StepGraph
 from torchtitan_npu.simulator.ir.workload_graph import DataFlow, IterationSpec, WorkloadGraph
 
@@ -23,10 +24,15 @@ def build_workload_graph(
     local_batch_size: int,
     seq_len: int,
     num_micro_batches: int = 1,
+    schedule_plan: SchedulePlan | None = None,
 ) -> WorkloadGraph:
     """One captured training step, wrapped as a single-iteration
     `WorkloadGraph`. `num_iterations` is always 1 -- the simulator captures
-    exactly one train step, per design doc §1."""
+    exactly one train step, per design doc §1.
+
+    `schedule_plan` is the structured L2 view (ordered ScheduleActions +
+    DataSlots); when provided it is attached to the WorkloadGraph so the
+    L3 exposes both the legacy flat ScheduleGraph and the structured plan."""
     input_flow = DataFlow(
         source="dataloader",
         tensor_shape=(local_batch_size, seq_len),
@@ -56,4 +62,5 @@ def build_workload_graph(
         data_inputs=[input_flow],
         data_outputs=[output_flow],
         cross_iter_passes=[],
+        schedule_plan=schedule_plan,
     )
