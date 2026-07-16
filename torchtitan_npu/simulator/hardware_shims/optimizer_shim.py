@@ -14,6 +14,10 @@ skips the numerical parameter update. Optimizer values are irrelevant to the
 single-step meta simulation, and executing the in-place update would require
 DTensor optimizer kernels to support every simulated mesh layout.
 
+The optimizer OpNode uses logical DTensor global shapes so uneven HSDP shards
+do not leak into operator modeling. Tensor dependencies and memory events keep
+using per-rank local tensors.
+
 See meta_env._patch_fused_adamw_for_meta for installation.
 """
 
@@ -56,4 +60,5 @@ def _meta_safe_fused_adamw(
             "npu.npu_apply_adam_w.default",
             inputs or [torch.empty(1, device="meta")],
             mutated,
+            logical_dtensor_shapes=True,
         )

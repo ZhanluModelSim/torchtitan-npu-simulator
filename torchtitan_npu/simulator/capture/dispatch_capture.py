@@ -37,27 +37,33 @@ def _next_op_id() -> int:
     return next(_id_counter)
 
 
-def _flatten_tensors(value: Any) -> list[torch.Tensor]:
+def _flatten_tensors(value: Any, *, localize_dtensor: bool = True) -> list[torch.Tensor]:
     """Recursively extract all tensors from nested lists/tuples/dicts.
 
     PyTorch operator arguments can nest tensors inside dicts (e.g. some
     custom ops pass ``{"mask": tensor}``), so we recurse into dict values
     too -- otherwise those tensors are missed, breaking producer/consumer
-    edge construction and producing incomplete IR dependencies."""
+    edge construction and producing incomplete IR dependencies. DTensors are
+    localized by default because dependency and memory tracking are per-rank;
+    callers may retain them to read logical global metadata instead.
+    """
     tensors: list[torch.Tensor] = []
 
     from torch.distributed.tensor import DTensor
     if isinstance(value, DTensor):
-        local_tensor = getattr(value, "_local_tensor", None)
-        tensors.append(local_tensor if isinstance(local_tensor, torch.Tensor) else value.to_local())
+        if localize_dtensor:
+            local_tensor = getattr(value, "_local_tensor", None)
+            tensors.append(local_tensor if isinstance(local_tensor, torch.Tensor) else value.to_local())
+        else:
+            tensors.append(value)
     elif isinstance(value, torch.Tensor):
         tensors.append(value)
     elif isinstance(value, dict):
         for item in value.values():
-            tensors.extend(_flatten_tensors(item))
+            tensors.extend(_flatten_tensors(item, localize_dtensor=localize_dtensor))
     elif isinstance(value, (list, tuple)):
         for item in value:
-            tensors.extend(_flatten_tensors(item))
+            tensors.extend(_flatten_tensors(item, localize_dtensor=localize_dtensor))
     return tensors
 
 
@@ -88,6 +94,7 @@ class _RawEvent:
     comp_type: str = "F"
     # FSDP sharding state active when this op ran ("SHARDED"/"UNSHARDED"/"NA").
     fsdp_state: str = "NA"
+    tensor_shape_scope: str = "local"
 
 
 def _shape_signature(event: _RawEvent) -> tuple:
@@ -102,6 +109,7 @@ def _shape_signature(event: _RawEvent) -> tuple:
         event.execution_kind,
         event.comp_type,
         event.pp_stage,
+        event.tensor_shape_scope,
         tuple(tuple(i.shape) for i in event.inputs),
         tuple(tuple(o.shape) for o in event.outputs),
     )
@@ -208,6 +216,8 @@ class OpDispatchCapture(TorchDispatchMode):
         inputs: list[torch.Tensor],
         outputs: list[torch.Tensor],
         module_path: str = "",
+        *,
+        logical_dtensor_shapes: bool = False,
     ) -> None:
         """Manually register one synthetic L0 event, as if `raw_op_type` had
         gone through __torch_dispatch__ normally. Used by
@@ -215,12 +225,35 @@ class OpDispatchCapture(TorchDispatchMode):
         for real (raw Triton kernels / JIT-compiled extensions) but whose
         real op name + output shape are known analytically. Participates in
         the same producer/consumer id(tensor) wiring, repeat_count dedup,
-        and phase tagging as real dispatched events."""
+        and phase tagging as real dispatched events.
+
+        ``logical_dtensor_shapes`` keeps local tensors for dependency and
+        memory tracking, but uses DTensor global shapes in the OpNode metadata.
+        This is intended for logical fused ops such as optimizer updates.
+        """
+        logical_input_metas = None
+        logical_output_metas = None
+        if logical_dtensor_shapes:
+            logical_input_metas = [
+                to_tensor_meta(tensor, name=f"in_{idx}")
+                for idx, tensor in enumerate(
+                    _flatten_tensors(inputs, localize_dtensor=False)
+                )
+            ]
+            logical_output_metas = [
+                to_tensor_meta(tensor, name=f"out_{idx}")
+                for idx, tensor in enumerate(
+                    _flatten_tensors(outputs, localize_dtensor=False)
+                )
+            ]
         self._record_event(
             raw_op_type,
             _flatten_tensors(inputs),
             _flatten_tensors(outputs),
             module_path,
+            input_metas=logical_input_metas,
+            output_metas=logical_output_metas,
+            tensor_shape_scope="global" if logical_dtensor_shapes else "local",
         )
 
     def _record_event(
@@ -229,6 +262,10 @@ class OpDispatchCapture(TorchDispatchMode):
         flat_inputs: list[torch.Tensor],
         flat_outputs: list[torch.Tensor],
         module_path: str,
+        *,
+        input_metas: list[TensorMeta] | None = None,
+        output_metas: list[TensorMeta] | None = None,
+        tensor_shape_scope: str = "local",
     ) -> None:
         if not self._capture_l0:
             return  # pass-through: duplicate (stage, comp_type) class skips L0 capture
@@ -246,8 +283,12 @@ class OpDispatchCapture(TorchDispatchMode):
         input_ids = [self.tensor_id(tensor) for tensor in flat_inputs]
         output_ids = [self.tensor_id(tensor) for tensor in flat_outputs]
         predecessors = sorted({self._producer[tensor_id] for tensor_id in input_ids if tensor_id in self._producer})
-        input_metas = [to_tensor_meta(t, name=f"in_{i}") for i, t in enumerate(flat_inputs)]
-        output_metas = [to_tensor_meta(t, name=f"out_{i}") for i, t in enumerate(flat_outputs)]
+        if input_metas is None:
+            input_metas = [to_tensor_meta(t, name=f"in_{i}") for i, t in enumerate(flat_inputs)]
+        if output_metas is None:
+            output_metas = [to_tensor_meta(t, name=f"out_{i}") for i, t in enumerate(flat_outputs)]
+        if len(input_metas) != len(flat_inputs) or len(output_metas) != len(flat_outputs):
+            raise ValueError("Logical and local synthetic-op tensor counts must match")
 
         op_type = to_canonical_op_type(raw_op_type)
         phase = self.phase_provider() if self.phase_provider else "forward"
@@ -294,6 +335,7 @@ class OpDispatchCapture(TorchDispatchMode):
             pp_mb_idx=pp_mb_idx,
             comp_type=comp_type,
             fsdp_state=fsdp_state,
+            tensor_shape_scope=tensor_shape_scope,
         )
         signature = _shape_signature(candidate)
 
@@ -380,6 +422,8 @@ class OpDispatchCapture(TorchDispatchMode):
             }
             if event.module_path:
                 annotations["module_path"] = event.module_path
+            if event.tensor_shape_scope != "local":
+                annotations["tensor_shape_scope"] = event.tensor_shape_scope
             if event.repeat_count > 1:
                 annotations["repeat_count"] = event.repeat_count
             if cost.unknown:
