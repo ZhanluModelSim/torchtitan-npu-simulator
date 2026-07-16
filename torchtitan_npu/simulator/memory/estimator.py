@@ -23,7 +23,11 @@ from torchtitan_npu.simulator.memory.activation_checkpoint import ActivationChec
 from torchtitan_npu.simulator.memory.alias_rules import is_alias_event, is_mutation_event
 from torchtitan_npu.simulator.memory.fsdp_residency import FSDPFullParamResidencyPlugin
 from torchtitan_npu.simulator.memory.gradient_residency import MissingParameterGradientPlugin
-from torchtitan_npu.simulator.memory.plugins import MemoryModelContext, MissingParameterGradient
+from torchtitan_npu.simulator.memory.plugins import (
+    MemoryModelContext,
+    MissingParameterGradient,
+    ParameterTensorMetadata,
+)
 from torchtitan_npu.simulator.memory.records import (
     FSDPResidencyEvent,
     MemoryPlan,
@@ -51,11 +55,12 @@ def _to_local_tensor(value: object) -> torch.Tensor | None:
 
 def _snapshot_parameters(
     model_parts: Iterable[nn.Module],
-) -> tuple[list[TensorLifetime], set[int], list[MissingParameterGradient]]:
+) -> tuple[list[TensorLifetime], set[int], list[MissingParameterGradient], list[ParameterTensorMetadata]]:
     lifetimes: list[TensorLifetime] = []
     seen_params: set[int] = set()
     param_ids: set[int] = set()
     missing_gradients: list[MissingParameterGradient] = []
+    parameter_tensors: list[ParameterTensorMetadata] = []
     for part_idx, model in enumerate(model_parts):
         for name, param in model.named_parameters(recurse=True):
             param_id = id(param)
@@ -84,6 +89,14 @@ def _snapshot_parameters(
                     reason="persistent_param",
                 )
             )
+            parameter_tensors.append(
+                ParameterTensorMetadata(
+                    name=f"{part_idx}:{name}",
+                    num_bytes=tensor_volume_bytes(shape, dtype),
+                    shape=shape,
+                    dtype=dtype,
+                )
+            )
             if param.requires_grad and getattr(param, "grad", None) is None:
                 missing_gradients.append(
                     MissingParameterGradient(
@@ -93,7 +106,20 @@ def _snapshot_parameters(
                         dtype=dtype,
                     )
                 )
-    return lifetimes, param_ids, missing_gradients
+    return lifetimes, param_ids, missing_gradients, parameter_tensors
+
+
+def _is_parameter_materialization(ref: TensorRef, parameter_tensors: Iterable[ParameterTensorMetadata]) -> bool:
+    """Match a local parameter materialized through DTensor ``to_local``.
+
+    Meta DTensor can return a new local tensor identity without emitting a
+    dispatch-visible alias. Exact metadata matching is safe here: this only
+    applies to first-observed inputs and does not infer expanded FSDP weights.
+    """
+    return any(
+        ref.shape == parameter.shape and ref.dtype == parameter.dtype and ref.num_bytes == parameter.num_bytes
+        for parameter in parameter_tensors
+    )
 
 
 def _external_lifetime(ref: TensorRef, event: RawMemoryEvent) -> TensorLifetime:
@@ -246,7 +272,7 @@ def estimate_static_memory(
     fsdp_residency_events: Iterable[FSDPResidencyEvent] | None = None,
 ) -> MemoryPlan:
     events = sorted(raw_events, key=lambda event: event.seq_idx)
-    param_lifetimes, param_ids, missing_parameter_gradients = _snapshot_parameters(model_parts or [])
+    param_lifetimes, param_ids, missing_parameter_gradients, parameter_tensors = _snapshot_parameters(model_parts or [])
     end_seq = max((event.seq_idx for event in events), default=0) + 1
     for lifetime in param_lifetimes:
         lifetime.death_seq = end_seq
@@ -255,6 +281,7 @@ def estimate_static_memory(
     lifetimes_by_tensor_id: dict[int, TensorLifetime] = {}
     alias_base_by_tensor_id: dict[int, int] = {}
     alias_lifetimes: list[TensorLifetime] = []
+    parameter_materialization_ids: set[int] = set()
     unclassified_ops: list[dict[str, Any]] = []
     notes = [
         "P0 estimates active tensor bytes from static tensor metadata; it does not model allocator reserved/cache or kernel workspace.",
@@ -266,8 +293,13 @@ def estimate_static_memory(
             root_tensor_id = _resolve_alias(ref.tensor_id, alias_base_by_tensor_id)
             if root_tensor_id in param_ids:
                 continue
+            if root_tensor_id in parameter_materialization_ids:
+                continue
             lifetime = lifetimes_by_tensor_id.get(root_tensor_id)
             if lifetime is None:
+                if _is_parameter_materialization(ref, parameter_tensors):
+                    parameter_materialization_ids.add(root_tensor_id)
+                    continue
                 lifetime = _external_lifetime(ref, event)
                 lifetimes_by_tensor_id[root_tensor_id] = lifetime
             lifetime.mark_consumer(event.op_id, event.seq_idx, event.phase)
@@ -277,6 +309,8 @@ def estimate_static_memory(
         mutation = is_mutation_event(event)
         for ref in event.outputs:
             if ref.tensor_id in param_ids:
+                continue
+            if ref.tensor_id in parameter_materialization_ids:
                 continue
             if mutation and ref.tensor_id in input_ids:
                 continue
@@ -306,6 +340,7 @@ def estimate_static_memory(
         param_ids=param_ids,
         fsdp_residency_events=list(fsdp_residency_events or []),
         missing_parameter_gradients=missing_parameter_gradients,
+        parameter_tensors=parameter_tensors,
         notes=notes,
     )
     plugin_lifetimes = FSDPFullParamResidencyPlugin().apply(plugin_context)

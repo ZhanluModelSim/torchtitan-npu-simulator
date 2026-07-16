@@ -225,6 +225,29 @@ def test_parameter_alias_is_not_counted_as_external_input():
     assert external_bytes == 2 * 4 * 4
 
 
+def test_dtensor_local_parameter_materialization_is_not_counted_as_external_input():
+    class ParameterModule(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(torch.empty(1, 4, 8, device="meta"))
+
+    model = ParameterModule()
+    local_parameter = TensorRef(
+        tensor_id=99,
+        name="local_parameter",
+        shape=(1, 4, 8),
+        dtype="float32",
+        device="meta",
+        num_bytes=1 * 4 * 8 * 4,
+    )
+    plan = estimate_static_memory(
+        [event(0, 10, "aten._to_copy.default", inputs=[local_parameter], outputs=[tref(1)])],
+        model_parts=[model],
+    )
+
+    assert not any(item.tensor_id == "external:99" for item in plan.tensor_lifetimes)
+
+
 @dataclass
 class FakeComm:
     op_id: int
@@ -311,6 +334,35 @@ def test_fsdp_explicit_markers_replace_full_param_and_bound_staging_buffer():
     assert staging_lifetime.death_seq == 2
     assert staging_lifetime.reason == "fsdp_allgather_staging"
     assert not any(item.tensor_id == "external:3" for item in plan.tensor_lifetimes)
+
+
+def test_fsdp_explicit_markers_remove_identity_lost_unsharded_parameter_alias():
+    class ParameterModule(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.weight = nn.Parameter(torch.empty(1, 4, 8, device="meta"))
+
+    full_param = TensorRef(
+        tensor_id=99,
+        name="full_parameter",
+        shape=(2, 4, 8),
+        dtype="bfloat16",
+        device="meta",
+        num_bytes=2 * 4 * 8 * 2,
+    )
+    plan = estimate_static_memory(
+        [event(3, 20, "aten.mm.default", inputs=[full_param], outputs=[tref(1)])],
+        model_parts=[ParameterModule()],
+        fsdp_residency_events=[
+            FSDPResidencyEvent("layer0", "alloc", 2, "forward", full_param.num_bytes, (123,)),
+            FSDPResidencyEvent("layer0", "free", 5, "forward", full_param.num_bytes, (123,)),
+        ],
+    )
+
+    assert not any(item.tensor_id == "external:99" for item in plan.tensor_lifetimes)
+    residency = next(item for item in plan.tensor_lifetimes if item.kind == "fsdp_full_param")
+    assert (residency.birth_seq, residency.death_seq) == (2, 5)
+    assert "1 unsharded parameter aliases removed" in " ".join(plan.notes)
 
 
 def test_parameter_bytes_are_persistent_and_counted():

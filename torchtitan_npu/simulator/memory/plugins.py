@@ -28,6 +28,16 @@ class MissingParameterGradient:
     dtype: str
 
 
+@dataclass(frozen=True, slots=True)
+class ParameterTensorMetadata:
+    """Local parameter-shard metadata used to recover DTensor aliases."""
+
+    name: str
+    num_bytes: int
+    shape: tuple[int, ...]
+    dtype: str
+
+
 @dataclass(slots=True)
 class MemoryModelContext:
     events: list[RawMemoryEvent]
@@ -36,6 +46,7 @@ class MemoryModelContext:
     param_ids: set[int]
     fsdp_residency_events: list[FSDPResidencyEvent] = field(default_factory=list)
     missing_parameter_gradients: list[MissingParameterGradient] = field(default_factory=list)
+    parameter_tensors: list[ParameterTensorMetadata] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
 

@@ -71,6 +71,21 @@ class FSDPFullParamResidencyPlugin(MemoryModelPlugin):
             if context.lifetimes_by_tensor_id.pop(tensor_id, None) is not None:
                 removed += 1
 
+        # ``DTensor.to_local()`` can expose an unsharded parameter through a
+        # fresh tensor identity. When no dispatch-visible alias connects it to
+        # the FSDP tracked tensor, generic use-def liveness sees it as an
+        # external input and retains it until backward. Restrict this recovery
+        # to explicit FSDP marker mode: the marker below remains the source of
+        # truth for the full-parameter residency interval and byte count.
+        removed_unsharded_aliases = 0
+        removed_unsharded_alias_bytes = 0
+        for tensor_id, lifetime in list(context.lifetimes_by_tensor_id.items()):
+            if not _is_unsharded_parameter_alias(lifetime, context):
+                continue
+            context.lifetimes_by_tensor_id.pop(tensor_id)
+            removed_unsharded_aliases += 1
+            removed_unsharded_alias_bytes += lifetime.num_bytes
+
         alloc_seqs = sorted(
             event.seq_idx for event in context.fsdp_residency_events if event.action == "alloc"
         )
@@ -121,7 +136,9 @@ class FSDPFullParamResidencyPlugin(MemoryModelPlugin):
         context.notes.append(
             "FSDP residency plugin used explicit unshard/reshard markers: "
             f"{len(synthesized)} residency intervals, {removed} generic tensor lifetimes replaced, "
-            f"{shortened_staging_buffers} all-gather staging lifetimes shortened."
+            f"{shortened_staging_buffers} all-gather staging lifetimes shortened, "
+            f"{removed_unsharded_aliases} unsharded parameter aliases removed "
+            f"({removed_unsharded_alias_bytes} bytes)."
         )
         if active_by_group or unmatched_frees:
             context.notes.append(
@@ -187,3 +204,20 @@ class FSDPFullParamResidencyPlugin(MemoryModelPlugin):
 def _is_fsdp_l2_allgather(event: RawMemoryEvent, comm: Any) -> bool:
     primitive = _comm_field(comm, "comm_primitive", "") or event.raw_op_type.removeprefix("comm.")
     return primitive == "allgather" and _comm_field(comm, "comm_layer", "") == "L2"
+
+
+def _is_unsharded_parameter_alias(lifetime: TensorLifetime, context: MemoryModelContext) -> bool:
+    """Whether an external tensor is an expanded local FSDP parameter shard."""
+    if lifetime.kind != "external_input" or lifetime.producer_raw_op != "external_input":
+        return False
+    for parameter in context.parameter_tensors:
+        if len(lifetime.shape) != len(parameter.shape) or not lifetime.shape:
+            continue
+        if lifetime.shape[1:] != parameter.shape[1:]:
+            continue
+        local_leading_dim = parameter.shape[0]
+        if local_leading_dim <= 0 or lifetime.shape[0] < local_leading_dim:
+            continue
+        if lifetime.shape[0] % local_leading_dim == 0:
+            return True
+    return False
