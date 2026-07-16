@@ -96,6 +96,18 @@ def _strip_hardware_dependent_model_converters(config: Any) -> None:
     model_converters_config.converters = kept
 
 
+def _capture_num_micro_batches(
+    *, pp_enabled: bool, pp_schedule: Any | None, gradient_accumulation_steps: int
+) -> int:
+    """Return the microbatch count of the schedule being captured."""
+    if not pp_enabled:
+        return gradient_accumulation_steps
+    num_micro_batches = getattr(pp_schedule, "_n_microbatches", None)
+    if not isinstance(num_micro_batches, int) or num_micro_batches <= 0:
+        raise RuntimeError("PP simulation requires a schedule with a positive _n_microbatches value")
+    return num_micro_batches
+
+
 
 def run_simulation_step(
     *,
@@ -404,6 +416,12 @@ class SimulationTrainer(Trainer):
         import torch.distributed as dist
         is_multi_proc = self.config.comm.mode == "multi_proc_meta"
         rank = dist.get_rank() if (is_multi_proc and dist.is_initialized()) else 0
+        pp_schedule = getattr(self, "pp_schedule", None)
+        num_micro_batches = _capture_num_micro_batches(
+            pp_enabled=self.parallel_dims.pp_enabled,
+            pp_schedule=pp_schedule,
+            gradient_accumulation_steps=self.gradient_accumulation_steps,
+        )
 
         self.workload_graph = run_simulation_step(
             model_parts=self.model_parts,
@@ -416,11 +434,11 @@ class SimulationTrainer(Trainer):
             local_batch_size=self.config.training.local_batch_size,
             seq_len=self.config.training.seq_len,
             pipeline_schedule=self.config.parallelism.pipeline_parallel_schedule,
-            num_micro_batches=self.gradient_accumulation_steps,
+            num_micro_batches=num_micro_batches,
             gradient_accumulation=self.gradient_accumulation_steps,
             rank=rank,
             enable_memory_tracking=self.simulation_config.enable_memory_tracking,
-            pp_schedule=getattr(self, "pp_schedule", None),
+            pp_schedule=pp_schedule,
         )
 
         t2 = time.perf_counter()

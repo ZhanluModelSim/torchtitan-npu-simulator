@@ -504,16 +504,23 @@ def capture_fake_collectives(*, memory_tracking_enabled: bool = True) -> Iterato
     orig_send = dist.send
     orig_recv = dist.recv
 
+    @contextmanager
+    def _p2p_context(tensor: torch.Tensor, direction: str) -> Iterator[None]:
+        from torchtitan_npu.simulator.meta_env import _consume_p2p_op_context, _use_p2p_op_context
+
+        with _use_p2p_op_context(_consume_p2p_op_context(tensor, direction)):
+            yield
+
     def patched_isend(tensor, dst=None, group=None, tag=0, group_dst=None):  # noqa: ANN001
         if not _should_intercept(group):
             return orig_isend(tensor, dst=dst, group=group, tag=tag, group_dst=group_dst)
-        # Record P2P send with PP context
-        from torchtitan_npu.simulator.meta_env import _pp_context
-        event = _record_comm_with_l0(recorder, "p2p_send", group, tensor)
-        event.p2p_peer_rank = dst if dst is not None else (group_dst if group_dst is not None else -1)
-        event.p2p_direction = f"{_pp_context['phase']}_send"
-        event.p2p_mb_idx = int(_pp_context["mb_idx"])
-        event.p2p_stage = int(_pp_context["stage"])
+        with _p2p_context(tensor, "send"):
+            from torchtitan_npu.simulator.meta_env import _pp_context
+            event = _record_comm_with_l0(recorder, "p2p_send", group, tensor)
+            event.p2p_peer_rank = dst if dst is not None else (group_dst if group_dst is not None else -1)
+            event.p2p_direction = f"{_pp_context['phase']}_send"
+            event.p2p_mb_idx = int(_pp_context["mb_idx"])
+            event.p2p_stage = int(_pp_context["stage"])
         # No actual data transfer — meta tensors have no data.
         # Shape inference is handled by DYNAMIC mode via _send_meta/_recv_meta.
         return _NoOpWork()
@@ -521,13 +528,13 @@ def capture_fake_collectives(*, memory_tracking_enabled: bool = True) -> Iterato
     def patched_irecv(tensor, src=None, group=None, tag=0, group_src=None):  # noqa: ANN001
         if not _should_intercept(group):
             return orig_irecv(tensor, src=src, group=group, tag=tag, group_src=group_src)
-        # Record P2P recv with PP context
-        from torchtitan_npu.simulator.meta_env import _pp_context
-        event = _record_comm_with_l0(recorder, "p2p_recv", group, tensor)
-        event.p2p_peer_rank = src if src is not None else (group_src if group_src is not None else -1)
-        event.p2p_direction = f"{_pp_context['phase']}_recv"
-        event.p2p_mb_idx = int(_pp_context["mb_idx"])
-        event.p2p_stage = int(_pp_context["stage"])
+        with _p2p_context(tensor, "recv"):
+            from torchtitan_npu.simulator.meta_env import _pp_context
+            event = _record_comm_with_l0(recorder, "p2p_recv", group, tensor)
+            event.p2p_peer_rank = src if src is not None else (group_src if group_src is not None else -1)
+            event.p2p_direction = f"{_pp_context['phase']}_recv"
+            event.p2p_mb_idx = int(_pp_context["mb_idx"])
+            event.p2p_stage = int(_pp_context["stage"])
         # No actual data transfer — meta tensors have no data.
         # The recv buffer shape was already set by DYNAMIC mode's
         # _setup_forward_recv_info using metadata from _recv_meta.
@@ -536,23 +543,25 @@ def capture_fake_collectives(*, memory_tracking_enabled: bool = True) -> Iterato
     def patched_send(tensor, dst=None, group=None, tag=0, group_dst=None):  # noqa: ANN001
         if not _should_intercept(group):
             return orig_send(tensor, dst=dst, group=group, tag=tag, group_dst=group_dst)
-        from torchtitan_npu.simulator.meta_env import _pp_context
-        event = _record_comm_with_l0(recorder, "p2p_send", group, tensor)
-        event.p2p_peer_rank = dst if dst is not None else (group_dst if group_dst is not None else -1)
-        event.p2p_direction = f"{_pp_context['phase']}_send"
-        event.p2p_mb_idx = int(_pp_context["mb_idx"])
-        event.p2p_stage = int(_pp_context["stage"])
+        with _p2p_context(tensor, "send"):
+            from torchtitan_npu.simulator.meta_env import _pp_context
+            event = _record_comm_with_l0(recorder, "p2p_send", group, tensor)
+            event.p2p_peer_rank = dst if dst is not None else (group_dst if group_dst is not None else -1)
+            event.p2p_direction = f"{_pp_context['phase']}_send"
+            event.p2p_mb_idx = int(_pp_context["mb_idx"])
+            event.p2p_stage = int(_pp_context["stage"])
         return None
 
     def patched_recv(tensor, src=None, group=None, tag=0, group_src=None):  # noqa: ANN001
         if not _should_intercept(group):
             return orig_recv(tensor, src=src, group=group, tag=tag, group_src=group_src)
-        from torchtitan_npu.simulator.meta_env import _pp_context
-        event = _record_comm_with_l0(recorder, "p2p_recv", group, tensor)
-        event.p2p_peer_rank = src if src is not None else (group_src if group_src is not None else -1)
-        event.p2p_direction = f"{_pp_context['phase']}_recv"
-        event.p2p_mb_idx = int(_pp_context["mb_idx"])
-        event.p2p_stage = int(_pp_context["stage"])
+        with _p2p_context(tensor, "recv"):
+            from torchtitan_npu.simulator.meta_env import _pp_context
+            event = _record_comm_with_l0(recorder, "p2p_recv", group, tensor)
+            event.p2p_peer_rank = src if src is not None else (group_src if group_src is not None else -1)
+            event.p2p_direction = f"{_pp_context['phase']}_recv"
+            event.p2p_mb_idx = int(_pp_context["mb_idx"])
+            event.p2p_stage = int(_pp_context["stage"])
         return 0
 
     dist.isend = patched_isend

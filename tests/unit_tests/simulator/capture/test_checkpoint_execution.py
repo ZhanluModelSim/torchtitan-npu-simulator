@@ -13,6 +13,9 @@ from torch.utils.checkpoint import (
 )
 
 from torchtitan_npu.simulator.capture.checkpoint_execution import (
+    RECOMPUTE,
+    _compose_context_fn,
+    current_execution_kind,
     install_checkpoint_execution_tracking,
 )
 from torchtitan_npu.simulator.capture.dispatch_capture import OpDispatchCapture
@@ -90,3 +93,15 @@ def test_unwrapped_model_has_no_recompute_ops():
         "original_forward",
         "backward",
     }
+
+
+def test_full_checkpoint_recompute_context_can_be_reentered():
+    _, recompute_context = _compose_context_fn(None)()
+
+    # DualPipeV may split one checkpointed backward into input- and
+    # weight-gradient passes. Full AC uses a reusable nullcontext; our marker
+    # must preserve that property.
+    with recompute_context:
+        assert current_execution_kind("backward") == RECOMPUTE
+    with recompute_context:
+        assert current_execution_kind("backward") == RECOMPUTE

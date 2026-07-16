@@ -9,9 +9,12 @@ import pytest
 import torch
 import torch.distributed as dist
 from torch.distributed import _functional_collectives as funcol
+from torch.distributed.pipelining import schedules
 
 from torchtitan_npu.simulator.capture.comm_events import capture_fake_collectives
 from torchtitan_npu.simulator.meta_env import (
+    _mark_p2p_ops,
+    _pp_context,
     _local_tensor_for_shape,
     _split_meta_dtensor,
     patch_device_type_to_meta,
@@ -145,3 +148,31 @@ def test_disabled_memory_tracking_drops_fsdp_residency_events():
         )
 
     assert recorder.fsdp_residency_events == []
+
+
+def test_mixed_p2p_batch_uses_each_op_pp_context():
+    """1F1B fuses forward-send and backward-recv from different chunks."""
+    previous_context = dict(_pp_context)
+    patch_device_type_to_meta()
+    send_tensor = torch.empty(4, device="meta")
+    recv_tensor = torch.empty(4, device="meta")
+    try:
+        with capture_fake_collectives() as recorder:
+            send_op = dist.P2POp(dist.isend, send_tensor, 1, dist.group.WORLD)
+            recv_op = dist.P2POp(dist.irecv, recv_tensor, 1, dist.group.WORLD)
+            _mark_p2p_ops(
+                [send_op], stage=0, mb_idx=0, phase="forward", direction="send"
+            )
+            _mark_p2p_ops(
+                [recv_op], stage=1, mb_idx=2, phase="backward", direction="recv"
+            )
+            schedules._batch_p2p([send_op, recv_op], desc="fwd_send_bwd_recv")
+
+        assert [(event.p2p_stage, event.p2p_mb_idx, event.p2p_direction) for event in recorder.events] == [
+            (0, 0, "forward_send"),
+            (1, 2, "backward_recv"),
+        ]
+    finally:
+        _pp_context.clear()
+        _pp_context.update(previous_context)
+        unpatch_device_type_to_meta()

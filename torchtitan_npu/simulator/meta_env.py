@@ -10,11 +10,13 @@ ever allocated. See design doc §5.1 for the verification this relies on."""
 
 from __future__ import annotations
 
+import contextvars
 import importlib
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import timedelta
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Iterator
 
 import torch
 
@@ -220,6 +222,77 @@ _pp_context: dict[str, int | str] = {
     "comp_type": "F",
     "fsdp_state": "NA",
 }
+
+
+@dataclass(frozen=True)
+class _P2POpContext:
+    """Exact PP coordinates carried by one deferred P2POp."""
+
+    stage: int
+    mb_idx: int
+    phase: str
+    direction: str
+
+
+_p2p_op_contexts: contextvars.ContextVar[dict[tuple[int, str], list[_P2POpContext]] | None] = (
+    contextvars.ContextVar("simulator_p2p_op_contexts", default=None)
+)
+
+
+def _mark_p2p_ops(
+    ops: list[object], *, stage: int, mb_idx: int, phase: str, direction: str
+) -> list[object]:
+    """Attach PP coordinates while a PipelineStage creates deferred P2POps."""
+    context = _P2POpContext(stage=stage, mb_idx=mb_idx, phase=phase, direction=direction)
+    for op in ops:
+        setattr(op, "_simulator_pp_context", context)
+    return ops
+
+
+@contextmanager
+def _bind_p2p_op_contexts(ops: list[object]) -> Iterator[None]:
+    """Make deferred P2POp coordinates available to patched isend/irecv."""
+    contexts: dict[tuple[int, str], list[_P2POpContext]] = {}
+    for op in ops:
+        context = getattr(op, "_simulator_pp_context", None)
+        tensor = getattr(op, "tensor", None)
+        if not isinstance(context, _P2POpContext) or not isinstance(tensor, torch.Tensor):
+            continue
+        contexts.setdefault((id(tensor), context.direction), []).append(context)
+    token = _p2p_op_contexts.set(contexts or None)
+    try:
+        yield
+    finally:
+        _p2p_op_contexts.reset(token)
+
+
+def _consume_p2p_op_context(tensor: torch.Tensor, direction: str) -> _P2POpContext | None:
+    contexts = _p2p_op_contexts.get()
+    if contexts is None:
+        return None
+    entries = contexts.get((id(tensor), direction))
+    return entries.pop(0) if entries else None
+
+
+@contextmanager
+def _use_p2p_op_context(context: _P2POpContext | None) -> Iterator[None]:
+    """Expose one P2POp's metadata to the comm and L0 capture layers."""
+    if context is None:
+        yield
+        return
+
+    previous = dict(_pp_context)
+    _pp_context.update(
+        stage=context.stage,
+        mb_idx=context.mb_idx,
+        phase=context.phase,
+        comp_type="F" if context.phase == "forward" else "B",
+    )
+    try:
+        yield
+    finally:
+        _pp_context.clear()
+        _pp_context.update(previous)
 
 # Per-stage FSDP sharding state machine, updated by the patched
 # FSDPParamGroup.unshard/reshard (and by _PipelineScheduleRuntime
@@ -1507,6 +1580,56 @@ def _patch_pipeline_action_context() -> None:
     sch._get_profiler_function_name = _patched_profiler_name
 
 
+def _patch_pipeline_p2p_context() -> None:
+    """Bind P2P events to the stage and microbatch that created each P2POp.
+
+    Pipeline schedules create P2POps at one point and execute them later,
+    sometimes in a mixed forward-send/backward-recv batch. Reading the mutable
+    chunk context when ``isend`` or ``irecv`` finally runs cannot identify the
+    originating action. Store the coordinates on the Python P2POp instance and
+    expose them only while that instance is executed by ``_batch_p2p``.
+    """
+    try:
+        from torch.distributed.pipelining import schedules as sch
+        from torch.distributed.pipelining.stage import PipelineStage
+    except Exception:
+        return
+
+    if hasattr(sch, "_sim_orig_batch_p2p_context"):
+        return
+
+    def _wrap_get_ops(method_name: str, *, phase: str, direction: str, chunk_name: str) -> None:
+        original = getattr(PipelineStage, method_name)
+
+        def _wrapped(self, *args, **kwargs):  # noqa: ANN001
+            ops = original(self, *args, **kwargs)
+            chunk_id = args[0] if args else kwargs.get(chunk_name)
+            if isinstance(chunk_id, int):
+                _mark_p2p_ops(
+                    ops,
+                    stage=int(self.stage_index),
+                    mb_idx=chunk_id,
+                    phase=phase,
+                    direction=direction,
+                )
+            return ops
+
+        setattr(PipelineStage, method_name, _wrapped)
+
+    _wrap_get_ops("get_fwd_recv_ops", phase="forward", direction="recv", chunk_name="fwd_chunk_id")
+    _wrap_get_ops("get_fwd_send_ops", phase="forward", direction="send", chunk_name="fwd_chunk_id")
+    _wrap_get_ops("get_bwd_recv_ops", phase="backward", direction="recv", chunk_name="bwd_chunk_id")
+    _wrap_get_ops("get_bwd_send_ops", phase="backward", direction="send", chunk_name="bwd_chunk_id")
+
+    sch._sim_orig_batch_p2p_context = sch._batch_p2p
+
+    def _patched_batch_p2p(p2p_ops, desc=None):  # noqa: ANN001
+        with _bind_p2p_op_contexts(p2p_ops):
+            return sch._sim_orig_batch_p2p_context(p2p_ops, desc)
+
+    sch._batch_p2p = _patched_batch_p2p
+
+
 def _patch_get_stage_indices_for_fake_pg() -> None:
     """Patch ``_get_stage_indices`` inside ``pipeline_module_split`` to
     return ALL stage indices (not just the local PP rank's stages) when
@@ -2286,6 +2409,7 @@ def patch_device_type_to_meta() -> None:
     _patch_pipeline_stage_for_pp_context()
     _patch_metadata_inference_skip()
     _patch_pipeline_action_context()
+    _patch_pipeline_p2p_context()
     _patch_torch_equal_for_meta()
     _patch_init_distributed_for_multi_proc_meta()
     _patch_fsdp_get_device_from_mesh()

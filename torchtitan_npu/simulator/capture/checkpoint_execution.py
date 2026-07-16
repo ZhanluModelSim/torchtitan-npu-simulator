@@ -47,10 +47,38 @@ def current_execution_kind(phase: str) -> str:
     }.get(phase, phase)
 
 
-@contextlib.contextmanager
-def _composed_context(first: contextlib.AbstractContextManager, kind: str) -> Iterator[None]:
-    with first, execution_kind_context(kind):
-        yield
+class _ExecutionKindContext(contextlib.AbstractContextManager):
+    """Add execution-kind tagging without making a reusable context one-shot.
+
+    Non-reentrant checkpoint creates its forward/recompute context pair once
+    per forward. Schedules that split input- and weight-gradient calculation
+    can enter that recompute context more than once. A generator-based wrapper
+    is inherently one-shot, even when the wrapped context (normally
+    ``nullcontext`` for full AC) is reusable.
+    """
+
+    def __init__(self, first: contextlib.AbstractContextManager, kind: str) -> None:
+        self._first = first
+        self._kind = kind
+        self._kind_contexts: list[contextlib.AbstractContextManager] = []
+
+    def __enter__(self):  # noqa: ANN204
+        kind_context = execution_kind_context(self._kind)
+        kind_context.__enter__()
+        try:
+            result = self._first.__enter__()
+        except BaseException as error:
+            kind_context.__exit__(type(error), error, error.__traceback__)
+            raise
+        self._kind_contexts.append(kind_context)
+        return result
+
+    def __exit__(self, exc_type, exc_value, traceback):  # noqa: ANN001
+        kind_context = self._kind_contexts.pop()
+        try:
+            return self._first.__exit__(exc_type, exc_value, traceback)
+        finally:
+            kind_context.__exit__(exc_type, exc_value, traceback)
 
 
 def _compose_context_fn(
@@ -63,8 +91,8 @@ def _compose_context_fn(
         else:
             forward_context, recompute_context = context_fn()
         return (
-            _composed_context(forward_context, ORIGINAL_FORWARD),
-            _composed_context(recompute_context, RECOMPUTE),
+            _ExecutionKindContext(forward_context, ORIGINAL_FORWARD),
+            _ExecutionKindContext(recompute_context, RECOMPUTE),
         )
 
     return tracked_contexts

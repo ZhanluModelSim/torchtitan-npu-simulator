@@ -11,7 +11,11 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-from torchtitan_npu.simulator.trainer import _strip_hardware_dependent_model_converters, run_simulation_step
+from torchtitan_npu.simulator.trainer import (
+    _capture_num_micro_batches,
+    _strip_hardware_dependent_model_converters,
+    run_simulation_step,
+)
 
 
 @pytest.fixture
@@ -31,6 +35,25 @@ def _build_parallel_dims(world_size: int):
     )
     parallel_dims.build_mesh()
     return parallel_dims
+
+
+def test_capture_num_micro_batches_uses_pp_schedule_not_gradient_accumulation():
+    assert _capture_num_micro_batches(
+        pp_enabled=True,
+        pp_schedule=SimpleNamespace(_n_microbatches=4),
+        gradient_accumulation_steps=1,
+    ) == 4
+    assert _capture_num_micro_batches(
+        pp_enabled=False,
+        pp_schedule=None,
+        gradient_accumulation_steps=3,
+    ) == 3
+    with pytest.raises(RuntimeError, match="_n_microbatches"):
+        _capture_num_micro_batches(
+            pp_enabled=True,
+            pp_schedule=SimpleNamespace(_n_microbatches=0),
+            gradient_accumulation_steps=1,
+        )
 
 
 def test_run_simulation_step_produces_complete_workload_graph(fake_world):
@@ -62,10 +85,19 @@ def test_run_simulation_step_produces_complete_workload_graph(fake_world):
     )
 
     assert graph.num_iterations == 1
-    assert "forward" in graph.step_templates
-    assert "backward" in graph.step_templates
+    assert {"s0_F", "s0_B", "s0_OPTIMIZER"} <= graph.step_templates.keys()
+    assert {template.step_type for template in graph.step_templates.values()} >= {
+        "F",
+        "B",
+        "OPTIMIZER",
+    }
     schedule = graph.iteration.schedule
-    assert len(schedule.instances) == 4  # world_size
+    assert {instance.step_ref for instance in schedule.instances} == {
+        "s0_F",
+        "s0_B",
+        "s0_OPTIMIZER",
+    }
+    assert {instance.pipeline_stage for instance in schedule.instances} == {0}
     assert schedule.annotations["rank_table"]["world_size"] == 4
 
 
@@ -90,8 +122,7 @@ def test_run_simulation_step_captures_optimizer_phase(fake_world):
         local_batch_size=2,
         seq_len=4,
     )
-    assert "optimizer" in graph.step_templates
-    optimizer_ops = graph.step_templates["optimizer"].nodes
+    optimizer_ops = graph.step_templates["s0_OPTIMIZER"].nodes
     assert len(optimizer_ops) > 0
 
 
