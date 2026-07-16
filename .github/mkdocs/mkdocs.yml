@@ -9,5 +9,8 @@ hooks:
   - mkdocs_hooks.py
 plugins:
   - include-markdown
+markdown_extensions:
+  - md_in_html
+  - tables
 theme:
   name: readthedocs

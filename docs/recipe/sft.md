@@ -389,7 +389,7 @@ NGPU=1 MODULE=torchtitan_npu.models.qwen3 \
 
 ### 训练结果参考
 
-![training curves](training_curves.png)
+![training curves](../assets/training_curves.png)
 
 <details>
 <summary>详细日志</summary>

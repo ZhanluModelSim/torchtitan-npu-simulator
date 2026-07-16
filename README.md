@@ -1,4 +1,4 @@
-<div align="center">
+<div align="center" markdown="1">
 
 # torchtitan-npu
 
@@ -61,6 +61,8 @@ pip install -e .
 快速启动大语言模型的训练任务，参见
 [快速上手文档](https://gitcode.com/cann/torchtitan-npu/blob/master/docs/user-guides/quickstart.md) 。
 
+
+<a id="特性支持概览"></a>
 
 # 特性支持概览
 
@@ -167,6 +169,7 @@ torchtitan-npu/
 ### 2026.04
 
 System: Atlas 800T A3
+
 | Model              | Number of NPUs | Precision | GBS | Local BS | Sequence Length | FSDP | TP  | PP  | CP  | EP  | Throughput (tokens/p/s) | MFU |
 | :----------------- | :------------- | :-------- | :-- | :------- | :-------------- | :--- | :-- | :-- | :-- | :-- | :----------- | :-- |
 | [DeepSeek-V4-Flash](https://gitcode.com/cann/torchtitan-npu/blob/8343a6efac598ce86c2cec5a974f187310fd2728/torchtitan_npu/models/deepseek_v4/config_registry.py#L100) | 64             | BF16      | 1024  | 1       | 4096            | 128   | 1   | 1   | 1   | 128  | 1056          | 27.67% |
@@ -174,7 +177,8 @@ System: Atlas 800T A3
 | [DeepSeek-V3.2-671B](https://gitcode.com/cann/torchtitan-npu/blob/8343a6efac598ce86c2cec5a974f187310fd2728/torchtitan_npu/models/deepseek_v32/config_registry.py#L101) | 64             | BF16      | 512  | 1        | 4096            | 32   | 4   | 1   | 1   | 64  | 146           | / |
 | [DeepSeek-V3-671B](https://gitcode.com/cann/torchtitan-npu/blob/8343a6efac598ce86c2cec5a974f187310fd2728/torchtitan_npu/models/deepseek_v3/config_registry.py#L156)   | 64             | BF16      | 1024 | 1       | 4096            | 32   | 4   | 1   | 1   | 128  | 546          | / |
 | [DeepSeek-V3-671B + compile(AutoFuse)](https://gitcode.com/cann/torchtitan-npu/blob/8343a6efac598ce86c2cec5a974f187310fd2728/torchtitan_npu/models/deepseek_v3/config_registry.py#L156)   | 64             | BF16      | 1024 | 1       | 4096            | 32   | 4   | 1   | 1   | 128  |     576      | / |
- > 注：以上MoE模型的性能数据均开启负载均衡配置`moe_force_load_balance=true`。
+
+> 注：以上MoE模型的性能数据均开启负载均衡配置`moe_force_load_balance=true`。
 
 # 免责声明
 
