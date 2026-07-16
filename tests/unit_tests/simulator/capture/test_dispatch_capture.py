@@ -6,6 +6,7 @@
 import torch
 import torch.nn as nn
 
+from torchtitan_npu.simulator.capture.checkpoint_execution import execution_kind_context
 from torchtitan_npu.simulator.capture.dispatch_capture import OpDispatchCapture
 from torchtitan_npu.simulator.capture.module_path import ModulePathTracker
 
@@ -87,6 +88,26 @@ def test_phase_provider_tags_every_node_and_defaults_to_forward():
     nodes = capture.build_nodes()
     phases = sorted({n.annotations["phase"] for n in nodes.values()})
     assert phases == ["backward", "forward"]
+    assert {n.annotations["execution_kind"] for n in nodes.values()} == {
+        "backward",
+        "original_forward",
+    }
+
+
+def test_capture_does_not_deduplicate_recompute_with_normal_backward():
+    capture = OpDispatchCapture(phase_provider=lambda: "backward")
+    tensor = torch.empty(2, device="meta")
+    with capture:
+        capture.record_synthetic_op("test.same_op", [tensor], [tensor])
+        with execution_kind_context("recompute"):
+            capture.record_synthetic_op("test.same_op", [tensor], [tensor])
+
+    same_ops = [
+        node for node in capture.build_nodes().values()
+        if node.annotations["raw_op_type"] == "test.same_op"
+    ]
+    assert len(same_ops) == 2
+    assert [node.annotations["execution_kind"] for node in same_ops] == ["backward", "recompute"]
 
 
 def test_record_synthetic_op_creates_a_node_with_given_raw_op_type():

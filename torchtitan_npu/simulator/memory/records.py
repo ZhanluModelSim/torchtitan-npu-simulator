@@ -32,6 +32,7 @@ class RawMemoryEvent:
     module_path: str
     inputs: tuple[TensorRef, ...]
     outputs: tuple[TensorRef, ...]
+    execution_kind: str
     pp_stage: int = -1
     pp_mb_idx: int = -1
 

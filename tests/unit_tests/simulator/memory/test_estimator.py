@@ -34,6 +34,7 @@ def event(
     inputs: list[TensorRef] | None = None,
     outputs: list[TensorRef] | None = None,
     phase: str = "forward",
+    execution_kind: str | None = None,
     op_type: str = "elementwise",
     module_path: str = "",
 ) -> RawMemoryEvent:
@@ -44,6 +45,11 @@ def event(
         raw_op_type=raw_op_type,
         op_type=op_type,
         phase=phase,
+        execution_kind=execution_kind or {
+            "forward": "original_forward",
+            "backward": "backward",
+            "optimizer": "optimizer",
+        }[phase],
         module_path=module_path,
         inputs=tuple(inputs or []),
         outputs=tuple(outputs or []),
@@ -404,7 +410,15 @@ def test_memory_plan_exports_compact_chrome_trace(tmp_path):
     a, b, grad = tref(1, 32), tref(2, 32), tref(3, 32)
     plan = estimate_static_memory([
         event(0, 10, "aten.relu.default", inputs=[a], outputs=[b], phase="forward"),
-        event(5, 20, "aten.relu_backward.default", inputs=[b], outputs=[grad], phase="backward"),
+        event(
+            5,
+            20,
+            "aten.relu.default",
+            inputs=[b],
+            outputs=[grad],
+            phase="backward",
+            execution_kind="recompute",
+        ),
     ])
 
     trace = memory_plan_to_chrome_trace(plan)
@@ -413,6 +427,7 @@ def test_memory_plan_exports_compact_chrome_trace(tmp_path):
     assert any(item["ph"] == "C" and item["name"] == "active_bytes" for item in events)
     assert any(item["ph"] == "X" and item["name"] == "forward" for item in events)
     assert any(item["ph"] == "X" and item["name"] == "backward" for item in events)
+    assert any(item["ph"] == "X" and item["name"] == "recompute" for item in events)
     assert any(item["ph"] == "i" and item["name"] == "peak active bytes" for item in events)
     assert trace["metadata"]["forward_active_bytes_peak"] == 64
     assert trace["metadata"]["backward_active_bytes_peak"] == 64
@@ -424,7 +439,8 @@ def test_memory_plan_exports_compact_chrome_trace(tmp_path):
     assert not (tmp_path / "memory_trace.json").exists()
     memory_events_header = (memory_dir / "memory_events.csv").read_text().splitlines()[0]
     memory_timeline_header = (memory_dir / "memory_timeline.csv").read_text().splitlines()[0]
-    assert memory_events_header.startswith("event_id,seq_idx,phase,op_id")
+    assert memory_events_header.startswith("event_id,seq_idx,phase,execution_kind,op_id")
+    assert "execution_kind" in memory_events_header
     assert memory_timeline_header.startswith("seq_idx,phase,op_id,action")
 
 

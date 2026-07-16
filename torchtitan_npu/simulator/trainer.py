@@ -19,6 +19,7 @@ import torch.nn as nn
 from torchtitan.trainer import Trainer
 
 from torchtitan_npu.simulator.capture.comm_events import capture_fake_collectives
+from torchtitan_npu.simulator.capture.checkpoint_execution import install_checkpoint_execution_tracking
 from torchtitan_npu.simulator.capture.dispatch_capture import OpDispatchCapture
 from torchtitan_npu.simulator.capture.module_path import ModulePathTracker
 from torchtitan_npu.simulator.capture.schedule_builder import build_schedule_graph
@@ -132,6 +133,7 @@ def run_simulation_step(
     t0 = time.perf_counter()
 
     patch_device_type_to_meta()
+    install_checkpoint_execution_tracking(model_parts)
     global_valid_tokens = float(labels.numel())
 
     boundary = StepBoundaryTracker()
@@ -261,6 +263,21 @@ def run_simulation_step(
     print(f"{'TOTAL':<30} {total:>10.2f} {'100.0%':>8}")
     print("=" * 60)
     print(f"Captured ops: {len(nodes)}, comm events: {len(comm_recorder.events)}")
+    execution_summary: dict[str, dict[str, int]] = {}
+    for node in nodes.values():
+        kind = node.annotations.get("execution_kind", "unknown")
+        repeat_count = int(node.annotations.get("repeat_count", 1))
+        summary = execution_summary.setdefault(kind, {"nodes": 0, "invocations": 0, "flops": 0})
+        summary["nodes"] += 1
+        summary["invocations"] += repeat_count
+        summary["flops"] += node.flops * repeat_count
+    print(
+        "Execution kinds: "
+        + ", ".join(
+            f"{kind}=nodes:{values['nodes']}/calls:{values['invocations']}/flops:{values['flops']}"
+            for kind, values in execution_summary.items()
+        )
+    )
     print(f"Step templates: {list(step_templates.keys())}")
     if memory_plan is not None:
         print(
@@ -443,6 +460,8 @@ class SimulationTrainer(Trainer):
                         "op_type": n.op_type,
                         "raw_op_type": n.annotations.get("raw_op_type", ""),
                         "phase": n.annotations.get("phase", ""),
+                        "execution_kind": n.annotations.get("execution_kind", ""),
+                        "is_recompute": n.annotations.get("is_recompute", False),
                         "inputs_shape": [list(m.shape) for m in n.inputs],
                         "outputs_shape": [list(m.shape) for m in n.outputs],
                         "inputs_dtype": [str(m.dtype) for m in n.inputs],
@@ -516,9 +535,9 @@ class SimulationTrainer(Trainer):
                 for tid, sg in r["step_templates"].items():
                     fname = os.path.join(ir_dir, f"stage_{stage}_{sg['step_type']}_l0_ops.csv")
                     with open(fname, "w", encoding="utf-8") as f:
-                        f.write("topo_order,op_id,seq_idx,op_type,raw_op_type,phase,inputs_shape,outputs_shape,flops,peak_mem,comm_bytes,module_path,comm_dim,comm_ranks\n")
+                        f.write("topo_order,op_id,seq_idx,op_type,raw_op_type,phase,execution_kind,is_recompute,inputs_shape,outputs_shape,flops,peak_mem,comm_bytes,module_path,comm_dim,comm_ranks\n")
                         for i, n in enumerate(sg["nodes"]):
-                            f.write(f"{i},{n['op_id']},{n['seq_idx']},{n['op_type']},{n['raw_op_type']},{n['phase']},{';'.join(str(s) for s in n['inputs_shape'])},{';'.join(str(s) for s in n['outputs_shape'])},{n['flops']},{n['peak_mem']},{n['comm_bytes']},{n['module_path']},{n['comm_dim']},{n['comm_ranks']}\n")
+                            f.write(f"{i},{n['op_id']},{n['seq_idx']},{n['op_type']},{n['raw_op_type']},{n['phase']},{n['execution_kind']},{n['is_recompute']},{';'.join(str(s) for s in n['inputs_shape'])},{';'.join(str(s) for s in n['outputs_shape'])},{n['flops']},{n['peak_mem']},{n['comm_bytes']},{n['module_path']},{n['comm_dim']},{n['comm_ranks']}\n")
 
         print(f"Merged {len(all_ranks)} PP stages' IR to {out_dir}")
 

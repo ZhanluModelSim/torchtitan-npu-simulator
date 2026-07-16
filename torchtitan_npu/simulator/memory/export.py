@@ -62,6 +62,42 @@ def _build_phase_spans(plan: MemoryPlan) -> list[dict]:
     return spans
 
 
+def _build_execution_kind_spans(plan: MemoryPlan) -> list[dict]:
+    spans: list[dict] = []
+    current_kind = ""
+    start_seq = 0
+    last_seq = 0
+
+    for event in sorted(plan.raw_events, key=lambda item: item.seq_idx):
+        kind = event.execution_kind
+        if kind != current_kind:
+            if current_kind:
+                spans.append({
+                    "name": current_kind,
+                    "ph": "X",
+                    "pid": 1,
+                    "tid": 5,
+                    "ts": _trace_ts(start_seq),
+                    "dur": max(_TRACE_TS_SCALE_US, _trace_ts(last_seq - start_seq + 1)),
+                    "args": {"execution_kind": current_kind},
+                })
+            current_kind = kind
+            start_seq = event.seq_idx
+        last_seq = event.seq_idx
+
+    if current_kind:
+        spans.append({
+            "name": current_kind,
+            "ph": "X",
+            "pid": 1,
+            "tid": 5,
+            "ts": _trace_ts(start_seq),
+            "dur": max(_TRACE_TS_SCALE_US, _trace_ts(last_seq - start_seq + 1)),
+            "args": {"execution_kind": current_kind},
+        })
+    return spans
+
+
 def memory_plan_to_chrome_trace(plan: MemoryPlan) -> dict:
     """Build a compact Chrome Trace / Perfetto JSON payload.
 
@@ -76,8 +112,10 @@ def memory_plan_to_chrome_trace(plan: MemoryPlan) -> dict:
         {"name": "thread_name", "ph": "M", "pid": 1, "tid": 2, "args": {"name": "training phase"}},
         {"name": "thread_name", "ph": "M", "pid": 1, "tid": 3, "args": {"name": "fsdp full-param bytes"}},
         {"name": "thread_name", "ph": "M", "pid": 1, "tid": 4, "args": {"name": "gradient accumulator bytes"}},
+        {"name": "thread_name", "ph": "M", "pid": 1, "tid": 5, "args": {"name": "execution kind"}},
     ]
     trace_events.extend(_build_phase_spans(plan))
+    trace_events.extend(_build_execution_kind_spans(plan))
     active_by_kind: dict[str, int] = {}
     for event in sorted(plan.timeline_events, key=lambda item: (item.seq_idx, item.action, item.tensor_id)):
         delta = event.num_bytes if event.action == "alloc" else -event.num_bytes
@@ -164,6 +202,7 @@ def export_memory_plan(plan: MemoryPlan, out_dir: str) -> None:
             "event_id",
             "seq_idx",
             "phase",
+            "execution_kind",
             "op_id",
             "raw_op_type",
             "op_type",
@@ -182,6 +221,7 @@ def export_memory_plan(plan: MemoryPlan, out_dir: str) -> None:
                 "event_id": event.event_id,
                 "seq_idx": event.seq_idx,
                 "phase": event.phase,
+                "execution_kind": event.execution_kind,
                 "op_id": event.op_id,
                 "raw_op_type": event.raw_op_type,
                 "op_type": event.op_type,

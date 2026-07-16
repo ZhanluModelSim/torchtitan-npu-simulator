@@ -19,6 +19,7 @@ from typing import Any, Callable
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
+from torchtitan_npu.simulator.capture.checkpoint_execution import current_execution_kind
 from torchtitan_npu.simulator.capture.module_path import ModulePathTracker
 from torchtitan_npu.simulator.capture.op_mapping import to_canonical_op_type
 from torchtitan_npu.simulator.capture.tensor_utils import dtype_to_str, tensor_volume_bytes, to_tensor_meta
@@ -70,6 +71,7 @@ class _RawEvent:
     predecessors: list[str]
     module_path: str = ""
     phase: str = "forward"
+    execution_kind: str = "original_forward"
     repeat_count: int = 1
     comm_dim: str = ""
     comm_ranks_str: str = ""
@@ -83,6 +85,7 @@ def _shape_signature(event: _RawEvent) -> tuple:
         event.raw_op_type,
         event.module_path,
         event.phase,
+        event.execution_kind,
         tuple(tuple(i.shape) for i in event.inputs),
         tuple(tuple(o.shape) for o in event.outputs),
     )
@@ -182,6 +185,7 @@ class OpDispatchCapture(TorchDispatchMode):
 
         op_type = to_canonical_op_type(raw_op_type)
         phase = self.phase_provider() if self.phase_provider else "forward"
+        execution_kind = current_execution_kind(phase)
 
         # Read PP context for this op's stage/mb attribution
         pp_stage = -1
@@ -202,6 +206,7 @@ class OpDispatchCapture(TorchDispatchMode):
             predecessors=predecessors,
             module_path=module_path,
             phase=phase,
+            execution_kind=execution_kind,
             seq_idx=next(_seq_counter),
             pp_stage=pp_stage,
             pp_mb_idx=pp_mb_idx,
@@ -226,6 +231,7 @@ class OpDispatchCapture(TorchDispatchMode):
                     raw_op_type=raw_op_type,
                     op_type=op_type,
                     phase=phase,
+                    execution_kind=execution_kind,
                     module_path=module_path,
                     inputs=tuple(
                         _to_tensor_ref(tensor, name=f"in_{idx}", tensor_id=input_ids[idx])
@@ -278,7 +284,12 @@ class OpDispatchCapture(TorchDispatchMode):
         nodes: dict[str, OpNode] = {}
         for event in self._events:
             cost = self.cost_model.compute(event.op_type, event.inputs, event.outputs, {})
-            annotations: dict[str, Any] = {"raw_op_type": event.raw_op_type, "phase": event.phase}
+            annotations: dict[str, Any] = {
+                "raw_op_type": event.raw_op_type,
+                "phase": event.phase,
+                "execution_kind": event.execution_kind,
+                "is_recompute": event.execution_kind == "recompute",
+            }
             if event.module_path:
                 annotations["module_path"] = event.module_path
             if event.repeat_count > 1:

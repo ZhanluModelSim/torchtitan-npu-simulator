@@ -307,11 +307,18 @@ simulator_output/<配置名>/
 | `repeat_count` | 去重折叠的重复次数 |
 | `module_path` | 算子所属模块路径（如 `layers.2._checkpoint_wrapped_module.moe`） |
 | `phase` | 捕获阶段：`forward` / `backward` / `optimizer` |
+| `execution_kind` | 实际执行类型：`original_forward` / `recompute` / `backward` / `optimizer` |
+| `is_recompute` | 当前算子是否由 activation checkpoint 在 backward 中实际重放 |
 | `comm_dim` | 通信维度名/组名（仅通信算子有值，如 `3713` 表示 FSDP 组） |
 | `comm_ranks` | 通信域包含的 Rank 列表（仅通信算子有值，如 `0,1,2,3,...,15` 表示这 16 个 rank 属于同一通信组） |
 
 > [!NOTE]
 > 通信算子（`allgather`、`allreduce`、`reduce_scatter`、`all_to_all`、`broadcast`）在 L0 图中以 `comm.*` 前缀的 `raw_op_type` 注册，同时在 L2 ScheduleGraph 中生成 DataPass。`comm_dim` 标识通信所属的并行维度（如 FSDP/TP/EP），`comm_ranks` 列出参与该次通信的具体 Rank。
+
+> [!NOTE]
+> activation checkpoint 重放仍属于 `phase=backward`，但会被精确标记为
+> `execution_kind=recompute`。该标记来自 PyTorch checkpoint 的重放上下文，
+> selective checkpoint 中直接读取已保存结果、没有实际重放的算子不会被标记。
 
 > [!IMPORTANT]
 > 大规模仿真（如 2048 die）时，全量展开所有 rank 的 CSV 会非常大（每 rank 数万行）。可通过配置中的 `simulation.csv_max_ranks` 限制展开的 rank 数量：
