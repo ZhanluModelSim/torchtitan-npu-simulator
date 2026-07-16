@@ -1,3 +1,6 @@
+// Adapted from:
+// https://gitcode.com/Ascend/MindSpeed/blob/9f9eebfa28faf06ee97474a3c996f0fcd0897ea6/mindspeed/ops/csrc/cann/npu_lightning_indexer.cpp
+//
 // Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 //
 // This source code is licensed under the BSD-style license found in the
