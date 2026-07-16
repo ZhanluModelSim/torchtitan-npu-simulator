@@ -22,7 +22,8 @@ from torchtitan_npu.simulator.capture.tensor_utils import dtype_to_str, tensor_v
 from torchtitan_npu.simulator.memory.activation_checkpoint import ActivationCheckpointPlugin
 from torchtitan_npu.simulator.memory.alias_rules import is_alias_event, is_mutation_event
 from torchtitan_npu.simulator.memory.fsdp_residency import FSDPFullParamResidencyPlugin
-from torchtitan_npu.simulator.memory.plugins import MemoryModelContext
+from torchtitan_npu.simulator.memory.gradient_residency import MissingParameterGradientPlugin
+from torchtitan_npu.simulator.memory.plugins import MemoryModelContext, MissingParameterGradient
 from torchtitan_npu.simulator.memory.records import (
     FSDPResidencyEvent,
     MemoryPlan,
@@ -48,10 +49,13 @@ def _to_local_tensor(value: object) -> torch.Tensor | None:
     return None
 
 
-def _snapshot_parameters(model_parts: Iterable[nn.Module]) -> tuple[list[TensorLifetime], set[int]]:
+def _snapshot_parameters(
+    model_parts: Iterable[nn.Module],
+) -> tuple[list[TensorLifetime], set[int], list[MissingParameterGradient]]:
     lifetimes: list[TensorLifetime] = []
     seen_params: set[int] = set()
     param_ids: set[int] = set()
+    missing_gradients: list[MissingParameterGradient] = []
     for part_idx, model in enumerate(model_parts):
         for name, param in model.named_parameters(recurse=True):
             param_id = id(param)
@@ -80,7 +84,16 @@ def _snapshot_parameters(model_parts: Iterable[nn.Module]) -> tuple[list[TensorL
                     reason="persistent_param",
                 )
             )
-    return lifetimes, param_ids
+            if param.requires_grad and getattr(param, "grad", None) is None:
+                missing_gradients.append(
+                    MissingParameterGradient(
+                        name=f"{part_idx}:{name}",
+                        num_bytes=tensor_volume_bytes(shape, dtype),
+                        shape=shape,
+                        dtype=dtype,
+                    )
+                )
+    return lifetimes, param_ids, missing_gradients
 
 
 def _external_lifetime(ref: TensorRef, event: RawMemoryEvent) -> TensorLifetime:
@@ -233,7 +246,7 @@ def estimate_static_memory(
     fsdp_residency_events: Iterable[FSDPResidencyEvent] | None = None,
 ) -> MemoryPlan:
     events = sorted(raw_events, key=lambda event: event.seq_idx)
-    param_lifetimes, param_ids = _snapshot_parameters(model_parts or [])
+    param_lifetimes, param_ids, missing_parameter_gradients = _snapshot_parameters(model_parts or [])
     end_seq = max((event.seq_idx for event in events), default=0) + 1
     for lifetime in param_lifetimes:
         lifetime.death_seq = end_seq
@@ -292,10 +305,12 @@ def estimate_static_memory(
         lifetimes_by_tensor_id=lifetimes_by_tensor_id,
         param_ids=param_ids,
         fsdp_residency_events=list(fsdp_residency_events or []),
+        missing_parameter_gradients=missing_parameter_gradients,
         notes=notes,
     )
     plugin_lifetimes = FSDPFullParamResidencyPlugin().apply(plugin_context)
     ActivationCheckpointPlugin().apply(plugin_context)
+    plugin_lifetimes.extend(MissingParameterGradientPlugin().apply(plugin_context))
 
     lifetimes = [*param_lifetimes, *lifetimes_by_tensor_id.values(), *alias_lifetimes, *plugin_lifetimes]
     for lifetime in lifetimes:

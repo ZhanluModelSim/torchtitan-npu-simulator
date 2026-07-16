@@ -18,6 +18,16 @@ from typing import Any, Protocol
 from torchtitan_npu.simulator.memory.records import FSDPResidencyEvent, RawMemoryEvent, TensorLifetime
 
 
+@dataclass(frozen=True, slots=True)
+class MissingParameterGradient:
+    """A trainable local parameter that did not receive an autograd tensor."""
+
+    name: str
+    num_bytes: int
+    shape: tuple[int, ...]
+    dtype: str
+
+
 @dataclass(slots=True)
 class MemoryModelContext:
     events: list[RawMemoryEvent]
@@ -25,6 +35,7 @@ class MemoryModelContext:
     lifetimes_by_tensor_id: dict[int, TensorLifetime]
     param_ids: set[int]
     fsdp_residency_events: list[FSDPResidencyEvent] = field(default_factory=list)
+    missing_parameter_gradients: list[MissingParameterGradient] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
 

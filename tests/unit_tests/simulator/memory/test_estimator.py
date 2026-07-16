@@ -172,6 +172,23 @@ def test_backward_output_consumed_by_optimizer_is_gradient_accumulator():
     assert lifetime.death_seq == 5
 
 
+def test_missing_parameter_gradients_are_synthesized_through_optimizer():
+    model = nn.Linear(4, 2, bias=False, device="meta")
+    plan = estimate_static_memory(
+        [
+            event(0, 10, "aten.relu_backward.default", phase="backward"),
+            event(5, 20, "optimizer.step", phase="optimizer"),
+        ],
+        model_parts=[model],
+    )
+
+    gradient = next(item for item in plan.tensor_lifetimes if item.tensor_id == "synthetic_grad:0:weight")
+    assert gradient.kind == "gradient_accumulator"
+    assert gradient.num_bytes == 4 * 2 * 4
+    assert (gradient.birth_seq, gradient.death_seq) == (0, 5)
+    assert "synthesized 1 missing parameter gradients" in " ".join(plan.notes)
+
+
 def test_alias_output_has_zero_bytes():
     a, b = tref(1, 64), tref(2, 64)
     plan = estimate_static_memory([
