@@ -111,6 +111,8 @@ def test_checkpoint_plugin_releases_internal_forward_tensor_before_backward():
     lifetime = next(item for item in plan.tensor_lifetimes if item.tensor_id == "tensor:2")
     assert lifetime.kind == "checkpoint_recompute_temp"
     assert lifetime.death_seq == 1
+    release = next(item for item in plan.timeline_events if item.tensor_id == "tensor:2" and item.action == "free")
+    assert release.phase == "forward"
 
 
 def test_checkpoint_plugin_keeps_cross_scope_output_as_activation():

@@ -228,7 +228,10 @@ def _finalize_kind(lifetime: TensorLifetime) -> None:
         lifetime.reason = "last_consumer"
 
 
-def _build_timeline(lifetimes: list[TensorLifetime]) -> list[MemoryTimelineEvent]:
+def _build_timeline(
+    lifetimes: list[TensorLifetime],
+    phase_by_seq: dict[int, str],
+) -> list[MemoryTimelineEvent]:
     edges: list[tuple[int, int, TensorLifetime, str]] = []
     for lifetime in lifetimes:
         if lifetime.num_bytes <= 0:
@@ -246,7 +249,14 @@ def _build_timeline(lifetimes: list[TensorLifetime]) -> list[MemoryTimelineEvent
             op_id = lifetime.producer_op
         else:
             active -= lifetime.num_bytes
-            phase = lifetime.consumer_phases[-1] if lifetime.consumer_phases else lifetime.producer_phase
+            # Activation checkpointing can shorten a forward lifetime even
+            # though its original use-def chain also has a backward
+            # recomputation consumer. The actual release sequence is the
+            # authoritative phase for trace spans and phase peaks.
+            phase = phase_by_seq.get(
+                seq_idx,
+                lifetime.consumer_phases[-1] if lifetime.consumer_phases else lifetime.producer_phase,
+            )
             op_id = lifetime.consumer_ops[-1] if lifetime.consumer_ops else lifetime.producer_op
         timeline.append(
             MemoryTimelineEvent(
@@ -387,7 +397,7 @@ def estimate_static_memory(
     for lifetime in lifetimes:
         _finalize_kind(lifetime)
 
-    timeline = _build_timeline(lifetimes)
+    timeline = _build_timeline(lifetimes, {event.seq_idx: event.phase for event in events})
     peak_event = max(timeline, key=lambda item: item.active_bytes_after, default=None)
     phase_peaks = _phase_peak_active_bytes(timeline, events)
     plan = MemoryPlan(
