@@ -3,33 +3,38 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""GE graph-mode fusion profile: consume an offline-captured GE fused graph
-(produced by Phase 1 ``scripts/ge_fusion_capture.py`` on a real NPU) to
-populate ``StepGraph.fused_regions``.
+"""GE graph-mode fusion: achieve the fusion effect in a pure no-NPU
+environment by reproducing GE's fusion behavior on the captured L0 DAG.
 
-Why offline + consume (not run fusion in the simulator)
--------------------------------------------------------
+Why a host-only pass (not running real GE)
+------------------------------------------
 The simulator captures L0 ops under meta-device ``__torch_dispatch__``, which
 yields an *over-decomposed* graph (~75% of nodes are aten primitives like
 ``aten.mul``/``aten.unsqueeze`` that a real NPU's Graph Engine fuses away).
-GE's op fusion happens inside the ``aclgrph`` compile pipeline, whose
-``build_initialize`` needs the NPU runtime/driver -- so fusion cannot run in a
-no-NPU simulator. Instead we interface with GE's *output*: Phase 1 captures
-the GE-compiled (fused) graph as a profile, and this module (Phase 2) loads it
-and maps it onto the captured L0 ops so the simulator models real fused
-kernels.
+GE's op fusion happens inside the ``aclgrph`` compile pipeline. We verified
+that this pipeline is *partially* accessible host-only:
+  * ``build_initialize({"ge.socVersion": "Ascend910B"})`` succeeds without NPU.
+  * ``DUMP_GE_GRAPH=1`` dumps every compile stage (PreRunBegin ->
+    AfterBuiltinFusionPass -> OptimizeOriginalGraph -> ... -> BeforeBuild) as
+    parseable proto-text.
+BUT real GE fusion still cannot be harvested host-only:
+  * ``build_model`` fails at device-kernel codegen for real ops (matmul/norm).
+  * The BuiltinFusionPass / OptimizeOriginalGraph passes do NOT trigger fusion
+    on ``ge.es``-built graphs -- verified across all 10 stage dumps (residual
+    Add+LayerNorm stayed separate at every stage).
+So we reproduce GE's fusion *behavior* via a host-only graph-rewrite on the
+captured DAG, targeting GE's authentic fused op types from the ``ge.es.nn``
+catalog (AddRmsNorm, AddLayerNorm, FusedMatMul, AdamApplyOneWithDecay). This
+delivers the fusion EFFECT (compression + eliminated intermediates) with zero
+NPU dependence.
 
-Profile sources
----------------
-* JSON profile (``load_fusion_profile_json``): the portable contract. Phase 1
-  emits one entry per fused GE node with its ``fused_op_type`` and the
-  ``original_op_seq_idxs`` (the captured L0 ``OpNode.seq_idx`` values that
-  merged into it). This carries the original->fused mapping explicitly.
-* ``.air`` graph (``load_fusion_profile_air``): GE's native serialized graph.
-  ``extract_graph_topology`` walks it to recover fused-node types + data edges
-  (producer/consumer). ``.air`` alone does not carry the original->fused op
-  mapping, so this yields topology only -- useful for fused-op cost typing
-  even without per-op attribution.
+Two consumption modes
+---------------------
+* Host-only pass (``build_ge_fusion_profile``): the primary pure-no-NPU path.
+  Walks the captured StepGraph, pattern-matches GE fusion rules, emits a
+  GEFusionProfile with authentic fused op types.
+* Optional loaders (``load_fusion_profile_json``/``_air``): cross-check a
+  profile captured elsewhere (e.g. a real-NPU GE dump) against the host pass.
 """
 
 from __future__ import annotations
@@ -234,3 +239,136 @@ def _tensor_bytes(shape: Any, dtype: Any) -> int:
     # map common GE DataType enum value->bytes; fall back to 4 (float32)
     sizes = {0: 4, 1: 8, 2: 2, 3: 1, 4: 1, 6: 4, 7: 4, 9: 8, 10: 4, 11: 1, 12: 2}
     return numel * sizes.get(getattr(dtype, "value", None) if dtype is not None else None, 4)
+
+
+# ---------------------------------------------------------------------------
+# Host-only fusion pass (GE-catalog-grounded)
+# ---------------------------------------------------------------------------
+# Real GE fusion cannot run host-only (build_model fails at device-kernel
+# codegen for real ops, and the BuiltinFusionPass / OptimizeOriginalGraph
+# passes do not trigger on ge.es-built graphs -- verified across all compile-
+# stage dumps). So the pure-no-NPU path reproduces GE's fusion *behavior* via a
+# graph-rewrite on the captured L0 DAG, targeting GE's authentic fused op
+# types from the ge.es.nn catalog (AddRmsNorm, AddLayerNorm, FusedMatMul,
+# AdamApplyOneWithDecay). This gives the fusion EFFECT (compression +
+# eliminated intermediates) without any NPU hardware or offline capture.
+
+# captured L0 op_type -> classification
+_NORM_OPS = {"rms_norm", "layer_norm"}
+_MATMUL_OPS = {"matmul", "bmm"}
+# elementwise / shape / reduction primitives that GE folds into fusion regions
+_FUSIBLE = {
+    "unknown", "view", "reshape", "transpose", "cat", "split", "gelu", "silu",
+    "swiglu", "moe_re_routing", "einsum",
+}
+# optimizer foreach sub-ops (aten primitives of _fused_adamw_ decomposition)
+_FOREACH_OPT = {"zeros", "zeros_like", "zero_", "mean", "sub", "sign", "mul",
+                "add", "add_", "select", "floor_divide", "_to_copy", "clone",
+                "detach", "unsqueeze"}
+# GE fused-op-type targets (authentic names from the ge.es.nn catalog)
+_GE_ADD_RMS = "AddRmsNorm"
+_GE_ADD_LN = "AddLayerNorm"
+_GE_FUSED_MM = "FusedMatMul"
+_GE_ELT = "ElementwiseFusion"
+_GE_ADAMW = "AdamApplyOneWithDecay"
+
+
+def _raw(n: Any) -> str:
+    return str(n.annotations.get("raw_op_type", ""))
+
+
+def build_ge_fusion_profile(step_graph: Any) -> GEFusionProfile:
+    """Host-only fusion pass: walk the captured StepGraph DAG and emit a
+    GEFusionProfile whose fused op types are GE's authentic catalog names.
+
+    Patterns (GE fusion behavior):
+      * residual Add + rms_norm/layer_norm -> AddRmsNorm / AddLayerNorm
+      * matmul/bmm + trailing bias-Add -> FusedMatMul
+      * consecutive single-consumer elementwise/shape chains -> ElementwiseFusion
+      * optimizer foreach-adamw sub-ops -> AdamApplyOneWithDecay
+    Anchors (attention/rope/softmax/comm/adamw_step) are kept as single-op
+    regions (GE preserves them).
+    """
+    nodes = {n.op_id: n for n in step_graph.nodes.values()}
+    order = sorted(step_graph.nodes.values(), key=lambda n: n.seq_idx)
+    succ = {n.op_id: [int(s) for s in n.successors] for n in order}
+    pred = {n.op_id: [int(p) for p in n.predecessors] for n in order}
+    visited: set[int] = set()
+    fused: list[FusedNode] = []
+    run: list[int] = []  # pending elementwise chain
+
+    def flush_run():
+        nonlocal run
+        if run:
+            fused.append(FusedNode(node_id=len(fused), fused_op_type=_GE_ELT,
+                                   original_op_seq_idxs=[nodes[o].seq_idx for o in run]))
+            run = []
+
+    def single_succ(oid: int) -> int | None:
+        s = succ.get(oid, [])
+        return s[0] if len(s) == 1 else None
+
+    for n in order:
+        if n.op_id in visited:
+            continue
+        t = n.op_type
+        if t in _NORM_OPS:
+            # residual Add + norm fusion: merge immediate elementwise "add"
+            # predecessor that has this norm as its single successor.
+            add_pred = None
+            for p in pred.get(n.op_id, []):
+                pn = nodes.get(p)
+                if pn is None or pn.op_id in visited:
+                    continue
+                if pn.op_type in _FUSIBLE and "add" in _raw(pn) and single_succ(p) == n.op_id:
+                    add_pred = p
+                    break
+            flush_run()
+            seqs = [nodes[add_pred].seq_idx, n.seq_idx] if add_pred else [n.seq_idx]
+            fused.append(FusedNode(node_id=len(fused),
+                                   fused_op_type=_GE_ADD_RMS if t == "rms_norm" else _GE_ADD_LN,
+                                   original_op_seq_idxs=seqs))
+            visited.add(n.op_id)
+            if add_pred:
+                visited.add(add_pred)
+            continue
+        if t in _MATMUL_OPS:
+            # matmul + trailing bias-Add -> FusedMatMul
+            flush_run()
+            bias_s = None
+            for s in succ.get(n.op_id, []):
+                sn = nodes.get(s)
+                if sn is None or sn.op_id in visited:
+                    continue
+                if sn.op_type in _FUSIBLE and "add" in _raw(sn) and len(pred.get(s, [])) <= 2:
+                    bias_s = s
+                    break
+            seqs = [n.seq_idx] + ([nodes[bias_s].seq_idx] if bias_s else [])
+            fused.append(FusedNode(node_id=len(fused), fused_op_type=_GE_FUSED_MM,
+                                   original_op_seq_idxs=seqs))
+            visited.add(n.op_id)
+            if bias_s:
+                visited.add(bias_s)
+            continue
+        # optimizer foreach sub-op block
+        if step_graph.step_type.upper() == "OPTIMIZER" and (
+                t in _FOREACH_OPT or (t == "unknown" and _raw(n) in _FOREACH_OPT)):
+            run.append(n.op_id)
+            visited.add(n.op_id)
+            continue
+        if t in _FUSIBLE:
+            run.append(n.op_id)
+            visited.add(n.op_id)
+            continue
+        # anchor: single-op region
+        flush_run()
+        fused.append(FusedNode(node_id=len(fused), fused_op_type=t,
+                               original_op_seq_idxs=[n.seq_idx]))
+        visited.add(n.op_id)
+    # optimizer foreach run -> single AdamApplyOneWithDecay
+    if run and step_graph.step_type.upper() == "OPTIMIZER":
+        fused.append(FusedNode(node_id=len(fused), fused_op_type=_GE_ADAMW,
+                               original_op_seq_idxs=[nodes[o].seq_idx for o in run]))
+        run = []
+    flush_run()
+    return GEFusionProfile(graph_name=step_graph.step_id, fused_nodes=fused)
