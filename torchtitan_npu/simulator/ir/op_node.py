@@ -42,6 +42,7 @@ class OpNode:
             w = csv.writer(f)
             w.writerow([
                 "op_id", "seq_idx", "op_type", "raw_op_type", "phase",
+                "execution_kind", "is_recompute",
                 "inputs_shape", "outputs_shape", "inputs_dtype", "outputs_dtype",
                 "flops", "peak_mem", "param_mem", "comm_bytes",
                 "repeat_count", "module_path", "comm_dim", "comm_ranks",
@@ -52,6 +53,7 @@ class OpNode:
             w.writerow([
                 self.op_id, self.seq_idx, self.op_type,
                 ann.get("raw_op_type", ""), ann.get("phase", ""),
+                ann.get("execution_kind", ""), ann.get("is_recompute", False),
                 shapes(self.inputs), shapes(self.outputs),
                 dtypes(self.inputs), dtypes(self.outputs),
                 self.flops, self.peak_mem, self.param_mem, self.comm_bytes,

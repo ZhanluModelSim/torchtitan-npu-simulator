@@ -256,6 +256,7 @@ cat simulator_output/deepseek_v4_pro_61_layers/summary.txt
 | `simulation_result.json` | JSON | 完整四层 IR 结构化数据 |
 | `kernel_summary/` | CSV 目录 | 按 Rank 拆分的算子汇总 |
 | `ir_export/` | CSV 目录 | 各层级 IR 导出（见下文） |
+| `memory/` | JSON/CSV 目录 | 内存摘要、Perfetto trace、事件时间线和 tensor 生命周期 |
 
 ### 多进程模式（multi_proc_meta）
 
@@ -268,6 +269,7 @@ simulator_output/<配置名>/
 │   ├── trace.html
 │   ├── simulation_result.json
 │   ├── kernel_summary/
+│   ├── memory/
 │   └── ir_export/
 │       ├── rank_schedule.csv          # L3: inter-rank schedule
 │       ├── l1_schedule/               # L2: per-stage L1 schedule
@@ -305,11 +307,18 @@ simulator_output/<配置名>/
 | `repeat_count` | 去重折叠的重复次数 |
 | `module_path` | 算子所属模块路径（如 `layers.2._checkpoint_wrapped_module.moe`） |
 | `phase` | 捕获阶段：`forward` / `backward` / `optimizer` |
+| `execution_kind` | 实际执行类型：`original_forward` / `recompute` / `backward` / `optimizer` |
+| `is_recompute` | 当前算子是否由 activation checkpoint 在 backward 中实际重放 |
 | `comm_dim` | 通信维度名/组名（仅通信算子有值，如 `3713` 表示 FSDP 组） |
 | `comm_ranks` | 通信域包含的 Rank 列表（仅通信算子有值，如 `0,1,2,3,...,15` 表示这 16 个 rank 属于同一通信组） |
 
 > [!NOTE]
 > 通信算子（`allgather`、`allreduce`、`reduce_scatter`、`all_to_all`、`broadcast`）在 L0 图中以 `comm.*` 前缀的 `raw_op_type` 注册，同时在 L2 ScheduleGraph 中生成 DataPass。`comm_dim` 标识通信所属的并行维度（如 FSDP/TP/EP），`comm_ranks` 列出参与该次通信的具体 Rank。
+
+> [!NOTE]
+> activation checkpoint 重放仍属于 `phase=backward`，但会被精确标记为
+> `execution_kind=recompute`。该标记来自 PyTorch checkpoint 的重放上下文，
+> selective checkpoint 中直接读取已保存结果、没有实际重放的算子不会被标记。
 
 > [!IMPORTANT]
 > 大规模仿真（如 2048 die）时，全量展开所有 rank 的 CSV 会非常大（每 rank 数万行）。可通过配置中的 `simulation.csv_max_ranks` 限制展开的 rank 数量：
@@ -419,6 +428,7 @@ def my_model_simulate() -> SimulationTrainerConfig:
 
 关键约束：
 
+- 内存跟踪默认开启。可通过 CLI 设置 `--simulation.no-enable-memory-tracking` 关闭；关闭后不记录内存事件、tensor 生命周期和 FSDP 参数驻留，也不执行静态内存估算。内存结果统一输出到 `<output_dir>/memory/`。
 - `world_size`（`NGPU` 环境变量）必须等于 `dp_replicate × dp_shard × cp × tp × pp`。`data_parallel_shard_degree=-1` 时由 torchtitan 自动计算。
 - `pipeline_parallel_degree > 1` 时，DeepSeek-V4 不支持 MTP，需设 `num_mtp_modules=0`。
 - `pipeline_parallel_degree > 1` 时，`local_batch_size` 需 ≥ `pp_degree`（1F1B 调度需要足够 microbatch）。

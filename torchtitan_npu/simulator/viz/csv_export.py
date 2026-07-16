@@ -111,7 +111,7 @@ def export_kernel_summary_csv(workload_graph: WorkloadGraph, path: str, *, max_r
         "raw_op_type", "inputs_shape", "outputs_shape",
         "inputs_dtype", "outputs_dtype",
         "flops", "peak_mem", "param_mem", "comm_bytes",
-        "repeat_count", "module_path", "phase",
+        "repeat_count", "module_path", "phase", "execution_kind", "is_recompute",
         "comm_dim", "comm_ranks",
     ]
 
@@ -142,6 +142,8 @@ def export_kernel_summary_csv(workload_graph: WorkloadGraph, path: str, *, max_r
                 str(ann.get("repeat_count", 1)),
                 ann.get("module_path", ""),
                 ann.get("phase", ""),
+                ann.get("execution_kind", ""),
+                str(ann.get("is_recompute", False)),
                 ann.get("comm_dim", ""),
                 ann.get("comm_ranks", ""),
             ])

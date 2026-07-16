@@ -322,7 +322,7 @@ V 型映射 `generate_rank_to_stage_mapping(N, 2N, style="v")`：rank0={0,3}、r
 @dataclass
 class DataSlot:
     ...
-    comm_primitive: str = ""   # p2p_send | allgather | reduce_scatter | allreduce | "" 
+    comm_primitive: str = ""   # p2p_send | allgather | reduce_scatter | allreduce | ""
     is_local_transfer: bool = False   # V 型同 rank 相邻 stage：进程内递交，无通信
 ```
 

@@ -19,6 +19,7 @@ import torch.nn as nn
 from torchtitan.trainer import Trainer
 
 from torchtitan_npu.simulator.capture.comm_events import capture_fake_collectives
+from torchtitan_npu.simulator.capture.checkpoint_execution import install_checkpoint_execution_tracking
 from torchtitan_npu.simulator.capture.dispatch_capture import OpDispatchCapture
 from torchtitan_npu.simulator.capture.module_path import ModulePathTracker
 from torchtitan_npu.simulator.capture.schedule_builder import build_schedule_graph, build_schedule_plan
@@ -27,6 +28,8 @@ from torchtitan_npu.simulator.capture.workload_builder import build_workload_gra
 from torchtitan_npu.simulator.hardware_shims.mhc_converter import apply_mhc_shims
 from torchtitan_npu.simulator.hardware_shims.smla_converter import apply_smla_shims
 from torchtitan_npu.simulator.ir.workload_graph import WorkloadGraph
+from torchtitan_npu.simulator.memory.estimator import estimate_static_memory
+from torchtitan_npu.simulator.memory.export import export_memory_plan
 from torchtitan_npu.simulator.meta_env import patch_device_type_to_meta
 from torchtitan_npu.simulator.moe_force_balance import force_deterministic_seed, force_moe_load_balance
 from torchtitan_npu.simulator.rank_table import build_rank_table
@@ -41,6 +44,7 @@ from torchtitan_npu.simulator.viz.text_summary import write_text_summary
 class SimulationConfig:
     output_dir: str = "./simulator_output"
     output_formats: list[str] = field(default_factory=lambda: [])
+    enable_memory_tracking: bool = True
     target_npu_device_type: str = "non_a5"
     csv_max_ranks: int | None = None
     simulated_parallel_degrees: dict[str, int] = field(default_factory=dict)
@@ -108,6 +112,7 @@ def run_simulation_step(
     num_micro_batches: int = 1,
     gradient_accumulation: int = 1,
     rank: int = 0,
+    enable_memory_tracking: bool = True,
     pp_schedule: Any | None = None,
 ) -> WorkloadGraph:
     """Run one forward+backward+optimizer step under full capture and
@@ -129,6 +134,7 @@ def run_simulation_step(
     t0 = time.perf_counter()
 
     patch_device_type_to_meta()
+    install_checkpoint_execution_tracking(model_parts)
     global_valid_tokens = float(labels.numel())
 
     # Default PP stage attribution: non-PP steps use stage 0 (the single
@@ -167,12 +173,18 @@ def run_simulation_step(
             return "backward"
         return boundary.current_phase
 
-    capture = OpDispatchCapture(module_path_tracker=module_path_tracker, phase_provider=_phase_provider)
+    capture = OpDispatchCapture(
+        module_path_tracker=module_path_tracker,
+        phase_provider=_phase_provider,
+        record_memory=enable_memory_tracking,
+    )
 
     t1 = time.perf_counter()
     timings["setup"] = t1 - t0
 
-    with capture_fake_collectives() as comm_recorder, boundary, module_path_tracker, capture:
+    with capture_fake_collectives(
+        memory_tracking_enabled=enable_memory_tracking
+    ) as comm_recorder, boundary, module_path_tracker, capture:
         boundary.mark("forward")
         forward_backward_step(
             input_dict=input_dict,
@@ -240,6 +252,23 @@ def run_simulation_step(
     )
     timings["build_workload_graph"] = time.perf_counter() - t8
 
+    memory_plan = None
+    if enable_memory_tracking:
+        t9 = time.perf_counter()
+        memory_plan = estimate_static_memory(
+            capture.memory_events(),
+            model_parts=model_parts,
+            comm_events=comm_recorder.events,
+            fsdp_residency_events=comm_recorder.fsdp_residency_events,
+        )
+        wg.iteration.schedule.annotations["memory_plan"] = memory_plan
+        wg.iteration.schedule.annotations["memory_summary"] = memory_plan.to_summary_dict()
+        for step_graph in wg.step_templates.values():
+            step_graph.param_mem = memory_plan.persistent_param_bytes
+            step_graph.peak_active_mem = memory_plan.peak_active_bytes
+            step_graph.annotations["memory_summary"] = memory_plan.to_summary_dict()
+        timings["estimate_memory"] = time.perf_counter() - t9
+
     timings["total"] = time.perf_counter() - t0
 
     # Print timing table
@@ -251,14 +280,43 @@ def run_simulation_step(
     total = timings["total"]
     for name in ["setup", "forward_backward", "optimizer", "build_nodes",
                  "build_step_graphs", "build_rank_table", "build_schedule_graph",
-                 "build_schedule_plan", "build_workload_graph"]:
+                 "build_schedule_plan", "build_workload_graph", "estimate_memory"]:
+        if name not in timings:
+            continue
         t = timings[name]
         print(f"{name:<30} {t:>10.2f} {t/total*100:>7.1f}%")
     print("-" * 60)
     print(f"{'TOTAL':<30} {total:>10.2f} {'100.0%':>8}")
     print("=" * 60)
     print(f"Captured ops: {len(nodes)}, comm events: {len(comm_recorder.events)}")
+    execution_summary: dict[str, dict[str, int]] = {}
+    for node in nodes.values():
+        kind = node.annotations.get("execution_kind", "unknown")
+        repeat_count = int(node.annotations.get("repeat_count", 1))
+        summary = execution_summary.setdefault(kind, {"nodes": 0, "invocations": 0, "flops": 0})
+        summary["nodes"] += 1
+        summary["invocations"] += repeat_count
+        summary["flops"] += node.flops * repeat_count
+    print(
+        "Execution kinds: "
+        + ", ".join(
+            f"{kind}=nodes:{values['nodes']}/calls:{values['invocations']}/flops:{values['flops']}"
+            for kind, values in execution_summary.items()
+        )
+    )
     print(f"Step templates: {list(step_templates.keys())}")
+    if memory_plan is not None:
+        print(
+            "Static memory: "
+            f"persistent_param_bytes={memory_plan.persistent_param_bytes} "
+            f"active_bytes_peak={memory_plan.peak_active_bytes} "
+            f"forward_peak={memory_plan.forward_peak_active_bytes} "
+            f"backward_peak={memory_plan.backward_peak_active_bytes} "
+            f"optimizer_peak={memory_plan.optimizer_peak_active_bytes} "
+            f"peak_seq_idx={memory_plan.peak_seq_idx}"
+        )
+    else:
+        print("Static memory tracking: disabled")
     print()
 
     return wg
@@ -305,8 +363,7 @@ class SimulationTrainer(Trainer):
             config.optimizer.swap_optimizer = False
         # Keep implementation="fused" — _patch_fused_adamw_for_meta in
         # meta_env.py patches torch._fused_adamw_ with a meta-safe shim
-        # that records npu.npu_apply_adam_w and uses standard foreach
-        # math for shape inference.
+        # that records npu.npu_apply_adam_w without numerical updates.
 
         patch_device_type_to_meta()
 
@@ -362,6 +419,7 @@ class SimulationTrainer(Trainer):
             num_micro_batches=self.gradient_accumulation_steps,
             gradient_accumulation=self.gradient_accumulation_steps,
             rank=rank,
+            enable_memory_tracking=self.simulation_config.enable_memory_tracking,
             pp_schedule=getattr(self, "pp_schedule", None),
         )
 
@@ -430,6 +488,8 @@ class SimulationTrainer(Trainer):
                         "op_type": n.op_type,
                         "raw_op_type": n.annotations.get("raw_op_type", ""),
                         "phase": n.annotations.get("phase", ""),
+                        "execution_kind": n.annotations.get("execution_kind", ""),
+                        "is_recompute": n.annotations.get("is_recompute", False),
                         "comp_type": n.annotations.get("comp_type", ""),
                         "fsdp_state": n.annotations.get("fsdp_state", "NA"),
                         "pp_stage": n.annotations.get("pp_stage", -1),
@@ -506,9 +566,9 @@ class SimulationTrainer(Trainer):
                 for tid, sg in r["step_templates"].items():
                     fname = os.path.join(ir_dir, f"stage_{stage}_{sg['step_type']}_l0_ops.csv")
                     with open(fname, "w", encoding="utf-8") as f:
-                        f.write("topo_order,op_id,seq_idx,op_type,raw_op_type,phase,comp_type,fsdp_state,pp_stage,inputs_shape,outputs_shape,flops,peak_mem,comm_bytes,module_path,comm_dim,comm_ranks\n")
+                        f.write("topo_order,op_id,seq_idx,op_type,raw_op_type,phase,execution_kind,is_recompute,comp_type,fsdp_state,pp_stage,inputs_shape,outputs_shape,flops,peak_mem,comm_bytes,module_path,comm_dim,comm_ranks\n")
                         for i, n in enumerate(sg["nodes"]):
-                            f.write(f"{i},{n['op_id']},{n['seq_idx']},{n['op_type']},{n['raw_op_type']},{n['phase']},{n.get('comp_type','')},{n.get('fsdp_state','NA')},{n.get('pp_stage',-1)},{';'.join(str(s) for s in n['inputs_shape'])},{';'.join(str(s) for s in n['outputs_shape'])},{n['flops']},{n['peak_mem']},{n['comm_bytes']},{n['module_path']},{n['comm_dim']},{n['comm_ranks']}\n")
+                            f.write(f"{i},{n['op_id']},{n['seq_idx']},{n['op_type']},{n['raw_op_type']},{n['phase']},{n.get('execution_kind','')},{n.get('is_recompute',False)},{n.get('comp_type','')},{n.get('fsdp_state','NA')},{n.get('pp_stage',-1)},{';'.join(str(s) for s in n['inputs_shape'])},{';'.join(str(s) for s in n['outputs_shape'])},{n['flops']},{n['peak_mem']},{n['comm_bytes']},{n['module_path']},{n['comm_dim']},{n['comm_ranks']}\n")
 
         print(f"Merged {len(all_ranks)} PP stages' IR to {out_dir}")
 
@@ -538,6 +598,11 @@ class SimulationTrainer(Trainer):
             t = time.perf_counter()
             write_text_summary(self.workload_graph, os.path.join(out_dir, "summary.txt"))
             export_timings["text"] = time.perf_counter() - t
+        memory_plan = self.workload_graph.iteration.schedule.annotations.get("memory_plan")
+        if memory_plan is not None and any(fmt in formats for fmt in ("json", "csv", "text", "html", "trace")):
+            t = time.perf_counter()
+            export_memory_plan(memory_plan, out_dir)
+            export_timings["memory"] = time.perf_counter() - t
         if "html" in formats:
             t = time.perf_counter()
             export_html(self.workload_graph, os.path.join(out_dir, "trace.html"))

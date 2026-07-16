@@ -12,21 +12,25 @@ no storage to alias-track, matching spec/L0-OpNode.md's "Meta tensor
 from __future__ import annotations
 
 import itertools
+import weakref
 from dataclasses import dataclass
 from typing import Any, Callable
 
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
+from torchtitan_npu.simulator.capture.checkpoint_execution import current_execution_kind
 from torchtitan_npu.simulator.capture.module_path import ModulePathTracker
 from torchtitan_npu.simulator.capture.op_mapping import to_canonical_op_type
-from torchtitan_npu.simulator.capture.tensor_utils import to_tensor_meta
+from torchtitan_npu.simulator.capture.tensor_utils import dtype_to_str, tensor_volume_bytes, to_tensor_meta
 from torchtitan_npu.simulator.cost.op_cost_model import OpCostModel
 from torchtitan_npu.simulator.ir.op_node import OpNode
 from torchtitan_npu.simulator.ir.tensor_meta import TensorMeta
+from torchtitan_npu.simulator.memory.records import RawMemoryEvent, TensorRef
 
 _id_counter = itertools.count()
 _seq_counter = itertools.count()
+_memory_event_counter = itertools.count()
 
 
 def _next_op_id() -> int:
@@ -44,7 +48,8 @@ def _flatten_tensors(value: Any) -> list[torch.Tensor]:
 
     from torch.distributed.tensor import DTensor
     if isinstance(value, DTensor):
-        tensors.append(value.to_local())
+        local_tensor = getattr(value, "_local_tensor", None)
+        tensors.append(local_tensor if isinstance(local_tensor, torch.Tensor) else value.to_local())
     elif isinstance(value, torch.Tensor):
         tensors.append(value)
     elif isinstance(value, dict):
@@ -66,6 +71,7 @@ class _RawEvent:
     predecessors: list[str]
     module_path: str = ""
     phase: str = "forward"
+    execution_kind: str = "original_forward"
     repeat_count: int = 1
     comm_dim: str = ""
     comm_ranks_str: str = ""
@@ -92,10 +98,25 @@ def _shape_signature(event: _RawEvent) -> tuple:
     return (
         event.raw_op_type,
         event.module_path,
+        event.phase,
+        event.execution_kind,
         event.comp_type,
         event.pp_stage,
         tuple(tuple(i.shape) for i in event.inputs),
         tuple(tuple(o.shape) for o in event.outputs),
+    )
+
+
+def _to_tensor_ref(tensor: torch.Tensor, name: str, tensor_id: int) -> TensorRef:
+    dtype = dtype_to_str(tensor.dtype)
+    shape = tuple(int(d) for d in tensor.shape)
+    return TensorRef(
+        tensor_id=tensor_id,
+        name=name,
+        shape=shape,
+        dtype=dtype,
+        device=str(tensor.device),
+        num_bytes=tensor_volume_bytes(shape, dtype),
     )
 
 
@@ -114,13 +135,18 @@ class OpDispatchCapture(TorchDispatchMode):
         cost_model: OpCostModel | None = None,
         module_path_tracker: ModulePathTracker | None = None,
         phase_provider: Callable[[], str] | None = None,
+        record_memory: bool = True,
     ) -> None:
         super().__init__()
         self.cost_model = cost_model or OpCostModel()
         self.module_path_tracker = module_path_tracker
         self.phase_provider = phase_provider
+        self.record_memory = record_memory
         self._events: list[_RawEvent] = []
-        self._producer: dict[int, str] = {}
+        self._memory_events: list[RawMemoryEvent] = []
+        self._producer: dict[int, int] = {}
+        self._tensor_identities: dict[int, tuple[weakref.ReferenceType[torch.Tensor], int]] = {}
+        self._reused_tensor_ids = itertools.count(1)
         self._last_signature: tuple | None = None
         self._previous_active_capture: OpDispatchCapture | None = None
         self._capture_l0: bool = True  # pass-through when False (duplicate class)
@@ -190,7 +216,12 @@ class OpDispatchCapture(TorchDispatchMode):
         real op name + output shape are known analytically. Participates in
         the same producer/consumer id(tensor) wiring, repeat_count dedup,
         and phase tagging as real dispatched events."""
-        self._record_event(raw_op_type, inputs, outputs, module_path)
+        self._record_event(
+            raw_op_type,
+            _flatten_tensors(inputs),
+            _flatten_tensors(outputs),
+            module_path,
+        )
 
     def _record_event(
         self,
@@ -212,12 +243,15 @@ class OpDispatchCapture(TorchDispatchMode):
                 return
         except Exception:
             pass
-        predecessors = sorted({self._producer[id(t)] for t in flat_inputs if id(t) in self._producer})
+        input_ids = [self.tensor_id(tensor) for tensor in flat_inputs]
+        output_ids = [self.tensor_id(tensor) for tensor in flat_outputs]
+        predecessors = sorted({self._producer[tensor_id] for tensor_id in input_ids if tensor_id in self._producer})
         input_metas = [to_tensor_meta(t, name=f"in_{i}") for i, t in enumerate(flat_inputs)]
         output_metas = [to_tensor_meta(t, name=f"out_{i}") for i, t in enumerate(flat_outputs)]
 
         op_type = to_canonical_op_type(raw_op_type)
         phase = self.phase_provider() if self.phase_provider else "forward"
+        execution_kind = current_execution_kind(phase)
 
         # Read PP context for this op's stage/mb/comp_type/fsdp_state attribution.
         # `comp_type` is set per-chunk by the patched forward_one_chunk /
@@ -254,6 +288,7 @@ class OpDispatchCapture(TorchDispatchMode):
             predecessors=predecessors,
             module_path=module_path,
             phase=phase,
+            execution_kind=execution_kind,
             seq_idx=next(_seq_counter),
             pp_stage=pp_stage,
             pp_mb_idx=pp_mb_idx,
@@ -271,17 +306,50 @@ class OpDispatchCapture(TorchDispatchMode):
             candidate.op_id = op_id
             self._events.append(candidate)
 
+        if self.record_memory:
+            self._memory_events.append(
+                RawMemoryEvent(
+                    event_id=next(_memory_event_counter),
+                    op_id=op_id,
+                    seq_idx=candidate.seq_idx,
+                    raw_op_type=raw_op_type,
+                    op_type=op_type,
+                    phase=phase,
+                    execution_kind=execution_kind,
+                    module_path=module_path,
+                    inputs=tuple(
+                        _to_tensor_ref(tensor, name=f"in_{idx}", tensor_id=input_ids[idx])
+                        for idx, tensor in enumerate(flat_inputs)
+                    ),
+                    outputs=tuple(
+                        _to_tensor_ref(tensor, name=f"out_{idx}", tensor_id=output_ids[idx])
+                        for idx, tensor in enumerate(flat_outputs)
+                    ),
+                    pp_stage=pp_stage,
+                    pp_mb_idx=pp_mb_idx,
+                )
+            )
+
         # Resolve pending comm links: if any input tensor was produced by a
         # comm op (e.g. recv/unshard), this op is the dst_entry_op consumer.
-        for t in flat_inputs:
-            tid = id(t)
+        for tid in input_ids:
             if tid in self._pending_comm_links:
                 event = self._pending_comm_links.pop(tid)
                 event.dst_entry_op = op_id
-            self._last_signature = signature
+        self._last_signature = signature
 
-        for t in flat_outputs:
-            self._producer[id(t)] = op_id
+        for tid in output_ids:
+            self._producer[tid] = op_id
+
+    def tensor_id(self, tensor: torch.Tensor) -> int:
+        raw_id = id(tensor)
+        identity = self._tensor_identities.get(raw_id)
+        if identity is not None and identity[0]() is tensor:
+            return identity[1]
+
+        stable_id = raw_id if identity is None else -next(self._reused_tensor_ids)
+        self._tensor_identities[raw_id] = (weakref.ref(tensor), stable_id)
+        return stable_id
 
     def __enter__(self) -> "OpDispatchCapture":
         super().__enter__()
@@ -303,6 +371,8 @@ class OpDispatchCapture(TorchDispatchMode):
             annotations: dict[str, Any] = {
                 "raw_op_type": event.raw_op_type,
                 "phase": event.phase,
+                "execution_kind": event.execution_kind,
+                "is_recompute": event.execution_kind == "recompute",
                 # Always stamp comp_type/fsdp_state so build_step_graphs can
                 # bucket by (stage, comp_type) regardless of capture order.
                 "comp_type": event.comp_type,
@@ -342,6 +412,10 @@ class OpDispatchCapture(TorchDispatchMode):
                 if pred_id in nodes:
                     nodes[pred_id].successors.append(op_id)
         return nodes
+
+    def memory_events(self) -> list[RawMemoryEvent]:
+        """Return the uncollapsed op stream used by static memory planning."""
+        return list(self._memory_events)
 
 
 _active_capture: "OpDispatchCapture | None" = None

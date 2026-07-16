@@ -24,9 +24,18 @@ def export_text_summary(workload_graph: WorkloadGraph) -> str:
     for step_id, step_graph in workload_graph.step_templates.items():
         total_flops = sum(node.flops for node in step_graph.nodes.values())
         total_comm_bytes = sum(node.comm_bytes for node in step_graph.nodes.values())
-        total_peak_mem = sum(node.peak_mem for node in step_graph.nodes.values())
+        total_op_output_bytes_estimate = sum(node.peak_mem for node in step_graph.nodes.values())
         lines.append(f"[{step_graph.step_type}] step={step_id} nodes={len(step_graph.nodes)}")
-        lines.append(f"  total_flops={total_flops}  total_peak_mem_bytes={total_peak_mem}  total_comm_bytes={total_comm_bytes}")
+        lines.append(
+            f"  total_flops={total_flops}  "
+            f"total_op_output_bytes_estimate={total_op_output_bytes_estimate}  "
+            f"total_comm_bytes={total_comm_bytes}"
+        )
+        if step_graph.peak_active_mem:
+            lines.append(
+                f"  active_bytes_peak={step_graph.peak_active_mem}  "
+                f"persistent_param_bytes={step_graph.param_mem}"
+            )
         lines.append(f"  is_acyclic={step_graph.is_acyclic}")
         for node in step_graph.nodes.values():
             if node.annotations.get("cost_unknown"):
@@ -45,6 +54,17 @@ def export_text_summary(workload_graph: WorkloadGraph) -> str:
         comm_bytes_by_primitive[data_pass.comm_primitive] = comm_bytes_by_primitive.get(data_pass.comm_primitive, 0) + volume
     for primitive, total_bytes in sorted(comm_bytes_by_primitive.items()):
         lines.append(f"  comm[{primitive}] total_bytes={total_bytes}")
+    memory_summary = schedule.annotations.get("memory_summary", {})
+    if memory_summary:
+        lines.append(
+            "  memory "
+            f"active_bytes_peak={memory_summary.get('active_bytes_peak', 0)} "
+            f"forward_peak={memory_summary.get('forward_active_bytes_peak', 0)} "
+            f"backward_peak={memory_summary.get('backward_active_bytes_peak', 0)} "
+            f"optimizer_peak={memory_summary.get('optimizer_active_bytes_peak', 0)} "
+            f"peak_seq_idx={memory_summary.get('peak_seq_idx', 0)} "
+            f"persistent_param_bytes={memory_summary.get('persistent_param_bytes', 0)}"
+        )
     lines.append("")
 
     if unknown_op_types:

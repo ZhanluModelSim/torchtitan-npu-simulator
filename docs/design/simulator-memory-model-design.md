@@ -447,3 +447,112 @@ seq_idx,phase,op_id,event,tensor_id,kind,bytes,active_bytes_after,reason
 5. 后续再补 microbatch/PP 实例化、optimizer state、async comm 和 HTML 曲线。
 
 这样可以在工程复杂度可控的前提下，得到一个合理、有据、能被 DES 消费的显存变化模型。
+
+## 15. P0 开发计划
+
+第一版只实现静态 active tensor bytes，不做 allocator/reserved/workspace。它必须能在单进程 meta simulator 和 multi-proc meta 每 rank 独立导出下稳定运行。
+
+### 15.1 核心数据结构
+
+```text
+TensorRef:
+  tensor_id: int
+  shape: tuple[int, ...]
+  dtype: str
+  device: str
+  num_bytes: int
+
+RawMemoryEvent:
+  event_id: int
+  op_id: int
+  seq_idx: int
+  raw_op_type: str
+  op_type: str
+  phase: str
+  module_path: str
+  inputs: list[TensorRef]
+  outputs: list[TensorRef]
+
+TensorLifetime:
+  tensor_id: str
+  kind: parameter_shard | external_input | activation | temporary | dead_temp_output | alias | comm_buffer | fsdp_full_param
+  num_bytes: int
+  birth_seq: int
+  death_seq: int
+  producer_op: int
+  consumer_ops: list[int]
+  alias_of: str
+  reason: str
+
+MemoryTimelineEvent:
+  seq_idx: int
+  action: alloc | free
+  tensor_id: str
+  kind: str
+  num_bytes: int
+  active_bytes_after: int
+  reason: str
+
+MemoryPlan:
+  persistent_param_bytes: int
+  peak_active_bytes: int
+  peak_seq_idx: int
+  tensor_lifetimes: list[TensorLifetime]
+  timeline_events: list[MemoryTimelineEvent]
+  unclassified_ops: list[dict]
+```
+
+### 15.2 P0 算法伪代码
+
+```text
+raw_events = capture.memory_events()
+params = snapshot_model_parameters(model_parts)
+comm_by_op = {comm.op_id: comm for comm in comm_events}
+
+for param in params:
+  add persistent lifetime(step_start, step_end)
+
+for event in raw_events ordered by seq_idx:
+  for input in event.inputs:
+    lifetime = find_or_create_external_input(input)
+    lifetime.last_consumer = event.seq_idx
+    lifetime.consumer_ops.add(event.op_id)
+
+  for output in event.outputs:
+    if output is known parameter or in-place mutation target:
+      continue
+    if alias_rules.is_alias(event):
+      add zero-byte alias lifetime(alias_of=first_input)
+      continue
+    kind = classify_output(event, comm_by_op)
+    add allocated lifetime(birth=event.seq_idx, kind=kind)
+
+for lifetime in allocated_lifetimes:
+  if no consumers:
+    lifetime.death_seq = lifetime.birth_seq
+    lifetime.kind = dead_temp_output unless comm/FSDP rule extends it
+  else:
+    lifetime.death_seq = max(consumer.seq_idx)
+    if produced in forward and consumed in backward:
+      lifetime.kind = activation
+    elif kind was op_output:
+      lifetime.kind = temporary
+
+timeline = sweep alloc/free events ordered by seq_idx
+peak = max(active_bytes_after)
+```
+
+### 15.3 第一版明确取舍
+
+- 使用未折叠 raw event stream 算生命周期，保留现有折叠 L0 图用于展示。
+- alias 只做白名单，不尝试从 storage 推断。
+- mutation 只做 raw op 名称和输入输出 id 的保守识别。
+- FSDP 先基于 `CommEvent` 分类 allgather/reduce_scatter buffer，并以 last consumer 释放；reshard hook 显式释放留到 P1。
+- PP/microbatch 先每 rank 导出实际捕获的 L0 曲线，不展开 MB1+ 模板；P1 再按 L2 timeline 实例化。
+- 输出名使用 `active_bytes_peak`，旧 `sum(node.peak_mem)` 在 summary 中改名为 `total_op_output_bytes_estimate`。
+
+### 15.4 验收
+
+- 单元测试覆盖简单链、dead output、cross phase activation、checkpoint-like 重算、alias、comm/FSDP 分类。
+- smoke 脚本输出人可读日志：参数常驻、峰值、峰值位置、top lifetimes、导出路径。
+- multi-proc meta 下每 rank 单独导出 `memory_summary.json`、`memory_events.csv`、`tensor_lifetimes.csv`。

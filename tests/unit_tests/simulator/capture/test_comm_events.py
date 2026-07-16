@@ -11,6 +11,12 @@ import torch.distributed as dist
 from torch.distributed import _functional_collectives as funcol
 
 from torchtitan_npu.simulator.capture.comm_events import capture_fake_collectives
+from torchtitan_npu.simulator.meta_env import (
+    _local_tensor_for_shape,
+    _split_meta_dtensor,
+    patch_device_type_to_meta,
+    unpatch_device_type_to_meta,
+)
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -65,8 +71,77 @@ def test_funcol_all_to_all_single_respects_output_split_sizes():
     assert recorder.events[0].comm_primitive == "all_to_all"
 
 
+def test_meta_dtensor_split_preserves_backward_connectivity():
+    from torch.distributed.device_mesh import DeviceMesh
+    from torch.distributed.tensor import DTensor, Replicate
+
+    mesh = DeviceMesh.from_group(dist.group.WORLD, "meta", mesh=list(range(8)))
+    local = torch.randn(2, 4, device="meta", requires_grad=True)
+    tensor = DTensor.from_local(local, mesh, [Replicate()], run_check=False)
+
+    left, right = _split_meta_dtensor(tensor, [2, 2], dim=-1)
+    (left.sum() + right.sum()).backward()
+
+    assert left.shape == (2, 2)
+    assert right.shape == (2, 2)
+    assert local.grad is not None
+    assert local.grad.shape == local.shape
+
+
+def test_dtensor_shape_checks_use_local_shape():
+    from torch.distributed.device_mesh import DeviceMesh
+    from torch.distributed.tensor import DTensor, Shard
+
+    mesh = DeviceMesh.from_group(dist.group.WORLD, "meta", mesh=list(range(8)))
+    local = torch.empty(2, 2, device="meta")
+    tensor = DTensor.from_local(
+        local,
+        mesh,
+        [Shard(1)],
+        shape=torch.Size((2, 16)),
+        stride=(16, 1),
+        run_check=False,
+    )
+
+    assert tensor.shape == (2, 16)
+    assert _local_tensor_for_shape(tensor).shape == (2, 2)
+
+
+def test_hsdp_ep_mesh_info_uses_replicate_then_shard_axes():
+    from torch.distributed.device_mesh import DeviceMesh
+    from torch.distributed.fsdp._fully_shard._fsdp_common import HSDPMeshInfo
+    import torchtitan.models.llama4.parallelize as llama4_parallelize
+
+    mesh = DeviceMesh(
+        "meta",
+        torch.arange(8).reshape(2, 4),
+        mesh_dim_names=("dp_replicate", "fsdp"),
+    )
+    try:
+        patch_device_type_to_meta()
+        mesh_info = llama4_parallelize.FSDPMeshInfo(mesh, shard_mesh_dim=0)
+        assert isinstance(mesh_info, HSDPMeshInfo)
+        assert mesh_info.replicate_mesh_dim == 0
+        assert mesh_info.shard_mesh_dim == 1
+    finally:
+        unpatch_device_type_to_meta()
+
+
 def test_collectives_restored_after_context_exit():
     original_all_reduce = dist.all_reduce
     with capture_fake_collectives():
         assert dist.all_reduce is not original_all_reduce
     assert dist.all_reduce is original_all_reduce
+
+
+def test_disabled_memory_tracking_drops_fsdp_residency_events():
+    with capture_fake_collectives(memory_tracking_enabled=False) as recorder:
+        recorder.record_fsdp_residency(
+            group_id="group",
+            action="alloc",
+            phase="forward",
+            num_bytes=1024,
+            tensor_ids=(1,),
+        )
+
+    assert recorder.fsdp_residency_events == []

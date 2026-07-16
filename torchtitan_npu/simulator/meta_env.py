@@ -181,12 +181,15 @@ _original_pipeline_schedule_warmup_p2p: Any = _MISSING
 _original_window_exchange: tuple[Any, Any] | None = None
 _original_dtensor_meta_to_dtensor: Any = _MISSING
 _original_rowwise_prepare_output: Any = _MISSING
+_original_torch_split: Any = _MISSING
 _original_redistribute_local_tensor: Any = _MISSING
 _original_recv_object_list: Any = _MISSING
 _original_send_object_list: Any = _MISSING
 _original_torch_equal: Any = _MISSING
 _original_fwd_one_chunk: Any = _MISSING
 _original_bwd_one_chunk: Any = _MISSING
+_original_fused_adamw: Any = _MISSING
+_original_llama4_fsdp_mesh_info: Any = _MISSING
 _original_bwd_weight_one_chunk: Any = _MISSING
 _original_get_stage_indices: Any = _MISSING
 _patched = False
@@ -250,6 +253,25 @@ _comm_layer: str = ""
 # True, so only the real forward_one_chunk calls define each `s{stage}_F`
 # template (with the correct stage attribution).
 _in_metadata_inference: bool = False
+
+
+class _MetaLocalShape(torch.autograd.Function):
+    """Change a local meta tensor's shape without detaching autograd."""
+
+    @staticmethod
+    def forward(ctx, input_tensor, output_shape):  # noqa: ANN001
+        ctx.input_shape = tuple(input_tensor.shape)
+        ctx.input_dtype = input_tensor.dtype
+        return torch.empty(tuple(output_shape), dtype=input_tensor.dtype, device="meta")
+
+    @staticmethod
+    def backward(ctx, grad_output):  # noqa: ANN001
+        return torch.empty(ctx.input_shape, dtype=ctx.input_dtype, device="meta"), None
+
+
+def _local_tensor_for_shape(tensor: torch.Tensor) -> torch.Tensor:
+    local_tensor = getattr(tensor, "_local_tensor", None)
+    return local_tensor if isinstance(local_tensor, torch.Tensor) else tensor
 
 
 def _patch_tensor_npu_method_to_meta() -> None:
@@ -758,22 +780,65 @@ def _patch_rowwise_parallel_output_for_meta() -> None:
                 continue
             global_seq = outputs.shape[1]
             expected_local_seq = global_seq // mesh_size
-            if result.shape[1] == expected_local_seq:
+            local_result = _local_tensor_for_shape(result)
+            if local_result.shape[1] == expected_local_seq:
                 continue
             # Values are irrelevant under meta simulation; create a tensor with
             # the correct local shape so downstream PrepareModuleInputOutput
             # hooks see consistent DTensor metadata.
-            new_shape = list(result.shape)
+            new_shape = list(local_result.shape)
             new_shape[1] = expected_local_seq
-            result = torch.empty(
-                new_shape,
-                dtype=result.dtype,
-                device=result.device,
-                requires_grad=result.requires_grad,
-            )
+            corrected_local = _MetaLocalShape.apply(local_result, tuple(new_shape))
+            if isinstance(result, DTensor):
+                result = DTensor.from_local(
+                    corrected_local,
+                    device_mesh=result.device_mesh,
+                    placements=result.placements,
+                    shape=result.shape,
+                    stride=result.stride(),
+                    run_check=False,
+                )
+            else:
+                result = corrected_local
         return result
 
     RowwiseParallel._prepare_output_fn = _meta_safe_prepare_output_fn
+
+
+def _split_meta_dtensor(tensor: torch.Tensor, split_sizes: list[int] | tuple[int, ...], dim: int) -> tuple:
+    normalized_dim = dim if dim >= 0 else tensor.ndim + dim
+    outputs = []
+    start = 0
+    for size in split_sizes:
+        size = int(size)
+        outputs.append(tensor.narrow(normalized_dim, start, size))
+        start += size
+    return tuple(outputs)
+
+
+def _patch_torch_split_for_meta_dtensor() -> None:
+    """Avoid DTensor SplitWithSizesBackward mixing local and distributed grads."""
+    global _original_torch_split
+    if _original_torch_split is not _MISSING:
+        return
+    _original_torch_split = torch.split
+
+    def _meta_safe_split(tensor, split_size_or_sections, dim=0):  # noqa: ANN001
+        try:
+            from torch.distributed.tensor import DTensor
+
+            is_meta_dtensor = isinstance(tensor, DTensor) and tensor.device.type == "meta"
+        except Exception:
+            is_meta_dtensor = False
+        if not is_meta_dtensor or not isinstance(split_size_or_sections, (list, tuple)):
+            return _original_torch_split(tensor, split_size_or_sections, dim=dim)
+
+        normalized_dim = dim if dim >= 0 else tensor.ndim + dim
+        if sum(int(size) for size in split_size_or_sections) != tensor.shape[normalized_dim]:
+            return _original_torch_split(tensor, split_size_or_sections, dim=dim)
+        return _split_meta_dtensor(tensor, split_size_or_sections, dim)
+
+    torch.split = _meta_safe_split
 
 
 def _patch_window_exchange_for_fake_pg() -> None:
@@ -1917,35 +1982,9 @@ def _patch_comm_layer_context() -> None:
 
     # Patch FSDPParamGroup.unshard/reshard → L2 + sync _fsdp_state
     try:
-        from torch.distributed.fsdp._fully_shard._fsdp_param_group import FSDPParamGroup
+        from torchtitan_npu.simulator.capture.fsdp_residency import install_fsdp_residency_hooks
 
-        if not hasattr(FSDPParamGroup, "_sim_orig_unshard"):
-            FSDPParamGroup._sim_orig_unshard = FSDPParamGroup.unshard
-            FSDPParamGroup._sim_orig_reshard = FSDPParamGroup.reshard
-
-            def _patched_unshard(self, async_op=False):  # noqa: ANN001
-                global _comm_layer
-                _comm_layer = "L2"
-                # Record FSDP state transition for the currently-active PP
-                # stage (from _pp_context). Multiple FSDPParamGroup instances
-                # may exist per stage; they all transition together under the
-                # runtime schedule's UNSHARD action, so one stage-level state
-                # entry captures the per-microbatch reshard variation.
-                stage = _pp_context.get("stage", 0)
-                if isinstance(stage, int):
-                    _fsdp_state[stage] = "UNSHARDED"
-                return FSDPParamGroup._sim_orig_unshard(self, async_op)
-
-            def _patched_reshard(self):  # noqa: ANN001
-                global _comm_layer
-                _comm_layer = "L2"
-                stage = _pp_context.get("stage", 0)
-                if isinstance(stage, int):
-                    _fsdp_state[stage] = "SHARDED"
-                return FSDPParamGroup._sim_orig_reshard(self)
-
-            FSDPParamGroup.unshard = _patched_unshard
-            FSDPParamGroup.reshard = _patched_reshard
+        install_fsdp_residency_hooks()
     except Exception:
         pass
 
@@ -2110,35 +2149,62 @@ def _patch_fused_adamw_for_meta() -> None:
     ``npu.npu_apply_adam_w`` (a fused NPU kernel). Under meta simulation,
     ``fused=True`` raises RuntimeError (meta device not in supported list).
 
-    This patch replaces ``torch._fused_adamw_`` with a meta-safe shim that:
-    1. Records ``npu.npu_apply_adam_w.default`` via ``record_synthetic_op``
-    2. Executes standard foreach AdamW math for shape inference
-    3. Suppresses individual ``_foreach_*`` sub-op capture
+    This patch replaces ``torch._fused_adamw_`` with a meta-safe shim that
+    records ``npu.npu_apply_adam_w.default`` without performing numerical
+    optimizer updates.
     """
-    if not _is_meta_simulation:
+    global _original_fused_adamw
+    if _original_fused_adamw is not _MISSING:
         return
     try:
         from torchtitan_npu.simulator.hardware_shims.optimizer_shim import _meta_safe_fused_adamw
         import torch
 
-        if not hasattr(torch, "_sim_orig_fused_adamw"):
-            torch._sim_orig_fused_adamw = torch._fused_adamw_
+        _original_fused_adamw = torch._fused_adamw_
 
-            def _patched_fused_adamw(params, grads, exp_avgs, exp_avg_sqs,
-                                     max_exp_avg_sqs, state_steps, **kwargs):
-                if not _is_meta_simulation:
-                    return torch._sim_orig_fused_adamw(
-                        params, grads, exp_avgs, exp_avg_sqs,
-                        max_exp_avg_sqs, state_steps, **kwargs
-                    )
-                return _meta_safe_fused_adamw(
+        def _patched_fused_adamw(params, grads, exp_avgs, exp_avg_sqs,
+                                 max_exp_avg_sqs, state_steps, **kwargs):
+            if not _is_meta_simulation:
+                return _original_fused_adamw(
                     params, grads, exp_avgs, exp_avg_sqs,
                     max_exp_avg_sqs, state_steps, **kwargs
                 )
+            return _meta_safe_fused_adamw(
+                params, grads, exp_avgs, exp_avg_sqs,
+                max_exp_avg_sqs, state_steps, **kwargs
+            )
 
-            torch._fused_adamw_ = _patched_fused_adamw
+        torch._fused_adamw_ = _patched_fused_adamw
     except Exception:
+        _original_fused_adamw = _MISSING
         pass
+
+
+def _patch_llama4_hsdp_ep_mesh_info() -> None:
+    """Preserve the replicate axis for llama4's HSDP+EP placement callback.
+
+    The pinned torchtitan ``llama4.apply_fsdp`` builds ``FSDPMeshInfo``
+    explicitly for per-parameter EP placement. On a 2D HSDP mesh that makes
+    dim 0 (``dp_replicate``) the shard axis, instead of replicating on dim 0
+    and sharding on dim 1 (``fsdp``). PyTorch's normal 2D fully_shard path
+    uses ``HSDPMeshInfo`` with the correct axes.
+    """
+    global _original_llama4_fsdp_mesh_info
+    if _original_llama4_fsdp_mesh_info is not _MISSING:
+        return
+
+    import torchtitan.models.llama4.parallelize as llama4_parallelize
+    from torch.distributed.fsdp._fully_shard._fsdp_common import HSDPMeshInfo
+
+    original = llama4_parallelize.FSDPMeshInfo
+    _original_llama4_fsdp_mesh_info = original
+
+    def _hsdp_aware_mesh_info(mesh, *args, **kwargs):  # noqa: ANN001, ANN202
+        if mesh.ndim == 2:
+            return HSDPMeshInfo(mesh, shard_mesh_dim=1, replicate_mesh_dim=0)
+        return original(mesh, *args, **kwargs)
+
+    llama4_parallelize.FSDPMeshInfo = _hsdp_aware_mesh_info
 
 
 def patch_device_type_to_meta() -> None:
@@ -2212,6 +2278,7 @@ def patch_device_type_to_meta() -> None:
     _patch_pipeline_schedule_warmup_for_meta()
     _patch_dtensor_meta_to_dtensor_for_meta()
     _patch_rowwise_parallel_output_for_meta()
+    _patch_torch_split_for_meta_dtensor()
     _patch_window_exchange_for_fake_pg()
     _patch_redistribute_local_tensor_for_meta()
     _patch_object_collectives_for_fake_pg()
@@ -2225,6 +2292,7 @@ def patch_device_type_to_meta() -> None:
     _patch_dtensor_random_for_fake_mesh()
     _patch_comm_layer_context()
     _patch_mxfp8_for_meta()
+    _patch_llama4_hsdp_ep_mesh_info()
     _patch_fused_adamw_for_meta()
     global _is_meta_simulation
     _is_meta_simulation = True
@@ -2233,9 +2301,15 @@ def patch_device_type_to_meta() -> None:
 
 def unpatch_device_type_to_meta() -> None:
     """Restore the original device_type/device_module bindings (test-only helper)."""
-    global _patched, _original_fsdp_validate_no_meta_params, _original_tensor_npu_method, _original_torch_full
+    global _patched, _is_meta_simulation
+    global _original_fsdp_validate_no_meta_params, _original_tensor_npu_method, _original_torch_full
     global _original_moe_token_dispatch, _original_grouped_mm, _original_li_loss_forward, _original_pipeline_schedule_warmup_p2p
     global _original_window_exchange, _original_dtensor_meta_to_dtensor, _original_rowwise_prepare_output
+    global _original_torch_split
+    global _original_redistribute_local_tensor, _original_recv_object_list, _original_send_object_list
+    global _original_torch_equal
+    global _original_fused_adamw
+    global _original_llama4_fsdp_mesh_info
     for (module_path, attr_name), original in _original_values.items():
         module = importlib.import_module(module_path)
         if original is _MISSING:
@@ -2298,6 +2372,10 @@ def unpatch_device_type_to_meta() -> None:
         RowwiseParallel._prepare_output_fn = _original_rowwise_prepare_output
         _original_rowwise_prepare_output = _MISSING
 
+    if _original_torch_split is not _MISSING:
+        torch.split = _original_torch_split
+        _original_torch_split = _MISSING
+
     if _original_redistribute_local_tensor is not _MISSING:
         import torch.distributed.tensor._redistribute as _redistribute_module
 
@@ -2316,4 +2394,15 @@ def unpatch_device_type_to_meta() -> None:
         torch.equal = _original_torch_equal
         _original_torch_equal = _MISSING
 
+    if _original_fused_adamw is not _MISSING:
+        torch._fused_adamw_ = _original_fused_adamw
+        _original_fused_adamw = _MISSING
+
+    if _original_llama4_fsdp_mesh_info is not _MISSING:
+        import torchtitan.models.llama4.parallelize as llama4_parallelize
+
+        llama4_parallelize.FSDPMeshInfo = _original_llama4_fsdp_mesh_info
+        _original_llama4_fsdp_mesh_info = _MISSING
+
+    _is_meta_simulation = False
     _patched = False

@@ -645,7 +645,7 @@ def apply_non_moe_tp(
             [Replicate()],
         )
         # pyrefly: ignore [missing-attribute]
-        if transformer_block.attention.compress_ratio == 1:
+        if transformer_block.attention.compress_ratio <= 1:
             attention_kernel_plan = attention_kernel_plan_ratio1
         # pyrefly: ignore [missing-attribute]
         elif transformer_block.attention.compress_ratio == 4:

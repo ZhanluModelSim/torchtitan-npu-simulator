@@ -15,7 +15,16 @@ from torchtitan_npu.simulator.viz.json_export import export_json, workload_graph
 
 
 def _tiny_workload() -> WorkloadGraph:
-    node = OpNode(op_id="op1", op_type="matmul", inputs=[], outputs=[], attrs={}, predecessors=[], successors=[])
+    node = OpNode(
+        op_id="op1",
+        op_type="matmul",
+        inputs=[],
+        outputs=[],
+        attrs={},
+        predecessors=[],
+        successors=[],
+        annotations={"execution_kind": "recompute", "is_recompute": True},
+    )
     template = StepGraph(step_id="tmpl", step_type="forward", nodes={"op1": node})
     schedule = ScheduleGraph(schedule_id="sched", workload_type="train", step_templates={"tmpl": template}, instances=[])
     return WorkloadGraph(
@@ -29,6 +38,9 @@ def test_workload_graph_to_dict_is_plain_dict():
     assert isinstance(d, dict)
     assert d["workload_id"] == "wl1"
     assert d["step_templates"]["tmpl"]["nodes"]["op1"]["op_type"] == "matmul"
+    annotations = d["step_templates"]["tmpl"]["nodes"]["op1"]["annotations"]
+    assert annotations["execution_kind"] == "recompute"
+    assert annotations["is_recompute"] is True
 
 
 def test_export_json_writes_valid_json_file():

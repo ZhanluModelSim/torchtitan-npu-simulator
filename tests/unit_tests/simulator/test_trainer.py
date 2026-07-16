@@ -95,6 +95,35 @@ def test_run_simulation_step_captures_optimizer_phase(fake_world):
     assert len(optimizer_ops) > 0
 
 
+def test_run_simulation_step_can_disable_memory_tracking(fake_world):
+    parallel_dims = _build_parallel_dims(4)
+    model = nn.Linear(4, 4, device="meta")
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+
+    def forward_backward_step(*, input_dict, labels, global_valid_tokens):
+        loss = model(input_dict["input"]).sum() / global_valid_tokens
+        loss.backward()
+        return loss
+
+    graph = run_simulation_step(
+        model_parts=[model],
+        parallel_dims=parallel_dims,
+        forward_backward_step=forward_backward_step,
+        input_dict={"input": torch.randn(2, 4, device="meta")},
+        labels=torch.randint(0, 10, (2, 4), device="meta"),
+        optimizer_step=optimizer.step,
+        lr_scheduler_step=lambda: None,
+        local_batch_size=2,
+        seq_len=4,
+        enable_memory_tracking=False,
+    )
+
+    assert "memory_plan" not in graph.iteration.schedule.annotations
+    assert "memory_summary" not in graph.iteration.schedule.annotations
+    assert all(step.param_mem == 0 for step in graph.step_templates.values())
+    assert all(step.peak_active_mem == 0 for step in graph.step_templates.values())
+
+
 def test_simulation_trainer_config_build_dispatches_to_simulation_trainer():
     # Regression test for the Configurable._owner auto-wiring mechanism
     # this design relies on (verified against the pinned torchtitan
@@ -151,3 +180,4 @@ def test_simulation_config_defaults_target_npu_device_type_to_non_a5():
 
     config = SimulationConfig(output_dir="./out")
     assert config.target_npu_device_type == "non_a5"
+    assert config.enable_memory_tracking is True

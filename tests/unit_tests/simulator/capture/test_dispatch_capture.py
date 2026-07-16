@@ -6,6 +6,7 @@
 import torch
 import torch.nn as nn
 
+from torchtitan_npu.simulator.capture.checkpoint_execution import execution_kind_context
 from torchtitan_npu.simulator.capture.dispatch_capture import OpDispatchCapture
 from torchtitan_npu.simulator.capture.module_path import ModulePathTracker
 
@@ -87,6 +88,26 @@ def test_phase_provider_tags_every_node_and_defaults_to_forward():
     nodes = capture.build_nodes()
     phases = sorted({n.annotations["phase"] for n in nodes.values()})
     assert phases == ["backward", "forward"]
+    assert {n.annotations["execution_kind"] for n in nodes.values()} == {
+        "backward",
+        "original_forward",
+    }
+
+
+def test_capture_does_not_deduplicate_recompute_with_normal_backward():
+    capture = OpDispatchCapture(phase_provider=lambda: "backward")
+    tensor = torch.empty(2, device="meta")
+    with capture:
+        capture.record_synthetic_op("test.same_op", [tensor], [tensor])
+        with execution_kind_context("recompute"):
+            capture.record_synthetic_op("test.same_op", [tensor], [tensor])
+
+    same_ops = [
+        node for node in capture.build_nodes().values()
+        if node.annotations["raw_op_type"] == "test.same_op"
+    ]
+    assert len(same_ops) == 2
+    assert [node.annotations["execution_kind"] for node in same_ops] == ["backward", "recompute"]
 
 
 def test_record_synthetic_op_creates_a_node_with_given_raw_op_type():
@@ -100,6 +121,38 @@ def test_record_synthetic_op_creates_a_node_with_given_raw_op_type():
     assert len(synthetic) == 1
     assert synthetic[0].op_type == "unknown"  # not in OP_MAPPING -- expected, display_op_label handles it
     assert [o.shape for o in synthetic[0].outputs] == [(2, 4)]
+
+
+def test_capture_keeps_uncollapsed_memory_events_for_liveness():
+    capture = OpDispatchCapture()
+    with capture:
+        x = torch.zeros(4, device="meta")
+        for _ in range(3):
+            x = x.relu()
+    nodes = capture.build_nodes()
+    relu_nodes = [n for n in nodes.values() if "relu" in n.annotations["raw_op_type"]]
+    relu_memory_events = [e for e in capture.memory_events() if "relu" in e.raw_op_type]
+    assert len(relu_nodes) == 1
+    assert relu_nodes[0].annotations["repeat_count"] == 3
+    assert len(relu_memory_events) == 3
+    assert len({e.seq_idx for e in relu_memory_events}) == 3
+
+
+def test_capture_can_disable_memory_event_recording_without_disabling_l0_capture():
+    capture = OpDispatchCapture(record_memory=False)
+    with capture:
+        x = torch.zeros(4, device="meta")
+        x.relu()
+
+    assert capture.build_nodes()
+    assert capture.memory_events() == []
+
+
+def test_capture_returns_stable_id_for_same_live_tensor():
+    capture = OpDispatchCapture()
+    tensor = torch.zeros(4, device="meta")
+
+    assert capture.tensor_id(tensor) == capture.tensor_id(tensor)
 
 
 def test_record_synthetic_op_wires_producer_consumer_edges():
