@@ -267,6 +267,9 @@ def run_simulation_step(
             "Static memory: "
             f"persistent_param_bytes={memory_plan.persistent_param_bytes} "
             f"active_bytes_peak={memory_plan.peak_active_bytes} "
+            f"forward_peak={memory_plan.forward_peak_active_bytes} "
+            f"backward_peak={memory_plan.backward_peak_active_bytes} "
+            f"optimizer_peak={memory_plan.optimizer_peak_active_bytes} "
             f"peak_seq_idx={memory_plan.peak_seq_idx}"
         )
     else:

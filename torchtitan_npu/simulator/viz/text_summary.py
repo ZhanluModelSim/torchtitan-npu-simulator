@@ -59,6 +59,9 @@ def export_text_summary(workload_graph: WorkloadGraph) -> str:
         lines.append(
             "  memory "
             f"active_bytes_peak={memory_summary.get('active_bytes_peak', 0)} "
+            f"forward_peak={memory_summary.get('forward_active_bytes_peak', 0)} "
+            f"backward_peak={memory_summary.get('backward_active_bytes_peak', 0)} "
+            f"optimizer_peak={memory_summary.get('optimizer_active_bytes_peak', 0)} "
             f"peak_seq_idx={memory_summary.get('peak_seq_idx', 0)} "
             f"persistent_param_bytes={memory_summary.get('persistent_param_bytes', 0)}"
         )

@@ -264,6 +264,42 @@ def _build_timeline(lifetimes: list[TensorLifetime]) -> list[MemoryTimelineEvent
     return timeline
 
 
+def _phase_peak_active_bytes(
+    timeline: list[MemoryTimelineEvent],
+    events: list[RawMemoryEvent],
+) -> dict[str, int]:
+    """Return phase peaks, including memory already live on phase entry."""
+    phases = ("forward", "backward", "optimizer")
+    phase_seqs: dict[str, list[int]] = {phase: [] for phase in phases}
+    for event in events:
+        if event.phase in phase_seqs:
+            phase_seqs[event.phase].append(event.seq_idx)
+    for event in timeline:
+        if event.phase in phase_seqs:
+            phase_seqs[event.phase].append(event.seq_idx)
+
+    peaks: dict[str, int] = {}
+    for phase, seqs in phase_seqs.items():
+        if not seqs:
+            peaks[phase] = 0
+            continue
+        start_seq, end_seq = min(seqs), max(seqs)
+        active_at_entry = 0
+        for event in timeline:
+            if event.seq_idx >= start_seq:
+                break
+            active_at_entry = event.active_bytes_after
+        peak = active_at_entry
+        for event in timeline:
+            if event.seq_idx < start_seq:
+                continue
+            if event.seq_idx > end_seq:
+                break
+            peak = max(peak, event.active_bytes_after)
+        peaks[phase] = peak
+    return peaks
+
+
 def estimate_static_memory(
     raw_events: Iterable[RawMemoryEvent],
     *,
@@ -353,9 +389,13 @@ def estimate_static_memory(
 
     timeline = _build_timeline(lifetimes)
     peak_event = max(timeline, key=lambda item: item.active_bytes_after, default=None)
+    phase_peaks = _phase_peak_active_bytes(timeline, events)
     plan = MemoryPlan(
         persistent_param_bytes=sum(item.num_bytes for item in param_lifetimes),
         peak_active_bytes=peak_event.active_bytes_after if peak_event else 0,
+        forward_peak_active_bytes=phase_peaks["forward"],
+        backward_peak_active_bytes=phase_peaks["backward"],
+        optimizer_peak_active_bytes=phase_peaks["optimizer"],
         peak_seq_idx=peak_event.seq_idx if peak_event else 0,
         peak_phase=peak_event.phase if peak_event else "",
         raw_events=events,

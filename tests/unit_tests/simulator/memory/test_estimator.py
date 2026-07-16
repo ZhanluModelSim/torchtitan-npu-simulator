@@ -172,6 +172,19 @@ def test_backward_output_consumed_by_optimizer_is_gradient_accumulator():
     assert lifetime.death_seq == 5
 
 
+def test_phase_peaks_include_memory_live_on_phase_entry():
+    x, activation, grad = tref(1), tref(2), tref(3)
+    plan = estimate_static_memory([
+        event(0, 10, "aten.relu.default", inputs=[x], outputs=[activation], phase="forward"),
+        event(5, 20, "aten.relu_backward.default", inputs=[activation], outputs=[grad], phase="backward"),
+        event(9, 30, "optimizer.step", inputs=[grad], phase="optimizer"),
+    ])
+
+    assert plan.forward_peak_active_bytes == 32
+    assert plan.backward_peak_active_bytes == 32
+    assert plan.optimizer_peak_active_bytes == 16
+
+
 def test_missing_parameter_gradients_are_synthesized_through_optimizer():
     model = nn.Linear(4, 2, bias=False, device="meta")
     plan = estimate_static_memory(
@@ -399,6 +412,9 @@ def test_memory_plan_exports_compact_chrome_trace(tmp_path):
     assert any(item["ph"] == "X" and item["name"] == "forward" for item in events)
     assert any(item["ph"] == "X" and item["name"] == "backward" for item in events)
     assert any(item["ph"] == "i" and item["name"] == "peak active bytes" for item in events)
+    assert trace["metadata"]["forward_active_bytes_peak"] == 64
+    assert trace["metadata"]["backward_active_bytes_peak"] == 64
+    assert trace["metadata"]["optimizer_active_bytes_peak"] == 0
 
     export_memory_plan(plan, str(tmp_path))
     memory_dir = tmp_path / "memory"

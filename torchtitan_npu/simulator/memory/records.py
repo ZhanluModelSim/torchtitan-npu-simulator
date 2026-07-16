@@ -90,6 +90,9 @@ class MemoryPlan:
     metric: str = "active_tensor_bytes"
     persistent_param_bytes: int = 0
     peak_active_bytes: int = 0
+    forward_peak_active_bytes: int = 0
+    backward_peak_active_bytes: int = 0
+    optimizer_peak_active_bytes: int = 0
     peak_seq_idx: int = 0
     peak_phase: str = ""
     raw_events: list[RawMemoryEvent] = field(default_factory=list)
@@ -103,6 +106,9 @@ class MemoryPlan:
             "metric": self.metric,
             "persistent_param_bytes": self.persistent_param_bytes,
             "active_bytes_peak": self.peak_active_bytes,
+            "forward_active_bytes_peak": self.forward_peak_active_bytes,
+            "backward_active_bytes_peak": self.backward_peak_active_bytes,
+            "optimizer_active_bytes_peak": self.optimizer_peak_active_bytes,
             "peak_seq_idx": self.peak_seq_idx,
             "peak_phase": self.peak_phase,
             "raw_memory_event_count": len(self.raw_events),
