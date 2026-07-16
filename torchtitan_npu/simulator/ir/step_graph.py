@@ -107,20 +107,33 @@ class StepGraph:
         shapes = lambda metas: ";".join("[" + ",".join(str(d) for d in m.shape) + "]" for m in metas)
         dtypes = lambda metas: ";".join(m.dtype for m in metas)
 
+        # When fused_regions is populated, append region_id/fused_op_type columns
+        # so each op row shows which fusion region it belongs to (additive; the
+        # base columns stay identical to the non-fusion export).
+        fused = bool(getattr(self, "fused_regions", None))
+        op_to_region: dict[int, tuple[int, str]] = {}
+        if fused:
+            for r in self.fused_regions:
+                for oid in r.op_ids:
+                    op_to_region[oid] = (r.region_id, r.fused_op_type)
+
         with open(path, "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
-            w.writerow([
+            header = [
                 "topo_order", "op_id", "seq_idx", "op_type", "raw_op_type", "phase",
                 "comp_type", "fsdp_state",
                 "inputs_shape", "outputs_shape", "inputs_dtype", "outputs_dtype",
                 "flops", "peak_mem", "comm_bytes", "repeat_count",
                 "module_path", "comm_dim", "comm_ranks",
                 "predecessors", "successors",
-            ])
+            ]
+            if fused:
+                header += ["region_id", "fused_op_type"]
+            w.writerow(header)
             for topo_idx, op_id in enumerate(sorted_ids):
                 node = self.nodes[op_id]
                 ann = node.annotations
-                w.writerow([
+                row = [
                     topo_idx, op_id, node.seq_idx, node.op_type,
                     ann.get("raw_op_type", ""), ann.get("phase", ""),
                     ann.get("comp_type", ""), ann.get("fsdp_state", "NA"),
@@ -131,4 +144,37 @@ class StepGraph:
                     ann.get("comm_dim", ""), ann.get("comm_ranks", ""),
                     ";".join(str(p) for p in node.predecessors),
                     ";".join(str(s) for s in node.successors),
+                ]
+                if fused:
+                    rid, ftype = op_to_region.get(op_id, ("", ""))
+                    row += [rid, ftype]
+                w.writerow(row)
+
+    def export_fused_regions_csv(self, path: str) -> None:
+        """Export the fusion regions: one row per fused region. Mirrors the L0
+        export granularity (one CSV per step) so the fused result is
+        inspectable in the same format as step_*_l0_ops.csv.
+
+        Columns: region_id, fused_op_type, is_unfused, op_count, op_ids,
+        eliminated_intermediates_bytes, member_op_types
+        """
+        import csv
+
+        regions = getattr(self, "fused_regions", None) or []
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow([
+                "region_id", "fused_op_type", "is_unfused", "op_count", "op_ids",
+                "eliminated_intermediates_bytes", "member_op_types",
+            ])
+            for r in regions:
+                types = {}
+                for oid in r.op_ids:
+                    t = self.nodes[oid].op_type if oid in self.nodes else "?"
+                    types[t] = types.get(t, 0) + 1
+                w.writerow([
+                    r.region_id, r.fused_op_type, int(r.is_unfused),
+                    len(r.op_ids), ";".join(str(o) for o in r.op_ids),
+                    r.eliminated_intermediates_bytes,
+                    ";".join(f"{k}:{v}" for k, v in types.items()),
                 ])

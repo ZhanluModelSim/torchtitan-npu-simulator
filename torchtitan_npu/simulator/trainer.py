@@ -44,6 +44,7 @@ class SimulationConfig:
     target_npu_device_type: str = "non_a5"
     csv_max_ranks: int | None = None
     simulated_parallel_degrees: dict[str, int] = field(default_factory=dict)
+    enable_fusion: bool = False
 
 
 @dataclass(kw_only=True, slots=True)
@@ -367,6 +368,15 @@ class SimulationTrainer(Trainer):
 
         t2 = time.perf_counter()
 
+        # Host-only GE-catalog fusion pass: populate StepGraph.fused_regions
+        # so _export writes the fused-region view alongside the original IR.
+        if self.simulation_config.enable_fusion:
+            from torchtitan_npu.simulator.ir.ge_fusion import (
+                build_ge_fusion_profile, apply_ge_fusion_profile,
+            )
+            for sg in self.workload_graph.step_templates.values():
+                apply_ge_fusion_profile(sg, build_ge_fusion_profile(sg))
+
         # Each rank exports independently to rank_N/ directory (no merge)
         if is_multi_proc and dist.is_initialized():
             self._export(rank=rank)
@@ -567,9 +577,19 @@ class SimulationTrainer(Trainer):
                 os.path.join(ir_dir, "l1_schedule"),
                 max_ranks=self.simulation_config.csv_max_ranks,
             )
-            # L1: per-step L0 ops
+            # L1: per-step L0 ops (export_l0_csv appends region_id/fused_op_type
+            # columns automatically when fused_regions is populated)
             for tid, sg in self.workload_graph.step_templates.items():
                 sg.export_l0_csv(os.path.join(ir_dir, f"step_{sg.step_type}_l0_ops.csv"))
+            # L1 fusion: per-step fused regions (only when fusion was applied)
+            if any(getattr(sg, "fused_regions", None) for sg in self.workload_graph.step_templates.values()):
+                fused_dir = os.path.join(ir_dir, "fused_regions")
+                os.makedirs(fused_dir, exist_ok=True)
+                for tid, sg in self.workload_graph.step_templates.items():
+                    if getattr(sg, "fused_regions", None):
+                        sg.export_fused_regions_csv(
+                            os.path.join(fused_dir, f"step_{sg.step_type}_fused_regions.csv")
+                        )
             export_timings["csv_ir_export"] = time.perf_counter() - t
 
         total_export = time.perf_counter() - t0
