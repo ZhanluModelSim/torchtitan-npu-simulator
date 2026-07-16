@@ -78,14 +78,30 @@ class _RawEvent:
     seq_idx: int = 0
     pp_stage: int = -1
     pp_mb_idx: int = -1
+    # Fine-grained compute-graph class (mirrors
+    # torch.distributed.pipelining.schedules._ComputationType):
+    # "F" forward, "B" full backward, "I" input-grad only, "W" weight-grad
+    # only, "F_RECOMPUTE" recompute forward, "OPTIMIZER". For non-PP steps
+    # this derives from `phase` (F/B/OPTIMIZER). Used by build_step_graphs
+    # to bucket L0 ops into per-(stage, comp_type) StepGraphs instead of
+    # the coarse forward/backward/optimizer triple.
+    comp_type: str = "F"
+    # FSDP sharding state active when this op ran ("SHARDED"/"UNSHARDED"/"NA").
+    fsdp_state: str = "NA"
 
 
 def _shape_signature(event: _RawEvent) -> tuple:
+    # `comp_type` is part of the signature so that a full-backward ("B") op
+    # and an input-grad ("I") / weight-grad ("W") op with identical shapes do
+    # NOT collapse into one repeat_count'd entry — they belong to different
+    # compute-graph templates and must stay distinct in the L0 IR.
     return (
         event.raw_op_type,
         event.module_path,
         event.phase,
         event.execution_kind,
+        event.comp_type,
+        event.pp_stage,
         tuple(tuple(i.shape) for i in event.inputs),
         tuple(tuple(o.shape) for o in event.outputs),
     )
@@ -133,8 +149,47 @@ class OpDispatchCapture(TorchDispatchMode):
         self._reused_tensor_ids = itertools.count(1)
         self._last_signature: tuple | None = None
         self._previous_active_capture: OpDispatchCapture | None = None
-        self._capture_l0: bool = True  # pass-through when False (MB 1+)
+        self._capture_l0: bool = True  # pass-through when False (duplicate class)
         self._pending_comm_links: dict[int, object] = {}  # id(tensor) → CommEvent for dst_entry_op resolution
+        # Per-(stage, comp_type) class dedup: the FIRST occurrence of each
+        # class is captured in full (becomes a StepGraph template), every later
+        # occurrence is a pass-through that only bumps the instance count. This
+        # captures every distinct compute graph once while keeping capture cost
+        # proportional to the number of distinct classes (not num_microbatches).
+        self._captured_classes: set[tuple[int, str]] = set()
+        self._class_instance_counts: dict[tuple[int, str], int] = {}
+        self._chunk_class_key: tuple[int, str] | None = None
+
+    def begin_chunk(self, class_key: tuple[int, str]) -> None:
+        """Mark the start of one pipeline compute chunk (one
+        forward_one_chunk / backward_one_chunk / backward_weight_one_chunk
+        call). `class_key = (pp_stage, comp_type)`. If this class has not
+        been captured yet, enable full L0 capture for this chunk; otherwise
+        disable it (pass-through) and bump the class's instance count so
+        the L2 schedule can still instantiate the matching template for
+        this microbatch. Pairs with `end_chunk`."""
+        self._chunk_class_key = class_key
+        if class_key in self._captured_classes:
+            self._capture_l0 = False
+            self._class_instance_counts[class_key] = self._class_instance_counts.get(class_key, 1) + 1
+        else:
+            self._captured_classes.add(class_key)
+            self._capture_l0 = True
+            self._class_instance_counts[class_key] = 1
+
+    def end_chunk(self) -> None:
+        """Mark the end of a compute chunk. Restores L0 capture so that
+        inter-chunk communication / the optimizer phase (which run outside
+        any chunk) are still recorded, matching the pre-existing behavior."""
+        self._capture_l0 = True
+        self._chunk_class_key = None
+
+    @property
+    def class_instance_counts(self) -> dict[tuple[int, str], int]:
+        """Per-class instance counts (number of microbatches that executed
+        each captured template). Consumed by the L2 schedule builder to
+        instantiate StepInstances for every microbatch."""
+        return self._class_instance_counts
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):  # noqa: ANN001, ANN201
         kwargs = kwargs or {}
@@ -176,7 +231,18 @@ class OpDispatchCapture(TorchDispatchMode):
         module_path: str,
     ) -> None:
         if not self._capture_l0:
-            return  # pass-through: MB 1+ skips L0 capture
+            return  # pass-through: duplicate (stage, comp_type) class skips L0 capture
+        # Skip the framework metadata-inference forward (DYNAMIC-mode
+        # `_compute_outputs` and the FSDP _lazy_init/unshard setup it triggers),
+        # which is a shape-inference artifact, not a training microbatch — see
+        # meta_env._in_metadata_inference (set around _prepare_forward_infra /
+        # _prepare_backward_infra / _compute_outputs).
+        try:
+            from torchtitan_npu.simulator.meta_env import _in_metadata_inference
+            if _in_metadata_inference:
+                return
+        except Exception:
+            pass
         input_ids = [self.tensor_id(tensor) for tensor in flat_inputs]
         output_ids = [self.tensor_id(tensor) for tensor in flat_outputs]
         predecessors = sorted({self._producer[tensor_id] for tensor_id in input_ids if tensor_id in self._producer})
@@ -187,15 +253,31 @@ class OpDispatchCapture(TorchDispatchMode):
         phase = self.phase_provider() if self.phase_provider else "forward"
         execution_kind = current_execution_kind(phase)
 
-        # Read PP context for this op's stage/mb attribution
+        # Read PP context for this op's stage/mb/comp_type/fsdp_state attribution.
+        # `comp_type` is set per-chunk by the patched forward_one_chunk /
+        # backward_one_chunk / backward_weight_one_chunk (see meta_env.py).
+        # For non-PP steps (no chunk patches run), derive comp_type from phase.
         pp_stage = -1
         pp_mb_idx = -1
+        comp_type = ""
+        fsdp_state = "NA"
         try:
             from torchtitan_npu.simulator.meta_env import _pp_context
             pp_stage = int(_pp_context.get("stage", -1))
             pp_mb_idx = int(_pp_context.get("mb_idx", -1))
+            comp_type = str(_pp_context.get("comp_type", ""))
+            fsdp_state = str(_pp_context.get("fsdp_state", "NA"))
         except Exception:
             pass
+        if phase == "optimizer":
+            comp_type = "OPTIMIZER"
+        elif not comp_type or comp_type == "F":
+            # Only honor an explicit "F" during forward; otherwise derive from
+            # phase so non-PP backward ops are not mislabeled "F" (the default).
+            if phase == "backward":
+                comp_type = "B"
+            else:
+                comp_type = "F"
 
         candidate = _RawEvent(
             op_id=0,
@@ -210,6 +292,8 @@ class OpDispatchCapture(TorchDispatchMode):
             seq_idx=next(_seq_counter),
             pp_stage=pp_stage,
             pp_mb_idx=pp_mb_idx,
+            comp_type=comp_type,
+            fsdp_state=fsdp_state,
         )
         signature = _shape_signature(candidate)
 
@@ -289,6 +373,10 @@ class OpDispatchCapture(TorchDispatchMode):
                 "phase": event.phase,
                 "execution_kind": event.execution_kind,
                 "is_recompute": event.execution_kind == "recompute",
+                # Always stamp comp_type/fsdp_state so build_step_graphs can
+                # bucket by (stage, comp_type) regardless of capture order.
+                "comp_type": event.comp_type,
+                "fsdp_state": event.fsdp_state,
             }
             if event.module_path:
                 annotations["module_path"] = event.module_path

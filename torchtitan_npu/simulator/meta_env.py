@@ -190,6 +190,7 @@ _original_fwd_one_chunk: Any = _MISSING
 _original_bwd_one_chunk: Any = _MISSING
 _original_fused_adamw: Any = _MISSING
 _original_llama4_fsdp_mesh_info: Any = _MISSING
+_original_bwd_weight_one_chunk: Any = _MISSING
 _original_get_stage_indices: Any = _MISSING
 _patched = False
 
@@ -197,7 +198,39 @@ _patched = False
 # PipelineStage.forward_one_chunk / backward_one_chunk so that
 # comm_events.py's P2P interceptors can attribute isend/irecv calls
 # to the correct microbatch, phase, and stage.
-_pp_context: dict[str, int | str] = {"mb_idx": 0, "phase": "forward", "stage": 0}
+#
+# `comp_type` is the fine-grained compute-graph class, drawn from
+# torch.distributed.pipelining.schedules._ComputationType:
+#   "F" forward, "B" full backward (I+W in one autograd.backward pass),
+#   "I" backward_input only (stage_backward_input, full_backward=False),
+#   "W" backward_weight only (stage_backward_weight / backward_weight_one_chunk),
+#   "F_RECOMPUTE" activation-checkpoint recompute forward, "OPTIMIZER".
+# It is set by the patched chunk methods below and read by
+# dispatch_capture._record_event to bucket L0 ops into per-(stage, comp_type)
+# StepGraphs instead of the coarse forward/backward/optimizer triple.
+_pp_context: dict[str, int | str] = {
+    "mb_idx": 0,
+    "phase": "forward",
+    # Default stage is -1 ("unattributed"): ops captured outside any compute
+    # chunk (FSDP _lazy_init / inter-chunk comm / framework setup, which run
+    # before the first forward_one_chunk stamps the real stage) bucket into a
+    # clearly-labelled `s-1_*` template instead of masquerading as stage 0's
+    # real forward. The chunk patches overwrite this with the real stage_index.
+    "stage": -1,
+    "comp_type": "F",
+    "fsdp_state": "NA",
+}
+
+# Per-stage FSDP sharding state machine, updated by the patched
+# FSDPParamGroup.unshard/reshard (and by _PipelineScheduleRuntime
+# UNSHARD/RESHARD actions). Values: "SHARDED" / "UNSHARDED" / "NA".
+# Read by the chunk patches to stamp the current FSDP state onto each
+# captured compute graph class. FSDP2 with PP keeps params unsharded
+# across the whole step (reshard_after_backward=False), so this usually
+# stays "UNSHARDED" — but tracking it preserves the cross-microbatch
+# reshard variation the schedule explicitly issues as UNSHARD/RESHARD
+# actions (visible in the L2 timeline as comm DataPasses).
+_fsdp_state: dict[int, str] = {}
 
 # Global flag: when True, all collective/P2P communication is intercepted
 # as no-op (regardless of ProcessGroup type). Set by SimulationTrainer
@@ -208,6 +241,18 @@ _is_meta_simulation: bool = False
 # whether a comm call originates from model compute ("L1") or framework
 # scheduling ("L2"). Read by _record_comm to classify CommEvent.
 _comm_layer: str = ""
+
+# True while a pipeline stage runs its DYNAMIC-mode metadata-inference forward
+# (`_forward_metadata_inference` -> `_compute_outputs` -> `submod(...)`), which
+# PyTorch issues once per stage BEFORE the real compute chunks to infer output
+# shapes for cross-rank P2P. That forward is a *framework shape-inference
+# artifact*, not a training microbatch: its ops run with the default
+# `_pp_context["stage"]=0` (no chunk has stamped the real stage yet) and would
+# otherwise pollute the per-(stage, comp_type) L0 templates with a spurious
+# `s0_F` graph. dispatch_capture._record_event skips recording while this is
+# True, so only the real forward_one_chunk calls define each `s{stage}_F`
+# template (with the correct stage attribution).
+_in_metadata_inference: bool = False
 
 
 class _MetaLocalShape(torch.autograd.Function):
@@ -1085,13 +1130,23 @@ def _patch_pipeline_stage_meta_exchange_for_fake_pg() -> None:
         # Let the original _prepare_forward_infra run — it will call
         # _forward_metadata_inference which uses _recv_meta to get input
         # shapes from the previous stage.
+        global _in_metadata_inference
         if not _is_fake(self.group) and not _is_meta_simulation:
             return orig_prepare_forward(self, num_microbatches, args, kwargs=kwargs, has_backward=has_backward)
 
         # For multi_proc_meta (gloo, not fake PG), let original handle it
-        # (DYNAMIC mode + _send_meta/_recv_meta via gloo)
+        # (DYNAMIC mode + _send_meta/_recv_meta via gloo). Bracket with the
+        # metadata-inference flag so the FSDP _lazy_init / unshard setup and
+        # the _compute_outputs forward it triggers are NOT recorded into the
+        # per-(stage, comp_type) L0 templates (they are framework
+        # shape-inference artifacts, not training microbatches).
         if not _is_fake(self.group) and _is_meta_simulation:
-            return orig_prepare_forward(self, num_microbatches, args, kwargs=kwargs, has_backward=has_backward)
+            prev = _in_metadata_inference
+            _in_metadata_inference = True
+            try:
+                return orig_prepare_forward(self, num_microbatches, args, kwargs=kwargs, has_backward=has_backward)
+            finally:
+                _in_metadata_inference = prev
 
         # If user_meta.inputs is already set, use the original path
         if self._user_meta.inputs is not None:
@@ -1125,12 +1180,21 @@ def _patch_pipeline_stage_meta_exchange_for_fake_pg() -> None:
             else:
                 input_tensors = ()
 
-        # Run forward to get outputs (no_grad not needed on meta device)
+        # Run forward to get outputs (no_grad not needed on meta device).
+        # This is a framework shape-inference forward (the fake-PG analogue of
+        # DYNAMIC mode's `_compute_outputs`), not a training microbatch — gate
+        # it with `_in_metadata_inference` so dispatch_capture skips recording
+        # its ops into the per-(stage, comp_type) L0 templates. (`global`
+        # declared once near the top of this function.)
+        prev_inf = _in_metadata_inference
+        _in_metadata_inference = True
         try:
             outputs = self.submod(*input_tensors, **(kwargs or {}))
         except Exception:
             # If forward fails, use empty outputs
             outputs = input_tensors
+        finally:
+            _in_metadata_inference = prev_inf
 
         if not isinstance(outputs, tuple):
             outputs = (outputs,) if outputs is not None else ()
@@ -1159,9 +1223,17 @@ def _patch_pipeline_stage_meta_exchange_for_fake_pg() -> None:
             return orig_prepare_backward(self, num_microbatches, loss_fn=loss_fn, target=target, received_grad_meta=received_grad_meta)
 
         # For multi_proc_meta (gloo, not fake), DYNAMIC mode handles
-        # backward metadata via _send_meta/_recv_meta. Skip this patch.
+        # backward metadata via _send_meta/_recv_meta. Bracket with the
+        # metadata-inference flag so the backward metadata inference (and any
+        # FSDP setup it triggers) is not recorded as training compute.
+        global _in_metadata_inference
         if not _is_fake(self.group):
-            return orig_prepare_backward(self, num_microbatches, loss_fn=loss_fn, target=target, received_grad_meta=received_grad_meta)
+            prev = _in_metadata_inference
+            _in_metadata_inference = True
+            try:
+                return orig_prepare_backward(self, num_microbatches, loss_fn=loss_fn, target=target, received_grad_meta=received_grad_meta)
+            finally:
+                _in_metadata_inference = prev
 
         if self._user_meta.input_grads is not None or self._user_meta.output_grads is not None:
             return orig_prepare_backward(self, num_microbatches, loss_fn=loss_fn, target=target, received_grad_meta=received_grad_meta)
@@ -1213,15 +1285,33 @@ def _patch_torch_equal_for_meta() -> None:
 
 
 def _patch_pipeline_stage_for_pp_context() -> None:
-    """Patch PipelineStage.forward_one_chunk / backward_one_chunk to
-    update the global ``_pp_context`` dict with the current microbatch
-    index, phase (forward/backward), and stage index.  This lets
-    comm_events.py's P2P interceptors attribute isend/irecv calls to
-    the correct microbatch and phase without inspecting the call stack.
+    """Patch PipelineStage.forward_one_chunk / backward_one_chunk /
+    backward_weight_one_chunk to update the global ``_pp_context`` dict
+    with the current microbatch index, phase, stage index, and *fine-grained
+    compute-graph class* (``comp_type``), and to gate L0 capture on a
+    per-(stage, comp_type) class key instead of ``mb_idx == 0``.
 
-    All PP schedule types (1F1B, GPipe, DualPipe, etc.) go through
-    these two methods, so one patch covers every schedule variant."""
-    global _original_fwd_one_chunk, _original_bwd_one_chunk
+    ``comp_type`` maps directly to
+    ``torch.distributed.pipelining.schedules._ComputationType``:
+      * forward_one_chunk                              -> "F"
+      * backward_one_chunk(full_backward=True)        -> "B" (I+W in one pass)
+      * backward_one_chunk(full_backward=False)       -> "I" (input-grad only)
+      * backward_weight_one_chunk                      -> "W" (weight-grad only)
+
+    The L0 capture gate is ``cap.begin_chunk((stage, comp_type))``:
+    the FIRST occurrence of each (stage, comp_type) class is captured in
+    full, every subsequent occurrence (same class, later microbatch) is a
+    pass-through that only records an L2 timeline event and bumps the
+    class's instance count.  This makes every distinct compute graph
+    appear exactly once in the L0 IR while keeping capture cost
+    proportional to the number of distinct classes (not num_microbatches).
+
+    All PP schedule types (1F1B, GPipe, DualPipe, ZBV, Interleaved, etc.)
+    go through these methods, so one set of patches covers every schedule
+    variant.  Runtime zero-bubble schedules additionally dispatch
+    UNSHARD/RESHARD actions, whose FSDP state is tracked by the unshard/
+    reshard patches in ``_patch_comm_layer_context``."""
+    global _original_fwd_one_chunk, _original_bwd_one_chunk, _original_bwd_weight_one_chunk
     try:
         from torch.distributed.pipelining.stage import PipelineStage
     except Exception:
@@ -1231,17 +1321,26 @@ def _patch_pipeline_stage_for_pp_context() -> None:
         return
     _original_fwd_one_chunk = PipelineStage.forward_one_chunk
     _original_bwd_one_chunk = PipelineStage.backward_one_chunk
+    _original_bwd_weight_one_chunk = getattr(PipelineStage, "backward_weight_one_chunk", None)
+
+    def _stamp_chunk_context(self, mb_idx: int, comp_type: str, phase: str) -> None:  # noqa: ANN001
+        _pp_context["mb_idx"] = mb_idx
+        _pp_context["phase"] = phase
+        _pp_context["stage"] = self.stage_index
+        _pp_context["comp_type"] = comp_type
+        _pp_context["fsdp_state"] = _fsdp_state.get(self.stage_index, "NA")
 
     def _patched_fwd_one_chunk(self, mb_idx, *args, **kwargs):  # noqa: ANN001
-        _pp_context["mb_idx"] = mb_idx
-        _pp_context["phase"] = "forward"
-        _pp_context["stage"] = self.stage_index
-        # Control L0 capture: only MB 0 gets full L0, MB 1+ is pass-through
+        _stamp_chunk_context(self, mb_idx, "F", "forward")
         from torchtitan_npu.simulator.capture.dispatch_capture import get_active_capture
         cap = get_active_capture()
         if cap is not None:
-            cap._capture_l0 = (mb_idx == 0)
-        result = _original_fwd_one_chunk(self, mb_idx, *args, **kwargs)
+            cap.begin_chunk((self.stage_index, "F"))
+        try:
+            result = _original_fwd_one_chunk(self, mb_idx, *args, **kwargs)
+        finally:
+            if cap is not None:
+                cap.end_chunk()
         # Record L2 timeline event (always, regardless of L0 capture)
         from torchtitan_npu.simulator.capture.comm_events import get_active_recorder
         recorder = get_active_recorder()
@@ -1251,20 +1350,28 @@ def _patch_pipeline_stage_for_pp_context() -> None:
                 pp_stage=self.stage_index,
                 pp_mb_idx=mb_idx,
                 phase="forward",
+                comp_type="F",
             )
         return result
 
     def _patched_bwd_one_chunk(self, mb_idx, *args, **kwargs):  # noqa: ANN001
-        _pp_context["mb_idx"] = mb_idx
-        _pp_context["phase"] = "backward"
-        _pp_context["stage"] = self.stage_index
-        # Control L0 capture: only MB 0 gets full L0, MB 1+ is pass-through
+        # backward_one_chunk carries a `full_backward` kwarg/arg: True -> "B"
+        # (I+W in one autograd.backward pass), False -> "I" (input-grad only,
+        # a subsequent backward_weight_one_chunk call will compute "W").
+        full_backward = kwargs.get("full_backward", True)
+        if not full_backward and len(args) > 0 and isinstance(args[-1], bool):
+            full_backward = args[-1]
+        comp_type = "B" if full_backward else "I"
+        _stamp_chunk_context(self, mb_idx, comp_type, "backward")
         from torchtitan_npu.simulator.capture.dispatch_capture import get_active_capture
         cap = get_active_capture()
         if cap is not None:
-            cap._capture_l0 = (mb_idx == 0)
-        result = _original_bwd_one_chunk(self, mb_idx, *args, **kwargs)
-        # Record L2 timeline event
+            cap.begin_chunk((self.stage_index, comp_type))
+        try:
+            result = _original_bwd_one_chunk(self, mb_idx, *args, **kwargs)
+        finally:
+            if cap is not None:
+                cap.end_chunk()
         from torchtitan_npu.simulator.capture.comm_events import get_active_recorder
         recorder = get_active_recorder()
         if recorder is not None:
@@ -1273,11 +1380,131 @@ def _patch_pipeline_stage_for_pp_context() -> None:
                 pp_stage=self.stage_index,
                 pp_mb_idx=mb_idx,
                 phase="backward",
+                comp_type=comp_type,
+            )
+        return result
+
+    def _patched_bwd_weight_one_chunk(self, bwd_chunk_id, *args, **kwargs):  # noqa: ANN001
+        # backward_weight_one_chunk runs the deferred weight-grad pass that
+        # pairs with a prior backward_one_chunk(full_backward=False) ("I").
+        # Use the chunk_id as the microbatch index for context attribution.
+        mb_idx = bwd_chunk_id if isinstance(bwd_chunk_id, int) else _pp_context.get("mb_idx", 0)
+        _stamp_chunk_context(self, mb_idx, "W", "backward")
+        from torchtitan_npu.simulator.capture.dispatch_capture import get_active_capture
+        cap = get_active_capture()
+        if cap is not None:
+            cap.begin_chunk((self.stage_index, "W"))
+        try:
+            result = _original_bwd_weight_one_chunk(self, bwd_chunk_id, *args, **kwargs)
+        finally:
+            if cap is not None:
+                cap.end_chunk()
+        from torchtitan_npu.simulator.capture.comm_events import get_active_recorder
+        recorder = get_active_recorder()
+        if recorder is not None:
+            recorder.record_timeline_event(
+                action="backward_weight_one_chunk",
+                pp_stage=self.stage_index,
+                pp_mb_idx=mb_idx,
+                phase="backward",
+                comp_type="W",
             )
         return result
 
     PipelineStage.forward_one_chunk = _patched_fwd_one_chunk
     PipelineStage.backward_one_chunk = _patched_bwd_one_chunk
+    if _original_bwd_weight_one_chunk is not None:
+        PipelineStage.backward_weight_one_chunk = _patched_bwd_weight_one_chunk
+
+
+def _patch_metadata_inference_skip() -> None:
+    """Wrap ``_PipelineStageBase._compute_outputs`` so the DYNAMIC-mode
+    metadata-inference forward (run once per stage before the real compute
+    chunks to infer cross-rank P2P shapes) sets ``_in_metadata_inference``
+    during its execution. ``dispatch_capture._record_event`` skips recording
+    while this flag is set, so the inference forward — a framework
+    shape-inference artifact that runs with the default ``_pp_context["stage"]=0``
+    (no chunk has stamped the real stage yet) — does not pollute the
+    per-(stage, comp_type) L0 templates with a spurious ``s0_F`` graph. The
+    real ``forward_one_chunk`` calls define each ``s{stage}_F`` template with
+    correct stage attribution."""
+    try:
+        from torch.distributed.pipelining.stage import PipelineStage
+    except Exception:
+        return
+    if hasattr(PipelineStage, "_sim_orig_compute_outputs"):
+        return
+    PipelineStage._sim_orig_compute_outputs = PipelineStage._compute_outputs
+
+    def _patched_compute_outputs(self, *args, module, **kwargs):  # noqa: ANN001
+        global _in_metadata_inference
+        prev = _in_metadata_inference
+        _in_metadata_inference = True
+        try:
+            return PipelineStage._sim_orig_compute_outputs(self, *args, module=module, **kwargs)
+        finally:
+            _in_metadata_inference = prev
+
+    PipelineStage._compute_outputs = _patched_compute_outputs
+
+
+def _patch_pipeline_action_context() -> None:
+    """Patch ``schedules._get_profiler_function_name`` (called by
+    ``_PipelineScheduleRuntime._step_microbatches`` as
+    ``with record_function(_get_profiler_function_name(action))`` for EVERY
+    action in the lowered plan, including non-compute ones) to stamp the
+    correct ``_pp_context["stage"]`` / ``comp_type`` per action.
+
+    Problem: only ``forward_one_chunk`` / ``backward_one_chunk`` /
+    ``backward_weight_one_chunk`` (my patches) set ``_pp_context["stage"]``.
+    The non-compute plan actions — ``UNSHARD`` / ``RESHARD`` / ``SEND_F`` /
+    ``RECV_F`` / ``SEND_B`` / ``RECV_B`` / ``REDUCE_GRAD`` — run inside
+    ``_perform_action`` WITHOUT going through those chunk methods, so any L0
+    op they emit (e.g. the FSDP all-gather from ``unshard()``) is stamped
+    with the STALE ``stage`` (the last chunk's, or the default -1 before the
+    first chunk) and lands in the wrong template (the ``s-1_F`` "unattributed"
+    bucket). This patch stamps the real ``action.stage_index`` (and a
+    comm-specific ``comp_type``) right before each action's body runs, so
+    those comm ops bucket into ``s{stage}_UNSHARD`` / ``s{stage}_RESHARD``
+    etc. Compute actions (F/B/I/W/OVERLAP_F_B) are still overridden by the
+    chunk patches that run inside the body, so their attribution is
+    unaffected. Single-stage schedules (1F1B/GPipe) don't call this helper
+    (they use ``record_function(f"Forward {i}")``) and are unaffected — their
+    UNSHARD runs inside ``forward_one_chunk`` where the stage is already set.
+
+    This is the capture-side half of fixing the UNSHARD/RESHARD <-> L0
+    linkage gap; the build-side half (``build_schedule_plan`` linking the
+    action to its L0 comm op via ``comm_op_id``) lives in schedule_builder.
+    """
+    try:
+        from torch.distributed.pipelining import schedules as sch
+    except Exception:
+        return
+    if hasattr(sch, "_sim_orig_profiler_name"):
+        return
+    sch._sim_orig_profiler_name = sch._get_profiler_function_name
+
+    def _patched_profiler_name(action):  # noqa: ANN001
+        try:
+            _pp_context["stage"] = int(getattr(action, "stage_index", -1))
+            ct = getattr(getattr(action, "computation_type", None), "value", "")
+            # Comm actions get a dedicated comp_type so their L0 ops bucket
+            # into s{stage}_{UNSHARD|RESHARD|REDUCE_GRAD}; SEND/RECV inherit
+            # the forward/backward comp_type of the phase they belong to.
+            if ct in ("UNSHARD", "RESHARD", "REDUCE_GRAD"):
+                _pp_context["comp_type"] = ct
+            elif ct in ("SEND_F", "RECV_F"):
+                _pp_context["comp_type"] = "F"
+            elif ct in ("SEND_B", "RECV_B"):
+                _pp_context["comp_type"] = "B"
+            # compute actions (F/B/I/W/OVERLAP_F_B): leave comp_type to the
+            # chunk patch which runs inside the action body (it sets the
+            # correct F/B/I/W and the same stage).
+        except Exception:
+            pass
+        return sch._sim_orig_profiler_name(action)
+
+    sch._get_profiler_function_name = _patched_profiler_name
 
 
 def _patch_get_stage_indices_for_fake_pg() -> None:
@@ -1745,6 +1972,7 @@ def _patch_comm_layer_context() -> None:
             _cp_mod._sim_orig_allgather_seq = _orig_allgather_seq
 
             def _patched_allgather_seq(tensor, mesh, seq_dim=1):  # noqa: ANN001
+                global _comm_layer
                 _comm_layer = "L1"
                 return _orig_allgather_seq(tensor, mesh, seq_dim)
 
@@ -1752,7 +1980,7 @@ def _patch_comm_layer_context() -> None:
     except Exception:
         pass
 
-    # Patch FSDPParamGroup.unshard/reshard → L2
+    # Patch FSDPParamGroup.unshard/reshard → L2 + sync _fsdp_state
     try:
         from torchtitan_npu.simulator.capture.fsdp_residency import install_fsdp_residency_hooks
 
@@ -1768,6 +1996,7 @@ def _patch_comm_layer_context() -> None:
             _PipelineSchedule._sim_orig_step_microbatches = _PipelineSchedule._step_microbatches
 
             def _patched_step_microbatches(self, *args, **kwargs):  # noqa: ANN001
+                global _comm_layer
                 _comm_layer = "L2"
                 return _PipelineSchedule._sim_orig_step_microbatches(self, *args, **kwargs)
 
@@ -2055,6 +2284,8 @@ def patch_device_type_to_meta() -> None:
     _patch_object_collectives_for_fake_pg()
     _patch_pipeline_stage_meta_exchange_for_fake_pg()
     _patch_pipeline_stage_for_pp_context()
+    _patch_metadata_inference_skip()
+    _patch_pipeline_action_context()
     _patch_torch_equal_for_meta()
     _patch_init_distributed_for_multi_proc_meta()
     _patch_fsdp_get_device_from_mesh()

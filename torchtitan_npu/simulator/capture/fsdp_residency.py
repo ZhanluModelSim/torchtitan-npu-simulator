@@ -81,6 +81,13 @@ def _record_residency(param_group: Any, action: str, metadata: tuple[int, tuple[
     )
 
 
+def _set_stage_fsdp_state(meta_env: Any, state: str) -> None:
+    """Synchronize the PP capture context with an FSDP state transition."""
+    stage = meta_env._pp_context.get("stage", -1)
+    if isinstance(stage, int):
+        meta_env._fsdp_state[stage] = state
+
+
 def install_fsdp_residency_hooks() -> None:
     from torch.distributed.fsdp._fully_shard._fsdp_param_group import FSDPParamGroup
     import torchtitan_npu.simulator.meta_env as meta_env
@@ -105,6 +112,8 @@ def install_fsdp_residency_hooks() -> None:
         track_memory = _memory_tracking_enabled()
         _, sharded_tensors = _residency_metadata(self) if track_memory else (0, ())
         result = FSDPParamGroup._sim_orig_wait_for_unshard(self)
+        if not was_unsharded and self.is_unsharded:
+            _set_stage_fsdp_state(meta_env, "UNSHARDED")
         if track_memory and not was_unsharded and self.is_unsharded:
             num_bytes, full_tensors = _residency_metadata(self)
             tensors = tuple({id(tensor): tensor for tensor in (*sharded_tensors, *full_tensors)}.values())
@@ -123,6 +132,7 @@ def install_fsdp_residency_hooks() -> None:
         finally:
             meta_env._comm_layer = previous_comm_layer
         if was_unsharded and not self.is_unsharded:
+            _set_stage_fsdp_state(meta_env, "SHARDED")
             _record_residency(self, "free", metadata)
         return result
 
