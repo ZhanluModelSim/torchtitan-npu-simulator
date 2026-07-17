@@ -1817,18 +1817,11 @@ def _patch_device_mesh_world_size_check() -> None:
         # (the mesh was created with fake backend to simulate a larger
         # world than the actual gloo world_size)
         if self._device_type == "fake":
-            # Create a FakeProcessGroup with the full mesh size as the
-            # "default group" for this mesh.  This allows new_group() to
-            # create subgroups up to mesh_size without hitting the
-            # group_world_size > global_world_size check.
-            mesh_size = self._layout.numel()
-            gloo_rank = get_world_size()  # just to ensure dist is initialized
-            import torch.distributed as dist
-            global_rank = dist.get_rank() if dist.is_initialized() else 0
-            from torch._C._distributed_c10d import FakeProcessGroup
-            opts = FakeProcessGroup.Options()
-            fake_pg = FakeProcessGroup._create_internal(global_rank, mesh_size, opts)
-            return fake_pg
+            # DeviceMesh ignores this method's return value. Creating a raw
+            # FakeProcessGroup here therefore produced an orphan group that
+            # was never registered with c10d. The dimension process groups
+            # are created immediately afterwards by _init_process_groups().
+            return _get_default_group()
 
         # For non-fake backend, use the original logic
         world_size = get_world_size()
@@ -1882,7 +1875,17 @@ def _patch_parallel_dims_for_multi_proc(full_ws: int, gloo_ws: int) -> None:
         # Mesh is bigger than gloo world_size: use fake backend.
         # Also patch DeviceMesh to skip the mesh > world_size check.
         _patch_device_mesh_world_size_check()
-        return orig_init_mesh("fake", mesh_shape, mesh_dim_names=mesh_dim_names, **kwargs)
+        backend_override = dict(kwargs.pop("backend_override", None) or {})
+        for index in range(len(mesh_shape)):
+            dim_key = mesh_dim_names[index] if mesh_dim_names else index
+            backend_override[dim_key] = "fake"
+        return orig_init_mesh(
+            "fake",
+            mesh_shape,
+            mesh_dim_names=mesh_dim_names,
+            backend_override=backend_override,
+            **kwargs,
+        )
 
     dm_mod.init_device_mesh = _patched_init_device_mesh
 
@@ -1892,6 +1895,61 @@ def _patch_parallel_dims_for_multi_proc(full_ws: int, gloo_ws: int) -> None:
         pd_mod.init_device_mesh = _patched_init_device_mesh
     except Exception:
         pass
+
+    # The real gloo group is the PP control plane. DeviceMesh otherwise
+    # reuses the default group for *any* dimension whose degree happens to
+    # equal gloo world_size (for example CP=4 when PP=4). Force every logical
+    # dimension except PP onto the fake backend, regardless of its degree.
+    DeviceMesh = dm_mod.DeviceMesh
+    if not hasattr(DeviceMesh, "_sim_orig_unflatten"):
+        DeviceMesh._sim_orig_unflatten = DeviceMesh._unflatten
+
+        def _patched_unflatten(
+            self, dim, mesh_sizes, mesh_dim_names, backend_override=None  # noqa: ANN001
+        ):
+            if not _is_meta_simulation:
+                return DeviceMesh._sim_orig_unflatten(
+                    self,
+                    dim,
+                    mesh_sizes,
+                    mesh_dim_names,
+                    backend_override=backend_override,
+                )
+            overrides = dict(backend_override or {})
+            for dim_name in mesh_dim_names:
+                if dim_name != "pp":
+                    overrides[dim_name] = "fake"
+            return DeviceMesh._sim_orig_unflatten(
+                self,
+                dim,
+                mesh_sizes,
+                mesh_dim_names,
+                backend_override=overrides,
+            )
+
+        DeviceMesh._unflatten = _patched_unflatten
+
+    if not hasattr(DeviceMesh, "_sim_orig_flatten"):
+        DeviceMesh._sim_orig_flatten = DeviceMesh._flatten
+
+        def _patched_flatten(self, mesh_dim_name=None, backend_override=None):  # noqa: ANN001
+            if not _is_meta_simulation:
+                return DeviceMesh._sim_orig_flatten(
+                    self,
+                    mesh_dim_name=mesh_dim_name,
+                    backend_override=backend_override,
+                )
+            # ParallelDims flattens batch+CP into the loss mesh. It is a
+            # logical data-parallel domain, never the real PP control group.
+            if backend_override is None and mesh_dim_name != "pp":
+                backend_override = "fake"
+            return DeviceMesh._sim_orig_flatten(
+                self,
+                mesh_dim_name=mesh_dim_name,
+                backend_override=backend_override,
+            )
+
+        DeviceMesh._flatten = _patched_flatten
 
 
 def _patch_new_group_for_fake_backend() -> None:
@@ -1920,21 +1978,29 @@ def _patch_new_group_for_fake_backend() -> None:
         pg_tag=None, use_local_synchronization=False, group_desc=None,
         device_id=None, sort_ranks=True,
     ):
-        # In meta simulation mode, when group_world_size > gloo world_size
-        # or any rank >= gloo world_size, create a FakeProcessGroup directly
-        # (bypassing the size/range checks).  This happens for subgroups of
-        # a fake world_mesh whose rank IDs exceed the gloo process count.
+        # Logical meshes explicitly request backend="fake". When such a
+        # group's size/ranks exceed the real gloo world, create it directly
+        # and bypass only the real-world size/range checks.
         if _is_meta_simulation and dc.is_initialized():
             gloo_ws = dc.get_world_size()
             group_ws = len(ranks) if ranks is not None else gloo_ws
-            needs_fake = group_ws > gloo_ws
-            if not needs_fake and ranks:
-                needs_fake = any(r >= gloo_ws for r in ranks)
+            requested_fake = backend is not None and dc.Backend(backend) == dc.Backend.FAKE
+            exceeds_gloo_world = group_ws > gloo_ws
+            if not exceeds_gloo_world and ranks:
+                exceeds_gloo_world = any(r >= gloo_ws for r in ranks)
+            needs_fake = requested_fake and exceeds_gloo_world
             if needs_fake:
                 # Bypass _new_group_with_tag's size check by calling
                 # _new_process_group_helper directly with backend="fake".
                 if sort_ranks and ranks is not None:
                     ranks = sorted(ranks)
+                if ranks is not None:
+                    if len(set(ranks)) != len(ranks):
+                        raise ValueError(
+                            f"ranks list must not contain duplicate entries, got {ranks}"
+                        )
+                    if any(rank < 0 for rank in ranks):
+                        raise ValueError(f"ranks must be non-negative, got {ranks}")
                 global_rank = dc.get_rank()
                 group_rank = ranks.index(global_rank) if ranks and global_rank in ranks else -1
 
@@ -1946,9 +2012,8 @@ def _patch_new_group_for_fake_backend() -> None:
 
                 from torch.distributed.distributed_c10d import (
                     _new_process_group_helper, _process_group_name, _world,
-                    Backend, PrefixStore, _get_default_timeout,
+                    Backend, _get_default_timeout,
                 )
-                from datetime import timedelta
                 group_name = _process_group_name(
                     ranks or [], use_hashed_name=use_local_synchronization,
                 )
@@ -1974,6 +2039,15 @@ def _patch_new_group_for_fake_backend() -> None:
 
                 if group_rank == -1:
                     return dc.GroupMember.NON_GROUP_MEMBER
+
+                # _new_process_group_helper registers the PG name/backend/tag,
+                # but the public _new_group_with_tag wrapper normally owns
+                # this rank map. We bypassed that wrapper to allow logical
+                # ranks beyond the real gloo world, so restore its invariant.
+                _world.pg_group_ranks[pg] = {
+                    global_rank: local_rank
+                    for local_rank, global_rank in enumerate(ranks or [])
+                }
                 return pg
 
         return orig(
@@ -1983,19 +2057,28 @@ def _patch_new_group_for_fake_backend() -> None:
 
     dc._new_group_with_tag = _patched_new_group_with_tag
     # Also patch the public new_group — it has a different signature than
-    # _new_group_with_tag (e.g. pg_options), so use **kwargs to forward.
-    def _patched_new_group(*args, **kwargs):  # noqa: ANN001
-        # Map new_group's kwargs to _new_group_with_tag's kwargs
+    # _new_group_with_tag (e.g. pg_options). Keep its positional/keyword
+    # calling convention intact because DeviceMesh is not its only caller.
+    def _patched_new_group(
+        ranks=None,
+        timeout=None,
+        backend=None,
+        pg_options=None,
+        use_local_synchronization=False,
+        group_desc=None,
+        device_id=None,
+        sort_ranks=True,
+    ):
         return _patched_new_group_with_tag(
-            ranks=kwargs.get("ranks"),
-            timeout=kwargs.get("timeout"),
-            backend=kwargs.get("backend"),
-            backend_options=kwargs.get("pg_options"),  # new_group uses pg_options
+            ranks=ranks,
+            timeout=timeout,
+            backend=backend,
+            backend_options=pg_options,
             pg_tag=None,
-            use_local_synchronization=kwargs.get("use_local_synchronization", False),
-            group_desc=kwargs.get("group_desc"),
-            device_id=kwargs.get("device_id"),
-            sort_ranks=kwargs.get("sort_ranks", True),
+            use_local_synchronization=use_local_synchronization,
+            group_desc=group_desc,
+            device_id=device_id,
+            sort_ranks=sort_ranks,
         )
     dc.new_group = _patched_new_group
 

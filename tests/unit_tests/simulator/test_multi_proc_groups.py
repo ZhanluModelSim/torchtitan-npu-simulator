@@ -1,0 +1,77 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+import os
+
+import pytest
+import torch.distributed as dist
+
+from torchtitan_npu.simulator.meta_env import (
+    _patch_new_group_for_fake_backend,
+    _patch_parallel_dims_for_multi_proc,
+    patch_device_type_to_meta,
+    unpatch_device_type_to_meta,
+)
+
+
+@pytest.fixture
+def single_gloo_rank():
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    os.environ["MASTER_PORT"] = "29917"
+    patch_device_type_to_meta()
+    dist.init_process_group("gloo", rank=0, world_size=1)
+    _patch_new_group_for_fake_backend()
+    _patch_parallel_dims_for_multi_proc(full_ws=4, gloo_ws=1)
+    try:
+        yield
+    finally:
+        dist.destroy_process_group()
+        unpatch_device_type_to_meta()
+
+
+def test_oversized_fake_group_registers_logical_rank_map(single_gloo_rank):
+    import torch.distributed.device_mesh as device_mesh
+    from torch.distributed import distributed_c10d as c10d
+
+    world_mesh = device_mesh.init_device_mesh(
+        "meta", (4,), mesh_dim_names=("world",)
+    )
+    group = world_mesh.get_group()
+
+    assert dist.get_backend(group) == "fake"
+    assert group in c10d._world.pg_map
+    assert c10d._world.pg_group_ranks[group] == {0: 0, 1: 1, 2: 2, 3: 3}
+    assert dist.get_group_rank(group, 0) == 0
+    assert dist.get_global_rank(group, 3) == 3
+
+
+def test_only_pp_dimension_reuses_real_gloo_group(single_gloo_rank):
+    import torch.distributed.device_mesh as device_mesh
+
+    world_mesh = device_mesh.init_device_mesh(
+        "meta", (4,), mesh_dim_names=("world",)
+    )
+    logical_mesh = world_mesh._unflatten(
+        0,
+        (1, 4),
+        ("pp", "cp"),
+    )
+
+    assert dist.get_backend(logical_mesh["pp"].get_group()) == "gloo"
+    assert dist.get_backend(logical_mesh["cp"].get_group()) == "fake"
+
+
+def test_patched_new_group_preserves_positional_arguments(single_gloo_rank):
+    group = dist.new_group(
+        [0], None, "fake", None, False, "positional-arguments", None, False
+    )
+
+    assert dist.get_backend(group) == "fake"
+    assert group.size() == 1
+
+
+def test_out_of_range_real_group_is_not_silently_converted(single_gloo_rank):
+    with pytest.raises(ValueError, match="world size|out of range"):
+        dist.new_group(ranks=[0, 1], backend="gloo")

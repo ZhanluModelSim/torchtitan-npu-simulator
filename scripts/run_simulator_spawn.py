@@ -11,7 +11,7 @@ This script:
 2. Spawns PP degree processes using mp.Process with spawn method
 3. Each process sets RANK/WORLD_SIZE/LOCAL_RANK env vars
 4. Each process calls torchtitan_npu.entry.main() (same as torchrun)
-5. WorkloadGraph objects are returned to the main process via mp.Queue
+5. Each process writes its rank-local graph and returns a completion record
 
 Equivalent to:
     NGPU=64 torchrun --nproc_per_node=4 -m torchtitan_npu.entry \
@@ -23,7 +23,152 @@ Equivalent to:
 
 import argparse
 import os
+import queue
 import sys
+import time
+
+
+_WORKER_TIMEOUT_SECONDS = 600
+
+
+def _worker_failures(processes: list[object]) -> list[tuple[int, int]]:
+    """Return ``(rank, exitcode)`` for workers that exited unsuccessfully."""
+    return [
+        (rank, process.exitcode)
+        for rank, process in enumerate(processes)
+        if process.exitcode not in (None, 0)
+    ]
+
+
+def _format_worker_failures(failures: list[tuple[int, int]]) -> str:
+    return ", ".join(f"rank {rank} (exitcode {exitcode})" for rank, exitcode in failures)
+
+
+def _collect_worker_results(
+    result_queue: object,
+    processes: list[object],
+    expected_count: int,
+    timeout: float = _WORKER_TIMEOUT_SECONDS,
+) -> list[dict[str, object]]:
+    """Collect lightweight completion records while monitoring worker health."""
+    deadline = time.monotonic() + timeout
+    results: list[dict[str, object]] = []
+
+    while len(results) < expected_count:
+        failures = _worker_failures(processes)
+        if failures:
+            raise RuntimeError(
+                "simulator worker failed: " + _format_worker_failures(failures)
+            )
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(
+                f"timed out after {timeout:g}s waiting for simulator workers "
+                f"({len(results)}/{expected_count} results received)"
+            )
+
+        try:
+            result = result_queue.get(timeout=min(0.5, remaining))
+        except queue.Empty:
+            if all(process.exitcode is not None for process in processes):
+                break
+            continue
+
+        if not isinstance(result, dict):
+            raise RuntimeError(
+                f"simulator worker returned an invalid result: {result!r}"
+            )
+        results.append(result)
+
+    return results
+
+
+def _validate_worker_results(
+    results: list[dict[str, object]],
+    processes: list[object],
+    expected_count: int,
+) -> list[dict[str, object]]:
+    """Verify that every PP rank completed capture and export exactly once."""
+    failures = _worker_failures(processes)
+    if failures:
+        raise RuntimeError(
+            "simulator worker failed: " + _format_worker_failures(failures)
+        )
+
+    ranks = [result.get("rank") for result in results]
+    invalid_ranks = [rank for rank in ranks if not isinstance(rank, int)]
+    if invalid_ranks:
+        raise RuntimeError(f"worker results contain invalid ranks: {invalid_ranks}")
+
+    expected_ranks = set(range(expected_count))
+    actual_ranks = set(ranks)
+    duplicate_ranks = sorted(rank for rank in actual_ranks if ranks.count(rank) > 1)
+    missing_ranks = sorted(expected_ranks - actual_ranks)
+    unexpected_ranks = sorted(actual_ranks - expected_ranks)
+    if duplicate_ranks or missing_ranks or unexpected_ranks:
+        raise RuntimeError(
+            "incomplete simulator worker results: "
+            f"missing={missing_ranks}, duplicate={duplicate_ranks}, "
+            f"unexpected={unexpected_ranks}"
+        )
+
+    for result in results:
+        rank = result["rank"]
+        template_count = result.get("step_template_count")
+        if not isinstance(template_count, int) or template_count <= 0:
+            raise RuntimeError(
+                f"rank {rank} captured no step templates: {template_count!r}"
+            )
+
+        template_ids = result.get("step_template_ids")
+        if not isinstance(template_ids, list) or not all(
+            isinstance(template_id, str) for template_id in template_ids
+        ):
+            raise RuntimeError(
+                f"rank {rank} returned invalid step template IDs: {template_ids!r}"
+            )
+        required_templates = {f"s{rank}_F", f"s{rank}_B"}
+        missing_templates = sorted(required_templates - set(template_ids))
+        if missing_templates:
+            raise RuntimeError(
+                f"rank {rank} capture is incomplete; missing step templates "
+                f"{missing_templates}"
+            )
+
+        output_dir = result.get("output_dir")
+        if not isinstance(output_dir, str) or not os.path.isdir(output_dir):
+            raise RuntimeError(
+                f"rank {rank} output directory is missing: {output_dir!r}"
+            )
+
+    return sorted(results, key=lambda result: result["rank"])
+
+
+def _terminate_workers(processes: list[object]) -> None:
+    for process in processes:
+        if process.is_alive():
+            process.terminate()
+    for process in processes:
+        process.join()
+
+
+def _join_workers(
+    processes: list[object], timeout: float = _WORKER_TIMEOUT_SECONDS
+) -> None:
+    """Join all workers within one shared deadline."""
+    deadline = time.monotonic() + timeout
+    for process in processes:
+        process.join(timeout=max(0.0, deadline - time.monotonic()))
+
+    alive_ranks = [
+        rank for rank, process in enumerate(processes) if process.is_alive()
+    ]
+    if alive_ranks:
+        raise TimeoutError(
+            f"timed out after {timeout:g}s waiting for worker ranks "
+            f"{alive_ranks} to exit"
+        )
 
 
 def _worker_fn(
@@ -37,7 +182,7 @@ def _worker_fn(
     """Worker function for each spawned process.
 
     Calls torchtitan_npu.entry.main() by setting sys.argv, same as torchrun.
-    After training, puts the WorkloadGraph onto result_queue if provided.
+    After training, puts a lightweight completion record onto result_queue.
     """
     # Set environment variables that torchrun would normally set
     os.environ["RANK"] = str(rank)
@@ -58,8 +203,10 @@ def _worker_fn(
     argv.extend(extra_args)
     sys.argv = argv
 
-    # Patch SimulationTrainer.train to capture workload_graph before
-    # trainer.close() destroys it. The graph is put onto result_queue.
+    # Patch SimulationTrainer.train to report capture/export completion before
+    # trainer.close() destroys the graph. Keep the queue payload lightweight:
+    # multiprocessing.Queue serializes in a background thread, so attempting
+    # to send WorkloadGraph directly cannot provide a reliable fallback.
     if result_queue is not None:
         import torchtitan_npu.simulator.trainer as trainer_mod
 
@@ -67,19 +214,19 @@ def _worker_fn(
 
         def _patched_train(self):
             _orig_train(self)
-            if self.workload_graph is not None:
-                try:
-                    result_queue.put({
-                        "rank": rank,
-                        "workload_graph": self.workload_graph,
-                    })
-                except Exception:
-                    # WorkloadGraph may not be picklable (contains unpicklable
-                    # objects like RankTable). Fall back to output_dir path.
-                    result_queue.put({
-                        "rank": rank,
-                        "output_dir": self.simulation_config.output_dir,
-                    })
+            if self.workload_graph is None:
+                raise RuntimeError(f"rank {rank} finished without a WorkloadGraph")
+
+            output_dir = os.path.abspath(
+                os.path.join(self.simulation_config.output_dir, f"rank_{rank}")
+            )
+            result_queue.put({
+                "rank": rank,
+                "workload_id": str(self.workload_graph.workload_id),
+                "step_template_count": len(self.workload_graph.step_templates),
+                "step_template_ids": sorted(self.workload_graph.step_templates),
+                "output_dir": output_dir,
+            })
 
         trainer_mod.SimulationTrainer.train = _patched_train
 
@@ -160,28 +307,23 @@ def main() -> None:
             p.start()
             procs.append(p)
 
-        # Collect results from the queue while processes run
-        results = []
-        for _ in range(nproc):
-            try:
-                result = result_queue.get(timeout=600)
-                results.append(result)
-                print(f"[spawn] Received result from rank {result.get('rank', '?')}")
-            except Exception:
-                print("[spawn] Warning: timeout waiting for result from a process")
+        completed = False
+        try:
+            results = _collect_worker_results(result_queue, procs, nproc)
+            _join_workers(procs)
+            completed = True
+        finally:
+            if not completed:
+                _terminate_workers(procs)
 
-        for p in procs:
-            p.join()
-        print(f"[spawn] All processes finished")
-
-        # Process collected results
-        for r in results:
-            if "workload_graph" in r:
-                wg = r["workload_graph"]
-                print(f"[spawn] rank {r['rank']}: WorkloadGraph {wg.workload_id}, "
-                      f"{len(wg.step_templates)} step templates")
-            elif "output_dir" in r:
-                print(f"[spawn] rank {r['rank']}: output at {r['output_dir']}")
+        results = _validate_worker_results(results, procs, nproc)
+        print(f"[spawn] All {nproc} processes finished successfully")
+        for result in results:
+            print(
+                f"[spawn] rank {result['rank']}: WorkloadGraph "
+                f"{result['workload_id']}, {result['step_template_count']} "
+                f"step templates, output at {result['output_dir']}"
+            )
 
     print("[spawn] Done")
 

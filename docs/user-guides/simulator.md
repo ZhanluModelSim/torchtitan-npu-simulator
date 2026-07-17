@@ -503,9 +503,14 @@ NGPU=64 torchrun --nproc_per_node=4 --master_port=29500 \
 
 > [!IMPORTANT]
 > - `--nproc_per_node` 必须等于 PP degree（如 PP=4 则 4 个进程）
+> - 外部 gloo 进程的 `RANK` 必须连续取 `0..PP-1`，且 `WORLD_SIZE=PP`。例如 PP=4 时使用
+>   `RANK=0,1,2,3`；`0,16,32,48` 这类值只是完整逻辑 mesh 中各 PP stage 的代表 rank，
+>   由 simulator 内部映射，不能作为 gloo 的进程 `RANK`
 > - `NGPU` 必须等于完整模拟 world_size（如 PP=4 × CP=4 × DP=4 = 64）
 > - 配置中 `context_parallel_degree` 等设为真实值（非 1），`data_parallel_shard_degree=-1` 自动计算
 > - `simulated_parallel_degrees` 字典中的 `world_size` 用于设置 `TORCHTITAN_SIM_WORLD_SIZE` 环境变量
+> - `run_simulator_spawn.py` 只会在全部 PP rank 成功退出、各自抓到本 stage 的前反向 template 并完成输出后报告成功；
+>   任一 rank 失败、缺失或重复都会使启动器返回失败
 
 ### 输出
 
