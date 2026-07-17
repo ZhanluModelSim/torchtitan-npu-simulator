@@ -51,6 +51,9 @@ from torchtitan.models.llama4.parallelize import apply_fsdp
 
 from torchtitan_npu.converters.kernels.rms_norm import NPURMSNorm
 from torchtitan_npu.converters.registry import has_npu_converter
+from torchtitan_npu.distributed.activation_checkpoint import (
+    extend_selective_ac_save_ops,
+)
 from torchtitan_npu.models.common.dsa_indexer_loss import DSAIndexerLossLoggingHelper
 from torchtitan_npu.models.deepseek_v4.model import Attention
 from torchtitan_npu.models.deepseek_v4.model import MoE as DeepSeekV4MoE
@@ -58,25 +61,7 @@ from torchtitan_npu.models.deepseek_v4.model import MoE as DeepSeekV4MoE
 logger = logging.getLogger(__name__)
 
 FSDP_MP_POLICY_ATTR = "_mp_policy"
-
-
-# for selective op activation checkpointing
-_op_sac_save_list = {
-    torch.ops.aten.mm.default,
-    torch.ops.aten._scaled_dot_product_efficient_attention.default,
-    torch.ops.aten._scaled_dot_product_flash_attention.default,
-    torch.ops.aten._scaled_dot_product_cudnn_attention.default,
-    torch.ops.aten._scaled_dot_product_attention_math.default,
-    torch.ops.aten._scaled_dot_product_fused_attention_overrideable.default,
-    torch.ops._c10d_functional.reduce_scatter_tensor.default,
-    torch.ops._c10d_functional.all_to_all_single.default,
-    # for low precision training, it's useful to always save
-    # the result of max, since the absolute maximum is
-    # used to compute the scaling factor for quantization.
-    torch.ops.aten.max.default,
-    torch._higher_order_ops.flex_attention,
-    torch._higher_order_ops.inductor_compiled_code,
-}
+_GROUPED_MM_ATTR = "_grouped_mm"
 
 
 class AwaitRowwiseParallel(RowwiseParallel):
@@ -347,8 +332,6 @@ def parallelize_deepseek_v4(
         # Import deepep module to register custom ops before accessing them
         import torchtitan.distributed.deepep  # noqa: F401 - registers torch.ops.deepep
 
-        _op_sac_save_list.add(torch.ops.deepep.dispatch.default)
-        _op_sac_save_list.add(torch.ops.deepep.combine.default)
     else:
         use_deepep = False
 
@@ -363,17 +346,34 @@ def parallelize_deepseek_v4(
         )
 
     model_compile_enabled = compile_config.enable and "model" in compile_config.components
+    npu_gmm_enabled = has_npu_converter(model_converters.converters, "npu_gmm")
+    save_grouped_mm_outputs = ac_config.mode == "selective" and model_compile_enabled and npu_gmm_enabled
 
     if ac_config.mode != "none":
-        apply_ac(
-            model,
-            ac_config,
-            model_compile_enabled=model_compile_enabled,
-            base_folder=dump_folder,
-        )
+        grouped_mm_op = getattr(torch.ops.aten, _GROUPED_MM_ATTR).default
+        save_ops = {grouped_mm_op} if save_grouped_mm_outputs else set()
+        with extend_selective_ac_save_ops(save_ops):
+            apply_ac(
+                model,
+                ac_config,
+                model_compile_enabled=model_compile_enabled,
+                base_folder=dump_folder,
+            )
+        if save_grouped_mm_outputs:
+            logger.info("Selective AC will save grouped MM outputs")
 
     if model_compile_enabled:
-        apply_compile(model, compile_config, parallel_dims.ep_enabled)
+        if npu_gmm_enabled:
+            from torchtitan_npu.converters.kernels.gmm import (
+                compile_expert_activation,
+            )
+
+            compile_expert_activation(
+                model,
+                backend=compile_config.backend,
+                dynamic_tokens=parallel_dims.ep_enabled,
+            )
+        apply_compile(model, compile_config)
 
     dp_mesh: DeviceMesh | None = None
     if parallel_dims.fsdp_enabled or parallel_dims.ep_enabled:
@@ -977,47 +977,7 @@ def _compile_children_except(
         )
 
 
-_NPU_GMM_COMPILED_ATTR = "_npu_gmm_compiled"
-_NPU_GMM_FN_ATTR = "_run_experts_grouped_mm"
-_TORCH_DYNAMO_ATTR = "_dynamo"
-
-
-def _patch_grouped_mm_compile(compile_config, ep_enabled: bool) -> None:
-    from torchtitan_npu.converters.kernels import gmm as gmm_module
-
-    grouped_mm = getattr(gmm_module, _NPU_GMM_FN_ATTR)
-    if getattr(grouped_mm, _NPU_GMM_COMPILED_ATTR, False):
-        return
-
-    compiled_fn = gmm_module.compile_grouped_mm(grouped_mm, backend=compile_config.backend)
-    maybe_mark_dynamic = getattr(torch, _TORCH_DYNAMO_ATTR).maybe_mark_dynamic
-
-    def _run_experts_grouped_mm_compiled(
-        w13: torch.Tensor | None,
-        w2: torch.Tensor,
-        _w3: torch.Tensor | None,
-        x: torch.Tensor,
-        num_tokens_per_expert: torch.Tensor,
-        swiglu_limit: float | None = None,
-        routed_scores: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        if ep_enabled:
-            maybe_mark_dynamic(x, 0)
-        return compiled_fn(
-            w13,
-            w2,
-            _w3,
-            x,
-            num_tokens_per_expert,
-            swiglu_limit,
-            routed_scores,
-        )
-
-    setattr(_run_experts_grouped_mm_compiled, _NPU_GMM_COMPILED_ATTR, True)
-    setattr(gmm_module, _NPU_GMM_FN_ATTR, _run_experts_grouped_mm_compiled)
-
-
-def apply_compile(model: nn.Module, compile_config, ep_enabled: bool):
+def apply_compile(model: nn.Module, compile_config):
     """
     Apply torch.compile to each TransformerBlock, which makes compilation efficient due to
     repeated structure. Alternatively one can compile the whole model (after applying DP).
@@ -1049,7 +1009,6 @@ def apply_compile(model: nn.Module, compile_config, ep_enabled: bool):
         # pyrefly: ignore [missing-attribute]
         model.layers.register_module(layer_id, transformer_block)
 
-    _patch_grouped_mm_compile(compile_config, ep_enabled)
     # NOTE: We don't compile for loop code path due to an issue with unbacked symints:
     # https://github.com/pytorch/pytorch/issues/166460
 
