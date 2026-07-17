@@ -4,42 +4,44 @@
 # LICENSE file in the root directory of this source tree.
 
 """
-Patch for torchtitan.tools.utils.has_cuda_capability
+Patch for torchtitan.components.quantization.mx.has_cuda_capability
 
 Target:
-- torchtitan.tools.utils.has_cuda_capability
+- torchtitan.components.quantization.mx.has_cuda_capability
 
 Reason:
-- Upstream's MXFP8Converter.__init__ (torchtitan/components/quantization/mx.py)
-  calls has_cuda_capability(10, 0) to guard MXFP8 behind Hopper+ (SM100) GPU
-  hardware.  On Ascend NPU there is no CUDA device, so the check always fails
-  even though torchao + torchtitan_npu provide NPU-native MXFP8 kernels.
+- MXFP8Converter.__init__ calls has_cuda_capability(10, 0) to guard
+  MXFP8 behind Blackwell+ (SM100). On Ascend NPU there is no CUDA device, so the
+  check always fails even though torchao + torchtitan_npu provide NPU-native
+  MXFP8 kernels.
 
-- This patch replaces has_cuda_capability with an NPU-aware version that
-  verifies the device is Ascend950 (the minimum NPU architecture supporting
-  MXFP8) and returns True accordingly, allowing MXFP8Converter to initialise.
-
-Idempotency:
-- Importing this module installs the wrapper exactly once thanks to Python's
-  module cache.
+- This patch replaces has_cuda_capability in the mx module only,
+  avoiding side effects on other callers (attention.py, float8.py, etc.).
 """
 
-from torchtitan.tools import utils as tt_utils
+from torchtitan.tools.logging import logger
 
-from torchtitan_npu.tools.device import get_npu_device_type
+try:
+    from torchtitan.components.quantization import mx as mx_module
 
+    from torchtitan_npu.tools.device import get_npu_device_type
 
-def has_mx_capability(major: int, minor: int) -> bool:
-    """Replace has_cuda_capability with an Ascend950 architecture check.
+    def has_mx_capability(major: int, minor: int) -> bool:
+        """Check NPU capability equivalent to CUDA SM capability for MXFP8.
 
-    MXFP8 on NPU requires Ascend950 (or equivalent).  Returns True when the
-    active device meets the requirement, otherwise raises RuntimeError with
-    a clear message.
-    """
-    device_name = get_npu_device_type()
-    if device_name == "A5":
-        return True
-    raise RuntimeError(f"MXFP8 is only supported on Ascend950 or higher architecture, but got device: {device_name}")
+        Ascend950 (A5) provides MXFP8 support equivalent to NVIDIA SM100 (Blackwell).
+        Returns True on A5 regardless of the requested SM version, so that upstream
+        MXFP8 checks pass even if torchtitan changes the (major, minor) parameters.
+        """
+        device_type = get_npu_device_type()
+        if device_type == "A5":
+            return True
+        logger.warning(
+            f"Patched cuda capability check does not acknowledge cuda {major},{minor} "
+            f"abilities on current NPU platform '{device_type}'."
+        )
+        return False
 
-
-tt_utils.has_cuda_capability = has_mx_capability
+    mx_module.has_cuda_capability = has_mx_capability
+except (ImportError, AttributeError):
+    logger.warning("Failed to patch torchtitan.components.quantization.mx.has_cuda_capability.")
