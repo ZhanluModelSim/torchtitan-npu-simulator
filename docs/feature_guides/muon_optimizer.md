@@ -191,7 +191,7 @@ optimizer = OptimizerConfig(
 
 ## 参考文献
 
-- [DeepSeek-V4 Technical Report](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/blob/main/DeepSeek_V4.pdf)
+- [DeepSeek-V4 Technical Report](https://arxiv.org/pdf/2606.19348)
 - [Muon is Scalable for LLM Training](https://arxiv.org/pdf/2502.16982)
 - [Muon 优化器指南：快速上手与关键细节](https://kexue.fm/archives/11416)
 - [Muon 优化器赏析：从向量到矩阵的本质跨越](https://www.spaces.ac.cn/archives/10592)

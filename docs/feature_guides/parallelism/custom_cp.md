@@ -14,8 +14,8 @@
 `torchtitan_npu` 在
 `torchtitan_npu/distributed/context_parallel/registry.py` 中维护一个 NPU 自有的
 CP 策略注册表，并提供入口函数 `apply_cp_to_attention_module`，在 CP 开启时自动为
-attention 模块匹配并应用合适的 CP 策略。目前已提供两个自定义 CP ，分别是
-SDPA Ulysses CP 和 DSA CP：
+attention 模块匹配并应用合适的 CP 策略。目前注册的自定义 CP 策略包括
+SDPA Ulysses CP、DSA CP、CompressorAttention CP 和 NPUVarlen Ulysses CP：
 
 ### SDPA Ulysses CP
 
@@ -40,12 +40,28 @@ CP 场景下的正确性。
 关于 DSA CP 的更多原理介绍，参考
 [技术文档](https://gitcode.com/cann/cann-recipes-train/blob/master/docs/llm_pretrain/deepseek-v32_pre_train_optimization.md#自定义CP策略)。
 
+### CompressorAttention CP
+
+定义在 `torchtitan_npu/distributed/context_parallel/compressor_attention_cp.py`，为
+DeepSeek-V4 Attention 的 compressor 路径提供 CP。该策略在 pre-hook 中通过
+P2P window exchange 拼接相邻 CP rank 的重叠窗口，并在 post-hook 中对压缩后的
+KV 与 `k_indexer` 做 CP 域 all-gather、因果切片和必要的 padding。
+
+### NPUVarlen Ulysses CP
+
+定义在 `torchtitan_npu/distributed/context_parallel/npu_varlen_cp.py`，为
+`NPUVarlenAttention` 提供 Ulysses 风格的 CP。该策略复用 Ulysses all-to-all，
+在 forward 前后交换 Q/K/V 和输出的序列、头维分布，并注册 mask handler 以保留
+`VarlenMetadata` 文档边界信息。
+
 ## 支持范围
 
 | 模型 | CP 实现 | 触发条件 | 说明 |
 | --- | --- | --- | --- |
-| DeepSeek-V3 | Ulysses CP | `context_parallel_degree > 1` | SDPA 路径使用 All-to-All 变换 |
+| DeepSeek-V3 / Qwen3 SDPA | Ulysses CP | `context_parallel_degree > 1` | SDPA 路径使用 All-to-All 变换 |
 | DeepSeek-V3.2 | DSA CP | `context_parallel_degree > 1` 且启用 `npu_dsa` converter | - |
+| DeepSeek-V4 | CompressorAttention CP | `context_parallel_degree > 1` 且启用 `npu_smla` converter | CompressorAttention 路径处理窗口重叠、压缩 KV 和 CP mask |
+| Qwen3 TND | NPUVarlen Ulysses CP | `context_parallel_degree > 1` 且配置使用 `NPUVarlenAttention` | TND 路径使用 All-to-All 变换并保留 `VarlenMetadata` |
 
 
 ## 配置选项
@@ -57,15 +73,16 @@ Custom CP 配置写在模型的 `config_registry.py` 中。对应字段
 |--------|------|--------|------|
 | `context_parallel_degree` | int | 1 | Context 并行度；大于 1 时启用 CP mesh |
 
-> **注意**：DeepSeek-V3.2 的 DSA CP 依赖 `npu_dsa` converter。
-> 若 `context_parallel_degree > 1` 但 converters 中没有 `npu_dsa`，
-> attention 模块无法命中任何已注册的 CP 策略 detector，并行化阶段会抛出
-> `NotImplementedError`，提示 `No custom CP strategy found for module ...`。
+> **注意**：DeepSeek-V3.2 的 DSA CP 依赖 `npu_dsa` converter，DeepSeek-V4 的
+> CompressorAttention CP 依赖 `npu_smla` converter。启用对应模型的 CP 时，
+> converters 中需要包含匹配的融合算子 converter。
 
 CP类型由框架根据模型及转换器配置**自动选择**，无需手动指定：
 
-- **DeepSeek-V3**：`context_parallel_degree > 1` 时自动使用 Ulysses CP。
+- **DeepSeek-V3 / Qwen3 SDPA**：`context_parallel_degree > 1` 时自动使用 Ulysses CP。
 - **DeepSeek-V3.2**：当 converters 中包含 `npu_dsa` 且 CP 开启时，自动使用 DSA CP。
+- **DeepSeek-V4**：当 converters 中包含 `npu_smla` 且 CP 开启时，自动使用 CompressorAttention CP。
+- **Qwen3 TND**：当模型配置使用 `NPUVarlenAttention` 且 CP 开启时，自动使用 NPUVarlen Ulysses CP。
 
 ### 配置示例一：SDPA Ulysses CP（DeepSeek-V3）
 
