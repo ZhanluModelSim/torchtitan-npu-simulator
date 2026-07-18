@@ -10,15 +10,12 @@ from torchtitan.components.quantization.mx import MXFP8Converter
 from torchtitan.protocols.model_converter import ModelConvertersContainer
 
 from torchtitan_npu.config.configs import (
-    ChatDataLoaderConfig,
     TrainerConfig,
     cpt_default_config,
     debug_single_node_eq_pruned_config,
-    sft_default_config,
     trainer_base_config,
 )
 from torchtitan_npu.converters import get_model_converter_config
-from torchtitan_npu.hf_datasets.chat_processors import dsv4_chat_encoder, process_gsm8k_sample, process_tau_sample
 
 from . import model_registry
 
@@ -113,31 +110,4 @@ def debug_deepseek_v4_pro_single_node() -> TrainerConfig:
         model_spec=model_registry("v4_pro_16layers_16experts"),
         model_converters=ModelConvertersContainer.Config(converters=_default_converters()),
         parallelism=replace(base.parallelism, expert_parallel_degree=16),
-    )
-
-
-def sft_deepseek_v4_flash_16k_128die_tau() -> TrainerConfig:
-    base = sft_default_config(deepseek_v4_flash_4k_128die())
-    return replace(
-        base,
-        dataloader=ChatDataLoaderConfig(
-            load_dataset_kwargs={"data_files": "train-00000-of-00001.parquet", "split": "train"},
-            sample_processor=process_tau_sample,
-            chat_encoder=dsv4_chat_encoder(),
-        ),
-        training=replace(base.training, seq_len=16384),
-        parallelism=replace(base.parallelism, context_parallel_degree=4),
-    )
-
-
-def sft_deepseek_v4_flash_1k_128die_gsm8k() -> TrainerConfig:
-    base = sft_default_config(deepseek_v4_flash_4k_128die())
-    return replace(
-        base,
-        dataloader=ChatDataLoaderConfig(
-            load_dataset_kwargs={"name": "main", "split": "train"},
-            sample_processor=process_gsm8k_sample,
-            chat_encoder=dsv4_chat_encoder(),
-        ),
-        training=replace(base.training, seq_len=1024),
     )

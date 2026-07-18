@@ -4,14 +4,8 @@
 # LICENSE file in the root directory of this source tree.
 
 import json
-
-from torchtitan_npu.patches.encoders.dsv4 import DSV4EncoderConfig
-
-_DSV4_ENCODER_PATH = "./assets/hf/DeepSeek-V4-Flash-Base/encoding/encoding_dsv4.py"
-
-
-def dsv4_chat_encoder() -> DSV4EncoderConfig:
-    return DSV4EncoderConfig(encoding_module_path=_DSV4_ENCODER_PATH)
+from collections.abc import Callable
+from importlib import import_module
 
 
 def process_tau_sample(sample):
@@ -35,3 +29,38 @@ def process_gsm8k_sample(sample):
         {"role": "user", "content": sample["question"]},
         {"role": "assistant", "reasoning_content": reasoning.strip(), "content": final_answer.strip()},
     ]
+
+
+def process_wordle_sample(sample: dict) -> list[dict]:
+    if "messages" in sample:
+        messages = list(sample["messages"])
+    elif "prompt" in sample and "completion" in sample:
+        messages = list(sample["prompt"]) + list(sample["completion"])
+    else:
+        raise KeyError(f"Wordle sample must have 'messages' or 'prompt'+'completion'. Got keys: {list(sample.keys())}")
+
+    normalized = []
+    for message in messages:
+        normalized_message = dict(message)
+        content = normalized_message.get("content")
+        if isinstance(content, list):
+            normalized_message["content"] = "\n".join(str(item) for item in content)
+        normalized.append(normalized_message)
+    return normalized
+
+
+def import_chat_processor(path: str) -> Callable:
+    module_name, _, attr_name = path.rpartition(".")
+    if not module_name or not attr_name:
+        raise ValueError(
+            f"chat_processor must be an import path like "
+            f"'torchtitan_npu.hf_datasets.chat_processors.process_gsm8k_sample', got {path!r}"
+        )
+    module = import_module(module_name)
+    try:
+        processor = getattr(module, attr_name)
+    except AttributeError as exc:
+        raise ValueError(f"Unknown chat_processor import path {path!r}") from exc
+    if not callable(processor):
+        raise TypeError(f"chat_processor import path {path!r} resolved to non-callable {processor!r}")
+    return processor

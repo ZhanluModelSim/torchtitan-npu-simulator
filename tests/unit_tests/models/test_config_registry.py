@@ -6,6 +6,8 @@
 import importlib
 import json
 import re
+import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
@@ -214,6 +216,10 @@ def _deepseek_v4_registry() -> ModuleType:
     return importlib.import_module("torchtitan_npu.models.deepseek_v4.config_registry")
 
 
+def _qwen3_registry() -> ModuleType:
+    return importlib.import_module("torchtitan_npu.models.qwen3.config_registry")
+
+
 def _converter_names(trainer_config) -> list[str]:
     return [getattr(converter, "name", type(converter).__name__) for converter in trainer_config.model_converters.converters]
 
@@ -321,16 +327,34 @@ def test_debug_single_node_config_applies_common_debug_semantics_without_cpt_com
     assert trainer_config.compile.enable is False
 
 
-def test_deepseek_v4_sft_processors_follow_upstream_hf_dataset_layout():
+def test_deepseek_v4_chat_processors_are_registered():
     processors = importlib.import_module("torchtitan_npu.hf_datasets.chat_processors")
-    config_registry = _deepseek_v4_registry()
-    tau_config = config_registry.sft_deepseek_v4_flash_16k_128die_tau()
-    gsm8k_config = config_registry.sft_deepseek_v4_flash_1k_128die_gsm8k()
 
     assert callable(processors.process_tau_sample)
     assert callable(processors.process_gsm8k_sample)
-    assert tau_config.dataloader.sample_processor is processors.process_tau_sample
-    assert gsm8k_config.dataloader.sample_processor is processors.process_gsm8k_sample
+
+
+def test_tau_demo_dataset_is_processable():
+    pq = pytest.importorskip("pyarrow.parquet")
+    from torchtitan_npu.hf_datasets.chat_processors import process_tau_sample
+
+    table = pq.read_table("tests/assets/tau_historical_sft/demo_train_00000_of_00001.parquet")
+    sample = table.slice(0, 1).to_pylist()[0]
+
+    processed = process_tau_sample(sample)
+
+    assert processed[0]["role"] == "system"
+    assert processed[0]["tools"]
+    assert any(message["role"] == "user" for message in processed)
+
+
+def test_qwen3_sft_configs_use_registered_chat_processors():
+    config_registry = _qwen3_registry()
+    gsm8k_config = config_registry.sft_qwen3_30ba3b_gsm8k()
+    wordle_config = config_registry.sft_qwen3_1_7b_wordle()
+
+    assert gsm8k_config.dataloader.chat_processor == "torchtitan_npu.hf_datasets.chat_processors.process_gsm8k_sample"
+    assert wordle_config.dataloader.chat_processor == "torchtitan_npu.hf_datasets.chat_processors.process_wordle_sample"
 
 
 def test_tau_sample_processor_accepts_json_messages_and_tools():
@@ -370,6 +394,26 @@ def test_gsm8k_sample_processor_splits_reasoning_and_final_answer():
         {"role": "user", "content": "What is 2+2?"},
         {"role": "assistant", "reasoning_content": "Compute 2 + 2.", "content": "4"},
     ]
+
+
+def test_chat_processor_import_path_resolves_processors():
+    processors = importlib.import_module("torchtitan_npu.hf_datasets.chat_processors")
+
+    assert (
+        processors.import_chat_processor("torchtitan_npu.hf_datasets.chat_processors.process_gsm8k_sample")
+        is processors.process_gsm8k_sample
+    )
+    assert (
+        processors.import_chat_processor("torchtitan_npu.hf_datasets.chat_processors.process_tau_sample")
+        is processors.process_tau_sample
+    )
+    assert (
+        processors.import_chat_processor("torchtitan_npu.hf_datasets.chat_processors.process_wordle_sample")
+        is processors.process_wordle_sample
+    )
+
+    with pytest.raises(ValueError, match="chat_processor must be an import path"):
+        processors.import_chat_processor("missing")
 
 
 def test_deepseek_v4_debug_configs_do_not_inherit_cpt_comm_override():
@@ -415,41 +459,160 @@ def test_deepseek_v4_pro_single_node_derives_from_flash_single_node_config():
     assert pro_config.parallelism.expert_parallel_degree == 16
 
 
-def test_deepseek_v4_sft_configs_keep_flash_cpt_semantics():
-    config_registry = _deepseek_v4_registry()
-    flash_cpt = config_registry.deepseek_v4_flash_4k_128die()
-
-    for config_name in ("sft_deepseek_v4_flash_16k_128die_tau", "sft_deepseek_v4_flash_1k_128die_gsm8k"):
-        trainer_config = getattr(config_registry, config_name)()
-
-        assert trainer_config.model_spec.name == flash_cpt.model_spec.name
-        assert trainer_config.model_spec.flavor == flash_cpt.model_spec.flavor
-        assert trainer_config.comm.trace_buf_size == 0
-        assert trainer_config.debug.moe_force_load_balance is False
-        assert trainer_config.lr_scheduler.warmup_steps == 20
-        assert trainer_config.training.steps == 100
-        assert trainer_config.training.global_batch_size == -1
-        assert trainer_config.training.num_mtp_modules == flash_cpt.training.num_mtp_modules
-        assert trainer_config.parallelism.data_parallel_shard_degree == flash_cpt.parallelism.data_parallel_shard_degree
-        assert trainer_config.parallelism.pipeline_parallel_schedule == "1F1B"
-        assert trainer_config.checkpoint.initial_load_in_hf is True
-        assert trainer_config.checkpoint.load_only is False
-        assert trainer_config.checkpoint.export_dtype == "bfloat16"
-
-
-def test_deepseek_v4_sft_configs_apply_dataset_specific_overrides():
+def test_deepseek_v4_cpt_config_can_select_chat_dataloader_from_cli():
+    from torchtitan.config.manager import ConfigManager
     from torchtitan_npu.config.configs import ChatDataLoaderConfig
 
-    config_registry = _deepseek_v4_registry()
-    tau_config = config_registry.sft_deepseek_v4_flash_16k_128die_tau()
-    gsm8k_config = config_registry.sft_deepseek_v4_flash_1k_128die_gsm8k()
+    config = ConfigManager().parse_args(
+        [
+            "--module",
+            "torchtitan_npu.models.deepseek_v4",
+            "--config",
+            "deepseek_v4_flash_4k_128die",
+            "--training.seq_len",
+            "16384",
+            "--parallelism.context_parallel_degree",
+            "4",
+            "--training.global_batch_size",
+            "-1",
+            "--checkpoint.no_load_only",
+            "--checkpoint.interval",
+            "500",
+            "--checkpoint.export_dtype",
+            "bfloat16",
+            "dataloader:chat_data_loader_config",
+            "--dataloader.dataset_path",
+            "./tests/assets/tau_historical_sft",
+            "--dataloader.data_files",
+            "demo_train_00000_of_00001.parquet",
+            "--dataloader.dataset_config_name",
+            "default",
+            "--dataloader.chat_processor",
+            "torchtitan_npu.hf_datasets.chat_processors.process_tau_sample",
+            "dataloader.chat_encoder:dsv4_encoder_config",
+            "--dataloader.chat_encoder.encoding_module_path",
+            "/tmp/encoding_dsv4.py",
+        ]
+    )
 
-    assert isinstance(tau_config.dataloader, ChatDataLoaderConfig)
-    assert tau_config.training.seq_len == 16384
-    assert tau_config.parallelism.context_parallel_degree == 4
-    assert tau_config.dataloader.load_dataset_kwargs == {"data_files": "train-00000-of-00001.parquet", "split": "train"}
+    assert isinstance(config.dataloader, ChatDataLoaderConfig)
+    assert config.training.seq_len == 16384
+    assert config.training.global_batch_size == -1
+    assert config.parallelism.context_parallel_degree == 4
+    assert config.checkpoint.load_only is False
+    assert config.checkpoint.interval == 500
+    assert config.checkpoint.export_dtype == "bfloat16"
+    assert config.dataloader.dataset_path == "./tests/assets/tau_historical_sft"
+    assert config.dataloader.data_files == "demo_train_00000_of_00001.parquet"
+    assert config.dataloader.dataset_config_name == "default"
+    assert config.dataloader.chat_processor == "torchtitan_npu.hf_datasets.chat_processors.process_tau_sample"
+    assert config.dataloader.chat_encoder is not None
+    assert config.dataloader.chat_encoder.encoding_module_path == "/tmp/encoding_dsv4.py"
 
-    assert isinstance(gsm8k_config.dataloader, ChatDataLoaderConfig)
-    assert gsm8k_config.training.seq_len == 1024
-    assert gsm8k_config.parallelism.context_parallel_degree == 1
-    assert gsm8k_config.dataloader.load_dataset_kwargs == {"name": "main", "split": "train"}
+
+def test_deepseek_v4_chat_dataloader_script_order_keeps_top_level_overrides_before_subcommands():
+    from torchtitan.config.manager import ConfigManager
+
+    config = ConfigManager().parse_args(
+        [
+            "--module",
+            "torchtitan_npu.models.deepseek_v4",
+            "--config",
+            "deepseek_v4_flash_4k_128die",
+            "--training.global_batch_size",
+            "-1",
+            "--checkpoint.no_load_only",
+            "--checkpoint.interval",
+            "500",
+            "--checkpoint.export_dtype",
+            "bfloat16",
+            "--training.seq_len",
+            "1024",
+            "--parallelism.context_parallel_degree",
+            "1",
+            "dataloader:chat_data_loader_config",
+            "--dataloader.dataset_path",
+            "./tests/assets/tau_historical_sft",
+            "--dataloader.data_files",
+            "demo_train_00000_of_00001.parquet",
+            "--dataloader.dataset_config_name",
+            "default",
+            "--dataloader.chat_processor",
+            "torchtitan_npu.hf_datasets.chat_processors.process_tau_sample",
+            "dataloader.chat_encoder:dsv4_encoder_config",
+            "--dataloader.chat_encoder.encoding_module_path",
+            "/tmp/encoding_dsv4.py",
+        ]
+    )
+
+    assert config.training.global_batch_size == -1
+    assert config.training.seq_len == 1024
+    assert config.parallelism.context_parallel_degree == 1
+    assert config.checkpoint.load_only is False
+    assert config.checkpoint.interval == 500
+    assert config.checkpoint.export_dtype == "bfloat16"
+    assert config.dataloader.dataset_path == "./tests/assets/tau_historical_sft"
+    assert config.dataloader.data_files == "demo_train_00000_of_00001.parquet"
+    assert config.dataloader.dataset_config_name == "default"
+    assert config.dataloader.chat_processor == "torchtitan_npu.hf_datasets.chat_processors.process_tau_sample"
+    assert config.dataloader.chat_encoder.encoding_module_path == "/tmp/encoding_dsv4.py"
+
+
+def test_deepseek_v4_cpt_config_can_select_gsm8k_chat_dataloader_from_cli():
+    from torchtitan.config.manager import ConfigManager
+    from torchtitan_npu.config.configs import ChatDataLoaderConfig
+
+    config = ConfigManager().parse_args(
+        [
+            "--module",
+            "torchtitan_npu.models.deepseek_v4",
+            "--config",
+            "deepseek_v4_flash_4k_128die",
+            "--training.seq_len",
+            "1024",
+            "dataloader:chat_data_loader_config",
+            "--dataloader.dataset_path",
+            "/data/dataset/openai/gsm8k",
+            "--dataloader.dataset_config_name",
+            "main",
+            "--dataloader.chat_processor",
+            "torchtitan_npu.hf_datasets.chat_processors.process_gsm8k_sample",
+            "dataloader.chat_encoder:dsv4_encoder_config",
+            "--dataloader.chat_encoder.encoding_module_path",
+            "/tmp/encoding_dsv4.py",
+        ]
+    )
+
+    assert isinstance(config.dataloader, ChatDataLoaderConfig)
+    assert config.training.seq_len == 1024
+    assert config.dataloader.dataset_path == "/data/dataset/openai/gsm8k"
+    assert config.dataloader.dataset_config_name == "main"
+    assert config.dataloader.chat_processor == "torchtitan_npu.hf_datasets.chat_processors.process_gsm8k_sample"
+    assert config.dataloader.chat_encoder is not None
+    assert config.dataloader.chat_encoder.encoding_module_path == "/tmp/encoding_dsv4.py"
+
+
+def test_chat_dataloader_help_exposes_one_typed_dataset_cli_surface():
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "torchtitan.config.manager",
+            "--module",
+            "torchtitan_npu.models.deepseek_v4",
+            "--config",
+            "deepseek_v4_flash_4k_128die",
+            "dataloader:chat_data_loader_config",
+            "--help",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0
+    help_text = result.stdout + result.stderr
+    assert "--dataloader.dataset-split" in help_text
+    assert "--dataloader.data-files" in help_text
+    assert "--dataloader.dataset-config-name" in help_text
+    assert "--dataloader.load-dataset-kwargs" not in help_text

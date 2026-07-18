@@ -129,7 +129,7 @@ parallelism = ParallelismConfig(
 ```
 
 多机长序列训练推荐在 `scripts/run_train_multinodes.sh` 中配置节点 IP、
-`NPUS_PER_NODE` 等集群信息后，直接覆盖为 32k 预置配置启动：
+`NGPU` 等集群信息后，直接覆盖为 32k 预置配置启动：
 
 ```bash
 MODULE=torchtitan_npu.models.deepseek_v32 \

@@ -16,7 +16,6 @@ from torchtitan_npu.config.configs import (
     trainer_base_config,
 )
 from torchtitan_npu.converters import get_model_converter_config
-from torchtitan_npu.hf_datasets.chat_processors import process_gsm8k_sample
 
 from . import model_registry
 
@@ -67,7 +66,7 @@ def sft_qwen3_30ba3b_gsm8k() -> TrainerConfig:
         dataloader=ChatDataLoaderConfig(
             dataset_path="openai/gsm8k",
             load_dataset_kwargs={"name": "main", "split": "train"},
-            sample_processor=process_gsm8k_sample,
+            chat_processor="torchtitan_npu.hf_datasets.chat_processors.process_gsm8k_sample",
         ),
         checkpoint=replace(
             base.checkpoint,
@@ -92,28 +91,6 @@ def sft_qwen3_30ba3b_gsm8k_tnd() -> TrainerConfig:
 
 def _qwen3_1_7b_converters() -> ModelConvertersContainer.Config:
     return ModelConvertersContainer.Config(converters=[])
-
-
-def _process_wordle_sample(sample: dict) -> list[dict]:
-    """Convert a ``willcb/V3-wordle`` sample to Qwen3 chat messages.
-
-    The dataset uses ``prompt`` (list of system + first-user messages) and
-    ``completion`` (list of multi-turn assistant + user messages).
-    We concatenate them into a single conversation and ensure ``content``
-    is always a plain string.
-    """
-    if "messages" in sample:
-        messages = sample["messages"]
-    elif "prompt" in sample and "completion" in sample:
-        messages = list(sample["prompt"]) + list(sample["completion"])
-    else:
-        raise KeyError(f"Wordle sample must have 'messages' or 'prompt'+'completion'. Got keys: {list(sample.keys())}")
-    # Normalize: ensure content is always a string (Jinja2 chat templates
-    # expect strings; some datasets store content as lists).
-    for msg in messages:
-        if isinstance(msg.get("content"), list):
-            msg["content"] = "\n".join(str(c) for c in msg["content"])
-    return messages
 
 
 def _qwen3_1_7b_base() -> TrainerConfig:
@@ -146,7 +123,7 @@ def sft_qwen3_1_7b_wordle() -> TrainerConfig:
         dataloader=ChatDataLoaderConfig(
             dataset_path="willcb/V3-wordle",
             load_dataset_kwargs={"split": "train"},
-            sample_processor=_process_wordle_sample,
+            chat_processor="torchtitan_npu.hf_datasets.chat_processors.process_wordle_sample",
         ),
         checkpoint=replace(
             base.checkpoint,

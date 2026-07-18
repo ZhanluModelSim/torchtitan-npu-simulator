@@ -29,9 +29,11 @@ Usage in npu config_registry functions:
         )
 """
 
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
-from typing import Literal
+from typing import Annotated, Any, Literal
 
+import tyro
 from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import MetricsProcessor
@@ -232,6 +234,52 @@ class CheckpointConfig(CheckpointManager.Config):
 class ChatDataLoaderConfig(_ChatDataLoader.Config):
     """ChatDataLoader config with NPU-specific chat_encoder field."""
 
+    load_dataset_kwargs: Annotated[dict[str, Any], tyro.conf.Suppress] = field(
+        default_factory=lambda: {"split": "train"}
+    )  # pyrefly: ignore [bad-override]
+    """
+    Extra kwargs passed to datasets.load_dataset() from Python config.
+
+    Common dataset controls use the typed fields below. This inherited mapping
+    remains available for advanced Python-only dataset options and is hidden
+    from the CLI to avoid duplicate entry points.
+    """
+
+    sample_processor: Annotated[Callable | None, tyro.conf.Suppress] = field(  # pyrefly: ignore [bad-override]
+        default=None,
+        repr=False,
+    )
+    """
+    Upstream ChatDataLoader requires this field. NPU configs populate it
+    internally from the CLI-friendly chat_processor import path before init.
+    """
+
+    chat_processor: str | None = None
+    """
+    Import path of a dataset-specific chat processor.
+    When set, it is resolved to ``sample_processor`` before ChatDataLoader
+    constructs ChatDataset. This keeps dataset parsing out of model configs
+    and makes SFT dataset processing CLI-selectable.
+    """
+
+    dataset_split: str | None = None
+    """
+    Optional dataset split passed to ``datasets.load_dataset()``.
+    When unset, the Python-only ``load_dataset_kwargs`` value is preserved.
+    """
+
+    data_files: str = ""
+    """
+    Optional data files passed to ``datasets.load_dataset()``.
+    Empty values leave a Python-configured value unchanged.
+    """
+
+    dataset_config_name: str = ""
+    """
+    Optional HuggingFace dataset configuration name.
+    Empty values leave a Python-configured value unchanged.
+    """
+
     chat_encoder: DSV4EncoderConfig | ChatEncoderConfig | None = None
     """
     Configurable non-Jinja chat encoder (e.g. DSV4ChatEncoder).
@@ -255,6 +303,9 @@ class TrainerConfig(Trainer.Config):
     training: TrainingConfig = field(default_factory=TrainingConfig)  # type: ignore[assignment]
     profiling: ProfilingConfig = field(default_factory=ProfilingConfig)  # type: ignore[assignment]
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)  # type: ignore[assignment]
+    dataloader: HuggingFaceTextDataLoader.Config | ChatDataLoaderConfig = field(  # pyrefly: ignore [bad-override]
+        default_factory=HuggingFaceTextDataLoader.Config
+    )  # type: ignore[assignment]
 
 
 def trainer_base_config() -> TrainerConfig:

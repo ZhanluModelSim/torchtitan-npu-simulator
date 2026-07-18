@@ -22,8 +22,7 @@ export TASK_QUEUE_ENABLE=2
 export STREAMS_PER_DEVICE=32
 export MULTI_STREAM_MEMORY_RESERVE=1
 
-# TODO change to your network interface
-Network_Interface=enp23s0f3
+Network_Interface=${Network_Interface:-$(ip -o -4 addr show scope global | awk '$2 != "docker0" {print $2; exit}')}
 export GLOO_SOCKET_IFNAME=${Network_Interface}
 export HCCL_SOCKET_IFNAME=${Network_Interface}
 export HCCL_IF_BASE_PORT=30000
@@ -31,22 +30,23 @@ export HCCL_IF_BASE_PORT=30000
 export LOG_RANK=${LOG_RANK:-0}  # rank to show log
 export PYTHONUNBUFFERED=1
 
-# TODO change to your device ips
-IPs=('192.168.xxx.xxx' '192.168.xxx.xxx')
-# TODO change 192.168 to your local IP
-LOCAL_HOST=`ifconfig|grep "inet 192.168"| awk '{print $2}'`
-# if you have not ifconfig , use the following command
-# LOCAL_HOST=$(ip addr show ${Network_Interface} | grep "inet " | grep -v "127.0.0.1" | awk '{print $2}' | cut -d'/' -f1)
-# Or LOCAL_HOST=`hostname -I | awk '{print $1}'`
+LOCAL_HOST=${LOCAL_HOST:-$(ip addr show "${Network_Interface}" | grep "inet " | awk '{print $2}' | cut -d'/' -f1 | head -n1)}
+LOCAL_HOST=${LOCAL_HOST:-$(hostname -I | awk '{print $1}')}
 echo $LOCAL_HOST
-NPUS_PER_NODE=16
-MASTER_ADDR=${IPs[0]}
-MASTER_PORT=6300
-NNODES=${#IPs[@]}
-NODE_RANK=""
+if [[ -n "${NODE_IPS:-}" ]]; then
+    read -r -a IPs <<< "${NODE_IPS//,/ }"
+else
+    IPs=("${LOCAL_HOST}")
+fi
+NGPU=${NGPU:-8}
+NPUS_PER_NODE=${NGPU}
+MASTER_ADDR=${MASTER_ADDR:-${IPs[0]}}
+MASTER_PORT=${MASTER_PORT:-6300}
+NNODES=${NNODES:-${#IPs[@]}}
+NODE_RANK=${NODE_RANK:-}
 for i in "${!IPs[@]}";
 do
-    if [ "$LOCAL_HOST" == "${IPs[$i]}" ];
+    if [[ "$LOCAL_HOST" == "${IPs[$i]}" ]];
     then
         echo "Node Rank : ${i}"
         NODE_RANK=$i
@@ -57,11 +57,8 @@ if [[ $NODE_RANK == "" ]];then
     echo "[Error] Variable \"NODE_RANK\" must be configured"
     exit 1
 fi
-WORLD_SIZE=$(($NPUS_PER_NODE*$NNODES))
-
 set -exo pipefail
 
-NGPU=${NGPU:-"16"}
 RDZV_ID="dsv32_train_$(date +%Y%m%d)"
 MODULE=${MODULE:-"torchtitan_npu.models.deepseek_v32"}
 CONFIG=${CONFIG:-"deepseek_v32_671b_61layers_4k_128die"}
@@ -73,6 +70,6 @@ mkdir -p logs
 
 TORCHFT_LIGHTHOUSE=${TORCHFT_LIGHTHOUSE:-"http://localhost:29510"}
 TORCHFT_LIGHTHOUSE=${TORCHFT_LIGHTHOUSE} \
-torchrun --nnodes=${NNODES} --node_rank=${NODE_RANK} --nproc_per_node=${NGPU} --master_addr=${MASTER_ADDR} --master_port=${MASTER_PORT} \
+torchrun --nnodes=${NNODES} --node_rank=${NODE_RANK} --nproc_per_node=${NPUS_PER_NODE} --master_addr=${MASTER_ADDR} --master_port=${MASTER_PORT} \
 --local-ranks-filter ${LOG_RANK} --role rank --tee 3 \
 -m ${TRAIN_FILE} --module ${MODULE} --config ${CONFIG} "$@" 2>&1 | tee -a logs/${logfile}

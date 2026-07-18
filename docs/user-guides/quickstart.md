@@ -78,7 +78,7 @@ bash scripts/run_train.sh \
 > [!NOTE]
 > * `MODULE`: 指定模型 Python 模块，默认 `torchtitan_npu.models.deepseek_v32`。切换模型时改为对应模块，例如 DeepSeek-V4 改为 `torchtitan_npu.models.deepseek_v4`。
 > * `CONFIG`: 指定 `config_registry.py` 中的配置函数，默认 `deepseek_v32_671b_4layers_debug`。需与 `MODULE` 对应同一模型，例如 DeepSeek-V4 改为 `debug_deepseek_v4_flash_single_node`。
-> * `NGPU`: 指定单节点参与训练的 NPU 数量，`scripts/run_train.sh` 默认值为 16。
+> * `NGPU`: 指定单机或多机每节点参与训练的 NPU 数量；`scripts/run_train.sh` 默认值为 16，`scripts/run_train_multinodes.sh` 默认值为 8。
 > * `training.allow_hf32`：控制 NPU MatMul、Conv、aclnn 算子是否启用 HF32，默认启用，无需传参；关闭时添加 `--training.no-allow_hf32`，这是 Tyro 为该布尔字段自动生成的反向选项。
 > * `--training.steps` 与 `--training.global_batch_size`: 动态覆盖 registry 配置中的字段。
 

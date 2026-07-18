@@ -15,6 +15,8 @@ Replaces the old tokenizer.py patch — encoder routing is now done here,
 not on the tokenizer.
 """
 
+import copy
+
 from torchtitan.components.loss import IGNORE_INDEX
 from torchtitan.hf_datasets.text_datasets import ChatDataLoader, ChatDataset
 from torchtitan.tools.logging import logger
@@ -22,6 +24,46 @@ from torchtitan.tools.logging import logger
 from torchtitan_npu.patches.torchtitan.hf_datasets import _mtp_seq_len_delta
 
 _orig_loader_init = ChatDataLoader.__init__
+
+
+def _prepare_upstream_loader_config(config):
+    """Apply NPU CLI fields without mutating the registry-owned config."""
+
+    original_load_kwargs = getattr(config, "load_dataset_kwargs", {})
+    load_kwargs = dict(original_load_kwargs)
+
+    dataset_split = getattr(config, "dataset_split", "")
+    if dataset_split:
+        load_kwargs["split"] = dataset_split
+
+    data_files = getattr(config, "data_files", "")
+    if data_files:
+        load_kwargs["data_files"] = data_files
+
+    dataset_config_name = getattr(config, "dataset_config_name", "")
+    if dataset_config_name:
+        load_kwargs["name"] = dataset_config_name
+
+    cleaned_load_kwargs = {key: value for key, value in load_kwargs.items() if value not in (None, "")}
+
+    original_sample_processor = getattr(config, "sample_processor", None)
+    sample_processor = original_sample_processor
+    chat_processor_name = getattr(config, "chat_processor", None)
+    if chat_processor_name:
+        from torchtitan_npu.hf_datasets.chat_processors import import_chat_processor
+
+        sample_processor = import_chat_processor(chat_processor_name)
+
+    if sample_processor is None:
+        raise ValueError("ChatDataLoaderConfig requires either sample_processor or chat_processor import path.")
+
+    if cleaned_load_kwargs == original_load_kwargs and sample_processor is original_sample_processor:
+        return config
+
+    prepared_config = copy.copy(config)
+    prepared_config.load_dataset_kwargs = cleaned_load_kwargs
+    prepared_config.sample_processor = sample_processor
+    return prepared_config
 
 
 def _patched_loader_init(
@@ -35,6 +77,8 @@ def _patched_loader_init(
     local_batch_size,
     **kwargs,
 ):
+    config = _prepare_upstream_loader_config(config)
+
     chat_encoder_cfg = getattr(config, "chat_encoder", None)
     chat_encoder = chat_encoder_cfg.build() if chat_encoder_cfg is not None else None
 

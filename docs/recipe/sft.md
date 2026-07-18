@@ -4,22 +4,22 @@ torchtitan-npu 支持基于对话数据的指令微调（Supervised Fine-Tuning,
 
 ## 支持矩阵
 
-| 模型 | 任务 / 数据集 | 编码方式 | 单轮 | 多轮 | Tool Call | 配置名 |
-|------|-------------|---------|------|------|-----------|--------|
-| Qwen3-30B-A3B | GSM8K | Jinja chat template | ✅ | — | — | `sft_qwen3_30ba3b_gsm8k` |
-| Qwen3-1.7B | Wordle | Jinja chat template | — | ✅ | — | `sft_qwen3_1_7b_wordle` |
-| DeepSeek-V4 | tau-bench | 自定义编码器 (encoding_dsv4.py) | — | ✅ | ✅ | `sft_deepseek_v4_flash_16k_128die_tau` |
-| DeepSeek-V4 | GSM8K | 自定义编码器 (encoding_dsv4.py) | ✅ | — | — | `sft_deepseek_v4_flash_1k_128die_gsm8k` |
+| 模型 | 任务 / 数据集 | 编码方式 | 单轮 | 多轮 | Tool Call |
+|------|-------------|---------|------|------|-----------|
+| Qwen3-30B-A3B | GSM8K | Jinja chat template | ✅ | — | — |
+| Qwen3-1.7B | Wordle | Jinja chat template | — | ✅ | — |
+| DeepSeek-V4 | tau-bench | 自定义编码器 (encoding_dsv4.py) | — | ✅ | ✅ |
+| DeepSeek-V4 | GSM8K | 自定义编码器 (encoding_dsv4.py) | ✅ | — | — |
 
 ## 架构概述
 
 torchtitan-npu 的 SFT 能力由两层正交配置驱动：
 
 - **chat_encoder**（模型级）：决定消息如何渲染为文本。支持 Jinja chat template（默认）和自定义编码器（通过 `BaseChatEncoder` 子类）。
-- **sample_processor**（数据集级）：决定原始数据样本如何转为 OpenAI 格式消息列表。不同数据集写不同的 `process_sample` 函数。
+- **chat_processor**（数据集级）：决定原始数据样本如何转为 OpenAI 格式消息列表。处理函数集中在 `torchtitan_npu/hf_datasets/chat_processors.py`，可通过 `--dataloader.chat_processor <import-path>` 从 CLI 选择。
 
 ```text
-原始样本 → sample_processor → 消息列表 → chat template / chat_encoder → token ids
+原始样本 → chat_processor → 消息列表 → chat template / chat_encoder → token ids
                                                                       ↓
                                                            label masking
 ```
@@ -52,18 +52,27 @@ NGPU=1 MODULE=torchtitan_npu.models.qwen3 CONFIG=sft_qwen3_1_7b_wordle bash scri
 
 ### DeepSeek-V4 SFT（tau-bench 多轮 + Tool Call）
 
+`examples/deepseek_v4/sft_deepseek_v4_flash_16k_A3.sh` 中的 dataset、
+processor 和 encoder 路径通过环境变量覆盖；训练参数（如 seq_len、CP）通过脚本
+后的 CLI 参数覆盖。脚本在 `"$@"` 后用隔离线固定 DataLoader 和 ChatEncoder 子命令，
+这些子命令不接受顶层 CLI 覆盖。
+
 ```bash
-CONFIG=sft_deepseek_v4_flash_16k_128die_tau \
-DATASET_PATH=/data/dataset/tau-historical-sft/processed_clean \
+DATASET_PATH=./tests/assets/tau_historical_sft \
+DATA_FILES=demo_train_00000_of_00001.parquet \
+CHAT_PROCESSOR=torchtitan_npu.hf_datasets.chat_processors.process_tau_sample \
   bash examples/deepseek_v4/sft_deepseek_v4_flash_16k_A3.sh
 ```
 
 ### DeepSeek-V4 SFT（GSM8K 单轮）
 
 ```bash
-CONFIG=sft_deepseek_v4_flash_1k_128die_gsm8k \
 DATASET_PATH=/data/dataset/openai/gsm8k \
-  bash examples/deepseek_v4/sft_deepseek_v4_flash_16k_A3.sh
+DATASET_CONFIG_NAME=main \
+CHAT_PROCESSOR=torchtitan_npu.hf_datasets.chat_processors.process_gsm8k_sample \
+  bash examples/deepseek_v4/sft_deepseek_v4_flash_16k_A3.sh \
+    --training.seq_len 1024 \
+    --parallelism.context_parallel_degree 1
 ```
 
 ---
@@ -90,21 +99,20 @@ DeepSeek-V4 的编码器，薄封装 `encoding_dsv4.py`，并在渲染时按 mes
 - `drop_thinking`：是否在训练时丢弃思考内容（默认 `True`，节省 token）
 - `reasoning_effort`：推理力度，`"max"` / `"high"` / `None`
 
-配置示例：
+训练时通过 CLI 选择 DSV4 编码器：
 
-```python
-from torchtitan_npu.patches.encoders import DSV4EncoderConfig
-
-dataloader=ChatDataLoaderConfig(
-    ...,
-    chat_encoder=DSV4EncoderConfig(
-        encoding_module_path="/path/to/encoding_dsv4.py",
-        thinking_mode="thinking",    # "chat" | "thinking"
-        drop_thinking=True,
-        reasoning_effort=None,       # "max" | "high" | None
-    ),
-)
+```bash
+dataloader.chat_encoder:dsv4_encoder_config \
+  --dataloader.chat_encoder.encoding_module_path /path/to/encoding_dsv4.py \
+  --dataloader.chat_encoder.thinking_mode thinking \
+  --dataloader.chat_encoder.drop_thinking \
+  --dataloader.chat_encoder.reasoning_effort None
 ```
+
+`examples/deepseek_v4/sft_deepseek_v4_flash_16k_A3.sh` 已经默认传入
+`dataloader.chat_encoder:dsv4_encoder_config` 和
+`--dataloader.chat_encoder.encoding_module_path`。通常只需要通过
+`HF_ASSETS_PATH` 指向包含 `encoding/encoding_dsv4.py` 的模型资产目录。
 
 ### 为新模型添加编码器
 
@@ -112,7 +120,11 @@ dataloader=ChatDataLoaderConfig(
 2. 继承 `BaseChatEncoder`，实现 `encode_messages_with_assistant_ranges()`
 3. 继承 `ChatEncoderConfig`，实现 `build()`
 4. 在 `encoders/__init__.py` 中导出
-5. 在 `config_registry.py` 的 SFT 配置中通过 `chat_encoder=MyEncoderConfig(...)` 引用
+5. 将新的 encoder config 加入 `ChatDataLoaderConfig.chat_encoder` 的 union 类型，
+   让 tyro 暴露对应的 `dataloader.chat_encoder:<config-subcommand>`
+6. 训练时通过 `dataloader.chat_encoder:<config-subcommand>` 选择该 encoder config；
+   如果维护自定义 registry config，也可以在 `ChatDataLoaderConfig` 中设置
+   `chat_encoder=MyEncoderConfig(...)`
 
 示例：
 
@@ -142,9 +154,15 @@ class MyEncoderConfig(ChatEncoderConfig):
 
 ## 数据预处理
 
-### sample_processor
+### chat_processor
 
-SFT 的数据预处理在 `config_registry.py` 的配置函数中完成。`process_sample` 接收 HuggingFace 数据集的原始样本，返回 OpenAI 格式消息列表。
+SFT 的数据预处理集中在 `torchtitan_npu/hf_datasets/chat_processors.py`。processor 接收 HuggingFace 数据集的原始样本，返回 OpenAI 格式消息列表。
+
+模型 config 可以通过 `ChatDataLoaderConfig(chat_processor="...")` 提供默认 import path，用户也可以用 CLI 覆盖：
+
+```bash
+--dataloader.chat_processor torchtitan_npu.hf_datasets.chat_processors.process_gsm8k_sample
+```
 
 #### 单轮示例（Qwen3 + GSM8K）
 
@@ -188,7 +206,7 @@ def process_tau_sample(sample):
 
 ### 消息格式
 
-`process_sample` 返回 OpenAI 格式消息列表：
+processor 返回 OpenAI 格式消息列表：
 
 ```python
 # 单轮
@@ -345,7 +363,7 @@ pprint.pprint(next(iter(ds)), width=100, depth=3)
 "
 ```
 
-`torchtitan_npu.models.qwen3.config_registry` 的 `_process_wordle_sample` 函数将 `prompt` 和 `completion` 拼接为完整的 `[system, user, assistant, user, assistant, ...]` 消息列表。
+`process_wordle_sample` processor 会将 `prompt` 和 `completion` 拼接为完整的 `[system, user, assistant, user, assistant, ...]` 消息列表。
 
 ### 模型选择
 

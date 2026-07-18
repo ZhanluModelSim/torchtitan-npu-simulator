@@ -11,10 +11,135 @@ import pytest
 import torch
 
 from torchtitan.components.loss import IGNORE_INDEX
+import torchtitan_npu.patches.torchtitan.chat_dataset as chat_dataset_patch
 from torchtitan_npu.patches.torchtitan.chat_dataset import (
+    _patched_loader_init,
     _patched_tokenize_sample,
     _patched_validate_messages,
 )
+
+
+# ---------------------------------------------------------------------------
+# _patched_loader_init
+# ---------------------------------------------------------------------------
+
+
+def test_loader_init_resolves_chat_processor_import_path_before_upstream_init(monkeypatch):
+    from torchtitan_npu.config.configs import ChatDataLoaderConfig
+    from torchtitan_npu.hf_datasets.chat_processors import process_gsm8k_sample
+
+    captured = {}
+
+    def fake_orig_loader_init(
+        self,
+        config,
+        *,
+        dp_world_size,
+        dp_rank,
+        tokenizer,
+        seq_len,
+        local_batch_size,
+        **kwargs,
+    ):
+        del dp_world_size, dp_rank, tokenizer, seq_len, local_batch_size, kwargs
+        captured["sample_processor"] = config.sample_processor
+        self.dataset = MagicMock()
+
+    config = ChatDataLoaderConfig(chat_processor="torchtitan_npu.hf_datasets.chat_processors.process_gsm8k_sample")
+    loader = MagicMock()
+
+    monkeypatch.setattr(chat_dataset_patch, "_orig_loader_init", fake_orig_loader_init)
+    monkeypatch.setattr(chat_dataset_patch, "_mtp_seq_len_delta", lambda: 0)
+
+    _patched_loader_init(
+        loader,
+        config,
+        dp_world_size=1,
+        dp_rank=0,
+        tokenizer=MagicMock(),
+        seq_len=128,
+        local_batch_size=1,
+    )
+
+    assert captured["sample_processor"] is process_gsm8k_sample
+    assert config.sample_processor is None
+
+
+def test_loader_init_requires_sample_processor_or_chat_processor(monkeypatch):
+    from torchtitan_npu.config.configs import ChatDataLoaderConfig
+
+    monkeypatch.setattr(chat_dataset_patch, "_mtp_seq_len_delta", lambda: 0)
+
+    with pytest.raises(ValueError, match="requires either sample_processor or chat_processor"):
+        _patched_loader_init(
+            MagicMock(),
+            ChatDataLoaderConfig(),
+            dp_world_size=1,
+            dp_rank=0,
+            tokenizer=MagicMock(),
+            seq_len=128,
+            local_batch_size=1,
+        )
+
+
+def test_loader_init_merges_typed_dataset_fields_without_mutating_config(monkeypatch):
+    from torchtitan_npu.config.configs import ChatDataLoaderConfig
+
+    captured = {}
+    copy_calls = []
+
+    def fake_orig_loader_init(
+        self,
+        config,
+        *,
+        dp_world_size,
+        dp_rank,
+        tokenizer,
+        seq_len,
+        local_batch_size,
+        **kwargs,
+    ):
+        del dp_world_size, dp_rank, tokenizer, seq_len, local_batch_size, kwargs
+        captured["load_dataset_kwargs"] = config.load_dataset_kwargs
+        self.dataset = MagicMock()
+
+    monkeypatch.setattr(chat_dataset_patch, "_orig_loader_init", fake_orig_loader_init)
+    monkeypatch.setattr(chat_dataset_patch, "_mtp_seq_len_delta", lambda: 0)
+    original_copy = chat_dataset_patch.copy.copy
+
+    def counting_copy(value):
+        copy_calls.append(value)
+        return original_copy(value)
+
+    monkeypatch.setattr(chat_dataset_patch.copy, "copy", counting_copy)
+
+    original_kwargs = {"split": "validation", "name": "main", "extra": 3}
+    config = ChatDataLoaderConfig(
+        load_dataset_kwargs=original_kwargs,
+        dataset_split="train",
+        data_files="demo.parquet",
+        dataset_config_name="default",
+        chat_processor="torchtitan_npu.hf_datasets.chat_processors.process_gsm8k_sample",
+    )
+
+    _patched_loader_init(
+        MagicMock(),
+        config,
+        dp_world_size=1,
+        dp_rank=0,
+        tokenizer=MagicMock(),
+        seq_len=128,
+        local_batch_size=1,
+    )
+
+    assert captured["load_dataset_kwargs"] == {
+        "split": "train",
+        "name": "default",
+        "extra": 3,
+        "data_files": "demo.parquet",
+    }
+    assert config.load_dataset_kwargs == original_kwargs
+    assert len(copy_calls) == 1
 
 
 # ---------------------------------------------------------------------------
