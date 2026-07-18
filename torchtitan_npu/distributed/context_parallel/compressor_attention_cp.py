@@ -7,7 +7,7 @@
 
 from collections.abc import Callable
 from functools import partial
-from typing import Any
+from typing import Any, cast
 
 import torch
 import torch.distributed._functional_collectives as ft_c
@@ -155,6 +155,12 @@ def _window_exchange(tensor: torch.Tensor, window: int, group: c10d.ProcessGroup
     )
 
 
+_window_exchange = cast(
+    "Callable[[torch.Tensor, int, c10d.ProcessGroup], torch.Tensor]",
+    torch.compiler.disable(_window_exchange),
+)
+
+
 def _allgather_seq_local(local_tensor: torch.Tensor, mesh: DeviceMesh, seq_dim: int = 1) -> torch.Tensor:
     """All-gather a local tensor along the sequence dim across the CP mesh."""
     group = mesh.get_group()
@@ -192,6 +198,7 @@ class CompressorAttentionCP(ParallelStyle):
         self.window = max(compress_ratio, 128)
 
     def _apply(self, module: torch.nn.Module, device_mesh: DeviceMesh) -> torch.nn.Module:
+        cast("Any", module)._requires_compile_graph_break = True
         module.register_forward_pre_hook(partial(self._pre_hook, mesh=device_mesh), with_kwargs=True)
         module.register_forward_hook(partial(self._post_hook, mesh=device_mesh))
         return module

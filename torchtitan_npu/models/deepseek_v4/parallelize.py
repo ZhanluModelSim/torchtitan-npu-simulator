@@ -972,7 +972,7 @@ def _compile_children_except(
             torch.compile(
                 child_module,
                 backend=compile_config.backend,
-                fullgraph=True,
+                fullgraph=not getattr(child_module, "_requires_compile_graph_break", False),
             ),
         )
 

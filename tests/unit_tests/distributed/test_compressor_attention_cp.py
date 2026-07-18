@@ -27,6 +27,7 @@ from torchtitan_npu.distributed.context_parallel.compressor_attention_cp import 
     _detect_dsv4,
     _window_exchange,
     _WindowExchangeLocal,
+    CompressorAttentionCP,
 )
 
 
@@ -126,6 +127,10 @@ class TestWindowExchange:
     """Single-rank tests for ``_WindowExchangeLocal`` / ``_window_exchange`` (world_size=1 identity path)."""
 
     @staticmethod
+    def test_runs_outside_compiled_graph():
+        assert getattr(_window_exchange, "_torchdynamo_disable", False)
+
+    @staticmethod
     def test_forward_identity():
         mesh = _make_cpu_mesh()
         group = mesh.get_group()
@@ -210,6 +215,14 @@ class TestWindowExchange:
         assert torch.allclose(grad_tensor, grad_output)
         assert grad_window is None
         assert grad_group is None
+
+
+def test_cp_marks_pre_attention_as_requiring_compile_graph_break():
+    module = torch.nn.Identity()
+
+    CompressorAttentionCP(compress_ratio=4)._apply(module, MagicMock())
+
+    assert getattr(module, "_requires_compile_graph_break", False)
 
 
 # ===========================================================================

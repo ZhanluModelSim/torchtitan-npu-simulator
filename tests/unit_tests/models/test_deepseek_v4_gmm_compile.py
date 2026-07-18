@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.nn as nn
 
 from torchtitan_npu.converters.kernels import gmm as gmm_module
 from torchtitan_npu.models.deepseek_v4 import parallelize
@@ -20,6 +21,46 @@ _EXPERT_ACTIVATION_COMPILE_KEY_ATTR = "_expert_activation_compile_key"
 _RUN_GROUPED_MM_ATTR = "_run_experts_grouped_mm"
 _GROUPED_MM_ATTR = "_grouped_mm"
 _DYNAMO_ATTR = "_dynamo"
+
+
+@pytest.mark.parametrize(
+    ("requires_graph_break", "pre_attention_fullgraph"),
+    [(False, True), (True, False)],
+)
+def test_compile_respects_module_graph_break_requirement(
+    monkeypatch,
+    requires_graph_break,
+    pre_attention_fullgraph,
+):
+    module = nn.Module()
+    pre_attention = nn.Identity()
+    projection = nn.Identity()
+    inner_attention = nn.Identity()
+    module.add_module("pre_attention", pre_attention)
+    module.add_module("projection", projection)
+    module.add_module("inner_attention", inner_attention)
+    if requires_graph_break:
+        setattr(pre_attention, "_requires_compile_graph_break", True)
+
+    compile_calls = []
+
+    def fake_compile(child, *, backend, fullgraph):
+        compile_calls.append((child, backend, fullgraph))
+        return child
+
+    monkeypatch.setattr(torch, "compile", fake_compile)
+
+    compile_config = SimpleNamespace(backend="inductor_npu")
+    parallelize._compile_children_except(
+        module,
+        {"inner_attention"},
+        compile_config,
+    )
+
+    assert compile_calls == [
+        (pre_attention, "inductor_npu", pre_attention_fullgraph),
+        (projection, "inductor_npu", True),
+    ]
 
 
 def _new_npu_grouped_experts() -> gmm_module.NpuGroupedExperts:
@@ -224,3 +265,5 @@ def test_parallelize_selective_ac_wires_grouped_mm_save(
     assert save_ops_calls == [expected_save_ops]
     assert len(bridge_compile_calls) == int(compile_enabled and gmm_enabled)
     assert len(model_compile_calls) == int(compile_enabled)
+    if compile_enabled:
+        assert model_compile_calls[0][1] == {}
