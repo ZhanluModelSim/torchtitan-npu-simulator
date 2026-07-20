@@ -10,8 +10,9 @@ from __future__ import annotations
 import dataclasses
 from collections.abc import Callable
 
-from torchtitan_npu.config.configs import TrainerConfig
 from torchtitan_npu.models.deepseek_v4.config_registry import (
+    TrainerConfig as DeepSeekV4TrainerConfig,
+    _apply_mxfp8_fqns_override,
     deepseek_v4_flash_baseline_bf16 as _deepseek_v4_flash_baseline_bf16,
     deepseek_v4_flash_baseline_mxfp8 as _deepseek_v4_flash_baseline_mxfp8,
     deepseek_v4_pro_20t_baseline_bf16 as _deepseek_v4_pro_20t_baseline_bf16,
@@ -23,17 +24,25 @@ from torchtitan_npu.models.deepseek_v4.config_registry import (
 from torchtitan_npu.simulator.trainer import SimulationConfig, SimulationTrainerConfig
 
 
+@dataclasses.dataclass(kw_only=True, slots=True)
+class DeepSeekV4SimulationTrainerConfig(SimulationTrainerConfig):
+    mxfp8_fqns: list[str] | None = None
+
+    def __post_init__(self) -> None:
+        _apply_mxfp8_fqns_override(self.model_converters, self.mxfp8_fqns)
+
+
 def _simulation_config(
-    factory: Callable[[], TrainerConfig],
+    factory: Callable[[], DeepSeekV4TrainerConfig],
     *,
     output_name: str,
-) -> SimulationTrainerConfig:
+) -> DeepSeekV4SimulationTrainerConfig:
     base_config = factory()
     base_fields = {field.name: getattr(base_config, field.name) for field in dataclasses.fields(base_config)}
     # Simulator capture requires eager dispatch. This must be disabled before
     # entry.py performs its compile dependency checks.
     base_fields["compile"] = dataclasses.replace(base_config.compile, enable=False)
-    return SimulationTrainerConfig(
+    return DeepSeekV4SimulationTrainerConfig(
         **base_fields,
         simulation=SimulationConfig(output_dir=f"./simulator_output/{output_name}"),
     )

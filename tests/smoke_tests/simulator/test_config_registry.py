@@ -9,6 +9,8 @@ import pytest
 
 torch_npu = pytest.importorskip("torch_npu", reason="requires torch_npu + CANN")
 
+from torchtitan.components.quantization.mx import MXFP8Converter  # noqa: E402
+from torchtitan.config import ConfigManager  # noqa: E402
 from torchtitan_npu.models.deepseek_v4 import config_registry as model_configs  # noqa: E402
 from torchtitan_npu.simulator import config_registry as simulator_configs  # noqa: E402
 
@@ -38,3 +40,42 @@ def test_simulator_config_preserves_training_config(config_name):
 
     assert sim_config.simulation.output_dir == f"./simulator_output/{config_name}"
     assert sim_config.simulation.world_size is None
+
+
+@pytest.mark.parametrize(
+    "module",
+    ("torchtitan_npu.models.deepseek_v4", "torchtitan_npu.simulator"),
+)
+def test_mxfp8_fqns_cli_override(module):
+    config = ConfigManager().parse_args(
+        [
+            "--module",
+            module,
+            "--config",
+            "deepseek_v4_flash_baseline_mxfp8",
+            "--mxfp8-fqns",
+            "moe.experts,post_attention.wo_a",
+        ]
+    )
+
+    mxfp8_configs = [
+        converter
+        for converter in config.model_converters.converters
+        if isinstance(converter, MXFP8Converter.Config)
+    ]
+    assert len(mxfp8_configs) == 1
+    assert mxfp8_configs[0].fqns == ["moe.experts", "post_attention.wo_a"]
+
+
+def test_mxfp8_fqns_cli_override_requires_mxfp8_recipe():
+    with pytest.raises(ValueError, match="requires exactly one MXFP8 converter"):
+        ConfigManager().parse_args(
+            [
+                "--module",
+                "torchtitan_npu.models.deepseek_v4",
+                "--config",
+                "deepseek_v4_flash_baseline_bf16",
+                "--mxfp8-fqns",
+                "moe.experts",
+            ]
+        )

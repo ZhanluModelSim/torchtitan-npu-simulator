@@ -4,6 +4,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from dataclasses import dataclass
+
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.quantization.mx import MXFP8Converter
@@ -21,12 +23,42 @@ from torchtitan_npu.config.configs import (
     OptimizerConfig,
     ParallelismConfig,
     ProfilingConfig,
-    TrainerConfig,
+    TrainerConfig as NpuTrainerConfig,
     TrainingConfig,
 )
 from torchtitan_npu.converters import get_model_converter_config
 
 from . import model_registry
+
+
+@dataclass(kw_only=True, slots=True)
+class TrainerConfig(NpuTrainerConfig):
+    """DeepSeek V4 config with a stable MXFP8 FQN CLI override."""
+
+    mxfp8_fqns: list[str] | None = None
+
+    def __post_init__(self) -> None:
+        _apply_mxfp8_fqns_override(self.model_converters, self.mxfp8_fqns)
+
+
+def _apply_mxfp8_fqns_override(
+    model_converters: ModelConvertersContainer.Config,
+    fqns: list[str] | None,
+) -> None:
+    if fqns is None:
+        return
+
+    mxfp8_configs = [
+        converter
+        for converter in model_converters.converters
+        if isinstance(converter, MXFP8Converter.Config)
+    ]
+    if len(mxfp8_configs) != 1:
+        raise ValueError(
+            "mxfp8_fqns requires exactly one MXFP8 converter, "
+            f"but found {len(mxfp8_configs)}"
+        )
+    mxfp8_configs[0].fqns = list(fqns)
 
 
 def _default_converters(*, enable_mxfp8: bool) -> list:
