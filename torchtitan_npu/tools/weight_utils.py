@@ -6,10 +6,10 @@
 import gc
 import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import torch
-from torch.distributed.tensor import DTensor
+from torch.distributed.tensor import DTensor, Replicate, Shard
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +98,13 @@ def split_fused_experts(state_dict: dict) -> dict:
     return result
 
 
+def _take_local_shard(tensor, device_mesh, placements, dim):
+    for mesh_dim, placement in enumerate(placements):
+        if isinstance(placement, Shard) and placement.dim == dim:
+            tensor = torch.chunk(tensor, device_mesh.size(mesh_dim), dim=dim)[device_mesh.get_local_rank(mesh_dim)]
+    return tensor
+
+
 def _fuse_w1_w3_dtensor(w1: DTensor, w3: DTensor) -> DTensor:
     """fuse DTensor via cpu"""
     if w1.device_mesh != w3.device_mesh:
@@ -106,6 +113,28 @@ def _fuse_w1_w3_dtensor(w1: DTensor, w3: DTensor) -> DTensor:
         raise ValueError(f"w1 and w3 must have the same placements. Got w1: {w1.placements}, w3: {w3.placements}")
     device_mesh = w1.device_mesh
     placements = w1.placements
+
+    if any(isinstance(placement, Shard) and placement.dim == 1 for placement in placements):
+        fused_shape = torch.Size((*w1.shape[:1], w1.shape[1] + w3.shape[1], *w1.shape[2:]))
+        fused_stride = torch.empty(fused_shape, device="meta").stride()
+        # Gather one source at a time so the full fused weight never resides on NPU.
+        replicated_placements = tuple(
+            Replicate() if isinstance(placement, Shard) and placement.dim == 1 else placement
+            for placement in placements
+        )
+        w1_cpu = w1.redistribute(device_mesh, placements=replicated_placements).to_local().cpu()
+        w3_cpu = w3.redistribute(device_mesh, placements=replicated_placements).to_local().cpu()
+        fused_cpu = torch.cat((w1_cpu, w3_cpu), dim=1)
+        del w1_cpu, w3_cpu
+        gc.collect()
+        fused_cpu = _take_local_shard(fused_cpu, device_mesh, placements, dim=1)
+        return DTensor.from_local(
+            fused_cpu.to(w1.device),
+            device_mesh=device_mesh,
+            placements=placements,
+            shape=fused_shape,
+            stride=fused_stride,
+        )
 
     local_w1 = w1.to_local()
     local_w3 = w3.to_local()
@@ -165,6 +194,52 @@ def _fuse_w1_w3_tensor(w1: torch.Tensor, w3: torch.Tensor) -> torch.Tensor:
 
 def _split_w13_dtensor(w13: DTensor) -> tuple[DTensor, DTensor]:
     """split DTensor"""
+    if any(isinstance(placement, Shard) and placement.dim == 1 for placement in w13.placements):
+        sharded_mesh_dims = [
+            mesh_dim
+            for mesh_dim, placement in enumerate(w13.placements)
+            if isinstance(placement, Shard) and placement.dim == 1
+        ]
+        # The view-based path is valid when one mesh dimension separates the two fused halves.
+        if len(sharded_mesh_dims) != 1 or w13.device_mesh.size(sharded_mesh_dims[0]) != 2:
+            replicated_placements = tuple(
+                Replicate() if isinstance(placement, Shard) and placement.dim == 1 else placement
+                for placement in w13.placements
+            )
+            w13_cpu = w13.redistribute(w13.device_mesh, placements=replicated_placements).to_local().cpu()
+            w1_cpu, w3_cpu = torch.chunk(w13_cpu, 2, dim=1)
+            w1_cpu = _take_local_shard(w1_cpu, w13.device_mesh, w13.placements, dim=1)
+            w3_cpu = _take_local_shard(w3_cpu, w13.device_mesh, w13.placements, dim=1)
+            weight_shape = torch.Size((*w13.shape[:1], w13.shape[1] // 2, *w13.shape[2:]))
+            weight_stride = torch.empty(weight_shape, device="meta").stride()
+            return (
+                DTensor.from_local(
+                    w1_cpu.to(w13.device),
+                    device_mesh=w13.device_mesh,
+                    placements=w13.placements,
+                    shape=weight_shape,
+                    stride=weight_stride,
+                ),
+                DTensor.from_local(
+                    w3_cpu.to(w13.device),
+                    device_mesh=w13.device_mesh,
+                    placements=w13.placements,
+                    shape=weight_shape,
+                    stride=weight_stride,
+                ),
+            )
+
+        split_shape = (*w13.shape[:1], 2, w13.shape[1] // 2, *w13.shape[2:])
+        split_placements = tuple(
+            Shard(placement.dim + 1) if isinstance(placement, Shard) and placement.dim >= 1 else placement
+            for placement in w13.placements
+        )
+        split = cast("DTensor", w13.reshape(split_shape)).redistribute(
+            w13.device_mesh,
+            placements=split_placements,
+        )
+        return cast("tuple[DTensor, DTensor]", torch.unbind(split, dim=1))
+
     local_tensor = w13.to_local()
     chunks = torch.chunk(local_tensor, 2, dim=1)
     local_w1 = chunks[0]

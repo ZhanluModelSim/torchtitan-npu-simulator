@@ -3,13 +3,54 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
+import pytest
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor import Shard, distribute_tensor
 
 import torchtitan_npu.tools.weight_utils as weight_utils
 from torchtitan_npu.tools.weight_utils import (
+    _fuse_w1_w3_dtensor,
+    _split_w13_dtensor,
     _split_w13_for_mapping,
     convert_expert_format,
     detect_expert_format,
 )
+
+
+def _run_dtensor_fuse_split_test(rank, world_size, init_file):
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=world_size,
+    )
+    try:
+        mesh = init_device_mesh("cpu", (world_size,))
+        w1_full = torch.arange(2 * 5 * 4).reshape(2, 5, 4)
+        w3_full = w1_full + 1000
+        w1 = distribute_tensor(w1_full, mesh, [Shard(1)])
+        w3 = distribute_tensor(w3_full, mesh, [Shard(1)])
+
+        w13 = _fuse_w1_w3_dtensor(w1, w3)
+        expected_w13 = torch.cat((w1_full, w3_full), dim=1)
+
+        assert w13.placements == (Shard(1),)
+        assert w13.shape == expected_w13.shape
+        assert torch.equal(w13.to_local(), torch.chunk(expected_w13, world_size, dim=1)[rank])
+        assert torch.equal(w13.full_tensor(), expected_w13)
+
+        split_w1, split_w3 = _split_w13_dtensor(w13)
+
+        assert split_w1.placements == (Shard(1),)
+        assert split_w3.placements == (Shard(1),)
+        assert torch.equal(split_w1.to_local(), torch.chunk(w1_full, world_size, dim=1)[rank])
+        assert torch.equal(split_w3.to_local(), torch.chunk(w3_full, world_size, dim=1)[rank])
+        assert torch.equal(split_w1.full_tensor(), w1_full)
+        assert torch.equal(split_w3.full_tensor(), w3_full)
+    finally:
+        dist.destroy_process_group()
 
 
 def test_detect_expert_format_returns_none_for_non_moe_weights():
@@ -118,6 +159,16 @@ def test_convert_expert_format_splits_dtensor_w13_with_placements(monkeypatch):
     assert captured_calls[1]["placements"] == ("shard",)
     assert result["model.layers.0.moe.experts.w1"].to_local().shape == (2, 4, 8)
     assert result["model.layers.0.moe.experts.w3"].to_local().shape == (2, 4, 8)
+
+
+@pytest.mark.parametrize("world_size", [2, 3])
+def test_dtensor_fuse_and_split_preserve_sharded_concat_dimension(tmp_path, world_size):
+    mp.spawn(
+        _run_dtensor_fuse_split_test,
+        args=(world_size, tmp_path / f"dist_init_{world_size}"),
+        nprocs=world_size,
+        join=True,
+    )
 
 
 def test_split_w13_for_mapping_dtensor_uses_views_without_losing_values(monkeypatch):
