@@ -196,6 +196,29 @@ class TokenChoiceTopKRouter(common_moe.TokenChoiceTopKRouter):
             )
 
 
+class DeepSeekV4FeedForward(FeedForward):
+    """SwiGLU FFN with DeepSeek-V4 gate/up clamp for the shared expert.
+
+    The official DeepSeek-V4 implementation applies ``swiglu_limit`` to both
+    routed and shared experts before the SwiGLU activation. Routed experts get
+    the clamp via ``npu_gmm`` (see converters/kernels/gmm.py); the shared
+    expert must apply it here because the upstream ``FeedForward`` has no
+    clamp. ``w1/w2/w3`` parameter names and the inherited ``Config`` are kept
+    so state_dict mapping and the TP plan (``moe.shared_experts.w1/w2/w3``)
+    remain unchanged.
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(FeedForward.Config):
+        pass
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        limit = float(self.swiglu_limit)  # pyrefly: ignore [bad-argument-type]
+        gate = torch.clamp(self.w1(x), max=limit)
+        up = torch.clamp(self.w3(x), min=-limit, max=limit)
+        return self.w2(F.silu(gate) * up)
+
+
 class MoE(Module):
     """DSV4 token-choice MoE (hash routing optional). Mirrors upstream MoE wiring."""
 
@@ -245,7 +268,7 @@ class MoE(Module):
         n_shared = moe_args.num_shared_experts
         if n_shared > 0:
             shared_hidden = hidden_dim * n_shared
-            self.shared_experts = FeedForward.Config(
+            self.shared_experts = DeepSeekV4FeedForward.Config(
                 w1=Linear.Config(
                     in_features=dim,
                     out_features=shared_hidden,
@@ -262,6 +285,7 @@ class MoE(Module):
                     bias=False,
                 ),
             ).build()
+            self.shared_experts.swiglu_limit = moe_args.swiglu_limit
         else:
             self.shared_experts = None
 
