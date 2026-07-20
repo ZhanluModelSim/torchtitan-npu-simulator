@@ -37,7 +37,7 @@ def _compile_requires_bypass_triton_codegen(model_name: str) -> bool:
     return not _uses_inductor_npu_ext(model_name)
 
 
-def _resolve_simulator_runtime(config):  # noqa: ANN001, ANN202
+def _resolve_simulator_runtime(config, cli_args=None):  # noqa: ANN001, ANN202
     """Resolve simulator-only runtime state from the final parsed config."""
     if not hasattr(config, "simulation"):
         return None
@@ -46,21 +46,23 @@ def _resolve_simulator_runtime(config):  # noqa: ANN001, ANN202
         resolve_simulation_runtime_from_environment,
     )
 
-    return resolve_simulation_runtime_from_environment(config)
+    return resolve_simulation_runtime_from_environment(config, cli_args=cli_args)
 
 
-def _parse_config():  # noqa: ANN202
+def _parse_config(cli_args=None):  # noqa: ANN001, ANN202
     # ConfigManager's default argument captures sys.argv at module import
     # time. Read the current argv explicitly for embedded launchers.
-    return ConfigManager().parse_args(sys.argv[1:])
+    args = sys.argv[1:] if cli_args is None else cli_args
+    return ConfigManager().parse_args(args)
 
 
 def main() -> None:
     """Main entry point for NPU training with new config system."""
     init_logger()
 
-    config = _parse_config()
-    _resolve_simulator_runtime(config)
+    cli_args = sys.argv[1:]
+    config = _parse_config(cli_args)
+    _resolve_simulator_runtime(config, cli_args)
 
     trainer = None
 

@@ -198,7 +198,7 @@ def _resolve_launch_config(entry_args: list[str]):  # noqa: ANN202
     )
 
     config = ConfigManager().parse_args(entry_args)
-    runtime = resolve_simulation_runtime_from_environment(config)
+    runtime = resolve_simulation_runtime_from_environment(config, cli_args=entry_args)
     return config, runtime
 
 

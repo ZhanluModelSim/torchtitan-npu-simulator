@@ -187,7 +187,7 @@ NGPU=384 python3 -m torchtitan_npu.entry \
 ```
 
 > [!NOTE]
-> - `simulation.world_size` 指定模拟的**总卡数**，可通过 `--simulation.world-size` 覆盖；未配置时回退到 `NGPU`。
+> - `simulation.world_size` 指定模拟的**总卡数**。优先级为显式 `--simulation.world-size` > 启动环境 `NGPU` > 配置函数默认值；解析结果会在构建 mesh 前写回配置。
 > - 最终 PP=1 时自动使用 `fake_backend`；最终 PP>1 时自动使用 `multi_proc_meta`。
 > - `--training.steps=1` 是默认值，Simulator 只捕获一个 step。
 > - `--hf_assets_path` 指定 tokenizer 路径，用仓库内置的 `deepseekv3_tokenizer` 即可（见上一步说明）。

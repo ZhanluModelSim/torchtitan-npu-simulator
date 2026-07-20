@@ -172,6 +172,24 @@ def test_resolve_launch_config_uses_fake_backend_after_pp_is_disabled(
     assert runtime.comm_mode == "fake_backend"
 
 
+def test_resolve_launch_config_ngpu_overrides_registry_world_size(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("NGPU", "32")
+    monkeypatch.delenv("TORCHTITAN_SIM_WORLD_SIZE", raising=False)
+    entry_args = launcher._build_entry_args(
+        "deepseek_v4_pro_simulate_16_layers_pp4_cp4",
+        "./tests/assets/tokenizer/deepseekv3_tokenizer",
+        [],
+    )
+
+    config, runtime = launcher._resolve_launch_config(entry_args)
+
+    assert runtime.world_size == 32
+    assert config.simulation.world_size == 32
+    assert config.parallelism.data_parallel_shard_degree == 2
+
+
 def test_resolve_launch_config_cli_world_size_wins_over_stale_environment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

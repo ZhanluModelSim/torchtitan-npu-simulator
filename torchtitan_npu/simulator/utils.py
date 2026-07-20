@@ -14,8 +14,9 @@ Usage:
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Sequence
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,17 +173,37 @@ def resolve_simulation_runtime(
     )
 
 
-def resolve_simulation_runtime_from_environment(config: Any) -> SimulationRuntime:
-    """Resolve runtime, using environment only when config cannot provide it."""
+def _has_explicit_world_size(cli_args: Sequence[str]) -> bool:
+    """Return whether the simulator world size was explicitly set on the CLI."""
+    option_names = ("--simulation.world-size", "--simulation.world_size")
+    return any(
+        arg == option or arg.startswith(f"{option}=")
+        for arg in cli_args
+        for option in option_names
+    )
+
+
+def resolve_simulation_runtime_from_environment(
+    config: Any,
+    *,
+    cli_args: Sequence[str] | None = None,
+) -> SimulationRuntime:
+    """Resolve runtime before mesh construction.
+
+    An explicit CLI value has the highest priority. Otherwise ``NGPU`` is the
+    launcher's world-size input and overrides registry defaults. The internal
+    environment variable is only a fallback for spawned workers.
+    """
+    args = sys.argv[1:] if cli_args is None else cli_args
     internal_world_size = os.environ.get("TORCHTITAN_SIM_WORLD_SIZE")
     configured_world_size = get_world_size(config)
     ngpu_world_size = os.environ.get("NGPU")
-    if configured_world_size > 0:
+    if _has_explicit_world_size(args):
         world_size = configured_world_size
-    elif internal_world_size:
-        world_size = int(internal_world_size)
     elif ngpu_world_size:
         world_size = int(ngpu_world_size)
+    elif internal_world_size:
+        world_size = int(internal_world_size)
     else:
         world_size = configured_world_size
     runtime = resolve_simulation_runtime(config, world_size=world_size)

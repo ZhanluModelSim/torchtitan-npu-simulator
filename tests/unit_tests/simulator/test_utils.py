@@ -12,6 +12,7 @@ import pytest
 from torchtitan_npu.simulator.utils import (
     get_world_size,
     resolve_simulation_runtime,
+    resolve_simulation_runtime_from_environment,
 )
 
 
@@ -102,3 +103,32 @@ def test_runtime_rejects_invalid_expert_mesh() -> None:
 
     with pytest.raises(ValueError, match=r"EP\*ETP .* must divide"):
         resolve_simulation_runtime(config)
+
+
+def test_ngpu_overrides_registry_world_size_before_auto_dp_resolution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(pp=4, cp=4, dp_shard=-1, world_size=384)
+    monkeypatch.setenv("NGPU", "64")
+    monkeypatch.delenv("TORCHTITAN_SIM_WORLD_SIZE", raising=False)
+
+    runtime = resolve_simulation_runtime_from_environment(config, cli_args=[])
+
+    assert runtime.world_size == 64
+    assert config.simulation.world_size == 64
+    assert config.parallelism.data_parallel_shard_degree == 4
+
+
+def test_explicit_cli_world_size_overrides_ngpu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(pp=4, cp=4, dp_shard=-1, world_size=32)
+    monkeypatch.setenv("NGPU", "64")
+
+    runtime = resolve_simulation_runtime_from_environment(
+        config,
+        cli_args=["--simulation.world-size", "32"],
+    )
+
+    assert runtime.world_size == 32
+    assert config.parallelism.data_parallel_shard_degree == 2
