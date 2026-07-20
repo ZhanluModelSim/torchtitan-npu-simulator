@@ -17,7 +17,6 @@ from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
 from torchtitan.protocols.model_converter import ModelConvertersContainer
 
 from torchtitan_npu.config.configs import (
-    ChatDataLoaderConfig,
     CheckpointConfig,
     OptimizerConfig,
     ParallelismConfig,
@@ -26,14 +25,12 @@ from torchtitan_npu.config.configs import (
     TrainingConfig,
 )
 from torchtitan_npu.converters import get_model_converter_config
-from torchtitan_npu.patches.encoders.dsv4 import DSV4EncoderConfig
 
 from . import model_registry
 
 
-def _default_converters() -> list:
-    return [
-        # Migrated to the new ModelCustomConfig registry by upstream MR !144.
+def _default_converters(*, enable_mxfp8: bool) -> list:
+    converters = [
         get_model_converter_config("npu_rms_norm"),
         get_model_converter_config("npu_moe_dispatch"),
         get_model_converter_config("npu_gmm"),
@@ -41,175 +38,88 @@ def _default_converters() -> list:
         get_model_converter_config("npu_smla"),
         get_model_converter_config("npu_mhc_pre"),
     ]
+    if enable_mxfp8:
+        converters.append(
+            MXFP8Converter.Config(
+                recipe_name="mxfp8_rceil",
+                fqns=[
+                    "pre_attention.wq_a",
+                    "pre_attention.wq_b",
+                    "pre_attention.wkv",
+                    "pre_attention.indexer.wq_b",
+                    "pre_attention.indexer.weights_proj",
+                    "post_attention.wo_a",
+                    "post_attention.wo_b",
+                    "moe.experts",
+                    "moe.shared_experts",
+                    "e_proj",
+                    "h_proj",
+                ],
+            )
+        )
+    return converters
 
 
-def _enable_all_converters() -> list:
-    return [
-        get_model_converter_config("npu_rms_norm"),
-        get_model_converter_config("npu_moe_dispatch"),
-        get_model_converter_config("npu_gmm"),
-        get_model_converter_config("npu_rope"),
-        get_model_converter_config("npu_smla"),
-        get_model_converter_config("npu_mhc_pre"),
-        get_model_converter_config("npu_mhc_post"),
-    ]
-
-
-def deepseek_v4_flash_single_server_16_experts_43_layers_bf16() -> TrainerConfig:
-    return TrainerConfig(
-        hf_assets_path="./tests/assets/tokenizer/deepseekv4_tokenizer",
-        model_spec=model_registry("v4_flash_debug_16_experts_43_layers"),
-        debug=DebugConfig(print_config=True, moe_force_load_balance=True),
-        model_converters=ModelConvertersContainer.Config(converters=_enable_all_converters()),
-        metrics=MetricsProcessor.Config(log_freq=1),
-        dataloader=HuggingFaceTextDataLoader.Config(dataset="c4_test"),
-        optimizer=OptimizerConfig(
-            name="AdamW",
-            lr=1e-5,
-            eps=1e-6,
-            swap_optimizer=True,
-        ),
-        lr_scheduler=LRSchedulersContainer.Config(
-            warmup_steps=4,
-            decay_ratio=0.8,
-            decay_type="cosine",
-            min_lr_factor=0.01,
-        ),
-        training=TrainingConfig(
-            local_batch_size=1,
-            seq_len=4096,
-            max_norm=1.0,
-            steps=20,
-            num_mtp_modules=1,
-        ),
-        parallelism=ParallelismConfig(
-            data_parallel_replicate_degree=1,
-            data_parallel_shard_degree=-1,
-            fsdp_reshard_after_forward="always",
-            tensor_parallel_degree=1,
-            enable_async_tensor_parallel=False,
-            pipeline_parallel_degree=1,
-            pipeline_parallel_schedule="1F1B",
-            expert_parallel_degree=8,
-            expert_tensor_parallel_degree=1,
-            context_parallel_degree=1,
-        ),
-        checkpoint=CheckpointConfig(
-            enable=False,
-            folder="checkpoint",
-            load_step=0,
-            interval=500,
-            last_save_model_only=True,
-            load_only=True,
-            initial_load_in_hf=False,
-            initial_load_path="/data/models/dsv4_bf16",
-            export_dtype="float32",
-            async_mode="disabled",
-        ),
-        activation_checkpoint=ActivationCheckpointConfig(mode="full"),
-        compile=CompileConfig(enable=False, components=["model", "loss"]),
-        profiling=ProfilingConfig(enable_profiling=False),
+def _adamw_optimizer() -> OptimizerConfig:
+    return OptimizerConfig(
+        name="AdamW",
+        lr=1e-5,
+        eps=1e-6,
+        swap_optimizer=True,
     )
 
 
-def deepseek_v4_flash_single_server_16_experts_43_layers_mxfp8() -> TrainerConfig:
-    return TrainerConfig(
-        hf_assets_path="./tests/assets/tokenizer/deepseekv4_tokenizer",
-        model_spec=model_registry("v4_flash_debug_16_experts_43_layers"),
-        debug=DebugConfig(print_config=True, moe_force_load_balance=True),
-        model_converters=ModelConvertersContainer.Config(
-            converters=[
-                *_enable_all_converters(),
-                MXFP8Converter.Config(
-                    recipe_name="mxfp8_rceil",
-                    fqns=[
-                        "pre_attention.wq_a",
-                        "pre_attention.wq_b",
-                        "pre_attention.wkv",
-                        "pre_attention.indexer.wq_b",
-                        "pre_attention.indexer.weights_proj",
-                        "post_attention.wo_a",
-                        "post_attention.wo_b",
-                        "moe.experts",
-                        "moe.shared_experts",
-                        "e_proj",
-                        "h_proj",
-                    ],
-                ),
-            ]
-        ),
-        metrics=MetricsProcessor.Config(log_freq=1),
-        dataloader=HuggingFaceTextDataLoader.Config(dataset="c4_test"),
-        optimizer=OptimizerConfig(
-            name="AdamW",
-            lr=1e-5,
-            eps=1e-6,
-            swap_optimizer=True,
-        ),
-        lr_scheduler=LRSchedulersContainer.Config(
-            warmup_steps=4,
-            decay_ratio=0.8,
-            decay_type="cosine",
-            min_lr_factor=0.01,
-        ),
-        training=TrainingConfig(
-            local_batch_size=1,
-            seq_len=4096,
-            max_norm=1.0,
-            steps=20,
-            num_mtp_modules=1,
-        ),
-        parallelism=ParallelismConfig(
-            data_parallel_replicate_degree=1,
-            data_parallel_shard_degree=-1,
-            fsdp_reshard_after_forward="always",
-            tensor_parallel_degree=1,
-            enable_async_tensor_parallel=False,
-            pipeline_parallel_degree=1,
-            pipeline_parallel_schedule="1F1B",
-            expert_parallel_degree=8,
-            expert_tensor_parallel_degree=1,
-            context_parallel_degree=1,
-        ),
-        checkpoint=CheckpointConfig(
-            enable=False,
-            folder="checkpoint",
-            load_step=0,
-            interval=500,
-            last_save_model_only=True,
-            load_only=True,
-            initial_load_in_hf=False,
-            initial_load_path="/data/models/dsv4_bf16",
-            export_dtype="float32",
-            async_mode="disabled",
-        ),
-        activation_checkpoint=ActivationCheckpointConfig(mode="full"),
-        compile=CompileConfig(enable=False, components=["model", "loss"]),
-        profiling=ProfilingConfig(enable_profiling=False),
+def _lr_scheduler(*, warmup_steps: int) -> LRSchedulersContainer.Config:
+    return LRSchedulersContainer.Config(
+        warmup_steps=warmup_steps,
+        decay_ratio=0.8,
+        decay_type="cosine",
+        min_lr_factor=0.01,
     )
 
 
-def deepseek_v4_flash_43layers_4k_128die() -> TrainerConfig:
+def _parallelism(*, expert_parallel_degree: int) -> ParallelismConfig:
+    return ParallelismConfig(
+        data_parallel_replicate_degree=1,
+        data_parallel_shard_degree=-1,
+        fsdp_reshard_after_forward="always",
+        tensor_parallel_degree=1,
+        enable_async_tensor_parallel=False,
+        pipeline_parallel_degree=1,
+        pipeline_parallel_schedule="1F1B",
+        expert_parallel_degree=expert_parallel_degree,
+        expert_tensor_parallel_degree=1,
+        context_parallel_degree=1,
+    )
+
+
+def _profiling() -> ProfilingConfig:
+    return ProfilingConfig(
+        enable_profiling=False,
+        enable_online_parse=False,
+        profile_ranks=[0],
+        profile_step_start=6,
+        profile_step_end=7,
+        profile_record_shapes=True,
+        profile_with_memory=True,
+        enable_memory_snapshot=False,
+        save_memory_snapshot_folder="memory_snapshot",
+    )
+
+
+def _flash_baseline(*, enable_mxfp8: bool) -> TrainerConfig:
     return TrainerConfig(
         hf_assets_path="./tests/assets/tokenizer/deepseekv4_tokenizer",
-        model_spec=model_registry("v4_flash_debug_256_experts_43_layers"),
+        model_spec=model_registry("v4_flash_baseline"),
         debug=DebugConfig(print_config=True),
         comm=CommConfig(trace_buf_size=0),
-        model_converters=ModelConvertersContainer.Config(converters=_default_converters()),
+        model_converters=ModelConvertersContainer.Config(
+            converters=_default_converters(enable_mxfp8=enable_mxfp8)
+        ),
         metrics=MetricsProcessor.Config(log_freq=1),
         dataloader=HuggingFaceTextDataLoader.Config(dataset="c4_test"),
-        optimizer=OptimizerConfig(
-            name="AdamW",
-            lr=1e-5,
-            eps=1e-6,
-            swap_optimizer=True,
-        ),
-        lr_scheduler=LRSchedulersContainer.Config(
-            warmup_steps=400,
-            decay_ratio=0.8,
-            decay_type="cosine",
-            min_lr_factor=0.01,
-        ),
+        optimizer=_adamw_optimizer(),
+        lr_scheduler=_lr_scheduler(warmup_steps=400),
         training=TrainingConfig(
             global_batch_size=1024,
             local_batch_size=1,
@@ -218,18 +128,7 @@ def deepseek_v4_flash_43layers_4k_128die() -> TrainerConfig:
             steps=2000,
             num_mtp_modules=1,
         ),
-        parallelism=ParallelismConfig(
-            data_parallel_replicate_degree=1,
-            data_parallel_shard_degree=-1,
-            fsdp_reshard_after_forward="always",
-            tensor_parallel_degree=1,
-            enable_async_tensor_parallel=False,
-            pipeline_parallel_degree=1,
-            pipeline_parallel_schedule="1F1B",
-            expert_parallel_degree=64,
-            expert_tensor_parallel_degree=1,
-            context_parallel_degree=1,
-        ),
+        parallelism=_parallelism(expert_parallel_degree=32),
         checkpoint=CheckpointConfig(
             enable=False,
             folder="checkpoint",
@@ -243,169 +142,31 @@ def deepseek_v4_flash_43layers_4k_128die() -> TrainerConfig:
         ),
         activation_checkpoint=ActivationCheckpointConfig(mode="full"),
         compile=CompileConfig(enable=False, components=["model", "loss"]),
-        profiling=ProfilingConfig(
-            enable_profiling=False,
-            enable_online_parse=False,
-            profile_ranks=[0],
-            profile_step_start=6,
-            profile_step_end=7,
-            profile_record_shapes=True,
-            profile_with_memory=True,
-        ),
+        profiling=_profiling(),
     )
 
 
-def deepseek_v4_flash_single_server_16_experts_43_layers_muon() -> TrainerConfig:
-    return TrainerConfig(
-        hf_assets_path="./tests/assets/tokenizer/deepseekv4_tokenizer",
-        model_spec=model_registry("v4_flash_debug_16_experts_43_layers"),
-        debug=DebugConfig(print_config=True, moe_force_load_balance=True),
-        model_converters=ModelConvertersContainer.Config(converters=_enable_all_converters()),
-        metrics=MetricsProcessor.Config(log_freq=1),
-        dataloader=HuggingFaceTextDataLoader.Config(dataset="c4_test"),
-        optimizer=OptimizerConfig(
-            name="Muon",
-            lr=2.2e-4,
-            weight_decay=0.1,
-            muon_momentum=0.95,
-            muon_enable_nesterov=True,
-            muon_ns_steps=10,
-            muon_adjust_lr_fn="match_rms_adamw",
-            muon_hybrid_ns=True,
-            swap_optimizer=True,
-            swap_merge_buckets=4,
-        ),
-        lr_scheduler=LRSchedulersContainer.Config(
-            warmup_steps=4,
-            decay_ratio=0.8,
-            decay_type="cosine",
-            min_lr_factor=0.01,
-        ),
-        training=TrainingConfig(
-            local_batch_size=1,
-            seq_len=4096,
-            max_norm=1.0,
-            steps=20,
-            num_mtp_modules=1,
-        ),
-        parallelism=ParallelismConfig(
-            data_parallel_replicate_degree=1,
-            data_parallel_shard_degree=-1,
-            fsdp_reshard_after_forward="always",
-            tensor_parallel_degree=1,
-            enable_async_tensor_parallel=False,
-            pipeline_parallel_degree=1,
-            pipeline_parallel_schedule="1F1B",
-            expert_parallel_degree=8,
-            expert_tensor_parallel_degree=1,
-            context_parallel_degree=1,
-        ),
-        checkpoint=CheckpointConfig(
-            enable=False,
-            folder="checkpoint",
-            load_step=0,
-            interval=500,
-            last_save_model_only=True,
-            load_only=True,
-            initial_load_in_hf=False,
-            initial_load_path="/data/models/dsv4_bf16",
-            export_dtype="float32",
-            async_mode="disabled",
-        ),
-        activation_checkpoint=ActivationCheckpointConfig(mode="full"),
-        compile=CompileConfig(enable=False, components=["model", "loss"]),
-        profiling=ProfilingConfig(enable_profiling=False),
-    )
+def deepseek_v4_flash_baseline_bf16() -> TrainerConfig:
+    return _flash_baseline(enable_mxfp8=False)
 
 
-def deepseek_v4_pro_debug_16_layers() -> TrainerConfig:
+def deepseek_v4_flash_baseline_mxfp8() -> TrainerConfig:
+    return _flash_baseline(enable_mxfp8=True)
+
+
+def _pro_baseline(*, enable_mxfp8: bool) -> TrainerConfig:
     return TrainerConfig(
         hf_assets_path="./tests/assets/tokenizer/deepseek_v4_pro_tokenizer",
-        model_spec=model_registry("v4_pro_debug_16_layers"),
-        debug=DebugConfig(print_config=True, moe_force_load_balance=True),
-        model_converters=ModelConvertersContainer.Config(converters=_default_converters()),
-        metrics=MetricsProcessor.Config(log_freq=1),
-        dataloader=HuggingFaceTextDataLoader.Config(dataset="c4_test"),
-        optimizer=OptimizerConfig(
-            name="AdamW",
-            lr=1e-5,
-            eps=1e-6,
-            swap_optimizer=True,
-        ),
-        lr_scheduler=LRSchedulersContainer.Config(
-            warmup_steps=4,
-            decay_ratio=0.8,
-            decay_type="cosine",
-            min_lr_factor=0.01,
-        ),
-        training=TrainingConfig(
-            local_batch_size=1,
-            seq_len=4096,
-            max_norm=1.0,
-            steps=20,
-            num_mtp_modules=1,
-        ),
-        parallelism=ParallelismConfig(
-            data_parallel_replicate_degree=1,
-            data_parallel_shard_degree=-1,
-            fsdp_reshard_after_forward="always",
-            tensor_parallel_degree=1,
-            enable_async_tensor_parallel=False,
-            pipeline_parallel_degree=1,
-            pipeline_parallel_schedule="1F1B",
-            expert_parallel_degree=16,
-            expert_tensor_parallel_degree=1,
-            context_parallel_degree=1,
-        ),
-        checkpoint=CheckpointConfig(
-            enable=False,
-            folder="checkpoint",
-            load_step=0,
-            interval=500,
-            last_save_model_only=True,
-            load_only=True,
-            initial_load_in_hf=False,
-            initial_load_path="/data/models/deepseek-v4-pro-bfloat16",
-            export_dtype="float32",
-            async_mode="disabled",
-        ),
-        activation_checkpoint=ActivationCheckpointConfig(mode="full"),
-        compile=CompileConfig(enable=False, components=["model", "loss"]),
-        profiling=ProfilingConfig(
-            enable_profiling=False,
-            enable_online_parse=False,
-            profile_ranks=[0],
-            profile_step_start=6,
-            profile_step_end=7,
-            profile_record_shapes=True,
-            profile_with_memory=True,
-            enable_memory_snapshot=False,
-            save_memory_snapshot_folder="memory_snapshot",
-        ),
-    )
-
-
-def deepseek_v4_pro_debug_61_layers_4k_384die() -> TrainerConfig:
-    return TrainerConfig(
-        hf_assets_path="./tests/assets/tokenizer/deepseek_v4_pro_tokenizer",
-        model_spec=model_registry("v4_pro_debug_61_layers"),
+        model_spec=model_registry("v4_pro_baseline"),
         debug=DebugConfig(print_config=True, moe_force_load_balance=True),
         comm=CommConfig(trace_buf_size=0),
-        model_converters=ModelConvertersContainer.Config(converters=_default_converters()),
+        model_converters=ModelConvertersContainer.Config(
+            converters=_default_converters(enable_mxfp8=enable_mxfp8)
+        ),
         metrics=MetricsProcessor.Config(log_freq=1),
         dataloader=HuggingFaceTextDataLoader.Config(dataset="c4_test"),
-        optimizer=OptimizerConfig(
-            name="AdamW",
-            lr=1e-5,
-            eps=1e-6,
-            swap_optimizer=True,
-        ),
-        lr_scheduler=LRSchedulersContainer.Config(
-            warmup_steps=400,
-            decay_ratio=0.8,
-            decay_type="cosine",
-            min_lr_factor=0.01,
-        ),
+        optimizer=_adamw_optimizer(),
+        lr_scheduler=_lr_scheduler(warmup_steps=400),
         training=TrainingConfig(
             global_batch_size=384,
             local_batch_size=1,
@@ -414,18 +175,7 @@ def deepseek_v4_pro_debug_61_layers_4k_384die() -> TrainerConfig:
             steps=2000,
             num_mtp_modules=1,
         ),
-        parallelism=ParallelismConfig(
-            data_parallel_replicate_degree=1,
-            data_parallel_shard_degree=-1,
-            fsdp_reshard_after_forward="always",
-            tensor_parallel_degree=1,
-            enable_async_tensor_parallel=False,
-            pipeline_parallel_degree=1,
-            pipeline_parallel_schedule="1F1B",
-            expert_parallel_degree=192,
-            expert_tensor_parallel_degree=1,
-            context_parallel_degree=1,
-        ),
+        parallelism=_parallelism(expert_parallel_degree=64),
         checkpoint=CheckpointConfig(
             enable=False,
             folder="checkpoint",
@@ -440,60 +190,30 @@ def deepseek_v4_pro_debug_61_layers_4k_384die() -> TrainerConfig:
         ),
         activation_checkpoint=ActivationCheckpointConfig(mode="full"),
         compile=CompileConfig(enable=True, components=["model", "loss"]),
-        profiling=ProfilingConfig(
-            enable_profiling=False,
-            enable_online_parse=False,
-            profile_ranks=[0],
-            profile_step_start=6,
-            profile_step_end=7,
-            profile_record_shapes=True,
-            profile_with_memory=True,
-            enable_memory_snapshot=False,
-            save_memory_snapshot_folder="memory_snapshot",
-        ),
+        profiling=_profiling(),
     )
 
 
-def deepseek_v4_pro_20t_baseline_fp8() -> TrainerConfig:
+def deepseek_v4_pro_baseline_bf16() -> TrainerConfig:
+    return _pro_baseline(enable_mxfp8=False)
+
+
+def deepseek_v4_pro_baseline_mxfp8() -> TrainerConfig:
+    return _pro_baseline(enable_mxfp8=True)
+
+
+def _pro_20t_baseline(*, enable_mxfp8: bool) -> TrainerConfig:
     return TrainerConfig(
         hf_assets_path="./tests/assets/tokenizer/deepseekv4_tokenizer",
         model_spec=model_registry("v4_pro_20t_baseline"),
         debug=DebugConfig(print_config=True, moe_force_load_balance=True),
         model_converters=ModelConvertersContainer.Config(
-            converters=[
-                *_enable_all_converters(),
-                MXFP8Converter.Config(
-                    recipe_name="mxfp8_rceil",
-                    fqns=[
-                        "pre_attention.wq_a",
-                        "pre_attention.wq_b",
-                        "pre_attention.wkv",
-                        "pre_attention.indexer.wq_b",
-                        "pre_attention.indexer.weights_proj",
-                        "post_attention.wo_a",
-                        "post_attention.wo_b",
-                        "moe.experts",
-                        "moe.shared_experts",
-                        "e_proj",
-                        "h_proj",
-                    ],
-                ),
-            ]
+            converters=_default_converters(enable_mxfp8=enable_mxfp8)
         ),
         metrics=MetricsProcessor.Config(log_freq=1),
         dataloader=HuggingFaceTextDataLoader.Config(dataset="c4_test"),
-        optimizer=OptimizerConfig(
-            name="AdamW",
-            lr=1e-5,
-            eps=1e-6,
-            swap_optimizer=True,
-        ),
-        lr_scheduler=LRSchedulersContainer.Config(
-            warmup_steps=4,
-            decay_ratio=0.8,
-            decay_type="cosine",
-            min_lr_factor=0.01,
-        ),
+        optimizer=_adamw_optimizer(),
+        lr_scheduler=_lr_scheduler(warmup_steps=4),
         training=TrainingConfig(
             global_batch_size=2048,
             local_batch_size=1,
@@ -502,18 +222,7 @@ def deepseek_v4_pro_20t_baseline_fp8() -> TrainerConfig:
             steps=20,
             num_mtp_modules=1,
         ),
-        parallelism=ParallelismConfig(
-            data_parallel_replicate_degree=1,
-            data_parallel_shard_degree=-1,
-            fsdp_reshard_after_forward="always",
-            tensor_parallel_degree=1,
-            enable_async_tensor_parallel=False,
-            pipeline_parallel_degree=1,
-            pipeline_parallel_schedule="1F1B",
-            expert_parallel_degree=8,
-            expert_tensor_parallel_degree=1,
-            context_parallel_degree=1,
-        ),
+        parallelism=_parallelism(expert_parallel_degree=256),
         checkpoint=CheckpointConfig(
             enable=False,
             folder="checkpoint",
@@ -530,6 +239,14 @@ def deepseek_v4_pro_20t_baseline_fp8() -> TrainerConfig:
         compile=CompileConfig(enable=False, components=["model", "loss"]),
         profiling=ProfilingConfig(enable_profiling=False),
     )
+
+
+def deepseek_v4_pro_20t_baseline_bf16() -> TrainerConfig:
+    return _pro_20t_baseline(enable_mxfp8=False)
+
+
+def deepseek_v4_pro_20t_baseline_mxfp8() -> TrainerConfig:
+    return _pro_20t_baseline(enable_mxfp8=True)
 
 
 def deepseek_v4_smoketest() -> TrainerConfig:
@@ -558,188 +275,9 @@ def deepseek_v4_smoketest() -> TrainerConfig:
             steps=2,
             num_mtp_modules=0,
         ),
-        parallelism=ParallelismConfig(
-            data_parallel_replicate_degree=1,
-            data_parallel_shard_degree=-1,
-            fsdp_reshard_after_forward="always",
-            tensor_parallel_degree=1,
-            enable_async_tensor_parallel=False,
-            pipeline_parallel_degree=1,
-            expert_parallel_degree=1,
-            expert_tensor_parallel_degree=1,
-            context_parallel_degree=1,
-        ),
+        parallelism=_parallelism(expert_parallel_degree=1),
         checkpoint=CheckpointConfig(enable=False),
         activation_checkpoint=ActivationCheckpointConfig(mode="none"),
-        compile=CompileConfig(enable=False, components=["model", "loss"]),
-        profiling=ProfilingConfig(enable_profiling=False),
-    )
-
-
-def sft_deepseek_v4_flash_debug_256_experts_43_layers_tau() -> TrainerConfig:
-    """SFT config for DeepSeek V4 flash debug (256 experts, 43 layers) on tau-bench-synthetic."""
-
-    def process_tau_sample(sample):
-        import json
-
-        # tau-bench stores messages/tools as JSON strings in parquet
-        raw_messages = sample["messages"]
-        messages = json.loads(raw_messages) if isinstance(raw_messages, str) else raw_messages
-        messages = [dict(m) for m in messages]
-
-        raw_tools = sample.get("tools", [])
-        tools = json.loads(raw_tools) if isinstance(raw_tools, str) else raw_tools
-
-        if tools:
-            if messages and messages[0].get("role") == "system":
-                messages[0] = dict(messages[0])
-                messages[0]["tools"] = tools
-            else:
-                messages.insert(0, {"role": "system", "content": "", "tools": tools})
-
-        return messages
-
-    return TrainerConfig(
-        hf_assets_path="./assets/hf/DeepSeek-V4-Flash-Base",
-        model_spec=model_registry("v4_flash_debug_256_experts_43_layers"),
-        debug=DebugConfig(print_config=True, moe_force_load_balance=False),
-        comm=CommConfig(trace_buf_size=0),
-        model_converters=ModelConvertersContainer.Config(converters=_default_converters()),
-        metrics=MetricsProcessor.Config(log_freq=1),
-        dataloader=ChatDataLoaderConfig(
-            dataset_path="/data/dataset/tau-historical-sft/processed_clean",
-            load_dataset_kwargs={
-                "data_files": "train-00000-of-00001.parquet",
-                "split": "train",
-            },
-            sample_processor=process_tau_sample,
-            chat_encoder=DSV4EncoderConfig(
-                encoding_module_path="./assets/hf/DeepSeek-V4-Flash-Base/encoding/encoding_dsv4.py",
-            ),
-        ),
-        optimizer=OptimizerConfig(
-            name="AdamW",
-            lr=1e-5,
-            eps=1e-6,
-            swap_optimizer=True,
-        ),
-        lr_scheduler=LRSchedulersContainer.Config(
-            warmup_steps=20,
-            decay_ratio=0.8,
-            decay_type="cosine",
-            min_lr_factor=0.01,
-        ),
-        training=TrainingConfig(
-            local_batch_size=1,
-            seq_len=16384,
-            max_norm=1.0,
-            steps=100,
-            num_mtp_modules=1,
-        ),
-        parallelism=ParallelismConfig(
-            data_parallel_replicate_degree=1,
-            data_parallel_shard_degree=-1,
-            fsdp_reshard_after_forward="always",
-            tensor_parallel_degree=1,
-            enable_async_tensor_parallel=False,
-            pipeline_parallel_degree=1,
-            pipeline_parallel_schedule="Interleaved1F1B",
-            expert_parallel_degree=64,
-            expert_tensor_parallel_degree=1,
-            context_parallel_degree=4,
-        ),
-        checkpoint=CheckpointConfig(
-            enable=True,
-            folder="checkpoint",
-            load_step=0,
-            interval=500,
-            last_save_model_only=True,
-            load_only=False,
-            initial_load_in_hf=True,
-            initial_load_path="/data/models/dsv4_flash_bf16",
-            export_dtype="bfloat16",
-            async_mode="disabled",
-        ),
-        activation_checkpoint=ActivationCheckpointConfig(mode="full"),
-        compile=CompileConfig(enable=False, components=["model", "loss"]),
-        profiling=ProfilingConfig(enable_profiling=False),
-    )
-
-
-def sft_deepseek_v4_flash_debug_256_experts_43_layers_gsm8k() -> TrainerConfig:
-    """SFT config for DeepSeek V4 flash debug (256 experts, 43 layers) on GSM8K."""
-
-    def process_gsm8k_sample(sample):
-        answer = sample["answer"]
-        reasoning, final_answer = answer.rsplit("####", 1)
-        return [
-            {"role": "user", "content": sample["question"]},
-            {
-                "role": "assistant",
-                "reasoning_content": reasoning.strip(),
-                "content": final_answer.strip(),
-            },
-        ]
-
-    return TrainerConfig(
-        hf_assets_path="./assets/hf/DeepSeek-V4-Flash-Base",
-        model_spec=model_registry("v4_flash_debug_256_experts_43_layers"),
-        debug=DebugConfig(print_config=True, moe_force_load_balance=False),
-        comm=CommConfig(trace_buf_size=0),
-        model_converters=ModelConvertersContainer.Config(converters=_default_converters()),
-        metrics=MetricsProcessor.Config(log_freq=1),
-        dataloader=ChatDataLoaderConfig(
-            dataset_path="/data/dataset/openai/gsm8k",
-            load_dataset_kwargs={"name": "main", "split": "train"},
-            sample_processor=process_gsm8k_sample,
-            chat_encoder=DSV4EncoderConfig(
-                encoding_module_path="./assets/hf/DeepSeek-V4-Flash-Base/encoding/encoding_dsv4.py",
-            ),
-        ),
-        optimizer=OptimizerConfig(
-            name="AdamW",
-            lr=1e-5,
-            eps=1e-6,
-            swap_optimizer=True,
-        ),
-        lr_scheduler=LRSchedulersContainer.Config(
-            warmup_steps=20,
-            decay_ratio=0.8,
-            decay_type="cosine",
-            min_lr_factor=0.01,
-        ),
-        training=TrainingConfig(
-            local_batch_size=1,
-            seq_len=1024,
-            max_norm=1.0,
-            steps=100,
-            num_mtp_modules=1,
-        ),
-        parallelism=ParallelismConfig(
-            data_parallel_replicate_degree=1,
-            data_parallel_shard_degree=-1,
-            fsdp_reshard_after_forward="always",
-            tensor_parallel_degree=1,
-            enable_async_tensor_parallel=False,
-            pipeline_parallel_degree=1,
-            pipeline_parallel_schedule="Interleaved1F1B",
-            expert_parallel_degree=64,
-            expert_tensor_parallel_degree=1,
-            context_parallel_degree=1,
-        ),
-        checkpoint=CheckpointConfig(
-            enable=True,
-            folder="checkpoint",
-            load_step=0,
-            interval=500,
-            last_save_model_only=True,
-            load_only=False,
-            initial_load_in_hf=True,
-            initial_load_path="/data/models/dsv4_flash_bf16",
-            export_dtype="bfloat16",
-            async_mode="disabled",
-        ),
-        activation_checkpoint=ActivationCheckpointConfig(mode="full"),
         compile=CompileConfig(enable=False, components=["model", "loss"]),
         profiling=ProfilingConfig(enable_profiling=False),
     )

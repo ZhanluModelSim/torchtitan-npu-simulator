@@ -3,8 +3,10 @@
 
 Usage:
     python3 scripts/run_simulator_spawn.py \
-        --config deepseek_v4_pro_simulate_16_layers_pp4_cp4 \
-        --hf_assets_path ./tests/assets/tokenizer/deepseekv3_tokenizer
+        --config deepseek_v4_pro_baseline_bf16 \
+        --parallelism.pipeline-parallel-degree 4 \
+        --training.num-mtp-modules 0 \
+        --simulation.world-size 256
 
 This script:
 1. Parses the config to determine PP degree (nproc_per_node) and world_size (NGPU)
@@ -14,11 +16,13 @@ This script:
 5. Each process writes its rank-local graph and returns a completion record
 
 Equivalent to:
-    NGPU=64 torchrun --nproc_per_node=4 -m torchtitan_npu.entry \
+    NGPU=256 torchrun --nproc_per_node=4 -m torchtitan_npu.entry \
         --module torchtitan_npu.simulator \
-        --config deepseek_v4_pro_simulate_16_layers_pp4_cp4 \
+        --config deepseek_v4_pro_baseline_bf16 \
+        --parallelism.pipeline-parallel-degree 4 \
+        --training.num-mtp-modules 0 \
         --training.steps=1 \
-        --hf_assets_path ./tests/assets/tokenizer/deepseekv3_tokenizer
+        --simulation.world-size 256
 """
 
 import argparse

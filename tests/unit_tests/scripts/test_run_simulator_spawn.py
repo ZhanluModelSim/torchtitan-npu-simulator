@@ -135,39 +135,39 @@ def test_resolve_launch_config_applies_cli_overrides_before_spawn(
     monkeypatch.delenv("NGPU", raising=False)
     monkeypatch.delenv("TORCHTITAN_SIM_WORLD_SIZE", raising=False)
     entry_args = launcher._build_entry_args(
-        "deepseek_v4_pro_simulate_16_layers_pp4_cp4",
+        "deepseek_v4_pro_baseline_bf16",
         "./tests/assets/tokenizer/deepseekv3_tokenizer",
         [
             "--parallelism.pipeline-parallel-degree",
             "2",
             "--simulation.world-size",
-            "32",
+            "128",
         ],
     )
 
     config, runtime = launcher._resolve_launch_config(entry_args)
 
     assert config.parallelism.pipeline_parallel_degree == 2
-    assert config.parallelism.data_parallel_shard_degree == 4
+    assert config.parallelism.data_parallel_shard_degree == 64
     assert runtime.pp_degree == 2
     assert runtime.comm_mode == "multi_proc_meta"
-    assert runtime.world_size == 32
+    assert runtime.world_size == 128
 
 
 def test_resolve_launch_config_uses_fake_backend_after_pp_is_disabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv("NGPU", raising=False)
+    monkeypatch.setenv("NGPU", "128")
     monkeypatch.delenv("TORCHTITAN_SIM_WORLD_SIZE", raising=False)
     entry_args = launcher._build_entry_args(
-        "deepseek_v4_pro_simulate_16_layers_pp4_cp4",
+        "deepseek_v4_pro_baseline_bf16",
         "./tests/assets/tokenizer/deepseekv3_tokenizer",
         ["--parallelism.pipeline-parallel-degree", "1"],
     )
 
     config, runtime = launcher._resolve_launch_config(entry_args)
 
-    assert config.parallelism.data_parallel_shard_degree == 16
+    assert config.parallelism.data_parallel_shard_degree == 128
     assert runtime.pp_degree == 1
     assert runtime.comm_mode == "fake_backend"
 
@@ -175,33 +175,33 @@ def test_resolve_launch_config_uses_fake_backend_after_pp_is_disabled(
 def test_resolve_launch_config_ngpu_overrides_registry_world_size(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("NGPU", "32")
+    monkeypatch.setenv("NGPU", "128")
     monkeypatch.delenv("TORCHTITAN_SIM_WORLD_SIZE", raising=False)
     entry_args = launcher._build_entry_args(
-        "deepseek_v4_pro_simulate_16_layers_pp4_cp4",
+        "deepseek_v4_pro_baseline_bf16",
         "./tests/assets/tokenizer/deepseekv3_tokenizer",
         [],
     )
 
     config, runtime = launcher._resolve_launch_config(entry_args)
 
-    assert runtime.world_size == 32
-    assert config.simulation.world_size == 32
-    assert config.parallelism.data_parallel_shard_degree == 2
+    assert runtime.world_size == 128
+    assert config.simulation.world_size == 128
+    assert config.parallelism.data_parallel_shard_degree == 128
 
 
 def test_resolve_launch_config_cli_world_size_wins_over_stale_environment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("NGPU", "128")
-    monkeypatch.setenv("TORCHTITAN_SIM_WORLD_SIZE", "128")
+    monkeypatch.setenv("NGPU", "256")
+    monkeypatch.setenv("TORCHTITAN_SIM_WORLD_SIZE", "256")
     entry_args = launcher._build_entry_args(
-        "deepseek_v4_pro_simulate_16_layers_pp4_cp4",
+        "deepseek_v4_pro_baseline_bf16",
         "./tests/assets/tokenizer/deepseekv3_tokenizer",
-        ["--simulation.world-size", "32"],
+        ["--simulation.world-size", "128"],
     )
 
     config, runtime = launcher._resolve_launch_config(entry_args)
 
-    assert config.parallelism.data_parallel_shard_degree == 2
-    assert runtime.world_size == 32
+    assert config.parallelism.data_parallel_shard_degree == 128
+    assert runtime.world_size == 128

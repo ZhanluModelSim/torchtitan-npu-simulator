@@ -15,23 +15,9 @@ from .parallelize import parallelize_deepseek_v4
 from .state_dict_adapter import DeepSeekV4StateDictAdapter
 
 
-def _make_moe_args() -> MoEArgs:
+def _make_flash_moe_args() -> MoEArgs:
     return MoEArgs(
         num_experts=256,
-        num_shared_experts=1,
-        top_k=6,
-        score_func="sqrtsoftplus",
-        route_norm=True,
-        score_before_experts=False,
-        use_grouped_mm=True,
-        n_hash_layers=3,
-        swiglu_limit=10,
-    )
-
-
-def _make_single_node_eq_pruned_moe_args() -> MoEArgs:
-    return MoEArgs(
-        num_experts=16,
         num_shared_experts=1,
         top_k=6,
         score_func="sqrtsoftplus",
@@ -88,7 +74,7 @@ def _make_smoke_moe_args() -> MoEArgs:
 def _smoketest_model() -> DeepSeekV4Model.Config:
     return DeepSeekV4Model.Config(
         vocab_size=129280,
-        n_layers=2,
+        n_layers=4,
         n_heads=4,
         max_batch_size=2,
         max_seq_len=128,
@@ -100,10 +86,10 @@ def _smoketest_model() -> DeepSeekV4Model.Config:
         o_lora_rank=32,
         o_groups=4,
         window_size=32,
-        compress_ratios=(1, 1),
+        compress_ratios=(1, 1, 4, 128),
         moe_args=_make_smoke_moe_args(),
         hc_sinkhorn_iters=4,
-        hc_mult=2,
+        hc_mult=4,
         hc_eps=1e-6,
         compress_rope_theta=40000,
         original_seq_len=128,
@@ -118,7 +104,7 @@ def _smoketest_model() -> DeepSeekV4Model.Config:
     )
 
 
-def _v4_flash_debug_16_experts_43_layers() -> DeepSeekV4Model.Config:
+def _v4_flash_baseline() -> DeepSeekV4Model.Config:
     return DeepSeekV4Model.Config(
         vocab_size=129280,
         n_layers=43,
@@ -139,7 +125,7 @@ def _v4_flash_debug_16_experts_43_layers() -> DeepSeekV4Model.Config:
             4,
         )
         + (128, 4) * 20,
-        moe_args=_make_single_node_eq_pruned_moe_args(),
+        moe_args=_make_flash_moe_args(),
         hc_sinkhorn_iters=20,
         hc_mult=4,
         hc_eps=1e-6,
@@ -156,78 +142,7 @@ def _v4_flash_debug_16_experts_43_layers() -> DeepSeekV4Model.Config:
     )
 
 
-def _v4_flash_debug_256_experts_43_layers() -> DeepSeekV4Model.Config:
-    return DeepSeekV4Model.Config(
-        vocab_size=129280,
-        n_layers=43,
-        n_heads=64,
-        max_batch_size=4,
-        max_seq_len=4096,
-        dim=4096,
-        moe_inter_dim=2048,
-        head_dim=512,
-        rope_head_dim=64,
-        q_lora_rank=1024,
-        o_lora_rank=1024,
-        o_groups=8,
-        window_size=128,
-        compress_ratios=(
-            1,
-            1,
-            4,
-        )
-        + (128, 4) * 20,
-        moe_args=_make_moe_args(),
-        hc_sinkhorn_iters=20,
-        hc_mult=4,
-        hc_eps=1e-6,
-        compress_rope_theta=160000,
-        original_seq_len=65536,
-        rope_theta=10000,
-        rope_factor=16,
-        beta_fast=32,
-        beta_slow=1,
-        enable_indexer_loss=True,
-        index_n_heads=64,
-        index_head_dim=128,
-        index_topk=512,
-    )
-
-
-def _v4_pro_debug_16_layers() -> DeepSeekV4Model.Config:
-    return DeepSeekV4Model.Config(
-        vocab_size=129280,
-        n_layers=16,
-        n_heads=128,
-        max_batch_size=4,
-        max_seq_len=4096,
-        dim=7168,
-        moe_inter_dim=3072,
-        head_dim=512,
-        rope_head_dim=64,
-        q_lora_rank=1536,
-        o_lora_rank=1024,
-        o_groups=16,
-        window_size=128,
-        compress_ratios=(128,) + (128, 4) * 30,
-        moe_args=_make_single_node_eq_pruned_moe_args(),
-        hc_sinkhorn_iters=20,
-        hc_mult=4,
-        hc_eps=1e-6,
-        compress_rope_theta=160000,
-        original_seq_len=65536,
-        rope_theta=10000,
-        rope_factor=16,
-        beta_fast=32,
-        beta_slow=1,
-        enable_indexer_loss=True,
-        index_n_heads=64,
-        index_head_dim=128,
-        index_topk=1024,
-    )
-
-
-def _v4_pro_debug_61_layers() -> DeepSeekV4Model.Config:
+def _v4_pro_baseline() -> DeepSeekV4Model.Config:
     return DeepSeekV4Model.Config(
         vocab_size=129280,
         n_layers=61,
@@ -292,12 +207,11 @@ def _v4_pro_20t_baseline() -> DeepSeekV4Model.Config:
         index_topk=1024,
     )
 
+
 deepseekv4_configs = {
     "smoketest": _smoketest_model,
-    "v4_flash_debug_16_experts_43_layers": _v4_flash_debug_16_experts_43_layers,
-    "v4_flash_debug_256_experts_43_layers": _v4_flash_debug_256_experts_43_layers,
-    "v4_pro_debug_16_layers": _v4_pro_debug_16_layers,
-    "v4_pro_debug_61_layers": _v4_pro_debug_61_layers,
+    "v4_flash_baseline": _v4_flash_baseline,
+    "v4_pro_baseline": _v4_pro_baseline,
     "v4_pro_20t_baseline": _v4_pro_20t_baseline,
 }
 
