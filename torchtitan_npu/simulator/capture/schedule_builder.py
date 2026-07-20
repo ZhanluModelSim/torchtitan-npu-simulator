@@ -180,7 +180,7 @@ def build_schedule_plan(
             action_id = next(_action_seq)
             return ScheduleAction(
                 id=f"{action_id}", action_id=f"r{rank}_a{action_id}", rank=rank, stage=-1, mb_idx=-1,
-                action_type="OVERLAP_F_B", seq_idx=seq_hint, sub_actions=subs,
+                action_type="OVERLAP_F_B", seq_idx=seq_hint, schedule_order=seq_hint, sub_actions=subs,
             )
         seq = seq_hint
         if action_type == "COMPUTE" and comp_type and stage >= 0 and mb >= 0:
@@ -190,6 +190,7 @@ def build_schedule_plan(
         return ScheduleAction(
             id=f"{action_id}", action_id=f"r{rank}_a{action_id}", rank=rank, stage=stage, mb_idx=mb,
             action_type=action_type, comp_type=comp_type, template_ref=tmpl, seq_idx=seq,
+            schedule_order=seq_hint,
         )
 
     # --- 1. action skeleton ---------------------------------------------------
@@ -213,7 +214,7 @@ def build_schedule_plan(
             actions.append(ScheduleAction(
                 id=f"{action_id}", action_id=f"r{rank}_a{action_id}", rank=rank, stage=stage, mb_idx=mb,
                 action_type="COMPUTE", comp_type=ct, template_ref=f"s{stage}_{ct}",
-                seq_idx=int(ev.get("seq_idx", 0)),
+                seq_idx=int(ev.get("seq_idx", 0)), schedule_order=int(ev.get("seq_idx", 0)),
             ))
         # comm actions (P2P + FSDP) from CommEvents
         for ev in comm_events:
@@ -234,7 +235,7 @@ def build_schedule_plan(
                 id=f"{action_id}", action_id=f"r{rank}_a{action_id}", rank=rank,
                 stage=int(ev.p2p_stage) if ev.p2p_stage >= 0 else rank,
                 mb_idx=int(ev.p2p_mb_idx) if ev.p2p_mb_idx >= 0 else -1,
-                action_type=atype, seq_idx=int(ev.seq_idx),
+                action_type=atype, seq_idx=int(ev.seq_idx), schedule_order=int(ev.seq_idx),
             ))
     else:
         # non-PP: one action per captured template, ordered F < B < OPTIMIZER
@@ -247,8 +248,11 @@ def build_schedule_plan(
             actions.append(ScheduleAction(
                 id=f"{action_id}", action_id=f"r{rank}_a{action_id}", rank=rank, stage=rank, mb_idx=0,
                 action_type="COMPUTE" if ct != "OPTIMIZER" else "OPTIMIZER",
-                comp_type=ct, template_ref=tid, seq_idx=min_seq,
+                comp_type=ct, template_ref=tid, seq_idx=min_seq, schedule_order=min_seq,
             ))
+
+    def _schedule_order(action: ScheduleAction) -> int:
+        return action.schedule_order if action.schedule_order >= 0 else action.seq_idx
 
     # --- 2. DataSlots: P2P activations / grad_inputs -------------------------
     def add_slot(slot: DataSlot) -> None:
@@ -447,8 +451,8 @@ def build_schedule_plan(
         cons = None
         for ca in actions:
             if (ca.action_type == "COMPUTE" and ca.stage == s
-                    and ca.seq_idx >= a.seq_idx and ca is not a):
-                if cons is None or ca.seq_idx < cons.seq_idx:
+                    and _schedule_order(ca) >= _schedule_order(a) and ca is not a):
+                if cons is None or _schedule_order(ca) < _schedule_order(cons):
                     cons = ca
         slot = DataSlot(
             slot_id=_slot_id(), kind="param_full", shape=shape, dtype=dtype, volume_bytes=bytes_,
@@ -485,8 +489,9 @@ def build_schedule_plan(
         prod = None
         for ca in actions:
             if (ca.action_type == "COMPUTE" and ca.stage == s
-                    and ca.comp_type in ("B", "I", "W") and ca.seq_idx <= a.seq_idx):
-                if prod is None or ca.seq_idx > prod.seq_idx:
+                    and ca.comp_type in ("B", "I", "W")
+                    and _schedule_order(ca) <= _schedule_order(a)):
+                if prod is None or _schedule_order(ca) > _schedule_order(prod):
                     prod = ca
         slot = DataSlot(
             slot_id=_slot_id(), kind="param_shard", shape=shape, dtype=dtype, volume_bytes=bytes_,
@@ -526,6 +531,7 @@ def build_schedule_plan(
                 id=f"{action_id}", action_id=f"r{rank}_a{action_id}", rank=rank, stage=rank, mb_idx=-1,
                 action_type="OPTIMIZER", comp_type="OPTIMIZER",
                 template_ref=f"s{rank}_OPTIMIZER", seq_idx=min_seq,
+                schedule_order=max((_schedule_order(a) for a in actions), default=-1) + 1,
             )
             actions.append(act)
         opt_action = next(a for a in actions if a.action_type == "OPTIMIZER")
@@ -535,7 +541,7 @@ def build_schedule_plan(
                 opt_action.consumes.append(sid)
 
     # --- assemble -------------------------------------------------------------
-    actions.sort(key=lambda a: a.seq_idx)
+    actions.sort(key=_schedule_order)
     dp_degree = rank_table.dim_degrees.get("dp_replicate", 1) * rank_table.dim_degrees.get(
         "fsdp", rank_table.dim_degrees.get("dp_shard", 1)
     )

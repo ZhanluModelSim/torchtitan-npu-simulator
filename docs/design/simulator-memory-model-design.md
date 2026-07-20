@@ -261,6 +261,20 @@ rank7/stage2/forward/mb3/...
 
 这样不需要重新捕获所有 microbatch 的 L0，也不需要把展示图完全展开。
 
+当前实现采用该方案，并限定在 `pp_degree > 1` 的内存路径：
+
+- 从 raw memory events 中为每个 `(stage, comp_type)` 选择完整模板；
+- 按 `SchedulePlan.actions` 展开任意调度，不根据 1F1B、GPipe 或 DualPipeV 名称分支；
+- `OVERLAP_F_B` 在内存时间轴中按 sub-action 稳定展开，保留 action span 供 Perfetto 展示；
+- 参数/buffer tensor ID 保持持久，microbatch 相关输入输出生成独立 ID；
+- PP P2P 接收由下游 stage input 表达，避免再叠加一份通信 buffer；
+- FSDP 显式驻留 marker 保持真实调用次数，不随计算模板复制；
+- 非 PP 直接调用原有 `estimate_static_memory`，不经过模板重放。
+
+`ScheduleAction` 同时保留两类位置：`schedule_order` 是 lowered pipeline plan 的逻辑
+顺序，`seq_idx` 是捕获来源位置。compute 的 `seq_idx` 可能是 L0 op 位置，而通信 action
+的 `seq_idx` 可能是 plan index，因此不能把二者作为同一时间轴排序。
+
 ## 8. 优先级
 
 ### P0：最小可信闭环
@@ -278,7 +292,7 @@ rank7/stage2/forward/mb3/...
 
 | 项 | 影响 | 复杂度 | 说明 |
 |---|---:|---:|---|
-| microbatch/PP template 实例化 | 大 | 中 | PP/grad accumulation 配置需要 |
+| microbatch/PP template 实例化 | 大 | 中 | 已实现通用 action-plan 重放 |
 | in-place/out mutation | 中到大 | 中 | 避免 optimizer/copy 重复算 |
 | grad/optimizer state 开关 | 中到极大 | 中 | 是否做训练峰值取决于目标 |
 | async comm wait/phase boundary | 中 | 中 | 初版可保守近似 |
@@ -389,13 +403,14 @@ torchtitan_npu/simulator/memory/
 
 ```text
 simulator_output/<config>/
-├── memory_summary.json
-├── memory_events/
-│   └── rank_0.csv
-├── tensor_lifetimes/
-│   └── rank_0.csv
-├── unclassified_memory_ops.csv
-└── unclassified_dead_outputs.csv
+└── memory/
+    ├── memory_summary.json
+    ├── memory_events.csv
+    ├── memory_timeline.csv
+    ├── tensor_lifetimes.csv
+    ├── memory_actions.csv
+    ├── memory_trace.json
+    └── unclassified_memory_ops.csv
 ```
 
 `memory_events/rank_0.csv`：
@@ -548,11 +563,11 @@ peak = max(active_bytes_after)
 - alias 只做白名单，不尝试从 storage 推断。
 - mutation 只做 raw op 名称和输入输出 id 的保守识别。
 - FSDP 先基于 `CommEvent` 分类 allgather/reduce_scatter buffer，并以 last consumer 释放；reshard hook 显式释放留到 P1。
-- PP/microbatch 先每 rank 导出实际捕获的 L0 曲线，不展开 MB1+ 模板；P1 再按 L2 timeline 实例化。
+- PP/microbatch 按 L2 `SchedulePlan` 实例化 MB1+ 的 memory events；L0/L1 展示图仍保持折叠。
 - 输出名使用 `active_bytes_peak`，旧 `sum(node.peak_mem)` 在 summary 中改名为 `total_op_output_bytes_estimate`。
 
 ### 15.4 验收
 
 - 单元测试覆盖简单链、dead output、cross phase activation、checkpoint-like 重算、alias、comm/FSDP 分类。
 - smoke 脚本输出人可读日志：参数常驻、峰值、峰值位置、top lifetimes、导出路径。
-- multi-proc meta 下每 rank 单独导出 `memory_summary.json`、`memory_events.csv`、`tensor_lifetimes.csv`。
+- multi-proc meta 下每 rank 单独导出 `memory/`，PP 额外包含 `memory_actions.csv` 和 action span trace。

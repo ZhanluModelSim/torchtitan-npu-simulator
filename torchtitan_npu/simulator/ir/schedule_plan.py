@@ -114,7 +114,8 @@ class ScheduleAction:
     action_type: str
     comp_type: str = ""                     # COMPUTE: F / B / I / W / F_RECOMPUTE / OPTIMIZER
     template_ref: str = ""                  # COMPUTE: L1 step_template id (s{stage}_{comp_type})
-    seq_idx: int = 0                        # execution order (from capture; plan-index fallback)
+    seq_idx: int = 0                        # captured source position (plan-index fallback)
+    schedule_order: int = -1                # logical order in the lowered pipeline plan
     consumes: list[str] = field(default_factory=list)   # DataSlot ids
     produces: list[str] = field(default_factory=list)   # DataSlot ids
     duration_est: float = 0.0
@@ -148,7 +149,7 @@ class SchedulePlan:
     plan_id: str
     workload_type: str                      # train | inference | eval
     step_templates: dict[str, StepGraph]    # L1 templates (COMPUTE actions reference these)
-    actions: list[ScheduleAction]           # ordered (by seq_idx, then plan order)
+    actions: list[ScheduleAction]           # ordered by schedule_order
     data_slots: dict[str, DataSlot]
     pp_degree: int = 1
     tp_degree: int = 1
@@ -214,7 +215,7 @@ class SchedulePlan:
         with open(path, "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
             w.writerow([
-                "seq_idx", "action_id", "action_type", "stage", "mb_idx",
+                "seq_idx", "schedule_order", "action_id", "action_type", "stage", "mb_idx",
                 "comp_type", "template_ref", "rank",
                 "consumes", "produces", "sub_actions", "annotations",
                 # denormalized comm detail (direct, no 2-hop lookup)
@@ -223,10 +224,10 @@ class SchedulePlan:
                 "comm_group_ranks", "comm_src_exit_op", "comm_dst_entry_op",
                 "comm_op_id", "comm_is_noop",
             ])
-            for a in sorted(self.actions, key=lambda x: x.seq_idx):
+            for a in self.actions:
                 c = a.comm
                 w.writerow([
-                    a.seq_idx, a.action_id, a.action_type, a.stage,
+                    a.seq_idx, a.schedule_order, a.action_id, a.action_type, a.stage,
                     a.mb_idx if a.mb_idx >= 0 else "",
                     a.comp_type, a.template_ref, a.rank,
                     ";".join(a.consumes), ";".join(a.produces),

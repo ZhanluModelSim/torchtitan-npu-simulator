@@ -35,6 +35,7 @@ class RawMemoryEvent:
     execution_kind: str
     pp_stage: int = -1
     pp_mb_idx: int = -1
+    comp_type: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,6 +87,19 @@ class MemoryTimelineEvent:
     reason: str = ""
 
 
+@dataclass(frozen=True, slots=True)
+class MemoryActionSpan:
+    action_id: str
+    action_type: str
+    stage: int
+    microbatch: int
+    comp_type: str
+    phase: str
+    start_seq: int
+    end_seq: int
+    source_seq_idx: int = 0
+
+
 @dataclass(slots=True)
 class MemoryPlan:
     metric: str = "active_tensor_bytes"
@@ -99,6 +113,7 @@ class MemoryPlan:
     raw_events: list[RawMemoryEvent] = field(default_factory=list)
     tensor_lifetimes: list[TensorLifetime] = field(default_factory=list)
     timeline_events: list[MemoryTimelineEvent] = field(default_factory=list)
+    action_spans: list[MemoryActionSpan] = field(default_factory=list)
     unclassified_ops: list[dict[str, Any]] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
@@ -115,6 +130,7 @@ class MemoryPlan:
             "raw_memory_event_count": len(self.raw_events),
             "tensor_lifetime_count": len(self.tensor_lifetimes),
             "timeline_event_count": len(self.timeline_events),
+            "memory_action_span_count": len(self.action_spans),
             "unclassified_op_count": len(self.unclassified_ops),
             "included": [
                 "local parameter tensors",
@@ -135,5 +151,6 @@ class MemoryPlan:
         data = self.to_summary_dict()
         data["tensor_lifetimes"] = [asdict(item) for item in self.tensor_lifetimes]
         data["timeline_events"] = [asdict(item) for item in self.timeline_events]
+        data["action_spans"] = [asdict(item) for item in self.action_spans]
         data["unclassified_ops"] = list(self.unclassified_ops)
         return data

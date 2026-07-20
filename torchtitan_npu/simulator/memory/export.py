@@ -98,6 +98,41 @@ def _build_execution_kind_spans(plan: MemoryPlan) -> list[dict]:
     return spans
 
 
+def _build_schedule_action_spans(plan: MemoryPlan) -> list[dict]:
+    spans: list[dict] = []
+    stages = sorted({span.stage for span in plan.action_spans if span.stage >= 0})
+    for stage in stages:
+        spans.append({
+            "name": "thread_name",
+            "ph": "M",
+            "pid": 1,
+            "tid": 100 + stage,
+            "args": {"name": f"PP stage {stage} actions"},
+        })
+    for span in plan.action_spans:
+        tid = 100 + span.stage if span.stage >= 0 else 99
+        label = span.comp_type or span.action_type
+        if span.microbatch >= 0:
+            label = f"{label} mb{span.microbatch}"
+        spans.append({
+            "name": label,
+            "ph": "X",
+            "pid": 1,
+            "tid": tid,
+            "ts": _trace_ts(span.start_seq),
+            "dur": max(_TRACE_TS_SCALE_US, _trace_ts(span.end_seq - span.start_seq + 1)),
+            "args": {
+                "action_id": span.action_id,
+                "action_type": span.action_type,
+                "stage": span.stage,
+                "microbatch": span.microbatch,
+                "comp_type": span.comp_type,
+                "phase": span.phase,
+            },
+        })
+    return spans
+
+
 def memory_plan_to_chrome_trace(plan: MemoryPlan) -> dict:
     """Build a compact Chrome Trace / Perfetto JSON payload.
 
@@ -116,6 +151,7 @@ def memory_plan_to_chrome_trace(plan: MemoryPlan) -> dict:
     ]
     trace_events.extend(_build_phase_spans(plan))
     trace_events.extend(_build_execution_kind_spans(plan))
+    trace_events.extend(_build_schedule_action_spans(plan))
     active_by_kind: dict[str, int] = {}
     for event in sorted(plan.timeline_events, key=lambda item: (item.seq_idx, item.action, item.tensor_id)):
         delta = event.num_bytes if event.action == "alloc" else -event.num_bytes
@@ -184,6 +220,7 @@ def memory_plan_to_chrome_trace(plan: MemoryPlan) -> dict:
             "backward_active_bytes_peak": plan.backward_peak_active_bytes,
             "optimizer_active_bytes_peak": plan.optimizer_peak_active_bytes,
             "peak_seq_idx": plan.peak_seq_idx,
+            "memory_action_span_count": len(plan.action_spans),
         },
     }
 
@@ -213,6 +250,7 @@ def export_memory_plan(plan: MemoryPlan, out_dir: str) -> None:
             "output_shapes",
             "pp_stage",
             "pp_mb_idx",
+            "comp_type",
         ]
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
@@ -232,7 +270,19 @@ def export_memory_plan(plan: MemoryPlan, out_dir: str) -> None:
                 "output_shapes": _shapes(event.outputs),
                 "pp_stage": event.pp_stage,
                 "pp_mb_idx": event.pp_mb_idx,
+                "comp_type": event.comp_type,
             })
+
+    if plan.action_spans:
+        with open(os.path.join(memory_dir, "memory_actions.csv"), "w", newline="", encoding="utf-8") as f:
+            fieldnames = [
+                "action_id", "action_type", "stage", "microbatch", "comp_type",
+                "phase", "start_seq", "end_seq", "source_seq_idx",
+            ]
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for span in plan.action_spans:
+                writer.writerow(asdict(span))
 
     with open(os.path.join(memory_dir, "memory_timeline.csv"), "w", newline="", encoding="utf-8") as f:
         fieldnames = [

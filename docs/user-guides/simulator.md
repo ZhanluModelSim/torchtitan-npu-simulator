@@ -250,6 +250,17 @@ cat simulator_output/deepseek_v4_pro_61_layers/summary.txt
 | `ir_export/` | CSV 目录 | 各层级 IR 导出（见下文） |
 | `memory/` | JSON/CSV 目录 | 内存摘要、Perfetto trace、事件时间线和 tensor 生命周期 |
 
+`memory/` 中的主要文件：
+
+| 文件 | 内容 |
+|------|------|
+| `memory_summary.json` | 参数常驻、前向/反向/optimizer 峰值及覆盖范围 |
+| `memory_events.csv` | 未折叠的算子输入输出事件，含 PP stage/microbatch/comp_type |
+| `memory_timeline.csv` | alloc/free 后的 active tensor bytes 曲线 |
+| `tensor_lifetimes.csv` | 每个 tensor 的 birth、last consumer、death 和分类 |
+| `memory_actions.csv` | PP 调度 action 与展开后内存事件区间的映射；非 PP 不生成 |
+| `memory_trace.json` | 可由 Chrome Trace 或 Perfetto 打开的阶段趋势图 |
+
 ### 多进程模式（multi_proc_meta）
 
 每个 PP stage 进程独立输出到 `rank_N/` 子目录，**不合并到 Rank 0**：
@@ -538,6 +549,15 @@ PP=4+CP=4 配置下，每个 stage 的通信捕获情况：
 | Optimizer | ✅ 完整捕获 | ✅ 从 L0 构建 | ✅ 完整 timeline | ✅ 完整捕获 |
 
 L0/L1 捕获开销从 O(PP × num_mb × ops_per_mb) 降为 O(ops_per_mb)，与 microbatch 数量无关。
+
+PP 内存估算不会只使用 MB 0 的曲线。它以完整捕获的 `(stage, comp_type)` raw memory
+events 为模板，按照 L2 `SchedulePlan` 的通用 action 顺序实例化每个 microbatch；支持
+F/B、I/W、`OVERLAP_F_B` 等 action 组合，不依赖特定 1F1B 名称。每个实例获得独立的
+非持久 tensor ID，参数和 buffer 保持单实例，FSDP 显式 unshard/reshard 驻留事件也不会
+按 microbatch 重复克隆。L0/L1 展示图仍保持折叠，因此不会因 microbatch 数量显著膨胀。
+
+`ScheduleAction.schedule_order` 表示 pipeline plan 的逻辑顺序；`seq_idx` 保留其抓图来源
+位置。两者不能混排，尤其是 DualPipeV 等包含通信、虚拟 stage 和 overlap action 的调度。
 
 ### 资源消耗
 

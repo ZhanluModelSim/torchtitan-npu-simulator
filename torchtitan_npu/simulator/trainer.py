@@ -28,8 +28,8 @@ from torchtitan_npu.simulator.capture.workload_builder import build_workload_gra
 from torchtitan_npu.simulator.hardware_shims.mhc_converter import apply_mhc_shims
 from torchtitan_npu.simulator.hardware_shims.smla_converter import apply_smla_shims
 from torchtitan_npu.simulator.ir.workload_graph import WorkloadGraph
-from torchtitan_npu.simulator.memory.estimator import estimate_static_memory
 from torchtitan_npu.simulator.memory.export import export_memory_plan
+from torchtitan_npu.simulator.memory.schedule_replay import estimate_schedule_memory
 from torchtitan_npu.simulator.meta_env import patch_device_type_to_meta
 from torchtitan_npu.simulator.moe_force_balance import force_deterministic_seed, force_moe_load_balance
 from torchtitan_npu.simulator.rank_table import build_rank_table
@@ -269,8 +269,9 @@ def run_simulation_step(
     memory_plan = None
     if enable_memory_tracking:
         t9 = time.perf_counter()
-        memory_plan = estimate_static_memory(
+        memory_plan = estimate_schedule_memory(
             capture.memory_events(),
+            schedule_plan=schedule_plan,
             model_parts=model_parts,
             comm_events=comm_recorder.events,
             fsdp_residency_events=comm_recorder.fsdp_residency_events,

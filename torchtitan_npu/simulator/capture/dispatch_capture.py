@@ -369,6 +369,7 @@ class OpDispatchCapture(TorchDispatchMode):
                     ),
                     pp_stage=pp_stage,
                     pp_mb_idx=pp_mb_idx,
+                    comp_type=comp_type,
                 )
             )
 
