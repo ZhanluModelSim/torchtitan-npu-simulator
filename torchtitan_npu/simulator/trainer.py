@@ -47,6 +47,8 @@ class SimulationConfig:
     enable_memory_tracking: bool = True
     target_npu_device_type: str = "non_a5"
     csv_max_ranks: int | None = None
+    world_size: int | None = None
+    # Compatibility snapshot populated from the final parsed parallel config.
     simulated_parallel_degrees: dict[str, int] = field(default_factory=dict)
 
 
@@ -354,11 +356,17 @@ class SimulationTrainer(Trainer):
     Config = SimulationTrainerConfig
 
     def __init__(self, config: SimulationTrainerConfig) -> None:
+        # entry.py normally resolves this before build(). Keep direct
+        # SimulationTrainerConfig.build() callers on the same invariant.
+        from torchtitan_npu.simulator.utils import (
+            resolve_simulation_runtime_from_environment,
+        )
+
+        resolve_simulation_runtime_from_environment(config)
+
         force_moe_load_balance(config)
         force_deterministic_seed(config)
         config.compile.enable = False  # tracing needs eager dispatch, not a compiled graph
-        # comm.mode is set by entry.py / config_registry; do not override here
-        # (fake_backend for single-process, multi_proc_meta for multi-process)
         apply_mhc_shims()
         apply_smla_shims()
         _strip_hardware_dependent_model_converters(config)

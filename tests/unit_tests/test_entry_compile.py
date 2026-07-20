@@ -5,6 +5,7 @@
 
 from types import SimpleNamespace
 
+import torchtitan_npu.entry as entry_mod
 from torchtitan_npu.entry import (
     _compile_requires_bypass_triton_codegen,
     _has_model_converter,
@@ -31,3 +32,28 @@ def test_compile_strategy_helpers_document_model_groups():
 
     assert not _compile_requires_bypass_triton_codegen("vlm")
     assert _compile_requires_bypass_triton_codegen("llama3")
+
+
+def test_parse_config_uses_current_sys_argv(monkeypatch):  # noqa: ANN001
+    parsed = object()
+    received_args = []
+
+    class FakeConfigManager:
+        def parse_args(self, args):  # noqa: ANN001, ANN202
+            received_args.extend(args)
+            return parsed
+
+    monkeypatch.setattr(entry_mod, "ConfigManager", FakeConfigManager)
+    monkeypatch.setattr(
+        entry_mod.sys,
+        "argv",
+        ["embedded", "--module", "torchtitan_npu.simulator", "--config", "demo"],
+    )
+
+    assert entry_mod._parse_config() is parsed
+    assert received_args == [
+        "--module",
+        "torchtitan_npu.simulator",
+        "--config",
+        "demo",
+    ]

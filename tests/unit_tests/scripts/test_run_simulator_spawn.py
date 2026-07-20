@@ -127,3 +127,63 @@ def test_collect_worker_results_stops_when_a_process_fails() -> None:
         launcher._collect_worker_results(
             queue.Queue(), [_process(), _process(3)], expected_count=2, timeout=0.1
         )
+
+
+def test_resolve_launch_config_applies_cli_overrides_before_spawn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("NGPU", raising=False)
+    monkeypatch.delenv("TORCHTITAN_SIM_WORLD_SIZE", raising=False)
+    entry_args = launcher._build_entry_args(
+        "deepseek_v4_pro_simulate_16_layers_pp4_cp4",
+        "./tests/assets/tokenizer/deepseekv3_tokenizer",
+        [
+            "--parallelism.pipeline-parallel-degree",
+            "2",
+            "--simulation.world-size",
+            "32",
+        ],
+    )
+
+    config, runtime = launcher._resolve_launch_config(entry_args)
+
+    assert config.parallelism.pipeline_parallel_degree == 2
+    assert config.parallelism.data_parallel_shard_degree == 4
+    assert runtime.pp_degree == 2
+    assert runtime.comm_mode == "multi_proc_meta"
+    assert runtime.world_size == 32
+
+
+def test_resolve_launch_config_uses_fake_backend_after_pp_is_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("NGPU", raising=False)
+    monkeypatch.delenv("TORCHTITAN_SIM_WORLD_SIZE", raising=False)
+    entry_args = launcher._build_entry_args(
+        "deepseek_v4_pro_simulate_16_layers_pp4_cp4",
+        "./tests/assets/tokenizer/deepseekv3_tokenizer",
+        ["--parallelism.pipeline-parallel-degree", "1"],
+    )
+
+    config, runtime = launcher._resolve_launch_config(entry_args)
+
+    assert config.parallelism.data_parallel_shard_degree == 16
+    assert runtime.pp_degree == 1
+    assert runtime.comm_mode == "fake_backend"
+
+
+def test_resolve_launch_config_cli_world_size_wins_over_stale_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("NGPU", "128")
+    monkeypatch.setenv("TORCHTITAN_SIM_WORLD_SIZE", "128")
+    entry_args = launcher._build_entry_args(
+        "deepseek_v4_pro_simulate_16_layers_pp4_cp4",
+        "./tests/assets/tokenizer/deepseekv3_tokenizer",
+        ["--simulation.world-size", "32"],
+    )
+
+    config, runtime = launcher._resolve_launch_config(entry_args)
+
+    assert config.parallelism.data_parallel_shard_degree == 2
+    assert runtime.world_size == 32

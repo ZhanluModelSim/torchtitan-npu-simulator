@@ -171,12 +171,42 @@ def _join_workers(
         )
 
 
+def _build_entry_args(
+    config_name: str,
+    hf_assets_path: str | None,
+    extra_args: list[str],
+) -> list[str]:
+    args = [
+        "--module",
+        "torchtitan_npu.simulator",
+        "--config",
+        config_name,
+        "--training.steps",
+        "1",
+    ]
+    if hf_assets_path:
+        args.extend(["--hf_assets_path", hf_assets_path])
+    args.extend(extra_args)
+    return args
+
+
+def _resolve_launch_config(entry_args: list[str]):  # noqa: ANN202
+    """Parse the exact worker CLI before deciding how many workers to spawn."""
+    from torchtitan.config import ConfigManager
+    from torchtitan_npu.simulator.utils import (
+        resolve_simulation_runtime_from_environment,
+    )
+
+    config = ConfigManager().parse_args(entry_args)
+    runtime = resolve_simulation_runtime_from_environment(config)
+    return config, runtime
+
+
 def _worker_fn(
     rank: int,
     nproc: int,
     sim_world_size: int,
-    config_name: str,
-    extra_args: list[str],
+    entry_args: list[str],
     result_queue: object | None = None,
 ) -> None:
     """Worker function for each spawned process.
@@ -193,15 +223,8 @@ def _worker_fn(
     os.environ["NGPU"] = str(sim_world_size)
     os.environ["TORCHTITAN_SIM_WORLD_SIZE"] = str(sim_world_size)
 
-    # Build sys.argv for entry.py's ConfigManager.parse_args()
-    argv = [
-        "torchtitan_npu.entry",
-        "--module", "torchtitan_npu.simulator",
-        "--config", config_name,
-        "--training.steps", "1",
-    ]
-    argv.extend(extra_args)
-    sys.argv = argv
+    # Use the same CLI that the parent resolved before spawning.
+    sys.argv = ["torchtitan_npu.entry", *entry_args]
 
     # Patch SimulationTrainer.train to report capture/export completion before
     # trainer.close() destroys the graph. Keep the queue payload lightweight:
@@ -248,39 +271,16 @@ def main() -> None:
     )
     args, extra = parser.parse_known_args()
 
-    # Build the config to extract PP degree and world_size
-    config_module = __import__(
-        "torchtitan_npu.simulator.config_registry",
-        fromlist=[args.config],
-    )
-    config_fn = getattr(config_module, args.config)
-    config = config_fn()
-
-    # Extract PP degree (nproc_per_node) and world_size (NGPU)
-    from torchtitan_npu.simulator.utils import get_nproc_per_node, get_world_size
-
-    nproc = get_nproc_per_node(config)
-    world_size = get_world_size(config)
-
-    if world_size == 0:
-        ngpu_env = os.environ.get("NGPU")
-        if ngpu_env:
-            world_size = int(ngpu_env)
-        else:
-            print("ERROR: Cannot determine world_size. dp_shard=-1 (auto).")
-            print("  Please set NGPU env var.")
-            sys.exit(1)
+    entry_args = _build_entry_args(args.config, args.hf_assets_path, extra)
+    _config, runtime = _resolve_launch_config(entry_args)
+    nproc = runtime.pp_degree
+    world_size = runtime.world_size
 
     print(f"[spawn] config={args.config}")
     print(f"[spawn] nproc_per_node (PP degree) = {nproc}")
     print(f"[spawn] world_size (NGPU) = {world_size}")
-    print(f"[spawn] comm_mode = {config.comm.mode}")
-
-    # Build extra args for entry.py (space-separated key value pairs)
-    extra_args = []
-    if args.hf_assets_path:
-        extra_args.extend(["--hf_assets_path", args.hf_assets_path])
-    extra_args.extend(extra)
+    print(f"[spawn] comm_mode = {runtime.comm_mode}")
+    print(f"[spawn] parallel_degrees = {runtime.parallel_degrees}")
 
     # Set master addr/port in env for workers
     os.environ["MASTER_ADDR"] = "127.0.0.1"
@@ -289,7 +289,7 @@ def main() -> None:
     if nproc == 1:
         # Single process, no spawn needed
         print("[spawn] Single process mode (PP=1), running directly")
-        _worker_fn(0, 1, world_size, args.config, extra_args)
+        _worker_fn(0, 1, world_size, entry_args)
     else:
         # Spawn nproc processes with a result queue
         import torch.multiprocessing as mp
@@ -302,7 +302,7 @@ def main() -> None:
         for rank in range(nproc):
             p = ctx.Process(
                 target=_worker_fn,
-                args=(rank, nproc, world_size, args.config, extra_args, result_queue),
+                args=(rank, nproc, world_size, entry_args, result_queue),
             )
             p.start()
             procs.append(p)

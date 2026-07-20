@@ -212,3 +212,4 @@ def test_simulation_config_defaults_target_npu_device_type_to_non_a5():
     config = SimulationConfig(output_dir="./out")
     assert config.target_npu_device_type == "non_a5"
     assert config.enable_memory_tracking is True
+    assert config.world_size is None

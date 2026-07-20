@@ -24,11 +24,18 @@ from torchtitan_npu.models.deepseek_v4.config_registry import (
 from torchtitan_npu.simulator.trainer import SimulationConfig, SimulationTrainerConfig
 
 
-def _to_simulation_config(base_config: object, output_dir: str, *, comm_mode: str = "fake_backend") -> SimulationTrainerConfig:
+def _to_simulation_config(
+    base_config: object,
+    output_dir: str,
+    *,
+    world_size: int | None = None,
+) -> SimulationTrainerConfig:
     base_fields = {f.name: getattr(base_config, f.name) for f in dataclasses.fields(base_config)}
-    sim_config = SimulationTrainerConfig(**base_fields, simulation=SimulationConfig(output_dir=output_dir))
+    sim_config = SimulationTrainerConfig(
+        **base_fields,
+        simulation=SimulationConfig(output_dir=output_dir, world_size=world_size),
+    )
     sim_config.compile.enable = False
-    sim_config.comm.mode = comm_mode
     return sim_config
 
 
@@ -37,7 +44,11 @@ def deepseek_v4_pro_simulate_61_layers() -> SimulationTrainerConfig:
     `expert_parallel_degree=192`, `384die` world size -- see
     docs/superpowers/specs/2026-07-01-npu-simulator-design.md."""
     base_config = deepseek_v4_pro_debug_61_layers_4k_384die()
-    return _to_simulation_config(base_config, output_dir="./simulator_output/deepseek_v4_pro_61_layers")
+    return _to_simulation_config(
+        base_config,
+        output_dir="./simulator_output/deepseek_v4_pro_61_layers",
+        world_size=384,
+    )
 
 
 def deepseek_v4_pro_simulate_20t_baseline_fp8() -> SimulationTrainerConfig:
@@ -54,7 +65,11 @@ def deepseek_v4_pro_simulate_16_layers() -> SimulationTrainerConfig:
     """Smaller/faster variant for local smoke testing before running the
     full 61-layer acceptance config (Task 20)."""
     base_config = deepseek_v4_pro_debug_16_layers()
-    return _to_simulation_config(base_config, output_dir="./simulator_output/deepseek_v4_pro_16_layers")
+    return _to_simulation_config(
+        base_config,
+        output_dir="./simulator_output/deepseek_v4_pro_16_layers",
+        world_size=384,
+    )
 
 
 def deepseek_v4_pro_simulate_16_layers_mxfp8() -> SimulationTrainerConfig:
@@ -99,7 +114,9 @@ def deepseek_v4_pro_simulate_16_layers_mxfp8() -> SimulationTrainerConfig:
         ),
     )
     return _to_simulation_config(
-        base_config, output_dir="./simulator_output/deepseek_v4_pro_16_layers_mxfp8"
+        base_config,
+        output_dir="./simulator_output/deepseek_v4_pro_16_layers_mxfp8",
+        world_size=16,
     )
 
 
@@ -134,6 +151,7 @@ def deepseek_v4_pro_simulate_61_layers_pp16_tp8_cp4_ep128() -> SimulationTrainer
     return _to_simulation_config(
         base_config,
         output_dir="./simulator_output/deepseek_v4_pro_61_layers_pp16_tp8_cp4_ep128",
+        world_size=2048,
     )
 
 
@@ -155,22 +173,22 @@ def deepseek_v4_pro_simulate_16_layers_cp4() -> SimulationTrainerConfig:
     return _to_simulation_config(
         base_config,
         output_dir="./simulator_output/deepseek_v4_pro_16_layers_cp4",
+        world_size=16,
     )
 
 
 def deepseek_v4_pro_simulate_16_layers_pp4_cp4() -> SimulationTrainerConfig:
     """PP=4 + CP=4 variant for multi-process CP+FSDP capture.
 
-    Run with: ``NGPU=64 torchrun --nproc_per_node=4 -m torchtitan_npu.entry
-    --module torchtitan_npu.simulator
+    Run with: ``python3 scripts/run_simulator_spawn.py
     --config deepseek_v4_pro_simulate_16_layers_pp4_cp4
-    --training.steps=1``
+    --hf_assets_path ./tests/assets/tokenizer/deepseekv3_tokenizer``
 
     Uses real parallel degrees (PP=4, CP=4, DP=4 → world_size=64).
     The gloo PG has only 4 processes (one per PP stage); CP/FSDP/TP/EP
     subgroups use FakeProcessGroup with the correct simulated size.
-    ``TORCHTITAN_SIM_WORLD_SIZE=64`` env var tells init_distributed to
-    return 64 (not gloo's 4) for ParallelDims validation.
+    The resolved runtime tells init_distributed to return 64 (not gloo's
+    4) for ParallelDims validation.
     """
     base_config = deepseek_v4_pro_debug_16_layers()
     base_config = dataclasses.replace(
@@ -192,27 +210,22 @@ def deepseek_v4_pro_simulate_16_layers_pp4_cp4() -> SimulationTrainerConfig:
             data_parallel_shard_degree=-1,  # auto: 64 / (1*4*1*4) = 4
         ),
     )
-    sim_config = _to_simulation_config(
+    return _to_simulation_config(
         base_config,
         output_dir="./simulator_output/deepseek_v4_pro_16_layers_pp4_cp4",
-        comm_mode="multi_proc_meta",
+        world_size=64,
     )
-    sim_config.simulation.simulated_parallel_degrees = {
-        "pp": 4, "tp": 1, "cp": 4, "ep": 1,
-        "dp_replicate": 1, "dp_shard": 4,
-        "etp": 1, "world_size": 64,
-    }
-    return sim_config
+
 
 def deepseek_v4_pro_simulate_16_layers_pp4_cp4_ep4() -> SimulationTrainerConfig:
     """PP=4 + CP=4 + EP=4 variant for multi-process all_to_all capture.
 
-    Run with: ``NGPU=128 torchrun --nproc_per_node=4 -m torchtitan_npu.entry
-    --module torchtitan_npu.simulator
+    Run with: ``python3 scripts/run_simulator_spawn.py
     --config deepseek_v4_pro_simulate_16_layers_pp4_cp4_ep4
-    --training.steps=1``
+    --hf_assets_path ./tests/assets/tokenizer/deepseekv3_tokenizer``
 
-    Uses real parallel degrees (PP=4, CP=4, EP=4, DP=2 → world_size=128).
+    Uses real parallel degrees (PP=4, CP=4, EP=4, DP=8 → world_size=128).
+    EP reinterprets the dense DP/CP/TP mesh; it is not a world-size factor.
     EP > 1 triggers ExpertParallel → NpuExpertParallel → all_to_all.
     """
     base_config = deepseek_v4_pro_debug_16_layers()
@@ -226,27 +239,18 @@ def deepseek_v4_pro_simulate_16_layers_pp4_cp4_ep4() -> SimulationTrainerConfig:
         parallelism=dataclasses.replace(
             base_config.parallelism,
             pipeline_parallel_degree=4,
-            # 1 * 2 * 4 * 1 * 4 = 128 == TORCHTITAN_SIM_WORLD_SIZE
+            # 1 * 8 * 4 * 1 * 4 = 128 == simulator world_size
             tensor_parallel_degree=1,
             context_parallel_degree=4,
             expert_parallel_degree=4,
-            data_parallel_shard_degree=-1,  # auto: 128 / (1*4*1*4) = 8... wait
+            data_parallel_shard_degree=-1,  # auto: 128 / (1*4*1*4) = 8
         ),
     )
-    # Fix: dp_shard = world_size / (dp_replicate * cp * tp * pp * ep * etp)
-    # = 128 / (1 * 4 * 1 * 4 * 4 * 1) = 2
-    # But ParallelDims computes: dp_shard = world_size / (cp * tp * pp * ep * etp)
-    # = 128 / (4 * 1 * 4 * 4 * 1) = 2
-    sim_config = _to_simulation_config(
+    return _to_simulation_config(
         base_config,
         output_dir="./simulator_output/deepseek_v4_pro_16_layers_pp4_cp4_ep4",
+        world_size=128,
     )
-    sim_config.simulation.simulated_parallel_degrees = {
-        "pp": 4, "tp": 1, "cp": 4, "ep": 4,
-        "dp_replicate": 1, "dp_shard": 2,
-        "etp": 1, "world_size": 128,
-    }
-    return sim_config
 
 
 def deepseek_v4_pro_simulate_16_layers_dualpipe() -> SimulationTrainerConfig:
@@ -289,14 +293,8 @@ def deepseek_v4_pro_simulate_16_layers_dualpipe() -> SimulationTrainerConfig:
             data_parallel_replicate_degree=1,
         ),
     )
-    sim_config = _to_simulation_config(
+    return _to_simulation_config(
         base_config,
         output_dir="./simulator_output/deepseek_v4_pro_16_layers_dualpipe",
-        comm_mode="multi_proc_meta",
+        world_size=2,
     )
-    sim_config.simulation.simulated_parallel_degrees = {
-        "pp": 2, "tp": 1, "cp": 1, "ep": 1,
-        "dp_replicate": 1, "dp_shard": 1,
-        "etp": 1, "world_size": 2,
-    }
-    return sim_config

@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import os
+import sys
 
 import torch
 from torchtitan.config import ConfigManager
@@ -36,17 +37,35 @@ def _compile_requires_bypass_triton_codegen(model_name: str) -> bool:
     return not _uses_inductor_npu_ext(model_name)
 
 
+def _resolve_simulator_runtime(config):  # noqa: ANN001, ANN202
+    """Resolve simulator-only runtime state from the final parsed config."""
+    if not hasattr(config, "simulation"):
+        return None
+
+    from torchtitan_npu.simulator.utils import (
+        resolve_simulation_runtime_from_environment,
+    )
+
+    return resolve_simulation_runtime_from_environment(config)
+
+
+def _parse_config():  # noqa: ANN202
+    # ConfigManager's default argument captures sys.argv at module import
+    # time. Read the current argv explicitly for embedded launchers.
+    return ConfigManager().parse_args(sys.argv[1:])
+
+
 def main() -> None:
     """Main entry point for NPU training with new config system."""
     init_logger()
 
-    config_manager = ConfigManager()
-    config = config_manager.parse_args()
+    config = _parse_config()
+    _resolve_simulator_runtime(config)
 
     trainer = None
 
     comm_mode = os.getenv("COMM_MODE", None)
-    # For simulator configs, comm.mode is set in config_registry
+    # Simulator mode is derived from the final PP degree after CLI parsing.
     if hasattr(config, "comm") and config.comm.mode in ("fake_backend", "local_tensor", "multi_proc_meta"):
         comm_mode = config.comm.mode
     if comm_mode not in ("fake_backend", "local_tensor", "multi_proc_meta"):

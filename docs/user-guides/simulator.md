@@ -153,52 +153,45 @@ ln -s ../deepseekv3_tokenizer/tokenizer_config.json tests/assets/tokenizer/deeps
 
 ### 3. 运行仿真
 
-Simulator 复用现有的 `scripts/run_train.sh` 脚本和 `torchtitan_npu.entry` 入口，只需将 `MODULE` 改为 `torchtitan_npu.simulator`，`CONFIG` 改为对应的仿真配置函数名，并设置 `COMM_MODE=fake_backend`：
+Simulator 推荐使用 `run_simulator_spawn.py`。启动器会先完成与 worker 相同的配置解析和 CLI 覆盖，再根据最终 PP degree 自动选择通信模式和真实进程数：
 
 ```bash
-# 16 层小规模验证（快速跑通，约 1 分钟）
-MODULE=torchtitan_npu.simulator \
-CONFIG=deepseek_v4_pro_simulate_16_layers \
-COMM_MODE=fake_backend \
-NGPU=384 \
-bash scripts/run_train.sh --hf_assets_path ./tests/assets/tokenizer/deepseekv3_tokenizer
+# 16 层小规模验证（PP=1，自动使用 fake_backend）
+python3 scripts/run_simulator_spawn.py \
+    --config deepseek_v4_pro_simulate_16_layers \
+    --hf_assets_path ./tests/assets/tokenizer/deepseekv3_tokenizer
 ```
 
 ```bash
-# 61 层验收配置（384 die，PP=1/TP=1/CP=1/EP=192）
-MODULE=torchtitan_npu.simulator \
-CONFIG=deepseek_v4_pro_simulate_61_layers \
-COMM_MODE=fake_backend \
-NGPU=384 \
-bash scripts/run_train.sh --hf_assets_path ./tests/assets/tokenizer/deepseekv3_tokenizer
+# 61 层验收配置（384 die，PP=1）
+python3 scripts/run_simulator_spawn.py \
+    --config deepseek_v4_pro_simulate_61_layers \
+    --hf_assets_path ./tests/assets/tokenizer/deepseekv3_tokenizer
 ```
 
 ```bash
-# 千卡规模（2048 die，PP=16/TP=8/CP=4/EP=128/FSDP auto）
-MODULE=torchtitan_npu.simulator \
-CONFIG=deepseek_v4_pro_simulate_61_layers_pp16_tp8_cp4_ep128 \
-COMM_MODE=fake_backend \
-NGPU=2048 \
-bash scripts/run_train.sh --hf_assets_path ./tests/assets/tokenizer/deepseekv3_tokenizer
+# 千卡规模（模拟 2048 die，自动启动 16 个 PP 进程）
+python3 scripts/run_simulator_spawn.py \
+    --config deepseek_v4_pro_simulate_61_layers_pp16_tp8_cp4_ep128 \
+    --hf_assets_path ./tests/assets/tokenizer/deepseekv3_tokenizer
 ```
 
-也可以直接用 `python3 -m` 调用（与 `run_train.sh` 中 `COMM_MODE` 分支等价）：
+PP=1 时也可以直接用 `python3 -m` 调用，通信模式仍会自动解析：
 
 ```bash
-NGPU=384 LOCAL_RANK=0 python3 -m torchtitan_npu.entry \
+NGPU=384 python3 -m torchtitan_npu.entry \
     --module torchtitan_npu.simulator \
     --config deepseek_v4_pro_simulate_61_layers \
-    --comm.mode=fake_backend \
     --training.steps=1 \
     --hf_assets_path ./tests/assets/tokenizer/deepseekv3_tokenizer
 ```
 
 > [!NOTE]
-> - `NGPU` 环境变量指定模拟的**总卡数**（world_size），必须与配置中的并行度乘积一致。
-> - `--comm.mode=fake_backend` 是必须的，启用 fake Process Group 实现单进程模拟全部 rank。
+> - `simulation.world_size` 指定模拟的**总卡数**，可通过 `--simulation.world-size` 覆盖；未配置时回退到 `NGPU`。
+> - 最终 PP=1 时自动使用 `fake_backend`；最终 PP>1 时自动使用 `multi_proc_meta`。
 > - `--training.steps=1` 是默认值，Simulator 只捕获一个 step。
 > - `--hf_assets_path` 指定 tokenizer 路径，用仓库内置的 `deepseekv3_tokenizer` 即可（见上一步说明）。
-> - 不需要 `torchrun`，单进程 `python3 -m` 即可运行。
+> - CLI 对 PP/TP/CP/EP/DP 的覆盖会在选择模式、计算进程数和构建 mesh 前统一生效。
 
 ### 4. 获取输出文件
 
@@ -233,12 +226,11 @@ cat simulator_output/deepseek_v4_pro_61_layers/summary.txt
 | `deepseek_v4_pro_simulate_16_layers_cp4` | DeepSeek-V4-Pro | 16 | PP=1/CP=4/EP=16 | 16 | fake_backend | CP 通信捕获验证 |
 | `deepseek_v4_pro_simulate_16_layers_pp4_cp4` | DeepSeek-V4-Pro | 16 | PP=4/CP=4/DP=4 | 64 | multi_proc_meta | PP+CP+FSDP 全通信捕获 |
 | `deepseek_v4_pro_simulate_61_layers` | DeepSeek-V4-Pro | 61 | PP=1/TP=1/CP=1/EP=192 | 384 | fake_backend | 验收配置 |
-| `deepseek_v4_pro_simulate_61_layers_pp16_tp8_cp4_ep128` | DeepSeek-V4-Pro | 61 | PP=16/TP=8/CP=4/EP=128/FSDP=-1 | 2048 | fake_backend | 千卡规模（单进程） |
-| `deepseek_v4_pro_simulate_61_layers_pp16_tp8_cp4_ep128_multiproc` | DeepSeek-V4-Pro | 61 | PP=16/TP=8/CP=4/EP=128/FSDP=-1 | 2048 | multi_proc_meta | 千卡规模（多进程） |
+| `deepseek_v4_pro_simulate_61_layers_pp16_tp8_cp4_ep128` | DeepSeek-V4-Pro | 61 | PP=16/TP=8/CP=4/EP=128/FSDP=-1 | 2048 | multi_proc_meta | 千卡规模（16 个 PP 进程） |
 
-每个仿真配置内部复用对应的真实训练配置（如 `deepseek_v4_pro_debug_61_layers_4k_384die()`），原样继承 model_spec、并行度、optimizer 等全部字段，仅强制以下三项：
+每个仿真配置内部复用对应的真实训练配置（如 `deepseek_v4_pro_debug_61_layers_4k_384die()`），原样继承 model_spec、并行度、optimizer 等全部字段。运行时统一处理：
 
-- `comm.mode = "fake_backend"`（fake PG）
+- 根据最终 PP degree 推导 `comm.mode`
 - `compile.enable = False`（捕获需要 eager dispatch）
 - `debug.moe_force_load_balance = True`（MoE 强制负载均衡）
 
@@ -422,18 +414,22 @@ def my_model_simulate() -> SimulationTrainerConfig:
         ),
     )
 
-    # 3. 转为仿真配置（自动强制 fake_backend / compile=False / moe_force_load_balance）
-    return _to_simulation_config(base_config, output_dir="./simulator_output/my_model")
+    # 3. 只声明模拟总规模；通信模式和其余 degree 在 CLI 解析后生成
+    return _to_simulation_config(
+        base_config,
+        output_dir="./simulator_output/my_model",
+        world_size=64,
+    )
 ```
 
 关键约束：
 
 - 内存跟踪默认开启。可通过 CLI 设置 `--simulation.no-enable-memory-tracking` 关闭；关闭后不记录内存事件、tensor 生命周期和 FSDP 参数驻留，也不执行静态内存估算。内存结果统一输出到 `<output_dir>/memory/`。
-- `world_size`（`NGPU` 环境变量）必须等于 `dp_replicate × dp_shard × cp × tp × pp`。`data_parallel_shard_degree=-1` 时由 torchtitan 自动计算。
+- `simulation.world_size` 必须等于 `dp_replicate × dp_shard × cp × tp × pp`；EP/ETP 不额外乘入 dense world size。`data_parallel_shard_degree=-1` 时由 simulator 根据最终 CLI 配置计算。
 - `pipeline_parallel_degree > 1` 时，DeepSeek-V4 不支持 MTP，需设 `num_mtp_modules=0`。
 - `pipeline_parallel_degree > 1` 时，`local_batch_size` 需 ≥ `pp_degree`（1F1B 调度需要足够 microbatch）。
-- PP > 1 时需使用 `multi_proc_meta` 模式（`comm_mode="multi_proc_meta"`），并用 `torchrun --nproc_per_node=PP` 启动。
-- `multi_proc_meta` 模式下需设置 `simulated_parallel_degrees` 字典（含 `world_size`），用于 `TORCHTITAN_SIM_WORLD_SIZE` 环境变量。
+- PP > 1 时自动使用 `multi_proc_meta`；PP=1 时自动使用 `fake_backend`，配置函数无需编码 mode。
+- `simulated_parallel_degrees` 是解析后的兼容快照，由 simulator 自动生成，不应在新配置中手写。
 
 ## 多进程仿真模式（multi_proc_meta）
 
@@ -466,14 +462,14 @@ def my_model_simulate() -> SimulationTrainerConfig:
 
 PyTorch 的 `_new_group_with_tag` 检查 `group_world_size <= global_world_size`。当 gloo world_size=4 但需要创建 size=16 的 FSDP 子组时，此检查会失败。
 
-`_patch_new_group_for_fake_backend()` 在 `_is_meta_simulation=True` 时，检测到 `group_ws > gloo_ws` 或 `rank >= gloo_ws`，直接调用 `_new_process_group_helper` 创建 `FakeProcessGroup`，绕过 size/range 检查。FakeProcessGroup 不需要真实进程，只需正确的 rank/size。
+`_patch_new_group_for_fake_backend()` 在 `_is_meta_simulation=True` 且调用方明确请求 `backend="fake"` 时，如果检测到 `group_ws > gloo_ws` 或 `rank >= gloo_ws`，直接调用 `_new_process_group_helper` 创建并注册 `FakeProcessGroup`，只绕过逻辑 rank 超出真实 gloo world 的检查。
 
 #### 2. Fake mesh 的 device handle
 
 当 `device_type="fake"` 时，`_get_device_handle("fake")` 返回 `getattr(torch, "fake", None)`。Simulator 将 `torch.fake` 指向与 `torch.meta` 相同的 `_MetaDeviceModule` stub，使 `device_count()`、`current_device()` 等调用返回安全默认值。
 
 同时 patch 了：
-- `DeviceMesh._setup_world_group_and_device`：对 fake mesh 返回 size=mesh_size 的 FakeProcessGroup（而非 gloo default group）
+- `DeviceMesh._setup_world_group_and_device`：跳过 fake mesh 的真实 world-size 限制；各维度 FakeProcessGroup 随后由 `_init_process_groups()` 正式创建和注册
 - `FSDP._get_device_from_mesh`：对 fake mesh 返回 `torch.device("meta")`
 - `DTensor._random._resolve_device`：对 fake mesh 返回 `torch.device("meta")`
 
@@ -492,23 +488,22 @@ PP stage 间的 tensor shape/dtype 元数据通过 `PipelineStage._send_meta/_re
 ### 运行方式
 
 ```bash
-# PP=4 + CP=4 多进程仿真（4 个 gloo 进程，模拟 64 rank）
-NGPU=64 torchrun --nproc_per_node=4 --master_port=29500 \
-    -m torchtitan_npu.entry \
-    --module torchtitan_npu.simulator \
+# PP=4 + CP=4：解析最终配置后自动启动 4 个 gloo 进程，模拟 64 rank
+python3 scripts/run_simulator_spawn.py \
     --config deepseek_v4_pro_simulate_16_layers_pp4_cp4 \
-    --training.steps=1 \
     --hf_assets_path ./tests/assets/tokenizer/deepseekv3_tokenizer
 ```
+
+高级用法可以直接使用 `torchrun`，但进程数在 Python 解析配置前已经确定，因此必须由调用方保证 `--nproc_per_node` 等于 CLI 覆盖后的最终 PP degree。
 
 > [!IMPORTANT]
 > - `--nproc_per_node` 必须等于 PP degree（如 PP=4 则 4 个进程）
 > - 外部 gloo 进程的 `RANK` 必须连续取 `0..PP-1`，且 `WORLD_SIZE=PP`。例如 PP=4 时使用
 >   `RANK=0,1,2,3`；`0,16,32,48` 这类值只是完整逻辑 mesh 中各 PP stage 的代表 rank，
 >   由 simulator 内部映射，不能作为 gloo 的进程 `RANK`
-> - `NGPU` 必须等于完整模拟 world_size（如 PP=4 × CP=4 × DP=4 = 64）
+> - `simulation.world_size`（或作为回退的 `NGPU`）必须等于完整模拟 world_size（如 PP=4 × CP=4 × DP=4 = 64）
 > - 配置中 `context_parallel_degree` 等设为真实值（非 1），`data_parallel_shard_degree=-1` 自动计算
-> - `simulated_parallel_degrees` 字典中的 `world_size` 用于设置 `TORCHTITAN_SIM_WORLD_SIZE` 环境变量
+> - `simulated_parallel_degrees` 和 `TORCHTITAN_SIM_WORLD_SIZE` 由解析后的 runtime 自动生成
 > - `run_simulator_spawn.py` 只会在全部 PP rank 成功退出、各自抓到本 stage 的前反向 template 并完成输出后报告成功；
 >   任一 rank 失败、缺失或重复都会使启动器返回失败
 
