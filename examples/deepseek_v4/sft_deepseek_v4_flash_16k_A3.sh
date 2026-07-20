@@ -30,6 +30,7 @@ ENCODING_MODULE_PATH="${ENCODING_MODULE_PATH:-${HF_ASSETS_PATH}/encoding/encodin
 EXTRA_ARGS=(
   # Trainer overrides
   --hf_assets_path "${HF_ASSETS_PATH}"
+  --parallelism.data_parallel_shard_degree -1
   --parallelism.expert_parallel_degree 64
   --parallelism.context_parallel_degree 4
   --training.global_batch_size -1

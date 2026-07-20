@@ -11,8 +11,8 @@ HF_ASSETS_PATH="${HF_ASSETS_PATH:-/data/models/DeepSeek-V4-Flash-bf16}"
 CHECKPOINT_INITIAL_LOAD_PATH="${CHECKPOINT_INITIAL_LOAD_PATH:-/data/models/DeepSeek-V4-Flash-bf16}"
 
 EXTRA_ARGS=(
+  # Trainer overrides
   --hf_assets_path "${HF_ASSETS_PATH}"
-  --dataloader.dataset "${DATASET}"
   # --checkpoint.no_enable # debug
   --checkpoint.initial_load_path "${CHECKPOINT_INITIAL_LOAD_PATH}"
   # --profiling.enable_profiling
@@ -24,11 +24,17 @@ EXTRA_ARGS=(
   --profiling.profile_with_memory
   # --training.steps 20 # debug
   # --lr_scheduler.warmup_steps 4 # debug
+  # User top-level Trainer overrides
+  "$@"
+
+  ################## Top-level CLI overrides end; following subcommands cannot be overridden. ##################
+  # DataLoader subcommand
+  dataloader:config
+  --dataloader.dataset "${DATASET}"
 )
 
 MODULE="${MODULE:-torchtitan_npu.models.deepseek_v4}" \
 CONFIG="${CONFIG:-deepseek_v4_flash_4k_128npus}" \
 NGPU="${NGPU:-16}" \
 bash scripts/run_train_multinodes.sh \
-  "${EXTRA_ARGS[@]}" \
-  "$@"
+  "${EXTRA_ARGS[@]}"
