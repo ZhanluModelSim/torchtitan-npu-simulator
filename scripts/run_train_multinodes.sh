@@ -61,7 +61,7 @@ set -exo pipefail
 
 RDZV_ID="dsv32_train_$(date +%Y%m%d)"
 MODULE=${MODULE:-"torchtitan_npu.models.deepseek_v32"}
-CONFIG=${CONFIG:-"deepseek_v32_671b_61layers_4k_128die"}
+CONFIG=${CONFIG:-"deepseek_v32_671b_128npus"}
 TRAIN_FILE=${TRAIN_FILE:-"torchtitan_npu.entry"}
 time=$(date +%Y%m%d%H%M)
 logfile=dsv32_128die_${time}_node${NODE_RANK}_${LOCAL_HOST//./_}.log

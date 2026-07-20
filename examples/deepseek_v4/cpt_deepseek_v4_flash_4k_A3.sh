@@ -27,7 +27,7 @@ EXTRA_ARGS=(
 )
 
 MODULE="${MODULE:-torchtitan_npu.models.deepseek_v4}" \
-CONFIG="${CONFIG:-deepseek_v4_flash_4k_128die}" \
+CONFIG="${CONFIG:-deepseek_v4_flash_4k_128npus}" \
 NGPU="${NGPU:-16}" \
 bash scripts/run_train_multinodes.sh \
   "${EXTRA_ARGS[@]}" \

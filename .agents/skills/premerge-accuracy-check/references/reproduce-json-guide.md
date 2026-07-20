@@ -22,7 +22,7 @@ tar czf ./numerical_report/infra_files.tar.gz -C "$REPO_ROOT" \
   "candidate_branch": "<candidate_branch>",
   "candidate_commit": "<candidate_commit_hash>",
   "model_name": "torchtitan_npu.models.deepseek_v32",
-  "config_name": "deepseek_v32_671b_4layers_debug",
+  "config_name": "deepseek_v32_671b_16npus",
   "training_steps": 100,
   "parallelism_summary": "TP=1/EP=1 (FSDP), TP=2/EP=1 (TP)",
   "branch_diff": "分支关系 + 改动总结（见下方规则）",

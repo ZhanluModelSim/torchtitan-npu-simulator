@@ -87,13 +87,14 @@ def _public_config_names(registry: ModelConfigRegistry, prefixes: tuple[str, ...
 def _config_name_pattern(registry: ModelConfigRegistry) -> re.Pattern[str]:
     model_name = _model_name_pattern(registry.config_model_names)
     seq_len = r"[0-9]+k"
-    cluster_size = r"[0-9]+die"
+    cluster_size = r"[0-9]+npus"
     suffix = r"[a-z0-9]+"
     return re.compile(
         rf"^(?:"
-        rf"{model_name}_{seq_len}_{cluster_size}(?:_{suffix})?"
-        rf"|sft_{model_name}_{seq_len}_{cluster_size}_{suffix}"
+        rf"{model_name}_{seq_len}(?:_{suffix})*_{cluster_size}"
+        rf"|sft_{model_name}_{seq_len}_{suffix}_{cluster_size}"
         rf"|debug_{model_name}_(?:single_node(?:_{suffix})?|smoketest)"
+        rf"|debug_{model_name}(?:_{suffix})*_{cluster_size}"
         rf")$"
     )
 
@@ -252,7 +253,7 @@ def test_trainer_base_config_sets_shared_training_defaults():
 
 def test_deepseek_v4_flash_cpt_config_applies_flash_and_cpt_overrides():
     config_registry = _deepseek_v4_registry()
-    trainer_config = config_registry.deepseek_v4_flash_4k_128die()
+    trainer_config = config_registry.deepseek_v4_flash_4k_128npus()
 
     assert trainer_config.model_spec.name == "deepseek_v4"
     assert trainer_config.model_spec.flavor == "v4_flash_43layers_256experts"
@@ -280,8 +281,8 @@ def test_deepseek_v4_flash_cpt_config_applies_flash_and_cpt_overrides():
 
 def test_deepseek_v4_pro_cpt_config_only_overrides_pro_differences():
     config_registry = _deepseek_v4_registry()
-    flash_config = config_registry.deepseek_v4_flash_4k_128die()
-    pro_config = config_registry.deepseek_v4_pro_4k_384die()
+    flash_config = config_registry.deepseek_v4_flash_4k_128npus()
+    pro_config = config_registry.deepseek_v4_pro_4k_384npus()
 
     assert pro_config.model_spec.name == flash_config.model_spec.name
     assert pro_config.model_spec.flavor == "v4_pro_61layers_384experts"
@@ -300,7 +301,7 @@ def test_deepseek_v4_pro_cpt_config_only_overrides_pro_differences():
 
 def test_debug_single_node_config_applies_common_debug_semantics_without_cpt_comm_override():
     config_registry = _deepseek_v4_registry()
-    trainer_config = config_registry.debug_deepseek_v4_flash_single_node()
+    trainer_config = config_registry.debug_deepseek_v4_flash_8npus()
 
     assert trainer_config.model_spec.flavor == "v4_flash_43layers_16experts"
     assert _converter_names(trainer_config) == [
@@ -419,7 +420,7 @@ def test_chat_processor_import_path_resolves_processors():
 def test_deepseek_v4_debug_configs_do_not_inherit_cpt_comm_override():
     config_registry = _deepseek_v4_registry()
 
-    for config_name in ("debug_deepseek_v4_flash_single_node", "debug_deepseek_v4_pro_single_node"):
+    for config_name in ("debug_deepseek_v4_flash_8npus", "debug_deepseek_v4_pro_16npus"):
         trainer_config = getattr(config_registry, config_name)()
 
         assert trainer_config.comm.trace_buf_size != 0
@@ -430,8 +431,8 @@ def test_deepseek_v4_flash_single_node_mxfp8_derives_from_flash_single_node_conf
 
     config_registry = _deepseek_v4_registry()
 
-    flash_config = config_registry.debug_deepseek_v4_flash_single_node()
-    mxfp8_config = config_registry.debug_deepseek_v4_flash_single_node_mxfp8()
+    flash_config = config_registry.debug_deepseek_v4_flash_8npus()
+    mxfp8_config = config_registry.debug_deepseek_v4_flash_mxfp8_8npus()
 
     assert mxfp8_config.model_spec == flash_config.model_spec
     assert mxfp8_config.parallelism == flash_config.parallelism
@@ -446,8 +447,8 @@ def test_deepseek_v4_flash_single_node_mxfp8_derives_from_flash_single_node_conf
 def test_deepseek_v4_pro_single_node_derives_from_flash_single_node_config():
     config_registry = _deepseek_v4_registry()
 
-    flash_config = config_registry.debug_deepseek_v4_flash_single_node()
-    pro_config = config_registry.debug_deepseek_v4_pro_single_node()
+    flash_config = config_registry.debug_deepseek_v4_flash_8npus()
+    pro_config = config_registry.debug_deepseek_v4_pro_16npus()
 
     assert pro_config.model_spec.name == flash_config.model_spec.name
     assert pro_config.model_spec.flavor == "v4_pro_16layers_16experts"
@@ -468,7 +469,7 @@ def test_deepseek_v4_cpt_config_can_select_chat_dataloader_from_cli():
             "--module",
             "torchtitan_npu.models.deepseek_v4",
             "--config",
-            "deepseek_v4_flash_4k_128die",
+            "deepseek_v4_flash_4k_128npus",
             "--training.seq_len",
             "16384",
             "--parallelism.context_parallel_degree",
@@ -518,7 +519,7 @@ def test_deepseek_v4_chat_dataloader_script_order_keeps_top_level_overrides_befo
             "--module",
             "torchtitan_npu.models.deepseek_v4",
             "--config",
-            "deepseek_v4_flash_4k_128die",
+            "deepseek_v4_flash_4k_128npus",
             "--training.global_batch_size",
             "-1",
             "--checkpoint.no_load_only",
@@ -567,7 +568,7 @@ def test_deepseek_v4_cpt_config_can_select_gsm8k_chat_dataloader_from_cli():
             "--module",
             "torchtitan_npu.models.deepseek_v4",
             "--config",
-            "deepseek_v4_flash_4k_128die",
+            "deepseek_v4_flash_4k_128npus",
             "--training.seq_len",
             "1024",
             "dataloader:chat_data_loader_config",
@@ -601,7 +602,7 @@ def test_chat_dataloader_help_exposes_one_typed_dataset_cli_surface():
             "--module",
             "torchtitan_npu.models.deepseek_v4",
             "--config",
-            "deepseek_v4_flash_4k_128die",
+            "deepseek_v4_flash_4k_128npus",
             "dataloader:chat_data_loader_config",
             "--help",
         ],
