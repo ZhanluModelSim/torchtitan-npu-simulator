@@ -81,7 +81,7 @@ checkpoint 配置由 `torchtitan.components.checkpoint.CheckpointManager.Config`
 ```bash
 NGPU=16 \
 MODULE=torchtitan_npu.models.deepseek_v32 \
-CONFIG=deepseek_v32_671b_16npus \
+CONFIG=deepseek_v32_671b_4layers_debug \
 bash scripts/run_train.sh \
   --dump_folder ./outputs/dsv32_4layers \
   --checkpoint.enable \
@@ -139,7 +139,7 @@ checkpoint=CheckpointManager.Config(
 ```bash
 NGPU=16 \
 MODULE=torchtitan_npu.models.deepseek_v32 \
-CONFIG=deepseek_v32_671b_16npus \
+CONFIG=deepseek_v32_671b_4layers_debug \
 bash scripts/run_train.sh \
   --dump_folder ./outputs/dsv32_4layers \
   --checkpoint.enable \
@@ -163,7 +163,7 @@ bash scripts/run_train.sh \
 ```bash
 NGPU=16 \
 MODULE=torchtitan_npu.models.deepseek_v32 \
-CONFIG=deepseek_v32_671b_16npus \
+CONFIG=deepseek_v32_671b_4layers_debug \
 bash scripts/run_train.sh \
   --dump_folder ./outputs/dsv32_new_job \
   --checkpoint.enable \
@@ -205,7 +205,7 @@ bash scripts/run_train.sh \
 ```bash
 NGPU=16 \
 MODULE=torchtitan_npu.models.deepseek_v32 \
-CONFIG=deepseek_v32_671b_128npus \
+CONFIG=deepseek_v32_671b_61layers_4k_128die \
 bash scripts/run_train.sh \
   --checkpoint.enable \
   --checkpoint.initial_load_in_hf \
@@ -233,7 +233,7 @@ HF 权重只能作为模型权重加载，不能恢复优化器或训练步数�
 ```bash
 NGPU=16 \
 MODULE=torchtitan_npu.models.deepseek_v32 \
-CONFIG=deepseek_v32_671b_128npus \
+CONFIG=deepseek_v32_671b_61layers_4k_128die \
 bash scripts/run_train.sh \
   --dump_folder ./outputs/dsv32_hf_export \
   --checkpoint.enable \
@@ -259,7 +259,7 @@ seed checkpoint 用于先在单卡 CPU 初始化模型，再让多卡任务通�
 ```bash
 NGPU=1 \
 MODULE=torchtitan_npu.models.deepseek_v32 \
-CONFIG=deepseek_v32_671b_16npus \
+CONFIG=deepseek_v32_671b_4layers_debug \
 bash scripts/run_train.sh \
   --checkpoint.enable \
   --checkpoint.create_seed_checkpoint \
@@ -290,7 +290,7 @@ python scripts/checkpoint_conversion/convert_to_hf.py \
   ./outputs/dsv32_4layers/checkpoint/step-1000 \
   ./outputs/dsv32_4layers/hf_output \
   --model_name deepseek_v32 \
-  --model_flavor deepseek_v32_671b_16npus \
+  --model_flavor deepseek_v32_671b_4layers_debug \
   --hf_assets_path ./assets/hf/DeepSeek-V3.2 \
   --export_dtype bfloat16
 ```

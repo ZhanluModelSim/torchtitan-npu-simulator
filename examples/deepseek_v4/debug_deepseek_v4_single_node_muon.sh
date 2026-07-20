@@ -40,7 +40,7 @@ EXTRA_ARGS=(
 )
 
 MODULE="${MODULE:-torchtitan_npu.models.deepseek_v4}" \
-CONFIG="${CONFIG:-debug_deepseek_v4_flash_8npus}" \
+CONFIG="${CONFIG:-debug_deepseek_v4_flash_single_node}" \
 NGPU="${NGPU:-8}" \
 bash scripts/run_train.sh \
   "${EXTRA_ARGS[@]}"

@@ -372,20 +372,19 @@ def _smoketest_model() -> DeepSeekV32ModelNpu.Config:
     )
 
 
-def _v32_671b_61layers_16experts_model() -> DeepSeekV32ModelNpu.Config:
+def _671b_debug_4_layers_model() -> DeepSeekV32ModelNpu.Config:
     # FlexAttention.Config is the placeholder required by
     # upstream validation (runtime inner_attention is replaced
     # by ``DSASparseAttention`` in ``Attention.__init__``).
     return _make_dsv32_model_config(
-        n_layers=61,
+        n_layers=4,
         mask_type="block_causal",
         inner_attention=FlexAttention.Config(),
-        num_experts=16,
         route_scale=2.5,
     )
 
 
-def _v32_671b_61layers_256experts_model() -> DeepSeekV32ModelNpu.Config:
+def _671b_debug_128die_model() -> DeepSeekV32ModelNpu.Config:
     return _make_dsv32_model_config(
         dim=7168,
         inter_dim=18432,
@@ -399,8 +398,8 @@ def _v32_671b_61layers_256experts_model() -> DeepSeekV32ModelNpu.Config:
 
 deepseekv32_configs = {
     "smoketest": _smoketest_model,
-    "_v32_671b_61layers_16experts": _v32_671b_61layers_16experts_model,
-    "_v32_671b_61layers_256experts": _v32_671b_61layers_256experts_model,
+    "671B_debug_4_layers": _671b_debug_4_layers_model,
+    "671B_debug_128die": _671b_debug_128die_model,
 }
 
 

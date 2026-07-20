@@ -92,7 +92,7 @@ def _make_dsv3_model_config(
     )
 
 
-def _v3_16b_model() -> DeepSeekV3ModelNpu.Config:
+def _16b_model() -> DeepSeekV3ModelNpu.Config:
     model_config = _make_dsv3_model_config(
         vocab_size=102400,
         dim=2048,
@@ -124,7 +124,7 @@ def _v3_16b_model() -> DeepSeekV3ModelNpu.Config:
     return model_config
 
 
-def _smoketest_model() -> DeepSeekV3ModelNpu.Config:
+def _671b_debug_model() -> DeepSeekV3ModelNpu.Config:
     return _make_dsv3_model_config(
         dim=128,
         inter_dim=512,
@@ -135,18 +135,29 @@ def _smoketest_model() -> DeepSeekV3ModelNpu.Config:
     )
 
 
-def _v3_671b_61layers_16experts_model() -> DeepSeekV3ModelNpu.Config:
+def _671b_debug_4layers_256experts() -> DeepSeekV3ModelNpu.Config:
     return _make_dsv3_model_config(
         dim=7168,
         inter_dim=18432,
         moe_inter_dim=2048,
-        n_layers=61,
+        n_layers=4,
         n_dense_layers=3,
-        num_experts=16,
+        num_experts=256,
     )
 
 
-def _v3_671b_61layers_256experts_model() -> DeepSeekV3ModelNpu.Config:
+def _671b_debug_16die_model() -> DeepSeekV3ModelNpu.Config:
+    return _make_dsv3_model_config(
+        dim=7168,
+        inter_dim=18432,
+        moe_inter_dim=2048,
+        n_layers=4,
+        n_dense_layers=3,
+        num_experts=8,
+    )
+
+
+def _671b_debug_128die_model() -> DeepSeekV3ModelNpu.Config:
     return _make_dsv3_model_config(
         dim=7168,
         inter_dim=18432,
@@ -158,10 +169,11 @@ def _v3_671b_61layers_256experts_model() -> DeepSeekV3ModelNpu.Config:
 
 
 deepseekv3_configs = {
-    "16B": _v3_16b_model,
-    "smoketest": _smoketest_model,
-    "_v3_671b_61layers_16experts": _v3_671b_61layers_16experts_model,
-    "_v3_671b_61layers_256experts": _v3_671b_61layers_256experts_model,
+    "16B": _16b_model,
+    "671B_debug": _671b_debug_model,
+    "671B_debug_4layers_256experts": _671b_debug_4layers_256experts,
+    "671B_debug_16die": _671b_debug_16die_model,
+    "671B_debug_128die": _671b_debug_128die_model,
 }
 
 

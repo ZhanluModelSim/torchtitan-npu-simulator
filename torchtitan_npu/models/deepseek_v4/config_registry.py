@@ -63,7 +63,7 @@ def _flash_base() -> TrainerConfig:
     )
 
 
-def deepseek_v4_flash_4k_128npus() -> TrainerConfig:
+def deepseek_v4_flash_4k_128die() -> TrainerConfig:
     base = cpt_default_config(_flash_base())
     return replace(
         base,
@@ -72,8 +72,8 @@ def deepseek_v4_flash_4k_128npus() -> TrainerConfig:
     )
 
 
-def deepseek_v4_pro_4k_384npus() -> TrainerConfig:
-    base = replace(deepseek_v4_flash_4k_128npus(), model_spec=model_registry("v4_pro_61layers_384experts"))
+def deepseek_v4_pro_4k_384die() -> TrainerConfig:
+    base = replace(deepseek_v4_flash_4k_128die(), model_spec=model_registry("v4_pro_61layers_384experts"))
     return replace(
         base,
         training=replace(base.training, global_batch_size=384),
@@ -82,7 +82,7 @@ def deepseek_v4_pro_4k_384npus() -> TrainerConfig:
     )
 
 
-def debug_deepseek_v4_flash_8npus() -> TrainerConfig:
+def debug_deepseek_v4_flash_single_node() -> TrainerConfig:
     base = debug_single_node_eq_pruned_config(_flash_base())
     return replace(
         base,
@@ -92,8 +92,8 @@ def debug_deepseek_v4_flash_8npus() -> TrainerConfig:
     )
 
 
-def debug_deepseek_v4_flash_mxfp8_8npus() -> TrainerConfig:
-    base = debug_deepseek_v4_flash_8npus()
+def debug_deepseek_v4_flash_single_node_mxfp8() -> TrainerConfig:
+    base = debug_deepseek_v4_flash_single_node()
     return replace(
         base,
         model_converters=ModelConvertersContainer.Config(
@@ -103,8 +103,8 @@ def debug_deepseek_v4_flash_mxfp8_8npus() -> TrainerConfig:
     )
 
 
-def debug_deepseek_v4_pro_16npus() -> TrainerConfig:
-    base = debug_deepseek_v4_flash_8npus()
+def debug_deepseek_v4_pro_single_node() -> TrainerConfig:
+    base = debug_deepseek_v4_flash_single_node()
     return replace(
         base,
         model_spec=model_registry("v4_pro_16layers_16experts"),

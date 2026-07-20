@@ -33,10 +33,10 @@ def _default_converters() -> list:
     ]
 
 
-def deepseek_v32_671b_16npus() -> TrainerConfig:
+def deepseek_v32_671b_4layers_debug() -> TrainerConfig:
     return TrainerConfig(
         hf_assets_path="./assets/hf/DeepSeek-V3.2",
-        model_spec=model_registry("_v32_671b_61layers_16experts"),
+        model_spec=model_registry("671B_debug_4_layers"),
         debug=DebugConfig(print_config=True),
         model_converters=ModelConvertersContainer.Config(converters=_default_converters()),
         metrics=MetricsProcessor.Config(log_freq=1),
@@ -57,7 +57,7 @@ def deepseek_v32_671b_16npus() -> TrainerConfig:
             min_lr_factor=0.01,
         ),
         training=TrainingConfig(
-            local_batch_size=1,
+            local_batch_size=4,
             seq_len=2048,
             max_norm=1.0,
             steps=20,
@@ -98,10 +98,10 @@ def deepseek_v32_671b_16npus() -> TrainerConfig:
     )
 
 
-def deepseek_v32_671b_128npus() -> TrainerConfig:
+def deepseek_v32_671b_61layers_4k_128die() -> TrainerConfig:
     return TrainerConfig(
         hf_assets_path="./assets/hf/DeepSeek-V3.2",
-        model_spec=model_registry("_v32_671b_61layers_256experts"),
+        model_spec=model_registry("671B_debug_128die"),
         debug=DebugConfig(print_config=True),
         model_converters=ModelConvertersContainer.Config(converters=_default_converters()),
         metrics=MetricsProcessor.Config(log_freq=1),
@@ -153,10 +153,10 @@ def deepseek_v32_671b_128npus() -> TrainerConfig:
     )
 
 
-def deepseek_v32_671b_32k_128npus() -> TrainerConfig:
+def deepseek_v32_671b_61layers_32k_128die() -> TrainerConfig:
     return TrainerConfig(
         hf_assets_path="./assets/hf/DeepSeek-V3.2",
-        model_spec=model_registry("_v32_671b_61layers_256experts"),
+        model_spec=model_registry("671B_debug_128die"),
         debug=DebugConfig(print_config=True),
         model_converters=ModelConvertersContainer.Config(converters=_default_converters()),
         metrics=MetricsProcessor.Config(log_freq=1),

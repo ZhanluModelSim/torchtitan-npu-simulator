@@ -106,7 +106,7 @@ bash scripts/run_train.sh \
 ### 配置示例二：DSA Context Parallel（DeepSeek-V3.2）
 
 DeepSeek-V3.2 `config_registry.py` 中的
-`deepseek_v32_671b_32k_128npus` 配置默认启用 32k 长序列 CP：
+`deepseek_v32_671b_61layers_32k_128die` 配置默认启用 32k 长序列 CP：
 
 ```python
 from torchtitan.protocols.model_converter import ModelConvertersContainer
@@ -133,7 +133,7 @@ parallelism = ParallelismConfig(
 
 ```bash
 MODULE=torchtitan_npu.models.deepseek_v32 \
-CONFIG=deepseek_v32_671b_32k_128npus \
+CONFIG=deepseek_v32_671b_61layers_32k_128die \
 bash scripts/run_train_multinodes.sh
 ```
 
@@ -142,7 +142,7 @@ bash scripts/run_train_multinodes.sh
 ```bash
 NGPU=16 \
 MODULE=torchtitan_npu.models.deepseek_v32 \
-CONFIG=deepseek_v32_671b_16npus \
+CONFIG=deepseek_v32_671b_4layers_debug \
 bash scripts/run_train.sh \
   --parallelism.context_parallel_degree 2
 ```
@@ -159,5 +159,5 @@ bash scripts/run_train.sh \
 - DeepSeek-V3.2 DSA CP 会对 `block.attention.inner_attention` 应用 CP patch，
   并将 `model_args`、`tp_mesh` 和 converters 传入自定义 CP 路由。
 - 若使用 32k 长序列训练，建议优先从
-  `deepseek_v32_671b_32k_128npus` 预置配置开始调整，避免遗漏 DSA
+  `deepseek_v32_671b_61layers_32k_128die` 预置配置开始调整，避免遗漏 DSA
   converter、CP 并行度和长序列 batch 配置。
