@@ -33,6 +33,7 @@ NPU_CONVERTER_NAMES = (
     "npu_rope",
     "npu_smla",
     "npu_mhc_pre",
+    "npu_mhc_post",
 )
 
 

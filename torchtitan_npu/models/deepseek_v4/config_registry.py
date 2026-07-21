@@ -69,6 +69,7 @@ def _default_converters(*, enable_mxfp8: bool) -> list:
         get_model_converter_config("npu_rope"),
         get_model_converter_config("npu_smla"),
         get_model_converter_config("npu_mhc_pre"),
+        get_model_converter_config("npu_mhc_post"),
     ]
     if enable_mxfp8:
         converters.append(
