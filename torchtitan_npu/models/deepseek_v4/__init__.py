@@ -43,6 +43,20 @@ def _make_smoke_moe_args() -> MoEArgs:
     )
 
 
+def _make_mini_1b_moe_args() -> MoEArgs:
+    return MoEArgs(
+        num_experts=16,
+        num_shared_experts=1,
+        top_k=2,
+        score_func="sqrtsoftplus",
+        route_norm=True,
+        score_before_experts=False,
+        use_grouped_mm=True,
+        n_hash_layers=2,
+        swiglu_limit=10,
+    )
+
+
 def _v4_flash_default_model_config() -> dict:
     moe_args = MoEArgs(
         num_experts=256,
@@ -131,33 +145,37 @@ def _v4_pro_default_model_config() -> dict:
     }
 
 
-def _smoketest_model() -> DeepSeekV4Model.Config:
+def _mini_1b_model() -> DeepSeekV4Model.Config:
     config = _v4_flash_default_model_config()
     config.update(
         {
-            "n_layers": 2,
-            "n_heads": 4,
-            "max_batch_size": 2,
-            "max_seq_len": 128,
-            "dim": 128,
-            "moe_inter_dim": 64,
-            "head_dim": 32,
-            "rope_head_dim": 16,
-            "q_lora_rank": 64,
-            "o_lora_rank": 32,
+            "n_layers": 24,
+            "n_heads": 16,
+            "max_batch_size": 4,
+            "max_seq_len": 4096,
+            "dim": 1024,
+            "moe_inter_dim": 512,
+            "head_dim": 64,
+            "rope_head_dim": 32,
+            "q_lora_rank": 384,
+            "o_lora_rank": 384,
             "o_groups": 4,
-            "window_size": 32,
-            "compress_ratios": (1, 1),
-            "moe_args": _make_smoke_moe_args(),
-            "hc_sinkhorn_iters": 4,
-            "hc_mult": 2,
-            "compress_rope_theta": 40000,
-            "original_seq_len": 128,
-            "rope_factor": 4,
-            "enable_indexer_loss": False,
-            "index_n_heads": 4,
-            "index_head_dim": 16,
-            "index_topk": 16,
+            "window_size": 64,
+            "compress_ratios": (1, 1) + (4, 96) * 10 + (4, 1),
+            "moe_args": _make_mini_1b_moe_args(),
+            "hc_sinkhorn_iters": 20,
+            "hc_mult": 4,
+            "hc_eps": 1e-6,
+            "compress_rope_theta": 160000,
+            "original_seq_len": 0,
+            "rope_theta": 10000,
+            "rope_factor": 1,
+            "beta_fast": 32,
+            "beta_slow": 1,
+            "enable_indexer_loss": True,
+            "index_n_heads": 8,
+            "index_head_dim": 64,
+            "index_topk": 128,
         }
     )
     return DeepSeekV4Model.Config(**config)
@@ -195,11 +213,11 @@ def _v4_pro_61layers_384experts() -> DeepSeekV4Model.Config:
 
 
 deepseekv4_configs = {
-    "smoketest": _smoketest_model,
     "v4_flash_43layers_16experts": _v4_flash_43layers_16experts,
     "v4_flash_43layers_256experts": _v4_flash_43layers_256experts,
     "v4_pro_16layers_16experts": _v4_pro_16layers_16experts,
     "v4_pro_61layers_384experts": _v4_pro_61layers_384experts,
+    "mini_1b": _mini_1b_model,
 }
 
 

@@ -551,9 +551,11 @@ class SparseAttention(Module):
         ).scatter_(-1, topk_idxs.unsqueeze(1), 0)
 
         attn_weights = attn_weights + index_mask[..., :-1]
-        sinks = attn_sink.reshape(1, -1, 1, 1).expand(query_states.shape[0], -1, query_states.shape[-2], -1)
+        sinks = attn_sink.reshape(1, -1, 1, 1).repeat(query_states.shape[0], 1, query_states.shape[-2], 1)
         combined_logits = torch.cat([attn_weights, sinks], dim=-1)
+
         combined_logits = combined_logits - combined_logits.max(dim=-1, keepdim=True).values
+
         probs = nn.functional.softmax(combined_logits.float(), dim=-1, dtype=combined_logits.dtype)
         scores = probs[..., :-1]
         attn_output = torch.matmul(scores, kv_states)

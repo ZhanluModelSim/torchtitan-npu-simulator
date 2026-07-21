@@ -43,27 +43,27 @@ class DeepSeekV4PipelineStaticTest(unittest.TestCase):
 
         from torchtitan_npu.models.deepseek_v4 import model_registry
 
-        self.assertIs(model_registry("smoketest").pipelining_fn, pipeline_llm)
+        self.assertIs(model_registry("mini_1b").pipelining_fn, pipeline_llm)
 
     def test_config_layers_matches_total_layer_count(self):
         # ``Config.layers`` lets upstream pipeline_llm derive the layer count via
         # ``len(model_config.layers)`` even though DeepSeek-V4 stores ``n_layers``.
         from torchtitan_npu.models.deepseek_v4 import deepseekv4_configs
 
-        config = deepseekv4_configs["smoketest"]()
+        config = deepseekv4_configs["mini_1b"]()
         self.assertEqual(len(config.layers), config.n_layers + config.num_mtp_modules)
 
     def test_update_from_config_rejects_mtp_with_pp(self):
         from torchtitan_npu.models.deepseek_v4 import deepseekv4_configs
 
-        config = deepseekv4_configs["smoketest"]()
+        config = deepseekv4_configs["mini_1b"]()
         with self.assertRaisesRegex(NotImplementedError, r"MTP \+ PP"):
             config.update_from_config(trainer_config=_trainer_config(num_mtp_modules=1, pipeline_parallel_degree=2))
 
     def test_update_from_config_allows_mtp_without_pp(self):
         from torchtitan_npu.models.deepseek_v4 import deepseekv4_configs
 
-        config = deepseekv4_configs["smoketest"]()
+        config = deepseekv4_configs["mini_1b"]()
         config.update_from_config(trainer_config=_trainer_config(num_mtp_modules=1, pipeline_parallel_degree=1))
         self.assertEqual(config.num_mtp_modules, 1)
 

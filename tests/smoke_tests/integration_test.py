@@ -68,7 +68,7 @@ class OverrideDefinitions:
 _DEEPSEEK_V3_MODULE = "torchtitan_npu.models.deepseek_v3"
 _DEEPSEEK_V3_CONFIG = "deepseek_v3_smoketest"
 _DEEPSEEK_V4_MODULE = "torchtitan_npu.models.deepseek_v4"
-_DEEPSEEK_V4_CONFIG = "debug_deepseek_v4_smoketest"
+_DEEPSEEK_V4_CONFIG = "debug_deepseek_v4_single_node_1b"
 _DEEPSEEK_V32_MODULE = "tests.smoke_tests"
 _DEEPSEEK_V32_CONFIG = "deepseek_v32_smoketest"
 _NPU_TRAIN_FILE = "torchtitan_npu.entry"

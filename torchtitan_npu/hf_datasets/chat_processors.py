@@ -7,6 +7,8 @@ import json
 from collections.abc import Callable
 from importlib import import_module
 
+_YELP_STAR_NAMES = ("1 star", "2 stars", "3 stars", "4 stars", "5 stars")
+
 
 def process_tau_sample(sample):
     raw_messages = sample["messages"]
@@ -47,6 +49,22 @@ def process_wordle_sample(sample: dict) -> list[dict]:
             normalized_message["content"] = "\n".join(str(item) for item in content)
         normalized.append(normalized_message)
     return normalized
+
+
+def process_yelp_sample(sample):
+    text = str(sample.get("text", "")).strip()
+    label = int(sample["label"])
+    prompt = f"Classify the sentiment of the following review by its star rating from 1 to 5 stars.\n\nReview: {text}"
+    return [
+        {
+            "role": "user",
+            "content": (
+                "Classify the sentiment of the following review by its star rating "
+                f"from 1 to 5 stars.\n\nReview: {text}"
+            ),
+        },
+        {"role": "assistant", "content": _YELP_STAR_NAMES[label]},
+    ]
 
 
 def import_chat_processor(path: str) -> Callable:

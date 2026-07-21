@@ -10,6 +10,7 @@ torchtitan-npu 支持基于对话数据的指令微调（Supervised Fine-Tuning,
 | Qwen3-1.7B | Wordle | Jinja chat template | — | ✅ | — |
 | DeepSeek-V4 | tau-bench | 自定义编码器 (encoding_dsv4.py) | — | ✅ | ✅ |
 | DeepSeek-V4 | GSM8K | 自定义编码器 (encoding_dsv4.py) | ✅ | — | — |
+| DeepSeek-V4-Mini-1B | Yelp Review Full | ChatML template | ✅ | — | — |
 
 ## 架构概述
 
@@ -73,6 +74,16 @@ CHAT_PROCESSOR=torchtitan_npu.hf_datasets.chat_processors.process_gsm8k_sample \
   bash examples/deepseek_v4/sft_deepseek_v4_flash_16k_A3.sh \
     --training.seq_len 1024 \
     --parallelism.context_parallel_degree 1
+```
+
+### DeepSeek-V4-Mini-1B SFT（Yelp Review Full 单轮）
+
+```bash
+HF_ASSETS_PATH=/data/models/deepseek-v4-mini-1B-init \
+CHECKPOINT_INITIAL_LOAD_PATH=/data/models/deepseek-v4-mini-1B-init \
+DATA_FILES=/data/dataset/yelp_review_full/train-00000-of-00001.parquet \
+CHECKPOINT_FOLDER=./outputs/deepseek_v4_1b_yelp/checkpoint \
+  bash examples/deepseek_v4/sft_deepseek_v4_1k_A3.sh
 ```
 
 ---

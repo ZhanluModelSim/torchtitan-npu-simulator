@@ -55,7 +55,7 @@ class DeepSeekV4TNDTest(unittest.TestCase):
 
         smla = get_model_converter_config("npu_smla")
         mhc_pre = get_model_converter_config("npu_mhc_pre")
-        config = deepseekv4_configs["smoketest"]()
+        config = deepseekv4_configs["mini_1b"]()
         with (
             patch("torchtitan_npu.models.deepseek_v4.model.get_npu_device_type", return_value="A5"),
             self.assertRaisesRegex(ValueError, "missing converter.*npu_mhc_post"),

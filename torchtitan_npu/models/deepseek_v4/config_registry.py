@@ -40,15 +40,23 @@ def _default_converters(*extra_names: str) -> list:
     return [get_model_converter_config(name) for name in (*_DEFAULT_CONVERTERS, *extra_names)]
 
 
-def debug_deepseek_v4_smoketest() -> TrainerConfig:
+def debug_deepseek_v4_single_node_1b() -> TrainerConfig:
     base = trainer_base_config()
     return replace(
         base,
         hf_assets_path="./tests/assets/tokenizer/deepseekv4_tokenizer",
-        model_spec=model_registry("smoketest"),
+        model_spec=model_registry("mini_1b"),
+        model_converters=ModelConvertersContainer.Config(
+            converters=[
+                get_model_converter_config("npu_rms_norm"),
+                get_model_converter_config("npu_moe_dispatch"),
+                get_model_converter_config("npu_gmm"),
+                get_model_converter_config("npu_rope"),
+            ]
+        ),
         optimizer=replace(base.optimizer, swap_optimizer=False),
         lr_scheduler=replace(base.lr_scheduler, min_lr_factor=0.1, warmup_steps=2),
-        training=replace(base.training, seq_len=128, steps=2, num_mtp_modules=0),
+        training=replace(base.training, seq_len=576, steps=2, num_mtp_modules=0),
         activation_checkpoint=replace(base.activation_checkpoint, mode="none"),
     )
 
