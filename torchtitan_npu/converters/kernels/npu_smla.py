@@ -33,9 +33,6 @@ from torchtitan_npu.models.deepseek_v4.tnd import (
     DeepSeekV4SMLAAttentionMasks,
     smla_global_tnd_post_dataloading_process,
 )
-from torchtitan_npu.models.deepseek_v4.tnd import (
-    max_seqlen_from_cu_seqlens as _max_seqlen_from_cu_seqlens,
-)
 from torchtitan_npu.ops.aclnn.builder import build_op
 from torchtitan_npu.tools.device import get_npu_device_type
 
@@ -171,12 +168,11 @@ def _sparse_attention_metadata_kwargs(
     cmp_ratio: int,
     num_heads_q: int,
 ) -> dict[str, Any]:
-    cu_seqlens_cmp_kv = attention_masks.cu_seqlens_cmp_kv.get(cmp_ratio)
     return {
         "batch_size": attention_masks.batch_size,
-        "max_seqlen_q": _max_seqlen_from_cu_seqlens(attention_masks.cu_seqlens_q),
-        "max_seqlen_ori_kv": _max_seqlen_from_cu_seqlens(attention_masks.cu_seqlens_ori_kv),
-        "max_seqlen_cmp_kv": 0 if cu_seqlens_cmp_kv is None else _max_seqlen_from_cu_seqlens(cu_seqlens_cmp_kv),
+        "max_seqlen_q": attention_masks.max_seqlen_q,
+        "max_seqlen_ori_kv": attention_masks.max_seqlen_q,
+        "max_seqlen_cmp_kv": attention_masks.max_seqlen_cmp_kv.get(cmp_ratio, 0),
         "num_heads_q": num_heads_q,
         "num_heads_kv": 1,
         "head_dim": model_args.head_dim,
@@ -726,8 +722,8 @@ class SparseFlashMLA(torch.autograd.Function):
             cu_seqlens_k=cu_seqlens_k,
             cmp_residual_k=attention_masks.cmp_residual_k.get(cmp_ratio),
             batch_size=attention_masks.batch_size,
-            max_seqlen_q=_max_seqlen_from_cu_seqlens(attention_masks.cu_seqlens_q),
-            max_seqlen_k=0 if cu_seqlens_k is None else _max_seqlen_from_cu_seqlens(cu_seqlens_k),
+            max_seqlen_q=attention_masks.max_seqlen_q,
+            max_seqlen_k=attention_masks.max_seqlen_cmp_kv.get(cmp_ratio, 0),
             topk=model_args.index_topk,
             layout_q="TND",
             layout_k="TND",
@@ -808,8 +804,8 @@ class LightningIndexer(torch.autograd.Function):
             cu_seqlens_k=cu_seqlens_k,
             cmp_residual_k=attention_masks.cmp_residual_k.get(cmp_ratio),
             batch_size=attention_masks.batch_size,
-            max_seqlen_q=_max_seqlen_from_cu_seqlens(attention_masks.cu_seqlens_q),
-            max_seqlen_k=0 if cu_seqlens_k is None else _max_seqlen_from_cu_seqlens(cu_seqlens_k),
+            max_seqlen_q=attention_masks.max_seqlen_q,
+            max_seqlen_k=attention_masks.max_seqlen_cmp_kv.get(cmp_ratio, 0),
             layout_q="TND",
             layout_k="TND",
             mask_mode=3,

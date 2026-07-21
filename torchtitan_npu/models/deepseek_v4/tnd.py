@@ -21,6 +21,9 @@ class DeepSeekV4SMLAAttentionMasks(NamedTuple):
     cu_seqlens_ori_kv: torch.Tensor
     cu_seqlens_cmp_kv: dict[int, torch.Tensor]
     cmp_residual_k: dict[int, torch.Tensor]
+    block_starts_by_ratio: dict[int, torch.Tensor]
+    max_seqlen_q: int
+    max_seqlen_cmp_kv: dict[int, int]
     batch_size: int
     seq_len: int
     cache_id: int = -1
@@ -33,13 +36,6 @@ def lengths_to_cu_seqlens(lengths: torch.Tensor) -> torch.Tensor:
             torch.cumsum(lengths, dim=0, dtype=lengths.dtype),
         )
     )
-
-
-def max_seqlen_from_cu_seqlens(cu_seqlens: torch.Tensor) -> int:
-    if cu_seqlens.numel() <= 1:
-        return 0
-    lengths = cu_seqlens[1:] - cu_seqlens[:-1]
-    return int(lengths.max().item())
 
 
 def _residual_cmp_ratios(model_args: Any) -> tuple[int, ...]:
@@ -98,12 +94,6 @@ def _tnd_compressed_block_starts(flat_positions: torch.Tensor, ratio: int) -> to
     return torch.nonzero(block_starts, as_tuple=False).flatten()
 
 
-def _compressed_lengths_from_request_layout(layout: _SMLARequestLayout, ratio: int) -> torch.Tensor:
-    block_starts = _tnd_compressed_block_starts(layout.flat_positions, ratio)
-    compressed_lengths = torch.searchsorted(block_starts, layout.ends) - torch.searchsorted(block_starts, layout.starts)
-    return compressed_lengths.to(dtype=torch.int32)
-
-
 def build_smla_attention_masks(
     positions: torch.Tensor,
     model_args: Any,
@@ -137,9 +127,18 @@ def build_smla_attention_masks(
             num_mtp_modules=0 if positions_are_tnd else model_args.num_mtp_modules,
         )
         actual_seq_q = request_layout.lengths.to(device=device)
-        cmp_lengths = {
-            ratio: _compressed_lengths_from_request_layout(request_layout, ratio).to(device=device)
+        block_starts_by_ratio = {
+            ratio: _tnd_compressed_block_starts(request_layout.flat_positions, ratio).contiguous()
             for ratio in residual_cmp_ratios
+        }
+        cmp_lengths = {
+            ratio: (
+                torch.searchsorted(block_starts, request_layout.ends)
+                - torch.searchsorted(block_starts, request_layout.starts)
+            )
+            .to(dtype=torch.int32)
+            .to(device=device)
+            for ratio, block_starts in block_starts_by_ratio.items()
         }
         batch_size = int(actual_seq_q.numel())
         seq_len = request_layout.seq_len
@@ -147,12 +146,18 @@ def build_smla_attention_masks(
         valid_positions = positions[:, :seq_len].ge(0)
         actual_seq_q = valid_positions.sum(dim=1, dtype=torch.int32).to(device=device)
         cmp_lengths = {ratio: torch.div(actual_seq_q, ratio, rounding_mode="floor") for ratio in residual_cmp_ratios}
+        block_starts_by_ratio = {}
     actual_seq_ori_kv = actual_seq_q.clone()
     return DeepSeekV4SMLAAttentionMasks(
         cu_seqlens_q=lengths_to_cu_seqlens(actual_seq_q),
         cu_seqlens_ori_kv=lengths_to_cu_seqlens(actual_seq_ori_kv),
         cu_seqlens_cmp_kv={ratio: lengths_to_cu_seqlens(lengths) for ratio, lengths in cmp_lengths.items()},
         cmp_residual_k={ratio: actual_seq_ori_kv - ratio * cmp_lengths[ratio] for ratio in residual_cmp_ratios},
+        block_starts_by_ratio=block_starts_by_ratio,
+        max_seqlen_q=int(actual_seq_q.max().item()) if actual_seq_q.numel() > 0 else 0,
+        max_seqlen_cmp_kv={
+            ratio: int(lengths.max().item()) if lengths.numel() > 0 else 0 for ratio, lengths in cmp_lengths.items()
+        },
         batch_size=batch_size,
         seq_len=seq_len,
         cache_id=next(_SMLA_ATTENTION_MASK_CACHE_IDS),

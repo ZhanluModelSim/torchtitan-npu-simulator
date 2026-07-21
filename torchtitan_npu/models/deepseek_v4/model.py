@@ -94,32 +94,6 @@ def rotate_activation(x: torch.Tensor, hadamard_mat: torch.Tensor) -> torch.Tens
     return hadamard_transform_ref(x, hadamard_mat, scale=hidden_size**-0.5)
 
 
-def _tnd_full_block_starts_from_positions(positions: torch.Tensor, ratio: int) -> torch.Tensor:
-    """Return TND token offsets where a full compressor block stays inside one request."""
-    if positions.dim() == 1:
-        positions = positions.unsqueeze(0)
-    if positions.dim() != 2:
-        raise ValueError("DeepSeek-V4 TND compressor positions must be a [B, S] tensor.")
-
-    flat_positions = positions.reshape(-1)
-    if flat_positions.numel() == 0:
-        raise ValueError("DeepSeek-V4 TND compressor positions contain no tokens.")
-    flat_valid = flat_positions.ge(0)
-    token_indices = torch.arange(flat_positions.numel(), device=positions.device)
-    end_indices = token_indices + ratio - 1
-    end_in_range = end_indices < flat_positions.numel()
-    clamped_end_indices = end_indices.clamp_max(flat_positions.numel() - 1)
-    end_positions = flat_positions[clamped_end_indices]
-    block_starts = (
-        flat_valid
-        & flat_positions.remainder(ratio).eq(0)
-        & end_in_range
-        & flat_valid[clamped_end_indices]
-        & end_positions.eq(flat_positions + ratio - 1)
-    )
-    return torch.nonzero(block_starts, as_tuple=False).flatten()
-
-
 class Compressor(Module):
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
@@ -207,12 +181,14 @@ class Compressor(Module):
         x: torch.Tensor,
         freqs_cis: torch.Tensor,
         positions: torch.Tensor,
+        block_starts: torch.Tensor | None = None,
     ) -> torch.Tensor:
         ratio, overlap = self.compress_ratio, self.overlap
         dtype = x.dtype
         flat_x = x.reshape(-1, x.shape[-1])
         flat_positions = positions.reshape(-1)
-        block_starts = _tnd_full_block_starts_from_positions(positions, ratio)
+        if block_starts is None:
+            raise RuntimeError("DeepSeekV4 TND compressor requires cached block_starts from attention_masks.")
 
         block_offsets = torch.arange(ratio, device=x.device)
         block_indices = block_starts.unsqueeze(1) + block_offsets.unsqueeze(0)
@@ -258,9 +234,10 @@ class Compressor(Module):
         x: torch.Tensor,
         freqs_cis: torch.Tensor,
         positions: torch.Tensor | None = None,
+        block_starts: torch.Tensor | None = None,
     ):
         if self.use_tnd_metadata and positions is not None:
-            return self._forward_tnd(x, freqs_cis, positions)
+            return self._forward_tnd(x, freqs_cis, positions, block_starts=block_starts)
         return self._forward_bsnd(x, freqs_cis, positions=positions)
 
     def init_weights(self, init_std: float):
@@ -315,6 +292,7 @@ class Indexer(Module):
         freqs_cis: torch.Tensor,
         hadamard_mat: torch.Tensor,
         positions: torch.Tensor | None = None,
+        block_starts: torch.Tensor | None = None,
     ):
         is_tnd = x.dim() == 2
         rd = self.rope_head_dim
@@ -329,7 +307,7 @@ class Indexer(Module):
         q_rope = apply_rotary_emb(q_rope, freqs_cis, positions=positions)
         q = torch.cat([q_nope, q_rope], dim=-1)
         q = rotate_activation(q, hadamard_mat)
-        k = self.compressor(x, freqs_cis, positions=positions)
+        k = self.compressor(x, freqs_cis, positions=positions, block_starts=block_starts)
         k = rotate_activation(k, hadamard_mat)
         weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads**-0.5)
         return q, k, weights
@@ -670,6 +648,7 @@ class PreAttention(Module):
         freqs_cis: torch.Tensor,
         hadamard_mat: torch.Tensor,
         positions: torch.Tensor | None = None,
+        block_starts: torch.Tensor | None = None,
     ):
         rd = self.rope_head_dim
         # Q projection
@@ -695,12 +674,23 @@ class PreAttention(Module):
                 freqs_cis,
                 hadamard_mat,
                 positions=positions,
+                block_starts=block_starts,
             )
 
         if self.compress_ratio == 4:
-            kv_compress = self.compressor(x, freqs_cis, positions=positions)
+            kv_compress = self.compressor(
+                x,
+                freqs_cis,
+                positions=positions,
+                block_starts=block_starts,
+            )
         elif self.compress_ratio > 1:
-            kv_compress = self.compressor_128(x, freqs_cis, positions=positions)
+            kv_compress = self.compressor_128(
+                x,
+                freqs_cis,
+                positions=positions,
+                block_starts=block_starts,
+            )
 
         return q, kv, kv_compress, q_indexer, k_indexer, weights
 
@@ -880,13 +870,14 @@ class Attention(Module):
         positions: torch.Tensor | None = None,
     ):
         input_layout = "TND" if x.dim() == 2 else "BSND"
+        block_starts = None
         if input_layout == "TND":
             if attention_masks is None:
                 raise RuntimeError("DeepSeekV4 TND attention requires SMLA attention_masks.")
             smla_attention_masks = cast("Any", attention_masks)
             bsz = smla_attention_masks.batch_size
-            cu_seqlens_q = smla_attention_masks.cu_seqlens_q
-            seqlen = int((cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item())
+            seqlen = smla_attention_masks.max_seqlen_q
+            block_starts = smla_attention_masks.block_starts_by_ratio.get(self.compress_ratio)
         else:
             bsz, seqlen, _ = x.size()
         freqs_cis = freqs_cis.to(x.device)
@@ -896,6 +887,7 @@ class Attention(Module):
             freqs_cis,
             hadamard_mat,
             positions=positions,
+            block_starts=block_starts,
         )
 
         local_heads = q.shape[1] if input_layout == "TND" else q.shape[2]

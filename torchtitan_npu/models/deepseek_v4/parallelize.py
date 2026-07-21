@@ -943,8 +943,7 @@ def _compile_moe_transformer_block(
         if attr_name == "hc_pre" or (use_global_tnd and attr_name == "hc_post"):
             continue
         if isinstance(submod, Attention):
-            skip_names = {"inner_attention", "pre_attention"} if use_global_tnd else {"inner_attention"}
-            _compile_children_except(submod, skip_names, compile_config)
+            _compile_children_except(submod, {"inner_attention"}, compile_config)
         elif isinstance(submod, DeepSeekV4MoE):
             _compile_children_except(submod, {"experts"}, compile_config)
         elif isinstance(submod, NPURMSNorm):

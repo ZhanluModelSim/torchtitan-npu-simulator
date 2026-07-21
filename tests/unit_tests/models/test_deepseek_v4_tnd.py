@@ -10,7 +10,10 @@ from unittest.mock import patch
 import torch
 from torchtitan.components.loss import IGNORE_INDEX
 
-from torchtitan_npu.models.deepseek_v4.tnd import smla_global_tnd_post_dataloading_process
+from torchtitan_npu.models.deepseek_v4.tnd import (
+    build_smla_attention_masks,
+    smla_global_tnd_post_dataloading_process,
+)
 
 
 def _model_args(num_mtp_modules: int) -> SimpleNamespace:
@@ -58,6 +61,81 @@ class DeepSeekV4TNDTest(unittest.TestCase):
             self.assertRaisesRegex(ValueError, "missing converter.*npu_mhc_post"),
         ):
             config.update_from_config(trainer_config=_trainer_config(converters=[smla, mhc_pre]))
+
+    def test_tnd_attention_masks_cache_compressor_layout(self):
+        positions = torch.tensor([0, 1, 2, 3, 0, 1, 2, 3])
+        model_args = SimpleNamespace(
+            compress_ratios=(4, 128),
+            mtp_layer_compress_ratio=1,
+            num_mtp_modules=0,
+            use_global_tnd=True,
+        )
+
+        attention_masks = build_smla_attention_masks(positions, model_args)
+
+        torch.testing.assert_close(attention_masks.block_starts_by_ratio[4], torch.tensor([0, 4]))
+        self.assertEqual(attention_masks.block_starts_by_ratio[128].numel(), 0)
+        self.assertEqual(attention_masks.max_seqlen_q, 4)
+        self.assertEqual(attention_masks.max_seqlen_cmp_kv, {4: 1, 128: 0})
+
+    def test_tnd_ratio4_reuses_supplied_compressor_block_starts(self):
+        from torchtitan_npu.models.deepseek_v4 import model as deepseek_model
+
+        class RecordingCompressor(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.use_tnd_metadata = True
+                self.block_starts = None
+
+            def forward(self, x, freqs_cis, positions=None, block_starts=None):
+                self.block_starts = block_starts
+                return x
+
+        class RecordingIndexer(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.block_starts = None
+
+            def forward(
+                self,
+                x,
+                qr,
+                freqs_cis,
+                hadamard_mat,
+                positions=None,
+                block_starts=None,
+            ):
+                self.block_starts = block_starts
+                return x, x, x
+
+        pre_attention = deepseek_model.PreAttention.__new__(deepseek_model.PreAttention)
+        torch.nn.Module.__init__(pre_attention)
+        pre_attention.n_heads = 1
+        pre_attention.head_dim = 4
+        pre_attention.rope_head_dim = 2
+        pre_attention.eps = 1e-6
+        pre_attention.compress_ratio = 4
+        pre_attention.wq_a = torch.nn.Identity()
+        pre_attention.q_norm = torch.nn.Identity()
+        pre_attention.wq_b = torch.nn.Identity()
+        pre_attention.wkv = torch.nn.Identity()
+        pre_attention.kv_norm = torch.nn.Identity()
+        pre_attention.compressor = RecordingCompressor()
+        pre_attention.indexer = RecordingIndexer()
+
+        positions = torch.arange(8)
+        expected_block_starts = torch.tensor([0, 4])
+        with patch.object(deepseek_model, "apply_rotary_emb", side_effect=lambda x, *args, **kwargs: x):
+            pre_attention(
+                torch.randn(8, 4),
+                torch.empty(0),
+                torch.eye(4),
+                positions=positions,
+                block_starts=expected_block_starts,
+            )
+
+        self.assertIs(pre_attention.indexer.block_starts, pre_attention.compressor.block_starts)
+        torch.testing.assert_close(pre_attention.compressor.block_starts, expected_block_starts)
 
     def test_mtp_shifts_do_not_cross_packed_request_boundaries(self):
         inputs = torch.tensor([[10, 11, 12, 13, 20, 21, 22, 23]])
