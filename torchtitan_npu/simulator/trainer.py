@@ -626,7 +626,7 @@ class SimulationTrainer(Trainer):
             write_text_summary(self.workload_graph, os.path.join(out_dir, "summary.txt"))
             export_timings["text"] = time.perf_counter() - t
         memory_plan = self.workload_graph.iteration.schedule.annotations.get("memory_plan")
-        if memory_plan is not None and any(fmt in formats for fmt in ("json", "csv", "text", "html", "trace")):
+        if memory_plan is not None and "mem" in formats:
             t = time.perf_counter()
             export_memory_plan(memory_plan, out_dir)
             export_timings["memory"] = time.perf_counter() - t

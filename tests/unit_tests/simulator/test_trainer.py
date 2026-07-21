@@ -12,6 +12,7 @@ import torch.distributed as dist
 import torch.nn as nn
 
 from torchtitan_npu.simulator.trainer import (
+    SimulationTrainer,
     _capture_num_micro_batches,
     _strip_hardware_dependent_model_converters,
     run_simulation_step,
@@ -153,6 +154,59 @@ def test_run_simulation_step_can_disable_memory_tracking(fake_world):
     assert "memory_summary" not in graph.iteration.schedule.annotations
     assert all(step.param_mem == 0 for step in graph.step_templates.values())
     assert all(step.peak_active_mem == 0 for step in graph.step_templates.values())
+
+
+@pytest.mark.parametrize(
+    ("output_formats", "expect_memory_export"),
+    [([], False), (["json", "csv", "text", "html", "trace"], False), (["mem"], True)],
+)
+def test_memory_export_requires_explicit_mem_format(tmp_path, monkeypatch, output_formats, expect_memory_export):
+    exported: list[object] = []
+    memory_plan = object()
+    monkeypatch.setattr(
+        "torchtitan_npu.simulator.trainer.export_memory_plan",
+        lambda plan, _out_dir: exported.append(plan),
+    )
+    monkeypatch.setattr(
+        "torchtitan_npu.simulator.trainer.export_json",
+        lambda *_args: None,
+    )
+    monkeypatch.setattr(
+        "torchtitan_npu.simulator.trainer.export_kernel_summary_csv",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "torchtitan_npu.simulator.trainer.write_text_summary",
+        lambda *_args: None,
+    )
+    monkeypatch.setattr(
+        "torchtitan_npu.simulator.trainer.export_html",
+        lambda *_args: None,
+    )
+
+    schedule = SimpleNamespace(
+        annotations={"memory_plan": memory_plan},
+        export_l1_schedule_csv=lambda *_args, **_kwargs: None,
+    )
+    workload_graph = SimpleNamespace(
+        iteration=SimpleNamespace(schedule=schedule),
+        schedule_plan=None,
+        step_templates={},
+        export_schedule_csv=lambda *_args, **_kwargs: None,
+    )
+    trainer = SimpleNamespace(
+        workload_graph=workload_graph,
+        simulation_config=SimpleNamespace(
+            output_dir=str(tmp_path),
+            output_formats=output_formats,
+            csv_max_ranks=None,
+        ),
+        config=SimpleNamespace(comm=SimpleNamespace(mode="fake_backend")),
+    )
+
+    SimulationTrainer._export(trainer)
+
+    assert exported == ([memory_plan] if expect_memory_export else [])
 
 
 def test_simulation_trainer_config_build_dispatches_to_simulation_trainer():

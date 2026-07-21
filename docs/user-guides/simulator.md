@@ -248,7 +248,15 @@ cat simulator_output/deepseek_v4_pro_61_layers/summary.txt
 | `simulation_result.json` | JSON | 完整四层 IR 结构化数据 |
 | `kernel_summary/` | CSV 目录 | 按 Rank 拆分的算子汇总 |
 | `ir_export/` | CSV 目录 | 各层级 IR 导出（见下文） |
-| `memory/` | JSON/CSV 目录 | 内存摘要、Perfetto trace、事件时间线和 tensor 生命周期 |
+| `memory/` | JSON/CSV 目录 | 内存摘要、Perfetto trace、事件时间线和 tensor 生命周期；需显式启用 `mem` 格式 |
+
+内存计算由 `simulation.enable_memory_tracking` 控制；内存文件导出则独立由
+`simulation.output_formats` 中的 `mem` 控制。`json`、`csv`、`text`、`html` 和
+`trace` 都不会隐式写出 `memory/`。例如只导出内存产物：
+
+```bash
+--simulation.output_formats mem
+```
 
 `memory/` 中的主要文件：
 

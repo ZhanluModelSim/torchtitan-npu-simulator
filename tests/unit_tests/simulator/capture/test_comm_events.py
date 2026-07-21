@@ -151,12 +151,15 @@ def test_disabled_memory_tracking_drops_fsdp_residency_events():
 
 
 def test_mixed_p2p_batch_uses_each_op_pp_context():
-    """1F1B fuses forward-send and backward-recv from different chunks."""
+    """Deferred 1F1B P2POps do not inherit the stale warmup context."""
     previous_context = dict(_pp_context)
     patch_device_type_to_meta()
     send_tensor = torch.empty(4, device="meta")
     recv_tensor = torch.empty(4, device="meta")
     try:
+        # The first warmup recv executes before forward_one_chunk can stamp a
+        # stage. Both P2POps must instead use their creation-time metadata.
+        _pp_context.update(stage=-1, mb_idx=-1, phase="forward", comp_type="F")
         with capture_fake_collectives() as recorder:
             send_op = dist.P2POp(dist.isend, send_tensor, 1, dist.group.WORLD)
             recv_op = dist.P2POp(dist.irecv, recv_tensor, 1, dist.group.WORLD)
