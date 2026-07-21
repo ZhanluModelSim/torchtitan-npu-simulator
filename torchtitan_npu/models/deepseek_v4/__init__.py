@@ -65,7 +65,7 @@ def _make_smoke_moe_args() -> MoEArgs:
         score_func="sqrtsoftplus",
         route_norm=True,
         score_before_experts=False,
-        use_grouped_mm=False,
+        use_grouped_mm=True,
         n_hash_layers=0,
         swiglu_limit=10,
     )

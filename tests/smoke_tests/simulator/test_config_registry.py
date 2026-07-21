@@ -11,6 +11,7 @@ torch_npu = pytest.importorskip("torch_npu", reason="requires torch_npu + CANN")
 
 from torchtitan.components.quantization.mx import MXFP8Converter  # noqa: E402
 from torchtitan.config import ConfigManager  # noqa: E402
+from torchtitan_npu.converters.registry import has_npu_converter  # noqa: E402
 from torchtitan_npu.models.deepseek_v4 import config_registry as model_configs  # noqa: E402
 from torchtitan_npu.simulator import config_registry as simulator_configs  # noqa: E402
 
@@ -23,6 +24,15 @@ CONFIG_NAMES = (
     "deepseek_v4_pro_20t_baseline_bf16",
     "deepseek_v4_pro_20t_baseline_mxfp8",
     "deepseek_v4_smoketest",
+)
+
+NPU_CONVERTER_NAMES = (
+    "npu_rms_norm",
+    "npu_moe_dispatch",
+    "npu_gmm",
+    "npu_rope",
+    "npu_smla",
+    "npu_mhc_pre",
 )
 
 
@@ -40,6 +50,15 @@ def test_simulator_config_preserves_training_config(config_name):
 
     assert sim_config.simulation.output_dir == f"./simulator_output/{config_name}"
     assert sim_config.simulation.world_size is None
+
+
+def test_smoketest_uses_production_npu_converter_path():
+    config = model_configs.deepseek_v4_smoketest()
+
+    assert config.model_spec.model.moe_args.use_grouped_mm is True
+    assert len(config.model_converters.converters) == len(NPU_CONVERTER_NAMES)
+    for converter_name in NPU_CONVERTER_NAMES:
+        assert has_npu_converter(config.model_converters.converters, converter_name)
 
 
 @pytest.mark.parametrize(

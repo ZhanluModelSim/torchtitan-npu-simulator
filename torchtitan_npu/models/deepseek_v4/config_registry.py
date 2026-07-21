@@ -286,7 +286,9 @@ def deepseek_v4_smoketest() -> TrainerConfig:
         hf_assets_path="./tests/assets/tokenizer/deepseekv4_tokenizer",
         model_spec=model_registry("smoketest"),
         debug=DebugConfig(print_config=True),
-        model_converters=ModelConvertersContainer.Config(converters=[]),
+        model_converters=ModelConvertersContainer.Config(
+            converters=_default_converters(enable_mxfp8=False)
+        ),
         metrics=MetricsProcessor.Config(log_freq=1),
         dataloader=HuggingFaceTextDataLoader.Config(dataset="c4_test"),
         optimizer=OptimizerConfig(
