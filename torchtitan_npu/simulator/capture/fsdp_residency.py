@@ -65,7 +65,7 @@ def _record_residency(param_group: Any, action: str, metadata: tuple[int, tuple[
     recorder = get_active_recorder()
     capture = get_active_capture()
     num_bytes, tensors = metadata
-    if recorder is None or num_bytes <= 0:
+    if recorder is None:
         return
     tensor_ids = tuple(
         sorted(capture.tensor_id(tensor) if capture is not None else id(tensor) for tensor in tensors)
@@ -114,10 +114,14 @@ def install_fsdp_residency_hooks() -> None:
         result = FSDPParamGroup._sim_orig_wait_for_unshard(self)
         if not was_unsharded and self.is_unsharded:
             _set_stage_fsdp_state(meta_env, "UNSHARDED")
-        if track_memory and not was_unsharded and self.is_unsharded:
-            num_bytes, full_tensors = _residency_metadata(self)
-            tensors = tuple({id(tensor): tensor for tensor in (*sharded_tensors, *full_tensors)}.values())
-            _record_residency(self, "alloc", (num_bytes, tensors))
+        if not was_unsharded and self.is_unsharded:
+            if track_memory:
+                num_bytes, full_tensors = _residency_metadata(self)
+                tensors = tuple({id(tensor): tensor for tensor in (*sharded_tensors, *full_tensors)}.values())
+                metadata = (num_bytes, tensors)
+            else:
+                metadata = (0, ())
+            _record_residency(self, "alloc", metadata)
         return result
 
     def patched_reshard(self):  # noqa: ANN001, ANN202

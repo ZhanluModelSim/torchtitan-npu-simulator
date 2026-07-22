@@ -46,6 +46,11 @@ class FSDPResidencyEvent:
     phase: str
     num_bytes: int
     tensor_ids: tuple[int, ...] = ()
+    capture_process_rank: int = -1
+    pp_stage: int = -1
+    pp_mb_idx: int = -1
+    comp_type: str = ""
+    parent_compute_instance_id: str = ""
 
 
 @dataclass(slots=True)

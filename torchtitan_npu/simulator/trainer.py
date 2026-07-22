@@ -246,6 +246,7 @@ def run_simulation_step(
         step_templates=step_templates,
         rank_table=rank_table,
         comm_events=comm_recorder.events,
+        fsdp_residency_events=comm_recorder.fsdp_schedule_events,
         timeline_events=comm_recorder.timeline_events,
         pp_schedule_obj=pp_schedule,
         pipeline_schedule=pipeline_schedule,

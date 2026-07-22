@@ -1403,8 +1403,18 @@ def _patch_pipeline_stage_for_pp_context() -> None:
         _pp_context["comp_type"] = comp_type
         _pp_context["fsdp_state"] = _fsdp_state.get(self.stage_index, "NA")
 
+    def _timeline_start_seq() -> int | None:
+        from torchtitan_npu.simulator.capture.comm_events import get_active_recorder
+
+        if get_active_recorder() is None:
+            return None
+        from torchtitan_npu.simulator.capture.dispatch_capture import _seq_counter
+
+        return next(_seq_counter)
+
     def _patched_fwd_one_chunk(self, mb_idx, *args, **kwargs):  # noqa: ANN001
         _stamp_chunk_context(self, mb_idx, "F", "forward")
+        start_seq_idx = _timeline_start_seq()
         from torchtitan_npu.simulator.capture.dispatch_capture import get_active_capture
         cap = get_active_capture()
         if cap is not None:
@@ -1424,6 +1434,7 @@ def _patch_pipeline_stage_for_pp_context() -> None:
                 pp_mb_idx=mb_idx,
                 phase="forward",
                 comp_type="F",
+                start_seq_idx=start_seq_idx,
             )
         return result
 
@@ -1436,6 +1447,7 @@ def _patch_pipeline_stage_for_pp_context() -> None:
             full_backward = args[-1]
         comp_type = "B" if full_backward else "I"
         _stamp_chunk_context(self, mb_idx, comp_type, "backward")
+        start_seq_idx = _timeline_start_seq()
         from torchtitan_npu.simulator.capture.dispatch_capture import get_active_capture
         cap = get_active_capture()
         if cap is not None:
@@ -1454,6 +1466,7 @@ def _patch_pipeline_stage_for_pp_context() -> None:
                 pp_mb_idx=mb_idx,
                 phase="backward",
                 comp_type=comp_type,
+                start_seq_idx=start_seq_idx,
             )
         return result
 
@@ -1463,6 +1476,7 @@ def _patch_pipeline_stage_for_pp_context() -> None:
         # Use the chunk_id as the microbatch index for context attribution.
         mb_idx = bwd_chunk_id if isinstance(bwd_chunk_id, int) else _pp_context.get("mb_idx", 0)
         _stamp_chunk_context(self, mb_idx, "W", "backward")
+        start_seq_idx = _timeline_start_seq()
         from torchtitan_npu.simulator.capture.dispatch_capture import get_active_capture
         cap = get_active_capture()
         if cap is not None:
@@ -1481,6 +1495,7 @@ def _patch_pipeline_stage_for_pp_context() -> None:
                 pp_mb_idx=mb_idx,
                 phase="backward",
                 comp_type="W",
+                start_seq_idx=start_seq_idx,
             )
         return result
 

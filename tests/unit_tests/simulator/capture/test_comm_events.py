@@ -148,6 +148,8 @@ def test_disabled_memory_tracking_drops_fsdp_residency_events():
         )
 
     assert recorder.fsdp_residency_events == []
+    assert len(recorder.fsdp_schedule_events) == 1
+    assert recorder.fsdp_schedule_events[0].group_id == "group"
 
 
 def test_mixed_p2p_batch_uses_each_op_pp_context():
@@ -174,6 +176,10 @@ def test_mixed_p2p_batch_uses_each_op_pp_context():
         assert [(event.p2p_stage, event.p2p_mb_idx, event.p2p_direction) for event in recorder.events] == [
             (0, 0, "forward_send"),
             (1, 2, "backward_recv"),
+        ]
+        assert [event.transfer_id for event in recorder.events] == [
+            "pp:forward:s0->s1:mb0:t0",
+            "pp:backward:s2->s1:mb2:t0",
         ]
     finally:
         _pp_context.clear()

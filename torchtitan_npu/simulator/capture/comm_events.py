@@ -70,6 +70,7 @@ class CommEvent:
     comp_type: str = ""
     # FSDP sharding state active when this comm op ran.
     fsdp_state: str = "NA"
+    transfer_id: str = ""       # stable cross-rank PP rendezvous key
 
 
 class _NoOpWork:
@@ -90,6 +91,7 @@ class CommEventRecorder:
         self.events: list[CommEvent] = []
         self.timeline_events: list[dict] = []  # L2 scheduling events (MB 1+ pass-through)
         self.fsdp_residency_events: list[FSDPResidencyEvent] = []
+        self.fsdp_schedule_events: list[FSDPResidencyEvent] = []
 
     def record(
         self,
@@ -126,6 +128,7 @@ class CommEventRecorder:
         pp_mb_idx: int,
         phase: str,
         comp_type: str = "",
+        start_seq_idx: int | None = None,
     ) -> None:
         """Record an L2 scheduling-level timeline event (e.g. forward_one_chunk,
         backward_one_chunk, backward_weight_one_chunk).  Used for every
@@ -134,8 +137,13 @@ class CommEventRecorder:
         so the L2 schedule can instantiate the right template for each
         microbatch. ``comp_type`` carries the F/B/I/W class."""
         from torchtitan_npu.simulator.capture.dispatch_capture import _seq_counter
+        end_seq_idx = next(_seq_counter)
+        instance_id = f"s{pp_stage}_{comp_type or phase}_mb{pp_mb_idx}"
         self.timeline_events.append({
-            "seq_idx": next(_seq_counter),
+            "seq_idx": end_seq_idx,
+            "start_seq_idx": end_seq_idx if start_seq_idx is None else start_seq_idx,
+            "end_seq_idx": end_seq_idx,
+            "instance_id": instance_id,
             "action": action,
             "pp_stage": pp_stage,
             "pp_mb_idx": pp_mb_idx,
@@ -152,21 +160,38 @@ class CommEventRecorder:
         num_bytes: int,
         tensor_ids: tuple[int, ...],
     ) -> None:
-        if not self.memory_tracking_enabled:
-            return
-
         from torchtitan_npu.simulator.capture.dispatch_capture import _seq_counter
 
-        self.fsdp_residency_events.append(
-            FSDPResidencyEvent(
-                group_id=group_id,
-                action=action,
-                seq_idx=next(_seq_counter),
-                phase=phase,
-                num_bytes=num_bytes,
-                tensor_ids=tensor_ids,
-            )
+        from torchtitan_npu.simulator.meta_env import _pp_context
+
+        stage = int(_pp_context.get("stage", -1))
+        mb_idx = int(_pp_context.get("mb_idx", -1))
+        comp_type = str(_pp_context.get("comp_type", ""))
+        try:
+            capture_process_rank = dist.get_rank() if dist.is_initialized() else 0
+        except (RuntimeError, ValueError):
+            capture_process_rank = -1
+
+        event = FSDPResidencyEvent(
+            group_id=group_id,
+            action=action,
+            seq_idx=next(_seq_counter),
+            phase=phase,
+            num_bytes=num_bytes,
+            tensor_ids=tensor_ids,
+            capture_process_rank=capture_process_rank,
+            pp_stage=stage,
+            pp_mb_idx=mb_idx,
+            comp_type=comp_type,
+            parent_compute_instance_id=(
+                f"s{stage}_{comp_type}_mb{mb_idx}"
+                if stage >= 0 and mb_idx >= 0 and comp_type
+                else ""
+            ),
         )
+        self.fsdp_schedule_events.append(event)
+        if self.memory_tracking_enabled:
+            self.fsdp_residency_events.append(event)
 
 
 def _resolve_world_size(group: object) -> int:
@@ -511,6 +536,23 @@ def capture_fake_collectives(*, memory_tracking_enabled: bool = True) -> Iterato
         with _use_p2p_op_context(_consume_p2p_op_context(tensor, direction)):
             yield
 
+    def _finalize_pp_transfer_id(event: CommEvent) -> None:
+        direction = event.p2p_direction
+        stage = event.p2p_stage
+        if direction == "forward_send":
+            src_stage, dst_stage, base = stage, stage + 1, "forward"
+        elif direction == "forward_recv":
+            src_stage, dst_stage, base = stage - 1, stage, "forward"
+        elif direction == "backward_send":
+            src_stage, dst_stage, base = stage, stage - 1, "backward"
+        elif direction == "backward_recv":
+            src_stage, dst_stage, base = stage + 1, stage, "backward"
+        else:
+            return
+        event.transfer_id = (
+            f"pp:{base}:s{src_stage}->s{dst_stage}:mb{event.p2p_mb_idx}:t0"
+        )
+
     def patched_isend(tensor, dst=None, group=None, tag=0, group_dst=None):  # noqa: ANN001
         if not _should_intercept(group):
             return orig_isend(tensor, dst=dst, group=group, tag=tag, group_dst=group_dst)
@@ -521,6 +563,7 @@ def capture_fake_collectives(*, memory_tracking_enabled: bool = True) -> Iterato
             event.p2p_direction = f"{_pp_context['phase']}_send"
             event.p2p_mb_idx = int(_pp_context["mb_idx"])
             event.p2p_stage = int(_pp_context["stage"])
+            _finalize_pp_transfer_id(event)
         # No actual data transfer — meta tensors have no data.
         # Shape inference is handled by DYNAMIC mode via _send_meta/_recv_meta.
         return _NoOpWork()
@@ -535,6 +578,7 @@ def capture_fake_collectives(*, memory_tracking_enabled: bool = True) -> Iterato
             event.p2p_direction = f"{_pp_context['phase']}_recv"
             event.p2p_mb_idx = int(_pp_context["mb_idx"])
             event.p2p_stage = int(_pp_context["stage"])
+            _finalize_pp_transfer_id(event)
         # No actual data transfer — meta tensors have no data.
         # The recv buffer shape was already set by DYNAMIC mode's
         # _setup_forward_recv_info using metadata from _recv_meta.
@@ -550,6 +594,7 @@ def capture_fake_collectives(*, memory_tracking_enabled: bool = True) -> Iterato
             event.p2p_direction = f"{_pp_context['phase']}_send"
             event.p2p_mb_idx = int(_pp_context["mb_idx"])
             event.p2p_stage = int(_pp_context["stage"])
+            _finalize_pp_transfer_id(event)
         return None
 
     def patched_recv(tensor, src=None, group=None, tag=0, group_src=None):  # noqa: ANN001
@@ -562,6 +607,7 @@ def capture_fake_collectives(*, memory_tracking_enabled: bool = True) -> Iterato
             event.p2p_direction = f"{_pp_context['phase']}_recv"
             event.p2p_mb_idx = int(_pp_context["mb_idx"])
             event.p2p_stage = int(_pp_context["stage"])
+            _finalize_pp_transfer_id(event)
         return 0
 
     dist.isend = patched_isend

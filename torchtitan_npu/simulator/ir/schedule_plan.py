@@ -35,7 +35,7 @@ from torchtitan_npu.simulator.ir.step_graph import StepGraph
 
 @dataclass
 class DataSlot:
-    """A tensor flowing between two ScheduleActions.
+    """A tensor or readiness token flowing between two ScheduleActions.
 
     ``kind`` controls how the slot is interpreted:
       * ``activation``       — forward output of stage S, input of stage S+1
@@ -46,6 +46,7 @@ class DataSlot:
       * ``optimizer_state``  — updated param (OPTIMIZER→next iter)
       * ``dataloader_input`` — first-stage forward input (external)
       * ``kv_cache``         — inference cross-iteration KV cache
+      * ``control``          — zero-byte action-completion dependency
     """
 
     slot_id: str
@@ -62,13 +63,14 @@ class DataSlot:
     is_local_transfer: bool = False        # V-schedule same-rank adjacent stage (set_local_*_input, no comm)
     src_exit_op: int = 0                   # L1 template exit op_id (producer side)
     dst_entry_op: int = 0                  # L1 template entry op_id (consumer side)
+    external: bool = False                 # supplied outside this SchedulePlan
 
 
 @dataclass
 class CommDetail:
     """Denormalized communication descriptor carried directly on a comm
-    ``ScheduleAction`` (SEND_F/RECV_F/SEND_B/RECV_B/UNSHARD/RESHARD/
-    REDUCE_GRAD) so consumers can read the comm volume / peer / shape without
+    ``ScheduleAction`` (SEND_F/RECV_F/SEND_B/RECV_B/UNSHARD/REDUCE_GRAD)
+    so consumers can read the comm volume / peer / shape without
     a 2-hop lookup through ``data_slots``. Field set mirrors ``DataPass`` +
     ``TensorSlot`` (shape/dtype/volume_bytes/src_exit_op/dst_entry_op/
     comm_group_ranks) plus the L0 ``comm_op_id`` for replay and a ``slot_id``
@@ -92,6 +94,7 @@ class CommDetail:
     slot_id: str = ""                # back-ref to the DataSlot this comm transports
     comm_op_id: int = 0             # L0 comm OpNode id for replay (0 = no-op / not captured)
     is_noop: bool = False           # FSDP mesh=1 etc: action ran but no real collective
+    transfer_id: str = ""           # stable SEND/RECV rendezvous key across rank plans
 
 
 @dataclass
@@ -120,8 +123,8 @@ class ScheduleAction:
     produces: list[str] = field(default_factory=list)   # DataSlot ids
     duration_est: float = 0.0
     sub_actions: list[ScheduleAction] | None = None     # OVERLAP_F_B
-    # For comm/FSDP actions: the L0 OpNode id that implements this action
-    # (the allgather/reduce_scatter/p2p synthetic op captured by comm_events).
+    # For communication actions: the L0 OpNode id that implements this action
+    # (the allgather/reduce-scatter/p2p synthetic op captured by comm_events).
     # Set by build_schedule_plan; lookup via SchedulePlan.find_op_node().
     # 0 = no captured L0 op (e.g. FSDP no-op when mesh size 1 -> is_noop=True).
     comm_op_id: int = 0
@@ -131,8 +134,9 @@ class ScheduleAction:
     # data transfer to replay.
     is_noop: bool = False
     # Direct comm descriptor for comm actions (SEND_F/RECV_F/SEND_B/RECV_B/
-    # UNSHARD/RESHARD/REDUCE_GRAD). None for COMPUTE/OPTIMIZER/OVERLAP_F_B
-    # parent. Carries the data-pass-level detail (shape/bytes/peer/group/
+    # UNSHARD/REDUCE_GRAD). RESHARD is a local full-parameter release and has
+    # no real communication descriptor (a no-op marker may still be present).
+    # Carries the data-pass-level detail (shape/bytes/peer/group/
     # src_exit_op/dst_entry_op) + comm_op_id for replay, so consumers don't
     # need to cross-reference execution_timeline + data_passes.
     comm: CommDetail | None = None
@@ -184,7 +188,7 @@ class SchedulePlan:
         """Locate the L0 ``OpNode`` for a captured op_id (e.g. an action's
         ``comm_op_id``) across all L1 step_templates. Returns the OpNode or
         None. This is the entry point for simulation replay: given an
-        UNSHARD/RESHARD/SEND/RECV action, ``action.comm_op_id`` +
+        UNSHARD/SEND/RECV action, ``action.comm_op_id`` +
         ``find_op_node(comm_op_id)`` yields the actual op (shape, comm_bytes,
         flops, module_path, …) to replay."""
         if not op_id:
@@ -222,7 +226,7 @@ class SchedulePlan:
                 "comm_primitive", "comm_role", "comm_bytes", "comm_shape",
                 "comm_src_stage", "comm_dst_stage", "comm_peer_rank",
                 "comm_group_ranks", "comm_src_exit_op", "comm_dst_entry_op",
-                "comm_op_id", "comm_is_noop",
+                "comm_op_id", "comm_is_noop", "comm_transfer_id",
             ])
             for a in self.actions:
                 c = a.comm
@@ -240,12 +244,14 @@ class SchedulePlan:
                     ";".join(",".join(str(r) for r in g) for g in c.comm_group_ranks) if c else "",
                     c.src_exit_op if c else "", c.dst_entry_op if c else "",
                     c.comm_op_id if c else "", int(c.is_noop) if c else "",
+                    c.transfer_id if c else "",
                 ])
             w.writerow(["# DataSlots", "", "", "", "", "", "", "", "", "", "", ""])
             w.writerow([
                 "slot_id", "kind", "stage_src", "stage_dst", "mb_idx",
                 "shape", "dtype", "bytes", "comm_primitive", "is_local",
                 "producer_action", "consumer_actions", "src_exit_op", "dst_entry_op",
+                "external",
             ])
             for s in slots.values():
                 w.writerow([
@@ -256,4 +262,5 @@ class SchedulePlan:
                     int(s.is_local_transfer),
                     s.producer_action_id, ";".join(s.consumer_action_ids),
                     s.src_exit_op, s.dst_entry_op,
+                    int(s.external),
                 ])
