@@ -6,6 +6,10 @@
 > `PP > 1`、每个进程一个 PP stage、`B` 为完整 backward。不要在这一版同时扩展
 > DualPipe、V schedule、I/W split、跨迭代流水或复杂 overlap。
 
+如果下层已经生成 `SchedulePlan`，上层不需要理解本文的捕获和组装过程。请直接阅读
+[`schedule-plan-des-consumer-guide.md`](./schedule-plan-des-consumer-guide.md)，按现有 action、slot、
+communication descriptor 重建 DES。
+
 开始实现前先阅读：
 
 - `torchtitan_npu/simulator/capture/schedule_builder.py`
