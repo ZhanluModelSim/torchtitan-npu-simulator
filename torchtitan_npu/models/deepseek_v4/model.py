@@ -42,6 +42,26 @@ logger = logging.getLogger()
 _NORM_INIT = {"weight": nn.init.ones_}
 
 
+def _apply_rotary_emb_single(
+    x: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor | None,
+    inverse: bool,
+) -> torch.Tensor:
+    if freqs_cis.is_complex():
+        if inverse:
+            freqs_cis = freqs_cis.conj()
+        return apply_rotary_emb_single_complex(x, freqs_cis, positions)
+    if positions is None and freqs_cis.size(1) != x.size(1):
+        freqs_cis = freqs_cis.narrow(1, 0, x.size(1))
+    return cast("Any", apply_rotary_emb_single_complex)(
+        x,
+        freqs_cis,
+        positions,
+        inverse=inverse,
+    )
+
+
 def apply_rotary_emb(
     x: torch.Tensor,
     freqs_cis: torch.Tensor,
@@ -49,25 +69,22 @@ def apply_rotary_emb(
     positions: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Apply RoPE while presenting TND tensors as fake-batch BSND to the shared helper."""
-    if inverse:
-        freqs_cis = freqs_cis.conj()
-
     if positions is not None:
         position_index = positions.squeeze(0) if positions.dim() > 1 and positions.size(0) == 1 else positions
         if position_index.dim() == 1 and x.size(0) == position_index.numel():
             positions = position_index.unsqueeze(0)
             if x.ndim == 3:
-                return apply_rotary_emb_single_complex(x.unsqueeze(0), freqs_cis, positions).squeeze(0)
+                return _apply_rotary_emb_single(x.unsqueeze(0), freqs_cis, positions, inverse).squeeze(0)
             if x.ndim == 2:
                 return (
-                    apply_rotary_emb_single_complex(x.unsqueeze(0).unsqueeze(2), freqs_cis, positions)
+                    _apply_rotary_emb_single(x.unsqueeze(0).unsqueeze(2), freqs_cis, positions, inverse)
                     .squeeze(0)
                     .squeeze(1)
                 )
 
     if x.ndim == 3:
-        return apply_rotary_emb_single_complex(x.unsqueeze(2), freqs_cis, positions).squeeze(2)
-    return apply_rotary_emb_single_complex(x, freqs_cis, positions)
+        return _apply_rotary_emb_single(x.unsqueeze(2), freqs_cis, positions, inverse).squeeze(2)
+    return _apply_rotary_emb_single(x, freqs_cis, positions, inverse)
 
 
 def hadamard_transform_ref(x, hadamard_mat, scale=1.0):
@@ -94,6 +111,22 @@ def rotate_activation(x: torch.Tensor, hadamard_mat: torch.Tensor) -> torch.Tens
     return hadamard_transform_ref(x, hadamard_mat, scale=hidden_size**-0.5)
 
 
+def _rope_cache_compression_offsets(model_args: DeepSeekV4Model.Config) -> dict[int, int]:
+    """Return packed-cache offsets for active model compression ratios."""
+    max_seq_len = model_args.max_seq_len
+    ratios = set(model_args.compress_ratios[: model_args.n_layers])
+    if model_args.num_mtp_modules > 0 and model_args.mtp_layer_compress_ratio > 1:
+        ratios.add(model_args.mtp_layer_compress_ratio)
+    offset = max_seq_len
+    offsets = {}
+    for ratio in sorted(ratios):
+        if ratio <= 1:
+            continue
+        offsets[ratio] = offset
+        offset += (max_seq_len + ratio - 1) // ratio
+    return offsets
+
+
 class Compressor(Module):
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
@@ -110,6 +143,10 @@ class Compressor(Module):
         self.rope_head_dim = args.rope_head_dim
         self.nope_head_dim = config.head_dim - args.rope_head_dim
         self.compress_ratio = config.compress_ratio
+        self.rope_cache_offset = None
+        if args.use_npu_rope:
+            offsets = _rope_cache_compression_offsets(args)
+            self.rope_cache_offset = offsets.get(config.compress_ratio)
         self.overlap = config.compress_ratio == 4
         self.rotate = config.rotate
         self.use_tnd_metadata = False
@@ -160,8 +197,15 @@ class Compressor(Module):
             raise ValueError(f"seqlen ({seqlen}) must be divisible by compress_ratio ({ratio})")
         if positions is not None:
             comp_positions = positions[:, ::ratio]
-        else:
+        elif freqs_cis.is_complex():
             freqs_cis = freqs_cis[::ratio]
+            comp_positions = None
+        else:
+            segment_len = seqlen // ratio
+            assert self.rope_cache_offset is not None and self.rope_cache_offset + segment_len <= freqs_cis.size(1), (
+                "real RoPE cache must contain the packed compression segment"
+            )
+            freqs_cis = freqs_cis.narrow(1, self.rope_cache_offset, segment_len)
             comp_positions = None
 
         kv = kv.unflatten(1, (-1, ratio))
@@ -488,6 +532,22 @@ def precompute_freqs_cis(model_args: DeepSeekV4Model.Config, with_compressor: bo
     freqs = torch.outer(t, freqs)
     freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
     return freqs_cis
+
+
+def precompute_rope_cache(
+    model_args: DeepSeekV4Model.Config,
+    with_compressor: bool,
+) -> torch.Tensor:
+    freqs_cis = precompute_freqs_cis(model_args, with_compressor)
+    if not model_args.use_npu_rope:
+        return freqs_cis
+    cache = torch.view_as_real(freqs_cis).movedim(-1, 0).repeat_interleave(2, dim=-1)
+    mtp_uses_compressor = model_args.num_mtp_modules > 0 and model_args.mtp_layer_compress_ratio > 1
+    if not with_compressor and not mtp_uses_compressor:
+        return cache
+
+    offsets = _rope_cache_compression_offsets(model_args)
+    return torch.cat([cache, *(cache[:, ::ratio] for ratio in offsets)], dim=1)
 
 
 class SparseAttention(Module):
@@ -1245,7 +1305,7 @@ class MTPModule(DeepSeekV4TransformerBlock):
         Args:
             input_offset (torch.Tensor): Input tensor of original token (batch_size, seq_len, dim).
             prev_embed (torch.Tensor): Input tensor of main module output token (batch_size, seq_len, dim).
-            freqs_cis (torch.Tensor): Precomputed complex exponential values for rotary embeddings.
+            freqs_cis (torch.Tensor): Precomputed rotary embedding cache.
 
         Returns:
             torch.Tensor: Output tensor with the same shape as the input.
@@ -1317,6 +1377,7 @@ class DeepSeekV4Model(BaseModel):
         beta_slow: int = 1
         n_layers: int = 4
         use_smla: bool = False
+        use_npu_rope: bool = False
         use_global_tnd: bool = False
         num_mtp_modules: int = 0
         mtp_layer_compress_ratio: int = 1
@@ -1348,6 +1409,7 @@ class DeepSeekV4Model(BaseModel):
 
             converters = trainer_config.model_converters.converters
             self.use_smla = has_npu_converter(converters, "npu_smla")
+            self.use_npu_rope = has_npu_converter(converters, "npu_rope")
             use_mhc_pre = has_npu_converter(converters, "npu_mhc_pre")
             use_mhc_post = has_npu_converter(converters, "npu_mhc_post")
             use_a5 = get_npu_device_type() == "A5"
@@ -1414,10 +1476,10 @@ class DeepSeekV4Model(BaseModel):
             out_features=model_args.vocab_size,
             bias=False,
         ).build()
-        self.register_buffer("freqs_cis", precompute_freqs_cis(model_args, True), persistent=False)
+        self.register_buffer("freqs_cis", precompute_rope_cache(model_args, True), persistent=False)
         self.register_buffer(
             "freqs_cis_wo_compressor",
-            precompute_freqs_cis(model_args, False),
+            precompute_rope_cache(model_args, False),
             persistent=False,
         )
         self.register_buffer(
@@ -1479,6 +1541,14 @@ class DeepSeekV4Model(BaseModel):
             h = tokens
             input_ids = self._normalize_pp_input_ids(input_ids)
             seq_len = h.shape[1]
+        compressor_freqs_cis = self.freqs_cis
+        freqs_cis_wo_compressor = self.freqs_cis_wo_compressor
+        if positions is not None:
+            if not compressor_freqs_cis.is_complex() and compressor_freqs_cis.size(1) != self.max_seq_len:
+                compressor_freqs_cis = compressor_freqs_cis.narrow(1, 0, self.max_seq_len)
+            if not freqs_cis_wo_compressor.is_complex() and freqs_cis_wo_compressor.size(1) != self.max_seq_len:
+                freqs_cis_wo_compressor = freqs_cis_wo_compressor.narrow(1, 0, self.max_seq_len)
+
         # Main model calculate
         for layer in self.layers.values():
             layer_id = cast("Any", layer).layer_id
@@ -1486,7 +1556,11 @@ class DeepSeekV4Model(BaseModel):
                 h = layer(
                     h,
                     input_ids,
-                    (self.freqs_cis if self.model_args.compress_ratios[layer_id] > 1 else self.freqs_cis_wo_compressor),
+                    (
+                        compressor_freqs_cis
+                        if self.model_args.compress_ratios[layer_id] > 1
+                        else freqs_cis_wo_compressor
+                    ),
                     self.hadamard_mat,
                     attention_masks,
                     positions=positions,
@@ -1538,8 +1612,7 @@ class DeepSeekV4Model(BaseModel):
                     input_offset,
                     prev_embed,
                     input_ids,
-                    # Assumption: No compressor in MTP modules.
-                    self.freqs_cis_wo_compressor,
+                    freqs_cis_wo_compressor,
                     self.hadamard_mat,
                     attention_masks,
                     positions=positions,
@@ -1552,8 +1625,8 @@ class DeepSeekV4Model(BaseModel):
     def init_weights(self, buffer_device: torch.device | None = None) -> None:
         buffer_device = buffer_device or self.freqs_cis.device
         with torch.device(buffer_device):
-            self.freqs_cis = precompute_freqs_cis(self.model_args, True)
-            self.freqs_cis_wo_compressor = precompute_freqs_cis(self.model_args, False)
+            self.freqs_cis = precompute_rope_cache(self.model_args, True)
+            self.freqs_cis_wo_compressor = precompute_rope_cache(self.model_args, False)
             self.hadamard_mat = torch.tensor(
                 # pyrefly: ignore [implicit-import]
                 scipy.linalg.hadamard(self.model_args.index_head_dim, float),

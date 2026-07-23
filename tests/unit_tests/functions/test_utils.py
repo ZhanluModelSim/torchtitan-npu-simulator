@@ -31,14 +31,49 @@ def test_npu_apply_rotary_emb_single_complex_prepares_interleaved_cos_sin(monkey
 
     monkeypatch.setattr(rope_kernel.torch_npu, "npu_rotary_mul", fake_rotary_mul)
 
-    result = rope_kernel.npu_apply_rotary_emb_single_complex(x, freqs_cis)
+    result = rope_kernel.npu_apply_rotary_emb_single_complex(x, freqs_cis, inverse=True)
 
     assert result.shape == x.shape
     assert captured["cos"].shape == (1, 8, 1, 32)
     assert captured["sin"].shape == (1, 8, 1, 32)
+    assert torch.equal(captured["cos"], freqs_cis.real.repeat_interleave(2, dim=-1)[None, :, None, :])
+    assert torch.equal(captured["sin"], -freqs_cis.imag.repeat_interleave(2, dim=-1)[None, :, None, :])
     assert captured["cos"].dtype == torch.float32
     assert captured["sin"].dtype == torch.float32
     assert captured["rotary_mode"] == "interleave"
+
+
+def test_npu_apply_rotary_emb_single_complex_uses_stacked_cache(monkeypatch):
+    captured = {}
+    x = torch.randn(2, 4, 3, 8, dtype=torch.bfloat16)
+    cos = torch.randn(8, 8, dtype=torch.float32)
+    sin = torch.randn(8, 8, dtype=torch.float32)
+    rope_cache = torch.stack((cos, sin))
+    positions = torch.tensor([[6, 4, 2, -1], [7, 5, 3, 1]])
+
+    def fake_rotary_mul(tensor, selected_cos, selected_sin, rotary_mode="half"):
+        captured["cos"] = selected_cos
+        captured["sin"] = selected_sin
+        captured["rotary_mode"] = rotary_mode
+        return tensor
+
+    monkeypatch.setattr(rope_kernel.torch_npu, "npu_rotary_mul", fake_rotary_mul)
+
+    result = rope_kernel.npu_apply_rotary_emb_single_complex(
+        x,
+        rope_cache,
+        positions,
+        inverse=True,
+    )
+
+    expected_cos = cos[positions[0]].view(1, 4, 1, 8)
+    expected_sin = -sin[positions[0]].view(1, 4, 1, 8)
+    assert torch.equal(captured["cos"], expected_cos)
+    assert torch.equal(captured["sin"], expected_sin)
+    assert captured["cos"].dtype == torch.float32
+    assert captured["sin"].dtype == torch.float32
+    assert captured["rotary_mode"] == "interleave"
+    assert result.dtype == x.dtype
 
 
 def test_npu_apply_rotary_emb_cos_sin_uses_input_sequence_length(monkeypatch):

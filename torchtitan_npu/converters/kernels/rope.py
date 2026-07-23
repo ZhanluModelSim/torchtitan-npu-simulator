@@ -145,6 +145,8 @@ def npu_apply_rotary_emb_single_complex(
     x: torch.Tensor,
     freqs_cis: torch.Tensor,
     positions: torch.Tensor | None = None,
+    *,
+    inverse: bool = False,
 ) -> torch.Tensor:
     from torch.distributed.tensor import DTensor
 
@@ -155,12 +157,32 @@ def npu_apply_rotary_emb_single_complex(
     positions = _maybe_wrap_positions(positions, x)
     if isinstance(positions, DTensor):
         positions = positions.to_local()
+
     seqlen = x_local.shape[1]
-    freqs_cis = _select_freqs_cis(freqs_cis_local, positions, seqlen)
-
     x_f = x_local.float()
+    if freqs_cis_local.is_complex():
+        selected_freqs = _select_freqs_cis(freqs_cis_local, positions, seqlen)
+        cos, sin = _complex_to_interleaved_cos_sin(selected_freqs, x_f.dtype)
+    else:
+        assert (
+            freqs_cis_local.ndim == 3
+            and freqs_cis_local.shape[0] == 2
+            and freqs_cis_local.shape[-1] == x_local.shape[-1]
+            and freqs_cis_local.dtype == torch.float32
+        ), "interleaved RoPE cache must be fp32 with shape [2, cache_seq_len, head_dim]"
+        if positions is None:
+            selected_cache = freqs_cis_local if freqs_cis_local.shape[1] == seqlen else freqs_cis_local[:, :seqlen]
+        else:
+            position_index = positions[0] if positions.dim() > 1 else positions
+            selected_cache = freqs_cis_local[:, position_index]
+        cos, sin = selected_cache.unbind(0)
+        shape = [d if i == 1 or i == x_local.ndim - 1 else 1 for i, d in enumerate(x_local.shape)]
+        cos = cos.view(*shape)
+        sin = sin.view(*shape)
 
-    cos, sin = _complex_to_interleaved_cos_sin(freqs_cis, x_f.dtype)
+    if inverse:
+        sin = -sin
+
     y = torch_npu.npu_rotary_mul(x_f, cos, sin, rotary_mode="interleave")
     y = y.to(x_local.dtype)
 

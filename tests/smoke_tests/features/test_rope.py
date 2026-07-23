@@ -125,3 +125,31 @@ def test_npu_apply_rotary_emb_deepseek_precision(npu_device):
     assert expected.shape == actual.shape
 
     _assert_tensors_close(expected, actual, "Output mismatch", rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("inverse", [False, True])
+def test_npu_apply_rotary_emb_deepseek_stacked_cache_bitwise(npu_device, inverse):
+    x_seed = stable_randn(2, 128, 8, 64, dtype=torch.bfloat16, device=npu_device)
+    upstream = stable_randn(*x_seed.shape, dtype=torch.bfloat16, device=npu_device)
+    positions = torch.arange(128, device=npu_device).unsqueeze(0)
+    positions[0, -1] = -1
+    freqs_cis = _complex_freqs((128, 32), npu_device)
+    rope_cache = torch.view_as_real(freqs_cis).movedim(-1, 0).repeat_interleave(2, dim=-1)
+
+    expected_x = x_seed.clone().requires_grad_(True)
+    actual_x = x_seed.clone().requires_grad_(True)
+    expected_freqs = freqs_cis.conj() if inverse else freqs_cis
+    expected = npu_apply_rotary_emb_deepseek(expected_x, expected_freqs, positions)
+    actual = npu_apply_rotary_emb_deepseek(
+        actual_x,
+        rope_cache,
+        positions,
+        inverse=inverse,
+    )
+    expected.backward(upstream)
+    actual.backward(upstream)
+
+    assert torch.equal(expected, actual)
+    assert expected_x.grad is not None
+    assert actual_x.grad is not None
+    assert torch.equal(expected_x.grad, actual_x.grad)

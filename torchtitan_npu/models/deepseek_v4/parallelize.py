@@ -10,11 +10,15 @@
 
 import dataclasses
 import logging
+from collections.abc import Callable
 from typing import Any, cast
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from torch.distributed._composable.replicate_with_fsdp import (
+    replicate as replicate_with_fsdp,
+)
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     CheckpointWrapper,
 )
@@ -195,6 +199,15 @@ class HcHeadParallelStyle(ParallelStyle):
         return parallelize_module(module, device_mesh, self.io_plan)
 
 
+def _disable_state_cast_forward_inputs(fsdp_state: Any) -> None:
+    mp_policy = getattr(fsdp_state, FSDP_MP_POLICY_ATTR)
+    setattr(
+        fsdp_state,
+        FSDP_MP_POLICY_ATTR,
+        dataclasses.replace(mp_policy, cast_forward_inputs=False),
+    )
+
+
 def _disable_lm_head_cast_forward_inputs(model: nn.Module) -> None:
     """Keep LM head inputs in fp32 after data parallel wrapping.
 
@@ -210,8 +223,7 @@ def _disable_lm_head_cast_forward_inputs(model: nn.Module) -> None:
 
     This changes only ``FSDPState._mp_policy``. It leaves
     ``FSDPParamGroup.mp_policy`` untouched, so the LM head parameters remain
-    bf16-sharded. The same state exists for both ``apply_fsdp`` and
-    ``apply_replicate`` because ``ReplicateModule`` inherits ``FSDPModule``.
+    bf16-sharded.
     """
     # TODO(upstream sync): remove this once the pinned torchtitan baseline
     # includes pytorch/torchtitan#2881 (merge 21c4913), which sets
@@ -226,12 +238,20 @@ def _disable_lm_head_cast_forward_inputs(model: nn.Module) -> None:
     fsdp_state = fully_shard.state(output)  # pyrefly: ignore [missing-attribute]
     if fsdp_state is None:
         return
-    mp_policy = getattr(fsdp_state, FSDP_MP_POLICY_ATTR)
-    setattr(
-        fsdp_state,
-        FSDP_MP_POLICY_ATTR,
-        dataclasses.replace(mp_policy, cast_forward_inputs=False),
-    )
+    _disable_state_cast_forward_inputs(fsdp_state)
+
+
+def _disable_transformer_block_cast_forward_inputs(
+    model: nn.Module,
+    state_fn: Callable[[nn.Module], Any],
+) -> None:
+    """Keep the precomputed fp32 NPU RoPE cache in fp32 at block entry."""
+    # Block activations already have the mixed-precision parameter dtype. Only
+    # the real-valued RoPE cache must bypass the wrapper's forward-input cast.
+    for transformer_block in cast("Any", model).layers.values():
+        fsdp_state = state_fn(transformer_block)
+        assert fsdp_state is not None, "Expected every DeepSeek-V4 transformer block to have data-parallel state."
+        _disable_state_cast_forward_inputs(fsdp_state)
 
 
 def _validate_deepseek_v4_parallelism(model_args, parallel_dims: ParallelDims) -> None:
@@ -398,6 +418,11 @@ def parallelize_deepseek_v4(
             gradient_divide_factor=parallel_dims.fsdp_gradient_divide_factor,
         )
         _disable_lm_head_cast_forward_inputs(model)
+        if model_args.use_npu_rope:
+            _disable_transformer_block_cast_forward_inputs(
+                model,
+                fully_shard.state,  # pyrefly: ignore [missing-attribute]
+            )
 
         if parallel_dims.dp_replicate_enabled:
             logger.info("Applied HSDP to the model")
@@ -418,6 +443,11 @@ def parallelize_deepseek_v4(
             reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
         )
         _disable_lm_head_cast_forward_inputs(model)
+        if model_args.use_npu_rope:
+            _disable_transformer_block_cast_forward_inputs(
+                model,
+                replicate_with_fsdp.state,  # pyrefly: ignore [missing-attribute]
+            )
 
     return model
 
