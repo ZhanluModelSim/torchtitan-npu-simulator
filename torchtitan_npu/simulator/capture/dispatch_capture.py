@@ -218,6 +218,8 @@ class OpDispatchCapture(TorchDispatchMode):
         module_path: str = "",
         *,
         logical_dtensor_shapes: bool = False,
+        memory_inputs: list[torch.Tensor] | None = None,
+        memory_outputs: list[torch.Tensor] | None = None,
     ) -> None:
         """Manually register one synthetic L0 event, as if `raw_op_type` had
         gone through __torch_dispatch__ normally. Used by
@@ -230,6 +232,9 @@ class OpDispatchCapture(TorchDispatchMode):
         ``logical_dtensor_shapes`` keeps local tensors for dependency and
         memory tracking, but uses DTensor global shapes in the OpNode metadata.
         This is intended for logical fused ops such as optimizer updates.
+
+        ``memory_inputs`` and ``memory_outputs`` may expose additional operands
+        to tensor-lifetime tracking without adding them to the logical OpNode.
         """
         logical_input_metas = None
         logical_output_metas = None
@@ -254,6 +259,16 @@ class OpDispatchCapture(TorchDispatchMode):
             input_metas=logical_input_metas,
             output_metas=logical_output_metas,
             tensor_shape_scope="global" if logical_dtensor_shapes else "local",
+            memory_flat_inputs=(
+                _flatten_tensors(memory_inputs)
+                if memory_inputs is not None
+                else None
+            ),
+            memory_flat_outputs=(
+                _flatten_tensors(memory_outputs)
+                if memory_outputs is not None
+                else None
+            ),
         )
 
     def _record_event(
@@ -266,6 +281,8 @@ class OpDispatchCapture(TorchDispatchMode):
         input_metas: list[TensorMeta] | None = None,
         output_metas: list[TensorMeta] | None = None,
         tensor_shape_scope: str = "local",
+        memory_flat_inputs: list[torch.Tensor] | None = None,
+        memory_flat_outputs: list[torch.Tensor] | None = None,
     ) -> None:
         if not self._capture_l0:
             return  # pass-through: duplicate (stage, comp_type) class skips L0 capture
@@ -282,6 +299,10 @@ class OpDispatchCapture(TorchDispatchMode):
             pass
         input_ids = [self.tensor_id(tensor) for tensor in flat_inputs]
         output_ids = [self.tensor_id(tensor) for tensor in flat_outputs]
+        memory_flat_inputs = flat_inputs if memory_flat_inputs is None else memory_flat_inputs
+        memory_flat_outputs = flat_outputs if memory_flat_outputs is None else memory_flat_outputs
+        memory_input_ids = [self.tensor_id(tensor) for tensor in memory_flat_inputs]
+        memory_output_ids = [self.tensor_id(tensor) for tensor in memory_flat_outputs]
         predecessors = sorted({self._producer[tensor_id] for tensor_id in input_ids if tensor_id in self._producer})
         if input_metas is None:
             input_metas = [to_tensor_meta(t, name=f"in_{i}") for i, t in enumerate(flat_inputs)]
@@ -360,12 +381,12 @@ class OpDispatchCapture(TorchDispatchMode):
                     execution_kind=execution_kind,
                     module_path=module_path,
                     inputs=tuple(
-                        _to_tensor_ref(tensor, name=f"in_{idx}", tensor_id=input_ids[idx])
-                        for idx, tensor in enumerate(flat_inputs)
+                        _to_tensor_ref(tensor, name=f"in_{idx}", tensor_id=memory_input_ids[idx])
+                        for idx, tensor in enumerate(memory_flat_inputs)
                     ),
                     outputs=tuple(
-                        _to_tensor_ref(tensor, name=f"out_{idx}", tensor_id=output_ids[idx])
-                        for idx, tensor in enumerate(flat_outputs)
+                        _to_tensor_ref(tensor, name=f"out_{idx}", tensor_id=memory_output_ids[idx])
+                        for idx, tensor in enumerate(memory_flat_outputs)
                     ),
                     pp_stage=pp_stage,
                     pp_mb_idx=pp_mb_idx,

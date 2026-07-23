@@ -52,10 +52,16 @@ def test_meta_safe_fused_adamw_does_not_read_values_or_dispatch_updates():
             maximize=False,
         )
 
+    node = next(
+        node for node in capture.build_nodes().values()
+        if node.annotations["raw_op_type"] == "npu.npu_apply_adam_w.default"
+    )
     event = next(
         event for event in capture.memory_events()
         if event.raw_op_type == "npu.npu_apply_adam_w.default"
     )
+    assert len(node.inputs) == 1
+    assert len(node.outputs) == 1
     assert len(event.inputs) == 5
     assert len(event.outputs) == 4
     assert {ref.tensor_id for ref in event.outputs} <= {
@@ -116,8 +122,8 @@ def test_hsdp_optimizer_node_uses_global_shapes_but_memory_uses_local_shapes(
         if event.raw_op_type == "npu.npu_apply_adam_w.default"
     )
 
-    assert [meta.shape for meta in node.inputs[:4]] == [(3, 8)] * 4
-    assert [meta.shape for meta in node.outputs[:3]] == [(3, 8)] * 3
+    assert [meta.shape for meta in node.inputs] == [(3, 8)]
+    assert [meta.shape for meta in node.outputs] == [(3, 8)]
     assert node.annotations["tensor_shape_scope"] == "global"
     assert [ref.shape for ref in event.inputs[:4]] == [(1, 8)] * 4
     assert [ref.shape for ref in event.outputs[:3]] == [(1, 8)] * 3

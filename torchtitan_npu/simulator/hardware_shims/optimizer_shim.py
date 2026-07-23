@@ -39,9 +39,11 @@ def _meta_safe_fused_adamw(
 
     cap = get_active_capture()
 
-    # Record the fused NPU op name (one per param group)
+    # Model optimizer work from parameter volume only. Gradients and optimizer
+    # states are algorithm-derived multiples of that volume; expanding them
+    # here makes otherwise identical operands ambiguous to downstream consumers.
     if cap is not None:
-        inputs = [
+        memory_inputs = [
             *params,
             *grads,
             *exp_avgs,
@@ -49,7 +51,7 @@ def _meta_safe_fused_adamw(
             *max_exp_avg_sqs,
             *state_steps,
         ]
-        mutated = [
+        memory_outputs = [
             *params,
             *exp_avgs,
             *exp_avg_sqs,
@@ -58,7 +60,9 @@ def _meta_safe_fused_adamw(
         ]
         cap.record_synthetic_op(
             "npu.npu_apply_adam_w.default",
-            inputs or [torch.empty(1, device="meta")],
-            mutated,
+            params or [torch.empty(1, device="meta")],
+            params,
             logical_dtensor_shapes=True,
+            memory_inputs=memory_inputs,
+            memory_outputs=memory_outputs,
         )
