@@ -145,11 +145,13 @@ def test_disabled_memory_tracking_drops_fsdp_residency_events():
             phase="forward",
             num_bytes=1024,
             tensor_ids=(1,),
+            shard_world_size=1,
         )
 
     assert recorder.fsdp_residency_events == []
     assert len(recorder.fsdp_schedule_events) == 1
     assert recorder.fsdp_schedule_events[0].group_id == "group"
+    assert recorder.fsdp_schedule_events[0].shard_world_size == 1
 
 
 def test_mixed_p2p_batch_uses_each_op_pp_context():

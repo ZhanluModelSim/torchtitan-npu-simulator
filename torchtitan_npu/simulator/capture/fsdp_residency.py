@@ -58,7 +58,12 @@ def _residency_metadata(param_group: Any) -> tuple[int, tuple[torch.Tensor, ...]
     return num_bytes, tuple(tracked_tensors.values())
 
 
-def _record_residency(param_group: Any, action: str, metadata: tuple[int, tuple[torch.Tensor, ...]]) -> None:
+def _record_residency(
+    param_group: Any,
+    action: str,
+    metadata: tuple[int, tuple[torch.Tensor, ...]],
+    shard_world_size: int,
+) -> None:
     from torchtitan_npu.simulator.capture.comm_events import get_active_recorder
     from torchtitan_npu.simulator.capture.dispatch_capture import get_active_capture
 
@@ -78,7 +83,17 @@ def _record_residency(param_group: Any, action: str, metadata: tuple[int, tuple[
         phase=phase,
         num_bytes=num_bytes,
         tensor_ids=tensor_ids,
+        shard_world_size=shard_world_size,
     )
+
+
+def _shard_world_size(param_group: Any) -> int:
+    try:
+        return int(param_group._all_gather_process_group.size())
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        mesh_info = getattr(param_group, "mesh_info", None)
+        shard_mesh_size = getattr(mesh_info, "shard_mesh_size", -1)
+        return int(shard_mesh_size) if shard_mesh_size is not None else -1
 
 
 def _set_stage_fsdp_state(meta_env: Any, state: str) -> None:
@@ -109,6 +124,7 @@ def install_fsdp_residency_hooks() -> None:
 
     def patched_wait_for_unshard(self):  # noqa: ANN001, ANN202
         was_unsharded = self.is_unsharded
+        shard_world_size = _shard_world_size(self)
         track_memory = _memory_tracking_enabled()
         _, sharded_tensors = _residency_metadata(self) if track_memory else (0, ())
         result = FSDPParamGroup._sim_orig_wait_for_unshard(self)
@@ -121,7 +137,8 @@ def install_fsdp_residency_hooks() -> None:
                 metadata = (num_bytes, tensors)
             else:
                 metadata = (0, ())
-            _record_residency(self, "alloc", metadata)
+            self._sim_residency_shard_world_size = shard_world_size
+            _record_residency(self, "alloc", metadata, shard_world_size)
         return result
 
     def patched_reshard(self):  # noqa: ANN001, ANN202
@@ -137,7 +154,10 @@ def install_fsdp_residency_hooks() -> None:
             meta_env._comm_layer = previous_comm_layer
         if was_unsharded and not self.is_unsharded:
             _set_stage_fsdp_state(meta_env, "SHARDED")
-            _record_residency(self, "free", metadata)
+            shard_world_size = getattr(self, "_sim_residency_shard_world_size", None)
+            if shard_world_size is None:
+                shard_world_size = _shard_world_size(self)
+            _record_residency(self, "free", metadata, shard_world_size)
         return result
 
     FSDPParamGroup.unshard = patched_unshard

@@ -484,10 +484,16 @@ def build_schedule_plan(
 
     def _mark_fsdp_noop_or_raise(action: ScheduleAction, stage: int) -> None:
         stage_uses_fsdp = fsdp_stage_usage.get(stage)
-        if stage_uses_fsdp is not False and fsdp_degree > 1:
+        shard_world_size = int(action.annotations.get("shard_world_size", -1))
+        requires_collective = (
+            shard_world_size > 1
+            or (shard_world_size < 0 and stage_uses_fsdp is not False and fsdp_degree > 1)
+        )
+        if requires_collective:
             raise RuntimeError(
                 f"{action.action_type} action {action.action_id} on stage {stage} "
-                f"requires FSDP communication (shard degree {fsdp_degree}) but no "
+                "requires FSDP communication "
+                f"(group shard size {shard_world_size}, global shard degree {fsdp_degree}) but no "
                 "captured CommEvent was matched"
             )
         action.is_noop = True
@@ -510,6 +516,12 @@ def build_schedule_plan(
         if a.action_type != "UNSHARD":
             continue
         s = a.stage if a.stage >= 0 else rank
+        shard_world_size = int(a.annotations.get("shard_world_size", -1))
+        if shard_world_size == 1:
+            # This group only changes local residency state. It must not consume
+            # an all-gather captured for a later, actually sharded group.
+            _mark_fsdp_noop_or_raise(a, s)
+            continue
         group_id = str(a.annotations.get("fsdp_group_id", ""))
         comp_type = str(a.annotations.get("residency_comp_type", ""))
         residency_key = (s, group_id, comp_type)

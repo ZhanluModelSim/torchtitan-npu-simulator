@@ -51,6 +51,7 @@ class FSDPResidencyEvent:
     pp_mb_idx: int = -1
     comp_type: str = ""
     parent_compute_instance_id: str = ""
+    shard_world_size: int = -1
 
 
 @dataclass(slots=True)

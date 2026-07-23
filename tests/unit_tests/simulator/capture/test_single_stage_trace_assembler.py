@@ -351,3 +351,113 @@ def test_repeated_fsdp_residency_reuses_folded_allgather_template() -> None:
     assert len(unshards) == 2
     assert [action.comm_op_id for action in unshards] == [910, 910]
     assert all(action.comm is not None and action.comm.primitive == "allgather" for action in unshards)
+
+
+def test_group_local_shard_size_controls_unshard_noop() -> None:
+    allgather = OpNode(
+        op_id=920,
+        op_type="allgather",
+        inputs=[],
+        outputs=[],
+        attrs={},
+        predecessors=[],
+        successors=[],
+        annotations={"raw_op_type": "comm.allgather"},
+    )
+    templates = {
+        "s0_F": StepGraph("s0_F", "F", {920: allgather}),
+        "s0_B": StepGraph("s0_B", "B", {}),
+    }
+    comm_events = [
+        CommEvent(
+            event_id="dense-allgather",
+            comm_primitive="allgather",
+            group_name="fsdp",
+            world_size=2,
+            tensor_shape=(128,),
+            dtype="bfloat16",
+            volume_bytes=256,
+            op_id=920,
+            comm_layer="L2",
+            p2p_stage=0,
+            p2p_mb_idx=0,
+            seq_idx=12,
+            comp_type="F",
+        ),
+    ]
+    residency = [
+        FSDPResidencyEvent(
+            group_id="expert-efsdp",
+            action="alloc",
+            seq_idx=11,
+            phase="forward",
+            num_bytes=256,
+            pp_stage=0,
+            pp_mb_idx=0,
+            comp_type="F",
+            parent_compute_instance_id="s0_F_mb0",
+            shard_world_size=1,
+        ),
+        FSDPResidencyEvent(
+            group_id="dense",
+            action="alloc",
+            seq_idx=12,
+            phase="forward",
+            num_bytes=256,
+            pp_stage=0,
+            pp_mb_idx=0,
+            comp_type="F",
+            parent_compute_instance_id="s0_F_mb0",
+            shard_world_size=2,
+        ),
+        FSDPResidencyEvent(
+            group_id="dense",
+            action="free",
+            seq_idx=18,
+            phase="forward",
+            num_bytes=256,
+            pp_stage=0,
+            pp_mb_idx=0,
+            comp_type="F",
+            parent_compute_instance_id="s0_F_mb0",
+            shard_world_size=2,
+        ),
+        FSDPResidencyEvent(
+            group_id="expert-efsdp",
+            action="free",
+            seq_idx=19,
+            phase="forward",
+            num_bytes=256,
+            pp_stage=0,
+            pp_mb_idx=0,
+            comp_type="F",
+            parent_compute_instance_id="s0_F_mb0",
+            shard_world_size=1,
+        ),
+    ]
+
+    plan = build_schedule_plan(
+        step_templates=templates,
+        rank_table=_RankTable(pp=1, dp_shard=2),
+        comm_events=comm_events,
+        fsdp_residency_events=residency,
+        timeline_events=[
+            _timeline(0, "F", 0, 10, 20),
+            _timeline(0, "B", 0, 30, 40),
+        ],
+        pipeline_schedule="1F1B",
+        rank=0,
+    )
+
+    unshards = [action for action in plan.actions if action.action_type == "UNSHARD"]
+    dense = next(
+        action for action in unshards if action.annotations["fsdp_group_id"] == "dense"
+    )
+    expert = next(
+        action for action in unshards if action.annotations["fsdp_group_id"] == "expert-efsdp"
+    )
+    assert dense.comm is not None and dense.comm.primitive == "allgather"
+    assert not dense.is_noop
+    assert expert.is_noop
+    assert expert.comm is not None and expert.comm.is_noop
+    assert not expert.consumes and not expert.produces

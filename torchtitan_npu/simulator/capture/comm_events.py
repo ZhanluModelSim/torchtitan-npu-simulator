@@ -159,6 +159,7 @@ class CommEventRecorder:
         phase: str,
         num_bytes: int,
         tensor_ids: tuple[int, ...],
+        shard_world_size: int = -1,
     ) -> None:
         from torchtitan_npu.simulator.capture.dispatch_capture import _seq_counter
 
@@ -188,6 +189,7 @@ class CommEventRecorder:
                 if stage >= 0 and mb_idx >= 0 and comp_type
                 else ""
             ),
+            shard_world_size=shard_world_size,
         )
         self.fsdp_schedule_events.append(event)
         if self.memory_tracking_enabled:

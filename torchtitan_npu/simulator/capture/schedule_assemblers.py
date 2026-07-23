@@ -148,6 +148,7 @@ class SingleStageTraceAssembler:
                 "parent_compute_instance_id": event.parent_compute_instance_id,
                 "residency_comp_type": event.comp_type,
                 "residency_bytes": event.num_bytes,
+                "shard_world_size": event.shard_world_size,
             },
         )
 
