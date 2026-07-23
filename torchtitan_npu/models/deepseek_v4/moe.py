@@ -143,13 +143,14 @@ class TokenChoiceTopKRouter(common_moe.TokenChoiceTopKRouter):
                 - num_tokens_per_expert (torch.Tensor):
                     Number of tokens assigned to each expert with shape ``(num_experts,)``.
         """
-        scores = self.gate(x)
+        with torch.autocast(device_type=x.device.type, dtype=torch.float32):
+            scores = self.gate(x)
         if self.score_func == "sigmoid":
-            scores = torch.sigmoid(scores.to(torch.float32))
+            scores = torch.sigmoid(scores)
         elif self.score_func == "softmax":
-            scores = F.softmax(scores.to(torch.float32), dim=1)
+            scores = F.softmax(scores, dim=1)
         elif self.score_func == "sqrtsoftplus":
-            scores = _softplus_stable(scores.to(torch.float32)).sqrt()
+            scores = _softplus_stable(scores).sqrt()
         else:
             raise NotImplementedError(f"Unknown score function {self.score_func}")
 
