@@ -211,7 +211,12 @@ def run_simulation_step(
         boundary.mark("optimizer")
         # Always capture L0 for optimizer phase (not controlled by microbatch)
         capture._capture_l0 = True
-        optimizer_step()
+        from torchtitan_npu.simulator.hardware_shims.optimizer_shim import (
+            capture_optimizer_param_groups,
+        )
+
+        with capture_optimizer_param_groups(optimizer_step):
+            optimizer_step()
         lr_scheduler_step()
         t3 = time.perf_counter()
         timings["optimizer"] = t3 - t2

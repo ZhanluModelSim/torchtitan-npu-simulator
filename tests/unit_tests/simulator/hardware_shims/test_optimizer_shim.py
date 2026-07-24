@@ -10,7 +10,10 @@ import torch
 import torch.distributed as dist
 
 from torchtitan_npu.simulator.capture.dispatch_capture import OpDispatchCapture
-from torchtitan_npu.simulator.hardware_shims.optimizer_shim import _meta_safe_fused_adamw
+from torchtitan_npu.simulator.hardware_shims.optimizer_shim import (
+    _meta_safe_fused_adamw,
+    capture_optimizer_param_groups,
+)
 
 
 @pytest.fixture(scope="module")
@@ -67,6 +70,47 @@ def test_meta_safe_fused_adamw_does_not_read_values_or_dispatch_updates():
     assert {ref.tensor_id for ref in event.outputs} <= {
         ref.tensor_id for ref in event.inputs
     }
+
+
+def test_optimizer_scope_models_complete_param_group_when_grad_is_missing():
+    used = torch.nn.Parameter(torch.empty(4, device="meta"))
+    missing_grad = torch.nn.Parameter(torch.empty(7, device="meta"))
+    optimizer = torch.optim.AdamW([used, missing_grad], lr=1e-3)
+    grad = torch.empty_like(used)
+    exp_avg = torch.empty_like(used)
+    exp_avg_sq = torch.empty_like(used)
+    state_step = torch.empty((), device="meta")
+    capture = OpDispatchCapture(phase_provider=lambda: "optimizer")
+
+    with capture, capture_optimizer_param_groups(optimizer.step):
+        _meta_safe_fused_adamw(
+            [used],
+            [grad],
+            [exp_avg],
+            [exp_avg_sq],
+            [],
+            [state_step],
+            amsgrad=False,
+            beta1=0.9,
+            beta2=0.999,
+            lr=1e-3,
+            weight_decay=0.01,
+            eps=1e-8,
+            maximize=False,
+        )
+
+    node = next(
+        node
+        for node in capture.build_nodes().values()
+        if node.annotations["raw_op_type"] == "npu.npu_apply_adam_w.default"
+    )
+    event = next(
+        event
+        for event in capture.memory_events()
+        if event.raw_op_type == "npu.npu_apply_adam_w.default"
+    )
+    assert [meta.shape for meta in node.inputs] == [(4,), (7,)]
+    assert [ref.shape for ref in event.inputs] == [(4,), (4,), (4,), (4,), ()]
 
 
 def test_hsdp_optimizer_node_uses_global_shapes_but_memory_uses_local_shapes(

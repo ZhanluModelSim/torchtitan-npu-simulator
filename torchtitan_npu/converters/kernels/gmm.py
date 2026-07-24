@@ -104,7 +104,39 @@ def npu_grouped_experts_forward(
     # and the clamp is skipped in ``_run_experts_grouped_mm``.
     swiglu_limit = getattr(self, "swiglu_limit", None)
 
-    out = _run_experts_grouped_mm(w13, w2, None, x, num_tokens_per_expert, swiglu_limit, routed_scores)
+    # Tensor subclasses (for example MXFP8 training weights) already own their
+    # autograd behavior. Keep those paths untouched without depending on a
+    # converter-specific class name or version.
+    plain_weight_types = (torch.Tensor, nn.Parameter)
+    needs_meta_autograd = (
+        x.device.type == "meta"
+        and type(w2) in plain_weight_types
+        and type(w13) in plain_weight_types
+    )
+    if needs_meta_autograd:
+        from torchtitan_npu.simulator.hardware_shims.grouped_experts_shim import (
+            run_meta_grouped_experts,
+        )
+
+        out = run_meta_grouped_experts(
+            _run_experts_grouped_mm,
+            w13,
+            w2,
+            x,
+            num_tokens_per_expert,
+            swiglu_limit,
+            routed_scores,
+        )
+    else:
+        out = _run_experts_grouped_mm(
+            w13,
+            w2,
+            None,
+            x,
+            num_tokens_per_expert,
+            swiglu_limit,
+            routed_scores,
+        )
 
     if is_tp and tp_group is not None:
         import torch.distributed as dist

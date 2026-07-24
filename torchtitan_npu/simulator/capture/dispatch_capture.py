@@ -13,8 +13,9 @@ from __future__ import annotations
 
 import itertools
 import weakref
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
@@ -191,6 +192,16 @@ class OpDispatchCapture(TorchDispatchMode):
         any chunk) are still recorded, matching the pre-existing behavior."""
         self._capture_l0 = True
         self._chunk_class_key = None
+
+    @contextmanager
+    def suspend_recording(self) -> Iterator[None]:
+        """Temporarily execute dispatches without adding capture events."""
+        previous = self._capture_l0
+        self._capture_l0 = False
+        try:
+            yield
+        finally:
+            self._capture_l0 = previous
 
     @property
     def class_instance_counts(self) -> dict[tuple[int, str], int]:
