@@ -10,7 +10,10 @@ from torchtitan_npu.simulator.ir.op_node import OpNode
 from torchtitan_npu.simulator.ir.schedule_graph import ScheduleGraph
 from torchtitan_npu.simulator.ir.step_graph import StepGraph
 from torchtitan_npu.simulator.ir.workload_graph import DataFlow, IterationSpec, WorkloadGraph
-from torchtitan_npu.simulator.viz.html_export import export_html, normalize_module_path, render_html
+from torchtitan_npu.simulator.viz.html_export import (
+    _normalize_module_path as normalize_module_path,
+)
+from torchtitan_npu.simulator.viz.html_export import export_html, render_html
 
 
 def test_normalize_module_path_strips_numeric_modulelist_indices():
@@ -40,19 +43,19 @@ def _workload_with_repeated_layers(num_layers: int) -> WorkloadGraph:
     )
 
 
-def test_render_html_folds_repeated_layers_into_one_group():
+def test_render_html_groups_repeated_layer_ops():
     workload = _workload_with_repeated_layers(61)
     page = render_html(workload)
     assert "layers.N.attention.wq" in page
-    assert "&times; 61 layers" in page
-    # only the representative layer's op should actually be listed
-    assert page.count("<li><code>op_") == 1
+    assert "×61 ops" in page
+    assert page.count("class='op-type'>matmul") == 61
 
 
-def test_render_html_includes_rank_table_world_size():
+def test_render_html_includes_rank_table_dimensions():
     workload = _workload_with_repeated_layers(2)
     page = render_html(workload)
-    assert "world_size=384" in page
+    assert "RankTable (Communication Domains)" in page
+    assert "<tr><td>ep</td><td>192</td><td>0 groups</td></tr>" in page
 
 
 def test_export_html_writes_a_file():

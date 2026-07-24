@@ -40,7 +40,8 @@ def test_sim_hc_pre_records_real_op_names_in_active_capture():
     raw_names = {n.annotations.get("raw_op_type") for n in nodes.values()}
     assert "npu.npu_rms_norm.default" in raw_names
     assert "aten.matmul.default" in raw_names
-    assert "triton.hc_pre_fwd" in raw_names
+    assert "triton._triton_hc_prepost_fwd_kernel" in raw_names
+    assert "triton._triton_hc_sinkhorn_comb_fwd_kernel" in raw_names
     assert "triton.hc_pre_bmm_forward" in raw_names
 
 
@@ -65,10 +66,14 @@ def test_sim_hc_pre_records_backward_op_names_only_during_backward_phase():
         (y.sum() + h_post.sum() + h_res.sum()).backward()
     nodes = capture.build_nodes()
     bwd_names = {n.annotations["raw_op_type"] for n in nodes.values() if n.annotations["phase"] == "backward"}
-    assert "triton.hc_pre_bwd" in bwd_names
+    assert "triton._triton_hc_prepost_bwd_kernel" in bwd_names
+    assert "triton._triton_hc_prepost_bwd_dst_reduce_kernel" in bwd_names
+    assert "triton._triton_hc_sinkhorn_comb_bwd_kernel" in bwd_names
+    assert "triton._triton_hc_sinkhorn_comb_bwd_dst_reduce_kernel" in bwd_names
     assert "triton.hc_pre_bmm_backward" in bwd_names
     fwd_names = {n.annotations["raw_op_type"] for n in nodes.values() if n.annotations["phase"] == "forward"}
-    assert "triton.hc_pre_fwd" in fwd_names
+    assert "triton._triton_hc_prepost_fwd_kernel" in fwd_names
+    assert "triton._triton_hc_sinkhorn_comb_fwd_kernel" in fwd_names
 
 
 def test_sim_hc_pre_works_on_meta_device():
@@ -100,7 +105,7 @@ def test_sim_hc_head_records_real_op_names():
         shim(t["x"])
     nodes = capture.build_nodes()
     raw_names = {n.annotations.get("raw_op_type") for n in nodes.values()}
-    assert "triton.hc_pre_only_fwd" in raw_names
+    assert "triton._triton_hc_preonly_fwd_kernel" in raw_names
     assert "triton.hc_pre_bmm_forward" in raw_names
 
 
@@ -138,8 +143,8 @@ def test_sim_hc_post_records_real_op_names():
         shim(t["x"], t["residual"], t["post"], t["comb"])
     nodes = capture.build_nodes()
     raw_names = {n.annotations.get("raw_op_type") for n in nodes.values()}
-    assert "triton.hc_post_bmm1_forward" in raw_names
-    assert "triton.hc_post_bmm2_forward" in raw_names
+    assert "triton._triton_hc_post_bmm1_fwd_kernel" in raw_names
+    assert "triton._triton_hc_post_bmm2_fwd_kernel" in raw_names
     assert "triton.add_fwd" in raw_names
 
 

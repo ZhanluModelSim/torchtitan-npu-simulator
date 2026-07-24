@@ -17,18 +17,18 @@ def _node(op_id: str, phase: str) -> OpNode:
     )
 
 
-def test_build_step_graphs_buckets_by_phase():
+def test_build_step_graphs_buckets_by_stage_and_comp_type():
     nodes = {
         "f1": _node("f1", "forward"),
         "b1": _node("b1", "backward"),
         "o1": _node("o1", "optimizer"),
     }
     graphs = build_step_graphs(nodes)
-    assert set(graphs.keys()) == {"forward", "backward", "optimizer"}
-    assert graphs["forward"].step_type == "forward"
-    assert "f1" in graphs["forward"].nodes
-    assert "b1" in graphs["backward"].nodes
-    assert "o1" in graphs["optimizer"].nodes
+    assert set(graphs.keys()) == {"s-1_F", "s-1_B", "s-1_OPTIMIZER"}
+    assert graphs["s-1_F"].step_type == "F"
+    assert "f1" in graphs["s-1_F"].nodes
+    assert "b1" in graphs["s-1_B"].nodes
+    assert "o1" in graphs["s-1_OPTIMIZER"].nodes
 
 
 def test_build_step_graphs_defaults_missing_phase_to_forward():
@@ -36,14 +36,14 @@ def test_build_step_graphs_defaults_missing_phase_to_forward():
         op_id="x", op_type="x", inputs=[], outputs=[], attrs={}, predecessors=[], successors=[], annotations={},
     )
     graphs = build_step_graphs({"x": node_without_phase})
-    assert "x" in graphs["forward"].nodes
+    assert "x" in graphs["s-1_F"].nodes
 
 
 def test_build_step_graphs_skips_empty_phases():
     nodes = {"f1": _node("f1", "forward")}
     graphs = build_step_graphs(nodes)
-    assert "backward" not in graphs
-    assert "optimizer" not in graphs
+    assert "s-1_B" not in graphs
+    assert "s-1_OPTIMIZER" not in graphs
 
 
 def test_step_boundary_tracker_flips_phase_on_backward_call():
@@ -79,7 +79,11 @@ def test_step_boundary_tracker_integrates_with_dispatch_capture():
         y.sum().backward()
     nodes = capture.build_nodes()
     graphs = build_step_graphs(nodes)
-    assert "forward" in graphs
-    assert "backward" in graphs
-    relu_nodes = [n for n in graphs["forward"].nodes.values() if "relu" in n.annotations["raw_op_type"]]
+    assert "s-1_F" in graphs
+    assert "s-1_B" in graphs
+    relu_nodes = [
+        node
+        for node in graphs["s-1_F"].nodes.values()
+        if "relu" in node.annotations["raw_op_type"]
+    ]
     assert relu_nodes, "relu should have been captured during the forward phase"
