@@ -11,6 +11,7 @@ docs/superpowers/specs/2026-07-01-npu-simulator-design.md."""
 from __future__ import annotations
 
 import os
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -22,7 +23,10 @@ from torchtitan_npu.simulator.capture.comm_events import capture_fake_collective
 from torchtitan_npu.simulator.capture.checkpoint_execution import install_checkpoint_execution_tracking
 from torchtitan_npu.simulator.capture.dispatch_capture import OpDispatchCapture
 from torchtitan_npu.simulator.capture.module_path import ModulePathTracker
-from torchtitan_npu.simulator.capture.schedule_builder import build_schedule_graph, build_schedule_plan
+from torchtitan_npu.simulator.capture.schedule_builder import (
+    build_schedule_plan,
+    project_schedule_plan_to_graph,
+)
 from torchtitan_npu.simulator.capture.step_boundary import StepBoundaryTracker, build_step_graphs
 from torchtitan_npu.simulator.capture.workload_builder import build_workload_graph
 from torchtitan_npu.simulator.hardware_shims.mhc_converter import apply_mhc_shims
@@ -38,6 +42,20 @@ from torchtitan_npu.simulator.viz.dot_export import export_dot
 from torchtitan_npu.simulator.viz.html_export import export_html
 from torchtitan_npu.simulator.viz.json_export import export_json
 from torchtitan_npu.simulator.viz.text_summary import write_text_summary
+
+
+def _l0_csv_filename(
+    template_id: str,
+    step_type: str,
+    step_type_counts: Counter[str],
+) -> str:
+    label = step_type
+    if step_type_counts[step_type] > 1:
+        label = "".join(
+            character if character.isalnum() or character in {"-", "_"} else "_"
+            for character in template_id
+        )
+    return f"step_{label}_l0_ops.csv"
 
 
 @dataclass(kw_only=True, slots=True)
@@ -197,7 +215,8 @@ def run_simulation_step(
     timings["setup"] = t1 - t0
 
     with capture_fake_collectives(
-        memory_tracking_enabled=enable_memory_tracking
+        memory_tracking_enabled=enable_memory_tracking,
+        capture_process_rank=rank,
     ) as comm_recorder, boundary, module_path_tracker, capture:
         boundary.mark("forward")
         forward_backward_step(
@@ -234,19 +253,6 @@ def run_simulation_step(
     timings["build_rank_table"] = time.perf_counter() - t6
 
     t7 = time.perf_counter()
-    schedule_graph = build_schedule_graph(
-        step_templates=step_templates,
-        rank_table=rank_table,
-        comm_events=comm_recorder.events,
-        timeline_events=comm_recorder.timeline_events,
-        pipeline_schedule=pipeline_schedule,
-        num_micro_batches=num_micro_batches,
-        gradient_accumulation=gradient_accumulation,
-        rank=rank,
-    )
-    timings["build_schedule_graph"] = time.perf_counter() - t7
-
-    t7b = time.perf_counter()
     schedule_plan = build_schedule_plan(
         step_templates=step_templates,
         rank_table=rank_table,
@@ -258,8 +264,16 @@ def run_simulation_step(
         num_micro_batches=num_micro_batches,
         gradient_accumulation=gradient_accumulation,
         rank=rank,
+        captured_trace_primary=True,
     )
-    timings["build_schedule_plan"] = time.perf_counter() - t7b
+    timings["build_schedule_plan"] = time.perf_counter() - t7
+
+    t7b = time.perf_counter()
+    schedule_graph = project_schedule_plan_to_graph(
+        schedule_plan=schedule_plan,
+        rank_table=rank_table,
+    )
+    timings["build_schedule_graph"] = time.perf_counter() - t7b
 
     t8 = time.perf_counter()
     wg = build_workload_graph(
@@ -369,7 +383,16 @@ class SimulationTrainer(Trainer):
             resolve_simulation_runtime_from_environment,
         )
 
-        resolve_simulation_runtime_from_environment(config)
+        runtime = resolve_simulation_runtime_from_environment(config)
+
+        from torchtitan_npu.simulator.rank_context import (
+            configure_simulation_rank_context,
+        )
+
+        self.rank_context = configure_simulation_rank_context(
+            logical_world_size=runtime.world_size,
+            pp_degree=runtime.pp_degree,
+        )
 
         force_moe_load_balance(config)
         force_deterministic_seed(config)
@@ -405,8 +428,7 @@ class SimulationTrainer(Trainer):
             # Patch init_device_mesh to use fake backend for meshes larger
             # than gloo world_size (e.g. world_mesh of size 64 with 4 gloo procs)
             from torchtitan_npu.simulator.meta_env import _patch_parallel_dims_for_multi_proc
-            import torch.distributed as dist
-            gloo_ws = dist.get_world_size() if dist.is_initialized() else 1
+            gloo_ws = self.rank_context.capture_world_size
             full_ws = int(sim_degrees.get("world_size", gloo_ws)) if sim_degrees else gloo_ws
             _patch_parallel_dims_for_multi_proc(full_ws, gloo_ws)
 
@@ -427,10 +449,9 @@ class SimulationTrainer(Trainer):
 
         t1 = time.perf_counter()
 
-        # Determine rank for this process
         import torch.distributed as dist
         is_multi_proc = self.config.comm.mode == "multi_proc_meta"
-        rank = dist.get_rank() if (is_multi_proc and dist.is_initialized()) else 0
+        rank = self.rank_context.capture_process_rank
         pp_schedule = getattr(self, "pp_schedule", None)
         num_micro_batches = _capture_num_micro_batches(
             pp_enabled=self.parallel_dims.pp_enabled,
@@ -474,136 +495,6 @@ class SimulationTrainer(Trainer):
         print(f"{'export':<30} {t3-t2:>10.2f}")
         print(f"{'TOTAL train()':<30} {t3-t0:>10.2f}")
         print()
-
-    def _export_per_rank(self, rank: int) -> None:
-        """Write this rank's IR to a per-rank JSON file."""
-        assert self.workload_graph is not None
-        out_dir = self.simulation_config.output_dir
-        per_rank_dir = os.path.join(out_dir, "per_rank")
-        os.makedirs(per_rank_dir, exist_ok=True)
-        # Serialize this rank's captured data
-        try:
-            import orjson as _json
-            _dumps = lambda d: _json.dumps(d)
-            _mode = "wb"
-        except ImportError:
-            import json as _json
-            _dumps = lambda d: _json.dumps(d)
-            _mode = "w"
-        schedule = self.workload_graph.iteration.schedule
-        rank_data = {
-            "rank": rank,
-            "pipeline_stage": rank,  # In multi_proc_meta, rank == PP stage
-            "step_templates": {},
-            "execution_timeline": [
-                {
-                    "seq_idx": e.seq_idx,
-                    "op_id": e.op_id,
-                    "rank": rank,
-                    "pipeline_stage": rank,
-                    "micro_batch_idx": e.micro_batch_idx,
-                    "phase": e.phase,
-                    "comp_type": e.comp_type,
-                    "comm_type": e.comm_type,
-                    "comm_peer_rank": e.comm_peer_rank,
-                }
-                for e in schedule.execution_timeline
-            ],
-        }
-        # Serialize step templates (L0 ops)
-        for tid, sg in self.workload_graph.step_templates.items():
-            rank_data["step_templates"][tid] = {
-                "step_type": sg.step_type,
-                "nodes": [
-                    {
-                        "op_id": n.op_id,
-                        "seq_idx": n.seq_idx,
-                        "op_type": n.op_type,
-                        "raw_op_type": n.annotations.get("raw_op_type", ""),
-                        "phase": n.annotations.get("phase", ""),
-                        "execution_kind": n.annotations.get("execution_kind", ""),
-                        "is_recompute": n.annotations.get("is_recompute", False),
-                        "comp_type": n.annotations.get("comp_type", ""),
-                        "fsdp_state": n.annotations.get("fsdp_state", "NA"),
-                        "pp_stage": n.annotations.get("pp_stage", -1),
-                        "inputs_shape": [list(m.shape) for m in n.inputs],
-                        "outputs_shape": [list(m.shape) for m in n.outputs],
-                        "inputs_dtype": [str(m.dtype) for m in n.inputs],
-                        "outputs_dtype": [str(m.dtype) for m in n.outputs],
-                        "flops": n.flops,
-                        "peak_mem": n.peak_mem,
-                        "comm_bytes": n.comm_bytes,
-                        "module_path": n.annotations.get("module_path", ""),
-                        "comm_dim": n.annotations.get("comm_dim", ""),
-                        "comm_ranks": n.annotations.get("comm_ranks", ""),
-                    }
-                    for n in sg.nodes.values()
-                ],
-            }
-        with open(os.path.join(per_rank_dir, f"rank_{rank}.json"), _mode) as f:
-            f.write(_dumps(rank_data))
-
-    def _merge_per_rank_ir(self) -> None:
-        """Merge all per-rank IR files into the final output."""
-        out_dir = self.simulation_config.output_dir
-        per_rank_dir = os.path.join(out_dir, "per_rank")
-        import glob
-
-        try:
-            import orjson as _json
-            _loads = _json.loads
-            _read_mode = "rb"
-        except ImportError:
-            import json as _json
-            _loads = _json.load
-            _read_mode = "r"
-
-        rank_files = sorted(glob.glob(os.path.join(per_rank_dir, "rank_*.json")),
-                            key=lambda p: int(p.split("rank_")[-1].split(".")[0]))
-        all_ranks = []
-        for f in rank_files:
-            with open(f, _read_mode) as fh:
-                if _read_mode == "rb":
-                    all_ranks.append(_loads(fh.read()))
-                else:
-                    all_ranks.append(_loads(fh))
-
-        # Write merged summary
-        with open(os.path.join(out_dir, "merged_summary.txt"), "w") as f:
-            f.write(f"Merged IR from {len(all_ranks)} PP stages\n\n")
-            for r in all_ranks:
-                stage = r["pipeline_stage"]
-                templates = r["step_templates"]
-                timeline = r["execution_timeline"]
-                from collections import Counter
-                phases = Counter(e["phase"] for e in timeline)
-                f.write(f"[Stage {stage}] rank={r['rank']} phases={dict(phases)}\n")
-                for tid, sg in templates.items():
-                    f.write(f"  {tid}: {sg['step_type']}, {len(sg['nodes'])} nodes\n")
-                p2p = [e for e in timeline if e["comm_type"] and ("send" in e["comm_type"] or "recv" in e["comm_type"])]
-                f.write(f"  P2P events: {len(p2p)}\n")
-                for e in p2p[:5]:
-                    f.write(f"    seq={e['seq_idx']} mb={e['micro_batch_idx']} comm={e['comm_type']} peer={e['comm_peer_rank']}\n")
-                if len(p2p) > 5:
-                    f.write(f"    ... and {len(p2p)-5} more\n")
-                f.write("\n")
-
-        # Also export the rank 0's workload graph as the base, plus
-        # per-stage L0 CSVs
-        formats = self.simulation_config.output_formats
-        if "csv" in formats:
-            ir_dir = os.path.join(out_dir, "ir_export")
-            os.makedirs(ir_dir, exist_ok=True)
-            for r in all_ranks:
-                stage = r["pipeline_stage"]
-                for tid, sg in r["step_templates"].items():
-                    fname = os.path.join(ir_dir, f"stage_{stage}_{sg['step_type']}_l0_ops.csv")
-                    with open(fname, "w", encoding="utf-8") as f:
-                        f.write("topo_order,op_id,seq_idx,op_type,raw_op_type,phase,execution_kind,is_recompute,comp_type,fsdp_state,pp_stage,inputs_shape,outputs_shape,flops,peak_mem,comm_bytes,module_path,comm_dim,comm_ranks\n")
-                        for i, n in enumerate(sg["nodes"]):
-                            f.write(f"{i},{n['op_id']},{n['seq_idx']},{n['op_type']},{n['raw_op_type']},{n['phase']},{n.get('execution_kind','')},{n.get('is_recompute',False)},{n.get('comp_type','')},{n.get('fsdp_state','NA')},{n.get('pp_stage',-1)},{';'.join(str(s) for s in n['inputs_shape'])},{';'.join(str(s) for s in n['outputs_shape'])},{n['flops']},{n['peak_mem']},{n['comm_bytes']},{n['module_path']},{n['comm_dim']},{n['comm_ranks']}\n")
-
-        print(f"Merged {len(all_ranks)} PP stages' IR to {out_dir}")
 
     def _export(self, rank: int = 0) -> None:
         import time
@@ -666,8 +557,17 @@ class SimulationTrainer(Trainer):
                 max_ranks=self.simulation_config.csv_max_ranks,
             )
             # L1: per-step L0 ops
+            step_type_counts = Counter(
+                template.step_type
+                for template in self.workload_graph.step_templates.values()
+            )
             for tid, sg in self.workload_graph.step_templates.items():
-                sg.export_l0_csv(os.path.join(ir_dir, f"step_{sg.step_type}_l0_ops.csv"))
+                sg.export_l0_csv(
+                    os.path.join(
+                        ir_dir,
+                        _l0_csv_filename(tid, sg.step_type, step_type_counts),
+                    )
+                )
             export_timings["csv_ir_export"] = time.perf_counter() - t
 
         total_export = time.perf_counter() - t0

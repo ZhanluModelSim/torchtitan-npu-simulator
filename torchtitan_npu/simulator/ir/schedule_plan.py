@@ -18,11 +18,10 @@ by action A and consumed by action B is a data dependency A→B.
 This replaces the old flat ``ScheduleGraph.execution_timeline`` trace as
 the primary L2 object: the trace only recorded *what ran* (captured seq
 events), not the *plan structure* (which (stage, comp_type, microbatch)
-runs when, and what data crosses stage boundaries).  ``pipeline_order_with_comms``
-(the runtime schedule's lowered plan, containing F/B/I/W + UNSHARD/RESHARD/
-SEND_F/RECV_F/SEND_B/RECV_B/REDUCE_GRAD + OVERLAP_F_B) is the structural
-source; capture enriches each action with seq_idx / template_ref / DataSlot
-shapes / L0 op-level src_exit_op↔dst_entry_op linkage.
+runs when, and what data crosses stage boundaries). The captured semantic
+action stream is the structural source. Runtime schedule metadata such as
+``pipeline_order_with_comms`` is an optional compatibility fallback when a
+caller has no semantic capture.
 """
 
 from __future__ import annotations
@@ -31,6 +30,9 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from torchtitan_npu.simulator.ir.step_graph import StepGraph
+
+
+SCHEDULE_PLAN_SCHEMA_VERSION = 2
 
 
 @dataclass
@@ -118,7 +120,7 @@ class ScheduleAction:
     comp_type: str = ""                     # COMPUTE: F / B / I / W / F_RECOMPUTE / OPTIMIZER
     template_ref: str = ""                  # COMPUTE: L1 step_template id (s{stage}_{comp_type})
     seq_idx: int = 0                        # captured source position (plan-index fallback)
-    schedule_order: int = -1                # logical order in the lowered pipeline plan
+    schedule_order: int = -1                # rank-local semantic execution order
     consumes: list[str] = field(default_factory=list)   # DataSlot ids
     produces: list[str] = field(default_factory=list)   # DataSlot ids
     duration_est: float = 0.0
@@ -146,9 +148,9 @@ class ScheduleAction:
 @dataclass
 class SchedulePlan:
     """The L2 scheduling view: ordered actions + the DataSlots flowing
-    between them.  Built by ``build_schedule_plan`` from
-    ``pipeline_order_with_comms`` (runtime schedules) or the captured
-    timeline (single-stage schedules), enriched with capture data."""
+    between them. Built by ``build_schedule_plan`` from the captured semantic
+    timeline for every schedule family. A lowered runtime plan is only a
+    fallback for legacy callers that do not provide capture records."""
 
     plan_id: str
     workload_type: str                      # train | inference | eval

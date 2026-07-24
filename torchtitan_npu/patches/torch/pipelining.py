@@ -94,6 +94,31 @@ def backward_maybe_with_nosync(
     This helper should adapt any pipeline parallel schedule to work with common/supported data parallel libraries.
     """
 
+    def stage_backward_input_compatible_with_meta():
+        stage_outputs = bwd_kwargs["stage_output"]
+        try:
+            from torchtitan_npu.simulator.meta_env import _is_meta_simulation
+        except ImportError:
+            _is_meta_simulation = False
+        if _is_meta_simulation:
+            # PyTorch ends stage_backward_input with t.detach_(). A pipeline
+            # stage is allowed to return a view, but views reject in-place
+            # detach. A meta clone preserves the autograd edge and shape
+            # semantics without allocating storage.
+            stage_outputs = [
+                output.clone()
+                if isinstance(output, torch.Tensor)
+                and getattr(output, "_base", None) is not None
+                else output
+                for output in stage_outputs
+            ]
+        return stage_backward_input(
+            stage_outputs,
+            bwd_kwargs["output_grads"],
+            bwd_kwargs["input_values"],
+            self.submod.parameters(),
+        )
+
     def perform_backward(
         backward_type,
     ) -> Callable[
@@ -110,12 +135,7 @@ def backward_maybe_with_nosync(
                 None,
             )
         elif backward_type == "input":
-            return lambda: stage_backward_input(
-                bwd_kwargs["stage_output"],
-                bwd_kwargs["output_grads"],
-                bwd_kwargs["input_values"],
-                self.submod.parameters(),
-            )
+            return stage_backward_input_compatible_with_meta
         elif backward_type == "weight":
             return lambda: (
                 stage_backward_weight(self.submod.parameters(), bwd_kwargs["param_groups"]),

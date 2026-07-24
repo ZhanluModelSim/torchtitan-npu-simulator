@@ -8,7 +8,10 @@ from types import SimpleNamespace
 import pytest
 
 from torchtitan_npu.simulator.capture.comm_events import CommEvent
-from torchtitan_npu.simulator.capture.schedule_builder import build_schedule_plan
+from torchtitan_npu.simulator.capture.schedule_builder import (
+    build_schedule_plan,
+    project_schedule_plan_to_graph,
+)
 from torchtitan_npu.simulator.ir.op_node import OpNode
 from torchtitan_npu.simulator.ir.step_graph import StepGraph
 
@@ -96,6 +99,54 @@ def test_runtime_plan_order_is_independent_from_captured_l0_seq_idx() -> None:
     ]
     assert [action.schedule_order for action in plan.actions] == [0, 1, 2]
     assert [action.seq_idx for action in plan.actions] == [100, 1, 200]
+
+    graph = project_schedule_plan_to_graph(
+        schedule_plan=plan,
+        rank_table=_RankTable(),
+    )
+    assert graph.annotations["projection_source"] == "schedule_plan"
+    assert [entry.schedule_order for entry in graph.execution_timeline] == [
+        0,
+        1,
+        2,
+    ]
+
+
+def test_non_pp_schedule_order_is_independent_from_l0_seq_idx() -> None:
+    templates = {
+        step_type: StepGraph(
+            f"s0_{step_type}",
+            step_type,
+            {
+                seq_idx: OpNode(
+                    op_id=seq_idx,
+                    op_type=step_type.lower(),
+                    inputs=[],
+                    outputs=[],
+                    attrs={},
+                    predecessors=[],
+                    successors=[],
+                    seq_idx=seq_idx,
+                )
+            },
+        )
+        for step_type, seq_idx in (("F", 0), ("B", 1990), ("OPTIMIZER", 3982))
+    }
+
+    plan = build_schedule_plan(
+        step_templates=templates,
+        rank_table=_RankTable(),
+        comm_events=[],
+        rank=0,
+    )
+
+    assert [action.comp_type for action in plan.actions] == [
+        "F",
+        "B",
+        "OPTIMIZER",
+    ]
+    assert [action.schedule_order for action in plan.actions] == [0, 1, 2]
+    assert [action.seq_idx for action in plan.actions] == [0, 1990, 3982]
 
 
 def test_noop_fsdp_actions_do_not_create_blocking_slots() -> None:

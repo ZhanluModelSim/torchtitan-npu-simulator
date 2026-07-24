@@ -194,6 +194,7 @@ _original_fused_adamw: Any = _MISSING
 _original_llama4_fsdp_mesh_info: Any = _MISSING
 _original_bwd_weight_one_chunk: Any = _MISSING
 _original_get_stage_indices: Any = _MISSING
+_original_parameter_new: Any = _MISSING
 _patched = False
 
 # Pipeline parallel execution context, updated by patched
@@ -232,6 +233,7 @@ class _P2POpContext:
     mb_idx: int
     phase: str
     direction: str
+    tensor_ordinal: int
 
 
 _p2p_op_contexts: contextvars.ContextVar[dict[tuple[int, str], list[_P2POpContext]] | None] = (
@@ -243,8 +245,14 @@ def _mark_p2p_ops(
     ops: list[object], *, stage: int, mb_idx: int, phase: str, direction: str
 ) -> list[object]:
     """Attach PP coordinates while a PipelineStage creates deferred P2POps."""
-    context = _P2POpContext(stage=stage, mb_idx=mb_idx, phase=phase, direction=direction)
-    for op in ops:
+    for tensor_ordinal, op in enumerate(ops):
+        context = _P2POpContext(
+            stage=stage,
+            mb_idx=mb_idx,
+            phase=phase,
+            direction=direction,
+            tensor_ordinal=tensor_ordinal,
+        )
         setattr(op, "_simulator_pp_context", context)
     return ops
 
@@ -614,6 +622,41 @@ def _patch_moe_dispatch_to_avoid_meta_tensor_value_reads() -> None:
         return routed_output
 
     expert_parallel_cls._token_combine = _meta_safe_token_combine
+
+
+def _patch_parameter_dtensor_for_meta() -> None:
+    """Preserve a meta DTensor when it is promoted to ``nn.Parameter``.
+
+    Upstream parallel styles commonly call ``nn.Parameter(distribute_tensor())``.
+    PyTorch's parameter constructor recreates that DTensor's local shard on CPU
+    when its DeviceMesh uses the meta device type. The distributed tensor is
+    already a leaf with the correct spec, so marking it as a parameter is both
+    sufficient and avoids coupling the simulator to any particular parallel
+    style implementation.
+    """
+    global _original_parameter_new
+    if _original_parameter_new is not _MISSING:
+        return
+
+    try:
+        from torch.distributed.tensor import DTensor
+    except ImportError:
+        return
+
+    _original_parameter_new = torch.nn.Parameter.__new__
+
+    def _meta_safe_parameter_new(cls, data=None, requires_grad=True):  # noqa: ANN001
+        if (
+            _is_meta_simulation
+            and isinstance(data, DTensor)
+            and data.device.type == "meta"
+        ):
+            data.requires_grad_(requires_grad)
+            data._is_param = True
+            return data
+        return _original_parameter_new(cls, data, requires_grad)
+
+    torch.nn.Parameter.__new__ = staticmethod(_meta_safe_parameter_new)
 
 
 def _patch_li_loss_to_skip_buggy_einsum() -> None:
@@ -1403,18 +1446,19 @@ def _patch_pipeline_stage_for_pp_context() -> None:
         _pp_context["comp_type"] = comp_type
         _pp_context["fsdp_state"] = _fsdp_state.get(self.stage_index, "NA")
 
-    def _timeline_start_seq() -> int | None:
+    def _timeline_start() -> tuple[int | None, int | None]:
         from torchtitan_npu.simulator.capture.comm_events import get_active_recorder
 
-        if get_active_recorder() is None:
-            return None
+        recorder = get_active_recorder()
+        if recorder is None:
+            return None, None
         from torchtitan_npu.simulator.capture.dispatch_capture import _seq_counter
 
-        return next(_seq_counter)
+        return next(_seq_counter), recorder.next_action_order()
 
     def _patched_fwd_one_chunk(self, mb_idx, *args, **kwargs):  # noqa: ANN001
         _stamp_chunk_context(self, mb_idx, "F", "forward")
-        start_seq_idx = _timeline_start_seq()
+        start_seq_idx, start_action_order = _timeline_start()
         from torchtitan_npu.simulator.capture.dispatch_capture import get_active_capture
         cap = get_active_capture()
         if cap is not None:
@@ -1435,6 +1479,7 @@ def _patch_pipeline_stage_for_pp_context() -> None:
                 phase="forward",
                 comp_type="F",
                 start_seq_idx=start_seq_idx,
+                start_action_order=start_action_order,
             )
         return result
 
@@ -1447,7 +1492,7 @@ def _patch_pipeline_stage_for_pp_context() -> None:
             full_backward = args[-1]
         comp_type = "B" if full_backward else "I"
         _stamp_chunk_context(self, mb_idx, comp_type, "backward")
-        start_seq_idx = _timeline_start_seq()
+        start_seq_idx, start_action_order = _timeline_start()
         from torchtitan_npu.simulator.capture.dispatch_capture import get_active_capture
         cap = get_active_capture()
         if cap is not None:
@@ -1467,6 +1512,7 @@ def _patch_pipeline_stage_for_pp_context() -> None:
                 phase="backward",
                 comp_type=comp_type,
                 start_seq_idx=start_seq_idx,
+                start_action_order=start_action_order,
             )
         return result
 
@@ -1476,7 +1522,7 @@ def _patch_pipeline_stage_for_pp_context() -> None:
         # Use the chunk_id as the microbatch index for context attribution.
         mb_idx = bwd_chunk_id if isinstance(bwd_chunk_id, int) else _pp_context.get("mb_idx", 0)
         _stamp_chunk_context(self, mb_idx, "W", "backward")
-        start_seq_idx = _timeline_start_seq()
+        start_seq_idx, start_action_order = _timeline_start()
         from torchtitan_npu.simulator.capture.dispatch_capture import get_active_capture
         cap = get_active_capture()
         if cap is not None:
@@ -1496,6 +1542,7 @@ def _patch_pipeline_stage_for_pp_context() -> None:
                 phase="backward",
                 comp_type="W",
                 start_seq_idx=start_seq_idx,
+                start_action_order=start_action_order,
             )
         return result
 
@@ -1570,26 +1617,54 @@ def _patch_pipeline_action_context() -> None:
         return
     if hasattr(sch, "_sim_orig_profiler_name"):
         return
-    sch._sim_orig_profiler_name = sch._get_profiler_function_name
+    profiler_name = getattr(sch, "_get_profiler_function_name", None)
+    if profiler_name is None:
+        raise RuntimeError(
+            "the installed torch pipeline runtime does not expose "
+            "_get_profiler_function_name; semantic schedule capture cannot "
+            "bind actions to PP stages"
+        )
+    sch._sim_orig_profiler_name = profiler_name
 
     def _patched_profiler_name(action):  # noqa: ANN001
-        try:
-            _pp_context["stage"] = int(getattr(action, "stage_index", -1))
-            ct = getattr(getattr(action, "computation_type", None), "value", "")
-            # Comm actions get a dedicated comp_type so their L0 ops bucket
-            # into s{stage}_{UNSHARD|RESHARD|REDUCE_GRAD}; SEND/RECV inherit
-            # the forward/backward comp_type of the phase they belong to.
-            if ct in ("UNSHARD", "RESHARD", "REDUCE_GRAD"):
-                _pp_context["comp_type"] = ct
-            elif ct in ("SEND_F", "RECV_F"):
-                _pp_context["comp_type"] = "F"
-            elif ct in ("SEND_B", "RECV_B"):
-                _pp_context["comp_type"] = "B"
-            # compute actions (F/B/I/W/OVERLAP_F_B): leave comp_type to the
-            # chunk patch which runs inside the action body (it sets the
-            # correct F/B/I/W and the same stage).
-        except Exception:
-            pass
+        stage_index = getattr(action, "stage_index", None)
+        computation_type = getattr(action, "computation_type", None)
+        ct = getattr(computation_type, "value", "")
+        if stage_index is None or not ct:
+            raise RuntimeError(
+                "torch pipeline action is missing stage_index or "
+                f"computation_type: {action!r}"
+            )
+
+        _pp_context["stage"] = int(stage_index)
+        microbatch_index = getattr(action, "microbatch_index", None)
+        _pp_context["mb_idx"] = (
+            int(microbatch_index)
+            if microbatch_index is not None
+            else -1
+        )
+        # Comm actions get a dedicated comp_type so their L0 ops bucket into
+        # s{stage}_{UNSHARD|RESHARD|REDUCE_GRAD}. SEND/RECV inherit the phase
+        # of the tensor transfer. Compute chunks stamp their own exact F/B/I/W
+        # context inside PipelineStage.
+        if ct in ("UNSHARD", "RESHARD", "REDUCE_GRAD"):
+            _pp_context["comp_type"] = ct
+        elif ct in ("SEND_F", "RECV_F"):
+            _pp_context["comp_type"] = "F"
+        elif ct in ("SEND_B", "RECV_B"):
+            _pp_context["comp_type"] = "B"
+
+        from torchtitan_npu.simulator.capture.comm_events import (
+            get_active_recorder,
+        )
+
+        recorder = get_active_recorder()
+        if recorder is not None:
+            recorder.record_pipeline_action(
+                action_type=ct,
+                stage=_pp_context["stage"],
+                mb_idx=_pp_context["mb_idx"],
+            )
         return sch._sim_orig_profiler_name(action)
 
     sch._get_profiler_function_name = _patched_profiler_name
@@ -1828,10 +1903,9 @@ def _patch_device_mesh_world_size_check() -> None:
         if not default_initialized:
             init_process_group()
 
-        # Skip the mesh > world_size check when device_type is "fake"
-        # (the mesh was created with fake backend to simulate a larger
-        # world than the actual gloo world_size)
-        if self._device_type == "fake":
+        # The mesh keeps the meta device type for DTensor/FSDP consistency,
+        # while all oversized logical dimensions use fake process groups.
+        if _is_meta_simulation:
             # DeviceMesh ignores this method's return value. Creating a raw
             # FakeProcessGroup here therefore produced an orphan group that
             # was never registered with c10d. The dimension process groups
@@ -1865,11 +1939,117 @@ def _patch_parallel_dims_for_multi_proc(full_ws: int, gloo_ws: int) -> None:
     2. Patches init_device_mesh to accept mesh > gloo_ws by using
        fake backend for dimensions that exceed gloo_ws
     """
+    from torchtitan_npu.simulator.rank_context import (
+        configure_simulation_rank_context,
+        get_simulation_rank_context,
+    )
+
+    configure_simulation_rank_context(
+        logical_world_size=full_ws,
+        pp_degree=gloo_ws,
+    )
+
     try:
         from torch.distributed.device_mesh import init_device_mesh as orig_init_mesh
         import torch.distributed.device_mesh as dm_mod
     except Exception:
         return
+
+    DeviceMesh = dm_mod.DeviceMesh
+
+    if not hasattr(DeviceMesh, "_sim_orig_get_mesh_tensor_from_full_mesh"):
+        DeviceMesh._sim_orig_get_mesh_tensor_from_full_mesh = (
+            DeviceMesh._get_mesh_tensor_from_full_mesh
+        )
+
+        def _sim_get_mesh_tensor_from_full_mesh(
+            full_mesh, current_rank=None  # noqa: ANN001
+        ):
+            if _is_meta_simulation and current_rank is None:
+                current_rank = (
+                    get_simulation_rank_context().logical_global_rank
+                )
+            return DeviceMesh._sim_orig_get_mesh_tensor_from_full_mesh(
+                full_mesh, current_rank
+            )
+
+        DeviceMesh._get_mesh_tensor_from_full_mesh = staticmethod(
+            _sim_get_mesh_tensor_from_full_mesh
+        )
+
+    if not hasattr(dm_mod, "_sim_orig_group_aware_get_rank"):
+        dm_mod._sim_orig_group_aware_get_rank = dm_mod.get_rank
+
+        def _sim_group_aware_get_rank(group=None):  # noqa: ANN001
+            if group is not None:
+                try:
+                    import torch.distributed as dist
+
+                    if str(dist.get_backend(group)).lower() == "fake":
+                        return int(group.rank())
+                except (AttributeError, RuntimeError, ValueError):
+                    pass
+            return dm_mod._sim_orig_group_aware_get_rank(group)
+
+        dm_mod.get_rank = _sim_group_aware_get_rank
+
+    # A DeviceMesh object represents the full logical world, so its coordinate
+    # must use the representative logical rank. Process-group construction is
+    # different: the real PP dimension must still select groups by physical
+    # Gloo rank, while fake dimensions select by logical rank.
+    if not hasattr(DeviceMesh, "_sim_orig_rank_aware_init"):
+        DeviceMesh._sim_orig_rank_aware_init = DeviceMesh.__init__
+
+        def _sim_rank_aware_device_mesh_init(self, *args, **kwargs):  # noqa: ANN001
+            device_type_arg = (
+                kwargs.get("device_type")
+                if "device_type" in kwargs
+                else (args[0] if args else None)
+            )
+            if (
+                _is_meta_simulation
+                and device_type_arg in {"fake", "meta"}
+                and kwargs.get("_rank") is None
+            ):
+                kwargs["_rank"] = get_simulation_rank_context().logical_global_rank
+            return DeviceMesh._sim_orig_rank_aware_init(self, *args, **kwargs)
+
+        DeviceMesh.__init__ = _sim_rank_aware_device_mesh_init
+
+    if not hasattr(DeviceMesh, "_sim_orig_rank_aware_init_one_process_group"):
+        DeviceMesh._sim_orig_rank_aware_init_one_process_group = (
+            DeviceMesh._init_one_process_group
+        )
+
+        def _sim_rank_aware_init_one_process_group(
+            sub_layout, rank_map, dim_name, backend_override  # noqa: ANN001
+        ):
+            backend, _options = backend_override
+            if not (_is_meta_simulation and backend == "fake"):
+                result = DeviceMesh._sim_orig_rank_aware_init_one_process_group(
+                    sub_layout, rank_map, dim_name, backend_override
+                )
+                return result
+
+            original_get_rank = dm_mod.get_rank
+
+            def _logical_rank(group=None):  # noqa: ANN001
+                if group is None:
+                    return get_simulation_rank_context().logical_global_rank
+                return original_get_rank(group)
+
+            dm_mod.get_rank = _logical_rank
+            try:
+                result = DeviceMesh._sim_orig_rank_aware_init_one_process_group(
+                    sub_layout, rank_map, dim_name, backend_override
+                )
+                return result
+            finally:
+                dm_mod.get_rank = original_get_rank
+
+        DeviceMesh._init_one_process_group = staticmethod(
+            _sim_rank_aware_init_one_process_group
+        )
 
     if hasattr(dm_mod, "_sim_orig_init_device_mesh"):
         return
@@ -1895,7 +2075,7 @@ def _patch_parallel_dims_for_multi_proc(full_ws: int, gloo_ws: int) -> None:
             dim_key = mesh_dim_names[index] if mesh_dim_names else index
             backend_override[dim_key] = "fake"
         return orig_init_mesh(
-            "fake",
+            device_type,
             mesh_shape,
             mesh_dim_names=mesh_dim_names,
             backend_override=backend_override,
@@ -1915,7 +2095,6 @@ def _patch_parallel_dims_for_multi_proc(full_ws: int, gloo_ws: int) -> None:
     # reuses the default group for *any* dimension whose degree happens to
     # equal gloo world_size (for example CP=4 when PP=4). Force every logical
     # dimension except PP onto the fake backend, regardless of its degree.
-    DeviceMesh = dm_mod.DeviceMesh
     if not hasattr(DeviceMesh, "_sim_orig_unflatten"):
         DeviceMesh._sim_orig_unflatten = DeviceMesh._unflatten
 
@@ -2016,7 +2195,11 @@ def _patch_new_group_for_fake_backend() -> None:
                         )
                     if any(rank < 0 for rank in ranks):
                         raise ValueError(f"ranks must be non-negative, got {ranks}")
-                global_rank = dc.get_rank()
+                from torchtitan_npu.simulator.rank_context import (
+                    get_simulation_rank_context,
+                )
+
+                global_rank = get_simulation_rank_context().logical_global_rank
                 group_rank = ranks.index(global_rank) if ranks and global_rank in ranks else -1
 
                 if group_rank == -1:
@@ -2041,7 +2224,18 @@ def _patch_new_group_for_fake_backend() -> None:
                 pg, _ = _new_process_group_helper(
                     group_size=group_ws,
                     group_rank=group_rank if group_rank >= 0 else 0,
-                    global_ranks_in_group=ranks or [],
+                    # c10d's helper rejects a subgroup when the *physical*
+                    # default-group rank is absent. For a logical fake group,
+                    # substitute that physical rank only for construction;
+                    # the public logical rank map is restored below.
+                    global_ranks_in_group=(
+                        [
+                            dc.get_rank() if index == group_rank else rank
+                            for index, rank in enumerate(ranks or [])
+                        ]
+                        if group_rank >= 0
+                        else (ranks or [])
+                    ),
                     backend=Backend.FAKE,
                     store=default_store,
                     group_name=group_name,
@@ -2494,6 +2688,7 @@ def patch_device_type_to_meta() -> None:
     _patch_torch_full_npu_device_literal()
     _patch_grouped_mm_offsets_dtype()
     _patch_moe_dispatch_to_avoid_meta_tensor_value_reads()
+    _patch_parameter_dtensor_for_meta()
     _patch_li_loss_to_skip_buggy_einsum()
     _neutralize_fsdp_meta_param_validation()
     _patch_pipeline_schedule_warmup_for_meta()
@@ -2531,7 +2726,7 @@ def unpatch_device_type_to_meta() -> None:
     global _original_redistribute_local_tensor, _original_recv_object_list, _original_send_object_list
     global _original_torch_equal
     global _original_fused_adamw
-    global _original_llama4_fsdp_mesh_info
+    global _original_llama4_fsdp_mesh_info, _original_parameter_new
     for (module_path, attr_name), original in _original_values.items():
         module = importlib.import_module(module_path)
         if original is _MISSING:
@@ -2625,6 +2820,10 @@ def unpatch_device_type_to_meta() -> None:
 
         llama4_parallelize.FSDPMeshInfo = _original_llama4_fsdp_mesh_info
         _original_llama4_fsdp_mesh_info = _MISSING
+
+    if _original_parameter_new is not _MISSING:
+        torch.nn.Parameter.__new__ = _original_parameter_new
+        _original_parameter_new = _MISSING
 
     _is_meta_simulation = False
     _patched = False

@@ -7,8 +7,9 @@
 > DualPipe、V schedule、I/W split、跨迭代流水或复杂 overlap。
 
 如果下层已经生成 `SchedulePlan`，上层不需要理解本文的捕获和组装过程。请直接阅读
-[`schedule-plan-des-consumer-guide.md`](./schedule-plan-des-consumer-guide.md)，按现有 action、slot、
-communication descriptor 重建 DES。
+[`schedule-plan-dependency-reconstruction-contract.md`](./schedule-plan-dependency-reconstruction-contract.md)，
+按现有 action、slot 和 communication descriptor 重建依赖。DES 状态机和内存消费的扩展说明见
+[`schedule-plan-des-consumer-guide.md`](./schedule-plan-des-consumer-guide.md)。
 
 开始实现前先阅读：
 

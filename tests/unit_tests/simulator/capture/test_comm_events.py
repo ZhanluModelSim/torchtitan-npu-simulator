@@ -187,3 +187,34 @@ def test_mixed_p2p_batch_uses_each_op_pp_context():
         _pp_context.clear()
         _pp_context.update(previous_context)
         unpatch_device_type_to_meta()
+
+
+def test_multiple_p2p_tensors_get_distinct_transfer_ids():
+    previous_context = dict(_pp_context)
+    patch_device_type_to_meta()
+    tensors = [torch.empty(4, device="meta"), torch.empty(8, device="meta")]
+    try:
+        _pp_context.update(stage=0, mb_idx=3, phase="forward", comp_type="F")
+        with capture_fake_collectives() as recorder:
+            ops = [
+                dist.P2POp(dist.isend, tensor, 1, dist.group.WORLD)
+                for tensor in tensors
+            ]
+            _mark_p2p_ops(
+                ops,
+                stage=0,
+                mb_idx=3,
+                phase="forward",
+                direction="send",
+            )
+            schedules._batch_p2p(ops, desc="two_forward_tensors")
+
+        assert [event.transfer_id for event in recorder.events] == [
+            "pp:forward:s0->s1:mb3:t0",
+            "pp:forward:s0->s1:mb3:t1",
+        ]
+        assert [event.action_order for event in recorder.events] == [0, 1]
+    finally:
+        _pp_context.clear()
+        _pp_context.update(previous_context)
+        unpatch_device_type_to_meta()

@@ -52,6 +52,9 @@ class FSDPResidencyEvent:
     comp_type: str = ""
     parent_compute_instance_id: str = ""
     shard_world_size: int = -1
+    action_order: int = -1
+    transition_id: str = ""
+    schedule_source: str = "state"
 
 
 @dataclass(slots=True)

@@ -14,6 +14,7 @@ import torch.nn as nn
 from torchtitan_npu.simulator.trainer import (
     SimulationTrainer,
     _capture_num_micro_batches,
+    _l0_csv_filename,
     _strip_hardware_dependent_model_converters,
     run_simulation_step,
 )
@@ -207,6 +208,16 @@ def test_memory_export_requires_explicit_mem_format(tmp_path, monkeypatch, outpu
     SimulationTrainer._export(trainer)
 
     assert exported == ([memory_plan] if expect_memory_export else [])
+
+
+def test_l0_csv_filename_preserves_virtual_stage_templates():
+    from collections import Counter
+
+    counts = Counter({"F": 2, "B": 1})
+
+    assert _l0_csv_filename("s0_F", "F", counts) == "step_s0_F_l0_ops.csv"
+    assert _l0_csv_filename("s3_F", "F", counts) == "step_s3_F_l0_ops.csv"
+    assert _l0_csv_filename("s0_B", "B", counts) == "step_B_l0_ops.csv"
 
 
 def test_simulation_trainer_config_build_dispatches_to_simulation_trainer():

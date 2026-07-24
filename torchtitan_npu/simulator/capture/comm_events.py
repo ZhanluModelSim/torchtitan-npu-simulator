@@ -71,6 +71,11 @@ class CommEvent:
     # FSDP sharding state active when this comm op ran.
     fsdp_state: str = "NA"
     transfer_id: str = ""       # stable cross-rank PP rendezvous key
+    capture_process_rank: int = -1
+    tensor_ordinal: int = 0
+    action_order: int = -1
+    fsdp_transition_id: str = ""
+    fsdp_group_id: str = ""
 
 
 class _NoOpWork:
@@ -86,12 +91,42 @@ class _NoOpWork:
 
 
 class CommEventRecorder:
-    def __init__(self, *, memory_tracking_enabled: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        memory_tracking_enabled: bool = True,
+        capture_process_rank: int = 0,
+    ) -> None:
         self.memory_tracking_enabled = memory_tracking_enabled
+        self.capture_process_rank = capture_process_rank
         self.events: list[CommEvent] = []
         self.timeline_events: list[dict] = []  # L2 scheduling events (MB 1+ pass-through)
         self.fsdp_residency_events: list[FSDPResidencyEvent] = []
         self.fsdp_schedule_events: list[FSDPResidencyEvent] = []
+        self._action_counter = itertools.count()
+
+    def next_action_order(self) -> int:
+        return next(self._action_counter)
+
+    def record_pipeline_action(
+        self,
+        *,
+        action_type: str,
+        stage: int,
+        mb_idx: int = -1,
+    ) -> None:
+        from torchtitan_npu.simulator.capture.dispatch_capture import _seq_counter
+
+        self.timeline_events.append(
+            {
+                "event_kind": "schedule_action",
+                "action_type": action_type,
+                "pp_stage": stage,
+                "pp_mb_idx": mb_idx,
+                "seq_idx": next(_seq_counter),
+                "action_order": self.next_action_order(),
+            }
+        )
 
     def record(
         self,
@@ -116,6 +151,8 @@ class CommEventRecorder:
             volume_bytes=tensor_volume_bytes(tuple(tensor.shape), dtype_str),
             comm_dim=comm_dim,
             comm_ranks=comm_ranks or [],
+            capture_process_rank=self.capture_process_rank,
+            action_order=self.next_action_order(),
         )
         self.events.append(event)
         return event
@@ -129,6 +166,7 @@ class CommEventRecorder:
         phase: str,
         comp_type: str = "",
         start_seq_idx: int | None = None,
+        start_action_order: int | None = None,
     ) -> None:
         """Record an L2 scheduling-level timeline event (e.g. forward_one_chunk,
         backward_one_chunk, backward_weight_one_chunk).  Used for every
@@ -138,11 +176,18 @@ class CommEventRecorder:
         microbatch. ``comp_type`` carries the F/B/I/W class."""
         from torchtitan_npu.simulator.capture.dispatch_capture import _seq_counter
         end_seq_idx = next(_seq_counter)
+        end_action_order = self.next_action_order()
         instance_id = f"s{pp_stage}_{comp_type or phase}_mb{pp_mb_idx}"
         self.timeline_events.append({
             "seq_idx": end_seq_idx,
             "start_seq_idx": end_seq_idx if start_seq_idx is None else start_seq_idx,
             "end_seq_idx": end_seq_idx,
+            "action_order": (
+                end_action_order
+                if start_action_order is None
+                else start_action_order
+            ),
+            "end_action_order": end_action_order,
             "instance_id": instance_id,
             "action": action,
             "pp_stage": pp_stage,
@@ -160,6 +205,10 @@ class CommEventRecorder:
         num_bytes: int,
         tensor_ids: tuple[int, ...],
         shard_world_size: int = -1,
+        transition_id: str = "",
+        include_schedule: bool = True,
+        include_memory: bool = True,
+        schedule_source: str = "state",
     ) -> None:
         from torchtitan_npu.simulator.capture.dispatch_capture import _seq_counter
 
@@ -168,11 +217,6 @@ class CommEventRecorder:
         stage = int(_pp_context.get("stage", -1))
         mb_idx = int(_pp_context.get("mb_idx", -1))
         comp_type = str(_pp_context.get("comp_type", ""))
-        try:
-            capture_process_rank = dist.get_rank() if dist.is_initialized() else 0
-        except (RuntimeError, ValueError):
-            capture_process_rank = -1
-
         event = FSDPResidencyEvent(
             group_id=group_id,
             action=action,
@@ -180,7 +224,7 @@ class CommEventRecorder:
             phase=phase,
             num_bytes=num_bytes,
             tensor_ids=tensor_ids,
-            capture_process_rank=capture_process_rank,
+            capture_process_rank=self.capture_process_rank,
             pp_stage=stage,
             pp_mb_idx=mb_idx,
             comp_type=comp_type,
@@ -190,9 +234,13 @@ class CommEventRecorder:
                 else ""
             ),
             shard_world_size=shard_world_size,
+            action_order=self.next_action_order(),
+            transition_id=transition_id,
+            schedule_source=schedule_source,
         )
-        self.fsdp_schedule_events.append(event)
-        if self.memory_tracking_enabled:
+        if include_schedule:
+            self.fsdp_schedule_events.append(event)
+        if include_memory and self.memory_tracking_enabled:
             self.fsdp_residency_events.append(event)
 
 
@@ -269,12 +317,24 @@ def _resolve_comm_ranks(group: object) -> list[list[int]]:
                 return [ranks] if len(ranks) > 1 else []
         except Exception:
             pass
-    # ProcessGroup: only know our own group's size, not all groups
+    # ProcessGroup: c10d keeps the exact global-rank map for registered groups.
     if hasattr(group, "size"):
         try:
-            ws = int(group.size())
-            rank = int(group.rank()) if hasattr(group, "rank") else 0
-            return [list(range(rank, rank + ws))]
+            get_process_group_ranks = getattr(dist, "get_process_group_ranks", None)
+            if get_process_group_ranks is not None:
+                ranks = [int(rank) for rank in get_process_group_ranks(group)]
+                return [ranks] if len(ranks) > 1 else []
+            from torch.distributed import distributed_c10d as c10d
+
+            rank_map = c10d._world.pg_group_ranks.get(group)
+            if rank_map:
+                ranks = [
+                    int(global_rank)
+                    for global_rank, _local_rank in sorted(
+                        rank_map.items(), key=lambda item: item[1]
+                    )
+                ]
+                return [ranks] if len(ranks) > 1 else []
         except Exception:
             pass
     return []
@@ -312,6 +372,16 @@ def _record_comm_with_l0(
     # UNSHARD/RESHARD actions in runtime zero-bubble schedules).
     event.comp_type = str(_pp_context.get("comp_type", ""))
     event.fsdp_state = str(_pp_context.get("fsdp_state", "NA"))
+    try:
+        from torchtitan_npu.simulator.capture.fsdp_residency import (
+            get_active_fsdp_transition,
+        )
+
+        transition_id, group_id = get_active_fsdp_transition()
+        event.fsdp_transition_id = transition_id
+        event.fsdp_group_id = group_id
+    except ImportError:
+        pass
     # For FSDP collective comm (allgather/reduce_scatter), record the active
     # stage so build_schedule_plan can match the plan's UNSHARD/RESHARD action
     # (by stage) to this CommEvent + its L0 op_id. (P2P events already set
@@ -331,13 +401,14 @@ def _record_comm_with_l0(
         if producer_op is not None:
             event.src_exit_op = producer_op
 
+        event_count_before = len(capture._events)
         capture.record_synthetic_op(
             raw_op_type=f"comm.{comm_primitive}",
             inputs=[tensor],
             outputs=[out],
         )
         # Link the L0 op to this CommEvent and store comm metadata in annotations
-        if capture._events:
+        if len(capture._events) > event_count_before:
             event.op_id = capture._events[-1].op_id
             # Store comm_dim and comm_ranks in the L0 node's annotations
             # so they appear in CSV and JSON exports
@@ -367,7 +438,11 @@ def get_active_recorder() -> CommEventRecorder | None:
 
 
 @contextmanager
-def capture_fake_collectives(*, memory_tracking_enabled: bool = True) -> Iterator[CommEventRecorder]:
+def capture_fake_collectives(
+    *,
+    memory_tracking_enabled: bool = True,
+    capture_process_rank: int = 0,
+) -> Iterator[CommEventRecorder]:
     """Monkeypatch the legacy (`torch.distributed.*`) and functional
     (`torch.distributed._functional_collectives.*`) collective APIs for the
     duration of the context.
@@ -387,7 +462,10 @@ def capture_fake_collectives(*, memory_tracking_enabled: bool = True) -> Iterato
     calls made while the context is active as fake, unconditionally.
     """
     global _active_recorder
-    recorder = CommEventRecorder(memory_tracking_enabled=memory_tracking_enabled)
+    recorder = CommEventRecorder(
+        memory_tracking_enabled=memory_tracking_enabled,
+        capture_process_rank=capture_process_rank,
+    )
     _active_recorder = recorder
 
     orig_all_reduce = dist.all_reduce
@@ -532,11 +610,12 @@ def capture_fake_collectives(*, memory_tracking_enabled: bool = True) -> Iterato
     orig_recv = dist.recv
 
     @contextmanager
-    def _p2p_context(tensor: torch.Tensor, direction: str) -> Iterator[None]:
+    def _p2p_context(tensor: torch.Tensor, direction: str) -> Iterator[object | None]:
         from torchtitan_npu.simulator.meta_env import _consume_p2p_op_context, _use_p2p_op_context
 
-        with _use_p2p_op_context(_consume_p2p_op_context(tensor, direction)):
-            yield
+        context = _consume_p2p_op_context(tensor, direction)
+        with _use_p2p_op_context(context):
+            yield context
 
     def _finalize_pp_transfer_id(event: CommEvent) -> None:
         direction = event.p2p_direction
@@ -552,19 +631,21 @@ def capture_fake_collectives(*, memory_tracking_enabled: bool = True) -> Iterato
         else:
             return
         event.transfer_id = (
-            f"pp:{base}:s{src_stage}->s{dst_stage}:mb{event.p2p_mb_idx}:t0"
+            f"pp:{base}:s{src_stage}->s{dst_stage}:mb{event.p2p_mb_idx}:"
+            f"t{event.tensor_ordinal}"
         )
 
     def patched_isend(tensor, dst=None, group=None, tag=0, group_dst=None):  # noqa: ANN001
         if not _should_intercept(group):
             return orig_isend(tensor, dst=dst, group=group, tag=tag, group_dst=group_dst)
-        with _p2p_context(tensor, "send"):
+        with _p2p_context(tensor, "send") as context:
             from torchtitan_npu.simulator.meta_env import _pp_context
             event = _record_comm_with_l0(recorder, "p2p_send", group, tensor)
             event.p2p_peer_rank = dst if dst is not None else (group_dst if group_dst is not None else -1)
             event.p2p_direction = f"{_pp_context['phase']}_send"
             event.p2p_mb_idx = int(_pp_context["mb_idx"])
             event.p2p_stage = int(_pp_context["stage"])
+            event.tensor_ordinal = int(getattr(context, "tensor_ordinal", 0))
             _finalize_pp_transfer_id(event)
         # No actual data transfer — meta tensors have no data.
         # Shape inference is handled by DYNAMIC mode via _send_meta/_recv_meta.
@@ -573,13 +654,14 @@ def capture_fake_collectives(*, memory_tracking_enabled: bool = True) -> Iterato
     def patched_irecv(tensor, src=None, group=None, tag=0, group_src=None):  # noqa: ANN001
         if not _should_intercept(group):
             return orig_irecv(tensor, src=src, group=group, tag=tag, group_src=group_src)
-        with _p2p_context(tensor, "recv"):
+        with _p2p_context(tensor, "recv") as context:
             from torchtitan_npu.simulator.meta_env import _pp_context
             event = _record_comm_with_l0(recorder, "p2p_recv", group, tensor)
             event.p2p_peer_rank = src if src is not None else (group_src if group_src is not None else -1)
             event.p2p_direction = f"{_pp_context['phase']}_recv"
             event.p2p_mb_idx = int(_pp_context["mb_idx"])
             event.p2p_stage = int(_pp_context["stage"])
+            event.tensor_ordinal = int(getattr(context, "tensor_ordinal", 0))
             _finalize_pp_transfer_id(event)
         # No actual data transfer — meta tensors have no data.
         # The recv buffer shape was already set by DYNAMIC mode's
@@ -589,26 +671,28 @@ def capture_fake_collectives(*, memory_tracking_enabled: bool = True) -> Iterato
     def patched_send(tensor, dst=None, group=None, tag=0, group_dst=None):  # noqa: ANN001
         if not _should_intercept(group):
             return orig_send(tensor, dst=dst, group=group, tag=tag, group_dst=group_dst)
-        with _p2p_context(tensor, "send"):
+        with _p2p_context(tensor, "send") as context:
             from torchtitan_npu.simulator.meta_env import _pp_context
             event = _record_comm_with_l0(recorder, "p2p_send", group, tensor)
             event.p2p_peer_rank = dst if dst is not None else (group_dst if group_dst is not None else -1)
             event.p2p_direction = f"{_pp_context['phase']}_send"
             event.p2p_mb_idx = int(_pp_context["mb_idx"])
             event.p2p_stage = int(_pp_context["stage"])
+            event.tensor_ordinal = int(getattr(context, "tensor_ordinal", 0))
             _finalize_pp_transfer_id(event)
         return None
 
     def patched_recv(tensor, src=None, group=None, tag=0, group_src=None):  # noqa: ANN001
         if not _should_intercept(group):
             return orig_recv(tensor, src=src, group=group, tag=tag, group_src=group_src)
-        with _p2p_context(tensor, "recv"):
+        with _p2p_context(tensor, "recv") as context:
             from torchtitan_npu.simulator.meta_env import _pp_context
             event = _record_comm_with_l0(recorder, "p2p_recv", group, tensor)
             event.p2p_peer_rank = src if src is not None else (group_src if group_src is not None else -1)
             event.p2p_direction = f"{_pp_context['phase']}_recv"
             event.p2p_mb_idx = int(_pp_context["mb_idx"])
             event.p2p_stage = int(_pp_context["stage"])
+            event.tensor_ordinal = int(getattr(context, "tensor_ordinal", 0))
             _finalize_pp_transfer_id(event)
         return 0
 

@@ -7,9 +7,24 @@
 
 from __future__ import annotations
 
+import contextvars
+import itertools
 from typing import Any
 
 import torch
+
+
+_transition_counter = itertools.count()
+_active_fsdp_transition: contextvars.ContextVar[tuple[str, str]] = (
+    contextvars.ContextVar(
+        "simulator_active_fsdp_transition",
+        default=("", ""),
+    )
+)
+
+
+def get_active_fsdp_transition() -> tuple[str, str]:
+    return _active_fsdp_transition.get()
 
 
 def _memory_tracking_enabled() -> bool:
@@ -63,6 +78,11 @@ def _record_residency(
     action: str,
     metadata: tuple[int, tuple[torch.Tensor, ...]],
     shard_world_size: int,
+    transition_id: str,
+    *,
+    include_schedule: bool = True,
+    include_memory: bool = True,
+    schedule_source: str = "state",
 ) -> None:
     from torchtitan_npu.simulator.capture.comm_events import get_active_recorder
     from torchtitan_npu.simulator.capture.dispatch_capture import get_active_capture
@@ -84,6 +104,10 @@ def _record_residency(
         num_bytes=num_bytes,
         tensor_ids=tensor_ids,
         shard_world_size=shard_world_size,
+        transition_id=transition_id,
+        include_schedule=include_schedule,
+        include_memory=include_memory,
+        schedule_source=schedule_source,
     )
 
 
@@ -115,12 +139,68 @@ def install_fsdp_residency_hooks() -> None:
     FSDPParamGroup._sim_orig_reshard = FSDPParamGroup.reshard
 
     def patched_unshard(self, async_op=False):  # noqa: ANN001, ANN202
+        from torchtitan_npu.simulator.capture.comm_events import get_active_recorder
+
+        recorder = get_active_recorder()
+        capture_rank = recorder.capture_process_rank if recorder is not None else -1
+        group_id = str(id(self))
+        transition_id = (
+            f"fsdp:r{capture_rank}:g{group_id}:u{next(_transition_counter)}"
+        )
+        event_count_before = len(recorder.events) if recorder is not None else 0
+        was_unsharded = self.is_unsharded
+        previous_transition_id = getattr(
+            self, "_sim_active_transition_id", ""
+        )
+        previous_pending_transition_id = getattr(
+            self, "_sim_pending_transition_id", ""
+        )
+        explicit_schedule_action = (
+            meta_env._pp_context.get("comp_type") == "UNSHARD"
+        )
         previous_comm_layer = meta_env._comm_layer
         meta_env._comm_layer = "L2"
+        token = _active_fsdp_transition.set((transition_id, group_id))
         try:
-            return FSDPParamGroup._sim_orig_unshard(self, async_op)
+            result = FSDPParamGroup._sim_orig_unshard(self, async_op)
         finally:
+            _active_fsdp_transition.reset(token)
             meta_env._comm_layer = previous_comm_layer
+        launched_collective = recorder is not None and any(
+            event.fsdp_transition_id == transition_id
+            for event in recorder.events[event_count_before:]
+        )
+        if launched_collective:
+            self._sim_active_transition_id = transition_id
+            self._sim_pending_transition_id = ""
+        elif previous_transition_id:
+            pass
+        elif previous_pending_transition_id:
+            pass
+        elif not was_unsharded and self.is_unsharded:
+            self._sim_active_transition_id = transition_id
+        elif not was_unsharded:
+            # Async unshard has been requested but residency starts only when
+            # wait_for_unshard observes the state transition.
+            self._sim_pending_transition_id = transition_id
+        effective_transition_id = getattr(
+            self, "_sim_active_transition_id", ""
+        ) or getattr(self, "_sim_pending_transition_id", "")
+        if explicit_schedule_action:
+            _record_residency(
+                self,
+                "alloc",
+                (
+                    _residency_metadata(self)
+                    if _memory_tracking_enabled()
+                    else (0, ())
+                ),
+                _shard_world_size(self),
+                effective_transition_id,
+                include_memory=False,
+                schedule_source="intent",
+            )
+        return result
 
     def patched_wait_for_unshard(self):  # noqa: ANN001, ANN202
         was_unsharded = self.is_unsharded
@@ -130,6 +210,11 @@ def install_fsdp_residency_hooks() -> None:
         result = FSDPParamGroup._sim_orig_wait_for_unshard(self)
         if not was_unsharded and self.is_unsharded:
             _set_stage_fsdp_state(meta_env, "UNSHARDED")
+            if not getattr(self, "_sim_active_transition_id", ""):
+                self._sim_active_transition_id = getattr(
+                    self, "_sim_pending_transition_id", ""
+                )
+            self._sim_pending_transition_id = ""
         if not was_unsharded and self.is_unsharded:
             if track_memory:
                 num_bytes, full_tensors = _residency_metadata(self)
@@ -138,7 +223,13 @@ def install_fsdp_residency_hooks() -> None:
             else:
                 metadata = (0, ())
             self._sim_residency_shard_world_size = shard_world_size
-            _record_residency(self, "alloc", metadata, shard_world_size)
+            _record_residency(
+                self,
+                "alloc",
+                metadata,
+                shard_world_size,
+                getattr(self, "_sim_active_transition_id", ""),
+            )
         return result
 
     def patched_reshard(self):  # noqa: ANN001, ANN202
@@ -148,6 +239,20 @@ def install_fsdp_residency_hooks() -> None:
         metadata: tuple[int, tuple[torch.Tensor, ...]] = (
             _residency_metadata(self) if was_unsharded and _memory_tracking_enabled() else (0, ())
         )
+        transition_id = getattr(self, "_sim_active_transition_id", "")
+        explicit_schedule_action = (
+            meta_env._pp_context.get("comp_type") == "RESHARD"
+        )
+        if explicit_schedule_action:
+            _record_residency(
+                self,
+                "free",
+                metadata,
+                _shard_world_size(self),
+                transition_id,
+                include_memory=False,
+                schedule_source="intent",
+            )
         try:
             result = FSDPParamGroup._sim_orig_reshard(self)
         finally:
@@ -157,7 +262,17 @@ def install_fsdp_residency_hooks() -> None:
             shard_world_size = getattr(self, "_sim_residency_shard_world_size", None)
             if shard_world_size is None:
                 shard_world_size = _shard_world_size(self)
-            _record_residency(self, "free", metadata, shard_world_size)
+            _record_residency(
+                self,
+                "free",
+                metadata,
+                shard_world_size,
+                transition_id,
+            )
+            self._sim_active_transition_id = ""
+            self._sim_pending_transition_id = ""
+        elif explicit_schedule_action:
+            self._sim_pending_transition_id = ""
         return result
 
     FSDPParamGroup.unshard = patched_unshard

@@ -4,6 +4,10 @@
 >
 > 本文只说明已经提供了哪些数据，以及如何使用这些数据重建依赖、通信和执行状态。
 > 不涉及数据如何捕获，也不要求消费端理解模型框架内部实现。
+>
+> `capture_schema_version = 2` 的权威输入契约、依赖重建顺序和禁止兜底项见
+> [`schedule-plan-dependency-reconstruction-contract.md`](./schedule-plan-dependency-reconstruction-contract.md)。
+> 本文保留更详细的 DES 状态机和内存消费说明；若两者冲突，以契约文档为准。
 
 ## 1. 消费端目标
 

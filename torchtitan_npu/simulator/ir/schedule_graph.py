@@ -18,7 +18,7 @@ from torchtitan_npu.simulator.ir.step_graph import StepGraph
 class TimelineEntry:
     """One op's position in the execution timeline, captured (not inferred)."""
 
-    seq_idx: int           # global execution sequence number (from capture)
+    seq_idx: int           # source L0 sequence number, not L2 schedule order
     op_id: int             # L0 OpNode ID (-1 for MB 1+ pass-through)
     rank: int              # which rank executed this op
     pipeline_stage: int    # PP stage (-1 if not PP)
@@ -31,6 +31,8 @@ class TimelineEntry:
     # timeline entry. Lets L2 consumers distinguish input-grad vs weight-grad
     # backward chunks and pick the correct L1 template per microbatch.
     comp_type: str = ""
+    schedule_order: int = -1
+    transfer_id: str = ""
 
 
 @dataclass
@@ -112,8 +114,8 @@ class ScheduleGraph:
 
         Outputs one CSV per rank under ``path/`` directory (created if
         needed).  Each row = one captured execution event (forward chunk,
-        backward chunk, P2P send/recv, collective comm), ordered by
-        captured ``seq_idx``.
+        backward chunk, P2P send/recv, collective comm), ordered by semantic
+        ``schedule_order``. ``seq_idx`` is retained as an L0 source reference.
 
         Columns:
             seq_idx, phase, microbatch, action, comm_type, comm_peer_rank,
@@ -127,11 +129,8 @@ class ScheduleGraph:
 
         os.makedirs(path, exist_ok=True)
 
-        # Group execution_timeline entries by rank
-        # (currently all entries have rank=0 since capture is single-process;
-        # for PP, the pipeline_stage field distinguishes stages)
-        # We export one file per pipeline_stage (since all ranks in the same
-        # stage share the same template/schedule)
+        # Each physical PP capture process exports its representative stage.
+        # Keep grouping here so merged/multi-stage graphs remain exportable.
         stages_seen: set[int] = set()
         for entry in self.execution_timeline:
             stage = entry.pipeline_stage if entry.pipeline_stage >= 0 else 0
@@ -143,15 +142,20 @@ class ScheduleGraph:
                 e for e in self.execution_timeline
                 if (e.pipeline_stage if e.pipeline_stage >= 0 else 0) == stage
             ]
-            stage_entries.sort(key=lambda e: e.seq_idx)
+            stage_entries.sort(
+                key=lambda e: (
+                    e.schedule_order if e.schedule_order >= 0 else e.seq_idx,
+                    e.seq_idx,
+                )
+            )
 
             fname = os.path.join(path, f"stage_{stage}_l1_schedule.csv")
             with open(fname, "w", newline="", encoding="utf-8") as f:
                 w = csv.writer(f)
                 w.writerow([
-                    "seq_idx", "phase", "comp_type", "microbatch", "action",
+                    "schedule_order", "seq_idx", "phase", "comp_type", "microbatch", "action",
                     "comm_type", "comm_peer_rank", "comm_dim", "comm_ranks",
-                    "op_id",
+                    "op_id", "transfer_id",
                 ])
                 for e in stage_entries:
                     # Use captured action field directly
@@ -162,10 +166,10 @@ class ScheduleGraph:
                     else:
                         action = "compute"
                     w.writerow([
-                        e.seq_idx, e.phase, e.comp_type,
+                        e.schedule_order, e.seq_idx, e.phase, e.comp_type,
                         e.micro_batch_idx if e.micro_batch_idx >= 0 else "",
                         action,
                         e.comm_type, e.comm_peer_rank,
                         "", "",  # comm_dim/comm_ranks not in TimelineEntry
-                        e.op_id,
+                        e.op_id, e.transfer_id,
                     ])

@@ -67,13 +67,13 @@ class WorkloadGraph:
         between them.
 
         Columns:
-            seq_idx, pipeline_stage, phase, microbatch, action,
+            schedule_order, seq_idx, pipeline_stage, phase, microbatch, action,
             comm_type, comm_peer_rank, depends_on_stage, depends_on_seq
 
         All data from captured execution_timeline.  ``depends_on_stage``
-        and ``depends_on_seq`` are derived from P2P recv events: a recv's
-        peer_rank identifies the sending stage, and the matching send's
-        seq_idx is the dependency.  No scheduling rules are inferred.
+        and ``depends_on_seq`` are derived from exact ``transfer_id`` joins.
+        Stage/direction/microbatch matching is retained only for legacy
+        captures without transfer IDs.
         """
         import csv
 
@@ -84,25 +84,33 @@ class WorkloadGraph:
         # microbatch M), find its seq_idx.  Then a P2P recv with matching
         # stage/direction/mb can look up the send's seq_idx as its dependency.
         # send_key = (stage, direction_without_send/recv_suffix, mb_idx)
-        # Note: under single-process fake PG, only one PP stage is executed
-        # and captured.  Sends from other stages are not captured, so
-        # depends_on_seq may be empty — only depends_on_stage is filled
-        # from the captured peer_rank.
+        # Per-rank exports may not contain the peer's send row. In that case
+        # transfer_id remains the complete cross-rank join key even though
+        # depends_on_seq is empty in this individual CSV.
         send_seq_lookup: dict[tuple[int, str, int], int] = {}
+        send_transfer_lookup: dict[str, int] = {}
         for entry in timeline:
             if entry.comm_type and "send" in entry.comm_type:
                 base_dir = entry.comm_type.replace("_send", "")
                 key = (entry.pipeline_stage, base_dir, entry.micro_batch_idx)
                 send_seq_lookup[key] = entry.seq_idx
+                if entry.transfer_id:
+                    send_transfer_lookup[entry.transfer_id] = entry.seq_idx
 
         with open(path, "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
             w.writerow([
-                "seq_idx", "pipeline_stage", "phase", "microbatch", "action",
+                "schedule_order", "seq_idx", "pipeline_stage", "phase", "microbatch", "action",
                 "comm_type", "comm_peer_rank",
-                "depends_on_stage", "depends_on_seq",
+                "transfer_id", "depends_on_stage", "depends_on_seq",
             ])
-            for entry in sorted(timeline, key=lambda e: e.seq_idx):
+            for entry in sorted(
+                timeline,
+                key=lambda e: (
+                    e.schedule_order if e.schedule_order >= 0 else e.seq_idx,
+                    e.seq_idx,
+                ),
+            ):
                 depends_on_stage = ""
                 depends_on_seq = ""
                 if entry.comm_type and "recv" in entry.comm_type:
@@ -116,13 +124,20 @@ class WorkloadGraph:
                         send_stage = entry.pipeline_stage + 1
                     depends_on_stage = send_stage
                     key = (send_stage, base_dir, entry.micro_batch_idx)
-                    depends_on_seq = send_seq_lookup.get(key, "")
+                    depends_on_seq = (
+                        send_transfer_lookup.get(entry.transfer_id, "")
+                        if entry.transfer_id
+                        else send_seq_lookup.get(key, "")
+                    )
 
-                # For non-comm entries, use stage 0 as default (single-process
-                # capture only executes one stage)
                 stage = entry.pipeline_stage if entry.pipeline_stage >= 0 else 0
-                action = entry.comm_type if entry.comm_type else f"{entry.phase}_one_chunk"
+                action = (
+                    entry.comm_type
+                    or entry.action
+                    or f"{entry.phase}_one_chunk"
+                )
                 w.writerow([
+                    entry.schedule_order,
                     entry.seq_idx,
                     stage,
                     entry.phase,
@@ -130,6 +145,7 @@ class WorkloadGraph:
                     action,
                     entry.comm_type,
                     entry.comm_peer_rank if entry.comm_peer_rank >= 0 else "",
+                    entry.transfer_id,
                     depends_on_stage,
                     depends_on_seq,
                 ])

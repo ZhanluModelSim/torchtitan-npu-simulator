@@ -4,6 +4,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import os
+import multiprocessing as mp
 
 import pytest
 import torch.distributed as dist
@@ -14,6 +15,49 @@ from torchtitan_npu.simulator.meta_env import (
     patch_device_type_to_meta,
     unpatch_device_type_to_meta,
 )
+
+
+def _logical_submesh_worker(
+    rank: int,
+    rendezvous_path: str,
+    result_queue,
+) -> None:
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = "2"
+    patch_device_type_to_meta()
+    try:
+        dist.init_process_group(
+            "gloo",
+            init_method=f"file://{rendezvous_path}",
+            rank=rank,
+            world_size=2,
+        )
+        _patch_new_group_for_fake_backend()
+        _patch_parallel_dims_for_multi_proc(full_ws=4, gloo_ws=2)
+
+        import torch.distributed.device_mesh as device_mesh
+
+        world_mesh = device_mesh.init_device_mesh(
+            "meta", (4,), mesh_dim_names=("world",)
+        )
+        sparse_mesh = world_mesh._unflatten(
+            0,
+            (2, 1, 1, 2, 1),
+            ("pp", "dp_replicate", "efsdp", "ep", "etp"),
+        )
+        ep_mesh = sparse_mesh["ep"]
+        result_queue.put(
+            (
+                rank,
+                ep_mesh.mesh.tolist(),
+                ep_mesh.get_coordinate(),
+                dist.get_process_group_ranks(ep_mesh.get_group()),
+            )
+        )
+    finally:
+        if dist.is_initialized():
+            dist.destroy_process_group()
+        unpatch_device_type_to_meta()
 
 
 @pytest.fixture
@@ -75,3 +119,28 @@ def test_patched_new_group_preserves_positional_arguments(single_gloo_rank):
 def test_out_of_range_real_group_is_not_silently_converted(single_gloo_rank):
     with pytest.raises(ValueError, match="world size|out of range"):
         dist.new_group(ranks=[0, 1], backend="gloo")
+
+
+def test_each_pp_worker_selects_its_logical_submesh(tmp_path):
+    context = mp.get_context("spawn")
+    result_queue = context.Queue()
+    rendezvous_path = str(tmp_path / "logical-submesh-rendezvous")
+    processes = [
+        context.Process(
+            target=_logical_submesh_worker,
+            args=(rank, rendezvous_path, result_queue),
+        )
+        for rank in range(2)
+    ]
+
+    for process in processes:
+        process.start()
+    results = [result_queue.get(timeout=30) for _ in processes]
+    for process in processes:
+        process.join(timeout=30)
+        assert process.exitcode == 0
+
+    assert sorted(results) == [
+        (0, [0, 1], (0,), [0, 1]),
+        (1, [2, 3], (0,), [2, 3]),
+    ]

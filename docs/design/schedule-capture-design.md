@@ -1,5 +1,12 @@
 # L0-L3 IR 层级归属设计
 
+> 历史说明：本文保留早期 L0/L1/L2 通信分层讨论，不再定义当前 PP L2
+> 组装方案。当前的 rank 身份、语义 action、FSDP residency、跨 stage
+> 依赖和 `SchedulePlan` 主数据流以
+> [PP L2 Capture Architecture](./pp-l2-capture-architecture.md) 为准。
+> 特别地，RESHARD 是本地 full-parameter residency 释放，不等同于梯度
+> reduce-scatter。
+
 > 状态：设计中
 > 作者：Copilot
 > 日期：2026-07-09
