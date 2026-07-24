@@ -10,6 +10,11 @@ This module patches _to_mxfp8_then_scaled_grouped_mm to support NPU by:
 1. Adding NpuMXFP8GroupedMM autograd function for NPU-specific grouped MM
 2. Patching _to_mxfp8_then_scaled_grouped_mm to use NPU path when available
 
+AC Optimization:
+    Uses dual-axis quant + ctx/stack bridge to avoid re-quantization in backward
+    when activation checkpoint is enabled. Falls back to re-quantization when
+    torch.compile is enabled (to avoid Dynamo HOP side-effect errors).
+
 Note: In torchao v0.17.0, _to_mxfp8_then_scaled_grouped_mm was moved from
 scaled_grouped_mm.py to mxfp8_grouped_mm.py.
 """
@@ -17,6 +22,17 @@ scaled_grouped_mm.py to mxfp8_grouped_mm.py.
 import torch
 import torch_npu
 from einops import rearrange
+
+from torchtitan_npu.patches.torchao_npu.activation_checkpoint_state import (
+    is_in_recomputation,
+    pop_gmm_quant_data,
+    push_gmm_quant_data,
+)
+from torchtitan_npu.patches.torchao_npu.mx_ac_config import (
+    ac_enabled_context,
+    get_ac_mode,
+    should_save_bwd_quant_for_mx,
+)
 
 
 @torch._dynamo.allow_in_graph
@@ -26,6 +42,13 @@ class NpuMXFP8GroupedMM(torch.autograd.Function):
 
     Uses torch_npu operations for efficient MX-format grouped matrix multiplication
     on NPU hardware.
+
+    AC Optimization:
+        - When AC disabled: dual-axis quant in forward, ctx stores bwd data.
+        - When AC enabled + compile disabled: stack bridge passes bwd data
+          from recomputation forward to backward.
+        - When AC enabled + compile enabled: falls back to re-quantization
+          in backward (Dynamo-safe).
     """
 
     @staticmethod
@@ -33,10 +56,31 @@ class NpuMXFP8GroupedMM(torch.autograd.Function):
     def forward(ctx, x, weight, group_list):
         ctx.save_for_backward(x, weight)
         ctx.group_list = group_list
+
         x_mxfp8, x_scale = torch_npu.npu_dynamic_mx_quant(x, axis=-1, dst_type=torch.float8_e4m3fn, scale_alg=1)
-        weight_mxfp8, weight_scale = torch_npu.npu_dynamic_mx_quant(
-            weight, axis=-2, dst_type=torch.float8_e4m3fn, scale_alg=1
-        )
+
+        save_bwd = should_save_bwd_quant_for_mx()
+        in_recomp = is_in_recomputation()
+
+        if save_bwd:
+            weight_mxfp8_bwd, weight_scale_bwd, weight_mxfp8, weight_scale = (
+                torch_npu.npu_dynamic_mx_quant_with_dual_axis(weight, dst_type=torch.float8_e4m3fn, scale_alg=1)
+            )
+
+            if in_recomp:
+                push_gmm_quant_data(
+                    {
+                        "weight_mxfp8_bwd": weight_mxfp8_bwd,
+                        "weight_scale_bwd": weight_scale_bwd,
+                    }
+                )
+            else:
+                ctx.weight_bwd = weight_mxfp8_bwd
+                ctx.weight_scale_bwd = weight_scale_bwd
+        else:
+            weight_mxfp8, weight_scale = torch_npu.npu_dynamic_mx_quant(
+                weight, axis=-2, dst_type=torch.float8_e4m3fn, scale_alg=1
+            )
 
         return torch_npu.npu_grouped_matmul(
             [x_mxfp8],
@@ -58,12 +102,25 @@ class NpuMXFP8GroupedMM(torch.autograd.Function):
     def backward(ctx, grad):
         x, weight = ctx.saved_tensors
         group_list = ctx.group_list
+
         grad_mxfp8, grad_scale = torch_npu.npu_dynamic_mx_quant(
             grad, axis=-1, dst_type=torch.float8_e4m3fn, scale_alg=1
         )
-        weight_mxfp8, weight_scale = torch_npu.npu_dynamic_mx_quant(
-            weight, axis=-1, dst_type=torch.float8_e4m3fn, scale_alg=1
-        )
+
+        stack_data = pop_gmm_quant_data()
+        if stack_data is not None:
+            weight_mxfp8 = stack_data["weight_mxfp8_bwd"]
+            weight_scale = stack_data["weight_scale_bwd"]
+
+        elif hasattr(ctx, "weight_bwd"):
+            weight_mxfp8 = ctx.weight_bwd
+            weight_scale = ctx.weight_scale_bwd
+
+        else:
+            weight_mxfp8, weight_scale = torch_npu.npu_dynamic_mx_quant(
+                weight, axis=-1, dst_type=torch.float8_e4m3fn, scale_alg=1
+            )
+
         grad_input = torch_npu.npu_grouped_matmul(
             [grad_mxfp8],
             [rearrange(weight_mxfp8, "n h f -> n f h")],
@@ -78,6 +135,7 @@ class NpuMXFP8GroupedMM(torch.autograd.Function):
             per_token_scale_dtype=torch_npu.float8_e8m0fnu,
             split_item=3,
         )[0]
+
         x_mxfp8, x_scale = torch_npu.npu_grouped_dynamic_mx_quant(
             x,
             group_list.to(torch.int32),  # npu_grouped_dynamic_mx_quant requires group_list to have dtype int32
@@ -127,9 +185,12 @@ def _patched_to_mxfp8_then_scaled_grouped_mm(
     wgrad_with_hp, scale_calculation_mode, pad_token_groups_for_grouped_mm)
     for compatibility with MXFP8TrainingWeightWrapperTensor's
     __torch_function__ call site, which passes these through from config.
-    """
 
-    return NpuMXFP8GroupedMM.apply(A, B_t, offs)
+    AC state is read from the global get_ac_mode() (set in entry.py).
+    """
+    ac_enabled = get_ac_mode() != "none"
+    with ac_enabled_context(ac_enabled):
+        return NpuMXFP8GroupedMM.apply(A, B_t, offs)
 
 
 def apply_patches():

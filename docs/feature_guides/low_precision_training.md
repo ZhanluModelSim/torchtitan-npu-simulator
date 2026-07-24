@@ -51,6 +51,12 @@ NPU 侧通过 patch `torchao.prototype.moe_training.mxfp8_grouped_mm._to_mxfp8_t
 | `recipe_name` | str | `"mxfp8_rceil"` | 量化 recipe 名称。当前唯一可选值：`"mxfp8_rceil"`（MXFP8 动态量化，scale 计算采用 RCEIL 舍入模式）。 |
 | `fqns` | list[str] | [] | 需要启用 MXFP8 量化的模块全限定名（FQN）列表。匹配规则为子字符串包含，例如 `"moe.experts"` 将匹配所有 FQN 中包含该字符串的模块。留空表示不对任何模块启用 MXFP8。 |
 
+### 环境变量配置
+
+| 环境变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `MXFP8_DUAL_AXIS_FORWARD` | `1`（启用） | 控制 MXFP8 线性层和 MoE 专家层是否启用 forward dual-axis 量化（forward 阶段同时生成 backward 的量化数据），默认启用。设置为 `0` 或 `false` 可关闭，forward 回退到 single-axis 量化行为。无论 `MXFP8_DUAL_AXIS_FORWARD` 是否启用，Linear的 backward grad始终使用 dual-axis 量化。 |
+
 ### 配置示例
 
 在模型的 `config_registry.py` 中配置 `model_converters` 并添加 `MXFP8Converter`：
