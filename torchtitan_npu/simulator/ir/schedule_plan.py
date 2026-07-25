@@ -210,11 +210,23 @@ class SchedulePlan:
         return None
 
     def export_schedule_plan_csv(self, path: str) -> None:
-        """One row per action: seq, action_type, stage, mb, comp_type,
-        template_ref, consumes→slot_ids, produces→slot_ids, plus one row
-        per DataSlot (shape/bytes/comm/local/producer/consumers)."""
+        """Export top-level and nested actions plus their DataSlots.
+
+        Nested ``OVERLAP_F_B`` children are emitted immediately after their
+        parent and carry ``parent_action_id``. Only rows without a parent are
+        rank-local issue-queue entries.
+        """
         import csv
         import os
+
+        def iter_action_rows(
+            actions: list[ScheduleAction],
+            parent_action_id: str = "",
+        ):
+            for action in actions:
+                yield action, parent_action_id
+                if action.sub_actions:
+                    yield from iter_action_rows(action.sub_actions, action.action_id)
 
         os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
         slots = self.data_slots
@@ -224,13 +236,14 @@ class SchedulePlan:
                 "seq_idx", "schedule_order", "action_id", "action_type", "stage", "mb_idx",
                 "comp_type", "template_ref", "rank",
                 "consumes", "produces", "sub_actions", "annotations",
+                "parent_action_id",
                 # denormalized comm detail (direct, no 2-hop lookup)
                 "comm_primitive", "comm_role", "comm_bytes", "comm_shape",
                 "comm_src_stage", "comm_dst_stage", "comm_peer_rank",
                 "comm_group_ranks", "comm_src_exit_op", "comm_dst_entry_op",
                 "comm_op_id", "comm_is_noop", "comm_transfer_id",
             ])
-            for a in self.actions:
+            for a, parent_action_id in iter_action_rows(self.actions):
                 c = a.comm
                 w.writerow([
                     a.seq_idx, a.schedule_order, a.action_id, a.action_type, a.stage,
@@ -239,6 +252,7 @@ class SchedulePlan:
                     ";".join(a.consumes), ";".join(a.produces),
                     ";".join(s.action_id for s in (a.sub_actions or [])),
                     ";".join(f"{k}={v}" for k, v in a.annotations.items()),
+                    parent_action_id,
                     c.primitive if c else "", c.role if c else "",
                     c.volume_bytes if c else "", list(c.shape) if c else "",
                     c.src_stage if c else "", c.dst_stage if c else "",

@@ -4,6 +4,9 @@
 >
 > 本文是 `capture_schema_version = 2` 的下游消费契约。它只说明输入中已经有什么、
 > 如何建立依赖和通信事件，以及哪些情况必须拒绝；不讨论这些数据如何捕获。
+>
+> DualPipeV 的虚拟 stage 映射、overlap 串行降级和专项验收见
+> [`dualpipev-schedule-plan-consumer-guide.md`](./dualpipev-schedule-plan-consumer-guide.md)。
 
 ## 1. 重建目标
 
@@ -45,6 +48,9 @@ plan.annotations["capture_process_rank"] is present
 
 进程内集成应直接消费 `SchedulePlan` 对象。`schedule_plan.csv` 是可读导出，只适合调试；
 如果必须解析 CSV，列表、布尔值和 annotations 必须使用结构化解析，不能按显示字符串做模糊匹配。
+CSV 会递归导出 overlap 子动作：`parent_action_id` 为空的是顶层 action，可进入 issue queue；
+该字段非空的是父动作内部的子动作，只加入 action 索引，不能再次独立发布。文件后半段以
+`slot_id,kind,...` 作为新 header，开始 DataSlot section；解析器必须在这里切换 schema。
 
 ## 3. 四种关系必须分开
 

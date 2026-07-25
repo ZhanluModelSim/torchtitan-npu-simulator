@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import contextvars
 import importlib
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import timedelta
 from types import SimpleNamespace
@@ -192,6 +192,7 @@ _original_fwd_one_chunk: Any = _MISSING
 _original_bwd_one_chunk: Any = _MISSING
 _original_fused_adamw: Any = _MISSING
 _original_llama4_fsdp_mesh_info: Any = _MISSING
+_original_maybe_enable_amp: Any = _MISSING
 _original_bwd_weight_one_chunk: Any = _MISSING
 _original_get_stage_indices: Any = _MISSING
 _original_parameter_new: Any = _MISSING
@@ -1626,6 +1627,26 @@ def _patch_pipeline_action_context() -> None:
         )
     sch._sim_orig_profiler_name = profiler_name
 
+    def _serialize_sub_action(sub_action):  # noqa: ANN001
+        computation_type = getattr(sub_action, "computation_type", None)
+        action_type = getattr(computation_type, "value", "")
+        stage_index = getattr(sub_action, "stage_index", None)
+        if stage_index is None or not action_type:
+            raise RuntimeError(
+                "torch pipeline overlap child is missing stage_index or "
+                f"computation_type: {sub_action!r}"
+            )
+        microbatch_index = getattr(sub_action, "microbatch_index", None)
+        return {
+            "action_type": str(action_type),
+            "pp_stage": int(stage_index),
+            "pp_mb_idx": (
+                int(microbatch_index)
+                if microbatch_index is not None
+                else -1
+            ),
+        }
+
     def _patched_profiler_name(action):  # noqa: ANN001
         stage_index = getattr(action, "stage_index", None)
         computation_type = getattr(action, "computation_type", None)
@@ -1660,10 +1681,16 @@ def _patch_pipeline_action_context() -> None:
 
         recorder = get_active_recorder()
         if recorder is not None:
+            sub_actions = getattr(action, "sub_actions", None)
             recorder.record_pipeline_action(
                 action_type=ct,
                 stage=_pp_context["stage"],
                 mb_idx=_pp_context["mb_idx"],
+                sub_actions=(
+                    [_serialize_sub_action(sub_action) for sub_action in sub_actions]
+                    if sub_actions
+                    else None
+                ),
             )
         return sch._sim_orig_profiler_name(action)
 
@@ -2622,6 +2649,29 @@ def _patch_llama4_hsdp_ep_mesh_info() -> None:
     llama4_parallelize.FSDPMeshInfo = _hsdp_aware_mesh_info
 
 
+def _patch_maybe_enable_amp_for_meta() -> None:
+    """Disable AMP only for simulator-owned meta device execution."""
+    global _original_maybe_enable_amp
+    if _original_maybe_enable_amp is not _MISSING:
+        return
+
+    import torchtitan.distributed.utils as dist_utils
+
+    original = dist_utils.maybe_enable_amp
+    _original_maybe_enable_amp = original
+
+    def _meta_safe_maybe_enable_amp(
+        parallel_dims: Any,
+        mixed_precision_param: str,
+        device_type: str,
+    ) -> Any:
+        if device_type == "meta":
+            return nullcontext()
+        return original(parallel_dims, mixed_precision_param, device_type)
+
+    dist_utils.maybe_enable_amp = _meta_safe_maybe_enable_amp
+
+
 def patch_device_type_to_meta() -> None:
     """Idempotently rebind `device_type="meta"` / `device_module=<stub>`
     across every module that imported them by value at load time, register
@@ -2639,7 +2689,9 @@ def patch_device_type_to_meta() -> None:
     `_patch_grouped_mm_offsets_dtype`,
     `_patch_moe_dispatch_to_avoid_meta_tensor_value_reads`, and
     `_patch_li_loss_to_skip_buggy_einsum`), and disable FSDP2's meta-param
-    validation (see `_neutralize_fsdp_meta_param_validation`)."""
+    validation (see `_neutralize_fsdp_meta_param_validation`). It also
+    disables AMP only for meta execution because PyTorch does not register
+    `torch.autocast("meta")` (see `_patch_maybe_enable_amp_for_meta`)."""
     global _patched
     if _patched:
         return
@@ -2710,6 +2762,7 @@ def patch_device_type_to_meta() -> None:
     _patch_comm_layer_context()
     _patch_mxfp8_for_meta()
     _patch_llama4_hsdp_ep_mesh_info()
+    _patch_maybe_enable_amp_for_meta()
     _patch_fused_adamw_for_meta()
     global _is_meta_simulation
     _is_meta_simulation = True
@@ -2726,7 +2779,7 @@ def unpatch_device_type_to_meta() -> None:
     global _original_redistribute_local_tensor, _original_recv_object_list, _original_send_object_list
     global _original_torch_equal
     global _original_fused_adamw
-    global _original_llama4_fsdp_mesh_info, _original_parameter_new
+    global _original_llama4_fsdp_mesh_info, _original_maybe_enable_amp, _original_parameter_new
     for (module_path, attr_name), original in _original_values.items():
         module = importlib.import_module(module_path)
         if original is _MISSING:
@@ -2820,6 +2873,12 @@ def unpatch_device_type_to_meta() -> None:
 
         llama4_parallelize.FSDPMeshInfo = _original_llama4_fsdp_mesh_info
         _original_llama4_fsdp_mesh_info = _MISSING
+
+    if _original_maybe_enable_amp is not _MISSING:
+        import torchtitan.distributed.utils as dist_utils
+
+        dist_utils.maybe_enable_amp = _original_maybe_enable_amp
+        _original_maybe_enable_amp = _MISSING
 
     if _original_parameter_new is not _MISSING:
         torch.nn.Parameter.__new__ = _original_parameter_new

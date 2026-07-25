@@ -114,19 +114,21 @@ class CommEventRecorder:
         action_type: str,
         stage: int,
         mb_idx: int = -1,
+        sub_actions: list[dict[str, int | str]] | None = None,
     ) -> None:
         from torchtitan_npu.simulator.capture.dispatch_capture import _seq_counter
 
-        self.timeline_events.append(
-            {
-                "event_kind": "schedule_action",
-                "action_type": action_type,
-                "pp_stage": stage,
-                "pp_mb_idx": mb_idx,
-                "seq_idx": next(_seq_counter),
-                "action_order": self.next_action_order(),
-            }
-        )
+        event: dict[str, object] = {
+            "event_kind": "schedule_action",
+            "action_type": action_type,
+            "pp_stage": stage,
+            "pp_mb_idx": mb_idx,
+            "seq_idx": next(_seq_counter),
+            "action_order": self.next_action_order(),
+        }
+        if sub_actions:
+            event["sub_actions"] = [dict(sub_action) for sub_action in sub_actions]
+        self.timeline_events.append(event)
 
     def record(
         self,

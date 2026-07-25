@@ -64,6 +64,28 @@ def test_patch_installs_and_restores_hsdp_ep_mesh_info_fix():
     assert llama4_parallelize.FSDPMeshInfo is original
 
 
+def test_patch_disables_amp_for_meta_and_restores_original():
+    import torchtitan.distributed.utils as dist_utils
+
+    original = dist_utils.maybe_enable_amp
+    try:
+        patch_device_type_to_meta()
+        parallel_dims = SimpleNamespace(
+            fsdp_enabled=False,
+            dp_replicate_enabled=False,
+            tp_enabled=False,
+            pp_enabled=False,
+        )
+        with dist_utils.maybe_enable_amp(parallel_dims, "bfloat16", "meta"):
+            pass
+        with dist_utils.maybe_enable_amp(parallel_dims, "bfloat16", "cpu"):
+            assert torch.is_autocast_enabled("cpu")
+    finally:
+        unpatch_device_type_to_meta()
+
+    assert dist_utils.maybe_enable_amp is original
+
+
 def test_patch_is_idempotent():
     import torchtitan.tools.utils as utils_mod
 

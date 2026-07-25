@@ -218,3 +218,28 @@ def test_multiple_p2p_tensors_get_distinct_transfer_ids():
         _pp_context.clear()
         _pp_context.update(previous_context)
         unpatch_device_type_to_meta()
+
+
+def test_pipeline_action_preserves_overlap_children():
+    with capture_fake_collectives() as recorder:
+        recorder.record_pipeline_action(
+            action_type="OVERLAP_F_B",
+            stage=-1,
+            sub_actions=[
+                {"action_type": "F", "pp_stage": 0, "pp_mb_idx": 3},
+                {"action_type": "B", "pp_stage": 3, "pp_mb_idx": 1},
+            ],
+        )
+
+    assert recorder.timeline_events == [{
+        "event_kind": "schedule_action",
+        "action_type": "OVERLAP_F_B",
+        "pp_stage": -1,
+        "pp_mb_idx": -1,
+        "seq_idx": recorder.timeline_events[0]["seq_idx"],
+        "action_order": 0,
+        "sub_actions": [
+            {"action_type": "F", "pp_stage": 0, "pp_mb_idx": 3},
+            {"action_type": "B", "pp_stage": 3, "pp_mb_idx": 1},
+        ],
+    }]

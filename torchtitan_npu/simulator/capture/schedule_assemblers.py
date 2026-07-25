@@ -7,7 +7,6 @@
 
 from __future__ import annotations
 
-from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Iterable
 
@@ -22,6 +21,9 @@ _PP_DIRECTIONS: dict[str, tuple[str, str]] = {
     "backward_send": ("SEND_B", "send"),
     "backward_recv": ("RECV_B", "recv"),
 }
+_COMPUTE_ACTION_TYPES = {"F", "B", "I", "W"}
+_P2P_ACTION_TYPES = {"SEND_F", "RECV_F", "SEND_B", "RECV_B"}
+_RESIDENCY_ACTION_TYPES = {"UNSHARD", "RESHARD"}
 
 
 @dataclass(slots=True)
@@ -36,6 +38,7 @@ class ActionSpec:
     comm_op_id: int = 0
     comm: CommDetail | None = None
     is_noop: bool = False
+    sub_actions: list[ActionSpec] | None = None
     annotations: dict[str, Any] = field(default_factory=dict)
 
 
@@ -59,6 +62,246 @@ class CapturedTraceAssembler:
         self.comm_events = list(comm_events)
         self.fsdp_residency_events = list(fsdp_residency_events)
         self.rank = rank
+
+    def _schedule_intents(self) -> list[dict[str, Any]]:
+        return sorted(
+            (
+                event
+                for event in self.timeline_events
+                if event.get("event_kind") == "schedule_action"
+            ),
+            key=lambda event: int(
+                event.get("action_order", event.get("seq_idx", 0))
+            ),
+        )
+
+    @staticmethod
+    def _intent_key(intent: dict[str, Any]) -> tuple[int, int, str]:
+        return (
+            int(intent.get("pp_stage", -1)),
+            int(intent.get("pp_mb_idx", -1)),
+            str(intent.get("action_type", "")),
+        )
+
+    @classmethod
+    def _bind_compute_intents(
+        cls,
+        compute_specs: list[ActionSpec],
+        schedule_intents: list[dict[str, Any]],
+    ) -> list[ActionSpec]:
+        compute_intents = [
+            intent
+            for intent in schedule_intents
+            if intent.get("action_type") in _COMPUTE_ACTION_TYPES
+            or intent.get("action_type") == "OVERLAP_F_B"
+        ]
+        if not compute_intents:
+            return compute_specs
+
+        by_key: dict[tuple[int, int, str], list[ActionSpec]] = {}
+        for spec in compute_specs:
+            by_key.setdefault(
+                (spec.stage, spec.mb_idx, spec.comp_type), []
+            ).append(spec)
+
+        def claim(
+            descriptor: dict[str, Any],
+            parent_intent: dict[str, Any],
+        ) -> ActionSpec:
+            key = cls._intent_key(descriptor)
+            candidates = by_key.get(key, [])
+            if not candidates:
+                raise RuntimeError(
+                    "pipeline schedule action was observed without matching "
+                    f"compute execution event: {key}"
+                )
+            spec = candidates.pop(0)
+            intent_order = int(
+                parent_intent.get(
+                    "action_order", parent_intent.get("seq_idx", 0)
+                )
+            )
+            spec.order_key = (intent_order, 0, 0)
+            spec.annotations["capture_schedule_intent"] = True
+            spec.annotations["schedule_intent_order"] = intent_order
+            return spec
+
+        bound: list[ActionSpec] = []
+        for intent in compute_intents:
+            if intent.get("action_type") != "OVERLAP_F_B":
+                bound.append(claim(intent, intent))
+                continue
+
+            child_descriptors = intent.get("sub_actions")
+            if not isinstance(child_descriptors, list) or not child_descriptors:
+                raise RuntimeError(
+                    "OVERLAP_F_B schedule intent has no sub-action descriptors"
+                )
+            children = [
+                claim(child, intent)
+                for child in child_descriptors
+                if isinstance(child, dict)
+            ]
+            if len(children) != len(child_descriptors):
+                raise RuntimeError(
+                    "OVERLAP_F_B schedule intent contains an invalid sub-action"
+                )
+            intent_order = int(
+                intent.get("action_order", intent.get("seq_idx", 0))
+            )
+            bound.append(ActionSpec(
+                action_type="OVERLAP_F_B",
+                stage=-1,
+                mb_idx=-1,
+                seq_idx=int(intent.get("seq_idx", 0)),
+                order_key=(intent_order, 0, 0),
+                sub_actions=children,
+                annotations={
+                    "capture_schedule_intent": True,
+                    "capture_action_order": intent_order,
+                },
+            ))
+
+        unmatched = {
+            key: len(candidates)
+            for key, candidates in by_key.items()
+            if candidates
+        }
+        if unmatched:
+            raise RuntimeError(
+                "pipeline compute executions were observed without matching "
+                f"schedule actions: {unmatched}"
+            )
+        return bound
+
+    @classmethod
+    def _bind_p2p_intents(
+        cls,
+        p2p_specs: list[ActionSpec],
+        schedule_intents: list[dict[str, Any]],
+    ) -> list[ActionSpec]:
+        p2p_intents = [
+            intent
+            for intent in schedule_intents
+            if intent.get("action_type") in _P2P_ACTION_TYPES
+        ]
+        if not p2p_intents:
+            return p2p_specs
+
+        unmatched = list(p2p_specs)
+        for intent in p2p_intents:
+            key = cls._intent_key(intent)
+            matches = [
+                spec
+                for spec in unmatched
+                if (spec.stage, spec.mb_idx, spec.action_type) == key
+            ]
+            if not matches:
+                raise RuntimeError(
+                    "pipeline P2P action was observed without matching "
+                    f"communication event: {key}"
+                )
+            intent_order = int(
+                intent.get("action_order", intent.get("seq_idx", 0))
+            )
+            for tensor_ordinal, spec in enumerate(matches):
+                spec.order_key = (intent_order, 0, tensor_ordinal)
+                spec.annotations["capture_schedule_intent"] = True
+                spec.annotations["schedule_intent_order"] = intent_order
+                unmatched.remove(spec)
+        if unmatched:
+            identities = [
+                (spec.stage, spec.mb_idx, spec.action_type)
+                for spec in unmatched
+            ]
+            raise RuntimeError(
+                "pipeline P2P communication events were observed without "
+                f"matching schedule actions: {identities}"
+            )
+        return p2p_specs
+
+    @staticmethod
+    def _noop_residency_spec(intent: dict[str, Any]) -> ActionSpec:
+        stage = int(intent.get("pp_stage", -1))
+        mb_idx = int(intent.get("pp_mb_idx", -1))
+        action_order = int(
+            intent.get("action_order", intent.get("seq_idx", 0))
+        )
+        return ActionSpec(
+            action_type=str(intent.get("action_type", "")),
+            stage=stage,
+            mb_idx=mb_idx,
+            seq_idx=int(intent.get("seq_idx", 0)),
+            order_key=(action_order, 0, 0),
+            comm=CommDetail(
+                src_stage=stage,
+                dst_stage=stage,
+                mb_idx=mb_idx,
+                is_noop=True,
+            ),
+            is_noop=True,
+            annotations={
+                "capture_schedule_intent": True,
+                "capture_action_order": action_order,
+                "fsdp_intent_noop": True,
+            },
+        )
+
+    @classmethod
+    def _bind_residency_intents(
+        cls,
+        residency_specs: list[ActionSpec],
+        schedule_intents: list[dict[str, Any]],
+    ) -> list[ActionSpec]:
+        residency_intents = [
+            intent
+            for intent in schedule_intents
+            if intent.get("action_type") in _RESIDENCY_ACTION_TYPES
+        ]
+        if not residency_intents:
+            return residency_specs
+
+        matched_intents: set[int] = set()
+        for spec_ordinal, spec in enumerate(residency_specs):
+            event_order = int(
+                spec.annotations.get(
+                    "capture_action_order", spec.order_key[0]
+                )
+            )
+            candidates = [
+                (intent_ordinal, intent)
+                for intent_ordinal, intent in enumerate(residency_intents)
+                if intent.get("action_type") == spec.action_type
+                and int(intent.get("pp_stage", -1)) == spec.stage
+                and int(
+                    intent.get("action_order", intent.get("seq_idx", 0))
+                ) <= event_order
+            ]
+            if not candidates:
+                continue
+            intent_ordinal, intent = max(
+                candidates,
+                key=lambda item: int(
+                    item[1].get(
+                        "action_order", item[1].get("seq_idx", 0)
+                    )
+                ),
+            )
+            matched_intents.add(intent_ordinal)
+            intent_order = int(
+                intent.get("action_order", intent.get("seq_idx", 0))
+            )
+            if spec.action_type == "UNSHARD":
+                spec.order_key = (intent_order, 0, spec_ordinal)
+            spec.annotations["capture_schedule_intent"] = True
+            spec.annotations["schedule_intent_order"] = intent_order
+
+        residency_specs.extend(
+            cls._noop_residency_spec(intent)
+            for intent_ordinal, intent in enumerate(residency_intents)
+            if intent_ordinal not in matched_intents
+        )
+        return residency_specs
 
     @staticmethod
     def _compute_spec(event: dict[str, Any]) -> ActionSpec:
@@ -297,42 +540,30 @@ class CapturedTraceAssembler:
         )
 
     def build(self) -> list[ActionSpec]:
+        schedule_intents = self._schedule_intents()
         compute_events = [
             event
             for event in self.timeline_events
             if event.get("event_kind") != "schedule_action"
         ]
-        specs = [self._compute_spec(event) for event in compute_events]
-        compute_intents = Counter(
-            (
-                int(event.get("pp_stage", -1)),
-                int(event.get("pp_mb_idx", -1)),
-                str(event.get("action_type", "")),
-            )
-            for event in self.timeline_events
-            if event.get("event_kind") == "schedule_action"
-            and event.get("action_type") in {"F", "B", "I", "W"}
-        )
-        observed_compute = Counter(
-            (spec.stage, spec.mb_idx, spec.comp_type)
-            for spec in specs
-        )
-        missing_compute = compute_intents - observed_compute
-        if missing_compute:
-            raise RuntimeError(
-                "pipeline schedule actions were observed without matching "
-                f"compute execution events: {dict(missing_compute)}"
-            )
+        observed_compute_specs = [
+            self._compute_spec(event) for event in compute_events
+        ]
         compute_by_instance = {
             str(spec.annotations["compute_instance_id"]): spec
-            for spec in specs
+            for spec in observed_compute_specs
         }
+        specs = self._bind_compute_intents(
+            observed_compute_specs,
+            schedule_intents,
+        )
 
-        specs.extend(
+        p2p_specs = [
             spec
             for event in self.comm_events
             if (spec := self._p2p_spec(event)) is not None
-        )
+        ]
+        specs.extend(self._bind_p2p_intents(p2p_specs, schedule_intents))
         schedule_residency_events = [
             event
             for event in self.fsdp_residency_events
@@ -367,9 +598,29 @@ class CapturedTraceAssembler:
                 # Actual state loss is the memory release position. The later
                 # explicit RESHARD call may already be a no-op.
                 merged_residency_events[key] = event
-        specs.extend(
+        captured_alloc_transitions = {
+            event.transition_id
+            for event in merged_residency_events.values()
+            if event.action == "alloc" and event.transition_id
+        }
+        merged_residency_events = {
+            key: event
+            for key, event in merged_residency_events.items()
+            if not (
+                event.action == "free"
+                and event.transition_id
+                and event.transition_id not in captured_alloc_transitions
+            )
+        }
+        residency_specs = [
             self._residency_spec(event, compute_by_instance, ordinal)
             for ordinal, event in enumerate(merged_residency_events.values())
+        ]
+        specs.extend(
+            self._bind_residency_intents(
+                residency_specs,
+                schedule_intents,
+            )
         )
         reduce_intents = [
             event
@@ -420,8 +671,13 @@ class CapturedTraceAssembler:
             for ordinal, event in enumerate(reduce_comm_events)
             if event.event_id not in matched_reduce_event_ids
         )
-        for spec in specs:
+        def annotate(spec: ActionSpec) -> None:
             spec.annotations.setdefault("capture_process_rank", self.rank)
+            for child in spec.sub_actions or []:
+                annotate(child)
+
+        for spec in specs:
+            annotate(spec)
         return sorted(specs, key=lambda spec: spec.order_key)
 
 

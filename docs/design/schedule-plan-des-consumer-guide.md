@@ -8,6 +8,9 @@
 > `capture_schema_version = 2` 的权威输入契约、依赖重建顺序和禁止兜底项见
 > [`schedule-plan-dependency-reconstruction-contract.md`](./schedule-plan-dependency-reconstruction-contract.md)。
 > 本文保留更详细的 DES 状态机和内存消费说明；若两者冲突，以契约文档为准。
+>
+> DualPipeV 的虚拟 stage、overlap parent/sub-action 以及串行降级接入规则见
+> [`dualpipev-schedule-plan-consumer-guide.md`](./dualpipev-schedule-plan-consumer-guide.md)。
 
 ## 1. 消费端目标
 
@@ -35,7 +38,10 @@ WorkloadGraph.schedule_plan: SchedulePlan
 本次 step 的全部 plan，再统一构建跨 rank communication matcher。
 
 `ir_export/schedule_plan.csv` 是相同结构的可读导出，适合检查和调试。进程内集成应优先直接使用
-`SchedulePlan` 对象，避免重新解析 CSV 中的列表和 annotation 字符串。
+`SchedulePlan` 对象，避免重新解析 CSV 中的列表和 annotation 字符串。CSV 中
+`parent_action_id` 为空的 action 才是顶层发布单元；非空行是 overlap 子动作，只用于建立
+完整 action 索引和解析 DataSlot 引用。该文件包含 action 和 DataSlot 两个连续 section；
+遇到第二个 `slot_id,kind,...` header 后必须切换 schema，不能继续按 action 行解析。
 
 消费端需要读取四类对象：
 
@@ -63,7 +69,8 @@ world。此时一份 stage plan 是具有相同 PP 坐标的逻辑 rank 的执�
 
 如果上层 DES 需要展开完整 logical world：
 
-1. 从 RankTable 的 `rank_coordinates` 找到 `pp == action.stage` 的所有逻辑 rank。
+1. 从 RankTable 的 `rank_coordinates` 找到
+   `pp == plan.annotations["capture_process_rank"]` 的所有逻辑 rank。
 2. 为每个逻辑 rank 克隆该 stage 的 action 和 DataSlot instance。
 3. 克隆后的 ID 必须带逻辑 rank 命名空间，例如 `g17:r1_a4`、`g17:r1_slot_8`。
 4. 重写每个 clone 内部的 producer/consumer/consumes/produces 引用。

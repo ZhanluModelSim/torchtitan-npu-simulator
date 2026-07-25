@@ -95,29 +95,86 @@ def backward_maybe_with_nosync(
     """
 
     def stage_backward_input_compatible_with_meta():
-        stage_outputs = bwd_kwargs["stage_output"]
+        original_stage_outputs = bwd_kwargs["stage_output"]
+        stage_outputs = original_stage_outputs
         try:
             from torchtitan_npu.simulator.meta_env import _is_meta_simulation
         except ImportError:
             _is_meta_simulation = False
         if _is_meta_simulation:
-            # PyTorch ends stage_backward_input with t.detach_(). A pipeline
-            # stage is allowed to return a view, but views reject in-place
-            # detach. A meta clone preserves the autograd edge and shape
-            # semantics without allocating storage.
+            # PyTorch detaches stage outputs after the input-gradient pass.
+            # Keep the original graph for the simulator's direct W replay and
+            # let upstream detach these zero-storage clones instead.
             stage_outputs = [
                 output.clone()
-                if isinstance(output, torch.Tensor)
-                and getattr(output, "_base", None) is not None
-                else output
+                if isinstance(output, torch.Tensor) else output
                 for output in stage_outputs
             ]
-        return stage_backward_input(
+        dinputs, param_groups = stage_backward_input(
             stage_outputs,
             bwd_kwargs["output_grads"],
             bwd_kwargs["input_values"],
             self.submod.parameters(),
         )
+        if _is_meta_simulation:
+            # PyTorch 2.12's split-W helper reconstructs GradientEdge objects
+            # from internal autograd Nodes. Some meta/custom Function nodes no
+            # longer expose the legacy _input_metadata attribute required by
+            # that path. Tensor-rooted autograd.grad is public API and yields
+            # the same parameter gradients without depending on Node internals.
+            param_groups = [{
+                "_simulator_stage_outputs": original_stage_outputs,
+                "_simulator_output_grads": bwd_kwargs["output_grads"],
+            }]
+        return dinputs, param_groups
+
+    def stage_backward_weight_compatible_with_meta():
+        params = tuple(self.submod.parameters())
+        param_groups = bwd_kwargs["param_groups"]
+        simulator_group = (
+            param_groups[0]
+            if param_groups
+            and "_simulator_stage_outputs" in param_groups[0]
+            else None
+        )
+        if simulator_group is None:
+            return stage_backward_weight(iter(params), param_groups)
+
+        outputs = tuple(
+            output
+            for output in simulator_group["_simulator_stage_outputs"]
+            if isinstance(output, torch.Tensor) and output.requires_grad
+        )
+        output_grads = simulator_group["_simulator_output_grads"]
+        if output_grads is None:
+            grad_outputs = tuple(torch.ones_like(output) for output in outputs)
+        else:
+            grad_outputs = tuple(
+                grad
+                for output, grad in zip(
+                    simulator_group["_simulator_stage_outputs"],
+                    output_grads,
+                    strict=True,
+                )
+                if isinstance(output, torch.Tensor) and output.requires_grad
+            )
+        trainable = tuple(param for param in params if param.requires_grad)
+        previous_grads = tuple(param.grad for param in params)
+        if outputs and trainable:
+            dweights = torch.autograd.grad(
+                outputs,
+                trainable,
+                grad_outputs=grad_outputs,
+                allow_unused=True,
+            )
+            for param, grad in zip(trainable, dweights, strict=True):
+                if grad is None:
+                    continue
+                if param.grad is None:
+                    param.grad = grad
+                else:
+                    param.grad += grad
+        return previous_grads
 
     def perform_backward(
         backward_type,
@@ -138,7 +195,7 @@ def backward_maybe_with_nosync(
             return stage_backward_input_compatible_with_meta
         elif backward_type == "weight":
             return lambda: (
-                stage_backward_weight(self.submod.parameters(), bwd_kwargs["param_groups"]),
+                stage_backward_weight_compatible_with_meta(),
                 None,
             )
         else:

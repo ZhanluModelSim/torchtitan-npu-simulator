@@ -93,6 +93,109 @@ def test_schedule_compute_intent_without_execution_fails_fast() -> None:
         )
 
 
+def test_dualpipe_overlap_intent_groups_observed_compute_children() -> None:
+    overlap_intent = {
+        "event_kind": "schedule_action",
+        "action_type": "OVERLAP_F_B",
+        "pp_stage": -1,
+        "pp_mb_idx": -1,
+        "seq_idx": 10,
+        "action_order": 4,
+        "sub_actions": [
+            {"action_type": "F", "pp_stage": 0, "pp_mb_idx": 3},
+            {"action_type": "B", "pp_stage": 3, "pp_mb_idx": 1},
+        ],
+    }
+    forward = _timeline(0, "F", 3, 20, 21)
+    forward["action_order"] = 5
+    backward = _timeline(3, "B", 1, 30, 31)
+    backward["action_order"] = 6
+
+    plan = build_schedule_plan(
+        step_templates={
+            "s0_F": StepGraph("s0_F", "F", {}),
+            "s3_B": StepGraph("s3_B", "B", {}),
+        },
+        rank_table=_RankTable(),
+        comm_events=[],
+        timeline_events=[overlap_intent, forward, backward],
+        pipeline_schedule="DualPipeV",
+        rank=0,
+        captured_trace_primary=True,
+    )
+
+    overlap = next(
+        action
+        for action in plan.actions
+        if action.action_type == "OVERLAP_F_B"
+    )
+    assert [(child.stage, child.mb_idx, child.comp_type) for child in overlap.sub_actions] == [
+        (0, 3, "F"),
+        (3, 1, "B"),
+    ]
+    assert all(
+        child.schedule_order == overlap.schedule_order
+        for child in overlap.sub_actions
+    )
+    assert not any(
+        action.action_type == "COMPUTE"
+        for action in plan.actions
+    )
+
+
+def test_runtime_fsdp_intents_without_fsdp_module_remain_explicit_noops() -> None:
+    forward = _timeline(0, "F", 0, 20, 21)
+    forward["action_order"] = 1
+    plan = build_schedule_plan(
+        step_templates={"s0_F": StepGraph("s0_F", "F", {})},
+        rank_table=_RankTable(),
+        comm_events=[],
+        timeline_events=[
+            {
+                "event_kind": "schedule_action",
+                "action_type": "UNSHARD",
+                "pp_stage": 0,
+                "pp_mb_idx": -1,
+                "seq_idx": 10,
+                "action_order": 0,
+            },
+            {
+                "event_kind": "schedule_action",
+                "action_type": "F",
+                "pp_stage": 0,
+                "pp_mb_idx": 0,
+                "seq_idx": 19,
+                "action_order": 1,
+            },
+            forward,
+            {
+                "event_kind": "schedule_action",
+                "action_type": "RESHARD",
+                "pp_stage": 0,
+                "pp_mb_idx": -1,
+                "seq_idx": 30,
+                "action_order": 2,
+            },
+        ],
+        pipeline_schedule="DualPipeV",
+        rank=0,
+        captured_trace_primary=True,
+    )
+
+    assert [action.action_type for action in plan.actions] == [
+        "UNSHARD",
+        "COMPUTE",
+        "RESHARD",
+    ]
+    noops = [
+        action
+        for action in plan.actions
+        if action.action_type in {"UNSHARD", "RESHARD"}
+    ]
+    assert all(action.is_noop for action in noops)
+    assert all(not action.consumes and not action.produces for action in noops)
+
+
 def _p2p(
     event_id: str,
     direction: str,
@@ -911,3 +1014,148 @@ def test_fsdp_transition_id_matches_allgather_without_order_guessing() -> None:
         if action.action_type == "UNSHARD"
     }
     assert matched == {"group-a": 930, "group-b": 931}
+
+
+def test_overlapping_fsdp_prefetches_pair_by_transition_and_parent_compute() -> None:
+    nodes = {
+        op_id: OpNode(
+            op_id=op_id,
+            op_type="allgather",
+            inputs=[],
+            outputs=[],
+            attrs={},
+            predecessors=[],
+            successors=[],
+            annotations={"raw_op_type": "comm.allgather"},
+        )
+        for op_id in (940, 941)
+    }
+    templates = {"s0_F": StepGraph("s0_F", "F", nodes)}
+    comm_events = [
+        CommEvent(
+            event_id=f"allgather-{mb_idx}",
+            comm_primitive="allgather",
+            group_name="fsdp",
+            world_size=2,
+            tensor_shape=(128,),
+            dtype="bfloat16",
+            volume_bytes=256,
+            op_id=940 + mb_idx,
+            comm_layer="L2",
+            p2p_stage=0,
+            p2p_mb_idx=mb_idx,
+            comp_type="F",
+            seq_idx=10 + mb_idx,
+            fsdp_group_id="shared-group",
+            fsdp_transition_id=f"transition-{mb_idx}",
+        )
+        for mb_idx in range(2)
+    ]
+    residency = []
+    for mb_idx, (alloc_order, free_order) in enumerate(((0, 3), (1, 5))):
+        residency.extend(
+            [
+                FSDPResidencyEvent(
+                    group_id="shared-group",
+                    action="alloc",
+                    seq_idx=10 + mb_idx,
+                    phase="forward",
+                    num_bytes=256,
+                    pp_stage=0,
+                    pp_mb_idx=mb_idx,
+                    comp_type="F",
+                    parent_compute_instance_id=f"s0_F_mb{mb_idx}",
+                    shard_world_size=2,
+                    transition_id=f"transition-{mb_idx}",
+                    action_order=alloc_order,
+                ),
+                FSDPResidencyEvent(
+                    group_id="shared-group",
+                    action="free",
+                    seq_idx=20 + mb_idx,
+                    phase="forward",
+                    num_bytes=256,
+                    pp_stage=0,
+                    pp_mb_idx=mb_idx,
+                    comp_type="F",
+                    parent_compute_instance_id=f"s0_F_mb{mb_idx}",
+                    shard_world_size=2,
+                    transition_id=f"transition-{mb_idx}",
+                    action_order=free_order,
+                ),
+            ]
+        )
+    timelines = [
+        _timeline(0, "F", 0, 30, 31),
+        _timeline(0, "F", 1, 40, 41),
+    ]
+    timelines[0]["action_order"] = 2
+    timelines[1]["action_order"] = 4
+
+    plan = build_schedule_plan(
+        step_templates=templates,
+        rank_table=_RankTable(pp=1, dp_shard=2),
+        comm_events=comm_events,
+        fsdp_residency_events=residency,
+        timeline_events=timelines,
+        pipeline_schedule="custom",
+        rank=0,
+    )
+
+    unshards = [
+        action for action in plan.actions if action.action_type == "UNSHARD"
+    ]
+    assert len(unshards) == 2
+    for unshard in unshards:
+        transition_id = unshard.annotations["fsdp_transition_id"]
+        expected_mb = int(transition_id.rsplit("-", 1)[1])
+        param_slot = plan.data_slots[unshard.produces[0]]
+        consumer = plan.action_map[param_slot.consumer_action_ids[0]]
+        assert consumer.comp_type == "F"
+        assert consumer.mb_idx == expected_mb
+
+    reshards = [
+        action for action in plan.actions if action.action_type == "RESHARD"
+    ]
+    for reshard in reshards:
+        transition_id = reshard.annotations["fsdp_transition_id"]
+        expected_mb = int(transition_id.rsplit("-", 1)[1])
+        control_slot = plan.data_slots[reshard.consumes[0]]
+        producer = plan.action_map[control_slot.producer_action_id]
+        assert producer.comp_type == "F"
+        assert producer.mb_idx == expected_mb
+
+
+def test_free_only_fsdp_transition_does_not_create_l2_residency_action() -> None:
+    timeline = _timeline(0, "F", 0, 10, 20)
+    timeline["action_order"] = 0
+    plan = build_schedule_plan(
+        step_templates={"s0_F": StepGraph("s0_F", "F", {})},
+        rank_table=_RankTable(pp=1, dp_shard=2),
+        comm_events=[],
+        fsdp_residency_events=[
+            FSDPResidencyEvent(
+                group_id="cleanup-group",
+                action="free",
+                seq_idx=30,
+                phase="backward",
+                num_bytes=256,
+                pp_stage=0,
+                pp_mb_idx=0,
+                comp_type="W",
+                parent_compute_instance_id="",
+                shard_world_size=2,
+                transition_id="transition-outside-step",
+                action_order=1,
+                schedule_source="state",
+            )
+        ],
+        timeline_events=[timeline],
+        pipeline_schedule="custom",
+        rank=0,
+    )
+
+    assert all(
+        action.action_type not in {"UNSHARD", "RESHARD"}
+        for action in plan.actions
+    )

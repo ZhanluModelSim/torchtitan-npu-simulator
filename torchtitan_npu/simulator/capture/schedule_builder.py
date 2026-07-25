@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import itertools
 import uuid
+from collections import defaultdict
 from typing import Any, Iterator
 
 from torchtitan_npu.simulator.capture.comm_events import CommEvent
@@ -253,11 +254,17 @@ def build_schedule_plan(
             fsdp_residency_events=fsdp_residency_events,
             rank=rank,
         ).build()
-        for schedule_order, spec in enumerate(specs):
+
+        def materialize_spec(
+            spec: Any,
+            schedule_order: int,
+        ) -> ScheduleAction:
             action_id = next(_action_seq)
-            actions.append(ScheduleAction(
-                id=f"{action_id}", action_id=f"r{rank}_a{action_id}", rank=rank,
-                stage=spec.stage if spec.stage >= 0 else rank,
+            action = ScheduleAction(
+                id=f"{action_id}",
+                action_id=f"r{rank}_a{action_id}",
+                rank=rank,
+                stage=spec.stage if spec.stage >= 0 else -1,
                 mb_idx=spec.mb_idx,
                 action_type=spec.action_type,
                 comp_type=spec.comp_type,
@@ -268,7 +275,16 @@ def build_schedule_plan(
                 comm=spec.comm,
                 is_noop=spec.is_noop,
                 annotations=dict(spec.annotations),
-            ))
+            )
+            if spec.sub_actions:
+                action.sub_actions = [
+                    materialize_spec(child, schedule_order)
+                    for child in spec.sub_actions
+                ]
+            return action
+
+        for schedule_order, spec in enumerate(specs):
+            actions.append(materialize_spec(spec, schedule_order))
     elif plan_obj and rank in plan_obj:
         # runtime schedule: lower the plan for this rank
         for i, a in enumerate(plan_obj[rank]):
@@ -579,6 +595,13 @@ def build_schedule_plan(
                 return tid
         return ""
 
+    compute_by_instance_id = {
+        str(action.annotations["compute_instance_id"]): action
+        for action in iter_actions(actions)
+        if action.action_type == "COMPUTE"
+        and action.annotations.get("compute_instance_id")
+    }
+
     for a in actions:
         if a.action_type != "UNSHARD":
             continue
@@ -647,17 +670,32 @@ def build_schedule_plan(
         else:
             _mark_fsdp_noop_or_raise(a, s)
             continue
-        # consumer = next COMPUTE on that stage after this unshard
-        cons = None
-        for ca in iter_actions(actions):
-            if (ca.action_type == "COMPUTE" and ca.stage == s
-                    and _schedule_order(ca) >= _schedule_order(a) and ca is not a):
-                if cons is None or _action_position(ca) < _action_position(cons):
-                    cons = ca
+        parent_instance_id = str(
+            a.annotations.get("parent_compute_instance_id", "")
+        )
+        cons = compute_by_instance_id.get(parent_instance_id)
+        if parent_instance_id and cons is None:
+            raise RuntimeError(
+                f"UNSHARD action {a.action_id} references missing parent compute "
+                f"{parent_instance_id!r}"
+            )
+        if cons is None:
+            # Compatibility for legacy residency events without parent identity.
+            for ca in iter_actions(actions):
+                if (ca.action_type == "COMPUTE" and ca.stage == s
+                        and _schedule_order(ca) >= _schedule_order(a) and ca is not a):
+                    if cons is None or _action_position(ca) < _action_position(cons):
+                        cons = ca
         if cons is None:
             raise RuntimeError(
                 f"UNSHARD action {a.action_id} on stage {s} has real communication "
                 "but no following compute consumer"
+            )
+        if cons.stage != s or _schedule_order(cons) < _schedule_order(a):
+            raise RuntimeError(
+                f"UNSHARD action {a.action_id} has invalid parent compute "
+                f"{cons.action_id} at stage={cons.stage}, "
+                f"order={cons.schedule_order}"
             )
         slot = DataSlot(
             slot_id=_slot_id(rank), kind="param_full", shape=shape, dtype=dtype, volume_bytes=bytes_,
@@ -674,29 +712,33 @@ def build_schedule_plan(
             src_exit_op=src_exit, dst_entry_op=dst_entry,
             slot_id=slot.slot_id, comm_op_id=a.comm_op_id, is_noop=a.is_noop,
         )
-    active_unshards: dict[tuple[int, str], ScheduleAction] = {}
+    active_unshards_by_transition: dict[str, ScheduleAction] = {}
+    legacy_active_unshards: dict[
+        tuple[int, str], list[ScheduleAction]
+    ] = defaultdict(list)
     for a in actions:
         s = a.stage if a.stage >= 0 else rank
         group_id = str(a.annotations.get("fsdp_group_id", "__stage__"))
         residency_key = (s, group_id)
+        transition_id = str(a.annotations.get("fsdp_transition_id", ""))
         if a.action_type == "UNSHARD":
-            if residency_key in active_unshards:
-                previous = active_unshards[residency_key]
-                raise RuntimeError(
-                    f"UNSHARD action {a.action_id} duplicates active FSDP residency "
-                    f"for stage {s}, group {group_id}; previous="
-                    f"(action={previous.action_id}, order={previous.schedule_order}, "
-                    f"transition={previous.annotations.get('fsdp_transition_id', '')}, "
-                    f"parent={previous.annotations.get('parent_compute_instance_id', '')}); "
-                    f"current=(order={a.schedule_order}, "
-                    f"transition={a.annotations.get('fsdp_transition_id', '')}, "
-                    f"parent={a.annotations.get('parent_compute_instance_id', '')})"
-                )
-            active_unshards[residency_key] = a
+            if transition_id:
+                previous = active_unshards_by_transition.get(transition_id)
+                if previous is not None:
+                    raise RuntimeError(
+                        f"UNSHARD action {a.action_id} duplicates FSDP transition "
+                        f"{transition_id}; previous action={previous.action_id}"
+                    )
+                active_unshards_by_transition[transition_id] = a
+            else:
+                legacy_active_unshards[residency_key].append(a)
             continue
         if a.action_type != "RESHARD":
             continue
         if bool(a.annotations.get("fsdp_intent_noop", False)):
+            legacy_queue = legacy_active_unshards.get(residency_key, [])
+            if legacy_queue:
+                legacy_queue.pop(0)
             a.is_noop = True
             a.comm = CommDetail(
                 src_stage=s,
@@ -705,7 +747,13 @@ def build_schedule_plan(
                 is_noop=True,
             )
             continue
-        unshard = active_unshards.pop(residency_key, None)
+        if transition_id:
+            unshard = active_unshards_by_transition.pop(
+                transition_id, None
+            )
+        else:
+            legacy_queue = legacy_active_unshards.get(residency_key, [])
+            unshard = legacy_queue.pop(0) if legacy_queue else None
         if unshard is None:
             captured_residency = [
                 (
@@ -721,7 +769,8 @@ def build_schedule_plan(
             ]
             raise RuntimeError(
                 f"RESHARD action {a.action_id} on stage {s}, group {group_id} "
-                "has no active preceding UNSHARD; captured residency actions="
+                f"with transition {transition_id!r} has no active preceding "
+                "UNSHARD; captured residency actions="
                 f"{captured_residency}"
             )
         if unshard.is_noop:
@@ -730,18 +779,38 @@ def build_schedule_plan(
             continue
 
         # Reshard may follow forward or backward depending on FSDP policy.
-        prod = None
-        for ca in iter_actions(actions):
-            if (ca.action_type == "COMPUTE" and ca.stage == s
-                    and ca.comp_type in ("F", "B", "I", "W")
-                    and _schedule_order(ca) >= _schedule_order(unshard)
-                    and _schedule_order(ca) <= _schedule_order(a)):
-                if prod is None or _action_position(ca) > _action_position(prod):
-                    prod = ca
+        parent_instance_id = str(
+            a.annotations.get("parent_compute_instance_id", "")
+        )
+        prod = compute_by_instance_id.get(parent_instance_id)
+        if parent_instance_id and prod is None:
+            raise RuntimeError(
+                f"RESHARD action {a.action_id} references missing parent compute "
+                f"{parent_instance_id!r}"
+            )
+        if prod is None:
+            # Compatibility for legacy residency events without parent identity.
+            for ca in iter_actions(actions):
+                if (ca.action_type == "COMPUTE" and ca.stage == s
+                        and ca.comp_type in ("F", "B", "I", "W")
+                        and _schedule_order(ca) >= _schedule_order(unshard)
+                        and _schedule_order(ca) <= _schedule_order(a)):
+                    if prod is None or _action_position(ca) > _action_position(prod):
+                        prod = ca
         if prod is None:
             raise RuntimeError(
                 f"RESHARD action {a.action_id} on stage {s} has an active full parameter "
                 "but no preceding compute producer"
+            )
+        if (
+            prod.stage != s
+            or _schedule_order(prod) < _schedule_order(unshard)
+            or _schedule_order(prod) > _schedule_order(a)
+        ):
+            raise RuntimeError(
+                f"RESHARD action {a.action_id} has invalid parent compute "
+                f"{prod.action_id} at stage={prod.stage}, "
+                f"order={prod.schedule_order}"
             )
         slot = DataSlot(
             slot_id=_slot_id(rank), kind="control", volume_bytes=0,
@@ -751,10 +820,19 @@ def build_schedule_plan(
         )
         add_slot(slot)
 
-    if active_unshards:
+    unresolved_actions = list(active_unshards_by_transition.values())
+    unresolved_actions.extend(
+        action
+        for queue in legacy_active_unshards.values()
+        for action in queue
+    )
+    if unresolved_actions:
         unresolved = ", ".join(
-            f"stage={stage}/group={group_id}/action={action.action_id}"
-            for (stage, group_id), action in active_unshards.items()
+            f"stage={action.stage}/group="
+            f"{action.annotations.get('fsdp_group_id', '')}/transition="
+            f"{action.annotations.get('fsdp_transition_id', '')}/"
+            f"action={action.action_id}"
+            for action in unresolved_actions
         )
         raise RuntimeError(f"UNSHARD actions without matching RESHARD: {unresolved}")
 
@@ -876,6 +954,7 @@ def build_schedule_plan(
         plan,
         strict_1f1b=(
             is_captured_trace
+            and pipeline_schedule.lower() == "1f1b"
             and {"F", "B"} <= trace_compute_types
             and trace_compute_types <= {"F", "B"}
         ),
