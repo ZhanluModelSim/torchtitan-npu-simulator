@@ -78,6 +78,20 @@ class DeepSeekV4TNDTest(unittest.TestCase):
         self.assertEqual(attention_masks.max_seqlen_q, 4)
         self.assertEqual(attention_masks.max_seqlen_cmp_kv, {4: 1, 128: 0})
 
+    def test_tnd_ratio4_aligns_blocks_to_request_local_positions(self):
+        positions = torch.arange(1, 4097, dtype=torch.int32)
+        model_args = SimpleNamespace(
+            compress_ratios=(4,),
+            mtp_layer_compress_ratio=1,
+            num_mtp_modules=0,
+            use_global_tnd=True,
+        )
+        attention_masks = build_smla_attention_masks(positions, model_args)
+        torch.testing.assert_close(
+            attention_masks.block_starts_by_ratio[4],
+            torch.arange(0, 4096, 4, dtype=torch.int64),
+        )
+
     def test_tnd_ratio4_reuses_supplied_compressor_block_starts(self):
         from torchtitan_npu.models.deepseek_v4 import model as deepseek_model
 

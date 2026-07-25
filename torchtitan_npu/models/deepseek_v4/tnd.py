@@ -84,13 +84,28 @@ def _request_layout_from_positions(
     return _SMLARequestLayout(flat_positions, starts, ends, lengths, seq_len)
 
 
-def _tnd_compressed_block_starts(flat_positions: torch.Tensor, ratio: int) -> torch.Tensor:
-    token_indices = torch.arange(flat_positions.numel(), device=flat_positions.device)
+def _tnd_compressed_block_starts(
+    flat_positions: torch.Tensor,
+    ratio: int,
+    token_indices: torch.Tensor,
+    local_offsets: torch.Tensor,
+) -> torch.Tensor:
+    """Return full compressor blocks aligned to each request's local offset.
+
+    ``positions`` are absolute RoPE positions and a fixed dataloader window may
+    begin in the middle of a document.  Compression, however, follows the
+    same local ``[0:ratio]`` grouping as the BSND path.  Therefore block
+    alignment must be reset at every request boundary instead of using
+    ``flat_positions % ratio``.
+    """
+    if flat_positions.numel() == 0:
+        return flat_positions.new_empty((0,), dtype=torch.long)
+
     end_indices = token_indices + ratio - 1
     end_in_range = end_indices < flat_positions.numel()
     clamped_end_indices = end_indices.clamp_max(flat_positions.numel() - 1)
     end_positions = flat_positions[clamped_end_indices]
-    block_starts = flat_positions.remainder(ratio).eq(0) & end_in_range & end_positions.eq(flat_positions + ratio - 1)
+    block_starts = local_offsets.remainder(ratio).eq(0) & end_in_range & end_positions.eq(flat_positions + ratio - 1)
     return torch.nonzero(block_starts, as_tuple=False).flatten()
 
 
@@ -127,8 +142,16 @@ def build_smla_attention_masks(
             num_mtp_modules=0 if positions_are_tnd else model_args.num_mtp_modules,
         )
         actual_seq_q = request_layout.lengths.to(device=device)
+        token_indices = torch.arange(request_layout.flat_positions.numel(), device=device)
+        request_ids = torch.searchsorted(request_layout.starts, token_indices, right=True) - 1
+        local_offsets = token_indices - request_layout.starts[request_ids]
         block_starts_by_ratio = {
-            ratio: _tnd_compressed_block_starts(request_layout.flat_positions, ratio).contiguous()
+            ratio: _tnd_compressed_block_starts(
+                request_layout.flat_positions,
+                ratio,
+                token_indices,
+                local_offsets,
+            ).contiguous()
             for ratio in residual_cmp_ratios
         }
         cmp_lengths = {

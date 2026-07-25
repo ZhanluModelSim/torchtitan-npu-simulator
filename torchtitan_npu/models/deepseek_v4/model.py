@@ -249,7 +249,11 @@ class Compressor(Module):
             overlap_kv[1:, :ratio] = kv[:-1, :, : self.head_dim]
             overlap_score[1:, :ratio] = score[:-1, :, : self.head_dim]
 
-            has_prev_block = flat_positions[block_starts].ge(ratio).view(-1, 1, 1)
+            block_positions = flat_positions[block_starts]
+            previous_indices = (block_starts - ratio).clamp_min(0)
+            has_prev_block = (
+                block_starts.ge(ratio) & flat_positions[previous_indices].eq(block_positions - ratio)
+            ).view(-1, 1, 1)
             overlap_kv[:, :ratio] = torch.where(
                 has_prev_block,
                 overlap_kv[:, :ratio],
