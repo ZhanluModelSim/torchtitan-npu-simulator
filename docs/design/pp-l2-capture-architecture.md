@@ -21,6 +21,12 @@ the same semantic interfaces:
 These interfaces are the capture boundary. TorchTitan's lowered schedule is
 useful for validation, but is not the primary L2 source.
 
+Communication is normalized before export according to
+[`communication-ownership-contract.md`](./communication-ownership-contract.md).
+Communication inside a compute span belongs to its immutable L1 template.
+Only PP transfers, external FSDP prefetch, and genuinely standalone
+collectives remain in L2.
+
 ## 2. Rank Identities
 
 A `multi_proc_meta` worker has two rank identities:
@@ -106,10 +112,10 @@ Memory replay uses state events, not intent events.
 
 Some runtime schedules contain `REDUCE_GRAD` even when the meta execution path
 does not issue a collective. Capture records the schedule intent independently
-from communication. If a matching collective is observed, both become one
-action. Otherwise L2 exports an explicit no-op action with no DataSlot, so it
-preserves schedule shape without blocking replay. The optimizer then depends
-directly on the last real local gradient producer.
+from communication. Ownership normalization removes a no-op intent. It also
+removes the L2 action when the real collective is already captured in B/I/W.
+The optimizer then depends directly on the last real local gradient producer.
+A real collective outside every compute template remains a REDUCE_GRAD action.
 
 ### Ordering
 
@@ -126,6 +132,7 @@ events. It is not a cross-rank clock and must not be used as transfer identity.
 ```text
 semantic events
     -> CapturedTraceAssembler
+    -> communication ownership plugins
     -> ordered ScheduleAction list
     -> typed DataSlot dependencies
     -> validation
@@ -152,12 +159,12 @@ consumers to understand capture internals.
 - RECV_F -> local forward;
 - forward -> forward state -> corresponding backward;
 - RECV_B -> local backward;
-- unshard -> full parameter -> owning compute;
-- owning compute -> control dependency -> reshard;
-- backward -> local gradient -> reduction -> optimizer.
+- external prefetch unshard -> full parameter -> owning compute;
+- owning compute -> control dependency -> external prefetch reshard;
+- standalone backward reduction -> optimizer.
 
-Size-one FSDP groups and schedule-only actions without real work create explicit
-no-op actions and no blocking DataSlot. A real unshard without a compute
+Size-one FSDP groups and schedule-only actions without real work are omitted
+and create no blocking DataSlot. A real external unshard without a compute
 consumer, or a real reshard without an active unshard and preceding compute, is
 an error.
 

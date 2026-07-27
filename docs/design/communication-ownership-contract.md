@@ -1,0 +1,123 @@
+# Communication Ownership Contract
+
+## 1. Boundary
+
+The simulator exports immutable L1 `StepGraph` templates and an L2
+`SchedulePlan`. Communication ownership is decided before either artifact is
+exported. The downstream predictor or DES must not move communication between
+these layers.
+
+Ownership is semantic and schedule-independent:
+
+| Observed behavior | Owner | Export |
+| --- | --- | --- |
+| communication executes inside F/B/I/W | `L1_STAGE` | node in the referenced compute template |
+| PP send/receive between stages | `L2_PIPELINE` | SEND/RECV action plus a dedicated communication fragment |
+| FSDP prefetch issued outside compute | `L2_PREFETCH` | UNSHARD/RESHARD actions and residency slots |
+| standalone gradient collective | `L2_STANDALONE` | REDUCE_GRAD action |
+| schedule intent without real work | none | omitted |
+
+The capture implementation must not branch on `1F1B`, `DualPipeV`, or another
+schedule name. It determines ownership from the real communication node,
+compute span, FSDP transition identity, and explicit schedule intent.
+
+## 2. L1 Stage Communication
+
+All communication nodes in a compute template are part of that template's
+cost and dependency graph. This includes:
+
+- TP, CP, and EP collectives;
+- FSDP all-gather triggered while entering F/B/I/W;
+- FSDP or DDP gradient reduction triggered inside B/I/W.
+
+Each such node has:
+
+```text
+annotations.communication_owner = L1_STAGE
+```
+
+When repeated microbatches have different communication shapes, capture emits
+immutable variants such as:
+
+```text
+s0_F
+s0_F__comm_v1
+```
+
+Every compute action references the correct variant through `template_ref`.
+The downstream system predicts and replays each referenced template as-is.
+
+Independent stage-local collectives are connected to the compute entries that
+need their results. Multiple independent FSDP groups remain parallel unless
+the captured graph records a dependency between them.
+
+## 3. L2 Communication
+
+### Pipeline P2P
+
+PP P2P never remains in F/B/I/W. It is extracted into an immutable fragment
+and represented by SEND/RECV plus `transfer_id`. Cross-rank reconstruction
+still joins endpoints by `transfer_id`.
+
+### External FSDP prefetch
+
+An FSDP all-gather remains in L2 only when the schedule issued it outside the
+owning compute span. It is exported as:
+
+```text
+UNSHARD -> param_full -> COMPUTE -> control -> RESHARD
+```
+
+The pair has `communication_owner=L2_PREFETCH`. `RESHARD` closes full-parameter
+residency; it is not a gradient reduce-scatter.
+
+### Standalone gradient reduction
+
+A real reduction outside all compute templates remains:
+
+```text
+B/W -> grad_local -> REDUCE_GRAD -> grad_reduced -> OPTIMIZER
+```
+
+It has `communication_owner=L2_STANDALONE`. If the real collective is already
+inside B/I/W, no L2 REDUCE_GRAD is exported. A no-op REDUCE_GRAD intent is also
+omitted, and the optimizer depends on the last local gradient producer.
+
+## 4. Consumer Rules
+
+For each COMPUTE action:
+
+1. resolve `plan.step_templates[action.template_ref]`;
+2. replay every node in that graph, including `L1_STAGE` communication;
+3. do not synthesize FSDP communication from the schedule name;
+4. do not add L2 communication for a collective already in the template.
+
+For each explicit L2 communication action, replay only its own communication
+fragment or `CommDetail`. L2 controls pipeline order, external prefetch, and
+standalone collectives. It does not edit an already predicted L1 template.
+
+The plan annotation `communication_ownership` reports:
+
+```text
+internal_fsdp_transitions
+external_fsdp_prefetches
+generated_l1_templates
+internal_gradient_reductions
+external_gradient_reductions
+removed_noop_gradient_intents
+stage_owned_collectives
+```
+
+## 5. Acceptance Checks
+
+For 1F1B and DualPipeV with `reshard_after_forward=always`:
+
+1. later microbatch F/B/I/W templates contain expected FSDP all-gather nodes;
+2. compute actions reference the matching communication variant;
+3. only explicit prefetch transitions remain as L2 UNSHARD/RESHARD;
+4. reduce-scatter in B/I/W has no duplicate L2 REDUCE_GRAD;
+5. PP P2P is absent from compute templates and present in SEND/RECV fragments;
+6. all non-external DataSlots have a producer and replay reaches every action.
+
+For non-PP capture, stage-local communication remains in the ordinary F/B
+templates and no PP fragment is created.

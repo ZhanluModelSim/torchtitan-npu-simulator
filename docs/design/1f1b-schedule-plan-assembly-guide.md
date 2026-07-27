@@ -327,21 +327,21 @@ FSDP 以 residency interval 为权威，不要从算子名字猜测释放时间�
 
 ### 7.1 UNSHARD
 
-对每个真实 `alloc` interval：
+对每个 stage 外显式 prefetch 的真实 `alloc` interval：
 
 1. 找到同 group 的 all-gather CommEvent。
 2. 创建 UNSHARD action，绑定 all-gather 的 `comm_op_id/shape/bytes/group`。
 3. UNSHARD 完成后产生 `param_full(group_id)`。
 4. interval 内使用该参数的 F/B action 消费 `param_full`。
 
-捕获会折叠 MB1+ 的 L0 图，但 residency 仍逐 microbatch 保留。因此应按
-`(stage, group_id, comp_type)` 复用首个已捕获 microbatch 的 all-gather L0 模板，
-同时为每个 microbatch 保留独立 UNSHARD/RESHARD action。元数据推理阶段产生、且没有合法
+若 all-gather 在 F/B/I/W 内触发，ownership 插件会把它归入对应 L1
+模板或不可变通信变体，不再生成 L2 UNSHARD/RESHARD。只有计算外的 prefetch
+保留独立 action。元数据推理阶段产生、且没有合法
 `stage/mb/parent_compute_instance_id` 的 residency 不属于训练 schedule，应在 assembler 入口过滤；
 若 stage/mb 合法但 parent compute 不存在，则必须报错。
 
 若 stage 使用 FSDP 且 shard degree 大于 1，却找不到 all-gather，立即构图失败。
-mesh size 为 1 时可以保留 `is_noop=True` action，但不得创建阻塞 slot。
+mesh size 为 1 或无真实变化的 intent 应被删除，不创建阻塞 slot。
 
 ### 7.2 RESHARD
 
@@ -356,14 +356,14 @@ mesh size 为 1 时可以保留 `is_noop=True` action，但不得创建阻塞 sl
 
 ### 7.3 REDUCE_GRAD
 
-FSDP reduce-scatter 或 DDP all-reduce 应创建 REDUCE_GRAD：
+仅当 FSDP reduce-scatter 或 DDP all-reduce 在计算模板之外独立执行时创建 REDUCE_GRAD：
 
 ```text
 last relevant B -> REDUCE_GRAD -> grad_reduced -> OPTIMIZER
 ```
 
-如果梯度通信在 B 内异步发起，使用捕获到的 parent compute 和 seq 确定发布位置；
-依赖仍必须保证对应梯度已经产生。
+如果梯度通信在 B/I/W 内发起，它属于该 L1 模板，不再创建 L2
+REDUCE_GRAD。下游不得重复调度。
 
 ## 8. optimizer 与 step 收尾
 
@@ -400,11 +400,11 @@ last relevant B -> REDUCE_GRAD -> grad_reduced -> OPTIMIZER
 
 ### 9.3 FSDP
 
-- real UNSHARD 有 all-gather；
-- MB1+ 可复用同 group/comp_type 的 MB0 all-gather 模板，但 residency action 不折叠；
+- external UNSHARD 有 all-gather；
+- stage 内 all-gather 位于 compute 模板或 `__comm_vN` 变体；
 - real RESHARD 没有 collective，且有最后 compute producer；
-- reduce-scatter 只归属 REDUCE_GRAD；
-- no-op action 没有阻塞 slot；
+- stage 内 reduce-scatter 只归属 L1，独立 reduce-scatter 只归属 REDUCE_GRAD；
+- no-op action 已被移除；
 - 每个 residency alloc 有且只有一个匹配 free，允许显式标记跨迭代常驻的例外。
 
 ### 9.4 图性质
@@ -526,8 +526,8 @@ DES 能完成整个 step，无 dangling slot、unmatched transfer 或 active res
 
 在 Case A 基础上验证：
 
-- all-gather 只属于 UNSHARD；
-- reduce-scatter 只属于 REDUCE_GRAD；
+- 外部 all-gather 属于 UNSHARD，stage 内 all-gather 属于 L1；
+- stage 内 reduce-scatter 属于 L1，独立 reduce-scatter 属于 REDUCE_GRAD；
 - RESHARD 没有 comm_op_id，消费最后 compute 的 control slot；
 - `param_full` bytes 在 alloc 后增加、free 后减少；
 - persistent parameter bytes 约为 shard=1 的一半，full-param 峰值只在 residency interval 内出现。

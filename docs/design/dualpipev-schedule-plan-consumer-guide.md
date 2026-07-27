@@ -124,12 +124,18 @@ producer compute
 
 ## 6. FSDP 与内存
 
-FSDP action 仍按通用契约消费，不因 DualPipeV 改变：
+DualPipeV 与 1F1B 使用相同的通信归属契约：
 
 ```text
-UNSHARD -> param_full -> COMPUTE -> RESHARD
-BACKWARD -> grad_local -> REDUCE_GRAD -> OPTIMIZER
+stage 内触发的 all-gather/reduce-scatter -> COMPUTE 的 L1 StepGraph
+stage 外显式 prefetch -> UNSHARD -> COMPUTE -> RESHARD
+stage 外真实梯度归约 -> BACKWARD -> REDUCE_GRAD -> OPTIMIZER
 ```
+
+下游必须完整回放 `action.template_ref` 指向的图，不能再根据 FSDP 配置向 L2
+补通信。只有 `communication_owner=L2_PREFETCH/L2_STANDALONE` 的 action
+需要由 L2 单独调度。详细规则见
+[`communication-ownership-contract.md`](./communication-ownership-contract.md)。
 
 一个物理 rank 拥有多个虚拟 stage 时，参数基线和 FSDP residency 都按物理 rank 汇总。小模型中
 embedding/output 可能远大于 transformer layer，因此 V 形切分可能产生明显 rank 间显存不均；
@@ -157,4 +163,5 @@ PP=2 的最小验收应覆盖：
 - rank0 拥有 stage 0 和 3，rank1 拥有 stage 1 和 2；
 - 至少一个 overlap parent 在串行模式下能完成两个 child；
 - 前向 activation 和反向 gradient 同时覆盖跨 rank与同 rank local transfer；
-- 开启 DP shard 后 UNSHARD/RESHARD 成对，且不改变 PP transfer 配对。
+- 开启 DP shard 后，外部 prefetch 的 UNSHARD/RESHARD 成对；stage 内 FSDP
+  通信位于 L1，且两者都不改变 PP transfer 配对。

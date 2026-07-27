@@ -340,6 +340,20 @@ def run_simulation_step(
         )
     )
     print(f"Step templates: {list(step_templates.keys())}")
+    communication_ownership = schedule_plan.annotations.get(
+        "communication_ownership",
+        {},
+    )
+    if communication_ownership:
+        print(
+            "Communication ownership: "
+            f"L1_collectives={communication_ownership.get('stage_owned_collectives', 0)} "
+            f"L1_fsdp_transitions={communication_ownership.get('internal_fsdp_transitions', 0)} "
+            f"L2_fsdp_prefetches={communication_ownership.get('external_fsdp_prefetches', 0)} "
+            f"L1_gradient_reductions={communication_ownership.get('internal_gradient_reductions', 0)} "
+            f"L2_gradient_reductions={communication_ownership.get('external_gradient_reductions', 0)} "
+            f"removed_noop_gradient_intents={communication_ownership.get('removed_noop_gradient_intents', 0)}"
+        )
     if memory_plan is not None:
         print(
             "Static memory: "

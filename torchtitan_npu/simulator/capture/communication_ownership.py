@@ -1,0 +1,825 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+"""Normalize communication ownership before L1 templates are exported.
+
+The pipeline runtime may execute stage-local communication as standalone
+schedule actions.  Capture therefore sees fragments such as ``s0_UNSHARD``
+even though the downstream simulator treats one F/B/I/W StepGraph as the
+complete stage execution unit.  This module resolves that abstraction gap:
+
+* PP point-to-point operators remain L2-owned and are extracted from compute
+  templates into immutable communication fragments.
+* FSDP collectives observed inside F/B/I/W become part of immutable L1
+  template variants.
+* Explicit FSDP prefetch actions remain in L2 because their issue position is
+  outside the owning compute chunk.
+* Gradient collectives already captured by a compute template are not emitted
+  again as L2 ``REDUCE_GRAD`` actions.
+
+The plugins consume semantic capture records only.  They do not inspect the
+pipeline schedule class or branch on schedule names.
+"""
+
+from __future__ import annotations
+
+from collections import defaultdict
+from dataclasses import dataclass, replace
+from typing import Iterable, Protocol
+
+from torchtitan_npu.simulator.capture.comm_events import CommEvent
+from torchtitan_npu.simulator.capture.schedule_assemblers import ActionSpec
+from torchtitan_npu.simulator.ir.op_node import OpNode
+from torchtitan_npu.simulator.ir.step_graph import StepGraph
+
+
+_COMPUTE_TYPES = {"F", "B", "I", "W", "F_RECOMPUTE"}
+_STAGE_TEMPLATE_TYPES = _COMPUTE_TYPES | {"OPTIMIZER"}
+_P2P_ACTION_BY_DIRECTION = {
+    "forward_send": "SEND_F",
+    "forward_recv": "RECV_F",
+    "backward_send": "SEND_B",
+    "backward_recv": "RECV_B",
+}
+
+
+@dataclass(slots=True)
+class CommunicationOwnershipResult:
+    specs: list[ActionSpec]
+    internal_fsdp_transitions: set[str]
+    external_fsdp_transitions: set[str]
+    generated_templates: list[str]
+    internal_gradient_reductions: int
+    external_gradient_reductions: int
+    removed_noop_gradient_intents: int
+    stage_owned_collectives: int
+
+
+class CommunicationOwnershipPlugin(Protocol):
+    def apply(
+        self,
+        *,
+        step_templates: dict[str, StepGraph],
+        specs: list[ActionSpec],
+        comm_events: list[CommEvent],
+    ) -> list[ActionSpec]:
+        ...
+
+
+def _iter_specs(specs: Iterable[ActionSpec]) -> Iterable[ActionSpec]:
+    for spec in specs:
+        yield spec
+        if spec.sub_actions:
+            yield from _iter_specs(spec.sub_actions)
+
+
+def _clone_node(
+    node: OpNode,
+    *,
+    op_id: int | None = None,
+    predecessors: list[int] | None = None,
+    annotations: dict | None = None,
+) -> OpNode:
+    return replace(
+        node,
+        op_id=node.op_id if op_id is None else op_id,
+        inputs=list(node.inputs),
+        outputs=list(node.outputs),
+        attrs=dict(node.attrs),
+        predecessors=(
+            list(node.predecessors)
+            if predecessors is None
+            else list(predecessors)
+        ),
+        successors=[],
+        annotations=(
+            dict(node.annotations)
+            if annotations is None
+            else dict(annotations)
+        ),
+    )
+
+
+def _rebuild_successors(nodes: dict[int, OpNode]) -> None:
+    for node in nodes.values():
+        node.successors = []
+    for op_id, node in nodes.items():
+        for predecessor in node.predecessors:
+            if predecessor in nodes:
+                nodes[predecessor].successors.append(op_id)
+
+
+def _refresh_graph_topology(graph: StepGraph) -> None:
+    _rebuild_successors(graph.nodes)
+    graph.entry_nodes = [
+        op_id
+        for op_id, node in graph.nodes.items()
+        if not any(predecessor in graph.nodes for predecessor in node.predecessors)
+    ]
+    graph.exit_nodes = [
+        op_id
+        for op_id, node in graph.nodes.items()
+        if not any(successor in graph.nodes for successor in node.successors)
+    ]
+    in_degree = {
+        op_id: sum(
+            predecessor in graph.nodes for predecessor in node.predecessors
+        )
+        for op_id, node in graph.nodes.items()
+    }
+    ready = [
+        op_id for op_id, degree in in_degree.items() if degree == 0
+    ]
+    visited = 0
+    while ready:
+        op_id = ready.pop()
+        visited += 1
+        for successor in graph.nodes[op_id].successors:
+            if successor not in in_degree:
+                continue
+            in_degree[successor] -= 1
+            if in_degree[successor] == 0:
+                ready.append(successor)
+    graph.is_acyclic = visited == len(graph.nodes)
+    graph.comm_volume = sum(
+        node.comm_bytes * int(node.annotations.get("repeat_count", 1))
+        for node in graph.nodes.values()
+    )
+
+
+def _copy_without_nodes(
+    template: StepGraph,
+    removed_op_ids: set[int],
+    *,
+    annotations: dict | None = None,
+) -> StepGraph:
+    nodes = {
+        op_id: _clone_node(
+            node,
+            predecessors=[
+                predecessor
+                for predecessor in node.predecessors
+                if predecessor not in removed_op_ids
+            ],
+        )
+        for op_id, node in template.nodes.items()
+        if op_id not in removed_op_ids
+    }
+    _rebuild_successors(nodes)
+    return StepGraph(
+        step_id=template.step_id,
+        step_type=template.step_type,
+        nodes=nodes,
+        tensor_lifetimes=dict(template.tensor_lifetimes),
+        total_flops=template.total_flops,
+        peak_active_mem=template.peak_active_mem,
+        param_mem=template.param_mem,
+        comm_volume=template.comm_volume,
+        device_placement=dict(template.device_placement),
+        annotations=(
+            dict(template.annotations)
+            if annotations is None
+            else dict(annotations)
+        ),
+        fused_regions=list(template.fused_regions),
+        internal_data_passes=list(template.internal_data_passes),
+    )
+
+
+def _find_node(
+    step_templates: dict[str, StepGraph],
+    op_id: int,
+) -> tuple[str, OpNode] | None:
+    if not op_id:
+        return None
+    for template_id, template in step_templates.items():
+        node = template.nodes.get(op_id)
+        if node is not None:
+            return template_id, node
+    return None
+
+
+def _find_comm_node(
+    step_templates: dict[str, StepGraph],
+    event: CommEvent,
+) -> tuple[str, OpNode] | None:
+    if not event.op_id:
+        return None
+    found = _find_node(step_templates, event.op_id)
+    if found is None:
+        return None
+    _template_id, node = found
+    if node.annotations.get("raw_op_type") != f"comm.{event.comm_primitive}":
+        return None
+    return found
+
+
+class PipelineP2POwnershipPlugin:
+    """Extract cross-stage P2P operators from stage compute templates."""
+
+    def apply(
+        self,
+        *,
+        step_templates: dict[str, StepGraph],
+        specs: list[ActionSpec],
+        comm_events: list[CommEvent],
+    ) -> list[ActionSpec]:
+        located: dict[int, tuple[str, OpNode, CommEvent]] = {}
+        for event in comm_events:
+            if event.p2p_direction not in _P2P_ACTION_BY_DIRECTION:
+                continue
+            found = _find_comm_node(step_templates, event)
+            if found is None:
+                continue
+            template_id, node = found
+            located[event.op_id] = (template_id, node, event)
+        if not located:
+            return specs
+
+        removed = set(located)
+        for template_id, template in list(step_templates.items()):
+            if template.step_type not in _COMPUTE_TYPES:
+                continue
+            if not removed.intersection(template.nodes):
+                continue
+            annotations = dict(template.annotations)
+            annotations["communication_ownership_normalized"] = True
+            step_templates[template_id] = _copy_without_nodes(
+                template,
+                removed,
+                annotations=annotations,
+            )
+
+        fragment_nodes: dict[str, dict[int, OpNode]] = defaultdict(dict)
+        for op_id, (_source_template, node, event) in located.items():
+            action_type = _P2P_ACTION_BY_DIRECTION[event.p2p_direction]
+            stage = int(event.p2p_stage)
+            fragment_id = f"s{stage}_PP_{action_type}"
+            annotations = dict(node.annotations)
+            annotations.update({
+                "communication_owner": "L2_PIPELINE",
+                "source_op_id": op_id,
+                "pp_action_type": action_type,
+            })
+            fragment_nodes[fragment_id][op_id] = _clone_node(
+                node,
+                predecessors=[],
+                annotations=annotations,
+            )
+
+        for fragment_id, nodes in fragment_nodes.items():
+            _rebuild_successors(nodes)
+            step_templates[fragment_id] = StepGraph(
+                step_id=fragment_id,
+                step_type=fragment_id.split("_PP_", 1)[1],
+                nodes=nodes,
+                annotations={
+                    "template_kind": "l2_communication_fragment",
+                    "communication_owner": "L2_PIPELINE",
+                },
+            )
+        return specs
+
+
+@dataclass(frozen=True, slots=True)
+class _OwnedCollective:
+    spec: ActionSpec
+    event: CommEvent
+    source_template: str
+    source_node: OpNode
+
+    @property
+    def signature(self) -> tuple:
+        return (
+            str(self.spec.annotations.get("fsdp_group_id", "")),
+            self.event.comm_primitive,
+            tuple(self.event.tensor_shape),
+            self.event.dtype,
+            int(self.event.world_size),
+            tuple(tuple(group) for group in self.event.comm_ranks),
+        )
+
+
+class FSDPStageOwnershipPlugin:
+    """Fold compute-local FSDP collectives into immutable L1 variants."""
+
+    def __init__(self) -> None:
+        self.internal_transitions: set[str] = set()
+        self.external_transitions: set[str] = set()
+        self.generated_templates: list[str] = []
+
+    def apply(
+        self,
+        *,
+        step_templates: dict[str, StepGraph],
+        specs: list[ActionSpec],
+        comm_events: list[CommEvent],
+    ) -> list[ActionSpec]:
+        flat_specs = list(_iter_specs(specs))
+        compute_specs = [
+            spec
+            for spec in flat_specs
+            if spec.action_type == "COMPUTE"
+            and spec.comp_type in _COMPUTE_TYPES
+        ]
+        compute_by_instance = {
+            str(spec.annotations.get("compute_instance_id", "")): spec
+            for spec in compute_specs
+            if spec.annotations.get("compute_instance_id")
+        }
+        unshards = [
+            spec for spec in specs if spec.action_type == "UNSHARD"
+        ]
+
+        self.external_transitions = {
+            str(spec.annotations.get("fsdp_transition_id", ""))
+            for spec in unshards
+            if spec.annotations.get("fsdp_schedule_source") == "intent"
+            and spec.annotations.get("fsdp_transition_id")
+        }
+        internal_unshards = [
+            spec
+            for spec in unshards
+            if spec.annotations.get("fsdp_schedule_source") == "state"
+            and spec.annotations.get("fsdp_transition_id")
+            and spec.annotations.get("parent_compute_instance_id")
+        ]
+        self.internal_transitions = {
+            str(spec.annotations["fsdp_transition_id"])
+            for spec in internal_unshards
+        }
+
+        if internal_unshards:
+            self._build_template_variants(
+                step_templates=step_templates,
+                compute_specs=compute_specs,
+                compute_by_instance=compute_by_instance,
+                internal_unshards=internal_unshards,
+                comm_events=comm_events,
+            )
+
+        retained: list[ActionSpec] = []
+        for spec in specs:
+            if spec.action_type not in {"UNSHARD", "RESHARD"}:
+                retained.append(spec)
+                continue
+            transition_id = str(
+                spec.annotations.get("fsdp_transition_id", "")
+            )
+            if transition_id in self.external_transitions:
+                spec.annotations["communication_owner"] = "L2_PREFETCH"
+                retained.append(spec)
+                continue
+            if transition_id in self.internal_transitions:
+                continue
+            if spec.is_noop or spec.annotations.get("fsdp_intent_noop"):
+                continue
+            retained.append(spec)
+        return retained
+
+    def _build_template_variants(
+        self,
+        *,
+        step_templates: dict[str, StepGraph],
+        compute_specs: list[ActionSpec],
+        compute_by_instance: dict[str, ActionSpec],
+        internal_unshards: list[ActionSpec],
+        comm_events: list[CommEvent],
+    ) -> None:
+        source_nodes: dict[int, tuple[str, OpNode]] = {}
+        for template_id, template in step_templates.items():
+            for op_id, node in template.nodes.items():
+                source_nodes[op_id] = (template_id, node)
+
+        real_events = [
+            event
+            for event in comm_events
+            if event.comm_primitive == "allgather"
+            and event.fsdp_transition_id
+        ]
+        event_by_transition = {
+            event.fsdp_transition_id: event for event in real_events
+        }
+        canonical_by_group_comp: dict[
+            tuple[int, str, str], CommEvent
+        ] = {}
+        canonical_by_group: dict[tuple[int, str], CommEvent] = {}
+
+        def is_valid_allgather(event: CommEvent | None) -> bool:
+            return bool(
+                event is not None
+                and event.op_id
+                and event.op_id in source_nodes
+                and source_nodes[event.op_id][1].annotations.get(
+                    "raw_op_type"
+                ) == "comm.allgather"
+            )
+
+        for event in real_events:
+            if not is_valid_allgather(event):
+                continue
+            stage = int(event.p2p_stage)
+            canonical_by_group_comp.setdefault(
+                (stage, event.fsdp_group_id, event.comp_type),
+                event,
+            )
+            canonical_by_group.setdefault(
+                (stage, event.fsdp_group_id),
+                event,
+            )
+
+        owned_by_parent: dict[str, list[_OwnedCollective]] = defaultdict(list)
+        for spec in sorted(internal_unshards, key=lambda item: item.order_key):
+            transition_id = str(spec.annotations["fsdp_transition_id"])
+            event = event_by_transition.get(transition_id)
+            group_id = str(spec.annotations.get("fsdp_group_id", ""))
+            comp_type = str(spec.annotations.get("residency_comp_type", ""))
+            if not is_valid_allgather(event):
+                event = canonical_by_group_comp.get(
+                    (spec.stage, group_id, comp_type)
+                ) or canonical_by_group.get((spec.stage, group_id))
+            shard_world_size = int(
+                spec.annotations.get("shard_world_size", -1)
+            )
+            if not is_valid_allgather(event):
+                if shard_world_size > 1:
+                    raise RuntimeError(
+                        "compute-local FSDP transition has no reusable "
+                        f"all-gather template: transition={transition_id}, "
+                        f"stage={spec.stage}, group={group_id}"
+                    )
+                continue
+            parent_id = str(
+                spec.annotations.get("parent_compute_instance_id", "")
+            )
+            if parent_id not in compute_by_instance:
+                raise RuntimeError(
+                    "compute-local FSDP transition references missing "
+                    f"compute instance {parent_id!r}"
+                )
+            source_template, source_node = source_nodes[event.op_id]
+            owned_by_parent[parent_id].append(
+                _OwnedCollective(
+                    spec=spec,
+                    event=event,
+                    source_template=source_template,
+                    source_node=source_node,
+                )
+            )
+
+        fsdp_op_ids = {
+            event.op_id
+            for event in real_events
+            if event.op_id
+            and event.op_id in source_nodes
+            and source_nodes[event.op_id][1].annotations.get(
+                "raw_op_type"
+            ) == "comm.allgather"
+        }
+        next_synthetic_id = min(
+            (op_id for template in step_templates.values() for op_id in template.nodes),
+            default=0,
+        ) - 1
+
+        specs_by_template: dict[str, list[ActionSpec]] = defaultdict(list)
+        for spec in compute_specs:
+            specs_by_template[spec.template_ref].append(spec)
+
+        for base_id, instances in specs_by_template.items():
+            base_template = step_templates.get(base_id)
+            if base_template is None:
+                if any(
+                    owned_by_parent.get(
+                        str(spec.annotations.get("compute_instance_id", ""))
+                    )
+                    for spec in instances
+                ):
+                    raise RuntimeError(
+                        f"FSDP-owned communication has no L1 base template {base_id!r}"
+                    )
+                continue
+
+            signature_by_instance: dict[str, tuple] = {}
+            owned_by_signature: dict[
+                tuple, list[_OwnedCollective]
+            ] = {}
+            for spec in instances:
+                instance_id = str(
+                    spec.annotations.get("compute_instance_id", "")
+                )
+                owned = owned_by_parent.get(instance_id, [])
+                signature = tuple(item.signature for item in owned)
+                signature_by_instance[instance_id] = signature
+                owned_by_signature.setdefault(signature, owned)
+
+            if not any(owned_by_signature):
+                continue
+
+            base_source_ids = set(base_template.nodes)
+            signatures = list(owned_by_signature)
+            primary_signature = max(
+                signatures,
+                key=lambda signature: (
+                    sum(
+                        item.source_node.op_id in base_source_ids
+                        for item in owned_by_signature[signature]
+                    ),
+                    -signatures.index(signature),
+                ),
+            )
+            ordered_signatures = [
+                primary_signature,
+                *(signature for signature in signatures if signature != primary_signature),
+            ]
+
+            normalized_templates: dict[tuple, str] = {}
+            for variant_index, signature in enumerate(ordered_signatures):
+                template_id = (
+                    base_id
+                    if variant_index == 0
+                    else f"{base_id}__comm_v{variant_index}"
+                )
+                pure = _copy_without_nodes(
+                    base_template,
+                    fsdp_op_ids,
+                    annotations={
+                        **base_template.annotations,
+                        "communication_ownership_normalized": True,
+                    },
+                )
+                owned = owned_by_signature[signature]
+                node_id_map: dict[int, int] = {}
+                for item in owned:
+                    original_id = item.source_node.op_id
+                    if (
+                        variant_index == 0
+                        and original_id in base_source_ids
+                        and original_id not in pure.nodes
+                    ):
+                        new_id = original_id
+                    else:
+                        new_id = next_synthetic_id
+                        next_synthetic_id -= 1
+                    node_id_map[original_id] = new_id
+
+                pure_entry_nodes = [
+                    op_id
+                    for op_id, node in pure.nodes.items()
+                    if not any(pred in pure.nodes for pred in node.predecessors)
+                ]
+                successor_links: dict[int, list[int]] = defaultdict(list)
+                for item in owned:
+                    source = item.source_node
+                    new_id = node_id_map[source.op_id]
+                    predecessors = [
+                        (
+                            node_id_map[predecessor]
+                            if predecessor in node_id_map
+                            else predecessor
+                        )
+                        for predecessor in source.predecessors
+                        if predecessor in pure.nodes
+                        or predecessor in node_id_map
+                    ]
+                    annotations = dict(source.annotations)
+                    annotations.update({
+                        "communication_owner": "L1_STAGE",
+                        "source_op_id": source.op_id,
+                        "fsdp_group_id": item.event.fsdp_group_id,
+                        "ownership_placement": (
+                            "captured"
+                            if item.source_template == base_id
+                            else "compute_prelude"
+                        ),
+                    })
+                    pure.nodes[new_id] = _clone_node(
+                        source,
+                        op_id=new_id,
+                        predecessors=predecessors,
+                        annotations=annotations,
+                    )
+                    for successor in source.successors:
+                        if successor in pure.nodes:
+                            successor_links[new_id].append(successor)
+
+                for comm_id, successors in successor_links.items():
+                    for successor in successors:
+                        if comm_id not in pure.nodes[successor].predecessors:
+                            pure.nodes[successor].predecessors.append(comm_id)
+
+                for item in owned:
+                    comm_id = node_id_map[item.source_node.op_id]
+                    node = pure.nodes[comm_id]
+                    has_internal_predecessor = any(
+                        predecessor in pure.nodes
+                        for predecessor in node.predecessors
+                    )
+                    if (
+                        not has_internal_predecessor
+                        and not successor_links.get(comm_id)
+                    ):
+                        for entry in pure_entry_nodes:
+                            if comm_id not in pure.nodes[entry].predecessors:
+                                pure.nodes[entry].predecessors.append(comm_id)
+
+                _refresh_graph_topology(pure)
+                if not pure.is_acyclic:
+                    raise RuntimeError(
+                        "communication ownership produced a cyclic L1 "
+                        f"template {template_id!r}"
+                    )
+                pure.step_id = template_id
+                pure.annotations.update({
+                    "template_kind": "stage_compute",
+                    "internal_fsdp_collectives": len(owned),
+                    "fsdp_communication_signature": [
+                        list(item.signature) for item in owned
+                    ],
+                })
+                step_templates[template_id] = pure
+                normalized_templates[signature] = template_id
+                if template_id != base_id:
+                    self.generated_templates.append(template_id)
+
+            for spec in instances:
+                instance_id = str(
+                    spec.annotations.get("compute_instance_id", "")
+                )
+                signature = signature_by_instance[instance_id]
+                spec.template_ref = normalized_templates[signature]
+                spec.annotations["internal_fsdp_collectives"] = len(signature)
+                spec.annotations["communication_ownership_normalized"] = True
+
+
+class GradientReductionOwnershipPlugin:
+    """Keep only genuinely standalone gradient reductions in L2.
+
+    FSDP/DDP reductions may be emitted both as an L1 communication node and as
+    a schedule-level REDUCE_GRAD intent.  The L1 template is authoritative when
+    the real collective is already inside F/B/I/W.  A real collective captured
+    outside every compute template remains an explicit L2 action.
+    """
+
+    def __init__(self) -> None:
+        self.internal_reductions = 0
+        self.external_reductions = 0
+        self.removed_noop_intents = 0
+
+    def apply(
+        self,
+        *,
+        step_templates: dict[str, StepGraph],
+        specs: list[ActionSpec],
+        comm_events: list[CommEvent],
+    ) -> list[ActionSpec]:
+        internal_op_ids: set[int] = set()
+        for template in step_templates.values():
+            if template.step_type not in _STAGE_TEMPLATE_TYPES:
+                continue
+            for node in template.nodes.values():
+                if node.annotations.get("raw_op_type") not in {
+                    "comm.reduce_scatter",
+                    "comm.allreduce",
+                }:
+                    continue
+                node.annotations.update({
+                    "communication_owner": "L1_STAGE",
+                    "gradient_reduction": True,
+                })
+                internal_op_ids.add(node.op_id)
+        self.internal_reductions = len(internal_op_ids)
+
+        event_by_op_id = {
+            event.op_id: event
+            for event in comm_events
+            if event.op_id
+            and event.comm_primitive in {"reduce_scatter", "allreduce"}
+        }
+        retained: list[ActionSpec] = []
+        for spec in specs:
+            if spec.action_type != "REDUCE_GRAD":
+                retained.append(spec)
+                continue
+            if spec.is_noop or (spec.comm is not None and spec.comm.is_noop):
+                self.removed_noop_intents += 1
+                continue
+
+            event = event_by_op_id.get(spec.comm_op_id)
+            found = (
+                _find_comm_node(step_templates, event)
+                if event is not None
+                else None
+            )
+            if found is not None:
+                template_id, node = found
+                template = step_templates[template_id]
+                if template.step_type in _STAGE_TEMPLATE_TYPES:
+                    node.annotations.update({
+                        "communication_owner": "L1_STAGE",
+                        "gradient_reduction": True,
+                    })
+                    template.annotations[
+                        "communication_ownership_normalized"
+                    ] = True
+                    if node.op_id not in internal_op_ids:
+                        internal_op_ids.add(node.op_id)
+                        self.internal_reductions += 1
+                    continue
+
+            spec.annotations["communication_owner"] = "L2_STANDALONE"
+            self.external_reductions += 1
+            retained.append(spec)
+        return retained
+
+
+class EmbeddedStageCommunicationPlugin:
+    """Mark every remaining communication node embedded in stage compute."""
+
+    def __init__(self) -> None:
+        self.stage_owned_collectives = 0
+
+    def apply(
+        self,
+        *,
+        step_templates: dict[str, StepGraph],
+        specs: list[ActionSpec],
+        comm_events: list[CommEvent],
+    ) -> list[ActionSpec]:
+        del comm_events
+        counts_by_template: dict[str, int] = {}
+        for template_id, template in step_templates.items():
+            if template.step_type not in _STAGE_TEMPLATE_TYPES:
+                continue
+            collective_count = 0
+            for node in template.nodes.values():
+                if not str(node.annotations.get("raw_op_type", "")).startswith(
+                    "comm."
+                ):
+                    continue
+                node.annotations.setdefault(
+                    "communication_owner",
+                    "L1_STAGE",
+                )
+                collective_count += 1
+                self.stage_owned_collectives += 1
+            counts_by_template[template_id] = collective_count
+            if collective_count:
+                template.annotations[
+                    "communication_ownership_normalized"
+                ] = True
+                template.annotations[
+                    "stage_owned_collectives"
+                ] = collective_count
+
+        for spec in _iter_specs(specs):
+            if spec.action_type == "COMPUTE":
+                collective_count = counts_by_template.get(
+                    spec.template_ref,
+                    0,
+                )
+                spec.annotations[
+                    "stage_owned_collectives"
+                ] = collective_count
+                spec.annotations[
+                    "communication_ownership_normalized"
+                ] = True
+        return specs
+
+
+def normalize_communication_ownership(
+    *,
+    step_templates: dict[str, StepGraph],
+    specs: list[ActionSpec],
+    comm_events: Iterable[CommEvent],
+) -> CommunicationOwnershipResult:
+    """Apply capture-side ownership plugins before L2 materialization."""
+
+    events = list(comm_events)
+    normalized = list(specs)
+    plugins: list[CommunicationOwnershipPlugin] = [
+        PipelineP2POwnershipPlugin(),
+    ]
+    fsdp_plugin = FSDPStageOwnershipPlugin()
+    plugins.append(fsdp_plugin)
+    gradient_plugin = GradientReductionOwnershipPlugin()
+    plugins.append(gradient_plugin)
+    embedded_plugin = EmbeddedStageCommunicationPlugin()
+    plugins.append(embedded_plugin)
+    for plugin in plugins:
+        normalized = plugin.apply(
+            step_templates=step_templates,
+            specs=normalized,
+            comm_events=events,
+        )
+    return CommunicationOwnershipResult(
+        specs=normalized,
+        internal_fsdp_transitions=set(fsdp_plugin.internal_transitions),
+        external_fsdp_transitions=set(fsdp_plugin.external_transitions),
+        generated_templates=list(fsdp_plugin.generated_templates),
+        internal_gradient_reductions=gradient_plugin.internal_reductions,
+        external_gradient_reductions=gradient_plugin.external_reductions,
+        removed_noop_gradient_intents=gradient_plugin.removed_noop_intents,
+        stage_owned_collectives=embedded_plugin.stage_owned_collectives,
+    )

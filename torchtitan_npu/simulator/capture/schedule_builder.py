@@ -18,6 +18,10 @@ from collections import defaultdict
 from typing import Any, Iterator
 
 from torchtitan_npu.simulator.capture.comm_events import CommEvent
+from torchtitan_npu.simulator.capture.communication_ownership import (
+    CommunicationOwnershipResult,
+    normalize_communication_ownership,
+)
 from torchtitan_npu.simulator.capture.schedule_assemblers import (
     CapturedTraceAssembler,
     pp_transfer_id,
@@ -241,6 +245,7 @@ def build_schedule_plan(
     # --- 1. action skeleton ---------------------------------------------------
     plan_obj = None
     is_captured_trace = False
+    communication_ownership: CommunicationOwnershipResult | None = None
     if pp_schedule_obj is not None:
         plan_obj = getattr(pp_schedule_obj, "pipeline_order_with_comms", None)
     use_captured_trace = bool(timeline_events) and (
@@ -254,6 +259,12 @@ def build_schedule_plan(
             fsdp_residency_events=fsdp_residency_events,
             rank=rank,
         ).build()
+        communication_ownership = normalize_communication_ownership(
+            step_templates=step_templates,
+            specs=specs,
+            comm_events=comm_events,
+        )
+        specs = communication_ownership.specs
 
         def materialize_spec(
             spec: Any,
@@ -291,6 +302,11 @@ def build_schedule_plan(
             actions.append(map_action(a, i))
     else:
         # non-PP: one action per captured template, ordered F < B < OPTIMIZER
+        communication_ownership = normalize_communication_ownership(
+            step_templates=step_templates,
+            specs=[],
+            comm_events=comm_events,
+        )
         order = {"F": 0, "B": 1, "OPTIMIZER": 2}
         ordered_templates = sorted(
             step_templates,
@@ -943,6 +959,33 @@ def build_schedule_plan(
             "rank_table": rank_table.to_dict(),
             "comm_events_summary": comm_summary,
             "assembler": "captured_trace" if is_captured_trace else "runtime_or_non_pp",
+            "communication_ownership": (
+                {
+                    "internal_fsdp_transitions": len(
+                        communication_ownership.internal_fsdp_transitions
+                    ),
+                    "external_fsdp_prefetches": len(
+                        communication_ownership.external_fsdp_transitions
+                    ),
+                    "generated_l1_templates": list(
+                        communication_ownership.generated_templates
+                    ),
+                    "internal_gradient_reductions": (
+                        communication_ownership.internal_gradient_reductions
+                    ),
+                    "external_gradient_reductions": (
+                        communication_ownership.external_gradient_reductions
+                    ),
+                    "removed_noop_gradient_intents": (
+                        communication_ownership.removed_noop_gradient_intents
+                    ),
+                    "stage_owned_collectives": (
+                        communication_ownership.stage_owned_collectives
+                    ),
+                }
+                if communication_ownership is not None
+                else {}
+            ),
         },
     )
     trace_compute_types = {

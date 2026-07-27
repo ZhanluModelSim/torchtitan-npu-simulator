@@ -298,8 +298,11 @@ pp:{forward|backward}:s{src}->s{dst}:mb{microbatch}:t{tensor_ordinal}
 
 ### 7.1 Collective
 
-`UNSHARD` 和 `REDUCE_GRAD` 的 `comm.role == "collective"`。完整 logical world 模式下，为同一
-collective 的所有 endpoint 创建一个共享事件。至少按以下信息区分实例：
+只有保留在 L2 的 `UNSHARD` 和 `REDUCE_GRAD` 才按本节重建 collective。
+`COMPUTE` 引用的 L1 模板可能已经包含 `communication_owner=L1_STAGE` 的
+all-gather、reduce-scatter、TP、CP 或 EP 通信；它们必须随模板回放，不能在 L2
+重复创建。完整 logical world 模式下，为同一 L2 collective 的所有 endpoint
+创建一个共享事件。至少按以下信息区分实例：
 
 ```text
 primitive
@@ -349,15 +352,18 @@ RESHARD done
     -> full parameter residency closes
 ```
 
-`RESHARD` 是本地释放，不是 reduce-scatter。梯度 reduce-scatter/all-reduce 由
+`RESHARD` 是本地释放，不是 reduce-scatter。梯度 reduce-scatter/all-reduce
+若在 B/I/W 内触发，则由对应 L1 模板表达；只有独立执行时才由
 `REDUCE_GRAD` 表达。
 
-`is_noop=True` 表示该 schedule intent 没有实际通信或驻留变化：
+兼容旧 schema 时，`is_noop=True` 表示 schedule intent 没有实际通信或驻留变化：
 
 - 不创建 collective event；
 - 不等待 DataSlot；
 - 到达 issue cursor 后立即完成；
 - 不得借用相邻 action 的通信补齐。
+
+当前 capture schema 会在导出前删除这类 no-op action。
 
 若一个非 no-op UNSHARD 缺少 collective 描述，或 RESHARD 没有可关闭的 active residency，
 必须报错。

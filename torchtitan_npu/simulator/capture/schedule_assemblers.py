@@ -263,6 +263,14 @@ class CapturedTraceAssembler:
 
         matched_intents: set[int] = set()
         for spec_ordinal, spec in enumerate(residency_specs):
+            # Only the transition emitted by the runtime's explicit
+            # UNSHARD/RESHARD action belongs at the lowered schedule intent.
+            # FSDP may reshard a module after a compute chunk and allocate it
+            # again for a later microbatch. Those state transitions must keep
+            # their observed action order instead of collapsing onto the
+            # first stage-level prefetch intent.
+            if spec.annotations.get("fsdp_schedule_source") != "intent":
+                continue
             event_order = int(
                 spec.annotations.get(
                     "capture_action_order", spec.order_key[0]
