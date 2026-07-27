@@ -289,17 +289,154 @@ class _OwnedCollective:
     event: CommEvent
     source_template: str
     source_node: OpNode
+    owner_compute_instance_id: str
 
     @property
     def signature(self) -> tuple:
         return (
             str(self.spec.annotations.get("fsdp_group_id", "")),
+            str(self.spec.annotations.get("fsdp_module_fqn", "")),
+            str(self.spec.annotations.get("fsdp_prefetch_source_fqn", "")),
+            str(self.spec.annotations.get("fsdp_prefetch_type", "")),
             self.event.comm_primitive,
             tuple(self.event.tensor_shape),
             self.event.dtype,
             int(self.event.world_size),
             tuple(tuple(group) for group in self.event.comm_ranks),
+            self.owner_compute_instance_id
+            != str(
+                self.spec.annotations.get(
+                    "parent_compute_instance_id",
+                    "",
+                )
+            ),
         )
+
+
+@dataclass(frozen=True, slots=True)
+class _FSDPGroupRegion:
+    group_id: str
+    module_fqn: str
+    wait_seq_idx: int
+    release_seq_idx: int
+    entry_op_ids: tuple[int, ...]
+    exit_op_ids: tuple[int, ...]
+    external_predecessors: tuple[int, ...]
+
+
+def _fsdp_group_regions(
+    template: StepGraph,
+    removed_op_ids: set[int],
+) -> list[_FSDPGroupRegion]:
+    waits = sorted(
+        (
+            node
+            for node in template.nodes.values()
+            if node.annotations.get("fsdp_marker") == "unshard_wait"
+        ),
+        key=lambda node: (node.seq_idx, node.op_id),
+    )
+    releases_by_group: dict[str, list[OpNode]] = defaultdict(list)
+    for node in template.nodes.values():
+        if node.annotations.get("fsdp_marker") != "reshard_release":
+            continue
+        releases_by_group[
+            str(node.annotations.get("fsdp_group_id", ""))
+        ].append(node)
+    for releases in releases_by_group.values():
+        releases.sort(key=lambda node: (node.seq_idx, node.op_id))
+
+    regions: list[_FSDPGroupRegion] = []
+    for wait_index, wait in enumerate(waits):
+        group_id = str(wait.annotations.get("fsdp_group_id", ""))
+        if not group_id:
+            continue
+        release = next(
+            (
+                candidate
+                for candidate in releases_by_group.get(group_id, ())
+                if candidate.seq_idx > wait.seq_idx
+            ),
+            None,
+        )
+        next_wait_seq = (
+            waits[wait_index + 1].seq_idx
+            if wait_index + 1 < len(waits)
+            else max(
+                (node.seq_idx for node in template.nodes.values()),
+                default=wait.seq_idx,
+            )
+            + 1
+        )
+        release_seq_idx = (
+            release.seq_idx if release is not None else next_wait_seq
+        )
+        body = {
+            op_id
+            for op_id, node in template.nodes.items()
+            if op_id not in removed_op_ids
+            and wait.seq_idx < node.seq_idx < release_seq_idx
+        }
+        if not body:
+            continue
+        entries = tuple(
+            sorted(
+                (
+                    op_id
+                    for op_id in body
+                    if not any(
+                        predecessor in body
+                        for predecessor in template.nodes[
+                            op_id
+                        ].predecessors
+                    )
+                ),
+                key=lambda op_id: (
+                    template.nodes[op_id].seq_idx,
+                    op_id,
+                ),
+            )
+        )
+        exits = tuple(
+            sorted(
+                (
+                    op_id
+                    for op_id in body
+                    if not any(
+                        successor in body
+                        for successor in template.nodes[op_id].successors
+                    )
+                ),
+                key=lambda op_id: (
+                    template.nodes[op_id].seq_idx,
+                    op_id,
+                ),
+            )
+        )
+        external_predecessors = tuple(
+            dict.fromkeys(
+                predecessor
+                for entry in entries
+                for predecessor in template.nodes[entry].predecessors
+                if predecessor not in body
+                and predecessor not in removed_op_ids
+                and predecessor in template.nodes
+            )
+        )
+        regions.append(
+            _FSDPGroupRegion(
+                group_id=group_id,
+                module_fqn=str(
+                    wait.annotations.get("fsdp_module_fqn", "")
+                ),
+                wait_seq_idx=wait.seq_idx,
+                release_seq_idx=release_seq_idx,
+                entry_op_ids=entries,
+                exit_op_ids=exits,
+                external_predecessors=external_predecessors,
+            )
+        )
+    return regions
 
 
 class FSDPStageOwnershipPlugin:
@@ -329,6 +466,17 @@ class FSDPStageOwnershipPlugin:
             for spec in compute_specs
             if spec.annotations.get("compute_instance_id")
         }
+        compute_by_key: dict[tuple[int, int, str], list[ActionSpec]] = (
+            defaultdict(list)
+        )
+        for compute_spec in compute_specs:
+            compute_by_key[
+                (
+                    compute_spec.stage,
+                    compute_spec.mb_idx,
+                    compute_spec.comp_type,
+                )
+            ].append(compute_spec)
         unshards = [
             spec for spec in specs if spec.action_type == "UNSHARD"
         ]
@@ -356,6 +504,7 @@ class FSDPStageOwnershipPlugin:
                 step_templates=step_templates,
                 compute_specs=compute_specs,
                 compute_by_instance=compute_by_instance,
+                compute_by_key=compute_by_key,
                 internal_unshards=internal_unshards,
                 comm_events=comm_events,
             )
@@ -385,6 +534,7 @@ class FSDPStageOwnershipPlugin:
         step_templates: dict[str, StepGraph],
         compute_specs: list[ActionSpec],
         compute_by_instance: dict[str, ActionSpec],
+        compute_by_key: dict[tuple[int, int, str], list[ActionSpec]],
         internal_unshards: list[ActionSpec],
         comm_events: list[CommEvent],
     ) -> None:
@@ -433,17 +583,18 @@ class FSDPStageOwnershipPlugin:
         owned_by_parent: dict[str, list[_OwnedCollective]] = defaultdict(list)
         for spec in sorted(internal_unshards, key=lambda item: item.order_key):
             transition_id = str(spec.annotations["fsdp_transition_id"])
-            event = event_by_transition.get(transition_id)
+            semantic_event = event_by_transition.get(transition_id)
+            source_event = semantic_event
             group_id = str(spec.annotations.get("fsdp_group_id", ""))
             comp_type = str(spec.annotations.get("residency_comp_type", ""))
-            if not is_valid_allgather(event):
-                event = canonical_by_group_comp.get(
+            if not is_valid_allgather(source_event):
+                source_event = canonical_by_group_comp.get(
                     (spec.stage, group_id, comp_type)
                 ) or canonical_by_group.get((spec.stage, group_id))
             shard_world_size = int(
                 spec.annotations.get("shard_world_size", -1)
             )
-            if not is_valid_allgather(event):
+            if not is_valid_allgather(source_event):
                 if shard_world_size > 1:
                     raise RuntimeError(
                         "compute-local FSDP transition has no reusable "
@@ -451,6 +602,19 @@ class FSDPStageOwnershipPlugin:
                         f"stage={spec.stage}, group={group_id}"
                     )
                 continue
+            event = semantic_event or source_event
+            if not event.fsdp_module_fqn:
+                event.fsdp_module_fqn = str(
+                    spec.annotations.get("fsdp_module_fqn", "")
+                )
+            if not event.fsdp_prefetch_source_fqn:
+                event.fsdp_prefetch_source_fqn = str(
+                    spec.annotations.get("fsdp_prefetch_source_fqn", "")
+                )
+            if not event.fsdp_prefetch_type:
+                event.fsdp_prefetch_type = str(
+                    spec.annotations.get("fsdp_prefetch_type", "")
+                )
             parent_id = str(
                 spec.annotations.get("parent_compute_instance_id", "")
             )
@@ -459,13 +623,64 @@ class FSDPStageOwnershipPlugin:
                     "compute-local FSDP transition references missing "
                     f"compute instance {parent_id!r}"
                 )
-            source_template, source_node = source_nodes[event.op_id]
-            owned_by_parent[parent_id].append(
+            owner_id = parent_id
+            prefetch_source_fqn = (
+                event.fsdp_prefetch_source_fqn
+                or str(
+                    spec.annotations.get(
+                        "fsdp_prefetch_source_fqn",
+                        "",
+                    )
+                )
+            )
+            if prefetch_source_fqn and event.comp_type in _COMPUTE_TYPES:
+                launch_candidates = compute_by_key.get(
+                    (
+                        int(event.p2p_stage),
+                        int(event.p2p_mb_idx),
+                        event.comp_type,
+                    ),
+                    [],
+                )
+                launch_owner = next(
+                    (
+                        candidate
+                        for candidate in launch_candidates
+                        if int(
+                            candidate.annotations.get(
+                                "capture_start_seq",
+                                candidate.seq_idx,
+                            )
+                        )
+                        <= event.seq_idx
+                        <= int(
+                            candidate.annotations.get(
+                                "capture_end_seq",
+                                candidate.seq_idx,
+                            )
+                        )
+                    ),
+                    (
+                        launch_candidates[0]
+                        if len(launch_candidates) == 1
+                        else None
+                    ),
+                )
+                if launch_owner is not None:
+                    owner_id = str(
+                        launch_owner.annotations.get(
+                            "compute_instance_id",
+                            "",
+                        )
+                    )
+            source_template, source_node = source_nodes[source_event.op_id]
+            owned_by_parent[owner_id].append(
                 _OwnedCollective(
                     spec=spec,
                     event=event,
                     source_template=source_template,
                     source_node=source_node,
+                    owner_compute_instance_id=owner_id,
                 )
             )
 
@@ -477,6 +692,12 @@ class FSDPStageOwnershipPlugin:
             and source_nodes[event.op_id][1].annotations.get(
                 "raw_op_type"
             ) == "comm.allgather"
+        }
+        marker_op_ids = {
+            op_id
+            for template in step_templates.values()
+            for op_id, node in template.nodes.items()
+            if node.annotations.get("fsdp_marker")
         }
         next_synthetic_id = min(
             (op_id for template in step_templates.values() for op_id in template.nodes),
@@ -541,9 +762,14 @@ class FSDPStageOwnershipPlugin:
                     if variant_index == 0
                     else f"{base_id}__comm_v{variant_index}"
                 )
+                removed_op_ids = fsdp_op_ids | marker_op_ids
+                regions = _fsdp_group_regions(
+                    base_template,
+                    removed_op_ids,
+                )
                 pure = _copy_without_nodes(
                     base_template,
-                    fsdp_op_ids,
+                    removed_op_ids,
                     annotations={
                         **base_template.annotations,
                         "communication_ownership_normalized": True,
@@ -564,15 +790,64 @@ class FSDPStageOwnershipPlugin:
                         next_synthetic_id -= 1
                     node_id_map[original_id] = new_id
 
-                pure_entry_nodes = [
-                    op_id
-                    for op_id, node in pure.nodes.items()
-                    if not any(pred in pure.nodes for pred in node.predecessors)
-                ]
+                region_by_group = {
+                    region.group_id: region for region in regions
+                }
+                regions_by_module: dict[
+                    str, list[_FSDPGroupRegion]
+                ] = defaultdict(list)
+                for region in regions:
+                    if region.module_fqn:
+                        regions_by_module[region.module_fqn].append(region)
+
+                comm_id_by_group = {
+                    str(item.spec.annotations.get("fsdp_group_id", "")):
+                    node_id_map[item.source_node.op_id]
+                    for item in owned
+                }
                 successor_links: dict[int, list[int]] = defaultdict(list)
+                residency_intervals: list[dict[str, object]] = []
                 for item in owned:
                     source = item.source_node
                     new_id = node_id_map[source.op_id]
+                    group_id = str(
+                        item.spec.annotations.get("fsdp_group_id", "")
+                    )
+                    module_fqn = (
+                        item.event.fsdp_module_fqn
+                        or str(
+                            item.spec.annotations.get(
+                                "fsdp_module_fqn",
+                                "",
+                            )
+                        )
+                    )
+                    prefetch_source_fqn = (
+                        item.event.fsdp_prefetch_source_fqn
+                        or str(
+                            item.spec.annotations.get(
+                                "fsdp_prefetch_source_fqn",
+                                "",
+                            )
+                        )
+                    )
+                    prefetch_type = (
+                        item.event.fsdp_prefetch_type
+                        or str(
+                            item.spec.annotations.get(
+                                "fsdp_prefetch_type",
+                                "",
+                            )
+                        )
+                    )
+                    region = region_by_group.get(group_id)
+                    if region is None and module_fqn:
+                        module_regions = regions_by_module.get(
+                            module_fqn,
+                            [],
+                        )
+                        if len(module_regions) == 1:
+                            region = module_regions[0]
                     predecessors = [
                         (
                             node_id_map[predecessor]
@@ -583,15 +858,171 @@ class FSDPStageOwnershipPlugin:
                         if predecessor in pure.nodes
                         or predecessor in node_id_map
                     ]
+                    captured_successors = [
+                        successor
+                        for successor in source.successors
+                        if successor in pure.nodes
+                    ]
+                    source_is_captured = (
+                        item.source_template == base_id
+                        and source.op_id in base_source_ids
+                    )
+                    target_parent_id = str(
+                        item.spec.annotations.get(
+                            "parent_compute_instance_id",
+                            "",
+                        )
+                    )
+                    cross_action_prefetch = (
+                        item.owner_compute_instance_id
+                        != target_parent_id
+                    )
+                    placement = (
+                        "cross_action_prefetch"
+                        if cross_action_prefetch
+                        else "captured"
+                    )
+                    target_entries: tuple[int, ...] = tuple(
+                        captured_successors
+                    )
+                    if not captured_successors:
+                        if cross_action_prefetch:
+                            source_regions = regions_by_module.get(
+                                prefetch_source_fqn,
+                                [],
+                            )
+                            source_group_ids = {
+                                source_region.group_id
+                                for source_region in source_regions
+                            }
+                            predecessors.extend(
+                                comm_id
+                                for source_group_id in source_group_ids
+                                if (
+                                    comm_id := comm_id_by_group.get(
+                                        source_group_id
+                                    )
+                                )
+                                is not None
+                            )
+                            predecessors = list(
+                                dict.fromkeys(predecessors)
+                            )
+                            target_entries = ()
+                        elif region is None:
+                            if source_is_captured:
+                                residency_intervals.append({
+                                    "fsdp_group_id": group_id,
+                                    "fsdp_module_fqn": module_fqn,
+                                    "allgather_op_id": new_id,
+                                    "target_entry_op_ids": [],
+                                    "release_after_op_ids": [],
+                                    "fsdp_prefetch_source_fqn": (
+                                        prefetch_source_fqn
+                                    ),
+                                    "fsdp_prefetch_type": prefetch_type,
+                                    "ownership_placement": placement,
+                                })
+                                annotations = dict(source.annotations)
+                                annotations.update({
+                                    "communication_owner": "L1_STAGE",
+                                    "source_op_id": source.op_id,
+                                    "fsdp_group_id": group_id,
+                                    "fsdp_module_fqn": module_fqn,
+                                    "fsdp_prefetch_source_fqn": (
+                                        prefetch_source_fqn
+                                    ),
+                                    "fsdp_prefetch_type": prefetch_type,
+                                    "ownership_placement": placement,
+                                })
+                                pure.nodes[new_id] = _clone_node(
+                                    source,
+                                    op_id=new_id,
+                                    predecessors=predecessors,
+                                    annotations=annotations,
+                                )
+                                continue
+                            raise RuntimeError(
+                                "compute-local FSDP all-gather has no "
+                                "parameter-group compute region: "
+                                f"template={base_id}, group={group_id}, "
+                                f"module={module_fqn!r}"
+                            )
+                        if (
+                            not cross_action_prefetch
+                            and region is not None
+                        ):
+                            target_entries = region.entry_op_ids
+                        if (
+                            not cross_action_prefetch
+                            and not target_entries
+                        ):
+                            raise RuntimeError(
+                                "compute-local FSDP parameter group has no "
+                                "compute entry: "
+                                f"template={base_id}, group={group_id}, "
+                                f"module={module_fqn!r}"
+                            )
+                        if (
+                            not cross_action_prefetch
+                            and prefetch_source_fqn
+                        ):
+                            placement = "layer_prefetch"
+                            source_regions = regions_by_module.get(
+                                prefetch_source_fqn,
+                                [],
+                            )
+                            source_group_ids = {
+                                source_region.group_id
+                                for source_region in source_regions
+                            }
+                            predecessors.extend(
+                                comm_id
+                                for source_group_id in source_group_ids
+                                if (
+                                    comm_id := comm_id_by_group.get(
+                                        source_group_id
+                                    )
+                                )
+                                is not None
+                            )
+                        elif not cross_action_prefetch:
+                            placement = "layer_jit"
+                            predecessors.extend(
+                                region.external_predecessors
+                            )
+                            if not predecessors:
+                                previous_regions = [
+                                    candidate
+                                    for candidate in regions
+                                    if candidate.release_seq_idx
+                                    <= region.wait_seq_idx
+                                ]
+                                if previous_regions:
+                                    previous = max(
+                                        previous_regions,
+                                        key=lambda candidate: (
+                                            candidate.release_seq_idx,
+                                            candidate.wait_seq_idx,
+                                        ),
+                                    )
+                                    predecessors.extend(
+                                        previous.exit_op_ids
+                                    )
+                    predecessors = list(dict.fromkeys(predecessors))
                     annotations = dict(source.annotations)
                     annotations.update({
                         "communication_owner": "L1_STAGE",
                         "source_op_id": source.op_id,
-                        "fsdp_group_id": item.event.fsdp_group_id,
-                        "ownership_placement": (
-                            "captured"
-                            if item.source_template == base_id
-                            else "compute_prelude"
+                        "fsdp_group_id": group_id,
+                        "fsdp_module_fqn": module_fqn,
+                        "fsdp_prefetch_source_fqn": (
+                            prefetch_source_fqn
+                        ),
+                        "fsdp_prefetch_type": prefetch_type,
+                        "ownership_placement": placement,
+                        "fsdp_target_compute_instance_id": (
+                            target_parent_id
                         ),
                     })
                     pure.nodes[new_id] = _clone_node(
@@ -600,29 +1031,31 @@ class FSDPStageOwnershipPlugin:
                         predecessors=predecessors,
                         annotations=annotations,
                     )
-                    for successor in source.successors:
-                        if successor in pure.nodes:
-                            successor_links[new_id].append(successor)
+                    successor_links[new_id].extend(target_entries)
+                    residency_intervals.append({
+                        "fsdp_group_id": group_id,
+                        "fsdp_module_fqn": module_fqn,
+                        "allgather_op_id": new_id,
+                        "target_entry_op_ids": list(target_entries),
+                        "release_after_op_ids": (
+                            list(region.exit_op_ids)
+                            if region is not None
+                            else []
+                        ),
+                        "fsdp_prefetch_source_fqn": (
+                            prefetch_source_fqn
+                        ),
+                        "fsdp_prefetch_type": prefetch_type,
+                        "ownership_placement": placement,
+                        "fsdp_target_compute_instance_id": (
+                            target_parent_id
+                        ),
+                    })
 
                 for comm_id, successors in successor_links.items():
                     for successor in successors:
                         if comm_id not in pure.nodes[successor].predecessors:
                             pure.nodes[successor].predecessors.append(comm_id)
-
-                for item in owned:
-                    comm_id = node_id_map[item.source_node.op_id]
-                    node = pure.nodes[comm_id]
-                    has_internal_predecessor = any(
-                        predecessor in pure.nodes
-                        for predecessor in node.predecessors
-                    )
-                    if (
-                        not has_internal_predecessor
-                        and not successor_links.get(comm_id)
-                    ):
-                        for entry in pure_entry_nodes:
-                            if comm_id not in pure.nodes[entry].predecessors:
-                                pure.nodes[entry].predecessors.append(comm_id)
 
                 _refresh_graph_topology(pure)
                 if not pure.is_acyclic:
@@ -637,6 +1070,7 @@ class FSDPStageOwnershipPlugin:
                     "fsdp_communication_signature": [
                         list(item.signature) for item in owned
                     ],
+                    "fsdp_residency_intervals": residency_intervals,
                 })
                 step_templates[template_id] = pure
                 normalized_templates[signature] = template_id
@@ -651,6 +1085,31 @@ class FSDPStageOwnershipPlugin:
                 spec.template_ref = normalized_templates[signature]
                 spec.annotations["internal_fsdp_collectives"] = len(signature)
                 spec.annotations["communication_ownership_normalized"] = True
+
+
+class FSDPMarkerCleanupPlugin:
+    """Remove capture-only FSDP structural markers from exported templates."""
+
+    def apply(
+        self,
+        *,
+        step_templates: dict[str, StepGraph],
+        specs: list[ActionSpec],
+        comm_events: list[CommEvent],
+    ) -> list[ActionSpec]:
+        del comm_events
+        for template_id, template in list(step_templates.items()):
+            marker_ids = {
+                op_id
+                for op_id, node in template.nodes.items()
+                if node.annotations.get("fsdp_marker")
+            }
+            if not marker_ids:
+                continue
+            cleaned = _copy_without_nodes(template, marker_ids)
+            _refresh_graph_topology(cleaned)
+            step_templates[template_id] = cleaned
+        return specs
 
 
 class GradientReductionOwnershipPlugin:
@@ -803,6 +1262,7 @@ def normalize_communication_ownership(
     ]
     fsdp_plugin = FSDPStageOwnershipPlugin()
     plugins.append(fsdp_plugin)
+    plugins.append(FSDPMarkerCleanupPlugin())
     gradient_plugin = GradientReductionOwnershipPlugin()
     plugins.append(gradient_plugin)
     embedded_plugin = EmbeddedStageCommunicationPlugin()

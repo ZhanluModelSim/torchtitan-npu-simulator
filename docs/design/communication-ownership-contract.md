@@ -48,8 +48,39 @@ Every compute action references the correct variant through `template_ref`.
 The downstream system predicts and replays each referenced template as-is.
 
 Independent stage-local collectives are connected to the compute entries that
-need their results. Multiple independent FSDP groups remain parallel unless
-the captured graph records a dependency between them.
+need their results. FSDP ownership uses captured parameter-group boundaries,
+not the whole stage:
+
+```text
+unshard_wait(group N)
+  -> compute region for group N
+  -> reshard_release(group N)
+```
+
+The capture-only boundary markers are removed before export. The resulting
+template records each interval in
+`StepGraph.annotations["fsdp_residency_intervals"]`, including the group/module,
+all-gather node, target entries, release exits, prefetch source, and placement.
+
+The placement values are:
+
+| value | meaning |
+| --- | --- |
+| `captured` | the original all-gather and its tensor edges were in this template |
+| `layer_jit` | all-gather starts after the previous group and gates only its own group |
+| `layer_prefetch` | all-gather starts when the source group is ready and overlaps source compute |
+| `cross_action_prefetch` | all-gather is launched by one compute action for a later compute action |
+
+`cross_action_prefetch` belongs to the launch action's L1 template. It is an
+exit of that template when the target use is in a later action; the later
+action must not contain a duplicate all-gather. Rank-local action order then
+provides target readiness.
+
+Multiple independent FSDP groups remain parallel unless the captured graph
+records a dependency between them. There is no fallback that connects a
+missing all-gather to every stage entry. A sharded transition without either
+captured tensor edges or a matching parameter-group boundary is a capture
+error.
 
 ## 3. L2 Communication
 
@@ -92,6 +123,11 @@ For each COMPUTE action:
 3. do not synthesize FSDP communication from the schedule name;
 4. do not add L2 communication for a collective already in the template.
 
+The downstream system does not need to interpret
+`fsdp_residency_intervals` to reconstruct dependencies: the required edges
+are already present in the L1 graph. The annotation is for validation,
+visualization, and memory accounting.
+
 For each explicit L2 communication action, replay only its own communication
 fragment or `CommDetail`. L2 controls pipeline order, external prefetch, and
 standalone collectives. It does not edit an already predicted L1 template.
@@ -118,6 +154,11 @@ For 1F1B and DualPipeV with `reshard_after_forward=always`:
 4. reduce-scatter in B/I/W has no duplicate L2 REDUCE_GRAD;
 5. PP P2P is absent from compute templates and present in SEND/RECV fragments;
 6. all non-external DataSlots have a producer and replay reaches every action.
+7. no exported template contains `sim.fsdp_*` marker operators;
+8. a copied all-gather gates only its parameter-group entries, never every
+   entry of the stage;
+9. a cross-action prefetch appears in the launch template and not the target
+   template.
 
 For non-PP capture, stage-local communication remains in the ordinary F/B
 templates and no PP fragment is created.

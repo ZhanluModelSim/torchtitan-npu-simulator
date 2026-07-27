@@ -55,6 +55,9 @@ class FSDPResidencyEvent:
     action_order: int = -1
     transition_id: str = ""
     schedule_source: str = "state"
+    module_fqn: str = ""
+    prefetch_source_fqn: str = ""
+    prefetch_type: str = ""
 
 
 @dataclass(slots=True)

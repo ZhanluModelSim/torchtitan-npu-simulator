@@ -137,6 +137,20 @@ stage 外真实梯度归约 -> BACKWARD -> REDUCE_GRAD -> OPTIMIZER
 需要由 L2 单独调度。详细规则见
 [`communication-ownership-contract.md`](./communication-ownership-contract.md)。
 
+同一个 virtual stage 的相邻 F/B/I/W action 之间可能发生 FSDP 跨 action
+prefetch。例如 B 或 W 尾部发起 all-gather，为稍后的 F 准备参数。该通信已经归入实际发起
+它的 L1 模板，并标记为 `ownership_placement=cross_action_prefetch`；目标 F 模板不会重复包含
+它。下游仍按原有规则执行，不需要新增边：
+
+1. 完整执行 launch action 引用的 L1 图，包括该 all-gather；
+2. all-gather 作为 L1 图出口时，launch action 要等它完成；
+3. 继续遵守 rank-local 顶层 `schedule_order`；
+4. 不要因为目标 F 中没有相同 all-gather 而在 L2 补通信。
+
+层内 prefetch 则直接表现为 L1 DAG 中两个可并行分支：目标层 all-gather 和来源层 compute
+共享前置 readiness，目标层 compute 等待 all-gather。即使后端暂时把 DualPipeV 的双图
+overlap 串行化，也必须保留单张 L1 图内部的通信/计算并行关系。
+
 一个物理 rank 拥有多个虚拟 stage 时，参数基线和 FSDP residency 都按物理 rank 汇总。小模型中
 embedding/output 可能远大于 transformer layer，因此 V 形切分可能产生明显 rank 间显存不均；
 不能据此把较小 rank 的参数补齐到平均值。
@@ -157,6 +171,7 @@ embedding/output 可能远大于 transformer layer，因此 V 形切分可能产
 7. local transfer 只有 DataSlot，没有 P2P endpoint；
 8. 每个 rank 最终完成全部 parent、child、通信和 FSDP action；
 9. 无法推进时打印 pending parent、child readiness、缺失 slot 和未配对 transfer。
+10. L1 中不存在 `sim.fsdp_*`，且 `cross_action_prefetch` 未在目标 action 重复。
 
 PP=2 的最小验收应覆盖：
 

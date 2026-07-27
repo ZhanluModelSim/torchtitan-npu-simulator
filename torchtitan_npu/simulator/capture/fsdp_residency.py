@@ -21,10 +21,76 @@ _active_fsdp_transition: contextvars.ContextVar[tuple[str, str]] = (
         default=("", ""),
     )
 )
+_active_fsdp_communication_context: contextvars.ContextVar[
+    tuple[str, str, str]
+] = contextvars.ContextVar(
+    "simulator_active_fsdp_communication_context",
+    default=("", "", ""),
+)
+_active_fsdp_prefetch_source: contextvars.ContextVar[
+    tuple[str, str]
+] = contextvars.ContextVar(
+    "simulator_active_fsdp_prefetch_source",
+    default=("", ""),
+)
+_active_fsdp_state_source: contextvars.ContextVar[str] = (
+    contextvars.ContextVar(
+        "simulator_active_fsdp_state_source",
+        default="",
+    )
+)
 
 
 def get_active_fsdp_transition() -> tuple[str, str]:
     return _active_fsdp_transition.get()
+
+
+def get_active_fsdp_communication_context() -> tuple[str, str, str]:
+    return _active_fsdp_communication_context.get()
+
+
+def _module_fqn(param_group: Any) -> str:
+    return str(getattr(param_group, "_module_fqn", "") or "")
+
+
+def _transition_prefetch(param_group: Any) -> tuple[str, str]:
+    return (
+        str(getattr(param_group, "_sim_prefetch_source_fqn", "") or ""),
+        str(getattr(param_group, "_sim_prefetch_type", "") or ""),
+    )
+
+
+def _record_fsdp_marker(
+    param_group: Any,
+    marker: str,
+    *,
+    prefetch_source_fqn: str = "",
+    prefetch_type: str = "",
+) -> None:
+    from torchtitan_npu.simulator.capture.dispatch_capture import (
+        get_active_capture,
+    )
+
+    capture = get_active_capture()
+    if capture is None:
+        return
+    module_fqn = _module_fqn(param_group)
+    capture.record_synthetic_op(
+        raw_op_type=f"sim.fsdp_{marker}",
+        inputs=[],
+        outputs=[],
+        module_path=module_fqn,
+        extra_annotations={
+            "fsdp_marker": marker,
+            "fsdp_group_id": str(id(param_group)),
+            "fsdp_module_fqn": module_fqn,
+            "fsdp_transition_id": str(
+                getattr(param_group, "_sim_active_transition_id", "") or ""
+            ),
+            "fsdp_prefetch_source_fqn": prefetch_source_fqn,
+            "fsdp_prefetch_type": prefetch_type,
+        },
+    )
 
 
 def _memory_tracking_enabled() -> bool:
@@ -108,6 +174,9 @@ def _record_residency(
         include_schedule=include_schedule,
         include_memory=include_memory,
         schedule_source=schedule_source,
+        module_fqn=_module_fqn(param_group),
+        prefetch_source_fqn=_transition_prefetch(param_group)[0],
+        prefetch_type=_transition_prefetch(param_group)[1],
     )
 
 
@@ -129,6 +198,7 @@ def _set_stage_fsdp_state(meta_env: Any, state: str) -> None:
 
 def install_fsdp_residency_hooks() -> None:
     from torch.distributed.fsdp._fully_shard._fsdp_param_group import FSDPParamGroup
+    from torch.distributed.fsdp._fully_shard._fsdp_state import FSDPState
     import torchtitan_npu.simulator.meta_env as meta_env
 
     if hasattr(FSDPParamGroup, "_sim_orig_unshard"):
@@ -137,6 +207,9 @@ def install_fsdp_residency_hooks() -> None:
     FSDPParamGroup._sim_orig_unshard = FSDPParamGroup.unshard
     FSDPParamGroup._sim_orig_wait_for_unshard = FSDPParamGroup.wait_for_unshard
     FSDPParamGroup._sim_orig_reshard = FSDPParamGroup.reshard
+    orig_prefetch_unshard = FSDPParamGroup._prefetch_unshard
+    orig_state_pre_forward = FSDPState._pre_forward
+    orig_state_pre_backward = FSDPState._pre_backward
 
     def patched_unshard(self, async_op=False):  # noqa: ANN001, ANN202
         from torchtitan_npu.simulator.capture.comm_events import get_active_recorder
@@ -161,9 +234,16 @@ def install_fsdp_residency_hooks() -> None:
         previous_comm_layer = meta_env._comm_layer
         meta_env._comm_layer = "L2"
         token = _active_fsdp_transition.set((transition_id, group_id))
+        prefetch_source_fqn, prefetch_type = (
+            _active_fsdp_prefetch_source.get()
+        )
+        communication_token = _active_fsdp_communication_context.set(
+            (_module_fqn(self), prefetch_source_fqn, prefetch_type)
+        )
         try:
             result = FSDPParamGroup._sim_orig_unshard(self, async_op)
         finally:
+            _active_fsdp_communication_context.reset(communication_token)
             _active_fsdp_transition.reset(token)
             meta_env._comm_layer = previous_comm_layer
         launched_collective = recorder is not None and any(
@@ -173,6 +253,8 @@ def install_fsdp_residency_hooks() -> None:
         if launched_collective:
             self._sim_active_transition_id = transition_id
             self._sim_pending_transition_id = ""
+            self._sim_prefetch_source_fqn = prefetch_source_fqn
+            self._sim_prefetch_type = prefetch_type
         elif previous_transition_id:
             pass
         elif previous_pending_transition_id:
@@ -183,6 +265,8 @@ def install_fsdp_residency_hooks() -> None:
             # Async unshard has been requested but residency starts only when
             # wait_for_unshard observes the state transition.
             self._sim_pending_transition_id = transition_id
+            self._sim_prefetch_source_fqn = prefetch_source_fqn
+            self._sim_prefetch_type = prefetch_type
         effective_transition_id = getattr(
             self, "_sim_active_transition_id", ""
         ) or getattr(self, "_sim_pending_transition_id", "")
@@ -230,6 +314,14 @@ def install_fsdp_residency_hooks() -> None:
                 shard_world_size,
                 getattr(self, "_sim_active_transition_id", ""),
             )
+        if self.is_unsharded:
+            prefetch_source_fqn, prefetch_type = _transition_prefetch(self)
+            _record_fsdp_marker(
+                self,
+                "unshard_wait",
+                prefetch_source_fqn=prefetch_source_fqn,
+                prefetch_type=prefetch_type,
+            )
         return result
 
     def patched_reshard(self):  # noqa: ANN001, ANN202
@@ -269,12 +361,65 @@ def install_fsdp_residency_hooks() -> None:
                 shard_world_size,
                 transition_id,
             )
+            prefetch_source_fqn, prefetch_type = _transition_prefetch(self)
+            _record_fsdp_marker(
+                self,
+                "reshard_release",
+                prefetch_source_fqn=prefetch_source_fqn,
+                prefetch_type=prefetch_type,
+            )
             self._sim_active_transition_id = ""
             self._sim_pending_transition_id = ""
+            self._sim_prefetch_source_fqn = ""
+            self._sim_prefetch_type = ""
         elif explicit_schedule_action:
             self._sim_pending_transition_id = ""
         return result
 
+    def _state_module_fqn(state: Any) -> str:
+        for param_group in getattr(state, "_fsdp_param_groups", ()):
+            if module_fqn := _module_fqn(param_group):
+                return module_fqn
+        return ""
+
+    def patched_state_pre_forward(self, *args, **kwargs):  # noqa: ANN001, ANN202
+        token = _active_fsdp_state_source.set(_state_module_fqn(self))
+        try:
+            return orig_state_pre_forward(self, *args, **kwargs)
+        finally:
+            _active_fsdp_state_source.reset(token)
+
+    def patched_state_pre_backward(self, *args, **kwargs):  # noqa: ANN001, ANN202
+        token = _active_fsdp_state_source.set(_state_module_fqn(self))
+        try:
+            return orig_state_pre_backward(self, *args, **kwargs)
+        finally:
+            _active_fsdp_state_source.reset(token)
+
+    def patched_prefetch_unshard(  # noqa: ANN202
+        target_param_group,
+        pass_type,
+    ):
+        source_fqn = _active_fsdp_state_source.get()
+        _record_fsdp_marker(
+            target_param_group,
+            "prefetch_launch",
+            prefetch_source_fqn=source_fqn,
+            prefetch_type=str(pass_type),
+        )
+        token = _active_fsdp_prefetch_source.set(
+            (source_fqn, str(pass_type))
+        )
+        try:
+            return orig_prefetch_unshard(target_param_group, pass_type)
+        finally:
+            _active_fsdp_prefetch_source.reset(token)
+
     FSDPParamGroup.unshard = patched_unshard
     FSDPParamGroup.wait_for_unshard = patched_wait_for_unshard
     FSDPParamGroup.reshard = patched_reshard
+    FSDPParamGroup._prefetch_unshard = staticmethod(
+        patched_prefetch_unshard
+    )
+    FSDPState._pre_forward = patched_state_pre_forward
+    FSDPState._pre_backward = patched_state_pre_backward

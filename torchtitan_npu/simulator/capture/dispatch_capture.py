@@ -96,6 +96,7 @@ class _RawEvent:
     # FSDP sharding state active when this op ran ("SHARDED"/"UNSHARDED"/"NA").
     fsdp_state: str = "NA"
     tensor_shape_scope: str = "local"
+    extra_annotations: dict[str, Any] | None = None
 
 
 def _shape_signature(event: _RawEvent) -> tuple:
@@ -113,6 +114,12 @@ def _shape_signature(event: _RawEvent) -> tuple:
         event.tensor_shape_scope,
         tuple(tuple(i.shape) for i in event.inputs),
         tuple(tuple(o.shape) for o in event.outputs),
+        tuple(
+            sorted(
+                (str(key), repr(value))
+                for key, value in (event.extra_annotations or {}).items()
+            )
+        ),
     )
 
 
@@ -231,6 +238,7 @@ class OpDispatchCapture(TorchDispatchMode):
         logical_dtensor_shapes: bool = False,
         memory_inputs: list[torch.Tensor] | None = None,
         memory_outputs: list[torch.Tensor] | None = None,
+        extra_annotations: dict[str, Any] | None = None,
     ) -> None:
         """Manually register one synthetic L0 event, as if `raw_op_type` had
         gone through __torch_dispatch__ normally. Used by
@@ -280,6 +288,7 @@ class OpDispatchCapture(TorchDispatchMode):
                 if memory_outputs is not None
                 else None
             ),
+            extra_annotations=extra_annotations,
         )
 
     def _record_event(
@@ -294,6 +303,7 @@ class OpDispatchCapture(TorchDispatchMode):
         tensor_shape_scope: str = "local",
         memory_flat_inputs: list[torch.Tensor] | None = None,
         memory_flat_outputs: list[torch.Tensor] | None = None,
+        extra_annotations: dict[str, Any] | None = None,
     ) -> None:
         if not self._capture_l0:
             return  # pass-through: duplicate (stage, comp_type) class skips L0 capture
@@ -368,6 +378,11 @@ class OpDispatchCapture(TorchDispatchMode):
             comp_type=comp_type,
             fsdp_state=fsdp_state,
             tensor_shape_scope=tensor_shape_scope,
+            extra_annotations=(
+                dict(extra_annotations)
+                if extra_annotations is not None
+                else None
+            ),
         )
         signature = _shape_signature(candidate)
 
@@ -469,6 +484,8 @@ class OpDispatchCapture(TorchDispatchMode):
                 annotations["pp_stage"] = event.pp_stage
             if event.pp_mb_idx >= 0:
                 annotations["pp_mb_idx"] = event.pp_mb_idx
+            if event.extra_annotations:
+                annotations.update(event.extra_annotations)
             nodes[event.op_id] = OpNode(
                 op_id=event.op_id,
                 op_type=event.op_type,

@@ -467,6 +467,9 @@ class CapturedTraceAssembler:
                 ),
                 "fsdp_schedule_source": event.schedule_source,
                 "capture_action_order": event.action_order,
+                "fsdp_module_fqn": event.module_fqn,
+                "fsdp_prefetch_source_fqn": event.prefetch_source_fqn,
+                "fsdp_prefetch_type": event.prefetch_type,
             },
         )
 

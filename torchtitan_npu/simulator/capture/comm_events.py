@@ -76,6 +76,9 @@ class CommEvent:
     action_order: int = -1
     fsdp_transition_id: str = ""
     fsdp_group_id: str = ""
+    fsdp_module_fqn: str = ""
+    fsdp_prefetch_source_fqn: str = ""
+    fsdp_prefetch_type: str = ""
 
 
 class _NoOpWork:
@@ -211,6 +214,9 @@ class CommEventRecorder:
         include_schedule: bool = True,
         include_memory: bool = True,
         schedule_source: str = "state",
+        module_fqn: str = "",
+        prefetch_source_fqn: str = "",
+        prefetch_type: str = "",
     ) -> None:
         from torchtitan_npu.simulator.capture.dispatch_capture import _seq_counter
 
@@ -239,6 +245,9 @@ class CommEventRecorder:
             action_order=self.next_action_order(),
             transition_id=transition_id,
             schedule_source=schedule_source,
+            module_fqn=module_fqn,
+            prefetch_source_fqn=prefetch_source_fqn,
+            prefetch_type=prefetch_type,
         )
         if include_schedule:
             self.fsdp_schedule_events.append(event)
@@ -376,12 +385,18 @@ def _record_comm_with_l0(
     event.fsdp_state = str(_pp_context.get("fsdp_state", "NA"))
     try:
         from torchtitan_npu.simulator.capture.fsdp_residency import (
+            get_active_fsdp_communication_context,
             get_active_fsdp_transition,
         )
 
         transition_id, group_id = get_active_fsdp_transition()
         event.fsdp_transition_id = transition_id
         event.fsdp_group_id = group_id
+        (
+            event.fsdp_module_fqn,
+            event.fsdp_prefetch_source_fqn,
+            event.fsdp_prefetch_type,
+        ) = get_active_fsdp_communication_context()
     except ImportError:
         pass
     # For FSDP collective comm (allgather/reduce_scatter), record the active
@@ -392,6 +407,7 @@ def _record_comm_with_l0(
     if not event.p2p_direction:
         try:
             event.p2p_stage = int(_pp_context.get("stage", -1))
+            event.p2p_mb_idx = int(_pp_context.get("mb_idx", -1))
         except (TypeError, ValueError):
             pass
 
@@ -408,6 +424,15 @@ def _record_comm_with_l0(
             raw_op_type=f"comm.{comm_primitive}",
             inputs=[tensor],
             outputs=[out],
+            module_path=event.fsdp_module_fqn,
+            extra_annotations={
+                "fsdp_group_id": event.fsdp_group_id,
+                "fsdp_module_fqn": event.fsdp_module_fqn,
+                "fsdp_prefetch_source_fqn": (
+                    event.fsdp_prefetch_source_fqn
+                ),
+                "fsdp_prefetch_type": event.fsdp_prefetch_type,
+            },
         )
         # Link the L0 op to this CommEvent and store comm metadata in annotations
         if len(capture._events) > event_count_before:
