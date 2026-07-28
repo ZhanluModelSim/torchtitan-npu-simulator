@@ -342,8 +342,8 @@ class DSV32_SDPA(Module):  # noqa: N801
         q_indexer: torch.Tensor | None = None,
         k_indexer: torch.Tensor | None = None,
         weights: torch.Tensor | None = None,
-        end_pos: torch.Tensor | None = None,
-        index_topk: torch.Tensor | None = None,
+        end_pos: int | None = None,
+        index_topk: int | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         bsz = q.size(0)
 
@@ -359,6 +359,8 @@ class DSV32_SDPA(Module):  # noqa: N801
                 )
             return q.new_zeros(1), output
 
+        assert end_pos is not None
+        assert index_topk is not None
         # prepare attention_mask for sparse attention according to lightning_indexer score
         index_score = bf16_index(
             q_indexer.contiguous(),
@@ -674,7 +676,7 @@ class TransformerBlockV32(DeepSeekV3TransformerBlock):
             assert config.feed_forward is not None
             self.feed_forward = config.feed_forward.build()
 
-    # pyrefly: ignore [bad-param-name-override]
+    # pyrefly: ignore [bad-param-name-override, bad-override]
     def forward(
         self,
         x: torch.Tensor,

@@ -37,6 +37,7 @@ def _apply_patches():
 
     # patching torchtitan
     from torchtitan_npu.patches.torchtitan import (  # noqa: F401
+        attention,
         attention_varlen_cpu,
         chat_dataset,
         expert_parallel,
@@ -44,6 +45,7 @@ def _apply_patches():
         loss,
         optimizer,
         pp_loss_normalize,
+        trainer_post_dataloading_process,
     )
 
     # patching model_converter and ops

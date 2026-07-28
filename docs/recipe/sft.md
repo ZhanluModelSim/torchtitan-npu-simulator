@@ -242,7 +242,7 @@ processor 返回 OpenAI 格式消息列表：
 
 1. **编码**：通过 Jinja2 chat template 或 `chat_encoder` 渲染为完整 token 序列
 2. **Label masking**：通过 ChatML header 扫描或编码器返回的 assistant 区间，仅对 assistant 回复计算 loss
-3. **Packing**：对多个样本做 greedy packing（短样本打包到同一 seq_len 窗口，EOS 分隔，per-document position 重置）
+3. **Packing**：当 attention `mask_type` 为 `block_causal`（FlexAttention/VarlenAttention，或 dense-mask SDPA）时，对多个样本做 greedy packing（短样本打包到同一 seq_len 窗口，EOS 分隔，per-document position 重置）。普通 `causal` SDPA 为避免跨文档 attention 会将每个样本 pre-pad 到 `seq_len`，实际上不做 packing
 4. **截断/丢弃**：超过 seq_len 的样本自动丢弃（而非截断）
 
 ---

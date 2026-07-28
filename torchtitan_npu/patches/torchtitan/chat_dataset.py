@@ -21,6 +21,7 @@ from torchtitan.components.loss import IGNORE_INDEX
 from torchtitan.hf_datasets.text_datasets import ChatDataLoader, ChatDataset
 from torchtitan.tools.logging import logger
 
+from torchtitan_npu.patches.torchtitan._trainer_config_stash import get_trainer_config
 from torchtitan_npu.patches.torchtitan.hf_datasets import _mtp_seq_len_delta
 
 _orig_loader_init = ChatDataLoader.__init__
@@ -66,6 +67,18 @@ def _prepare_upstream_loader_config(config):
     return prepared_config
 
 
+def _supports_per_document_masking() -> bool:
+    trainer_config = get_trainer_config()
+    if trainer_config is None or trainer_config.model_spec is None:
+        return True
+    model = trainer_config.model_spec.model
+    layers = getattr(model, "layers", None)
+    if not layers:
+        return True
+    mask_type = getattr(layers[0].attention, "mask_type", "causal")
+    return mask_type == "block_causal"
+
+
 def _patched_loader_init(
     self,
     config,
@@ -94,6 +107,14 @@ def _patched_loader_init(
         local_batch_size=local_batch_size,
         **kwargs,
     )
+
+    self.dataset._greedy_packing = _supports_per_document_masking()
+    if not self.dataset._greedy_packing:
+        logger.warning(
+            "[ChatDataset Patch] Greedy packing is disabled because the attention mask_type "
+            "is not 'block_causal'. Each sample will be padded to seq_len to prevent "
+            "cross-document attention. This differs from upstream ChatDataset behavior."
+        )
 
     if chat_encoder is not None:
         self.dataset._chat_encoder = chat_encoder
@@ -241,6 +262,13 @@ def _patched_tokenize_sample(self, sample):
             self._sample_idx,
         )
         return None
+
+    if not getattr(self, "_greedy_packing", True):
+        pad_len = self.seq_len - len(input_ids)
+        if pad_len > 0:
+            input_ids = list(input_ids) + [self._eos_id] * pad_len
+            label_ids = list(label_ids) + [IGNORE_INDEX] * pad_len
+
     return input_ids, label_ids
 
 

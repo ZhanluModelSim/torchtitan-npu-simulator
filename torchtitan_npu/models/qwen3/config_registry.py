@@ -140,3 +140,27 @@ def sft_qwen3_1_7b_wordle() -> TrainerConfig:
             profile_with_memory=True,
         ),
     )
+
+
+def sft_qwen3_1_7b_wordle_block_causal_sdpa() -> TrainerConfig:
+    """Wordle SFT with packed-document masks evaluated by dense SDPA.
+
+    This is an opt-in recipe.  The ordinary Wordle recipe remains causal SDPA
+    and therefore intentionally disables greedy packing.
+    """
+
+    from torchtitan.models.common.attention import ScaledDotProductAttention
+    from torchtitan.models.common.decoder import Decoder
+
+    base = sft_qwen3_1_7b_wordle()
+    assert base.model_spec is not None
+    model_config = base.model_spec.model
+    assert isinstance(model_config, Decoder.Config)
+    for layer_config in model_config.layers:
+        if not isinstance(layer_config.attention.inner_attention, ScaledDotProductAttention.Config):
+            raise TypeError(
+                "block-causal SDPA requires ScaledDotProductAttention layers, "
+                f"got {type(layer_config.attention.inner_attention).__name__}"
+            )
+        layer_config.attention.mask_type = "block_causal"
+    return base

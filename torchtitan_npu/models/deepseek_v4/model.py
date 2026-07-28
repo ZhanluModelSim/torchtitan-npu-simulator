@@ -1293,7 +1293,7 @@ class MTPModule(DeepSeekV4TransformerBlock):
             normalized_shape=model_args.dim, eps=model_args.norm_eps, param_init=_NORM_INIT
         ).build()
 
-    # pyrefly: ignore [bad-param-name-override]
+    # pyrefly: ignore [bad-param-name-override, bad-override]
     def forward(
         self,
         input_offset: torch.Tensor,
