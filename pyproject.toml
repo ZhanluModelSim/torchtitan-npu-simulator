@@ -3,9 +3,8 @@ requires = ["setuptools>=64"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "torchtitan-npu-lite"
+name = "torchtitan-npu"
 version = "0.1.0"
 description = "Ascend NPU overrides for torchtitan"
 requires-python = ">=3.12"
 dependencies = ["torchtitan", "torch-npu"]
-
