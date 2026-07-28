@@ -119,6 +119,63 @@ def test_pp_replay_follows_stage0_warmup_steady_and_cooldown_order() -> None:
     assert plan.peak_active_bytes >= 4 * activation.num_bytes
 
 
+def test_pp_model_peak_covers_replayed_microbatches_but_excludes_optimizer() -> None:
+    activation = _ref(10)
+    grad = _ref(20, 4)
+    optimizer_state = _ref(30, 1000)
+    events = [
+        _event(1, 101, comp_type="F", phase="forward", outputs=(activation,)),
+        replace(
+            _event(
+                20,
+                201,
+                comp_type="B",
+                phase="backward",
+                inputs=(activation,),
+                outputs=(grad,),
+            ),
+            raw_op_type="aten.mm.default",
+        ),
+        replace(
+            _event(
+                30,
+                301,
+                comp_type="OPTIMIZER",
+                phase="optimizer",
+                inputs=(grad,),
+                outputs=(optimizer_state,),
+            ),
+            raw_op_type="aten.clone.default",
+        ),
+    ]
+    actions = [
+        _action(0, "F", 0),
+        _action(1, "F", 1),
+        _action(2, "B", 0),
+        _action(3, "B", 1),
+        ScheduleAction(
+            id=4,
+            action_id="optimizer",
+            rank=0,
+            stage=0,
+            mb_idx=-1,
+            action_type="OPTIMIZER",
+            comp_type="OPTIMIZER",
+            template_ref="s0_OPTIMIZER",
+            seq_idx=50,
+        ),
+    ]
+
+    plan = estimate_schedule_memory(
+        events,
+        schedule_plan=_plan(actions, pp_degree=2, microbatches=2),
+    )
+
+    assert plan.model_active_bytes_peak == 204
+    assert plan.peak_active_bytes == 1004
+    assert plan.model_active_bytes_peak < plan.peak_active_bytes
+
+
 def test_pp_replay_uses_arbitrary_comp_types_and_flattens_overlap() -> None:
     forward = _event(1, 101, comp_type="F", phase="forward", outputs=(_ref(10),))
     backward_input = _event(2, 201, comp_type="I", phase="backward", outputs=(_ref(20),))

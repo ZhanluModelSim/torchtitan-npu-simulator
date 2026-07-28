@@ -310,6 +310,25 @@ def _phase_peak_active_bytes(
     return peaks
 
 
+def _model_peak_active_bytes(
+    timeline: list[MemoryTimelineEvent],
+    events: list[RawMemoryEvent],
+) -> int:
+    """Return the rank-local peak before optimizer execution begins."""
+    optimizer_start = min(
+        (event.seq_idx for event in events if event.phase == "optimizer"),
+        default=None,
+    )
+    return max(
+        (
+            event.active_bytes_after
+            for event in timeline
+            if optimizer_start is None or event.seq_idx < optimizer_start
+        ),
+        default=0,
+    )
+
+
 def estimate_static_memory(
     raw_events: Iterable[RawMemoryEvent],
     *,
@@ -403,6 +422,7 @@ def estimate_static_memory(
     plan = MemoryPlan(
         persistent_param_bytes=sum(item.num_bytes for item in param_lifetimes),
         peak_active_bytes=peak_event.active_bytes_after if peak_event else 0,
+        model_active_bytes_peak=_model_peak_active_bytes(timeline, events),
         forward_peak_active_bytes=phase_peaks["forward"],
         backward_peak_active_bytes=phase_peaks["backward"],
         optimizer_peak_active_bytes=phase_peaks["optimizer"],

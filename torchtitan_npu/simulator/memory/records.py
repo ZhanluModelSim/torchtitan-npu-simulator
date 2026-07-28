@@ -117,6 +117,7 @@ class MemoryPlan:
     metric: str = "active_tensor_bytes"
     persistent_param_bytes: int = 0
     peak_active_bytes: int = 0
+    model_active_bytes_peak: int = 0
     forward_peak_active_bytes: int = 0
     backward_peak_active_bytes: int = 0
     optimizer_peak_active_bytes: int = 0
@@ -134,6 +135,7 @@ class MemoryPlan:
             "metric": self.metric,
             "persistent_param_bytes": self.persistent_param_bytes,
             "active_bytes_peak": self.peak_active_bytes,
+            "model_active_bytes_peak": self.model_active_bytes_peak,
             "forward_active_bytes_peak": self.forward_peak_active_bytes,
             "backward_active_bytes_peak": self.backward_peak_active_bytes,
             "optimizer_active_bytes_peak": self.optimizer_peak_active_bytes,

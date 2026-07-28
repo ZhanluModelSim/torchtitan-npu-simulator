@@ -59,7 +59,9 @@ WorkloadGraph.iteration.schedule.annotations["memory_plan"]
 ```
 
 其中 `MemoryPlan.persistent_param_bytes` 是当前 rank 的持久参数基线。它不属于 action 依赖，
-应在 step 开始前加入显存状态。
+应在 step 开始前加入显存状态。`model_active_bytes_peak` 是 optimizer 开始前完整 rank-local
+时间线的峰值，覆盖全部 microbatch、PP 通信及 FSDP residency；显存容量判断应优先使用该值，
+而不是包含 optimizer 近似状态的 `active_bytes_peak`。
 
 ### 2.1 Rank-local plan 与逻辑 rank
 

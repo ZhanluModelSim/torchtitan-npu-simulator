@@ -136,6 +136,8 @@ def print_report(analysis: dict[str, Any], top: int) -> None:
     print(f"  forward_end_seq={analysis['forward_end_seq']}")
     print(f"  persistent_param_bytes={_gib(int(summary['persistent_param_bytes'])):.3f} GiB")
     print(f"  active_bytes_peak={_gib(int(summary['active_bytes_peak'])):.3f} GiB")
+    model_peak = int(summary.get("model_active_bytes_peak", summary["active_bytes_peak"]))
+    print(f"  model_active_bytes_peak={_gib(model_peak):.3f} GiB")
     print(
         "  forward_to_backward_residents="
         f"{analysis['resident_count']} tensors, {_gib(analysis['resident_bytes']):.3f} GiB"

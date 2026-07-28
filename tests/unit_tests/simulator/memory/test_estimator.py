@@ -193,6 +193,35 @@ def test_phase_peaks_include_memory_live_on_phase_entry():
     assert plan.optimizer_peak_active_bytes == 16
 
 
+def test_model_peak_excludes_optimizer_allocations():
+    activation = tref(1, 32)
+    grad = tref(2, 16)
+    optimizer_state = tref(3, 512)
+    plan = estimate_static_memory([
+        event(0, 10, "aten.relu.default", outputs=[activation], phase="forward"),
+        event(
+            5,
+            20,
+            "aten.relu_backward.default",
+            inputs=[activation],
+            outputs=[grad],
+            phase="backward",
+        ),
+        event(
+            9,
+            30,
+            "optimizer.step",
+            inputs=[grad],
+            outputs=[optimizer_state],
+            phase="optimizer",
+        ),
+    ])
+
+    assert plan.model_active_bytes_peak == 48
+    assert plan.peak_active_bytes == 528
+    assert plan.to_summary_dict()["model_active_bytes_peak"] == 48
+
+
 def test_missing_parameter_gradients_are_synthesized_through_optimizer():
     model = nn.Linear(4, 2, bias=False, device="meta")
     plan = estimate_static_memory(
@@ -432,6 +461,7 @@ def test_memory_plan_exports_compact_chrome_trace(tmp_path):
     assert trace["metadata"]["forward_active_bytes_peak"] == 64
     assert trace["metadata"]["backward_active_bytes_peak"] == 64
     assert trace["metadata"]["optimizer_active_bytes_peak"] == 0
+    assert trace["metadata"]["model_active_bytes_peak"] == 64
 
     export_memory_plan(plan, str(tmp_path))
     memory_dir = tmp_path / "memory"

@@ -300,7 +300,7 @@ def run_simulation_step(
         wg.iteration.schedule.annotations["memory_summary"] = memory_plan.to_summary_dict()
         for step_graph in wg.step_templates.values():
             step_graph.param_mem = memory_plan.persistent_param_bytes
-            step_graph.peak_active_mem = memory_plan.peak_active_bytes
+            step_graph.peak_active_mem = memory_plan.model_active_bytes_peak
             step_graph.annotations["memory_summary"] = memory_plan.to_summary_dict()
         timings["estimate_memory"] = time.perf_counter() - t9
 
@@ -359,6 +359,7 @@ def run_simulation_step(
             "Static memory: "
             f"persistent_param_bytes={memory_plan.persistent_param_bytes} "
             f"active_bytes_peak={memory_plan.peak_active_bytes} "
+            f"model_active_bytes_peak={memory_plan.model_active_bytes_peak} "
             f"forward_peak={memory_plan.forward_peak_active_bytes} "
             f"backward_peak={memory_plan.backward_peak_active_bytes} "
             f"optimizer_peak={memory_plan.optimizer_peak_active_bytes} "

@@ -432,6 +432,7 @@ seq_idx,phase,op_id,event,tensor_id,kind,bytes,active_bytes_after,reason
   "rank": 0,
   "persistent_param_bytes": 123456789,
   "active_bytes_peak": 234567890,
+  "model_active_bytes_peak": 223456789,
   "peak_seq_idx": 1234,
   "included": [
     "local parameter shards",

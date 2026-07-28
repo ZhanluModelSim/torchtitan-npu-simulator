@@ -33,7 +33,7 @@ def export_text_summary(workload_graph: WorkloadGraph) -> str:
         )
         if step_graph.peak_active_mem:
             lines.append(
-                f"  active_bytes_peak={step_graph.peak_active_mem}  "
+                f"  model_active_bytes_peak={step_graph.peak_active_mem}  "
                 f"persistent_param_bytes={step_graph.param_mem}"
             )
         lines.append(f"  is_acyclic={step_graph.is_acyclic}")
@@ -59,6 +59,7 @@ def export_text_summary(workload_graph: WorkloadGraph) -> str:
         lines.append(
             "  memory "
             f"active_bytes_peak={memory_summary.get('active_bytes_peak', 0)} "
+            f"model_active_bytes_peak={memory_summary.get('model_active_bytes_peak', 0)} "
             f"forward_peak={memory_summary.get('forward_active_bytes_peak', 0)} "
             f"backward_peak={memory_summary.get('backward_active_bytes_peak', 0)} "
             f"optimizer_peak={memory_summary.get('optimizer_active_bytes_peak', 0)} "

@@ -41,6 +41,7 @@ def _print_plan(plan, raw_event_count: int, out_dir: str) -> None:  # noqa: ANN0
     print(f"  raw_memory_events={raw_event_count}")
     print(f"  persistent_param_bytes={plan.persistent_param_bytes}")
     print(f"  active_bytes_peak={plan.peak_active_bytes}")
+    print(f"  model_active_bytes_peak={plan.model_active_bytes_peak}")
     print(f"  peak_seq_idx={plan.peak_seq_idx} peak_phase={plan.peak_phase}")
     print("  largest lifetimes:")
     ranked = sorted(plan.tensor_lifetimes, key=lambda item: item.num_bytes, reverse=True)
