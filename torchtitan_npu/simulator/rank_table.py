@@ -61,7 +61,7 @@ def build_rank_table(parallel_dims: Any) -> RankTable:
     }
 
     process_groups: dict[str, list[list[int]]] = {}
-    dim_by_group_name: dict[str, str] = {}
+    dimensions_by_group_name: dict[str, set[str]] = {}
 
     composite_meshes = getattr(parallel_dims, "_global_meshes", {}) or {}
     for composite in composite_meshes.values():
@@ -70,16 +70,18 @@ def build_rank_table(parallel_dims: Any) -> RankTable:
             continue
         full_tensor = composite.mesh
         for axis_pos, axis_name in enumerate(mesh_dim_names):
+            try:
+                group_name = str(composite[axis_name].get_group().group_name)
+                dimensions_by_group_name.setdefault(group_name, set()).add(
+                    axis_name
+                )
+            except (ValueError, RuntimeError, AttributeError):
+                pass  # single-axis view unavailable (e.g. degree-1 dim) -- harmless
             if axis_name in process_groups:
-                continue  # already captured from an earlier composite mesh
+                continue  # groups already captured from an earlier composite mesh
             groups = _groups_along_axis(full_tensor, axis_pos)
             process_groups[axis_name] = groups
             dim_degrees.setdefault(axis_name, int(full_tensor.shape[axis_pos]))
-            try:
-                group_name = str(composite[axis_name].get_group().group_name)
-                dim_by_group_name[group_name] = axis_name
-            except (ValueError, RuntimeError, AttributeError):
-                pass  # single-axis view unavailable (e.g. degree-1 dim) -- harmless
 
     # Any dimension never discovered via a composite mesh (e.g. tp/cp
     # disabled, degree 1) still gets a trivial per-rank singleton group.
@@ -93,6 +95,12 @@ def build_rank_table(parallel_dims: Any) -> RankTable:
             for idx, rank in enumerate(group):
                 if 0 <= rank < world_size:
                     rank_coordinates[rank][name] = idx
+
+    dim_by_group_name = {
+        group_name: next(iter(dimensions))
+        for group_name, dimensions in dimensions_by_group_name.items()
+        if len(dimensions) == 1
+    }
 
     return RankTable(
         world_size=world_size,

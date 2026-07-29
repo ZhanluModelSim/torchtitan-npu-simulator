@@ -62,3 +62,35 @@ def test_rank_table_to_dict_is_json_serializable(fake_world):
     table = build_rank_table(parallel_dims)
     serialized = json.dumps(table.to_dict())
     assert '"world_size": 16' in serialized
+
+
+def test_rank_table_does_not_assign_ambiguous_shared_group_name(fake_world):
+    from torchtitan.distributed.parallel_dims import ParallelDims
+
+    parallel_dims = ParallelDims(
+        dp_replicate=1,
+        dp_shard=16,
+        cp=1,
+        tp=1,
+        pp=1,
+        ep=8,
+        etp=1,
+        world_size=16,
+    )
+    parallel_dims.build_mesh()
+
+    table = build_rank_table(parallel_dims)
+    dimensions_by_group_name: dict[str, set[str]] = {}
+    for composite in parallel_dims._global_meshes.values():
+        for dimension in composite.mesh_dim_names:
+            try:
+                group_name = str(composite[dimension].get_group().group_name)
+            except (ValueError, RuntimeError, AttributeError):
+                continue
+            dimensions_by_group_name.setdefault(group_name, set()).add(
+                dimension
+            )
+
+    for group_name, dimensions in dimensions_by_group_name.items():
+        if len(dimensions) > 1:
+            assert group_name not in table.dim_by_group_name

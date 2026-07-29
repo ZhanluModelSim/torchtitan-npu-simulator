@@ -84,6 +84,8 @@ class _RawEvent:
     phase: str = "forward"
     execution_kind: str = "original_forward"
     repeat_count: int = 1
+    group_name: str = ""
+    raw_group_name: str = ""
     comm_dim: str = ""
     comm_ranks_str: str = ""
     seq_idx: int = 0
@@ -534,6 +536,10 @@ class OpDispatchCapture(TorchDispatchMode):
                 annotations["cost_unknown"] = True
             if event.comm_dim:
                 annotations["comm_dim"] = event.comm_dim
+            if event.group_name:
+                annotations["group_name"] = event.group_name
+            if event.raw_group_name:
+                annotations["raw_group_name"] = event.raw_group_name
             if event.comm_ranks_str:
                 annotations["comm_ranks"] = event.comm_ranks_str
             if event.pp_stage >= 0:
@@ -562,6 +568,18 @@ class OpDispatchCapture(TorchDispatchMode):
                 if pred_id in nodes:
                     nodes[pred_id].successors.append(op_id)
         return nodes
+
+    def apply_comm_group_names(
+        self,
+        group_names_by_op_id: dict[int, tuple[str, str]],
+    ) -> None:
+        """Apply resolved and raw communication group names to L0 events."""
+        for event in self._events:
+            names = group_names_by_op_id.get(event.op_id)
+            if names is None:
+                continue
+            event.group_name, event.raw_group_name = names
+            event.comm_dim = event.group_name
 
     def memory_events(self) -> list[RawMemoryEvent]:
         """Return the uncollapsed op stream used by static memory planning."""

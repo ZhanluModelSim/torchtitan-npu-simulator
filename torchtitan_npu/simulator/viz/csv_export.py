@@ -79,7 +79,7 @@ def export_kernel_summary_csv(workload_graph: WorkloadGraph, path: str, *, max_r
         rank, step_type, step_id, topo_order, op_id, op_type, raw_op_type,
         inputs_shape, outputs_shape, inputs_dtype, outputs_dtype,
         flops, peak_mem, param_mem, comm_bytes, repeat_count, module_path,
-        phase, comm_dim, comm_ranks
+        phase, group_name, raw_group_name, comm_dim, comm_ranks
 
     Args:
         workload_graph: The captured L3 WorkloadGraph.
@@ -112,7 +112,7 @@ def export_kernel_summary_csv(workload_graph: WorkloadGraph, path: str, *, max_r
         "inputs_dtype", "outputs_dtype",
         "flops", "peak_mem", "param_mem", "comm_bytes",
         "repeat_count", "module_path", "phase", "execution_kind", "is_recompute",
-        "comm_dim", "comm_ranks",
+        "group_name", "raw_group_name", "comm_dim", "comm_ranks",
     ]
 
     template_rows: dict[str, list[list[str]]] = {}
@@ -144,6 +144,8 @@ def export_kernel_summary_csv(workload_graph: WorkloadGraph, path: str, *, max_r
                 ann.get("phase", ""),
                 ann.get("execution_kind", ""),
                 str(ann.get("is_recompute", False)),
+                ann.get("group_name", ""),
+                ann.get("raw_group_name", ""),
                 ann.get("comm_dim", ""),
                 ann.get("comm_ranks", ""),
             ])

@@ -115,7 +115,8 @@ class StepGraph:
                 "comp_type", "fsdp_state",
                 "inputs_shape", "outputs_shape", "inputs_dtype", "outputs_dtype",
                 "flops", "peak_mem", "comm_bytes", "repeat_count",
-                "module_path", "comm_dim", "comm_ranks",
+                "module_path", "group_name", "raw_group_name",
+                "comm_dim", "comm_ranks",
                 "predecessors", "successors",
             ])
             for topo_idx, op_id in enumerate(sorted_ids):
@@ -130,6 +131,7 @@ class StepGraph:
                     dtypes(node.inputs), dtypes(node.outputs),
                     node.flops, node.peak_mem, node.comm_bytes,
                     ann.get("repeat_count", 1), ann.get("module_path", ""),
+                    ann.get("group_name", ""), ann.get("raw_group_name", ""),
                     ann.get("comm_dim", ""), ann.get("comm_ranks", ""),
                     ";".join(str(p) for p in node.predecessors),
                     ";".join(str(s) for s in node.successors),

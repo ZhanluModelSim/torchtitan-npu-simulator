@@ -20,6 +20,7 @@ import torch.nn as nn
 from torchtitan.trainer import Trainer
 
 from torchtitan_npu.simulator.capture.comm_events import capture_fake_collectives
+from torchtitan_npu.simulator.capture.comm_group_resolver import resolve_comm_event_groups
 from torchtitan_npu.simulator.capture.checkpoint_execution import install_checkpoint_execution_tracking
 from torchtitan_npu.simulator.capture.dispatch_capture import OpDispatchCapture
 from torchtitan_npu.simulator.capture.module_path import ModulePathTracker
@@ -248,16 +249,21 @@ def run_simulation_step(
         timings["optimizer"] = t3 - t2
 
     t4 = time.perf_counter()
-    nodes = capture.build_nodes()
-    timings["build_nodes"] = time.perf_counter() - t4
+    rank_table = build_rank_table(parallel_dims)
+    group_names_by_op_id = resolve_comm_event_groups(
+        comm_recorder.events,
+        rank_table,
+    )
+    capture.apply_comm_group_names(group_names_by_op_id)
+    timings["build_rank_table"] = time.perf_counter() - t4
 
     t5 = time.perf_counter()
-    step_templates = build_step_graphs(nodes)
-    timings["build_step_graphs"] = time.perf_counter() - t5
+    nodes = capture.build_nodes()
+    timings["build_nodes"] = time.perf_counter() - t5
 
     t6 = time.perf_counter()
-    rank_table = build_rank_table(parallel_dims)
-    timings["build_rank_table"] = time.perf_counter() - t6
+    step_templates = build_step_graphs(nodes)
+    timings["build_step_graphs"] = time.perf_counter() - t6
 
     t7 = time.perf_counter()
     schedule_plan = build_schedule_plan(
@@ -323,8 +329,8 @@ def run_simulation_step(
     print(f"{'Stage':<30} {'Time (s)':>10} {'%':>8}")
     print("-" * 60)
     total = timings["total"]
-    for name in ["setup", "forward_backward", "optimizer", "build_nodes",
-                 "build_step_graphs", "build_rank_table", "build_schedule_graph",
+    for name in ["setup", "forward_backward", "optimizer", "build_rank_table",
+                 "build_nodes", "build_step_graphs", "build_schedule_graph",
                  "build_schedule_plan", "build_workload_graph", "estimate_memory"]:
         if name not in timings:
             continue

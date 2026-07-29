@@ -45,7 +45,8 @@ class OpNode:
                 "execution_kind", "is_recompute",
                 "inputs_shape", "outputs_shape", "inputs_dtype", "outputs_dtype",
                 "flops", "peak_mem", "param_mem", "comm_bytes",
-                "repeat_count", "module_path", "comm_dim", "comm_ranks",
+                "repeat_count", "module_path", "group_name",
+                "raw_group_name", "comm_dim", "comm_ranks",
                 "predecessors", "successors",
             ])
             shapes = lambda metas: ";".join("[" + ",".join(str(d) for d in m.shape) + "]" for m in metas)
@@ -58,6 +59,7 @@ class OpNode:
                 dtypes(self.inputs), dtypes(self.outputs),
                 self.flops, self.peak_mem, self.param_mem, self.comm_bytes,
                 ann.get("repeat_count", 1), ann.get("module_path", ""),
+                ann.get("group_name", ""), ann.get("raw_group_name", ""),
                 ann.get("comm_dim", ""), ann.get("comm_ranks", ""),
                 ";".join(str(p) for p in self.predecessors),
                 ";".join(str(s) for s in self.successors),

@@ -52,6 +52,7 @@ class CommEvent:
     tensor_shape: tuple[int, ...]
     dtype: str
     volume_bytes: int
+    raw_group_name: str = ""  # framework-generated ProcessGroup identifier
     op_id: int = 0  # L0 OpNode ID if this event was also recorded as a synthetic op
     comm_dim: str = ""  # parallel dimension name (e.g. "tp", "ep", "fsdp")
     comm_ranks: list[list[int]] = field(default_factory=list)  # groups of ranks in this comm domain
@@ -146,14 +147,16 @@ class CommEventRecorder:
         can set ``op_id`` after optionally registering a synthetic L0 op."""
         dtype_str = dtype_to_str(tensor.dtype)
         world_size = _resolve_world_size(group)
+        raw_group_name = _group_name(group)
         event = CommEvent(
             event_id=f"comm_{next(_event_counter)}",
             comm_primitive=comm_primitive,
-            group_name=_group_name(group),
+            group_name=raw_group_name,
             world_size=world_size,
             tensor_shape=tuple(int(d) for d in tensor.shape),
             dtype=dtype_str,
             volume_bytes=tensor_volume_bytes(tuple(tensor.shape), dtype_str),
+            raw_group_name=raw_group_name,
             comm_dim=comm_dim,
             comm_ranks=comm_ranks or [],
             capture_process_rank=self.capture_process_rank,
@@ -439,6 +442,8 @@ def _record_comm_with_l0(
             event.op_id = capture._events[-1].op_id
             # Store comm_dim and comm_ranks in the L0 node's annotations
             # so they appear in CSV and JSON exports
+            capture._events[-1].group_name = event.group_name
+            capture._events[-1].raw_group_name = event.raw_group_name
             capture._events[-1].comm_dim = comm_dim
             capture._events[-1].comm_ranks_str = ";".join(
                 ",".join(str(r) for r in g) for g in comm_ranks

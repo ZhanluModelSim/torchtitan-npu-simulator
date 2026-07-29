@@ -370,11 +370,13 @@ simulator_output/<配置名>/
 | `phase` | 捕获阶段：`forward` / `backward` / `optimizer` |
 | `execution_kind` | 实际执行类型：`original_forward` / `recompute` / `backward` / `optimizer` |
 | `is_recompute` | 当前算子是否由 activation checkpoint 在 backward 中实际重放 |
-| `comm_dim` | 通信维度名/组名（仅通信算子有值，如 `3713` 表示 FSDP 组） |
+| `group_name` | 解析后的通信维度名（如 `tp`、`ep`、`fsdp`）；无法唯一解析时回退为框架原始组 ID |
+| `raw_group_name` | 框架生成的原始 ProcessGroup 名称（如 `3713`） |
+| `comm_dim` | `group_name` 的兼容别名 |
 | `comm_ranks` | 通信域包含的 Rank 列表（仅通信算子有值，如 `0,1,2,3,...,15` 表示这 16 个 rank 属于同一通信组） |
 
 > [!NOTE]
-> 通信算子（`allgather`、`allreduce`、`reduce_scatter`、`all_to_all`、`broadcast`）在 L0 图中以 `comm.*` 前缀的 `raw_op_type` 注册，同时在 L2 ScheduleGraph 中生成 DataPass。`comm_dim` 标识通信所属的并行维度（如 FSDP/TP/EP），`comm_ranks` 列出参与该次通信的具体 Rank。
+> 通信算子（`allgather`、`allreduce`、`reduce_scatter`、`all_to_all`、`broadcast`）在 L0 图中以 `comm.*` 前缀的 `raw_op_type` 注册，同时在 L2 ScheduleGraph 中生成 DataPass。`group_name` 标识通信所属的并行维度，`comm_ranks` 列出参与该次通信的具体 Rank。原始组名、Rank 集合和通信原语仍无法唯一确定维度时，`group_name` 保留 `raw_group_name`，不会猜测。
 
 > [!NOTE]
 > activation checkpoint 重放仍属于 `phase=backward`，但会被精确标记为
