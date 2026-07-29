@@ -15,7 +15,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from torchtitan_npu.simulator.memory.records import FSDPResidencyEvent, RawMemoryEvent, TensorLifetime
+from torchtitan_npu.simulator.memory.records import (
+    CheckpointBoundaryEvent,
+    CheckpointTensorRecord,
+    FSDPResidencyEvent,
+    RawMemoryEvent,
+    TensorLifetime,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,6 +53,10 @@ class MemoryModelContext:
     fsdp_residency_events: list[FSDPResidencyEvent] = field(default_factory=list)
     missing_parameter_gradients: list[MissingParameterGradient] = field(default_factory=list)
     parameter_tensors: list[ParameterTensorMetadata] = field(default_factory=list)
+    checkpoint_boundary_events: list[CheckpointBoundaryEvent] = field(default_factory=list)
+    checkpoint_tensors: list[CheckpointTensorRecord] = field(default_factory=list)
+    alias_base_by_tensor_id: dict[int, int] = field(default_factory=dict)
+    offload_ac_saved_tensors: bool = False
     notes: list[str] = field(default_factory=list)
 
 

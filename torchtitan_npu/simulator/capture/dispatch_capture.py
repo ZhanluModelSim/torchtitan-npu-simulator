@@ -27,7 +27,11 @@ from torchtitan_npu.simulator.capture.tensor_utils import dtype_to_str, tensor_v
 from torchtitan_npu.simulator.cost.op_cost_model import OpCostModel
 from torchtitan_npu.simulator.ir.op_node import OpNode
 from torchtitan_npu.simulator.ir.tensor_meta import TensorMeta
-from torchtitan_npu.simulator.memory.records import RawMemoryEvent, TensorRef
+from torchtitan_npu.simulator.memory.records import (
+    CheckpointBoundaryEvent,
+    RawMemoryEvent,
+    TensorRef,
+)
 
 _id_counter = itertools.count()
 _seq_counter = itertools.count()
@@ -133,6 +137,7 @@ def _to_tensor_ref(tensor: torch.Tensor, name: str, tensor_id: int) -> TensorRef
         dtype=dtype,
         device=str(tensor.device),
         num_bytes=tensor_volume_bytes(shape, dtype),
+        requires_grad=tensor.requires_grad,
     )
 
 
@@ -160,6 +165,7 @@ class OpDispatchCapture(TorchDispatchMode):
         self.record_memory = record_memory
         self._events: list[_RawEvent] = []
         self._memory_events: list[RawMemoryEvent] = []
+        self._checkpoint_boundary_events: list[CheckpointBoundaryEvent] = []
         self._producer: dict[int, int] = {}
         self._tensor_identities: dict[int, tuple[weakref.ReferenceType[torch.Tensor], int]] = {}
         self._reused_tensor_ids = itertools.count(1)
@@ -289,6 +295,56 @@ class OpDispatchCapture(TorchDispatchMode):
                 else None
             ),
             extra_annotations=extra_annotations,
+        )
+
+    def record_checkpoint_boundary(
+        self,
+        checkpoint_id: str,
+        inputs: Any,
+        outputs: Any,
+    ) -> None:
+        """Record the tensors crossing one original-forward AC boundary."""
+        if not self.record_memory or not self._capture_l0:
+            return
+
+        def refs(value: Any, role: str) -> tuple[TensorRef, ...]:
+            result: list[TensorRef] = []
+            seen: set[int] = set()
+            for tensor in _flatten_tensors(value):
+                tensor_id = self.tensor_id(tensor)
+                if tensor_id in seen:
+                    continue
+                seen.add(tensor_id)
+                result.append(
+                    _to_tensor_ref(
+                        tensor,
+                        name=f"{role}_{len(result)}",
+                        tensor_id=tensor_id,
+                    )
+                )
+            return tuple(result)
+
+        pp_stage = -1
+        pp_mb_idx = -1
+        comp_type = "F"
+        try:
+            from torchtitan_npu.simulator.meta_env import _pp_context
+            pp_stage = int(_pp_context.get("stage", -1))
+            pp_mb_idx = int(_pp_context.get("mb_idx", -1))
+            comp_type = str(_pp_context.get("comp_type", "F")) or "F"
+        except Exception:
+            pass
+
+        self._checkpoint_boundary_events.append(
+            CheckpointBoundaryEvent(
+                checkpoint_id=checkpoint_id,
+                seq_idx=self._memory_events[-1].seq_idx if self._memory_events else -1,
+                inputs=refs(inputs, "input"),
+                outputs=refs(outputs, "output"),
+                pp_stage=pp_stage,
+                pp_mb_idx=pp_mb_idx,
+                comp_type=comp_type,
+            )
         )
 
     def _record_event(
@@ -510,6 +566,10 @@ class OpDispatchCapture(TorchDispatchMode):
     def memory_events(self) -> list[RawMemoryEvent]:
         """Return the uncollapsed op stream used by static memory planning."""
         return list(self._memory_events)
+
+    def checkpoint_boundary_events(self) -> list[CheckpointBoundaryEvent]:
+        """Return original-forward activation-checkpoint boundary metadata."""
+        return list(self._checkpoint_boundary_events)
 
 
 _active_capture: "OpDispatchCapture | None" = None

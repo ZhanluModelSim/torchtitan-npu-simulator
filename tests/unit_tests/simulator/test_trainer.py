@@ -163,15 +163,25 @@ def test_run_simulation_step_can_disable_memory_tracking(fake_world):
 
 
 @pytest.mark.parametrize(
-    ("output_formats", "expect_memory_export"),
+    ("output_formats", "expect_memory_details"),
     [([], False), (["json", "csv", "text", "html", "trace"], False), (["mem"], True)],
 )
-def test_memory_export_requires_explicit_mem_format(tmp_path, monkeypatch, output_formats, expect_memory_export):
-    exported: list[object] = []
+def test_memory_summary_is_default_and_details_require_mem_format(
+    tmp_path,
+    monkeypatch,
+    output_formats,
+    expect_memory_details,
+):
+    summaries: list[object] = []
+    details: list[object] = []
     memory_plan = object()
     monkeypatch.setattr(
-        "torchtitan_npu.simulator.trainer.export_memory_plan",
-        lambda plan, _out_dir: exported.append(plan),
+        "torchtitan_npu.simulator.trainer.export_memory_summary",
+        lambda plan, _out_dir: summaries.append(plan),
+    )
+    monkeypatch.setattr(
+        "torchtitan_npu.simulator.trainer.export_memory_details",
+        lambda plan, _out_dir: details.append(plan),
     )
     monkeypatch.setattr(
         "torchtitan_npu.simulator.trainer.export_json",
@@ -212,7 +222,8 @@ def test_memory_export_requires_explicit_mem_format(tmp_path, monkeypatch, outpu
 
     SimulationTrainer._export(trainer)
 
-    assert exported == ([memory_plan] if expect_memory_export else [])
+    assert summaries == [memory_plan]
+    assert details == ([memory_plan] if expect_memory_details else [])
 
 
 def test_l0_csv_filename_preserves_virtual_stage_templates():
@@ -282,4 +293,6 @@ def test_simulation_config_defaults_target_npu_device_type_to_non_a5():
     config = SimulationConfig(output_dir="./out")
     assert config.target_npu_device_type == "non_a5"
     assert config.enable_memory_tracking is True
+    assert config.memory_parameter_storage_dtype == ""
+    assert config.memory_offload_ac_saved_tensors is False
     assert config.world_size is None

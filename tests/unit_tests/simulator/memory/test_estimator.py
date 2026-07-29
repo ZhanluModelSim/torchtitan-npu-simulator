@@ -5,14 +5,24 @@
 
 from dataclasses import dataclass
 
+import pytest
 import torch
 import torch.nn as nn
 
 from torchtitan_npu.simulator.capture.dispatch_capture import OpDispatchCapture
 from torchtitan_npu.simulator.memory import estimator
 from torchtitan_npu.simulator.memory.estimator import estimate_static_memory
-from torchtitan_npu.simulator.memory.export import export_memory_plan, memory_plan_to_chrome_trace
-from torchtitan_npu.simulator.memory.records import FSDPResidencyEvent, RawMemoryEvent, TensorRef
+from torchtitan_npu.simulator.memory.export import (
+    export_memory_plan,
+    export_memory_summary,
+    memory_plan_to_chrome_trace,
+)
+from torchtitan_npu.simulator.memory.records import (
+    CheckpointBoundaryEvent,
+    FSDPResidencyEvent,
+    RawMemoryEvent,
+    TensorRef,
+)
 
 
 def tref(tensor_id: int, num_bytes: int = 16) -> TensorRef:
@@ -23,6 +33,7 @@ def tref(tensor_id: int, num_bytes: int = 16) -> TensorRef:
         dtype="float32",
         device="meta",
         num_bytes=num_bytes,
+        requires_grad=True,
     )
 
 
@@ -146,6 +157,170 @@ def test_checkpoint_plugin_keeps_cross_scope_output_as_activation():
     lifetime = next(item for item in plan.tensor_lifetimes if item.tensor_id == "tensor:2")
     assert lifetime.kind == "activation"
     assert lifetime.death_seq == 5
+
+
+def test_checkpoint_boundary_can_offload_saved_activation_but_keeps_metadata():
+    x, saved, output, grad = tref(1, 32), tref(2, 64), tref(3, 16), tref(4, 64)
+    plan = estimate_static_memory(
+        [
+            event(0, 10, "aten.relu.default", inputs=[x], outputs=[saved]),
+            event(1, 11, "aten.relu.default", inputs=[saved], outputs=[output]),
+            event(
+                5,
+                20,
+                "aten.relu_backward.default",
+                inputs=[saved],
+                outputs=[grad],
+                phase="backward",
+            ),
+        ],
+        checkpoint_boundary_events=[
+            CheckpointBoundaryEvent(
+                checkpoint_id="part0:layers.1",
+                seq_idx=1,
+                inputs=(saved,),
+                outputs=(output,),
+            )
+        ],
+        offload_ac_saved_tensors=True,
+    )
+
+    lifetime = next(item for item in plan.tensor_lifetimes if item.tensor_id == "tensor:2")
+    assert lifetime.kind == "checkpoint_saved_activation"
+    assert lifetime.num_bytes == 64
+    assert lifetime.modeled_num_bytes == 0
+    assert lifetime.residency_policy == "offloaded"
+    assert not any(item.tensor_id == "tensor:2" for item in plan.timeline_events)
+
+    saved_record = next(
+        item
+        for item in plan.checkpoint_tensors
+        if item.checkpoint_id == "part0:layers.1" and item.role == "input"
+    )
+    assert saved_record.shape == saved.shape
+    assert saved_record.dtype == "float32"
+    assert saved_record.num_bytes == 64
+    assert saved_record.modeled_num_bytes == 0
+    summary = plan.to_summary_dict()
+    assert summary["checkpoint_tensor_logical_bytes"] == 64
+    assert summary["checkpoint_tensor_modeled_bytes"] == 0
+    marker = summary["checkpoint_saved_activations"]["part0:layers.1"]
+    assert marker["marker_kind"] == "module"
+    assert marker["logical_bytes_per_instance"] == 64
+    assert marker["modeled_bytes_per_instance"] == 0
+    assert marker["instance_count"] == 1
+    assert marker["size_variants"] == [
+        {
+            "logical_bytes": 64,
+            "modeled_bytes": 0,
+            "tensor_count": 1,
+            "instance_count": 1,
+        }
+    ]
+
+
+def test_checkpoint_boundary_is_metadata_only_when_offload_is_disabled():
+    x, saved, grad = tref(1), tref(2, 64), tref(3, 64)
+    plan = estimate_static_memory(
+        [
+            event(0, 10, "aten.relu.default", inputs=[x], outputs=[saved]),
+            event(5, 20, "aten.relu_backward.default", inputs=[saved], outputs=[grad], phase="backward"),
+        ],
+        checkpoint_boundary_events=[
+            CheckpointBoundaryEvent(
+                checkpoint_id="part0:layers.0",
+                seq_idx=0,
+                inputs=(saved,),
+                outputs=(),
+            )
+        ],
+    )
+
+    lifetime = next(item for item in plan.tensor_lifetimes if item.tensor_id == "tensor:2")
+    assert lifetime.kind == "checkpoint_saved_activation"
+    assert lifetime.modeled_num_bytes is None
+    assert lifetime.resident_num_bytes == 64
+    assert any(item.tensor_id == "tensor:2" for item in plan.timeline_events)
+
+
+def test_checkpoint_offload_excludes_non_gradient_context_inputs():
+    saved = tref(2, 64)
+    context = TensorRef(
+        tensor_id=3,
+        name="freqs",
+        shape=(8, 8),
+        dtype="float32",
+        device="meta",
+        num_bytes=256,
+        requires_grad=False,
+    )
+    plan = estimate_static_memory(
+        [
+            event(
+                0,
+                10,
+                "aten.relu.default",
+                inputs=[tref(1), context],
+                outputs=[saved],
+            ),
+        ],
+        checkpoint_boundary_events=[
+            CheckpointBoundaryEvent(
+                checkpoint_id="part0:layers.0",
+                seq_idx=0,
+                inputs=(saved, context),
+                outputs=(),
+            )
+        ],
+        offload_ac_saved_tensors=True,
+    )
+
+    records = {
+        item.tensor_id: item
+        for item in plan.checkpoint_tensors
+        if item.role == "input"
+    }
+    assert records["tensor:2"].is_saved_activation is True
+    assert records["tensor:2"].modeled_num_bytes == 0
+    assert records["external:3"].is_saved_activation is False
+    assert records["external:3"].modeled_num_bytes == 256
+    assert records["external:3"].residency_policy == "resident"
+
+
+def test_checkpoint_summary_preserves_size_variants_for_one_marker():
+    small, large = tref(2, 64), tref(3, 128)
+    plan = estimate_static_memory(
+        [
+            event(0, 10, "aten.relu.default", inputs=[tref(1)], outputs=[small]),
+            event(1, 11, "aten.relu.default", inputs=[small], outputs=[large]),
+        ],
+        checkpoint_boundary_events=[
+            CheckpointBoundaryEvent(
+                checkpoint_id="part0:shared_block",
+                seq_idx=0,
+                inputs=(small,),
+                outputs=(),
+            ),
+            CheckpointBoundaryEvent(
+                checkpoint_id="part0:shared_block",
+                seq_idx=1,
+                inputs=(large,),
+                outputs=(),
+            ),
+        ],
+    )
+
+    marker = plan.to_summary_dict()["checkpoint_saved_activations"][
+        "part0:shared_block"
+    ]
+    assert marker["logical_bytes_per_instance"] is None
+    assert marker["modeled_bytes_per_instance"] is None
+    assert marker["instance_count"] == 2
+    assert marker["logical_bytes_total"] == 192
+    assert [item["logical_bytes"] for item in marker["size_variants"]] == [
+        64,
+        128,
+    ]
 
 
 def test_checkpoint_plugin_treats_pathless_collective_as_internal_transport():
@@ -422,6 +597,36 @@ def test_parameter_bytes_are_persistent_and_counted():
     assert plan.peak_active_bytes == plan.persistent_param_bytes
 
 
+def test_parameter_storage_dtype_changes_only_modeled_residency():
+    model = nn.Linear(4, 2, bias=False, device="meta", dtype=torch.float32)
+    plan = estimate_static_memory(
+        [],
+        model_parts=[model],
+        parameter_storage_dtype="bfloat16",
+    )
+
+    parameter = next(
+        item for item in plan.tensor_lifetimes if item.kind == "parameter_shard"
+    )
+    assert parameter.dtype == "float32"
+    assert parameter.num_bytes == 4 * 2 * 4
+    assert parameter.modeled_dtype == "bfloat16"
+    assert parameter.modeled_num_bytes == 4 * 2 * 2
+    assert parameter.residency_policy == "dtype_override"
+    assert plan.persistent_param_bytes == 4 * 2 * 2
+    assert plan.peak_active_bytes == plan.persistent_param_bytes
+
+
+def test_parameter_storage_dtype_rejects_unknown_dtype():
+    model = nn.Linear(4, 2, bias=False, device="meta")
+    with pytest.raises(ValueError, match="Unsupported simulator memory dtype"):
+        estimate_static_memory(
+            [],
+            model_parts=[model],
+            parameter_storage_dtype="fp4",
+        )
+
+
 def test_parameter_snapshot_deduplicates_by_parameter_identity(monkeypatch):
     model = nn.Sequential(
         nn.Linear(4, 4, bias=False, device="meta"),
@@ -472,6 +677,43 @@ def test_memory_plan_exports_compact_chrome_trace(tmp_path):
     assert memory_events_header.startswith("event_id,seq_idx,phase,execution_kind,op_id")
     assert "execution_kind" in memory_events_header
     assert memory_timeline_header.startswith("seq_idx,phase,op_id,action")
+
+
+def test_memory_summary_export_does_not_write_detailed_artifacts(tmp_path):
+    plan = estimate_static_memory([], model_parts=[nn.Linear(4, 2, device="meta")])
+
+    export_memory_summary(plan, str(tmp_path))
+
+    memory_dir = tmp_path / "memory"
+    assert {path.name for path in memory_dir.iterdir()} == {
+        "memory_summary.json"
+    }
+
+
+def test_memory_plan_exports_checkpoint_tensor_metadata(tmp_path):
+    saved = tref(2, 64)
+    plan = estimate_static_memory(
+        [event(0, 10, "aten.relu.default", inputs=[tref(1)], outputs=[saved])],
+        checkpoint_boundary_events=[
+            CheckpointBoundaryEvent(
+                checkpoint_id="part0:layers.0",
+                seq_idx=0,
+                inputs=(saved,),
+                outputs=(),
+            )
+        ],
+        offload_ac_saved_tensors=True,
+    )
+
+    export_memory_plan(plan, str(tmp_path))
+    checkpoint_csv = tmp_path / "memory" / "checkpoint_tensors.csv"
+    assert checkpoint_csv.is_file()
+    header, row = checkpoint_csv.read_text().splitlines()
+    assert header.startswith(
+        "checkpoint_id,marker_kind,seq_idx,tensor_id,role,shape,dtype"
+    )
+    assert "part0:layers.0" in row
+    assert "offloaded" in row
 
 
 def test_chrome_trace_includes_fsdp_full_param_counter():

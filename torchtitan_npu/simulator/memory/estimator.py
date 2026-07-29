@@ -18,7 +18,11 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from torchtitan_npu.simulator.capture.tensor_utils import dtype_to_str, tensor_volume_bytes
+from torchtitan_npu.simulator.capture.tensor_utils import (
+    dtype_to_str,
+    normalize_supported_dtype,
+    tensor_volume_bytes,
+)
 from torchtitan_npu.simulator.memory.activation_checkpoint import ActivationCheckpointPlugin
 from torchtitan_npu.simulator.memory.alias_rules import is_alias_event, is_mutation_event
 from torchtitan_npu.simulator.memory.fsdp_residency import FSDPFullParamResidencyPlugin
@@ -29,6 +33,7 @@ from torchtitan_npu.simulator.memory.plugins import (
     ParameterTensorMetadata,
 )
 from torchtitan_npu.simulator.memory.records import (
+    CheckpointBoundaryEvent,
     FSDPResidencyEvent,
     MemoryPlan,
     MemoryTimelineEvent,
@@ -55,6 +60,7 @@ def _to_local_tensor(value: object) -> torch.Tensor | None:
 
 def _snapshot_parameters(
     model_parts: Iterable[nn.Module],
+    parameter_storage_dtype: str | None = None,
 ) -> tuple[list[TensorLifetime], set[int], list[MissingParameterGradient], list[ParameterTensorMetadata]]:
     lifetimes: list[TensorLifetime] = []
     seen_params: set[int] = set()
@@ -74,11 +80,17 @@ def _snapshot_parameters(
             param_ids.add(tid)
             dtype = dtype_to_str(tensor.dtype)
             shape = tuple(int(d) for d in tensor.shape)
+            num_bytes = tensor_volume_bytes(shape, dtype)
+            modeled_num_bytes = (
+                tensor_volume_bytes(shape, parameter_storage_dtype)
+                if parameter_storage_dtype is not None
+                else None
+            )
             lifetimes.append(
                 TensorLifetime(
                     tensor_id=f"param:{part_idx}:{name}",
                     kind="parameter_shard",
-                    num_bytes=tensor_volume_bytes(shape, dtype),
+                    num_bytes=num_bytes,
                     birth_seq=-1,
                     death_seq=-1,
                     producer_op=-1,
@@ -86,13 +98,20 @@ def _snapshot_parameters(
                     producer_phase="init",
                     shape=shape,
                     dtype=dtype,
+                    modeled_num_bytes=modeled_num_bytes,
+                    modeled_dtype=parameter_storage_dtype or "",
+                    residency_policy=(
+                        "dtype_override"
+                        if parameter_storage_dtype is not None and parameter_storage_dtype != dtype
+                        else "resident"
+                    ),
                     reason="persistent_param",
                 )
             )
             parameter_tensors.append(
                 ParameterTensorMetadata(
                     name=f"{part_idx}:{name}",
-                    num_bytes=tensor_volume_bytes(shape, dtype),
+                    num_bytes=num_bytes,
                     shape=shape,
                     dtype=dtype,
                 )
@@ -101,7 +120,7 @@ def _snapshot_parameters(
                 missing_gradients.append(
                     MissingParameterGradient(
                         name=f"{part_idx}:{name}",
-                        num_bytes=tensor_volume_bytes(shape, dtype),
+                        num_bytes=num_bytes,
                         shape=shape,
                         dtype=dtype,
                     )
@@ -209,6 +228,7 @@ def _finalize_kind(lifetime: TensorLifetime) -> None:
         "alias",
         "fsdp_full_param",
         "checkpoint_recompute_temp",
+        "checkpoint_saved_activation",
     }:
         return
     if lifetime.producer_phase == "backward" and "optimizer" in lifetime.consumer_phases:
@@ -234,7 +254,7 @@ def _build_timeline(
 ) -> list[MemoryTimelineEvent]:
     edges: list[tuple[int, int, TensorLifetime, str]] = []
     for lifetime in lifetimes:
-        if lifetime.num_bytes <= 0:
+        if lifetime.resident_num_bytes <= 0:
             continue
         edges.append((lifetime.birth_seq, 0, lifetime, "alloc"))
         edges.append((lifetime.death_seq, 1, lifetime, "free"))
@@ -244,11 +264,11 @@ def _build_timeline(
     timeline: list[MemoryTimelineEvent] = []
     for seq_idx, _order, lifetime, action in edges:
         if action == "alloc":
-            active += lifetime.num_bytes
+            active += lifetime.resident_num_bytes
             phase = lifetime.producer_phase
             op_id = lifetime.producer_op
         else:
-            active -= lifetime.num_bytes
+            active -= lifetime.resident_num_bytes
             # Activation checkpointing can shorten a forward lifetime even
             # though its original use-def chain also has a backward
             # recomputation consumer. The actual release sequence is the
@@ -266,7 +286,7 @@ def _build_timeline(
                 action=action,
                 tensor_id=lifetime.tensor_id,
                 kind=lifetime.kind,
-                num_bytes=lifetime.num_bytes,
+                num_bytes=lifetime.resident_num_bytes,
                 active_bytes_after=active,
                 reason=lifetime.reason,
             )
@@ -335,9 +355,19 @@ def estimate_static_memory(
     model_parts: Iterable[nn.Module] | None = None,
     comm_events: Iterable[Any] | None = None,
     fsdp_residency_events: Iterable[FSDPResidencyEvent] | None = None,
+    checkpoint_boundary_events: Iterable[CheckpointBoundaryEvent] | None = None,
+    parameter_storage_dtype: str | None = None,
+    offload_ac_saved_tensors: bool = False,
 ) -> MemoryPlan:
     events = sorted(raw_events, key=lambda event: event.seq_idx)
-    param_lifetimes, param_ids, missing_parameter_gradients, parameter_tensors = _snapshot_parameters(model_parts or [])
+    if parameter_storage_dtype:
+        parameter_storage_dtype = normalize_supported_dtype(parameter_storage_dtype)
+    else:
+        parameter_storage_dtype = None
+    param_lifetimes, param_ids, missing_parameter_gradients, parameter_tensors = _snapshot_parameters(
+        model_parts or [],
+        parameter_storage_dtype,
+    )
     end_seq = max((event.seq_idx for event in events), default=0) + 1
     for lifetime in param_lifetimes:
         lifetime.death_seq = end_seq
@@ -406,6 +436,9 @@ def estimate_static_memory(
         fsdp_residency_events=list(fsdp_residency_events or []),
         missing_parameter_gradients=missing_parameter_gradients,
         parameter_tensors=parameter_tensors,
+        checkpoint_boundary_events=list(checkpoint_boundary_events or []),
+        alias_base_by_tensor_id=alias_base_by_tensor_id,
+        offload_ac_saved_tensors=offload_ac_saved_tensors,
         notes=notes,
     )
     plugin_lifetimes = FSDPFullParamResidencyPlugin().apply(plugin_context)
@@ -420,7 +453,9 @@ def estimate_static_memory(
     peak_event = max(timeline, key=lambda item: item.active_bytes_after, default=None)
     phase_peaks = _phase_peak_active_bytes(timeline, events)
     plan = MemoryPlan(
-        persistent_param_bytes=sum(item.num_bytes for item in param_lifetimes),
+        parameter_storage_dtype=parameter_storage_dtype or "",
+        offload_ac_saved_tensors=offload_ac_saved_tensors,
+        persistent_param_bytes=sum(item.resident_num_bytes for item in param_lifetimes),
         peak_active_bytes=peak_event.active_bytes_after if peak_event else 0,
         model_active_bytes_peak=_model_peak_active_bytes(timeline, events),
         forward_peak_active_bytes=phase_peaks["forward"],
@@ -430,6 +465,7 @@ def estimate_static_memory(
         peak_phase=peak_event.phase if peak_event else "",
         raw_events=events,
         tensor_lifetimes=sorted(lifetimes, key=lambda item: (item.birth_seq, item.tensor_id)),
+        checkpoint_tensors=plugin_context.checkpoint_tensors,
         timeline_events=timeline,
         unclassified_ops=unclassified_ops,
         notes=notes,

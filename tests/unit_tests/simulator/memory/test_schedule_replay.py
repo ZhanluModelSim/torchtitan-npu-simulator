@@ -14,7 +14,12 @@ from torchtitan_npu.simulator.ir.schedule_plan import ScheduleAction, SchedulePl
 from torchtitan_npu.simulator.memory.estimator import estimate_static_memory
 from torchtitan_npu.simulator.memory.export import export_memory_plan, memory_plan_to_chrome_trace
 from torchtitan_npu.simulator.memory.schedule_replay import estimate_schedule_memory
-from torchtitan_npu.simulator.memory.records import FSDPResidencyEvent, RawMemoryEvent, TensorRef
+from torchtitan_npu.simulator.memory.records import (
+    CheckpointBoundaryEvent,
+    FSDPResidencyEvent,
+    RawMemoryEvent,
+    TensorRef,
+)
 
 
 def _ref(tensor_id: int, num_bytes: int = 100) -> TensorRef:
@@ -25,6 +30,7 @@ def _ref(tensor_id: int, num_bytes: int = 100) -> TensorRef:
         dtype="uint8",
         device="meta",
         num_bytes=num_bytes,
+        requires_grad=True,
     )
 
 
@@ -363,6 +369,62 @@ def test_checkpoint_internal_tensor_is_released_in_each_forward_instance() -> No
     for lifetime in checkpoint_temps:
         producer = next(event for event in plan.raw_events if event.seq_idx == lifetime.birth_seq)
         assert lifetime.death_seq <= forward_ends[producer.pp_mb_idx]
+
+
+def test_checkpoint_saved_activation_offload_replays_for_each_microbatch() -> None:
+    saved = _ref(10)
+    output = _ref(11)
+    grad = _ref(12)
+    events = [
+        _event(1, 101, comp_type="F", phase="forward", outputs=(saved,)),
+        _event(2, 102, comp_type="F", phase="forward", inputs=(saved,), outputs=(output,)),
+        _event(20, 201, comp_type="B", phase="backward", inputs=(saved,), outputs=(grad,)),
+    ]
+    actions = [
+        _action(0, "F", 0),
+        _action(1, "F", 1),
+        _action(2, "B", 0),
+        _action(3, "B", 1),
+    ]
+
+    plan = estimate_schedule_memory(
+        events,
+        schedule_plan=_plan(actions, pp_degree=2, microbatches=2),
+        checkpoint_boundary_events=[
+            CheckpointBoundaryEvent(
+                checkpoint_id="part0:layers.0",
+                seq_idx=2,
+                inputs=(saved,),
+                outputs=(output,),
+                pp_stage=0,
+                pp_mb_idx=0,
+                comp_type="F",
+            )
+        ],
+        offload_ac_saved_tensors=True,
+    )
+
+    saved_records = [
+        item for item in plan.checkpoint_tensors if item.role == "input"
+    ]
+    assert {item.pp_mb_idx for item in saved_records} == {0, 1}
+    assert all(item.modeled_num_bytes == 0 for item in saved_records)
+    saved_lifetimes = [
+        item
+        for item in plan.tensor_lifetimes
+        if item.kind == "checkpoint_saved_activation"
+    ]
+    assert len(saved_lifetimes) == 2
+    assert all(item.resident_num_bytes == 0 for item in saved_lifetimes)
+    marker = plan.to_summary_dict()["checkpoint_saved_activations"][
+        "part0:layers.0"
+    ]
+    assert marker["logical_bytes_per_instance"] == saved.num_bytes
+    assert marker["modeled_bytes_per_instance"] == 0
+    assert marker["instance_count"] == 2
+    assert marker["logical_bytes_total"] == 2 * saved.num_bytes
+    assert marker["pp_stages"] == [0]
+    assert marker["microbatches"] == [0, 1]
 
 
 def test_explicit_fsdp_residency_is_not_multiplied_by_microbatch_replay() -> None:

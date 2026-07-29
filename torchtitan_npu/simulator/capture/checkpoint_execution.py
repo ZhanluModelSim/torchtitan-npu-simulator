@@ -113,8 +113,8 @@ def install_checkpoint_execution_tracking(model_parts: Iterable[nn.Module]) -> i
 
     installed = 0
     seen: set[int] = set()
-    for model in model_parts:
-        for module in model.modules():
+    for part_idx, model in enumerate(model_parts):
+        for module_name, module in model.named_modules():
             if id(module) in seen or not isinstance(module, CheckpointWrapper):
                 continue
             seen.add(id(module))
@@ -132,6 +132,32 @@ def install_checkpoint_execution_tracking(model_parts: Iterable[nn.Module]) -> i
             checkpoint_fn.keywords["context_fn"] = _compose_context_fn(
                 checkpoint_fn.keywords.get("context_fn")
             )
+            checkpoint_id = f"part{part_idx}:{module_name or '<root>'}"
+            original_forward = module.forward
+
+            @functools.wraps(original_forward)
+            def tracked_forward(
+                *args,
+                __original_forward=original_forward,
+                __checkpoint_id=checkpoint_id,
+                **kwargs,
+            ):
+                result = __original_forward(*args, **kwargs)
+                if current_execution_kind("forward") == ORIGINAL_FORWARD:
+                    from torchtitan_npu.simulator.capture.dispatch_capture import (
+                        get_active_capture,
+                    )
+
+                    capture = get_active_capture()
+                    if capture is not None:
+                        capture.record_checkpoint_boundary(
+                            __checkpoint_id,
+                            (args, kwargs),
+                            result,
+                        )
+                return result
+
+            module.forward = tracked_forward
             setattr(module, _INSTALL_MARKER, True)
             installed += 1
     return installed

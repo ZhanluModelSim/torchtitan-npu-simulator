@@ -32,7 +32,10 @@ from torchtitan_npu.simulator.capture.workload_builder import build_workload_gra
 from torchtitan_npu.simulator.hardware_shims.mhc_converter import apply_mhc_shims
 from torchtitan_npu.simulator.hardware_shims.smla_converter import apply_smla_shims
 from torchtitan_npu.simulator.ir.workload_graph import WorkloadGraph
-from torchtitan_npu.simulator.memory.export import export_memory_plan
+from torchtitan_npu.simulator.memory.export import (
+    export_memory_details,
+    export_memory_summary,
+)
 from torchtitan_npu.simulator.memory.schedule_replay import estimate_schedule_memory
 from torchtitan_npu.simulator.meta_env import patch_device_type_to_meta
 from torchtitan_npu.simulator.moe_force_balance import force_deterministic_seed, force_moe_load_balance
@@ -63,6 +66,8 @@ class SimulationConfig:
     output_dir: str = "./simulator_output"
     output_formats: list[str] = field(default_factory=lambda: [])
     enable_memory_tracking: bool = True
+    memory_parameter_storage_dtype: str = ""
+    memory_offload_ac_saved_tensors: bool = False
     target_npu_device_type: str = "non_a5"
     csv_max_ranks: int | None = None
     world_size: int | None = None
@@ -145,6 +150,8 @@ def run_simulation_step(
     gradient_accumulation: int = 1,
     rank: int = 0,
     enable_memory_tracking: bool = True,
+    memory_parameter_storage_dtype: str = "",
+    memory_offload_ac_saved_tensors: bool = False,
     pp_schedule: Any | None = None,
 ) -> WorkloadGraph:
     """Run one forward+backward+optimizer step under full capture and
@@ -295,6 +302,9 @@ def run_simulation_step(
             model_parts=model_parts,
             comm_events=comm_recorder.events,
             fsdp_residency_events=comm_recorder.fsdp_residency_events,
+            checkpoint_boundary_events=capture.checkpoint_boundary_events(),
+            parameter_storage_dtype=memory_parameter_storage_dtype or None,
+            offload_ac_saved_tensors=memory_offload_ac_saved_tensors,
         )
         wg.iteration.schedule.annotations["memory_plan"] = memory_plan
         wg.iteration.schedule.annotations["memory_summary"] = memory_plan.to_summary_dict()
@@ -489,6 +499,12 @@ class SimulationTrainer(Trainer):
             gradient_accumulation=self.gradient_accumulation_steps,
             rank=rank,
             enable_memory_tracking=self.simulation_config.enable_memory_tracking,
+            memory_parameter_storage_dtype=(
+                self.simulation_config.memory_parameter_storage_dtype
+            ),
+            memory_offload_ac_saved_tensors=(
+                self.simulation_config.memory_offload_ac_saved_tensors
+            ),
             pp_schedule=pp_schedule,
         )
 
@@ -538,10 +554,14 @@ class SimulationTrainer(Trainer):
             write_text_summary(self.workload_graph, os.path.join(out_dir, "summary.txt"))
             export_timings["text"] = time.perf_counter() - t
         memory_plan = self.workload_graph.iteration.schedule.annotations.get("memory_plan")
-        if memory_plan is not None and "mem" in formats:
+        if memory_plan is not None:
             t = time.perf_counter()
-            export_memory_plan(memory_plan, out_dir)
-            export_timings["memory"] = time.perf_counter() - t
+            export_memory_summary(memory_plan, out_dir)
+            export_timings["memory_summary"] = time.perf_counter() - t
+            if "mem" in formats:
+                t = time.perf_counter()
+                export_memory_details(memory_plan, out_dir)
+                export_timings["memory_details"] = time.perf_counter() - t
         if "html" in formats:
             t = time.perf_counter()
             export_html(self.workload_graph, os.path.join(out_dir, "trace.html"))

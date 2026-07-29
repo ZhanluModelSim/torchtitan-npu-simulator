@@ -248,11 +248,12 @@ cat simulator_output/deepseek_v4_pro_61_layers/summary.txt
 | `simulation_result.json` | JSON | 完整四层 IR 结构化数据 |
 | `kernel_summary/` | CSV 目录 | 按 Rank 拆分的算子汇总 |
 | `ir_export/` | CSV 目录 | 各层级 IR 导出（见下文） |
-| `memory/` | JSON/CSV 目录 | 内存摘要、Perfetto trace、事件时间线和 tensor 生命周期；需显式启用 `mem` 格式 |
+| `memory/` | JSON/CSV 目录 | 默认包含内存摘要；显式启用 `mem` 后还包含 Perfetto trace、事件时间线和 tensor 生命周期 |
 
-内存计算由 `simulation.enable_memory_tracking` 控制；内存文件导出则独立由
-`simulation.output_formats` 中的 `mem` 控制。`json`、`csv`、`text`、`html` 和
-`trace` 都不会隐式写出 `memory/`。例如只导出内存产物：
+内存计算由 `simulation.enable_memory_tracking` 控制。只要内存跟踪开启，
+`memory/memory_summary.json` 就会默认导出，不依赖 `output_formats`。
+`simulation.output_formats` 中的 `mem` 只控制体积较大的详细 trace 和 CSV。例如
+导出完整内存产物：
 
 ```bash
 --simulation.output_formats mem
@@ -262,12 +263,61 @@ cat simulator_output/deepseek_v4_pro_61_layers/summary.txt
 
 | 文件 | 内容 |
 |------|------|
-| `memory_summary.json` | 参数常驻、前向/反向/optimizer 峰值及覆盖范围 |
-| `memory_events.csv` | 未折叠的算子输入输出事件，含 PP stage/microbatch/comp_type |
-| `memory_timeline.csv` | alloc/free 后的 active tensor bytes 曲线 |
-| `tensor_lifetimes.csv` | 每个 tensor 的 birth、last consumer、death 和分类 |
-| `memory_actions.csv` | PP 调度 action 与展开后内存事件区间的映射；非 PP 不生成 |
-| `memory_trace.json` | 可由 Chrome Trace 或 Perfetto 打开的阶段趋势图 |
+| `memory_summary.json` | 默认导出；参数常驻、前向/反向/optimizer 峰值及 checkpoint 聚合 |
+| `memory_events.csv` | `mem`；未折叠的算子输入输出事件，含 PP stage/microbatch/comp_type |
+| `memory_timeline.csv` | `mem`；alloc/free 后的 active tensor bytes 曲线 |
+| `tensor_lifetimes.csv` | `mem`；每个 tensor 的 birth、last consumer、death、逻辑大小、建模驻留大小和分类 |
+| `checkpoint_tensors.csv` | `mem`；每个 AC wrapper 边界的输入/输出元数据；存在 AC 边界时生成 |
+| `memory_actions.csv` | `mem`；PP 调度 action 与展开后内存事件区间的映射；非 PP 不生成 |
+| `memory_trace.json` | `mem`；可由 Chrome Trace 或 Perfetto 打开的阶段趋势图 |
+
+可通过两个独立开关调整内存建模假设：
+
+```bash
+# 参数仍保留捕获到的原始 dtype/num_bytes，但静态本地参数分片按 BF16 计入设备驻留。
+--simulation.memory-parameter-storage-dtype bfloat16
+
+# AC wrapper 的保存输入仍写入 checkpoint_tensors.csv，但不计入设备驻留和峰值。
+--simulation.memory-offload-ac-saved-tensors
+```
+
+参数 dtype 覆盖仅作用于静态本地参数分片，不改变梯度、optimizer state 或 FSDP
+all-gather 全参数的 dtype。AC 卸载仅作用于每个 `CheckpointWrapper` 输入中
+`requires_grad=True` 的保存激活；freqs、mask 等无梯度上下文仍会记录，但不会被当作
+保存激活卸载。checkpoint 内部临时值仍按其 forward/recompute 生命周期建模。两个开关默认均关闭。
+
+`memory_summary.json` 的 `checkpoint_saved_activations` 按稳定的
+`checkpoint_id` marker 聚合保存激活。例如：
+
+```json
+{
+  "checkpoint_saved_activations": {
+    "part0:layers.0": {
+      "marker_kind": "module",
+      "logical_bytes_per_instance": 262144,
+      "modeled_bytes_per_instance": 0,
+      "instance_count": 2,
+      "logical_bytes_total": 524288,
+      "modeled_bytes_total": 0,
+      "pp_stages": [0],
+      "microbatches": [0, 1],
+      "size_variants": [
+        {
+          "logical_bytes": 262144,
+          "modeled_bytes": 0,
+          "tensor_count": 1,
+          "instance_count": 2
+        }
+      ]
+    }
+  }
+}
+```
+
+`logical_bytes_per_instance` 可直接作为后续一次恢复/load 的大小。若同一个 marker
+存在动态 shape，该字段为 `null`，具体大小和出现次数记录在 `size_variants`。
+marker 当前使用 AC wrapper 模块路径且 `marker_kind="module"`；该结构不依赖“层”的
+概念，后续 selective AC 可以使用 op 级 marker 和 `marker_kind="op"` 并复用相同格式。
 
 ### 多进程模式（multi_proc_meta）
 
@@ -443,7 +493,9 @@ def my_model_simulate() -> SimulationTrainerConfig:
 
 关键约束：
 
-- 内存跟踪默认开启。可通过 CLI 设置 `--simulation.no-enable-memory-tracking` 关闭；关闭后不记录内存事件、tensor 生命周期和 FSDP 参数驻留，也不执行静态内存估算。内存结果统一输出到 `<output_dir>/memory/`。
+- 内存跟踪默认开启。可通过 CLI 设置 `--simulation.no-enable-memory-tracking` 关闭；关闭后不记录内存事件、tensor 生命周期和 FSDP 参数驻留，也不执行静态内存估算。开启时始终导出 `<output_dir>/memory/memory_summary.json`；只有 `output_formats` 包含 `mem` 时才导出详细 trace 和 CSV。
+- `simulation.memory_parameter_storage_dtype` 可指定静态本地参数分片的建模驻留 dtype（例如 `bfloat16`）；原始 dtype 和逻辑大小仍保留在生命周期记录中。
+- `simulation.memory_offload_ac_saved_tensors` 可将 AC wrapper 保存输入按零设备驻留建模，同时保留 `checkpoint_tensors.csv` 元数据。
 - `simulation.world_size` 必须等于 `dp_replicate × dp_shard × cp × tp × pp`；EP/ETP 不额外乘入 dense world size。`data_parallel_shard_degree=-1` 时由 simulator 根据最终 CLI 配置计算。
 - `pipeline_parallel_degree > 1` 时，DeepSeek-V4 不支持 MTP，需设 `num_mtp_modules=0`。
 - `pipeline_parallel_degree > 1` 时，`local_batch_size` 需 ≥ `pp_degree`（1F1B 调度需要足够 microbatch）。

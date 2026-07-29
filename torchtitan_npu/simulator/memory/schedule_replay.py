@@ -12,6 +12,7 @@ from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Iterable
 
 from torchtitan_npu.simulator.memory.records import (
+    CheckpointBoundaryEvent,
     FSDPResidencyEvent,
     MemoryActionSpan,
     MemoryPlan,
@@ -31,6 +32,7 @@ _BACKWARD_COMP_TYPES = {"B", "I", "W", "F_RECOMPUTE"}
 @dataclass(slots=True)
 class ReplayedMemoryCapture:
     events: list[RawMemoryEvent]
+    checkpoint_boundary_events: list[CheckpointBoundaryEvent]
     fsdp_residency_events: list[FSDPResidencyEvent]
     action_spans: list[MemoryActionSpan]
     dropped_duplicate_events: int = 0
@@ -70,7 +72,12 @@ def _select_templates(
     events: list[RawMemoryEvent],
     compute_keys: set[tuple[int, str]],
     non_replayable_op_ids: set[int],
-) -> tuple[dict[tuple[int, str], list[RawMemoryEvent]], set[int], int]:
+) -> tuple[
+    dict[tuple[int, str], list[RawMemoryEvent]],
+    dict[tuple[int, str], int],
+    set[int],
+    int,
+]:
     candidates: dict[tuple[int, str], dict[int, list[RawMemoryEvent]]] = {}
     for event in events:
         key = _template_key(event)
@@ -79,6 +86,7 @@ def _select_templates(
         candidates.setdefault(key, {}).setdefault(event.pp_mb_idx, []).append(event)
 
     templates: dict[tuple[int, str], list[RawMemoryEvent]] = {}
+    source_microbatches: dict[tuple[int, str], int] = {}
     selected_event_ids: set[int] = set()
     duplicate_count = 0
     for key, by_microbatch in candidates.items():
@@ -88,12 +96,12 @@ def _select_templates(
             by_microbatch.items(),
             key=lambda item: (-len(item[1]), item[0]),
         )
-        del source_mb
         template = sorted(template, key=lambda event: event.seq_idx)
         templates[key] = template
+        source_microbatches[key] = source_mb
         selected_event_ids.update(event.event_id for event in template)
         duplicate_count += sum(len(group) for group in by_microbatch.values()) - len(template)
-    return templates, selected_event_ids, duplicate_count
+    return templates, source_microbatches, selected_event_ids, duplicate_count
 
 
 def _clone_ref(ref: TensorRef, tensor_id: int) -> TensorRef:
@@ -106,6 +114,7 @@ def replay_pp_memory_capture(
     schedule_plan: SchedulePlan,
     comm_events: Iterable[Any] | None = None,
     fsdp_residency_events: Iterable[FSDPResidencyEvent] | None = None,
+    checkpoint_boundary_events: Iterable[CheckpointBoundaryEvent] | None = None,
     persistent_tensor_ids: set[int] | None = None,
 ) -> ReplayedMemoryCapture:
     """Replay one captured template for every PP compute action.
@@ -137,11 +146,16 @@ def replay_pp_memory_capture(
         if getattr(event, "comm_layer", "") == "L2"
         and bool(getattr(event, "p2p_direction", ""))
     } & raw_comm_op_ids
-    templates, selected_event_ids, dropped_duplicates = _select_templates(
+    templates, source_microbatches, selected_event_ids, dropped_duplicates = _select_templates(
         events,
         compute_keys,
         non_replayable_op_ids,
     )
+    boundary_templates: dict[tuple[int, str], list[CheckpointBoundaryEvent]] = {}
+    for boundary in checkpoint_boundary_events or []:
+        key = (boundary.pp_stage, boundary.comp_type)
+        if boundary.pp_mb_idx == source_microbatches.get(key):
+            boundary_templates.setdefault(key, []).append(boundary)
     missing_templates = sorted(compute_keys - templates.keys())
     if missing_templates:
         formatted = ", ".join(
@@ -186,6 +200,7 @@ def replay_pp_memory_capture(
         return op_ids[key]
 
     replayed: list[RawMemoryEvent] = []
+    replayed_boundaries: list[CheckpointBoundaryEvent] = []
     action_spans: list[MemoryActionSpan] = []
     consumed_event_ids: set[int] = set()
     logical_seq = 0
@@ -250,6 +265,24 @@ def replay_pp_memory_capture(
             for event in templates.get((action.stage, action.comp_type), []):
                 append_event(event, action=action)
                 consumed_event_ids.add(event.event_id)
+            for boundary in boundary_templates.get((action.stage, action.comp_type), []):
+                replayed_boundaries.append(
+                    replace(
+                        boundary,
+                        seq_idx=max(start_seq, logical_seq - 1),
+                        inputs=tuple(
+                            _clone_ref(ref, tensor_id_for(action.mb_idx, ref.tensor_id))
+                            for ref in boundary.inputs
+                        ),
+                        outputs=tuple(
+                            _clone_ref(ref, tensor_id_for(action.mb_idx, ref.tensor_id))
+                            for ref in boundary.outputs
+                        ),
+                        pp_stage=action.stage,
+                        pp_mb_idx=action.mb_idx,
+                        comp_type=action.comp_type,
+                    )
+                )
         elif action.action_type == "OPTIMIZER":
             for event in optimizer_events:
                 if event.event_id not in consumed_event_ids:
@@ -305,6 +338,7 @@ def replay_pp_memory_capture(
     )
     return ReplayedMemoryCapture(
         events=replayed,
+        checkpoint_boundary_events=replayed_boundaries,
         fsdp_residency_events=remapped_fsdp,
         action_spans=action_spans,
         dropped_duplicate_events=dropped_duplicates,
@@ -348,6 +382,9 @@ def estimate_schedule_memory(
     model_parts: Iterable[nn.Module] | None = None,
     comm_events: Iterable[Any] | None = None,
     fsdp_residency_events: Iterable[FSDPResidencyEvent] | None = None,
+    checkpoint_boundary_events: Iterable[CheckpointBoundaryEvent] | None = None,
+    parameter_storage_dtype: str | None = None,
+    offload_ac_saved_tensors: bool = False,
 ) -> MemoryPlan:
     """Estimate memory, replaying templates only for PP schedules."""
     from torchtitan_npu.simulator.memory.estimator import estimate_static_memory
@@ -358,6 +395,9 @@ def estimate_schedule_memory(
             model_parts=model_parts,
             comm_events=comm_events,
             fsdp_residency_events=fsdp_residency_events,
+            checkpoint_boundary_events=checkpoint_boundary_events,
+            parameter_storage_dtype=parameter_storage_dtype,
+            offload_ac_saved_tensors=offload_ac_saved_tensors,
         )
 
     replayed = replay_pp_memory_capture(
@@ -365,6 +405,7 @@ def estimate_schedule_memory(
         schedule_plan=schedule_plan,
         comm_events=comm_events,
         fsdp_residency_events=fsdp_residency_events,
+        checkpoint_boundary_events=checkpoint_boundary_events,
         persistent_tensor_ids=_persistent_tensor_ids(model_parts or []),
     )
     plan = estimate_static_memory(
@@ -372,6 +413,9 @@ def estimate_schedule_memory(
         model_parts=model_parts,
         comm_events=comm_events,
         fsdp_residency_events=replayed.fsdp_residency_events,
+        checkpoint_boundary_events=replayed.checkpoint_boundary_events,
+        parameter_storage_dtype=parameter_storage_dtype,
+        offload_ac_saved_tensors=offload_ac_saved_tensors,
     )
     plan.action_spans = replayed.action_spans
     plan.notes.append(

@@ -57,6 +57,32 @@ def test_full_checkpoint_marks_only_replayed_ops_as_recompute():
     assert any(node.annotations["execution_kind"] == "original_forward" for node in nodes)
 
 
+def test_checkpoint_wrapper_records_original_forward_boundary():
+    model = nn.Sequential(
+        checkpoint_wrapper(
+            nn.Sequential(nn.Linear(4, 4), nn.GELU()),
+            preserve_rng_state=False,
+        )
+    )
+    assert install_checkpoint_execution_tracking([model]) == 1
+    capture = OpDispatchCapture()
+    inputs = torch.randn(2, 4, requires_grad=True)
+    previous_device_type = DefaultDeviceType.get_device_type()
+    DefaultDeviceType.set_device_type("cpu")
+    try:
+        with capture:
+            model(inputs).sum().backward()
+    finally:
+        DefaultDeviceType.set_device_type(previous_device_type)
+
+    boundaries = capture.checkpoint_boundary_events()
+    assert len(boundaries) == 1
+    assert boundaries[0].checkpoint_id == "part0:0"
+    assert boundaries[0].inputs[0].shape == (2, 4)
+    assert boundaries[0].inputs[0].requires_grad is True
+    assert boundaries[0].outputs[0].shape == (2, 4)
+
+
 def test_selective_checkpoint_preserves_policy_and_excludes_saved_op_from_recompute():
     policy_calls: list[tuple[bool, str]] = []
 

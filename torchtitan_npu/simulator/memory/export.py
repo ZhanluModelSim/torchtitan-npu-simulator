@@ -214,6 +214,8 @@ def memory_plan_to_chrome_trace(plan: MemoryPlan) -> dict:
         "traceEvents": trace_events,
         "metadata": {
             "metric": plan.metric,
+            "parameter_storage_dtype": plan.parameter_storage_dtype or "captured",
+            "offload_ac_saved_tensors": plan.offload_ac_saved_tensors,
             "persistent_param_bytes": plan.persistent_param_bytes,
             "active_bytes_peak": plan.peak_active_bytes,
             "model_active_bytes_peak": plan.model_active_bytes_peak,
@@ -226,12 +228,17 @@ def memory_plan_to_chrome_trace(plan: MemoryPlan) -> dict:
     }
 
 
-def export_memory_plan(plan: MemoryPlan, out_dir: str) -> None:
+def export_memory_summary(plan: MemoryPlan, out_dir: str) -> None:
     memory_dir = os.path.join(out_dir, "memory")
     os.makedirs(memory_dir, exist_ok=True)
     with open(os.path.join(memory_dir, "memory_summary.json"), "w", encoding="utf-8") as f:
         json.dump(plan.to_summary_dict(), f, indent=2, ensure_ascii=False)
 
+
+def export_memory_details(plan: MemoryPlan, out_dir: str) -> None:
+    """Export the detailed memory trace and CSV artifacts."""
+    memory_dir = os.path.join(out_dir, "memory")
+    os.makedirs(memory_dir, exist_ok=True)
     with open(os.path.join(memory_dir, "memory_trace.json"), "w", encoding="utf-8") as f:
         json.dump(memory_plan_to_chrome_trace(plan), f, indent=2, ensure_ascii=False)
 
@@ -318,6 +325,9 @@ def export_memory_plan(plan: MemoryPlan, out_dir: str) -> None:
             "alias_of",
             "shape",
             "dtype",
+            "modeled_num_bytes",
+            "modeled_dtype",
+            "residency_policy",
             "reason",
         ]
         writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -330,6 +340,41 @@ def export_memory_plan(plan: MemoryPlan, out_dir: str) -> None:
             row["shape"] = "[" + ",".join(str(dim) for dim in lifetime.shape) + "]"
             writer.writerow(row)
 
+    if plan.checkpoint_tensors:
+        with open(
+            os.path.join(memory_dir, "checkpoint_tensors.csv"),
+            "w",
+            newline="",
+            encoding="utf-8",
+        ) as f:
+            fieldnames = [
+                "checkpoint_id",
+                "marker_kind",
+                "seq_idx",
+                "tensor_id",
+                "role",
+                "shape",
+                "dtype",
+                "num_bytes",
+                "modeled_num_bytes",
+                "requires_grad",
+                "is_saved_activation",
+                "residency_policy",
+                "pp_stage",
+                "pp_mb_idx",
+                "comp_type",
+            ]
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for checkpoint_tensor in plan.checkpoint_tensors:
+                row = asdict(checkpoint_tensor)
+                row["shape"] = (
+                    "["
+                    + ",".join(str(dim) for dim in checkpoint_tensor.shape)
+                    + "]"
+                )
+                writer.writerow(row)
+
     if plan.unclassified_ops:
         with open(os.path.join(memory_dir, "unclassified_memory_ops.csv"), "w", newline="", encoding="utf-8") as f:
             fieldnames = ["seq_idx", "op_id", "raw_op_type", "phase", "output_bytes"]
@@ -337,3 +382,9 @@ def export_memory_plan(plan: MemoryPlan, out_dir: str) -> None:
             writer.writeheader()
             for item in plan.unclassified_ops:
                 writer.writerow(item)
+
+
+def export_memory_plan(plan: MemoryPlan, out_dir: str) -> None:
+    """Export both the compact summary and all detailed memory artifacts."""
+    export_memory_summary(plan, out_dir)
+    export_memory_details(plan, out_dir)

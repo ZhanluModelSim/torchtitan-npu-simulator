@@ -19,6 +19,7 @@ class TensorRef:
     dtype: str
     device: str
     num_bytes: int
+    requires_grad: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,6 +37,18 @@ class RawMemoryEvent:
     pp_stage: int = -1
     pp_mb_idx: int = -1
     comp_type: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class CheckpointBoundaryEvent:
+    checkpoint_id: str
+    seq_idx: int
+    inputs: tuple[TensorRef, ...]
+    outputs: tuple[TensorRef, ...]
+    marker_kind: str = "module"
+    pp_stage: int = -1
+    pp_mb_idx: int = -1
+    comp_type: str = "F"
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,7 +89,14 @@ class TensorLifetime:
     alias_of: str = ""
     shape: tuple[int, ...] = ()
     dtype: str = ""
+    modeled_num_bytes: int | None = None
+    modeled_dtype: str = ""
+    residency_policy: str = "resident"
     reason: str = ""
+
+    @property
+    def resident_num_bytes(self) -> int:
+        return self.num_bytes if self.modeled_num_bytes is None else self.modeled_num_bytes
 
     def mark_consumer(self, op_id: int, seq_idx: int, phase: str) -> None:
         self.consumer_ops.append(op_id)
@@ -112,9 +132,30 @@ class MemoryActionSpan:
     source_seq_idx: int = 0
 
 
+@dataclass(frozen=True, slots=True)
+class CheckpointTensorRecord:
+    checkpoint_id: str
+    marker_kind: str
+    seq_idx: int
+    tensor_id: str
+    role: str
+    shape: tuple[int, ...]
+    dtype: str
+    num_bytes: int
+    modeled_num_bytes: int
+    requires_grad: bool
+    is_saved_activation: bool
+    residency_policy: str
+    pp_stage: int = -1
+    pp_mb_idx: int = -1
+    comp_type: str = "F"
+
+
 @dataclass(slots=True)
 class MemoryPlan:
     metric: str = "active_tensor_bytes"
+    parameter_storage_dtype: str = ""
+    offload_ac_saved_tensors: bool = False
     persistent_param_bytes: int = 0
     peak_active_bytes: int = 0
     model_active_bytes_peak: int = 0
@@ -125,14 +166,116 @@ class MemoryPlan:
     peak_phase: str = ""
     raw_events: list[RawMemoryEvent] = field(default_factory=list)
     tensor_lifetimes: list[TensorLifetime] = field(default_factory=list)
+    checkpoint_tensors: list[CheckpointTensorRecord] = field(default_factory=list)
     timeline_events: list[MemoryTimelineEvent] = field(default_factory=list)
     action_spans: list[MemoryActionSpan] = field(default_factory=list)
     unclassified_ops: list[dict[str, Any]] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
 
+    def _checkpoint_saved_activations_by_marker(self) -> dict[str, dict[str, Any]]:
+        instances_by_marker: dict[
+            str,
+            dict[tuple[int, int, int, str], dict[str, int]],
+        ] = {}
+        for item in self.checkpoint_tensors:
+            if not item.is_saved_activation:
+                continue
+            instance_key = (
+                item.seq_idx,
+                item.pp_stage,
+                item.pp_mb_idx,
+                item.comp_type,
+            )
+            instance = instances_by_marker.setdefault(
+                item.checkpoint_id,
+                {},
+            ).setdefault(
+                instance_key,
+                {
+                    "logical_bytes": 0,
+                    "modeled_bytes": 0,
+                    "tensor_count": 0,
+                },
+            )
+            instance["logical_bytes"] += item.num_bytes
+            instance["modeled_bytes"] += item.modeled_num_bytes
+            instance["tensor_count"] += 1
+
+        result: dict[str, dict[str, Any]] = {}
+        for marker, instances in sorted(instances_by_marker.items()):
+            variant_counts: dict[tuple[int, int, int], int] = {}
+            for instance in instances.values():
+                variant = (
+                    instance["logical_bytes"],
+                    instance["modeled_bytes"],
+                    instance["tensor_count"],
+                )
+                variant_counts[variant] = variant_counts.get(variant, 0) + 1
+
+            size_variants = [
+                {
+                    "logical_bytes": logical_bytes,
+                    "modeled_bytes": modeled_bytes,
+                    "tensor_count": tensor_count,
+                    "instance_count": instance_count,
+                }
+                for (
+                    logical_bytes,
+                    modeled_bytes,
+                    tensor_count,
+                ), instance_count in sorted(variant_counts.items())
+            ]
+            consistent = len(size_variants) == 1
+            marker_kinds = {
+                item.marker_kind
+                for item in self.checkpoint_tensors
+                if item.is_saved_activation and item.checkpoint_id == marker
+            }
+            result[marker] = {
+                "marker_kind": (
+                    next(iter(marker_kinds))
+                    if len(marker_kinds) == 1
+                    else "mixed"
+                ),
+                "logical_bytes_per_instance": (
+                    size_variants[0]["logical_bytes"] if consistent else None
+                ),
+                "modeled_bytes_per_instance": (
+                    size_variants[0]["modeled_bytes"] if consistent else None
+                ),
+                "tensor_count_per_instance": (
+                    size_variants[0]["tensor_count"] if consistent else None
+                ),
+                "instance_count": len(instances),
+                "logical_bytes_total": sum(
+                    instance["logical_bytes"] for instance in instances.values()
+                ),
+                "modeled_bytes_total": sum(
+                    instance["modeled_bytes"] for instance in instances.values()
+                ),
+                "pp_stages": sorted(
+                    {
+                        stage
+                        for _seq_idx, stage, _microbatch, _comp_type in instances
+                        if stage >= 0
+                    }
+                ),
+                "microbatches": sorted(
+                    {
+                        microbatch
+                        for _seq_idx, _stage, microbatch, _comp_type in instances
+                        if microbatch >= 0
+                    }
+                ),
+                "size_variants": size_variants,
+            }
+        return result
+
     def to_summary_dict(self) -> dict[str, Any]:
         return {
             "metric": self.metric,
+            "parameter_storage_dtype": self.parameter_storage_dtype or "captured",
+            "offload_ac_saved_tensors": self.offload_ac_saved_tensors,
             "persistent_param_bytes": self.persistent_param_bytes,
             "active_bytes_peak": self.peak_active_bytes,
             "model_active_bytes_peak": self.model_active_bytes_peak,
@@ -143,6 +286,23 @@ class MemoryPlan:
             "peak_phase": self.peak_phase,
             "raw_memory_event_count": len(self.raw_events),
             "tensor_lifetime_count": len(self.tensor_lifetimes),
+            "checkpoint_tensor_count": len(self.checkpoint_tensors),
+            "checkpoint_saved_activation_count": sum(
+                item.is_saved_activation for item in self.checkpoint_tensors
+            ),
+            "checkpoint_tensor_logical_bytes": sum(
+                item.num_bytes
+                for item in self.checkpoint_tensors
+                if item.is_saved_activation
+            ),
+            "checkpoint_tensor_modeled_bytes": sum(
+                item.modeled_num_bytes
+                for item in self.checkpoint_tensors
+                if item.is_saved_activation
+            ),
+            "checkpoint_saved_activations": (
+                self._checkpoint_saved_activations_by_marker()
+            ),
             "timeline_event_count": len(self.timeline_events),
             "memory_action_span_count": len(self.action_spans),
             "unclassified_op_count": len(self.unclassified_ops),
@@ -164,6 +324,7 @@ class MemoryPlan:
     def to_dict(self) -> dict[str, Any]:
         data = self.to_summary_dict()
         data["tensor_lifetimes"] = [asdict(item) for item in self.tensor_lifetimes]
+        data["checkpoint_tensors"] = [asdict(item) for item in self.checkpoint_tensors]
         data["timeline_events"] = [asdict(item) for item in self.timeline_events]
         data["action_spans"] = [asdict(item) for item in self.action_spans]
         data["unclassified_ops"] = list(self.unclassified_ops)

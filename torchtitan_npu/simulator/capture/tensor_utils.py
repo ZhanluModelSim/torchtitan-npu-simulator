@@ -51,6 +51,17 @@ def dtype_byte_size(dtype_str: str) -> int:
     return _DTYPE_BYTE_SIZES.get(dtype_str, _DEFAULT_DTYPE_BYTE_SIZE)
 
 
+def normalize_supported_dtype(dtype_str: str) -> str:
+    """Return a canonical simulator dtype or reject an invalid policy value."""
+    canonical = dtype_str.removeprefix("torch.").lower()
+    if canonical not in _DTYPE_BYTE_SIZES:
+        supported = ", ".join(sorted(_DTYPE_BYTE_SIZES))
+        raise ValueError(
+            f"Unsupported simulator memory dtype {dtype_str!r}; expected one of: {supported}"
+        )
+    return canonical
+
+
 def tensor_volume_bytes(shape: tuple[int, ...], dtype_str: str) -> int:
     """Total byte size of a tensor with the given shape and dtype."""
     numel = 1
