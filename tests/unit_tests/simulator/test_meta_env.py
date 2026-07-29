@@ -97,6 +97,44 @@ def test_patch_is_idempotent():
         unpatch_device_type_to_meta()
 
 
+def test_patch_promotes_meta_dtensor_to_leaf_parameter(tmp_path):
+    import torch.distributed as dist
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.tensor import DTensor, Replicate
+
+    rendezvous = tmp_path / "dtensor-parameter-rendezvous"
+    dist.init_process_group(
+        "fake",
+        init_method=f"file://{rendezvous}",
+        rank=0,
+        world_size=2,
+    )
+    try:
+        patch_device_type_to_meta()
+        mesh = init_device_mesh("meta", (2,))
+        local_parameter = nn.Parameter(torch.ones(4, device="meta"))
+        distributed = DTensor.from_local(
+            local_parameter,
+            mesh,
+            [Replicate()],
+            run_check=False,
+        )
+        assert distributed.grad_fn is not None
+
+        parameter = nn.Parameter(distributed)
+        module = nn.Module()
+        module.register_parameter("weight", parameter)
+
+        assert isinstance(module.weight, DTensor)
+        assert module.weight.device.type == "meta"
+        assert module.weight.is_leaf
+        assert module.weight.grad_fn is None
+        assert module.weight.requires_grad
+    finally:
+        unpatch_device_type_to_meta()
+        dist.destroy_process_group()
+
+
 def test_stub_device_module_methods_used_by_trainer_and_metrics_do_not_raise():
     try:
         patch_device_type_to_meta()

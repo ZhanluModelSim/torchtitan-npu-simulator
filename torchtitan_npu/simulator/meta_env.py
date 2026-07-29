@@ -652,9 +652,10 @@ def _patch_parameter_dtensor_for_meta() -> None:
             and isinstance(data, DTensor)
             and data.device.type == "meta"
         ):
-            data.requires_grad_(requires_grad)
-            data._is_param = True
-            return data
+            parameter = data.detach()
+            parameter.requires_grad_(requires_grad)
+            parameter._is_param = True
+            return parameter
         return _original_parameter_new(cls, data, requires_grad)
 
     torch.nn.Parameter.__new__ = staticmethod(_meta_safe_parameter_new)
