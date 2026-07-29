@@ -11,9 +11,10 @@ that wraps it).
 """
 
 from dataclasses import dataclass
-from typing import ClassVar
+from typing import Annotated, ClassVar
 
 import torch.nn as nn
+import tyro
 from torchao.core.config import AOBaseConfig
 from torchao.quantization.quant_api import _is_linear, quantize_
 from torchtitan.components.quantization import QuantizationConverter
@@ -47,13 +48,29 @@ class NpuQuantizeConverter(QuantizationConverter):
         # ``quantize_``. The user is responsible for constructing the config with
         # whatever fields it requires (weight/activation configs,
         # ``params_filter_fn``, ``step``, etc.).
-        base_config: AOBaseConfig
+        #
+        # Suppressed from tyro CLI parsing because ``AOBaseConfig`` is an
+        # abstract base class — tyro can't pick a concrete subclass from CLI
+        # args. The type is made Optional so ``None`` is a valid default at the
+        # dataclass level; a non-None value must be supplied programmatically,
+        # enforced by ``__post_init__``.
+        base_config: Annotated[AOBaseConfig | None, tyro.conf.Suppress] = None
 
         # Module-level filter passed to ``quantize_``. Receives ``(module, fqn)``
         # and returns ``True`` if the quantize handler should be applied to that
         # module. Defaults to :func:`torchao.quantization.quant_api._is_linear`
         # (matches the default used by ``quantize_`` itself).
-        filter_fn: ModuleFilterFn = _is_linear
+        #
+        # Suppressed from tyro CLI parsing because ``ModuleFilterFn`` is a
+        # Protocol; tyro can't auto-construct a callable from CLI args.
+        filter_fn: Annotated[ModuleFilterFn, tyro.conf.Suppress] = _is_linear
+
+        def __post_init__(self):
+            if self.base_config is None:
+                raise ValueError(
+                    "NpuQuantizeConverter.Config.base_config must be provided "
+                    "programmatically; it cannot be set via CLI."
+                )
 
         def to_dict(self) -> dict:
             # Serialize base_config via repr to avoid JSON-serialization issues
@@ -70,17 +87,6 @@ class NpuQuantizeConverter(QuantizationConverter):
         parallel_dims: ParallelDims,
         model_compile_enabled: bool,
     ):
-        # TODO: torch.compile compatibility for wrapper tensors + custom autograd.Function
-        # has not been verified yet. Warn so users know the compile path is untested;
-        # drop this once compile support is validated.
-        if model_compile_enabled:
-            logger.warning(
-                "NpuQuantizeConverter does not honor model_compile_enabled — the converter "
-                "ignores this flag and applies parameter wrapping unconditionally. Wrapper "
-                "tensors + custom autograd.Function have not been verified under torch.compile; "
-                "if you hit errors, disable model compile (job_config.compile.enable=false)."
-            )
-
         self.base_config = config.base_config
         self.filter_fn = config.filter_fn
         logger.info(f"Parameter quantize active with base_config={type(self.base_config).__name__}")
@@ -92,6 +98,9 @@ class NpuQuantizeConverter(QuantizationConverter):
         verify_module_protocol(model, nn.Linear, Linear)
         saved_attrs = capture_module_attrs(model, ["_init_mean", "_init_std"], nn_module_cls=nn.Linear)
 
+        # `base_config` is Optional at the type level (see Config), but
+        # `__post_init__` guarantees it is non-None by the time we get here.
+        assert self.base_config is not None, "base_config cannot be None"
         quantize_(model, self.base_config, filter_fn=self.filter_fn)
 
         # Re-inject Linear protocol and re-attach attrs lost during conversion

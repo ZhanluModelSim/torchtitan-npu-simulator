@@ -39,7 +39,10 @@ def mxfp4_dequantize(
     assert output_shape[axis] % block_size == 0, f"quant dim must be divisible by block_size ({block_size})"
 
     # Use cached 256-entry LUT (indexed by full byte, no nibble splitting)
-    lut = _get_fp4_e2m1_pair_lut(data.device, torch.bfloat16, low_first)
+    # pyrefly: ignore [bad-assignment, bad-argument-type, bad-argument-count]
+    # (_get_fp4_e2m1_pair_lut is wrapped by @torch.compiler.disable, which
+    # collapses its signature to (fn) -> Any in pyrefly's view.)
+    lut: torch.Tensor = _get_fp4_e2m1_pair_lut(data.device, torch.bfloat16, low_first)
     idx = data.to(torch.uint8).reshape(-1).to(torch.long)
     values = torch.index_select(lut, dim=0, index=idx)
 
@@ -77,18 +80,21 @@ def mxfp4_dequantize(
     return result.to(output_dtype)
 
 
+@torch.compiler.disable
 @functools.cache
-def _get_fp4_e2m1_pair_lut(device, dtype=torch.bfloat16, low_first: bool = True):
+def _get_fp4_e2m1_pair_lut(device, dtype=torch.bfloat16, low_first: bool = True) -> torch.Tensor:
     """LUT mapping a packed uint8 byte to a pair of decoded FP4 values.
 
     Returns shape [256, 2], indexed by the full byte value.
     low nibble → index 0, high nibble → index 1 (or swapped if low_first=False).
     """
-    fp4_vals = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]
-
-    if low_first:
-        lut = [[fp4_vals[p & 0x0F], fp4_vals[p >> 4]] for p in range(256)]
-    else:
-        lut = [[fp4_vals[p >> 4], fp4_vals[p & 0x0F]] for p in range(256)]
-
-    return torch.tensor(lut, device=device, dtype=dtype)
+    fp4_vals = torch.tensor(
+        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+        device=device,
+        dtype=dtype,
+    )
+    p = torch.arange(256, device=device)
+    low_nibble = p & 0x0F
+    high_nibble = p >> 4
+    idx0, idx1 = (low_nibble, high_nibble) if low_first else (high_nibble, low_nibble)
+    return torch.stack([fp4_vals[idx0], fp4_vals[idx1]], dim=1)

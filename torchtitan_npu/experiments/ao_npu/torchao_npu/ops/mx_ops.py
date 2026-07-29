@@ -10,6 +10,22 @@ from ..quantization.quant_configs import MXQuantizeConfig
 from ..quantization.quant_primitives.mx import mxfp4_dequantize
 
 
+def _to_npu_dtype_override(dtype: torch.dtype) -> int | None:
+    """Return NPU dtype int for ``x1_dtype``/``x2_dtype``, or ``None`` to omit.
+
+    ``npu_quant_matmul``'s ``x1_dtype``/``x2_dtype`` parameters must only be
+    passed for dtypes where the tensor's storage dtype differs from its logical
+    dtype.  ``float4_e2m1fn_x2`` is stored as ``uint8`` (two FP4 values per
+    byte), so the kernel needs the explicit hint ``torch_npu.float4_e2m1fn_x2``.
+    Standard FP8 types (``float8_e4m3fn``, ``float8_e5m2``) are natively
+    represented by the tensor's dtype and **must not** be passed — doing so
+    causes a ``RuntimeError`` under ``torch.compile``'s fake-tensor tracing.
+    """
+    if dtype == torch.float4_e2m1fn_x2:
+        return torch_npu.float4_e2m1fn_x2
+    return None
+
+
 class MXFP4FakeQuantize(torch.autograd.Function):
     """MX FP4 fake quantize via autograd.Function.
 
@@ -103,8 +119,8 @@ class _MXQuantMM(torch.autograd.Function):
             group_sizes=[1, 1, config_A.block_size],
             scale_dtype=torch_npu.float8_e8m0fnu,
             pertoken_scale_dtype=torch_npu.float8_e8m0fnu,
-            x1_dtype=config_A.elem_dtype,
-            x2_dtype=config_B.elem_dtype,
+            x1_dtype=_to_npu_dtype_override(config_A.elem_dtype),
+            x2_dtype=_to_npu_dtype_override(config_B.elem_dtype),
         )
 
         if A.ndim != 2:
@@ -143,8 +159,8 @@ class _MXQuantMM(torch.autograd.Function):
             group_sizes=[1, 1, config_A.block_size],
             scale_dtype=torch_npu.float8_e8m0fnu,
             pertoken_scale_dtype=torch_npu.float8_e8m0fnu,
-            x1_dtype=config_A.elem_dtype,
-            x2_dtype=config_B.elem_dtype,
+            x1_dtype=_to_npu_dtype_override(config_A.elem_dtype),
+            x2_dtype=_to_npu_dtype_override(config_B.elem_dtype),
         )
 
         # --- Step 3: wgrad  dB = A^T @ dY  (contract over M) ---
@@ -157,8 +173,8 @@ class _MXQuantMM(torch.autograd.Function):
             group_sizes=[1, 1, config_A.block_size],
             scale_dtype=torch_npu.float8_e8m0fnu,
             pertoken_scale_dtype=torch_npu.float8_e8m0fnu,
-            x1_dtype=config_A.elem_dtype,
-            x2_dtype=config_A.elem_dtype,
+            x1_dtype=_to_npu_dtype_override(config_A.elem_dtype),
+            x2_dtype=_to_npu_dtype_override(config_A.elem_dtype),
         )
 
         if dY.ndim != 2:

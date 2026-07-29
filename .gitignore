@@ -27,6 +27,8 @@ torchtitan/experiments/flux/assets/*
 error.json
 _remote_module_non_scriptable.py
 pipeline_logs
+kernel_meta/
+.static_kernel_records.json
 
 # Editor temporaries (VIM)
 [._]*.s[a-v][a-z]
