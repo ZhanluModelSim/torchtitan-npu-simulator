@@ -1,4 +1,4 @@
-# Pending upstream PR: https://github.com/pytorch/torchtitan/pull/3634
+# Pending upstream PR: https://github.com/pytorch/torchtitan/pull/3864
 
 import functools
 import logging

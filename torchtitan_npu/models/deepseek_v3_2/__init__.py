@@ -94,7 +94,7 @@ def _build_dsv3_2_layers(
                 weights_proj=Linear.Config(
                     in_features=dim,
                     out_features=index_n_heads,
-                    param_init={"weight": partial(nn.init.normal_, std=1.0)},
+                    param_init=_LINEAR_INIT,
                 ),
                 rope=CosSinRoPE.Config(
                     dim=qk_rope_head_dim,

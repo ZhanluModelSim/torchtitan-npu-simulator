@@ -241,6 +241,7 @@ def kernel(
     cfg: SparseInnerAttention.Config,
 ) -> NPUSparseInnerAttention.Config:
     return NPUSparseInnerAttention.Config(
+        sharding_config=cfg.sharding_config,
         index_topk=cfg.index_topk,
         indexer_loss=derive(cfg.indexer_loss, NPUSparseIndexerLoss.Config),
     )

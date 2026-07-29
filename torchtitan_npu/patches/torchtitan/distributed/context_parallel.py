@@ -26,6 +26,8 @@ def patched_cp_shard(
 ):
     """Build rank-local varlen metadata after sharding inputs for CP."""
     is_varlen = isinstance(attention_masks, VarlenMetadata)
+    batch_size = inputs[0].size(0)
+    seq_len = inputs[0].size(input_seq_dim)
 
     inputs, output_masks = original_cp_shard(
         cp_mesh,
@@ -41,11 +43,10 @@ def patched_cp_shard(
             "headtail",
         ), f"varlen only support headtail as load balancer, got ({load_balancer_type})"
 
-        seq_len = inputs[0].size(input_seq_dim)
         output_masks = CPVarlenMetadata.from_global(
             attention_masks,
             cp_mesh,
-            inputs[0].size(0),
+            batch_size,
             seq_len,
             load_balancer=(
                 _HeadTailLoadBalancer(seq_len, cp_mesh.size(0), cp_mesh.device_type)
