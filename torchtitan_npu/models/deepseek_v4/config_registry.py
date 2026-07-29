@@ -116,6 +116,15 @@ def debug_deepseek_v4_pro_single_node() -> TrainerConfig:
     return replace(
         base,
         model_spec=model_registry("v4_pro_16layers_16experts"),
-        model_converters=ModelConvertersContainer.Config(converters=_default_converters()),
-        parallelism=replace(base.parallelism, expert_parallel_degree=16),
+    )
+
+
+def debug_deepseek_v4_pro_single_node_mxfp8() -> TrainerConfig:
+    base = debug_deepseek_v4_pro_single_node()
+    return replace(
+        base,
+        model_converters=ModelConvertersContainer.Config(
+            converters=base.model_converters.converters  # noqa: RUF005
+            + [MXFP8Converter.Config(recipe_name="mxfp8_rceil", fqns=list(_MXFP8_FQNS))]
+        ),
     )

@@ -25,3 +25,15 @@ NGPU=8 LOG_RANK=0 bash examples/deepseek_v4/debug_deepseek_v4_single_node.sh \
   --checkpoint.initial_load_path ./export_ckpt/checkpoint/step-1 \
   --checkpoint.initial_load_in_hf
 ```
+4. DeepSeek V4 Pro debug
+```sh
+CONFIG=debug_deepseek_v4_pro_single_node \
+  NGPU=8 LOG_RANK=0 \
+  bash examples/deepseek_v4/debug_deepseek_v4_single_node.sh
+```
+5. DeepSeek V4 Pro MXFP8 debug
+```sh
+CONFIG=debug_deepseek_v4_pro_single_node_mxfp8 \
+  NGPU=8 LOG_RANK=0 \
+  bash examples/deepseek_v4/debug_deepseek_v4_single_node.sh
+```

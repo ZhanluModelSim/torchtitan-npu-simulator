@@ -455,8 +455,26 @@ def test_deepseek_v4_pro_single_node_derives_from_flash_single_node_config():
     assert pro_config.checkpoint == flash_config.checkpoint
     assert pro_config.debug == flash_config.debug
     assert pro_config.comm == flash_config.comm
-    assert _converter_names(pro_config) == _converter_names(flash_config)[:-1]
-    assert pro_config.parallelism.expert_parallel_degree == 16
+    assert _converter_names(pro_config) == _converter_names(flash_config)
+    assert pro_config.parallelism == flash_config.parallelism
+
+
+def test_deepseek_v4_pro_single_node_mxfp8_derives_from_pro_single_node_config():
+    from torchtitan.components.quantization.mx import MXFP8Converter
+
+    config_registry = _deepseek_v4_registry()
+
+    pro_config = config_registry.debug_deepseek_v4_pro_single_node()
+    mxfp8_config = config_registry.debug_deepseek_v4_pro_single_node_mxfp8()
+
+    assert mxfp8_config.model_spec == pro_config.model_spec
+    assert mxfp8_config.parallelism == pro_config.parallelism
+    assert mxfp8_config.training == pro_config.training
+    assert mxfp8_config.checkpoint == pro_config.checkpoint
+    assert _converter_names(mxfp8_config)[:-1] == _converter_names(pro_config)
+    assert len(mxfp8_config.model_converters.converters) == len(pro_config.model_converters.converters) + 1
+    assert isinstance(mxfp8_config.model_converters.converters[-1], MXFP8Converter.Config)
+    assert mxfp8_config.model_converters.converters[-1].recipe_name == "mxfp8_rceil"
 
 
 def test_deepseek_v4_cpt_config_can_select_chat_dataloader_from_cli():
