@@ -3,6 +3,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from contextlib import ExitStack
+
 import torch
 import torch.nn as nn
 
@@ -59,6 +61,78 @@ def test_capture_tags_module_path_when_tracker_supplied():
     tagged = [n for n in nodes.values() if "module_path" in n.annotations]
     assert tagged, "expected at least one op tagged with a module_path"
     assert any("0" in n.annotations["module_path"] for n in tagged)  # Sequential child "0" (Linear)
+
+
+def test_capture_tags_normal_backward_ops_with_module_path():
+    model = nn.Sequential(
+        nn.Linear(4, 8, device="meta"),
+        nn.ReLU(),
+        nn.Linear(8, 2, device="meta"),
+    )
+    phase = {"value": "forward"}
+    tracker = ModulePathTracker(model)
+    capture = OpDispatchCapture(
+        module_path_tracker=tracker,
+        phase_provider=lambda: phase["value"],
+    )
+
+    with tracker, capture:
+        inputs = torch.randn(2, 4, device="meta", requires_grad=True)
+        output = model(inputs)
+        phase["value"] = "backward"
+        output.sum().backward()
+        assert tracker.current_path() == ""
+
+    backward_nodes = [
+        node
+        for node in capture.build_nodes().values()
+        if node.annotations["phase"] == "backward"
+    ]
+    paths = {
+        node.annotations.get("module_path", "")
+        for node in backward_nodes
+    }
+    assert "0" in paths
+    assert "1" in paths
+    assert "2" in paths
+    assert any(
+        node.annotations.get("module_path") == "2"
+        and node.annotations["raw_op_type"] == "aten.mm.default"
+        for node in backward_nodes
+    )
+
+
+def test_backward_module_path_tracking_does_not_add_dispatch_events():
+    def capture_raw_ops(track_module_path: bool) -> list[tuple[str, str]]:
+        model = nn.Sequential(
+            nn.Linear(4, 8, device="meta"),
+            nn.ReLU(),
+            nn.Linear(8, 2, device="meta"),
+        )
+        phase = {"value": "forward"}
+        tracker = ModulePathTracker(model) if track_module_path else None
+        capture = OpDispatchCapture(
+            module_path_tracker=tracker,
+            phase_provider=lambda: phase["value"],
+        )
+
+        if tracker is None:
+            contexts = (capture,)
+        else:
+            contexts = (tracker, capture)
+        with ExitStack() as stack:
+            for context in contexts:
+                stack.enter_context(context)
+            inputs = torch.randn(2, 4, device="meta", requires_grad=True)
+            output = model(inputs)
+            phase["value"] = "backward"
+            output.sum().backward()
+        return [
+            (event.raw_op_type, event.phase)
+            for event in capture.memory_events()
+        ]
+
+    assert capture_raw_ops(True) == capture_raw_ops(False)
 
 
 def test_unknown_op_type_is_flagged_in_annotations():

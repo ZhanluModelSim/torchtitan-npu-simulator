@@ -460,6 +460,10 @@ simulator_output/<配置名>/
 > selective checkpoint 内部被缓存并在重计算阶段复用的 forward tensor 会保留
 > 原始 use-def 生命周期，并标记为 `checkpoint_saved_for_recompute`；它们不会按
 > full checkpoint 的内部临时值提前释放。
+>
+> `module_path` 同时覆盖正常 forward、checkpoint recompute 和模块内部的
+> backward 算子。backward 路径由模块输出的梯度边界确定，因此可用于按层汇总
+> 算子时间；loss、跨层通信等没有唯一模块归属的全局算子可能保持为空。
 
 > [!IMPORTANT]
 > 大规模仿真（如 2048 die）时，全量展开所有 rank 的 CSV 会非常大（每 rank 数万行）。可通过配置中的 `simulation.csv_max_ranks` 限制展开的 rank 数量：
