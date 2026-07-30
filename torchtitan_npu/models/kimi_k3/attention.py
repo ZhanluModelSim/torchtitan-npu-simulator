@@ -169,70 +169,27 @@ class KimiDeltaAttention(nn.Module):
         g: torch.Tensor,
         beta: torch.Tensor,
     ) -> torch.Tensor:
-        """Chunk-wise KDA forward. Tries fused triton kernel, falls back to naive."""
-        try:
-            from triton_ascend_kernels.attention.fla.kda.chunk import chunk_kda
+        """Chunk-wise KDA forward via triton-ascend-kernels fused operator."""
+        from triton_ascend_kernels.attention.fla.kda.chunk import chunk_kda
 
-            o, _ = chunk_kda(
-                q=q,
-                k=k,
-                v=v,
-                g=g,
-                beta=beta,
-                A_log=self.A_log,
-                dt_bias=self.dt_bias,
-                initial_state=None,
-                output_final_state=False,
-                use_qk_l2norm_in_kernel=True,
-                use_gate_in_kernel=True,
-                use_beta_sigmoid_in_kernel=False,
-                safe_gate=self.gate_lower_bound is not None,
-                lower_bound=self.gate_lower_bound,
-                transpose_state_layout=True,
-                cu_seqlens=None,
-            )
-            return o
-        except ImportError:
-            return self._chunk_kda_naive(q, k, v, g, beta)
-
-    def _chunk_kda_naive(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        g: torch.Tensor,
-        beta: torch.Tensor,
-    ) -> torch.Tensor:
-        """Naive chunk KDA for environments without triton-ascend-kernels.
-
-        Simplified causal linear attention: O = softmax_causal(Q @ K^T) @ V
-        with per-head gating. Sufficient for simulator shape verification.
-        """
-        batch_size, seq_len, num_heads, head_dim = q.shape
-
-        # L2 normalize q and k
-        q = F.normalize(q, p=2, dim=-1)
-        k = F.normalize(k, p=2, dim=-1)
-
-        # Transpose to (B, H, S, D) for attention
-        q = q.transpose(1, 2)  # (B, H, S, D)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
-
-        # Causal attention scores
-        attn = torch.matmul(q, k.transpose(-2, -1))  # (B, H, S, S)
-        causal_mask = torch.tril(torch.ones(seq_len, seq_len, device=q.device, dtype=torch.bool))
-        attn = attn.masked_fill(~causal_mask, float("-inf"))
-        attn = torch.softmax(attn, dim=-1)
-
-        # Apply beta scaling (B, S, H) -> (B, H, S, 1)
-        beta_scale = beta.transpose(1, 2).unsqueeze(-1)  # (B, H, S, 1)
-        attn = attn * beta_scale
-
-        # Output
-        o = torch.matmul(attn, v)  # (B, H, S, D)
-        o = o.transpose(1, 2)  # (B, S, H, D)
-
+        o, _ = chunk_kda(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            A_log=self.A_log,
+            dt_bias=self.dt_bias,
+            initial_state=None,
+            output_final_state=False,
+            use_qk_l2norm_in_kernel=True,
+            use_gate_in_kernel=True,
+            use_beta_sigmoid_in_kernel=False,
+            safe_gate=self.gate_lower_bound is not None,
+            lower_bound=self.gate_lower_bound,
+            transpose_state_layout=True,
+            cu_seqlens=None,
+        )
         return o
 
 

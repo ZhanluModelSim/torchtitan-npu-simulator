@@ -30,6 +30,8 @@ from torchtitan_npu.simulator.capture.schedule_builder import (
 )
 from torchtitan_npu.simulator.capture.step_boundary import StepBoundaryTracker, build_step_graphs
 from torchtitan_npu.simulator.capture.workload_builder import build_workload_graph
+from torchtitan_npu.simulator.hardware_shims.kda_converter import apply_kda_shims
+from torchtitan_npu.simulator.hardware_shims.kimi_k3_moe_converter import apply_kimi_k3_moe_shims
 from torchtitan_npu.simulator.hardware_shims.mhc_converter import apply_mhc_shims
 from torchtitan_npu.simulator.hardware_shims.rms_norm_converter import (
     apply_rms_norm_shims,
@@ -483,6 +485,10 @@ class SimulationTrainer(Trainer):
             _patch_parallel_dims_for_multi_proc(full_ws, gloo_ws)
 
         super().__init__(config)
+        # Kimi K3 shims: applied after model construction (model_parts exists now)
+        for model_part in self.model_parts:
+            apply_kda_shims(model_part)
+            apply_kimi_k3_moe_shims(model_part)
         self.simulation_config = config.simulation
         self.workload_graph: WorkloadGraph | None = None
 

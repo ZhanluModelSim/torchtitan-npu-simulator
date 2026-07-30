@@ -28,6 +28,7 @@ def _default_converters() -> list:
     return [
         get_model_converter_config("npu_rms_norm"),
         get_model_converter_config("npu_rope"),
+        get_model_converter_config("npu_kimi_k3_moe"),
     ]
 
 
