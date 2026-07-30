@@ -180,6 +180,7 @@ class KimiSparseMoeBlock(nn.Module):
         self.hidden_size = config.hidden_size
         self.num_experts = config.num_experts
         self.top_k = config.top_k
+        self.load_balance_coeff = 0.0  # No auxiliary loss balancing for K3 (uses bias correction)
 
         self.use_latent_moe = config.routed_expert_hidden_size is not None
         self.moe_hidden_size = config.routed_expert_hidden_size or config.hidden_size
@@ -255,6 +256,10 @@ class KimiSparseMoeBlock(nn.Module):
         self, x: torch.Tensor, topk_idx: torch.Tensor, topk_weight: torch.Tensor
     ) -> torch.Tensor:
         """Standard per-expert loop (non-fused). NPU fused path via converter."""
+        # Meta device: use simplified forward (all experts process all tokens equally)
+        if x.device.type == "meta":
+            return self._moe_forward_meta(x, topk_idx, topk_weight)
+
         final_hidden_states = torch.zeros_like(x)
         with torch.no_grad():
             expert_mask = F.one_hot(topk_idx, num_classes=self.num_experts).permute(2, 1, 0)
@@ -269,3 +274,14 @@ class KimiSparseMoeBlock(nn.Module):
             final_hidden_states.index_add_(0, token_idx, expert_out.to(final_hidden_states.dtype))
 
         return final_hidden_states
+
+    def _moe_forward_meta(
+        self, x: torch.Tensor, topk_idx: torch.Tensor, topk_weight: torch.Tensor
+    ) -> torch.Tensor:
+        """Meta-device MoE forward: deterministic round-robin, no data-dependent ops."""
+        num_tokens = x.shape[0]
+        # Each token goes through top_k experts; use first expert for shape inference
+        expert_out = self.experts[0](x)
+        # Scale by average routing weight
+        scale = topk_weight.sum(dim=-1, keepdim=True) / self.top_k
+        return expert_out * scale

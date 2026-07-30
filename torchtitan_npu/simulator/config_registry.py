@@ -102,3 +102,29 @@ def deepseek_v4_smoketest() -> SimulationTrainerConfig:
         _model_configs.deepseek_v4_smoketest,
         output_name="deepseek_v4_smoketest",
     )
+
+
+# ---------------------------------------------------------------------------
+# Kimi K3 simulator configs
+# ---------------------------------------------------------------------------
+
+from torchtitan_npu.models.kimi_k3.config_registry import (  # noqa: E402
+    kimi_k3_smoketest as _kimi_k3_smoketest,
+)
+
+
+def kimi_k3_simulate() -> SimulationTrainerConfig:
+    """Kimi K3 debug model: FSDP2 + CP=2 + EP=2, PP=1, TP=1."""
+    base_config = _kimi_k3_smoketest()
+    base_config.parallelism.data_parallel_shard_degree = 4
+    base_config.parallelism.tensor_parallel_degree = 1
+    base_config.parallelism.pipeline_parallel_degree = 1
+    base_config.parallelism.expert_parallel_degree = 2
+    base_config.parallelism.context_parallel_degree = 2
+    base_config.parallelism.expert_tensor_parallel_degree = 1
+    base_fields = {field.name: getattr(base_config, field.name) for field in dataclasses.fields(base_config)}
+    base_fields["compile"] = dataclasses.replace(base_config.compile, enable=False)
+    return SimulationTrainerConfig(
+        **base_fields,
+        simulation=SimulationConfig(output_dir="./simulator_output/kimi_k3_simulate"),
+    )

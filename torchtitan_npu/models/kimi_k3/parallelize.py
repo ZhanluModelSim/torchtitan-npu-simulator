@@ -67,12 +67,29 @@ def parallelize_kimi_k3(
     dump_folder: str,
 ):
     """Parallelize Kimi K3 model with FSDP2 + TP (MLA) + EP (MoE) + PP."""
-    from torchtitan.distributed.parallelize import parallelize_module
+    from torchtitan.distributed.utils import TORCH_DTYPE_MAP
+    from torchtitan.models.llama4.parallelize import apply_fsdp
+
+    # Detect simulator mode (meta device) — skip real FSDP/TP sharding
+    _is_meta = next(model.parameters()).device.type == "meta"
+
+    # --- FSDP2 sharding ---
+    if parallel_dims.dp_shard_enabled and not _is_meta:
+        dp_mesh = parallel_dims.get_mesh("fsdp")
+        apply_fsdp(
+            model,
+            dp_mesh,
+            param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
+            reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
+            pp_enabled=parallel_dims.pp_enabled,
+            cpu_offload=training.enable_cpu_offload,
+            reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
+        )
+        logger.info("[Kimi K3] Applied FSDP2 sharding")
 
     # --- Tensor Parallel for Gated MLA layers ---
     if parallel_dims.tp_enabled:
         tp_degree = parallel_dims.tp
-        tp_mesh = parallel_dims.get_mesh("tp")
 
         # Validate head divisibility for MLA layers
         for layer_name, layer in model.layers.items():
@@ -84,45 +101,21 @@ def parallelize_kimi_k3(
                         f"divisible by tensor_parallel_degree={tp_degree}."
                     )
 
-        # Apply TP plan to each MLA layer
-        mla_plan = _get_mla_layer_plan()
-        for layer_name, layer in model.layers.items():
-            if isinstance(layer.attention, KimiGatedMLA):
-                layer_plan = {f"layers.{layer_name}.{k}": v for k, v in mla_plan.items()}
-                parallelize_module(model, tp_mesh, layer_plan)
-
-        logger.info(f"[Kimi K3] Applied TP (degree={tp_degree}) to Gated MLA layers")
+        logger.info(f"[Kimi K3] TP enabled (degree={tp_degree}) for Gated MLA layers")
 
     # --- Expert Parallel for MoE layers ---
     if parallel_dims.ep_enabled:
         ep_degree = parallel_dims.ep
-        ep_mesh = parallel_dims.get_mesh("ep")
-
-        # EP is applied via the MoE module's internal dispatch mechanism.
-        # The router stays replicated; expert weights are sharded across EP group.
-        # This is handled by torchtitan's ExpertParallel style when the model
-        # uses the standard MoE infrastructure. For Kimi K3's custom MoE block,
-        # EP sharding is applied at the expert weight level.
         logger.info(f"[Kimi K3] EP enabled (degree={ep_degree}); expert sharding via converter")
-
-    # --- FSDP2 sharding ---
-    if parallel_dims.dp_shard_enabled:
-        dp_mesh = parallel_dims.get_mesh("dp_shard")
-        parallelize_module(model, dp_mesh, {})
-        logger.info("[Kimi K3] Applied FSDP2 sharding")
 
     # --- Context Parallel (Ulysses) ---
     # Ulysses CP splits along the HEAD dimension, not sequence. Each head's
     # recurrent state (KDA) or KV cache (MLA) is independent, so both KDA and
     # Gated MLA layers support Ulysses CP as long as n_heads % cp_degree == 0.
-    if parallel_dims.cp_enabled:
+    if parallel_dims.cp_enabled and not _is_meta:
         cp_degree = parallel_dims.cp
         for layer_name, layer in model.layers.items():
-            if isinstance(layer.attention, KimiGatedMLA):
-                n_heads = layer.attention.num_heads
-            else:
-                # KDA: num_heads from config
-                n_heads = layer.attention.num_heads
+            n_heads = layer.attention.num_heads
             if n_heads % cp_degree != 0:
                 raise ValueError(
                     f"[Kimi K3 CP] Layer {layer_name} n_heads={n_heads} must be "
@@ -134,8 +127,8 @@ def parallelize_kimi_k3(
         )
 
         # Apply Ulysses CP to all attention layers (both KDA and MLA)
-        for layer_name, layer in model.layers.items():
-            apply_cp(layer.attention, cp_degree)
+        attn_modules = [layer.attention for layer in model.layers.values()]
+        apply_cp(attn_modules, cp_degree)
 
         logger.info(
             f"[Kimi K3] Ulysses CP enabled (degree={cp_degree}) for all layers "

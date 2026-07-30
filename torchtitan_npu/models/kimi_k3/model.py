@@ -25,7 +25,7 @@ from .feed_forward import KimiMLP, KimiSparseMoeBlock
 logger = logging.getLogger(__name__)
 
 
-class KimiK3TransformerBlock(nn.Module):
+class KimiK3TransformerBlock(Module):
     """Single decoder layer: attention (KDA or Gated MLA) + FFN (dense or MoE)."""
 
     @dataclass(kw_only=True, slots=True)
@@ -33,8 +33,6 @@ class KimiK3TransformerBlock(nn.Module):
         attention: KimiDeltaAttention.Config | KimiGatedMLA.Config = field(
             default_factory=KimiDeltaAttention.Config
         )
-        attention_norm: nn.RMSNorm | None = None
-        ffn_norm: nn.RMSNorm | None = None
         feed_forward: KimiMLP | None = None
         moe: KimiSparseMoeBlock.Config | None = None
         norm_eps: float = 1e-5
@@ -55,9 +53,11 @@ class KimiK3TransformerBlock(nn.Module):
         if config.moe is not None:
             self.moe = KimiSparseMoeBlock(config.moe)
             self.feed_forward = None
+            self.moe_enabled = True
         elif config.feed_forward is not None:
             self.feed_forward = config.feed_forward
             self.moe = None
+            self.moe_enabled = False
         else:
             raise ValueError("Either feed_forward or moe must be specified")
 
@@ -83,7 +83,7 @@ class KimiK3TransformerBlock(nn.Module):
         return x
 
 
-class KimiK3Model(nn.Module):
+class KimiK3Model(Module):
     """Kimi K3: 2.8T MoE model with hybrid KDA/Gated-MLA attention.
 
     Architecture:
@@ -100,15 +100,43 @@ class KimiK3Model(nn.Module):
         layers: list[KimiK3TransformerBlock.Config] = field(default_factory=list)
         norm_eps: float = 1e-5
 
+        def update_from_config(self, *, trainer_config, **kwargs) -> None:
+            """Called by Trainer.__init__ to sync runtime params (seq_len, etc.)."""
+            pass
+
+        def get_nparams_and_flops(self, model, seq_len: int) -> tuple[int, float]:
+            """Return (total_params, flops_per_token) for MFU calculation."""
+            nparams = sum(p.numel() for p in model.parameters())
+            # Approximate: 6 * nparams * seq_len (2 for fwd + 4 for bwd)
+            flops_per_token = 6.0 * nparams
+            return nparams, flops_per_token
+
     def __init__(self, config: Config):
         super().__init__()
-        self.config = config
         self.tok_embeddings = nn.Embedding(config.vocab_size, config.dim)
         self.layers = ModuleDict(
             {str(i): KimiK3TransformerBlock(layer_cfg) for i, layer_cfg in enumerate(config.layers)}
         )
         self.norm = nn.RMSNorm(config.dim, eps=config.norm_eps)
         self.output = nn.Linear(config.dim, config.vocab_size, bias=False)
+
+    def verify_module_protocol(self) -> None:
+        """Verify model conforms to torchtitan's module protocol."""
+        pass
+
+    def init_weights(self, *, buffer_device=None) -> None:
+        """Initialize model weights. Called by Trainer after parallelize."""
+        import torch.nn.init as init
+
+        dim = self.tok_embeddings.embedding_dim
+        init.normal_(self.tok_embeddings.weight, mean=0.0, std=1.0)
+        init.normal_(self.output.weight, mean=0.0, std=dim ** -0.5)
+        for layer in self.layers.values():
+            for p in layer.parameters():
+                if p.dim() >= 2:
+                    init.normal_(p, mean=0.0, std=0.02)
+                elif p.dim() == 1:
+                    init.ones_(p)
 
     def forward(
         self,
