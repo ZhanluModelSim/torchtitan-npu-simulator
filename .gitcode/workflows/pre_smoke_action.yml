@@ -1,0 +1,107 @@
+name: PR-pipeline-pre_smoke
+
+concurrency:
+  max: 3
+  exceed-action: QUEUE
+  enable: true
+  preemption:
+    enable: true
+    events: [mr_id]
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "Pull Request number"
+        required: true
+        type: string
+      target_branch:
+        description: "Pull Request target branch"
+        required: true
+        default: "override-refactor"
+        type: string
+      source_branch:
+        description: "Pull Request source branch"
+        required: false
+        default: ""
+        type: string
+  pull_request_comment:
+    types: [created]
+    branches: ["override-refactor"]
+    comments: ["^(?:\\/)?compile$"]
+  pr_comment:
+    types: [created]
+    branches: ["override-refactor"]
+    keyword: "^(?:\\/)?compile$"
+
+env:
+  repo_name: "torchtitan-npu"
+  TARGET_BRANCH: ${{ atomgit.base_ref || inputs.target_branch }}
+  obs_smoke_path: "${{ vars.OBS_PATH }}/${{ atomgit.event.pull_request.number || inputs.pr_number }}/smoke"
+
+stages:
+  # Temporary validation image. Restore revise-img after the image is
+  # registered in cann/.gitcode image-conf and pushed to the pre_smoke repo.
+  stage1:
+    name: pre_smoke
+    jobs:
+      JOB_dsv_smoke:
+        timeout-minutes: 15
+        name: PreSmoke_Dsv3_2_Dsv4
+        needs: []
+        steps:
+          - name: Checkout
+            identifier: process_checkout
+            uses: checkout
+            with:
+              ref: ${{ atomgit.event.pull_request.merge_commit_sha }}
+              token: ${{ secrets.GIT_TOKEN }}
+              path: "./runner"
+          - name: Checkout GitCode CI assets
+            identifier: process_checkout_gitcode
+            uses: checkout
+            with:
+              repository: "https://gitcode.com/cann/.gitcode.git"
+              ref: master
+              path: "./runner/ci"
+          - name: Package source
+            run: |
+              cd ${{ steps.process_checkout.outputs.path }}
+              tar --exclude=.git --exclude=ci -zcf ../smoke_data.tar.gz .
+              mv ../smoke_data.tar.gz ./
+          - name: Upload source
+            identifier: process_upload
+            uses: obs-upload
+            with:
+              endpoint: "https://obs.cn-north-4.myhuaweicloud.com"
+              bucket: "ascend-ci"
+              access-key: ${{ secrets.AK }}
+              secret-key: ${{ secrets.SK }}
+              artifact-path: "${{ steps.process_checkout.outputs.path }}/smoke_data.tar.gz"
+              object-prefix: ${{ env.obs_smoke_path }}/
+          - name: Run NPU smoke
+            uses: manifest-management-plugin
+            with:
+              action: DEPLOY
+              repo: ${{ steps.process_checkout.outputs.path }}
+              file_path: ${{ steps.process_checkout.outputs.path }}/ci/smoke-conf/smoke-A2.yaml
+              manifest_image: swr.cn-north-4.myhuaweicloud.com/ci_cann/ubuntu24.04_arm:wdy01
+              custom_shell_script: |-
+                set -euo pipefail
+                mkdir -p /home/taskspace
+                cd /home/taskspace
+                artifact_url="${{ steps.process_upload.outputs.primary-url }}"
+                wget -nv "${artifact_url}" -O smoke_data.tar.gz
+                tar -zxf smoke_data.tar.gz
+                bash .gitcode/scripts/smoke_test.sh
+          - name: Clean NPU smoke resources
+            uses: manifest-management-plugin
+            with:
+              action: CRUSH
+              repo: ${{ steps.process_checkout.outputs.path }}
+              file_path: ${{ steps.process_checkout.outputs.path }}/ci/smoke-conf/smoke-A2.yaml
+        if: "${{ default() && env.TARGET_BRANCH == 'override-refactor' }}"
+        runs-on: ["self-hosted", "arch=arm", "smoke=204"]
+    pre:
+      - type: auto
+    fail-fast: true
