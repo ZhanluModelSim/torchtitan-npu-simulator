@@ -48,6 +48,9 @@ def event(
     execution_kind: str | None = None,
     op_type: str = "elementwise",
     module_path: str = "",
+    pp_stage: int = -1,
+    pp_mb_idx: int = -1,
+    comp_type: str = "",
 ) -> RawMemoryEvent:
     return RawMemoryEvent(
         event_id=seq_idx,
@@ -64,6 +67,9 @@ def event(
         module_path=module_path,
         inputs=tuple(inputs or []),
         outputs=tuple(outputs or []),
+        pp_stage=pp_stage,
+        pp_mb_idx=pp_mb_idx,
+        comp_type=comp_type,
     )
 
 
@@ -130,6 +136,274 @@ def test_checkpoint_plugin_releases_internal_forward_tensor_before_backward():
     assert lifetime.death_seq == 1
     release = next(item for item in plan.timeline_events if item.tensor_id == "tensor:2" and item.action == "free")
     assert release.phase == "forward"
+
+
+@pytest.mark.parametrize(
+    ("offload", "modeled_bytes", "has_timeline"),
+    [(False, 64, True), (True, 0, False)],
+)
+def test_checkpoint_plugin_keeps_tensor_reused_during_recompute(
+    offload,
+    modeled_bytes,
+    has_timeline,
+):
+    x, saved, output, recomputed = (
+        tref(1),
+        tref(2, 64),
+        tref(3),
+        tref(4),
+    )
+    plan = estimate_static_memory(
+        [
+            event(
+                0,
+                10,
+                "aten.mm.default",
+                inputs=[x],
+                outputs=[saved],
+                module_path="layers.0._checkpoint_wrapped_module.attention",
+            ),
+            event(
+                1,
+                11,
+                "aten.add.Tensor",
+                inputs=[saved],
+                outputs=[output],
+                module_path="layers.0._checkpoint_wrapped_module",
+            ),
+            event(
+                5,
+                20,
+                "aten.bmm.default",
+                inputs=[saved],
+                outputs=[recomputed],
+                phase="backward",
+                execution_kind="recompute",
+                module_path="layers.0._checkpoint_wrapped_module.attention",
+            ),
+        ],
+        checkpoint_boundary_events=[
+            CheckpointBoundaryEvent(
+                checkpoint_id="part0:layers.0",
+                seq_idx=1,
+                inputs=(x,),
+                outputs=(output,),
+                pp_stage=0,
+                pp_mb_idx=0,
+            )
+        ],
+        offload_ac_saved_tensors=offload,
+    )
+
+    lifetime = next(
+        item for item in plan.tensor_lifetimes if item.tensor_id == "tensor:2"
+    )
+    assert lifetime.kind == "checkpoint_saved_for_recompute"
+    assert lifetime.death_seq == 5
+    assert lifetime.resident_num_bytes == modeled_bytes
+    assert (
+        any(item.tensor_id == "tensor:2" for item in plan.timeline_events)
+        is has_timeline
+    )
+
+    summary = plan.to_summary_dict()
+    assert summary["checkpoint_recompute_saved_tensor_count"] == 1
+    assert summary["checkpoint_recompute_saved_logical_bytes"] == 64
+    assert summary["checkpoint_recompute_saved_modeled_bytes"] == modeled_bytes
+    assert summary["checkpoint_prefetch_unattributed_tensor_count"] == 0
+    assert summary["checkpoint_prefetch_unattributed_logical_bytes"] == 0
+    assert summary["checkpoint_saved_activations"]["part0:layers.0"][
+        "logical_bytes_per_instance"
+    ] == 16
+    prefetch = summary["checkpoint_prefetch"]["part0:layers.0"]
+    assert prefetch["boundary_logical_bytes_per_instance"] == 16
+    assert prefetch["recompute_saved_logical_bytes_per_instance"] == 64
+    assert prefetch["prefetch_logical_bytes_per_instance"] == 80
+    assert prefetch["boundary_modeled_bytes_per_instance"] == (
+        0 if offload else 16
+    )
+    assert prefetch["recompute_saved_modeled_bytes_per_instance"] == modeled_bytes
+    assert prefetch["modeled_bytes_per_instance"] == (
+        0 if offload else 80
+    )
+    assert prefetch["boundary_tensor_count_per_instance"] == 1
+    assert prefetch["recompute_saved_tensor_count_per_instance"] == 1
+    assert prefetch["tensor_count_per_instance"] == 2
+
+    recompute_record = next(
+        item
+        for item in plan.checkpoint_tensors
+        if item.role == "recompute_saved"
+    )
+    assert recompute_record.checkpoint_id == "part0:layers.0"
+    assert recompute_record.seq_idx == 1
+    assert recompute_record.num_bytes == 64
+    assert recompute_record.modeled_num_bytes == modeled_bytes
+
+
+def test_checkpoint_prefetch_matches_recompute_saved_tensors_to_microbatches():
+    x0, saved0, output0 = tref(1), tref(2, 64), tref(3)
+    x1, saved1, output1 = tref(4), tref(5, 64), tref(6)
+    plan = estimate_static_memory(
+        [
+            event(
+                0,
+                10,
+                "aten.mm.default",
+                inputs=[x0],
+                outputs=[saved0],
+                module_path="layers.0._checkpoint_wrapped_module.attention",
+                pp_stage=1,
+                pp_mb_idx=0,
+                comp_type="F",
+            ),
+            event(
+                1,
+                11,
+                "aten.add.Tensor",
+                inputs=[saved0],
+                outputs=[output0],
+                module_path="layers.0._checkpoint_wrapped_module",
+                pp_stage=1,
+                pp_mb_idx=0,
+                comp_type="F",
+            ),
+            event(
+                2,
+                12,
+                "aten.mm.default",
+                inputs=[x1],
+                outputs=[saved1],
+                module_path="layers.0._checkpoint_wrapped_module.attention",
+                pp_stage=1,
+                pp_mb_idx=1,
+                comp_type="F",
+            ),
+            event(
+                3,
+                13,
+                "aten.add.Tensor",
+                inputs=[saved1],
+                outputs=[output1],
+                module_path="layers.0._checkpoint_wrapped_module",
+                pp_stage=1,
+                pp_mb_idx=1,
+                comp_type="F",
+            ),
+            event(
+                5,
+                20,
+                "aten.bmm.default",
+                inputs=[saved1],
+                phase="backward",
+                execution_kind="recompute",
+                module_path="layers.0._checkpoint_wrapped_module.attention",
+                pp_stage=1,
+                pp_mb_idx=1,
+                comp_type="B",
+            ),
+            event(
+                6,
+                21,
+                "aten.bmm.default",
+                inputs=[saved0],
+                phase="backward",
+                execution_kind="recompute",
+                module_path="layers.0._checkpoint_wrapped_module.attention",
+                pp_stage=1,
+                pp_mb_idx=0,
+                comp_type="B",
+            ),
+        ],
+        checkpoint_boundary_events=[
+            CheckpointBoundaryEvent(
+                checkpoint_id="part0:layers.0",
+                seq_idx=1,
+                inputs=(x0,),
+                outputs=(output0,),
+                pp_stage=1,
+                pp_mb_idx=0,
+            ),
+            CheckpointBoundaryEvent(
+                checkpoint_id="part0:layers.0",
+                seq_idx=3,
+                inputs=(x1,),
+                outputs=(output1,),
+                pp_stage=1,
+                pp_mb_idx=1,
+            ),
+        ],
+        offload_ac_saved_tensors=True,
+    )
+
+    records = {
+        item.tensor_id: item
+        for item in plan.checkpoint_tensors
+        if item.role == "recompute_saved"
+    }
+    assert records["tensor:2"].pp_mb_idx == 0
+    assert records["tensor:2"].seq_idx == 1
+    assert records["tensor:5"].pp_mb_idx == 1
+    assert records["tensor:5"].seq_idx == 3
+
+    prefetch = plan.to_summary_dict()["checkpoint_prefetch"]["part0:layers.0"]
+    assert prefetch["prefetch_logical_bytes_per_instance"] == 80
+    assert prefetch["instance_count"] == 2
+    assert prefetch["prefetch_logical_bytes_total"] == 160
+    assert prefetch["microbatches"] == [0, 1]
+
+
+def test_checkpoint_prefetch_does_not_treat_external_context_as_internal_saved():
+    context = TensorRef(
+        tensor_id=1,
+        name="index_table",
+        shape=(1024, 6),
+        dtype="int64",
+        device="meta",
+        num_bytes=1024 * 6 * 8,
+        requires_grad=False,
+    )
+    output = tref(2, 64)
+    plan = estimate_static_memory(
+        [
+            event(
+                0,
+                10,
+                "aten.index.Tensor",
+                inputs=[context],
+                outputs=[output],
+                module_path="layers.0._checkpoint_wrapped_module.router",
+            ),
+            event(
+                5,
+                20,
+                "aten.index.Tensor",
+                inputs=[context],
+                phase="backward",
+                execution_kind="recompute",
+                module_path="layers.0._checkpoint_wrapped_module.router",
+            ),
+        ],
+        checkpoint_boundary_events=[
+            CheckpointBoundaryEvent(
+                checkpoint_id="part0:layers.0",
+                seq_idx=0,
+                inputs=(context,),
+                outputs=(output,),
+            )
+        ],
+        offload_ac_saved_tensors=True,
+    )
+
+    external = next(
+        item for item in plan.tensor_lifetimes if item.tensor_id == "external:1"
+    )
+    assert external.kind == "external_input"
+    assert external.resident_num_bytes == context.num_bytes
+    summary = plan.to_summary_dict()
+    assert summary["checkpoint_recompute_saved_tensor_count"] == 0
+    assert summary["checkpoint_prefetch_unattributed_tensor_count"] == 0
+    assert "part0:layers.0" not in summary["checkpoint_prefetch"]
 
 
 def test_checkpoint_plugin_keeps_cross_scope_output_as_activation():
@@ -321,6 +595,16 @@ def test_checkpoint_summary_preserves_size_variants_for_one_marker():
         64,
         128,
     ]
+    prefetch = plan.to_summary_dict()["checkpoint_prefetch"][
+        "part0:shared_block"
+    ]
+    assert prefetch["prefetch_logical_bytes_per_instance"] is None
+    assert prefetch["modeled_bytes_per_instance"] is None
+    assert prefetch["instance_count"] == 2
+    assert prefetch["prefetch_logical_bytes_total"] == 192
+    assert [
+        item["prefetch_logical_bytes"] for item in prefetch["size_variants"]
+    ] == [64, 128]
 
 
 def test_checkpoint_plugin_treats_pathless_collective_as_internal_transport():

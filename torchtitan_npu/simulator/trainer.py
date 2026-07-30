@@ -134,6 +134,15 @@ def _capture_num_micro_batches(
     return num_micro_batches
 
 
+def _validate_activation_checkpoint_mode(mode: str) -> None:
+    if mode == "memory_budget":
+        raise ValueError(
+            "Simulator does not support activation_checkpoint.mode='memory_budget': "
+            "that mode requires torch.compile, while simulator capture requires "
+            "eager TorchDispatch execution. Use 'none', 'full', or 'selective'."
+        )
+
+
 
 def run_simulation_step(
     *,
@@ -425,6 +434,7 @@ class SimulationTrainer(Trainer):
             pp_degree=runtime.pp_degree,
         )
 
+        _validate_activation_checkpoint_mode(config.activation_checkpoint.mode)
         force_moe_load_balance(config)
         force_deterministic_seed(config)
         config.compile.enable = False  # tracing needs eager dispatch, not a compiled graph

@@ -16,6 +16,7 @@ from torchtitan_npu.simulator.trainer import (
     _capture_num_micro_batches,
     _l0_csv_filename,
     _strip_hardware_dependent_model_converters,
+    _validate_activation_checkpoint_mode,
     run_simulation_step,
 )
 
@@ -56,6 +57,17 @@ def test_capture_num_micro_batches_uses_pp_schedule_not_gradient_accumulation():
             pp_schedule=SimpleNamespace(_n_microbatches=0),
             gradient_accumulation_steps=1,
         )
+
+
+def test_memory_budget_activation_checkpoint_is_rejected_for_eager_capture():
+    with pytest.raises(
+        ValueError,
+        match="requires torch.compile.*requires eager TorchDispatch",
+    ):
+        _validate_activation_checkpoint_mode("memory_budget")
+
+    for mode in ("none", "full", "selective"):
+        _validate_activation_checkpoint_mode(mode)
 
 
 def test_run_simulation_step_produces_complete_workload_graph(fake_world):

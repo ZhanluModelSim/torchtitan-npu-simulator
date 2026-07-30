@@ -15,7 +15,13 @@ outputs; the rest can be released after their final forward consumer.
 from __future__ import annotations
 
 from torchtitan_npu.simulator.memory.plugins import MemoryModelContext, MemoryModelPlugin
-from torchtitan_npu.simulator.memory.records import CheckpointTensorRecord, TensorLifetime
+from torchtitan_npu.simulator.memory.records import (
+    CheckpointBoundaryEvent,
+    CheckpointTensorRecord,
+    RawMemoryEvent,
+    TensorLifetime,
+    TensorRef,
+)
 
 _CHECKPOINT_WRAPPED_MODULE = "._checkpoint_wrapped_module"
 
@@ -35,16 +41,87 @@ def _resolve_alias(tensor_id: int, alias_base_by_tensor_id: dict[int, int]) -> i
     return current
 
 
+def _boundary_scope(checkpoint_id: str) -> str:
+    """Return the module scope encoded in a stable checkpoint marker."""
+    _part, separator, scope = checkpoint_id.partition(":")
+    return scope if separator else checkpoint_id
+
+
+def _same_parallel_instance(
+    event: RawMemoryEvent,
+    boundary: CheckpointBoundaryEvent,
+) -> bool:
+    stage_matches = (
+        event.pp_stage < 0
+        or boundary.pp_stage < 0
+        or event.pp_stage == boundary.pp_stage
+    )
+    microbatch_matches = (
+        event.pp_mb_idx < 0
+        or boundary.pp_mb_idx < 0
+        or event.pp_mb_idx == boundary.pp_mb_idx
+    )
+    return stage_matches and microbatch_matches
+
+
+def _find_checkpoint_boundary(
+    scope: str,
+    producer_event: RawMemoryEvent,
+    boundaries_by_scope: dict[str, list[CheckpointBoundaryEvent]],
+) -> CheckpointBoundaryEvent | None:
+    """Find the wrapper exit belonging to one checkpoint-internal tensor."""
+    return min(
+        (
+            boundary
+            for boundary in boundaries_by_scope.get(scope, [])
+            if boundary.seq_idx >= producer_event.seq_idx
+            and _same_parallel_instance(producer_event, boundary)
+        ),
+        key=lambda boundary: boundary.seq_idx,
+        default=None,
+    )
+
+
+def _producer_ref(
+    tensor_id: int,
+    producer_event: RawMemoryEvent,
+    alias_base_by_tensor_id: dict[int, int],
+) -> TensorRef | None:
+    for ref in producer_event.outputs:
+        if ref.tensor_id == tensor_id:
+            return ref
+    for ref in producer_event.outputs:
+        if _resolve_alias(ref.tensor_id, alias_base_by_tensor_id) == tensor_id:
+            return ref
+    return None
+
+
 class ActivationCheckpointPlugin(MemoryModelPlugin):
     """Release checkpoint-internal forward tensors before recomputation."""
 
     def apply(self, context: MemoryModelContext) -> list[TensorLifetime]:
         event_by_seq = {event.seq_idx: event for event in context.events}
+        boundaries_by_scope: dict[str, list[CheckpointBoundaryEvent]] = {}
+        for boundary in context.checkpoint_boundary_events:
+            boundaries_by_scope.setdefault(
+                _boundary_scope(boundary.checkpoint_id),
+                [],
+            ).append(boundary)
+        for boundaries in boundaries_by_scope.values():
+            boundaries.sort(key=lambda boundary: boundary.seq_idx)
+
         released_count = 0
         released_bytes = 0
+        recompute_saved_count = 0
+        recompute_saved_bytes = 0
+        unattributed_recompute_saved_count = 0
+        unattributed_recompute_saved_bytes = 0
 
-        for lifetime in context.lifetimes_by_tensor_id.values():
-            if lifetime.producer_phase != "forward":
+        for tensor_id, lifetime in context.lifetimes_by_tensor_id.items():
+            if (
+                lifetime.producer_phase != "forward"
+                or lifetime.kind == "external_input"
+            ):
                 continue
             producer_event = event_by_seq.get(lifetime.birth_seq)
             if producer_event is None:
@@ -65,6 +142,58 @@ class ActivationCheckpointPlugin(MemoryModelPlugin):
             if crosses_checkpoint_boundary:
                 continue
 
+            recompute_consumers = [
+                event_by_seq[seq_idx]
+                for seq_idx in lifetime.consumer_seqs
+                if seq_idx in event_by_seq
+                and event_by_seq[seq_idx].execution_kind == "recompute"
+            ]
+            if recompute_consumers:
+                lifetime.kind = "checkpoint_saved_for_recompute"
+                lifetime.reason = "forward_tensor_reused_during_recompute"
+                if context.offload_ac_saved_tensors:
+                    lifetime.modeled_num_bytes = 0
+                    lifetime.residency_policy = "offloaded"
+                recompute_saved_count += 1
+                recompute_saved_bytes += lifetime.num_bytes
+
+                boundary = _find_checkpoint_boundary(
+                    scope,
+                    producer_event,
+                    boundaries_by_scope,
+                )
+                if boundary is None:
+                    unattributed_recompute_saved_count += 1
+                    unattributed_recompute_saved_bytes += lifetime.num_bytes
+                    continue
+                ref = _producer_ref(
+                    tensor_id,
+                    producer_event,
+                    context.alias_base_by_tensor_id,
+                )
+                context.checkpoint_tensors.append(
+                    CheckpointTensorRecord(
+                        checkpoint_id=boundary.checkpoint_id,
+                        marker_kind=boundary.marker_kind,
+                        seq_idx=boundary.seq_idx,
+                        tensor_id=lifetime.tensor_id,
+                        role="recompute_saved",
+                        shape=ref.shape if ref is not None else lifetime.shape,
+                        dtype=ref.dtype if ref is not None else lifetime.dtype,
+                        num_bytes=lifetime.num_bytes,
+                        modeled_num_bytes=lifetime.resident_num_bytes,
+                        requires_grad=(
+                            ref.requires_grad if ref is not None else False
+                        ),
+                        is_saved_activation=True,
+                        residency_policy=lifetime.residency_policy,
+                        pp_stage=boundary.pp_stage,
+                        pp_mb_idx=boundary.pp_mb_idx,
+                        comp_type=boundary.comp_type,
+                    )
+                )
+                continue
+
             lifetime.kind = "checkpoint_recompute_temp"
             lifetime.reason = "checkpoint_internal_recompute"
             lifetime.death_seq = max(
@@ -79,6 +208,26 @@ class ActivationCheckpointPlugin(MemoryModelPlugin):
                 "Activation-checkpoint plugin released "
                 f"{released_count} checkpoint-internal forward lifetimes "
                 f"({released_bytes} bytes) before backward recomputation."
+            )
+
+        if recompute_saved_count:
+            policy = (
+                "offloaded from modeled device memory"
+                if context.offload_ac_saved_tensors
+                else "kept resident until their final recompute consumer"
+            )
+            context.notes.append(
+                "Activation-checkpoint plugin identified "
+                f"{recompute_saved_count} forward tensors reused during recompute "
+                f"({recompute_saved_bytes} logical bytes); {policy}."
+            )
+        if unattributed_recompute_saved_count:
+            context.notes.append(
+                "Activation-checkpoint plugin could not attribute "
+                f"{unattributed_recompute_saved_count} recompute-saved tensors "
+                f"({unattributed_recompute_saved_bytes} bytes) to a checkpoint "
+                "boundary; they remain in global totals but not per-checkpoint "
+                "prefetch totals."
             )
 
         saved_tensor_ids: set[int] = set()

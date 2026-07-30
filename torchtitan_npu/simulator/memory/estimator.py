@@ -229,6 +229,7 @@ def _finalize_kind(lifetime: TensorLifetime) -> None:
         "fsdp_full_param",
         "checkpoint_recompute_temp",
         "checkpoint_saved_activation",
+        "checkpoint_saved_for_recompute",
     }:
         return
     if lifetime.producer_phase == "backward" and "optimizer" in lifetime.consumer_phases:

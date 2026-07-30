@@ -234,6 +234,23 @@ cat simulator_output/deepseek_v4_pro_61_layers/summary.txt
 - `compile.enable = False`（捕获需要 eager dispatch）
 - `debug.moe_force_load_balance = True`（MoE 强制负载均衡）
 
+### Activation checkpoint
+
+可通过 CLI 选择 activation checkpoint 模式：
+
+```bash
+--activation-checkpoint.mode none       # 不重计算，保留普通 forward 激活
+--activation-checkpoint.mode full       # 按 transformer block 完整重计算
+--activation-checkpoint.mode selective  # op 级 selective activation checkpoint
+```
+
+`selective` 使用 TorchTitan 的 op SAC policy：保存部分计算/通信结果，其余算子在
+backward 中重放。可通过
+`activation_checkpoint.per_op_sac_force_recompute_mm_shapes_by_fqns`
+指定需要强制重计算的 `nn.Linear` FQN。`memory_budget` 依赖
+`torch.compile` 的图分区器，而 simulator 必须使用 eager TorchDispatch 捕获，因此
+当前明确不支持。
+
 ## 输出文件
 
 ### 单进程模式（fake_backend）
@@ -267,7 +284,7 @@ cat simulator_output/deepseek_v4_pro_61_layers/summary.txt
 | `memory_events.csv` | `mem`；未折叠的算子输入输出事件，含 PP stage/microbatch/comp_type |
 | `memory_timeline.csv` | `mem`；alloc/free 后的 active tensor bytes 曲线 |
 | `tensor_lifetimes.csv` | `mem`；每个 tensor 的 birth、last consumer、death、逻辑大小、建模驻留大小和分类 |
-| `checkpoint_tensors.csv` | `mem`；每个 AC wrapper 边界的输入/输出元数据；存在 AC 边界时生成 |
+| `checkpoint_tensors.csv` | `mem`；AC wrapper 边界输入/输出及 selective 内部保存 tensor 元数据；存在 AC 边界时生成 |
 | `memory_actions.csv` | `mem`；PP 调度 action 与展开后内存事件区间的映射；非 PP 不生成 |
 | `memory_trace.json` | `mem`；可由 Chrome Trace 或 Perfetto 打开的阶段趋势图 |
 
@@ -277,14 +294,21 @@ cat simulator_output/deepseek_v4_pro_61_layers/summary.txt
 # 参数仍保留捕获到的原始 dtype/num_bytes，但静态本地参数分片按 BF16 计入设备驻留。
 --simulation.memory-parameter-storage-dtype bfloat16
 
-# AC wrapper 的保存输入仍写入 checkpoint_tensors.csv，但不计入设备驻留和峰值。
+# AC 保存 tensor 仍保留元数据，但不计入设备驻留和峰值。
 --simulation.memory-offload-ac-saved-tensors
 ```
 
 参数 dtype 覆盖仅作用于静态本地参数分片，不改变梯度、optimizer state 或 FSDP
-all-gather 全参数的 dtype。AC 卸载仅作用于每个 `CheckpointWrapper` 输入中
-`requires_grad=True` 的保存激活；freqs、mask 等无梯度上下文仍会记录，但不会被当作
-保存激活卸载。checkpoint 内部临时值仍按其 forward/recompute 生命周期建模。两个开关默认均关闭。
+all-gather 全参数的 dtype。AC 卸载作用于每个 `CheckpointWrapper` 输入中
+`requires_grad=True` 的保存激活，以及 selective checkpoint 在重计算期间复用的
+forward tensor；freqs、mask 等无梯度上下文仍会记录，但不会被当作边界保存激活卸载。
+checkpoint 内部临时值仍按其 forward/recompute 生命周期建模。两个开关默认均关闭。
+
+selective checkpoint 保存的内部 tensor 在 `tensor_lifetimes.csv` 中标记为
+`checkpoint_saved_for_recompute`。summary 中的
+`checkpoint_recompute_saved_{tensor_count,logical_bytes,modeled_bytes}`
+分别给出数量、逻辑大小和建模驻留大小；全量明细中对应的
+`checkpoint_tensors.csv` 记录使用 `role=recompute_saved`。
 
 `memory_summary.json` 的 `checkpoint_saved_activations` 按稳定的
 `checkpoint_id` marker 聚合保存激活。例如：
@@ -318,6 +342,57 @@ all-gather 全参数的 dtype。AC 卸载仅作用于每个 `CheckpointWrapper` 
 存在动态 shape，该字段为 `null`，具体大小和出现次数记录在 `size_variants`。
 marker 当前使用 AC wrapper 模块路径且 `marker_kind="module"`；该结构不依赖“层”的
 概念，后续 selective AC 可以使用 op 级 marker 和 `marker_kind="op"` 并复用相同格式。
+
+评估 AC offload 回捞带宽时，使用同一 summary 中的 `checkpoint_prefetch`：
+
+```json
+{
+  "checkpoint_prefetch": {
+    "part0:layers.0": {
+      "marker_kind": "module",
+      "boundary_logical_bytes_per_instance": 262144,
+      "recompute_saved_logical_bytes_per_instance": 1048576,
+      "prefetch_logical_bytes_per_instance": 1310720,
+      "boundary_modeled_bytes_per_instance": 0,
+      "recompute_saved_modeled_bytes_per_instance": 0,
+      "modeled_bytes_per_instance": 0,
+      "boundary_tensor_count_per_instance": 1,
+      "recompute_saved_tensor_count_per_instance": 3,
+      "tensor_count_per_instance": 4,
+      "instance_count": 2,
+      "prefetch_logical_bytes_total": 2621440,
+      "modeled_bytes_total": 0,
+      "pp_stages": [0],
+      "microbatches": [0, 1],
+      "size_variants": [
+        {
+          "boundary_logical_bytes": 262144,
+          "boundary_modeled_bytes": 0,
+          "boundary_tensor_count": 1,
+          "recompute_saved_logical_bytes": 1048576,
+          "recompute_saved_modeled_bytes": 0,
+          "recompute_saved_tensor_count": 3,
+          "prefetch_logical_bytes": 1310720,
+          "modeled_bytes": 0,
+          "tensor_count": 4,
+          "instance_count": 2
+        }
+      ]
+    }
+  }
+}
+```
+
+`prefetch_logical_bytes_per_instance` 是一次执行该 checkpoint 前需要恢复的总字节数：
+wrapper 边界保存输入与 selective AC 内部保存结果之和。full AC 通常只有前者；
+selective AC 两部分都可能存在。`prefetch_logical_bytes_total` 是该 marker 在整个
+训练 step 中所有实例的总回捞流量。开启 AC offload 后，logical bytes 保持不变，
+而 modeled bytes 为 0，表示这些 tensor 不计入设备驻留。
+
+同一 marker 存在动态 shape 时，所有 `*_per_instance` 字段为 `null`，应从
+`size_variants` 读取各尺寸及出现次数。若 selective 保存值无法可靠匹配 checkpoint
+边界，`checkpoint_prefetch_unattributed_{tensor_count,logical_bytes}` 会非零；
+此时分层结果不完整，不应直接作为总带宽结论。
 
 ### 多进程模式（multi_proc_meta）
 
@@ -382,6 +457,9 @@ simulator_output/<配置名>/
 > activation checkpoint 重放仍属于 `phase=backward`，但会被精确标记为
 > `execution_kind=recompute`。该标记来自 PyTorch checkpoint 的重放上下文，
 > selective checkpoint 中直接读取已保存结果、没有实际重放的算子不会被标记。
+> selective checkpoint 内部被缓存并在重计算阶段复用的 forward tensor 会保留
+> 原始 use-def 生命周期，并标记为 `checkpoint_saved_for_recompute`；它们不会按
+> full checkpoint 的内部临时值提前释放。
 
 > [!IMPORTANT]
 > 大规模仿真（如 2048 die）时，全量展开所有 rank 的 CSV 会非常大（每 rank 数万行）。可通过配置中的 `simulation.csv_max_ranks` 限制展开的 rank 数量：

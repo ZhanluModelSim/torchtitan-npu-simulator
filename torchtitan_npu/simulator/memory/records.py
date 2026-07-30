@@ -178,7 +178,7 @@ class MemoryPlan:
             dict[tuple[int, int, int, str], dict[str, int]],
         ] = {}
         for item in self.checkpoint_tensors:
-            if not item.is_saved_activation:
+            if not item.is_saved_activation or item.role != "input":
                 continue
             instance_key = (
                 item.seq_idx,
@@ -229,7 +229,9 @@ class MemoryPlan:
             marker_kinds = {
                 item.marker_kind
                 for item in self.checkpoint_tensors
-                if item.is_saved_activation and item.checkpoint_id == marker
+                if item.is_saved_activation
+                and item.role == "input"
+                and item.checkpoint_id == marker
             }
             result[marker] = {
                 "marker_kind": (
@@ -271,7 +273,166 @@ class MemoryPlan:
             }
         return result
 
+    def _checkpoint_prefetch_by_marker(self) -> dict[str, dict[str, Any]]:
+        instances_by_marker: dict[
+            str,
+            dict[tuple[int, int, int, str], dict[str, int]],
+        ] = {}
+        marker_kinds: dict[str, set[str]] = {}
+        for item in self.checkpoint_tensors:
+            if not item.is_saved_activation or item.role not in {
+                "input",
+                "recompute_saved",
+            }:
+                continue
+            instance_key = (
+                item.seq_idx,
+                item.pp_stage,
+                item.pp_mb_idx,
+                item.comp_type,
+            )
+            instance = instances_by_marker.setdefault(
+                item.checkpoint_id,
+                {},
+            ).setdefault(
+                instance_key,
+                {
+                    "boundary_logical_bytes": 0,
+                    "boundary_modeled_bytes": 0,
+                    "boundary_tensor_count": 0,
+                    "recompute_saved_logical_bytes": 0,
+                    "recompute_saved_modeled_bytes": 0,
+                    "recompute_saved_tensor_count": 0,
+                },
+            )
+            prefix = "boundary" if item.role == "input" else "recompute_saved"
+            instance[f"{prefix}_logical_bytes"] += item.num_bytes
+            instance[f"{prefix}_modeled_bytes"] += item.modeled_num_bytes
+            instance[f"{prefix}_tensor_count"] += 1
+            marker_kinds.setdefault(item.checkpoint_id, set()).add(item.marker_kind)
+
+        result: dict[str, dict[str, Any]] = {}
+        for marker, instances in sorted(instances_by_marker.items()):
+            variants: dict[tuple[int, ...], int] = {}
+            enriched_instances: list[dict[str, int]] = []
+            for instance in instances.values():
+                enriched = {
+                    **instance,
+                    "prefetch_logical_bytes": (
+                        instance["boundary_logical_bytes"]
+                        + instance["recompute_saved_logical_bytes"]
+                    ),
+                    "modeled_bytes": (
+                        instance["boundary_modeled_bytes"]
+                        + instance["recompute_saved_modeled_bytes"]
+                    ),
+                    "tensor_count": (
+                        instance["boundary_tensor_count"]
+                        + instance["recompute_saved_tensor_count"]
+                    ),
+                }
+                enriched_instances.append(enriched)
+                variant = tuple(enriched[key] for key in (
+                    "boundary_logical_bytes",
+                    "boundary_modeled_bytes",
+                    "boundary_tensor_count",
+                    "recompute_saved_logical_bytes",
+                    "recompute_saved_modeled_bytes",
+                    "recompute_saved_tensor_count",
+                    "prefetch_logical_bytes",
+                    "modeled_bytes",
+                    "tensor_count",
+                ))
+                variants[variant] = variants.get(variant, 0) + 1
+
+            size_variants = [
+                {
+                    "boundary_logical_bytes": values[0],
+                    "boundary_modeled_bytes": values[1],
+                    "boundary_tensor_count": values[2],
+                    "recompute_saved_logical_bytes": values[3],
+                    "recompute_saved_modeled_bytes": values[4],
+                    "recompute_saved_tensor_count": values[5],
+                    "prefetch_logical_bytes": values[6],
+                    "modeled_bytes": values[7],
+                    "tensor_count": values[8],
+                    "instance_count": instance_count,
+                }
+                for values, instance_count in sorted(variants.items())
+            ]
+            consistent = len(size_variants) == 1
+            per_instance = size_variants[0] if consistent else {}
+            kinds = marker_kinds[marker]
+            result[marker] = {
+                "marker_kind": next(iter(kinds)) if len(kinds) == 1 else "mixed",
+                "boundary_logical_bytes_per_instance": per_instance.get(
+                    "boundary_logical_bytes"
+                ),
+                "recompute_saved_logical_bytes_per_instance": per_instance.get(
+                    "recompute_saved_logical_bytes"
+                ),
+                "prefetch_logical_bytes_per_instance": per_instance.get(
+                    "prefetch_logical_bytes"
+                ),
+                "boundary_modeled_bytes_per_instance": per_instance.get(
+                    "boundary_modeled_bytes"
+                ),
+                "recompute_saved_modeled_bytes_per_instance": per_instance.get(
+                    "recompute_saved_modeled_bytes"
+                ),
+                "modeled_bytes_per_instance": per_instance.get("modeled_bytes"),
+                "boundary_tensor_count_per_instance": per_instance.get(
+                    "boundary_tensor_count"
+                ),
+                "recompute_saved_tensor_count_per_instance": per_instance.get(
+                    "recompute_saved_tensor_count"
+                ),
+                "tensor_count_per_instance": per_instance.get("tensor_count"),
+                "instance_count": len(instances),
+                "prefetch_logical_bytes_total": sum(
+                    instance["prefetch_logical_bytes"]
+                    for instance in enriched_instances
+                ),
+                "modeled_bytes_total": sum(
+                    instance["modeled_bytes"] for instance in enriched_instances
+                ),
+                "pp_stages": sorted(
+                    {
+                        stage
+                        for _seq_idx, stage, _microbatch, _comp_type in instances
+                        if stage >= 0
+                    }
+                ),
+                "microbatches": sorted(
+                    {
+                        microbatch
+                        for _seq_idx, _stage, microbatch, _comp_type in instances
+                        if microbatch >= 0
+                    }
+                ),
+                "size_variants": size_variants,
+            }
+        return result
+
     def to_summary_dict(self) -> dict[str, Any]:
+        recompute_saved_records = [
+            item
+            for item in self.checkpoint_tensors
+            if item.role == "recompute_saved"
+        ]
+        recompute_saved_lifetimes = [
+            item
+            for item in self.tensor_lifetimes
+            if item.kind == "checkpoint_saved_for_recompute"
+        ]
+        attributed_recompute_saved_ids = {
+            item.tensor_id for item in recompute_saved_records
+        }
+        unattributed_recompute_saved = [
+            item
+            for item in recompute_saved_lifetimes
+            if item.tensor_id not in attributed_recompute_saved_ids
+        ]
         return {
             "metric": self.metric,
             "parameter_storage_dtype": self.parameter_storage_dtype or "captured",
@@ -288,21 +449,38 @@ class MemoryPlan:
             "tensor_lifetime_count": len(self.tensor_lifetimes),
             "checkpoint_tensor_count": len(self.checkpoint_tensors),
             "checkpoint_saved_activation_count": sum(
-                item.is_saved_activation for item in self.checkpoint_tensors
+                item.is_saved_activation and item.role == "input"
+                for item in self.checkpoint_tensors
             ),
             "checkpoint_tensor_logical_bytes": sum(
                 item.num_bytes
                 for item in self.checkpoint_tensors
-                if item.is_saved_activation
+                if item.is_saved_activation and item.role == "input"
             ),
             "checkpoint_tensor_modeled_bytes": sum(
                 item.modeled_num_bytes
                 for item in self.checkpoint_tensors
-                if item.is_saved_activation
+                if item.is_saved_activation and item.role == "input"
+            ),
+            "checkpoint_recompute_saved_tensor_count": len(
+                recompute_saved_lifetimes
+            ),
+            "checkpoint_recompute_saved_logical_bytes": sum(
+                item.num_bytes for item in recompute_saved_lifetimes
+            ),
+            "checkpoint_recompute_saved_modeled_bytes": sum(
+                item.resident_num_bytes for item in recompute_saved_lifetimes
+            ),
+            "checkpoint_prefetch_unattributed_tensor_count": len(
+                unattributed_recompute_saved
+            ),
+            "checkpoint_prefetch_unattributed_logical_bytes": sum(
+                item.num_bytes for item in unattributed_recompute_saved
             ),
             "checkpoint_saved_activations": (
                 self._checkpoint_saved_activations_by_marker()
             ),
+            "checkpoint_prefetch": self._checkpoint_prefetch_by_marker(),
             "timeline_event_count": len(self.timeline_events),
             "memory_action_span_count": len(self.action_spans),
             "unclassified_op_count": len(self.unclassified_ops),
