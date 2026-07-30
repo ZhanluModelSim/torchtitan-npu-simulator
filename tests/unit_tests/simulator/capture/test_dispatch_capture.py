@@ -39,6 +39,49 @@ def test_capture_builds_predecessor_successor_edges():
     assert relu_node.op_id in producer.successors
 
 
+def test_capture_links_mutated_view_to_later_base_consumer():
+    # FSDP packs parameter gradients into a view of its flat input buffer.
+    # chunk_cat has no tensor output, so the writable schema argument is the
+    # only way to connect the packed gradients to reduce-scatter.
+    __import__("torch.distributed._composable.fsdp")
+    capture = OpDispatchCapture()
+    with capture:
+        gradients = [
+            torch.ones(4, device="meta"),
+            torch.ones(4, device="meta"),
+        ]
+        flat_buffer = torch.empty(8, device="meta")
+        packed_view = flat_buffer.view(2, 4)
+        torch.ops.fsdp.chunk_cat.default(
+            gradients,
+            0,
+            2,
+            out=packed_view,
+        )
+        reduced = torch.empty(4, device="meta")
+        capture.record_synthetic_op(
+            "comm.reduce_scatter",
+            inputs=[flat_buffer],
+            outputs=[reduced],
+        )
+
+    nodes = capture.build_nodes()
+    chunk_cat = next(
+        node
+        for node in nodes.values()
+        if node.annotations["raw_op_type"] == "fsdp.chunk_cat.default"
+    )
+    reduce_scatter = next(
+        node
+        for node in nodes.values()
+        if node.annotations["raw_op_type"] == "comm.reduce_scatter"
+    )
+
+    assert chunk_cat.op_id in reduce_scatter.predecessors
+    assert reduce_scatter.op_id in chunk_cat.successors
+    assert capture.producer_op(flat_buffer) == chunk_cat.op_id
+
+
 def test_capture_deduplicates_consecutive_identical_ops():
     capture = OpDispatchCapture()
     with capture:

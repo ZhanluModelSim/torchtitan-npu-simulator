@@ -12,6 +12,7 @@ from torch.distributed import _functional_collectives as funcol
 from torch.distributed.pipelining import schedules
 
 from torchtitan_npu.simulator.capture.comm_events import capture_fake_collectives
+from torchtitan_npu.simulator.capture.dispatch_capture import OpDispatchCapture
 from torchtitan_npu.simulator.meta_env import (
     _mark_p2p_ops,
     _pp_context,
@@ -56,6 +57,41 @@ def test_all_to_all_single_on_meta_is_noop_and_recorded():
     with capture_fake_collectives() as recorder:
         dist.all_to_all_single(output_t, input_t)
     assert recorder.events[0].comm_primitive == "all_to_all"
+
+
+def test_reduce_scatter_uses_flat_buffer_mutation_as_source_op():
+    __import__("torch.distributed._composable.fsdp")
+    capture = OpDispatchCapture()
+    with capture, capture_fake_collectives() as recorder:
+        gradients = [
+            torch.ones(4, device="meta"),
+            torch.ones(4, device="meta"),
+        ]
+        flat_buffer = torch.empty(8, device="meta")
+        packed_view = flat_buffer.view(2, 4)
+        torch.ops.fsdp.chunk_cat.default(
+            gradients,
+            0,
+            2,
+            out=packed_view,
+        )
+        reduced = torch.empty(1, device="meta")
+        dist.reduce_scatter_tensor(reduced, flat_buffer)
+
+    nodes = capture.build_nodes()
+    chunk_cat = next(
+        node
+        for node in nodes.values()
+        if node.annotations["raw_op_type"] == "fsdp.chunk_cat.default"
+    )
+    reduce_scatter = next(
+        node
+        for node in nodes.values()
+        if node.annotations["raw_op_type"] == "comm.reduce_scatter"
+    )
+
+    assert recorder.events[0].src_exit_op == chunk_cat.op_id
+    assert chunk_cat.op_id in reduce_scatter.predecessors
 
 
 def test_funcol_all_gather_tensor_returns_correctly_shaped_new_tensor():

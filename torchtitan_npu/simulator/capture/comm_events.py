@@ -418,7 +418,7 @@ def _record_comm_with_l0(
     capture = get_active_capture()
     if capture is not None:
         # Resolve src_exit_op: find the L1 op that produced the input tensor
-        producer_op = capture._producer.get(capture.tensor_id(tensor))
+        producer_op = capture.producer_op(tensor)
         if producer_op is not None:
             event.src_exit_op = producer_op
 

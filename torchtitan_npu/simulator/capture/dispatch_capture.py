@@ -3,11 +3,12 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""L0 op-level capture via TorchDispatchMode. Captures every dispatched
-operator (aten or NPU custom op) during a training step, building a
-producer/consumer dependency graph keyed by `id(tensor)` (meta tensors have
-no storage to alias-track, matching spec/L0-OpNode.md's "Meta tensor
-环境下关闭存储级追踪，退化到纯 id(tensor) 级" rule)."""
+"""L0 op-level capture via TorchDispatchMode.
+
+Dependencies are keyed by tensor identity. View/base aliases additionally
+share a mutation frontier so writes such as FSDP ``chunk_cat(..., out=view)``
+remain visible when a later collective reads the base flat buffer.
+"""
 
 from __future__ import annotations
 
@@ -72,6 +73,30 @@ def _flatten_tensors(value: Any, *, localize_dtensor: bool = True) -> list[torch
     return tensors
 
 
+def _schema_mutated_tensors(
+    func: Any,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> list[torch.Tensor]:
+    """Return tensor arguments marked writable by the operator schema."""
+    schema = getattr(func, "_schema", None)
+    if schema is None:
+        return []
+
+    mutated: list[torch.Tensor] = []
+    for index, argument in enumerate(schema.arguments):
+        alias_info = getattr(argument, "alias_info", None)
+        if alias_info is None or not alias_info.is_write:
+            continue
+        value = (
+            args[index]
+            if index < len(args)
+            else kwargs.get(argument.name)
+        )
+        mutated.extend(_flatten_tensors(value))
+    return mutated
+
+
 @dataclass
 class _RawEvent:
     op_id: int
@@ -79,7 +104,7 @@ class _RawEvent:
     op_type: str
     inputs: list[TensorMeta]
     outputs: list[TensorMeta]
-    predecessors: list[str]
+    predecessors: list[int]
     module_path: str = ""
     phase: str = "forward"
     execution_kind: str = "original_forward"
@@ -169,6 +194,7 @@ class OpDispatchCapture(TorchDispatchMode):
         self._memory_events: list[RawMemoryEvent] = []
         self._checkpoint_boundary_events: list[CheckpointBoundaryEvent] = []
         self._producer: dict[int, int] = {}
+        self._mutation_frontier: dict[int, int] = {}
         self._tensor_identities: dict[int, tuple[weakref.ReferenceType[torch.Tensor], int]] = {}
         self._reused_tensor_ids = itertools.count(1)
         self._last_signature: tuple | None = None
@@ -227,12 +253,19 @@ class OpDispatchCapture(TorchDispatchMode):
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):  # noqa: ANN001, ANN201
         kwargs = kwargs or {}
+        mutated_inputs = _schema_mutated_tensors(func, args, kwargs)
         result = func(*args, **kwargs)
 
         flat_inputs = _flatten_tensors(args) + _flatten_tensors(tuple(kwargs.values()))
         flat_outputs = _flatten_tensors(result if isinstance(result, (tuple, list)) else (result,))
         module_path = self.module_path_tracker.current_path() if self.module_path_tracker else ""
-        self._record_event(str(func), flat_inputs, flat_outputs, module_path)
+        self._record_event(
+            str(func),
+            flat_inputs,
+            flat_outputs,
+            module_path,
+            mutated_inputs=mutated_inputs,
+        )
 
         return result
 
@@ -362,6 +395,7 @@ class OpDispatchCapture(TorchDispatchMode):
         memory_flat_inputs: list[torch.Tensor] | None = None,
         memory_flat_outputs: list[torch.Tensor] | None = None,
         extra_annotations: dict[str, Any] | None = None,
+        mutated_inputs: list[torch.Tensor] | None = None,
     ) -> None:
         if not self._capture_l0:
             return  # pass-through: duplicate (stage, comp_type) class skips L0 capture
@@ -378,11 +412,28 @@ class OpDispatchCapture(TorchDispatchMode):
             pass
         input_ids = [self.tensor_id(tensor) for tensor in flat_inputs]
         output_ids = [self.tensor_id(tensor) for tensor in flat_outputs]
+        alias_frontier_ids = {
+            frontier
+            for tensor in flat_inputs
+            if (
+                frontier := self._mutation_frontier.get(
+                    self._alias_root_id(tensor)
+                )
+            )
+            is not None
+        }
         memory_flat_inputs = flat_inputs if memory_flat_inputs is None else memory_flat_inputs
         memory_flat_outputs = flat_outputs if memory_flat_outputs is None else memory_flat_outputs
         memory_input_ids = [self.tensor_id(tensor) for tensor in memory_flat_inputs]
         memory_output_ids = [self.tensor_id(tensor) for tensor in memory_flat_outputs]
-        predecessors = sorted({self._producer[tensor_id] for tensor_id in input_ids if tensor_id in self._producer})
+        predecessors = sorted(
+            {
+                self._producer[tensor_id]
+                for tensor_id in input_ids
+                if tensor_id in self._producer
+            }
+            | alias_frontier_ids
+        )
         if input_metas is None:
             input_metas = [to_tensor_meta(t, name=f"in_{i}") for i, t in enumerate(flat_inputs)]
         if output_metas is None:
@@ -448,6 +499,14 @@ class OpDispatchCapture(TorchDispatchMode):
             retained = self._events[-1]
             retained.repeat_count += 1
             op_id = retained.op_id
+            retained.predecessors = sorted(
+                set(retained.predecessors)
+                | {
+                    predecessor
+                    for predecessor in predecessors
+                    if predecessor != op_id
+                }
+            )
         else:
             op_id = _next_op_id()
             candidate.op_id = op_id
@@ -488,6 +547,8 @@ class OpDispatchCapture(TorchDispatchMode):
 
         for tid in output_ids:
             self._producer[tid] = op_id
+        for tensor in mutated_inputs or ():
+            self._mutation_frontier[self._alias_root_id(tensor)] = op_id
 
     def tensor_id(self, tensor: torch.Tensor) -> int:
         raw_id = id(tensor)
@@ -498,6 +559,24 @@ class OpDispatchCapture(TorchDispatchMode):
         stable_id = raw_id if identity is None else -next(self._reused_tensor_ids)
         self._tensor_identities[raw_id] = (weakref.ref(tensor), stable_id)
         return stable_id
+
+    def _alias_root_id(self, tensor: torch.Tensor) -> int:
+        root = tensor
+        seen: set[int] = set()
+        while isinstance(getattr(root, "_base", None), torch.Tensor):
+            raw_id = id(root)
+            if raw_id in seen:
+                break
+            seen.add(raw_id)
+            root = root._base
+        return self.tensor_id(root)
+
+    def producer_op(self, tensor: torch.Tensor) -> int | None:
+        """Return the op after which the tensor's current value is ready."""
+        mutation = self._mutation_frontier.get(self._alias_root_id(tensor))
+        if mutation is not None:
+            return mutation
+        return self._producer.get(self.tensor_id(tensor))
 
     def __enter__(self) -> "OpDispatchCapture":
         super().__enter__()
