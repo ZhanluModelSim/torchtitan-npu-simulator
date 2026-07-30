@@ -231,9 +231,33 @@ def _16layer_reduced_model() -> KimiK3Model.Config:
     )
 
 
+def _full_model() -> KimiK3Model.Config:
+    """Full Kimi K3 2.8T model: 93 layers, 896 experts, top-16."""
+    return _make_kimi_k3_model_config(
+        vocab_size=163840,
+        dim=7168,
+        n_layers=93,
+        n_dense_layers=1,
+        n_heads=96,
+        q_lora_rank=1536,
+        kv_lora_rank=512,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+        v_head_dim=128,
+        dense_hidden_dim=33792,
+        moe_inter_dim=3072,
+        num_experts=896,
+        num_shared_experts=2,
+        router_top_k=16,
+        routed_expert_hidden_size=3584,
+        kda_layers=_FULL_KDA_LAYERS,
+    )
+
+
 kimi_k3_configs = {
     "debug": _debug_model,
     "16layer_reduced": _16layer_reduced_model,
+    "full": _full_model,
 }
 
 
