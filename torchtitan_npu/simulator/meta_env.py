@@ -16,7 +16,7 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import timedelta
 from types import SimpleNamespace
-from typing import Any, Iterator
+from typing import Any, Iterator, overload
 
 import torch
 
@@ -196,6 +196,7 @@ _original_maybe_enable_amp: Any = _MISSING
 _original_bwd_weight_one_chunk: Any = _MISSING
 _original_get_stage_indices: Any = _MISSING
 _original_parameter_new: Any = _MISSING
+_original_fsdp_chunk_with_empty: Any = _MISSING
 _patched = False
 
 # Pipeline parallel execution context, updated by patched
@@ -736,6 +737,89 @@ def _neutralize_fsdp_meta_param_validation() -> None:
         return
     _original_fsdp_validate_no_meta_params = FSDPParamGroup._validate_no_meta_params
     FSDPParamGroup._validate_no_meta_params = lambda self: None
+
+
+class _LazyMetaChunks:
+    """Index-compatible lazy equivalent of FSDP's ``_chunk_with_empty``."""
+
+    def __init__(self, tensor: torch.Tensor, num_chunks: int, dim: int) -> None:
+        if num_chunks <= 0:
+            raise ValueError(f"num_chunks must be positive, got {num_chunks}")
+        if dim < 0:
+            dim += tensor.ndim
+        if dim < 0 or dim >= tensor.ndim:
+            raise IndexError(
+                f"Dimension out of range (expected in [{-tensor.ndim}, "
+                f"{tensor.ndim - 1}], got {dim})"
+            )
+        self._tensor = tensor
+        self._num_chunks = num_chunks
+        self._dim = dim
+        dim_size = tensor.size(dim)
+        self._chunk_size = (
+            (dim_size + num_chunks - 1) // num_chunks
+            if dim_size > 0
+            else 0
+        )
+        self._actual_chunks = (
+            (dim_size + self._chunk_size - 1) // self._chunk_size
+            if dim_size > 0
+            else num_chunks
+        )
+
+    def __len__(self) -> int:
+        return self._num_chunks
+
+    @overload
+    def __getitem__(self, index: int) -> torch.Tensor: ...
+
+    @overload
+    def __getitem__(self, index: slice) -> list[torch.Tensor]: ...
+
+    def __getitem__(
+        self,
+        index: int | slice,
+    ) -> torch.Tensor | list[torch.Tensor]:
+        if isinstance(index, slice):
+            return [self[item] for item in range(*index.indices(len(self)))]
+        if index < 0:
+            index += len(self)
+        if index < 0 or index >= len(self):
+            raise IndexError("chunk index out of range")
+        if index >= self._actual_chunks:
+            return self._tensor.new_empty(0)
+        if self._chunk_size == 0:
+            return self._tensor.narrow(self._dim, 0, 0)
+        start = index * self._chunk_size
+        length = min(self._chunk_size, self._tensor.size(self._dim) - start)
+        return self._tensor.narrow(self._dim, start, length)
+
+
+def _patch_fsdp_chunk_with_empty_for_meta() -> None:
+    """Avoid materializing one empty tensor per logical FSDP rank.
+
+    FSDP only indexes the current-rank chunk and chunk zero during parameter
+    initialization, but its helper eagerly pads a Python list to world size.
+    At large simulated world sizes that creates millions of useless meta
+    tensors. A lazy sequence preserves indexing and shape semantics in O(1).
+    """
+    global _original_fsdp_chunk_with_empty
+    from torch.distributed.fsdp._fully_shard import _fsdp_param
+
+    if _original_fsdp_chunk_with_empty is not _MISSING:
+        return
+    _original_fsdp_chunk_with_empty = _fsdp_param._chunk_with_empty
+
+    def _meta_chunk_with_empty(
+        tensor: torch.Tensor,
+        num_chunks: int,
+        dim: int,
+    ) -> Any:
+        if tensor.device.type == "meta":
+            return _LazyMetaChunks(tensor, num_chunks, dim)
+        return _original_fsdp_chunk_with_empty(tensor, num_chunks, dim)
+
+    _fsdp_param._chunk_with_empty = _meta_chunk_with_empty
 
 
 def _patch_pipeline_schedule_warmup_for_meta() -> None:
@@ -2744,6 +2828,7 @@ def patch_device_type_to_meta() -> None:
     _patch_parameter_dtensor_for_meta()
     _patch_li_loss_to_skip_buggy_einsum()
     _neutralize_fsdp_meta_param_validation()
+    _patch_fsdp_chunk_with_empty_for_meta()
     _patch_pipeline_schedule_warmup_for_meta()
     _patch_dtensor_meta_to_dtensor_for_meta()
     _patch_rowwise_parallel_output_for_meta()
@@ -2781,6 +2866,7 @@ def unpatch_device_type_to_meta() -> None:
     global _original_torch_equal
     global _original_fused_adamw
     global _original_llama4_fsdp_mesh_info, _original_maybe_enable_amp, _original_parameter_new
+    global _original_fsdp_chunk_with_empty
     for (module_path, attr_name), original in _original_values.items():
         module = importlib.import_module(module_path)
         if original is _MISSING:
@@ -2794,6 +2880,12 @@ def unpatch_device_type_to_meta() -> None:
 
         FSDPParamGroup._validate_no_meta_params = _original_fsdp_validate_no_meta_params
         _original_fsdp_validate_no_meta_params = _MISSING
+
+    if _original_fsdp_chunk_with_empty is not _MISSING:
+        from torch.distributed.fsdp._fully_shard import _fsdp_param
+
+        _fsdp_param._chunk_with_empty = _original_fsdp_chunk_with_empty
+        _original_fsdp_chunk_with_empty = _MISSING
 
     if _original_tensor_npu_method is not _MISSING:
         torch.Tensor.npu = _original_tensor_npu_method

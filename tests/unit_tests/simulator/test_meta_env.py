@@ -237,6 +237,82 @@ def test_patch_neutralizes_fsdp_meta_param_validation():
         assert FSDPParamGroup._validate_no_meta_params is original
 
 
+@pytest.mark.parametrize(
+    ("shape", "num_chunks", "dim"),
+    [
+        ((13, 3), 6, 0),
+        ((2, 7), 8, 0),
+        ((4, 12), 3, 1),
+        ((0, 3), 8, 0),
+    ],
+)
+def test_patch_lazily_preserves_fsdp_meta_chunk_shapes(
+    shape,
+    num_chunks,
+    dim,
+):
+    from torch.distributed.fsdp._fully_shard import _fsdp_param
+
+    tensor = torch.empty(shape, device="meta")
+    original = _fsdp_param._chunk_with_empty
+    expected = original(tensor, num_chunks, dim)
+    try:
+        patch_device_type_to_meta()
+        chunks = _fsdp_param._chunk_with_empty(tensor, num_chunks, dim)
+
+        assert not isinstance(chunks, list)
+        assert len(chunks) == num_chunks
+        for index in range(num_chunks):
+            assert chunks[index].size() == expected[index].size()
+            assert chunks[index].stride() == expected[index].stride()
+    finally:
+        unpatch_device_type_to_meta()
+        assert _fsdp_param._chunk_with_empty is original
+
+
+def test_patch_fsdp_meta_chunks_materializes_only_accessed_shards(monkeypatch):
+    from torch.distributed.fsdp._fully_shard import _fsdp_param
+
+    tensor = torch.empty((128, 64), device="meta")
+    new_empty_calls = 0
+    original_new_empty = torch.Tensor.new_empty
+
+    def counted_new_empty(self, *args, **kwargs):
+        nonlocal new_empty_calls
+        new_empty_calls += 1
+        return original_new_empty(self, *args, **kwargs)
+
+    try:
+        patch_device_type_to_meta()
+        monkeypatch.setattr(torch.Tensor, "new_empty", counted_new_empty)
+        chunks = _fsdp_param._chunk_with_empty(tensor, 8192, 0)
+
+        assert chunks[0].shape == (1, 64)
+        assert chunks[8191].shape == (0,)
+        assert new_empty_calls == 1
+    finally:
+        unpatch_device_type_to_meta()
+
+
+def test_patch_fsdp_chunks_keeps_non_meta_path_unchanged():
+    from torch.distributed.fsdp._fully_shard import _fsdp_param
+
+    tensor = torch.arange(14).reshape(7, 2)
+    original = _fsdp_param._chunk_with_empty
+    expected = original(tensor, 6, 0)
+    try:
+        patch_device_type_to_meta()
+        chunks = _fsdp_param._chunk_with_empty(tensor, 6, 0)
+
+        assert isinstance(chunks, list)
+        assert len(chunks) == len(expected)
+        for actual, expected_chunk in zip(chunks, expected):
+            torch.testing.assert_close(actual, expected_chunk)
+    finally:
+        unpatch_device_type_to_meta()
+        assert _fsdp_param._chunk_with_empty is original
+
+
 def test_patch_redirects_tensor_npu_method_to_meta_when_torch_npu_present():
     # Regression test for a real crash found via the 16-layer
     # DeepSeek-V4-Pro smoke run (SMLA sparse attention forward):
