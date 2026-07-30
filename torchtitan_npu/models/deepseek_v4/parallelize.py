@@ -36,7 +36,6 @@ from torch.distributed.tensor.parallel import (
 from torchtitan.components.quantization.float8 import find_float8_linear_config
 from torchtitan.config import TORCH_DTYPE_MAP
 from torchtitan.distributed import ParallelDims
-from torchtitan.distributed.activation_checkpoint import apply_ac
 from torchtitan.distributed.expert_parallel import (
     DeepEPExpertParallel,
     ExpertParallel,
@@ -50,29 +49,13 @@ from torchtitan.models.llama4.parallelize import apply_fsdp
 
 from torchtitan_npu.converters.registry import has_npu_converter
 from torchtitan_npu.models.common.dsa_indexer_loss import DSAIndexerLossLoggingHelper
+from torchtitan_npu.models.deepseek_v4.activation_checkpoint import (
+    apply_deepseek_v4_ac,
+)
 from torchtitan_npu.models.deepseek_v4.model import Attention
 from torchtitan_npu.models.deepseek_v4.model import MoE as DeepSeekV4MoE
 
 logger = logging.getLogger(__name__)
-
-
-# for selective op activation checkpointing
-_op_sac_save_list = {
-    torch.ops.aten.mm.default,
-    torch.ops.aten._scaled_dot_product_efficient_attention.default,
-    torch.ops.aten._scaled_dot_product_flash_attention.default,
-    torch.ops.aten._scaled_dot_product_cudnn_attention.default,
-    torch.ops.aten._scaled_dot_product_attention_math.default,
-    torch.ops.aten._scaled_dot_product_fused_attention_overrideable.default,
-    torch.ops._c10d_functional.reduce_scatter_tensor.default,
-    torch.ops._c10d_functional.all_to_all_single.default,
-    # for low precision training, it's useful to always save
-    # the result of max, since the absolute maximum is
-    # used to compute the scaling factor for quantization.
-    torch.ops.aten.max.default,
-    torch._higher_order_ops.flex_attention,
-    torch._higher_order_ops.inductor_compiled_code,
-}
 
 
 class AwaitRowwiseParallel(RowwiseParallel):
@@ -289,8 +272,6 @@ def parallelize_deepseek_v4(
         # Import deepep module to register custom ops before accessing them
         import torchtitan.distributed.deepep  # noqa: F401 - registers torch.ops.deepep
 
-        _op_sac_save_list.add(torch.ops.deepep.dispatch.default)
-        _op_sac_save_list.add(torch.ops.deepep.combine.default)
     else:
         use_deepep = False
 
@@ -307,7 +288,7 @@ def parallelize_deepseek_v4(
     model_compile_enabled = compile_config.enable and "model" in compile_config.components
 
     if ac_config.mode != "none":
-        apply_ac(
+        apply_deepseek_v4_ac(
             model,
             ac_config,
             model_compile_enabled=model_compile_enabled,
