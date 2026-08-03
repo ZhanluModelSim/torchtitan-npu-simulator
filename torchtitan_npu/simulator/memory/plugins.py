@@ -55,6 +55,7 @@ class MemoryModelContext:
     parameter_tensors: list[ParameterTensorMetadata] = field(default_factory=list)
     checkpoint_boundary_events: list[CheckpointBoundaryEvent] = field(default_factory=list)
     checkpoint_tensors: list[CheckpointTensorRecord] = field(default_factory=list)
+    activation_offload_tensors: list[CheckpointTensorRecord] = field(default_factory=list)
     alias_base_by_tensor_id: dict[int, int] = field(default_factory=dict)
     offload_ac_saved_tensors: bool = False
     notes: list[str] = field(default_factory=list)

@@ -167,6 +167,7 @@ class MemoryPlan:
     raw_events: list[RawMemoryEvent] = field(default_factory=list)
     tensor_lifetimes: list[TensorLifetime] = field(default_factory=list)
     checkpoint_tensors: list[CheckpointTensorRecord] = field(default_factory=list)
+    activation_offload_tensors: list[CheckpointTensorRecord] = field(default_factory=list)
     timeline_events: list[MemoryTimelineEvent] = field(default_factory=list)
     action_spans: list[MemoryActionSpan] = field(default_factory=list)
     unclassified_ops: list[dict[str, Any]] = field(default_factory=list)
@@ -414,6 +415,121 @@ class MemoryPlan:
             }
         return result
 
+    def _activation_prefetch_records(self) -> list[CheckpointTensorRecord]:
+        records = [
+            item
+            for item in self.checkpoint_tensors
+            if item.is_saved_activation
+            and item.role in {"input", "recompute_saved"}
+            and item.residency_policy == "offloaded"
+        ]
+        records.extend(self.activation_offload_tensors)
+
+        unique_records: list[CheckpointTensorRecord] = []
+        seen: set[tuple[str, int, int, int, str]] = set()
+        for item in records:
+            key = (
+                item.checkpoint_id,
+                item.seq_idx,
+                item.pp_stage,
+                item.pp_mb_idx,
+                item.tensor_id,
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            unique_records.append(item)
+        return unique_records
+
+    def _activation_prefetch_by_marker(self) -> dict[str, dict[str, Any]]:
+        instances_by_marker: dict[
+            str,
+            dict[tuple[int, int, int], dict[str, int]],
+        ] = {}
+        marker_kinds: dict[str, set[str]] = {}
+        for item in self._activation_prefetch_records():
+            instance_key = (
+                item.pp_stage,
+                item.pp_mb_idx,
+                (
+                    0
+                    if item.pp_stage >= 0 or item.pp_mb_idx >= 0
+                    else item.seq_idx
+                ),
+            )
+            instance = instances_by_marker.setdefault(
+                item.checkpoint_id,
+                {},
+            ).setdefault(
+                instance_key,
+                {
+                    "logical_bytes": 0,
+                    "modeled_bytes": 0,
+                    "tensor_count": 0,
+                },
+            )
+            instance["logical_bytes"] += item.num_bytes
+            instance["modeled_bytes"] += item.modeled_num_bytes
+            instance["tensor_count"] += 1
+            marker_kinds.setdefault(item.checkpoint_id, set()).add(item.marker_kind)
+
+        result: dict[str, dict[str, Any]] = {}
+        for marker, instances in sorted(instances_by_marker.items()):
+            variants: dict[tuple[int, int, int], int] = {}
+            for instance in instances.values():
+                variant = (
+                    instance["logical_bytes"],
+                    instance["modeled_bytes"],
+                    instance["tensor_count"],
+                )
+                variants[variant] = variants.get(variant, 0) + 1
+
+            size_variants = [
+                {
+                    "logical_bytes": logical_bytes,
+                    "modeled_bytes": modeled_bytes,
+                    "tensor_count": tensor_count,
+                    "instance_count": instance_count,
+                }
+                for (
+                    logical_bytes,
+                    modeled_bytes,
+                    tensor_count,
+                ), instance_count in sorted(variants.items())
+            ]
+            consistent = len(size_variants) == 1
+            per_instance = size_variants[0] if consistent else {}
+            kinds = marker_kinds[marker]
+            result[marker] = {
+                "marker_kind": next(iter(kinds)) if len(kinds) == 1 else "mixed",
+                "logical_bytes_per_instance": per_instance.get("logical_bytes"),
+                "modeled_bytes_per_instance": per_instance.get("modeled_bytes"),
+                "tensor_count_per_instance": per_instance.get("tensor_count"),
+                "instance_count": len(instances),
+                "logical_bytes_total": sum(
+                    instance["logical_bytes"] for instance in instances.values()
+                ),
+                "modeled_bytes_total": sum(
+                    instance["modeled_bytes"] for instance in instances.values()
+                ),
+                "pp_stages": sorted(
+                    {
+                        stage
+                        for stage, _microbatch, _occurrence in instances
+                        if stage >= 0
+                    }
+                ),
+                "microbatches": sorted(
+                    {
+                        microbatch
+                        for _stage, microbatch, _occurrence in instances
+                        if microbatch >= 0
+                    }
+                ),
+                "size_variants": size_variants,
+            }
+        return result
+
     def to_summary_dict(self) -> dict[str, Any]:
         recompute_saved_records = [
             item
@@ -432,6 +548,22 @@ class MemoryPlan:
             item
             for item in recompute_saved_lifetimes
             if item.tensor_id not in attributed_recompute_saved_ids
+        ]
+        offloaded_activation_lifetimes = [
+            item
+            for item in self.tensor_lifetimes
+            if item.residency_policy == "offloaded"
+            and item.kind in {
+                "checkpoint_saved_activation",
+                "checkpoint_saved_for_recompute",
+                "offloaded_activation",
+            }
+        ]
+        activation_prefetch_records = self._activation_prefetch_records()
+        unattributed_prefetch_records = [
+            item
+            for item in activation_prefetch_records
+            if item.marker_kind == "unattributed"
         ]
         return {
             "metric": self.metric,
@@ -481,6 +613,28 @@ class MemoryPlan:
                 self._checkpoint_saved_activations_by_marker()
             ),
             "checkpoint_prefetch": self._checkpoint_prefetch_by_marker(),
+            "activation_offload_tensor_count": len(
+                offloaded_activation_lifetimes
+            ),
+            "activation_offload_logical_bytes": sum(
+                item.num_bytes for item in offloaded_activation_lifetimes
+            ),
+            "activation_offload_modeled_bytes": sum(
+                item.resident_num_bytes for item in offloaded_activation_lifetimes
+            ),
+            "activation_prefetch_tensor_count": len(
+                activation_prefetch_records
+            ),
+            "activation_prefetch_logical_bytes": sum(
+                item.num_bytes for item in activation_prefetch_records
+            ),
+            "activation_prefetch_unattributed_tensor_count": len(
+                unattributed_prefetch_records
+            ),
+            "activation_prefetch_unattributed_logical_bytes": sum(
+                item.num_bytes for item in unattributed_prefetch_records
+            ),
+            "activation_prefetch": self._activation_prefetch_by_marker(),
             "timeline_event_count": len(self.timeline_events),
             "memory_action_span_count": len(self.action_spans),
             "unclassified_op_count": len(self.unclassified_ops),
@@ -503,6 +657,9 @@ class MemoryPlan:
         data = self.to_summary_dict()
         data["tensor_lifetimes"] = [asdict(item) for item in self.tensor_lifetimes]
         data["checkpoint_tensors"] = [asdict(item) for item in self.checkpoint_tensors]
+        data["activation_offload_tensors"] = [
+            asdict(item) for item in self.activation_offload_tensors
+        ]
         data["timeline_events"] = [asdict(item) for item in self.timeline_events]
         data["action_spans"] = [asdict(item) for item in self.action_spans]
         data["unclassified_ops"] = list(self.unclassified_ops)

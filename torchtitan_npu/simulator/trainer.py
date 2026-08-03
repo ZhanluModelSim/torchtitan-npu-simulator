@@ -68,6 +68,7 @@ class SimulationConfig:
     output_formats: list[str] = field(default_factory=lambda: [])
     enable_memory_tracking: bool = True
     memory_parameter_storage_dtype: str = ""
+    # Historical CLI name; now covers saved activations in none/full/selective.
     memory_offload_ac_saved_tensors: bool = False
     target_npu_device_type: str = "non_a5"
     csv_max_ranks: int | None = None

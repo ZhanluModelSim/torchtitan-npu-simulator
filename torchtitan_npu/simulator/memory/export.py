@@ -12,7 +12,10 @@ import json
 import os
 from dataclasses import asdict
 
-from torchtitan_npu.simulator.memory.records import MemoryPlan
+from torchtitan_npu.simulator.memory.records import (
+    CheckpointTensorRecord,
+    MemoryPlan,
+)
 
 _TRACE_TS_SCALE_US = 1000
 _PHASES = {"forward", "backward", "optimizer"}
@@ -24,6 +27,36 @@ def _trace_ts(seq_idx: int) -> int:
 
 def _shapes(refs: tuple) -> str:
     return ";".join("[" + ",".join(str(dim) for dim in ref.shape) + "]" for ref in refs)
+
+
+def _write_saved_tensor_records(
+    path: str,
+    records: list[CheckpointTensorRecord],
+) -> None:
+    fieldnames = [
+        "checkpoint_id",
+        "marker_kind",
+        "seq_idx",
+        "tensor_id",
+        "role",
+        "shape",
+        "dtype",
+        "num_bytes",
+        "modeled_num_bytes",
+        "requires_grad",
+        "is_saved_activation",
+        "residency_policy",
+        "pp_stage",
+        "pp_mb_idx",
+        "comp_type",
+    ]
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for record in records:
+            row = asdict(record)
+            row["shape"] = "[" + ",".join(str(dim) for dim in record.shape) + "]"
+            writer.writerow(row)
 
 
 def _build_phase_spans(plan: MemoryPlan) -> list[dict]:
@@ -341,39 +374,16 @@ def export_memory_details(plan: MemoryPlan, out_dir: str) -> None:
             writer.writerow(row)
 
     if plan.checkpoint_tensors:
-        with open(
+        _write_saved_tensor_records(
             os.path.join(memory_dir, "checkpoint_tensors.csv"),
-            "w",
-            newline="",
-            encoding="utf-8",
-        ) as f:
-            fieldnames = [
-                "checkpoint_id",
-                "marker_kind",
-                "seq_idx",
-                "tensor_id",
-                "role",
-                "shape",
-                "dtype",
-                "num_bytes",
-                "modeled_num_bytes",
-                "requires_grad",
-                "is_saved_activation",
-                "residency_policy",
-                "pp_stage",
-                "pp_mb_idx",
-                "comp_type",
-            ]
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            for checkpoint_tensor in plan.checkpoint_tensors:
-                row = asdict(checkpoint_tensor)
-                row["shape"] = (
-                    "["
-                    + ",".join(str(dim) for dim in checkpoint_tensor.shape)
-                    + "]"
-                )
-                writer.writerow(row)
+            plan.checkpoint_tensors,
+        )
+
+    if plan.activation_offload_tensors:
+        _write_saved_tensor_records(
+            os.path.join(memory_dir, "activation_offload_tensors.csv"),
+            plan.activation_offload_tensors,
+        )
 
     if plan.unclassified_ops:
         with open(os.path.join(memory_dir, "unclassified_memory_ops.csv"), "w", newline="", encoding="utf-8") as f:

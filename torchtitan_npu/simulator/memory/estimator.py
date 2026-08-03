@@ -24,6 +24,7 @@ from torchtitan_npu.simulator.capture.tensor_utils import (
     tensor_volume_bytes,
 )
 from torchtitan_npu.simulator.memory.activation_checkpoint import ActivationCheckpointPlugin
+from torchtitan_npu.simulator.memory.activation_offload import ActivationOffloadPlugin
 from torchtitan_npu.simulator.memory.alias_rules import is_alias_event, is_mutation_event
 from torchtitan_npu.simulator.memory.fsdp_residency import FSDPFullParamResidencyPlugin
 from torchtitan_npu.simulator.memory.gradient_residency import MissingParameterGradientPlugin
@@ -230,6 +231,7 @@ def _finalize_kind(lifetime: TensorLifetime) -> None:
         "checkpoint_recompute_temp",
         "checkpoint_saved_activation",
         "checkpoint_saved_for_recompute",
+        "offloaded_activation",
     }:
         return
     if lifetime.producer_phase == "backward" and "optimizer" in lifetime.consumer_phases:
@@ -444,6 +446,7 @@ def estimate_static_memory(
     )
     plugin_lifetimes = FSDPFullParamResidencyPlugin().apply(plugin_context)
     ActivationCheckpointPlugin().apply(plugin_context)
+    ActivationOffloadPlugin().apply(plugin_context)
     plugin_lifetimes.extend(MissingParameterGradientPlugin().apply(plugin_context))
 
     lifetimes = [*param_lifetimes, *lifetimes_by_tensor_id.values(), *alias_lifetimes, *plugin_lifetimes]
@@ -467,6 +470,7 @@ def estimate_static_memory(
         raw_events=events,
         tensor_lifetimes=sorted(lifetimes, key=lambda item: (item.birth_seq, item.tensor_id)),
         checkpoint_tensors=plugin_context.checkpoint_tensors,
+        activation_offload_tensors=plugin_context.activation_offload_tensors,
         timeline_events=timeline,
         unclassified_ops=unclassified_ops,
         notes=notes,

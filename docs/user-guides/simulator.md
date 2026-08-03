@@ -285,6 +285,7 @@ backward 中重放。可通过
 | `memory_timeline.csv` | `mem`；alloc/free 后的 active tensor bytes 曲线 |
 | `tensor_lifetimes.csv` | `mem`；每个 tensor 的 birth、last consumer、death、逻辑大小、建模驻留大小和分类 |
 | `checkpoint_tensors.csv` | `mem`；AC wrapper 边界输入/输出及 selective 内部保存 tensor 元数据；存在 AC 边界时生成 |
+| `activation_offload_tensors.csv` | `mem`；不属于 AC wrapper 记录、但被统一激活卸载策略覆盖的 tensor 及逐层归属 |
 | `memory_actions.csv` | `mem`；PP 调度 action 与展开后内存事件区间的映射；非 PP 不生成 |
 | `memory_trace.json` | `mem`；可由 Chrome Trace 或 Perfetto 打开的阶段趋势图 |
 
@@ -294,15 +295,16 @@ backward 中重放。可通过
 # 参数仍保留捕获到的原始 dtype/num_bytes，但静态本地参数分片按 BF16 计入设备驻留。
 --simulation.memory-parameter-storage-dtype bfloat16
 
-# AC 保存 tensor 仍保留元数据，但不计入设备驻留和峰值。
+# 所有前向保存激活仍保留元数据，但不计入设备驻留和峰值。
 --simulation.memory-offload-ac-saved-tensors
 ```
 
 参数 dtype 覆盖仅作用于静态本地参数分片，不改变梯度、optimizer state 或 FSDP
-all-gather 全参数的 dtype。AC 卸载作用于每个 `CheckpointWrapper` 输入中
-`requires_grad=True` 的保存激活，以及 selective checkpoint 在重计算期间复用的
-forward tensor；freqs、mask 等无梯度上下文仍会记录，但不会被当作边界保存激活卸载。
-checkpoint 内部临时值仍按其 forward/recompute 生命周期建模。两个开关默认均关闭。
+all-gather 全参数的 dtype。激活卸载作用于所有“forward 产生且正常 backward
+仍需使用”的 tensor，因此对 `activation_checkpoint.mode=none/full/selective`
+使用同一建模假设。full/selective 的 checkpoint 内部重计算临时值不是保存激活，
+仍按其 forward/recompute 生命周期建模。freqs、mask 等无梯度外部上下文不会被
+当作保存激活卸载。两个开关默认均关闭。
 
 selective checkpoint 保存的内部 tensor 在 `tensor_lifetimes.csv` 中标记为
 `checkpoint_saved_for_recompute`。summary 中的
@@ -343,7 +345,45 @@ selective checkpoint 保存的内部 tensor 在 `tensor_lifetimes.csv` 中标记
 marker 当前使用 AC wrapper 模块路径且 `marker_kind="module"`；该结构不依赖“层”的
 概念，后续 selective AC 可以使用 op 级 marker 和 `marker_kind="op"` 并复用相同格式。
 
-评估 AC offload 回捞带宽时，使用同一 summary 中的 `checkpoint_prefetch`：
+`checkpoint_prefetch` 保留 AC 专用的边界输入与 selective 保存值统计。评估三种
+AC 模式下的统一激活回捞带宽时，应使用 `activation_prefetch`：
+
+```json
+{
+  "activation_offload_tensor_count": 567,
+  "activation_offload_logical_bytes": 32992845480,
+  "activation_offload_modeled_bytes": 0,
+  "activation_prefetch_logical_bytes": 32992845480,
+  "activation_prefetch": {
+    "part0:layers.0": {
+      "marker_kind": "layer",
+      "logical_bytes_per_instance": 1771982464,
+      "modeled_bytes_per_instance": 0,
+      "tensor_count_per_instance": 29,
+      "instance_count": 1,
+      "logical_bytes_total": 1771982464,
+      "modeled_bytes_total": 0,
+      "pp_stages": [0],
+      "microbatches": [0],
+      "size_variants": [
+        {
+          "logical_bytes": 1771982464,
+          "modeled_bytes": 0,
+          "tensor_count": 29,
+          "instance_count": 1
+        }
+      ]
+    }
+  }
+}
+```
+
+none 模式按正常 backward consumer 的 `layers.N` 归档保存激活；full/selective
+复用 checkpoint marker，并合并该层其他保存激活。没有唯一层归属的 loss、logits
+等记录在 `part0:<unattributed>`，其总量同时写入
+`activation_prefetch_unattributed_{tensor_count,logical_bytes}`。
+
+AC 专用的 `checkpoint_prefetch` 结构如下：
 
 ```json
 {
@@ -579,7 +619,7 @@ def my_model_simulate() -> SimulationTrainerConfig:
 
 - 内存跟踪默认开启。可通过 CLI 设置 `--simulation.no-enable-memory-tracking` 关闭；关闭后不记录内存事件、tensor 生命周期和 FSDP 参数驻留，也不执行静态内存估算。开启时始终导出 `<output_dir>/memory/memory_summary.json`；只有 `output_formats` 包含 `mem` 时才导出详细 trace 和 CSV。
 - `simulation.memory_parameter_storage_dtype` 可指定静态本地参数分片的建模驻留 dtype（例如 `bfloat16`）；原始 dtype 和逻辑大小仍保留在生命周期记录中。
-- `simulation.memory_offload_ac_saved_tensors` 可将 AC wrapper 保存输入按零设备驻留建模，同时保留 `checkpoint_tensors.csv` 元数据。
+- `simulation.memory_offload_ac_saved_tensors` 可将所有 forward-to-backward 保存激活按零设备驻留建模，覆盖 AC `none/full/selective`；逐层回捞量见 `activation_prefetch`，详细非 checkpoint 记录见 `activation_offload_tensors.csv`。
 - `simulation.world_size` 必须等于 `dp_replicate × dp_shard × cp × tp × pp`；EP/ETP 不额外乘入 dense world size。`data_parallel_shard_degree=-1` 时由 simulator 根据最终 CLI 配置计算。
 - `pipeline_parallel_degree > 1` 时，DeepSeek-V4 不支持 MTP，需设 `num_mtp_modules=0`。
 - `pipeline_parallel_degree > 1` 时，`local_batch_size` 需 ≥ `pp_degree`（1F1B 调度需要足够 microbatch）。

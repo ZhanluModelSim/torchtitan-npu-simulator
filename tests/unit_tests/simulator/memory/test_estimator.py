@@ -138,6 +138,157 @@ def test_checkpoint_plugin_releases_internal_forward_tensor_before_backward():
     assert release.phase == "forward"
 
 
+def test_activation_offload_covers_none_mode_and_reports_each_layer():
+    x = tref(1)
+    layer0_saved = tref(2, 64)
+    layer1_saved = tref(3, 128)
+    grad1 = tref(4, 128)
+    grad0 = tref(5, 64)
+    events = [
+        event(
+            0,
+            10,
+            "aten.mm.default",
+            inputs=[x],
+            outputs=[layer0_saved],
+            module_path="layers.0.attention",
+        ),
+        event(
+            1,
+            11,
+            "aten.mm.default",
+            inputs=[layer0_saved],
+            outputs=[layer1_saved],
+            module_path="layers.1.attention",
+        ),
+        event(
+            5,
+            20,
+            "aten.mm.default",
+            inputs=[layer1_saved],
+            outputs=[grad1],
+            phase="backward",
+            execution_kind="backward",
+            module_path="layers.1.attention",
+        ),
+        event(
+            6,
+            21,
+            "aten.mm.default",
+            inputs=[layer0_saved],
+            outputs=[grad0],
+            phase="backward",
+            execution_kind="backward",
+            module_path="layers.0.attention",
+        ),
+    ]
+
+    resident_plan = estimate_static_memory(events)
+    offloaded_plan = estimate_static_memory(
+        events,
+        offload_ac_saved_tensors=True,
+    )
+
+    offloaded = {
+        item.tensor_id: item
+        for item in offloaded_plan.tensor_lifetimes
+        if item.kind == "offloaded_activation"
+    }
+    assert set(offloaded) == {"tensor:2", "tensor:3"}
+    assert all(item.resident_num_bytes == 0 for item in offloaded.values())
+    assert (
+        offloaded_plan.model_active_bytes_peak
+        < resident_plan.model_active_bytes_peak
+    )
+
+    summary = offloaded_plan.to_summary_dict()
+    assert summary["activation_offload_tensor_count"] == 2
+    assert summary["activation_offload_logical_bytes"] == 192
+    assert summary["activation_offload_modeled_bytes"] == 0
+    assert summary["activation_prefetch_tensor_count"] == 2
+    assert summary["activation_prefetch_logical_bytes"] == 192
+    assert summary["activation_prefetch_unattributed_tensor_count"] == 0
+    assert summary["activation_prefetch"]["part0:layers.0"][
+        "logical_bytes_per_instance"
+    ] == 64
+    assert summary["activation_prefetch"]["part0:layers.1"][
+        "logical_bytes_per_instance"
+    ] == 128
+
+    records = {
+        item.tensor_id: item
+        for item in offloaded_plan.activation_offload_tensors
+    }
+    assert records["tensor:2"].checkpoint_id == "part0:layers.0"
+    assert records["tensor:3"].checkpoint_id == "part0:layers.1"
+    assert all(item.role == "activation_saved" for item in records.values())
+
+
+def test_activation_offload_preserves_pipeline_microbatch_instances():
+    saved0 = tref(2, 64)
+    saved1 = tref(3, 64)
+    plan = estimate_static_memory(
+        [
+            event(
+                0,
+                10,
+                "aten.mm.default",
+                inputs=[tref(1)],
+                outputs=[saved0],
+                module_path="layers.0.attention",
+                pp_stage=1,
+                pp_mb_idx=0,
+                comp_type="F",
+            ),
+            event(
+                1,
+                11,
+                "aten.mm.default",
+                inputs=[tref(4)],
+                outputs=[saved1],
+                module_path="layers.0.attention",
+                pp_stage=1,
+                pp_mb_idx=1,
+                comp_type="F",
+            ),
+            event(
+                5,
+                20,
+                "aten.mm.default",
+                inputs=[saved1],
+                phase="backward",
+                execution_kind="backward",
+                module_path="layers.0.attention",
+                pp_stage=1,
+                pp_mb_idx=1,
+                comp_type="B",
+            ),
+            event(
+                6,
+                21,
+                "aten.mm.default",
+                inputs=[saved0],
+                phase="backward",
+                execution_kind="backward",
+                module_path="layers.0.attention",
+                pp_stage=1,
+                pp_mb_idx=0,
+                comp_type="B",
+            ),
+        ],
+        offload_ac_saved_tensors=True,
+    )
+
+    marker = plan.to_summary_dict()["activation_prefetch"][
+        "part0:layers.0"
+    ]
+    assert marker["logical_bytes_per_instance"] == 64
+    assert marker["logical_bytes_total"] == 128
+    assert marker["instance_count"] == 2
+    assert marker["pp_stages"] == [1]
+    assert marker["microbatches"] == [0, 1]
+
+
 @pytest.mark.parametrize(
     ("offload", "modeled_bytes", "has_timeline"),
     [(False, 64, True), (True, 0, False)],
@@ -229,6 +380,15 @@ def test_checkpoint_plugin_keeps_tensor_reused_during_recompute(
     assert prefetch["boundary_tensor_count_per_instance"] == 1
     assert prefetch["recompute_saved_tensor_count_per_instance"] == 1
     assert prefetch["tensor_count_per_instance"] == 2
+    if offload:
+        activation_prefetch = summary["activation_prefetch"][
+            "part0:layers.0"
+        ]
+        assert activation_prefetch["logical_bytes_per_instance"] == 80
+        assert activation_prefetch["modeled_bytes_per_instance"] == 0
+        assert activation_prefetch["tensor_count_per_instance"] == 2
+    else:
+        assert summary["activation_prefetch"] == {}
 
     recompute_record = next(
         item
@@ -771,12 +931,33 @@ class FakeComm:
 def test_fsdp_allgather_output_is_classified_as_full_param_buffer():
     shard, full = tref(1, 32), tref(2, 128)
     plan = estimate_static_memory(
-        [event(0, 10, "comm.allgather", inputs=[shard], outputs=[full], op_type="allgather")],
+        [
+            event(
+                0,
+                10,
+                "comm.allgather",
+                inputs=[shard],
+                outputs=[full],
+                op_type="allgather",
+            ),
+            event(
+                5,
+                20,
+                "aten.mm.default",
+                inputs=[full],
+                phase="backward",
+                execution_kind="backward",
+                module_path="layers.0.attention",
+            ),
+        ],
         comm_events=[FakeComm(op_id=10, comm_primitive="allgather", comm_dim="fsdp")],
+        offload_ac_saved_tensors=True,
     )
     full_lifetime = next(item for item in plan.tensor_lifetimes if item.tensor_id == "tensor:2")
     assert full_lifetime.kind == "fsdp_full_param"
     assert full_lifetime.num_bytes == 128
+    assert full_lifetime.resident_num_bytes == 128
+    assert plan.activation_offload_tensors == []
     assert not any(item.tensor_id.startswith("fsdp_full_param:") for item in plan.tensor_lifetimes)
 
 
@@ -997,6 +1178,45 @@ def test_memory_plan_exports_checkpoint_tensor_metadata(tmp_path):
         "checkpoint_id,marker_kind,seq_idx,tensor_id,role,shape,dtype"
     )
     assert "part0:layers.0" in row
+    assert "offloaded" in row
+
+
+def test_memory_plan_exports_none_mode_activation_offload_metadata(tmp_path):
+    saved = tref(2, 64)
+    plan = estimate_static_memory(
+        [
+            event(
+                0,
+                10,
+                "aten.relu.default",
+                inputs=[tref(1)],
+                outputs=[saved],
+                module_path="layers.0",
+            ),
+            event(
+                5,
+                20,
+                "aten.relu.default",
+                inputs=[saved],
+                phase="backward",
+                execution_kind="backward",
+                module_path="layers.0",
+            ),
+        ],
+        offload_ac_saved_tensors=True,
+    )
+
+    export_memory_plan(plan, str(tmp_path))
+    activation_csv = (
+        tmp_path / "memory" / "activation_offload_tensors.csv"
+    )
+    assert activation_csv.is_file()
+    header, row = activation_csv.read_text().splitlines()
+    assert header.startswith(
+        "checkpoint_id,marker_kind,seq_idx,tensor_id,role,shape,dtype"
+    )
+    assert "part0:layers.0" in row
+    assert "activation_saved" in row
     assert "offloaded" in row
 
 
