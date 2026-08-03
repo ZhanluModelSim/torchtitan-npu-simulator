@@ -140,6 +140,13 @@ def _profiling() -> ProfilingConfig:
     )
 
 
+def _activation_checkpoint() -> ActivationCheckpointConfig:
+    return ActivationCheckpointConfig(
+        mode="full",
+        per_op_sac_force_recompute_mm_shapes_by_fqns=[],
+    )
+
+
 def _flash_baseline(*, enable_mxfp8: bool) -> TrainerConfig:
     return TrainerConfig(
         hf_assets_path="./tests/assets/tokenizer/deepseekv4_tokenizer",
@@ -173,7 +180,7 @@ def _flash_baseline(*, enable_mxfp8: bool) -> TrainerConfig:
             export_dtype="float32",
             async_mode="disabled",
         ),
-        activation_checkpoint=ActivationCheckpointConfig(mode="full"),
+        activation_checkpoint=_activation_checkpoint(),
         compile=CompileConfig(enable=False, components=["model", "loss"]),
         profiling=_profiling(),
     )
@@ -221,7 +228,7 @@ def _pro_baseline(*, enable_mxfp8: bool) -> TrainerConfig:
             export_dtype="float32",
             async_mode="disabled",
         ),
-        activation_checkpoint=ActivationCheckpointConfig(mode="full"),
+        activation_checkpoint=_activation_checkpoint(),
         compile=CompileConfig(enable=True, components=["model", "loss"]),
         profiling=_profiling(),
     )
@@ -268,7 +275,7 @@ def _pro_20t_baseline(*, enable_mxfp8: bool) -> TrainerConfig:
             export_dtype="float32",
             async_mode="disabled",
         ),
-        activation_checkpoint=ActivationCheckpointConfig(mode="full"),
+        activation_checkpoint=_activation_checkpoint(),
         compile=CompileConfig(enable=False, components=["model", "loss"]),
         profiling=ProfilingConfig(enable_profiling=False),
     )
@@ -312,7 +319,7 @@ def deepseek_v4_smoketest() -> TrainerConfig:
         ),
         parallelism=_parallelism(expert_parallel_degree=1),
         checkpoint=CheckpointConfig(enable=False),
-        activation_checkpoint=ActivationCheckpointConfig(mode="none"),
+        activation_checkpoint=_activation_checkpoint(),
         compile=CompileConfig(enable=False, components=["model", "loss"]),
         profiling=ProfilingConfig(enable_profiling=False),
     )
