@@ -166,12 +166,28 @@ def test_deepseek_v4_model_overrides_cli(module):
     assert model.use_smla is True
 
 
+def test_deepseek_v4_model_overrides_allow_extra_compress_ratios():
+    config = ConfigManager().parse_args(
+        [
+            "--module",
+            "torchtitan_npu.simulator",
+            "--config",
+            "deepseek_v4_smoketest",
+            "--model-overrides.n-layers",
+            "3",
+        ]
+    )
+
+    assert config.model_spec.model.n_layers == 3
+    assert config.model_spec.model.compress_ratios == (1, 1, 4, 128)
+
+
 @pytest.mark.parametrize(
     ("args", "message"),
     (
         (
-            ["--model-overrides.n-layers", "3"],
-            "compress_ratios must contain one value per main layer",
+            ["--model-overrides.n-layers", "5"],
+            "compress_ratios must contain at least one value per main layer",
         ),
         (
             [

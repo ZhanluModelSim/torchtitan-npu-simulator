@@ -82,7 +82,7 @@ false -> --model-overrides.no-use-smla
 | `model_overrides.o_lora_rank` | Output LoRA Rank | 输出 LoRA 秩 | `int` / 整数输入 | 基础 | 必须大于 0；影响输出投影参数量 |
 | `model_overrides.o_groups` | Output Projection Groups | 输出投影分组数 | `int` / 整数输入 | 高级 | 必须大于 0；`n_heads` 必须能被该值整除 |
 | `model_overrides.window_size` | Sliding Window Size | 滑动窗口大小 | `int` / 整数输入 | 高级 | 必须大于 0 |
-| `model_overrides.compress_ratios` | Per-Layer Compression Ratios | 逐层压缩比 | `list[int]` / 整数列表 | 高级 | 元素数量必须等于 `n_layers`；每个值必须大于等于 0 |
+| `model_overrides.compress_ratios` | Per-Layer Compression Ratios | 逐层压缩比 | `list[int]` / 整数列表 | 高级 | 元素数量不能少于 `n_layers`；允许保留不会被当前层数消费的尾部值；每个值必须大于等于 0 |
 | `model_overrides.use_smla` | Enable SMLA | 启用 SMLA | `bool` / 开关 | 派生 | 当前运行时根据是否安装 `npu_smla` converter 更新，普通页面建议隐藏 |
 
 ## 索引器
@@ -244,7 +244,7 @@ Web 页面应以所选 preset 解析后的完整 `model_overrides` 作为表单�
 
 Web 页面至少应实现以下即时校验，后端仍需执行最终校验：
 
-1. 修改 `n_layers` 时，要求 `compress_ratios` 的元素数量同步变化。
+1. `compress_ratios` 的元素数量必须大于等于 `n_layers`；减少层数时可以保留尾部值，增加层数时必须补足。
 2. `n_heads % o_groups == 0`。
 3. `rope_head_dim <= head_dim`。
 4. `rope_head_dim <= index_head_dim`。

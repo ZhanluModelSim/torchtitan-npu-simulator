@@ -130,10 +130,10 @@ def validate_model_overrides(config: DeepSeekV4ModelOverrides) -> None:
             f"got {config.load_balance_coeff}"
         )
 
-    if len(config.compress_ratios) != config.n_layers:
+    if len(config.compress_ratios) < config.n_layers:
         raise ValueError(
-            "model_overrides.compress_ratios must contain one value per main "
-            f"layer, got {len(config.compress_ratios)} values for "
+            "model_overrides.compress_ratios must contain at least one value "
+            f"per main layer, got {len(config.compress_ratios)} values for "
             f"n_layers={config.n_layers}"
         )
     if any(ratio < 0 for ratio in config.compress_ratios):

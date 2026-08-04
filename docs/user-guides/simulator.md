@@ -226,8 +226,8 @@ python3 -m torchtitan_npu.entry \
 
 配置解析阶段会检查正数范围、`compress_ratios` 与 `n_layers` 的长度、
 head/group 整除关系、RoPE head 维度、Hadamard 维度，以及 MoE 的
-`top_k`、专家数和专家分组关系。修改 `n_layers` 时必须同时提供相同数量的
-`compress_ratios`。
+`top_k`、专家数和专家分组关系。`compress_ratios` 不能少于 `n_layers`；
+减少层数时可以保留 preset 尾部的多余值，增加层数时必须补足。
 
 ### 5. 获取输出文件
 
