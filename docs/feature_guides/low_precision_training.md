@@ -87,7 +87,6 @@ model_converters = ModelConvertersContainer.Config(
                 "pre_attention.wq_b",
                 "pre_attention.wkv",
                 "pre_attention.indexer.wq_b",
-                "pre_attention.indexer.weights_proj",
                 "post_attention.wo_a",
                 "post_attention.wo_b",
                 # MoE 专家层
