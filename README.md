@@ -104,10 +104,15 @@ pip install -e .
     </tr>
     <!-- 训练精度 -->
     <tr>
-      <td>训练精度</td>
+      <td rowspan="2">训练精度</td>
       <td><a href="https://gitcode.com/cann/torchtitan-npu/blob/master/docs/feature_guides/low_precision_training.md">MxFP8 量化</a></td>
       <td>✅</td>
       <td>✅ (Ascend 950)</td>
+    </tr>
+    <tr>
+      <td><a href="https://gitcode.com/cann/torchtitan-npu/blob/master/docs/feature_guides/fsdp_parameter_precision.md">FSDP 参数级精度保留</a></td>
+      <td>❌</td>
+      <td>✅</td>
     </tr>
     <!-- 训练调试与监控 -->
     <tr>

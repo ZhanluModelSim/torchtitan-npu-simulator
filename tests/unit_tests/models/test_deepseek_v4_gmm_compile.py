@@ -214,7 +214,10 @@ def _parallelize_test_model(ac_mode, compile_enabled):
         parallel_dims=parallel_dims,
         training=SimpleNamespace(seq_len=8),
         model_converters=SimpleNamespace(converters=[]),
-        parallelism=SimpleNamespace(expert_parallel_comm_backend="alltoall"),
+        parallelism=SimpleNamespace(
+            expert_parallel_comm_backend="alltoall",
+            fsdp_preserve_parameter_patterns=[],
+        ),
         compile_config=SimpleNamespace(
             enable=compile_enabled,
             components=("model",),

@@ -425,6 +425,38 @@ def test_deepseek_v4_debug_configs_do_not_inherit_cpt_comm_override():
         assert trainer_config.comm.trace_buf_size != 0
 
 
+def test_deepseek_v4_configs_define_model_scoped_fsdp_parameter_patterns():
+    from torchtitan_npu.models.deepseek_v4 import config_registry
+
+    expected_patterns = [
+        "layers.*.*norm.weight",
+        "norm.weight",
+        "layers.*.attention.pre_attention.*_norm.weight",
+        "layers.*.attention.pre_attention.**.compressor*.norm.weight",
+        "layers.*.attention.pre_attention.**.compressor*.ape",
+        "layers.*.attention.pre_attention.**.compressor*.wkv.weight",
+        "layers.*.attention.pre_attention.**.compressor*.wgate.weight",
+        "layers.*.attention.inner_attention.attn_sink",
+        "layers.*.moe.router.gate.weight",
+        "layers.*.hc_*",
+        "layers.*.*hc_head.hc_head_*",
+    ]
+    configs = (
+        config_registry.debug_deepseek_v4_single_node_1b(),
+        config_registry.debug_deepseek_v4_flash_single_node(),
+        config_registry.debug_deepseek_v4_pro_single_node(),
+    )
+
+    for config in configs:
+        assert config.parallelism.fsdp_preserve_parameter_patterns == expected_patterns
+
+    pattern_list_ids = {
+        id(config.parallelism.fsdp_preserve_parameter_patterns)
+        for config in configs
+    }
+    assert len(pattern_list_ids) == len(configs)
+
+
 def test_deepseek_v4_flash_single_node_mxfp8_derives_from_flash_single_node_config():
     from torchtitan.components.quantization.mx import MXFP8Converter
 

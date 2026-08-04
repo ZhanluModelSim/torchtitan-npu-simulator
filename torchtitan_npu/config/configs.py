@@ -145,6 +145,17 @@ class ParallelismConfig(_BaseParallelismConfig):
     To opt back into a reordering balancer, set it explicitly.
     """
 
+    fsdp_preserve_parameter_patterns: list[str] = field(default_factory=list)
+    """
+    Parameter FQN glob patterns that retain their original dtype inside FSDP.
+
+    ``*`` matches within one FQN segment and ``**`` matches zero or more
+    complete segments. Model code applies the patterns after converters and
+    model-parallel transforms, immediately before fully_shard(). Selected
+    ordinary parameters bypass the unit-level param dtype cast; unselected
+    parameters inherit it. TorchAO wrappers must not be selected.
+    """
+
 
 @dataclass(kw_only=True, slots=True)
 class TrainingConfig(_BaseTrainingConfig):

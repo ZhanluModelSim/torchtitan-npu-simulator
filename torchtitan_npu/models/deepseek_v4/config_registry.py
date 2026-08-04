@@ -36,6 +36,21 @@ _MXFP8_FQNS = (
 _DEFAULT_CONVERTERS = ("npu_rms_norm", "npu_moe_dispatch", "npu_gmm", "npu_rope", "npu_smla", "npu_mhc_pre")
 
 
+_DEEPSEEK_V4_FP32_PARAMETER_PATTERNS = [
+    "layers.*.*norm.weight",
+    "norm.weight",
+    "layers.*.attention.pre_attention.*_norm.weight",
+    "layers.*.attention.pre_attention.**.compressor*.norm.weight",
+    "layers.*.attention.pre_attention.**.compressor*.ape",
+    "layers.*.attention.pre_attention.**.compressor*.wkv.weight",
+    "layers.*.attention.pre_attention.**.compressor*.wgate.weight",
+    "layers.*.attention.inner_attention.attn_sink",
+    "layers.*.moe.router.gate.weight",
+    "layers.*.hc_*",
+    "layers.*.*hc_head.hc_head_*",
+]
+
+
 def _default_converters(*extra_names: str) -> list:
     return [get_model_converter_config(name) for name in (*_DEFAULT_CONVERTERS, *extra_names)]
 
@@ -55,6 +70,10 @@ def debug_deepseek_v4_single_node_1b() -> TrainerConfig:
             ]
         ),
         optimizer=replace(base.optimizer, swap_optimizer=False),
+        parallelism=replace(
+            base.parallelism,
+            fsdp_preserve_parameter_patterns=_DEEPSEEK_V4_FP32_PARAMETER_PATTERNS.copy(),
+        ),
         lr_scheduler=replace(base.lr_scheduler, min_lr_factor=0.1, warmup_steps=2),
         training=replace(base.training, seq_len=576, steps=2, num_mtp_modules=0),
         activation_checkpoint=replace(base.activation_checkpoint, mode="none"),
@@ -67,6 +86,10 @@ def _flash_base() -> TrainerConfig:
         base,
         model_spec=model_registry("v4_flash_43layers_256experts"),
         model_converters=ModelConvertersContainer.Config(converters=_default_converters()),
+        parallelism=replace(
+            base.parallelism,
+            fsdp_preserve_parameter_patterns=_DEEPSEEK_V4_FP32_PARAMETER_PATTERNS.copy(),
+        ),
         training=replace(base.training, num_mtp_modules=1),
     )
 

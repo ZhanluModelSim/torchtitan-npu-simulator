@@ -58,6 +58,9 @@ from torchtitan_npu.converters.registry import has_npu_converter
 from torchtitan_npu.distributed.activation_checkpoint import (
     extend_selective_ac_save_ops,
 )
+from torchtitan_npu.distributed.fsdp_parameter_precision import (
+    apply_fsdp_parameter_precision,
+)
 from torchtitan_npu.models.common.dsa_indexer_loss import DSAIndexerLossLoggingHelper
 from torchtitan_npu.models.deepseek_v4.model import Attention
 from torchtitan_npu.models.deepseek_v4.model import MoE as DeepSeekV4MoE
@@ -395,8 +398,13 @@ def parallelize_deepseek_v4(
             )
         apply_compile(model, compile_config)
 
+    fsdp_preserve_parameter_patterns = parallelism.fsdp_preserve_parameter_patterns
+    fully_shard_enabled = parallel_dims.fsdp_enabled or parallel_dims.ep_enabled
+    if fsdp_preserve_parameter_patterns and not fully_shard_enabled:
+        logger.warning("Ignoring fsdp_preserve_parameter_patterns because FSDP/EP is disabled")
+
     dp_mesh: DeviceMesh | None = None
-    if parallel_dims.fsdp_enabled or parallel_dims.ep_enabled:
+    if fully_shard_enabled:
         # apply FSDP or HSDP, potentially with Context Parallel
         dp_mesh_names = ["dp_replicate", "fsdp"] if parallel_dims.dp_replicate_enabled else ["fsdp"]
         dp_mesh = parallel_dims.get_mesh(dp_mesh_names)
@@ -404,6 +412,19 @@ def parallelize_deepseek_v4(
         # the mesh dim names of which the MoE params are sharded on via FSDP/HSDP
         edp_mesh_names = ["dp_replicate", "efsdp"] if parallel_dims.dp_replicate_enabled else ["efsdp"]
         edp_mesh = parallel_dims.get_optional_mesh(edp_mesh_names)
+
+        # EP uses the same fully_shard() path for expert parameters, so
+        # precision markers must be applied before the first fully_shard() call.
+        if fsdp_preserve_parameter_patterns:
+            marked_parameter_names = apply_fsdp_parameter_precision(
+                model,
+                fsdp_preserve_parameter_patterns,
+            )
+            if marked_parameter_names:
+                logger.info(
+                    "Applied parameter-level FSDP precision overrides to %d parameters",
+                    len(marked_parameter_names),
+                )
 
         apply_fsdp(
             model,
