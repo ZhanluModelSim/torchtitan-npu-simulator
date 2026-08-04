@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import MetricsProcessor
@@ -23,21 +23,33 @@ from torchtitan_npu.config.configs import (
     OptimizerConfig,
     ParallelismConfig,
     ProfilingConfig,
-    TrainerConfig as NpuTrainerConfig,
     TrainingConfig,
 )
+from torchtitan_npu.config.configs import TrainerConfig as NpuTrainerConfig
 from torchtitan_npu.converters import get_model_converter_config
 
 from . import model_registry
+from .config_overrides import (
+    DeepSeekV4ModelOverrides,
+    apply_model_overrides,
+    build_model_spec_with_overrides,
+)
 
 
 @dataclass(kw_only=True, slots=True)
 class TrainerConfig(NpuTrainerConfig):
-    """DeepSeek V4 config with a stable MXFP8 FQN CLI override."""
+    """DeepSeek V4 config with stable model and MXFP8 CLI overrides."""
 
+    model_overrides: DeepSeekV4ModelOverrides = field(
+        default_factory=DeepSeekV4ModelOverrides
+    )
     mxfp8_fqns: list[str] | None = None
 
     def __post_init__(self) -> None:
+        self.model_spec = apply_model_overrides(
+            self.model_spec,
+            self.model_overrides,
+        )
         _apply_mxfp8_fqns_override(self.model_converters, self.mxfp8_fqns)
 
 
@@ -148,9 +160,13 @@ def _activation_checkpoint() -> ActivationCheckpointConfig:
 
 
 def _flash_baseline(*, enable_mxfp8: bool) -> TrainerConfig:
+    model_spec, model_overrides = build_model_spec_with_overrides(
+        model_registry("v4_flash_baseline")
+    )
     return TrainerConfig(
         hf_assets_path="./tests/assets/tokenizer/deepseekv4_tokenizer",
-        model_spec=model_registry("v4_flash_baseline"),
+        model_spec=model_spec,
+        model_overrides=model_overrides,
         debug=DebugConfig(print_config=True),
         comm=CommConfig(trace_buf_size=0),
         model_converters=ModelConvertersContainer.Config(
@@ -195,9 +211,13 @@ def deepseek_v4_flash_baseline_mxfp8() -> TrainerConfig:
 
 
 def _pro_baseline(*, enable_mxfp8: bool) -> TrainerConfig:
+    model_spec, model_overrides = build_model_spec_with_overrides(
+        model_registry("v4_pro_baseline")
+    )
     return TrainerConfig(
         hf_assets_path="./tests/assets/tokenizer/deepseek_v4_pro_tokenizer",
-        model_spec=model_registry("v4_pro_baseline"),
+        model_spec=model_spec,
+        model_overrides=model_overrides,
         debug=DebugConfig(print_config=True, moe_force_load_balance=True),
         comm=CommConfig(trace_buf_size=0),
         model_converters=ModelConvertersContainer.Config(
@@ -243,9 +263,13 @@ def deepseek_v4_pro_baseline_mxfp8() -> TrainerConfig:
 
 
 def _pro_20t_baseline(*, enable_mxfp8: bool) -> TrainerConfig:
+    model_spec, model_overrides = build_model_spec_with_overrides(
+        model_registry("v4_pro_20t_baseline")
+    )
     return TrainerConfig(
         hf_assets_path="./tests/assets/tokenizer/deepseekv4_tokenizer",
-        model_spec=model_registry("v4_pro_20t_baseline"),
+        model_spec=model_spec,
+        model_overrides=model_overrides,
         debug=DebugConfig(print_config=True, moe_force_load_balance=True),
         model_converters=ModelConvertersContainer.Config(
             converters=_default_converters(enable_mxfp8=enable_mxfp8)
@@ -290,9 +314,13 @@ def deepseek_v4_pro_20t_baseline_mxfp8() -> TrainerConfig:
 
 
 def deepseek_v4_smoketest() -> TrainerConfig:
+    model_spec, model_overrides = build_model_spec_with_overrides(
+        model_registry("smoketest")
+    )
     return TrainerConfig(
         hf_assets_path="./tests/assets/tokenizer/deepseekv4_tokenizer",
-        model_spec=model_registry("smoketest"),
+        model_spec=model_spec,
+        model_overrides=model_overrides,
         debug=DebugConfig(print_config=True),
         model_converters=ModelConvertersContainer.Config(
             converters=_default_converters(enable_mxfp8=False)

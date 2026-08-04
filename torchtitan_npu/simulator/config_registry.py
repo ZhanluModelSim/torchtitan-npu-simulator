@@ -8,32 +8,39 @@
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Callable
+from typing import TYPE_CHECKING
 
-from torchtitan_npu.models.deepseek_v4.config_registry import (
-    TrainerConfig as DeepSeekV4TrainerConfig,
-    _apply_mxfp8_fqns_override,
-    deepseek_v4_flash_baseline_bf16 as _deepseek_v4_flash_baseline_bf16,
-    deepseek_v4_flash_baseline_mxfp8 as _deepseek_v4_flash_baseline_mxfp8,
-    deepseek_v4_pro_20t_baseline_bf16 as _deepseek_v4_pro_20t_baseline_bf16,
-    deepseek_v4_pro_20t_baseline_mxfp8 as _deepseek_v4_pro_20t_baseline_mxfp8,
-    deepseek_v4_pro_baseline_bf16 as _deepseek_v4_pro_baseline_bf16,
-    deepseek_v4_pro_baseline_mxfp8 as _deepseek_v4_pro_baseline_mxfp8,
-    deepseek_v4_smoketest as _deepseek_v4_smoketest,
+from torchtitan_npu.models.deepseek_v4 import config_registry as _model_configs
+from torchtitan_npu.models.deepseek_v4.config_overrides import (
+    DeepSeekV4ModelOverrides,
+    apply_model_overrides,
 )
 from torchtitan_npu.simulator.trainer import SimulationConfig, SimulationTrainerConfig
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 
 @dataclasses.dataclass(kw_only=True, slots=True)
 class DeepSeekV4SimulationTrainerConfig(SimulationTrainerConfig):
+    model_overrides: DeepSeekV4ModelOverrides = dataclasses.field(
+        default_factory=DeepSeekV4ModelOverrides
+    )
     mxfp8_fqns: list[str] | None = None
 
     def __post_init__(self) -> None:
-        _apply_mxfp8_fqns_override(self.model_converters, self.mxfp8_fqns)
+        self.model_spec = apply_model_overrides(
+            self.model_spec,
+            self.model_overrides,
+        )
+        _model_configs._apply_mxfp8_fqns_override(
+            self.model_converters,
+            self.mxfp8_fqns,
+        )
 
 
 def _simulation_config(
-    factory: Callable[[], DeepSeekV4TrainerConfig],
+    factory: Callable[[], _model_configs.TrainerConfig],
     *,
     output_name: str,
 ) -> DeepSeekV4SimulationTrainerConfig:
@@ -50,48 +57,48 @@ def _simulation_config(
 
 def deepseek_v4_flash_baseline_bf16() -> SimulationTrainerConfig:
     return _simulation_config(
-        _deepseek_v4_flash_baseline_bf16,
+        _model_configs.deepseek_v4_flash_baseline_bf16,
         output_name="deepseek_v4_flash_baseline_bf16",
     )
 
 
 def deepseek_v4_flash_baseline_mxfp8() -> SimulationTrainerConfig:
     return _simulation_config(
-        _deepseek_v4_flash_baseline_mxfp8,
+        _model_configs.deepseek_v4_flash_baseline_mxfp8,
         output_name="deepseek_v4_flash_baseline_mxfp8",
     )
 
 
 def deepseek_v4_pro_baseline_bf16() -> SimulationTrainerConfig:
     return _simulation_config(
-        _deepseek_v4_pro_baseline_bf16,
+        _model_configs.deepseek_v4_pro_baseline_bf16,
         output_name="deepseek_v4_pro_baseline_bf16",
     )
 
 
 def deepseek_v4_pro_baseline_mxfp8() -> SimulationTrainerConfig:
     return _simulation_config(
-        _deepseek_v4_pro_baseline_mxfp8,
+        _model_configs.deepseek_v4_pro_baseline_mxfp8,
         output_name="deepseek_v4_pro_baseline_mxfp8",
     )
 
 
 def deepseek_v4_pro_20t_baseline_bf16() -> SimulationTrainerConfig:
     return _simulation_config(
-        _deepseek_v4_pro_20t_baseline_bf16,
+        _model_configs.deepseek_v4_pro_20t_baseline_bf16,
         output_name="deepseek_v4_pro_20t_baseline_bf16",
     )
 
 
 def deepseek_v4_pro_20t_baseline_mxfp8() -> SimulationTrainerConfig:
     return _simulation_config(
-        _deepseek_v4_pro_20t_baseline_mxfp8,
+        _model_configs.deepseek_v4_pro_20t_baseline_mxfp8,
         output_name="deepseek_v4_pro_20t_baseline_mxfp8",
     )
 
 
 def deepseek_v4_smoketest() -> SimulationTrainerConfig:
     return _simulation_config(
-        _deepseek_v4_smoketest,
+        _model_configs.deepseek_v4_smoketest,
         output_name="deepseek_v4_smoketest",
     )

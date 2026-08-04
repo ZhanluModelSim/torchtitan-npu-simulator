@@ -193,7 +193,43 @@ NGPU=384 python3 -m torchtitan_npu.entry \
 > - `--hf_assets_path` 指定 tokenizer 路径，用仓库内置的 `deepseekv3_tokenizer` 即可（见上一步说明）。
 > - CLI 对 PP/TP/CP/EP/DP 的覆盖会在选择模式、计算进程数和构建 mesh 前统一生效。
 
-### 4. 获取输出文件
+### 4. 覆盖 DeepSeek-V4 模型参数
+
+DeepSeek-V4 的内置配置作为 preset 使用，模型参数可通过
+`--model-overrides.<字段名>` 覆盖。字段名与
+`DeepSeekV4Model.Config`、`MoEArgs` 保持一致，CLI 中仅将下划线转换为
+连字符：
+
+```bash
+NGPU=8 python3 -m torchtitan_npu.entry \
+    --module torchtitan_npu.simulator \
+    --config deepseek_v4_smoketest \
+    --model-overrides.n-layers 3 \
+    --model-overrides.dim 192 \
+    --model-overrides.compress-ratios 1 4 128 \
+    --model-overrides.moe-args.num-experts 16 \
+    --model-overrides.moe-args.top-k 4 \
+    --model-overrides.moe-args.num-expert-groups 4 \
+    --model-overrides.moe-args.num-limited-groups None
+```
+
+布尔字段使用 `--model-overrides.<字段名>` 和
+`--model-overrides.no-<字段名>`；可空字段传 `None`。运行以下命令可查看
+当前版本支持的全部字段及所选 preset 的默认值：
+
+```bash
+python3 -m torchtitan_npu.entry \
+    --module torchtitan_npu.simulator \
+    --config deepseek_v4_smoketest \
+    --help
+```
+
+配置解析阶段会检查正数范围、`compress_ratios` 与 `n_layers` 的长度、
+head/group 整除关系、RoPE head 维度、Hadamard 维度，以及 MoE 的
+`top_k`、专家数和专家分组关系。修改 `n_layers` 时必须同时提供相同数量的
+`compress_ratios`。
+
+### 5. 获取输出文件
 
 仿真输出默认写入项目目录下的 `simulator_output/<配置名>/`。由于启动容器时已将项目目录挂载到 `/workspace`，输出文件会直接同步到宿主机，无需额外拷贝：
 
