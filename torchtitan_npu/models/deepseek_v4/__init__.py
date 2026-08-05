@@ -41,6 +41,7 @@ from .attention import (
 )
 from .compressor import IndexSelection
 from .model import DeepSeekV4Model, DeepSeekV4TransformerBlock
+from .mhc import HcPost, HcPre
 from .moe import DeepSeekV4MoE, DeepSeekV4Router
 from .parallelize import parallelize_deepseek_v4
 from .state_dict_adapter import DeepSeekV4StateDictAdapter
@@ -482,6 +483,14 @@ def _build_v4_layers(
                 norm_eps=norm_eps,
                 sinkhorn_iters=sinkhorn_iters,
                 hc_eps=hc_eps,
+                hc_pre=HcPre.Config(
+                    hc_mult=hc_mult,
+                    dim=dim,
+                    sinkhorn_iters=sinkhorn_iters,
+                    eps=hc_eps,
+                    norm_eps=norm_eps,
+                ),
+                hc_post=HcPost.Config(),
             )
         )
     return layers

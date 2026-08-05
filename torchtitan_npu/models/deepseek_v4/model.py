@@ -28,6 +28,8 @@ class DeepSeekV4TransformerBlock(TransformerBlock):
         norm_eps: float = 1e-6
         sinkhorn_iters: int = 20
         hc_eps: float = 1e-6
+        hc_pre: HcPre.Config
+        hc_post: HcPost.Config
 
     def __init__(self, config: Config):
         super().__init__()
@@ -62,14 +64,8 @@ class DeepSeekV4TransformerBlock(TransformerBlock):
         self.hc_attn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
         self.hc_ffn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
 
-        self.hc_pre = HcPre.Config(
-            hc_mult=cfg.hc_mult,
-            dim=cfg.dim,
-            sinkhorn_iters=cfg.sinkhorn_iters,
-            eps=cfg.hc_eps,
-            norm_eps=cfg.norm_eps,
-        ).build()
-        self.hc_post = HcPost.Config().build()
+        self.hc_pre = cfg.hc_pre.build()
+        self.hc_post = cfg.hc_post.build()
 
         if self._param_init is None:
             self._param_init = {}

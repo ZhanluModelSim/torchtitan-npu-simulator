@@ -75,7 +75,7 @@ Float8、LoRA 等 converter 在配置构造期间先执行，override 随后看�
 torchtitan_npu/override/
 ├── common/           # 模型无关的 NPU 兼容和融合实现
 ├── deepseek_v3_2/    # DeepSeek-V3.2 模型专属实现
-└── deepseek_v4/      # DeepSeek-V4 Golden、RoPE 和 DSA 实现
+└── deepseek_v4/      # DeepSeek-V4 Golden、RoPE、DSA 和 MHC 实现
 ```
 
 常用的模型无关 target：
@@ -111,6 +111,31 @@ torchtitan_npu.override.deepseek_v4.varlen_dsa.npu_dsv4_packed_mask_handler_over
 ```
 
 `dsa_sparse_attention_golden` 与 `npu_smla_tnd_override` 声明同一个 `DSAFlexAttention.Config` 节点，不能同时启用。DSV4 compat RoPE 与 fused RoPE、Golden RMSNorm 与通用融合 RMSNorm 也分别互斥。TND 数据约定见 [DeepSeek-V4 TND 适配](../../docs/TND.md)。
+
+### DeepSeek-V4 MHC
+
+DeepSeek-V4 MHC 提供两个可独立启用的融合 override：
+
+```text
+torchtitan_npu.override.deepseek_v4.mhc.npu_mhc_pre
+torchtitan_npu.override.deepseek_v4.mhc.npu_mhc_post
+```
+
+| Override | 替换组件 | 融合算子 |
+| --- | --- | --- |
+| `npu_mhc_pre` | `HcPre` | `cann_ops_transformer.ops.mhc_pre_sinkhorn` |
+| `npu_mhc_post` | `HcPost` | `cann_ops_transformer.ops.mhc_post` |
+
+两个 replacement 分别继承源 `HcPre` 和 `HcPost`，保留原 Config、初始化和模块结构，只重写 `forward`。`HcSplitSinkhorn` 和 `HcHead` 继续使用源实现；源 `HcPre.__init__` 仍会创建 `HcSplitSinkhorn`，但融合 Pre 路径不会执行它的 `forward`。
+
+当前 [`scripts/run_train_dsv4.sh`](../../scripts/run_train_dsv4.sh) 没有默认加入 MHC override，需要在完整的 `OVERRIDE_IMPORTS` 中显式添加。该环境变量一旦设置，会覆盖脚本根据 `ATTENTION` 和 `BASE_OVERRIDES` 自动生成的整个列表，因此不能只填写 MHC 两项而遗漏 attention、mask handler、RoPE 等原有入口。也可以在 Python 配置中追加：
+
+```python
+cfg.override.imports.extend([
+    "torchtitan_npu.override.deepseek_v4.mhc.npu_mhc_pre",
+    "torchtitan_npu.override.deepseek_v4.mhc.npu_mhc_post",
+])
+```
 
 ## Override 与 package patch
 
