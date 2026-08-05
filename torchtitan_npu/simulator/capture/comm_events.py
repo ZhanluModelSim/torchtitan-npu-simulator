@@ -14,6 +14,7 @@ grad all-reduce, broadcast)."""
 from __future__ import annotations
 
 import itertools
+import contextvars
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Iterator
@@ -27,6 +28,25 @@ from torchtitan_npu.simulator.capture.tensor_utils import dtype_to_str, tensor_v
 from torchtitan_npu.simulator.memory.records import FSDPResidencyEvent
 
 _event_counter = itertools.count()
+_default_collective_context: contextvars.ContextVar[
+    tuple[str, object] | None
+] = contextvars.ContextVar(
+    "simulator_default_collective_context",
+    default=None,
+)
+
+
+@contextmanager
+def default_collective_context(
+    dimension: str,
+    group: object,
+) -> Iterator[None]:
+    """Retain the logical group when fake DTensor lowers it to WORLD/None."""
+    token = _default_collective_context.set((dimension, group))
+    try:
+        yield
+    finally:
+        _default_collective_context.reset(token)
 
 
 def _should_intercept(group: object) -> bool:
@@ -263,6 +283,16 @@ def _resolve_world_size(group: object) -> int:
     collectives API accepts: ProcessGroup, DeviceMesh, list of ranks, or
     group-name string. Returns 1 if unresolvable (e.g. None or
     dist not initialized)."""
+    active_context = _default_collective_context.get()
+    group_name = getattr(group, "group_name", None)
+    if active_context is not None and (
+        group is None
+        or group is dist.group.WORLD
+        or isinstance(group, (list, tuple))
+        or str(group) == "default"
+        or str(group_name) == "default"
+    ):
+        return _resolve_world_size(active_context[1])
     if group is None:
         return dist.get_world_size() if dist.is_initialized() else 1
     # ProcessGroup
@@ -293,6 +323,16 @@ def _resolve_world_size(group: object) -> int:
 def _group_name(group: object) -> str:
     """Extract a group-name string from any group type for RankTable
     dimension attribution. Falls back to "default" when unresolvable."""
+    active_context = _default_collective_context.get()
+    raw_group_name = getattr(group, "group_name", None)
+    if active_context is not None and (
+        group is None
+        or group is dist.group.WORLD
+        or isinstance(group, (list, tuple))
+        or str(group) == "default"
+        or str(raw_group_name) == "default"
+    ):
+        return active_context[0]
     if group is None:
         return "default"
     # ProcessGroup
@@ -319,6 +359,16 @@ def _resolve_comm_ranks(group: object) -> list[list[int]]:
     communication domain.  Returns a list of groups, where each group is a
     list of global rank IDs (e.g. ``[[0,1,2,3],[4,5,6,7]]`` for two TP
     groups of size 4).  Returns ``[]`` when unresolvable."""
+    active_context = _default_collective_context.get()
+    group_name = getattr(group, "group_name", None)
+    if active_context is not None and (
+        group is None
+        or group is dist.group.WORLD
+        or isinstance(group, (list, tuple))
+        or str(group) == "default"
+        or str(group_name) == "default"
+    ):
+        return _resolve_comm_ranks(active_context[1])
     if group is None:
         ws = dist.get_world_size() if dist.is_initialized() else 1
         return [list(range(ws))] if ws > 1 else []
@@ -461,6 +511,168 @@ def _record_comm_with_l0(
     return event
 
 
+def _uncaptured_empty(
+    shape: tuple[int, ...] | list[int],
+    *,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    """Create a collective output without adding an allocator L0 node."""
+    from torchtitan_npu.simulator.capture.dispatch_capture import (
+        get_active_capture,
+    )
+
+    capture = get_active_capture()
+    if capture is None:
+        return torch.empty(shape, dtype=dtype, device=device)
+    with capture.suspend_recording():
+        return torch.empty(shape, dtype=dtype, device=device)
+
+
+def _require_sequence_fallback(comm_event: CommEvent) -> None:
+    """Mark a synchronous autograd collective whose handoff is C++-internal."""
+    from torchtitan_npu.simulator.capture.dispatch_capture import (
+        get_active_capture,
+    )
+
+    capture = get_active_capture()
+    if capture is None or not comm_event.op_id:
+        return
+    for event in reversed(capture._events):
+        if event.op_id == comm_event.op_id:
+            event.extra_annotations[
+                "sync_collective_sequence_fallback"
+            ] = True
+            return
+
+
+class _SimAllGatherTensorAutograd(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, tensor, gather_dim, group, recorder):  # noqa: ANN001
+        output_shape = list(tensor.shape)
+        output_shape[gather_dim] *= _resolve_world_size(group)
+        output = _uncaptured_empty(
+            output_shape,
+            dtype=tensor.dtype,
+            device=tensor.device,
+        )
+        _record_comm_with_l0(recorder, "allgather", group, tensor, output)
+        ctx.group = group
+        ctx.recorder = recorder
+        ctx.input_shape = tuple(tensor.shape)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):  # noqa: ANN001
+        grad_input = _uncaptured_empty(
+            ctx.input_shape,
+            dtype=grad_output.dtype,
+            device=grad_output.device,
+        )
+        comm_event = _record_comm_with_l0(
+            ctx.recorder,
+            "reduce_scatter",
+            ctx.group,
+            grad_output,
+            grad_input,
+        )
+        _require_sequence_fallback(comm_event)
+        return grad_input, None, None, None
+
+
+class _SimReduceScatterTensorAutograd(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, tensor, scatter_dim, group, recorder):  # noqa: ANN001
+        output_shape = list(tensor.shape)
+        world_size = _resolve_world_size(group)
+        dim_size = output_shape[scatter_dim]
+        if world_size > 1 and dim_size % world_size != 0:
+            raise ValueError(
+                f"reduce_scatter: scatter_dim size {dim_size} is not "
+                f"divisible by world_size {world_size}"
+            )
+        output_shape[scatter_dim] = dim_size // world_size
+        output = _uncaptured_empty(
+            output_shape,
+            dtype=tensor.dtype,
+            device=tensor.device,
+        )
+        _record_comm_with_l0(
+            recorder,
+            "reduce_scatter",
+            group,
+            tensor,
+            output,
+        )
+        ctx.group = group
+        ctx.recorder = recorder
+        ctx.input_shape = tuple(tensor.shape)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):  # noqa: ANN001
+        grad_input = _uncaptured_empty(
+            ctx.input_shape,
+            dtype=grad_output.dtype,
+            device=grad_output.device,
+        )
+        _record_comm_with_l0(
+            ctx.recorder,
+            "allgather",
+            ctx.group,
+            grad_output,
+            grad_input,
+        )
+        return grad_input, None, None, None
+
+
+class _SimAllToAllSingleAutograd(torch.autograd.Function):
+    @staticmethod
+    def forward(  # noqa: ANN001
+        ctx,
+        tensor,
+        output_split_sizes,
+        input_split_sizes,
+        group,
+        recorder,
+    ):
+        output_shape = list(tensor.shape)
+        if output_split_sizes:
+            output_shape[0] = int(sum(output_split_sizes))
+        output = _uncaptured_empty(
+            output_shape,
+            dtype=tensor.dtype,
+            device=tensor.device,
+        )
+        _record_comm_with_l0(
+            recorder,
+            "all_to_all",
+            group,
+            tensor,
+            output,
+        )
+        ctx.group = group
+        ctx.recorder = recorder
+        ctx.input_shape = tuple(tensor.shape)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):  # noqa: ANN001
+        grad_input = _uncaptured_empty(
+            ctx.input_shape,
+            dtype=grad_output.dtype,
+            device=grad_output.device,
+        )
+        _record_comm_with_l0(
+            ctx.recorder,
+            "all_to_all",
+            ctx.group,
+            grad_output,
+            grad_input,
+        )
+        return grad_input, None, None, None, None
+
+
 _active_recorder: CommEventRecorder | None = None
 
 
@@ -519,7 +731,13 @@ def capture_fake_collectives(
     def patched_all_reduce(tensor, op=dist.ReduceOp.SUM, group=None, async_op=False):  # noqa: ANN001
         if not _should_intercept(group):
             return orig_all_reduce(tensor, op=op, group=group, async_op=async_op)
-        _record_comm_with_l0(recorder, "allreduce", group, tensor)
+        comm_event = _record_comm_with_l0(
+            recorder,
+            "allreduce",
+            group,
+            tensor,
+        )
+        _require_sequence_fallback(comm_event)
         return _NoOpWork() if async_op else None
 
     def patched_all_gather_into_tensor(output_tensor, input_tensor, group=None, async_op=False):  # noqa: ANN001
@@ -566,7 +784,15 @@ def capture_fake_collectives(
 
     def patched_funcol_all_reduce(self_tensor, reduceOp, group, tag=""):  # noqa: ANN001, N803
         out = self_tensor.clone()
-        _record_comm_with_l0(recorder, "allreduce", group, self_tensor, out); return out
+        comm_event = _record_comm_with_l0(
+            recorder,
+            "allreduce",
+            group,
+            self_tensor,
+            out,
+        )
+        _require_sequence_fallback(comm_event)
+        return out
 
     def patched_funcol_all_gather_tensor(self_tensor, gather_dim, group, tag=""):  # noqa: ANN001
         world_size = _resolve_world_size(group)
@@ -596,33 +822,29 @@ def capture_fake_collectives(
         _record_comm_with_l0(recorder, "all_to_all", group, self_tensor, out); return out
 
     def patched_funcol_all_gather_tensor_autograd(self_tensor, gather_dim, group, tag=""):  # noqa: ANN001
-        world_size = _resolve_world_size(group)
-        out_shape = list(self_tensor.shape)
-        if gather_dim < len(out_shape):
-            out_shape[gather_dim] *= world_size
-        out = torch.empty(out_shape, dtype=self_tensor.dtype, device=self_tensor.device)
-        _record_comm_with_l0(recorder, "allgather", group, self_tensor, out); return out
+        return _SimAllGatherTensorAutograd.apply(
+            self_tensor,
+            gather_dim,
+            group,
+            recorder,
+        )
 
     def patched_funcol_reduce_scatter_tensor_autograd(self_tensor, reduceOp, scatter_dim, group, tag=""):  # noqa: ANN001, N803
-        world_size = _resolve_world_size(group)
-        out_shape = list(self_tensor.shape)
-        if scatter_dim < len(out_shape):
-            dim_size = out_shape[scatter_dim]
-            if world_size > 1 and dim_size % world_size != 0:
-                raise ValueError(
-                    f"reduce_scatter: scatter_dim size {dim_size} is not divisible by "
-                    f"world_size {world_size}; check parallelism config / tensor shapes"
-                )
-            out_shape[scatter_dim] = dim_size // world_size
-        out = torch.empty(out_shape, dtype=self_tensor.dtype, device=self_tensor.device)
-        _record_comm_with_l0(recorder, "reduce_scatter", group, self_tensor, out); return out
+        return _SimReduceScatterTensorAutograd.apply(
+            self_tensor,
+            scatter_dim,
+            group,
+            recorder,
+        )
 
     def patched_funcol_all_to_all_single_autograd(self_tensor, output_split_sizes, input_split_sizes, group, tag=""):  # noqa: ANN001
-        out_shape = list(self_tensor.shape)
-        if output_split_sizes:
-            out_shape[0] = int(sum(output_split_sizes))
-        out = torch.empty(out_shape, dtype=self_tensor.dtype, device=self_tensor.device)
-        _record_comm_with_l0(recorder, "all_to_all", group, self_tensor, out); return out
+        return _SimAllToAllSingleAutograd.apply(
+            self_tensor,
+            output_split_sizes,
+            input_split_sizes,
+            group,
+            recorder,
+        )
 
     dist.all_reduce = patched_all_reduce
     dist.all_gather_into_tensor = patched_all_gather_into_tensor

@@ -38,7 +38,9 @@ def kimi_k3_smoketest() -> TrainerConfig:
         hf_assets_path="./tests/assets/tokenizer",
         model_spec=model_registry("debug"),
         debug=DebugConfig(print_config=True),
-        model_converters=ModelConvertersContainer.Config(converters=[]),
+        model_converters=ModelConvertersContainer.Config(
+            converters=_default_converters()
+        ),
         metrics=MetricsProcessor.Config(log_freq=1),
         dataloader=HuggingFaceTextDataLoader.Config(dataset="c4_test"),
         optimizer=OptimizerConfig(

@@ -17,7 +17,9 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.distributed.tensor import DTensor
 
+from torchtitan.models.common.rmsnorm import RMSNorm
 from torchtitan.protocols.module import Module
 
 
@@ -40,9 +42,19 @@ class ShortConvolution(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: (batch, seq_len, hidden_size)
-        residual = x
         x_t = x.transpose(1, 2)  # (batch, hidden_size, seq_len)
-        x_t = self.conv(x_t)[..., : x.shape[1]]  # causal: trim right padding
+        weight = self.conv.weight
+        if isinstance(weight, DTensor):
+            weight = weight.to_local()
+        x_t = F.conv1d(
+            x_t,
+            weight,
+            bias=None,
+            stride=self.conv.stride,
+            padding=self.conv.padding,
+            dilation=self.conv.dilation,
+            groups=x_t.shape[1],
+        )[..., : x.shape[1]]
         x = x_t.transpose(1, 2)
         if self.activation == "silu":
             x = F.silu(x)
@@ -172,14 +184,24 @@ class KimiDeltaAttention(nn.Module):
         """Chunk-wise KDA forward via triton-ascend-kernels fused operator."""
         from triton_ascend_kernels.attention.fla.kda.chunk import chunk_kda
 
+        A_log = (
+            self.A_log.to_local()
+            if isinstance(self.A_log, DTensor)
+            else self.A_log
+        )
+        dt_bias = (
+            self.dt_bias.to_local()
+            if isinstance(self.dt_bias, DTensor)
+            else self.dt_bias
+        )
         o, _ = chunk_kda(
             q=q,
             k=k,
             v=v,
             g=g,
             beta=beta,
-            A_log=self.A_log,
-            dt_bias=self.dt_bias,
+            A_log=A_log,
+            dt_bias=dt_bias,
             initial_state=None,
             output_final_state=False,
             use_qk_l2norm_in_kernel=True,
@@ -226,14 +248,20 @@ class KimiGatedMLA(nn.Module):
 
         # Query projection with LoRA
         self.q_a_proj = nn.Linear(self.hidden_size, self.q_lora_rank, bias=False)
-        self.q_a_layernorm = nn.RMSNorm(self.q_lora_rank, eps=config.norm_eps)
+        self.q_a_layernorm = RMSNorm.Config(
+            normalized_shape=self.q_lora_rank,
+            eps=config.norm_eps,
+        ).build()
         self.q_b_proj = nn.Linear(self.q_lora_rank, self.num_heads * self.q_head_dim, bias=False)
 
         # KV projection with MQA compression
         self.kv_a_proj_with_mqa = nn.Linear(
             self.hidden_size, self.kv_lora_rank + self.qk_rope_head_dim, bias=False
         )
-        self.kv_a_layernorm = nn.RMSNorm(self.kv_lora_rank, eps=config.norm_eps)
+        self.kv_a_layernorm = RMSNorm.Config(
+            normalized_shape=self.kv_lora_rank,
+            eps=config.norm_eps,
+        ).build()
         self.kv_b_proj = nn.Linear(
             self.kv_lora_rank,
             self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
@@ -266,8 +294,8 @@ class KimiGatedMLA(nn.Module):
         kv = kv.view(batch_size, seq_len, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
         k_nope, v = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
 
-        # RoPE on q_rope and k_rope (simplified: apply rotary in-place)
-        # In full implementation, use torchtitan's RoPE infrastructure
+        # Kimi K3 sets mla_use_nope=True, so the legacy q_rope/k_rope slices
+        # participate in attention without rotary position encoding.
         k_rope_expanded = k_rope.unsqueeze(2).expand(-1, -1, self.num_heads, -1)
 
         query = torch.cat([q_nope, q_rope], dim=-1)

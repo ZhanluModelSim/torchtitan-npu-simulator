@@ -20,13 +20,13 @@ from .model import KimiK3Model, KimiK3TransformerBlock
 from .parallelize import parallelize_kimi_k3
 from .state_dict_adapter import KimiK3StateDictAdapter
 
-# Default KDA layer indices for full 93-layer model (0-indexed)
+# KDA layer indices from the official config, converted from 1-based to 0-based.
 _FULL_KDA_LAYERS = [
-    1, 2, 3, 5, 6, 7, 9, 10, 11, 13, 14, 15, 17, 18, 19,
-    21, 22, 23, 25, 26, 27, 29, 30, 31, 33, 34, 35, 37, 38, 39,
-    41, 42, 43, 45, 46, 47, 49, 50, 51, 53, 54, 55, 57, 58, 59,
-    61, 62, 63, 65, 66, 67, 69, 70, 71, 73, 74, 75, 77, 78, 79,
-    81, 82, 83, 85, 86, 87, 89, 90, 91,
+    0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14, 16, 17, 18,
+    20, 21, 22, 24, 25, 26, 28, 29, 30, 32, 33, 34, 36, 37, 38,
+    40, 41, 42, 44, 45, 46, 48, 49, 50, 52, 53, 54, 56, 57, 58,
+    60, 61, 62, 64, 65, 66, 68, 69, 70, 72, 73, 74, 76, 77, 78,
+    80, 81, 82, 84, 85, 86, 88, 89, 90,
 ]
 
 
@@ -41,6 +41,7 @@ def _build_kimi_k3_layers(
     qk_nope_head_dim: int,
     qk_rope_head_dim: int,
     v_head_dim: int,
+    kda_head_dim: int,
     dense_hidden_dim: int,
     moe_inter_dim: int,
     num_experts: int,
@@ -57,11 +58,12 @@ def _build_kimi_k3_layers(
     conv_kernel_size: int = 4,
     gate_lower_bound: float | None = -5.0,
     use_full_rank_gate: bool = True,
+    attn_res_block_size: int | None = 12,
 ) -> list[KimiK3TransformerBlock.Config]:
     """Build per-layer TransformerBlock configs with hybrid KDA/MLA attention."""
     if kda_layers is None:
-        # Default pattern: every 4th layer (starting from index 3) is MLA
-        kda_layers = [i for i in range(n_layers) if (i + 1) % 4 != 0 and i > 0]
+        # Official pattern uses 1-based layer numbers: three KDA, then one MLA.
+        kda_layers = [i for i in range(n_layers) if (i + 1) % 4 != 0]
 
     layers = []
     for layer_id in range(n_layers):
@@ -70,7 +72,7 @@ def _build_kimi_k3_layers(
             attn_cfg = KimiDeltaAttention.Config(
                 dim=dim,
                 num_heads=n_heads,
-                head_dim=qk_nope_head_dim + qk_rope_head_dim,
+                head_dim=kda_head_dim,
                 conv_kernel_size=conv_kernel_size,
                 gate_lower_bound=gate_lower_bound,
                 use_full_rank_gate=use_full_rank_gate,
@@ -91,7 +93,7 @@ def _build_kimi_k3_layers(
         # FFN: dense for first n_dense_layers, MoE for the rest
         is_dense = layer_id < n_dense_layers
         if is_dense:
-            ffn = KimiMLP(
+            ffn = KimiMLP.Config(
                 hidden_size=dim,
                 intermediate_size=dense_hidden_dim,
                 beta=situ_beta,
@@ -123,6 +125,8 @@ def _build_kimi_k3_layers(
                 moe=moe_cfg,
                 norm_eps=norm_eps,
                 dim=dim,
+                layer_id=layer_id,
+                attn_res_block_size=attn_res_block_size,
             )
         )
     return layers
@@ -140,6 +144,7 @@ def _make_kimi_k3_model_config(
     qk_nope_head_dim: int = 128,
     qk_rope_head_dim: int = 64,
     v_head_dim: int = 128,
+    kda_head_dim: int = 128,
     dense_hidden_dim: int = 33792,
     moe_inter_dim: int = 3072,
     num_experts: int = 896,
@@ -153,6 +158,7 @@ def _make_kimi_k3_model_config(
     situ_beta: float = 4.0,
     situ_linear_beta: float | None = 25.0,
     norm_eps: float = 1e-5,
+    attn_res_block_size: int | None = 12,
 ) -> KimiK3Model.Config:
     layers = _build_kimi_k3_layers(
         n_layers=n_layers,
@@ -164,6 +170,7 @@ def _make_kimi_k3_model_config(
         qk_nope_head_dim=qk_nope_head_dim,
         qk_rope_head_dim=qk_rope_head_dim,
         v_head_dim=v_head_dim,
+        kda_head_dim=kda_head_dim,
         dense_hidden_dim=dense_hidden_dim,
         moe_inter_dim=moe_inter_dim,
         num_experts=num_experts,
@@ -177,12 +184,14 @@ def _make_kimi_k3_model_config(
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
         norm_eps=norm_eps,
+        attn_res_block_size=attn_res_block_size,
     )
     return KimiK3Model.Config(
         vocab_size=vocab_size,
         dim=dim,
         layers=layers,
         norm_eps=norm_eps,
+        attn_res_block_size=attn_res_block_size,
     )
 
 
@@ -199,13 +208,14 @@ def _debug_model() -> KimiK3Model.Config:
         qk_nope_head_dim=16,
         qk_rope_head_dim=16,
         v_head_dim=16,
+        kda_head_dim=32,
         dense_hidden_dim=512,
         moe_inter_dim=128,
         num_experts=8,
         num_shared_experts=2,
         router_top_k=3,
         routed_expert_hidden_size=128,
-        kda_layers=[1, 2, 3],  # layers 1,2,3 are KDA; layer 0 is MLA (dense)
+        kda_layers=[0, 1, 2],
     )
 
 

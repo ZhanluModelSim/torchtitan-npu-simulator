@@ -3,11 +3,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Kimi K3 feed-forward modules: SiTU-GLU activation and Stable LatentMoE.
-
-Fork reason: SiTU-GLU and LatentMoE are novel to Kimi K3, not in upstream torchtitan.
-Reference: MindSpeed-MM mindspeed_mm/fsdp/models/kimi_k3/modeling_kimi_linear.py
-"""
+"""Kimi K3 feed-forward modules: SiTU-GLU and Stable LatentMoE."""
 
 import math
 from dataclasses import dataclass
@@ -15,16 +11,14 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.distributed.tensor import DTensor, Partial
 
+from torchtitan.models.common.rmsnorm import RMSNorm
 from torchtitan.protocols.module import Module
 
 
 class SituGLU(nn.Module):
-    """SiTU-GLU activation: beta * tanh(gate/beta) * sigmoid(gate) * up.
-
-    When linear_beta is set, up is also transformed:
-    up = linear_beta * tanh(up / linear_beta)
-    """
+    """SiTU-GLU activation used by both dense and routed experts."""
 
     def __init__(self, beta: float = 4.0, linear_beta: float | None = 25.0):
         super().__init__()
@@ -32,54 +26,154 @@ class SituGLU(nn.Module):
         self.linear_beta = linear_beta
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        d = x.shape[-1] // 2
-        gate = x[..., :d].float()
-        up = x[..., d:].float()
-        situ_a = self.beta * torch.tanh(gate / self.beta) * torch.sigmoid(gate)
+        gate, up = x.chunk(2, dim=-1)
+        gate_float = gate.float()
+        up_float = up.float()
+        activated_gate = (
+            self.beta
+            * torch.tanh(gate_float / self.beta)
+            * torch.sigmoid(gate_float)
+        )
         if self.linear_beta is not None:
-            up = self.linear_beta * torch.tanh(up / self.linear_beta)
-        return (situ_a * up).to(x.dtype)
+            up_float = self.linear_beta * torch.tanh(
+                up_float / self.linear_beta
+            )
+        return (activated_gate * up_float).to(x.dtype)
 
 
-class KimiBlockSparseMLP(nn.Module):
-    """Per-expert MLP with SiTU-GLU activation.
+class KimiMLP(Module):
+    """Dense/shared Kimi MLP with SiTU-GLU."""
 
-    Weight layout matches MindSpeed-MM's KimiBlockSparseMLP:
-    w1 (gate), w3 (up), w2 (down).
-    """
+    @dataclass(kw_only=True, slots=True)
+    class Config(Module.Config):
+        hidden_size: int
+        intermediate_size: int
+        beta: float = 4.0
+        linear_beta: float | None = 25.0
 
-    def __init__(self, hidden_size: int, intermediate_size: int, beta: float = 4.0, linear_beta: float | None = 25.0):
+    def __init__(self, config: Config):
         super().__init__()
-        self.w1 = nn.Linear(hidden_size, intermediate_size, bias=False)
-        self.w2 = nn.Linear(intermediate_size, hidden_size, bias=False)
-        self.w3 = nn.Linear(hidden_size, intermediate_size, bias=False)
-        self.act_fn = SituGLU(beta=beta, linear_beta=linear_beta)
+        self.gate_proj = nn.Linear(
+            config.hidden_size,
+            config.intermediate_size,
+            bias=False,
+        )
+        self.up_proj = nn.Linear(
+            config.hidden_size,
+            config.intermediate_size,
+            bias=False,
+        )
+        self.down_proj = nn.Linear(
+            config.intermediate_size,
+            config.hidden_size,
+            bias=False,
+        )
+        self.act_fn = SituGLU(
+            beta=config.beta,
+            linear_beta=config.linear_beta,
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate_up = torch.cat([self.w1(x), self.w3(x)], dim=-1)
-        return self.w2(self.act_fn(gate_up))
-
-
-class KimiMLP(nn.Module):
-    """Standard MLP for shared experts with SiTU-GLU."""
-
-    def __init__(self, hidden_size: int, intermediate_size: int, beta: float = 4.0, linear_beta: float | None = 25.0):
-        super().__init__()
-        self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
-        self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
-        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
-        self.act_fn = SituGLU(beta=beta, linear_beta=linear_beta)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate_up = torch.cat([self.gate_proj(x), self.up_proj(x)], dim=-1)
+        gate_up = torch.cat((self.gate_proj(x), self.up_proj(x)), dim=-1)
         return self.down_proj(self.act_fn(gate_up))
 
 
-class KimiMoEGate(nn.Module):
-    """MoE router with sigmoid scoring + e_score_correction_bias (noaux_tc).
+class KimiGroupedExperts(nn.Module):
+    """Routed experts in torchtitan's ``[E, out, in]`` weight layout."""
 
-    Supports group topk selection when num_expert_group > 1.
-    """
+    def __init__(
+        self,
+        *,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        beta: float,
+        linear_beta: float | None,
+    ):
+        super().__init__()
+        self.num_experts = num_experts
+        self.w1 = nn.Parameter(
+            torch.empty(num_experts, intermediate_size, hidden_size)
+        )
+        self.w2 = nn.Parameter(
+            torch.empty(num_experts, hidden_size, intermediate_size)
+        )
+        self.w3 = nn.Parameter(
+            torch.empty(num_experts, intermediate_size, hidden_size)
+        )
+        self.act_fn = SituGLU(beta=beta, linear_beta=linear_beta)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        num_tokens_per_expert: torch.Tensor,
+    ) -> torch.Tensor:
+        if isinstance(self.w1, DTensor):
+            w1 = self.w1.to_local()
+            w2 = self.w2.to_local()
+            w3 = self.w3.to_local()
+        else:
+            w1, w2, w3 = self.w1, self.w2, self.w3
+
+        if x.device.type == "cpu":
+            return self._forward_loop(x, num_tokens_per_expert, w1, w2, w3)
+
+        offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
+        gate = torch._grouped_mm(
+            x.bfloat16(),
+            w1.bfloat16().transpose(-2, -1),
+            offs=offsets,
+        )
+        up = torch._grouped_mm(
+            x.bfloat16(),
+            w3.bfloat16().transpose(-2, -1),
+            offs=offsets,
+        )
+        hidden = self.act_fn(torch.cat((gate, up), dim=-1))
+        return torch._grouped_mm(
+            hidden,
+            w2.bfloat16().transpose(-2, -1),
+            offs=offsets,
+        ).type_as(x)
+
+    def _forward_loop(
+        self,
+        x: torch.Tensor,
+        num_tokens_per_expert: torch.Tensor,
+        w1: torch.Tensor,
+        w2: torch.Tensor,
+        w3: torch.Tensor,
+    ) -> torch.Tensor:
+        token_counts = num_tokens_per_expert.to(torch.int64).tolist()
+        outputs = []
+        offset = 0
+        for expert_idx, token_count in enumerate(token_counts):
+            expert_input = x[offset : offset + token_count]
+            gate = F.linear(expert_input, w1[expert_idx])
+            up = F.linear(expert_input, w3[expert_idx])
+            outputs.append(
+                F.linear(
+                    self.act_fn(torch.cat((gate, up), dim=-1)),
+                    w2[expert_idx],
+                )
+            )
+            offset += token_count
+        return torch.cat(outputs, dim=0) if outputs else torch.empty_like(x)
+
+
+class KimiRouterLinear(nn.Linear):
+    """Router projection evaluated in float32, matching the reference model."""
+
+    def forward(self, input_tensor: torch.Tensor) -> torch.Tensor:
+        return F.linear(
+            input_tensor.float(),
+            self.weight.float(),
+            None,
+        )
+
+
+class KimiMoEGate(nn.Module):
+    """Kimi sigmoid router with correction bias and optional group limiting."""
 
     def __init__(
         self,
@@ -91,6 +185,7 @@ class KimiMoEGate(nn.Module):
         topk_group: int = 1,
         routed_scaling_factor: float = 1.0,
         renormalize: bool = True,
+        debug_force_load_balance: bool = False,
     ):
         super().__init__()
         self.top_k = top_k
@@ -100,17 +195,25 @@ class KimiMoEGate(nn.Module):
         self.num_expert_groups = num_expert_groups
         self.topk_group = topk_group
         self.renormalize = renormalize
+        self.debug_force_load_balance = debug_force_load_balance
 
-        self.weight = nn.Parameter(torch.empty(num_experts, hidden_size))
-        self.e_score_correction_bias = nn.Parameter(torch.empty(num_experts))
-        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
-        nn.init.zeros_(self.e_score_correction_bias)
+        self.gate = KimiRouterLinear(
+            hidden_size,
+            num_experts,
+            bias=False,
+        )
+        self.register_parameter(
+            "e_score_correction_bias",
+            nn.Parameter(torch.zeros(num_experts)),
+        )
+        nn.init.kaiming_uniform_(self.gate.weight, a=math.sqrt(5))
 
-    def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        bsz, seq_len, h = hidden_states.shape
-        hidden_flat = hidden_states.view(-1, h)
-
-        logits = F.linear(hidden_flat.float(), self.weight.float())
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        hidden_flat = hidden_states.view(-1, hidden_states.shape[-1])
+        logits = self.gate(hidden_flat)
         if self.score_func == "sigmoid":
             scores = logits.sigmoid()
         elif self.score_func == "softmax":
@@ -118,43 +221,101 @@ class KimiMoEGate(nn.Module):
         else:
             raise ValueError(f"Unsupported score_func: {self.score_func}")
 
-        scores_for_choice = scores + self.e_score_correction_bias.unsqueeze(0)
+        scores_for_choice = (
+            scores + self.e_score_correction_bias.unsqueeze(0)
+        )
+        if self.num_expert_groups > 1:
+            if self.num_experts % self.num_expert_groups != 0:
+                raise ValueError(
+                    "num_experts must be divisible by num_expert_groups"
+                )
+            if self.topk_group >= self.num_expert_groups:
+                raise ValueError(
+                    "topk_group must be smaller than num_expert_groups"
+                )
+            num_tokens = hidden_flat.shape[0]
+            grouped_scores = scores_for_choice.view(
+                num_tokens, self.num_expert_groups, -1
+            )
+            if grouped_scores.shape[-1] < 2:
+                raise ValueError("Each expert group must contain at least 2 experts")
+            group_scores = grouped_scores.topk(2, dim=-1)[0].sum(dim=-1)
+            group_indices = torch.topk(
+                group_scores,
+                k=self.topk_group,
+                dim=-1,
+                sorted=False,
+            )[1]
+            group_mask = torch.zeros_like(group_scores, dtype=torch.bool)
+            group_mask.scatter_(1, group_indices, True)
+            scores_for_choice = grouped_scores.masked_fill(
+                ~group_mask.unsqueeze(-1),
+                float("-inf"),
+            ).view(num_tokens, -1)
 
-        # Group topk selection
-        if self.num_expert_groups > 1 and self.num_expert_groups > self.topk_group:
-            n_tokens = bsz * seq_len
-            group_scores = (
-                scores_for_choice.view(n_tokens, self.num_expert_groups, -1)
-                .topk(2, dim=-1)[0]
-                .sum(dim=-1)
+        if self.debug_force_load_balance:
+            token_offsets = (
+                torch.arange(
+                    hidden_flat.shape[0],
+                    device=hidden_flat.device,
+                    dtype=torch.int64,
+                )
+                * self.top_k
             )
-            group_idx = torch.topk(group_scores, k=self.topk_group, dim=-1, sorted=False)[1]
-            group_mask = torch.zeros_like(group_scores)
-            group_mask.scatter_(1, group_idx, 1)
-            score_mask = (
-                group_mask.unsqueeze(-1)
-                .expand(n_tokens, self.num_expert_groups, self.num_experts // self.num_expert_groups)
-                .reshape(n_tokens, -1)
+            expert_offsets = torch.arange(
+                self.top_k,
+                device=hidden_flat.device,
+                dtype=torch.int64,
             )
-            tmp_scores = scores_for_choice.masked_fill(~score_mask.bool(), float("-inf"))
+            topk_idx = (
+                token_offsets.unsqueeze(1) + expert_offsets.unsqueeze(0)
+            ) % self.num_experts
         else:
-            tmp_scores = scores_for_choice
-
-        _, topk_idx = torch.topk(tmp_scores, k=self.top_k, dim=-1, sorted=False)
+            topk_idx = torch.topk(
+                scores_for_choice,
+                k=self.top_k,
+                dim=-1,
+                sorted=False,
+            )[1]
         topk_weight = scores.gather(1, topk_idx)
-
         if self.top_k > 1 and self.renormalize:
-            topk_weight = topk_weight / (topk_weight.sum(dim=-1, keepdim=True) + 1e-20)
+            topk_weight = topk_weight / (
+                topk_weight.sum(dim=-1, keepdim=True) + 1e-20
+            )
+        return topk_idx, topk_weight * self.routed_scaling_factor
 
-        topk_weight = topk_weight * self.routed_scaling_factor
-        return topk_idx, topk_weight
+
+class KimiTokenReorderer(nn.Module):
+    """Group routed tokens by expert while preserving token-score alignment."""
+
+    def __init__(self, *, num_experts: int, top_k: int):
+        super().__init__()
+        self.num_experts = num_experts
+        self.top_k = top_k
+
+    def forward(
+        self,
+        top_scores: torch.Tensor,
+        selected_experts_indices: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        flat_expert_indices = selected_experts_indices.reshape(-1)
+        num_tokens_per_expert = torch.histc(
+            flat_expert_indices.float(),
+            bins=self.num_experts,
+            min=0,
+            max=self.num_experts - 1,
+        ).to(torch.int64)
+        sorted_assignment_indices = torch.argsort(
+            flat_expert_indices,
+            stable=True,
+        )
+        sorted_scores = top_scores.reshape(-1)[sorted_assignment_indices]
+        token_indices = sorted_assignment_indices // self.top_k
+        return sorted_scores, token_indices, num_tokens_per_expert
 
 
 class KimiSparseMoeBlock(nn.Module):
-    """Stable LatentMoE block for Kimi K3.
-
-    Flow: gate → latent compress → experts → latent norm → latent decompress + shared
-    """
+    """Stable LatentMoE with grouped routed experts."""
 
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
@@ -173,6 +334,7 @@ class KimiSparseMoeBlock(nn.Module):
         situ_beta: float = 4.0
         situ_linear_beta: float | None = 25.0
         norm_eps: float = 1e-5
+        debug_force_load_balance: bool = False
 
     def __init__(self, config: Config):
         super().__init__()
@@ -180,12 +342,12 @@ class KimiSparseMoeBlock(nn.Module):
         self.hidden_size = config.hidden_size
         self.num_experts = config.num_experts
         self.top_k = config.top_k
-        self.load_balance_coeff = 0.0  # No auxiliary loss balancing for K3 (uses bias correction)
+        self.load_balance_coeff = None
 
         self.use_latent_moe = config.routed_expert_hidden_size is not None
-        self.moe_hidden_size = config.routed_expert_hidden_size or config.hidden_size
-
-        # Router
+        self.moe_hidden_size = (
+            config.routed_expert_hidden_size or config.hidden_size
+        )
         self.gate = KimiMoEGate(
             hidden_size=config.hidden_size,
             num_experts=config.num_experts,
@@ -195,78 +357,91 @@ class KimiSparseMoeBlock(nn.Module):
             topk_group=config.topk_group,
             routed_scaling_factor=config.routed_scaling_factor,
             renormalize=config.renormalize,
+            debug_force_load_balance=config.debug_force_load_balance,
         )
 
-        # Latent projections
         if self.use_latent_moe:
-            self.routed_expert_down_proj = nn.Linear(config.hidden_size, self.moe_hidden_size, bias=False)
-            self.routed_expert_up_proj = nn.Linear(self.moe_hidden_size, config.hidden_size, bias=False)
+            self.routed_expert_down_proj = nn.Linear(
+                config.hidden_size,
+                self.moe_hidden_size,
+                bias=False,
+            )
+            self.routed_expert_up_proj = nn.Linear(
+                self.moe_hidden_size,
+                config.hidden_size,
+                bias=False,
+            )
             if config.latent_moe_use_norm:
-                self.routed_expert_norm = nn.RMSNorm(self.moe_hidden_size, eps=config.norm_eps)
+                self.routed_expert_norm = RMSNorm.Config(
+                    normalized_shape=self.moe_hidden_size,
+                    eps=config.norm_eps,
+                ).build()
 
-        # Routed experts
-        self.experts = nn.ModuleList([
-            KimiBlockSparseMLP(
-                hidden_size=self.moe_hidden_size,
-                intermediate_size=config.moe_intermediate_size,
-                beta=config.situ_beta,
-                linear_beta=config.situ_linear_beta,
-            )
-            for _ in range(config.num_experts)
-        ])
+        self.reorderer = KimiTokenReorderer(
+            num_experts=config.num_experts,
+            top_k=config.top_k,
+        )
+        self.experts = KimiGroupedExperts(
+            num_experts=config.num_experts,
+            hidden_size=self.moe_hidden_size,
+            intermediate_size=config.moe_intermediate_size,
+            beta=config.situ_beta,
+            linear_beta=config.situ_linear_beta,
+        )
 
-        # Shared experts
         if config.num_shared_experts > 0:
-            shared_intermediate = config.moe_intermediate_size * config.num_shared_experts
-            self.shared_experts = KimiMLP(
+            self.shared_experts = KimiMLP.Config(
                 hidden_size=config.hidden_size,
-                intermediate_size=shared_intermediate,
+                intermediate_size=(
+                    config.moe_intermediate_size * config.num_shared_experts
+                ),
                 beta=config.situ_beta,
                 linear_beta=config.situ_linear_beta,
-            )
+            ).build()
+        else:
+            self.shared_experts = None
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if isinstance(hidden_states, DTensor):
+            if hidden_states.device_mesh.ndim != 1:
+                raise ValueError(
+                    "Kimi MoE expects a 1D TP DTensor input, "
+                    f"got {hidden_states.device_mesh.ndim}D"
+                )
+            hidden_states = hidden_states.to_local(grad_placements=(Partial(),))
+
         identity = hidden_states
-        orig_shape = hidden_states.shape
+        original_shape = hidden_states.shape
         topk_idx, topk_weight = self.gate(hidden_states)
         hidden_flat = hidden_states.view(-1, hidden_states.shape[-1])
 
-        # Latent compression
         if self.use_latent_moe:
             hidden_flat = self.routed_expert_down_proj(hidden_flat)
 
-        # Expert computation
-        y = self._moe_forward(hidden_flat, topk_idx, topk_weight)
+        (
+            topk_weight,
+            token_indices,
+            num_tokens_per_expert,
+        ) = self.reorderer(topk_weight, topk_idx)
+        routed_input = hidden_flat[token_indices]
+        routed_output = self.experts(routed_input, num_tokens_per_expert)
+        routed_output = routed_output * topk_weight.unsqueeze(-1).to(
+            routed_output.dtype
+        )
 
-        # Latent decompression
+        combined = torch.zeros_like(hidden_flat)
+        combined.index_add_(
+            0,
+            token_indices,
+            routed_output.to(combined.dtype),
+        )
+
         if self.use_latent_moe:
             if self.config.latent_moe_use_norm:
-                y = self.routed_expert_norm(y)
-            y = self.routed_expert_up_proj(y)
+                combined = self.routed_expert_norm(combined)
+            combined = self.routed_expert_up_proj(combined)
 
-        y = y.view(*orig_shape)
-
-        # Add shared experts
-        if self.config.num_shared_experts > 0:
-            y = y + self.shared_experts(identity)
-
-        return y
-
-    def _moe_forward(
-        self, x: torch.Tensor, topk_idx: torch.Tensor, topk_weight: torch.Tensor
-    ) -> torch.Tensor:
-        """Standard per-expert loop (non-fused). NPU fused path via converter."""
-        final_hidden_states = torch.zeros_like(x)
-        with torch.no_grad():
-            expert_mask = F.one_hot(topk_idx, num_classes=self.num_experts).permute(2, 1, 0)
-            expert_hit = torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero()
-
-        for expert_idx_tensor in expert_hit:
-            expert_idx = expert_idx_tensor.item()
-            top_k_pos, token_idx = torch.where(expert_mask[expert_idx])
-            current_state = x[token_idx]
-            expert_out = self.experts[expert_idx](current_state)
-            expert_out = expert_out * topk_weight[token_idx, top_k_pos, None].to(expert_out.dtype)
-            final_hidden_states.index_add_(0, token_idx, expert_out.to(final_hidden_states.dtype))
-
-        return final_hidden_states
+        output = combined.view(*original_shape)
+        if self.shared_experts is not None:
+            output = output + self.shared_experts(identity)
+        return output

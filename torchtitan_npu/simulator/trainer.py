@@ -31,7 +31,9 @@ from torchtitan_npu.simulator.capture.schedule_builder import (
 from torchtitan_npu.simulator.capture.step_boundary import StepBoundaryTracker, build_step_graphs
 from torchtitan_npu.simulator.capture.workload_builder import build_workload_graph
 from torchtitan_npu.simulator.hardware_shims.kda_converter import apply_kda_shims
-from torchtitan_npu.simulator.hardware_shims.kimi_k3_moe_converter import apply_kimi_k3_moe_shims
+from torchtitan_npu.simulator.hardware_shims.rms_norm_shim import (
+    apply_rms_norm_autograd_shim,
+)
 from torchtitan_npu.simulator.hardware_shims.mhc_converter import apply_mhc_shims
 from torchtitan_npu.simulator.hardware_shims.rms_norm_converter import (
     apply_rms_norm_shims,
@@ -241,16 +243,34 @@ def run_simulation_step(
     t1 = time.perf_counter()
     timings["setup"] = t1 - t0
 
+    from contextlib import nullcontext
+    from torchtitan_npu.simulator.capture.comm_events import (
+        default_collective_context,
+    )
+
+    get_optional_mesh = getattr(parallel_dims, "get_optional_mesh", None)
+    tp_mesh = (
+        get_optional_mesh("tp")
+        if callable(get_optional_mesh)
+        else None
+    )
+    tp_collective_context = (
+        default_collective_context("tp", tp_mesh.get_group())
+        if tp_mesh is not None
+        else nullcontext()
+    )
+
     with capture_fake_collectives(
         memory_tracking_enabled=enable_memory_tracking,
         capture_process_rank=rank,
     ) as comm_recorder, boundary, module_path_tracker, capture:
         boundary.mark("forward")
-        forward_backward_step(
-            input_dict=input_dict,
-            labels=labels,
-            global_valid_tokens=global_valid_tokens,
-        )
+        with tp_collective_context:
+            forward_backward_step(
+                input_dict=input_dict,
+                labels=labels,
+                global_valid_tokens=global_valid_tokens,
+            )
         t2 = time.perf_counter()
         timings["forward_backward"] = t2 - t1
 
@@ -451,6 +471,7 @@ class SimulationTrainer(Trainer):
         apply_mhc_shims()
         apply_rms_norm_shims()
         apply_smla_shims()
+        apply_rms_norm_autograd_shim()
         _strip_hardware_dependent_model_converters(config)
         if hasattr(config.optimizer, "swap_optimizer"):
             # swap_optimizer (NPU-specific host/device state swapping to
@@ -485,10 +506,10 @@ class SimulationTrainer(Trainer):
             _patch_parallel_dims_for_multi_proc(full_ws, gloo_ws)
 
         super().__init__(config)
-        # Kimi K3 shims: applied after model construction (model_parts exists now)
+        # Bind KDA after model construction so TP/CP/FSDP hooks and distributed
+        # parameters remain attached to the original attention module.
         for model_part in self.model_parts:
             apply_kda_shims(model_part)
-            apply_kimi_k3_moe_shims(model_part)
         self.simulation_config = config.simulation
         self.workload_graph: WorkloadGraph | None = None
 

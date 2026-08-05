@@ -109,6 +109,7 @@ def deepseek_v4_smoketest() -> SimulationTrainerConfig:
 # ---------------------------------------------------------------------------
 
 from torchtitan_npu.models.kimi_k3.config_registry import (  # noqa: E402
+    _default_converters as _kimi_k3_default_converters,
     kimi_k3_smoketest as _kimi_k3_smoketest,
 )
 
@@ -151,7 +152,9 @@ def kimi_k3_full_simulate() -> SimulationTrainerConfig:
         hf_assets_path="./tests/assets/tokenizer/deepseekv3_tokenizer",
         model_spec=kimi_k3_model_registry("full"),
         debug=DebugConfig(print_config=False),
-        model_converters=ModelConvertersContainer.Config(converters=[]),
+        model_converters=ModelConvertersContainer.Config(
+            converters=_kimi_k3_default_converters()
+        ),
         metrics=MetricsProcessor.Config(log_freq=1),
         dataloader=HuggingFaceTextDataLoader.Config(dataset="c4_test"),
         optimizer=OptimizerConfig(name="AdamW", lr=2.2e-4, eps=1e-8),
