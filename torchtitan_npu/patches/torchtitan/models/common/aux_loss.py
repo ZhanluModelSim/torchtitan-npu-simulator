@@ -8,7 +8,7 @@
 
 """Auxiliary-loss gradient injection and distributed metric collection.
 
-This mirrors TorchTitan PR #3634. Model specs must register
+This mirrors TorchTitan PR #3864. Model specs must register
 ``register_aux_loss_zero_hook`` after building the optimizer.
 """
 
