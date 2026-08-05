@@ -55,3 +55,16 @@ def test_meta_grouped_experts_produces_shape_correct_expert_gradients():
         (4, 16, 8),
     ]
     assert all(event.phase == "backward" for event in grouped_mm_events)
+
+    mul_events = [event for event in backward_events if event.raw_op_type == "aten.mul.Tensor"]
+    swiglu_event = next(
+        event
+        for event in backward_events
+        if event.raw_op_type == "npu.npu_swiglu_backward.default"
+    )
+    assert len(mul_events) == 2
+    assert grouped_mm_events[0].op_id in mul_events[0].predecessors
+    assert grouped_mm_events[0].op_id in mul_events[1].predecessors
+    assert mul_events[0].op_id in swiglu_event.predecessors
+    assert swiglu_event.op_id in grouped_mm_events[2].predecessors
+    assert swiglu_event.op_id in grouped_mm_events[3].predecessors

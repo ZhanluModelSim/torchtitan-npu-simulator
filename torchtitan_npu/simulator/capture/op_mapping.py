@@ -40,6 +40,7 @@ OP_MAPPING: dict[str, str] = {
     "aten.softmax.default": "softmax",
     "aten._softmax.default": "softmax",
     "npu.npu_swiglu.default": "swiglu",
+    "npu.npu_swiglu_backward.default": "swiglu",
     "npu.npu_rotary_mul.default": "rope",
     # MoE dispatch
     "npu.npu_moe_token_permute.default": "moe_token_permute",

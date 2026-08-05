@@ -8,13 +8,20 @@ import os
 import pytest
 import torch
 import torch.distributed as dist
+import torch_npu
 from torch.distributed import _functional_collectives as funcol
 from torch.distributed.pipelining import schedules
 
 from torchtitan_npu.simulator.capture.comm_events import capture_fake_collectives
 from torchtitan_npu.simulator.capture.dispatch_capture import OpDispatchCapture
+from torchtitan_npu.simulator.hardware_shims.grouped_experts_shim import (
+    run_meta_grouped_experts,
+)
 from torchtitan_npu.simulator.hardware_shims.moe_dispatch_shim import (
     run_meta_all_to_all,
+)
+from torchtitan_npu.simulator.hardware_shims.moe_permutation_shim import (
+    run_meta_moe_token_permute,
 )
 from torchtitan_npu.simulator.meta_env import (
     _local_tensor_for_shape,
@@ -85,6 +92,101 @@ def test_meta_all_to_all_is_replayed_during_backward():
     ]
     assert tensor.grad is not None
     assert tensor.grad.shape == tensor.shape
+
+
+def test_meta_moe_backward_dependencies_connect_gmms_to_all_to_all():
+    phase = ["forward"]
+    capture = OpDispatchCapture(phase_provider=lambda: phase[0])
+    tokens = torch.empty((12, 8), device="meta", requires_grad=True)
+    scores = torch.empty((12, 1), device="meta", requires_grad=True)
+    indices = torch.empty((12, 1), dtype=torch.int64, device="meta")
+    counts = torch.empty((4,), dtype=torch.int32, device="meta")
+    w13 = torch.empty((4, 16, 8), device="meta", requires_grad=True)
+    w2 = torch.empty((4, 8, 8), device="meta", requires_grad=True)
+
+    def fake_experts_forward(
+        _w13,
+        _w2,
+        _w3,
+        routed_tokens,
+        _counts,
+        _limit,
+        _scores,
+    ):
+        return torch.empty_like(routed_tokens)
+
+    with capture, capture_fake_collectives():
+        routed_tokens = run_meta_all_to_all(tokens, dist.group.WORLD)
+        routed_scores = run_meta_all_to_all(scores, dist.group.WORLD)
+        routed_tokens, _ = run_meta_moe_token_permute(
+            torch_npu.npu_moe_token_permute,
+            routed_tokens,
+            indices,
+        )
+        routed_scores, _ = run_meta_moe_token_permute(
+            torch_npu.npu_moe_token_permute,
+            routed_scores,
+            indices,
+        )
+        expert_output = run_meta_grouped_experts(
+            fake_experts_forward,
+            w13,
+            w2,
+            routed_tokens,
+            counts,
+            7.0,
+            routed_scores,
+        )
+        combined = run_meta_all_to_all(expert_output, dist.group.WORLD)
+        phase[0] = "backward"
+        combined.sum().backward()
+
+    nodes = capture.build_nodes()
+    backward_nodes = [
+        node
+        for node in nodes.values()
+        if node.annotations["phase"] == "backward"
+    ]
+    all_to_all_nodes = sorted(
+        (
+            node
+            for node in backward_nodes
+            if node.annotations["raw_op_type"] == "comm.all_to_all"
+        ),
+        key=lambda node: node.seq_idx,
+    )
+    grouped_mm_nodes = sorted(
+        (
+            node
+            for node in backward_nodes
+            if node.annotations["raw_op_type"] == "aten._grouped_mm.default"
+        ),
+        key=lambda node: node.seq_idx,
+    )
+    score_mul = next(
+        node
+        for node in backward_nodes
+        if node.annotations["raw_op_type"] == "aten.mul.Tensor"
+        and node.outputs[0].shape == (12, 1)
+    )
+
+    def ancestors(op_id: int) -> set[int]:
+        result: set[int] = set()
+        pending = list(nodes[op_id].predecessors)
+        while pending:
+            predecessor = pending.pop()
+            if predecessor in result or predecessor not in nodes:
+                continue
+            result.add(predecessor)
+            pending.extend(nodes[predecessor].predecessors)
+        return result
+
+    assert len(all_to_all_nodes) == 3
+    assert len(grouped_mm_nodes) == 4
+    combine_all_to_all, score_all_to_all, token_all_to_all = all_to_all_nodes
+    assert combine_all_to_all.op_id in ancestors(grouped_mm_nodes[0].op_id)
+    assert score_mul.op_id in ancestors(score_all_to_all.op_id)
+    assert grouped_mm_nodes[2].op_id in ancestors(token_all_to_all.op_id)
 
 
 def test_reduce_scatter_uses_flat_buffer_mutation_as_source_op():

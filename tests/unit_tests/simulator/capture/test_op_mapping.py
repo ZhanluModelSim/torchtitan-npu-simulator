@@ -17,6 +17,7 @@ def test_known_npu_op_maps_to_canonical_type():
     assert to_canonical_op_type("npu.npu_moe_token_permute.default") == "moe_token_permute"
     assert to_canonical_op_type("npu.npu_moe_token_permute_grad.default") == "moe_token_permute"
     assert to_canonical_op_type("npu.npu_rotary_mul.default") == "rope"
+    assert to_canonical_op_type("npu.npu_swiglu_backward.default") == "swiglu"
     assert to_canonical_op_type("npu.npu_quant_matmul.default") == "matmul"
     assert to_canonical_op_type("npu.npu_grouped_matmul.default") == "grouped_mm"
     assert to_canonical_op_type("aten._grouped_mm.default") == "grouped_mm"

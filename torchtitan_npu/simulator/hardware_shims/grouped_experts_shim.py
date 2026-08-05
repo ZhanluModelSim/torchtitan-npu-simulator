@@ -62,7 +62,8 @@ def _current_module_path() -> str:
     return capture.module_path_tracker.current_path()
 
 
-def _record_grouped_mm(
+def _record_op(
+    raw_op_type: str,
     inputs: list[torch.Tensor],
     output: torch.Tensor,
     module_path: str,
@@ -74,11 +75,24 @@ def _record_grouped_mm(
     capture = get_active_capture()
     if capture is not None:
         capture.record_synthetic_op(
-            "aten._grouped_mm.default",
+            raw_op_type,
             inputs=inputs,
             outputs=[output],
             module_path=module_path,
         )
+
+
+def _record_grouped_mm(
+    inputs: list[torch.Tensor],
+    output: torch.Tensor,
+    module_path: str,
+) -> None:
+    _record_op(
+        "aten._grouped_mm.default",
+        inputs,
+        output,
+        module_path,
+    )
 
 
 class _SimGroupedExperts(torch.autograd.Function):
@@ -94,16 +108,23 @@ class _SimGroupedExperts(torch.autograd.Function):
         swiglu_limit,
         routed_scores,
     ):
-        hidden = _uncaptured_empty(
+        pre_activation = _uncaptured_empty(
+            (x.shape[0], w13.shape[-2]),
+            x,
+        )
+        activated_hidden = _uncaptured_empty(
             (x.shape[0], w2.shape[-1]),
             x,
         )
+        scaled_hidden = _uncaptured_empty_like(activated_hidden)
         ctx.save_for_backward(
             w13,
             w2,
             x,
             num_tokens_per_expert,
-            hidden,
+            pre_activation,
+            activated_hidden,
+            scaled_hidden,
         )
         ctx.routed_scores = routed_scores
         ctx.module_path = _current_module_path()
@@ -120,32 +141,64 @@ class _SimGroupedExperts(torch.autograd.Function):
     @staticmethod
     # pyrefly: ignore [bad-override]
     def backward(ctx, grad_output):
-        w13, w2, x, num_tokens_per_expert, hidden = ctx.saved_tensors
+        (
+            w13,
+            w2,
+            x,
+            num_tokens_per_expert,
+            pre_activation,
+            activated_hidden,
+            scaled_hidden,
+        ) = ctx.saved_tensors
         routed_scores = ctx.routed_scores
 
         dw13 = _uncaptured_empty_like(w13)
         dw2 = _uncaptured_empty_like(w2)
         dx = _uncaptured_empty_like(x)
-        grad_hidden = _uncaptured_empty_like(hidden)
-        grad_pre_activation = _uncaptured_empty(
-            (x.shape[0], w13.shape[-2]),
-            x,
-        )
+        grad_scaled_hidden = _uncaptured_empty_like(scaled_hidden)
 
         # Each forward GMM contributes one activation-gradient GMM and one
         # weight-gradient GMM. These are shape-only events, but their count,
-        # tensor metadata, dependencies, and FLOPs match the production
+        # tensor metadata, dependencies, and FLOPs follow the production
         # grouped-expert backward.
         _record_grouped_mm(
             [grad_output, w2, num_tokens_per_expert],
-            grad_hidden,
+            grad_scaled_hidden,
             ctx.module_path,
         )
         _record_grouped_mm(
-            [hidden, grad_output, num_tokens_per_expert],
+            [scaled_hidden, grad_output, num_tokens_per_expert],
             dw2,
             ctx.module_path,
         )
+
+        if isinstance(routed_scores, torch.Tensor):
+            grad_activated_hidden = _uncaptured_empty_like(activated_hidden)
+            drouted_scores = _uncaptured_empty_like(routed_scores)
+            _record_op(
+                "aten.mul.Tensor",
+                [grad_scaled_hidden, routed_scores],
+                grad_activated_hidden,
+                ctx.module_path,
+            )
+            _record_op(
+                "aten.mul.Tensor",
+                [grad_scaled_hidden, activated_hidden],
+                drouted_scores,
+                ctx.module_path,
+            )
+        else:
+            grad_activated_hidden = grad_scaled_hidden
+            drouted_scores = None
+
+        grad_pre_activation = _uncaptured_empty_like(pre_activation)
+        _record_op(
+            "npu.npu_swiglu_backward.default",
+            [grad_activated_hidden, pre_activation],
+            grad_pre_activation,
+            ctx.module_path,
+        )
+
         _record_grouped_mm(
             [grad_pre_activation, w13, num_tokens_per_expert],
             dx,
@@ -157,7 +210,6 @@ class _SimGroupedExperts(torch.autograd.Function):
             ctx.module_path,
         )
 
-        drouted_scores = _uncaptured_empty_like(routed_scores) if isinstance(routed_scores, torch.Tensor) else None
         return None, dw13, dw2, dx, None, None, drouted_scores
 
 
