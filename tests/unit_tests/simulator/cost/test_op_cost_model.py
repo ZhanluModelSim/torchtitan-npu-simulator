@@ -34,6 +34,39 @@ def test_matmul_missing_inputs_returns_unknown():
     assert result.unknown is True
 
 
+def test_grouped_mm_weight_gradient_does_not_multiply_tokens_by_experts():
+    model = OpCostModel()
+    activations = TensorMeta(
+        name="activations",
+        shape=(96, 64),
+        dtype="bfloat16",
+        device="meta",
+    )
+    output_grads = TensorMeta(
+        name="output_grads",
+        shape=(96, 128),
+        dtype="bfloat16",
+        device="meta",
+    )
+    weight_grad = TensorMeta(
+        name="weight_grad",
+        shape=(8, 64, 128),
+        dtype="bfloat16",
+        device="meta",
+    )
+
+    result = model.compute(
+        "grouped_mm",
+        [activations, output_grads],
+        [weight_grad],
+        {},
+    )
+
+    assert result.flops == 2 * 96 * 64 * 128
+    assert result.peak_mem == 8 * 64 * 128 * 2
+    assert result.unknown is False
+
+
 def test_rms_norm_cost():
     model = OpCostModel()
     x = TensorMeta(name="x", shape=(2, 8, 16), dtype="float32", device="meta")

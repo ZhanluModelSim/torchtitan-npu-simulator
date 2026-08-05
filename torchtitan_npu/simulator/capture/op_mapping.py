@@ -18,6 +18,11 @@ OP_MAPPING: dict[str, str] = {
     "aten.bmm.default": "bmm",
     "aten.matmul.default": "matmul",
     "aten.einsum.default": "einsum",
+    "aten._grouped_mm.default": "grouped_mm",
+    "npu.npu_quant_matmul.default": "matmul",
+    "npu.npu_grouped_matmul.default": "grouped_mm",
+    "npu.npu_dynamic_mx_quant.default": "quantize",
+    "npu.npu_grouped_dynamic_mx_quant.default": "quantize",
     # attention
     "aten.scaled_dot_product_attention.default": "sdpa",
     "aten._scaled_dot_product_flash_attention.default": "flash_attention_fwd",
@@ -28,6 +33,7 @@ OP_MAPPING: dict[str, str] = {
     # normalization
     "aten.native_layer_norm.default": "layer_norm",
     "npu.npu_rms_norm.default": "rms_norm",
+    "npu.npu_rms_norm_backward.default": "rms_norm_backward",
     # activation
     "aten.gelu.default": "gelu",
     "aten.silu.default": "silu",
@@ -37,6 +43,7 @@ OP_MAPPING: dict[str, str] = {
     "npu.npu_rotary_mul.default": "rope",
     # MoE dispatch
     "npu.npu_moe_token_permute.default": "moe_token_permute",
+    "npu.npu_moe_token_permute_grad.default": "moe_token_permute",
     "npu.npu_moe_token_unpermute.default": "moe_token_unpermute",
     "npu.npu_moe_re_routing.default": "moe_re_routing",
     # memory / IO

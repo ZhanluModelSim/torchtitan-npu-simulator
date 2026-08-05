@@ -13,8 +13,13 @@ def test_known_aten_op_maps_to_canonical_type():
 
 def test_known_npu_op_maps_to_canonical_type():
     assert to_canonical_op_type("npu.npu_rms_norm.default") == "rms_norm"
+    assert to_canonical_op_type("npu.npu_rms_norm_backward.default") == "rms_norm_backward"
     assert to_canonical_op_type("npu.npu_moe_token_permute.default") == "moe_token_permute"
+    assert to_canonical_op_type("npu.npu_moe_token_permute_grad.default") == "moe_token_permute"
     assert to_canonical_op_type("npu.npu_rotary_mul.default") == "rope"
+    assert to_canonical_op_type("npu.npu_quant_matmul.default") == "matmul"
+    assert to_canonical_op_type("npu.npu_grouped_matmul.default") == "grouped_mm"
+    assert to_canonical_op_type("aten._grouped_mm.default") == "grouped_mm"
 
 
 def test_unknown_op_maps_to_unknown():

@@ -13,10 +13,13 @@ from torch.distributed.pipelining import schedules
 
 from torchtitan_npu.simulator.capture.comm_events import capture_fake_collectives
 from torchtitan_npu.simulator.capture.dispatch_capture import OpDispatchCapture
+from torchtitan_npu.simulator.hardware_shims.moe_dispatch_shim import (
+    run_meta_all_to_all,
+)
 from torchtitan_npu.simulator.meta_env import (
+    _local_tensor_for_shape,
     _mark_p2p_ops,
     _pp_context,
-    _local_tensor_for_shape,
     _split_meta_dtensor,
     patch_device_type_to_meta,
     unpatch_device_type_to_meta,
@@ -57,6 +60,31 @@ def test_all_to_all_single_on_meta_is_noop_and_recorded():
     with capture_fake_collectives() as recorder:
         dist.all_to_all_single(output_t, input_t)
     assert recorder.events[0].comm_primitive == "all_to_all"
+
+
+def test_meta_all_to_all_is_replayed_during_backward():
+    phase = ["forward"]
+    capture = OpDispatchCapture(phase_provider=lambda: phase[0])
+    tensor = torch.randn(8, device="meta", requires_grad=True)
+
+    with capture, capture_fake_collectives() as recorder:
+        output = run_meta_all_to_all(tensor, dist.group.WORLD)
+        loss = output.sum()
+        phase[0] = "backward"
+        loss.backward()
+
+    all_to_all_nodes = [
+        node
+        for node in capture.build_nodes().values()
+        if node.annotations["raw_op_type"] == "comm.all_to_all"
+    ]
+    assert len(recorder.events) == 2
+    assert [node.annotations["phase"] for node in all_to_all_nodes] == [
+        "forward",
+        "backward",
+    ]
+    assert tensor.grad is not None
+    assert tensor.grad.shape == tensor.shape
 
 
 def test_reduce_scatter_uses_flat_buffer_mutation_as_source_op():
@@ -147,9 +175,9 @@ def test_dtensor_shape_checks_use_local_shape():
 
 
 def test_hsdp_ep_mesh_info_uses_replicate_then_shard_axes():
+    import torchtitan.models.llama4.parallelize as llama4_parallelize
     from torch.distributed.device_mesh import DeviceMesh
     from torch.distributed.fsdp._fully_shard._fsdp_common import HSDPMeshInfo
-    import torchtitan.models.llama4.parallelize as llama4_parallelize
 
     mesh = DeviceMesh(
         "meta",

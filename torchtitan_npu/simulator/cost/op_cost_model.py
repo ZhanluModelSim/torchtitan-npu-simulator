@@ -9,8 +9,9 @@ an unrecognized op_type."""
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any
 
 from torchtitan_npu.simulator.capture.tensor_utils import tensor_volume_bytes
 from torchtitan_npu.simulator.ir.tensor_meta import TensorMeta
@@ -25,7 +26,7 @@ class CostEstimate:
     unknown: bool = False
 
     @classmethod
-    def unknown_cost(cls) -> "CostEstimate":
+    def unknown_cost(cls) -> CostEstimate:
         return cls(unknown=True)
 
 
@@ -45,11 +46,13 @@ class OpCostModel:
             "matmul": self._matmul,
             "addmm": self._matmul,
             "bmm": self._bmm,
-            "grouped_mm": self._matmul,
+            "grouped_mm": self._grouped_mm,
+            "quantize": self._data_move,
             "sdpa": self._attention,
             "flash_attention_fwd": self._attention,
             "layer_norm": self._norm,
             "rms_norm": self._norm,
+            "rms_norm_backward": self._norm,
             "gelu": self._elementwise,
             "silu": self._elementwise,
             "swiglu": self._elementwise,
@@ -86,6 +89,38 @@ class OpCostModel:
 
     def _bmm(self, inputs: list[TensorMeta], outputs: list[TensorMeta], attrs: dict[str, Any]) -> CostEstimate:
         return self._matmul(inputs, outputs, attrs)
+
+    def _grouped_mm(
+        self,
+        inputs: list[TensorMeta],
+        outputs: list[TensorMeta],
+        attrs: dict[str, Any],
+    ) -> CostEstimate:
+        if len(inputs) < 2 or not outputs:
+            return CostEstimate.unknown_cost()
+
+        output = outputs[0]
+        if len(output.shape) != 3:
+            return self._matmul(inputs, outputs, attrs)
+
+        lhs_shape = inputs[0].shape
+        rhs_shape = inputs[1].shape
+        if len(lhs_shape) < 2 or len(rhs_shape) < 2:
+            return CostEstimate.unknown_cost()
+
+        if lhs_shape[-1] == rhs_shape[-2]:
+            reduction_dim = lhs_shape[-1]
+        elif lhs_shape[0] == rhs_shape[0]:
+            reduction_dim = lhs_shape[0]
+        else:
+            return CostEstimate.unknown_cost()
+
+        # A rank-3 output is a grouped weight gradient [experts, M, N].
+        # Experts partition the routed-token reduction rather than multiplying
+        # it, so FLOPs use only the matrix dimensions M/N.
+        flops = 2 * int(output.shape[-2]) * int(output.shape[-1]) * int(reduction_dim)
+        out_bytes = tensor_volume_bytes(output.shape, output.dtype)
+        return CostEstimate(flops=flops, peak_mem=out_bytes)
 
     def _attention(self, inputs: list[TensorMeta], outputs: list[TensorMeta], attrs: dict[str, Any]) -> CostEstimate:
         if len(inputs) < 2 or not outputs:

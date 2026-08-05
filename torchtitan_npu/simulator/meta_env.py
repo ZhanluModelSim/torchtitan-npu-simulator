@@ -557,10 +557,49 @@ def _patch_moe_dispatch_to_avoid_meta_tensor_value_reads() -> None:
     if _original_moe_token_dispatch is not _MISSING:
         return
     original_token_dispatch = expert_parallel_cls._token_dispatch
-    _original_moe_token_dispatch = (expert_parallel_cls, original_token_dispatch)
+    original_token_combine = expert_parallel_cls._token_combine
+    _original_moe_token_dispatch = (
+        expert_parallel_cls,
+        original_token_dispatch,
+        original_token_combine,
+    )
 
     is_fake_process_group = moe_dispatch_mod.is_fake_process_group
     torch_npu = moe_dispatch_mod.torch_npu
+    from torchtitan_npu.simulator.hardware_shims.moe_dispatch_shim import (
+        run_meta_all_to_all,
+    )
+    from torchtitan_npu.simulator.hardware_shims.moe_permutation_shim import (
+        run_meta_moe_token_permute,
+    )
+
+    permute_key = ("torch_npu", "npu_moe_token_permute")
+    if permute_key not in _original_values:
+        original_token_permute = torch_npu.npu_moe_token_permute
+        _original_values[permute_key] = original_token_permute
+
+        def _meta_safe_token_permute(
+            tokens,
+            indices,
+            num_out_tokens=None,
+            padded_mode=False,
+        ):  # noqa: ANN001
+            if tokens.device.type != "meta":
+                return original_token_permute(
+                    tokens,
+                    indices,
+                    num_out_tokens=num_out_tokens,
+                    padded_mode=padded_mode,
+                )
+            return run_meta_moe_token_permute(
+                original_token_permute,
+                tokens,
+                indices,
+                num_out_tokens,
+                padded_mode,
+            )
+
+        torch_npu.npu_moe_token_permute = _meta_safe_token_permute
 
     def _meta_safe_token_dispatch(self, mod, inputs, device_mesh):  # noqa: ANN001
         routed_input, num_tokens_per_expert, routed_scores = inputs
@@ -568,16 +607,9 @@ def _patch_moe_dispatch_to_avoid_meta_tensor_value_reads() -> None:
         if not is_fake_process_group(group):
             return original_token_dispatch(self, mod, inputs, device_mesh)
 
-        # Record EP all_to_all comm events before short-circuiting.
-        # EP all_to_all is part of MoE compute (L1), same as CP P2P/allgather.
-        global _comm_layer
-        _comm_layer = "L1"
-        from torchtitan_npu.simulator.capture.comm_events import get_active_recorder, _record_comm_with_l0
-        recorder = get_active_recorder()
-        if recorder is not None:
-            _record_comm_with_l0(recorder, "all_to_all", group, routed_input)
-            if routed_scores is not None:
-                _record_comm_with_l0(recorder, "all_to_all", group, routed_scores)
+        routed_input = run_meta_all_to_all(routed_input, group)
+        if routed_scores is not None:
+            routed_scores = run_meta_all_to_all(routed_scores, group)
 
         ep_degree = device_mesh.shape[0]
         num_local_experts = num_tokens_per_expert.shape[0] // ep_degree
@@ -600,28 +632,15 @@ def _patch_moe_dispatch_to_avoid_meta_tensor_value_reads() -> None:
 
     expert_parallel_cls._token_dispatch = _meta_safe_token_dispatch
 
-    # Also patch _token_combine to record the combine all_to_all before
-    # the is_fake early return skips it.
-    original_token_combine = expert_parallel_cls._token_combine
-
     def _meta_safe_token_combine(self, mod, routed_output, device_mesh):  # noqa: ANN001
         group = device_mesh.get_group()
         if not is_fake_process_group(group):
             return original_token_combine(self, mod, routed_output, device_mesh)
 
-        # Record combine all_to_all before short-circuiting
-        global _comm_layer
-        _comm_layer = "L1"
-        from torchtitan_npu.simulator.capture.comm_events import get_active_recorder, _record_comm_with_l0
-        recorder = get_active_recorder()
-        if recorder is not None:
-            _record_comm_with_l0(recorder, "all_to_all", group, routed_output)
-
-        # Original fake-mode logic: unpermute then return (skip all_to_all)
         routed_output = moe_dispatch_mod.NPUMoeTokenUnpermute.apply(
             routed_output, self.permuted_indices, routed_output.shape
         )
-        return routed_output
+        return run_meta_all_to_all(routed_output, group)
 
     expert_parallel_cls._token_combine = _meta_safe_token_combine
 
@@ -2859,8 +2878,13 @@ def unpatch_device_type_to_meta() -> None:
         _original_grouped_mm = _MISSING
 
     if _original_moe_token_dispatch is not _MISSING:
-        expert_parallel_cls, original_token_dispatch = _original_moe_token_dispatch
+        (
+            expert_parallel_cls,
+            original_token_dispatch,
+            original_token_combine,
+        ) = _original_moe_token_dispatch
         expert_parallel_cls._token_dispatch = original_token_dispatch
+        expert_parallel_cls._token_combine = original_token_combine
         _original_moe_token_dispatch = _MISSING
 
     if _original_li_loss_forward is not _MISSING:

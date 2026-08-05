@@ -24,7 +24,8 @@ def test_meta_grouped_experts_produces_shape_correct_expert_gradients():
         assert scores.shape == (12, 1)
         return torch.empty(x.shape[0], w2.shape[1], device=x.device)
 
-    capture = OpDispatchCapture()
+    phase = ["forward"]
+    capture = OpDispatchCapture(phase_provider=lambda: phase[0])
     grad_output = torch.empty(12, 8, device="meta")
     with capture:
         output = run_meta_grouped_experts(
@@ -37,15 +38,20 @@ def test_meta_grouped_experts_produces_shape_correct_expert_gradients():
             scores,
         )
         forward_event_count = len(capture._events)
+        phase[0] = "backward"
         output.backward(grad_output)
 
     assert x.grad is not None and x.grad.shape == x.shape
     assert w13.grad is not None and w13.grad.shape == w13.shape
     assert w2.grad is not None and w2.grad.shape == w2.shape
     assert scores.grad is not None and scores.grad.shape == scores.shape
-    # The shim only repairs autograd connectivity. Shape-only gradients must
-    # not add fabricated operators to the downstream workload graph.
-    backward_op_types = {
-        event.raw_op_type for event in capture._events[forward_event_count:]
-    }
-    assert backward_op_types <= {"aten.detach.default"}
+    backward_events = capture._events[forward_event_count:]
+    grouped_mm_events = [event for event in backward_events if event.raw_op_type == "aten._grouped_mm.default"]
+    assert len(grouped_mm_events) == 4
+    assert [event.outputs[0].shape for event in grouped_mm_events] == [
+        (12, 8),
+        (4, 8, 8),
+        (12, 8),
+        (4, 16, 8),
+    ]
+    assert all(event.phase == "backward" for event in grouped_mm_events)

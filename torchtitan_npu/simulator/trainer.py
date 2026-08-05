@@ -13,15 +13,15 @@ from __future__ import annotations
 import os
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
 from torchtitan.trainer import Trainer
 
+from torchtitan_npu.simulator.capture.checkpoint_execution import install_checkpoint_execution_tracking
 from torchtitan_npu.simulator.capture.comm_events import capture_fake_collectives
 from torchtitan_npu.simulator.capture.comm_group_resolver import resolve_comm_event_groups
-from torchtitan_npu.simulator.capture.checkpoint_execution import install_checkpoint_execution_tracking
 from torchtitan_npu.simulator.capture.dispatch_capture import OpDispatchCapture
 from torchtitan_npu.simulator.capture.module_path import ModulePathTracker
 from torchtitan_npu.simulator.capture.schedule_builder import (
@@ -31,8 +31,10 @@ from torchtitan_npu.simulator.capture.schedule_builder import (
 from torchtitan_npu.simulator.capture.step_boundary import StepBoundaryTracker, build_step_graphs
 from torchtitan_npu.simulator.capture.workload_builder import build_workload_graph
 from torchtitan_npu.simulator.hardware_shims.mhc_converter import apply_mhc_shims
+from torchtitan_npu.simulator.hardware_shims.rms_norm_converter import (
+    apply_rms_norm_shims,
+)
 from torchtitan_npu.simulator.hardware_shims.smla_converter import apply_smla_shims
-from torchtitan_npu.simulator.ir.workload_graph import WorkloadGraph
 from torchtitan_npu.simulator.memory.export import (
     export_memory_details,
     export_memory_summary,
@@ -46,6 +48,11 @@ from torchtitan_npu.simulator.viz.dot_export import export_dot
 from torchtitan_npu.simulator.viz.html_export import export_html
 from torchtitan_npu.simulator.viz.json_export import export_json
 from torchtitan_npu.simulator.viz.text_summary import write_text_summary
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from torchtitan_npu.simulator.ir.workload_graph import WorkloadGraph
 
 
 def _l0_csv_filename(
@@ -440,6 +447,7 @@ class SimulationTrainer(Trainer):
         force_deterministic_seed(config)
         config.compile.enable = False  # tracing needs eager dispatch, not a compiled graph
         apply_mhc_shims()
+        apply_rms_norm_shims()
         apply_smla_shims()
         _strip_hardware_dependent_model_converters(config)
         if hasattr(config.optimizer, "swap_optimizer"):

@@ -46,6 +46,23 @@ def test_unpatch_restores_torch_split():
     assert torch.split is original
 
 
+def test_unpatch_restores_both_moe_expert_parallel_methods():
+    pytest.importorskip("torch_npu", reason="torch_npu-specific regression test")
+    from torchtitan_npu.converters.kernels.moe_dispatch import NpuExpertParallel
+
+    original_dispatch = NpuExpertParallel._token_dispatch
+    original_combine = NpuExpertParallel._token_combine
+    try:
+        patch_device_type_to_meta()
+        assert NpuExpertParallel._token_dispatch is not original_dispatch
+        assert NpuExpertParallel._token_combine is not original_combine
+    finally:
+        unpatch_device_type_to_meta()
+
+    assert NpuExpertParallel._token_dispatch is original_dispatch
+    assert NpuExpertParallel._token_combine is original_combine
+
+
 def test_patch_installs_and_restores_fused_adamw_shim():
     original = torch._fused_adamw_
     patch_device_type_to_meta()
