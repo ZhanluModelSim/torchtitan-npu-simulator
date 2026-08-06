@@ -5,9 +5,17 @@
 
 import torch
 
-from torchtitan_npu.models.kimi_k3.attention import KimiDeltaAttention
+from torchtitan_npu.converters.kernels.kimi_k3_moe import (
+    NpuKimiRMSNormGated,
+)
+from torchtitan_npu.models.kimi_k3.attention import (
+    KimiDeltaAttention,
+    RMSNormGated,
+)
 from torchtitan_npu.simulator.capture.dispatch_capture import OpDispatchCapture
-from torchtitan_npu.simulator.hardware_shims.kda_converter import apply_kda_shims
+from torchtitan_npu.simulator.hardware_shims.kda_converter import (
+    apply_kimi_k3_shims,
+)
 
 
 def _build_attention() -> KimiDeltaAttention:
@@ -22,8 +30,8 @@ def test_kda_binding_preserves_module_identity_and_hooks():
     module_id = id(attention)
     hook_ids = set(attention._forward_hooks)
 
-    apply_kda_shims(attention)
-    apply_kda_shims(attention)
+    apply_kimi_k3_shims(attention)
+    apply_kimi_k3_shims(attention)
 
     assert id(attention) == module_id
     assert set(attention._forward_hooks) == hook_ids
@@ -33,7 +41,7 @@ def test_kda_binding_preserves_module_identity_and_hooks():
 
 def test_kda_core_records_only_fused_forward_and_backward_nodes():
     attention = _build_attention()
-    apply_kda_shims(attention)
+    apply_kimi_k3_shims(attention)
     tensors = [
         torch.empty(
             1,
@@ -59,3 +67,28 @@ def test_kda_core_records_only_fused_forward_and_backward_nodes():
     assert raw_names.count("triton_ascend_kernels.chunk_kda_grad") == 1
     assert "aten.empty_like.default" not in raw_names
     assert output.shape == tensors[2].shape
+
+
+def test_kimi_gated_rms_norm_uses_new_module_level_autograd_shim():
+    module = NpuKimiRMSNormGated(RMSNormGated(16))
+    apply_kimi_k3_shims(module)
+    apply_kimi_k3_shims(module)
+    x = torch.empty((2, 3, 16), device="meta", requires_grad=True)
+    gate = torch.empty_like(x, requires_grad=True)
+    phase = {"value": "forward"}
+    capture = OpDispatchCapture(phase_provider=lambda: phase["value"])
+
+    with capture:
+        output = module(x, gate)
+        phase["value"] = "backward"
+        output.sum().backward()
+
+    raw_names = [
+        node.annotations["raw_op_type"]
+        for node in capture.build_nodes().values()
+    ]
+    assert raw_names.count("npu.npu_rms_norm.default") == 1
+    assert raw_names.count("npu.npu_rms_norm_backward.default") == 1
+    assert module._simulator_gated_rms_norm_shim_installed is True
+    assert x.grad is not None
+    assert gate.grad is not None

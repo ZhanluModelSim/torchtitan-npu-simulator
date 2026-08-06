@@ -24,17 +24,17 @@ def _rank_table() -> RankTable:
     )
 
 
-def test_build_schedule_graph_creates_one_instance_per_rank():
+def test_build_schedule_graph_creates_rank_local_instance():
     template = StepGraph(step_id="tmpl", step_type="forward", nodes={})
     graph = build_schedule_graph(
         step_templates={"tmpl": template}, rank_table=_rank_table(), comm_events=[],
     )
-    assert len(graph.instances) == 4
-    assert {i.instance_id for i in graph.instances} == {"rank0", "rank1", "rank2", "rank3"}
+    assert len(graph.instances) == 1
+    assert {i.instance_id for i in graph.instances} == {"rank0_tmpl"}
     assert all(i.step_ref == "tmpl" for i in graph.instances)
 
 
-def test_build_schedule_graph_expands_comm_event_into_data_passes():
+def test_build_schedule_graph_creates_rank_local_collective_data_pass():
     template = StepGraph(step_id="tmpl", step_type="forward", nodes={})
     event = CommEvent(
         event_id="c1", comm_primitive="all_to_all", group_name="grp_ep",
@@ -43,15 +43,16 @@ def test_build_schedule_graph_expands_comm_event_into_data_passes():
     graph = build_schedule_graph(
         step_templates={"tmpl": template}, rank_table=_rank_table(), comm_events=[event],
     )
-    # ep groups are [0,1] and [2,3]: exactly one pass per group (single pair each)
-    assert len(graph.data_passes) == 2
-    pass_pairs = {(p.src_instance, p.dst_instance) for p in graph.data_passes}
-    assert pass_pairs == {("rank0", "rank1"), ("rank2", "rank3")}
+    # Capture is rank-local: a collective invocation is represented once and
+    # retains its communication dimension/group metadata.
+    assert len(graph.data_passes) == 1
+    assert graph.data_passes[0].src_instance == "rank0"
+    assert graph.data_passes[0].dst_instance == "group:"
     assert all(p.comm_primitive == "all_to_all" for p in graph.data_passes)
     assert all(p.requires_communication for p in graph.data_passes)
 
 
-def test_build_schedule_graph_ignores_comm_event_with_unknown_group():
+def test_build_schedule_graph_preserves_collective_with_unknown_group_name():
     template = StepGraph(step_id="tmpl", step_type="forward", nodes={})
     event = CommEvent(
         event_id="c2", comm_primitive="allreduce", group_name="totally_unrecognized_group",
@@ -60,7 +61,9 @@ def test_build_schedule_graph_ignores_comm_event_with_unknown_group():
     graph = build_schedule_graph(
         step_templates={"tmpl": template}, rank_table=_rank_table(), comm_events=[event],
     )
-    assert graph.data_passes == []
+    assert len(graph.data_passes) == 1
+    assert graph.data_passes[0].src_instance == "rank0"
+    assert graph.data_passes[0].comm_primitive == "allreduce"
 
 
 def test_build_schedule_graph_carries_rank_table_in_annotations():

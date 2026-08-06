@@ -30,9 +30,8 @@ from torchtitan_npu.simulator.capture.schedule_builder import (
 )
 from torchtitan_npu.simulator.capture.step_boundary import StepBoundaryTracker, build_step_graphs
 from torchtitan_npu.simulator.capture.workload_builder import build_workload_graph
-from torchtitan_npu.simulator.hardware_shims.kda_converter import apply_kda_shims
-from torchtitan_npu.simulator.hardware_shims.rms_norm_shim import (
-    apply_rms_norm_autograd_shim,
+from torchtitan_npu.simulator.hardware_shims.kda_converter import (
+    apply_kimi_k3_shims,
 )
 from torchtitan_npu.simulator.hardware_shims.mhc_converter import apply_mhc_shims
 from torchtitan_npu.simulator.hardware_shims.rms_norm_converter import (
@@ -471,7 +470,6 @@ class SimulationTrainer(Trainer):
         apply_mhc_shims()
         apply_rms_norm_shims()
         apply_smla_shims()
-        apply_rms_norm_autograd_shim()
         _strip_hardware_dependent_model_converters(config)
         if hasattr(config.optimizer, "swap_optimizer"):
             # swap_optimizer (NPU-specific host/device state swapping to
@@ -506,10 +504,10 @@ class SimulationTrainer(Trainer):
             _patch_parallel_dims_for_multi_proc(full_ws, gloo_ws)
 
         super().__init__(config)
-        # Bind KDA after model construction so TP/CP/FSDP hooks and distributed
-        # parameters remain attached to the original attention module.
+        # Bind Kimi shims after model construction so TP/CP/FSDP hooks and
+        # distributed parameters remain attached to the original modules.
         for model_part in self.model_parts:
-            apply_kda_shims(model_part)
+            apply_kimi_k3_shims(model_part)
         self.simulation_config = config.simulation
         self.workload_graph: WorkloadGraph | None = None
 

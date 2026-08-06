@@ -35,7 +35,7 @@ def _default_converters() -> list:
 def kimi_k3_smoketest() -> TrainerConfig:
     """Minimal smoketest: 4-layer debug model, 2 steps, random weights."""
     return TrainerConfig(
-        hf_assets_path="./tests/assets/tokenizer",
+        hf_assets_path="./tests/assets/tokenizer/deepseekv3_tokenizer",
         model_spec=model_registry("debug"),
         debug=DebugConfig(print_config=True),
         model_converters=ModelConvertersContainer.Config(
@@ -78,7 +78,7 @@ def kimi_k3_smoketest() -> TrainerConfig:
 def kimi_k3_16layer_reduced() -> TrainerConfig:
     """16-layer reduced model for single-node validation (matches MindSpeed-MM A3 config)."""
     return TrainerConfig(
-        hf_assets_path="./tests/assets/tokenizer",
+        hf_assets_path="./tests/assets/tokenizer/deepseekv3_tokenizer",
         model_spec=model_registry("16layer_reduced"),
         debug=DebugConfig(print_config=True),
         model_converters=ModelConvertersContainer.Config(converters=_default_converters()),
