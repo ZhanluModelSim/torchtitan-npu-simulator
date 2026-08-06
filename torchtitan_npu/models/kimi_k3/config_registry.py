@@ -7,7 +7,12 @@
 
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import MetricsProcessor
-from torchtitan.config import ActivationCheckpointConfig, DebugConfig
+from torchtitan.config import (
+    ActivationCheckpointConfig,
+    CommConfig,
+    CompileConfig,
+    DebugConfig,
+)
 from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
 from torchtitan.protocols.model_converter import ModelConvertersContainer
 
@@ -32,17 +37,94 @@ def _default_converters() -> list:
     ]
 
 
-def kimi_k3_smoketest() -> TrainerConfig:
-    """Minimal smoketest: 4-layer debug model, 2 steps, random weights."""
+def _parallelism(*, expert_parallel_degree: int = 128) -> ParallelismConfig:
+    """Return the Kimi K3 baseline parallel layout.
+
+    Kimi K3 is an MoE model, so the production baseline shards parameters
+    through FSDP and distributes routed experts across 128 EP ranks. Other
+    dimensions stay disabled unless a recipe explicitly opts into them.
+    """
+    return ParallelismConfig(
+        data_parallel_replicate_degree=1,
+        data_parallel_shard_degree=-1,
+        tensor_parallel_degree=1,
+        pipeline_parallel_degree=1,
+        expert_parallel_degree=expert_parallel_degree,
+        expert_tensor_parallel_degree=1,
+        context_parallel_degree=1,
+    )
+
+
+def _trainer_config(
+    *,
+    flavor: str,
+    training: TrainingConfig,
+    optimizer: OptimizerConfig,
+    lr_scheduler: LRSchedulersContainer.Config,
+    parallelism: ParallelismConfig,
+    activation_checkpoint: ActivationCheckpointConfig,
+    print_config: bool,
+) -> TrainerConfig:
     return TrainerConfig(
         hf_assets_path="./tests/assets/tokenizer/deepseekv3_tokenizer",
-        model_spec=model_registry("debug"),
-        debug=DebugConfig(print_config=True),
+        model_spec=model_registry(flavor),
+        debug=DebugConfig(print_config=print_config),
+        comm=CommConfig(trace_buf_size=0),
         model_converters=ModelConvertersContainer.Config(
             converters=_default_converters()
         ),
         metrics=MetricsProcessor.Config(log_freq=1),
         dataloader=HuggingFaceTextDataLoader.Config(dataset="c4_test"),
+        optimizer=optimizer,
+        lr_scheduler=lr_scheduler,
+        training=training,
+        parallelism=parallelism,
+        checkpoint=CheckpointConfig(enable=False),
+        activation_checkpoint=activation_checkpoint,
+        compile=CompileConfig(enable=False, components=["model", "loss"]),
+        profiling=ProfilingConfig(enable_profiling=False),
+    )
+
+
+def kimi_k3_baseline() -> TrainerConfig:
+    """Full Kimi K3 baseline with FSDP auto-sharding and EP=128."""
+    return _trainer_config(
+        flavor="full",
+        training=TrainingConfig(
+            local_batch_size=1,
+            seq_len=4096,
+            max_norm=1.0,
+            steps=2000,
+        ),
+        optimizer=OptimizerConfig(
+            name="AdamW",
+            lr=2.2e-4,
+            eps=1e-8,
+            swap_optimizer=True,
+            swap_optimizer_times=16,
+        ),
+        lr_scheduler=LRSchedulersContainer.Config(
+            warmup_steps=2000,
+            decay_ratio=0.8,
+            decay_type="cosine",
+            min_lr_factor=0.1,
+        ),
+        parallelism=_parallelism(),
+        activation_checkpoint=ActivationCheckpointConfig(mode="full"),
+        print_config=True,
+    )
+
+
+def kimi_k3_smoketest() -> TrainerConfig:
+    """Minimal 4-layer recipe; EP=1 is intentional for local debugging."""
+    return _trainer_config(
+        flavor="debug",
+        training=TrainingConfig(
+            local_batch_size=2,
+            seq_len=512,
+            max_norm=1.0,
+            steps=2,
+        ),
         optimizer=OptimizerConfig(
             name="AdamW",
             lr=1e-4,
@@ -54,36 +136,22 @@ def kimi_k3_smoketest() -> TrainerConfig:
             decay_type="cosine",
             min_lr_factor=0.1,
         ),
-        training=TrainingConfig(
-            local_batch_size=2,
-            seq_len=512,
-            max_norm=1.0,
-            steps=2,
-        ),
-        parallelism=ParallelismConfig(
-            data_parallel_replicate_degree=1,
-            data_parallel_shard_degree=-1,
-            tensor_parallel_degree=1,
-            pipeline_parallel_degree=1,
-            expert_parallel_degree=1,
-            expert_tensor_parallel_degree=1,
-            context_parallel_degree=1,
-        ),
-        checkpoint=CheckpointConfig(enable=False),
+        parallelism=_parallelism(expert_parallel_degree=1),
         activation_checkpoint=ActivationCheckpointConfig(mode="selective"),
-        profiling=ProfilingConfig(enable_profiling=False),
+        print_config=True,
     )
 
 
 def kimi_k3_16layer_reduced() -> TrainerConfig:
     """16-layer reduced model for single-node validation (matches MindSpeed-MM A3 config)."""
-    return TrainerConfig(
-        hf_assets_path="./tests/assets/tokenizer/deepseekv3_tokenizer",
-        model_spec=model_registry("16layer_reduced"),
-        debug=DebugConfig(print_config=True),
-        model_converters=ModelConvertersContainer.Config(converters=_default_converters()),
-        metrics=MetricsProcessor.Config(log_freq=1),
-        dataloader=HuggingFaceTextDataLoader.Config(dataset="c4_test"),
+    return _trainer_config(
+        flavor="16layer_reduced",
+        training=TrainingConfig(
+            local_batch_size=1,
+            seq_len=4096,
+            max_norm=1.0,
+            steps=20,
+        ),
         optimizer=OptimizerConfig(
             name="AdamW",
             lr=2.2e-4,
@@ -97,22 +165,7 @@ def kimi_k3_16layer_reduced() -> TrainerConfig:
             decay_type="cosine",
             min_lr_factor=0.1,
         ),
-        training=TrainingConfig(
-            local_batch_size=1,
-            seq_len=4096,
-            max_norm=1.0,
-            steps=20,
-        ),
-        parallelism=ParallelismConfig(
-            data_parallel_replicate_degree=1,
-            data_parallel_shard_degree=-1,
-            tensor_parallel_degree=1,
-            pipeline_parallel_degree=1,
-            expert_parallel_degree=4,
-            expert_tensor_parallel_degree=1,
-            context_parallel_degree=1,
-        ),
-        checkpoint=CheckpointConfig(enable=False),
+        parallelism=_parallelism(),
         activation_checkpoint=ActivationCheckpointConfig(mode="full"),
-        profiling=ProfilingConfig(enable_profiling=False),
+        print_config=True,
     )

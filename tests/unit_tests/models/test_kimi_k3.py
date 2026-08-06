@@ -30,6 +30,29 @@ def _stub_kda_kernel(monkeypatch):
 
 
 class TestModelRegistry:
+    def test_baseline_uses_only_fsdp_and_ep_parallelism(self):
+        from torchtitan_npu.models.kimi_k3.config_registry import kimi_k3_baseline
+
+        parallelism = kimi_k3_baseline().parallelism
+        assert parallelism.data_parallel_shard_degree == -1
+        assert parallelism.expert_parallel_degree == 128
+        assert parallelism.data_parallel_replicate_degree == 1
+        assert parallelism.tensor_parallel_degree == 1
+        assert parallelism.pipeline_parallel_degree == 1
+        assert parallelism.expert_tensor_parallel_degree == 1
+        assert parallelism.context_parallel_degree == 1
+
+    def test_simulator_config_reuses_baseline_parallelism(self):
+        from torchtitan_npu.models.kimi_k3.config_registry import kimi_k3_baseline
+        from torchtitan_npu.simulator.config_registry import kimi_k3_full_simulate
+
+        training_config = kimi_k3_baseline()
+        simulation_config = kimi_k3_full_simulate()
+
+        assert simulation_config.parallelism == training_config.parallelism
+        assert simulation_config.compile.components == training_config.compile.components
+        assert simulation_config.compile.enable is False
+
     def test_smoketest_enables_required_npu_converters(self):
         from torchtitan_npu.models.kimi_k3.config_registry import (
             kimi_k3_smoketest,
