@@ -30,10 +30,30 @@ from torchtitan_npu.converters.model_custom_interface import (
     ParallelizePlanUpdater,
 )
 from torchtitan_npu.converters.registry import register_model_converter
+from torchtitan_npu.distributed.activation_checkpoint import (
+    ALL_TO_ALL_SAC_SAVE_OPS,
+    retain_op_output,
+)
 from torchtitan_npu.distributed.process_group import is_fake_process_group
 from torchtitan_npu.models.deepseek_v4.moe import MoE as DeepSeekV4MoE
 
 NpuTokenDispatchResult = tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]
+
+
+def _retained_all_to_all_single(
+    tensor: torch.Tensor,
+    output_splits: list[int] | None,
+    input_splits: list[int] | None,
+    group: Any,
+) -> torch.Tensor:
+    return retain_op_output(
+        ALL_TO_ALL_SAC_SAVE_OPS,
+        all_to_all_single_autograd,
+        tensor,
+        output_splits,
+        input_splits,
+        group,
+    )
 
 
 class _LocalExpertInputs(NamedTuple):
@@ -172,7 +192,9 @@ class NpuExpertParallel(ExpertParallel):
                 num_tokens_per_expert_group = num_tokens_per_expert
                 output_splits = input_splits
             else:
-                num_tokens_per_expert_group = all_to_all_single(
+                num_tokens_per_expert_group = retain_op_output(
+                    ALL_TO_ALL_SAC_SAVE_OPS,
+                    all_to_all_single,
                     num_tokens_per_expert,
                     None,
                     None,
@@ -200,20 +222,20 @@ class NpuExpertParallel(ExpertParallel):
 
         is_fake = is_fake_process_group(device_mesh.get_group())
         if not is_fake:
-            # perform all-to-all
-            routed_input = all_to_all_single_autograd(
+            group = device_mesh.get_group()
+            routed_input = _retained_all_to_all_single(
                 routed_input,
                 self.output_splits,
                 self.input_splits,
-                device_mesh.get_group(),
+                group,
             )
 
             if routed_scores is not None:
-                routed_scores = all_to_all_single_autograd(
+                routed_scores = _retained_all_to_all_single(
                     routed_scores,
                     self.output_splits,
                     self.input_splits,
-                    device_mesh.get_group(),
+                    group,
                 )
 
         # NOTE: After this all-to-all, the routed input is put on proper EP rank.
@@ -261,7 +283,7 @@ class NpuExpertParallel(ExpertParallel):
         if is_fake_process_group(device_mesh.get_group()):
             return routed_output
 
-        routed_output = all_to_all_single_autograd(
+        routed_output = _retained_all_to_all_single(
             routed_output,
             self.input_splits,
             self.output_splits,

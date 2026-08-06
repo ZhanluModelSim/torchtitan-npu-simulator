@@ -11,6 +11,7 @@
 
 import logging
 from collections.abc import Callable
+from functools import cache
 
 import torch
 import torch_npu
@@ -27,10 +28,14 @@ from torchtitan_npu.converters.model_custom_interface import (
     StateDictUpdater,
 )
 from torchtitan_npu.converters.registry import register_model_converter
+from torchtitan_npu.distributed.activation_checkpoint import retain_op_output
 from torchtitan_npu.tools.weight_utils import _split_w13_for_mapping, fuse_experts
 
 logger = logging.getLogger(__name__)
 
+_GROUPED_MM_ATTR = "_grouped_mm"
+_ATEN_GROUPED_MM_SAC_SAVE_OPS = frozenset({getattr(torch.ops.aten, _GROUPED_MM_ATTR).default})
+NPU_GMM_SAC_SAVE_OPS = _ATEN_GROUPED_MM_SAC_SAVE_OPS | {torch.ops.npu.npu_grouped_matmul.default}
 _GROUPED_MM_INT32_OFFSET_MAX = torch.iinfo(torch.int32).max
 _ExpertActivationFn = Callable[[torch.Tensor, float | None, torch.Tensor | None], torch.Tensor]
 _DYNAMO_ATTR = "_dynamo"
@@ -82,6 +87,35 @@ def _validate_grouped_mm_offsets_int32_range(x: torch.Tensor) -> None:
             f"above the int32 limit {_GROUPED_MM_INT32_OFFSET_MAX}. "
             "Reduce the per-rank MoE workload."
         )
+
+
+@cache
+def _get_mxfp8_weight_wrapper_type() -> type[torch.Tensor] | None:
+    # Resolve after torchtitan_npu has installed its torchao NPU patches.
+    try:
+        from torchao.prototype.moe_training.tensor import MXFP8TrainingWeightWrapperTensor
+    except ModuleNotFoundError:
+        return None
+    return MXFP8TrainingWeightWrapperTensor
+
+
+def _call_grouped_mm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    offsets: torch.Tensor,
+) -> torch.Tensor:
+    grouped_mm = getattr(torch, _GROUPED_MM_ATTR)
+    # The MXFP8 override retains its concrete backend GMM.
+    mxfp8_wrapper_type = _get_mxfp8_weight_wrapper_type()
+    if mxfp8_wrapper_type is not None and isinstance(weight, mxfp8_wrapper_type):
+        return grouped_mm(x, weight, offs=offsets)
+    return retain_op_output(
+        _ATEN_GROUPED_MM_SAC_SAVE_OPS,
+        grouped_mm,
+        x,
+        weight,
+        offs=offsets,
+    )
 
 
 def _expert_activation(
@@ -142,9 +176,17 @@ def _run_experts_grouped_mm(
     offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
     if w13 is None:
         raise ValueError("w13 cannot be None for grouped_mm experts")
-    h = torch._grouped_mm(x.bfloat16(), w13.bfloat16().transpose(-2, -1), offs=offsets)
+    h = _call_grouped_mm(
+        x.bfloat16(),
+        w13.bfloat16().transpose(-2, -1),
+        offsets,
+    )
     h = activation_fn(h, swiglu_limit, routed_scores)
-    out = torch._grouped_mm(h, w2.bfloat16().transpose(-2, -1), offs=offsets).type_as(x)
+    out = _call_grouped_mm(
+        h,
+        w2.bfloat16().transpose(-2, -1),
+        offsets,
+    ).type_as(x)
 
     return out
 

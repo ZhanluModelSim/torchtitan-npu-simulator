@@ -33,6 +33,11 @@ def _call_token_dispatch(parallel_style, inputs, device_mesh):
     return token_dispatch(torch.nn.Module(), inputs, device_mesh)
 
 
+def _call_token_combine(parallel_style, routed_output, device_mesh):
+    token_combine = attrgetter("_token_combine")(parallel_style)
+    return token_combine(torch.nn.Module(), routed_output, device_mesh)
+
+
 def test_moe_dispatch_config_wires_converter_and_plan_updater():
     expert_parallel = _expert_parallel_module()
 
@@ -143,9 +148,20 @@ def test_token_dispatch_real_process_group_routes_scores_through_re_routing(monk
     class FakeReRouting:
         apply = staticmethod(fake_re_routing_apply)
 
+    class FakeUnpermute:
+        @staticmethod
+        def apply(routed_output, _indices, _shape):
+            return routed_output
+
+    def fake_retain(save_ops, function, *args, **kwargs):
+        seen.setdefault("retained_ops", []).append(set(save_ops))
+        return function(*args, **kwargs)
+
     monkeypatch.setattr(moe_dispatch, "all_to_all_single", fake_all_to_all_single)
     monkeypatch.setattr(moe_dispatch, "all_to_all_single_autograd", fake_all_to_all_single_autograd)
     monkeypatch.setattr(moe_dispatch, "NPUMoeReRouting", FakeReRouting)
+    monkeypatch.setattr(moe_dispatch, "NPUMoeTokenUnpermute", FakeUnpermute)
+    monkeypatch.setattr(moe_dispatch, "retain_op_output", fake_retain)
 
     parallel_style = moe_dispatch.NpuExpertParallel()
     routed_input = torch.arange(20, dtype=torch.float32).view(10, 2)
@@ -167,8 +183,16 @@ def test_token_dispatch_real_process_group_routes_scores_through_re_routing(monk
     assert torch.equal(seen["rerouting_counts"], num_tokens_per_expert_group.view(2, 2))
     assert torch.equal(output, routed_input + 101)
     assert torch.equal(output_scores, routed_scores + 201)
+    combined = _call_token_combine(parallel_style, output, device_mesh)
+    assert torch.equal(combined, output + 100)
     assert torch.equal(parallel_style.permuted_indices, torch.arange(10))
     assert torch.equal(num_tokens_per_local_expert, torch.tensor([6, 4], dtype=torch.int64))
+    assert seen["retained_ops"] == [
+        set(moe_dispatch.ALL_TO_ALL_SAC_SAVE_OPS),
+        set(moe_dispatch.ALL_TO_ALL_SAC_SAVE_OPS),
+        set(moe_dispatch.ALL_TO_ALL_SAC_SAVE_OPS),
+        set(moe_dispatch.ALL_TO_ALL_SAC_SAVE_OPS),
+    ]
 
 
 def test_dsv4_forward_runs_routed_experts_before_shared_experts(monkeypatch):

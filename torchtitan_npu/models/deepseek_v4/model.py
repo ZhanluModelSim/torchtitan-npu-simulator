@@ -24,6 +24,10 @@ from torchtitan.models.utils import get_dense_model_nparams_and_flops
 from torchtitan.protocols.model import BaseModel
 from torchtitan.protocols.module import Module, ModuleDict
 
+from torchtitan_npu.distributed.activation_checkpoint import (
+    BMM_SAC_SAVE_OPS,
+    retain_op_output,
+)
 from torchtitan_npu.models.common.dsa_indexer_loss import (
     DSAIndexerLoss,
     DSAIndexerLossAutoScaler,
@@ -35,6 +39,8 @@ from .moe import MoE, MoEArgs
 from .tnd import smla_attn_type, smla_get_attention_masks, smla_layers
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from torchtitan.models.common.attention import AttentionMasksType
 
 logger = logging.getLogger()
@@ -845,6 +851,31 @@ class InnerAttention(Module):
         return o, compress_topk_idxs, index_score
 
 
+def _retained_output_projection_impl(
+    output: torch.Tensor,
+    projection: Linear,
+    projection_rank: int,
+) -> torch.Tensor:
+    leading_shape = output.shape[:-2]
+    n_groups = output.shape[-2]
+    # Keep tensor-subclass weights inside this eager region instead of carrying them across the graph break.
+    weight = projection.weight.view(n_groups, projection_rank, -1)
+    output = output.flatten(0, -3).transpose(0, 1)
+    output = retain_op_output(
+        BMM_SAC_SAVE_OPS,
+        torch.bmm,
+        output,
+        weight.transpose(1, 2),
+    )
+    return output.transpose(0, 1).reshape(*leading_shape, n_groups, -1)
+
+
+_retained_output_projection = cast(
+    "Callable[[torch.Tensor, Linear, int], torch.Tensor]",
+    torch.compiler.disable(_retained_output_projection_impl),
+)
+
+
 class PostAttention(Module):
     """Post-attention module: compilable output projection after the NPU attention kernel."""
 
@@ -870,10 +901,15 @@ class PostAttention(Module):
             out_features=args.dim,
             bias=False,
         ).build()
+        self._retain_output_projection = False
+
+    def enable_output_projection_retention(self) -> None:
+        self._retain_output_projection = True
+        self._requires_compile_graph_break = True
 
     def forward(
         self,
-        o: torch.Tensor,
+        output: torch.Tensor,
         freqs_cis: torch.Tensor,
         bsz: int,
         seqlen: int,
@@ -882,18 +918,24 @@ class PostAttention(Module):
         input_layout: str = "BSND",
     ):
         rd = self.rope_head_dim
-        o_nope, o_rope = torch.split(o, [self.head_dim - rd, rd], dim=-1)
-        o_rope = apply_rotary_emb(o_rope, freqs_cis, True, positions=positions)
-        o = torch.cat([o_nope, o_rope], dim=-1)
+        output_nope, output_rope = torch.split(output, [self.head_dim - rd, rd], dim=-1)
+        output_rope = apply_rotary_emb(output_rope, freqs_cis, True, positions=positions)
+        output = torch.cat([output_nope, output_rope], dim=-1)
         if input_layout == "TND":
-            o = o.view(o.size(0), n_local_groups, -1)
+            output = output.view(output.size(0), n_local_groups, -1)
+            if self._retain_output_projection:
+                output = _retained_output_projection(output, self.wo_a, self.o_lora_rank)
+            else:
+                wo_a = self.wo_a.weight.view(n_local_groups, self.o_lora_rank, -1)
+                output = torch.einsum("tgd,grd->tgr", output, wo_a)
+            return self.wo_b(output.reshape(output.size(0), -1))
+        output = output.view(bsz, seqlen, n_local_groups, -1)
+        if self._retain_output_projection:
+            output = _retained_output_projection(output, self.wo_a, self.o_lora_rank)
+        else:
             wo_a = self.wo_a.weight.view(n_local_groups, self.o_lora_rank, -1)
-            o = torch.einsum("tgd,grd->tgr", o, wo_a)
-            return self.wo_b(o.reshape(o.size(0), -1))
-        o = o.view(bsz, seqlen, n_local_groups, -1)
-        wo_a = self.wo_a.weight.view(n_local_groups, self.o_lora_rank, -1)
-        o = torch.einsum("bsgd,grd->bsgr", o, wo_a)
-        return self.wo_b(o.reshape(bsz, seqlen, -1))
+            output = torch.einsum("bsgd,grd->bsgr", output, wo_a)
+        return self.wo_b(output.reshape(bsz, seqlen, -1))
 
     def init_weights(self, init_std: float):
         for linear in [self.wo_a, self.wo_b]:

@@ -23,6 +23,7 @@ import torch
 import torch_npu
 from einops import rearrange
 
+from torchtitan_npu.distributed.activation_checkpoint import retain_op_output
 from torchtitan_npu.patches.torchao_npu.activation_checkpoint_state import (
     is_in_recomputation,
     pop_gmm_quant_data,
@@ -33,6 +34,8 @@ from torchtitan_npu.patches.torchao_npu.mx_ac_config import (
     get_ac_mode,
     should_save_bwd_quant_for_mx,
 )
+
+_NPU_GROUPED_MATMUL_SAC_SAVE_OPS = frozenset({torch.ops.npu.npu_grouped_matmul.default})
 
 
 @torch._dynamo.allow_in_graph
@@ -82,7 +85,9 @@ class NpuMXFP8GroupedMM(torch.autograd.Function):
                 weight, axis=-2, dst_type=torch.float8_e4m3fn, scale_alg=1
             )
 
-        return torch_npu.npu_grouped_matmul(
+        return retain_op_output(
+            _NPU_GROUPED_MATMUL_SAC_SAVE_OPS,
+            torch_npu.npu_grouped_matmul,
             [x_mxfp8],
             [weight_mxfp8],
             bias=None,

@@ -53,22 +53,25 @@ from torchtitan.models.common import FlexAttention, VarlenAttention
 from torchtitan.models.llama3.parallelize import apply_replicate
 from torchtitan.models.llama4.parallelize import apply_fsdp
 
+from torchtitan_npu.converters.kernels.gmm import NPU_GMM_SAC_SAVE_OPS
 from torchtitan_npu.converters.kernels.rms_norm import NPURMSNorm
 from torchtitan_npu.converters.registry import has_npu_converter
 from torchtitan_npu.distributed.activation_checkpoint import (
+    ALL_TO_ALL_SAC_SAVE_OPS,
+    BMM_SAC_SAVE_OPS,
+    apply_scoped_selective_ac,
     extend_selective_ac_save_ops,
 )
 from torchtitan_npu.distributed.fsdp_parameter_precision import (
     apply_fsdp_parameter_precision,
 )
 from torchtitan_npu.models.common.dsa_indexer_loss import DSAIndexerLossLoggingHelper
-from torchtitan_npu.models.deepseek_v4.model import Attention
+from torchtitan_npu.models.deepseek_v4.model import Attention, PostAttention
 from torchtitan_npu.models.deepseek_v4.model import MoE as DeepSeekV4MoE
 
 logger = logging.getLogger(__name__)
 
 FSDP_MP_POLICY_ATTR = "_mp_policy"
-_GROUPED_MM_ATTR = "_grouped_mm"
 
 
 class AwaitRowwiseParallel(RowwiseParallel):
@@ -271,6 +274,15 @@ def _validate_deepseek_v4_parallelism(model_args, parallel_dims: ParallelDims) -
             )
 
 
+def _apply_deepseek_v4_scoped_selective_ac(model, ac_config) -> None:
+    save_ops = BMM_SAC_SAVE_OPS | ALL_TO_ALL_SAC_SAVE_OPS | NPU_GMM_SAC_SAVE_OPS
+    for module in model.modules():
+        if isinstance(module, PostAttention):
+            module.enable_output_projection_retention()
+
+    apply_scoped_selective_ac(model, ac_config, save_ops)
+
+
 def parallelize_deepseek_v4(
     model: nn.Module,
     *,
@@ -370,20 +382,27 @@ def parallelize_deepseek_v4(
 
     model_compile_enabled = compile_config.enable and "model" in compile_config.components
     npu_gmm_enabled = has_npu_converter(model_converters.converters, "npu_gmm")
-    save_grouped_mm_outputs = ac_config.mode == "selective" and model_compile_enabled and npu_gmm_enabled
+    npu_moe_dispatch_enabled = has_npu_converter(model_converters.converters, "npu_moe_dispatch")
+    # TP reduces the GMM2 output in place, which would mutate its retained local value.
+    save_grouped_mm_outputs = (
+        ac_config.mode == "selective" and model_compile_enabled and npu_gmm_enabled and not parallel_dims.tp_enabled
+    )
+    use_scoped_selective_ac = save_grouped_mm_outputs and npu_moe_dispatch_enabled and not use_deepep
 
-    if ac_config.mode != "none":
-        grouped_mm_op = getattr(torch.ops.aten, _GROUPED_MM_ATTR).default
-        save_ops = {grouped_mm_op} if save_grouped_mm_outputs else set()
-        with extend_selective_ac_save_ops(save_ops):
+    if use_scoped_selective_ac:
+        _apply_deepseek_v4_scoped_selective_ac(model, ac_config)
+        logger.info("Applied scoped selective AC")
+    elif ac_config.mode != "none":
+        additional_ops = NPU_GMM_SAC_SAVE_OPS if save_grouped_mm_outputs else frozenset()
+        with extend_selective_ac_save_ops(additional_ops):
             apply_ac(
                 model,
                 ac_config,
                 model_compile_enabled=model_compile_enabled,
                 base_folder=dump_folder,
             )
-        if save_grouped_mm_outputs:
-            logger.info("Selective AC will save grouped MM outputs")
+    if save_grouped_mm_outputs:
+        logger.info("Selective AC will save grouped MM outputs")
 
     if model_compile_enabled:
         if npu_gmm_enabled:
