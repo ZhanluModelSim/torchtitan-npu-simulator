@@ -12,6 +12,7 @@ logger = logging.getLogger(__name__)
 _PATCHED = False
 
 _LOWERINGS_TO_KEEP = (
+    ("copy_", "default"),
     ("view", "default"),
     ("reshape", "default"),
     ("view_as_complex", "default"),
