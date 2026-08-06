@@ -1,32 +1,32 @@
-# 新模型最终验收规范
+# 新模型最终验收规范（Meta 模拟器）
 
 本文定义什么时候可以判定一个新接入模型“可用”。它是模型开发完成后的最终验收，不是各开发步骤的局部验收。接入步骤见[新模型接入开发流程](../feature_guides/new_model_onboarding.md)。
 
 ## 1. 可用的定义
 
-只有同时满足以下条件，才可把模型标记为可用：
+只有同时满足以下条件，才可把模型标记为“模拟器建模可用”：
 
-1. 声明支持的训练特性和并行组合全部通过必选验证。
+1. 声明支持的模拟器特性和并行组合全部通过必选验证。
 2. 参数切分、核心算子、通信依赖和显存均有独立预期值，并与实测证据一致。
-3. 模拟器验证了结构、shape、依赖和资源估计，真实 NPU 验证了数值与训练生命周期。
+3. meta 路径验证了结构、shape、autograd 连通性、依赖和资源估计。
 4. 不支持的模式被明确记录并 fail fast，不能静默降级或产生看似成功的错误结果。
 5. 验收证据记录 commit、基线、配置、world size、软件版本和输出路径，可重复执行。
 
-“进程退出码为 0”“单卡 loss 能下降”或“模拟器能生成报告”都只是必要的局部信号，不能单独证明模型可用。
+“进程退出码为 0”或“模拟器能生成报告”都只是必要的局部信号，不能单独证明模型建模正确。meta 不产生可用于精度判断的 loss/grad norm 数值；真实 NPU 数值训练和硬件 profiler 是独立目标，不是本文的默认门槛。
 
 ## 2. 验收前准备
 
 验收前冻结以下输入：
 
 - 被测 commit 和它基于的训练主分支 commit。
-- 模型配置、tokenizer、数据、随机种子和 checkpoint。
-- 软件/硬件环境，包括 Docker 镜像或 digest、PyTorch、torch_npu、CANN、NPU 型号和 rank 数。
+- 模型配置、tokenizer/test asset、用于固定 MoE 路由的输入或策略，以及 state-dict 样本 schema。
+- 模拟环境，包括 Docker 镜像或 digest、PyTorch、torch_npu、CANN、模拟 world size 和 capture rank。
 - 模型支持矩阵，以及明确排除的功能。
 - 独立计算的参数量、逐层权重 shape、并行后 local shape。
 - 核心算子清单和理论调用次数。
 - 每种并行预期产生的通信类型、消息 shape/字节数和先后关系。
 
-建议先用 `debug` 规格定位，再用 `reduced` 规格完成真实 NPU 组合测试，最后用正式规格进行模拟器的容量与数量级验证。不能只用缩小后改变了 layer 类型、MoE 分布或 attention 规律的配置代替正式结构。
+建议先用 `debug` 规格定位，再用 `reduced` 规格完成 meta 核心组合测试，最后用正式规格进行模拟器的容量与数量级验证。不能只用缩小后改变了 layer 类型、MoE 分布或 attention 规律的配置代替正式结构。
 
 ## 3. 必测配置矩阵
 
@@ -64,7 +64,7 @@
 - 实际 layer 类型、数量和分布与配置一致。
 - 全局参数总量、逐层参数量和 tied weight 去重规则与独立公式一致。
 - state-dict 名称、shape、dtype 和合并/拆分顺序正确。
-- checkpoint save/load 后模型输出可重复，DCP/HF 转换路径按声明支持。
+- DCP/HF 转换路径按声明支持，保存/重新加载后 key、shape、dtype 和权重布局保持一致。
 
 静态参数字节数按实际 storage dtype 计算：
 
@@ -89,14 +89,18 @@ FQN, global_shape, local_shape, dtype, mesh, placement, replicated/sharded
 3. MoE routed expert 只出现在所属 EP rank；shared expert 的复制/切分符合设计。
 4. TP、ETP、FSDP 同时开启时，不重复切分同一维，也不漏掉应切分的维度。
 5. padding、对齐和空 expert rank 必须有显式解释。
-6. 每 rank 静态参数字节数与独立估算一致。确定性部分应精确匹配；只允许对明确记录的 padding/alignment 使用容差。
+6. 在一组小的并行对照矩阵中，静态参数字节数的变化与实际 placement 语义一致；不要求为所有模型建立通用的自动精确公式。
+
+建议至少对照单卡、FSDP/eFSDP、TP、EP、ETP、CP 和一个核心组合：FSDP 应降低可分片常驻权重；EP 主要影响 routed experts；ETP 只影响专家内部语义维；CP 不应改变静态权重。组合场景重点检查没有重复切分或漏切分，而非把所有参数简单除以 world size。
 
 FSDP/eFSDP 还需同时验证：
 
 - 常驻 shard 的大小。
 - 计算前 all-gather 后 full parameter 的 shape 和临时驻留。
 - 反向梯度 reduce-scatter 后的 local shape。
-- 模块边界上的 reshard 时机。
+- 直接通信依赖：all-gather 在首个消费者前，reduce-scatter 在最后一个梯度生产者后。
+
+`fsdp_state`、residency transition 和 L2 prefetch 标注属于公共模拟器调度能力，不是模型专用语义。非 PP 基线若所有模型都未产出这些标注，应以 L0 collective 的 group、shape 和 producer/consumer 边验收模型；公共标注缺失应单列为 simulator 任务，不能在新模型中引入特例补丁。
 
 ### 4.3 核心算子的 shape、数量和融合
 
@@ -109,7 +113,7 @@ FSDP/eFSDP 还需同时验证：
 | execution kind | original forward、recompute、backward、optimizer |
 | global/local shape | 各输入输出和关键权重 shape |
 | 理论次数 | 按 layer 数、激活专家数、microbatch、AC 模式计算 |
-| 实际次数 | profiler/模拟器统计值 |
+| 实际次数 | 模拟器统计值 |
 | 融合要求 | 允许的实现及禁止出现的小算子分解 |
 
 重点核对：
@@ -182,7 +186,7 @@ rank, process_group, collective/p2p type, tensor shape, bytes, peer/root, phase
 - sequence length、microbatch 或 expert token 数增加时，相关激活/workspace 应按理论阶数增长。
 - TP/CP/EP 改变的是对应语义维的 local tensor，而不是把所有显存简单除以 world size。
 
-静态可精确计算的部分应精确匹配；动态 workspace 或 allocator 差异可以使用预先声明的容差，但报告必须给出解析估算、模拟器结果和真实 NPU 结果三者的差异原因。只判断“数量级差不多”不足以验收静态参数和可确定激活。
+验收应给出各对照配置之间的变化原因和 peak 构成。对于模型特有 workspace 或动态 token 路由，重点验证量级、单调性和 tensor 生命周期逻辑；不要求使用真实 NPU allocator 结果作为基线。
 
 显存输出字段见[模拟器使用指南](../user-guides/simulator.md)，建模原则见[模拟器显存模型设计](../design/simulator-memory-model-design.md)。
 
@@ -191,28 +195,15 @@ rank, process_group, collective/p2p type, tensor shape, bytes, peer/root, phase
 在单卡和核心组合上检查：
 
 - memory estimator、snapshot 和逐 module/activation hook。
-- profiler、算子计数和 raw op 捕获。
+- 算子计数、raw op 捕获和 CSV/JSON 导出。
 - AC、activation offload、compile 等声明支持的图变换。
 - fused RMSNorm、GMM、attention 和模型特有算子是否仍被 hook。
-- optimizer、梯度裁剪、checkpoint save/load 和恢复训练。
+- optimizer、梯度裁剪，以及 checkpoint/state-dict schema 的 save/load 闭环。
 - converter 后模块 FQN、参数身份和 state-dict 路径是否稳定。
 
 任何 fused/custom op 若在统计、显存或依赖图中不可见，视为未兼容；不能以真实 kernel 尚未实现为由跳过 shape-only hook。
 
-### 4.7 真实 NPU 数值和端到端训练
-
-模拟器不计算真实数值，因此最终可用结论必须包含真实 NPU 验证：
-
-- 固定 checkpoint、数据、seed 和训练超参，与可信基线比较 loss、grad norm 和关键张量。
-- 检查 NaN/Inf、梯度缺失、异常 expert 负载和 rank 间分歧。
-- 执行足够多个 step，使 optimizer update、梯度累积和周期性 hook 至少触发一次。
-- 完成保存、退出、加载和继续训练。
-- 使用 profiler 确认实际融合算子与通信行为，不仅依赖模拟器推断。
-- 声明支持的核心组合至少完成一次真实 NPU reduced 规格训练。
-
-数值容差应按 dtype、算子实现和并行归约误差预先定义。发现偏离时，应进入精度定位流程，不能通过放大容差掩盖系统性错误。
-
-### 4.8 回归和可维护性
+### 4.7 回归和可维护性
 
 最后执行仓库现有单测、模型单测和 smoke test，并确认：
 
@@ -232,7 +223,7 @@ rank, process_group, collective/p2p type, tensor shape, bytes, peer/root, phase
 3. 不含 PP 的核心组合。
 4. 在单卡和核心组合上分别执行 AC 关闭/开启。
 5. 插件、hook、显存和依赖回放。
-6. 真实 NPU reduced 规格数值与恢复训练。
+6. state-dict/checkpoint schema 的 meta 闭环。
 7. 最后执行 PP 和含 PP 的最终组合。
 8. 正式规格模拟器容量验证及证据归档。
 
@@ -250,15 +241,6 @@ python3 scripts/run_simulator_spawn.py \
   --activation-checkpoint.mode full
 ```
 
-真实命令应使用该模型已注册的 module/config，并记录完整覆盖项，例如：
-
-```bash
-python3 -m torchtitan_npu.entry \
-  --module torchtitan_npu.models.<model> \
-  --config <reduced_config> \
-  <parallel_overrides>
-```
-
 ## 6. 验收证据模板
 
 每个必测配置保留一行汇总，并链接原始报告：
@@ -266,24 +248,23 @@ python3 -m torchtitan_npu.entry \
 | 字段 | 内容 |
 | --- | --- |
 | Commit/base | 被测 commit、训练主分支基线 |
-| Environment | Docker 镜像/digest、torch、torch_npu、CANN、NPU、rank 数 |
+| Environment | Docker 镜像/digest、torch、torch_npu、CANN、模拟 world size、capture rank |
 | Model/config | 模型 flavor、layer、seq、microbatch、dtype |
 | Parallel | DP/FSDP/eFSDP/TP/EP/ETP/CP/PP |
 | Features | AC、offload、compile、converter |
-| Parameters | 预期/实际全局和每 rank 数量、字节数 |
+| Parameters | 全局数量、每 rank 字节数及并行对照下的变化解释 |
 | Operators | 预期/实际核心 op shape 和 F/R/B 次数 |
 | Communication | 类型、次数、字节数、依赖校验结果 |
-| Memory | 解析值、模拟值、真实峰值及阶段 |
-| Numerics | loss、grad norm、容差、NaN/Inf |
-| Lifecycle | save/load/resume、hook/plugin 结果 |
-| Evidence | trace、CSV/JSON、profiler、日志路径 |
+| Memory | 模拟 peak、阶段、构成与 AC/并行对照 |
+| Lifecycle | state-dict schema save/load、hook/plugin 结果 |
+| Evidence | trace、CSV/JSON、memory report、日志路径 |
 | Result | PASS/FAIL，以及差异说明 |
 
 最终汇总应明确给出以下三种结论之一：
 
-- **Ready**：所有声明支持范围的必选项通过，证据完整，无静默降级。
-- **Conditionally ready**：明确缩小了支持范围；未支持项有文档并 fail fast，不能按完整支持宣传。
-- **Not ready**：任一核心并行、shape/数量、通信依赖、显存逻辑或真实数值门槛未通过。
+- **Ready**：所有声明支持的模拟器范围通过，证据完整，无静默降级。
+- **Conditionally ready**：明确缩小了模拟器支持范围；未支持项有文档并 fail fast，不能按完整支持宣传。
+- **Not ready**：任一核心并行、shape/数量、通信依赖或显存逻辑未通过。
 
 以下情况必须判定为 **Not ready**：
 
@@ -292,4 +273,3 @@ python3 -m torchtitan_npu.entry \
 - 只统计前向，没有重计算和反向。
 - 只看通信节点存在，没有验证 shape、字节和依赖。
 - 自定义融合算子被展开成小算子或未进入 hook。
-- 只通过模拟器，未做真实 NPU 数值验证，却声明可训练。

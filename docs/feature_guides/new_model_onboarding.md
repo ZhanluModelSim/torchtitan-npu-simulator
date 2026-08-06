@@ -1,8 +1,10 @@
 # 新模型接入开发流程
 
-本文用于固化一个模型从“代码可以构造”到“具备完整训练与模拟能力”的接入流程。流程适用于 Dense、MoE 以及包含模型特有融合算子的架构；并行重点覆盖 FSDP（含 eFSDP）、TP、EP、ETP、CP，PP 作为最后阶段接入。
+本文用于固化一个模型从“代码可以构造”到“具备完整 meta 模拟器建模能力”的接入流程。流程适用于 Dense、MoE 以及包含模型特有融合算子的架构；并行重点覆盖 FSDP（含 eFSDP）、TP、EP、ETP、CP，PP 作为最后阶段接入。
 
-最终是否可以对外声明模型可用，不以某个单测或一次单步训练成功为准，而应执行[新模型最终验收规范](../test_guides/model_acceptance.md)。
+本文默认验收目标是 simulator 的结构、shape、通信依赖和显存建模，不包含真实 NPU 数值训练或硬件 profiler。若项目另行声明需要真实训练可用性，应另立数值/性能验收，不把它混入模型建模接入的结论。
+
+最终是否可以对外声明模型的 simulator 建模可用，不以某个单测或一次单步执行成功为准，而应执行[新模型最终验收规范](../test_guides/model_acceptance.md)。
 
 ## 1. 先定义接入范围和模型契约
 
@@ -18,7 +20,7 @@
 | 权重 | 每类参数的全局 shape、参数量公式、初始化和 tied weight 关系 |
 | 状态字典 | 原始权重名与框架权重名的双向映射，是否有合并/拆分权重 |
 | 支持范围 | FSDP/eFSDP、TP、EP、ETP、CP、PP、AC、compile、offload 的目标状态 |
-| 验证基线 | 可比对的 loss/grad norm、算子清单、显存或 profiler 结果 |
+| 验证基线 | 算子清单、local shape、通信行为和显存趋势 |
 
 同时记录当前功能分支真正对应的开发基线。模型分支应 rebase 到它所属的训练主分支，而不是默认选择 `master`。解决冲突时优先保留目标基线中较新的通用实现，再把模型差异重新适配进去，避免恢复已经废弃的 shim、配置项或通信建模逻辑。
 
@@ -66,7 +68,7 @@ MoE 参数还要区分 shared experts 与 routed experts。这份计算结果会
 外部权重 -> 框架 state_dict -> 构造模型 -> 保存 -> 重新加载
 ```
 
-若存在合并/拆分权重，回路后逐 tensor 校验名称、shape、dtype 和数值。
+若存在合并/拆分权重，回路后逐 tensor 校验名称、shape、dtype 和拆分/合并顺序。meta 建模只要求 state-dict schema 闭环；数值逐元素比较属于另行声明的真实权重兼容性范围。
 
 更多 converter 和 state-dict 扩展方式见[模型定制](model_custom.md)。
 
@@ -131,13 +133,13 @@ MoE 参数还要区分 shared experts 与 routed experts。这份计算结果会
 
 - activation checkpoint：`none`、`full`、`selective`。
 - memory estimator、memory snapshot、激活值 hook、module hook。
-- profiler、算子统计和原始 op 捕获。
+- 算子统计、原始 op 捕获和导出。
 - optimizer 构造后处理、梯度裁剪、checkpoint save/load。
 - compile、激活 offload 等声明支持的特性。
 
 重计算场景必须区分 `original_forward`、`recompute` 和 `backward`。如果把两次 forward 合并统计，核心算子数量、依赖关系和激活生命周期都会错误。
 
-模块替换或 converter 执行后，检查 FQN 是否仍可被插件找到。模型专用 fused op 也必须经过同一套 hook 和统计链路，不能成为 memory/profiler 的盲区。
+模块替换或 converter 执行后，检查 FQN 是否仍可被插件找到。模型专用 fused op 也必须经过同一套 hook 和统计链路，不能成为显存、算子统计或依赖捕获的盲区。
 
 ## 7. 接入模拟器建模
 
@@ -168,7 +170,7 @@ MoE 参数还要区分 shared experts 与 routed experts。这份计算结果会
 - 每种并行的布局计划与非法配置单测。
 - 模型特有算子的 forward/backward shape、DTensor 和 hook 单测。
 - 模拟器单步、通信捕获和显存输出 smoke test。
-- 真实 NPU 的 reduced 配置训练测试。
+- reduced 规格的 meta 单步、AC 开关和核心并行组合测试。
 
 这些测试用于尽早发现局部问题，但不能替代最终验收。实现完成后，按照[新模型最终验收规范](../test_guides/model_acceptance.md)生成完整证据包并给出结论。
 
