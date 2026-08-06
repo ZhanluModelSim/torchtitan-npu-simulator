@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import torch
+from torch.distributed.tensor import DTensor
 
 from torchtitan_npu.converters.kernels.rms_norm import NPURMSNorm
 from torchtitan_npu.simulator.capture.dispatch_capture import get_active_capture
@@ -84,9 +85,35 @@ class SimRMSNorm(NPURMSNorm):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         resolved_eps = self.eps if self.eps is not None else torch.finfo(x.dtype).eps
+        return run_meta_rms_norm(x, self.weight, resolved_eps)
+
+
+def run_meta_rms_norm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    epsilon: float,
+) -> torch.Tensor:
+    """Run the simulator-owned fused RMSNorm autograd boundary."""
+    if not isinstance(x, DTensor):
         return _SimRMSNorm.apply(
             x,
-            self.weight,
-            resolved_eps,
+            weight,
+            epsilon,
             _current_module_path(),
         )
+
+    local_weight = weight.to_local() if isinstance(weight, DTensor) else weight
+    local_output = _SimRMSNorm.apply(
+        x.to_local(),
+        local_weight,
+        epsilon,
+        _current_module_path(),
+    )
+    return DTensor.from_local(
+        local_output,
+        x.device_mesh,
+        x.placements,
+        run_check=False,
+        shape=x.shape,
+        stride=x.stride(),
+    )

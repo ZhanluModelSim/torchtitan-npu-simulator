@@ -646,6 +646,35 @@ class OpDispatchCapture(TorchDispatchMode):
             for pred_id in node.predecessors:
                 if pred_id in nodes:
                     nodes[pred_id].successors.append(op_id)
+
+        # Some autograd collectives hand their gradient to the engine through
+        # C++ accumulation without a dispatcher-visible tensor consumer. For
+        # synchronous calls, conservatively gate the next connected backward
+        # chain so replay cannot move it ahead of the collective.
+        ordered_nodes = sorted(nodes.values(), key=lambda node: node.seq_idx)
+        for index, node in enumerate(ordered_nodes):
+            if (
+                not node.annotations.get(
+                    "sync_collective_sequence_fallback",
+                    False,
+                )
+                or node.successors
+            ):
+                continue
+            for candidate in ordered_nodes[index + 1 :]:
+                if (
+                    candidate.annotations.get("phase")
+                    != node.annotations.get("phase")
+                    or candidate.annotations.get("execution_kind")
+                    != node.annotations.get("execution_kind")
+                    or candidate.annotations.get("comp_type")
+                    != node.annotations.get("comp_type")
+                    or not candidate.successors
+                ):
+                    continue
+                candidate.predecessors.append(node.op_id)
+                node.successors.append(candidate.op_id)
+                break
         return nodes
 
     def apply_comm_group_names(

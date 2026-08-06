@@ -30,10 +30,22 @@ def _get_eps(module: nn.Module) -> float | None:
 
 class NPURMSNorm(RMSNorm):
     def __init__(self, parent: RMSNorm):
-        # Shallow copy of parent's __dict__ is intentional here
-        self.__dict__.update(parent.__dict__)
-        # ``parent.eps`` may be missing/None on nn.RMSNorm; normalize via _get_eps
-        # so forward() sees a clean float (or None to fall back to dtype eps).
+        normalized_shape = parent.normalized_shape
+        if len(normalized_shape) != 1:
+            raise ValueError(
+                "NPURMSNorm supports one-dimensional normalized_shape, got "
+                f"{normalized_shape}"
+            )
+        super().__init__(
+            RMSNorm.Config(
+                normalized_shape=normalized_shape[0],
+                eps=_get_eps(parent),
+                elementwise_affine=parent.elementwise_affine,
+                param_init=getattr(parent, "_param_init", None),
+            )
+        )
+        if parent.weight is not None:
+            self.register_parameter("weight", parent.weight)
         self.eps = _get_eps(parent)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
