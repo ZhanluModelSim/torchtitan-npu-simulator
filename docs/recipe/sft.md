@@ -242,8 +242,44 @@ processor 返回 OpenAI 格式消息列表：
 
 1. **编码**：通过 Jinja2 chat template 或 `chat_encoder` 渲染为完整 token 序列
 2. **Label masking**：通过 ChatML header 扫描或编码器返回的 assistant 区间，仅对 assistant 回复计算 loss
-3. **Packing**：当 attention `mask_type` 为 `block_causal`（FlexAttention/VarlenAttention，或 dense-mask SDPA）时，对多个样本做 greedy packing（短样本打包到同一 seq_len 窗口，EOS 分隔，per-document position 重置）。普通 `causal` SDPA 为避免跨文档 attention 会将每个样本 pre-pad 到 `seq_len`，实际上不做 packing
+3. **Packing**：当 attention `mask_type` 为 `block_causal`（FlexAttention/VarlenAttention，或 dense-mask SDPA）时，对多个样本做 greedy packing（短样本打包到同一 seq_len 窗口，per-document position 重置）。普通 `causal` SDPA 为避免跨文档 attention 会将每个样本 pre-pad 到 `seq_len`，实际上不做 packing。边界判定规则见下文[文档边界如何判定](#文档边界如何判定)
 4. **截断/丢弃**：超过 seq_len 的样本自动丢弃（而非截断）
+
+### 文档边界如何判定
+
+这里的“文档边界”是 packed attention 隔离不同数据样本的边界，不是消息角色边界，
+也不是 label masking 的 assistant 区间。当前 NPU dense SDPA 和 VarlenAttention 路径
+以 dataloader 返回的 `positions` 为唯一依据：每放入一个新的原始样本，position 从
+`0` 重新计数，因此所有 `positions == 0` 的位置都是新文档起点；每个 packed
+sequence 的第一个 position 也必须为 `0`。
+
+例如：
+
+```text
+positions:       [0, 1, 2, 0, 1, 2, 3, 0, 1]
+document starts: [0,       3,          7]
+cu_seq:          [0,       3,          7, 9]
+```
+
+不再通过 `input_ids == eos_id` 判断文档边界。chat template 可能在同一条多轮对话的
+消息之间插入 EOS，padding token 也可能与 EOS 共用 token id；按 token 值判断会把
+一条对话错误拆成多个文档，或者把 padding 拆成大量单 token 文档。消息内部出现
+EOS 不会重置 `positions`，只有 dataloader 开始放置下一个 packed 样本时才会重置。
+
+得到文档起点后，各 attention 路径按如下方式消费：
+
+- **dense SDPA**：对起点做累计计数生成 document id，只允许 query 关注同一
+  document 中不晚于自己的 key，即 `same_document & causal`。
+- **VarlenAttention**：将起点展平并追加物理序列终点，生成
+  `VarlenMetadata.cu_seq_q/cu_seq_k`，相邻起点差的最大值作为 `max_q/max_k`。
+- **Context Parallel**：先从未切分的全局 `positions` 构造 mask/metadata，再进入
+  `prepare_context_parallel_input()`。dense mask 与输入一起做 CP 变换；NPU Varlen
+  的 metadata 保持全局且不切分，因为 Ulysses all-to-all 会在 attention 前恢复
+  完整序列，所以每个 CP rank 必须看到相同的全局文档边界。
+
+> **注意**：以上 position-based 流程目前覆盖 NPU dense SDPA 和
+> VarlenAttention。FlexAttention 仍沿用上游 TorchTitan 的 EOS-based document
+> mask 生成逻辑，不应将其与这里的 position-based 行为混为一谈。
 
 ---
 

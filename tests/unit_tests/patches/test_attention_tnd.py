@@ -1,9 +1,26 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 """Unit tests for NPUVarlenAttention."""
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import torch
+from torchtitan.models.common.decoder import Decoder
+
 from torchtitan_npu.models.common.npu_varlen_attention import NPUVarlenAttention
+
+
+def _metadata_from_positions(positions):
+    from torchtitan_npu.models.qwen3.config_registry import sft_qwen3_1_7b_wordle
+    from torchtitan_npu.models.qwen3.tnd_config import _enable_npu_varlen_attention
+
+    model_config = _enable_npu_varlen_attention(sft_qwen3_1_7b_wordle().model_spec).model
+    return Decoder.get_attention_masks(
+        SimpleNamespace(config=model_config),
+        torch.zeros_like(positions),
+        tokenizer=SimpleNamespace(eos_id=0),
+        positions=positions,
+    )
 
 
 def _make_attn():
@@ -182,3 +199,44 @@ class TestTNDConfig:
         assert metadata.cu_seq_k.device.type == "cpu"
         assert metadata.cu_seq_q.dtype == torch.int64
         assert metadata.cu_seq_k.dtype == torch.int64
+
+    @staticmethod
+    def test_position_resets_create_varlen_metadata_for_packed_samples():
+        positions = torch.tensor(
+            [
+                [0, 1, 2, 0, 1, 0],
+                [0, 1, 0, 1, 2, 3],
+            ]
+        )
+
+        metadata = _metadata_from_positions(positions)
+
+        expected = torch.tensor([0, 3, 5, 6, 8, 12], dtype=torch.int64)
+        torch.testing.assert_close(metadata.cu_seq_q, expected)
+        torch.testing.assert_close(metadata.cu_seq_k, expected)
+        assert metadata.cu_seq_q.device.type == "cpu"
+        assert metadata.max_q == 4
+        assert metadata.max_k == 4
+
+    @staticmethod
+    def test_qwen3_tnd_decoder_builds_metadata_from_positions():
+        from torchtitan_npu.models.qwen3.config_registry import sft_qwen3_1_7b_wordle
+        from torchtitan_npu.models.qwen3.tnd_config import _enable_npu_varlen_attention
+
+        model_spec = _enable_npu_varlen_attention(sft_qwen3_1_7b_wordle().model_spec)
+        model_config = model_spec.model
+        tokens = torch.tensor([[10, 0, 11, 12, 13, 14, 0, 15]])
+        positions = torch.tensor([[0, 1, 2, 3, 4, 0, 1, 2]])
+
+        metadata = Decoder.get_attention_masks(
+            SimpleNamespace(config=model_config),
+            tokens,
+            tokenizer=SimpleNamespace(eos_id=0),
+            positions=positions,
+        )
+
+        torch.testing.assert_close(
+            metadata.cu_seq_q,
+            torch.tensor([0, 5, 8], dtype=torch.int64),
+        )
+        assert metadata.max_q == 5

@@ -1,6 +1,6 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 # This file is derived from torchtitan,
-# https://github.com/pytorch/torchtitan/blob/main/tests/integration_tests/run_tests.py
+# https://github.com/pytorch/torchtitan/blob/ac13e536c84e7f6647b14fa9375c3c8a8a2b8578/tests/integration_tests/run_tests.py
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 #
 # This source code is licensed under the BSD-style license found in the

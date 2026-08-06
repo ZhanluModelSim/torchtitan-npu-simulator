@@ -17,8 +17,15 @@ GQAttention.forward (上游, 不修改)
 
 ### 1.1 文档边界检测
 
-直接复用上游 EOS-based VarlenMetadata（`model.get_attention_masks()` 在
-`post_dataloading_process` 中计算，`add_eos=True` 确保每文档尾部有 EOS）。
+文档边界以 dataloader 返回的 `positions` 为唯一依据。greedy packing 每放入一个新的
+原始样本时都会将 position 重置为 `0`，因此 `positions == 0` 的位置就是各文档起点。
+`post_dataloading_process` 会先在未切分的全局 `positions` 上计算这些起点，再由
+`model.get_attention_masks()` 构造 `VarlenMetadata`。
+
+不能使用 `input_ids == eos_id` 判断文档边界：chat template 可能在同一条对话的消息之间
+插入 EOS，padding token 也可能与 EOS 共用 token id。消息内部的 EOS 不会重置
+`positions`，只有开始放置下一个 packed 样本时才会重置。更完整的 packing 说明见
+[SFT 文档边界判定](../recipe/sft.md#文档边界如何判定)。
 
 ### 1.2 Context Parallel
 

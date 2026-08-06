@@ -60,9 +60,18 @@ from torchtitan.components.loss import IGNORE_INDEX
 from torchtitan.models.common import ScaledDotProductAttention
 
 from torchtitan_npu.models.common.npu_varlen_attention import NPUVarlenAttention
+from torchtitan_npu.models.deepseek_v4.config_registry import (
+    debug_deepseek_v4_flash_single_node,
+)
+from torchtitan_npu.models.deepseek_v4.model import (
+    enable_smla_varlen_attention_dispatch,
+)
 from torchtitan_npu.models.qwen3.config_registry import (
     sft_qwen3_1_7b_wordle,
     sft_qwen3_30ba3b_gsm8k_tnd,
+)
+from torchtitan_npu.patches.torchtitan.chat_dataset import (
+    _supports_per_document_masking,
 )
 from tests.unit_tests.patches.chat_dataset_test_utils import (
     DATASET_RECORDS,
@@ -154,8 +163,45 @@ class TestVarlenKeepsPacking:
 
         assert loader.dataset._greedy_packing is True
 
-        input_ids, _label_ids = next_single_sequence(loader)
+        input_batch, _label_batch = next(iter(loader))
+        input_ids = input_batch["input"][0].tolist()
+        positions = input_batch["positions"][0].tolist()
         assert sample_content_text(input_ids) == "AAAABBBBCCCCDDDD"
+        # Each packed chat and the final padding region has its own position
+        # reset even though the shifted chat inputs do not end in EOS.
+        assert [index for index, position in enumerate(positions) if position == 0] == [
+            0,
+            68,
+            136,
+        ]
+
+
+class TestDeepSeekV4PackingDetection:
+    """DeepSeek-V4 exposes a flat model config instead of Decoder layer configs."""
+
+    def test_sdpa_disables_packing_without_inspecting_integer_layers(self):
+        trainer_config = debug_deepseek_v4_flash_single_node()
+        model_config = trainer_config.model_spec.model
+        enable_smla_varlen_attention_dispatch()
+        model_config.use_global_tnd = False
+
+        with patch(
+            "torchtitan_npu.patches.torchtitan.chat_dataset.get_trainer_config",
+            return_value=trainer_config,
+        ):
+            assert _supports_per_document_masking() is False
+
+    def test_global_varlen_keeps_packing(self):
+        trainer_config = debug_deepseek_v4_flash_single_node()
+        model_config = trainer_config.model_spec.model
+        enable_smla_varlen_attention_dispatch()
+        model_config.use_global_tnd = True
+
+        with patch(
+            "torchtitan_npu.patches.torchtitan.chat_dataset.get_trainer_config",
+            return_value=trainer_config,
+        ):
+            assert _supports_per_document_masking() is True
 
 
 class TestPretrainingUnaffected:

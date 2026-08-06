@@ -6,7 +6,14 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Patches for torchtitan attention and dense block-causal SDPA support."""
+"""Patches block-causal attention to use dataloader document boundaries.
+
+Chat templates may emit EOS tokens between messages, while greedy packing
+boundaries are represented by resets in the dataloader's ``positions`` tensor.
+Using token values as document markers therefore splits conversations and can
+also miss the boundary between two packed samples.  This patch routes the
+position resets to Varlen Attention and dense SDPA masks.
+"""
 
 from __future__ import annotations
 
@@ -19,6 +26,8 @@ from torchtitan.models.common.attention import (
     BaseAttention,
     LocalMapInnerAttention,
     ScaledDotProductAttention,
+    VarlenAttention,
+    VarlenMetadata,
 )
 from torchtitan.models.common.decoder import Decoder
 from torchtitan.tools.logging import logger
@@ -26,6 +35,7 @@ from torchtitan.tools.logging import logger
 if TYPE_CHECKING:
     from torchtitan.components.tokenizer import BaseTokenizer
     from torchtitan.models.common.attention import AttentionMasksType
+
 
 # --- BaseAttention.Config.__post_init__ -------------------------------------
 
@@ -107,45 +117,52 @@ ScaledDotProductAttention.forward = _patched_sdpa_forward
 # --- Decoder.get_attention_masks --------------------------------------------
 
 
-def _is_block_causal_sdpa_config(config: object) -> bool:
-    if not isinstance(config, Decoder.Config) or not config.layers:
-        return False
-    attention = config.layers[0].attention
-    return (
-        isinstance(attention.inner_attention, ScaledDotProductAttention.Config)
-        and attention.mask_type == "block_causal"
-    )
+def _get_position_boundary_attention(config: object):
+    """Return the attention implementation if it supports position boundaries.
 
-
-def build_block_causal_sdpa_mask(
-    input_batch: torch.Tensor,
-    eos_id: int,
-) -> torch.Tensor:
-    """Build a dense ``[batch, 1, seq, seq]`` block-causal allow-mask.
-
-    ``True`` entries are positions visible to SDPA.  An EOS token remains in
-    the document it terminates; the following token starts a new document.
-    This is the same boundary convention used by torchtitan's flex/varlen
-    document-mask helpers.
+    Position resets can be converted to a dense boolean mask for SDPA and to
+    ``VarlenMetadata`` for Varlen Attention.
     """
 
-    if input_batch.ndim != 2:
-        raise ValueError(f"input_batch must have shape [batch, seq], got {tuple(input_batch.shape)}")
+    if not isinstance(config, Decoder.Config) or not config.layers:
+        return None
+    attention = config.layers[0].attention
+    inner_attention = attention.inner_attention
+    if attention.mask_type != "block_causal" or not isinstance(
+        inner_attention, (ScaledDotProductAttention.Config, VarlenAttention.Config)
+    ):
+        return None
+    return inner_attention
 
-    eos = input_batch.eq(eos_id)
-    # Match torchtitan's document-mask convention by terminating the physical
-    # sequence even when its final token is not EOS.  The current token remains
-    # in its document; this only gives the terminal position a stable boundary
-    # for document-id construction.
-    eos = eos.clone()
-    eos[:, -1] = True
-    document_ids = torch.cumsum(eos.to(torch.int64), dim=1) - eos.to(torch.int64)
 
-    seq_len = input_batch.shape[1]
-    positions = torch.arange(seq_len, device=input_batch.device)
-    causal = positions[:, None] >= positions[None, :]
+def _document_starts(positions: torch.Tensor) -> torch.Tensor:
+    if positions.ndim != 2 or positions.numel() == 0:
+        raise ValueError(f"positions must have non-empty shape [batch, seq], got {tuple(positions.shape)}")
+
+    starts = positions.eq(0)
+    if not bool(starts[:, 0].all().item()):
+        raise ValueError("each packed sequence must start with position 0")
+    return starts
+
+
+def _dense_mask_from_starts(starts: torch.Tensor) -> torch.Tensor:
+    document_ids = starts.to(torch.int64).cumsum(dim=1)
+    token_indices = torch.arange(starts.shape[1], device=starts.device)
+    causal = token_indices[:, None] >= token_indices[None, :]
     same_document = document_ids[:, :, None] == document_ids[:, None, :]
     return (same_document & causal).unsqueeze(1)
+
+
+def _varlen_metadata_from_starts(starts: torch.Tensor) -> VarlenMetadata:
+    sequence_starts = starts.flatten().nonzero(as_tuple=True)[0].cpu()
+    cu_seq = torch.cat((sequence_starts, sequence_starts.new_tensor([starts.numel()])))
+    max_seq_len = int(torch.diff(cu_seq).max().item())
+    return VarlenMetadata(
+        cu_seq_q=cu_seq,
+        cu_seq_k=cu_seq,
+        max_q=max_seq_len,
+        max_k=max_seq_len,
+    )
 
 
 _original_decoder_get_attention_masks = Decoder.get_attention_masks
@@ -156,11 +173,23 @@ def _patched_decoder_get_attention_masks(
     input_batch: torch.Tensor,
     tokenizer: BaseTokenizer,
     extra_inputs: dict[str, torch.Tensor] | None = None,
+    positions: torch.Tensor | None = None,
 ) -> AttentionMasksType | torch.Tensor:
-    if _is_block_causal_sdpa_config(self.config):
-        if tokenizer.eos_id is None:
-            raise ValueError("tokenizer.eos_id is required for block-causal SDPA")
-        return build_block_causal_sdpa_mask(input_batch, tokenizer.eos_id)
+    inner_attention = _get_position_boundary_attention(self.config)
+    if inner_attention is not None and positions is not None:
+        if positions.shape != input_batch.shape:
+            raise ValueError(
+                f"positions shape {tuple(positions.shape)} must match input batch shape {tuple(input_batch.shape)}"
+            )
+        starts = _document_starts(positions)
+        if isinstance(inner_attention, ScaledDotProductAttention.Config):
+            return _dense_mask_from_starts(starts)
+        if isinstance(inner_attention, VarlenAttention.Config):
+            return _varlen_metadata_from_starts(starts)
+
+    if isinstance(inner_attention, ScaledDotProductAttention.Config):
+        raise ValueError("block-causal SDPA attention requires dataloader positions")
+
     return _original_decoder_get_attention_masks(
         self,
         input_batch=input_batch,
@@ -171,4 +200,4 @@ def _patched_decoder_get_attention_masks(
 
 _titan_decoder.Decoder.get_attention_masks = _patched_decoder_get_attention_masks  # pyrefly: ignore [bad-assignment]
 
-logger.info("[Patch] Enabled dense block-causal masks for SDPA")
+logger.info("[Patch] Enabled position-based block-causal masks for SDPA/Varlen attention")

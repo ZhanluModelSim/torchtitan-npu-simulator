@@ -1,4 +1,6 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
+# This file is derived from torchtitan,
+# https://github.com/pytorch/torchtitan/blob/ac13e536c84e7f6647b14fa9375c3c8a8a2b8578/torchtitan/hf_datasets/text_datasets.py
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
@@ -72,10 +74,22 @@ def _supports_per_document_masking() -> bool:
     if trainer_config is None or trainer_config.model_spec is None:
         return True
     model = trainer_config.model_spec.model
+
+    # DeepSeek-V4 uses a flat model config: ``layers`` is only a range-like
+    # layer-count view when global TND is disabled.  Its attention dispatch is
+    # instead exposed through ``attn_type``.  Consult that capability before
+    # attempting the Decoder.Config-style per-layer lookup below.
+    attn_type = getattr(model, "attn_type", None)
+    if attn_type in ("sdpa", "varlen"):
+        return attn_type == "varlen"
+
     layers = getattr(model, "layers", None)
     if not layers:
         return True
-    mask_type = getattr(layers[0].attention, "mask_type", "causal")
+    attention = getattr(layers[0], "attention", None)
+    if attention is None:
+        return False
+    mask_type = getattr(attention, "mask_type", "causal")
     return mask_type == "block_causal"
 
 
