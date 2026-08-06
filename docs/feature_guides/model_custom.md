@@ -1,5 +1,7 @@
 # Model Custom框架介绍
 
+新模型的完整开发顺序、并行接入和模拟器建模要求见[新模型接入开发流程](new_model_onboarding.md)。
+
 ## 1. 重构目的
 
 **基于 torchtitan 的 ModelConverter 机制，为 torchtitan-npu 提供了一套声明式、可组合的模型自定义框架，取代了原先 monkey-patch 方式**
