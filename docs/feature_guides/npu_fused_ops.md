@@ -32,6 +32,7 @@ model_converters = ModelConvertersContainer.Config(
   - [NPU MoE Dispatch](#npu-moe-dispatch)
   - [RMSNorm](#rmsnorm)
   - [RoPE](#rope)
+  - [MHC head compute mix](#mhc_head_compute_mix)
 
 关于本仓库适配的各融合算子的详细说明，请查看对应的 NPU 融合算子开发者文档。
 
@@ -181,3 +182,35 @@ get_model_converter_config("npu_rope")
 ```
 **ModelConverter 源码路径：** `torchtitan_npu/converters/kernels/rope.py` \
 **相关 NPU 融合算子开发者文档：** [`npu_rope`](https://www.hiascend.com/document/detail/zh/Pytorch/730/apiref/torchnpuCustomsapi/docs/context/torch_npu-npu_rotary_mul.md)
+
+-----------
+
+ ## mhc_head_compute_mix
+ mhc_head_compute_mix 是专为多头混合（Multi‑Head Compute Mix）设计的自定义算子，主要用于模型中 HcHead 模块的前向与反向计算。它接收输入张量 x、权重矩阵、以及 head‑wise 的 scale 与 base 参数，经 RMS 归一化、投影、sigmoid 变换和 BMM 运算后，输出混合后的结果，并保存反向传播所需的中间状态。
+
+ 该 converter 当前未在 DeepSeek-V4 默认 `config_registry.py` 中打开，A3 上建议保持关闭，继续使用默认模型路径，避免 converter 替换带来的额外开销或性能退化。
+
+ **配置示例**：
+
+1、添加配置
+ ```python
+ get_model_converter_config("npu_mhc_head_compute_mix_tilelang")
+ ```
+2、删除可能覆盖配置的追加设置
+
+将torchtitan_npu\models\deepseek_v4\config_registry.py的debug_deepseek_v4_flash_single_node中的追加配置npu_mhc_post删去。
+
+ **tilelang-ascend安装**：
+
+ 参考tilelang-ascend开源社区安装指南：https://github.com/tile-ai/tilelang-ascend#installation
+
+ ```shell
+ git clone --recursive https://github.com/tile-ai/tilelang-ascend.git
+ cd tilelang-ascend
+ bash install_ascend.sh
+ source set_env.sh
+ ```
+
+ **ModelConverter 源码路径：** `torchtitan_npu/converters/kernels/mhc_head_compute_mix_tilelang.py`
+
+ **相关 tilelang-ascend 算子开源社区路径：** [`mhc_head_compute_mix`](https://github.com/tile-ai/tilelang-ascend/blob/ascendc_pto/examples/tile_kernels/mhc/head_compute_mix_kernel.py)
