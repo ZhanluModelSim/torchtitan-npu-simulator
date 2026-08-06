@@ -654,7 +654,10 @@ class LiCompute(Module):
     ):
         end_pos = seqlen
         # We performed QAT here, kv could also use fp8 format, though current implementation uses bf16
-        index_score = torch.einsum("bshd,btd->bsht", q_indexer, k_indexer)
+        # equivalent to einsum("bshd,btd->bsht")
+        b, s, h, d = q_indexer.shape
+        index_score = torch.bmm(q_indexer.reshape(b, s * h, d), k_indexer.transpose(-1, -2))
+        index_score = index_score.reshape(b, s, h, -1)
         index_score = (index_score.relu_() * weights.unsqueeze(-1)).sum(dim=2)
         device = index_score.device
         base = torch.arange(seqlen, device=device).unsqueeze(1)
@@ -927,14 +930,20 @@ class PostAttention(Module):
                 output = _retained_output_projection(output, self.wo_a, self.o_lora_rank)
             else:
                 wo_a = self.wo_a.weight.view(n_local_groups, self.o_lora_rank, -1)
-                output = torch.einsum("tgd,grd->tgr", output, wo_a)
+                # equivalent to einsum("tgd,grd->tgr", output, wo_a)
+                output = torch.bmm(output.transpose(0, 1), wo_a.transpose(-1, -2)).transpose(0, 1)
             return self.wo_b(output.reshape(output.size(0), -1))
         output = output.view(bsz, seqlen, n_local_groups, -1)
         if self._retain_output_projection:
             output = _retained_output_projection(output, self.wo_a, self.o_lora_rank)
         else:
             wo_a = self.wo_a.weight.view(n_local_groups, self.o_lora_rank, -1)
-            output = torch.einsum("bsgd,grd->bsgr", output, wo_a)
+            # equivalent to einsum("bsgd,grd->bsgr", output, wo_a)
+            output = torch.bmm(
+                output.permute(2, 0, 1, 3).reshape(n_local_groups, bsz * seqlen, -1),
+                wo_a.transpose(-1, -2),
+            )
+            output = output.reshape(n_local_groups, bsz, seqlen, -1).permute(1, 2, 0, 3)
         return self.wo_b(output.reshape(bsz, seqlen, -1))
 
     def init_weights(self, init_std: float):
