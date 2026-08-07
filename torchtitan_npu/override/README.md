@@ -97,11 +97,11 @@ torchtitan_npu.override.deepseek_v3_2.sparse_attention.kernel
 torchtitan_npu.override.deepseek_v3_2.sparse_attention.mask_handler
 ```
 
-DeepSeek-V4 推荐使用 [`scripts/run_train_dsv4.sh`](../../scripts/run_train_dsv4.sh) 组合 recipe：
+DeepSeek-V4 推荐使用 [`scripts/run_train.sh`](../../scripts/run_train.sh) 组合 recipe。脚本中的 `GOLDEN_OVERRIDES` 是固定参考配置，融合实现通过 `TEST_OVERRIDES` 配置：
 
 ```bash
-ATTENTION=golden ./scripts/run_train_dsv4.sh
-ATTENTION=smla   ./scripts/run_train_dsv4.sh
+USE_GOLDEN=1 ./scripts/run_train.sh
+./scripts/run_train.sh
 ```
 
 两种 DSA kernel 都必须搭配：

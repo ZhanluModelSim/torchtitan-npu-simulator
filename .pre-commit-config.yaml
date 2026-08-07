@@ -65,7 +65,7 @@ repos:
             "-L",
             "CANN,cann,NNAL,nnal,ASCEND,ascend,EnQue,CopyIn,ArchType,AND,ND,tbe,copyin,alog",
             "--skip",
-            "*.py,*.cpp,*.hpp,*.c,*.h,tests/assets/tokenizer/qwen3-tokenizer/merges.txt",
+            "*.py,*.cpp,*.hpp,*.c,*.h,tests/assets/tokenizer/qwen3-tokenizer/merges.txt,tests/assets/c4_test/data.json",
           ]
 
   # OAT compliance check (Open Source Audit Tool)

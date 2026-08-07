@@ -4,6 +4,9 @@ torch_npu @ https://gitcode.com/hitwdy/torchtitan-npu-ci-wheels/releases/downloa
 torch_npu @ https://gitcode.com/hitwdy/torchtitan-npu-ci-wheels/releases/download/torch-npu-2.14.0-git213ed90-cp312-x86_64/torch_npu-2.14.0%2Bgit213ed90-cp312-cp312-linux_x86_64.whl#sha256=dfa8445c335a846e9b1409b2c9bbef287c889566260fcf807e3f1ef244e98754 ; platform_machine == "x86_64"
 torchtitan @ git+https://gitcode.com/GitHub_Trending/to/torchtitan.git@cc286a63599e42480a07928cc362e514ae448a85
 pybind11==3.0.4
+numpy
+PyYAML
+ninja
 --extra-index-url https://triton-ascend.osinfra.cn/pypi/simple
 triton-ascend==3.2.1
 scipy==1.13.1

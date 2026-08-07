@@ -7,9 +7,7 @@ DeepSeek-V4（DSV4）仅在 DSA 注意力内部使用 TND。模型、Compressor�
 融合路径要求完整的 Ascend NPU 运行环境，以及与 CANN 版本匹配的 `cann_ops_transformer`。推荐使用仓内脚本：
 
 ```bash
-TORCHTITAN_DIR=/path/to/torchtitan \
-ATTENTION=smla \
-./scripts/run_train_dsv4.sh
+./scripts/run_train.sh
 ```
 
 手动配置时，以下两个 override 必须同时启用：
