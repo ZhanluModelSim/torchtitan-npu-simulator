@@ -41,6 +41,10 @@ OP_MAPPING: dict[str, str] = {
     "aten._softmax.default": "softmax",
     "npu.npu_swiglu.default": "swiglu",
     "npu.npu_swiglu_backward.default": "swiglu",
+    "simulator.kimi_gated_mla": "kimi_gated_mla",
+    "simulator.kimi_gated_mla_backward": "kimi_gated_mla",
+    "simulator.kimi_situ_glu": "situ_glu",
+    "simulator.kimi_situ_glu_backward": "situ_glu",
     "npu.npu_rotary_mul.default": "rope",
     # MoE dispatch
     "npu.npu_moe_token_permute.default": "moe_token_permute",
@@ -52,8 +56,20 @@ OP_MAPPING: dict[str, str] = {
     "aten.reshape.default": "reshape",
     "aten.permute.default": "transpose",
     "aten.transpose.int": "transpose",
+    "aten.t.default": "transpose",
+    "aten.slice.Tensor": "metadata_view",
+    "aten.select.int": "metadata_view",
+    "aten.narrow.default": "metadata_view",
+    "aten.as_strided.default": "metadata_view",
+    "aten.squeeze.dim": "metadata_view",
+    "aten.squeeze.default": "metadata_view",
+    "aten.unsqueeze.default": "metadata_view",
+    "aten.expand.default": "metadata_view",
+    "aten.alias.default": "metadata_view",
+    "aten.detach.default": "metadata_view",
     "aten.cat.default": "cat",
     "aten.split.default": "split",
+    "aten.split.Tensor": "split",
     "aten.split_with_sizes.default": "split",
     # optimizer
     "aten._fused_adamw_.default": "adamw_step",
@@ -66,6 +82,26 @@ OP_MAPPING: dict[str, str] = {
     "comm.p2p_send": "p2p_send",
     "comm.p2p_recv": "p2p_recv",
 }
+
+# These dispatcher calls only change tensor metadata or aliasing.  They are
+# retained in the L0 IR because their aliases and dependency edges matter for
+# replay and liveness, but they are not launched device kernels.
+_METADATA_VIEW_PREFIXES = (
+    "aten.view.", "aten.reshape.", "aten.permute.", "aten.transpose.",
+    "aten.t.", "aten.slice.", "aten.select.", "aten.narrow.",
+    "aten.as_strided.", "aten.split.", "aten.split_with_sizes.",
+    "aten.squeeze.", "aten.unsqueeze.", "aten.expand.", "aten.alias.",
+    "aten.detach.",
+)
+
+
+def is_metadata_view_op(raw_op_type: str) -> bool:
+    """Whether ``raw_op_type`` is an alias-only metadata view operation.
+
+    ``cat``, ``clone`` and ``contiguous`` are deliberately excluded: they can
+    allocate/copy storage and remain visible device work.
+    """
+    return raw_op_type.startswith(_METADATA_VIEW_PREFIXES)
 
 
 def to_canonical_op_type(raw_op_type: str) -> str:

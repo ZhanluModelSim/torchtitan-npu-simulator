@@ -50,12 +50,14 @@ class OpCostModel:
             "quantize": self._data_move,
             "sdpa": self._attention,
             "flash_attention_fwd": self._attention,
+            "kimi_gated_mla": self._kimi_gated_mla,
             "layer_norm": self._norm,
             "rms_norm": self._norm,
             "rms_norm_backward": self._norm,
             "gelu": self._elementwise,
             "silu": self._elementwise,
             "swiglu": self._elementwise,
+            "situ_glu": self._elementwise,
             "softmax": self._elementwise,
             "rope": self._elementwise,
             "moe_token_permute": self._data_move,
@@ -65,6 +67,13 @@ class OpCostModel:
             "reduce_scatter": self._allreduce,
             "allgather": self._allgather,
             "all_to_all": self._allgather,
+            # Alias-only shape/layout changes are L0 dependency nodes, not
+            # launched device kernels. Their aliasing is modeled elsewhere.
+            "view": self._metadata_view,
+            "reshape": self._metadata_view,
+            "transpose": self._metadata_view,
+            "split": self._metadata_view,
+            "metadata_view": self._metadata_view,
         }
 
     def compute(
@@ -129,6 +138,24 @@ class OpCostModel:
         seq_k = key_shape[-2] if len(key_shape) >= 2 else key_shape[-1]
         out_bytes = tensor_volume_bytes(outputs[0].shape, outputs[0].dtype)
         return CostEstimate(flops=2 * _numel(outputs[0].shape) * seq_k, peak_mem=out_bytes)
+
+    def _kimi_gated_mla(self, inputs: list[TensorMeta], outputs: list[TensorMeta], attrs: dict[str, Any]) -> CostEstimate:
+        if not outputs or len(outputs[0].shape) < 2:
+            return CostEstimate.unknown_cost()
+        output = outputs[0]
+        seq_len = output.shape[-2]
+        return CostEstimate(
+            flops=4 * _numel(output.shape) * seq_len,
+            peak_mem=tensor_volume_bytes(output.shape, output.dtype),
+        )
+
+    def _metadata_view(
+        self,
+        inputs: list[TensorMeta],
+        outputs: list[TensorMeta],
+        attrs: dict[str, Any],
+    ) -> CostEstimate:
+        return CostEstimate()
 
     def _norm(self, inputs: list[TensorMeta], outputs: list[TensorMeta], attrs: dict[str, Any]) -> CostEstimate:
         if not inputs or not outputs:

@@ -3,12 +3,13 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Per-rank topological-order CSV export of all L0-L3 graph nodes.
+"""Per-rank topological-order CSV export of device-kernel L0-L3 graph nodes.
 
 Outputs ``kernel_summary.csv``: one row per (rank, step_template, op_node),
 sorted by rank → step template order → topological order (ties broken by
 op_id ascending).  This gives a flat, spreadsheet-friendly view of every
-kernel every rank executes, in execution dependency order.
+kernel every rank executes, in execution dependency order. Alias-only
+metadata views remain in detailed IR exports but are omitted here.
 
 The topological order is computed per StepGraph via Kahn's algorithm
 (restricted to in-graph edges, mirroring ``step_graph._check_acyclic``).
@@ -121,13 +122,16 @@ def export_kernel_summary_csv(workload_graph: WorkloadGraph, path: str, *, max_r
         nodes = step_graph.nodes
         sorted_ids = topo_orders[tid]
         rows = []
-        for topo_idx, op_id in enumerate(sorted_ids):
+        device_topo_idx = 0
+        for op_id in sorted_ids:
             node = nodes[op_id]
             ann = node.annotations
+            if ann.get("metadata_view", False):
+                continue
             rows.append([
                 step_graph.step_type,
                 tid,
-                str(topo_idx),
+                str(device_topo_idx),
                 op_id,
                 display_op_label(node.op_type, ann),
                 ann.get("raw_op_type", ""),
@@ -149,6 +153,7 @@ def export_kernel_summary_csv(workload_graph: WorkloadGraph, path: str, *, max_r
                 ann.get("comm_dim", ""),
                 ann.get("comm_ranks", ""),
             ])
+            device_topo_idx += 1
         template_rows[tid] = rows
 
     # Determine output directory: strip ".csv" suffix if present, then

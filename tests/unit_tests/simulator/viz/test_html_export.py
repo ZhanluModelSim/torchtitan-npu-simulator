@@ -85,3 +85,20 @@ def test_render_html_labels_unknown_ops_with_real_raw_op_type():
     page = render_html(workload)
     assert "npu.npu_moe_token_unpermute_with_routing_map.default" in page
     assert "<strong>unknown</strong>" not in page
+
+
+def test_render_html_omits_metadata_views_from_device_kernel_table():
+    view = OpNode(
+        op_id="view", op_type="transpose", inputs=[], outputs=[], attrs={}, predecessors=[], successors=[],
+        annotations={"metadata_view": True, "raw_op_type": "aten.t.default"},
+    )
+    matmul = OpNode(op_id="mm", op_type="matmul", inputs=[], outputs=[], attrs={}, predecessors=[], successors=[])
+    template = StepGraph(step_id="tmpl", step_type="forward", nodes={"view": view, "mm": matmul})
+    schedule = ScheduleGraph(schedule_id="sched", workload_type="train", step_templates={"tmpl": template}, instances=[])
+    workload = WorkloadGraph(
+        workload_id="wl1", workload_type="train", step_templates={"tmpl": template},
+        iteration=IterationSpec(schedule=schedule, microbatch_count=1), num_iterations=1,
+    )
+    page = render_html(workload)
+    assert "aten.t.default" not in page
+    assert "1 device ops" in page

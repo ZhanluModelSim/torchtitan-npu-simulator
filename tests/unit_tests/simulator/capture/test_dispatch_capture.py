@@ -189,6 +189,21 @@ def test_unknown_op_type_is_flagged_in_annotations():
     assert all(n.annotations.get("cost_unknown") for n in unknown_nodes)
 
 
+def test_capture_marks_metadata_views_zero_cost_but_keeps_their_dependencies():
+    capture = OpDispatchCapture()
+    with capture:
+        source = torch.randn(2, 4, device="meta")
+        viewed = source.t()
+        viewed.relu()
+
+    nodes = capture.build_nodes()
+    transpose = next(node for node in nodes.values() if node.annotations["raw_op_type"] == "aten.t.default")
+    relu = next(node for node in nodes.values() if "relu" in node.annotations["raw_op_type"])
+    assert transpose.annotations["metadata_view"] is True
+    assert transpose.flops == transpose.peak_mem == 0
+    assert transpose.op_id in relu.predecessors
+
+
 def test_phase_provider_tags_every_node_and_defaults_to_forward():
     capture_no_provider = OpDispatchCapture()
     with capture_no_provider:

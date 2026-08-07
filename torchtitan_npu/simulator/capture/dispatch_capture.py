@@ -23,7 +23,7 @@ from torch.utils._python_dispatch import TorchDispatchMode
 
 from torchtitan_npu.simulator.capture.checkpoint_execution import current_execution_kind
 from torchtitan_npu.simulator.capture.module_path import ModulePathTracker
-from torchtitan_npu.simulator.capture.op_mapping import to_canonical_op_type
+from torchtitan_npu.simulator.capture.op_mapping import is_metadata_view_op, to_canonical_op_type
 from torchtitan_npu.simulator.capture.tensor_utils import dtype_to_str, tensor_volume_bytes, to_tensor_meta
 from torchtitan_npu.simulator.cost.op_cost_model import OpCostModel
 from torchtitan_npu.simulator.ir.op_node import OpNode
@@ -611,6 +611,8 @@ class OpDispatchCapture(TorchDispatchMode):
                 annotations["tensor_shape_scope"] = event.tensor_shape_scope
             if event.repeat_count > 1:
                 annotations["repeat_count"] = event.repeat_count
+            if is_metadata_view_op(event.raw_op_type):
+                annotations["metadata_view"] = True
             if cost.unknown:
                 annotations["cost_unknown"] = True
             if event.comm_dim:

@@ -10,8 +10,10 @@ from torchtitan_npu.converters.kernels.kimi_k3_moe import (
 )
 from torchtitan_npu.models.kimi_k3.attention import (
     KimiDeltaAttention,
+    KimiGatedMLA,
     RMSNormGated,
 )
+from torchtitan_npu.models.kimi_k3.feed_forward import KimiMLP
 from torchtitan_npu.simulator.capture.dispatch_capture import OpDispatchCapture
 from torchtitan_npu.simulator.hardware_shims.kda_converter import (
     apply_kimi_k3_shims,
@@ -92,3 +94,52 @@ def test_kimi_gated_rms_norm_uses_new_module_level_autograd_shim():
     assert module._simulator_gated_rms_norm_shim_installed is True
     assert x.grad is not None
     assert gate.grad is not None
+
+
+def test_kimi_gated_mla_records_one_virtual_fused_op_per_pass():
+    module = KimiGatedMLA(
+        KimiGatedMLA.Config(
+            dim=16,
+            n_heads=2,
+            q_lora_rank=8,
+            kv_lora_rank=4,
+            qk_nope_head_dim=4,
+            qk_rope_head_dim=2,
+            v_head_dim=4,
+        )
+    )
+    apply_kimi_k3_shims(module)
+    x = torch.empty((2, 3, 16), device="meta", requires_grad=True)
+    phase = {"value": "forward"}
+    capture = OpDispatchCapture(phase_provider=lambda: phase["value"])
+
+    with capture:
+        output = module(x)
+        phase["value"] = "backward"
+        output.sum().backward()
+
+    raw_names = [node.annotations["raw_op_type"] for node in capture.build_nodes().values()]
+    assert raw_names.count("simulator.kimi_gated_mla") == 1
+    assert raw_names.count("simulator.kimi_gated_mla_backward") == 1
+    assert "aten.scaled_dot_product_attention.default" not in raw_names
+    assert module._simulator_mla_shim_installed is True
+
+
+def test_kimi_shared_expert_situ_glu_records_one_fused_activation_per_pass():
+    module = KimiMLP(KimiMLP.Config(hidden_size=16, intermediate_size=32)).to("meta")
+    apply_kimi_k3_shims(module)
+    x = torch.empty((2, 3, 16), device="meta", requires_grad=True)
+    phase = {"value": "forward"}
+    capture = OpDispatchCapture(phase_provider=lambda: phase["value"])
+
+    with capture:
+        output = module(x)
+        phase["value"] = "backward"
+        output.sum().backward()
+
+    raw_names = [node.annotations["raw_op_type"] for node in capture.build_nodes().values()]
+    assert raw_names.count("simulator.kimi_situ_glu") == 1
+    assert raw_names.count("simulator.kimi_situ_glu_backward") == 1
+    assert "aten.tanh.default" not in raw_names
+    assert "aten.sigmoid.default" not in raw_names
+    assert module._simulator_mlp_shim_installed is True

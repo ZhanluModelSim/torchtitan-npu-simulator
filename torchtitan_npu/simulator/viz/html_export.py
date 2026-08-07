@@ -114,11 +114,18 @@ def _render_l0_op_row(op_id: int, node: OpNode, topo_idx: int) -> str:
 
 
 def _render_l1_step_graph(step_graph: StepGraph) -> str:
-    sorted_ids = _topo_sort(step_graph.nodes)
-    total_flops = sum(n.flops for n in step_graph.nodes.values())
-    total_comm = sum(n.comm_bytes for n in step_graph.nodes.values())
-    total_peak = sum(n.peak_mem for n in step_graph.nodes.values())
-    comm_count = sum(1 for n in step_graph.nodes.values() if _is_comm_op(n.annotations))
+    # Metadata views remain in the graph for replay and alias correctness,
+    # but the default human-facing table represents launched device kernels.
+    visible_nodes = {
+        op_id: node
+        for op_id, node in step_graph.nodes.items()
+        if not node.annotations.get("metadata_view", False)
+    }
+    sorted_ids = _topo_sort(visible_nodes)
+    total_flops = sum(n.flops for n in visible_nodes.values())
+    total_comm = sum(n.comm_bytes for n in visible_nodes.values())
+    total_peak = sum(n.peak_mem for n in visible_nodes.values())
+    comm_count = sum(1 for n in visible_nodes.values() if _is_comm_op(n.annotations))
 
     # Group consecutive ops by normalized module path to merge repeated layers
     groups: list[tuple[str, int, int, list[tuple[int, OpNode]]]] = []  # (norm_path, start_topo, count, ops)
@@ -127,7 +134,7 @@ def _render_l1_step_graph(step_graph: StepGraph) -> str:
     group_start: int = 0
 
     for idx, op_id in enumerate(sorted_ids):
-        node = step_graph.nodes[op_id]
+        node = visible_nodes[op_id]
         raw_path = node.annotations.get("module_path", "")
         norm = _normalize_module_path(raw_path)
 
@@ -178,7 +185,7 @@ def _render_l1_step_graph(step_graph: StepGraph) -> str:
 <summary>
   <span class="badge l1-badge">L1</span>
   <strong>{html.escape(step_graph.step_type)}</strong>
-  <span class="meta">{len(step_graph.nodes)} ops ({comm_count} comm) &middot;
+  <span class="meta">{len(visible_nodes)} device ops ({comm_count} comm) &middot;
   flops={_fmt_flops(total_flops)} &middot; peak_mem={_fmt_bytes(total_peak)} &middot;
   comm={_fmt_bytes(total_comm)} &middot; acyclic={step_graph.is_acyclic}</span>
 </summary>

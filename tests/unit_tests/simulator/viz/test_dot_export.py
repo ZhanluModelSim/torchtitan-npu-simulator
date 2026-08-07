@@ -54,3 +54,25 @@ def test_export_dot_labels_unknown_ops_with_real_raw_op_type():
             content = f.read()
     assert 'label="aten.embedding.default"' in content
     assert 'label="unknown"' not in content
+
+
+def test_export_dot_folds_metadata_views_and_preserves_reachable_edge():
+    node_a = OpNode(op_id="a", op_type="matmul", inputs=[], outputs=[], attrs={}, predecessors=[], successors=["v"])
+    node_v = OpNode(
+        op_id="v", op_type="transpose", inputs=[], outputs=[], attrs={},
+        predecessors=["a"], successors=["b"], annotations={"metadata_view": True},
+    )
+    node_b = OpNode(op_id="b", op_type="matmul", inputs=[], outputs=[], attrs={}, predecessors=["v"], successors=[])
+    template = StepGraph(step_id="tmpl", step_type="forward", nodes={"a": node_a, "v": node_v, "b": node_b})
+    schedule = ScheduleGraph(schedule_id="sched", workload_type="train", step_templates={"tmpl": template}, instances=[])
+    workload = WorkloadGraph(
+        workload_id="wl1", workload_type="train", step_templates={"tmpl": template},
+        iteration=IterationSpec(schedule=schedule, microbatch_count=1), num_iterations=1,
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "graph.dot")
+        export_dot(workload, path)
+        with open(path, encoding="utf-8") as f:
+            content = f.read()
+    assert '"v" [label=' not in content
+    assert '"a" -> "b"' in content
