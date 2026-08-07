@@ -12,7 +12,6 @@ from torchtitan_npu.patches.torchtitan.distributed.varlen_cp import (
     CPVarlenMetadata,
 )
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -61,8 +60,10 @@ def patched_cp_shard(
 def apply() -> None:
     import torchtitan.distributed.context_parallel as cp_module
 
-    logger.info("[PATCH] torchtitan.distributed.context_parallel.cp_shard -> patched_cp_shard")
-    cp_module.cp_shard = patched_cp_shard
+    logger.info(
+        "[PATCH] torchtitan.distributed.context_parallel.cp_shard -> patched_cp_shard"
+    )
+    cp_module.cp_shard = patched_cp_shard  # pyrefly: ignore [bad-assignment]
 
 
 apply()

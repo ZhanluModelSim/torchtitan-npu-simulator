@@ -8,11 +8,9 @@ from dataclasses import dataclass
 import spmd_types as spmd
 import torch
 import torch.nn.functional as F
-
 from torchtitan.distributed.utils import get_spmd_backend
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.nn_modules import RMSNorm
-
 from torchtitan.protocols.module import Module
 
 from torchtitan_npu.patches.torchtitan.models.common.rope import SingleComplexRoPE
@@ -43,10 +41,10 @@ class Compressor(Module):
         compress_ratio: int = 4
         norm_eps: float = 1e-6
 
-        wkv: Linear.Config | None = None
-        wgate: Linear.Config | None = None
-        norm: RMSNorm.Config | None = None
-        ape: Linear.Config | None = None
+        wkv: Linear.Config
+        wgate: Linear.Config
+        norm: RMSNorm.Config
+        ape: Linear.Config
 
     def __init__(self, config: Config):
         super().__init__()
@@ -125,18 +123,18 @@ class Compressor(Module):
 
         kv = (kv * score.softmax(dim=1)).sum(dim=1)
         kv = self.norm(kv.to(dtype))
-        kv_nope, kv_rope = torch.split(
-            kv, [self.head_dim - rd, rd], dim=-1
+        kv_nope, kv_rope = torch.split(kv, [self.head_dim - rd, rd], dim=-1)
+        kv_rope = (
+            self.single_rope(
+                kv_rope.unsqueeze(0).unsqueeze(2),
+                compressed.block_positions.unsqueeze(0),
+            )
+            .squeeze(0)
+            .squeeze(1)
         )
-        kv_rope = self.single_rope(
-            kv_rope.unsqueeze(0).unsqueeze(2),
-            compressed.block_positions.unsqueeze(0),
-        ).squeeze(0).squeeze(1)
         canonical = torch.cat([kv_nope, kv_rope], dim=-1)
 
-        storage = canonical.new_zeros(
-            (batch_size * storage_len, self.head_dim)
-        )
+        storage = canonical.new_zeros((batch_size * storage_len, self.head_dim))
         storage.index_copy_(0, compressed.storage_indices, canonical)
         storage = storage.view(batch_size, storage_len, self.head_dim)
         _assert_spmd_replicated_activation(storage)
@@ -155,9 +153,9 @@ class Indexer(Module):
         compress_ratio: int = 4
         norm_eps: float = 1e-6
 
-        wq_b: Linear.Config | None = None
-        weights_proj: Linear.Config | None = None
-        compressor: "Compressor.Config | None" = None
+        wq_b: Linear.Config
+        weights_proj: Linear.Config
+        compressor: Compressor.Config
 
     def __init__(self, config: Config):
         super().__init__()
@@ -217,7 +215,9 @@ class Indexer(Module):
             attention_masks=attention_masks,
         )
         k = self._rotate_activation(k)
-        weights = self.weights_proj(x) * (self.softmax_scale * self.num_index_heads**-0.5)
+        weights = self.weights_proj(x) * (
+            self.softmax_scale * self.num_index_heads**-0.5
+        )
         return q, k, weights
 
 
@@ -282,14 +282,10 @@ class IndexSelection(Module):
                 ~valid, torch.finfo(index_score.dtype).min
             )
         else:
-            valid = torch.zeros(
-                (total_tokens, 0), dtype=torch.bool, device=q.device
-            )
+            valid = torch.zeros((total_tokens, 0), dtype=torch.bool, device=q.device)
 
         selected_width = min(self.index_topk, total_blocks)
-        selected_score, selected_global = index_score.topk(
-            selected_width, dim=-1
-        )
+        selected_score, selected_global = index_score.topk(selected_width, dim=-1)
         selected_valid = torch.gather(valid, dim=-1, index=selected_global)
         compressed_doc_starts = torch.searchsorted(block_docs, query_docs)
         selected_local = selected_global - compressed_doc_starts.unsqueeze(1)
@@ -299,12 +295,8 @@ class IndexSelection(Module):
         pad = self.index_topk - selected_width
         if pad:
             selected_local = F.pad(selected_local, (0, pad), value=-1)
-            selected_score = F.pad(
-                selected_score, (0, pad), value=float("-inf")
-            )
-        indices = restore_token_tensor(
-            selected_local, metadata, fill_value=-1
-        )
+            selected_score = F.pad(selected_score, (0, pad), value=float("-inf"))
+        indices = restore_token_tensor(selected_local, metadata, fill_value=-1)
         scores = restore_token_tensor(
             selected_score, metadata, fill_value=float("-inf")
         )

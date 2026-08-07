@@ -4,9 +4,9 @@
 # LICENSE file in the root directory of this source tree.
 
 from torchtitan.config import (
+    TORCH_DTYPE_MAP,
     CompileConfig,
     ParallelismConfig,
-    TORCH_DTYPE_MAP,
     TrainingConfig,
 )
 from torchtitan.distributed import ParallelDims
@@ -19,6 +19,7 @@ from torchtitan.distributed.full_dtensor import (
     validate_config,
 )
 from torchtitan.distributed.tensor_parallel import maybe_enable_async_tp
+
 from torchtitan_npu.models.deepseek_v4.model import DeepSeekV4Model
 
 
@@ -32,9 +33,7 @@ def parallelize_deepseek_v4(
     ac_config: ActivationCheckpointingConfig,
     dump_folder: str,
 ):
-    assert (
-        training.seq_len % parallel_dims.seq_len_divisor == 0
-    ), f"""
+    assert training.seq_len % parallel_dims.seq_len_divisor == 0, f"""
         Sequence length {training.seq_len} must be divisible by the product of TP degree
         ({parallel_dims.tp}) and 2 * CP degree ({parallel_dims.cp}).
         """

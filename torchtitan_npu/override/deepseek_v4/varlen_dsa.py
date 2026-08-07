@@ -29,7 +29,7 @@ class DSAVarlenAttention(DSAFlexAttention):
     """DSV4 sparse attention with a varlen-typed config."""
 
     @dataclass(kw_only=True, slots=True)
-    class Config(VarlenAttention.Config):
+    class Config(VarlenAttention.Config):  # pyrefly: ignore [bad-override]
         """Varlen-rooted equivalent of ``DSAFlexAttention.Config``.
 
         ``dsa_window_size`` avoids the tuple-valued varlen ``window_size``.
@@ -45,7 +45,7 @@ class DSAVarlenAttention(DSAFlexAttention):
         return_lse: bool = False
 
     def __init__(self, config: Config) -> None:
-        super().__init__(config)
+        super().__init__(config)  # pyrefly: ignore [bad-argument-type]
         # Replace the unused varlen attention window with the DSA window.
         self.window_size = config.dsa_window_size
 

@@ -3,12 +3,12 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from collections.abc import Callable
 import dataclasses
+from collections.abc import Callable
 from functools import partial
+from typing import TYPE_CHECKING
 
 import torch.nn as nn
-
 from torchtitan.components.optimizer import register_moe_load_balancing_hook
 from torchtitan.distributed.pipeline_parallel import pipeline_llm
 from torchtitan.models.common import (
@@ -19,7 +19,6 @@ from torchtitan.models.common import (
     RMSNorm,
     RoPE,
 )
-
 from torchtitan.models.common.config_utils import (
     make_ffn_config,
     make_routed_experts_config,
@@ -36,21 +35,24 @@ from torchtitan_npu.patches.torchtitan.models.common.rope import SingleComplexRo
 
 from .attention import (
     Attention,
-    DSAIndexerAuxLoss,
     DSAFlexAttention,
+    DSAIndexerAuxLoss,
 )
 from .compressor import IndexSelection
-from .model import DeepSeekV4Model, DeepSeekV4TransformerBlock
 from .mhc import HcPost, HcPre
+from .model import DeepSeekV4Model, DeepSeekV4TransformerBlock
 from .moe import DeepSeekV4MoE, DeepSeekV4Router
 from .parallelize import parallelize_deepseek_v4
 from .state_dict_adapter import DeepSeekV4StateDictAdapter
 
+if TYPE_CHECKING:
+    from .compressor import Compressor, Indexer
+
 __all__ = [
-    "parallelize_deepseek_v4",
     "DeepSeekV4Model",
     "deepseek_v4_configs",
     "model_registry",
+    "parallelize_deepseek_v4",
 ]
 
 _LINEAR_INIT = {
@@ -85,6 +87,7 @@ def _depth_init(layer_id: int) -> dict[str, Callable]:
         "bias": nn.init.zeros_,
     }
 
+
 def _depth_experts_init(layer_id: int) -> dict[str, Callable]:
     return {
         "w1_EFD": partial(nn.init.trunc_normal_, std=0.02),
@@ -104,6 +107,7 @@ def _make_compressor_config(
     rope: RoPE.Config,
 ) -> "Compressor.Config":
     from .compressor import Compressor
+
     return Compressor.Config(
         dim=dim,
         single_rope=SingleComplexRoPE.Config(**dataclasses.asdict(rope)),
@@ -112,21 +116,28 @@ def _make_compressor_config(
         compress_ratio=compress_ratio,
         norm_eps=norm_eps,
         wkv=Linear.Config(
-            in_features=dim, out_features=coff * head_dim, bias=False,
+            in_features=dim,
+            out_features=coff * head_dim,
+            bias=False,
             param_init=_LINEAR_INIT,
         ),
         wgate=Linear.Config(
-            in_features=dim, out_features=coff * head_dim, bias=False,
+            in_features=dim,
+            out_features=coff * head_dim,
+            bias=False,
             param_init=_LINEAR_INIT,
         ),
         norm=RMSNorm.Config(
-            normalized_shape=head_dim, eps=norm_eps,
+            normalized_shape=head_dim,
+            eps=norm_eps,
             param_init=_NORM_INIT,
         ),
         # ``ape`` uses ``Linear`` only as a parameter container. Its weight has
         # shape ``[compress_ratio, coff * head_dim]``.
         ape=Linear.Config(
-            in_features=coff * head_dim, out_features=compress_ratio, bias=False,
+            in_features=coff * head_dim,
+            out_features=compress_ratio,
+            bias=False,
             param_init=_LINEAR_INIT,
         ),
     )
@@ -144,6 +155,7 @@ def _make_indexer_config(
     rope: RoPE.Config,
 ) -> "Indexer.Config":
     from .compressor import Indexer
+
     coff = 2  # overlap always True for indexer
     return Indexer.Config(
         dim=dim,
@@ -161,7 +173,9 @@ def _make_indexer_config(
             param_init=_LINEAR_INIT,
         ),
         weights_proj=Linear.Config(
-            in_features=dim, out_features=num_index_heads, bias=False,
+            in_features=dim,
+            out_features=num_index_heads,
+            bias=False,
             param_init=_LINEAR_INIT,
         ),
         compressor=_make_compressor_config(
@@ -209,15 +223,23 @@ def _make_v4_attn_config(
     if compress_ratio == 4:
         coff = 2  # 1 + overlap (overlap=True when compress_ratio==4)
         compressor_cfg = _make_compressor_config(
-            dim=dim, head_dim=hd, rope_head_dim=rope_head_dim,
+            dim=dim,
+            head_dim=hd,
+            rope_head_dim=rope_head_dim,
             compress_ratio=compress_ratio,
-            norm_eps=norm_eps, coff=coff, rope=rope,
+            norm_eps=norm_eps,
+            coff=coff,
+            rope=rope,
         )
         indexer_cfg = _make_indexer_config(
-            dim=dim, num_index_heads=index_n_heads,
+            dim=dim,
+            num_index_heads=index_n_heads,
             index_head_dim=index_head_dim,
-            rope_head_dim=rope_head_dim, q_lora_rank=q_lora_rank,
-            compress_ratio=compress_ratio, norm_eps=norm_eps, rope=rope,
+            rope_head_dim=rope_head_dim,
+            q_lora_rank=q_lora_rank,
+            compress_ratio=compress_ratio,
+            norm_eps=norm_eps,
+            rope=rope,
         )
         index_selection_cfg = IndexSelection.Config(
             index_topk=index_topk,
@@ -232,9 +254,13 @@ def _make_v4_attn_config(
     elif compress_ratio > 1:
         coff = 1  # no overlap
         compressor_128_cfg = _make_compressor_config(
-            dim=dim, head_dim=hd, rope_head_dim=rope_head_dim,
+            dim=dim,
+            head_dim=hd,
+            rope_head_dim=rope_head_dim,
             compress_ratio=compress_ratio,
-            norm_eps=norm_eps, coff=coff, rope=rope,
+            norm_eps=norm_eps,
+            coff=coff,
+            rope=rope,
         )
     inner_attention_cfg = DSAFlexAttention.Config(
         window_size=window_size,
@@ -265,37 +291,51 @@ def _make_v4_attn_config(
         rope=dataclasses.replace(rope),
         single_rope=SingleComplexRoPE.Config(**dataclasses.asdict(rope)),
         wq_a=Linear.Config(
-            in_features=dim, out_features=q_lora_rank, bias=False,
+            in_features=dim,
+            out_features=q_lora_rank,
+            bias=False,
             param_init=_LINEAR_INIT,
         ),
         q_norm=RMSNorm.Config(
-            normalized_shape=q_lora_rank, eps=norm_eps,
+            normalized_shape=q_lora_rank,
+            eps=norm_eps,
             param_init=_NORM_INIT,
         ),
         wq_b=Linear.Config(
-            in_features=q_lora_rank, out_features=n_heads * hd, bias=False,
+            in_features=q_lora_rank,
+            out_features=n_heads * hd,
+            bias=False,
             param_init=_LINEAR_INIT,
         ),
         wkv=Linear.Config(
-            in_features=dim, out_features=hd, bias=False,
+            in_features=dim,
+            out_features=hd,
+            bias=False,
             param_init=_LINEAR_INIT,
         ),
         kv_norm=RMSNorm.Config(
-            normalized_shape=hd, eps=norm_eps,
+            normalized_shape=hd,
+            eps=norm_eps,
             param_init=_NORM_INIT,
         ),
         wo_a=Linear.Config(
-            in_features=per_group_in, out_features=per_group_out, bias=False,
+            in_features=per_group_in,
+            out_features=per_group_out,
+            bias=False,
             param_init=_LINEAR_INIT,
         ),
         wo_b=Linear.Config(
-            in_features=per_group_out, out_features=dim, bias=False,
+            in_features=per_group_out,
+            out_features=dim,
+            bias=False,
             param_init=_LINEAR_INIT,
         ),
         # ``attn_sink`` uses ``Linear`` as a parameter container for a
         # ``[n_heads, 1]`` weight; attention squeezes it to a head-wise vector.
         attn_sink=Linear.Config(
-            in_features=1, out_features=n_heads, bias=False,
+            in_features=1,
+            out_features=n_heads,
+            bias=False,
             param_init=_LINEAR_INIT,
         ),
         compressor=compressor_cfg,
@@ -331,7 +371,7 @@ def _make_v4_moe_config(
                 param_init=_depth_init(layer_id),
             ),
             top_k=top_k,
-            score_func="sqrtsoftplus",
+            score_func="sqrtsoftplus",  # pyrefly: ignore [bad-argument-type]
             route_scale=route_scale,
             route_norm=route_norm,
             vocab_size=vocab_size,
@@ -469,11 +509,13 @@ def _build_v4_layers(
             DeepSeekV4TransformerBlock.Config(
                 attention=attn_cfg,
                 attention_norm=RMSNorm.Config(
-                    normalized_shape=dim, eps=norm_eps,
+                    normalized_shape=dim,
+                    eps=norm_eps,
                     param_init=_NORM_INIT,
                 ),
                 ffn_norm=RMSNorm.Config(
-                    normalized_shape=dim, eps=norm_eps,
+                    normalized_shape=dim,
+                    eps=norm_eps,
                     param_init=_NORM_INIT,
                 ),
                 feed_forward=ffn_cfg,

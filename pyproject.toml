@@ -8,3 +8,73 @@ version = "0.1.0"
 description = "Ascend NPU overrides for torchtitan"
 requires-python = ">=3.12"
 dependencies = ["torchtitan", "torch-npu"]
+
+[tool.pytest.ini_options]
+markers = [
+    "cpu: CPU-only unit test",
+    "static: source and declaration contract test",
+]
+
+[tool.pyrefly]
+project-excludes = ["**/tests/**", "CI", "torchtitan_npu/ops/triton", "scripts"]
+ignore-missing-imports = ["torchao.*", "torchft", "cann_ops_transformer"]
+search-path = ["/tmp/torchtitan"]
+replace-imports-with-any = ["torch_npu", "torch.npu"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "N", "C4", "UP", "I", "SIM", "TCH", "PLE", "RUF"]
+ignore = [
+    "E203",
+    "E302",
+    "E305",
+    "E402",
+    "E721",
+    "E731",
+    "E741",
+    "F405",
+    "F821",
+    "F841",
+    "B007",
+    "B008",
+    "N803",
+    "N806",
+    "N812",
+    "N817",
+    "C408",
+    "RUF001",
+    "RUF002",
+    "RUF003",
+    "RUF012",
+]
+exclude = [
+    ".git",
+    ".agents",
+    "docs",
+    "build",
+    "scripts",
+    "venv",
+    "*.pyi",
+    ".pre-commit-config.yaml",
+    "*.md",
+    ".flake8",
+    "tests/",
+    "CI",
+    "torchtitan_npu/ops/triton",
+]
+fixable = ["ALL"]
+
+[tool.ruff.lint.pycodestyle]
+max-line-length = 132
+
+[tool.ruff.lint.isort]
+known-first-party = ["torchtitan_npu", "tests"]
+known-third-party = ["torchtitan"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false

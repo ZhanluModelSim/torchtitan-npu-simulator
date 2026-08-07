@@ -18,6 +18,8 @@ from torchtitan.models.common.decoder import Decoder
 from torchtitan.models.common.rope import RoPE
 from torchtitan.models.deepseek_v3.model import (
     Attention as V3Attention,
+)
+from torchtitan.models.deepseek_v3.model import (
     DeepSeekV3Model,
 )
 from torchtitan.protocols.module import Module
@@ -189,7 +191,8 @@ class BlockMaskHandler(BaseMaskHandler):
     class Config(BaseMaskHandler.Config):
         pass
 
-    def post_process(self, masks):
+    def post_process(self, masks, *, positions=None):
+        del positions
         assert isinstance(masks, BlockMask), f"expected BlockMask, got {type(masks)}"
         B = masks.kv_num_blocks.shape[0]
         seq_len = masks.seq_lengths[0]
@@ -230,7 +233,7 @@ class SparseIndexerLoss(LoggedAuxLoss):
         *,
         carrier: torch.Tensor,
     ) -> torch.Tensor:
-        B, Lq, K = topk_indices_BLqK.shape
+        B = topk_indices_BLqK.shape[0]
 
         k_sqz = k_BL1H.float().squeeze(2)
         b_idx = torch.arange(B, device=topk_indices_BLqK.device)[:, None, None]
@@ -266,7 +269,7 @@ class SparseInnerAttention(FlexAttention):
         self.index_topk = config.index_topk
         self.indexer_loss = config.indexer_loss.build()
 
-    def forward(
+    def forward(  # pyrefly: ignore [bad-param-name-override]
         self,
         q_nope_BLNH: torch.Tensor,
         k_nope_BL1H: torch.Tensor,
@@ -341,7 +344,7 @@ class Attention(V3Attention):
         self.register_state_dict_post_hook(self._merge_wkv_b_on_save)
         self.register_load_state_dict_pre_hook(self._split_wkv_b_on_load)
 
-    def forward(
+    def forward(  # pyrefly: ignore [bad-param-name-override]
         self,
         x_BLD: torch.Tensor,
         attention_masks: AttentionMasksType,

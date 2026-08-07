@@ -6,7 +6,6 @@
 from typing import TYPE_CHECKING
 
 import spmd_types as spmd
-
 from torchtitan.distributed.parallel_dims import MeshAxisName
 from torchtitan.models.common.decoder_sharding import (
     colwise_config,
@@ -180,14 +179,17 @@ def set_deepseek_v4_layer_sharding(
     enable_ep: bool,
 ) -> None:
     hc_rep = ShardingConfig(
-        state_shardings={
-            n: _dense_param_rep
-            for n in [
-                "hc_attn_fn", "hc_ffn_fn",
-                "hc_attn_base", "hc_ffn_base",
-                "hc_attn_scale", "hc_ffn_scale",
-            ]
-        },
+        state_shardings=dict.fromkeys(
+            [
+                "hc_attn_fn",
+                "hc_ffn_fn",
+                "hc_attn_base",
+                "hc_ffn_base",
+                "hc_attn_scale",
+                "hc_ffn_scale",
+            ],
+            _dense_param_rep,
+        ),
     )
     layer_cfg.sharding_config = hc_rep
 
@@ -224,12 +226,12 @@ def set_deepseek_v4_layer_sharding(
             if enable_ep
             else dense_activation_placement(tp=spmd.R)
         )
-        layer_cfg.moe.sharding_config.in_src_shardings["input_ids"] = (
-            input_ids_src_placement
-        )
-        layer_cfg.moe.sharding_config.in_dst_shardings["input_ids"] = (
-            input_ids_dst_placement
-        )
+        moe_sharding = layer_cfg.moe.sharding_config
+        assert moe_sharding is not None
+        assert moe_sharding.in_src_shardings is not None
+        assert moe_sharding.in_dst_shardings is not None
+        moe_sharding.in_src_shardings["input_ids"] = input_ids_src_placement
+        moe_sharding.in_dst_shardings["input_ids"] = input_ids_dst_placement
 
 
 def set_deepseek_v4_sharding_config(
@@ -241,10 +243,9 @@ def set_deepseek_v4_sharding_config(
     set_decoder_sharding_config(config, enable_sp=enable_sp)
 
     hc_rep = ShardingConfig(
-        state_shardings={
-            n: _dense_param_rep
-            for n in ["hc_head_fn", "hc_head_base", "hc_head_scale"]
-        },
+        state_shardings=dict.fromkeys(
+            ["hc_head_fn", "hc_head_base", "hc_head_scale"], _dense_param_rep
+        ),
     )
     model_sharding = config.sharding_config or ShardingConfig()
     model_sharding.state_shardings.update(hc_rep.state_shardings)

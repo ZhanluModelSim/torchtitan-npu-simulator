@@ -101,7 +101,10 @@ def _apply_v3_2_attention_sharding(
         local_map=LocalMapConfig(in_grad_placements=None),
     )
 
-    indexer_loss_cfg = attention.inner_attention.indexer_loss
+    from torchtitan_npu.models.deepseek_v3_2.model import SparseInnerAttention
+
+    assert isinstance(inner_cfg, SparseInnerAttention.Config)
+    indexer_loss_cfg = inner_cfg.indexer_loss
     indexer_loss_cfg.sharding_config = ShardingConfig(
         state_shardings={"_acc": dense_param_placement(tp=spmd.I)},
         in_src_shardings={

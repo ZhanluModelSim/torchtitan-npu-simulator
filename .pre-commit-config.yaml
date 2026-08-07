@@ -1,0 +1,91 @@
+# ---------------------------------------------------------------------------------------------------------
+# Copyright (c) 2026 Huawei Technologies Co., Ltd.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# the BSD-style license found in the LICENSE file in the root directory of this source tree.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# ---------------------------------------------------------------------------------------------------------
+minimum_pre_commit_version: 4.0.0
+exclude: ^LICENSES/|\.(html|csv|svg)$
+
+default_install_hook_types: [pre-commit]
+default_stages: [pre-commit]
+ci:
+  autofix_prs: false
+  autoupdate_schedule: monthly
+
+repos:
+  # pre-commit basic checks
+  - repo: https://gitcode.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+        args: ["--allow-multiple-documents"]
+      - id: check-added-large-files
+        exclude: ^tests/assets/tokenizer/
+      - id: check-merge-conflict
+      - id: detect-private-key
+      - id: check-json
+        exclude: ^tests/assets/.*\.json$
+      - id: no-commit-to-branch
+        args: ['--branch=main']
+
+  # C++ code formatting check
+  - repo: https://gitcode.com/pre-commit-clang/mirrors-clang-format
+    rev: v18.1.8
+    hooks:
+      - id: clang-format
+        files: \.(c|h|cpp|hpp|cc|hh|cxx|hxx|asc)$
+        args:
+          - "--style=file"
+          - "--verbose"
+          - "-i"
+        exclude: ^build/|tests/third_party/
+
+  # Python code check
+  - repo: https://gitcode.com/gh_mirrors/ru/ruff-pre-commit
+    rev: v0.14.14
+    hooks:
+      - id: ruff-check
+        args: ["--output-format", "github", "--fix", "--exclude", ".agents/**,tests/**"]
+        types: [python]
+      - id: ruff-format
+        args: ["--exclude", ".agents/**,tests/**"]
+        types: [python]
+
+  # Spell check
+  - repo: https://gitcode.com/gh_mirrors/co/codespell
+    rev: v2.4.1
+    hooks:
+      - id: codespell
+        args: [
+            "-L",
+            "CANN,cann,NNAL,nnal,ASCEND,ascend,EnQue,CopyIn,ArchType,AND,ND,tbe,copyin,alog",
+            "--skip",
+            "*.py,*.cpp,*.hpp,*.c,*.h,tests/assets/tokenizer/qwen3-tokenizer/merges.txt",
+          ]
+
+  # OAT compliance check (Open Source Audit Tool)
+  - repo: local
+    hooks:
+      - id: oat-check
+        name: OAT Compliance Check
+        entry: bash scripts/oat_check.sh
+        language: system
+        pass_filenames: false
+        stages: [pre-commit]
+        verbose: true
+
+  # Pyrefly type checking
+  - repo: local
+    hooks:
+      - id: pyrefly
+        name: Pyrefly (type checking)
+        entry: python3 -m pyrefly check
+        language: system
+        types: [python]
+        pass_filenames: false
+        args: [--config, pyproject.toml]

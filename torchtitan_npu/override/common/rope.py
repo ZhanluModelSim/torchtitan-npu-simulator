@@ -47,7 +47,8 @@ class _NPUComplexCacheMixin:
         query: torch.Tensor,
         positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        return reshape_complex_cache_via_real(self.cache, query, positions)
+        cache = self.cache  # pyrefly: ignore [missing-attribute]
+        return reshape_complex_cache_via_real(cache, query, positions)
 
 
 class NPUComplexRoPE(_NPUComplexCacheMixin, ComplexRoPE):
@@ -95,7 +96,8 @@ class _FirstRowPositionsMixin:
     ) -> torch.Tensor:
         if positions is not None and positions.size(0) > 1:
             positions = positions[0].unsqueeze(0)
-        return super()._reshape_cache(query, positions)
+        reshape_cache = super()._reshape_cache  # pyrefly: ignore [missing-attribute]
+        return reshape_cache(query, positions)
 
 
 class NPUFusedRoPE(_FirstRowPositionsMixin, NPUComplexRoPE):

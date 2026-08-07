@@ -7,7 +7,6 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
-
 from torchtitan.protocols.module import Module
 
 
@@ -32,11 +31,15 @@ class HcSplitSinkhorn(Module):
         pre, post, comb = mixes.split([hc_mult, hc_mult, hc_mult * hc_mult], dim=-1)
         comb = comb.unflatten(-1, (hc_mult, hc_mult))
 
-        pre = torch.sigmoid(
-            pre * hc_scale[0] + hc_base[:hc_mult].unsqueeze(0).unsqueeze(0)
-        ) + self.eps
+        pre = (
+            torch.sigmoid(
+                pre * hc_scale[0] + hc_base[:hc_mult].unsqueeze(0).unsqueeze(0)
+            )
+            + self.eps
+        )
         post = 2 * torch.sigmoid(
-            post * hc_scale[1] + hc_base[hc_mult : 2 * hc_mult].unsqueeze(0).unsqueeze(0)
+            post * hc_scale[1]
+            + hc_base[hc_mult : 2 * hc_mult].unsqueeze(0).unsqueeze(0)
         )
         comb = comb * hc_scale[2] + hc_base[2 * hc_mult :].view(
             hc_mult, hc_mult

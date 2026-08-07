@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
-from torchtitan.config import derive, override
+from torchtitan.config import override
 
 from torchtitan_npu.models.deepseek_v4.attention import DSAFlexAttention
 from torchtitan_npu.models.deepseek_v4.packed import (
@@ -32,7 +32,6 @@ from torchtitan_npu.override.deepseek_v4.varlen_dsa import (
     derive_varlen_dsa,
 )
 
-
 _LAYOUT = "TND"
 _ORI_MASK_MODE = 4
 _CMP_MASK_MODE = 3
@@ -44,9 +43,7 @@ class SMLAMetadataCache:
     def __init__(self) -> None:
         self._batch_cache_id: int | None = None
         # Cache key presence separately because valid metadata may be None.
-        self._values: dict[
-            tuple[str, int, tuple[Any, ...]], torch.Tensor | None
-        ] = {}
+        self._values: dict[tuple[str, int, tuple[Any, ...]], torch.Tensor | None] = {}
 
     def get_or_create(
         self,
@@ -109,9 +106,7 @@ def _validate_model_input_layout(
         raise ValueError("ratio>1 npu_smla_tnd requires compressed KV=[B,C,D].")
     expected = (batch_size, seqlen // ratio)
     if cmp_kv.shape[:2] != expected:
-        raise ValueError(
-            "Compressed KV storage must be [B,S//ratio,D] for local TND."
-        )
+        raise ValueError("Compressed KV storage must be [B,S//ratio,D] for local TND.")
     return metadata, compressed
 
 
@@ -178,9 +173,7 @@ def _sparse_metadata(
         "sparse_flash_mla",
         ratio,
         signature,
-        lambda: ops.sparse_flash_mla_metadata(
-            num_heads_q, 1, head_dim, **kwargs
-        ),
+        lambda: ops.sparse_flash_mla_metadata(num_heads_q, 1, head_dim, **kwargs),
     )
 
 
@@ -297,7 +290,7 @@ def _compute_li_loss(
 
 class _SparseFlashMLATND(torch.autograd.Function):
     @staticmethod
-    def forward(
+    def forward(  # pyrefly: ignore [bad-override]
         ctx,
         query,
         ori_kv,
@@ -326,9 +319,7 @@ class _SparseFlashMLATND(torch.autograd.Function):
             query,
             ori_kv=ori_kv,
             cmp_kv=cmp_kv if has_compressed else None,
-            cmp_sparse_indices=(
-                cmp_sparse_indices if has_sparse_indices else None
-            ),
+            cmp_sparse_indices=(cmp_sparse_indices if has_sparse_indices else None),
             ori_block_table=None,
             cmp_block_table=None,
             cu_seqlens_q=cu_seqlens_q,
@@ -372,7 +363,7 @@ class _SparseFlashMLATND(torch.autograd.Function):
         return result
 
     @staticmethod
-    def backward(ctx, grad_output):
+    def backward(ctx, grad_output):  # pyrefly: ignore [bad-override]
         (
             result,
             softmax_lse,
@@ -427,9 +418,7 @@ class _SparseFlashMLATND(torch.autograd.Function):
             ori_kv=ori_kv,
             cmp_kv=cmp_kv if has_compressed else None,
             ori_sparse_indices=None,
-            cmp_sparse_indices=(
-                cmp_sparse_indices if has_sparse_indices else None
-            ),
+            cmp_sparse_indices=(cmp_sparse_indices if has_sparse_indices else None),
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_ori_kv=cu_seqlens_ori_kv,
             cu_seqlens_cmp_kv=(cu_seqlens_cmp_kv if has_compressed else None),
@@ -456,7 +445,9 @@ class _SparseFlashMLATND(torch.autograd.Function):
         dindexer_q = dindexer_k = dindex_weights = None
         if ctx.ratio == 4 and ctx.indexer_loss_coeff != 0:
             if any(x is None for x in (indexer_q, indexer_k, index_weights)):
-                raise RuntimeError("ratio-4 npu_smla_tnd requires LI tensors in backward.")
+                raise RuntimeError(
+                    "ratio-4 npu_smla_tnd requires LI tensors in backward."
+                )
             slig_metadata = ops.sparse_lightning_indexer_kl_loss_grad_metadata(
                 indexer_q.shape[1],
                 1,
@@ -495,9 +486,7 @@ class _SparseFlashMLATND(torch.autograd.Function):
                 )
                 ctx.indexer_loss_accumulator.add_(li_loss.detach())
             query_rows = cmp_softmax_l1.sum(dim=-1).numel()
-            grad_scale = (
-                ctx.indexer_loss_coeff * ctx.softmax_scale / float(query_rows)
-            )
+            grad_scale = ctx.indexer_loss_coeff * ctx.softmax_scale / float(query_rows)
             dindexer_q = (dindexer_q * grad_scale).to(indexer_q.dtype)
             dindexer_k = (dindexer_k * grad_scale).to(indexer_k.dtype)
             dindex_weights = (dindex_weights * grad_scale).to(index_weights.dtype)
@@ -559,25 +548,29 @@ class NPUSMLATNDAttention(DSAVarlenAttention):
             attention_masks,
             self.compress_ratio,
         )
-        batch_size, seqlen, num_heads, head_dim = query_states.shape
         query = compact_token_tensor(query_states, metadata).contiguous()
         ori_kv = compact_token_tensor(kv_states, metadata).unsqueeze(1).contiguous()
         cmp_kv = (
             None
             if compressed is None
-            else compact_compressed_tensor(
-                kv_compress, metadata, self.compress_ratio
-            ).unsqueeze(1).contiguous()
+            else compact_compressed_tensor(kv_compress, metadata, self.compress_ratio)
+            .unsqueeze(1)
+            .contiguous()
         )
 
         index_q = index_k = weights = cmp_sparse_indices = None
         if self.compress_ratio == 4:
             if q_indexer is None or k_indexer is None or index_weights is None:
-                raise ValueError("ratio-4 npu_smla_tnd requires all LI projection tensors.")
+                raise ValueError(
+                    "ratio-4 npu_smla_tnd requires all LI projection tensors."
+                )
+            assert compressed is not None
             index_q = compact_token_tensor(q_indexer, metadata).contiguous()
-            index_k = compact_compressed_tensor(
-                k_indexer, metadata, self.compress_ratio
-            ).unsqueeze(1).contiguous()
+            index_k = (
+                compact_compressed_tensor(k_indexer, metadata, self.compress_ratio)
+                .unsqueeze(1)
+                .contiguous()
+            )
             weights = compact_token_tensor(index_weights, metadata).contiguous()
             cmp_sparse_indices = _run_lightning_indexer(
                 get_cann_transformer_ops(),
@@ -626,11 +619,7 @@ class NPUSMLATNDAttention(DSAVarlenAttention):
             weights if weights is not None else empty_value.clone(),
             metadata.varlen.cu_seq_q,
             metadata.varlen.cu_seq_q.clone(),
-            (
-                empty_int32.clone()
-                if compressed is None
-                else compressed.varlen.cu_seq_k
-            ),
+            (empty_int32.clone() if compressed is None else compressed.varlen.cu_seq_k),
             empty_int32.clone() if compressed is None else compressed.residual,
             self.softmax_scale,
             self.compress_ratio,

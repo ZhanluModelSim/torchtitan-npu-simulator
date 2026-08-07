@@ -8,7 +8,6 @@ from typing import Any
 
 import torch
 from torch.distributed.tensor import DTensor
-
 from torchtitan.models.deepseek_v3.state_dict_adapter import DeepSeekV3StateDictAdapter
 from torchtitan.models.utils import MoEStateDictAdapter
 
@@ -24,6 +23,7 @@ class DeepSeekV4StateDictAdapter(MoEStateDictAdapter):
         hf_assets_path: str | None,
     ):
         super().__init__(model_config, hf_assets_path)
+        self.dsv4_model_config = model_config
 
         self.from_hf_map = {
             "embed.weight": "tok_embeddings.weight",
@@ -67,41 +67,45 @@ class DeepSeekV4StateDictAdapter(MoEStateDictAdapter):
             cr = self.compress_ratios[layer_id]
             if cr != 1:
                 comp = "compressor" if cr == 4 else "compressor_128"
-                self.from_hf_map.update({
-                    f"layers.{layer_id}.attn.compressor.ape": (
-                        f"layers.{layer_id}.attention.{comp}.ape.weight"
-                    ),
-                    f"layers.{layer_id}.attn.compressor.norm.weight": (
-                        f"layers.{layer_id}.attention.{comp}.norm.weight"
-                    ),
-                    f"layers.{layer_id}.attn.compressor.wgate.weight": (
-                        f"layers.{layer_id}.attention.{comp}.wgate.weight"
-                    ),
-                    f"layers.{layer_id}.attn.compressor.wkv.weight": (
-                        f"layers.{layer_id}.attention.{comp}.wkv.weight"
-                    ),
-                })
+                self.from_hf_map.update(
+                    {
+                        f"layers.{layer_id}.attn.compressor.ape": (
+                            f"layers.{layer_id}.attention.{comp}.ape.weight"
+                        ),
+                        f"layers.{layer_id}.attn.compressor.norm.weight": (
+                            f"layers.{layer_id}.attention.{comp}.norm.weight"
+                        ),
+                        f"layers.{layer_id}.attn.compressor.wgate.weight": (
+                            f"layers.{layer_id}.attention.{comp}.wgate.weight"
+                        ),
+                        f"layers.{layer_id}.attn.compressor.wkv.weight": (
+                            f"layers.{layer_id}.attention.{comp}.wkv.weight"
+                        ),
+                    }
+                )
             if cr == 4:
-                self.from_hf_map.update({
-                    f"layers.{layer_id}.attn.indexer.compressor.ape": (
-                        f"layers.{layer_id}.attention.indexer.compressor.ape.weight"
-                    ),
-                    f"layers.{layer_id}.attn.indexer.compressor.norm.weight": (
-                        f"layers.{layer_id}.attention.indexer.compressor.norm.weight"
-                    ),
-                    f"layers.{layer_id}.attn.indexer.compressor.wgate.weight": (
-                        f"layers.{layer_id}.attention.indexer.compressor.wgate.weight"
-                    ),
-                    f"layers.{layer_id}.attn.indexer.compressor.wkv.weight": (
-                        f"layers.{layer_id}.attention.indexer.compressor.wkv.weight"
-                    ),
-                    f"layers.{layer_id}.attn.indexer.wq_b.weight": (
-                        f"layers.{layer_id}.attention.indexer.wq_b.weight"
-                    ),
-                    f"layers.{layer_id}.attn.indexer.weights_proj.weight": (
-                        f"layers.{layer_id}.attention.indexer.weights_proj.weight"
-                    ),
-                })
+                self.from_hf_map.update(
+                    {
+                        f"layers.{layer_id}.attn.indexer.compressor.ape": (
+                            f"layers.{layer_id}.attention.indexer.compressor.ape.weight"
+                        ),
+                        f"layers.{layer_id}.attn.indexer.compressor.norm.weight": (
+                            f"layers.{layer_id}.attention.indexer.compressor.norm.weight"
+                        ),
+                        f"layers.{layer_id}.attn.indexer.compressor.wgate.weight": (
+                            f"layers.{layer_id}.attention.indexer.compressor.wgate.weight"
+                        ),
+                        f"layers.{layer_id}.attn.indexer.compressor.wkv.weight": (
+                            f"layers.{layer_id}.attention.indexer.compressor.wkv.weight"
+                        ),
+                        f"layers.{layer_id}.attn.indexer.wq_b.weight": (
+                            f"layers.{layer_id}.attention.indexer.wq_b.weight"
+                        ),
+                        f"layers.{layer_id}.attn.indexer.weights_proj.weight": (
+                            f"layers.{layer_id}.attention.indexer.weights_proj.weight"
+                        ),
+                    }
+                )
             if layer_id < model_config.layers[0].moe.router.n_hash_layers:
                 self.from_hf_map.update(
                     {
@@ -115,12 +119,13 @@ class DeepSeekV4StateDictAdapter(MoEStateDictAdapter):
 
     @staticmethod
     def _first_number(key: str) -> str:
-        return re.search(r"\d+", key).group(0)
+        match = re.search(r"\d+", key)
+        if match is None:
+            raise ValueError(f"Expected a numeric layer index in key: {key}")
+        return match.group(0)
 
     def _map_layer(self, key: str, mapping: dict[str, str]) -> str:
-        return mapping[self._abstract_key(key, count=1)].format(
-            self._first_number(key)
-        )
+        return mapping[self._abstract_key(key, count=1)].format(self._first_number(key))
 
     def to_hf(self, state_dict: dict[str, Any]) -> dict[str, Any]:
         to_hf_map = {v: k for k, v in self.from_hf_map.items()}
@@ -139,20 +144,27 @@ class DeepSeekV4StateDictAdapter(MoEStateDictAdapter):
                 new_abstract = to_hf_map[abstract_key]
 
                 if isinstance(value, DTensor):
-                    self.grouped_expert_weight_placements[abstract_key] = value.placements
+                    self.grouped_expert_weight_placements[abstract_key] = (
+                        value.placements
+                    )
                     self.grouped_expert_weight_shape[abstract_key] = value.shape
                     self.grouped_expert_weight_mesh[abstract_key] = value.device_mesh
                     local_fqn = self._get_local_experts_weights(
-                        new_abstract, abstract_key, layer_num, value,
+                        new_abstract,
+                        abstract_key,
+                        layer_num,
+                        value,
                     )
                     hf_state_dict.update(local_fqn)
                 else:
                     num_experts = next(
-                        l for l in self.model_config.layers if l.moe is not None
+                        l for l in self.dsv4_model_config.layers if l.moe is not None
                     ).moe.num_experts
                     split_values = self._split_experts_weights(value, num_experts)
                     for e in range(num_experts):
-                        hf_state_dict[new_abstract.format(layer_num, e)] = split_values[e].squeeze()
+                        hf_state_dict[new_abstract.format(layer_num, e)] = split_values[
+                            e
+                        ].squeeze()
 
             elif "layers" in key:
                 # HF stores attn_sink as [H], while the model uses [H, 1].
@@ -197,14 +209,19 @@ class DeepSeekV4StateDictAdapter(MoEStateDictAdapter):
 
                 if titan_abstract in self.local_experts_indices:
                     stacked = self._concatenate_expert_weights_dtensor(
-                        expert_weights, titan_abstract, layer_num,
+                        expert_weights,
+                        titan_abstract,
+                        layer_num,
                     )
                 else:
                     num_experts = next(
-                        l for l in self.model_config.layers if l.moe is not None
+                        l for l in self.dsv4_model_config.layers if l.moe is not None
                     ).moe.num_experts
                     stacked = self._concatenate_expert_weights(
-                        expert_weights, titan_abstract, layer_num, num_experts,
+                        expert_weights,
+                        titan_abstract,
+                        layer_num,
+                        num_experts,
                     )
                 if stacked is not None:
                     state_dict[new_key] = stacked

@@ -31,8 +31,7 @@ def patched_post_dataloading_process(self, input_dict, labels, model_parts):
 
 def apply() -> None:
     logger.info(
-        "[PATCH] Validator.post_dataloading_process -> "
-        "patched_post_dataloading_process"
+        "[PATCH] Validator.post_dataloading_process -> patched_post_dataloading_process"
     )
     Validator.post_dataloading_process = patched_post_dataloading_process
 

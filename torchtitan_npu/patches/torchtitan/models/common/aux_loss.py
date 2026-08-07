@@ -42,7 +42,9 @@ class _AuxLossInjection(torch.autograd.Function):
     """Identity-forward autograd that injects an aux-loss gradient on backward."""
 
     @staticmethod
-    def forward(ctx, carrier: torch.Tensor, aux_loss: torch.Tensor) -> torch.Tensor:
+    def forward(  # pyrefly: ignore [bad-override]
+        ctx, carrier: torch.Tensor, aux_loss: torch.Tensor
+    ) -> torch.Tensor:
         ctx.save_for_backward(aux_loss)
         return carrier
 
@@ -98,14 +100,16 @@ class LoggedAuxLoss(Module):
         )
         LoggedAuxLoss._group_counts[(config.reduce_mesh, self.metric_name)] += 1
 
-
     def _compute_mesh_scale_factor(self) -> float:
-        pd = ParallelDims.get()
+        pd = ParallelDims.get()  # pyrefly: ignore [missing-attribute]
         batch_mesh = pd.get_optional_mesh("batch", include_singleton_axes=True)
-        reduce_mesh = pd.get_optional_mesh(self.reduce_mesh, include_singleton_axes=True)
+        reduce_mesh = pd.get_optional_mesh(
+            self.reduce_mesh, include_singleton_axes=True
+        )
 
+        assert batch_mesh is not None
+        assert reduce_mesh is not None
         return batch_mesh.size() / reduce_mesh.size()
-
 
     def _init_self_buffers(self, *, buffer_device: torch.device | None = None) -> None:
         if buffer_device is None:
@@ -115,12 +119,11 @@ class LoggedAuxLoss(Module):
 
     def inject(self, carrier: torch.Tensor, raw_sum: torch.Tensor) -> torch.Tensor:
         """Inject aux loss gradient into the forward graph and accumulate for logging."""
+        assert self.global_batch_size is not None
         scale = self._mesh_scale_factor / self.global_batch_size
         if self.training and _should_run_forward():
             self._acc.add_(raw_sum.detach() * scale)
-        return _AuxLossInjection.apply(
-            carrier, raw_sum * (self.coeff * scale)
-        )
+        return _AuxLossInjection.apply(carrier, raw_sum * (self.coeff * scale))
 
     def read(self) -> torch.Tensor:
         """Read the accumulated value without clearing."""

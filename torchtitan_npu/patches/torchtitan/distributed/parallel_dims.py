@@ -16,18 +16,15 @@ def _patched_post_init(self):
     ParallelDims._global_instance = self
 
 
-@classmethod
 def _patched_get(cls) -> ParallelDims:
-    assert cls._global_instance is not None, (
-        "ParallelDims has not been initialized."
-    )
+    assert cls._global_instance is not None, "ParallelDims has not been initialized."
     return cls._global_instance
 
 
 def apply() -> None:
     ParallelDims._global_instance = None
     ParallelDims.__post_init__ = _patched_post_init
-    ParallelDims.get = _patched_get
+    ParallelDims.get = classmethod(_patched_get)
 
     logger.info("[PATCH] ParallelDims._global_instance + get()")
 

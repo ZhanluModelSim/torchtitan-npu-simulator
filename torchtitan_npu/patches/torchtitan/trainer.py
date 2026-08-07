@@ -30,7 +30,9 @@ def patched_post_dataloading_process(self, input_dict, labels):
 
 
 def apply() -> None:
-    logger.info("[PATCH] Trainer.post_dataloading_process -> patched_post_dataloading_process")
+    logger.info(
+        "[PATCH] Trainer.post_dataloading_process -> patched_post_dataloading_process"
+    )
     Trainer.post_dataloading_process = patched_post_dataloading_process
 
 

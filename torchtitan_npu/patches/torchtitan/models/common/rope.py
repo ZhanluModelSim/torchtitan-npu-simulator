@@ -13,7 +13,6 @@ Remove this module after the TorchTitan dependency includes the PR.
 from dataclasses import dataclass
 
 import torch
-
 from torchtitan.models.common.rope import ComplexRoPE
 
 __all__ = ["SingleComplexRoPE"]
@@ -26,7 +25,7 @@ class SingleComplexRoPE(ComplexRoPE):
     class Config(ComplexRoPE.Config):
         pass
 
-    def forward(
+    def forward(  # pyrefly: ignore [bad-param-name-override]
         self,
         x: torch.Tensor,
         positions: torch.Tensor | None = None,
@@ -37,7 +36,7 @@ class SingleComplexRoPE(ComplexRoPE):
         return self.apply_rotary_emb(x, rope_cache, inverse=inverse)
 
     @staticmethod
-    def apply_rotary_emb(
+    def apply_rotary_emb(  # pyrefly: ignore [bad-param-name-override]
         x: torch.Tensor,
         rope_cache: torch.Tensor,
         *,

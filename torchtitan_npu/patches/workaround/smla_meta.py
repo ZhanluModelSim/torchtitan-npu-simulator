@@ -14,7 +14,6 @@ ships the floor division.
 import torch
 from torchtitan.tools.logging import logger
 
-
 _NAMESPACE = "cann_ops_transformer"
 _OP_NAME = "sparse_flash_mla"
 
@@ -57,6 +56,7 @@ def _sparse_flash_mla_meta(
         # The kernel still needs a valid tensor here, just not a sized one.
         return attn_out, torch.empty([], dtype=torch.float32, device="meta")
 
+    assert ori_kv is not None
     if layout_q == "BSND":
         kv_heads = ori_kv.shape[2]
         lse_shape = [q.shape[0], kv_heads, q.shape[1], q.shape[2] // kv_heads]

@@ -53,7 +53,9 @@ def patched_update_from_config(self, *, config, **kwargs):
 
 
 def apply() -> None:
-    logger.info("[PATCH] Decoder.Config.update_from_config -> patched_update_from_config")
+    logger.info(
+        "[PATCH] Decoder.Config.update_from_config -> patched_update_from_config"
+    )
     Decoder.Config.update_from_config = patched_update_from_config
 
 

@@ -13,7 +13,6 @@ from dataclasses import dataclass
 
 import torch
 import torch_npu
-
 from torchtitan.config import derive, override
 from torchtitan.models.common.token_dispatcher import AllToAllTokenDispatcher
 
@@ -22,7 +21,7 @@ from torchtitan.models.common.token_dispatcher import AllToAllTokenDispatcher
 class NPULocalDispatchMetadata:
     input_shape: torch.Size
     permuted_indices: torch.Tensor
-    topk_scores_experts_sorted_N: torch.Tensor
+    topk_scores_experts_sorted_N: torch.Tensor  # noqa: N815
 
 
 class NPUAllToAllTokenDispatcher(AllToAllTokenDispatcher):
@@ -32,7 +31,7 @@ class NPUAllToAllTokenDispatcher(AllToAllTokenDispatcher):
     class Config(AllToAllTokenDispatcher.Config):
         pass
 
-    def dispatch(
+    def dispatch(  # pyrefly: ignore [bad-override]
         self,
         x_TD: torch.Tensor,
         topk_scores_TK: torch.Tensor,

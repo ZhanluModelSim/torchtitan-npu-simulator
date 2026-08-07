@@ -14,7 +14,6 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
-
 from torchtitan.config import derive, override
 from torchtitan.models.common.nn_modules import RMSNorm
 
@@ -54,6 +53,7 @@ class GoldenRMSNorm(RMSNorm):
         dtype = x.dtype
         x = x.float()
         var = x.square().mean(-1, keepdim=True)
+        assert self.eps is not None
         x = x * torch.rsqrt(var + self.eps)
         if self.weight is None:
             return x.to(dtype)
@@ -91,7 +91,10 @@ class GoldenDSV4MoE(DeepSeekV4MoE):
             h = weights * h
         return F.linear(h.to(dtype), w2)
 
-    def forward(self, x_BLD: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
+    def forward(self, x_BLD: torch.Tensor, **router_kwargs) -> torch.Tensor:
+        input_ids = router_kwargs.get("input_ids")
+        if input_ids is None:
+            raise ValueError("input_ids is required for GoldenDSV4MoE routing.")
         shape = x_BLD.size()
         x_TD = x_BLD.reshape(-1, shape[-1])
 
@@ -174,12 +177,8 @@ def _sparse_attn_chunk(
     safe_BMK = torch.where(
         valid_BMK, topk_idxs_BMK, torch.zeros_like(topk_idxs_BMK)
     ).long()
-    batch_BMK = (
-        torch.arange(b, device=kv_BND.device).view(b, 1, 1).expand(-1, m, k)
-    )
-    kv_BMKD = kv_BND[batch_BMK, safe_BMK, :] * valid_BMK.unsqueeze(-1).to(
-        kv_BND.dtype
-    )
+    batch_BMK = torch.arange(b, device=kv_BND.device).view(b, 1, 1).expand(-1, m, k)
+    kv_BMKD = kv_BND[batch_BMK, safe_BMK, :] * valid_BMK.unsqueeze(-1).to(kv_BND.dtype)
 
     scores_BMHK = torch.matmul(q_BMHD.float(), kv_BMKD.float().transpose(-2, -1))
     scores_BMHK = scores_BMHK * softmax_scale
@@ -272,9 +271,7 @@ class GoldenDSASparseAttention(DSAVarlenAttention):
             if compressed_len == 0:
                 continue
             local = torch.arange(q_end - q_start, device=device)
-            limit = torch.div(
-                local + 1, self.compress_ratio, rounding_mode="floor"
-            )
+            limit = torch.div(local + 1, self.compress_ratio, rounding_mode="floor")
             candidates = torch.arange(compressed_len, device=device).expand(
                 q_end - q_start, -1
             )
@@ -307,12 +304,11 @@ class GoldenDSASparseAttention(DSAVarlenAttention):
         global_indices = (
             starts.unsqueeze(1) + compressed_indices.clamp_min(0)
         ).clamp_max(compressed_kv.shape[0] - 1)
-        selected_kv = compressed_kv.index_select(
-            0, global_indices.flatten()
-        ).view(*global_indices.shape, compressed_kv.shape[-1])
+        selected_kv = compressed_kv.index_select(0, global_indices.flatten()).view(
+            *global_indices.shape, compressed_kv.shape[-1]
+        )
         selected_score = (
-            torch.einsum("thd,tkd->thk", query, selected_kv)
-            * self.softmax_scale
+            torch.einsum("thd,tkd->thk", query, selected_kv) * self.softmax_scale
         )
         selected_prob = torch.exp(
             selected_score.float() - attn_lse.unsqueeze(-1).float()
@@ -354,9 +350,7 @@ class GoldenDSASparseAttention(DSAVarlenAttention):
         compressed_kv = (
             query.new_empty((0, query.shape[-1]))
             if self.compress_ratio <= 1
-            else compact_compressed_tensor(
-                kv_compress, metadata, self.compress_ratio
-            )
+            else compact_compressed_tensor(kv_compress, metadata, self.compress_ratio)
         )
 
         index_score = None
@@ -370,9 +364,7 @@ class GoldenDSASparseAttention(DSAVarlenAttention):
             compressed_indices = compact_token_tensor(outer_indices, metadata)
             index_score = compact_token_tensor(outer_scores, metadata)
         elif self.compress_ratio > 1:
-            compressed_indices = self._packed_compressed_indices(
-                metadata, query.device
-            )
+            compressed_indices = self._packed_compressed_indices(metadata, query.device)
         else:
             compressed_indices = None
 
@@ -394,6 +386,8 @@ class GoldenDSASparseAttention(DSAVarlenAttention):
             indices = window_indices
             all_kv = original_kv
             if self.compress_ratio > 1:
+                assert compressed_indices is not None
+                assert compressed_kv is not None
                 compressed = metadata.compression_for_ratio(self.compress_ratio)
                 compressed_starts = torch.searchsorted(
                     compressed.document_ids,
@@ -425,6 +419,9 @@ class GoldenDSASparseAttention(DSAVarlenAttention):
             attn_lse = attn_lse.squeeze(0)
             carrier = restore_token_tensor(output, metadata)
             if self.compress_ratio == 4:
+                assert compressed_indices is not None
+                assert compressed_kv is not None
+                assert index_score is not None
                 carrier = self._apply_packed_indexer_loss(
                     carrier,
                     query.detach(),
@@ -446,24 +443,20 @@ class GoldenDSASparseAttention(DSAVarlenAttention):
             length = q_end - q_start
             document_query = query[q_start:q_end].unsqueeze(0)
             document_kv = original_kv[q_start:q_end]
-            indices = get_window_topk_idxs(
-                self.window_size, 1, length, query.device
-            )
+            indices = get_window_topk_idxs(self.window_size, 1, length, query.device)
             if compressed is not None:
+                assert compressed_indices is not None
+                assert compressed_kv is not None
                 c_start, c_end = compressed.sequence_ranges[document_id]
                 document_compressed = compressed_kv[c_start:c_end]
-                document_indices = compressed_indices[
-                    q_start:q_end, : c_end - c_start
-                ]
+                document_indices = compressed_indices[q_start:q_end, : c_end - c_start]
                 document_indices = torch.where(
                     document_indices < 0,
                     document_indices,
                     document_indices + length,
                 ).unsqueeze(0)
                 indices = torch.cat([indices, document_indices], dim=-1)
-                document_kv = torch.cat(
-                    [document_kv, document_compressed], dim=0
-                )
+                document_kv = torch.cat([document_kv, document_compressed], dim=0)
             result, lse = _sparse_attn(
                 document_query,
                 document_kv.unsqueeze(0),

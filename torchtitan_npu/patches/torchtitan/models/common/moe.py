@@ -14,7 +14,6 @@ backport after the TorchTitan dependency includes the PR.
 import torch
 import torch.nn.functional as F
 from torch.distributed.tensor import DTensor
-
 from torchtitan.models.common.moe import MoE
 from torchtitan.models.common.token_dispatcher import DeepEPTokenDispatcher
 
@@ -25,14 +24,14 @@ class RouterKwargsMoE(MoE):
     """Forward router-specific keyword arguments through ``MoE``."""
 
     def forward(self, x_BLD: torch.Tensor, **router_kwargs) -> torch.Tensor:
-        B, L, D = x_BLD.shape
+        B, L, _ = x_BLD.shape
         sp_size = getattr(self.routed_experts.token_dispatcher, "sp_size", 1)
         if not isinstance(x_BLD, DTensor) and self.seq_dim_tp_sharded:
             seq_pad = 0
             seq_dim_pad_tokens = 0
             num_local_tokens_after_seq_dim_padding = B * L
         else:
-            seq_pad = sp_size - L if L < sp_size else 0
+            seq_pad = sp_size - L if sp_size > L else 0
             if seq_pad:
                 x_BLD = F.pad(x_BLD, (0, 0, 0, seq_pad))
                 L = L + seq_pad

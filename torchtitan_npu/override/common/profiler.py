@@ -9,16 +9,13 @@
 import os
 from dataclasses import dataclass
 
-import torch
 import torch_npu
-
 from torchtitan.config import derive, override
 from torchtitan.tools.logging import logger
 from torchtitan.tools.profiler import Profiler
 
 
 class NPUProfiler(Profiler):
-
     @dataclass(kw_only=True, slots=True)
     class Config(Profiler.Config):
         pass
@@ -30,7 +27,7 @@ class NPUProfiler(Profiler):
         base_folder: str,
         leaf_folder: str,
     ):
-        cfg: NPUProfiler.Config = self._config
+        cfg = self._config
         if not cfg.enable_profiling:
             return None
 
@@ -86,7 +83,10 @@ class NPUProfiler(Profiler):
                 torch_npu.profiler.ProfilerActivity.NPU,
             ],
             schedule=torch_npu.profiler.schedule(
-                wait=wait, warmup=warmup, active=active, **additional_params,
+                wait=wait,
+                warmup=warmup,
+                active=active,
+                **additional_params,
             ),
             on_trace_ready=on_trace_ready,
             record_shapes=True,

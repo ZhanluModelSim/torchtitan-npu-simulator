@@ -25,8 +25,7 @@ RUN python3 -m pip install --no-cache-dir \
     esdk-obs-python
 
 COPY requirements.txt /tmp/requirements.txt
-# for ut
-# COPY requirements-dev.txt /tmp/requirements-dev.txt
+COPY requirements-dev.txt /tmp/requirements-dev.txt
 
 # The self-built torch_npu wheel is CPython 3.12/aarch64 only. Install its
 # dependencies first, then install the wheel without dependencies because its
@@ -37,7 +36,7 @@ RUN test "$(uname -m)" = "aarch64" \
     && sed '/^torch_npu @ /d' /tmp/requirements.txt > /tmp/requirements_without_torch_npu.txt \
     && python3 -m pip install --no-cache-dir --prefer-binary --retries 10 --timeout 120 \
         -r /tmp/requirements_without_torch_npu.txt \
-        -r /tmp/requirements_dev.txt \
+        -r /tmp/requirements-dev.txt \
     && torch_npu_requirement="$(sed -n '/^torch_npu @ /p' /tmp/requirements.txt)" \
     && test -n "${torch_npu_requirement}" \
     && python3 -m pip install --no-cache-dir --no-deps --retries 10 --timeout 120 \

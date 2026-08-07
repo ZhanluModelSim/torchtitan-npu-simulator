@@ -10,9 +10,8 @@ from dataclasses import dataclass
 
 import torch
 import torch_npu
-
-from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.config import derive, override
+from torchtitan.models.common.nn_modules import RMSNorm
 
 
 class NPURMSNorm(RMSNorm):

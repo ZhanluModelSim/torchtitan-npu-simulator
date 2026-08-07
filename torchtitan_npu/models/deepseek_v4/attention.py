@@ -8,13 +8,11 @@ from dataclasses import dataclass
 import spmd_types as spmd
 import torch
 import torch.nn.functional as F
-from torch import nn
-
 from torchtitan.distributed.utils import get_spmd_backend
 from torchtitan.models.common.attention import (
     BaseAttention,
-    create_attention_mask,
     FlexAttention,
+    create_attention_mask,
 )
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.nn_modules import RMSNorm
@@ -27,6 +25,7 @@ from torchtitan_npu.patches.torchtitan.models.common.aux_loss import (
 from torchtitan_npu.patches.torchtitan.models.common.rope import SingleComplexRoPE
 
 from .compressor import Compressor, Indexer, IndexSelection
+
 
 def _assert_spmd_attention_type(tensor, *, tp):
     if get_spmd_backend() == "spmd_types":
@@ -134,9 +133,7 @@ class DSAIndexerAuxLoss(LoggedAuxLoss):
             index_score,
             torch.zeros_like(index_score),
         )
-        log_selected_main_attn_dist = selected_main_attn_dist.clamp_min(
-            self.eps
-        ).log()
+        log_selected_main_attn_dist = selected_main_attn_dist.clamp_min(self.eps).log()
         loss = (
             selected_main_attn_dist * (log_selected_main_attn_dist - index_score)
         ).sum(dim=-1)
@@ -352,7 +349,7 @@ class DSAFlexAttention(FlexAttention):
             separate_full_blocks=False,
         )
 
-    def forward(
+    def forward(  # pyrefly: ignore [bad-param-name-override]
         self,
         query_states,
         kv_states,
@@ -400,6 +397,7 @@ class DSAFlexAttention(FlexAttention):
         def maybe_return_lse(out, lse):
             return out, lse
 
+        out_transform = maybe_return_lse if self.return_lse else None
         attn_out = super().forward(
             query_states,
             key_value_states,
@@ -408,7 +406,7 @@ class DSAFlexAttention(FlexAttention):
             score_mod=v4_sink_score_mod,
             scale=self.softmax_scale,
             enable_gqa=True,
-            out_transform=maybe_return_lse if self.return_lse else None,
+            out_transform=out_transform,  # pyrefly: ignore [bad-argument-type]
         )
         if self.return_lse:
             output, attn_lse = attn_out
@@ -449,14 +447,14 @@ class Attention(BaseAttention):
 
         # Declare submodule configs as fields so sharding can be assigned before
         # the modules are built.
-        wq_a: Linear.Config | None = None
-        q_norm: RMSNorm.Config | None = None
-        wq_b: Linear.Config | None = None
-        wkv: Linear.Config | None = None
-        kv_norm: RMSNorm.Config | None = None
-        wo_a: Linear.Config | None = None
-        wo_b: Linear.Config | None = None
-        attn_sink: Linear.Config | None = None
+        wq_a: Linear.Config
+        q_norm: RMSNorm.Config
+        wq_b: Linear.Config
+        wkv: Linear.Config
+        kv_norm: RMSNorm.Config
+        wo_a: Linear.Config
+        wo_b: Linear.Config
+        attn_sink: Linear.Config
 
         compressor: Compressor.Config | None = None
         compressor_128: Compressor.Config | None = None

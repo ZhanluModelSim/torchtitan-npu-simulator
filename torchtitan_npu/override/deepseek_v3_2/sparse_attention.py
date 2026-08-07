@@ -8,7 +8,6 @@ from dataclasses import dataclass
 import spmd_types as spmd
 import torch
 import torch_npu
-
 from torchtitan.config import derive, override
 from torchtitan.models.common.attention import (
     AttentionMasksType,
@@ -16,7 +15,10 @@ from torchtitan.models.common.attention import (
     VarlenMetadata,
 )
 
-from torchtitan_npu.models.deepseek_v3_2.model import SparseIndexerLoss, SparseInnerAttention
+from torchtitan_npu.models.deepseek_v3_2.model import (
+    SparseIndexerLoss,
+    SparseInnerAttention,
+)
 from torchtitan_npu.patches.torchtitan.distributed.varlen_cp import CPVarlenMetadata
 from torchtitan_npu.patches.torchtitan.models.common.mask_handler import BaseMaskHandler
 
@@ -38,7 +40,10 @@ class NPUVarlenMetadataHandler(BaseMaskHandler):
     class Config(BaseMaskHandler.Config):
         pass
 
-    def post_process(self, masks: AttentionMasksType) -> NPUVarlenMetadata:
+    def post_process(
+        self, masks: AttentionMasksType, *, positions=None
+    ) -> NPUVarlenMetadata:
+        del positions
         assert isinstance(masks, (VarlenMetadata, CPVarlenMetadata)), (
             f"expected VarlenMetadata or CPVarlenMetadata, got {type(masks)}"
         )
@@ -56,14 +61,36 @@ class NPUVarlenMetadataHandler(BaseMaskHandler):
 @spmd.register_autograd_function
 class _NPUSparseIndexerLossFunc(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q_nope_TNH, k_nope_T1H, idx_q_TNH, idx_k_T1H, idx_w_TN,
-                sparse_indices, softmax_max, softmax_sum,
-                scale_value, q_rope_TNH, k_rope_T1H,
-                actual_seq_qlen, actual_seq_klen,
-                coeff, acc_buffer):
-        ctx.save_for_backward(q_nope_TNH, k_nope_T1H, idx_q_TNH, idx_k_T1H, idx_w_TN,
-                              sparse_indices, softmax_max, softmax_sum,
-                              q_rope_TNH, k_rope_T1H)
+    def forward(  # pyrefly: ignore [bad-override]
+        ctx,
+        q_nope_TNH,
+        k_nope_T1H,
+        idx_q_TNH,
+        idx_k_T1H,
+        idx_w_TN,
+        sparse_indices,
+        softmax_max,
+        softmax_sum,
+        scale_value,
+        q_rope_TNH,
+        k_rope_T1H,
+        actual_seq_qlen,
+        actual_seq_klen,
+        coeff,
+        acc_buffer,
+    ):
+        ctx.save_for_backward(
+            q_nope_TNH,
+            k_nope_T1H,
+            idx_q_TNH,
+            idx_k_T1H,
+            idx_w_TN,
+            sparse_indices,
+            softmax_max,
+            softmax_sum,
+            q_rope_TNH,
+            k_rope_T1H,
+        )
         ctx.scale_value = scale_value
         ctx.actual_seq_qlen = actual_seq_qlen
         ctx.actual_seq_klen = actual_seq_klen
@@ -73,35 +100,72 @@ class _NPUSparseIndexerLossFunc(torch.autograd.Function):
 
     @staticmethod
     def typecheck_forward(
-        q_nope_TNH, k_nope_T1H, idx_q_TNH, idx_k_T1H, idx_w_TN,
-        sparse_indices, softmax_max, softmax_sum,
-        scale_value, q_rope_TNH, k_rope_T1H,
-        actual_seq_qlen, actual_seq_klen,
-        coeff, acc_buffer,
+        q_nope_TNH,
+        k_nope_T1H,
+        idx_q_TNH,
+        idx_k_T1H,
+        idx_w_TN,
+        sparse_indices,
+        softmax_max,
+        softmax_sum,
+        scale_value,
+        q_rope_TNH,
+        k_rope_T1H,
+        actual_seq_qlen,
+        actual_seq_klen,
+        coeff,
+        acc_buffer,
     ):
         return _NPUSparseIndexerLossFunc.apply(
-            q_nope_TNH, k_nope_T1H, idx_q_TNH, idx_k_T1H, idx_w_TN,
-            sparse_indices, softmax_max, softmax_sum,
-            scale_value, q_rope_TNH, k_rope_T1H,
-            actual_seq_qlen, actual_seq_klen,
-            coeff, acc_buffer,
+            q_nope_TNH,
+            k_nope_T1H,
+            idx_q_TNH,
+            idx_k_T1H,
+            idx_w_TN,
+            sparse_indices,
+            softmax_max,
+            softmax_sum,
+            scale_value,
+            q_rope_TNH,
+            k_rope_T1H,
+            actual_seq_qlen,
+            actual_seq_klen,
+            coeff,
+            acc_buffer,
         )
 
     @staticmethod
-    def backward(ctx, grad_scale):
-        (q_nope_TNH, k_nope_T1H, idx_q_TNH, idx_k_T1H, idx_w_TN,
-         sparse_indices, softmax_max, softmax_sum,
-         q_rope_TNH, k_rope_T1H) = ctx.saved_tensors
+    def backward(ctx, grad_scale):  # pyrefly: ignore [bad-override]
+        (
+            q_nope_TNH,
+            k_nope_T1H,
+            idx_q_TNH,
+            idx_k_T1H,
+            idx_w_TN,
+            sparse_indices,
+            softmax_max,
+            softmax_sum,
+            q_rope_TNH,
+            k_rope_T1H,
+        ) = ctx.saved_tensors
 
         d_q_idx, d_k_idx, d_w, loss = (
             torch_npu.npu_sparse_lightning_indexer_grad_kl_loss(
-                q_nope_TNH, k_nope_T1H, idx_q_TNH, idx_k_T1H, idx_w_TN,
-                sparse_indices, softmax_max, softmax_sum,
+                q_nope_TNH,
+                k_nope_T1H,
+                idx_q_TNH,
+                idx_k_T1H,
+                idx_w_TN,
+                sparse_indices,
+                softmax_max,
+                softmax_sum,
                 scale_value=ctx.scale_value,
-                query_rope=q_rope_TNH, key_rope=k_rope_T1H,
+                query_rope=q_rope_TNH,
+                key_rope=k_rope_T1H,
                 actual_seq_qlen=ctx.actual_seq_qlen,
                 actual_seq_klen=ctx.actual_seq_klen,
-                layout="TND", sparse_mode=3,
+                layout="TND",
+                sparse_mode=3,
             )
         )
 
@@ -112,8 +176,23 @@ class _NPUSparseIndexerLossFunc(torch.autograd.Function):
 
         ctx.acc_buffer.add_(loss.squeeze() * grad_scale / ctx.coeff)
 
-        return (None, None, d_q_idx, d_k_idx, d_w, None, None, None,
-                None, None, None, None, None, None, None)
+        return (
+            None,
+            None,
+            d_q_idx,
+            d_k_idx,
+            d_w,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
 
 
 class NPUSparseIndexerLoss(SparseIndexerLoss):
@@ -124,16 +203,40 @@ class NPUSparseIndexerLoss(SparseIndexerLoss):
     def __init__(self, config: Config) -> None:
         super().__init__(config)
 
-    def forward(self, q_nope_TNH, k_nope_T1H, idx_q_TNH, idx_k_T1H, idx_w_TN,
-                sparse_indices, softmax_max, softmax_sum,
-                scale, q_rope_TNH, k_rope_T1H,
-                actual_seq_qlen, actual_seq_klen, *, carrier):
+    def forward(  # pyrefly: ignore [bad-param-name-override]
+        self,
+        q_nope_TNH,
+        k_nope_T1H,
+        idx_q_TNH,
+        idx_k_T1H,
+        idx_w_TN,
+        sparse_indices,
+        softmax_max,
+        softmax_sum,
+        scale,
+        q_rope_TNH,
+        k_rope_T1H,
+        actual_seq_qlen,
+        actual_seq_klen,
+        *,
+        carrier,
+    ):
         dummy = _NPUSparseIndexerLossFunc.apply(
-            q_nope_TNH, k_nope_T1H, idx_q_TNH, idx_k_T1H, idx_w_TN,
-            sparse_indices, softmax_max, softmax_sum,
-            scale, q_rope_TNH, k_rope_T1H,
-            actual_seq_qlen, actual_seq_klen,
-            self.coeff, self._acc,
+            q_nope_TNH,
+            k_nope_T1H,
+            idx_q_TNH,
+            idx_k_T1H,
+            idx_w_TN,
+            sparse_indices,
+            softmax_max,
+            softmax_sum,
+            scale,
+            q_rope_TNH,
+            k_rope_T1H,
+            actual_seq_qlen,
+            actual_seq_klen,
+            self.coeff,
+            self._acc,
         )
         # Normalize the summed KL value before logging.
         return self.inject(carrier, dummy / q_nope_TNH.shape[0])
@@ -152,7 +255,7 @@ class NPUSparseInnerAttention(VarlenAttention):
         self.index_topk = config.index_topk
         self.indexer_loss = NPUSparseIndexerLoss(config.indexer_loss)
 
-    def forward(
+    def forward(  # pyrefly: ignore [bad-param-name-override]
         self,
         q_nope_BLNH: torch.Tensor,
         k_nope_BL1H: torch.Tensor,
@@ -221,10 +324,17 @@ class NPUSparseInnerAttention(VarlenAttention):
 
         if self.training:
             output_TNH = self.indexer_loss(
-                q_nope_TNH, k_nope_T1H,
-                idx_q_TNH, idx_k_T1H, idx_w_TN,
-                sparse_indices, softmax_max, softmax_sum,
-                scale, q_rope_TNH, k_rope_T1H,
+                q_nope_TNH,
+                k_nope_T1H,
+                idx_q_TNH,
+                idx_k_T1H,
+                idx_w_TN,
+                sparse_indices,
+                softmax_max,
+                softmax_sum,
+                scale,
+                q_rope_TNH,
+                k_rope_T1H,
                 attention_masks.actual_seq_qlen,
                 attention_masks.actual_seq_klen,
                 carrier=output_TNH,

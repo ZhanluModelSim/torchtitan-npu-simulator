@@ -14,9 +14,7 @@ from itertools import count
 from typing import NamedTuple
 
 import torch
-
 from torchtitan.models.common.attention import VarlenMetadata
-
 
 _PACKED_METADATA_IDS = count()
 
@@ -207,7 +205,9 @@ def _sequence_layout(
         flat_positions.append(row_positions)
 
     if not sequence_lengths:
-        raise ValueError("DeepSeek-V4 packed metadata requires at least one valid token.")
+        raise ValueError(
+            "DeepSeek-V4 packed metadata requires at least one valid token."
+        )
 
     token_indices = torch.cat(flat_indices).to(torch.int64)
     compact_positions = torch.cat(flat_positions)
@@ -260,15 +260,15 @@ def _compression_info(
         row_ids = torch.div(
             token_indices[starts], container_seq_len, rounding_mode="floor"
         )
-        row_counts = torch.bincount(
-            row_ids, minlength=container_batch_size
-        ).to(torch.int64)
+        row_counts = torch.bincount(row_ids, minlength=container_batch_size).to(
+            torch.int64
+        )
         row_offsets = torch.cat(
             [row_counts.new_zeros((1,)), row_counts.cumsum(dim=0)[:-1]]
         )
-        slots = torch.arange(starts.numel(), device=starts.device) - row_offsets[
-            row_ids
-        ]
+        slots = (
+            torch.arange(starts.numel(), device=starts.device) - row_offsets[row_ids]
+        )
         storage_indices = row_ids * blocks_per_row + slots
     else:
         storage_indices = starts.new_empty((0,))

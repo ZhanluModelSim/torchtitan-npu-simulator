@@ -8,13 +8,14 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 from torch.distributed.tensor import DTensor
-
-from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.moe import TokenChoiceTopKRouter
+
 from torchtitan_npu.patches.torchtitan.models.common.moe import RouterKwargsMoE
 
 
-def _build_hash_routing_table(vocab_size, num_experts, top_k, device=None, chunk_size=8192):
+def _build_hash_routing_table(
+    vocab_size, num_experts, top_k, device=None, chunk_size=8192
+):
     if top_k > num_experts:
         raise ValueError(f"top_k ({top_k}) must be <= num_experts ({num_experts})")
     tid2eid = torch.empty((vocab_size, top_k), dtype=torch.long, device=device)
@@ -54,9 +55,12 @@ class DeepSeekV4Router(TokenChoiceTopKRouter):
         if self.hash:
             if buffer_device is None:
                 buffer_device = self.tid2eid.device
+            assert buffer_device is not None
             with torch.device(buffer_device):
                 self.tid2eid = _build_hash_routing_table(
-                    self.vocab_size, self.num_experts, self.top_k,
+                    self.vocab_size,
+                    self.num_experts,
+                    self.top_k,
                     device=buffer_device,
                 )
 
@@ -106,8 +110,8 @@ class DeepSeekV4Router(TokenChoiceTopKRouter):
         top_scores = scores.gather(dim=-1, index=selected_experts_indices)
 
         if self._debug_force_load_balance:
-            selected_experts_indices, top_scores = self._debug_force_load_balance_routing(
-                scores
+            selected_experts_indices, top_scores = (
+                self._debug_force_load_balance_routing(scores)
             )
 
         if self.route_norm:
@@ -123,5 +127,5 @@ class DeepSeekV4MoE(RouterKwargsMoE):
     class Config(RouterKwargsMoE.Config):
         pass
 
-    def forward(self, x_BLD: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
-        return super().forward(x_BLD, input_ids=input_ids)
+    def forward(self, x_BLD: torch.Tensor, **router_kwargs) -> torch.Tensor:
+        return super().forward(x_BLD, **router_kwargs)

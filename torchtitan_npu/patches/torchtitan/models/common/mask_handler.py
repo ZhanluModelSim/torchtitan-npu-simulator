@@ -1,11 +1,10 @@
 # Pending upstream PR: https://github.com/pytorch/torchtitan/pull/3634
 
 from dataclasses import dataclass
+from typing import Any
 
 import torch
-
 from torchtitan.config.configurable import Configurable
-from torchtitan.models.common.attention import AttentionMasksType
 
 
 class BaseMaskHandler(Configurable):
@@ -23,17 +22,20 @@ class BaseMaskHandler(Configurable):
 
     def post_process(
         self,
-        masks: AttentionMasksType,
-    ) -> AttentionMasksType:
+        masks: Any,
+        *,
+        positions: torch.Tensor | None = None,
+    ) -> Any:
+        del positions
         return masks
 
 
 def run_mask_handler(
     handler: BaseMaskHandler,
-    masks: AttentionMasksType,
+    masks: Any,
     *,
     positions: torch.Tensor | None,
-) -> AttentionMasksType:
+) -> Any:
     """Run the handler with its declared position-data contract."""
 
     if getattr(handler, "wants_positions", False):

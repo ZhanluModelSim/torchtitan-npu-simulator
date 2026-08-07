@@ -42,7 +42,9 @@ def _swap_state_init_hook(optimizer, args, kwargs):
             state = optimizer.state[p]
             if len(state) == 0:
                 state["step"] = torch.zeros(
-                    (), dtype=torch.float32, device=p.device,
+                    (),
+                    dtype=torch.float32,
+                    device=p.device,
                 )
                 state["exp_avg"] = _make_swap(p).zero_()
                 state["exp_avg_sq"] = _make_swap(p).zero_()
@@ -56,7 +58,6 @@ def _swap_load_post_hook(optimizer):
 
 
 class SwapOptimizersContainer(OptimizersContainer):
-
     @dataclass(kw_only=True, slots=True)
     class Config(OptimizersContainer.Config):
         pass

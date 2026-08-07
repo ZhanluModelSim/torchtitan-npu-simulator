@@ -5,7 +5,6 @@ import torch
 
 from torchtitan_npu.patches.workaround import smla_meta
 
-
 _ops_module: Any | None = None
 
 

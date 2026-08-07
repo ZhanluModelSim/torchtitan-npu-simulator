@@ -4,9 +4,6 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from functools import partial
-
-import torch.nn as nn
 from torchtitan.components.optimizer import register_moe_load_balancing_hook
 from torchtitan.config import derive
 from torchtitan.distributed.pipeline_parallel import pipeline_llm
@@ -19,25 +16,28 @@ from torchtitan.models.common import (
     RMSNorm,
 )
 from torchtitan.models.deepseek_v3 import (
-    _build_dsv3_layers,
     _EMBEDDING_INIT,
     _LINEAR_INIT,
     _NORM_INIT,
+    _build_dsv3_layers,
     _output_linear_init,
 )
 from torchtitan.models.utils import validate_converter_order
 from torchtitan.protocols.model import ModelConfigConverter
 from torchtitan.protocols.model_spec import ModelSpec
 
+from torchtitan_npu.patches.torchtitan.models.common.aux_loss import (
+    register_aux_loss_zero_hook,
+)
 from torchtitan_npu.patches.torchtitan.models.common.linear import BatchedLinear
-from torchtitan_npu.patches.torchtitan.models.common.aux_loss import register_aux_loss_zero_hook
+
 from .model import Attention, DeepSeekV32Model, Indexer, SparseInnerAttention
 from .parallelize import parallelize_deepseek_v3_2
 from .state_dict_adapter import DeepSeekV32StateDictAdapter
 
 __all__ = [
-    "parallelize_deepseek_v3_2",
     "deepseekv3_2_configs",
+    "parallelize_deepseek_v3_2",
 ]
 
 
