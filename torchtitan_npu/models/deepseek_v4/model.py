@@ -93,6 +93,26 @@ def apply_rotary_emb(
     return _apply_rotary_emb_single(x, freqs_cis, positions, inverse)
 
 
+def apply_partial_rotary_emb_fallback(
+    x: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    partial_slice: list[int],
+    inverse: bool = False,
+    positions: torch.Tensor | None = None,
+) -> torch.Tensor:
+    if len(partial_slice) != 2:
+        raise ValueError("partial_slice must contain exactly two integers.")
+    start, end = partial_slice
+    if start < 0 or end < start or end > x.shape[-1]:
+        raise ValueError(f"Invalid partial_slice {partial_slice} for input last dim {x.shape[-1]}.")
+
+    x_rot = apply_rotary_emb(x[..., start:end], freqs_cis, inverse=inverse, positions=positions)
+    return torch.cat([x[..., :start], x_rot, x[..., end:]], dim=-1)
+
+
+apply_partial_rotary_emb_ = apply_partial_rotary_emb_fallback
+
+
 def hadamard_transform_ref(x, hadamard_mat, scale=1.0):
     """
     Eager implementation of the Hadamard transform
@@ -222,8 +242,12 @@ class Compressor(Module):
 
         kv = (kv * score.softmax(dim=2)).sum(dim=2)
         kv = self.norm(kv.to(dtype))
-        kv_rot = apply_rotary_emb(kv[..., -self.rope_head_dim:], freqs_cis, positions=comp_positions)  # fmt: skip
-        kv = torch.cat([kv[..., : -self.rope_head_dim], kv_rot], dim=-1)
+        kv = apply_partial_rotary_emb_(
+            kv,
+            freqs_cis,
+            partial_slice=[self.head_dim - self.rope_head_dim, self.head_dim],
+            positions=comp_positions,
+        )
         return kv
 
     def _forward_tnd(
@@ -274,14 +298,14 @@ class Compressor(Module):
 
         kv = (kv * score.softmax(dim=1)).sum(dim=1)
         kv = self.norm(kv.to(dtype))
-        rope_start = -self.rope_head_dim
         comp_positions = flat_positions[block_starts].unsqueeze(0)
-        kv_rot = apply_rotary_emb(
-            kv.unsqueeze(0)[..., rope_start:],
+        kv = apply_partial_rotary_emb_(
+            kv,
             freqs_cis,
+            partial_slice=[self.head_dim - self.rope_head_dim, self.head_dim],
             positions=comp_positions,
-        ).squeeze(0)
-        return torch.cat([kv[..., :rope_start], kv_rot], dim=-1)
+        )
+        return kv
 
     def forward(
         self,
@@ -356,10 +380,12 @@ class Indexer(Module):
         else:
             bsz, seqlen, _ = x.size()
             q = q.view(bsz, seqlen, self.n_heads, self.head_dim)
-        q = q.clone()
-        q_nope, q_rope = torch.split(q, [self.head_dim - rd, rd], dim=-1)
-        q_rope = apply_rotary_emb(q_rope, freqs_cis, positions=positions)
-        q = torch.cat([q_nope, q_rope], dim=-1)
+        q = apply_partial_rotary_emb_(
+            q,
+            freqs_cis,
+            partial_slice=[self.head_dim - rd, self.head_dim],
+            positions=positions,
+        )
         q = rotate_activation(q, hadamard_mat)
         k = self.compressor(x, freqs_cis, positions=positions, block_starts=block_starts)
         k = rotate_activation(k, hadamard_mat)
@@ -730,17 +756,23 @@ class PreAttention(Module):
         qr = q = self.q_norm(self.wq_a(x))
         q = self.wq_b(q).unflatten(-1, (self.n_heads, self.head_dim))
         q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + self.eps)
-        q_nope, q_rope = torch.split(q, [self.head_dim - rd, rd], dim=-1)
-        q_rope = apply_rotary_emb(q_rope, freqs_cis, positions=positions)
-        q = torch.cat([q_nope, q_rope], dim=-1)
+        q = apply_partial_rotary_emb_(
+            q,
+            freqs_cis,
+            partial_slice=[self.head_dim - rd, self.head_dim],
+            positions=positions,
+        )
 
         kv = kv_compress = q_indexer = k_indexer = weights = None
 
         kv = self.wkv(x)
         kv = self.kv_norm(kv)
-        kv_nope, kv_rope = torch.split(kv, [self.head_dim - rd, rd], dim=-1)
-        kv_rope = apply_rotary_emb(kv_rope, freqs_cis, positions=positions)
-        kv = torch.cat([kv_nope, kv_rope], dim=-1)
+        kv = apply_partial_rotary_emb_(
+            kv,
+            freqs_cis,
+            partial_slice=[self.head_dim - rd, self.head_dim],
+            positions=positions,
+        )
 
         if self.compress_ratio > 1 and hasattr(self, "indexer"):
             q_indexer, k_indexer, weights = self.indexer(
@@ -921,9 +953,13 @@ class PostAttention(Module):
         input_layout: str = "BSND",
     ):
         rd = self.rope_head_dim
-        output_nope, output_rope = torch.split(output, [self.head_dim - rd, rd], dim=-1)
-        output_rope = apply_rotary_emb(output_rope, freqs_cis, True, positions=positions)
-        output = torch.cat([output_nope, output_rope], dim=-1)
+        output = apply_partial_rotary_emb_(
+            output,
+            freqs_cis,
+            partial_slice=[self.head_dim - rd, self.head_dim],
+            inverse=True,
+            positions=positions,
+        )
         if input_layout == "TND":
             output = output.view(output.size(0), n_local_groups, -1)
             if self._retain_output_projection:
@@ -1464,7 +1500,10 @@ class DeepSeekV4Model(BaseModel):
 
             converters = trainer_config.model_converters.converters
             self.use_smla = has_npu_converter(converters, "npu_smla")
-            self.use_npu_rope = has_npu_converter(converters, "npu_rope")
+            self.use_npu_rope = has_npu_converter(converters, "npu_rope") or has_npu_converter(
+                converters,
+                "npu_rope_inplace_partial",
+            )
             use_mhc_pre = has_npu_converter(converters, "npu_mhc_pre")
             use_mhc_post = has_npu_converter(converters, "npu_mhc_post")
             use_a5 = get_npu_device_type() == "A5"

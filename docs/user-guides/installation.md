@@ -6,7 +6,7 @@ torchtitan-npu支持Atlas 800T A3等昇腾训练硬件形态。软件版本配�
 
 | torchtitan-npu版本            | torchtitan版本  | PyTorch版本    | torch_npu版本 | CANN版本  | Python版本                               |      Triton Ascend        |
 |------------------------|-------------|--------------|-------------|---------|----------------------------------------|--------------|
-| master | main `ac13e536c84e7f6647b14fa9375c3c8a8a2b8578` | 2.12.0 | 2.12.0rc1 | 9.0.0 | Python3.11.x | 3.2.1 |
+| master | main `ac13e536c84e7f6647b14fa9375c3c8a8a2b8578` | 2.12.0 | 2.12.0rc1 | [9.2.0_daily0730](https://ascend.devcloud.huaweicloud.com/artifactory/cann-run-mirror/software/master/20260730143326087/) | Python3.11.x | 3.2.1 |
 | v0.2.2-dev | v0.2.2 `73a0e6979dd10b6b1904098eb3c8f62c18ab87ce` | 2.10.0 | 2.10.0       | 9.0.0    |  Python3.11.x        |   3.2.1
 
 ## 源码安装

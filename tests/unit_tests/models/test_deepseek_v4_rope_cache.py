@@ -173,14 +173,15 @@ def test_compressor_keeps_complex_cache_semantics(monkeypatch):
     assert torch.equal(captured["freqs_cis"], cache[::4])
 
 
-def test_update_from_config_derives_use_npu_rope(monkeypatch):
+@pytest.mark.parametrize("converter_name", ["npu_rope", "npu_rope_inplace_partial"])
+def test_update_from_config_derives_use_npu_rope(monkeypatch, converter_name):
     trainer_config = debug_deepseek_v4_single_node_1b()
     trainer_config = replace(
         trainer_config,
-        model_converters=ModelConvertersContainer.Config(converters=[get_model_converter_config("npu_rope")]),
+        model_converters=ModelConvertersContainer.Config(converters=[get_model_converter_config(converter_name)]),
     )
     model_config = trainer_config.model_spec.model
-    monkeypatch.setattr(deepseek_v4_model, "get_npu_device_type", lambda: "A3")
+    monkeypatch.setattr(deepseek_v4_model, "get_npu_device_type", lambda: "A5")
 
     model_config.update_from_config(trainer_config=trainer_config)
 

@@ -71,6 +71,7 @@ def test_core_converter_registrations_exist():
         "torchtitan_npu.converters.kernels.dsa",
         "torchtitan_npu.converters.kernels.rms_norm",
         "torchtitan_npu.converters.kernels.rope",
+        "torchtitan_npu.converters.kernels.inplace_partial_rope",
         "torchtitan_npu.converters.kernels.moe_dispatch",
         "torchtitan_npu.converters.features.vlm",
     ):
@@ -81,6 +82,7 @@ def test_core_converter_registrations_exist():
         "npu_dsa",
         "npu_rms_norm",
         "npu_rope",
+        "npu_rope_inplace_partial",
         "npu_moe_dispatch",
         "npu_vlm",
     ]

@@ -32,6 +32,7 @@ model_converters = ModelConvertersContainer.Config(
   - [NPU MoE Dispatch](#npu-moe-dispatch)
   - [RMSNorm](#rmsnorm)
   - [RoPE](#rope)
+    - [In-place Partial RoPE](#in-place-partial-rope)
   - [MHC head compute mix](#mhc_head_compute_mix)
 
 关于本仓库适配的各融合算子的详细说明，请查看对应的 NPU 融合算子开发者文档。
@@ -182,6 +183,37 @@ get_model_converter_config("npu_rope")
 ```
 **ModelConverter 源码路径：** `torchtitan_npu/converters/kernels/rope.py` \
 **相关 NPU 融合算子开发者文档：** [`npu_rope`](https://www.hiascend.com/document/detail/zh/Pytorch/730/apiref/torchnpuCustomsapi/docs/context/torch_npu-npu_rotary_mul.md)
+
+### In-place Partial RoPE
+
+`npu_rope_inplace_partial` 将匹配到的 partial RoPE 路径替换为基于
+`cann_ops_transformer.ops.inplace_partial_rotary_mul` 的融合实现。原实现需要拆分待旋转区间、
+生成旋转结果，再与未旋转部分重新拼接；融合算子直接将结果写回
+`x[..., start:end]`，且保持该范围之外的数据不变。这样可以减少中间 Tensor 分配、`cat`
+操作和额外的显存读写。该 converter 同时复用 `npu_rope` 的预计算 cos/sin cache，避免
+partial RoPE 重复执行 real/imag、`repeat_interleave`。
+
+**使用要求：**
+
+- 对匹配到 partial RoPE 绑定的模型，converter 会检查当前环境是否提供
+  `cann_ops_transformer.ops.inplace_partial_rotary_mul`；算子不可用时会显式抛出异常。
+  未匹配到绑定的模型会直接跳过。
+- 需要安装提供
+  `cann_ops_transformer.ops.inplace_partial_rotary_mul` 及其反向算子的
+  [`ops-transformer`](https://gitcode.com/cann/ops-transformer) 软件包。
+- 当前已接入 DeepSeek-V4 的 partial RoPE 调用；算子本身不限定模型。如果 converter
+  被其他模型选中但未找到对应调用路径，会直接跳过，不修改该模型。
+
+`npu_rope_inplace_partial` 只替换 partial RoPE 绑定，可与 `npu_rope` 同时配置。
+当环境提供所需融合算子时，将其加入 DeepSeek-V4 converter 列表即可：
+
+```python
+get_model_converter_config("npu_rope_inplace_partial")
+```
+
+**ModelConverter 源码路径：** `torchtitan_npu/converters/kernels/inplace_partial_rope.py` \
+**相关 NPU 融合算子开发者文档：**
+[`inplace_partial_rotary_mul`](https://gitcode.com/cann/ops-transformer/blob/master/torch_extension/cann_ops_transformer/docs/zh/inplace_partial_rotary_mul.md)
 
 -----------
 
