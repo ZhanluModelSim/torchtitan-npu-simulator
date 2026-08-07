@@ -8,12 +8,14 @@ import os
 import pytest
 import torch
 import torch.distributed as dist
+import torch.nn as nn
 import torch_npu
 from torch.distributed import _functional_collectives as funcol
 from torch.distributed.pipelining import schedules
 
 from torchtitan_npu.simulator.capture.comm_events import capture_fake_collectives
 from torchtitan_npu.simulator.capture.dispatch_capture import OpDispatchCapture
+from torchtitan_npu.simulator.capture.module_path import ModulePathTracker
 from torchtitan_npu.simulator.hardware_shims.grouped_experts_shim import (
     run_meta_grouped_experts,
 )
@@ -92,6 +94,44 @@ def test_meta_all_to_all_is_replayed_during_backward():
     ]
     assert tensor.grad is not None
     assert tensor.grad.shape == tensor.shape
+
+
+def test_meta_all_to_all_uses_active_module_path():
+    class MoE(nn.Module):
+        def forward(self, tensor: torch.Tensor) -> torch.Tensor:
+            return run_meta_all_to_all(tensor, dist.group.WORLD)
+
+    class Model(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.moe = MoE()
+
+        def forward(self, tensor: torch.Tensor) -> torch.Tensor:
+            return self.moe(tensor)
+
+    phase = ["forward"]
+    model = Model()
+    module_path_tracker = ModulePathTracker(model)
+    capture = OpDispatchCapture(
+        module_path_tracker=module_path_tracker,
+        phase_provider=lambda: phase[0],
+    )
+    tensor = torch.randn(8, device="meta", requires_grad=True)
+
+    with capture_fake_collectives(), module_path_tracker, capture:
+        output = model(tensor)
+        phase[0] = "backward"
+        output.sum().backward()
+
+    all_to_all_nodes = [
+        node
+        for node in capture.build_nodes().values()
+        if node.annotations["raw_op_type"] == "comm.all_to_all"
+    ]
+    assert [node.annotations["module_path"] for node in all_to_all_nodes] == [
+        "moe",
+        "moe",
+    ]
 
 
 def test_meta_moe_backward_dependencies_connect_gmms_to_all_to_all():

@@ -467,6 +467,13 @@ def _record_comm_with_l0(
     out = output_tensor if output_tensor is not None else tensor
     capture = get_active_capture()
     if capture is not None:
+        # FSDP collectives are attributed to the residency transition's
+        # module. All other collectives, including MoE all-to-all, belong to
+        # the module that is active when the collective is issued.
+        module_path = event.fsdp_module_fqn
+        if not module_path and capture.module_path_tracker is not None:
+            module_path = capture.module_path_tracker.current_path()
+
         # Resolve src_exit_op: find the L1 op that produced the input tensor
         producer_op = capture.producer_op(tensor)
         if producer_op is not None:
@@ -477,7 +484,7 @@ def _record_comm_with_l0(
             raw_op_type=f"comm.{comm_primitive}",
             inputs=[tensor],
             outputs=[out],
-            module_path=event.fsdp_module_fqn,
+            module_path=module_path,
             extra_annotations={
                 "fsdp_group_id": event.fsdp_group_id,
                 "fsdp_module_fqn": event.fsdp_module_fqn,
