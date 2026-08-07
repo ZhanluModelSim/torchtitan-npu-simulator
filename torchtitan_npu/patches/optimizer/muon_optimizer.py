@@ -162,6 +162,16 @@ def calculate_shard_shape(shape, rank, world_size):
     return (dim0, *shape[1:])
 
 
+def get_muon_compile_options(compile_config):
+    enabled = bool(
+        compile_config is not None
+        and getattr(compile_config, "enable", False)
+        and "muon" in (getattr(compile_config, "components", ()) or ())
+    )
+    backend = (getattr(compile_config, "backend", None) or "inductor") if enabled else None
+    return enabled, backend
+
+
 @dataclass
 class CommContext:
     """Communication context for distributed optimizer operations."""
@@ -234,6 +244,8 @@ class DistributedMuon(Optimizer):
         experts_weights_layout="G-D_out-D_in",
         adjust_lr_fn="original",
         hybrid_ns=False,
+        compile_enabled=False,
+        compile_backend="inductor",
     ):
         self.is_light = False
         self.communication_dtype = communication_dtype
@@ -241,6 +253,18 @@ class DistributedMuon(Optimizer):
         self.log_parameters_types = True
         self.adjust_lr_fn = adjust_lr_fn
         self.hybrid_ns = hybrid_ns
+        self._zeropower_fn = zeropower_via_newtonschulz5
+        if compile_enabled:
+            logger.info(
+                "Compiling Muon Newton-Schulz tensor function with torch.compile backend=%s",
+                compile_backend,
+            )
+            self._zeropower_fn = torch.compile(
+                zeropower_via_newtonschulz5,
+                backend=compile_backend,
+                fullgraph=True,
+                dynamic=True,
+            )
         _init_kwargs = {k: v for k, v in locals().items() if k != "self"}
         defaults = self._build_defaults(**_init_kwargs)
         self._init_parallel_info(parallel_dims)
@@ -266,38 +290,6 @@ class DistributedMuon(Optimizer):
         self._device_module: Any = None
         self._swap_to_device_stream: Any = None
         self._swap_to_host_stream: Any = None
-
-    @staticmethod
-    @torch.no_grad()
-    def lmo(
-        g,
-        eps,
-        backend_steps,
-        transpose_experts=False,
-        adjust_lr_fn="original",
-        hybrid_ns=False,
-    ):
-        """LMO: Low-orthogonal Matrix Operation (zeropower + normalise).
-
-        Supports: 2D (linear), 3D (MoE expert).
-        """
-        g = g.to_local() if isinstance(g, DTensor) else g
-
-        def _orth_and_norm(x):
-            x = zeropower_via_newtonschulz5(x, steps=backend_steps, eps=eps, hybrid_ns=hybrid_ns)
-            x = DistributedMuon.normalise_grad(x, eps=eps, adjust_lr_fn=adjust_lr_fn)
-            return x
-
-        if g.ndim == 2:
-            return _orth_and_norm(g)
-        elif g.ndim == 3:
-            if g.shape[0] > 0:
-                g = g.transpose(1, 2) if transpose_experts else g
-                g = _orth_and_norm(g)
-                g = g.transpose(1, 2) if transpose_experts else g
-            return g
-        else:
-            raise ValueError(f"lmo expects 2D or 3D grad, got shape: {g.shape}")
 
     @staticmethod
     @torch.no_grad()
@@ -373,6 +365,38 @@ class DistributedMuon(Optimizer):
             g = buf if not nesterov else g.add(buf, alpha=momentum)
 
         return g
+
+    @torch.no_grad()
+    def lmo(
+        self,
+        g,
+        eps,
+        backend_steps,
+        transpose_experts=False,
+        adjust_lr_fn="original",
+        hybrid_ns=False,
+    ):
+        """LMO: Low-orthogonal Matrix Operation (zeropower + normalise).
+
+        Supports: 2D (linear), 3D (MoE expert).
+        """
+        g = g.to_local() if isinstance(g, DTensor) else g
+
+        def _orth_and_norm(x):
+            x = self._zeropower_fn(x, steps=backend_steps, eps=eps, hybrid_ns=hybrid_ns)
+            x = DistributedMuon.normalise_grad(x, eps=eps, adjust_lr_fn=adjust_lr_fn)
+            return x
+
+        if g.ndim == 2:
+            return _orth_and_norm(g)
+        elif g.ndim == 3:
+            if g.shape[0] > 0:
+                g = g.transpose(1, 2) if transpose_experts else g
+                g = _orth_and_norm(g)
+                g = g.transpose(1, 2) if transpose_experts else g
+            return g
+        else:
+            raise ValueError(f"lmo expects 2D or 3D grad, got shape: {g.shape}")
 
     @torch.no_grad()
     def prepare_gradients_and_momentum(self, skip_param_types=None):
@@ -515,7 +539,7 @@ class DistributedMuon(Optimizer):
                 continue
 
             u = self.lmo(
-                g,
+                g.to(dtype=self.communication_dtype),
                 **param_kwargs,
                 transpose_experts=transpose,
                 adjust_lr_fn=self.adjust_lr_fn,
@@ -1286,7 +1310,15 @@ class MuonHybridOptimizersContainer(OptimizersContainer):
             param_groups = _build_muon_param_groups(
                 muon_params, muon_param_names, muon_kwargs, self.extra_param_group_split_rules
             )
-            muon = DistributedMuon(param_groups, muon_param_names, parallel_dims, **muon_kwargs)
+            compile_enabled, compile_backend = get_muon_compile_options(kwargs.get("compile_config"))
+            muon = DistributedMuon(
+                param_groups,
+                muon_param_names,
+                parallel_dims,
+                **muon_kwargs,
+                compile_enabled=compile_enabled,
+                compile_backend=compile_backend,
+            )
             adamw = torch.optim.AdamW(adamw_params, **adamw_kwargs)
             owner = self._owner
             if owner is None:

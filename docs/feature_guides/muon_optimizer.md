@@ -34,6 +34,39 @@ $$X_{k+1} = a \cdot X_k + b \cdot X_k X_k^T X_k + c \cdot (X_k X_k^T)^2 X_k$$
 
 此策略在保持收敛速度的同时，提升了正交化结果的数值稳定性。
 
+#### 编译 Newton-Schulz
+
+Muon 支持只对 Newton-Schulz 张量函数启用 `torch.compile`，编译边界只覆盖 `zeropower_via_newtonschulz5()`，其余逻辑仍保持 eager 执行。
+
+当前验证环境版本：`torch_npu 2.12.0.20260805`、`CANN 9.2.0 (20260730)`。当前版本的代码暂不支持同时开启 DSV4 的 `npu_smla` converter。
+
+启用方式是打开全局 compile，并在 `components` 中包含 `"muon"`：
+
+```python
+from torchtitan.config import CompileConfig
+
+compile = CompileConfig(
+    enable=True,
+    components=["muon"],
+)
+```
+
+启动时也可以通过命令行覆盖：
+
+```bash
+bash scripts/run_train.sh \
+  --compile.enable \
+  --compile.components muon
+```
+
+Muon compile 当前使用如下策略：
+
+- `fullgraph=True`：要求 Newton-Schulz 函数完整成图，避免编译边界内出现 graph break
+- `dynamic=True`：允许 Newton-Schulz 在不同矩阵尺寸间复用动态图编译结果，减少 shape specialization 导致的重复编译
+- `backend=<compile.backend>`：若 `CompileConfig.backend` 已配置，则透传给 `torch.compile`
+
+启用 `dynamic=True` 后，Muon Newton-Schulz 可覆盖 2D 与 3D 输入以及不同矩阵尺寸，避免仅因 batch 或矩阵形状变化触发大量 rank/shape specialization。
+
 ### 学习率调整模式
 
 Muon 优化器支持两种学习率调整模式（通过 `muon_adjust_lr_fn` 配置），其核心区别在于如何根据矩阵形状调整学习率，以及是否需要独立的超参数调优。
@@ -188,6 +221,29 @@ optimizer = OptimizerConfig(
 ```
 
 如果同时开启 `virtual_optimizer=True`，当前实现会直接拒绝构建，因为 Muon 尚未适配 Virtual Optimizer 的状态分片和 step 路径。
+
+#### 示例 4：只编译 Muon Newton-Schulz
+
+该配置适合验证 optimizer 侧 compile，不影响 model/loss 的 eager 或原有 compile 策略：
+
+```python
+from torchtitan.config import CompileConfig
+
+compile = CompileConfig(
+    enable=True,
+    components=["muon"],
+)
+```
+
+启动时也可以通过命令行覆盖同名字段：
+
+```bash
+bash scripts/run_train.sh \
+  --compile.enable \
+  --compile.components muon
+```
+
+Muon compile 默认使用 `dynamic=True`，通常不需要额外提高 `torch._dynamo.config.recompile_limit`。
 
 ## 参考文献
 

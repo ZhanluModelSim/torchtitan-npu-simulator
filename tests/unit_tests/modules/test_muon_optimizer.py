@@ -17,9 +17,11 @@ from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan_npu.patches.optimizer.muon_optimizer import (
     _build_adamw_kwargs,
     _build_muon_kwargs,
+    get_muon_compile_options,
     _get_muon_lr_config,
     _split_parameters_for_muon,
     build_muon_lr_schedulers,
+    DistributedMuon,
     MuonHybridOptimizersContainer,
     MuonLRSchedulersContainer,
     zeropower_via_newtonschulz5,
@@ -230,6 +232,41 @@ def test_3d_input():
     grad = torch.randn(3, 16, 8)
     result = zeropower_via_newtonschulz5(grad, steps=5)
     assert result.shape == grad.shape
+
+
+def test_muon_lmo_matches_legacy_2d():
+    torch.manual_seed(42)
+    grad = torch.randn(4, 8)
+    expected = DistributedMuon.normalise_grad(
+        zeropower_via_newtonschulz5(grad, steps=2, eps=1e-7, hybrid_ns=False),
+        eps=1e-7,
+        adjust_lr_fn="match_rms_adamw",
+    )
+    optimizer = object.__new__(DistributedMuon)
+    optimizer._zeropower_fn = zeropower_via_newtonschulz5
+
+    actual = optimizer.lmo(
+        grad,
+        eps=1e-7,
+        backend_steps=2,
+        adjust_lr_fn="match_rms_adamw",
+        hybrid_ns=False,
+    )
+
+    torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize(
+    ("enable", "components", "expected_options"),
+    [
+        (False, ["muon"], (False, None)),
+        (True, ["loss"], (False, None)),
+        (True, ["loss", "muon"], (True, "test-backend")),
+    ],
+)
+def test_muon_compile_is_selected_from_compile_config(enable, components, expected_options):
+    compile_config = types.SimpleNamespace(enable=enable, components=components, backend="test-backend")
+    assert get_muon_compile_options(compile_config) == expected_options
 
 
 def test_hybrid_ns_runs():

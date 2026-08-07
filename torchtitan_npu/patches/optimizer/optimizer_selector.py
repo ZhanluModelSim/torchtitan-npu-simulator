@@ -31,6 +31,17 @@ def _build_muon_config_kwargs(config: Any) -> dict[str, Any]:
     }
 
 
+def _get_compile_config(kwargs) -> Any | None:
+    compile_config = kwargs.get("compile_config")
+    if compile_config is not None:
+        return compile_config
+
+    from torchtitan_npu.patches.torchtitan._trainer_config_stash import get_trainer_config
+
+    trainer_config = get_trainer_config()
+    return getattr(trainer_config, "compile", None)
+
+
 class NpuOptimizerDispatcher:
     _virtual_patched = False
     _swap_patched = False
@@ -93,7 +104,10 @@ class NpuOptimizerDispatcher:
 
         cfg = MuonHybridOptimizersContainer.Config(**_build_muon_config_kwargs(config))
         return cfg.build(
-            model_parts=kwargs["model_parts"], parallel_dims=parallel_dims, ft_manager=kwargs.get("ft_manager")
+            model_parts=kwargs["model_parts"],
+            parallel_dims=parallel_dims,
+            ft_manager=kwargs.get("ft_manager"),
+            compile_config=_get_compile_config(kwargs),
         )
 
     @staticmethod
@@ -110,7 +124,10 @@ class NpuOptimizerDispatcher:
             **cfg_kwargs,
         )
         return cfg.build(
-            model_parts=kwargs["model_parts"], parallel_dims=parallel_dims, ft_manager=kwargs.get("ft_manager")
+            model_parts=kwargs["model_parts"],
+            parallel_dims=parallel_dims,
+            ft_manager=kwargs.get("ft_manager"),
+            compile_config=_get_compile_config(kwargs),
         )
 
     @staticmethod

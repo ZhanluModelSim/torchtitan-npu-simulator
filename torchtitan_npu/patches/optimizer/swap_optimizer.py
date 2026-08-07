@@ -830,7 +830,12 @@ class SwapMuonHybridOptimizersContainer(MuonHybridOptimizersContainer):
                     for f in fields(MuonHybridOptimizersContainer.Config)
                     if hasattr(self, f.name)
                 },
-            ).build(model_parts=model_parts, parallel_dims=parallel_dims, ft_manager=ft_manager)
+            ).build(
+                model_parts=model_parts,
+                parallel_dims=parallel_dims,
+                ft_manager=ft_manager,
+                compile_config=kwargs.get("compile_config"),
+            )
             owner = self._owner
             if owner is None:
                 raise RuntimeError("SwapMuonHybridOptimizersContainer.Config owner is not initialized.")

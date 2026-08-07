@@ -37,10 +37,19 @@ from torchtitan.config import CompileConfig
 
 compile = CompileConfig(
     enable=True,
-    # 编译完整模型，而不是只编译 loss
-    components=["model", "loss"],
+    # 编译完整模型
+    components=["model", "loss", "muon"],
 )
 ```
+
+`components` 可以按需选择编译范围：
+
+| component | 说明 |
+|-----------|------|
+| `"model"` | 编译模型 forward/backward 主图 |
+| `"loss"` | 编译 loss 计算 |
+| `"muon"` | 编译 Muon optimizer 中的 Newton-Schulz 张量函数，详见 [Muon 优化器特性](./muon_optimizer.md) |
+
 
 方式二：启动训练时通过命令行开启：
 
