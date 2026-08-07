@@ -113,6 +113,11 @@ def test_run_simulation_step_produces_complete_workload_graph(fake_world):
     }
     assert {instance.pipeline_stage for instance in schedule.instances} == {0}
     assert schedule.annotations["rank_table"]["world_size"] == 4
+    assert all(
+        not node.annotations.get("metadata_view", False)
+        for step in graph.step_templates.values()
+        for node in step.nodes.values()
+    )
     memory_summary = schedule.annotations["memory_summary"]
     assert all(
         step.peak_active_mem == memory_summary["model_active_bytes_peak"]

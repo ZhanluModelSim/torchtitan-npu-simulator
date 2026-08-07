@@ -29,6 +29,7 @@ from torchtitan_npu.simulator.capture.schedule_builder import (
     project_schedule_plan_to_graph,
 )
 from torchtitan_npu.simulator.capture.step_boundary import StepBoundaryTracker, build_step_graphs
+from torchtitan_npu.simulator.capture.graph_normalization import fold_metadata_views
 from torchtitan_npu.simulator.capture.workload_builder import build_workload_graph
 from torchtitan_npu.simulator.hardware_shims.kda_converter import (
     apply_kimi_k3_shims,
@@ -297,6 +298,7 @@ def run_simulation_step(
 
     t5 = time.perf_counter()
     nodes = capture.build_nodes()
+    nodes = fold_metadata_views(nodes)
     timings["build_nodes"] = time.perf_counter() - t5
 
     t6 = time.perf_counter()

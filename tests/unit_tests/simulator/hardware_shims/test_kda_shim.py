@@ -119,10 +119,12 @@ def test_kimi_gated_mla_records_one_virtual_fused_op_per_pass():
         output.sum().backward()
 
     raw_names = [node.annotations["raw_op_type"] for node in capture.build_nodes().values()]
-    assert raw_names.count("simulator.kimi_gated_mla") == 1
-    assert raw_names.count("simulator.kimi_gated_mla_backward") == 1
+    assert raw_names.count("gated_mla") == 1
+    assert raw_names.count("gated_mla_backward") == 1
     assert "aten.scaled_dot_product_attention.default" not in raw_names
     assert module._simulator_mla_shim_installed is True
+    assert x.grad is not None
+    assert all(parameter.grad is not None for parameter in module.parameters())
 
 
 def test_kimi_shared_expert_situ_glu_records_one_fused_activation_per_pass():
@@ -138,8 +140,10 @@ def test_kimi_shared_expert_situ_glu_records_one_fused_activation_per_pass():
         output.sum().backward()
 
     raw_names = [node.annotations["raw_op_type"] for node in capture.build_nodes().values()]
-    assert raw_names.count("simulator.kimi_situ_glu") == 1
-    assert raw_names.count("simulator.kimi_situ_glu_backward") == 1
+    assert raw_names.count("situ_glu") == 1
+    assert raw_names.count("situ_glu_backward") == 1
     assert "aten.tanh.default" not in raw_names
     assert "aten.sigmoid.default" not in raw_names
     assert module._simulator_mlp_shim_installed is True
+    assert x.grad is not None
+    assert all(parameter.grad is not None for parameter in module.parameters())

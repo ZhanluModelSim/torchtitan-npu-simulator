@@ -50,7 +50,7 @@ class OpCostModel:
             "quantize": self._data_move,
             "sdpa": self._attention,
             "flash_attention_fwd": self._attention,
-            "kimi_gated_mla": self._kimi_gated_mla,
+            "gated_mla": self._gated_mla,
             "layer_norm": self._norm,
             "rms_norm": self._norm,
             "rms_norm_backward": self._norm,
@@ -139,7 +139,7 @@ class OpCostModel:
         out_bytes = tensor_volume_bytes(outputs[0].shape, outputs[0].dtype)
         return CostEstimate(flops=2 * _numel(outputs[0].shape) * seq_k, peak_mem=out_bytes)
 
-    def _kimi_gated_mla(self, inputs: list[TensorMeta], outputs: list[TensorMeta], attrs: dict[str, Any]) -> CostEstimate:
+    def _gated_mla(self, inputs: list[TensorMeta], outputs: list[TensorMeta], attrs: dict[str, Any]) -> CostEstimate:
         if not outputs or len(outputs[0].shape) < 2:
             return CostEstimate.unknown_cost()
         output = outputs[0]

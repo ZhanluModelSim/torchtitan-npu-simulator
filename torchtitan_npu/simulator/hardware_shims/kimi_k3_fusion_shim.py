@@ -45,14 +45,14 @@ class _SimKimiGatedMLA(torch.autograd.Function):
         output = _empty_like(hidden_states)
         ctx.save_for_backward(hidden_states, *parameters)
         ctx.module_path = module_path
-        _record("simulator.kimi_gated_mla", [hidden_states, *parameters], [output], module_path)
+        _record("gated_mla", [hidden_states, *parameters], [output], module_path)
         return output
 
     @staticmethod
     def backward(ctx, grad_output):  # noqa: ANN001
         saved = ctx.saved_tensors
         grads = [_empty_like(tensor) for tensor in saved]
-        _record("simulator.kimi_gated_mla_backward", [*saved, grad_output], grads, ctx.module_path)
+        _record("gated_mla_backward", [*saved, grad_output], grads, ctx.module_path)
         return (*grads, None)
 
 
@@ -62,14 +62,14 @@ class _SimKimiSiTUGLU(torch.autograd.Function):
         output = _empty(tuple(gate.shape), gate)
         ctx.save_for_backward(gate, up)
         ctx.module_path = module_path
-        _record("simulator.kimi_situ_glu", [gate, up], [output], module_path)
+        _record("situ_glu", [gate, up], [output], module_path)
         return output
 
     @staticmethod
     def backward(ctx, grad_output):  # noqa: ANN001
         gate, up = ctx.saved_tensors
         grad_gate, grad_up = _empty_like(gate), _empty_like(up)
-        _record("simulator.kimi_situ_glu_backward", [gate, up, grad_output], [grad_gate, grad_up], ctx.module_path)
+        _record("situ_glu_backward", [gate, up, grad_output], [grad_gate, grad_up], ctx.module_path)
         return grad_gate, grad_up, None
 
 
