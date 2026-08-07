@@ -3,6 +3,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from typing import Any
+
 from torch.distributed.checkpoint.hf_storage import HuggingFaceStorageReader
 from torchtitan.models.deepseek_v3 import DeepSeekV3StateDictAdapter
 
@@ -30,6 +32,12 @@ def _first_moe_index(model_config) -> int:
 
 
 class DeepSeekV32StateDictAdapter(DeepSeekV3StateDictAdapter):
+    _MTP_SHARED_WEIGHTS = {
+        "embed_tokens.weight": "model.embed_tokens.weight",
+        "shared_head.norm.weight": "model.norm.weight",
+        "shared_head.head.weight": "lm_head.weight",
+    }
+
     def __init__(self, model_config, hf_assets_path: str | None = None):
         super().__init__(model_config, hf_assets_path)
 
@@ -47,6 +55,29 @@ class DeepSeekV32StateDictAdapter(DeepSeekV3StateDictAdapter):
         self.first_k_dense = _first_moe_index(model_config)
         self._input_format = "hf"
         self._input_expert_format = "standard"
+
+        first_mtp_layer = len(model_config.layers) - model_config.num_mtp_modules
+        self._mtp_shared_weight_aliases = {
+            f"model.layers.{layer_id}.{suffix}": source_fqn
+            for layer_id in range(first_mtp_layer, len(model_config.layers))
+            for suffix, source_fqn in self._MTP_SHARED_WEIGHTS.items()
+        }
+
+    def to_hf(self, state_dict: dict[str, Any]) -> dict[str, Any]:
+        hf_state_dict = super().to_hf(state_dict)
+
+        # HF repeats the shared main-model weights under each MTP layer.
+        for alias_fqn, source_fqn in self._mtp_shared_weight_aliases.items():
+            if source_fqn in hf_state_dict:
+                hf_state_dict[alias_fqn] = hf_state_dict[source_fqn]
+
+        return hf_state_dict
+
+    def from_hf(self, hf_state_dict: dict[str, Any]) -> dict[str, Any]:
+        hf_state_dict = hf_state_dict.copy()
+        for alias_fqn in self._mtp_shared_weight_aliases:
+            hf_state_dict.pop(alias_fqn, None)
+        return super().from_hf(hf_state_dict)
 
     # pyrefly: ignore [bad-override]
     def get_hf_storage_reader(self, path: str, from_quantized: bool = False):

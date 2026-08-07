@@ -125,6 +125,7 @@ def _patched_checkpoint_manager_dcp_save(
     to_hf: bool = False,
 ):
     ret = None
+    hf_state_dict_metadata: dict[str, Any] | None = None
 
     storage_writer = None
     checkpoint_save_id = None
@@ -180,14 +181,28 @@ def _patched_checkpoint_manager_dcp_save(
             storage_writer=storage_writer,
             checkpoint_id=checkpoint_save_id,
         )
+        if to_hf:
+            hf_state_dict_metadata = ret.state_dict_metadata
 
     if to_hf and fqn_to_index_mapping:
-        consolidate_safetensors_files_on_every_rank(
-            input_dir=os.path.join(checkpoint_id, "sharded"),
-            output_dir=checkpoint_id,
-            fqn_to_index_mapping=fqn_to_index_mapping,
-            num_threads=5,
-        )
+        if hf_state_dict_metadata is not None:
+            exported_fqns = hf_state_dict_metadata.keys()
+            dropped_fqns = fqn_to_index_mapping.keys() - exported_fqns
+            if dropped_fqns:
+                logger.warning(
+                    "Dropping %d HF shard mapping keys not present in the exported state dict. "
+                    "Verify they are intentionally disabled: %s",
+                    len(dropped_fqns),
+                    ", ".join(sorted(dropped_fqns)[:5]),
+                )
+            fqn_to_index_mapping = {key: index for key, index in fqn_to_index_mapping.items() if key in exported_fqns}
+        if fqn_to_index_mapping:
+            consolidate_safetensors_files_on_every_rank(
+                input_dir=os.path.join(checkpoint_id, "sharded"),
+                output_dir=checkpoint_id,
+                fqn_to_index_mapping=fqn_to_index_mapping,
+                num_threads=5,
+            )
 
     if enable_garbage_collection:
         GarbageCollection.collect("GC collection invoked by checkpointer.")

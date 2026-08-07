@@ -84,6 +84,67 @@ def test_checkpoint_manager_dcp_save_builds_writer_for_all_async_modes(monkeypat
         assert captured["kwargs"]["async_checkpointer_type"] is checkpoint.AsyncCheckpointerType.PROCESS
 
 
+def test_checkpoint_manager_dcp_save_uses_global_hf_shard_mapping(monkeypatch, tmp_path, caplog):
+    from torchtitan.components.checkpoint import AsyncMode
+
+    from torchtitan_npu.patches.torch import checkpoint
+
+    source_mapping = {
+        "kept.weight": 2,
+        "remote_expert.weight": 3,
+        "unused_mtp.weight": 4,
+    }
+    adapter = SimpleNamespace(
+        fqn_to_index_mapping=source_mapping.copy(),
+        to_hf=lambda state_dict: {
+            "kept.weight": torch.ones(1),
+        },
+    )
+    captured = {}
+
+    def capture_writer(*args, fqn_to_index_mapping, **kwargs):
+        captured["writer_mapping"] = fqn_to_index_mapping
+        return SimpleNamespace()
+
+    def capture_consolidation(*args, fqn_to_index_mapping, **kwargs):
+        captured["consolidation_mapping"] = fqn_to_index_mapping
+
+    metadata = SimpleNamespace(
+        state_dict_metadata={
+            "kept.weight": object(),
+            "remote_expert.weight": object(),
+        }
+    )
+
+    monkeypatch.setattr(checkpoint, "HuggingFaceStorageWriter", capture_writer)
+    monkeypatch.setattr(checkpoint.dcp, "save", lambda *args, **kwargs: metadata)
+    monkeypatch.setattr(checkpoint, "consolidate_safetensors_files_on_every_rank", capture_consolidation)
+
+    manager = SimpleNamespace(
+        sd_adapter=adapter,
+        _npu_checkpoint_sync_files=True,
+        _npu_checkpoint_drop_page_cache_after_save=False,
+    )
+
+    result = checkpoint._patched_checkpoint_manager_dcp_save(
+        manager,
+        {},
+        str(tmp_path / "checkpoint"),
+        AsyncMode.DISABLED,
+        to_hf=True,
+    )
+
+    expected_mapping = {
+        "kept.weight": 2,
+        "remote_expert.weight": 3,
+    }
+    assert result is metadata
+    assert captured["writer_mapping"] == source_mapping
+    assert captured["consolidation_mapping"] == expected_mapping
+    assert adapter.fqn_to_index_mapping == source_mapping
+    assert "unused_mtp.weight" in caplog.text
+
+
 def test_group_dtensors_by_layout_groups_non_dtensors_together():
     tensor_a = torch.randn(2, 2)
     tensor_b = torch.randn(2, 2)
