@@ -1,0 +1,1372 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" >
+<head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+      <link rel="shortcut icon" href="../../img/favicon.ico" />
+    <title>DeepSeek-V4 模型参数 Web 字段目录 - torchtitan-npu</title>
+    <link rel="stylesheet" href="../../css/theme.css" />
+    <link rel="stylesheet" href="../../css/theme_extra.css" />
+        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/styles/github.min.css" />
+    
+      <script>
+        // Current page data
+        var mkdocs_page_name = "DeepSeek-V4 \u6a21\u578b\u53c2\u6570 Web \u5b57\u6bb5\u76ee\u5f55";
+        var mkdocs_page_input_path = "user-guides/deepseek_v4_model_parameters.md";
+        var mkdocs_page_url = null;
+      </script>
+    
+    <!--[if lt IE 9]>
+      <script src="../../js/html5shiv.min.js"></script>
+    <![endif]-->
+      <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/highlight.min.js"></script>
+      <script>hljs.highlightAll();</script> 
+</head>
+
+<body class="wy-body-for-nav" role="document">
+
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side stickynav">
+    <div class="wy-side-scroll">
+      <div class="wy-side-nav-search">
+          <a href="../.." class="icon icon-home"> torchtitan-npu
+        </a>
+      </div>
+
+      <div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <ul>
+                <li class="toctree-l1"><a class="reference internal" href="../..">Home</a>
+                </li>
+              </ul>
+              <ul>
+                <li class="toctree-l1"><a class="reference internal" href="../../lint_guide/">Lint 指南</a>
+                </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Community</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../community/contributors/">提交者与贡献者（Committers and Contributors）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../community/governance/">社区治理</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../community/versioning_policy/">版本策略</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Design</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/1f1b-schedule-plan-assembly-guide/">1F1B 完整依赖组装与 DES 回放实现指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/alltoall-capture-analysis/">all_to_all 通信捕获缺失分析</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/communication-ownership-contract/">Communication Ownership Contract</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/dualpipev-schedule-plan-consumer-guide/">DualPipeV SchedulePlan 下游接入指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/l2-l3-schedule-plan-design/">L2/L3 调度 IR 重构设计：从扁平 trace 到结构化 SchedulePlan</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/low-precision-sim-analysis/">低精度训练（MXFP8）Simulator 使能分析</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/optimizer-ops-analysis/">优化器算子捕获问题分析</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/pipeline-multi-graph-capture-design/">复杂 Pipeline 策略下完整计算图捕获方案设计</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/pp-l2-capture-architecture/">PP L2 Capture Architecture</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/schedule-capture-design/">L0-L3 IR 层级归属设计</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/schedule-plan-dependency-reconstruction-contract/">SchedulePlan 下游依赖重建契约</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/schedule-plan-des-consumer-guide/">SchedulePlan 依赖重建与 DES 消费指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/simulator-memory-model-design/">Simulator Memory Model 改造设计</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Feature guides</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/checkpoint/">Checkpoint 使用指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/deepseek_v32_mtp/">多Token预测特性(Multi Token Prediction, MTP)</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/low_precision_training/">低精度训练特性（MXFP8）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/metrics_and_debugging/">调试支持特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/model_custom/">Model Custom框架介绍</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/muon_optimizer/">Muon 优化器特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/new_model_onboarding/">新模型接入开发流程</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/npu_fused_ops/">NPU 融合算子适配</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/swap_optimizer/">SwapOptimizer 特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/torch_compile/">torch.compile 支持</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/virtual_optimizer/">Virtual Optimizer - 优化器显存虚拟化特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/vlm/">VLM NPU 支持</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" >Parallelism</a>
+    <ul>
+                <li class="toctree-l2"><a class="reference internal" href="../../feature_guides/parallelism/custom_cp/">自定义 Context Parallel 特性</a>
+                </li>
+    </ul>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Recipe</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../recipe/sft/">SFT 指令微调</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Superpowers</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" >Plans</a>
+    <ul>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/plans/2026-07-01-mhc-real-op-name-capture-implementation/">MHC Real-Op-Name Capture Implementation Plan</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/plans/2026-07-01-npu-simulator-implementation/">torchtitan_npu Simulator Implementation Plan</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/plans/2026-07-01-smla-real-op-name-capture-implementation/">SMLA Real-Op-Name Capture Implementation Plan</a>
+                </li>
+    </ul>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" >Specs</a>
+    <ul>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/specs/2026-07-01-mhc-real-op-name-capture-design/">MHC 真实算子名捕获 — 架构与方案设计（阶段一：MHC）</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/specs/2026-07-01-npu-simulator-design/">torchtitan_npu Simulator — 架构与方案设计</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/specs/2026-07-01-smla-real-op-name-capture-design/">SMLA 真实算子名捕获 — 架构与方案设计（阶段二：SMLA）</a>
+                </li>
+    </ul>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Test guides</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../test_guides/model_acceptance/">新模型最终验收规范（Meta 模拟器）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../test_guides/test_design/">测试设计</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../test_guides/test_guide/">测试使用指南</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">User guides</span></p>
+              <ul class="current">
+                  <li class="toctree-l1 current"><a class="reference internal current" href="#">DeepSeek-V4 模型参数 Web 字段目录</a>
+    <ul class="current">
+    <li class="toctree-l2"><a class="reference internal" href="#_1">字段命名约定</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#web">Web 展示级别</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#_2">核心模型结构</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#_3">注意力与压缩结构</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#_4">索引器</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#hyper-connection">Hyper-Connection</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#moe">MoE 结构与路由</a>
+        <ul>
+    <li class="toctree-l3"><a class="reference internal" href="#moe_1">模型级 MoE 参数</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#moe_args">moe_args 全量字段</a>
+    </li>
+        </ul>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#rope">RoPE 与上下文扩展</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#mtp">MTP</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#_5">内部与调试字段</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#_6">默认值使用规则</a>
+        <ul>
+    <li class="toctree-l3"><a class="reference internal" href="#_7">核心规模对比</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#_8">完整模型默认值</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#moe_2">完整 MoE 默认值</a>
+    </li>
+        </ul>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#web_1">Web 端最低联动规则</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#web_2">推荐的 Web 分组</a>
+    </li>
+    </ul>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../installation/">软件安装</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../quickstart/">快速上手</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../simulator/">Simulator 使用指南</a>
+                  </li>
+              </ul>
+      </div>
+    </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap">
+      <nav class="wy-nav-top" role="navigation" aria-label="Mobile navigation menu">
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../..">torchtitan-npu</a>
+        
+      </nav>
+      <div class="wy-nav-content">
+        <div class="rst-content"><div role="navigation" aria-label="breadcrumbs navigation">
+  <ul class="wy-breadcrumbs">
+    <li><a href="../.." class="icon icon-home" aria-label="Docs"></a></li>
+          <li class="breadcrumb-item">User guides</li>
+      <li class="breadcrumb-item active">DeepSeek-V4 模型参数 Web 字段目录</li>
+    <li class="wy-breadcrumbs-aside">
+    </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+            <div class="section" itemprop="articleBody">
+              
+                <h1 id="deepseek-v4-web">DeepSeek-V4 模型参数 Web 字段目录</h1>
+<p>本文档定义 Web 页面可配置的 DeepSeek-V4 <strong>模型参数</strong>。范围仅包括：</p>
+<ul>
+<li><code>DeepSeekV4Model.Config</code></li>
+<li><code>DeepSeekV4Model.Config.moe_args</code> 对应的 <code>MoEArgs</code></li>
+</ul>
+<p>不包括训练、并行、重计算、优化器、通信、检查点和 simulator 参数。</p>
+<p>当前模型配置包含 35 个一级字段，其中 <code>moe_args</code> 是嵌套对象；展开后共有
+49 个叶子参数。</p>
+<h2 id="_1">字段命名约定</h2>
+<p>Web 请求和内部数据结构推荐使用 snake_case：</p>
+<pre><code class="language-json">{
+  &quot;model_overrides&quot;: {
+    &quot;n_layers&quot;: 16,
+    &quot;dim&quot;: 4096,
+    &quot;moe_args&quot;: {
+      &quot;num_experts&quot;: 256,
+      &quot;top_k&quot;: 8
+    }
+  }
+}
+</code></pre>
+<p>转换为 CLI 时保持相同层级，仅将下划线转换为连字符：</p>
+<pre><code class="language-text">model_overrides.n_layers
+    -&gt; --model-overrides.n-layers
+
+model_overrides.moe_args.num_experts
+    -&gt; --model-overrides.moe-args.num-experts
+</code></pre>
+<p>布尔字段：</p>
+<pre><code class="language-text">true  -&gt; --model-overrides.use-smla
+false -&gt; --model-overrides.no-use-smla
+</code></pre>
+<p>可空字段使用 <code>None</code>。列表字段使用一个参数名加多个值：</p>
+<pre><code class="language-text">--model-overrides.compress-ratios 1 4 128
+</code></pre>
+<h2 id="web">Web 展示级别</h2>
+<table>
+<thead>
+<tr>
+<th>级别</th>
+<th>建议</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>基础</td>
+<td>默认展示，适合模型规模和显存估算页面</td>
+</tr>
+<tr>
+<td>高级</td>
+<td>放入“高级模型参数”区域</td>
+</tr>
+<tr>
+<td>专家</td>
+<td>默认折叠，需要理解具体算法后修改</td>
+</tr>
+<tr>
+<td>隐藏</td>
+<td>不建议在普通页面展示，保留给调试或内部接口</td>
+</tr>
+<tr>
+<td>派生</td>
+<td>字段属于模型 schema，但当前运行时会从其他状态重新计算；建议只读或隐藏</td>
+</tr>
+</tbody>
+</table>
+<h2 id="_2">核心模型结构</h2>
+<table>
+<thead>
+<tr>
+<th>Web 字段</th>
+<th>English label</th>
+<th>中文名称</th>
+<th>类型/控件</th>
+<th>展示</th>
+<th>规则与说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>model_overrides.vocab_size</code></td>
+<td>Vocabulary Size</td>
+<td>词表大小</td>
+<td><code>int</code> / 整数输入</td>
+<td>基础</td>
+<td>必须大于 0；修改后需要匹配 tokenizer 和 checkpoint</td>
+</tr>
+<tr>
+<td><code>model_overrides.dim</code></td>
+<td>Hidden Dimension</td>
+<td>隐藏层维度</td>
+<td><code>int</code> / 整数输入</td>
+<td>基础</td>
+<td>必须大于 0；直接影响参数量、激活和算子 shape</td>
+</tr>
+<tr>
+<td><code>model_overrides.n_layers</code></td>
+<td>Transformer Layers</td>
+<td>Transformer 层数</td>
+<td><code>int</code> / 整数输入</td>
+<td>基础</td>
+<td>必须大于 0；必须同步调整 <code>compress_ratios</code></td>
+</tr>
+<tr>
+<td><code>model_overrides.n_heads</code></td>
+<td>Attention Heads</td>
+<td>注意力头数</td>
+<td><code>int</code> / 整数输入</td>
+<td>基础</td>
+<td>必须大于 0，且能被 <code>o_groups</code> 整除</td>
+</tr>
+<tr>
+<td><code>model_overrides.head_dim</code></td>
+<td>Attention Head Dimension</td>
+<td>注意力头维度</td>
+<td><code>int</code> / 整数输入</td>
+<td>基础</td>
+<td>必须大于 0，且不小于 <code>rope_head_dim</code></td>
+</tr>
+<tr>
+<td><code>model_overrides.norm_eps</code></td>
+<td>Normalization Epsilon</td>
+<td>归一化 Epsilon</td>
+<td><code>float</code> / 小数输入</td>
+<td>高级</td>
+<td>必须大于 0</td>
+</tr>
+<tr>
+<td><code>model_overrides.max_batch_size</code></td>
+<td>Maximum Batch Size</td>
+<td>最大批大小</td>
+<td><code>int</code> / 整数输入</td>
+<td>高级</td>
+<td>必须大于 0；模型侧容量参数，不等同于训练 batch size</td>
+</tr>
+<tr>
+<td><code>model_overrides.max_seq_len</code></td>
+<td>Maximum Sequence Length</td>
+<td>最大序列长度</td>
+<td><code>int</code> / 整数输入</td>
+<td>派生</td>
+<td>必须大于 0；当前 <code>update_from_config()</code> 会用实际序列长度更新该值</td>
+</tr>
+</tbody>
+</table>
+<h2 id="_3">注意力与压缩结构</h2>
+<table>
+<thead>
+<tr>
+<th>Web 字段</th>
+<th>English label</th>
+<th>中文名称</th>
+<th>类型/控件</th>
+<th>展示</th>
+<th>规则与说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>model_overrides.rope_head_dim</code></td>
+<td>RoPE Head Dimension</td>
+<td>RoPE 头维度</td>
+<td><code>int</code> / 整数输入</td>
+<td>高级</td>
+<td>必须大于 0，且不大于 <code>head_dim</code> 和 <code>index_head_dim</code></td>
+</tr>
+<tr>
+<td><code>model_overrides.q_lora_rank</code></td>
+<td>Query LoRA Rank</td>
+<td>查询 LoRA 秩</td>
+<td><code>int</code> / 整数输入</td>
+<td>基础</td>
+<td>必须大于 0；影响 Query 投影参数量</td>
+</tr>
+<tr>
+<td><code>model_overrides.o_lora_rank</code></td>
+<td>Output LoRA Rank</td>
+<td>输出 LoRA 秩</td>
+<td><code>int</code> / 整数输入</td>
+<td>基础</td>
+<td>必须大于 0；影响输出投影参数量</td>
+</tr>
+<tr>
+<td><code>model_overrides.o_groups</code></td>
+<td>Output Projection Groups</td>
+<td>输出投影分组数</td>
+<td><code>int</code> / 整数输入</td>
+<td>高级</td>
+<td>必须大于 0；<code>n_heads</code> 必须能被该值整除</td>
+</tr>
+<tr>
+<td><code>model_overrides.window_size</code></td>
+<td>Sliding Window Size</td>
+<td>滑动窗口大小</td>
+<td><code>int</code> / 整数输入</td>
+<td>高级</td>
+<td>必须大于 0</td>
+</tr>
+<tr>
+<td><code>model_overrides.compress_ratios</code></td>
+<td>Per-Layer Compression Ratios</td>
+<td>逐层压缩比</td>
+<td><code>list[int]</code> / 整数列表</td>
+<td>高级</td>
+<td>元素数量不能少于 <code>n_layers</code>；允许保留不会被当前层数消费的尾部值；每个值必须大于等于 0</td>
+</tr>
+<tr>
+<td><code>model_overrides.use_smla</code></td>
+<td>Enable SMLA</td>
+<td>启用 SMLA</td>
+<td><code>bool</code> / 开关</td>
+<td>派生</td>
+<td>当前运行时根据是否安装 <code>npu_smla</code> converter 更新，普通页面建议隐藏</td>
+</tr>
+</tbody>
+</table>
+<h2 id="_4">索引器</h2>
+<table>
+<thead>
+<tr>
+<th>Web 字段</th>
+<th>English label</th>
+<th>中文名称</th>
+<th>类型/控件</th>
+<th>展示</th>
+<th>规则与说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>model_overrides.index_n_heads</code></td>
+<td>Indexer Heads</td>
+<td>索引器头数</td>
+<td><code>int</code> / 整数输入</td>
+<td>高级</td>
+<td>必须大于 0</td>
+</tr>
+<tr>
+<td><code>model_overrides.index_head_dim</code></td>
+<td>Indexer Head Dimension</td>
+<td>索引器头维度</td>
+<td><code>int</code> / 整数输入</td>
+<td>高级</td>
+<td>必须大于 0，必须是 2 的幂，且不小于 <code>rope_head_dim</code></td>
+</tr>
+<tr>
+<td><code>model_overrides.index_topk</code></td>
+<td>Indexer Top-K</td>
+<td>索引器 Top-K</td>
+<td><code>int</code> / 整数输入</td>
+<td>高级</td>
+<td>必须大于 0</td>
+</tr>
+<tr>
+<td><code>model_overrides.enable_indexer_loss</code></td>
+<td>Enable Indexer Loss</td>
+<td>启用索引器损失</td>
+<td><code>bool</code> / 开关</td>
+<td>高级</td>
+<td>控制是否计算索引器辅助损失</td>
+</tr>
+</tbody>
+</table>
+<h2 id="hyper-connection">Hyper-Connection</h2>
+<table>
+<thead>
+<tr>
+<th>Web 字段</th>
+<th>English label</th>
+<th>中文名称</th>
+<th>类型/控件</th>
+<th>展示</th>
+<th>规则与说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>model_overrides.hc_sinkhorn_iters</code></td>
+<td>Hyper-Connection Sinkhorn Iterations</td>
+<td>Hyper-Connection Sinkhorn 迭代次数</td>
+<td><code>int</code> / 整数输入</td>
+<td>专家</td>
+<td>必须大于 0</td>
+</tr>
+<tr>
+<td><code>model_overrides.hc_mult</code></td>
+<td>Hyper-Connection Multiplicity</td>
+<td>Hyper-Connection 分支数</td>
+<td><code>int</code> / 整数输入</td>
+<td>高级</td>
+<td>必须大于 0；影响隐藏状态扩展倍率</td>
+</tr>
+<tr>
+<td><code>model_overrides.hc_eps</code></td>
+<td>Hyper-Connection Epsilon</td>
+<td>Hyper-Connection Epsilon</td>
+<td><code>float</code> / 小数输入</td>
+<td>专家</td>
+<td>必须大于 0</td>
+</tr>
+</tbody>
+</table>
+<h2 id="moe">MoE 结构与路由</h2>
+<h3 id="moe_1">模型级 MoE 参数</h3>
+<table>
+<thead>
+<tr>
+<th>Web 字段</th>
+<th>English label</th>
+<th>中文名称</th>
+<th>类型/控件</th>
+<th>展示</th>
+<th>规则与说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>model_overrides.moe_inter_dim</code></td>
+<td>Expert Intermediate Dimension</td>
+<td>专家中间层维度</td>
+<td><code>int</code> / 整数输入</td>
+<td>基础</td>
+<td>必须大于 0；直接影响单个专家参数量</td>
+</tr>
+<tr>
+<td><code>model_overrides.load_balance_coeff</code></td>
+<td>Expert Load-Balance Coefficient</td>
+<td>专家负载均衡系数</td>
+<td><code>float</code> / 小数输入</td>
+<td>高级</td>
+<td>必须大于 0；当前会同步到 <code>moe_args.load_balance_coeff</code></td>
+</tr>
+</tbody>
+</table>
+<h3 id="moe_args"><code>moe_args</code> 全量字段</h3>
+<table>
+<thead>
+<tr>
+<th>Web 字段</th>
+<th>English label</th>
+<th>中文名称</th>
+<th>类型/控件</th>
+<th>展示</th>
+<th>规则与说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>model_overrides.moe_args.num_experts</code></td>
+<td>Routed Experts</td>
+<td>路由专家数</td>
+<td><code>int</code> / 整数输入</td>
+<td>基础</td>
+<td>必须大于 0，且不小于 <code>top_k</code></td>
+</tr>
+<tr>
+<td><code>model_overrides.moe_args.num_shared_experts</code></td>
+<td>Shared Experts</td>
+<td>共享专家数</td>
+<td><code>int</code> / 整数输入</td>
+<td>基础</td>
+<td>必须大于等于 0</td>
+</tr>
+<tr>
+<td><code>model_overrides.moe_args.score_func</code></td>
+<td>Router Score Function</td>
+<td>路由评分函数</td>
+<td><code>enum</code> / 下拉框</td>
+<td>高级</td>
+<td>可选 <code>softmax</code>、<code>sigmoid</code>、<code>sqrtsoftplus</code></td>
+</tr>
+<tr>
+<td><code>model_overrides.moe_args.route_norm</code></td>
+<td>Normalize Routing Weights</td>
+<td>归一化路由权重</td>
+<td><code>bool</code> / 开关</td>
+<td>高级</td>
+<td>控制 Top-K 路由权重是否重新归一化</td>
+</tr>
+<tr>
+<td><code>model_overrides.moe_args.route_scale</code></td>
+<td>Routing Score Scale</td>
+<td>路由分数缩放系数</td>
+<td><code>float</code> / 小数输入</td>
+<td>高级</td>
+<td>必须大于 0</td>
+</tr>
+<tr>
+<td><code>model_overrides.moe_args.gate_bias</code></td>
+<td>Router Gate Bias</td>
+<td>路由门控偏置</td>
+<td><code>bool</code> / 开关</td>
+<td>专家</td>
+<td>控制 router gate 是否使用 bias</td>
+</tr>
+<tr>
+<td><code>model_overrides.moe_args.score_before_experts</code></td>
+<td>Apply Score Before Experts</td>
+<td>专家计算前应用路由分数</td>
+<td><code>bool</code> / 开关</td>
+<td>专家</td>
+<td>控制路由权重应用在专家计算前还是合并阶段</td>
+</tr>
+<tr>
+<td><code>model_overrides.moe_args.top_k</code></td>
+<td>Experts Per Token</td>
+<td>每 Token 激活专家数</td>
+<td><code>int</code> / 整数输入</td>
+<td>基础</td>
+<td>必须大于 0，且不大于 <code>num_experts</code></td>
+</tr>
+<tr>
+<td><code>model_overrides.moe_args.num_expert_groups</code></td>
+<td>Expert Groups</td>
+<td>专家分组数</td>
+<td><code>int \| null</code> / 可空整数</td>
+<td>高级</td>
+<td>非空时必须大于 0，并整除 <code>num_experts</code></td>
+</tr>
+<tr>
+<td><code>model_overrides.moe_args.num_limited_groups</code></td>
+<td>Routing Candidate Groups</td>
+<td>路由候选组数</td>
+<td><code>int \| null</code> / 可空整数</td>
+<td>高级</td>
+<td>非空时必须大于 0；若设置专家分组，则不能超过 <code>num_expert_groups</code></td>
+</tr>
+<tr>
+<td><code>model_overrides.moe_args.use_grouped_mm</code></td>
+<td>Use Grouped Matrix Multiplication</td>
+<td>使用分组矩阵乘</td>
+<td><code>bool</code> / 开关</td>
+<td>高级</td>
+<td>关闭后使用逐专家计算路径，通常不建议关闭</td>
+</tr>
+<tr>
+<td><code>model_overrides.moe_args.load_balance_coeff</code></td>
+<td>MoE Load-Balance Coefficient</td>
+<td>MoE 负载均衡系数</td>
+<td><code>float \| null</code> / 可空小数</td>
+<td>隐藏</td>
+<td>非空时必须大于 0；当前会被模型级 <code>load_balance_coeff</code> 覆盖</td>
+</tr>
+<tr>
+<td><code>model_overrides.moe_args.debug_force_load_balance</code></td>
+<td>Force Balanced Routing</td>
+<td>强制均衡路由</td>
+<td><code>bool</code> / 开关</td>
+<td>派生</td>
+<td>当前会从调试状态更新，仅用于调试</td>
+</tr>
+<tr>
+<td><code>model_overrides.moe_args.n_hash_layers</code></td>
+<td>Hash-Routed Layers</td>
+<td>哈希路由层数</td>
+<td><code>int</code> / 整数输入</td>
+<td>高级</td>
+<td>必须大于等于 0；前 N 层使用 hash routing</td>
+</tr>
+<tr>
+<td><code>model_overrides.moe_args.swiglu_limit</code></td>
+<td>SwiGLU Activation Limit</td>
+<td>SwiGLU 激活上限</td>
+<td><code>float</code> / 小数输入</td>
+<td>专家</td>
+<td>必须大于 0</td>
+</tr>
+</tbody>
+</table>
+<h2 id="rope">RoPE 与上下文扩展</h2>
+<table>
+<thead>
+<tr>
+<th>Web 字段</th>
+<th>English label</th>
+<th>中文名称</th>
+<th>类型/控件</th>
+<th>展示</th>
+<th>规则与说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>model_overrides.compress_rope_theta</code></td>
+<td>Compression RoPE Theta</td>
+<td>压缩 RoPE Theta</td>
+<td><code>float</code> / 小数输入</td>
+<td>专家</td>
+<td>必须大于 0</td>
+</tr>
+<tr>
+<td><code>model_overrides.original_seq_len</code></td>
+<td>Original Context Length</td>
+<td>原始上下文长度</td>
+<td><code>int</code> / 整数输入</td>
+<td>高级</td>
+<td>必须大于 0</td>
+</tr>
+<tr>
+<td><code>model_overrides.rope_theta</code></td>
+<td>RoPE Base Theta</td>
+<td>RoPE 基础 Theta</td>
+<td><code>int</code> / 整数输入</td>
+<td>高级</td>
+<td>必须大于 0</td>
+</tr>
+<tr>
+<td><code>model_overrides.rope_factor</code></td>
+<td>RoPE Scaling Factor</td>
+<td>RoPE 缩放系数</td>
+<td><code>int</code> / 整数输入</td>
+<td>高级</td>
+<td>必须大于 0</td>
+</tr>
+<tr>
+<td><code>model_overrides.beta_fast</code></td>
+<td>YaRN Fast Beta</td>
+<td>YaRN 快速 Beta</td>
+<td><code>int</code> / 整数输入</td>
+<td>专家</td>
+<td>必须大于 0，并大于 <code>beta_slow</code></td>
+</tr>
+<tr>
+<td><code>model_overrides.beta_slow</code></td>
+<td>YaRN Slow Beta</td>
+<td>YaRN 慢速 Beta</td>
+<td><code>int</code> / 整数输入</td>
+<td>专家</td>
+<td>必须大于等于 0，并小于 <code>beta_fast</code></td>
+</tr>
+</tbody>
+</table>
+<h2 id="mtp">MTP</h2>
+<table>
+<thead>
+<tr>
+<th>Web 字段</th>
+<th>English label</th>
+<th>中文名称</th>
+<th>类型/控件</th>
+<th>展示</th>
+<th>规则与说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>model_overrides.num_mtp_modules</code></td>
+<td>MTP Modules</td>
+<td>MTP 模块数</td>
+<td><code>int</code> / 整数输入</td>
+<td>派生</td>
+<td>必须大于等于 0；当前运行时由 MTP 状态更新，普通页面建议只读或隐藏</td>
+</tr>
+<tr>
+<td><code>model_overrides.mtp_layer_compress_ratio</code></td>
+<td>MTP Layer Compression Ratio</td>
+<td>MTP 层压缩比</td>
+<td><code>int</code> / 整数输入</td>
+<td>高级</td>
+<td>必须大于等于 0</td>
+</tr>
+</tbody>
+</table>
+<h2 id="_5">内部与调试字段</h2>
+<table>
+<thead>
+<tr>
+<th>Web 字段</th>
+<th>English label</th>
+<th>中文名称</th>
+<th>类型/控件</th>
+<th>展示</th>
+<th>规则与说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>model_overrides.param_init</code></td>
+<td>Parameter Initializers</td>
+<td>参数初始化器</td>
+<td><code>map \| null</code></td>
+<td>隐藏</td>
+<td>值通常包含 Python callable，不适合作为通用 Web JSON 参数；建议固定为 <code>null</code></td>
+</tr>
+<tr>
+<td><code>model_overrides.debug_force_load_balance</code></td>
+<td>Force Model Load Balance</td>
+<td>强制模型负载均衡</td>
+<td><code>bool</code> / 开关</td>
+<td>隐藏</td>
+<td>模型级调试字段；实际 MoE 路由调试状态由嵌套字段和运行时状态决定</td>
+</tr>
+</tbody>
+</table>
+<h2 id="_6">默认值使用规则</h2>
+<p>Web 页面应以所选 preset 解析后的完整 <code>model_overrides</code> 作为表单默认值，
+不应在前端代码中复制一份默认配置。</p>
+<p>推荐流程：</p>
+<ol>
+<li>用户选择 preset。</li>
+<li>后端加载对应 config，并返回完整 <code>model_overrides</code>。</li>
+<li>Web 使用返回值初始化全部模型参数。</li>
+<li>用户只提交相对该默认值发生变化的字段，或提交完整模型参数对象。</li>
+<li>后端再次执行类型和联动校验。</li>
+</ol>
+<p>以下数值是当前 <code>model_registry</code> 中四个模型 preset 的原始默认值。派生字段
+仍可能在模型构建阶段按前文说明更新。</p>
+<h3 id="_7">核心规模对比</h3>
+<table>
+<thead>
+<tr>
+<th>Preset</th>
+<th style="text-align: right;">Layers</th>
+<th style="text-align: right;">Hidden Dim</th>
+<th style="text-align: right;">Heads</th>
+<th style="text-align: right;">Head Dim</th>
+<th style="text-align: right;">Q LoRA Rank</th>
+<th style="text-align: right;">O LoRA Rank</th>
+<th style="text-align: right;">O Groups</th>
+<th style="text-align: right;">Expert Dim</th>
+<th style="text-align: right;">Experts</th>
+<th style="text-align: right;">Top-K</th>
+<th style="text-align: right;">Index Top-K</th>
+<th>Compression Pattern</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>smoketest</code></td>
+<td style="text-align: right;">4</td>
+<td style="text-align: right;">128</td>
+<td style="text-align: right;">4</td>
+<td style="text-align: right;">32</td>
+<td style="text-align: right;">64</td>
+<td style="text-align: right;">32</td>
+<td style="text-align: right;">4</td>
+<td style="text-align: right;">64</td>
+<td style="text-align: right;">8</td>
+<td style="text-align: right;">2</td>
+<td style="text-align: right;">16</td>
+<td><code>(1, 1, 4, 128)</code></td>
+</tr>
+<tr>
+<td><code>v4_flash_baseline</code></td>
+<td style="text-align: right;">43</td>
+<td style="text-align: right;">4096</td>
+<td style="text-align: right;">64</td>
+<td style="text-align: right;">512</td>
+<td style="text-align: right;">1024</td>
+<td style="text-align: right;">1024</td>
+<td style="text-align: right;">8</td>
+<td style="text-align: right;">2048</td>
+<td style="text-align: right;">256</td>
+<td style="text-align: right;">6</td>
+<td style="text-align: right;">512</td>
+<td><code>(1, 1, 4) + (128, 4) * 20</code></td>
+</tr>
+<tr>
+<td><code>v4_pro_baseline</code></td>
+<td style="text-align: right;">61</td>
+<td style="text-align: right;">7168</td>
+<td style="text-align: right;">128</td>
+<td style="text-align: right;">512</td>
+<td style="text-align: right;">1536</td>
+<td style="text-align: right;">1024</td>
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">3072</td>
+<td style="text-align: right;">384</td>
+<td style="text-align: right;">6</td>
+<td style="text-align: right;">1024</td>
+<td><code>(128,) + (128, 4) * 30</code></td>
+</tr>
+<tr>
+<td><code>v4_pro_20t_baseline</code></td>
+<td style="text-align: right;">96</td>
+<td style="text-align: right;">12288</td>
+<td style="text-align: right;">192</td>
+<td style="text-align: right;">512</td>
+<td style="text-align: right;">2304</td>
+<td style="text-align: right;">1536</td>
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">2752</td>
+<td style="text-align: right;">2048</td>
+<td style="text-align: right;">23</td>
+<td style="text-align: right;">1024</td>
+<td><code>(128, 4) * 47 + (128, 0)</code></td>
+</tr>
+</tbody>
+</table>
+<h3 id="_8">完整模型默认值</h3>
+<table>
+<thead>
+<tr>
+<th>Web 字段</th>
+<th style="text-align: right;"><code>smoketest</code></th>
+<th style="text-align: right;"><code>v4_flash_baseline</code></th>
+<th style="text-align: right;"><code>v4_pro_baseline</code></th>
+<th style="text-align: right;"><code>v4_pro_20t_baseline</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>model_overrides.param_init</code></td>
+<td style="text-align: right;"><code>None</code></td>
+<td style="text-align: right;"><code>None</code></td>
+<td style="text-align: right;"><code>None</code></td>
+<td style="text-align: right;"><code>None</code></td>
+</tr>
+<tr>
+<td><code>model_overrides.norm_eps</code></td>
+<td style="text-align: right;"><code>1e-6</code></td>
+<td style="text-align: right;"><code>1e-6</code></td>
+<td style="text-align: right;"><code>1e-6</code></td>
+<td style="text-align: right;"><code>1e-6</code></td>
+</tr>
+<tr>
+<td><code>model_overrides.vocab_size</code></td>
+<td style="text-align: right;"><code>129280</code></td>
+<td style="text-align: right;"><code>129280</code></td>
+<td style="text-align: right;"><code>129280</code></td>
+<td style="text-align: right;"><code>129280</code></td>
+</tr>
+<tr>
+<td><code>model_overrides.dim</code></td>
+<td style="text-align: right;"><code>128</code></td>
+<td style="text-align: right;"><code>4096</code></td>
+<td style="text-align: right;"><code>7168</code></td>
+<td style="text-align: right;"><code>12288</code></td>
+</tr>
+<tr>
+<td><code>model_overrides.n_layers</code></td>
+<td style="text-align: right;"><code>4</code></td>
+<td style="text-align: right;"><code>43</code></td>
+<td style="text-align: right;"><code>61</code></td>
+<td style="text-align: right;"><code>96</code></td>
+</tr>
+<tr>
+<td><code>model_overrides.n_heads</code></td>
+<td style="text-align: right;"><code>4</code></td>
+<td style="text-align: right;"><code>64</code></td>
+<td style="text-align: right;"><code>128</code></td>
+<td style="text-align: right;"><code>192</code></td>
+</tr>
+<tr>
+<td><code>model_overrides.head_dim</code></td>
+<td style="text-align: right;"><code>32</code></td>
+<td style="text-align: right;"><code>512</code></td>
+<td style="text-align: right;"><code>512</code></td>
+<td style="text-align: right;"><code>512</code></td>
+</tr>
+<tr>
+<td><code>model_overrides.max_batch_size</code></td>
+<td style="text-align: right;"><code>2</code></td>
+<td style="text-align: right;"><code>4</code></td>
+<td style="text-align: right;"><code>4</code></td>
+<td style="text-align: right;"><code>4</code></td>
+</tr>
+<tr>
+<td><code>model_overrides.max_seq_len</code></td>
+<td style="text-align: right;"><code>128</code></td>
+<td style="text-align: right;"><code>4096</code></td>
+<td style="text-align: right;"><code>4096</code></td>
+<td style="text-align: right;"><code>4096</code></td>
+</tr>
+<tr>
+<td><code>model_overrides.rope_head_dim</code></td>
+<td style="text-align: right;"><code>16</code></td>
+<td style="text-align: right;"><code>64</code></td>
+<td style="text-align: right;"><code>64</code></td>
+<td style="text-align: right;"><code>64</code></td>
+</tr>
+<tr>
+<td><code>model_overrides.q_lora_rank</code></td>
+<td style="text-align: right;"><code>64</code></td>
+<td style="text-align: right;"><code>1024</code></td>
+<td style="text-align: right;"><code>1536</code></td>
+<td style="text-align: right;"><code>2304</code></td>
+</tr>
+<tr>
+<td><code>model_overrides.o_lora_rank</code></td>
+<td style="text-align: right;"><code>32</code></td>
+<td style="text-align: right;"><code>1024</code></td>
+<td style="text-align: right;"><code>1024</code></td>
+<td style="text-align: right;"><code>1536</code></td>
+</tr>
+<tr>
+<td><code>model_overrides.o_groups</code></td>
+<td style="text-align: right;"><code>4</code></td>
+<td style="text-align: right;"><code>8</code></td>
+<td style="text-align: right;"><code>16</code></td>
+<td style="text-align: right;"><code>16</code></td>
+</tr>
+<tr>
+<td><code>model_overrides.window_size</code></td>
+<td style="text-align: right;"><code>32</code></td>
+<td style="text-align: right;"><code>128</code></td>
+<td style="text-align: right;"><code>128</code></td>
+<td style="text-align: right;"><code>128</code></td>
+</tr>
+<tr>
+<td><code>model_overrides.compress_ratios</code></td>
+<td style="text-align: right;"><code>(1, 1, 4, 128)</code></td>
+<td style="text-align: right;"><code>(1, 1, 4) + (128, 4) * 20</code></td>
+<td style="text-align: right;"><code>(128,) + (128, 4) * 30</code></td>
+<td style="text-align: right;"><code>(128, 4) * 47 + (128, 0)</code></td>
+</tr>
+<tr>
+<td><code>model_overrides.index_n_heads</code></td>
+<td style="text-align: right;"><code>4</code></td>
+<td style="text-align: right;"><code>64</code></td>
+<td style="text-align: right;"><code>64</code></td>
+<td style="text-align: right;"><code>64</code></td>
+</tr>
+<tr>
+<td><code>model_overrides.index_head_dim</code></td>
+<td style="text-align: right;"><code>16</code></td>
+<td style="text-align: right;"><code>128</code></td>
+<td style="text-align: right;"><code>128</code></td>
+<td style="text-align: right;"><code>128</code></td>
+</tr>
+<tr>
+<td><code>model_overrides.index_topk</code></td>
+<td style="text-align: right;"><code>16</code></td>
+<td style="text-align: right;"><code>512</code></td>
+<td style="text-align: right;"><code>1024</code></td>
+<td style="text-align: right;"><code>1024</code></td>
+</tr>
+<tr>
+<td><code>model_overrides.enable_indexer_loss</code></td>
+<td style="text-align: right;"><code>false</code></td>
+<td style="text-align: right;"><code>true</code></td>
+<td style="text-align: right;"><code>true</code></td>
+<td style="text-align: right;"><code>true</code></td>
+</tr>
+<tr>
+<td><code>model_overrides.hc_sinkhorn_iters</code></td>
+<td style="text-align: right;"><code>4</code></td>
+<td style="text-align: right;"><code>20</code></td>
+<td style="text-align: right;"><code>20</code></td>
+<td style="text-align: right;"><code>24</code></td>
+</tr>
+<tr>
+<td><code>model_overrides.hc_mult</code></td>
+<td style="text-align: right;"><code>4</code></td>
+<td style="text-align: right;"><code>4</code></td>
+<td style="text-align: right;"><code>4</code></td>
+<td style="text-align: right;"><code>4</code></td>
+</tr>
+<tr>
+<td><code>model_overrides.hc_eps</code></td>
+<td style="text-align: right;"><code>1e-6</code></td>
+<td style="text-align: right;"><code>1e-6</code></td>
+<td style="text-align: right;"><code>1e-6</code></td>
+<td style="text-align: right;"><code>1e-6</code></td>
+</tr>
+<tr>
+<td><code>model_overrides.moe_inter_dim</code></td>
+<td style="text-align: right;"><code>64</code></td>
+<td style="text-align: right;"><code>2048</code></td>
+<td style="text-align: right;"><code>3072</code></td>
+<td style="text-align: right;"><code>2752</code></td>
+</tr>
+<tr>
+<td><code>model_overrides.load_balance_coeff</code></td>
+<td style="text-align: right;"><code>0.001</code></td>
+<td style="text-align: right;"><code>0.001</code></td>
+<td style="text-align: right;"><code>0.001</code></td>
+<td style="text-align: right;"><code>0.001</code></td>
+</tr>
+<tr>
+<td><code>model_overrides.compress_rope_theta</code></td>
+<td style="text-align: right;"><code>40000</code></td>
+<td style="text-align: right;"><code>160000</code></td>
+<td style="text-align: right;"><code>160000</code></td>
+<td style="text-align: right;"><code>160000</code></td>
+</tr>
+<tr>
+<td><code>model_overrides.original_seq_len</code></td>
+<td style="text-align: right;"><code>128</code></td>
+<td style="text-align: right;"><code>65536</code></td>
+<td style="text-align: right;"><code>65536</code></td>
+<td style="text-align: right;"><code>65536</code></td>
+</tr>
+<tr>
+<td><code>model_overrides.rope_theta</code></td>
+<td style="text-align: right;"><code>10000</code></td>
+<td style="text-align: right;"><code>10000</code></td>
+<td style="text-align: right;"><code>10000</code></td>
+<td style="text-align: right;"><code>10000</code></td>
+</tr>
+<tr>
+<td><code>model_overrides.rope_factor</code></td>
+<td style="text-align: right;"><code>4</code></td>
+<td style="text-align: right;"><code>16</code></td>
+<td style="text-align: right;"><code>16</code></td>
+<td style="text-align: right;"><code>16</code></td>
+</tr>
+<tr>
+<td><code>model_overrides.beta_fast</code></td>
+<td style="text-align: right;"><code>32</code></td>
+<td style="text-align: right;"><code>32</code></td>
+<td style="text-align: right;"><code>32</code></td>
+<td style="text-align: right;"><code>32</code></td>
+</tr>
+<tr>
+<td><code>model_overrides.beta_slow</code></td>
+<td style="text-align: right;"><code>1</code></td>
+<td style="text-align: right;"><code>1</code></td>
+<td style="text-align: right;"><code>1</code></td>
+<td style="text-align: right;"><code>1</code></td>
+</tr>
+<tr>
+<td><code>model_overrides.use_smla</code></td>
+<td style="text-align: right;"><code>false</code></td>
+<td style="text-align: right;"><code>false</code></td>
+<td style="text-align: right;"><code>false</code></td>
+<td style="text-align: right;"><code>false</code></td>
+</tr>
+<tr>
+<td><code>model_overrides.num_mtp_modules</code></td>
+<td style="text-align: right;"><code>0</code></td>
+<td style="text-align: right;"><code>0</code></td>
+<td style="text-align: right;"><code>0</code></td>
+<td style="text-align: right;"><code>0</code></td>
+</tr>
+<tr>
+<td><code>model_overrides.mtp_layer_compress_ratio</code></td>
+<td style="text-align: right;"><code>1</code></td>
+<td style="text-align: right;"><code>1</code></td>
+<td style="text-align: right;"><code>1</code></td>
+<td style="text-align: right;"><code>1</code></td>
+</tr>
+<tr>
+<td><code>model_overrides.debug_force_load_balance</code></td>
+<td style="text-align: right;"><code>false</code></td>
+<td style="text-align: right;"><code>false</code></td>
+<td style="text-align: right;"><code>false</code></td>
+<td style="text-align: right;"><code>false</code></td>
+</tr>
+</tbody>
+</table>
+<h3 id="moe_2">完整 MoE 默认值</h3>
+<table>
+<thead>
+<tr>
+<th>Web 字段</th>
+<th style="text-align: right;"><code>smoketest</code></th>
+<th style="text-align: right;"><code>v4_flash_baseline</code></th>
+<th style="text-align: right;"><code>v4_pro_baseline</code></th>
+<th style="text-align: right;"><code>v4_pro_20t_baseline</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>model_overrides.moe_args.num_experts</code></td>
+<td style="text-align: right;"><code>8</code></td>
+<td style="text-align: right;"><code>256</code></td>
+<td style="text-align: right;"><code>384</code></td>
+<td style="text-align: right;"><code>2048</code></td>
+</tr>
+<tr>
+<td><code>model_overrides.moe_args.num_shared_experts</code></td>
+<td style="text-align: right;"><code>1</code></td>
+<td style="text-align: right;"><code>1</code></td>
+<td style="text-align: right;"><code>1</code></td>
+<td style="text-align: right;"><code>1</code></td>
+</tr>
+<tr>
+<td><code>model_overrides.moe_args.score_func</code></td>
+<td style="text-align: right;"><code>sqrtsoftplus</code></td>
+<td style="text-align: right;"><code>sqrtsoftplus</code></td>
+<td style="text-align: right;"><code>sqrtsoftplus</code></td>
+<td style="text-align: right;"><code>sqrtsoftplus</code></td>
+</tr>
+<tr>
+<td><code>model_overrides.moe_args.route_norm</code></td>
+<td style="text-align: right;"><code>true</code></td>
+<td style="text-align: right;"><code>true</code></td>
+<td style="text-align: right;"><code>true</code></td>
+<td style="text-align: right;"><code>true</code></td>
+</tr>
+<tr>
+<td><code>model_overrides.moe_args.route_scale</code></td>
+<td style="text-align: right;"><code>1.5</code></td>
+<td style="text-align: right;"><code>1.5</code></td>
+<td style="text-align: right;"><code>1.5</code></td>
+<td style="text-align: right;"><code>1.5</code></td>
+</tr>
+<tr>
+<td><code>model_overrides.moe_args.gate_bias</code></td>
+<td style="text-align: right;"><code>false</code></td>
+<td style="text-align: right;"><code>false</code></td>
+<td style="text-align: right;"><code>false</code></td>
+<td style="text-align: right;"><code>false</code></td>
+</tr>
+<tr>
+<td><code>model_overrides.moe_args.score_before_experts</code></td>
+<td style="text-align: right;"><code>false</code></td>
+<td style="text-align: right;"><code>false</code></td>
+<td style="text-align: right;"><code>false</code></td>
+<td style="text-align: right;"><code>false</code></td>
+</tr>
+<tr>
+<td><code>model_overrides.moe_args.top_k</code></td>
+<td style="text-align: right;"><code>2</code></td>
+<td style="text-align: right;"><code>6</code></td>
+<td style="text-align: right;"><code>6</code></td>
+<td style="text-align: right;"><code>23</code></td>
+</tr>
+<tr>
+<td><code>model_overrides.moe_args.num_expert_groups</code></td>
+<td style="text-align: right;"><code>None</code></td>
+<td style="text-align: right;"><code>None</code></td>
+<td style="text-align: right;"><code>None</code></td>
+<td style="text-align: right;"><code>None</code></td>
+</tr>
+<tr>
+<td><code>model_overrides.moe_args.num_limited_groups</code></td>
+<td style="text-align: right;"><code>8</code></td>
+<td style="text-align: right;"><code>8</code></td>
+<td style="text-align: right;"><code>8</code></td>
+<td style="text-align: right;"><code>8</code></td>
+</tr>
+<tr>
+<td><code>model_overrides.moe_args.use_grouped_mm</code></td>
+<td style="text-align: right;"><code>true</code></td>
+<td style="text-align: right;"><code>true</code></td>
+<td style="text-align: right;"><code>true</code></td>
+<td style="text-align: right;"><code>true</code></td>
+</tr>
+<tr>
+<td><code>model_overrides.moe_args.load_balance_coeff</code></td>
+<td style="text-align: right;"><code>0.001</code></td>
+<td style="text-align: right;"><code>0.001</code></td>
+<td style="text-align: right;"><code>0.001</code></td>
+<td style="text-align: right;"><code>0.001</code></td>
+</tr>
+<tr>
+<td><code>model_overrides.moe_args.debug_force_load_balance</code></td>
+<td style="text-align: right;"><code>false</code></td>
+<td style="text-align: right;"><code>false</code></td>
+<td style="text-align: right;"><code>false</code></td>
+<td style="text-align: right;"><code>false</code></td>
+</tr>
+<tr>
+<td><code>model_overrides.moe_args.n_hash_layers</code></td>
+<td style="text-align: right;"><code>0</code></td>
+<td style="text-align: right;"><code>3</code></td>
+<td style="text-align: right;"><code>3</code></td>
+<td style="text-align: right;"><code>3</code></td>
+</tr>
+<tr>
+<td><code>model_overrides.moe_args.swiglu_limit</code></td>
+<td style="text-align: right;"><code>10</code></td>
+<td style="text-align: right;"><code>10</code></td>
+<td style="text-align: right;"><code>10</code></td>
+<td style="text-align: right;"><code>10</code></td>
+</tr>
+</tbody>
+</table>
+<h2 id="web_1">Web 端最低联动规则</h2>
+<p>Web 页面至少应实现以下即时校验，后端仍需执行最终校验：</p>
+<ol>
+<li><code>compress_ratios</code> 的元素数量必须大于等于 <code>n_layers</code>；减少层数时可以保留尾部值，增加层数时必须补足。</li>
+<li><code>n_heads % o_groups == 0</code>。</li>
+<li><code>rope_head_dim &lt;= head_dim</code>。</li>
+<li><code>rope_head_dim &lt;= index_head_dim</code>。</li>
+<li><code>index_head_dim</code> 必须是 2 的幂。</li>
+<li><code>moe_args.top_k &lt;= moe_args.num_experts</code>。</li>
+<li><code>num_expert_groups</code> 非空时必须整除 <code>num_experts</code>。</li>
+<li><code>num_limited_groups</code> 和 <code>num_expert_groups</code> 都非空时，前者不能大于后者。</li>
+<li><code>beta_fast &gt; beta_slow &gt;= 0</code>。</li>
+<li>除明确允许 0 或 <code>null</code> 的字段外，整数和浮点规模参数必须大于 0。</li>
+</ol>
+<h2 id="web_2">推荐的 Web 分组</h2>
+<p>普通用户默认展示：</p>
+<ul>
+<li>模型规模：<code>vocab_size</code>、<code>n_layers</code>、<code>dim</code>、<code>n_heads</code>、<code>head_dim</code></li>
+<li>注意力投影：<code>q_lora_rank</code>、<code>o_lora_rank</code></li>
+<li>MoE 规模：<code>moe_inter_dim</code>、<code>num_experts</code>、<code>num_shared_experts</code>、<code>top_k</code></li>
+</ul>
+<p>高级区域展示：</p>
+<ul>
+<li>注意力压缩、索引器、RoPE、Hyper-Connection、专家分组和 MTP 压缩参数</li>
+</ul>
+<p>隐藏或只读：</p>
+<ul>
+<li><code>param_init</code></li>
+<li>两个 <code>debug_force_load_balance</code></li>
+<li><code>moe_args.load_balance_coeff</code></li>
+<li><code>use_smla</code></li>
+<li><code>num_mtp_modules</code></li>
+<li><code>max_seq_len</code></li>
+</ul>
+              
+            </div>
+          </div><footer>
+    <div class="rst-footer-buttons" role="navigation" aria-label="Footer Navigation">
+        <a href="../../test_guides/test_guide/" class="btn btn-neutral float-left" title="测试使用指南"><span class="icon icon-circle-arrow-left"></span> Previous</a>
+        <a href="../installation/" class="btn btn-neutral float-right" title="软件安装">Next <span class="icon icon-circle-arrow-right"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <!-- Copyright etc -->
+  </div>
+
+  Built with <a href="https://www.mkdocs.org/">MkDocs</a> using a <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a> provided by <a href="https://readthedocs.org">Read the Docs</a>.
+</footer>
+          
+        </div>
+      </div>
+
+    </section>
+
+  </div>
+
+  <div class="rst-versions" role="note" aria-label="Versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    
+    
+      <span><a href="../../test_guides/test_guide/" style="color: #fcfcfc">&laquo; Previous</a></span>
+    
+    
+      <span><a href="../installation/" style="color: #fcfcfc">Next &raquo;</a></span>
+    
+  </span>
+</div>
+    <script src="../../js/jquery-3.6.0.min.js"></script>
+    <script>var base_url = "../..";</script>
+    <script src="../../js/theme_extra.js"></script>
+    <script src="../../js/theme.js"></script>
+    <script>
+        jQuery(function () {
+            SphinxRtdTheme.Navigation.enable(true);
+        });
+    </script>
+
+</body>
+</html>

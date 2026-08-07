@@ -1,0 +1,869 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" >
+<head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+      <link rel="shortcut icon" href="../../img/favicon.ico" />
+    <title>L0-L3 IR 层级归属设计 - torchtitan-npu</title>
+    <link rel="stylesheet" href="../../css/theme.css" />
+    <link rel="stylesheet" href="../../css/theme_extra.css" />
+        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/styles/github.min.css" />
+    
+      <script>
+        // Current page data
+        var mkdocs_page_name = "L0-L3 IR \u5c42\u7ea7\u5f52\u5c5e\u8bbe\u8ba1";
+        var mkdocs_page_input_path = "design/schedule-capture-design.md";
+        var mkdocs_page_url = null;
+      </script>
+    
+    <!--[if lt IE 9]>
+      <script src="../../js/html5shiv.min.js"></script>
+    <![endif]-->
+      <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/highlight.min.js"></script>
+      <script>hljs.highlightAll();</script> 
+</head>
+
+<body class="wy-body-for-nav" role="document">
+
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side stickynav">
+    <div class="wy-side-scroll">
+      <div class="wy-side-nav-search">
+          <a href="../.." class="icon icon-home"> torchtitan-npu
+        </a>
+      </div>
+
+      <div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <ul>
+                <li class="toctree-l1"><a class="reference internal" href="../..">Home</a>
+                </li>
+              </ul>
+              <ul>
+                <li class="toctree-l1"><a class="reference internal" href="../../lint_guide/">Lint 指南</a>
+                </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Community</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../community/contributors/">提交者与贡献者（Committers and Contributors）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../community/governance/">社区治理</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../community/versioning_policy/">版本策略</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Design</span></p>
+              <ul class="current">
+                  <li class="toctree-l1"><a class="reference internal" href="../1f1b-schedule-plan-assembly-guide/">1F1B 完整依赖组装与 DES 回放实现指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../alltoall-capture-analysis/">all_to_all 通信捕获缺失分析</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../communication-ownership-contract/">Communication Ownership Contract</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../dualpipev-schedule-plan-consumer-guide/">DualPipeV SchedulePlan 下游接入指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../l2-l3-schedule-plan-design/">L2/L3 调度 IR 重构设计：从扁平 trace 到结构化 SchedulePlan</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../low-precision-sim-analysis/">低精度训练（MXFP8）Simulator 使能分析</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../optimizer-ops-analysis/">优化器算子捕获问题分析</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../pipeline-multi-graph-capture-design/">复杂 Pipeline 策略下完整计算图捕获方案设计</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../pp-l2-capture-architecture/">PP L2 Capture Architecture</a>
+                  </li>
+                  <li class="toctree-l1 current"><a class="reference internal current" href="#">L0-L3 IR 层级归属设计</a>
+    <ul class="current">
+    <li class="toctree-l2"><a class="reference internal" href="#1">1. 问题陈述</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#2">2. 层级定义</a>
+        <ul>
+    <li class="toctree-l3"><a class="reference internal" href="#l0-opnode">L0 OpNode</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#l1-stepgraph">L1 StepGraph</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#l2-schedulegraph">L2 ScheduleGraph</a>
+    </li>
+        </ul>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#3">3. 基于调用路径的层级判定</a>
+        <ul>
+    <li class="toctree-l3"><a class="reference internal" href="#31">3.1 核心思路</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#32">3.2 调用路径分析</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#33-_comm_layer">3.3 方案：_comm_layer 上下文变量</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#34">3.4 回退判定</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#35-modulepathtracker">3.5 为什么不只用 ModulePathTracker</a>
+    </li>
+        </ul>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#4">4. 实现变更</a>
+        <ul>
+    <li class="toctree-l3"><a class="reference internal" href="#41-commevent-comm_layer">4.1 CommEvent 增加 comm_layer 字段</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#42-meta_envpy-_comm_layer-patch">4.2 meta_env.py 增加 _comm_layer 和 patch</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#43-comm_eventspy-_record_comm-comm_layer">4.3 comm_events.py: _record_comm 记录 comm_layer</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#44-schedule_builderpy-comm_layer">4.4 schedule_builder.py: 按 comm_layer 分流</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#45-step_boundarypy-l1-stepgraph-cp">4.5 step_boundary.py: L1 StepGraph 包含 CP 通信</a>
+    </li>
+        </ul>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#5">5. 实施计划</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#6-l2-datapass-l1-stepgraph">6. L2 DataPass 与 L1 StepGraph 的连接关系</a>
+        <ul>
+    <li class="toctree-l3"><a class="reference internal" href="#61">6.1 问题</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#62">6.2 需要的连接关系</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#63">6.3 连接关系的方向性</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#64">6.4 实现方案</a>
+        <ul>
+    <li class="toctree-l4"><a class="reference internal" href="#641">6.4.1 捕获时记录连接点</a>
+    </li>
+    <li class="toctree-l4"><a class="reference internal" href="#642-stepinstance">6.4.2 StepInstance 标识</a>
+    </li>
+    <li class="toctree-l4"><a class="reference internal" href="#643-datapass">6.4.3 DataPass 结构更新</a>
+    </li>
+        </ul>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#65">6.5 回放路径示例</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#66">6.6 实施补充</a>
+    </li>
+        </ul>
+    </li>
+    </ul>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../schedule-plan-dependency-reconstruction-contract/">SchedulePlan 下游依赖重建契约</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../schedule-plan-des-consumer-guide/">SchedulePlan 依赖重建与 DES 消费指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../simulator-memory-model-design/">Simulator Memory Model 改造设计</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Feature guides</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/checkpoint/">Checkpoint 使用指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/deepseek_v32_mtp/">多Token预测特性(Multi Token Prediction, MTP)</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/low_precision_training/">低精度训练特性（MXFP8）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/metrics_and_debugging/">调试支持特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/model_custom/">Model Custom框架介绍</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/muon_optimizer/">Muon 优化器特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/new_model_onboarding/">新模型接入开发流程</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/npu_fused_ops/">NPU 融合算子适配</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/swap_optimizer/">SwapOptimizer 特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/torch_compile/">torch.compile 支持</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/virtual_optimizer/">Virtual Optimizer - 优化器显存虚拟化特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/vlm/">VLM NPU 支持</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" >Parallelism</a>
+    <ul>
+                <li class="toctree-l2"><a class="reference internal" href="../../feature_guides/parallelism/custom_cp/">自定义 Context Parallel 特性</a>
+                </li>
+    </ul>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Recipe</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../recipe/sft/">SFT 指令微调</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Superpowers</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" >Plans</a>
+    <ul>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/plans/2026-07-01-mhc-real-op-name-capture-implementation/">MHC Real-Op-Name Capture Implementation Plan</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/plans/2026-07-01-npu-simulator-implementation/">torchtitan_npu Simulator Implementation Plan</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/plans/2026-07-01-smla-real-op-name-capture-implementation/">SMLA Real-Op-Name Capture Implementation Plan</a>
+                </li>
+    </ul>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" >Specs</a>
+    <ul>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/specs/2026-07-01-mhc-real-op-name-capture-design/">MHC 真实算子名捕获 — 架构与方案设计（阶段一：MHC）</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/specs/2026-07-01-npu-simulator-design/">torchtitan_npu Simulator — 架构与方案设计</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/specs/2026-07-01-smla-real-op-name-capture-design/">SMLA 真实算子名捕获 — 架构与方案设计（阶段二：SMLA）</a>
+                </li>
+    </ul>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Test guides</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../test_guides/model_acceptance/">新模型最终验收规范（Meta 模拟器）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../test_guides/test_design/">测试设计</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../test_guides/test_guide/">测试使用指南</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">User guides</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/deepseek_v4_model_parameters/">DeepSeek-V4 模型参数 Web 字段目录</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/installation/">软件安装</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/quickstart/">快速上手</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/simulator/">Simulator 使用指南</a>
+                  </li>
+              </ul>
+      </div>
+    </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap">
+      <nav class="wy-nav-top" role="navigation" aria-label="Mobile navigation menu">
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../..">torchtitan-npu</a>
+        
+      </nav>
+      <div class="wy-nav-content">
+        <div class="rst-content"><div role="navigation" aria-label="breadcrumbs navigation">
+  <ul class="wy-breadcrumbs">
+    <li><a href="../.." class="icon icon-home" aria-label="Docs"></a></li>
+          <li class="breadcrumb-item">Design</li>
+      <li class="breadcrumb-item active">L0-L3 IR 层级归属设计</li>
+    <li class="wy-breadcrumbs-aside">
+    </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+            <div class="section" itemprop="articleBody">
+              
+                <h1 id="l0-l3-ir">L0-L3 IR 层级归属设计</h1>
+<blockquote>
+<p>历史说明：本文保留早期 L0/L1/L2 通信分层讨论，不再定义当前 PP L2
+组装方案。当前的 rank 身份、语义 action、FSDP residency、跨 stage
+依赖和 <code>SchedulePlan</code> 主数据流以
+<a href="../pp-l2-capture-architecture/">PP L2 Capture Architecture</a> 为准。
+特别地，RESHARD 是本地 full-parameter residency 释放，不等同于梯度
+reduce-scatter。</p>
+<p>状态：设计中
+作者：Copilot
+日期：2026-07-09
+修订：2026-07-09 v2 — 基于调用路径上下文区分通信层级，不依赖名称匹配</p>
+</blockquote>
+<h2 id="1">1. 问题陈述</h2>
+<p>当前实现中 L1 StepGraph 和 L2 ScheduleGraph 的通信层级归属有误：</p>
+<table>
+<thead>
+<tr>
+<th>通信类型</th>
+<th>当前归属</th>
+<th>正确归属</th>
+<th>原因</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>CP P2P (<code>_WindowExchange</code>)</td>
+<td>L1 + L2 混杂</td>
+<td><strong>L1</strong></td>
+<td>attention 计算的一部分</td>
+</tr>
+<tr>
+<td>CP allgather (<code>_allgather_seq</code>)</td>
+<td>L1 + L2 混杂</td>
+<td><strong>L1</strong></td>
+<td>attention 计算的一部分</td>
+</tr>
+<tr>
+<td>PP P2P (<code>forward_send/recv</code>)</td>
+<td>L1（错误）</td>
+<td><strong>L2</strong></td>
+<td>stage 间调度依赖</td>
+</tr>
+<tr>
+<td>FSDP allgather (unshard)</td>
+<td>L1 + L2 混杂</td>
+<td><strong>L2</strong></td>
+<td>参数管理，StepGraph 间依赖</td>
+</tr>
+<tr>
+<td>FSDP reduce_scatter (reshard)</td>
+<td>L1 + L2 混杂</td>
+<td><strong>L2</strong></td>
+<td>参数管理，StepGraph 间依赖</td>
+</tr>
+<tr>
+<td>FSDP allreduce</td>
+<td>L2</td>
+<td><strong>L2</strong></td>
+<td>正确</td>
+</tr>
+</tbody>
+</table>
+<h2 id="2">2. 层级定义</h2>
+<h3 id="l0-opnode">L0 OpNode</h3>
+<p>纯计算算子（aten/npu/triton）。<strong>不含任何通信算子</strong>。</p>
+<h3 id="l1-stepgraph">L1 StepGraph</h3>
+<p>一个 microbatch 的一个 phase（forward/backward/optimizer）的计算 DAG。</p>
+<p>包含：
+- 所有 L0 计算算子
+- <strong>CP 通信</strong>：<code>_WindowExchange</code> 的 P2P、<code>_allgather_seq</code> 的 allgather——这些在 <code>CompressorAttentionCP</code> 的 forward/backward 函数内部调用，是 attention 计算的一部分
+- Activation checkpointing 的 recomputation 算子</p>
+<p>不包含：PP P2P、FSDP 通信。</p>
+<h3 id="l2-schedulegraph">L2 ScheduleGraph</h3>
+<p>L1 StepGraph 之间的调度依赖关系。</p>
+<p>包含：
+- StepInstance（每个 microbatch × phase 的 L1 实例）
+- <strong>PP P2P DataPass</strong>：stage 间 activation/gradient 传递
+- <strong>FSDP DataPass</strong>：unshard/reshard/allreduce
+- execution_timeline：microbatch 调度时序 + PP/FSDP 通信时序</p>
+<p>不包含：L0 计算算子、CP 通信。</p>
+<h2 id="3">3. 基于调用路径的层级判定</h2>
+<h3 id="31">3.1 核心思路</h3>
+<p>不通过通信算子名称（如 <code>cp_</code> 前缀）判定层级，而是通过<strong>捕获时的调用路径上下文</strong>判定：通信发生在模型计算内部（L1）还是框架调度层（L2）。</p>
+<h3 id="32">3.2 调用路径分析</h3>
+<p>每种通信类型的调用栈：</p>
+<table>
+<thead>
+<tr>
+<th>通信类型</th>
+<th>调用入口</th>
+<th>调用栈特征</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>CP P2P</td>
+<td><code>CompressorAttentionCP._pre_hook</code></td>
+<td>model.forward → attention → _pre_hook → _WindowExchange → c10d.isend</td>
+</tr>
+<tr>
+<td>CP allgather</td>
+<td><code>CompressorAttentionCP._post_hook</code></td>
+<td>model.forward → attention → _post_hook → _allgather_seq → funcol.all_gather</td>
+</tr>
+<tr>
+<td>PP P2P</td>
+<td><code>PipelineSchedule._step_microbatches</code></td>
+<td>pp_schedule.step → _step_microbatches → _batch_p2p → dist.isend</td>
+</tr>
+<tr>
+<td>FSDP unshard</td>
+<td><code>FSDPParamGroup.pre_forward</code></td>
+<td>model.forward → module → pre_forward → unshard → all_gather</td>
+</tr>
+<tr>
+<td>FSDP reshard</td>
+<td><code>FSDPParamGroup.post_backward</code></td>
+<td>autograd.backward → post_backward → reshard → reduce_scatter</td>
+</tr>
+<tr>
+<td>FSDP allreduce</td>
+<td>梯度同步</td>
+<td>optimizer → all_reduce</td>
+</tr>
+</tbody>
+</table>
+<h3 id="33-_comm_layer">3.3 方案：<code>_comm_layer</code> 上下文变量</h3>
+<p>在 <code>meta_env.py</code> 中维护一个全局 <code>_comm_layer</code> 变量，由<strong>调用入口的 patch</strong> 设置：</p>
+<pre><code class="language-python"># meta_env.py
+_comm_layer: str = &quot;&quot;  # &quot;&quot;, &quot;L1&quot; (model compute), &quot;L2&quot; (framework scheduling)
+</code></pre>
+<p><strong>设置时机</strong>——patch 各调用入口：</p>
+<table>
+<thead>
+<tr>
+<th>调用入口</th>
+<th>设置值</th>
+<th>实现方式</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>_WindowExchange.forward/backward</code></td>
+<td><code>"L1"</code></td>
+<td>已有 patch（<code>_meta_safe_forward</code>），在记录 CP P2P 前设置</td>
+</tr>
+<tr>
+<td><code>_allgather_seq</code></td>
+<td><code>"L1"</code></td>
+<td>新增 patch，在函数入口设置</td>
+</tr>
+<tr>
+<td><code>FSDPParamGroup.unshard</code></td>
+<td><code>"L2"</code></td>
+<td>新增 patch，在方法入口设置</td>
+</tr>
+<tr>
+<td><code>FSDPParamGroup.reshard</code></td>
+<td><code>"L2"</code></td>
+<td>新增 patch，在方法入口设置</td>
+</tr>
+<tr>
+<td><code>FSDPParamGroup.pre_forward</code></td>
+<td><code>"L2"</code></td>
+<td>新增 patch（覆盖 unshard 调用）</td>
+</tr>
+<tr>
+<td><code>FSDPParamGroup.post_backward</code></td>
+<td><code>"L2"</code></td>
+<td>新增 patch（覆盖 reshard 调用）</td>
+</tr>
+<tr>
+<td><code>PipelineSchedule._step_microbatches</code></td>
+<td><code>"L2"</code></td>
+<td>新增 patch，在方法入口设置</td>
+</tr>
+<tr>
+<td>其他（无 patch 覆盖的路径）</td>
+<td><code>""</code></td>
+<td>默认，由 <code>_record_comm</code> 回退判定</td>
+</tr>
+</tbody>
+</table>
+<p><strong>读取时机</strong>——在 <code>comm_events.py</code> 的 <code>_record_comm</code> 中读取：</p>
+<pre><code class="language-python">def _record_comm(recorder, comm_primitive, group, tensor, ...):
+    from torchtitan_npu.simulator.meta_env import _comm_layer
+    event = recorder.record(...)
+    event.comm_layer = _comm_layer  # &quot;L1&quot; or &quot;L2&quot; or &quot;&quot;
+    ...
+</code></pre>
+<h3 id="34">3.4 回退判定</h3>
+<p>当 <code>_comm_layer</code> 为空时（未被任何 patch 设置），使用调用栈特征回退判定：</p>
+<pre><code class="language-python">def _infer_comm_layer() -&gt; str:
+    &quot;&quot;&quot;Fallback: infer layer from call stack when _comm_layer is not set.&quot;&quot;&quot;
+    import inspect
+    for frame_info in inspect.stack():
+        module = inspect.getmodule(frame_info.frame)
+        if module is None:
+            continue
+        name = module.__name__ or &quot;&quot;
+        if &quot;compressor_attention_cp&quot; in name:
+            return &quot;L1&quot;
+        if &quot;fsdp&quot; in name or &quot;pipelining&quot; in name:
+            return &quot;L2&quot;
+    return &quot;L2&quot;  # default to L2 for unknown comm
+</code></pre>
+<blockquote>
+<p>回退判定只在 patch 未覆盖的路径上触发，正常情况下 <code>_comm_layer</code> 已被设置。</p>
+</blockquote>
+<h3 id="35-modulepathtracker">3.5 为什么不只用 ModulePathTracker</h3>
+<p><code>ModulePathTracker</code> 通过 forward hooks 追踪模块调用栈，可以区分"是否在模型 forward 内部"。但：
+- FSDP 的 <code>pre_forward</code> hook 也在模型 forward 内部执行（作为 forward pre_hook），<code>ModulePathTracker</code> 会显示模块路径
+- PP P2P 在 <code>PipelineSchedule._step_microbatches</code> 中调用，此时不在任何模块 forward 内部，<code>ModulePathTracker</code> 栈为空</p>
+<p>因此 <code>ModulePathTracker</code> 能区分 PP P2P（栈空）vs CP/FSDP（栈非空），但<strong>无法区分 CP vs FSDP</strong>（两者都在模块 forward 内部）。<code>_comm_layer</code> 上下文变量通过精确 patch 调用入口解决了这个问题。</p>
+<h2 id="4">4. 实现变更</h2>
+<h3 id="41-commevent-comm_layer">4.1 CommEvent 增加 comm_layer 字段</h3>
+<pre><code class="language-python">@dataclass
+class CommEvent:
+    # ... 现有字段 ...
+    comm_layer: str = &quot;&quot;  # &quot;L1&quot; (model compute) or &quot;L2&quot; (framework scheduling)
+</code></pre>
+<h3 id="42-meta_envpy-_comm_layer-patch">4.2 meta_env.py 增加 _comm_layer 和 patch</h3>
+<pre><code class="language-python">_comm_layer: str = &quot;&quot;
+
+# 在 _meta_safe_forward (已有) 中设置:
+def _meta_safe_forward(ctx, tensor, window, group):
+    global _comm_layer
+    _comm_layer = &quot;L1&quot;  # CP P2P is part of attention compute
+    ...
+
+# 新增 patch: _allgather_seq
+def _patch_allgather_seq_for_comm_layer():
+    from torchtitan_npu.distributed.context_parallel.compressor_attention_cp import _allgather_seq
+    orig = _allgather_seq
+    def _patched(tensor, mesh, seq_dim=1):
+        global _comm_layer
+        _comm_layer = &quot;L1&quot;
+        return orig(tensor, mesh, seq_dim)
+    # patch in module
+
+# 新增 patch: FSDPParamGroup.unshard/reshard
+def _patch_fsdp_for_comm_layer():
+    from torch.distributed.fsdp._fully_shard._fsdp_param_group import FSDPParamGroup
+    orig_unshard = FSDPParamGroup.unshard
+    orig_reshard = FSDPParamGroup.reshard
+    def _patched_unshard(self, async_op=False):
+        global _comm_layer
+        _comm_layer = &quot;L2&quot;
+        return orig_unshard(self, async_op)
+    def _patched_reshard(self):
+        global _comm_layer
+        _comm_layer = &quot;L2&quot;
+        return orig_reshard(self)
+    FSDPParamGroup.unshard = _patched_unshard
+    FSDPParamGroup.reshard = _patched_reshard
+
+# 新增 patch: PipelineSchedule._step_microbatches
+def _patch_pipeline_schedule_for_comm_layer():
+    from torch.distributed.pipelining.schedules import _PipelineSchedule
+    orig = _PipelineSchedule._step_microbatches
+    def _patched(self, *args, **kwargs):
+        global _comm_layer
+        _comm_layer = &quot;L2&quot;
+        return orig(self, *args, **kwargs)
+    _PipelineSchedule._step_microbatches = _patched
+</code></pre>
+<h3 id="43-comm_eventspy-_record_comm-comm_layer">4.3 comm_events.py: _record_comm 记录 comm_layer</h3>
+<pre><code class="language-python">def _record_comm(recorder, comm_primitive, group, tensor, ...):
+    from torchtitan_npu.simulator.meta_env import _comm_layer
+    event = recorder.record(...)
+    event.comm_layer = _comm_layer
+    ...
+</code></pre>
+<h3 id="44-schedule_builderpy-comm_layer">4.4 schedule_builder.py: 按 comm_layer 分流</h3>
+<pre><code class="language-python"># L1 DataPasses (CP comm, comm_layer=&quot;L1&quot;)
+l1_data_passes = [e for e in comm_events if e.comm_layer == &quot;L1&quot;]
+
+# L2 DataPasses (PP/FSDP comm, comm_layer=&quot;L2&quot;)
+l2_data_passes = [e for e in comm_events if e.comm_layer == &quot;L2&quot;]
+
+# L2 execution_timeline: only L2 events
+l2_timeline = [e for e in all_events if e.comm_layer != &quot;L1&quot; and not e.is_l0_compute]
+</code></pre>
+<h3 id="45-step_boundarypy-l1-stepgraph-cp">4.5 step_boundary.py: L1 StepGraph 包含 CP 通信</h3>
+<p><code>build_step_graphs</code> 将 <code>comm_layer="L1"</code> 的 CommEvent 关联到对应 phase 的 StepGraph，作为内部 DataPass。</p>
+<h2 id="5">5. 实施计划</h2>
+<table>
+<thead>
+<tr>
+<th>步骤</th>
+<th>文件</th>
+<th>改动</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td><code>meta_env.py</code></td>
+<td>增加 <code>_comm_layer</code> 全局变量；patch <code>_allgather_seq</code>、<code>FSDPParamGroup.unshard/reshard</code>、<code>PipelineSchedule._step_microbatches</code> 设置 <code>_comm_layer</code></td>
+</tr>
+<tr>
+<td>2</td>
+<td><code>comm_events.py</code></td>
+<td><code>CommEvent</code> 增加 <code>comm_layer</code> 字段；<code>_record_comm</code> 读取并记录 <code>_comm_layer</code></td>
+</tr>
+<tr>
+<td>3</td>
+<td><code>schedule_builder.py</code></td>
+<td>按 <code>comm_layer</code> 分流：L1 通信归 StepGraph，L2 通信归 ScheduleGraph</td>
+</tr>
+<tr>
+<td>4</td>
+<td><code>step_boundary.py</code></td>
+<td><code>build_step_graphs</code> 关联 L1 通信到 StepGraph</td>
+</tr>
+<tr>
+<td>5</td>
+<td><code>schedule_graph.py</code></td>
+<td>StepGraph 增加 <code>internal_data_passes</code> 字段</td>
+</tr>
+<tr>
+<td>6</td>
+<td>测试</td>
+<td>验证 L1 只含 CP 通信、L2 只含 PP/FSDP 通信</td>
+</tr>
+</tbody>
+</table>
+<h2 id="6-l2-datapass-l1-stepgraph">6. L2 DataPass 与 L1 StepGraph 的连接关系</h2>
+<h3 id="61">6.1 问题</h3>
+<p>当前 DataPass 的 <code>src_exit_op</code> 和 <code>dst_entry_op</code> 都指向<strong>通信算子自身的 op_id</strong>（<code>src_exit_op == dst_entry_op</code>），没有建立与 L1 StepGraph 入口/出口算子的连接。回放时无法从 L2 顶层沿着 DataPass 链找到 L1 的具体入口/出口算子。</p>
+<h3 id="62">6.2 需要的连接关系</h3>
+<p>每条 L2 DataPass 应连接两个 L1 StepGraph 实例（或一个 L1 实例与一个通信端点）：</p>
+<pre><code>L1 StepGraph (src)  ──src_exit_op──▶  L2 DataPass  ──dst_entry_op──▶  L1 StepGraph (dst)
+   (出口算子)                              (通信)                          (入口算子)
+</code></pre>
+<table>
+<thead>
+<tr>
+<th>L2 通信类型</th>
+<th>src_exit_op 指向</th>
+<th>dst_entry_op 指向</th>
+<th>语义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>FSDP unshard (allgather)</td>
+<td>通信算子自身 op_id</td>
+<td>L1 forward 的<strong>入口算子</strong>（第一个消费 unshard 参数的算子）</td>
+<td>unshard 后参数进入 forward 计算</td>
+</tr>
+<tr>
+<td>FSDP reshard (reduce_scatter)</td>
+<td>L1 backward 的<strong>出口算子</strong>（梯度产出算子）</td>
+<td>通信算子自身 op_id</td>
+<td>backward 产出的梯度被 reshard</td>
+</tr>
+<tr>
+<td>FSDP allreduce</td>
+<td>L1 optimizer 的<strong>出口算子</strong></td>
+<td>通信算子自身 op_id</td>
+<td>optimizer 产出的梯度被同步</td>
+</tr>
+<tr>
+<td>PP forward_send</td>
+<td>L1 forward 的<strong>出口算子</strong>（activation 产出算子）</td>
+<td>通信算子自身 op_id</td>
+<td>forward 产出的 activation 被 send</td>
+</tr>
+<tr>
+<td>PP forward_recv</td>
+<td>通信算子自身 op_id</td>
+<td>L1 forward 的<strong>入口算子</strong>（第一个消费 recv activation 的算子）</td>
+<td>recv 的 activation 进入 forward 计算</td>
+</tr>
+<tr>
+<td>PP backward_send</td>
+<td>L1 backward 的<strong>出口算子</strong>（gradient 产出算子）</td>
+<td>通信算子自身 op_id</td>
+<td>backward 产出的 gradient 被 send</td>
+</tr>
+<tr>
+<td>PP backward_recv</td>
+<td>通信算子自身 op_id</td>
+<td>L1 backward 的<strong>入口算子</strong>（第一个消费 recv gradient 的算子）</td>
+<td>recv 的 gradient 进入 backward 计算</td>
+</tr>
+</tbody>
+</table>
+<h3 id="63">6.3 连接关系的方向性</h3>
+<pre><code>                    ┌─────────────────────────────────────────┐
+                    │           L2 ScheduleGraph              │
+                    │                                         │
+  FSDP unshard ──▶  │  dst_entry_op → forward StepGraph entry  │
+                    │                      │                  │
+                    │                 (L1 compute)             │
+                    │                      │                  │
+  PP forward_send ◀│  src_exit_op ← forward StepGraph exit     │
+                    │                      │                  │
+                    │                 (PP P2P)                │
+                    │                      │                  │
+  PP forward_recv ─▶│  dst_entry_op → next stage forward entry│
+                    │                      │                  │
+                    │                 (L1 compute)             │
+                    │                      │                  │
+  FSDP reshard ◀│  src_exit_op ← backward StepGraph exit      │
+                    │                                         │
+                    └─────────────────────────────────────────┘
+</code></pre>
+<h3 id="64">6.4 实现方案</h3>
+<h4 id="641">6.4.1 捕获时记录连接点</h4>
+<p>在 <code>_record_comm</code> 中，除了记录通信事件本身，还需要记录它与 L1 StepGraph 的连接关系。关键信息是：<strong>通信发生时，当前 L1 计算图的入口/出口算子是什么</strong>。</p>
+<p><strong>方案 A：基于 producer/consumer 关系（推荐）</strong></p>
+<p><code>OpDispatchCapture</code> 已经维护了 <code>_producer</code> 字典（<code>id(tensor) → op_id</code>），记录每个张量由哪个算子产出。当通信算子被调用时：</p>
+<ul>
+<li><strong>unshard（allgather）</strong>：通信产出的张量被后续计算算子消费。<code>dst_entry_op</code> = 第一个消费通信产出张量的算子 op_id（通过 <code>_producer</code> 反查通信算子的消费者）。</li>
+<li><strong>reshard（reduce_scatter）</strong>：通信消费的张量由前序计算算子产出。<code>src_exit_op</code> = 产出通信输入张量的算子 op_id（通过 <code>_producer</code> 查找）。</li>
+<li><strong>PP send</strong>：通信消费的张量由 forward 计算产出。<code>src_exit_op</code> = 产出 send 输入张量的算子 op_id。</li>
+<li><strong>PP recv</strong>：通信产出的张量被后续计算消费。<code>dst_entry_op</code> = 第一个消费 recv 产出张量的算子 op_id。</li>
+</ul>
+<pre><code class="language-python">def _record_comm(recorder, comm_primitive, group, tensor, output_tensor=None):
+    ...
+    event = recorder.record(...)
+
+    # Determine connection to L1 StepGraph
+    capture = get_active_capture()
+    if capture is not None:
+        if output_tensor is not None:
+            # Comm produces a tensor that will be consumed by L1 compute
+            # dst_entry_op will be set later when the consumer is captured
+            # For now, register a pending link
+            capture._pending_comm_links[id(output_tensor)] = event
+        else:
+            # Comm consumes a tensor produced by L1 compute
+            # src_exit_op = the producer of the input tensor
+            producer_op = capture._producer.get(id(tensor))
+            if producer_op is not None:
+                event.src_exit_op = producer_op
+    ...
+</code></pre>
+<p><strong>延迟解析 dst_entry_op</strong>：通信产出的张量可能稍后才被计算算子消费。在 <code>_record_event</code> 中，当捕获一个新算子时，检查其输入张量是否有 pending comm link：</p>
+<pre><code class="language-python">def _record_event(self, raw_op_type, flat_inputs, ...):
+    ...
+    # Check if any input tensor was produced by a comm op (pending link)
+    for t in flat_inputs:
+        if id(t) in self._pending_comm_links:
+            event = self._pending_comm_links.pop(id(t))
+            event.dst_entry_op = op_id  # this op is the first consumer
+    ...
+</code></pre>
+<h4 id="642-stepinstance">6.4.2 StepInstance 标识</h4>
+<p>DataPass 的 <code>src_instance</code> / <code>dst_instance</code> 需要标识具体的 L1 StepGraph 实例（哪个 rank、哪个 microbatch、哪个 phase）：</p>
+<pre><code class="language-python"># 当前: src_instance = &quot;rank1&quot; (只有 rank)
+# 改为: src_instance = &quot;rank1_mb0_forward&quot; (rank + microbatch + phase)
+</code></pre>
+<p>这需要从 <code>_pp_context</code> 获取 <code>mb_idx</code> 和 <code>phase</code>，在 <code>_record_comm</code> 时记录到 CommEvent。</p>
+<h4 id="643-datapass">6.4.3 DataPass 结构更新</h4>
+<pre><code class="language-python">@dataclass
+class DataPass:
+    src_instance: str          # &quot;rank1_mb0_forward&quot; (rank + mb + phase)
+    dst_instance: str          # &quot;rank2_mb0_forward&quot; or &quot;group:fsdp&quot;
+    slots: list[TensorSlot]
+    src_device: int | None = None
+    dst_device: int | None = None
+    requires_communication: bool = False
+    comm_primitive: str = &quot;&quot;
+    comm_group_ranks: list[list[int]] = field(default_factory=list)
+    # 连接关系:
+    # src_exit_op: src_instance 的出口算子 op_id (产出被通信的数据)
+    # dst_entry_op: dst_instance 的入口算子 op_id (消费通信的数据)
+    # 如果指向通信算子自身，表示该端是通信端点（非 L1 计算端）
+</code></pre>
+<p>TensorSlot 的 <code>src_exit_op</code> / <code>dst_entry_op</code> 语义：</p>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>值</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>src_exit_op</code></td>
+<td>L1 计算算子 op_id</td>
+<td>数据由该 L1 算子产出，然后进入通信</td>
+</tr>
+<tr>
+<td><code>src_exit_op</code></td>
+<td>通信算子 op_id</td>
+<td>数据由通信产出（如 recv/unshard），src 端是通信端点</td>
+</tr>
+<tr>
+<td><code>dst_entry_op</code></td>
+<td>L1 计算算子 op_id</td>
+<td>数据被该 L1 算子消费，通信后进入计算</td>
+</tr>
+<tr>
+<td><code>dst_entry_op</code></td>
+<td>通信算子 op_id</td>
+<td>数据被通信消费（如 send/reshard），dst 端是通信端点</td>
+</tr>
+</tbody>
+</table>
+<h3 id="65">6.5 回放路径示例</h3>
+<p>以 PP=4, MB=0 的 forward 为例，回放路径：</p>
+<pre><code>1. L2: PP forward_recv (stage 1, MB 0)
+   └─ dst_entry_op → L1 forward StepGraph (stage 1, MB 0) 的入口算子
+
+2. L1: forward StepGraph (stage 1, MB 0) 内部按拓扑序回放
+   └─ exit_nodes → 出口算子
+
+3. L2: PP forward_send (stage 1, MB 0)
+   └─ src_exit_op → L1 forward StepGraph (stage 1, MB 0) 的出口算子
+   └─ dst_entry_op → 通信算子自身（send 端点）
+
+4. L2: PP forward_recv (stage 2, MB 0)
+   └─ dst_entry_op → L1 forward StepGraph (stage 2, MB 0) 的入口算子
+
+5. L1: forward StepGraph (stage 2, MB 0) 内部回放
+   ...
+</code></pre>
+<p>FSDP 的回放路径：</p>
+<pre><code>1. L2: FSDP unshard (allgather, rank 1, MB 0, forward)
+   └─ dst_entry_op → L1 forward StepGraph (rank 1, MB 0) 的入口算子
+
+2. L1: forward StepGraph 内部回放
+   └─ exit_nodes → 出口算子
+
+3. L2: FSDP reshard (reduce_scatter, rank 1, MB 0, backward)
+   └─ src_exit_op → L1 backward StepGraph (rank 1, MB 0) 的出口算子
+</code></pre>
+<h3 id="66">6.6 实施补充</h3>
+<p>在原实施计划基础上增加：</p>
+<table>
+<thead>
+<tr>
+<th>步骤</th>
+<th>文件</th>
+<th>改动</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>7</td>
+<td><code>dispatch_capture.py</code></td>
+<td>增加 <code>_pending_comm_links</code> 字典；<code>_record_event</code> 中检查输入张量是否有 pending comm link，设置 <code>dst_entry_op</code></td>
+</tr>
+<tr>
+<td>8</td>
+<td><code>comm_events.py</code></td>
+<td><code>_record_comm</code> 中通过 <code>_producer</code> 查找 <code>src_exit_op</code>；注册 pending link for <code>dst_entry_op</code></td>
+</tr>
+<tr>
+<td>9</td>
+<td><code>schedule_builder.py</code></td>
+<td>DataPass 的 <code>src_instance</code>/<code>dst_instance</code> 改为 <code>rank_mb_phase</code> 格式</td>
+</tr>
+<tr>
+<td>10</td>
+<td>测试</td>
+<td>验证 DataPass 的 <code>src_exit_op</code>/<code>dst_entry_op</code> 指向 L1 计算算子（非通信算子自身）</td>
+</tr>
+</tbody>
+</table>
+              
+            </div>
+          </div><footer>
+    <div class="rst-footer-buttons" role="navigation" aria-label="Footer Navigation">
+        <a href="../pp-l2-capture-architecture/" class="btn btn-neutral float-left" title="PP L2 Capture Architecture"><span class="icon icon-circle-arrow-left"></span> Previous</a>
+        <a href="../schedule-plan-dependency-reconstruction-contract/" class="btn btn-neutral float-right" title="SchedulePlan 下游依赖重建契约">Next <span class="icon icon-circle-arrow-right"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <!-- Copyright etc -->
+  </div>
+
+  Built with <a href="https://www.mkdocs.org/">MkDocs</a> using a <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a> provided by <a href="https://readthedocs.org">Read the Docs</a>.
+</footer>
+          
+        </div>
+      </div>
+
+    </section>
+
+  </div>
+
+  <div class="rst-versions" role="note" aria-label="Versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    
+    
+      <span><a href="../pp-l2-capture-architecture/" style="color: #fcfcfc">&laquo; Previous</a></span>
+    
+    
+      <span><a href="../schedule-plan-dependency-reconstruction-contract/" style="color: #fcfcfc">Next &raquo;</a></span>
+    
+  </span>
+</div>
+    <script src="../../js/jquery-3.6.0.min.js"></script>
+    <script>var base_url = "../..";</script>
+    <script src="../../js/theme_extra.js"></script>
+    <script src="../../js/theme.js"></script>
+    <script>
+        jQuery(function () {
+            SphinxRtdTheme.Navigation.enable(true);
+        });
+    </script>
+
+</body>
+</html>

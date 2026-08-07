@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" >
+<head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+      <link rel="shortcut icon" href="../../img/favicon.ico" />
+    <title>复杂 Pipeline 策略下完整计算图捕获方案设计 - torchtitan-npu</title>
+    <link rel="stylesheet" href="../../css/theme.css" />
+    <link rel="stylesheet" href="../../css/theme_extra.css" />
+        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/styles/github.min.css" />
+    
+      <script>
+        // Current page data
+        var mkdocs_page_name = "\u590d\u6742 Pipeline \u7b56\u7565\u4e0b\u5b8c\u6574\u8ba1\u7b97\u56fe\u6355\u83b7\u65b9\u6848\u8bbe\u8ba1";
+        var mkdocs_page_input_path = "design/pipeline-multi-graph-capture-design.md";
+        var mkdocs_page_url = null;
+      </script>
+    
+    <!--[if lt IE 9]>
+      <script src="../../js/html5shiv.min.js"></script>
+    <![endif]-->
+      <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/highlight.min.js"></script>
+      <script>hljs.highlightAll();</script> 
+</head>
+
+<body class="wy-body-for-nav" role="document">
+
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side stickynav">
+    <div class="wy-side-scroll">
+      <div class="wy-side-nav-search">
+          <a href="../.." class="icon icon-home"> torchtitan-npu
+        </a>
+      </div>
+
+      <div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <ul>
+                <li class="toctree-l1"><a class="reference internal" href="../..">Home</a>
+                </li>
+              </ul>
+              <ul>
+                <li class="toctree-l1"><a class="reference internal" href="../../lint_guide/">Lint 指南</a>
+                </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Community</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../community/contributors/">提交者与贡献者（Committers and Contributors）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../community/governance/">社区治理</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../community/versioning_policy/">版本策略</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Design</span></p>
+              <ul class="current">
+                  <li class="toctree-l1"><a class="reference internal" href="../1f1b-schedule-plan-assembly-guide/">1F1B 完整依赖组装与 DES 回放实现指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../alltoall-capture-analysis/">all_to_all 通信捕获缺失分析</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../communication-ownership-contract/">Communication Ownership Contract</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../dualpipev-schedule-plan-consumer-guide/">DualPipeV SchedulePlan 下游接入指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../l2-l3-schedule-plan-design/">L2/L3 调度 IR 重构设计：从扁平 trace 到结构化 SchedulePlan</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../low-precision-sim-analysis/">低精度训练（MXFP8）Simulator 使能分析</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../optimizer-ops-analysis/">优化器算子捕获问题分析</a>
+                  </li>
+                  <li class="toctree-l1 current"><a class="reference internal current" href="#">复杂 Pipeline 策略下完整计算图捕获方案设计</a>
+    <ul class="current">
+    <li class="toctree-l2"><a class="reference internal" href="#1">1. 问题</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#2">2. 根因分析</a>
+        <ul>
+    <li class="toctree-l3"><a class="reference internal" href="#21-_computationtype">2.1 复杂策略的真实计算流：_ComputationType 枚举</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#22-gating">2.2 当前捕获的三处 gating/分桶缺陷</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#23">2.3 当前的"效率机制"与完整性的冲突</a>
+    </li>
+        </ul>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#3">3. 方案设计</a>
+        <ul>
+    <li class="toctree-l3"><a class="reference internal" href="#30">3.0 设计目标与约束</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#31-_computationtype-phase">3.1 核心思路：用 _ComputationType 替换扁平 phase，按"每形态首现捕获"去重</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#32-iw-comp_type-schedule">3.2 I/W 区分的落地：comp_type 直接来自 schedule 动作</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#33-l0-dispatch_capturepy">3.3 L0 捕获侧改动（dispatch_capture.py）</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#34-fsdp-reshard-meta_envpy-comm_eventspy">3.4 FSDP reshard 状态机（meta_env.py + comm_events.py）</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#35-l1l2">3.5 L1/L2 装配改动</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#36-b-iw">3.6 可选扩展：B 图内部逐算子 I/W 归因</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#37-chunk-producer-chunk">3.7 chunk 局部 producer 表与跨 chunk 依赖</a>
+    </li>
+        </ul>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#4">4. 改动清单（按文件）</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#5">5. 效率分析</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#6">6. 验证方案</a>
+    </li>
+    </ul>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../pp-l2-capture-architecture/">PP L2 Capture Architecture</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../schedule-capture-design/">L0-L3 IR 层级归属设计</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../schedule-plan-dependency-reconstruction-contract/">SchedulePlan 下游依赖重建契约</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../schedule-plan-des-consumer-guide/">SchedulePlan 依赖重建与 DES 消费指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../simulator-memory-model-design/">Simulator Memory Model 改造设计</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Feature guides</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/checkpoint/">Checkpoint 使用指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/deepseek_v32_mtp/">多Token预测特性(Multi Token Prediction, MTP)</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/low_precision_training/">低精度训练特性（MXFP8）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/metrics_and_debugging/">调试支持特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/model_custom/">Model Custom框架介绍</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/muon_optimizer/">Muon 优化器特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/new_model_onboarding/">新模型接入开发流程</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/npu_fused_ops/">NPU 融合算子适配</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/swap_optimizer/">SwapOptimizer 特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/torch_compile/">torch.compile 支持</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/virtual_optimizer/">Virtual Optimizer - 优化器显存虚拟化特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/vlm/">VLM NPU 支持</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" >Parallelism</a>
+    <ul>
+                <li class="toctree-l2"><a class="reference internal" href="../../feature_guides/parallelism/custom_cp/">自定义 Context Parallel 特性</a>
+                </li>
+    </ul>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Recipe</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../recipe/sft/">SFT 指令微调</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Superpowers</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" >Plans</a>
+    <ul>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/plans/2026-07-01-mhc-real-op-name-capture-implementation/">MHC Real-Op-Name Capture Implementation Plan</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/plans/2026-07-01-npu-simulator-implementation/">torchtitan_npu Simulator Implementation Plan</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/plans/2026-07-01-smla-real-op-name-capture-implementation/">SMLA Real-Op-Name Capture Implementation Plan</a>
+                </li>
+    </ul>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" >Specs</a>
+    <ul>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/specs/2026-07-01-mhc-real-op-name-capture-design/">MHC 真实算子名捕获 — 架构与方案设计（阶段一：MHC）</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/specs/2026-07-01-npu-simulator-design/">torchtitan_npu Simulator — 架构与方案设计</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/specs/2026-07-01-smla-real-op-name-capture-design/">SMLA 真实算子名捕获 — 架构与方案设计（阶段二：SMLA）</a>
+                </li>
+    </ul>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Test guides</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../test_guides/model_acceptance/">新模型最终验收规范（Meta 模拟器）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../test_guides/test_design/">测试设计</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../test_guides/test_guide/">测试使用指南</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">User guides</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/deepseek_v4_model_parameters/">DeepSeek-V4 模型参数 Web 字段目录</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/installation/">软件安装</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/quickstart/">快速上手</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/simulator/">Simulator 使用指南</a>
+                  </li>
+              </ul>
+      </div>
+    </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap">
+      <nav class="wy-nav-top" role="navigation" aria-label="Mobile navigation menu">
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../..">torchtitan-npu</a>
+        
+      </nav>
+      <div class="wy-nav-content">
+        <div class="rst-content"><div role="navigation" aria-label="breadcrumbs navigation">
+  <ul class="wy-breadcrumbs">
+    <li><a href="../.." class="icon icon-home" aria-label="Docs"></a></li>
+          <li class="breadcrumb-item">Design</li>
+      <li class="breadcrumb-item active">复杂 Pipeline 策略下完整计算图捕获方案设计</li>
+    <li class="wy-breadcrumbs-aside">
+    </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+            <div class="section" itemprop="articleBody">
+              
+                <h1 id="pipeline">复杂 Pipeline 策略下完整计算图捕获方案设计</h1>
+<blockquote>
+<p>分支：feat/npu-simulator
+日期：2026-07-14
+涉及文件：<code>meta_env.py</code>、<code>capture/dispatch_capture.py</code>、<code>capture/step_boundary.py</code>、<code>capture/schedule_builder.py</code>、<code>capture/comm_events.py</code>、<code>ir/step_graph.py</code>、<code>ir/schedule_graph.py</code>、<code>trainer.py</code></p>
+</blockquote>
+<h2 id="1">1. 问题</h2>
+<p>用户反馈：<code>meta_env.py</code> 与 <code>dispatch_capture.py</code> 对复杂 Pipeline 策略的捕获不完整，具体表现为：</p>
+<ol>
+<li><strong>只捕获 microbatch=0 的 L0 计算图</strong>：MB 1+ 被整体跳过 L0 捕获。</li>
+<li><strong>只按 forward/backward/optimizer 三分类</strong>：无法区分复杂策略下 backward 的不同形态。</li>
+<li><strong>不同 microbatch 间的 FSDP reshard 差异丢失</strong>：MB 0 的图不能代表后续 MB 的图。</li>
+</ol>
+<p>针对"复杂 Pipeline 策略"，用户特别指出两点结构性差异当前无法还原：
+- backward 有 <strong>I（input grad）与 W（weight grad）的区别</strong>；
+- 不同 microbatch 之间可能存在 <strong>是否 fsdp reshard 的差异</strong>。</p>
+<h2 id="2">2. 根因分析</h2>
+<h3 id="21-_computationtype">2.1 复杂策略的真实计算流：<code>_ComputationType</code> 枚举</h3>
+<p><code>torch.distributed.pipelining.schedules._ComputationType</code> 直接对应复杂策略（<code>ScheduleZBVZeroBubble</code> / <code>ScheduleDualPipeV</code> / <code>ScheduleInterleavedZeroBubble</code> / <code>ScheduleLoopedBFS</code>，均继承 <code>_PipelineScheduleRuntime</code>）的动作类型：</p>
+<pre><code class="language-python">class _ComputationType(str, Enum):
+    FORWARD          = &quot;F&quot;   # forward_one_chunk
+    FULL_BACKWARD    = &quot;B&quot;   # backward_one_chunk(full_backward=True)  → I+W 一次 autograd.backward
+    BACKWARD_INPUT   = &quot;I&quot;   # backward_one_chunk(full_backward=False) → 仅 stage_backward_input（torch.autograd.grad 保留图）
+    BACKWARD_WEIGHT  = &quot;W&quot;   # backward_weight_one_chunk              → stage_backward_weight（第二次 autograd.grad，仅权重）
+    UNSHARD          = &quot;UNSHARD&quot;   # FSDPParamGroup.unshard (all_gather)
+    RESHARD           = &quot;RESHARD&quot;    # FSDPParamGroup.reshard (reduce_scatter)
+    SEND_F / RECV_F / SEND_B / RECV_B / REDUCE_GRAD ...
+</code></pre>
+<p><strong>关键发现</strong>：用户说的"I 与 W 的区别"恰好就是 <code>BACKWARD_INPUT="I"</code> 与 <code>BACKWARD_WEIGHT="W"</code>。zero-bubble 类策略把一次 backward 拆成两次独立的 autograd 传递（<code>stage_backward_input</code> 用 <code>torch.autograd.grad</code> 只算输入梯度并保留图；<code>stage_backward_weight</code> 用第二次 <code>torch.autograd.grad</code> 只算权重梯度），产生<strong>两个互相独立、拓扑不同的 L0 计算图</strong>。<code>FULL_BACKWARD="B"</code> 则是 1F1B/GPipe 的单次 <code>torch.autograd.backward</code>（I+W 混在一张图里）。</p>
+<p><code>_PipelineScheduleRuntime._perform_action</code> 按 <code>pipeline_order_with_comms</code> 顺序对<strong>每个 stage、每个 microbatch</strong> 依次执行 F / I / W / B / UNSHARD / RESHARD / SEND / RECV，因此一个训练 step 内实际存在 <code>num_stages × {F, B or (I,W)} × num_microbatches</code> 个独立计算块，且 I/W/UNSHARD/RESHARD 在不同 MB 间的交错顺序由策略决定。</p>
+<h3 id="22-gating">2.2 当前捕获的三处 gating/分桶缺陷</h3>
+<p><strong>(a) MB 1+ 的 L0 捕获被整体关闭</strong> — <code>meta_env.py:1174-1178</code> / <code>1196-1200</code>：</p>
+<pre><code class="language-python">def _patched_fwd_one_chunk(self, mb_idx, *args, **kwargs):
+    ...
+    cap._capture_l0 = (mb_idx == 0)   # ← 只有 MB 0 进 L0 捕获
+</code></pre>
+<p><code>dispatch_capture.py:148-149</code> 据此直接 <code>return</code>，MB 1+ 的全部算子（含零气泡策略下可能仅在后续 MB 才出现的某种 I/W 形态）都被丢弃。而 <code>comm_events</code> 对所有 MB 始终记录，导致 L2 timeline 与 L0 模板对不上。</p>
+<p><strong>(b) phase 仅三值，backward 形态被合并</strong> — <code>step_boundary.py:21</code> <code>_PHASES = ("forward","backward","optimizer")</code>，<code>build_step_graphs</code>（<code>step_boundary.py:88-101</code>）只按 <code>annotations["phase"]</code> 分桶。<code>FULL_BACKWARD</code>/<code>BACKWARD_INPUT</code>/<code>BACKWARD_WEIGHT</code> 三种拓扑不同的图全部塞进同一个 <code>"backward"</code> StepGraph，I/W 的边界彻底丢失。</p>
+<p><strong>(c) 不同 stage 的同 phase 图被合并</strong> — fake-PG 单进程下 <code>_patch_get_stage_indices_for_fake_pg</code>（<code>meta_env.py:1218</code>）把所有 PP stage 建在同一个进程里顺序执行，所有 stage 的 forward/backward 算子都流进 <code>OpDispatchCapture._events</code> 这一个扁平 list，再被 (b) 按 phase 合并 → stage0 与 stageN 的不同模型块图被混进同一张图。</p>
+<p><strong>(d) FSDP reshard 状态不在分类键里</strong> — <code>UNSHARD</code>/<code>RESHARD</code> 当前只被 <code>comm_events</code> 作为 L2 collective 记录（<code>_patch_comm_layer_context</code> 给 unshard/reshard 打 "L2" 标），但<strong>不进入 L0 图的分类键</strong>，所以"本次 forward 前是否刚 unshard、本次 backward 后是否 reshard"这种跨 MB 的状态差异不会生成不同的 L0 模板，也不会在 L1 层体现。</p>
+<h3 id="23">2.3 当前的"效率机制"与完整性的冲突</h3>
+<p><code>dispatch_capture.py:182-184</code> 用"连续同 signature → <code>repeat_count++</code>"折叠重复算子，这是面向"同一张图内相邻重复层"的，不是面向"跨 MB 去重"。把 MB 1+ 全关掉（用牺牲完整性换效率）是过激的取舍：复杂策略下不同 MB 的图<strong>大多结构相同</strong>，只有少量形态（首/末 MB 边界、FSDP reshard 切换点、recompute）不同。正确做法是"按形态去重、每形态只捕获一次"，而非"只捕 MB 0"。</p>
+<h2 id="3">3. 方案设计</h2>
+<h3 id="30">3.0 设计目标与约束</h3>
+<ul>
+<li><strong>完整性</strong>：训练 step 内出现的每一种 <code>(stage, 计算形态, FSDP状态, 边界)</code> 组合的计算图都被捕获至少一次，且每个 microbatch 的每个计算块都能在 L1/L2 被映射到正确的模板实例。</li>
+<li><strong>效率</strong>：捕获开销 ∝ <strong>不同形态数 × 单块算子数</strong>，而非 <code>num_microbatches × 单块算子数</code>。复杂策略下不同形态数 ≪ <code>num_microbatches × num_stages</code>，因此 MB 1+ 的绝大多数计算块走 pass-through。</li>
+<li><strong>不破坏现有 L1/L2/L3 IR 形态</strong>：<code>StepGraph</code>/<code>StepInstance</code>/<code>DataPass</code>/<code>TimelineEntry</code> 结构保留，仅扩充分类维度。</li>
+</ul>
+<h3 id="31-_computationtype-phase">3.1 核心思路：用 <code>_ComputationType</code> 替换扁平 phase，按"每形态首现捕获"去重</h3>
+<p>把"图分类键"从 <code>phase ∈ {forward, backward, optimizer}</code> 升级为多维度 <strong>GraphClassKey</strong>：</p>
+<pre><code>GraphClassKey = (pp_stage, comp_type, fsdp_state, mb_boundary)
+</code></pre>
+<ul>
+<li><code>pp_stage</code>：该计算块所属 PP stage（解决 2.2(c)）。</li>
+<li><code>comp_type</code> ∈ {<code>F</code>, <code>B</code>, <code>I</code>, <code>W</code>, <code>F_RECOMPUTE</code>, <code>OPTIMIZER</code>}（解决 2.2(b) + 用户的 I/W 诉求）。</li>
+<li><code>F_RECOMPUTE</code>：activation checkpointing 在 backward 阶段重算的 forward（autograd 上下文不同，是独立图）。</li>
+<li><code>OPTIMIZER</code>：沿用现有 <code>boundary.mark("optimizer")</code>。</li>
+<li><code>fsdp_state</code> ∈ {<code>SHARDED</code>, <code>UNSHARDED</code>, <code>NA</code>}：本 stage 当前参数分片状态（解决 2.2(d) + 用户的 reshard 诉求）。<strong>注意：这只影响 L0 模板是否含 unshard/reshard 集体通信算子，以及 L2 DataPass；同一 comp_type 在两种 fsdp_state 下的"纯计算算子"通常相同</strong>，见 3.5 的取舍。</li>
+<li><code>mb_boundary</code> ∈ {<code>FIRST</code>, <code>STEADY</code>, <code>LAST</code>}：仅对<strong>同 comp_type 但首/末 MB 边界行为不同</strong>的场景产生新模板（如 FSDP2 首次 forward 的 <code>_lazy_init</code>、末次 backward 的 <code>REDUCE_GRAD</code>）。</li>
+</ul>
+<p><strong>捕获 gating 规则</strong>（替换 <code>cap._capture_l0 = (mb_idx == 0)</code>）：</p>
+<pre><code class="language-python">key = (stage, comp_type, fsdp_state, mb_boundary)
+should_capture = key not in self._captured_classes
+</code></pre>
+<ul>
+<li>首次出现 → 全量 L0 捕获，作为该 key 的模板，记入 <code>_captured_classes</code>。</li>
+<li>再次出现 → pass-through（仅记 timeline + comm，不记 L0 算子），并把该次记为对应模板的一个 instance。</li>
+</ul>
+<p>这样<strong>每种形态恰好捕获一次</strong>，既完整又高效。</p>
+<h3 id="32-iw-comp_type-schedule">3.2 I/W 区分的落地：<code>comp_type</code> 直接来自 schedule 动作</h3>
+<p><strong>复杂策略（<code>_PipelineScheduleRuntime</code>）</strong>：patch <code>_PipelineScheduleRuntime._perform_action</code>，在分发前读 <code>action.computation_type</code> 与 <code>action.stage_index</code>，写入扩展后的 <code>_pp_context</code>：</p>
+<pre><code class="language-python">_pp_context = {
+    &quot;stage&quot;: 0, &quot;mb_idx&quot;: 0,
+    &quot;comp_type&quot;: &quot;F&quot;,        # 新增：F / B / I / W
+    &quot;fsdp_state&quot;: &quot;UNSHARDED&quot;,  # 新增
+    &quot;chunk_id&quot;: 0,           # 新增：用于 chunk 边界
+}
+</code></pre>
+<p><code>_perform_action</code> 对 <code>UNSHARD</code>/<code>RESHARD</code> 不开 L0 捕获（它们是 L2 通信，由 <code>comm_events</code> 记录），但<strong>更新对应 stage 的 <code>fsdp_state</code></strong>（见 3.5 状态机），使得紧随其后的 <code>FORWARD</code>/<code>BACKWARD*</code> 拿到正确的 fsdp_state 参与分类键。</p>
+<p><strong>简单策略（<code>PipelineScheduleSingle</code>：1F1B / GPipe）</strong>：不走 <code>_perform_action</code>，仍 hook <code>forward_one_chunk</code>/<code>backward_one_chunk</code>。<code>backward_one_chunk</code> 带 <code>full_backward: bool</code> 参数：
+- <code>full_backward=True</code> → <code>comp_type = "B"</code>
+- <code>full_backward=False</code> → <code>comp_type = "I"</code>（随后 <code>backward_weight_one_chunk</code> 被调用时设 <code>"W"</code>）</p>
+<p>再 hook <code>backward_weight_one_chunk</code> 把 <code>comp_type</code> 切到 <code>"W"</code>。这覆盖所有策略类型，单一 patch 点集合。</p>
+<blockquote>
+<p>说明：对 <code>FULL_BACKWARD="B"</code> 这种 I+W 混在一张图的情况，本设计在<strong>模板/StepGraph 粒度</strong>已用 <code>comp_type</code> 标注该图为"B（I+W 合一）"；若还需对 B 图内部<strong>逐算子</strong>标注 I 路径 vs W 路径，需要 autograd 节点级追溯（见 3.6 可选扩展）。零气泡策略下真正需要区分 I/W 的场景，schedule 本身已经把 I/W 拆成两次独立 autograd 传递，模板级 <code>comp_type=I</code> 与 <code>comp_type=W</code> 已天然分开，无需逐算子标注。</p>
+</blockquote>
+<h3 id="33-l0-dispatch_capturepy">3.3 L0 捕获侧改动（<code>dispatch_capture.py</code>）</h3>
+<ol>
+<li><strong><code>_RawEvent</code> 增字段</strong>：<code>comp_type: str</code>、<code>fsdp_state: str</code>、<code>mb_boundary: str</code>（原 <code>phase</code> 保留向后兼容，由 <code>comp_type</code> 派生：<code>I/W/B → "backward"</code>）。</li>
+<li><strong>chunk 级捕获 scope</strong>：新增 <code>_chunk_events: list[_RawEvent]</code> 与 <code>_chunk_classes_seen: set[tuple]</code>。当前一个 <code>_events</code> 扁平 list 改为"按 chunk 收集 → chunk 结束时按 class_key 决定提交/丢弃"：</li>
+<li><code>_begin_chunk(key)</code>：若 key 未见过 → <code>_capture_mode="capture"</code>；否则 <code>"passthrough"</code>。</li>
+<li><code>_record_event</code>：<code>passthrough</code> 模式下直接 return（同现状的 <code>_capture_l0=False</code>）；<code>capture</code> 模式写入 <code>_chunk_events</code>，<strong>chunk 内仍用现有连续 signature 折叠 repeat_count</strong>（同一 chunk 内的重复层仍折叠，保效率）。</li>
+<li><code>_end_chunk(key)</code>：<code>capture</code> 模式 → 把 <code>_chunk_events</code> 提交为一个新 <code>StepGraph</code> 模板（<code>step_type = comp_type</code>），清空；<code>passthrough</code> 模式 → 丢弃 <code>_chunk_events</code>，给对应模板 <code>instance_count += 1</code>。</li>
+<li><strong>op 的 stage/mb 归因</strong>：仍从 <code>_pp_context</code> 读 <code>stage</code>/<code>mb_idx</code> 写入 <code>_RawEvent.pp_stage</code>/<code>pp_mb_idx</code>（已有），保证 L2 timeline 全量。</li>
+</ol>
+<p><code>build_nodes</code> 改为返回 <code>dict[str, StepGraph]</code>（key = class_key 的字符串化，如 <code>stage0_F_UNSHARDED_FIRST</code>），而非按 phase 的三桶。</p>
+<h3 id="34-fsdp-reshard-meta_envpy-comm_eventspy">3.4 FSDP reshard 状态机（<code>meta_env.py</code> + <code>comm_events.py</code>）</h3>
+<p>维护 <code>_fsdp_state: dict[int, str]</code>（stage → <code>SHARDED</code>/<code>UNSHARDED</code>）：</p>
+<ul>
+<li><code>_perform_action(UNSHARD, stage)</code> 或 <code>FSDPParamGroup.unshard</code> patch → <code>_fsdp_state[stage] = "UNSHARDED"</code>，并保证随后该 stage 的 <code>FORWARD</code>/<code>BACKWARD*</code> 读到 <code>UNSHARDED</code>。</li>
+<li><code>_perform_action(RESHARD, stage)</code> 或 <code>FSDPParamGroup.reshard</code> patch → <code>_fsdp_state[stage] = "SHARDED"</code>。</li>
+<li>初始 <code>SHARDED</code>（FSDP2 默认参数分片）。无 FSDP 时 <code>NA</code>。</li>
+</ul>
+<p><strong>取舍</strong>：把 <code>fsdp_state</code> 放进 class_key 会在"参数 reshard 了但纯计算算子不变"时生成两个 L0 模板。这通常是期望行为——因为 unshard/reshard 集体通信算子会进 L0 图（<code>comm.*</code> 节点），导致两模板拓扑确实不同（一个带 allgather、一个带 reduce_scatter）。若发现纯计算部分完全相同、只想在 L2 DataPass 层区分，可把 <code>fsdp_state</code> 从 L0 class_key 移出、仅用于 L2 <code>StepInstance</code> 标注（见 3.7 兜底）。</p>
+<h3 id="35-l1l2">3.5 L1/L2 装配改动</h3>
+<p><strong><code>step_boundary.py</code></strong>：<code>_PHASES</code> 扩为动态集合；<code>build_step_graphs</code> 改为按 <code>class_key</code>（或等价的 <code>(stage, comp_type)</code>）分桶，而非 <code>phase</code>。<code>step_type</code> 用 <code>comp_type</code>（<code>F</code>/<code>B</code>/<code>I</code>/<code>W</code>/<code>F_RECOMPUTE</code>/<code>OPTIMIZER</code>）+ stage。</p>
+<p><strong><code>schedule_builder.py</code></strong>：
+- <code>StepInstance</code> 改为 per <code>(microbatch, stage, comp_type)</code>：<code>instance_id = f"rank{rank}_s{stage}_mb{mb}_{comp_type}"</code>，<code>micro_batch_idx=mb</code>，<code>pipeline_stage=stage</code>，新增 <code>comp_type</code>/<code>fsdp_state</code> 字段。
+- 全量 <code>execution_timeline</code>：对<strong>每个</strong>计算块（含 MB 1+）都产出一条 <code>TimelineEntry</code>（seq 来自捕获、mb_idx/stage/comp_type 来自 <code>_pp_context</code>/timeline_events），不再只对 MB 0。
+- <code>DataPass</code>：P2P/FSDP 通信按 <code>(src_stage, src_mb, dst_stage, dst_mb)</code> 连接正确的 StepInstance，而非笼统 <code>rank{stage}</code>。<code>src_exit_op</code>/<code>dst_entry_op</code> 需要在"该 MB 的 chunk 内"反查 producer——见 3.7 的 chunk 局部 producer 表。</p>
+<p><strong><code>ir/schedule_graph.py</code></strong>：<code>StepInstance</code> 增 <code>comp_type</code>/<code>fsdp_state</code>；<code>TimelineEntry</code> 增 <code>comp_type</code>；<code>StepGraph.step_type</code> 语义改为 comp_type。</p>
+<h3 id="36-b-iw">3.6 可选扩展：B 图内部逐算子 I/W 归因</h3>
+<p>若需要对 <code>FULL_BACKWARD</code> 模板内部逐算子标注 I 路径/W 路径：在 chunk 捕获期间记录每个 leaf 的 <code>id()</code>——参数 leaf → W 汇聚点，输入 leaf → I 汇聚点。backward 算子产出张量若链路可达参数 leaf 记 <code>"W"</code>、可达输入 leaf 记 <code>"I"</code>、两者皆可达记 <code>"I+W"</code>。实现上需要在 chunk 结束时跑一次轻量反向 BFS（沿 <code>_producer</code> 图从两类 leaf 出发打标），开销 O(单块算子数)。本设计将其列为可选，因为零气泡场景下 I/W 已在模板级天然分离。</p>
+<h3 id="37-chunk-producer-chunk">3.7 chunk 局部 producer 表与跨 chunk 依赖</h3>
+<p>当前 <code>_producer: dict[id(tensor), op_id]</code> 是 step 级全局表。改为 <strong>per-chunk 局部表</strong> <code>_chunk_producer</code>，chunk 结束随模板提交。跨 chunk 的依赖（如 backward 引用 forward 保存的激活、I 块引用 W 块的中间节点）通过<strong>外部 predecessor</strong>表达（<code>step_graph.py:_compute_entry_exit</code> 已支持"前驱不在本图内即视为外部依赖"，见 <code>step_graph.py:17-28</code> 注释），无需跨 chunk 维护全局 id 映射。<code>src_exit_op</code>/<code>dst_entry_op</code> 在 chunk 内反查 <code>comm.*</code> 算子的 producer/consumer 时也用局部表，保证 DataPass 连到正确 chunk 的边界算子。</p>
+<h2 id="4">4. 改动清单（按文件）</h2>
+<table>
+<thead>
+<tr>
+<th>文件</th>
+<th>改动</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>meta_env.py</code></td>
+<td>(1) <code>_pp_context</code> 增 <code>comp_type</code>/<code>fsdp_state</code>/<code>chunk_id</code>；(2) 新增 patch <code>_perform_action</code>（runtime 策略）写 comp_type + 驱动 fsdp 状态机；(3) <code>_patch_pipeline_stage_for_pp_context</code> 的 <code>forward_one_chunk</code>/<code>backward_one_chunk</code> 改用 class_key gating 替换 <code>mb_idx==0</code>，并读 <code>full_backward</code> 区分 B/I；(4) 新增 patch <code>backward_weight_one_chunk</code> 设 <code>comp_type="W"</code>；(5) <code>_patch_comm_layer_context</code> 的 unshard/reshard patch 同步更新 <code>_fsdp_state</code>；(6) <code>_patch_get_stage_indices_for_fake_pg</code> 已建全部 stage，无需改。</td>
+</tr>
+<tr>
+<td><code>capture/dispatch_capture.py</code></td>
+<td>(1) <code>_RawEvent</code> 增 <code>comp_type</code>/<code>fsdp_state</code>/<code>mb_boundary</code>；(2) 把扁平 <code>_events</code> + <code>_capture_l0</code> bool 改为 chunk scope（<code>_begin_chunk</code>/<code>_end_chunk</code> + <code>_chunk_classes_seen</code>），首现捕获、重复 pass-through；(3) <code>build_nodes</code> → 返回 <code>dict[class_key_str, StepGraph]</code>。</td>
+</tr>
+<tr>
+<td><code>capture/step_boundary.py</code></td>
+<td><code>_PHASES</code> 动态化；<code>build_step_graphs</code> 按 <code>(stage, comp_type)</code> 分桶。</td>
+</tr>
+<tr>
+<td><code>capture/comm_events.py</code></td>
+<td>CommEvent 增 <code>comp_type</code>/<code>fsdp_state</code>（从 <code>_pp_context</code> 读），便于 L2 按块连接 DataPass。</td>
+</tr>
+<tr>
+<td><code>capture/schedule_builder.py</code></td>
+<td>StepInstance per <code>(mb, stage, comp_type)</code>；全量 timeline；DataPass 连到具体 StepInstance（带 mb_idx）。</td>
+</tr>
+<tr>
+<td><code>ir/schedule_graph.py</code> / <code>ir/step_graph.py</code></td>
+<td><code>StepInstance</code>/<code>TimelineEntry</code> 增 <code>comp_type</code>/<code>fsdp_state</code>；<code>step_type</code> 语义改 comp_type。</td>
+</tr>
+<tr>
+<td><code>trainer.py</code></td>
+<td><code>run_simulation_step</code> 透传 <code>comp_type</code> 维度；<code>num_micro_batches</code> 已有；导出（CSV/JSON/HTML）按 class_key 多模板输出。</td>
+</tr>
+<tr>
+<td>viz 导出</td>
+<td>per-stage×comp_type 的 L0 CSV 文件名（如 <code>stage0_I_l0_ops.csv</code>、<code>stage0_W_l0_ops.csv</code>）。</td>
+</tr>
+</tbody>
+</table>
+<h2 id="5">5. 效率分析</h2>
+<p>设 <code>S</code> = PP stage 数，<code>M</code> = microbatch 数，<code>C</code> = 单块平均算子数。</p>
+<ul>
+<li><strong>当前</strong>：L0 捕获 ≈ <code>S × C</code>（仅 MB 0 全 stage），但丢失 MB 1+ 的形态差异；timeline 记 <code>S×M</code> 块但无对应 L0。</li>
+<li><strong>朴素全捕</strong>：<code>S × M × C</code>，完整但 <code>M</code> 倍开销。</li>
+<li><strong>本方案</strong>：<code>D × C</code>，其中 <code>D = 不同 class_key 数 ≤ S × {F, B or (I,W), F_RECOMPUTE?} × {SHARDED, UNSHARDED} × {FIRST, STEADY, LAST}</code>。实际 D ≪ S×M（典型 D ≈ S×2~4），与朴素全捕相比降到 <code>D/(S×M) ≈ 2/M ~ 4/M</code>。对 M=4 的 DSV4 约 1/4 ~ 1/2 开销，但换得全量形态。</li>
+</ul>
+<p>L1/L2 装配开销仍 ∝ timeline 事件数（<code>S×M</code>），但这是轻量 dict 操作，远低于 L0 dispatch 拦截开销。</p>
+<h2 id="6">6. 验证方案</h2>
+<ol>
+<li><strong>单元</strong>：构造 fake schedule（CSV 形式 <code>pipeline_parallel_schedule_csv</code>）含 <code>F</code>/<code>I</code>/<code>W</code>/<code>UNSHARD</code>/<code>RESHARD</code> 交错，断言每个 <code>(stage, comp_type)</code> 都产出独立 StepGraph 模板，且 <code>instance_count</code> 之和 = <code>S×M</code>。</li>
+<li><strong>端到端（容器 <code>titan-npu-sim-e2e</code>）</strong>：用 DSV4 <code>ZBVZeroBubble</code> 配置跑一次，检查输出：</li>
+<li><code>ir_export/</code> 下出现 <code>stage{s}_{F|I|W|B}_l0_ops.csv</code>，而非单一 <code>backward</code>；</li>
+<li><code>l1_schedule.csv</code> 每个 MB 的每个计算块都有 comp_type 标注，timeline 行数 ≈ <code>S×M</code>；</li>
+<li>I 模板的 exit 节点 = P2P send 的源（input grad），W 模板不含 P2P send、其 exit 指向 optimizer 入口。</li>
+<li><strong>回归</strong>：<code>GPipe</code>/<code>1F1B</code>（仅 F/B/O）下输出退化为 3 类 × S 模板，与现状等价（仅多了 per-stage 分桶），不破坏既有对照基线。</li>
+</ol>
+              
+            </div>
+          </div><footer>
+    <div class="rst-footer-buttons" role="navigation" aria-label="Footer Navigation">
+        <a href="../optimizer-ops-analysis/" class="btn btn-neutral float-left" title="优化器算子捕获问题分析"><span class="icon icon-circle-arrow-left"></span> Previous</a>
+        <a href="../pp-l2-capture-architecture/" class="btn btn-neutral float-right" title="PP L2 Capture Architecture">Next <span class="icon icon-circle-arrow-right"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <!-- Copyright etc -->
+  </div>
+
+  Built with <a href="https://www.mkdocs.org/">MkDocs</a> using a <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a> provided by <a href="https://readthedocs.org">Read the Docs</a>.
+</footer>
+          
+        </div>
+      </div>
+
+    </section>
+
+  </div>
+
+  <div class="rst-versions" role="note" aria-label="Versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    
+    
+      <span><a href="../optimizer-ops-analysis/" style="color: #fcfcfc">&laquo; Previous</a></span>
+    
+    
+      <span><a href="../pp-l2-capture-architecture/" style="color: #fcfcfc">Next &raquo;</a></span>
+    
+  </span>
+</div>
+    <script src="../../js/jquery-3.6.0.min.js"></script>
+    <script>var base_url = "../..";</script>
+    <script src="../../js/theme_extra.js"></script>
+    <script src="../../js/theme.js"></script>
+    <script>
+        jQuery(function () {
+            SphinxRtdTheme.Navigation.enable(true);
+        });
+    </script>
+
+</body>
+</html>

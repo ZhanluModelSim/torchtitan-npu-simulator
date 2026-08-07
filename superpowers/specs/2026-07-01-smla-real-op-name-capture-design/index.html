@@ -1,0 +1,623 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" >
+<head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+      <link rel="shortcut icon" href="../../../img/favicon.ico" />
+    <title>SMLA 真实算子名捕获 — 架构与方案设计（阶段二：SMLA） - torchtitan-npu</title>
+    <link rel="stylesheet" href="../../../css/theme.css" />
+    <link rel="stylesheet" href="../../../css/theme_extra.css" />
+        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/styles/github.min.css" />
+    
+      <script>
+        // Current page data
+        var mkdocs_page_name = "SMLA \u771f\u5b9e\u7b97\u5b50\u540d\u6355\u83b7 \u2014 \u67b6\u6784\u4e0e\u65b9\u6848\u8bbe\u8ba1\uff08\u9636\u6bb5\u4e8c\uff1aSMLA\uff09";
+        var mkdocs_page_input_path = "superpowers/specs/2026-07-01-smla-real-op-name-capture-design.md";
+        var mkdocs_page_url = null;
+      </script>
+    
+    <!--[if lt IE 9]>
+      <script src="../../../js/html5shiv.min.js"></script>
+    <![endif]-->
+      <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/highlight.min.js"></script>
+      <script>hljs.highlightAll();</script> 
+</head>
+
+<body class="wy-body-for-nav" role="document">
+
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side stickynav">
+    <div class="wy-side-scroll">
+      <div class="wy-side-nav-search">
+          <a href="../../.." class="icon icon-home"> torchtitan-npu
+        </a>
+      </div>
+
+      <div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <ul>
+                <li class="toctree-l1"><a class="reference internal" href="../../..">Home</a>
+                </li>
+              </ul>
+              <ul>
+                <li class="toctree-l1"><a class="reference internal" href="../../../lint_guide/">Lint 指南</a>
+                </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Community</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../community/contributors/">提交者与贡献者（Committers and Contributors）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../community/governance/">社区治理</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../community/versioning_policy/">版本策略</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Design</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/1f1b-schedule-plan-assembly-guide/">1F1B 完整依赖组装与 DES 回放实现指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/alltoall-capture-analysis/">all_to_all 通信捕获缺失分析</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/communication-ownership-contract/">Communication Ownership Contract</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/dualpipev-schedule-plan-consumer-guide/">DualPipeV SchedulePlan 下游接入指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/l2-l3-schedule-plan-design/">L2/L3 调度 IR 重构设计：从扁平 trace 到结构化 SchedulePlan</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/low-precision-sim-analysis/">低精度训练（MXFP8）Simulator 使能分析</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/optimizer-ops-analysis/">优化器算子捕获问题分析</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/pipeline-multi-graph-capture-design/">复杂 Pipeline 策略下完整计算图捕获方案设计</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/pp-l2-capture-architecture/">PP L2 Capture Architecture</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/schedule-capture-design/">L0-L3 IR 层级归属设计</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/schedule-plan-dependency-reconstruction-contract/">SchedulePlan 下游依赖重建契约</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/schedule-plan-des-consumer-guide/">SchedulePlan 依赖重建与 DES 消费指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/simulator-memory-model-design/">Simulator Memory Model 改造设计</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Feature guides</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../feature_guides/checkpoint/">Checkpoint 使用指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../feature_guides/deepseek_v32_mtp/">多Token预测特性(Multi Token Prediction, MTP)</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../feature_guides/low_precision_training/">低精度训练特性（MXFP8）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../feature_guides/metrics_and_debugging/">调试支持特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../feature_guides/model_custom/">Model Custom框架介绍</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../feature_guides/muon_optimizer/">Muon 优化器特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../feature_guides/new_model_onboarding/">新模型接入开发流程</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../feature_guides/npu_fused_ops/">NPU 融合算子适配</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../feature_guides/swap_optimizer/">SwapOptimizer 特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../feature_guides/torch_compile/">torch.compile 支持</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../feature_guides/virtual_optimizer/">Virtual Optimizer - 优化器显存虚拟化特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../feature_guides/vlm/">VLM NPU 支持</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" >Parallelism</a>
+    <ul>
+                <li class="toctree-l2"><a class="reference internal" href="../../../feature_guides/parallelism/custom_cp/">自定义 Context Parallel 特性</a>
+                </li>
+    </ul>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Recipe</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../recipe/sft/">SFT 指令微调</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Superpowers</span></p>
+              <ul class="current">
+                  <li class="toctree-l1"><a class="reference internal" >Plans</a>
+    <ul>
+                <li class="toctree-l2"><a class="reference internal" href="../../plans/2026-07-01-mhc-real-op-name-capture-implementation/">MHC Real-Op-Name Capture Implementation Plan</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../plans/2026-07-01-npu-simulator-implementation/">torchtitan_npu Simulator Implementation Plan</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../plans/2026-07-01-smla-real-op-name-capture-implementation/">SMLA Real-Op-Name Capture Implementation Plan</a>
+                </li>
+    </ul>
+                  </li>
+                  <li class="toctree-l1 current"><a class="reference internal current" >Specs</a>
+    <ul class="current">
+                <li class="toctree-l2"><a class="reference internal" href="../2026-07-01-mhc-real-op-name-capture-design/">MHC 真实算子名捕获 — 架构与方案设计（阶段一：MHC）</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../2026-07-01-npu-simulator-design/">torchtitan_npu Simulator — 架构与方案设计</a>
+                </li>
+                <li class="toctree-l2 current"><a class="reference internal current" href="#">SMLA 真实算子名捕获 — 架构与方案设计（阶段二：SMLA）</a>
+    <ul class="current">
+    <li class="toctree-l3"><a class="reference internal" href="#1">1. 背景与问题</a>
+        <ul>
+    <li class="toctree-l4"><a class="reference internal" href="#11-systematic-debugging">1.1 根因（已用 systematic-debugging 流程确认，非猜测）</a>
+    </li>
+        </ul>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#2-smla">2. 关键约束（与阶段一相同的结论，但需要重新为 SMLA 逐一确认）</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#3-aclnn">3. 命名约定：新增 aclnn.* 前缀</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#4">4. 真实算子名 + 形状目录（逐一核实自源码，非推测）</a>
+        <ul>
+    <li class="toctree-l4"><a class="reference internal" href="#41-sparseattention-simnpusparseattention">4.1 SparseAttention → SimNpuSparseAttention</a>
+    </li>
+    <li class="toctree-l4"><a class="reference internal" href="#42-licompute-simnpulicompute">4.2 LiCompute → SimNpuLiCompute</a>
+    </li>
+    <li class="toctree-l4"><a class="reference internal" href="#43-liloss-simnpuliloss">4.3 LiLoss → SimNpuLiLoss</a>
+    </li>
+        </ul>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#5">5. 架构设计</a>
+        <ul>
+    <li class="toctree-l4"><a class="reference internal" href="#51-mhc">5.1 新增文件（与阶段一 MHC 完全同构的文件组织）</a>
+    </li>
+    <li class="toctree-l4"><a class="reference internal" href="#52-smla_shimpy">5.2 smla_shim.py 设计要点</a>
+    </li>
+    <li class="toctree-l4"><a class="reference internal" href="#53-smla_converterpy">5.3 smla_converter.py 设计要点</a>
+    </li>
+    <li class="toctree-l4"><a class="reference internal" href="#54-simulationtrainer">5.4 集成到 SimulationTrainer</a>
+    </li>
+        </ul>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#6">6. 测试与验证策略（延续阶段一"先小后大"的原则）</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#7">7. 明确不在阶段二范围内</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#8">8. 与用户需求的对应关系</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#9-cann-titan-npu-sim-e2e-mhc">9. 验证结果（全新 CANN 容器 titan-npu-sim-e2e，与 MHC 阶段同一容器）</a>
+    </li>
+    </ul>
+                </li>
+    </ul>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Test guides</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../test_guides/model_acceptance/">新模型最终验收规范（Meta 模拟器）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../test_guides/test_design/">测试设计</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../test_guides/test_guide/">测试使用指南</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">User guides</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../user-guides/deepseek_v4_model_parameters/">DeepSeek-V4 模型参数 Web 字段目录</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../user-guides/installation/">软件安装</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../user-guides/quickstart/">快速上手</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../user-guides/simulator/">Simulator 使用指南</a>
+                  </li>
+              </ul>
+      </div>
+    </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap">
+      <nav class="wy-nav-top" role="navigation" aria-label="Mobile navigation menu">
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../..">torchtitan-npu</a>
+        
+      </nav>
+      <div class="wy-nav-content">
+        <div class="rst-content"><div role="navigation" aria-label="breadcrumbs navigation">
+  <ul class="wy-breadcrumbs">
+    <li><a href="../../.." class="icon icon-home" aria-label="Docs"></a></li>
+          <li class="breadcrumb-item">Superpowers</li>
+          <li class="breadcrumb-item">Specs</li>
+      <li class="breadcrumb-item active">SMLA 真实算子名捕获 — 架构与方案设计（阶段二：SMLA）</li>
+    <li class="wy-breadcrumbs-aside">
+    </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+            <div class="section" itemprop="articleBody">
+              
+                <h1 id="smla-smla">SMLA 真实算子名捕获 — 架构与方案设计（阶段二：SMLA）</h1>
+<h2 id="1">1. 背景与问题</h2>
+<p><code>docs/superpowers/specs/2026-07-01-mhc-real-op-name-capture-design.md</code>（阶段一：MHC）完成并
+通过真实容器验收后，用户在审阅 61 层验收结果时发现：<strong>捕获图中 attention 相关计算显示为原始
+分解的 aten 小算子</strong>（<code>matmul</code>/<code>softmax</code>/<code>einsum</code>/<code>topk</code>/<code>scatter_</code>/<code>cat</code> 等），而不是融合后的
+NPU sparse attention / lightning-indexer 算子。</p>
+<h3 id="11-systematic-debugging">1.1 根因（已用 systematic-debugging 流程确认，非猜测）</h3>
+<ul>
+<li><code>torchtitan_npu/simulator/trainer.py:77</code>：<code>_HARDWARE_DEPENDENT_CONVERTER_NAMES =
+  frozenset({"npu_smla"})</code>——<code>npu_smla</code> 转换器目前仍被整体剥离，这是阶段一（MHC）设计文档
+  §6 明确记录、有意推迟到"阶段二"的范围外项。</li>
+<li><code>npu_smla</code> 在验收配置的 <code>_default_converters()</code> 中确实启用
+  （<code>torchtitan_npu/models/deepseek_v4/config_registry.py:41,52</code>）。</li>
+<li>剥离后，<code>SparseAttention</code>/<code>LiCompute</code> 落回转换前的 base 类（<code>torchtitan_npu/models/
+  deepseek_v4/model.py:455-523</code>、<code>526-556</code>）。这两个 base 类是<strong>手工分解实现</strong>：
+  <code>SparseAttention.forward</code> 用 <code>matmul</code>+<code>scatter_</code>+<code>cat</code>+<code>softmax</code>+<code>matmul</code> 手搓 attention；
+  <code>LiCompute.forward</code> 用 <code>einsum</code>+<code>relu_</code>+<code>topk</code> 手搓 lightning-indexer 打分。完全不调用任何
+  融合 kernel。</li>
+<li>捕获机制本身没有问题——<code>TorchDispatchMode</code> 忠实记录了实际执行的每个算子；问题在于实际执行
+  的就是这套手工分解实现，而不是真实生产环境会跑的 <code>torch_npu</code> 融合算子。</li>
+</ul>
+<p>本文档设计<strong>阶段二</strong>的修复：把 <code>npu_smla</code> 从"整体剥离"改为"影子记录"（与阶段一 MHC 完全
+同构的模式），覆盖 <code>SparseAttention</code>、<code>LiCompute</code>、<code>LiLoss</code> 三个子模块。</p>
+<h2 id="2-smla">2. 关键约束（与阶段一相同的结论，但需要重新为 SMLA 逐一确认）</h2>
+<ul>
+<li><code>get_npu_device_type()</code> 在仿真环境下恒为 <code>"UNKNOWN"</code>（<code>_MetaDeviceModule.get_device_name()</code>
+  返回 <code>"Meta_Simulator"</code>，不匹配任何 marker），所以 <code>NpuSMLAConverter.convert()</code> 里
+  <code>use_smla_kernel = get_npu_device_type() == "A5"</code> 恒为 <code>False</code>——非 A5 分支才是仿真环境下
+  会被选中的路径。</li>
+<li>非 A5 分支的三个真实算子（<code>sparse_attn_sharedkv</code>、<code>lightning_indexer</code>、
+  <code>sparse_lightning_indexer_grad_kl_loss</code>）都是通过 <code>build_op(...)</code> 在<strong>运行时 JIT 编译</strong>的
+  本地 ACLNN 自定义算子扩展（<code>torchtitan_npu/ops/aclnn/*/binding.cpp</code>，用 <code>ACLNN_CMD</code> 宏调用
+  真实 NPU 算子库）——已确认这些扩展绑定为 <code>_sas_op</code>/<code>_li_op</code>/<code>_kl_op</code> 三个模块级全局变量
+  （<code>npu_smla.py:41</code>），既不经过 PyTorch dispatcher，也无法在 meta tensor 上运行（真正调用会
+  尝试编译+链接+执行真实 ACLNN 算子，需要真实 NPU 硬件与工具链）。</li>
+<li>A5 融合路径同样不可达：<code>NpuSMLAConverter.convert_smla_kernel()</code>（A5 分支）需要
+  <code>importlib.import_module("custom_ops")</code>——这个私有包在任何环境下都确认不可得（与阶段一
+  MHC 的结论完全一致）。</li>
+</ul>
+<p><strong>结论</strong>：与阶段一完全相同——两条路径都无法真正执行，唯一现实的做法是"影子记录"：不跑真实
+kernel，只按真实算子名 + 解析出的形状公式，向捕获流里手工登记 <code>OpNode</code>。<strong>阶段二只覆盖非 A5
+目标</strong>（与阶段一保持一致的范围限定）。</p>
+<h2 id="3-aclnn">3. 命名约定：新增 <code>aclnn.*</code> 前缀</h2>
+<p>阶段一 MHC 的合成算子用 <code>triton.*</code> 前缀（真实是 <code>@triton.jit</code> 内核）。SMLA 的三个真实算子
+是 <code>ACLNN_CMD</code> 宏构建的 ACLNN 自定义算子（已读取 <code>torchtitan_npu/ops/aclnn/*/binding.cpp</code>
+源码确认，非 Triton），用 <code>aclnn.</code> 前缀更准确地反映其真实技术形态，同时与 <code>triton.*</code>/
+<code>npu.*</code>（真实 dispatcher 算子）/<code>aten.*</code> 保持并列、互不混淆的命名体系。</p>
+<h2 id="4">4. 真实算子名 + 形状目录（逐一核实自源码，非推测）</h2>
+<h3 id="41-sparseattention-simnpusparseattention">4.1 <code>SparseAttention</code> → <code>SimNpuSparseAttention</code></h3>
+<p>固定的公开契约（<code>SparseAttention.__init__</code>/<code>forward</code>，<code>model.py:455-523</code>，任何转换后的类都
+必须保持这个 I/O 形状不变）：</p>
+<pre><code>输入: query_states[B,S,N,D], kv_states[B,S,D], attn_sink[N],
+      kv_compress[B,S//R,D]|None, compress_topk_idxs[B,S,K]|None
+输出: attn_output[B,S,N,D]
+</code></pre>
+<p>（<code>N</code>=<code>n_heads</code>, <code>D</code>=<code>head_dim</code>, <code>R</code>=<code>compress_ratios[layer_id]</code> ∈ {1,4,128}, <code>K</code>=<code>index_topk</code>）</p>
+<p>真实调用链（<code>NpuSparseAttention.forward</code> → <code>npu_sparse_attn_shared_kv</code> wrapper →
+<code>SparseAttnSharedKV(torch.autograd.Function)</code>，<code>npu_smla.py:1330-1359</code>、<code>537-588</code>、
+<code>378-534</code>）：</p>
+<table>
+<thead>
+<tr>
+<th>步骤</th>
+<th>真实算子名（<code>raw_op_type</code>）</th>
+<th>触发时机</th>
+<th>输入</th>
+<th>输出</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>A</td>
+<td><code>aclnn.npu_sparse_attn_sharedkv_metadata</code></td>
+<td>forward</td>
+<td>5 个占位张量 + 标量（<code>num_heads_q=N</code> 等，仅用于确定 metadata 内容，值不影响下游 shape）</td>
+<td><code>metadata:[1024]</code> int32</td>
+</tr>
+<tr>
+<td>B</td>
+<td><code>aclnn.npu_sparse_attn_sharedkv</code></td>
+<td>forward</td>
+<td><code>query:[B,S,N,D]</code> bf16, <code>ori_kv:[B,S,1,D]</code> bf16（<code>kv_states.unsqueeze(2)</code>）, <code>cmp_kv:[B,S//R,1,D]</code>|None bf16, <code>cmp_sparse_indices:[B,S,1,K]</code>|None int32, <code>sinks:[N]</code> fp32, <code>metadata:[1024]</code> int32</td>
+<td><code>result:[B,S,N,D]</code> bf16, <code>softmax_lse:[B,S,N,1]</code> fp32</td>
+</tr>
+<tr>
+<td>C（bwd）</td>
+<td><code>aclnn.npu_sparse_attn_sharedkv_grad</code></td>
+<td>backward</td>
+<td><code>query/ori_kv/cmp_kv/result/softmax_lse</code>（同 fwd 形状）+ <code>grad_output:[B,S,N,D]</code></td>
+<td><code>dquery:[B,S,N,D]</code>, <code>dori_kv:[B,S,1,D]</code>, <code>dcmp_kv:[B,S//R,1,D]</code>|空张量（<code>R==1</code> 时）, <code>dsinks:[N]</code></td>
+</tr>
+</tbody>
+</table>
+<p>形状来源（已逐行核对 <code>torchtitan_npu/ops/aclnn/sparse_attn_sharedkv/binding.cpp</code>）：
+<code>attnOutput = at::empty(query.sizes(), ...)</code>（第 42 行）、<code>lse_sizes.back()=1</code>（第 45-47
+行）、<code>metadata = at::empty(1024, ...)</code>（第 20 行）、<code>dQuery/dOriKv/dSinks = at::empty(
+query/oriKv/sinks.sizes(), ...)</code>（第 70-72 行）、<code>dCmpKv</code> 仅当 <code>cmpRatio &gt; 1</code> 时才
+<code>at::empty(cmpKv.sizes(), ...)</code>，否则是未定义的空 <code>at::Tensor()</code>（第 74-78 行）。</p>
+<p><strong><code>R</code> 的三种取值处理</strong>（<code>NpuSparseAttention.forward</code> 第 1355 行：
+<code>cmp_sparse_indices=compress_topk_idxs if self.compress_ratio == 4 else None</code>）：
+- <code>R=4</code>：<code>cmp_kv:[B,S//4,1,D]</code>, <code>cmp_sparse_indices:[B,S,1,K]</code>, <code>topk=K</code>。
+- <code>R=128</code>：<code>cmp_kv:[B,S//128,1,D]</code>, <code>cmp_sparse_indices=None</code>, <code>topk=0</code>。
+- <code>R=1</code>：<code>cmp_kv=None</code>, <code>cmp_sparse_indices=None</code>, <code>topk=0</code>。</p>
+<p><code>SparseAttnSharedKV.backward</code> 的返回值有 24 个位置（对应 24 个 forward 位置参数），shim 只
+需要在 <code>query</code>/<code>ori_kv</code>/<code>cmp_kv</code>（视 R 而定）/<code>sinks</code> 对应位置返回正确形状的梯度，其余（标量
+参数、<code>cu_seq_lens_*</code>、<code>ori_sparse_indices</code> 等）返回 <code>None</code>。</p>
+<h3 id="42-licompute-simnpulicompute">4.2 <code>LiCompute</code> → <code>SimNpuLiCompute</code></h3>
+<p>固定的公开契约（<code>LiCompute.__init__</code>/<code>forward</code>，<code>model.py:526-556</code>）：</p>
+<pre><code>输入: q_indexer[B,S,N_i,D_i], k_indexer[B,S//4,D_i], weights[B,S,N_i], seqlen:int, offset:int
+输出: compress_topk_idxs[B,S,K] int32, index_score[B,S,K]
+</code></pre>
+<p>（<code>N_i</code>=<code>index_n_heads</code>, <code>D_i</code>=<code>index_head_dim</code>；<code>LiCompute</code>/<code>LiLoss</code> 只在 <code>R==4</code> 的层存在，
+<code>InnerAttention.__init__</code> 里用 <code>if self.compress_ratio == 4:</code> 判断，<code>model.py:682-691</code>）</p>
+<p>真实调用（<code>NpuLiCompute.forward</code>，<code>npu_smla.py:1362-1406</code>）：</p>
+<table>
+<thead>
+<tr>
+<th>步骤</th>
+<th>真实算子名</th>
+<th>输入</th>
+<th>输出</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>D</td>
+<td><code>aclnn.npu_lightning_indexer</code></td>
+<td><code>query:[B,S,N_i,D_i]</code> bf16, <code>key:[B,S//4,1,D_i]</code> bf16（<code>k_indexer.unsqueeze(2)</code>）, <code>weights:[B,S,N_i]</code> bf16</td>
+<td><code>sparse_indices:[B,S,1,K]</code> int32, <code>sparse_values:[B,S,1,K]</code> bf16 → 两者各自 <code>.squeeze(2)</code> 得到 <code>[B,S,K]</code></td>
+</tr>
+</tbody>
+</table>
+<p>形状来源（<code>torchtitan_npu/ops/aclnn/lightning_indexer/binding.cpp:19-26</code>）：
+<code>sparse_indices/sparse_values = at::empty({B, S1, N2=1, sparse_count=K}, ...)</code>。</p>
+<p><strong>关键复杂点</strong>：<code>NpuLiCompute.forward</code>（非 A5）<strong>直接调用 <code>_li_op.npu_lightning_indexer(...)</code>，
+没有 <code>torch.autograd.Function</code> 包装</strong>（对照 A5 路径的 <code>LightningIndexer(torch.autograd.
+Function)</code> 有显式 <code>backward</code>，<code>npu_smla.py:1036-1095</code>）。这不会导致真实训练崩溃，因为：
+<code>compress_topk_idxs</code> 是 int32（本就无梯度）；<code>index_score</code> 的梯度实际经由<strong>独立的</strong> <code>LiLoss</code>
+通道流动（<code>InnerAttention.forward</code> 把 <code>q</code>/<code>kv</code>/<code>kv_compress</code> <code>.detach()</code> 后传给
+<code>li_loss</code>，<code>model.py:714-726</code>）。<strong>shim 里必须自己包一层 <code>torch.autograd.Function</code></strong>（真实
+实现没有，但仿真需要它来维持梯度图连通性、以及 backward 阶段 phase 标记的一致性——与阶段一
+<code>SimHcHead</code> 面对"真实实现没有独立反向"时的处理原则相同），backward 对两个输出均返回
+<code>None</code>（镜像 A5 路径 <code>LightningIndexer.backward</code> 返回 <code>_none_grads(4)</code> 的行为）。</p>
+<h3 id="43-liloss-simnpuliloss">4.3 <code>LiLoss</code> → <code>SimNpuLiLoss</code></h3>
+<p>固定的公开契约（<code>LiLoss.forward</code>，<code>model.py:308-337</code>；<code>NpuLiLoss.forward</code> 参数顺序，
+<code>npu_smla.py:1545</code>）：</p>
+<pre><code>输入: q[B,S,N,D](detached), kv[B,S,D](detached), kv_compress[B,S//4,D](detached),
+      attn_sink[N](未使用), q_indexer[B,S,N_i,D_i], k_indexer[B,S//4,D_i],
+      weights[B,S,N_i], sparse_indices[B,S,K], indexer_score[B,S,K](未使用),
+      attention_masks(未使用), offset:int(未使用)
+输出: loss（标量 fp32）
+</code></pre>
+<p>真实调用链是"延迟计算"模式（<code>NpuLiLoss.forward</code> → <code>npu_sparse_lightning_indexer_grad_kl_loss</code>
+→ <code>SparseLightningIndexerGradKLLossWrapper(torch.autograd.Function)</code>，<code>npu_smla.py:1545-1573</code>、
+<code>1499-1531</code>、<code>1409-1495</code>）：</p>
+<table>
+<thead>
+<tr>
+<th>步骤</th>
+<th>真实算子名</th>
+<th>触发时机</th>
+<th>输入</th>
+<th>输出</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>（无）</td>
+<td>无真实调用</td>
+<td>forward</td>
+<td>—</td>
+<td><code>loss = torch.zeros(1,...)[0]</code>（<strong>forward 本身不发起任何硬件调用</strong>，只是 <code>ctx.save_for_backward</code> 保存张量供 backward 用）</td>
+</tr>
+<tr>
+<td>E</td>
+<td><code>aclnn.npu_sparse_lightning_indexer_grad_kl_loss</code></td>
+<td>backward</td>
+<td><code>query:[B,S,N,D]</code>, <code>key:[B,S//4,1,D]</code>（<code>kv_compress.unsqueeze(2)</code>）, <code>query_index:[B,S,N_i,D_i]</code>, <code>key_index:[B,S//4,1,D_i]</code>（<code>k_indexer.unsqueeze(2)</code>）, <code>weight:[B,S,N_i]</code>, <code>sparse_indices:[B,S,1,K]</code>（<code>.unsqueeze(2)</code>）</td>
+<td><code>d_query_index:[B,S,N_i,D_i]</code>, <code>d_key_index:[B,S//4,1,D_i]</code>, <code>d_weight:[B,S,N_i]</code>, <code>loss:[1]</code> fp32</td>
+</tr>
+</tbody>
+</table>
+<p>形状来源（<code>torchtitan_npu/ops/aclnn/sparse_lightning_indexer_grad_kl_loss/binding.cpp:23-26</code>）：
+<code>d_query_index/d_key_index/d_weight = at::zeros(query_index/key_index/weight.sizes(), ...)</code>，
+<code>loss = at::zeros({1}, ...)</code>。</p>
+<p><code>SparseLightningIndexerGradKLLossWrapper.backward</code> 返回 14 个位置的梯度：<code>query</code>/<code>key</code>
+（detached，梯度为 <code>None</code>）、<code>d_query_index</code>/<code>d_key_index</code>/<code>d_weights</code>（真实梯度）、
+<code>sparse_indices</code>（int32，<code>None</code>）、其余 8 个标量参数（<code>None</code>）。</p>
+<p><strong>与现有 <code>meta_env._patch_li_loss_to_skip_buggy_einsum</code> 的关系</strong>：该 patch 打在
+<code>LiLoss.forward</code>（base 类方法）上，用来绕过 base 类 <code>_current_selected_attn_dist</code> 的一个真实
+预置 shape bug（从未在真实生产触发，因为生产环境永远用 <code>NpuLiLoss</code>）。<code>SimNpuLiLoss</code> 继承
+<code>LiLoss</code> 但<strong>自己定义 <code>forward</code></strong>——Python MRO 规则下，<code>SimNpuLiLoss</code> 实例调用 <code>.forward()</code>
+永远解析到 <code>SimNpuLiLoss.forward</code>，<code>LiLoss.forward</code> 上的 patch 因此自然变得不可达，
+<strong>不需要对 <code>meta_env.py</code> 做任何修改</strong>（不需要撤销该 patch，也不会和它冲突——两者面向不同的
+类方法，MRO 保证不会同时生效）。</p>
+<h2 id="5">5. 架构设计</h2>
+<h3 id="51-mhc">5.1 新增文件（与阶段一 MHC 完全同构的文件组织）</h3>
+<pre><code>torchtitan_npu/simulator/hardware_shims/
+├── smla_shim.py        # 新增：SimNpuSparseAttention / SimNpuLiCompute / SimNpuLiLoss
+└── smla_converter.py    # 新增：SimSMLAConverter + apply_smla_shims()/unapply_smla_shims()
+</code></pre>
+<p>不改动任何生产代码文件（<code>converters/kernels/npu_smla.py</code>、<code>models/deepseek_v4/model.py</code>、
+<code>ops/aclnn/*/binding.cpp</code> 保持字节不变），延续本项目"纯侧载新增文件"的约定。</p>
+<h3 id="52-smla_shimpy">5.2 <code>smla_shim.py</code> 设计要点</h3>
+<ul>
+<li><code>SimNpuSparseAttention(SparseAttention)</code>：<code>__init__(self, parent)</code> 用
+  <code>self.__dict__.update(parent.__dict__)</code>（与阶段一所有 shim 类一致的模式，同时也是
+  <code>torchtitan</code> <code>verify_module_protocol()</code> 要求的继承方式——继承 base 类才能满足
+  <code>isinstance(mod, Module)</code> 检查，这是阶段一容器验证踩过的坑，这次直接在设计里避免）。
+  <code>forward</code> 委托给 <code>_SimSparseAttnFn(torch.autograd.Function)</code>，登记步骤 A/B（forward）、
+  C（backward）三个合成节点。</li>
+<li><code>SimNpuLiCompute(LiCompute)</code>：同样继承 + <code>__dict__.update</code>。<code>forward</code> 委托给
+  <code>_SimLightningIndexerFn(torch.autograd.Function)</code>（<strong>阶段二新增的壳，真实实现没有对应的
+  autograd.Function</strong>），forward 登记步骤 D，backward 对两个输出返回 <code>None</code>（无合成节点可
+  登记，因为真实非 A5 路径这里确实没有反向 kernal）。</li>
+<li><code>SimNpuLiLoss(LiLoss)</code>：<code>forward</code> 直接返回 <code>torch.zeros((), device=q.device,
+  dtype=torch.float32)</code>（不经过任何 <code>torch.autograd.Function</code>——<strong>镜像真实
+  <code>SparseLightningIndexerGradKLLossWrapper.forward</code> 本身就不发起硬件调用</strong>这一事实），但用一个
+  专门的 <code>_SimLiLossFn(torch.autograd.Function)</code> 包装，使得只有当 loss 真正参与
+  <code>.backward()</code> 时才登记步骤 E 的合成节点（对应真实"延迟计算"语义：真实 kernel 只在反向触发）。</li>
+<li>所有形状构造统一复用阶段一已验证的 <code>_record</code>/<code>_empty_like_shape</code> 风格 helper（在
+  <code>smla_shim.py</code> 内重新定义一份，保持 <code>hardware_shims</code> 包内每个 shim 模块自成一体、不产生
+  跨模块隐式依赖——与 <code>mhc_shim.py</code> 让 <code>mhc_converter.py</code>、而非其他 shim 模块，作为唯一的
+  跨文件依赖点的组织方式一致）。</li>
+</ul>
+<h3 id="53-smla_converterpy">5.3 <code>smla_converter.py</code> 设计要点</h3>
+<pre><code class="language-python">class SimSMLAConverter(ModelCustomConverter):
+    &quot;&quot;&quot;Replaces every SparseAttention/LiCompute/LiLoss submodule with the
+    corresponding Sim* shim -- never selects the real fused (A5) or
+    JIT-compiled (non-A5) implementation (see design doc §2: neither path
+    can execute under simulation).&quot;&quot;&quot;
+
+    def convert(self, model: nn.Module) -&gt; None:
+        for name, module in list(model.named_modules()):
+            if isinstance(module, SparseAttention):
+                replace_module_with_name(model, name, SimNpuSparseAttention(module))
+            if isinstance(module, LiCompute):
+                replace_module_with_name(model, name, SimNpuLiCompute(module))
+            if isinstance(module, LiLoss):
+                replace_module_with_name(model, name, SimNpuLiLoss(module))
+
+
+def apply_smla_shims() -&gt; None:
+    &quot;&quot;&quot;Patch NpuSMLAModelConfig.model_converter to point at SimSMLAConverter.
+    Reversible via unapply_smla_shims(). Mirrors apply_mhc_shims() exactly.&quot;&quot;&quot;
+    ...
+
+def unapply_smla_shims() -&gt; None:
+    ...
+</code></pre>
+<p>可逆类属性 patch 机制与阶段一 <code>apply_mhc_shims()</code>/<code>unapply_mhc_shims()</code> 完全同构（记录原值、
+patch、对称恢复），patch 目标是已注册的 <code>NpuSMLAModelConfig.model_converter</code>（<code>npu_smla.py</code>
+里 <code>@register_model_converter("npu_smla")</code> 装饰的类，<code>:1639-1640</code>）。</p>
+<h3 id="54-simulationtrainer">5.4 集成到 <code>SimulationTrainer</code></h3>
+<p><code>trainer.py</code> 改动：
+1. 新增 <code>from torchtitan_npu.simulator.hardware_shims.smla_converter import apply_smla_shims</code>
+   导入（按字母序插入现有 <code>hardware_shims</code>/<code>ir</code>/<code>meta_env</code> 导入块）。
+2. <code>_HARDWARE_DEPENDENT_CONVERTER_NAMES</code> 从 <code>frozenset({"npu_smla"})</code> 收窄为
+   <strong><code>frozenset()</code>（空集）</strong>——不再需要剥离任何转换器。保留 <code>_strip_hardware_dependent_
+   model_converters</code> 函数本身（不删除，YAGNI 但保留通用机制以备将来需要），只是这次调用时
+   传入的名单为空、实际不做任何过滤。
+3. <code>SimulationTrainer.__init__</code> 里 <code>apply_mhc_shims()</code> 调用之后（顺序不敏感，两者互不干扰，
+   替换的是不同的转换器名）新增 <code>apply_smla_shims()</code> 调用，同样在
+   <code>_strip_hardware_dependent_model_converters(config)</code> 之前。</p>
+<h2 id="6">6. 测试与验证策略（延续阶段一"先小后大"的原则）</h2>
+<ol>
+<li><strong>单元测试（纯 Python，构造真实 <code>SparseAttention</code>/<code>LiCompute</code>/<code>LiLoss</code> parent 实例）</strong>：</li>
+<li>与阶段一相同的已知限制：本沙盒无法导入 <code>torchtitan_npu.models.deepseek_v4.model</code>
+     （沙盒内 <code>torchtitan</code> 非精确 pinned commit，<code>TokenReorderer</code> 缺失，与阶段一记录的限制
+     同一根因），这几个测试预期在沙盒里失败、在真实 CANN 容器里通过。</li>
+<li><code>SimNpuSparseAttention</code>：断言 <code>forward</code> 输出 shape 与 §4.1 一致；断言
+     <code>record_synthetic_op</code> 记录了 <code>aclnn.npu_sparse_attn_sharedkv_metadata</code>/
+     <code>aclnn.npu_sparse_attn_sharedkv</code>（forward 阶段）与 <code>aclnn.npu_sparse_attn_sharedkv_grad</code>
+     （backward 阶段，且仅在 backward 阶段）；断言反向梯度正确传播到 <code>query_states</code>/
+     <code>kv_states</code>/<code>attn_sink</code>（<code>kv_compress</code>、<code>compress_topk_idxs</code> 视 R 而定）。</li>
+<li><code>SimNpuLiCompute</code>：断言输出 shape；断言记录 <code>aclnn.npu_lightning_indexer</code>；断言反向对
+     <code>q_indexer</code>/<code>k_indexer</code>/<code>weights</code> 返回 <code>None</code> 梯度不报错（即调用
+     <code>.sum().backward()</code> 时若 <code>compress_topk_idxs</code>/<code>index_score</code> 参与了计算图，梯度正确
+     终止在这里而不传播，同时不抛异常）。</li>
+<li><code>SimNpuLiLoss</code>：断言 forward 直接返回标量 0、不登记任何合成节点；断言只有真正调用
+     <code>.backward()</code> 时才登记 <code>aclnn.npu_sparse_lightning_indexer_grad_kl_loss</code>，且反向梯度
+     正确传播到 <code>q_indexer</code>/<code>k_indexer</code>/<code>weights</code>（<code>q</code>/<code>kv</code>/<code>kv_compress</code> 因为是 detached
+     输入，梯度应为 <code>None</code>，与真实实现一致）。</li>
+<li><strong>容器内小规模 spike</strong>：先只验证 <code>SimNpuSparseAttention</code>（形状最简单、独立于 R 分支）跑通
+   （构造一个 <code>R=1</code> 的最小配置），确认 <code>trace.html</code>/<code>compute_graph.dot</code> 里出现
+   <code>aclnn.npu_sparse_attn_sharedkv</code>/<code>aclnn.npu_sparse_attn_sharedkv_grad</code> 节点。</li>
+<li><strong>扩展到全部三个类</strong> + <code>R=4</code>（含 LiCompute/LiLoss）分支后，重跑 16 层冒烟 + 61 层验收，
+   确认：</li>
+<li>exit code 0，四个产出文件正常生成。</li>
+<li><code>compute_graph.dot</code>/<code>summary.txt</code> 中出现全部 5 个 <code>aclnn.*</code> 合成算子名，且不再出现
+     base <code>SparseAttention</code>/<code>LiCompute</code> 特有的算子序列（如 <code>aten.topk.default</code>——除非其他
+     地方也用到 topk，需要具体核实是否消失或只是数量减少）。</li>
+<li>forward/backward/optimizer 节点总数、通信统计与阶段二修改前保持同一数量级（SMLA 只占
+     整个 61 层模型的一部分子模块）。</li>
+</ol>
+<h2 id="7">7. 明确不在阶段二范围内</h2>
+<ul>
+<li><strong>A5 目标的真实形状公式</strong>：与阶段一 MHC 相同的推迟理由——A5 路径需要不可得的 <code>custom_ops</code>
+  私有包，<code>target_npu_device_type="A5"</code> 场景下这几个 shim 会记录 warning 并退化为非 A5
+  命名，等确有需要时再补充。</li>
+<li><strong><code>SMLAMetadataCache</code>/<code>attention_masks</code> 相关的 A5 专属机制</strong>：非 A5 路径完全不依赖它们
+  （已在 §2/§4 确认），本阶段不涉及。</li>
+</ul>
+<h2 id="8">8. 与用户需求的对应关系</h2>
+<ul>
+<li>"为什么 attention 算子是原始小算子而非融合后的 sparse attention"：本设计让
+  <code>SparseAttention</code>/<code>LiCompute</code>/<code>LiLoss</code> 相关节点的 <code>raw_op_type</code> 与生产环境真实调用的
+  ACLNN 算子名（<code>aclnn.npu_sparse_attn_sharedkv</code> 等）保持一致，不再依赖"剥离转换器、退化成
+  手工分解实现"的近似。</li>
+<li>不需要真实 NPU 硬件、不做真实内存分配：<code>record_synthetic_op</code> 全程只用
+  <code>torch.empty(..., device="meta")</code>/<code>torch.zeros(..., device="meta")</code> 构造影子输出，不调用
+  任何真实 ACLNN 扩展。</li>
+</ul>
+<h2 id="9-cann-titan-npu-sim-e2e-mhc">9. 验证结果（全新 CANN 容器 <code>titan-npu-sim-e2e</code>，与 MHC 阶段同一容器）</h2>
+<p>实施阶段通过 subagent-driven-development 按 7 个任务逐一实现 + review，<strong>全部 5 个任务的
+implementer + reviewer 均一次通过（零 Critical/Important 发现）</strong>——与 MHC 阶段（发现 3 个
+真实 bug）相比，本阶段得益于更充分的前期源码核实（Task 1-4 全部逐行核对了真实 <code>.cpp</code> binding
+文件），实现质量显著更高。</p>
+<p><strong>16 层冒烟</strong>（<code>deepseek_v4_pro_simulate_16_layers</code>，<code>--training.steps=1</code>）：<code>EXIT_CODE=0</code>，
+<strong>第一次运行即完全成功</strong>（未发现任何需要修复的 bug）。<code>compute_graph.dot</code> 中 5 个真实 ACLNN
+算子名全部出现：<code>aclnn.npu_sparse_attn_sharedkv</code>(34)、
+<code>aclnn.npu_sparse_attn_sharedkv_metadata</code>(34)、<code>aclnn.npu_sparse_attn_sharedkv_grad</code>(17)、
+<code>aclnn.npu_lightning_indexer</code>(14)、<code>aclnn.npu_sparse_lightning_indexer_grad_kl_loss</code>(7)。
+<code>summary.txt</code> 的"Unrecognized op types"列表中 <code>aten.einsum.default</code>（此前 base <code>LiCompute</code>
+手工实现的标志性算子）<strong>完全消失</strong>；<code>aten.topk.default</code> 仍有 1 处，经核实与 SMLA 无关（MoE
+路由分发逻辑的 topk，非 LiCompute 的）。forward/backward/optimizer 节点数
+（8150/18057/1090）、通信统计与阶段一（MHC）修改后保持同一数量级，<code>is_acyclic=True</code>。</p>
+<p><strong>61 层/384 die 验收目标</strong>（<code>deepseek_v4_pro_simulate_61_layers</code>）：<code>EXIT_CODE=0</code>（约 8 分钟）。
+关键结果：
+- <code>RankTable</code>：<code>world_size=384</code>（<code>dp_degree=384</code>），<code>tp_degree=pp_degree=1</code>——与验收目标、以及
+  MHC 阶段的结果完全一致，SMLA shim 不影响并行拓扑。
+- 真实算子名验证：<code>compute_graph.dot</code> 中 5 个 <code>aclnn.*</code> 算子全部出现，且按层数比例放大（相对
+  16 层的 34/34/17/14/7，61 层为 124/124/62/60/30，约 61/16≈3.8 倍，与层数缩放关系一致）。
+- <code>summary.txt</code> 的"Unrecognized op types"（97 项）正确包含 3 个 <code>aclnn.*</code> 合成算子名（预期
+  行为：不在 <code>OP_MAPPING</code>/cost model 覆盖范围内，成本估算标记"未知"，但真实算子名本身已正确
+  捕获并可见）。
+- forward/backward/optimizer 节点数：30557/66687/3931（相对 MHC 阶段修改后的
+  34250/68398/3571 保持同一数量级）；<code>is_acyclic=True</code>；通信统计
+  （<code>allgather</code>/<code>allreduce</code>/<code>reduce_scatter</code>）与之前保持同一数量级。
+- 四个产出文件（<code>simulation_result.json</code> ~8.8GB、<code>compute_graph.dot</code>、<code>summary.txt</code>、
+  <code>trace.html</code>）全部正确生成。</p>
+<p><strong>结论</strong>：阶段二（SMLA 真实算子名捕获）目标完全达成并通过真实容器验证。至此，MHC（阶段一）
++ SMLA（阶段二）两个用户报告的"融合算子未正确捕获"问题均已闭环：捕获图中不再有任何模块因
+硬件依赖被整体剥离退化为不同实现，<code>_HARDWARE_DEPENDENT_CONVERTER_NAMES</code> 已收窄为空集。A5
+目标形状公式仍按 §7 保持未实现状态，留待后续任务（当前无已知业务需求）。</p>
+              
+            </div>
+          </div><footer>
+    <div class="rst-footer-buttons" role="navigation" aria-label="Footer Navigation">
+        <a href="../2026-07-01-npu-simulator-design/" class="btn btn-neutral float-left" title="torchtitan_npu Simulator — 架构与方案设计"><span class="icon icon-circle-arrow-left"></span> Previous</a>
+        <a href="../../../test_guides/model_acceptance/" class="btn btn-neutral float-right" title="新模型最终验收规范（Meta 模拟器）">Next <span class="icon icon-circle-arrow-right"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <!-- Copyright etc -->
+  </div>
+
+  Built with <a href="https://www.mkdocs.org/">MkDocs</a> using a <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a> provided by <a href="https://readthedocs.org">Read the Docs</a>.
+</footer>
+          
+        </div>
+      </div>
+
+    </section>
+
+  </div>
+
+  <div class="rst-versions" role="note" aria-label="Versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    
+    
+      <span><a href="../2026-07-01-npu-simulator-design/" style="color: #fcfcfc">&laquo; Previous</a></span>
+    
+    
+      <span><a href="../../../test_guides/model_acceptance/" style="color: #fcfcfc">Next &raquo;</a></span>
+    
+  </span>
+</div>
+    <script src="../../../js/jquery-3.6.0.min.js"></script>
+    <script>var base_url = "../../..";</script>
+    <script src="../../../js/theme_extra.js"></script>
+    <script src="../../../js/theme.js"></script>
+    <script>
+        jQuery(function () {
+            SphinxRtdTheme.Navigation.enable(true);
+        });
+    </script>
+
+</body>
+</html>

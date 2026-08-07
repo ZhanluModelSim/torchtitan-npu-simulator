@@ -38,7 +38,7 @@
               <ul class="current">
                 <li class="toctree-l1 current"><a class="reference internal current" href="#">Home</a>
     <ul class="current">
-    <li class="toctree-l2"><a class="reference internal" href="#torchtitan">基于 torchtitan 的昇腾全流程大模型训练适配插件</a>
+    <li class="toctree-l2"><a class="reference internal" href="#_2">社群</a>
     </li>
     </ul>
                 </li>
@@ -56,13 +56,40 @@
                   <li class="toctree-l1"><a class="reference internal" href="community/versioning_policy/">版本策略</a>
                   </li>
               </ul>
+              <p class="caption"><span class="caption-text">Design</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="design/1f1b-schedule-plan-assembly-guide/">1F1B 完整依赖组装与 DES 回放实现指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="design/alltoall-capture-analysis/">all_to_all 通信捕获缺失分析</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="design/communication-ownership-contract/">Communication Ownership Contract</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="design/dualpipev-schedule-plan-consumer-guide/">DualPipeV SchedulePlan 下游接入指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="design/l2-l3-schedule-plan-design/">L2/L3 调度 IR 重构设计：从扁平 trace 到结构化 SchedulePlan</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="design/low-precision-sim-analysis/">低精度训练（MXFP8）Simulator 使能分析</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="design/optimizer-ops-analysis/">优化器算子捕获问题分析</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="design/pipeline-multi-graph-capture-design/">复杂 Pipeline 策略下完整计算图捕获方案设计</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="design/pp-l2-capture-architecture/">PP L2 Capture Architecture</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="design/schedule-capture-design/">L0-L3 IR 层级归属设计</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="design/schedule-plan-dependency-reconstruction-contract/">SchedulePlan 下游依赖重建契约</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="design/schedule-plan-des-consumer-guide/">SchedulePlan 依赖重建与 DES 消费指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="design/simulator-memory-model-design/">Simulator Memory Model 改造设计</a>
+                  </li>
+              </ul>
               <p class="caption"><span class="caption-text">Feature guides</span></p>
               <ul>
                   <li class="toctree-l1"><a class="reference internal" href="feature_guides/checkpoint/">Checkpoint 使用指南</a>
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="feature_guides/deepseek_v32_mtp/">多Token预测特性(Multi Token Prediction, MTP)</a>
-                  </li>
-                  <li class="toctree-l1"><a class="reference internal" href="feature_guides/fsdp_parameter_precision/">Fsdp parameter precision</a>
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="feature_guides/low_precision_training/">低精度训练特性（MXFP8）</a>
                   </li>
@@ -72,9 +99,9 @@
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="feature_guides/muon_optimizer/">Muon 优化器特性</a>
                   </li>
-                  <li class="toctree-l1"><a class="reference internal" href="feature_guides/npu_fused_ops/">NPU 融合算子适配</a>
+                  <li class="toctree-l1"><a class="reference internal" href="feature_guides/new_model_onboarding/">新模型接入开发流程</a>
                   </li>
-                  <li class="toctree-l1"><a class="reference internal" href="feature_guides/npu_tnd_attention/">TND Attention (Per-Document Causal Attention)</a>
+                  <li class="toctree-l1"><a class="reference internal" href="feature_guides/npu_fused_ops/">NPU 融合算子适配</a>
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="feature_guides/swap_optimizer/">SwapOptimizer 特性</a>
                   </li>
@@ -96,8 +123,33 @@
                   <li class="toctree-l1"><a class="reference internal" href="recipe/sft/">SFT 指令微调</a>
                   </li>
               </ul>
+              <p class="caption"><span class="caption-text">Superpowers</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" >Plans</a>
+    <ul>
+                <li class="toctree-l2"><a class="reference internal" href="superpowers/plans/2026-07-01-mhc-real-op-name-capture-implementation/">MHC Real-Op-Name Capture Implementation Plan</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="superpowers/plans/2026-07-01-npu-simulator-implementation/">torchtitan_npu Simulator Implementation Plan</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="superpowers/plans/2026-07-01-smla-real-op-name-capture-implementation/">SMLA Real-Op-Name Capture Implementation Plan</a>
+                </li>
+    </ul>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" >Specs</a>
+    <ul>
+                <li class="toctree-l2"><a class="reference internal" href="superpowers/specs/2026-07-01-mhc-real-op-name-capture-design/">MHC 真实算子名捕获 — 架构与方案设计（阶段一：MHC）</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="superpowers/specs/2026-07-01-npu-simulator-design/">torchtitan_npu Simulator — 架构与方案设计</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="superpowers/specs/2026-07-01-smla-real-op-name-capture-design/">SMLA 真实算子名捕获 — 架构与方案设计（阶段二：SMLA）</a>
+                </li>
+    </ul>
+                  </li>
+              </ul>
               <p class="caption"><span class="caption-text">Test guides</span></p>
               <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="test_guides/model_acceptance/">新模型最终验收规范（Meta 模拟器）</a>
+                  </li>
                   <li class="toctree-l1"><a class="reference internal" href="test_guides/test_design/">测试设计</a>
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="test_guides/test_guide/">测试使用指南</a>
@@ -105,9 +157,13 @@
               </ul>
               <p class="caption"><span class="caption-text">User guides</span></p>
               <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="user-guides/deepseek_v4_model_parameters/">DeepSeek-V4 模型参数 Web 字段目录</a>
+                  </li>
                   <li class="toctree-l1"><a class="reference internal" href="user-guides/installation/">软件安装</a>
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="user-guides/quickstart/">快速上手</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="user-guides/simulator/">Simulator 使用指南</a>
                   </li>
               </ul>
       </div>
@@ -142,15 +198,20 @@ LICENSE file in the root directory of this source tree.
 
 <!-- Used for MkDocs generation. Checkout torchtitan-npu.github.io/torchtitan-npu.  -->
 <div align="center">
-<h1 id="torchtitan-npu">torchtitan-npu</h1>
-<h4 id="torchtitan">基于 torchtitan 的昇腾全流程大模型训练适配插件</h4>
-<p><a href="#特性支持概览"><img alt="Documentation" src="https://img.shields.io/badge/docs-latest-brightgreen.svg?style=flat" /></a>
-<a href="https://gitcode.com/cann/torchtitan-npu/blob/master/LICENSE"><img alt="license" src="https://img.shields.io/badge/license-BSD_3--Clause-lightgrey.svg" /></a>
-<a href="https://gitcode.com/cann/torchtitan-npu/blob/master/CONTRIBUTING.md"><img alt="contributing" src="https://img.shields.io/badge/CONTRIBUTING-teal" /></a>
-<a href="https://gitcode.com/cann/community/tree/master/CANN/sigs/framework-adapter"><img alt="SIG" src="https://img.shields.io/badge/SIG-framework--adapter-yellow" /></a>
-<a href="https://pypi.org/project/torchtitan-npu/"><img alt="pypi" src="https://img.shields.io/badge/pypi-0.2.2.post1-blue" /></a>
-<a href="https://zread.ai/hicann/torchtitan-npu"><img alt="zread" src="https://img.shields.io/badge/Ask_Zread-_.svg?style=plastic&amp;color=00b0aa&amp;labelColor=000000&amp;logo=data%3Aimage%2Fsvg%2Bxml%3Bbase64%2CPHN2ZyB3aWR0aD0iMTYiIGhlaWdodD0iMTYiIHZpZXdCb3g9IjAgMCAxNiAxNiIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHBhdGggZD0iTTQuOTYxNTYgMS42MDAxSDIuMjQxNTZDMS44ODgxIDEuNjAwMSAxLjYwMTU2IDEuODg2NjQgMS42MDE1NiAyLjI0MDFWNC45NjAxQzEuNjAxNTYgNS4zMTM1NiAxLjg4ODEgNS42MDAxIDIuMjQxNTYgNS42MDAxSDQuOTYxNTZDNS4zMTUwMiA1LjYwMDEgNS42MDE1NiA1LjMxMzU2IDUuNjAxNTYgNC45NjAxVjIuMjQwMUM1LjYwMTU2IDEuODg2NjQgNS4zMTUwMiAxLjYwMDEgNC45NjE1NiAxLjYwMDFaIiBmaWxsPSIjZmZmIi8%2BCjxwYXRoIGQ9Ik00Ljk2MTU2IDEwLjM5OTlIMi4yNDE1NkMxLjg4ODEgMTAuMzk5OSAxLjYwMTU2IDEwLjY4NjQgMS42MDE1NiAxMS4wMzk5VjEzLjc1OTlDMS42MDE1NiAxNC4xMTM0IDEuODg4MSAxNC4zOTk5IDIuMjQxNTYgMTQuMzk5OUg0Ljk2MTU2QzUuMzE1MDIgMTQuMzk5OSA1LjYwMTU2IDE0LjExMzQgNS42MDE1NiAxMy43NTk5VjExLjAzOTlDNS42MDE1NiAxMC42ODY0IDUuMzE1MDIgMTAuMzk5OSA0Ljk2MTU2IDEwLjM5OTlaIiBmaWxsPSIjZmZmIi8%2BCjxwYXRoIGQ9Ik0xMy43NTg0IDEuNjAwMUgxMS4wMzg0QzEwLjY4NSAxLjYwMDEgMTAuMzk4NCAxLjg4NjY0IDEwLjM5ODQgMi4yNDAxVjQuOTYwMUMxMC4zOTg0IDUuMzEzNTYgMTAuNjg1IDUuNjAwMSAxMS4wMzg0IDUuNjAwMUgxMy43NTg0QzE0LjExMTkgNS42MDAxIDE0LjM5ODQgNS4zMTM1NiAxNC4zOTg0IDQuOTYwMVYyLjI0MDFDMTQuMzk4NCAxLjg4NjY0IDE0LjExMTkgMS42MDAxIDEzLjc1ODQgMS42MDAxWiIgZmlsbD0iI2ZmZiIvPgo8cGF0aCBkPSJNNCAxMkwxMiA0TDQgMTJaIiBmaWxsPSIjZmZmIi8%2BCjxwYXRoIGQ9Ik00IDEyTDEyIDQiIHN0cm9rZT0iI2ZmZiIgc3Ryb2tlLXdpZHRoPSIxLjUiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIvPgo8L3N2Zz4K&amp;logoColor=ffffff" /></a></p>
+
+# torchtitan-npu
+
+<h4>基于 torchtitan 的昇腾全流程大模型训练适配插件</h4>
+
+[![Documentation](https://img.shields.io/badge/docs-latest-brightgreen.svg?style=flat)](#特性支持概览)
+[![license](https://img.shields.io/badge/license-BSD_3--Clause-lightgrey.svg)](https://gitcode.com/cann/torchtitan-npu/blob/master/LICENSE)
+[![contributing](https://img.shields.io/badge/CONTRIBUTING-teal)](https://gitcode.com/cann/torchtitan-npu/blob/master/CONTRIBUTING.md)
+[![SIG](https://img.shields.io/badge/SIG-framework--adapter-yellow)](https://gitcode.com/cann/community/tree/master/CANN/sigs/framework-adapter)
+[![pypi](https://img.shields.io/badge/pypi-0.2.2.post1-blue)](https://pypi.org/project/torchtitan-npu/)
+[![zread](https://img.shields.io/badge/Ask_Zread-_.svg?style=plastic&color=00b0aa&labelColor=000000&logo=data%3Aimage%2Fsvg%2Bxml%3Bbase64%2CPHN2ZyB3aWR0aD0iMTYiIGhlaWdodD0iMTYiIHZpZXdCb3g9IjAgMCAxNiAxNiIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHBhdGggZD0iTTQuOTYxNTYgMS42MDAxSDIuMjQxNTZDMS44ODgxIDEuNjAwMSAxLjYwMTU2IDEuODg2NjQgMS42MDE1NiAyLjI0MDFWNC45NjAxQzEuNjAxNTYgNS4zMTM1NiAxLjg4ODEgNS42MDAxIDIuMjQxNTYgNS42MDAxSDQuOTYxNTZDNS4zMTUwMiA1LjYwMDEgNS42MDE1NiA1LjMxMzU2IDUuNjAxNTYgNC45NjAxVjIuMjQwMUM1LjYwMTU2IDEuODg2NjQgNS4zMTUwMiAxLjYwMDEgNC45NjE1NiAxLjYwMDFaIiBmaWxsPSIjZmZmIi8%2BCjxwYXRoIGQ9Ik00Ljk2MTU2IDEwLjM5OTlIMi4yNDE1NkMxLjg4ODEgMTAuMzk5OSAxLjYwMTU2IDEwLjY4NjQgMS42MDE1NiAxMS4wMzk5VjEzLjc1OTlDMS42MDE1NiAxNC4xMTM0IDEuODg4MSAxNC4zOTk5IDIuMjQxNTYgMTQuMzk5OUg0Ljk2MTU2QzUuMzE1MDIgMTQuMzk5OSA1LjYwMTU2IDE0LjExMzQgNS42MDE1NiAxMy43NTk5VjExLjAzOTlDNS42MDE1NiAxMC42ODY0IDUuMzE1MDIgMTAuMzk5OSA0Ljk2MTU2IDEwLjM5OTlaIiBmaWxsPSIjZmZmIi8%2BCjxwYXRoIGQ9Ik0xMy43NTg0IDEuNjAwMUgxMS4wMzg0QzEwLjY4NSAxLjYwMDEgMTAuMzk4NCAxLjg4NjY0IDEwLjM5ODQgMi4yNDAxVjQuOTYwMUMxMC4zOTg0IDUuMzEzNTYgMTAuNjg1IDUuNjAwMSAxMS4wMzg0IDUuNjAwMUgxMy43NTg0QzE0LjExMTkgNS42MDAxIDE0LjM5ODQgNS4zMTM1NiAxNC4zOTg0IDQuOTYwMVYyLjI0MDFDMTQuMzk4NCAxLjg4NjY0IDE0LjExMTkgMS42MDAxIDEzLjc1ODQgMS42MDAxWiIgZmlsbD0iI2ZmZiIvPgo8cGF0aCBkPSJNNCAxMkwxMiA0TDQgMTJaIiBmaWxsPSIjZmZmIi8%2BCjxwYXRoIGQ9Ik00IDEyTDEyIDQiIHN0cm9rZT0iI2ZmZiIgc3Ryb2tlLXdpZHRoPSIxLjUiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIvPgo8L3N2Zz4K&logoColor=ffffff)](https://zread.ai/hicann/torchtitan-npu)
+
 </div>
+
 <h1 id="_1">简介</h1>
 <hr />
 <p><code>torchtitan-npu</code>定位为<code>torchtitan</code>的昇腾（Ascend）后端扩展插件，通过即插即用的硬件亲和性优化，充分释放NPU算力，助力<code>PyTorch native</code>训练在昇腾平台无缝、高效、稳定地运行。</p>
@@ -184,7 +245,6 @@ pip install -e .
 <h1 id="_5">快速上手</h1>
 <p>快速启动大语言模型的训练任务，参见
 <a href="https://gitcode.com/cann/torchtitan-npu/blob/master/docs/user-guides/quickstart.md">快速上手文档</a> 。</p>
-<p><a id="特性支持概览"></a></p>
 <h1 id="_6">特性支持概览</h1>
 <hr />
 <table>
@@ -223,15 +283,10 @@ pip install -e .
     </tr>
     <!-- 训练精度 -->
     <tr>
-      <td rowspan="2">训练精度</td>
+      <td>训练精度</td>
       <td><a href="https://gitcode.com/cann/torchtitan-npu/blob/master/docs/feature_guides/low_precision_training.md">MxFP8 量化</a></td>
       <td>✅</td>
       <td>✅ (Ascend 950)</td>
-    </tr>
-    <tr>
-      <td><a href="https://gitcode.com/cann/torchtitan-npu/blob/master/docs/feature_guides/fsdp_parameter_precision.md">FSDP 参数级精度保留</a></td>
-      <td>❌</td>
-      <td>✅</td>
     </tr>
     <!-- 训练调试与监控 -->
     <tr>
@@ -288,103 +343,14 @@ pip install -e .
 <h1 id="_8">性能基准</h1>
 <hr />
 <h3 id="202604">2026.04</h3>
-<p>System: Atlas 800T A3</p>
-<table>
-<thead>
-<tr>
-<th style="text-align: left;">Model</th>
-<th style="text-align: left;">Number of NPUs</th>
-<th style="text-align: left;">Precision</th>
-<th style="text-align: left;">GBS</th>
-<th style="text-align: left;">Local BS</th>
-<th style="text-align: left;">Sequence Length</th>
-<th style="text-align: left;">FSDP</th>
-<th style="text-align: left;">TP</th>
-<th style="text-align: left;">PP</th>
-<th style="text-align: left;">CP</th>
-<th style="text-align: left;">EP</th>
-<th style="text-align: left;">Throughput (tokens/p/s)</th>
-<th style="text-align: left;">MFU</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td style="text-align: left;"><a href="https://gitcode.com/cann/torchtitan-npu/blob/8343a6efac598ce86c2cec5a974f187310fd2728/torchtitan_npu/models/deepseek_v4/config_registry.py#L100">DeepSeek-V4-Flash</a></td>
-<td style="text-align: left;">64</td>
-<td style="text-align: left;">BF16</td>
-<td style="text-align: left;">1024</td>
-<td style="text-align: left;">1</td>
-<td style="text-align: left;">4096</td>
-<td style="text-align: left;">128</td>
-<td style="text-align: left;">1</td>
-<td style="text-align: left;">1</td>
-<td style="text-align: left;">1</td>
-<td style="text-align: left;">128</td>
-<td style="text-align: left;">1084</td>
-<td style="text-align: left;">27.71%</td>
-</tr>
-<tr>
-<td style="text-align: left;"><a href="https://gitcode.com/cann/torchtitan-npu/blob/8343a6efac598ce86c2cec5a974f187310fd2728/torchtitan_npu/models/deepseek_v32/config_registry.py#L156">DeepSeek-V3.2-671B</a></td>
-<td style="text-align: left;">64</td>
-<td style="text-align: left;">BF16</td>
-<td style="text-align: left;">128</td>
-<td style="text-align: left;">1</td>
-<td style="text-align: left;">32768</td>
-<td style="text-align: left;">4</td>
-<td style="text-align: left;">4</td>
-<td style="text-align: left;">1</td>
-<td style="text-align: left;">8</td>
-<td style="text-align: left;">64</td>
-<td style="text-align: left;">103</td>
-<td style="text-align: left;">/</td>
-</tr>
-<tr>
-<td style="text-align: left;"><a href="https://gitcode.com/cann/torchtitan-npu/blob/8343a6efac598ce86c2cec5a974f187310fd2728/torchtitan_npu/models/deepseek_v32/config_registry.py#L101">DeepSeek-V3.2-671B</a></td>
-<td style="text-align: left;">64</td>
-<td style="text-align: left;">BF16</td>
-<td style="text-align: left;">512</td>
-<td style="text-align: left;">1</td>
-<td style="text-align: left;">4096</td>
-<td style="text-align: left;">32</td>
-<td style="text-align: left;">4</td>
-<td style="text-align: left;">1</td>
-<td style="text-align: left;">1</td>
-<td style="text-align: left;">64</td>
-<td style="text-align: left;">146</td>
-<td style="text-align: left;">/</td>
-</tr>
-<tr>
-<td style="text-align: left;"><a href="https://gitcode.com/cann/torchtitan-npu/blob/8343a6efac598ce86c2cec5a974f187310fd2728/torchtitan_npu/models/deepseek_v3/config_registry.py#L156">DeepSeek-V3-671B</a></td>
-<td style="text-align: left;">64</td>
-<td style="text-align: left;">BF16</td>
-<td style="text-align: left;">1024</td>
-<td style="text-align: left;">1</td>
-<td style="text-align: left;">4096</td>
-<td style="text-align: left;">32</td>
-<td style="text-align: left;">4</td>
-<td style="text-align: left;">1</td>
-<td style="text-align: left;">1</td>
-<td style="text-align: left;">128</td>
-<td style="text-align: left;">546</td>
-<td style="text-align: left;">/</td>
-</tr>
-<tr>
-<td style="text-align: left;"><a href="https://gitcode.com/cann/torchtitan-npu/blob/8343a6efac598ce86c2cec5a974f187310fd2728/torchtitan_npu/models/deepseek_v3/config_registry.py#L156">DeepSeek-V3-671B + compile(AutoFuse)</a></td>
-<td style="text-align: left;">64</td>
-<td style="text-align: left;">BF16</td>
-<td style="text-align: left;">1024</td>
-<td style="text-align: left;">1</td>
-<td style="text-align: left;">4096</td>
-<td style="text-align: left;">32</td>
-<td style="text-align: left;">4</td>
-<td style="text-align: left;">1</td>
-<td style="text-align: left;">1</td>
-<td style="text-align: left;">128</td>
-<td style="text-align: left;">576</td>
-<td style="text-align: left;">/</td>
-</tr>
-</tbody>
-</table>
+<p>System: Atlas 800T A3
+| Model              | Number of NPUs | Precision | GBS | Local BS | Sequence Length | FSDP | TP  | PP  | CP  | EP  | Throughput (tokens/p/s) | MFU |
+| :----------------- | :------------- | :-------- | :-- | :------- | :-------------- | :--- | :-- | :-- | :-- | :-- | :----------- | :-- |
+| <a href="https://gitcode.com/cann/torchtitan-npu/blob/8343a6efac598ce86c2cec5a974f187310fd2728/torchtitan_npu/models/deepseek_v4/config_registry.py#L100">DeepSeek-V4-Flash</a> | 64             | BF16      | 1024  | 1       | 4096            | 128   | 1   | 1   | 1   | 128  | 1056          | 27.67% |
+| <a href="https://gitcode.com/cann/torchtitan-npu/blob/8343a6efac598ce86c2cec5a974f187310fd2728/torchtitan_npu/models/deepseek_v32/config_registry.py#L156">DeepSeek-V3.2-671B</a> | 64             | BF16      | 128  | 1       | 32768           | 4    | 4   | 1   | 8  | 64  | 103           | / |
+| <a href="https://gitcode.com/cann/torchtitan-npu/blob/8343a6efac598ce86c2cec5a974f187310fd2728/torchtitan_npu/models/deepseek_v32/config_registry.py#L101">DeepSeek-V3.2-671B</a> | 64             | BF16      | 512  | 1        | 4096            | 32   | 4   | 1   | 1   | 64  | 146           | / |
+| <a href="https://gitcode.com/cann/torchtitan-npu/blob/8343a6efac598ce86c2cec5a974f187310fd2728/torchtitan_npu/models/deepseek_v3/config_registry.py#L156">DeepSeek-V3-671B</a>   | 64             | BF16      | 1024 | 1       | 4096            | 32   | 4   | 1   | 1   | 128  | 546          | / |
+| <a href="https://gitcode.com/cann/torchtitan-npu/blob/8343a6efac598ce86c2cec5a974f187310fd2728/torchtitan_npu/models/deepseek_v3/config_registry.py#L156">DeepSeek-V3-671B + compile(AutoFuse)</a>   | 64             | BF16      | 1024 | 1       | 4096            | 32   | 4   | 1   | 1   | 128  |     576      | / |</p>
 <blockquote>
 <p>注：以上MoE模型的性能数据均开启负载均衡配置<code>moe_force_load_balance=true</code>。</p>
 </blockquote>
@@ -459,5 +425,5 @@ pip install -e .
 
 <!--
 MkDocs version : 1.6.1
-Build Date UTC : 2026-08-05 16:03:43.660712+00:00
+Build Date UTC : 2026-08-07 15:00:00.694165+00:00
 -->

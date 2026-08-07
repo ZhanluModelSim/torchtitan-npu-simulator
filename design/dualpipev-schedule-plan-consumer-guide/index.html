@@ -1,0 +1,411 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" >
+<head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+      <link rel="shortcut icon" href="../../img/favicon.ico" />
+    <title>DualPipeV SchedulePlan 下游接入指南 - torchtitan-npu</title>
+    <link rel="stylesheet" href="../../css/theme.css" />
+    <link rel="stylesheet" href="../../css/theme_extra.css" />
+        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/styles/github.min.css" />
+    
+      <script>
+        // Current page data
+        var mkdocs_page_name = "DualPipeV SchedulePlan \u4e0b\u6e38\u63a5\u5165\u6307\u5357";
+        var mkdocs_page_input_path = "design/dualpipev-schedule-plan-consumer-guide.md";
+        var mkdocs_page_url = null;
+      </script>
+    
+    <!--[if lt IE 9]>
+      <script src="../../js/html5shiv.min.js"></script>
+    <![endif]-->
+      <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/highlight.min.js"></script>
+      <script>hljs.highlightAll();</script> 
+</head>
+
+<body class="wy-body-for-nav" role="document">
+
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side stickynav">
+    <div class="wy-side-scroll">
+      <div class="wy-side-nav-search">
+          <a href="../.." class="icon icon-home"> torchtitan-npu
+        </a>
+      </div>
+
+      <div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <ul>
+                <li class="toctree-l1"><a class="reference internal" href="../..">Home</a>
+                </li>
+              </ul>
+              <ul>
+                <li class="toctree-l1"><a class="reference internal" href="../../lint_guide/">Lint 指南</a>
+                </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Community</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../community/contributors/">提交者与贡献者（Committers and Contributors）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../community/governance/">社区治理</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../community/versioning_policy/">版本策略</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Design</span></p>
+              <ul class="current">
+                  <li class="toctree-l1"><a class="reference internal" href="../1f1b-schedule-plan-assembly-guide/">1F1B 完整依赖组装与 DES 回放实现指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../alltoall-capture-analysis/">all_to_all 通信捕获缺失分析</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../communication-ownership-contract/">Communication Ownership Contract</a>
+                  </li>
+                  <li class="toctree-l1 current"><a class="reference internal current" href="#">DualPipeV SchedulePlan 下游接入指南</a>
+    <ul class="current">
+    <li class="toctree-l2"><a class="reference internal" href="#1">1. 接入边界</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#2-stage-rank">2. 虚拟 stage 与物理 rank</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#3-overlap-action">3. Overlap action</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#4">4. 后端暂不支持双图并发时</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#5-p2p-v">5. P2P 与本地 V 转移</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#6-fsdp">6. FSDP 与内存</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#7">7. 接入验收</a>
+    </li>
+    </ul>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../l2-l3-schedule-plan-design/">L2/L3 调度 IR 重构设计：从扁平 trace 到结构化 SchedulePlan</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../low-precision-sim-analysis/">低精度训练（MXFP8）Simulator 使能分析</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../optimizer-ops-analysis/">优化器算子捕获问题分析</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../pipeline-multi-graph-capture-design/">复杂 Pipeline 策略下完整计算图捕获方案设计</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../pp-l2-capture-architecture/">PP L2 Capture Architecture</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../schedule-capture-design/">L0-L3 IR 层级归属设计</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../schedule-plan-dependency-reconstruction-contract/">SchedulePlan 下游依赖重建契约</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../schedule-plan-des-consumer-guide/">SchedulePlan 依赖重建与 DES 消费指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../simulator-memory-model-design/">Simulator Memory Model 改造设计</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Feature guides</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/checkpoint/">Checkpoint 使用指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/deepseek_v32_mtp/">多Token预测特性(Multi Token Prediction, MTP)</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/low_precision_training/">低精度训练特性（MXFP8）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/metrics_and_debugging/">调试支持特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/model_custom/">Model Custom框架介绍</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/muon_optimizer/">Muon 优化器特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/new_model_onboarding/">新模型接入开发流程</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/npu_fused_ops/">NPU 融合算子适配</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/swap_optimizer/">SwapOptimizer 特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/torch_compile/">torch.compile 支持</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/virtual_optimizer/">Virtual Optimizer - 优化器显存虚拟化特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/vlm/">VLM NPU 支持</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" >Parallelism</a>
+    <ul>
+                <li class="toctree-l2"><a class="reference internal" href="../../feature_guides/parallelism/custom_cp/">自定义 Context Parallel 特性</a>
+                </li>
+    </ul>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Recipe</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../recipe/sft/">SFT 指令微调</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Superpowers</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" >Plans</a>
+    <ul>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/plans/2026-07-01-mhc-real-op-name-capture-implementation/">MHC Real-Op-Name Capture Implementation Plan</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/plans/2026-07-01-npu-simulator-implementation/">torchtitan_npu Simulator Implementation Plan</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/plans/2026-07-01-smla-real-op-name-capture-implementation/">SMLA Real-Op-Name Capture Implementation Plan</a>
+                </li>
+    </ul>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" >Specs</a>
+    <ul>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/specs/2026-07-01-mhc-real-op-name-capture-design/">MHC 真实算子名捕获 — 架构与方案设计（阶段一：MHC）</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/specs/2026-07-01-npu-simulator-design/">torchtitan_npu Simulator — 架构与方案设计</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/specs/2026-07-01-smla-real-op-name-capture-design/">SMLA 真实算子名捕获 — 架构与方案设计（阶段二：SMLA）</a>
+                </li>
+    </ul>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Test guides</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../test_guides/model_acceptance/">新模型最终验收规范（Meta 模拟器）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../test_guides/test_design/">测试设计</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../test_guides/test_guide/">测试使用指南</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">User guides</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/deepseek_v4_model_parameters/">DeepSeek-V4 模型参数 Web 字段目录</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/installation/">软件安装</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/quickstart/">快速上手</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/simulator/">Simulator 使用指南</a>
+                  </li>
+              </ul>
+      </div>
+    </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap">
+      <nav class="wy-nav-top" role="navigation" aria-label="Mobile navigation menu">
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../..">torchtitan-npu</a>
+        
+      </nav>
+      <div class="wy-nav-content">
+        <div class="rst-content"><div role="navigation" aria-label="breadcrumbs navigation">
+  <ul class="wy-breadcrumbs">
+    <li><a href="../.." class="icon icon-home" aria-label="Docs"></a></li>
+          <li class="breadcrumb-item">Design</li>
+      <li class="breadcrumb-item active">DualPipeV SchedulePlan 下游接入指南</li>
+    <li class="wy-breadcrumbs-aside">
+    </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+            <div class="section" itemprop="articleBody">
+              
+                <h1 id="dualpipev-scheduleplan">DualPipeV SchedulePlan 下游接入指南</h1>
+<blockquote>
+<p>目标读者：消费 simulator L2 <code>SchedulePlan</code>、负责训练 step 组装和 DES 的开发者或 agent。</p>
+<p>本文只描述 DualPipeV 相比普通 1F1B/GPipe 新增的消费规则。通用依赖、P2P、collective
+和 logical world 展开规则以
+<a href="../schedule-plan-dependency-reconstruction-contract/"><code>schedule-plan-dependency-reconstruction-contract.md</code></a>
+为准。</p>
+</blockquote>
+<h2 id="1">1. 接入边界</h2>
+<p>DualPipeV 不要求下游根据 schedule 名称重新生成流水计划。捕获端已经输出：</p>
+<ul>
+<li>每个物理 PP 进程的顶层 action 发布顺序；</li>
+<li>同一物理 rank 上多个虚拟 stage 的 compute action；</li>
+<li>F/B overlap parent 及其两个 compute sub-action；</li>
+<li>stage 间本地 DataSlot 和跨 rank P2P <code>transfer_id</code>；</li>
+<li>每个 compute sub-action 对应的 L1 <code>StepGraph</code>；</li>
+<li>FSDP UNSHARD/RESHARD/REDUCE_GRAD action 和依赖。</li>
+</ul>
+<p>下游仍只需要实现“按顺序发布、按依赖就绪、按资源执行”。<code>pipeline_schedule</code> 仅用于日志和
+验收，不能成为硬编码 DualPipeV 时序的开关。</p>
+<p>如果从 CSV 调试导出读取，<code>schedule_plan.csv</code> 包含两个连续 section：</p>
+<pre><code class="language-text">action header + action rows
+slot_id,kind,... header + DataSlot rows
+</code></pre>
+<p>遇到 <code>slot_id,kind,...</code> 后必须切换到 DataSlot schema，不能继续按 action header 解析。生产接入
+仍应直接消费进程内 <code>SchedulePlan</code> 对象。</p>
+<h2 id="2-stage-rank">2. 虚拟 stage 与物理 rank</h2>
+<p>PP degree 为 <code>p</code> 时，DualPipeV 通常有 <code>2p</code> 个虚拟 stage。一份 rank-local plan 可能拥有两个
+不相邻的 stage。例如 PP=2：</p>
+<table>
+<thead>
+<tr>
+<th>capture process</th>
+<th>虚拟 stage</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>rank 0</td>
+<td>0、3</td>
+</tr>
+<tr>
+<td>rank 1</td>
+<td>1、2</td>
+</tr>
+</tbody>
+</table>
+<p>因此：</p>
+<ol>
+<li>action 的归属 rank 使用 <code>plan.annotations["capture_process_rank"]</code>；</li>
+<li><code>action.stage</code> 只表示模型虚拟 stage，不能用来推导物理 rank；</li>
+<li>logical world clone 仍按 PP mesh 坐标选择 capture plan；</li>
+<li>同 rank 相邻虚拟 stage 之间使用 <code>DataSlot.is_local_transfer=True</code>，不创建网络事件；</li>
+<li>跨 rank stage 之间按 <code>comm.transfer_id</code> 配对 SEND/RECV。</li>
+</ol>
+<h2 id="3-overlap-action">3. Overlap action</h2>
+<p><code>OVERLAP_F_B</code> 是顶层发布单元，<code>sub_actions</code> 是实际 F/B compute：</p>
+<pre><code class="language-text">OVERLAP_F_B parent
+  sub_actions[0] -&gt; COMPUTE(F or B)
+  sub_actions[1] -&gt; COMPUTE(B or F)
+</code></pre>
+<p>消费端必须：</p>
+<ol>
+<li>仅将 parent 放入 rank issue queue；</li>
+<li>将 parent 和所有 sub-action 都加入 <code>action_id</code> 索引；</li>
+<li>在 sub-action 上解析 <code>consumes</code>、<code>produces</code> 和 <code>template_ref</code>；</li>
+<li>每个 sub-action 独立判断输入 readiness；</li>
+<li>所有 sub-action 完成后，parent 才完成并推进顶层 issue cursor；</li>
+<li>禁止再把 sub-action 当作顶层 action 发布，否则会重复执行。</li>
+</ol>
+<p>DataSlot 可以直接引用 sub-action ID。不能把依赖提升到 parent 后丢弃原始 child 引用。</p>
+<h2 id="4">4. 后端暂不支持双图并发时</h2>
+<p>允许先将 overlap 串行执行，但应把 parent 实现为“单资源复合组”，而不是合并成一个不可见的
+compute action：</p>
+<pre><code class="language-text">on parent issued:
+    pending = sub_actions in captured order
+    while pending:
+        child = first ready child
+        if no child is ready:
+            wait for dependency or communication completion
+        execute child exclusively
+        publish this child's output slots immediately
+        remove child from pending
+    complete parent
+</code></pre>
+<p>关键约束：</p>
+<ul>
+<li>不要等待两个 child 的输入全部就绪后才启动 parent；第一个 child 的输出可能推动远端事件，
+  进而使第二个 child 就绪，预先等待并集可能制造死锁。</li>
+<li>child 串行时仍分别实例化各自的 <code>StepGraph</code>，不能只保留其中一张图。</li>
+<li>child 完成后立即发布其输出，不要延迟到 parent 完成。</li>
+<li>多个 child 同时 ready 时使用 <code>sub_actions</code> 记录顺序，保证确定性。</li>
+<li>串行模式只改变资源重叠，不改变 DataSlot、P2P 和 collective 依赖。</li>
+</ul>
+<p>这种模式可以正确完成 step，但时间与峰值内存是保守近似：没有计算重叠，两个 child 的临时
+tensor 也不会同时驻留。输出中应标记 <code>dualpipe_overlap_mode=serialized</code>，避免将结果误认为真实
+DualPipeV 并发性能。</p>
+<h2 id="5-p2p-v">5. P2P 与本地 V 转移</h2>
+<p>对每个跨 rank transfer：</p>
+<pre><code class="language-text">key = comm.transfer_id
+require exactly one SEND
+require exactly one RECV
+require same src_stage, dst_stage, mb_idx and volume_bytes
+</code></pre>
+<p>同 rank 的 V 形 stage 转移没有 SEND/RECV：</p>
+<pre><code class="language-text">producer compute
+  -&gt; DataSlot(is_local_transfer=True)
+  -&gt; consumer compute
+</code></pre>
+<p>不要因为看不到通信 action 就补一个虚假 P2P，也不要把 local transfer 当 external input。</p>
+<h2 id="6-fsdp">6. FSDP 与内存</h2>
+<p>DualPipeV 与 1F1B 使用相同的通信归属契约：</p>
+<pre><code class="language-text">stage 内触发的 all-gather/reduce-scatter -&gt; COMPUTE 的 L1 StepGraph
+stage 外显式 prefetch -&gt; UNSHARD -&gt; COMPUTE -&gt; RESHARD
+stage 外真实梯度归约 -&gt; BACKWARD -&gt; REDUCE_GRAD -&gt; OPTIMIZER
+</code></pre>
+<p>下游必须完整回放 <code>action.template_ref</code> 指向的图，不能再根据 FSDP 配置向 L2
+补通信。只有 <code>communication_owner=L2_PREFETCH/L2_STANDALONE</code> 的 action
+需要由 L2 单独调度。详细规则见
+<a href="../communication-ownership-contract/"><code>communication-ownership-contract.md</code></a>。</p>
+<p>同一个 virtual stage 的相邻 F/B/I/W action 之间可能发生 FSDP 跨 action
+prefetch。例如 B 或 W 尾部发起 all-gather，为稍后的 F 准备参数。该通信已经归入实际发起
+它的 L1 模板，并标记为 <code>ownership_placement=cross_action_prefetch</code>；目标 F 模板不会重复包含
+它。下游仍按原有规则执行，不需要新增边：</p>
+<ol>
+<li>完整执行 launch action 引用的 L1 图，包括该 all-gather；</li>
+<li>all-gather 作为 L1 图出口时，launch action 要等它完成；</li>
+<li>继续遵守 rank-local 顶层 <code>schedule_order</code>；</li>
+<li>不要因为目标 F 中没有相同 all-gather 而在 L2 补通信。</li>
+</ol>
+<p>层内 prefetch 则直接表现为 L1 DAG 中两个可并行分支：目标层 all-gather 和来源层 compute
+共享前置 readiness，目标层 compute 等待 all-gather。即使后端暂时把 DualPipeV 的双图
+overlap 串行化，也必须保留单张 L1 图内部的通信/计算并行关系。</p>
+<p>一个物理 rank 拥有多个虚拟 stage 时，参数基线和 FSDP residency 都按物理 rank 汇总。小模型中
+embedding/output 可能远大于 transformer layer，因此 V 形切分可能产生明显 rank 间显存不均；
+不能据此把较小 rank 的参数补齐到平均值。</p>
+<p>串行 overlap 的内存回放应遵循实际采用的 child 执行顺序。它能保持生命周期和量级正确，但不
+表达两个 compute graph 真正并发时的瞬时峰值。</p>
+<h2 id="7">7. 接入验收</h2>
+<p>组装前至少检查：</p>
+<ol>
+<li>每个顶层 <code>schedule_order</code> 唯一且非负；</li>
+<li>parent 不在任何其他 parent 下，sub-action 不进入顶层 issue queue；</li>
+<li>每个 overlap parent 恰有两个有效 compute child；</li>
+<li>child 的 <code>template_ref</code>、consumes 和 produces 全部可解析；</li>
+<li>所有非 external consumed slot 都有有效 producer；</li>
+<li>所有跨 rank <code>transfer_id</code> 恰有一对 SEND/RECV；</li>
+<li>local transfer 只有 DataSlot，没有 P2P endpoint；</li>
+<li>每个 rank 最终完成全部 parent、child、通信和 FSDP action；</li>
+<li>无法推进时打印 pending parent、child readiness、缺失 slot 和未配对 transfer。</li>
+<li>L1 中不存在 <code>sim.fsdp_*</code>，且 <code>cross_action_prefetch</code> 未在目标 action 重复。</li>
+</ol>
+<p>PP=2 的最小验收应覆盖：</p>
+<ul>
+<li>rank0 拥有 stage 0 和 3，rank1 拥有 stage 1 和 2；</li>
+<li>至少一个 overlap parent 在串行模式下能完成两个 child；</li>
+<li>前向 activation 和反向 gradient 同时覆盖跨 rank与同 rank local transfer；</li>
+<li>开启 DP shard 后，外部 prefetch 的 UNSHARD/RESHARD 成对；stage 内 FSDP
+  通信位于 L1，且两者都不改变 PP transfer 配对。</li>
+</ul>
+              
+            </div>
+          </div><footer>
+    <div class="rst-footer-buttons" role="navigation" aria-label="Footer Navigation">
+        <a href="../communication-ownership-contract/" class="btn btn-neutral float-left" title="Communication Ownership Contract"><span class="icon icon-circle-arrow-left"></span> Previous</a>
+        <a href="../l2-l3-schedule-plan-design/" class="btn btn-neutral float-right" title="L2/L3 调度 IR 重构设计：从扁平 trace 到结构化 SchedulePlan">Next <span class="icon icon-circle-arrow-right"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <!-- Copyright etc -->
+  </div>
+
+  Built with <a href="https://www.mkdocs.org/">MkDocs</a> using a <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a> provided by <a href="https://readthedocs.org">Read the Docs</a>.
+</footer>
+          
+        </div>
+      </div>
+
+    </section>
+
+  </div>
+
+  <div class="rst-versions" role="note" aria-label="Versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    
+    
+      <span><a href="../communication-ownership-contract/" style="color: #fcfcfc">&laquo; Previous</a></span>
+    
+    
+      <span><a href="../l2-l3-schedule-plan-design/" style="color: #fcfcfc">Next &raquo;</a></span>
+    
+  </span>
+</div>
+    <script src="../../js/jquery-3.6.0.min.js"></script>
+    <script>var base_url = "../..";</script>
+    <script src="../../js/theme_extra.js"></script>
+    <script src="../../js/theme.js"></script>
+    <script>
+        jQuery(function () {
+            SphinxRtdTheme.Navigation.enable(true);
+        });
+    </script>
+
+</body>
+</html>

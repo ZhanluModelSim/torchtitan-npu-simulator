@@ -1,0 +1,1029 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" >
+<head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+      <link rel="shortcut icon" href="../../img/favicon.ico" />
+    <title>Simulator Memory Model 改造设计 - torchtitan-npu</title>
+    <link rel="stylesheet" href="../../css/theme.css" />
+    <link rel="stylesheet" href="../../css/theme_extra.css" />
+        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/styles/github.min.css" />
+    
+      <script>
+        // Current page data
+        var mkdocs_page_name = "Simulator Memory Model \u6539\u9020\u8bbe\u8ba1";
+        var mkdocs_page_input_path = "design/simulator-memory-model-design.md";
+        var mkdocs_page_url = null;
+      </script>
+    
+    <!--[if lt IE 9]>
+      <script src="../../js/html5shiv.min.js"></script>
+    <![endif]-->
+      <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/highlight.min.js"></script>
+      <script>hljs.highlightAll();</script> 
+</head>
+
+<body class="wy-body-for-nav" role="document">
+
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side stickynav">
+    <div class="wy-side-scroll">
+      <div class="wy-side-nav-search">
+          <a href="../.." class="icon icon-home"> torchtitan-npu
+        </a>
+      </div>
+
+      <div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <ul>
+                <li class="toctree-l1"><a class="reference internal" href="../..">Home</a>
+                </li>
+              </ul>
+              <ul>
+                <li class="toctree-l1"><a class="reference internal" href="../../lint_guide/">Lint 指南</a>
+                </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Community</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../community/contributors/">提交者与贡献者（Committers and Contributors）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../community/governance/">社区治理</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../community/versioning_policy/">版本策略</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Design</span></p>
+              <ul class="current">
+                  <li class="toctree-l1"><a class="reference internal" href="../1f1b-schedule-plan-assembly-guide/">1F1B 完整依赖组装与 DES 回放实现指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../alltoall-capture-analysis/">all_to_all 通信捕获缺失分析</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../communication-ownership-contract/">Communication Ownership Contract</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../dualpipev-schedule-plan-consumer-guide/">DualPipeV SchedulePlan 下游接入指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../l2-l3-schedule-plan-design/">L2/L3 调度 IR 重构设计：从扁平 trace 到结构化 SchedulePlan</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../low-precision-sim-analysis/">低精度训练（MXFP8）Simulator 使能分析</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../optimizer-ops-analysis/">优化器算子捕获问题分析</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../pipeline-multi-graph-capture-design/">复杂 Pipeline 策略下完整计算图捕获方案设计</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../pp-l2-capture-architecture/">PP L2 Capture Architecture</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../schedule-capture-design/">L0-L3 IR 层级归属设计</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../schedule-plan-dependency-reconstruction-contract/">SchedulePlan 下游依赖重建契约</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../schedule-plan-des-consumer-guide/">SchedulePlan 依赖重建与 DES 消费指南</a>
+                  </li>
+                  <li class="toctree-l1 current"><a class="reference internal current" href="#">Simulator Memory Model 改造设计</a>
+    <ul class="current">
+    <li class="toctree-l2"><a class="reference internal" href="#1">1. 背景</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#2">2. 当前问题</a>
+        <ul>
+    <li class="toctree-l3"><a class="reference internal" href="#21-peak_mem">2.1 peak_mem 不是峰值显存</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#22-param_mem">2.2 param_mem 当前不可靠</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#23-l0">2.3 L0 折叠不适合直接算生命周期</a>
+    </li>
+        </ul>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#3">3. 目标与非目标</a>
+        <ul>
+    <li class="toctree-l3"><a class="reference internal" href="#31">3.1 目标</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#32">3.2 非目标</a>
+    </li>
+        </ul>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#4">4. 生命周期规则</a>
+        <ul>
+    <li class="toctree-l3"><a class="reference internal" href="#41">4.1 基础规则</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#42-forward-activation-backward">4.2 Forward activation 与 backward</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#43-escape">4.3 Escape 标记</a>
+    </li>
+        </ul>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#5-fsdp">5. FSDP 建模</a>
+        <ul>
+    <li class="toctree-l3"><a class="reference internal" href="#51">5.1 需要表达的对象</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#52">5.2 匹配信号</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#53">5.3 释放点</a>
+    </li>
+        </ul>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#6-aliasmutation-unknown">6. Alias、Mutation 与 Unknown</a>
+        <ul>
+    <li class="toctree-l3"><a class="reference internal" href="#61-alias">6.1 Alias</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#62-in-place-mutation">6.2 In-place / mutation</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#63-unknown-op">6.3 Unknown op</a>
+    </li>
+        </ul>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#7-microbatch-pp">7. Microbatch 与 PP</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#8">8. 优先级</a>
+        <ul>
+    <li class="toctree-l3"><a class="reference internal" href="#p0">P0：最小可信闭环</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#p1">P1：训练显存与调度精度</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#p2">P2：真实设备贴近度</a>
+    </li>
+        </ul>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#9">9. 技术可达性</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#10">10. 模块设计</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#11">11. 工作量预估</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#12">12. 验证计划</a>
+        <ul>
+    <li class="toctree-l3"><a class="reference internal" href="#121">12.1 单元测试</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#122-fsdp">12.2 FSDP 场景测试</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#123">12.3 集成测试</a>
+    </li>
+        </ul>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#13">13. 输出示例</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#14">14. 结论</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#15-p0">15. P0 开发计划</a>
+        <ul>
+    <li class="toctree-l3"><a class="reference internal" href="#151">15.1 核心数据结构</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#152-p0">15.2 P0 算法伪代码</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#153">15.3 第一版明确取舍</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#154">15.4 验收</a>
+    </li>
+        </ul>
+    </li>
+    </ul>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Feature guides</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/checkpoint/">Checkpoint 使用指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/deepseek_v32_mtp/">多Token预测特性(Multi Token Prediction, MTP)</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/low_precision_training/">低精度训练特性（MXFP8）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/metrics_and_debugging/">调试支持特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/model_custom/">Model Custom框架介绍</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/muon_optimizer/">Muon 优化器特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/new_model_onboarding/">新模型接入开发流程</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/npu_fused_ops/">NPU 融合算子适配</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/swap_optimizer/">SwapOptimizer 特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/torch_compile/">torch.compile 支持</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/virtual_optimizer/">Virtual Optimizer - 优化器显存虚拟化特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/vlm/">VLM NPU 支持</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" >Parallelism</a>
+    <ul>
+                <li class="toctree-l2"><a class="reference internal" href="../../feature_guides/parallelism/custom_cp/">自定义 Context Parallel 特性</a>
+                </li>
+    </ul>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Recipe</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../recipe/sft/">SFT 指令微调</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Superpowers</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" >Plans</a>
+    <ul>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/plans/2026-07-01-mhc-real-op-name-capture-implementation/">MHC Real-Op-Name Capture Implementation Plan</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/plans/2026-07-01-npu-simulator-implementation/">torchtitan_npu Simulator Implementation Plan</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/plans/2026-07-01-smla-real-op-name-capture-implementation/">SMLA Real-Op-Name Capture Implementation Plan</a>
+                </li>
+    </ul>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" >Specs</a>
+    <ul>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/specs/2026-07-01-mhc-real-op-name-capture-design/">MHC 真实算子名捕获 — 架构与方案设计（阶段一：MHC）</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/specs/2026-07-01-npu-simulator-design/">torchtitan_npu Simulator — 架构与方案设计</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/specs/2026-07-01-smla-real-op-name-capture-design/">SMLA 真实算子名捕获 — 架构与方案设计（阶段二：SMLA）</a>
+                </li>
+    </ul>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Test guides</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../test_guides/model_acceptance/">新模型最终验收规范（Meta 模拟器）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../test_guides/test_design/">测试设计</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../test_guides/test_guide/">测试使用指南</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">User guides</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/deepseek_v4_model_parameters/">DeepSeek-V4 模型参数 Web 字段目录</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/installation/">软件安装</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/quickstart/">快速上手</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/simulator/">Simulator 使用指南</a>
+                  </li>
+              </ul>
+      </div>
+    </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap">
+      <nav class="wy-nav-top" role="navigation" aria-label="Mobile navigation menu">
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../..">torchtitan-npu</a>
+        
+      </nav>
+      <div class="wy-nav-content">
+        <div class="rst-content"><div role="navigation" aria-label="breadcrumbs navigation">
+  <ul class="wy-breadcrumbs">
+    <li><a href="../.." class="icon icon-home" aria-label="Docs"></a></li>
+          <li class="breadcrumb-item">Design</li>
+      <li class="breadcrumb-item active">Simulator Memory Model 改造设计</li>
+    <li class="wy-breadcrumbs-aside">
+    </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+            <div class="section" itemprop="articleBody">
+              
+                <h1 id="simulator-memory-model">Simulator Memory Model 改造设计</h1>
+<blockquote>
+<p>状态：设计建议
+日期：2026-07-13
+目标：把当前 simulator 中不准确的 <code>peak_mem</code> 累加口径，改造成可解释、可回放、可供 DES 消费的显存事件模型。</p>
+</blockquote>
+<h2 id="1">1. 背景</h2>
+<p>当前 simulator 在 meta device 上捕获一个训练 step 的 L0-L3 IR：</p>
+<ul>
+<li><code>OpDispatchCapture</code> 通过 <code>TorchDispatchMode</code> 捕获 aten/npu 算子，记录输入输出 shape/dtype、producer/consumer 边、phase、seq_idx。</li>
+<li><code>CommEventRecorder</code> 拦截 FSDP/TP/PP/EP/CP 等通信，记录通信 primitive、tensor shape/dtype/bytes、comm_layer、src_exit_op、dst_entry_op。</li>
+<li><code>StepGraph</code> 按 forward/backward/optimizer 分桶。</li>
+<li><code>ScheduleGraph</code> 记录 L2 调度与 DataPass。</li>
+</ul>
+<p>这些数据已经足够作为内存建模的基础，但当前 <code>peak_mem</code> 字段语义不对。</p>
+<h2 id="2">2. 当前问题</h2>
+<h3 id="21-peak_mem">2.1 <code>peak_mem</code> 不是峰值显存</h3>
+<p><code>OpCostModel</code> 当前在 matmul、attention、norm、elementwise、data_move 等 handler 中把 <code>outputs[0]</code> 的 bytes 写入 <code>CostEstimate.peak_mem</code>。后续 summary 又按 step 做：</p>
+<pre><code class="language-text">total_peak_mem_bytes = sum(node.peak_mem for node in step_graph.nodes.values())
+</code></pre>
+<p>这等价于“阶段内所有 op 输出大小求和”，不是某个时刻活跃 tensor bytes 的峰值。</p>
+<p>直接后果：</p>
+<ul>
+<li>会把生命周期互斥的输出全部累加，明显高估。</li>
+<li>无法表达 forward activation 是否活到 backward。</li>
+<li>无法表达 checkpoint recompute 后原 forward activation 被释放。</li>
+<li>无法表达 FSDP full-param buffer 的 allgather/reshard 生命周期。</li>
+<li>无法作为后续 DES 的显存曲线输入。</li>
+</ul>
+<h3 id="22-param_mem">2.2 <code>param_mem</code> 当前不可靠</h3>
+<p><code>TensorMeta.is_parameter</code> 默认是 <code>False</code>，dispatch 捕获时没有建立 <code>id(param) -&gt; parameter name/shard info</code> 的映射。因此通过 op input 判断参数大小不可靠，FSDP 后尤其不可靠：compute op 看到的可能是 allgather 回来的 full-param buffer 或其 view，而不是原始 <code>nn.Parameter</code> 对象。</p>
+<h3 id="23-l0">2.3 L0 折叠不适合直接算生命周期</h3>
+<p>当前 L0 有相邻重复算子的 <code>repeat_count</code> 折叠。折叠适合展示和摘要，不适合内存生命周期计算，因为它会丢失：</p>
+<ul>
+<li>具体 producer/consumer 顺序；</li>
+<li>last consumer；</li>
+<li>checkpoint recompute 的实际出现位置；</li>
+<li>microbatch overlap 下的峰值位置。</li>
+</ul>
+<p>内存模型需要基于未折叠 raw event stream，或先由 raw event stream 生成 memory events 后再聚合展示。</p>
+<h2 id="3">3. 目标与非目标</h2>
+<h3 id="31">3.1 目标</h3>
+<p>第一版目标是产出合理、有据、可解释的 <code>active tensor bytes</code> 曲线：</p>
+<pre><code class="language-text">active_bytes =
+  persistent local params
++ external inputs / labels
++ FSDP full-param buffers
++ non-alias op outputs live by use-def
++ comm buffers live by CommEvent
+</code></pre>
+<p>并导出：</p>
+<ul>
+<li>每 rank 的 <code>persistent_param_bytes</code>。</li>
+<li>每 tensor 的生命周期：alloc seq、free seq、bytes、kind、producer、consumers。</li>
+<li>每 seq 的 memory event：alloc/free、bytes、active_bytes_after。</li>
+<li>每 step/rank 的 <code>active_bytes_peak</code> 和 peak 发生位置。</li>
+<li>未分类或高风险 tensor/op 的审查列表。</li>
+</ul>
+<h3 id="32">3.2 非目标</h3>
+<p>第一版不追求对齐真实设备 allocator 的 <code>reserved_bytes</code>：</p>
+<ul>
+<li>不模拟 allocator cache。</li>
+<li>不模拟 fragmentation。</li>
+<li>不模拟 kernel workspace。</li>
+<li>不模拟真实 NPU 内部临时 buffer。</li>
+<li>不强行复刻 PyTorch/FSDP 内部所有释放细节。</li>
+</ul>
+<p>报告与导出字段应使用 <code>active_bytes_peak</code>，不要继续称为真实 device peak。</p>
+<h2 id="4">4. 生命周期规则</h2>
+<p>生命周期不能边捕获边决定，必须在完整 step 捕获结束后离线计算。原因是 forward tensor 是否会被 backward 消耗，只有 backward 捕获完才知道。</p>
+<h3 id="41">4.1 基础规则</h3>
+<p>对每个 tensor record：</p>
+<pre><code class="language-text">alloc_seq = producer_seq
+free_seq = max(consumer.seq_idx)
+
+if no consumers and not escaped:
+    free_seq = producer_seq
+</code></pre>
+<p>分类规则：</p>
+<table>
+<thead>
+<tr>
+<th>kind</th>
+<th>生命周期</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>parameter_shard</code></td>
+<td>step_start -&gt; step_end</td>
+</tr>
+<tr>
+<td><code>optimizer_state</code></td>
+<td>step_start -&gt; step_end，可作为开关</td>
+</tr>
+<tr>
+<td><code>external_input</code> / <code>label</code></td>
+<td>first use 前 alloc，last consumer 后 free</td>
+</tr>
+<tr>
+<td><code>op_output</code></td>
+<td>producer 后 alloc，last consumer 后 free</td>
+</tr>
+<tr>
+<td><code>dead_temp_output</code></td>
+<td>producer 后 alloc，producer 后 free</td>
+</tr>
+<tr>
+<td><code>alias</code></td>
+<td>不分配 bytes，只延长 base buffer lifetime</td>
+</tr>
+<tr>
+<td><code>comm_buffer</code></td>
+<td>comm alloc -&gt; comm consumer/wait/phase boundary</td>
+</tr>
+<tr>
+<td><code>fsdp_full_param</code></td>
+<td>allgather/unshard alloc -&gt; reshard/free point</td>
+</tr>
+</tbody>
+</table>
+<h3 id="42-forward-activation-backward">4.2 Forward activation 与 backward</h3>
+<p>非 checkpoint 情况：</p>
+<pre><code class="language-text">forward producer -&gt; backward consumer
+free at last backward consumer
+</code></pre>
+<p>checkpoint 情况：</p>
+<pre><code class="language-text">original forward activation:
+  only consumed inside forward
+  free at last forward consumer
+
+recomputed activation:
+  produced in backward phase
+  consumed by backward gradient op
+  free at last backward consumer
+</code></pre>
+<p>这不需要特殊猜 checkpoint，只要 raw event stream 保留完整 forward+backward use-def 链即可自然表达。</p>
+<h3 id="43-escape">4.3 Escape 标记</h3>
+<p>没有 consumer 的 tensor 不能一概 producer 后释放，需要标记逃逸对象：</p>
+<ul>
+<li>loss / model output；</li>
+<li>L2 DataPass slot；</li>
+<li>P2P send buffer；</li>
+<li>FSDP allgather output；</li>
+<li>optimizer state / grad shard；</li>
+<li>其他框架持有的跨 phase tensor。</li>
+</ul>
+<p>初版可以保守处理：无法分类的无 consumer tensor 导出到 <code>unclassified_dead_outputs.csv</code>，默认不进入核心 peak，或按配置决定 producer 后释放。</p>
+<h2 id="5-fsdp">5. FSDP 建模</h2>
+<p>FSDP 是内存模型中影响最大的部分，不能只依赖普通 op input/output。</p>
+<h3 id="51">5.1 需要表达的对象</h3>
+<pre><code class="language-text">persistent local shard param:
+  step_start -&gt; step_end
+
+fsdp allgather output / full param buffer:
+  allgather/unshard seq -&gt; matching reshard/free seq
+
+compute view of full param:
+  alias of full param buffer
+  no extra bytes
+
+reduce_scatter input / full grad buffer:
+  free at reduce_scatter seq or matching reshard point
+
+reduce_scatter output / grad shard:
+  reduce_scatter seq -&gt; optimizer consumer or step_end
+</code></pre>
+<h3 id="52">5.2 匹配信号</h3>
+<p>FSDP-aware planner 使用以下信号组合，而不是靠单一字符串猜测：</p>
+<ul>
+<li><code>CommEvent.comm_layer == "L2"</code>；</li>
+<li><code>CommEvent.comm_primitive in {"allgather", "reduce_scatter", "allreduce"}</code>；</li>
+<li><code>comm_dim</code> / <code>comm_ranks</code> 对应 FSDP 或 DP shard 维度；</li>
+<li><code>src_exit_op</code> / <code>dst_entry_op</code> 连接到 L1 compute；</li>
+<li>tensor shape/dtype 与参数 shard/full param shape 匹配；</li>
+<li>module_path 或 FSDP hook 上下文作为辅助信息。</li>
+</ul>
+<h3 id="53">5.3 释放点</h3>
+<p>FSDP full-param buffer 的释放点优先级：</p>
+<ol>
+<li>明确捕获到的 reshard/free hook 或 reduce_scatter event。</li>
+<li>matching FSDP reduce_scatter。</li>
+<li>last compute consumer。</li>
+<li>phase boundary fallback。</li>
+</ol>
+<p>这个释放点比单纯 last consumer 更接近 FSDP 语义，因为真实框架会在 hook 中管理 full-param buffer 的保留和释放。</p>
+<h2 id="6-aliasmutation-unknown">6. Alias、Mutation 与 Unknown</h2>
+<h3 id="61-alias">6.1 Alias</h3>
+<p>以下 op 初版应视为 alias，不额外分配 bytes：</p>
+<ul>
+<li><code>view</code></li>
+<li><code>reshape</code></li>
+<li><code>transpose</code></li>
+<li><code>permute</code></li>
+<li><code>slice</code></li>
+<li><code>select</code></li>
+<li><code>split</code></li>
+<li><code>narrow</code></li>
+<li><code>as_strided</code></li>
+</ul>
+<p>以下 op 通常是真分配：</p>
+<ul>
+<li><code>cat</code></li>
+<li><code>clone</code></li>
+<li><code>contiguous</code></li>
+<li><code>empty_like</code></li>
+<li><code>zeros_like</code></li>
+<li>通信 output buffer</li>
+<li>fused/custom op 的真实 output</li>
+</ul>
+<h3 id="62-in-place-mutation">6.2 In-place / mutation</h3>
+<p><code>add_</code>、<code>copy_</code>、optimizer update、foreach mutation、<code>out=</code> 参数可能复用已有 buffer。初版至少需要：</p>
+<ul>
+<li>识别 raw op name 中的 trailing <code>_</code>。</li>
+<li>识别 kwargs 中的 <code>out</code> tensor。</li>
+<li>对 mutation op 不创建新 allocation，只记录 input buffer 被写。</li>
+</ul>
+<h3 id="63-unknown-op">6.3 Unknown op</h3>
+<p>Unknown op 不能默认 output 分配，也不能默认 alias。处理策略：</p>
+<ul>
+<li>白名单逐步分类。</li>
+<li>未分类 op 导出 <code>unclassified_memory_ops.csv</code>。</li>
+<li>核心 peak 报告展示 unknown coverage。</li>
+<li>必要时提供 conservative/aggressive 两种模式：</li>
+<li>conservative：unknown output 不计入核心 peak，只报告风险；</li>
+<li>aggressive：unknown output 按新分配计入，作为上界。</li>
+</ul>
+<h2 id="7-microbatch-pp">7. Microbatch 与 PP</h2>
+<p>当前 simulator 对首个 microbatch 捕完整 L0，后续 microbatch 多为 L2 timeline/pass-through。内存模型不能只用 MB0 的曲线，否则 PP/gradient accumulation 下峰值位置可能错。</p>
+<p>合理做法：</p>
+<ol>
+<li>使用 MB0 raw event stream 生成 L1 memory template。</li>
+<li>按 L2 execution timeline 实例化 template：</li>
+</ol>
+<pre><code class="language-text">mb3/op42/out0
+rank7/stage2/forward/mb3/...
+</code></pre>
+<ol>
+<li>对每个实例生成独立 tensor id，但复用模板中的 shape/dtype/bytes/relative lifetime。</li>
+<li>对 PP P2P、FSDP DataPass 使用 captured CommEvent 和 ScheduleGraph 补齐跨 instance 生命周期。</li>
+</ol>
+<p>这样不需要重新捕获所有 microbatch 的 L0，也不需要把展示图完全展开。</p>
+<p>当前实现采用该方案，并限定在 <code>pp_degree &gt; 1</code> 的内存路径：</p>
+<ul>
+<li>从 raw memory events 中为每个 <code>(stage, comp_type)</code> 选择完整模板；</li>
+<li>按 <code>SchedulePlan.actions</code> 展开任意调度，不根据 1F1B、GPipe 或 DualPipeV 名称分支；</li>
+<li><code>OVERLAP_F_B</code> 在内存时间轴中按 sub-action 稳定展开，保留 action span 供 Perfetto 展示；</li>
+<li>参数/buffer tensor ID 保持持久，microbatch 相关输入输出生成独立 ID；</li>
+<li>PP P2P 接收由下游 stage input 表达，避免再叠加一份通信 buffer；</li>
+<li>FSDP 显式驻留 marker 保持真实调用次数，不随计算模板复制；</li>
+<li>非 PP 直接调用原有 <code>estimate_static_memory</code>，不经过模板重放。</li>
+</ul>
+<p><code>ScheduleAction</code> 同时保留两类位置：<code>schedule_order</code> 是 lowered pipeline plan 的逻辑
+顺序，<code>seq_idx</code> 是捕获来源位置。compute 的 <code>seq_idx</code> 可能是 L0 op 位置，而通信 action
+的 <code>seq_idx</code> 可能是 plan index，因此不能把二者作为同一时间轴排序。</p>
+<h2 id="8">8. 优先级</h2>
+<h3 id="p0">P0：最小可信闭环</h3>
+<table>
+<thead>
+<tr>
+<th>项</th>
+<th style="text-align: right;">影响</th>
+<th style="text-align: right;">复杂度</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>移除或改名 <code>sum(node.peak_mem)</code></td>
+<td style="text-align: right;">极大</td>
+<td style="text-align: right;">低</td>
+<td>先停止输出误导性 peak</td>
+</tr>
+<tr>
+<td>本地参数 shard bytes</td>
+<td style="text-align: right;">极大</td>
+<td style="text-align: right;">低</td>
+<td>从 <code>model_parts.named_parameters()</code> 去重统计</td>
+</tr>
+<tr>
+<td>raw tensor use-def</td>
+<td style="text-align: right;">极大</td>
+<td style="text-align: right;">中</td>
+<td>记录 tensor_id、producer、consumers、bytes</td>
+</tr>
+<tr>
+<td>alias 白名单</td>
+<td style="text-align: right;">极大</td>
+<td style="text-align: right;">中</td>
+<td>避免 view/reshape 重复分配</td>
+</tr>
+<tr>
+<td>FSDP allgather/full-param/reshard</td>
+<td style="text-align: right;">极大</td>
+<td style="text-align: right;">中高</td>
+<td>决定大模型峰值是否合理</td>
+</tr>
+<tr>
+<td>memory events 导出</td>
+<td style="text-align: right;">极大</td>
+<td style="text-align: right;">中</td>
+<td>DES 消费的直接输入</td>
+</tr>
+</tbody>
+</table>
+<h3 id="p1">P1：训练显存与调度精度</h3>
+<table>
+<thead>
+<tr>
+<th>项</th>
+<th style="text-align: right;">影响</th>
+<th style="text-align: right;">复杂度</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>microbatch/PP template 实例化</td>
+<td style="text-align: right;">大</td>
+<td style="text-align: right;">中</td>
+<td>已实现通用 action-plan 重放</td>
+</tr>
+<tr>
+<td>in-place/out mutation</td>
+<td style="text-align: right;">中到大</td>
+<td style="text-align: right;">中</td>
+<td>避免 optimizer/copy 重复算</td>
+</tr>
+<tr>
+<td>grad/optimizer state 开关</td>
+<td style="text-align: right;">中到极大</td>
+<td style="text-align: right;">中</td>
+<td>是否做训练峰值取决于目标</td>
+</tr>
+<tr>
+<td>async comm wait/phase boundary</td>
+<td style="text-align: right;">中</td>
+<td style="text-align: right;">中</td>
+<td>初版可保守近似</td>
+</tr>
+<tr>
+<td>checkpoint trace 校验</td>
+<td style="text-align: right;">大</td>
+<td style="text-align: right;">低</td>
+<td>主要验证 use-def 是否自然表达</td>
+</tr>
+</tbody>
+</table>
+<h3 id="p2">P2：真实设备贴近度</h3>
+<table>
+<thead>
+<tr>
+<th>项</th>
+<th style="text-align: right;">影响</th>
+<th style="text-align: right;">复杂度</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>allocator reserved/cache</td>
+<td style="text-align: right;">中</td>
+<td style="text-align: right;">高</td>
+<td>第一版不做</td>
+</tr>
+<tr>
+<td>fragmentation</td>
+<td style="text-align: right;">中</td>
+<td style="text-align: right;">高</td>
+<td>第一版不做</td>
+</tr>
+<tr>
+<td>kernel workspace</td>
+<td style="text-align: right;">小到中</td>
+<td style="text-align: right;">高</td>
+<td>当前需求可忽略</td>
+</tr>
+<tr>
+<td>alignment/padding</td>
+<td style="text-align: right;">小到中</td>
+<td style="text-align: right;">低</td>
+<td>后续可加简单 align</td>
+</tr>
+</tbody>
+</table>
+<h2 id="9">9. 技术可达性</h2>
+<p>该方案不需要黑魔法，也不需要复刻 NPU allocator。核心依赖都是当前 simulator 已经有的信号：</p>
+<ul>
+<li><code>TorchDispatchMode</code> 已经能捕获 op 输入输出和 seq_idx。</li>
+<li><code>_producer</code> 已经能建立 tensor producer 边。</li>
+<li><code>CommEvent</code> 已经有 comm primitive、shape/dtype/bytes、comm_layer、src/dst op。</li>
+<li><code>ScheduleGraph</code> 已经有 L2 timeline 和 DataPass。</li>
+<li>模型参数可以从 <code>model_parts</code> 静态遍历。</li>
+</ul>
+<p>主要新增的是数据结构和离线 planner，不是新的执行路径。</p>
+<h2 id="10">10. 模块设计</h2>
+<p>建议新增：</p>
+<pre><code class="language-text">torchtitan_npu/simulator/memory/
+├── __init__.py
+├── tensor_record.py        # TensorRecord / MemoryEvent dataclass
+├── parameter_snapshot.py   # local parameter shard bytes
+├── raw_event_recorder.py   # raw tensor use-def extraction helpers
+├── alias_rules.py          # alias / allocation / mutation op classification
+├── fsdp_rules.py           # FSDP-aware lifetime rules
+├── planner.py              # build_memory_plan(workload_graph, capture, ...)
+└── export.py               # CSV/JSON summary exports
+</code></pre>
+<p>需要改动：</p>
+<table>
+<thead>
+<tr>
+<th>文件</th>
+<th>改动</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>capture/dispatch_capture.py</code></td>
+<td>保留未折叠 raw event stream；记录 tensor_id、producer、consumer、alias/mutation 信息</td>
+</tr>
+<tr>
+<td><code>capture/tensor_utils.py</code></td>
+<td>增加 tensor bytes helper 或直接复用现有 <code>tensor_volume_bytes</code></td>
+</tr>
+<tr>
+<td><code>trainer.py</code></td>
+<td>在 <code>build_nodes()</code> / <code>build_step_graphs()</code> 后调用 memory planner</td>
+</tr>
+<tr>
+<td><code>ir/tensor_meta.py</code></td>
+<td>可选增加 <code>tensor_id</code>、<code>num_bytes</code>、<code>alias_of</code>；也可以先放在独立 memory record 中，避免扰动 IR</td>
+</tr>
+<tr>
+<td><code>ir/step_graph.py</code></td>
+<td>填充 <code>peak_active_mem</code>、<code>param_mem</code>、<code>tensor_lifetimes</code></td>
+</tr>
+<tr>
+<td><code>viz/text_summary.py</code></td>
+<td>输出 <code>active_bytes_peak</code>，移除或改名 <code>total_peak_mem_bytes</code></td>
+</tr>
+<tr>
+<td><code>viz/json_export.py</code></td>
+<td>导出 memory plan</td>
+</tr>
+<tr>
+<td><code>viz/csv_export.py</code></td>
+<td>导出 memory events / tensor lifetimes</td>
+</tr>
+<tr>
+<td><code>viz/html_export.py</code></td>
+<td>可选展示 per-rank memory curve</td>
+</tr>
+<tr>
+<td><code>docs/user-guides/simulator.md</code></td>
+<td>更新 <code>peak_mem</code> 字段说明</td>
+</tr>
+</tbody>
+</table>
+<h2 id="11">11. 工作量预估</h2>
+<p>按一个熟悉当前 simulator 的工程师估算：</p>
+<table>
+<thead>
+<tr>
+<th>阶段</th>
+<th>内容</th>
+<th style="text-align: right;">预估</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td>止血：改 summary 字段语义，新增文档说明</td>
+<td style="text-align: right;">0.5-1 天</td>
+</tr>
+<tr>
+<td>2</td>
+<td>参数 shard bytes 统计与导出</td>
+<td style="text-align: right;">1 天</td>
+</tr>
+<tr>
+<td>3</td>
+<td>raw tensor use-def recorder 与基础 lifetime planner</td>
+<td style="text-align: right;">2-3 天</td>
+</tr>
+<tr>
+<td>4</td>
+<td>alias/mutation 基础规则</td>
+<td style="text-align: right;">1-2 天</td>
+</tr>
+<tr>
+<td>5</td>
+<td>FSDP-aware allgather/reshard 生命周期</td>
+<td style="text-align: right;">2-4 天</td>
+</tr>
+<tr>
+<td>6</td>
+<td>memory events CSV/JSON + summary peak</td>
+<td style="text-align: right;">1-2 天</td>
+</tr>
+<tr>
+<td>7</td>
+<td>microbatch/PP template 实例化</td>
+<td style="text-align: right;">2-4 天</td>
+</tr>
+<tr>
+<td>8</td>
+<td>测试与 trace 校验</td>
+<td style="text-align: right;">2-3 天</td>
+</tr>
+<tr>
+<td>9</td>
+<td>HTML 曲线与用户文档</td>
+<td style="text-align: right;">1-2 天</td>
+</tr>
+</tbody>
+</table>
+<p>最小可信闭环：约 7-12 人日。</p>
+<p>带 PP/microbatch 实例化和较完整导出：约 12-18 人日。</p>
+<p>不建议第一阶段投入 allocator/cache/fragmentation/workspace，这些会显著增加复杂度，但对“合理有据”的 active tensor bytes 曲线不是必要条件。</p>
+<h2 id="12">12. 验证计划</h2>
+<h3 id="121">12.1 单元测试</h3>
+<ul>
+<li>简单链：<code>a -&gt; b -&gt; c</code>，验证 b 在 c 消费后释放。</li>
+<li>dead output：无 consumer 的临时 output 在 producer 后释放。</li>
+<li>cross phase：forward output 被 backward op 消费，释放点在 backward。</li>
+<li>checkpoint-like：forward output 只在 forward 内消费，backward 重算生成新 tensor。</li>
+<li>alias：view/reshape 不新增 bytes，base lifetime 延长。</li>
+<li>mutation：in-place op 不新增 bytes。</li>
+</ul>
+<h3 id="122-fsdp">12.2 FSDP 场景测试</h3>
+<ul>
+<li>allgather output 被 compute 消费，形成 <code>fsdp_full_param</code>。</li>
+<li>full-param view 进入 matmul，不重复分配。</li>
+<li>reduce_scatter 后 full buffer 释放。</li>
+<li>local shard param step 常驻。</li>
+<li>无法匹配的 FSDP event 进入 unclassified 报告。</li>
+</ul>
+<h3 id="123">12.3 集成测试</h3>
+<ul>
+<li><code>deepseek_v4_pro_simulate_16_layers</code>：验证基础 active peak 非零且 summary 不再出现 <code>sum(node.peak_mem)</code>。</li>
+<li>CP/EP 配置：验证 L1 comm buffer 进入 memory events。</li>
+<li>PP/FSDP 配置：验证 memory curve 随 microbatch timeline 实例化。</li>
+</ul>
+<h2 id="13">13. 输出示例</h2>
+<p>建议新增文件：</p>
+<pre><code class="language-text">simulator_output/&lt;config&gt;/
+└── memory/
+    ├── memory_summary.json
+    ├── memory_events.csv
+    ├── memory_timeline.csv
+    ├── tensor_lifetimes.csv
+    ├── memory_actions.csv
+    ├── memory_trace.json
+    └── unclassified_memory_ops.csv
+</code></pre>
+<p><code>memory_events/rank_0.csv</code>：</p>
+<pre><code class="language-text">seq_idx,phase,op_id,event,tensor_id,kind,bytes,active_bytes_after,reason
+0,init,-1,alloc,param:tok_embeddings.weight,parameter_shard,1048576,1048576,persistent_param
+12,forward,45,alloc,t:45:out0,op_output,262144,1310720,producer
+18,forward,52,free,t:45:out0,op_output,262144,1048576,last_consumer
+30,forward,80,alloc,fsdp:80:full_param,fsdp_full_param,16777216,17825792,allgather
+45,forward,97,free,fsdp:80:full_param,fsdp_full_param,16777216,1048576,reshard
+</code></pre>
+<p><code>memory_summary.json</code>：</p>
+<pre><code class="language-json">{
+  &quot;metric&quot;: &quot;active_tensor_bytes&quot;,
+  &quot;rank&quot;: 0,
+  &quot;persistent_param_bytes&quot;: 123456789,
+  &quot;active_bytes_peak&quot;: 234567890,
+  &quot;model_active_bytes_peak&quot;: 223456789,
+  &quot;peak_seq_idx&quot;: 1234,
+  &quot;included&quot;: [
+    &quot;local parameter shards&quot;,
+    &quot;external inputs and labels&quot;,
+    &quot;op outputs by use-def&quot;,
+    &quot;comm buffers&quot;,
+    &quot;FSDP full parameter buffers&quot;
+  ],
+  &quot;excluded&quot;: [
+    &quot;allocator reserved/cache&quot;,
+    &quot;fragmentation&quot;,
+    &quot;kernel workspace&quot;,
+    &quot;device internal temporary buffers&quot;
+  ]
+}
+</code></pre>
+<h2 id="14">14. 结论</h2>
+<p>当前 <code>peak_mem</code> 的核心问题不是公式不够精细，而是计算位置错了：显存峰值不是单 op cost model 能给出的字段，而是需要基于执行序、tensor use-def、通信事件和 FSDP 语义离线扫描得到的 active set。</p>
+<p>推荐路线：</p>
+<ol>
+<li>立即停止把 <code>sum(node.peak_mem)</code> 展示为 peak。</li>
+<li>保留现有折叠图用于展示，但新增未折叠 raw event stream 给 memory planner。</li>
+<li>第一版只承诺 <code>active_tensor_bytes</code>，不承诺真实 allocator peak。</li>
+<li>P0 优先覆盖参数 shard、use-def、alias、FSDP allgather/reshard。</li>
+<li>后续再补 microbatch/PP 实例化、optimizer state、async comm 和 HTML 曲线。</li>
+</ol>
+<p>这样可以在工程复杂度可控的前提下，得到一个合理、有据、能被 DES 消费的显存变化模型。</p>
+<h2 id="15-p0">15. P0 开发计划</h2>
+<p>第一版只实现静态 active tensor bytes，不做 allocator/reserved/workspace。它必须能在单进程 meta simulator 和 multi-proc meta 每 rank 独立导出下稳定运行。</p>
+<h3 id="151">15.1 核心数据结构</h3>
+<pre><code class="language-text">TensorRef:
+  tensor_id: int
+  shape: tuple[int, ...]
+  dtype: str
+  device: str
+  num_bytes: int
+
+RawMemoryEvent:
+  event_id: int
+  op_id: int
+  seq_idx: int
+  raw_op_type: str
+  op_type: str
+  phase: str
+  module_path: str
+  inputs: list[TensorRef]
+  outputs: list[TensorRef]
+
+TensorLifetime:
+  tensor_id: str
+  kind: parameter_shard | external_input | activation | temporary | dead_temp_output | alias | comm_buffer | fsdp_full_param
+  num_bytes: int
+  birth_seq: int
+  death_seq: int
+  producer_op: int
+  consumer_ops: list[int]
+  alias_of: str
+  reason: str
+
+MemoryTimelineEvent:
+  seq_idx: int
+  action: alloc | free
+  tensor_id: str
+  kind: str
+  num_bytes: int
+  active_bytes_after: int
+  reason: str
+
+MemoryPlan:
+  persistent_param_bytes: int
+  peak_active_bytes: int
+  peak_seq_idx: int
+  tensor_lifetimes: list[TensorLifetime]
+  timeline_events: list[MemoryTimelineEvent]
+  unclassified_ops: list[dict]
+</code></pre>
+<h3 id="152-p0">15.2 P0 算法伪代码</h3>
+<pre><code class="language-text">raw_events = capture.memory_events()
+params = snapshot_model_parameters(model_parts)
+comm_by_op = {comm.op_id: comm for comm in comm_events}
+
+for param in params:
+  add persistent lifetime(step_start, step_end)
+
+for event in raw_events ordered by seq_idx:
+  for input in event.inputs:
+    lifetime = find_or_create_external_input(input)
+    lifetime.last_consumer = event.seq_idx
+    lifetime.consumer_ops.add(event.op_id)
+
+  for output in event.outputs:
+    if output is known parameter or in-place mutation target:
+      continue
+    if alias_rules.is_alias(event):
+      add zero-byte alias lifetime(alias_of=first_input)
+      continue
+    kind = classify_output(event, comm_by_op)
+    add allocated lifetime(birth=event.seq_idx, kind=kind)
+
+for lifetime in allocated_lifetimes:
+  if no consumers:
+    lifetime.death_seq = lifetime.birth_seq
+    lifetime.kind = dead_temp_output unless comm/FSDP rule extends it
+  else:
+    lifetime.death_seq = max(consumer.seq_idx)
+    if produced in forward and consumed in backward:
+      lifetime.kind = activation
+    elif kind was op_output:
+      lifetime.kind = temporary
+
+timeline = sweep alloc/free events ordered by seq_idx
+peak = max(active_bytes_after)
+</code></pre>
+<h3 id="153">15.3 第一版明确取舍</h3>
+<ul>
+<li>使用未折叠 raw event stream 算生命周期，保留现有折叠 L0 图用于展示。</li>
+<li>alias 只做白名单，不尝试从 storage 推断。</li>
+<li>mutation 只做 raw op 名称和输入输出 id 的保守识别。</li>
+<li>FSDP 先基于 <code>CommEvent</code> 分类 allgather/reduce_scatter buffer，并以 last consumer 释放；reshard hook 显式释放留到 P1。</li>
+<li>PP/microbatch 按 L2 <code>SchedulePlan</code> 实例化 MB1+ 的 memory events；L0/L1 展示图仍保持折叠。</li>
+<li>输出名使用 <code>active_bytes_peak</code>，旧 <code>sum(node.peak_mem)</code> 在 summary 中改名为 <code>total_op_output_bytes_estimate</code>。</li>
+</ul>
+<h3 id="154">15.4 验收</h3>
+<ul>
+<li>单元测试覆盖简单链、dead output、cross phase activation、checkpoint-like 重算、alias、comm/FSDP 分类。</li>
+<li>smoke 脚本输出人可读日志：参数常驻、峰值、峰值位置、top lifetimes、导出路径。</li>
+<li>multi-proc meta 下每 rank 单独导出 <code>memory/</code>，PP 额外包含 <code>memory_actions.csv</code> 和 action span trace。</li>
+</ul>
+              
+            </div>
+          </div><footer>
+    <div class="rst-footer-buttons" role="navigation" aria-label="Footer Navigation">
+        <a href="../schedule-plan-des-consumer-guide/" class="btn btn-neutral float-left" title="SchedulePlan 依赖重建与 DES 消费指南"><span class="icon icon-circle-arrow-left"></span> Previous</a>
+        <a href="../../feature_guides/checkpoint/" class="btn btn-neutral float-right" title="Checkpoint 使用指南">Next <span class="icon icon-circle-arrow-right"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <!-- Copyright etc -->
+  </div>
+
+  Built with <a href="https://www.mkdocs.org/">MkDocs</a> using a <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a> provided by <a href="https://readthedocs.org">Read the Docs</a>.
+</footer>
+          
+        </div>
+      </div>
+
+    </section>
+
+  </div>
+
+  <div class="rst-versions" role="note" aria-label="Versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    
+    
+      <span><a href="../schedule-plan-des-consumer-guide/" style="color: #fcfcfc">&laquo; Previous</a></span>
+    
+    
+      <span><a href="../../feature_guides/checkpoint/" style="color: #fcfcfc">Next &raquo;</a></span>
+    
+  </span>
+</div>
+    <script src="../../js/jquery-3.6.0.min.js"></script>
+    <script>var base_url = "../..";</script>
+    <script src="../../js/theme_extra.js"></script>
+    <script src="../../js/theme.js"></script>
+    <script>
+        jQuery(function () {
+            SphinxRtdTheme.Navigation.enable(true);
+        });
+    </script>
+
+</body>
+</html>

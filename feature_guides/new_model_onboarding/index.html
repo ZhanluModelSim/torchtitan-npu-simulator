@@ -1,0 +1,546 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" >
+<head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+      <link rel="shortcut icon" href="../../img/favicon.ico" />
+    <title>新模型接入开发流程 - torchtitan-npu</title>
+    <link rel="stylesheet" href="../../css/theme.css" />
+    <link rel="stylesheet" href="../../css/theme_extra.css" />
+        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/styles/github.min.css" />
+    
+      <script>
+        // Current page data
+        var mkdocs_page_name = "\u65b0\u6a21\u578b\u63a5\u5165\u5f00\u53d1\u6d41\u7a0b";
+        var mkdocs_page_input_path = "feature_guides/new_model_onboarding.md";
+        var mkdocs_page_url = null;
+      </script>
+    
+    <!--[if lt IE 9]>
+      <script src="../../js/html5shiv.min.js"></script>
+    <![endif]-->
+      <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/highlight.min.js"></script>
+      <script>hljs.highlightAll();</script> 
+</head>
+
+<body class="wy-body-for-nav" role="document">
+
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side stickynav">
+    <div class="wy-side-scroll">
+      <div class="wy-side-nav-search">
+          <a href="../.." class="icon icon-home"> torchtitan-npu
+        </a>
+      </div>
+
+      <div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <ul>
+                <li class="toctree-l1"><a class="reference internal" href="../..">Home</a>
+                </li>
+              </ul>
+              <ul>
+                <li class="toctree-l1"><a class="reference internal" href="../../lint_guide/">Lint 指南</a>
+                </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Community</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../community/contributors/">提交者与贡献者（Committers and Contributors）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../community/governance/">社区治理</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../community/versioning_policy/">版本策略</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Design</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/1f1b-schedule-plan-assembly-guide/">1F1B 完整依赖组装与 DES 回放实现指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/alltoall-capture-analysis/">all_to_all 通信捕获缺失分析</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/communication-ownership-contract/">Communication Ownership Contract</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/dualpipev-schedule-plan-consumer-guide/">DualPipeV SchedulePlan 下游接入指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/l2-l3-schedule-plan-design/">L2/L3 调度 IR 重构设计：从扁平 trace 到结构化 SchedulePlan</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/low-precision-sim-analysis/">低精度训练（MXFP8）Simulator 使能分析</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/optimizer-ops-analysis/">优化器算子捕获问题分析</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/pipeline-multi-graph-capture-design/">复杂 Pipeline 策略下完整计算图捕获方案设计</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/pp-l2-capture-architecture/">PP L2 Capture Architecture</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/schedule-capture-design/">L0-L3 IR 层级归属设计</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/schedule-plan-dependency-reconstruction-contract/">SchedulePlan 下游依赖重建契约</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/schedule-plan-des-consumer-guide/">SchedulePlan 依赖重建与 DES 消费指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/simulator-memory-model-design/">Simulator Memory Model 改造设计</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Feature guides</span></p>
+              <ul class="current">
+                  <li class="toctree-l1"><a class="reference internal" href="../checkpoint/">Checkpoint 使用指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../deepseek_v32_mtp/">多Token预测特性(Multi Token Prediction, MTP)</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../low_precision_training/">低精度训练特性（MXFP8）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../metrics_and_debugging/">调试支持特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../model_custom/">Model Custom框架介绍</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../muon_optimizer/">Muon 优化器特性</a>
+                  </li>
+                  <li class="toctree-l1 current"><a class="reference internal current" href="#">新模型接入开发流程</a>
+    <ul class="current">
+    <li class="toctree-l2"><a class="reference internal" href="#1">1. 先定义接入范围和模型契约</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#2">2. 完成单卡模型骨架</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#3">3. 接入注册、配置和权重转换</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#4-npu">4. 接入 NPU 融合算子和模型特有算子</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#5">5. 按统一顺序接入并行</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#6-achook">6. 补齐 AC、Hook、插件和训练生命周期</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#7">7. 接入模拟器建模</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#8">8. 建立测试分层并进入最终验收</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#_2">常见失效模式</a>
+    </li>
+    </ul>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../npu_fused_ops/">NPU 融合算子适配</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../swap_optimizer/">SwapOptimizer 特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../torch_compile/">torch.compile 支持</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../virtual_optimizer/">Virtual Optimizer - 优化器显存虚拟化特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../vlm/">VLM NPU 支持</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" >Parallelism</a>
+    <ul>
+                <li class="toctree-l2"><a class="reference internal" href="../parallelism/custom_cp/">自定义 Context Parallel 特性</a>
+                </li>
+    </ul>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Recipe</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../recipe/sft/">SFT 指令微调</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Superpowers</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" >Plans</a>
+    <ul>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/plans/2026-07-01-mhc-real-op-name-capture-implementation/">MHC Real-Op-Name Capture Implementation Plan</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/plans/2026-07-01-npu-simulator-implementation/">torchtitan_npu Simulator Implementation Plan</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/plans/2026-07-01-smla-real-op-name-capture-implementation/">SMLA Real-Op-Name Capture Implementation Plan</a>
+                </li>
+    </ul>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" >Specs</a>
+    <ul>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/specs/2026-07-01-mhc-real-op-name-capture-design/">MHC 真实算子名捕获 — 架构与方案设计（阶段一：MHC）</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/specs/2026-07-01-npu-simulator-design/">torchtitan_npu Simulator — 架构与方案设计</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/specs/2026-07-01-smla-real-op-name-capture-design/">SMLA 真实算子名捕获 — 架构与方案设计（阶段二：SMLA）</a>
+                </li>
+    </ul>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Test guides</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../test_guides/model_acceptance/">新模型最终验收规范（Meta 模拟器）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../test_guides/test_design/">测试设计</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../test_guides/test_guide/">测试使用指南</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">User guides</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/deepseek_v4_model_parameters/">DeepSeek-V4 模型参数 Web 字段目录</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/installation/">软件安装</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/quickstart/">快速上手</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/simulator/">Simulator 使用指南</a>
+                  </li>
+              </ul>
+      </div>
+    </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap">
+      <nav class="wy-nav-top" role="navigation" aria-label="Mobile navigation menu">
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../..">torchtitan-npu</a>
+        
+      </nav>
+      <div class="wy-nav-content">
+        <div class="rst-content"><div role="navigation" aria-label="breadcrumbs navigation">
+  <ul class="wy-breadcrumbs">
+    <li><a href="../.." class="icon icon-home" aria-label="Docs"></a></li>
+          <li class="breadcrumb-item">Feature guides</li>
+      <li class="breadcrumb-item active">新模型接入开发流程</li>
+    <li class="wy-breadcrumbs-aside">
+    </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+            <div class="section" itemprop="articleBody">
+              
+                <h1 id="_1">新模型接入开发流程</h1>
+<p>本文用于固化一个模型从“代码可以构造”到“具备完整 meta 模拟器建模能力”的接入流程。流程适用于 Dense、MoE 以及包含模型特有融合算子的架构；并行重点覆盖 FSDP（含 eFSDP）、TP、EP、ETP、CP，PP 作为最后阶段接入。</p>
+<p>本文默认验收目标是 simulator 的结构、shape、通信依赖和显存建模，不包含真实 NPU 数值训练或硬件 profiler。若项目另行声明需要真实训练可用性，应另立数值/性能验收，不把它混入模型建模接入的结论。</p>
+<p>最终是否可以对外声明模型的 simulator 建模可用，不以某个单测或一次单步执行成功为准，而应执行<a href="../../test_guides/model_acceptance/">新模型最终验收规范</a>。</p>
+<h2 id="1">1. 先定义接入范围和模型契约</h2>
+<p>编码前先形成一份模型契约，避免后续用运行现象反推架构。至少记录：</p>
+<table>
+<thead>
+<tr>
+<th>类别</th>
+<th>必须明确的内容</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>来源</td>
+<td>参考实现、配置、权重格式、tokenizer、基线 commit</td>
+</tr>
+<tr>
+<td>网络结构</td>
+<td>layer 数、hidden size、head 数、KV head 数、head dim、FFN/intermediate size</td>
+</tr>
+<tr>
+<td>Attention</td>
+<td>MHA/GQA/MLA/KDA 等类型，RoPE、门控、Q/K norm、滑窗或全局 attention 规则</td>
+</tr>
+<tr>
+<td>MoE</td>
+<td>routed/shared expert 数、每 token 激活专家数、路由方式、专家权重布局</td>
+</tr>
+<tr>
+<td>Norm/激活</td>
+<td>RMSNorm 变体、门控方式、激活函数及其融合边界</td>
+</tr>
+<tr>
+<td>权重</td>
+<td>每类参数的全局 shape、参数量公式、初始化和 tied weight 关系</td>
+</tr>
+<tr>
+<td>状态字典</td>
+<td>原始权重名与框架权重名的双向映射，是否有合并/拆分权重</td>
+</tr>
+<tr>
+<td>支持范围</td>
+<td>FSDP/eFSDP、TP、EP、ETP、CP、PP、AC、compile、offload 的目标状态</td>
+</tr>
+<tr>
+<td>验证基线</td>
+<td>算子清单、local shape、通信行为和显存趋势</td>
+</tr>
+</tbody>
+</table>
+<p>同时记录当前功能分支真正对应的开发基线。模型分支应 rebase 到它所属的训练主分支，而不是默认选择 <code>master</code>。解决冲突时优先保留目标基线中较新的通用实现，再把模型差异重新适配进去，避免恢复已经废弃的 shim、配置项或通信建模逻辑。</p>
+<p>建议为每类 layer 写出参数量公式。全模型参数量至少能拆成：</p>
+<pre><code class="language-text">embedding + dense layers + moe layers + final norm + output
+</code></pre>
+<p>MoE 参数还要区分 shared experts 与 routed experts。这份计算结果会成为后续权重切分、静态显存和算子 shape 验收的独立基线。</p>
+<h2 id="2">2. 完成单卡模型骨架</h2>
+<p>先实现不含并行语义的纯模型，通常包括：</p>
+<ul>
+<li><code>model.py</code>：模型、decoder layer、初始化和 loss 接口。</li>
+<li><code>attention.py</code>：模型特有 attention 及其 mask/cache-free 训练路径。</li>
+<li><code>feed_forward.py</code>：Dense FFN、MoE router、shared/routed experts。</li>
+<li><code>config_registry.py</code>：至少提供 <code>debug</code>、<code>reduced</code> 和正式规格。</li>
+</ul>
+<p>这一阶段应满足：</p>
+<ol>
+<li>配置字段能完整描述架构，不能依赖不可见的命令行覆盖才能启动。</li>
+<li>单卡前向、反向和 loss 可执行，输入输出 shape 与模型契约一致。</li>
+<li>参数总量和逐层参数量与独立公式一致。</li>
+<li>Dense/MoE layer 的选择规则、特殊首尾层和共享权重关系正确。</li>
+<li>对非法配置尽早报错，例如 head、序列长度、专家数不能被目标并行度整除。</li>
+</ol>
+<p>不要在基础模型里提前混入 DTensor、DeviceMesh 或模拟器特例。并行布局、NPU 融合和模拟器 shape-only 行为应分别由并行计划、converter 和模拟器适配承担。</p>
+<h2 id="3">3. 接入注册、配置和权重转换</h2>
+<p>一个可被框架发现的模型至少需要完成：</p>
+<ol>
+<li>在模型包中提供 <code>ModelSpec</code>，注册 model、parallelize、pipeline、loss、optimizer 后处理和 state-dict adapter。</li>
+<li>在 <code>torchtitan_npu</code> 的模型注入/注册入口中声明模型，使 <code>--module</code> 和配置解析能命中它。</li>
+<li>提供可直接运行的训练配置与模拟器配置，并使用仓库内有效的 tokenizer/test asset。</li>
+<li>实现 checkpoint、DCP 或 HF 权重所需的 state-dict 双向转换。</li>
+</ol>
+<p>权重转换要与运行时模块布局保持同一份约定。例如 MoE 的 <code>w1/w3</code> 合并成 <code>w13</code> 后，converter、state-dict adapter、并行切分和算子建模都必须使用同一个维度顺序。不能只让随机初始化路径可用，而让加载或保存后的权重悄悄错位。</p>
+<p>推荐至少验证以下回路：</p>
+<pre><code class="language-text">外部权重 -&gt; 框架 state_dict -&gt; 构造模型 -&gt; 保存 -&gt; 重新加载
+</code></pre>
+<p>若存在合并/拆分权重，回路后逐 tensor 校验名称、shape、dtype 和拆分/合并顺序。meta 建模只要求 state-dict schema 闭环；数值逐元素比较属于另行声明的真实权重兼容性范围。</p>
+<p>更多 converter 和 state-dict 扩展方式见<a href="../model_custom/">模型定制</a>。</p>
+<h2 id="4-npu">4. 接入 NPU 融合算子和模型特有算子</h2>
+<p>优先复用通用 converter，例如 RMSNorm、RoPE、GMM；只有语义或权重布局确实不同才增加模型专用 converter。接入时需明确：</p>
+<ul>
+<li>converter 的执行顺序以及它依赖的前置转换。</li>
+<li>替换前后的模块 FQN 是否稳定，已有 hook、参数和 state dict 是否仍可追踪。</li>
+<li>训练前向和反向分别对应哪些原始算子。</li>
+<li>算子是否真正保持融合边界，还是退化成大量小算子。</li>
+<li>自定义 autograd 的梯度个数、shape 和 dtype 是否与输入一一对应。</li>
+</ul>
+<p>模型特有的 Triton、KDA、门控 RMSNorm 等算子，在模拟器中不要求实现真实数值 kernel，但必须提供准确的 shape-only 前向/反向，并以真实 raw op 名称被 hook。不能为了“能跑”把它展开成标量、小 MM 或逐元素算子，否则算子数量、依赖、耗时和显存估计都会失真。</p>
+<p>自定义 autograd 与 DTensor 组合时需要特别处理：</p>
+<ol>
+<li>本地 shape-only 算子只接收 local tensor。</li>
+<li>输出需要按输入的 mesh 和 placement 重新封装。</li>
+<li>backward 返回的本地梯度也要满足原 placement。</li>
+<li>hook 应在模型构造和并行化完成后的正确阶段绑定，避免替换模块时丢失并行参数或 hook。</li>
+</ol>
+<p>融合算子的通用接入方式见<a href="../npu_fused_ops/">NPU 融合算子</a>。</p>
+<h2 id="5">5. 按统一顺序接入并行</h2>
+<p>并行实现要显式表达参数、激活和通信布局，不应只以“多卡不报错”作为目标。推荐按以下顺序开发：</p>
+<ol>
+<li>非 MoE 部分 TP。</li>
+<li>MoE 的 EP/ETP，以及它与 TP 的组合。</li>
+<li>CP。</li>
+<li>activation checkpoint。</li>
+<li>FSDP 或 eFSDP。</li>
+<li>DP replicate 或其他外层数据并行。</li>
+<li>最后接入 PP。</li>
+</ol>
+<p>具体代码顺序应与当前训练主分支的通用模型保持一致；顺序变化必须说明其布局依据。每种并行需写清下面的契约：</p>
+<table>
+<thead>
+<tr>
+<th>并行</th>
+<th>参数布局</th>
+<th>关键激活布局</th>
+<th>典型通信</th>
+<th>必查约束</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>TP</td>
+<td>attention/FFN 指定维度 shard</td>
+<td>hidden/head/intermediate 维的 shard 或 replicate</td>
+<td>all-reduce、reduce-scatter、all-gather</td>
+<td>head、KV head、intermediate size 可切分</td>
+</tr>
+<tr>
+<td>EP</td>
+<td>routed experts 按 expert 维分布</td>
+<td>token 按目的专家重排</td>
+<td>all-to-all/dispatch/combine</td>
+<td>expert 数、top-k、group 与 rank 映射</td>
+</tr>
+<tr>
+<td>ETP</td>
+<td>单个专家内部矩阵切分</td>
+<td>expert token 与 intermediate shard</td>
+<td>expert 内 collective</td>
+<td>与 EP mesh 正交且 shape 不重复除</td>
+</tr>
+<tr>
+<td>CP</td>
+<td>sequence/context 维切分</td>
+<td>local sequence、KV/attention 中间量</td>
+<td>ring/all-to-all 等 CP 通信</td>
+<td>sequence length 与 mask/RoPE offset</td>
+</tr>
+<tr>
+<td>FSDP</td>
+<td>参数/梯度按 DP shard</td>
+<td>计算前临时 unshard</td>
+<td>all-gather、reduce-scatter</td>
+<td>replicated 参数、padding、reshard 时机</td>
+</tr>
+<tr>
+<td>eFSDP</td>
+<td>composable FSDP 布局</td>
+<td>与模块级 fully_shard 边界一致</td>
+<td>all-gather、reduce-scatter</td>
+<td>shard group、模块边界和 DTensor placement</td>
+</tr>
+<tr>
+<td>PP</td>
+<td>layer/stage 切分</td>
+<td>microbatch 激活跨 stage</td>
+<td>send/recv</td>
+<td>stage 边界、loss stage、schedule</td>
+</tr>
+</tbody>
+</table>
+<p>组合并行时，逐个维度计算 local shape，禁止简单使用 <code>global/world_size</code>。例如：</p>
+<ul>
+<li>replicated 参数不应除以任何并行度；</li>
+<li>routed expert 参数只按 EP 和可能的 ETP/FSDP 维度切分；</li>
+<li>TP 与 ETP 作用于不同语义维度时分别计算；</li>
+<li>EP/ETP 通常不作为 world-size 公式之外的额外乘数，而是已有 mesh 维度的解释；</li>
+<li>FSDP 计算瞬间存在 full-parameter residency，静态 shard 大小不能代替峰值。</li>
+</ul>
+<p>并行入口还应在执行前校验 mesh 和整除条件，使不支持的组合明确失败，而不是静默回退成 replicate。</p>
+<h2 id="6-achook">6. 补齐 AC、Hook、插件和训练生命周期</h2>
+<p>模型接入不仅包括主前向，还要检查框架在模型生命周期上的所有扩展点：</p>
+<ul>
+<li>activation checkpoint：<code>none</code>、<code>full</code>、<code>selective</code>。</li>
+<li>memory estimator、memory snapshot、激活值 hook、module hook。</li>
+<li>算子统计、原始 op 捕获和导出。</li>
+<li>optimizer 构造后处理、梯度裁剪、checkpoint save/load。</li>
+<li>compile、激活 offload 等声明支持的特性。</li>
+</ul>
+<p>重计算场景必须区分 <code>original_forward</code>、<code>recompute</code> 和 <code>backward</code>。如果把两次 forward 合并统计，核心算子数量、依赖关系和激活生命周期都会错误。</p>
+<p>模块替换或 converter 执行后，检查 FQN 是否仍可被插件找到。模型专用 fused op 也必须经过同一套 hook 和统计链路，不能成为显存、算子统计或依赖捕获的盲区。</p>
+<h2 id="7">7. 接入模拟器建模</h2>
+<p>模拟器配置应尽量复用真实模型配置，仅覆盖运行规模、硬件和输出项。接入内容包括：</p>
+<ol>
+<li>模型能在 meta/fake 路径构造并执行。</li>
+<li>所有模型特有算子都有 shape-only 前向和反向。</li>
+<li>raw op 名称、FQN、dtype、global/local shape 可被记录。</li>
+<li>通信事件按 rank-local 语义捕获，并保留 group、peer 和字节数。</li>
+<li>前向、重计算、反向依赖能够生成可回放 DAG。</li>
+<li>参数、梯度、optimizer、saved activation、临时 buffer 和通信 buffer 能进入显存模型。</li>
+</ol>
+<p>不要用全局 monkeypatch 恢复已经删除的模拟器 shim；应使用当前主分支提供的模块级 bridge 或 converter 扩展点。模拟器只替代数值计算，不应绕开真实模型结构、并行计划和 autograd 拓扑。</p>
+<p>运行和输出文件说明见<a href="../../user-guides/simulator/">模拟器使用指南</a>。通信归属、依赖重建和显存模型分别见：</p>
+<ul>
+<li><a href="../../design/communication-ownership-contract/">通信归属契约</a></li>
+<li><a href="../../design/schedule-plan-dependency-reconstruction-contract/">调度计划依赖重建契约</a></li>
+<li><a href="../../design/simulator-memory-model-design/">模拟器显存模型设计</a></li>
+</ul>
+<h2 id="8">8. 建立测试分层并进入最终验收</h2>
+<p>开发阶段至少建立以下测试：</p>
+<ul>
+<li>配置和 registry 单测。</li>
+<li>单卡模型构造、参数量、前向/反向 shape 单测。</li>
+<li>state-dict 转换和 round-trip 单测。</li>
+<li>每种并行的布局计划与非法配置单测。</li>
+<li>模型特有算子的 forward/backward shape、DTensor 和 hook 单测。</li>
+<li>模拟器单步、通信捕获和显存输出 smoke test。</li>
+<li>reduced 规格的 meta 单步、AC 开关和核心并行组合测试。</li>
+</ul>
+<p>这些测试用于尽早发现局部问题，但不能替代最终验收。实现完成后，按照<a href="../../test_guides/model_acceptance/">新模型最终验收规范</a>生成完整证据包并给出结论。</p>
+<h2 id="_2">常见失效模式</h2>
+<table>
+<thead>
+<tr>
+<th>现象</th>
+<th>常见根因</th>
+<th>应对方式</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>单卡可跑，多卡 shape 错</td>
+<td>local/global shape 混用，重复除并行度</td>
+<td>为每个 tensor 记录语义维和 placement</td>
+</tr>
+<tr>
+<td>TP 后 hook 调用 <code>to_local</code> 失败</td>
+<td>自定义算子丢失 DTensor 包装</td>
+<td>local 执行后按原 mesh/placement 重封装</td>
+</tr>
+<tr>
+<td>算子总数很大且都是小算子</td>
+<td>fused/Triton op 被分解或未被 hook</td>
+<td>使用真实 raw op 的 shape-only bridge</td>
+</tr>
+<tr>
+<td>AC 后算子数翻倍但统计无法解释</td>
+<td>原始前向和 recompute 未区分</td>
+<td>按 execution kind 分桶统计</td>
+</tr>
+<tr>
+<td>FSDP 通信存在但回放错误</td>
+<td>unshard/reshard/grad RS 的依赖边错误</td>
+<td>校验通信前后最后生产者和首个消费者</td>
+</tr>
+<tr>
+<td>EP 前向正常、反向挂起或次序错</td>
+<td>dispatch/combine 的逆向依赖缺失</td>
+<td>独立核对 backward all-to-all 链路</td>
+</tr>
+<tr>
+<td>显存远小于真实值</td>
+<td>只统计静态 shard，漏 full-param 或临时量</td>
+<td>分 persistent、transient、saved activation 建模</td>
+</tr>
+<tr>
+<td>默认配置无法启动</td>
+<td>tokenizer、配置名或注册依赖隐藏覆盖</td>
+<td>使用仓库资产执行零额外参数 smoke test</td>
+</tr>
+<tr>
+<td>rebase 后旧 bug 回归</td>
+<td>冲突时恢复了模型分支旧通用实现</td>
+<td>以训练主分支当前通用实现为基线重适配</td>
+</tr>
+<tr>
+<td>测试命令失效</td>
+<td>沿用过期配置名、算子名或接口</td>
+<td>以目标基线现有 API 编写测试</td>
+</tr>
+</tbody>
+</table>
+              
+            </div>
+          </div><footer>
+    <div class="rst-footer-buttons" role="navigation" aria-label="Footer Navigation">
+        <a href="../muon_optimizer/" class="btn btn-neutral float-left" title="Muon 优化器特性"><span class="icon icon-circle-arrow-left"></span> Previous</a>
+        <a href="../npu_fused_ops/" class="btn btn-neutral float-right" title="NPU 融合算子适配">Next <span class="icon icon-circle-arrow-right"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <!-- Copyright etc -->
+  </div>
+
+  Built with <a href="https://www.mkdocs.org/">MkDocs</a> using a <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a> provided by <a href="https://readthedocs.org">Read the Docs</a>.
+</footer>
+          
+        </div>
+      </div>
+
+    </section>
+
+  </div>
+
+  <div class="rst-versions" role="note" aria-label="Versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    
+    
+      <span><a href="../muon_optimizer/" style="color: #fcfcfc">&laquo; Previous</a></span>
+    
+    
+      <span><a href="../npu_fused_ops/" style="color: #fcfcfc">Next &raquo;</a></span>
+    
+  </span>
+</div>
+    <script src="../../js/jquery-3.6.0.min.js"></script>
+    <script>var base_url = "../..";</script>
+    <script src="../../js/theme_extra.js"></script>
+    <script src="../../js/theme.js"></script>
+    <script>
+        jQuery(function () {
+            SphinxRtdTheme.Navigation.enable(true);
+        });
+    </script>
+
+</body>
+</html>

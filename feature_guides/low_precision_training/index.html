@@ -52,13 +52,40 @@
                   <li class="toctree-l1"><a class="reference internal" href="../../community/versioning_policy/">版本策略</a>
                   </li>
               </ul>
+              <p class="caption"><span class="caption-text">Design</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/1f1b-schedule-plan-assembly-guide/">1F1B 完整依赖组装与 DES 回放实现指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/alltoall-capture-analysis/">all_to_all 通信捕获缺失分析</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/communication-ownership-contract/">Communication Ownership Contract</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/dualpipev-schedule-plan-consumer-guide/">DualPipeV SchedulePlan 下游接入指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/l2-l3-schedule-plan-design/">L2/L3 调度 IR 重构设计：从扁平 trace 到结构化 SchedulePlan</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/low-precision-sim-analysis/">低精度训练（MXFP8）Simulator 使能分析</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/optimizer-ops-analysis/">优化器算子捕获问题分析</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/pipeline-multi-graph-capture-design/">复杂 Pipeline 策略下完整计算图捕获方案设计</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/pp-l2-capture-architecture/">PP L2 Capture Architecture</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/schedule-capture-design/">L0-L3 IR 层级归属设计</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/schedule-plan-dependency-reconstruction-contract/">SchedulePlan 下游依赖重建契约</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/schedule-plan-des-consumer-guide/">SchedulePlan 依赖重建与 DES 消费指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/simulator-memory-model-design/">Simulator Memory Model 改造设计</a>
+                  </li>
+              </ul>
               <p class="caption"><span class="caption-text">Feature guides</span></p>
               <ul class="current">
                   <li class="toctree-l1"><a class="reference internal" href="../checkpoint/">Checkpoint 使用指南</a>
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../deepseek_v32_mtp/">多Token预测特性(Multi Token Prediction, MTP)</a>
-                  </li>
-                  <li class="toctree-l1"><a class="reference internal" href="../fsdp_parameter_precision/">Fsdp parameter precision</a>
                   </li>
                   <li class="toctree-l1 current"><a class="reference internal current" href="#">低精度训练特性（MXFP8）</a>
     <ul class="current">
@@ -78,13 +105,11 @@
         <ul>
     <li class="toctree-l3"><a class="reference internal" href="#mxfp8converter">MXFP8Converter 配置</a>
     </li>
-    <li class="toctree-l3"><a class="reference internal" href="#_6">环境变量配置</a>
-    </li>
-    <li class="toctree-l3"><a class="reference internal" href="#_7">配置示例</a>
+    <li class="toctree-l3"><a class="reference internal" href="#_6">配置示例</a>
     </li>
         </ul>
     </li>
-    <li class="toctree-l2"><a class="reference internal" href="#_8">验证清单</a>
+    <li class="toctree-l2"><a class="reference internal" href="#_7">验证清单</a>
     </li>
     </ul>
                   </li>
@@ -94,9 +119,9 @@
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../muon_optimizer/">Muon 优化器特性</a>
                   </li>
-                  <li class="toctree-l1"><a class="reference internal" href="../npu_fused_ops/">NPU 融合算子适配</a>
+                  <li class="toctree-l1"><a class="reference internal" href="../new_model_onboarding/">新模型接入开发流程</a>
                   </li>
-                  <li class="toctree-l1"><a class="reference internal" href="../npu_tnd_attention/">TND Attention (Per-Document Causal Attention)</a>
+                  <li class="toctree-l1"><a class="reference internal" href="../npu_fused_ops/">NPU 融合算子适配</a>
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../swap_optimizer/">SwapOptimizer 特性</a>
                   </li>
@@ -118,8 +143,33 @@
                   <li class="toctree-l1"><a class="reference internal" href="../../recipe/sft/">SFT 指令微调</a>
                   </li>
               </ul>
+              <p class="caption"><span class="caption-text">Superpowers</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" >Plans</a>
+    <ul>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/plans/2026-07-01-mhc-real-op-name-capture-implementation/">MHC Real-Op-Name Capture Implementation Plan</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/plans/2026-07-01-npu-simulator-implementation/">torchtitan_npu Simulator Implementation Plan</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/plans/2026-07-01-smla-real-op-name-capture-implementation/">SMLA Real-Op-Name Capture Implementation Plan</a>
+                </li>
+    </ul>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" >Specs</a>
+    <ul>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/specs/2026-07-01-mhc-real-op-name-capture-design/">MHC 真实算子名捕获 — 架构与方案设计（阶段一：MHC）</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/specs/2026-07-01-npu-simulator-design/">torchtitan_npu Simulator — 架构与方案设计</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/specs/2026-07-01-smla-real-op-name-capture-design/">SMLA 真实算子名捕获 — 架构与方案设计（阶段二：SMLA）</a>
+                </li>
+    </ul>
+                  </li>
+              </ul>
               <p class="caption"><span class="caption-text">Test guides</span></p>
               <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../test_guides/model_acceptance/">新模型最终验收规范（Meta 模拟器）</a>
+                  </li>
                   <li class="toctree-l1"><a class="reference internal" href="../../test_guides/test_design/">测试设计</a>
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../../test_guides/test_guide/">测试使用指南</a>
@@ -127,9 +177,13 @@
               </ul>
               <p class="caption"><span class="caption-text">User guides</span></p>
               <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/deepseek_v4_model_parameters/">DeepSeek-V4 模型参数 Web 字段目录</a>
+                  </li>
                   <li class="toctree-l1"><a class="reference internal" href="../../user-guides/installation/">软件安装</a>
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../../user-guides/quickstart/">快速上手</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/simulator/">Simulator 使用指南</a>
                   </li>
               </ul>
       </div>
@@ -230,24 +284,7 @@
 </tr>
 </tbody>
 </table>
-<h3 id="_6">环境变量配置</h3>
-<table>
-<thead>
-<tr>
-<th>环境变量</th>
-<th>默认值</th>
-<th>说明</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td><code>MXFP8_DUAL_AXIS_FORWARD</code></td>
-<td><code>1</code>（启用）</td>
-<td>控制 MXFP8 线性层和 MoE 专家层是否启用 forward dual-axis 量化（forward 阶段同时生成 backward 的量化数据），默认启用。设置为 <code>0</code> 或 <code>false</code> 可关闭，forward 回退到 single-axis 量化行为。无论 <code>MXFP8_DUAL_AXIS_FORWARD</code> 是否启用，Linear的 backward grad始终使用 dual-axis 量化。</td>
-</tr>
-</tbody>
-</table>
-<h3 id="_7">配置示例</h3>
+<h3 id="_6">配置示例</h3>
 <p>在模型的 <code>config_registry.py</code> 中配置 <code>model_converters</code> 并添加 <code>MXFP8Converter</code>：</p>
 <p><strong>示例：对指定线性层和 MoE 专家层启用 MXFP8 低精度训练</strong></p>
 <pre><code class="language-python">from torchtitan.components.quantization.mx import MXFP8Converter
@@ -273,6 +310,7 @@ model_converters = ModelConvertersContainer.Config(
                 &quot;pre_attention.wq_b&quot;,
                 &quot;pre_attention.wkv&quot;,
                 &quot;pre_attention.indexer.wq_b&quot;,
+                &quot;pre_attention.indexer.weights_proj&quot;,
                 &quot;post_attention.wo_a&quot;,
                 &quot;post_attention.wo_b&quot;,
                 # MoE 专家层
@@ -283,7 +321,7 @@ model_converters = ModelConvertersContainer.Config(
     ],
 )
 </code></pre>
-<h2 id="_8">验证清单</h2>
+<h2 id="_7">验证清单</h2>
 <ol>
 <li><strong>确认 converter 生效</strong>：启动日志中应出现以下关键字：</li>
 <li><code>MXFP8 MoE training enabled</code>（来自上游 <code>MXFP8Converter.__init__</code>）</li>
@@ -298,7 +336,7 @@ model_converters = ModelConvertersContainer.Config(
             </div>
           </div><footer>
     <div class="rst-footer-buttons" role="navigation" aria-label="Footer Navigation">
-        <a href="../fsdp_parameter_precision/" class="btn btn-neutral float-left" title="Fsdp parameter precision"><span class="icon icon-circle-arrow-left"></span> Previous</a>
+        <a href="../deepseek_v32_mtp/" class="btn btn-neutral float-left" title="多Token预测特性(Multi Token Prediction, MTP)"><span class="icon icon-circle-arrow-left"></span> Previous</a>
         <a href="../metrics_and_debugging/" class="btn btn-neutral float-right" title="调试支持特性">Next <span class="icon icon-circle-arrow-right"></span></a>
     </div>
 
@@ -322,7 +360,7 @@ model_converters = ModelConvertersContainer.Config(
   <span class="rst-current-version" data-toggle="rst-current-version">
     
     
-      <span><a href="../fsdp_parameter_precision/" style="color: #fcfcfc">&laquo; Previous</a></span>
+      <span><a href="../deepseek_v32_mtp/" style="color: #fcfcfc">&laquo; Previous</a></span>
     
     
       <span><a href="../metrics_and_debugging/" style="color: #fcfcfc">Next &raquo;</a></span>

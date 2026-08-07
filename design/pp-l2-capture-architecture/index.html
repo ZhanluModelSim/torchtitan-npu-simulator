@@ -1,0 +1,461 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" >
+<head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+      <link rel="shortcut icon" href="../../img/favicon.ico" />
+    <title>PP L2 Capture Architecture - torchtitan-npu</title>
+    <link rel="stylesheet" href="../../css/theme.css" />
+    <link rel="stylesheet" href="../../css/theme_extra.css" />
+        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/styles/github.min.css" />
+    
+      <script>
+        // Current page data
+        var mkdocs_page_name = "PP L2 Capture Architecture";
+        var mkdocs_page_input_path = "design/pp-l2-capture-architecture.md";
+        var mkdocs_page_url = null;
+      </script>
+    
+    <!--[if lt IE 9]>
+      <script src="../../js/html5shiv.min.js"></script>
+    <![endif]-->
+      <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/highlight.min.js"></script>
+      <script>hljs.highlightAll();</script> 
+</head>
+
+<body class="wy-body-for-nav" role="document">
+
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side stickynav">
+    <div class="wy-side-scroll">
+      <div class="wy-side-nav-search">
+          <a href="../.." class="icon icon-home"> torchtitan-npu
+        </a>
+      </div>
+
+      <div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <ul>
+                <li class="toctree-l1"><a class="reference internal" href="../..">Home</a>
+                </li>
+              </ul>
+              <ul>
+                <li class="toctree-l1"><a class="reference internal" href="../../lint_guide/">Lint 指南</a>
+                </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Community</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../community/contributors/">提交者与贡献者（Committers and Contributors）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../community/governance/">社区治理</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../community/versioning_policy/">版本策略</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Design</span></p>
+              <ul class="current">
+                  <li class="toctree-l1"><a class="reference internal" href="../1f1b-schedule-plan-assembly-guide/">1F1B 完整依赖组装与 DES 回放实现指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../alltoall-capture-analysis/">all_to_all 通信捕获缺失分析</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../communication-ownership-contract/">Communication Ownership Contract</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../dualpipev-schedule-plan-consumer-guide/">DualPipeV SchedulePlan 下游接入指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../l2-l3-schedule-plan-design/">L2/L3 调度 IR 重构设计：从扁平 trace 到结构化 SchedulePlan</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../low-precision-sim-analysis/">低精度训练（MXFP8）Simulator 使能分析</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../optimizer-ops-analysis/">优化器算子捕获问题分析</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../pipeline-multi-graph-capture-design/">复杂 Pipeline 策略下完整计算图捕获方案设计</a>
+                  </li>
+                  <li class="toctree-l1 current"><a class="reference internal current" href="#">PP L2 Capture Architecture</a>
+    <ul class="current">
+    <li class="toctree-l2"><a class="reference internal" href="#1-goal">1. Goal</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#2-rank-identities">2. Rank Identities</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#3-canonical-capture-records">3. Canonical Capture Records</a>
+        <ul>
+    <li class="toctree-l3"><a class="reference internal" href="#compute-action">Compute action</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#pipeline-transfer">Pipeline transfer</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#fsdp-residency-transition">FSDP residency transition</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#explicit-schedule-only-actions">Explicit schedule-only actions</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#ordering">Ordering</a>
+    </li>
+        </ul>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#4-canonical-l2-assembly">4. Canonical L2 Assembly</a>
+        <ul>
+    <li class="toctree-l3"><a class="reference internal" href="#stage-local-dependencies">Stage-local dependencies</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#cross-stage-dependencies">Cross-stage dependencies</a>
+    </li>
+        </ul>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#5-compatibility-rules">5. Compatibility Rules</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#6-required-validation">6. Required Validation</a>
+    </li>
+    </ul>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../schedule-capture-design/">L0-L3 IR 层级归属设计</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../schedule-plan-dependency-reconstruction-contract/">SchedulePlan 下游依赖重建契约</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../schedule-plan-des-consumer-guide/">SchedulePlan 依赖重建与 DES 消费指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../simulator-memory-model-design/">Simulator Memory Model 改造设计</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Feature guides</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/checkpoint/">Checkpoint 使用指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/deepseek_v32_mtp/">多Token预测特性(Multi Token Prediction, MTP)</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/low_precision_training/">低精度训练特性（MXFP8）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/metrics_and_debugging/">调试支持特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/model_custom/">Model Custom框架介绍</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/muon_optimizer/">Muon 优化器特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/new_model_onboarding/">新模型接入开发流程</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/npu_fused_ops/">NPU 融合算子适配</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/swap_optimizer/">SwapOptimizer 特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/torch_compile/">torch.compile 支持</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/virtual_optimizer/">Virtual Optimizer - 优化器显存虚拟化特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/vlm/">VLM NPU 支持</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" >Parallelism</a>
+    <ul>
+                <li class="toctree-l2"><a class="reference internal" href="../../feature_guides/parallelism/custom_cp/">自定义 Context Parallel 特性</a>
+                </li>
+    </ul>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Recipe</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../recipe/sft/">SFT 指令微调</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Superpowers</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" >Plans</a>
+    <ul>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/plans/2026-07-01-mhc-real-op-name-capture-implementation/">MHC Real-Op-Name Capture Implementation Plan</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/plans/2026-07-01-npu-simulator-implementation/">torchtitan_npu Simulator Implementation Plan</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/plans/2026-07-01-smla-real-op-name-capture-implementation/">SMLA Real-Op-Name Capture Implementation Plan</a>
+                </li>
+    </ul>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" >Specs</a>
+    <ul>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/specs/2026-07-01-mhc-real-op-name-capture-design/">MHC 真实算子名捕获 — 架构与方案设计（阶段一：MHC）</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/specs/2026-07-01-npu-simulator-design/">torchtitan_npu Simulator — 架构与方案设计</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/specs/2026-07-01-smla-real-op-name-capture-design/">SMLA 真实算子名捕获 — 架构与方案设计（阶段二：SMLA）</a>
+                </li>
+    </ul>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Test guides</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../test_guides/model_acceptance/">新模型最终验收规范（Meta 模拟器）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../test_guides/test_design/">测试设计</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../test_guides/test_guide/">测试使用指南</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">User guides</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/deepseek_v4_model_parameters/">DeepSeek-V4 模型参数 Web 字段目录</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/installation/">软件安装</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/quickstart/">快速上手</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/simulator/">Simulator 使用指南</a>
+                  </li>
+              </ul>
+      </div>
+    </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap">
+      <nav class="wy-nav-top" role="navigation" aria-label="Mobile navigation menu">
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../..">torchtitan-npu</a>
+        
+      </nav>
+      <div class="wy-nav-content">
+        <div class="rst-content"><div role="navigation" aria-label="breadcrumbs navigation">
+  <ul class="wy-breadcrumbs">
+    <li><a href="../.." class="icon icon-home" aria-label="Docs"></a></li>
+          <li class="breadcrumb-item">Design</li>
+      <li class="breadcrumb-item active">PP L2 Capture Architecture</li>
+    <li class="wy-breadcrumbs-aside">
+    </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+            <div class="section" itemprop="articleBody">
+              
+                <h1 id="pp-l2-capture-architecture">PP L2 Capture Architecture</h1>
+<h2 id="1-goal">1. Goal</h2>
+<p>The simulator captures one representative process for each pipeline stage while
+describing a larger logical device mesh. L2 must export the actual rank-local
+execution order and enough stable identities for an external assembler or DES
+to connect plans from different stages.</p>
+<p>The capture must not depend on a specific TorchTitan schedule implementation.
+1F1B, GPipe, interleaved schedules, and runtime schedules eventually execute
+the same semantic interfaces:</p>
+<ul>
+<li><code>PipelineStage.forward_one_chunk</code></li>
+<li><code>PipelineStage.backward_one_chunk</code></li>
+<li><code>PipelineStage.backward_weight_one_chunk</code></li>
+<li>pipeline P2P operations</li>
+<li>FSDP parameter-group unshard, wait, and reshard</li>
+<li>gradient collectives</li>
+</ul>
+<p>These interfaces are the capture boundary. TorchTitan's lowered schedule is
+useful for validation, but is not the primary L2 source.</p>
+<p>Communication is normalized before export according to
+<a href="../communication-ownership-contract/"><code>communication-ownership-contract.md</code></a>.
+Communication inside a compute span belongs to its immutable L1 template.
+Only PP transfers, external FSDP prefetch, and genuinely standalone
+collectives remain in L2.</p>
+<h2 id="2-rank-identities">2. Rank Identities</h2>
+<p>A <code>multi_proc_meta</code> worker has two rank identities:</p>
+<table>
+<thead>
+<tr>
+<th>Identity</th>
+<th>Meaning</th>
+<th>Example: world=64, PP=4</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>capture_process_rank</code></td>
+<td>Real Gloo control-plane rank</td>
+<td><code>0,1,2,3</code></td>
+</tr>
+<tr>
+<td><code>logical_global_rank</code></td>
+<td>Representative rank in the complete mesh</td>
+<td><code>0,16,32,48</code></td>
+</tr>
+</tbody>
+</table>
+<p>The real Gloo group only advances PP control traffic. DeviceMesh slicing,
+DTensor placement, FSDP/EP/TP groups, and rank-table metadata use the logical
+rank. P2P peer ranks remain capture-process ranks.</p>
+<p><code>SimulationRankContext</code> is the only conversion point. Code must not silently
+fall back to rank 0 when the distributed process group is not initialized.
+For PP greater than one, <code>RANK</code> and <code>WORLD_SIZE</code> must both be present (or an
+equivalent process group must already be initialized), and the physical world
+size must equal the PP degree.</p>
+<h2 id="3-canonical-capture-records">3. Canonical Capture Records</h2>
+<p>Each worker records a rank-local semantic action stream.</p>
+<p>Runtime schedules also emit an intent record for every explicit action. Intent
+records are an integrity oracle, not the source of tensor dependencies. A
+normal <code>F</code>, <code>B</code>, <code>I</code>, or <code>W</code> intent must have a matching compute execution
+record. Missing matches fail capture instead of silently assigning later work
+to a stale stage.</p>
+<h3 id="compute-action">Compute action</h3>
+<p>Identity:</p>
+<pre><code class="language-text">(stage, comp_type, microbatch)
+</code></pre>
+<p><code>comp_type</code> is <code>F</code>, <code>B</code>, <code>I</code>, or <code>W</code>. The first occurrence of each
+<code>(stage, comp_type)</code> captures the full L0 graph as a reusable template. Every
+occurrence records an L2 compute instance.</p>
+<h3 id="pipeline-transfer">Pipeline transfer</h3>
+<p>Identity:</p>
+<pre><code class="language-text">pp:{forward|backward}:s{src}-&gt;s{dst}:mb{microbatch}:t{tensor_ordinal}
+</code></pre>
+<p>SEND and RECV plans from different workers carry the same <code>transfer_id</code>.
+Multiple tensors in one P2P batch use distinct ordinals. The external assembler
+must join transfers by <code>transfer_id</code>, not by local <code>seq_idx</code>.</p>
+<h3 id="fsdp-residency-transition">FSDP residency transition</h3>
+<p>Identity:</p>
+<pre><code class="language-text">fsdp:r{capture_rank}:g{parameter_group_id}:u{transition_ordinal}
+</code></pre>
+<p>The transition ID connects:</p>
+<ol>
+<li>the all-gather launched by <code>unshard</code>;</li>
+<li>the full-parameter allocation observed by <code>wait_for_unshard</code>;</li>
+<li>the later residency release observed by <code>reshard</code>.</li>
+</ol>
+<p>FSDP may call <code>unshard</code> again while a previous asynchronous all-gather is in
+flight. A no-op call must retain the in-flight transition ID. A new ID becomes
+active only when that call launches a collective.</p>
+<p>One logical transition has two observable timelines:</p>
+<ul>
+<li>schedule intent: the explicit <code>UNSHARD</code> or <code>RESHARD</code> action position;</li>
+<li>residency state: full-parameter allocation after async unshard wait, and
+  actual release when reshard changes state.</li>
+</ul>
+<p>Assembly merges both by <code>(transition_id, action)</code>. It keeps the explicit
+<code>UNSHARD</code> position, but uses the actual state-loss position for <code>RESHARD</code>.
+Memory replay uses state events, not intent events.</p>
+<h3 id="explicit-schedule-only-actions">Explicit schedule-only actions</h3>
+<p>Some runtime schedules contain <code>REDUCE_GRAD</code> even when the meta execution path
+does not issue a collective. Capture records the schedule intent independently
+from communication. Ownership normalization removes a no-op intent. It also
+removes the L2 action when the real collective is already captured in B/I/W.
+The optimizer then depends directly on the last real local gradient producer.
+A real collective outside every compute template remains a REDUCE_GRAD action.</p>
+<h3 id="ordering">Ordering</h3>
+<p><code>action_order</code> is a recorder-owned monotonic semantic clock. <code>schedule_order</code>
+is assigned from this stream after assembly.</p>
+<p><code>seq_idx</code> is retained only as a reference into captured L0 operators and memory
+events. It is not a cross-rank clock and must not be used as transfer identity.</p>
+<h2 id="4-canonical-l2-assembly">4. Canonical L2 Assembly</h2>
+<p><code>SchedulePlan</code> is the authoritative L2 representation:</p>
+<pre><code class="language-text">semantic events
+    -&gt; CapturedTraceAssembler
+    -&gt; communication ownership plugins
+    -&gt; ordered ScheduleAction list
+    -&gt; typed DataSlot dependencies
+    -&gt; validation
+</code></pre>
+<p>The legacy <code>ScheduleGraph</code> is projected from the completed <code>SchedulePlan</code>.
+It must not independently match communication events or infer another
+execution order.</p>
+<p>Current exports carry <code>annotations.capture_schema_version = 2</code> and
+<code>annotations.capture_process_rank</code>. Consumers should reject an unsupported
+schema instead of treating missing <code>schedule_order</code>, <code>external</code>, or stable
+identity fields as empty defaults.</p>
+<p>The downstream reconstruction contract is documented in
+<a href="../schedule-plan-dependency-reconstruction-contract/"><code>schedule-plan-dependency-reconstruction-contract.md</code></a>.
+It defines local DataSlot dependencies, cross-rank rendezvous, logical-rank
+expansion, collective/FSDP state, and fail-fast validation without requiring
+consumers to understand capture internals.</p>
+<h3 id="stage-local-dependencies">Stage-local dependencies</h3>
+<ul>
+<li>external dataloader input -&gt; first-stage forward;</li>
+<li>RECV_F -&gt; local forward;</li>
+<li>forward -&gt; forward state -&gt; corresponding backward;</li>
+<li>RECV_B -&gt; local backward;</li>
+<li>external prefetch unshard -&gt; full parameter -&gt; owning compute;</li>
+<li>owning compute -&gt; control dependency -&gt; external prefetch reshard;</li>
+<li>standalone backward reduction -&gt; optimizer.</li>
+</ul>
+<p>Size-one FSDP groups and schedule-only actions without real work are omitted
+and create no blocking DataSlot. A real external unshard without a compute
+consumer, or a real reshard without an active unshard and preceding compute, is
+an error.</p>
+<h3 id="cross-stage-dependencies">Cross-stage dependencies</h3>
+<p>The sender plan contains:</p>
+<pre><code class="language-text">producer compute -&gt; local slot -&gt; SEND
+</code></pre>
+<p>The receiver plan contains:</p>
+<pre><code class="language-text">RECV -&gt; received slot -&gt; consumer compute
+</code></pre>
+<p>The external assembler joins SEND and RECV by <code>transfer_id</code>. Local action IDs
+and local sequence numbers are never compared across plans.</p>
+<p>Adjacent virtual stages mapped to the same capture process have no P2P
+collective. L2 synthesizes <code>is_local_transfer=True</code> activation and input-gradient
+slots from the complete stage-to-rank mapping. The terminal loss stage is also
+derived from that mapping, not from the physical PP worker count.</p>
+<h2 id="5-compatibility-rules">5. Compatibility Rules</h2>
+<ul>
+<li>Capture semantic interfaces, not schedule class names.</li>
+<li>Preserve explicit runtime schedule metadata as optional validation input.</li>
+<li>Never infer logical mesh membership from physical Gloo rank.</li>
+<li>Resolve process-group ranks from c10d's registered rank map.</li>
+<li>Keep meta DeviceMesh device type consistent with DTensor/FSDP while using
+  fake process groups for logical non-PP dimensions.</li>
+<li>Avoid reconstructing a distributed DTensor through <code>nn.Parameter</code>; preserve
+  its local meta shard and parameter marker.</li>
+<li>Treat missing identity fields only as legacy-input compatibility. New capture
+  paths must emit <code>action_order</code>, <code>transfer_id</code>, and FSDP <code>transition_id</code>.</li>
+</ul>
+<h2 id="6-required-validation">6. Required Validation</h2>
+<p>Minimum regression matrix:</p>
+<ol>
+<li>non-PP, single process;</li>
+<li>PP=2 1F1B with multiple microbatches;</li>
+<li>PP=2 GPipe;</li>
+<li>PP=2, EP=2, DP-shard=2 on logical world size 4;</li>
+<li>multi-tensor P2P transfer;</li>
+<li>repeated/asynchronous FSDP unshard;</li>
+<li>size-one E-FSDP no-op group;</li>
+<li>a runtime/interleaved schedule with <code>I</code>, <code>W</code>, and explicit residency actions;</li>
+<li>an explicit <code>REDUCE_GRAD</code> with and without a captured collective.</li>
+</ol>
+<p>For every multi-process case verify:</p>
+<ul>
+<li>every capture worker emits a non-empty plan;</li>
+<li>action <code>rank</code> is the capture-process rank;</li>
+<li>action <code>stage</code> is the actual PP stage;</li>
+<li>logical communication groups differ between PP stages when expected;</li>
+<li>SEND/RECV transfer IDs pair exactly once;</li>
+<li>every non-external DataSlot has a producer;</li>
+<li>replay reaches every non-noop action.</li>
+</ul>
+              
+            </div>
+          </div><footer>
+    <div class="rst-footer-buttons" role="navigation" aria-label="Footer Navigation">
+        <a href="../pipeline-multi-graph-capture-design/" class="btn btn-neutral float-left" title="复杂 Pipeline 策略下完整计算图捕获方案设计"><span class="icon icon-circle-arrow-left"></span> Previous</a>
+        <a href="../schedule-capture-design/" class="btn btn-neutral float-right" title="L0-L3 IR 层级归属设计">Next <span class="icon icon-circle-arrow-right"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <!-- Copyright etc -->
+  </div>
+
+  Built with <a href="https://www.mkdocs.org/">MkDocs</a> using a <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a> provided by <a href="https://readthedocs.org">Read the Docs</a>.
+</footer>
+          
+        </div>
+      </div>
+
+    </section>
+
+  </div>
+
+  <div class="rst-versions" role="note" aria-label="Versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    
+    
+      <span><a href="../pipeline-multi-graph-capture-design/" style="color: #fcfcfc">&laquo; Previous</a></span>
+    
+    
+      <span><a href="../schedule-capture-design/" style="color: #fcfcfc">Next &raquo;</a></span>
+    
+  </span>
+</div>
+    <script src="../../js/jquery-3.6.0.min.js"></script>
+    <script>var base_url = "../..";</script>
+    <script src="../../js/theme_extra.js"></script>
+    <script src="../../js/theme.js"></script>
+    <script>
+        jQuery(function () {
+            SphinxRtdTheme.Navigation.enable(true);
+        });
+    </script>
+
+</body>
+</html>

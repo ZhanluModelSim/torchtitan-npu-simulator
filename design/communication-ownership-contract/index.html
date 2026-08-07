@@ -1,0 +1,426 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" >
+<head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+      <link rel="shortcut icon" href="../../img/favicon.ico" />
+    <title>Communication Ownership Contract - torchtitan-npu</title>
+    <link rel="stylesheet" href="../../css/theme.css" />
+    <link rel="stylesheet" href="../../css/theme_extra.css" />
+        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/styles/github.min.css" />
+    
+      <script>
+        // Current page data
+        var mkdocs_page_name = "Communication Ownership Contract";
+        var mkdocs_page_input_path = "design/communication-ownership-contract.md";
+        var mkdocs_page_url = null;
+      </script>
+    
+    <!--[if lt IE 9]>
+      <script src="../../js/html5shiv.min.js"></script>
+    <![endif]-->
+      <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/highlight.min.js"></script>
+      <script>hljs.highlightAll();</script> 
+</head>
+
+<body class="wy-body-for-nav" role="document">
+
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side stickynav">
+    <div class="wy-side-scroll">
+      <div class="wy-side-nav-search">
+          <a href="../.." class="icon icon-home"> torchtitan-npu
+        </a>
+      </div>
+
+      <div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <ul>
+                <li class="toctree-l1"><a class="reference internal" href="../..">Home</a>
+                </li>
+              </ul>
+              <ul>
+                <li class="toctree-l1"><a class="reference internal" href="../../lint_guide/">Lint 指南</a>
+                </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Community</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../community/contributors/">提交者与贡献者（Committers and Contributors）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../community/governance/">社区治理</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../community/versioning_policy/">版本策略</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Design</span></p>
+              <ul class="current">
+                  <li class="toctree-l1"><a class="reference internal" href="../1f1b-schedule-plan-assembly-guide/">1F1B 完整依赖组装与 DES 回放实现指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../alltoall-capture-analysis/">all_to_all 通信捕获缺失分析</a>
+                  </li>
+                  <li class="toctree-l1 current"><a class="reference internal current" href="#">Communication Ownership Contract</a>
+    <ul class="current">
+    <li class="toctree-l2"><a class="reference internal" href="#1-boundary">1. Boundary</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#2-l1-stage-communication">2. L1 Stage Communication</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#3-l2-communication">3. L2 Communication</a>
+        <ul>
+    <li class="toctree-l3"><a class="reference internal" href="#pipeline-p2p">Pipeline P2P</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#external-fsdp-prefetch">External FSDP prefetch</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#standalone-gradient-reduction">Standalone gradient reduction</a>
+    </li>
+        </ul>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#4-consumer-rules">4. Consumer Rules</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#5-acceptance-checks">5. Acceptance Checks</a>
+    </li>
+    </ul>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../dualpipev-schedule-plan-consumer-guide/">DualPipeV SchedulePlan 下游接入指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../l2-l3-schedule-plan-design/">L2/L3 调度 IR 重构设计：从扁平 trace 到结构化 SchedulePlan</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../low-precision-sim-analysis/">低精度训练（MXFP8）Simulator 使能分析</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../optimizer-ops-analysis/">优化器算子捕获问题分析</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../pipeline-multi-graph-capture-design/">复杂 Pipeline 策略下完整计算图捕获方案设计</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../pp-l2-capture-architecture/">PP L2 Capture Architecture</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../schedule-capture-design/">L0-L3 IR 层级归属设计</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../schedule-plan-dependency-reconstruction-contract/">SchedulePlan 下游依赖重建契约</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../schedule-plan-des-consumer-guide/">SchedulePlan 依赖重建与 DES 消费指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../simulator-memory-model-design/">Simulator Memory Model 改造设计</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Feature guides</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/checkpoint/">Checkpoint 使用指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/deepseek_v32_mtp/">多Token预测特性(Multi Token Prediction, MTP)</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/low_precision_training/">低精度训练特性（MXFP8）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/metrics_and_debugging/">调试支持特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/model_custom/">Model Custom框架介绍</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/muon_optimizer/">Muon 优化器特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/new_model_onboarding/">新模型接入开发流程</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/npu_fused_ops/">NPU 融合算子适配</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/swap_optimizer/">SwapOptimizer 特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/torch_compile/">torch.compile 支持</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/virtual_optimizer/">Virtual Optimizer - 优化器显存虚拟化特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/vlm/">VLM NPU 支持</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" >Parallelism</a>
+    <ul>
+                <li class="toctree-l2"><a class="reference internal" href="../../feature_guides/parallelism/custom_cp/">自定义 Context Parallel 特性</a>
+                </li>
+    </ul>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Recipe</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../recipe/sft/">SFT 指令微调</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Superpowers</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" >Plans</a>
+    <ul>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/plans/2026-07-01-mhc-real-op-name-capture-implementation/">MHC Real-Op-Name Capture Implementation Plan</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/plans/2026-07-01-npu-simulator-implementation/">torchtitan_npu Simulator Implementation Plan</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/plans/2026-07-01-smla-real-op-name-capture-implementation/">SMLA Real-Op-Name Capture Implementation Plan</a>
+                </li>
+    </ul>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" >Specs</a>
+    <ul>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/specs/2026-07-01-mhc-real-op-name-capture-design/">MHC 真实算子名捕获 — 架构与方案设计（阶段一：MHC）</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/specs/2026-07-01-npu-simulator-design/">torchtitan_npu Simulator — 架构与方案设计</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/specs/2026-07-01-smla-real-op-name-capture-design/">SMLA 真实算子名捕获 — 架构与方案设计（阶段二：SMLA）</a>
+                </li>
+    </ul>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Test guides</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../test_guides/model_acceptance/">新模型最终验收规范（Meta 模拟器）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../test_guides/test_design/">测试设计</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../test_guides/test_guide/">测试使用指南</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">User guides</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/deepseek_v4_model_parameters/">DeepSeek-V4 模型参数 Web 字段目录</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/installation/">软件安装</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/quickstart/">快速上手</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/simulator/">Simulator 使用指南</a>
+                  </li>
+              </ul>
+      </div>
+    </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap">
+      <nav class="wy-nav-top" role="navigation" aria-label="Mobile navigation menu">
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../..">torchtitan-npu</a>
+        
+      </nav>
+      <div class="wy-nav-content">
+        <div class="rst-content"><div role="navigation" aria-label="breadcrumbs navigation">
+  <ul class="wy-breadcrumbs">
+    <li><a href="../.." class="icon icon-home" aria-label="Docs"></a></li>
+          <li class="breadcrumb-item">Design</li>
+      <li class="breadcrumb-item active">Communication Ownership Contract</li>
+    <li class="wy-breadcrumbs-aside">
+    </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+            <div class="section" itemprop="articleBody">
+              
+                <h1 id="communication-ownership-contract">Communication Ownership Contract</h1>
+<h2 id="1-boundary">1. Boundary</h2>
+<p>The simulator exports immutable L1 <code>StepGraph</code> templates and an L2
+<code>SchedulePlan</code>. Communication ownership is decided before either artifact is
+exported. The downstream predictor or DES must not move communication between
+these layers.</p>
+<p>Ownership is semantic and schedule-independent:</p>
+<table>
+<thead>
+<tr>
+<th>Observed behavior</th>
+<th>Owner</th>
+<th>Export</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>communication executes inside F/B/I/W</td>
+<td><code>L1_STAGE</code></td>
+<td>node in the referenced compute template</td>
+</tr>
+<tr>
+<td>PP send/receive between stages</td>
+<td><code>L2_PIPELINE</code></td>
+<td>SEND/RECV action plus a dedicated communication fragment</td>
+</tr>
+<tr>
+<td>FSDP prefetch issued outside compute</td>
+<td><code>L2_PREFETCH</code></td>
+<td>UNSHARD/RESHARD actions and residency slots</td>
+</tr>
+<tr>
+<td>standalone gradient collective</td>
+<td><code>L2_STANDALONE</code></td>
+<td>REDUCE_GRAD action</td>
+</tr>
+<tr>
+<td>schedule intent without real work</td>
+<td>none</td>
+<td>omitted</td>
+</tr>
+</tbody>
+</table>
+<p>The capture implementation must not branch on <code>1F1B</code>, <code>DualPipeV</code>, or another
+schedule name. It determines ownership from the real communication node,
+compute span, FSDP transition identity, and explicit schedule intent.</p>
+<h2 id="2-l1-stage-communication">2. L1 Stage Communication</h2>
+<p>All communication nodes in a compute template are part of that template's
+cost and dependency graph. This includes:</p>
+<ul>
+<li>TP, CP, and EP collectives;</li>
+<li>FSDP all-gather triggered while entering F/B/I/W;</li>
+<li>FSDP or DDP gradient reduction triggered inside B/I/W.</li>
+</ul>
+<p>Each such node has:</p>
+<pre><code class="language-text">annotations.communication_owner = L1_STAGE
+</code></pre>
+<p>When repeated microbatches have different communication shapes, capture emits
+immutable variants such as:</p>
+<pre><code class="language-text">s0_F
+s0_F__comm_v1
+</code></pre>
+<p>Every compute action references the correct variant through <code>template_ref</code>.
+The downstream system predicts and replays each referenced template as-is.</p>
+<p>Independent stage-local collectives are connected to the compute entries that
+need their results. FSDP ownership uses captured parameter-group boundaries,
+not the whole stage:</p>
+<pre><code class="language-text">unshard_wait(group N)
+  -&gt; compute region for group N
+  -&gt; reshard_release(group N)
+</code></pre>
+<p>The capture-only boundary markers are removed before export. The resulting
+template records each interval in
+<code>StepGraph.annotations["fsdp_residency_intervals"]</code>, including the group/module,
+all-gather node, target entries, release exits, prefetch source, and placement.</p>
+<p>The placement values are:</p>
+<table>
+<thead>
+<tr>
+<th>value</th>
+<th>meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>captured</code></td>
+<td>the original all-gather and its tensor edges were in this template</td>
+</tr>
+<tr>
+<td><code>layer_jit</code></td>
+<td>all-gather starts after the previous group and gates only its own group</td>
+</tr>
+<tr>
+<td><code>layer_prefetch</code></td>
+<td>all-gather starts when the source group is ready and overlaps source compute</td>
+</tr>
+<tr>
+<td><code>cross_action_prefetch</code></td>
+<td>all-gather is launched by one compute action for a later compute action</td>
+</tr>
+</tbody>
+</table>
+<p><code>cross_action_prefetch</code> belongs to the launch action's L1 template. It is an
+exit of that template when the target use is in a later action; the later
+action must not contain a duplicate all-gather. Rank-local action order then
+provides target readiness.</p>
+<p>Multiple independent FSDP groups remain parallel unless the captured graph
+records a dependency between them. There is no fallback that connects a
+missing all-gather to every stage entry. A sharded transition without either
+captured tensor edges or a matching parameter-group boundary is a capture
+error.</p>
+<h2 id="3-l2-communication">3. L2 Communication</h2>
+<h3 id="pipeline-p2p">Pipeline P2P</h3>
+<p>PP P2P never remains in F/B/I/W. It is extracted into an immutable fragment
+and represented by SEND/RECV plus <code>transfer_id</code>. Cross-rank reconstruction
+still joins endpoints by <code>transfer_id</code>.</p>
+<h3 id="external-fsdp-prefetch">External FSDP prefetch</h3>
+<p>An FSDP all-gather remains in L2 only when the schedule issued it outside the
+owning compute span. It is exported as:</p>
+<pre><code class="language-text">UNSHARD -&gt; param_full -&gt; COMPUTE -&gt; control -&gt; RESHARD
+</code></pre>
+<p>The pair has <code>communication_owner=L2_PREFETCH</code>. <code>RESHARD</code> closes full-parameter
+residency; it is not a gradient reduce-scatter.</p>
+<h3 id="standalone-gradient-reduction">Standalone gradient reduction</h3>
+<p>A real reduction outside all compute templates remains:</p>
+<pre><code class="language-text">B/W -&gt; grad_local -&gt; REDUCE_GRAD -&gt; grad_reduced -&gt; OPTIMIZER
+</code></pre>
+<p>It has <code>communication_owner=L2_STANDALONE</code>. If the real collective is already
+inside B/I/W, no L2 REDUCE_GRAD is exported. A no-op REDUCE_GRAD intent is also
+omitted, and the optimizer depends on the last local gradient producer.</p>
+<h2 id="4-consumer-rules">4. Consumer Rules</h2>
+<p>For each COMPUTE action:</p>
+<ol>
+<li>resolve <code>plan.step_templates[action.template_ref]</code>;</li>
+<li>replay every node in that graph, including <code>L1_STAGE</code> communication;</li>
+<li>do not synthesize FSDP communication from the schedule name;</li>
+<li>do not add L2 communication for a collective already in the template.</li>
+</ol>
+<p>The downstream system does not need to interpret
+<code>fsdp_residency_intervals</code> to reconstruct dependencies: the required edges
+are already present in the L1 graph. The annotation is for validation,
+visualization, and memory accounting.</p>
+<p>For each explicit L2 communication action, replay only its own communication
+fragment or <code>CommDetail</code>. L2 controls pipeline order, external prefetch, and
+standalone collectives. It does not edit an already predicted L1 template.</p>
+<p>The plan annotation <code>communication_ownership</code> reports:</p>
+<pre><code class="language-text">internal_fsdp_transitions
+external_fsdp_prefetches
+generated_l1_templates
+internal_gradient_reductions
+external_gradient_reductions
+removed_noop_gradient_intents
+stage_owned_collectives
+</code></pre>
+<h2 id="5-acceptance-checks">5. Acceptance Checks</h2>
+<p>For 1F1B and DualPipeV with <code>reshard_after_forward=always</code>:</p>
+<ol>
+<li>later microbatch F/B/I/W templates contain expected FSDP all-gather nodes;</li>
+<li>compute actions reference the matching communication variant;</li>
+<li>only explicit prefetch transitions remain as L2 UNSHARD/RESHARD;</li>
+<li>reduce-scatter in B/I/W has no duplicate L2 REDUCE_GRAD;</li>
+<li>PP P2P is absent from compute templates and present in SEND/RECV fragments;</li>
+<li>all non-external DataSlots have a producer and replay reaches every action.</li>
+<li>no exported template contains <code>sim.fsdp_*</code> marker operators;</li>
+<li>a copied all-gather gates only its parameter-group entries, never every
+   entry of the stage;</li>
+<li>a cross-action prefetch appears in the launch template and not the target
+   template.</li>
+</ol>
+<p>For non-PP capture, stage-local communication remains in the ordinary F/B
+templates and no PP fragment is created.</p>
+              
+            </div>
+          </div><footer>
+    <div class="rst-footer-buttons" role="navigation" aria-label="Footer Navigation">
+        <a href="../alltoall-capture-analysis/" class="btn btn-neutral float-left" title="all_to_all 通信捕获缺失分析"><span class="icon icon-circle-arrow-left"></span> Previous</a>
+        <a href="../dualpipev-schedule-plan-consumer-guide/" class="btn btn-neutral float-right" title="DualPipeV SchedulePlan 下游接入指南">Next <span class="icon icon-circle-arrow-right"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <!-- Copyright etc -->
+  </div>
+
+  Built with <a href="https://www.mkdocs.org/">MkDocs</a> using a <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a> provided by <a href="https://readthedocs.org">Read the Docs</a>.
+</footer>
+          
+        </div>
+      </div>
+
+    </section>
+
+  </div>
+
+  <div class="rst-versions" role="note" aria-label="Versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    
+    
+      <span><a href="../alltoall-capture-analysis/" style="color: #fcfcfc">&laquo; Previous</a></span>
+    
+    
+      <span><a href="../dualpipev-schedule-plan-consumer-guide/" style="color: #fcfcfc">Next &raquo;</a></span>
+    
+  </span>
+</div>
+    <script src="../../js/jquery-3.6.0.min.js"></script>
+    <script>var base_url = "../..";</script>
+    <script src="../../js/theme_extra.js"></script>
+    <script src="../../js/theme.js"></script>
+    <script>
+        jQuery(function () {
+            SphinxRtdTheme.Navigation.enable(true);
+        });
+    </script>
+
+</body>
+</html>

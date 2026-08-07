@@ -1,0 +1,1332 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" >
+<head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+      <link rel="shortcut icon" href="../../../img/favicon.ico" />
+    <title>SMLA Real-Op-Name Capture Implementation Plan - torchtitan-npu</title>
+    <link rel="stylesheet" href="../../../css/theme.css" />
+    <link rel="stylesheet" href="../../../css/theme_extra.css" />
+        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/styles/github.min.css" />
+    
+      <script>
+        // Current page data
+        var mkdocs_page_name = "SMLA Real-Op-Name Capture Implementation Plan";
+        var mkdocs_page_input_path = "superpowers/plans/2026-07-01-smla-real-op-name-capture-implementation.md";
+        var mkdocs_page_url = null;
+      </script>
+    
+    <!--[if lt IE 9]>
+      <script src="../../../js/html5shiv.min.js"></script>
+    <![endif]-->
+      <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/highlight.min.js"></script>
+      <script>hljs.highlightAll();</script> 
+</head>
+
+<body class="wy-body-for-nav" role="document">
+
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side stickynav">
+    <div class="wy-side-scroll">
+      <div class="wy-side-nav-search">
+          <a href="../../.." class="icon icon-home"> torchtitan-npu
+        </a>
+      </div>
+
+      <div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <ul>
+                <li class="toctree-l1"><a class="reference internal" href="../../..">Home</a>
+                </li>
+              </ul>
+              <ul>
+                <li class="toctree-l1"><a class="reference internal" href="../../../lint_guide/">Lint 指南</a>
+                </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Community</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../community/contributors/">提交者与贡献者（Committers and Contributors）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../community/governance/">社区治理</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../community/versioning_policy/">版本策略</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Design</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/1f1b-schedule-plan-assembly-guide/">1F1B 完整依赖组装与 DES 回放实现指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/alltoall-capture-analysis/">all_to_all 通信捕获缺失分析</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/communication-ownership-contract/">Communication Ownership Contract</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/dualpipev-schedule-plan-consumer-guide/">DualPipeV SchedulePlan 下游接入指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/l2-l3-schedule-plan-design/">L2/L3 调度 IR 重构设计：从扁平 trace 到结构化 SchedulePlan</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/low-precision-sim-analysis/">低精度训练（MXFP8）Simulator 使能分析</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/optimizer-ops-analysis/">优化器算子捕获问题分析</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/pipeline-multi-graph-capture-design/">复杂 Pipeline 策略下完整计算图捕获方案设计</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/pp-l2-capture-architecture/">PP L2 Capture Architecture</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/schedule-capture-design/">L0-L3 IR 层级归属设计</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/schedule-plan-dependency-reconstruction-contract/">SchedulePlan 下游依赖重建契约</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/schedule-plan-des-consumer-guide/">SchedulePlan 依赖重建与 DES 消费指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/simulator-memory-model-design/">Simulator Memory Model 改造设计</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Feature guides</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../feature_guides/checkpoint/">Checkpoint 使用指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../feature_guides/deepseek_v32_mtp/">多Token预测特性(Multi Token Prediction, MTP)</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../feature_guides/low_precision_training/">低精度训练特性（MXFP8）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../feature_guides/metrics_and_debugging/">调试支持特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../feature_guides/model_custom/">Model Custom框架介绍</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../feature_guides/muon_optimizer/">Muon 优化器特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../feature_guides/new_model_onboarding/">新模型接入开发流程</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../feature_guides/npu_fused_ops/">NPU 融合算子适配</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../feature_guides/swap_optimizer/">SwapOptimizer 特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../feature_guides/torch_compile/">torch.compile 支持</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../feature_guides/virtual_optimizer/">Virtual Optimizer - 优化器显存虚拟化特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../feature_guides/vlm/">VLM NPU 支持</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" >Parallelism</a>
+    <ul>
+                <li class="toctree-l2"><a class="reference internal" href="../../../feature_guides/parallelism/custom_cp/">自定义 Context Parallel 特性</a>
+                </li>
+    </ul>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Recipe</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../recipe/sft/">SFT 指令微调</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Superpowers</span></p>
+              <ul class="current">
+                  <li class="toctree-l1 current"><a class="reference internal current" >Plans</a>
+    <ul class="current">
+                <li class="toctree-l2"><a class="reference internal" href="../2026-07-01-mhc-real-op-name-capture-implementation/">MHC Real-Op-Name Capture Implementation Plan</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../2026-07-01-npu-simulator-implementation/">torchtitan_npu Simulator Implementation Plan</a>
+                </li>
+                <li class="toctree-l2 current"><a class="reference internal current" href="#">SMLA Real-Op-Name Capture Implementation Plan</a>
+    <ul class="current">
+    <li class="toctree-l3"><a class="reference internal" href="#global-constraints">Global Constraints</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#reference-exact-shapes-and-real-op-names-verified-against-real-production-c-sources">Reference: exact shapes and real op names (verified against real production C++ sources)</a>
+        <ul>
+    <li class="toctree-l4"><a class="reference internal" href="#sparseattention-simnpusparseattention">SparseAttention → SimNpuSparseAttention</a>
+    </li>
+    <li class="toctree-l4"><a class="reference internal" href="#licompute-simnpulicompute">LiCompute → SimNpuLiCompute</a>
+    </li>
+    <li class="toctree-l4"><a class="reference internal" href="#liloss-simnpuliloss">LiLoss → SimNpuLiLoss</a>
+    </li>
+    <li class="toctree-l4"><a class="reference internal" href="#task-1-simnpusparseattention-hardware-shim">Task 1: SimNpuSparseAttention hardware shim</a>
+    </li>
+    <li class="toctree-l4"><a class="reference internal" href="#task-2-simnpulicompute-hardware-shim">Task 2: SimNpuLiCompute hardware shim</a>
+    </li>
+    <li class="toctree-l4"><a class="reference internal" href="#task-3-simnpuliloss-hardware-shim">Task 3: SimNpuLiLoss hardware shim</a>
+    </li>
+    <li class="toctree-l4"><a class="reference internal" href="#task-4-simsmlaconverter-applyunapply-wiring">Task 4: SimSMLAConverter + apply/unapply wiring</a>
+    </li>
+    <li class="toctree-l4"><a class="reference internal" href="#task-5-wire-into-simulationtrainer">Task 5: Wire into SimulationTrainer</a>
+    </li>
+    <li class="toctree-l4"><a class="reference internal" href="#task-6-small-scale-container-validation-spike">Task 6: Small-scale container validation spike</a>
+    </li>
+    <li class="toctree-l4"><a class="reference internal" href="#task-7-full-container-re-validation-16-layer-61-layer">Task 7: Full container re-validation (16-layer + 61-layer)</a>
+    </li>
+        </ul>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#explicitly-out-of-scope-for-this-plan">Explicitly out of scope for this plan</a>
+    </li>
+    </ul>
+                </li>
+    </ul>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" >Specs</a>
+    <ul>
+                <li class="toctree-l2"><a class="reference internal" href="../../specs/2026-07-01-mhc-real-op-name-capture-design/">MHC 真实算子名捕获 — 架构与方案设计（阶段一：MHC）</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../specs/2026-07-01-npu-simulator-design/">torchtitan_npu Simulator — 架构与方案设计</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../specs/2026-07-01-smla-real-op-name-capture-design/">SMLA 真实算子名捕获 — 架构与方案设计（阶段二：SMLA）</a>
+                </li>
+    </ul>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Test guides</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../test_guides/model_acceptance/">新模型最终验收规范（Meta 模拟器）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../test_guides/test_design/">测试设计</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../test_guides/test_guide/">测试使用指南</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">User guides</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../user-guides/deepseek_v4_model_parameters/">DeepSeek-V4 模型参数 Web 字段目录</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../user-guides/installation/">软件安装</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../user-guides/quickstart/">快速上手</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../user-guides/simulator/">Simulator 使用指南</a>
+                  </li>
+              </ul>
+      </div>
+    </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap">
+      <nav class="wy-nav-top" role="navigation" aria-label="Mobile navigation menu">
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../..">torchtitan-npu</a>
+        
+      </nav>
+      <div class="wy-nav-content">
+        <div class="rst-content"><div role="navigation" aria-label="breadcrumbs navigation">
+  <ul class="wy-breadcrumbs">
+    <li><a href="../../.." class="icon icon-home" aria-label="Docs"></a></li>
+          <li class="breadcrumb-item">Superpowers</li>
+          <li class="breadcrumb-item">Plans</li>
+      <li class="breadcrumb-item active">SMLA Real-Op-Name Capture Implementation Plan</li>
+    <li class="wy-breadcrumbs-aside">
+    </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+            <div class="section" itemprop="articleBody">
+              
+                <h1 id="smla-real-op-name-capture-implementation-plan">SMLA Real-Op-Name Capture Implementation Plan</h1>
+<blockquote>
+<p><strong>For agentic workers:</strong> REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (<code>- [ ]</code>) syntax for tracking.</p>
+</blockquote>
+<p><strong>Goal:</strong> Replace the current blanket strip-out of the <code>npu_smla</code> model converter with simulator-only
+shim classes for <code>SparseAttention</code>/<code>LiCompute</code>/<code>LiLoss</code>, so the captured L0 op graph shows the <em>real</em>
+ACLNN op names that would run in production (<code>aclnn.npu_sparse_attn_sharedkv</code> etc.) instead of the
+base classes' manually-decomposed <code>matmul</code>/<code>softmax</code>/<code>einsum</code>/<code>topk</code> op sequence.</p>
+<p><strong>Architecture:</strong> Reuses <code>OpDispatchCapture.record_synthetic_op()</code> (already built for MHC, zero
+changes needed) via <code>torch.autograd.Function</code> shim classes (<code>_SimSparseAttnFn</code>/
+<code>_SimLightningIndexerFn</code>/<code>_SimLiLossFn</code>) that record the real op names + analytically-derived shapes
+(verified directly against the real production <code>ops/aclnn/*/binding.cpp</code> C++ sources) without ever
+invoking the real ACLNN extensions. A reversible class-attribute patch
+(<code>apply_smla_shims()</code>/<code>unapply_smla_shims()</code>, mirroring the already-built <code>apply_mhc_shims()</code>)
+installs the shims in place of the real <code>NpuSMLAConverter</code>, only under simulation.</p>
+<p><strong>Tech Stack:</strong> Python 3.12, PyTorch 2.12 (<code>torch.autograd.Function</code>, <code>torch.empty(device="meta")</code>), pytest.</p>
+<h2 id="global-constraints">Global Constraints</h2>
+<ul>
+<li>Zero modification to any existing production file (<code>torchtitan_npu/converters/</code>,
+  <code>torchtitan_npu/models/</code>, <code>torchtitan_npu/ops/</code> all stay byte-for-byte unchanged) -- this feature
+  is purely additive, consistent with this repo's side-loaded-package convention.</li>
+<li>All new simulator code lives under <code>torchtitan_npu/simulator/</code>.</li>
+<li>Every new/modified test must pass in this sandbox (no <code>torch_npu</code> installed) <strong>except</strong> tests that
+  import <code>torchtitan_npu.models.deepseek_v4.model</code> (this sandbox's plain <code>torchtitan</code> package is not
+  the exact pinned commit and transitively fails with an unrelated <code>AttributeError</code> about
+  <code>TokenReorderer</code> -- the exact same, already-documented root cause as the MHC plan's tests). These
+  tests are expected to fail with that specific error in this sandbox and pass in the real CANN
+  container (Task 6 is their first real signal). Use the scratch-verification workaround (a
+  throwaway, NOT-committed script using fake stand-in parent objects) to gain real confidence before
+  committing the real test file -- see the MHC plan
+  (<code>docs/superpowers/plans/2026-07-01-mhc-real-op-name-capture-implementation.md</code>) for the exact
+  established pattern.</li>
+<li>STRICT SCOPE BOUNDARY per task: modify/create ONLY the files each task's brief lists. Never touch
+  <code>torchtitan_npu/__init__.py</code> or any file outside <code>torchtitan_npu/simulator/</code> -- two earlier tasks in
+  the MHC plan's execution had implementers violate this to work around the sandbox limitation above,
+  and both had to be reverted after review caught them. Use the scratch-verification workaround
+  instead.</li>
+<li>Follow this repo's TDD convention: write the failing test first, run it, then implement.</li>
+<li>Commit after each task passes its tests.</li>
+<li>All shim classes MUST subclass their real base class (<code>SimNpuSparseAttention(SparseAttention)</code>, not
+  <code>SimNpuSparseAttention(nn.Module)</code>) -- this is a hard requirement, not style: <code>torchtitan</code>'s
+  <code>BaseModel.verify_module_protocol()</code> asserts <code>isinstance(mod, torchtitan.protocols.module.Module)</code>
+  for every submodule, and only subclassing the real base class satisfies this with zero extra code.
+  This was a real bug found via container validation during the MHC plan's Task 7 -- avoid repeating
+  it here by building it into every task from the start.</li>
+<li>All shim <code>__init__</code> methods use <code>self.__dict__.update(parent.__dict__)</code> (no <code>super().__init__()</code>
+  call) -- matches the real <code>NpuSparseAttention</code>/<code>NpuLiCompute</code>/<code>NpuLiLoss</code> classes' own
+  <code>__init__</code> pattern exactly (<code>torchtitan_npu/converters/kernels/npu_smla.py:1330-1338</code>, <code>1362-1370</code>,
+  and mirrored for <code>NpuLiLoss</code> at <code>1534-1543</code>).</li>
+</ul>
+<hr />
+<h2 id="reference-exact-shapes-and-real-op-names-verified-against-real-production-c-sources">Reference: exact shapes and real op names (verified against real production C++ sources)</h2>
+<p><code>B</code>=batch, <code>S</code>=seqlen, <code>N</code>=<code>n_heads</code>, <code>D</code>=<code>head_dim</code>, <code>N_i</code>=<code>index_n_heads</code>, <code>D_i</code>=<code>index_head_dim</code>,
+<code>K</code>=<code>index_topk</code>, <code>R</code>=<code>compress_ratios[layer_id]</code> (one of <code>1</code>, <code>4</code>, <code>128</code>).</p>
+<h3 id="sparseattention-simnpusparseattention"><code>SparseAttention</code> → <code>SimNpuSparseAttention</code></h3>
+<p>Fixed public contract (<code>SparseAttention.forward</code>, <code>torchtitan_npu/models/deepseek_v4/model.py:475-523</code>
+-- any replacement class must keep this exact I/O):</p>
+<pre><code>forward(query_states[B,S,N,D], kv_states[B,S,D], attn_sink[N],
+        kv_compress[B,S//R,D]|None, compress_topk_idxs[B,S,K]|None) -&gt; attn_output[B,S,N,D]
+</code></pre>
+<p>Real call chain (<code>NpuSparseAttention.forward</code> → <code>npu_sparse_attn_shared_kv</code> wrapper →
+<code>SparseAttnSharedKV(torch.autograd.Function)</code>, <code>torchtitan_npu/converters/kernels/npu_smla.py:
+1330-1359</code>, <code>537-588</code>, <code>378-485</code> forward / <code>487-534</code> backward):</p>
+<table>
+<thead>
+<tr>
+<th>step</th>
+<th>real op name</th>
+<th>when</th>
+<th>inputs</th>
+<th>outputs</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>A</td>
+<td><code>aclnn.npu_sparse_attn_sharedkv_metadata</code></td>
+<td>forward</td>
+<td><code>query</code> (used only to derive shape)</td>
+<td><code>metadata[1024]</code> int32</td>
+</tr>
+<tr>
+<td>B</td>
+<td><code>aclnn.npu_sparse_attn_sharedkv</code></td>
+<td>forward</td>
+<td><code>query[B,S,N,D]</code> (bf16), <code>ori_kv[B,S,1,D]</code> (bf16, = <code>kv_states.unsqueeze(2)</code>), <code>cmp_kv[B,S//R,1,D]</code>|omitted (bf16, = <code>kv_compress.unsqueeze(2)</code>, only when not None), <code>cmp_sparse_indices[B,S,1,K]</code>|omitted (int32, = <code>compress_topk_idxs.unsqueeze(2)</code>, only when <code>R==4</code>), <code>sinks[N]</code> (fp32), <code>metadata[1024]</code></td>
+<td><code>result[B,S,N,D]</code> (bf16), <code>softmax_lse[B,S,N,1]</code> (fp32)</td>
+</tr>
+<tr>
+<td>C (bwd)</td>
+<td><code>aclnn.npu_sparse_attn_sharedkv_grad</code></td>
+<td>backward</td>
+<td><code>query</code>, <code>ori_kv</code>, <code>cmp_kv</code>|omitted, <code>result</code>, <code>softmax_lse</code>, <code>sinks</code>, <code>grad_result[B,S,N,D]</code></td>
+<td><code>dquery[B,S,N,D]</code>, <code>dori_kv[B,S,1,D]</code>, <code>dcmp_kv[B,S//R,1,D]</code>|omitted, <code>dsinks[N]</code></td>
+</tr>
+</tbody>
+</table>
+<p>Shape sources verified directly against <code>torchtitan_npu/ops/aclnn/sparse_attn_sharedkv/binding.cpp</code>:
+<code>attnOutput = at::empty(query.sizes(), ...)</code> (line 42); <code>lse_sizes.back()=1</code> on <code>query.sizes()</code>
+(lines 45-47); <code>metadata = at::empty(1024, ...)</code> (line 20); <code>dQuery/dOriKv/dSinks = at::empty(
+query/oriKv/sinks.sizes(), ...)</code> (lines 70-72); <code>dCmpKv = at::empty(cmpKv.sizes(), ...)</code> only when
+<code>cmpRatio &gt; 1</code> (lines 74-78).</p>
+<p><code>SparseAttnSharedKV.forward</code> returns <strong>only <code>result</code></strong> (a single tensor, not a tuple) --
+<code>softmax_lse</code> is saved via <code>ctx.save_for_backward</code> for internal backward use, never returned to the
+caller (<code>npu_smla.py:483-485</code>: <code>return result</code>, confirmed directly; <code>npu_sparse_attn_shared_kv</code>
+wrapper does <code>return output.contiguous()</code> on this single tensor, <code>npu_smla.py:588</code>).</p>
+<h3 id="licompute-simnpulicompute"><code>LiCompute</code> → <code>SimNpuLiCompute</code></h3>
+<p>Fixed public contract (<code>LiCompute.forward</code>, <code>model.py:537-556</code>; <code>LiCompute</code>/<code>LiLoss</code> only exist on
+<code>R==4</code> layers, <code>InnerAttention.__init__</code>, <code>model.py:682-691</code>):</p>
+<pre><code>forward(q_indexer[B,S,N_i,D_i], k_indexer[B,S//4,D_i], weights[B,S,N_i],
+        seqlen:int, offset:int) -&gt; (compress_topk_idxs[B,S,K] int32, index_score[B,S,K])
+</code></pre>
+<p>Real call (<code>NpuLiCompute.forward</code>, <code>npu_smla.py:1372-1406</code>): calls <code>_li_op.npu_lightning_indexer(...)</code>
+<strong>directly, with no <code>torch.autograd.Function</code> wrapper</strong> (confirmed: no autograd.Function anywhere in
+this call path, unlike <code>SparseAttention</code>'s <code>SparseAttnSharedKV</code>). This never crashes in real training
+because <code>compress_topk_idxs</code> is int32 (non-differentiable) and <code>index_score</code>'s gradient flows through
+the <em>separate</em> <code>LiLoss</code> path via detached tensors (<code>InnerAttention.forward:714-726</code>).</p>
+<table>
+<thead>
+<tr>
+<th>step</th>
+<th>real op name</th>
+<th>inputs</th>
+<th>outputs</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>D</td>
+<td><code>aclnn.npu_lightning_indexer</code></td>
+<td><code>query[B,S,N_i,D_i]</code> (bf16, = <code>q_indexer.to(bf16)</code>), <code>key[B,S//4,1,D_i]</code> (bf16, = <code>k_indexer.to(bf16).unsqueeze(2)</code>), <code>weights[B,S,N_i]</code> (bf16)</td>
+<td><code>sparse_indices[B,S,1,K]</code> int32, <code>sparse_values[B,S,1,K]</code> bf16 → each <code>.squeeze(2)</code> → <code>[B,S,K]</code></td>
+</tr>
+</tbody>
+</table>
+<p>Shape source: <code>torchtitan_npu/ops/aclnn/lightning_indexer/binding.cpp:19-26</code>:
+<code>sparse_indices/sparse_values = at::empty({B, S1, N2=1, sparse_count=K}, ...)</code>.</p>
+<p><strong>The shim must wrap this in its own <code>torch.autograd.Function</code></strong> (the real implementation has none)
+purely for gradient-graph connectivity and consistent backward-phase tagging -- backward returns
+<code>None</code> for every input (mirrors the A5-path <code>LightningIndexer.backward</code>'s <code>_none_grads(4)</code>,
+<code>npu_smla.py:1059-1061</code>).</p>
+<p><code>_add_offset_to_valid_sparse_indices</code> (<code>npu_smla.py:301-310</code>, applied to <code>compress_topk_idxs</code> after
+the real op call) is pure PyTorch (<code>torch.where</code>/<code>+</code>/<code>.eq</code>), has no hardware dependency, and is
+imported directly (read-only) rather than reimplemented.</p>
+<h3 id="liloss-simnpuliloss"><code>LiLoss</code> → <code>SimNpuLiLoss</code></h3>
+<p>Fixed public contract (<code>LiLoss.forward</code>, <code>model.py:308-337</code>; <code>NpuLiLoss.forward</code> same positional
+order, <code>npu_smla.py:1545-1573</code>):</p>
+<pre><code>forward(q[B,S,N,D] detached, kv[B,S,D] detached, kv_compress[B,S//4,D] detached,
+        attn_sink[N] (unused), q_indexer[B,S,N_i,D_i], k_indexer[B,S//4,D_i],
+        weights[B,S,N_i], sparse_indices[B,S,K], indexer_score[B,S,K] (unused),
+        attention_masks (unused), offset:int (unused)) -&gt; loss (scalar fp32)
+</code></pre>
+<p>Real call chain is a <strong>deferred-computation pattern</strong>: <code>NpuLiLoss.forward</code> → <code>npu_sparse_lightning_
+indexer_grad_kl_loss</code> → <code>SparseLightningIndexerGradKLLossWrapper(torch.autograd.Function)</code>
+(<code>npu_smla.py:1545-1573</code>, <code>1499-1531</code>, <code>1409-1495</code>):</p>
+<table>
+<thead>
+<tr>
+<th>step</th>
+<th>real op name</th>
+<th>when</th>
+<th>inputs</th>
+<th>outputs</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>(none)</td>
+<td>--</td>
+<td>forward</td>
+<td>--</td>
+<td><code>loss = torch.zeros(1, dtype=torch.float32, device=query.device)[0]</code> -- <strong>no hardware call in forward</strong>, confirmed directly at <code>npu_smla.py:1441</code>: <code>return torch.zeros(1, dtype=torch.float32, device=query.device)[0]</code></td>
+</tr>
+<tr>
+<td>E</td>
+<td><code>aclnn.npu_sparse_lightning_indexer_grad_kl_loss</code></td>
+<td>backward</td>
+<td><code>query[B,S,N,D]</code> (= <code>q</code>), <code>key[B,S//4,1,D]</code> (= <code>kv_compress.unsqueeze(2)</code>), <code>query_index[B,S,N_i,D_i]</code> (= <code>q_indexer</code>), <code>key_index[B,S//4,1,D_i]</code> (= <code>k_indexer.unsqueeze(2)</code>), <code>weights[B,S,N_i]</code>, <code>sparse_indices[B,S,1,K]</code> (= <code>sparse_indices.unsqueeze(2)</code>)</td>
+<td><code>d_query_index[B,S,N_i,D_i]</code>, <code>d_key_index[B,S//4,1,D_i]</code>, <code>d_weight[B,S,N_i]</code>, <code>loss[1]</code> fp32</td>
+</tr>
+</tbody>
+</table>
+<p>Shape source: <code>torchtitan_npu/ops/aclnn/sparse_lightning_indexer_grad_kl_loss/binding.cpp:23-26</code>:
+<code>d_query_index/d_key_index/d_weight = at::zeros(query_index/key_index/weight.sizes(), ...)</code>,
+<code>loss = at::zeros({1}, ...)</code>.</p>
+<p><code>SparseLightningIndexerGradKLLossWrapper.forward</code> (<code>npu_smla.py:1412-1441</code>) takes 14 positional args
+and does <code>ctx.save_for_backward(query, key, query_index, key_index, weights, sparse_indices)</code>
+(6 tensors); <code>backward</code> (<code>npu_smla.py:1444-1495</code>) returns 14 grad values:
+<code>(None, None, d_query_index, d_key_index, d_weights, None, None, None, None, None, None, None, None)</code>
+(<code>query</code>/<code>key</code> are detached inputs → <code>None</code>; <code>sparse_indices</code> int32 → <code>None</code>; remaining 8 are scalar
+config args → <code>None</code>). The shim simplifies this to a 7-arg autograd.Function (dropping the scalar
+config args that don't affect shape): <code>(query, key, query_index, key_index, weights, sparse_indices,
+module_path)</code> → backward returns 7 values: <code>(None, None, d_query_index, d_key_index, d_weights, None,
+None)</code>.</p>
+<p><strong>Interaction with the existing <code>meta_env._patch_li_loss_to_skip_buggy_einsum</code> patch</strong>: that patch
+replaces <code>LiLoss.forward</code> (the base class method) to work around a real pre-existing shape bug in
+<code>LiLoss._current_selected_attn_dist</code>, never hit in real production (which always uses <code>NpuLiLoss</code>).
+Since <code>SimNpuLiLoss(LiLoss)</code> defines its <strong>own</strong> <code>forward</code>, Python's MRO means instances of
+<code>SimNpuLiLoss</code> always resolve <code>.forward()</code> to <code>SimNpuLiLoss.forward</code>, never to the patched
+<code>LiLoss.forward</code> -- <strong>no change to <code>meta_env.py</code> is needed or wanted.</strong></p>
+<hr />
+<h3 id="task-1-simnpusparseattention-hardware-shim">Task 1: <code>SimNpuSparseAttention</code> hardware shim</h3>
+<p><strong>Files:</strong>
+- Create: <code>torchtitan_npu/simulator/hardware_shims/smla_shim.py</code>
+- Test: <code>tests/unit_tests/simulator/hardware_shims/test_smla_shim.py</code></p>
+<p><strong>Interfaces:</strong>
+- Consumes: <code>torchtitan_npu.simulator.capture.dispatch_capture.get_active_capture()</code> (already exists
+  from the MHC plan's Task 1, zero changes needed).
+- Produces: <code>SimNpuSparseAttention(SparseAttention)</code> with <code>__init__(self, parent: SparseAttention)</code>
+  and <code>forward(self, query_states, kv_states, attn_sink, kv_compress=None, compress_topk_idxs=None) -&gt;
+  Tensor</code> (matches <code>SparseAttention.forward</code>'s exact signature).</p>
+<ul>
+<li>[ ] <strong>Step 1: Write the failing test</strong></li>
+</ul>
+<p>Create <code>tests/unit_tests/simulator/hardware_shims/test_smla_shim.py</code>:</p>
+<pre><code class="language-python"># Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+import torch
+
+from torchtitan_npu.models.deepseek_v4.model import DeepSeekV4Model, SparseAttention
+from torchtitan_npu.simulator.capture.dispatch_capture import OpDispatchCapture
+from torchtitan_npu.simulator.hardware_shims.smla_shim import SimNpuSparseAttention
+
+
+def _build_sim_sparse_attention(B=2, S=3, N=4, D=8, R=4, K=5):
+    args = DeepSeekV4Model.Config(n_heads=N, head_dim=D, compress_ratios=(R,), window_size=2, n_layers=1)
+    parent = SparseAttention(SparseAttention.Config(layer_id=0, args=args))
+    shim = SimNpuSparseAttention(parent)
+    tensors = {
+        &quot;query_states&quot;: torch.randn(B, S, N, D, requires_grad=True),
+        &quot;kv_states&quot;: torch.randn(B, S, D, requires_grad=True),
+        &quot;attn_sink&quot;: torch.randn(N, requires_grad=True),
+    }
+    if R != 1:
+        tensors[&quot;kv_compress&quot;] = torch.randn(B, S // R, D, requires_grad=True)
+    if R == 4:
+        tensors[&quot;compress_topk_idxs&quot;] = torch.randint(0, S, (B, S, K), dtype=torch.int32)
+    return shim, tensors
+
+
+def test_sim_sparse_attention_forward_returns_correct_shape_r1():
+    shim, t = _build_sim_sparse_attention(B=2, S=3, N=4, D=8, R=1)
+    y = shim(t[&quot;query_states&quot;], t[&quot;kv_states&quot;], t[&quot;attn_sink&quot;])
+    assert y.shape == (2, 3, 4, 8)
+
+
+def test_sim_sparse_attention_forward_returns_correct_shape_r4():
+    shim, t = _build_sim_sparse_attention(B=2, S=8, N=4, D=8, R=4, K=5)
+    y = shim(t[&quot;query_states&quot;], t[&quot;kv_states&quot;], t[&quot;attn_sink&quot;], t[&quot;kv_compress&quot;], t[&quot;compress_topk_idxs&quot;])
+    assert y.shape == (2, 8, 4, 8)
+
+
+def test_sim_sparse_attention_records_real_op_names():
+    shim, t = _build_sim_sparse_attention(B=2, S=8, N=4, D=8, R=4, K=5)
+    capture = OpDispatchCapture()
+    with capture:
+        shim(t[&quot;query_states&quot;], t[&quot;kv_states&quot;], t[&quot;attn_sink&quot;], t[&quot;kv_compress&quot;], t[&quot;compress_topk_idxs&quot;])
+    nodes = capture.build_nodes()
+    raw_names = {n.annotations.get(&quot;raw_op_type&quot;) for n in nodes.values()}
+    assert &quot;aclnn.npu_sparse_attn_sharedkv_metadata&quot; in raw_names
+    assert &quot;aclnn.npu_sparse_attn_sharedkv&quot; in raw_names
+
+
+def test_sim_sparse_attention_backward_propagates_gradient_and_records_grad_op():
+    shim, t = _build_sim_sparse_attention(B=2, S=8, N=4, D=8, R=4, K=5)
+    phase_box = {&quot;value&quot;: &quot;forward&quot;}
+    capture = OpDispatchCapture(phase_provider=lambda: phase_box[&quot;value&quot;])
+    with capture:
+        y = shim(t[&quot;query_states&quot;], t[&quot;kv_states&quot;], t[&quot;attn_sink&quot;], t[&quot;kv_compress&quot;], t[&quot;compress_topk_idxs&quot;])
+        phase_box[&quot;value&quot;] = &quot;backward&quot;
+        y.sum().backward()
+    assert t[&quot;query_states&quot;].grad is not None
+    assert t[&quot;query_states&quot;].grad.shape == t[&quot;query_states&quot;].shape
+    assert t[&quot;kv_states&quot;].grad is not None
+    assert t[&quot;kv_states&quot;].grad.shape == t[&quot;kv_states&quot;].shape
+    assert t[&quot;attn_sink&quot;].grad is not None
+    assert t[&quot;attn_sink&quot;].grad.shape == t[&quot;attn_sink&quot;].shape
+    assert t[&quot;kv_compress&quot;].grad is not None
+    assert t[&quot;kv_compress&quot;].grad.shape == t[&quot;kv_compress&quot;].shape
+    nodes = capture.build_nodes()
+    bwd_names = {n.annotations[&quot;raw_op_type&quot;] for n in nodes.values() if n.annotations[&quot;phase&quot;] == &quot;backward&quot;}
+    assert &quot;aclnn.npu_sparse_attn_sharedkv_grad&quot; in bwd_names
+
+
+def test_sim_sparse_attention_works_on_meta_device():
+    shim, t = _build_sim_sparse_attention(B=2, S=8, N=4, D=8, R=4, K=5)
+    meta_t = {k: (v.detach().to(&quot;meta&quot;).requires_grad_(True) if v.dtype != torch.int32 else v.detach().to(&quot;meta&quot;)) for k, v in t.items()}
+    y = shim(meta_t[&quot;query_states&quot;], meta_t[&quot;kv_states&quot;], meta_t[&quot;attn_sink&quot;], meta_t[&quot;kv_compress&quot;], meta_t[&quot;compress_topk_idxs&quot;])
+    assert y.device.type == &quot;meta&quot;
+    y.sum().backward()
+    assert meta_t[&quot;query_states&quot;].grad is not None
+</code></pre>
+<ul>
+<li>[ ] <strong>Step 2: Run test to verify it fails</strong></li>
+</ul>
+<p>Run: <code>python3 -m pytest tests/unit_tests/simulator/hardware_shims/test_smla_shim.py -v</code>
+Expected: FAIL with <code>ModuleNotFoundError: No module named 'torchtitan_npu.simulator.hardware_shims.smla_shim'</code></p>
+<ul>
+<li>[ ] <strong>Step 3: Implement <code>smla_shim.py</code></strong></li>
+</ul>
+<p>Create <code>torchtitan_npu/simulator/hardware_shims/smla_shim.py</code>:</p>
+<pre><code class="language-python"># Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+&quot;&quot;&quot;Shape-only shims for SMLA's SparseAttention/LiCompute/LiLoss (`torchtitan_npu.converters.
+kernels.npu_smla`'s NpuSparseAttention/NpuLiCompute/NpuLiLoss in production). Records the real
+production ACLNN op names (`aclnn.npu_sparse_attn_sharedkv` etc., verified against the real
+ops/aclnn/*/binding.cpp C++ sources) into the active OpDispatchCapture, with analytically-derived
+shapes -- never invoking the real JIT-compiled ACLNN extensions. See design doc for exact shape
+formulas: docs/superpowers/specs/2026-07-01-smla-real-op-name-capture-design.md.&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import torch
+
+from torchtitan_npu.converters.kernels.npu_smla import _add_offset_to_valid_sparse_indices
+from torchtitan_npu.models.deepseek_v4.model import LiCompute, LiLoss, SparseAttention
+from torchtitan_npu.simulator.capture.dispatch_capture import get_active_capture
+
+
+def _record(raw_op_type: str, inputs: list[torch.Tensor], outputs: list[torch.Tensor], module_path: str) -&gt; None:
+    capture = get_active_capture()
+    if capture is not None:
+        capture.record_synthetic_op(raw_op_type, inputs=inputs, outputs=outputs, module_path=module_path)
+
+
+class _SimSparseAttnFn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, query, ori_kv, cmp_kv, cmp_sparse_indices, sinks, module_path):  # noqa: ANN001
+        B, S, N, D = query.shape
+        dtype = query.dtype
+
+        metadata = torch.empty(1024, dtype=torch.int32, device=query.device)
+        _record(&quot;aclnn.npu_sparse_attn_sharedkv_metadata&quot;, [query], [metadata], module_path)
+
+        result = torch.empty((B, S, N, D), dtype=dtype, device=query.device)
+        softmax_lse = torch.empty((B, S, N, 1), dtype=torch.float32, device=query.device)
+        fwd_inputs = [query, ori_kv, sinks, metadata]
+        if cmp_kv is not None:
+            fwd_inputs.append(cmp_kv)
+        if cmp_sparse_indices is not None:
+            fwd_inputs.append(cmp_sparse_indices)
+        _record(&quot;aclnn.npu_sparse_attn_sharedkv&quot;, fwd_inputs, [result, softmax_lse], module_path)
+
+        ctx.save_for_backward(query, ori_kv, cmp_kv, result, softmax_lse, sinks)
+        ctx.module_path = module_path
+        return result
+
+    @staticmethod
+    def backward(ctx, grad_result):  # noqa: ANN001
+        query, ori_kv, cmp_kv, result, softmax_lse, sinks = ctx.saved_tensors
+        dquery = torch.empty_like(query)
+        dori_kv = torch.empty_like(ori_kv)
+        dsinks = torch.empty_like(sinks)
+        dcmp_kv = torch.empty_like(cmp_kv) if cmp_kv is not None else None
+
+        bwd_inputs = [query, ori_kv, result, softmax_lse, sinks, grad_result]
+        if cmp_kv is not None:
+            bwd_inputs.append(cmp_kv)
+        bwd_outputs = [dquery, dori_kv, dsinks]
+        if dcmp_kv is not None:
+            bwd_outputs.append(dcmp_kv)
+        _record(&quot;aclnn.npu_sparse_attn_sharedkv_grad&quot;, bwd_inputs, bwd_outputs, ctx.module_path)
+
+        return dquery, dori_kv, dcmp_kv, None, dsinks, None
+
+
+class SimNpuSparseAttention(SparseAttention):
+    &quot;&quot;&quot;Drop-in simulator replacement for `NpuSparseAttention`
+    (`torchtitan_npu.converters.kernels.npu_smla`). Same forward() signature as base
+    `SparseAttention`; never runs the real JIT-compiled ACLNN extension, only records the real
+    op names + analytically-correct shapes.
+
+    `__init__` mirrors `NpuSparseAttention.__init__(self, parent: SparseAttention)`'s exact
+    `__dict__` shallow-copy pattern (`npu_smla.py:1330-1338`) -- required both for consistency
+    and to satisfy torchtitan's `verify_module_protocol()` (subclassing `SparseAttention`
+    transitively satisfies the `isinstance(mod, Module)` check with zero extra code).&quot;&quot;&quot;
+
+    def __init__(self, parent: &quot;SparseAttention&quot;) -&gt; None:
+        self.__dict__.update(parent.__dict__)
+
+    def forward(self, query_states, kv_states, attn_sink, kv_compress=None, compress_topk_idxs=None):
+        if compress_topk_idxs is not None and compress_topk_idxs.dtype != torch.int32:
+            compress_topk_idxs = compress_topk_idxs.to(torch.int32)
+        ori_kv = kv_states.unsqueeze(2).contiguous()
+        cmp_kv = kv_compress.unsqueeze(2).contiguous() if kv_compress is not None else None
+        cmp_sparse_indices = compress_topk_idxs.unsqueeze(2).contiguous() if self.compress_ratio == 4 else None
+        module_path = self.__class__.__name__
+        result = _SimSparseAttnFn.apply(
+            query_states.contiguous(), ori_kv, cmp_kv, cmp_sparse_indices, attn_sink.float(), module_path
+        )
+        return result.contiguous()
+</code></pre>
+<ul>
+<li>[ ] <strong>Step 4: Run test to verify it passes</strong></li>
+</ul>
+<p>Run: <code>python3 -m pytest tests/unit_tests/simulator/hardware_shims/test_smla_shim.py -v</code>
+Expected: all 5 tests PASS.</p>
+<ul>
+<li>[ ] <strong>Step 5: Commit</strong></li>
+</ul>
+<pre><code class="language-bash">git add torchtitan_npu/simulator/hardware_shims/smla_shim.py tests/unit_tests/simulator/hardware_shims/test_smla_shim.py
+git commit -m &quot;feat(simulator): add SimNpuSparseAttention hardware shim for SMLA sparse attention&quot;
+</code></pre>
+<hr />
+<h3 id="task-2-simnpulicompute-hardware-shim">Task 2: <code>SimNpuLiCompute</code> hardware shim</h3>
+<p><strong>Files:</strong>
+- Modify: <code>torchtitan_npu/simulator/hardware_shims/smla_shim.py</code> (append)
+- Test: <code>tests/unit_tests/simulator/hardware_shims/test_smla_shim.py</code> (append)</p>
+<p><strong>Interfaces:</strong>
+- Consumes: <code>_record</code> (Task 1, same file)
+- Produces: <code>SimNpuLiCompute(LiCompute)</code> with <code>__init__(self, parent: LiCompute)</code> and
+  <code>forward(self, q_indexer, k_indexer, weights, seqlen, offset) -&gt; tuple[Tensor, Tensor]</code> (matches
+  <code>LiCompute.forward</code>'s exact signature).</p>
+<ul>
+<li>[ ] <strong>Step 1: Write the failing test</strong></li>
+</ul>
+<p>Add to <code>tests/unit_tests/simulator/hardware_shims/test_smla_shim.py</code>:</p>
+<pre><code class="language-python">from torchtitan_npu.models.deepseek_v4.model import LiCompute  # add to existing import line
+from torchtitan_npu.simulator.hardware_shims.smla_shim import SimNpuLiCompute  # add to existing import line
+
+
+def _build_sim_li_compute(B=2, S=8, N_i=4, D_i=8, K=5, ratio=4):
+    parent = LiCompute(LiCompute.Config(ratio=ratio, index_topk=K))
+    shim = SimNpuLiCompute(parent)
+    tensors = {
+        &quot;q_indexer&quot;: torch.randn(B, S, N_i, D_i, requires_grad=True),
+        &quot;k_indexer&quot;: torch.randn(B, S // ratio, D_i, requires_grad=True),
+        &quot;weights&quot;: torch.randn(B, S, N_i, requires_grad=True),
+    }
+    return shim, tensors
+
+
+def test_sim_li_compute_forward_returns_correct_shapes():
+    shim, t = _build_sim_li_compute(B=2, S=8, N_i=4, D_i=8, K=5, ratio=4)
+    compress_topk_idxs, index_score = shim(t[&quot;q_indexer&quot;], t[&quot;k_indexer&quot;], t[&quot;weights&quot;], seqlen=8, offset=0)
+    assert compress_topk_idxs.shape == (2, 8, 5)
+    assert index_score.shape == (2, 8, 5)
+
+
+def test_sim_li_compute_records_real_op_name():
+    shim, t = _build_sim_li_compute()
+    capture = OpDispatchCapture()
+    with capture:
+        shim(t[&quot;q_indexer&quot;], t[&quot;k_indexer&quot;], t[&quot;weights&quot;], seqlen=8, offset=0)
+    nodes = capture.build_nodes()
+    raw_names = {n.annotations.get(&quot;raw_op_type&quot;) for n in nodes.values()}
+    assert &quot;aclnn.npu_lightning_indexer&quot; in raw_names
+
+
+def test_sim_li_compute_backward_does_not_raise_and_returns_none_grad():
+    shim, t = _build_sim_li_compute()
+    compress_topk_idxs, index_score = shim(t[&quot;q_indexer&quot;], t[&quot;k_indexer&quot;], t[&quot;weights&quot;], seqlen=8, offset=0)
+    # index_score is a real (non-detached) autograd node output -- summing and backpropagating
+    # through it must not raise, even though the real op has no gradient (mirrors production,
+    # where index_score's actual gradient flows through the separate LiLoss path instead).
+    index_score.float().sum().backward()
+    assert t[&quot;q_indexer&quot;].grad is None  # real non-A5 implementation has no gradient for this path
+</code></pre>
+<ul>
+<li>[ ] <strong>Step 2: Run test to verify it fails</strong></li>
+</ul>
+<p>Run: <code>python3 -m pytest tests/unit_tests/simulator/hardware_shims/test_smla_shim.py -v -k li_compute</code>
+Expected: FAIL with <code>ImportError: cannot import name 'SimNpuLiCompute'</code></p>
+<ul>
+<li>[ ] <strong>Step 3: Implement <code>SimNpuLiCompute</code></strong></li>
+</ul>
+<p>Append to <code>torchtitan_npu/simulator/hardware_shims/smla_shim.py</code>:</p>
+<pre><code class="language-python">class _SimLightningIndexerFn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, query, key, weights, index_topk, module_path):  # noqa: ANN001
+        B, S, N_i, D_i = query.shape
+        K = index_topk
+        sparse_indices = torch.empty((B, S, 1, K), dtype=torch.int32, device=query.device)
+        sparse_values = torch.empty((B, S, 1, K), dtype=query.dtype, device=query.device)
+        _record(&quot;aclnn.npu_lightning_indexer&quot;, [query, key, weights], [sparse_indices, sparse_values], module_path)
+        return sparse_indices.squeeze(2), sparse_values.squeeze(2)
+
+    @staticmethod
+    def backward(ctx, grad_topk_idxs, grad_index_score):  # noqa: ANN001
+        # The real non-A5 npu_lightning_indexer call has no autograd kernel (see design doc
+        # §4.2): compress_topk_idxs is non-differentiable (int32), and index_score's real
+        # gradient flows through the separate LiLoss path via detached tensors, never back
+        # through LiCompute. Mirrors the A5 LightningIndexer.backward's all-None return.
+        return None, None, None, None, None
+
+
+class SimNpuLiCompute(LiCompute):
+    &quot;&quot;&quot;Drop-in simulator replacement for `NpuLiCompute`
+    (`torchtitan_npu.converters.kernels.npu_smla`). The real non-A5 implementation calls
+    `_li_op.npu_lightning_indexer` directly with no `torch.autograd.Function` wrapper --
+    `_SimLightningIndexerFn` adds one here purely for gradient-graph connectivity and
+    consistent backward-phase tagging, matching the pattern established for `SimHcHead` in
+    the MHC plan.&quot;&quot;&quot;
+
+    def __init__(self, parent: &quot;LiCompute&quot;) -&gt; None:
+        self.__dict__.update(parent.__dict__)
+
+    def forward(self, q_indexer: torch.Tensor, k_indexer: torch.Tensor, weights: torch.Tensor, seqlen: int, offset: int):
+        q_indexer = q_indexer.to(torch.bfloat16)
+        k_indexer = k_indexer.to(torch.bfloat16).unsqueeze(2)
+        weights = weights.to(torch.bfloat16)
+        module_path = self.__class__.__name__
+        compress_topk_idxs, index_score = _SimLightningIndexerFn.apply(q_indexer, k_indexer, weights, self.index_topk, module_path)
+        compress_topk_idxs = _add_offset_to_valid_sparse_indices(compress_topk_idxs, offset)
+        return compress_topk_idxs, index_score
+</code></pre>
+<ul>
+<li>[ ] <strong>Step 4: Run test to verify it passes</strong></li>
+</ul>
+<p>Run: <code>python3 -m pytest tests/unit_tests/simulator/hardware_shims/test_smla_shim.py -v</code>
+Expected: all tests (Task 1's 5 + Task 2's 3 = 8) PASS.</p>
+<ul>
+<li>[ ] <strong>Step 5: Commit</strong></li>
+</ul>
+<pre><code class="language-bash">git add torchtitan_npu/simulator/hardware_shims/smla_shim.py tests/unit_tests/simulator/hardware_shims/test_smla_shim.py
+git commit -m &quot;feat(simulator): add SimNpuLiCompute hardware shim for SMLA lightning-indexer&quot;
+</code></pre>
+<hr />
+<h3 id="task-3-simnpuliloss-hardware-shim">Task 3: <code>SimNpuLiLoss</code> hardware shim</h3>
+<p><strong>Files:</strong>
+- Modify: <code>torchtitan_npu/simulator/hardware_shims/smla_shim.py</code> (append)
+- Test: <code>tests/unit_tests/simulator/hardware_shims/test_smla_shim.py</code> (append)</p>
+<p><strong>Interfaces:</strong>
+- Consumes: <code>_record</code> (Task 1, same file)
+- Produces: <code>SimNpuLiLoss(LiLoss)</code> with <code>__init__(self, parent: LiLoss)</code> and
+  <code>forward(self, q, kv, kv_compress, attn_sink, q_indexer, k_indexer, weights, sparse_indices,
+  indexer_score, attention_masks, offset) -&gt; Tensor</code> (matches <code>LiLoss.forward</code>'s exact signature).</p>
+<ul>
+<li>[ ] <strong>Step 1: Write the failing test</strong></li>
+</ul>
+<p>Add to <code>tests/unit_tests/simulator/hardware_shims/test_smla_shim.py</code>:</p>
+<pre><code class="language-python">from torchtitan_npu.models.deepseek_v4.model import LiLoss  # add to existing import line
+from torchtitan_npu.simulator.hardware_shims.smla_shim import SimNpuLiLoss  # add to existing import line
+
+
+def _build_sim_li_loss(B=2, S=8, N=4, D=8, N_i=4, D_i=8, K=5, ratio=4):
+    parent = LiLoss(LiLoss.Config(n_heads=N, softmax_scale=0.1, compress_ratio=ratio, window_size=2, layer_id=0, n_layers=1))
+    shim = SimNpuLiLoss(parent)
+    tensors = {
+        &quot;q&quot;: torch.randn(B, S, N, D),
+        &quot;kv&quot;: torch.randn(B, S, D),
+        &quot;kv_compress&quot;: torch.randn(B, S // ratio, D),
+        &quot;attn_sink&quot;: torch.randn(N),
+        &quot;q_indexer&quot;: torch.randn(B, S, N_i, D_i, requires_grad=True),
+        &quot;k_indexer&quot;: torch.randn(B, S // ratio, D_i, requires_grad=True),
+        &quot;weights&quot;: torch.randn(B, S, N_i, requires_grad=True),
+        &quot;sparse_indices&quot;: torch.randint(0, S, (B, S, K), dtype=torch.int32),
+        &quot;indexer_score&quot;: torch.randn(B, S, K),
+    }
+    return shim, tensors
+
+
+def test_sim_li_loss_forward_returns_zero_scalar_with_no_recorded_op():
+    shim, t = _build_sim_li_loss()
+    capture = OpDispatchCapture()
+    with capture:
+        loss = shim(
+            t[&quot;q&quot;], t[&quot;kv&quot;], t[&quot;kv_compress&quot;], t[&quot;attn_sink&quot;], t[&quot;q_indexer&quot;], t[&quot;k_indexer&quot;],
+            t[&quot;weights&quot;], t[&quot;sparse_indices&quot;], t[&quot;indexer_score&quot;], None, 0,
+        )
+    assert loss.shape == ()
+    assert loss.item() == 0.0
+    nodes = capture.build_nodes()
+    raw_names = {n.annotations.get(&quot;raw_op_type&quot;) for n in nodes.values()}
+    assert &quot;aclnn.npu_sparse_lightning_indexer_grad_kl_loss&quot; not in raw_names  # not fired during forward
+
+
+def test_sim_li_loss_backward_records_real_op_and_propagates_gradient():
+    shim, t = _build_sim_li_loss()
+    phase_box = {&quot;value&quot;: &quot;forward&quot;}
+    capture = OpDispatchCapture(phase_provider=lambda: phase_box[&quot;value&quot;])
+    with capture:
+        loss = shim(
+            t[&quot;q&quot;], t[&quot;kv&quot;], t[&quot;kv_compress&quot;], t[&quot;attn_sink&quot;], t[&quot;q_indexer&quot;], t[&quot;k_indexer&quot;],
+            t[&quot;weights&quot;], t[&quot;sparse_indices&quot;], t[&quot;indexer_score&quot;], None, 0,
+        )
+        phase_box[&quot;value&quot;] = &quot;backward&quot;
+        loss.backward()
+    assert t[&quot;q_indexer&quot;].grad is not None
+    assert t[&quot;q_indexer&quot;].grad.shape == t[&quot;q_indexer&quot;].shape
+    assert t[&quot;k_indexer&quot;].grad is not None
+    assert t[&quot;k_indexer&quot;].grad.shape == t[&quot;k_indexer&quot;].shape
+    assert t[&quot;weights&quot;].grad is not None
+    assert t[&quot;weights&quot;].grad.shape == t[&quot;weights&quot;].shape
+    nodes = capture.build_nodes()
+    bwd_names = {n.annotations[&quot;raw_op_type&quot;] for n in nodes.values() if n.annotations[&quot;phase&quot;] == &quot;backward&quot;}
+    assert &quot;aclnn.npu_sparse_lightning_indexer_grad_kl_loss&quot; in bwd_names
+</code></pre>
+<ul>
+<li>[ ] <strong>Step 2: Run test to verify it fails</strong></li>
+</ul>
+<p>Run: <code>python3 -m pytest tests/unit_tests/simulator/hardware_shims/test_smla_shim.py -v -k li_loss</code>
+Expected: FAIL with <code>ImportError: cannot import name 'SimNpuLiLoss'</code></p>
+<ul>
+<li>[ ] <strong>Step 3: Implement <code>SimNpuLiLoss</code></strong></li>
+</ul>
+<p>Append to <code>torchtitan_npu/simulator/hardware_shims/smla_shim.py</code>:</p>
+<pre><code class="language-python">class _SimLiLossFn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, query, key, query_index, key_index, weights, sparse_indices, module_path):  # noqa: ANN001
+        ctx.save_for_backward(query, key, query_index, key_index, weights, sparse_indices)
+        ctx.module_path = module_path
+        # Mirrors the real SparseLightningIndexerGradKLLossWrapper.forward exactly: no
+        # hardware call here, just a deferred zero placeholder -- the real kernel only fires
+        # in backward (npu_smla.py:1441: &quot;Return dummy loss during fwd, real operation will
+        # be postponed to bwd, to avoid redundant computation ... in case where activation
+        # checkpointing is enabled&quot;).
+        return torch.zeros((), dtype=torch.float32, device=query.device)
+
+    @staticmethod
+    def backward(ctx, grad):  # noqa: ANN001
+        query, key, query_index, key_index, weights, sparse_indices = ctx.saved_tensors
+        d_query_index = torch.empty_like(query_index)
+        d_key_index = torch.empty_like(key_index)
+        d_weights = torch.empty_like(weights)
+        loss = torch.empty((1,), dtype=torch.float32, device=query.device)
+        _record(
+            &quot;aclnn.npu_sparse_lightning_indexer_grad_kl_loss&quot;,
+            [query, key, query_index, key_index, weights, sparse_indices],
+            [d_query_index, d_key_index, d_weights, loss],
+            ctx.module_path,
+        )
+        return None, None, d_query_index, d_key_index, d_weights, None, None
+
+
+class SimNpuLiLoss(LiLoss):
+    &quot;&quot;&quot;Drop-in simulator replacement for `NpuLiLoss`
+    (`torchtitan_npu.converters.kernels.npu_smla`). Real implementation is a &quot;deferred
+    computation&quot; pattern: forward returns a zero scalar immediately with no hardware call;
+    the real ACLNN kernel only fires in backward. `_SimLiLossFn` replicates this exactly.
+
+    Note: subclassing `LiLoss` and defining `forward` here means Python's MRO always resolves
+    a `SimNpuLiLoss` instance's `.forward()` to this method, never to the real base `LiLoss.
+    forward` (even though `meta_env._patch_li_loss_to_skip_buggy_einsum` patches that base
+    method elsewhere) -- no interaction or conflict with that existing patch.&quot;&quot;&quot;
+
+    def __init__(self, parent: &quot;LiLoss&quot;) -&gt; None:
+        self.__dict__.update(parent.__dict__)
+
+    def forward(
+        self, q, kv, kv_compress, attn_sink, q_indexer, k_indexer, weights,
+        sparse_indices, indexer_score, attention_masks, offset,
+    ):
+        if sparse_indices.dtype != torch.int32:
+            sparse_indices = sparse_indices.to(torch.int32)
+        key = kv_compress.unsqueeze(2)
+        key_index = k_indexer.unsqueeze(2)
+        sparse_indices = sparse_indices.unsqueeze(2)
+        module_path = self.__class__.__name__
+        loss = _SimLiLossFn.apply(q, key, q_indexer, key_index, weights, sparse_indices, module_path)
+        self.save_loss(loss)
+        return loss
+</code></pre>
+<ul>
+<li>[ ] <strong>Step 4: Run test to verify it passes</strong></li>
+</ul>
+<p>Run: <code>python3 -m pytest tests/unit_tests/simulator/hardware_shims/test_smla_shim.py -v</code>
+Expected: all tests (Task 1's 5 + Task 2's 3 + Task 3's 2 = 10) PASS.</p>
+<ul>
+<li>[ ] <strong>Step 5: Commit</strong></li>
+</ul>
+<pre><code class="language-bash">git add torchtitan_npu/simulator/hardware_shims/smla_shim.py tests/unit_tests/simulator/hardware_shims/test_smla_shim.py
+git commit -m &quot;feat(simulator): add SimNpuLiLoss hardware shim for SMLA lightning-indexer KL loss&quot;
+</code></pre>
+<hr />
+<h3 id="task-4-simsmlaconverter-applyunapply-wiring">Task 4: <code>SimSMLAConverter</code> + apply/unapply wiring</h3>
+<p><strong>Files:</strong>
+- Create: <code>torchtitan_npu/simulator/hardware_shims/smla_converter.py</code>
+- Test: <code>tests/unit_tests/simulator/hardware_shims/test_smla_converter.py</code></p>
+<p><strong>Interfaces:</strong>
+- Consumes: <code>SimNpuSparseAttention</code>, <code>SimNpuLiCompute</code>, <code>SimNpuLiLoss</code> (Tasks 1-3);
+  <code>SparseAttention</code>, <code>LiCompute</code>, <code>LiLoss</code> from <code>torchtitan_npu.models.deepseek_v4.model</code>;
+  <code>NpuSMLAModelConfig</code> from <code>torchtitan_npu.converters.kernels.npu_smla</code>; <code>replace_module_with_name</code>
+  from <code>torchtitan_npu.converters.convert_utils</code>.
+- Produces: <code>apply_smla_shims() -&gt; None</code>, <code>unapply_smla_shims() -&gt; None</code>.</p>
+<ul>
+<li>[ ] <strong>Step 1: Write the failing test</strong></li>
+</ul>
+<p>Create <code>tests/unit_tests/simulator/hardware_shims/test_smla_converter.py</code>:</p>
+<pre><code class="language-python"># Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+import torch.nn as nn
+
+from torchtitan_npu.converters.kernels.npu_smla import NpuSMLAModelConfig
+from torchtitan_npu.models.deepseek_v4.model import DeepSeekV4Model, LiCompute, LiLoss, SparseAttention
+from torchtitan_npu.simulator.hardware_shims.smla_converter import apply_smla_shims, unapply_smla_shims
+from torchtitan_npu.simulator.hardware_shims.smla_shim import SimNpuLiCompute, SimNpuLiLoss, SimNpuSparseAttention
+
+
+class _FakeModelSpec:
+    name = &quot;deepseek_v4&quot;
+
+
+def test_apply_smla_shims_replaces_converter_target_class():
+    original = NpuSMLAModelConfig.model_converter
+    try:
+        apply_smla_shims()
+        assert NpuSMLAModelConfig.model_converter is not original
+    finally:
+        unapply_smla_shims()
+        assert NpuSMLAModelConfig.model_converter is original
+
+
+def test_applied_smla_converter_replaces_all_three_submodule_types():
+    apply_smla_shims()
+    try:
+        args = DeepSeekV4Model.Config(n_heads=4, head_dim=8, compress_ratios=(4,), window_size=2, n_layers=1)
+        model = nn.Sequential()
+        model.add_module(&quot;sparse_attn&quot;, SparseAttention(SparseAttention.Config(layer_id=0, args=args)))
+        model.add_module(&quot;li_compute&quot;, LiCompute(LiCompute.Config(ratio=4, index_topk=5)))
+        model.add_module(&quot;li_loss&quot;, LiLoss(LiLoss.Config(n_heads=4, softmax_scale=0.1, compress_ratio=4, window_size=2, layer_id=0, n_layers=1)))
+        converter = NpuSMLAModelConfig.model_converter(_FakeModelSpec())
+        converter.convert(model)
+        assert isinstance(model.sparse_attn, SimNpuSparseAttention)
+        assert isinstance(model.li_compute, SimNpuLiCompute)
+        assert isinstance(model.li_loss, SimNpuLiLoss)
+    finally:
+        unapply_smla_shims()
+
+
+def test_unapply_is_idempotent_when_not_applied():
+    unapply_smla_shims()  # must not raise even if apply_smla_shims was never called
+    unapply_smla_shims()  # calling twice must also not raise
+</code></pre>
+<ul>
+<li>[ ] <strong>Step 2: Run test to verify it fails</strong></li>
+</ul>
+<p>Run: <code>python3 -m pytest tests/unit_tests/simulator/hardware_shims/test_smla_converter.py -v</code>
+Expected: FAIL with <code>ModuleNotFoundError: No module named 'torchtitan_npu.simulator.hardware_shims.smla_converter'</code></p>
+<ul>
+<li>[ ] <strong>Step 3: Implement <code>smla_converter.py</code></strong></li>
+</ul>
+<p>First, confirm the exact registered converter class name via:</p>
+<pre><code class="language-bash">grep -n &quot;register_model_converter(\&quot;npu_smla\&quot;)&quot; -A 2 torchtitan_npu/converters/kernels/npu_smla.py
+</code></pre>
+<p>Expected output: <code>@register_model_converter("npu_smla")</code> immediately followed by
+<code>class NpuSMLAModelConfig(ModelCustomConfig):</code> (confirmed at <code>npu_smla.py:1639-1640</code>).</p>
+<p>Create <code>torchtitan_npu/simulator/hardware_shims/smla_converter.py</code>:</p>
+<pre><code class="language-python"># Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+&quot;&quot;&quot;Reversible class-attribute patch that swaps the `npu_smla` model converter's target
+implementation class for the simulator's shape-only shims (SimNpuSparseAttention/
+SimNpuLiCompute/SimNpuLiLoss), instead of SimulationTrainer stripping this converter out
+entirely. Mirrors mhc_converter.py's apply_mhc_shims()/unapply_mhc_shims() exactly --
+NpuSMLAModelConfig is the real, already-registered converter-config class from
+torchtitan_npu.converters.kernels.npu_smla (zero modification to that file: this module only
+reassigns its `model_converter` class attribute at runtime, under simulation).&quot;&quot;&quot;
+
+from __future__ import annotations
+
+import torch.nn as nn
+
+from torchtitan_npu.converters.convert_utils import replace_module_with_name
+from torchtitan_npu.converters.kernels.npu_smla import NpuSMLAModelConfig
+from torchtitan_npu.converters.model_custom_interface import ModelCustomConverter
+from torchtitan_npu.models.deepseek_v4.model import LiCompute, LiLoss, SparseAttention
+from torchtitan_npu.simulator.hardware_shims.smla_shim import SimNpuLiCompute, SimNpuLiLoss, SimNpuSparseAttention
+
+_original_smla_converter: type | None = None
+
+
+class SimSMLAConverter(ModelCustomConverter):
+    &quot;&quot;&quot;Replaces every SparseAttention/LiCompute/LiLoss submodule with the corresponding Sim*
+    shim -- never selects the real fused (A5) or JIT-compiled (non-A5) implementation (see
+    design doc §2: neither path can execute under simulation).&quot;&quot;&quot;
+
+    def convert(self, model: nn.Module) -&gt; None:
+        for name, module in list(model.named_modules()):
+            if isinstance(module, SparseAttention):
+                replace_module_with_name(model, name, SimNpuSparseAttention(module))
+            if isinstance(module, LiCompute):
+                replace_module_with_name(model, name, SimNpuLiCompute(module))
+            if isinstance(module, LiLoss):
+                replace_module_with_name(model, name, SimNpuLiLoss(module))
+
+
+def apply_smla_shims() -&gt; None:
+    &quot;&quot;&quot;Patch NpuSMLAModelConfig.model_converter to point at SimSMLAConverter. Idempotent: the
+    `is None` guard below means only the *first* call saves the pre-patch &quot;original&quot; value;
+    every subsequent call is a no-op for that bookkeeping, so unapply_smla_shims() always
+    restores the value active before the very first apply_smla_shims() call.&quot;&quot;&quot;
+    global _original_smla_converter
+    if _original_smla_converter is None:
+        _original_smla_converter = NpuSMLAModelConfig.model_converter
+    NpuSMLAModelConfig.model_converter = SimSMLAConverter
+
+
+def unapply_smla_shims() -&gt; None:
+    &quot;&quot;&quot;Restore the original converter class. Safe to call even if apply_smla_shims() was
+    never called (no-op), and safe to call more than once (idempotent).&quot;&quot;&quot;
+    global _original_smla_converter
+    if _original_smla_converter is not None:
+        NpuSMLAModelConfig.model_converter = _original_smla_converter
+        _original_smla_converter = None
+</code></pre>
+<ul>
+<li>[ ] <strong>Step 4: Run test to verify it passes</strong></li>
+</ul>
+<p>Run: <code>python3 -m pytest tests/unit_tests/simulator/hardware_shims/test_smla_converter.py -v</code>
+Expected: all 3 tests PASS.</p>
+<ul>
+<li>[ ] <strong>Step 5: Commit</strong></li>
+</ul>
+<pre><code class="language-bash">git add torchtitan_npu/simulator/hardware_shims/smla_converter.py tests/unit_tests/simulator/hardware_shims/test_smla_converter.py
+git commit -m &quot;feat(simulator): add reversible SMLA converter patch (SimSMLAConverter)&quot;
+</code></pre>
+<hr />
+<h3 id="task-5-wire-into-simulationtrainer">Task 5: Wire into <code>SimulationTrainer</code></h3>
+<p><strong>Files:</strong>
+- Modify: <code>torchtitan_npu/simulator/trainer.py</code>
+- Modify: <code>tests/unit_tests/simulator/test_trainer.py</code></p>
+<p><strong>Interfaces:</strong>
+- Consumes: <code>apply_smla_shims</code> (Task 4)
+- Produces: narrows <code>_HARDWARE_DEPENDENT_CONVERTER_NAMES</code> to <code>frozenset()</code> (empty).</p>
+<ul>
+<li>[ ] <strong>Step 1: Write the failing test</strong></li>
+</ul>
+<p>In <code>tests/unit_tests/simulator/test_trainer.py</code>, replace
+<code>test_strip_hardware_dependent_model_converters_only_removes_smla</code> (from the MHC plan's Task 6 --
+MHC is no longer stripped and now neither is SMLA) with:</p>
+<pre><code class="language-python">def test_strip_hardware_dependent_model_converters_removes_nothing():
+    # Updated expectation (was: strips npu_smla only). SMLA is no longer stripped either --
+    # SimulationTrainer now installs SimSMLAConverter via apply_smla_shims() instead (Task 4),
+    # so npu_smla stays in the converters list and gets a real (shim) implementation rather
+    # than being dropped to the base class. _HARDWARE_DEPENDENT_CONVERTER_NAMES is now empty.
+    config = SimpleNamespace(
+        model_converters=SimpleNamespace(
+            converters=[
+                _fake_converter_config(&quot;npu_rms_norm&quot;),
+                _fake_converter_config(&quot;npu_mhc_pre&quot;),
+                _fake_converter_config(&quot;npu_mhc_post&quot;),
+                _fake_converter_config(&quot;npu_smla&quot;),
+                _fake_converter_config(&quot;npu_gmm&quot;),
+            ]
+        )
+    )
+    _strip_hardware_dependent_model_converters(config)
+    remaining_names = {c._owner._model_config.name for c in config.model_converters.converters}
+    assert remaining_names == {&quot;npu_rms_norm&quot;, &quot;npu_mhc_pre&quot;, &quot;npu_mhc_post&quot;, &quot;npu_smla&quot;, &quot;npu_gmm&quot;}
+</code></pre>
+<ul>
+<li>[ ] <strong>Step 2: Run test to verify it fails</strong></li>
+</ul>
+<p>Run: <code>python3 -m pytest tests/unit_tests/simulator/test_trainer.py -v -k removes_nothing</code>
+Expected: FAIL on the <code>assert remaining_names == ...</code> line (current code still strips <code>npu_smla</code>).</p>
+<ul>
+<li>[ ] <strong>Step 3: Modify <code>trainer.py</code></strong></li>
+</ul>
+<p>View the current file first to find the exact locations:</p>
+<pre><code class="language-bash">grep -n &quot;_HARDWARE_DEPENDENT_CONVERTER_NAMES\|apply_mhc_shims&quot; torchtitan_npu/simulator/trainer.py
+</code></pre>
+<p>Make these two edits to <code>torchtitan_npu/simulator/trainer.py</code>:</p>
+<ol>
+<li>Add the import right after the existing <code>apply_mhc_shims</code> import (alphabetically,
+   <code>hardware_shims.mhc_converter</code> &lt; <code>hardware_shims.smla_converter</code>):</li>
+</ol>
+<pre><code class="language-python">from torchtitan_npu.simulator.hardware_shims.smla_converter import apply_smla_shims
+</code></pre>
+<ol>
+<li>Change <code>_HARDWARE_DEPENDENT_CONVERTER_NAMES</code> to an empty frozenset, and update the comment
+   block directly above it to explain both MHC and SMLA are now shimmed rather than stripped:</li>
+</ol>
+<pre><code class="language-python"># npu_mhc_pre/npu_mhc_post: no longer stripped -- SimulationTrainer.__init__ calls
+# apply_mhc_shims() (torchtitan_npu.simulator.hardware_shims.mhc_converter) to install
+# SimHcPre/SimHcHead/SimHcPost instead, preserving the real op names in the captured graph. See
+# docs/superpowers/specs/2026-07-01-mhc-real-op-name-capture-design.md.
+# npu_smla: no longer stripped either -- SimulationTrainer.__init__ calls apply_smla_shims()
+# (torchtitan_npu.simulator.hardware_shims.smla_converter) to install SimNpuSparseAttention/
+# SimNpuLiCompute/SimNpuLiLoss instead. See
+# docs/superpowers/specs/2026-07-01-smla-real-op-name-capture-design.md.
+_HARDWARE_DEPENDENT_CONVERTER_NAMES = frozenset()
+</code></pre>
+<ol>
+<li>In <code>SimulationTrainer.__init__</code>, find the line <code>apply_mhc_shims()</code> (added by the MHC plan's
+   Task 6, immediately before <code>_strip_hardware_dependent_model_converters(config)</code>) and add
+   <code>apply_smla_shims()</code> right after it:</li>
+</ol>
+<pre><code class="language-python">        apply_mhc_shims()
+        apply_smla_shims()
+        _strip_hardware_dependent_model_converters(config)
+</code></pre>
+<ul>
+<li>[ ] <strong>Step 4: Run tests to verify they pass</strong></li>
+</ul>
+<p>Run: <code>python3 -m pytest tests/unit_tests/simulator/test_trainer.py -v</code>
+Expected: all tests PASS.</p>
+<p>Then run the full simulator suite to check for regressions:</p>
+<p>Run: <code>python3 -m pytest tests/unit_tests/simulator/ tests/smoke_tests/simulator/ -q</code>
+Expected: all PASS (previous 129 + this plan's new tests; some may report import errors for
+<code>torch_npu</code>/<code>torchtitan_npu.models.deepseek_v4.model</code> if run outside the container per this repo's
+existing sandbox limitation -- acceptable, matches the documented convention).</p>
+<ul>
+<li>[ ] <strong>Step 5: Commit</strong></li>
+</ul>
+<pre><code class="language-bash">git add torchtitan_npu/simulator/trainer.py tests/unit_tests/simulator/test_trainer.py
+git commit -m &quot;feat(simulator): wire apply_smla_shims into SimulationTrainer, strip-out list now empty&quot;
+</code></pre>
+<hr />
+<h3 id="task-6-small-scale-container-validation-spike">Task 6: Small-scale container validation spike</h3>
+<p><strong>Files:</strong> none (validation only, no code changes expected)</p>
+<p><strong>Interfaces:</strong> none</p>
+<ul>
+<li>[ ] <strong>Step 1: Run the full simulator test suite in the CANN container</strong></li>
+</ul>
+<pre><code class="language-bash">sudo docker exec titan-npu-sim-e2e bash -c &quot;
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+export LD_LIBRARY_PATH=\&quot;/usr/local/python3.12.13/lib/python3.12/site-packages/torch/lib:\${LD_LIBRARY_PATH}\&quot;
+cd /mnt/c/Users/admin/Documents/torchtitan-npu-simulator/.worktrees/feat-npu-simulator
+python3 -m pytest -v tests/unit_tests/simulator/ tests/smoke_tests/simulator/ 2&gt;&amp;1 | tail -40
+&quot;
+</code></pre>
+<p>Expected: all tests pass (previous 129 + this plan's new tests, no import-error skips this time
+since the container has the exact pinned <code>torchtitan</code> and real <code>torch_npu</code>).</p>
+<ul>
+<li>[ ] <strong>Step 2: Run the 16-layer smoke config and confirm SMLA's real op names appear</strong></li>
+</ul>
+<pre><code class="language-bash">sudo docker exec titan-npu-sim-e2e bash -c &quot;
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+export LD_LIBRARY_PATH=\&quot;/usr/local/python3.12.13/lib/python3.12/site-packages/torch/lib:\${LD_LIBRARY_PATH}\&quot;
+cd /mnt/c/Users/admin/Documents/torchtitan-npu-simulator/.worktrees/feat-npu-simulator
+rm -rf simulator_output/deepseek_v4_pro_16_layers
+NGPU=16 LOCAL_RANK=0 WORLD_SIZE=16 RANK=0 COMM_MODE=fake_backend \
+python3 -m torchtitan_npu.entry \
+  --module torchtitan_npu.simulator \
+  --config deepseek_v4_pro_simulate_16_layers \
+  --comm.mode=fake_backend --training.steps=1 \
+  --hf_assets_path=./tests/assets/tokenizer/deepseekv3_tokenizer 2&gt;&amp;1 | tail -60
+echo EXIT_CODE=\$?
+grep -oE 'label=\&quot;aclnn\.[a-z_]*\&quot;' simulator_output/deepseek_v4_pro_16_layers/compute_graph.dot | sort | uniq -c
+&quot;
+</code></pre>
+<p>Expected: <code>EXIT_CODE=0</code>, and the <code>grep</code> output shows at least <code>aclnn.npu_sparse_attn_sharedkv</code>,
+<code>aclnn.npu_sparse_attn_sharedkv_metadata</code>, <code>aclnn.npu_sparse_attn_sharedkv_grad</code> (confirms
+<code>SimNpuSparseAttention</code>'s real op names now appear where the base <code>SparseAttention</code>'s
+<code>matmul</code>/<code>softmax</code>/<code>scatter_</code> sequence used to be). <code>aclnn.npu_lightning_indexer</code> and
+<code>aclnn.npu_sparse_lightning_indexer_grad_kl_loss</code> should also appear if this 16-layer config
+includes any <code>R==4</code> layers -- check <code>summary.txt</code>/<code>compute_graph.dot</code> for these two; if absent,
+verify via <code>python3 -c "from torchtitan_npu.models.deepseek_v4.config_registry import
+deepseek_v4_pro_debug_16_layers; print(deepseek_v4_pro_debug_16_layers().model.compress_ratios)"</code>
+(or equivalent) whether this specific config actually has any <code>R==4</code> layer -- if not, this is
+expected and not a bug (LiCompute/LiLoss only exist on <code>R==4</code> layers), and Step 3 of Task 7 (the
+61-layer config, which per the MHC plan's records definitely has R==4 layers, since MHC's own
+61-layer validation confirmed non-zero MoE/attention activity across all layer types) is where
+this gets exercised for real.</p>
+<ul>
+<li>[ ] <strong>Step 3: If Step 2 fails, debug before proceeding</strong></li>
+</ul>
+<p>If the run crashes: read the stack trace, identify the exact failing call. Likely culprits (in
+order of likelihood, based on the MHC plan's own debugging history): (a) a shape mismatch between
+what <code>SimNpuSparseAttention</code>/<code>SimNpuLiCompute</code>/<code>SimNpuLiLoss</code> produce and what the surrounding
+<code>InnerAttention.forward</code> expects downstream -- re-verify against the exact production call site in
+<code>torchtitan_npu/models/deepseek_v4/model.py:693-729</code>; (b) a missing <code>torch.autograd.Function</code>
+gradient-count mismatch (the number of values <code>backward()</code> returns must exactly match the number of
+positional arguments <code>forward()</code> received) -- re-count carefully against this plan's exact code;
+(c) the <code>SparseAttention.Config</code>/<code>LiCompute.Config</code>/<code>LiLoss.Config</code> real construction in the actual
+model differs subtly from this plan's test fixtures. Fix the specific issue found, re-run this
+task's Step 1 (full test suite) to catch regressions, then retry Step 2. Do not proceed to Task 7
+until Step 2 passes cleanly.</p>
+<ul>
+<li>[ ] <strong>Step 4: Commit any fixes made during debugging</strong></li>
+</ul>
+<pre><code class="language-bash">git add -A
+git commit -m &quot;fix(simulator): correct SMLA shim shape/signature found via 16-layer container validation&quot;
+</code></pre>
+<p>(Skip this step if Step 2 passed on the first try with no code changes needed.)</p>
+<hr />
+<h3 id="task-7-full-container-re-validation-16-layer-61-layer">Task 7: Full container re-validation (16-layer + 61-layer)</h3>
+<p><strong>Files:</strong> none (validation only)</p>
+<p><strong>Interfaces:</strong> none</p>
+<ul>
+<li>[ ] <strong>Step 1: Re-run the 16-layer smoke config, save <code>summary.txt</code></strong></li>
+</ul>
+<pre><code class="language-bash">sudo docker exec titan-npu-sim-e2e bash -c &quot;
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+export LD_LIBRARY_PATH=\&quot;/usr/local/python3.12.13/lib/python3.12/site-packages/torch/lib:\${LD_LIBRARY_PATH}\&quot;
+cd /mnt/c/Users/admin/Documents/torchtitan-npu-simulator/.worktrees/feat-npu-simulator
+rm -rf simulator_output/deepseek_v4_pro_16_layers
+NGPU=16 LOCAL_RANK=0 WORLD_SIZE=16 RANK=0 COMM_MODE=fake_backend \
+python3 -m torchtitan_npu.entry \
+  --module torchtitan_npu.simulator \
+  --config deepseek_v4_pro_simulate_16_layers \
+  --comm.mode=fake_backend --training.steps=1 \
+  --hf_assets_path=./tests/assets/tokenizer/deepseekv3_tokenizer
+echo EXIT_CODE=\$?
+cat simulator_output/deepseek_v4_pro_16_layers/summary.txt
+&quot;
+</code></pre>
+<p>Expected: <code>EXIT_CODE=0</code>. Confirm the "Unrecognized op types" list no longer contains
+<code>aten.einsum.default</code>/<code>aten.topk.default</code> if they were previously present ONLY due to the base
+<code>LiCompute</code>/<code>SparseAttention</code> implementations (some of these aten ops may still appear if used
+elsewhere in the model unrelated to SMLA -- that's expected; the key check is that
+<code>aclnn.npu_sparse_attn_sharedkv</code> etc. now appear in the list too, confirming the shim's real names
+are captured, even if cost-model coverage for them is "unknown" -- same as MHC's <code>triton.*</code> entries).</p>
+<ul>
+<li>[ ] <strong>Step 2: Re-run the 61-layer acceptance config</strong></li>
+</ul>
+<pre><code class="language-bash">sudo docker exec titan-npu-sim-e2e bash -c &quot;
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+export LD_LIBRARY_PATH=\&quot;/usr/local/python3.12.13/lib/python3.12/site-packages/torch/lib:\${LD_LIBRARY_PATH}\&quot;
+cd /mnt/c/Users/admin/Documents/torchtitan-npu-simulator/.worktrees/feat-npu-simulator
+rm -rf simulator_output/deepseek_v4_pro_61_layers
+NGPU=384 LOCAL_RANK=0 WORLD_SIZE=384 RANK=0 COMM_MODE=fake_backend \
+python3 -m torchtitan_npu.entry \
+  --module torchtitan_npu.simulator \
+  --config deepseek_v4_pro_simulate_61_layers \
+  --comm.mode=fake_backend --training.steps=1 \
+  --hf_assets_path=./tests/assets/tokenizer/deepseekv3_tokenizer
+echo EXIT_CODE=\$?
+cat simulator_output/deepseek_v4_pro_61_layers/summary.txt
+grep -oE 'label=\&quot;aclnn\.[a-z_]*\&quot;' simulator_output/deepseek_v4_pro_61_layers/compute_graph.dot | sort | uniq -c
+&quot;
+</code></pre>
+<p>Expected: <code>EXIT_CODE=0</code> (takes ~8-9 minutes, matching prior acceptance runs' timing). Confirm
+<code>RankTable</code>: <code>world_size=384</code>, <code>dim_degrees["ep"]=192</code>, <code>pp=tp=cp=1</code> (unchanged from all prior
+acceptance runs -- SMLA's shim should not affect parallelism/RankTable at all). Confirm all 5
+<code>aclnn.*</code> op names appear (<code>npu_sparse_attn_sharedkv</code>, <code>npu_sparse_attn_sharedkv_metadata</code>,
+<code>npu_sparse_attn_sharedkv_grad</code>, <code>npu_lightning_indexer</code>, <code>npu_sparse_lightning_indexer_grad_kl_loss</code>)
+-- the 61-layer config's <code>compress_ratios</code> include <code>4</code> (confirmed by the MHC plan's own container
+validation showing non-trivial MoE/attention activity across all layer types), so all three shim
+classes should be exercised. Confirm forward/backward/optimizer node counts are in the same order
+of magnitude as the prior (MHC-only) acceptance run's baseline (forward=34250, backward=68398,
+optimizer=3571) -- some difference is expected (SMLA's real op sequence has different granularity
+than the base classes' sequence), but a wildly different order of magnitude would indicate a bug.</p>
+<ul>
+<li>[ ] <strong>Step 3: Copy the updated output out of the container for review</strong></li>
+</ul>
+<pre><code class="language-bash">HOST_DIR=&quot;/mnt/c/Users/admin/Documents/torchtitan-npu-simulator/simulator_review_output/deepseek_v4_pro_61_layers_post_smla_shim&quot;
+mkdir -p &quot;$HOST_DIR&quot;
+sudo docker cp &quot;titan-npu-sim-e2e:/mnt/c/Users/admin/Documents/torchtitan-npu-simulator/.worktrees/feat-npu-simulator/simulator_output/deepseek_v4_pro_61_layers/compute_graph.dot&quot; &quot;$HOST_DIR/&quot;
+sudo docker cp &quot;titan-npu-sim-e2e:/mnt/c/Users/admin/Documents/torchtitan-npu-simulator/.worktrees/feat-npu-simulator/simulator_output/deepseek_v4_pro_61_layers/summary.txt&quot; &quot;$HOST_DIR/&quot;
+sudo docker cp &quot;titan-npu-sim-e2e:/mnt/c/Users/admin/Documents/torchtitan-npu-simulator/.worktrees/feat-npu-simulator/simulator_output/deepseek_v4_pro_61_layers/trace.html&quot; &quot;$HOST_DIR/&quot;
+sudo chown -R $(id -u):$(id -g) &quot;$HOST_DIR&quot;
+</code></pre>
+<ul>
+<li>[ ] <strong>Step 4: Update the design doc with final validated results</strong></li>
+</ul>
+<p>Add a "§9. 验证结果" section to
+<code>docs/superpowers/specs/2026-07-01-smla-real-op-name-capture-design.md</code> recording: the exact
+container commands run, exit codes, and the confirmed presence of all 5 <code>aclnn.*</code> op names in the
+61-layer output, plus the forward/backward/optimizer node counts observed.</p>
+<ul>
+<li>[ ] <strong>Step 5: Commit</strong></li>
+</ul>
+<pre><code class="language-bash">git add docs/superpowers/specs/2026-07-01-smla-real-op-name-capture-design.md
+git commit -m &quot;docs(simulator): record SMLA shim validation results (16-layer + 61-layer re-run)&quot;
+git push origin feat/npu-simulator
+</code></pre>
+<h2 id="explicitly-out-of-scope-for-this-plan">Explicitly out of scope for this plan</h2>
+<ul>
+<li><strong><code>target_npu_device_type == "A5"</code></strong>: as with the MHC plan, the shims always record non-A5
+  (ACLNN JIT) op names regardless of this config value -- the A5 path's real shapes were never
+  verified (design doc §7) since it depends on the unavailable <code>custom_ops</code> private package
+  regardless of environment.</li>
+</ul>
+              
+            </div>
+          </div><footer>
+    <div class="rst-footer-buttons" role="navigation" aria-label="Footer Navigation">
+        <a href="../2026-07-01-npu-simulator-implementation/" class="btn btn-neutral float-left" title="torchtitan_npu Simulator Implementation Plan"><span class="icon icon-circle-arrow-left"></span> Previous</a>
+        <a href="../../specs/2026-07-01-mhc-real-op-name-capture-design/" class="btn btn-neutral float-right" title="MHC 真实算子名捕获 — 架构与方案设计（阶段一：MHC）">Next <span class="icon icon-circle-arrow-right"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <!-- Copyright etc -->
+  </div>
+
+  Built with <a href="https://www.mkdocs.org/">MkDocs</a> using a <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a> provided by <a href="https://readthedocs.org">Read the Docs</a>.
+</footer>
+          
+        </div>
+      </div>
+
+    </section>
+
+  </div>
+
+  <div class="rst-versions" role="note" aria-label="Versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    
+    
+      <span><a href="../2026-07-01-npu-simulator-implementation/" style="color: #fcfcfc">&laquo; Previous</a></span>
+    
+    
+      <span><a href="../../specs/2026-07-01-mhc-real-op-name-capture-design/" style="color: #fcfcfc">Next &raquo;</a></span>
+    
+  </span>
+</div>
+    <script src="../../../js/jquery-3.6.0.min.js"></script>
+    <script>var base_url = "../../..";</script>
+    <script src="../../../js/theme_extra.js"></script>
+    <script src="../../../js/theme.js"></script>
+    <script>
+        jQuery(function () {
+            SphinxRtdTheme.Navigation.enable(true);
+        });
+    </script>
+
+</body>
+</html>

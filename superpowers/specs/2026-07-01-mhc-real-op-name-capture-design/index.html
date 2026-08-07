@@ -1,0 +1,576 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" >
+<head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+      <link rel="shortcut icon" href="../../../img/favicon.ico" />
+    <title>MHC 真实算子名捕获 — 架构与方案设计（阶段一：MHC） - torchtitan-npu</title>
+    <link rel="stylesheet" href="../../../css/theme.css" />
+    <link rel="stylesheet" href="../../../css/theme_extra.css" />
+        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/styles/github.min.css" />
+    
+      <script>
+        // Current page data
+        var mkdocs_page_name = "MHC \u771f\u5b9e\u7b97\u5b50\u540d\u6355\u83b7 \u2014 \u67b6\u6784\u4e0e\u65b9\u6848\u8bbe\u8ba1\uff08\u9636\u6bb5\u4e00\uff1aMHC\uff09";
+        var mkdocs_page_input_path = "superpowers/specs/2026-07-01-mhc-real-op-name-capture-design.md";
+        var mkdocs_page_url = null;
+      </script>
+    
+    <!--[if lt IE 9]>
+      <script src="../../../js/html5shiv.min.js"></script>
+    <![endif]-->
+      <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/highlight.min.js"></script>
+      <script>hljs.highlightAll();</script> 
+</head>
+
+<body class="wy-body-for-nav" role="document">
+
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side stickynav">
+    <div class="wy-side-scroll">
+      <div class="wy-side-nav-search">
+          <a href="../../.." class="icon icon-home"> torchtitan-npu
+        </a>
+      </div>
+
+      <div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <ul>
+                <li class="toctree-l1"><a class="reference internal" href="../../..">Home</a>
+                </li>
+              </ul>
+              <ul>
+                <li class="toctree-l1"><a class="reference internal" href="../../../lint_guide/">Lint 指南</a>
+                </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Community</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../community/contributors/">提交者与贡献者（Committers and Contributors）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../community/governance/">社区治理</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../community/versioning_policy/">版本策略</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Design</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/1f1b-schedule-plan-assembly-guide/">1F1B 完整依赖组装与 DES 回放实现指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/alltoall-capture-analysis/">all_to_all 通信捕获缺失分析</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/communication-ownership-contract/">Communication Ownership Contract</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/dualpipev-schedule-plan-consumer-guide/">DualPipeV SchedulePlan 下游接入指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/l2-l3-schedule-plan-design/">L2/L3 调度 IR 重构设计：从扁平 trace 到结构化 SchedulePlan</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/low-precision-sim-analysis/">低精度训练（MXFP8）Simulator 使能分析</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/optimizer-ops-analysis/">优化器算子捕获问题分析</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/pipeline-multi-graph-capture-design/">复杂 Pipeline 策略下完整计算图捕获方案设计</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/pp-l2-capture-architecture/">PP L2 Capture Architecture</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/schedule-capture-design/">L0-L3 IR 层级归属设计</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/schedule-plan-dependency-reconstruction-contract/">SchedulePlan 下游依赖重建契约</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/schedule-plan-des-consumer-guide/">SchedulePlan 依赖重建与 DES 消费指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/simulator-memory-model-design/">Simulator Memory Model 改造设计</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Feature guides</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../feature_guides/checkpoint/">Checkpoint 使用指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../feature_guides/deepseek_v32_mtp/">多Token预测特性(Multi Token Prediction, MTP)</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../feature_guides/low_precision_training/">低精度训练特性（MXFP8）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../feature_guides/metrics_and_debugging/">调试支持特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../feature_guides/model_custom/">Model Custom框架介绍</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../feature_guides/muon_optimizer/">Muon 优化器特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../feature_guides/new_model_onboarding/">新模型接入开发流程</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../feature_guides/npu_fused_ops/">NPU 融合算子适配</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../feature_guides/swap_optimizer/">SwapOptimizer 特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../feature_guides/torch_compile/">torch.compile 支持</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../feature_guides/virtual_optimizer/">Virtual Optimizer - 优化器显存虚拟化特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../feature_guides/vlm/">VLM NPU 支持</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" >Parallelism</a>
+    <ul>
+                <li class="toctree-l2"><a class="reference internal" href="../../../feature_guides/parallelism/custom_cp/">自定义 Context Parallel 特性</a>
+                </li>
+    </ul>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Recipe</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../recipe/sft/">SFT 指令微调</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Superpowers</span></p>
+              <ul class="current">
+                  <li class="toctree-l1"><a class="reference internal" >Plans</a>
+    <ul>
+                <li class="toctree-l2"><a class="reference internal" href="../../plans/2026-07-01-mhc-real-op-name-capture-implementation/">MHC Real-Op-Name Capture Implementation Plan</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../plans/2026-07-01-npu-simulator-implementation/">torchtitan_npu Simulator Implementation Plan</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../plans/2026-07-01-smla-real-op-name-capture-implementation/">SMLA Real-Op-Name Capture Implementation Plan</a>
+                </li>
+    </ul>
+                  </li>
+                  <li class="toctree-l1 current"><a class="reference internal current" >Specs</a>
+    <ul class="current">
+                <li class="toctree-l2 current"><a class="reference internal current" href="#">MHC 真实算子名捕获 — 架构与方案设计（阶段一：MHC）</a>
+    <ul class="current">
+    <li class="toctree-l3"><a class="reference internal" href="#1">1. 背景与问题</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#2">2. 关键约束（决定了不能"直接跑真实实现"）</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#3">3. 架构设计</a>
+        <ul>
+    <li class="toctree-l4"><a class="reference internal" href="#31">3.1 新增能力一览</a>
+    </li>
+    <li class="toctree-l4"><a class="reference internal" href="#32-opdispatchcapturerecord_synthetic_op">3.2 OpDispatchCapture.record_synthetic_op</a>
+    </li>
+    <li class="toctree-l4"><a class="reference internal" href="#33-simulationconfigtarget_npu_device_type">3.3 SimulationConfig.target_npu_device_type</a>
+    </li>
+    <li class="toctree-l4"><a class="reference internal" href="#34-simhcpre-simhcheadhardware_shimsmhc_shimpy">3.4 SimHcPre / SimHcHead（hardware_shims/mhc_shim.py）</a>
+    </li>
+    <li class="toctree-l4"><a class="reference internal" href="#35">3.5 影子张量的构造</a>
+    </li>
+        </ul>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#4">4. 端到端集成</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#5">5. 测试与验证策略（先小后大，呼应最初"先小规模验证"的要求）</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#6">6. 明确不在阶段一范围内（阶段二待办）</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#7">7. 与用户需求的对应关系</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#8-cann-titan-npu-sim-e2e-20">8. 验证结果（全新 CANN 容器 titan-npu-sim-e2e，与原 20 任务验收同一容器）</a>
+    </li>
+    </ul>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../2026-07-01-npu-simulator-design/">torchtitan_npu Simulator — 架构与方案设计</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../2026-07-01-smla-real-op-name-capture-design/">SMLA 真实算子名捕获 — 架构与方案设计（阶段二：SMLA）</a>
+                </li>
+    </ul>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Test guides</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../test_guides/model_acceptance/">新模型最终验收规范（Meta 模拟器）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../test_guides/test_design/">测试设计</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../test_guides/test_guide/">测试使用指南</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">User guides</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../user-guides/deepseek_v4_model_parameters/">DeepSeek-V4 模型参数 Web 字段目录</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../user-guides/installation/">软件安装</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../user-guides/quickstart/">快速上手</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../user-guides/simulator/">Simulator 使用指南</a>
+                  </li>
+              </ul>
+      </div>
+    </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap">
+      <nav class="wy-nav-top" role="navigation" aria-label="Mobile navigation menu">
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../..">torchtitan-npu</a>
+        
+      </nav>
+      <div class="wy-nav-content">
+        <div class="rst-content"><div role="navigation" aria-label="breadcrumbs navigation">
+  <ul class="wy-breadcrumbs">
+    <li><a href="../../.." class="icon icon-home" aria-label="Docs"></a></li>
+          <li class="breadcrumb-item">Superpowers</li>
+          <li class="breadcrumb-item">Specs</li>
+      <li class="breadcrumb-item active">MHC 真实算子名捕获 — 架构与方案设计（阶段一：MHC）</li>
+    <li class="wy-breadcrumbs-aside">
+    </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+            <div class="section" itemprop="articleBody">
+              
+                <h1 id="mhc-mhc">MHC 真实算子名捕获 — 架构与方案设计（阶段一：MHC）</h1>
+<h2 id="1">1. 背景与问题</h2>
+<p><code>docs/superpowers/specs/2026-07-01-npu-simulator-design.md</code> 完成后的审阅中发现两个与
+"捕获出的图与真实运行算子名一致"这一目标相关的问题：</p>
+<ol>
+<li>
+<p><strong>可视化标签丢失真实算子名（已修复）</strong>：<code>dot_export.py</code>/<code>html_export.py</code> 之前直接用
+   <code>OpNode.op_type</code> 作为节点显示标签；<code>op_type</code> 只覆盖 <code>OP_MAPPING</code> 表里 ~20 个规范算子名，
+   其余一律显示为字面量 <code>"unknown"</code>。16 层冒烟模型里实测有 94 种不在表内的真实算子（如
+   <code>aten.embedding.default</code>、<code>npu.npu_moe_token_unpermute_with_routing_map.default</code>），全部
+   在图上显示成无区分度的 <code>"unknown"</code>，即便真实算子名早已被
+   <code>dispatch_capture.py</code> 记录在 <code>OpNode.annotations["raw_op_type"]</code> 里。已修复：新增
+   <code>op_mapping.display_op_label(op_type, annotations)</code>，<code>op_type=="unknown"</code> 时 fallback 到
+   <code>raw_op_type</code>，<code>dot_export.py</code>/<code>html_export.py</code>/<code>text_summary.py</code> 三处统一改用该函数。</p>
+</li>
+<li>
+<p><strong>MHC/SMLA 转换器被整体剥离，捕获出的算子序列与生产环境不一致（本文档要解决的问题）</strong>：
+   <code>SimulationTrainer._strip_hardware_dependent_model_converters</code> 会把
+   <code>npu_mhc_pre</code>/<code>npu_mhc_post</code>/<code>npu_smla</code> 从 <code>config.model_converters.converters</code> 中删除，
+   回退到转换前的纯 PyTorch base 类（<code>HcPre</code>/<code>HcPost</code>/<code>HcHead</code>/<code>SparseAttention</code>/<code>LiCompute</code>/
+   <code>LiLoss</code>）。<strong>验收配置 <code>deepseek_v4_pro_debug_61_layers_4k_384die</code> 的
+   <code>_default_converters()</code> 确实同时启用了 <code>npu_smla</code> 和 <code>npu_mhc_pre</code></strong>（<code>config_registry.py</code>
+   第 34-43 行）——这不是假设场景，捕获出的图目前对这些模块显示的是与生产环境完全不同的算子
+   序列（base class 的 <code>matmul</code>/<code>softmax</code> 等，而不是真实跑的 <code>npu_hc_pre</code>/Triton kernel）。</p>
+</li>
+</ol>
+<p>本文档设计<strong>阶段一</strong>的修复：仅覆盖 <strong>MHC</strong>（<code>HcPre</code>/<code>HcHead</code>，对应 <code>npu_mhc_pre</code> 转换器，
+<code>npu_mhc_post</code>/<code>HcPost</code> 在验收配置里未启用但设计上一并覆盖）。<strong>SMLA 作为阶段二，本文档不
+覆盖，暂维持现状剥离</strong>（原因见 §6）。</p>
+<h2 id="2">2. 关键约束（决定了不能"直接跑真实实现"）</h2>
+<p>读源码逐一确认：</p>
+<ul>
+<li><code>MHCPreConverter.convert()</code>/<code>MHCPostConverter.convert()</code> 里
+  <code>use_fused_kernel = get_npu_device_type() == "A5"</code>；<code>get_npu_device_type()</code> 调用
+  <code>torch_npu.npu.get_device_name()</code>，仿真环境下这是 <code>meta_env._MetaDeviceModule</code>，
+  <code>get_device_name()</code> 返回 <code>"Meta_Simulator"</code>，不匹配 <code>_NPU_DEVICE_TYPE_MAP</code> 任何 marker
+  → 恒为 <code>"UNKNOWN"</code> → <code>use_fused_kernel</code> 恒为 <code>False</code>。也就是说<strong>不加干预的话，仿真环境下
+  永远走非 A5（Triton）分支</strong>。</li>
+<li>即使我们强行让 <code>get_npu_device_type()</code> 返回 <code>"A5"</code>，<code>MHCPreConverter.convert()</code> 里
+  <code>if use_fused_kernel: import custom_ops</code> 这一步会失败——<code>custom_ops</code> 是一个<strong>私有扩展包，
+  在任何环境（包括真实容器）都确认不可得</strong>，这不是仿真特有的限制。所以 A5 融合路径<strong>在当前
+  条件下无法被真正选中执行</strong>，与是否仿真无关。</li>
+<li>非 A5 分支最终调用的 <code>hc_pre_bmm_forward</code>/<code>hc_pre_fwd</code> 等（<code>ops/triton/*.py</code>）是裸
+  <code>@triton.jit</code> kernel：既不经过 PyTorch dispatcher（<code>TorchDispatchMode</code> 完全看不到），也无法
+  在 meta tensor 上运行（Triton 需要真实内存地址读写）。</li>
+</ul>
+<p><strong>结论</strong>：两条路径都无法真正执行；唯一现实的做法是"影子记录"——不跑真实 kernel，只按真实算
+子名 + 解析出的形状公式，向捕获流里手工登记一条 <code>OpNode</code>。且由于 A5 路径连
+<code>import custom_ops</code> 都过不去，<strong>阶段一只实现非 A5（Triton）目标</strong>，A5 目标的真实中间张量形
+状（<code>hc_before_norm</code>/<code>inv_rms</code>/<code>sum_out</code>/<code>norm_out</code> 等）留待确有需要时再补充验证。</p>
+<h2 id="3">3. 架构设计</h2>
+<h3 id="31">3.1 新增能力一览</h3>
+<pre><code>torchtitan_npu/simulator/
+├── capture/
+│   └── dispatch_capture.py      # 改动：新增 record_synthetic_op() 方法
+├── hardware_shims/               # 新增子包
+│   ├── __init__.py
+│   └── mhc_shim.py               # 新增：SimHcPre / SimHcHead
+├── trainer.py                    # 改动：SimulationConfig 新增 target_npu_device_type 字段；
+│                                  #      SimulationTrainer 用 SimHcPre/SimHcHead 替换剥离逻辑
+</code></pre>
+<p>不改动任何生产代码文件（<code>converters/kernels/mhc_prepost.py</code>、<code>ops/triton/*.py</code> 保持字节不
+变）——延续本项目"纯侧载新增文件"的约定。</p>
+<h3 id="32-opdispatchcapturerecord_synthetic_op">3.2 <code>OpDispatchCapture.record_synthetic_op</code></h3>
+<pre><code class="language-python">def record_synthetic_op(
+    self,
+    raw_op_type: str,
+    inputs: list[torch.Tensor],
+    outputs: list[torch.Tensor],
+    module_path: str = &quot;&quot;,
+) -&gt; None:
+    &quot;&quot;&quot;Manually register one synthetic L0 event, as if `raw_op_type` had
+    gone through __torch_dispatch__ normally. Used by hardware_shims for
+    ops that cannot execute for real (raw Triton kernels / JIT-compiled
+    extensions) but whose real op name + output shape are known
+    analytically. Participates in the same producer/consumer id(tensor)
+    wiring and repeat_count dedup as real dispatched events.&quot;&quot;&quot;
+</code></pre>
+<p>实现上复用 <code>OpDispatchCapture.__torch_dispatch__</code> 里已有的 <code>_RawEvent</code> 构造 +
+producer 绑定 + 去重逻辑（提炼成一个私有 <code>_record_event(raw_op_type, inputs, outputs,
+module_path, phase)</code> 辅助方法，<code>__torch_dispatch__</code> 和 <code>record_synthetic_op</code> 两处共用，避免
+重复实现"生成 op_id → 建 TensorMeta → 记录 predecessor → 更新 producer 表 → 去重折叠"这套
+逻辑）。<code>op_type</code> 一律通过现有 <code>to_canonical_op_type(raw_op_type)</code> 解析（MHC 的真实名不在
+<code>OP_MAPPING</code> 表内，会得到 <code>"unknown"</code>，然后走 §1 已修复的 <code>display_op_label</code> 兜底显示
+<code>raw_op_type</code>——两个修复点在这里自然衔接）。</p>
+<p>shim 如何拿到当前 <code>OpDispatchCapture</code> 实例：<code>OpDispatchCapture</code> 已经是通过
+<code>with capture:</code> 包裹整个 step 的 <code>TorchDispatchMode</code>，同一时刻只有一个实例处于激活状态。新增
+一个模块级 <code>_active_capture: OpDispatchCapture | None</code> 上下文变量，<code>OpDispatchCapture.__enter__</code>
+/<code>__exit__</code> 里设置/清空，shim 通过 <code>get_active_capture()</code> 取到它——避免把 capture 实例层层透
+传进模型 forward。</p>
+<p><strong>关键正确性要求（自查阶段发现）：shim 的核心计算必须实现成 <code>torch.autograd.Function</code></strong>，
+结构上镜像真实的 <code>MHCPreTriton</code>/<code>MHCPreOnlyTriton</code>/<code>MHCPostTriton</code>，而不能是普通函数调用。
+原因：</p>
+<ol>
+<li><strong>梯度图连通性</strong>：<code>torch.empty(..., device="meta")</code> 产生的是叶子张量，本身不带任何
+   <code>grad_fn</code>。如果 <code>SimHcPre.forward</code> 只是直接调用普通函数拼出输出，PyTorch 不知道这个输出
+   "依赖"于输入——后续调用 <code>loss.backward()</code> 时，梯度传播会在这里断掉，导致 MHC 模块之前
+   （更早）的所有层都收不到梯度、<code>step_boundary.py</code> 统计出的 backward 节点数偏少。用
+   <code>torch.autograd.Function.apply(...)</code> 包裹（哪怕 <code>forward</code>/<code>backward</code> 内部只做 shape 推导，
+   不做真实数值计算）可以让 PyTorch 自动把输出的 <code>grad_fn</code> 指向这个 Function，<code>.backward()</code>
+   走到这里时会正确调用我们的 <code>backward()</code>，梯度（同样是 <code>torch.empty(device="meta")</code> 构造、
+   与对应输入同 shape）继续正确流向更早的层——这与真实的 <code>MHCPreTriton</code> 完全同构：它的
+   Triton kernel 内部也是用 <code>torch.empty(...)</code> 现分配输出 buffer，梯度连通性同样完全依赖
+   外层 <code>torch.autograd.Function</code>，而不是张量自身"记得"什么。</li>
+<li><strong>backward 阶段合成节点的正确 phase 标记</strong>：<code>step_boundary.StepBoundaryTracker</code> 在
+   <code>torch.Tensor.backward()</code> <strong>被调用的那一刻</strong>把 <code>current_phase</code> 设为 <code>"backward"</code>，此后
+   autograd 引擎在遍历计算图时触发的每一个 <code>torch.autograd.Function.backward()</code>（包括我们的
+   shim）都发生在这个窗口内。只有把"登记 <code>hc_pre_bwd</code>/<code>hc_pre_bmm_backward</code> 合成节点"这件事
+   真正放在 <code>_SimHcPreFn.backward()</code> 里执行（而不是提前在 <code>forward()</code> 时就一次性登记完
+   forward+backward 两组节点），<code>record_synthetic_op</code> 读到的 <code>phase_provider()</code> 才会正确返回
+   <code>"backward"</code>，与真实调度顺序、真实 phase 归类完全一致。</li>
+</ol>
+<p>因此 <code>SimHcPre</code>/<code>SimHcHead</code>/<code>SimHcPost</code> 三个 <code>nn.Module</code> 内部各自委托给一个同名
+<code>_SimHcPreFn</code>/<code>_SimHcHeadFn</code>/<code>_SimHcPostFn</code>（<code>torch.autograd.Function</code> 子类）：
+<code>forward(ctx, ...)</code> 里登记 forward 阶段的合成节点、返回 shape 正确的 meta 输出，
+<code>ctx.save_for_backward</code> 只需保存<strong>形状信息</strong>（不需要真实数值）；
+<code>backward(ctx, *grad_outputs)</code> 里登记 backward 阶段的合成节点、返回与每个输入同 shape 的
+<code>torch.empty(device="meta")</code> 梯度占位。</p>
+<h3 id="33-simulationconfigtarget_npu_device_type">3.3 <code>SimulationConfig.target_npu_device_type</code></h3>
+<pre><code class="language-python">@dataclass
+class SimulationConfig:
+    output_dir: str
+    target_npu_device_type: Literal[&quot;A5&quot;, &quot;non_a5&quot;] = &quot;non_a5&quot;
+</code></pre>
+<p>默认 <code>"non_a5"</code>（原因：A5 路径依赖不可得的 <code>custom_ops</code>，<code>non_a5</code> 是唯一当前可验证、可落地
+的目标；用户可显式切到 <code>"A5"</code>，但阶段一 <code>SimHcPre</code>/<code>SimHcHead</code> 在 <code>target_npu_device_type=="A5"</code>
+时的行为是：仍然只登记非 A5 一套算子名，附加一条 <code>logger.warning</code>，直到阶段二/三补充 A5 真实
+形状公式为止——不做"看起来支持但形状是瞎猜的"半成品）。</p>
+<h3 id="34-simhcpre-simhcheadhardware_shimsmhc_shimpy">3.4 <code>SimHcPre</code> / <code>SimHcHead</code>（<code>hardware_shims/mhc_shim.py</code>）</h3>
+<p>替换生产环境的 <code>NpuHcPre</code>/<code>NpuHcHead</code>（这两个类只在仿真环境下被这两个 shim 类替换，生产
+<code>torchtitan_npu</code> 包完全不受影响）。以 <code>SimHcPre.forward</code> 为例，对照 <code>NpuHcPre.forward</code>
+（<code>mhc_prepost.py</code>）+ <code>MHCPreTriton.forward</code>（<code>ops/triton/mhc_triton.py</code>）逐行核对后的真实
+调用序列 &amp; 形状（<code>n = self.hc_mult</code>，本仓 DeepSeek-V4-Pro 配置里 <code>n=4</code>）：</p>
+<table>
+<thead>
+<tr>
+<th>步骤</th>
+<th>真实调用</th>
+<th>是否需要 shim</th>
+<th>输入 shape</th>
+<th>输出 shape</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td><code>torch_npu.npu_rms_norm</code></td>
+<td>否（已是真实 dispatcher 算子，meta 下已验证可用，模型其余位置同款调用正常跑通）</td>
+<td><code>x_flat[BS,nD]</code>, <code>gamma[nD]</code></td>
+<td><code>x_norm_flat[BS,nD]</code>, <code>rstd[BS,1]</code></td>
+</tr>
+<tr>
+<td>2</td>
+<td><code>torch.matmul</code></td>
+<td>否（普通 aten 算子）</td>
+<td><code>x_norm_mat[B,S,nD]</code>, <code>weight[nD,n²+2n]</code></td>
+<td><code>x_proj[B,S,n²+2n]</code></td>
+</tr>
+<tr>
+<td>3</td>
+<td><code>hc_pre_fwd</code>（Triton, Sinkhorn）</td>
+<td><strong>是</strong></td>
+<td><code>mixes=x_proj[B,S,n²+2n]</code>, <code>hc_scale[3]</code>, <code>hc_base[n²+2n]</code></td>
+<td><code>h_pre[B,S,n]</code>, <code>h_post[B,S,n]</code>, <code>h_res[B,S,n,n]</code></td>
+</tr>
+<tr>
+<td>4</td>
+<td><code>hc_pre_bmm_forward</code>（Triton, BMM）</td>
+<td><strong>是</strong></td>
+<td><code>H_pre=h_pre[B,S,n]</code>, <code>x=x_unflatten[B,S,n,D]</code></td>
+<td><code>y[B,S,D]</code></td>
+</tr>
+</tbody>
+</table>
+<p><code>raw_op_type</code> 登记为 <code>"triton.hc_pre_fwd"</code>/<code>"triton.hc_pre_bmm_forward"</code>（<code>triton.</code> 前缀
+区分于 <code>aten.</code>/<code>npu.</code> 命名空间，明确标注"这是一个手工登记的合成节点，对应真实生产环境里的
+同名 Triton 函数"，在 <code>annotations</code> 里额外加 <code>"synthetic": True</code> 标记，供后续排查/统计使用）。
+backward 对称登记 <code>"triton.hc_pre_bwd"</code>/<code>"triton.hc_pre_bmm_backward"</code>。</p>
+<p><code>SimHcHead</code>（对应 <code>MHCPreOnlyTriton</code>）结构相同，用 <code>hc_pre_only_fwd</code>/<code>hc_pre_only_bwd</code>
+替换步骤 3（只产出 <code>h_pre[B,S,n]</code>，没有 <code>h_post</code>/<code>h_res</code>）。</p>
+<p><code>SimHcPost</code>（<code>npu_mhc_post</code>，验收配置未启用，但设计一并覆盖，供 <code>_enable_all_converters()</code>
+场景使用）对应 <code>MHCPostTriton</code>：步骤拆成 <code>hc_post_bmm1_forward([B,S,C],[B,S,4]→[B,S,4,C])</code> +
+<code>hc_post_bmm2_forward([B,S,4,4],[B,S,4,C]→[B,S,4,C])</code> + <code>add_fwd</code>（逐元素相加，两个
+<code>[B*S,N*D]</code> 张量相加得到同形状结果，无需自定义 backward——PyTorch 自动微分对纯加法自动给出
+梯度，不用单独登记）三个合成节点，backward 对称登记 <code>hc_post_bmm1_backward</code>/
+<code>hc_post_bmm2_backward</code>。</p>
+<p>所有形状公式均已对照 <code>ops/triton/pre_bmm.py</code>/<code>post_bmm1.py</code>/<code>post_bmm2.py</code>/
+<code>prepost_sinkhorn.py</code>/<code>add.py</code> 里的 <code>if xxx.shape != ...: raise ValueError(...)</code> 断言和函数
+docstring 逐一核实，不是猜测值。</p>
+<h3 id="35">3.5 影子张量的构造</h3>
+<p>shim 不调用真实 Triton kernel，而是直接：</p>
+<pre><code class="language-python">def _meta_like(shape: tuple[int, ...], dtype: torch.dtype, ref: torch.Tensor) -&gt; torch.Tensor:
+    return torch.empty(shape, dtype=dtype, device=ref.device)  # ref.device is already &quot;meta&quot;
+</code></pre>
+<p><code>torch.empty(..., device="meta")</code> 不做真实内存分配（与整个 simulator 的 meta-only 前提一
+致），值不重要（下游同样是 shape-only 传播，之前 20 个任务的验收已经证明这套"只关心 shape
+不关心数值"的策略对训练一步的完整捕获是够用的——DeepSeek-V4-Pro 61 层验收本身也是这个前提
+下跑通的）。</p>
+<h2 id="4">4. 端到端集成</h2>
+<p><code>trainer.py</code>：</p>
+<pre><code class="language-python">def apply_mhc_shims() -&gt; None:
+    &quot;&quot;&quot;Patch MHCPrePostModelConfig.model_converter / MHCPostModelConfig.model_converter to
+    point at SimMHCPreConverter/SimMHCPostConverter, instead of stripping npu_mhc_pre/
+    npu_mhc_post out entirely -- keeps the captured op sequence's real op names consistent
+    with what the real converter would have produced. Reversible via unapply_mhc_shims().&quot;&quot;&quot;
+</code></pre>
+<p><code>SimulationTrainer.__init__</code> 调用顺序改为：先调用 <code>apply_mhc_shims()</code>（把
+<code>npu_mhc_pre</code>/<code>npu_mhc_post</code> 转换器的目标类替换成 shim），再调用
+<code>_strip_hardware_dependent_model_converters(config)</code>（<code>_HARDWARE_DEPENDENT_CONVERTER_NAMES</code>
+收窄为只剩 <code>frozenset({"npu_smla"})</code>，MHC 不再被剥离）。</p>
+<p>替换转换器目标类的具体机制（<strong>实现阶段相对本节初版的简化</strong>：不是对
+<code>config.model_converters.converters</code> 列表做逐项替换，而是直接对已注册的
+<code>MHCPrePostModelConfig</code>/<code>MHCPostModelConfig</code> 类做<strong>可逆的类属性 patch</strong>——与
+<code>meta_env.py</code> 现有的"记录原值、patch、可对称 unpatch"约定完全一致，也更简单：不需要在
+<code>config</code> 实例层面重建兼容的 Config 对象）：新增 <code>SimMHCPreConverter</code>/<code>SimMHCPostConverter</code>
+（继承现有 <code>ModelCustomConverter</code>，<code>convert()</code> 里把 <code>HcPre</code>/<code>HcHead</code>/<code>HcPost</code> 替换成
+<code>SimHcPre</code>/<code>SimHcHead</code>/<code>SimHcPost</code>），<code>apply_mhc_shims()</code> 把
+<code>MHCPrePostModelConfig.model_converter</code>/<code>MHCPostModelConfig.model_converter</code> 这两个类属性
+直接指向它们（<code>unapply_mhc_shims()</code> 对称恢复原值）。</p>
+<p><strong>实现阶段发现的额外关键点（真实容器验证中确认，见 §8）</strong>：
+- <code>SimHcPre</code>/<code>SimHcHead</code>/<code>SimHcPost</code> 必须继承 <code>HcPre</code>/<code>HcHead</code>/<code>HcPost</code>（与真实的
+  <code>NpuHcPre(HcPre)</code>/<code>NpuHcHead(HcHead)</code>/<code>NpuHcPost(HcPost)</code> 完全一致的继承方式），不能只继承
+  <code>nn.Module</code>——torchtitan 的 <code>BaseModel.verify_module_protocol()</code> 会检查每个子模块是否是
+  <code>torchtitan.protocols.module.Module</code> 的实例，纯 <code>nn.Module</code> 子类会导致模型构建时直接崩溃。
+  <code>HcPre</code>/<code>HcHead</code>/<code>HcPost</code> 本身已经是 <code>Module</code> 的子类，直接继承它们即可零成本满足这个检查。
+- <code>HcHead</code>（不同于 <code>HcPre</code>）并不把 <code>hc_mult</code> 存成实例属性——<code>HcHead.__init__</code> 只是把它当一个
+  局部变量用来决定 <code>hc_head_fn</code>/<code>hc_head_base</code> 的形状。<code>SimHcHead.forward</code> 必须从
+  <code>self.hc_head_fn.shape[0]</code> 现算 <code>hc_mult</code>，不能引用不存在的 <code>self.hc_mult</code>。</p>
+<h2 id="5">5. 测试与验证策略（先小后大，呼应最初"先小规模验证"的要求）</h2>
+<ol>
+<li><strong>单元测试（纯 Python，不需要 torch_npu）</strong>：</li>
+<li><code>record_synthetic_op</code> 正确生成 <code>OpNode</code>、正确串联 predecessor/successor、正确参与
+     <code>repeat_count</code> 去重（复用 <code>test_dispatch_capture.py</code> 已有的测试基础设施和断言风格）。</li>
+<li><code>SimHcPre</code>/<code>SimHcHead</code>/<code>SimHcPost</code> 在 CPU 上用<strong>普通（非 meta）张量</strong>跑一遍 forward，
+     断言：(a) 输出 shape 与上表一致；(b) <code>record_synthetic_op</code> 被调用且 <code>raw_op_type</code> 与预
+     期一致；(c) 不抛异常、不依赖 Triton/torch_npu。</li>
+<li><strong>梯度连通性回归测试（对应 §3.2 的关键正确性要求）</strong>：构造一个 <code>x.requires_grad_(True)</code>
+     的输入，跑 <code>SimHcPre(...).sum().backward()</code>，断言 <code>x.grad is not None</code> 且
+     <code>x.grad.shape == x.shape</code>——证明 <code>_SimHcPreFn</code> 正确参与了 autograd 图，没有在 MHC 这一层
+     断掉梯度传播。同时断言：<code>record_synthetic_op</code> 记录的 forward 组节点在 <code>.backward()</code>
+     调用<strong>之前</strong>就已存在，backward 组节点在调用<strong>之后</strong>才出现，且都带有正确的
+     <code>phase</code>（用一个假的 <code>phase_provider</code> 模拟 <code>StepBoundaryTracker</code> 的行为来验证时序）。</li>
+<li><strong>容器内小规模 spike</strong>（先只验证 <code>hc_pre_bmm_forward</code> 这一个、形状最简单的节点）：
+   构造一个只含 1 层、<code>npu_mhc_pre</code> 启用的最小配置，跑一次，确认
+   <code>trace.html</code>/<code>compute_graph.dot</code> 里出现 <code>triton.hc_pre_bmm_forward</code> 节点而不是回退到
+   base <code>HcPre</code> 的 <code>matmul</code>/<code>softmax</code> 序列。</li>
+<li><strong>扩展到全部 MHC 算子</strong>后，重跑 16 层冒烟 + 61 层验收，确认：</li>
+<li>exit code 0，四个产出文件正常生成。</li>
+<li><code>summary.txt</code> 的 "Unrecognized op types" 列表里不再包含任何 base-<code>HcPre</code>/<code>HcHead</code>
+     特有的算子（因为已经换成 shim 登记的真实名）。</li>
+<li>forward/backward 节点总数、通信统计（allgather/reduce_scatter/allreduce）与之前验收
+     结果保持同一数量级（MHC 只占整个 61 层模型的一小部分子模块，不应引起总量剧烈变化）。</li>
+</ol>
+<h2 id="6">6. 明确不在阶段一范围内（阶段二待办）</h2>
+<ul>
+<li><strong>SMLA</strong>（<code>npu_smla</code>：<code>SparseAttention</code>/<code>LiCompute</code>/<code>LiLoss</code>）：继续维持现状剥离。SMLA 的
+  稀疏/lightning-indexer 注意力族形状公式比 MHC 复杂得多（<code>metadata</code> 依赖运行时 topk 索引结
+  构），且非 A5 路径走的是 <code>build_op(...)</code> JIT 编译的本地扩展对象方法调用（<code>_sas_op.xxx(...)</code>），
+  同样拿不到 dispatcher 钩子，需要同一套 <code>record_synthetic_op</code> 机制，但形状公式需要单独一轮
+  源码核实 + 小规模验证，作为独立后续任务跟踪，不在本文档/本阶段实现。</li>
+<li><strong>A5 目标的真实形状公式</strong>：<code>torch_npu.npu_hc_pre</code>/<code>npu_mhc_pre_sinkhorn_grad</code> 等的完整中间
+  张量形状（<code>hc_before_norm</code>/<code>inv_rms</code>/<code>sum_out</code>/<code>norm_out</code>）未在本阶段验证，<code>target_npu_
+  device_type="A5"</code> 场景下 <code>SimHcPre</code> 会记录 warning 并退化为非 A5 命名，等确有需要时再补充。</li>
+</ul>
+<h2 id="7">7. 与用户需求的对应关系</h2>
+<ul>
+<li>"抓取的计算图符合原始完整流程" + "抓取出来的图中与真实运行的算子名一致"：本设计让
+  MHC 相关节点的 <code>raw_op_type</code> 与生产环境真实调用的函数名（<code>torch_npu</code> 算子名或
+  <code>ops/triton/*.py</code> 里的真实函数名）保持一致，不再依赖"剥离转换器、退化成不同实现"的近似。</li>
+<li>不需要真实 NPU 硬件、不做真实内存分配：<code>record_synthetic_op</code> 全程只用
+  <code>torch.empty(..., device="meta")</code> 构造影子输出，不调用任何真实 Triton kernel 或 aclnn 扩展。</li>
+</ul>
+<h2 id="8-cann-titan-npu-sim-e2e-20">8. 验证结果（全新 CANN 容器 <code>titan-npu-sim-e2e</code>，与原 20 任务验收同一容器）</h2>
+<p>实施阶段通过 subagent-driven-development 按 8 个任务逐一实现 + review，容器内真实验证过程中
+额外发现并修复了 2 个真实 bug（均已同步更新到本文档 §4 和实施计划文档）：</p>
+<ol>
+<li><code>SimHcHead</code> 引用不存在的 <code>self.hc_mult</code>（<code>HcHead</code> 只在 <code>__init__</code> 里把它当局部变量用，从不
+   存成实例属性）——16 层冒烟跑到 <code>test_mhc_shim.py</code> 单元测试阶段就被抓到
+   （<code>AttributeError: 'HcHead' object has no attribute 'hc_mult'</code>），修复为从
+   <code>self.hc_head_fn.shape[0]</code> 现算。</li>
+<li><code>SimHcPre</code>/<code>SimHcHead</code>/<code>SimHcPost</code> 只继承了 <code>nn.Module</code>，未继承 <code>HcPre</code>/<code>HcHead</code>/<code>HcPost</code>，
+   导致真实构建 16 层模型时 <code>torchtitan.protocols.model.BaseModel.verify_module_protocol()</code>
+   直接抛出 <code>RuntimeError</code>（17 个 <code>hc_pre</code> 子模块全部不满足 Module protocol）——单元测试测不出
+   这个问题（单元测试直接构造 <code>SimHcPre</code> 实例，不经过完整模型构建 + protocol 校验），只有真实
+   跑通 <code>torchtitan_npu.entry</code> 才会触发；改为继承 <code>HcPre</code>/<code>HcHead</code>/<code>HcPost</code>（与真实
+   <code>NpuHcPre(HcPre)</code> 等完全一致的继承方式）后解决。</li>
+</ol>
+<p><strong>16 层冒烟</strong>（<code>deepseek_v4_pro_simulate_16_layers</code>，<code>--training.steps=1</code>）：<code>EXIT_CODE=0</code>，
+<code>compute_graph.dot</code> 中 <code>triton.hc_pre_fwd</code>/<code>triton.hc_pre_bmm_forward</code> 各出现 68 次，
+<code>triton.hc_pre_bwd</code>/<code>triton.hc_pre_bmm_backward</code> 各出现 34 次——replaces 掉了之前 base <code>HcPre</code>
+类的 <code>rsqrt</code>/<code>sigmoid</code>/<code>matmul</code> 等不相关算子序列。<code>summary.txt</code> 的 forward/backward/optimizer
+节点数（9136/18646/1006）、通信统计与去除 MHC 影响前后保持同一数量级，<code>is_acyclic=True</code>。</p>
+<p><strong>61 层/384 die 验收目标</strong>（<code>deepseek_v4_pro_simulate_61_layers</code>）：<code>EXIT_CODE=0</code>（约 8-9
+分钟，与 MHC 修复前基本一致）。关键结果：
+- <code>RankTable</code>：<code>world_size=384</code>（<code>dp_degree=384</code>），<code>tp_degree=pp_degree=1</code>——与验收目标完全
+  一致，MHC shim 不影响并行拓扑。
+- 真实算子名验证：<code>compute_graph.dot</code> 中 <code>triton.hc_pre_fwd</code>/<code>triton.hc_pre_bmm_forward</code> 各
+  248 次，<code>triton.hc_pre_bwd</code>/<code>triton.hc_pre_bmm_backward</code> 各 124 次（相对 16 层的 68/34 按
+  61/16≈3.8 倍比例放大，与层数缩放关系一致）。
+- <code>summary.txt</code> 的"Unrecognized op types"列表（105 项）正确包含这 4 个 <code>triton.hc_pre_*</code>
+  合成算子名（预期行为：它们不在 <code>OP_MAPPING</code>/cost model 覆盖范围内，故成本估算标记为
+  "未知"，但真实算子名本身已正确捕获并可见——回应 §1 已修复的可视化标签兜底问题）。
+- forward/backward/optimizer 节点数：34250/68398/3571（相对 MHC 修复前的
+  50027/137299/3508 有差异，符合预期：MHC 真实算子序列与 base-class 回退序列的节点粒度本就
+  不同）；<code>is_acyclic=True</code>；通信统计（<code>allgather</code>/<code>allreduce</code>/<code>reduce_scatter</code>）与之前保持
+  同一数量级。
+- 四个产出文件（<code>simulation_result.json</code> ~8.8GB、<code>compute_graph.dot</code>、<code>summary.txt</code>、
+  <code>trace.html</code>）全部正确生成。</p>
+<p><strong>结论</strong>：阶段一（MHC 真实算子名捕获）目标完全达成并通过真实容器验证；SMLA（阶段二）与 A5
+目标形状公式仍按 §6 保持未实现状态，留待后续任务。</p>
+              
+            </div>
+          </div><footer>
+    <div class="rst-footer-buttons" role="navigation" aria-label="Footer Navigation">
+        <a href="../../plans/2026-07-01-smla-real-op-name-capture-implementation/" class="btn btn-neutral float-left" title="SMLA Real-Op-Name Capture Implementation Plan"><span class="icon icon-circle-arrow-left"></span> Previous</a>
+        <a href="../2026-07-01-npu-simulator-design/" class="btn btn-neutral float-right" title="torchtitan_npu Simulator — 架构与方案设计">Next <span class="icon icon-circle-arrow-right"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <!-- Copyright etc -->
+  </div>
+
+  Built with <a href="https://www.mkdocs.org/">MkDocs</a> using a <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a> provided by <a href="https://readthedocs.org">Read the Docs</a>.
+</footer>
+          
+        </div>
+      </div>
+
+    </section>
+
+  </div>
+
+  <div class="rst-versions" role="note" aria-label="Versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    
+    
+      <span><a href="../../plans/2026-07-01-smla-real-op-name-capture-implementation/" style="color: #fcfcfc">&laquo; Previous</a></span>
+    
+    
+      <span><a href="../2026-07-01-npu-simulator-design/" style="color: #fcfcfc">Next &raquo;</a></span>
+    
+  </span>
+</div>
+    <script src="../../../js/jquery-3.6.0.min.js"></script>
+    <script>var base_url = "../../..";</script>
+    <script src="../../../js/theme_extra.js"></script>
+    <script src="../../../js/theme.js"></script>
+    <script>
+        jQuery(function () {
+            SphinxRtdTheme.Navigation.enable(true);
+        });
+    </script>
+
+</body>
+</html>

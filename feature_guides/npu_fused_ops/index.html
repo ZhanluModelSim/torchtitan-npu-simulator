@@ -52,13 +52,40 @@
                   <li class="toctree-l1"><a class="reference internal" href="../../community/versioning_policy/">版本策略</a>
                   </li>
               </ul>
+              <p class="caption"><span class="caption-text">Design</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/1f1b-schedule-plan-assembly-guide/">1F1B 完整依赖组装与 DES 回放实现指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/alltoall-capture-analysis/">all_to_all 通信捕获缺失分析</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/communication-ownership-contract/">Communication Ownership Contract</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/dualpipev-schedule-plan-consumer-guide/">DualPipeV SchedulePlan 下游接入指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/l2-l3-schedule-plan-design/">L2/L3 调度 IR 重构设计：从扁平 trace 到结构化 SchedulePlan</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/low-precision-sim-analysis/">低精度训练（MXFP8）Simulator 使能分析</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/optimizer-ops-analysis/">优化器算子捕获问题分析</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/pipeline-multi-graph-capture-design/">复杂 Pipeline 策略下完整计算图捕获方案设计</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/pp-l2-capture-architecture/">PP L2 Capture Architecture</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/schedule-capture-design/">L0-L3 IR 层级归属设计</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/schedule-plan-dependency-reconstruction-contract/">SchedulePlan 下游依赖重建契约</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/schedule-plan-des-consumer-guide/">SchedulePlan 依赖重建与 DES 消费指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/simulator-memory-model-design/">Simulator Memory Model 改造设计</a>
+                  </li>
+              </ul>
               <p class="caption"><span class="caption-text">Feature guides</span></p>
               <ul class="current">
                   <li class="toctree-l1"><a class="reference internal" href="../checkpoint/">Checkpoint 使用指南</a>
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../deepseek_v32_mtp/">多Token预测特性(Multi Token Prediction, MTP)</a>
-                  </li>
-                  <li class="toctree-l1"><a class="reference internal" href="../fsdp_parameter_precision/">Fsdp parameter precision</a>
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../low_precision_training/">低精度训练特性（MXFP8）</a>
                   </li>
@@ -67,6 +94,8 @@
                   <li class="toctree-l1"><a class="reference internal" href="../model_custom/">Model Custom框架介绍</a>
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../muon_optimizer/">Muon 优化器特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../new_model_onboarding/">新模型接入开发流程</a>
                   </li>
                   <li class="toctree-l1 current"><a class="reference internal current" href="#">NPU 融合算子适配</a>
     <ul class="current">
@@ -90,8 +119,6 @@
     </li>
     </ul>
                   </li>
-                  <li class="toctree-l1"><a class="reference internal" href="../npu_tnd_attention/">TND Attention (Per-Document Causal Attention)</a>
-                  </li>
                   <li class="toctree-l1"><a class="reference internal" href="../swap_optimizer/">SwapOptimizer 特性</a>
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../torch_compile/">torch.compile 支持</a>
@@ -112,8 +139,33 @@
                   <li class="toctree-l1"><a class="reference internal" href="../../recipe/sft/">SFT 指令微调</a>
                   </li>
               </ul>
+              <p class="caption"><span class="caption-text">Superpowers</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" >Plans</a>
+    <ul>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/plans/2026-07-01-mhc-real-op-name-capture-implementation/">MHC Real-Op-Name Capture Implementation Plan</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/plans/2026-07-01-npu-simulator-implementation/">torchtitan_npu Simulator Implementation Plan</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/plans/2026-07-01-smla-real-op-name-capture-implementation/">SMLA Real-Op-Name Capture Implementation Plan</a>
+                </li>
+    </ul>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" >Specs</a>
+    <ul>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/specs/2026-07-01-mhc-real-op-name-capture-design/">MHC 真实算子名捕获 — 架构与方案设计（阶段一：MHC）</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/specs/2026-07-01-npu-simulator-design/">torchtitan_npu Simulator — 架构与方案设计</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/specs/2026-07-01-smla-real-op-name-capture-design/">SMLA 真实算子名捕获 — 架构与方案设计（阶段二：SMLA）</a>
+                </li>
+    </ul>
+                  </li>
+              </ul>
               <p class="caption"><span class="caption-text">Test guides</span></p>
               <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../test_guides/model_acceptance/">新模型最终验收规范（Meta 模拟器）</a>
+                  </li>
                   <li class="toctree-l1"><a class="reference internal" href="../../test_guides/test_design/">测试设计</a>
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../../test_guides/test_guide/">测试使用指南</a>
@@ -121,9 +173,13 @@
               </ul>
               <p class="caption"><span class="caption-text">User guides</span></p>
               <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/deepseek_v4_model_parameters/">DeepSeek-V4 模型参数 Web 字段目录</a>
+                  </li>
                   <li class="toctree-l1"><a class="reference internal" href="../../user-guides/installation/">软件安装</a>
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../../user-guides/quickstart/">快速上手</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/simulator/">Simulator 使用指南</a>
                   </li>
               </ul>
       </div>
@@ -218,10 +274,7 @@ model_converters = ModelConvertersContainer.Config(
 <hr />
 <h2 id="smla-sparse-flash-mla">SMLA (Sparse Flash MLA)</h2>
 <p><code>npu_smla</code> 面向 DeepSeek-V4 的稀疏 MLA 注意力路径。该 ModelConverter 会根据硬件类型选择实现：
-在 A5 上通过 <a href="https://gitcode.com/cann/ops-transformer"><code>cann_ops_transformer</code></a>
-提供的 <code>sparse_flash_mla</code>、<code>lightning_indexer</code> 及对应 metadata/反向算子执行；
-在非 A5 场景下继续使用兼容原有 DeepSeek-V4 sparse attention / LI / LI loss 的 NPU 实现。
-A5 路径要求 <code>cann_ops_transformer</code> 能够被 Python 导入，缺失时 converter 会直接报错并指出所缺依赖。</p>
+在 A5 上替换为 <code>torch_npu</code> 提供的 SMLA 融合算子路径，并将 SMLA 所需的 attention masks 接入 torchtitan 原生 <code>post_dataloading_process</code>；在非 A5 场景下继续使用兼容原有 DeepSeek-V4 sparse attention / LI / LI loss 的 NPU 实现。</p>
 <p><strong>配置示例：</strong></p>
 <pre><code class="language-python">get_model_converter_config(&quot;npu_smla&quot;)
 </code></pre>
@@ -238,14 +291,14 @@ logging.getLogger(&quot;torchtitan_npu.converters.kernels.npu_smla&quot;).setLev
 <p><strong>ModelConverter 源码路径：</strong> <code>torchtitan_npu/converters/kernels/npu_smla.py</code></p>
 <hr />
 <h2 id="mhcpre">MHCPre</h2>
-<p><code>npu_mhc_pre</code> 面向 DeepSeek-V4 的 MHC pre-processing 路径，将模型中的 <code>HcPre</code> 模块替换为 NPU 亲和实现。在 A5 上使用 <code>cann_ops_transformer.ops.mhc_pre_sinkhorn</code> 及其反向融合算子；在非 A5 场景下使用已有 Triton 实现。DeepSeek-V4 默认配置中已启用该 converter。</p>
+<p><code>npu_mhc_pre</code> 面向 DeepSeek-V4 的 MHC pre-processing 路径，将模型中的 <code>HcPre</code> 模块替换为 NPU 亲和实现。在 A5 上使用 <code>torch_npu.npu_hc_pre</code> 及其反向融合算子；在非 A5 场景下使用已有 Triton 实现。DeepSeek-V4 默认配置中已启用该 converter。</p>
 <p><strong>配置示例</strong>：</p>
 <pre><code class="language-python">get_model_converter_config(&quot;npu_mhc_pre&quot;)
 </code></pre>
 <p><strong>ModelConverter 源码路径：</strong> <code>torchtitan_npu/converters/kernels/mhc_prepost.py</code></p>
 <hr />
 <h2 id="mhcpost">MHCPost</h2>
-<p><code>npu_mhc_post</code> 面向 DeepSeek-V4 的 MHC post-processing 路径，将模型中的 <code>HcPost</code> 模块替换为 NPU 亲和实现。在 A5 上使用 <code>cann_ops_transformer.ops.mhc_post</code> 及其反向融合算子；在非 A5 场景下会走已有 Triton 实现并替换 <code>HcHead</code>。</p>
+<p><code>npu_mhc_post</code> 面向 DeepSeek-V4 的 MHC post-processing 路径，将模型中的 <code>HcPost</code> 模块替换为 NPU 亲和实现。在 A5 上使用 <code>torch_npu.npu_hc_post</code> 及其反向融合算子；在非 A5 场景下会走已有 Triton 实现并替换 <code>HcHead</code>。</p>
 <p>该 converter 当前未在 DeepSeek-V4 默认 <code>config_registry.py</code> 中打开，主要是出于性能考虑：A5 上建议按需打开以使用 MHC post 融合算子；A3 上建议保持关闭，继续使用默认模型路径，避免 converter 替换带来的额外开销或性能退化。</p>
 <p><strong>配置示例</strong>：</p>
 <pre><code class="language-python">get_model_converter_config(&quot;npu_mhc_post&quot;)
@@ -273,7 +326,7 @@ logging.getLogger(&quot;torchtitan_npu.converters.kernels.npu_smla&quot;).setLev
 <p><strong>ModelConverter 源码路径：</strong> <code>torchtitan_npu/converters/kernels/moe_dispatch.py</code>、<code>torchtitan_npu/converters/kernels/permutation.py</code></p>
 <h2 id="rmsnorm">RMSNorm</h2>
 <p>RMSNorm 通过计算输入张量每个样本的平方均值的平方根来稳定深层网络的训练。</p>
-<p>本 ModelConverter 将模型中的 RMSNorm 操作替换为基于 <code>npu_rms_norm</code> 融合算子的实现。</p>
+<p>本 ModelConverter 将模型中的 RmsNorm 操作替换为基于 <code>npu_rms_norm</code> 融合算子的实现。</p>
 <p><strong>配置项</strong>：<code>npu_rms_norm</code>\
 <strong>配置示例</strong>：</p>
 <pre><code class="language-python">get_model_converter_config(&quot;npu_rms_norm&quot;)
@@ -293,8 +346,8 @@ logging.getLogger(&quot;torchtitan_npu.converters.kernels.npu_smla&quot;).setLev
             </div>
           </div><footer>
     <div class="rst-footer-buttons" role="navigation" aria-label="Footer Navigation">
-        <a href="../muon_optimizer/" class="btn btn-neutral float-left" title="Muon 优化器特性"><span class="icon icon-circle-arrow-left"></span> Previous</a>
-        <a href="../npu_tnd_attention/" class="btn btn-neutral float-right" title="TND Attention (Per-Document Causal Attention)">Next <span class="icon icon-circle-arrow-right"></span></a>
+        <a href="../new_model_onboarding/" class="btn btn-neutral float-left" title="新模型接入开发流程"><span class="icon icon-circle-arrow-left"></span> Previous</a>
+        <a href="../swap_optimizer/" class="btn btn-neutral float-right" title="SwapOptimizer 特性">Next <span class="icon icon-circle-arrow-right"></span></a>
     </div>
 
   <hr/>
@@ -317,10 +370,10 @@ logging.getLogger(&quot;torchtitan_npu.converters.kernels.npu_smla&quot;).setLev
   <span class="rst-current-version" data-toggle="rst-current-version">
     
     
-      <span><a href="../muon_optimizer/" style="color: #fcfcfc">&laquo; Previous</a></span>
+      <span><a href="../new_model_onboarding/" style="color: #fcfcfc">&laquo; Previous</a></span>
     
     
-      <span><a href="../npu_tnd_attention/" style="color: #fcfcfc">Next &raquo;</a></span>
+      <span><a href="../swap_optimizer/" style="color: #fcfcfc">Next &raquo;</a></span>
     
   </span>
 </div>

@@ -1,0 +1,611 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" >
+<head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+      <link rel="shortcut icon" href="../../img/favicon.ico" />
+    <title>新模型最终验收规范（Meta 模拟器） - torchtitan-npu</title>
+    <link rel="stylesheet" href="../../css/theme.css" />
+    <link rel="stylesheet" href="../../css/theme_extra.css" />
+        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/styles/github.min.css" />
+    
+      <script>
+        // Current page data
+        var mkdocs_page_name = "\u65b0\u6a21\u578b\u6700\u7ec8\u9a8c\u6536\u89c4\u8303\uff08Meta \u6a21\u62df\u5668\uff09";
+        var mkdocs_page_input_path = "test_guides/model_acceptance.md";
+        var mkdocs_page_url = null;
+      </script>
+    
+    <!--[if lt IE 9]>
+      <script src="../../js/html5shiv.min.js"></script>
+    <![endif]-->
+      <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/highlight.min.js"></script>
+      <script>hljs.highlightAll();</script> 
+</head>
+
+<body class="wy-body-for-nav" role="document">
+
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side stickynav">
+    <div class="wy-side-scroll">
+      <div class="wy-side-nav-search">
+          <a href="../.." class="icon icon-home"> torchtitan-npu
+        </a>
+      </div>
+
+      <div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <ul>
+                <li class="toctree-l1"><a class="reference internal" href="../..">Home</a>
+                </li>
+              </ul>
+              <ul>
+                <li class="toctree-l1"><a class="reference internal" href="../../lint_guide/">Lint 指南</a>
+                </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Community</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../community/contributors/">提交者与贡献者（Committers and Contributors）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../community/governance/">社区治理</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../community/versioning_policy/">版本策略</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Design</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/1f1b-schedule-plan-assembly-guide/">1F1B 完整依赖组装与 DES 回放实现指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/alltoall-capture-analysis/">all_to_all 通信捕获缺失分析</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/communication-ownership-contract/">Communication Ownership Contract</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/dualpipev-schedule-plan-consumer-guide/">DualPipeV SchedulePlan 下游接入指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/l2-l3-schedule-plan-design/">L2/L3 调度 IR 重构设计：从扁平 trace 到结构化 SchedulePlan</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/low-precision-sim-analysis/">低精度训练（MXFP8）Simulator 使能分析</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/optimizer-ops-analysis/">优化器算子捕获问题分析</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/pipeline-multi-graph-capture-design/">复杂 Pipeline 策略下完整计算图捕获方案设计</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/pp-l2-capture-architecture/">PP L2 Capture Architecture</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/schedule-capture-design/">L0-L3 IR 层级归属设计</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/schedule-plan-dependency-reconstruction-contract/">SchedulePlan 下游依赖重建契约</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/schedule-plan-des-consumer-guide/">SchedulePlan 依赖重建与 DES 消费指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/simulator-memory-model-design/">Simulator Memory Model 改造设计</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Feature guides</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/checkpoint/">Checkpoint 使用指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/deepseek_v32_mtp/">多Token预测特性(Multi Token Prediction, MTP)</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/low_precision_training/">低精度训练特性（MXFP8）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/metrics_and_debugging/">调试支持特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/model_custom/">Model Custom框架介绍</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/muon_optimizer/">Muon 优化器特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/new_model_onboarding/">新模型接入开发流程</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/npu_fused_ops/">NPU 融合算子适配</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/swap_optimizer/">SwapOptimizer 特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/torch_compile/">torch.compile 支持</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/virtual_optimizer/">Virtual Optimizer - 优化器显存虚拟化特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/vlm/">VLM NPU 支持</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" >Parallelism</a>
+    <ul>
+                <li class="toctree-l2"><a class="reference internal" href="../../feature_guides/parallelism/custom_cp/">自定义 Context Parallel 特性</a>
+                </li>
+    </ul>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Recipe</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../recipe/sft/">SFT 指令微调</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Superpowers</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" >Plans</a>
+    <ul>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/plans/2026-07-01-mhc-real-op-name-capture-implementation/">MHC Real-Op-Name Capture Implementation Plan</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/plans/2026-07-01-npu-simulator-implementation/">torchtitan_npu Simulator Implementation Plan</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/plans/2026-07-01-smla-real-op-name-capture-implementation/">SMLA Real-Op-Name Capture Implementation Plan</a>
+                </li>
+    </ul>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" >Specs</a>
+    <ul>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/specs/2026-07-01-mhc-real-op-name-capture-design/">MHC 真实算子名捕获 — 架构与方案设计（阶段一：MHC）</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/specs/2026-07-01-npu-simulator-design/">torchtitan_npu Simulator — 架构与方案设计</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/specs/2026-07-01-smla-real-op-name-capture-design/">SMLA 真实算子名捕获 — 架构与方案设计（阶段二：SMLA）</a>
+                </li>
+    </ul>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Test guides</span></p>
+              <ul class="current">
+                  <li class="toctree-l1 current"><a class="reference internal current" href="#">新模型最终验收规范（Meta 模拟器）</a>
+    <ul class="current">
+    <li class="toctree-l2"><a class="reference internal" href="#1">1. 可用的定义</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#2">2. 验收前准备</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#3">3. 必测配置矩阵</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#4">4. 验收维度与判定标准</a>
+        <ul>
+    <li class="toctree-l3"><a class="reference internal" href="#41">4.1 配置、结构和权重</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#42-local-shape">4.2 并行切分后的 local shape 和静态显存</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#43-shape">4.3 核心算子的 shape、数量和融合</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#44">4.4 通信行为和依赖回放</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#45">4.5 端到端显存估计</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#46-hook">4.6 插件、Hook 和训练特性兼容性</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#47">4.7 回归和可维护性</a>
+    </li>
+        </ul>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#5">5. 推荐执行顺序</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#6">6. 验收证据模板</a>
+    </li>
+    </ul>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../test_design/">测试设计</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../test_guide/">测试使用指南</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">User guides</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/deepseek_v4_model_parameters/">DeepSeek-V4 模型参数 Web 字段目录</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/installation/">软件安装</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/quickstart/">快速上手</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/simulator/">Simulator 使用指南</a>
+                  </li>
+              </ul>
+      </div>
+    </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap">
+      <nav class="wy-nav-top" role="navigation" aria-label="Mobile navigation menu">
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../..">torchtitan-npu</a>
+        
+      </nav>
+      <div class="wy-nav-content">
+        <div class="rst-content"><div role="navigation" aria-label="breadcrumbs navigation">
+  <ul class="wy-breadcrumbs">
+    <li><a href="../.." class="icon icon-home" aria-label="Docs"></a></li>
+          <li class="breadcrumb-item">Test guides</li>
+      <li class="breadcrumb-item active">新模型最终验收规范（Meta 模拟器）</li>
+    <li class="wy-breadcrumbs-aside">
+    </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+            <div class="section" itemprop="articleBody">
+              
+                <h1 id="meta">新模型最终验收规范（Meta 模拟器）</h1>
+<p>本文定义什么时候可以判定一个新接入模型“可用”。它是模型开发完成后的最终验收，不是各开发步骤的局部验收。接入步骤见<a href="../../feature_guides/new_model_onboarding/">新模型接入开发流程</a>。</p>
+<h2 id="1">1. 可用的定义</h2>
+<p>只有同时满足以下条件，才可把模型标记为“模拟器建模可用”：</p>
+<ol>
+<li>声明支持的模拟器特性和并行组合全部通过必选验证。</li>
+<li>参数切分、核心算子、通信依赖和显存均有独立预期值，并与实测证据一致。</li>
+<li>meta 路径验证了结构、shape、autograd 连通性、依赖和资源估计。</li>
+<li>不支持的模式被明确记录并 fail fast，不能静默降级或产生看似成功的错误结果。</li>
+<li>验收证据记录 commit、基线、配置、world size、软件版本和输出路径，可重复执行。</li>
+</ol>
+<p>“进程退出码为 0”或“模拟器能生成报告”都只是必要的局部信号，不能单独证明模型建模正确。meta 不产生可用于精度判断的 loss/grad norm 数值；真实 NPU 数值训练和硬件 profiler 是独立目标，不是本文的默认门槛。</p>
+<h2 id="2">2. 验收前准备</h2>
+<p>验收前冻结以下输入：</p>
+<ul>
+<li>被测 commit 和它基于的训练主分支 commit。</li>
+<li>模型配置、tokenizer/test asset、用于固定 MoE 路由的输入或策略，以及 state-dict 样本 schema。</li>
+<li>模拟环境，包括 Docker 镜像或 digest、PyTorch、torch_npu、CANN、模拟 world size 和 capture rank。</li>
+<li>模型支持矩阵，以及明确排除的功能。</li>
+<li>独立计算的参数量、逐层权重 shape、并行后 local shape。</li>
+<li>核心算子清单和理论调用次数。</li>
+<li>每种并行预期产生的通信类型、消息 shape/字节数和先后关系。</li>
+</ul>
+<p>建议先用 <code>debug</code> 规格定位，再用 <code>reduced</code> 规格完成 meta 核心组合测试，最后用正式规格进行模拟器的容量与数量级验证。不能只用缩小后改变了 layer 类型、MoE 分布或 attention 规律的配置代替正式结构。</p>
+<h2 id="3">3. 必测配置矩阵</h2>
+<p>先声明模型支持矩阵，再从下表选择必测项。FSDP（含 eFSDP）、TP、EP、CP 是 MoE 模型接入的核心门槛；ETP 在模型声明支持时同样为必测。PP 最后验证。</p>
+<table>
+<thead>
+<tr>
+<th>场景</th>
+<th>并行配置</th>
+<th>目的</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>单卡基线</td>
+<td>所有并行度为 1</td>
+<td>参数、算子和显存的参考基线</td>
+</tr>
+<tr>
+<td>FSDP</td>
+<td><code>dp_shard=2</code>，分别测试 FSDP/eFSDP</td>
+<td>参数/梯度切分和 unshard/reshard</td>
+</tr>
+<tr>
+<td>TP</td>
+<td><code>tp=2</code></td>
+<td>attention、FFN、Norm 边界和 TP 通信</td>
+</tr>
+<tr>
+<td>EP</td>
+<td><code>ep=2</code></td>
+<td>expert placement、token dispatch/combine</td>
+</tr>
+<tr>
+<td>ETP</td>
+<td><code>etp=2</code>，并与 EP/TP 的目标组合测试</td>
+<td>专家内部切分及组合布局</td>
+</tr>
+<tr>
+<td>CP</td>
+<td><code>cp=2</code></td>
+<td>sequence 切分、mask/RoPE offset 和 CP 通信</td>
+</tr>
+<tr>
+<td>核心组合</td>
+<td>FSDP/eFSDP + TP + EP + CP，按需加入 ETP</td>
+<td>mesh 正交性、local shape 和通信组合</td>
+</tr>
+<tr>
+<td>PP</td>
+<td><code>pp=2</code>，最后执行</td>
+<td>stage 边界、microbatch 和 send/recv</td>
+</tr>
+<tr>
+<td>最终组合</td>
+<td>加入 PP 的声明支持组合</td>
+<td>全功能最终门槛</td>
+</tr>
+</tbody>
+</table>
+<p>不需要机械覆盖所有并行度的笛卡尔积，但必须覆盖：</p>
+<ul>
+<li>每个并行维度单独开启一次。</li>
+<li>每对会共同作用于同一参数、激活或通信域的并行至少组合一次。</li>
+<li>至少一个不含 PP 的核心组合。</li>
+<li>声明支持 PP 时，至少一个含 PP 的最终组合。</li>
+<li>所有验证分别覆盖 activation checkpoint 关闭和开启；开启至少包含实际支持的 <code>full</code> 或 <code>selective</code>。</li>
+</ul>
+<p>若支持激活 offload、compile 或其他会改变图和显存的功能，应在核心组合上增加开启/关闭对照。</p>
+<h2 id="4">4. 验收维度与判定标准</h2>
+<h3 id="41">4.1 配置、结构和权重</h3>
+<p>检查：</p>
+<ul>
+<li>默认配置不依赖隐藏命令行覆盖即可解析和构造。</li>
+<li>实际 layer 类型、数量和分布与配置一致。</li>
+<li>全局参数总量、逐层参数量和 tied weight 去重规则与独立公式一致。</li>
+<li>state-dict 名称、shape、dtype 和合并/拆分顺序正确。</li>
+<li>DCP/HF 转换路径按声明支持，保存/重新加载后 key、shape、dtype 和权重布局保持一致。</li>
+</ul>
+<p>静态参数字节数按实际 storage dtype 计算：</p>
+<pre><code class="language-text">parameter_bytes = numel × bytes_per_element
+</code></pre>
+<p>不能把计算 dtype 当成参数 storage dtype，也不能因 tied weight 重复计数。</p>
+<h3 id="42-local-shape">4.2 并行切分后的 local shape 和静态显存</h3>
+<p>对每个参数和核心激活记录：</p>
+<pre><code class="language-text">FQN, global_shape, local_shape, dtype, mesh, placement, replicated/sharded
+</code></pre>
+<p>判定要求：</p>
+<ol>
+<li>local shape 由 tensor 语义维和 placement 推导，与实际 DTensor/local tensor 一致。</li>
+<li>replicated 参数不除并行度；sharded 参数只除实际作用在该维度的 mesh。</li>
+<li>MoE routed expert 只出现在所属 EP rank；shared expert 的复制/切分符合设计。</li>
+<li>TP、ETP、FSDP 同时开启时，不重复切分同一维，也不漏掉应切分的维度。</li>
+<li>padding、对齐和空 expert rank 必须有显式解释。</li>
+<li>在一组小的并行对照矩阵中，静态参数字节数的变化与实际 placement 语义一致；不要求为所有模型建立通用的自动精确公式。</li>
+</ol>
+<p>建议至少对照单卡、FSDP/eFSDP、TP、EP、ETP、CP 和一个核心组合：FSDP 应降低可分片常驻权重；EP 主要影响 routed experts；ETP 只影响专家内部语义维；CP 不应改变静态权重。组合场景重点检查没有重复切分或漏切分，而非把所有参数简单除以 world size。</p>
+<p>FSDP/eFSDP 还需同时验证：</p>
+<ul>
+<li>常驻 shard 的大小。</li>
+<li>计算前 all-gather 后 full parameter 的 shape 和临时驻留。</li>
+<li>反向梯度 reduce-scatter 后的 local shape。</li>
+<li>直接通信依赖：all-gather 在首个消费者前，reduce-scatter 在最后一个梯度生产者后。</li>
+</ul>
+<p><code>fsdp_state</code>、residency transition 和 L2 prefetch 标注属于公共模拟器调度能力，不是模型专用语义。非 PP 基线若所有模型都未产出这些标注，应以 L0 collective 的 group、shape 和 producer/consumer 边验收模型；公共标注缺失应单列为 simulator 任务，不能在新模型中引入特例补丁。</p>
+<h3 id="43-shape">4.3 核心算子的 shape、数量和融合</h3>
+<p>先建立算子账本，至少包括：</p>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>raw op/FQN</td>
+<td>实际捕获到的算子名和所属模块</td>
+</tr>
+<tr>
+<td>layer 类型</td>
+<td>attention、dense FFN、shared/routed expert 等</td>
+</tr>
+<tr>
+<td>execution kind</td>
+<td>original forward、recompute、backward、optimizer</td>
+</tr>
+<tr>
+<td>global/local shape</td>
+<td>各输入输出和关键权重 shape</td>
+</tr>
+<tr>
+<td>理论次数</td>
+<td>按 layer 数、激活专家数、microbatch、AC 模式计算</td>
+</tr>
+<tr>
+<td>实际次数</td>
+<td>模拟器统计值</td>
+</tr>
+<tr>
+<td>融合要求</td>
+<td>允许的实现及禁止出现的小算子分解</td>
+</tr>
+</tbody>
+</table>
+<p>重点核对：</p>
+<ul>
+<li>attention 核心算子以及 Q/K/V、score、output 的 MM/BMM shape。</li>
+<li>GMM 专家输入 token 数、expert offset、权重 shape 和 routed/shared expert 次数。</li>
+<li>RMSNorm、门控 RMSNorm、RoPE、激活函数等融合算子。</li>
+<li>模型特有的 Triton/KDA/其他算子。</li>
+<li>前向、反向的 MM/BMM/GMM 数量和比例。</li>
+</ul>
+<p>算子次数必须分别按 execution kind 统计。若某段被 full AC 包裹，通常会出现一次 original forward 和一次 recompute；未重计算的段不能被统一乘二。验收报告要写出理论公式，而不是只给出一个总数。</p>
+<p>MoE 的 GMM shape 和执行量受实际路由 token 数影响。应固定输入与 router 结果，或保存每个 expert 的 token histogram，再由该 histogram 推导预期值；不能简单用 <code>num_experts × layer 数</code> 代替实际调用量。空 expert、capacity/padding 和 shared expert 需要分别计数。</p>
+<p>对于模拟器中的模型特有算子，允许使用 shape-only 实现，但必须：</p>
+<ol>
+<li>以真实融合 op 名称被捕获。</li>
+<li>前向、反向 shape 和梯度输入数正确。</li>
+<li>参与 hook、依赖图和显存生命周期。</li>
+<li>不退化为大量逐元素或小 MM 算子。</li>
+</ol>
+<h3 id="44">4.4 通信行为和依赖回放</h3>
+<p>每个通信事件至少记录：</p>
+<pre><code class="language-text">rank, process_group, collective/p2p type, tensor shape, bytes, peer/root, phase
+</code></pre>
+<p>数量和字节数由 local tensor shape 推导，并按 rank-local 语义统计；不能把一个 rank 捕获到的 collective 人工扩成全 world 的事件。</p>
+<p>按并行类型验证以下不变量：</p>
+<ul>
+<li>TP：局部 GEMM 的生产者先于 all-reduce/reduce-scatter，后续消费者等待通信结果。</li>
+<li>CP：KV/attention 交换与对应计算块匹配，mask、RoPE offset 和 sequence chunk 不错位。</li>
+<li>EP：router/dispatch → all-to-all → expert 计算 → all-to-all → combine 链路完整；backward 按正确的逆向数据依赖执行。</li>
+<li>FSDP/eFSDP：参数 all-gather/unshard 在首个参数消费者前完成；梯度 reduce-scatter 在最后一个梯度生产者之后开始。</li>
+<li>PP：send/recv 成对，tensor shape、microbatch、stage 和 schedule slot 匹配。</li>
+</ul>
+<p>依赖图必须满足：</p>
+<ol>
+<li>无未解析依赖、悬空节点和环。</li>
+<li>每个通信有唯一归属，不重复插入。</li>
+<li>producer/consumer 边跨原始前向、重计算和反向时仍指向正确 execution kind。</li>
+<li>通信前后的 compute 节点可追踪，回放顺序与训练语义一致。</li>
+<li>必需的 P2P transfer 成对，collective 的 group/rank 成员一致。</li>
+</ol>
+<p>设计约束可参考<a href="../../design/communication-ownership-contract/">通信归属契约</a>和<a href="../../design/schedule-plan-dependency-reconstruction-contract/">调度计划依赖重建契约</a>。</p>
+<h3 id="45">4.5 端到端显存估计</h3>
+<p>显存报告至少分解为：</p>
+<ul>
+<li>常驻参数 shard/replica。</li>
+<li>FSDP full-parameter 临时驻留。</li>
+<li>梯度和 optimizer state。</li>
+<li>saved activations。</li>
+<li>recompute 临时激活。</li>
+<li>attention、GMM 和融合算子的 workspace/temporary。</li>
+<li>collective/P2P buffer。</li>
+<li>offload/prefetch 相关驻留。</li>
+</ul>
+<p>必须对 AC 关闭与开启分别验证；支持 offload 时再做开关对照。除了 peak 数值，还需核对 peak 发生在哪个执行阶段、由哪些 tensor 构成。</p>
+<p>以下趋势应符合逻辑，否则必须解释：</p>
+<ul>
+<li>FSDP 后常驻参数通常随 shard 增大而下降，但计算阶段仍可能出现 full-parameter 峰值。</li>
+<li>full/selective AC 应减少 saved activation，增加相应区域的 recompute 算子。</li>
+<li>offload 应降低设备驻留，但不能让逻辑 tensor、prefetch 或传输成本凭空消失。</li>
+<li>sequence length、microbatch 或 expert token 数增加时，相关激活/workspace 应按理论阶数增长。</li>
+<li>TP/CP/EP 改变的是对应语义维的 local tensor，而不是把所有显存简单除以 world size。</li>
+</ul>
+<p>验收应给出各对照配置之间的变化原因和 peak 构成。对于模型特有 workspace 或动态 token 路由，重点验证量级、单调性和 tensor 生命周期逻辑；不要求使用真实 NPU allocator 结果作为基线。</p>
+<p>显存输出字段见<a href="../../user-guides/simulator/">模拟器使用指南</a>，建模原则见<a href="../../design/simulator-memory-model-design/">模拟器显存模型设计</a>。</p>
+<h3 id="46-hook">4.6 插件、Hook 和训练特性兼容性</h3>
+<p>在单卡和核心组合上检查：</p>
+<ul>
+<li>memory estimator、snapshot 和逐 module/activation hook。</li>
+<li>算子计数、raw op 捕获和 CSV/JSON 导出。</li>
+<li>AC、activation offload、compile 等声明支持的图变换。</li>
+<li>fused RMSNorm、GMM、attention 和模型特有算子是否仍被 hook。</li>
+<li>optimizer、梯度裁剪，以及 checkpoint/state-dict schema 的 save/load 闭环。</li>
+<li>converter 后模块 FQN、参数身份和 state-dict 路径是否稳定。</li>
+</ul>
+<p>任何 fused/custom op 若在统计、显存或依赖图中不可见，视为未兼容；不能以真实 kernel 尚未实现为由跳过 shape-only hook。</p>
+<h3 id="47">4.7 回归和可维护性</h3>
+<p>最后执行仓库现有单测、模型单测和 smoke test，并确认：</p>
+<ul>
+<li>没有修改其他模型的注册、默认配置和 converter 行为。</li>
+<li>没有恢复目标训练主分支已删除的兼容层或旧接口。</li>
+<li>非法或未支持配置有清晰错误信息。</li>
+<li>新增测试使用当前 API、配置名和算子名。</li>
+</ul>
+<p>通用测试命令见<a href="../test_guide/">测试指南</a>。</p>
+<h2 id="5">5. 推荐执行顺序</h2>
+<p>建议按以下顺序收敛问题：</p>
+<ol>
+<li>单卡：参数、shape、核心算子账本。</li>
+<li>FSDP/eFSDP、TP、EP/ETP、CP 分别开启。</li>
+<li>不含 PP 的核心组合。</li>
+<li>在单卡和核心组合上分别执行 AC 关闭/开启。</li>
+<li>插件、hook、显存和依赖回放。</li>
+<li>state-dict/checkpoint schema 的 meta 闭环。</li>
+<li>最后执行 PP 和含 PP 的最终组合。</li>
+<li>正式规格模拟器容量验证及证据归档。</li>
+</ol>
+<p>模拟器示例：</p>
+<pre><code class="language-bash">python3 scripts/run_simulator_spawn.py \
+  --config &lt;model&gt;_simulate \
+  --simulation.output_formats mem \
+  --activation-checkpoint.mode none
+
+python3 scripts/run_simulator_spawn.py \
+  --config &lt;model&gt;_simulate \
+  --simulation.output_formats mem \
+  --activation-checkpoint.mode full
+</code></pre>
+<h2 id="6">6. 验收证据模板</h2>
+<p>每个必测配置保留一行汇总，并链接原始报告：</p>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>内容</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Commit/base</td>
+<td>被测 commit、训练主分支基线</td>
+</tr>
+<tr>
+<td>Environment</td>
+<td>Docker 镜像/digest、torch、torch_npu、CANN、模拟 world size、capture rank</td>
+</tr>
+<tr>
+<td>Model/config</td>
+<td>模型 flavor、layer、seq、microbatch、dtype</td>
+</tr>
+<tr>
+<td>Parallel</td>
+<td>DP/FSDP/eFSDP/TP/EP/ETP/CP/PP</td>
+</tr>
+<tr>
+<td>Features</td>
+<td>AC、offload、compile、converter</td>
+</tr>
+<tr>
+<td>Parameters</td>
+<td>全局数量、每 rank 字节数及并行对照下的变化解释</td>
+</tr>
+<tr>
+<td>Operators</td>
+<td>预期/实际核心 op shape 和 F/R/B 次数</td>
+</tr>
+<tr>
+<td>Communication</td>
+<td>类型、次数、字节数、依赖校验结果</td>
+</tr>
+<tr>
+<td>Memory</td>
+<td>模拟 peak、阶段、构成与 AC/并行对照</td>
+</tr>
+<tr>
+<td>Lifecycle</td>
+<td>state-dict schema save/load、hook/plugin 结果</td>
+</tr>
+<tr>
+<td>Evidence</td>
+<td>trace、CSV/JSON、memory report、日志路径</td>
+</tr>
+<tr>
+<td>Result</td>
+<td>PASS/FAIL，以及差异说明</td>
+</tr>
+</tbody>
+</table>
+<p>最终汇总应明确给出以下三种结论之一：</p>
+<ul>
+<li><strong>Ready</strong>：所有声明支持的模拟器范围通过，证据完整，无静默降级。</li>
+<li><strong>Conditionally ready</strong>：明确缩小了模拟器支持范围；未支持项有文档并 fail fast，不能按完整支持宣传。</li>
+<li><strong>Not ready</strong>：任一核心并行、shape/数量、通信依赖或显存逻辑未通过。</li>
+</ul>
+<p>以下情况必须判定为 <strong>Not ready</strong>：</p>
+<ul>
+<li>只验证了单卡或只验证进程能退出。</li>
+<li>只看总显存，没有参数/激活/临时量分解。</li>
+<li>只统计前向，没有重计算和反向。</li>
+<li>只看通信节点存在，没有验证 shape、字节和依赖。</li>
+<li>自定义融合算子被展开成小算子或未进入 hook。</li>
+</ul>
+              
+            </div>
+          </div><footer>
+    <div class="rst-footer-buttons" role="navigation" aria-label="Footer Navigation">
+        <a href="../../superpowers/specs/2026-07-01-smla-real-op-name-capture-design/" class="btn btn-neutral float-left" title="SMLA 真实算子名捕获 — 架构与方案设计（阶段二：SMLA）"><span class="icon icon-circle-arrow-left"></span> Previous</a>
+        <a href="../test_design/" class="btn btn-neutral float-right" title="测试设计">Next <span class="icon icon-circle-arrow-right"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <!-- Copyright etc -->
+  </div>
+
+  Built with <a href="https://www.mkdocs.org/">MkDocs</a> using a <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a> provided by <a href="https://readthedocs.org">Read the Docs</a>.
+</footer>
+          
+        </div>
+      </div>
+
+    </section>
+
+  </div>
+
+  <div class="rst-versions" role="note" aria-label="Versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    
+    
+      <span><a href="../../superpowers/specs/2026-07-01-smla-real-op-name-capture-design/" style="color: #fcfcfc">&laquo; Previous</a></span>
+    
+    
+      <span><a href="../test_design/" style="color: #fcfcfc">Next &raquo;</a></span>
+    
+  </span>
+</div>
+    <script src="../../js/jquery-3.6.0.min.js"></script>
+    <script>var base_url = "../..";</script>
+    <script src="../../js/theme_extra.js"></script>
+    <script src="../../js/theme.js"></script>
+    <script>
+        jQuery(function () {
+            SphinxRtdTheme.Navigation.enable(true);
+        });
+    </script>
+
+</body>
+</html>

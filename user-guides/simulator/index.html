@@ -1,0 +1,1425 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" >
+<head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+      <link rel="shortcut icon" href="../../img/favicon.ico" />
+    <title>Simulator 使用指南 - torchtitan-npu</title>
+    <link rel="stylesheet" href="../../css/theme.css" />
+    <link rel="stylesheet" href="../../css/theme_extra.css" />
+        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/styles/github.min.css" />
+    
+      <script>
+        // Current page data
+        var mkdocs_page_name = "Simulator \u4f7f\u7528\u6307\u5357";
+        var mkdocs_page_input_path = "user-guides/simulator.md";
+        var mkdocs_page_url = null;
+      </script>
+    
+    <!--[if lt IE 9]>
+      <script src="../../js/html5shiv.min.js"></script>
+    <![endif]-->
+      <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/highlight.min.js"></script>
+      <script>hljs.highlightAll();</script> 
+</head>
+
+<body class="wy-body-for-nav" role="document">
+
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side stickynav">
+    <div class="wy-side-scroll">
+      <div class="wy-side-nav-search">
+          <a href="../.." class="icon icon-home"> torchtitan-npu
+        </a>
+      </div>
+
+      <div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <ul>
+                <li class="toctree-l1"><a class="reference internal" href="../..">Home</a>
+                </li>
+              </ul>
+              <ul>
+                <li class="toctree-l1"><a class="reference internal" href="../../lint_guide/">Lint 指南</a>
+                </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Community</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../community/contributors/">提交者与贡献者（Committers and Contributors）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../community/governance/">社区治理</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../community/versioning_policy/">版本策略</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Design</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/1f1b-schedule-plan-assembly-guide/">1F1B 完整依赖组装与 DES 回放实现指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/alltoall-capture-analysis/">all_to_all 通信捕获缺失分析</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/communication-ownership-contract/">Communication Ownership Contract</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/dualpipev-schedule-plan-consumer-guide/">DualPipeV SchedulePlan 下游接入指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/l2-l3-schedule-plan-design/">L2/L3 调度 IR 重构设计：从扁平 trace 到结构化 SchedulePlan</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/low-precision-sim-analysis/">低精度训练（MXFP8）Simulator 使能分析</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/optimizer-ops-analysis/">优化器算子捕获问题分析</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/pipeline-multi-graph-capture-design/">复杂 Pipeline 策略下完整计算图捕获方案设计</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/pp-l2-capture-architecture/">PP L2 Capture Architecture</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/schedule-capture-design/">L0-L3 IR 层级归属设计</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/schedule-plan-dependency-reconstruction-contract/">SchedulePlan 下游依赖重建契约</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/schedule-plan-des-consumer-guide/">SchedulePlan 依赖重建与 DES 消费指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/simulator-memory-model-design/">Simulator Memory Model 改造设计</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Feature guides</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/checkpoint/">Checkpoint 使用指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/deepseek_v32_mtp/">多Token预测特性(Multi Token Prediction, MTP)</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/low_precision_training/">低精度训练特性（MXFP8）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/metrics_and_debugging/">调试支持特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/model_custom/">Model Custom框架介绍</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/muon_optimizer/">Muon 优化器特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/new_model_onboarding/">新模型接入开发流程</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/npu_fused_ops/">NPU 融合算子适配</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/swap_optimizer/">SwapOptimizer 特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/torch_compile/">torch.compile 支持</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/virtual_optimizer/">Virtual Optimizer - 优化器显存虚拟化特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/vlm/">VLM NPU 支持</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" >Parallelism</a>
+    <ul>
+                <li class="toctree-l2"><a class="reference internal" href="../../feature_guides/parallelism/custom_cp/">自定义 Context Parallel 特性</a>
+                </li>
+    </ul>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Recipe</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../recipe/sft/">SFT 指令微调</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Superpowers</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" >Plans</a>
+    <ul>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/plans/2026-07-01-mhc-real-op-name-capture-implementation/">MHC Real-Op-Name Capture Implementation Plan</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/plans/2026-07-01-npu-simulator-implementation/">torchtitan_npu Simulator Implementation Plan</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/plans/2026-07-01-smla-real-op-name-capture-implementation/">SMLA Real-Op-Name Capture Implementation Plan</a>
+                </li>
+    </ul>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" >Specs</a>
+    <ul>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/specs/2026-07-01-mhc-real-op-name-capture-design/">MHC 真实算子名捕获 — 架构与方案设计（阶段一：MHC）</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/specs/2026-07-01-npu-simulator-design/">torchtitan_npu Simulator — 架构与方案设计</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/specs/2026-07-01-smla-real-op-name-capture-design/">SMLA 真实算子名捕获 — 架构与方案设计（阶段二：SMLA）</a>
+                </li>
+    </ul>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Test guides</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../test_guides/model_acceptance/">新模型最终验收规范（Meta 模拟器）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../test_guides/test_design/">测试设计</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../test_guides/test_guide/">测试使用指南</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">User guides</span></p>
+              <ul class="current">
+                  <li class="toctree-l1"><a class="reference internal" href="../deepseek_v4_model_parameters/">DeepSeek-V4 模型参数 Web 字段目录</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../installation/">软件安装</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../quickstart/">快速上手</a>
+                  </li>
+                  <li class="toctree-l1 current"><a class="reference internal current" href="#">Simulator 使用指南</a>
+    <ul class="current">
+    <li class="toctree-l2"><a class="reference internal" href="#_1">工作原理</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#_2">环境准备</a>
+        <ul>
+    <li class="toctree-l3"><a class="reference internal" href="#_3">方式一：使用预构建镜像（推荐）</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#dockerfile-arm64">方式二：使用 Dockerfile 自行构建镜像（支持 ARM64）</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#cann">方式三：使用基础 CANN 镜像手动搭建</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#_4">方式四：本地环境</a>
+    </li>
+        </ul>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#_5">快速开始</a>
+        <ul>
+    <li class="toctree-l3"><a class="reference internal" href="#1-simulator">1. 切换到 simulator 分支</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#2-tokenizer">2. 准备 Tokenizer</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#3">3. 运行仿真</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#4-deepseek-v4">4. 覆盖 DeepSeek-V4 模型参数</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#5">5. 获取输出文件</a>
+    </li>
+        </ul>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#_6">内置仿真配置</a>
+        <ul>
+    <li class="toctree-l3"><a class="reference internal" href="#activation-checkpoint">Activation checkpoint</a>
+    </li>
+        </ul>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#_7">输出文件</a>
+        <ul>
+    <li class="toctree-l3"><a class="reference internal" href="#fake_backend">单进程模式（fake_backend）</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#multi_proc_meta">多进程模式（multi_proc_meta）</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#kernel_summary">kernel_summary/ 说明</a>
+    </li>
+        </ul>
+    </li>
+    </ul>
+                  </li>
+              </ul>
+      </div>
+    </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap">
+      <nav class="wy-nav-top" role="navigation" aria-label="Mobile navigation menu">
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../..">torchtitan-npu</a>
+        
+      </nav>
+      <div class="wy-nav-content">
+        <div class="rst-content"><div role="navigation" aria-label="breadcrumbs navigation">
+  <ul class="wy-breadcrumbs">
+    <li><a href="../.." class="icon icon-home" aria-label="Docs"></a></li>
+          <li class="breadcrumb-item">User guides</li>
+      <li class="breadcrumb-item active">Simulator 使用指南</li>
+    <li class="wy-breadcrumbs-aside">
+    </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+            <div class="section" itemprop="articleBody">
+              
+                <h1 id="simulator">Simulator 使用指南</h1>
+<p>torchtitan-npu Simulator 是一个<strong>侧载式（side-loaded）</strong>的计算图捕获工具，它在不依赖真实 NPU 硬件、不分配真实显存的前提下，完整捕获一个训练 step 中<strong>所有卡</strong>的计算图，并输出四层 IR（L0 OpNode → L1 StepGraph → L2 ScheduleGraph → L3 WorkloadGraph）及可视化文件。</p>
+<h2 id="_1">工作原理</h2>
+<p>Simulator 通过以下机制实现"零硬件捕获"：</p>
+<ol>
+<li><strong>Meta Device 替身</strong>：将 <code>torchtitan.tools.utils.device_type</code> 猴子补丁为 <code>"meta"</code>，模型全程在 <code>torch.device("meta")</code> 上构建和运行，不分配真实显存。</li>
+<li><strong>Fake Process Group</strong>：两种模式——<code>fake_backend</code>（单进程，<code>FakeProcessGroup</code> 模拟全部 rank）和 <code>multi_proc_meta</code>（多进程，PP 维度用 gloo 真实多进程，CP/TP/EP/FSDP 维度用 <code>FakeProcessGroup</code> 模拟）。</li>
+<li><strong>集合通信拦截</strong>：拦截 <code>torch.distributed.*</code> 和 <code>_functional_collectives.*</code> 的所有集合通信调用（含 autograd 变体和 P2P），在 meta 张量上不做真实通信，只记录通信事件（op 类型、group、shape、bytes、PP context）。</li>
+<li><strong>MoE 强制负载均衡</strong>：强制 <code>debug.moe_force_load_balance=True</code>，路由逻辑退化为与输入数值无关的 round-robin，保证 meta 张量下 shape 推断正确。</li>
+<li><strong>算子级捕获</strong>：通过 <code>TorchDispatchMode</code> 拦截每个 aten/npu 算子调用，记录 op 类型、输入输出 shape、producer/consumer 依赖关系、PP stage/microbatch 上下文。</li>
+<li><strong>Microbatch 分层捕获</strong>：首个 microbatch 完整捕获 L0/L1 算子图，后续 microbatch 跳过 L0/L1（pass-through 模式），只捕获 L2 调度时序和 L3 通信事件。L0/L1 捕获开销与 microbatch 数量无关。</li>
+</ol>
+<h2 id="_2">环境准备</h2>
+<p>Simulator 需要 <code>torch</code> 和 <code>torch_npu</code>（用于 NPU 自定义算子的 meta 核注册），但<strong>不需要真实 NPU 硬件</strong>（<code>torch.npu.is_available()</code> 可以为 <code>False</code>）。</p>
+<h3 id="_3">方式一：使用预构建镜像（推荐）</h3>
+<p>已将调试环境打包为容器镜像并上传至华为云 SWR，内含 CANN 9.1.0-beta.1-950、Python 3.12.13、torch 2.12.0+cpu、torch_npu 2.12.0.rc1、torchtitan 0.2.2、torchtitan_npu 0.2.2.post1，开箱即用。</p>
+<pre><code class="language-bash"># 1. 拉取镜像
+sudo docker pull swr.cn-north-4.myhuaweicloud.com/zhanlu/torchtitan-npu-simulator:v1.0
+
+# 2. 克隆项目代码（如已有可跳过）
+git clone https://github.com/ZhanluModelSim/torchtitan-npu-simulator.git
+cd torchtitan-npu-simulator
+git checkout feat/npu-simulator
+
+# 3. 启动容器，挂载项目目录
+sudo docker run -d --name titan-sim \
+  -v $(pwd):/workspace \
+  -w /workspace \
+  swr.cn-north-4.myhuaweicloud.com/zhanlu/torchtitan-npu-simulator:v1.0 \
+  sleep infinity
+
+# 4. 进入容器
+sudo docker exec -it titan-sim bash
+
+# 5. 加载 CANN 环境变量（每次进入容器都需要执行）
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+
+# 6. 验证环境
+python3 -c &quot;import torch; import torch_npu; print('torch', torch.__version__); print('torch_npu', torch_npu.__version__); print('npu available', torch.npu.is_available())&quot;
+# 预期输出：
+#   torch 2.12.0+cpu
+#   torch_npu 2.12.0.rc1
+#   npu available False   ← 正常，simulator 不需要真实硬件
+</code></pre>
+<blockquote>
+<p>[!TIP]
+镜像约 24.5GB，首次拉取需要较长时间。如果网络较慢，可先用 <code>--quiet</code> 模式后台拉取。</p>
+<p>每次重新进入容器都需要执行 <code>source /usr/local/Ascend/ascend-toolkit/set_env.sh</code> 加载 CANN 环境变量。也可以将其写入 <code>~/.bashrc</code> 一劳永逸：
+<code>bash
+echo 'source /usr/local/Ascend/ascend-toolkit/set_env.sh 2&gt;/dev/null' &gt;&gt; ~/.bashrc</code></p>
+</blockquote>
+<h3 id="dockerfile-arm64">方式二：使用 Dockerfile 自行构建镜像（支持 ARM64）</h3>
+<p>项目根目录提供 <code>Dockerfile</code>，可在 x86_64 和 ARM64（aarch64）架构下自行构建镜像。CANN 基础镜像、torch、torch_npu、triton-ascend 均已提供 ARM64 wheel，无需额外适配。</p>
+<pre><code class="language-bash"># 1. 克隆项目代码
+git clone https://github.com/ZhanluModelSim/torchtitan-npu-simulator.git
+cd torchtitan-npu-simulator
+git checkout feat/npu-simulator
+
+# 2. 构建镜像（自动识别当前架构）
+sudo docker build -t torchtitan-npu-simulator:v1.0 .
+
+# 3. 启动容器，挂载项目目录
+sudo docker run -d --name titan-sim \
+  -v $(pwd):/workspace \
+  -w /workspace \
+  torchtitan-npu-simulator:v1.0 \
+  sleep infinity
+
+# 4. 进入容器（CANN 环境变量已写入 bashrc，自动加载）
+sudo docker exec -it titan-sim bash
+
+# 5. 验证环境
+python3 -c &quot;import torch; import torch_npu; print('torch', torch.__version__); print('torch_npu', torch_npu.__version__); print('npu available', torch.npu.is_available())&quot;
+</code></pre>
+<blockquote>
+<p>[!NOTE]
+Dockerfile 会自动完成以下操作：
+- 以 CANN 9.1.0-beta.1-950 镜像为基础（提供 <code>libhccl.so</code> 等 torch_npu 依赖库）
+- 安装 <code>torch==2.12.0+cpu</code>（CPU 版，无需 GPU/NPU 硬件）
+- 安装 <code>torch_npu==2.12.0rc1</code>（提供 NPU 算子 meta 核注册）
+- 从 gitcode 拉取并安装 torchtitan（pinned commit <code>ac13e536</code>）
+- 安装 <code>requirements.txt</code> 中的全部依赖（numpy、triton-ascend、scipy 等）
+- 克隆并安装 torchtitan_npu（simulator 分支，editable 模式）
+- 将 <code>source set_env.sh</code> 写入 <code>/etc/bash.bashrc</code>，进入容器自动加载 CANN 环境</p>
+<p>构建耗时约 10-30 分钟（取决于网络速度），镜像约 25GB。</p>
+</blockquote>
+<h3 id="cann">方式三：使用基础 CANN 镜像手动搭建</h3>
+<p>如果需要完全自定义环境，可从基础 CANN 镜像开始逐步安装：</p>
+<pre><code class="language-bash"># 拉取基础 CANN 镜像
+docker pull quay.m.daocloud.io/ascend/cann:9.1.0-beta.1-950-ubuntu22.04-py3.12
+
+# 启动容器
+docker run -d --name titan-sim \
+  -v $(pwd):/workspace \
+  -w /workspace \
+  quay.m.daocloud.io/ascend/cann:9.1.0-beta.1-950-ubuntu22.04-py3.12 \
+  sleep infinity
+
+# 进入容器，加载 CANN 环境并安装依赖
+docker exec -it titan-sim bash
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+pip install torch==2.12.0+cpu torch_npu==2.12.0.rc1 -f https://download.pytorch.org/whl/cpu/torch_stable.html
+cd /workspace &amp;&amp; pip install -e .
+</code></pre>
+<h3 id="_4">方式四：本地环境</h3>
+<p>确保已安装 <code>torch</code> 和 <code>torch_npu</code>（版本以 <code>requirements.txt</code> 锁定为准），并已 source CANN 环境变量。</p>
+<h2 id="_5">快速开始</h2>
+<p>以下命令均在<strong>容器内</strong>执行（通过 <code>docker exec -it titan-sim bash</code> 进入后，先 <code>source /usr/local/Ascend/ascend-toolkit/set_env.sh</code>）。</p>
+<h3 id="1-simulator">1. 切换到 simulator 分支</h3>
+<pre><code class="language-bash">git checkout feat/npu-simulator
+</code></pre>
+<h3 id="2-tokenizer">2. 准备 Tokenizer</h3>
+<p>DeepSeek-V4-Pro 仿真配置默认引用 <code>./tests/assets/tokenizer/deepseek_v4_pro_tokenizer</code>，该目录<strong>未随仓库提交</strong>。Simulator 只在 meta device 上运行，tokenizer 仅用于 dataloader 生成 token ID（不影响捕获的 shape/结构），因此可以用仓库内置的 <code>deepseekv3_tokenizer</code> 替代：</p>
+<pre><code class="language-bash"># 方式一：用 --hf_assets_path 覆盖（推荐，无需修改代码）
+# 在运行仿真命令时追加 --hf_assets_path ./tests/assets/tokenizer/deepseekv3_tokenizer
+
+# 方式二：创建软链接
+mkdir -p tests/assets/tokenizer/deepseek_v4_pro_tokenizer
+ln -s ../deepseekv3_tokenizer/tokenizer.json tests/assets/tokenizer/deepseek_v4_pro_tokenizer/
+ln -s ../deepseekv3_tokenizer/tokenizer_config.json tests/assets/tokenizer/deepseek_v4_pro_tokenizer/
+</code></pre>
+<blockquote>
+<p>[!NOTE]
+仓库内置的 tokenizer 资产位于 <code>tests/assets/tokenizer/</code>，已 git 跟踪的有 <code>deepseekv3_tokenizer</code>、<code>qwen3-tokenizer</code>、<code>vlm_tokenizer</code>。Simulator 不关心词表内容（meta tensor 无数值），任何能正常 encode 的 tokenizer 均可使用。</p>
+</blockquote>
+<h3 id="3">3. 运行仿真</h3>
+<p>Simulator 推荐使用 <code>run_simulator_spawn.py</code>。启动器会先完成与 worker 相同的配置解析和 CLI 覆盖，再根据最终 PP degree 自动选择通信模式和真实进程数：</p>
+<pre><code class="language-bash"># 16 层小规模验证（PP=1，自动使用 fake_backend）
+python3 scripts/run_simulator_spawn.py \
+    --config deepseek_v4_pro_simulate_16_layers \
+    --hf_assets_path ./tests/assets/tokenizer/deepseekv3_tokenizer
+</code></pre>
+<pre><code class="language-bash"># 61 层验收配置（384 die，PP=1）
+python3 scripts/run_simulator_spawn.py \
+    --config deepseek_v4_pro_simulate_61_layers \
+    --hf_assets_path ./tests/assets/tokenizer/deepseekv3_tokenizer
+</code></pre>
+<pre><code class="language-bash"># 千卡规模（模拟 2048 die，自动启动 16 个 PP 进程）
+python3 scripts/run_simulator_spawn.py \
+    --config deepseek_v4_pro_simulate_61_layers_pp16_tp8_cp4_ep128 \
+    --hf_assets_path ./tests/assets/tokenizer/deepseekv3_tokenizer
+</code></pre>
+<p>PP=1 时也可以直接用 <code>python3 -m</code> 调用，通信模式仍会自动解析：</p>
+<pre><code class="language-bash">NGPU=384 python3 -m torchtitan_npu.entry \
+    --module torchtitan_npu.simulator \
+    --config deepseek_v4_pro_simulate_61_layers \
+    --training.steps=1 \
+    --hf_assets_path ./tests/assets/tokenizer/deepseekv3_tokenizer
+</code></pre>
+<blockquote>
+<p>[!NOTE]
+- <code>simulation.world_size</code> 指定模拟的<strong>总卡数</strong>。优先级为显式 <code>--simulation.world-size</code> &gt; 启动环境 <code>NGPU</code> &gt; 配置函数默认值；解析结果会在构建 mesh 前写回配置。
+- 最终 PP=1 时自动使用 <code>fake_backend</code>；最终 PP&gt;1 时自动使用 <code>multi_proc_meta</code>。
+- <code>--training.steps=1</code> 是默认值，Simulator 只捕获一个 step。
+- <code>--hf_assets_path</code> 指定 tokenizer 路径，用仓库内置的 <code>deepseekv3_tokenizer</code> 即可（见上一步说明）。
+- CLI 对 PP/TP/CP/EP/DP 的覆盖会在选择模式、计算进程数和构建 mesh 前统一生效。</p>
+</blockquote>
+<h3 id="4-deepseek-v4">4. 覆盖 DeepSeek-V4 模型参数</h3>
+<p>DeepSeek-V4 的内置配置作为 preset 使用，模型参数可通过
+<code>--model-overrides.&lt;字段名&gt;</code> 覆盖。字段名与
+<code>DeepSeekV4Model.Config</code>、<code>MoEArgs</code> 保持一致，CLI 中仅将下划线转换为
+连字符：</p>
+<pre><code class="language-bash">NGPU=8 python3 -m torchtitan_npu.entry \
+    --module torchtitan_npu.simulator \
+    --config deepseek_v4_smoketest \
+    --model-overrides.n-layers 3 \
+    --model-overrides.dim 192 \
+    --model-overrides.compress-ratios 1 4 128 \
+    --model-overrides.moe-args.num-experts 16 \
+    --model-overrides.moe-args.top-k 4 \
+    --model-overrides.moe-args.num-expert-groups 4 \
+    --model-overrides.moe-args.num-limited-groups None
+</code></pre>
+<p>布尔字段使用 <code>--model-overrides.&lt;字段名&gt;</code> 和
+<code>--model-overrides.no-&lt;字段名&gt;</code>；可空字段传 <code>None</code>。运行以下命令可查看
+当前版本支持的全部字段及所选 preset 的默认值：</p>
+<pre><code class="language-bash">python3 -m torchtitan_npu.entry \
+    --module torchtitan_npu.simulator \
+    --config deepseek_v4_smoketest \
+    --help
+</code></pre>
+<p>配置解析阶段会检查正数范围、<code>compress_ratios</code> 与 <code>n_layers</code> 的长度、
+head/group 整除关系、RoPE head 维度、Hadamard 维度，以及 MoE 的
+<code>top_k</code>、专家数和专家分组关系。<code>compress_ratios</code> 不能少于 <code>n_layers</code>；
+减少层数时可以保留 preset 尾部的多余值，增加层数时必须补足。</p>
+<h3 id="5">5. 获取输出文件</h3>
+<p>仿真输出默认写入项目目录下的 <code>simulator_output/&lt;配置名&gt;/</code>。由于启动容器时已将项目目录挂载到 <code>/workspace</code>，输出文件会直接同步到宿主机，无需额外拷贝：</p>
+<pre><code class="language-bash"># 在宿主机上直接查看（无需进入容器）
+ls simulator_output/deepseek_v4_pro_61_layers/
+# summary.txt  trace.html  compute_graph.dot  simulation_result.json
+
+# 查看摘要
+cat simulator_output/deepseek_v4_pro_61_layers/summary.txt
+
+# 在浏览器中打开可视化页面
+# macOS:  open simulator_output/deepseek_v4_pro_61_layers/trace.html
+# Linux:  xdg-open simulator_output/deepseek_v4_pro_61_layers/trace.html
+</code></pre>
+<blockquote>
+<p>[!TIP]
+如果容器启动时未挂载项目目录（<code>-v</code> 参数），输出文件只在容器内。可通过 <code>docker cp</code> 拷出到宿主机：
+<code>bash
+sudo docker cp titan-sim:/workspace/simulator_output ./simulator_output</code></p>
+</blockquote>
+<h2 id="_6">内置仿真配置</h2>
+<p>所有仿真配置定义在 <code>torchtitan_npu/simulator/config_registry.py</code> 中，通过 <code>--config &lt;函数名&gt;</code> 选择：</p>
+<table>
+<thead>
+<tr>
+<th>配置函数名</th>
+<th>模型</th>
+<th>层数</th>
+<th>并行策略</th>
+<th>world_size</th>
+<th>模式</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>deepseek_v4_pro_simulate_16_layers</code></td>
+<td>DeepSeek-V4-Pro</td>
+<td>16</td>
+<td>PP=1/TP=1/CP=1/EP=16</td>
+<td>384</td>
+<td>fake_backend</td>
+<td>快速验证</td>
+</tr>
+<tr>
+<td><code>deepseek_v4_pro_simulate_16_layers_cp4</code></td>
+<td>DeepSeek-V4-Pro</td>
+<td>16</td>
+<td>PP=1/CP=4/EP=16</td>
+<td>16</td>
+<td>fake_backend</td>
+<td>CP 通信捕获验证</td>
+</tr>
+<tr>
+<td><code>deepseek_v4_pro_simulate_16_layers_pp4_cp4</code></td>
+<td>DeepSeek-V4-Pro</td>
+<td>16</td>
+<td>PP=4/CP=4/DP=4</td>
+<td>64</td>
+<td>multi_proc_meta</td>
+<td>PP+CP+FSDP 全通信捕获</td>
+</tr>
+<tr>
+<td><code>deepseek_v4_pro_simulate_61_layers</code></td>
+<td>DeepSeek-V4-Pro</td>
+<td>61</td>
+<td>PP=1/TP=1/CP=1/EP=192</td>
+<td>384</td>
+<td>fake_backend</td>
+<td>验收配置</td>
+</tr>
+<tr>
+<td><code>deepseek_v4_pro_simulate_61_layers_pp16_tp8_cp4_ep128</code></td>
+<td>DeepSeek-V4-Pro</td>
+<td>61</td>
+<td>PP=16/TP=8/CP=4/EP=128/FSDP=-1</td>
+<td>2048</td>
+<td>multi_proc_meta</td>
+<td>千卡规模（16 个 PP 进程）</td>
+</tr>
+</tbody>
+</table>
+<p>每个仿真配置内部复用对应的真实训练配置（如 <code>deepseek_v4_pro_debug_61_layers_4k_384die()</code>），原样继承 model_spec、并行度、optimizer 等全部字段。运行时统一处理：</p>
+<ul>
+<li>根据最终 PP degree 推导 <code>comm.mode</code></li>
+<li><code>compile.enable = False</code>（捕获需要 eager dispatch）</li>
+<li><code>debug.moe_force_load_balance = True</code>（MoE 强制负载均衡）</li>
+</ul>
+<h3 id="activation-checkpoint">Activation checkpoint</h3>
+<p>可通过 CLI 选择 activation checkpoint 模式：</p>
+<pre><code class="language-bash">--activation-checkpoint.mode none       # 不重计算，保留普通 forward 激活
+--activation-checkpoint.mode full       # 按 transformer block 完整重计算
+--activation-checkpoint.mode selective  # op 级 selective activation checkpoint
+</code></pre>
+<p><code>selective</code> 使用 TorchTitan 的 op SAC policy：保存部分计算/通信结果，其余算子在
+backward 中重放。可通过
+<code>activation_checkpoint.per_op_sac_force_recompute_mm_shapes_by_fqns</code>
+指定需要强制重计算的 <code>nn.Linear</code> FQN。<code>memory_budget</code> 依赖
+<code>torch.compile</code> 的图分区器，而 simulator 必须使用 eager TorchDispatch 捕获，因此
+当前明确不支持。</p>
+<h2 id="_7">输出文件</h2>
+<h3 id="fake_backend">单进程模式（fake_backend）</h3>
+<p>仿真完成后，输出文件默认写入 <code>simulator_output/&lt;配置名&gt;/</code> 目录：</p>
+<table>
+<thead>
+<tr>
+<th>文件</th>
+<th>格式</th>
+<th>内容</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>summary.txt</code></td>
+<td>纯文本</td>
+<td>摘要报告：各阶段 op 数、FLOPs、内存、通信量统计</td>
+</tr>
+<tr>
+<td><code>trace.html</code></td>
+<td>自包含 HTML</td>
+<td>可视化页面：L3→L2→L1→L0 层级展开</td>
+</tr>
+<tr>
+<td><code>compute_graph.dot</code></td>
+<td>Graphviz</td>
+<td>算子依赖图</td>
+</tr>
+<tr>
+<td><code>simulation_result.json</code></td>
+<td>JSON</td>
+<td>完整四层 IR 结构化数据</td>
+</tr>
+<tr>
+<td><code>kernel_summary/</code></td>
+<td>CSV 目录</td>
+<td>按 Rank 拆分的算子汇总</td>
+</tr>
+<tr>
+<td><code>ir_export/</code></td>
+<td>CSV 目录</td>
+<td>各层级 IR 导出（见下文）</td>
+</tr>
+<tr>
+<td><code>memory/</code></td>
+<td>JSON/CSV 目录</td>
+<td>默认包含内存摘要；显式启用 <code>mem</code> 后还包含 Perfetto trace、事件时间线和 tensor 生命周期</td>
+</tr>
+</tbody>
+</table>
+<p>内存计算由 <code>simulation.enable_memory_tracking</code> 控制。只要内存跟踪开启，
+<code>memory/memory_summary.json</code> 就会默认导出，不依赖 <code>output_formats</code>。
+<code>simulation.output_formats</code> 中的 <code>mem</code> 只控制体积较大的详细 trace 和 CSV。例如
+导出完整内存产物：</p>
+<pre><code class="language-bash">--simulation.output_formats mem
+</code></pre>
+<p><code>memory/</code> 中的主要文件：</p>
+<table>
+<thead>
+<tr>
+<th>文件</th>
+<th>内容</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>memory_summary.json</code></td>
+<td>默认导出；参数常驻、前向/反向/optimizer 峰值及 checkpoint 聚合</td>
+</tr>
+<tr>
+<td><code>memory_events.csv</code></td>
+<td><code>mem</code>；未折叠的算子输入输出事件，含 PP stage/microbatch/comp_type</td>
+</tr>
+<tr>
+<td><code>memory_timeline.csv</code></td>
+<td><code>mem</code>；alloc/free 后的 active tensor bytes 曲线</td>
+</tr>
+<tr>
+<td><code>tensor_lifetimes.csv</code></td>
+<td><code>mem</code>；每个 tensor 的 birth、last consumer、death、逻辑大小、建模驻留大小和分类</td>
+</tr>
+<tr>
+<td><code>checkpoint_tensors.csv</code></td>
+<td><code>mem</code>；AC wrapper 边界输入/输出及 selective 内部保存 tensor 元数据；存在 AC 边界时生成</td>
+</tr>
+<tr>
+<td><code>activation_offload_tensors.csv</code></td>
+<td><code>mem</code>；不属于 AC wrapper 记录、但被统一激活卸载策略覆盖的 tensor 及逐层归属</td>
+</tr>
+<tr>
+<td><code>memory_actions.csv</code></td>
+<td><code>mem</code>；PP 调度 action 与展开后内存事件区间的映射；非 PP 不生成</td>
+</tr>
+<tr>
+<td><code>memory_trace.json</code></td>
+<td><code>mem</code>；可由 Chrome Trace 或 Perfetto 打开的阶段趋势图</td>
+</tr>
+</tbody>
+</table>
+<p>可通过两个独立开关调整内存建模假设：</p>
+<pre><code class="language-bash"># 参数仍保留捕获到的原始 dtype/num_bytes，但静态本地参数分片按 BF16 计入设备驻留。
+--simulation.memory-parameter-storage-dtype bfloat16
+
+# 所有前向保存激活仍保留元数据，但不计入设备驻留和峰值。
+--simulation.memory-offload-ac-saved-tensors
+</code></pre>
+<p>参数 dtype 覆盖仅作用于静态本地参数分片，不改变梯度、optimizer state 或 FSDP
+all-gather 全参数的 dtype。激活卸载作用于所有“forward 产生且正常 backward
+仍需使用”的 tensor，因此对 <code>activation_checkpoint.mode=none/full/selective</code>
+使用同一建模假设。full/selective 的 checkpoint 内部重计算临时值不是保存激活，
+仍按其 forward/recompute 生命周期建模。freqs、mask 等无梯度外部上下文不会被
+当作保存激活卸载。两个开关默认均关闭。</p>
+<p>selective checkpoint 保存的内部 tensor 在 <code>tensor_lifetimes.csv</code> 中标记为
+<code>checkpoint_saved_for_recompute</code>。summary 中的
+<code>checkpoint_recompute_saved_{tensor_count,logical_bytes,modeled_bytes}</code>
+分别给出数量、逻辑大小和建模驻留大小；全量明细中对应的
+<code>checkpoint_tensors.csv</code> 记录使用 <code>role=recompute_saved</code>。</p>
+<p><code>memory_summary.json</code> 的 <code>checkpoint_saved_activations</code> 按稳定的
+<code>checkpoint_id</code> marker 聚合保存激活。例如：</p>
+<pre><code class="language-json">{
+  &quot;checkpoint_saved_activations&quot;: {
+    &quot;part0:layers.0&quot;: {
+      &quot;marker_kind&quot;: &quot;module&quot;,
+      &quot;logical_bytes_per_instance&quot;: 262144,
+      &quot;modeled_bytes_per_instance&quot;: 0,
+      &quot;instance_count&quot;: 2,
+      &quot;logical_bytes_total&quot;: 524288,
+      &quot;modeled_bytes_total&quot;: 0,
+      &quot;pp_stages&quot;: [0],
+      &quot;microbatches&quot;: [0, 1],
+      &quot;size_variants&quot;: [
+        {
+          &quot;logical_bytes&quot;: 262144,
+          &quot;modeled_bytes&quot;: 0,
+          &quot;tensor_count&quot;: 1,
+          &quot;instance_count&quot;: 2
+        }
+      ]
+    }
+  }
+}
+</code></pre>
+<p><code>logical_bytes_per_instance</code> 可直接作为后续一次恢复/load 的大小。若同一个 marker
+存在动态 shape，该字段为 <code>null</code>，具体大小和出现次数记录在 <code>size_variants</code>。
+marker 当前使用 AC wrapper 模块路径且 <code>marker_kind="module"</code>；该结构不依赖“层”的
+概念，后续 selective AC 可以使用 op 级 marker 和 <code>marker_kind="op"</code> 并复用相同格式。</p>
+<p><code>checkpoint_prefetch</code> 保留 AC 专用的边界输入与 selective 保存值统计。评估三种
+AC 模式下的统一激活回捞带宽时，应使用 <code>activation_prefetch</code>：</p>
+<pre><code class="language-json">{
+  &quot;activation_offload_tensor_count&quot;: 567,
+  &quot;activation_offload_logical_bytes&quot;: 32992845480,
+  &quot;activation_offload_modeled_bytes&quot;: 0,
+  &quot;activation_prefetch_logical_bytes&quot;: 32992845480,
+  &quot;activation_prefetch&quot;: {
+    &quot;part0:layers.0&quot;: {
+      &quot;marker_kind&quot;: &quot;layer&quot;,
+      &quot;logical_bytes_per_instance&quot;: 1771982464,
+      &quot;modeled_bytes_per_instance&quot;: 0,
+      &quot;tensor_count_per_instance&quot;: 29,
+      &quot;instance_count&quot;: 1,
+      &quot;logical_bytes_total&quot;: 1771982464,
+      &quot;modeled_bytes_total&quot;: 0,
+      &quot;pp_stages&quot;: [0],
+      &quot;microbatches&quot;: [0],
+      &quot;size_variants&quot;: [
+        {
+          &quot;logical_bytes&quot;: 1771982464,
+          &quot;modeled_bytes&quot;: 0,
+          &quot;tensor_count&quot;: 29,
+          &quot;instance_count&quot;: 1
+        }
+      ]
+    }
+  }
+}
+</code></pre>
+<p>none 模式按正常 backward consumer 的 <code>layers.N</code> 归档保存激活；full/selective
+复用 checkpoint marker，并合并该层其他保存激活。没有唯一层归属的 loss、logits
+等记录在 <code>part0:&lt;unattributed&gt;</code>，其总量同时写入
+<code>activation_prefetch_unattributed_{tensor_count,logical_bytes}</code>。</p>
+<p>AC 专用的 <code>checkpoint_prefetch</code> 结构如下：</p>
+<pre><code class="language-json">{
+  &quot;checkpoint_prefetch&quot;: {
+    &quot;part0:layers.0&quot;: {
+      &quot;marker_kind&quot;: &quot;module&quot;,
+      &quot;boundary_logical_bytes_per_instance&quot;: 262144,
+      &quot;recompute_saved_logical_bytes_per_instance&quot;: 1048576,
+      &quot;prefetch_logical_bytes_per_instance&quot;: 1310720,
+      &quot;boundary_modeled_bytes_per_instance&quot;: 0,
+      &quot;recompute_saved_modeled_bytes_per_instance&quot;: 0,
+      &quot;modeled_bytes_per_instance&quot;: 0,
+      &quot;boundary_tensor_count_per_instance&quot;: 1,
+      &quot;recompute_saved_tensor_count_per_instance&quot;: 3,
+      &quot;tensor_count_per_instance&quot;: 4,
+      &quot;instance_count&quot;: 2,
+      &quot;prefetch_logical_bytes_total&quot;: 2621440,
+      &quot;modeled_bytes_total&quot;: 0,
+      &quot;pp_stages&quot;: [0],
+      &quot;microbatches&quot;: [0, 1],
+      &quot;size_variants&quot;: [
+        {
+          &quot;boundary_logical_bytes&quot;: 262144,
+          &quot;boundary_modeled_bytes&quot;: 0,
+          &quot;boundary_tensor_count&quot;: 1,
+          &quot;recompute_saved_logical_bytes&quot;: 1048576,
+          &quot;recompute_saved_modeled_bytes&quot;: 0,
+          &quot;recompute_saved_tensor_count&quot;: 3,
+          &quot;prefetch_logical_bytes&quot;: 1310720,
+          &quot;modeled_bytes&quot;: 0,
+          &quot;tensor_count&quot;: 4,
+          &quot;instance_count&quot;: 2
+        }
+      ]
+    }
+  }
+}
+</code></pre>
+<p><code>prefetch_logical_bytes_per_instance</code> 是一次执行该 checkpoint 前需要恢复的总字节数：
+wrapper 边界保存输入与 selective AC 内部保存结果之和。full AC 通常只有前者；
+selective AC 两部分都可能存在。<code>prefetch_logical_bytes_total</code> 是该 marker 在整个
+训练 step 中所有实例的总回捞流量。开启 AC offload 后，logical bytes 保持不变，
+而 modeled bytes 为 0，表示这些 tensor 不计入设备驻留。</p>
+<p>同一 marker 存在动态 shape 时，所有 <code>*_per_instance</code> 字段为 <code>null</code>，应从
+<code>size_variants</code> 读取各尺寸及出现次数。若 selective 保存值无法可靠匹配 checkpoint
+边界，<code>checkpoint_prefetch_unattributed_{tensor_count,logical_bytes}</code> 会非零；
+此时分层结果不完整，不应直接作为总带宽结论。</p>
+<h3 id="multi_proc_meta">多进程模式（multi_proc_meta）</h3>
+<p>每个 PP stage 进程独立输出到 <code>rank_N/</code> 子目录，<strong>不合并到 Rank 0</strong>：</p>
+<pre><code>simulator_output/&lt;配置名&gt;/
+├── rank_0/                    # PP Stage 0
+│   ├── summary.txt
+│   ├── trace.html
+│   ├── simulation_result.json
+│   ├── kernel_summary/
+│   ├── memory/
+│   └── ir_export/
+│       ├── rank_schedule.csv          # L3: inter-rank schedule
+│       ├── l1_schedule/               # L2: per-stage L1 schedule
+│       │   └── stage_0_l1_schedule.csv
+│       ├── step_forward_l0_ops.csv    # L1: forward L0 ops (MB 0 only)
+│       ├── step_backward_l0_ops.csv   # L1: backward L0 ops (MB 0 only)
+│       └── step_optimizer_l0_ops.csv  # L1: optimizer L0 ops
+├── rank_1/                    # PP Stage 1
+│   └── ...
+├── rank_2/
+│   └── ...
+└── rank_3/
+    └── ...
+</code></pre>
+<blockquote>
+<p>[!NOTE]
+各 stage 的 IR 独立输出，不合并。跨 stage 的调度关系（如 PP P2P send/recv 配对）可通过各 stage 的 <code>execution_timeline</code> 中的 <code>comm_peer_rank</code> 字段自行关联。</p>
+</blockquote>
+<h3 id="kernel_summary">kernel_summary/ 说明</h3>
+<p>将 L0 算子按 <strong>Rank 拆分为独立文件</strong>（<code>rank_0.csv</code>、<code>rank_1.csv</code>、...），每个文件内按<strong>拓扑序排列</strong>（拓扑序相同时以 op_id 升序），每行一个算子。multi_proc 模式下位于 <code>rank_N/kernel_summary/</code> 目录中。</p>
+<table>
+<thead>
+<tr>
+<th>列</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>rank</code></td>
+<td>逻辑 rank 编号（0 ~ world_size-1）</td>
+</tr>
+<tr>
+<td><code>step_type</code></td>
+<td>步骤类型：<code>forward</code> / <code>backward</code> / <code>optimizer</code></td>
+</tr>
+<tr>
+<td><code>step_id</code></td>
+<td>步骤模板 ID</td>
+</tr>
+<tr>
+<td><code>topo_order</code></td>
+<td>在该步骤模板内的拓扑序（从 0 开始，Kahn 算法）</td>
+</tr>
+<tr>
+<td><code>op_id</code></td>
+<td>算子唯一 ID</td>
+</tr>
+<tr>
+<td><code>op_type</code></td>
+<td>规范化算子类型（如 <code>matmul</code>、<code>rms_norm</code>），未映射的显示原始算子名</td>
+</tr>
+<tr>
+<td><code>raw_op_type</code></td>
+<td>原始 dispatcher 算子名（如 <code>aten.addmm.default</code>、<code>npu.npu_rms_norm.default</code>）</td>
+</tr>
+<tr>
+<td><code>inputs_shape</code> / <code>outputs_shape</code></td>
+<td>输入/输出张量 shape，格式 <code>[d0,d1];[d0,d1]</code></td>
+</tr>
+<tr>
+<td><code>inputs_dtype</code> / <code>outputs_dtype</code></td>
+<td>输入/输出 dtype</td>
+</tr>
+<tr>
+<td><code>flops</code> / <code>peak_mem</code> / <code>param_mem</code> / <code>comm_bytes</code></td>
+<td>成本估算</td>
+</tr>
+<tr>
+<td><code>repeat_count</code></td>
+<td>去重折叠的重复次数</td>
+</tr>
+<tr>
+<td><code>module_path</code></td>
+<td>算子所属模块路径（如 <code>layers.2._checkpoint_wrapped_module.moe</code>）</td>
+</tr>
+<tr>
+<td><code>phase</code></td>
+<td>捕获阶段：<code>forward</code> / <code>backward</code> / <code>optimizer</code></td>
+</tr>
+<tr>
+<td><code>execution_kind</code></td>
+<td>实际执行类型：<code>original_forward</code> / <code>recompute</code> / <code>backward</code> / <code>optimizer</code></td>
+</tr>
+<tr>
+<td><code>is_recompute</code></td>
+<td>当前算子是否由 activation checkpoint 在 backward 中实际重放</td>
+</tr>
+<tr>
+<td><code>group_name</code></td>
+<td>解析后的通信维度名（如 <code>tp</code>、<code>ep</code>、<code>fsdp</code>）；无法唯一解析时回退为框架原始组 ID</td>
+</tr>
+<tr>
+<td><code>raw_group_name</code></td>
+<td>框架生成的原始 ProcessGroup 名称（如 <code>3713</code>）</td>
+</tr>
+<tr>
+<td><code>comm_dim</code></td>
+<td><code>group_name</code> 的兼容别名</td>
+</tr>
+<tr>
+<td><code>comm_ranks</code></td>
+<td>通信域包含的 Rank 列表（仅通信算子有值，如 <code>0,1,2,3,...,15</code> 表示这 16 个 rank 属于同一通信组）</td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p>[!NOTE]
+通信算子（<code>allgather</code>、<code>allreduce</code>、<code>reduce_scatter</code>、<code>all_to_all</code>、<code>broadcast</code>）在 L0 图中以 <code>comm.*</code> 前缀的 <code>raw_op_type</code> 注册，同时在 L2 ScheduleGraph 中生成 DataPass。<code>group_name</code> 标识通信所属的并行维度，<code>comm_ranks</code> 列出参与该次通信的具体 Rank。原始组名、Rank 集合和通信原语仍无法唯一确定维度时，<code>group_name</code> 保留 <code>raw_group_name</code>，不会猜测。</p>
+<p>[!NOTE]
+activation checkpoint 重放仍属于 <code>phase=backward</code>，但会被精确标记为
+<code>execution_kind=recompute</code>。该标记来自 PyTorch checkpoint 的重放上下文，
+selective checkpoint 中直接读取已保存结果、没有实际重放的算子不会被标记。
+selective checkpoint 内部被缓存并在重计算阶段复用的 forward tensor 会保留
+原始 use-def 生命周期，并标记为 <code>checkpoint_saved_for_recompute</code>；它们不会按
+full checkpoint 的内部临时值提前释放。</p>
+<p><code>module_path</code> 同时覆盖正常 forward、checkpoint recompute 和模块内部的
+backward 算子。backward 路径由模块输出的梯度边界确定，因此可用于按层汇总
+算子时间；loss、跨层通信等没有唯一模块归属的全局算子可能保持为空。</p>
+<p>[!IMPORTANT]
+大规模仿真（如 2048 die）时，全量展开所有 rank 的 CSV 会非常大（每 rank 数万行）。可通过配置中的 <code>simulation.csv_max_ranks</code> 限制展开的 rank 数量：</p>
+<p>```python</p>
+<h1 id="config_registrypy">在 config_registry.py 的仿真配置函数中，或运行时覆盖：</h1>
+<p>config.simulation.csv_max_ranks = 4  # 只展开前 4 个 rank
+```</p>
+<p>也可通过命令行跳过 CSV 输出：<code>--simulation.output_formats text html dot json</code>（不含 <code>csv</code>）。</p>
+</blockquote>
+<h3 id="summarytxt">summary.txt 示例</h3>
+<pre><code>Workload: 85f74af2e243 (train)
+Iterations: 1 (warmup=0)
+
+[forward] step=forward nodes=70656
+  total_flops=91237669536768  total_peak_mem_bytes=48222492672  total_comm_bytes=0
+  is_acyclic=True
+
+[optimizer] step=optimizer nodes=112
+  total_flops=0  total_peak_mem_bytes=0  total_comm_bytes=0
+  is_acyclic=True
+
+Schedule: 4096 instances, 3416184 data passes
+  dp_degree=16 tp_degree=8 pp_degree=16 pipeline_schedule=1F1B
+  comm[allgather] total_bytes=22314758805504
+  comm[allreduce] total_bytes=552960
+  comm[reduce_scatter] total_bytes=143655866204160
+</code></pre>
+<h2 id="ir">四层 IR 结构</h2>
+<p>输出遵循 <a href="https://github.com/ZhanluModelSim/workload-model-platform/tree/master/spec">workload-model-platform spec</a> 定义的四层 IR。通信算子按其语义归属不同层级（详见 <a href="../../design/schedule-capture-design/">L0-L3 层级归属设计</a>）。</p>
+<table>
+<thead>
+<tr>
+<th>层级</th>
+<th>类名</th>
+<th>文件</th>
+<th>描述</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>L0</td>
+<td><code>OpNode</code></td>
+<td><code>ir/op_node.py</code></td>
+<td>纯计算算子调用：op_type、输入输出 TensorMeta、FLOPs/mem 估算、前后依赖、<code>pp_stage</code>/<code>pp_mb_idx</code>。<strong>不含通信算子</strong></td>
+</tr>
+<tr>
+<td>L1</td>
+<td><code>StepGraph</code></td>
+<td><code>ir/step_graph.py</code></td>
+<td>一个 microbatch 的一个 phase 的计算 DAG（仅 MB 0 捕获）。包含计算算子 + <strong>CP 通信</strong>（attention 内部的 P2P/allgather，作为内部 DataPass）</td>
+</tr>
+<tr>
+<td>L2</td>
+<td><code>ScheduleGraph</code></td>
+<td><code>ir/schedule_graph.py</code></td>
+<td>L1 StepGraph 间的调度依赖：microbatch 排队时序、<strong>PP P2P</strong>（stage 间传递）、<strong>FSDP 通信</strong>（unshard/reshard/allreduce）、依赖关系</td>
+</tr>
+<tr>
+<td>L3</td>
+<td><code>WorkloadGraph</code></td>
+<td><code>ir/workload_graph.py</code></td>
+<td>顶层容器：迭代语义、DataFlow（dataloader 输入）、跨迭代参数传递</td>
+</tr>
+</tbody>
+</table>
+<h3 id="_8">通信算子层级归属</h3>
+<p>通信算子按<strong>调用路径上下文</strong>归属不同层级（不依赖名称匹配，详见 <a href="../../design/schedule-capture-design/">L0-L3 层级归属设计</a>）：</p>
+<table>
+<thead>
+<tr>
+<th>通信类型</th>
+<th>调用入口</th>
+<th>归属</th>
+<th>原因</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>CP P2P (<code>_WindowExchange</code>)</td>
+<td><code>CompressorAttentionCP._pre_hook</code></td>
+<td><strong>L1</strong></td>
+<td>attention forward 的一部分</td>
+</tr>
+<tr>
+<td>CP allgather (<code>_allgather_seq</code>)</td>
+<td><code>CompressorAttentionCP._post_hook</code></td>
+<td><strong>L1</strong></td>
+<td>attention forward 的一部分</td>
+</tr>
+<tr>
+<td>PP P2P (<code>forward_send/recv</code>)</td>
+<td><code>PipelineSchedule._step_microbatches</code></td>
+<td><strong>L2</strong></td>
+<td>stage 间调度依赖</td>
+</tr>
+<tr>
+<td>FSDP allgather (unshard)</td>
+<td><code>FSDPParamGroup.pre_forward</code></td>
+<td><strong>L2</strong></td>
+<td>forward 前参数 unshard</td>
+</tr>
+<tr>
+<td>FSDP reduce_scatter (reshard)</td>
+<td><code>FSDPParamGroup.post_backward</code></td>
+<td><strong>L2</strong></td>
+<td>backward 后参数 reshard</td>
+</tr>
+<tr>
+<td>FSDP allreduce</td>
+<td>梯度同步</td>
+<td><strong>L2</strong></td>
+<td>optimizer 梯度同步</td>
+</tr>
+</tbody>
+</table>
+<p>判定方式：在 <code>meta_env.py</code> 中维护 <code>_comm_layer</code> 上下文变量，由各调用入口的 patch 设置（<code>"L1"</code> 表示模型计算内部，<code>"L2"</code> 表示框架调度层）。<code>_record_comm</code> 读取该变量为每个 CommEvent 标注层级。</p>
+<h3 id="l2-execution_timeline">L2 execution_timeline 说明</h3>
+<p><code>execution_timeline</code> 只包含 <strong>L2 级别</strong>的事件（不含 L0 计算算子和 CP 通信）：</p>
+<table>
+<thead>
+<tr>
+<th>字段</th>
+<th>说明</th>
+<th>来源</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>seq_idx</code></td>
+<td>全局执行序号</td>
+<td>captured</td>
+</tr>
+<tr>
+<td><code>op_id</code></td>
+<td>L0 OpNode ID（MB 0 的计算算子为 -1，因为 L0 不在 L2 timeline 中）</td>
+<td>—</td>
+</tr>
+<tr>
+<td><code>rank</code></td>
+<td>进程 rank</td>
+<td>captured</td>
+</tr>
+<tr>
+<td><code>pipeline_stage</code></td>
+<td>PP stage</td>
+<td>captured</td>
+</tr>
+<tr>
+<td><code>micro_batch_idx</code></td>
+<td>microbatch 序号</td>
+<td>captured</td>
+</tr>
+<tr>
+<td><code>phase</code></td>
+<td>forward / backward / optimizer</td>
+<td>captured</td>
+</tr>
+<tr>
+<td><code>action</code></td>
+<td><code>forward_one_chunk</code> / <code>backward_one_chunk</code> / <code>comm</code></td>
+<td>captured</td>
+</tr>
+<tr>
+<td><code>comm_type</code></td>
+<td>PP/FSDP 通信类型（如 <code>forward_send</code>、<code>allgather</code>、<code>reduce_scatter</code>）</td>
+<td>captured</td>
+</tr>
+<tr>
+<td><code>comm_peer_rank</code></td>
+<td>P2P peer rank</td>
+<td>captured</td>
+</tr>
+</tbody>
+</table>
+<h3 id="l2-datapass">L2 DataPass 说明</h3>
+<p>DataPass 只从 <strong>PP/FSDP 通信</strong>生成（CP 通信在 L1 内部）：</p>
+<table>
+<thead>
+<tr>
+<th>DataPass 类型</th>
+<th>src_instance</th>
+<th>dst_instance</th>
+<th>comm_group_ranks</th>
+<th>语义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>PP P2P</td>
+<td><code>rank{src_stage}</code></td>
+<td><code>rank{dst_rank}</code></td>
+<td><code>[]</code></td>
+<td>stage 间数据传输</td>
+</tr>
+<tr>
+<td>FSDP 集合</td>
+<td><code>rank{caller}</code></td>
+<td><code>group:{dim}</code></td>
+<td><code>[[0,1,...],...]</code></td>
+<td>参数 unshard/reshard/梯度同步</td>
+</tr>
+</tbody>
+</table>
+<h2 id="_9">自定义仿真配置</h2>
+<p>要为其他模型或并行策略创建仿真配置，在 <code>torchtitan_npu/simulator/config_registry.py</code> 中添加新函数：</p>
+<pre><code class="language-python">def my_model_simulate() -&gt; SimulationTrainerConfig:
+    # 1. 调用目标模型的真实训练配置
+    base_config = my_model_debug_config()
+
+    # 2. 如需修改并行策略，用 dataclasses.replace
+    base_config = dataclasses.replace(
+        base_config,
+        parallelism=dataclasses.replace(
+            base_config.parallelism,
+            pipeline_parallel_degree=4,
+            tensor_parallel_degree=2,
+            # ...
+        ),
+    )
+
+    # 3. 只声明模拟总规模；通信模式和其余 degree 在 CLI 解析后生成
+    return _to_simulation_config(
+        base_config,
+        output_dir=&quot;./simulator_output/my_model&quot;,
+        world_size=64,
+    )
+</code></pre>
+<p>关键约束：</p>
+<ul>
+<li>内存跟踪默认开启。可通过 CLI 设置 <code>--simulation.no-enable-memory-tracking</code> 关闭；关闭后不记录内存事件、tensor 生命周期和 FSDP 参数驻留，也不执行静态内存估算。开启时始终导出 <code>&lt;output_dir&gt;/memory/memory_summary.json</code>；只有 <code>output_formats</code> 包含 <code>mem</code> 时才导出详细 trace 和 CSV。</li>
+<li><code>simulation.memory_parameter_storage_dtype</code> 可指定静态本地参数分片的建模驻留 dtype（例如 <code>bfloat16</code>）；原始 dtype 和逻辑大小仍保留在生命周期记录中。</li>
+<li><code>simulation.memory_offload_ac_saved_tensors</code> 可将所有 forward-to-backward 保存激活按零设备驻留建模，覆盖 AC <code>none/full/selective</code>；逐层回捞量见 <code>activation_prefetch</code>，详细非 checkpoint 记录见 <code>activation_offload_tensors.csv</code>。</li>
+<li><code>simulation.world_size</code> 必须等于 <code>dp_replicate × dp_shard × cp × tp × pp</code>；EP/ETP 不额外乘入 dense world size。<code>data_parallel_shard_degree=-1</code> 时由 simulator 根据最终 CLI 配置计算。</li>
+<li><code>pipeline_parallel_degree &gt; 1</code> 时，DeepSeek-V4 不支持 MTP，需设 <code>num_mtp_modules=0</code>。</li>
+<li><code>pipeline_parallel_degree &gt; 1</code> 时，<code>local_batch_size</code> 需 ≥ <code>pp_degree</code>（1F1B 调度需要足够 microbatch）。</li>
+<li>PP &gt; 1 时自动使用 <code>multi_proc_meta</code>；PP=1 时自动使用 <code>fake_backend</code>，配置函数无需编码 mode。</li>
+<li><code>simulated_parallel_degrees</code> 是解析后的兼容快照，由 simulator 自动生成，不应在新配置中手写。</li>
+</ul>
+<h2 id="multi_proc_meta_1">多进程仿真模式（multi_proc_meta）</h2>
+<h3 id="_10">背景：单进程模式的局限</h3>
+<p><code>fake_backend</code> 单进程模式通过 <code>FakeProcessGroup</code> 在一个进程内模拟全部 rank，能正确捕获 TP/CP/EP/FSDP 的集合通信，但 <strong>PP（Pipeline Parallel）的调度逻辑无法真实复刻</strong>——<code>PipelineScheduleSingle</code>（1F1B）要求每个进程只运行一个 stage，单进程内无法模拟多 stage 间的真实 P2P 调度时序。</p>
+<h3 id="pp-fake-pg">方案：PP 用真实多进程，其他维度用 Fake PG</h3>
+<p><code>multi_proc_meta</code> 模式的核心思路是<strong>分层处理</strong>：</p>
+<table>
+<thead>
+<tr>
+<th>维度</th>
+<th>处理方式</th>
+<th>进程数</th>
+<th>ProcessGroup 类型</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>PP</td>
+<td>真实多进程</td>
+<td>PP degree（如 4）</td>
+<td>gloo（真实 rendezvous）</td>
+</tr>
+<tr>
+<td>CP</td>
+<td>Fake PG</td>
+<td>—</td>
+<td>FakeProcessGroup（size=cp_degree）</td>
+</tr>
+<tr>
+<td>FSDP</td>
+<td>Fake PG</td>
+<td>—</td>
+<td>FakeProcessGroup（size=fsdp_degree）</td>
+</tr>
+<tr>
+<td>TP</td>
+<td>Fake PG</td>
+<td>—</td>
+<td>FakeProcessGroup（size=tp_degree）</td>
+</tr>
+<tr>
+<td>EP</td>
+<td>Fake PG</td>
+<td>—</td>
+<td>FakeProcessGroup（size=ep_degree）</td>
+</tr>
+</tbody>
+</table>
+<p>具体来说：
+- 用 <code>torchrun --nproc_per_node=PP</code> 启动 PP 个 gloo 进程，每个进程运行一个 PP stage
+- <code>init_distributed</code> 返回<strong>完整模拟 world_size</strong>（如 PP=4, CP=4, DP=4 → 64），使 <code>ParallelDims._validate()</code> 通过
+- <code>init_device_mesh</code> 创建 size=64 的 world_mesh 时，因 64 &gt; gloo_ws(4)，自动切换到 fake backend
+- world_mesh 的 default group 是一个 size=64 的 <code>FakeProcessGroup</code>
+- 从 world_mesh unflatten 出的子组（CP/FSDP/TP/EP）通过 <code>new_group(backend="fake")</code> 创建，各自有正确的 size 和 rank</p>
+<h3 id="_11">关键技术点</h3>
+<h4 id="1-new_group-size">1. 绕过 <code>new_group</code> 的 size 检查</h4>
+<p>PyTorch 的 <code>_new_group_with_tag</code> 检查 <code>group_world_size &lt;= global_world_size</code>。当 gloo world_size=4 但需要创建 size=16 的 FSDP 子组时，此检查会失败。</p>
+<p><code>_patch_new_group_for_fake_backend()</code> 在 <code>_is_meta_simulation=True</code> 且调用方明确请求 <code>backend="fake"</code> 时，如果检测到 <code>group_ws &gt; gloo_ws</code> 或 <code>rank &gt;= gloo_ws</code>，直接调用 <code>_new_process_group_helper</code> 创建并注册 <code>FakeProcessGroup</code>，只绕过逻辑 rank 超出真实 gloo world 的检查。</p>
+<h4 id="2-fake-mesh-device-handle">2. Fake mesh 的 device handle</h4>
+<p>当 <code>device_type="fake"</code> 时，<code>_get_device_handle("fake")</code> 返回 <code>getattr(torch, "fake", None)</code>。Simulator 将 <code>torch.fake</code> 指向与 <code>torch.meta</code> 相同的 <code>_MetaDeviceModule</code> stub，使 <code>device_count()</code>、<code>current_device()</code> 等调用返回安全默认值。</p>
+<p>同时 patch 了：
+- <code>DeviceMesh._setup_world_group_and_device</code>：跳过 fake mesh 的真实 world-size 限制；各维度 FakeProcessGroup 随后由 <code>_init_process_groups()</code> 正式创建和注册
+- <code>FSDP._get_device_from_mesh</code>：对 fake mesh 返回 <code>torch.device("meta")</code>
+- <code>DTensor._random._resolve_device</code>：对 fake mesh 返回 <code>torch.device("meta")</code></p>
+<h4 id="3-cp-p2p">3. CP P2P 通信捕获</h4>
+<p>DeepSeek-V4 的 CP 使用 <code>CompressorAttentionCP</code>，包含两类通信：
+- <code>_WindowExchange</code>：P2P <code>c10d.isend/irecv</code> 在相邻 CP rank 间交换序列窗口
+- <code>_allgather_seq</code>：<code>funcol.all_gather_tensor_autograd</code> 聚合压缩后的 KV</p>
+<p><code>_meta_safe_forward</code> patch 在短路 P2P 前，通过 <code>get_active_recorder()</code> 获取当前 <code>CommEventRecorder</code>，调用 <code>_record_comm_with_l0()</code> 记录 <code>cp_forward_send/recv</code> 和 <code>cp_backward_send/recv</code> 事件，确保 CP P2P 通信出现在 L0 图中。</p>
+<h4 id="4-pp">4. PP 元数据交换</h4>
+<p>PP stage 间的 tensor shape/dtype 元数据通过 <code>PipelineStage._send_meta/_recv_meta</code> 交换。在 multi_proc 模式下，这些使用 gloo 的 <code>send_object_list/recv_object_list</code> 真实传递（不被 comm_events 拦截器 no-op），保证 DYNAMIC 模式的 shape 推断正确。</p>
+<h3 id="_12">运行方式</h3>
+<pre><code class="language-bash"># PP=4 + CP=4：解析最终配置后自动启动 4 个 gloo 进程，模拟 64 rank
+python3 scripts/run_simulator_spawn.py \
+    --config deepseek_v4_pro_simulate_16_layers_pp4_cp4 \
+    --hf_assets_path ./tests/assets/tokenizer/deepseekv3_tokenizer
+</code></pre>
+<p>高级用法可以直接使用 <code>torchrun</code>，但进程数在 Python 解析配置前已经确定，因此必须由调用方保证 <code>--nproc_per_node</code> 等于 CLI 覆盖后的最终 PP degree。</p>
+<blockquote>
+<p>[!IMPORTANT]
+- <code>--nproc_per_node</code> 必须等于 PP degree（如 PP=4 则 4 个进程）
+- 外部 gloo 进程的 <code>RANK</code> 必须连续取 <code>0..PP-1</code>，且 <code>WORLD_SIZE=PP</code>。例如 PP=4 时使用
+  <code>RANK=0,1,2,3</code>；<code>0,16,32,48</code> 这类值只是完整逻辑 mesh 中各 PP stage 的代表 rank，
+  由 simulator 内部映射，不能作为 gloo 的进程 <code>RANK</code>
+- <code>simulation.world_size</code>（或作为回退的 <code>NGPU</code>）必须等于完整模拟 world_size（如 PP=4 × CP=4 × DP=4 = 64）
+- 配置中 <code>context_parallel_degree</code> 等设为真实值（非 1），<code>data_parallel_shard_degree=-1</code> 自动计算
+- <code>simulated_parallel_degrees</code> 和 <code>TORCHTITAN_SIM_WORLD_SIZE</code> 由解析后的 runtime 自动生成
+- <code>run_simulator_spawn.py</code> 只会在全部 PP rank 成功退出、各自抓到本 stage 的前反向 template 并完成输出后报告成功；
+  任一 rank 失败、缺失或重复都会使启动器返回失败</p>
+</blockquote>
+<h3 id="_13">输出</h3>
+<p>每个 PP stage 进程独立捕获自己的 L0-L3 IR，<strong>直接以 rank ID 输出</strong>到 <code>rank_N/</code> 目录，不合并到 Rank 0。各 stage 的 IR 独立完整，包含：</p>
+<ul>
+<li><code>step_forward_l0_ops.csv</code> / <code>step_backward_l0_ops.csv</code> / <code>step_optimizer_l0_ops.csv</code>：L0 算子（仅 MB 0 捕获）</li>
+<li><code>l1_schedule/stage_N_l1_schedule.csv</code>：L2 调度时序（所有 microbatch）</li>
+<li><code>rank_schedule.csv</code>：L3 inter-rank 调度关系</li>
+<li><code>simulation_result.json</code>：完整四层 IR（含 <code>pp_stage</code>/<code>pp_mb_idx</code> annotations）</li>
+</ul>
+<h3 id="_14">通信捕获验证</h3>
+<p>PP=4+CP=4 配置下，每个 stage 的通信捕获情况：</p>
+<table>
+<thead>
+<tr>
+<th>通信类型</th>
+<th>来源</th>
+<th>每 stage 数量</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>CP allgather</td>
+<td><code>_allgather_seq</code></td>
+<td>20-39 (fwd) + 8-14 (bwd)</td>
+<td>kv_compress + k_indexer 的 all_gather</td>
+</tr>
+<tr>
+<td>CP P2P send/recv</td>
+<td><code>_WindowExchange</code></td>
+<td>3-22 (fwd) + 4-11 (bwd)</td>
+<td>相邻 CP rank 间的序列窗口交换</td>
+</tr>
+<tr>
+<td>FSDP allgather</td>
+<td>FSDP2 unshard</td>
+<td>含在 allgather 中</td>
+<td>forward + pre-backward 参数 unshard</td>
+</tr>
+<tr>
+<td>FSDP reduce_scatter</td>
+<td>FSDP2 reshard</td>
+<td>4-5 (bwd)</td>
+<td>post-backward 参数 reshard</td>
+</tr>
+<tr>
+<td>FSDP allreduce</td>
+<td>梯度同步</td>
+<td>1 (opt)</td>
+<td>optimizer 阶段梯度 allreduce</td>
+</tr>
+<tr>
+<td>PP P2P</td>
+<td>1F1B 调度</td>
+<td>含在 P2P 中</td>
+<td>stage 间 activation/gradient 传递</td>
+</tr>
+</tbody>
+</table>
+<h3 id="microbatch">Microbatch 分层捕获</h3>
+<table>
+<thead>
+<tr>
+<th>Microbatch</th>
+<th>L0 (OpNode)</th>
+<th>L1 (StepGraph)</th>
+<th>L2 (Timeline)</th>
+<th>L3 (CommEvent)</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>MB 0</td>
+<td>✅ 完整捕获</td>
+<td>✅ 从 L0 构建</td>
+<td>✅ 完整 timeline</td>
+<td>✅ 完整捕获</td>
+</tr>
+<tr>
+<td>MB 1+</td>
+<td>❌ 跳过 (pass-through)</td>
+<td>❌ 跳过</td>
+<td>✅ 只捕获调度事件</td>
+<td>✅ 完整捕获</td>
+</tr>
+<tr>
+<td>Optimizer</td>
+<td>✅ 完整捕获</td>
+<td>✅ 从 L0 构建</td>
+<td>✅ 完整 timeline</td>
+<td>✅ 完整捕获</td>
+</tr>
+</tbody>
+</table>
+<p>L0/L1 捕获开销从 O(PP × num_mb × ops_per_mb) 降为 O(ops_per_mb)，与 microbatch 数量无关。</p>
+<p>PP 内存估算不会只使用 MB 0 的曲线。它以完整捕获的 <code>(stage, comp_type)</code> raw memory
+events 为模板，按照 L2 <code>SchedulePlan</code> 的通用 action 顺序实例化每个 microbatch；支持
+F/B、I/W、<code>OVERLAP_F_B</code> 等 action 组合，不依赖特定 1F1B 名称。每个实例获得独立的
+非持久 tensor ID，参数和 buffer 保持单实例，FSDP 显式 unshard/reshard 驻留事件也不会
+按 microbatch 重复克隆。L0/L1 展示图仍保持折叠，因此不会因 microbatch 数量显著膨胀。</p>
+<p><code>ScheduleAction.schedule_order</code> 表示 pipeline plan 的逻辑顺序；<code>seq_idx</code> 保留其抓图来源
+位置。两者不能混排，尤其是 DualPipeV 等包含通信、虚拟 stage 和 overlap action 的调度。</p>
+<h3 id="_15">资源消耗</h3>
+<table>
+<thead>
+<tr>
+<th>配置</th>
+<th>进程数</th>
+<th>每进程内存</th>
+<th>总内存</th>
+<th>耗时</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>PP=4, CP=4, 16层</td>
+<td>4</td>
+<td>~200MB</td>
+<td>~1GB</td>
+<td>~4s</td>
+</tr>
+<tr>
+<td>PP=16, 61层</td>
+<td>16</td>
+<td>~300MB</td>
+<td>~5GB</td>
+<td>~30s</td>
+</tr>
+<tr>
+<td>PP=16, TP=8, CP=4, EP=128, 61层</td>
+<td>16</td>
+<td>~500MB</td>
+<td>~8GB</td>
+<td>~2min</td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p>[!TIP]
+模型全程在 meta device 上运行，零显存分配。内存主要消耗在 Python 对象（OpNode、CommEvent 等），与模型层数和 op 数量成正比。</p>
+</blockquote>
+<h2 id="_16">工作目录结构</h2>
+<pre><code>torchtitan_npu/simulator/
+├── config_registry.py        # 仿真配置工厂函数
+├── trainer.py                # SimulationTrainer：一步训练 + 捕获 + 导出
+├── meta_env.py               # Meta device 替身层 + multi_proc patch + PP context
+├── moe_force_balance.py      # 强制 MoE 负载均衡
+├── rank_table.py             # 从 ParallelDims/DeviceMesh 展开通信域（RankTable）
+├── ir/                       # 四层 IR dataclass
+│   ├── op_node.py            #   L0 OpNode (含 pp_stage/pp_mb_idx)
+│   ├── step_graph.py         #   L1 StepGraph (MB 0 only)
+│   ├── schedule_graph.py     #   L2 ScheduleGraph (TimelineEntry/DataPass/StepInstance)
+│   └── workload_graph.py     #   L3 WorkloadGraph
+├── capture/                  # 捕获管线
+│   ├── dispatch_capture.py   #   TorchDispatchMode 算子级捕获 (含 _capture_l0 pass-through)
+│   ├── comm_events.py        #   集合通信拦截 + CommEvent + timeline_events
+│   ├── step_boundary.py      #   forward/backward/optimizer 边界识别
+│   ├── schedule_builder.py   #   组装 L2 (从 OpNode+CommEvent 直接映射，无推断)
+│   └── workload_builder.py   #   组装 L3 WorkloadGraph
+├── cost/
+│   └── op_cost_model.py      # NPU 算子 FLOPs/mem/comm_bytes 估算
+├── hardware_shims/           # 硬件依赖算子的 meta 影子实现
+│   ├── mhc_converter.py      #   MHC 算子（hc_pre/hc_head/hc_post）
+│   └── smla_converter.py     #   SMLA 算子（sparse_attn/lightning_indexer）
+└── viz/                      # 可视化导出
+    ├── json_export.py        #   JSON (orjson 加速)
+    ├── html_export.py        #   HTML L3→L2→L1→L0 层级展开
+    ├── dot_export.py
+    └── text_summary.py
+</code></pre>
+<h2 id="_17">常见问题</h2>
+<h3 id="q-filenotfounderror-tokenizer-path">Q: 仿真报错 FileNotFoundError: tokenizer path 相关</h3>
+<p>DeepSeek-V4-Pro 配置默认引用 <code>./tests/assets/tokenizer/deepseek_v4_pro_tokenizer</code>，该目录未随仓库提交。解决方法：运行时追加 <code>--hf_assets_path ./tests/assets/tokenizer/deepseekv3_tokenizer</code>，用仓库内置的 v3 tokenizer 替代（Simulator 在 meta device 上运行，不关心词表内容，详见"快速开始 → 准备 Tokenizer"章节）。</p>
+<h3 id="q-inductor_npu_ext-is-not-available">Q: 仿真报错 "inductor_npu_ext is not available"</h3>
+<p>仿真配置已自动强制 <code>compile.enable=False</code>，如果仍报此错，检查是否在 <code>config_registry.py</code> 之外手动传了 <code>--compile.enable=True</code>。</p>
+<h3 id="q-narrow-unexpectedly-changed-concrete-size">Q: 仿真报错 "narrow unexpectedly changed concrete size"</h3>
+<p>这是 DTensor 重分布在 meta device 下的 shape 不一致问题，<code>meta_env.py</code> 中的 <code>_patch_redistribute_local_tensor_for_meta</code> 已处理。如果仍出现，确认 <code>patch_device_type_to_meta()</code> 已被调用（<code>SimulationTrainer.__init__</code> 会自动调用）。</p>
+<h3 id="q-pp-1-expected-_stagebackwardmeta-from-p2p">Q: PP &gt; 1 时仿真报错 "Expected _StageBackwardMeta from P2P"</h3>
+<p>Pipeline 并行下，<code>meta_env.py</code> 中的 <code>_patch_pipeline_stage_meta_exchange_for_fake_pg</code> 会将 PP 元数据交换从 P2P 改为进程内共享缓冲区，并强制 STATIC 推断模式。确认该 patch 已生效。</p>
+<h3 id="q-rank">Q: 如何查看特定 rank 的通信详情</h3>
+<p>multi_proc 模式下，各 stage 的 <code>rank_N/ir_export/rank_schedule.csv</code> 和 <code>rank_N/simulation_result.json</code> 中的 <code>data_passes</code> 列表包含每条通信的 <code>src_instance</code>/<code>dst_instance</code>/<code>comm_primitive</code>/<code>comm_group_ranks</code>，可按 rank ID 过滤查看。跨 stage 的 P2P 配对可通过 <code>comm_peer_rank</code> 字段关联。</p>
+<h3 id="q-forward-backward">Q: forward 和 backward 的算子数量差异很大</h3>
+<p>这是正常的。DeepSeek-V4 的 MoE 模型在 forward 中有大量的 shape 操作（view、unsqueeze、slice 等）用于 attention 和 MoE 的 reshape，而 backward 不需要重复所有 shape 操作。此外，activation checkpointing 的 recomputation 算子已正确放在 backward template 中（通过 <code>_pp_context["phase"]</code> 检测）。</p>
+<h3 id="q">Q: 仿真耗时过长</h3>
+<p>61 层 / 2048 die 的完整仿真（含 JSON 导出）约需 2-3 分钟。如果只需摘要和 HTML，可在配置中设置 <code>simulation.output_formats=["text", "html"]</code> 跳过 JSON 导出（JSON 文件在千卡规模下可达 GB 级）。Microbatch 分层捕获已将 L0 开销降为与 microbatch 数量无关。</p>
+              
+            </div>
+          </div><footer>
+    <div class="rst-footer-buttons" role="navigation" aria-label="Footer Navigation">
+        <a href="../quickstart/" class="btn btn-neutral float-left" title="快速上手"><span class="icon icon-circle-arrow-left"></span> Previous</a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <!-- Copyright etc -->
+  </div>
+
+  Built with <a href="https://www.mkdocs.org/">MkDocs</a> using a <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a> provided by <a href="https://readthedocs.org">Read the Docs</a>.
+</footer>
+          
+        </div>
+      </div>
+
+    </section>
+
+  </div>
+
+  <div class="rst-versions" role="note" aria-label="Versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    
+    
+      <span><a href="../quickstart/" style="color: #fcfcfc">&laquo; Previous</a></span>
+    
+    
+  </span>
+</div>
+    <script src="../../js/jquery-3.6.0.min.js"></script>
+    <script>var base_url = "../..";</script>
+    <script src="../../js/theme_extra.js"></script>
+    <script src="../../js/theme.js"></script>
+    <script>
+        jQuery(function () {
+            SphinxRtdTheme.Navigation.enable(true);
+        });
+    </script>
+
+</body>
+</html>

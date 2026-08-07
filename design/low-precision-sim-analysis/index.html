@@ -1,0 +1,425 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" >
+<head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+      <link rel="shortcut icon" href="../../img/favicon.ico" />
+    <title>低精度训练（MXFP8）Simulator 使能分析 - torchtitan-npu</title>
+    <link rel="stylesheet" href="../../css/theme.css" />
+    <link rel="stylesheet" href="../../css/theme_extra.css" />
+        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/styles/github.min.css" />
+    
+      <script>
+        // Current page data
+        var mkdocs_page_name = "\u4f4e\u7cbe\u5ea6\u8bad\u7ec3\uff08MXFP8\uff09Simulator \u4f7f\u80fd\u5206\u6790";
+        var mkdocs_page_input_path = "design/low-precision-sim-analysis.md";
+        var mkdocs_page_url = null;
+      </script>
+    
+    <!--[if lt IE 9]>
+      <script src="../../js/html5shiv.min.js"></script>
+    <![endif]-->
+      <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/highlight.min.js"></script>
+      <script>hljs.highlightAll();</script> 
+</head>
+
+<body class="wy-body-for-nav" role="document">
+
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side stickynav">
+    <div class="wy-side-scroll">
+      <div class="wy-side-nav-search">
+          <a href="../.." class="icon icon-home"> torchtitan-npu
+        </a>
+      </div>
+
+      <div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <ul>
+                <li class="toctree-l1"><a class="reference internal" href="../..">Home</a>
+                </li>
+              </ul>
+              <ul>
+                <li class="toctree-l1"><a class="reference internal" href="../../lint_guide/">Lint 指南</a>
+                </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Community</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../community/contributors/">提交者与贡献者（Committers and Contributors）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../community/governance/">社区治理</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../community/versioning_policy/">版本策略</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Design</span></p>
+              <ul class="current">
+                  <li class="toctree-l1"><a class="reference internal" href="../1f1b-schedule-plan-assembly-guide/">1F1B 完整依赖组装与 DES 回放实现指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../alltoall-capture-analysis/">all_to_all 通信捕获缺失分析</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../communication-ownership-contract/">Communication Ownership Contract</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../dualpipev-schedule-plan-consumer-guide/">DualPipeV SchedulePlan 下游接入指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../l2-l3-schedule-plan-design/">L2/L3 调度 IR 重构设计：从扁平 trace 到结构化 SchedulePlan</a>
+                  </li>
+                  <li class="toctree-l1 current"><a class="reference internal current" href="#">低精度训练（MXFP8）Simulator 使能分析</a>
+    <ul class="current">
+    <li class="toctree-l2"><a class="reference internal" href="#1">1. 目标</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#2">2. 当前状态</a>
+        <ul>
+    <li class="toctree-l3"><a class="reference internal" href="#21-mxfp8">2.1 MXFP8 在真实训练中的工作方式</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#22-simulator">2.2 Simulator 中的问题</a>
+    </li>
+        </ul>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#3">3. 方案</a>
+        <ul>
+    <li class="toctree-l3"><a class="reference internal" href="#31">3.1 核心思路</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#32">3.2 具体改动</a>
+        <ul>
+    <li class="toctree-l4"><a class="reference internal" href="#321">3.2.1 绕过硬件检查</a>
+    </li>
+    <li class="toctree-l4"><a class="reference internal" href="#322-meta-kernel">3.2.2 使用真实 meta kernel</a>
+    </li>
+    <li class="toctree-l4"><a class="reference internal" href="#323-selective-ac">3.2.3 Selective AC</a>
+    </li>
+    <li class="toctree-l4"><a class="reference internal" href="#324-torchao">3.2.4 安装 torchao</a>
+    </li>
+        </ul>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#33">3.3 捕获的算子</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#34">3.4 通信量变化</a>
+    </li>
+        </ul>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#4">4. 实施计划</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#5">5. 验证标准</a>
+    </li>
+    </ul>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../optimizer-ops-analysis/">优化器算子捕获问题分析</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../pipeline-multi-graph-capture-design/">复杂 Pipeline 策略下完整计算图捕获方案设计</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../pp-l2-capture-architecture/">PP L2 Capture Architecture</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../schedule-capture-design/">L0-L3 IR 层级归属设计</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../schedule-plan-dependency-reconstruction-contract/">SchedulePlan 下游依赖重建契约</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../schedule-plan-des-consumer-guide/">SchedulePlan 依赖重建与 DES 消费指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../simulator-memory-model-design/">Simulator Memory Model 改造设计</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Feature guides</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/checkpoint/">Checkpoint 使用指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/deepseek_v32_mtp/">多Token预测特性(Multi Token Prediction, MTP)</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/low_precision_training/">低精度训练特性（MXFP8）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/metrics_and_debugging/">调试支持特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/model_custom/">Model Custom框架介绍</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/muon_optimizer/">Muon 优化器特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/new_model_onboarding/">新模型接入开发流程</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/npu_fused_ops/">NPU 融合算子适配</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/swap_optimizer/">SwapOptimizer 特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/torch_compile/">torch.compile 支持</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/virtual_optimizer/">Virtual Optimizer - 优化器显存虚拟化特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/vlm/">VLM NPU 支持</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" >Parallelism</a>
+    <ul>
+                <li class="toctree-l2"><a class="reference internal" href="../../feature_guides/parallelism/custom_cp/">自定义 Context Parallel 特性</a>
+                </li>
+    </ul>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Recipe</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../recipe/sft/">SFT 指令微调</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Superpowers</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" >Plans</a>
+    <ul>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/plans/2026-07-01-mhc-real-op-name-capture-implementation/">MHC Real-Op-Name Capture Implementation Plan</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/plans/2026-07-01-npu-simulator-implementation/">torchtitan_npu Simulator Implementation Plan</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/plans/2026-07-01-smla-real-op-name-capture-implementation/">SMLA Real-Op-Name Capture Implementation Plan</a>
+                </li>
+    </ul>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" >Specs</a>
+    <ul>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/specs/2026-07-01-mhc-real-op-name-capture-design/">MHC 真实算子名捕获 — 架构与方案设计（阶段一：MHC）</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/specs/2026-07-01-npu-simulator-design/">torchtitan_npu Simulator — 架构与方案设计</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/specs/2026-07-01-smla-real-op-name-capture-design/">SMLA 真实算子名捕获 — 架构与方案设计（阶段二：SMLA）</a>
+                </li>
+    </ul>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Test guides</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../test_guides/model_acceptance/">新模型最终验收规范（Meta 模拟器）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../test_guides/test_design/">测试设计</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../test_guides/test_guide/">测试使用指南</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">User guides</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/deepseek_v4_model_parameters/">DeepSeek-V4 模型参数 Web 字段目录</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/installation/">软件安装</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/quickstart/">快速上手</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/simulator/">Simulator 使用指南</a>
+                  </li>
+              </ul>
+      </div>
+    </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap">
+      <nav class="wy-nav-top" role="navigation" aria-label="Mobile navigation menu">
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../..">torchtitan-npu</a>
+        
+      </nav>
+      <div class="wy-nav-content">
+        <div class="rst-content"><div role="navigation" aria-label="breadcrumbs navigation">
+  <ul class="wy-breadcrumbs">
+    <li><a href="../.." class="icon icon-home" aria-label="Docs"></a></li>
+          <li class="breadcrumb-item">Design</li>
+      <li class="breadcrumb-item active">低精度训练（MXFP8）Simulator 使能分析</li>
+    <li class="wy-breadcrumbs-aside">
+    </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+            <div class="section" itemprop="articleBody">
+              
+                <h1 id="mxfp8simulator">低精度训练（MXFP8）Simulator 使能分析</h1>
+<blockquote>
+<p>分支：feat/low-precision-sim
+日期：2026-07-10</p>
+</blockquote>
+<h2 id="1">1. 目标</h2>
+<p>在 simulator 中启用 MXFP8 低精度训练特性，使捕获的 IR 中包含 MXFP8 量化算子（<code>npu_dynamic_mx_quant</code>、<code>npu_quant_matmul</code>、<code>npu_grouped_matmul</code>），而非普通的 <code>aten.mm</code>/<code>aten.addmm</code>。</p>
+<h2 id="2">2. 当前状态</h2>
+<h3 id="21-mxfp8">2.1 MXFP8 在真实训练中的工作方式</h3>
+<pre><code>MXFP8Converter.convert(model)
+  → 对 fqns 匹配的 nn.Linear 权重包装为 MXFP8TrainingWeightWrapperTensor
+  → forward 时 __torch_function__ 拦截 matmul
+    → _to_mxfp8_then_scaled_mm (被 NPU patch 替换为 NpuMXFP8MM.apply)
+      → NpuMXFP8MM.forward:
+          x_mxfp8 = torch_npu.npu_dynamic_mx_quant(x)     ← 量化
+          weight_mxfp8 = torch_npu.npu_dynamic_mx_quant(w)  ← 量化
+          output = torch_npu.npu_quant_matmul(x_mxfp8, w_mxfp8)  ← FP8 matmul
+      → NpuMXFP8MM.backward:
+          (同上，dx 和 dw 都在 FP8 精度下计算)
+</code></pre>
+<h3 id="22-simulator">2.2 Simulator 中的问题</h3>
+<table>
+<thead>
+<tr>
+<th>问题</th>
+<th>原因</th>
+<th>影响</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>has_mx_capability</code> 检查 NPU 硬件</td>
+<td><code>get_npu_device_type()</code> 返回 "UNKNOWN"（无真实 NPU）</td>
+<td>MXFP8Converter 初始化时 raise RuntimeError</td>
+</tr>
+<tr>
+<td>torchao 未安装</td>
+<td>容器中无 torchao</td>
+<td>patches 被跳过</td>
+</tr>
+</tbody>
+</table>
+<h2 id="3">3. 方案</h2>
+<h3 id="31">3.1 核心思路</h3>
+<p>保留真实的 <code>NpuMXFP8MM</code> 和 <code>NpuMXFP8GroupedMM</code> autograd 实现。当前
+<code>npu_dynamic_mx_quant</code>、<code>npu_quant_matmul</code> 和 <code>npu_grouped_matmul</code> 均已提供
+meta kernel，可直接完成 shape 推导并被 dispatcher capture、selective AC policy
+和 memory tracker 共同观察。Simulator 仅绕过无真实硬件时的 capability 检查。</p>
+<h3 id="32">3.2 具体改动</h3>
+<h4 id="321">3.2.1 绕过硬件检查</h4>
+<p>在 <code>meta_env.py</code> 中 patch <code>has_mx_capability</code>，在 <code>_is_meta_simulation=True</code> 时直接返回 <code>True</code>：</p>
+<pre><code class="language-python">def _patch_mx_capability_check_for_meta():
+    from torchtitan_npu.patches.torchao_npu import mx_capability_check
+    orig = mx_capability_check.has_mx_capability
+    def _meta_safe_has_mx_capability(major, minor):
+        if _is_meta_simulation:
+            return True
+        return orig(major, minor)
+    # patch
+</code></pre>
+<h4 id="322-meta-kernel">3.2.2 使用真实 meta kernel</h4>
+<p><code>meta_env.py</code> 不替换 torchao 的 <code>_to_mxfp8_then_scaled_mm</code> 或
+<code>_to_mxfp8_then_scaled_grouped_mm</code>。NPU patch 中的 autograd function 直接在
+meta tensor 上执行，因此捕获结果与真实训练使用同一组 dispatcher op。</p>
+<h4 id="323-selective-ac">3.2.3 Selective AC</h4>
+<p>DeepSeek V4 的 selective AC 扩展保存以下高计算量算子的输出：</p>
+<ul>
+<li><code>aten._grouped_mm.default</code></li>
+<li><code>npu.npu_quant_matmul.default</code></li>
+<li><code>npu.npu_grouped_matmul.default</code></li>
+</ul>
+<p>量化算子仍然重计算，避免保存 FP8 tensor 和 scale 带来的额外驻留。</p>
+<h4 id="324-torchao">3.2.4 安装 torchao</h4>
+<p>容器中需要安装 <code>torchao</code>。已安装 <code>torchao==0.17.0</code>。</p>
+<h3 id="33">3.3 捕获的算子</h3>
+<p>启用 MXFP8 后，simulator 捕获的 L0 算子将变化：</p>
+<table>
+<thead>
+<tr>
+<th>位置</th>
+<th>不启用 MXFP8</th>
+<th>启用 MXFP8</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Linear forward</td>
+<td><code>aten.mm.default</code></td>
+<td><code>npu.npu_dynamic_mx_quant.default</code> × 2 + <code>npu.npu_quant_matmul.default</code></td>
+</tr>
+<tr>
+<td>Linear backward</td>
+<td><code>aten.mm.default</code> (dx, dw)</td>
+<td><code>npu.npu_dynamic_mx_quant.default</code> × 2 + <code>npu.npu_quant_matmul.default</code> (dx, dw)</td>
+</tr>
+<tr>
+<td>MoE forward</td>
+<td><code>npu.npu_grouped_matmul.default</code></td>
+<td><code>npu.npu_dynamic_mx_quant.default</code> × 2 + <code>npu.npu_grouped_matmul.default</code></td>
+</tr>
+<tr>
+<td>MoE backward</td>
+<td><code>npu.npu_grouped_matmul.default</code></td>
+<td>同上</td>
+</tr>
+</tbody>
+</table>
+<h3 id="34">3.4 通信量变化</h3>
+<p>MXFP8 将 matmul 的输入从 BF16（2 bytes/element）降为 FP8（1 byte/element），通信量减半：
+- FSDP allgather 的参数量减半（FP8 vs BF16）
+- 但量化 scale 额外传输（每 32 元素 1 byte scale，约 3% 额外开销）</p>
+<h2 id="4">4. 实施计划</h2>
+<table>
+<thead>
+<tr>
+<th>步骤</th>
+<th>文件</th>
+<th>改动</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1</td>
+<td><code>meta_env.py</code></td>
+<td>patch <code>has_mx_capability</code> 在 meta 模式下返回 True</td>
+</tr>
+<tr>
+<td>2</td>
+<td><code>models/deepseek_v4/activation_checkpoint.py</code></td>
+<td>扩展 selective AC 保存算子</td>
+</tr>
+<tr>
+<td>3</td>
+<td><code>config_registry.py</code></td>
+<td>添加 MXFP8 仿真配置</td>
+</tr>
+<tr>
+<td>4</td>
+<td>测试</td>
+<td>验证真实 NPU op 的捕获和重计算行为</td>
+</tr>
+</tbody>
+</table>
+<h2 id="5">5. 验证标准</h2>
+<ol>
+<li><strong>MXFP8Converter 初始化成功</strong>：不报硬件检查错误</li>
+<li><strong>捕获的 L0 算子变化</strong>：Linear 层的 <code>aten.mm</code> 被替换为 <code>npu.npu_dynamic_mx_quant</code> + <code>npu.npu_quant_matmul</code></li>
+<li><strong>MoE 专家层</strong>：<code>npu.npu_grouped_matmul</code> 前有 <code>npu.npu_dynamic_mx_quant</code> 量化算子</li>
+<li><strong>shape 正确</strong>：matmul 输出 shape 与不启用 MXFP8 时一致</li>
+<li><strong>backward 正确</strong>：dx 和 dw 的 shape 正确</li>
+<li><strong>selective AC 正确</strong>：三个高计算量 matmul 不出现在 recompute，量化算子仍在 recompute</li>
+</ol>
+              
+            </div>
+          </div><footer>
+    <div class="rst-footer-buttons" role="navigation" aria-label="Footer Navigation">
+        <a href="../l2-l3-schedule-plan-design/" class="btn btn-neutral float-left" title="L2/L3 调度 IR 重构设计：从扁平 trace 到结构化 SchedulePlan"><span class="icon icon-circle-arrow-left"></span> Previous</a>
+        <a href="../optimizer-ops-analysis/" class="btn btn-neutral float-right" title="优化器算子捕获问题分析">Next <span class="icon icon-circle-arrow-right"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <!-- Copyright etc -->
+  </div>
+
+  Built with <a href="https://www.mkdocs.org/">MkDocs</a> using a <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a> provided by <a href="https://readthedocs.org">Read the Docs</a>.
+</footer>
+          
+        </div>
+      </div>
+
+    </section>
+
+  </div>
+
+  <div class="rst-versions" role="note" aria-label="Versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    
+    
+      <span><a href="../l2-l3-schedule-plan-design/" style="color: #fcfcfc">&laquo; Previous</a></span>
+    
+    
+      <span><a href="../optimizer-ops-analysis/" style="color: #fcfcfc">Next &raquo;</a></span>
+    
+  </span>
+</div>
+    <script src="../../js/jquery-3.6.0.min.js"></script>
+    <script>var base_url = "../..";</script>
+    <script src="../../js/theme_extra.js"></script>
+    <script src="../../js/theme.js"></script>
+    <script>
+        jQuery(function () {
+            SphinxRtdTheme.Navigation.enable(true);
+        });
+    </script>
+
+</body>
+</html>

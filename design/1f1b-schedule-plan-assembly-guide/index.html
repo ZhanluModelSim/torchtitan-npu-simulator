@@ -1,0 +1,762 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" >
+<head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+      <link rel="shortcut icon" href="../../img/favicon.ico" />
+    <title>1F1B 完整依赖组装与 DES 回放实现指南 - torchtitan-npu</title>
+    <link rel="stylesheet" href="../../css/theme.css" />
+    <link rel="stylesheet" href="../../css/theme_extra.css" />
+        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/styles/github.min.css" />
+    
+      <script>
+        // Current page data
+        var mkdocs_page_name = "1F1B \u5b8c\u6574\u4f9d\u8d56\u7ec4\u88c5\u4e0e DES \u56de\u653e\u5b9e\u73b0\u6307\u5357";
+        var mkdocs_page_input_path = "design/1f1b-schedule-plan-assembly-guide.md";
+        var mkdocs_page_url = null;
+      </script>
+    
+    <!--[if lt IE 9]>
+      <script src="../../js/html5shiv.min.js"></script>
+    <![endif]-->
+      <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/highlight.min.js"></script>
+      <script>hljs.highlightAll();</script> 
+</head>
+
+<body class="wy-body-for-nav" role="document">
+
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side stickynav">
+    <div class="wy-side-scroll">
+      <div class="wy-side-nav-search">
+          <a href="../.." class="icon icon-home"> torchtitan-npu
+        </a>
+      </div>
+
+      <div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <ul>
+                <li class="toctree-l1"><a class="reference internal" href="../..">Home</a>
+                </li>
+              </ul>
+              <ul>
+                <li class="toctree-l1"><a class="reference internal" href="../../lint_guide/">Lint 指南</a>
+                </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Community</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../community/contributors/">提交者与贡献者（Committers and Contributors）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../community/governance/">社区治理</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../community/versioning_policy/">版本策略</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Design</span></p>
+              <ul class="current">
+                  <li class="toctree-l1 current"><a class="reference internal current" href="#">1F1B 完整依赖组装与 DES 回放实现指南</a>
+    <ul class="current">
+    <li class="toctree-l2"><a class="reference internal" href="#1">1. 最终目标</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#2">2. 当前实现中必须先修正的问题</a>
+        <ul>
+    <li class="toctree-l3"><a class="reference internal" href="#21-reduce-scatter-reshard">2.1 reduce-scatter 被错误映射成 RESHARD</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#22-compute-timeline">2.2 compute timeline 目前只有结束点</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#23-p2p-rank">2.3 P2P 缺少跨 rank 稳定标识</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#24-fsdp-residency-action">2.4 FSDP residency 缺少 action 归属</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#25-unshard-fsdp-group">2.5 一个 UNSHARD 可能包含多个 FSDP group</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#26-capture-process-rank-global-rank">2.6 capture process rank 不一定是逻辑 global rank</a>
+    </li>
+        </ul>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#3">3. 模块边界</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#4-des">4. DES 所需的权威对象</a>
+        <ul>
+    <li class="toctree-l3"><a class="reference internal" href="#41-scheduleaction">4.1 ScheduleAction</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#42-dataslot">4.2 DataSlot</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#43-communication-descriptor">4.3 Communication descriptor</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#44-l1-template">4.4 L1 template</a>
+    </li>
+        </ul>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#5-1f1b-action-skeleton">5. 1F1B action skeleton 的构建</a>
+        <ul>
+    <li class="toctree-l3"><a class="reference internal" href="#51-compute-actions">5.1 创建 compute actions</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#52-p2p-actions">5.2 创建 P2P actions</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#53-f-b-microbatch">5.3 创建 F 与 B 的同 microbatch 依赖</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#54-issue_order">5.4 不要把整个 issue_order 变成依赖链</a>
+    </li>
+        </ul>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#6-p2p">6. P2P 依赖的正确表达</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#7-fsdp">7. FSDP 状态和依赖</a>
+        <ul>
+    <li class="toctree-l3"><a class="reference internal" href="#71-unshard">7.1 UNSHARD</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#72-reshard">7.2 RESHARD</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#73-reduce_grad">7.3 REDUCE_GRAD</a>
+    </li>
+        </ul>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#8-optimizer-step">8. optimizer 与 step 收尾</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#9-plan">9. Plan 校验器是必需功能</a>
+        <ul>
+    <li class="toctree-l3"><a class="reference internal" href="#91">9.1 引用完整性</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#92-1f1b">9.2 1F1B 结构</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#93-fsdp">9.3 FSDP</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#94">9.4 图性质</a>
+    </li>
+        </ul>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#10-des">10. DES 最小状态机</a>
+        <ul>
+    <li class="toctree-l3"><a class="reference internal" href="#_1">死锁诊断</a>
+    </li>
+        </ul>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#11">11. 实现顺序</a>
+        <ul>
+    <li class="toctree-l3"><a class="reference internal" href="#p01">P0.1 捕获契约</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#p02-assembler">P0.2 独立 assembler</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#p03-des">P0.3 DES</a>
+    </li>
+        </ul>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#12">12. 验收矩阵</a>
+        <ul>
+    <li class="toctree-l3"><a class="reference internal" href="#case-app2m4dp-shard1">Case A：PP=2，M=4，DP shard=1</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#case-bpp2m4dp-shard2">Case B：PP=2，M=4，DP shard=2</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#case-cmicrobatch">Case C：microbatch 对照</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#case-d-pp">Case D：非 PP 回归</a>
+    </li>
+        </ul>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#13">13. 交付要求</a>
+    </li>
+    </ul>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../alltoall-capture-analysis/">all_to_all 通信捕获缺失分析</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../communication-ownership-contract/">Communication Ownership Contract</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../dualpipev-schedule-plan-consumer-guide/">DualPipeV SchedulePlan 下游接入指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../l2-l3-schedule-plan-design/">L2/L3 调度 IR 重构设计：从扁平 trace 到结构化 SchedulePlan</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../low-precision-sim-analysis/">低精度训练（MXFP8）Simulator 使能分析</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../optimizer-ops-analysis/">优化器算子捕获问题分析</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../pipeline-multi-graph-capture-design/">复杂 Pipeline 策略下完整计算图捕获方案设计</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../pp-l2-capture-architecture/">PP L2 Capture Architecture</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../schedule-capture-design/">L0-L3 IR 层级归属设计</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../schedule-plan-dependency-reconstruction-contract/">SchedulePlan 下游依赖重建契约</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../schedule-plan-des-consumer-guide/">SchedulePlan 依赖重建与 DES 消费指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../simulator-memory-model-design/">Simulator Memory Model 改造设计</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Feature guides</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/checkpoint/">Checkpoint 使用指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/deepseek_v32_mtp/">多Token预测特性(Multi Token Prediction, MTP)</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/low_precision_training/">低精度训练特性（MXFP8）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/metrics_and_debugging/">调试支持特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/model_custom/">Model Custom框架介绍</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/muon_optimizer/">Muon 优化器特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/new_model_onboarding/">新模型接入开发流程</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/npu_fused_ops/">NPU 融合算子适配</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/swap_optimizer/">SwapOptimizer 特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/torch_compile/">torch.compile 支持</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/virtual_optimizer/">Virtual Optimizer - 优化器显存虚拟化特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/vlm/">VLM NPU 支持</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" >Parallelism</a>
+    <ul>
+                <li class="toctree-l2"><a class="reference internal" href="../../feature_guides/parallelism/custom_cp/">自定义 Context Parallel 特性</a>
+                </li>
+    </ul>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Recipe</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../recipe/sft/">SFT 指令微调</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Superpowers</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" >Plans</a>
+    <ul>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/plans/2026-07-01-mhc-real-op-name-capture-implementation/">MHC Real-Op-Name Capture Implementation Plan</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/plans/2026-07-01-npu-simulator-implementation/">torchtitan_npu Simulator Implementation Plan</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/plans/2026-07-01-smla-real-op-name-capture-implementation/">SMLA Real-Op-Name Capture Implementation Plan</a>
+                </li>
+    </ul>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" >Specs</a>
+    <ul>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/specs/2026-07-01-mhc-real-op-name-capture-design/">MHC 真实算子名捕获 — 架构与方案设计（阶段一：MHC）</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/specs/2026-07-01-npu-simulator-design/">torchtitan_npu Simulator — 架构与方案设计</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/specs/2026-07-01-smla-real-op-name-capture-design/">SMLA 真实算子名捕获 — 架构与方案设计（阶段二：SMLA）</a>
+                </li>
+    </ul>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Test guides</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../test_guides/model_acceptance/">新模型最终验收规范（Meta 模拟器）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../test_guides/test_design/">测试设计</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../test_guides/test_guide/">测试使用指南</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">User guides</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/deepseek_v4_model_parameters/">DeepSeek-V4 模型参数 Web 字段目录</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/installation/">软件安装</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/quickstart/">快速上手</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/simulator/">Simulator 使用指南</a>
+                  </li>
+              </ul>
+      </div>
+    </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap">
+      <nav class="wy-nav-top" role="navigation" aria-label="Mobile navigation menu">
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../..">torchtitan-npu</a>
+        
+      </nav>
+      <div class="wy-nav-content">
+        <div class="rst-content"><div role="navigation" aria-label="breadcrumbs navigation">
+  <ul class="wy-breadcrumbs">
+    <li><a href="../.." class="icon icon-home" aria-label="Docs"></a></li>
+          <li class="breadcrumb-item">Design</li>
+      <li class="breadcrumb-item active">1F1B 完整依赖组装与 DES 回放实现指南</li>
+    <li class="wy-breadcrumbs-aside">
+    </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+            <div class="section" itemprop="articleBody">
+              
+                <h1 id="1f1b-des">1F1B 完整依赖组装与 DES 回放实现指南</h1>
+<blockquote>
+<p>目标读者：负责继续实现 simulator L2/L3 与 DES 的 AI 或开发者。</p>
+<p>本文只聚焦第一个可验收版本：<code>PipelineScheduleSingle</code> 的 1F1B，优先支持
+<code>PP &gt; 1</code>、每个进程一个 PP stage、<code>B</code> 为完整 backward。不要在这一版同时扩展
+DualPipe、V schedule、I/W split、跨迭代流水或复杂 overlap。</p>
+</blockquote>
+<p>如果下层已经生成 <code>SchedulePlan</code>，上层不需要理解本文的捕获和组装过程。请直接阅读
+<a href="../schedule-plan-dependency-reconstruction-contract/"><code>schedule-plan-dependency-reconstruction-contract.md</code></a>，
+按现有 action、slot 和 communication descriptor 重建依赖。DES 状态机和内存消费的扩展说明见
+<a href="../schedule-plan-des-consumer-guide/"><code>schedule-plan-des-consumer-guide.md</code></a>。</p>
+<p>开始实现前先阅读：</p>
+<ul>
+<li><code>torchtitan_npu/simulator/capture/schedule_builder.py</code></li>
+<li><code>torchtitan_npu/simulator/capture/comm_events.py</code></li>
+<li><code>torchtitan_npu/simulator/capture/fsdp_residency.py</code></li>
+<li><code>torchtitan_npu/simulator/meta_env.py</code> 中的 PP context patches</li>
+<li><code>torchtitan_npu/simulator/ir/schedule_plan.py</code></li>
+<li><code>torchtitan_npu/simulator/memory/schedule_replay.py</code></li>
+</ul>
+<h2 id="1">1. 最终目标</h2>
+<p>从一次 meta capture 产生的信息中，构造一份可以独立驱动 DES 的 1F1B 计划。DES 必须能够：</p>
+<ol>
+<li>按每个 rank 的真实 1F1B 顺序发布 F、B、P2P、FSDP 和 optimizer action。</li>
+<li>根据真实数据依赖阻塞或激活 action，不产生无 producer 的内部依赖。</li>
+<li>正确配对跨 rank 的 SEND/RECV，允许 RECV 先发布并等待 SEND。</li>
+<li>正确区分 FSDP all-gather、full-parameter 释放和 gradient reduce-scatter。</li>
+<li>展开 <code>template_ref</code> 指向的 L1 StepGraph，计算每个 compute action 的耗时和静态输入输出内存。</li>
+<li>在事件队列为空但 step 未结束时，输出明确的死锁原因，而不是静默停止。</li>
+</ol>
+<p>第一个版本的正确性标准不是与真实执行逐纳秒对齐，而是：action 顺序合理、依赖完备、
+通信可推进、内存状态转换有来源，并且 PP/FSDP 规模变化符合常理。</p>
+<h2 id="2">2. 当前实现中必须先修正的问题</h2>
+<p>当前 <code>build_schedule_plan()</code> 对 <code>PipelineScheduleSingle</code> 使用
+<code>timeline_events + comm_events</code> 合成 action。这个分支只能作为数据来源验证，不能直接作为最终实现。</p>
+<h3 id="21-reduce-scatter-reshard">2.1 reduce-scatter 被错误映射成 RESHARD</h3>
+<p>当前 fallback 把：</p>
+<pre><code class="language-text">allgather      -&gt; UNSHARD
+reduce_scatter -&gt; RESHARD
+</code></pre>
+<p>第二条是错误的。PyTorch pipeline 语义是：</p>
+<pre><code class="language-text">UNSHARD     = all-gather full parameter
+RESHARD     = 本地释放 full parameter，不发生 collective
+REDUCE_GRAD = gradient reduce-scatter 或 all-reduce
+</code></pre>
+<p>因此不得使用“有没有 reduce-scatter CommEvent”判断 RESHARD 是否存在。</p>
+<h3 id="22-compute-timeline">2.2 compute timeline 目前只有结束点</h3>
+<p><code>forward_one_chunk</code>/<code>backward_one_chunk</code> 当前在函数返回后记录 timeline event。
+FSDP unshard、reshard 和部分通信可能发生在 chunk 内部，仅按所有事件的 <code>seq_idx</code> 排序，
+可能得到错误的 action 包含关系。</p>
+<p>1F1B assembler 至少需要每个 compute instance 的：</p>
+<pre><code class="language-text">instance_id, rank, stage, mb_idx, comp_type, start_seq, end_seq, template_ref
+</code></pre>
+<p>建议保留当前结束事件以兼容导出，同时补充 begin/end 或一次带 start/end 的结构化记录。</p>
+<h3 id="23-p2p-rank">2.3 P2P 缺少跨 rank 稳定标识</h3>
+<p>不同进程本地生成的 <code>slot_N</code> 不能用于跨 rank 配对。必须为同一次逻辑传输生成确定性的：</p>
+<pre><code class="language-text">transfer_id = (iteration, direction, src_stage, dst_stage, mb_idx, tensor_ordinal)
+</code></pre>
+<p>第一版每个 stage 边界、每个 microbatch、每个方向只有一个主 tensor 时，
+<code>tensor_ordinal=0</code>。不要使用本地 action id、op id 或捕获顺序作为跨 rank 主键。</p>
+<h3 id="24-fsdp-residency-action">2.4 FSDP residency 缺少 action 归属</h3>
+<p><code>FSDPResidencyEvent</code> 已记录 <code>group_id/action/seq_idx/num_bytes</code>，但完整组装还需要：</p>
+<pre><code class="language-text">rank, stage, mb_idx, comp_type, parent_compute_instance_id
+</code></pre>
+<p>这些字段应在 hook 触发时从 <code>_pp_context</code> 固化，不能在构图阶段读取已经变化的全局 context。</p>
+<h3 id="25-unshard-fsdp-group">2.5 一个 UNSHARD 可能包含多个 FSDP group</h3>
+<p>stage 内可能有多个嵌套 FSDP group。一个 stage 只保存一个 <code>CommDetail</code> 会丢通信和内存信息。
+第一版应选择以下一种显式表达，推荐前者：</p>
+<ol>
+<li>每个 <code>group_id</code> 建一个 UNSHARD/RESHARD action。</li>
+<li>一个聚合 action 持有 <code>comm_details[]</code> 和 <code>residency_transitions[]</code>。</li>
+</ol>
+<p>不要只保留第一条 all-gather，其余静默丢弃。</p>
+<h3 id="26-capture-process-rank-global-rank">2.6 capture process rank 不一定是逻辑 global rank</h3>
+<p><code>multi_proc_meta</code> 可能只启动 PP 数量的真实 Gloo 进程，同时模拟更大的逻辑 world。
+不得默认 <code>os process rank == simulated global rank</code>。结构化记录至少要区分：</p>
+<pre><code class="language-text">capture_process_rank
+pp_stage
+logical_rank or logical_rank_coordinates
+</code></pre>
+<p>第一版 P2P 配对以 <code>src_stage/dst_stage/mb/direction</code> 为稳定拓扑主键，再通过 RankTable
+解析或展开逻辑 rank。不要使用 Gloo rank 推导 DP/TP/FSDP group。</p>
+<h2 id="3">3. 模块边界</h2>
+<p>不要继续在 <code>build_schedule_plan()</code> 中线性增加 1F1B 特判。使用 assembler 插件边界：</p>
+<pre><code class="language-text">SchedulePlanAssembler
+  - RuntimePlanAssembler
+      输入 pipeline_order_with_comms
+      服务 DualPipe/ZBV 等 lowered schedule
+
+  - SingleStageTraceAssembler
+      输入 compute spans、P2P、FSDP residency、collectives
+      服务 PipelineScheduleSingle: 1F1B/GPipe
+</code></pre>
+<p>公共层只负责：</p>
+<ul>
+<li>action/slot 注册与唯一 ID；</li>
+<li>producer/consumer 双向索引；</li>
+<li>plan invariant 校验；</li>
+<li>export；</li>
+<li>L1 template 查询。</li>
+</ul>
+<p>1F1B assembler 不应修改 runtime-plan assembler 已验证的行为。<code>PP == 1</code> 继续走非 PP 路径，
+除非有单独测试证明切换不会改变原有内存估计。</p>
+<h2 id="4-des">4. DES 所需的权威对象</h2>
+<p>DES 不能只读取 DataSlot，也不能只读取 action 列表。完整输入由以下部分组成。</p>
+<h3 id="41-scheduleaction">4.1 ScheduleAction</h3>
+<p>Action 是可发布、可执行、可完成的主体：</p>
+<pre><code class="language-text">action_id
+rank, stage, mb_idx
+action_type: COMPUTE | SEND_F | RECV_F | SEND_B | RECV_B |
+             UNSHARD | RESHARD | REDUCE_GRAD | OPTIMIZER
+comp_type: F | B
+issue_order
+template_ref
+consumes[]
+produces[]
+is_noop
+</code></pre>
+<p><code>issue_order</code> 表示本 rank 的程序发布顺序，不等价于所有相邻 action 都存在数据依赖。</p>
+<h3 id="42-dataslot">4.2 DataSlot</h3>
+<p>DataSlot 表示 action 完成后可用的数据或 readiness token：</p>
+<pre><code class="language-text">slot_id
+kind
+producer_action_id
+consumer_action_ids[]
+shape, dtype, volume_bytes
+src_stage, dst_stage, mb_idx
+lifetime/release_policy
+</code></pre>
+<p>第一版至少支持：</p>
+<pre><code class="language-text">dataloader_input
+activation_local
+activation_recv
+grad_local
+grad_recv
+forward_state
+param_full
+control
+grad_reduced
+</code></pre>
+<p>外部输入允许没有内部 producer，但必须显式标记 <code>external=True</code>。其他 consumed slot 必须有且只有一个 producer。</p>
+<h3 id="43-communication-descriptor">4.3 Communication descriptor</h3>
+<p>SEND/RECV 通过 <code>transfer_id</code> 配对，通信描述至少包含：</p>
+<pre><code class="language-text">transfer_id
+role: send | recv
+primitive
+src_rank, dst_rank
+src_stage, dst_stage
+mb_idx
+shape, dtype, volume_bytes
+group/peer
+comm_op_id
+</code></pre>
+<p>同一次传输只能计一次网络代价。可以让通信 matcher 创建一个共享 transfer event，
+SEND/RECV 都等待该 event 完成；不能把两边各算一次完整通信。</p>
+<h3 id="44-l1-template">4.4 L1 template</h3>
+<p>每个 <code>COMPUTE(stage, mb, F/B)</code> 必须解析到：</p>
+<pre><code class="language-text">s{stage}_F
+s{stage}_B
+</code></pre>
+<p>DES 展开模板中的 L0 op 和内部 tensor 依赖。不同 microbatch 可以复用同一模板，
+但每次实例化必须有独立 action instance、时间状态和非持久 tensor 标识。</p>
+<h2 id="5-1f1b-action-skeleton">5. 1F1B action skeleton 的构建</h2>
+<p>不要根据 1F1B 公式重新猜测本地顺序。捕获到的 compute span 和 P2P issue 顺序是权威来源。</p>
+<h3 id="51-compute-actions">5.1 创建 compute actions</h3>
+<p>对当前 rank 的每个 compute span：</p>
+<pre><code class="language-text">F(stage, mb) -&gt; COMPUTE comp_type=F template=s{stage}_F
+B(stage, mb) -&gt; COMPUTE comp_type=B template=s{stage}_B
+</code></pre>
+<p>按 <code>start_seq</code> 确定 <code>issue_order</code>。必须验证每个本地 microbatch 恰好有一个 F 和一个 B。</p>
+<h3 id="52-p2p-actions">5.2 创建 P2P actions</h3>
+<p>按 CommEvent 的 <code>p2p_direction</code> 创建：</p>
+<pre><code class="language-text">forward_send  -&gt; SEND_F
+forward_recv  -&gt; RECV_F
+backward_send -&gt; SEND_B
+backward_recv -&gt; RECV_B
+</code></pre>
+<p>只接受以下四个精确值：<code>forward_send</code>、<code>forward_recv</code>、<code>backward_send</code>、
+<code>backward_recv</code>。不能用简单的 <code>"send" in direction</code>，否则
+<code>cp_forward_send/cp_backward_send</code> 会被误当成 PP action。</p>
+<p>当前 PP P2P capture 不保证 <code>comm_layer == "L2"</code>，因此第一版不能仅靠该字段过滤。
+应联合校验精确 direction、P2P primitive、stage、mb 和 peer；peer 的逻辑 rank 由 RankTable 解析。</p>
+<p>各 rank 的理论边界如下，用于校验而不是生成顺序：</p>
+<pre><code class="language-text">非首 stage: RECV_F(m) -&gt; F(m)
+非末 stage: F(m) -&gt; SEND_F(m)
+非末 stage: RECV_B(m) -&gt; B(m)
+非首 stage: B(m) -&gt; SEND_B(m)
+</code></pre>
+<h3 id="53-f-b-microbatch">5.3 创建 F 与 B 的同 microbatch 依赖</h3>
+<p>每个 <code>B(stage, mb)</code> 必须依赖同 stage 的 <code>F(stage, mb)</code> 已完成。建立零字节
+<code>forward_state</code> 或 <code>control</code> slot：</p>
+<pre><code class="language-text">F(stage, mb) -&gt; B(stage, mb)
+</code></pre>
+<p>这条依赖不能因为开启 full recompute 而删除。重计算改变 activation 的内存生命周期，
+不改变 B 必须发生在原始 F 之后这一控制事实。</p>
+<h3 id="54-issue_order">5.4 不要把整个 issue_order 变成依赖链</h3>
+<p>本 rank 的 issue cursor 保证 action 按程序顺序发布。只有真实的数据或完成条件才创建 slot。
+否则会把异步通信和可重叠计算强制串行化。</p>
+<h2 id="6-p2p">6. P2P 依赖的正确表达</h2>
+<p>P2P 必须区分“action 可以发布”和“数据传输已经完成”。推荐的数据链为：</p>
+<pre><code class="language-text">发送端：
+F(src,m) --activation_local--&gt; SEND_F(transfer_id)
+B(src,m) --grad_local-------&gt; SEND_B(transfer_id)
+
+接收端：
+RECV_F(transfer_id) --activation_recv--&gt; F(dst,m)
+RECV_B(transfer_id) --grad_recv-------&gt; B(dst,m)
+</code></pre>
+<p>SEND 与 RECV 的远端关系由 <code>transfer_id</code> 和 communication matcher 表达，不创建普通的
+<code>SEND -&gt; RECV</code> 开始依赖。</p>
+<p>原因：真实系统允许 RECV 先发布并等待。如果 RECV 必须先消费 SEND 产出的普通 slot 才能发布，
+某些 rank 顺序会在 rendezvous 之前互相等待，产生人为死锁。</p>
+<p>DES 的通信推进逻辑：</p>
+<pre><code class="language-text">post SEND when local input slot is ready
+post RECV when rank issue cursor reaches it
+when SEND and RECV with same transfer_id are both posted:
+    schedule one network transfer event
+when transfer completes:
+    mark SEND done
+    mark RECV done
+    publish RECV output slot
+</code></pre>
+<p>如果后端希望使用 eager-send 模型，也必须保留相同的 <code>transfer_id</code>，并保证 RECV 可以先挂起。</p>
+<h2 id="7-fsdp">7. FSDP 状态和依赖</h2>
+<p>FSDP 以 residency interval 为权威，不要从算子名字猜测释放时间。</p>
+<h3 id="71-unshard">7.1 UNSHARD</h3>
+<p>对每个 stage 外显式 prefetch 的真实 <code>alloc</code> interval：</p>
+<ol>
+<li>找到同 group 的 all-gather CommEvent。</li>
+<li>创建 UNSHARD action，绑定 all-gather 的 <code>comm_op_id/shape/bytes/group</code>。</li>
+<li>UNSHARD 完成后产生 <code>param_full(group_id)</code>。</li>
+<li>interval 内使用该参数的 F/B action 消费 <code>param_full</code>。</li>
+</ol>
+<p>若 all-gather 在 F/B/I/W 内触发，ownership 插件会把它归入对应 L1
+模板或不可变通信变体，不再生成 L2 UNSHARD/RESHARD。只有计算外的 prefetch
+保留独立 action。元数据推理阶段产生、且没有合法
+<code>stage/mb/parent_compute_instance_id</code> 的 residency 不属于训练 schedule，应在 assembler 入口过滤；
+若 stage/mb 合法但 parent compute 不存在，则必须报错。</p>
+<p>若 stage 使用 FSDP 且 shard degree 大于 1，却找不到 all-gather，立即构图失败。
+mesh size 为 1 或无真实变化的 intent 应被删除，不创建阻塞 slot。</p>
+<h3 id="72-reshard">7.2 RESHARD</h3>
+<p>对每个真实 <code>free</code> interval：</p>
+<ol>
+<li>创建 RESHARD action，不绑定 reduce-scatter。</li>
+<li>找到 interval 内最后一个使用该 full parameter 的 compute action。</li>
+<li>建立零字节 control slot：<code>last_compute -&gt; RESHARD</code>。</li>
+<li>RESHARD 完成时结束 <code>param_full</code> 的 residency，释放对应字节。</li>
+</ol>
+<p>缺少配对 alloc、最后 consumer 或 group_id 时直接失败。不要创建 producer 为空的 slot。</p>
+<h3 id="73-reduce_grad">7.3 REDUCE_GRAD</h3>
+<p>仅当 FSDP reduce-scatter 或 DDP all-reduce 在计算模板之外独立执行时创建 REDUCE_GRAD：</p>
+<pre><code class="language-text">last relevant B -&gt; REDUCE_GRAD -&gt; grad_reduced -&gt; OPTIMIZER
+</code></pre>
+<p>如果梯度通信在 B/I/W 内发起，它属于该 L1 模板，不再创建 L2
+REDUCE_GRAD。下游不得重复调度。</p>
+<h2 id="8-optimizer-step">8. optimizer 与 step 收尾</h2>
+<p>为捕获到的 optimizer template 创建一个 OPTIMIZER action：</p>
+<ul>
+<li><code>template_ref</code> 指向 optimizer L1 graph；</li>
+<li>消费本 rank 所有 <code>grad_reduced</code>；</li>
+<li>没有 DP gradient collective 时，消费最后 B 产生的本地 grad readiness；</li>
+<li>只能在所有本地 microbatch 的 backward 完成后执行。</li>
+</ul>
+<p>第一版不要求完整表达下一 iteration 的 optimizer state，但必须保证 step 在 optimizer 完成后结束，
+并且没有仍处于 active 状态的 full parameter residency 或未完成 P2P transfer。</p>
+<h2 id="9-plan">9. Plan 校验器是必需功能</h2>
+<p>构建完成后、导出前运行统一 validator。至少检查：</p>
+<h3 id="91">9.1 引用完整性</h3>
+<ul>
+<li>action id、slot id 全局唯一；</li>
+<li>每个 <code>consumes/produces</code> 引用的 slot 存在；</li>
+<li>action 与 slot 两侧索引互相一致；</li>
+<li>非 external consumed slot 恰好一个 producer；</li>
+<li>compute action 的 template 存在；</li>
+<li>非 no-op 通信 action 的通信描述完整。</li>
+</ul>
+<h3 id="92-1f1b">9.2 1F1B 结构</h3>
+<ul>
+<li>每个本地 <code>(stage, mb)</code> 恰好一个 F 和一个 B；</li>
+<li><code>F(stage,mb)</code> 在 <code>B(stage,mb)</code> 之前；</li>
+<li>首 stage 没有 RECV_F，末 stage 没有 SEND_F；</li>
+<li>末 stage 没有 RECV_B，首 stage 没有 SEND_B；</li>
+<li>每个 SEND/RECV 均能通过 transfer_id 在全 rank plan 中唯一配对。</li>
+</ul>
+<h3 id="93-fsdp">9.3 FSDP</h3>
+<ul>
+<li>external UNSHARD 有 all-gather；</li>
+<li>stage 内 all-gather 位于 compute 模板或 <code>__comm_vN</code> 变体；</li>
+<li>real RESHARD 没有 collective，且有最后 compute producer；</li>
+<li>stage 内 reduce-scatter 只归属 L1，独立 reduce-scatter 只归属 REDUCE_GRAD；</li>
+<li>no-op action 已被移除；</li>
+<li>每个 residency alloc 有且只有一个匹配 free，允许显式标记跨迭代常驻的例外。</li>
+</ul>
+<h3 id="94">9.4 图性质</h3>
+<ul>
+<li>普通数据和 control 边无环；</li>
+<li>P2P channel 单独由 communication matcher 校验，不参与 SEND-&gt;RECV 的开始依赖拓扑；</li>
+<li>所有非 external action 从初始 ready 集合最终可达；</li>
+<li>不允许通过“把未解析依赖当 ready”绕过错误。</li>
+</ul>
+<h2 id="10-des">10. DES 最小状态机</h2>
+<p>每个 action 至少具有：</p>
+<pre><code class="language-text">NOT_ISSUED -&gt; POSTED/READY -&gt; RUNNING/WAITING_COMM -&gt; DONE
+</code></pre>
+<p>推进规则：</p>
+<pre><code class="language-text">for each rank:
+    inspect next action by issue_order
+    if action is RECV:
+        post it even when remote SEND is absent
+    elif all local consumed slots are ready:
+        post it
+
+for each posted action:
+    noop:
+        complete immediately
+    compute:
+        start when compute resource is free
+    SEND/RECV:
+        register with communication matcher
+    UNSHARD/REDUCE_GRAD:
+        start when communication resource and inputs are ready
+    RESHARD:
+        complete after its control dependency, then release param_full
+
+on action completion:
+    publish output slots
+    release input slots whose last consumer completed
+    advance dependent actions
+</code></pre>
+<p>注意：rank issue cursor 是否在 action POSTED 后前进，必须与捕获的 API 语义一致。
+第一版可以采用保守策略：普通 compute 等待 DONE；异步 SEND/RECV 在成功 POSTED 后允许 cursor 前进。</p>
+<h3 id="_1">死锁诊断</h3>
+<p>当 event queue 为空但仍有未完成 action 时，输出：</p>
+<pre><code class="language-text">rank cursor and next action
+unresolved local slot ids and expected producers
+posted but unmatched transfer_ids
+active FSDP group_ids
+resource owners
+</code></pre>
+<p>随后抛出异常。禁止把这些 action 自动标成完成。</p>
+<h2 id="11">11. 实现顺序</h2>
+<h3 id="p01">P0.1 捕获契约</h3>
+<ol>
+<li>compute timeline 增加稳定 <code>instance_id/start_seq/end_seq</code>。</li>
+<li>FSDP residency 增加 stage/mb/comp_type/parent instance。</li>
+<li>P2P 生成确定性 transfer_id。</li>
+<li>保留旧字段和导出，避免破坏现有 runtime schedule。</li>
+</ol>
+<h3 id="p02-assembler">P0.2 独立 assembler</h3>
+<ol>
+<li>增加 <code>SingleStageTraceAssembler</code>。</li>
+<li>先只生成 compute + P2P + F-&gt;B control。</li>
+<li>通过 PP=2、无 FSDP 的 validator 和 DES。</li>
+<li>再接入 FSDP residency、UNSHARD/RESHARD/REDUCE_GRAD。</li>
+<li>最后接 optimizer 和内存释放。</li>
+</ol>
+<h3 id="p03-des">P0.3 DES</h3>
+<ol>
+<li>实现 rank issue cursor。</li>
+<li>实现 local slot readiness。</li>
+<li>实现基于 transfer_id 的 SEND/RECV matcher。</li>
+<li>实现 compute/comm 资源与 cost model duration。</li>
+<li>实现 no-op、RESHARD release 和死锁诊断。</li>
+</ol>
+<p>不要在第一版实现：任意 overlap group、I/W split、V schedule 本地跨 stage、跨 iteration pipeline、
+精确 allocator fragmentation。接口应允许后续扩展，但当前验收不依赖这些功能。</p>
+<h2 id="12">12. 验收矩阵</h2>
+<h3 id="case-app2m4dp-shard1">Case A：PP=2，M=4，DP shard=1</h3>
+<p>每个 stage 必须有 <code>F x4 + B x4</code>。</p>
+<p>stage 0：</p>
+<pre><code class="language-text">SEND_F x4
+RECV_B x4
+RECV_F x0
+SEND_B x0
+</code></pre>
+<p>stage 1：</p>
+<pre><code class="language-text">RECV_F x4
+SEND_B x4
+SEND_F x0
+RECV_B x0
+</code></pre>
+<p>全局有 4 个 forward transfer_id 和 4 个 backward transfer_id，全部唯一配对。
+DES 能完成整个 step，无 dangling slot、unmatched transfer 或 active residency。</p>
+<h3 id="case-bpp2m4dp-shard2">Case B：PP=2，M=4，DP shard=2</h3>
+<p>在 Case A 基础上验证：</p>
+<ul>
+<li>外部 all-gather 属于 UNSHARD，stage 内 all-gather 属于 L1；</li>
+<li>stage 内 reduce-scatter 属于 L1，独立 reduce-scatter 属于 REDUCE_GRAD；</li>
+<li>RESHARD 没有 comm_op_id，消费最后 compute 的 control slot；</li>
+<li><code>param_full</code> bytes 在 alloc 后增加、free 后减少；</li>
+<li>persistent parameter bytes 约为 shard=1 的一半，full-param 峰值只在 residency interval 内出现。</li>
+</ul>
+<h3 id="case-cmicrobatch">Case C：microbatch 对照</h3>
+<p>比较 M=2 与 M=4：</p>
+<ul>
+<li>action 和 P2P 数量按 microbatch 线性增长；</li>
+<li>persistent parameter bytes 不随 M 变化；</li>
+<li>非重计算 activation residency 可以增长；</li>
+<li>full recompute 下 activation 峰值不应出现无界增长。</li>
+</ul>
+<h3 id="case-d-pp">Case D：非 PP 回归</h3>
+<p><code>PP=1</code> 必须继续使用原路径，输出的 persistent params、peak memory 和 action 计数不能因
+1F1B assembler 引入明显变化。</p>
+<h2 id="13">13. 交付要求</h2>
+<p>完成时应同时提交：</p>
+<ol>
+<li>assembler 与 capture schema 改动；</li>
+<li>plan validator；</li>
+<li>DES SEND/RECV matcher 与死锁诊断；</li>
+<li>单元测试；</li>
+<li>PP=2 的 shard=1/shard=2 可读日志；</li>
+<li>每个 rank 的 schedule plan，以及聚合后的 transfer 配对摘要；</li>
+<li>memory timeline，至少展示 F/B 阶段、P2P、param_full alloc/free 和峰值。</li>
+</ol>
+<p>最终日志至少包含：</p>
+<pre><code class="language-text">actions by type/rank/stage
+slots by kind
+paired/unmatched transfers
+FSDP residency intervals
+ready/running/waiting action counts
+step completion time
+peak memory and peak action
+</code></pre>
+<p>只有“所有 action 完成、所有 required transfer 配对、所有内部 consumed slot 可追溯、
+所有非跨迭代 residency 已关闭”同时成立，才能认为一次 1F1B 仿真完成。</p>
+              
+            </div>
+          </div><footer>
+    <div class="rst-footer-buttons" role="navigation" aria-label="Footer Navigation">
+        <a href="../../community/versioning_policy/" class="btn btn-neutral float-left" title="版本策略"><span class="icon icon-circle-arrow-left"></span> Previous</a>
+        <a href="../alltoall-capture-analysis/" class="btn btn-neutral float-right" title="all_to_all 通信捕获缺失分析">Next <span class="icon icon-circle-arrow-right"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <!-- Copyright etc -->
+  </div>
+
+  Built with <a href="https://www.mkdocs.org/">MkDocs</a> using a <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a> provided by <a href="https://readthedocs.org">Read the Docs</a>.
+</footer>
+          
+        </div>
+      </div>
+
+    </section>
+
+  </div>
+
+  <div class="rst-versions" role="note" aria-label="Versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    
+    
+      <span><a href="../../community/versioning_policy/" style="color: #fcfcfc">&laquo; Previous</a></span>
+    
+    
+      <span><a href="../alltoall-capture-analysis/" style="color: #fcfcfc">Next &raquo;</a></span>
+    
+  </span>
+</div>
+    <script src="../../js/jquery-3.6.0.min.js"></script>
+    <script>var base_url = "../..";</script>
+    <script src="../../js/theme_extra.js"></script>
+    <script src="../../js/theme.js"></script>
+    <script>
+        jQuery(function () {
+            SphinxRtdTheme.Navigation.enable(true);
+        });
+    </script>
+
+</body>
+</html>

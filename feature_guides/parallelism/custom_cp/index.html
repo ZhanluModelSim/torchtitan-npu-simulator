@@ -52,13 +52,40 @@
                   <li class="toctree-l1"><a class="reference internal" href="../../../community/versioning_policy/">版本策略</a>
                   </li>
               </ul>
+              <p class="caption"><span class="caption-text">Design</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/1f1b-schedule-plan-assembly-guide/">1F1B 完整依赖组装与 DES 回放实现指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/alltoall-capture-analysis/">all_to_all 通信捕获缺失分析</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/communication-ownership-contract/">Communication Ownership Contract</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/dualpipev-schedule-plan-consumer-guide/">DualPipeV SchedulePlan 下游接入指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/l2-l3-schedule-plan-design/">L2/L3 调度 IR 重构设计：从扁平 trace 到结构化 SchedulePlan</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/low-precision-sim-analysis/">低精度训练（MXFP8）Simulator 使能分析</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/optimizer-ops-analysis/">优化器算子捕获问题分析</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/pipeline-multi-graph-capture-design/">复杂 Pipeline 策略下完整计算图捕获方案设计</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/pp-l2-capture-architecture/">PP L2 Capture Architecture</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/schedule-capture-design/">L0-L3 IR 层级归属设计</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/schedule-plan-dependency-reconstruction-contract/">SchedulePlan 下游依赖重建契约</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/schedule-plan-des-consumer-guide/">SchedulePlan 依赖重建与 DES 消费指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/simulator-memory-model-design/">Simulator Memory Model 改造设计</a>
+                  </li>
+              </ul>
               <p class="caption"><span class="caption-text">Feature guides</span></p>
               <ul class="current">
                   <li class="toctree-l1"><a class="reference internal" href="../../checkpoint/">Checkpoint 使用指南</a>
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../../deepseek_v32_mtp/">多Token预测特性(Multi Token Prediction, MTP)</a>
-                  </li>
-                  <li class="toctree-l1"><a class="reference internal" href="../../fsdp_parameter_precision/">Fsdp parameter precision</a>
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../../low_precision_training/">低精度训练特性（MXFP8）</a>
                   </li>
@@ -68,9 +95,9 @@
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../../muon_optimizer/">Muon 优化器特性</a>
                   </li>
-                  <li class="toctree-l1"><a class="reference internal" href="../../npu_fused_ops/">NPU 融合算子适配</a>
+                  <li class="toctree-l1"><a class="reference internal" href="../../new_model_onboarding/">新模型接入开发流程</a>
                   </li>
-                  <li class="toctree-l1"><a class="reference internal" href="../../npu_tnd_attention/">TND Attention (Per-Document Causal Attention)</a>
+                  <li class="toctree-l1"><a class="reference internal" href="../../npu_fused_ops/">NPU 融合算子适配</a>
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../../swap_optimizer/">SwapOptimizer 特性</a>
                   </li>
@@ -89,10 +116,6 @@
     <li class="toctree-l4"><a class="reference internal" href="#sdpa-ulysses-cp">SDPA Ulysses CP</a>
     </li>
     <li class="toctree-l4"><a class="reference internal" href="#dsa-cp">DSA CP</a>
-    </li>
-    <li class="toctree-l4"><a class="reference internal" href="#compressorattention-cp">CompressorAttention CP</a>
-    </li>
-    <li class="toctree-l4"><a class="reference internal" href="#npuvarlen-ulysses-cp">NPUVarlen Ulysses CP</a>
     </li>
         </ul>
     </li>
@@ -118,8 +141,33 @@
                   <li class="toctree-l1"><a class="reference internal" href="../../../recipe/sft/">SFT 指令微调</a>
                   </li>
               </ul>
+              <p class="caption"><span class="caption-text">Superpowers</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" >Plans</a>
+    <ul>
+                <li class="toctree-l2"><a class="reference internal" href="../../../superpowers/plans/2026-07-01-mhc-real-op-name-capture-implementation/">MHC Real-Op-Name Capture Implementation Plan</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../../superpowers/plans/2026-07-01-npu-simulator-implementation/">torchtitan_npu Simulator Implementation Plan</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../../superpowers/plans/2026-07-01-smla-real-op-name-capture-implementation/">SMLA Real-Op-Name Capture Implementation Plan</a>
+                </li>
+    </ul>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" >Specs</a>
+    <ul>
+                <li class="toctree-l2"><a class="reference internal" href="../../../superpowers/specs/2026-07-01-mhc-real-op-name-capture-design/">MHC 真实算子名捕获 — 架构与方案设计（阶段一：MHC）</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../../superpowers/specs/2026-07-01-npu-simulator-design/">torchtitan_npu Simulator — 架构与方案设计</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../../superpowers/specs/2026-07-01-smla-real-op-name-capture-design/">SMLA 真实算子名捕获 — 架构与方案设计（阶段二：SMLA）</a>
+                </li>
+    </ul>
+                  </li>
+              </ul>
               <p class="caption"><span class="caption-text">Test guides</span></p>
               <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../test_guides/model_acceptance/">新模型最终验收规范（Meta 模拟器）</a>
+                  </li>
                   <li class="toctree-l1"><a class="reference internal" href="../../../test_guides/test_design/">测试设计</a>
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../../../test_guides/test_guide/">测试使用指南</a>
@@ -127,9 +175,13 @@
               </ul>
               <p class="caption"><span class="caption-text">User guides</span></p>
               <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../user-guides/deepseek_v4_model_parameters/">DeepSeek-V4 模型参数 Web 字段目录</a>
+                  </li>
                   <li class="toctree-l1"><a class="reference internal" href="../../../user-guides/installation/">软件安装</a>
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../../../user-guides/quickstart/">快速上手</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../user-guides/simulator/">Simulator 使用指南</a>
                   </li>
               </ul>
       </div>
@@ -171,8 +223,8 @@
 <p><code>torchtitan_npu</code> 在
 <code>torchtitan_npu/distributed/context_parallel/registry.py</code> 中维护一个 NPU 自有的
 CP 策略注册表，并提供入口函数 <code>apply_cp_to_attention_module</code>，在 CP 开启时自动为
-attention 模块匹配并应用合适的 CP 策略。目前注册的自定义 CP 策略包括
-SDPA Ulysses CP、DSA CP、CompressorAttention CP 和 NPUVarlen Ulysses CP：</p>
+attention 模块匹配并应用合适的 CP 策略。目前已提供两个自定义 CP ，分别是
+SDPA Ulysses CP 和 DSA CP：</p>
 <h3 id="sdpa-ulysses-cp">SDPA Ulysses CP</h3>
 <p>定义在 <code>torchtitan_npu/distributed/context_parallel/ulysses_cp.py</code>，为常用的
 SDPA 实现 Ulysses 风格的 CP。通过自定义 Context Parallel Context，我们在
@@ -192,16 +244,6 @@ AllGather，并在反向传播中完成对应的 ReduceScatter，以确保 DSA �
 CP 场景下的正确性。</p>
 <p>关于 DSA CP 的更多原理介绍，参考
 <a href="https://gitcode.com/cann/cann-recipes-train/blob/master/docs/llm_pretrain/deepseek-v32_pre_train_optimization.md#自定义CP策略">技术文档</a>。</p>
-<h3 id="compressorattention-cp">CompressorAttention CP</h3>
-<p>定义在 <code>torchtitan_npu/distributed/context_parallel/compressor_attention_cp.py</code>，为
-DeepSeek-V4 Attention 的 compressor 路径提供 CP。该策略在 pre-hook 中通过
-P2P window exchange 拼接相邻 CP rank 的重叠窗口，并在 post-hook 中对压缩后的
-KV 与 <code>k_indexer</code> 做 CP 域 all-gather、因果切片和必要的 padding。</p>
-<h3 id="npuvarlen-ulysses-cp">NPUVarlen Ulysses CP</h3>
-<p>定义在 <code>torchtitan_npu/distributed/context_parallel/npu_varlen_cp.py</code>，为
-<code>NPUVarlenAttention</code> 提供 Ulysses 风格的 CP。该策略复用 Ulysses all-to-all，
-在 forward 前后交换 Q/K/V 和输出的序列、头维分布，并注册 mask handler 以保留
-<code>VarlenMetadata</code> 文档边界信息。</p>
 <h2 id="_2">支持范围</h2>
 <table>
 <thead>
@@ -214,7 +256,7 @@ KV 与 <code>k_indexer</code> 做 CP 域 all-gather、因果切片和必要的 p
 </thead>
 <tbody>
 <tr>
-<td>DeepSeek-V3 / Qwen3 SDPA</td>
+<td>DeepSeek-V3</td>
 <td>Ulysses CP</td>
 <td><code>context_parallel_degree &gt; 1</code></td>
 <td>SDPA 路径使用 All-to-All 变换</td>
@@ -224,18 +266,6 @@ KV 与 <code>k_indexer</code> 做 CP 域 all-gather、因果切片和必要的 p
 <td>DSA CP</td>
 <td><code>context_parallel_degree &gt; 1</code> 且启用 <code>npu_dsa</code> converter</td>
 <td>-</td>
-</tr>
-<tr>
-<td>DeepSeek-V4</td>
-<td>CompressorAttention CP</td>
-<td><code>context_parallel_degree &gt; 1</code> 且启用 <code>npu_smla</code> converter</td>
-<td>CompressorAttention 路径处理窗口重叠、压缩 KV 和 CP mask</td>
-</tr>
-<tr>
-<td>Qwen3 TND</td>
-<td>NPUVarlen Ulysses CP</td>
-<td><code>context_parallel_degree &gt; 1</code> 且配置使用 <code>NPUVarlenAttention</code></td>
-<td>TND 路径使用 All-to-All 变换并保留 <code>VarlenMetadata</code></td>
 </tr>
 </tbody>
 </table>
@@ -261,16 +291,15 @@ KV 与 <code>k_indexer</code> 做 CP 域 all-gather、因果切片和必要的 p
 </tbody>
 </table>
 <blockquote>
-<p><strong>注意</strong>：DeepSeek-V3.2 的 DSA CP 依赖 <code>npu_dsa</code> converter，DeepSeek-V4 的
-CompressorAttention CP 依赖 <code>npu_smla</code> converter。启用对应模型的 CP 时，
-converters 中需要包含匹配的融合算子 converter。</p>
+<p><strong>注意</strong>：DeepSeek-V3.2 的 DSA CP 依赖 <code>npu_dsa</code> converter。
+若 <code>context_parallel_degree &gt; 1</code> 但 converters 中没有 <code>npu_dsa</code>，
+attention 模块无法命中任何已注册的 CP 策略 detector，并行化阶段会抛出
+<code>NotImplementedError</code>，提示 <code>No custom CP strategy found for module ...</code>。</p>
 </blockquote>
 <p>CP类型由框架根据模型及转换器配置<strong>自动选择</strong>，无需手动指定：</p>
 <ul>
-<li><strong>DeepSeek-V3 / Qwen3 SDPA</strong>：<code>context_parallel_degree &gt; 1</code> 时自动使用 Ulysses CP。</li>
+<li><strong>DeepSeek-V3</strong>：<code>context_parallel_degree &gt; 1</code> 时自动使用 Ulysses CP。</li>
 <li><strong>DeepSeek-V3.2</strong>：当 converters 中包含 <code>npu_dsa</code> 且 CP 开启时，自动使用 DSA CP。</li>
-<li><strong>DeepSeek-V4</strong>：当 converters 中包含 <code>npu_smla</code> 且 CP 开启时，自动使用 CompressorAttention CP。</li>
-<li><strong>Qwen3 TND</strong>：当模型配置使用 <code>NPUVarlenAttention</code> 且 CP 开启时，自动使用 NPUVarlen Ulysses CP。</li>
 </ul>
 <h3 id="sdpa-ulysses-cpdeepseek-v3">配置示例一：SDPA Ulysses CP（DeepSeek-V3）</h3>
 <p>在 <code>torchtitan_npu/models/deepseek_v3/config_registry.py</code> 的配置函数中设置：</p>
@@ -306,7 +335,7 @@ parallelism = ParallelismConfig(
 )
 </code></pre>
 <p>多机长序列训练推荐在 <code>scripts/run_train_multinodes.sh</code> 中配置节点 IP、
-<code>NGPU</code> 等集群信息后，直接覆盖为 32k 预置配置启动：</p>
+<code>NPUS_PER_NODE</code> 等集群信息后，直接覆盖为 32k 预置配置启动：</p>
 <pre><code class="language-bash">MODULE=torchtitan_npu.models.deepseek_v32 \
 CONFIG=deepseek_v32_671b_61layers_32k_128die \
 bash scripts/run_train_multinodes.sh
