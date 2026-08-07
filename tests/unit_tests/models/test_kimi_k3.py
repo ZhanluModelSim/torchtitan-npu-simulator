@@ -31,9 +31,11 @@ def _stub_kda_kernel(monkeypatch):
 
 class TestModelRegistry:
     def test_baseline_uses_only_fsdp_and_ep_parallelism(self):
-        from torchtitan_npu.models.kimi_k3.config_registry import kimi_k3_baseline
+        from torchtitan_npu.models.kimi_k3.config_registry import (
+            kimi_k3_baseline_bf16,
+        )
 
-        parallelism = kimi_k3_baseline().parallelism
+        parallelism = kimi_k3_baseline_bf16().parallelism
         assert parallelism.data_parallel_shard_degree == -1
         assert parallelism.expert_parallel_degree == 128
         assert parallelism.data_parallel_replicate_degree == 1
@@ -43,15 +45,69 @@ class TestModelRegistry:
         assert parallelism.context_parallel_degree == 1
 
     def test_simulator_config_reuses_baseline_parallelism(self):
-        from torchtitan_npu.models.kimi_k3.config_registry import kimi_k3_baseline
-        from torchtitan_npu.simulator.config_registry import kimi_k3_full_simulate
+        from torchtitan_npu.models.kimi_k3.config_registry import (
+            kimi_k3_baseline_bf16 as training_baseline_bf16,
+        )
+        from torchtitan_npu.simulator.config_registry import (
+            kimi_k3_baseline_bf16 as simulator_baseline_bf16,
+        )
 
-        training_config = kimi_k3_baseline()
-        simulation_config = kimi_k3_full_simulate()
+        training_config = training_baseline_bf16()
+        simulation_config = simulator_baseline_bf16()
 
         assert simulation_config.parallelism == training_config.parallelism
         assert simulation_config.compile.components == training_config.compile.components
         assert simulation_config.compile.enable is False
+
+    def test_mxfp8_baseline_enables_moe_converter(self):
+        from torchtitan.components.quantization.mx import MXFP8Converter
+        from torchtitan_npu.models.kimi_k3.config_registry import (
+            kimi_k3_baseline_mxfp8,
+        )
+
+        config = kimi_k3_baseline_mxfp8()
+        mxfp8_configs = [
+            converter
+            for converter in config.model_converters.converters
+            if isinstance(converter, MXFP8Converter.Config)
+        ]
+        assert len(mxfp8_configs) == 1
+        assert mxfp8_configs[0].fqns == ["moe.experts", "moe.shared_experts"]
+
+    @pytest.mark.parametrize(
+        "module",
+        ("torchtitan_npu.models.kimi_k3", "torchtitan_npu.simulator"),
+    )
+    def test_mxfp8_fqns_cli_override(self, module):
+        from torchtitan.components.quantization.mx import MXFP8Converter
+        from torchtitan.config import ConfigManager
+
+        config = ConfigManager().parse_args(
+            [
+                "--module",
+                module,
+                "--config",
+                "kimi_k3_baseline_mxfp8",
+                "--mxfp8-fqns",
+                "moe.experts",
+            ]
+        )
+        mxfp8_configs = [
+            converter
+            for converter in config.model_converters.converters
+            if isinstance(converter, MXFP8Converter.Config)
+        ]
+        assert len(mxfp8_configs) == 1
+        assert mxfp8_configs[0].fqns == ["moe.experts"]
+
+    def test_smoketest_uses_single_batch_without_cp_or_ep(self):
+        from torchtitan_npu.models.kimi_k3.config_registry import kimi_k3_smoketest
+
+        config = kimi_k3_smoketest()
+        assert config.training.local_batch_size == 1
+        assert config.parallelism.data_parallel_shard_degree == -1
+        assert config.parallelism.context_parallel_degree == 1
+        assert config.parallelism.expert_parallel_degree == 1
 
     def test_smoketest_enables_required_npu_converters(self):
         from torchtitan_npu.models.kimi_k3.config_registry import (

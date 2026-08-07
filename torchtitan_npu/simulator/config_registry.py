@@ -112,34 +112,52 @@ def deepseek_v4_smoketest() -> SimulationTrainerConfig:
 from torchtitan_npu.models.kimi_k3 import config_registry as _kimi_k3_configs  # noqa: E402
 
 
+@dataclasses.dataclass(kw_only=True, slots=True)
+class KimiK3SimulationTrainerConfig(SimulationTrainerConfig):
+    """Kimi K3 simulator config with an optional MXFP8 target-FQN override."""
+
+    mxfp8_fqns: list[str] | None = None
+
+    def __post_init__(self) -> None:
+        _kimi_k3_configs._apply_mxfp8_fqns_override(
+            self.model_converters,
+            self.mxfp8_fqns,
+        )
+
+
 def _kimi_k3_simulation_config(
     factory: Callable[[], TrainerConfig],
     *,
     output_name: str,
-) -> SimulationTrainerConfig:
+) -> KimiK3SimulationTrainerConfig:
     base_config = factory()
     base_fields = {
         field.name: getattr(base_config, field.name)
         for field in dataclasses.fields(base_config)
     }
     base_fields["compile"] = dataclasses.replace(base_config.compile, enable=False)
-    return SimulationTrainerConfig(
+    return KimiK3SimulationTrainerConfig(
         **base_fields,
         simulation=SimulationConfig(output_dir=f"./simulator_output/{output_name}"),
     )
 
 
-def kimi_k3_simulate() -> SimulationTrainerConfig:
-    """Kimi K3 debug simulator recipe."""
+def kimi_k3_baseline_bf16() -> KimiK3SimulationTrainerConfig:
     return _kimi_k3_simulation_config(
-        _kimi_k3_configs.kimi_k3_smoketest,
-        output_name="kimi_k3_simulate",
+        _kimi_k3_configs.kimi_k3_baseline_bf16,
+        output_name="kimi_k3_baseline_bf16",
     )
 
 
-def kimi_k3_full_simulate() -> SimulationTrainerConfig:
-    """Full Kimi K3 simulator recipe with FSDP=-1 and EP=128."""
+def kimi_k3_baseline_mxfp8() -> KimiK3SimulationTrainerConfig:
     return _kimi_k3_simulation_config(
-        _kimi_k3_configs.kimi_k3_baseline,
-        output_name="kimi_k3_full_simulate",
+        _kimi_k3_configs.kimi_k3_baseline_mxfp8,
+        output_name="kimi_k3_baseline_mxfp8",
+    )
+
+
+def kimi_k3_smoketest() -> KimiK3SimulationTrainerConfig:
+    return _kimi_k3_simulation_config(
+        _kimi_k3_configs.kimi_k3_smoketest,
+        output_name="kimi_k3_smoketest",
     )
