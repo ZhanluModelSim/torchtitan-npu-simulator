@@ -107,7 +107,7 @@ def test_kimi_gated_mla_records_one_virtual_fused_op_per_pass():
             qk_rope_head_dim=2,
             v_head_dim=4,
         )
-    )
+    ).to("meta")
     apply_kimi_k3_shims(module)
     x = torch.empty((2, 3, 16), device="meta", requires_grad=True)
     phase = {"value": "forward"}
@@ -118,13 +118,19 @@ def test_kimi_gated_mla_records_one_virtual_fused_op_per_pass():
         phase["value"] = "backward"
         output.sum().backward()
 
-    raw_names = [node.annotations["raw_op_type"] for node in capture.build_nodes().values()]
+    nodes = list(capture.build_nodes().values())
+    raw_names = [node.annotations["raw_op_type"] for node in nodes]
     assert raw_names.count("gated_mla") == 1
     assert raw_names.count("gated_mla_backward") == 1
     assert "aten.scaled_dot_product_attention.default" not in raw_names
+    assert raw_names.count("aten.mm.default") >= 6
+    assert "aten.sigmoid.default" in raw_names
     assert module._simulator_mla_shim_installed is True
     assert x.grad is not None
     assert all(parameter.grad is not None for parameter in module.parameters())
+    fused_forward = next(node for node in nodes if node.annotations["raw_op_type"] == "gated_mla")
+    assert [meta.shape for meta in fused_forward.inputs] == [(2, 2, 3, 6)] * 3
+    assert [meta.shape for meta in fused_forward.outputs] == [(2, 2, 3, 6)]
 
 
 def test_kimi_shared_expert_situ_glu_records_one_fused_activation_per_pass():

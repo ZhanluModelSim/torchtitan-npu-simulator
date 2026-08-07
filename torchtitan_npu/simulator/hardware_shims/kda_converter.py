@@ -20,7 +20,7 @@ from torchtitan_npu.models.kimi_k3.attention import KimiGatedMLA
 from torchtitan_npu.models.kimi_k3.feed_forward import KimiGroupedExperts, KimiMLP
 from torchtitan_npu.simulator.hardware_shims.kda_shim import sim_chunk_kda
 from torchtitan_npu.simulator.hardware_shims.kimi_k3_fusion_shim import (
-    sim_kimi_gated_mla,
+    sim_gated_mla_attention,
     sim_kimi_situ_glu,
 )
 from torchtitan_npu.simulator.hardware_shims.rms_norm_shim import (
@@ -86,7 +86,7 @@ def apply_kimi_k3_shims(model) -> None:
                 setattr(module, _GATED_RMS_NORM_SHIM_MARKER, True)
         elif isinstance(module, KimiGatedMLA):
             if not getattr(module, _MLA_SHIM_MARKER, False):
-                module.forward = MethodType(sim_kimi_gated_mla, module)
+                module._attention_core = MethodType(sim_gated_mla_attention, module)
                 setattr(module, _MLA_SHIM_MARKER, True)
         elif isinstance(module, KimiMLP):
             if not getattr(module, _MLP_SHIM_MARKER, False):

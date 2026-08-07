@@ -312,7 +312,7 @@ class KimiGatedMLA(nn.Module):
         key = key.transpose(1, 2)
         v_padded = v_padded.transpose(1, 2)
 
-        attn_output = F.scaled_dot_product_attention(query, key, v_padded, is_causal=True)
+        attn_output = self._attention_core(query, key, v_padded)
         attn_output = attn_output.transpose(1, 2)  # (B, S, H, D)
 
         # Trim padding
@@ -326,3 +326,12 @@ class KimiGatedMLA(nn.Module):
         attn_output = attn_output * gate
 
         return self.o_proj(attn_output)
+
+    def _attention_core(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run the MLA attention core after all projection/layout work."""
+        return F.scaled_dot_product_attention(query, key, value, is_causal=True)

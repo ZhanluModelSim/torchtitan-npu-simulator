@@ -38,14 +38,13 @@ def _record(name: str, inputs: list[torch.Tensor], outputs: list[torch.Tensor], 
         capture.record_synthetic_op(name, inputs=inputs, outputs=outputs, module_path=path)
 
 
-class _SimKimiGatedMLA(torch.autograd.Function):
+class _SimGatedMLA(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, hidden_states, *args):  # noqa: ANN001
-        *parameters, module_path = args
-        output = _empty_like(hidden_states)
-        ctx.save_for_backward(hidden_states, *parameters)
+    def forward(ctx, query, key, value, module_path):  # noqa: ANN001
+        output = _empty_like(query)
+        ctx.save_for_backward(query, key, value)
         ctx.module_path = module_path
-        _record("gated_mla", [hidden_states, *parameters], [output], module_path)
+        _record("gated_mla", [query, key, value], [output], module_path)
         return output
 
     @staticmethod
@@ -73,8 +72,14 @@ class _SimKimiSiTUGLU(torch.autograd.Function):
         return grad_gate, grad_up, None
 
 
-def sim_kimi_gated_mla(module, hidden_states, attention_masks=None, positions=None):  # noqa: ANN001
-    return _SimKimiGatedMLA.apply(hidden_states, *tuple(module.parameters()), _module_path())
+def sim_gated_mla_attention(
+    module: torch.nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+) -> torch.Tensor:
+    """Simulator-only MLA attention core, excluding all projections/norms."""
+    return _SimGatedMLA.apply(query, key, value, _module_path())
 
 
 def sim_kimi_situ_glu(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
