@@ -69,7 +69,7 @@ TND 只存在于 NPU 融合内核的局部计算中，不会成为模型公共�
 
 ## 压缩布局：CompressedVarlenMetadata
 
-[`metadata.py`](../torchtitan_npu/models/deepseek_v4/metadata.py) 定义唯一的注意力契约 `CompressedVarlenMetadata`，由同文件中的 `CompressedBlockMaskHandler`（模型目录默认 handler）每个 batch 构建一次，供所有 DSA 层复用：
+[`metadata.py`](../../torchtitan_npu/models/deepseek_v4/metadata.py) 定义唯一的注意力契约 `CompressedVarlenMetadata`，由同文件中的 `CompressedBlockMaskHandler`（模型目录默认 handler）每个 batch 构建一次，供所有 DSA 层复用：
 
 - `varlen`：`VarlenMetadata`，`cu_seq_q` 是序列边界的唯一权威来源。当前要求 `cu_seq_q == cu_seq_k`（尚无 context parallel）。
 - `batch_size` / `seq_len`：容器网格形状。DSV4 打包场景使用 `local_batch_size == 1`，因此 `batch_size == 1`、`seq_len` 等于总 token 数（`cu_seq_q[-1]`），元数据完全由 varlen 流推导，不依赖 positions。
@@ -95,7 +95,7 @@ cu_seqlens = [0, 3, 5]   # 一行里打包了 2 条序列
 
 ## 压缩与索引规则
 
-[`compressor.py`](../torchtitan_npu/models/deepseek_v4/compressor.py) 只处理完整压缩块，且**绝不跨文档压缩**。对长度为 `L` 的序列：
+[`compressor.py`](../../torchtitan_npu/models/deepseek_v4/compressor.py) 只处理完整压缩块，且**绝不跨文档压缩**。对长度为 `L` 的序列：
 
 ```text
 compressed_len = floor(L / r)
@@ -122,7 +122,7 @@ overlap_valid    = [F, T, F, T, T, T]  # 文档起始块没有前驱
 
 ## CANN 融合路径
 
-[`sparse_attn/cann.py`](../torchtitan_npu/override/deepseek_v4/sparse_attn/cann.py) 中的 `CANNCompressedSparseInnerAttention` 执行以下步骤：
+[`sparse_attn/cann.py`](../../torchtitan_npu/override/deepseek_v4/sparse_attn/cann.py) 中的 `CANNCompressedSparseInnerAttention` 执行以下步骤：
 
 1. 校验模型输入与 `CompressedVarlenMetadata` 一致，按 `self.compress_ratio` 取 plan。
 2. 把 query、原始 KV 转成 TND；压缩 KV 与 Indexer key 取容器网格头部 `n_blocks` 槽位转成打包流。
@@ -149,12 +149,3 @@ overlap_valid    = [F, T, F, T, T, T]  # 文档起始块没有前驱
 | Tensor Parallel | DSA 路径固定 TP=1（indexer score 对 head 维求和），TP 方案待 CP 之后另行设计 |
 | 空压缩流 | doc-packing 场景要求每条序列至少产生一个完整压缩块；NPU handler 对 `T_cmp=0` 直接报错（CANN CSA/HCA 不接受空 `cmp_kv`） |
 | 运行环境 | 需要 `torch_npu`、CANN、HCCL、Ascend NPU，以及匹配的 `cann_ops_transformer` |
-
-## 轻量检查
-
-以下命令只验证 Python 语法和文档改动，不等价于 NPU 训练验证：
-
-```bash
-python -m compileall -q torchtitan_npu
-git diff --check
-```

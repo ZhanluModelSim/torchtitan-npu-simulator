@@ -1,6 +1,6 @@
 # 快速上手
 
-参考[软件安装](./installation.md)准备环境后，以 DeepSeek-V4 模型为例，按照以下步骤在 NPU 平台上运行 torchtitan-npu。
+参考 [软件安装](./installation.md) 准备环境后，进入 `torchtitan-npu` 仓库根目录。除另有说明外，本文中的相对路径和命令均以仓库根目录为基准。以下步骤以 DeepSeek-V4 模型为例，在 NPU 平台上运行 torchtitan-npu。
 
 ## 数据准备
 
@@ -66,7 +66,7 @@ bash scripts/run_train.sh \
 > [!NOTE]
 > `scripts/run_train.sh` 配置项说明：
 > - `MODULE`：模型 Python 模块，默认为 `torchtitan_npu.models.deepseek_v4`。
-> - `CONFIG`：`config_registry.py` 中的配置函数，默认为 `deepseek_v4_debugmodel`。
+> - `CONFIG`：`torchtitan_npu/models/deepseek_v4/config_registry.py` 中注册的配置函数，默认为 `deepseek_v4_debugmodel`。
 > - `NGPU`：当前节点参与训练的 NPU 数量，默认为 `1`。
 > - `HF_ASSETS_PATH`：Tokenizer 目录，默认为示例路径 `/path/to/dsv4_tokenizer`，运行前需替换为实际目录。
 > - `DATASET` 和 `DATASET_PATH`：数据集名称和目录，默认使用仓内的 `tests/assets/c4_test/`。
@@ -90,7 +90,7 @@ bash scripts/run_train.sh \
   --checkpoint.no-enable
 ```
 
-DeepSeek-V4 的 SMLA 融合路径和 TND 数据约定见 [DeepSeek-V4 TND 适配](./TND.md)。
+DeepSeek-V4 的 SMLA 融合路径和 TND 数据约定见 [DeepSeek-V4 TND 适配](../feature_guides/deepseek_v4_tnd.md)。
 
 ### 排查启动报错：查看更多 rank 日志
 

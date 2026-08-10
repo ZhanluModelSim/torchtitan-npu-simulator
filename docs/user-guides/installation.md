@@ -26,14 +26,14 @@ torchtitan-npu 支持 Atlas 800T A3 等昇腾训练硬件。软件版本配套�
   <tbody>
     <tr>
       <td>昇腾NPU驱动</td>
-      <td rowspan="2">《<a href="https://www.hiascend.com/document/detail/zh/canncommercial/82RC1/softwareinst/instg/instg_0005.html?Mode=PmIns&InstallType=local&OS=Debian&Software=cannToolKit">驱动固件安装指南</a>》</td>
+      <td rowspan="2">《<a href="https://www.hiascend.com/document/detail/zh/canncommercial/latest/softwareinst/instg/instg_0005.html?OS=Debian&InstallType=local">驱动固件安装指南</a>》</td>
     </tr>
     <tr>
       <td>昇腾 NPU 固件</td>
     </tr>
     <tr>
       <td>Toolkit（开发套件）</td>
-      <td rowspan="3"><a href="https://ascend.devcloud.huaweicloud.com/artifactory/cann-run-mirror/software/master/">CANN 主线取包链接</a></td>
+      <td rowspan="3"><a href="https://ascend.devcloud.huaweicloud.com/artifactory/cann-run-mirror/software/legacy/20260805101249091/">CANN 主线取包链接</a></td>
     </tr>
     <tr>
       <td>ops/Kernel（算子包）</td>

@@ -263,7 +263,7 @@ token 数时应调整 `seq_len`。Golden reference 使用包含 reference tier �
 路径使用独立的精简 `CANNCompressedVarlenMetadata`，只携带 kernel contract 和预计算
 的 CANN metadata，不构造 Golden 路径使用的稠密 mask、文档位置和静态块列表。
 
-TND 数据约定见 [DeepSeek-V4 TND 适配](../../docs/TND.md)。
+TND 数据约定见 [DeepSeek-V4 TND 适配](../../docs/feature_guides/deepseek_v4_tnd.md)。
 
 ## Override 与 package patch
 
