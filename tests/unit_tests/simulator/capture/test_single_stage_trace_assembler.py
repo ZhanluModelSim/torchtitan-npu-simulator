@@ -18,7 +18,9 @@ from torchtitan_npu.simulator.capture.schedule_validation import (
     replay_1f1b_readiness,
     validate_1f1b_transfer_pairs,
 )
+from torchtitan_npu.simulator.capture.workload_builder import build_workload_graph
 from torchtitan_npu.simulator.ir.op_node import OpNode
+from torchtitan_npu.simulator.ir.schedule_graph import ScheduleGraph
 from torchtitan_npu.simulator.ir.step_graph import StepGraph
 from torchtitan_npu.simulator.memory.records import FSDPResidencyEvent
 
@@ -1368,14 +1370,223 @@ def test_fsdp_allgather_is_anchored_to_its_parameter_group(
     assert group1.op_id in graph.nodes[200].predecessors
     assert group1.annotations["ownership_placement"] == expected_placement
     if prefetch_source_fqn:
-        assert group1.predecessors == [group0.op_id]
-        assert 100 not in group1.predecessors
+        launch_nodes = [
+            node
+            for node in graph.nodes.values()
+            if node.op_type == "FSDP_PREFETCH_LAUNCH"
+        ]
+        assert len(launch_nodes) == 1
+        launch = launch_nodes[0]
+        assert launch.predecessors == [group0.op_id]
+        assert group1.predecessors == [launch.op_id]
+        assert launch.op_id in graph.nodes[100].predecessors
+        assert (
+            launch.flops,
+            launch.peak_mem,
+            launch.param_mem,
+            launch.comm_bytes,
+        ) == (0, 0, 0, 0)
+        assert launch.annotations["zero_cost"] is True
     else:
         assert group1.predecessors == [100]
+        assert all(
+            node.op_type != "FSDP_PREFETCH_LAUNCH"
+            for node in graph.nodes.values()
+        )
     assert all(
         not node.annotations.get("fsdp_marker")
         for node in graph.nodes.values()
     )
+
+
+@pytest.mark.parametrize(
+    ("comp_type", "layer_order", "prefetch_type"),
+    [
+        ("F", (0, 1, 2), "FORWARD"),
+        ("B", (2, 1, 0), "BACKWARD"),
+    ],
+)
+def test_fsdp_prefetch_launch_blocks_recursive_layer_runahead(
+    comp_type: str,
+    layer_order: tuple[int, ...],
+    prefetch_type: str,
+) -> None:
+    template_id = f"s0_{comp_type}"
+    compute_ids = [100 + position for position in range(3)]
+    allgather_ids = [500 + position for position in range(3)]
+    nodes: dict[int, OpNode] = {}
+    for position, layer in enumerate(layer_order):
+        compute_id = compute_ids[position]
+        predecessor = compute_ids[position - 1] if position else None
+        nodes[10 + 2 * position] = _fsdp_marker(
+            10 + 2 * position,
+            10 + 20 * position,
+            "unshard_wait",
+            f"group{layer}",
+            f"layers.{layer}",
+        )
+        nodes[11 + 2 * position] = _fsdp_marker(
+            11 + 2 * position,
+            30 + 20 * position,
+            "reshard_release",
+            f"group{layer}",
+            f"layers.{layer}",
+        )
+        nodes[compute_id] = OpNode(
+            op_id=compute_id,
+            op_type="matmul",
+            inputs=[],
+            outputs=[],
+            attrs={},
+            predecessors=[] if predecessor is None else [predecessor],
+            successors=(
+                []
+                if position == len(layer_order) - 1
+                else [compute_ids[position + 1]]
+            ),
+            seq_idx=20 + 20 * position,
+            annotations={"raw_op_type": "aten.mm.default"},
+        )
+
+    templates = {
+        template_id: StepGraph(template_id, comp_type, nodes),
+        "s0_UNSHARD": StepGraph(
+            "s0_UNSHARD",
+            "UNSHARD",
+            {
+                op_id: OpNode(
+                    op_id=op_id,
+                    op_type="allgather",
+                    inputs=[],
+                    outputs=[],
+                    attrs={},
+                    predecessors=[],
+                    successors=[],
+                    comm_bytes=128,
+                    annotations={"raw_op_type": "comm.allgather"},
+                )
+                for op_id in allgather_ids
+            },
+        ),
+    }
+    compute = ActionSpec(
+        action_type="COMPUTE",
+        stage=0,
+        mb_idx=0,
+        seq_idx=1,
+        order_key=(1, 0, 0),
+        comp_type=comp_type,
+        template_ref=template_id,
+        annotations={"compute_instance_id": f"{template_id}_mb0"},
+    )
+    unshards: list[ActionSpec] = []
+    comm_events: list[CommEvent] = []
+    for position, layer in enumerate(layer_order):
+        source_fqn = (
+            "" if position == 0 else f"layers.{layer_order[position - 1]}"
+        )
+        transition_id = f"transition{position}"
+        unshards.append(
+            ActionSpec(
+                action_type="UNSHARD",
+                stage=0,
+                mb_idx=0,
+                seq_idx=2 + position,
+                order_key=(2 + position, 0, position),
+                annotations={
+                    "fsdp_schedule_source": "state",
+                    "fsdp_transition_id": transition_id,
+                    "fsdp_group_id": f"group{layer}",
+                    "fsdp_module_fqn": f"layers.{layer}",
+                    "fsdp_prefetch_source_fqn": source_fqn,
+                    "fsdp_prefetch_type": prefetch_type if source_fqn else "",
+                    "parent_compute_instance_id": f"{template_id}_mb0",
+                    "residency_comp_type": comp_type,
+                    "shard_world_size": 2,
+                },
+            )
+        )
+        comm_events.extend([
+            CommEvent(
+                event_id=f"canonical{position}",
+                comm_primitive="allgather",
+                group_name="fsdp",
+                world_size=2,
+                tensor_shape=(64,),
+                dtype="bfloat16",
+                volume_bytes=128,
+                op_id=allgather_ids[position],
+                p2p_stage=0,
+                comp_type="UNSHARD",
+                fsdp_group_id=f"group{layer}",
+                fsdp_transition_id=f"canonical{position}",
+                fsdp_module_fqn=f"layers.{layer}",
+            ),
+            CommEvent(
+                event_id=f"semantic{position}",
+                comm_primitive="allgather",
+                group_name="fsdp",
+                world_size=2,
+                tensor_shape=(64,),
+                dtype="bfloat16",
+                volume_bytes=128,
+                p2p_stage=0,
+                comp_type=comp_type,
+                fsdp_group_id=f"group{layer}",
+                fsdp_transition_id=transition_id,
+                fsdp_module_fqn=f"layers.{layer}",
+                fsdp_prefetch_source_fqn=source_fqn,
+                fsdp_prefetch_type=prefetch_type if source_fqn else "",
+            ),
+        ])
+
+    normalize_communication_ownership(
+        step_templates=templates,
+        specs=[compute, *unshards],
+        comm_events=comm_events,
+    )
+
+    workload = build_workload_graph(
+        schedule_graph=ScheduleGraph(
+            schedule_id="fsdp-prefetch-launch",
+            workload_type="train",
+            step_templates=templates,
+            instances=[],
+        ),
+        step_templates=templates,
+        local_batch_size=1,
+        seq_len=128,
+    )
+    graph = workload.step_templates[template_id]
+    allgathers = {
+        node.annotations["fsdp_group_id"]: node
+        for node in graph.nodes.values()
+        if node.annotations.get("communication_owner") == "L1_STAGE"
+    }
+    launches = {
+        node.annotations["fsdp_group_id"]: node
+        for node in graph.nodes.values()
+        if node.op_type == "FSDP_PREFETCH_LAUNCH"
+    }
+    assert len(launches) == 2
+    assert graph.is_acyclic
+    for position in (1, 2):
+        source_layer = layer_order[position - 1]
+        target_layer = layer_order[position]
+        launch = launches[f"group{target_layer}"]
+        source_allgather = allgathers[f"group{source_layer}"]
+        target_allgather = allgathers[f"group{target_layer}"]
+        assert source_allgather.op_id in launch.predecessors
+        assert launch.op_id in graph.nodes[compute_ids[position - 1]].predecessors
+        assert target_allgather.predecessors == [launch.op_id]
+        assert target_allgather.op_id in graph.nodes[compute_ids[position]].predecessors
+        assert (
+            launch.flops,
+            launch.peak_mem,
+            launch.param_mem,
+            launch.comm_bytes,
+        ) == (0, 0, 0, 0)
+    assert compute_ids[0] in launches[f"group{layer_order[2]}"].predecessors
 
 
 def test_cross_action_fsdp_prefetch_belongs_to_launch_compute() -> None:
@@ -1402,8 +1613,32 @@ def test_cross_action_fsdp_prefetch_belongs_to_launch_compute() -> None:
         seq_idx=50,
         annotations={"raw_op_type": "aten.mm.default"},
     )
+    source_compute = OpNode(
+        op_id=100,
+        op_type="matmul",
+        inputs=[],
+        outputs=[],
+        attrs={},
+        predecessors=[],
+        successors=[],
+        seq_idx=20,
+        annotations={"raw_op_type": "aten.mm.default"},
+    )
     templates = {
-        "s0_B": StepGraph("s0_B", "B", {300: prefetch}),
+        "s0_B": StepGraph(
+            "s0_B",
+            "B",
+            {
+                1: _fsdp_marker(
+                    1, 10, "unshard_wait", "group0", "layers.0"
+                ),
+                2: _fsdp_marker(
+                    2, 30, "reshard_release", "group0", "layers.0"
+                ),
+                100: source_compute,
+                300: prefetch,
+            },
+        ),
         "s0_F": StepGraph(
             "s0_F",
             "F",
@@ -1503,6 +1738,15 @@ def test_cross_action_fsdp_prefetch_belongs_to_launch_compute() -> None:
         ]
         == "s0_F_mb1"
     )
+    launch_nodes = [
+        node
+        for node in templates["s0_B"].nodes.values()
+        if node.op_type == "FSDP_PREFETCH_LAUNCH"
+    ]
+    assert len(launch_nodes) == 1
+    launch = launch_nodes[0]
+    assert launch.op_id in templates["s0_B"].nodes[100].predecessors
+    assert backward_allgathers[0].predecessors == [launch.op_id]
     assert all(
         node.annotations.get("raw_op_type") != "comm.allgather"
         for node in templates["s0_F"].nodes.values()

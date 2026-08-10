@@ -71,6 +71,21 @@ The placement values are:
 | `layer_prefetch` | all-gather starts when the source group is ready and overlaps source compute |
 | `cross_action_prefetch` | all-gather is launched by one compute action for a later compute action |
 
+Every layer or cross-action prefetch has an explicit zero-cost control operator
+in the exported L1 graph:
+
+```text
+source input/gradient readiness + source parameter all-gather
+                         -> FSDP_PREFETCH_LAUNCH -> source compute
+                                                   -> target all-gather
+```
+
+`FSDP_PREFETCH_LAUNCH` has zero FLOPs, peak memory, parameter memory, and
+communication bytes. It models the source module hook: the target all-gather
+may overlap source compute, but a chain of fast all-gathers cannot recursively
+prefetch later layers before each source module is reached. A prefetch without
+a matching source parameter-group region is a capture error.
+
 `cross_action_prefetch` belongs to the launch action's L1 template. It is an
 exit of that template when the target use is in a later action; the later
 action must not contain a duplicate all-gather. Rank-local action order then

@@ -147,9 +147,11 @@ prefetch。例如 B 或 W 尾部发起 all-gather，为稍后的 F 准备参数�
 3. 继续遵守 rank-local 顶层 `schedule_order`；
 4. 不要因为目标 F 中没有相同 all-gather 而在 L2 补通信。
 
-层内 prefetch 则直接表现为 L1 DAG 中两个可并行分支：目标层 all-gather 和来源层 compute
-共享前置 readiness，目标层 compute 等待 all-gather。即使后端暂时把 DualPipeV 的双图
-overlap 串行化，也必须保留单张 L1 图内部的通信/计算并行关系。
+层内和跨 action 的 prefetch 都通过零开销控制算子 `FSDP_PREFETCH_LAUNCH` 表达：来源层的
+输入/梯度 readiness 和本层参数 all-gather 共同依赖到该算子，随后来源层 compute 与目标层
+all-gather 从该算子分叉并行，目标层 compute 再等待目标 all-gather。它的 FLOPs、显存和通信量
+均为 0，只用于阻止 all-gather 链在尚未到达来源层 hook 时继续向后预取。即使后端暂时把
+DualPipeV 的双图 overlap 串行化，也必须保留单张 L1 图内部的这些依赖与通信/计算并行关系。
 
 一个物理 rank 拥有多个虚拟 stage 时，参数基线和 FSDP residency 都按物理 rank 汇总。小模型中
 embedding/output 可能远大于 transformer layer，因此 V 形切分可能产生明显 rank 间显存不均；

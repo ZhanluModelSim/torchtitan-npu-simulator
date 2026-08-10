@@ -37,6 +37,7 @@ from torchtitan_npu.simulator.ir.step_graph import StepGraph
 
 _COMPUTE_TYPES = {"F", "B", "I", "W", "F_RECOMPUTE"}
 _STAGE_TEMPLATE_TYPES = _COMPUTE_TYPES | {"OPTIMIZER"}
+_FSDP_PREFETCH_LAUNCH_OP = "FSDP_PREFETCH_LAUNCH"
 _P2P_ACTION_BY_DIRECTION = {
     "forward_send": "SEND_F",
     "forward_recv": "RECV_F",
@@ -322,6 +323,57 @@ class _FSDPGroupRegion:
     entry_op_ids: tuple[int, ...]
     exit_op_ids: tuple[int, ...]
     external_predecessors: tuple[int, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _FSDPPrefetchAnchor:
+    predecessor_op_ids: tuple[int, ...]
+    source_entry_op_ids: tuple[int, ...]
+    seq_idx: int
+
+
+def _fsdp_prefetch_anchor(
+    *,
+    template_id: str,
+    target_group_id: str,
+    target_module_fqn: str,
+    prefetch_source_fqn: str,
+    regions_by_module: dict[str, list[_FSDPGroupRegion]],
+    comm_id_by_group: dict[str, int],
+) -> _FSDPPrefetchAnchor:
+    source_regions = regions_by_module.get(prefetch_source_fqn, [])
+    if not source_regions:
+        raise RuntimeError(
+            "FSDP prefetch has no source parameter-group compute region: "
+            f"template={template_id}, target_group={target_group_id}, "
+            f"target_module={target_module_fqn!r}, "
+            f"source_module={prefetch_source_fqn!r}"
+        )
+
+    predecessor_op_ids = list(
+        dict.fromkeys(
+            predecessor
+            for region in source_regions
+            for predecessor in region.external_predecessors
+        )
+    )
+    predecessor_op_ids.extend(
+        comm_id
+        for region in source_regions
+        if (comm_id := comm_id_by_group.get(region.group_id)) is not None
+    )
+    source_entry_op_ids = tuple(
+        dict.fromkeys(
+            entry
+            for region in source_regions
+            for entry in region.entry_op_ids
+        )
+    )
+    return _FSDPPrefetchAnchor(
+        predecessor_op_ids=tuple(dict.fromkeys(predecessor_op_ids)),
+        source_entry_op_ids=source_entry_op_ids,
+        seq_idx=min(region.wait_seq_idx for region in source_regions),
+    )
 
 
 def _fsdp_group_regions(
@@ -800,11 +852,25 @@ class FSDPStageOwnershipPlugin:
                     if region.module_fqn:
                         regions_by_module[region.module_fqn].append(region)
 
-                comm_id_by_group = {
-                    str(item.spec.annotations.get("fsdp_group_id", "")):
-                    node_id_map[item.source_node.op_id]
-                    for item in owned
-                }
+                comm_id_by_group: dict[str, int] = {}
+                for item in owned:
+                    target_parent_id = str(
+                        item.spec.annotations.get(
+                            "parent_compute_instance_id",
+                            "",
+                        )
+                    )
+                    if item.owner_compute_instance_id != target_parent_id:
+                        continue
+                    # A later action may prefetch the same group again. Only
+                    # this action's all-gather proves its source params ready.
+                    group_id = str(
+                        item.spec.annotations.get("fsdp_group_id", "")
+                    )
+                    comm_id_by_group.setdefault(
+                        group_id,
+                        node_id_map[item.source_node.op_id],
+                    )
                 successor_links: dict[int, list[int]] = defaultdict(list)
                 residency_intervals: list[dict[str, object]] = []
                 for item in owned:
@@ -877,40 +943,22 @@ class FSDPStageOwnershipPlugin:
                         item.owner_compute_instance_id
                         != target_parent_id
                     )
-                    placement = (
-                        "cross_action_prefetch"
-                        if cross_action_prefetch
-                        else "captured"
-                    )
                     target_entries: tuple[int, ...] = tuple(
                         captured_successors
                     )
+                    if cross_action_prefetch:
+                        placement = "cross_action_prefetch"
+                    elif prefetch_source_fqn:
+                        placement = "layer_prefetch"
+                    elif captured_successors:
+                        placement = "captured"
+                    else:
+                        placement = "layer_jit"
                     if not captured_successors:
                         if cross_action_prefetch:
-                            source_regions = regions_by_module.get(
-                                prefetch_source_fqn,
-                                [],
-                            )
-                            source_group_ids = {
-                                source_region.group_id
-                                for source_region in source_regions
-                            }
-                            predecessors.extend(
-                                comm_id
-                                for source_group_id in source_group_ids
-                                if (
-                                    comm_id := comm_id_by_group.get(
-                                        source_group_id
-                                    )
-                                )
-                                is not None
-                            )
-                            predecessors = list(
-                                dict.fromkeys(predecessors)
-                            )
                             target_entries = ()
                         elif region is None:
-                            if source_is_captured:
+                            if source_is_captured and not prefetch_source_fqn:
                                 residency_intervals.append({
                                     "fsdp_group_id": group_id,
                                     "fsdp_module_fqn": module_fqn,
@@ -948,10 +996,7 @@ class FSDPStageOwnershipPlugin:
                                 f"template={base_id}, group={group_id}, "
                                 f"module={module_fqn!r}"
                             )
-                        if (
-                            not cross_action_prefetch
-                            and region is not None
-                        ):
+                        if not cross_action_prefetch and region is not None:
                             target_entries = region.entry_op_ids
                         if (
                             not cross_action_prefetch
@@ -963,31 +1008,7 @@ class FSDPStageOwnershipPlugin:
                                 f"template={base_id}, group={group_id}, "
                                 f"module={module_fqn!r}"
                             )
-                        if (
-                            not cross_action_prefetch
-                            and prefetch_source_fqn
-                        ):
-                            placement = "layer_prefetch"
-                            source_regions = regions_by_module.get(
-                                prefetch_source_fqn,
-                                [],
-                            )
-                            source_group_ids = {
-                                source_region.group_id
-                                for source_region in source_regions
-                            }
-                            predecessors.extend(
-                                comm_id
-                                for source_group_id in source_group_ids
-                                if (
-                                    comm_id := comm_id_by_group.get(
-                                        source_group_id
-                                    )
-                                )
-                                is not None
-                            )
-                        elif not cross_action_prefetch:
-                            placement = "layer_jit"
+                        if not cross_action_prefetch and not prefetch_source_fqn:
                             predecessors.extend(
                                 region.external_predecessors
                             )
@@ -1009,6 +1030,51 @@ class FSDPStageOwnershipPlugin:
                                     predecessors.extend(
                                         previous.exit_op_ids
                                     )
+                    prefetch_launch_op_id: int | None = None
+                    if prefetch_source_fqn:
+                        anchor = _fsdp_prefetch_anchor(
+                            template_id=base_id,
+                            target_group_id=group_id,
+                            target_module_fqn=module_fqn,
+                            prefetch_source_fqn=prefetch_source_fqn,
+                            regions_by_module=regions_by_module,
+                            comm_id_by_group=comm_id_by_group,
+                        )
+                        prefetch_launch_op_id = next_synthetic_id
+                        next_synthetic_id -= 1
+                        pure.nodes[prefetch_launch_op_id] = OpNode(
+                            op_id=prefetch_launch_op_id,
+                            op_type=_FSDP_PREFETCH_LAUNCH_OP,
+                            inputs=[],
+                            outputs=[],
+                            attrs={},
+                            predecessors=list(anchor.predecessor_op_ids),
+                            successors=[],
+                            flops=0,
+                            peak_mem=0,
+                            param_mem=0,
+                            comm_bytes=0,
+                            annotations={
+                                "raw_op_type": _FSDP_PREFETCH_LAUNCH_OP,
+                                "control_op": True,
+                                "zero_cost": True,
+                                "fsdp_group_id": group_id,
+                                "fsdp_module_fqn": module_fqn,
+                                "fsdp_prefetch_source_fqn": (
+                                    prefetch_source_fqn
+                                ),
+                                "fsdp_prefetch_type": prefetch_type,
+                                "ownership_placement": placement,
+                                "fsdp_target_compute_instance_id": (
+                                    target_parent_id
+                                ),
+                            },
+                            seq_idx=anchor.seq_idx,
+                        )
+                        successor_links[prefetch_launch_op_id].extend(
+                            anchor.source_entry_op_ids
+                        )
+                        predecessors.append(prefetch_launch_op_id)
                     predecessors = list(dict.fromkeys(predecessors))
                     annotations = dict(source.annotations)
                     annotations.update({
@@ -1023,6 +1089,9 @@ class FSDPStageOwnershipPlugin:
                         "ownership_placement": placement,
                         "fsdp_target_compute_instance_id": (
                             target_parent_id
+                        ),
+                        "fsdp_prefetch_launch_op_id": (
+                            prefetch_launch_op_id
                         ),
                     })
                     pure.nodes[new_id] = _clone_node(
@@ -1050,6 +1119,7 @@ class FSDPStageOwnershipPlugin:
                         "fsdp_target_compute_instance_id": (
                             target_parent_id
                         ),
+                        "prefetch_launch_op_id": prefetch_launch_op_id,
                     })
 
                 for comm_id, successors in successor_links.items():
