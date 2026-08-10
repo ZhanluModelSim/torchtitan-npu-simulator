@@ -653,7 +653,7 @@ class SparseAttention(Module):
         combined_logits = combined_logits - combined_logits.max(dim=-1, keepdim=True).values
 
         probs = nn.functional.softmax(combined_logits.float(), dim=-1, dtype=combined_logits.dtype)
-        scores = probs[..., :-1]
+        scores = probs[..., :-1].to(attn_weights.dtype)
         attn_output = torch.matmul(scores, kv_states)
         attn_output = attn_output.transpose(1, 2).contiguous()
         return attn_output

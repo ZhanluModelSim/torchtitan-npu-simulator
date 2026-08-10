@@ -74,6 +74,35 @@ logger = logging.getLogger(__name__)
 FSDP_MP_POLICY_ATTR = "_mp_policy"
 
 
+def _summarize_fsdp_parameter_names(parameter_names: tuple[str, ...]) -> str:
+    grouped_names: dict[str, list[int]] = {}
+    for name in parameter_names:
+        segments = name.split(".")
+        if len(segments) > 2 and segments[0] == "layers" and segments[1].isdigit():
+            grouped_name = ".".join(("layers", "*", *segments[2:]))
+            grouped_names.setdefault(grouped_name, []).append(int(segments[1]))
+        else:
+            grouped_names.setdefault(name, [])
+
+    summaries: list[str] = []
+    for name, layer_ids in grouped_names.items():
+        if not layer_ids:
+            summaries.append(name)
+            continue
+
+        unique_layer_ids = sorted(set(layer_ids))
+        if unique_layer_ids == list(range(unique_layer_ids[0], unique_layer_ids[-1] + 1)):
+            layer_scope = (
+                str(unique_layer_ids[0])
+                if len(unique_layer_ids) == 1
+                else f"{unique_layer_ids[0]}-{unique_layer_ids[-1]}"
+            )
+        else:
+            layer_scope = ", ".join(str(layer_id) for layer_id in unique_layer_ids)
+        summaries.append(f"{name} ({len(layer_ids)} params; layers {layer_scope})")
+    return "\n  - ".join(summaries)
+
+
 class AwaitRowwiseParallel(RowwiseParallel):
     @staticmethod
     def _prepare_output_fn(output_layouts, use_local_output, mod, outputs, device_mesh):
@@ -380,6 +409,25 @@ def parallelize_deepseek_v4(
             use_deepep=use_deepep,
         )
 
+    fsdp_preserve_parameter_patterns = parallelism.fsdp_preserve_parameter_patterns
+    fully_shard_enabled = parallel_dims.fsdp_enabled or parallel_dims.ep_enabled
+    if fsdp_preserve_parameter_patterns and not fully_shard_enabled:
+        logger.warning("Ignoring fsdp_preserve_parameter_patterns because FSDP/EP is disabled")
+
+    # Resolve model-owned FQNs before activation checkpointing and compilation
+    # insert transparent wrapper segments into parameter names.
+    if fsdp_preserve_parameter_patterns and fully_shard_enabled:
+        marked_parameter_names = apply_fsdp_parameter_precision(
+            model,
+            fsdp_preserve_parameter_patterns,
+        )
+        if marked_parameter_names:
+            logger.info(
+                "Applied parameter-level FSDP precision overrides to %d parameters:\n  - %s",
+                len(marked_parameter_names),
+                _summarize_fsdp_parameter_names(marked_parameter_names),
+            )
+
     model_compile_enabled = compile_config.enable and "model" in compile_config.components
     npu_gmm_enabled = has_npu_converter(model_converters.converters, "npu_gmm")
     npu_moe_dispatch_enabled = has_npu_converter(model_converters.converters, "npu_moe_dispatch")
@@ -417,11 +465,6 @@ def parallelize_deepseek_v4(
             )
         apply_compile(model, compile_config)
 
-    fsdp_preserve_parameter_patterns = parallelism.fsdp_preserve_parameter_patterns
-    fully_shard_enabled = parallel_dims.fsdp_enabled or parallel_dims.ep_enabled
-    if fsdp_preserve_parameter_patterns and not fully_shard_enabled:
-        logger.warning("Ignoring fsdp_preserve_parameter_patterns because FSDP/EP is disabled")
-
     dp_mesh: DeviceMesh | None = None
     if fully_shard_enabled:
         # apply FSDP or HSDP, potentially with Context Parallel
@@ -431,19 +474,6 @@ def parallelize_deepseek_v4(
         # the mesh dim names of which the MoE params are sharded on via FSDP/HSDP
         edp_mesh_names = ["dp_replicate", "efsdp"] if parallel_dims.dp_replicate_enabled else ["efsdp"]
         edp_mesh = parallel_dims.get_optional_mesh(edp_mesh_names)
-
-        # EP uses the same fully_shard() path for expert parameters, so
-        # precision markers must be applied before the first fully_shard() call.
-        if fsdp_preserve_parameter_patterns:
-            marked_parameter_names = apply_fsdp_parameter_precision(
-                model,
-                fsdp_preserve_parameter_patterns,
-            )
-            if marked_parameter_names:
-                logger.info(
-                    "Applied parameter-level FSDP precision overrides to %d parameters",
-                    len(marked_parameter_names),
-                )
 
         apply_fsdp(
             model,

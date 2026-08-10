@@ -429,13 +429,7 @@ def test_deepseek_v4_configs_define_model_scoped_fsdp_parameter_patterns():
     from torchtitan_npu.models.deepseek_v4 import config_registry
 
     expected_patterns = [
-        "layers.*.*norm.weight",
-        "norm.weight",
-        "layers.*.attention.pre_attention.*_norm.weight",
-        "layers.*.attention.pre_attention.**.compressor*.norm.weight",
         "layers.*.attention.pre_attention.**.compressor*.ape",
-        "layers.*.attention.pre_attention.**.compressor*.wkv.weight",
-        "layers.*.attention.pre_attention.**.compressor*.wgate.weight",
         "layers.*.attention.inner_attention.attn_sink",
         "layers.*.moe.router.gate.weight",
         "layers.*.hc_*",

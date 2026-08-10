@@ -36,13 +36,7 @@ _DEFAULT_CONVERTERS = ("npu_rms_norm", "npu_moe_dispatch", "npu_gmm", "npu_rope"
 
 
 _DEEPSEEK_V4_FP32_PARAMETER_PATTERNS = [
-    "layers.*.*norm.weight",
-    "norm.weight",
-    "layers.*.attention.pre_attention.*_norm.weight",
-    "layers.*.attention.pre_attention.**.compressor*.norm.weight",
     "layers.*.attention.pre_attention.**.compressor*.ape",
-    "layers.*.attention.pre_attention.**.compressor*.wkv.weight",
-    "layers.*.attention.pre_attention.**.compressor*.wgate.weight",
     "layers.*.attention.inner_attention.attn_sink",
     "layers.*.moe.router.gate.weight",
     "layers.*.hc_*",
