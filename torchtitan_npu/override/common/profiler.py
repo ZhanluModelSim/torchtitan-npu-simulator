@@ -15,7 +15,7 @@ from torchtitan.tools.logging import logger
 from torchtitan.tools.profiler import Profiler
 
 
-class NPUProfiler(Profiler):
+class CANNProfiler(Profiler):
     @dataclass(kw_only=True, slots=True)
     class Config(Profiler.Config):
         pass
@@ -101,7 +101,7 @@ class NPUProfiler(Profiler):
 
 @override(
     target=Profiler.Config,
-    description="NPU profiler using torch_npu.profiler with Ascend-specific options",
+    description="CANN profiler using torch_npu.profiler with Ascend-specific options",
 )
-def npu_profiler_override(cfg: Profiler.Config) -> NPUProfiler.Config:
-    return derive(cfg, NPUProfiler.Config)
+def cann(cfg: Profiler.Config) -> CANNProfiler.Config:
+    return derive(cfg, CANNProfiler.Config)

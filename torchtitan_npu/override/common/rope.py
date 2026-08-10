@@ -4,10 +4,10 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Override: provide NPU-compatible and fused rotary embeddings.
+"""Override: provide torch-compatible and CANN fused rotary embeddings.
 
-Compatibility variants index complex caches through real views. Fused variants
-also call ``torch_npu.npu_rotary_mul``; select one variant per RoPE config.
+The workaround variant indexes complex caches through real views; the CANN
+fused variants call ``torch_npu.npu_rotary_mul``.  Select one per RoPE config.
 """
 
 from dataclasses import dataclass
@@ -22,65 +22,40 @@ from torchtitan.models.common.rope import (
     _reshape_for_broadcast,
 )
 
-from torchtitan_npu.patches.torchtitan.models.common.rope import SingleComplexRoPE
 
-
-def reshape_complex_cache_via_real(
-    cache: torch.Tensor,
-    query: torch.Tensor,
-    positions: torch.Tensor | None,
-) -> torch.Tensor:
-    """Index a complex cache through its real view for Ascend NPU support."""
-    positions = _maybe_wrap_positions(positions, query)
-    complex_query_shape = (*query.shape[:-1], query.shape[-1] // 2)
-    cache_flat = torch.view_as_real(cache).flatten(-2, -1)
-    reshaped = _reshape_for_broadcast(cache_flat, complex_query_shape, positions)
-    reshaped = reshaped.view(*reshaped.shape[:-1], -1, 2)
-    return torch.view_as_complex(reshaped)
-
-
-class _NPUComplexCacheMixin:
+class _WorkaroundComplexCacheMixin:
     """Replace complex cache indexing without changing its frequencies."""
+
+    cache: torch.Tensor
 
     def _reshape_cache(
         self,
         query: torch.Tensor,
         positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        cache = self.cache  # pyrefly: ignore [missing-attribute]
-        return reshape_complex_cache_via_real(cache, query, positions)
+        # Index the complex cache through its real view for Ascend NPU
+        # support.
+        positions = _maybe_wrap_positions(positions, query)
+        complex_query_shape = (*query.shape[:-1], query.shape[-1] // 2)
+        cache_flat = torch.view_as_real(self.cache).flatten(-2, -1)
+        reshaped = _reshape_for_broadcast(cache_flat, complex_query_shape, positions)
+        reshaped = reshaped.view(*reshaped.shape[:-1], -1, 2)
+        return torch.view_as_complex(reshaped)
 
 
-class NPUComplexRoPE(_NPUComplexCacheMixin, ComplexRoPE):
+class WorkaroundComplexRoPE(_WorkaroundComplexCacheMixin, ComplexRoPE):
     @dataclass(kw_only=True, slots=True)
     class Config(ComplexRoPE.Config):
-        pass
-
-
-class NPUSingleComplexRoPE(_NPUComplexCacheMixin, SingleComplexRoPE):
-    @dataclass(kw_only=True, slots=True)
-    class Config(SingleComplexRoPE.Config):
         pass
 
 
 @override(
     target=ComplexRoPE.Config,
     exact=True,
-    description="NPU-friendly ComplexRoPE indexing via view_as_real",
+    description="Torch-compatible ComplexRoPE indexing via view_as_real (workaround)",
 )
-def npu_rope_override(cfg: ComplexRoPE.Config) -> NPUComplexRoPE.Config:
-    return derive(cfg, NPUComplexRoPE.Config)
-
-
-@override(
-    target=SingleComplexRoPE.Config,
-    exact=True,
-    description="NPU-friendly SingleComplexRoPE indexing via view_as_real",
-)
-def npu_single_complex_rope_override(
-    cfg: SingleComplexRoPE.Config,
-) -> NPUSingleComplexRoPE.Config:
-    return derive(cfg, NPUSingleComplexRoPE.Config)
+def workaround(cfg: ComplexRoPE.Config) -> WorkaroundComplexRoPE.Config:
+    return derive(cfg, WorkaroundComplexRoPE.Config)
 
 
 class _FirstRowPositionsMixin:
@@ -96,54 +71,40 @@ class _FirstRowPositionsMixin:
     ) -> torch.Tensor:
         if positions is not None and positions.size(0) > 1:
             positions = positions[0].unsqueeze(0)
-        reshape_cache = super()._reshape_cache  # pyrefly: ignore [missing-attribute]
-        return reshape_cache(query, positions)
+        return super()._reshape_cache(  # pyrefly: ignore [missing-attribute]
+            query, positions
+        )
 
 
-class NPUFusedRoPE(_FirstRowPositionsMixin, NPUComplexRoPE):
+class CANNComplexRoPE(_FirstRowPositionsMixin, WorkaroundComplexRoPE):
     @dataclass(kw_only=True, slots=True)
-    class Config(NPUComplexRoPE.Config):
+    class Config(WorkaroundComplexRoPE.Config):
         pass
 
     @staticmethod
-    def apply_rotary_emb(
+    def apply_rotary_emb(  # pyrefly: ignore [bad-override]
         query: torch.Tensor,
-        key: torch.Tensor,
+        key: torch.Tensor | None,
         rope_cache: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        *,
+        inverse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         cos = rope_cache.real.repeat_interleave(2, dim=-1).to(query.dtype)
         sin = rope_cache.imag.repeat_interleave(2, dim=-1).to(query.dtype)
+        if inverse:
+            sin = -sin
         xq_out = torch_npu.npu_rotary_mul(
             query.float(), cos, sin, rotary_mode="interleave"
         ).type_as(query)
+        if key is None:
+            return xq_out
         xk_out = torch_npu.npu_rotary_mul(
             key.float(), cos.to(key.dtype), sin.to(key.dtype), rotary_mode="interleave"
         ).type_as(key)
         return xq_out, xk_out
 
 
-class NPUFusedSingleRoPE(_FirstRowPositionsMixin, NPUSingleComplexRoPE):
-    @dataclass(kw_only=True, slots=True)
-    class Config(NPUSingleComplexRoPE.Config):
-        pass
-
-    @staticmethod
-    def apply_rotary_emb(
-        x: torch.Tensor,
-        rope_cache: torch.Tensor,
-        *,
-        inverse: bool,
-    ) -> torch.Tensor:
-        cos = rope_cache.real.repeat_interleave(2, dim=-1).to(x.dtype)
-        sin = rope_cache.imag.repeat_interleave(2, dim=-1).to(x.dtype)
-        if inverse:
-            sin = -sin
-        return torch_npu.npu_rotary_mul(
-            x.float(), cos, sin, rotary_mode="interleave"
-        ).type_as(x)
-
-
-class NPUCosSinRoPE(_FirstRowPositionsMixin, CosSinRoPE):
+class CANNCosSinRoPE(_FirstRowPositionsMixin, CosSinRoPE):
     @dataclass(kw_only=True, slots=True)
     class Config(CosSinRoPE.Config):
         pass
@@ -153,7 +114,11 @@ class NPUCosSinRoPE(_FirstRowPositionsMixin, CosSinRoPE):
         query: torch.Tensor,
         key: torch.Tensor,
         rope_cache: torch.Tensor,
+        *,
+        inverse: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if inverse:
+            raise NotImplementedError("CosSinRoPE does not support inverse rotation.")
         head_dim = query.shape[-1]
         cos = rope_cache[..., :head_dim].to(query.dtype)
         sin = rope_cache[..., head_dim:].to(query.dtype)
@@ -169,26 +134,15 @@ class NPUCosSinRoPE(_FirstRowPositionsMixin, CosSinRoPE):
 @override(
     target=ComplexRoPE.Config,
     exact=True,
-    description="NPU fused RoPE via torch_npu.npu_rotary_mul (interleave mode)",
+    description="CANN fused ComplexRoPE via torch_npu.npu_rotary_mul (interleave mode)",
 )
-def npu_fused_rope_override(cfg: ComplexRoPE.Config) -> NPUFusedRoPE.Config:
-    return derive(cfg, NPUFusedRoPE.Config)
-
-
-@override(
-    target=SingleComplexRoPE.Config,
-    exact=True,
-    description="NPU fused single-tensor RoPE via npu_rotary_mul (interleave)",
-)
-def npu_fused_single_rope_override(
-    cfg: SingleComplexRoPE.Config,
-) -> NPUFusedSingleRoPE.Config:
-    return derive(cfg, NPUFusedSingleRoPE.Config)
+def cann_complex(cfg: ComplexRoPE.Config) -> CANNComplexRoPE.Config:
+    return derive(cfg, CANNComplexRoPE.Config)
 
 
 @override(
     target=CosSinRoPE.Config,
-    description="NPU fused CosSinRoPE via torch_npu.npu_rotary_mul (half mode)",
+    description="CANN fused CosSinRoPE via torch_npu.npu_rotary_mul (half mode)",
 )
-def npu_cossin_rope_override(cfg: CosSinRoPE.Config) -> NPUCosSinRoPE.Config:
-    return derive(cfg, NPUCosSinRoPE.Config)
+def cann_cossin(cfg: CosSinRoPE.Config) -> CANNCosSinRoPE.Config:
+    return derive(cfg, CANNCosSinRoPE.Config)

@@ -21,6 +21,13 @@ ignore-missing-imports = ["torchao.*", "torchft", "cann_ops_transformer"]
 search-path = ["/tmp/torchtitan"]
 replace-imports-with-any = ["torch_npu", "torch.npu"]
 
+[[tool.pyrefly.sub-config]]
+# Patch files deliberately monkey-patch upstream modules through full
+# ``torchtitan...`` / ``torch...`` paths without importing each submodule.
+matches = "torchtitan_npu/patches/**"
+[tool.pyrefly.sub-config.errors]
+implicit-import = false
+
 [tool.ruff]
 target-version = "py312"
 line-length = 88

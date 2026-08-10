@@ -7,27 +7,36 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
+from torch import nn
 from torchtitan.protocols.module import Module
 
 
-class HcSplitSinkhorn(Module):
+class HcPre(Module):
+    """Head-collaboration pre step; owns its mixing parameters."""
+
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
         hc_mult: int = 4
+        dim: int
         sinkhorn_iters: int = 20
         eps: float = 1e-6
+        norm_eps: float = 1e-6
 
     def __init__(self, config: Config):
         super().__init__()
+        hc_mult = config.hc_mult
+        mix_hc = (2 + hc_mult) * hc_mult
+        hc_dim = hc_mult * config.dim
         self.hc_mult = config.hc_mult
         self.sinkhorn_iters = config.sinkhorn_iters
         self.eps = config.eps
+        self.norm_eps = config.norm_eps
+        self.hc_fn = nn.Parameter(torch.empty(mix_hc, hc_dim, dtype=torch.float32))
+        self.hc_base = nn.Parameter(torch.empty(mix_hc, dtype=torch.float32))
+        self.hc_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
 
-    def forward(self, mixes, hc_scale, hc_base):
+    def _sinkhorn(self, mixes, hc_scale, hc_base):
         hc_mult = self.hc_mult
-        mixes = mixes.float()
-        hc_scale = hc_scale.float()
-        hc_base = hc_base.float()
         pre, post, comb = mixes.split([hc_mult, hc_mult, hc_mult * hc_mult], dim=-1)
         comb = comb.unflatten(-1, (hc_mult, hc_mult))
 
@@ -45,8 +54,6 @@ class HcSplitSinkhorn(Module):
             hc_mult, hc_mult
         ).unsqueeze(0).unsqueeze(0)
 
-        # Match the inference baseline's explicit exp-normalize sequence.
-        # ``torch.softmax`` rounds differently and changes later Sinkhorn steps.
         row_max = comb.max(dim=-1, keepdim=True).values
         comb = torch.exp(comb - row_max)
         comb = comb / comb.sum(dim=-1, keepdim=True) + self.eps
@@ -56,32 +63,14 @@ class HcSplitSinkhorn(Module):
             comb = comb / (comb.sum(dim=-2, keepdim=True) + self.eps)
         return pre, post, comb
 
-
-class HcPre(Module):
-    @dataclass(kw_only=True, slots=True)
-    class Config(Module.Config):
-        hc_mult: int = 4
-        dim: int
-        sinkhorn_iters: int = 20
-        eps: float = 1e-6
-        norm_eps: float = 1e-6
-
-    def __init__(self, config: Config):
-        super().__init__()
-        self.hc_mult = config.hc_mult
-        self.norm_eps = config.norm_eps
-        self.sinkhorn = HcSplitSinkhorn.Config(
-            hc_mult=config.hc_mult,
-            sinkhorn_iters=config.sinkhorn_iters,
-            eps=config.eps,
-        ).build()
-
-    def forward(self, x, hc_fn, hc_scale, hc_base):
+    def forward(self, x):
         shape, dtype = x.size(), x.dtype
         x = x.flatten(2).float()
         rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + self.norm_eps)
-        mixes = F.linear(x, hc_fn.float()) * rsqrt
-        pre, post, comb = self.sinkhorn(mixes, hc_scale, hc_base)
+        mixes = F.linear(x, self.hc_fn.float()) * rsqrt
+        pre, post, comb = self._sinkhorn(
+            mixes, self.hc_scale.float(), self.hc_base.float()
+        )
         y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=2)
         return y.to(dtype), post, comb
 
@@ -102,6 +91,8 @@ class HcPost(Module):
 
 
 class HcHead(Module):
+    """Head-collaboration head; owns its mixing parameters."""
+
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
         hc_mult: int = 4
@@ -111,14 +102,20 @@ class HcHead(Module):
 
     def __init__(self, config: Config):
         super().__init__()
+        hc_dim = config.hc_mult * config.dim
         self.norm_eps = config.norm_eps
         self.eps = config.eps
+        self.hc_fn = nn.Parameter(
+            torch.empty(config.hc_mult, hc_dim, dtype=torch.float32)
+        )
+        self.hc_base = nn.Parameter(torch.empty(config.hc_mult, dtype=torch.float32))
+        self.hc_scale = nn.Parameter(torch.empty(1, dtype=torch.float32))
 
-    def forward(self, x, hc_fn, hc_scale, hc_base):
+    def forward(self, x):
         shape, dtype = x.size(), x.dtype
         x = x.flatten(2).float()
         rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + self.norm_eps)
-        mixes = F.linear(x, hc_fn.float()) * rsqrt
-        pre = torch.sigmoid(mixes * hc_scale.float() + hc_base.float()) + self.eps
+        mixes = F.linear(x, self.hc_fn.float()) * rsqrt
+        pre = torch.sigmoid(mixes * self.hc_scale + self.hc_base) + self.eps
         y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=2)
         return y.to(dtype)

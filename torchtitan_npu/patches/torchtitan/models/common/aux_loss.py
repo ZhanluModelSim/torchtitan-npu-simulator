@@ -1,10 +1,10 @@
+# Pending upstream PR: https://github.com/pytorch/torchtitan/pull/3864
+
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
-
-# Pending upstream PR: https://github.com/pytorch/torchtitan/pull/3864
 
 """Auxiliary-loss gradient injection and distributed metric collection.
 
@@ -107,8 +107,6 @@ class LoggedAuxLoss(Module):
             self.reduce_mesh, include_singleton_axes=True
         )
 
-        assert batch_mesh is not None
-        assert reduce_mesh is not None
         return batch_mesh.size() / reduce_mesh.size()
 
     def _init_self_buffers(self, *, buffer_device: torch.device | None = None) -> None:
@@ -119,8 +117,10 @@ class LoggedAuxLoss(Module):
 
     def inject(self, carrier: torch.Tensor, raw_sum: torch.Tensor) -> torch.Tensor:
         """Inject aux loss gradient into the forward graph and accumulate for logging."""
-        assert self.global_batch_size is not None
-        scale = self._mesh_scale_factor / self.global_batch_size
+        scale = (
+            self._mesh_scale_factor  # pyrefly: ignore [unsupported-operation]
+            / self.global_batch_size
+        )
         if self.training and _should_run_forward():
             self._acc.add_(raw_sum.detach() * scale)
         return _AuxLossInjection.apply(carrier, raw_sum * (self.coeff * scale))

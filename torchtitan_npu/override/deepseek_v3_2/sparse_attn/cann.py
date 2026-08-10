@@ -1,6 +1,7 @@
-"""Override: run DeepSeek-V3.2 sparse attention with fused NPU kernels.
+"""Override: run DeepSeek-V3.2 sparse attention with fused CANN kernels.
 
-The attention core and mask handler share TND sequence-length metadata.
+The TND sequence-length mask handler and the fused attention core live
+together here.
 """
 
 from dataclasses import dataclass
@@ -8,7 +9,6 @@ from dataclasses import dataclass
 import spmd_types as spmd
 import torch
 import torch_npu
-from torchtitan.config import derive, override
 from torchtitan.models.common.attention import (
     AttentionMasksType,
     VarlenAttention,
@@ -17,49 +17,13 @@ from torchtitan.models.common.attention import (
 
 from torchtitan_npu.models.deepseek_v3_2.model import (
     SparseIndexerLoss,
-    SparseInnerAttention,
 )
 from torchtitan_npu.patches.torchtitan.distributed.varlen_cp import CPVarlenMetadata
 from torchtitan_npu.patches.torchtitan.models.common.mask_handler import BaseMaskHandler
 
 
-@dataclass(frozen=True, eq=False)
-class NPUVarlenMetadata:
-    """Varlen metadata with CPU sequence lengths required by TND kernels.
-
-    The handler extracts both length lists in one device-to-host transfer.
-    """
-
-    varlen_meta: VarlenMetadata | CPVarlenMetadata
-    actual_seq_qlen: list[int]
-    actual_seq_klen: list[int]
-
-
-class NPUVarlenMetadataHandler(BaseMaskHandler):
-    @dataclass(kw_only=True, slots=True)
-    class Config(BaseMaskHandler.Config):
-        pass
-
-    def post_process(
-        self, masks: AttentionMasksType, *, positions=None
-    ) -> NPUVarlenMetadata:
-        del positions
-        assert isinstance(masks, (VarlenMetadata, CPVarlenMetadata)), (
-            f"expected VarlenMetadata or CPVarlenMetadata, got {type(masks)}"
-        )
-        cu_q, cu_k = masks.cu_seq_q, masks.cu_seq_k
-        actual_seq_qlen, actual_seq_klen = (
-            torch.stack([cu_q[1:], cu_k[1:]]).cpu().tolist()
-        )
-        return NPUVarlenMetadata(
-            varlen_meta=masks,
-            actual_seq_qlen=actual_seq_qlen,
-            actual_seq_klen=actual_seq_klen,
-        )
-
-
 @spmd.register_autograd_function
-class _NPUSparseIndexerLossFunc(torch.autograd.Function):
+class _CANNSparseIndexerLossFunc(torch.autograd.Function):
     @staticmethod
     def forward(  # pyrefly: ignore [bad-override]
         ctx,
@@ -116,7 +80,7 @@ class _NPUSparseIndexerLossFunc(torch.autograd.Function):
         coeff,
         acc_buffer,
     ):
-        return _NPUSparseIndexerLossFunc.apply(
+        return _CANNSparseIndexerLossFunc.apply(
             q_nope_TNH,
             k_nope_T1H,
             idx_q_TNH,
@@ -195,7 +159,7 @@ class _NPUSparseIndexerLossFunc(torch.autograd.Function):
         )
 
 
-class NPUSparseIndexerLoss(SparseIndexerLoss):
+class CANNSparseIndexerLoss(SparseIndexerLoss):
     @dataclass(kw_only=True, slots=True)
     class Config(SparseIndexerLoss.Config):
         pass
@@ -221,7 +185,7 @@ class NPUSparseIndexerLoss(SparseIndexerLoss):
         *,
         carrier,
     ):
-        dummy = _NPUSparseIndexerLossFunc.apply(
+        dummy = _CANNSparseIndexerLossFunc.apply(
             q_nope_TNH,
             k_nope_T1H,
             idx_q_TNH,
@@ -242,18 +206,30 @@ class NPUSparseIndexerLoss(SparseIndexerLoss):
         return self.inject(carrier, dummy / q_nope_TNH.shape[0])
 
 
-class NPUSparseInnerAttention(VarlenAttention):
-    """Sparse attention using NPU fused ops (MLA-absorb mode)."""
+@dataclass(frozen=True, eq=False)
+class CANNVarlenMetadata:
+    """Varlen metadata with CPU sequence lengths required by TND kernels.
+
+    The handler extracts both length lists in one device-to-host transfer.
+    """
+
+    varlen_meta: VarlenMetadata | CPVarlenMetadata
+    actual_seq_qlen: list[int]
+    actual_seq_klen: list[int]
+
+
+class CANNSparseInnerAttention(VarlenAttention):
+    """Sparse attention using CANN fused ops (MLA-absorb mode)."""
 
     @dataclass(kw_only=True, slots=True)
     class Config(VarlenAttention.Config):
         index_topk: int
-        indexer_loss: NPUSparseIndexerLoss.Config
+        indexer_loss: CANNSparseIndexerLoss.Config
 
     def __init__(self, config: Config) -> None:
         super().__init__(config)
         self.index_topk = config.index_topk
-        self.indexer_loss = NPUSparseIndexerLoss(config.indexer_loss)
+        self.indexer_loss = CANNSparseIndexerLoss(config.indexer_loss)
 
     def forward(  # pyrefly: ignore [bad-param-name-override]
         self,
@@ -265,7 +241,7 @@ class NPUSparseInnerAttention(VarlenAttention):
         idx_k_BL1H: torch.Tensor,
         idx_w_BLN: torch.Tensor,
         *,
-        attention_masks: NPUVarlenMetadata,
+        attention_masks: CANNVarlenMetadata,
         scale: float,
     ) -> torch.Tensor:
         B, L_q, N, _ = q_nope_BLNH.shape
@@ -343,25 +319,28 @@ class NPUSparseInnerAttention(VarlenAttention):
         return output_TNH.reshape(B, L_q, N, -1)
 
 
-@override(
-    target=SparseInnerAttention.Config,
-    description="NPU sparse flash attention via torch_npu.npu_sparse_flash_attention",
-)
-def kernel(
-    cfg: SparseInnerAttention.Config,
-) -> NPUSparseInnerAttention.Config:
-    return NPUSparseInnerAttention.Config(
-        sharding_config=cfg.sharding_config,
-        index_topk=cfg.index_topk,
-        indexer_loss=derive(cfg.indexer_loss, NPUSparseIndexerLoss.Config),
-    )
+# ---------------------------------------------------------------------------
+# TND varlen metadata handler
+# ---------------------------------------------------------------------------
 
 
-@override(
-    target=BaseMaskHandler.Config,
-    description="NPUVarlenMetadata handler for TND layout (NPU sparse attention).",
-)
-def mask_handler(
-    cfg: BaseMaskHandler.Config,
-) -> NPUVarlenMetadataHandler.Config:
-    return NPUVarlenMetadataHandler.Config()
+class CANNVarlenMetadataHandler(BaseMaskHandler):
+    @dataclass(kw_only=True, slots=True)
+    class Config(BaseMaskHandler.Config):
+        pass
+
+    def post_process(  # pyrefly: ignore [bad-override]
+        self, masks: AttentionMasksType
+    ) -> CANNVarlenMetadata:
+        assert isinstance(masks, (VarlenMetadata, CPVarlenMetadata)), (
+            f"expected VarlenMetadata or CPVarlenMetadata, got {type(masks)}"
+        )
+        cu_q, cu_k = masks.cu_seq_q, masks.cu_seq_k
+        actual_seq_qlen, actual_seq_klen = (
+            torch.stack([cu_q[1:], cu_k[1:]]).cpu().tolist()
+        )
+        return CANNVarlenMetadata(
+            varlen_meta=masks,
+            actual_seq_qlen=actual_seq_qlen,
+            actual_seq_klen=actual_seq_klen,
+        )

@@ -9,26 +9,26 @@ from typing import Any
 import torch
 from torch.distributed.tensor import DTensor
 from torchtitan.models.deepseek_v3.state_dict_adapter import DeepSeekV3StateDictAdapter
-from torchtitan.models.utils import MoEStateDictAdapter
 
 from .model import DeepSeekV4Model
 
 
-class DeepSeekV4StateDictAdapter(MoEStateDictAdapter):
-    get_hf_storage_reader = DeepSeekV3StateDictAdapter.get_hf_storage_reader
-
+class DeepSeekV4StateDictAdapter(DeepSeekV3StateDictAdapter):
     def __init__(
         self,
         model_config: DeepSeekV4Model.Config,
         hf_assets_path: str | None,
     ):
-        super().__init__(model_config, hf_assets_path)
-        self.dsv4_model_config = model_config
+        super().__init__(
+            model_config,  # pyrefly: ignore [bad-argument-type]
+            hf_assets_path,
+        )
 
         self.from_hf_map = {
             "embed.weight": "tok_embeddings.weight",
-            # Attention (monolithic)
-            "layers.{}.attn.attn_sink": "layers.{}.attention.attn_sink.weight",
+            "head.weight": "lm_head.weight",
+            # Attention
+            "layers.{}.attn.attn_sink": "layers.{}.attention.attn_sink",
             "layers.{}.attn.kv_norm.weight": "layers.{}.attention.kv_norm.weight",
             "layers.{}.attn.q_norm.weight": "layers.{}.attention.q_norm.weight",
             "layers.{}.attn.wo_a.weight": "layers.{}.attention.wo_a.weight",
@@ -49,28 +49,27 @@ class DeepSeekV4StateDictAdapter(MoEStateDictAdapter):
             "layers.{}.ffn.shared_experts.w3.weight": "layers.{}.moe.shared_experts.w3.weight",
             "layers.{}.ffn.shared_experts.w2.weight": "layers.{}.moe.shared_experts.w2.weight",
             # mHC
-            "layers.{}.hc_attn_base": "layers.{}.hc_attn_base",
-            "layers.{}.hc_attn_fn": "layers.{}.hc_attn_fn",
-            "layers.{}.hc_attn_scale": "layers.{}.hc_attn_scale",
-            "layers.{}.hc_ffn_base": "layers.{}.hc_ffn_base",
-            "layers.{}.hc_ffn_fn": "layers.{}.hc_ffn_fn",
-            "layers.{}.hc_ffn_scale": "layers.{}.hc_ffn_scale",
-            "hc_head_base": "hc_head_base",
-            "hc_head_fn": "hc_head_fn",
-            "hc_head_scale": "hc_head_scale",
+            "layers.{}.hc_attn_base": "layers.{}.hc_attn_pre.hc_base",
+            "layers.{}.hc_attn_fn": "layers.{}.hc_attn_pre.hc_fn",
+            "layers.{}.hc_attn_scale": "layers.{}.hc_attn_pre.hc_scale",
+            "layers.{}.hc_ffn_base": "layers.{}.hc_ffn_pre.hc_base",
+            "layers.{}.hc_ffn_fn": "layers.{}.hc_ffn_pre.hc_fn",
+            "layers.{}.hc_ffn_scale": "layers.{}.hc_ffn_pre.hc_scale",
+            "hc_head_base": "hc_head.hc_base",
+            "hc_head_fn": "hc_head.hc_fn",
+            "hc_head_scale": "hc_head.hc_scale",
             "norm.weight": "norm.weight",
-            "head.weight": "lm_head.weight",
         }
 
         self.compress_ratios = model_config.compress_ratios
         for layer_id in range(model_config.n_layers):
             cr = self.compress_ratios[layer_id]
             if cr != 1:
-                comp = "compressor" if cr == 4 else "compressor_128"
+                comp = "compressor"
                 self.from_hf_map.update(
                     {
                         f"layers.{layer_id}.attn.compressor.ape": (
-                            f"layers.{layer_id}.attention.{comp}.ape.weight"
+                            f"layers.{layer_id}.attention.{comp}.ape"
                         ),
                         f"layers.{layer_id}.attn.compressor.norm.weight": (
                             f"layers.{layer_id}.attention.{comp}.norm.weight"
@@ -87,7 +86,7 @@ class DeepSeekV4StateDictAdapter(MoEStateDictAdapter):
                 self.from_hf_map.update(
                     {
                         f"layers.{layer_id}.attn.indexer.compressor.ape": (
-                            f"layers.{layer_id}.attention.indexer.compressor.ape.weight"
+                            f"layers.{layer_id}.attention.indexer.compressor.ape"
                         ),
                         f"layers.{layer_id}.attn.indexer.compressor.norm.weight": (
                             f"layers.{layer_id}.attention.indexer.compressor.norm.weight"
@@ -106,26 +105,15 @@ class DeepSeekV4StateDictAdapter(MoEStateDictAdapter):
                         ),
                     }
                 )
-            if layer_id < model_config.layers[0].moe.router.n_hash_layers:
+            layer_cfg = model_config.layers[layer_id]
+            if layer_cfg.moe.router.hash:
                 self.from_hf_map.update(
                     {
-                        f"layers.{layer_id}.ffn.gate.tid2eid": f"layers.{layer_id}.moe.router.tid2eid",
+                        f"layers.{layer_id}.ffn.gate.tid2eid": (
+                            f"layers.{layer_id}.moe.router.tid2eid"
+                        ),
                     }
                 )
-
-    @staticmethod
-    def _abstract_key(key: str, count: int) -> str:
-        return re.sub(r"(\d+)", "{}", key, count=count)
-
-    @staticmethod
-    def _first_number(key: str) -> str:
-        match = re.search(r"\d+", key)
-        if match is None:
-            raise ValueError(f"Expected a numeric layer index in key: {key}")
-        return match.group(0)
-
-    def _map_layer(self, key: str, mapping: dict[str, str]) -> str:
-        return mapping[self._abstract_key(key, count=1)].format(self._first_number(key))
 
     def to_hf(self, state_dict: dict[str, Any]) -> dict[str, Any]:
         to_hf_map = {v: k for k, v in self.from_hf_map.items()}
@@ -139,8 +127,10 @@ class DeepSeekV4StateDictAdapter(MoEStateDictAdapter):
                 hf_state_dict[new_key] = value
 
             elif "moe.routed_experts.inner_experts" in key:
-                abstract_key = self._abstract_key(key, count=1)
-                layer_num = self._first_number(key)
+                abstract_key = re.sub(r"(\d+)", "{}", key, count=1)
+                layer_num = re.search(  # pyrefly: ignore [missing-attribute]
+                    r"\d+", key
+                ).group(0)
                 new_abstract = to_hf_map[abstract_key]
 
                 if isinstance(value, DTensor):
@@ -157,9 +147,11 @@ class DeepSeekV4StateDictAdapter(MoEStateDictAdapter):
                     )
                     hf_state_dict.update(local_fqn)
                 else:
-                    num_experts = next(
-                        l for l in self.dsv4_model_config.layers if l.moe is not None
-                    ).moe.num_experts
+                    num_experts = (
+                        self.model_config.layers[  # pyrefly: ignore [missing-attribute]
+                            0
+                        ].moe.num_experts
+                    )
                     split_values = self._split_experts_weights(value, num_experts)
                     for e in range(num_experts):
                         hf_state_dict[new_abstract.format(layer_num, e)] = split_values[
@@ -167,14 +159,12 @@ class DeepSeekV4StateDictAdapter(MoEStateDictAdapter):
                         ].squeeze()
 
             elif "layers" in key:
-                # HF stores attn_sink as [H], while the model uses [H, 1].
-                if (
-                    key.endswith(".attn_sink.weight")
-                    and value.ndim == 2
-                    and value.shape[-1] == 1
-                ):
-                    value = value.squeeze(-1)
-                hf_state_dict[self._map_layer(key, to_hf_map)] = value
+                abstract_key = re.sub(r"(\d+)", "{}", key, count=1)
+                layer_num = re.search(  # pyrefly: ignore [missing-attribute]
+                    r"\d+", key
+                ).group(0)
+                new_key = to_hf_map[abstract_key].format(layer_num)
+                hf_state_dict[new_key] = value
 
             else:
                 if key in to_hf_map:
@@ -196,7 +186,7 @@ class DeepSeekV4StateDictAdapter(MoEStateDictAdapter):
                 state_dict[new_key] = value
 
             elif "ffn.experts" in key:
-                abstract_key = self._abstract_key(key, count=2)
+                abstract_key = re.sub(r"(\d+)", "{}", key, count=2)
                 layer_num, expert_num, _ = re.findall(r"\d+", key)
                 titan_abstract = self.from_hf_map[abstract_key]
                 new_key = titan_abstract.format(layer_num)
@@ -214,9 +204,11 @@ class DeepSeekV4StateDictAdapter(MoEStateDictAdapter):
                         layer_num,
                     )
                 else:
-                    num_experts = next(
-                        l for l in self.dsv4_model_config.layers if l.moe is not None
-                    ).moe.num_experts
+                    num_experts = (
+                        self.model_config.layers[  # pyrefly: ignore [missing-attribute]
+                            0
+                        ].moe.num_experts
+                    )
                     stacked = self._concatenate_expert_weights(
                         expert_weights,
                         titan_abstract,
@@ -227,10 +219,12 @@ class DeepSeekV4StateDictAdapter(MoEStateDictAdapter):
                     state_dict[new_key] = stacked
 
             elif "layers" in key:
-                # HF stores attn_sink as [H], while the model uses [H, 1].
-                if key.endswith(".attn_sink") and value.ndim == 1:
-                    value = value.unsqueeze(-1)
-                state_dict[self._map_layer(key, self.from_hf_map)] = value
+                abstract_key = re.sub(r"(\d+)", "{}", key, count=1)
+                layer_num = re.search(  # pyrefly: ignore [missing-attribute]
+                    r"\d+", key
+                ).group(0)
+                new_key = self.from_hf_map[abstract_key].format(layer_num)
+                state_dict[new_key] = value
 
             else:
                 if key in self.from_hf_map:

@@ -3,447 +3,268 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
-import spmd_types as spmd
 import torch
-import torch.nn.functional as F
-from torchtitan.distributed.utils import get_spmd_backend
+from torch.nn.attention.flex_attention import _DEFAULT_SPARSE_BLOCK_SIZE, BlockMask
 from torchtitan.models.common.attention import (
     BaseAttention,
     FlexAttention,
-    create_attention_mask,
+    VarlenAttention,
 )
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.models.common.rope import RoPE
 from torchtitan.protocols.module import Module
 
-from torchtitan_npu.patches.torchtitan.models.common.aux_loss import (
-    LoggedAuxLoss,
-)
-from torchtitan_npu.patches.torchtitan.models.common.rope import SingleComplexRoPE
+from torchtitan_npu.patches.torchtitan.models.common.linear import BatchedLinear
 
-from .compressor import Compressor, Indexer, IndexSelection
+from .compressor import Compressor, Indexer
+from .metadata import CompressedVarlenMetadata
 
 
-def _assert_spmd_attention_type(tensor, *, tp):
-    if get_spmd_backend() == "spmd_types":
-        spmd.assert_type(
-            tensor,
-            {"dp": spmd.S(0), "cp": spmd.S(1), "tp": tp},
-        )
+class CompressedSparseInnerAttention(FlexAttention):
+    """DeepSeek sparse attention core for DeepSeek-V4 (varlen-typed reference).
 
+    The core attends over the concatenated container KV ``[0, S + n_cmp + 1)``,
+    where the first ``S`` positions are the uncompressed sliding-window KV
+    (``swa_k``), the next ``n_cmp`` positions are the compressed KV in the
+    ``[B, S // ratio, D]`` container grid (``cmp_k``), and the last position is
+    a learned attention sink token:
 
-def get_window_topk_idxs(
-    window_size: int,
-    bsz: int,
-    seqlen: int,
-    device,
-) -> torch.Tensor:
-    window = min(seqlen, window_size)
-    base = torch.arange(seqlen, device=device).unsqueeze(1)
-    idxs = (base - window + 1).clamp(0) + torch.arange(window, device=device)
-    idxs = torch.where(idxs > base, -1, idxs)
-    return idxs.unsqueeze(0).expand(bsz, -1, -1)
+    - sliding window: fixed ``mask_mod`` pattern, restricted to the query
+      token's document;
+    - compressed blocks: for HCA (``compress_ratio=128``) all causally
+      reachable blocks of the same document, also a fixed pattern; for CSA
+      (``compress_ratio=4``) each query attends only its top-k selected
+      container slots, chosen by ``Indexer.select`` against the dense mask
+      from ``CompressedBlockMaskHandler``;
+    - attention sink: always attendable via ``score_mod``.
 
+    ``_build_block_mask`` is the single-document container formulation (kept
+    for upstream parity and its unit test); ``_build_varlen_block_mask`` is the
+    document-packed path driven by ``CompressedVarlenMetadata``.  NPU overrides
+    replace the whole ``forward`` (fused SMLA/CSA kernels consume the raw
+    ``q / swa_k / cmp_k / idx_q / idx_k / idx_w`` tensors).
+    """
 
-def get_compress_topk_idxs(
-    compress_ratio: int,
-    bsz: int,
-    seqlen: int,
-    device,
-) -> torch.Tensor:
-    compress_len = seqlen // compress_ratio
-    if compress_len == 0:
-        return torch.empty((bsz, seqlen, 0), dtype=torch.int64, device=device)
-
-    idxs = torch.arange(compress_len, device=device).repeat(seqlen, 1)
-    causal_limit = torch.arange(1, seqlen + 1, device=device).unsqueeze(1)
-    causal_limit = causal_limit // compress_ratio
-    idxs = torch.where(idxs >= causal_limit, -1, idxs)
-    return idxs.unsqueeze(0).expand(bsz, -1, -1)
-
-
-class DSAIndexerAuxLoss(LoggedAuxLoss):
     @dataclass(kw_only=True, slots=True)
-    class Config(LoggedAuxLoss.Config):
-        num_heads: int
-        softmax_scale: float
-        window_size: int
-        coeff: float = 1.0
-        eps: float = 1e-10
-
-    def __init__(self, config: Config) -> None:
-        super().__init__(config)
-        self.num_heads = config.num_heads
-        self.softmax_scale = config.softmax_scale
-        self.window_size = config.window_size
-        self.eps = config.eps
-
-    def _selected_main_attn_dist(
-        self,
-        q,
-        kv_compress,
-        compress_topk_idxs,
-        attn_lse,
-    ) -> torch.Tensor:
-        _, seqlen, _, head_dim = q.size()
-        gather_idxs = compress_topk_idxs.clamp(min=0)
-        selected_kv = torch.gather(
-            kv_compress.unsqueeze(1).expand(-1, seqlen, -1, -1),
-            dim=2,
-            index=gather_idxs.unsqueeze(-1).expand(-1, -1, -1, head_dim),
-        )
-
-        selected_score = (
-            torch.einsum("bshd,bskd->bhsk", q, selected_kv) * self.softmax_scale
-        )
-        selected_prob = torch.exp(
-            selected_score.float() - attn_lse.transpose(1, 2).unsqueeze(-1).float()
-        )
-        selected_prob = selected_prob.masked_fill(
-            compress_topk_idxs.unsqueeze(1) < 0, 0.0
-        )
-        return selected_prob.sum(dim=1) / self.num_heads
-
-    def _indexer_loss(
-        self,
-        selected_main_attn_dist,
-        index_score,
-        compress_topk_idxs,
-    ) -> torch.Tensor:
-        selected_main_attn_dist = selected_main_attn_dist.float().clamp_min(0)
-        target_sum = selected_main_attn_dist.sum(dim=-1, keepdim=True)
-        valid_target = target_sum > self.eps
-
-        index_score = torch.where(
-            valid_target,
-            index_score,
-            torch.zeros_like(index_score),
-        )
-        index_score = F.log_softmax(index_score, dim=-1, dtype=torch.float32)
-
-        selected_main_attn_dist = selected_main_attn_dist / target_sum.clamp_min(
-            self.eps
-        )
-        positive_target = selected_main_attn_dist > 0
-        index_score = torch.where(
-            positive_target,
-            index_score,
-            torch.zeros_like(index_score),
-        )
-        log_selected_main_attn_dist = selected_main_attn_dist.clamp_min(self.eps).log()
-        loss = (
-            selected_main_attn_dist * (log_selected_main_attn_dist - index_score)
-        ).sum(dim=-1)
-        loss = (target_sum.squeeze(-1) * loss).mean()
-        return loss * self.softmax_scale
-
-    def forward(
-        self,
-        carrier,
-        q,
-        kv_compress,
-        compress_topk_idxs,
-        index_score,
-        attn_lse,
+    class Config(  # pyrefly: ignore [bad-override]
+        VarlenAttention.Config
     ):
-        if index_score.numel() == 0:
-            return carrier
-        selected_main_attn_dist = self._selected_main_attn_dist(
-            q,
-            kv_compress,
-            compress_topk_idxs,
-            attn_lse,
-        )
-        loss = self._indexer_loss(
-            selected_main_attn_dist,
-            index_score,
-            compress_topk_idxs,
-        )
-        if self.global_batch_size is None:
-            raise RuntimeError("DSAIndexerAuxLoss requires global_batch_size.")
-        return self.inject(carrier, loss * self.global_batch_size)
-
-
-class DSAFlexAttention(FlexAttention):
-    @dataclass(kw_only=True, slots=True)
-    class Config(FlexAttention.Config):
-        window_size: int
+        # Redeclared as the int DSA window (replaces the inherited varlen
+        # ``window_size`` tuple, which is never used by the DSA path).
+        window_size: int  # pyrefly: ignore [bad-override]
         compress_ratio: int
         softmax_scale: float
-        index_selection: IndexSelection.Config | None = None
-        indexer_aux_loss: DSAIndexerAuxLoss.Config | None = None
-        return_lse: bool = False
+        index_topk: int
+        block_size: int | tuple[int, int] = _DEFAULT_SPARSE_BLOCK_SIZE
+        # Consumed by the inherited ``FlexAttention.__init__`` (kernel options
+        # for the flex_attention backend of the reference path).
+        kernel_options: dict = field(default_factory=dict)
 
     def __init__(self, config: Config) -> None:
-        super().__init__(config)
+        super().__init__(config)  # pyrefly: ignore [bad-argument-type]
+        # Subclasses read ``self.window_size`` as an int.
         self.window_size = config.window_size
         self.compress_ratio = config.compress_ratio
         self.softmax_scale = config.softmax_scale
+        self.index_topk = config.index_topk
         self.block_size = config.block_size
-        self.return_lse = config.return_lse or config.indexer_aux_loss is not None
-        if config.index_selection is not None:
-            self.index_selection = config.index_selection.build()
-        if config.indexer_aux_loss is not None:
-            self.indexer_aux_loss = config.indexer_aux_loss.build()
 
-    def _select_compressed(
+    def _build_varlen_block_mask(
         self,
-        query_states,
-        kv_compress,
-        q_indexer,
-        k_indexer,
-        index_weights,
-        *,
-        attention_masks=None,
-    ):
-        bsz, seqlen, _, _ = query_states.size()
-        if self.compress_ratio == 4:
-            if not hasattr(self, "index_selection"):
-                raise RuntimeError(
-                    "DSAFlexAttention requires index_selection when compress_ratio=4."
-                )
-            if q_indexer is None or k_indexer is None or index_weights is None:
-                raise ValueError(
-                    "DSAFlexAttention requires q_indexer, k_indexer, and "
-                    "index_weights when compress_ratio=4."
-                )
-            return self.index_selection(
-                q_indexer,
-                k_indexer,
-                index_weights,
-                attention_masks=attention_masks,
-            )
-
-        if self.compress_ratio > 1:
-            if kv_compress is None:
-                raise ValueError(
-                    "DSAFlexAttention requires compressed KV when compress_ratio>1."
-                )
-            return (
-                get_compress_topk_idxs(
-                    self.compress_ratio,
-                    bsz,
-                    seqlen,
-                    query_states.device,
-                ),
-                None,
-            )
-
-        return None, None
-
-    def _prepare_sparse_inputs(
-        self,
-        query_states,
-        kv_states,
-        kv_compress,
-        q_indexer,
-        k_indexer,
-        index_weights,
-        *,
-        attention_masks=None,
-    ):
-        bsz, seqlen, _, _ = query_states.size()
-        window_topk_idxs = get_window_topk_idxs(
-            self.window_size,
-            bsz,
-            seqlen,
-            query_states.device,
-        )
-        compress_topk_idxs, index_score = self._select_compressed(
-            query_states,
-            kv_compress,
-            q_indexer,
-            k_indexer,
-            index_weights,
-            attention_masks=attention_masks,
-        )
-
-        if (
-            compress_topk_idxs is not None
-            and kv_compress is not None
-            and compress_topk_idxs.size(-1) > kv_compress.size(1)
-        ):
-            compact_topk = kv_compress.size(1)
-            compress_topk_idxs = compress_topk_idxs[..., :compact_topk]
-            if index_score is not None:
-                index_score = index_score[..., :compact_topk]
-
-        if kv_compress is None or kv_compress.numel() == 0:
-            return kv_states, window_topk_idxs, compress_topk_idxs, index_score
-
-        if compress_topk_idxs is None:
-            raise RuntimeError(
-                "DSAFlexAttention received compressed KV without compressed indices."
-            )
-        kv_offset = kv_states.size(1)
-        attention_compress_idxs = torch.where(
-            compress_topk_idxs < 0,
-            compress_topk_idxs,
-            compress_topk_idxs + kv_offset,
-        )
-        topk_idxs = torch.cat([window_topk_idxs, attention_compress_idxs], dim=-1)
-        return (
-            torch.cat([kv_states, kv_compress], dim=1),
-            topk_idxs,
-            compress_topk_idxs,
-            index_score,
-        )
-
-    def _apply_indexer_aux_loss(
-        self,
-        carrier,
-        query_states,
-        kv_compress,
-        compress_topk_idxs,
-        index_score,
-        attn_lse,
-    ):
-        if (
-            not self.training
-            or not hasattr(self, "indexer_aux_loss")
-            or kv_compress is None
-            or compress_topk_idxs is None
-            or index_score is None
-            or attn_lse is None
-        ):
-            return carrier
-        return self.indexer_aux_loss(
-            carrier,
-            query_states.detach(),
-            kv_compress.detach(),
-            compress_topk_idxs,
-            index_score,
-            attn_lse.detach(),
-        )
-
-    def _create_topk_mask(
-        self,
-        *,
-        topk_idxs: torch.Tensor,
-        bsz: int,
-        seqlen: int,
-        kv_len: int,
+        metadata: CompressedVarlenMetadata,
+        topk_indices: torch.Tensor | None,
+        n_cmp: int,
         device,
-    ):
-        sink_idx = kv_len
-        topk = topk_idxs.size(-1)
+    ) -> BlockMask:
+        """Document-packed block mask driven by ``CompressedVarlenMetadata``.
 
-        def v4_sparse_mask_mod(b, h, q_idx, kv_idx):
-            selected = kv_idx < 0
-            for idx in range(topk):
-                selected = selected | (topk_idxs[b, q_idx, idx] == kv_idx)
+        The block listing is a superset (window range, selected/full compressed
+        region, sink); ``mask_mod`` applies the exact per-token predicates
+        (same document, per-document causal limit, top-k selection).
+        """
+        bsz, seqlen = metadata.batch_size, metadata.seq_len
+        bs = self.block_size
+        bq, bk = bs if isinstance(bs, tuple) else (bs, bs)
+        kv_len = seqlen + n_cmp + 1
+        n_kv_blocks = (kv_len + bk - 1) // bk
+        n_q_blocks = seqlen // bq
+        sink_idx = seqlen + n_cmp
+        ratio = self.compress_ratio
+        window_size = self.window_size
+        if metadata.plans.get(ratio) is None:
+            raise ValueError(f"No compression layout for ratio={ratio}.")
+        ref = metadata.reference.ratios[ratio]
+
+        # Static parts (window, sink, HCA range) are hoisted in the metadata;
+        # only the CSA top-k blocks are scattered here.
+        bm = ref.static_blocks.expand(  # pyrefly: ignore [missing-attribute]
+            bsz, 1, -1, -1
+        ).clone()
+        if topk_indices is not None:
+            cmp_block_of = (seqlen + torch.arange(n_cmp, device=device)) // bk
+            block_of_topk = cmp_block_of[topk_indices].reshape(
+                bsz, n_q_blocks, bq * topk_indices.size(-1)
+            )
+            bm[:, 0].scatter_add_(
+                -1,
+                block_of_topk.clamp(0, n_kv_blocks - 1),
+                torch.ones_like(block_of_topk, dtype=torch.int32),
+            )
+        bm = (bm > 0).to(torch.int32)  # pyrefly: ignore [missing-attribute]
+        kv_num_blocks = bm.sum(dim=-1).to(torch.int32)
+        kv_indices = torch.argsort(bm, dim=-1, descending=True, stable=True).to(
+            torch.int32
+        )
+
+        cmp_sel = torch.zeros(
+            bsz, seqlen, max(n_cmp, 1), dtype=torch.bool, device=device
+        )
+        if topk_indices is not None:
+            cmp_sel.scatter_(2, topk_indices.clamp(0, max(n_cmp, 1) - 1), True)
+
+        doc_of_token = metadata.reference.doc_of_token
+        pos_in_doc = metadata.reference.pos_in_doc
+        if ratio > 1 and n_cmp > 0:
+            cmp_doc = ref.doc_of_block
+            cmp_local = ref.block_local
+        else:
+            # No compressed slots: keep the gather safe with dummy values.
+            cmp_doc = torch.full(
+                (bsz, max(n_cmp, 1)), -1, dtype=torch.int32, device=device
+            )
+            cmp_local = torch.full(
+                (bsz, max(n_cmp, 1)), -1, dtype=torch.int32, device=device
+            )
+
+        def csa_varlen_mask_mod(
+            b: torch.Tensor, h: torch.Tensor, q_idx: torch.Tensor, kv_idx: torch.Tensor
+        ) -> torch.Tensor:
+            doc_q = doc_of_token[b, q_idx]
+            kv_safe = kv_idx.clamp(0, seqlen - 1)
+            swa = (
+                (kv_idx < seqlen)
+                & (kv_idx <= q_idx)
+                & (q_idx - kv_idx < window_size)
+                & (doc_of_token[b, kv_safe] == doc_q)
+            )
             is_sink = kv_idx == sink_idx
-            return selected | is_sink
+            if ratio > 1:
+                c = kv_idx - seqlen
+                in_cmp = (c >= 0) & (c < n_cmp)
+                c_safe = c.clamp(0, max(n_cmp, 1) - 1)
+                same_doc = (
+                    cmp_doc[  # pyrefly: ignore [unsupported-operation]
+                        b, c_safe
+                    ]
+                    == doc_q
+                )
+                causal = cmp_local[  # pyrefly: ignore [unsupported-operation]
+                    b, c_safe
+                ] < torch.div(pos_in_doc[b, q_idx] + 1, ratio, rounding_mode="floor")
+                if topk_indices is not None:
+                    topk_sel = cmp_sel[b, q_idx, c_safe]
+                    return swa | (in_cmp & same_doc & causal & topk_sel) | is_sink
+                return swa | (in_cmp & same_doc & causal) | is_sink
+            return swa | is_sink
 
-        return create_attention_mask(
-            v4_sparse_mask_mod,
-            bsz,
-            None,
-            seqlen,
-            kv_len + 1,
-            device=device,
-            BLOCK_SIZE=self.block_size,
-            separate_full_blocks=False,
+        return BlockMask.from_kv_blocks(
+            kv_num_blocks,
+            kv_indices,
+            BLOCK_SIZE=(bq, bk),
+            mask_mod=csa_varlen_mask_mod,
+            seq_lengths=(seqlen, kv_len),
         )
 
     def forward(  # pyrefly: ignore [bad-param-name-override]
         self,
-        query_states,
-        kv_states,
-        kv_compress,
-        attn_sink,
-        q_indexer=None,
-        k_indexer=None,
-        index_weights=None,
+        q,
+        swa_k,
+        cmp_k=None,
+        idx_q=None,
+        idx_k=None,
+        idx_w=None,
+        attn_sink: torch.Tensor | None = None,
         *,
         attention_masks=None,
-    ):
-        bsz, seqlen, _, head_dim = query_states.size()
-        (
-            kv_states,
-            topk_idxs,
-            compress_topk_idxs,
-            index_score,
-        ) = self._prepare_sparse_inputs(
-            query_states,
-            kv_states,
-            kv_compress,
-            q_indexer,
-            k_indexer,
-            index_weights,
-            attention_masks=attention_masks,
-        )
-        kv_len = kv_states.size(1)
+    ) -> torch.Tensor:
+        if not isinstance(attention_masks, CompressedVarlenMetadata):
+            raise TypeError(
+                "CompressedSparseInnerAttention requires CompressedVarlenMetadata "
+                f"attention masks, got {type(attention_masks)}."
+            )
+        if attn_sink is None:
+            raise ValueError("CompressedSparseInnerAttention requires attn_sink")
 
-        sink_kv = kv_states.new_zeros((bsz, 1, head_dim))
-        kv_states = torch.cat([kv_states, sink_kv], dim=1)
-        key_value_states = kv_states.unsqueeze(2)
+        metadata = attention_masks
+        bsz, seqlen, _, head_dim = q.size()
+        n_cmp = 0 if cmp_k is None else cmp_k.size(1)
+        sink_idx = seqlen + n_cmp
 
-        block_mask = self._create_topk_mask(
-            topk_idxs=topk_idxs,
-            bsz=bsz,
-            seqlen=seqlen,
-            kv_len=kv_len,
-            device=query_states.device,
+        topk_indices = None
+        if self.compress_ratio == 4:
+            if idx_q is None or idx_k is None or idx_w is None:
+                raise ValueError(
+                    "CompressedSparseInnerAttention requires idx_q, idx_k, and "
+                    "idx_w when compress_ratio=4"
+                )
+            if metadata.plans.get(4) is None:
+                raise ValueError(
+                    "CompressedSparseInnerAttention requires the ratio-4 "
+                    "compression layout for indexer selection."
+                )
+            topk_indices, _ = Indexer.select(
+                idx_q,
+                idx_k,
+                idx_w,
+                metadata.reference.ratios[  # pyrefly: ignore [bad-argument-type]
+                    4
+                ].dense_mask,
+                self.index_topk,
+            )
+
+        kv = swa_k.unsqueeze(2)
+        if cmp_k is not None:
+            kv = torch.cat([kv, cmp_k.unsqueeze(2)], dim=1)
+        sink_kv = kv.new_zeros((bsz, 1, 1, head_dim))
+        kv = torch.cat([kv, sink_kv], dim=1)
+
+        block_mask = self._build_varlen_block_mask(
+            metadata, topk_indices, n_cmp, q.device
         )
-        sink_idx = kv_len
 
         def v4_sink_score_mod(score, b, h, q_idx, kv_idx):
-            return torch.where(kv_idx == sink_idx, attn_sink[h], score)
+            return torch.where(
+                kv_idx == sink_idx,
+                attn_sink[h],  # pyrefly: ignore [unsupported-operation]
+                score,
+            )
 
-        def maybe_return_lse(out, lse):
-            return out, lse
-
-        out_transform = maybe_return_lse if self.return_lse else None
-        attn_out = super().forward(
-            query_states,
-            key_value_states,
-            key_value_states,
+        return super().forward(
+            q,
+            kv,
+            kv,
             attention_masks=block_mask,
             score_mod=v4_sink_score_mod,
             scale=self.softmax_scale,
             enable_gqa=True,
-            out_transform=out_transform,  # pyrefly: ignore [bad-argument-type]
-        )
-        if self.return_lse:
-            output, attn_lse = attn_out
-        else:
-            output, attn_lse = attn_out, None
-        return self._apply_indexer_aux_loss(
-            output,
-            query_states,
-            kv_compress,
-            compress_topk_idxs,
-            index_score,
-            attn_lse,
         )
 
 
 class Attention(BaseAttention):
     @dataclass(kw_only=True, slots=True)
     class Config(BaseAttention.Config):
-        dim: int
         n_heads: int
         inner_attention: Module.Config
         rope: RoPE.Config
-        single_rope: SingleComplexRoPE.Config
-        head_dim: int = 512
-        rope_head_dim: int = 64
-        q_lora_rank: int = 1024
-        o_lora_rank: int = 1024
-        n_groups: int = 8
-        compress_ratio: int = 1
-        window_size: int = 128
-        norm_eps: float = 1e-6
-        index_n_heads: int = 64
-        index_head_dim: int = 128
-        index_topk: int = 512
-        n_layers: int = 4
-        layer_id: int = 0
-        mask_type: str = "causal"
+        head_dim: int
+        rope_head_dim: int
+        q_lora_rank: int
+        n_groups: int
+        compress_ratio: int
+        norm_eps: float
 
         # Declare submodule configs as fields so sharding can be assigned before
         # the modules are built.
@@ -452,13 +273,13 @@ class Attention(BaseAttention):
         wq_b: Linear.Config
         wkv: Linear.Config
         kv_norm: RMSNorm.Config
-        wo_a: Linear.Config
+        wo_a: BatchedLinear.Config
         wo_b: Linear.Config
-        attn_sink: Linear.Config
 
-        compressor: Compressor.Config | None = None
-        compressor_128: Compressor.Config | None = None
-        indexer: Indexer.Config | None = None
+        # Built only for ``compress_ratio > 1`` layers (``indexer`` only for
+        # ratio-4 CSA layers); the registry passes ``None`` otherwise.
+        compressor: Compressor.Config | None
+        indexer: Indexer.Config | None
 
     def __init__(self, config: Config):
         super().__init__()
@@ -466,17 +287,10 @@ class Attention(BaseAttention):
         self.n_heads = cfg.n_heads
         self.head_dim = cfg.head_dim
         self.rope_head_dim = cfg.rope_head_dim
-        self.q_lora_rank = cfg.q_lora_rank
-        self.o_lora_rank = cfg.o_lora_rank
         self.n_groups = cfg.n_groups
         self.compress_ratio = cfg.compress_ratio
-        self.window_size = cfg.window_size
         self.norm_eps = cfg.norm_eps
-        self.softmax_scale = cfg.head_dim**-0.5
-        self.layer_id = cfg.layer_id
-        self.n_layers = cfg.n_layers
         self.rope = cfg.rope.build()
-        self.single_rope = cfg.single_rope.build()
 
         self.wq_a = cfg.wq_a.build()
         self.q_norm = cfg.q_norm.build()
@@ -485,109 +299,77 @@ class Attention(BaseAttention):
         self.kv_norm = cfg.kv_norm.build()
         self.wo_a = cfg.wo_a.build()
         self.wo_b = cfg.wo_b.build()
-        self.attn_sink = cfg.attn_sink.build().float()
+        # Bare head-wise sink parameter (fp32), matching the inference
+        # reference and the kernels' ``[N1]`` sink contract.
+        self.attn_sink = torch.nn.Parameter(
+            torch.empty(cfg.n_heads, dtype=torch.float32)
+        )
 
         if cfg.compressor is not None:
             self.compressor = cfg.compressor.build()
         if cfg.indexer is not None:
             self.indexer = cfg.indexer.build()
-        if cfg.compressor_128 is not None:
-            self.compressor_128 = cfg.compressor_128.build()
 
         self.inner_attention = cfg.inner_attention.build()
-        self._dsa_loss_tracker = None
 
-    def set_dsa_loss_tracker(self, tracker):
-        self._dsa_loss_tracker = tracker
-
-    def forward(self, x, attention_masks=None, positions=None):
+    def forward(self, x, attention_masks, positions):
         bsz, seqlen, _ = x.size()
         rd = self.rope_head_dim
 
         qr = self.q_norm(self.wq_a(x))
-        _assert_spmd_attention_type(qr, tp=spmd.R)
         q = self.wq_b(qr)
-        with spmd.local():
-            q = q.view(bsz, seqlen, -1, self.head_dim)
-            _assert_spmd_attention_type(q, tp=spmd.S(2))
+        q = q.view(bsz, seqlen, -1, self.head_dim)
         q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + self.norm_eps)
         q_nope, q_rope = torch.split(q, [self.head_dim - rd, rd], dim=-1)
 
-        kv = self.wkv(x)
-        kv = self.kv_norm(kv)
-        _assert_spmd_attention_type(kv, tp=spmd.R)
-        kv_nope, kv_rope = torch.split(kv, [self.head_dim - rd, rd], dim=-1)
+        swa_k = self.wkv(x)
+        swa_k = self.kv_norm(swa_k)
+        kv_nope, kv_rope = torch.split(swa_k, [self.head_dim - rd, rd], dim=-1)
 
         q_rope, kv_rope = self.rope(q_rope, kv_rope.unsqueeze(2), positions)
         q = torch.cat([q_nope, q_rope], dim=-1)
-        kv = torch.cat([kv_nope, kv_rope.squeeze(2)], dim=-1)
-        _assert_spmd_attention_type(q, tp=spmd.S(2))
-        _assert_spmd_attention_type(kv, tp=spmd.R)
+        swa_k = torch.cat([kv_nope, kv_rope.squeeze(2)], dim=-1)
 
-        kv_compress = None
-        q_indexer = k_indexer = index_weights = None
+        cmp_k = None
+        idx_q = idx_k = idx_w = None
 
         if self.compress_ratio > 1 and hasattr(self, "indexer"):
-            q_indexer, k_indexer, index_weights = self.indexer(
+            idx_q, idx_k, idx_w = self.indexer(
                 x.detach(),
                 qr.detach(),
                 positions=positions,
                 attention_masks=attention_masks,
             )
 
-        if self.compress_ratio == 4:
-            kv_compress = self.compressor(
-                x,
-                positions=positions,
-                attention_masks=attention_masks,
-            )
-        elif self.compress_ratio > 1:
-            kv_compress = self.compressor_128(
+        if self.compress_ratio > 1:
+            cmp_k = self.compressor(
                 x,
                 positions=positions,
                 attention_masks=attention_masks,
             )
 
-        # Keep the inner-attention positional contract tensor-only. TP
-        # ``local_map`` requires a placement for every positional input, even
-        # when a layer does not use compressed KV or the learned indexer.
-        if kv_compress is None:
-            kv_compress = kv.new_empty((bsz, 0, self.head_dim))
-        if q_indexer is None:
-            q_indexer = x.new_empty((bsz, seqlen, 0, 0))
-            k_indexer = x.new_empty((bsz, 0, 0))
-            index_weights = x.new_empty((bsz, seqlen, 0))
-        _assert_spmd_attention_type(kv_compress, tp=spmd.R)
-        _assert_spmd_attention_type(q_indexer, tp=spmd.R)
-        _assert_spmd_attention_type(k_indexer, tp=spmd.R)
-        _assert_spmd_attention_type(index_weights, tp=spmd.R)
-
-        attn_sink_param = self.attn_sink.weight.squeeze(-1)
+        # Inner-attention positional contract: absent components are None.
+        #   sink + swa_k always; + cmp_k when compress_ratio > 1;
+        #   + idx_q/idx_k/idx_w when compress_ratio == 4 (indexer layer).
         o = self.inner_attention(
             q,
-            kv,
-            kv_compress,
-            attn_sink_param,
-            q_indexer,
-            k_indexer,
-            index_weights,
+            swa_k,
+            cmp_k,
+            idx_q,
+            idx_k,
+            idx_w,
+            attn_sink=self.attn_sink,
             attention_masks=attention_masks,
         )
 
         o_nope, o_rope = torch.split(o, [self.head_dim - rd, rd], dim=-1)
-        o_rope = self.single_rope(o_rope, positions, inverse=True)
+        o_rope = self.rope(o_rope, positions=positions, inverse=True)
         o = torch.cat([o_nope, o_rope], dim=-1)
-        _assert_spmd_attention_type(o, tp=spmd.S(2))
 
-        with spmd.local():
-            n_local_groups = self.n_groups // (self.n_heads // o.shape[2])
-            o = o.view(bsz, seqlen, n_local_groups, -1)
-            _assert_spmd_attention_type(o, tp=spmd.S(2))
-            # ``wo_a`` stores grouped LoRA-A weights in a ``Linear`` module,
-            # but the grouped projection is computed directly with einsum.
-            wo_a = self.wo_a.weight.view(n_local_groups, self.o_lora_rank, -1)
-        o = torch.einsum("bsgd,grd->bsgr", o, wo_a)
-        with spmd.local():
-            o = o.reshape(bsz, seqlen, -1)
-            _assert_spmd_attention_type(o, tp=spmd.S(2))
+        # ``wo_a`` is a BatchedLinear over the head groups; group the heads
+        # before the per-group matmul.
+        n_local_groups = self.n_groups // (self.n_heads // o.shape[2])
+        o = o.view(bsz, seqlen, n_local_groups, -1)
+        o = self.wo_a(o)
+        o = o.reshape(bsz, seqlen, -1)
         return self.wo_b(o)

@@ -3,7 +3,7 @@
 import functools
 import logging
 
-import torchtitan.distributed.full_dtensor as full_dtensor
+import torchtitan
 from torchtitan.distributed.full_dtensor import (
     validate_config as original_validate_config,
 )
@@ -29,7 +29,7 @@ def apply() -> None:
     logger.info(
         "[PATCH] torchtitan.distributed.full_dtensor.validate_config -> patched_validate_config"
     )
-    full_dtensor.validate_config = patched_validate_config
+    torchtitan.distributed.full_dtensor.validate_config = patched_validate_config
 
 
 apply()

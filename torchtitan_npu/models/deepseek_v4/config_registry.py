@@ -8,11 +8,7 @@ from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.optimizer import default_adamw
-from torchtitan.config import (
-    CompileConfig,
-    ParallelismConfig,
-    TrainingConfig,
-)
+from torchtitan.config import CompileConfig, ParallelismConfig, TrainingConfig
 from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
 from torchtitan.models.common.config_utils import decoder_vocab_size
 from torchtitan.tools.profiler import Profiler
@@ -21,8 +17,13 @@ from torchtitan.trainer import Trainer
 from . import model_registry
 
 
-def deepseek_v4_debugmodel() -> Trainer.Config:
-    model_spec = model_registry("debugmodel")
+def _make_trainer_config(
+    flavor: str,
+    *,
+    local_batch_size: int,
+    seq_len: int,
+) -> Trainer.Config:
+    model_spec = model_registry(flavor)
     return Trainer.Config(
         loss=ChunkedLossWrapper.Config(
             loss_fn=CrossEntropyLoss.Config(
@@ -46,8 +47,8 @@ def deepseek_v4_debugmodel() -> Trainer.Config:
             min_lr_factor=0.0,
         ),
         training=TrainingConfig(
-            local_batch_size=8,
-            seq_len=2048,
+            local_batch_size=local_batch_size,
+            seq_len=seq_len,
             steps=10,
         ),
         parallelism=ParallelismConfig(
@@ -60,85 +61,15 @@ def deepseek_v4_debugmodel() -> Trainer.Config:
             interval=100,
         ),
     )
+
+
+def deepseek_v4_debugmodel() -> Trainer.Config:
+    return _make_trainer_config("debugmodel", local_batch_size=1, seq_len=2048)
 
 
 def deepseek_v4_flash() -> Trainer.Config:
-    model_spec = model_registry("deepseek_v4_flash")
-    return Trainer.Config(
-        loss=ChunkedLossWrapper.Config(
-            loss_fn=CrossEntropyLoss.Config(
-                global_vocab_size=decoder_vocab_size(model_spec),
-            ),
-        ),
-        profiler=Profiler.Config(
-            enable_profiling=False,
-            profile_freq=10,
-            profiler_active=10,
-            profiler_warmup=0,
-        ),
-        metrics=MetricsProcessor.Config(log_freq=1),
-        model_spec=model_spec,
-        dataloader=HuggingFaceTextDataLoader.Config(dataset="c4_test"),
-        optimizer=default_adamw(lr=8e-4),
-        lr_scheduler=LRSchedulersContainer.Config(
-            warmup_steps=2,
-            decay_ratio=0.8,
-            decay_type="linear",
-            min_lr_factor=0.0,
-        ),
-        training=TrainingConfig(
-            local_batch_size=1,
-            seq_len=4096,
-            steps=10,
-        ),
-        parallelism=ParallelismConfig(
-            expert_parallel_degree=1,
-        ),
-        activation_checkpoint=None,
-        compile=CompileConfig(enable=False),
-        checkpoint=CheckpointManager.Config(
-            enable=False,
-            interval=100,
-        ),
-    )
+    return _make_trainer_config("deepseek_v4_flash", local_batch_size=1, seq_len=4096)
 
 
 def deepseek_v4_pro() -> Trainer.Config:
-    model_spec = model_registry("deepseek_v4_pro")
-    return Trainer.Config(
-        loss=ChunkedLossWrapper.Config(
-            loss_fn=CrossEntropyLoss.Config(
-                global_vocab_size=decoder_vocab_size(model_spec),
-            ),
-        ),
-        profiler=Profiler.Config(
-            enable_profiling=False,
-            profile_freq=10,
-            profiler_active=10,
-            profiler_warmup=0,
-        ),
-        metrics=MetricsProcessor.Config(log_freq=1),
-        model_spec=model_spec,
-        dataloader=HuggingFaceTextDataLoader.Config(dataset="c4_test"),
-        optimizer=default_adamw(lr=8e-4),
-        lr_scheduler=LRSchedulersContainer.Config(
-            warmup_steps=2,
-            decay_ratio=0.8,
-            decay_type="linear",
-            min_lr_factor=0.0,
-        ),
-        training=TrainingConfig(
-            local_batch_size=1,
-            seq_len=4096,
-            steps=10,
-        ),
-        parallelism=ParallelismConfig(
-            expert_parallel_degree=1,
-        ),
-        activation_checkpoint=None,
-        compile=CompileConfig(enable=False),
-        checkpoint=CheckpointManager.Config(
-            enable=False,
-            interval=100,
-        ),
-    )
+    return _make_trainer_config("deepseek_v4_pro", local_batch_size=1, seq_len=4096)

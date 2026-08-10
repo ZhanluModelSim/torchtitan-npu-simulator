@@ -4,9 +4,10 @@ import functools
 import logging
 
 import torch
+from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor.experimental._attention import _HeadTailLoadBalancer
 from torchtitan.distributed.context_parallel import cp_shard as original_cp_shard
-from torchtitan.models.common.attention import VarlenMetadata
+from torchtitan.models.common.attention import AttentionMasksType, VarlenMetadata
 
 from torchtitan_npu.patches.torchtitan.distributed.varlen_cp import (
     CPVarlenMetadata,
@@ -17,12 +18,12 @@ logger = logging.getLogger(__name__)
 
 @functools.wraps(original_cp_shard)
 def patched_cp_shard(
-    cp_mesh,
+    cp_mesh: DeviceMesh,
     inputs: tuple[torch.Tensor, ...],
-    attention_masks,
-    load_balancer_type="headtail",
-    input_seq_dim=1,
-):
+    attention_masks: AttentionMasksType | None,
+    load_balancer_type: str | None = "headtail",
+    input_seq_dim: int = 1,
+) -> tuple[tuple[torch.Tensor, ...], AttentionMasksType | CPVarlenMetadata | None]:
     """Build rank-local varlen metadata after sharding inputs for CP."""
     is_varlen = isinstance(attention_masks, VarlenMetadata)
     batch_size = inputs[0].size(0)
@@ -58,12 +59,14 @@ def patched_cp_shard(
 
 
 def apply() -> None:
-    import torchtitan.distributed.context_parallel as cp_module
+    import torchtitan.distributed.context_parallel
 
     logger.info(
         "[PATCH] torchtitan.distributed.context_parallel.cp_shard -> patched_cp_shard"
     )
-    cp_module.cp_shard = patched_cp_shard  # pyrefly: ignore [bad-assignment]
+    torchtitan.distributed.context_parallel.cp_shard = (
+        patched_cp_shard  # pyrefly: ignore [bad-assignment]
+    )
 
 
 apply()

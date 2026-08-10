@@ -15,7 +15,6 @@ from torchtitan.models.common.decoder_sharding import (
     norm_config,
     rowwise_config,
     set_decoder_sharding_config,
-    set_dense_ffn_sharding,
 )
 from torchtitan.models.common.moe_sharding import set_moe_sharding_config
 from torchtitan.protocols.sharding import LocalMapConfig, ShardingConfig, SpmdLayout
@@ -54,34 +53,40 @@ def dense_token_ids_sequence_parallel_placement() -> SpmdLayout:
     )
 
 
-def set_dsa_flex_attention_sharding(inner_attention_cfg) -> None:
-    query_states = dense_activation_placement(tp=spmd.S(2))
+def set_compressed_sparse_attention_sharding(inner_attention_cfg) -> None:
+    q = dense_activation_placement(tp=spmd.S(2))
     replicated_activation = dense_activation_placement(tp=spmd.R)
 
     input_shardings = {
-        "query_states": query_states,
-        "kv_states": replicated_activation,
-        "kv_compress": replicated_activation,
+        "q": q,
+        "swa_k": replicated_activation,
+        "cmp_k": replicated_activation,
         "attn_sink": _attn_sink_placement,
-        "q_indexer": replicated_activation,
-        "k_indexer": replicated_activation,
-        "index_weights": replicated_activation,
+        "idx_q": replicated_activation,
+        "idx_k": replicated_activation,
+        "idx_w": replicated_activation,
     }
     grad_placements = [
-        query_states,
+        q,
+        dense_activation_placement(tp=spmd.P),
+        dense_activation_placement(tp=spmd.P),
+        dense_activation_placement(tp=spmd.P),
         dense_activation_placement(tp=spmd.P),
         dense_activation_placement(tp=spmd.P),
         _attn_sink_placement,
-        dense_activation_placement(tp=spmd.P),
-        dense_activation_placement(tp=spmd.P),
-        dense_activation_placement(tp=spmd.P),
     ]
 
     inner_attention_cfg.sharding_config = ShardingConfig(
         in_src_shardings=input_shardings,
         in_dst_shardings=dict(input_shardings),
-        out_src_shardings=query_states,
-        out_dst_shardings=query_states,
+        out_src_shardings=q,
+        out_dst_shardings=q,
+        # The CANN indexer-loss accumulator is a per-rank fp32 scalar buffer;
+        # replicate it (like the v3.2 ``_acc``) so the loss logger reads a
+        # consistent value.
+        state_shardings={
+            "_indexer_loss_acc": dense_param_placement(tp=spmd.I),
+        },
         local_map=LocalMapConfig(in_grad_placements=tuple(grad_placements)),
     )
 
@@ -101,9 +106,12 @@ def set_deepseek_v4_attention_sharding(attention_cfg, *, enable_sp):
         in_dst_shardings={
             "x": dense_activation_placement(tp=spmd.R),
         },
+        # ``attn_sink`` is a bare ``[n_heads]`` parameter used as a head-wise
+        # vector, so TP shards its head dimension.
+        state_shardings={"attn_sink": _attn_sink_placement},
     )
 
-    set_dsa_flex_attention_sharding(at.inner_attention)
+    set_compressed_sparse_attention_sharding(at.inner_attention)
 
     # Attention submodule configs are explicit fields, so their parameter
     # layouts can be assigned before construction.
@@ -112,26 +120,18 @@ def set_deepseek_v4_attention_sharding(attention_cfg, *, enable_sp):
     at.wq_b.sharding_config = colwise_config()
     at.wkv.sharding_config = _replicate_weight
     at.kv_norm.sharding_config = _replicate_weight
-    # ``wo_a`` stores grouped LoRA-A weights used by einsum rather than a
-    # standard matmul. Colwise sharding distributes its head groups on dim 0.
-    at.wo_a.sharding_config = colwise_config()
+    # ``wo_a`` is a BatchedLinear of per-group matrices, so TP shards its
+    # group dimension (dim 0), like dsv3.2's ``w_uv``.
+    at.wo_a.sharding_config = ShardingConfig(
+        state_shardings={"weight": dense_param_placement(tp=spmd.S(0))}
+    )
     at.wo_b.sharding_config = rowwise_config(output_sp=enable_sp)
-    # ``attn_sink`` is stored as ``[n_heads, 1]`` and used as a head-wise
-    # vector, so TP shards its head dimension.
-    at.attn_sink.sharding_config = ShardingConfig(
-        state_shardings={"weight": _attn_sink_placement},
-    )
     at.rope.sharding_config = ShardingConfig(
-        state_shardings={"cache": _dense_param_rep},
-    )
-    at.single_rope.sharding_config = ShardingConfig(
         state_shardings={"cache": _dense_param_rep},
     )
 
     if at.compressor is not None:
         set_compressor_sharding(at.compressor)
-    if at.compressor_128 is not None:
-        set_compressor_sharding(at.compressor_128)
     if at.indexer is not None:
         set_indexer_sharding(at.indexer)
 
@@ -139,13 +139,16 @@ def set_deepseek_v4_attention_sharding(attention_cfg, *, enable_sp):
 def set_compressor_sharding(compressor_cfg):
     # Compressor projections, normalization, and APE are explicit config
     # fields, allowing each parameter layout to be assigned before build.
-    compressor_cfg.single_rope.sharding_config = ShardingConfig(
+    compressor_cfg.rope.sharding_config = ShardingConfig(
         state_shardings={"cache": _dense_param_rep},
     )
     compressor_cfg.wkv.sharding_config = _replicate_weight
     compressor_cfg.wgate.sharding_config = _replicate_weight
     compressor_cfg.norm.sharding_config = _replicate_weight
-    compressor_cfg.ape.sharding_config = _replicate_weight
+    # ``ape`` is a plain parameter on the Compressor module itself.
+    compressor_cfg.sharding_config = ShardingConfig(
+        state_shardings={"ape": _dense_param_rep}
+    )
 
 
 def set_indexer_sharding(indexer_cfg):
@@ -160,7 +163,7 @@ def set_indexer_sharding(indexer_cfg):
             "qr": replicated_activation,
         },
     )
-    indexer_cfg.single_rope.sharding_config = ShardingConfig(
+    indexer_cfg.rope.sharding_config = ShardingConfig(
         state_shardings={"cache": _dense_param_rep},
     )
     indexer_cfg.wq_b.sharding_config = ShardingConfig(
@@ -178,20 +181,15 @@ def set_deepseek_v4_layer_sharding(
     enable_sp: bool,
     enable_ep: bool,
 ) -> None:
-    hc_rep = ShardingConfig(
-        state_shardings=dict.fromkeys(
-            [
-                "hc_attn_fn",
-                "hc_ffn_fn",
-                "hc_attn_base",
-                "hc_ffn_base",
-                "hc_attn_scale",
-                "hc_ffn_scale",
-            ],
-            _dense_param_rep,
-        ),
+    hc_pre_rep = ShardingConfig(
+        state_shardings={
+            "hc_fn": _dense_param_rep,
+            "hc_base": _dense_param_rep,
+            "hc_scale": _dense_param_rep,
+        },
     )
-    layer_cfg.sharding_config = hc_rep
+    layer_cfg.hc_attn_pre.sharding_config = hc_pre_rep
+    layer_cfg.hc_ffn_pre.sharding_config = hc_pre_rep
 
     norm = norm_config(enable_sp=enable_sp)
     layer_cfg.attention_norm.sharding_config = norm
@@ -204,34 +202,25 @@ def set_deepseek_v4_layer_sharding(
 
     set_deepseek_v4_attention_sharding(layer_cfg.attention, enable_sp=enable_sp)
 
-    # Dense FFN (non-MoE layers only)
-    if layer_cfg.feed_forward is not None:
-        set_dense_ffn_sharding(
-            layer_cfg.feed_forward,
-            attn_x_layout=attn_x_layout,
-            enable_sp=enable_sp,
-        )
-
-    # MoE FFN (MoE-enabled layers only).
-    if layer_cfg.moe is not None:
-        set_moe_sharding_config(
-            layer_cfg.moe,
-            enable_ep=enable_ep,
-            enable_sp=enable_sp,
-            expert_param_layout=_GROUPED_EXPERTS_PARAM_LAYOUT,
-        )
-        input_ids_src_placement = dense_activation_placement(tp=spmd.R)
-        input_ids_dst_placement = (
-            dense_token_ids_sequence_parallel_placement()
-            if enable_ep
-            else dense_activation_placement(tp=spmd.R)
-        )
-        moe_sharding = layer_cfg.moe.sharding_config
-        assert moe_sharding is not None
-        assert moe_sharding.in_src_shardings is not None
-        assert moe_sharding.in_dst_shardings is not None
-        moe_sharding.in_src_shardings["input_ids"] = input_ids_src_placement
-        moe_sharding.in_dst_shardings["input_ids"] = input_ids_dst_placement
+    # MoE FFN (every DSV4 layer is a MoE layer).
+    set_moe_sharding_config(
+        layer_cfg.moe,
+        enable_ep=enable_ep,
+        enable_sp=enable_sp,
+        expert_param_layout=_GROUPED_EXPERTS_PARAM_LAYOUT,
+    )
+    input_ids_src_placement = dense_activation_placement(tp=spmd.R)
+    input_ids_dst_placement = (
+        dense_token_ids_sequence_parallel_placement()
+        if enable_ep
+        else dense_activation_placement(tp=spmd.R)
+    )
+    layer_cfg.moe.sharding_config.in_src_shardings[  # pyrefly: ignore [missing-attribute]
+        "input_ids"
+    ] = input_ids_src_placement
+    layer_cfg.moe.sharding_config.in_dst_shardings[  # pyrefly: ignore [missing-attribute]
+        "input_ids"
+    ] = input_ids_dst_placement
 
 
 def set_deepseek_v4_sharding_config(
@@ -242,14 +231,13 @@ def set_deepseek_v4_sharding_config(
 ) -> None:
     set_decoder_sharding_config(config, enable_sp=enable_sp)
 
-    hc_rep = ShardingConfig(
-        state_shardings=dict.fromkeys(
-            ["hc_head_fn", "hc_head_base", "hc_head_scale"], _dense_param_rep
-        ),
+    config.hc_head.sharding_config = ShardingConfig(
+        state_shardings={
+            "hc_fn": _dense_param_rep,
+            "hc_base": _dense_param_rep,
+            "hc_scale": _dense_param_rep,
+        },
     )
-    model_sharding = config.sharding_config or ShardingConfig()
-    model_sharding.state_shardings.update(hc_rep.state_shardings)
-    config.sharding_config = model_sharding
 
     for layer_cfg in config.layers:
         set_deepseek_v4_layer_sharding(

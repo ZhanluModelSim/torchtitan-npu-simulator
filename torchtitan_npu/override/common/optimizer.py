@@ -71,9 +71,9 @@ class SwapOptimizersContainer(OptimizersContainer):
 
 @override(
     target=OptimizersContainer.Config,
-    description="Allocate Adam/AdamW states in NPU swap memory (host-offload)",
+    description="Allocate Adam/AdamW states in swap memory (host-offload)",
 )
-def npu_swap_optimizer_override(
+def swap(
     cfg: OptimizersContainer.Config,
 ) -> SwapOptimizersContainer.Config:
     return derive(cfg, SwapOptimizersContainer.Config)

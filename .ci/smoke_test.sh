@@ -49,19 +49,27 @@ readonly -a ALL_CASES=(
     deepseek_v4_ep2
 )
 
-readonly DSV32_OVERRIDES="\
-torchtitan_npu.override.deepseek_v3_2.sparse_attention.kernel,\
-torchtitan_npu.override.deepseek_v3_2.sparse_attention.mask_handler,\
-torchtitan_npu.override.common.rope.npu_rope_override,\
-torchtitan_npu.override.common.rope.npu_single_complex_rope_override,\
-torchtitan_npu.override.common.rms_norm.npu_rms_norm_override"
+# The v3.2 fused path: TND mask handler + fused attention (sparse_attn
+# package), the CANN fused complex rope, and the CANN RMSNorm.  The legacy
+# npu_*_override / single-complex names are gone (the unified rope API).
+readonly -a DSV32_OVERRIDES=(
+    torchtitan_npu.override.deepseek_v3_2.sparse_attn.cann_metadata
+    torchtitan_npu.override.deepseek_v3_2.sparse_attn.cann
+    torchtitan_npu.override.common.rope.cann_complex
+    torchtitan_npu.override.common.rms_norm.cann
+)
 
-readonly DSV4_OVERRIDES="\
-torchtitan_npu.override.deepseek_v4.fused_dsa.npu_smla_tnd_override,\
-torchtitan_npu.override.deepseek_v4.varlen_dsa.npu_dsv4_packed_mask_handler_override,\
-torchtitan_npu.override.deepseek_v4.rope.npu_dsv4_rope_override,\
-torchtitan_npu.override.deepseek_v4.rope.npu_dsv4_single_rope_override,\
-torchtitan_npu.override.deepseek_v4.golden.rms_norm_golden"
+# The v4 fused path (debugmodel geometry, kept in sync with run_train.sh):
+# CANN RMSNorm + fused rope, the CANN metadata layer (geometry JSON — a
+# single --override.imports argument, hence the array form), and the fused
+# TND attention.
+readonly DSV4_GEOMETRY='{"num_heads":16,"head_dim":512,"index_n_heads":8,"index_head_dim":128,"index_topk":512}'
+readonly -a DSV4_OVERRIDES=(
+    torchtitan_npu.override.common.rms_norm.cann
+    torchtitan_npu.override.common.rope.cann_complex
+    "torchtitan_npu.override.deepseek_v4.sparse_attn.cann_metadata=${DSV4_GEOMETRY}"
+    torchtitan_npu.override.deepseek_v4.sparse_attn.cann
+)
 
 WORK_DIR=""
 TORCHTITAN_DIR=""
@@ -213,7 +221,8 @@ _print_command() {
 
 _run_case() {
     local case_name="$1"
-    local module config tokenizer_dir overrides
+    local module config tokenizer_dir
+    local -a overrides=()
     local cp_degree=1
     local ep_degree=2
     local -a spmd_args=()
@@ -223,13 +232,13 @@ _run_case() {
             module="torchtitan_npu.models.deepseek_v3_2"
             config="deepseek_v3_2_debugmodel"
             tokenizer_dir="${DSV32_TOKENIZER_DIR}"
-            overrides="${DSV32_OVERRIDES}"
+            overrides=("${DSV32_OVERRIDES[@]}")
             ;;
         deepseek_v4_*)
             module="torchtitan_npu.models.deepseek_v4"
             config="deepseek_v4_debugmodel"
             tokenizer_dir="${DSV4_TOKENIZER_DIR}"
-            overrides="${DSV4_OVERRIDES}"
+            overrides=("${DSV4_OVERRIDES[@]}")
             ;;
         *)
             echo "Unsupported model in case ${case_name}" >&2
@@ -256,13 +265,31 @@ _run_case() {
     fi
     local dp_shard_degree=$((NPROC_PER_NODE / cp_degree))
 
+    # ``--override.imports`` is a single tyro nargs="*" flag: repeated flags
+    # do NOT append (only the last survives).  One flag carries all targets —
+    # the plain ones comma-joined into one token, the kwargs target (the v4
+    # geometry JSON, containing commas/quotes) as its own token.
+    local -a override_tokens=()
+    local -a plain_overrides=()
+    local ov
+    for ov in "${overrides[@]}"; do
+        if [[ "${ov}" == *"="* ]]; then
+            override_tokens+=("${ov}")
+        else
+            plain_overrides+=("${ov}")
+        fi
+    done
+    if [[ ${#plain_overrides[@]} -gt 0 ]]; then
+        override_tokens=("$(IFS=,; echo "${plain_overrides[*]}")" "${override_tokens[@]}")
+    fi
+    local -a override_args=(--override.imports "${override_tokens[@]}")
+
     local -a train_args=(
         --module "${module}"
         --config "${config}"
         --hf-assets-path "${tokenizer_dir}"
         --dataloader.dataset c4_test
         --dataloader.dataset-path "${TORCHTITAN_DIR}/tests/assets/c4_test"
-        --override.imports "${overrides}"
         --training.local-batch-size 1
         --training.seq-len "${SMOKE_SEQ_LEN}"
         --training.steps "${SMOKE_STEPS}"
@@ -270,6 +297,7 @@ _run_case() {
         --parallelism.context-parallel-degree "${cp_degree}"
         --parallelism.expert-parallel-degree "${ep_degree}"
         "${spmd_args[@]}"
+        "${override_args[@]}"
         --checkpoint.no-enable
         --metrics.log-freq 1
         --dump-folder "${REPORT_DIR}/${case_name}/dump"

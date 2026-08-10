@@ -14,8 +14,13 @@ from torchtitan.config import derive, override
 from torchtitan_npu.models.deepseek_v4.mhc import HcPost, HcPre
 
 
-class FusedHcPre(HcPre):
-    """HcPre backed by ``cann_ops_transformer.ops.mhc_pre_sinkhorn``."""
+class CANNHcPre(HcPre):
+    """HcPre backed by ``cann_ops_transformer.ops.mhc_pre_sinkhorn``.
+
+    The modern model-dir ``HcPre`` owns its mixing parameters and calls
+    ``forward(x)``; the fused op consumes them internally (linear + RMS
+    scaling + sigmoid + sinkhorn), mirroring the eager implementation.
+    """
 
     @dataclass(kw_only=True, slots=True)
     class Config(HcPre.Config):
@@ -24,27 +29,26 @@ class FusedHcPre(HcPre):
     def forward(
         self,
         x: torch.Tensor,
-        hc_fn: torch.Tensor,
-        hc_scale: torch.Tensor,
-        hc_base: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        outputs = cann_ops.mhc_pre_sinkhorn(
+        # The block feeds the 4-D ``[B, S, hc_mult, dim]`` form (the eager
+        # path flattens to ``[B, S, hc_mult * dim]`` for its linear); the
+        # fused op consumes the 4-D form directly (x: FLOAT16/BFLOAT16).
+        dtype = x.dtype
+        h_in, h_post, h_res = cann_ops.mhc_pre_sinkhorn(
             x,
-            hc_fn.to(torch.float32),
-            hc_scale.to(torch.float32),
-            hc_base.to(torch.float32),
+            self.hc_fn.float(),
+            self.hc_scale.float(),
+            self.hc_base.float(),
             self.hc_mult,
-            self.sinkhorn.sinkhorn_iters,
-            self.sinkhorn.eps,
+            self.sinkhorn_iters,
+            self.eps,
             self.norm_eps,
         )
-
-        h_in, h_post, h_res = outputs[:3]
         h_res = h_res.reshape(*x.shape[:2], self.hc_mult, self.hc_mult)
-        return h_in, h_post, h_res
+        return h_in.to(dtype), h_post, h_res
 
 
-class FusedHcPost(HcPost):
+class CANNHcPost(HcPost):
     """HcPost backed by ``cann_ops_transformer.ops.mhc_post``."""
 
     @dataclass(kw_only=True, slots=True)
@@ -68,8 +72,8 @@ class FusedHcPost(HcPost):
         "NPU fused DeepSeek-V4 HcPre via cann_ops_transformer.ops.mhc_pre_sinkhorn"
     ),
 )
-def npu_mhc_pre(cfg: HcPre.Config) -> FusedHcPre.Config:
-    return derive(cfg, FusedHcPre.Config)
+def cann_hc_pre(cfg: HcPre.Config) -> CANNHcPre.Config:
+    return derive(cfg, CANNHcPre.Config)
 
 
 @override(
@@ -77,5 +81,5 @@ def npu_mhc_pre(cfg: HcPre.Config) -> FusedHcPre.Config:
     exact=True,
     description=("NPU fused DeepSeek-V4 HcPost via cann_ops_transformer.ops.mhc_post"),
 )
-def npu_mhc_post(cfg: HcPost.Config) -> FusedHcPost.Config:
-    return derive(cfg, FusedHcPost.Config)
+def cann_hc_post(cfg: HcPost.Config) -> CANNHcPost.Config:
+    return derive(cfg, CANNHcPost.Config)

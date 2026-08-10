@@ -3,86 +3,42 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from dataclasses import dataclass, field, replace
-from functools import partial
+from dataclasses import dataclass
 
 import torch
-from torch import nn
-from torchtitan.models.common.attention import AttentionMasksType, VarlenAttention
+from torchtitan.models.common.attention import AttentionMasksType
 from torchtitan.models.common.decoder import Decoder, TransformerBlock
+from torchtitan.models.common.moe import MoE
 
-from torchtitan_npu.patches.torchtitan.models.common.mask_handler import (
-    BaseMaskHandler,
-)
+from torchtitan_npu.patches.torchtitan.models.common.mask_handler import BaseMaskHandler
 
 from .mhc import HcHead, HcPost, HcPre
-from .packed import build_dsv4_packed_metadata
 
 
 class DeepSeekV4TransformerBlock(TransformerBlock):
     @dataclass(kw_only=True, slots=True)
     class Config(TransformerBlock.Config):
-        dim: int
-        hc_mult: int = 4
-        norm_eps: float = 1e-6
-        sinkhorn_iters: int = 20
-        hc_eps: float = 1e-6
-        hc_pre: HcPre.Config
+        # DeepSeek-V4 has no non-MoE layer; ``moe`` is required (overrides the
+        # inherited ``MoE.Config | None = None``).
+        moe: MoE.Config  # pyrefly: ignore [bad-override]
+        hc_attn_pre: HcPre.Config
+        hc_ffn_pre: HcPre.Config
         hc_post: HcPost.Config
 
     def __init__(self, config: Config):
         super().__init__()
         cfg = config
 
+        self.moe_enabled = True
+
         self.attention = cfg.attention.build()
-        assert cfg.attention_norm is not None
-        assert cfg.ffn_norm is not None
         self.attention_norm = cfg.attention_norm.build()
         self.ffn_norm = cfg.ffn_norm.build()
-        self.moe_enabled = cfg.moe is not None
-        if self.moe_enabled:
-            assert cfg.moe is not None
-            self.moe = cfg.moe.build()
-            self.feed_forward = None
-        else:
-            assert cfg.feed_forward is not None
-            self.moe = None
-            self.feed_forward = cfg.feed_forward.build()
+        self.moe = cfg.moe.build()
 
-        self.hc_mult = cfg.hc_mult
-        mix_hc = (2 + cfg.hc_mult) * cfg.hc_mult
-        hc_dim = cfg.hc_mult * cfg.dim
-
-        self.hc_attn_fn = nn.Parameter(torch.empty(mix_hc, hc_dim, dtype=torch.float32))
-        self.hc_ffn_fn = nn.Parameter(torch.empty(mix_hc, hc_dim, dtype=torch.float32))
-        self.hc_attn_base = nn.Parameter(torch.empty(mix_hc, dtype=torch.float32))
-        self.hc_ffn_base = nn.Parameter(torch.empty(mix_hc, dtype=torch.float32))
-        self.hc_attn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
-        self.hc_ffn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
-
-        self.hc_pre = cfg.hc_pre.build()
+        self.hc_attn_pre = cfg.hc_attn_pre.build()
+        self.hc_ffn_pre = cfg.hc_ffn_pre.build()
         self.hc_post = cfg.hc_post.build()
-
-        if self._param_init is None:
-            self._param_init = {}
-        self._param_init.update(
-            {
-                "hc_attn_fn": partial(_init_trunc_normal, std=0.02),
-                "hc_ffn_fn": partial(_init_trunc_normal, std=0.02),
-                "hc_attn_base": partial(_init_trunc_normal, std=0.02),
-                "hc_ffn_base": partial(_init_trunc_normal, std=0.02),
-                "hc_attn_scale": partial(_init_trunc_normal, std=0.02),
-                "hc_ffn_scale": partial(_init_trunc_normal, std=0.02),
-            }
-        )
-
-    def _mhc_step(self, x, residual, hc_fn, hc_scale, hc_base, norm, fn, *a, **kw):
-        x, post, comb = self.hc_pre(x, hc_fn, hc_scale, hc_base)
-        if norm is not None:
-            x = norm(x)
-        x = fn(x)
-        x = self.hc_post(x, residual, post, comb)
-        return x
 
     def forward(
         self,
@@ -92,89 +48,25 @@ class DeepSeekV4TransformerBlock(TransformerBlock):
         positions: torch.Tensor | None = None,
     ):
         residual = x
-        x, post, comb = self.hc_pre(
-            x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
-        )
+        x, post, comb = self.hc_attn_pre(x)
         x = self.attention(self.attention_norm(x), attention_masks, positions)
         x = self.hc_post(x, residual, post, comb)
         residual = x
-        x, post, comb = self.hc_pre(
-            x, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base
-        )
-        if self.moe_enabled:
-            assert self.moe is not None
-            x = self.moe(self.ffn_norm(x), input_ids=input_ids)
-        else:
-            assert self.feed_forward is not None
-            x = self.feed_forward(self.ffn_norm(x))
+        x, post, comb = self.hc_ffn_pre(x)
+        x = self.moe(self.ffn_norm(x), input_ids=input_ids)
         x = self.hc_post(x, residual, post, comb)
         return x
-
-
-class DSV4PackedMetadataHandler(BaseMaskHandler):
-    """Derive the DSV4 compression plan from a rank-local varlen stream.
-
-    The handler runs after ``cp_shard``, so all token and block mappings refer
-    to the sequence shard held by the current rank.
-    """
-
-    # VarlenMetadata carries neither the [B, S] shape nor per-token positions.
-    wants_positions = True
-
-    @dataclass(kw_only=True, slots=True)
-    class Config(BaseMaskHandler.Config):
-        compress_ratios: tuple[int, ...] = ()
-
-    def __init__(self, config: Config):
-        super().__init__(config)
-        self.compress_ratios = tuple(config.compress_ratios)
-
-    def post_process(self, masks, *, positions=None):
-        if positions is None:
-            raise ValueError(
-                "DSV4PackedMetadataHandler requires positions; the caller must "
-                "route through run_mask_handler, which honours wants_positions."
-            )
-        return build_dsv4_packed_metadata(
-            masks, self.compress_ratios, positions=positions
-        )
-
-
-def _require_packed_mask_handler(attention_config, mask_handler_config) -> None:
-    """Validate the mask handler required by a varlen attention core.
-
-    A varlen core makes ``get_attention_masks`` return ``VarlenMetadata``.
-    Without the packed handler, compression and selection would not receive
-    document-aware token and block mappings.
-    """
-
-    inner_attention = getattr(attention_config, "inner_attention", None)
-    if not isinstance(inner_attention, VarlenAttention.Config):
-        return
-    if isinstance(mask_handler_config, DSV4PackedMetadataHandler.Config):
-        return
-    raise ValueError(
-        f"{type(inner_attention).__name__} needs the DSV4 packed compression "
-        f"plan, but mask_handler is {type(mask_handler_config).__name__}. Add "
-        "torchtitan_npu.override.deepseek_v4.varlen_dsa."
-        "npu_dsv4_packed_mask_handler_override to override.imports."
-    )
 
 
 class DeepSeekV4Model(Decoder):
     @dataclass(kw_only=True, slots=True)
     class Config(Decoder.Config):
-        dim: int
         vocab_size: int
         hc_mult: int = 4
-        compress_ratios: tuple[int, ...] = (1, 1, 4, 4)
-        n_layers: int = 4
-        norm_eps: float = 1e-6
-        # Flex attention consumes ``BlockMask`` through this pass-through
-        # handler. Varlen recipes replace it with the packed metadata handler.
-        mask_handler: BaseMaskHandler.Config = field(
-            default_factory=BaseMaskHandler.Config
-        )
+        compress_ratios: tuple[int, ...]
+        n_layers: int
+        hc_head: HcHead.Config
+        mask_handler: BaseMaskHandler.Config
 
         def update_from_config(self, *, config, **kwargs):
             Decoder.Config.update_from_config(self, config=config, **kwargs)
@@ -227,55 +119,11 @@ class DeepSeekV4Model(Decoder):
         super().__init__(config)
         cfg = config
 
-        if self.lm_head is not None and self.lm_head.weight.dtype != torch.float32:
-            self.lm_head.weight.data = self.lm_head.weight.data.float()
-
         self.hc_mult = cfg.hc_mult
-        self.compress_ratios = list(cfg.compress_ratios)[: cfg.n_layers]
-        self.n_main_layers = cfg.n_layers
 
-        _require_packed_mask_handler(cfg.first_attention, cfg.mask_handler)
-        # Numerical entry points build configs without ``Trainer``, so inject
-        # compression ratios here. Copy the handler config rather than mutating
-        # a config that may be inspected or built again.
-        handler_config = cfg.mask_handler
-        if isinstance(handler_config, DSV4PackedMetadataHandler.Config):
-            handler_config = replace(
-                handler_config,
-                compress_ratios=tuple(self.compress_ratios),
-            )
-        self._mask_handler = handler_config.build()
+        self._mask_handler = cfg.mask_handler.build()
 
-        hc_dim = cfg.hc_mult * cfg.dim
-        self.hc_head_fn = nn.Parameter(
-            torch.empty(cfg.hc_mult, hc_dim, dtype=torch.float32)
-        )
-        self.hc_head_base = nn.Parameter(torch.empty(cfg.hc_mult, dtype=torch.float32))
-        self.hc_head_scale = nn.Parameter(torch.empty(1, dtype=torch.float32))
-
-        self.hc_head = HcHead.Config(
-            hc_mult=cfg.hc_mult,
-            dim=cfg.dim,
-            norm_eps=cfg.norm_eps,
-            eps=1e-6,
-        ).build()
-
-        if self._param_init is None:
-            self._param_init = {}
-        self._param_init.update(
-            {
-                "hc_head_fn": partial(_init_trunc_normal, std=0.02),
-                "hc_head_base": partial(_init_trunc_normal, std=0.02),
-                "hc_head_scale": partial(_init_trunc_normal, std=0.02),
-            }
-        )
-
-        self._dsa_loss_tracker = {}
-
-    def get_dsa_losses(self):
-        losses = dict(self._dsa_loss_tracker)
-        self._dsa_loss_tracker.clear()
-        return losses
+        self.hc_head = cfg.hc_head.build()
 
     def forward(
         self,
@@ -287,19 +135,15 @@ class DeepSeekV4Model(Decoder):
         h = self.tok_embeddings(tokens) if self.tok_embeddings is not None else tokens
         h = h.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
 
-        for i in range(self.n_main_layers):
-            layer = self.layers[str(i)]
+        for layer in self.layers.values():
             h = layer(h, input_ids, attention_masks, positions)
 
-        h = self.hc_head(h, self.hc_head_fn, self.hc_head_scale, self.hc_head_base)
+        h = self.hc_head(h)
         h = self.norm(h) if self.norm is not None else h
         if self._skip_lm_head:
             return h
         if self.lm_head is None:
             return h
-        output = torch.nn.functional.linear(h.float(), self.lm_head.weight.float())
-        return output
-
-
-def _init_trunc_normal(x, std=0.02):
-    nn.init.trunc_normal_(x, mean=0.0, std=std)
+        # Follow the dsv3/common-decoder convention: lm_head stays in BF16
+        # (checkpoint dtype) and is applied as a plain module call.
+        return self.lm_head(h)

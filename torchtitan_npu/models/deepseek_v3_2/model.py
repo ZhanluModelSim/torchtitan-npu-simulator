@@ -191,8 +191,9 @@ class BlockMaskHandler(BaseMaskHandler):
     class Config(BaseMaskHandler.Config):
         pass
 
-    def post_process(self, masks, *, positions=None):
-        del positions
+    def post_process(  # pyrefly: ignore [bad-override]
+        self, masks
+    ):
         assert isinstance(masks, BlockMask), f"expected BlockMask, got {type(masks)}"
         B = masks.kv_num_blocks.shape[0]
         seq_len = masks.seq_lengths[0]
@@ -233,7 +234,7 @@ class SparseIndexerLoss(LoggedAuxLoss):
         *,
         carrier: torch.Tensor,
     ) -> torch.Tensor:
-        B = topk_indices_BLqK.shape[0]
+        B, _Lq, _K = topk_indices_BLqK.shape
 
         k_sqz = k_BL1H.float().squeeze(2)
         b_idx = torch.arange(B, device=topk_indices_BLqK.device)[:, None, None]

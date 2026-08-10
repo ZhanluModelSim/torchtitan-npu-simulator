@@ -1,17 +1,13 @@
 # Pending upstream PR: https://github.com/pytorch/torchtitan/pull/3634
 
 from dataclasses import dataclass
-from typing import Any
 
-import torch
 from torchtitan.config.configurable import Configurable
+from torchtitan.models.common.attention import AttentionMasksType
 
 
 class BaseMaskHandler(Configurable):
     """Post-process attention masks after optional CP sharding."""
-
-    wants_positions: bool = False
-    """Whether ``post_process`` accepts the ``positions`` keyword."""
 
     @dataclass(kw_only=True, slots=True)
     class Config(Configurable.Config):
@@ -22,22 +18,6 @@ class BaseMaskHandler(Configurable):
 
     def post_process(
         self,
-        masks: Any,
-        *,
-        positions: torch.Tensor | None = None,
-    ) -> Any:
-        del positions
+        masks: AttentionMasksType,
+    ) -> AttentionMasksType:
         return masks
-
-
-def run_mask_handler(
-    handler: BaseMaskHandler,
-    masks: Any,
-    *,
-    positions: torch.Tensor | None,
-) -> Any:
-    """Run the handler with its declared position-data contract."""
-
-    if getattr(handler, "wants_positions", False):
-        return handler.post_process(masks, positions=positions)
-    return handler.post_process(masks)

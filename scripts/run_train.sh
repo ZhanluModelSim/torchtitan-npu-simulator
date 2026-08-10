@@ -12,10 +12,21 @@
 #
 # Keep GOLDEN_OVERRIDES unchanged. Edit TEST_OVERRIDES for the implementation
 # under test.
+#
+# NOTE: MODULE must resolve through ``torchtitan_npu`` so the package is
+# imported early (its __init__ activates the patches/torchtitan backports);
+# if it were imported only at apply_override time the patches would come in
+# too late.
 
 set -e
 
-source /usr/local/Ascend/cann/set_env.sh
+if [ -f /usr/local/Ascend/cann/set_env.sh ]; then
+    source /usr/local/Ascend/cann/set_env.sh
+elif [ -f /usr/local/Ascend/ascend-toolkit/set_env.sh ]; then
+    source /usr/local/Ascend/ascend-toolkit/set_env.sh
+else
+    source /home/developer/Ascend/ascend-toolkit/set_env.sh
+fi
 
 NGPU=${NGPU:-1}
 export LOG_RANK=${LOG_RANK:-0}
@@ -23,29 +34,68 @@ MODULE=${MODULE:-"torchtitan_npu.models.deepseek_v4"}
 CONFIG=${CONFIG:-"deepseek_v4_debugmodel"}
 COMM_MODE=${COMM_MODE:-""}
 export CLOSE_MATMUL_K_SHIFT=${CLOSE_MATMUL_K_SHIFT:-1}
-TORCHFT_LIGHTHOUSE=${TORCHFT_LIGHTHOUSE:-"http://localhost:29510"}
 
-# Fixed numerical reference. Do not modify this list.
-readonly GOLDEN_OVERRIDES="\
-torchtitan_npu.override.deepseek_v4.golden.dsa_sparse_attention_golden,\
-torchtitan_npu.override.deepseek_v4.varlen_dsa.npu_dsv4_packed_mask_handler_override,\
-torchtitan_npu.override.deepseek_v4.rope.npu_dsv4_rope_override,\
-torchtitan_npu.override.deepseek_v4.rope.npu_dsv4_single_rope_override,\
-torchtitan_npu.override.deepseek_v4.golden.rms_norm_golden,\
-torchtitan_npu.override.deepseek_v4.golden.dsv4_moe_golden"
+# The CANN mask handler needs the attention geometry from the selected model
+# config. Keep these values in sync with the DeepSeek-V4 config registry.
+case "${CONFIG}" in
+    deepseek_v4_debugmodel)
+        MASK_HANDLER_GEOMETRY='{"num_heads":16,"head_dim":512,"index_n_heads":8,"index_head_dim":128,"index_topk":512}'
+        ;;
+    deepseek_v4_flash)
+        MASK_HANDLER_GEOMETRY='{"num_heads":64,"head_dim":512,"index_n_heads":64,"index_head_dim":128,"index_topk":512}'
+        ;;
+    deepseek_v4_pro)
+        MASK_HANDLER_GEOMETRY='{"num_heads":128,"head_dim":512,"index_n_heads":64,"index_head_dim":128,"index_topk":1024}'
+        ;;
+    *)
+        MASK_HANDLER_GEOMETRY=""
+        ;;
+esac
 
-# Edit this list to select the implementation under test.
-TEST_OVERRIDES="\
-torchtitan_npu.override.deepseek_v4.fused_dsa.npu_smla_tnd_override,\
-torchtitan_npu.override.deepseek_v4.varlen_dsa.npu_dsv4_packed_mask_handler_override,\
-torchtitan_npu.override.deepseek_v4.rope.npu_dsv4_rope_override,\
-torchtitan_npu.override.deepseek_v4.rope.npu_dsv4_single_rope_override,\
-torchtitan_npu.override.deepseek_v4.golden.rms_norm_golden"
+# Fixed numerical reference: Torch RMSNorm from the model config, the torch-
+# compatible DSV4 rope (unconditional YaRN, patched generic path), the normal
+# bf16 MoE (clamped via the GroupedExperts/FeedForward patch — the same
+# dtype and clamp semantics as transformers), and the eager Golden
+# sparse-attention implementation.
+readonly -a GOLDEN_OVERRIDES=(
+    torchtitan_npu.override.common.rope.workaround
+    torchtitan_npu.override.deepseek_v4.sparse_attn.golden
+)
+
+# Fused implementation under test: CANN RMSNorm, CANN fused rope, mask
+# metadata, and SMLA. Both paths use the model's normal (clamped) MoE.
+readonly -a TEST_OVERRIDES=(
+    torchtitan_npu.override.common.rms_norm.cann
+    torchtitan_npu.override.common.rope.cann_complex
+    "torchtitan_npu.override.deepseek_v4.sparse_attn.cann_metadata=${MASK_HANDLER_GEOMETRY}"
+    torchtitan_npu.override.deepseek_v4.sparse_attn.cann
+)
 
 if [ "${USE_GOLDEN:-0}" = "1" ]; then
-    OVERRIDE_IMPORTS="${GOLDEN_OVERRIDES}"
+    OVERRIDE_IMPORTS=("${GOLDEN_OVERRIDES[@]}")
 else
-    OVERRIDE_IMPORTS="${TEST_OVERRIDES}"
+    if [ -z "${MASK_HANDLER_GEOMETRY}" ]; then
+        echo "Unsupported CONFIG='${CONFIG}' for fused DSV4 overrides" >&2
+        exit 2
+    fi
+    OVERRIDE_IMPORTS=("${TEST_OVERRIDES[@]}")
+fi
+
+# ``--override.imports`` is a single tyro nargs="*" flag: repeated flags do
+# NOT append (only the last one survives).  One flag carries all targets —
+# the plain ones comma-joined into a single token, the kwargs target (the
+# CANN mask-handler geometry JSON) as its own token.
+_override_tokens=()
+_plain_overrides=()
+for _ov in "${OVERRIDE_IMPORTS[@]}"; do
+    if [[ "${_ov}" == *"="* ]]; then
+        _override_tokens+=("${_ov}")
+    else
+        _plain_overrides+=("${_ov}")
+    fi
+done
+if [[ ${#_plain_overrides[@]} -gt 0 ]]; then
+    _override_tokens=("$(IFS=,; echo "${_plain_overrides[*]}")" "${_override_tokens[@]}")
 fi
 
 ARGS=(
@@ -54,7 +104,7 @@ ARGS=(
     --hf-assets-path "${HF_ASSETS_PATH:-/path/to/dsv4_tokenizer}"
     --dataloader.dataset "${DATASET:-c4_test}"
     --dataloader.dataset-path "${DATASET_PATH:-tests/assets/c4_test}"
-    --override.imports "${OVERRIDE_IMPORTS}"
+    --override.imports "${_override_tokens[@]}"
 )
 
 if [ -n "$COMM_MODE" ]; then
