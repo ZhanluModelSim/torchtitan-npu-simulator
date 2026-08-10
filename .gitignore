@@ -109,3 +109,6 @@ outputs/
 oat_reports/
 
 log/
+
+# Generated training-log visualizations (created lazily by the skill).
+/outputs/
