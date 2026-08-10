@@ -4,6 +4,7 @@
 # LICENSE file in the root directory of this source tree.
 
 from operator import attrgetter
+from types import SimpleNamespace
 from typing import Any, cast
 
 import torch
@@ -50,6 +51,106 @@ def test_moe_dispatch_config_wires_converter_and_plan_updater():
     updater = moe_dispatch.MoeDispatchModelConfig.parallelize_plan_updater
     standard = updater.update(expert_parallel.ExpertParallel())
     assert isinstance(standard, moe_dispatch.NpuExpertParallel)
+
+
+def test_tilelang_moe_reduce_config_is_independent_opt_in():
+    assert moe_dispatch.TileLangMoeReduceModelConfig.model_converter is moe_dispatch.TileLangMoeReduceConverter
+    assert issubclass(
+        moe_dispatch.NpuDeepSeekV4MoETileLangReduce,
+        moe_dispatch.NpuDeepSeekV4MoE,
+    )
+
+
+def test_tilelang_moe_reduce_path_is_selected_only_by_opt_in_module(monkeypatch):
+    tilelang_calls = []
+    cann_calls = []
+
+    def fake_permute(data, indices):
+        routed = data.repeat_interleave(2, dim=0) if data.shape[0] == 2 else data
+        return routed, torch.arange(indices.numel(), dtype=torch.int32)
+
+    def fake_tilelang(routed_output, mapping):
+        tilelang_calls.append((routed_output.clone(), mapping.clone()))
+        return torch.full((2, 3), 7.0)
+
+    def fake_unpermute(routed_output, sorted_indices, _probs):
+        cann_calls.append(sorted_indices.clone())
+        return routed_output
+
+    class FakeExperts(torch.nn.Module):
+        def forward(self, routed_input, _counts, _scores):
+            return routed_input
+
+    class FakeRouter(torch.nn.Module):
+        def forward(self, _tokens, _input_ids, _bias):
+            return (
+                torch.ones(2, 2),
+                torch.tensor([[0, 1], [1, 0]]),
+                torch.tensor([2, 2]),
+            )
+
+    def make_module(module_type):
+        module = cast("Any", object.__new__(module_type))
+        torch.nn.Module.__init__(module)
+        module.reorderer = SimpleNamespace(top_k=2)
+        module.experts = FakeExperts()
+        module.router = FakeRouter()
+        module.expert_bias = None
+        module.shared_experts = None
+        module.tokens_per_expert = torch.zeros(2, dtype=torch.int64)
+        return module
+
+    monkeypatch.setattr(moe_dispatch.torch_npu, "npu_moe_token_permute", fake_permute)
+    monkeypatch.setattr(moe_dispatch.torch_npu, "npu_moe_token_unpermute", fake_unpermute)
+    tokens = torch.arange(6, dtype=torch.float32).view(2, 3)
+    input_ids = torch.zeros(2, dtype=torch.int64)
+
+    tilelang_module = make_module(moe_dispatch.NpuDeepSeekV4MoETileLangReduce)
+    tilelang_module.tilelang_reduce_op = fake_tilelang
+    tilelang_output = tilelang_module(tokens, input_ids)
+    assert torch.equal(tilelang_output, torch.full((2, 3), 7.0))
+    assert len(tilelang_calls) == 1
+    assert not cann_calls
+
+    default_module = make_module(moe_dispatch.NpuDeepSeekV4MoE)
+    default_output = default_module(tokens, input_ids)
+    expected = tokens.repeat_interleave(2, dim=0).view(2, 2, 3).sum(dim=1)
+    assert torch.equal(default_output, expected)
+    assert len(tilelang_calls) == 1
+    assert len(cann_calls) == 1
+
+
+def test_tilelang_moe_reduce_converter_loads_custom_op_only_when_needed(monkeypatch):
+    load_calls = []
+
+    def fake_tilelang(routed_output, _mapping):
+        return routed_output
+
+    def fake_loader():
+        load_calls.append(True)
+        return fake_tilelang
+
+    monkeypatch.setattr(moe_dispatch, "load_tilelang_moe_reduce_fused", fake_loader)
+    converter = moe_dispatch.TileLangMoeReduceConverter(cast("Any", SimpleNamespace(name="test")))
+
+    empty_model = torch.nn.Module()
+    converter.convert(empty_model)
+    assert not load_calls
+
+    model = torch.nn.Module()
+    tilelang_module = cast(
+        "Any",
+        object.__new__(moe_dispatch.NpuDeepSeekV4MoETileLangReduce),
+    )
+    torch.nn.Module.__init__(tilelang_module)
+    model.add_module("moe", tilelang_module)
+
+    converter.convert(model)
+    assert tilelang_module.tilelang_reduce_op is fake_tilelang
+    assert len(load_calls) == 1
+
+    converter.convert(model)
+    assert len(load_calls) == 1
 
 
 def test_re_routing_backward_unpermutes_token_and_scale_grads(monkeypatch):

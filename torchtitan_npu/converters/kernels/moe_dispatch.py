@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from collections.abc import Callable
 from typing import Any, NamedTuple, cast
 
 import torch
@@ -38,6 +39,15 @@ from torchtitan_npu.distributed.process_group import is_fake_process_group
 from torchtitan_npu.models.deepseek_v4.moe import MoE as DeepSeekV4MoE
 
 NpuTokenDispatchResult = tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]
+TileLangMoeReduceOp = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
+
+
+def load_tilelang_moe_reduce_fused() -> TileLangMoeReduceOp:
+    """Register and return the optional TileLang custom op on demand."""
+
+    from torchtitan_npu.ops.tilelang.moe_reduce import tilelang_moe_reduce_fused
+
+    return tilelang_moe_reduce_fused
 
 
 def _retained_all_to_all_single(
@@ -105,6 +115,13 @@ def _run_local_experts(self, inputs: _LocalExpertInputs) -> torch.Tensor:
         routed_scores,
     )
 
+    if isinstance(self, NpuDeepSeekV4MoETileLangReduce):
+        token_topk_to_pos = sorted_indices.view(inputs.total_tokens, self.reorderer.top_k)
+        reduce_op = self.tilelang_reduce_op
+        if reduce_op is None:
+            raise RuntimeError("TileLang MoE reduce module was not initialized by its converter")
+        return reduce_op(routed_output, token_topk_to_pos)
+
     unpermuted = torch_npu.npu_moe_token_unpermute(
         routed_output,
         sorted_indices,
@@ -144,6 +161,12 @@ class NpuDeepSeekV4MoE(DeepSeekV4MoE):
         return _npu_moe_forward_for_dsv4(self, x, input_ids)
 
 
+class NpuDeepSeekV4MoETileLangReduce(NpuDeepSeekV4MoE):
+    """DeepSeek-V4 NPU MoE with opt-in TileLang combine/reduce."""
+
+    tilelang_reduce_op: TileLangMoeReduceOp | None = None
+
+
 def _npu_moe_forward_for_dsv4(self, x, input_ids):
     x, original_shape, dim, total_tokens = _flatten_moe_input(x)
     input_ids_flat = input_ids.flatten() if input_ids is not None else None
@@ -170,6 +193,31 @@ class NpuMoeDispatchConverter(ModelCustomConverter):
                 replace_module_with_name(model, name, _adopt_module_state(NpuDeepSeekV4MoE, module))
             elif isinstance(module, MoE):
                 replace_module_with_name(model, name, _adopt_module_state(NpuMoE, module))
+
+
+class TileLangMoeReduceConverter(ModelCustomConverter):
+    """Opt in DeepSeek-V4 MoE modules to the TileLang combine/reduce path."""
+
+    def convert(self, model: nn.Module):
+        reduce_op: TileLangMoeReduceOp | None = None
+        for name, module in model.named_modules():
+            if isinstance(module, NpuDeepSeekV4MoETileLangReduce):
+                if module.tilelang_reduce_op is None:
+                    reduce_op = reduce_op or load_tilelang_moe_reduce_fused()
+                    module.tilelang_reduce_op = reduce_op
+                continue
+            if isinstance(module, (NpuDeepSeekV4MoE, DeepSeekV4MoE)):
+                reduce_op = reduce_op or load_tilelang_moe_reduce_fused()
+                replacement = cast(
+                    "NpuDeepSeekV4MoETileLangReduce",
+                    _adopt_module_state(NpuDeepSeekV4MoETileLangReduce, module),
+                )
+                replacement.tilelang_reduce_op = reduce_op
+                replace_module_with_name(
+                    model,
+                    name,
+                    replacement,
+                )
 
 
 class NpuExpertParallel(ExpertParallel):
@@ -307,3 +355,8 @@ class NpuMoeDispatchParallelizePlanUpdater(ParallelizePlanUpdater):
 class MoeDispatchModelConfig(ModelCustomConfig):
     model_converter = NpuMoeDispatchConverter
     parallelize_plan_updater = NpuMoeDispatchParallelizePlanUpdater
+
+
+@register_model_converter("npu_moe_reduce_fused_tilelang")
+class TileLangMoeReduceModelConfig(ModelCustomConfig):
+    model_converter = TileLangMoeReduceConverter

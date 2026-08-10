@@ -157,6 +157,22 @@ get_model_converter_config("npu_moe_dispatch")
 
 **ModelConverter 源码路径：** `torchtitan_npu/converters/kernels/moe_dispatch.py`、`torchtitan_npu/converters/kernels/permutation.py`
 
+## reduce_fused
+
+`reduce_fused` 是面向 MoE combine 阶段的 TileLang 算子，用于将默认的
+`npu_moe_token_unpermute` 加 Top-K 求和替换为融合的前向和反向实现。
+
+该 converter 当前未在 DeepSeek-V4 默认 `config_registry.py` 中打开，默认继续使用
+AscendC 路径。如需开启，配置如下：
+
+```python
+get_model_converter_config("npu_moe_reduce_fused_tilelang")
+```
+
+**ModelConverter 源码路径：** `torchtitan_npu/converters/kernels/moe_dispatch.py`
+
+**reduce_fused 算子源码路径：** `torchtitan_npu/ops/tilelang/moe_reduce.py`、`torchtitan_npu/ops/tilelang/runtime.py`、`torchtitan_npu/ops/tilelang/moe_reduce_fused.py`、`torchtitan_npu/ops/tilelang/moe_reduce_fused_bwd.py`
+
 ## RMSNorm
 RMSNorm 通过计算输入张量每个样本的平方均值的平方根来稳定深层网络的训练。
 

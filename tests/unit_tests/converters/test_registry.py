@@ -84,6 +84,7 @@ def test_core_converter_registrations_exist():
         "npu_rope",
         "npu_rope_inplace_partial",
         "npu_moe_dispatch",
+        "npu_moe_reduce_fused_tilelang",
         "npu_vlm",
     ]
     for name in expected_model_converter_names:
