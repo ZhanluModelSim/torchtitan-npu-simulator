@@ -82,6 +82,8 @@
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../dualpipev-schedule-plan-consumer-guide/">DualPipeV SchedulePlan 下游接入指南</a>
                   </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../kimi_k3_fused_ops_readme/">Kimi K3 simulator fused-op README</a>
+                  </li>
                   <li class="toctree-l1"><a class="reference internal" href="../l2-l3-schedule-plan-design/">L2/L3 调度 IR 重构设计：从扁平 trace 到结构化 SchedulePlan</a>
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../low-precision-sim-analysis/">低精度训练（MXFP8）Simulator 使能分析</a>
@@ -308,6 +310,17 @@ all-gather node, target entries, release exits, prefetch source, and placement.<
 </tr>
 </tbody>
 </table>
+<p>Every layer or cross-action prefetch has an explicit zero-cost control operator
+in the exported L1 graph:</p>
+<pre><code class="language-text">source input/gradient readiness + source parameter all-gather
+                         -&gt; FSDP_PREFETCH_LAUNCH -&gt; source compute
+                                                   -&gt; target all-gather
+</code></pre>
+<p><code>FSDP_PREFETCH_LAUNCH</code> has zero FLOPs, peak memory, parameter memory, and
+communication bytes. It models the source module hook: the target all-gather
+may overlap source compute, but a chain of fast all-gathers cannot recursively
+prefetch later layers before each source module is reached. A prefetch without
+a matching source parameter-group region is a capture error.</p>
 <p><code>cross_action_prefetch</code> belongs to the launch action's L1 template. It is an
 exit of that template when the target use is in a later action; the later
 action must not contain a duplicate all-gather. Rank-local action order then

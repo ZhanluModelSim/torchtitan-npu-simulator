@@ -78,6 +78,8 @@
     </li>
     </ul>
                   </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../kimi_k3_fused_ops_readme/">Kimi K3 simulator fused-op README</a>
+                  </li>
                   <li class="toctree-l1"><a class="reference internal" href="../l2-l3-schedule-plan-design/">L2/L3 调度 IR 重构设计：从扁平 trace 到结构化 SchedulePlan</a>
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../low-precision-sim-analysis/">低精度训练（MXFP8）Simulator 使能分析</a>
@@ -332,9 +334,11 @@ prefetch。例如 B 或 W 尾部发起 all-gather，为稍后的 F 准备参数�
 <li>继续遵守 rank-local 顶层 <code>schedule_order</code>；</li>
 <li>不要因为目标 F 中没有相同 all-gather 而在 L2 补通信。</li>
 </ol>
-<p>层内 prefetch 则直接表现为 L1 DAG 中两个可并行分支：目标层 all-gather 和来源层 compute
-共享前置 readiness，目标层 compute 等待 all-gather。即使后端暂时把 DualPipeV 的双图
-overlap 串行化，也必须保留单张 L1 图内部的通信/计算并行关系。</p>
+<p>层内和跨 action 的 prefetch 都通过零开销控制算子 <code>FSDP_PREFETCH_LAUNCH</code> 表达：来源层的
+输入/梯度 readiness 和本层参数 all-gather 共同依赖到该算子，随后来源层 compute 与目标层
+all-gather 从该算子分叉并行，目标层 compute 再等待目标 all-gather。它的 FLOPs、显存和通信量
+均为 0，只用于阻止 all-gather 链在尚未到达来源层 hook 时继续向后预取。即使后端暂时把
+DualPipeV 的双图 overlap 串行化，也必须保留单张 L1 图内部的这些依赖与通信/计算并行关系。</p>
 <p>一个物理 rank 拥有多个虚拟 stage 时，参数基线和 FSDP residency 都按物理 rank 汇总。小模型中
 embedding/output 可能远大于 transformer layer，因此 V 形切分可能产生明显 rank 间显存不均；
 不能据此把较小 rank 的参数补齐到平均值。</p>
@@ -367,7 +371,7 @@ embedding/output 可能远大于 transformer layer，因此 V 形切分可能产
           </div><footer>
     <div class="rst-footer-buttons" role="navigation" aria-label="Footer Navigation">
         <a href="../communication-ownership-contract/" class="btn btn-neutral float-left" title="Communication Ownership Contract"><span class="icon icon-circle-arrow-left"></span> Previous</a>
-        <a href="../l2-l3-schedule-plan-design/" class="btn btn-neutral float-right" title="L2/L3 调度 IR 重构设计：从扁平 trace 到结构化 SchedulePlan">Next <span class="icon icon-circle-arrow-right"></span></a>
+        <a href="../kimi_k3_fused_ops_readme/" class="btn btn-neutral float-right" title="Kimi K3 simulator fused-op README">Next <span class="icon icon-circle-arrow-right"></span></a>
     </div>
 
   <hr/>
@@ -393,7 +397,7 @@ embedding/output 可能远大于 transformer layer，因此 V 形切分可能产
       <span><a href="../communication-ownership-contract/" style="color: #fcfcfc">&laquo; Previous</a></span>
     
     
-      <span><a href="../l2-l3-schedule-plan-design/" style="color: #fcfcfc">Next &raquo;</a></span>
+      <span><a href="../kimi_k3_fused_ops_readme/" style="color: #fcfcfc">Next &raquo;</a></span>
     
   </span>
 </div>

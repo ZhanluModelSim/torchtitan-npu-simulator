@@ -1,0 +1,645 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" >
+<head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+      <link rel="shortcut icon" href="../../img/favicon.ico" />
+    <title>Kimi K3 simulator fused-op README - torchtitan-npu</title>
+    <link rel="stylesheet" href="../../css/theme.css" />
+    <link rel="stylesheet" href="../../css/theme_extra.css" />
+        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/styles/github.min.css" />
+    
+      <script>
+        // Current page data
+        var mkdocs_page_name = "Kimi K3 simulator fused-op README";
+        var mkdocs_page_input_path = "design/kimi_k3_fused_ops_readme.md";
+        var mkdocs_page_url = null;
+      </script>
+    
+    <!--[if lt IE 9]>
+      <script src="../../js/html5shiv.min.js"></script>
+    <![endif]-->
+      <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/highlight.min.js"></script>
+      <script>hljs.highlightAll();</script> 
+</head>
+
+<body class="wy-body-for-nav" role="document">
+
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side stickynav">
+    <div class="wy-side-scroll">
+      <div class="wy-side-nav-search">
+          <a href="../.." class="icon icon-home"> torchtitan-npu
+        </a>
+      </div>
+
+      <div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <ul>
+                <li class="toctree-l1"><a class="reference internal" href="../..">Home</a>
+                </li>
+              </ul>
+              <ul>
+                <li class="toctree-l1"><a class="reference internal" href="../../lint_guide/">Lint 指南</a>
+                </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Community</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../community/contributors/">提交者与贡献者（Committers and Contributors）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../community/governance/">社区治理</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../community/versioning_policy/">版本策略</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Design</span></p>
+              <ul class="current">
+                  <li class="toctree-l1"><a class="reference internal" href="../1f1b-schedule-plan-assembly-guide/">1F1B 完整依赖组装与 DES 回放实现指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../alltoall-capture-analysis/">all_to_all 通信捕获缺失分析</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../communication-ownership-contract/">Communication Ownership Contract</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../dualpipev-schedule-plan-consumer-guide/">DualPipeV SchedulePlan 下游接入指南</a>
+                  </li>
+                  <li class="toctree-l1 current"><a class="reference internal current" href="#">Kimi K3 simulator fused-op README</a>
+    <ul class="current">
+    <li class="toctree-l2"><a class="reference internal" href="#roofline">记号与 roofline 口径</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#1-kda-core">1. KDA core</a>
+        <ul>
+    <li class="toctree-l3"><a class="reference internal" href="#tensor-contract">Tensor contract</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#_1">融合边界与伪代码</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#roofline_1">粗粒度 roofline</a>
+    </li>
+        </ul>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#2-gated-mla-attention-core">2. Gated MLA attention core</a>
+        <ul>
+    <li class="toctree-l3"><a class="reference internal" href="#tensor-contract_1">Tensor contract</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#_2">融合边界与伪代码</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#roofline_2">粗粒度 roofline</a>
+    </li>
+        </ul>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#3-situ-glu-activation">3. SiTU-GLU activation</a>
+        <ul>
+    <li class="toctree-l3"><a class="reference internal" href="#tensor-contract_2">Tensor contract</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#_3">融合边界与伪代码</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#roofline_3">粗粒度 roofline</a>
+    </li>
+        </ul>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#capture">Capture 与后端使用建议</a>
+    </li>
+    </ul>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../l2-l3-schedule-plan-design/">L2/L3 调度 IR 重构设计：从扁平 trace 到结构化 SchedulePlan</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../low-precision-sim-analysis/">低精度训练（MXFP8）Simulator 使能分析</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../optimizer-ops-analysis/">优化器算子捕获问题分析</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../pipeline-multi-graph-capture-design/">复杂 Pipeline 策略下完整计算图捕获方案设计</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../pp-l2-capture-architecture/">PP L2 Capture Architecture</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../schedule-capture-design/">L0-L3 IR 层级归属设计</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../schedule-plan-dependency-reconstruction-contract/">SchedulePlan 下游依赖重建契约</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../schedule-plan-des-consumer-guide/">SchedulePlan 依赖重建与 DES 消费指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../simulator-memory-model-design/">Simulator Memory Model 改造设计</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Feature guides</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/checkpoint/">Checkpoint 使用指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/deepseek_v32_mtp/">多Token预测特性(Multi Token Prediction, MTP)</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/low_precision_training/">低精度训练特性（MXFP8）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/metrics_and_debugging/">调试支持特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/model_custom/">Model Custom框架介绍</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/muon_optimizer/">Muon 优化器特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/new_model_onboarding/">新模型接入开发流程</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/npu_fused_ops/">NPU 融合算子适配</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/swap_optimizer/">SwapOptimizer 特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/torch_compile/">torch.compile 支持</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/virtual_optimizer/">Virtual Optimizer - 优化器显存虚拟化特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/vlm/">VLM NPU 支持</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" >Parallelism</a>
+    <ul>
+                <li class="toctree-l2"><a class="reference internal" href="../../feature_guides/parallelism/custom_cp/">自定义 Context Parallel 特性</a>
+                </li>
+    </ul>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Recipe</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../recipe/sft/">SFT 指令微调</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Superpowers</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" >Plans</a>
+    <ul>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/plans/2026-07-01-mhc-real-op-name-capture-implementation/">MHC Real-Op-Name Capture Implementation Plan</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/plans/2026-07-01-npu-simulator-implementation/">torchtitan_npu Simulator Implementation Plan</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/plans/2026-07-01-smla-real-op-name-capture-implementation/">SMLA Real-Op-Name Capture Implementation Plan</a>
+                </li>
+    </ul>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" >Specs</a>
+    <ul>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/specs/2026-07-01-mhc-real-op-name-capture-design/">MHC 真实算子名捕获 — 架构与方案设计（阶段一：MHC）</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/specs/2026-07-01-npu-simulator-design/">torchtitan_npu Simulator — 架构与方案设计</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/specs/2026-07-01-smla-real-op-name-capture-design/">SMLA 真实算子名捕获 — 架构与方案设计（阶段二：SMLA）</a>
+                </li>
+    </ul>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Test guides</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../test_guides/model_acceptance/">新模型最终验收规范（Meta 模拟器）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../test_guides/test_design/">测试设计</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../test_guides/test_guide/">测试使用指南</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">User guides</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/deepseek_v4_model_parameters/">DeepSeek-V4 模型参数 Web 字段目录</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/installation/">软件安装</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/quickstart/">快速上手</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../user-guides/simulator/">Simulator 使用指南</a>
+                  </li>
+              </ul>
+      </div>
+    </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap">
+      <nav class="wy-nav-top" role="navigation" aria-label="Mobile navigation menu">
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../..">torchtitan-npu</a>
+        
+      </nav>
+      <div class="wy-nav-content">
+        <div class="rst-content"><div role="navigation" aria-label="breadcrumbs navigation">
+  <ul class="wy-breadcrumbs">
+    <li><a href="../.." class="icon icon-home" aria-label="Docs"></a></li>
+          <li class="breadcrumb-item">Design</li>
+      <li class="breadcrumb-item active">Kimi K3 simulator fused-op README</li>
+    <li class="wy-breadcrumbs-aside">
+    </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+            <div class="section" itemprop="articleBody">
+              
+                <h1 id="kimi-k3-simulator-fused-op-readme">Kimi K3 simulator fused-op README</h1>
+<p>本文说明 Kimi K3 simulator 中三个核心融合算子的 IR 语义。每个前向算子
+都有一个对应的反向算子，因此一次训练步在 L0 中会出现六类节点：</p>
+<table>
+<thead>
+<tr>
+<th>语义</th>
+<th>前向 raw op name</th>
+<th>反向 raw op name</th>
+<th>simulator 实现</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>KDA core</td>
+<td><code>triton_ascend_kernels.chunk_kda</code></td>
+<td><code>triton_ascend_kernels.chunk_kda_grad</code></td>
+<td><code>kda_shim.py</code></td>
+</tr>
+<tr>
+<td>Gated MLA attention core</td>
+<td><code>gated_mla</code></td>
+<td><code>gated_mla_backward</code></td>
+<td><code>kimi_k3_fusion_shim.py</code></td>
+</tr>
+<tr>
+<td>SiTU-GLU activation</td>
+<td><code>situ_glu</code></td>
+<td><code>situ_glu_backward</code></td>
+<td><code>kimi_k3_fusion_shim.py</code></td>
+</tr>
+</tbody>
+</table>
+<p>这些不是实际执行的 NPU/Triton kernel，也不是通过 <code>torch.library</code> 注册的
+custom op。它们是 simulator 在 meta 执行时用 <code>torch.autograd.Function</code> 建立
+autograd 连通性、再调用 <code>capture.record_synthetic_op()</code> 写入的 synthetic L0
+OpNode。KDA 保留生产 Triton 算子名，便于与真实 profiler 对齐；MLA 和
+SiTU-GLU 使用模型无关的语义名。</p>
+<h2 id="roofline">记号与 roofline 口径</h2>
+<p>以下记号用于全部估算：</p>
+<table>
+<thead>
+<tr>
+<th>记号</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>B</code></td>
+<td>micro-batch 内 batch size</td>
+</tr>
+<tr>
+<td><code>S</code></td>
+<td>当前 rank 的 sequence length</td>
+</tr>
+<tr>
+<td><code>H</code></td>
+<td>attention heads</td>
+</tr>
+<tr>
+<td><code>D</code></td>
+<td>每 head 的 attention/KDA hidden dimension</td>
+</tr>
+<tr>
+<td><code>I</code></td>
+<td>MLP intermediate dimension</td>
+</tr>
+<tr>
+<td><code>T</code></td>
+<td>SiTU-GLU 的 token 数；共享专家通常为 <code>B*S</code>，路由专家为本 rank 的 routed-token 数</td>
+</tr>
+<tr>
+<td><code>b</code></td>
+<td>一个元素的字节数，例如 BF16 为 2、FP32 为 4</td>
+</tr>
+<tr>
+<td><code>N</code></td>
+<td><code>B*H*S*D</code></td>
+</tr>
+</tbody>
+</table>
+<p>文中的访存量是理想化的 external-tensor 下界：每个输入只读一次、每个输出
+只写一次，不计 cache miss、重复加载、临时 buffer、参数分片通信、重计算或
+硬件布局转换。它适合用于设备无关的 arithmetic-intensity / roofline 比较，
+不能替代真实硬件带宽测量。</p>
+<h2 id="1-kda-core">1. KDA core</h2>
+<h3 id="tensor-contract">Tensor contract</h3>
+<p><code>KimiDeltaAttention</code> 在 q/k/v 投影、ShortConv、gate/beta 投影之后调用 KDA。
+因此这些投影和卷积不属于本融合节点。</p>
+<table>
+<thead>
+<tr>
+<th>Tensor</th>
+<th>Shape</th>
+<th>维度语义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>q</code></td>
+<td><code>[B, S, H, D]</code></td>
+<td>batch、token 位置、head、每-head query feature</td>
+</tr>
+<tr>
+<td><code>k</code></td>
+<td><code>[B, S, H, D]</code></td>
+<td>batch、token 位置、head、每-head key feature</td>
+</tr>
+<tr>
+<td><code>v</code></td>
+<td><code>[B, S, H, D]</code></td>
+<td>batch、token 位置、head、每-head value feature</td>
+</tr>
+<tr>
+<td><code>g</code></td>
+<td><code>[B, S, H, D]</code></td>
+<td>batch、token、head、per-channel decay/gate feature</td>
+</tr>
+<tr>
+<td><code>beta</code></td>
+<td><code>[B, S, H]</code></td>
+<td>batch、token、head 的 delta update rate</td>
+</tr>
+<tr>
+<td><code>A_log</code></td>
+<td><code>[H]</code></td>
+<td>每 head 的稳定化/decay 参数</td>
+</tr>
+<tr>
+<td><code>dt_bias</code></td>
+<td><code>[H*D]</code></td>
+<td>展平的 head-channel bias；逻辑形状为 <code>[H, D]</code></td>
+</tr>
+<tr>
+<td><code>o</code></td>
+<td><code>[B, S, H, D]</code></td>
+<td>KDA 输出，和 <code>v</code> 同形状</td>
+</tr>
+</tbody>
+</table>
+<p>反向节点输入为 <code>q/k/v/g/beta</code> 和 <code>dO</code>，其中 <code>dO</code> 为 <code>[B,S,H,D]</code>；它产生
+<code>dQ/dK/dV/dG</code>（均 <code>[B,S,H,D]</code>）、<code>dBeta</code>（<code>[B,S,H]</code>）、<code>dA_log</code>（<code>[H]</code>）和
+<code>dDt_bias</code>（<code>[H*D]</code>）。当前 capture 的反向 raw 输入列表只显式记录动态输入和
+<code>dO</code>，但 autograd bridge 仍向 <code>A_log</code>、<code>dt_bias</code> 返回梯度。</p>
+<h3 id="_1">融合边界与伪代码</h3>
+<p>KDA 是有状态、因果的 delta-attention recurrence。真实 Triton 实现使用
+chunked 算法和内部状态分块；下列伪代码只描述融合边界，而非其精确数值实现：</p>
+<pre><code class="language-text"># Outside KDA: q/k/v projections, ShortConv, f_a/f_b gate projections,
+#              beta projection and sigmoid.
+state = initial_state
+for t in causal_order(S):
+    decay = decay_from(g[:, t], A_log, dt_bias)
+    state = gated_delta_update(state, k[:, t], v[:, t], beta[:, t], decay)
+    o[:, t] = query_state(q[:, t], state)
+return o
+
+# Backward: one fused reverse recurrence produces gradients for all inputs.
+</code></pre>
+<p>被融合的是因果 state update、decay/beta 处理、query-state 读取以及它们的
+反向 recurrence。<code>q/k/v</code> 的线性投影、ShortConv、<code>g</code>/<code>beta</code> 投影、RMSNorm、
+residual 和后续 MLP/MoE 都保持独立 OpNode。</p>
+<h3 id="roofline_1">粗粒度 roofline</h3>
+<p>KDA 的主要工作是每 token/head 对 <code>D x D</code> state 的读取、更新和查询。忽略
+chunk 边界优化后，可使用下列设备无关近似：</p>
+<table>
+<thead>
+<tr>
+<th>Pass</th>
+<th>FLOPs</th>
+<th>external tensor traffic lower bound</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>forward</td>
+<td>approximately <code>4*B*S*H*D^2 + O(B*S*H*D)</code></td>
+<td><code>(5*N + B*S*H + H + H*D) * b</code></td>
+</tr>
+<tr>
+<td>backward</td>
+<td>approximately <code>8*B*S*H*D^2 + O(B*S*H*D)</code></td>
+<td><code>(9*N + 2*B*S*H + 2*H + 2*H*D) * b</code></td>
+</tr>
+</tbody>
+</table>
+<p>这里 <code>4</code> 和 <code>8</code> 分别表示 state update/query 与其反向的数量级系数；真实
+chunk-KDA 会因 chunk size、门控实现和状态重算而变化。这个近似的 forward
+arithmetic intensity 为约 <code>4*B*S*H*D^2 / ((5*N+B*S*H+H+H*D)*b)</code>，大序列时
+约为 <code>4D/(5b)</code>。</p>
+<h2 id="2-gated-mla-attention-core">2. Gated MLA attention core</h2>
+<h3 id="tensor-contract_1">Tensor contract</h3>
+<p>这个 synthetic op 只替换 <code>KimiGatedMLA._attention_core()</code> 中的 causal SDPA。
+名称中的 <code>gated</code> 是架构名称；输出 gate 本身仍是融合节点外的
+<code>sigmoid(g_proj(hidden_states))</code> 与逐元素乘法。</p>
+<table>
+<thead>
+<tr>
+<th>Tensor</th>
+<th>Shape</th>
+<th>维度语义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>Q</code></td>
+<td><code>[B, H, S, Dq]</code></td>
+<td>batch、head、query token、query/key feature</td>
+</tr>
+<tr>
+<td><code>K</code></td>
+<td><code>[B, H, S, Dq]</code></td>
+<td>batch、head、key token、query/key feature</td>
+</tr>
+<tr>
+<td><code>V</code></td>
+<td><code>[B, H, S, Dq]</code></td>
+<td>batch、head、value token、padded value feature</td>
+</tr>
+<tr>
+<td><code>O</code></td>
+<td><code>[B, H, S, Dq]</code></td>
+<td>batch、head、attention output token、padded value feature</td>
+</tr>
+</tbody>
+</table>
+<p><code>Dq = qk_nope_head_dim + qk_rope_head_dim</code>。如果 <code>v_head_dim &lt; Dq</code>，模块会先
+对 value pad 到 <code>Dq</code>，attention 后再 trim 回 <code>v_head_dim</code>；pad、trim、transpose
+和 reshape 都不属于 <code>gated_mla</code>。反向输入为 <code>Q/K/V/dO</code>，输出为
+<code>dQ/dK/dV</code>，三者均为 <code>[B,H,S,Dq]</code>。</p>
+<h3 id="_2">融合边界与伪代码</h3>
+<pre><code class="language-text"># Outside fused op:
+q = q_b_proj(rms_norm(q_a_proj(hidden_states)))
+kv = kv_b_proj(rms_norm(kv_a_proj_with_mqa(hidden_states)))
+Q, K, V = split_and_layout(q, kv)
+V = pad_to_qk_head_dim(V)
+
+# gated_mla:
+scores = causal_mask((Q @ transpose(K)) / sqrt(Dq))
+probabilities = softmax(scores)
+O = probabilities @ V
+
+# Outside fused op:
+O = trim_and_layout(O)
+O = O * sigmoid(g_proj(hidden_states))
+return o_proj(O)
+</code></pre>
+<p>因此 q_a/q_b、kv_a/kv_b 的 LoRA/MQA 投影，两个 RMSNorm，布局处理，输出 gate
+和 <code>o_proj</code> 都会作为普通 MM/RMSNorm/elementwise OpNode 被捕获。融合节点只
+代表 FlashAttention/MLA attention core，避免把整个 attention module 误建模为
+单个大算子。</p>
+<h3 id="roofline_2">粗粒度 roofline</h3>
+<p>令 <code>Nq = B*H*S*Dq</code>。在自注意力 <code>Sq=Sk=S</code> 且不物化 score/probability 矩阵时：</p>
+<table>
+<thead>
+<tr>
+<th>Pass</th>
+<th>FLOPs</th>
+<th>external tensor traffic lower bound</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>forward</td>
+<td><code>4*B*H*S^2*Dq + O(B*H*S^2)</code></td>
+<td><code>4*Nq*b</code></td>
+</tr>
+<tr>
+<td>backward</td>
+<td><code>8*B*H*S^2*Dq + O(B*H*S^2)</code></td>
+<td><code>6*Nq*b</code></td>
+</tr>
+</tbody>
+</table>
+<p>forward 的两个 GEMM 分别为 <code>QK^T</code> 和 <code>P@V</code>；backward 包含 dV、dP、dQ、dK
+四个同数量级 GEMM。softmax 的标量工作以 <code>O(B*H*S^2)</code> 记入余项。对应 forward
+arithmetic intensity 下界约为 <code>S/b</code>，说明长序列下该算子天然偏计算密集；实际
+FlashAttention 的 tiling、causal 下三角和重算策略会改变常数，但不改变该量级。</p>
+<h2 id="3-situ-glu-activation">3. SiTU-GLU activation</h2>
+<h3 id="tensor-contract_2">Tensor contract</h3>
+<p>SiTU-GLU 的两个输入由两个独立投影/GMM 产生，投影本身和后续 down projection/GMM
+不属于本融合节点。</p>
+<table>
+<thead>
+<tr>
+<th>Tensor</th>
+<th>Shape</th>
+<th>维度语义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>gate</code></td>
+<td><code>[..., I]</code></td>
+<td>任意 token 前缀维度、intermediate channel；展平后为 <code>[T,I]</code></td>
+</tr>
+<tr>
+<td><code>up</code></td>
+<td><code>[..., I]</code></td>
+<td>与 <code>gate</code> 相同的 token/channel 布局</td>
+</tr>
+<tr>
+<td><code>y</code></td>
+<td><code>[..., I]</code></td>
+<td>激活后的 intermediate tensor</td>
+</tr>
+<tr>
+<td><code>dY</code></td>
+<td><code>[..., I]</code></td>
+<td>来自 down projection/GMM 的梯度</td>
+</tr>
+<tr>
+<td><code>dGate</code>, <code>dUp</code></td>
+<td><code>[..., I]</code></td>
+<td>返回给两条输入投影/GMM 的梯度</td>
+</tr>
+</tbody>
+</table>
+<p>共享专家通常使用 <code>[B,S,I]</code>，路由专家通常使用 <code>[T_routed,I]</code>；两者共享完全相同
+的逐元素语义。</p>
+<h3 id="_3">融合边界与伪代码</h3>
+<pre><code class="language-text"># Outside fused op:
+gate = gate_proj(x)                 # or first grouped_mm
+up   = up_proj(x)                   # or second grouped_mm
+
+# situ_glu, beta=4 and linear_beta=25 by default:
+activated_gate = beta * tanh(gate / beta) * sigmoid(gate)
+bounded_up = linear_beta * tanh(up / linear_beta)
+y = activated_gate * bounded_up
+
+# Outside fused op:
+out = down_proj(y)                  # or third grouped_mm
+</code></pre>
+<p>当 <code>linear_beta</code> 为 <code>None</code> 时，<code>bounded_up = up</code>。反向节点融合上述表达式的导数，
+直接生成 <code>dGate</code> 和 <code>dUp</code>，不会在 L0 中拆成 <code>tanh</code>、<code>sigmoid</code> 和多个小乘法节点。</p>
+<h3 id="roofline_3">粗粒度 roofline</h3>
+<p>令 <code>M = T*I</code>。把 <code>tanh</code>、<code>sigmoid</code> 视为常数代价的逐元素函数：</p>
+<table>
+<thead>
+<tr>
+<th>Pass</th>
+<th>FLOPs / element</th>
+<th>external tensor traffic lower bound</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>forward</td>
+<td>about 6 scalar arithmetic + 3 transcendental evaluations</td>
+<td><code>3*M*b</code></td>
+</tr>
+<tr>
+<td>backward</td>
+<td>about 12 scalar arithmetic + 3 transcendental evaluations</td>
+<td><code>5*M*b</code></td>
+</tr>
+</tbody>
+</table>
+<p>因此其 forward arithmetic intensity 约为 <code>(6 + 3*c_trans)/ (3*b)</code>，其中
+<code>c_trans</code> 是将一次 transcendental 换算为普通 FLOP 的约定值。无论如何，它的
+复杂度为 <code>O(T*I)</code>，通常比 attention 和 GMM 更偏带宽/指令开销受限；将其合成一个
+节点的目的正是避免把这种单一逐元素 kernel 错误放大为大量设备小算子。</p>
+<h2 id="capture">Capture 与后端使用建议</h2>
+<ul>
+<li>后端读取 <code>self.workload_graph</code> 时可将上述六个 raw op 视为真实设备工作节点。</li>
+<li><code>metadata_view</code> 已在 WorkloadGraph 构建前收缩，不会把 weight transpose/view
+  等纯元数据操作传给后端。</li>
+<li>反向节点保留与前向相同的 module path，并通过 autograd bridge 连到对应输入；
+  不能将 <code>_backward</code> 当成独立、无依赖的 kernel。</li>
+<li>本文 roofline 不包含重计算。启用 AC 后，应按实际 execution kind 将重算前向节点
+  额外计入总 FLOPs/traffic。</li>
+</ul>
+              
+            </div>
+          </div><footer>
+    <div class="rst-footer-buttons" role="navigation" aria-label="Footer Navigation">
+        <a href="../dualpipev-schedule-plan-consumer-guide/" class="btn btn-neutral float-left" title="DualPipeV SchedulePlan 下游接入指南"><span class="icon icon-circle-arrow-left"></span> Previous</a>
+        <a href="../l2-l3-schedule-plan-design/" class="btn btn-neutral float-right" title="L2/L3 调度 IR 重构设计：从扁平 trace 到结构化 SchedulePlan">Next <span class="icon icon-circle-arrow-right"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <!-- Copyright etc -->
+  </div>
+
+  Built with <a href="https://www.mkdocs.org/">MkDocs</a> using a <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a> provided by <a href="https://readthedocs.org">Read the Docs</a>.
+</footer>
+          
+        </div>
+      </div>
+
+    </section>
+
+  </div>
+
+  <div class="rst-versions" role="note" aria-label="Versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    
+    
+      <span><a href="../dualpipev-schedule-plan-consumer-guide/" style="color: #fcfcfc">&laquo; Previous</a></span>
+    
+    
+      <span><a href="../l2-l3-schedule-plan-design/" style="color: #fcfcfc">Next &raquo;</a></span>
+    
+  </span>
+</div>
+    <script src="../../js/jquery-3.6.0.min.js"></script>
+    <script>var base_url = "../..";</script>
+    <script src="../../js/theme_extra.js"></script>
+    <script src="../../js/theme.js"></script>
+    <script>
+        jQuery(function () {
+            SphinxRtdTheme.Navigation.enable(true);
+        });
+    </script>
+
+</body>
+</html>
