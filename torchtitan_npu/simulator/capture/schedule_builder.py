@@ -24,6 +24,7 @@ from torchtitan_npu.simulator.capture.communication_ownership import (
 )
 from torchtitan_npu.simulator.capture.schedule_assemblers import (
     CapturedTraceAssembler,
+    NonPipelineTraceAssembler,
     pp_transfer_id,
 )
 from torchtitan_npu.simulator.capture.schedule_validation import validate_schedule_plan
@@ -302,29 +303,33 @@ def build_schedule_plan(
             actions.append(map_action(a, i))
     else:
         # non-PP: one action per captured template, ordered F < B < OPTIMIZER
+        specs = NonPipelineTraceAssembler(
+            step_templates=step_templates,
+            fsdp_residency_events=fsdp_residency_events,
+            rank=rank,
+        ).build()
         communication_ownership = normalize_communication_ownership(
             step_templates=step_templates,
-            specs=[],
+            specs=specs,
             comm_events=comm_events,
         )
-        order = {"F": 0, "B": 1, "OPTIMIZER": 2}
-        ordered_templates = sorted(
-            step_templates,
-            key=lambda template_id: order.get(
-                step_templates[template_id].step_type, 9
-            ),
-        )
-        for schedule_order, tid in enumerate(ordered_templates):
-            sg = step_templates[tid]
-            ct = sg.step_type
-            min_seq = min((n.seq_idx for n in sg.nodes.values()), default=0)
+        for schedule_order, spec in enumerate(communication_ownership.specs):
             action_id = next(_action_seq)
-            actions.append(ScheduleAction(
-                id=f"{action_id}", action_id=f"r{rank}_a{action_id}", rank=rank, stage=rank, mb_idx=0,
-                action_type="COMPUTE" if ct != "OPTIMIZER" else "OPTIMIZER",
-                comp_type=ct, template_ref=tid, seq_idx=min_seq,
-                schedule_order=schedule_order,
-            ))
+            actions.append(
+                ScheduleAction(
+                    id=f"{action_id}",
+                    action_id=f"r{rank}_a{action_id}",
+                    rank=rank,
+                    stage=rank,
+                    mb_idx=0,
+                    action_type=spec.action_type,
+                    comp_type=spec.comp_type,
+                    template_ref=spec.template_ref,
+                    seq_idx=spec.seq_idx,
+                    schedule_order=schedule_order,
+                    annotations=dict(spec.annotations),
+                )
+            )
 
     def _schedule_order(action: ScheduleAction) -> int:
         return action.schedule_order if action.schedule_order >= 0 else action.seq_idx

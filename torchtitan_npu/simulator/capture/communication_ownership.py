@@ -26,8 +26,9 @@ pipeline schedule class or branch on schedule names.
 from __future__ import annotations
 
 from collections import defaultdict
+from collections.abc import Iterable
 from dataclasses import dataclass, replace
-from typing import Iterable, Protocol
+from typing import Protocol
 
 from torchtitan_npu.simulator.capture.comm_events import CommEvent
 from torchtitan_npu.simulator.capture.schedule_assemblers import ActionSpec
@@ -38,6 +39,7 @@ from torchtitan_npu.simulator.ir.step_graph import StepGraph
 _COMPUTE_TYPES = {"F", "B", "I", "W", "F_RECOMPUTE"}
 _STAGE_TEMPLATE_TYPES = _COMPUTE_TYPES | {"OPTIMIZER"}
 _FSDP_PREFETCH_LAUNCH_OP = "FSDP_PREFETCH_LAUNCH"
+_FSDP_POST_BACKWARD_SYNC_OP = "FSDP_POST_BACKWARD_SYNC"
 _P2P_ACTION_BY_DIRECTION = {
     "forward_send": "SEND_F",
     "forward_recv": "RECV_F",
@@ -491,6 +493,133 @@ def _fsdp_group_regions(
     return regions
 
 
+def _add_fsdp_backward_reduction_syncs(
+    graph: StepGraph,
+    regions: list[_FSDPGroupRegion],
+    next_synthetic_id: int,
+) -> tuple[int, int]:
+    """Model FSDP2's one-module reduce-scatter backpressure."""
+    if graph.step_type not in {"B", "W"}:
+        return next_synthetic_id, 0
+
+    ordered_regions = sorted(
+        regions,
+        key=lambda region: (region.wait_seq_idx, region.group_id),
+    )
+    module_blocks: list[list[_FSDPGroupRegion]] = []
+    for region in ordered_regions:
+        if (
+            not module_blocks
+            or module_blocks[-1][0].module_fqn != region.module_fqn
+        ):
+            module_blocks.append([region])
+        else:
+            module_blocks[-1].append(region)
+    if len(module_blocks) < 2:
+        return next_synthetic_id, 0
+
+    reduce_scatters = sorted(
+        (
+            node
+            for node in graph.nodes.values()
+            if node.annotations.get("raw_op_type")
+            == "comm.reduce_scatter"
+        ),
+        key=lambda node: (node.seq_idx, node.op_id),
+    )
+    reductions_by_block: list[list[OpNode]] = []
+    for block_index, block in enumerate(module_blocks):
+        start_seq = block[0].wait_seq_idx
+        end_seq = (
+            module_blocks[block_index + 1][0].wait_seq_idx
+            if block_index + 1 < len(module_blocks)
+            else float("inf")
+        )
+        reductions_by_block.append(
+            [
+                node
+                for node in reduce_scatters
+                if start_seq < node.seq_idx < end_seq
+            ]
+        )
+
+    sync_count = 0
+    for block_index in range(1, len(module_blocks)):
+        prior_reductions = reductions_by_block[block_index - 1]
+        if not prior_reductions:
+            continue
+        current_block = module_blocks[block_index]
+        first_region = current_block[0]
+        predecessor_ids = list(
+            dict.fromkeys(
+                [
+                    *first_region.exit_op_ids,
+                    *(node.op_id for node in prior_reductions),
+                ]
+            )
+        )
+        if not predecessor_ids:
+            continue
+
+        sync_id = next_synthetic_id
+        next_synthetic_id -= 1
+        prior_module_fqn = module_blocks[block_index - 1][0].module_fqn
+        graph.nodes[sync_id] = OpNode(
+            op_id=sync_id,
+            op_type=_FSDP_POST_BACKWARD_SYNC_OP,
+            inputs=[],
+            outputs=[],
+            attrs={},
+            predecessors=predecessor_ids,
+            successors=[],
+            flops=0,
+            peak_mem=0,
+            param_mem=0,
+            comm_bytes=0,
+            annotations={
+                "raw_op_type": _FSDP_POST_BACKWARD_SYNC_OP,
+                "control_op": True,
+                "zero_cost": True,
+                "fsdp_module_fqn": first_region.module_fqn,
+                "fsdp_prior_module_fqn": prior_module_fqn,
+                "fsdp_waited_reduce_scatter_op_ids": [
+                    node.op_id for node in prior_reductions
+                ],
+                "fsdp_sync_scope": "prior_module_reduce_scatter",
+            },
+            seq_idx=first_region.release_seq_idx,
+        )
+
+        gated_regions = list(current_block[1:])
+        if block_index + 1 < len(module_blocks):
+            gated_regions.append(module_blocks[block_index + 1][0])
+        gated_group_ids = {region.group_id for region in gated_regions}
+        gated_node_ids = {
+            node.op_id
+            for node in reductions_by_block[block_index]
+        }
+        gated_node_ids.update(
+            entry
+            for region in gated_regions
+            for entry in region.entry_op_ids
+        )
+        gated_node_ids.update(
+            node.op_id
+            for node in graph.nodes.values()
+            if node.annotations.get("raw_op_type") == "comm.allgather"
+            and str(node.annotations.get("fsdp_group_id", ""))
+            in gated_group_ids
+            and not node.annotations.get("fsdp_prefetch_source_fqn")
+        )
+        for gated_id in gated_node_ids:
+            gated = graph.nodes.get(gated_id)
+            if gated is not None and sync_id not in gated.predecessors:
+                gated.predecessors.append(sync_id)
+        sync_count += 1
+
+    return next_synthetic_id, sync_count
+
+
 class FSDPStageOwnershipPlugin:
     """Fold compute-local FSDP collectives into immutable L1 variants."""
 
@@ -674,6 +803,17 @@ class FSDPStageOwnershipPlugin:
                 raise RuntimeError(
                     "compute-local FSDP transition references missing "
                     f"compute instance {parent_id!r}"
+                )
+            parent_compute = compute_by_instance[parent_id]
+            if parent_compute.annotations.get("non_pipeline_capture"):
+                # Non-PP has no chunk hook to update _pp_context.comp_type.
+                # The residency state is authoritative for whether an AG was
+                # launched by forward or backward FSDP hooks.
+                event = replace(
+                    event,
+                    comp_type=parent_compute.comp_type,
+                    p2p_stage=parent_compute.stage,
+                    p2p_mb_idx=parent_compute.mb_idx,
                 )
             owner_id = parent_id
             prefetch_source_fqn = (
@@ -1127,6 +1267,15 @@ class FSDPStageOwnershipPlugin:
                         if comm_id not in pure.nodes[successor].predecessors:
                             pure.nodes[successor].predecessors.append(comm_id)
 
+                (
+                    next_synthetic_id,
+                    backward_sync_count,
+                ) = _add_fsdp_backward_reduction_syncs(
+                    pure,
+                    regions,
+                    next_synthetic_id,
+                )
+
                 _refresh_graph_topology(pure)
                 if not pure.is_acyclic:
                     raise RuntimeError(
@@ -1141,6 +1290,7 @@ class FSDPStageOwnershipPlugin:
                         list(item.signature) for item in owned
                     ],
                     "fsdp_residency_intervals": residency_intervals,
+                    "fsdp_post_backward_syncs": backward_sync_count,
                 })
                 step_templates[template_id] = pure
                 normalized_templates[signature] = template_id

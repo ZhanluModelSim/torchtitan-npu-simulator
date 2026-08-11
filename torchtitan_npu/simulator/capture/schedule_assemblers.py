@@ -7,12 +7,16 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Iterable
+from collections.abc import Iterable
+from dataclasses import dataclass, field, replace
+from typing import TYPE_CHECKING, Any
 
 from torchtitan_npu.simulator.capture.comm_events import CommEvent
 from torchtitan_npu.simulator.ir.schedule_plan import CommDetail
 from torchtitan_npu.simulator.memory.records import FSDPResidencyEvent
+
+if TYPE_CHECKING:
+    from torchtitan_npu.simulator.ir.step_graph import StepGraph
 
 
 _PP_DIRECTIONS: dict[str, tuple[str, str]] = {
@@ -689,6 +693,116 @@ class CapturedTraceAssembler:
 
         for spec in specs:
             annotate(spec)
+        return sorted(specs, key=lambda spec: spec.order_key)
+
+
+class NonPipelineTraceAssembler:
+    """Build ownership specs when no pipeline runtime timeline exists."""
+
+    _STEP_ORDER = {"F": 0, "B": 1, "OPTIMIZER": 2}
+
+    def __init__(
+        self,
+        *,
+        step_templates: dict[str, StepGraph],
+        fsdp_residency_events: Iterable[FSDPResidencyEvent],
+        rank: int,
+    ) -> None:
+        self.step_templates = step_templates
+        self.fsdp_residency_events = list(fsdp_residency_events)
+        self.rank = rank
+
+    @staticmethod
+    def _comp_type(step_type: str) -> str:
+        normalized = step_type.upper()
+        return {
+            "FORWARD": "F",
+            "BACKWARD": "B",
+            "OPTIMIZER": "OPTIMIZER",
+        }.get(normalized, normalized)
+
+    def build(self) -> list[ActionSpec]:
+        ordered_templates = sorted(
+            self.step_templates.items(),
+            key=lambda item: (
+                self._STEP_ORDER.get(self._comp_type(item[1].step_type), 9),
+                item[0],
+            ),
+        )
+        specs: list[ActionSpec] = []
+        compute_by_type: dict[str, ActionSpec] = {}
+        compute_by_instance: dict[str, ActionSpec] = {}
+        for schedule_order, (template_id, template) in enumerate(
+            ordered_templates
+        ):
+            comp_type = self._comp_type(template.step_type)
+            if comp_type not in _COMPUTE_ACTION_TYPES | {"OPTIMIZER"}:
+                continue
+            seqs = [node.seq_idx for node in template.nodes.values()]
+            start_seq = min(seqs, default=0)
+            end_seq = max(seqs, default=start_seq)
+            instance_id = f"nonpp:r{self.rank}:{template_id}:mb0"
+            spec = ActionSpec(
+                action_type=(
+                    "OPTIMIZER" if comp_type == "OPTIMIZER" else "COMPUTE"
+                ),
+                stage=self.rank,
+                mb_idx=0,
+                seq_idx=start_seq,
+                order_key=(schedule_order, 0, 0),
+                comp_type=comp_type,
+                template_ref=template_id,
+                annotations={
+                    "compute_instance_id": instance_id,
+                    "capture_start_seq": start_seq,
+                    "capture_end_seq": end_seq,
+                    "non_pipeline_capture": True,
+                },
+            )
+            specs.append(spec)
+            compute_by_type.setdefault(comp_type, spec)
+            compute_by_instance[instance_id] = spec
+
+        merged_events: dict[
+            tuple[str, str] | tuple[str, int], FSDPResidencyEvent
+        ] = {}
+        for ordinal, event in enumerate(self.fsdp_residency_events):
+            if event.action not in {"alloc", "free"}:
+                continue
+            comp_type = "B" if event.phase.lower() == "backward" else "F"
+            parent = compute_by_type.get(comp_type)
+            if parent is None:
+                continue
+            normalized = replace(
+                event,
+                pp_stage=self.rank,
+                pp_mb_idx=0,
+                comp_type=comp_type,
+                parent_compute_instance_id=str(
+                    parent.annotations["compute_instance_id"]
+                ),
+            )
+            key: tuple[str, str] | tuple[str, int] = (
+                (normalized.transition_id, normalized.action)
+                if normalized.transition_id
+                else ("legacy", ordinal)
+            )
+            previous = merged_events.get(key)
+            if previous is None or (
+                normalized.schedule_source == "state"
+                and previous.schedule_source != "state"
+            ):
+                merged_events[key] = normalized
+
+        residency_specs = [
+            CapturedTraceAssembler._residency_spec(
+                event,
+                compute_by_instance,
+                ordinal,
+            )
+            for ordinal, event in enumerate(merged_events.values())
+        ]
+        specs.extend(residency_specs)
         return sorted(specs, key=lambda spec: spec.order_key)
 
 
