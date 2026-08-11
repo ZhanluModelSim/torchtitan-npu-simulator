@@ -3,11 +3,9 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-import math
 import types
 from dataclasses import fields
 from typing import cast
-
 import pytest
 import torch
 import torch.nn as nn
@@ -26,7 +24,7 @@ from torchtitan_npu.patches.optimizer.muon_optimizer import (
     MuonLRSchedulersContainer,
     zeropower_via_newtonschulz5,
 )
-from torchtitan_npu.patches.optimizer.swap_optimizer import unwrap_dtensor
+from torchtitan_npu.patches.optimizer.swap_optimizer import SwapMuonState, unwrap_dtensor
 
 
 class _DummyModel(nn.Module):
@@ -713,105 +711,304 @@ def test_muon_swap_optimizer_routing_and_config(monkeypatch, cpu_parallel_dims):
     assert recorded["swap_merge_buckets"] == 4
 
 
+class _TrackedMomentumState(dict):
+    def __init__(self, calls, **kwargs):
+        self.calls = calls
+        super().__init__(**kwargs)
+
+    def __setitem__(self, key, value):
+        if key == "momentum_buffer" and value is None:
+            self.calls.append(("clear",))
+        super().__setitem__(key, value)
+
+
+class _ScheduleGrad:
+    def __init__(self, index):
+        self.index = index
+
+    def to(self, **kwargs):
+        return self
+
+
+def _schedule_device(calls):
+    def record_event():
+        return None
+
+    def wait_stream(stream):
+        calls.append(("drain", stream))
+
+    current_stream = types.SimpleNamespace(
+        record_event=record_event,
+        wait_stream=wait_stream,
+    )
+
+    def get_current_stream():
+        return current_stream
+
+    return types.SimpleNamespace(current_stream=get_current_stream)
+
+
+def _make_expert_swap_stub(params, calls, transfer_stream):
+    indices = {id(param): index for index, param in enumerate(params)}
+
+    def swap_h2d(group, stream, reusable_group=None):
+        calls.append(("h2d", indices[id(group[0])], reusable_group, stream))
+
+    def wait_swap(group):
+        calls.append(("wait", indices[id(group[0])]))
+
+    def swap_d2h(group, stream):
+        index = indices[id(group[0])]
+        calls.append(("d2h", index, stream))
+        return f"buffer_{index}"
+
+    def get_grad(param, *args):
+        return _ScheduleGrad(indices[id(param)])
+
+    def lmo(grad, **kwargs):
+        calls.append(("compute", grad.index))
+        return grad
+
+    def ignore(*args, **kwargs):
+        return None
+
+    return types.SimpleNamespace(
+        _swap_enabled=True,
+        _swap_container=object(),
+        _swap_transfer_stream=transfer_stream,
+        _device_module=_schedule_device(calls),
+        experts_need_transpose=False,
+        communication_dtype=torch.float32,
+        adjust_lr_fn="original",
+        hybrid_ns=False,
+        parameters_to_groups=indices,
+        groups_info={index: (1e-3, False, 0.95, 0.0, {}) for index in range(len(params))},
+        _swap_h2d_group=swap_h2d,
+        _wait_swap_group=wait_swap,
+        _swap_d2h_group=swap_d2h,
+        _update_momentum_single=ignore,
+        get_momentum_or_grad=get_grad,
+        lmo=lmo,
+        update_bucket_params=ignore,
+    )
+
+
+def _make_fsdp_swap_stub(calls, transfer_stream):
+    def build_context(params):
+        return types.SimpleNamespace(world_size=1)
+
+    def swap_h2d(group, stream, reusable_group=None):
+        calls.append(("h2d", group[0], reusable_group, stream))
+
+    def wait_swap(group):
+        calls.append(("wait", group[0]))
+
+    def swap_d2h(group, stream):
+        calls.append(("d2h", group[0], stream))
+        return f"buffer_{group[0]}"
+
+    def process_group(index, group, *args):
+        calls.append(("compute", group[0]))
+
+    return types.SimpleNamespace(
+        _swap_enabled=True,
+        _swap_container=object(),
+        _swap_merge_buckets=1,
+        _swap_transfer_stream=transfer_stream,
+        _device_module=_schedule_device(calls),
+        _build_fsdp_context=build_context,
+        _swap_h2d_group=swap_h2d,
+        _wait_swap_group=wait_swap,
+        _swap_d2h_group=swap_d2h,
+        _process_fsdp_merge_group=process_group,
+    )
+
+
 def test_swap_muon_state_lifecycle(monkeypatch):
-    from torchtitan_npu.patches.optimizer.swap_optimizer import SwapMuonState
-
     p = torch.randn(4, 4)
-
+    calls = []
+    fake_device = _schedule_device(calls)
+    stream = fake_device.current_stream()
     original_zeros_like = torch.zeros_like
 
     def zeros_like_no_pin(input, *, pin_memory=False, device=None, **kwargs):
         return original_zeros_like(input, device=device or input.device, **kwargs)
 
+    def record_stream(tensor, active_stream):
+        calls.append(("record_stream", active_stream))
+
     monkeypatch.setattr(torch, "zeros_like", zeros_like_no_pin)
-
-    import torchtitan_npu.patches.optimizer.swap_optimizer as swap_mod
-
-    monkeypatch.setattr(swap_mod.torch, "zeros_like", zeros_like_no_pin)
-
-    class _FakeStream:
-        def record_event(self):
-            return None
-
-    class _FakeDeviceModule:
-        Stream = _FakeStream
-
-        @staticmethod
-        def current_stream():
-            return _FakeStream()
-
-    fake_device = _FakeDeviceModule()
+    monkeypatch.setattr(
+        torch.Tensor,
+        "record_stream",
+        record_stream,
+    )
     swap_state = SwapMuonState(p, fake_device)
-
     momentum_buffer = torch.randn(4, 4)
-    state = {"momentum_buffer": momentum_buffer}
+    state = _TrackedMomentumState(calls, momentum_buffer=momentum_buffer)
     swap_state.optim_state = state
 
     swap_state.init_from_momentum_buffer(momentum_buffer)
-
     assert swap_state.cpu_momentum is not None
     assert torch.allclose(swap_state.cpu_momentum, momentum_buffer)
     assert state["momentum_buffer"] is None
-    assert swap_state.on_device is False
+    assert not swap_state.on_device
 
-    swap_state.swap_to_device(stream=None)
-    assert state["momentum_buffer"] is not None
+    reusable_buffer = torch.empty(momentum_buffer.numel() + 4)
+    swap_state.swap_to_device(reusable_buffer=reusable_buffer)
+    assert state["momentum_buffer"] is reusable_buffer
     assert torch.allclose(state["momentum_buffer"], swap_state.cpu_momentum)
     assert swap_state.on_device
 
     state["momentum_buffer"].fill_(1.0)
-
-    swap_state.swap_to_host(stream=None)
+    calls.clear()
+    released_buffer, _ = swap_state.swap_to_host()
     assert torch.all(swap_state.cpu_momentum == 1.0)
+    assert released_buffer is reusable_buffer
     assert state["momentum_buffer"] is None
-    assert swap_state.on_device is False
+    assert not swap_state.on_device
+    assert calls == [("record_stream", stream), ("clear",)]
+
+    released_buffer.resize_(8)
+    swap_state.swap_to_device(reusable_buffer=released_buffer)
+    assert state["momentum_buffer"] is released_buffer
 
 
-def test_swap_merge_buckets_scheduling():
-    from torchtitan_npu.patches.optimizer.muon_optimizer import (
-        DistributedMuon,
-        SwapMergeContext,
+def test_swap_experts_reuses_released_group_without_host_wait():
+    params = [object() for _ in range(3)]
+    calls = []
+    transfer_stream = object()
+    opt = _make_expert_swap_stub(params, calls, transfer_stream)
+
+    DistributedMuon.step_experts(opt, params, [f"expert_{index}" for index in range(len(params))])
+
+    assert calls == [
+        ("h2d", 0, None, transfer_stream),
+        ("wait", 0),
+        ("compute", 0),
+        ("h2d", 1, None, transfer_stream),
+        ("d2h", 0, transfer_stream),
+        ("wait", 1),
+        ("compute", 1),
+        ("h2d", 2, "buffer_0", transfer_stream),
+        ("d2h", 1, transfer_stream),
+        ("wait", 2),
+        ("compute", 2),
+        ("d2h", 2, transfer_stream),
+        ("drain", transfer_stream),
+    ]
+
+
+def test_swap_fsdp_reuses_released_group_without_host_wait():
+    params = ["p0", "p1", "p2"]
+    calls = []
+    transfer_stream = object()
+    opt = _make_fsdp_swap_stub(calls, transfer_stream)
+
+    DistributedMuon.step_fsdp(opt, params, params)
+
+    assert calls == [
+        ("h2d", "p0", None, transfer_stream),
+        ("wait", "p0"),
+        ("compute", "p0"),
+        ("h2d", "p1", None, transfer_stream),
+        ("d2h", "p0", transfer_stream),
+        ("wait", "p1"),
+        ("compute", "p1"),
+        ("h2d", "p2", "buffer_p0", transfer_stream),
+        ("d2h", "p1", transfer_stream),
+        ("wait", "p2"),
+        ("compute", "p2"),
+        ("d2h", "p2", transfer_stream),
+        ("drain", transfer_stream),
+    ]
+
+
+def test_match_reusable_buffers_uses_sorted_positional_fast_path():
+    buffers = [object(), object(), object()]
+    calls = []
+
+    class _SwapState:
+        def __init__(self, expected):
+            self.expected = expected
+
+        def can_reuse_buffer(self, buffer):
+            calls.append((self.expected, buffer))
+            return buffer is self.expected
+
+    swap_states = [_SwapState(buffer) for buffer in buffers]
+
+    match_buffers = getattr(DistributedMuon, "_match_reusable_buffers")
+    matched = match_buffers(swap_states, buffers)
+
+    assert matched == buffers
+    assert calls == list(zip(buffers, buffers, strict=True))
+
+
+def test_swap_muon_checkpoint_waits_for_muon_and_adamw_transfers(monkeypatch):
+    from torchtitan_npu.patches.optimizer.swap_optimizer import (
+        SwapMuonHybridOptimizersContainer,
+        SwapOptimizersContainer,
     )
 
-    opt = DistributedMuon.__new__(DistributedMuon)
+    calls = []
 
-    opt._swap_merge_buckets = 4
-    assert opt._swap_merge_buckets == 4
+    def synchronize_muon():
+        calls.append("muon")
 
-    total_buckets = 10
-    swap_merge_buckets = opt._swap_merge_buckets
-    num_merge_groups = math.ceil(total_buckets / swap_merge_buckets)
-    assert num_merge_groups == 3
+    def wait_pending_adamw():
+        calls.append("adamw")
 
-    groups = []
-    for merge_idx in range(num_merge_groups):
-        start = merge_idx * swap_merge_buckets
-        end = min(start + swap_merge_buckets, total_buckets)
-        groups.append((start, end))
+    class _CheckpointContainer(SwapMuonHybridOptimizersContainer):
+        def configure(self):
+            self._muon_transfer_stream = types.SimpleNamespace(
+                synchronize=synchronize_muon
+            )
+            self.optimizers = [types.SimpleNamespace()]
+            self.model_parts = []
 
-    assert groups[0] == (0, 4)
-    assert groups[1] == (4, 8)
-    assert groups[2] == (8, 10)
-
-    swap_ctx = SwapMergeContext(
-        merge_buckets=swap_merge_buckets,
-        use_swap=True,
-        to_device_stream=None,
-        to_host_stream=None,
+    container = _CheckpointContainer.__new__(_CheckpointContainer)
+    container.configure()
+    monkeypatch.setattr(
+        SwapOptimizersContainer,
+        "wait_pending_swap_to_host",
+        wait_pending_adamw,
     )
-    assert swap_ctx.merge_buckets == 4
-    assert swap_ctx.use_swap is True
 
-    opt._swap_merge_buckets = 1
-    total_buckets = 5
-    num_merge_groups = math.ceil(total_buckets / opt._swap_merge_buckets)
-    assert num_merge_groups == 5
+    container.state_dict()
+
+    assert calls == ["muon", "adamw"]
+
+
+def test_swap_muon_load_state_dict_waits_for_pending_transfers(monkeypatch):
+    from torchtitan_npu.patches.optimizer.swap_optimizer import (
+        SwapMuonHybridOptimizersContainer,
+        SwapOptimizersContainer,
+    )
+
+    calls = []
+
+    class _LoadStateContainer(SwapMuonHybridOptimizersContainer):
+        def configure(self):
+            self._muon_swap_states = {1: SwapMuonState(torch.empty(0), torch)}
+            self.optimizers = [types.SimpleNamespace()]
+            self.model_parts = []
+
+        def _wait_pending_swap_to_host(self):
+            calls.append("wait")
+
+    container = _LoadStateContainer.__new__(_LoadStateContainer)
+    container.configure()
+    monkeypatch.setattr(SwapOptimizersContainer, "empty_device_cache", lambda: None)
+
+    container.load_state_dict({})
+
+    assert calls == ["wait"]
 
 
 def test_swap_muon_hybrid_checkpoint_roundtrip(monkeypatch):
     from torchtitan_npu.patches.optimizer.swap_optimizer import (
         SwapMuonHybridOptimizersContainer,
-        SwapMuonState,
     )
 
     original_zeros_like = torch.zeros_like
@@ -869,3 +1066,7 @@ def test_swap_muon_hybrid_checkpoint_roundtrip(monkeypatch):
     assert state2["momentum_buffer"] is None
     assert swap_state2.buf_shape == p2.shape
     assert swap_state2.buf_dtype == p2.dtype
+
+    swap_state2.swap_to_device(stream=types.SimpleNamespace(record_event=lambda: None))
+
+    assert torch.allclose(state2["momentum_buffer"], serialized)

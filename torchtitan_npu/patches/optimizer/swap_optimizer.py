@@ -43,6 +43,7 @@ logger = logging.getLogger(__name__)
 
 
 T = TypeVar("T", bound=Optimizer)
+_SWAP_RELEASE_EVENT_ATTR = "_swap_release_event"
 
 
 def _check_build_kwargs(config, kwargs):
@@ -334,19 +335,24 @@ class SwapOptimizersContainer(OptimizersContainer):
     @classmethod
     def swap_states_to_host(cls, param):
         if param not in cls.param_to_device_states_map:
-            return
+            return None
 
         device_state = cls.param_to_device_states_map[param]
         cpu_state = cls.param_to_cpu_states_map[param]
+        stream = get_torch_device().current_stream()
         for key in cls.state_keys:
             if key not in device_state or device_state[key] is None:
                 continue
             local_state = unwrap_dtensor(device_state[key])
             if local_state.untyped_storage().size() != 0:
                 cpu_state[key].copy_(local_state, non_blocking=True)
+                # Keep source storage alive until the asynchronous D2H consumes it.
+                local_state.record_stream(stream)
                 local_state.untyped_storage().resize_(0)
 
-        cls.swap_to_host_events_map[param] = get_torch_device().current_stream().record_event()
+        event = stream.record_event()
+        cls.swap_to_host_events_map[param] = event
+        return event
 
     @classmethod
     def wait_swap_to_device_event(cls, param):
@@ -591,29 +597,81 @@ def param_update(param, state, param_group):
     )
 
 
-def pipeline_load_param(swap_numel, params_list, start_index, current_swap_count):
+def _build_swap_buckets(params, swap_numel):
+    buckets = []
+    bucket = []
+    bucket_numel = 0
+    for param in params:
+        if param.grad is None:
+            continue
+        numel = unwrap_dtensor(param).numel()
+        if bucket and bucket_numel + numel > swap_numel:
+            buckets.append(bucket)
+            bucket = []
+            bucket_numel = 0
+        bucket.append(param)
+        bucket_numel += numel
+    if bucket:
+        buckets.append(bucket)
+    return buckets
+
+
+def _load_swap_bucket(params, *, wait_for_host):
     torch_device = get_torch_device()
-    torch_device.current_stream().wait_stream(SwapOptimizersContainer.swap_to_host_stream)
+    stream = SwapOptimizersContainer.swap_to_device_stream
+    if stream is None:
+        raise RuntimeError("Swap-to-device stream is not initialized.")
+    with torch_device.stream(stream):
+        if wait_for_host:
+            # The first bucket must wait for D2H left by the previous step.
+            host_stream = SwapOptimizersContainer.swap_to_host_stream
+            if host_stream is None:
+                raise RuntimeError("Swap-to-host stream is not initialized.")
+            stream.wait_stream(host_stream)
+        for param in params:
+            SwapOptimizersContainer.swap_states_to_device(param)
 
-    with torch_device.stream(SwapOptimizersContainer.swap_to_device_stream):
-        torch_device.current_stream().wait_stream(SwapOptimizersContainer.swap_to_host_stream)
 
-        idx = start_index
-        while idx < len(params_list):
-            param_local = unwrap_dtensor(params_list[idx])
-            if params_list[idx].grad is None:
-                idx += 1
-                continue  # skip no grad param
+def _wait_pending_swap_release(optimizer):
+    event = getattr(optimizer, _SWAP_RELEASE_EVENT_ATTR, None)
+    if event is not None:
+        event.synchronize()
+        setattr(optimizer, _SWAP_RELEASE_EVENT_ATTR, None)
 
-            numel = param_local.numel()
-            if current_swap_count > 0 and current_swap_count + numel > swap_numel:
-                break  # stop load params when the buffer is full
 
-            SwapOptimizersContainer.swap_states_to_device(params_list[idx])
-            current_swap_count += numel
-            idx += 1
+def _update_swap_bucket(optimizer, bucket):
+    for param in bucket:
+        SwapOptimizersContainer.wait_swap_to_device_event(param)
+        state = optimizer.state[param]
+        group = optimizer.param_to_group_map[param]
+        param_update(param, state, group)
+        SwapOptimizersContainer.param_update_events_map[param] = get_torch_device().current_stream().record_event()
 
-    return current_swap_count
+
+def _offload_swap_bucket(bucket):
+    release_event = None
+    with get_torch_device().stream(SwapOptimizersContainer.swap_to_host_stream):
+        for param in bucket:
+            SwapOptimizersContainer.wait_param_update_event(param)
+            event = SwapOptimizersContainer.swap_states_to_host(param)
+            if event is not None:
+                release_event = event
+    return release_event
+
+
+def _step_swap_buckets(optimizer, buckets):
+    _wait_pending_swap_release(optimizer)
+    _load_swap_bucket(buckets[0], wait_for_host=True)
+    for bucket_index, bucket in enumerate(buckets):
+        _update_swap_bucket(optimizer, bucket)
+
+        # Bound live state to the current and next buckets after current compute is submitted.
+        _wait_pending_swap_release(optimizer)
+        if bucket_index + 1 < len(buckets):
+            _load_swap_bucket(buckets[bucket_index + 1], wait_for_host=False)
+
+        release_event = _offload_swap_bucket(bucket)
+        setattr(optimizer, _SWAP_RELEASE_EVENT_ATTR, release_event)
 
 
 @_use_grad_for_differentiable
@@ -637,9 +695,9 @@ def swap_optimizer_step(self, closure=None):
                 device=get_torch_device().current_device(),
             )
 
-    swap_count = 0
     params_list = [p for group in self.param_groups for p in group["params"]]
-    for i, param in enumerate(params_list):
+    # Initialize all placeholders before asynchronous prefetch can reach them.
+    for param in params_list:
         if param.grad is None:
             continue
         if param.grad.is_sparse:
@@ -656,21 +714,12 @@ def swap_optimizer_step(self, closure=None):
         if "max_exp_avg_sq" not in state:
             state["max_exp_avg_sq"] = torch.zeros_like(param, memory_format=torch.preserve_format) if amsgrad else None
 
-        # pipelined swap update (load -> update -> offload)
-        # load
-        if swap_count == 0:
-            swap_count = pipeline_load_param(self.swap_numel, params_list, i, swap_count)
+    buckets = _build_swap_buckets(params_list, self.swap_numel)
+    if not buckets:
+        return loss
 
-        # update
-        SwapOptimizersContainer.wait_swap_to_device_event(param)
-        param_update(param, state, group)
-        SwapOptimizersContainer.param_update_events_map[param] = get_torch_device().current_stream().record_event()
-        # offload
-        with get_torch_device().stream(SwapOptimizersContainer.swap_to_host_stream):
-            SwapOptimizersContainer.wait_param_update_event(param)
-            swap_count -= unwrap_dtensor(param).numel()
-            SwapOptimizersContainer.swap_states_to_host(param)
-
+    _step_swap_buckets(self, buckets)
+    # Keep D2H asynchronous; the next step's first H2D waits for it.
     return loss
 
 
@@ -702,6 +751,7 @@ class SwapMuonState:
         self._optim_state: dict | None = None
         self._buf_shape = None
         self._buf_dtype = None
+        self._buf_device = unwrap_dtensor(param).device
 
     @property
     def cpu_momentum(self):
@@ -752,20 +802,35 @@ class SwapMuonState:
         self._set_momentum_buffer(None)
         self._on_device = False
 
-    def swap_to_device(self, stream=None):
+    def can_reuse_buffer(self, buffer):
+        if self._cpu_momentum is None or self._buf_dtype is None or self._buf_device is None:
+            return False
+        return (
+            buffer.dtype == self._buf_dtype
+            and buffer.device == self._buf_device
+            and buffer.is_contiguous()
+            and buffer.untyped_storage().nbytes() >= self._cpu_momentum.numel() * self._cpu_momentum.element_size()
+        )
+
+    def swap_to_device(self, stream=None, *, reusable_buffer=None):
         if self._cpu_momentum is None or self._on_device:
             return
         state = self._get_momentum_buffer()
         cpu = self._cpu_momentum
         if state is None:
-            if self._buf_shape is None or self._buf_dtype is None:
+            if self._buf_shape is None or self._buf_dtype is None or self._buf_device is None:
                 raise RuntimeError("SwapMuonState buffer metadata is not initialized.")
-            local_param = unwrap_dtensor(self.param)
-            local_state = torch.empty(
-                self._buf_shape,
-                dtype=self._buf_dtype,
-                device=local_param.device,
-            )
+            if reusable_buffer is None:
+                local_state = torch.empty(
+                    self._buf_shape,
+                    dtype=self._buf_dtype,
+                    device=self._buf_device,
+                )
+            else:
+                assert self.can_reuse_buffer(reusable_buffer)
+                # Resize metadata in place; the retained storage is already large enough.
+                reusable_buffer.resize_(self._buf_shape)
+                local_state = reusable_buffer
             self._set_momentum_buffer(
                 wrap_like_param(local_state, self.param) if isinstance(self.param, DTensor) else local_state
             )
@@ -779,18 +844,21 @@ class SwapMuonState:
 
     def swap_to_host(self, stream=None):
         if self._cpu_momentum is None or not self._on_device:
-            return
+            return None, None
+        active_stream = stream if stream is not None else self.device_module.current_stream()
         state = self._get_momentum_buffer()
+        reusable_buffer = None
         if state is not None:
             local_state = unwrap_dtensor(state)
             if local_state.untyped_storage().size() != 0:
                 self._cpu_momentum.copy_(local_state, non_blocking=True)
+                # Keep source storage alive until the asynchronous D2H consumes it.
+                local_state.record_stream(active_stream)
+                reusable_buffer = local_state
             self._set_momentum_buffer(None)
         self._on_device = False
-        if stream is not None:
-            self._swap_event = stream.record_event()
-        else:
-            self._swap_event = self.device_module.current_stream().record_event()
+        self._swap_event = active_stream.record_event()
+        return reusable_buffer, self._swap_event
 
     def wait_swap(self):
         if self._swap_event is not None:
@@ -865,8 +933,7 @@ class SwapMuonHybridOptimizersContainer(MuonHybridOptimizersContainer):
         if SwapOptimizersContainer.swap_to_device_stream is None:
             SwapOptimizersContainer.swap_to_device_stream = self._device_module.Stream()
             SwapOptimizersContainer.swap_to_host_stream = self._device_module.Stream()
-        self._swap_to_device_stream = SwapOptimizersContainer.swap_to_device_stream
-        self._swap_to_host_stream = SwapOptimizersContainer.swap_to_host_stream
+        self._muon_transfer_stream = SwapOptimizersContainer.swap_to_device_stream
         self._muon_swap_states: dict[int, SwapMuonState] = {}
         muon_optim = self.optimizers[0]
         if not isinstance(muon_optim, DistributedMuon):
@@ -877,8 +944,8 @@ class SwapMuonHybridOptimizersContainer(MuonHybridOptimizersContainer):
         muon_optim._swap_container = self
         muon_optim._swap_merge_buckets = swap_merge_buckets
         muon_optim._device_module = self._device_module
-        muon_optim._swap_to_device_stream = self._swap_to_device_stream
-        muon_optim._swap_to_host_stream = self._swap_to_host_stream
+        # Muon reuses one transfer stream for both directions to avoid contention.
+        muon_optim._swap_transfer_stream = self._muon_transfer_stream
         self._enable_adamw_swap(swap_optimizer_times)
         self._pre_init_swap_states()
         logger.info(
@@ -893,6 +960,8 @@ class SwapMuonHybridOptimizersContainer(MuonHybridOptimizersContainer):
         return self._muon_swap_states
 
     def step(self, *args, **kwargs) -> None:
+        if len(self.optimizers) > 1:
+            _wait_pending_swap_release(self.optimizers[1])
         self.optimizers[0].step(*args, **kwargs)
         if len(self.optimizers) > 1:
             self.optimizers[1].step(*args, **kwargs)
@@ -913,6 +982,7 @@ class SwapMuonHybridOptimizersContainer(MuonHybridOptimizersContainer):
         return merged
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        self._wait_pending_swap_to_host()
         muon_optim = self.optimizers[0]
         if not self._muon_swap_states:
             self._ensure_swap_states_initialized()
@@ -1043,6 +1113,7 @@ class SwapMuonHybridOptimizersContainer(MuonHybridOptimizersContainer):
             group["step"] = SwapOptimizersContainer.clone_loaded_value(step)
 
     def _wait_pending_swap_to_host(self):
+        self._muon_transfer_stream.synchronize()
         SwapOptimizersContainer.wait_pending_swap_to_host()
 
     def _ensure_swap_states_initialized(self):

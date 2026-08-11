@@ -193,8 +193,19 @@ class SwapMergeContext:
 
     merge_buckets: int
     use_swap: bool
-    to_device_stream: Any = None
-    to_host_stream: Any = None
+
+
+@dataclass
+class SwapBufferGroup:
+    """Device buffers released by one swap group in transfer-stream order."""
+
+    buffers: list[torch.Tensor]
+    event: Any
+
+    def synchronize(self):
+        if self.event is not None:
+            self.event.synchronize()
+        self.buffers.clear()
 
 
 @dataclass
@@ -288,8 +299,7 @@ class DistributedMuon(Optimizer):
         self._swap_merge_buckets: int = 1
 
         self._device_module: Any = None
-        self._swap_to_device_stream: Any = None
-        self._swap_to_host_stream: Any = None
+        self._swap_transfer_stream: Any = None
 
     @staticmethod
     @torch.no_grad()
@@ -344,6 +354,28 @@ class DistributedMuon(Optimizer):
         pairs.sort(key=sort_key, reverse=True)
         params, names = list(zip(*pairs, strict=True))
         return list(params), list(names)
+
+    @staticmethod
+    def _match_reusable_buffers(swap_states, buffers):
+        if len(buffers) >= len(swap_states):
+            matched = list(buffers[: len(swap_states)])
+            if all(
+                swap_state.can_reuse_buffer(buffer) for swap_state, buffer in zip(swap_states, matched, strict=True)
+            ):
+                return matched
+
+        available = list(buffers)
+        matched = []
+        for swap_state in swap_states:
+            candidates = [index for index, buffer in enumerate(available) if swap_state.can_reuse_buffer(buffer)]
+            if not candidates:
+                return None
+            best_fit = min(
+                candidates,
+                key=lambda index: available[index].untyped_storage().nbytes(),
+            )
+            matched.append(available.pop(best_fit))
+        return matched
 
     @torch.no_grad()
     def get_momentum_or_grad(self, p, momentum, nesterov):
@@ -515,45 +547,44 @@ class DistributedMuon(Optimizer):
 
         transpose = self.experts_need_transpose
         use_swap = self._swap_enabled and self._swap_container is not None
-
-        swap_to_device_stream: Any = None
-        swap_to_host_stream: Any = None
-        swap_state: Any = None
-
+        transfer_stream: Any = None
+        reusable_group: SwapBufferGroup | None = None
         if use_swap:
-            swap_to_device_stream = self._swap_to_device_stream
-            swap_to_host_stream = self._swap_to_host_stream
+            transfer_stream = self._swap_transfer_stream
+            self._swap_h2d_group(expert_params[:1], transfer_stream)
 
-        for p, p_name in zip(expert_params, expert_param_names, strict=True):
+        for index, (p, p_name) in enumerate(zip(expert_params, expert_param_names, strict=True)):
             validate_expert_shards_on_dim0(p, p_name)
             _, nesterov, momentum, _, param_kwargs = self.groups_info[self.parameters_to_groups[id(p)]]
 
             if use_swap:
-                swap_state = self._swap_h2d_single(p, swap_to_device_stream, swap_to_host_stream)
+                self._wait_swap_group((p,))
                 self._update_momentum_single(p, momentum)
 
             g = self.get_momentum_or_grad(p, momentum, nesterov)
-            if g is None:
-                if use_swap:
-                    self._swap_d2h_single(swap_state, swap_to_host_stream)
-                continue
-
-            u = self.lmo(
-                g.to(dtype=self.communication_dtype),
-                **param_kwargs,
-                transpose_experts=transpose,
-                adjust_lr_fn=self.adjust_lr_fn,
-                hybrid_ns=self.hybrid_ns,
-            )
-
-            self.update_bucket_params([p], [u])
+            if g is not None:
+                u = self.lmo(
+                    g.to(dtype=self.communication_dtype),
+                    **param_kwargs,
+                    transpose_experts=transpose,
+                    adjust_lr_fn=self.adjust_lr_fn,
+                    hybrid_ns=self.hybrid_ns,
+                )
+                self.update_bucket_params([p], [u])
 
             if use_swap:
-                self._swap_d2h_single(swap_state, swap_to_host_stream)
+                # Serialize H2D(next) before D2H(current) to avoid copy contention.
+                if index + 1 < len(expert_params):
+                    self._swap_h2d_group(
+                        (expert_params[index + 1],),
+                        transfer_stream,
+                        reusable_group=reusable_group,
+                    )
+                reusable_group = self._swap_d2h_group((p,), transfer_stream)
 
         if use_swap:
             self._device_module.current_stream().wait_stream(
-                swap_to_host_stream
+                transfer_stream
             )  # pyrefly: ignore[missing-attribute,unbound-name]
 
     def step_fsdp(self, fsdp_params, fsdp_param_names):
@@ -564,31 +595,49 @@ class DistributedMuon(Optimizer):
         if ctx is None:
             return
 
-        total_buckets = math.ceil(len(fsdp_params) / ctx.world_size)
         use_swap = self._swap_enabled and self._swap_container is not None
 
         swap_merge_buckets = getattr(self, "_swap_merge_buckets", 1)
-        num_merge_groups = math.ceil(total_buckets / swap_merge_buckets)
-
         swap_ctx = SwapMergeContext(
             merge_buckets=swap_merge_buckets,
             use_swap=use_swap,
-            to_device_stream=self._swap_to_device_stream if use_swap else None,
-            to_host_stream=self._swap_to_host_stream if use_swap else None,
         )
 
-        for merge_idx in range(num_merge_groups):
+        num_params_per_merge_group = swap_merge_buckets * ctx.world_size
+        # Materialize groups so the scheduler can access both current and next.
+        merge_groups = []
+        for start_idx in range(0, len(fsdp_params), num_params_per_merge_group):
+            end_idx = start_idx + num_params_per_merge_group
+            merge_groups.append(fsdp_params[start_idx:end_idx])
+
+        transfer_stream = self._swap_transfer_stream if use_swap else None
+        reusable_group: SwapBufferGroup | None = None
+        if use_swap:
+            self._swap_h2d_group(merge_groups[0], transfer_stream)
+
+        for merge_idx, merge_params in enumerate(merge_groups):
+            if use_swap:
+                self._wait_swap_group(merge_params)
             self._process_fsdp_merge_group(
                 merge_idx,
+                merge_params,
                 fsdp_params,
                 ctx,
                 swap_ctx,
-                total_buckets,
             )
+            if use_swap:
+                # Keep H2D(next) ahead of D2H(current) on the shared stream.
+                if merge_idx + 1 < len(merge_groups):
+                    self._swap_h2d_group(
+                        merge_groups[merge_idx + 1],
+                        transfer_stream,
+                        reusable_group=reusable_group,
+                    )
+                reusable_group = self._swap_d2h_group(merge_params, transfer_stream)
 
         if use_swap:
             self._device_module.current_stream().wait_stream(
-                swap_ctx.to_host_stream
+                transfer_stream
             )  # pyrefly: ignore[missing-attribute,unbound-name]
 
     def update_bucket_params(self, params, updates, tp_group=None):
@@ -686,31 +735,38 @@ class DistributedMuon(Optimizer):
         self._param_type_map[pid] = ptype
         return ptype
 
-    def _swap_h2d_single(self, param, swap_to_device_stream, swap_to_host_stream):
+    def _swap_h2d_group(self, params, stream, *, reusable_group=None):
         dev = self._device_module  # pyrefly: ignore[missing-attribute]
-        swap_state = self._swap_container.get_swap_state(id(param))  # pyrefly: ignore[missing-attribute]
-        with dev.stream(swap_to_device_stream):  # pyrefly: ignore[missing-attribute]
-            swap_to_device_stream.wait_stream(swap_to_host_stream)
-            swap_state.swap_to_device(stream=swap_to_device_stream)
-        swap_state.wait_swap()
-        return swap_state
+        swap_states = [
+            self._swap_container.get_swap_state(id(p))  # pyrefly: ignore[missing-attribute]
+            for p in params
+        ]
+        reusable_buffers = None
+        if reusable_group is not None:
+            reusable_buffers = self._match_reusable_buffers(
+                swap_states,
+                reusable_group.buffers,
+            )
+            if reusable_buffers is None:
+                reusable_group.synchronize()
+            else:
+                reusable_group.buffers.clear()
+        if reusable_buffers is None:
+            reusable_buffers = [None] * len(swap_states)
 
-    def _swap_d2h_single(self, swap_state, swap_to_host_stream):
-        dev = self._device_module  # pyrefly: ignore[missing-attribute]
-        compute_done = dev.current_stream().record_event()  # pyrefly: ignore[missing-attribute]
-        with dev.stream(swap_to_host_stream):  # pyrefly: ignore[missing-attribute]
-            swap_to_host_stream.wait_event(compute_done)
-            swap_state.swap_to_host(stream=swap_to_host_stream)
+        with dev.stream(stream):  # pyrefly: ignore[missing-attribute]
+            for swap_state, reusable_buffer in zip(
+                swap_states,
+                reusable_buffers,
+                strict=True,
+            ):
+                # D2H of the recycled storage is already ahead of this H2D on the same stream.
+                swap_state.swap_to_device(
+                    stream=stream,
+                    reusable_buffer=reusable_buffer,
+                )
 
-    def _swap_h2d_merge_group(self, params, swap_to_device_stream, swap_to_host_stream):
-        dev = self._device_module  # pyrefly: ignore[missing-attribute]
-        with dev.stream(swap_to_device_stream):  # pyrefly: ignore[missing-attribute]
-            swap_to_device_stream.wait_stream(swap_to_host_stream)
-            for p in params:
-                swap_state = self._swap_container.get_swap_state(id(p))  # pyrefly: ignore[missing-attribute]
-                swap_state.swap_to_device(stream=swap_to_device_stream)
-        h2d_done_event = swap_to_device_stream.record_event()
-        dev.current_stream().wait_event(h2d_done_event)  # pyrefly: ignore[missing-attribute]
+    def _wait_swap_group(self, params):
         for p in params:
             swap_state = self._swap_container.get_swap_state(id(p))  # pyrefly: ignore[missing-attribute]
             swap_state.wait_swap()
@@ -720,32 +776,34 @@ class DistributedMuon(Optimizer):
             momentum = self.groups_info[self.parameters_to_groups[id(p)]][2]
             self._update_momentum_single(p, momentum)
 
-    def _swap_d2h_merge_group(self, params, swap_to_host_stream):
+    def _swap_d2h_group(self, params, stream):
         dev = self._device_module  # pyrefly: ignore[missing-attribute]
+        # Prevent D2H from reading state before its compute update completes.
         compute_done = dev.current_stream().record_event()  # pyrefly: ignore[missing-attribute]
-        with dev.stream(swap_to_host_stream):  # pyrefly: ignore[missing-attribute]
-            swap_to_host_stream.wait_event(compute_done)
+        reusable_buffers = []
+        release_event = None
+        with dev.stream(stream):  # pyrefly: ignore[missing-attribute]
+            stream.wait_event(compute_done)
             for p in params:
                 swap_state = self._swap_container.get_swap_state(id(p))  # pyrefly: ignore[missing-attribute]
-                swap_state.swap_to_host(stream=swap_to_host_stream)
+                reusable_buffer, release_event = swap_state.swap_to_host(stream=stream)
+                if reusable_buffer is not None:
+                    reusable_buffers.append(reusable_buffer)
+        return SwapBufferGroup(reusable_buffers, release_event)
 
     def _process_fsdp_merge_group(
         self,
         merge_idx,
+        merge_params,
         fsdp_params,
         ctx,
         swap_ctx: SwapMergeContext,
-        total_buckets,
     ):
         merge_start_bucket = merge_idx * swap_ctx.merge_buckets
+        total_buckets = math.ceil(len(fsdp_params) / ctx.world_size)
         merge_end_bucket = min(merge_start_bucket + swap_ctx.merge_buckets, total_buckets)
         merge_start_idx = merge_start_bucket * ctx.world_size
-        merge_end_idx = min(merge_end_bucket * ctx.world_size, len(fsdp_params))
-        merge_params = fsdp_params[merge_start_idx:merge_end_idx]
         merge_updates: list[Any] = [None] * len(merge_params)
-
-        if swap_ctx.use_swap:
-            self._swap_h2d_merge_group(merge_params, swap_ctx.to_device_stream, swap_ctx.to_host_stream)
 
         for bucket_idx in range(merge_start_bucket, merge_end_bucket):
             start_idx = bucket_idx * ctx.world_size
@@ -772,9 +830,6 @@ class DistributedMuon(Optimizer):
 
         self.update_bucket_params(merge_params, merge_updates, tp_group=ctx.tp_group)
         del merge_updates
-
-        if swap_ctx.use_swap:
-            self._swap_d2h_merge_group(merge_params, swap_ctx.to_host_stream)
 
     def _build_defaults(self, **kwargs):
         return dict(

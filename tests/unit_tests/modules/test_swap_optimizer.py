@@ -5,6 +5,8 @@
 import importlib
 import os
 import types
+from contextlib import nullcontext
+from unittest.mock import MagicMock
 
 import pytest
 import torch
@@ -437,3 +439,146 @@ def test_loaded_plain_cpu_state_rebuilds_dtensor_runtime_placeholder():
     assert placeholder.device_mesh == param.device_mesh
     assert placeholder.placements == param.placements
     assert placeholder.to_local().untyped_storage().size() == 0
+
+
+class _SwapScheduleEvent:
+    def __init__(self, calls, index):
+        self.calls = calls
+        self.index = index
+
+    def synchronize(self):
+        self.calls.append(("release", self.index))
+
+
+def _configure_adamw_swap_schedule(monkeypatch):
+    params = [object() for _ in range(4)]
+    buckets = [params[:2], params[2:3], params[3:]]
+    calls = []
+    indices = {id(param): index for index, param in enumerate(params)}
+
+    def wait_event(event):
+        return None
+
+    def current_stream():
+        return types.SimpleNamespace(record_event=object, wait_event=wait_event)
+
+    def stream_context(stream):
+        return nullcontext()
+
+    fake_device = types.SimpleNamespace(current_stream=current_stream, stream=stream_context)
+
+    def get_device():
+        return fake_device
+
+    monkeypatch.setattr(swap_optimizer, "get_torch_device", get_device)
+    container = swap_optimizer.SwapOptimizersContainer
+
+    def wait_swap(param):
+        calls.append(("wait", indices[id(param)]))
+
+    def swap_to_host(param):
+        index = indices[id(param)]
+        calls.append(("d2h", index))
+        return _SwapScheduleEvent(calls, index)
+
+    def update(param, state, group):
+        calls.append(("update", indices[id(param)]))
+
+    def load_bucket(bucket, *, wait_for_host):
+        calls.append(("load", [indices[id(param)] for param in bucket], wait_for_host))
+
+    monkeypatch.setattr(container, "swap_to_host_stream", object())
+    monkeypatch.setattr(container, "wait_swap_to_device_event", wait_swap)
+    monkeypatch.setattr(container, "swap_states_to_host", swap_to_host)
+    monkeypatch.setattr(swap_optimizer, "param_update", update)
+    monkeypatch.setattr(swap_optimizer, "_load_swap_bucket", load_bucket)
+    group = {}
+    optimizer = types.SimpleNamespace(
+        state={param: {} for param in params},
+        param_to_group_map={param: group for param in params},
+        _swap_release_event=_SwapScheduleEvent(calls, "previous"),
+    )
+    return optimizer, buckets, calls
+
+
+def test_swap_adamw_bounds_prefetch_to_two_buckets(monkeypatch):
+    optimizer, buckets, calls = _configure_adamw_swap_schedule(monkeypatch)
+
+    step_buckets = getattr(swap_optimizer, "_step_swap_buckets")
+    step_buckets(optimizer, buckets)
+
+    assert calls == [
+        ("release", "previous"),
+        ("load", [0, 1], True),
+        ("wait", 0),
+        ("update", 0),
+        ("wait", 1),
+        ("update", 1),
+        ("load", [2], False),
+        ("d2h", 0),
+        ("d2h", 1),
+        ("wait", 2),
+        ("update", 2),
+        ("release", 1),
+        ("load", [3], False),
+        ("d2h", 2),
+        ("wait", 3),
+        ("update", 3),
+        ("release", 2),
+        ("d2h", 3),
+    ]
+    assert getattr(optimizer, "_swap_release_event").index == 3
+
+
+def test_swap_hybrid_waits_for_previous_adamw_release_before_muon_step():
+    calls = []
+    release_event = types.SimpleNamespace(synchronize=lambda: calls.append("release"))
+    muon = types.SimpleNamespace(step=lambda *args, **kwargs: calls.append("muon"))
+    adamw = types.SimpleNamespace(
+        _swap_release_event=release_event,
+        step=lambda *args, **kwargs: calls.append("adamw"),
+    )
+    container = swap_optimizer.SwapMuonHybridOptimizersContainer.__new__(
+        swap_optimizer.SwapMuonHybridOptimizersContainer
+    )
+    container.optimizers = [muon, adamw]
+
+    container.step()
+
+    assert calls == ["release", "muon", "adamw"]
+    assert getattr(adamw, "_swap_release_event") is None
+
+
+def test_swap_adamw_d2h_records_source_stream_before_releasing_storage(
+    monkeypatch,
+):
+    calls = []
+    param = object()
+    stream = types.SimpleNamespace(record_event=lambda: object())
+
+    storage = MagicMock()
+    storage.size.return_value = 1
+    storage.resize_.side_effect = lambda size: calls.append(("resize", size))
+
+    local_state = MagicMock()
+    local_state.untyped_storage.return_value = storage
+    local_state.record_stream.side_effect = lambda value: calls.append(("record_stream", value))
+    cpu_state = MagicMock()
+    cpu_state.copy_.side_effect = lambda source, non_blocking: calls.append(("copy", source, non_blocking))
+
+    container = swap_optimizer.SwapOptimizersContainer
+    container.param_to_device_states_map[param] = {"exp_avg": local_state}
+    container.param_to_cpu_states_map[param] = {"exp_avg": cpu_state}
+    monkeypatch.setattr(
+        swap_optimizer,
+        "get_torch_device",
+        lambda: types.SimpleNamespace(current_stream=lambda: stream),
+    )
+
+    swap_optimizer.SwapOptimizersContainer.swap_states_to_host(param)
+
+    assert calls == [
+        ("copy", local_state, True),
+        ("record_stream", stream),
+        ("resize", 0),
+    ]
