@@ -29,13 +29,9 @@ from typing import Any
 
 import torch
 from cann_ops_transformer import (
-    lightning_indexer,
     lightning_indexer_metadata,
-    sparse_flash_mla,
-    sparse_flash_mla_grad,
     sparse_flash_mla_grad_metadata,
     sparse_flash_mla_metadata,
-    sparse_lightning_indexer_kl_loss_grad,
     sparse_lightning_indexer_kl_loss_grad_metadata,
 )
 from torchtitan.models.common.attention import VarlenMetadata
@@ -333,7 +329,7 @@ class _SparseFlashMLATND(torch.autograd.Function):
         indexer_loss_accumulator,
     ):
         has_compressed = ratio > 1
-        result, softmax_lse = sparse_flash_mla(
+        result, softmax_lse = torch.ops.cann_ops_transformer.sparse_flash_mla.default(
             q,
             ori_kv=swa_k,
             cmp_kv=cmp_k if has_compressed else None,
@@ -411,7 +407,7 @@ class _SparseFlashMLATND(torch.autograd.Function):
             dsinks,
             _,
             cmp_softmax_l1,
-        ) = sparse_flash_mla_grad(
+        ) = torch.ops.cann_ops_transformer.sparse_flash_mla_grad.default(
             q,
             grad_output.contiguous(),
             result,
@@ -454,7 +450,7 @@ class _SparseFlashMLATND(torch.autograd.Function):
                 didx_k,
                 didx_w,
                 indexer_softmax,
-            ) = sparse_lightning_indexer_kl_loss_grad(
+            ) = torch.ops.cann_ops_transformer.sparse_lightning_indexer_kl_loss_grad.default(
                 q=idx_q,
                 k=idx_k,
                 w=idx_w.float(),
@@ -586,20 +582,22 @@ class CANNCompressedSparseInnerAttention(CompressedSparseInnerAttention):
                 .contiguous()
             )
             idx_w = idx_w.flatten(0, 1)
-            cmp_sparse_indices, _ = lightning_indexer(
-                idx_q,
-                idx_k,
-                idx_w.float(),
-                self.index_topk,
-                cu_seqlens_q=metadata.cu_seqlens_q,
-                cu_seqlens_k=plan.cu_seqlens_cmp_k,
-                cmp_residual_k=plan.block_remainder,
-                metadata=npu.li_metadata,
-                layout_q=_LAYOUT,
-                layout_k=_LAYOUT,
-                mask_mode=_CMP_MASK_MODE,
-                cmp_ratio=4,
-                return_value=1,
+            cmp_sparse_indices, _ = (
+                torch.ops.cann_ops_transformer.lightning_indexer.default(
+                    idx_q,
+                    idx_k,
+                    idx_w.float(),
+                    self.index_topk,
+                    cu_seqlens_q=metadata.cu_seqlens_q,
+                    cu_seqlens_k=plan.cu_seqlens_cmp_k,
+                    cmp_residual_k=plan.block_remainder,
+                    metadata=npu.li_metadata,
+                    layout_q=_LAYOUT,
+                    layout_k=_LAYOUT,
+                    mask_mode=_CMP_MASK_MODE,
+                    cmp_ratio=4,
+                    return_value=1,
+                )
             )
 
         indexer_loss_coeff = float(self.indexer_loss_coeff) if self.training else 0.0
