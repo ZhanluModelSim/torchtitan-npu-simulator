@@ -87,9 +87,9 @@ class CompressedBlockLayout:
     produce no compressed KV entry.  ``None`` for ratio-1 plans."""
 
     gather_indices: torch.Tensor | None
-    """Flat int64 indices into ``x.flatten(0, 1)`` for all complete-block
-    tokens, in document-major block order.  Reshape to ``[n_blocks, ratio, D]``
-    after the gather.  ``None`` for ratio-1 plans.
+    """Int64 indices into ``x.flatten(0, 1)`` with shape
+    ``[n_blocks, ratio]``, in document-major block order.  ``None`` for
+    ratio-1 plans.
 
     For CP-shaped streams the positions are the per-segment complete-block
     kgather slices, which degenerate to this contiguous doc-major form
@@ -266,9 +266,9 @@ def _derive_ratio_contract(
             start = k_start + b * ratio
             pieces.append(kgather[start : start + ratio])
     gather = (
-        torch.cat(pieces, dim=0)
+        torch.stack(pieces, dim=0)
         if pieces
-        else torch.empty((0,), dtype=torch.int64, device=device)
+        else torch.empty((0, ratio), dtype=torch.int64, device=device)
     )
     return cu_seqs, torch.tensor(remainder, dtype=torch.int32, device=device), gather
 

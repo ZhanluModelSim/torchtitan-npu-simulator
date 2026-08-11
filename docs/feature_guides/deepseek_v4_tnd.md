@@ -107,7 +107,7 @@ residual       = L - r * compressed_len
 ```text
 cu_seqlens_cmp_k = [0, 2, 6]   # 压缩块：2 + 4
 block_remainder = [2, 1]
-gather_indices   = A0..A7, B0..B15   # 24 个 token，6 个完整块
+gather_indices   = [A0..A3], [A4..A7], ..., [B12..B15]  # [6, 4]
 block_positions  = [0, 4, 0, 4, 8, 12]
 overlap_valid    = [F, T, F, T, T, T]  # 文档起始块没有前驱
 ```

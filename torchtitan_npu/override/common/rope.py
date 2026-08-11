@@ -6,8 +6,8 @@
 
 """Override: provide torch-compatible and CANN fused rotary embeddings.
 
-The workaround variant indexes complex caches through real views; the CANN
-fused variants call ``torch_npu.npu_rotary_mul``.  Select one per RoPE config.
+The workaround variant uses pre-expanded cosine/sine caches; the CANN fused
+variants call ``torch_npu.npu_rotary_mul``. Select one per RoPE config.
 """
 
 from dataclasses import dataclass
@@ -23,36 +23,82 @@ from torchtitan.models.common.rope import (
 )
 
 
-class _WorkaroundComplexCacheMixin:
-    """Replace complex cache indexing without changing its frequencies."""
+class _InterleavedCacheMixin:
+    def __init__(self, config: ComplexRoPE.Config):
+        super().__init__(config)  # pyrefly: ignore [bad-argument-count]
+        self._expand_interleaved_cache()
 
-    cache: torch.Tensor
+    def _init_self_buffers(
+        self,
+        *,
+        buffer_device: torch.device | None = None,
+    ) -> None:
+        super()._init_self_buffers(  # pyrefly: ignore [missing-attribute]
+            buffer_device=buffer_device
+        )
+        self._expand_interleaved_cache()
+
+    def _expand_interleaved_cache(self) -> None:
+        complex_cache = self.cache
+        self.cache = torch.stack(
+            (
+                complex_cache.real.repeat_interleave(2, dim=-1),
+                complex_cache.imag.repeat_interleave(2, dim=-1),
+            )
+        )
 
     def _reshape_cache(
         self,
         query: torch.Tensor,
         positions: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        # Index the complex cache through its real view for Ascend NPU
-        # support.
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         positions = _maybe_wrap_positions(positions, query)
-        complex_query_shape = (*query.shape[:-1], query.shape[-1] // 2)
-        cache_flat = torch.view_as_real(self.cache).flatten(-2, -1)
-        reshaped = _reshape_for_broadcast(cache_flat, complex_query_shape, positions)
-        reshaped = reshaped.view(*reshaped.shape[:-1], -1, 2)
-        return torch.view_as_complex(reshaped)
+        cos_cache, sin_cache = self.cache.unbind(0)
+        return (
+            _reshape_for_broadcast(cos_cache, query.shape, positions),
+            _reshape_for_broadcast(sin_cache, query.shape, positions),
+        )
 
 
-class WorkaroundComplexRoPE(_WorkaroundComplexCacheMixin, ComplexRoPE):
+def _apply_interleaved_rope(
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> torch.Tensor:
+    x_float = x.float()
+    pairs = x_float.reshape(*x.shape[:-1], -1, 2)
+    rotated = torch.stack((-pairs[..., 1], pairs[..., 0]), dim=-1).flatten(-2)
+    return (x_float * cos + rotated * sin).type_as(x)
+
+
+class WorkaroundComplexRoPE(  # pyrefly: ignore [inconsistent-inheritance]
+    _InterleavedCacheMixin, ComplexRoPE
+):
     @dataclass(kw_only=True, slots=True)
     class Config(ComplexRoPE.Config):
         pass
+
+    @staticmethod
+    def apply_rotary_emb(  # pyrefly: ignore [bad-override]
+        query: torch.Tensor,
+        key: torch.Tensor | None,
+        rope_cache: tuple[torch.Tensor, torch.Tensor],
+        *,
+        inverse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        cos, sin = rope_cache
+        if inverse:
+            sin = -sin
+        query_out = _apply_interleaved_rope(query, cos, sin)
+        if key is None:
+            return query_out
+        return query_out, _apply_interleaved_rope(key, cos, sin)
 
 
 @override(
     target=ComplexRoPE.Config,
     exact=True,
-    description="Torch-compatible ComplexRoPE indexing via view_as_real (workaround)",
+    description="Torch-compatible interleaved ComplexRoPE (workaround)",
 )
 def workaround(cfg: ComplexRoPE.Config) -> WorkaroundComplexRoPE.Config:
     return derive(cfg, WorkaroundComplexRoPE.Config)
@@ -68,7 +114,7 @@ class _FirstRowPositionsMixin:
         self,
         query: torch.Tensor,
         positions: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if positions is not None and positions.size(0) > 1:
             positions = positions[0].unsqueeze(0)
         return super()._reshape_cache(  # pyrefly: ignore [missing-attribute]
@@ -76,7 +122,10 @@ class _FirstRowPositionsMixin:
         )
 
 
-class CANNComplexRoPE(_FirstRowPositionsMixin, WorkaroundComplexRoPE):
+class CANNComplexRoPE(
+    _FirstRowPositionsMixin,
+    WorkaroundComplexRoPE,
+):
     @dataclass(kw_only=True, slots=True)
     class Config(WorkaroundComplexRoPE.Config):
         pass
@@ -85,12 +134,13 @@ class CANNComplexRoPE(_FirstRowPositionsMixin, WorkaroundComplexRoPE):
     def apply_rotary_emb(  # pyrefly: ignore [bad-override]
         query: torch.Tensor,
         key: torch.Tensor | None,
-        rope_cache: torch.Tensor,
+        rope_cache: tuple[torch.Tensor, torch.Tensor],
         *,
         inverse: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        cos = rope_cache.real.repeat_interleave(2, dim=-1).to(query.dtype)
-        sin = rope_cache.imag.repeat_interleave(2, dim=-1).to(query.dtype)
+        cos, sin = rope_cache
+        cos = cos.to(query.dtype)
+        sin = sin.to(query.dtype)
         if inverse:
             sin = -sin
         xq_out = torch_npu.npu_rotary_mul(

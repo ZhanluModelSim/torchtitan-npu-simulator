@@ -10,6 +10,12 @@
 #   USE_GOLDEN=1 ./scripts/run_train.sh  # Golden reference
 #   ./scripts/run_train.sh               # Test configuration (default)
 #
+# Optional graph-pattern compile controls:
+#
+#   TORCHINDUCTOR_NPU_EXT_DEBUG=allfallback \
+#   PATTERN_IMPORTS=torchtitan_npu.compile.patterns.deepseek_v4.inplace_partial_rope \
+#   COMPILE_BACKEND=inductor ./scripts/run_train.sh
+#
 # Keep GOLDEN_OVERRIDES unchanged. Edit TEST_OVERRIDES for the implementation
 # under test.
 #
@@ -34,6 +40,7 @@ MODULE=${MODULE:-"torchtitan_npu.models.deepseek_v4"}
 CONFIG=${CONFIG:-"deepseek_v4_debugmodel"}
 COMM_MODE=${COMM_MODE:-""}
 export CLOSE_MATMUL_K_SHIFT=${CLOSE_MATMUL_K_SHIFT:-1}
+export TORCHTITAN_NPU_PATTERN_IMPORTS="${PATTERN_IMPORTS:-${TORCHTITAN_NPU_PATTERN_IMPORTS:-}}"
 
 # The CANN mask handler needs the attention geometry from the selected model
 # config. Keep these values in sync with the DeepSeek-V4 config registry.
@@ -106,6 +113,14 @@ ARGS=(
     --dataloader.dataset-path "${DATASET_PATH:-tests/assets/c4_test}"
     --override.imports "${_override_tokens[@]}"
 )
+
+if [ -n "${COMPILE_BACKEND:-}" ]; then
+    ARGS+=(
+        --compile.enable
+        --compile.components model
+        --compile.backend "${COMPILE_BACKEND}"
+    )
+fi
 
 if [ -n "$COMM_MODE" ]; then
     echo "Running with comm_mode=${COMM_MODE}"

@@ -324,11 +324,12 @@ class Attention(BaseAttention):
 
         swa_k = self.wkv(x)
         swa_k = self.kv_norm(swa_k)
-        kv_nope, kv_rope = torch.split(swa_k, [self.head_dim - rd, rd], dim=-1)
+        kv_bsnd = swa_k.unsqueeze(2)
+        kv_nope, kv_rope = torch.split(kv_bsnd, [self.head_dim - rd, rd], dim=-1)
 
-        q_rope, kv_rope = self.rope(q_rope, kv_rope.unsqueeze(2), positions)
+        q_rope, kv_rope = self.rope(q_rope, kv_rope, positions)
         q = torch.cat([q_nope, q_rope], dim=-1)
-        swa_k = torch.cat([kv_nope, kv_rope.squeeze(2)], dim=-1)
+        swa_k = torch.cat([kv_nope, kv_rope], dim=-1).squeeze(2)
 
         cmp_k = None
         idx_q = idx_k = idx_w = None

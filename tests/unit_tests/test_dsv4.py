@@ -319,7 +319,8 @@ def test_cann_metadata_slim_contract(dsv4):
     assert not hasattr(md, "reference")
     assert md.plans[4].cu_seqlens_cmp_k.shape[0] == 5
     assert md.plans[4].block_remainder.shape[0] == 4
-    assert md.plans[4].gather_indices.numel() == 1024
+    assert md.plans[4].gather_indices.shape == (256, 4)
+    assert md.plans[128].gather_indices.shape == (8, 128)
     assert md.cu_seqlens_q is md.varlen.cu_seq_q
     assert md.cann_plans[4].smla_metadata is not None
     assert md.cann_plans[128].smla_metadata is not None
@@ -421,7 +422,7 @@ def test_layout_gather_indices(dsv4):
                 62,
             ],
             dtype=torch.int64,
-        ),
+        ).reshape(-1, 4),
     )
 
 
@@ -477,7 +478,7 @@ def test_layout_static_blocks(dsv4):
 def test_layout_container_round_trip(dsv4):
     p4 = _build_layout(dsv4, window_size=16).plans[4]
     x = torch.arange(64).view(1, 64).float()
-    block_tokens = x.flatten()[p4.gather_indices].reshape(15, 4)
+    block_tokens = x.flatten()[p4.gather_indices]
     container = torch.zeros(16, dtype=x.dtype)
     container[:15] = block_tokens.sum(dim=1)
     assert container[15] == 0
@@ -488,7 +489,8 @@ def test_layout_ratio128_empty(dsv4):
     md = _build_layout(dsv4, window_size=16)
     p128 = md.plans[128]
     r128 = md.reference.ratios[128]
-    assert p128.gather_indices.numel() == 0 and (r128.doc_of_block < 0).all()
+    assert p128.gather_indices.shape == (0, 128)
+    assert (r128.doc_of_block < 0).all()
     assert r128.dense_mask.shape == (1, 1, 64, 0)
     assert r128.static_blocks.shape[0] == 1  # kv_len = 65 -> window+sink only
 

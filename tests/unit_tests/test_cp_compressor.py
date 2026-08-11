@@ -652,7 +652,9 @@ def verify_unified_contract(cp_meta, ratio):
         ]
     )
     exp_gather = (
-        torch.cat(pieces, dim=0) if pieces else torch.empty((0,), dtype=torch.int64)
+        torch.stack(pieces, dim=0)
+        if pieces
+        else torch.empty((0, ratio), dtype=torch.int64)
     )
     assert torch.equal(plan.cu_seqlens_cmp_k, exp_cu), (plan.cu_seqlens_cmp_k, exp_cu)
     assert torch.equal(plan.block_remainder, torch.tensor(rem, dtype=torch.int32)), (
@@ -695,7 +697,7 @@ def run_case(name, docs, cp_size, lb, dtype=torch.float32, ratio=RATIO):
         packed_oracle = container.flatten(0, 1)[:n_blocks]  # doc-major blocks
     else:
         if n_blocks:
-            bt_full = x_flat[plan.gather_indices].reshape(n_blocks, ratio, -1)
+            bt_full = x_flat[plan.gather_indices]
             bids = torch.arange(n_blocks)
             seq_ids = torch.searchsorted(plan.cu_seqlens_cmp_k[1:], bids, right=True)
             block_local = bids - plan.cu_seqlens_cmp_k[seq_ids]
@@ -724,7 +726,7 @@ def run_case(name, docs, cp_size, lb, dtype=torch.float32, ratio=RATIO):
         doc_blocks[ps] = packed_oracle[cu_b[d] : cu_b[d + 1]]
     # indexer oracle: the same plan with the indexer's own compressor modules
     if n_blocks:
-        bt_full = x_flat[plan.gather_indices].reshape(n_blocks, ratio, -1)
+        bt_full = x_flat[plan.gather_indices]
         bids = torch.arange(n_blocks)
         seq_ids = torch.searchsorted(plan.cu_seqlens_cmp_k[1:], bids, right=True)
         block_local = bids - plan.cu_seqlens_cmp_k[seq_ids]

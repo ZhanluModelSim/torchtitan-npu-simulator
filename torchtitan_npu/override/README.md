@@ -180,7 +180,7 @@ converter 处理后的实际配置类型和 FQN 核对匹配结果。
 | `optimizer.swap` | `OptimizersContainer.Config` | `SwapOptimizersContainer.Config` | 将 Adam/AdamW 的 `exp_avg` 和 `exp_avg_sq` 放入 NPU swap memory |
 | `profiler.cann` | `Profiler.Config` | `CANNProfiler.Config` | 使用 `torch_npu.profiler` 采集 CPU/NPU trace |
 | `rms_norm.cann` | `RMSNorm.Config` | `CANNRMSNorm.Config` | 使用 `torch_npu.npu_rms_norm` |
-| `rope.workaround` | `ComplexRoPE.Config` | `WorkaroundComplexRoPE.Config` | 通过实数视图索引复数 cache；仅精确匹配 `ComplexRoPE.Config` |
+| `rope.workaround` | `ComplexRoPE.Config` | `WorkaroundComplexRoPE.Config` | 预展开 cos/sin cache，并使用 PyTorch 小算子计算 interleaved RoPE；仅精确匹配 `ComplexRoPE.Config` |
 | `rope.cann_complex` | `ComplexRoPE.Config` | `CANNComplexRoPE.Config` | 使用 interleave 模式的 `torch_npu.npu_rotary_mul`；仅精确匹配 |
 | `rope.cann_cossin` | `CosSinRoPE.Config` | `CANNCosSinRoPE.Config` | 使用 half 模式的 `torch_npu.npu_rotary_mul` |
 

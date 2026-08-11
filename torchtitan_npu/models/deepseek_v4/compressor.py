@@ -95,11 +95,10 @@ class Compressor(Module):
 
         # -- gather complete-block tokens from the flat token stream --
         flat_x = x.flatten(0, 1).float()
-        block_tokens = flat_x[plan.gather_indices]
-        n_blocks = plan.gather_indices.numel() // ratio
+        n_blocks = plan.gather_indices.shape[0]
         if n_blocks == 0:
             return x.new_zeros((batch_size, seqlen // ratio, self.head_dim))
-        block_tokens = block_tokens.reshape(n_blocks, ratio, -1)
+        block_tokens = flat_x[plan.gather_indices]
 
         # -- document-local block starts and overlap validity (B=1 contract:
         #    derived per layer from the packed stream, like the removed
@@ -144,16 +143,13 @@ class Compressor(Module):
         # -- softmax pool + norm + RoPE --
         kv = (kv * score.softmax(dim=1)).sum(dim=1)
         kv = self.norm(kv.to(dtype))
-        kv_nope, kv_rope = torch.split(kv, [nope_dim, rd], dim=-1)
-        kv_rope = (
-            self.rope(
-                kv_rope.unsqueeze(0).unsqueeze(2),
-                positions=block_positions.unsqueeze(0),
-            )
-            .squeeze(0)
-            .squeeze(1)
+        kv_bsnd = kv.unsqueeze(0).unsqueeze(2)
+        kv_nope, kv_rope = torch.split(kv_bsnd, [nope_dim, rd], dim=-1)
+        kv_rope = self.rope(
+            kv_rope,
+            positions=block_positions.unsqueeze(0),
         )
-        compressed = torch.cat([kv_nope, kv_rope], dim=-1)
+        compressed = torch.cat([kv_nope, kv_rope], dim=-1).squeeze(0).squeeze(1)
 
         # -- scatter the packed blocks into the container grid --
         container = compressed.new_zeros(
