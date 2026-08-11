@@ -16,11 +16,12 @@ import re
 from typing import Any
 
 import torch
-from torch.distributed.checkpoint import HuggingFaceStorageReader
+from torch.distributed.checkpoint import FileSystemReader, HuggingFaceStorageReader
 from torch.distributed.tensor import DTensor
 from torchtitan.models.deepseek_v3 import DeepSeekV3StateDictAdapter
 from torchtitan.models.utils import MoEStateDictAdapter
 
+from torchtitan_npu.checkpoint import MXFP8HuggingFaceStorageReader
 from torchtitan_npu.tools.weight_utils import (
     _split_w13_for_mapping,
     detect_input_format_by_path,
@@ -258,12 +259,19 @@ class DeepSeekV4StateDictAdapter(DeepSeekV3StateDictAdapter):
     def get_hf_storage_reader(self, path: str, from_quantized: bool = False):
         self._input_format = detect_input_format_by_path(path)
 
-        if self._input_format == "hf":
-            return HuggingFaceStorageReader(path)
-        else:
-            from torch.distributed.checkpoint import FileSystemReader
-
+        if self._input_format != "hf":
+            if from_quantized:
+                raise NotImplementedError(
+                    "Loading quantized DCP checkpoints is not supported; only quantized HF checkpoints are supported."
+                )
             return FileSystemReader(path)
+        if from_quantized:
+            return MXFP8HuggingFaceStorageReader(
+                path=path,
+                thread_count=4,
+                npu_max_inflight=2,
+            )
+        return HuggingFaceStorageReader(path)
 
     def to_hf(self, state_dict: dict[str, Any]) -> dict[str, Any]:
         """Create a load plan/ Convert to HF format"""
@@ -299,9 +307,11 @@ class DeepSeekV4StateDictAdapter(DeepSeekV3StateDictAdapter):
 
     def from_hf_deepseekv4(self, hf_state_dict: dict[str, Any]) -> dict[str, Any]:
         """
-        1. When loading from HF checkpoint, dequantize the weights from float8 to float32.
-        2. Convert between the HF shape and the torchtitan shape.
-        3. Concat separate expert's weight into GroupedExperts' weight.
+        1. Convert between the HF shape and the torchtitan shape.
+        2. Concat separate expert's weight into GroupedExperts' weight.
+
+        Quantized weights are dequantized by the selected storage reader before
+        this layout conversion runs.
         """
 
         state_dict = {}

@@ -8,7 +8,9 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
 import torch
+from torch.distributed.checkpoint import FileSystemReader, HuggingFaceStorageReader
 
 
 def _ensure_package_stub(module_name: str, path: Path) -> None:
@@ -31,6 +33,42 @@ def _load_module(module_name: str, module_path: Path):
     return module
 
 
+def _ensure_torchtitan_stubs() -> None:
+    if importlib.util.find_spec("torchtitan") is not None:
+        return
+
+    torchtitan = types.ModuleType("torchtitan")
+    models = types.ModuleType("torchtitan.models")
+    deepseek_v3 = types.ModuleType("torchtitan.models.deepseek_v3")
+    utils = types.ModuleType("torchtitan.models.utils")
+
+    class MoEStateDictAdapter:
+        def __init__(self, model_args, hf_assets_path=None):
+            self.model_config = model_args
+            self.hf_assets_path = hf_assets_path
+            self.grouped_expert_weight_placements = {}
+            self.grouped_expert_weight_shape = {}
+            self.grouped_expert_weight_mesh = {}
+            self.local_experts_indices = {}
+
+    class DeepSeekV3StateDictAdapter(MoEStateDictAdapter):
+        pass
+
+    deepseek_v3.DeepSeekV3StateDictAdapter = DeepSeekV3StateDictAdapter
+    utils.MoEStateDictAdapter = MoEStateDictAdapter
+    torchtitan.models = models
+    models.deepseek_v3 = deepseek_v3
+    models.utils = utils
+    sys.modules.update(
+        {
+            "torchtitan": torchtitan,
+            "torchtitan.models": models,
+            "torchtitan.models.deepseek_v3": deepseek_v3,
+            "torchtitan.models.utils": utils,
+        }
+    )
+
+
 def _load_dsv4_adapter_class():
     module_name = "torchtitan_npu.models.deepseek_v4.state_dict_adapter"
     if module_name in sys.modules:
@@ -42,6 +80,7 @@ def _load_dsv4_adapter_class():
     _ensure_package_stub("torchtitan_npu.models", npu_root / "models")
     _ensure_package_stub("torchtitan_npu.models.deepseek_v4", npu_root / "models" / "deepseek_v4")
     _ensure_package_stub("torchtitan_npu.tools", npu_root / "tools")
+    _ensure_torchtitan_stubs()
 
     _load_module("torchtitan_npu.tools.weight_utils", npu_root / "tools" / "weight_utils.py")
     module = _load_module(module_name, npu_root / "models" / "deepseek_v4" / "state_dict_adapter.py")
@@ -127,3 +166,20 @@ def test_split_w13_for_mapping_preserves_values_instead_of_placeholders():
     torch.testing.assert_close(split_dict["layers.0.moe.experts.w1"], expected_w1)
     torch.testing.assert_close(split_dict["layers.0.moe.experts.w3"], expected_w3)
     assert "layers.0.attention_norm.weight" in split_dict
+
+
+def test_storage_reader_rejects_quantized_dcp_but_preserves_other_paths(monkeypatch, tmp_path):
+    adapter_module = sys.modules[DeepSeekV4StateDictAdapter.__module__]
+    adapter = DeepSeekV4StateDictAdapter(_make_model_args(), hf_assets_path=None)
+
+    monkeypatch.setattr(adapter_module, "detect_input_format_by_path", lambda _path: "dcp")
+    with pytest.raises(NotImplementedError, match="quantized DCP checkpoints is not supported"):
+        adapter.get_hf_storage_reader(str(tmp_path), from_quantized=True)
+    assert isinstance(adapter.get_hf_storage_reader(str(tmp_path)), FileSystemReader)
+
+    monkeypatch.setattr(adapter_module, "detect_input_format_by_path", lambda _path: "hf")
+    assert isinstance(adapter.get_hf_storage_reader(str(tmp_path)), HuggingFaceStorageReader)
+    assert isinstance(
+        adapter.get_hf_storage_reader(str(tmp_path), from_quantized=True),
+        adapter_module.MXFP8HuggingFaceStorageReader,
+    )
