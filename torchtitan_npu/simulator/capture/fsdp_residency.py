@@ -84,6 +84,12 @@ def _record_fsdp_marker(
             "fsdp_marker": marker,
             "fsdp_group_id": str(id(param_group)),
             "fsdp_module_fqn": module_fqn,
+            "fsdp_param_group_index": int(
+                getattr(param_group, "_param_group_index", -1)
+            ),
+            "fsdp_num_param_groups": int(
+                getattr(param_group, "_num_param_groups", -1)
+            ),
             "fsdp_transition_id": str(
                 getattr(param_group, "_sim_active_transition_id", "") or ""
             ),

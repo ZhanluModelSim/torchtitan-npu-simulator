@@ -1909,6 +1909,128 @@ def test_fsdp_backward_sync_waits_prior_rs_but_not_hsdp_allreduce() -> None:
     assert all(sync.annotations["zero_cost"] is True for sync in syncs)
 
 
+def test_fsdp_backward_sync_handles_overlapping_param_group_regions() -> None:
+    from torchtitan_npu.simulator.capture.communication_ownership import (
+        _FSDPGroupRegion,
+        _add_fsdp_backward_reduction_syncs,
+        _refresh_graph_topology,
+    )
+
+    def node(
+        op_id: int,
+        seq_idx: int,
+        *,
+        predecessors: list[int] | None = None,
+        raw_op_type: str = "aten.mm.default",
+    ) -> OpNode:
+        return OpNode(
+            op_id=op_id,
+            op_type=raw_op_type.removeprefix("comm."),
+            inputs=[],
+            outputs=[],
+            attrs={},
+            predecessors=list(predecessors or []),
+            successors=[],
+            seq_idx=seq_idx,
+            annotations={"raw_op_type": raw_op_type},
+        )
+
+    graph = StepGraph(
+        "s0_B",
+        "B",
+        {
+            100: node(100, 10),
+            600: node(
+                600,
+                35,
+                predecessors=[100],
+                raw_op_type="comm.reduce_scatter",
+            ),
+            200: node(200, 60, predecessors=[100]),
+            201: node(201, 80, predecessors=[200]),
+            601: node(
+                601,
+                95,
+                predecessors=[201],
+                raw_op_type="comm.reduce_scatter",
+            ),
+            300: node(300, 120, predecessors=[201]),
+            602: node(
+                602,
+                135,
+                predecessors=[300],
+                raw_op_type="comm.reduce_scatter",
+            ),
+        },
+    )
+    regions = [
+        _FSDPGroupRegion(
+            "prior",
+            "layers.2",
+            1,
+            30,
+            (100,),
+            (100,),
+            (),
+            0,
+            1,
+        ),
+        _FSDPGroupRegion(
+            "outer",
+            "layers.1",
+            40,
+            90,
+            (200,),
+            (201,),
+            (100,),
+            0,
+            2,
+        ),
+        _FSDPGroupRegion(
+            "inner",
+            "layers.1",
+            50,
+            70,
+            (200,),
+            (200,),
+            (100,),
+            1,
+            2,
+        ),
+        _FSDPGroupRegion(
+            "next",
+            "layers.0",
+            110,
+            130,
+            (300,),
+            (300,),
+            (201,),
+            0,
+            1,
+        ),
+    ]
+
+    _, sync_count = _add_fsdp_backward_reduction_syncs(graph, regions, -1)
+    _refresh_graph_topology(graph)
+
+    syncs = sorted(
+        (
+            item
+            for item in graph.nodes.values()
+            if item.op_type == "FSDP_POST_BACKWARD_SYNC"
+        ),
+        key=lambda item: item.seq_idx,
+    )
+    assert sync_count == 2
+    assert graph.is_acyclic
+    assert syncs[0].seq_idx == 70
+    assert set(syncs[0].predecessors) == {200, 600}
+    assert syncs[0].op_id in graph.nodes[201].predecessors
+    assert syncs[0].op_id not in graph.nodes[200].predecessors
+    assert set(syncs[1].predecessors) == {300, 601}
+    assert syncs[1].op_id in graph.nodes[602].predecessors
+
+
 def test_cross_action_fsdp_prefetch_belongs_to_launch_compute() -> None:
     prefetch = OpNode(
         op_id=300,

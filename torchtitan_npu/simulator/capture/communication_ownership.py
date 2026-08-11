@@ -325,6 +325,8 @@ class _FSDPGroupRegion:
     entry_op_ids: tuple[int, ...]
     exit_op_ids: tuple[int, ...]
     external_predecessors: tuple[int, ...]
+    param_group_index: int = -1
+    num_param_groups: int = -1
 
 
 @dataclass(frozen=True, slots=True)
@@ -488,6 +490,12 @@ def _fsdp_group_regions(
                 entry_op_ids=entries,
                 exit_op_ids=exits,
                 external_predecessors=external_predecessors,
+                param_group_index=int(
+                    wait.annotations.get("fsdp_param_group_index", -1)
+                ),
+                num_param_groups=int(
+                    wait.annotations.get("fsdp_num_param_groups", -1)
+                ),
             )
         )
     return regions
@@ -517,6 +525,25 @@ def _add_fsdp_backward_reduction_syncs(
             module_blocks[-1].append(region)
     if len(module_blocks) < 2:
         return next_synthetic_id, 0
+
+    barrier_regions: list[_FSDPGroupRegion] = []
+    for block in module_blocks:
+        explicit_barriers = [
+            region
+            for region in block
+            if region.num_param_groups > 0
+            and region.param_group_index == region.num_param_groups - 1
+        ]
+        barrier_regions.append(
+            min(
+                explicit_barriers or block,
+                key=lambda region: (
+                    region.release_seq_idx,
+                    -region.wait_seq_idx,
+                    region.group_id,
+                ),
+            )
+        )
 
     reduce_scatters = sorted(
         (
@@ -548,12 +575,11 @@ def _add_fsdp_backward_reduction_syncs(
         prior_reductions = reductions_by_block[block_index - 1]
         if not prior_reductions:
             continue
-        current_block = module_blocks[block_index]
-        first_region = current_block[0]
+        barrier_region = barrier_regions[block_index]
         predecessor_ids = list(
             dict.fromkeys(
                 [
-                    *first_region.exit_op_ids,
+                    *barrier_region.exit_op_ids,
                     *(node.op_id for node in prior_reductions),
                 ]
             )
@@ -580,37 +606,37 @@ def _add_fsdp_backward_reduction_syncs(
                 "raw_op_type": _FSDP_POST_BACKWARD_SYNC_OP,
                 "control_op": True,
                 "zero_cost": True,
-                "fsdp_module_fqn": first_region.module_fqn,
+                "fsdp_module_fqn": barrier_region.module_fqn,
                 "fsdp_prior_module_fqn": prior_module_fqn,
+                "fsdp_barrier_group_id": barrier_region.group_id,
                 "fsdp_waited_reduce_scatter_op_ids": [
                     node.op_id for node in prior_reductions
                 ],
                 "fsdp_sync_scope": "prior_module_reduce_scatter",
             },
-            seq_idx=first_region.release_seq_idx,
+            seq_idx=barrier_region.release_seq_idx,
         )
 
-        gated_regions = list(current_block[1:])
-        if block_index + 1 < len(module_blocks):
-            gated_regions.append(module_blocks[block_index + 1][0])
-        gated_group_ids = {region.group_id for region in gated_regions}
-        gated_node_ids = {
-            node.op_id
-            for node in reductions_by_block[block_index]
+        next_barrier_seq = (
+            barrier_regions[block_index + 1].release_seq_idx
+            if block_index + 1 < len(barrier_regions)
+            else float("inf")
+        )
+        post_barrier_ids = {
+            op_id
+            for op_id, node in graph.nodes.items()
+            if barrier_region.release_seq_idx
+            < node.seq_idx
+            < next_barrier_seq
         }
-        gated_node_ids.update(
-            entry
-            for region in gated_regions
-            for entry in region.entry_op_ids
-        )
-        gated_node_ids.update(
-            node.op_id
-            for node in graph.nodes.values()
-            if node.annotations.get("raw_op_type") == "comm.allgather"
-            and str(node.annotations.get("fsdp_group_id", ""))
-            in gated_group_ids
-            and not node.annotations.get("fsdp_prefetch_source_fqn")
-        )
+        gated_node_ids = {
+            op_id
+            for op_id in post_barrier_ids
+            if not any(
+                predecessor in post_barrier_ids
+                for predecessor in graph.nodes[op_id].predecessors
+            )
+        }
         for gated_id in gated_node_ids:
             gated = graph.nodes.get(gated_id)
             if gated is not None and sync_id not in gated.predecessors:
