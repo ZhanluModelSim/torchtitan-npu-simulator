@@ -108,3 +108,53 @@ model_converters = ModelConvertersContainer.Config(
    - `converters` 顺序错误：`npu_gmm` 未放在 `MXFP8Converter` 之前，导致 MoE 专家层替换失败
    - `fqns` 匹配不到目标模块：检查模块的 FQN 是否包含配置的子字符串（注意大小写敏感）
    - 硬件不满足要求：日志报错 `MXFP8 is only supported on Ascend950 or higher architecture`
+
+## CLI 启动方式
+
+实验目录 `torchtitan_npu/experiments/ao_npu/benchmarks/e2e/dsv4_flash_single_node_train/` 提供 `run_train.sh` 作为低精度训练的启动入口。通过**环境变量**控制量化 recipe，无需修改 Python 代码。该脚本使用 `RecipeQuantizeConverter`，支持多种量化方案一键切换。
+
+```bash
+# 进入实验目录
+cd torchtitan_npu/experiments/ao_npu/benchmarks/e2e/dsv4_flash_single_node_train/
+
+# 默认启动（mix recipe + MXFP4 QAT 开启）
+bash run_train.sh
+
+# 切换量化 recipe
+RECIPE=all_mxfp8 bash run_train.sh
+RECIPE=all_block_fp8 bash run_train.sh
+
+# 关闭 MXFP4 QAT（routed expert 仅用 BlockFP8，不加 FP4 fake-quant）
+RECIPE=mix ENABLE_MXFP4_QAT=false bash run_train.sh
+
+# 完全关闭量化，跑 BF16 基线用于对比
+ENABLE_QUANTIZED_TRAINING=false bash run_train.sh
+```
+
+| 环境变量 | 默认值 | 说明 |
+|---|---|---|
+| `RECIPE` | `mix` | 量化 recipe：`all_mxfp8`、`mix`、`all_block_fp8` |
+| `ENABLE_QUANTIZED_TRAINING` | `true` | 设为 `false` 跳过所有量化 converter，等价于 BF16 训练 |
+| `ENABLE_MXFP4_QAT` | `true` | 设为 `false` 关闭 routed expert 的 MXFP4 fake-quantize |
+| `DST_TYPE_MAX` | `0.0` | MXFP4 QAT 权重 fake-quantize 的目标 dtype max（0.0 = 自动推断） |
+
+**其他训练参数**通过 tyro CLI flag 覆盖，例如：
+
+```bash
+RECIPE=mix ENABLE_MXFP4_QAT=false bash run_train.sh \
+  --training.steps 1000 \
+  --training.global_batch_size 128 \
+  --optimizer.lr 1e-4 \
+  --checkpoint.enable --checkpoint.initial_load_path /path/to/ckpt
+```
+
+**日志输出**：启动时脚本会打印所有环境变量和解析后的最终值，便于确认量化配置是否按预期生效。
+
+```
+==== Benchmark env vars ====
+RECIPE                 = mix
+Enable Quantized Train = true
+Enable MXFP4 QAT       = true
+...
+============================
+```
