@@ -5,11 +5,14 @@
 
 from types import SimpleNamespace
 
+import pytest
+
 import torchtitan_npu.entry as entry_mod
 from torchtitan_npu.entry import (
     _compile_requires_bypass_triton_codegen,
     _has_model_converter,
     _uses_inductor_npu_ext,
+    _validate_simulator_capture_workers,
 )
 
 
@@ -57,3 +60,17 @@ def test_parse_config_uses_current_sys_argv(monkeypatch):  # noqa: ANN001
         "--config",
         "demo",
     ]
+
+
+def test_simulator_worker_validation_rejects_logical_world_torchrun(
+    monkeypatch,
+):  # noqa: ANN001
+    monkeypatch.setenv("RANK", "0")
+    monkeypatch.setenv("WORLD_SIZE", "256")
+    runtime = SimpleNamespace(pp_degree=1, world_size=256)
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"capture world size=256, PP degree=1",
+    ):
+        _validate_simulator_capture_workers(runtime)

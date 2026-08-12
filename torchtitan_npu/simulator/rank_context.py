@@ -91,9 +91,9 @@ class SimulationRankContext:
                 "PP capture requires one initialized worker per pipeline rank; "
                 "RANK/WORLD_SIZE are absent and torch.distributed is not initialized"
             )
-        if pp_degree > 1 and capture_world_size != pp_degree:
+        if capture_world_size != pp_degree:
             raise RuntimeError(
-                "multi_proc_meta requires one real worker per PP rank: "
+                "simulator capture requires one real worker per PP rank: "
                 f"capture world size={capture_world_size}, PP degree={pp_degree}"
             )
         if not 0 <= capture_rank < capture_world_size:

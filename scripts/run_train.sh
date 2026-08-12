@@ -20,7 +20,11 @@ COMM_MODE=${COMM_MODE:-""}
 TORCHFT_LIGHTHOUSE=${TORCHFT_LIGHTHOUSE:-"http://localhost:29510"}
 
 
-if [ -n "$COMM_MODE" ]; then
+if [ "$MODULE" = "torchtitan_npu.simulator" ]; then
+    echo "Running simulator with PP-sized capture workers (logical world_size=${NGPU})"
+    NGPU="${NGPU}" python3 scripts/run_simulator_spawn.py \
+        --config "${CONFIG}" "$@"
+elif [ -n "$COMM_MODE" ]; then
     echo "Running with comm_mode=${COMM_MODE}"
     NGPU="${NGPU}" LOCAL_RANK=0 python3 -m "${TRAIN_FILE}" \
         --module "${MODULE}" --config "${CONFIG}" \

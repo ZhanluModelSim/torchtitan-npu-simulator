@@ -36,6 +36,20 @@ def test_single_process_non_pp_uses_logical_rank_zero(monkeypatch) -> None:
     assert context.logical_global_rank == 0
 
 
+def test_non_pp_capture_rejects_multiple_real_workers(monkeypatch) -> None:
+    monkeypatch.setenv("RANK", "0")
+    monkeypatch.setenv("WORLD_SIZE", "16")
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"capture world size=16, PP degree=1",
+    ):
+        SimulationRankContext.resolve(
+            logical_world_size=16,
+            pp_degree=1,
+        )
+
+
 def test_pp_capture_rejects_implicit_rank_zero(monkeypatch) -> None:
     monkeypatch.delenv("RANK", raising=False)
     monkeypatch.delenv("WORLD_SIZE", raising=False)

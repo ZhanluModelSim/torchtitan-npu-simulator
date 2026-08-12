@@ -49,6 +49,30 @@ def _resolve_simulator_runtime(config, cli_args=None):  # noqa: ANN001, ANN202
     return resolve_simulation_runtime_from_environment(config, cli_args=cli_args)
 
 
+def _validate_simulator_capture_workers(runtime) -> None:  # noqa: ANN001
+    """Reject launchers that confuse logical ranks with capture workers."""
+    if runtime is None:
+        return
+
+    from torchtitan_npu.simulator.rank_context import (
+        configure_simulation_rank_context,
+    )
+
+    context = configure_simulation_rank_context(
+        logical_world_size=runtime.world_size,
+        pp_degree=runtime.pp_degree,
+    )
+    logger.info(
+        "Simulator launch topology: capture_workers=%d, PP=%d, "
+        "logical_world_size=%d, capture_rank=%d, logical_rank=%d",
+        context.capture_world_size,
+        context.pp_degree,
+        context.logical_world_size,
+        context.capture_process_rank,
+        context.logical_global_rank,
+    )
+
+
 def _parse_config(cli_args=None):  # noqa: ANN001, ANN202
     # ConfigManager's default argument captures sys.argv at module import
     # time. Read the current argv explicitly for embedded launchers.
@@ -62,7 +86,8 @@ def main() -> None:
 
     cli_args = sys.argv[1:]
     config = _parse_config(cli_args)
-    _resolve_simulator_runtime(config, cli_args)
+    runtime = _resolve_simulator_runtime(config, cli_args)
+    _validate_simulator_capture_workers(runtime)
 
     trainer = None
 
