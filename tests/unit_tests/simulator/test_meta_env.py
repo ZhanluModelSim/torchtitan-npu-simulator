@@ -393,6 +393,144 @@ def test_patch_keeps_fsdp_shard_submeshes_separate_by_parent(monkeypatch):
         monkeypatch.setattr(_fsdp_param.FSDPParam, "_init_shard_mesh", original)
 
 
+def test_patch_reuses_concatenated_mesh_for_same_mesh_objects(monkeypatch):
+    from torch.distributed.device_mesh import DeviceMesh
+    from torch.distributed.fsdp._fully_shard import _fsdp_param
+
+    class Mesh:
+        device_type = "meta"
+
+    dp_mesh = Mesh()
+    tp_mesh = Mesh()
+    concatenated = object()
+    calls = 0
+    original = DeviceMesh._concatenate
+    original_init = _fsdp_param.FSDPParam._init_sharding_spec_tp
+
+    def concatenate(meshes):
+        nonlocal calls
+        calls += 1
+        assert meshes == [dp_mesh, tp_mesh]
+        return concatenated
+
+    def init_sharding_spec(_self):
+        return DeviceMesh._concatenate([dp_mesh, tp_mesh])
+
+    try:
+        monkeypatch.setattr(DeviceMesh, "_concatenate", staticmethod(concatenate))
+        monkeypatch.setattr(
+            _fsdp_param.FSDPParam,
+            "_init_sharding_spec_tp",
+            init_sharding_spec,
+        )
+        patch_device_type_to_meta()
+        patched_init = _fsdp_param.FSDPParam._init_sharding_spec_tp
+
+        assert patched_init(object()) is concatenated
+        assert patched_init(object()) is concatenated
+        assert calls == 1
+        assert DeviceMesh._concatenate([dp_mesh, tp_mesh]) is concatenated
+        assert calls == 2
+    finally:
+        unpatch_device_type_to_meta()
+        monkeypatch.setattr(DeviceMesh, "_concatenate", staticmethod(original))
+        monkeypatch.setattr(
+            _fsdp_param.FSDPParam,
+            "_init_sharding_spec_tp",
+            original_init,
+        )
+
+
+def test_patch_keeps_concatenated_meshes_separate_by_identity(monkeypatch):
+    from torch.distributed.device_mesh import DeviceMesh
+    from torch.distributed.fsdp._fully_shard import _fsdp_param
+
+    class Mesh:
+        device_type = "meta"
+
+        def __eq__(self, other):
+            return isinstance(other, Mesh)
+
+    first_pair = [Mesh(), Mesh()]
+    second_pair = [Mesh(), Mesh()]
+    calls = 0
+    original = DeviceMesh._concatenate
+    original_init = _fsdp_param.FSDPParam._init_sharding_spec_tp
+
+    def concatenate(meshes):
+        nonlocal calls
+        calls += 1
+        return tuple(meshes)
+
+    def init_sharding_spec(_self, meshes):
+        return DeviceMesh._concatenate(meshes)
+
+    try:
+        monkeypatch.setattr(DeviceMesh, "_concatenate", staticmethod(concatenate))
+        monkeypatch.setattr(
+            _fsdp_param.FSDPParam,
+            "_init_sharding_spec_tp",
+            init_sharding_spec,
+        )
+        patch_device_type_to_meta()
+        patched_init = _fsdp_param.FSDPParam._init_sharding_spec_tp
+
+        first_result = patched_init(object(), first_pair)
+        second_result = patched_init(object(), second_pair)
+        assert first_result is patched_init(object(), first_pair)
+        assert second_result is patched_init(object(), second_pair)
+        assert first_result is not second_result
+        assert calls == 2
+    finally:
+        unpatch_device_type_to_meta()
+        monkeypatch.setattr(DeviceMesh, "_concatenate", staticmethod(original))
+        monkeypatch.setattr(
+            _fsdp_param.FSDPParam,
+            "_init_sharding_spec_tp",
+            original_init,
+        )
+
+
+def test_patch_keeps_non_meta_mesh_concatenation_uncached(monkeypatch):
+    from torch.distributed.device_mesh import DeviceMesh
+    from torch.distributed.fsdp._fully_shard import _fsdp_param
+
+    mesh = SimpleNamespace(device_type="cpu")
+    calls = 0
+    original = DeviceMesh._concatenate
+    original_init = _fsdp_param.FSDPParam._init_sharding_spec_tp
+
+    def concatenate(meshes):
+        nonlocal calls
+        calls += 1
+        return list(meshes)
+
+    def init_sharding_spec(_self):
+        return DeviceMesh._concatenate([mesh])
+
+    try:
+        monkeypatch.setattr(DeviceMesh, "_concatenate", staticmethod(concatenate))
+        monkeypatch.setattr(
+            _fsdp_param.FSDPParam,
+            "_init_sharding_spec_tp",
+            init_sharding_spec,
+        )
+        patch_device_type_to_meta()
+        patched_init = _fsdp_param.FSDPParam._init_sharding_spec_tp
+
+        assert patched_init(object()) == [mesh]
+        assert patched_init(object()) == [mesh]
+        assert calls == 2
+    finally:
+        unpatch_device_type_to_meta()
+        monkeypatch.setattr(DeviceMesh, "_concatenate", staticmethod(original))
+        monkeypatch.setattr(
+            _fsdp_param.FSDPParam,
+            "_init_sharding_spec_tp",
+            original_init,
+        )
+
+
 def test_patch_redirects_tensor_npu_method_to_meta_when_torch_npu_present():
     # Regression test for a real crash found via the 16-layer
     # DeepSeek-V4-Pro smoke run (SMLA sparse attention forward):

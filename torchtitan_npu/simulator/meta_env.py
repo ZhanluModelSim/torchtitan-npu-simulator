@@ -198,6 +198,8 @@ _original_get_stage_indices: Any = _MISSING
 _original_parameter_new: Any = _MISSING
 _original_fsdp_chunk_with_empty: Any = _MISSING
 _original_fsdp_init_shard_mesh: Any = _MISSING
+_original_fsdp_init_sharding_spec_tp: Any = _MISSING
+_original_device_mesh_concatenate: Any = _MISSING
 _patched = False
 
 # Pipeline parallel execution context, updated by patched
@@ -842,18 +844,35 @@ def _patch_fsdp_chunk_with_empty_for_meta() -> None:
     _fsdp_param._chunk_with_empty = _meta_chunk_with_empty
 
 
-def _patch_fsdp_shard_mesh_cache_for_meta() -> None:
-    """Reuse one FSDP shard submesh for parameters on the same parent mesh."""
-    global _original_fsdp_init_shard_mesh
+def _patch_fsdp_mesh_caches_for_meta() -> None:
+    """Reuse parameter-independent FSDP meshes during meta initialization."""
+    global _original_fsdp_init_shard_mesh, _original_fsdp_init_sharding_spec_tp
+    global _original_device_mesh_concatenate
     from torch.distributed.fsdp._fully_shard import _fsdp_param
+    from torch.distributed.device_mesh import DeviceMesh
 
-    if _original_fsdp_init_shard_mesh is not _MISSING:
+    if (
+        _original_fsdp_init_shard_mesh is not _MISSING
+        or _original_fsdp_init_sharding_spec_tp is not _MISSING
+        or _original_device_mesh_concatenate is not _MISSING
+    ):
         return
     _original_fsdp_init_shard_mesh = _fsdp_param.FSDPParam._init_shard_mesh
+    _original_fsdp_init_sharding_spec_tp = (
+        _fsdp_param.FSDPParam._init_sharding_spec_tp
+    )
+    _original_device_mesh_concatenate = DeviceMesh._concatenate
     # DeviceMesh equality is structural, but distinct parent mesh objects may
     # represent different process groups. Key by identity and retain the parent
     # object to guard against Python reusing an id during this patch's lifetime.
-    cache: dict[int, tuple[Any, Any]] = {}
+    shard_mesh_cache: dict[int, tuple[Any, Any]] = {}
+    concatenated_mesh_cache: dict[
+        tuple[int, ...], tuple[tuple[Any, ...], Any]
+    ] = {}
+    concatenate_cache_enabled: contextvars.ContextVar[bool] = contextvars.ContextVar(
+        "fsdp_meta_concatenate_cache_enabled",
+        default=False,
+    )
 
     def _meta_cached_init_shard_mesh(self):  # noqa: ANN001, ANN202
         mesh = self.mesh_info.mesh
@@ -861,14 +880,45 @@ def _patch_fsdp_shard_mesh_cache_for_meta() -> None:
             return _original_fsdp_init_shard_mesh(self)
         if mesh.ndim == 1:
             return mesh
-        cached = cache.get(id(mesh))
+        cached = shard_mesh_cache.get(id(mesh))
         if cached is None or cached[0] is not mesh:
             shard_mesh = _original_fsdp_init_shard_mesh(self)
-            cache[id(mesh)] = (mesh, shard_mesh)
+            shard_mesh_cache[id(mesh)] = (mesh, shard_mesh)
             return shard_mesh
         return cached[1]
 
+    def _meta_cached_concatenate(device_mesh_list):  # noqa: ANN001, ANN202
+        meshes = tuple(device_mesh_list)
+        if (
+            not _is_meta_simulation
+            or not concatenate_cache_enabled.get()
+            or not meshes
+            or any(mesh.device_type not in {"meta", "fake"} for mesh in meshes)
+        ):
+            return _original_device_mesh_concatenate(device_mesh_list)
+        key = tuple(id(mesh) for mesh in meshes)
+        cached = concatenated_mesh_cache.get(key)
+        if cached is None or any(
+            cached_mesh is not mesh
+            for cached_mesh, mesh in zip(cached[0], meshes)
+        ):
+            concatenated = _original_device_mesh_concatenate(device_mesh_list)
+            concatenated_mesh_cache[key] = (meshes, concatenated)
+            return concatenated
+        return cached[1]
+
+    def _meta_cached_init_sharding_spec_tp(self, *args, **kwargs):  # noqa: ANN001, ANN202
+        token = concatenate_cache_enabled.set(True)
+        try:
+            return _original_fsdp_init_sharding_spec_tp(self, *args, **kwargs)
+        finally:
+            concatenate_cache_enabled.reset(token)
+
     _fsdp_param.FSDPParam._init_shard_mesh = _meta_cached_init_shard_mesh
+    _fsdp_param.FSDPParam._init_sharding_spec_tp = (
+        _meta_cached_init_sharding_spec_tp
+    )
+    DeviceMesh._concatenate = staticmethod(_meta_cached_concatenate)
 
 
 def _patch_pipeline_schedule_warmup_for_meta() -> None:
@@ -2837,7 +2887,7 @@ def patch_device_type_to_meta() -> None:
     _patch_li_loss_to_skip_buggy_einsum()
     _neutralize_fsdp_meta_param_validation()
     _patch_fsdp_chunk_with_empty_for_meta()
-    _patch_fsdp_shard_mesh_cache_for_meta()
+    _patch_fsdp_mesh_caches_for_meta()
     _patch_pipeline_schedule_warmup_for_meta()
     _patch_dtensor_meta_to_dtensor_for_meta()
     _patch_rowwise_parallel_output_for_meta()
@@ -2876,6 +2926,8 @@ def unpatch_device_type_to_meta() -> None:
     global _original_fused_adamw
     global _original_llama4_fsdp_mesh_info, _original_maybe_enable_amp, _original_parameter_new
     global _original_fsdp_chunk_with_empty, _original_fsdp_init_shard_mesh
+    global _original_fsdp_init_sharding_spec_tp
+    global _original_device_mesh_concatenate
     for (module_path, attr_name), original in _original_values.items():
         module = importlib.import_module(module_path)
         if original is _MISSING:
@@ -2901,6 +2953,20 @@ def unpatch_device_type_to_meta() -> None:
 
         _fsdp_param.FSDPParam._init_shard_mesh = _original_fsdp_init_shard_mesh
         _original_fsdp_init_shard_mesh = _MISSING
+
+    if _original_fsdp_init_sharding_spec_tp is not _MISSING:
+        from torch.distributed.fsdp._fully_shard import _fsdp_param
+
+        _fsdp_param.FSDPParam._init_sharding_spec_tp = (
+            _original_fsdp_init_sharding_spec_tp
+        )
+        _original_fsdp_init_sharding_spec_tp = _MISSING
+
+    if _original_device_mesh_concatenate is not _MISSING:
+        from torch.distributed.device_mesh import DeviceMesh
+
+        DeviceMesh._concatenate = staticmethod(_original_device_mesh_concatenate)
+        _original_device_mesh_concatenate = _MISSING
 
     if _original_tensor_npu_method is not _MISSING:
         torch.Tensor.npu = _original_tensor_npu_method
