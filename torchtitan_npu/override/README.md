@@ -105,7 +105,7 @@ torchtitan_npu.override.<scope>.<target>.<variant>
 | `torch` | 完全由标准 PyTorch 算子组成的独立实现 |
 | `triton` | Triton kernel 实现 |
 | `workaround` | 保持原计算语义、仅绕过当前后端兼容问题 |
-| 行为名称 | 与计算后端无关的能力，例如 `optimizer.swap` |
+| 行为名称 | 与计算后端无关的能力，例如 `optimizer.virtual` |
 
 同一 target family 中存在多个同类实现时，在 variant 后增加对象或职责限定，例如
 `rope.cann_complex`、`rope.cann_cossin` 和 `sparse_attn.cann_metadata`。不要添加
@@ -118,7 +118,7 @@ Replacement 类采用「variant + target」命名，并保留标准缩写的大�
 | CANN 实现 | `CANNRMSNorm`、`CANNComplexRoPE` |
 | Golden 实现 | `GoldenCompressedSparseInnerAttention` |
 | Workaround 实现 | `WorkaroundComplexRoPE` |
-| 行为实现 | `SwapOptimizersContainer` |
+| 行为实现 | `VirtualOptimizersContainer` |
 | 后端协议或元数据 | `CANNCompressedVarlenMetadata`、`CANNBlockLayoutMetadata` |
 
 不作为公开 override 入口的内部函数和类使用前导下划线。
@@ -177,7 +177,8 @@ converter 处理后的实际配置类型和 FQN 核对匹配结果。
 
 | 入口 | Target | Replacement | 说明 |
 | --- | --- | --- | --- |
-| `optimizer.swap` | `OptimizersContainer.Config` | `SwapOptimizersContainer.Config` | 将 Adam/AdamW 的 `exp_avg` 和 `exp_avg_sq` 放入 NPU swap memory |
+| `optimizer.virtual` | `OptimizersContainer.Config` | `VirtualOptimizersContainer.Config` | 将 Adam/AdamW 的 `exp_avg` 和 `exp_avg_sq` 放入 NPU swap memory |
+| `optimizer.checkpoint_virtual` | `CheckpointManager.Config` | `VirtualCheckpointManager.Config` | 为 Virtual Optimizer 的同步 native DCP 保存关闭 writer copy-ahead |
 | `profiler.cann` | `Profiler.Config` | `CANNProfiler.Config` | 使用 `torch_npu.profiler` 采集 CPU/NPU trace |
 | `rms_norm.cann` | `RMSNorm.Config` | `CANNRMSNorm.Config` | 使用 `torch_npu.npu_rms_norm` |
 | `rope.workaround` | `ComplexRoPE.Config` | `WorkaroundComplexRoPE.Config` | 预展开 cos/sin cache，并使用 PyTorch 小算子计算 interleaved RoPE；仅精确匹配 `ComplexRoPE.Config` |
@@ -187,6 +188,23 @@ converter 处理后的实际配置类型和 FQN 核对匹配结果。
 `rope.workaround` 与 `rope.cann_complex` 会声明同一 target，不能同时启用。
 `CANNComplexRoPE` 和 `CANNCosSinRoPE` 当前都要求同一 batch 内各行的位置布局一致，
 并使用第一行位置构造 batch 共享的 cosine/sine 表。
+
+### Virtual Optimizer 与 checkpoint
+
+Virtual Optimizer 使用 NPU swap memory 保存 Adam/AdamW 的 `exp_avg` 和
+`exp_avg_sq`。通过同步 native DCP 保存和恢复完整训练状态时，应同时启用：
+
+```bash
+--override.imports \
+  torchtitan_npu.override.common.optimizer.virtual,\
+  torchtitan_npu.override.common.optimizer.checkpoint_virtual
+```
+
+`optimizer.virtual` 负责创建 swap-backed optimizer state，`optimizer.checkpoint_virtual`
+负责让同步 native DCP 正确保存这些 live swap tensors。两个入口位于同一模块，但
+作用于不同的配置节点；checkpoint 逻辑是 Virtual Optimizer 的保存兼容处理，不是独立
+checkpoint 特性。完整的数据流、支持范围和限制见
+[Virtual Optimizer 特性说明](../../docs/feature_guides/virtual_optimizer.md)。
 
 ### DeepSeek-V3.2
 

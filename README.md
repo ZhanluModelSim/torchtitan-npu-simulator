@@ -34,7 +34,7 @@ SIG 例会：[sig-framework-adapter](https://meeting.osinfra.cn/cann?sig=sig-fra
 - [May. 2026]: ⚠️ **配置系统重构**：master 分支对齐 torchtitan main 的 `config_registry.py` / `ConfigManager` 机制，模型训练使用 `--module` 和 `--config` 启动，不再通过 `--job.config_file` 加载 TOML。
 - [Apr. 2026]: 🚀 **[DeepSeek-V4-Flash 续训练 0day 支持](https://gitcode.com/cann/cann-recipes-train/blob/master/llm_pretrain/deepseekv4/README.md)**：基于纯FSDP + 大EP极简切分，使能AutoFuse特性，达成训练入图，开箱即优。
 - [Apr. 2026]: 🚀 **【重要特性支持】算子自动融合**：基于AscendC AutoFuse的能力，支持torch.compile + Inductor后端的算子自动融合。
-- [Apr. 2026]: 🚀 **torchtitan‑npu 正式开源**：在 NPU 上支持 4D 并行等 torchtitan 原生特性，并引入 Swap Optimizer 等 NPU 亲和优化。
+- [Apr. 2026]: 🚀 **torchtitan‑npu 正式开源**：在 NPU 上支持 4D 并行等 torchtitan 原生特性，并引入 Virtual Optimizer 等 NPU 亲和优化。
 
 ***
 * [torchtitan-npu 0day 支持 DeepSeek-V4 续训练，助力训练场景轻松入图，开箱即优](https://gitcode.com/cann/cann-recipes-train/blob/master/docs/llm_pretrain/deepseek-v4_torchtitan_npu_autofuse.md)
@@ -126,9 +126,9 @@ pip install -e .
     <!-- 性能优化 -->
     <tr>
       <td rowspan="2">性能优化</td>
-      <td>Swap Optimizer</td>
+      <td><a href="docs/feature_guides/virtual_optimizer.md">Virtual Optimizer</a></td>
       <td>❌</td>
-      <td>❌</td>
+      <td>✅</td>
     </tr>
     <tr>
       <td>NPU 融合算子适配</td>
