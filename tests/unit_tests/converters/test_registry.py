@@ -5,7 +5,10 @@
 
 from contextlib import contextmanager
 
+import torch.nn as nn
+
 from torchtitan_npu.converters import registry
+from torchtitan_npu.converters.kernels import gmm as gmm_module
 
 
 @contextmanager
@@ -69,6 +72,8 @@ def test_core_converter_registrations_exist():
 
     for module_name in (
         "torchtitan_npu.converters.kernels.dsa",
+        "torchtitan_npu.converters.kernels.gmm",
+        "torchtitan_npu.converters.kernels.swiglu_group",
         "torchtitan_npu.converters.kernels.rms_norm",
         "torchtitan_npu.converters.kernels.rope",
         "torchtitan_npu.converters.kernels.inplace_partial_rope",
@@ -80,6 +85,8 @@ def test_core_converter_registrations_exist():
 
     expected_model_converter_names = [
         "npu_dsa",
+        "npu_gmm",
+        "npu_swiglu_group",
         "npu_rms_norm",
         "npu_rope",
         "npu_rope_inplace_partial",
@@ -91,3 +98,19 @@ def test_core_converter_registrations_exist():
         config = registry().get(name)
         assert config is not None, f"{name} should be registered"
         assert config.name == name
+
+    swiglu_config = registry().get("npu_swiglu_group")
+    assert swiglu_config is not None
+    assert swiglu_config.state_dict_updater is gmm_module.GMMStateDictUpdater
+    state_dict_updater_predicate = swiglu_config.state_dict_updater_predicate
+    assert callable(state_dict_updater_predicate)
+    assert state_dict_updater_predicate(nn.Module()) is False
+
+    model_with_npu_grouped_experts = nn.Module()
+    npu_grouped_experts = gmm_module.NpuGroupedExperts.__new__(
+        gmm_module.NpuGroupedExperts
+    )
+    nn.Module.__init__(npu_grouped_experts)
+    model_with_npu_grouped_experts.add_module("experts", npu_grouped_experts)
+    assert state_dict_updater_predicate(model_with_npu_grouped_experts) is True
+    assert registry().get("npu_gmm_swiglu") is None

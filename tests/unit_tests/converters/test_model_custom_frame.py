@@ -23,7 +23,9 @@ from torchtitan_npu.converters.framework.parallelize_plan_update_wrapper import 
 )
 from torchtitan_npu.converters.framework.state_dict_update_wrapper import (
     apply_state_dict_update,
+    get_state_dict_adapter_wrapper,
 )
+from torchtitan_npu.converters.model_custom_interface import ModelCustomConverter
 
 
 @contextmanager
@@ -80,6 +82,19 @@ class TestApplyParallelizePlanUpdater:
 
 
 class TestApplyStateDictUpdateIntegration:
+    @classmethod
+    def test_wrapper_owns_updater_registration(cls):
+        class MockOriginalAdapter:
+            pass
+
+        class CustomStateDictUpdater(StateDictUpdater):
+            pass
+
+        adapter_wrapper = get_state_dict_adapter_wrapper(MockOriginalAdapter)
+
+        assert adapter_wrapper.add_state_dict_updater(CustomStateDictUpdater) is True
+        assert adapter_wrapper.add_state_dict_updater(CustomStateDictUpdater) is False
+
     @classmethod
     def test_apply_state_dict_updater(cls):
         call_order = []
@@ -144,6 +159,93 @@ class TestApplyStateDictUpdateIntegration:
 
         assert result_from_hf.get("updater_from_hf_applied") is True
         assert result_from_hf.get("original_from_hf_applied") is True
+
+    @classmethod
+    def test_duplicate_updater_type_is_applied_once(cls):
+        call_order = []
+
+        class CustomStateDictUpdater(StateDictUpdater):
+            @classmethod
+            def to_hf(cls, state_dict):
+                call_order.append("updater_to_hf")
+                return state_dict
+
+            @classmethod
+            def from_hf(cls, state_dict):
+                call_order.append("updater_from_hf")
+                return state_dict
+
+        class MockOriginalAdapter:
+            @classmethod
+            def to_hf(cls, state_dict):
+                call_order.append("original_to_hf")
+                return state_dict
+
+            @classmethod
+            def from_hf(cls, state_dict):
+                call_order.append("original_from_hf")
+                return state_dict
+
+        train_spec = Mock()
+        train_spec.state_dict_adapter = MockOriginalAdapter
+
+        apply_state_dict_update(CustomStateDictUpdater, train_spec)
+        apply_state_dict_update(CustomStateDictUpdater, train_spec)
+
+        adapter = train_spec.state_dict_adapter()
+        adapter.to_hf({})
+        assert call_order == ["updater_to_hf", "original_to_hf"]
+
+        call_order.clear()
+        adapter.from_hf({})
+        assert call_order == ["original_from_hf", "updater_from_hf"]
+
+
+class TestModelCustomConfigConverter:
+    @classmethod
+    def test_state_dict_updater_predicate_uses_converted_model(cls):
+        class CapabilityConverter(ModelCustomConverter):
+            def convert(self, model):
+                model.has_state_dict_update_capability = model.enable_capability
+
+        class ConditionalStateDictUpdater(StateDictUpdater):
+            @classmethod
+            def to_hf(cls, state_dict):
+                return state_dict
+
+            @classmethod
+            def from_hf(cls, state_dict):
+                return state_dict
+
+        class ConditionalConfig(ModelCustomConfig):
+            name = "conditional_state_dict_update"
+            model_converter = CapabilityConverter
+            state_dict_updater = ConditionalStateDictUpdater
+            state_dict_updater_predicate = staticmethod(
+                lambda model: model.has_state_dict_update_capability
+            )
+
+        class ConditionalConfigConverter(ModelCustomConfigConverter):
+            _model_config = ConditionalConfig
+
+        converter = ConditionalConfigConverter.__new__(ConditionalConfigConverter)
+        converter.model_spec = Mock()
+
+        with patch(
+            "torchtitan_npu.converters.framework.model_custom_config_converter.apply_state_dict_update"
+        ) as mock_apply_state_dict_update:
+            disabled_model = nn.Module()
+            disabled_model.enable_capability = False
+            converter.convert(disabled_model)
+            mock_apply_state_dict_update.assert_not_called()
+
+            enabled_model = nn.Module()
+            enabled_model.enable_capability = True
+            converter.convert(enabled_model)
+            mock_apply_state_dict_update.assert_called_once_with(
+                ConditionalStateDictUpdater,
+                converter.model_spec,
+            )
 
 
 class TestRegisterModelConverter:

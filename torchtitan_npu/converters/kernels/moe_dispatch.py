@@ -18,6 +18,7 @@ from torch.distributed.tensor import DeviceMesh, DTensor
 from torch.distributed.tensor.parallel.style import ParallelStyle
 from torch.distributed.tensor.placement_types import Partial
 from torchtitan.distributed.expert_parallel import ExpertParallel
+from torchtitan.models.common.feed_forward import FeedForward
 from torchtitan.models.common.moe import MoE
 
 from torchtitan_npu.converters.convert_utils import replace_module_with_name
@@ -36,6 +37,7 @@ from torchtitan_npu.distributed.activation_checkpoint import (
     retain_op_output,
 )
 from torchtitan_npu.distributed.process_group import is_fake_process_group
+from torchtitan_npu.models.common.moe import NpuSharedExperts
 from torchtitan_npu.models.deepseek_v4.moe import MoE as DeepSeekV4MoE
 
 NpuTokenDispatchResult = tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]
@@ -185,14 +187,28 @@ def _npu_moe_forward_for_dsv4(self, x, input_ids):
 class NpuMoeDispatchConverter(ModelCustomConverter):
     """Replace MoE modules with NPU MoE dispatch implementations."""
 
+    @staticmethod
+    def _convert_shared_experts(module: nn.Module) -> None:
+        shared_experts = getattr(module, "shared_experts", None)
+        if shared_experts is None or isinstance(shared_experts, NpuSharedExperts):
+            return
+        if not isinstance(shared_experts, FeedForward):
+            raise ValueError("NPU MoE shared_experts must be a FeedForward module.")
+        NpuSharedExperts.convert(shared_experts)
+
     def convert(self, model: nn.Module):
-        for name, module in model.named_modules():
+        for name, module in list(model.named_modules()):
             if isinstance(module, (NpuMoE, NpuDeepSeekV4MoE)):
+                self._convert_shared_experts(module)
                 continue
             if isinstance(module, DeepSeekV4MoE):
-                replace_module_with_name(model, name, _adopt_module_state(NpuDeepSeekV4MoE, module))
+                converted = _adopt_module_state(NpuDeepSeekV4MoE, module)
             elif isinstance(module, MoE):
-                replace_module_with_name(model, name, _adopt_module_state(NpuMoE, module))
+                converted = _adopt_module_state(NpuMoE, module)
+            else:
+                continue
+            self._convert_shared_experts(converted)
+            replace_module_with_name(model, name, converted)
 
 
 class TileLangMoeReduceConverter(ModelCustomConverter):

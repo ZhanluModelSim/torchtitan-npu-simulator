@@ -8,9 +8,15 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torchtitan.models.common.feed_forward import FeedForward
+from torchtitan.models.common.linear import Linear
+from torchtitan.models.common.moe import MoE
 
 from torchtitan_npu.converters.kernels import moe_dispatch, permutation
 from torchtitan_npu.converters.kernels.permutation import NPUMoeReRouting
+from torchtitan_npu.models.common import moe as common_moe
 
 
 def _expert_parallel_module():
@@ -34,6 +40,28 @@ def _call_token_dispatch(parallel_style, inputs, device_mesh):
     return token_dispatch(torch.nn.Module(), inputs, device_mesh)
 
 
+def _feed_forward(dim: int = 2, hidden_dim: int = 2) -> FeedForward:
+    return FeedForward.Config(
+        w1=Linear.Config(in_features=dim, out_features=hidden_dim, bias=False),
+        w2=Linear.Config(in_features=hidden_dim, out_features=dim, bias=False),
+        w3=Linear.Config(in_features=dim, out_features=hidden_dim, bias=False),
+    ).build()
+
+
+def _moe_with_shared_experts() -> MoE:
+    module = MoE.__new__(MoE)
+    nn.Module.__init__(module)
+    module.shared_experts = _feed_forward()
+    return module
+
+
+class _MoeContainer(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.feed_forward = _feed_forward()
+        self.moe = _moe_with_shared_experts()
+
+
 def _call_token_combine(parallel_style, routed_output, device_mesh):
     token_combine = attrgetter("_token_combine")(parallel_style)
     return token_combine(torch.nn.Module(), routed_output, device_mesh)
@@ -51,6 +79,37 @@ def test_moe_dispatch_config_wires_converter_and_plan_updater():
     updater = moe_dispatch.MoeDispatchModelConfig.parallelize_plan_updater
     standard = updater.update(expert_parallel.ExpertParallel())
     assert isinstance(standard, moe_dispatch.NpuExpertParallel)
+
+
+def test_moe_dispatch_installs_native_shared_expert_adapter(
+    prepare_shared_expert_for_conversion,
+):
+    model = _MoeContainer()
+    dense = model.feed_forward
+    shared = model.moe.shared_experts
+    state = prepare_shared_expert_for_conversion(model, shared)
+
+    for linear in state.linears:
+        with torch.no_grad():
+            linear.weight.copy_(torch.eye(2))
+
+    moe_dispatch.NpuMoeDispatchConverter(SimpleNamespace(name="deepseek_v4")).convert(model)
+    converted_shared = model.moe.shared_experts
+    x = torch.tensor([[-3.0, 4.0]])
+    output = converted_shared(x)
+    expected = F.silu(torch.clamp(x, max=2.0)) * torch.clamp(x, min=-2.0, max=2.0)
+
+    assert isinstance(model.moe, moe_dispatch.NpuMoE)
+    assert model.feed_forward is dense
+    assert converted_shared is shared
+    assert isinstance(converted_shared, common_moe.NpuSharedExperts)
+    assert getattr(converted_shared, "_expert_activation_fn") is common_moe.native_shared_expert_activation
+    assert (converted_shared.w1, converted_shared.w2, converted_shared.w3) == state.linears
+    assert converted_shared.conversion_marker is state.marker
+    assert not converted_shared.training
+    assert state.hook_calls == [True]
+    assert tuple(model.state_dict()) == state.state_dict_keys
+    assert torch.allclose(output, expected)
 
 
 def test_tilelang_moe_reduce_config_is_independent_opt_in():

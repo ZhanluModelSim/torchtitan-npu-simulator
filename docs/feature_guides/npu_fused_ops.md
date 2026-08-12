@@ -29,6 +29,7 @@ model_converters = ModelConvertersContainer.Config(
   - [MHCPre](#mhcpre)
   - [MHCPost](#mhcpost)
   - [GMM（Grouped MatMul）](#gmmgrouped-matmul)
+  - [SwigluGroup](#swiglugroup)
   - [NPU MoE Dispatch](#npu-moe-dispatch)
   - [RMSNorm](#rmsnorm)
   - [RoPE](#rope)
@@ -142,10 +143,40 @@ get_model_converter_config("npu_gmm")
 
 -----------
 
+## SwigluGroup
+
+在 MoE 专家 FFN 中，`w1` 和 `w3` 投影结果会组成 gate/up 激活输入。
+常规实现需要依次完成限幅（模型配置 `swiglu_limit` 时）和 SwiGLU 激活；
+调用方传入 routed-score 时，还需对激活结果进行缩放，之后再送入 `w2` 投影。
+`SwigluGroup` 将这些连续的逐元素计算（包括可选的 routed-score 缩放）
+合并为一次算子调用，减少中间张量和算子下发开销。
+
+`npu_swiglu_group` ModelConverter 将共享专家和路由专家的上述激活阶段
+替换为 `cann_ops_nn.swiglu_group`。共享专家仍使用普通线性层，可独立启用；
+路由专家会自动启用 `npu_gmm` 的分组矩阵乘路径，并将两次 GMM 之间的激活
+替换为 `SwigluGroup`。已有的 `npu_gmm` 配置可以保留，两者的先后顺序不影响
+最终转换结果。
+
+启用方式：
+
+```python
+get_model_converter_config("npu_swiglu_group"),
+```
+
+对于包含路由专家的模型，不需要再单独配置 `npu_gmm`。
+
+**ModelConverter 源码路径：** `torchtitan_npu/converters/kernels/swiglu_group.py`
+
+**通用共享专家适配：** `torchtitan_npu/models/common/moe.py`
+
+**相关 NPU 融合算子开发者文档：** [`SwigluGroup`](https://gitcode.com/cann/ops-nn/blob/master/torch_extension/cann_ops_nn/ops/activation/swiglu_group/swiglu_group.md)、[`SwigluGroupBackward`](https://gitcode.com/cann/ops-nn/blob/master/torch_extension/cann_ops_nn/ops/activation/swiglu_group_backward/swiglu_group_backward.md)
+
+-----------
+
 
 ## NPU MoE Dispatch
 
-`npu_moe_dispatch` 面向 DS 系列和 Qwen3 MoE 的标准 `ExpertParallel` 路径。该 ModelConverter 负责接入 NPU MoE dispatch 流程：router 后仍使用 `npu_moe_token_permute` 做第一组 token/expert 聚合，expert 计算后仍使用 unpermute 还原；同时通过并行策略更新器将标准 `ExpertParallel` 替换为 `NpuExpertParallel`。
+`npu_moe_dispatch` 面向 DS 系列和 Qwen3 MoE 的标准 `ExpertParallel` 路径。该 ModelConverter 负责接入 NPU MoE dispatch 流程：router 后仍使用 `npu_moe_token_permute` 做第一组 token/expert 聚合，expert 计算后仍使用 unpermute 还原；同时通过并行策略更新器将标准 `ExpertParallel` 替换为 `NpuExpertParallel`。共享专家的通用 FeedForward 适配也由该层完成，默认使用原生小算子 activation，具体融合算子由后续 converter 注入。
 
 在 EP all-to-all 之后，标准 dispatch 流程需要把 rank-major token layout 重新整理为 local expert-major layout。这里的 `torch_npu.npu_moe_re_routing` 只优化这一段 local reroute：它替换旧路径中的 `repeat_interleave + npu_moe_token_permute`，减少局部重排热点上的冗余算子。
 

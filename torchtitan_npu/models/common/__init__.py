@@ -8,4 +8,9 @@ from .dsa_indexer_loss import (  # noqa: F401
     DSAIndexerLossAutoScaler,
     DSAIndexerLossLoggingHelper,
 )
+from .moe import (  # noqa: F401
+    NpuSharedExperts,
+    SharedExpertActivationFn,
+    native_shared_expert_activation,
+)
 from .npu_varlen_attention import NPUVarlenAttention  # noqa: F401

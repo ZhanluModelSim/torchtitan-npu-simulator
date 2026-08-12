@@ -138,9 +138,14 @@ def _expert_activation(
     return h
 
 
-def _compile_expert_activation(*, backend: str, dynamic_tokens: bool) -> _ExpertActivationFn:
+def _compile_expert_activation(
+    activation_fn: _ExpertActivationFn,
+    *,
+    backend: str,
+    dynamic_tokens: bool,
+) -> _ExpertActivationFn:
     compiled_activation = torch.compile(
-        _expert_activation,
+        activation_fn,
         backend=backend,
         fullgraph=True,
         options={"custom_partitioner_fn": _NpuGmmAotDefaultPartitioner()},
@@ -247,7 +252,7 @@ def npu_grouped_experts_forward(
 
     # DSv4 sets ``self.swiglu_limit`` on its GroupedExperts instance (see
     # torchtitan_npu/models/deepseek_v4/moe.py). Other models leave this unset
-    # and the clamp is skipped in ``_expert_activation``.
+    # and the selected activation skips the clamp.
     swiglu_limit = getattr(self, "swiglu_limit", None)
 
     out = _run_experts_grouped_mm(
@@ -277,10 +282,12 @@ class NpuGroupedExperts(GroupedExperts):
     def __init__(
         self,
         parent: GroupedExperts,
+        *,
+        activation_fn: _ExpertActivationFn = _expert_activation,
     ):
         self.__dict__.update(parent.__dict__)
         self.use_grouped_mm = True
-        self._expert_activation_fn: _ExpertActivationFn = _expert_activation
+        self._expert_activation_fn = activation_fn
         self._expert_activation_compile_key: tuple[str, bool] | None = None
         if self.w1 is not None and self.w3 is not None:
             w13_data = torch.empty(
@@ -320,6 +327,15 @@ class NpuGroupedExperts(GroupedExperts):
     def init_weights(self, init_std: float):
         npu_grouped_experts_init_weights(self, init_std)
 
+    def set_expert_activation(self, activation_fn: _ExpertActivationFn) -> None:
+        self._expert_activation_fn = activation_fn
+        self._expert_activation_compile_key = None
+
+
+def has_npu_grouped_experts(model: nn.Module) -> bool:
+    """Return whether ``model`` contains routed experts backed by NPU GMM."""
+    return any(isinstance(module, NpuGroupedExperts) for module in model.modules())
+
 
 def compile_expert_activation(
     model: nn.Module,
@@ -327,13 +343,14 @@ def compile_expert_activation(
     backend: str,
     dynamic_tokens: bool,
 ) -> None:
-    """Compile the activation bridge for grouped experts in ``model``."""
+    """Compile the selected activation bridge once for grouped experts in ``model``."""
     experts = [module for module in model.modules() if isinstance(module, NpuGroupedExperts)]
     compile_key = (backend, dynamic_tokens)
     if not experts or all(getattr(module, _EXPERT_ACTIVATION_COMPILE_KEY_ATTR) == compile_key for module in experts):
         return
 
     compiled_activation = _compile_expert_activation(
+        getattr(experts[0], _EXPERT_ACTIVATION_FN_ATTR),
         backend=backend,
         dynamic_tokens=dynamic_tokens,
     )
@@ -343,11 +360,22 @@ def compile_expert_activation(
 
 
 class NpuGroupedExpertConverter(ModelCustomConverter):
-    def convert(self, model: nn.Module):
-        for name, module in model.named_modules():
-            if not isinstance(module, GroupedExperts):
+    def convert(self, model: nn.Module) -> None:
+        has_converted_experts = has_npu_grouped_experts(model)
+        converted_experts = False
+        for name, module in list(model.named_modules()):
+            if isinstance(module, NpuGroupedExperts) or not isinstance(module, GroupedExperts):
                 continue
-            replace_module_with_name(model, name, NpuGroupedExperts(module))
+            activation_fn = getattr(module, _EXPERT_ACTIVATION_FN_ATTR, _expert_activation)
+            replace_module_with_name(
+                model,
+                name,
+                NpuGroupedExperts(module, activation_fn=activation_fn),
+            )
+            converted_experts = True
+
+        if has_converted_experts and not converted_experts:
+            logger.warning("npu_gmm is already applied; skipping duplicate conversion.")
 
 
 class GMMStateDictUpdater(StateDictUpdater):

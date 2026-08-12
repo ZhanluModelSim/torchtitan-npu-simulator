@@ -4,6 +4,7 @@
 # LICENSE file in the root directory of this source tree.
 
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -58,3 +59,4 @@ class ModelCustomConfig:
     model_converter: type["ModelCustomConverter"] | None = None
     parallelize_plan_updater: type["ParallelizePlanUpdater"] | None = None
     state_dict_updater: type["StateDictUpdater"] | None = None
+    state_dict_updater_predicate: Callable[[nn.Module], bool] | None = None

@@ -20,6 +20,14 @@ def get_state_dict_adapter_wrapper(cls):
 
         _updater_cls_list: list[type["StateDictUpdater"]] = []
 
+        @classmethod
+        def add_state_dict_updater(cls, updater_cls: type["StateDictUpdater"]) -> bool:
+            """Register an updater once and report whether it was added."""
+            if updater_cls in cls._updater_cls_list:
+                return False
+            cls._updater_cls_list.append(updater_cls)
+            return True
+
         def to_hf(self, state_dict: dict[str, Any]) -> dict[str, Any]:
             """Apply to_hf transformation"""
             for updater_cls in self._updater_cls_list:
@@ -45,12 +53,14 @@ def apply_state_dict_update(updater_cls: type["StateDictUpdater"], model_spec: M
     if state_dict_adapter is None:
         raise RuntimeError("[StateDictUpdateWrapper] TrainSpec.state_dict_adapter is None.")
 
-    if not hasattr(state_dict_adapter, "_updater_cls_list"):
+    if not hasattr(state_dict_adapter, "add_state_dict_updater"):
         adapter_wrapper = get_state_dict_adapter_wrapper(state_dict_adapter)
         model_spec.state_dict_adapter = adapter_wrapper
         state_dict_adapter = adapter_wrapper
 
     # pyrefly: ignore [missing-attribute]
-    state_dict_adapter._updater_cls_list.append(updater_cls)
+    if not state_dict_adapter.add_state_dict_updater(updater_cls):
+        logger.info(f"[StateDictUpdateWrapper] Skip duplicate StateDictUpdater {updater_cls}.")
+        return
 
     logger.info(f"[StateDictUpdateWrapper] Add StateDictUpdater {updater_cls}.")

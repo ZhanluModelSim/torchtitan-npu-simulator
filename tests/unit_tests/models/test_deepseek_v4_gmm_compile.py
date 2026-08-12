@@ -14,6 +14,7 @@ import torch.nn as nn
 import torch_npu
 
 from torchtitan_npu.converters.kernels import gmm as gmm_module
+from torchtitan_npu.converters.kernels import swiglu_group as swiglu_module
 from torchtitan_npu.models.deepseek_v4 import model as model_module
 from torchtitan_npu.models.deepseek_v4 import parallelize
 from torchtitan_npu.patches.torchao_npu import mxfp8_grouped_mm as mxfp8_gmm_module
@@ -21,6 +22,7 @@ from torchtitan_npu.patches.torchao_npu import mxfp8_grouped_mm as mxfp8_gmm_mod
 _EXPERT_ACTIVATION_ATTR = "_expert_activation"
 _EXPERT_ACTIVATION_FN_ATTR = "_expert_activation_fn"
 _EXPERT_ACTIVATION_COMPILE_KEY_ATTR = "_expert_activation_compile_key"
+_COMPILE_CHILDREN_EXCEPT_ATTR = "_compile_children_except"
 _RUN_GROUPED_MM_ATTR = "_run_experts_grouped_mm"
 _GROUPED_MM_ATTR = "_grouped_mm"
 _DYNAMO_ATTR = "_dynamo"
@@ -57,7 +59,7 @@ def test_compile_respects_module_graph_break_requirement(
     monkeypatch.setattr(torch, "compile", fake_compile)
 
     compile_config = SimpleNamespace(backend="inductor_npu")
-    parallelize._compile_children_except(
+    getattr(parallelize, _COMPILE_CHILDREN_EXCEPT_ATTR)(
         module,
         {"inner_attention"},
         compile_config,
@@ -69,10 +71,10 @@ def test_compile_respects_module_graph_break_requirement(
     ]
 
 
-def _new_npu_grouped_experts() -> gmm_module.NpuGroupedExperts:
+def _new_npu_grouped_experts(activation_fn) -> gmm_module.NpuGroupedExperts:
     module = gmm_module.NpuGroupedExperts.__new__(gmm_module.NpuGroupedExperts)
     torch.nn.Module.__init__(module)
-    setattr(module, _EXPERT_ACTIVATION_FN_ATTR, getattr(gmm_module, _EXPERT_ACTIVATION_ATTR))
+    setattr(module, _EXPERT_ACTIVATION_FN_ATTR, activation_fn)
     setattr(module, _EXPERT_ACTIVATION_COMPILE_KEY_ATTR, None)
     return module
 
@@ -226,7 +228,18 @@ def test_retained_output_projection_scopes_sac_to_bmm(monkeypatch):
     assert retained_calls == [(model_module.BMM_SAC_SAVE_OPS, torch.bmm)]
 
 
-def test_compile_expert_activation_is_shared_and_idempotent(monkeypatch):
+@pytest.mark.parametrize(
+    "activation_fn",
+    [
+        getattr(gmm_module, _EXPERT_ACTIVATION_ATTR),
+        swiglu_module.swiglu_group_activation,
+    ],
+    ids=("native", "swiglu_group"),
+)
+def test_compile_expert_activation_selects_mode_and_is_shared_and_idempotent(
+    monkeypatch,
+    activation_fn,
+):
     compile_calls = []
     dynamic_calls = []
     compiled_calls = []
@@ -247,22 +260,24 @@ def test_compile_expert_activation_is_shared_and_idempotent(monkeypatch):
     monkeypatch.setattr(getattr(torch, _DYNAMO_ATTR), "maybe_mark_dynamic", fake_maybe_mark_dynamic)
 
     model = torch.nn.Module()
-    expert_a = _new_npu_grouped_experts()
-    expert_b = _new_npu_grouped_experts()
+    expert_a = _new_npu_grouped_experts(activation_fn)
+    expert_b = _new_npu_grouped_experts(activation_fn)
     model.add_module("expert_a", expert_a)
     model.add_module("expert_b", expert_b)
-    eager_activation = getattr(gmm_module, _EXPERT_ACTIVATION_ATTR)
 
     gmm_module.compile_expert_activation(model, backend="inductor_npu", dynamic_tokens=True)
     gmm_module.compile_expert_activation(model, backend="inductor_npu", dynamic_tokens=True)
 
     assert len(compile_calls) == 1
     fn, backend, fullgraph, options = compile_calls[0]
-    assert fn is eager_activation
+    assert fn is activation_fn
     assert backend == "inductor_npu"
     assert fullgraph is True
     assert options["custom_partitioner_fn"].uuid() == "npu_expert_activation_default_partition"
     assert getattr(expert_a, _EXPERT_ACTIVATION_FN_ATTR) is getattr(expert_b, _EXPERT_ACTIVATION_FN_ATTR)
+    expected_compile_key = ("inductor_npu", True)
+    assert getattr(expert_a, _EXPERT_ACTIVATION_COMPILE_KEY_ATTR) == expected_compile_key
+    assert getattr(expert_b, _EXPERT_ACTIVATION_COMPILE_KEY_ATTR) == expected_compile_key
 
     h = torch.empty((4, 8), device="meta")
     scores = torch.empty((4, 1), device="meta")
@@ -289,12 +304,23 @@ def _fake_mesh(*args, **kwargs):
     return object()
 
 
-def _parallelize_test_model(ac_mode, compile_enabled, tp_enabled=False):
+def _parallelize_test_model(
+    ac_mode,
+    compile_enabled,
+    *,
+    tp_enabled=False,
+    has_npu_grouped_experts=False,
+):
     model = torch.nn.Module()
     post_attention = parallelize.PostAttention.__new__(parallelize.PostAttention)
     torch.nn.Module.__init__(post_attention)
     setattr(post_attention, _RETAIN_OUTPUT_PROJECTION_ATTR, False)
     model.add_module("post_attention", post_attention)
+    if has_npu_grouped_experts:
+        model.add_module(
+            "experts",
+            _new_npu_grouped_experts(getattr(gmm_module, _EXPERT_ACTIVATION_ATTR)),
+        )
     model.model_args = SimpleNamespace(use_global_tnd=False, n_layers=0, compress_ratios=())
     parallel_dims = SimpleNamespace(
         seq_len_divisor=1,
@@ -332,43 +358,26 @@ def _parallelize_test_model(ac_mode, compile_enabled, tp_enabled=False):
     return model
 
 
-@pytest.mark.parametrize(
-    "case",
-    [
-        ("selective", True, True, False, True),
-        ("full", True, True, False, False),
-        ("selective", False, True, False, False),
-        ("selective", True, False, False, False),
-        ("selective", True, True, True, False),
-    ],
-    ids=(
-        "selective-compiled",
-        "full-compiled",
-        "selective-eager",
-        "selective-without-gmm",
-        "selective-compiled-tp",
-    ),
-)
-def test_parallelize_selective_ac_wires_scoped_save_ops(
-    monkeypatch,
-    case,
-):
-    ac_mode, compile_enabled, gmm_enabled, tp_enabled, use_scoped_ac = case
-    save_ops_calls = []
-    scoped_ac_calls = []
-    native_ac_calls = []
-    bridge_compile_calls = []
-    model_compile_calls = []
+def _patch_parallelize_dependencies(monkeypatch, converter_names):
+    calls = SimpleNamespace(
+        save_ops=[],
+        scoped_ac=[],
+        native_ac=[],
+        bridge_compile=[],
+        model_compile=[],
+    )
 
     def record_save_ops(save_ops):
-        save_ops_calls.append(set(save_ops))
+        calls.save_ops.append(set(save_ops))
         return nullcontext()
 
     def has_converter(_converters, name):
-        return gmm_enabled if name == "npu_gmm" else name == "npu_moe_dispatch"
+        if name == "npu_gmm":
+            raise AssertionError("GMM capability must be detected from the converted model")
+        return name in converter_names
 
-    def record_scoped_ac(model, ac_config, save_ops):
-        scoped_ac_calls.append(set(save_ops))
+    def record_scoped_ac(_model, _ac_config, save_ops):
+        calls.scoped_ac.append(set(save_ops))
 
     monkeypatch.setattr(parallelize, "apply_distributed_indexer_loss_tracking", _noop)
     monkeypatch.setattr(parallelize, "find_float8_linear_config", lambda _converters: None)
@@ -378,25 +387,99 @@ def test_parallelize_selective_ac_wires_scoped_save_ops(
     monkeypatch.setattr(parallelize, "apply_moe_ep_tp", _noop)
     monkeypatch.setattr(parallelize, "extend_selective_ac_save_ops", record_save_ops)
     monkeypatch.setattr(parallelize, "apply_scoped_selective_ac", record_scoped_ac)
-    monkeypatch.setattr(parallelize, "apply_ac", _record_call(native_ac_calls))
-    monkeypatch.setattr(gmm_module, "compile_expert_activation", _record_call(bridge_compile_calls))
-    monkeypatch.setattr(parallelize, "apply_compile", _record_call(model_compile_calls))
+    monkeypatch.setattr(parallelize, "apply_ac", _record_call(calls.native_ac))
+    monkeypatch.setattr(gmm_module, "compile_expert_activation", _record_call(calls.bridge_compile))
+    monkeypatch.setattr(parallelize, "apply_compile", _record_call(calls.model_compile))
+    return calls
 
-    model = _parallelize_test_model(ac_mode, compile_enabled, tp_enabled=tp_enabled)
 
+@pytest.mark.parametrize(
+    "case",
+    [
+        ("selective", True, ("npu_gmm", "npu_moe_dispatch"), False, True, True),
+        (
+            "selective",
+            True,
+            ("npu_gmm", "npu_moe_dispatch", "npu_swiglu_group"),
+            False,
+            True,
+            True,
+        ),
+        ("full", True, ("npu_gmm", "npu_moe_dispatch"), False, True, False),
+        ("selective", False, ("npu_gmm", "npu_moe_dispatch"), False, True, False),
+        ("selective", True, ("npu_moe_dispatch",), False, False, False),
+        ("selective", True, ("npu_gmm", "npu_moe_dispatch"), True, True, False),
+        ("selective", True, ("npu_gmm", "npu_swiglu_group"), False, True, False),
+        ("selective", True, ("npu_swiglu_group",), False, True, False),
+        (
+            "selective",
+            True,
+            ("npu_swiglu_group", "npu_moe_dispatch"),
+            False,
+            True,
+            True,
+        ),
+        ("selective", True, ("npu_gmm", "npu_moe_dispatch"), False, False, False),
+    ],
+    ids=(
+        "selective-compiled",
+        "selective-compiled-swiglu-group",
+        "full-compiled",
+        "selective-eager",
+        "selective-without-gmm",
+        "selective-compiled-tp",
+        "selective-without-moe-dispatch",
+        "selective-swiglu-group-only",
+        "selective-auto-gmm-from-swiglu-group",
+        "selective-gmm-config-without-converted-experts",
+    ),
+)
+def test_parallelize_selective_ac_wires_scoped_save_ops(
+    monkeypatch,
+    case,
+):
+    (
+        ac_mode,
+        compile_enabled,
+        converter_names,
+        tp_enabled,
+        has_npu_grouped_experts,
+        use_scoped_ac,
+    ) = case
+    calls = _patch_parallelize_dependencies(monkeypatch, converter_names)
+
+    model = _parallelize_test_model(
+        ac_mode,
+        compile_enabled,
+        tp_enabled=tp_enabled,
+        has_npu_grouped_experts=has_npu_grouped_experts,
+    )
+    effective_gmm = any(
+        isinstance(module, gmm_module.NpuGroupedExperts) for module in model.modules()
+    )
+
+    save_grouped_mm = (
+        ac_mode == "selective"
+        and compile_enabled
+        and effective_gmm
+        and not tp_enabled
+    )
     target_ops = (
         parallelize.BMM_SAC_SAVE_OPS
         | parallelize.ALL_TO_ALL_SAC_SAVE_OPS
         | parallelize.NPU_GMM_SAC_SAVE_OPS
     )
-    expected_scoped_ops = (
-        set(target_ops) if use_scoped_ac else set()
-    )
-    assert scoped_ac_calls == ([expected_scoped_ops] if use_scoped_ac else [])
+    expected_scoped_ops = set(target_ops) if use_scoped_ac else set()
+    assert calls.scoped_ac == ([expected_scoped_ops] if use_scoped_ac else [])
     assert getattr(model.post_attention, _RETAIN_OUTPUT_PROJECTION_ATTR) is use_scoped_ac
-    assert save_ops_calls == ([] if use_scoped_ac else [set()])
-    assert len(native_ac_calls) == int(not use_scoped_ac)
-    assert len(bridge_compile_calls) == int(compile_enabled and gmm_enabled)
-    assert len(model_compile_calls) == int(compile_enabled)
+    expected_native_save_ops = (
+        set(parallelize.NPU_GMM_SAC_SAVE_OPS) if save_grouped_mm else set()
+    )
+    assert calls.save_ops == ([] if use_scoped_ac else [expected_native_save_ops])
+    assert len(calls.native_ac) == int(not use_scoped_ac)
+    assert len(calls.bridge_compile) == int(
+        compile_enabled and effective_gmm
+    )
+    assert len(calls.model_compile) == int(compile_enabled)
     if compile_enabled:
-        assert model_compile_calls[0][1] == {}
+        assert calls.model_compile[0][1] == {}

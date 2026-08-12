@@ -53,7 +53,10 @@ from torchtitan.models.common import FlexAttention, VarlenAttention
 from torchtitan.models.llama3.parallelize import apply_replicate
 from torchtitan.models.llama4.parallelize import apply_fsdp
 
-from torchtitan_npu.converters.kernels.gmm import NPU_GMM_SAC_SAVE_OPS
+from torchtitan_npu.converters.kernels.gmm import (
+    NPU_GMM_SAC_SAVE_OPS,
+    has_npu_grouped_experts,
+)
 from torchtitan_npu.converters.kernels.rms_norm import NPURMSNorm
 from torchtitan_npu.converters.registry import has_npu_converter
 from torchtitan_npu.distributed.activation_checkpoint import (
@@ -429,7 +432,7 @@ def parallelize_deepseek_v4(
             )
 
     model_compile_enabled = compile_config.enable and "model" in compile_config.components
-    npu_gmm_enabled = has_npu_converter(model_converters.converters, "npu_gmm")
+    npu_gmm_enabled = has_npu_grouped_experts(model)
     npu_moe_dispatch_enabled = has_npu_converter(model_converters.converters, "npu_moe_dispatch")
     # TP reduces the GMM2 output in place, which would mutate its retained local value.
     save_grouped_mm_outputs = (

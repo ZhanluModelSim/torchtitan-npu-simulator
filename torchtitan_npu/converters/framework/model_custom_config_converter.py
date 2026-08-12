@@ -57,7 +57,14 @@ class ModelCustomConfigConverter(Configurable, ModelConverter):
                 logger.info(f"[ModelCustomConfigConverter] Applied {parallelize_plan_updater}.")
 
             state_dict_updater = self._model_config.state_dict_updater
-            if state_dict_updater is not None:
+            state_dict_updater_predicate = getattr(
+                self._model_config,
+                "state_dict_updater_predicate",
+                None,
+            )
+            if state_dict_updater is not None and (
+                state_dict_updater_predicate is None or state_dict_updater_predicate(model)
+            ):
                 apply_state_dict_update(state_dict_updater, self.model_spec)
                 logger.info(f"[ModelCustomConfigConverter] Applied {state_dict_updater}.")
 
