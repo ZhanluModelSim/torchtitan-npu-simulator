@@ -152,6 +152,60 @@ def test_patch_promotes_meta_dtensor_to_leaf_parameter(tmp_path):
         dist.destroy_process_group()
 
 
+def test_from_local_backward_accepts_plain_global_gradient_on_meta(tmp_path):
+    import torch.distributed as dist
+    import torch.distributed.tensor._api as dtensor_api
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.tensor import DTensor, Shard
+    from torchtitan_npu.simulator.capture.dispatch_capture import OpDispatchCapture
+
+    class _PlainOutput(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, value):  # noqa: ANN001
+            return torch.empty(value.shape, dtype=value.dtype, device=value.device)
+
+        @staticmethod
+        def backward(ctx, grad_output):  # noqa: ANN001
+            return grad_output
+
+    rendezvous = tmp_path / "dtensor-plain-grad-rendezvous"
+    original_backward = dtensor_api._FromTorchTensor.backward
+    dist.init_process_group(
+        "fake",
+        init_method=f"file://{rendezvous}",
+        rank=0,
+        world_size=2,
+    )
+    try:
+        patch_device_type_to_meta()
+        assert dtensor_api._FromTorchTensor.backward is not original_backward
+        mesh = init_device_mesh("meta", (2,))
+        local = torch.empty(2, 3, device="meta", requires_grad=True)
+        distributed = DTensor.from_local(
+            local,
+            mesh,
+            [Shard(0)],
+            shape=torch.Size((4, 3)),
+            stride=(3, 1),
+            run_check=False,
+        )
+
+        capture = OpDispatchCapture(phase_provider=lambda: "backward")
+        with capture:
+            output = _PlainOutput.apply(distributed)
+            events_before_backward = len(capture._events)
+            output.sum().backward()
+
+        assert local.grad is not None
+        assert local.grad.shape == local.shape
+        internal_ops = capture._events[events_before_backward:]
+        assert all(event.raw_op_type != "aten.slice.Tensor" for event in internal_ops)
+    finally:
+        unpatch_device_type_to_meta()
+        dist.destroy_process_group()
+    assert dtensor_api._FromTorchTensor.backward is original_backward
+
+
 def test_stub_device_module_methods_used_by_trainer_and_metrics_do_not_raise():
     try:
         patch_device_type_to_meta()

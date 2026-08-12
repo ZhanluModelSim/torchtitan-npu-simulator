@@ -182,6 +182,7 @@ _original_li_loss_forward: Any = _MISSING
 _original_pipeline_schedule_warmup_p2p: Any = _MISSING
 _original_window_exchange: tuple[Any, Any] | None = None
 _original_dtensor_meta_to_dtensor: Any = _MISSING
+_original_from_torch_tensor_autograd: Any = _MISSING
 _original_rowwise_prepare_output: Any = _MISSING
 _original_torch_split: Any = _MISSING
 _original_redistribute_local_tensor: Any = _MISSING
@@ -1035,6 +1036,103 @@ def _patch_dtensor_meta_to_dtensor_for_meta() -> None:
         ).requires_grad_(self.requires_grad)
 
     _DTensorMeta.to_dtensor = _meta_safe_to_dtensor
+
+
+def _patch_from_local_backward_for_meta() -> None:
+    """Accept a plain logical gradient at DTensor ``from_local`` boundaries.
+
+    Tensor-parallel output hooks may intentionally return a plain Tensor while
+    their input was a DTensor. PyTorch's ``_FromTorchTensor.backward`` assumes
+    that every such gradient is still a DTensor. During meta simulation, turn
+    the plain logical gradient into the local shard requested by ``from_local``.
+    """
+    global _original_from_torch_tensor_autograd
+    if _original_from_torch_tensor_autograd is not _MISSING:
+        return
+
+    import torch.distributed.tensor._api as dtensor_api
+    from torch.distributed.tensor import DTensor, Replicate
+
+    boundary = dtensor_api._FromTorchTensor
+    original_forward = boundary.forward
+    original_backward = boundary.backward
+    _original_from_torch_tensor_autograd = (original_forward, original_backward)
+
+    @staticmethod
+    def _meta_forward(  # noqa: ANN001
+        ctx,
+        input,
+        device_mesh,
+        placements,
+        run_check,
+        shape=None,
+        stride=None,
+        grad_placements=None,
+    ):
+        ctx.meta_local_shape = input.shape
+        ctx.meta_local_dtype = input.dtype
+        ctx.meta_local_device = input.device
+        return original_forward(
+            ctx,
+            input,
+            device_mesh,
+            placements,
+            run_check,
+            shape,
+            stride,
+            grad_placements,
+        )
+
+    @staticmethod
+    def _meta_backward(ctx, grad_output):  # noqa: ANN001
+        if grad_output is None or isinstance(grad_output, DTensor):
+            return original_backward(ctx, grad_output)
+        if grad_output.device.type != "meta":
+            raise RuntimeError(
+                "Plain gradients at DTensor.from_local boundaries are only supported on meta"
+            )
+        if grad_output.dtype != ctx.meta_local_dtype or grad_output.device != ctx.meta_local_device:
+            raise RuntimeError(
+                "DTensor.from_local gradient dtype or device does not match its local input"
+            )
+
+        local_shape = ctx.meta_local_shape
+        if grad_output.shape == local_shape:
+            local_gradient = grad_output
+        else:
+            from torchtitan_npu.simulator.capture.dispatch_capture import (
+                get_active_capture,
+            )
+
+            normalized = (
+                ctx.grad_placements
+                if ctx.grad_placements is not None
+                else dtensor_api._normalize_placements_for_grad(ctx.forward_input_placements)
+            )
+            capture = get_active_capture()
+            recording = capture.suspend_recording() if capture is not None else nullcontext()
+            with recording:
+                replicated = DTensor.from_local(
+                    grad_output,
+                    device_mesh=ctx.forward_input_device_mesh,
+                    placements=tuple(Replicate() for _ in normalized),
+                    shape=grad_output.shape,
+                    stride=grad_output.stride(),
+                    run_check=False,
+                )
+                local_gradient = replicated.redistribute(
+                    device_mesh=ctx.forward_input_device_mesh,
+                    placements=normalized,
+                ).to_local()
+        if local_gradient.shape != local_shape:
+            raise RuntimeError(
+                f"DTensor.from_local gradient shape {tuple(local_gradient.shape)} does not match "
+                f"its local input shape {tuple(local_shape)}"
+            )
+        return local_gradient, None, None, None, None, None, None
+
+    boundary.forward = _meta_forward
+    boundary.backward = _meta_backward
 
 
 def _patch_rowwise_parallel_output_for_meta() -> None:
@@ -2890,6 +2988,7 @@ def patch_device_type_to_meta() -> None:
     _patch_fsdp_mesh_caches_for_meta()
     _patch_pipeline_schedule_warmup_for_meta()
     _patch_dtensor_meta_to_dtensor_for_meta()
+    _patch_from_local_backward_for_meta()
     _patch_rowwise_parallel_output_for_meta()
     _patch_torch_split_for_meta_dtensor()
     _patch_window_exchange_for_fake_pg()
@@ -2919,7 +3018,8 @@ def unpatch_device_type_to_meta() -> None:
     global _patched, _is_meta_simulation
     global _original_fsdp_validate_no_meta_params, _original_tensor_npu_method, _original_torch_full
     global _original_moe_token_dispatch, _original_grouped_mm, _original_li_loss_forward, _original_pipeline_schedule_warmup_p2p
-    global _original_window_exchange, _original_dtensor_meta_to_dtensor, _original_rowwise_prepare_output
+    global _original_window_exchange, _original_dtensor_meta_to_dtensor, _original_from_torch_tensor_autograd
+    global _original_rowwise_prepare_output
     global _original_torch_split
     global _original_redistribute_local_tensor, _original_recv_object_list, _original_send_object_list
     global _original_torch_equal
@@ -3014,6 +3114,14 @@ def unpatch_device_type_to_meta() -> None:
 
         _DTensorMeta.to_dtensor = _original_dtensor_meta_to_dtensor
         _original_dtensor_meta_to_dtensor = _MISSING
+
+    if _original_from_torch_tensor_autograd is not _MISSING:
+        import torch.distributed.tensor._api as dtensor_api
+
+        original_forward, original_backward = _original_from_torch_tensor_autograd
+        dtensor_api._FromTorchTensor.forward = original_forward
+        dtensor_api._FromTorchTensor.backward = original_backward
+        _original_from_torch_tensor_autograd = _MISSING
 
     if _original_rowwise_prepare_output is not _MISSING:
         from torch.distributed.tensor.parallel.style import RowwiseParallel
