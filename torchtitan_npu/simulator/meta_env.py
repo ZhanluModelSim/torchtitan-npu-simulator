@@ -197,6 +197,7 @@ _original_bwd_weight_one_chunk: Any = _MISSING
 _original_get_stage_indices: Any = _MISSING
 _original_parameter_new: Any = _MISSING
 _original_fsdp_chunk_with_empty: Any = _MISSING
+_original_fsdp_init_shard_mesh: Any = _MISSING
 _patched = False
 
 # Pipeline parallel execution context, updated by patched
@@ -839,6 +840,35 @@ def _patch_fsdp_chunk_with_empty_for_meta() -> None:
         return _original_fsdp_chunk_with_empty(tensor, num_chunks, dim)
 
     _fsdp_param._chunk_with_empty = _meta_chunk_with_empty
+
+
+def _patch_fsdp_shard_mesh_cache_for_meta() -> None:
+    """Reuse one FSDP shard submesh for parameters on the same parent mesh."""
+    global _original_fsdp_init_shard_mesh
+    from torch.distributed.fsdp._fully_shard import _fsdp_param
+
+    if _original_fsdp_init_shard_mesh is not _MISSING:
+        return
+    _original_fsdp_init_shard_mesh = _fsdp_param.FSDPParam._init_shard_mesh
+    # DeviceMesh equality is structural, but distinct parent mesh objects may
+    # represent different process groups. Key by identity and retain the parent
+    # object to guard against Python reusing an id during this patch's lifetime.
+    cache: dict[int, tuple[Any, Any]] = {}
+
+    def _meta_cached_init_shard_mesh(self):  # noqa: ANN001, ANN202
+        mesh = self.mesh_info.mesh
+        if not _is_meta_simulation or mesh.device_type not in {"meta", "fake"}:
+            return _original_fsdp_init_shard_mesh(self)
+        if mesh.ndim == 1:
+            return mesh
+        cached = cache.get(id(mesh))
+        if cached is None or cached[0] is not mesh:
+            shard_mesh = _original_fsdp_init_shard_mesh(self)
+            cache[id(mesh)] = (mesh, shard_mesh)
+            return shard_mesh
+        return cached[1]
+
+    _fsdp_param.FSDPParam._init_shard_mesh = _meta_cached_init_shard_mesh
 
 
 def _patch_pipeline_schedule_warmup_for_meta() -> None:
@@ -2807,6 +2837,7 @@ def patch_device_type_to_meta() -> None:
     _patch_li_loss_to_skip_buggy_einsum()
     _neutralize_fsdp_meta_param_validation()
     _patch_fsdp_chunk_with_empty_for_meta()
+    _patch_fsdp_shard_mesh_cache_for_meta()
     _patch_pipeline_schedule_warmup_for_meta()
     _patch_dtensor_meta_to_dtensor_for_meta()
     _patch_rowwise_parallel_output_for_meta()
@@ -2844,7 +2875,7 @@ def unpatch_device_type_to_meta() -> None:
     global _original_torch_equal
     global _original_fused_adamw
     global _original_llama4_fsdp_mesh_info, _original_maybe_enable_amp, _original_parameter_new
-    global _original_fsdp_chunk_with_empty
+    global _original_fsdp_chunk_with_empty, _original_fsdp_init_shard_mesh
     for (module_path, attr_name), original in _original_values.items():
         module = importlib.import_module(module_path)
         if original is _MISSING:
@@ -2864,6 +2895,12 @@ def unpatch_device_type_to_meta() -> None:
 
         _fsdp_param._chunk_with_empty = _original_fsdp_chunk_with_empty
         _original_fsdp_chunk_with_empty = _MISSING
+
+    if _original_fsdp_init_shard_mesh is not _MISSING:
+        from torch.distributed.fsdp._fully_shard import _fsdp_param
+
+        _fsdp_param.FSDPParam._init_shard_mesh = _original_fsdp_init_shard_mesh
+        _original_fsdp_init_shard_mesh = _MISSING
 
     if _original_tensor_npu_method is not _MISSING:
         torch.Tensor.npu = _original_tensor_npu_method

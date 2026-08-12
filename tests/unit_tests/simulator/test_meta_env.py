@@ -330,6 +330,69 @@ def test_patch_fsdp_chunks_keeps_non_meta_path_unchanged():
         assert _fsdp_param._chunk_with_empty is original
 
 
+def test_patch_reuses_fsdp_shard_submesh_for_same_parent(monkeypatch):
+    from torch.distributed.fsdp._fully_shard import _fsdp_param
+
+    class Mesh:
+        device_type = "meta"
+        ndim = 2
+
+    parent_mesh = Mesh()
+    mesh_info = SimpleNamespace(mesh=parent_mesh)
+    first = SimpleNamespace(mesh_info=mesh_info)
+    second = SimpleNamespace(mesh_info=mesh_info)
+    shard_mesh = object()
+    calls = 0
+    original = _fsdp_param.FSDPParam._init_shard_mesh
+
+    def derive(_self):
+        nonlocal calls
+        calls += 1
+        return shard_mesh
+
+    try:
+        monkeypatch.setattr(_fsdp_param.FSDPParam, "_init_shard_mesh", derive)
+        patch_device_type_to_meta()
+        patched = _fsdp_param.FSDPParam._init_shard_mesh
+
+        assert patched(first) is shard_mesh
+        assert patched(second) is shard_mesh
+        assert calls == 1
+    finally:
+        unpatch_device_type_to_meta()
+        monkeypatch.setattr(_fsdp_param.FSDPParam, "_init_shard_mesh", original)
+
+
+def test_patch_keeps_fsdp_shard_submeshes_separate_by_parent(monkeypatch):
+    from torch.distributed.fsdp._fully_shard import _fsdp_param
+
+    class Mesh:
+        device_type = "meta"
+        ndim = 2
+
+    first = SimpleNamespace(mesh_info=SimpleNamespace(mesh=Mesh()))
+    second = SimpleNamespace(mesh_info=SimpleNamespace(mesh=Mesh()))
+    original = _fsdp_param.FSDPParam._init_shard_mesh
+    calls = 0
+
+    def derive(self):
+        nonlocal calls
+        calls += 1
+        return self.mesh_info.mesh
+
+    try:
+        monkeypatch.setattr(_fsdp_param.FSDPParam, "_init_shard_mesh", derive)
+        patch_device_type_to_meta()
+        patched = _fsdp_param.FSDPParam._init_shard_mesh
+
+        assert patched(first) is first.mesh_info.mesh
+        assert patched(second) is second.mesh_info.mesh
+        assert calls == 2
+    finally:
+        unpatch_device_type_to_meta()
+        monkeypatch.setattr(_fsdp_param.FSDPParam, "_init_shard_mesh", original)
+
+
 def test_patch_redirects_tensor_npu_method_to_meta_when_torch_npu_present():
     # Regression test for a real crash found via the 16-layer
     # DeepSeek-V4-Pro smoke run (SMLA sparse attention forward):
