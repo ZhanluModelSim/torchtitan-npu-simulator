@@ -107,9 +107,7 @@ class CompressedSparseInnerAttention(FlexAttention):
         ).clone()
         if topk_indices is not None:
             cmp_block_of = (seqlen + torch.arange(n_cmp, device=device)) // bk
-            block_of_topk = cmp_block_of[topk_indices].reshape(
-                bsz, n_q_blocks, bq * topk_indices.size(-1)
-            )
+            block_of_topk = cmp_block_of[topk_indices].reshape(bsz, n_q_blocks, bq * topk_indices.size(-1))
             bm[:, 0].scatter_add_(
                 -1,
                 block_of_topk.clamp(0, n_kv_blocks - 1),
@@ -117,13 +115,9 @@ class CompressedSparseInnerAttention(FlexAttention):
             )
         bm = (bm > 0).to(torch.int32)  # pyrefly: ignore [missing-attribute]
         kv_num_blocks = bm.sum(dim=-1).to(torch.int32)
-        kv_indices = torch.argsort(bm, dim=-1, descending=True, stable=True).to(
-            torch.int32
-        )
+        kv_indices = torch.argsort(bm, dim=-1, descending=True, stable=True).to(torch.int32)
 
-        cmp_sel = torch.zeros(
-            bsz, seqlen, max(n_cmp, 1), dtype=torch.bool, device=device
-        )
+        cmp_sel = torch.zeros(bsz, seqlen, max(n_cmp, 1), dtype=torch.bool, device=device)
         if topk_indices is not None:
             cmp_sel.scatter_(2, topk_indices.clamp(0, max(n_cmp, 1) - 1), True)
 
@@ -134,12 +128,8 @@ class CompressedSparseInnerAttention(FlexAttention):
             cmp_local = ref.block_local
         else:
             # No compressed slots: keep the gather safe with dummy values.
-            cmp_doc = torch.full(
-                (bsz, max(n_cmp, 1)), -1, dtype=torch.int32, device=device
-            )
-            cmp_local = torch.full(
-                (bsz, max(n_cmp, 1)), -1, dtype=torch.int32, device=device
-            )
+            cmp_doc = torch.full((bsz, max(n_cmp, 1)), -1, dtype=torch.int32, device=device)
+            cmp_local = torch.full((bsz, max(n_cmp, 1)), -1, dtype=torch.int32, device=device)
 
         def csa_varlen_mask_mod(
             b: torch.Tensor, h: torch.Tensor, q_idx: torch.Tensor, kv_idx: torch.Tensor
@@ -209,13 +199,11 @@ class CompressedSparseInnerAttention(FlexAttention):
         if self.compress_ratio == 4:
             if idx_q is None or idx_k is None or idx_w is None:
                 raise ValueError(
-                    "CompressedSparseInnerAttention requires idx_q, idx_k, and "
-                    "idx_w when compress_ratio=4"
+                    "CompressedSparseInnerAttention requires idx_q, idx_k, and idx_w when compress_ratio=4"
                 )
             if metadata.plans.get(4) is None:
                 raise ValueError(
-                    "CompressedSparseInnerAttention requires the ratio-4 "
-                    "compression layout for indexer selection."
+                    "CompressedSparseInnerAttention requires the ratio-4 compression layout for indexer selection."
                 )
             topk_indices, _ = Indexer.select(
                 idx_q,
@@ -233,9 +221,7 @@ class CompressedSparseInnerAttention(FlexAttention):
         sink_kv = kv.new_zeros((bsz, 1, 1, head_dim))
         kv = torch.cat([kv, sink_kv], dim=1)
 
-        block_mask = self._build_varlen_block_mask(
-            metadata, topk_indices, n_cmp, q.device
-        )
+        block_mask = self._build_varlen_block_mask(metadata, topk_indices, n_cmp, q.device)
 
         def v4_sink_score_mod(score, b, h, q_idx, kv_idx):
             return torch.where(
@@ -285,9 +271,7 @@ class Attention(BaseAttention):
 
         # The CP token dispatcher (the RoutedExperts mirror): a submodule of
         # the attention, wired once by ``Attention.parallelize``.
-        token_dispatcher: CPTokenDispatcher.Config = field(
-            default_factory=CPTokenDispatcher.Config
-        )
+        token_dispatcher: CPTokenDispatcher.Config = field(default_factory=CPTokenDispatcher.Config)
 
     def __init__(self, config: Config):
         super().__init__()
@@ -311,9 +295,7 @@ class Attention(BaseAttention):
         self.wo_b = cfg.wo_b.build()
         # Bare head-wise sink parameter (fp32), matching the inference
         # reference and the kernels' ``[N1]`` sink contract.
-        self.attn_sink = torch.nn.Parameter(
-            torch.empty(cfg.n_heads, dtype=torch.float32)
-        )
+        self.attn_sink = torch.nn.Parameter(torch.empty(cfg.n_heads, dtype=torch.float32))
 
         self.compressor = cfg.compressor.build() if cfg.compressor is not None else None
         self.indexer = cfg.indexer.build() if cfg.indexer is not None else None
@@ -382,9 +364,7 @@ class Attention(BaseAttention):
             idx_k = self.token_dispatcher.select(idx_k, attention_masks.plans[4])
 
         if self.compress_ratio > 1:
-            assert self.compressor is not None, (
-                "compress_ratio > 1 requires the compressor submodule."
-            )
+            assert self.compressor is not None, "compress_ratio > 1 requires the compressor submodule."
             plan = attention_masks.plans[self.compress_ratio]
             pooled = self.compressor(x, attention_masks)
             cmp_k = self.token_dispatcher.select(pooled, plan)

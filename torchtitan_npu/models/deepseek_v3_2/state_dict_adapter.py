@@ -17,18 +17,10 @@ class DeepSeekV32StateDictAdapter(DeepSeekV3StateDictAdapter):
         super().__init__(model_config, hf_assets_path)
         self.from_hf_map.update(
             {
-                "model.layers.{}.self_attn.indexer.wq_b.weight": (
-                    "layers.{}.attention.indexer.wq_b.weight"
-                ),
-                "model.layers.{}.self_attn.indexer.wk.weight": (
-                    "layers.{}.attention.indexer.wk.weight"
-                ),
-                "model.layers.{}.self_attn.indexer.k_norm.weight": (
-                    "layers.{}.attention.indexer.k_norm.weight"
-                ),
-                "model.layers.{}.self_attn.indexer.k_norm.bias": (
-                    "layers.{}.attention.indexer.k_norm.bias"
-                ),
+                "model.layers.{}.self_attn.indexer.wq_b.weight": ("layers.{}.attention.indexer.wq_b.weight"),
+                "model.layers.{}.self_attn.indexer.wk.weight": ("layers.{}.attention.indexer.wk.weight"),
+                "model.layers.{}.self_attn.indexer.k_norm.weight": ("layers.{}.attention.indexer.k_norm.weight"),
+                "model.layers.{}.self_attn.indexer.k_norm.bias": ("layers.{}.attention.indexer.k_norm.bias"),
                 "model.layers.{}.self_attn.indexer.weights_proj.weight": (
                     "layers.{}.attention.indexer.weights_proj.weight"
                 ),

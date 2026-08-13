@@ -29,9 +29,7 @@ def _make_swap(t: torch.Tensor) -> torch.Tensor:
     out = (
         torch.empty_like(local)
         if local.numel() == 0
-        else torch_npu.empty_with_swapped_memory(
-            local.size(), dtype=local.dtype, device=local.device
-        )
+        else torch_npu.empty_with_swapped_memory(local.size(), dtype=local.dtype, device=local.device)
     )
     if isinstance(t, DTensor):
         return DTensor.from_local(

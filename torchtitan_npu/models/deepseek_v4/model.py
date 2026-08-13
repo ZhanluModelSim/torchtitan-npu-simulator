@@ -75,9 +75,7 @@ class DeepSeekV4Model(Decoder):
         n_layers: int
         window_size: int
         block_size: int | tuple[int, int] = _DEFAULT_SPARSE_BLOCK_SIZE
-        metadata_extension: MetadataExtension.Config = field(
-            default_factory=MetadataExtension.Config
-        )
+        metadata_extension: MetadataExtension.Config = field(default_factory=MetadataExtension.Config)
         hc_head: HcHead.Config
 
         def update_from_config(self, *, config, **kwargs):
@@ -90,14 +88,10 @@ class DeepSeekV4Model(Decoder):
                     layer_cfg = self.layers[i]
                     n_heads = layer_cfg.attention.n_heads
                     if n_heads % tp != 0:
-                        raise ValueError(
-                            f"n_heads ({n_heads}) must be divisible by tp ({tp})"
-                        )
+                        raise ValueError(f"n_heads ({n_heads}) must be divisible by tp ({tp})")
                     n_groups = layer_cfg.attention.n_groups
                     if n_groups % tp != 0:
-                        raise ValueError(
-                            f"n_groups ({n_groups}) must be divisible by tp ({tp})"
-                        )
+                        raise ValueError(f"n_groups ({n_groups}) must be divisible by tp ({tp})")
 
             # Context parallel is supported on the CANN fused path only: the
             # model's build_attention_masks derives the per-rank dispatch
@@ -121,9 +115,7 @@ class DeepSeekV4Model(Decoder):
             n_layers = self.n_layers
             head_dim = self.layers[0].attention.head_dim
             n_heads = self.layers[0].attention.n_heads
-            flops_per_token = (
-                6 * non_embed_params + 12 * n_layers * n_heads * head_dim * seq_len
-            )
+            flops_per_token = 6 * non_embed_params + 12 * n_layers * n_heads * head_dim * seq_len
             return total_params, int(flops_per_token)
 
     def __init__(self, config: Config):
@@ -177,9 +169,7 @@ class DeepSeekV4Model(Decoder):
         extra_kwargs["attention_masks"] = common
         return inputs, labels, extra_kwargs
 
-    def _build_cp_metadata(
-        self, inputs, labels, positions, common, cp_mesh, load_balancer_type
-    ):
+    def _build_cp_metadata(self, inputs, labels, positions, common, cp_mesh, load_balancer_type):
         """The context-parallel metadata: shard the tensors via the generic
         path and derive the rank-local plan from the global context (the
         common metadata's varlen + the load-balancer permutation).
@@ -188,15 +178,9 @@ class DeepSeekV4Model(Decoder):
         seq_len = common.seq_len
         cp_size = cp_mesh.size(0)
         if seq_len % cp_size != 0:
-            raise ValueError(
-                f"seq_len ({seq_len}) must be divisible by cp_size ({cp_size})."
-            )
+            raise ValueError(f"seq_len ({seq_len}) must be divisible by cp_size ({cp_size}).")
         shard_len = seq_len // cp_size
-        lb = (
-            _HeadTailLoadBalancer(seq_len, cp_size, cp_mesh.device_type)
-            if load_balancer_type == "headtail"
-            else None
-        )
+        lb = _HeadTailLoadBalancer(seq_len, cp_size, cp_mesh.device_type) if load_balancer_type == "headtail" else None
         (inputs, labels, positions), _ = cp_shard(
             cp_mesh,
             (inputs, labels, positions),

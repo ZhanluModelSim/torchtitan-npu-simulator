@@ -49,9 +49,7 @@ class _AuxLossInjection(torch.autograd.Function):
         return carrier
 
     @staticmethod
-    def typecheck_forward(
-        carrier: torch.Tensor, aux_loss: torch.Tensor
-    ) -> torch.Tensor:
+    def typecheck_forward(carrier: torch.Tensor, aux_loss: torch.Tensor) -> torch.Tensor:
         return _AuxLossInjection.apply(carrier, aux_loss)
 
     @staticmethod
@@ -95,17 +93,13 @@ class LoggedAuxLoss(Module):
         self.reduce_mesh = config.reduce_mesh
         self.global_batch_size = config.global_batch_size
         self._mesh_scale_factor = self._compute_mesh_scale_factor()
-        self.register_buffer(
-            "_acc", torch.zeros((), dtype=torch.float32), persistent=False
-        )
+        self.register_buffer("_acc", torch.zeros((), dtype=torch.float32), persistent=False)
         LoggedAuxLoss._group_counts[(config.reduce_mesh, self.metric_name)] += 1
 
     def _compute_mesh_scale_factor(self) -> float:
         pd = ParallelDims.get()  # pyrefly: ignore [missing-attribute]
         batch_mesh = pd.get_optional_mesh("batch", include_singleton_axes=True)
-        reduce_mesh = pd.get_optional_mesh(
-            self.reduce_mesh, include_singleton_axes=True
-        )
+        reduce_mesh = pd.get_optional_mesh(self.reduce_mesh, include_singleton_axes=True)
 
         return batch_mesh.size() / reduce_mesh.size()
 
@@ -170,6 +164,4 @@ def register_aux_loss_zero_hook(
     model_parts: list[nn.Module],
     parallel_dims: ParallelDims,
 ):
-    optimizers.register_step_pre_hook(
-        lambda *args, **kwargs: LoggedAuxLoss.zero_all(model_parts)
-    )
+    optimizers.register_step_pre_hook(lambda *args, **kwargs: LoggedAuxLoss.zero_all(model_parts))

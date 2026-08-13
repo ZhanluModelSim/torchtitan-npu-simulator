@@ -140,15 +140,11 @@ def _fill_cann_metadata(
         "has_ori_kv": True,
         "has_cmp_kv": has_cmp_kv,
     }
-    record.smla_metadata = sparse_flash_mla_metadata(
-        num_heads, 1, head_dim, **smla_kwargs
-    )
+    record.smla_metadata = sparse_flash_mla_metadata(num_heads, 1, head_dim, **smla_kwargs)
     grad_kwargs: dict[str, Any] = dict(smla_kwargs)
     grad_kwargs.pop("ori_topk_length")
     grad_kwargs.pop("cmp_topk_length")
-    record.smla_grad_metadata = sparse_flash_mla_grad_metadata(
-        num_heads, 1, head_dim, **grad_kwargs
-    )
+    record.smla_grad_metadata = sparse_flash_mla_grad_metadata(num_heads, 1, head_dim, **grad_kwargs)
     if ratio != 4:
         return
 
@@ -340,9 +336,7 @@ class _SparseFlashMLATND(torch.autograd.Function):
             q,
             ori_kv=swa_k,
             cmp_kv=cmp_k if has_compressed else None,
-            cmp_sparse_indices=(
-                cmp_sparse_indices if cmp_sparse_indices is not None else None
-            ),
+            cmp_sparse_indices=(cmp_sparse_indices if cmp_sparse_indices is not None else None),
             ori_block_table=None,
             cmp_block_table=None,
             cu_seqlens_q=cu_seqlens_q,
@@ -504,9 +498,7 @@ class _SparseFlashMLATND(torch.autograd.Function):
         SMLAG's ``cmp_softmax_l1``), scales the indexer grads, and
         accumulates the detached LI loss for logging."""
         if any(x is None for x in (idx_q, idx_k, idx_w, slig_metadata)):
-            raise RuntimeError(
-                "ratio-4 cann requires LI tensors and slig_metadata in backward."
-            )
+            raise RuntimeError("ratio-4 cann requires LI tensors and slig_metadata in backward.")
         (
             didx_q,
             didx_k,
@@ -580,11 +572,7 @@ class CANNCompressedSparseInnerAttention(CompressedSparseInnerAttention):
         TND stream (``[T_cmp, 1, D]``)."""
         asm = plan.cmp_k_global_gather_indices
         flat = container.flatten(0, 1)
-        return (
-            (flat[asm] if asm is not None else flat[: plan.cu_seqlens_cmp_k[-1]])
-            .unsqueeze(1)
-            .contiguous()
-        )
+        return (flat[asm] if asm is not None else flat[: plan.cu_seqlens_cmp_k[-1]]).unsqueeze(1).contiguous()
 
     def forward(
         self,
@@ -599,25 +587,18 @@ class CANNCompressedSparseInnerAttention(CompressedSparseInnerAttention):
         attention_masks=None,
     ):
         if not isinstance(attention_masks, CANNCompressedVarlenMetadata):
-            raise TypeError(
-                "cann requires CANNCompressedVarlenMetadata attention masks."
-            )
+            raise TypeError("cann requires CANNCompressedVarlenMetadata attention masks.")
         if attn_sink is None:
             raise ValueError("CANNCompressedSparseInnerAttention requires attn_sink")
         metadata = attention_masks
         plan = metadata.plans.get(self.compress_ratio)
         if plan is None:
-            raise ValueError(
-                f"No CompressedBlockLayout for ratio={self.compress_ratio}."
-            )
+            raise ValueError(f"No CompressedBlockLayout for ratio={self.compress_ratio}.")
         if self.compress_ratio <= 1:
             if cmp_k is not None and cmp_k.numel() != 0:
                 raise ValueError("ratio-1 cann must not receive compressed KV.")
         elif cmp_k is None or cmp_k.ndim != 3:
-            raise ValueError(
-                "ratio>1 cann requires compressed KV in the container "
-                "layout [B, S//ratio, D]."
-            )
+            raise ValueError("ratio>1 cann requires compressed KV in the container layout [B, S//ratio, D].")
         # q / swa_k shape consistency and the kernel input layouts are
         # validated by the aclnn interface itself.
         npu = metadata.cann_plans[self.compress_ratio]
@@ -629,9 +610,7 @@ class CANNCompressedSparseInnerAttention(CompressedSparseInnerAttention):
         # parallel the window plan's packed cumsum, otherwise the bare
         # ``cu_seq_k`` (identical to ``cu_seq_q`` without CP).
         cu_seqlens_ori_kv = (
-            metadata.window.cu_seqlens_ori_kv
-            if metadata.window is not None
-            else metadata.varlen.cu_seq_k
+            metadata.window.cu_seqlens_ori_kv if metadata.window is not None else metadata.varlen.cu_seq_k
         )
         if cmp_k is not None:
             # The container is the ShardingConfig all-gather's output (under

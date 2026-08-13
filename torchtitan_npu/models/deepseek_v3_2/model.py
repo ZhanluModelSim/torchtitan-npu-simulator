@@ -84,20 +84,12 @@ class Indexer(Module):
                     q_BLNH,
                     {"dp": spmd.S(0), "cp": spmd.S(1), "tp": spmd.S(2)},
                 )
-        q_pe_BLNH, q_nope_BLNH = torch.split(
-            q_BLNH, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
-        )
+        q_pe_BLNH, q_nope_BLNH = torch.split(q_BLNH, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1)
         k_BLD = self.k_norm(self.wk(x_BLD))
-        k_pe_BLD, k_nope_BLD = torch.split(
-            k_BLD, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
-        )
+        k_pe_BLD, k_nope_BLD = torch.split(k_BLD, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1)
         q_pe_BLNH, k_pe_BL1H = self.rope(q_pe_BLNH, k_pe_BLD.unsqueeze(2), positions)
-        idx_q_BLNH = Indexer._hadamard_rotate(
-            torch.cat([q_pe_BLNH, q_nope_BLNH], dim=-1)
-        )
-        idx_k_BL1H = Indexer._hadamard_rotate(
-            torch.cat([k_pe_BL1H.squeeze(2), k_nope_BLD], dim=-1)
-        )
+        idx_q_BLNH = Indexer._hadamard_rotate(torch.cat([q_pe_BLNH, q_nope_BLNH], dim=-1))
+        idx_k_BL1H = Indexer._hadamard_rotate(torch.cat([k_pe_BL1H.squeeze(2), k_nope_BLD], dim=-1))
 
         idx_w_BLN = self.weights_proj(x_BLD) * (self.n_heads**-0.5)
         idx_w_BLN = idx_w_BLN * (self.head_dim**-0.5)
@@ -121,15 +113,9 @@ class Indexer(Module):
         """
         Lkv = idx_k_BL1H.shape[1]
 
-        scores_BLqHLkv = torch.relu(
-            torch.einsum("blhd,bsd->blhs", idx_q_BLNH.float(), idx_k_BL1H.float())
-        )
-        index_scores_BLqLkv = (scores_BLqHLkv * idx_w_BLN.unsqueeze(-1).float()).sum(
-            dim=2
-        )
-        index_scores_BLqLkv = index_scores_BLqLkv.where(
-            dense_mask.squeeze(1), float("-inf")
-        )
+        scores_BLqHLkv = torch.relu(torch.einsum("blhd,bsd->blhs", idx_q_BLNH.float(), idx_k_BL1H.float()))
+        index_scores_BLqLkv = (scores_BLqHLkv * idx_w_BLN.unsqueeze(-1).float()).sum(dim=2)
+        index_scores_BLqLkv = index_scores_BLqLkv.where(dense_mask.squeeze(1), float("-inf"))
 
         k = min(index_topk, Lkv)
         topk_scores_BLqK, topk_indices_BLqK = index_scores_BLqLkv.topk(k, dim=-1)
@@ -236,9 +222,7 @@ class SparseInnerAttention(FlexAttention):
     @dataclass(kw_only=True, slots=True)
     class Config(FlexAttention.Config):
         index_topk: int
-        indexer_loss: SparseIndexerLoss.Config = field(
-            default_factory=SparseIndexerLoss.Config
-        )
+        indexer_loss: SparseIndexerLoss.Config = field(default_factory=SparseIndexerLoss.Config)
 
     def __init__(self, config: Config):
         super().__init__(config)
@@ -276,9 +260,7 @@ class SparseInnerAttention(FlexAttention):
         )
 
         with spmd.no_typecheck():
-            selected_bm = _build_selected_bm(
-                topk_indices_BLqK, block_mask.BLOCK_SIZE, k_BL1H.shape[1]
-            )
+            selected_bm = _build_selected_bm(topk_indices_BLqK, block_mask.BLOCK_SIZE, k_BL1H.shape[1])
 
         output_BLNH = super().forward(
             q_BLNH,
@@ -338,22 +320,16 @@ class Attention(V3Attention):
                     {"dp": spmd.S(0), "cp": spmd.S(1), "tp": spmd.S(2)},
                 )
 
-        q_nope_BLNH, q_pe_BLNH = torch.split(
-            q_BLNH, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
-        )
+        q_nope_BLNH, q_pe_BLNH = torch.split(q_BLNH, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
         kv_BLD = self.wkv_a(x_BLD)
-        kv_nope_BL1H, k_pe_BL1H = torch.split(
-            kv_BLD.unsqueeze(2), [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
-        )
+        kv_nope_BL1H, k_pe_BL1H = torch.split(kv_BLD.unsqueeze(2), [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         kv_nope_BL1H = self.kv_norm(kv_nope_BL1H)
 
         q_pe_BLNH, k_pe_BL1H = self.rope(q_pe_BLNH, k_pe_BL1H, positions)
         q_nope_BLNH = self.w_uk(q_nope_BLNH)
 
-        idx_q_BLNH, idx_k_BL1H, idx_w_BLN = self.indexer(
-            x_BLD.detach(), qr_BLD.detach(), positions=positions
-        )
+        idx_q_BLNH, idx_k_BL1H, idx_w_BLN = self.indexer(x_BLD.detach(), qr_BLD.detach(), positions=positions)
         # ``spmd_types`` cannot yet express the required TP-CP redistribution
         # for ``idx_k``, so mark the TP transition explicitly.
         if get_spmd_backend() == "spmd_types" and spmd.is_type_checking():
@@ -380,20 +356,14 @@ class Attention(V3Attention):
         wkv_key = f"{prefix}wkv_b.weight"
         wkv_b = state_dict.pop(wkv_key)
         wkv_b_3d = wkv_b.view(module.n_heads, -1, module.kv_lora_rank)
-        state_dict[f"{prefix}w_uk.weight"] = (
-            wkv_b_3d[:, : module.qk_nope_head_dim, :].transpose(-2, -1).contiguous()
-        )
-        state_dict[f"{prefix}w_uv.weight"] = wkv_b_3d[
-            :, module.qk_nope_head_dim :, :
-        ].contiguous()
+        state_dict[f"{prefix}w_uk.weight"] = wkv_b_3d[:, : module.qk_nope_head_dim, :].transpose(-2, -1).contiguous()
+        state_dict[f"{prefix}w_uv.weight"] = wkv_b_3d[:, module.qk_nope_head_dim :, :].contiguous()
 
     @staticmethod
     def _merge_wkv_b_on_save(module, state_dict, prefix, local_metadata):
         w_uk = state_dict.pop(f"{prefix}w_uk.weight")
         w_uv = state_dict.pop(f"{prefix}w_uv.weight")
-        wkv_b = torch.cat([w_uk.transpose(-2, -1), w_uv], dim=1).reshape(
-            -1, module.kv_lora_rank
-        )
+        wkv_b = torch.cat([w_uk.transpose(-2, -1), w_uv], dim=1).reshape(-1, module.kv_lora_rank)
         state_dict[f"{prefix}wkv_b.weight"] = wkv_b.contiguous()
 
 
@@ -405,9 +375,7 @@ class DeepSeekV32Model(DeepSeekV3Model):
 
     @dataclass(kw_only=True, slots=True)
     class Config(DeepSeekV3Model.Config):
-        metadata_extension: MetadataExtension.Config = field(
-            default_factory=MetadataExtension.Config
-        )
+        metadata_extension: MetadataExtension.Config = field(default_factory=MetadataExtension.Config)
 
         def update_from_config(self, *, config, **kwargs):
             Decoder.Config.update_from_config(self, config=config, **kwargs)
@@ -460,9 +428,7 @@ class DeepSeekV32Model(DeepSeekV3Model):
                 load_balancer_type,
             )
             masks = extra_kwargs["attention_masks"]
-        attention_masks = (
-            self._build_block_mask(masks) if isinstance(masks, BlockMask) else masks
-        )
+        attention_masks = self._build_block_mask(masks) if isinstance(masks, BlockMask) else masks
         if self._metadata_extension is not None:
             attention_masks = self._metadata_extension(attention_masks)
         extra_kwargs["attention_masks"] = attention_masks

@@ -69,10 +69,7 @@ class _PreAOTPatternPass(CustomGraphPass):
                 if source_file := inspect.getsourcefile(pattern_fn):
                     pattern_files.add(source_file)
                 pattern_key.extend(
-                    f"{key}={value!r}"
-                    for key, value in sorted(
-                        inspect.getclosurevars(pattern_fn).nonlocals.items()
-                    )
+                    f"{key}={value!r}" for key, value in sorted(inspect.getclosurevars(pattern_fn).nonlocals.items())
                 )
         return get_hash_for_files(
             tuple(sorted(pattern_files)),

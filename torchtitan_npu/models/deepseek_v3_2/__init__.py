@@ -183,9 +183,7 @@ def _debugmodel_v3_2(
     return DeepSeekV32Model.Config(
         vocab_size=vocab_size,
         dim=dim,
-        tok_embeddings=Embedding.Config(
-            num_embeddings=vocab_size, embedding_dim=dim, param_init=_EMBEDDING_INIT
-        ),
+        tok_embeddings=Embedding.Config(num_embeddings=vocab_size, embedding_dim=dim, param_init=_EMBEDDING_INIT),
         norm=RMSNorm.Config(normalized_shape=dim, param_init=_NORM_INIT),
         lm_head=Linear.Config(
             in_features=dim,

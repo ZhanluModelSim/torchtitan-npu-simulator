@@ -68,9 +68,7 @@ class DeepSeekV4StateDictAdapter(DeepSeekV3StateDictAdapter):
                 comp = "compressor"
                 self.from_hf_map.update(
                     {
-                        f"layers.{layer_id}.attn.compressor.ape": (
-                            f"layers.{layer_id}.attention.{comp}.ape"
-                        ),
+                        f"layers.{layer_id}.attn.compressor.ape": (f"layers.{layer_id}.attention.{comp}.ape"),
                         f"layers.{layer_id}.attn.compressor.norm.weight": (
                             f"layers.{layer_id}.attention.{comp}.norm.weight"
                         ),
@@ -109,9 +107,7 @@ class DeepSeekV4StateDictAdapter(DeepSeekV3StateDictAdapter):
             if layer_cfg.moe.router.hash:
                 self.from_hf_map.update(
                     {
-                        f"layers.{layer_id}.ffn.gate.tid2eid": (
-                            f"layers.{layer_id}.moe.router.tid2eid"
-                        ),
+                        f"layers.{layer_id}.ffn.gate.tid2eid": (f"layers.{layer_id}.moe.router.tid2eid"),
                     }
                 )
 
@@ -134,9 +130,7 @@ class DeepSeekV4StateDictAdapter(DeepSeekV3StateDictAdapter):
                 new_abstract = to_hf_map[abstract_key]
 
                 if isinstance(value, DTensor):
-                    self.grouped_expert_weight_placements[abstract_key] = (
-                        value.placements
-                    )
+                    self.grouped_expert_weight_placements[abstract_key] = value.placements
                     self.grouped_expert_weight_shape[abstract_key] = value.shape
                     self.grouped_expert_weight_mesh[abstract_key] = value.device_mesh
                     local_fqn = self._get_local_experts_weights(
@@ -147,16 +141,12 @@ class DeepSeekV4StateDictAdapter(DeepSeekV3StateDictAdapter):
                     )
                     hf_state_dict.update(local_fqn)
                 else:
-                    num_experts = (
-                        self.model_config.layers[  # pyrefly: ignore [missing-attribute]
-                            0
-                        ].moe.num_experts
-                    )
+                    num_experts = self.model_config.layers[  # pyrefly: ignore [missing-attribute]
+                        0
+                    ].moe.num_experts
                     split_values = self._split_experts_weights(value, num_experts)
                     for e in range(num_experts):
-                        hf_state_dict[new_abstract.format(layer_num, e)] = split_values[
-                            e
-                        ].squeeze()
+                        hf_state_dict[new_abstract.format(layer_num, e)] = split_values[e].squeeze()
 
             elif "layers" in key:
                 abstract_key = re.sub(r"(\d+)", "{}", key, count=1)
@@ -204,11 +194,9 @@ class DeepSeekV4StateDictAdapter(DeepSeekV3StateDictAdapter):
                         layer_num,
                     )
                 else:
-                    num_experts = (
-                        self.model_config.layers[  # pyrefly: ignore [missing-attribute]
-                            0
-                        ].moe.num_experts
-                    )
+                    num_experts = self.model_config.layers[  # pyrefly: ignore [missing-attribute]
+                        0
+                    ].moe.num_experts
                     stacked = self._concatenate_expert_weights(
                         expert_weights,
                         titan_abstract,

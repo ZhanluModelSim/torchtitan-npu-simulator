@@ -32,9 +32,7 @@ def set_deepseek_v3_2_sharding_config(
 ) -> None:
     set_decoder_sharding_config(config, enable_sp=enable_sp)
     for layer_cfg in config.layers:
-        _set_deepseek_v3_layer_sharding(
-            layer_cfg, enable_sp=enable_sp, enable_ep=enable_ep
-        )
+        _set_deepseek_v3_layer_sharding(layer_cfg, enable_sp=enable_sp, enable_ep=enable_ep)
         _apply_v3_2_attention_sharding(layer_cfg.attention, enable_sp=enable_sp)
 
 

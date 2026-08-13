@@ -50,10 +50,19 @@ repos:
     rev: v0.14.14
     hooks:
       - id: ruff-check
-        args: ["--output-format", "github", "--fix", "--exclude", ".agents/**,tests/**"]
+        args:
+          [
+            "--output-format",
+            "github",
+            "--fix",
+            "--line-length",
+            "120",
+            "--exclude",
+            ".agents/**,tests/**",
+          ]
         types: [python]
       - id: ruff-format
-        args: ["--exclude", ".agents/**,tests/**"]
+        args: ["--line-length", "120", "--exclude", ".agents/**,tests/**"]
         types: [python]
 
   # Spell check

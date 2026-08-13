@@ -1,3 +1,8 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 # Pending upstream PR: https://github.com/pytorch/torchtitan/pull/3864
 
 import functools
@@ -27,15 +32,10 @@ def _resolve_global_batch_size(config) -> int:
         world_size = int(os.environ.get("WORLD_SIZE", "1"))
     parallelism = config.parallelism
     model_parallel_degree = (
-        parallelism.context_parallel_degree
-        * parallelism.tensor_parallel_degree
-        * parallelism.pipeline_parallel_degree
+        parallelism.context_parallel_degree * parallelism.tensor_parallel_degree * parallelism.pipeline_parallel_degree
     )
     if world_size % model_parallel_degree != 0:
-        raise ValueError(
-            "WORLD_SIZE must be divisible by CP * TP * PP to derive the "
-            "aux-loss global batch size."
-        )
+        raise ValueError("WORLD_SIZE must be divisible by CP * TP * PP to derive the aux-loss global batch size.")
     batch_degree = world_size // model_parallel_degree
     training.global_batch_size = training.local_batch_size * batch_degree
     return training.global_batch_size
@@ -53,9 +53,7 @@ def patched_update_from_config(self, *, config, **kwargs):
 
 
 def apply() -> None:
-    logger.info(
-        "[PATCH] Decoder.Config.update_from_config -> patched_update_from_config"
-    )
+    logger.info("[PATCH] Decoder.Config.update_from_config -> patched_update_from_config")
     Decoder.Config.update_from_config = patched_update_from_config
 
 

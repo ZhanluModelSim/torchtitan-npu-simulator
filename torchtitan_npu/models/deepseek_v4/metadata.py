@@ -212,15 +212,11 @@ def build_kernel_layout(
     ``build_cp_plan`` instead (guarded below).
     """
     if not hasattr(varlen, "cu_seq_q"):
-        raise TypeError(
-            f"build_kernel_layout expects a varlen stream, got {type(varlen)}."
-        )
+        raise TypeError(f"build_kernel_layout expects a varlen stream, got {type(varlen)}.")
 
     cu_seq_q = varlen.cu_seq_q
     if int(cu_seq_q[0].item()) != 0:
-        raise ValueError(
-            f"varlen stream must start at token 0, got cu_seq_q[0]={cu_seq_q[0]}."
-        )
+        raise ValueError(f"varlen stream must start at token 0, got cu_seq_q[0]={cu_seq_q[0]}.")
     if not torch.equal(cu_seq_q, varlen.cu_seq_k):
         raise ValueError(
             "build_kernel_layout requires a plain stream (cu_seq_q == "
@@ -250,40 +246,23 @@ def build_kernel_layout(
             )
             continue
         if ratio not in (4, 128):
-            raise NotImplementedError(
-                f"CompressedBlockLayout does not support ratio={ratio}; "
-                "expected 1, 4, or 128."
-            )
+            raise NotImplementedError(f"CompressedBlockLayout does not support ratio={ratio}; expected 1, 4, or 128.")
         c_lens = [length // ratio for length in lengths]
         cu_seqs = torch.cat(
             [
                 torch.zeros((1,), dtype=torch.int32, device=device),
-                torch.tensor(c_lens, dtype=torch.int32, device=device).cumsum(
-                    0, dtype=torch.int32
-                ),
+                torch.tensor(c_lens, dtype=torch.int32, device=device).cumsum(0, dtype=torch.int32),
             ]
         )
         pieces = [
-            torch.arange(
-                k_start, k_start + ratio * cnt, dtype=torch.int64, device=device
-            )
+            torch.arange(k_start, k_start + ratio * cnt, dtype=torch.int64, device=device)
             for k_start, cnt in zip(cu[:-1], c_lens, strict=True)
             if cnt
         ]
-        positions = [
-            torch.arange(0, ratio * cnt, ratio, dtype=torch.int32, device=device)
-            for cnt in c_lens
-            if cnt
-        ]
-        gather = (
-            torch.cat(pieces, dim=0)
-            if pieces
-            else torch.empty((0,), dtype=torch.int64, device=device)
-        )
+        positions = [torch.arange(0, ratio * cnt, ratio, dtype=torch.int32, device=device) for cnt in c_lens if cnt]
+        gather = torch.cat(pieces, dim=0) if pieces else torch.empty((0,), dtype=torch.int64, device=device)
         block_positions = (
-            torch.cat(positions, dim=0)
-            if positions
-            else torch.empty((0,), dtype=torch.int32, device=device)
+            torch.cat(positions, dim=0) if positions else torch.empty((0,), dtype=torch.int32, device=device)
         )
         # Doc-start block ids of the docs that actually have blocks
         # (``cu[i] < cu[i+1]``); zero-block docs contribute no blocks to

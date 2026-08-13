@@ -131,9 +131,7 @@ def _window_range(seg: tuple[int, int, int, int], window_size: int) -> tuple[int
     return win_start, seg[1] + seg[3] - win_start
 
 
-def _block_range(
-    seg: tuple[int, int, int, int], doc_len: int, *, ratio: int
-) -> tuple[int, int, int]:
+def _block_range(seg: tuple[int, int, int, int], doc_len: int, *, ratio: int) -> tuple[int, int, int]:
     """``(A, B, strip)`` of the segment's ratio-aligned plan-block region.
 
     ``[A, B)`` covers the segment's complete blocks plus their borrow
@@ -146,11 +144,7 @@ def _block_range(
     p0, seg_len = seg[3], seg[1]
     q0 = p0 + seg_len
     straddle_idx = q0 // ratio
-    straddle = (
-        q0 % ratio != 0
-        and straddle_idx * ratio >= p0
-        and (straddle_idx + 1) * ratio <= doc_len
-    )
+    straddle = q0 % ratio != 0 and straddle_idx * ratio >= p0 and (straddle_idx + 1) * ratio <= doc_len
     b_first = (p0 + ratio - 1) // ratio
     b_last = q0 // ratio - 1
     if b_first <= b_last:
@@ -277,9 +271,7 @@ def _container_slots(segs_all, seg_blocks_all, *, ratio: int):
                 local.setdefault((seg[0], b), (rr, off))
                 off += 1
         max_kept = max(max_kept, off)
-    slots = {
-        (doc, b): owner * max_kept + off for (doc, b), (owner, off) in local.items()
-    }
+    slots = {(doc, b): owner * max_kept + off for (doc, b), (owner, off) in local.items()}
     return slots, max_kept
 
 
@@ -305,9 +297,7 @@ def _assemble_window_plan(
     # The receive slots number the stream-wide foreign order (matching the
     # routing's recv_offsets), so the gather indices run once over all rows.
     win_order, _ = _row_order(win_rows, rank=rank, shard_len=shard_len)
-    cu_ori = torch.tensor([0, *ori_lens], dtype=torch.int32, device=device).cumsum(
-        0, dtype=torch.int32
-    )
+    cu_ori = torch.tensor([0, *ori_lens], dtype=torch.int32, device=device).cumsum(0, dtype=torch.int32)
     return WindowPlan(
         exchange=_build_exchange_plan(routing_row, device),
         gather_indices=_tensor(win_order, device),
@@ -354,28 +344,18 @@ def _assemble_block_plan(
         if block_end <= A:
             continue
         cnt = (block_end - A) // ratio
-        pos_parts.append(
-            torch.arange(A, block_end, ratio, dtype=torch.int32, device=device)
-        )
+        pos_parts.append(torch.arange(A, block_end, ratio, dtype=torch.int32, device=device))
         first.append(pool_start)
         compressed_rows += list(range(pool_start + strip, pool_start + cnt))
         pool_start += cnt
-    block_positions = (
-        torch.cat(pos_parts)
-        if pos_parts
-        else torch.empty((0,), dtype=torch.int32, device=device)
-    )
+    block_positions = torch.cat(pos_parts) if pos_parts else torch.empty((0,), dtype=torch.int32, device=device)
     # The packed kernel tensors (the real causal-prefix counts).
     cu_cmp = [seg[2] // ratio for seg in segs]
     rem = [seg[2] % ratio for seg in segs]
-    cu_cmp_t = torch.tensor([0, *cu_cmp], dtype=torch.int32, device=device).cumsum(
-        0, dtype=torch.int32
-    )
+    cu_cmp_t = torch.tensor([0, *cu_cmp], dtype=torch.int32, device=device).cumsum(0, dtype=torch.int32)
     # ---- compressed-level gather: ownership + assembly ----
     slots, max_kept = _container_slots(segs_all, seg_blocks_all, ratio=ratio)
-    cmp_k_global_gather_indices = [
-        slots[(seg[0], b)] for seg in segs for b in range(seg[2] // ratio)
-    ]
+    cmp_k_global_gather_indices = [slots[(seg[0], b)] for seg in segs for b in range(seg[2] // ratio)]
     return CompressedBlockLayout(
         cu_seqlens_cmp_k=cu_cmp_t,
         block_remainder=torch.tensor(rem, dtype=torch.int32, device=device),
@@ -445,9 +425,7 @@ def build_cp_plan(
         for seg in segs_all[r]:
             win_start, win_len = _window_range(seg, window_size)
             doc = docs[seg[0]]
-            win_foreign[r] += [
-                p for p in doc[win_start : win_start + win_len] if p // shard_len != r
-            ]
+            win_foreign[r] += [p for p in doc[win_start : win_start + win_len] if p // shard_len != r]
     routing = _routing_geometry(win_foreign, shard_len=shard_len, cp_size=cp_size)
     window = _assemble_window_plan(
         my_segs,
@@ -476,9 +454,7 @@ def build_cp_plan(
                 A, B, strip = _block_range(seg, len(docs[seg[0]]), ratio=ratio)
                 block_end = (B // ratio) * ratio
                 seg_blocks_all[r].append((A, block_end, strip))
-                block_foreign[r] += [
-                    p for p in docs[seg[0]][A:block_end] if p // shard_len != r
-                ]
+                block_foreign[r] += [p for p in docs[seg[0]][A:block_end] if p // shard_len != r]
         routing = _routing_geometry(block_foreign, shard_len=shard_len, cp_size=cp_size)
         plans[ratio] = _assemble_block_plan(
             my_segs,
@@ -585,9 +561,7 @@ class CPTokenDispatcher(Configurable):
         transport selection: ``spmd_types`` eager, the native
         ``all_to_all_single`` under compile/tracing or non-spmd backends)."""
         mesh = self.cp_mesh
-        assert mesh is not None, (
-            "CPTokenDispatcher must be wired to a CP mesh before an exchange"
-        )
+        assert mesh is not None, "CPTokenDispatcher must be wired to a CP mesh before an exchange"
         if (
             torch.compiler.is_compiling() or torch.compiler._is_non_strict_tracing()
         ) or get_spmd_backend() != "spmd_types":
@@ -601,9 +575,7 @@ class CPTokenDispatcher(Configurable):
             output_split_sizes=out_splits,
         )
 
-    def gather(
-        self, x: torch.Tensor, plan: CompressedBlockLayout | WindowPlan
-    ) -> torch.Tensor:
+    def gather(self, x: torch.Tensor, plan: CompressedBlockLayout | WindowPlan) -> torch.Tensor:
         """The plan-driven row gather.
 
         ``plan`` is the ``WindowPlan`` (the swa path — the post-RoPE
@@ -626,9 +598,7 @@ class CPTokenDispatcher(Configurable):
             ex.send_splits,
             ex.recv_splits,
         )
-        aug = torch.cat([x.flatten(0, 1), rows[ex.recv_offsets]], dim=0)[
-            plan.gather_indices
-        ]
+        aug = torch.cat([x.flatten(0, 1), rows[ex.recv_offsets]], dim=0)[plan.gather_indices]
         return aug.view(1, -1, *x.shape[2:])
 
     def select(self, x: torch.Tensor, plan: CompressedBlockLayout) -> torch.Tensor:

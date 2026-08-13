@@ -143,9 +143,7 @@ class CANNComplexRoPE(
         sin = sin.to(query.dtype)
         if inverse:
             sin = -sin
-        xq_out = torch_npu.npu_rotary_mul(
-            query.float(), cos, sin, rotary_mode="interleave"
-        ).type_as(query)
+        xq_out = torch_npu.npu_rotary_mul(query.float(), cos, sin, rotary_mode="interleave").type_as(query)
         if key is None:
             return xq_out
         xk_out = torch_npu.npu_rotary_mul(
@@ -172,9 +170,7 @@ class CANNCosSinRoPE(_FirstRowPositionsMixin, CosSinRoPE):
         head_dim = query.shape[-1]
         cos = rope_cache[..., :head_dim].to(query.dtype)
         sin = rope_cache[..., head_dim:].to(query.dtype)
-        xq_out = torch_npu.npu_rotary_mul(
-            query.float(), cos, sin, rotary_mode="half"
-        ).type_as(query)
+        xq_out = torch_npu.npu_rotary_mul(query.float(), cos, sin, rotary_mode="half").type_as(query)
         xk_out = torch_npu.npu_rotary_mul(
             key.float(), cos.to(key.dtype), sin.to(key.dtype), rotary_mode="half"
         ).type_as(key)

@@ -155,12 +155,8 @@ def derive_reference_layout(
     """
     total_tokens = int(cu_seq_q[-1].item())
     lengths = torch.diff(cu_seq_q).to(torch.int32)
-    doc_of_token_flat = torch.repeat_interleave(
-        torch.arange(len(lengths), device=device, dtype=torch.int32), lengths
-    )
-    pos_in_doc_flat = (
-        torch.arange(total_tokens, device=device) - cu_seq_q[doc_of_token_flat.long()]
-    ).to(torch.int32)
+    doc_of_token_flat = torch.repeat_interleave(torch.arange(len(lengths), device=device, dtype=torch.int32), lengths)
+    pos_in_doc_flat = (torch.arange(total_tokens, device=device) - cu_seq_q[doc_of_token_flat.long()]).to(torch.int32)
     doc_of_token = doc_of_token_flat.view(batch_size, seq_len)
     pos_in_doc = pos_in_doc_flat.view(batch_size, seq_len)
 
@@ -168,9 +164,7 @@ def derive_reference_layout(
     for ratio, plan in plans.items():
         if ratio == 1:
             ratios[1] = ReferenceRatioLayout(
-                static_blocks=_build_static_blocks(
-                    seq_len, 0, 1, window_size, block_size, device
-                ),
+                static_blocks=_build_static_blocks(seq_len, 0, 1, window_size, block_size, device),
             )
             continue
         container_width = seq_len // ratio
@@ -197,12 +191,8 @@ def derive_reference_layout(
             bids = torch.arange(n_blocks, device=device, dtype=torch.int64)
             seq_ids = torch.searchsorted(cu_cmp[1:], bids, right=True)
             local_idx = bids - cu_cmp[seq_ids]
-            doc_of_block = torch.full(
-                (batch_size * container_width,), -1, dtype=torch.int32, device=device
-            )
-            block_local = torch.full(
-                (batch_size * container_width,), -1, dtype=torch.int32, device=device
-            )
+            doc_of_block = torch.full((batch_size * container_width,), -1, dtype=torch.int32, device=device)
+            block_local = torch.full((batch_size * container_width,), -1, dtype=torch.int32, device=device)
             doc_of_block[:n_blocks] = seq_ids.to(torch.int32)
             block_local[:n_blocks] = local_idx.to(torch.int32)
             dense_mask = _build_dense_mask(
@@ -216,9 +206,7 @@ def derive_reference_layout(
             dense_mask=dense_mask,
             doc_of_block=doc_of_block.view(batch_size, container_width),
             block_local=block_local.view(batch_size, container_width),
-            static_blocks=_build_static_blocks(
-                seq_len, seq_len // ratio, ratio, window_size, block_size, device
-            ),
+            static_blocks=_build_static_blocks(seq_len, seq_len // ratio, ratio, window_size, block_size, device),
         )
 
     return ReferenceLayout(

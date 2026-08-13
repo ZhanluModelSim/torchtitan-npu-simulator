@@ -1,3 +1,8 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 """Override: run DeepSeek-V3.2 sparse attention with fused CANN kernels.
 
 The TND sequence-length metadata extension and the fused attention core
@@ -114,24 +119,22 @@ class _CANNSparseIndexerLossFunc(torch.autograd.Function):
             k_rope_T1H,
         ) = ctx.saved_tensors
 
-        d_q_idx, d_k_idx, d_w, loss = (
-            torch_npu.npu_sparse_lightning_indexer_grad_kl_loss(
-                q_nope_TNH,
-                k_nope_T1H,
-                idx_q_TNH,
-                idx_k_T1H,
-                idx_w_TN,
-                sparse_indices,
-                softmax_max,
-                softmax_sum,
-                scale_value=ctx.scale_value,
-                query_rope=q_rope_TNH,
-                key_rope=k_rope_T1H,
-                actual_seq_qlen=ctx.actual_seq_qlen,
-                actual_seq_klen=ctx.actual_seq_klen,
-                layout="TND",
-                sparse_mode=3,
-            )
+        d_q_idx, d_k_idx, d_w, loss = torch_npu.npu_sparse_lightning_indexer_grad_kl_loss(
+            q_nope_TNH,
+            k_nope_T1H,
+            idx_q_TNH,
+            idx_k_T1H,
+            idx_w_TN,
+            sparse_indices,
+            softmax_max,
+            softmax_sum,
+            scale_value=ctx.scale_value,
+            query_rope=q_rope_TNH,
+            key_rope=k_rope_T1H,
+            actual_seq_qlen=ctx.actual_seq_qlen,
+            actual_seq_klen=ctx.actual_seq_klen,
+            layout="TND",
+            sparse_mode=3,
         )
 
         # Convert summed KL outputs using coeff / (tokens * global batch size).
@@ -338,9 +341,7 @@ class CANNVarlenMetadataExtension(MetadataExtension):
             f"expected VarlenMetadata or CPVarlenMetadata, got {type(metadata)}"
         )
         cu_q, cu_k = metadata.cu_seq_q, metadata.cu_seq_k
-        actual_seq_qlen, actual_seq_klen = (
-            torch.stack([cu_q[1:], cu_k[1:]]).cpu().tolist()
-        )
+        actual_seq_qlen, actual_seq_klen = torch.stack([cu_q[1:], cu_k[1:]]).cpu().tolist()
         return CANNVarlenMetadata(
             varlen_meta=metadata,
             actual_seq_qlen=actual_seq_qlen,

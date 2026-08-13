@@ -46,12 +46,10 @@ def _yarn_precompute_cache(self) -> torch.Tensor:
         high_freq_wavelen = original_max_position_embeddings / high_freq_factor
         low_freq_wavelen = original_max_position_embeddings / low_freq_factor
         freqs = torch.where(wavelen > low_freq_wavelen, freqs / scaling_factor, freqs)
-        smooth_factor = (
-            original_max_position_embeddings / wavelen - low_freq_factor
-        ) / (high_freq_factor - low_freq_factor)
-        smoothed_freqs = (
-            1 - smooth_factor
-        ) * freqs / scaling_factor + smooth_factor * freqs
+        smooth_factor = (original_max_position_embeddings / wavelen - low_freq_factor) / (
+            high_freq_factor - low_freq_factor
+        )
+        smoothed_freqs = (1 - smooth_factor) * freqs / scaling_factor + smooth_factor * freqs
         is_medium_freqs = ~(wavelen < high_freq_wavelen) * ~(wavelen > low_freq_wavelen)
         freqs = torch.where(is_medium_freqs, smoothed_freqs, freqs)
     elif cfg.scaling == "yarn" and cfg.original_seq_len > 0:
@@ -122,34 +120,24 @@ def _cossin_apply_rotary_emb(
     cos = rope_cache[..., :head_dim]
     sin = rope_cache[..., head_dim:]
     query_f = query.float()
-    xq_out = (query_f * cos) + (
-        torchtitan.models.common.rope.CosSinRoPE._rotate_half(query_f) * sin
-    )
+    xq_out = (query_f * cos) + (torchtitan.models.common.rope.CosSinRoPE._rotate_half(query_f) * sin)
     if key is None:
         return xq_out.type_as(query)
     key_f = key.float()
-    xk_out = (key_f * cos) + (
-        torchtitan.models.common.rope.CosSinRoPE._rotate_half(key_f) * sin
-    )
+    xk_out = (key_f * cos) + (torchtitan.models.common.rope.CosSinRoPE._rotate_half(key_f) * sin)
     return xq_out.type_as(query), xk_out.type_as(key)
 
 
 def apply() -> None:
     """Monkey-patch the upstream rope module to PR #3634's final state."""
 
-    torchtitan.models.common.rope.RoPE.forward = (
-        _rope_forward  # pyrefly: ignore [bad-assignment]
-    )
+    torchtitan.models.common.rope.RoPE.forward = _rope_forward  # pyrefly: ignore [bad-assignment]
     torchtitan.models.common.rope.ComplexRoPE._precompute_cache = _yarn_precompute_cache
-    torchtitan.models.common.rope.ComplexRoPE.apply_rotary_emb = (
-        staticmethod(  # pyrefly: ignore [bad-assignment]
-            _complex_apply_rotary_emb
-        )
+    torchtitan.models.common.rope.ComplexRoPE.apply_rotary_emb = staticmethod(  # pyrefly: ignore [bad-assignment]
+        _complex_apply_rotary_emb
     )
-    torchtitan.models.common.rope.CosSinRoPE.apply_rotary_emb = (
-        staticmethod(  # pyrefly: ignore [bad-assignment]
-            _cossin_apply_rotary_emb
-        )
+    torchtitan.models.common.rope.CosSinRoPE.apply_rotary_emb = staticmethod(  # pyrefly: ignore [bad-assignment]
+        _cossin_apply_rotary_emb
     )
 
 

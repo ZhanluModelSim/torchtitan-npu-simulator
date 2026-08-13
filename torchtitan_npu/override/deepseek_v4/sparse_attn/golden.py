@@ -57,9 +57,7 @@ def _sparse_attn_chunk(
 
     # Map unused ``-1`` slots to row 0, then mask their values.
     valid_BMK = topk_idxs_BMK != -1
-    safe_BMK = torch.where(
-        valid_BMK, topk_idxs_BMK, torch.zeros_like(topk_idxs_BMK)
-    ).long()
+    safe_BMK = torch.where(valid_BMK, topk_idxs_BMK, torch.zeros_like(topk_idxs_BMK)).long()
     batch_BMK = torch.arange(b, device=kv_BND.device).view(b, 1, 1).expand(-1, m, k)
     kv_BMKD = kv_BND[batch_BMK, safe_BMK, :] * valid_BMK.unsqueeze(-1).to(kv_BND.dtype)
 
@@ -162,21 +160,15 @@ class GoldenCompressedSparseInnerAttention(CompressedSparseInnerAttention):
             dtype=torch.int64,
             device=device,
         )
-        for document_id, (q_start, q_end) in enumerate(
-            _sequence_ranges(metadata.varlen.cu_seq_q)
-        ):
+        for document_id, (q_start, q_end) in enumerate(_sequence_ranges(metadata.varlen.cu_seq_q)):
             c_start, c_end = block_ranges[document_id]
             compressed_len = c_end - c_start
             if compressed_len == 0:
                 continue
             local = torch.arange(q_end - q_start, device=device)
             limit = torch.div(local + 1, self.compress_ratio, rounding_mode="floor")
-            candidates = torch.arange(compressed_len, device=device).expand(
-                q_end - q_start, -1
-            )
-            indices[q_start:q_end, :compressed_len] = torch.where(
-                candidates < limit.unsqueeze(1), candidates, -1
-            )
+            candidates = torch.arange(compressed_len, device=device).expand(q_end - q_start, -1)
+            indices[q_start:q_end, :compressed_len] = torch.where(candidates < limit.unsqueeze(1), candidates, -1)
         return indices
 
     def _select_topk(
@@ -193,9 +185,7 @@ class GoldenCompressedSparseInnerAttention(CompressedSparseInnerAttention):
         formulation.
         """
         if idx_q is None or idx_k is None or idx_w is None:
-            raise ValueError(
-                "ratio-4 golden reference requires all LI projection tensors."
-            )
+            raise ValueError("ratio-4 golden reference requires all LI projection tensors.")
         plan = metadata.plans[4]
         idx_q = idx_q.flatten(0, 1)
         idx_k = idx_k.flatten(0, 1)[: plan.cu_seqlens_cmp_k[-1]]
@@ -208,9 +198,7 @@ class GoldenCompressedSparseInnerAttention(CompressedSparseInnerAttention):
 
         query_docs = metadata.reference.doc_of_token.flatten()
         token_positions = metadata.reference.pos_in_doc.flatten()
-        causal_limit = torch.div(
-            token_positions + 1, self.compress_ratio, rounding_mode="floor"
-        )
+        causal_limit = torch.div(token_positions + 1, self.compress_ratio, rounding_mode="floor")
         block_docs = _packed_block_docs(plan, total_blocks, idx_q.device)
         if total_blocks:
             block_local = torch.arange(total_blocks, device=idx_q.device) - (
@@ -219,16 +207,10 @@ class GoldenCompressedSparseInnerAttention(CompressedSparseInnerAttention):
                 ].long()
             )
             valid = torch.eq(query_docs.unsqueeze(1), block_docs.unsqueeze(0))
-            valid = torch.logical_and(
-                valid, torch.lt(block_local.unsqueeze(0), causal_limit.unsqueeze(1))
-            )
-            index_score = index_score.masked_fill(
-                torch.logical_not(valid), torch.finfo(index_score.dtype).min
-            )
+            valid = torch.logical_and(valid, torch.lt(block_local.unsqueeze(0), causal_limit.unsqueeze(1)))
+            index_score = index_score.masked_fill(torch.logical_not(valid), torch.finfo(index_score.dtype).min)
         else:
-            valid = torch.zeros(
-                (total_tokens, 0), dtype=torch.bool, device=idx_q.device
-            )
+            valid = torch.zeros((total_tokens, 0), dtype=torch.bool, device=idx_q.device)
 
         selected_width = min(self.index_topk, total_blocks)
         selected_score, selected_global = index_score.topk(selected_width, dim=-1)
@@ -281,11 +263,7 @@ class GoldenCompressedSparseInnerAttention(CompressedSparseInnerAttention):
             compressed_indices = None
 
         outputs = []
-        compressed = (
-            None
-            if self.compress_ratio <= 1
-            else metadata.plans.get(self.compress_ratio)
-        )
+        compressed = None if self.compress_ratio <= 1 else metadata.plans.get(self.compress_ratio)
         block_ranges = (
             None
             if compressed is None
@@ -293,30 +271,24 @@ class GoldenCompressedSparseInnerAttention(CompressedSparseInnerAttention):
                 compressed.cu_seqlens_cmp_k  # pyrefly: ignore [bad-argument-type]
             )
         )
-        for document_id, (q_start, q_end) in enumerate(
-            _sequence_ranges(metadata.varlen.cu_seq_q)
-        ):
+        for document_id, (q_start, q_end) in enumerate(_sequence_ranges(metadata.varlen.cu_seq_q)):
             length = q_end - q_start
             document_query = query[q_start:q_end].unsqueeze(0)
             document_kv = original_kv[q_start:q_end]
             indices = _window_topk_idxs(self.window_size, 1, length, query.device)
             if compressed is not None:
-                c_start, c_end = (
-                    block_ranges[  # pyrefly: ignore [unsupported-operation]
-                        document_id
-                    ]
-                )
+                c_start, c_end = block_ranges[  # pyrefly: ignore [unsupported-operation]
+                    document_id
+                ]
                 document_compressed = compressed_kv[c_start:c_end]
                 document_indices = compressed_indices[  # pyrefly: ignore [unsupported-operation]
                     q_start:q_end, : c_end - c_start
                 ]
-                document_indices = (
-                    torch.where(  # pyrefly: ignore [no-matching-overload]
-                        document_indices < 0,
-                        document_indices,
-                        document_indices + length,
-                    ).unsqueeze(0)
-                )
+                document_indices = torch.where(  # pyrefly: ignore [no-matching-overload]
+                    document_indices < 0,
+                    document_indices,
+                    document_indices + length,
+                ).unsqueeze(0)
                 indices = torch.cat([indices, document_indices], dim=-1)
                 document_kv = torch.cat([document_kv, document_compressed], dim=0)
             result = _sparse_attn(

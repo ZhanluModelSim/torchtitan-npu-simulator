@@ -100,11 +100,7 @@ def set_compressed_sparse_attention_sharding(inner_attention_cfg) -> None:
 
 def set_deepseek_v4_attention_sharding(attention_cfg, *, enable_sp):
     at = attention_cfg
-    attn_x_layout = (
-        dense_sequence_parallel_placement()
-        if enable_sp
-        else dense_activation_placement(tp=spmd.I)
-    )
+    attn_x_layout = dense_sequence_parallel_placement() if enable_sp else dense_activation_placement(tp=spmd.I)
 
     at.sharding_config = ShardingConfig(
         in_src_shardings={
@@ -129,9 +125,7 @@ def set_deepseek_v4_attention_sharding(attention_cfg, *, enable_sp):
     at.kv_norm.sharding_config = _replicate_weight
     # ``wo_a`` is a BatchedLinear of per-group matrices, so TP shards its
     # group dimension (dim 0), like dsv3.2's ``w_uv``.
-    at.wo_a.sharding_config = ShardingConfig(
-        state_shardings={"weight": dense_param_placement(tp=spmd.S(0))}
-    )
+    at.wo_a.sharding_config = ShardingConfig(state_shardings={"weight": dense_param_placement(tp=spmd.S(0))})
     at.wo_b.sharding_config = rowwise_config(output_sp=enable_sp)
     at.rope.sharding_config = ShardingConfig(
         state_shardings={"cache": _dense_param_rep},
@@ -153,9 +147,7 @@ def set_compressor_sharding(compressor_cfg):
     compressor_cfg.wgate.sharding_config = _replicate_weight
     compressor_cfg.norm.sharding_config = _replicate_weight
     # ``ape`` is a plain parameter on the Compressor module itself.
-    compressor_cfg.sharding_config = ShardingConfig(
-        state_shardings={"ape": _dense_param_rep}
-    )
+    compressor_cfg.sharding_config = ShardingConfig(state_shardings={"ape": _dense_param_rep})
 
 
 def set_indexer_sharding(indexer_cfg):
@@ -201,11 +193,7 @@ def set_deepseek_v4_layer_sharding(
     norm = norm_config(enable_sp=enable_sp)
     layer_cfg.attention_norm.sharding_config = norm
     layer_cfg.ffn_norm.sharding_config = norm
-    attn_x_layout = (
-        dense_sequence_parallel_placement()
-        if enable_sp
-        else dense_activation_placement(tp=spmd.I)
-    )
+    attn_x_layout = dense_sequence_parallel_placement() if enable_sp else dense_activation_placement(tp=spmd.I)
 
     set_deepseek_v4_attention_sharding(layer_cfg.attention, enable_sp=enable_sp)
 
@@ -218,9 +206,7 @@ def set_deepseek_v4_layer_sharding(
     )
     input_ids_src_placement = dense_activation_placement(tp=spmd.R)
     input_ids_dst_placement = (
-        dense_token_ids_sequence_parallel_placement()
-        if enable_ep
-        else dense_activation_placement(tp=spmd.R)
+        dense_token_ids_sequence_parallel_placement() if enable_ep else dense_activation_placement(tp=spmd.R)
     )
     layer_cfg.moe.sharding_config.in_src_shardings[  # pyrefly: ignore [missing-attribute]
         "input_ids"
@@ -247,6 +233,4 @@ def set_deepseek_v4_sharding_config(
     )
 
     for layer_cfg in config.layers:
-        set_deepseek_v4_layer_sharding(
-            layer_cfg, enable_sp=enable_sp, enable_ep=enable_ep
-        )
+        set_deepseek_v4_layer_sharding(layer_cfg, enable_sp=enable_sp, enable_ep=enable_ep)

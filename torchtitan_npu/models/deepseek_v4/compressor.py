@@ -55,9 +55,7 @@ class Compressor(Module):
         compress_ratio: int
         # The CP token dispatcher (the RoutedExperts mirror): owned by the
         # compressor, wired once by ``Compressor.parallelize``.
-        token_dispatcher: CPTokenDispatcher.Config = field(
-            default_factory=CPTokenDispatcher.Config
-        )
+        token_dispatcher: CPTokenDispatcher.Config = field(default_factory=CPTokenDispatcher.Config)
 
     def __init__(self, config: Config):
         super().__init__()
@@ -75,9 +73,7 @@ class Compressor(Module):
         # ``ape`` is a plain score bias on the compression block, not a
         # projection; own it directly like the upstream implementation.  Its
         # param_init is declared on the Config (registry-side, ``_APE_INIT``).
-        self.ape = nn.Parameter(
-            torch.empty(cfg.compress_ratio, self.wkv.out_features, dtype=torch.float32)
-        )
+        self.ape = nn.Parameter(torch.empty(cfg.compress_ratio, self.wkv.out_features, dtype=torch.float32))
 
     def parallelize(self, parallel_dims) -> None:
         """Wire the compressor's own CP dispatcher (invoked automatically

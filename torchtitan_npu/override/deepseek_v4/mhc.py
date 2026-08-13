@@ -68,9 +68,7 @@ class CANNHcPost(HcPost):
 @override(
     target=HcPre.Config,
     exact=True,
-    description=(
-        "NPU fused DeepSeek-V4 HcPre via cann_ops_transformer.ops.mhc_pre_sinkhorn"
-    ),
+    description=("NPU fused DeepSeek-V4 HcPre via cann_ops_transformer.ops.mhc_pre_sinkhorn"),
 )
 def cann_hc_pre(cfg: HcPre.Config) -> CANNHcPre.Config:
     return derive(cfg, CANNHcPre.Config)

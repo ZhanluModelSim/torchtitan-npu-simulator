@@ -1,3 +1,8 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 """Run FlexAttention and block-mask creation eagerly on Ascend NPU.
 
 Importing this module applies the workaround.
@@ -14,9 +19,7 @@ from torch.nn.attention.flex_attention import (
 
 
 def apply() -> None:
-    torch.nn.attention.flex_attention._FLEX_ATTENTION_DISABLE_COMPILE_DEBUG = (
-        True  # pyrefly: ignore [bad-assignment]
-    )
+    torch.nn.attention.flex_attention._FLEX_ATTENTION_DISABLE_COMPILE_DEBUG = True  # pyrefly: ignore [bad-assignment]
 
     torchtitan.models.common.attention.FlexAttention._compiled_flex_attn = staticmethod(
         lambda *args, **kwargs: eager_flex_attention(*args, **kwargs)
@@ -27,9 +30,7 @@ def apply() -> None:
         kwargs["_compile"] = False
         return eager_create_block_mask(*args, **kwargs)
 
-    torchtitan.models.common.attention._compiled_create_block_mask = (
-        _eager_create_block_mask
-    )
+    torchtitan.models.common.attention._compiled_create_block_mask = _eager_create_block_mask
 
     if hasattr(torch.nn.attention.flex_attention, "_validate_device"):
         torch.nn.attention.flex_attention._validate_device = (

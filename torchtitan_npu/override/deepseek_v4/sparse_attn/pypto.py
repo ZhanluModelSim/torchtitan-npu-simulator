@@ -30,10 +30,7 @@ from .cann import (
 )
 
 _LI_MODULE = "torchtitan_npu.ops.pypto.lightning_indexer.lightning_indexer"
-_LIG_MODULE = (
-    "torchtitan_npu.ops.pypto.sparse_lightning_indexer_kl_loss_grad."
-    "sparse_lightning_indexer_kl_loss_grad"
-)
+_LIG_MODULE = "torchtitan_npu.ops.pypto.sparse_lightning_indexer_kl_loss_grad.sparse_lightning_indexer_kl_loss_grad"
 
 
 @cache
@@ -121,9 +118,7 @@ class _PyPTOSparseFlashMLATND(torch.autograd.Function):
             q,
             ori_kv=swa_k,
             cmp_kv=cmp_k if has_compressed else None,
-            cmp_sparse_indices=(
-                cmp_sparse_indices if cmp_sparse_indices is not None else None
-            ),
+            cmp_sparse_indices=(cmp_sparse_indices if cmp_sparse_indices is not None else None),
             ori_block_table=None,
             cmp_block_table=None,
             cu_seqlens_q=cu_seqlens_q,
@@ -232,9 +227,7 @@ class _PyPTOSparseFlashMLATND(torch.autograd.Function):
         didx_q = didx_k = didx_w = None
         if ctx.ratio == 4 and ctx.indexer_loss_coeff != 0:
             if any(x is None for x in (idx_q, idx_k, idx_w, slig_metadata)):
-                raise RuntimeError(
-                    "ratio-4 PyPTO requires LI tensors and slig_metadata in backward."
-                )
+                raise RuntimeError("ratio-4 PyPTO requires LI tensors and slig_metadata in backward.")
             (
                 didx_q,
                 didx_k,
@@ -312,25 +305,18 @@ class PyPTOCompressedSparseInnerAttention(CANNCompressedSparseInnerAttention):
         attention_masks=None,
     ):
         if not isinstance(attention_masks, CANNCompressedVarlenMetadata):
-            raise TypeError(
-                "pypto requires CANNCompressedVarlenMetadata attention masks."
-            )
+            raise TypeError("pypto requires CANNCompressedVarlenMetadata attention masks.")
         if attn_sink is None:
             raise ValueError("PyPTOCompressedSparseInnerAttention requires attn_sink")
         metadata = attention_masks
         plan = metadata.plans.get(self.compress_ratio)
         if plan is None:
-            raise ValueError(
-                f"No CompressedBlockLayout for ratio={self.compress_ratio}."
-            )
+            raise ValueError(f"No CompressedBlockLayout for ratio={self.compress_ratio}.")
         if self.compress_ratio <= 1:
             if cmp_k is not None and cmp_k.numel() != 0:
                 raise ValueError("ratio-1 PyPTO must not receive compressed KV.")
         elif cmp_k is None or cmp_k.ndim != 3:
-            raise ValueError(
-                "ratio>1 PyPTO requires compressed KV in the container "
-                "layout [B, S//ratio, D]."
-            )
+            raise ValueError("ratio>1 PyPTO requires compressed KV in the container layout [B, S//ratio, D].")
 
         npu = metadata.cann_plans[self.compress_ratio]
         batch_size, seqlen, _, _ = q.shape
@@ -338,9 +324,7 @@ class PyPTOCompressedSparseInnerAttention(CANNCompressedSparseInnerAttention):
         q = q.flatten(0, 1)
         swa_k = swa_k.flatten(0, 1).unsqueeze(1).contiguous()
         cu_seqlens_ori_kv = (
-            metadata.window.cu_seqlens_ori_kv
-            if metadata.window is not None
-            else metadata.varlen.cu_seq_k
+            metadata.window.cu_seqlens_ori_kv if metadata.window is not None else metadata.varlen.cu_seq_k
         )
         cmp_k = None if cmp_k is None else self._assemble_tnd(cmp_k, plan)
 

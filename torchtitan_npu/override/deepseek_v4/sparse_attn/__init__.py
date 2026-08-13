@@ -26,10 +26,7 @@ from .pypto import PyPTOCompressedSparseInnerAttention
 
 @override(
     target=MetadataExtension.Config,
-    description=(
-        "Precompute the CANN sparse-attention metadata kernels onto the "
-        "model-built DSV4 varlen contract"
-    ),
+    description=("Precompute the CANN sparse-attention metadata kernels onto the model-built DSV4 varlen contract"),
 )
 def cann_metadata(
     cfg: MetadataExtension.Config,
@@ -54,10 +51,7 @@ def cann_metadata(
 @override(
     target=CompressedSparseInnerAttention.Config,
     exact=True,
-    description=(
-        "Use cann_ops_transformer TND LightningIndexer and SparseFlashMLA "
-        "with fused SASG/SLIG backward"
-    ),
+    description=("Use cann_ops_transformer TND LightningIndexer and SparseFlashMLA with fused SASG/SLIG backward"),
 )
 def cann(
     cfg: CompressedSparseInnerAttention.Config,
@@ -76,9 +70,7 @@ def cann(
     # pass.
     sharding_config = result.sharding_config
     assert sharding_config is not None, "the cann override requires the sharding config"
-    sharding_config.state_shardings["_indexer_loss_acc"] = dense_param_placement(
-        tp=spmd.R
-    )
+    sharding_config.state_shardings["_indexer_loss_acc"] = dense_param_placement(tp=spmd.R)
     return result
 
 
@@ -101,10 +93,7 @@ def pypto(
 @override(
     target=CompressedSparseInnerAttention.Config,
     exact=True,
-    description=(
-        "DSV4 sparse attention golden reference "
-        "(eager per-document, dsv4-infer-npu bitwise)"
-    ),
+    description=("DSV4 sparse attention golden reference (eager per-document, dsv4-infer-npu bitwise)"),
 )
 def golden(
     cfg: CompressedSparseInnerAttention.Config,

@@ -49,9 +49,7 @@ class CANNProfiler(Profiler):
         }
 
         wait = profile_freq - (active + warmup)
-        assert wait >= 0, (
-            "profile_freq must be greater than or equal to warmup + active"
-        )
+        assert wait >= 0, "profile_freq must be greater than or equal to warmup + active"
 
         def _env_bool(name: str) -> bool:
             return os.environ.get(name, "0") == "1"

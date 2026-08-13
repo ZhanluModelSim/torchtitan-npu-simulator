@@ -379,10 +379,7 @@ def _build_v4_layers(
     hc_eps: float = 1e-6,
 ) -> list[DeepSeekV4TransformerBlock.Config]:
     if len(compress_ratios) != n_layers:
-        raise ValueError(
-            f"compress_ratios ({len(compress_ratios)} entries) must cover "
-            f"n_layers ({n_layers})."
-        )
+        raise ValueError(f"compress_ratios ({len(compress_ratios)} entries) must cover n_layers ({n_layers}).")
     layers = []
     for layer_id in range(n_layers):
         cr = compress_ratios[layer_id]
@@ -562,9 +559,7 @@ def _make_v4_config(
         layers=layers,
         window_size=window_size,
         block_size=block_size,
-        metadata_extension=ReferenceMetadataExtension.Config(
-            window_size=window_size, block_size=block_size
-        ),
+        metadata_extension=ReferenceMetadataExtension.Config(window_size=window_size, block_size=block_size),
         hc_mult=hc_mult,
         compress_ratios=compress_ratios,
         n_layers=n_layers,
@@ -715,10 +710,7 @@ def model_registry(
     converters: list[ModelConfigConverter.Config] | None = None,
 ) -> ModelSpec:
     if flavor not in deepseek_v4_configs:
-        raise ValueError(
-            f"Unknown deepseek_v4 flavor: {flavor}. "
-            f"Available: {list(deepseek_v4_configs.keys())}"
-        )
+        raise ValueError(f"Unknown deepseek_v4 flavor: {flavor}. Available: {list(deepseek_v4_configs.keys())}")
     config = deepseek_v4_configs[flavor](
         moe_comm_backend=moe_comm_backend,
         non_blocking_capacity_factor=non_blocking_capacity_factor,

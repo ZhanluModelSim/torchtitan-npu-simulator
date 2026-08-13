@@ -53,9 +53,7 @@ def apply() -> None:
         # workaround degrades gracefully (no D2H event synchronization).
         return
 
-    cast("Any", inductor_ir.DeviceCopy).create = classmethod(
-        _patched_device_copy_create
-    )
+    cast("Any", inductor_ir.DeviceCopy).create = classmethod(_patched_device_copy_create)
     _LoweringGuard.support(
         torch.ops.prims.device_put,
         cast("tuple[torch.dtype]", (*exclude(), torch.int64)),

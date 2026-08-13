@@ -43,19 +43,13 @@ from torchtitan.models.common.token_dispatcher import DeepEPTokenDispatcher
 __all__ = ["HashMoE", "HashRouter"]
 
 
-def _build_hash_routing_table(
-    vocab_size, num_experts, top_k, device=None, chunk_size=8192
-):
+def _build_hash_routing_table(vocab_size, num_experts, top_k, device=None, chunk_size=8192):
     if top_k > num_experts:
         raise ValueError(f"top_k ({top_k}) must be <= num_experts ({num_experts})")
     tid2eid = torch.empty((vocab_size, top_k), dtype=torch.long, device=device)
     for start in range(0, vocab_size, chunk_size):
         end = min(start + chunk_size, vocab_size)
-        tid2eid[start:end] = (
-            torch.rand((end - start, num_experts), device=device)
-            .topk(top_k, dim=-1)
-            .indices
-        )
+        tid2eid[start:end] = torch.rand((end - start, num_experts), device=device).topk(top_k, dim=-1).indices
     return tid2eid
 
 
@@ -84,9 +78,7 @@ class HashRouter(TokenChoiceTopKRouter):
                 raise ValueError("hash routing requires vocab_size.")
             self.register_buffer(
                 "tid2eid",
-                _build_hash_routing_table(
-                    self.vocab_size, self.num_experts, self.top_k
-                ),
+                _build_hash_routing_table(self.vocab_size, self.num_experts, self.top_k),
                 persistent=True,
             )
 
@@ -124,24 +116,16 @@ class HashRouter(TokenChoiceTopKRouter):
                 raise ValueError("input_ids is required for DSV4 hash routing.")
             selected_experts_indices = self.tid2eid[input_ids]
         else:
-            scores_for_choice = (
-                scores if expert_bias_E is None else scores + expert_bias_E
-            )
+            scores_for_choice = scores if expert_bias_E is None else scores + expert_bias_E
             # Apply node-limited routing if configured (upstream behavior).
             if self.num_expert_groups is not None:
-                scores_for_choice = self._get_node_limited_routing_scores(
-                    scores_for_choice
-                )
-            selected_experts_indices = scores_for_choice.topk(
-                self.top_k, dim=-1, sorted=False
-            )[1]
+                scores_for_choice = self._get_node_limited_routing_scores(scores_for_choice)
+            selected_experts_indices = scores_for_choice.topk(self.top_k, dim=-1, sorted=False)[1]
 
         top_scores = scores.gather(dim=-1, index=selected_experts_indices)
 
         if self._debug_force_load_balance:
-            selected_experts_indices, top_scores = (
-                self._debug_force_load_balance_routing(scores)
-            )
+            selected_experts_indices, top_scores = self._debug_force_load_balance_routing(scores)
 
         if self.route_norm:
             denominator = top_scores.sum(dim=-1, keepdim=True) + 1e-20
@@ -162,9 +146,7 @@ class HashMoE(MoE):
     class Config(MoE.Config):
         pass
 
-    def forward(
-        self, x_BLD: torch.Tensor, *, input_ids: torch.Tensor | None = None
-    ) -> torch.Tensor:
+    def forward(self, x_BLD: torch.Tensor, *, input_ids: torch.Tensor | None = None) -> torch.Tensor:
         """Forward through the router (with optional ``input_ids``) and experts.
 
         The body mirrors upstream ``MoE.forward``; ``input_ids`` is only
@@ -182,12 +164,8 @@ class HashMoE(MoE):
                 x_BLD = F.pad(x_BLD, (0, 0, 0, seq_pad))
                 L = L + seq_pad
             seq_dim_pad_tokens = (-L) % sp_size
-            local_batch_size = (
-                x_BLD._local_tensor.shape[0] if isinstance(x_BLD, DTensor) else B
-            )
-            num_local_tokens_after_seq_dim_padding = (
-                local_batch_size * (L + seq_dim_pad_tokens) // sp_size
-            )
+            local_batch_size = x_BLD._local_tensor.shape[0] if isinstance(x_BLD, DTensor) else B
+            num_local_tokens_after_seq_dim_padding = local_batch_size * (L + seq_dim_pad_tokens) // sp_size
 
         (
             topk_scores_BLK,
@@ -210,14 +188,10 @@ class HashMoE(MoE):
             topk_scores_BLK,
             topk_expert_ids_BLK,
             num_local_tokens_per_expert_E,
-            num_local_tokens_after_seq_dim_padding=(
-                num_local_tokens_after_seq_dim_padding
-            ),
+            num_local_tokens_after_seq_dim_padding=(num_local_tokens_after_seq_dim_padding),
         )
 
-        shared_out_BLD = (
-            self.shared_experts(x_BLD) if self.shared_experts is not None else None
-        )
+        shared_out_BLD = self.shared_experts(x_BLD) if self.shared_experts is not None else None
 
         if (
             isinstance(self.routed_experts.token_dispatcher, DeepEPTokenDispatcher)
@@ -273,11 +247,7 @@ class _ClampGroupedExperts(GroupedExperts):
             w3_EFD = self.w3_EFD
 
         offsets_E = torch.cumsum(num_tokens_per_expert_E, dim=0, dtype=torch.int32)
-        if (
-            get_spmd_backend() == "spmd_types"
-            and spmd.is_type_checking()
-            and spmd_mesh_size("ep") == 1
-        ):
+        if get_spmd_backend() == "spmd_types" and spmd.is_type_checking() and spmd_mesh_size("ep") == 1:
             for axis in ("dp", "cp"):
                 spmd.mutate_type(offsets_E, axis, src=spmd.P, dst=spmd.V)
 
@@ -295,9 +265,7 @@ class _ClampGroupedExperts(GroupedExperts):
             u_RF = torch.clamp(u_RF, min=-self.swiglu_limit, max=self.swiglu_limit)
             g_RF = torch.clamp(g_RF, max=self.swiglu_limit)
         h_RF = F.silu(g_RF) * u_RF
-        return torch._grouped_mm(
-            h_RF, w2_EDF.bfloat16().transpose(-2, -1), offs=offsets_E
-        ).type_as(x_RD)
+        return torch._grouped_mm(h_RF, w2_EDF.bfloat16().transpose(-2, -1), offs=offsets_E).type_as(x_RD)
 
 
 class _ClampFeedForward(FeedForward):
@@ -365,13 +333,9 @@ def apply() -> None:
     import torchtitan.models.common.config_utils
 
     global _original_make_routed_experts_config, _original_make_ffn_config
-    _original_make_routed_experts_config = (
-        torchtitan.models.common.config_utils.make_routed_experts_config
-    )
+    _original_make_routed_experts_config = torchtitan.models.common.config_utils.make_routed_experts_config
     _original_make_ffn_config = torchtitan.models.common.config_utils.make_ffn_config
-    torchtitan.models.common.config_utils.make_routed_experts_config = (
-        _clamp_make_routed_experts_config
-    )
+    torchtitan.models.common.config_utils.make_routed_experts_config = _clamp_make_routed_experts_config
     torchtitan.models.common.config_utils.make_ffn_config = _clamp_make_ffn_config
 
 

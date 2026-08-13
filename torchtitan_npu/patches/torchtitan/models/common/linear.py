@@ -25,9 +25,7 @@ class BatchedLinear(Module):
 
     def __init__(self, config: Config):
         super().__init__()
-        self.weight = nn.Parameter(
-            torch.empty(config.n_heads, config.out_features, config.in_features)
-        )
+        self.weight = nn.Parameter(torch.empty(config.n_heads, config.out_features, config.in_features))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         *prefix, H, D_in = x.shape

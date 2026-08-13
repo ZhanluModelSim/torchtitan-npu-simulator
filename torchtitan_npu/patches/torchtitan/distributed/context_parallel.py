@@ -1,3 +1,8 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
 # Pending upstream PR: https://github.com/pytorch/torchtitan/pull/3430
 
 import functools
@@ -25,9 +30,7 @@ def patched_cp_shard(
     **kwargs,
 ) -> tuple[tuple[torch.Tensor, ...], AttentionMasksType | CPVarlenMetadata | None]:
     """Build rank-local varlen metadata after sharding inputs for CP."""
-    load_balancer_type = (
-        args[0] if args else kwargs.get("load_balancer_type", "headtail")
-    )
+    load_balancer_type = args[0] if args else kwargs.get("load_balancer_type", "headtail")
     input_seq_dim = args[1] if len(args) > 1 else kwargs.get("input_seq_dim", 1)
     is_varlen = isinstance(attention_masks, VarlenMetadata)
     batch_size = inputs[0].size(0)
@@ -65,12 +68,8 @@ def patched_cp_shard(
 def apply() -> None:
     import torchtitan.distributed.context_parallel
 
-    logger.info(
-        "[PATCH] torchtitan.distributed.context_parallel.cp_shard -> patched_cp_shard"
-    )
-    torchtitan.distributed.context_parallel.cp_shard = (
-        patched_cp_shard  # pyrefly: ignore [bad-assignment]
-    )
+    logger.info("[PATCH] torchtitan.distributed.context_parallel.cp_shard -> patched_cp_shard")
+    torchtitan.distributed.context_parallel.cp_shard = patched_cp_shard  # pyrefly: ignore [bad-assignment]
 
 
 apply()
