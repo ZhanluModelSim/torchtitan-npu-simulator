@@ -28,7 +28,7 @@ EXTRA_ARGS=(
   --checkpoint.interval 500
   --checkpoint.last_save_model_only
   --checkpoint.export_dtype bfloat16
-  --training.local_batch_size 8
+  --training.local_batch_size 4
   --training.global_batch_size 8
   --training.seq_len 1152
   --training.steps 1000

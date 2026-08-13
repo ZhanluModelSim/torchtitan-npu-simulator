@@ -356,7 +356,6 @@ def debug_single_node_eq_pruned_config(base: TrainerConfig) -> TrainerConfig:
         training=replace(base.training, global_batch_size=-1, steps=20),
         checkpoint=replace(
             base.checkpoint,
-            load_step=0,
             load_only=True,
         ),
         compile=replace(base.compile, enable=False),
@@ -372,7 +371,6 @@ def cpt_default_config(base: TrainerConfig) -> TrainerConfig:
         checkpoint=replace(
             base.checkpoint,
             enable=True,
-            load_step=0,
             interval=10000,
             load_only=True,
             initial_load_in_hf=True,
