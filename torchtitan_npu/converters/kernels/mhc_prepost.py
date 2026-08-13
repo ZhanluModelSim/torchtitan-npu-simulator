@@ -9,6 +9,7 @@ import logging
 from typing import Any
 
 import torch
+import torch_npu
 from torch import Tensor, nn
 from torch.distributed.tensor import DTensor
 
@@ -52,6 +53,12 @@ def _mhc_pre_sinkhorn(
     norm_eps: float,
     hc_eps: float,
 ) -> tuple[Tensor, Tensor, Tensor]:
+    """Run the A5 MHC pre-mapping and Sinkhorn kernels.
+
+    Training uses the split torch_npu operators because their backward path is
+    numerically equivalent to the fused operator and avoids its slower fused
+    backward kernel.
+    """
     input_x = x
     use_fake_batch = x.dim() == 3
     if use_fake_batch:
@@ -59,18 +66,27 @@ def _mhc_pre_sinkhorn(
     elif x.dim() != 4:
         raise RuntimeError(f"MHC fused kernel expects residual to be TND or BSND, got shape {tuple(x.shape)}.")
 
-    outputs = _mhc_ops().mhc_pre_sinkhorn(
-        x.contiguous(),
-        weight.to(torch.float32),
-        hc_scale.to(torch.float32),
-        hc_base.to(torch.float32),
-        hc_mult,
-        sinkhorn_iters,
-        hc_eps,
-        norm_eps,
+    x = x.contiguous()
+    weight = weight.to(torch.float32)
+    hc_scale = hc_scale.to(torch.float32)
+    hc_base = hc_base.to(torch.float32)
+    h_in, h_post, h_res, _, _, _ = torch_npu.npu_mhc_pre(
+        x,
+        weight,
+        hc_scale,
+        hc_base,
+        norm_eps=norm_eps,
+        hc_eps=hc_eps,
+        out_flag=1,
     )
+    h_res, _, _ = torch_npu.npu_mhc_sinkhorn(
+        h_res,
+        eps=hc_eps,
+        num_iters=sinkhorn_iters,
+        out_flag=1,
+    )
+
     dim_b, dim_s, dim_n, _ = x.shape
-    h_in, h_post, h_res = outputs[:3]
     h_in = h_in.view(dim_b, dim_s, h_in.shape[-1])
     h_post = h_post.view(dim_b, dim_s, h_post.shape[-1])
     h_res = h_res.view(dim_b, dim_s, dim_n, dim_n)

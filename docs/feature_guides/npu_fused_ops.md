@@ -100,7 +100,13 @@ logging.getLogger("torchtitan_npu.converters.kernels.npu_smla").setLevel(
 
 ## MHCPre
 
-`npu_mhc_pre` 面向 DeepSeek-V4 的 MHC pre-processing 路径，将模型中的 `HcPre` 模块替换为 NPU 亲和实现。在 A5 上使用 `cann_ops_transformer.ops.mhc_pre_sinkhorn` 及其反向融合算子；在非 A5 场景下使用已有 Triton 实现。DeepSeek-V4 默认配置中已启用该 converter。
+`npu_mhc_pre` 面向 DeepSeek-V4 的 MHC pre-processing 路径，将模型中的 `HcPre` 模块替换为 NPU 亲和实现。DeepSeek-V4 默认配置中已启用该 converter。
+
+硬件路径与训练行为如下：
+
+- A5 训练路径无条件串联 `torch_npu.npu_mhc_pre(out_flag=1)` 和 `torch_npu.npu_mhc_sinkhorn(out_flag=1)`。`out_flag=1` 会保留 Autograd 反向所需的 RMSNorm、投影和 Sinkhorn 中间结果。
+- A5 反向由 torch_npu 注册的 `npu_mhc_sinkhorn_backward` 与 `npu_mhc_pre_backward` 依次完成。该拆分路径与融合 `mhc_pre_sinkhorn_backward` 经过 A5 实测验证等价，并避免融合反向 kernel 的额外开销。
+- 非 A5 场景继续使用已有 `MHCPreTriton` 实现。
 
 **配置示例**：
 ```python
