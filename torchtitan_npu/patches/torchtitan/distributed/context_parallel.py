@@ -21,10 +21,14 @@ def patched_cp_shard(
     cp_mesh: DeviceMesh,
     inputs: tuple[torch.Tensor, ...],
     attention_masks: AttentionMasksType | None,
-    load_balancer_type: str | None = "headtail",
-    input_seq_dim: int = 1,
+    *args,
+    **kwargs,
 ) -> tuple[tuple[torch.Tensor, ...], AttentionMasksType | CPVarlenMetadata | None]:
     """Build rank-local varlen metadata after sharding inputs for CP."""
+    load_balancer_type = (
+        args[0] if args else kwargs.get("load_balancer_type", "headtail")
+    )
+    input_seq_dim = args[1] if len(args) > 1 else kwargs.get("input_seq_dim", 1)
     is_varlen = isinstance(attention_masks, VarlenMetadata)
     batch_size = inputs[0].size(0)
     seq_len = inputs[0].size(input_seq_dim)
@@ -33,8 +37,8 @@ def patched_cp_shard(
         cp_mesh,
         inputs,
         None if is_varlen else attention_masks,
-        load_balancer_type,
-        input_seq_dim,
+        *args,
+        **kwargs,
     )
 
     if is_varlen:

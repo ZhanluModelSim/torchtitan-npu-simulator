@@ -35,7 +35,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 readonly TORCHTITAN_REPO="${TORCHTITAN_REPO:-https://gitcode.com/GitHub_Trending/to/torchtitan.git}"
-readonly TORCHTITAN_COMMIT="${TORCHTITAN_COMMIT:-cc286a63599e42480a07928cc362e514ae448a85}"
+TORCHTITAN_REQUIREMENT="$(grep -E '^torchtitan .*@[0-9a-f]{40}$' "${PROJECT_ROOT}/requirements.txt")"
+readonly TORCHTITAN_COMMIT="${TORCHTITAN_COMMIT:-${TORCHTITAN_REQUIREMENT##*@}}"
+[[ "${TORCHTITAN_COMMIT}" =~ ^[0-9a-f]{40}$ ]] || { echo "Invalid TorchTitan commit: ${TORCHTITAN_COMMIT}" >&2; exit 1; }
 readonly TOKENIZER_REPO="${DEEPSEEK_TOKENIZER_REPO:-https://gitcode.com/hitwdy/deepseekv4.git}"
 readonly NPROC_PER_NODE="${SMOKE_NPROC_PER_NODE:-4}"
 readonly SMOKE_STEPS="${SMOKE_STEPS:-5}"

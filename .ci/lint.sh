@@ -8,7 +8,9 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 readonly TORCHTITAN_BRANCH="main"
-readonly TORCHTITAN_COMMIT="cc286a63599e42480a07928cc362e514ae448a85"
+TORCHTITAN_REQUIREMENT="$(grep -E '^torchtitan .*@[0-9a-f]{40}$' "${PROJECT_ROOT}/requirements.txt")"
+readonly TORCHTITAN_COMMIT="${TORCHTITAN_REQUIREMENT##*@}"
+[[ "${TORCHTITAN_COMMIT}" =~ ^[0-9a-f]{40}$ ]] || { echo "Invalid TorchTitan commit: ${TORCHTITAN_COMMIT}" >&2; exit 1; }
 readonly TORCHTITAN_DIR="/tmp/torchtitan"
 
 # set python3.12 and pip3.12 as default
