@@ -3,7 +3,7 @@
 The CANN fused implementation (metadata layer + kernel) lives in
 ``cann.py`` and the eager golden reference in ``golden.py``; the
 registrations are defined here so the override paths stay
-``override.deepseek_v4.sparse_attn.{cann_metadata, cann, golden}``.
+``override.deepseek_v4.sparse_attn.{cann_metadata, cann, pypto, golden}``.
 """
 
 from torchtitan.config import derive, override
@@ -16,6 +16,7 @@ from .cann import (
     CANNCompressedVarlenMetadataHandler,
 )
 from .golden import GoldenCompressedSparseInnerAttention
+from .pypto import PyPTOCompressedSparseInnerAttention
 
 
 @override(
@@ -63,6 +64,22 @@ def cann(
     return derive(
         cfg,
         CANNCompressedSparseInnerAttention.Config,
+        indexer_loss_coeff=indexer_loss_coeff,
+    )
+
+
+@override(
+    target=CompressedSparseInnerAttention.Config,
+    exact=True,
+    description="Use PyPTO LI/LIG with CANN TND SMLA/SMLAG",
+)
+def pypto(
+    cfg: CompressedSparseInnerAttention.Config,
+    indexer_loss_coeff: float = 1.0,
+) -> PyPTOCompressedSparseInnerAttention.Config:
+    return derive(
+        cfg,
+        PyPTOCompressedSparseInnerAttention.Config,
         indexer_loss_coeff=indexer_loss_coeff,
     )
 

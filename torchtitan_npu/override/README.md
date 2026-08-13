@@ -72,7 +72,8 @@ torchtitan_npu/override/
     └── sparse_attn/
         ├── __init__.py
         ├── cann.py
-        └── golden.py
+        ├── golden.py
+        └── pypto.py
 ```
 
 - `common/` 存放只依赖 TorchTitan 公共组件、不依赖具体模型配置或元数据契约的实现。
@@ -233,6 +234,7 @@ torchtitan_npu.override.deepseek_v3_2.sparse_attn.cann
 | --- | --- | --- |
 | `sparse_attn.cann_metadata` | `CompressedBlockMaskHandler.Config` | `CANNCompressedVarlenMetadataHandler.Config` |
 | `sparse_attn.cann` | `CompressedSparseInnerAttention.Config` | `CANNCompressedSparseInnerAttention.Config` |
+| `sparse_attn.pypto` (replaces `sparse_attn.cann`) | `CompressedSparseInnerAttention.Config` | `PyPTOCompressedSparseInnerAttention.Config` |
 | `sparse_attn.golden` | `CompressedSparseInnerAttention.Config` | `GoldenCompressedSparseInnerAttention.Config` |
 | `mhc.cann_hc_pre` | `HcPre.Config` | `CANNHcPre.Config` | 使用 `cann_ops_transformer.ops.mhc_pre_sinkhorn` |
 | `mhc.cann_hc_post` | `HcPost.Config` | `CANNHcPost.Config` | 使用 `cann_ops_transformer.ops.mhc_post` |
@@ -282,6 +284,12 @@ token 数时应调整 `seq_len`。Golden reference 使用包含 reference tier �
 的 CANN metadata，不构造 Golden 路径使用的稠密 mask、文档位置和静态块列表。
 
 TND 数据约定见 [DeepSeek-V4 TND 适配](../../docs/feature_guides/deepseek_v4_tnd.md)。
+
+若使用 PyPTO 的 LI/LIG 算子，`torchtitan_npu.override.deepseek_v4.sparse_attn.pypto` 替换
+`torchtitan_npu.override.deepseek_v4.sparse_attn.cann`，未覆盖的 sparse-attention
+能力继续复用已验证的实现。使用该入口需要额外安装与当前 CANN 匹配的 `pypto`
+runtime，安装方法参见 [PyPTO 安装文档](https://gitcode.com/cann/pypto/blob/master/docs/zh/install/build_and_install.md)，
+安装后可用 `python3 -c "import pypto"` 检查。
 
 ## Override 与 package patch
 

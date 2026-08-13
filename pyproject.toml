@@ -16,7 +16,7 @@ markers = [
 ]
 
 [tool.pyrefly]
-project-excludes = ["**/tests/**", "CI", "torchtitan_npu/ops/triton", "scripts"]
+project-excludes = ["**/tests/**", "CI", "torchtitan_npu/ops/pypto", "torchtitan_npu/ops/triton", "scripts"]
 ignore-missing-imports = ["torchao.*", "torchft", "cann_ops_transformer"]
 search-path = ["/tmp/torchtitan"]
 replace-imports-with-any = ["torch_npu", "torch.npu"]
