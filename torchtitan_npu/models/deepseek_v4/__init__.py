@@ -26,10 +26,10 @@ from torchtitan_npu.patches.torchtitan.models.common.linear import BatchedLinear
 
 from .attention import Attention, CompressedSparseInnerAttention
 from .compressor import Compressor, Indexer
-from .metadata import CompressedBlockMaskHandler
 from .mhc import HcHead, HcPost, HcPre
 from .model import DeepSeekV4Model, DeepSeekV4TransformerBlock
 from .parallelize import parallelize_deepseek_v4
+from .reference import ReferenceMetadataExtension
 from .state_dict_adapter import DeepSeekV4StateDictAdapter
 
 __all__ = [
@@ -80,25 +80,6 @@ def _depth_experts_init(layer_id: int) -> dict[str, Callable]:
         "w2_EDF": partial(nn.init.trunc_normal_, std=depth_scaled_std(0.02, layer_id)),
         "w3_EFD": partial(nn.init.trunc_normal_, std=depth_scaled_std(0.02, layer_id)),
     }
-
-
-def _make_mask_handler_config(
-    *,
-    compress_ratios: tuple[int, ...],
-    window_size: int,
-    block_size: int | tuple[int, int] = _DEFAULT_SPARSE_BLOCK_SIZE,
-) -> CompressedBlockMaskHandler.Config:
-    """DSV4 packed mask handler with the model-config geometry constants.
-
-    The NPU override factory derives the CANN handler from this config and
-    receives the attention geometry (``num_heads`` ... ``index_topk``) as
-    override kwargs, so the model directory stays backend-agnostic.
-    """
-    return CompressedBlockMaskHandler.Config(
-        compress_ratios=compress_ratios,
-        window_size=window_size,
-        block_size=block_size,
-    )
 
 
 def _make_compressor_config(
@@ -375,6 +356,7 @@ def _build_v4_layers(
     n_groups: int,
     compress_ratios: tuple[int, ...],
     window_size: int,
+    block_size: int | tuple[int, int] = _DEFAULT_SPARSE_BLOCK_SIZE,
     norm_eps: float,
     index_n_heads: int,
     index_head_dim: int,
@@ -487,6 +469,7 @@ def _make_v4_config(
     n_groups: int,
     compress_ratios: tuple[int, ...],
     window_size: int,
+    block_size: int | tuple[int, int] = _DEFAULT_SPARSE_BLOCK_SIZE,
     norm_eps: float,
     index_n_heads: int,
     index_head_dim: int,
@@ -577,9 +560,10 @@ def _make_v4_config(
             param_init=_output_linear_init(dim),
         ),
         layers=layers,
-        mask_handler=_make_mask_handler_config(
-            compress_ratios=compress_ratios,
-            window_size=window_size,
+        window_size=window_size,
+        block_size=block_size,
+        metadata_extension=ReferenceMetadataExtension.Config(
+            window_size=window_size, block_size=block_size
         ),
         hc_mult=hc_mult,
         compress_ratios=compress_ratios,

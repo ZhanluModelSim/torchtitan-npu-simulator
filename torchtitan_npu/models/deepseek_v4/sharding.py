@@ -66,6 +66,13 @@ def set_compressed_sparse_attention_sharding(inner_attention_cfg) -> None:
         "idx_k": replicated_activation,
         "idx_w": replicated_activation,
     }
+    # Under context parallel the compressed containers are CP-sharded
+    # (``cp = S(1)``, the ``dense_activation_placement`` default) and the
+    # core consumes them replicated: the ShardingConfig emits the all-gather
+    # at the core boundary (the DeepSeek-V3.2 ``S(1) -> R`` pattern).
+    output_shardings = dict(input_shardings)
+    for name in ("cmp_k", "idx_k"):
+        output_shardings[name] = dense_activation_placement(tp=spmd.R, cp=spmd.R)
     grad_placements = [
         q,
         dense_activation_placement(tp=spmd.P),
@@ -78,7 +85,7 @@ def set_compressed_sparse_attention_sharding(inner_attention_cfg) -> None:
 
     inner_attention_cfg.sharding_config = ShardingConfig(
         in_src_shardings=input_shardings,
-        in_dst_shardings=dict(input_shardings),
+        in_dst_shardings=output_shardings,
         out_src_shardings=q,
         out_dst_shardings=q,
         # The CANN indexer-loss accumulator is a per-rank fp32 scalar buffer;

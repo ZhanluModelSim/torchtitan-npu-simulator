@@ -3,16 +3,24 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
-from torchtitan.models.common.attention import AttentionMasksType
+from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.tensor.experimental._context_parallel._load_balancer import (
+    _HeadTailLoadBalancer,
+)
+from torch.nn.attention.flex_attention import _DEFAULT_SPARSE_BLOCK_SIZE
+from torchtitan.distributed.context_parallel import cp_shard
+from torchtitan.models.common.attention import AttentionMasksType, VarlenMetadata
 from torchtitan.models.common.decoder import Decoder, TransformerBlock
 from torchtitan.models.common.moe import MoE
 
-from torchtitan_npu.patches.torchtitan.models.common.mask_handler import BaseMaskHandler
+from torchtitan_npu.models.common.metadata_extension import MetadataExtension
 
+from .metadata import CompressedVarlenMetadata, build_compressed_varlen_metadata
 from .mhc import HcHead, HcPost, HcPre
+from .token_dispatcher import build_cp_plan
 
 
 class DeepSeekV4TransformerBlock(TransformerBlock):
@@ -65,8 +73,12 @@ class DeepSeekV4Model(Decoder):
         hc_mult: int = 4
         compress_ratios: tuple[int, ...]
         n_layers: int
+        window_size: int
+        block_size: int | tuple[int, int] = _DEFAULT_SPARSE_BLOCK_SIZE
+        metadata_extension: MetadataExtension.Config = field(
+            default_factory=MetadataExtension.Config
+        )
         hc_head: HcHead.Config
-        mask_handler: BaseMaskHandler.Config
 
         def update_from_config(self, *, config, **kwargs):
             Decoder.Config.update_from_config(self, config=config, **kwargs)
@@ -87,11 +99,10 @@ class DeepSeekV4Model(Decoder):
                             f"n_groups ({n_groups}) must be divisible by tp ({tp})"
                         )
 
-            if parallelism.context_parallel_degree > 1:
-                raise NotImplementedError(
-                    "Context Parallel is not yet supported for DeepSeek V4 sparse attention."
-                )
-
+            # Context parallel is supported on the CANN fused path only: the
+            # model's build_attention_masks derives the per-rank dispatch
+            # plan when the trainer passes the CP mesh; the model-dir
+            # reference tier and the golden stay no-CP-only and raise there.
             from .sharding import set_deepseek_v4_sharding_config
 
             set_deepseek_v4_sharding_config(
@@ -120,10 +131,95 @@ class DeepSeekV4Model(Decoder):
         cfg = config
 
         self.hc_mult = cfg.hc_mult
+        self.compress_ratios = tuple(cfg.compress_ratios)
+        self.window_size = cfg.window_size
+        self.block_size = cfg.block_size
 
-        self._mask_handler = cfg.mask_handler.build()
+        self._metadata_extension = cfg.metadata_extension.build()
 
         self.hc_head = cfg.hc_head.build()
+
+    def build_attention_masks(
+        self,
+        inputs,
+        labels,
+        extra_kwargs,
+        *,
+        cp_mesh: DeviceMesh | None = None,
+        load_balancer_type: str | None = None,
+    ):
+        """The model-owned per-batch metadata construction (the single
+        overridable mask-handling seam).
+
+        One entry for both modes: the common contract
+        (``build_compressed_varlen_metadata``) is always built; under CP
+        ``_build_cp_metadata`` shards the inputs and derives the rank-local
+        plan from the global context in-frame (no plan-time communication);
+        the ``metadata_extension`` (e.g. the reference tier or the CANN
+        kernel metadata) runs last.
+        """
+        positions = extra_kwargs.get("positions")
+        masks = self.get_attention_masks(positions=positions)
+        if not isinstance(masks, VarlenMetadata):
+            raise TypeError(
+                "DeepSeek-V4 compression requires a varlen stream (the "
+                "inner attention is varlen-typed), got "
+                f"{type(masks)}."
+            )
+        common = build_compressed_varlen_metadata(masks, self.compress_ratios)
+        if cp_mesh is not None:
+            inputs, labels, positions, common = self._build_cp_metadata(
+                inputs, labels, positions, common, cp_mesh, load_balancer_type
+            )
+            extra_kwargs["positions"] = positions
+        if self._metadata_extension is not None:
+            common = self._metadata_extension(common)
+        extra_kwargs["attention_masks"] = common
+        return inputs, labels, extra_kwargs
+
+    def _build_cp_metadata(
+        self, inputs, labels, positions, common, cp_mesh, load_balancer_type
+    ):
+        """The context-parallel metadata: shard the tensors via the generic
+        path and derive the rank-local plan from the global context (the
+        common metadata's varlen + the load-balancer permutation).
+
+        Returns ``(inputs, labels, positions, metadata)``."""
+        seq_len = common.seq_len
+        cp_size = cp_mesh.size(0)
+        if seq_len % cp_size != 0:
+            raise ValueError(
+                f"seq_len ({seq_len}) must be divisible by cp_size ({cp_size})."
+            )
+        shard_len = seq_len // cp_size
+        lb = (
+            _HeadTailLoadBalancer(seq_len, cp_size, cp_mesh.device_type)
+            if load_balancer_type == "headtail"
+            else None
+        )
+        (inputs, labels, positions), _ = cp_shard(
+            cp_mesh,
+            (inputs, labels, positions),
+            None,
+            load_balancer_type,
+            1,
+        )
+        rank = cp_mesh.get_local_rank()
+        cp_meta, plans, window = build_cp_plan(
+            common.varlen,
+            lb,
+            rank=rank,
+            cp_size=cp_size,
+            shard_len=shard_len,
+            window_size=self.window_size,
+            ratios=sorted(set(self.compress_ratios)),
+        )
+        return (
+            inputs,
+            labels,
+            positions,
+            CompressedVarlenMetadata(varlen=cp_meta, plans=plans, window=window),
+        )
 
     def forward(
         self,

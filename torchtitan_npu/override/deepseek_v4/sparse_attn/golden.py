@@ -22,6 +22,9 @@ import torch.nn.functional as F
 
 from torchtitan_npu.models.deepseek_v4.attention import CompressedSparseInnerAttention
 from torchtitan_npu.models.deepseek_v4.metadata import CompressedVarlenMetadata
+from torchtitan_npu.models.deepseek_v4.reference import (
+    ReferenceCompressedVarlenMetadata,
+)
 
 # Bound the ``[B, M, topk, D]`` gather used by sparse attention.
 _ATTN_CHUNK = int(os.environ.get("TTNPU_DSA_ATTN_CHUNK", "256"))
@@ -181,7 +184,7 @@ class GoldenCompressedSparseInnerAttention(CompressedSparseInnerAttention):
         idx_q,
         idx_k,
         idx_w,
-        metadata: CompressedVarlenMetadata,
+        metadata: ReferenceCompressedVarlenMetadata,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """CSA reference: FP32 indexer scores, per-document causal top-k.
 
@@ -215,10 +218,12 @@ class GoldenCompressedSparseInnerAttention(CompressedSparseInnerAttention):
                     block_docs
                 ].long()
             )
-            valid = query_docs.unsqueeze(1) == block_docs.unsqueeze(0)
-            valid = valid & (block_local.unsqueeze(0) < causal_limit.unsqueeze(1))
+            valid = torch.eq(query_docs.unsqueeze(1), block_docs.unsqueeze(0))
+            valid = torch.logical_and(
+                valid, torch.lt(block_local.unsqueeze(0), causal_limit.unsqueeze(1))
+            )
             index_score = index_score.masked_fill(
-                ~valid, torch.finfo(index_score.dtype).min
+                torch.logical_not(valid), torch.finfo(index_score.dtype).min
             )
         else:
             valid = torch.zeros(
@@ -249,7 +254,7 @@ class GoldenCompressedSparseInnerAttention(CompressedSparseInnerAttention):
         idx_w=None,
         attn_sink=None,
         *,
-        attention_masks=None,
+        attention_masks: ReferenceCompressedVarlenMetadata | None = None,
     ):
         if not isinstance(attention_masks, CompressedVarlenMetadata):
             raise TypeError(

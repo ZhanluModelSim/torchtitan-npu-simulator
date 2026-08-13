@@ -21,6 +21,8 @@ from torchtitan_npu.patches.torchtitan.models.common.linear import BatchedLinear
 
 from .compressor import Compressor, Indexer
 from .metadata import CompressedVarlenMetadata
+from .reference import ReferenceCompressedVarlenMetadata
+from .token_dispatcher import CPTokenDispatcher
 
 
 class CompressedSparseInnerAttention(FlexAttention):
@@ -38,7 +40,7 @@ class CompressedSparseInnerAttention(FlexAttention):
       reachable blocks of the same document, also a fixed pattern; for CSA
       (``compress_ratio=4``) each query attends only its top-k selected
       container slots, chosen by ``Indexer.select`` against the dense mask
-      from ``CompressedBlockMaskHandler``;
+      from the model's ``build_attention_masks``;
     - attention sink: always attendable via ``score_mod``.
 
     ``_build_block_mask`` is the single-document container formulation (kept
@@ -74,7 +76,7 @@ class CompressedSparseInnerAttention(FlexAttention):
 
     def _build_varlen_block_mask(
         self,
-        metadata: CompressedVarlenMetadata,
+        metadata: ReferenceCompressedVarlenMetadata,
         topk_indices: torch.Tensor | None,
         n_cmp: int,
         device,
@@ -188,7 +190,7 @@ class CompressedSparseInnerAttention(FlexAttention):
         idx_w=None,
         attn_sink: torch.Tensor | None = None,
         *,
-        attention_masks=None,
+        attention_masks: ReferenceCompressedVarlenMetadata | None = None,
     ) -> torch.Tensor:
         if not isinstance(attention_masks, CompressedVarlenMetadata):
             raise TypeError(
@@ -281,6 +283,12 @@ class Attention(BaseAttention):
         compressor: Compressor.Config | None
         indexer: Indexer.Config | None
 
+        # The CP token dispatcher (the RoutedExperts mirror): a submodule of
+        # the attention, wired once by ``Attention.parallelize``.
+        token_dispatcher: CPTokenDispatcher.Config = field(
+            default_factory=CPTokenDispatcher.Config
+        )
+
     def __init__(self, config: Config):
         super().__init__()
         cfg = config
@@ -291,6 +299,8 @@ class Attention(BaseAttention):
         self.compress_ratio = cfg.compress_ratio
         self.norm_eps = cfg.norm_eps
         self.rope = cfg.rope.build()
+
+        self.token_dispatcher = cfg.token_dispatcher.build()
 
         self.wq_a = cfg.wq_a.build()
         self.q_norm = cfg.q_norm.build()
@@ -305,14 +315,34 @@ class Attention(BaseAttention):
             torch.empty(cfg.n_heads, dtype=torch.float32)
         )
 
-        if cfg.compressor is not None:
-            self.compressor = cfg.compressor.build()
-        if cfg.indexer is not None:
-            self.indexer = cfg.indexer.build()
+        self.compressor = cfg.compressor.build() if cfg.compressor is not None else None
+        self.indexer = cfg.indexer.build() if cfg.indexer is not None else None
 
         self.inner_attention = cfg.inner_attention.build()
 
+    def parallelize(self, parallel_dims) -> None:
+        """Parallelize the attention, then wire the CP mesh on the
+        attention's own token dispatcher (the ``RoutedExperts.parallelize``
+        mirror).  The compressors' dispatchers are wired by their owners'
+        ``parallelize`` through the framework's ``Module.parallelize``
+        recursion."""
+        super().parallelize(parallel_dims)
+        self.token_dispatcher.wire_meshes(cp_mesh=parallel_dims.get_optional_mesh("cp"))
+
     def forward(self, x, attention_masks, positions):
+        """The unified attention forward (CP and non-CP).
+
+        The Q side and the swa projection run on the local stream; the
+        token dispatcher's ops serve every consumer with no context-
+        parallel special-casing: ``gather`` exchanges the post-RoPE
+        ``swa_k`` rows (the window plan) into the packed ori stream, the
+        compressors gather their own block rows internally, and ``select``
+        packs the pooled streams into the padded containers.  The
+        containers' all-gather is declarative — the core's
+        ``ShardingConfig`` (``cp: S(1) -> R``) emits it at the core
+        boundary.
+        """
+        window = attention_masks.window
         bsz, seqlen, _ = x.size()
         rd = self.rope_head_dim
 
@@ -321,33 +351,43 @@ class Attention(BaseAttention):
         q = q.view(bsz, seqlen, -1, self.head_dim)
         q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + self.norm_eps)
         q_nope, q_rope = torch.split(q, [self.head_dim - rd, rd], dim=-1)
-
-        swa_k = self.wkv(x)
-        swa_k = self.kv_norm(swa_k)
-        kv_bsnd = swa_k.unsqueeze(2)
-        kv_nope, kv_rope = torch.split(kv_bsnd, [self.head_dim - rd, rd], dim=-1)
-
-        q_rope, kv_rope = self.rope(q_rope, kv_rope, positions)
+        q_rope = self.rope(q_rope, positions=positions)
         q = torch.cat([q_nope, q_rope], dim=-1)
-        swa_k = torch.cat([kv_nope, kv_rope], dim=-1).squeeze(2)
+
+        # The swa projection + RoPE run on the local rows (the sender's own
+        # doc-relative positions — the attention's positions convention
+        # resets per document); the window gather exchanges the post-RoPE
+        # rows into the packed ori stream.
+        swa_k = self.kv_norm(self.wkv(x))
+        kv_nope, kv_rope = torch.split(swa_k, [self.head_dim - rd, rd], dim=-1)
+        kv_rope = self.rope(
+            kv_rope.unsqueeze(2),
+            positions=positions.reshape(1, -1),
+        ).squeeze(2)
+        swa_k = torch.cat([kv_nope, kv_rope], dim=-1)
+        swa_k = self.token_dispatcher.gather(swa_k, window)
 
         cmp_k = None
         idx_q = idx_k = idx_w = None
 
-        if self.compress_ratio > 1 and hasattr(self, "indexer"):
+        if self.compress_ratio > 1 and self.indexer is not None:
             idx_q, idx_k, idx_w = self.indexer(
                 x.detach(),
                 qr.detach(),
                 positions=positions,
                 attention_masks=attention_masks,
             )
+            # The indexer's outputs: idx_q / idx_w (local), idx_k (the
+            # pooled stream — packed into the container).
+            idx_k = self.token_dispatcher.select(idx_k, attention_masks.plans[4])
 
         if self.compress_ratio > 1:
-            cmp_k = self.compressor(
-                x,
-                positions=positions,
-                attention_masks=attention_masks,
+            assert self.compressor is not None, (
+                "compress_ratio > 1 requires the compressor submodule."
             )
+            plan = attention_masks.plans[self.compress_ratio]
+            pooled = self.compressor(x, attention_masks)
+            cmp_k = self.token_dispatcher.select(pooled, plan)
 
         # Inner-attention positional contract: absent components are None.
         #   sink + swa_k always; + cmp_k when compress_ratio > 1;

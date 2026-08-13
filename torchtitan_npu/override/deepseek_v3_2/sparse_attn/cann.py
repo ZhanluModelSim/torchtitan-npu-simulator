@@ -1,8 +1,10 @@
 """Override: run DeepSeek-V3.2 sparse attention with fused CANN kernels.
 
-The TND sequence-length mask handler and the fused attention core live
-together here.
+The TND sequence-length metadata extension and the fused attention core
+live together here.
 """
+
+from __future__ import annotations
 
 from dataclasses import dataclass
 
@@ -10,16 +12,15 @@ import spmd_types as spmd
 import torch
 import torch_npu
 from torchtitan.models.common.attention import (
-    AttentionMasksType,
     VarlenAttention,
     VarlenMetadata,
 )
 
+from torchtitan_npu.models.common.metadata_extension import MetadataExtension
 from torchtitan_npu.models.deepseek_v3_2.model import (
     SparseIndexerLoss,
 )
 from torchtitan_npu.patches.torchtitan.distributed.varlen_cp import CPVarlenMetadata
-from torchtitan_npu.patches.torchtitan.models.common.mask_handler import BaseMaskHandler
 
 
 @spmd.register_autograd_function
@@ -206,18 +207,6 @@ class CANNSparseIndexerLoss(SparseIndexerLoss):
         return self.inject(carrier, dummy / q_nope_TNH.shape[0])
 
 
-@dataclass(frozen=True, eq=False)
-class CANNVarlenMetadata:
-    """Varlen metadata with CPU sequence lengths required by TND kernels.
-
-    The handler extracts both length lists in one device-to-host transfer.
-    """
-
-    varlen_meta: VarlenMetadata | CPVarlenMetadata
-    actual_seq_qlen: list[int]
-    actual_seq_klen: list[int]
-
-
 class CANNSparseInnerAttention(VarlenAttention):
     """Sparse attention using CANN fused ops (MLA-absorb mode)."""
 
@@ -324,23 +313,36 @@ class CANNSparseInnerAttention(VarlenAttention):
 # ---------------------------------------------------------------------------
 
 
-class CANNVarlenMetadataHandler(BaseMaskHandler):
+@dataclass(frozen=True, eq=False)
+class CANNVarlenMetadata:
+    """Varlen metadata with CPU sequence lengths required by TND kernels.
+
+    The handler extracts both length lists in one device-to-host transfer.
+    """
+
+    varlen_meta: VarlenMetadata | CPVarlenMetadata
+    actual_seq_qlen: list[int]
+    actual_seq_klen: list[int]
+
+
+class CANNVarlenMetadataExtension(MetadataExtension):
+    """The CANN TND metadata extension: extracts the host sequence-length
+    lists the TND kernels require from the model-built varlen mask."""
+
     @dataclass(kw_only=True, slots=True)
-    class Config(BaseMaskHandler.Config):
+    class Config(MetadataExtension.Config):
         pass
 
-    def post_process(  # pyrefly: ignore [bad-override]
-        self, masks: AttentionMasksType
-    ) -> CANNVarlenMetadata:
-        assert isinstance(masks, (VarlenMetadata, CPVarlenMetadata)), (
-            f"expected VarlenMetadata or CPVarlenMetadata, got {type(masks)}"
+    def __call__(self, metadata) -> CANNVarlenMetadata:
+        assert isinstance(metadata, (VarlenMetadata, CPVarlenMetadata)), (
+            f"expected VarlenMetadata or CPVarlenMetadata, got {type(metadata)}"
         )
-        cu_q, cu_k = masks.cu_seq_q, masks.cu_seq_k
+        cu_q, cu_k = metadata.cu_seq_q, metadata.cu_seq_k
         actual_seq_qlen, actual_seq_klen = (
             torch.stack([cu_q[1:], cu_k[1:]]).cpu().tolist()
         )
         return CANNVarlenMetadata(
-            varlen_meta=masks,
+            varlen_meta=metadata,
             actual_seq_qlen=actual_seq_qlen,
             actual_seq_klen=actual_seq_klen,
         )

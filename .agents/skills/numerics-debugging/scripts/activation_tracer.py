@@ -60,6 +60,33 @@ from torch import nn
 from torch._subclasses.fake_tensor import FakeTensor
 
 
+def _npu_safe_norm_hash(
+    t: torch.Tensor, use_scalar: bool = False
+) -> torch.Tensor | float:
+    """Clone of DebugMode's ``norm_hash_fn`` that works on NPU.
+
+    The default L1-norm hash dispatches ``torch.linalg.vector_norm`` on
+    complex tensors, which ``aclnnLinalgVectorNorm`` does not support
+    (EZ1001 / error 161002).  Complex tensors are hashed as the L1 norm
+    of the real and imaginary parts separately (a deterministic, still
+    injective-enough fingerprint for divergence detection).
+    """
+    with torch._C._DisablePythonDispatcher():
+        if not (t.is_floating_point() or t.is_complex()):
+            t = t.float()
+        t = t.contiguous()
+        if t.is_complex():
+            out = t.real.to(dtype=torch.float64).norm(p=1) + t.imag.to(
+                dtype=torch.float64
+            ).norm(p=1)
+        else:
+            out = t.to(dtype=torch.float64).norm(p=1)
+        if use_scalar:
+            return out.item()
+        return out
+
+
+
 @dataclass
 class _StackFrame:
     filename: str
@@ -602,7 +629,9 @@ class DebugModeTracer:
         # what catches in-place mutations — ``_fused_adam_`` returns
         # None so its output is unhashable, but the per-param input
         # hashes are still recorded.
-        self._hash_ctx = DebugMode.log_tensor_hashes(hash_fn="norm", hash_inputs=True)
+        self._hash_ctx = DebugMode.log_tensor_hashes(
+            hash_fn=_npu_safe_norm_hash, hash_inputs=True
+        )
 
         # Install global forward hooks so backward ops can recover
         # their owning module's FQN via the autograd graph.  DebugMode's

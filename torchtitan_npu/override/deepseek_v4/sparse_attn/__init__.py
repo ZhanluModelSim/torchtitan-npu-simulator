@@ -1,43 +1,48 @@
 """DeepSeek-V4 sparse-attention overrides (registry-facing module).
 
-The CANN fused implementation (metadata layer + kernel) lives in
-``cann.py`` and the eager golden reference in ``golden.py``; the
-registrations are defined here so the override paths stay
-``override.deepseek_v4.sparse_attn.{cann_metadata, cann, pypto, golden}``.
+The CANN fused implementation (metadata extension + kernel) lives in
+``cann.py``, the eager golden reference in ``golden.py``; the registrations
+are defined here so the override paths stay
+``override.deepseek_v4.sparse_attn.{cann_metadata, cann, pypto, golden}``.  The
+model's ``build_attention_masks`` owns the per-batch metadata construction
+(including context parallel); the ``cann_metadata`` override injects the
+CANN kernel-metadata extension (the model dir stays backend-agnostic).
 """
 
+import spmd_types as spmd
 from torchtitan.config import derive, override
+from torchtitan.models.common.decoder_sharding import dense_param_placement
 
+from torchtitan_npu.models.common.metadata_extension import MetadataExtension
 from torchtitan_npu.models.deepseek_v4.attention import CompressedSparseInnerAttention
-from torchtitan_npu.models.deepseek_v4.metadata import CompressedBlockMaskHandler
 
 from .cann import (
     CANNCompressedSparseInnerAttention,
-    CANNCompressedVarlenMetadataHandler,
+    CANNMetadataExtension,
 )
 from .golden import GoldenCompressedSparseInnerAttention
 from .pypto import PyPTOCompressedSparseInnerAttention
 
 
 @override(
-    target=CompressedBlockMaskHandler.Config,
+    target=MetadataExtension.Config,
     description=(
-        "DSV4 varlen contract plus the precomputed CANN sparse-attention "
-        "metadata kernels"
+        "Precompute the CANN sparse-attention metadata kernels onto the "
+        "model-built DSV4 varlen contract"
     ),
 )
 def cann_metadata(
-    cfg: CompressedBlockMaskHandler.Config,
+    cfg: MetadataExtension.Config,
     *,
     num_heads: int,
     head_dim: int,
     index_n_heads: int,
     index_head_dim: int,
     index_topk: int,
-) -> CANNCompressedVarlenMetadataHandler.Config:
+) -> CANNMetadataExtension.Config:
     return derive(
         cfg,
-        CANNCompressedVarlenMetadataHandler.Config,
+        CANNMetadataExtension.Config,
         num_heads=num_heads,
         head_dim=head_dim,
         index_n_heads=index_n_heads,
@@ -61,11 +66,20 @@ def cann(
     # ``sharding_config`` is copied from the source by ``derive``; the
     # sharding pass already ran before the overrides (update_from_config),
     # so the derived config keeps the sharding-pass values as-is.
-    return derive(
+    result = derive(
         cfg,
         CANNCompressedSparseInnerAttention.Config,
         indexer_loss_coeff=indexer_loss_coeff,
     )
+    # The CANN core's own ``_indexer_loss_acc`` accumulator buffer needs its
+    # placement declared (a replicated scalar) for the state-distribution
+    # pass.
+    sharding_config = result.sharding_config
+    assert sharding_config is not None, "the cann override requires the sharding config"
+    sharding_config.state_shardings["_indexer_loss_acc"] = dense_param_placement(
+        tp=spmd.R
+    )
+    return result
 
 
 @override(

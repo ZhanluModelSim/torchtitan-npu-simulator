@@ -43,7 +43,15 @@ def apply() -> None:
     if not torch_npu.npu.is_available():
         return
 
-    from torch_npu._inductor.ascendc.lowering.common import _LoweringGuard, exclude
+    try:
+        from torch_npu._inductor.ascendc.lowering.common import (  # pyrefly: ignore [missing-import]
+            _LoweringGuard,
+            exclude,
+        )
+    except ModuleNotFoundError:
+        # The AscendC lowering module is absent in this torch_npu build; the
+        # workaround degrades gracefully (no D2H event synchronization).
+        return
 
     cast("Any", inductor_ir.DeviceCopy).create = classmethod(
         _patched_device_copy_create

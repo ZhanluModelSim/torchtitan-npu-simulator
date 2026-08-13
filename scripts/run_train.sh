@@ -39,6 +39,8 @@ export LOG_RANK=${LOG_RANK:-0}
 MODULE=${MODULE:-"torchtitan_npu.models.deepseek_v4"}
 CONFIG=${CONFIG:-"deepseek_v4_debugmodel"}
 COMM_MODE=${COMM_MODE:-""}
+CP_DEGREE=${CP_DEGREE:-0}
+CP_LOAD_BALANCER=${CP_LOAD_BALANCER:-"headtail"}
 export CLOSE_MATMUL_K_SHIFT=${CLOSE_MATMUL_K_SHIFT:-1}
 export TORCHTITAN_NPU_PATTERN_IMPORTS="${PATTERN_IMPORTS:-${TORCHTITAN_NPU_PATTERN_IMPORTS:-}}"
 
@@ -119,6 +121,19 @@ if [ -n "${COMPILE_BACKEND:-}" ]; then
         --compile.enable
         --compile.components model
         --compile.backend "${COMPILE_BACKEND}"
+    )
+fi
+
+# Context parallel (fused path only): CP_DEGREE=2 etc. enables the CP
+# parallelism flags + the spmd_types backend (the ShardingConfig emits the
+# (idx_k, cmp_k) all-gather; the CP flow itself lives in the model dir).
+# seq_len must divide by the load-balancer divisibility rule (2 * cp for
+# headtail).
+if [ "${CP_DEGREE:-0}" -gt 1 ]; then
+    ARGS+=(
+        --parallelism.context_parallel_degree "${CP_DEGREE}"
+        --parallelism.context_parallel_load_balancer "${CP_LOAD_BALANCER}"
+        --parallelism.spmd_backend spmd_types
     )
 fi
 

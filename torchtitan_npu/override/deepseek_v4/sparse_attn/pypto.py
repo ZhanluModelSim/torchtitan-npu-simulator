@@ -101,6 +101,7 @@ class _PyPTOSparseFlashMLATND(torch.autograd.Function):
         cmp_sparse_indices,
         sinks,
         cu_seqlens_q,
+        cu_seqlens_ori_kv,
         cu_seqlens_cmp_kv,
         cmp_residual_kv,
         smla_metadata,
@@ -126,7 +127,7 @@ class _PyPTOSparseFlashMLATND(torch.autograd.Function):
             ori_block_table=None,
             cmp_block_table=None,
             cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_ori_kv=cu_seqlens_q,
+            cu_seqlens_ori_kv=cu_seqlens_ori_kv,
             cu_seqlens_cmp_kv=(cu_seqlens_cmp_kv if has_compressed else None),
             cmp_residual_kv=(cmp_residual_kv if has_compressed else None),
             sinks=sinks,
@@ -148,6 +149,7 @@ class _PyPTOSparseFlashMLATND(torch.autograd.Function):
             cmp_sparse_indices,
             sinks,
             cu_seqlens_q,
+            cu_seqlens_ori_kv,
             cu_seqlens_cmp_kv,
             cmp_residual_kv,
             smla_grad_metadata,
@@ -174,6 +176,7 @@ class _PyPTOSparseFlashMLATND(torch.autograd.Function):
             cmp_sparse_indices,
             sinks,
             cu_seqlens_q,
+            cu_seqlens_ori_kv,
             cu_seqlens_cmp_kv,
             cmp_residual_kv,
             smla_grad_metadata,
@@ -204,7 +207,7 @@ class _PyPTOSparseFlashMLATND(torch.autograd.Function):
             ori_sparse_indices=None,
             cmp_sparse_indices=(cmp_sparse_indices if has_sparse_indices else None),
             cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_ori_kv=cu_seqlens_q,
+            cu_seqlens_ori_kv=cu_seqlens_ori_kv,
             cu_seqlens_cmp_kv=(cu_seqlens_cmp_kv if has_compressed else None),
             seqused_q=None,
             seqused_ori_kv=None,
@@ -271,12 +274,13 @@ class _PyPTOSparseFlashMLATND(torch.autograd.Function):
             dcmp_kv,
             None,
             dsinks,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            None,  # cu_seqlens_q
+            None,  # cu_seqlens_ori_kv
+            None,  # cu_seqlens_cmp_kv
+            None,  # cmp_residual_kv
+            None,  # smla_metadata
+            None,  # smla_grad_metadata
+            None,  # slig_metadata
             didx_q,
             didx_k,
             didx_w,
@@ -333,31 +337,26 @@ class PyPTOCompressedSparseInnerAttention(CANNCompressedSparseInnerAttention):
 
         q = q.flatten(0, 1)
         swa_k = swa_k.flatten(0, 1).unsqueeze(1).contiguous()
-        cmp_k = (
-            None
-            if cmp_k is None
-            else cmp_k.flatten(0, 1)[: plan.cu_seqlens_cmp_k[-1]]
-            .unsqueeze(1)
-            .contiguous()
+        cu_seqlens_ori_kv = (
+            metadata.window.cu_seqlens_ori_kv
+            if metadata.window is not None
+            else metadata.varlen.cu_seq_k
         )
+        cmp_k = None if cmp_k is None else self._assemble_tnd(cmp_k, plan)
 
         cmp_sparse_indices = None
         if self.compress_ratio == 4:
             if idx_q is None or idx_k is None or idx_w is None:
                 raise ValueError("ratio-4 PyPTO requires all LI projection tensors.")
             idx_q = idx_q.flatten(0, 1)
-            idx_k = (
-                idx_k.flatten(0, 1)[: plan.cu_seqlens_cmp_k[-1]]
-                .unsqueeze(1)
-                .contiguous()
-            )
+            idx_k = self._assemble_tnd(idx_k, plan)
             idx_w = idx_w.flatten(0, 1)
             cmp_sparse_indices, _ = _lightning_indexer(
                 idx_q,
                 idx_k,
                 idx_w.float(),
                 self.index_topk,
-                cu_seqlens_q=metadata.cu_seqlens_q,
+                cu_seqlens_q=metadata.varlen.cu_seq_q,
                 cu_seqlens_k=plan.cu_seqlens_cmp_k,
                 cmp_residual_k=plan.block_remainder,
                 metadata=npu.li_metadata,
@@ -375,7 +374,8 @@ class PyPTOCompressedSparseInnerAttention(CANNCompressedSparseInnerAttention):
             cmp_k,
             cmp_sparse_indices,
             attn_sink.float(),
-            metadata.cu_seqlens_q,
+            metadata.varlen.cu_seq_q,
+            cu_seqlens_ori_kv,
             plan.cu_seqlens_cmp_k,
             plan.block_remainder,
             npu.smla_metadata,

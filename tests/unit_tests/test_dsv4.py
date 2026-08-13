@@ -95,11 +95,23 @@ _CU = torch.tensor([0, 10, 27, 47, 64], dtype=torch.int32)
 
 
 def _build_layout(dsv4, window_size=8, block_size=(8, 8)):
-    """The 64-token four-document layout (ratios 1/4/128)."""
+    """The 64-token four-document layout (ratios 1/4/128) with the
+    reference tier applied (the default ``metadata_extension``)."""
     v = VarlenMetadata(cu_seq_q=_CU, cu_seq_k=_CU.clone(), max_q=17, max_k=17)
-    return dsv4.metadata.build_compressed_varlen_metadata(
-        v, (1, 4, 128), window_size=window_size, block_size=block_size
+    md = dsv4.metadata.build_compressed_varlen_metadata(v, (1, 4, 128))
+    return dsv4.reference.ReferenceMetadataExtension(
+        dsv4.reference.ReferenceMetadataExtension.Config(
+            window_size=window_size, block_size=block_size
+        )
+    )(md)
+
+
+def _pack_container(dsv4, pooled, plan):
+    """The plan-driven container pack (the dispatcher's ``select``)."""
+    disp = dsv4.token_dispatcher.CPTokenDispatcher(
+        dsv4.token_dispatcher.CPTokenDispatcher.Config()
     )
+    return disp.select(pooled, plan)
 
 
 def build_compressor(dsv4, ratio):
@@ -160,6 +172,44 @@ def manual_compress(x, md, comp, ratio):
     return out.view(md.batch_size, md.seq_len // ratio, HD)
 
 
+def _pool_blocks_where(
+    comp, block_tokens, block_positions, overlap_valid, dtype, ratio
+):
+    """The pre-refactor pooling math (two ``where`` masks) — the bitwise
+    reference for the scatter-masking implementation (exact-zero softmax
+    weights make the two forms identical)."""
+    kv = comp.wkv(block_tokens)
+    score = comp.wgate(block_tokens) + comp.ape
+    if ratio == 4:
+        head_dim = comp.head_dim
+        n = kv.shape[0]
+        overlap_kv = kv.new_zeros(n, 2 * ratio, head_dim)
+        overlap_score = score.new_full((n, 2 * ratio, head_dim), float("-inf"))
+        overlap_kv[:, ratio:] = kv[:, :, head_dim:]
+        overlap_score[:, ratio:] = score[:, :, head_dim:]
+        prev = (torch.arange(n) - 1).clamp_min(0)
+        valid = overlap_valid.view(-1, 1, 1)
+        overlap_kv[:, :ratio] = torch.where(
+            valid, kv[prev, :, :head_dim], overlap_kv[:, :ratio]
+        )
+        overlap_score[:, :ratio] = torch.where(
+            valid, score[prev, :, :head_dim], overlap_score[:, :ratio]
+        )
+        kv, score = overlap_kv, overlap_score
+    kv = (kv * score.softmax(dim=1)).sum(dim=1)
+    kv = comp.norm(kv.to(dtype))
+    nope_dim = comp.head_dim - comp.rope_head_dim
+    kv_nope, kv_rope = torch.split(kv, [nope_dim, comp.rope_head_dim], dim=-1)
+    kv_rope = (
+        comp.rope(
+            kv_rope.unsqueeze(0).unsqueeze(2), positions=block_positions.unsqueeze(0)
+        )
+        .squeeze(0)
+        .squeeze(1)
+    )
+    return torch.cat([kv_nope, kv_rope], dim=-1)
+
+
 def _build_varlen(doc_lens):
     cu = torch.tensor(
         [0, *torch.tensor(doc_lens).cumsum(0).tolist()], dtype=torch.int32
@@ -167,23 +217,25 @@ def _build_varlen(doc_lens):
     return VarlenMetadata(cu_seq_q=cu, cu_seq_k=cu.clone(), max_q=17, max_k=17)
 
 
-def _run_handler(dsv4, doc_lens, ratios, **shape):
+def _run_extension(dsv4, doc_lens, ratios, **shape):
+    """The model-built metadata + the CANN metadata extension."""
     from torchtitan_npu.override.deepseek_v4.sparse_attn.cann import (
-        CANNCompressedVarlenMetadataHandler,
+        CANNMetadataExtension,
     )
 
     v = _build_varlen(doc_lens)
-    cfg = CANNCompressedVarlenMetadataHandler.Config(
-        compress_ratios=ratios,
-        window_size=shape.get("window_size", 128),
-        block_size=shape.get("block_size", (128, 128)),
-        num_heads=shape.get("num_heads", 16),
-        head_dim=shape.get("head_dim", 512),
-        index_n_heads=shape.get("index_n_heads", 8),
-        index_head_dim=shape.get("index_head_dim", 128),
-        index_topk=shape.get("index_topk", 512),
+    md = dsv4.metadata.build_compressed_varlen_metadata(v, ratios)
+    ext = CANNMetadataExtension(
+        CANNMetadataExtension.Config(
+            window_size=shape.get("window_size", 128),
+            num_heads=shape.get("num_heads", 16),
+            head_dim=shape.get("head_dim", 512),
+            index_n_heads=shape.get("index_n_heads", 8),
+            index_head_dim=shape.get("index_head_dim", 128),
+            index_topk=shape.get("index_topk", 512),
+        )
     )
-    return CANNCompressedVarlenMetadataHandler(cfg).post_process(v)
+    return ext(md)
 
 
 def window_idxs(window_size, bsz, seqlen, device):
@@ -258,7 +310,7 @@ def inputs(dsv4):
 def test_cann_metadata_zero_block_batch_rejected_before_any_cann_call(dsv4):
     dsv4.cann_ops.calls.clear()
     with pytest.raises(ValueError, match="no complete compression block"):
-        _run_handler(dsv4, (60, 60, 60, 76), (1, 4, 128))  # ratio-128: no blocks
+        _run_extension(dsv4, (60, 60, 60, 76), (1, 4, 128))  # ratio-128: no blocks
     assert not dsv4.cann_ops.calls, (
         "CANN metadata must not be computed for an invalid batch"
     )
@@ -266,7 +318,7 @@ def test_cann_metadata_zero_block_batch_rejected_before_any_cann_call(dsv4):
 
 def test_cann_metadata_smla_fills(dsv4):
     dsv4.cann_ops.calls.clear()
-    md = _run_handler(dsv4, (256, 256, 256, 256), (1, 4, 128))
+    md = _run_extension(dsv4, (256, 256, 256, 256), (1, 4, 128))
     assert md.batch_size == 1 and md.seq_len == 1024
     smla = [c for c in dsv4.cann_ops.calls if c[0] == "sparse_flash_mla_metadata"]
     assert len(smla) == 3  # ratios 1, 4, 128
@@ -283,7 +335,7 @@ def test_cann_metadata_smla_fills(dsv4):
 
 def test_cann_metadata_grad_fills(dsv4):
     dsv4.cann_ops.calls.clear()
-    _run_handler(dsv4, (256, 256, 256, 256), (1, 4, 128))
+    _run_extension(dsv4, (256, 256, 256, 256), (1, 4, 128))
     grad = [c for c in dsv4.cann_ops.calls if c[0] == "sparse_flash_mla_grad_metadata"]
     assert len(grad) == 3
     assert all(
@@ -293,7 +345,7 @@ def test_cann_metadata_grad_fills(dsv4):
 
 def test_cann_metadata_li_and_slig_fills(dsv4):
     dsv4.cann_ops.calls.clear()
-    md = _run_handler(dsv4, (256, 256, 256, 256), (1, 4, 128))
+    md = _run_extension(dsv4, (256, 256, 256, 256), (1, 4, 128))
     li = [c for c in dsv4.cann_ops.calls if c[0] == "lightning_indexer_metadata"]
     slig = [
         c
@@ -315,13 +367,11 @@ def test_cann_metadata_li_and_slig_fills(dsv4):
 
 def test_cann_metadata_slim_contract(dsv4):
     dsv4.cann_ops.calls.clear()
-    md = _run_handler(dsv4, (256, 256, 256, 256), (1, 4, 128))
+    md = _run_extension(dsv4, (256, 256, 256, 256), (1, 4, 128))
     assert not hasattr(md, "reference")
     assert md.plans[4].cu_seqlens_cmp_k.shape[0] == 5
     assert md.plans[4].block_remainder.shape[0] == 4
-    assert md.plans[4].gather_indices.shape == (256, 4)
-    assert md.plans[128].gather_indices.shape == (8, 128)
-    assert md.cu_seqlens_q is md.varlen.cu_seq_q
+    assert md.plans[4].gather_indices.numel() == 1024
     assert md.cann_plans[4].smla_metadata is not None
     assert md.cann_plans[128].smla_metadata is not None
     assert md.cann_plans[1].smla_metadata is not None
@@ -329,7 +379,7 @@ def test_cann_metadata_slim_contract(dsv4):
 
 def test_cann_metadata_ratio128_only_model(dsv4):
     dsv4.cann_ops.calls.clear()
-    md = _run_handler(dsv4, (512, 512), (128,))
+    md = _run_extension(dsv4, (512, 512), (128,))
     assert "lightning_indexer" not in [c[0] for c in dsv4.cann_ops.calls]
     assert md.cann_plans[128].li_metadata is None
 
@@ -422,7 +472,7 @@ def test_layout_gather_indices(dsv4):
                 62,
             ],
             dtype=torch.int64,
-        ).reshape(-1, 4),
+        ),
     )
 
 
@@ -478,7 +528,7 @@ def test_layout_static_blocks(dsv4):
 def test_layout_container_round_trip(dsv4):
     p4 = _build_layout(dsv4, window_size=16).plans[4]
     x = torch.arange(64).view(1, 64).float()
-    block_tokens = x.flatten()[p4.gather_indices]
+    block_tokens = x.flatten()[p4.gather_indices].reshape(15, 4)
     container = torch.zeros(16, dtype=x.dtype)
     container[:15] = block_tokens.sum(dim=1)
     assert container[15] == 0
@@ -489,13 +539,16 @@ def test_layout_ratio128_empty(dsv4):
     md = _build_layout(dsv4, window_size=16)
     p128 = md.plans[128]
     r128 = md.reference.ratios[128]
-    assert p128.gather_indices.shape == (0, 128)
-    assert (r128.doc_of_block < 0).all()
+    assert p128.gather_indices.numel() == 0 and (r128.doc_of_block < 0).all()
     assert r128.dense_mask.shape == (1, 1, 64, 0)
     assert r128.static_blocks.shape[0] == 1  # kv_len = 65 -> window+sink only
 
 
 def test_layout_cu_q_eq_cu_k_guard(dsv4):
+    """The plain-stream guard: the common build accepts only contiguous
+    documents (``cu_seq_q == cu_seq_k``) — context-parallel plans come
+    from ``build_cp_plan``.  The reference tier keeps its own guard for
+    CP-shaped metadata."""
     bad = VarlenMetadata(
         cu_seq_q=_CU,
         cu_seq_k=torch.tensor([0, 5, 27, 47, 64]),
@@ -503,9 +556,20 @@ def test_layout_cu_q_eq_cu_k_guard(dsv4):
         max_k=27,
     )
     with pytest.raises(ValueError):
-        dsv4.metadata.build_compressed_varlen_metadata(
-            bad, (4,), window_size=16, block_size=(8, 8)
-        )
+        dsv4.metadata.build_compressed_varlen_metadata(bad, (4,))
+    # the reference tier still rejects CP-shaped metadata outright
+    md = dsv4.metadata.CompressedVarlenMetadata(
+        varlen=bad,
+        plans={
+            1: dsv4.metadata.CompressedBlockLayout(
+                cu_seqlens_cmp_k=None, block_remainder=None, gather_indices=None
+            )
+        },
+    )
+    with pytest.raises(ValueError):
+        dsv4.reference.ReferenceMetadataExtension(
+            dsv4.reference.ReferenceMetadataExtension.Config(window_size=16)
+        )(md)
 
 
 # ---------------------------------------------------------------------------
@@ -525,9 +589,10 @@ def test_compressor_numerics_ratio4(inputs):
     a 4x margin over the measured worst (~1 ulp across seeds and thread
     counts) while still flagging any multi-ulp arithmetic regression.
     """
-    dsv4, md, x, pos = inputs
+    dsv4, md, x, _pos = inputs
     comp4 = build_compressor(dsv4, 4)
-    cmp4 = comp4(x, pos, md)
+    pooled = comp4(x, md)
+    cmp4 = _pack_container(dsv4, pooled, md.plans[4])
     assert cmp4.shape == (1, 16, 16)
     ref = manual_compress(x, md, comp4, 4)
     _assert_rounding_floor((cmp4 - ref).abs(), ref.abs().max().item())
@@ -535,18 +600,51 @@ def test_compressor_numerics_ratio4(inputs):
 
 def test_compressor_numerics_ratio128(inputs):
     """C128A with zero complete blocks — shape/emptiness only (no numerics)."""
-    dsv4, md, x, pos = inputs
+    dsv4, md, x, _pos = inputs
     comp128 = build_compressor(dsv4, 128)
-    cmp128 = comp128(x, pos, md)
-    assert cmp128.shape == (1, 0, 16)
+    cmp128 = comp128(x, md)
+    assert cmp128.shape == (0, 16)
     assert cmp128.numel() == 0
 
 
-def test_compressor_rejects_non_b1_batch(inputs):
-    dsv4, md, _, _ = inputs
-    comp4 = build_compressor(dsv4, 4)
-    with pytest.raises(ValueError, match="local_batch_size == 1"):
-        comp4(torch.randn(2, 64, DIM), torch.randn(2, 64), md)
+@pytest.mark.parametrize(
+    "case,ratio",
+    [
+        pytest.param(c, r, id=f"{c[0]}-r{r}")
+        for c in [
+            ("tiny", (5, 2, 9, 1, 7, 4, 3, 8, 2, 6, 5, 3, 4, 9, 4)),
+            ("single", (7, 1)),
+            ("single-full", (8,)),
+            ("r-multiples", (8, 12, 16, 4)),
+            ("r-boundary", (9, 13, 17, 1)),
+            ("zero-block", (3, 5, 9, 7)),
+            ("plain", (10, 17, 20, 17)),
+        ]
+        for r in (4, 128)
+    ],
+)
+def test_compressor_overlap_scatter_bitwise(dsv4, case, ratio):
+    """The scatter-masked overlap (``first_indices``) is bitwise-identical
+    to the old two-``where`` form: the masked borrowed rows have exactly
+    zero softmax weight, so their kv content never contributes."""
+    name, docs = case
+    v = _build_varlen(docs)
+    md = dsv4.metadata.build_compressed_varlen_metadata(v, (ratio,))
+    plan = md.plans[ratio]
+    comp = build_compressor(dsv4, ratio)
+    torch.manual_seed(0)
+    x = torch.randn(1, sum(docs), DIM)
+    pooled = comp(x, md)
+    if pooled.shape[0] == 0:
+        return
+    bt = x.flatten(0, 1)[plan.gather_indices].reshape(pooled.shape[0], ratio, -1)
+    bids = torch.arange(pooled.shape[0])
+    seq_ids = torch.searchsorted(plan.cu_seqlens_cmp_k[1:], bids, right=True)
+    overlap_valid = (bids - plan.cu_seqlens_cmp_k[seq_ids]) != 0
+    old = _pool_blocks_where(
+        comp, bt, plan.block_positions, overlap_valid, torch.float32, ratio
+    )
+    assert torch.equal(pooled, old), name
 
 
 def test_indexer_numerics(inputs):
@@ -623,9 +721,9 @@ def _assert_attn_matches_rounding_floor(dsv4, md, x, pos, ratio, topk):
         aq = torch.randn(1, 64, 4, 8)
         ak = torch.randn(1, 16, 8)
         aw = torch.randn(1, 64, 4)
-        cmp = build_compressor(dsv4, 4)(x, pos, md)
+        cmp = _pack_container(dsv4, build_compressor(dsv4, 4)(x, md), md.plans[4])
     elif ratio > 1:
-        cmp = build_compressor(dsv4, 128)(x, pos, md)
+        cmp = _pack_container(dsv4, build_compressor(dsv4, 128)(x, md), md.plans[128])
     core, golden = _build_attn_pair(dsv4, ratio, topk)
     with torch.no_grad():
         out = core(q, swa_k, cmp, aq, ak, aw, attn_sink=sink, attention_masks=md)
@@ -648,11 +746,13 @@ def test_attention_numerics_ratio4_zero_blocks(dsv4):
     (no numerics to compare; the golden is not exercised)."""
     cu = torch.tensor([0, 3, 8], dtype=torch.int32)
     v = VarlenMetadata(cu_seq_q=cu, cu_seq_k=cu.clone(), max_q=5, max_k=5)
-    md_s = dsv4.metadata.build_compressed_varlen_metadata(
-        v, (4,), window_size=8, block_size=(8, 8)
-    )
+    md_s = dsv4.reference.ReferenceMetadataExtension(
+        dsv4.reference.ReferenceMetadataExtension.Config(
+            window_size=8, block_size=(8, 8)
+        )
+    )(dsv4.metadata.build_compressed_varlen_metadata(v, (4,)))
     comp_s = build_compressor(dsv4, 4)
-    cmp_s = comp_s(torch.randn(1, 8, DIM), torch.arange(8).unsqueeze(0), md_s)
+    cmp_s = _pack_container(dsv4, comp_s(torch.randn(1, 8, DIM), md_s), md_s.plans[4])
     assert cmp_s.shape == (1, 2, 16)
     core_s = dsv4.attention.CompressedSparseInnerAttention(
         dsv4.attention.CompressedSparseInnerAttention.Config(
@@ -704,9 +804,11 @@ def test_ported_attended_sets_match_old_formulation(dsv4, ratio, topk):
 
     cu = torch.tensor([0, seqlen], dtype=torch.int32)
     v = VarlenMetadata(cu_seq_q=cu, cu_seq_k=cu.clone(), max_q=seqlen, max_k=seqlen)
-    md = dsv4.metadata.build_compressed_varlen_metadata(
-        v, (meta_ratio,), window_size=window_size, block_size=128
-    )
+    md = dsv4.reference.ReferenceMetadataExtension(
+        dsv4.reference.ReferenceMetadataExtension.Config(
+            window_size=window_size, block_size=128
+        )
+    )(dsv4.metadata.build_compressed_varlen_metadata(v, (meta_ratio,)))
     dsa = dsv4.attention.CompressedSparseInnerAttention(
         dsv4.attention.CompressedSparseInnerAttention.Config(
             block_size=128,

@@ -39,7 +39,7 @@ def _make_trainer_config(
         metrics=MetricsProcessor.Config(log_freq=1),
         model_spec=model_spec,
         dataloader=HuggingFaceTextDataLoader.Config(dataset="c4_test"),
-        optimizer=default_adamw(lr=8e-4),
+        optimizer=default_adamw(lr=1e-5),
         lr_scheduler=LRSchedulersContainer.Config(
             warmup_steps=2,
             decay_ratio=0.8,
@@ -48,6 +48,7 @@ def _make_trainer_config(
         ),
         training=TrainingConfig(
             local_batch_size=local_batch_size,
+            global_batch_size=128,
             seq_len=seq_len,
             steps=10,
         ),

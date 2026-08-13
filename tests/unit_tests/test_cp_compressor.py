@@ -617,56 +617,6 @@ def verify_dispatcher(
         failures.append((rank, "disp", "residual"))
 
 
-def verify_unified_contract(cp_meta, ratio):
-    """Cross-check the model-dir unified ``build_kernel_layout`` against
-    the direct per-segment formulas (single source of truth for the kernel
-    contract).
-
-    The unified builder must produce, for any CP-shaped stream, the same
-    cu_seqs / residuals / complete-block gather as the experiment's own
-    derivations — and, without context parallel, exactly the contiguous
-    doc-major form.
-    """
-    _, _, cp_plans = meta_mod.build_kernel_layout(cp_meta, (ratio,))
-    plan = cp_plans[ratio]
-    cu_q, cu_k = cp_meta.cu_seq_q, cp_meta.cu_seq_k
-    kg = cp_meta.k_global_gather_indices
-    c_lens, rem = [], []
-    pieces = []
-    for s in range(len(cu_q) - 1):
-        seg_len = int(cu_q[s + 1]) - int(cu_q[s])
-        if seg_len == 0:
-            continue
-        seqlen_k = int(cu_k[s + 1]) - int(cu_k[s])
-        p0 = seqlen_k - seg_len
-        c_lens.append(seqlen_k // ratio)
-        rem.append(seqlen_k % ratio)
-        k_start = int(cu_k[s])
-        for b in range((p0 + ratio - 1) // ratio, (p0 + seg_len) // ratio):
-            start = k_start + b * ratio
-            pieces.append(kg[start : start + ratio])
-    exp_cu = torch.cat(
-        [
-            torch.zeros((1,), dtype=torch.int32),
-            torch.tensor(c_lens, dtype=torch.int32).cumsum(0, dtype=torch.int32),
-        ]
-    )
-    exp_gather = (
-        torch.stack(pieces, dim=0)
-        if pieces
-        else torch.empty((0, ratio), dtype=torch.int64)
-    )
-    assert torch.equal(plan.cu_seqlens_cmp_k, exp_cu), (plan.cu_seqlens_cmp_k, exp_cu)
-    assert torch.equal(plan.block_remainder, torch.tensor(rem, dtype=torch.int32)), (
-        plan.block_remainder,
-        rem,
-    )
-    assert torch.equal(plan.gather_indices, exp_gather), (
-        plan.gather_indices.numel(),
-        exp_gather.numel(),
-    )
-
-
 def run_case(name, docs, cp_size, lb, dtype=torch.float32, ratio=RATIO):
     """docs: doc lengths; lb: None or a load balancer instance.
 
@@ -678,9 +628,7 @@ def run_case(name, docs, cp_size, lb, dtype=torch.float32, ratio=RATIO):
     seq_len = sum(docs)
     cu = torch.tensor([0, *torch.tensor(docs).cumsum(0).tolist()], dtype=torch.int32)
     v = VarlenMetadata(cu_seq_q=cu, cu_seq_k=cu, max_q=max(docs), max_k=max(docs))
-    md = meta_mod.build_compressed_varlen_metadata(
-        v, (ratio,), window_size=8, block_size=(8, 8)
-    )
+    md = meta_mod.build_compressed_varlen_metadata(v, (ratio,))
     plan = md.plans[ratio]
     comp = build_compressor(dtype, ratio)
     comp_idx = build_compressor(dtype, ratio)  # indexer mirror (own modules)
@@ -691,13 +639,12 @@ def run_case(name, docs, cp_size, lb, dtype=torch.float32, ratio=RATIO):
     x_flat = x.flatten(0, 1)
     n_blocks = int(plan.cu_seqlens_cmp_k[-1])
     if dtype == torch.float32:
-        positions = torch.arange(seq_len).unsqueeze(0)
         with torch.no_grad():
-            container = comp(x, positions, md)
-        packed_oracle = container.flatten(0, 1)[:n_blocks]  # doc-major blocks
+            pooled = comp(x, md)
+        packed_oracle = pooled  # doc-major blocks
     else:
         if n_blocks:
-            bt_full = x_flat[plan.gather_indices]
+            bt_full = x_flat[plan.gather_indices].reshape(n_blocks, ratio, -1)
             bids = torch.arange(n_blocks)
             seq_ids = torch.searchsorted(plan.cu_seqlens_cmp_k[1:], bids, right=True)
             block_local = bids - plan.cu_seqlens_cmp_k[seq_ids]
@@ -726,7 +673,7 @@ def run_case(name, docs, cp_size, lb, dtype=torch.float32, ratio=RATIO):
         doc_blocks[ps] = packed_oracle[cu_b[d] : cu_b[d + 1]]
     # indexer oracle: the same plan with the indexer's own compressor modules
     if n_blocks:
-        bt_full = x_flat[plan.gather_indices]
+        bt_full = x_flat[plan.gather_indices].reshape(n_blocks, ratio, -1)
         bids = torch.arange(n_blocks)
         seq_ids = torch.searchsorted(plan.cu_seqlens_cmp_k[1:], bids, right=True)
         block_local = bids - plan.cu_seqlens_cmp_k[seq_ids]
@@ -768,7 +715,6 @@ def run_case(name, docs, cp_size, lb, dtype=torch.float32, ratio=RATIO):
     for rank, info in enumerate(per_rank):
         cp_meta = info["cp_meta"]
         seg_plan = rank_plan(cp_meta, shard_len, rank, ratio=ratio, doc_table=doc_table)
-        verify_unified_contract(cp_meta, ratio)
         verify_ori_ranges(cp_meta, shard_len, rank)
         borrow = sum(
             int(s["prepend_global"].numel())
@@ -1040,15 +986,29 @@ def test_cp_sweep_case(dsv4_globals, case):
     ],
 )
 def test_degeneracy(dsv4_globals, docs, ratio):
-    """Plain stream vs cp=1 ``CPVarlenMetadata``: the unified kernel
-    contract is bitwise identical — the permanent no-drift guard for the
-    non-CP path."""
+    """Plain ``build_kernel_layout`` vs the cp=1 ``build_cp_plan``: the CP
+    plan degenerates bitwise to the plain contract — the permanent
+    no-drift guard between the two plan builders."""
+    from torchtitan_npu.models.deepseek_v4.token_dispatcher import build_cp_plan
+
     seq = sum(docs)
     cu = torch.tensor([0, *torch.tensor(docs).cumsum(0).tolist()], dtype=torch.int32)
     v = VarlenMetadata(cu_seq_q=cu, cu_seq_k=cu, max_q=max(docs), max_k=max(docs))
-    _, _, plain = meta_mod.build_kernel_layout(v, (ratio,))
-    cp_meta = CPVarlenMetadata.from_global(v, FakeMesh(0, 1), 1, seq, None)
-    _, _, cp1 = meta_mod.build_kernel_layout(cp_meta, (ratio,))
-    assert torch.equal(plain[ratio].cu_seqlens_cmp_k, cp1[ratio].cu_seqlens_cmp_k)
-    assert torch.equal(plain[ratio].block_remainder, cp1[ratio].block_remainder)
-    assert torch.equal(plain[ratio].gather_indices, cp1[ratio].gather_indices)
+    plain = meta_mod.build_kernel_layout(v, (ratio,))
+    _cp_meta, cp1_plans, _window = build_cp_plan(
+        v,
+        None,
+        rank=0,
+        cp_size=1,
+        shard_len=seq,
+        window_size=8,
+        ratios=[ratio],
+    )
+    cp1 = cp1_plans[ratio]
+    assert torch.equal(plain[ratio].cu_seqlens_cmp_k, cp1.cu_seqlens_cmp_k)
+    assert torch.equal(plain[ratio].block_remainder, cp1.block_remainder)
+    # at cp=1 every row is local and the assembly order is the doc-major
+    # order, so the gather indices and the contract match bitwise
+    assert torch.equal(plain[ratio].gather_indices, cp1.gather_indices)
+    assert torch.equal(plain[ratio].block_positions, cp1.block_positions)
+    assert torch.equal(plain[ratio].first_indices, cp1.first_indices)

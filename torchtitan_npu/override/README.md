@@ -213,10 +213,10 @@ checkpoint 特性。完整的数据流、支持范围和限制见
 
 | 入口 | Target | Replacement |
 | --- | --- | --- |
-| `sparse_attn.cann_metadata` | `BaseMaskHandler.Config` | `CANNVarlenMetadataHandler.Config` |
+| `sparse_attn.cann_metadata` | `MetadataExtension.Config` | `CANNVarlenMetadataExtension.Config` |
 | `sparse_attn.cann` | `SparseInnerAttention.Config` | `CANNSparseInnerAttention.Config` |
 
-TND 稀疏注意力需要同时启用 metadata handler 和注意力内核：
+TND 稀疏注意力需要同时启用 metadata 扩展和注意力内核：
 
 ```text
 torchtitan_npu.override.deepseek_v3_2.sparse_attn.cann_metadata
@@ -232,7 +232,7 @@ torchtitan_npu.override.deepseek_v3_2.sparse_attn.cann
 
 | 入口 | Target | Replacement |
 | --- | --- | --- |
-| `sparse_attn.cann_metadata` | `CompressedBlockMaskHandler.Config` | `CANNCompressedVarlenMetadataHandler.Config` |
+| `sparse_attn.cann_metadata` | `MetadataExtension.Config` | `CANNMetadataExtension.Config` |
 | `sparse_attn.cann` | `CompressedSparseInnerAttention.Config` | `CANNCompressedSparseInnerAttention.Config` |
 | `sparse_attn.pypto` (replaces `sparse_attn.cann`) | `CompressedSparseInnerAttention.Config` | `PyPTOCompressedSparseInnerAttention.Config` |
 | `sparse_attn.golden` | `CompressedSparseInnerAttention.Config` | `GoldenCompressedSparseInnerAttention.Config` |
@@ -274,7 +274,7 @@ Golden recipe 不替换 RMSNorm 和 MoE：RMSNorm 使用模型配置中的 Torch
 gather-matmul 使用 FP32 计算，并用于与 `dsv4-infer-npu` 基线及 CANN 融合路径比较。
 
 `sparse_attn.cann` 必须与 `sparse_attn.cann_metadata` 配套使用；
-`sparse_attn.golden` 使用模型默认的 `CompressedBlockMaskHandler`，不能再启用
+`sparse_attn.golden` 使用模型默认的 metadata 构建（无扩展），不能再启用
 `sparse_attn.cann_metadata`。两种注意力实现声明同一 target，也不能同时启用。
 
 DeepSeek-V4 当前采用单行 packed container，要求 `local_batch_size == 1`；增加每步

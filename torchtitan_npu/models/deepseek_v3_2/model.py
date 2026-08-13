@@ -10,7 +10,9 @@ from dataclasses import dataclass, field
 import spmd_types as spmd
 import torch
 import torch.nn.functional as F
+from torch.distributed.device_mesh import DeviceMesh
 from torch.nn.attention.flex_attention import BlockMask, create_mask
+from torchtitan.distributed.context_parallel import prepare_context_parallel_input
 from torchtitan.distributed.utils import get_spmd_backend
 from torchtitan.models.common import LayerNorm, Linear
 from torchtitan.models.common.attention import AttentionMasksType, FlexAttention
@@ -24,11 +26,9 @@ from torchtitan.models.deepseek_v3.model import (
 )
 from torchtitan.protocols.module import Module
 
+from torchtitan_npu.models.common.metadata_extension import MetadataExtension
 from torchtitan_npu.patches.torchtitan.models.common.aux_loss import LoggedAuxLoss
 from torchtitan_npu.patches.torchtitan.models.common.linear import BatchedLinear
-from torchtitan_npu.patches.torchtitan.models.common.mask_handler import (
-    BaseMaskHandler,
-)
 
 
 @functools.cache
@@ -182,31 +182,6 @@ def _build_selected_bm(
         mask_mod=mask_mod,
         seq_lengths=(Lq, kv_len),
     )
-
-
-class BlockMaskHandler(BaseMaskHandler):
-    """Build the DSA block mask and its shared dense attendability mask."""
-
-    @dataclass(kw_only=True, slots=True)
-    class Config(BaseMaskHandler.Config):
-        pass
-
-    def post_process(  # pyrefly: ignore [bad-override]
-        self, masks
-    ):
-        assert isinstance(masks, BlockMask), f"expected BlockMask, got {type(masks)}"
-        B = masks.kv_num_blocks.shape[0]
-        seq_len = masks.seq_lengths[0]
-        device = masks.kv_num_blocks.device
-        dense_mask = create_mask(
-            masks.mask_mod,
-            B,
-            1,
-            seq_len,
-            seq_len,
-            device=device,
-        )
-        return {"block_mask": masks, "dense_mask": dense_mask}
 
 
 class SparseIndexerLoss(LoggedAuxLoss):
@@ -430,8 +405,8 @@ class DeepSeekV32Model(DeepSeekV3Model):
 
     @dataclass(kw_only=True, slots=True)
     class Config(DeepSeekV3Model.Config):
-        mask_handler: BaseMaskHandler.Config = field(
-            default_factory=BlockMaskHandler.Config
+        metadata_extension: MetadataExtension.Config = field(
+            default_factory=MetadataExtension.Config
         )
 
         def update_from_config(self, *, config, **kwargs):
@@ -450,4 +425,61 @@ class DeepSeekV32Model(DeepSeekV3Model):
 
     def __init__(self, config: Config):
         super().__init__(config)
-        self._mask_handler = config.mask_handler.build()
+        self._metadata_extension = config.metadata_extension.build()
+
+    def build_attention_masks(
+        self,
+        inputs,
+        labels,
+        extra_kwargs,
+        *,
+        cp_mesh: DeviceMesh | None = None,
+        load_balancer_type: str | None = None,
+    ):
+        """The model-owned per-batch metadata construction (the single
+        overridable mask-handling seam).
+
+        The core mask comes from the (flex- or varlen-typed) inner attention;
+        under context parallel the generic ``prepare_context_parallel_input``
+        shards it.  The DSA block mask + the shared dense attendability mask
+        are derived from a flex ``BlockMask``; a varlen mask passes through
+        to the ``metadata_extension`` (the CANN TND conversion)."""
+        positions = extra_kwargs.get("positions")
+        masks = super().get_attention_masks(positions=positions)
+        if cp_mesh is not None:
+            # ``prepare_context_parallel_input`` shards ``attention_masks``
+            # only when the key is already present (it never adds it), so the
+            # built masks must be handed over before the CP shard call.
+            extra_kwargs["attention_masks"] = masks
+            inputs, labels, extra_kwargs = prepare_context_parallel_input(
+                inputs,
+                labels,
+                extra_kwargs,
+                cp_mesh,
+                inputs.device,
+                load_balancer_type,
+            )
+            masks = extra_kwargs["attention_masks"]
+        attention_masks = (
+            self._build_block_mask(masks) if isinstance(masks, BlockMask) else masks
+        )
+        if self._metadata_extension is not None:
+            attention_masks = self._metadata_extension(attention_masks)
+        extra_kwargs["attention_masks"] = attention_masks
+        return inputs, labels, extra_kwargs
+
+    @staticmethod
+    def _build_block_mask(masks: BlockMask) -> dict:
+        """The DSA block mask and its shared dense attendability mask."""
+        B = masks.kv_num_blocks.shape[0]
+        seq_len = masks.seq_lengths[0]
+        device = masks.kv_num_blocks.device
+        dense_mask = create_mask(
+            masks.mask_mod,
+            B,
+            1,
+            seq_len,
+            seq_len,
+            device=device,
+        )
+        return {"block_mask": masks, "dense_mask": dense_mask}

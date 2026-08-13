@@ -26,9 +26,9 @@ USE_GOLDEN=0  # TEST_OVERRIDES (default):
               #   override.deepseek_v4.sparse_attn.cann
 ```
 
-融合路径必须搭配 CANN mask handler（`sparse_attn.cann_metadata`，
-geometry 由脚本按 CONFIG 注入）。golden 参考路径使用模型目录默认的
-`CompressedBlockMaskHandler`，无需额外 handler override。Golden DSA 参考
+融合路径必须搭配 CANN metadata 扩展（`sparse_attn.cann_metadata`，
+geometry 由脚本按 CONFIG 注入）。golden 参考路径使用模型默认的 metadata
+构建（无扩展），无需额外 override。Golden DSA 参考
 （eager 逐文档、FP32、与 `dsv4-infer-npu` 比特一致）用于双层数值校验：
 golden 与 patched transformers 比特一致，CANN 融合内核与 golden 在容差内
 一致。`MODULE` 默认 `torchtitan_npu.models.deepseek_v4`，保证
@@ -41,9 +41,10 @@ backports）。
 模型张量 [B, S, ...]
         │
         ├─ positions + VarlenMetadata
-        │      └─ CompressedVarlenMetadata（CompressedBlockMaskHandler 一次性构建）
+        │      └─ CompressedVarlenMetadata（build_compressed_varlen_metadata 一次性构建公共契约；
+        │         参考 tier 与 CANN 内核张量经 metadata_extension 注入）
         │
-        ├─ Compressor：按 layout.gather_indices 压缩 → 容器网格 [B, S//r, D]
+        ├─ Compressor：按统一契约（gather_indices/block_positions/first_indices）压缩 → 池化键流；CP 下 Compressor 内部 borrow 原始行（borrow_x），调用侧按 plan 的 kept_indices/out_width 装入容器网格（pack_container）
         │
         ├─ 参考内核（golden/默认）
         │     kv = [swa_k | cmp_k 容器 | sink]，文档感知 BlockMask + dense mask top-k
@@ -71,16 +72,12 @@ TND 只存在于 NPU 融合内核的局部计算中，不会成为模型公共�
 
 [`metadata.py`](../../torchtitan_npu/models/deepseek_v4/metadata.py) 定义唯一的注意力契约 `CompressedVarlenMetadata`，由同文件中的 `CompressedBlockMaskHandler`（模型目录默认 handler）每个 batch 构建一次，供所有 DSA 层复用：
 
-- `varlen`：`VarlenMetadata`，`cu_seq_q` 是序列边界的唯一权威来源。当前要求 `cu_seq_q == cu_seq_k`（尚无 context parallel）。
+- `varlen`：`VarlenMetadata`，`cu_seq_q` 是序列边界的唯一权威来源。模型目录的参考 tier 要求 `cu_seq_q == cu_seq_k`（连续文档，non-CP）；统一 kernel contract（`build_kernel_layout`）无此限制，CP 流由 CANN 融合路径消费。
 - `batch_size` / `seq_len`：容器网格形状。DSV4 打包场景使用 `local_batch_size == 1`，因此 `batch_size == 1`、`seq_len` 等于总 token 数（`cu_seq_q[-1]`），元数据完全由 varlen 流推导，不依赖 positions。
-- `doc_of_token` / `pos_in_doc`：每个 token 的文档 id 与文档内位置，供参考内核的文档感知 mask 使用。
 - `plans[ratio]`：每个模型实际使用的压缩比（1、4、128）对应一个 `CompressedBlockLayout`：
   - `cu_seqlens_cmp_k`、`block_remainder`：打包压缩块流边界与每文档尾部余数，直接喂给 CANN 算子；
-  - `gather_indices`、`block_positions`、`overlap_valid`（仅 r=4）：Compressor 的压缩指令（文档内完整块、CSA 重叠）；
-  - 容器网格头部 `n_blocks` 个槽位即打包流（B=1 契约下 `storage_indices` 是恒等映射，不再存储）；
-  - `dense_mask`：`[B, 1, S, S//r]` 稠密 attendability（同文档且因果可达），供参考 Indexer 选择；
-  - `doc_of_block` / `block_local`：容器槽位的文档 id 与文档内块下标（参考内核 mask_mod 用）；
-  - `static_blocks`：参考注意力块列表的静态部分（滑窗、sink、HCA 压缩区），`window_size`/`block_size` 为模型配置常量，handler 一次性预计算；
+  - `gather_indices`、`block_positions`、`first_indices`：统一的 Compressor 契约（块 token gather、文档内块起点 RoPE、文档/段首块位置——重叠 borrow 掩码），CP 与非 CP 以同一字段名提供（CP 下 `plans[ratio]` 即 CP ratio plan——part 1 由 `build_kernel_layout` 在虚拟增强流上推导，`block_positions` 经 `+A` 文档锚定；`first_indices` 为 plan-block 序的段首位置；非 CP 下为 `cu_seqlens_cmp_k[:-1]`）；
+  - `dense_mask` / `doc_of_block` / `block_local` / `static_blocks`：参考 tier（`reference.py`），`window_size`/`block_size` 为模型配置常量，经 `ReferenceMetadataExtension` 一次性预计算；
   - CANN `*_metadata` 张量不进入模型目录元数据；CANN override handler 返回携带 `cann_plans` 的 `CANNCompressedVarlenMetadata` 包装。
 
 一个 batch 里可以打包多条序列，所以 `B` 与序列条数无关。例如：
@@ -145,7 +142,7 @@ overlap_valid    = [F, T, F, T, T, T]  # 文档起始块没有前驱
 | --- | --- |
 | `positions` | 必须提供 `[B, S]`，且每条序列从 0 连续递增 |
 | Padding | varlen 流必须覆盖本 rank 的全部 `B * S` 个 token，metadata 不表达 padding token |
-| Context Parallel | 暂不支持；`cu_seq_q == cu_seq_k` 在构建时强制校验 |
+| Context Parallel | 支持（CANN 融合路径，`CP_DEGREE=2 ./scripts/run_train.sh`）；CP 与非 CP 共用统一的 `plans[ratio]`（两部分：统一契约 + dispatcher 字段），CP 全部逻辑在 `token_dispatcher.py`（纯全局上下文 plan + `BaseEPTokenDispatcher` 形态的 dispatcher），`cp_plan` 只提供 `borrow_swa`/`borrow_x`/`pack_container` |
 | Tensor Parallel | DSA 路径固定 TP=1（indexer score 对 head 维求和），TP 方案待 CP 之后另行设计 |
 | 空压缩流 | doc-packing 场景要求每条序列至少产生一个完整压缩块；NPU handler 对 `T_cmp=0` 直接报错（CANN CSA/HCA 不接受空 `cmp_kv`） |
 | 运行环境 | 需要 `torch_npu`、CANN、HCCL、Ascend NPU，以及匹配的 `cann_ops_transformer` |

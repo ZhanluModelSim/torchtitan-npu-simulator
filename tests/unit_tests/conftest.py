@@ -87,6 +87,12 @@ def dsv4():
 
     ns = types.SimpleNamespace()
     ns.metadata = importlib.import_module("torchtitan_npu.models.deepseek_v4.metadata")
+    ns.token_dispatcher = importlib.import_module(
+        "torchtitan_npu.models.deepseek_v4.token_dispatcher"
+    )
+    ns.reference = importlib.import_module(
+        "torchtitan_npu.models.deepseek_v4.reference"
+    )
     ns.attention = importlib.import_module(
         "torchtitan_npu.models.deepseek_v4.attention"
     )
