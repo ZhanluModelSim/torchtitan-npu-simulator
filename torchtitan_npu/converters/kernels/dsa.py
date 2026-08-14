@@ -234,6 +234,8 @@ def dsa_forward(
     # Split q_nope / q_pe
     q_nope, q_pe = torch.split(q, [self.config.kv_lora_rank, self.config.qk_rope_head_dim], dim=-1)
     k_nope, k_pe = torch.split(k, [self.config.kv_lora_rank, self.config.qk_rope_head_dim], dim=-1)
+    k_nope = k_nope.contiguous()
+    k_pe = k_pe.contiguous()
 
     output, softmax_max, softmax_sum, *_ = torch_npu.npu_sparse_flash_attention(
         q_nope,
