@@ -24,6 +24,7 @@ The kernel inputs follow the training autocast contract: q/k/v are bf16,
 kernel's dtype check.
 """
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, cast
 
@@ -46,6 +47,24 @@ from torchtitan_npu.models.deepseek_v4.metadata import (
 _LAYOUT = "TND"
 _ORI_MASK_MODE = 4
 _CMP_MASK_MODE = 3
+
+
+@dataclass(frozen=True, slots=True)
+class _SparseAttentionHooks:
+    """Operator implementation bundle used by the fused attention bridge."""
+
+    lightning_indexer: Callable[..., Any]
+    sparse_flash_mla: Callable[..., Any]
+    sparse_flash_mla_grad: Callable[..., Any]
+    sparse_lightning_indexer_kl_loss_grad: Callable[..., Any]
+
+
+_CANN_SPARSEATTN_HOOK = _SparseAttentionHooks(
+    lightning_indexer=torch.ops.cann_ops_transformer.lightning_indexer,
+    sparse_flash_mla=torch.ops.cann_ops_transformer.sparse_flash_mla,
+    sparse_flash_mla_grad=torch.ops.cann_ops_transformer.sparse_flash_mla_grad,
+    sparse_lightning_indexer_kl_loss_grad=torch.ops.cann_ops_transformer.sparse_lightning_indexer_kl_loss_grad,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -330,9 +349,10 @@ class _SparseFlashMLATND(torch.autograd.Function):
         window_size,
         indexer_loss_coeff,
         indexer_loss_accumulator,
+        hooks,
     ):
         has_compressed = ratio > 1
-        result, softmax_lse = torch.ops.cann_ops_transformer.sparse_flash_mla(
+        result, softmax_lse = hooks.sparse_flash_mla(
             q,
             ori_kv=swa_k,
             cmp_kv=cmp_k if has_compressed else None,
@@ -378,6 +398,7 @@ class _SparseFlashMLATND(torch.autograd.Function):
         ctx.window_size = window_size
         ctx.indexer_loss_coeff = indexer_loss_coeff
         ctx.indexer_loss_accumulator = indexer_loss_accumulator
+        ctx.hooks = hooks
         return result
 
     @staticmethod
@@ -410,7 +431,7 @@ class _SparseFlashMLATND(torch.autograd.Function):
             dsinks,
             _,
             cmp_softmax_l1,
-        ) = torch.ops.cann_ops_transformer.sparse_flash_mla_grad(
+        ) = ctx.hooks.sparse_flash_mla_grad(
             q,
             grad_output.contiguous(),
             result,
@@ -478,6 +499,7 @@ class _SparseFlashMLATND(torch.autograd.Function):
             None,  # window_size
             None,  # indexer_loss_coeff
             None,  # indexer_loss_accumulator
+            None,  # hooks
         )
 
     @staticmethod
@@ -504,7 +526,7 @@ class _SparseFlashMLATND(torch.autograd.Function):
             didx_k,
             didx_w,
             indexer_softmax,
-        ) = torch.ops.cann_ops_transformer.sparse_lightning_indexer_kl_loss_grad(
+        ) = ctx.hooks.sparse_lightning_indexer_kl_loss_grad(
             q=idx_q,
             k=idx_k,
             w=idx_w.float(),
@@ -565,6 +587,7 @@ class CANNCompressedSparseInnerAttention(CompressedSparseInnerAttention):
             torch.zeros((), dtype=torch.float32),
             persistent=False,
         )
+        self.hooks = _CANN_SPARSEATTN_HOOK
 
     @staticmethod
     def _assemble_tnd(container, plan) -> torch.Tensor:
@@ -586,6 +609,7 @@ class CANNCompressedSparseInnerAttention(CompressedSparseInnerAttention):
         *,
         attention_masks=None,
     ):
+        hooks = self.hooks
         if not isinstance(attention_masks, CANNCompressedVarlenMetadata):
             raise TypeError("cann requires CANNCompressedVarlenMetadata attention masks.")
         if attn_sink is None:
@@ -625,7 +649,7 @@ class CANNCompressedSparseInnerAttention(CompressedSparseInnerAttention):
             idx_q = idx_q.flatten(0, 1)
             idx_k = self._assemble_tnd(idx_k, plan)
             idx_w = idx_w.flatten(0, 1)
-            cmp_sparse_indices, _ = torch.ops.cann_ops_transformer.lightning_indexer(
+            cmp_sparse_indices, _ = hooks.lightning_indexer(
                 idx_q,
                 idx_k,
                 idx_w.float(),
@@ -665,5 +689,6 @@ class CANNCompressedSparseInnerAttention(CompressedSparseInnerAttention):
             self.window_size,
             indexer_loss_coeff,
             indexer_loss_accumulator,
+            hooks,
         )
         return output.reshape(batch_size, seqlen, *output.shape[1:])
