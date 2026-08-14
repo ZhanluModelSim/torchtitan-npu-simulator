@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 
 from torchtitan_npu.simulator.capture.dispatch_capture import OpDispatchCapture
+from torchtitan_npu.simulator.capture.saved_tensors import AutogradSavedTensorCapture
 from torchtitan_npu.simulator.memory import estimator
 from torchtitan_npu.simulator.memory.estimator import estimate_static_memory
 from torchtitan_npu.simulator.memory.export import (
@@ -18,6 +19,7 @@ from torchtitan_npu.simulator.memory.export import (
     memory_plan_to_chrome_trace,
 )
 from torchtitan_npu.simulator.memory.records import (
+    AutogradSavedTensorEvent,
     CheckpointBoundaryEvent,
     FSDPResidencyEvent,
     RawMemoryEvent,
@@ -222,6 +224,89 @@ def test_activation_offload_covers_none_mode_and_reports_each_layer():
     assert records["tensor:2"].checkpoint_id == "part0:layers.0"
     assert records["tensor:3"].checkpoint_id == "part0:layers.1"
     assert all(item.role == "activation_saved" for item in records.values())
+
+
+def test_autograd_saved_slots_release_use_def_only_activations():
+    x = tref(1)
+    saved = tref(2, 64)
+    inferred_only = tref(3, 128)
+    grad = tref(4, 64)
+    plan = estimate_static_memory(
+        [
+            event(0, 10, "aten.mm.default", inputs=[x], outputs=[saved], module_path="layers.0.attention"),
+            event(1, 11, "aten.relu.default", inputs=[saved], outputs=[inferred_only], module_path="layers.0.attention"),
+            event(5, 20, "aten.mm.default", inputs=[saved, inferred_only], outputs=[grad], phase="backward"),
+        ],
+        autograd_saved_tensor_events=[
+            AutogradSavedTensorEvent(
+                slot_id=0,
+                tensor_id=2,
+                storage_key="saved-storage",
+                storage_bytes=64,
+                num_bytes=64,
+                shape=(16,),
+                dtype="float32",
+                pack_seq=0,
+                unpack_seq=5,
+                phase="forward",
+                execution_kind="original_forward",
+            ),
+        ],
+    )
+    lifetimes = {item.tensor_id: item for item in plan.tensor_lifetimes}
+    assert lifetimes["tensor:2"].kind == "activation"
+    assert lifetimes["tensor:2"].death_seq == 5
+    assert lifetimes["tensor:3"].kind == "temporary"
+    assert lifetimes["tensor:3"].death_seq == 1
+    assert plan.to_summary_dict()["autograd_saved_activation_count"] == 1
+
+
+def test_exact_autograd_saved_slots_drive_activation_offload():
+    saved = tref(2, 64)
+    ignored = tref(3, 128)
+    plan = estimate_static_memory(
+        [
+            event(0, 10, "aten.mm.default", outputs=[saved], module_path="layers.0.attention"),
+            event(1, 11, "aten.relu.default", outputs=[ignored], module_path="layers.0.attention"),
+            event(5, 20, "aten.mm.default", inputs=[saved, ignored], phase="backward"),
+        ],
+        autograd_saved_tensor_events=[
+            AutogradSavedTensorEvent(
+                slot_id=0,
+                tensor_id=2,
+                storage_key="saved-storage",
+                storage_bytes=64,
+                num_bytes=64,
+                shape=(16,),
+                dtype="float32",
+                pack_seq=0,
+                unpack_seq=5,
+                phase="forward",
+                execution_kind="original_forward",
+            ),
+        ],
+        offload_ac_saved_tensors=True,
+    )
+    lifetimes = {item.tensor_id: item for item in plan.tensor_lifetimes}
+    assert lifetimes["tensor:2"].kind == "offloaded_activation"
+    assert lifetimes["tensor:2"].resident_num_bytes == 0
+    assert lifetimes["tensor:3"].kind == "temporary"
+    assert [item.tensor_id for item in plan.activation_offload_tensors] == ["tensor:2"]
+    summary = plan.to_summary_dict()
+    assert summary["autograd_saved_activation_count"] == 1
+    assert summary["autograd_saved_activation_modeled_bytes"] == 0
+
+
+def test_autograd_saved_tensor_capture_records_meta_pack_and_unpack():
+    capture = OpDispatchCapture(record_memory=True)
+    with capture, AutogradSavedTensorCapture():
+        x = torch.empty(4, device="meta", requires_grad=True)
+        (x * x).sum().backward()
+    capture.finalize_autograd_saved_tensors()
+    saved = capture.autograd_saved_tensor_events()
+    assert len(saved) == 2
+    assert all(item.shape == (4,) for item in saved)
+    assert all(item.unpack_seq >= item.pack_seq for item in saved)
 
 
 def test_activation_offload_preserves_pipeline_microbatch_instances():

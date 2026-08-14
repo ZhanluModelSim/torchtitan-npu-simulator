@@ -12,6 +12,7 @@ from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Iterable
 
 from torchtitan_npu.simulator.memory.records import (
+    AutogradSavedTensorEvent,
     CheckpointBoundaryEvent,
     FSDPResidencyEvent,
     MemoryActionSpan,
@@ -383,6 +384,7 @@ def estimate_schedule_memory(
     comm_events: Iterable[Any] | None = None,
     fsdp_residency_events: Iterable[FSDPResidencyEvent] | None = None,
     checkpoint_boundary_events: Iterable[CheckpointBoundaryEvent] | None = None,
+    autograd_saved_tensor_events: Iterable[AutogradSavedTensorEvent] | None = None,
     parameter_storage_dtype: str | None = None,
     offload_ac_saved_tensors: bool = False,
 ) -> MemoryPlan:
@@ -396,6 +398,7 @@ def estimate_schedule_memory(
             comm_events=comm_events,
             fsdp_residency_events=fsdp_residency_events,
             checkpoint_boundary_events=checkpoint_boundary_events,
+            autograd_saved_tensor_events=autograd_saved_tensor_events,
             parameter_storage_dtype=parameter_storage_dtype,
             offload_ac_saved_tensors=offload_ac_saved_tensors,
         )
@@ -414,6 +417,9 @@ def estimate_schedule_memory(
         comm_events=comm_events,
         fsdp_residency_events=replayed.fsdp_residency_events,
         checkpoint_boundary_events=replayed.checkpoint_boundary_events,
+        # Exact slot replay over PP templates is intentionally deferred. A
+        # raw slot cannot be reused for a different microbatch identity.
+        autograd_saved_tensor_events=None,
         parameter_storage_dtype=parameter_storage_dtype,
         offload_ac_saved_tensors=offload_ac_saved_tensors,
     )

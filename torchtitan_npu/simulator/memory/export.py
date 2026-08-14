@@ -379,6 +379,37 @@ def export_memory_details(plan: MemoryPlan, out_dir: str) -> None:
             plan.checkpoint_tensors,
         )
 
+    if plan.autograd_saved_tensors:
+        with open(
+            os.path.join(memory_dir, "autograd_saved_tensors.csv"),
+            "w",
+            newline="",
+            encoding="utf-8",
+        ) as f:
+            fieldnames = [
+                "slot_id",
+                "tensor_id",
+                "storage_key",
+                "storage_bytes",
+                "num_bytes",
+                "shape",
+                "dtype",
+                "pack_seq",
+                "unpack_seq",
+                "phase",
+                "execution_kind",
+                "module_path",
+                "pp_stage",
+                "pp_mb_idx",
+                "comp_type",
+            ]
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for item in plan.autograd_saved_tensors:
+                row = asdict(item)
+                row["shape"] = "[" + ",".join(str(dim) for dim in item.shape) + "]"
+                writer.writerow(row)
+
     if plan.activation_offload_tensors:
         _write_saved_tensor_records(
             os.path.join(memory_dir, "activation_offload_tensors.csv"),

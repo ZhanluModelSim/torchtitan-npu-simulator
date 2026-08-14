@@ -11,6 +11,7 @@ import re
 
 from torchtitan_npu.simulator.memory.plugins import MemoryModelContext, MemoryModelPlugin
 from torchtitan_npu.simulator.memory.records import (
+    AutogradSavedTensorEvent,
     CheckpointTensorRecord,
     RawMemoryEvent,
     TensorLifetime,
@@ -86,11 +87,158 @@ def _normal_backward_consumers(
 
 
 class ActivationOffloadPlugin(MemoryModelPlugin):
-    """Offload every real forward activation retained for normal backward."""
+    """Model activations retained for normal backward.
+
+    When capture observed autograd saved-tensor slots, they are the source of
+    truth. The former use-def rule remains a compatibility fallback only.
+    """
 
     def apply(self, context: MemoryModelContext) -> list[TensorLifetime]:
+        if (
+            context.autograd_saved_tensors
+            and not context.checkpoint_boundary_events
+        ):
+            return self._apply_exact_autograd_slots(context)
         if not context.offload_ac_saved_tensors:
             return []
+        return self._apply_liveness_fallback(context)
+
+    def _apply_exact_autograd_slots(
+        self,
+        context: MemoryModelContext,
+    ) -> list[TensorLifetime]:
+        """Use real autograd pack/unpack slots instead of use-def inference."""
+        event_by_seq = {event.seq_idx: event for event in context.events}
+        forward_occurrences = _layer_occurrences(context.events, phase="forward")
+        backward_occurrences = _layer_occurrences(context.events, phase="backward")
+
+        excluded_kinds = {
+            "external_input",
+            "fsdp_full_param",
+            "comm_buffer",
+            "parameter_shard",
+            "checkpoint_recompute_temp",
+        }
+        chosen_by_storage: dict[str, tuple[AutogradSavedTensorEvent, TensorLifetime]] = {}
+        for saved in context.autograd_saved_tensors:
+            if (
+                saved.phase != "forward"
+                or saved.execution_kind != "original_forward"
+                or saved.unpack_seq < 0
+            ):
+                continue
+            tensor_id = _resolve_alias(saved.tensor_id, context.alias_base_by_tensor_id)
+            lifetime = context.lifetimes_by_tensor_id.get(tensor_id)
+            if lifetime is None or lifetime.kind in excluded_kinds:
+                continue
+            existing = chosen_by_storage.get(saved.storage_key)
+            if existing is None or saved.unpack_seq > existing[0].unpack_seq:
+                chosen_by_storage[saved.storage_key] = (saved, lifetime)
+
+        selected_tensor_ids = {
+            _resolve_alias(saved.tensor_id, context.alias_base_by_tensor_id)
+            for saved, _lifetime in chosen_by_storage.values()
+        }
+        released_count = 0
+        released_bytes = 0
+        for tensor_id, lifetime in context.lifetimes_by_tensor_id.items():
+            if (
+                lifetime.producer_phase != "forward"
+                or "backward" not in lifetime.consumer_phases
+                or lifetime.kind in excluded_kinds
+                or tensor_id in selected_tensor_ids
+            ):
+                continue
+            forward_seqs = [
+                seq_idx
+                for seq_idx, phase in zip(
+                    lifetime.consumer_seqs,
+                    lifetime.consumer_phases,
+                    strict=True,
+                )
+                if phase == "forward"
+            ]
+            lifetime.death_seq = max([lifetime.birth_seq, *forward_seqs])
+            lifetime.kind = "temporary"
+            lifetime.reason = "not_autograd_saved"
+            released_count += 1
+            released_bytes += lifetime.num_bytes
+
+        recorded: set[int] = set()
+        for saved, lifetime in chosen_by_storage.values():
+            lifetime.death_seq = max(lifetime.birth_seq, saved.unpack_seq)
+            lifetime.kind = "activation"
+            lifetime.reason = "autograd_saved_tensor"
+            if context.offload_ac_saved_tensors:
+                lifetime.modeled_num_bytes = 0
+                lifetime.residency_policy = "offloaded"
+                lifetime.kind = "offloaded_activation"
+
+            if not context.offload_ac_saved_tensors or id(lifetime) in recorded:
+                continue
+            recorded.add(id(lifetime))
+            producer_event = event_by_seq.get(lifetime.birth_seq)
+            if producer_event is None:
+                continue
+            ref = _producer_ref(
+                _resolve_alias(saved.tensor_id, context.alias_base_by_tensor_id),
+                producer_event,
+                context.alias_base_by_tensor_id,
+            )
+            consumer_event = event_by_seq.get(saved.unpack_seq)
+            occurrence = (
+                backward_occurrences.get(saved.unpack_seq)
+                if consumer_event is not None
+                else None
+            )
+            if occurrence is None:
+                occurrence = forward_occurrences.get(producer_event.seq_idx)
+            if occurrence is None:
+                scope, anchor_seq = "<unattributed>", producer_event.seq_idx
+            else:
+                scope, anchor_seq = occurrence
+            target_event = consumer_event or producer_event
+            context.activation_offload_tensors.append(
+                CheckpointTensorRecord(
+                    checkpoint_id=f"part0:{scope}",
+                    marker_kind="layer" if scope != "<unattributed>" else "unattributed",
+                    seq_idx=anchor_seq,
+                    tensor_id=lifetime.tensor_id,
+                    role="activation_saved",
+                    shape=ref.shape if ref is not None else lifetime.shape,
+                    dtype=ref.dtype if ref is not None else lifetime.dtype,
+                    num_bytes=lifetime.num_bytes,
+                    modeled_num_bytes=0,
+                    requires_grad=ref.requires_grad if ref is not None else False,
+                    is_saved_activation=True,
+                    residency_policy="offloaded",
+                    pp_stage=target_event.pp_stage,
+                    pp_mb_idx=target_event.pp_mb_idx,
+                    comp_type=target_event.comp_type,
+                )
+            )
+
+        selected_bytes = sum(
+            lifetime.num_bytes for _saved, lifetime in chosen_by_storage.values()
+        )
+        context.notes.append(
+            "Autograd saved-tensor capture selected "
+            f"{len(chosen_by_storage)} unique saved storages "
+            f"({selected_bytes} logical bytes) for normal backward."
+        )
+        if released_count:
+            context.notes.append(
+                "Autograd saved-tensor capture released "
+                f"{released_count} use-def-only forward tensors "
+                f"({released_bytes} bytes) at their final forward consumer."
+            )
+        return []
+
+    def _apply_liveness_fallback(
+        self,
+        context: MemoryModelContext,
+    ) -> list[TensorLifetime]:
+        """Compatibility path for checkpointed or unreplayed PP captures."""
 
         event_by_seq = {event.seq_idx: event for event in context.events}
         backward_occurrences = _layer_occurrences(context.events, phase="backward")

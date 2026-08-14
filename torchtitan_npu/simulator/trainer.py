@@ -247,6 +247,9 @@ def run_simulation_step(
     from torchtitan_npu.simulator.capture.comm_events import (
         default_collective_context,
     )
+    from torchtitan_npu.simulator.capture.saved_tensors import (
+        AutogradSavedTensorCapture,
+    )
 
     get_optional_mesh = getattr(parallel_dims, "get_optional_mesh", None)
     tp_mesh = (
@@ -260,10 +263,15 @@ def run_simulation_step(
         else nullcontext()
     )
 
+    saved_tensor_context = (
+        AutogradSavedTensorCapture()
+        if enable_memory_tracking
+        else nullcontext()
+    )
     with capture_fake_collectives(
         memory_tracking_enabled=enable_memory_tracking,
         capture_process_rank=rank,
-    ) as comm_recorder, boundary, module_path_tracker, capture:
+    ) as comm_recorder, boundary, module_path_tracker, capture, saved_tensor_context:
         boundary.mark("forward")
         with tp_collective_context:
             forward_backward_step(
@@ -273,6 +281,7 @@ def run_simulation_step(
             )
         t2 = time.perf_counter()
         timings["forward_backward"] = t2 - t1
+        capture.finalize_autograd_saved_tensors()
 
         boundary.mark("optimizer")
         # Always capture L0 for optimizer phase (not controlled by microbatch)
@@ -349,6 +358,7 @@ def run_simulation_step(
             comm_events=comm_recorder.events,
             fsdp_residency_events=comm_recorder.fsdp_residency_events,
             checkpoint_boundary_events=capture.checkpoint_boundary_events(),
+            autograd_saved_tensor_events=capture.autograd_saved_tensor_events(),
             parameter_storage_dtype=memory_parameter_storage_dtype or None,
             offload_ac_saved_tensors=memory_offload_ac_saved_tensors,
         )

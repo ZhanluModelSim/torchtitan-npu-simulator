@@ -152,6 +152,31 @@ class CheckpointTensorRecord:
 
 
 @dataclass(slots=True)
+class AutogradSavedTensorEvent:
+    """One autograd saved-tensor slot observed during meta execution.
+
+    ``storage_key`` identifies the underlying allocation, so views and
+    repeated saves can be deduplicated by the memory model.
+    """
+
+    slot_id: int
+    tensor_id: int
+    storage_key: str
+    storage_bytes: int
+    num_bytes: int
+    shape: tuple[int, ...]
+    dtype: str
+    pack_seq: int
+    unpack_seq: int = -1
+    phase: str = ""
+    execution_kind: str = ""
+    module_path: str = ""
+    pp_stage: int = -1
+    pp_mb_idx: int = -1
+    comp_type: str = ""
+
+
+@dataclass(slots=True)
 class MemoryPlan:
     metric: str = "active_tensor_bytes"
     parameter_storage_dtype: str = ""
@@ -168,6 +193,7 @@ class MemoryPlan:
     tensor_lifetimes: list[TensorLifetime] = field(default_factory=list)
     checkpoint_tensors: list[CheckpointTensorRecord] = field(default_factory=list)
     activation_offload_tensors: list[CheckpointTensorRecord] = field(default_factory=list)
+    autograd_saved_tensors: list[AutogradSavedTensorEvent] = field(default_factory=list)
     timeline_events: list[MemoryTimelineEvent] = field(default_factory=list)
     action_spans: list[MemoryActionSpan] = field(default_factory=list)
     unclassified_ops: list[dict[str, Any]] = field(default_factory=list)
@@ -559,6 +585,11 @@ class MemoryPlan:
                 "offloaded_activation",
             }
         ]
+        autograd_saved_activation_lifetimes = [
+            item
+            for item in self.tensor_lifetimes
+            if item.reason == "autograd_saved_tensor"
+        ]
         activation_prefetch_records = self._activation_prefetch_records()
         unattributed_prefetch_records = [
             item
@@ -580,6 +611,26 @@ class MemoryPlan:
             "raw_memory_event_count": len(self.raw_events),
             "tensor_lifetime_count": len(self.tensor_lifetimes),
             "checkpoint_tensor_count": len(self.checkpoint_tensors),
+            "autograd_saved_tensor_slot_count": len(self.autograd_saved_tensors),
+            "autograd_saved_tensor_storage_count": len(
+                {item.storage_key for item in self.autograd_saved_tensors}
+            ),
+            "autograd_saved_tensor_logical_bytes": sum(
+                item.num_bytes for item in self.autograd_saved_tensors
+            ),
+            "autograd_saved_tensor_storage_bytes": sum(
+                item.storage_bytes for item in self.autograd_saved_tensors
+            ),
+            "autograd_saved_activation_count": len(
+                autograd_saved_activation_lifetimes
+            ),
+            "autograd_saved_activation_logical_bytes": sum(
+                item.num_bytes for item in autograd_saved_activation_lifetimes
+            ),
+            "autograd_saved_activation_modeled_bytes": sum(
+                item.resident_num_bytes
+                for item in autograd_saved_activation_lifetimes
+            ),
             "checkpoint_saved_activation_count": sum(
                 item.is_saved_activation and item.role == "input"
                 for item in self.checkpoint_tensors
@@ -657,6 +708,9 @@ class MemoryPlan:
         data = self.to_summary_dict()
         data["tensor_lifetimes"] = [asdict(item) for item in self.tensor_lifetimes]
         data["checkpoint_tensors"] = [asdict(item) for item in self.checkpoint_tensors]
+        data["autograd_saved_tensors"] = [
+            asdict(item) for item in self.autograd_saved_tensors
+        ]
         data["activation_offload_tensors"] = [
             asdict(item) for item in self.activation_offload_tensors
         ]

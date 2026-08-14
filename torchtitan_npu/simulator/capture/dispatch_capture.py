@@ -29,6 +29,7 @@ from torchtitan_npu.simulator.cost.op_cost_model import OpCostModel
 from torchtitan_npu.simulator.ir.op_node import OpNode
 from torchtitan_npu.simulator.ir.tensor_meta import TensorMeta
 from torchtitan_npu.simulator.memory.records import (
+    AutogradSavedTensorEvent,
     CheckpointBoundaryEvent,
     RawMemoryEvent,
     TensorRef,
@@ -193,6 +194,8 @@ class OpDispatchCapture(TorchDispatchMode):
         self._events: list[_RawEvent] = []
         self._memory_events: list[RawMemoryEvent] = []
         self._checkpoint_boundary_events: list[CheckpointBoundaryEvent] = []
+        self._autograd_saved_tensor_events: list[AutogradSavedTensorEvent] = []
+        self._pending_saved_tensor_unpacks: list[int] = []
         self._producer: dict[int, int] = {}
         self._mutation_frontier: dict[int, int] = {}
         self._tensor_identities: dict[int, tuple[weakref.ReferenceType[torch.Tensor], int]] = {}
@@ -537,6 +540,11 @@ class OpDispatchCapture(TorchDispatchMode):
                 )
             )
 
+        if self._pending_saved_tensor_unpacks:
+            for slot_id in self._pending_saved_tensor_unpacks:
+                self._autograd_saved_tensor_events[slot_id].unpack_seq = candidate.seq_idx
+            self._pending_saved_tensor_unpacks.clear()
+
         # Resolve pending comm links: if any input tensor was produced by a
         # comm op (e.g. recv/unshard), this op is the dst_entry_op consumer.
         for tid in input_ids:
@@ -559,6 +567,67 @@ class OpDispatchCapture(TorchDispatchMode):
         stable_id = raw_id if identity is None else -next(self._reused_tensor_ids)
         self._tensor_identities[raw_id] = (weakref.ref(tensor), stable_id)
         return stable_id
+
+    @staticmethod
+    def _storage_identity(tensor: torch.Tensor) -> tuple[str, int]:
+        storage = tensor.untyped_storage()
+        return str(storage._cdata), int(storage.nbytes())
+
+    def record_autograd_saved_tensor_pack(self, tensor: torch.Tensor) -> int | None:
+        """Record a real autograd save without adding a synthetic L0 op."""
+        if not self.record_memory or not self._capture_l0:
+            return None
+        storage_key, storage_bytes = self._storage_identity(tensor)
+        phase = self.phase_provider() if self.phase_provider else "forward"
+        execution_kind = current_execution_kind(phase)
+        pp_stage = -1
+        pp_mb_idx = -1
+        comp_type = ""
+        try:
+            from torchtitan_npu.simulator.meta_env import _pp_context
+            pp_stage = int(_pp_context.get("stage", -1))
+            pp_mb_idx = int(_pp_context.get("mb_idx", -1))
+            comp_type = str(_pp_context.get("comp_type", ""))
+        except Exception:
+            pass
+        slot_id = len(self._autograd_saved_tensor_events)
+        self._autograd_saved_tensor_events.append(
+            AutogradSavedTensorEvent(
+                slot_id=slot_id,
+                tensor_id=self.tensor_id(tensor),
+                storage_key=storage_key,
+                storage_bytes=storage_bytes,
+                num_bytes=tensor.numel() * tensor.element_size(),
+                shape=tuple(int(dim) for dim in tensor.shape),
+                dtype=dtype_to_str(tensor.dtype),
+                pack_seq=(self._memory_events[-1].seq_idx if self._memory_events else -1),
+                phase=phase,
+                execution_kind=execution_kind,
+                module_path=(
+                    self.module_path_tracker.current_path()
+                    if self.module_path_tracker is not None
+                    else ""
+                ),
+                pp_stage=pp_stage,
+                pp_mb_idx=pp_mb_idx,
+                comp_type=comp_type,
+            )
+        )
+        return slot_id
+
+    def record_autograd_saved_tensor_unpack(self, slot_id: int | None) -> None:
+        if slot_id is not None and self.record_memory:
+            self._pending_saved_tensor_unpacks.append(slot_id)
+
+    def finalize_autograd_saved_tensors(self) -> None:
+        """Anchor unpacks that occur after the final dispatcher-visible op."""
+        fallback_seq = (self._memory_events[-1].seq_idx + 1) if self._memory_events else 0
+        for slot_id in self._pending_saved_tensor_unpacks:
+            self._autograd_saved_tensor_events[slot_id].unpack_seq = fallback_seq
+        self._pending_saved_tensor_unpacks.clear()
+
+    def autograd_saved_tensor_events(self) -> list[AutogradSavedTensorEvent]:
+        return list(self._autograd_saved_tensor_events)
 
     def _alias_root_id(self, tensor: torch.Tensor) -> int:
         root = tensor

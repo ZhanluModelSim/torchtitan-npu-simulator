@@ -34,6 +34,7 @@ from torchtitan_npu.simulator.memory.plugins import (
     ParameterTensorMetadata,
 )
 from torchtitan_npu.simulator.memory.records import (
+    AutogradSavedTensorEvent,
     CheckpointBoundaryEvent,
     FSDPResidencyEvent,
     MemoryPlan,
@@ -223,6 +224,10 @@ def _classify_output(event: RawMemoryEvent, comm_by_op: dict[int, Any]) -> tuple
 
 
 def _finalize_kind(lifetime: TensorLifetime) -> None:
+    # The autograd saved-tensor plugin has authoritative ownership for these
+    # forward values. A graph edge into backward does not imply retention.
+    if lifetime.reason == "not_autograd_saved":
+        return
     if lifetime.kind in {
         "parameter_shard",
         "external_input",
@@ -245,7 +250,8 @@ def _finalize_kind(lifetime: TensorLifetime) -> None:
         lifetime.reason = "no_consumer"
     elif lifetime.producer_phase == "forward" and "backward" in lifetime.consumer_phases:
         lifetime.kind = "activation"
-        lifetime.reason = "forward_to_backward"
+        if lifetime.reason != "autograd_saved_tensor":
+            lifetime.reason = "forward_to_backward"
     else:
         lifetime.kind = "temporary"
         lifetime.reason = "last_consumer"
@@ -359,6 +365,7 @@ def estimate_static_memory(
     comm_events: Iterable[Any] | None = None,
     fsdp_residency_events: Iterable[FSDPResidencyEvent] | None = None,
     checkpoint_boundary_events: Iterable[CheckpointBoundaryEvent] | None = None,
+    autograd_saved_tensor_events: Iterable[AutogradSavedTensorEvent] | None = None,
     parameter_storage_dtype: str | None = None,
     offload_ac_saved_tensors: bool = False,
 ) -> MemoryPlan:
@@ -440,6 +447,7 @@ def estimate_static_memory(
         missing_parameter_gradients=missing_parameter_gradients,
         parameter_tensors=parameter_tensors,
         checkpoint_boundary_events=list(checkpoint_boundary_events or []),
+        autograd_saved_tensors=list(autograd_saved_tensor_events or []),
         alias_base_by_tensor_id=alias_base_by_tensor_id,
         offload_ac_saved_tensors=offload_ac_saved_tensors,
         notes=notes,
@@ -471,6 +479,7 @@ def estimate_static_memory(
         tensor_lifetimes=sorted(lifetimes, key=lambda item: (item.birth_seq, item.tensor_id)),
         checkpoint_tensors=plugin_context.checkpoint_tensors,
         activation_offload_tensors=plugin_context.activation_offload_tensors,
+        autograd_saved_tensors=plugin_context.autograd_saved_tensors,
         timeline_events=timeline,
         unclassified_ops=unclassified_ops,
         notes=notes,
