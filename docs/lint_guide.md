@@ -9,7 +9,7 @@ pre-commit run --all-files
 为了正确运行 pre-commit 检查，需要安装开发依赖：
 
 ```bash
-pip install -r requirements.txt -r requirements_dev.txt
+python3 -m pip install -r requirements.txt -r requirements_dev.txt
 # 下载依赖并运行检查
 pre-commit run --all-files
 ```

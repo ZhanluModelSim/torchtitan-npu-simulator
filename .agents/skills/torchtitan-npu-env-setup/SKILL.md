@@ -153,15 +153,27 @@ pip install -e .
 > pip uninstall torchtitan_npu
 > ```
 
-### Step 4：可选特性 — 算子自动融合支持
+### Step 4：可选特性 — torch.compile 支持
 
-如需启用 `torch.compile` 编译链路下的 NPU Codegen 后端，按文档执行：
+兼容版本的 `torch_npu` 已内置 AscendC Codegen 后端，无需单独安装 `torchair` 或
+`inductor-npu-ext`。通过 `torchtitan_npu.entry` 启动训练时，使用以下命令启用
+`torch.compile`，本仓会自动选择 AscendC 后端：
 
 ```bash
-git clone https://gitcode.com/Ascend/torchair.git
-cd torchair/experimental/_inductor_npu_ext/
-pip3 install -e ./python/
-cd -
+export TORCHINDUCTOR_SIZE_ASSERTS=0
+bash scripts/run_train.sh --compile.enable
+```
+
+在独立代码中直接调用 `torch.compile` 时，通过 `options` 显式选择 AscendC 后端：
+
+```python
+import torch
+import torch_npu  # noqa: F401
+
+compiled_fn = torch.compile(
+    fn,
+    options={"npu_backend": "ascendc"},
+)
 ```
 
 功能说明参考：

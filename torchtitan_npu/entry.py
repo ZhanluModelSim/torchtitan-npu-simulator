@@ -24,6 +24,12 @@ if TYPE_CHECKING:
 _SKIP_FLEX_TO_SDPA_REWRITE_MODELS = {"vlm"}
 
 
+def _configure_compile_backend() -> None:
+    from torch._inductor import config as inductor_config
+
+    inductor_config.npu_backend = "ascendc"  # pyrefly: ignore [missing-attribute]
+
+
 def main() -> None:
     """Main entry point for NPU training with new config system."""
     init_logger()
@@ -70,6 +76,8 @@ def main() -> None:
         logger.warning("There might be performance issues with activation checkpointing and torch.compile enabled!")
 
     if config.compile.enable:
+        _configure_compile_backend()
+
         if model_name == "deepseek_v3":
             # MLA performs shape inference according to the value tensor;
             # patch the meta registration so dynamo traces the right shapes.
@@ -86,17 +94,6 @@ def main() -> None:
                 )
 
                 original_meta_func.__code__ = npu_fusion_attention_forward.__code__
-
-        try:
-            # pyrefly: ignore [missing-import]
-            import inductor_npu_ext  # noqa: F401
-        except Exception as e:
-            raise RuntimeError(
-                f"compile.enable is True for {model_name} model but inductor_npu_ext is not available. "
-                "Please install inductor_npu_ext before enabling compile. "
-                "See docs/torch_compile.md for installation instructions."
-            ) from e
-
     if model_name in ("deepseek_v32", "deepseek_v4"):
         from torchtitan_npu.train import (
             _patch_init_for_dsa_set_loss_scale,

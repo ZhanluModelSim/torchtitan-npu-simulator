@@ -22,15 +22,16 @@ INTEGRATION_REPORT_DIR="${PROJECT_ROOT}/test_reports/integration_tests"
 TORCHTITAN_BRANCH="main"
 TORCHTITAN_COMMIT="ac13e536c84e7f6647b14fa9375c3c8a8a2b8578"
 TORCHTITAN_DIR="${PROJECT_ROOT}/third_party/torchtitan"
-TORCHAIR_COMMIT="3c9418c2"
-TORCHAIR_DIR="${PROJECT_ROOT}/third_party/torchair"
 DEEPSEEK_TOKENIZER_REPO="${DEEPSEEK_TOKENIZER_REPO:-https://gitcode.com/hitwdy/deepseekv4.git}"
 DEEPSEEK_V4_TOKENIZER_DIR="${PROJECT_ROOT}/tests/assets/tokenizer/deepseekv4_tokenizer"
 DEEPSEEK_V32_TOKENIZER_DIR="${PROJECT_ROOT}/tests/assets/tokenizer/deepseekv32_tokenizer"
 TIMEOUT_SECONDS=${TIMEOUT_SECONDS:-300}
 SMOKE_STEPS=${SMOKE_STEPS:-1}
 # Known false-positive patterns to exclude from error detection
-ERROR_EXCLUDE_PATTERNS=("TORCH_NCCL_ASYNC_ERROR_HANDLING")
+ERROR_EXCLUDE_PATTERNS=(
+    "TORCH_NCCL_ASYNC_ERROR_HANDLING"
+    "HCCL_ASYNC_ERROR_HANDLING is deprecated"
+)
 
 export PYTHONPATH="${PROJECT_ROOT}/tests/smoke_tests/npu_bypass_triton_codegen:${PYTHONPATH:-}"
 
@@ -42,16 +43,6 @@ _setup_env() {
     if ! python3 -c "import torchtitan_npu" 2>/dev/null; then
         python3 -m pip install -e .
     fi
-
-    # Ensure the torch.compile NPU codegen extension is installed.
-    echo "Installing inductor_npu_ext from torchair ${TORCHAIR_COMMIT}..."
-    mkdir -p third_party
-    if [[ ! -d "$TORCHAIR_DIR/.git" ]]; then
-        git clone https://gitcode.com/Ascend/torchair.git "$TORCHAIR_DIR"
-    fi
-    git -C "$TORCHAIR_DIR" fetch origin
-    git -C "$TORCHAIR_DIR" checkout "$TORCHAIR_COMMIT"
-    pip3 install -e "$TORCHAIR_DIR/experimental/_inductor_npu_ext/python/"
 
     # Clone torchtitan source if not exists
     if [[ ! -d "$TORCHTITAN_DIR/.git" ]]; then

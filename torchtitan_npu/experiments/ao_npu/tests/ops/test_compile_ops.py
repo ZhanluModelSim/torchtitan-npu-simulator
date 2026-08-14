@@ -11,17 +11,16 @@ quantization paths (MX FP8, MX FP4, Block FP8).  The key concern is that
 omitted for standard FP8 types, where the tensor's native dtype is
 sufficient, but passed for FP4 where the tensor is stored as ``uint8``.
 
-The compilation uses ``backend="inductor"`` with ``inductor_npu_ext``,
-which is the standard NPU compile path used by torchtitan-npu.
+The compilation uses ``backend="inductor"`` and selects the bundled AscendC
+codegen with the ``npu_backend`` compile option.
 
 First invocation can be slow due to TBE kernel compilation (~minutes);
 subsequent runs with the same shape use the cached graph.
 """
 
-# Extends the inductor backend for NPU; import order matters (before torch.compile).
-import inductor_npu_ext  # noqa: F401
 import pytest
 import torch
+import torch_npu  # noqa: F401
 
 from torchtitan_npu.experiments.ao_npu.torchao_npu.ops.block_ops import (
     to_block_fp8_then_mm,
@@ -35,6 +34,18 @@ from torchtitan_npu.experiments.ao_npu.torchao_npu.quantization.quant_configs im
 
 def _npu_available():
     return hasattr(torch, "npu") and torch.npu.is_available()
+
+
+def _compile_and_assert_output(model, lhs, rhs, *, expected_shape):
+    compiled = torch.compile(
+        model,
+        backend="inductor",
+        dynamic=False,
+        options={"npu_backend": "ascendc"},
+    )
+    output = compiled(lhs, rhs)
+    assert output.shape == expected_shape, f"Expected {expected_shape}, got {output.shape}"
+    assert output.dtype == torch.bfloat16
 
 
 # ============================================================================
@@ -68,11 +79,7 @@ def test_mx_fp8_matmul_compile(M, K, N):
     config = MXQuantizeConfig()  # default: float8_e4m3fn
 
     model = MXMMModel(config, config).npu()
-    compiled = torch.compile(model, backend="inductor", dynamic=False)
-
-    Y = compiled(A, B)
-    assert Y.shape == (M, N), f"Expected ({M}, {N}), got {Y.shape}"
-    assert Y.dtype == torch.bfloat16
+    _compile_and_assert_output(model, A, B, expected_shape=(M, N))
 
 
 @pytest.mark.skipif(not _npu_available(), reason="NPU not available")
@@ -102,11 +109,7 @@ def test_mx_fp4_matmul_compile(M, K, N):
     config = MXQuantizeConfig(elem_dtype=torch.float4_e2m1fn_x2)
 
     model = MXMMModel(config, config).npu()
-    compiled = torch.compile(model, backend="inductor", dynamic=False)
-
-    Y = compiled(A, B)
-    assert Y.shape == (M, N), f"Expected ({M}, {N}), got {Y.shape}"
-    assert Y.dtype == torch.bfloat16
+    _compile_and_assert_output(model, A, B, expected_shape=(M, N))
 
 
 # ============================================================================
@@ -141,11 +144,7 @@ def test_block_fp8_without_mxfp4_compile(M, K, N):
     config_B = BlockQuantizeConfig()  # no mxfp4_fake_quantize_config
 
     model = BlockMMModel(config_A, config_B).npu()
-    compiled = torch.compile(model, backend="inductor", dynamic=False)
-
-    Y = compiled(A, B)
-    assert Y.shape == (M, N), f"Expected ({M}, {N}), got {Y.shape}"
-    assert Y.dtype == torch.bfloat16
+    _compile_and_assert_output(model, A, B, expected_shape=(M, N))
 
 
 @pytest.mark.skipif(not _npu_available(), reason="NPU not available")
@@ -167,8 +166,4 @@ def test_block_fp8_with_mxfp4_compile(M, K, N):
     )
 
     model = BlockMMModel(config_A, config_B).npu()
-    compiled = torch.compile(model, backend="inductor", dynamic=False)
-
-    Y = compiled(A, B)
-    assert Y.shape == (M, N), f"Expected ({M}, {N}), got {Y.shape}"
-    assert Y.dtype == torch.bfloat16
+    _compile_and_assert_output(model, A, B, expected_shape=(M, N))

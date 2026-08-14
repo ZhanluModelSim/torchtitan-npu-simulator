@@ -24,7 +24,10 @@ def test_quant_linear_mxfp8(npu_device):
     except RuntimeError as error:
         skip_on_runtime_unsupported(
             error,
-            ("does not support opType [DynamicMxQuant]",),
+            (
+                "does not support opType [DynamicMxQuant]",
+                "SoC version ascend910b verification failed",
+            ),
             "DynamicMxQuant is not supported on the current Ascend SOC",
         )
 

@@ -38,8 +38,6 @@ $$X_{k+1} = a \cdot X_k + b \cdot X_k X_k^T X_k + c \cdot (X_k X_k^T)^2 X_k$$
 
 Muon 支持只对 Newton-Schulz 张量函数启用 `torch.compile`，编译边界只覆盖 `zeropower_via_newtonschulz5()`，其余逻辑仍保持 eager 执行。
 
-当前验证环境版本：`torch_npu 2.12.0.20260805`、`CANN 9.2.0 (20260730)`。当前版本的代码暂不支持同时开启 DSV4 的 `npu_smla` converter。
-
 启用方式是打开全局 compile，并在 `components` 中包含 `"muon"`：
 
 ```python

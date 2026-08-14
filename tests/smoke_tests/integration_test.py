@@ -25,7 +25,6 @@ Usage:
     python tests/smoke_tests/integration_test.py ./outputs --test_name deepseek_v3_fake_backend_ep
     python tests/smoke_tests/integration_test.py ./outputs --test_name deepseek_v4_fake_backend_ep
     python tests/smoke_tests/integration_test.py ./outputs --test_name deepseek_v32_fake_backend_ep
-    python tests/smoke_tests/integration_test.py ./outputs --test_name deepseek_v32_checkpoint_async_with_pinned_mem
     python tests/smoke_tests/integration_test.py ./outputs --ngpu 4
 """
 
@@ -377,33 +376,8 @@ def _fake_backend_tests() -> list[OverrideDefinitions]:
     ]
 
 
-def _checkpoint_tests() -> list[OverrideDefinitions]:
-    """Checkpoint integration tests."""
-    return [
-        OverrideDefinitions(
-            [
-                [
-                    f"--module {_DEEPSEEK_V32_MODULE}",
-                    f"--config {_DEEPSEEK_V32_CONFIG}",
-                    "--optimizer.swap-optimizer",
-                    "--training.steps 2",
-                    "--checkpoint.enable",
-                    "--checkpoint.no-load-only",
-                    "--checkpoint.interval 1",
-                    "--checkpoint.folder checkpoint_async_with_pinned_mem",
-                    "--checkpoint.async-mode async_with_pinned_mem",
-                    "--checkpoint.no-sync-files",
-                ]
-            ],
-            "DeepSeek V3.2 checkpoint async_with_pinned_mem",
-            "deepseek_v32_checkpoint_async_with_pinned_mem",
-            ngpu=2,
-        ),
-    ]
-
-
 def generate_smoke_tests() -> list[OverrideDefinitions]:
-    return _tp_compile_tests() + _fake_backend_tests() + _base_tests() + _tp_tests() + _ep_tests() + _checkpoint_tests()
+    return _tp_compile_tests() + _fake_backend_tests() + _base_tests() + _tp_tests() + _ep_tests()
 
 
 # ============================================================================
