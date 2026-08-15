@@ -14,7 +14,7 @@ from torchtitan.protocols.module import Module
 
 
 class BatchedLinear(Module):
-    """Per-head linear map from ``(*, H, D_in)`` to ``(*, H, D_out)``."""
+    """Per-head linear map with a flattened ``[H * D_out, D_in]`` weight."""
 
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
@@ -25,10 +25,17 @@ class BatchedLinear(Module):
 
     def __init__(self, config: Config):
         super().__init__()
-        self.weight = nn.Parameter(torch.empty(config.n_heads, config.out_features, config.in_features))
+        self.out_features = config.out_features
+        self.weight = nn.Parameter(
+            torch.empty(
+                config.n_heads * config.out_features,
+                config.in_features,
+            )
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         *prefix, H, D_in = x.shape
+        weight = self.weight.view(H, self.out_features, D_in)
         x_h = x.reshape(-1, H, D_in).transpose(0, 1)  # (H, T, D_in)
-        out = torch.bmm(x_h, self.weight.transpose(-2, -1))  # (H, T, D_out)
+        out = torch.bmm(x_h, weight.transpose(-2, -1))  # (H, T, D_out)
         return out.transpose(0, 1).reshape(*prefix, H, -1)

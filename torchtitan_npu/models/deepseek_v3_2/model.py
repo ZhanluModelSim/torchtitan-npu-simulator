@@ -11,6 +11,7 @@ import spmd_types as spmd
 import torch
 import torch.nn.functional as F
 from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.tensor import DTensor, Replicate
 from torch.nn.attention.flex_attention import BlockMask, create_mask
 from torchtitan.distributed.context_parallel import prepare_context_parallel_input
 from torchtitan.distributed.utils import get_spmd_backend
@@ -302,6 +303,18 @@ class Attention(V3Attention):
         self.register_state_dict_post_hook(self._merge_wkv_b_on_save)
         self.register_load_state_dict_pre_hook(self._split_wkv_b_on_load)
 
+    @staticmethod
+    def _redistribute_state_dict_tensor(
+        tensor: torch.Tensor,
+        placements=None,
+    ) -> torch.Tensor:
+        """Redistribute a state-dict tensor to the requested placements."""
+        if not isinstance(tensor, DTensor):
+            return tensor
+        if placements is None:
+            placements = [Replicate()] * tensor.device_mesh.ndim
+        return tensor.redistribute(tensor.device_mesh, placements)
+
     def forward(  # pyrefly: ignore [bad-param-name-override]
         self,
         x_BLD: torch.Tensor,
@@ -355,15 +368,30 @@ class Attention(V3Attention):
     def _split_wkv_b_on_load(module, state_dict, prefix, *args):
         wkv_key = f"{prefix}wkv_b.weight"
         wkv_b = state_dict.pop(wkv_key)
+        placements = wkv_b.placements if isinstance(wkv_b, DTensor) else None
+        wkv_b = Attention._redistribute_state_dict_tensor(wkv_b)
+
         wkv_b_3d = wkv_b.view(module.n_heads, -1, module.kv_lora_rank)
-        state_dict[f"{prefix}w_uk.weight"] = wkv_b_3d[:, : module.qk_nope_head_dim, :].transpose(-2, -1).contiguous()
-        state_dict[f"{prefix}w_uv.weight"] = wkv_b_3d[:, module.qk_nope_head_dim :, :].contiguous()
+        w_uk = wkv_b_3d[:, : module.qk_nope_head_dim, :].transpose(-2, -1).contiguous()
+        w_uv = wkv_b_3d[:, module.qk_nope_head_dim :, :].contiguous()
+        w_uk = w_uk.reshape(-1, module.qk_nope_head_dim)
+        w_uv = w_uv.reshape(-1, module.kv_lora_rank)
+
+        state_dict[f"{prefix}w_uk.weight"] = Attention._redistribute_state_dict_tensor(w_uk, placements)
+        state_dict[f"{prefix}w_uv.weight"] = Attention._redistribute_state_dict_tensor(w_uv, placements)
 
     @staticmethod
     def _merge_wkv_b_on_save(module, state_dict, prefix, local_metadata):
         w_uk = state_dict.pop(f"{prefix}w_uk.weight")
         w_uv = state_dict.pop(f"{prefix}w_uv.weight")
+        placements = w_uk.placements if isinstance(w_uk, DTensor) else None
+        w_uk = Attention._redistribute_state_dict_tensor(w_uk)
+        w_uv = Attention._redistribute_state_dict_tensor(w_uv)
+
+        w_uk = w_uk.view(module.n_heads, module.kv_lora_rank, module.qk_nope_head_dim)
+        w_uv = w_uv.view(module.n_heads, module.v_head_dim, module.kv_lora_rank)
         wkv_b = torch.cat([w_uk.transpose(-2, -1), w_uv], dim=1).reshape(-1, module.kv_lora_rank)
+        wkv_b = Attention._redistribute_state_dict_tensor(wkv_b, placements)
         state_dict[f"{prefix}wkv_b.weight"] = wkv_b.contiguous()
 
 

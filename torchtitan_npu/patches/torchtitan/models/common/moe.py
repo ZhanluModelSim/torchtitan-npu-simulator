@@ -146,6 +146,12 @@ class HashMoE(MoE):
     class Config(MoE.Config):
         pass
 
+    def __init__(self, config: Config):
+        super().__init__(config)
+        # [TODO] need to add https://github.com/pytorch/torchtitan/pull/3634
+        if getattr(self.router, "hash", False):
+            del self.expert_bias_E
+
     def forward(self, x_BLD: torch.Tensor, *, input_ids: torch.Tensor | None = None) -> torch.Tensor:
         """Forward through the router (with optional ``input_ids``) and experts.
 

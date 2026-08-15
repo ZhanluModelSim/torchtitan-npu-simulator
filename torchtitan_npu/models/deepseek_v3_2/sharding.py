@@ -41,8 +41,8 @@ def _apply_v3_2_attention_sharding(
     *,
     enable_sp: bool,
 ) -> None:
-    # ``w_uk`` and ``w_uv`` hold independent per-head matrices, so TP shards
-    # dimension 0 instead of using DeepSeek V3's unused ``wkv_b`` layout.
+    # ``w_uk`` and ``w_uv`` store independent per-head matrices flattened
+    # across head and output dimensions, so TP shards their row dimension.
     attention.w_uk.sharding_config = ShardingConfig(
         state_shardings={"weight": dense_param_placement(tp=spmd.S(0))},
     )

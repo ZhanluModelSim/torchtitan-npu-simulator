@@ -9,6 +9,7 @@ from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.optimizer import default_adamw
 from torchtitan.config import CompileConfig, ParallelismConfig, TrainingConfig
+from torchtitan.distributed.activation_checkpoint import FullAC
 from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
 from torchtitan.models.common.config_utils import decoder_vocab_size
 from torchtitan.tools.profiler import Profiler
@@ -39,23 +40,26 @@ def _make_trainer_config(
         metrics=MetricsProcessor.Config(log_freq=1),
         model_spec=model_spec,
         dataloader=HuggingFaceTextDataLoader.Config(dataset="c4_test"),
-        optimizer=default_adamw(lr=1e-5),
+        optimizer=default_adamw(
+            lr=1e-5,
+            eps=1e-6,
+        ),
         lr_scheduler=LRSchedulersContainer.Config(
-            warmup_steps=2,
+            warmup_steps=20,
             decay_ratio=0.8,
-            decay_type="linear",
-            min_lr_factor=0.0,
+            decay_type="cosine",
+            min_lr_factor=0.01,
         ),
         training=TrainingConfig(
             local_batch_size=local_batch_size,
-            global_batch_size=128,
             seq_len=seq_len,
-            steps=10,
+            steps=100,
         ),
         parallelism=ParallelismConfig(
             expert_parallel_degree=1,
+            fsdp_reshard_after_forward="always",
         ),
-        activation_checkpoint=None,
+        activation_checkpoint=FullAC.Config(),
         compile=CompileConfig(enable=False),
         checkpoint=CheckpointManager.Config(
             enable=False,
@@ -70,6 +74,14 @@ def deepseek_v4_debugmodel() -> Trainer.Config:
 
 def deepseek_v4_flash() -> Trainer.Config:
     return _make_trainer_config("deepseek_v4_flash", local_batch_size=1, seq_len=4096)
+
+
+def deepseek_v4_flash_43layers_16experts() -> Trainer.Config:
+    return _make_trainer_config(
+        "deepseek_v4_flash_43layers_16experts",
+        local_batch_size=1,
+        seq_len=4096,
+    )
 
 
 def deepseek_v4_pro() -> Trainer.Config:

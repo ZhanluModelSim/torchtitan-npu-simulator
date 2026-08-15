@@ -617,6 +617,8 @@ def _debugmodel(
 def _deepseek_v4_flash(
     moe_comm_backend: str = "standard",
     non_blocking_capacity_factor: float | None = None,
+    *,
+    num_experts: int = 256,
 ) -> DeepSeekV4Model.Config:
     return _make_v4_config(
         dim=4096,
@@ -635,7 +637,7 @@ def _deepseek_v4_flash(
         index_head_dim=128,
         index_topk=512,
         moe_inter_dim=2048,
-        num_experts=256,
+        num_experts=num_experts,
         num_shared_experts=1,
         top_k=6,
         n_hash_layers=3,
@@ -699,6 +701,10 @@ def _deepseek_v4_pro(
 deepseek_v4_configs = {
     "debugmodel": _debugmodel,
     "deepseek_v4_flash": _deepseek_v4_flash,
+    "deepseek_v4_flash_43layers_16experts": partial(
+        _deepseek_v4_flash,
+        num_experts=16,
+    ),
     "deepseek_v4_pro": _deepseek_v4_pro,
 }
 

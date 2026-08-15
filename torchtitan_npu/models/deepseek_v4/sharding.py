@@ -123,8 +123,8 @@ def set_deepseek_v4_attention_sharding(attention_cfg, *, enable_sp):
     at.wq_b.sharding_config = colwise_config()
     at.wkv.sharding_config = _replicate_weight
     at.kv_norm.sharding_config = _replicate_weight
-    # ``wo_a`` is a BatchedLinear of per-group matrices, so TP shards its
-    # group dimension (dim 0), like dsv3.2's ``w_uv``.
+    # ``wo_a`` stores per-group matrices flattened across group and output
+    # dimensions, so TP shards its flattened row dimension (dim 0).
     at.wo_a.sharding_config = ShardingConfig(state_shardings={"weight": dense_param_placement(tp=spmd.S(0))})
     at.wo_b.sharding_config = rowwise_config(output_sp=enable_sp)
     at.rope.sharding_config = ShardingConfig(
