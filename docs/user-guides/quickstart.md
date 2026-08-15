@@ -1,9 +1,9 @@
 # 快速上手
 
-参考 [软件安装](./installation.md) 准备环境后，以DeepSeek-V3.2模型为例，按照如下步骤在 NPU 平台上运行
-torchtitan-npu。
+参考 [软件安装](./installation.md) 准备环境后，即可在 NPU 平台上运行 torchtitan-npu。
+`scripts/run_train.sh` 默认使用 Qwen3-0.6B debug 配置；下文同时提供 DeepSeek-V3.2 示例。
 
-## 数据准备
+## 数据准备（DeepSeek-V3.2 示例）
 
 1. 准备 Tokenizer [（以 DeepSeek-V3.2 网络为例）](https://huggingface.co/deepseek-ai/DeepSeek-V3.2/tree/main)。
 
@@ -27,6 +27,8 @@ hf_assets_path="./deepseekv3.2-tokenizer",
 测试场景可直接使用项目预置在 `tests/assets/tokenizer/deepseekv3_tokenizer/` 的 tokenizer，无需重复下载：
 
 ```bash
+MODULE=torchtitan_npu.models.deepseek_v32 \
+CONFIG=deepseek_v32_671b_4layers_debug \
 bash scripts/run_train.sh --hf_assets_path ./tests/assets/tokenizer/deepseekv3_tokenizer
 ```
 
@@ -62,8 +64,18 @@ source /usr/local/Ascend/cann/opp/vendors/custom_transformer/bin/set_env.bash
 
 ### 单机训练任务
 
-默认配置，以 16 NPU 启动 DeepSeek-V3.2 4层debug模型训练任务：
+脚本默认配置以 16 NPU 启动 Qwen3-0.6B debug 模型训练任务：
 ```bash
+bash scripts/run_train.sh
+```
+该默认配置使用项目预置的 `tests/assets/tokenizer/qwen3-tokenizer/` 和 `tests/assets/c4_test/`，不依赖上方的 DeepSeek tokenizer。
+
+本页前面的数据准备以 DeepSeek-V3.2 为例。如需启动 DeepSeek-V3.2 4 层 debug
+模型，请显式指定对应的模块和配置：
+
+```bash
+MODULE=torchtitan_npu.models.deepseek_v32 \
+CONFIG=deepseek_v32_671b_4layers_debug \
 bash scripts/run_train.sh
 ```
 
@@ -76,8 +88,8 @@ bash scripts/run_train.sh \
 ```
 
 > [!NOTE]
-> * `MODULE`: 指定模型 Python 模块，默认 `torchtitan_npu.models.deepseek_v32`。切换模型时改为对应模块，例如 DeepSeek-V4 改为 `torchtitan_npu.models.deepseek_v4`。
-> * `CONFIG`: 指定 `config_registry.py` 中的配置函数，默认 `deepseek_v32_671b_4layers_debug`。需与 `MODULE` 对应同一模型，例如 DeepSeek-V4 改为 `debug_deepseek_v4_flash_single_node`。
+> * `MODULE`: 指定模型 Python 模块，默认 `torchtitan_npu.models.qwen3`。切换模型时改为对应模块，例如 DeepSeek-V3.2 改为 `torchtitan_npu.models.deepseek_v32`，DeepSeek-V4 改为 `torchtitan_npu.models.deepseek_v4`。
+> * `CONFIG`: 指定 `config_registry.py` 中的配置函数，默认 `debug_qwen3_06b_single_node`。需与 `MODULE` 对应同一模型，例如 DeepSeek-V3.2 4 层 debug 配置为 `deepseek_v32_671b_4layers_debug`，DeepSeek-V4 改为 `debug_deepseek_v4_flash_single_node`。
 > * `NGPU`: 指定单机或多机每节点参与训练的 NPU 数量；`scripts/run_train.sh` 默认值为 16，`scripts/run_train_multinodes.sh` 默认值为 8。
 > * `training.allow_hf32`：控制 NPU MatMul、Conv、aclnn 算子是否启用 HF32，默认启用，无需传参；关闭时添加 `--training.no-allow_hf32`，这是 Tyro 为该布尔字段自动生成的反向选项。
 > * `--training.steps` 与 `--training.global_batch_size`: 动态覆盖 registry 配置中的字段。

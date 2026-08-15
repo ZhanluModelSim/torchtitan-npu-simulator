@@ -10,6 +10,8 @@ bash .ci/unit_test.sh
 python3 -m pytest -v --tb=short tests/unit_tests
 ```
 
+`.ci/unit_test.sh` 会依次执行两组单元测试。即使上游 UT 失败，本仓 UT 仍会继续执行；两组测试结束后脚本会输出退出码汇总，任意一组失败时最终返回非零退出码。
+
 ### 冒烟测试
 ```bash
 # 运行 smoke 套件（torchtitan-npu 集成 smoke + tests/smoke_tests）

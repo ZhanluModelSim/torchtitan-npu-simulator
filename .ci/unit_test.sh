@@ -19,6 +19,7 @@ TORCHTITAN_BRANCH="main"
 TORCHTITAN_COMMIT="ac13e536c84e7f6647b14fa9375c3c8a8a2b8578"
 TITAN_DIR="${PROJECT_ROOT}/third_party/torchtitan"
 TIMEOUT_SECONDS=${TIMEOUT_SECONDS:-300}
+upstream_exit_code=0
 
 
 # Run torchtitan upstream unit tests (with NPU patches applied)
@@ -98,10 +99,24 @@ EOF
         echo "No torchtitan tests found to run."
     else
         echo "Torchtitan upstream tests failed (exit_code=$exit_code)"
-        exit $exit_code
+        upstream_exit_code=$exit_code
     fi
+
+    return 0
 }
 
 run_upstream_ut
 cd "$PROJECT_ROOT"
-PYTHONPATH="${TITAN_DIR}:${PROJECT_ROOT}:${PYTHONPATH}" python3 -m pytest -v --tb=short tests/unit_tests
+if PYTHONPATH="${TITAN_DIR}:${PROJECT_ROOT}:${PYTHONPATH}" \
+    python3 -m pytest -v --tb=short tests/unit_tests; then
+    local_exit_code=0
+else
+    local_exit_code=$?
+fi
+
+echo "Unit test summary: upstream=${upstream_exit_code}, torchtitan-npu=${local_exit_code}"
+
+if [[ $upstream_exit_code -ne 0 ]]; then
+    exit "$upstream_exit_code"
+fi
+exit "$local_exit_code"
