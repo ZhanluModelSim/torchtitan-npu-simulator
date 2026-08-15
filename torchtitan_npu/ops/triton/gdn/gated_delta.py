@@ -10,7 +10,7 @@ import triton
 import triton.language as tl
 from torch import Tensor
 
-# pylint: disable=huawei-too-many-arguments
+# pylint: disable=huawei-too-many-arguments,huawei-too-many-return-values
 _CHUNK_SIZE, _VALUE_BLOCK_SIZE = 64, 16
 _GatedDeltaInputs = tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]
 
@@ -42,7 +42,7 @@ def _kernel_context(tokens, heads, dim, chunk_size, value_block_size):
     vd = value_block * value_block_size + tl.arange(0, value_block_size)
     matrix = d[:, None] * dim + vd[None, :]
     checkpoint_base = head_batch * (tokens // chunk_size) * dim * dim
-    return (blocks, value_block, head_batch, head, batch), (d, vd, matrix, checkpoint_base)
+    return blocks, value_block, head_batch, head, batch, d, vd, matrix, checkpoint_base
 
 
 @triton.jit
@@ -79,7 +79,7 @@ def _gated_delta_forward_kernel(
     store_output: tl.constexpr,
     store_checkpoints: tl.constexpr,
 ):
-    (_blocks, _value_block, _head_batch, head, batch), (d, vd, matrix, checkpoint_base) = _kernel_context(
+    _blocks, _value_block, _head_batch, head, batch, d, vd, matrix, checkpoint_base = _kernel_context(
         tokens, heads, dim, chunk_size, value_block_size
     )
     state = tl.zeros((dim, value_block_size), tl.float32)
@@ -126,7 +126,7 @@ def _gated_delta_backward_kernel(
     chunk_size: tl.constexpr,
     value_block_size: tl.constexpr,
 ):
-    (blocks, value_block, head_batch, head, batch), (d, vd, matrix, checkpoint_base) = _kernel_context(
+    blocks, value_block, head_batch, head, batch, d, vd, matrix, checkpoint_base = _kernel_context(
         tokens, heads, dim, chunk_size, value_block_size
     )
     scratch_base = head_batch * (chunk_size + 1) * dim * dim
