@@ -104,6 +104,8 @@
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../low-precision-sim-analysis/">低精度训练（MXFP8）Simulator 使能分析</a>
                   </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../megatron-activation-memory-deepseek-v4/">Megatron Activation Estimate vs DeepSeek V4</a>
+                  </li>
                   <li class="toctree-l1"><a class="reference internal" href="../optimizer-ops-analysis/">优化器算子捕获问题分析</a>
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../pipeline-multi-graph-capture-design/">复杂 Pipeline 策略下完整计算图捕获方案设计</a>
@@ -245,8 +247,8 @@
 </tr>
 <tr>
 <td>Gated MLA attention core</td>
-<td><code>gated_mla</code></td>
-<td><code>gated_mla_backward</code></td>
+<td><code>fusion_attention</code></td>
+<td><code>fusion_attention_grad</code></td>
 <td><code>kimi_k3_fusion_shim.py</code></td>
 </tr>
 <tr>
@@ -450,9 +452,13 @@ arithmetic intensity 为约 <code>4*B*S*H*D^2 / ((5*N+B*S*H+H+H*D)*b)</code>，�
 </tr>
 </tbody>
 </table>
+<p><code>fusion_attention</code> 和 <code>fusion_attention_grad</code> 均带有两个非 tensor kwargs，它们
+以 <code>OpNode.attrs</code> 写入工作负载图：<code>num_heads=H</code> 和固定的
+<code>layout="BNSD"</code>。其中 <code>N</code> 表示 head 维，因此该 layout 对应下表的
+<code>[B,H,S,Dq]</code> 物理 tensor 排列。</p>
 <p><code>Dq = qk_nope_head_dim + qk_rope_head_dim</code>。如果 <code>v_head_dim &lt; Dq</code>，模块会先
 对 value pad 到 <code>Dq</code>，attention 后再 trim 回 <code>v_head_dim</code>；pad、trim、transpose
-和 reshape 都不属于 <code>gated_mla</code>。反向输入为 <code>Q/K/V/dO</code>，输出为
+和 reshape 都不属于 <code>fusion_attention</code>。反向输入为 <code>Q/K/V/dO</code>，输出为
 <code>dQ/dK/dV</code>，三者均为 <code>[B,H,S,Dq]</code>。</p>
 <h3 id="_2">融合边界与伪代码</h3>
 <pre><code class="language-text"># Outside fused op:
@@ -461,7 +467,7 @@ kv = kv_b_proj(rms_norm(kv_a_proj_with_mqa(hidden_states)))
 Q, K, V = split_and_layout(q, kv)
 V = pad_to_qk_head_dim(V)
 
-# gated_mla:
+# fusion_attention(num_heads=H, layout=&quot;BNSD&quot;):
 scores = causal_mask((Q @ transpose(K)) / sqrt(Dq))
 probabilities = softmax(scores)
 O = probabilities @ V
