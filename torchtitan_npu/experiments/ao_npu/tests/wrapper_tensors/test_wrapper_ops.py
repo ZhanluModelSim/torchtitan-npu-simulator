@@ -625,10 +625,6 @@ def test_op_fake_quantize(
     device,
 ):
     """__torch_function__ fake-quantizes weight/activation and produces good SQNR."""
-    if wrapper_cls is MXTrainingWeightWrapperTensor and len(w_shape) == 3:
-        pytest.skip("MX wrapper does not support batched bmm")
-    if wrapper_cls is BlockTrainingWeightWrapperTensor and len(w_shape) == 3:
-        pytest.skip("Block wrapper does not support batched bmm")
 
     activation_tensor = torch.randn(*A_shape, device=device, dtype=torch.bfloat16)
     weight_tensor = torch.randn(*w_shape, device=device, dtype=torch.bfloat16)

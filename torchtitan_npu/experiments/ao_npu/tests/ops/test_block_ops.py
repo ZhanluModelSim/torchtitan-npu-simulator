@@ -8,6 +8,7 @@ import torch
 from torchao.float8.float8_utils import compute_error
 
 from torchtitan_npu.experiments.ao_npu.torchao_npu.ops.block_ops import (
+    to_block_fp8_then_bmm,
     to_block_fp8_then_grouped_mm,
     to_block_fp8_then_mm,
 )
@@ -146,9 +147,8 @@ def test_backward_finiteness(M, K, N, config_A, config_B):
 
     for name, g in [("A", A.grad), ("weight", weight.grad)]:
         assert g is not None, f"{name}.grad is None"
-        g_cpu = g.float().cpu()
-        assert torch.isfinite(g_cpu).all(), f"{name}.grad has non-finite values"
-        assert g_cpu.norm().item() > 0, f"{name}.grad is all zeros"
+        assert torch.isfinite(g).all(), f"{name}.grad has non-finite values"
+        assert g.norm().item() > 0, f"{name}.grad is all zeros"
 
 
 @pytest.mark.skipif(not _npu_available(), reason="NPU not available")
@@ -369,9 +369,8 @@ def test_grouped_backward_finiteness(M, K, N, E, group_sizes, config_A, config_B
 
     for name, g in [("A", A.grad), ("B", B.grad)]:
         assert g is not None, f"{name}.grad is None"
-        g_cpu = g.float().cpu()
-        assert torch.isfinite(g_cpu).all(), f"{name}.grad has non-finite values"
-        assert g_cpu.norm().item() > 0, f"{name}.grad is all zeros"
+        assert torch.isfinite(g).all(), f"{name}.grad has non-finite values"
+        assert g.norm().item() > 0, f"{name}.grad is all zeros"
 
 
 @pytest.mark.skipif(not _npu_available(), reason="NPU not available")
@@ -510,3 +509,122 @@ def test_quantize_right_operand_shape_and_dtype_3d(E, K, N, axis, config_B):
 
     assert B_q.dtype == config_B.elem_dtype
     assert B_q.shape == B.shape
+
+
+# =========================================================================
+# to_block_fp8_then_bmm (block FP8 batched matmul)
+# =========================================================================
+
+
+@pytest.mark.skipif(not _npu_available(), reason="NPU not available")
+@pytest.mark.parametrize(
+    "B, M, K, N, config_A, config_B",
+    [
+        (4, 2048, 4096, 2048, MXQuantizeConfig(), BlockQuantizeConfig()),
+        (4, 4096, 2048, 4096, MXQuantizeConfig(), BlockQuantizeConfig()),
+    ],
+)
+def test_bmm_forward_shape_and_dtype(B, M, K, N, config_A, config_B):
+    """Block FP8 batched matmul output shape and dtype match expectations."""
+    act = torch.randn(B, M, K, device="npu", dtype=torch.bfloat16)
+    weight = torch.randn(B, N, K, device="npu", dtype=torch.bfloat16).transpose(-1, -2)  # [B, K, N]
+
+    out = to_block_fp8_then_bmm(act, weight, config_A, config_B)
+
+    assert out.shape == (B, M, N), f"Expected ({B}, {M}, {N}), got {out.shape}"
+    assert out.dtype == act.dtype, f"Expected {act.dtype}, got {out.dtype}"
+    assert out.device.type == "npu"
+
+
+@pytest.mark.skipif(not _npu_available(), reason="NPU not available")
+@pytest.mark.parametrize(
+    "B, M, K, N, config_A, config_B, sqnr_threshold",
+    [
+        (4, 2048, 4096, 2048, MXQuantizeConfig(), BlockQuantizeConfig(), 27.5),
+        (
+            4,
+            2048,
+            4096,
+            2048,
+            MXQuantizeConfig(),
+            BlockQuantizeConfig(mxfp4_fake_quantize_config=MXQuantizeConfig(elem_dtype=torch.float4_e2m1fn_x2)),
+            17.5,
+        ),
+    ],
+)
+def test_bmm_sqnr_forward(B, M, K, N, config_A, config_B, sqnr_threshold):
+    """Block FP8 batched matmul forward output has acceptable SQNR."""
+    torch.manual_seed(42)
+    act = torch.randn(B, M, K, device="npu", dtype=torch.bfloat16)
+    weight = torch.randn(B, N, K, device="npu", dtype=torch.bfloat16).transpose(-1, -2)  # [B, K, N]
+
+    out_ref = torch.bmm(act, weight)
+    out_fp8 = to_block_fp8_then_bmm(act, weight, config_A, config_B)
+
+    sqnr = compute_error(out_ref.float(), out_fp8.float()).item()
+    assert sqnr > sqnr_threshold, f"BMM forward SQNR too low: {sqnr:.2f} dB"
+
+
+@pytest.mark.skipif(not _npu_available(), reason="NPU not available")
+@pytest.mark.parametrize(
+    "B, M, K, N, config_A, config_B, sqnr_threshold",
+    [
+        (4, 2048, 4096, 2048, MXQuantizeConfig(), BlockQuantizeConfig(), 30.5),
+        (
+            4,
+            2048,
+            4096,
+            2048,
+            MXQuantizeConfig(),
+            BlockQuantizeConfig(mxfp4_fake_quantize_config=MXQuantizeConfig(elem_dtype=torch.float4_e2m1fn_x2)),
+            17.5,
+        ),
+    ],
+)
+def test_bmm_sqnr_gradients(B, M, K, N, config_A, config_B, sqnr_threshold):
+    """Block FP8 batched matmul backward gradients have acceptable SQNR.
+
+    The weight is stored as ``[B, N, K]`` and transposed for the bmm (matching
+    model usage); gradients are checked on the stored leaf parameter.
+    """
+    torch.manual_seed(42)
+    act = torch.randn(B, M, K, device="npu", dtype=torch.bfloat16, requires_grad=True)
+    weight = torch.randn(B, N, K, device="npu", dtype=torch.bfloat16, requires_grad=True)
+
+    # --- Reference ---
+    act_ref = act.clone().detach().requires_grad_(True)
+    weight_ref = weight.clone().detach().requires_grad_(True)
+    torch.bmm(act_ref, weight_ref.transpose(-1, -2)).sum().backward()
+
+    # --- Block FP8 ---
+    act_fp8 = act.clone().detach().requires_grad_(True)
+    weight_fp8 = weight.clone().detach().requires_grad_(True)
+    to_block_fp8_then_bmm(act_fp8, weight_fp8.transpose(-1, -2), config_A, config_B).sum().backward()
+
+    sqnr_dA = compute_error(act_ref.grad.float(), act_fp8.grad.float()).item()
+    assert sqnr_dA > sqnr_threshold, f"dA SQNR too low: {sqnr_dA:.2f} dB"
+
+    sqnr_dB = compute_error(weight_ref.grad.float(), weight_fp8.grad.float()).item()
+    assert sqnr_dB > sqnr_threshold, f"dB SQNR too low: {sqnr_dB:.2f} dB"
+
+
+@pytest.mark.skipif(not _npu_available(), reason="NPU not available")
+@pytest.mark.parametrize(
+    "B, M, K, N, config_A, config_B",
+    [
+        (4, 1024, 2048, 1024, MXQuantizeConfig(), BlockQuantizeConfig()),
+    ],
+)
+def test_bmm_backward_finiteness(B, M, K, N, config_A, config_B):
+    """Block FP8 batched matmul gradients are finite and non-zero."""
+    torch.manual_seed(42)
+    act = torch.randn(B, M, K, device="npu", dtype=torch.bfloat16, requires_grad=True)
+    weight = torch.randn(B, N, K, device="npu", dtype=torch.bfloat16, requires_grad=True)
+    weight_b = weight.transpose(-1, -2)  # [B, K, N]
+
+    to_block_fp8_then_bmm(act, weight_b, config_A, config_B).sum().backward()
+
+    for name, g in [("act", act.grad), ("weight", weight.grad)]:
+        assert g is not None, f"{name}.grad is None"
+        assert torch.isfinite(g).all(), f"{name}.grad has non-finite values"
+        assert g.norm().item() > 0, f"{name}.grad is all zeros"

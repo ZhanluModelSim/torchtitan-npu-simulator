@@ -10,6 +10,7 @@ from torch import nn
 from torchao.prototype.moe_training.utils import unwrap_weight
 
 from ..ops import (
+    to_block_fp8_then_bmm,
     to_block_fp8_then_grouped_mm,
     to_block_fp8_then_mm,
 )
@@ -72,6 +73,10 @@ class BlockTrainingWeightWrapperTensor(BaseTrainingWeightWrapperTensor):
             # addmm: bias + A @ B where B is the wrapped weight
             return cls._block_fp8_addmm(args, kwargs)
 
+        elif func is torch.bmm:
+            # bmm: A @ B where both are 3D and B is the wrapped weight
+            return cls._block_fp8_bmm(args, kwargs)
+
         else:
             with torch._C.DisableTorchFunctionSubclass():
                 return func(*args, **kwargs)
@@ -132,6 +137,18 @@ class BlockTrainingWeightWrapperTensor(BaseTrainingWeightWrapperTensor):
             result = to_block_fp8_then_mm(A, B_data, B.activation_config, B.weight_config)  # type: ignore
             result = result + bias
             return result
+
+    @classmethod
+    def _block_fp8_bmm(cls, args, kwargs):
+        # bmm(A, B) — both 3D batched matmul, B is the wrapped weight
+        A, B = args[0], args[1]
+        assert not isinstance(A, cls), f"A should not be a {cls.__name__}"
+        assert isinstance(B, cls), f"B should be a {cls.__name__}"
+
+        B_data = unwrap_weight(B)
+
+        with torch._C.DisableTorchFunctionSubclass():
+            return to_block_fp8_then_bmm(A, B_data, B.activation_config, B.weight_config)  # type: ignore
 
 
 @register_parameter_swap_handler(BlockQuantizeConfig)

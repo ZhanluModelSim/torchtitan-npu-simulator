@@ -225,3 +225,72 @@ def test_to_mx_then_grouped_mm_backward(device, elem_dtype, sqnr_threshold):
     dB_sqnr = compute_error(B.grad, B_ref.grad).item()
     assert dA_sqnr > sqnr_threshold, f"dA SQNR {dA_sqnr:.1f} dB below {sqnr_threshold} dB for {elem_dtype}"
     assert dB_sqnr > sqnr_threshold, f"dB SQNR {dB_sqnr:.1f} dB below {sqnr_threshold} dB for {elem_dtype}"
+
+
+# =========================================================================
+# Tests for to_mx_then_bmm (real MX quantized batched matmul)
+# =========================================================================
+
+
+@pytest.mark.parametrize("device", ["npu"])
+@pytest.mark.parametrize(
+    "elem_dtype, B, M, K, N, sqnr_threshold",
+    [
+        (torch.float8_e4m3fn, 4, 2048, 4096, 2048, 27.5),
+        (torch.float8_e5m2, 4, 2048, 4096, 2048, 21.5),
+    ],
+)
+def test_to_mx_then_bmm_forward(device, elem_dtype, B, M, K, N, sqnr_threshold):
+    """to_mx_then_bmm forward produces reasonable SQNR vs bf16 baseline."""
+    from torchtitan_npu.experiments.ao_npu.torchao_npu.ops import to_mx_then_bmm
+
+    torch.manual_seed(0)
+    act = torch.randn(B, M, K, device=device, dtype=torch.bfloat16)
+    weight = torch.randn(B, K, N, device=device, dtype=torch.bfloat16)
+
+    cfg = MXQuantizeConfig(elem_dtype=elem_dtype)
+    Y = to_mx_then_bmm(act, weight, cfg, cfg)
+    Y_ref = torch.bmm(act, weight)
+
+    assert Y.shape == (B, M, N), f"Shape mismatch: {Y.shape}"
+    assert Y.dtype == act.dtype
+
+    sqnr = compute_error(Y, Y_ref).item()
+    assert sqnr > sqnr_threshold, f"SQNR {sqnr:.1f} dB below {sqnr_threshold} dB for {elem_dtype}"
+
+
+@pytest.mark.parametrize("device", ["npu"])
+@pytest.mark.parametrize(
+    "elem_dtype, B, M, K, N, sqnr_threshold",
+    [
+        (torch.float8_e4m3fn, 4, 2048, 4096, 2048, 30.5),
+        (torch.float8_e5m2, 4, 2048, 4096, 2048, 24.5),
+    ],
+)
+def test_to_mx_then_bmm_backward(device, elem_dtype, B, M, K, N, sqnr_threshold):
+    """to_mx_then_bmm backward produces meaningful batched gradients."""
+    from torchtitan_npu.experiments.ao_npu.torchao_npu.ops import to_mx_then_bmm
+
+    torch.manual_seed(1)
+    act = torch.randn(B, M, K, device=device, dtype=torch.bfloat16, requires_grad=True)
+    weight = torch.randn(B, K, N, device=device, dtype=torch.bfloat16, requires_grad=True)
+
+    act_ref = act.clone().detach().requires_grad_(True)
+    weight_ref = weight.clone().detach().requires_grad_(True)
+
+    cfg = MXQuantizeConfig(elem_dtype=elem_dtype)
+    Y = to_mx_then_bmm(act, weight, cfg, cfg)
+    Y_ref = torch.bmm(act_ref, weight_ref)
+
+    loss = Y.sum()
+    loss.backward()
+    loss_ref = Y_ref.sum()
+    loss_ref.backward()
+
+    assert act.grad is not None and weight.grad is not None
+    assert act_ref.grad is not None and weight_ref.grad is not None
+
+    dA_sqnr = compute_error(act.grad, act_ref.grad).item()
+    dB_sqnr = compute_error(weight.grad, weight_ref.grad).item()
+    assert dA_sqnr > sqnr_threshold, f"dA SQNR {dA_sqnr:.1f} dB below {sqnr_threshold} dB for {elem_dtype}"
+    assert dB_sqnr > sqnr_threshold, f"dB SQNR {dB_sqnr:.1f} dB below {sqnr_threshold} dB for {elem_dtype}"

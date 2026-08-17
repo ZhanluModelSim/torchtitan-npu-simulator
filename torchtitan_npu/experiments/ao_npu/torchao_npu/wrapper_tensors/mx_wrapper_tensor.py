@@ -10,6 +10,7 @@ from torch import nn
 from torchao.prototype.moe_training.utils import unwrap_weight
 
 from ..ops import (
+    to_mx_then_bmm,
     to_mx_then_grouped_mm,
     to_mx_then_mm,
 )
@@ -73,6 +74,9 @@ class MXTrainingWeightWrapperTensor(BaseTrainingWeightWrapperTensor):
         elif func is torch.addmm:
             return cls._mx_addmm(args, kwargs)
 
+        elif func is torch.bmm:
+            return cls._mx_bmm(args, kwargs)
+
         else:
             with torch._C.DisableTorchFunctionSubclass():
                 return func(*args, **kwargs)
@@ -91,6 +95,17 @@ class MXTrainingWeightWrapperTensor(BaseTrainingWeightWrapperTensor):
 
         with torch._C.DisableTorchFunctionSubclass():
             return to_mx_then_mm(A, B_data, B.activation_config, B.weight_config)  # type: ignore
+
+    @classmethod
+    def _mx_bmm(cls, args, kwargs):
+        A, B = args[0], args[1]
+        assert not isinstance(A, cls), f"A should not be a {cls.__name__}"
+        assert isinstance(B, cls), f"B should be a {cls.__name__}"
+
+        B_data = unwrap_weight(B)
+
+        with torch._C.DisableTorchFunctionSubclass():
+            return to_mx_then_bmm(A, B_data, B.activation_config, B.weight_config)  # type: ignore
 
     @classmethod
     def _mx_grouped_mm(cls, args, kwargs):
