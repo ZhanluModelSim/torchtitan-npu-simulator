@@ -79,7 +79,7 @@ def _apply_patches():
     from .patches.torch_npu import determinism  # noqa: F401
 
     # patching torchao for NPU MXFP8 training support
-    from .patches.torchao_npu import (  # noqa: F401
+    from .experiments.ao_npu.torchao_npu.patches import (  # noqa: F401
         mx_capability_check,
         mx_linear,
         mxfp8_grouped_mm,

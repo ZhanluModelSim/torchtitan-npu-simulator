@@ -22,7 +22,7 @@ import threading
 
 from torchtitan.tools.logging import logger
 
-from torchtitan_npu.patches.torchao_npu.activation_checkpoint_state import is_in_recomputation
+from torchtitan_npu.experiments.ao_npu.torchao_npu.patches.activation_checkpoint_state import is_in_recomputation
 
 _ac_mode: str | None = None
 _compile_enabled: bool | None = None
@@ -35,7 +35,7 @@ def _ensure_recomputation_detection() -> None:
     global _recomputation_detection_initialized
     if _recomputation_detection_initialized:
         return
-    from torchtitan_npu.patches.torchao_npu.activation_checkpoint_state import (
+    from torchtitan_npu.experiments.ao_npu.torchao_npu.patches.activation_checkpoint_state import (
         enable_recomputation_detection,
     )
 

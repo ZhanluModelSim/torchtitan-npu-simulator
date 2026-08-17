@@ -3,10 +3,15 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-# Trigger handler registrations via side-effect imports.
-from . import wrapper_tensors  # noqa: F401
-from .configs import ParamSwapConfig
+try:
+    # Trigger handler registrations via side-effect imports.
+    from . import wrapper_tensors  # noqa: F401
+    from .configs import ParamSwapConfig
 
-__all__ = [
-    "ParamSwapConfig",
-]
+    __all__ = [
+        "ParamSwapConfig",
+    ]
+except ModuleNotFoundError:
+    # torchao is not installed — these features are unavailable.
+    # This allows `import torchtitan_npu` to succeed without torchao.
+    __all__ = []

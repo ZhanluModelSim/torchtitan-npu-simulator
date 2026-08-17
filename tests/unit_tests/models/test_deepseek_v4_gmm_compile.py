@@ -17,7 +17,7 @@ from torchtitan_npu.converters.kernels import gmm as gmm_module
 from torchtitan_npu.converters.kernels import swiglu_group as swiglu_module
 from torchtitan_npu.models.deepseek_v4 import model as model_module
 from torchtitan_npu.models.deepseek_v4 import parallelize
-from torchtitan_npu.patches.torchao_npu import mxfp8_grouped_mm as mxfp8_gmm_module
+from torchtitan_npu.experiments.ao_npu.torchao_npu.patches import mxfp8_grouped_mm as mxfp8_gmm_module
 
 _EXPERT_ACTIVATION_ATTR = "_expert_activation"
 _EXPERT_ACTIVATION_FN_ATTR = "_expert_activation_fn"

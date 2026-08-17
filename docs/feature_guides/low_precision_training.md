@@ -16,9 +16,9 @@
 
 | 文件路径 | 修改作用                                                                    |
 | --- |-------------------------------------------------------------------------|
-| `torchtitan_npu/patches/torchao_npu/mx_capability_check.py` | 替换 `has_cuda_capability` 函数，使 MXFP8Converter 在 NPU 上进行硬件校验              |
-| `torchtitan_npu/patches/torchao_npu/mx_linear.py` | 替换 torchao 的 `_to_mxfp8_then_scaled_mm`，将线性层 MXFP8 计算重定向至 NPU 算子        |
-| `torchtitan_npu/patches/torchao_npu/mxfp8_grouped_mm.py` | 替换 torchao 的 `_to_mxfp8_then_scaled_grouped_mm`，将 MoE 分组矩阵乘法重定向至 NPU 算子 |
+| `torchtitan_npu/experiments/ao_npu/torchao_npu/patches/mx_capability_check.py` | 替换 `has_cuda_capability` 函数，使 MXFP8Converter 在 NPU 上进行硬件校验              |
+| `torchtitan_npu/experiments/ao_npu/torchao_npu/patches/mx_linear.py` | 替换 torchao 的 `_to_mxfp8_then_scaled_mm`，将线性层 MXFP8 计算重定向至 NPU 算子        |
+| `torchtitan_npu/experiments/ao_npu/torchao_npu/patches/mxfp8_grouped_mm.py` | 替换 torchao 的 `_to_mxfp8_then_scaled_grouped_mm`，将 MoE 分组矩阵乘法重定向至 NPU 算子 |
 
 ### 线性层低精度
 

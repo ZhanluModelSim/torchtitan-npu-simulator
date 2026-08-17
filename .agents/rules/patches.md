@@ -26,7 +26,7 @@ paths:
 - `patches/torchtitan/` — patch 上游 torchtitan 核心模块
 - `patches/torch/` — patch PyTorch 原生模块
 - `patches/torch_npu/` — patch torch_npu 模块
-- `patches/torchao_npu/` — patch torchao_npu 模块
+- `experiments/ao_npu/torchao_npu/patches/` — patch torchao 模块（实验性，torchao 为可选依赖）
 - `patches/distributed/` — patch 分布式相关工具
 - `patches/encoders/` — patch 数据编码相关模块
 - `patches/optimizer/` — patch 优化器

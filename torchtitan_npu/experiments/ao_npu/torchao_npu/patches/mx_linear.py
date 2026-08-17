@@ -19,12 +19,12 @@ AC Optimization:
 import torch
 import torch_npu
 
-from torchtitan_npu.patches.torchao_npu.activation_checkpoint_state import (
+from torchtitan_npu.experiments.ao_npu.torchao_npu.patches.activation_checkpoint_state import (
     is_in_recomputation,
     pop_mx_quant_data,
     push_mx_quant_data,
 )
-from torchtitan_npu.patches.torchao_npu.mx_ac_config import (
+from torchtitan_npu.experiments.ao_npu.torchao_npu.patches.mx_ac_config import (
     ac_enabled_context,
     get_ac_mode,
     should_save_bwd_quant_for_mx,

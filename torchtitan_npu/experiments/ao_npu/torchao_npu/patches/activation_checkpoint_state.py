@@ -43,7 +43,7 @@ def is_in_recomputation() -> bool:
     MXFP8 dual-axis forward is enabled.
     """
     # Lazy import to avoid circular dependency with mx_ac_config
-    from torchtitan_npu.patches.torchao_npu.mx_ac_config import (
+    from torchtitan_npu.experiments.ao_npu.torchao_npu.patches.mx_ac_config import (
         _ensure_recomputation_detection,
         is_mxfp8_dual_axis_forward,
     )
