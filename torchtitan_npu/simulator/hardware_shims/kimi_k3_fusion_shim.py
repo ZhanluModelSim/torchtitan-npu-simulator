@@ -32,10 +32,23 @@ def _module_path() -> str:
     return capture.module_path_tracker.current_path()
 
 
-def _record(name: str, inputs: list[torch.Tensor], outputs: list[torch.Tensor], path: str) -> None:
+def _record(
+    name: str,
+    inputs: list[torch.Tensor],
+    outputs: list[torch.Tensor],
+    path: str,
+    *,
+    attrs: dict[str, int | str] | None = None,
+) -> None:
     capture = get_active_capture()
     if capture is not None:
-        capture.record_synthetic_op(name, inputs=inputs, outputs=outputs, module_path=path)
+        capture.record_synthetic_op(
+            name,
+            inputs=inputs,
+            outputs=outputs,
+            module_path=path,
+            attrs=attrs,
+        )
 
 
 class _SimGatedMLA(torch.autograd.Function):
@@ -44,14 +57,15 @@ class _SimGatedMLA(torch.autograd.Function):
         output = _empty_like(query)
         ctx.save_for_backward(query, key, value)
         ctx.module_path = module_path
-        _record("gated_mla", [query, key, value], [output], module_path)
+        ctx.attrs = {"num_heads": int(query.shape[1]), "layout": "BNSD"}
+        _record("FusionAttention", [query, key, value], [output], module_path, attrs=ctx.attrs)
         return output
 
     @staticmethod
     def backward(ctx, grad_output):  # noqa: ANN001
         saved = ctx.saved_tensors
         grads = [_empty_like(tensor) for tensor in saved]
-        _record("gated_mla_backward", [*saved, grad_output], grads, ctx.module_path)
+        _record("FusionAttentionGard", [*saved, grad_output], grads, ctx.module_path, attrs=ctx.attrs)
         return (*grads, None)
 
 

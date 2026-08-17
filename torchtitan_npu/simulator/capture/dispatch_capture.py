@@ -128,6 +128,9 @@ class _RawEvent:
     # FSDP sharding state active when this op ran ("SHARDED"/"UNSHARDED"/"NA").
     fsdp_state: str = "NA"
     tensor_shape_scope: str = "local"
+    # Non-tensor operator arguments (for example layout and head count on a
+    # fused attention kernel). They become OpNode.attrs.
+    attrs: dict[str, Any] | None = None
     extra_annotations: dict[str, Any] | None = None
 
 
@@ -146,6 +149,9 @@ def _shape_signature(event: _RawEvent) -> tuple:
         event.tensor_shape_scope,
         tuple(tuple(i.shape) for i in event.inputs),
         tuple(tuple(o.shape) for o in event.outputs),
+        tuple(
+            sorted((str(key), repr(value)) for key, value in (event.attrs or {}).items())
+        ),
         tuple(
             sorted(
                 (str(key), repr(value))
@@ -282,6 +288,7 @@ class OpDispatchCapture(TorchDispatchMode):
         logical_dtensor_shapes: bool = False,
         memory_inputs: list[torch.Tensor] | None = None,
         memory_outputs: list[torch.Tensor] | None = None,
+        attrs: dict[str, Any] | None = None,
         extra_annotations: dict[str, Any] | None = None,
     ) -> None:
         """Manually register one synthetic L0 event, as if `raw_op_type` had
@@ -298,6 +305,7 @@ class OpDispatchCapture(TorchDispatchMode):
 
         ``memory_inputs`` and ``memory_outputs`` may expose additional operands
         to tensor-lifetime tracking without adding them to the logical OpNode.
+        ``attrs`` carries non-tensor operator kwargs into ``OpNode.attrs``.
         """
         logical_input_metas = None
         logical_output_metas = None
@@ -332,6 +340,7 @@ class OpDispatchCapture(TorchDispatchMode):
                 if memory_outputs is not None
                 else None
             ),
+            attrs=attrs,
             extra_annotations=extra_annotations,
         )
 
@@ -397,6 +406,7 @@ class OpDispatchCapture(TorchDispatchMode):
         tensor_shape_scope: str = "local",
         memory_flat_inputs: list[torch.Tensor] | None = None,
         memory_flat_outputs: list[torch.Tensor] | None = None,
+        attrs: dict[str, Any] | None = None,
         extra_annotations: dict[str, Any] | None = None,
         mutated_inputs: list[torch.Tensor] | None = None,
     ) -> None:
@@ -490,6 +500,7 @@ class OpDispatchCapture(TorchDispatchMode):
             comp_type=comp_type,
             fsdp_state=fsdp_state,
             tensor_shape_scope=tensor_shape_scope,
+            attrs=dict(attrs) if attrs is not None else None,
             extra_annotations=(
                 dict(extra_annotations)
                 if extra_annotations is not None
@@ -703,7 +714,7 @@ class OpDispatchCapture(TorchDispatchMode):
                 op_type=event.op_type,
                 inputs=event.inputs,
                 outputs=event.outputs,
-                attrs={},
+                attrs=dict(event.attrs or {}),
                 predecessors=list(event.predecessors),
                 successors=[],
                 flops=cost.flops,

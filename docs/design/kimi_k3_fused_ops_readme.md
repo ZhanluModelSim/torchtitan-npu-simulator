@@ -6,7 +6,7 @@
 | 语义 | 前向 raw op name | 反向 raw op name | simulator 实现 |
 | --- | --- | --- | --- |
 | KDA core | `triton_ascend_kernels.chunk_kda` | `triton_ascend_kernels.chunk_kda_grad` | `kda_shim.py` |
-| Gated MLA attention core | `gated_mla` | `gated_mla_backward` | `kimi_k3_fusion_shim.py` |
+| Gated MLA attention core | `FusionAttention` | `FusionAttentionGard` | `kimi_k3_fusion_shim.py` |
 | SiTU-GLU activation | `situ_glu` | `situ_glu_backward` | `kimi_k3_fusion_shim.py` |
 
 这些不是实际执行的 NPU/Triton kernel，也不是通过 `torch.library` 注册的
@@ -110,9 +110,14 @@ arithmetic intensity 为约 `4*B*S*H*D^2 / ((5*N+B*S*H+H+H*D)*b)`，大序列时
 | `V` | `[B, H, S, Dq]` | batch、head、value token、padded value feature |
 | `O` | `[B, H, S, Dq]` | batch、head、attention output token、padded value feature |
 
+`FusionAttention` 和 `FusionAttentionGard` 均带有两个非 tensor kwargs，它们
+以 `OpNode.attrs` 写入工作负载图：`num_heads=H` 和固定的
+`layout="BNSD"`。其中 `N` 表示 head 维，因此该 layout 对应下表的
+`[B,H,S,Dq]` 物理 tensor 排列。
+
 `Dq = qk_nope_head_dim + qk_rope_head_dim`。如果 `v_head_dim < Dq`，模块会先
 对 value pad 到 `Dq`，attention 后再 trim 回 `v_head_dim`；pad、trim、transpose
-和 reshape 都不属于 `gated_mla`。反向输入为 `Q/K/V/dO`，输出为
+和 reshape 都不属于 `FusionAttention`。反向输入为 `Q/K/V/dO`，输出为
 `dQ/dK/dV`，三者均为 `[B,H,S,Dq]`。
 
 ### 融合边界与伪代码
@@ -124,7 +129,7 @@ kv = kv_b_proj(rms_norm(kv_a_proj_with_mqa(hidden_states)))
 Q, K, V = split_and_layout(q, kv)
 V = pad_to_qk_head_dim(V)
 
-# gated_mla:
+# FusionAttention(num_heads=H, layout="BNSD"):
 scores = causal_mask((Q @ transpose(K)) / sqrt(Dq))
 probabilities = softmax(scores)
 O = probabilities @ V

@@ -255,6 +255,25 @@ def test_record_synthetic_op_creates_a_node_with_given_raw_op_type():
     assert [o.shape for o in synthetic[0].outputs] == [(2, 4)]
 
 
+def test_record_synthetic_op_preserves_non_tensor_kwargs_as_node_attrs():
+    capture = OpDispatchCapture()
+    with capture:
+        a = torch.randn(2, 4, device="meta")
+        b = torch.empty(2, 4, device="meta")
+        capture.record_synthetic_op(
+            "test.fused_attention",
+            inputs=[a],
+            outputs=[b],
+            attrs={"num_heads": 8, "layout": "BNSD"},
+        )
+    node = next(
+        node
+        for node in capture.build_nodes().values()
+        if node.annotations.get("raw_op_type") == "test.fused_attention"
+    )
+    assert node.attrs == {"num_heads": 8, "layout": "BNSD"}
+
+
 def test_capture_keeps_uncollapsed_memory_events_for_liveness():
     capture = OpDispatchCapture()
     with capture:
