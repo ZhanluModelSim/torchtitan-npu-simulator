@@ -152,6 +152,23 @@ def _refresh_graph_topology(graph: StepGraph) -> None:
     )
 
 
+def _has_path(graph: StepGraph, start_op_id: int, target_op_id: int) -> bool:
+    """Return whether adding ``target -> start`` would create a cycle."""
+    pending = [start_op_id]
+    visited: set[int] = set()
+    while pending:
+        op_id = pending.pop()
+        if op_id == target_op_id:
+            return True
+        if op_id in visited:
+            continue
+        visited.add(op_id)
+        node = graph.nodes.get(op_id)
+        if node is not None:
+            pending.extend(node.successors)
+    return False
+
+
 def _copy_without_nodes(
     template: StepGraph,
     removed_op_ids: set[int],
@@ -1038,6 +1055,7 @@ class FSDPStageOwnershipPlugin:
                         node_id_map[item.source_node.op_id],
                     )
                 successor_links: dict[int, list[int]] = defaultdict(list)
+                prefetch_source_entry_links: list[tuple[int, tuple[int, ...]]] = []
                 residency_intervals: list[dict[str, object]] = []
                 for item in owned:
                     source = item.source_node
@@ -1237,8 +1255,11 @@ class FSDPStageOwnershipPlugin:
                             },
                             seq_idx=anchor.seq_idx,
                         )
-                        successor_links[prefetch_launch_op_id].extend(
-                            anchor.source_entry_op_ids
+                        prefetch_source_entry_links.append(
+                            (
+                                prefetch_launch_op_id,
+                                anchor.source_entry_op_ids,
+                            )
                         )
                         predecessors.append(prefetch_launch_op_id)
                     predecessors = list(dict.fromkeys(predecessors))
@@ -1292,6 +1313,29 @@ class FSDPStageOwnershipPlugin:
                     for successor in successors:
                         if comm_id not in pure.nodes[successor].predecessors:
                             pure.nodes[successor].predecessors.append(comm_id)
+
+                _refresh_graph_topology(pure)
+                for launch_op_id, source_entries in prefetch_source_entry_links:
+                    skipped_entries: list[int] = []
+                    for source_entry_id in source_entries:
+                        # Some TP/FSDP layouts place the source all-gather
+                        # after a source-region entry. Gating that entry on a
+                        # launch which already waits for the all-gather closes
+                        # launch -> entry -> all-gather -> launch.
+                        if _has_path(pure, source_entry_id, launch_op_id):
+                            skipped_entries.append(source_entry_id)
+                            continue
+                        source_entry = pure.nodes.get(source_entry_id)
+                        if (
+                            source_entry is not None
+                            and launch_op_id not in source_entry.predecessors
+                        ):
+                            source_entry.predecessors.append(launch_op_id)
+                            _refresh_graph_topology(pure)
+                    if skipped_entries:
+                        pure.nodes[launch_op_id].annotations[
+                            "fsdp_prefetch_source_gate_skipped_entries"
+                        ] = skipped_entries
 
                 (
                     next_synthetic_id,

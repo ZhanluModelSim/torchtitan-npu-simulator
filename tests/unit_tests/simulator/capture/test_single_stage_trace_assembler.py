@@ -1589,6 +1589,165 @@ def test_fsdp_prefetch_launch_blocks_recursive_layer_runahead(
     assert compute_ids[0] in launches[f"group{layer_order[2]}"].predecessors
 
 
+def test_fsdp_prefetch_skips_a_source_gate_that_would_form_a_cycle() -> None:
+    source_entry = OpNode(
+        op_id=100,
+        op_type="matmul",
+        inputs=[],
+        outputs=[],
+        attrs={},
+        predecessors=[],
+        successors=[300],
+        seq_idx=20,
+        annotations={"raw_op_type": "aten.mm.default"},
+    )
+    source_allgather = OpNode(
+        op_id=300,
+        op_type="allgather",
+        inputs=[],
+        outputs=[],
+        attrs={},
+        predecessors=[100],
+        successors=[150],
+        seq_idx=25,
+        comm_bytes=128,
+        annotations={"raw_op_type": "comm.allgather"},
+    )
+    source_exit = OpNode(
+        op_id=150,
+        op_type="matmul",
+        inputs=[],
+        outputs=[],
+        attrs={},
+        predecessors=[300],
+        successors=[],
+        seq_idx=27,
+        annotations={"raw_op_type": "aten.mm.default"},
+    )
+    target_entry = OpNode(
+        op_id=200,
+        op_type="matmul",
+        inputs=[],
+        outputs=[],
+        attrs={},
+        predecessors=[],
+        successors=[],
+        seq_idx=50,
+        annotations={"raw_op_type": "aten.mm.default"},
+    )
+    target_allgather = OpNode(
+        op_id=301,
+        op_type="allgather",
+        inputs=[],
+        outputs=[],
+        attrs={},
+        predecessors=[],
+        successors=[],
+        seq_idx=45,
+        comm_bytes=128,
+        annotations={"raw_op_type": "comm.allgather"},
+    )
+    templates = {
+        "s0_B": StepGraph(
+            "s0_B",
+            "B",
+            {
+                10: _fsdp_marker(
+                    10, 10, "unshard_wait", "group0", "layers.0"
+                ),
+                11: _fsdp_marker(
+                    11, 30, "reshard_release", "group0", "layers.0"
+                ),
+                12: _fsdp_marker(
+                    12, 40, "unshard_wait", "group1", "layers.1"
+                ),
+                13: _fsdp_marker(
+                    13, 60, "reshard_release", "group1", "layers.1"
+                ),
+                100: source_entry,
+                150: source_exit,
+                200: target_entry,
+                300: source_allgather,
+                301: target_allgather,
+            },
+        )
+    }
+    compute = ActionSpec(
+        action_type="COMPUTE",
+        stage=0,
+        mb_idx=0,
+        seq_idx=1,
+        order_key=(1, 0, 0),
+        comp_type="B",
+        template_ref="s0_B",
+        annotations={"compute_instance_id": "s0_B_mb0"},
+    )
+    unshards = [
+        ActionSpec(
+            action_type="UNSHARD",
+            stage=0,
+            mb_idx=0,
+            seq_idx=2 + index,
+            order_key=(2 + index, 0, index),
+            annotations={
+                "fsdp_schedule_source": "state",
+                "fsdp_transition_id": f"transition{index}",
+                "fsdp_group_id": f"group{index}",
+                "fsdp_module_fqn": f"layers.{index}",
+                "fsdp_prefetch_source_fqn": "layers.0" if index == 1 else "",
+                "fsdp_prefetch_type": "BACKWARD" if index == 1 else "",
+                "parent_compute_instance_id": "s0_B_mb0",
+                "residency_comp_type": "B",
+                "shard_world_size": 2,
+            },
+        )
+        for index in range(2)
+    ]
+    comm_events = [
+        CommEvent(
+            event_id=f"allgather{index}",
+            comm_primitive="allgather",
+            group_name="fsdp",
+            world_size=2,
+            tensor_shape=(64,),
+            dtype="bfloat16",
+            volume_bytes=128,
+            op_id=300 + index,
+            p2p_stage=0,
+            comp_type="B",
+            fsdp_group_id=f"group{index}",
+            fsdp_transition_id=f"transition{index}",
+            fsdp_module_fqn=f"layers.{index}",
+            fsdp_prefetch_source_fqn="layers.0" if index == 1 else "",
+            fsdp_prefetch_type="BACKWARD" if index == 1 else "",
+        )
+        for index in range(2)
+    ]
+
+    normalize_communication_ownership(
+        step_templates=templates,
+        specs=[compute, *unshards],
+        comm_events=comm_events,
+    )
+
+    graph = templates["s0_B"]
+    launch = next(
+        node
+        for node in graph.nodes.values()
+        if node.op_type == "FSDP_PREFETCH_LAUNCH"
+    )
+    allgathers = {
+        node.annotations["fsdp_group_id"]: node
+        for node in graph.nodes.values()
+        if node.annotations.get("communication_owner") == "L1_STAGE"
+    }
+    assert graph.is_acyclic
+    assert launch.predecessors == [allgathers["group0"].op_id]
+    assert allgathers["group1"].predecessors == [launch.op_id]
+    assert launch.op_id not in graph.nodes[100].predecessors
+    assert launch.annotations["fsdp_prefetch_source_gate_skipped_entries"] == [100]
+
+
 def test_non_pipeline_fsdp_prefetch_launch_survives_workload_build() -> None:
     layer0 = OpNode(
         op_id=100,
