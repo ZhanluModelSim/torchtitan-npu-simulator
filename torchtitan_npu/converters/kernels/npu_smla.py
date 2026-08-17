@@ -179,7 +179,7 @@ def _sparse_attention_metadata_kwargs(
         "cmp_topk": model_args.index_topk if cmp_ratio == 4 else 0,
         "cmp_ratio": cmp_ratio,
         "ori_mask_mode": 4,
-        "cmp_mask_mode": 3,
+        "cmp_mask_mode": 3 if cmp_ratio > 1 else 0,
         "ori_win_left": 127,
         "ori_win_right": 0,
         "layout_q": "TND",
@@ -871,6 +871,10 @@ def npu_sparse_flash_mla(
         raise RuntimeError(f"DeepSeek-V4 SMLA indexer_k must be TND [T, D], got shape {tuple(indexer_k.shape)}.")
     if weights is not None and weights.dim() != 2:
         raise RuntimeError(f"DeepSeek-V4 SMLA weights must be TND [T, N], got shape {tuple(weights.shape)}.")
+    # cmp_kv is none, SWA require cmp_mask_mode is 0
+    # https://gitcode.com/cann/ops-transformer/blob/master/torch_extension/cann_ops_transformer/docs/zh/sparse_flash_mla.md
+    if cmp_kv is None:
+        cmp_mask_mode = 0
 
     attention_masks = _require_attention_masks(attention_masks)
     if metadata_cache is None:
