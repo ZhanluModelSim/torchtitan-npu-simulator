@@ -33,6 +33,11 @@ _original_use_deterministic_algorithms: Callable | None = None
 def _set_env_with_warning(name: str, value: str) -> None:
     """Set ``os.environ[name] = value``, warning on a genuine conflict."""
     existing = os.environ.get(name)
+    if name == "HCCL_DETERMINISTIC" and existing is not None and existing.lower() == "strict":
+        logger.warning(
+            "Both deterministic and batch-invariant modes are enabled; only batch-invariant mode takes effect."
+        )
+        return
     if existing is not None and existing.lower() != value.lower():
         logger.warning(
             "Overriding existing env %s=%r with %r for deterministic training.",
