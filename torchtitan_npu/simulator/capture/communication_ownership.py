@@ -1331,7 +1331,13 @@ class FSDPStageOwnershipPlugin:
                             and launch_op_id not in source_entry.predecessors
                         ):
                             source_entry.predecessors.append(launch_op_id)
-                            _refresh_graph_topology(pure)
+                            # Keep reachability current for later cycle checks
+                            # without rebuilding the full graph per prefetch
+                            # source entry. The final topology refresh below
+                            # remains the canonical rebuild.
+                            pure.nodes[launch_op_id].successors.append(
+                                source_entry_id
+                            )
                     if skipped_entries:
                         pure.nodes[launch_op_id].annotations[
                             "fsdp_prefetch_source_gate_skipped_entries"
