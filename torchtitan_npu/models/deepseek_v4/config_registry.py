@@ -78,6 +78,18 @@ def _flash_base() -> TrainerConfig:
     return replace(
         base,
         model_spec=model_registry("v4_flash_43layers_256experts"),
+        optimizer=replace(
+            base.optimizer,
+            name="Muon",
+            lr=2.2e-4,
+            weight_decay=0.1,
+            muon_momentum=0.95,
+            muon_enable_nesterov=True,
+            muon_ns_steps=10,
+            muon_adjust_lr_fn="match_rms_adamw",
+            muon_hybrid_ns=True,
+            swap_merge_buckets=4,
+        ),
         model_converters=ModelConvertersContainer.Config(converters=_default_converters()),
         parallelism=replace(
             base.parallelism,

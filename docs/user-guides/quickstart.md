@@ -104,14 +104,12 @@ bash scripts/run_train.sh \
 Network_Interface=enp23s0f3 # 填入 ifconfig 的驱动名
 ...
 # TODO change to your device ips
-IPs=('192.168.xxx.xxx' '192.168.xxx.xxx') # 填入集群的所有IP
-# TODO change 192.168 to your local IP
-LOCAL_HOST=`ifconfig|grep "inet 192.168"| awk '{print $2}'` # 将 "192.168" 替换为当前 IP
+NODE_IPS="192.168.xxx.xxx,192.168.xxx.xxx" # 填入集群的所有IP
 ```
 
 在所有参与训练的节点上同时执行 `scripts/run_train_multinodes.sh`，以启动多机预训练任务。以 DeepSeek-V3.2 完整模型为例：
 ```bash
-bash scripts/run_train_multinodes.sh
+NODE_IPS="192.168.xxx.xxx,192.168.xxx.xxx" Network_Interface=enp189s0f0 bash scripts/run_train_multinodes.sh
 ```
 
 > [!NOTE]
