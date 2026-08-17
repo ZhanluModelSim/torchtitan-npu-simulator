@@ -3,11 +3,12 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Override: run DeepSeek-V4 MHC pre/post with fused NPU operators."""
+"""Override: run DeepSeek-V4 MHC pre/post with NPU operators."""
 
 from dataclasses import dataclass
 
 import torch
+import torch_npu
 from cann_ops_transformer import ops as cann_ops
 from torchtitan.config import derive, override
 
@@ -15,11 +16,12 @@ from torchtitan_npu.models.deepseek_v4.mhc import HcPost, HcPre
 
 
 class CANNHcPre(HcPre):
-    """HcPre backed by ``cann_ops_transformer.ops.mhc_pre_sinkhorn``.
+    """HcPre backed by split ``torch_npu`` operators.
 
     The modern model-dir ``HcPre`` owns its mixing parameters and calls
-    ``forward(x)``; the fused op consumes them internally (linear + RMS
-    scaling + sigmoid + sinkhorn), mirroring the eager implementation.
+    ``forward(x)``. Training uses ``npu_mhc_pre`` followed by
+    ``npu_mhc_sinkhorn`` so autograd takes the split backward path instead of
+    the slower fused ``mhc_pre_sinkhorn`` backward kernel.
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -30,19 +32,21 @@ class CANNHcPre(HcPre):
         self,
         x: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # The block feeds the 4-D ``[B, S, hc_mult, dim]`` form (the eager
-        # path flattens to ``[B, S, hc_mult * dim]`` for its linear); the
-        # fused op consumes the 4-D form directly (x: FLOAT16/BFLOAT16).
         dtype = x.dtype
-        h_in, h_post, h_res = cann_ops.mhc_pre_sinkhorn(
+        h_in, h_post, h_res, _, _, _ = torch_npu.npu_mhc_pre(
             x,
             self.hc_fn.float(),
             self.hc_scale.float(),
             self.hc_base.float(),
-            self.hc_mult,
-            self.sinkhorn_iters,
-            self.eps,
-            self.norm_eps,
+            norm_eps=self.norm_eps,
+            hc_eps=self.eps,
+            out_flag=1,
+        )
+        h_res, _, _ = torch_npu.npu_mhc_sinkhorn(
+            h_res,
+            eps=self.eps,
+            num_iters=self.sinkhorn_iters,
+            out_flag=1,
         )
         h_res = h_res.reshape(*x.shape[:2], self.hc_mult, self.hc_mult)
         return h_in.to(dtype), h_post, h_res
@@ -68,7 +72,7 @@ class CANNHcPost(HcPost):
 @override(
     target=HcPre.Config,
     exact=True,
-    description=("NPU fused DeepSeek-V4 HcPre via cann_ops_transformer.ops.mhc_pre_sinkhorn"),
+    description="NPU DeepSeek-V4 HcPre via split torch_npu operators",
 )
 def cann_hc_pre(cfg: HcPre.Config) -> CANNHcPre.Config:
     return derive(cfg, CANNHcPre.Config)

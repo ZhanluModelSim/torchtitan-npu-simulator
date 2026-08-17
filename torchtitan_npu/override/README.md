@@ -236,7 +236,7 @@ torchtitan_npu.override.deepseek_v3_2.sparse_attn.cann
 | `sparse_attn.cann` | `CompressedSparseInnerAttention.Config` | `CANNCompressedSparseInnerAttention.Config` |
 | `sparse_attn.pypto` (replaces `sparse_attn.cann`) | `CompressedSparseInnerAttention.Config` | `PyPTOCompressedSparseInnerAttention.Config` |
 | `sparse_attn.golden` | `CompressedSparseInnerAttention.Config` | `GoldenCompressedSparseInnerAttention.Config` |
-| `mhc.cann_hc_pre` | `HcPre.Config` | `CANNHcPre.Config` | 使用 `cann_ops_transformer.ops.mhc_pre_sinkhorn` |
+| `mhc.cann_hc_pre` | `HcPre.Config` | `CANNHcPre.Config` | 使用 `torch_npu.npu_mhc_pre` + `torch_npu.npu_mhc_sinkhorn` |
 | `mhc.cann_hc_post` | `HcPost.Config` | `CANNHcPost.Config` | 使用 `cann_ops_transformer.ops.mhc_post` |
 
 `sparse_attn.cann_metadata` 需要传入 `num_heads`、`head_dim`、
