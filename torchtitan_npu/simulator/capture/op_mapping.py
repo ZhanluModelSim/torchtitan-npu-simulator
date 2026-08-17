@@ -42,7 +42,7 @@ OP_MAPPING: dict[str, str] = {
     "npu.npu_swiglu.default": "swiglu",
     "npu.npu_swiglu_backward.default": "swiglu",
     "fusion_attention": "fusion_attention",
-    "fusion_attention_gard": "fusion_attention",
+    "fusion_attention_grad": "fusion_attention",
     "situ_glu": "situ_glu",
     "situ_glu_backward": "situ_glu",
     "npu.npu_rotary_mul.default": "rope",

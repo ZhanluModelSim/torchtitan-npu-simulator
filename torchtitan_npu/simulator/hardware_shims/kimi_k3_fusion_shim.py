@@ -65,7 +65,7 @@ class _SimGatedMLA(torch.autograd.Function):
     def backward(ctx, grad_output):  # noqa: ANN001
         saved = ctx.saved_tensors
         grads = [_empty_like(tensor) for tensor in saved]
-        _record("fusion_attention_gard", [*saved, grad_output], grads, ctx.module_path, attrs=ctx.attrs)
+        _record("fusion_attention_grad", [*saved, grad_output], grads, ctx.module_path, attrs=ctx.attrs)
         return (*grads, None)
 
 

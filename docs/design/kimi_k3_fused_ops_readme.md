@@ -6,7 +6,7 @@
 | 语义 | 前向 raw op name | 反向 raw op name | simulator 实现 |
 | --- | --- | --- | --- |
 | KDA core | `triton_ascend_kernels.chunk_kda` | `triton_ascend_kernels.chunk_kda_grad` | `kda_shim.py` |
-| Gated MLA attention core | `fusion_attention` | `fusion_attention_gard` | `kimi_k3_fusion_shim.py` |
+| Gated MLA attention core | `fusion_attention` | `fusion_attention_grad` | `kimi_k3_fusion_shim.py` |
 | SiTU-GLU activation | `situ_glu` | `situ_glu_backward` | `kimi_k3_fusion_shim.py` |
 
 这些不是实际执行的 NPU/Triton kernel，也不是通过 `torch.library` 注册的
@@ -110,7 +110,7 @@ arithmetic intensity 为约 `4*B*S*H*D^2 / ((5*N+B*S*H+H+H*D)*b)`，大序列时
 | `V` | `[B, H, S, Dq]` | batch、head、value token、padded value feature |
 | `O` | `[B, H, S, Dq]` | batch、head、attention output token、padded value feature |
 
-`fusion_attention` 和 `fusion_attention_gard` 均带有两个非 tensor kwargs，它们
+`fusion_attention` 和 `fusion_attention_grad` 均带有两个非 tensor kwargs，它们
 以 `OpNode.attrs` 写入工作负载图：`num_heads=H` 和固定的
 `layout="BNSD"`。其中 `N` 表示 head 维，因此该 layout 对应下表的
 `[B,H,S,Dq]` 物理 tensor 排列。
