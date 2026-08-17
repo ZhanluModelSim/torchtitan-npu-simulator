@@ -50,7 +50,7 @@ class OpCostModel:
             "quantize": self._data_move,
             "sdpa": self._attention,
             "flash_attention_fwd": self._attention,
-            "FusionAttention": self._fusion_attention,
+            "fusion_attention": self._fusion_attention,
             "layer_norm": self._norm,
             "rms_norm": self._norm,
             "rms_norm_backward": self._norm,

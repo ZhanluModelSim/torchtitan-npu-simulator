@@ -120,17 +120,17 @@ def test_kimi_gated_mla_records_one_virtual_fused_op_per_pass():
 
     nodes = list(capture.build_nodes().values())
     raw_names = [node.annotations["raw_op_type"] for node in nodes]
-    assert raw_names.count("FusionAttention") == 1
-    assert raw_names.count("FusionAttentionGard") == 1
+    assert raw_names.count("fusion_attention") == 1
+    assert raw_names.count("fusion_attention_gard") == 1
     assert "aten.scaled_dot_product_attention.default" not in raw_names
     assert raw_names.count("aten.mm.default") >= 6
     assert "aten.sigmoid.default" in raw_names
     assert module._simulator_mla_shim_installed is True
     assert x.grad is not None
     assert all(parameter.grad is not None for parameter in module.parameters())
-    fused_forward = next(node for node in nodes if node.annotations["raw_op_type"] == "FusionAttention")
-    fused_backward = next(node for node in nodes if node.annotations["raw_op_type"] == "FusionAttentionGard")
-    assert fused_forward.op_type == fused_backward.op_type == "FusionAttention"
+    fused_forward = next(node for node in nodes if node.annotations["raw_op_type"] == "fusion_attention")
+    fused_backward = next(node for node in nodes if node.annotations["raw_op_type"] == "fusion_attention_gard")
+    assert fused_forward.op_type == fused_backward.op_type == "fusion_attention"
     assert [meta.shape for meta in fused_forward.inputs] == [(2, 2, 3, 6)] * 3
     assert [meta.shape for meta in fused_forward.outputs] == [(2, 2, 3, 6)]
     assert fused_forward.attrs == fused_backward.attrs == {"num_heads": 2, "layout": "BNSD"}

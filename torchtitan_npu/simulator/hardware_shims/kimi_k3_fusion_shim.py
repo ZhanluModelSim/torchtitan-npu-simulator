@@ -58,14 +58,14 @@ class _SimGatedMLA(torch.autograd.Function):
         ctx.save_for_backward(query, key, value)
         ctx.module_path = module_path
         ctx.attrs = {"num_heads": int(query.shape[1]), "layout": "BNSD"}
-        _record("FusionAttention", [query, key, value], [output], module_path, attrs=ctx.attrs)
+        _record("fusion_attention", [query, key, value], [output], module_path, attrs=ctx.attrs)
         return output
 
     @staticmethod
     def backward(ctx, grad_output):  # noqa: ANN001
         saved = ctx.saved_tensors
         grads = [_empty_like(tensor) for tensor in saved]
-        _record("FusionAttentionGard", [*saved, grad_output], grads, ctx.module_path, attrs=ctx.attrs)
+        _record("fusion_attention_gard", [*saved, grad_output], grads, ctx.module_path, attrs=ctx.attrs)
         return (*grads, None)
 
 
