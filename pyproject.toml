@@ -9,6 +9,10 @@ description = "Ascend NPU overrides for torchtitan"
 requires-python = ">=3.12"
 dependencies = ["torchtitan", "torch-npu"]
 
+[tool.setuptools.packages.find]
+include = ["torchtitan_npu*"]
+exclude = ["tests*", "CI*", "third_party*"]
+
 [tool.pytest.ini_options]
 markers = [
     "cpu: CPU-only unit test",

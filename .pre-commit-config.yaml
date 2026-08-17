@@ -70,6 +70,7 @@ repos:
     rev: v2.4.1
     hooks:
       - id: codespell
+        exclude: ^tests/assets/
         args: [
             "-L",
             "CANN,cann,NNAL,nnal,ASCEND,ascend,EnQue,CopyIn,ArchType,AND,ND,tbe,copyin,alog",
@@ -96,5 +97,6 @@ repos:
         entry: python3 -m pyrefly check
         language: system
         types: [python]
+        exclude: ^tests/assets/
         pass_filenames: false
         args: [--config, pyproject.toml]
