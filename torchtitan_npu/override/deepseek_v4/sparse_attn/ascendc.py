@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 from typing import Any, cast
 
 import torch
+import torch_npu
 from cann_ops_transformer import (
     lightning_indexer_metadata,
     sparse_flash_mla_grad_metadata,
@@ -47,6 +48,16 @@ from torchtitan_npu.models.deepseek_v4.metadata import (
 _LAYOUT = "TND"
 _ORI_MASK_MODE = 4
 _CMP_MASK_MODE = 3
+
+
+def _is_a5() -> bool:
+    try:
+        return torch_npu.npu.get_device_name().startswith("Ascend950")
+    except TypeError:
+        # CPU/UT runs may not have a current NPU device selected.  In that
+        # case torch_npu's optional device lookup returns None and fails
+        # before the device name can be queried; use the non-A5 behavior.
+        return False
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,7 +162,7 @@ def _fill_asc_metadata(
         "cmp_topk": index_topk if ratio == 4 else 0,
         "cmp_ratio": ratio,
         "ori_mask_mode": _ORI_MASK_MODE,
-        "cmp_mask_mode": _CMP_MASK_MODE,
+        "cmp_mask_mode": 0 if _is_a5() and not has_cmp_kv else _CMP_MASK_MODE,
         "ori_win_left": window_size - 1,
         "ori_win_right": 0,
         "layout_q": _LAYOUT,
@@ -373,7 +384,7 @@ class _SparseFlashMLATND(torch.autograd.Function):
             softmax_scale=softmax_scale,
             cmp_ratio=ratio,
             ori_mask_mode=_ORI_MASK_MODE,
-            cmp_mask_mode=_CMP_MASK_MODE,
+            cmp_mask_mode=0 if _is_a5() and not has_compressed else _CMP_MASK_MODE,
             ori_win_left=window_size - 1,
             ori_win_right=0,
             layout_q=_LAYOUT,
@@ -459,7 +470,7 @@ class _SparseFlashMLATND(torch.autograd.Function):
             softmax_scale=ctx.softmax_scale,
             cmp_ratio=ctx.ratio,
             ori_mask_mode=_ORI_MASK_MODE,
-            cmp_mask_mode=_CMP_MASK_MODE,
+            cmp_mask_mode=0 if _is_a5() and not has_compressed else _CMP_MASK_MODE,
             ori_win_left=ctx.window_size - 1,
             ori_win_right=0,
             layout_q=_LAYOUT,
