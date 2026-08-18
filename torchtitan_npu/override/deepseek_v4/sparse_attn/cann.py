@@ -351,6 +351,11 @@ class _SparseFlashMLATND(torch.autograd.Function):
         indexer_loss_accumulator,
         hooks,
     ):
+        # Non-CP self-attention uses the same cumsum for Q and original KV.
+        # Resolve the alias inside the Function instead of passing one Tensor
+        # object twice to autograd.Function.apply, which Dynamo rejects.
+        if cu_seqlens_ori_kv is None:
+            cu_seqlens_ori_kv = cu_seqlens_q
         has_compressed = ratio > 1
         result, softmax_lse = hooks.sparse_flash_mla(
             q,
@@ -633,9 +638,7 @@ class CANNCompressedSparseInnerAttention(CompressedSparseInnerAttention):
         # The ori cumsum: the kernel's ``cu_seqlens_ori_kv`` — under context
         # parallel the window plan's packed cumsum, otherwise the bare
         # ``cu_seq_k`` (identical to ``cu_seq_q`` without CP).
-        cu_seqlens_ori_kv = (
-            metadata.window.cu_seqlens_ori_kv if metadata.window is not None else metadata.varlen.cu_seq_k
-        )
+        cu_seqlens_ori_kv = metadata.window.cu_seqlens_ori_kv if metadata.window is not None else None
         if cmp_k is not None:
             # The container is the ShardingConfig all-gather's output (under
             # CP the padded per-rank containers concatenated); the kgather
