@@ -60,7 +60,8 @@ torchtitan_npu/override/
 │   ├── optimizer.py
 │   ├── profiler.py
 │   ├── rms_norm.py
-│   └── rope.py
+│   ├── rope.py
+│   └── token_dispatcher.py
 ├── deepseek_v3_2/
 │   ├── __init__.py
 │   └── sparse_attn/
@@ -189,10 +190,13 @@ converter 处理后的实际配置类型和 FQN 核对匹配结果。
 | `rope.workaround` | `ComplexRoPE.Config` | `WorkaroundComplexRoPE.Config` | 预展开 cos/sin cache，并使用 PyTorch 小算子计算 interleaved RoPE；仅精确匹配 `ComplexRoPE.Config` |
 | `rope.asc_complex` | `ComplexRoPE.Config` | `AscComplexRoPE.Config` | 使用 interleave 模式的 `torch_npu.npu_rotary_mul`；仅精确匹配 |
 | `rope.asc_cossin` | `CosSinRoPE.Config` | `AscCosSinRoPE.Config` | 使用 half 模式的 `torch_npu.npu_rotary_mul` |
+| `token_dispatcher.npu_all_to_all_token_dispatcher` | `AllToAllTokenDispatcher.Config` | `NPUAllToAllTokenDispatcher.Config` | 使用 `torch_npu.npu_moe_token_permute` `npu_moe_token_unpermute` 融合 MoE dispatch/combine |
+
 
 `rope.workaround` 与 `rope.asc_complex` 会声明同一 target，不能同时启用。
 `AscComplexRoPE` 和 `AscCosSinRoPE` 当前都要求同一 batch 内各行的位置布局一致，
 并使用第一行位置构造 batch 共享的 cosine/sine 表。
+
 
 ### Virtual Optimizer 与 checkpoint
 
