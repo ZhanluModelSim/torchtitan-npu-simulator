@@ -48,7 +48,11 @@ def _default_converters(*extra_names: str) -> list:
     return [get_model_converter_config(name) for name in (*_DEFAULT_CONVERTERS, *extra_names)]
 
 
-def debug_deepseek_v4_single_node_1b() -> TrainerConfig:
+def debug_deepseek_v4_smoketest() -> TrainerConfig:
+    return debug_deepseek_v4_mini_1b()
+
+
+def debug_deepseek_v4_mini_1b() -> TrainerConfig:
     base = trainer_base_config()
     return replace(
         base,

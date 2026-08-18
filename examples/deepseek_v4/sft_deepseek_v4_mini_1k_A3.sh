@@ -8,7 +8,7 @@ set -euo pipefail
 
 HF_ASSETS_PATH="${HF_ASSETS_PATH:-/data/models/deepseek-v4-mini-1B-init}"
 CHECKPOINT_INITIAL_LOAD_PATH="${CHECKPOINT_INITIAL_LOAD_PATH:-/data/models/deepseek-v4-mini-1B-init}"
-DATA_FILES="${DATA_FILES:-yelp_review_full/train-00000-of-00001.parquet}"
+DATA_FILES="${DATA_FILES:-datasets/Daring-Anteater/train.jsonl}"
 DATASET_SPLIT="${DATASET_SPLIT:-train}"
 CHECKPOINT_FOLDER="${CHECKPOINT_FOLDER:-checkpoint}"
 
@@ -28,9 +28,9 @@ EXTRA_ARGS=(
   --checkpoint.interval 500
   --checkpoint.last_save_model_only
   --checkpoint.export_dtype bfloat16
-  --training.local_batch_size 4
+  --training.local_batch_size 1
   --training.global_batch_size 8
-  --training.seq_len 1152
+  --training.seq_len 2016
   --training.steps 1000
   --lr_scheduler.warmup_steps 60
   # User top-level Trainer overrides
@@ -39,14 +39,14 @@ EXTRA_ARGS=(
   ################## Top-level CLI overrides end; following subcommands cannot be overridden. ##################
   # DataLoader subcommand
   dataloader:chat_data_loader_config
-  --dataloader.dataset_path parquet
-  --dataloader.chat_processor torchtitan_npu.hf_datasets.chat_processors.process_yelp_sample
+  --dataloader.dataset_path json
+  --dataloader.chat_processor torchtitan_npu.hf_datasets.chat_processors.process_daring_anteater_sample
   --dataloader.data_files "${DATA_FILES}"
   --dataloader.dataset_split "${DATASET_SPLIT}"
 )
 
 MODULE="${MODULE:-torchtitan_npu.models.deepseek_v4}" \
-CONFIG="${CONFIG:-debug_deepseek_v4_single_node_1b}" \
+CONFIG="${CONFIG:-debug_deepseek_v4_mini_1b}" \
 NGPU="${NGPU:-1}" \
 bash scripts/run_train_multinodes.sh \
   "${EXTRA_ARGS[@]}"

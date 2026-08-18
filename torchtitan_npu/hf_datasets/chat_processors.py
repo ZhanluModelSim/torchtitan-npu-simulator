@@ -51,6 +51,19 @@ def process_wordle_sample(sample: dict) -> list[dict]:
     return normalized
 
 
+def process_daring_anteater_sample(sample: dict) -> list[dict]:
+    messages: list[dict] = []
+
+    system_prompt = sample.get("system", "")
+    if isinstance(system_prompt, str) and system_prompt.strip():
+        messages.append({"role": "system", "content": system_prompt})
+
+    for turn in sample["conversations"]:
+        messages.append({"role": turn["from"].lower(), "content": turn["value"]})
+
+    return messages
+
+
 def process_yelp_sample(sample):
     text = str(sample.get("text", "")).strip()
     label = int(sample["label"])

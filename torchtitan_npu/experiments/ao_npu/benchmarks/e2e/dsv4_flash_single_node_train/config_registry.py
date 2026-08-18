@@ -26,12 +26,12 @@ from torchtitan_npu.experiments.ao_npu.benchmarks.e2e.dsv4_flash_single_node_tra
 )
 from torchtitan_npu.models.deepseek_v4.config_registry import (
     debug_deepseek_v4_flash_single_node,
-    debug_deepseek_v4_single_node_1b,
+    debug_deepseek_v4_mini_1b,
 )
 
 _BASE_CONFIGS = {
     "flash": debug_deepseek_v4_flash_single_node,
-    "1b": debug_deepseek_v4_single_node_1b,
+    "1b": debug_deepseek_v4_mini_1b,
 }
 
 

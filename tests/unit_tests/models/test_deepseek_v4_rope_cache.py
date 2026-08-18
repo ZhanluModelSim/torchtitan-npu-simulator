@@ -11,7 +11,7 @@ from torchtitan.protocols.model_converter import ModelConvertersContainer
 
 from torchtitan_npu.converters import get_model_converter_config
 from torchtitan_npu.models.deepseek_v4 import model as deepseek_v4_model
-from torchtitan_npu.models.deepseek_v4.config_registry import debug_deepseek_v4_single_node_1b
+from torchtitan_npu.models.deepseek_v4.config_registry import debug_deepseek_v4_smoketest
 
 
 @pytest.mark.parametrize("with_compressor", [False, True])
@@ -175,7 +175,7 @@ def test_compressor_keeps_complex_cache_semantics(monkeypatch):
 
 @pytest.mark.parametrize("converter_name", ["npu_rope", "npu_rope_inplace_partial"])
 def test_update_from_config_derives_use_npu_rope(monkeypatch, converter_name):
-    trainer_config = debug_deepseek_v4_single_node_1b()
+    trainer_config = debug_deepseek_v4_smoketest()
     trainer_config = replace(
         trainer_config,
         model_converters=ModelConvertersContainer.Config(converters=[get_model_converter_config(converter_name)]),

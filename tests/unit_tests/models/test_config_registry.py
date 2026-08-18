@@ -29,9 +29,9 @@ class ModelConfigRegistry:
 CONFIG_REGISTRIES = (
     ModelConfigRegistry(
         module_name="torchtitan_npu.models.deepseek_v4.config_registry",
-        config_model_names=("deepseek_v4_flash", "deepseek_v4_pro", "deepseek_v4"),
+        config_model_names=("deepseek_v4_flash", "deepseek_v4_pro", "deepseek_v4_mini", "deepseek_v4"),
         example_dir="examples/deepseek_v4",
-        example_model_names=("deepseek_v4_flash", "deepseek_v4_pro", "deepseek_v4"),
+        example_model_names=("deepseek_v4_flash", "deepseek_v4_pro", "deepseek_v4_mini", "deepseek_v4"),
         enabled=True,
     ),
     # Reserved for the same generic checks once DeepSeek V3 registry / examples are migrated.
@@ -94,6 +94,7 @@ def _config_name_pattern(registry: ModelConfigRegistry) -> re.Pattern[str]:
         rf"{model_name}_{seq_len}_{cluster_size}(?:_{suffix})?"
         rf"|sft_{model_name}_{seq_len}_{cluster_size}_{suffix}"
         rf"|debug_{model_name}_(?:single_node(?:_{suffix})?|smoketest)"
+        rf"|debug_deepseek_v4_mini_1b"
         rf")$"
     )
 
@@ -436,7 +437,7 @@ def test_deepseek_v4_configs_define_model_scoped_fsdp_parameter_patterns():
         "layers.*.*hc_head.hc_head_*",
     ]
     configs = (
-        config_registry.debug_deepseek_v4_single_node_1b(),
+        config_registry.debug_deepseek_v4_mini_1b(),
         config_registry.debug_deepseek_v4_flash_single_node(),
         config_registry.debug_deepseek_v4_pro_single_node(),
     )
