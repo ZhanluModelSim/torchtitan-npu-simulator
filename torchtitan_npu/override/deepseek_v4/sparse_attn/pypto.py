@@ -6,7 +6,7 @@
 """PyPTO LI/LIG hooks for the shared DeepSeek-V4 attention bridge.
 
 The metadata, input preparation and autograd bridge are implemented once by
-:mod:`.cann`.  CANN SMLA/SMLAG are reused eagerly; the PyPTO LI/LIG modules are
+:mod:`.ascendc`.  AscendC SMLA/SMLAG are reused eagerly; the PyPTO LI/LIG modules are
 loaded lazily on their first NPU call.
 """
 
@@ -18,8 +18,8 @@ from functools import cache
 
 import torch
 
-from .cann import (
-    CANNCompressedSparseInnerAttention,
+from .ascendc import (
+    AscCompressedSparseInnerAttention,
     _SparseAttentionHooks,
 )
 
@@ -52,7 +52,7 @@ def _pypto_sparse_lightning_indexer_kl_loss_grad(*, q: torch.Tensor, **kwargs):
 
 
 def _pypto_sparse_flash_mla_grad(*args, **kwargs):
-    """Use CANN SMLAG while preserving the deterministic workaround."""
+    """Use AscendC SMLAG while preserving the deterministic workaround."""
 
     deterministic_mode = torch.get_deterministic_debug_mode()
     if deterministic_mode:
@@ -72,11 +72,11 @@ _PYPTO_SPARSEATTN_HOOK = _SparseAttentionHooks(
 )
 
 
-class PyPTOCompressedSparseInnerAttention(CANNCompressedSparseInnerAttention):
-    """Use PyPTO LI/LIG with CANN metadata and SMLA/SMLAG."""
+class PyPTOCompressedSparseInnerAttention(AscCompressedSparseInnerAttention):
+    """Use PyPTO LI/LIG with AscendC metadata and SMLA/SMLAG."""
 
     @dataclass(kw_only=True, slots=True)
-    class Config(CANNCompressedSparseInnerAttention.Config):
+    class Config(AscCompressedSparseInnerAttention.Config):
         pass
 
     def __init__(self, config: Config) -> None:

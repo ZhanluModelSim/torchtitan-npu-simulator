@@ -3,16 +3,12 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-import importlib
-
 import pytest
 import torch
 from torch.fx.subgraph_rewriter import replace_pattern_with_filters
 
 _previous_pre_grad_pass = torch._inductor.config.pre_grad_custom_pass
-inplace_partial_rope = importlib.import_module(
-    "torchtitan_npu.compile.patterns.deepseek_v4.inplace_partial_rope"
-)
+import torchtitan_npu.compile.patterns.deepseek_v4.inplace_partial_rope as inplace_partial_rope  # noqa: E402
 _make_parent_rope_pattern = inplace_partial_rope._make_parent_rope_pattern
 
 

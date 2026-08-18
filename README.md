@@ -151,10 +151,10 @@ torchtitan-npu/
 │   │   ├── deepseek_v3_2/         # DeepSeek-V3.2 专属 override
 │   │   └── deepseek_v4/           # DeepSeek-V4 专属 override 与数值基线
 │   ├── patches/
-│   │   ├── torch_npu/             # torch_npu 的临时补丁
 │   │   ├── torchtitan/            # 尚未进入当前上游版本的临时补丁
 │   │   └── workaround/            # NPU 运行时兼容处理
 │   ├── ops/                       # CANN 与 NPU 专属算子封装
+│   │   └── ascendc/               # AscendC 算子适配（导入时自动加载）
 │   └── __init__.py                # 导入 package patch
 ├── scripts/                       # 训练与仓库辅助脚本
 ├── tests/                         # 单元测试和测试数据

@@ -124,7 +124,7 @@ class _GlooDispatcher(CPTokenDispatcher):
 
 
 def _slim_metadata(plans, window):
-    """A minimal kernel-contract holder (the CANN handler's slim shape)."""
+    """A minimal kernel-contract holder (the AscendC handler's slim shape)."""
 
     class _Slim:
         pass

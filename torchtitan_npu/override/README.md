@@ -1,7 +1,7 @@
 # Override 扩展
 
 `torchtitan_npu.override` 基于 TorchTitan 的配置级 override 机制替换
-`Configurable.Config` 节点，用于接入 NPU 兼容实现、CANN 融合算子和模型数值参考。
+`Configurable.Config` 节点，用于接入 NPU 兼容实现、AscendC 融合算子和模型数值参考。
 它不是算子级 override API；PyTorch backend 缺口及必须随包导入生效的临时适配放在
 `torchtitan_npu.patches`。
 
@@ -24,7 +24,7 @@ python -m torchtitan.train \
 
 ```bash
 --override.imports \
-  'torchtitan_npu.override.deepseek_v4.sparse_attn.cann_metadata={"num_heads":16,"head_dim":512,"index_n_heads":8,"index_head_dim":128,"index_topk":512}'
+  'torchtitan_npu.override.deepseek_v4.sparse_attn.asc_metadata={"num_heads":16,"head_dim":512,"index_n_heads":8,"index_head_dim":128,"index_topk":512}'
 ```
 
 也可以直接设置配置：
@@ -65,13 +65,13 @@ torchtitan_npu/override/
 │   ├── __init__.py
 │   └── sparse_attn/
 │       ├── __init__.py
-│       └── cann.py
+│       └── ascendc.py
 └── deepseek_v4/
     ├── __init__.py
     ├── mhc.py
     └── sparse_attn/
         ├── __init__.py
-        ├── cann.py
+        ├── ascendc.py
         ├── golden.py
         └── pypto.py
 ```
@@ -82,7 +82,7 @@ torchtitan_npu/override/
 - 简单 target 使用单文件，文件名采用 target 的 snake_case 语义，例如
   `RMSNorm -> rms_norm.py`。
 - 同一 target 同时包含较大的多后端实现时使用 package。package 名仍表示 target；
-  `__init__.py` 只定义稳定的注册入口，具体实现按 `cann.py`、`golden.py`、
+  `__init__.py` 只定义稳定的注册入口，具体实现按 `ascendc.py`、`golden.py`、
   `triton.py` 等拆分。
 - 各层 `__init__.py` 不批量导入无关注册模块，避免仅导入上层 package 就注册无关
   target。
@@ -100,7 +100,8 @@ torchtitan_npu.override.<scope>.<target>.<variant>
 
 | Variant | 含义 |
 | --- | --- |
-| `cann` | 调用 CANN 或 `torch_npu` 融合计算、Profiler 等 CANN 能力 |
+| `asc` | 调用 CANN 或 `torch_npu` 的融合计算能力 |
+| `cann` | 调用 CANN 或 `torch_npu` API 的非融合能力，如 `profiler.cann` |
 | `npu` | NPU runtime 级能力；仅在不能用具体 CANN、Torch 或行为名称表达时使用 |
 | `golden` | 模型专属的 eager 数值参考 |
 | `torch` | 完全由标准 PyTorch 算子组成的独立实现 |
@@ -109,18 +110,18 @@ torchtitan_npu.override.<scope>.<target>.<variant>
 | 行为名称 | 与计算后端无关的能力，例如 `optimizer.virtual` |
 
 同一 target family 中存在多个同类实现时，在 variant 后增加对象或职责限定，例如
-`rope.cann_complex`、`rope.cann_cossin` 和 `sparse_attn.cann_metadata`。不要添加
+`rope.asc_complex`、`rope.asc_cossin` 和 `sparse_attn.asc_metadata`。不要添加
 `_override` 后缀，也不要使用无法说明实现边界的 `ascend` 等泛化名称。
 
 Replacement 类采用「variant + target」命名，并保留标准缩写的大小写：
 
 | 类型 | 示例 |
 | --- | --- |
-| CANN 实现 | `CANNRMSNorm`、`CANNComplexRoPE` |
+| AscendC 实现 | `AscRMSNorm`、`AscComplexRoPE` |
 | Golden 实现 | `GoldenCompressedSparseInnerAttention` |
 | Workaround 实现 | `WorkaroundComplexRoPE` |
 | 行为实现 | `VirtualOptimizersContainer` |
-| 后端协议或元数据 | `CANNCompressedVarlenMetadata`、`CANNBlockLayoutMetadata` |
+| 后端协议或元数据 | `AscCompressedVarlenMetadata`、`AscBlockLayoutMetadata` |
 
 不作为公开 override 入口的内部函数和类使用前导下划线。
 
@@ -137,7 +138,7 @@ from torchtitan.config import derive, override
 from torchtitan.models.common.nn_modules import RMSNorm
 
 
-class CANNRMSNorm(RMSNorm):
+class AscRMSNorm(RMSNorm):
     @dataclass(kw_only=True, slots=True)
     class Config(RMSNorm.Config):
         pass
@@ -148,10 +149,10 @@ class CANNRMSNorm(RMSNorm):
 
 @override(
     target=RMSNorm.Config,
-    description="CANN fused RMSNorm via torch_npu.npu_rms_norm",
+    description="AscendC fused RMSNorm via torch_npu.npu_rms_norm",
 )
-def cann(cfg: RMSNorm.Config) -> CANNRMSNorm.Config:
-    return derive(cfg, CANNRMSNorm.Config)
+def asc(cfg: RMSNorm.Config) -> AscRMSNorm.Config:
+    return derive(cfg, AscRMSNorm.Config)
 ```
 
 实现需满足以下约定：
@@ -181,13 +182,13 @@ converter 处理后的实际配置类型和 FQN 核对匹配结果。
 | `optimizer.virtual` | `OptimizersContainer.Config` | `VirtualOptimizersContainer.Config` | 将 Adam/AdamW 的 `exp_avg` 和 `exp_avg_sq` 放入 NPU swap memory |
 | `optimizer.checkpoint_virtual` | `CheckpointManager.Config` | `VirtualCheckpointManager.Config` | 为 Virtual Optimizer 的同步 native DCP 保存关闭 writer copy-ahead |
 | `profiler.cann` | `Profiler.Config` | `CANNProfiler.Config` | 使用 `torch_npu.profiler` 采集 CPU/NPU trace |
-| `rms_norm.cann` | `RMSNorm.Config` | `CANNRMSNorm.Config` | 使用 `torch_npu.npu_rms_norm` |
+| `rms_norm.asc` | `RMSNorm.Config` | `AscRMSNorm.Config` | 使用 `torch_npu.npu_rms_norm` |
 | `rope.workaround` | `ComplexRoPE.Config` | `WorkaroundComplexRoPE.Config` | 预展开 cos/sin cache，并使用 PyTorch 小算子计算 interleaved RoPE；仅精确匹配 `ComplexRoPE.Config` |
-| `rope.cann_complex` | `ComplexRoPE.Config` | `CANNComplexRoPE.Config` | 使用 interleave 模式的 `torch_npu.npu_rotary_mul`；仅精确匹配 |
-| `rope.cann_cossin` | `CosSinRoPE.Config` | `CANNCosSinRoPE.Config` | 使用 half 模式的 `torch_npu.npu_rotary_mul` |
+| `rope.asc_complex` | `ComplexRoPE.Config` | `AscComplexRoPE.Config` | 使用 interleave 模式的 `torch_npu.npu_rotary_mul`；仅精确匹配 |
+| `rope.asc_cossin` | `CosSinRoPE.Config` | `AscCosSinRoPE.Config` | 使用 half 模式的 `torch_npu.npu_rotary_mul` |
 
-`rope.workaround` 与 `rope.cann_complex` 会声明同一 target，不能同时启用。
-`CANNComplexRoPE` 和 `CANNCosSinRoPE` 当前都要求同一 batch 内各行的位置布局一致，
+`rope.workaround` 与 `rope.asc_complex` 会声明同一 target，不能同时启用。
+`AscComplexRoPE` 和 `AscCosSinRoPE` 当前都要求同一 batch 内各行的位置布局一致，
 并使用第一行位置构造 batch 共享的 cosine/sine 表。
 
 ### Virtual Optimizer 与 checkpoint
@@ -213,18 +214,18 @@ checkpoint 特性。完整的数据流、支持范围和限制见
 
 | 入口 | Target | Replacement |
 | --- | --- | --- |
-| `sparse_attn.cann_metadata` | `MetadataExtension.Config` | `CANNVarlenMetadataExtension.Config` |
-| `sparse_attn.cann` | `SparseInnerAttention.Config` | `CANNSparseInnerAttention.Config` |
+| `sparse_attn.asc_metadata` | `MetadataExtension.Config` | `AscVarlenMetadataExtension.Config` |
+| `sparse_attn.asc` | `SparseInnerAttention.Config` | `AscSparseInnerAttention.Config` |
 
 TND 稀疏注意力需要同时启用 metadata 扩展和注意力内核：
 
 ```text
-torchtitan_npu.override.deepseek_v3_2.sparse_attn.cann_metadata
-torchtitan_npu.override.deepseek_v3_2.sparse_attn.cann
+torchtitan_npu.override.deepseek_v3_2.sparse_attn.asc_metadata
+torchtitan_npu.override.deepseek_v3_2.sparse_attn.asc
 ```
 
-`sparse_attn.cann` 会同时把嵌套的 `SparseIndexerLoss.Config` 派生为
-`CANNSparseIndexerLoss.Config`。
+`sparse_attn.asc` 会同时把嵌套的 `SparseIndexerLoss.Config` 派生为
+`AscSparseIndexerLoss.Config`。
 
 ### DeepSeek-V4
 
@@ -232,17 +233,17 @@ torchtitan_npu.override.deepseek_v3_2.sparse_attn.cann
 
 | 入口 | Target | Replacement |
 | --- | --- | --- |
-| `sparse_attn.cann_metadata` | `MetadataExtension.Config` | `CANNMetadataExtension.Config` |
-| `sparse_attn.cann` | `CompressedSparseInnerAttention.Config` | `CANNCompressedSparseInnerAttention.Config` |
-| `sparse_attn.pypto` (replaces `sparse_attn.cann`) | `CompressedSparseInnerAttention.Config` | `PyPTOCompressedSparseInnerAttention.Config` |
+| `sparse_attn.asc_metadata` | `MetadataExtension.Config` | `AscMetadataExtension.Config` |
+| `sparse_attn.asc` | `CompressedSparseInnerAttention.Config` | `AscCompressedSparseInnerAttention.Config` |
+| `sparse_attn.pypto` (replaces `sparse_attn.asc`) | `CompressedSparseInnerAttention.Config` | `PyPTOCompressedSparseInnerAttention.Config` |
 | `sparse_attn.golden` | `CompressedSparseInnerAttention.Config` | `GoldenCompressedSparseInnerAttention.Config` |
-| `mhc.cann_hc_pre` | `HcPre.Config` | `CANNHcPre.Config` | 使用 `torch_npu.npu_mhc_pre` + `torch_npu.npu_mhc_sinkhorn` |
-| `mhc.cann_hc_post` | `HcPost.Config` | `CANNHcPost.Config` | 使用 `cann_ops_transformer.ops.mhc_post` |
+| `mhc.asc_hc_pre` | `HcPre.Config` | `AscHcPre.Config` | 使用 `torch_npu.npu_mhc_pre` + `torch_npu.npu_mhc_sinkhorn` |
+| `mhc.asc_hc_post` | `HcPost.Config` | `AscHcPost.Config` | 使用 `cann_ops_transformer.ops.mhc_post` |
 
-`sparse_attn.cann_metadata` 需要传入 `num_heads`、`head_dim`、
+`sparse_attn.asc_metadata` 需要传入 `num_heads`、`head_dim`、
 `index_n_heads`、`index_head_dim` 和 `index_topk`。这些值必须与所选模型配置一致。
-`sparse_attn.cann` 还支持可选的 `indexer_loss_coeff`，默认值为 `1.0`。
-MHC 的 `cann_hc_pre` / `cann_hc_post` 是可选入口（`deepseek_v4/__init__.py`
+`sparse_attn.asc` 还支持可选的 `indexer_loss_coeff`，默认值为 `1.0`。
+MHC 的 `asc_hc_pre` / `asc_hc_post` 是可选入口（`deepseek_v4/__init__.py`
 默认只导入 `sparse_attn`），需要时显式加入 `override.imports`。
 推荐直接使用 [scripts/run_train.sh](../../scripts/run_train.sh)，脚本已为
 `deepseek_v4_debugmodel`、`deepseek_v4_flash` 和 `deepseek_v4_pro` 配置对应参数：
@@ -255,10 +256,10 @@ USE_GOLDEN=1 ./scripts/run_train.sh
 默认路径启用以下组合：
 
 ```text
-torchtitan_npu.override.common.rms_norm.cann
-torchtitan_npu.override.common.rope.cann_complex
-torchtitan_npu.override.deepseek_v4.sparse_attn.cann_metadata=<model geometry>
-torchtitan_npu.override.deepseek_v4.sparse_attn.cann
+torchtitan_npu.override.common.rms_norm.asc
+torchtitan_npu.override.common.rope.asc_complex
+torchtitan_npu.override.deepseek_v4.sparse_attn.asc_metadata=<model geometry>
+torchtitan_npu.override.deepseek_v4.sparse_attn.asc
 ```
 
 `USE_GOLDEN=1` 启用以下数值参考组合：
@@ -271,22 +272,22 @@ torchtitan_npu.override.deepseek_v4.sparse_attn.golden
 Golden recipe 不替换 RMSNorm 和 MoE：RMSNorm 使用模型配置中的 Torch 实现，MoE 使用
 当前模型路径中经过 package patch 修正的 BF16 实现。仓库不再提供独立的 GoldenRMSNorm
 或 GoldenMoE 入口。`sparse_attn.golden` 是逐文档 eager 数值参考，其 indexer score 和
-gather-matmul 使用 FP32 计算，并用于与 `dsv4-infer-npu` 基线及 CANN 融合路径比较。
+gather-matmul 使用 FP32 计算，并用于与 `dsv4-infer-npu` 基线及 AscendC 融合路径比较。
 
-`sparse_attn.cann` 必须与 `sparse_attn.cann_metadata` 配套使用；
+`sparse_attn.asc` 必须与 `sparse_attn.asc_metadata` 配套使用；
 `sparse_attn.golden` 使用模型默认的 metadata 构建（无扩展），不能再启用
-`sparse_attn.cann_metadata`。两种注意力实现声明同一 target，也不能同时启用。
+`sparse_attn.asc_metadata`。两种注意力实现声明同一 target，也不能同时启用。
 
 DeepSeek-V4 当前采用单行 packed container，要求 `local_batch_size == 1`；增加每步
 token 数时应调整 `seq_len`。Golden reference 使用包含 reference tier 的
-`CompressedVarlenMetadata`，当前仅支持无 context parallel 的连续文档布局。CANN
-路径使用独立的精简 `CANNCompressedVarlenMetadata`，只携带 kernel contract 和预计算
-的 CANN metadata，不构造 Golden 路径使用的稠密 mask、文档位置和静态块列表。
+`CompressedVarlenMetadata`，当前仅支持无 context parallel 的连续文档布局。AscendC
+路径使用独立的精简 `AscCompressedVarlenMetadata`，只携带 kernel contract 和预计算
+的 AscendC metadata，不构造 Golden 路径使用的稠密 mask、文档位置和静态块列表。
 
 TND 数据约定见 [DeepSeek-V4 TND 适配](../../docs/feature_guides/deepseek_v4_tnd.md)。
 
 若使用 PyPTO 的 LI/LIG 算子，`torchtitan_npu.override.deepseek_v4.sparse_attn.pypto` 替换
-`torchtitan_npu.override.deepseek_v4.sparse_attn.cann`，未覆盖的 sparse-attention
+`torchtitan_npu.override.deepseek_v4.sparse_attn.asc`，未覆盖的 sparse-attention
 能力继续复用已验证的实现。使用该入口需要额外安装与当前 CANN 匹配的 `pypto`
 runtime，安装方法参见 [PyPTO 安装文档](https://gitcode.com/cann/pypto/blob/master/docs/zh/install/build_and_install.md)，
 安装后可用 `python3 -c "import pypto"` 检查。

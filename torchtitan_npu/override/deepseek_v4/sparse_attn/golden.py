@@ -10,7 +10,7 @@ An eager per-document implementation over the packed stream, matching the
 ``dsv4-infer-npu`` inference baseline op-for-op (FP32 gather-matmul
 attention with a per-head sink, per-document indexer top-k).  It anchors the
 two-layer numeric scheme: this golden is compared bitwise against patched
-transformers, and the fused CANN kernels are checked within tolerance of it.
+transformers, and the fused AscendC kernels are checked within tolerance of it.
 """
 
 import itertools

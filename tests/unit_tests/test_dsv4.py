@@ -1,7 +1,7 @@
-"""DSV4 host-logic CPU tests: the CANN metadata layer, the packed layout,
+"""DSV4 host-logic CPU tests: the AscendC metadata layer, the packed layout,
 the compressor/indexer/attention numerics, and the ported DSA semantics.
 
-The CANN override host wiring (``test_cann_metadata_*``) and the model-dir
+The AscendC override host wiring (``test_asc_metadata_*``) and the model-dir
 contract (``test_layout_*``, ``test_compressor_*``, ``test_attention_*``,
 ``test_indexer_*``, ``test_ported_*``) all import against the real
 torchtitan checkout with the plugin's patches applied; only the
@@ -218,15 +218,15 @@ def _build_varlen(doc_lens):
 
 
 def _run_extension(dsv4, doc_lens, ratios, **shape):
-    """The model-built metadata + the CANN metadata extension."""
-    from torchtitan_npu.override.deepseek_v4.sparse_attn.cann import (
-        CANNMetadataExtension,
+    """The model-built metadata + the AscendC metadata extension."""
+    from torchtitan_npu.override.deepseek_v4.sparse_attn.ascendc import (
+        AscMetadataExtension,
     )
 
     v = _build_varlen(doc_lens)
     md = dsv4.metadata.build_compressed_varlen_metadata(v, ratios)
-    ext = CANNMetadataExtension(
-        CANNMetadataExtension.Config(
+    ext = AscMetadataExtension(
+        AscMetadataExtension.Config(
             window_size=shape.get("window_size", 128),
             num_heads=shape.get("num_heads", 16),
             head_dim=shape.get("head_dim", 512),
@@ -303,20 +303,20 @@ def inputs(dsv4):
 
 
 # ---------------------------------------------------------------------------
-# The CANN metadata layer (handler + kernel fills)
+# The AscendC metadata layer (handler + kernel fills)
 # ---------------------------------------------------------------------------
 
 
-def test_cann_metadata_zero_block_batch_rejected_before_any_cann_call(dsv4):
+def test_asc_metadata_zero_block_batch_rejected_before_any_asc_call(dsv4):
     dsv4.cann_ops.calls.clear()
     with pytest.raises(ValueError, match="no complete compression block"):
         _run_extension(dsv4, (60, 60, 60, 76), (1, 4, 128))  # ratio-128: no blocks
     assert not dsv4.cann_ops.calls, (
-        "CANN metadata must not be computed for an invalid batch"
+        "AscendC metadata must not be computed for an invalid batch"
     )
 
 
-def test_cann_metadata_smla_fills(dsv4):
+def test_asc_metadata_smla_fills(dsv4):
     dsv4.cann_ops.calls.clear()
     md = _run_extension(dsv4, (256, 256, 256, 256), (1, 4, 128))
     assert md.batch_size == 1 and md.seq_len == 1024
@@ -333,7 +333,7 @@ def test_cann_metadata_smla_fills(dsv4):
     assert torch.equal(by_ratio[4][2]["cmp_residual_kv"], md.plans[4].block_remainder)
 
 
-def test_cann_metadata_grad_fills(dsv4):
+def test_asc_metadata_grad_fills(dsv4):
     dsv4.cann_ops.calls.clear()
     _run_extension(dsv4, (256, 256, 256, 256), (1, 4, 128))
     grad = [c for c in dsv4.cann_ops.calls if c[0] == "sparse_flash_mla_grad_metadata"]
@@ -343,7 +343,7 @@ def test_cann_metadata_grad_fills(dsv4):
     )
 
 
-def test_cann_metadata_li_and_slig_fills(dsv4):
+def test_asc_metadata_li_and_slig_fills(dsv4):
     dsv4.cann_ops.calls.clear()
     md = _run_extension(dsv4, (256, 256, 256, 256), (1, 4, 128))
     li = [c for c in dsv4.cann_ops.calls if c[0] == "lightning_indexer_metadata"]
@@ -357,31 +357,31 @@ def test_cann_metadata_li_and_slig_fills(dsv4):
     assert li[0][1][3] == 512
     assert slig[0][1] == (8, 1, 128), slig[0][1]
     assert slig[0][2]["topk"] == 512  # keyword-only in the binding schema
-    assert md.cann_plans[4].li_metadata is not None
-    assert md.cann_plans[4].slig_metadata is not None
+    assert md.asc_plans[4].li_metadata is not None
+    assert md.asc_plans[4].slig_metadata is not None
     assert (
-        md.cann_plans[128].li_metadata is None
-        and md.cann_plans[128].slig_metadata is None
+        md.asc_plans[128].li_metadata is None
+        and md.asc_plans[128].slig_metadata is None
     )
 
 
-def test_cann_metadata_slim_contract(dsv4):
+def test_asc_metadata_slim_contract(dsv4):
     dsv4.cann_ops.calls.clear()
     md = _run_extension(dsv4, (256, 256, 256, 256), (1, 4, 128))
     assert not hasattr(md, "reference")
     assert md.plans[4].cu_seqlens_cmp_k.shape[0] == 5
     assert md.plans[4].block_remainder.shape[0] == 4
     assert md.plans[4].gather_indices.numel() == 1024
-    assert md.cann_plans[4].smla_metadata is not None
-    assert md.cann_plans[128].smla_metadata is not None
-    assert md.cann_plans[1].smla_metadata is not None
+    assert md.asc_plans[4].smla_metadata is not None
+    assert md.asc_plans[128].smla_metadata is not None
+    assert md.asc_plans[1].smla_metadata is not None
 
 
-def test_cann_metadata_ratio128_only_model(dsv4):
+def test_asc_metadata_ratio128_only_model(dsv4):
     dsv4.cann_ops.calls.clear()
     md = _run_extension(dsv4, (512, 512), (128,))
     assert "lightning_indexer" not in [c[0] for c in dsv4.cann_ops.calls]
-    assert md.cann_plans[128].li_metadata is None
+    assert md.asc_plans[128].li_metadata is None
 
 
 # ---------------------------------------------------------------------------

@@ -4,9 +4,9 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Override: provide torch-compatible and CANN fused rotary embeddings.
+"""Override: provide torch-compatible and AscendC fused rotary embeddings.
 
-The workaround variant uses pre-expanded cosine/sine caches; the CANN fused
+The workaround variant uses pre-expanded cosine/sine caches; the AscendC fused
 variants call ``torch_npu.npu_rotary_mul``. Select one per RoPE config.
 """
 
@@ -122,7 +122,7 @@ class _FirstRowPositionsMixin:
         )
 
 
-class CANNComplexRoPE(
+class AscComplexRoPE(
     _FirstRowPositionsMixin,
     WorkaroundComplexRoPE,
 ):
@@ -152,7 +152,7 @@ class CANNComplexRoPE(
         return xq_out, xk_out
 
 
-class CANNCosSinRoPE(_FirstRowPositionsMixin, CosSinRoPE):
+class AscCosSinRoPE(_FirstRowPositionsMixin, CosSinRoPE):
     @dataclass(kw_only=True, slots=True)
     class Config(CosSinRoPE.Config):
         pass
@@ -180,15 +180,15 @@ class CANNCosSinRoPE(_FirstRowPositionsMixin, CosSinRoPE):
 @override(
     target=ComplexRoPE.Config,
     exact=True,
-    description="CANN fused ComplexRoPE via torch_npu.npu_rotary_mul (interleave mode)",
+    description="AscendC fused ComplexRoPE via torch_npu.npu_rotary_mul (interleave mode)",
 )
-def cann_complex(cfg: ComplexRoPE.Config) -> CANNComplexRoPE.Config:
-    return derive(cfg, CANNComplexRoPE.Config)
+def asc_complex(cfg: ComplexRoPE.Config) -> AscComplexRoPE.Config:
+    return derive(cfg, AscComplexRoPE.Config)
 
 
 @override(
     target=CosSinRoPE.Config,
-    description="CANN fused CosSinRoPE via torch_npu.npu_rotary_mul (half mode)",
+    description="AscendC fused CosSinRoPE via torch_npu.npu_rotary_mul (half mode)",
 )
-def cann_cossin(cfg: CosSinRoPE.Config) -> CANNCosSinRoPE.Config:
-    return derive(cfg, CANNCosSinRoPE.Config)
+def asc_cossin(cfg: CosSinRoPE.Config) -> AscCosSinRoPE.Config:
+    return derive(cfg, AscCosSinRoPE.Config)

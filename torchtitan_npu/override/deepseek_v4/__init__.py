@@ -1,7 +1,7 @@
-"""DeepSeek-V4 CANN overrides.
+"""DeepSeek-V4 AscendC overrides.
 
 Importing this package imports ``sparse_attn`` (whose ``__init__`` pulls in
-``cann.py`` and ``golden.py``), firing all override registrations.
+``ascendc.py`` and ``golden.py``), firing all override registrations.
 """
 
 from . import sparse_attn  # noqa: F401

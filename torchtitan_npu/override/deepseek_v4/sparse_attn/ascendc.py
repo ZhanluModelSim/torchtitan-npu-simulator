@@ -4,16 +4,16 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Override: run DeepSeek-V4 DSA with fused CANN TND kernels.
+"""Override: run DeepSeek-V4 DSA with fused AscendC TND kernels.
 
-This module holds the CANN metadata extension (``CANNMetadataExtension``
+This module holds the AscendC metadata extension (``AscMetadataExtension``
 + the ``*_metadata`` fill) and the fused TND kernel
-(``CANNCompressedSparseInnerAttention``); the eager golden reference lives in
+(``AscCompressedSparseInnerAttention``); the eager golden reference lives in
 ``golden.py``.  The ``sparse_attn`` package ``__init__`` defines the
 registrations, so the override paths stay ``override.deepseek_v4.sparse_attn.*``.
 
-The fused path only bridges the CANN TND kernels' forward/backward with a
-slim ``torch.autograd.Function``.  All CANN metadata is precomputed by the
+The fused path only bridges the AscendC TND kernels' forward/backward with a
+slim ``torch.autograd.Function``.  All AscendC metadata is precomputed by the
 mask handler and carried in ``CompressedVarlenMetadata``, so this module
 never builds or caches metadata itself.  The container-grid compressed KV is
 converted to the packed TND stream by slicing the leading ``n_blocks``
@@ -59,7 +59,7 @@ class _SparseAttentionHooks:
     sparse_lightning_indexer_kl_loss_grad: Callable[..., Any]
 
 
-_CANN_SPARSEATTN_HOOK = _SparseAttentionHooks(
+_ASC_SPARSEATTN_HOOK = _SparseAttentionHooks(
     lightning_indexer=torch.ops.cann_ops_transformer.lightning_indexer,
     sparse_flash_mla=torch.ops.cann_ops_transformer.sparse_flash_mla,
     sparse_flash_mla_grad=torch.ops.cann_ops_transformer.sparse_flash_mla_grad,
@@ -68,24 +68,24 @@ _CANN_SPARSEATTN_HOOK = _SparseAttentionHooks(
 
 
 # ---------------------------------------------------------------------------
-# CANN metadata layer
+# AscendC metadata layer
 # ---------------------------------------------------------------------------
 #
-# ``CANNMetadataExtension`` post-processes the model-built metadata (the
+# ``AscMetadataExtension`` post-processes the model-built metadata (the
 # model's ``build_attention_masks``): after the document-packed layout (including
 # the dense compressed-key attendability mask) is built, it fills the
-# precomputed CANN ``*_metadata`` kernel outputs (lightning_indexer,
+# precomputed AscendC ``*_metadata`` kernel outputs (lightning_indexer,
 # sparse_flash_mla, sparse_flash_mla_grad,
 # sparse_lightning_indexer_kl_loss_grad) into a
-# ``CANNCompressedVarlenMetadata`` wrapper, keeping the model-dir metadata
+# ``AscCompressedVarlenMetadata`` wrapper, keeping the model-dir metadata
 # NPU-free.  Those kernels take only shape information, so their results are
 # layer-invariant and reused by every DSA layer and by the backward pass.
 
 
 @dataclass(kw_only=True, slots=True)
-class CANNBlockLayoutMetadata:
-    """CANN ``*_metadata`` kernel outputs for one compression ratio (the
-    key of ``cann_plans``)."""
+class AscBlockLayoutMetadata:
+    """AscendC ``*_metadata`` kernel outputs for one compression ratio (the
+    key of ``asc_plans``)."""
 
     smla_metadata: torch.Tensor | None = None
     """``sparse_flash_mla_metadata`` output (opaque, layer-invariant)."""
@@ -102,23 +102,23 @@ class CANNBlockLayoutMetadata:
 
 
 @dataclass(kw_only=True, slots=True)
-class CANNCompressedVarlenMetadata(CompressedVarlenMetadata):
+class AscCompressedVarlenMetadata(CompressedVarlenMetadata):
     """The fused path's varlen contract: the common kernel contract plus
-    the CANN metadata layer.
+    the AscendC metadata layer.
 
     A ``CompressedVarlenMetadata`` subclass carrying no reference tier (the
-    fused path never materializes it) and the ``cann_plans`` the fused
+    fused path never materializes it) and the ``asc_plans`` the fused
     core consumes.
     """
 
-    cann_plans: dict[int, CANNBlockLayoutMetadata] = field(default_factory=dict)
+    asc_plans: dict[int, AscBlockLayoutMetadata] = field(default_factory=dict)
 
 
-def _fill_cann_metadata(
+def _fill_asc_metadata(
     varlen: VarlenMetadata,
     ratio: int,
     plan: CompressedBlockLayout,
-    record: CANNBlockLayoutMetadata,
+    record: AscBlockLayoutMetadata,
     *,
     num_heads: int,
     head_dim: int,
@@ -195,7 +195,7 @@ def _fill_cann_metadata(
     )
 
 
-def _mark_dynamic(metadata: CANNCompressedVarlenMetadata) -> None:
+def _mark_dynamic(metadata: AscCompressedVarlenMetadata) -> None:
     """Mark batch-dependent leading dimensions so Dynamo does not specialize.
 
     The slim contract carries only the kernel tensors; the model-dir
@@ -231,18 +231,18 @@ def _mark_dynamic(metadata: CANNCompressedVarlenMetadata) -> None:
         torch._dynamo.maybe_mark_dynamic(tensor, 0)
 
 
-class CANNMetadataExtension(MetadataExtension):
-    """The CANN metadata extension: fills the vendor kernel tensors onto the
+class AscMetadataExtension(MetadataExtension):
+    """The AscendC metadata extension: fills the vendor kernel tensors onto the
     model-built metadata (the model dir stays backend-agnostic).
 
     Receives the model-dir metadata — ``CompressedVarlenMetadata`` (non-CP)
     or the CP-shaped variant (CP, built by the model's
     ``build_attention_masks``) — and returns the slim
-    ``CANNCompressedVarlenMetadata`` carrying the ``cann_plans``.  The
+    ``AscCompressedVarlenMetadata`` carrying the ``asc_plans``.  The
     attention geometry (``num_heads``, ``head_dim``, ``index_n_heads``,
     ``index_head_dim``, ``index_topk``) is passed as override kwargs by the
     factory below, keeping the model directory backend-agnostic.  Mismatched
-    geometry fails loudly: the CANN metadata kernels and the fused core
+    geometry fails loudly: the AscendC metadata kernels and the fused core
     validate against the actual tensors.
     """
 
@@ -254,8 +254,8 @@ class CANNMetadataExtension(MetadataExtension):
         index_head_dim: int
         index_topk: int
 
-    def __call__(self, metadata) -> CANNCompressedVarlenMetadata:
-        cfg = cast("CANNMetadataExtension.Config", self.config)
+    def __call__(self, metadata) -> AscCompressedVarlenMetadata:
+        cfg = cast("AscMetadataExtension.Config", self.config)
         plans = metadata.plans
         for ratio, p in plans.items():
             if ratio > 1 and p.gather_indices.numel() == 0:
@@ -264,12 +264,12 @@ class CANNMetadataExtension(MetadataExtension):
                     "doc-packed sequences must be long enough to produce at least "
                     "one full block per sequence."
                 )
-        cann_plans: dict[int, CANNBlockLayoutMetadata] = {}
+        asc_plans: dict[int, AscBlockLayoutMetadata] = {}
         window = metadata.window
         ori_cu = window.cu_seqlens_ori_kv if window is not None else None
         for ratio, p in plans.items():
-            record = CANNBlockLayoutMetadata()
-            _fill_cann_metadata(
+            record = AscBlockLayoutMetadata()
+            _fill_asc_metadata(
                 metadata.varlen,
                 ratio,
                 p,
@@ -282,17 +282,17 @@ class CANNMetadataExtension(MetadataExtension):
                 window_size=cfg.window_size,
                 cu_seqlens_ori_kv=ori_cu,
             )
-            cann_plans[ratio] = record
+            asc_plans[ratio] = record
         # ``plans[ratio]`` carries the full per-ratio plan: part 1 (the
         # unified compressor/kernel contract) and part 2 (the dispatcher
         # fields — the block borrow exchange routing + assembly,
         # ``compressed_rows``/``out_width``, ``cmp_k_global_gather_indices``); the
         # window plan rides on the metadata (``window``).
-        result = CANNCompressedVarlenMetadata(
+        result = AscCompressedVarlenMetadata(
             varlen=metadata.varlen,
             plans=plans,
             window=window,
-            cann_plans=cann_plans,
+            asc_plans=asc_plans,
         )
         _mark_dynamic(result)
         return result
@@ -322,7 +322,7 @@ class _SparseFlashMLATND(torch.autograd.Function):
     registration (unlike dsv3.2's older ``torch_npu`` ops), so the manual
     Function runs SMLA forward, SMLAG backward, and the SLIG indexer-loss
     gradient (which consumes SMLAG's ``cmp_softmax_l1``) in one bridge.
-    All CANN metadata tensors are precomputed in
+    All AscendC metadata tensors are precomputed in
     ``CompressedBlockLayout``.
     """
 
@@ -521,11 +521,11 @@ class _SparseFlashMLATND(torch.autograd.Function):
         slig_metadata,
     ):
         """The LightningIndexer KL-loss gradient (SLIG), mirroring dsv3.2's
-        ``CANNSparseIndexerLoss`` role: runs in the backward (it consumes
+        ``AscSparseIndexerLoss`` role: runs in the backward (it consumes
         SMLAG's ``cmp_softmax_l1``), scales the indexer grads, and
         accumulates the detached LI loss for logging."""
         if any(x is None for x in (idx_q, idx_k, idx_w, slig_metadata)):
-            raise RuntimeError("ratio-4 cann requires LI tensors and slig_metadata in backward.")
+            raise RuntimeError("ratio-4 asc requires LI tensors and slig_metadata in backward.")
         (
             didx_q,
             didx_k,
@@ -561,20 +561,20 @@ class _SparseFlashMLATND(torch.autograd.Function):
         return didx_q, didx_k, didx_w
 
 
-class CANNCompressedSparseInnerAttention(CompressedSparseInnerAttention):
+class AscCompressedSparseInnerAttention(CompressedSparseInnerAttention):
     """Run LI and SMLA/SMLAG/SLIG in a local TND layout.
 
-    The flow mirrors ``CANNSparseInnerAttention`` (dsv3.2): the core
+    The flow mirrors ``AscSparseInnerAttention`` (dsv3.2): the core
     contains the **kgather** — the compressed-level gather assembling the
     per-segment packed TND streams from the all-gathered padded containers
     (``cmp_k_global_gather_indices``; the plain identity slice without context
-    parallel) — and then calls the CANN ops directly (LightningIndexer,
+    parallel) — and then calls the AscendC ops directly (LightningIndexer,
     then SparseFlashMLA).  The difference from dsv3.2 is the op set: the
     ``cann_ops_transformer`` SMLA/SMLAG/SLIG kernels carry no native
     autograd registration (unlike the older ``torch_npu``
     ``npu_sparse_flash_attention``), so the fused core needs the manual
     ``_SparseFlashMLATND`` bridge — SMLA forward, SMLAG backward, and the
-    indexer KL-loss gradient (SLIG, the dsv3.2 ``CANNSparseIndexerLoss``
+    indexer KL-loss gradient (SLIG, the dsv3.2 ``AscSparseIndexerLoss``
     role) in the same backward because it consumes SMLAG's
     ``cmp_softmax_l1``.
     """
@@ -592,7 +592,7 @@ class CANNCompressedSparseInnerAttention(CompressedSparseInnerAttention):
             torch.zeros((), dtype=torch.float32),
             persistent=False,
         )
-        self.hooks = _CANN_SPARSEATTN_HOOK
+        self.hooks = _ASC_SPARSEATTN_HOOK
 
     @staticmethod
     def _assemble_tnd(container, plan) -> torch.Tensor:
@@ -615,22 +615,22 @@ class CANNCompressedSparseInnerAttention(CompressedSparseInnerAttention):
         attention_masks=None,
     ):
         hooks = self.hooks
-        if not isinstance(attention_masks, CANNCompressedVarlenMetadata):
-            raise TypeError("cann requires CANNCompressedVarlenMetadata attention masks.")
+        if not isinstance(attention_masks, AscCompressedVarlenMetadata):
+            raise TypeError("asc requires AscCompressedVarlenMetadata attention masks.")
         if attn_sink is None:
-            raise ValueError("CANNCompressedSparseInnerAttention requires attn_sink")
+            raise ValueError("AscCompressedSparseInnerAttention requires attn_sink")
         metadata = attention_masks
         plan = metadata.plans.get(self.compress_ratio)
         if plan is None:
             raise ValueError(f"No CompressedBlockLayout for ratio={self.compress_ratio}.")
         if self.compress_ratio <= 1:
             if cmp_k is not None and cmp_k.numel() != 0:
-                raise ValueError("ratio-1 cann must not receive compressed KV.")
+                raise ValueError("ratio-1 asc must not receive compressed KV.")
         elif cmp_k is None or cmp_k.ndim != 3:
-            raise ValueError("ratio>1 cann requires compressed KV in the container layout [B, S//ratio, D].")
+            raise ValueError("ratio>1 asc requires compressed KV in the container layout [B, S//ratio, D].")
         # q / swa_k shape consistency and the kernel input layouts are
         # validated by the aclnn interface itself.
-        npu = metadata.cann_plans[self.compress_ratio]
+        npu = metadata.asc_plans[self.compress_ratio]
         batch_size, seqlen, _, _ = q.shape
 
         q = q.flatten(0, 1)
@@ -648,7 +648,7 @@ class CANNCompressedSparseInnerAttention(CompressedSparseInnerAttention):
         cmp_sparse_indices = None
         if self.compress_ratio == 4:
             if idx_q is None or idx_k is None or idx_w is None:
-                raise ValueError("ratio-4 cann requires all LI projection tensors.")
+                raise ValueError("ratio-4 asc requires all LI projection tensors.")
             idx_q = idx_q.flatten(0, 1)
             idx_k = self._assemble_tnd(idx_k, plan)
             idx_w = idx_w.flatten(0, 1)

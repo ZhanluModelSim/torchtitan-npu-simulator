@@ -3,7 +3,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Override: run DeepSeek-V3.2 sparse attention with fused CANN kernels.
+"""Override: run DeepSeek-V3.2 sparse attention with fused AscendC kernels.
 
 The TND sequence-length metadata extension and the fused attention core
 live together here.
@@ -29,7 +29,7 @@ from torchtitan_npu.patches.torchtitan.distributed.varlen_cp import CPVarlenMeta
 
 
 @spmd.register_autograd_function
-class _CANNSparseIndexerLossFunc(torch.autograd.Function):
+class _AscSparseIndexerLossFunc(torch.autograd.Function):
     @staticmethod
     def forward(  # pyrefly: ignore [bad-override]
         ctx,
@@ -86,7 +86,7 @@ class _CANNSparseIndexerLossFunc(torch.autograd.Function):
         coeff,
         acc_buffer,
     ):
-        return _CANNSparseIndexerLossFunc.apply(
+        return _AscSparseIndexerLossFunc.apply(
             q_nope_TNH,
             k_nope_T1H,
             idx_q_TNH,
@@ -163,7 +163,7 @@ class _CANNSparseIndexerLossFunc(torch.autograd.Function):
         )
 
 
-class CANNSparseIndexerLoss(SparseIndexerLoss):
+class AscSparseIndexerLoss(SparseIndexerLoss):
     @dataclass(kw_only=True, slots=True)
     class Config(SparseIndexerLoss.Config):
         pass
@@ -189,7 +189,7 @@ class CANNSparseIndexerLoss(SparseIndexerLoss):
         *,
         carrier,
     ):
-        dummy = _CANNSparseIndexerLossFunc.apply(
+        dummy = _AscSparseIndexerLossFunc.apply(
             q_nope_TNH,
             k_nope_T1H,
             idx_q_TNH,
@@ -210,18 +210,18 @@ class CANNSparseIndexerLoss(SparseIndexerLoss):
         return self.inject(carrier, dummy / q_nope_TNH.shape[0])
 
 
-class CANNSparseInnerAttention(VarlenAttention):
-    """Sparse attention using CANN fused ops (MLA-absorb mode)."""
+class AscSparseInnerAttention(VarlenAttention):
+    """Sparse attention using AscendC fused ops (MLA-absorb mode)."""
 
     @dataclass(kw_only=True, slots=True)
     class Config(VarlenAttention.Config):
         index_topk: int
-        indexer_loss: CANNSparseIndexerLoss.Config
+        indexer_loss: AscSparseIndexerLoss.Config
 
     def __init__(self, config: Config) -> None:
         super().__init__(config)
         self.index_topk = config.index_topk
-        self.indexer_loss = CANNSparseIndexerLoss(config.indexer_loss)
+        self.indexer_loss = AscSparseIndexerLoss(config.indexer_loss)
 
     def forward(  # pyrefly: ignore [bad-param-name-override]
         self,
@@ -233,7 +233,7 @@ class CANNSparseInnerAttention(VarlenAttention):
         idx_k_BL1H: torch.Tensor,
         idx_w_BLN: torch.Tensor,
         *,
-        attention_masks: CANNVarlenMetadata,
+        attention_masks: AscVarlenMetadata,
         scale: float,
     ) -> torch.Tensor:
         B, L_q, N, _ = q_nope_BLNH.shape
@@ -317,7 +317,7 @@ class CANNSparseInnerAttention(VarlenAttention):
 
 
 @dataclass(frozen=True, eq=False)
-class CANNVarlenMetadata:
+class AscVarlenMetadata:
     """Varlen metadata with CPU sequence lengths required by TND kernels.
 
     The handler extracts both length lists in one device-to-host transfer.
@@ -328,21 +328,21 @@ class CANNVarlenMetadata:
     actual_seq_klen: list[int]
 
 
-class CANNVarlenMetadataExtension(MetadataExtension):
-    """The CANN TND metadata extension: extracts the host sequence-length
+class AscVarlenMetadataExtension(MetadataExtension):
+    """The AscendC TND metadata extension: extracts the host sequence-length
     lists the TND kernels require from the model-built varlen mask."""
 
     @dataclass(kw_only=True, slots=True)
     class Config(MetadataExtension.Config):
         pass
 
-    def __call__(self, metadata) -> CANNVarlenMetadata:
+    def __call__(self, metadata) -> AscVarlenMetadata:
         assert isinstance(metadata, (VarlenMetadata, CPVarlenMetadata)), (
             f"expected VarlenMetadata or CPVarlenMetadata, got {type(metadata)}"
         )
         cu_q, cu_k = metadata.cu_seq_q, metadata.cu_seq_k
         actual_seq_qlen, actual_seq_klen = torch.stack([cu_q[1:], cu_k[1:]]).cpu().tolist()
-        return CANNVarlenMetadata(
+        return AscVarlenMetadata(
             varlen_meta=metadata,
             actual_seq_qlen=actual_seq_qlen,
             actual_seq_klen=actual_seq_klen,

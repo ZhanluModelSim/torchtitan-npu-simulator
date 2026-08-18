@@ -146,7 +146,7 @@ class CompressedVarlenMetadata:
     Carried as ``attention_masks`` through the DSA layers.  Built by
     the model's ``build_attention_masks`` from a ``VarlenMetadata``
     stream: the kernel contract (``plans``).  The ``metadata_extension``
-    (e.g. the CANN kernel metadata, or the reference tier) post-processes
+    (e.g. the AscendC kernel metadata, or the reference tier) post-processes
     it into the concrete per-path contract.
 
     The container grid is ``[1, S]`` with ``S`` equal to the total token
@@ -205,7 +205,7 @@ def build_kernel_layout(
     """The kernel-contract tier: the per-ratio plans for a plain stream.
 
     Called once per batch by ``build_compressed_varlen_metadata``; the
-    CANN path materializes no reference tier (its extension only consumes
+    AscendC path materializes no reference tier (its extension only consumes
     the plans).  The container grid is ``[1, S]`` with ``S`` equal to the
     total token count, so the layout is derived purely from the document
     boundaries and the ratios.  Context-parallel streams must use
@@ -294,7 +294,7 @@ def build_compressed_varlen_metadata(
     Called once per batch by the model's ``build_attention_masks``: the
     common kernel contract (``build_kernel_layout``).  The reference tier
     and the vendor kernel tensors are filled by the ``metadata_extension``
-    (``reference.py`` / the CANN override).
+    (``reference.py`` / the AscendC override).
 
     Args:
         varlen: Rank-local ``VarlenMetadata``.  ``cu_seq_q`` is

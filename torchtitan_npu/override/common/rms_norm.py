@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Override: run RMSNorm with the fused CANN operator."""
+"""Override: run RMSNorm with the fused AscendC operator."""
 
 from dataclasses import dataclass
 
@@ -14,7 +14,7 @@ from torchtitan.config import derive, override
 from torchtitan.models.common.nn_modules import RMSNorm
 
 
-class CANNRMSNorm(RMSNorm):
+class AscRMSNorm(RMSNorm):
     """RMSNorm backed by ``torch_npu.npu_rms_norm``."""
 
     @dataclass(kw_only=True, slots=True)
@@ -27,7 +27,7 @@ class CANNRMSNorm(RMSNorm):
 
 @override(
     target=RMSNorm.Config,
-    description="CANN fused RMSNorm via torch_npu.npu_rms_norm",
+    description="AscendC fused RMSNorm via torch_npu.npu_rms_norm",
 )
-def cann(cfg: RMSNorm.Config) -> CANNRMSNorm.Config:
-    return derive(cfg, CANNRMSNorm.Config)
+def asc(cfg: RMSNorm.Config) -> AscRMSNorm.Config:
+    return derive(cfg, AscRMSNorm.Config)

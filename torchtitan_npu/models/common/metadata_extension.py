@@ -9,7 +9,7 @@ model-built attention masks/metadata.
 The model owns its per-batch metadata construction (``build_attention_masks``
 on the Decoder — including its own context-parallel handling).  The
 ``metadata_extension`` config field carries the vendor-specific post-process
-(the default is the identity): e.g. the CANN override injects the
+(the default is the identity): e.g. the AscendC override injects the
 ``*_metadata`` kernel tensors.  This replaces the removed ``mask_handler``
 pattern: the model's build is the only metadata-handling seam, and the
 extension only adds what the model cannot know (vendor kernel metadata).

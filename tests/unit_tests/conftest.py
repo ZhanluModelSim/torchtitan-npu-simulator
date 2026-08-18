@@ -27,8 +27,12 @@ sys.path.insert(
 # The NPU-bound seam: a fake ``cann_ops_transformer`` call recorder.
 # Everything else in the plugin imports against the real torchtitan checkout
 # with the patches applied; only the CANN op surface is untestable on CPU.
-# ``install()`` replaces the module in ``sys.modules`` with a recorder:
-# every call is appended to ``ct.calls`` as ``(fn_name, args, kwargs)``.
+# ``install()`` replaces the module (and its ``ops`` submodule) in
+# ``sys.modules`` and injects the missing ``torch.ops.cann_ops_transformer``
+# attributes with the recorder: every call is appended to ``ct.calls`` as
+# ``(fn_name, args, kwargs)``.  No real ``cann_ops_transformer`` package is
+# required; the recorder is installed at conftest import time so every test
+# module (including the compile-pattern tests) imports against it.
 # ---------------------------------------------------------------------------
 
 _FAKE_FUNCTIONS = (
@@ -40,6 +44,21 @@ _FAKE_FUNCTIONS = (
     "lightning_indexer_metadata",
     "sparse_lightning_indexer_kl_loss_grad",
     "sparse_lightning_indexer_kl_loss_grad_metadata",
+)
+
+# Imported via ``cann_ops_transformer.ops`` (the compile-pattern module).
+_OPS_SUBMODULE_FUNCTIONS = (
+    "inplace_partial_rotary_mul",
+    *_FAKE_FUNCTIONS,
+)
+
+# Resolved at import time via ``torch.ops.cann_ops_transformer.*`` (the
+# ``_ASC_SPARSEATTN_HOOK`` bundle); they are never invoked on CPU.
+_TORCH_OPS_FUNCTIONS = (
+    "lightning_indexer",
+    "sparse_flash_mla",
+    "sparse_flash_mla_grad",
+    "sparse_lightning_indexer_kl_loss_grad",
 )
 
 
@@ -59,6 +78,10 @@ def _fake_cann_ops():
 
     for fn_name in _FAKE_FUNCTIONS:
         setattr(ct, fn_name, _make(fn_name))
+
+    ct.ops = types.ModuleType("cann_ops_transformer.ops")
+    for fn_name in _OPS_SUBMODULE_FUNCTIONS:
+        setattr(ct.ops, fn_name, _make(fn_name))
     return ct
 
 
@@ -66,12 +89,32 @@ _INSTALLED = False
 
 
 def install():
-    """Replace ``cann_ops_transformer`` with the call recorder (once)."""
+    """Replace ``cann_ops_transformer`` with the call recorder (once).
+
+    Covers the Python module surface (``from cann_ops_transformer import
+    ...`` and ``from cann_ops_transformer.ops import ...``) and the
+    ``torch.ops.cann_ops_transformer`` namespace that fused modules resolve
+    at import time, so the CPU tests need no real CANN dependency.
+    Attributes already present in the ``torch.ops`` namespace (e.g. after a
+    real package import earlier in the process) are left untouched.
+    """
     global _INSTALLED
     if _INSTALLED:
         return
     _INSTALLED = True
-    sys.modules["cann_ops_transformer"] = _fake_cann_ops()
+    recorder = _fake_cann_ops()
+    sys.modules["cann_ops_transformer"] = recorder
+    sys.modules["cann_ops_transformer.ops"] = recorder.ops
+    ns = torch.ops.cann_ops_transformer
+    for fn_name in _TORCH_OPS_FUNCTIONS:
+        if not hasattr(ns, fn_name):
+            setattr(ns, fn_name, getattr(recorder, fn_name))
+
+
+# Installed at import time so every test module in this tree (including the
+# compile-pattern tests, whose collection precedes any fixture) imports
+# against the recorder rather than the real package.
+install()
 
 
 @pytest.fixture(scope="module")

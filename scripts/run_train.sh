@@ -44,7 +44,7 @@ CP_LOAD_BALANCER=${CP_LOAD_BALANCER:-"headtail"}
 export CLOSE_MATMUL_K_SHIFT=${CLOSE_MATMUL_K_SHIFT:-1}
 export TORCHTITAN_NPU_PATTERN_IMPORTS="${PATTERN_IMPORTS:-${TORCHTITAN_NPU_PATTERN_IMPORTS:-}}"
 
-# The CANN mask handler needs the attention geometry from the selected model
+# The AscendC mask handler needs the attention geometry from the selected model
 # config. Keep these values in sync with the DeepSeek-V4 config registry.
 case "${CONFIG}" in
     deepseek_v4_debugmodel)
@@ -71,13 +71,13 @@ readonly -a GOLDEN_OVERRIDES=(
     torchtitan_npu.override.deepseek_v4.sparse_attn.golden
 )
 
-# Fused implementation under test: CANN RMSNorm, CANN fused rope, mask
+# Fused implementation under test: AscendC RMSNorm, AscendC fused rope, mask
 # metadata, and SMLA. Both paths use the model's normal (clamped) MoE.
 readonly -a TEST_OVERRIDES=(
-    torchtitan_npu.override.common.rms_norm.cann
-    torchtitan_npu.override.common.rope.cann_complex
-    "torchtitan_npu.override.deepseek_v4.sparse_attn.cann_metadata=${MASK_HANDLER_GEOMETRY}"
-    torchtitan_npu.override.deepseek_v4.sparse_attn.cann
+    torchtitan_npu.override.common.rms_norm.asc
+    torchtitan_npu.override.common.rope.asc_complex
+    "torchtitan_npu.override.deepseek_v4.sparse_attn.asc_metadata=${MASK_HANDLER_GEOMETRY}"
+    torchtitan_npu.override.deepseek_v4.sparse_attn.asc
 )
 
 if [ "${USE_GOLDEN:-0}" = "1" ]; then
@@ -93,7 +93,7 @@ fi
 # ``--override.imports`` is a single tyro nargs="*" flag: repeated flags do
 # NOT append (only the last one survives).  One flag carries all targets —
 # the plain ones comma-joined into a single token, the kwargs target (the
-# CANN mask-handler geometry JSON) as its own token.
+# AscendC mask-handler geometry JSON) as its own token.
 _override_tokens=()
 _plain_overrides=()
 for _ov in "${OVERRIDE_IMPORTS[@]}"; do

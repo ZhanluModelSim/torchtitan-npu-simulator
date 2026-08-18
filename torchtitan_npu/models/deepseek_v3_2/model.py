@@ -439,7 +439,7 @@ class DeepSeekV32Model(DeepSeekV3Model):
         under context parallel the generic ``prepare_context_parallel_input``
         shards it.  The DSA block mask + the shared dense attendability mask
         are derived from a flex ``BlockMask``; a varlen mask passes through
-        to the ``metadata_extension`` (the CANN TND conversion)."""
+        to the ``metadata_extension`` (the AscendC TND conversion)."""
         positions = extra_kwargs.get("positions")
         masks = super().get_attention_masks(positions=positions)
         if cp_mesh is not None:

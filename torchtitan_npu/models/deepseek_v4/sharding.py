@@ -88,7 +88,7 @@ def set_compressed_sparse_attention_sharding(inner_attention_cfg) -> None:
         in_dst_shardings=output_shardings,
         out_src_shardings=q,
         out_dst_shardings=q,
-        # The CANN indexer-loss accumulator is a per-rank fp32 scalar buffer;
+        # The AscendC indexer-loss accumulator is a per-rank fp32 scalar buffer;
         # replicate it (like the v3.2 ``_acc``) so the loss logger reads a
         # consistent value.
         state_shardings={

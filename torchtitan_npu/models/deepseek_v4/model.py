@@ -93,7 +93,7 @@ class DeepSeekV4Model(Decoder):
                     if n_groups % tp != 0:
                         raise ValueError(f"n_groups ({n_groups}) must be divisible by tp ({tp})")
 
-            # Context parallel is supported on the CANN fused path only: the
+            # Context parallel is supported on the AscendC fused path only: the
             # model's build_attention_masks derives the per-rank dispatch
             # plan when the trainer passes the CP mesh; the model-dir
             # reference tier and the golden stay no-CP-only and raise there.
@@ -147,7 +147,7 @@ class DeepSeekV4Model(Decoder):
         (``build_compressed_varlen_metadata``) is always built; under CP
         ``_build_cp_metadata`` shards the inputs and derives the rank-local
         plan from the global context in-frame (no plan-time communication);
-        the ``metadata_extension`` (e.g. the reference tier or the CANN
+        the ``metadata_extension`` (e.g. the reference tier or the AscendC
         kernel metadata) runs last.
         """
         positions = extra_kwargs.get("positions")

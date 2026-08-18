@@ -7,10 +7,10 @@ import pytest
 import torch
 from torchtitan.models.common.rope import ComplexRoPE
 
-from torchtitan_npu.override.common.rope import CANNComplexRoPE, WorkaroundComplexRoPE
+from torchtitan_npu.override.common.rope import AscComplexRoPE, WorkaroundComplexRoPE
 
 
-@pytest.mark.parametrize("rope_cls", [WorkaroundComplexRoPE, CANNComplexRoPE])
+@pytest.mark.parametrize("rope_cls", [WorkaroundComplexRoPE, AscComplexRoPE])
 def test_interleaved_rope_caches_expanded_cos_and_sin(rope_cls):
     config = rope_cls.Config(dim=8, max_seq_len=16)
     rope = rope_cls(config)

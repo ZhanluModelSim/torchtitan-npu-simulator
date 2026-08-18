@@ -32,15 +32,15 @@ TORCHINDUCTOR_NPU_EXT_DEBUG=allfallback
 
 ```text
 torchtitan_npu.override.common.rope.workaround
-torchtitan_npu.override.deepseek_v4.sparse_attn.cann_metadata=...
-torchtitan_npu.override.deepseek_v4.sparse_attn.cann
+torchtitan_npu.override.deepseek_v4.sparse_attn.asc_metadata=...
+torchtitan_npu.override.deepseek_v4.sparse_attn.asc
 ```
 
 ### 约束
 
 - 算子当前只在 A5 上可用；
-- 不能同时启用 `torchtitan_npu.override.common.rope.cann_complex`，否则原始小算子
+- 不能同时启用 `torchtitan_npu.override.common.rope.asc_complex`，否则原始小算子
   片段会提前变成 `torch_npu.npu_rotary_mul`，pattern 无法命中；
-- 当前不支持 DeepSeek-V4 golden attention，整网验证使用 `sparse_attn.cann`；
-- `scripts/run_train.sh` 的 `TEST_OVERRIDES` 默认使用 `rope.cann_complex`，验证该
+- 当前不支持 DeepSeek-V4 golden attention，整网验证使用 `sparse_attn.asc`；
+- `scripts/run_train.sh` 的 `TEST_OVERRIDES` 默认使用 `rope.asc_complex`，验证该
   pattern 前需要换成 `rope.workaround`。

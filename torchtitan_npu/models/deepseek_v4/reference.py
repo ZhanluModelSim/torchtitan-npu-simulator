@@ -16,7 +16,7 @@ Per the tiered contract, the tier is *not* part of the common metadata build
 (``build_compressed_varlen_metadata``) — it is delivered through the
 ``metadata_extension`` seam.  The default ``metadata_extension`` config is
 ``ReferenceMetadataExtension`` (the golden path and the model-dir default
-attention get the tier); the CANN fused path replaces it with the CANN
+attention get the tier); the AscendC fused path replaces it with the AscendC
 extension, which materializes no reference tier at all.
 """
 
@@ -229,7 +229,7 @@ class ReferenceMetadataExtension(MetadataExtension):
     Wraps the common metadata (``build_compressed_varlen_metadata``'s
     output) with the reference-attention tensors.  The tier is no-CP-shaped
     (contiguous documents — ``cu_seq_q == cu_seq_k``); under context
-    parallel the fused CANN path is required (the reference tier and the
+    parallel the fused AscendC path is required (the reference tier and the
     golden stay no-CP-only).
     """
 
@@ -247,7 +247,7 @@ class ReferenceMetadataExtension(MetadataExtension):
         if not torch.equal(metadata.varlen.cu_seq_q, metadata.varlen.cu_seq_k):
             raise ValueError(
                 "the reference tier requires cu_seq_q == cu_seq_k (contiguous "
-                "documents); under context parallel the fused CANN path is "
+                "documents); under context parallel the fused AscendC path is "
                 "required — the reference tier and the golden are no-CP-only."
             )
         cfg = cast("ReferenceMetadataExtension.Config", self.config)

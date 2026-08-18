@@ -4,3 +4,5 @@
 # LICENSE file in the root directory of this source tree.
 
 """AscendC operator registrations used by NPU overrides."""
+
+from . import grouped_mm  # noqa: F401

@@ -15,8 +15,8 @@ import torchtitan_npu.ops.ascendc.mhc  # noqa: F401
 from torchtitan_npu.models.deepseek_v4.mhc import HcPost, HcPre
 
 
-class CANNHcPre(HcPre):
-    """HcPre backed by the hardware-specific CANN implementation.
+class AscHcPre(HcPre):
+    """HcPre backed by the hardware-specific AscendC implementation.
 
     The modern model-dir ``HcPre`` owns its mixing parameters and calls
     ``forward(x)``. Ascend A3 uses the fused
@@ -86,7 +86,7 @@ class CANNHcPre(HcPre):
         return h_in, h_post, h_res
 
 
-class CANNHcPost(HcPost):
+class AscHcPost(HcPost):
     """HcPost backed by ``cann_ops_transformer.ops.mhc_post``."""
 
     @dataclass(kw_only=True, slots=True)
@@ -108,8 +108,8 @@ class CANNHcPost(HcPost):
     exact=True,
     description="NPU DeepSeek-V4 HcPre with A3 fused and A5 split operators",
 )
-def cann_hc_pre(cfg: HcPre.Config) -> CANNHcPre.Config:
-    return derive(cfg, CANNHcPre.Config)
+def asc_hc_pre(cfg: HcPre.Config) -> AscHcPre.Config:
+    return derive(cfg, AscHcPre.Config)
 
 
 @override(
@@ -117,5 +117,5 @@ def cann_hc_pre(cfg: HcPre.Config) -> CANNHcPre.Config:
     exact=True,
     description=("NPU fused DeepSeek-V4 HcPost via cann_ops_transformer.ops.mhc_post"),
 )
-def cann_hc_post(cfg: HcPost.Config) -> CANNHcPost.Config:
-    return derive(cfg, CANNHcPost.Config)
+def asc_hc_post(cfg: HcPost.Config) -> AscHcPost.Config:
+    return derive(cfg, AscHcPost.Config)

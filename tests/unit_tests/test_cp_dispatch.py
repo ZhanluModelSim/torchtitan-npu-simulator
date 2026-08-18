@@ -9,7 +9,7 @@ real gloo process group via ``cp_dispatch_worker.py`` — the actual
 ``torch.distributed`` path (the ``spmd_types`` collectives are the NPU
 path, on-device; the portable gloo emulation lives in the worker).
 
-Also exercises the CANN handler's CP path (with the fake ``cann_ops``
+Also exercises the AscendC handler's CP path (with the fake ``cann_ops``
 recorder) and the ``CPAttention`` flow with a recording inner core.
 """
 
@@ -462,7 +462,7 @@ def test_dispatcher_vs_oracle(dsv4_globals, case):
 def _slim_cp_metadata(plans, window=None):
     """A minimal kernel-contract holder exposing the per-ratio block plans
     at ``plans[ratio]`` and the window plan at ``window`` (the same access
-    points the CANN handler builds in CP mode)."""
+    points the AscendC handler builds in CP mode)."""
 
     class _Slim:
         pass
@@ -551,19 +551,19 @@ def test_compressor_cp_branch(dsv4_globals, case):
 
 
 # ---------------------------------------------------------------------------
-# 4. The CANN handler's CP path (fake cann_ops recorder, mocked transport)
+# 4. The AscendC handler's CP path (fake cann_ops recorder, mocked transport)
 # ---------------------------------------------------------------------------
 
 
-def test_cann_extension_cp_metadata(dsv4_globals, dsv4):
-    """The CANN metadata extension over the model-built CP metadata (the
+def test_asc_extension_cp_metadata(dsv4_globals, dsv4):
+    """The AscendC metadata extension over the model-built CP metadata (the
     pure global-context plan derivation — no rounds, no transport)."""
     ratio = 4
     docs = (1000, 1000, 1000, 1000)
     lb = _ht(4000, 2)
     _v, cp_metas, shard_len = make_cp_metas(docs, 2, lb)
-    from torchtitan_npu.override.deepseek_v4.sparse_attn.cann import (
-        CANNMetadataExtension,
+    from torchtitan_npu.override.deepseek_v4.sparse_attn.ascendc import (
+        AscMetadataExtension,
     )
 
     for r in range(2):
@@ -577,8 +577,8 @@ def test_cann_extension_cp_metadata(dsv4_globals, dsv4):
             window_size=128,
             ratios=[1, ratio, 128],
         )
-        md = CANNMetadataExtension(
-            CANNMetadataExtension.Config(
+        md = AscMetadataExtension(
+            AscMetadataExtension.Config(
                 window_size=128,
                 num_heads=16,
                 head_dim=512,
