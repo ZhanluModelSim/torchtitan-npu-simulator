@@ -5,6 +5,7 @@
 
 import pytest
 import torch
+import torch_npu
 from torchao.float8.float8_utils import compute_error
 
 from torchtitan_npu.experiments.ao_npu.torchao_npu.quantization.quant_configs import MXQuantizeConfig
@@ -59,6 +60,59 @@ def test_mxfp4_fake_quantize_round_modes(round_mode):
     # Round mode should not affect shape/dtype, just numerical accuracy
     sqnr = compute_error(x, y).item()
     assert sqnr > 10, f"SQNR too low: {sqnr:.1f} dB for round_mode={round_mode}"
+
+
+# =========================================================================
+# Tests for mxfp8_dequantize
+# =========================================================================
+
+
+@pytest.mark.skipif(not hasattr(torch, "npu") or not torch.npu.is_available(), reason="NPU not available")
+@pytest.mark.parametrize("axis", [-1, -2])
+@pytest.mark.parametrize("shape", [(32, 256), (1024, 1024)])
+@pytest.mark.parametrize("elem_dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+def test_mxfp8_dequantize(shape, axis, elem_dtype):
+    """mxfp8_dequantize: shape preserved, SQNR vs original, idempotent."""
+    from torchtitan_npu.experiments.ao_npu.torchao_npu.ops.mx_ops import mxfp8_dequantize
+
+    torch.manual_seed(0)
+    x = torch.randn(*shape, device="npu", dtype=torch.bfloat16)
+    config = MXQuantizeConfig(elem_dtype=elem_dtype)
+
+    x_q, x_scale = torch_npu.npu_dynamic_mx_quant(
+        x,
+        axis=axis,
+        dst_type=elem_dtype,
+        block_size=config.block_size,
+        round_mode=config.round_mode,
+        scale_alg=config.scale_alg,
+    )
+
+    x_dq = mxfp8_dequantize(
+        x_q, x_scale, axis=axis, block_size=config.block_size, output_shape=x.shape, output_dtype=x.dtype
+    )
+
+    assert x_dq.shape == x.shape, f"Shape mismatch: {x_dq.shape} vs {x.shape}"
+    assert x_dq.dtype == x.dtype, f"Dtype mismatch: {x_dq.dtype} vs {x.dtype}"
+
+    sqnr = compute_error(x, x_dq).item()
+    threshold = 26 if elem_dtype == torch.float8_e4m3fn else 22
+    assert sqnr > threshold, f"SQNR {sqnr:.1f} dB below {threshold} dB for {elem_dtype}"
+
+    # Idempotency: requantize the dequantized output, dequantize again
+    x_q2, x_scale2 = torch_npu.npu_dynamic_mx_quant(
+        x_dq,
+        axis=axis,
+        dst_type=elem_dtype,
+        block_size=config.block_size,
+        round_mode=config.round_mode,
+        scale_alg=config.scale_alg,
+    )
+    x_dq2 = mxfp8_dequantize(
+        x_q2, x_scale2, axis=axis, block_size=config.block_size, output_shape=x.shape, output_dtype=x.dtype
+    )
+
+    assert torch.equal(x_dq, x_dq2), "Not idempotent"
 
 
 # =========================================================================

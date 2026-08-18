@@ -70,6 +70,57 @@ def mxfp4_fake_quantize(
     return MXFP4FakeQuantize.apply(hp, config, axis)
 
 
+def mxfp8_dequantize(
+    data: torch.Tensor,
+    scale: torch.Tensor,
+    axis: int,
+    block_size: int,
+    output_shape: torch.Size,
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Dequantize MXFP8 data from ``torch_npu.npu_dynamic_mx_quant`` output.
+
+    Unlike ``mxfp4_dequantize``, FP8 uses 1 byte per value so no LUT-based
+    nibble unpacking is needed. The scale format (E8M0, paired) is the same.
+
+    Args:
+        data: FP8 tensor (output y from npu_dynamic_mx_quant).
+              Shape matches the original input shape.
+        scale: uint8 E8M0 tensor (output mxscale_out).
+               ndim = data.ndim + 1, with a trailing 2 dim packing scale pairs.
+        axis: Quantization axis used in npu_dynamic_mx_quant.
+        block_size: Block size used in npu_dynamic_mx_quant.
+        output_dtype: Target dtype for the dequantized output.
+    """
+    assert output_shape[axis] % block_size == 0, f"quant dim must be divisible by block_size ({block_size})"
+
+    orig_shape = output_shape
+    pos_axis = axis if axis >= 0 else axis + data.ndim
+    qdim = orig_shape[pos_axis]
+    num_blocks = qdim // block_size
+
+    # Convert FP8 → output dtype (no nibble unpacking needed)
+    values = data.to(output_dtype)
+
+    # Unpack scale (same paired E8M0 format as mxfp4_dequantize)
+    s = scale.to(torch.uint8)
+    s = s.movedim(-1, pos_axis + 1)
+    s = s.flatten(pos_axis, pos_axis + 1)  # [..., packed_blocks*2, ...]
+    s = s.narrow(pos_axis, 0, num_blocks)  # trim padding when num_blocks is odd
+
+    # E8M0 uint8 → bf16 scale: 2^(e - 127)
+    s = torch.exp2(s.to(torch.bfloat16) - 127.0)
+
+    # Block-wise broadcast multiply
+    values = values.unflatten(pos_axis, (num_blocks, block_size))
+    s = s.unsqueeze(pos_axis + 1)
+
+    result = values * s  # broadcasts over block_size
+    result = result.reshape(orig_shape)
+
+    return result.to(output_dtype)
+
+
 # =========================================================================
 # Real MX quantized matmul ops
 # =========================================================================

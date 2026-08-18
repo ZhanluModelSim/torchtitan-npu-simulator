@@ -5,6 +5,7 @@
 
 import pytest
 import torch
+import torch_npu
 from torchao.float8.float8_utils import compute_error
 
 from torchtitan_npu.experiments.ao_npu.torchao_npu.ops.block_ops import (
@@ -12,11 +13,15 @@ from torchtitan_npu.experiments.ao_npu.torchao_npu.ops.block_ops import (
     to_block_fp8_then_grouped_mm,
     to_block_fp8_then_mm,
 )
+from torchtitan_npu.experiments.ao_npu.torchao_npu.ops.mx_ops import (
+    mxfp4_fake_quantize,
+    mxfp8_dequantize,
+)
 from torchtitan_npu.experiments.ao_npu.torchao_npu.quantization.quant_configs import (
     BlockQuantizeConfig,
     MXQuantizeConfig,
 )
-from torchtitan_npu.experiments.ao_npu.torchao_npu.quantization.quant_primitives.block_fp8 import quantize_right_operand
+from torchtitan_npu.experiments.ao_npu.torchao_npu.quantization.quant_primitives.block_fp8 import block_fp8_quantize
 
 
 def _npu_available():
@@ -450,7 +455,7 @@ def test_grouped_dtype_preservation(dtype, config_A, config_B):
 
 
 # =========================================================================
-# quantize_right_operand
+# block_fp8_quantize
 # =========================================================================
 
 
@@ -474,12 +479,12 @@ def test_grouped_dtype_preservation(dtype, config_A, config_B):
         ),
     ],
 )
-def test_quantize_right_operand_shape_and_dtype_2d(K, N, axis, config_B):
+def test_block_fp8_quantize_shape_and_dtype_2d(K, N, axis, config_B):
     """2D B: returns 3 tensors with expected dtype; output shape preserved."""
     torch.manual_seed(42)
     B = torch.randn(K, N, device="npu", dtype=torch.bfloat16)
 
-    B_q, _, _ = quantize_right_operand(B, axis=axis, config=config_B)
+    B_q, _, _ = block_fp8_quantize(B, axis=axis, config=config_B)
 
     assert B_q.dtype == config_B.elem_dtype
     assert B_q.shape == B.shape
@@ -500,12 +505,12 @@ def test_quantize_right_operand_shape_and_dtype_2d(K, N, axis, config_B):
         (3, 128, 64, -2, BlockQuantizeConfig()),
     ],
 )
-def test_quantize_right_operand_shape_and_dtype_3d(E, K, N, axis, config_B):
+def test_block_fp8_quantize_shape_and_dtype_3d(E, K, N, axis, config_B):
     """3D B (grouped): returns 3 tensors with expected dtype; output shape preserved."""
     torch.manual_seed(42)
     B = torch.randn(E, K, N, device="npu", dtype=torch.bfloat16)
 
-    B_q, _, _ = quantize_right_operand(B, axis=axis, config=config_B)
+    B_q, _, _ = block_fp8_quantize(B, axis=axis, config=config_B)
 
     assert B_q.dtype == config_B.elem_dtype
     assert B_q.shape == B.shape
@@ -628,3 +633,429 @@ def test_bmm_backward_finiteness(B, M, K, N, config_A, config_B):
         assert g is not None, f"{name}.grad is None"
         assert torch.isfinite(g).all(), f"{name}.grad has non-finite values"
         assert g.norm().item() > 0, f"{name}.grad is all zeros"
+
+
+@pytest.mark.skipif(not _npu_available(), reason="NPU not available")
+@pytest.mark.parametrize(
+    "shape, axis",
+    [
+        ((64, 128), -2),
+        ((64, 128), -1),
+        ((2, 64, 128), -2),
+        ((2, 64, 128), -1),
+        ((4, 128, 256), -2),
+        ((4, 128, 256), -1),
+        ((1024, 2048), -2),
+        ((1024, 2048), -1),
+    ],
+)
+def test_mxfp4_fused_op_equivalence(shape, axis):
+    """
+    Old (mxfp4_fake_quantize + dynamic_block_mx_quant) and new
+    (fused cann_ops_nn.mx_to_block_mx_quant) paths produce identical results.
+    """
+
+    torch.manual_seed(42)
+    B = torch.randn(*shape, device="npu", dtype=torch.bfloat16)
+    config = BlockQuantizeConfig(
+        mxfp4_fake_quantize_config=MXQuantizeConfig(elem_dtype=torch.float4_e2m1fn_x2),
+    )
+
+    # --- Old path: two-step ---
+    hp_tensor = mxfp4_fake_quantize(B, config.mxfp4_fake_quantize_config, axis=axis)
+    B_q_old, B_s1_old, B_s2_old = torch_npu.npu_dynamic_block_mx_quant(
+        hp_tensor,
+        dst_type=config.elem_dtype,
+        scale_alg=config.scale_alg,
+        dst_type_max=config.dst_type_max,
+    )
+
+    # --- New path: fused op ---
+    B_q_new, B_s1_new, B_s2_new = block_fp8_quantize(B, axis=axis, config=config)
+
+    # --- Compare: dequantize block FP8 to bf16, then torch.equal ---
+    # Block FP8 scale is broadcast across each 32×32 block (MXFP8 format).
+    # Dequant along K-dim using B_s2 (forward scale) or N-dim using B_s1 (backward scale).
+    block_size = 32
+    for axis, s_old, s_new, label in [(-2, B_s2_old, B_s2_new, "s2"), (-1, B_s1_old, B_s1_new, "s1")]:
+        dq_old = mxfp8_dequantize(
+            B_q_old, s_old, axis=axis, block_size=block_size, output_shape=B.shape, output_dtype=B.dtype
+        )
+        dq_new = mxfp8_dequantize(
+            B_q_new, s_new, axis=axis, block_size=block_size, output_shape=B.shape, output_dtype=B.dtype
+        )
+        assert torch.equal(dq_old, dq_new), f"Dequantized values differ with {label}"
+
+
+@pytest.mark.skipif(not _npu_available(), reason="NPU not available")
+@pytest.mark.parametrize(
+    "M, K, N, axis",
+    [
+        (128, 64, 256, -2),
+        (64, 128, 64, -1),
+    ],
+)
+def test_mxfp4_matmul_equivalence(M, K, N, axis):
+    """Matmul output using old vs new quantization paths has acceptable SQNR."""
+    torch.manual_seed(42)
+    A = torch.randn(M, K, device="npu", dtype=torch.bfloat16)
+    B = torch.randn(K, N, device="npu", dtype=torch.bfloat16)
+    config = BlockQuantizeConfig(
+        mxfp4_fake_quantize_config=MXQuantizeConfig(elem_dtype=torch.float4_e2m1fn_x2),
+    )
+    config_A = MXQuantizeConfig()
+
+    # Quantize A once (shared)
+    A_q1, A_s1, _, _ = torch_npu.npu_dynamic_mx_quant_with_dual_axis(
+        A.reshape(-1, A.shape[-1]),
+        round_mode=config_A.round_mode,
+        dst_type=config_A.elem_dtype,
+        scale_alg=config_A.scale_alg,
+        dst_type_max=config_A.dst_type_max,
+    )
+
+    # --- Old path: quantize B ---
+    hp = mxfp4_fake_quantize(B, config.mxfp4_fake_quantize_config, axis=axis)
+    B_q_old, _, B_s2_old = torch_npu.npu_dynamic_block_mx_quant(
+        hp,
+        dst_type=config.elem_dtype,
+        scale_alg=config.scale_alg,
+        dst_type_max=config.dst_type_max,
+    )
+    Y_old = torch_npu.npu_quant_matmul(
+        A_q1,
+        B_q_old,
+        B_s2_old,
+        pertoken_scale=A_s1,
+        output_dtype=A.dtype,
+        scale_dtype=torch_npu.float8_e8m0fnu,
+        pertoken_scale_dtype=torch_npu.float8_e8m0fnu,
+        group_sizes=[1, 1, 32],
+    )
+    if A.ndim != 2:
+        Y_old = Y_old.reshape(*A.shape[:-1], *Y_old.shape[1:])
+
+    # --- New path: quantize B ---
+    B_q_new, _, B_s2_new = block_fp8_quantize(B, axis=axis, config=config)
+    Y_new = torch_npu.npu_quant_matmul(
+        A_q1,
+        B_q_new,
+        B_s2_new,
+        pertoken_scale=A_s1,
+        output_dtype=A.dtype,
+        scale_dtype=torch_npu.float8_e8m0fnu,
+        pertoken_scale_dtype=torch_npu.float8_e8m0fnu,
+        group_sizes=[1, 1, 32],
+    )
+    if A.ndim != 2:
+        Y_new = Y_new.reshape(*A.shape[:-1], *Y_new.shape[1:])
+
+    assert torch.equal(Y_old, Y_new), "Matmul results differ between old and new quantization paths"
+
+
+@pytest.mark.skipif(not _npu_available(), reason="NPU not available")
+@pytest.mark.parametrize(
+    "M, K, N, E, group_sizes",
+    [
+        (192, 64, 128, 3, [64, 64, 64]),
+    ],
+)
+def test_mxfp4_grouped_matmul_equivalence(M, K, N, E, group_sizes):
+    """Grouped matmul output using old vs new quantization paths is identical."""
+    torch.manual_seed(42)
+    A = torch.randn(M, K, device="npu", dtype=torch.bfloat16)
+    B = torch.randn(E, K, N, device="npu", dtype=torch.bfloat16)
+    group_list = _group_list_from_sizes(group_sizes)
+    config = BlockQuantizeConfig(
+        mxfp4_fake_quantize_config=MXQuantizeConfig(elem_dtype=torch.float4_e2m1fn_x2),
+    )
+    config_A = MXQuantizeConfig()
+
+    # Quantize A once (shared)
+    A_q1, A_s1 = torch_npu.npu_dynamic_mx_quant(
+        A,
+        axis=-1,
+        round_mode=config_A.round_mode,
+        dst_type=config_A.elem_dtype,
+        block_size=config_A.block_size,
+        scale_alg=config_A.scale_alg,
+        dst_type_max=config_A.dst_type_max,
+    )
+
+    # --- Old path: quantize B ---
+    hp = mxfp4_fake_quantize(B, config.mxfp4_fake_quantize_config, axis=-2)
+    B_q_old, _, B_s2_old = torch_npu.npu_dynamic_block_mx_quant(
+        hp,
+        dst_type=config.elem_dtype,
+        scale_alg=config.scale_alg,
+        dst_type_max=config.dst_type_max,
+    )
+    Y_old = torch_npu.npu_grouped_matmul(
+        [A_q1],
+        [B_q_old],
+        scale=[B_s2_old],
+        per_token_scale=[A_s1],
+        group_list=group_list.to(torch.int64),
+        group_type=0,
+        output_dtype=A.dtype,
+        group_list_type=0,
+        scale_dtype=torch_npu.float8_e8m0fnu,
+        per_token_scale_dtype=torch_npu.float8_e8m0fnu,
+        split_item=3,
+    )[0]
+
+    # --- New path: quantize B ---
+    B_q_new, _, B_s2_new = block_fp8_quantize(B, axis=-2, config=config)
+    Y_new = torch_npu.npu_grouped_matmul(
+        [A_q1],
+        [B_q_new],
+        scale=[B_s2_new],
+        per_token_scale=[A_s1],
+        group_list=group_list.to(torch.int64),
+        group_type=0,
+        output_dtype=A.dtype,
+        group_list_type=0,
+        scale_dtype=torch_npu.float8_e8m0fnu,
+        per_token_scale_dtype=torch_npu.float8_e8m0fnu,
+        split_item=3,
+    )[0]
+
+    assert torch.equal(Y_old, Y_new), "Grouped matmul results differ between old and new quantization paths"
+
+
+@pytest.mark.skipif(not _npu_available(), reason="NPU not available")
+@pytest.mark.parametrize(
+    "M, K, N, axis",
+    [
+        (128, 64, 256, -2),
+        (64, 128, 64, -1),
+    ],
+)
+def test_mxfp4_matmul_backward_equivalence(M, K, N, axis):
+    """Backward gradients using old vs new quantization paths are identical."""
+    torch.manual_seed(42)
+    A = torch.randn(M, K, device="npu", dtype=torch.bfloat16)
+    B = torch.randn(K, N, device="npu", dtype=torch.bfloat16)
+    config = BlockQuantizeConfig(
+        mxfp4_fake_quantize_config=MXQuantizeConfig(elem_dtype=torch.float4_e2m1fn_x2),
+    )
+    config_A = MXQuantizeConfig()
+
+    A_flat = A.reshape(-1, A.shape[-1])
+
+    # Quantize A once (shared)
+    A_q1, A_s1, A_q2, A_s2 = torch_npu.npu_dynamic_mx_quant_with_dual_axis(
+        A_flat,
+        round_mode=config_A.round_mode,
+        dst_type=config_A.elem_dtype,
+        scale_alg=config_A.scale_alg,
+        dst_type_max=config_A.dst_type_max,
+    )
+
+    # --- Old path: quantize B ---
+    hp = mxfp4_fake_quantize(B, config.mxfp4_fake_quantize_config, axis=axis)
+    B_q_old, B_s1_old, B_s2_old = torch_npu.npu_dynamic_block_mx_quant(
+        hp,
+        dst_type=config.elem_dtype,
+        scale_alg=config.scale_alg,
+        dst_type_max=config.dst_type_max,
+    )
+
+    # --- New path: quantize B ---
+    B_q_new, B_s1_new, B_s2_new = block_fp8_quantize(B, axis=axis, config=config)
+
+    def _backward(dY, A_q2, A_s2, B_q, B_s1):
+        dY_q1, dY_s1, dY_q2, dY_s2 = torch_npu.npu_dynamic_mx_quant_with_dual_axis(
+            dY.reshape(-1, dY.shape[-1]),
+            round_mode=config_A.round_mode,
+            dst_type=config_A.elem_dtype,
+            scale_alg=config_A.scale_alg,
+            dst_type_max=config_A.dst_type_max,
+        )
+        dA = torch_npu.npu_quant_matmul(
+            dY_q1,
+            B_q.t(),
+            B_s1.transpose(0, 1),
+            pertoken_scale=dY_s1,
+            output_dtype=A.dtype,
+            scale_dtype=torch_npu.float8_e8m0fnu,
+            pertoken_scale_dtype=torch_npu.float8_e8m0fnu,
+            group_sizes=[1, 1, 32],
+        )
+        dB = torch_npu.npu_quant_matmul(
+            A_q2.t(),
+            dY_q2,
+            dY_s2,
+            pertoken_scale=A_s2.transpose(0, 1),
+            output_dtype=A.dtype,
+            scale_dtype=torch_npu.float8_e8m0fnu,
+            pertoken_scale_dtype=torch_npu.float8_e8m0fnu,
+            group_sizes=[1, 1, 32],
+        )
+        if dY.ndim != 2:
+            dA = dA.reshape(*dY.shape[:-1], *dA.shape[1:])
+        return dA, dB
+
+    # Forward matmul + backward for both paths
+    Y_old = torch_npu.npu_quant_matmul(
+        A_q1,
+        B_q_old,
+        B_s2_old,
+        pertoken_scale=A_s1,
+        output_dtype=A.dtype,
+        scale_dtype=torch_npu.float8_e8m0fnu,
+        pertoken_scale_dtype=torch_npu.float8_e8m0fnu,
+        group_sizes=[1, 1, 32],
+    )
+    if A.ndim != 2:
+        Y_old = Y_old.reshape(*A.shape[:-1], *Y_old.shape[1:])
+    dY = torch.randn_like(Y_old)
+    dA_old, dB_old = _backward(dY, A_q2, A_s2, B_q_old, B_s1_old)
+
+    Y_new = torch_npu.npu_quant_matmul(
+        A_q1,
+        B_q_new,
+        B_s2_new,
+        pertoken_scale=A_s1,
+        output_dtype=A.dtype,
+        scale_dtype=torch_npu.float8_e8m0fnu,
+        pertoken_scale_dtype=torch_npu.float8_e8m0fnu,
+        group_sizes=[1, 1, 32],
+    )
+    if A.ndim != 2:
+        Y_new = Y_new.reshape(*A.shape[:-1], *Y_new.shape[1:])
+    dA_new, dB_new = _backward(dY, A_q2, A_s2, B_q_new, B_s1_new)
+
+    assert torch.equal(dA_old, dA_new), "dA differs between old and new quantization paths"
+    assert torch.equal(dB_old, dB_new), "dB differs between old and new quantization paths"
+
+
+@pytest.mark.skipif(not _npu_available(), reason="NPU not available")
+@pytest.mark.parametrize(
+    "M, K, N, E, group_sizes",
+    [
+        (192, 64, 128, 3, [64, 64, 64]),
+    ],
+)
+def test_mxfp4_grouped_matmul_backward_equivalence(M, K, N, E, group_sizes):
+    """Grouped backward gradients using old vs new quantization paths are identical."""
+    torch.manual_seed(42)
+    A = torch.randn(M, K, device="npu", dtype=torch.bfloat16)
+    B = torch.randn(E, K, N, device="npu", dtype=torch.bfloat16)
+    group_list = _group_list_from_sizes(group_sizes)
+    config = BlockQuantizeConfig(
+        mxfp4_fake_quantize_config=MXQuantizeConfig(elem_dtype=torch.float4_e2m1fn_x2),
+    )
+    config_A = MXQuantizeConfig()
+
+    # Quantize A once (shared)
+    A_q1, A_s1 = torch_npu.npu_dynamic_mx_quant(
+        A,
+        axis=-1,
+        round_mode=config_A.round_mode,
+        dst_type=config_A.elem_dtype,
+        block_size=config_A.block_size,
+        scale_alg=config_A.scale_alg,
+        dst_type_max=config_A.dst_type_max,
+    )
+    A_q2, A_s2 = torch_npu.npu_grouped_dynamic_mx_quant(
+        A,
+        group_list.to(torch.int32),
+        round_mode=config_A.round_mode,
+        dst_type=config_A.elem_dtype,
+        blocksize=config_A.block_size,
+        scale_alg=config_A.scale_alg,
+    )
+
+    # --- Old path: quantize B ---
+    hp = mxfp4_fake_quantize(B, config.mxfp4_fake_quantize_config, axis=-2)
+    B_q_old, B_s1_old, B_s2_old = torch_npu.npu_dynamic_block_mx_quant(
+        hp,
+        dst_type=config.elem_dtype,
+        scale_alg=config.scale_alg,
+        dst_type_max=config.dst_type_max,
+    )
+
+    # --- New path: quantize B ---
+    B_q_new, B_s1_new, B_s2_new = block_fp8_quantize(B, axis=-2, config=config)
+
+    def _grouped_backward(dY, A_q2, A_s2, B_q, B_s1):
+        dY_q1, dY_s1 = torch_npu.npu_dynamic_mx_quant(
+            dY,
+            axis=-1,
+            round_mode=config_A.round_mode,
+            dst_type=config_A.elem_dtype,
+            block_size=config_A.block_size,
+            scale_alg=config_A.scale_alg,
+            dst_type_max=config_A.dst_type_max,
+        )
+        dY_q2, dY_s2 = torch_npu.npu_grouped_dynamic_mx_quant(
+            dY,
+            group_list.to(torch.int32),
+            round_mode=config_A.round_mode,
+            dst_type=config_A.elem_dtype,
+            blocksize=config_A.block_size,
+            scale_alg=config_A.scale_alg,
+        )
+        dA = torch_npu.npu_grouped_matmul(
+            [dY_q1],
+            [B_q.transpose(-1, -2)],
+            scale=[B_s1.transpose(1, 2)],
+            per_token_scale=[dY_s1],
+            group_list=group_list.to(torch.int64),
+            group_type=0,
+            output_dtype=A.dtype,
+            group_list_type=0,
+            scale_dtype=torch_npu.float8_e8m0fnu,
+            per_token_scale_dtype=torch_npu.float8_e8m0fnu,
+            split_item=3,
+        )[0]
+        dB = torch_npu.npu_grouped_matmul(
+            [A_q2.t()],
+            [dY_q2],
+            scale=[dY_s2],
+            per_token_scale=[A_s2.transpose(0, 1)],
+            group_list=group_list.to(torch.int64),
+            group_type=2,
+            output_dtype=A.dtype,
+            group_list_type=0,
+            scale_dtype=torch_npu.float8_e8m0fnu,
+            per_token_scale_dtype=torch_npu.float8_e8m0fnu,
+            split_item=3,
+        )[0]
+        return dA, dB
+
+    # Forward + backward for both paths
+    Y_old = torch_npu.npu_grouped_matmul(
+        [A_q1],
+        [B_q_old],
+        scale=[B_s2_old],
+        per_token_scale=[A_s1],
+        group_list=group_list.to(torch.int64),
+        group_type=0,
+        output_dtype=A.dtype,
+        group_list_type=0,
+        scale_dtype=torch_npu.float8_e8m0fnu,
+        per_token_scale_dtype=torch_npu.float8_e8m0fnu,
+        split_item=3,
+    )[0]
+    dY = torch.randn_like(Y_old)
+    dA_old, dB_old = _grouped_backward(dY, A_q2, A_s2, B_q_old, B_s1_old)
+
+    Y_new = torch_npu.npu_grouped_matmul(
+        [A_q1],
+        [B_q_new],
+        scale=[B_s2_new],
+        per_token_scale=[A_s1],
+        group_list=group_list.to(torch.int64),
+        group_type=0,
+        output_dtype=A.dtype,
+        group_list_type=0,
+        scale_dtype=torch_npu.float8_e8m0fnu,
+        per_token_scale_dtype=torch_npu.float8_e8m0fnu,
+        split_item=3,
+    )[0]
+    dA_new, dB_new = _grouped_backward(dY, A_q2, A_s2, B_q_new, B_s1_new)
+
+    assert torch.equal(dA_old, dA_new), "dA differs between old and new quantization paths"
+    assert torch.equal(dB_old, dB_new), "dB differs between old and new quantization paths"

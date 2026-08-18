@@ -94,7 +94,9 @@ def _get_fp4_e2m1_pair_lut(device, dtype=torch.bfloat16, low_first: bool = True)
         dtype=dtype,
     )
     p = torch.arange(256, device=device)
-    low_nibble = p & 0x0F
-    high_nibble = p >> 4
+    # Each byte packs two FP4 values: low nibble (bits 0-3) and high nibble (bits 4-7).
+    # Index fp4_vals (16 entries) by these nibbles.
+    low_nibble = p & 0x0F  # mask out high nibble → 0..15
+    high_nibble = p >> 4  # shift down high nibble → 0..15
     idx0, idx1 = (low_nibble, high_nibble) if low_first else (high_nibble, low_nibble)
     return torch.stack([fp4_vals[idx0], fp4_vals[idx1]], dim=1)
