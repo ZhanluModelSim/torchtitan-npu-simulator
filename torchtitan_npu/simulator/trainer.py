@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import os
 from collections import Counter
-from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -48,6 +47,10 @@ from torchtitan_npu.simulator.memory.schedule_replay import estimate_schedule_me
 from torchtitan_npu.simulator.meta_env import patch_device_type_to_meta
 from torchtitan_npu.simulator.moe_force_balance import force_deterministic_seed, force_moe_load_balance
 from torchtitan_npu.simulator.rank_table import build_rank_table
+from torchtitan_npu.simulator.selective_ac import (
+    SelectiveACSaveOp,
+    selective_ac_save_ops_context,
+)
 from torchtitan_npu.simulator.viz.csv_export import export_kernel_summary_csv
 from torchtitan_npu.simulator.viz.dot_export import export_dot
 from torchtitan_npu.simulator.viz.html_export import export_html
@@ -82,8 +85,7 @@ class SimulationConfig:
     memory_parameter_storage_dtype: str = ""
     # Historical CLI name; now covers saved activations in none/full/selective.
     memory_offload_ac_saved_tensors: bool = False
-    # DeepSeek V4 selective AC: save only grouped-matmul results.
-    selective_ac_gmm_only_save: bool = False
+    selective_ac_save_ops: list[SelectiveACSaveOp] | None = None
     target_npu_device_type: str = "non_a5"
     csv_max_ranks: int | None = None
     world_size: int | None = None
@@ -518,18 +520,17 @@ class SimulationTrainer(Trainer):
             full_ws = int(sim_degrees.get("world_size", gloo_ws)) if sim_degrees else gloo_ws
             _patch_parallel_dims_for_multi_proc(full_ws, gloo_ws)
 
-        # The framework's model parallelization callback does not receive the
-        # simulator config. Scope this V4-only policy to model construction.
-        ac_policy_context = nullcontext()
-        if config.model_spec.name == "deepseek_v4":
-            from torchtitan_npu.models.deepseek_v4.activation_checkpoint import (
-                gmm_only_save_context,
+        if (
+            config.simulation.selective_ac_save_ops is not None
+            and config.activation_checkpoint.mode != "selective"
+        ):
+            raise ValueError(
+                "simulation.selective_ac_save_ops requires "
+                "activation_checkpoint.mode=selective"
             )
-
-            ac_policy_context = gmm_only_save_context(
-                config.simulation.selective_ac_gmm_only_save
-            )
-        with ac_policy_context:
+        with selective_ac_save_ops_context(
+            config.simulation.selective_ac_save_ops
+        ):
             super().__init__(config)
         # Bind Kimi shims after model construction so TP/CP/FSDP hooks and
         # distributed parameters remain attached to the original modules.

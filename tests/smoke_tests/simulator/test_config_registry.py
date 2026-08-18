@@ -106,18 +106,20 @@ def test_mxfp8_fqns_cli_override_requires_mxfp8_recipe():
         )
 
 
-def test_gmm_only_save_cli_override():
+def test_selective_ac_save_ops_cli_override():
     config = ConfigManager().parse_args(
         [
             "--module",
             "torchtitan_npu.simulator",
             "--config",
             "deepseek_v4_smoketest",
-            "--simulation.selective-ac-gmm-only-save",
+            "--simulation.selective-ac-save-ops",
+            "default",
+            "gmm",
         ]
     )
 
-    assert config.simulation.selective_ac_gmm_only_save is True
+    assert config.simulation.selective_ac_save_ops == ["default", "gmm"]
 
 
 def test_model_override_schema_tracks_all_deepseek_v4_fields():
