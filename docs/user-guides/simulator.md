@@ -287,6 +287,16 @@ backward 中重放。可通过
 `torch.compile` 的图分区器，而 simulator 必须使用 eager TorchDispatch 捕获，因此
 当前明确不支持。
 
+DeepSeek V4 仿真可额外启用严格的 GMM-only SAC policy：
+
+```bash
+--activation-checkpoint.mode selective \
+--simulation.selective-ac-gmm-only-save
+```
+
+该模式仅保存 `aten._grouped_mm` / `npu_grouped_matmul` 的输出；普通
+`mm`、`linear`、`npu_quant_matmul`、通信和其他算子均在 backward 中重计算。
+
 ## 输出文件
 
 ### 单进程模式（fake_backend）

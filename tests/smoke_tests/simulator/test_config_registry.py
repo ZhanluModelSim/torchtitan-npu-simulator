@@ -106,6 +106,20 @@ def test_mxfp8_fqns_cli_override_requires_mxfp8_recipe():
         )
 
 
+def test_gmm_only_save_cli_override():
+    config = ConfigManager().parse_args(
+        [
+            "--module",
+            "torchtitan_npu.simulator",
+            "--config",
+            "deepseek_v4_smoketest",
+            "--simulation.selective-ac-gmm-only-save",
+        ]
+    )
+
+    assert config.simulation.selective_ac_gmm_only_save is True
+
+
 def test_model_override_schema_tracks_all_deepseek_v4_fields():
     model_fields = {
         field.name for field in dataclasses.fields(DeepSeekV4Model.Config)

@@ -13,8 +13,10 @@ from torch.utils.checkpoint import DefaultDeviceType
 from torchtitan.config import ActivationCheckpointConfig
 
 from torchtitan_npu.models.deepseek_v4.activation_checkpoint import (
+    _resolve_gmm_save_ops,
     _resolve_save_ops,
     apply_deepseek_v4_ac,
+    gmm_only_save_context,
 )
 from torchtitan_npu.patches.torchao_npu.mx_linear import NpuMXFP8MM
 from torchtitan_npu.simulator.capture.checkpoint_execution import (
@@ -27,6 +29,10 @@ from torchtitan_npu.simulator.capture.step_boundary import StepBoundaryTracker
 EXPECTED_SAVE_OPS = {
     "aten._grouped_mm.default",
     "npu.npu_quant_matmul.default",
+    "npu.npu_grouped_matmul.default",
+}
+EXPECTED_GMM_ONLY_SAVE_OPS = {
+    "aten._grouped_mm.default",
     "npu.npu_grouped_matmul.default",
 }
 
@@ -51,13 +57,14 @@ class _ModelWithLayers(nn.Module):
         return self.layers["0"](inputs)
 
 
-def _capture_mxfp8_checkpoint(mode: str) -> list:
+def _capture_mxfp8_checkpoint(mode: str, *, gmm_only_save: bool = False) -> list:
     model = _ModelWithLayers()
     apply_deepseek_v4_ac(
         model,
         ActivationCheckpointConfig(mode=mode),
         model_compile_enabled=False,
         base_folder=".",
+        gmm_only_save=gmm_only_save,
     )
     assert install_checkpoint_execution_tracking([model]) == 1
 
@@ -82,6 +89,7 @@ def _capture_mxfp8_checkpoint(mode: str) -> list:
 
 def test_deepseek_v4_save_ops_resolve_registered_dispatcher_ops():
     assert {str(op) for op in _resolve_save_ops()} == EXPECTED_SAVE_OPS
+    assert {str(op) for op in _resolve_gmm_save_ops()} == EXPECTED_GMM_ONLY_SAVE_OPS
 
 
 def test_selective_ac_extends_save_ops_only_during_model_wrapping():
@@ -132,6 +140,27 @@ def test_full_ac_does_not_extend_upstream_save_ops():
     assert get_save_ops.call_count == 1
 
 
+def test_gmm_only_save_replaces_default_selective_save_ops():
+    observed_save_ops = None
+
+    def _capture_save_ops(*args, **kwargs):  # noqa: ANN002, ANN003
+        nonlocal observed_save_ops
+        observed_save_ops = activation_checkpoint._get_save_ops()
+
+    with (
+        patch.object(activation_checkpoint, "apply_ac", _capture_save_ops),
+        gmm_only_save_context(True),
+    ):
+        apply_deepseek_v4_ac(
+            nn.Linear(4, 4),
+            SimpleNamespace(mode="selective"),
+            model_compile_enabled=False,
+            base_folder=".",
+        )
+
+    assert {str(op) for op in observed_save_ops} == EXPECTED_GMM_ONLY_SAVE_OPS
+
+
 def test_selective_ac_caches_real_npu_quant_matmul_but_recomputes_quantization():
     selective_nodes = _capture_mxfp8_checkpoint("selective")
     full_nodes = _capture_mxfp8_checkpoint("full")
@@ -149,3 +178,15 @@ def test_selective_ac_caches_real_npu_quant_matmul_but_recomputes_quantization()
     assert "npu.npu_dynamic_mx_quant.default" in selective_recompute_ops
     assert "npu.npu_quant_matmul.default" not in selective_recompute_ops
     assert "npu.npu_quant_matmul.default" in full_recompute_ops
+
+
+def test_gmm_only_save_recomputes_npu_quant_matmul():
+    nodes = _capture_mxfp8_checkpoint("selective", gmm_only_save=True)
+    recompute_ops = {
+        node.annotations["raw_op_type"]
+        for node in nodes
+        if node.annotations["execution_kind"] == "recompute"
+    }
+
+    assert "npu.npu_dynamic_mx_quant.default" in recompute_ops
+    assert "npu.npu_quant_matmul.default" in recompute_ops
