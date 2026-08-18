@@ -9,7 +9,6 @@ from dataclasses import dataclass
 
 import torch
 import torch_npu
-from torchtitan.config import derive, override
 
 import torchtitan_npu.ops.ascendc.mhc  # noqa: F401
 from torchtitan_npu.models.deepseek_v4.mhc import HcPost, HcPre
@@ -101,21 +100,3 @@ class AscHcPost(HcPost):
         comb: torch.Tensor,
     ) -> torch.Tensor:
         return torch.ops.cann_ops_transformer.mhc_post(residual, comb, x, post)
-
-
-@override(
-    target=HcPre.Config,
-    exact=True,
-    description="NPU DeepSeek-V4 HcPre with A3 fused and A5 split operators",
-)
-def asc_hc_pre(cfg: HcPre.Config) -> AscHcPre.Config:
-    return derive(cfg, AscHcPre.Config)
-
-
-@override(
-    target=HcPost.Config,
-    exact=True,
-    description=("NPU fused DeepSeek-V4 HcPost via cann_ops_transformer.ops.mhc_post"),
-)
-def asc_hc_post(cfg: HcPost.Config) -> AscHcPost.Config:
-    return derive(cfg, AscHcPost.Config)

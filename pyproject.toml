@@ -14,8 +14,10 @@ include = ["torchtitan_npu*"]
 exclude = ["tests*", "CI*", "third_party*"]
 
 [tool.pytest.ini_options]
+pythonpath = ["."]
 markers = [
     "cpu: CPU-only unit test",
+    "smoke: NPU smoke test",
     "static: source and declaration contract test",
 ]
 

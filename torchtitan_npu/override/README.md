@@ -68,7 +68,10 @@ torchtitan_npu/override/
 │       └── ascendc.py
 └── deepseek_v4/
     ├── __init__.py
-    ├── mhc.py
+    ├── mhc/
+    │   ├── __init__.py
+    │   ├── ascendc.py
+    │   └── triton.py
     └── sparse_attn/
         ├── __init__.py
         ├── ascendc.py
@@ -239,11 +242,14 @@ torchtitan_npu.override.deepseek_v3_2.sparse_attn.asc
 | `sparse_attn.golden` | `CompressedSparseInnerAttention.Config` | `GoldenCompressedSparseInnerAttention.Config` |
 | `mhc.asc_hc_pre` | `HcPre.Config` | `AscHcPre.Config` | 使用 `torch_npu.npu_mhc_pre` + `torch_npu.npu_mhc_sinkhorn` |
 | `mhc.asc_hc_post` | `HcPost.Config` | `AscHcPost.Config` | 使用 `cann_ops_transformer.ops.mhc_post` |
+| `mhc.triton_hc_pre` | `HcPre.Config` | `TritonHcPre.Config` | 使用 `mhc_pre_sinkhorn_op` + `mhc_pre_bmm_op` |
+| `mhc.triton_hc_post` | `HcPost.Config` | `TritonHcPost.Config` | 使用 `mhc_post_bmm1_op` + `mhc_post_bmm2_op` |
+| `mhc.triton_hc_head` | `HcHead.Config` | `TritonHcHead.Config` | 使用 `mhc_pre_only_sinkhorn_op` + `mhc_pre_bmm_op` |
 
 `sparse_attn.asc_metadata` 需要传入 `num_heads`、`head_dim`、
 `index_n_heads`、`index_head_dim` 和 `index_topk`。这些值必须与所选模型配置一致。
 `sparse_attn.asc` 还支持可选的 `indexer_loss_coeff`，默认值为 `1.0`。
-MHC 的 `asc_hc_pre` / `asc_hc_post` 是可选入口（`deepseek_v4/__init__.py`
+MHC 的 `asc_hc_pre` / `asc_hc_post` 与 `triton_hc_pre` / `triton_hc_post` / `triton_hc_head` 是可选入口（`deepseek_v4/__init__.py`
 默认只导入 `sparse_attn`），需要时显式加入 `override.imports`。
 推荐直接使用 [scripts/run_train.sh](../../scripts/run_train.sh)，脚本已为
 `deepseek_v4_debugmodel`、`deepseek_v4_flash` 和 `deepseek_v4_pro` 配置对应参数：
