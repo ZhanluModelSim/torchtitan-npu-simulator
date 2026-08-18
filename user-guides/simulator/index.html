@@ -520,6 +520,15 @@ backward 中重放。可通过
 指定需要强制重计算的 <code>nn.Linear</code> FQN。<code>memory_budget</code> 依赖
 <code>torch.compile</code> 的图分区器，而 simulator 必须使用 eager TorchDispatch 捕获，因此
 当前明确不支持。</p>
+<p>仿真可通过 save-op choices 覆盖任意模型的 selective SAC policy：</p>
+<pre><code class="language-bash">--activation-checkpoint.mode selective \
+--simulation.selective-ac-save-ops default gmm
+</code></pre>
+<p>可选值会显示在 CLI help 中：<code>full</code>、<code>none</code>、<code>default</code>、<code>compute-intensive</code>、
+<code>attention</code>、<code>linear</code>、<code>mm</code>、<code>gmm</code>、<code>quant-mm</code>、<code>comm</code>、<code>max</code>。<code>full</code> 是除
+<code>none</code> 外所有类别的便捷别名；<code>none</code> 必须单独使用；<code>default</code> 复用上游默认集合。
+即使选择了 <code>full</code>，<code>mm</code> 和 <code>linear</code> 仍保留上游的交替重计算策略；其余类别命中后
+保存输出。未传该参数时保持模型原有 policy。</p>
 <h2 id="_7">输出文件</h2>
 <h3 id="fake_backend">单进程模式（fake_backend）</h3>
 <p>仿真完成后，输出文件默认写入 <code>simulator_output/&lt;配置名&gt;/</code> 目录：</p>
