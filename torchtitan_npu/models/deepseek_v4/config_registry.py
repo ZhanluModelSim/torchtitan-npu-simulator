@@ -5,7 +5,9 @@
 # LICENSE file in the root directory of this source tree.
 
 from dataclasses import replace
+from types import SimpleNamespace
 
+import torch
 from torchtitan.components.quantization.mx import MXFP8Converter
 from torchtitan.protocols.model_converter import ModelConvertersContainer
 
@@ -103,12 +105,88 @@ def _flash_base() -> TrainerConfig:
     )
 
 
+def _torchao_npu() -> SimpleNamespace:
+    from torchtitan_npu.experiments.ao_npu.torchao_npu.configs import ParamSwapConfig
+    from torchtitan_npu.experiments.ao_npu.torchao_npu.interfaces.torchtitan import NpuQuantizeConverter
+    from torchtitan_npu.experiments.ao_npu.torchao_npu.quantization.filters import match_fqn_suffix
+    from torchtitan_npu.experiments.ao_npu.torchao_npu.quantization.quant_configs import (
+        BlockQuantizeConfig,
+        MXQuantizeConfig,
+    )
+
+    return SimpleNamespace(
+        ParamSwapConfig=ParamSwapConfig,
+        NpuQuantizeConverter=NpuQuantizeConverter,
+        match_fqn_suffix=match_fqn_suffix,
+        BlockQuantizeConfig=BlockQuantizeConfig,
+        MXQuantizeConfig=MXQuantizeConfig,
+    )
+
+
+def _block_mxfp8_converters() -> list:
+    torchao_npu = _torchao_npu()
+    return [
+        torchao_npu.NpuQuantizeConverter.Config(
+            base_config=torchao_npu.ParamSwapConfig(
+                weight_config=torchao_npu.BlockQuantizeConfig(),
+                activation_config=torchao_npu.MXQuantizeConfig(),
+            ),
+            filter_fn=torchao_npu.match_fqn_suffix(*_MXFP8_FQNS),
+        )
+    ]
+
+
+def _mxfp4_qat_converters() -> list:
+    torchao_npu = _torchao_npu()
+    return [
+        torchao_npu.NpuQuantizeConverter.Config(
+            base_config=torchao_npu.ParamSwapConfig(
+                weight_config=torchao_npu.BlockQuantizeConfig(),
+                activation_config=torchao_npu.MXQuantizeConfig(),
+            ),
+            filter_fn=torchao_npu.match_fqn_suffix(*(fqn for fqn in _MXFP8_FQNS if fqn != "moe.experts")),
+        ),
+        torchao_npu.NpuQuantizeConverter.Config(
+            base_config=torchao_npu.ParamSwapConfig(
+                weight_config=torchao_npu.BlockQuantizeConfig(
+                    mxfp4_fake_quantize_config=torchao_npu.MXQuantizeConfig(
+                        elem_dtype=torch.float4_e2m1fn_x2,
+                        dst_type_max=7.0,
+                    ),
+                ),
+                activation_config=torchao_npu.MXQuantizeConfig(),
+            ),
+            filter_fn=torchao_npu.match_fqn_suffix("moe.experts"),
+        ),
+    ]
+
+
 def deepseek_v4_flash_4k_128die() -> TrainerConfig:
     base = cpt_default_config(_flash_base())
     return replace(
         base,
         training=replace(base.training, global_batch_size=1024),
         parallelism=replace(base.parallelism, data_parallel_shard_degree=128, expert_parallel_degree=64),
+    )
+
+
+def deepseek_v4_flash_4k_128die_blockmxfp8() -> TrainerConfig:
+    base = deepseek_v4_flash_4k_128die()
+    return replace(
+        base,
+        model_converters=ModelConvertersContainer.Config(
+            converters=base.model_converters.converters + _block_mxfp8_converters()
+        ),
+    )
+
+
+def deepseek_v4_flash_4k_128die_mxfp4qat() -> TrainerConfig:
+    base = deepseek_v4_flash_4k_128die()
+    return replace(
+        base,
+        model_converters=ModelConvertersContainer.Config(
+            converters=base.model_converters.converters + _mxfp4_qat_converters()
+        ),
     )
 
 
@@ -143,6 +221,16 @@ def debug_deepseek_v4_flash_single_node_mxfp8() -> TrainerConfig:
     )
 
 
+def debug_deepseek_v4_flash_single_node_blockmxfp8() -> TrainerConfig:
+    base = debug_deepseek_v4_flash_single_node()
+    return replace(
+        base,
+        model_converters=ModelConvertersContainer.Config(
+            converters=base.model_converters.converters + _block_mxfp8_converters()
+        ),
+    )
+
+
 def debug_deepseek_v4_pro_single_node() -> TrainerConfig:
     base = debug_deepseek_v4_flash_single_node()
     return replace(
@@ -158,5 +246,15 @@ def debug_deepseek_v4_pro_single_node_mxfp8() -> TrainerConfig:
         model_converters=ModelConvertersContainer.Config(
             converters=base.model_converters.converters  # noqa: RUF005
             + [MXFP8Converter.Config(recipe_name="mxfp8_rceil", fqns=list(_MXFP8_FQNS))]
+        ),
+    )
+
+
+def debug_deepseek_v4_pro_single_node_blockmxfp8() -> TrainerConfig:
+    base = debug_deepseek_v4_pro_single_node()
+    return replace(
+        base,
+        model_converters=ModelConvertersContainer.Config(
+            converters=base.model_converters.converters + _block_mxfp8_converters()
         ),
     )
