@@ -161,6 +161,8 @@
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../installation/">软件安装</a>
                   </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../kimi_k3_model_parameters/">Kimi K3 模型参数 Web 字段目录</a>
+                  </li>
                   <li class="toctree-l1"><a class="reference internal" href="../quickstart/">快速上手</a>
                   </li>
                   <li class="toctree-l1 current"><a class="reference internal current" href="#">Simulator 使用指南</a>
@@ -187,7 +189,7 @@
     </li>
     <li class="toctree-l3"><a class="reference internal" href="#3">3. 运行仿真</a>
     </li>
-    <li class="toctree-l3"><a class="reference internal" href="#4-deepseek-v4">4. 覆盖 DeepSeek-V4 模型参数</a>
+    <li class="toctree-l3"><a class="reference internal" href="#4">4. 覆盖模型参数</a>
     </li>
     <li class="toctree-l3"><a class="reference internal" href="#5">5. 获取输出文件</a>
     </li>
@@ -393,11 +395,14 @@ python3 scripts/run_simulator_spawn.py \
 - <code>--hf_assets_path</code> 指定 tokenizer 路径，用仓库内置的 <code>deepseekv3_tokenizer</code> 即可（见上一步说明）。
 - CLI 对 PP/TP/CP/EP/DP 的覆盖会在选择模式、计算进程数和构建 mesh 前统一生效。</p>
 </blockquote>
-<h3 id="4-deepseek-v4">4. 覆盖 DeepSeek-V4 模型参数</h3>
-<p>DeepSeek-V4 的内置配置作为 preset 使用，模型参数可通过
+<h3 id="4">4. 覆盖模型参数</h3>
+<p>DeepSeek-V4 和 Kimi K3 的内置配置作为 preset 使用，模型参数可通过
 <code>--model-overrides.&lt;字段名&gt;</code> 覆盖。字段名与
-<code>DeepSeekV4Model.Config</code>、<code>MoEArgs</code> 保持一致，CLI 中仅将下划线转换为
-连字符：</p>
+各模型的 typed override schema 保持一致，CLI 中仅将下划线转换为连字符。
+DeepSeek-V4 字段详见
+<a href="../deepseek_v4_model_parameters/">DeepSeek-V4 模型参数目录</a>，Kimi K3 字段详见
+<a href="../kimi_k3_model_parameters/">Kimi K3 模型参数目录</a>。</p>
+<p>DeepSeek-V4 示例：</p>
 <pre><code class="language-bash">NGPU=8 python3 -m torchtitan_npu.entry \
     --module torchtitan_npu.simulator \
     --config deepseek_v4_smoketest \
@@ -409,18 +414,28 @@ python3 scripts/run_simulator_spawn.py \
     --model-overrides.moe-args.num-expert-groups 4 \
     --model-overrides.moe-args.num-limited-groups None
 </code></pre>
+<p>Kimi K3 示例：</p>
+<pre><code class="language-bash">NGPU=8 python3 -m torchtitan_npu.entry \
+    --module torchtitan_npu.simulator \
+    --config kimi_k3_smoketest \
+    --model-overrides.n-layers 3 \
+    --model-overrides.dim 192 \
+    --model-overrides.kda-layers 0 1 \
+    --model-overrides.num-experts 16 \
+    --model-overrides.router-top-k 4
+</code></pre>
 <p>布尔字段使用 <code>--model-overrides.&lt;字段名&gt;</code> 和
 <code>--model-overrides.no-&lt;字段名&gt;</code>；可空字段传 <code>None</code>。运行以下命令可查看
 当前版本支持的全部字段及所选 preset 的默认值：</p>
 <pre><code class="language-bash">python3 -m torchtitan_npu.entry \
     --module torchtitan_npu.simulator \
-    --config deepseek_v4_smoketest \
+    --config kimi_k3_smoketest \
     --help
 </code></pre>
-<p>配置解析阶段会检查正数范围、<code>compress_ratios</code> 与 <code>n_layers</code> 的长度、
-head/group 整除关系、RoPE head 维度、Hadamard 维度，以及 MoE 的
-<code>top_k</code>、专家数和专家分组关系。<code>compress_ratios</code> 不能少于 <code>n_layers</code>；
-减少层数时可以保留 preset 尾部的多余值，增加层数时必须补足。</p>
+<p>配置解析阶段会执行对应模型的正数范围和字段联动校验。DeepSeek-V4 会检查
+<code>compress_ratios</code>、RoPE/Hadamard 维度和 MoE 分组；Kimi K3 会检查
+KDA/MLA 维度、dense 前缀、KDA 层索引、LatentMoE 和专家分组。具体边界以
+上述两个模型参数目录为准。</p>
 <h3 id="5">5. 获取输出文件</h3>
 <p>仿真输出默认写入项目目录下的 <code>simulator_output/&lt;配置名&gt;/</code>。由于启动容器时已将项目目录挂载到 <code>/workspace</code>，输出文件会直接同步到宿主机，无需额外拷贝：</p>
 <pre><code class="language-bash"># 在宿主机上直接查看（无需进入容器）

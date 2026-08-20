@@ -1,0 +1,723 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" >
+<head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+      <link rel="shortcut icon" href="../../img/favicon.ico" />
+    <title>Kimi K3 模型参数 Web 字段目录 - torchtitan-npu</title>
+    <link rel="stylesheet" href="../../css/theme.css" />
+    <link rel="stylesheet" href="../../css/theme_extra.css" />
+        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/styles/github.min.css" />
+    
+      <script>
+        // Current page data
+        var mkdocs_page_name = "Kimi K3 \u6a21\u578b\u53c2\u6570 Web \u5b57\u6bb5\u76ee\u5f55";
+        var mkdocs_page_input_path = "user-guides/kimi_k3_model_parameters.md";
+        var mkdocs_page_url = null;
+      </script>
+    
+    <!--[if lt IE 9]>
+      <script src="../../js/html5shiv.min.js"></script>
+    <![endif]-->
+      <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/highlight.min.js"></script>
+      <script>hljs.highlightAll();</script> 
+</head>
+
+<body class="wy-body-for-nav" role="document">
+
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side stickynav">
+    <div class="wy-side-scroll">
+      <div class="wy-side-nav-search">
+          <a href="../.." class="icon icon-home"> torchtitan-npu
+        </a>
+      </div>
+
+      <div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <ul>
+                <li class="toctree-l1"><a class="reference internal" href="../..">Home</a>
+                </li>
+              </ul>
+              <ul>
+                <li class="toctree-l1"><a class="reference internal" href="../../lint_guide/">Lint 指南</a>
+                </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Community</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../community/contributors/">提交者与贡献者（Committers and Contributors）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../community/governance/">社区治理</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../community/versioning_policy/">版本策略</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Design</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/1f1b-schedule-plan-assembly-guide/">1F1B 完整依赖组装与 DES 回放实现指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/alltoall-capture-analysis/">all_to_all 通信捕获缺失分析</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/communication-ownership-contract/">Communication Ownership Contract</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/dualpipev-schedule-plan-consumer-guide/">DualPipeV SchedulePlan 下游接入指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/kimi_k3_fused_ops_readme/">Kimi K3 simulator fused-op README</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/l2-l3-schedule-plan-design/">L2/L3 调度 IR 重构设计：从扁平 trace 到结构化 SchedulePlan</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/low-precision-sim-analysis/">低精度训练（MXFP8）Simulator 使能分析</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/megatron-activation-memory-deepseek-v4/">Megatron Activation Estimate vs DeepSeek V4</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/optimizer-ops-analysis/">优化器算子捕获问题分析</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/pipeline-multi-graph-capture-design/">复杂 Pipeline 策略下完整计算图捕获方案设计</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/pp-l2-capture-architecture/">PP L2 Capture Architecture</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/schedule-capture-design/">L0-L3 IR 层级归属设计</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/schedule-plan-dependency-reconstruction-contract/">SchedulePlan 下游依赖重建契约</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/schedule-plan-des-consumer-guide/">SchedulePlan 依赖重建与 DES 消费指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../design/simulator-memory-model-design/">Simulator Memory Model 改造设计</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Feature guides</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/checkpoint/">Checkpoint 使用指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/deepseek_v32_mtp/">多Token预测特性(Multi Token Prediction, MTP)</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/low_precision_training/">低精度训练特性（MXFP8）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/metrics_and_debugging/">调试支持特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/model_custom/">Model Custom框架介绍</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/muon_optimizer/">Muon 优化器特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/new_model_onboarding/">新模型接入开发流程</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/npu_fused_ops/">NPU 融合算子适配</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/swap_optimizer/">SwapOptimizer 特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/torch_compile/">torch.compile 支持</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/virtual_optimizer/">Virtual Optimizer - 优化器显存虚拟化特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../feature_guides/vlm/">VLM NPU 支持</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" >Parallelism</a>
+    <ul>
+                <li class="toctree-l2"><a class="reference internal" href="../../feature_guides/parallelism/custom_cp/">自定义 Context Parallel 特性</a>
+                </li>
+    </ul>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Recipe</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../recipe/sft/">SFT 指令微调</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Superpowers</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" >Plans</a>
+    <ul>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/plans/2026-07-01-mhc-real-op-name-capture-implementation/">MHC Real-Op-Name Capture Implementation Plan</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/plans/2026-07-01-npu-simulator-implementation/">torchtitan_npu Simulator Implementation Plan</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/plans/2026-07-01-smla-real-op-name-capture-implementation/">SMLA Real-Op-Name Capture Implementation Plan</a>
+                </li>
+    </ul>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" >Specs</a>
+    <ul>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/specs/2026-07-01-mhc-real-op-name-capture-design/">MHC 真实算子名捕获 — 架构与方案设计（阶段一：MHC）</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/specs/2026-07-01-npu-simulator-design/">torchtitan_npu Simulator — 架构与方案设计</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../superpowers/specs/2026-07-01-smla-real-op-name-capture-design/">SMLA 真实算子名捕获 — 架构与方案设计（阶段二：SMLA）</a>
+                </li>
+    </ul>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Test guides</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../test_guides/model_acceptance/">新模型最终验收规范（Meta 模拟器）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../test_guides/test_design/">测试设计</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../test_guides/test_guide/">测试使用指南</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">User guides</span></p>
+              <ul class="current">
+                  <li class="toctree-l1"><a class="reference internal" href="../deepseek_v4_model_parameters/">DeepSeek-V4 模型参数 Web 字段目录</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../installation/">软件安装</a>
+                  </li>
+                  <li class="toctree-l1 current"><a class="reference internal current" href="#">Kimi K3 模型参数 Web 字段目录</a>
+    <ul class="current">
+    <li class="toctree-l2"><a class="reference internal" href="#cli">请求格式与 CLI 映射</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#_1">核心规模</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#gated-mla">Gated MLA</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#kda">KDA</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#dense-ffnmoe">Dense FFN、MoE 与路由</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#situ-glu">SiTU-GLU</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#_2">内部字段</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#preset">Preset 默认值</a>
+    </li>
+    <li class="toctree-l2"><a class="reference internal" href="#_3">上游最低联动与提交规则</a>
+    </li>
+    </ul>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../quickstart/">快速上手</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../simulator/">Simulator 使用指南</a>
+                  </li>
+              </ul>
+      </div>
+    </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap">
+      <nav class="wy-nav-top" role="navigation" aria-label="Mobile navigation menu">
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../..">torchtitan-npu</a>
+        
+      </nav>
+      <div class="wy-nav-content">
+        <div class="rst-content"><div role="navigation" aria-label="breadcrumbs navigation">
+  <ul class="wy-breadcrumbs">
+    <li><a href="../.." class="icon icon-home" aria-label="Docs"></a></li>
+          <li class="breadcrumb-item">User guides</li>
+      <li class="breadcrumb-item active">Kimi K3 模型参数 Web 字段目录</li>
+    <li class="wy-breadcrumbs-aside">
+    </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+            <div class="section" itemprop="articleBody">
+              
+                <h1 id="kimi-k3-web">Kimi K3 模型参数 Web 字段目录</h1>
+<p>本文档定义 Web 页面和上游服务可配置的 Kimi K3 <strong>模型参数</strong>。训练、并行、
+重计算、优化器、通信、检查点和 simulator 参数不在本文范围内。</p>
+<p>Kimi K3 的内部 <code>KimiK3Model.Config</code> 保存展开后的逐层 <code>layers[]</code>。该结构是
+派生结果，不适合作为公共接口。公共接口使用稳定的
+<code>KimiK3ModelOverrides</code> dataclass 一共包含 32 个字段，其中 <code>param_init</code> 是隐藏的
+内部字段。Web 实际可编辑和提交的是其余 31 个模型超参数；后端校验后统一重建
+每一层的 KDA/MLA 与 dense/MoE 配置。</p>
+<h2 id="cli">请求格式与 CLI 映射</h2>
+<p>Web 请求使用 snake_case：</p>
+<pre><code class="language-json">{
+  &quot;model_overrides&quot;: {
+    &quot;n_layers&quot;: 16,
+    &quot;dim&quot;: 4096,
+    &quot;kda_layers&quot;: [0, 1, 2, 4, 5, 6],
+    &quot;num_experts&quot;: 256,
+    &quot;router_top_k&quot;: 8
+  }
+}
+</code></pre>
+<p>CLI 保持同一层级，仅将下划线转换为连字符：</p>
+<pre><code class="language-text">model_overrides.n_layers -&gt; --model-overrides.n-layers
+model_overrides.router_top_k -&gt; --model-overrides.router-top-k
+</code></pre>
+<p>布尔字段使用 <code>--model-overrides.&lt;字段&gt;</code> / <code>--model-overrides.no-&lt;字段&gt;</code>；
+可空字段传 <code>None</code>；列表字段在一个参数名后传多个值：</p>
+<pre><code class="language-bash">python3 -m torchtitan_npu.entry \
+  --module torchtitan_npu.models.kimi_k3 \
+  --config kimi_k3_smoketest \
+  --model-overrides.n-layers 3 \
+  --model-overrides.kda-layers 0 1 \
+  --model-overrides.num-experts 16 \
+  --model-overrides.router-top-k 4
+</code></pre>
+<p>训练模块与 <code>torchtitan_npu.simulator</code> 使用完全相同的字段和校验规则。</p>
+<h2 id="_1">核心规模</h2>
+<table>
+<thead>
+<tr>
+<th>Web 字段</th>
+<th>English label</th>
+<th>中文名称</th>
+<th>类型</th>
+<th>展示</th>
+<th>规则与说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>model_overrides.vocab_size</code></td>
+<td>Vocabulary Size</td>
+<td>词表大小</td>
+<td><code>int</code></td>
+<td>基础</td>
+<td>大于 0；需匹配 tokenizer/checkpoint</td>
+</tr>
+<tr>
+<td><code>model_overrides.dim</code></td>
+<td>Hidden Dimension</td>
+<td>隐藏层维度</td>
+<td><code>int</code></td>
+<td>基础</td>
+<td>大于 0；同步作用于所有层</td>
+</tr>
+<tr>
+<td><code>model_overrides.n_layers</code></td>
+<td>Transformer Layers</td>
+<td>层数</td>
+<td><code>int</code></td>
+<td>基础</td>
+<td>大于 0；决定实际消费的 <code>kda_layers</code> 范围</td>
+</tr>
+<tr>
+<td><code>model_overrides.n_dense_layers</code></td>
+<td>Dense Prefix Layers</td>
+<td>Dense 前缀层数</td>
+<td><code>int</code></td>
+<td>基础</td>
+<td><code>0 &lt;= value &lt;= n_layers</code>；其余层为 MoE</td>
+</tr>
+<tr>
+<td><code>model_overrides.norm_eps</code></td>
+<td>RMSNorm Epsilon</td>
+<td>归一化 Epsilon</td>
+<td><code>float</code></td>
+<td>高级</td>
+<td>大于 0；同步作用于模型、attention 和 MoE</td>
+</tr>
+<tr>
+<td><code>model_overrides.attn_res_block_size</code></td>
+<td>Attention Residual Block Size</td>
+<td>Attention 残差块大小</td>
+<td><code>int \| null</code></td>
+<td>高级</td>
+<td><code>None</code> 关闭；否则大于 0</td>
+</tr>
+</tbody>
+</table>
+<h2 id="gated-mla">Gated MLA</h2>
+<table>
+<thead>
+<tr>
+<th>Web 字段</th>
+<th>English label</th>
+<th>中文名称</th>
+<th>类型</th>
+<th>展示</th>
+<th>规则与说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>model_overrides.n_heads</code></td>
+<td>Attention Heads</td>
+<td>注意力头数</td>
+<td><code>int</code></td>
+<td>基础</td>
+<td>大于 0；同时用于 KDA 和 MLA</td>
+</tr>
+<tr>
+<td><code>model_overrides.q_lora_rank</code></td>
+<td>Query LoRA Rank</td>
+<td>Query LoRA 秩</td>
+<td><code>int</code></td>
+<td>基础</td>
+<td>大于 0</td>
+</tr>
+<tr>
+<td><code>model_overrides.kv_lora_rank</code></td>
+<td>KV LoRA Rank</td>
+<td>KV LoRA 秩</td>
+<td><code>int</code></td>
+<td>基础</td>
+<td>大于 0</td>
+</tr>
+<tr>
+<td><code>model_overrides.qk_nope_head_dim</code></td>
+<td>QK NoPE Head Dimension</td>
+<td>非 RoPE QK 头维度</td>
+<td><code>int</code></td>
+<td>高级</td>
+<td>大于 0</td>
+</tr>
+<tr>
+<td><code>model_overrides.qk_rope_head_dim</code></td>
+<td>QK RoPE Head Dimension</td>
+<td>RoPE QK 头维度</td>
+<td><code>int</code></td>
+<td>高级</td>
+<td>大于 0</td>
+</tr>
+<tr>
+<td><code>model_overrides.v_head_dim</code></td>
+<td>Value Head Dimension</td>
+<td>Value 头维度</td>
+<td><code>int</code></td>
+<td>高级</td>
+<td>大于 0，且不超过两个 QK 维度之和</td>
+</tr>
+</tbody>
+</table>
+<h2 id="kda">KDA</h2>
+<table>
+<thead>
+<tr>
+<th>Web 字段</th>
+<th>English label</th>
+<th>中文名称</th>
+<th>类型</th>
+<th>展示</th>
+<th>规则与说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>model_overrides.kda_head_dim</code></td>
+<td>KDA Head Dimension</td>
+<td>KDA 头维度</td>
+<td><code>int</code></td>
+<td>基础</td>
+<td>大于 0</td>
+</tr>
+<tr>
+<td><code>model_overrides.kda_layers</code></td>
+<td>KDA Layer Indices</td>
+<td>KDA 层索引</td>
+<td><code>list[int]</code></td>
+<td>基础</td>
+<td>0-based、非负、不能重复；未列出的活动层使用 Gated MLA</td>
+</tr>
+<tr>
+<td><code>model_overrides.conv_kernel_size</code></td>
+<td>Short Convolution Kernel</td>
+<td>短卷积核大小</td>
+<td><code>int</code></td>
+<td>高级</td>
+<td>大于 0</td>
+</tr>
+<tr>
+<td><code>model_overrides.gate_lower_bound</code></td>
+<td>KDA Gate Lower Bound</td>
+<td>KDA 门控下界</td>
+<td><code>float \| null</code></td>
+<td>专家</td>
+<td><code>None</code> 表示不添加下界</td>
+</tr>
+<tr>
+<td><code>model_overrides.use_full_rank_gate</code></td>
+<td>Full-Rank Output Gate</td>
+<td>使用全秩输出门控</td>
+<td><code>bool</code></td>
+<td>高级</td>
+<td>关闭后使用低秩 gate 投影</td>
+</tr>
+</tbody>
+</table>
+<p><code>kda_layers</code> 可以保留大于等于 <code>n_layers</code> 的尾部索引，这些值不会被当前模型
+消费。因此从 93 层 preset 缩短层数时只改 <code>n_layers</code> 即可；增大层数时，上游
+必须确认新增层需要使用 KDA 还是 MLA，并相应更新列表。</p>
+<h2 id="dense-ffnmoe">Dense FFN、MoE 与路由</h2>
+<table>
+<thead>
+<tr>
+<th>Web 字段</th>
+<th>English label</th>
+<th>中文名称</th>
+<th>类型</th>
+<th>展示</th>
+<th>规则与说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>model_overrides.dense_hidden_dim</code></td>
+<td>Dense FFN Dimension</td>
+<td>Dense FFN 中间维度</td>
+<td><code>int</code></td>
+<td>基础</td>
+<td>大于 0</td>
+</tr>
+<tr>
+<td><code>model_overrides.moe_inter_dim</code></td>
+<td>Expert Intermediate Dimension</td>
+<td>专家中间维度</td>
+<td><code>int</code></td>
+<td>基础</td>
+<td>大于 0</td>
+</tr>
+<tr>
+<td><code>model_overrides.num_experts</code></td>
+<td>Routed Experts</td>
+<td>路由专家数</td>
+<td><code>int</code></td>
+<td>基础</td>
+<td>大于 0，且不小于 <code>router_top_k</code></td>
+</tr>
+<tr>
+<td><code>model_overrides.num_shared_experts</code></td>
+<td>Shared Experts</td>
+<td>共享专家数</td>
+<td><code>int</code></td>
+<td>基础</td>
+<td>大于等于 0；0 关闭共享专家</td>
+</tr>
+<tr>
+<td><code>model_overrides.router_top_k</code></td>
+<td>Experts per Token</td>
+<td>每 Token 激活专家数</td>
+<td><code>int</code></td>
+<td>基础</td>
+<td>大于 0，且不超过 <code>num_experts</code></td>
+</tr>
+<tr>
+<td><code>model_overrides.router_score_func</code></td>
+<td>Router Score Function</td>
+<td>路由评分函数</td>
+<td><code>enum</code></td>
+<td>高级</td>
+<td><code>sigmoid</code> 或 <code>softmax</code></td>
+</tr>
+<tr>
+<td><code>model_overrides.num_expert_groups</code></td>
+<td>Expert Groups</td>
+<td>专家分组数</td>
+<td><code>int</code></td>
+<td>高级</td>
+<td>大于 0，且整除 <code>num_experts</code></td>
+</tr>
+<tr>
+<td><code>model_overrides.topk_group</code></td>
+<td>Candidate Expert Groups</td>
+<td>候选专家组数</td>
+<td><code>int</code></td>
+<td>高级</td>
+<td>单组时必须为 1；启用多组时必须小于 <code>num_expert_groups</code></td>
+</tr>
+<tr>
+<td><code>model_overrides.routed_expert_hidden_size</code></td>
+<td>Latent MoE Hidden Size</td>
+<td>Latent MoE 隐藏维度</td>
+<td><code>int \| null</code></td>
+<td>基础</td>
+<td><code>None</code> 关闭 LatentMoE；否则大于 0</td>
+</tr>
+<tr>
+<td><code>model_overrides.latent_moe_use_norm</code></td>
+<td>Normalize Latent MoE Output</td>
+<td>LatentMoE 输出归一化</td>
+<td><code>bool</code></td>
+<td>高级</td>
+<td>仅 LatentMoE 开启时生效</td>
+</tr>
+<tr>
+<td><code>model_overrides.routed_scaling_factor</code></td>
+<td>Routed Output Scale</td>
+<td>路由输出缩放</td>
+<td><code>float</code></td>
+<td>高级</td>
+<td>大于 0</td>
+</tr>
+<tr>
+<td><code>model_overrides.renormalize</code></td>
+<td>Renormalize Top-K Weights</td>
+<td>归一化 Top-K 权重</td>
+<td><code>bool</code></td>
+<td>高级</td>
+<td>控制选中专家权重是否重新归一化</td>
+</tr>
+</tbody>
+</table>
+<p>多专家组还要求每组至少包含 2 个专家，并且被选中组内的专家总数不能小于
+<code>router_top_k</code>。<code>debug_force_load_balance</code> 不属于模型
+override；它由 <code>debug.moe_force_load_balance</code> 在运行时同步到每个 MoE 层。</p>
+<h2 id="situ-glu">SiTU-GLU</h2>
+<table>
+<thead>
+<tr>
+<th>Web 字段</th>
+<th>English label</th>
+<th>中文名称</th>
+<th>类型</th>
+<th>展示</th>
+<th>规则与说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>model_overrides.situ_beta</code></td>
+<td>SiTU Beta</td>
+<td>SiTU Beta</td>
+<td><code>float</code></td>
+<td>高级</td>
+<td>大于 0；Dense、共享专家和路由专家共用</td>
+</tr>
+<tr>
+<td><code>model_overrides.situ_linear_beta</code></td>
+<td>SiTU Linear Clamp</td>
+<td>SiTU 线性限幅</td>
+<td><code>float \| null</code></td>
+<td>高级</td>
+<td><code>None</code> 关闭；否则大于 0</td>
+</tr>
+</tbody>
+</table>
+<h2 id="_2">内部字段</h2>
+<table>
+<thead>
+<tr>
+<th>Web 字段</th>
+<th>English label</th>
+<th>中文名称</th>
+<th>类型</th>
+<th>展示</th>
+<th>规则与说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>model_overrides.param_init</code></td>
+<td>Parameter Initializers</td>
+<td>参数初始化器</td>
+<td><code>map \| null</code></td>
+<td>隐藏</td>
+<td>通常包含 Python callable，不适合作为 Web JSON；普通 Web 请求应省略该字段，后端保持 preset 的 <code>null</code> 值</td>
+</tr>
+</tbody>
+</table>
+<h2 id="preset">Preset 默认值</h2>
+<p>页面应先加载所选 config 返回的完整 <code>model_overrides</code>，再用它初始化表单；
+不要在前端复制默认值。当前三个模型 preset 的关键差异如下：</p>
+<table>
+<thead>
+<tr>
+<th>Preset/config</th>
+<th style="text-align: right;">Layers</th>
+<th style="text-align: right;">Dim</th>
+<th style="text-align: right;">Heads</th>
+<th style="text-align: right;">KDA/MLA</th>
+<th style="text-align: right;">Dense layers</th>
+<th style="text-align: right;">Experts</th>
+<th style="text-align: right;">Top-K</th>
+<th style="text-align: right;">Expert dim</th>
+<th style="text-align: right;">Latent dim</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>debug</code> / <code>kimi_k3_smoketest</code></td>
+<td style="text-align: right;">4</td>
+<td style="text-align: right;">256</td>
+<td style="text-align: right;">8</td>
+<td style="text-align: right;">3 / 1</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">8</td>
+<td style="text-align: right;">3</td>
+<td style="text-align: right;">128</td>
+<td style="text-align: right;">128</td>
+</tr>
+<tr>
+<td><code>16layer_reduced</code> / <code>kimi_k3_16layer_reduced</code></td>
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">7168</td>
+<td style="text-align: right;">96</td>
+<td style="text-align: right;">12 / 4</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">32</td>
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">3072</td>
+<td style="text-align: right;">3584</td>
+</tr>
+<tr>
+<td><code>full</code> / <code>kimi_k3_baseline_bf16</code>、<code>kimi_k3_baseline_mxfp8</code></td>
+<td style="text-align: right;">93</td>
+<td style="text-align: right;">7168</td>
+<td style="text-align: right;">96</td>
+<td style="text-align: right;">69 / 24</td>
+<td style="text-align: right;">1</td>
+<td style="text-align: right;">896</td>
+<td style="text-align: right;">16</td>
+<td style="text-align: right;">3072</td>
+<td style="text-align: right;">3584</td>
+</tr>
+</tbody>
+</table>
+<p>公共默认值为：<code>param_init=null</code>、<code>num_shared_experts=2</code>、<code>router_score_func="sigmoid"</code>、
+<code>num_expert_groups=1</code>、<code>topk_group=1</code>、<code>routed_scaling_factor=1.0</code>、
+<code>renormalize=true</code>、<code>situ_beta=4.0</code>、<code>situ_linear_beta=25.0</code>、
+<code>conv_kernel_size=4</code>、<code>gate_lower_bound=-5.0</code>、
+<code>use_full_rank_gate=true</code>、<code>norm_eps=1e-5</code>、<code>attn_res_block_size=12</code>。</p>
+<h2 id="_3">上游最低联动与提交规则</h2>
+<ol>
+<li>先选择 preset，并从后端读取完整 <code>model_overrides</code>。</li>
+<li>上游可以提交完整对象，也可以转换成 CLI 后只覆盖变化字段。</li>
+<li>修改 <code>n_layers</code> 时检查 dense 前缀范围，并检查新增层的 <code>kda_layers</code> 归属。</li>
+<li>修改 QK/V 维度时满足 <code>v_head_dim &lt;= qk_nope_head_dim + qk_rope_head_dim</code>。</li>
+<li>修改专家数时同时检查 Top-K、专家分组整除关系和每组专家数。</li>
+<li><code>routed_expert_hidden_size=None</code> 时建议隐藏 <code>latent_moe_use_norm</code>。</li>
+<li>后端始终执行最终类型与联动校验；前端校验不能替代后端校验。</li>
+</ol>
+<p>逐层 <code>layers[].layer_id</code>、attention 类型、dense/MoE 类型、各子配置中的
+<code>dim</code>/<code>norm_eps</code>/<code>attn_res_block_size</code>，以及 MoE 的
+<code>debug_force_load_balance</code> 都是派生字段，不应由上游直接提交。</p>
+              
+            </div>
+          </div><footer>
+    <div class="rst-footer-buttons" role="navigation" aria-label="Footer Navigation">
+        <a href="../installation/" class="btn btn-neutral float-left" title="软件安装"><span class="icon icon-circle-arrow-left"></span> Previous</a>
+        <a href="../quickstart/" class="btn btn-neutral float-right" title="快速上手">Next <span class="icon icon-circle-arrow-right"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <!-- Copyright etc -->
+  </div>
+
+  Built with <a href="https://www.mkdocs.org/">MkDocs</a> using a <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a> provided by <a href="https://readthedocs.org">Read the Docs</a>.
+</footer>
+          
+        </div>
+      </div>
+
+    </section>
+
+  </div>
+
+  <div class="rst-versions" role="note" aria-label="Versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    
+    
+      <span><a href="../installation/" style="color: #fcfcfc">&laquo; Previous</a></span>
+    
+    
+      <span><a href="../quickstart/" style="color: #fcfcfc">Next &raquo;</a></span>
+    
+  </span>
+</div>
+    <script src="../../js/jquery-3.6.0.min.js"></script>
+    <script>var base_url = "../..";</script>
+    <script src="../../js/theme_extra.js"></script>
+    <script src="../../js/theme.js"></script>
+    <script>
+        jQuery(function () {
+            SphinxRtdTheme.Navigation.enable(true);
+        });
+    </script>
+
+</body>
+</html>
