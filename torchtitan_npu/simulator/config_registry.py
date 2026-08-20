@@ -106,6 +106,104 @@ def deepseek_v4_smoketest() -> SimulationTrainerConfig:
 
 
 # ---------------------------------------------------------------------------
+# DeepSeek V3.2 simulator configs
+# ---------------------------------------------------------------------------
+
+from torchtitan_npu.models.deepseek_v32 import (  # noqa: E402
+    config_registry as _deepseek_v32_configs,
+)
+from torchtitan_npu.models.deepseek_v32.config_overrides import (  # noqa: E402
+    DeepSeekV32ModelOverrides,
+    apply_model_overrides as apply_deepseek_v32_model_overrides,
+)
+
+
+@dataclasses.dataclass(kw_only=True, slots=True)
+class DeepSeekV32SimulationTrainerConfig(SimulationTrainerConfig):
+    """DeepSeek V3.2 simulator config with stable model overrides."""
+
+    model_overrides: DeepSeekV32ModelOverrides = dataclasses.field(
+        default_factory=DeepSeekV32ModelOverrides
+    )
+
+    def __post_init__(self) -> None:
+        baseline_mtp = self.model_spec.model.num_mtp_modules
+        override_mtp = self.model_overrides.num_mtp_modules
+        training_mtp = self.training.num_mtp_modules
+        if override_mtp != baseline_mtp:
+            if training_mtp not in {baseline_mtp, override_mtp}:
+                raise ValueError(
+                    "model_overrides.num_mtp_modules conflicts with "
+                    "training.num_mtp_modules"
+                )
+            if training_mtp == baseline_mtp:
+                self.training.num_mtp_modules = override_mtp
+        self.model_spec = apply_deepseek_v32_model_overrides(
+            self.model_spec,
+            self.model_overrides,
+        )
+
+
+def _deepseek_v32_simulation_config(
+    factory: Callable[[], _deepseek_v32_configs.TrainerConfig],
+    *,
+    output_name: str,
+) -> DeepSeekV32SimulationTrainerConfig:
+    base_config = factory()
+    base_fields = {
+        field.name: getattr(base_config, field.name)
+        for field in dataclasses.fields(base_config)
+    }
+    base_fields["compile"] = dataclasses.replace(
+        base_config.compile,
+        enable=False,
+    )
+    return DeepSeekV32SimulationTrainerConfig(
+        **base_fields,
+        simulation=SimulationConfig(
+            output_dir=f"./simulator_output/{output_name}"
+        ),
+    )
+
+
+def deepseek_v32_smoketest() -> DeepSeekV32SimulationTrainerConfig:
+    return _deepseek_v32_simulation_config(
+        _deepseek_v32_configs.deepseek_v32_smoketest,
+        output_name="deepseek_v32_smoketest",
+    )
+
+
+def deepseek_v32_tp_smoketest() -> DeepSeekV32SimulationTrainerConfig:
+    return _deepseek_v32_simulation_config(
+        _deepseek_v32_configs.deepseek_v32_tp_smoketest,
+        output_name="deepseek_v32_tp_smoketest",
+    )
+
+
+def deepseek_v32_671b_4layers_debug() -> DeepSeekV32SimulationTrainerConfig:
+    return _deepseek_v32_simulation_config(
+        _deepseek_v32_configs.deepseek_v32_671b_4layers_debug,
+        output_name="deepseek_v32_671b_4layers_debug",
+    )
+
+
+def deepseek_v32_671b_61layers_4k_128die(
+) -> DeepSeekV32SimulationTrainerConfig:
+    return _deepseek_v32_simulation_config(
+        _deepseek_v32_configs.deepseek_v32_671b_61layers_4k_128die,
+        output_name="deepseek_v32_671b_61layers_4k_128die",
+    )
+
+
+def deepseek_v32_671b_61layers_32k_128die(
+) -> DeepSeekV32SimulationTrainerConfig:
+    return _deepseek_v32_simulation_config(
+        _deepseek_v32_configs.deepseek_v32_671b_61layers_32k_128die,
+        output_name="deepseek_v32_671b_61layers_32k_128die",
+    )
+
+
+# ---------------------------------------------------------------------------
 # Kimi K3 simulator configs
 # ---------------------------------------------------------------------------
 

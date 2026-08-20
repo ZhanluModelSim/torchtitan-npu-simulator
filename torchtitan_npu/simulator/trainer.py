@@ -31,6 +31,7 @@ from torchtitan_npu.simulator.capture.schedule_builder import (
 from torchtitan_npu.simulator.capture.step_boundary import StepBoundaryTracker, build_step_graphs
 from torchtitan_npu.simulator.capture.graph_normalization import fold_metadata_views
 from torchtitan_npu.simulator.capture.workload_builder import build_workload_graph
+from torchtitan_npu.simulator.hardware_shims.dsa_converter import apply_dsa_shims
 from torchtitan_npu.simulator.hardware_shims.kda_converter import (
     apply_kimi_k3_shims,
 )
@@ -484,6 +485,7 @@ class SimulationTrainer(Trainer):
         force_moe_load_balance(config)
         force_deterministic_seed(config)
         config.compile.enable = False  # tracing needs eager dispatch, not a compiled graph
+        apply_dsa_shims()
         apply_mhc_shims()
         apply_rms_norm_shims()
         apply_smla_shims()

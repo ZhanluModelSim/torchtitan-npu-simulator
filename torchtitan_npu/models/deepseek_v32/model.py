@@ -107,6 +107,19 @@ class DeepSeekV32ModelNpu(DeepSeekV3ModelNpu):
         # (e.g. ``model_args.layers[0].attention.<...>``).
         self.model_args = config
 
+    def _init_self_buffers(
+        self,
+        *,
+        buffer_device: torch.device | None = None,
+    ) -> None:
+        # The RoPE cache is already built and registered in __init__. The
+        # upstream decoder guard rejects a meta buffer_device because normal
+        # training should materialize buffers first, while simulator capture
+        # intentionally keeps the complete model on meta.
+        if buffer_device is not None and buffer_device.type == "meta":
+            return
+        super()._init_self_buffers(buffer_device=buffer_device)
+
     def forward(
         self,
         tokens: torch.Tensor,

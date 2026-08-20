@@ -145,9 +145,15 @@ def parallelize_deepseekv32(
         ({parallel_dims.tp}) and 2 * CP degree ({parallel_dims.cp}).
         """
 
-    assert parallel_dims.fsdp_enabled, (
-        "Mixed precision training for deepseek_v32 is only supported when fsdp is enabled. "
-    )
+    if (
+        not parallel_dims.fsdp_enabled
+        and training.mixed_precision_param != training.dtype
+    ):
+        raise ValueError(
+            "DeepSeek V3.2 mixed precision requires FSDP; use matching "
+            "training.dtype and training.mixed_precision_param for a "
+            "single-rank baseline"
+        )
 
     assert not (
         has_npu_converter(model_converters.converters, "npu_gmm")

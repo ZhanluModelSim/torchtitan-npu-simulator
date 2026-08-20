@@ -520,6 +520,27 @@ def _patch_swap_optimizer_get_device_info(stub: _MetaDeviceModule) -> None:
     swap_optimizer_mod.get_device_info = lambda: ("meta", stub)
 
 
+def _patch_torch_autocast_for_meta() -> None:
+    """Treat direct ``torch.autocast("meta")`` regions as no-ops.
+
+    Meta tensors have no numeric storage to cast, and PyTorch does not
+    register an autocast backend for the meta device. Some model code opens
+    autocast regions directly instead of using torchtitan's AMP helper.
+    """
+    key = ("torch", "autocast")
+    if key in _original_values:
+        return
+    original_autocast = torch.autocast
+    _original_values[key] = original_autocast
+
+    def _meta_safe_autocast(device_type, *args, **kwargs):  # noqa: ANN001, ANN202
+        if device_type == "meta":
+            return nullcontext()
+        return original_autocast(device_type, *args, **kwargs)
+
+    torch.autocast = _meta_safe_autocast
+
+
 def _patch_moe_dispatch_to_avoid_meta_tensor_value_reads() -> None:
     """`NpuExpertParallel._token_dispatch` (via `_compute_all_to_all_splits`)
     unconditionally calls `.to(torch.device("cpu"), ...)` then `.tolist()`
@@ -556,6 +577,28 @@ def _patch_moe_dispatch_to_avoid_meta_tensor_value_reads() -> None:
         import torchtitan_npu.converters.kernels.moe_dispatch as moe_dispatch_mod
     except Exception:  # best-effort guard: any failure here means "not available in this environment"
         return
+
+    gate_scores_key = (
+        "torchtitan_npu.converters.kernels.moe_dispatch",
+        "_local_gate_scores",
+    )
+    if gate_scores_key not in _original_values:
+        original_local_gate_scores = moe_dispatch_mod._local_gate_scores
+        _original_values[gate_scores_key] = original_local_gate_scores
+
+        def _meta_safe_local_gate_scores(router, x):  # noqa: ANN001, ANN202
+            if x.device.type != "meta":
+                return original_local_gate_scores(router, x)
+            gate = router.gate
+            gate_weight = gate.weight
+            gate_bias = getattr(gate, "bias", None)
+            if isinstance(gate_weight, moe_dispatch_mod.DTensor):
+                gate_weight = gate_weight.to_local()
+            if isinstance(gate_bias, moe_dispatch_mod.DTensor):
+                gate_bias = gate_bias.to_local()
+            return torch.nn.functional.linear(x, gate_weight, gate_bias)
+
+        moe_dispatch_mod._local_gate_scores = _meta_safe_local_gate_scores
 
     expert_parallel_cls = moe_dispatch_mod.NpuExpertParallel
     if _original_moe_token_dispatch is not _MISSING:
@@ -2979,6 +3022,7 @@ def patch_device_type_to_meta() -> None:
     _patch_swap_optimizer_get_device_info(stub)
     _patch_tensor_npu_method_to_meta()
     _patch_torch_full_npu_device_literal()
+    _patch_torch_autocast_for_meta()
     _patch_grouped_mm_offsets_dtype()
     _patch_moe_dispatch_to_avoid_meta_tensor_value_reads()
     _patch_parameter_dtensor_for_meta()

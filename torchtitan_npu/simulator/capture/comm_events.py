@@ -292,7 +292,10 @@ def _resolve_world_size(group: object) -> int:
         or str(group) == "default"
         or str(group_name) == "default"
     ):
-        return _resolve_world_size(active_context[1])
+        # Substitute once instead of recursing: fake DTensor may represent
+        # the logical group itself as a list/tuple, which also satisfies the
+        # condition above and would recurse forever.
+        group = active_context[1]
     if group is None:
         return dist.get_world_size() if dist.is_initialized() else 1
     # ProcessGroup
@@ -368,10 +371,15 @@ def _resolve_comm_ranks(group: object) -> list[list[int]]:
         or str(group) == "default"
         or str(group_name) == "default"
     ):
-        return _resolve_comm_ranks(active_context[1])
+        # Substitute once instead of recursing; the retained logical group
+        # can itself be a list/tuple under a FakeProcessGroup.
+        group = active_context[1]
     if group is None:
         ws = dist.get_world_size() if dist.is_initialized() else 1
         return [list(range(ws))] if ws > 1 else []
+    if isinstance(group, (list, tuple)):
+        ranks = [int(rank) for rank in group]
+        return [ranks] if len(ranks) > 1 else []
     # DeviceMesh: extract ranks from the mesh tensor
     if hasattr(group, "mesh") and hasattr(group, "ndm"):
         try:

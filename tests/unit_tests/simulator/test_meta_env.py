@@ -103,6 +103,19 @@ def test_patch_disables_amp_for_meta_and_restores_original():
     assert dist_utils.maybe_enable_amp is original
 
 
+def test_patch_makes_direct_meta_autocast_a_noop_and_restores_original():
+    original = torch.autocast
+    try:
+        patch_device_type_to_meta()
+        with torch.autocast("meta", dtype=torch.float32):
+            result = torch.empty(2, 3, device="meta") + 1
+        assert result.device.type == "meta"
+    finally:
+        unpatch_device_type_to_meta()
+
+    assert torch.autocast is original
+
+
 def test_patch_is_idempotent():
     import torchtitan.tools.utils as utils_mod
 

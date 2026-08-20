@@ -195,10 +195,11 @@ NGPU=384 python3 -m torchtitan_npu.entry \
 
 ### 4. 覆盖模型参数
 
-DeepSeek-V4 和 Kimi K3 的内置配置作为 preset 使用，模型参数可通过
+DeepSeek-V3.2、DeepSeek-V4 和 Kimi K3 的内置配置作为 preset 使用，模型参数可通过
 `--model-overrides.<字段名>` 覆盖。字段名与
 各模型的 typed override schema 保持一致，CLI 中仅将下划线转换为连字符。
-DeepSeek-V4 字段详见
+DeepSeek-V3.2 字段详见
+[DeepSeek-V3.2 模型参数目录](deepseek_v32_model_parameters.md)，DeepSeek-V4 字段详见
 [DeepSeek-V4 模型参数目录](deepseek_v4_model_parameters.md)，Kimi K3 字段详见
 [Kimi K3 模型参数目录](kimi_k3_model_parameters.md)。
 
@@ -230,6 +231,19 @@ NGPU=8 python3 -m torchtitan_npu.entry \
     --model-overrides.router-top-k 4
 ```
 
+DeepSeek-V3.2 示例：
+
+```bash
+NGPU=2 python3 -m torchtitan_npu.entry \
+    --module torchtitan_npu.simulator \
+    --config deepseek_v32_smoketest \
+    --model-overrides.n-layers 3 \
+    --model-overrides.dim 192 \
+    --model-overrides.n-heads 6 \
+    --model-overrides.num-experts 16 \
+    --model-overrides.router-top-k 4
+```
+
 布尔字段使用 `--model-overrides.<字段名>` 和
 `--model-overrides.no-<字段名>`；可空字段传 `None`。运行以下命令可查看
 当前版本支持的全部字段及所选 preset 的默认值：
@@ -241,10 +255,11 @@ python3 -m torchtitan_npu.entry \
     --help
 ```
 
-配置解析阶段会执行对应模型的正数范围和字段联动校验。DeepSeek-V4 会检查
+配置解析阶段会执行对应模型的正数范围和字段联动校验。DeepSeek-V3.2 会检查
+dense 前缀、DSA/Hadamard 维度、RoPE 和专家分组；DeepSeek-V4 会检查
 `compress_ratios`、RoPE/Hadamard 维度和 MoE 分组；Kimi K3 会检查
 KDA/MLA 维度、dense 前缀、KDA 层索引、LatentMoE 和专家分组。具体边界以
-上述两个模型参数目录为准。
+上述模型参数目录为准。
 
 ### 5. 获取输出文件
 
@@ -275,6 +290,11 @@ cat simulator_output/deepseek_v4_pro_61_layers/summary.txt
 
 | 配置函数名 | 模型 | 层数 | 并行策略 | world_size | 模式 | 说明 |
 |-----------|------|------|---------|------------|------|------|
+| `deepseek_v32_smoketest` | DeepSeek-V3.2 | 2 | 全部并行度为 1 | 运行时指定 | fake_backend | dense+MoE+DSA 单卡及矩阵基线 |
+| `deepseek_v32_tp_smoketest` | DeepSeek-V3.2 | 2 | TP=2，ATen MoE | 2 | fake_backend | 纯 TP 验证 |
+| `deepseek_v32_671b_4layers_debug` | DeepSeek-V3.2 | 4 | 复用训练配置 | 运行时指定 | 自动 | 4 层结构放大验证 |
+| `deepseek_v32_671b_61layers_4k_128die` | DeepSeek-V3.2 | 61 | TP=4/EP=64/FSDP=-1 | 128 | fake_backend | 4K 正式规格 |
+| `deepseek_v32_671b_61layers_32k_128die` | DeepSeek-V3.2 | 61 | TP=4/CP=8/EP=64/FSDP=-1 | 128 | fake_backend | 32K 正式规格 |
 | `deepseek_v4_pro_simulate_16_layers` | DeepSeek-V4-Pro | 16 | PP=1/TP=1/CP=1/EP=16 | 384 | fake_backend | 快速验证 |
 | `deepseek_v4_pro_simulate_16_layers_cp4` | DeepSeek-V4-Pro | 16 | PP=1/CP=4/EP=16 | 16 | fake_backend | CP 通信捕获验证 |
 | `deepseek_v4_pro_simulate_16_layers_pp4_cp4` | DeepSeek-V4-Pro | 16 | PP=4/CP=4/DP=4 | 64 | multi_proc_meta | PP+CP+FSDP 全通信捕获 |

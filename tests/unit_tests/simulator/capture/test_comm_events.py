@@ -13,7 +13,12 @@ import torch_npu
 from torch.distributed import _functional_collectives as funcol
 from torch.distributed.pipelining import schedules
 
-from torchtitan_npu.simulator.capture.comm_events import capture_fake_collectives
+from torchtitan_npu.simulator.capture.comm_events import (
+    _resolve_comm_ranks,
+    _resolve_world_size,
+    capture_fake_collectives,
+    default_collective_context,
+)
 from torchtitan_npu.simulator.capture.dispatch_capture import OpDispatchCapture
 from torchtitan_npu.simulator.capture.module_path import ModulePathTracker
 from torchtitan_npu.simulator.hardware_shims.grouped_experts_shim import (
@@ -52,6 +57,12 @@ def test_all_reduce_on_meta_tensor_is_noop_and_recorded():
     assert len(recorder.events) == 1
     assert recorder.events[0].comm_primitive == "allreduce"
     assert recorder.events[0].tensor_shape == (16, 16)
+
+
+def test_default_collective_context_accepts_rank_list_without_recursing():
+    with default_collective_context("tp", [0, 1]):
+        assert _resolve_world_size(None) == 2
+        assert _resolve_comm_ranks(None) == [[0, 1]]
 
 
 def test_all_gather_into_tensor_on_meta_is_noop_and_recorded():
