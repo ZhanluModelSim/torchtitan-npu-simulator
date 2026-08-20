@@ -7,8 +7,11 @@
 """Override: collect training traces with ``torch_npu.profiler``."""
 
 import os
+from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import cast
 
+import torch
 import torch_npu
 from torchtitan.config import derive, override
 from torchtitan.tools.logging import logger
@@ -18,7 +21,17 @@ from torchtitan.tools.profiler import Profiler
 class CANNProfiler(Profiler):
     @dataclass(kw_only=True, slots=True)
     class Config(Profiler.Config):
-        pass
+        profile_ranks: Sequence[int]
+        """Ranks to profile. ``[-1]`` profiles every rank."""
+
+        profile_with_memory: bool
+        """Whether to record memory events in the profiler trace."""
+
+        profile_with_stack: bool
+        """Whether to record Python/C++ stack information in the trace."""
+
+        enable_online_parse: bool
+        """Whether CANN should parse traces online via its trace handler."""
 
     def build_torch_profiler(
         self,
@@ -27,8 +40,17 @@ class CANNProfiler(Profiler):
         base_folder: str,
         leaf_folder: str,
     ):
-        cfg = self._config
+        cfg = cast("CANNProfiler.Config", self._config)
         if not cfg.enable_profiling:
+            return None
+
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        if -1 not in cfg.profile_ranks and rank not in cfg.profile_ranks:
+            logger.info(
+                "Profiling disabled for rank %d; configured profile_ranks=%s",
+                rank,
+                cfg.profile_ranks,
+            )
             return None
 
         trace_dir = os.path.join(base_folder, cfg.save_traces_folder)
@@ -37,7 +59,6 @@ class CANNProfiler(Profiler):
             cfg.profiler_warmup,
             cfg.profiler_active,
         )
-
         additional_params = {
             key: val
             for key, val in [
@@ -47,16 +68,13 @@ class CANNProfiler(Profiler):
             ]
             if val is not None
         }
-
         wait = profile_freq - (active + warmup)
-        assert wait >= 0, "profile_freq must be greater than or equal to warmup + active"
+        if wait < 0:
+            raise ValueError("profile_freq must be greater than or equal to warmup + active")
 
-        def _env_bool(name: str) -> bool:
-            return os.environ.get(name, "0") == "1"
-
-        profile_with_memory = _env_bool("TORCHTITAN_NPU_PROFILE_WITH_MEMORY")
-        profile_with_stack = _env_bool("TORCHTITAN_NPU_PROFILE_WITH_STACK")
-        enable_online_parse = _env_bool("TORCHTITAN_NPU_ENABLE_ONLINE_PARSE")
+        profile_with_memory = cfg.profile_with_memory
+        profile_with_stack = cfg.profile_with_stack
+        enable_online_parse = cfg.enable_online_parse
 
         # NPU profiling accepts only its TensorBoard handler or ``None``.
         if enable_online_parse:
@@ -101,5 +119,19 @@ class CANNProfiler(Profiler):
     target=Profiler.Config,
     description="CANN profiler using torch_npu.profiler with Ascend-specific options",
 )
-def cann(cfg: Profiler.Config) -> CANNProfiler.Config:
-    return derive(cfg, CANNProfiler.Config)
+def cann(
+    cfg: Profiler.Config,
+    *,
+    profile_ranks: Sequence[int] = (-1,),
+    profile_with_memory: bool = False,
+    profile_with_stack: bool = False,
+    enable_online_parse: bool = True,
+) -> CANNProfiler.Config:
+    return derive(
+        cfg,
+        CANNProfiler.Config,
+        profile_ranks=profile_ranks,
+        profile_with_memory=profile_with_memory,
+        profile_with_stack=profile_with_stack,
+        enable_online_parse=enable_online_parse,
+    )

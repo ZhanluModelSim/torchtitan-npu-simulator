@@ -16,6 +16,12 @@
 #   PATTERN_IMPORTS=torchtitan_npu.compile.patterns.deepseek_v4.inplace_partial_rope \
 #   COMPILE_BACKEND=inductor ./scripts/run_train.sh
 #
+# Profiling is off by default (--profiler.no-enable-profiling); enable it
+# explicitly with ENABLE_PROFILING=1 (optionally combined with the
+# PROFILE_START/PROFILE_END window below):
+#
+#   ENABLE_PROFILING=1 PROFILE_START=5 PROFILE_END=6 ./scripts/run_train.sh
+#
 # Keep GOLDEN_OVERRIDES unchanged. Edit TEST_OVERRIDES for the implementation
 # under test.
 #
@@ -90,6 +96,10 @@ else
     OVERRIDE_IMPORTS=("${TEST_OVERRIDES[@]}")
 fi
 
+if [ -n "${PROFILER_OVERRIDE:-}" ]; then
+    OVERRIDE_IMPORTS+=("${PROFILER_OVERRIDE}")
+fi
+
 # ``--override.imports`` is a single tyro nargs="*" flag: repeated flags do
 # NOT append (only the last one survives).  One flag carries all targets —
 # the plain ones comma-joined into a single token, the kwargs target (the
@@ -115,6 +125,45 @@ ARGS=(
     --dataloader.dataset-path "${DATASET_PATH:-tests/assets/c4_test}"
     --override.imports "${_override_tokens[@]}"
 )
+
+# An absolute profiling window is expressed with TorchTitan's native profiler
+# schedule.  For example, PROFILE_START=5 PROFILE_END=6 PROFILE_WARMUP=3
+# becomes skip_first=1, warmup=3, active=1, repeat=1.  The CANN override only
+# supplies CANN-specific options; it does not need a second step scheduler.
+ENABLE_PROFILING=${ENABLE_PROFILING:-0}
+if [ "${ENABLE_PROFILING}" = "1" ]; then
+    ARGS+=(--profiler.enable-profiling)
+else
+    ARGS+=(--profiler.no-enable-profiling)
+fi
+
+if [ -n "${PROFILE_START:-}" ] || [ -n "${PROFILE_END:-}" ]; then
+    if [[ ! "${PROFILE_START:-}" =~ ^[1-9][0-9]*$ ]] || [[ ! "${PROFILE_END:-}" =~ ^[1-9][0-9]*$ ]]; then
+        echo "PROFILE_START and PROFILE_END must be positive integers" >&2
+        exit 2
+    fi
+    PROFILE_WARMUP=${PROFILE_WARMUP:-3}
+    if [[ ! "${PROFILE_WARMUP}" =~ ^[0-9]+$ ]]; then
+        echo "PROFILE_WARMUP must be a non-negative integer" >&2
+        exit 2
+    fi
+    if [ "${PROFILE_END}" -le "${PROFILE_START}" ]; then
+        echo "PROFILE_END must be greater than PROFILE_START" >&2
+        exit 2
+    fi
+
+    PROFILE_SKIP_FIRST=$(( PROFILE_START > PROFILE_WARMUP ? PROFILE_START - PROFILE_WARMUP - 1 : 0 ))
+    PROFILE_WARMUP_STEPS=$(( PROFILE_START - 1 - PROFILE_SKIP_FIRST ))
+    PROFILE_ACTIVE=$(( PROFILE_END - PROFILE_START ))
+    PROFILE_FREQ=$(( PROFILE_WARMUP_STEPS + PROFILE_ACTIVE ))
+    ARGS+=(
+        --profiler.profile-freq "${PROFILE_FREQ}"
+        --profiler.profiler-warmup "${PROFILE_WARMUP_STEPS}"
+        --profiler.profiler-active "${PROFILE_ACTIVE}"
+        --profiler.profiler-repeat 1
+        --profiler.profiler-skip-first "${PROFILE_SKIP_FIRST}"
+    )
+fi
 
 if [ -n "${COMPILE_BACKEND:-}" ]; then
     ARGS+=(
