@@ -14,7 +14,9 @@ pytest "$BASE/test_training.py" -s -v
 pytest "$BASE/wrapper_tensors/test_param_swap_transform.py" -s -v
 pytest "$BASE/wrapper_tensors/test_wrapper_tensor.py" -s -v
 pytest "$BASE/wrapper_tensors/test_wrapper_ops.py" -s -v
+pytest "$BASE/wrapper_tensors/test_hif8_wrapper_tensor.py" -s -v
 pytest "$BASE/ops/test_mx_ops.py" -s -v
 pytest "$BASE/ops/test_block_ops.py" -s -v
+pytest "$BASE/ops/test_hif8_ops.py" -s -v
 
 echo "all tests successful"

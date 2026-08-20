@@ -9,6 +9,10 @@ from .block_ops import (
     to_block_fp8_then_mm,
 )
 from .float8_ops import float8_rowwise_fake_quantize
+from .hif8_ops import (
+    to_hif8_then_grouped_mm,
+    to_hif8_then_mm,
+)
 from .mx_ops import (
     mxfp4_fake_quantize,
     to_mx_then_bmm,
@@ -22,6 +26,8 @@ __all__ = [
     "to_block_fp8_then_bmm",
     "to_block_fp8_then_grouped_mm",
     "to_block_fp8_then_mm",
+    "to_hif8_then_grouped_mm",
+    "to_hif8_then_mm",
     "to_mx_then_bmm",
     "to_mx_then_grouped_mm",
     "to_mx_then_mm",

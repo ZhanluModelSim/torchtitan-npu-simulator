@@ -77,26 +77,26 @@ def test_config_infer_from_base_config(base_config, expected_weight_config, expe
 
 
 def test_config_rejects_invalid_weight_config():
-    """Invalid (non-FP8, non-NPU-MX) weight configs should be rejected."""
+    """Invalid (non-FP8, non-NPU-MX, non-NPU-Block, non-NPU-HiF8) weight configs should be rejected."""
     intx_config = IntxFakeQuantizeConfig(torch.int8, "per_channel")
     with pytest.raises(
         ValueError,
         match=(
-            r"^Only `Float8FakeQuantizeConfig`, `MXQuantizeConfig`, or `BlockQuantizeConfig` "
-            r"is supported for `weight_config` in ParamSwapConfig yet\.$"
+            r"^Only `Float8FakeQuantizeConfig`, `MXQuantizeConfig`, `BlockQuantizeConfig`, or "
+            r"`HiF8QuantizeConfig` is supported for `weight_config` in ParamSwapConfig yet\.$"
         ),
     ):
         ParamSwapConfig(weight_config=intx_config, step="prepare")
 
 
 def test_config_rejects_invalid_activation_config():
-    """Invalid (non-FP8, non-NPU-MX) activation configs should be rejected."""
+    """Invalid (non-FP8, non-NPU-MX, non-NPU-HiF8) activation configs should be rejected."""
     weight_config = Float8FakeQuantizeConfig(dtype=torch.float8_e4m3fn, granularity=PerRow())
     activation_config = IntxFakeQuantizeConfig(torch.int8, "per_channel")
     with pytest.raises(
         ValueError,
         match=(
-            r"^Only `Float8FakeQuantizeConfig` or `MXQuantizeConfig` is supported for "
+            r"^Only `Float8FakeQuantizeConfig`, `MXQuantizeConfig`, or `HiF8QuantizeConfig` is supported for "
             r"`activation_config` in ParamSwapConfig yet\.$"
         ),
     ):

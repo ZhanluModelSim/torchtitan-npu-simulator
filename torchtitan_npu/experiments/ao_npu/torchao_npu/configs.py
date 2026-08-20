@@ -18,6 +18,7 @@ from torchao.quantization.transform_module import register_quantize_module_handl
 from .quantization.filters import ParameterFilterFn, _is_parameter, _is_parameter_with_wrapped_data
 from .quantization.quant_configs import (
     BlockQuantizeConfig,
+    HiF8QuantizeConfig,
     MXQuantizeConfig,
 )
 from .quantization.transform import (
@@ -50,8 +51,10 @@ class ParamSwapConfig(QATConfig):
     (:class:`~torchao.quantization.qat.fake_quantize_config.Float8FakeQuantizeConfig`),
     NPU MX block-wise
     (:class:`~torchtitan_npu.experiments.ao_npu.torchao_npu.quantization.quant_configs.MXQuantizeConfig`),
-    and NPU Block FP8
-    (:class:`~torchtitan_npu.experiments.ao_npu.torchao_npu.quantization.quant_configs.BlockQuantizeConfig`).
+    NPU Block FP8
+    (:class:`~torchtitan_npu.experiments.ao_npu.torchao_npu.quantization.quant_configs.BlockQuantizeConfig`),
+    and NPU HiF8 per-tensor
+    (:class:`~torchtitan_npu.experiments.ao_npu.torchao_npu.quantization.quant_configs.HiF8QuantizeConfig`).
     """
 
     def __init__(
@@ -69,18 +72,18 @@ class ParamSwapConfig(QATConfig):
     def __post_init__(self):
         torch._C._log_api_usage_once("torchao.prototype.param_swap.ParamSwapConfig")
         if self.activation_config is not None and not isinstance(
-            self.activation_config, (Float8FakeQuantizeConfig, MXQuantizeConfig)
+            self.activation_config, Float8FakeQuantizeConfig | MXQuantizeConfig | HiF8QuantizeConfig
         ):
             raise ValueError(
-                "Only `Float8FakeQuantizeConfig` or `MXQuantizeConfig` "
+                "Only `Float8FakeQuantizeConfig`, `MXQuantizeConfig`, or `HiF8QuantizeConfig` "
                 "is supported for `activation_config` in ParamSwapConfig yet."
             )
         if self.weight_config is not None and not isinstance(
-            self.weight_config, (Float8FakeQuantizeConfig, MXQuantizeConfig, BlockQuantizeConfig)
+            self.weight_config, Float8FakeQuantizeConfig | MXQuantizeConfig | BlockQuantizeConfig | HiF8QuantizeConfig
         ):
             raise ValueError(
-                "Only `Float8FakeQuantizeConfig`, `MXQuantizeConfig`, or `BlockQuantizeConfig` "
-                "is supported for `weight_config` in ParamSwapConfig yet."
+                "Only `Float8FakeQuantizeConfig`, `MXQuantizeConfig`, `BlockQuantizeConfig`, or "
+                "`HiF8QuantizeConfig` is supported for `weight_config` in ParamSwapConfig yet."
             )
 
         super().__post_init__()

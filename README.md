@@ -29,6 +29,7 @@ SIG 例会：[sig-framework-adapter](https://meeting.osinfra.cn/cann?sig=sig-fra
 # 最新消息
 
 ---
+- [Aug. 2026]: 🚀 **支持 HiFloat8（HiF8）低精度训练**：新增 per-tensor 动态量化的 HiF8 训练后端，覆盖 Linear 与 MoE 专家层，在 Ascend 950 NPU 上进一步提升 DeepSeek-V4 等大模型的训练吞吐。
 - [May. 2026]: 🚀 **[DeepSeek-V4-Pro 模型续训练支持](https://gitcode.com/cann/cann-recipes-train/blob/master/llm_pretrain/deepseekv4/README.md)**：基于纯FSDP + 大EP极简切分，使能AutoFuse特性，达成训练入图。
 - [May. 2026]: ⚠️ **配置系统重构**：master 分支对齐 torchtitan main 的 `config_registry.py` / `ConfigManager` 机制，模型训练使用 `--module` 和 `--config` 启动，不再通过 `--job.config_file` 加载 TOML。
 - [Apr. 2026]: 🚀 **[DeepSeek-V4-Flash 续训练 0day 支持](https://gitcode.com/cann/cann-recipes-train/blob/master/llm_pretrain/deepseekv4/README.md)**：基于纯FSDP + 大EP极简切分，使能AutoFuse特性，达成训练入图，开箱即优。
@@ -104,9 +105,14 @@ pip install -e .
     </tr>
     <!-- 训练精度 -->
     <tr>
-      <td rowspan="2">训练精度</td>
+      <td rowspan="3">训练精度</td>
       <td><a href="https://gitcode.com/cann/torchtitan-npu/blob/master/docs/feature_guides/low_precision_training.md">MxFP8 量化</a></td>
       <td>✅</td>
+      <td>✅ (Ascend 950)</td>
+    </tr>
+    <tr>
+      <td><a href="https://gitcode.com/cann/torchtitan-npu/blob/master/docs/feature_guides/low_precision_training.md">HiFloat8 量化</a></td>
+      <td>❌</td>
       <td>✅ (Ascend 950)</td>
     </tr>
     <tr>

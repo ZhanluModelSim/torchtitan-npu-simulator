@@ -6,11 +6,13 @@
 from .base_wrapper_tensor import BaseTrainingWeightWrapperTensor
 from .block_wrapper_tensor import BlockTrainingWeightWrapperTensor
 from .float8_wrapper_tensor import Float8TrainingWeightWrapperTensor
+from .hif8_wrapper_tensor import HiF8TrainingWeightWrapperTensor
 from .mx_wrapper_tensor import MXTrainingWeightWrapperTensor
 
 __all__ = [
     "BaseTrainingWeightWrapperTensor",
     "BlockTrainingWeightWrapperTensor",
     "Float8TrainingWeightWrapperTensor",
+    "HiF8TrainingWeightWrapperTensor",
     "MXTrainingWeightWrapperTensor",
 ]

@@ -12,6 +12,7 @@ by both training-time wrapper tensors and future PTQ algorithms.
 from dataclasses import dataclass, field
 
 import torch
+import torch_npu
 from torchao.quantization.qat.fake_quantize_config import FakeQuantizeConfigBase
 
 NPU_SUPPORTED_ELEM_DTYPES = [
@@ -102,3 +103,24 @@ class BlockQuantizeConfig(FakeQuantizeConfigBase):
                 f"mxfp4_fake_quantize_config.elem_dtype must be FP4 (torch.float4_e2m1fn_x2), "
                 f"got {self.mxfp4_fake_quantize_config.elem_dtype}"
             )
+
+
+@dataclass
+class HiF8QuantizeConfig(FakeQuantizeConfigBase):
+    """
+    Config for HiF8 (``torch_npu.hifloat8``) per-tensor low-precision training.
+
+    Unlike :class:`MXQuantizeConfig`/:class:`BlockQuantizeConfig`, the underlying
+    kernel (``torch_npu.npu_dynamic_quant(..., quant_mode="pertensor")``) has no
+    block size, rounding mode, or scale-algorithm knobs -- the whole tensor gets
+    one dynamically-computed scalar scale. ``elem_dtype`` is kept as a field only
+    for symmetry with the other configs and interface uniformity; it is locked to
+    ``torch_npu.hifloat8``, the only dtype the kernel supports.
+    """
+
+    elem_dtype: torch.dtype = torch_npu.hifloat8
+
+    def __post_init__(self):
+        assert self.elem_dtype == torch_npu.hifloat8, (
+            f"For HiF8, elem_dtype must be torch_npu.hifloat8, got {self.elem_dtype}"
+        )
