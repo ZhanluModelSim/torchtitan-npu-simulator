@@ -48,6 +48,26 @@ logger = logging.getLogger()
 _NORM_INIT = {"weight": nn.init.ones_}
 
 
+class UnitScaleRMSNorm(RMSNorm):
+    """RMSNorm with a fixed unit scale that is excluded from checkpoints."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(RMSNorm.Config):
+        elementwise_affine: bool = field(default=False, init=False)
+
+    def __init__(self, config: Config) -> None:
+        super().__init__(config)
+        # nn.RMSNorm registers ``weight=None`` when affine is disabled. Keep a
+        # real Tensor under the same name so the NPU RMSNorm converter can pass
+        # it as gamma without introducing a trainable or checkpointed weight.
+        del self.weight
+        self.register_buffer(
+            "weight",
+            torch.empty(config.normalized_shape),
+            persistent=False,
+        )
+
+
 def _apply_rotary_emb_single(
     x: torch.Tensor,
     freqs_cis: torch.Tensor,
@@ -727,6 +747,7 @@ class PreAttention(Module):
             out_features=self.n_heads * self.head_dim,
             bias=False,
         ).build()
+        self.q_head_norm = UnitScaleRMSNorm.Config(normalized_shape=self.head_dim, eps=self.eps).build()
         self.wkv = Linear.Config(
             in_features=args.dim,
             out_features=self.head_dim,
@@ -755,7 +776,7 @@ class PreAttention(Module):
         # Q projection
         qr = q = self.q_norm(self.wq_a(x))
         q = self.wq_b(q).unflatten(-1, (self.n_heads, self.head_dim))
-        q = q * torch.rsqrt(q.square().mean(-1, keepdim=True) + self.eps)
+        q = self.q_head_norm(q)
         q = apply_partial_rotary_emb_(
             q,
             freqs_cis,
@@ -810,6 +831,8 @@ class PreAttention(Module):
         if hasattr(self, "kv_norm"):
             nn.init.trunc_normal_(self.kv_norm.weight, mean=1, std=0.02)
         nn.init.trunc_normal_(self.q_norm.weight, mean=1, std=0.02)
+        assert self.q_head_norm.weight is not None
+        nn.init.ones_(self.q_head_norm.weight)
         if self.compress_ratio == 4:
             self.indexer.init_weights(init_std)
             self.compressor.init_weights(init_std)

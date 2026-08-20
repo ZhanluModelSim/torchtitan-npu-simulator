@@ -132,6 +132,7 @@ class DeepSeekV4TNDTest(unittest.TestCase):
         pre_attention.wq_a = torch.nn.Identity()
         pre_attention.q_norm = torch.nn.Identity()
         pre_attention.wq_b = torch.nn.Identity()
+        pre_attention.q_head_norm = torch.nn.Identity()
         pre_attention.wkv = torch.nn.Identity()
         pre_attention.kv_norm = torch.nn.Identity()
         pre_attention.compressor = RecordingCompressor()
