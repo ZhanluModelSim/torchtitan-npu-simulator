@@ -3,7 +3,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Thin simulator wrappers around the DeepSeek-V4 training configs."""
+"""Thin simulator wrappers around production model training configs."""
 
 from __future__ import annotations
 
@@ -110,15 +110,26 @@ def deepseek_v4_smoketest() -> SimulationTrainerConfig:
 # ---------------------------------------------------------------------------
 
 from torchtitan_npu.models.kimi_k3 import config_registry as _kimi_k3_configs  # noqa: E402
+from torchtitan_npu.models.kimi_k3.config_overrides import (  # noqa: E402
+    KimiK3ModelOverrides,
+    apply_model_overrides as apply_kimi_k3_model_overrides,
+)
 
 
 @dataclasses.dataclass(kw_only=True, slots=True)
 class KimiK3SimulationTrainerConfig(SimulationTrainerConfig):
-    """Kimi K3 simulator config with an optional MXFP8 target-FQN override."""
+    """Kimi K3 simulator config with stable model and MXFP8 CLI overrides."""
 
+    model_overrides: KimiK3ModelOverrides = dataclasses.field(
+        default_factory=KimiK3ModelOverrides
+    )
     mxfp8_fqns: list[str] | None = None
 
     def __post_init__(self) -> None:
+        self.model_spec = apply_kimi_k3_model_overrides(
+            self.model_spec,
+            self.model_overrides,
+        )
         _kimi_k3_configs._apply_mxfp8_fqns_override(
             self.model_converters,
             self.mxfp8_fqns,

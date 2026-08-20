@@ -30,15 +30,27 @@ from torchtitan_npu.config.configs import (
 from torchtitan_npu.converters import get_model_converter_config
 
 from . import model_registry
+from .config_overrides import (
+    KimiK3ModelOverrides,
+    apply_model_overrides,
+    build_model_spec_with_overrides,
+)
 
 
 @dataclass(kw_only=True, slots=True)
 class TrainerConfig(NpuTrainerConfig):
-    """Kimi K3 config with an optional MXFP8 target-FQN override."""
+    """Kimi K3 config with stable model and MXFP8 CLI overrides."""
 
+    model_overrides: KimiK3ModelOverrides = field(
+        default_factory=KimiK3ModelOverrides
+    )
     mxfp8_fqns: list[str] | None = field(default=None)
 
     def __post_init__(self) -> None:
+        self.model_spec = apply_model_overrides(
+            self.model_spec,
+            self.model_overrides,
+        )
         _apply_mxfp8_fqns_override(self.model_converters, self.mxfp8_fqns)
 
 
@@ -107,9 +119,13 @@ def _trainer_config(
     enable_mxfp8: bool,
     print_config: bool,
 ) -> TrainerConfig:
+    model_spec, model_overrides = build_model_spec_with_overrides(
+        model_registry(flavor)
+    )
     return TrainerConfig(
         hf_assets_path="./tests/assets/tokenizer/deepseekv3_tokenizer",
-        model_spec=model_registry(flavor),
+        model_spec=model_spec,
+        model_overrides=model_overrides,
         debug=DebugConfig(print_config=print_config),
         comm=CommConfig(trace_buf_size=0),
         model_converters=ModelConvertersContainer.Config(

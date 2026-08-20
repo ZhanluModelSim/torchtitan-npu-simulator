@@ -5,6 +5,7 @@
 
 """Unit tests for Kimi K3 model: config registry, model instantiation, forward pass."""
 
+import dataclasses
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -30,6 +31,150 @@ def _stub_kda_kernel(monkeypatch):
 
 
 class TestModelRegistry:
+    def test_model_override_schema_is_stable(self):
+        from torchtitan_npu.models.kimi_k3.config_overrides import (
+            KimiK3ModelOverrides,
+        )
+
+        assert {
+            field.name for field in dataclasses.fields(KimiK3ModelOverrides)
+        } == {
+            "param_init",
+            "vocab_size",
+            "dim",
+            "n_layers",
+            "n_dense_layers",
+            "n_heads",
+            "q_lora_rank",
+            "kv_lora_rank",
+            "qk_nope_head_dim",
+            "qk_rope_head_dim",
+            "v_head_dim",
+            "kda_head_dim",
+            "kda_layers",
+            "conv_kernel_size",
+            "gate_lower_bound",
+            "use_full_rank_gate",
+            "dense_hidden_dim",
+            "moe_inter_dim",
+            "num_experts",
+            "num_shared_experts",
+            "router_top_k",
+            "router_score_func",
+            "num_expert_groups",
+            "topk_group",
+            "routed_expert_hidden_size",
+            "latent_moe_use_norm",
+            "routed_scaling_factor",
+            "renormalize",
+            "situ_beta",
+            "situ_linear_beta",
+            "norm_eps",
+            "attn_res_block_size",
+        }
+
+    @pytest.mark.parametrize("flavor", ("debug", "16layer_reduced", "full"))
+    def test_model_overrides_round_trip_registered_presets(self, flavor):
+        from torchtitan_npu.models.kimi_k3 import model_registry
+        from torchtitan_npu.models.kimi_k3.config_overrides import (
+            KimiK3ModelOverrides,
+        )
+
+        original = model_registry(flavor).model
+        overrides = KimiK3ModelOverrides.from_model_config(original)
+        rebuilt = overrides.to_model_config()
+
+        assert dataclasses.asdict(rebuilt) == dataclasses.asdict(original)
+
+    @pytest.mark.parametrize(
+        "module",
+        ("torchtitan_npu.models.kimi_k3", "torchtitan_npu.simulator"),
+    )
+    def test_model_overrides_cli_rebuilds_kimi_layers(self, module):
+        from torchtitan.config import ConfigManager
+
+        from torchtitan_npu.models.kimi_k3.attention import (
+            KimiDeltaAttention,
+            KimiGatedMLA,
+        )
+
+        config = ConfigManager().parse_args(
+            [
+                "--module",
+                module,
+                "--config",
+                "kimi_k3_smoketest",
+                "--model-overrides.n-layers",
+                "3",
+                "--model-overrides.dim",
+                "192",
+                "--model-overrides.kda-layers",
+                "0",
+                "1",
+                "--model-overrides.num-experts",
+                "16",
+                "--model-overrides.router-top-k",
+                "4",
+                "--model-overrides.num-expert-groups",
+                "4",
+                "--model-overrides.topk-group",
+                "2",
+                "--model-overrides.no-latent-moe-use-norm",
+            ]
+        )
+
+        model = config.model_spec.model
+        assert model.dim == 192
+        assert len(model.layers) == 3
+        assert isinstance(model.layers[0].attention, KimiDeltaAttention.Config)
+        assert isinstance(model.layers[1].attention, KimiDeltaAttention.Config)
+        assert isinstance(model.layers[2].attention, KimiGatedMLA.Config)
+        assert model.layers[1].moe.num_experts == 16
+        assert model.layers[1].moe.top_k == 4
+        assert model.layers[1].moe.num_expert_groups == 4
+        assert model.layers[1].moe.topk_group == 2
+        assert model.layers[1].moe.latent_moe_use_norm is False
+
+    @pytest.mark.parametrize(
+        ("args", "message"),
+        (
+            (
+                ["--model-overrides.router-top-k", "9"],
+                "router_top_k must be <= num_experts",
+            ),
+            (
+                ["--model-overrides.v-head-dim", "33"],
+                "v_head_dim must be <=",
+            ),
+            (
+                ["--model-overrides.kda-layers", "0", "-1"],
+                "kda_layers values must be >= 0",
+            ),
+            (
+                [
+                    "--model-overrides.num-expert-groups",
+                    "4",
+                    "--model-overrides.topk-group",
+                    "1",
+                ],
+                "router_top_k must not exceed the number of experts",
+            ),
+        ),
+    )
+    def test_model_overrides_validate_before_run(self, args, message):
+        from torchtitan.config import ConfigManager
+
+        with pytest.raises(ValueError, match=message):
+            ConfigManager().parse_args(
+                [
+                    "--module",
+                    "torchtitan_npu.models.kimi_k3",
+                    "--config",
+                    "kimi_k3_smoketest",
+                    *args,
+                ]
+            )
+
     def test_baseline_uses_only_fsdp_and_ep_parallelism(self):
         from torchtitan_npu.models.kimi_k3.config_registry import (
             kimi_k3_baseline_bf16,
