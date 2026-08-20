@@ -611,7 +611,9 @@ class AscCompressedSparseInnerAttention(CompressedSparseInnerAttention):
         TND stream (``[T_cmp, 1, D]``)."""
         asm = plan.cmp_k_global_gather_indices
         flat = container.flatten(0, 1)
-        return (flat[asm] if asm is not None else flat[: plan.cu_seqlens_cmp_k[-1]]).unsqueeze(1).contiguous()
+        if asm is not None:
+            return flat[asm].unsqueeze(1).contiguous()
+        return flat[: plan.n_cmp_blocks_host].unsqueeze(1).contiguous()
 
     def forward(
         self,

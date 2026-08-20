@@ -87,6 +87,11 @@ class CompressedBlockLayout:
     ``[n_seqs + 1]``.  Entry ``i`` is the global start index of sequence
     ``i``'s compressed blocks.  ``None`` for ratio-1 plans."""
 
+    n_cmp_blocks_host: int | None = None
+    """Host-cached ``cu_seqlens_cmp_k[-1]`` (total compressed blocks), set at
+    the eager plan-build boundary so ``_assemble_tnd`` avoids a per-layer
+    ``.item()`` D2H sync inside the compiled region."""
+
     block_remainder: torch.Tensor | None
     """Per-sequence block remainder (int32), ``[n_seqs]``: ``len[i] % ratio``
     trailing tokens of sequence ``i`` fall short of one full block and
@@ -172,6 +177,11 @@ class CompressedVarlenMetadata:
     independent window exchange + ori-stream assembly the Attention's
     ``swa_k`` gather consumes (``token_dispatcher.WindowPlan``)."""
 
+    seq_len_host: int | None = None
+    """Host-cached total token count (``cu_seq_q[-1]``), set once at the eager
+    ``build_compressed_varlen_metadata`` boundary so the ``seq_len`` property
+    avoids a per-layer ``.item()`` D2H sync inside the compiled region."""
+
     @property
     def batch_size(self) -> int:
         """Container batch size (``1`` for the current packed scenario)."""
@@ -180,6 +190,8 @@ class CompressedVarlenMetadata:
     @property
     def seq_len(self) -> int:
         """Container sequence length (the total token count)."""
+        if self.seq_len_host is not None:
+            return self.seq_len_host
         return int(self.varlen.cu_seq_q[-1].item())
 
 
@@ -271,6 +283,7 @@ def build_kernel_layout(
         first_indices = cu_seqs[:-1][torch.diff(cu_seqs) > 0].to(torch.int64)
         plans[ratio] = CompressedBlockLayout(
             cu_seqlens_cmp_k=cu_seqs,
+            n_cmp_blocks_host=sum(length // ratio for length in lengths),
             block_remainder=torch.tensor(
                 [length % ratio for length in lengths],
                 dtype=torch.int32,
@@ -302,7 +315,11 @@ def build_compressed_varlen_metadata(
         compress_ratios: Compression ratios present in the model.
     """
     plans = build_kernel_layout(varlen, compress_ratios)
+    # Cache the total token count on the host so the ``seq_len`` property
+    # avoids a per-layer ``.item()`` D2H sync inside the compiled region.
+    # Built once here (eager boundary) from ``cu_seq_q[-1]``.
     return CompressedVarlenMetadata(
         varlen=varlen,
         plans=plans,
+        seq_len_host=int(varlen.cu_seq_q[-1].item()),
     )
