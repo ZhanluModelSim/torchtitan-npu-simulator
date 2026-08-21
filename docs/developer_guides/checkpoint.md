@@ -75,14 +75,13 @@ Hugging Face 权重通常包含 `model.safetensors` 或
 
 ## 保存 DCP checkpoint
 
-以下命令使用当前脚本默认的 `deepseek_v4_debugmodel` 配置。运行前设置有效的
-`HF_ASSETS_PATH`，并准备 Ascend/CANN 环境：
+以下命令使用当前脚本默认的 `deepseek_v3_debugmodel` 配置。运行前准备 Ascend/CANN 环境：
 
 ```bash
 NGPU=1 \
-HF_ASSETS_PATH=/path/to/dsv4_tokenizer \
 bash scripts/run_train.sh \
-  --dump-folder ./outputs/dsv4_checkpoint \
+  --hf-assets-path tests/assets/deepseek_v3 \
+  --dump-folder ./outputs/dsv3_checkpoint \
   --checkpoint.enable \
   --checkpoint.folder checkpoint \
   --checkpoint.interval 100 \
@@ -92,8 +91,8 @@ bash scripts/run_train.sh \
 训练过程中会生成：
 
 ```text
-./outputs/dsv4_checkpoint/checkpoint/step-100/
-./outputs/dsv4_checkpoint/checkpoint/step-200/
+./outputs/dsv3_checkpoint/checkpoint/step-100/
+./outputs/dsv3_checkpoint/checkpoint/step-200/
 ```
 
 也可以在配置注册表中设置：

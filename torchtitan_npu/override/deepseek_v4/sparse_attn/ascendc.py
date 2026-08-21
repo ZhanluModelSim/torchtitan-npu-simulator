@@ -29,7 +29,6 @@ from dataclasses import dataclass, field
 from typing import Any, cast
 
 import torch
-import torch_npu
 from cann_ops_transformer import (
     lightning_indexer_metadata,
     sparse_flash_mla_grad_metadata,
@@ -44,20 +43,11 @@ from torchtitan_npu.models.deepseek_v4.metadata import (
     CompressedBlockLayout,
     CompressedVarlenMetadata,
 )
+from torchtitan_npu.override import _IS_A5
 
 _LAYOUT = "TND"
 _ORI_MASK_MODE = 4
 _CMP_MASK_MODE = 3
-
-
-def _is_a5() -> bool:
-    try:
-        return torch_npu.npu.get_device_name().startswith("Ascend950")
-    except TypeError:
-        # CPU/UT runs may not have a current NPU device selected.  In that
-        # case torch_npu's optional device lookup returns None and fails
-        # before the device name can be queried; use the non-A5 behavior.
-        return False
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,7 +152,7 @@ def _fill_asc_metadata(
         "cmp_topk": index_topk if ratio == 4 else 0,
         "cmp_ratio": ratio,
         "ori_mask_mode": _ORI_MASK_MODE,
-        "cmp_mask_mode": 0 if _is_a5() and not has_cmp_kv else _CMP_MASK_MODE,
+        "cmp_mask_mode": 0 if _IS_A5 and not has_cmp_kv else _CMP_MASK_MODE,
         "ori_win_left": window_size - 1,
         "ori_win_right": 0,
         "layout_q": _LAYOUT,
@@ -251,19 +241,19 @@ class AscMetadataExtension(MetadataExtension):
     ``build_attention_masks``) — and returns the slim
     ``AscCompressedVarlenMetadata`` carrying the ``asc_plans``.  The
     attention geometry (``num_heads``, ``head_dim``, ``index_n_heads``,
-    ``index_head_dim``, ``index_topk``) is passed as override kwargs by the
-    factory below, keeping the model directory backend-agnostic.  Mismatched
-    geometry fails loudly: the AscendC metadata kernels and the fused core
-    validate against the actual tensors.
+    ``index_head_dim``, ``index_topk``) is supplied by the model's static
+    ``SparseAttnMetadataConfig`` through the factory below. Mismatched geometry
+    fails loudly: the AscendC metadata kernels and the fused core validate
+    against the actual tensors.
     """
 
     @dataclass(kw_only=True, slots=True)
     class Config(MetadataExtension.Config):
-        num_heads: int
-        head_dim: int
-        index_n_heads: int
-        index_head_dim: int
-        index_topk: int
+        num_heads: int  # pyrefly: ignore [bad-override]
+        head_dim: int  # pyrefly: ignore [bad-override]
+        index_n_heads: int  # pyrefly: ignore [bad-override]
+        index_head_dim: int  # pyrefly: ignore [bad-override]
+        index_topk: int  # pyrefly: ignore [bad-override]
 
     def __call__(self, metadata) -> AscCompressedVarlenMetadata:
         cfg = cast("AscMetadataExtension.Config", self.config)
@@ -384,7 +374,7 @@ class _SparseFlashMLATND(torch.autograd.Function):
             softmax_scale=softmax_scale,
             cmp_ratio=ratio,
             ori_mask_mode=_ORI_MASK_MODE,
-            cmp_mask_mode=0 if _is_a5() and not has_compressed else _CMP_MASK_MODE,
+            cmp_mask_mode=0 if _IS_A5 and not has_compressed else _CMP_MASK_MODE,
             ori_win_left=window_size - 1,
             ori_win_right=0,
             layout_q=_LAYOUT,
@@ -470,7 +460,7 @@ class _SparseFlashMLATND(torch.autograd.Function):
             softmax_scale=ctx.softmax_scale,
             cmp_ratio=ctx.ratio,
             ori_mask_mode=_ORI_MASK_MODE,
-            cmp_mask_mode=0 if _is_a5() and not has_compressed else _CMP_MASK_MODE,
+            cmp_mask_mode=0 if _IS_A5 and not has_compressed else _CMP_MASK_MODE,
             ori_win_left=ctx.window_size - 1,
             ori_win_right=0,
             layout_q=_LAYOUT,

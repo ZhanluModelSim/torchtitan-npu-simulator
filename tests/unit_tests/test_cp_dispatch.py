@@ -887,6 +887,19 @@ def test_multiprocess_gloo(tmp_path):
     env = dict(os.environ)
     env["MASTER_ADDR"] = "127.0.0.1"
     env["MASTER_PORT"] = str(port)
+    # The worker is launched as a standalone script, so it does not inherit
+    # the pytest process's sys.path. Propagate the test directories
+    # explicitly; this also works when PYTHONSAFEPATH is enabled.
+    env["PYTHONPATH"] = os.pathsep.join(
+        filter(
+            None,
+            [
+                str(_REPO / "tests" / "unit_tests"),
+                str(_REPO),
+                env.get("PYTHONPATH", ""),
+            ],
+        )
+    )
     outdir = tmp_path
     procs = []
     for r in range(2):

@@ -9,6 +9,8 @@ model's ``build_attention_masks`` owns the per-batch metadata construction
 AscendC kernel-metadata extension (the model dir stays backend-agnostic).
 """
 
+from typing import TYPE_CHECKING
+
 import spmd_types as spmd
 from torchtitan.config import derive, override
 from torchtitan.models.common.decoder_sharding import dense_param_placement
@@ -16,12 +18,11 @@ from torchtitan.models.common.decoder_sharding import dense_param_placement
 from torchtitan_npu.models.common.metadata_extension import MetadataExtension
 from torchtitan_npu.models.deepseek_v4.attention import CompressedSparseInnerAttention
 
-from .ascendc import (
-    AscCompressedSparseInnerAttention,
-    AscMetadataExtension,
-)
 from .golden import GoldenCompressedSparseInnerAttention
-from .pypto import PyPTOCompressedSparseInnerAttention
+
+if TYPE_CHECKING:
+    from .ascendc import AscCompressedSparseInnerAttention, AscMetadataExtension
+    from .pypto import PyPTOCompressedSparseInnerAttention
 
 
 @override(
@@ -30,22 +31,11 @@ from .pypto import PyPTOCompressedSparseInnerAttention
 )
 def asc_metadata(
     cfg: MetadataExtension.Config,
-    *,
-    num_heads: int,
-    head_dim: int,
-    index_n_heads: int,
-    index_head_dim: int,
-    index_topk: int,
-) -> AscMetadataExtension.Config:
-    return derive(
-        cfg,
-        AscMetadataExtension.Config,
-        num_heads=num_heads,
-        head_dim=head_dim,
-        index_n_heads=index_n_heads,
-        index_head_dim=index_head_dim,
-        index_topk=index_topk,
-    )
+) -> "AscMetadataExtension.Config":
+    # Imported lazily so the golden path does not require cann_ops_transformer.
+    from .ascendc import AscMetadataExtension
+
+    return derive(cfg, AscMetadataExtension.Config)
 
 
 @override(
@@ -56,7 +46,10 @@ def asc_metadata(
 def asc(
     cfg: CompressedSparseInnerAttention.Config,
     indexer_loss_coeff: float = 1.0,
-) -> AscCompressedSparseInnerAttention.Config:
+) -> "AscCompressedSparseInnerAttention.Config":
+    # Imported lazily so the golden path does not require cann_ops_transformer.
+    from .ascendc import AscCompressedSparseInnerAttention
+
     # ``sharding_config`` is copied from the source by ``derive``; the
     # sharding pass already ran before the overrides (update_from_config),
     # so the derived config keeps the sharding-pass values as-is.
@@ -82,7 +75,10 @@ def asc(
 def pypto(
     cfg: CompressedSparseInnerAttention.Config,
     indexer_loss_coeff: float = 1.0,
-) -> PyPTOCompressedSparseInnerAttention.Config:
+) -> "PyPTOCompressedSparseInnerAttention.Config":
+    # Imported lazily so the golden path does not require cann_ops_transformer.
+    from .pypto import PyPTOCompressedSparseInnerAttention
+
     return derive(
         cfg,
         PyPTOCompressedSparseInnerAttention.Config,

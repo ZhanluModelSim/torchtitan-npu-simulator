@@ -32,8 +32,19 @@ TORCHINDUCTOR_NPU_EXT_DEBUG=allfallback
 
 ```text
 torchtitan_npu.override.common.rope.workaround
-torchtitan_npu.override.deepseek_v4.sparse_attn.asc_metadata=...
+torchtitan_npu.override.deepseek_v4.sparse_attn.asc_metadata
 torchtitan_npu.override.deepseek_v4.sparse_attn.asc
+```
+
+完整 wrapper 调用示例（示意；需按下文“约束”把 wrapper 默认的
+`rope.asc_complex` 调整为 `rope.workaround`）：
+
+```bash
+TORCHTITAN_NPU_PATTERN_IMPORTS=torchtitan_npu.compile.patterns.deepseek_v4.inplace_partial_rope \
+  bash examples/deepseek_v4/debug/deepseek_v4_mini_1p_cpt_2k_a3.sh \
+  --compile.enable \
+  --compile.components model \
+  --compile.backend inductor
 ```
 
 ### 约束
@@ -42,5 +53,5 @@ torchtitan_npu.override.deepseek_v4.sparse_attn.asc
 - 不能同时启用 `torchtitan_npu.override.common.rope.asc_complex`，否则原始小算子
   片段会提前变成 `torch_npu.npu_rotary_mul`，pattern 无法命中；
 - 当前不支持 DeepSeek-V4 golden attention，整网验证使用 `sparse_attn.asc`；
-- `scripts/run_train.sh` 的 `TEST_OVERRIDES` 默认使用 `rope.asc_complex`，验证该
-  pattern 前需要换成 `rope.workaround`。
+- `examples/deepseek_v4/*.sh` 的默认测试组合使用 `rope.asc_complex`；验证该 pattern
+  前需要把 wrapper 里的 attention override 切到 `rope.workaround`。

@@ -1,18 +1,21 @@
 # DeepSeek-V4 上下文并行（CP）
 
-DeepSeek-V4（DSV4）在文档打包序列上训练时，压缩注意力（CSA/HCA）的 KV 块按压缩比 `r` 对齐文档前缀：块可能跨越相邻 CP 卡的边界，各 rank 可压缩的块数随文档分布不均，查询可见的滑窗行与压缩块是文档相对范围。本仓为 DSV4 的 AscendC 融合路径实现了上下文并行：每个 batch 由 `build_cp_plan` 从切分前的全局文档结构纯本地推导出「计划」，`CPTokenDispatcher` 按计划完成窗口行与压缩块的 gather，以及压缩容器的声明式 all-gather。`CP_DEGREE >= 2` 时由 `scripts/run_train.sh` 激活。参考内核与 golden 数值基线不启用 CP。
+DeepSeek-V4（DSV4）在文档打包序列上训练时，压缩注意力（CSA/HCA）的 KV 块按压缩比 `r` 对齐文档前缀：块可能跨越相邻 CP 卡的边界，各 rank 可压缩的块数随文档分布不均，查询可见的滑窗行与压缩块是文档相对范围。本仓为 DSV4 的 AscendC 融合路径实现了上下文并行：每个 batch 由 `build_cp_plan` 从切分前的全局文档结构纯本地推导出「计划」，`CPTokenDispatcher` 按计划完成窗口行与压缩块的 gather，以及压缩容器的声明式 all-gather。context parallel 由 CLI 参数 `--parallelism.context-parallel-degree` 激活（配合 `--parallelism.spmd-backend=spmd_types`）。参考内核与 golden 数值基线不启用 CP。
 
 本文是 CP 功能的**实施交接文档**，目标读者是接手 DSV4 CP 开发的后续开发者：先看「启用方式」「设计要点」「关键设计决策」掌握整体方案与取舍依据，再看「每层数据流」「压缩器在 CP 下的工作方式」（含图示）与「组件与文件」定位代码，最后按「验证方式」执行回归。已知限制与内核契约均记录在案。
 
 ## 启用方式
 
 ```bash
-NGPU=2 CP_DEGREE=2 CP_LOAD_BALANCER=headtail CONFIG=deepseek_v4_debugmodel \
-  ./scripts/run_train.sh --training.steps 2
+NGPU=2 \
+  bash examples/deepseek_v4/debug/deepseek_v4_mini_1p_cpt_2k_a3.sh \
+  --parallelism.context-parallel-degree 2 \
+  --parallelism.spmd-backend spmd_types \
+  --training.steps 2
 ```
 
-- `CP_DEGREE > 1` 时脚本追加 `--parallelism.context_parallel_degree`、`--parallelism.context_parallel_load_balancer` 与 `--parallelism.spmd_backend spmd_types`。`spmd_types` 后端是压缩容器 `S(1) -> R` 声明式 all-gather 的前提。
-- `CP_LOAD_BALANCER` 支持 `headtail`（默认）与 `None`（plain 顺序切分）。headtail 要求 `seq_len` 整除 `2 * CP_DEGREE`，plain 要求整除 `CP_DEGREE`，不满足时 `_build_cp_metadata` 直接报错。
+- `--parallelism.context-parallel-degree > 1` 时即启用 CP；必须配合 `--parallelism.spmd-backend spmd_types`（`spmd_types` 后端是压缩容器 `S(1) -> R` 声明式 all-gather 的前提）。
+- `--parallelism.context-parallel-load-balancer` 支持 `headtail`（默认）与 `None`（plain 顺序切分）。headtail 要求 `seq_len` 整除 `2 * context_parallel_degree`，plain 要求整除 `context_parallel_degree`，不满足时 `_build_cp_metadata` 直接报错。
 - 需要完整 NPU 环境：`torch_npu`、CANN、HCCL 与匹配的 `cann_ops_transformer`。CP 只在融合路径生效，参考 tier 与 golden 限定无 CP（对 `cu_seq_q != cu_seq_k` 报错）。
 - `local_batch_size == 1` 是当前文档打包约定（增大批数据应提高 `seq_len`）；DSA 路径 TP 固定为 1。
 

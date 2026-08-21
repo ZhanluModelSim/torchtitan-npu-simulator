@@ -28,6 +28,13 @@ class MetadataExtension(Configurable):
         window_size: int = 0
         """The sliding-window size (model-config constant), consumed by the
         vendor extension's kernel metadata fills."""
+        num_heads: int | None = None
+        head_dim: int | None = None
+        index_n_heads: int | None = None
+        index_head_dim: int | None = None
+        index_topk: int | None = None
+        """Static sparse-attention geometry consumed by vendor metadata
+        extensions when the selected path requires it."""
 
     def __init__(self, config: Config):
         self.config = config

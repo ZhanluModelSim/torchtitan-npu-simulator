@@ -12,6 +12,7 @@ import torch_npu
 
 import torchtitan_npu.ops.ascendc.mhc  # noqa: F401
 from torchtitan_npu.models.deepseek_v4.mhc import HcPost, HcPre
+from torchtitan_npu.override import _IS_A5
 
 
 class AscHcPre(HcPre):
@@ -27,13 +28,9 @@ class AscHcPre(HcPre):
     class Config(HcPre.Config):
         pass
 
-    @staticmethod
-    def _is_a5() -> bool:
-        return torch_npu.npu.get_device_name().startswith("Ascend950")
-
     def __init__(self, config: Config):
         super().__init__(config)
-        self._use_split_backend = self._is_a5()
+        self._use_split_backend = _IS_A5
 
     def _forward_fused(
         self,

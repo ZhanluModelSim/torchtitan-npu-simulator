@@ -20,13 +20,15 @@ class OverrideDefinitions:
     This class is used to define the override definitions for the integration tests.
     """
 
-    override_args: Sequence[Sequence[str]] = tuple(tuple(" "))
+    override_args: Sequence[Sequence[str]] = ((" ",),)
     test_descr: str = "default"
     test_name: str = "default"
     ngpu: int = 4
     disabled: bool = False
     skip_rocm_test: bool = False
     env_vars: Mapping[str, str] | None = None
+    use_golden: bool = True
+    check_loss: bool = True
 
     def __repr__(self):
         return self.test_descr

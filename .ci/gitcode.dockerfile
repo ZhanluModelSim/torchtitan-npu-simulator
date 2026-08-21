@@ -33,11 +33,12 @@ COPY requirements-dev.txt /tmp/requirements-dev.txt
 # torch nightly build.
 RUN test "$(uname -m)" = "aarch64" \
     && python3 -c 'import sys; assert sys.version_info[:2] == (3, 12), sys.version' \
-    && sed '/^torch_npu @ /d' /tmp/requirements.txt > /tmp/requirements_without_torch_npu.txt \
+    && sed -E '/^torch_npu[[:space:]]*(@|==)/d' /tmp/requirements.txt > /tmp/requirements_without_torch_npu.txt \
     && python3 -m pip install --no-cache-dir --prefer-binary --retries 10 --timeout 120 \
         -r /tmp/requirements_without_torch_npu.txt \
         -r /tmp/requirements-dev.txt \
-    && torch_npu_requirement="$(sed -n '/^torch_npu @ /p' /tmp/requirements.txt)" \
-    && test -n "${torch_npu_requirement}" \
+    && { grep '^--find-links[[:space:]]' /tmp/requirements.txt > /tmp/torch_npu_requirement.txt || true; } \
+    && grep -E '^torch_npu[[:space:]]*(@|==)' /tmp/requirements.txt >> /tmp/torch_npu_requirement.txt \
+    && test -s /tmp/torch_npu_requirement.txt \
     && python3 -m pip install --no-cache-dir --no-deps --retries 10 --timeout 120 \
-        "${torch_npu_requirement}"
+        -r /tmp/torch_npu_requirement.txt

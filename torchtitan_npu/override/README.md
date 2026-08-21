@@ -5,6 +5,10 @@
 它不是算子级 override API；PyTorch backend 缺口及必须随包导入生效的临时适配放在
 `torchtitan_npu.patches`。
 
+DeepSeek-V4 的训练示例 wrapper（`examples/deepseek_v4/*.sh`）会按 `USE_GOLDEN`
+组装具体的 `--override.imports` 组合；`scripts/run_train.sh` 只是通用单节点 launcher，
+负责参数透传，不提供 `TEST_OVERRIDES` 或 `GOLDEN_OVERRIDES`。
+
 ## 启用方式
 
 `override.imports` 中的每个条目必须是完整的 `module.function` 路径。一个条目只会启用
@@ -24,7 +28,7 @@ python -m torchtitan.train \
 
 ```bash
 --override.imports \
-  'torchtitan_npu.override.deepseek_v4.sparse_attn.asc_metadata={"num_heads":16,"head_dim":512,"index_n_heads":8,"index_head_dim":128,"index_topk":512}'
+  'torchtitan_npu.override.deepseek_v4.sparse_attn.asc={"indexer_loss_coeff": 2.0}'
 ```
 
 也可以直接设置配置：
@@ -250,17 +254,16 @@ torchtitan_npu.override.deepseek_v3_2.sparse_attn.asc
 | `mhc.triton_hc_post` | `HcPost.Config` | `TritonHcPost.Config` | 使用 `mhc_post_bmm1_op` + `mhc_post_bmm2_op` |
 | `mhc.triton_hc_head` | `HcHead.Config` | `TritonHcHead.Config` | 使用 `mhc_pre_only_sinkhorn_op` + `mhc_pre_bmm_op` |
 
-`sparse_attn.asc_metadata` 需要传入 `num_heads`、`head_dim`、
-`index_n_heads`、`index_head_dim` 和 `index_topk`。这些值必须与所选模型配置一致。
-`sparse_attn.asc` 还支持可选的 `indexer_loss_coeff`，默认值为 `1.0`。
+`sparse_attn.asc_metadata` 无需参数。`sparse_attn.asc` 还支持可选的 `indexer_loss_coeff`，默认值为 `0.0`。
 MHC 的 `asc_hc_pre` / `asc_hc_post` 与 `triton_hc_pre` / `triton_hc_post` / `triton_hc_head` 是可选入口（`deepseek_v4/__init__.py`
 默认只导入 `sparse_attn`），需要时显式加入 `override.imports`。
-推荐直接使用 [scripts/run_train.sh](../../scripts/run_train.sh)，脚本已为
-`deepseek_v4_debugmodel`、`deepseek_v4_flash` 和 `deepseek_v4_pro` 配置对应参数：
+推荐直接使用 `examples/deepseek_v4/*.sh` wrapper；单机调试可使用
+[deepseek_v4_mini_1p_cpt_2k_a3.sh](../../examples/deepseek_v4/debug/deepseek_v4_mini_1p_cpt_2k_a3.sh)，
+它会组装 `--override.imports` 并调用 `scripts/run_train.sh`：
 
 ```bash
-./scripts/run_train.sh
-USE_GOLDEN=1 ./scripts/run_train.sh
+bash examples/deepseek_v4/debug/deepseek_v4_mini_1p_cpt_2k_a3.sh
+USE_GOLDEN=1 bash examples/deepseek_v4/debug/deepseek_v4_mini_1p_cpt_2k_a3.sh
 ```
 
 默认路径启用以下组合：
@@ -268,7 +271,7 @@ USE_GOLDEN=1 ./scripts/run_train.sh
 ```text
 torchtitan_npu.override.common.rms_norm.asc
 torchtitan_npu.override.common.rope.asc_complex
-torchtitan_npu.override.deepseek_v4.sparse_attn.asc_metadata=<model geometry>
+torchtitan_npu.override.deepseek_v4.sparse_attn.asc_metadata
 torchtitan_npu.override.deepseek_v4.sparse_attn.asc
 ```
 

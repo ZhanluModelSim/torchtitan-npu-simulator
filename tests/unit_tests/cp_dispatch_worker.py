@@ -17,10 +17,6 @@ outputs against the global-stream oracle.  Writes a JSON report to
 
 import json
 import os
-import sys
-
-sys.path.insert(0, "/home/developer/workspace/torchtitan-npu/tests/unit_tests")
-sys.path.insert(0, "/home/developer/workspace/torchtitan-npu")
 
 import torch
 
