@@ -12,6 +12,8 @@ from contextvars import ContextVar
 
 import torch
 
+from torchtitan_npu.simulator.capture.tensor_utils import to_tensor_meta
+
 
 _fp8_dispatch_transport_enabled: ContextVar[bool] = ContextVar(
     "fp8_dispatch_transport_enabled",
@@ -61,6 +63,10 @@ def _record_all_to_all(
     tensor: torch.Tensor,
     output: torch.Tensor,
     group: object,
+    *,
+    transport_tensor: torch.Tensor | None = None,
+    dependency_inputs: list[torch.Tensor] | None = None,
+    track_memory: bool = True,
 ) -> None:
     from torchtitan_npu.simulator import meta_env
     from torchtitan_npu.simulator.capture.comm_events import (
@@ -79,10 +85,28 @@ def _record_all_to_all(
         group,
         tensor,
         output,
+        transport_tensor=transport_tensor,
+        operation_input_metas=(
+            [to_tensor_meta(transport_tensor, name="in_0")]
+            if transport_tensor is not None
+            else None
+        ),
+        operation_output_metas=(
+            [to_tensor_meta(transport_tensor, name="out_0")]
+            if transport_tensor is not None
+            else None
+        ),
+        dependency_inputs=dependency_inputs,
+        memory_inputs=None if track_memory else [],
+        memory_outputs=None if track_memory else [],
     )
 
 
-def _record_fp8_payload_and_scale(tensor: torch.Tensor, group: object) -> None:
+def _record_fp8_payload_and_scale(
+    tensor: torch.Tensor,
+    output: torch.Tensor,
+    group: object,
+) -> None:
     payload = _uncaptured_empty_like(tensor, dtype=torch.float8_e4m3fn)
     scale_shape = (*tensor.shape[:-1], 1, (tensor.shape[-1] + 31) // 32)
     scale = _uncaptured_empty(
@@ -90,8 +114,21 @@ def _record_fp8_payload_and_scale(tensor: torch.Tensor, group: object) -> None:
         dtype=torch.uint8,
         device=tensor.device,
     )
-    _record_all_to_all(payload, _uncaptured_empty_like(payload), group)
-    _record_all_to_all(scale, _uncaptured_empty_like(scale), group)
+    scale_output = _uncaptured_empty_like(scale)
+    _record_all_to_all(
+        tensor,
+        scale_output,
+        group,
+        transport_tensor=scale,
+        track_memory=False,
+    )
+    _record_all_to_all(
+        tensor,
+        output,
+        group,
+        transport_tensor=payload,
+        dependency_inputs=[scale_output],
+    )
 
 
 class _SimAllToAll(torch.autograd.Function):
@@ -132,15 +169,16 @@ class _SimFP8DispatchAllToAll(torch.autograd.Function):
     # pyrefly: ignore [bad-override]
     def forward(ctx, tensor: torch.Tensor, group: object) -> torch.Tensor:
         ctx.group = group
-        _record_fp8_payload_and_scale(tensor, group)
-        return _uncaptured_empty_like(tensor)
+        output = _uncaptured_empty_like(tensor)
+        _record_fp8_payload_and_scale(tensor, output, group)
+        return output
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def backward(ctx, grad_output: torch.Tensor):
         grad_input = _uncaptured_empty_like(grad_output)
         if is_fp8_dispatch_transport_enabled():
-            _record_fp8_payload_and_scale(grad_output, ctx.group)
+            _record_fp8_payload_and_scale(grad_output, grad_input, ctx.group)
         else:
             _record_all_to_all(grad_output, grad_input, ctx.group)
         return grad_input, None

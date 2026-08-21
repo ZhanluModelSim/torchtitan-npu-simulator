@@ -24,6 +24,7 @@ import torch.distributed as dist
 from torch.distributed import _functional_collectives as funcol
 
 from torchtitan_npu.distributed.process_group import is_fake_process_group
+from torchtitan_npu.simulator.ir.tensor_meta import TensorMeta
 from torchtitan_npu.simulator.capture.tensor_utils import dtype_to_str, tensor_volume_bytes
 from torchtitan_npu.simulator.memory.records import FSDPResidencyEvent
 
@@ -410,6 +411,13 @@ def _record_comm_with_l0(
     group: object,
     tensor: torch.Tensor,
     output_tensor: torch.Tensor | None = None,
+    *,
+    transport_tensor: torch.Tensor | None = None,
+    operation_input_metas: list[TensorMeta] | None = None,
+    operation_output_metas: list[TensorMeta] | None = None,
+    dependency_inputs: list[torch.Tensor] | None = None,
+    memory_inputs: list[torch.Tensor] | None = None,
+    memory_outputs: list[torch.Tensor] | None = None,
 ) -> CommEvent:
     """Record a CommEvent AND register a synthetic L0 OpNode for the
     communication op, so it appears in the L0 compute graph and CSV.
@@ -420,7 +428,7 @@ def _record_comm_with_l0(
     comm_dim = _group_name(group)
     comm_ranks = _resolve_comm_ranks(group)
     event = recorder.record(
-        comm_primitive, group, tensor,
+        comm_primitive, group, transport_tensor if transport_tensor is not None else tensor,
         comm_dim=comm_dim, comm_ranks=comm_ranks,
     )
     # Assign a global seq_idx so comm events can be ordered in the timeline
@@ -485,6 +493,11 @@ def _record_comm_with_l0(
             inputs=[tensor],
             outputs=[out],
             module_path=module_path,
+            operation_input_metas=operation_input_metas,
+            operation_output_metas=operation_output_metas,
+            dependency_inputs=dependency_inputs,
+            memory_inputs=memory_inputs,
+            memory_outputs=memory_outputs,
             extra_annotations={
                 "fsdp_group_id": event.fsdp_group_id,
                 "fsdp_module_fqn": event.fsdp_module_fqn,

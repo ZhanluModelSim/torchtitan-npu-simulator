@@ -288,6 +288,9 @@ class OpDispatchCapture(TorchDispatchMode):
         logical_dtensor_shapes: bool = False,
         memory_inputs: list[torch.Tensor] | None = None,
         memory_outputs: list[torch.Tensor] | None = None,
+        dependency_inputs: list[torch.Tensor] | None = None,
+        operation_input_metas: list[TensorMeta] | None = None,
+        operation_output_metas: list[TensorMeta] | None = None,
         attrs: dict[str, Any] | None = None,
         extra_annotations: dict[str, Any] | None = None,
     ) -> None:
@@ -305,6 +308,11 @@ class OpDispatchCapture(TorchDispatchMode):
 
         ``memory_inputs`` and ``memory_outputs`` may expose additional operands
         to tensor-lifetime tracking without adding them to the logical OpNode.
+        ``dependency_inputs`` adds producer edges without changing the op's
+        tensor metadata or memory records. ``operation_*_metas`` overrides the
+        displayed/costed metadata while retaining ``inputs``/``outputs`` for
+        dependency wiring; transport shims use this when wire dtype differs
+        from the logical activation dtype.
         ``attrs`` carries non-tensor operator kwargs into ``OpNode.attrs``.
         """
         logical_input_metas = None
@@ -322,6 +330,10 @@ class OpDispatchCapture(TorchDispatchMode):
                     _flatten_tensors(outputs, localize_dtensor=False)
                 )
             ]
+        if operation_input_metas is not None:
+            logical_input_metas = operation_input_metas
+        if operation_output_metas is not None:
+            logical_output_metas = operation_output_metas
         self._record_event(
             raw_op_type,
             _flatten_tensors(inputs),
@@ -338,6 +350,11 @@ class OpDispatchCapture(TorchDispatchMode):
             memory_flat_outputs=(
                 _flatten_tensors(memory_outputs)
                 if memory_outputs is not None
+                else None
+            ),
+            dependency_flat_inputs=(
+                _flatten_tensors(dependency_inputs)
+                if dependency_inputs is not None
                 else None
             ),
             attrs=attrs,
@@ -406,6 +423,7 @@ class OpDispatchCapture(TorchDispatchMode):
         tensor_shape_scope: str = "local",
         memory_flat_inputs: list[torch.Tensor] | None = None,
         memory_flat_outputs: list[torch.Tensor] | None = None,
+        dependency_flat_inputs: list[torch.Tensor] | None = None,
         attrs: dict[str, Any] | None = None,
         extra_annotations: dict[str, Any] | None = None,
         mutated_inputs: list[torch.Tensor] | None = None,
@@ -425,6 +443,9 @@ class OpDispatchCapture(TorchDispatchMode):
             pass
         input_ids = [self.tensor_id(tensor) for tensor in flat_inputs]
         output_ids = [self.tensor_id(tensor) for tensor in flat_outputs]
+        dependency_input_ids = [
+            self.tensor_id(tensor) for tensor in (dependency_flat_inputs or [])
+        ]
         alias_frontier_ids = {
             frontier
             for tensor in flat_inputs
@@ -442,7 +463,7 @@ class OpDispatchCapture(TorchDispatchMode):
         predecessors = sorted(
             {
                 self._producer[tensor_id]
-                for tensor_id in input_ids
+                for tensor_id in (*input_ids, *dependency_input_ids)
                 if tensor_id in self._producer
             }
             | alias_frontier_ids

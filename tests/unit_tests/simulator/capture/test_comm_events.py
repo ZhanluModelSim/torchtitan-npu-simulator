@@ -111,10 +111,49 @@ def test_meta_fp8_dispatch_uses_payload_and_scale_only_in_forward():
     assert output.dtype == torch.bfloat16
     assert tensor.grad is not None
     assert [(event.dtype, event.volume_bytes) for event in recorder.events] == [
-        ("float8_e4m3fn", 8 * 64),
         ("uint8", 8 * 2),
+        ("float8_e4m3fn", 8 * 64),
         ("bfloat16", 8 * 64 * 2),
     ]
+
+
+def test_meta_fp8_dispatch_keeps_payload_and_scale_on_data_path():
+    capture = OpDispatchCapture()
+    tensor = torch.randn(8, 64, device="meta", dtype=torch.bfloat16)
+
+    with capture, capture_fake_collectives():
+        produced = tensor.sin()
+        output = run_meta_fp8_dispatch_all_to_all(produced, dist.group.WORLD)
+        consumed = output.cos()
+
+    nodes = capture.build_nodes()
+    forward_all_to_all = [
+        node
+        for node in nodes.values()
+        if node.annotations["raw_op_type"] == "comm.all_to_all"
+        and node.annotations["phase"] == "forward"
+    ]
+    producer = next(
+        node for node in nodes.values() if node.annotations["raw_op_type"] == "aten.sin.default"
+    )
+    consumer = next(
+        node for node in nodes.values() if node.annotations["raw_op_type"] == "aten.cos.default"
+    )
+
+    def ancestors(op_id: int) -> set[int]:
+        result: set[int] = set()
+        pending = list(nodes[op_id].predecessors)
+        while pending:
+            predecessor = pending.pop()
+            if predecessor in result:
+                continue
+            result.add(predecessor)
+            pending.extend(nodes[predecessor].predecessors)
+        return result
+
+    assert len(forward_all_to_all) == 2
+    assert all(producer.op_id in ancestors(node.op_id) for node in forward_all_to_all)
+    assert all(node.op_id in ancestors(consumer.op_id) for node in forward_all_to_all)
 
 
 def test_meta_fp8_dispatch_can_model_reverse_transport_as_fp8():
@@ -129,10 +168,10 @@ def test_meta_fp8_dispatch_can_model_reverse_transport_as_fp8():
 
     assert tensor.grad is not None
     assert [(event.dtype, event.volume_bytes) for event in recorder.events] == [
-        ("float8_e4m3fn", 8 * 64),
         ("uint8", 8 * 2),
         ("float8_e4m3fn", 8 * 64),
         ("uint8", 8 * 2),
+        ("float8_e4m3fn", 8 * 64),
     ]
 
 
