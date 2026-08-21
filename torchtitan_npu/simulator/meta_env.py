@@ -2238,6 +2238,37 @@ def _patch_device_mesh_world_size_check() -> None:
     DeviceMesh._setup_world_group_and_device = _patched_setup_world_group_and_device
 
 
+def _sim_compute_coordinates_from_mesh(mesh_tensor, rank):
+    """O(1) replacement for DeviceMesh._compute_coordinates_from_mesh.
+
+    For C-order arange meshes (root mesh from init_device_mesh), compute
+    coordinates via divmod. Fall back to original O(ngpu) scan for arbitrary
+    mesh tensors (e.g. sliced submeshes with non-consecutive ranks).
+    """
+    import torch
+
+    shape = tuple(mesh_tensor.shape)
+    numel = mesh_tensor.numel()
+    if numel == 0:
+        return None
+    # Validate C-order arange permutation; fall back if not
+    expected = torch.arange(numel).reshape(shape)
+    if not torch.equal(mesh_tensor, expected):
+        # Non-arange layout (e.g. sliced submesh) — use original scan
+        from torch.distributed.device_mesh import DeviceMesh
+
+        return DeviceMesh._sim_orig_compute_coordinates_from_mesh(
+            mesh_tensor, rank
+        )
+    if not (0 <= rank < numel):
+        return None
+    # C-order divmod: coord[i] = (rank // suffix_prod[i]) % shape[i]
+    suffix = [1] * len(shape)
+    for i in range(len(shape) - 2, -1, -1):
+        suffix[i] = suffix[i + 1] * shape[i + 1]
+    return tuple((rank // suffix[i]) % shape[i] for i in range(len(shape)))
+
+
 def _patch_parallel_dims_for_multi_proc(full_ws: int, gloo_ws: int) -> None:
     """Patch ParallelDims to use gloo world_size for mesh creation
     while keeping full_ws for validation.
@@ -2289,6 +2320,15 @@ def _patch_parallel_dims_for_multi_proc(full_ws: int, gloo_ws: int) -> None:
 
         DeviceMesh._get_mesh_tensor_from_full_mesh = staticmethod(
             _sim_get_mesh_tensor_from_full_mesh
+        )
+
+    # O(1) _compute_coordinates_from_mesh patch (avoid O(ngpu²) scan for large meshes)
+    if not hasattr(DeviceMesh, "_sim_orig_compute_coordinates_from_mesh"):
+        DeviceMesh._sim_orig_compute_coordinates_from_mesh = (
+            DeviceMesh._compute_coordinates_from_mesh
+        )
+        DeviceMesh._compute_coordinates_from_mesh = staticmethod(
+            _sim_compute_coordinates_from_mesh
         )
 
     if not hasattr(dm_mod, "_sim_orig_group_aware_get_rank"):
