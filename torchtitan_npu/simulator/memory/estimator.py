@@ -26,6 +26,7 @@ from torchtitan_npu.simulator.capture.tensor_utils import (
 from torchtitan_npu.simulator.memory.activation_checkpoint import ActivationCheckpointPlugin
 from torchtitan_npu.simulator.memory.activation_offload import ActivationOffloadPlugin
 from torchtitan_npu.simulator.memory.alias_rules import is_alias_event, is_mutation_event
+from torchtitan_npu.simulator.memory.fsdp_allgather_transport import FSDPAllGatherTransportPlugin
 from torchtitan_npu.simulator.memory.fsdp_residency import FSDPFullParamResidencyPlugin
 from torchtitan_npu.simulator.memory.gradient_residency import MissingParameterGradientPlugin
 from torchtitan_npu.simulator.memory.plugins import (
@@ -368,6 +369,7 @@ def estimate_static_memory(
     autograd_saved_tensor_events: Iterable[AutogradSavedTensorEvent] | None = None,
     parameter_storage_dtype: str | None = None,
     offload_ac_saved_tensors: bool = False,
+    fsdp_allgather_transport_dtype: str = "",
 ) -> MemoryPlan:
     events = sorted(raw_events, key=lambda event: event.seq_idx)
     if parameter_storage_dtype:
@@ -450,9 +452,12 @@ def estimate_static_memory(
         autograd_saved_tensors=list(autograd_saved_tensor_events or []),
         alias_base_by_tensor_id=alias_base_by_tensor_id,
         offload_ac_saved_tensors=offload_ac_saved_tensors,
+        fsdp_allgather_transport_dtype=fsdp_allgather_transport_dtype,
         notes=notes,
     )
     plugin_lifetimes = FSDPFullParamResidencyPlugin().apply(plugin_context)
+    if fsdp_allgather_transport_dtype:
+        FSDPAllGatherTransportPlugin(fsdp_allgather_transport_dtype).apply(plugin_context)
     ActivationCheckpointPlugin().apply(plugin_context)
     ActivationOffloadPlugin().apply(plugin_context)
     plugin_lifetimes.extend(MissingParameterGradientPlugin().apply(plugin_context))

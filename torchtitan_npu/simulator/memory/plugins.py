@@ -60,6 +60,7 @@ class MemoryModelContext:
     autograd_saved_tensors: list[AutogradSavedTensorEvent] = field(default_factory=list)
     alias_base_by_tensor_id: dict[int, int] = field(default_factory=dict)
     offload_ac_saved_tensors: bool = False
+    fsdp_allgather_transport_dtype: str = ""
     notes: list[str] = field(default_factory=list)
 
 

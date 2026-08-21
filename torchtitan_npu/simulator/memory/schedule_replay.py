@@ -387,6 +387,7 @@ def estimate_schedule_memory(
     autograd_saved_tensor_events: Iterable[AutogradSavedTensorEvent] | None = None,
     parameter_storage_dtype: str | None = None,
     offload_ac_saved_tensors: bool = False,
+    fsdp_allgather_transport_dtype: str = "",
 ) -> MemoryPlan:
     """Estimate memory, replaying templates only for PP schedules."""
     from torchtitan_npu.simulator.memory.estimator import estimate_static_memory
@@ -401,6 +402,7 @@ def estimate_schedule_memory(
             autograd_saved_tensor_events=autograd_saved_tensor_events,
             parameter_storage_dtype=parameter_storage_dtype,
             offload_ac_saved_tensors=offload_ac_saved_tensors,
+            fsdp_allgather_transport_dtype=fsdp_allgather_transport_dtype,
         )
 
     replayed = replay_pp_memory_capture(
@@ -422,6 +424,7 @@ def estimate_schedule_memory(
         autograd_saved_tensor_events=None,
         parameter_storage_dtype=parameter_storage_dtype,
         offload_ac_saved_tensors=offload_ac_saved_tensors,
+        fsdp_allgather_transport_dtype=fsdp_allgather_transport_dtype,
     )
     plan.action_spans = replayed.action_spans
     plan.notes.append(

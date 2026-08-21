@@ -122,6 +122,21 @@ def test_selective_ac_save_ops_cli_override():
     assert config.simulation.selective_ac_save_ops == ["default", "gmm"]
 
 
+def test_fsdp_allgather_fp8_cli_override_is_simulator_only():
+    config = ConfigManager().parse_args(
+        [
+            "--module",
+            "torchtitan_npu.simulator",
+            "--config",
+            "deepseek_v4_smoketest",
+            "--simulation.enable-fsdp-allgather-fp8",
+        ]
+    )
+
+    assert config.simulation.enable_fsdp_allgather_fp8 is True
+    assert config.training.mixed_precision_param == "bfloat16"
+
+
 def test_model_override_schema_tracks_all_deepseek_v4_fields():
     model_fields = {
         field.name for field in dataclasses.fields(DeepSeekV4Model.Config)

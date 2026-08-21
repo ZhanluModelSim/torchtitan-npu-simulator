@@ -30,6 +30,8 @@ _DTYPE_BYTE_SIZES: dict[str, int] = {
     "float64": 8,
     "float16": 2,
     "bfloat16": 2,
+    "float8_e4m3fn": 1,
+    "float8_e5m2": 1,
     "int64": 8,
     "int32": 4,
     "int16": 2,

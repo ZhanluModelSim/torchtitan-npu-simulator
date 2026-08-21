@@ -311,6 +311,7 @@ def test_simulation_config_defaults_target_npu_device_type_to_non_a5():
     assert config.target_npu_device_type == "non_a5"
     assert config.enable_memory_tracking is True
     assert config.memory_parameter_storage_dtype == ""
+    assert config.enable_fsdp_allgather_fp8 is False
     assert config.memory_offload_ac_saved_tensors is False
     assert config.selective_ac_save_ops is None
     assert config.world_size is None

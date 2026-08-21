@@ -85,6 +85,9 @@ class SimulationConfig:
     memory_parameter_storage_dtype: str = ""
     # Historical CLI name; now covers saved activations in none/full/selective.
     memory_offload_ac_saved_tensors: bool = False
+    # Simulator-only hypothetical optimization. This models FP8 FSDP
+    # all-gather transport without changing Titan's compute dtypes.
+    enable_fsdp_allgather_fp8: bool = False
     selective_ac_save_ops: list[SelectiveACSaveOp] | None = None
     target_npu_device_type: str = "non_a5"
     csv_max_ranks: int | None = None
@@ -179,6 +182,7 @@ def run_simulation_step(
     enable_memory_tracking: bool = True,
     memory_parameter_storage_dtype: str = "",
     memory_offload_ac_saved_tensors: bool = False,
+    fsdp_allgather_transport_dtype: str = "",
     pp_schedule: Any | None = None,
 ) -> WorkloadGraph:
     """Run one forward+backward+optimizer step under full capture and
@@ -313,6 +317,16 @@ def run_simulation_step(
     t5 = time.perf_counter()
     nodes = capture.build_nodes()
     nodes = fold_metadata_views(nodes)
+    if fsdp_allgather_transport_dtype:
+        from torchtitan_npu.simulator.memory.fsdp_allgather_transport import (
+            apply_fsdp_allgather_transport_dtype,
+        )
+
+        apply_fsdp_allgather_transport_dtype(
+            comm_recorder.events,
+            nodes,
+            fsdp_allgather_transport_dtype,
+        )
     timings["build_nodes"] = time.perf_counter() - t5
 
     t6 = time.perf_counter()
@@ -366,6 +380,7 @@ def run_simulation_step(
             autograd_saved_tensor_events=capture.autograd_saved_tensor_events(),
             parameter_storage_dtype=memory_parameter_storage_dtype or None,
             offload_ac_saved_tensors=memory_offload_ac_saved_tensors,
+            fsdp_allgather_transport_dtype=fsdp_allgather_transport_dtype,
         )
         wg.iteration.schedule.annotations["memory_plan"] = memory_plan
         wg.iteration.schedule.annotations["memory_summary"] = memory_plan.to_summary_dict()
@@ -582,6 +597,9 @@ class SimulationTrainer(Trainer):
             ),
             memory_offload_ac_saved_tensors=(
                 self.simulation_config.memory_offload_ac_saved_tensors
+            ),
+            fsdp_allgather_transport_dtype=(
+                "float8_e4m3fn" if self.simulation_config.enable_fsdp_allgather_fp8 else ""
             ),
             pp_schedule=pp_schedule,
         )
