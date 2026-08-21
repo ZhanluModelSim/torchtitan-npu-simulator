@@ -137,6 +137,20 @@ def test_fsdp_allgather_fp8_cli_override_is_simulator_only():
     assert config.training.mixed_precision_param == "bfloat16"
 
 
+def test_ep_dispatch_fp8_cli_override_is_simulator_only():
+    config = ConfigManager().parse_args(
+        [
+            "--module",
+            "torchtitan_npu.simulator",
+            "--config",
+            "deepseek_v4_smoketest",
+            "--simulation.enable-ep-dispatch-fp8",
+        ]
+    )
+
+    assert config.simulation.enable_ep_dispatch_fp8 is True
+
+
 def test_model_override_schema_tracks_all_deepseek_v4_fields():
     model_fields = {
         field.name for field in dataclasses.fields(DeepSeekV4Model.Config)

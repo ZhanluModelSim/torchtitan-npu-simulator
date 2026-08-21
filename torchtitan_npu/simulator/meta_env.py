@@ -571,7 +571,9 @@ def _patch_moe_dispatch_to_avoid_meta_tensor_value_reads() -> None:
     is_fake_process_group = moe_dispatch_mod.is_fake_process_group
     torch_npu = moe_dispatch_mod.torch_npu
     from torchtitan_npu.simulator.hardware_shims.moe_dispatch_shim import (
+        is_fp8_dispatch_transport_enabled,
         run_meta_all_to_all,
+        run_meta_fp8_dispatch_all_to_all,
     )
     from torchtitan_npu.simulator.hardware_shims.moe_permutation_shim import (
         run_meta_moe_token_permute,
@@ -611,7 +613,10 @@ def _patch_moe_dispatch_to_avoid_meta_tensor_value_reads() -> None:
         if not is_fake_process_group(group):
             return original_token_dispatch(self, mod, inputs, device_mesh)
 
-        routed_input = run_meta_all_to_all(routed_input, group)
+        if is_fp8_dispatch_transport_enabled():
+            routed_input = run_meta_fp8_dispatch_all_to_all(routed_input, group)
+        else:
+            routed_input = run_meta_all_to_all(routed_input, group)
         if routed_scores is not None:
             routed_scores = run_meta_all_to_all(routed_scores, group)
 

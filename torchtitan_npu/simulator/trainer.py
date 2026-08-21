@@ -35,6 +35,9 @@ from torchtitan_npu.simulator.hardware_shims.kda_converter import (
     apply_kimi_k3_shims,
 )
 from torchtitan_npu.simulator.hardware_shims.mhc_converter import apply_mhc_shims
+from torchtitan_npu.simulator.hardware_shims.moe_dispatch_shim import (
+    fp8_dispatch_transport_context,
+)
 from torchtitan_npu.simulator.hardware_shims.rms_norm_converter import (
     apply_rms_norm_shims,
 )
@@ -88,6 +91,10 @@ class SimulationConfig:
     # Simulator-only hypothetical optimization. This models FP8 FSDP
     # all-gather transport without changing Titan's compute dtypes.
     enable_fsdp_allgather_fp8: bool = False
+    # Simulator-only EP optimization. Models FP8 payload plus E8M0 scale
+    # transport for the forward token-dispatch all-to-all. Backward and
+    # combine stay BF16 in P0 until the direct-FP8 GMM autograd bridge exists.
+    enable_ep_dispatch_fp8: bool = False
     selective_ac_save_ops: list[SelectiveACSaveOp] | None = None
     target_npu_device_type: str = "non_a5"
     csv_max_ranks: int | None = None
@@ -577,32 +584,35 @@ class SimulationTrainer(Trainer):
             gradient_accumulation_steps=self.gradient_accumulation_steps,
         )
 
-        self.workload_graph = run_simulation_step(
-            model_parts=self.model_parts,
-            parallel_dims=self.parallel_dims,
-            forward_backward_step=lambda **kwargs: self.forward_backward_step(**kwargs),
-            input_dict=input_dict,
-            labels=labels,
-            optimizer_step=self.optimizers.step,
-            lr_scheduler_step=self.lr_schedulers.step,
-            local_batch_size=self.config.training.local_batch_size,
-            seq_len=self.config.training.seq_len,
-            pipeline_schedule=self.config.parallelism.pipeline_parallel_schedule,
-            num_micro_batches=num_micro_batches,
-            gradient_accumulation=self.gradient_accumulation_steps,
-            rank=rank,
-            enable_memory_tracking=self.simulation_config.enable_memory_tracking,
-            memory_parameter_storage_dtype=(
-                self.simulation_config.memory_parameter_storage_dtype
-            ),
-            memory_offload_ac_saved_tensors=(
-                self.simulation_config.memory_offload_ac_saved_tensors
-            ),
-            fsdp_allgather_transport_dtype=(
-                "float8_e4m3fn" if self.simulation_config.enable_fsdp_allgather_fp8 else ""
-            ),
-            pp_schedule=pp_schedule,
-        )
+        with fp8_dispatch_transport_context(
+            self.simulation_config.enable_ep_dispatch_fp8,
+        ):
+            self.workload_graph = run_simulation_step(
+                model_parts=self.model_parts,
+                parallel_dims=self.parallel_dims,
+                forward_backward_step=lambda **kwargs: self.forward_backward_step(**kwargs),
+                input_dict=input_dict,
+                labels=labels,
+                optimizer_step=self.optimizers.step,
+                lr_scheduler_step=self.lr_schedulers.step,
+                local_batch_size=self.config.training.local_batch_size,
+                seq_len=self.config.training.seq_len,
+                pipeline_schedule=self.config.parallelism.pipeline_parallel_schedule,
+                num_micro_batches=num_micro_batches,
+                gradient_accumulation=self.gradient_accumulation_steps,
+                rank=rank,
+                enable_memory_tracking=self.simulation_config.enable_memory_tracking,
+                memory_parameter_storage_dtype=(
+                    self.simulation_config.memory_parameter_storage_dtype
+                ),
+                memory_offload_ac_saved_tensors=(
+                    self.simulation_config.memory_offload_ac_saved_tensors
+                ),
+                fsdp_allgather_transport_dtype=(
+                    "float8_e4m3fn" if self.simulation_config.enable_fsdp_allgather_fp8 else ""
+                ),
+                pp_schedule=pp_schedule,
+            )
 
         t2 = time.perf_counter()
 

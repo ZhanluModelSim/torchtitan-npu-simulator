@@ -20,7 +20,9 @@ from torchtitan_npu.simulator.hardware_shims.grouped_experts_shim import (
     run_meta_grouped_experts,
 )
 from torchtitan_npu.simulator.hardware_shims.moe_dispatch_shim import (
+    fp8_dispatch_transport_context,
     run_meta_all_to_all,
+    run_meta_fp8_dispatch_all_to_all,
 )
 from torchtitan_npu.simulator.hardware_shims.moe_permutation_shim import (
     run_meta_moe_token_permute,
@@ -94,6 +96,44 @@ def test_meta_all_to_all_is_replayed_during_backward():
     ]
     assert tensor.grad is not None
     assert tensor.grad.shape == tensor.shape
+
+
+def test_meta_fp8_dispatch_uses_payload_and_scale_only_in_forward():
+    phase = ["forward"]
+    capture = OpDispatchCapture(phase_provider=lambda: phase[0])
+    tensor = torch.randn(8, 64, device="meta", dtype=torch.bfloat16, requires_grad=True)
+
+    with capture, capture_fake_collectives() as recorder:
+        output = run_meta_fp8_dispatch_all_to_all(tensor, dist.group.WORLD)
+        phase[0] = "backward"
+        output.sum().backward()
+
+    assert output.dtype == torch.bfloat16
+    assert tensor.grad is not None
+    assert [(event.dtype, event.volume_bytes) for event in recorder.events] == [
+        ("float8_e4m3fn", 8 * 64),
+        ("uint8", 8 * 2),
+        ("bfloat16", 8 * 64 * 2),
+    ]
+
+
+def test_meta_fp8_dispatch_can_model_reverse_transport_as_fp8():
+    phase = ["forward"]
+    capture = OpDispatchCapture(phase_provider=lambda: phase[0])
+    tensor = torch.randn(8, 64, device="meta", dtype=torch.bfloat16, requires_grad=True)
+
+    with fp8_dispatch_transport_context(True), capture, capture_fake_collectives() as recorder:
+        output = run_meta_fp8_dispatch_all_to_all(tensor, dist.group.WORLD)
+        phase[0] = "backward"
+        output.sum().backward()
+
+    assert tensor.grad is not None
+    assert [(event.dtype, event.volume_bytes) for event in recorder.events] == [
+        ("float8_e4m3fn", 8 * 64),
+        ("uint8", 8 * 2),
+        ("float8_e4m3fn", 8 * 64),
+        ("uint8", 8 * 2),
+    ]
 
 
 def test_meta_all_to_all_uses_active_module_path():

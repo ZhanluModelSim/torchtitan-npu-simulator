@@ -372,6 +372,20 @@ all-gather 全参数的 dtype。激活卸载作用于所有“forward 产生且�
 仍按其 forward/recompute 生命周期建模。freqs、mask 等无梯度外部上下文不会被
 当作保存激活卸载。两个开关默认均关闭。
 
+### FP8 MoE Dispatch 假设
+
+可开启 EP token-dispatch 的 FP8 通信建模：
+
+```bash
+--simulation.enable-ep-dispatch-fp8
+```
+
+P0 将前向 token dispatch 建模为 `float8_e4m3fn` payload 加每 32 个 hidden
+元素一个 1-byte MX scale；开关开启时，dispatch reverse A2A 也按相同格式建模。
+output combine 仍按 BF16 建模。该开关不改变真实训练计算 dtype，也不声称已经
+启用真实 NPU 上的“量化 A2A 直接进入 GMM”训练路径；后者需要独立的 GMM
+autograd bridge 才能保持 weight gradient 语义。
+
 selective checkpoint 保存的内部 tensor 在 `tensor_lifetimes.csv` 中标记为
 `checkpoint_saved_for_recompute`。summary 中的
 `checkpoint_recompute_saved_{tensor_count,logical_bytes,modeled_bytes}`
