@@ -69,7 +69,9 @@ class SparseAttentionCP(ParallelStyle):
         new_kwargs = dict(kwargs)
         k_indexer = new_kwargs.get("k_indexer")
         if k_indexer is not None and isinstance(k_indexer, torch.Tensor):
-            new_kwargs["k_indexer"] = _ag(k_indexer, dim=1)[:, :slice_end, :, :]
+            idx_k = _ag(k_indexer, dim=1)[:, :slice_end, :, :]
+            # Refresh 0-axis stride of the sliced tensor, otherwise LI may reject this.
+            new_kwargs["k_indexer"] = idx_k.reshape(-1).view_as(idx_k)
 
         new_args = (q, k, v, *args[3:])
         return new_args, new_kwargs
