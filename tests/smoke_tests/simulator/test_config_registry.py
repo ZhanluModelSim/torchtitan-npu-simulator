@@ -151,6 +151,21 @@ def test_ep_dispatch_fp8_cli_override_is_simulator_only():
     assert config.simulation.enable_ep_dispatch_fp8 is True
 
 
+def test_mixed_precision_reduce_accepts_bfloat16_from_cli():
+    config = ConfigManager().parse_args(
+        [
+            "--module",
+            "torchtitan_npu.simulator",
+            "--config",
+            "deepseek_v4_smoketest",
+            "--training.mixed-precision-reduce",
+            "bfloat16",
+        ]
+    )
+
+    assert config.training.mixed_precision_reduce == "bfloat16"
+
+
 def test_model_override_schema_tracks_all_deepseek_v4_fields():
     model_fields = {
         field.name for field in dataclasses.fields(DeepSeekV4Model.Config)

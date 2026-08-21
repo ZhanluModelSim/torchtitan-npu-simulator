@@ -144,6 +144,14 @@ class ParallelismConfig(_BaseParallelismConfig):
 class TrainingConfig(_BaseTrainingConfig):
     """Training config with NPU memory and Multi-Token-Prediction fields."""
 
+    mixed_precision_reduce: Literal["bfloat16", "float32"] = "float32"
+    """
+    Datatype used for FSDP/DDP gradient reduction.
+
+    Upstream currently restricts this field to ``float32``. NPU FSDP and DDP
+    support BF16 reduction, so expose it through the NPU CLI as well.
+    """
+
     torch_npu_memory_ratio: float = 1.0
     """
     Maximum proportion of NPU memory PyTorch is allowed to occupy in [0.0, 1.0].
