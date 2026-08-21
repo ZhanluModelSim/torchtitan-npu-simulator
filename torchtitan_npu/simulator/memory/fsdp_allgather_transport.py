@@ -13,6 +13,7 @@ all-gather transport volume and its short-lived staging buffer.
 from __future__ import annotations
 
 from collections.abc import Iterable
+from dataclasses import replace
 from typing import Any
 
 from torchtitan_npu.simulator.capture.tensor_utils import (
@@ -29,9 +30,15 @@ def _field(event: Any, name: str, default: Any = "") -> Any:
 
 
 def _is_fsdp_allgather(event: Any) -> bool:
-    return (
-        _field(event, "comm_primitive") == "allgather"
-        and "fsdp" in str(_field(event, "comm_dim")).lower()
+    if _field(event, "comm_primitive") != "allgather":
+        return False
+    # Fake ProcessGroup names are numeric (for example ``"0"``), so they
+    # cannot reliably identify the FSDP axis. Residency capture stamps the
+    # collective with its FSDP transition/group while the hook is active.
+    return bool(
+        _field(event, "fsdp_transition_id")
+        or _field(event, "fsdp_group_id")
+        or "fsdp" in str(_field(event, "comm_dim")).lower()
     )
 
 
@@ -54,6 +61,12 @@ def apply_fsdp_allgather_transport_dtype(
         node = nodes.get(event.op_id)
         if node is not None:
             node.comm_bytes = event.volume_bytes
+            # L0 OpNode metadata describes the bytes carried by this
+            # communication operation. Keep RawMemoryEvent tensors unchanged:
+            # FSDP dequantizes back to the captured compute dtype before its
+            # consumer, while the wire payload is FP8.
+            node.inputs = [replace(meta, dtype=dtype) for meta in node.inputs]
+            node.outputs = [replace(meta, dtype=dtype) for meta in node.outputs]
             node.annotations.update(
                 {
                     "transport_dtype": dtype,

@@ -3,6 +3,7 @@
 from types import SimpleNamespace
 
 from torchtitan_npu.simulator.ir.op_node import OpNode
+from torchtitan_npu.simulator.ir.tensor_meta import TensorMeta
 from torchtitan_npu.simulator.memory.estimator import estimate_static_memory
 from torchtitan_npu.simulator.memory.fsdp_allgather_transport import (
     apply_fsdp_allgather_transport_dtype,
@@ -19,11 +20,23 @@ def _event(seq_idx: int, op_id: int, inputs: tuple[TensorRef, ...], outputs: tup
 
 
 def test_transport_override_changes_only_fsdp_allgather_traffic():
-    node = OpNode(10, "allgather", [], [], {}, [], [], comm_bytes=64, peak_mem=128)
+    tensor = TensorMeta("t", (64,), "bfloat16", "meta")
+    node = OpNode(
+        10,
+        "allgather",
+        [tensor],
+        [tensor],
+        {},
+        [],
+        [],
+        comm_bytes=64,
+        peak_mem=128,
+    )
     fsdp = SimpleNamespace(
         op_id=10,
         comm_primitive="allgather",
-        comm_dim="fsdp",
+        comm_dim="0",
+        fsdp_group_id="layer0",
         tensor_shape=(64,),
         dtype="bfloat16",
         volume_bytes=128,
@@ -39,6 +52,10 @@ def test_transport_override_changes_only_fsdp_allgather_traffic():
 
     assert apply_fsdp_allgather_transport_dtype([fsdp, tp], {10: node}, "float8_e4m3fn") == 1
     assert (fsdp.dtype, fsdp.volume_bytes, node.comm_bytes, node.peak_mem) == ("float8_e4m3fn", 64, 64, 128)
+    assert ([meta.dtype for meta in node.inputs], [meta.dtype for meta in node.outputs]) == (
+        ["float8_e4m3fn"],
+        ["float8_e4m3fn"],
+    )
     assert (tp.dtype, tp.volume_bytes) == ("bfloat16", 128)
 
 
