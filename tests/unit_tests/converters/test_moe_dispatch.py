@@ -9,7 +9,7 @@ from typing import Any, cast
 import torch
 
 from torchtitan_npu.converters.kernels import moe_dispatch, permutation
-from torchtitan_npu.converters.kernels.permutation import NPUMoeReRouting
+from torchtitan_npu.converters.kernels.permutation import NPUMoeReRouting, NPUMoeTokenUnpermute
 
 
 def _expert_parallel_module():
@@ -68,10 +68,10 @@ def test_re_routing_backward_unpermutes_token_and_scale_grads(monkeypatch):
             expert_token_num_per_rank.sum(dim=0).to(torch.int32),
         )
 
-    unpermute_indices = []
+    unpermute_calls = []
 
     def fake_unpermute(permuted_tokens, sorted_indices, _probs):
-        unpermute_indices.append(sorted_indices.clone())
+        unpermute_calls.append((sorted_indices.clone(), torch.is_grad_enabled()))
         return permuted_tokens[sorted_indices.to(torch.int64)]
 
     monkeypatch.setattr(permutation.torch_npu, "npu_moe_re_routing", fake_re_routing)
@@ -97,13 +97,38 @@ def test_re_routing_backward_unpermutes_token_and_scale_grads(monkeypatch):
     assert num_tokens_per_expert.dtype is torch.int64
     expected_restore_indices = torch.argsort(token_order_indices)
     assert torch.equal(restore_indices, expected_restore_indices)
-    assert len(unpermute_indices) == 2
-    assert torch.equal(unpermute_indices[0], expected_restore_indices)
-    assert torch.equal(unpermute_indices[1], expected_restore_indices)
+    assert len(unpermute_calls) == 2
+    assert torch.equal(unpermute_calls[0][0], expected_restore_indices)
+    assert torch.equal(unpermute_calls[1][0], expected_restore_indices)
+    assert all(not grad_enabled for _indices, grad_enabled in unpermute_calls)
     assert routed_tokens.grad is not None
     assert scales.grad is not None
     assert torch.equal(routed_tokens.grad, token_grad[expected_restore_indices])
     assert torch.equal(scales.grad, scale_grad[expected_restore_indices])
+
+
+def test_token_unpermute_uses_its_explicit_backward_kernel(monkeypatch):
+    seen = {}
+
+    def fake_forward(permuted_tokens, sorted_indices, restore_shape, **kwargs):
+        seen["forward"] = (sorted_indices, restore_shape)
+        return permuted_tokens, None, None, None
+
+    def fake_backward(grad_output, sorted_indices, *_args, **_kwargs):
+        seen["backward"] = sorted_indices
+        return grad_output, None
+
+    monkeypatch.setattr(permutation.torch_npu, "_npu_moe_token_unpermute_with_routing_map", fake_forward)
+    monkeypatch.setattr(permutation.torch_npu, "npu_moe_token_unpermute_with_routing_map_grad", fake_backward)
+
+    tokens = torch.randn(4, 3, requires_grad=True)
+    indices = torch.tensor([2, 0, 3, 1], dtype=torch.int64)
+    NPUMoeTokenUnpermute.apply(tokens, indices, tokens.shape).sum().backward()
+
+    assert tokens.grad is not None
+    assert torch.equal(tokens.grad, torch.ones_like(tokens))
+    assert torch.equal(seen["forward"][0], indices)
+    assert torch.equal(seen["backward"], indices)
 
 
 def test_token_dispatch_real_process_group_routes_scores_through_re_routing(monkeypatch):

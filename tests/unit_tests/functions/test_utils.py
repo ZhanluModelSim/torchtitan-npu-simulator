@@ -41,6 +41,30 @@ def test_npu_apply_rotary_emb_single_complex_prepares_interleaved_cos_sin(monkey
     assert captured["rotary_mode"] == "interleave"
 
 
+def test_npu_rotary_mul_uses_the_registered_backward_kernel(monkeypatch):
+    captured = {}
+    x = torch.randn(2, 4, 3, 8, requires_grad=True)
+    cos = torch.randn(1, 4, 1, 8, requires_grad=True)
+    sin = torch.randn(1, 4, 1, 8, requires_grad=True)
+
+    def fake_rotary_mul(tensor, cos, sin, rotary_mode="half"):
+        return tensor * cos + sin
+
+    def fake_rotary_mul_backward(grad_output, tensor, cos, sin, rotary_mode="half"):
+        captured["rotary_mode"] = rotary_mode
+        return grad_output * cos, grad_output.sum_to_size(cos.shape), grad_output.sum_to_size(sin.shape)
+
+    monkeypatch.setattr(rope_kernel.torch_npu, "npu_rotary_mul", fake_rotary_mul)
+    monkeypatch.setattr(rope_kernel.torch_npu, "npu_rotary_mul_backward", fake_rotary_mul_backward)
+
+    rope_kernel.npu_rotary_mul(x, cos, sin, rotary_mode="interleave").sum().backward()
+
+    assert x.grad is not None
+    assert cos.grad is not None
+    assert sin.grad is not None
+    assert captured["rotary_mode"] == "interleave"
+
+
 def test_npu_apply_rotary_emb_cos_sin_uses_input_sequence_length(monkeypatch):
     captured = []
     xq = torch.randn(2, 4, 8, 16, dtype=torch.float16)

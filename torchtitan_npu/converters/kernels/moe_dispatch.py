@@ -142,11 +142,7 @@ def _run_local_experts(self, inputs: _LocalExpertInputs) -> torch.Tensor:
         routed_scores,
     )
 
-    unpermuted = torch_npu.npu_moe_token_unpermute(
-        routed_output,
-        sorted_indices,
-        None,
-    )
+    unpermuted = NPUMoeTokenUnpermute.apply(routed_output, sorted_indices, routed_output.shape)
     return unpermuted.view(inputs.total_tokens, self.reorderer.top_k, inputs.dim).sum(dim=1)
 
 

@@ -41,7 +41,7 @@ class NPUMoeTokenUnpermute(torch.autograd.Function):
     # pyrefly: ignore [bad-override]
     def backward(ctx, unpermuted_tokens_grad):
         if not unpermuted_tokens_grad.numel():
-            return unpermuted_tokens_grad, None, None, None, None, None
+            return unpermuted_tokens_grad, None, None
         if ctx.needs_input_grad[0]:
             sorted_indices = ctx.sorted_indices
             act_grad, _ = torch_npu.npu_moe_token_unpermute_with_routing_map_grad(
@@ -54,9 +54,9 @@ class NPUMoeTokenUnpermute(torch.autograd.Function):
                 drop_and_pad=False,
                 restore_shape=ctx.restore_shape,
             )
-            return act_grad, None, None, None, None, None
+            return act_grad, None, None
 
-        return None, None, None, None, None, None
+        return None, None, None
 
 
 class NPUMoeReRouting(torch.autograd.Function):
@@ -126,18 +126,23 @@ class NPUMoeReRouting(torch.autograd.Function):
 
         routed_tokens_grad = None
         if ctx.needs_input_grad[0] and permuted_tokens_grad is not None:
-            routed_tokens_grad = torch_npu.npu_moe_token_unpermute(
-                permuted_tokens_grad,
-                restore_indices,
-                None,
-            )
+            # This custom backward returns a first-order gradient. The raw
+            # NPU op has no Autograd dispatch registration, so never build a
+            # second-order graph through it.
+            with torch.no_grad():
+                routed_tokens_grad = torch_npu.npu_moe_token_unpermute(
+                    permuted_tokens_grad,
+                    restore_indices,
+                    None,
+                )
 
         per_token_scales_grad = None
         if ctx.needs_input_grad[2] and permuted_scales_grad is not None:
-            per_token_scales_grad = torch_npu.npu_moe_token_unpermute(
-                permuted_scales_grad,
-                restore_indices,
-                None,
-            )
+            with torch.no_grad():
+                per_token_scales_grad = torch_npu.npu_moe_token_unpermute(
+                    permuted_scales_grad,
+                    restore_indices,
+                    None,
+                )
 
         return routed_tokens_grad, None, per_token_scales_grad

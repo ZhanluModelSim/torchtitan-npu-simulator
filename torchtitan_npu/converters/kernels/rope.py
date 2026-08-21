@@ -22,6 +22,52 @@ from ..registry import register_model_converter
 logger = logging.getLogger(__name__)
 
 
+class NPURotaryMul(torch.autograd.Function):
+    """Autograd wrapper for the NPU RoPE kernel.
+
+    ``npu_rotary_mul`` provides a dedicated backward op but has no Autograd
+    dispatch registration. Calling it directly can silently drop its gradient
+    edge in newer PyTorch versions.
+    """
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def forward(
+        ctx,
+        tensor: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        rotary_mode: str = "half",
+    ) -> torch.Tensor:
+        ctx.save_for_backward(tensor, cos, sin)
+        ctx.rotary_mode = rotary_mode
+        if rotary_mode == "half":
+            return torch_npu.npu_rotary_mul(tensor, cos, sin)
+        return torch_npu.npu_rotary_mul(tensor, cos, sin, rotary_mode)
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def backward(ctx, grad_output: torch.Tensor):
+        tensor, cos, sin = ctx.saved_tensors
+        grad_tensor, grad_cos, grad_sin = torch_npu.npu_rotary_mul_backward(
+            grad_output,
+            tensor,
+            cos,
+            sin,
+            ctx.rotary_mode,
+        )
+        return grad_tensor, grad_cos, grad_sin, None
+
+
+def npu_rotary_mul(
+    tensor: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    rotary_mode: str = "half",
+) -> torch.Tensor:
+    return NPURotaryMul.apply(tensor, cos, sin, rotary_mode)
+
+
 def _complex_to_interleaved_cos_sin(freqs_cis: torch.Tensor, dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
     cos = freqs_cis.real.repeat_interleave(2, dim=-1)
     sin = freqs_cis.imag.repeat_interleave(2, dim=-1)
@@ -94,8 +140,8 @@ def npu_apply_rotary_emb_cos_sin(
 
     xq_f = xq_local.float()
     xk_f = xk_local.float()
-    xq_out = torch_npu.npu_rotary_mul(xq_f, cos, sin)
-    xk_out = torch_npu.npu_rotary_mul(xk_f, cos, sin)
+    xq_out = npu_rotary_mul(xq_f, cos, sin)
+    xk_out = npu_rotary_mul(xk_f, cos, sin)
 
     xq_out = xq_out.type_as(xq_local)
     xk_out = xk_out.type_as(xk_local)
@@ -130,8 +176,8 @@ def npu_apply_rotary_emb_complex(
     xk_f = xk_local.float()
 
     cos, sin = _complex_to_interleaved_cos_sin(freqs_cis, xq_f.dtype)
-    xq_out = torch_npu.npu_rotary_mul(xq_f, cos, sin, rotary_mode="interleave").type_as(xq_local)
-    xk_out = torch_npu.npu_rotary_mul(xk_f, cos.to(xk_f.dtype), sin.to(xk_f.dtype), rotary_mode="interleave").type_as(
+    xq_out = npu_rotary_mul(xq_f, cos, sin, rotary_mode="interleave").type_as(xq_local)
+    xk_out = npu_rotary_mul(xk_f, cos.to(xk_f.dtype), sin.to(xk_f.dtype), rotary_mode="interleave").type_as(
         xk_local
     )
 
@@ -161,7 +207,7 @@ def npu_apply_rotary_emb_single_complex(
     x_f = x_local.float()
 
     cos, sin = _complex_to_interleaved_cos_sin(freqs_cis, x_f.dtype)
-    y = torch_npu.npu_rotary_mul(x_f, cos, sin, rotary_mode="interleave")
+    y = npu_rotary_mul(x_f, cos, sin, rotary_mode="interleave")
     y = y.to(x_local.dtype)
 
     if is_dtensor:
