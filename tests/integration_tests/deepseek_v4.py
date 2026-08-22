@@ -103,6 +103,8 @@ def build_deepseek_v4_test_list() -> list[OverrideDefinitions]:
             extra_args=(
                 "--training.steps=1",
                 "--parallelism.expert-parallel-degree=2",
+                "--compile.enable",
+                "--compile.backend=aot_eager",
                 "--hf-assets-path=tests/assets/deepseek_v3",
                 "--training.global-batch-size=2",
             ),
@@ -118,6 +120,8 @@ def build_deepseek_v4_test_list() -> list[OverrideDefinitions]:
                 "--parallelism.expert-parallel-degree=2",
                 "--parallelism.context-parallel-degree=2",
                 "--parallelism.spmd-backend=spmd_types",
+                "--compile.enable",
+                "--compile.backend=aot_eager",
                 "--hf-assets-path=tests/assets/deepseek_v3",
                 "--training.global-batch-size=2",
             ),

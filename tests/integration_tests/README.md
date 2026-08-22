@@ -10,8 +10,8 @@
 | `dsv4_golden_1rank` | DeepSeek-V4 | 1 Rank 参考配置 | 1 | - | 是 | - |
 | `dsv4_golden_ep2_fsdp2` | DeepSeek-V4 | EP2 + FSDP2 | 2 | - | 是 | - |
 | `dsv4_smla_1rank_aot_eager` | DeepSeek-V4 | 1 Rank | 1 | `aot_eager` | 否 | SMLA 暂不支持 `--debug.deterministic` |
-| `dsv4_smla_ep2_fsdp2` | DeepSeek-V4 | EP2 + FSDP2 | 2 | - | 否 | SMLA 暂不支持 `--debug.deterministic`；原先 `aot_eager` 触发 `NpuMoeTokenUnpermuteBackward0` SymInt 解包失败，当前不编译规避，见 [#106](https://gitcode.com/cann/torchtitan-npu/issues/106) |
-| `dsv4_smla_cp2_ep2_fsdp2` | DeepSeek-V4 | CP2 + EP2 + FSDP2 | 4 | - | 否 | 与 EP2 同源：`NpuMoeTokenUnpermuteBackward0` SymInt 问题；当前不编译规避，见 [#106](https://gitcode.com/cann/torchtitan-npu/issues/106) |
+| `dsv4_smla_ep2_fsdp2` | DeepSeek-V4 | EP2 + FSDP2 | 2 | `aot_eager` | 否 | SMLA 暂不支持 `--debug.deterministic` |
+| `dsv4_smla_cp2_ep2_fsdp2` | DeepSeek-V4 | CP2 + EP2 + FSDP2 | 4 | `aot_eager` | 否 | SMLA 暂不支持 `--debug.deterministic` |
 | `dsv4_smla_cp2` | DeepSeek-V4 | CP2 | 2 | - | 否 | SMLA 暂不支持 `--debug.deterministic` |
 
 `use_golden` 与 `check_loss` 是两个独立维度：`use_golden` 仅决定使用 Golden 参考算子
@@ -23,23 +23,12 @@
 
 四个 SMLA case 都设置 `check_loss=False`，因此不会启用 `--debug.deterministic`，也不会
 读取 golden loss。它们用于覆盖 SMLA/NPU override 在单卡、EP+FSDP、CP+EP+FSDP 以及
-CP 场景下的实际构图、编译和训练执行路径；其中 1P 场景使用 `aot_eager`，EP2/CP2 两个
-场景当前以 eager 方式执行以规避 [#106](https://gitcode.com/cann/torchtitan-npu/issues/106)。
+CP 场景下的实际构图、编译和训练执行路径；单卡、EP2 和 CP2+EP2 场景均使用
+`aot_eager`，并默认覆盖 fused MoE token dispatcher。
 
 这里的 integration recipe 聚焦 sparse-attention / MHC 回归边界。端到端 example 脚本
 额外启用 Virtual Optimizer / checkpoint override；这些 storage/checkpoint override 不属于
 当前 integration loss regression 的覆盖范围。
-
-## 已知问题 / 待解决
-
-- **`NpuMoeTokenUnpermuteBackward0` SymInt 解包失败**：2P EP=2 SMLA + `aot_eager` 时，
-  `torch_npu.npu_moe_token_unpermute` 的自动生成 backward 在 AOTAutograd 中报
-  `RuntimeError: when unpacking SymInt, expected int but got u12 + u13`。
-- 影响用例：`dsv4_smla_ep2_fsdp2`、`dsv4_smla_cp2_ep2_fsdp2`。
-- 当前规避：EP2/CP2 两个用例不启用 `--compile.enable`，以 eager 方式覆盖
-  SMLA/EP/CP 路径；1P AOT 用例保留用于单卡编译回归。1P 编译路径当前另有
-  `torch_npu.npu.get_device_name()` 触发 Dynamo Unsupported 的环境/编译限制。
-- 跟踪 issue：[#106](https://gitcode.com/cann/torchtitan-npu/issues/106)。
 
 ## 入口
 

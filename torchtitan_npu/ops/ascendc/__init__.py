@@ -5,4 +5,8 @@
 
 """AscendC operator registrations used by NPU overrides."""
 
-from . import grouped_mm  # noqa: F401
+from . import (
+    grouped_mm,  # noqa: F401
+    moe_re_routing,  # noqa: F401
+    moe_token_unpermute,  # noqa: F401
+)

@@ -13,11 +13,10 @@ score multiply + ``deterministic_scatter_add`` with the fused NPU kernels
 
 Semantics of the upstream metadata fields under this override:
 
-- ``token_indices_experts_sorted_N`` stores the *inverse* permutation Q
-  returned by ``npu_moe_token_permute`` (the double-argsorted forward
-  permutation), NOT the forward argsort P of the upstream ``_local_reorder``.
-  Q is exactly the ``sorted_indices`` input consumed by
-  ``npu_moe_token_unpermute``.
+- ``token_indices_experts_sorted_N`` stores the ``sorted_indices`` tensor
+  returned by ``npu_moe_token_permute``. It is passed unchanged to
+  ``npu_moe_token_unpermute``; the dispatcher does not reinterpret it as the
+  upstream ``_local_reorder`` argsort tensor.
 - ``topk_scores_experts_sorted_N`` stores the original ``topk_scores_TK``
   ``(T, K)`` tensor, NOT the per-row gathered scores of the upstream
   ``_local_reorder``. ``npu_moe_token_unpermute`` expects ``probs`` shaped
@@ -46,6 +45,9 @@ from torchtitan.models.common.token_dispatcher import (
     AllToAllTokenDispatcher,
     LocalDispatchMetadata,
 )
+
+from torchtitan_npu.ops.ascendc.moe_re_routing import npu_moe_re_routing
+from torchtitan_npu.ops.ascendc.moe_token_unpermute import npu_moe_token_unpermute
 
 
 class NPUAllToAllTokenDispatcher(AllToAllTokenDispatcher):
@@ -96,9 +98,12 @@ class NPUAllToAllTokenDispatcher(AllToAllTokenDispatcher):
             metadata: dispatch metadata for combine()
         """
         # Fused NPU permute: replaces _local_reorder (argsort + index_select).
-        # sorted_indices_N is the inverse permutation Q; npu_moe_token_unpermute
-        # consumes Q directly in combine.
-        routed_input_ND, sorted_indices_N = torch_npu.npu_moe_token_permute(x_TD, topk_expert_ids_TK)
+        # Keep the kernel-returned sorted_indices opaque; the matching
+        # unpermute kernel consumes it directly in combine.
+        routed_input_ND, sorted_indices_N = torch_npu.npu_moe_token_permute(
+            x_TD,
+            topk_expert_ids_TK,
+        )
 
         # EP=1: local dispatch — no all-to-all needed.
         if self.ep_mesh is None:
@@ -155,22 +160,24 @@ class NPUAllToAllTokenDispatcher(AllToAllTokenDispatcher):
                 output_splits_list,
                 input_splits_list,
             )
-            # Reorder from rank-major to expert-major via _permute (inherited).
-            (
-                input_shape,
-                routed_input_RD,
-                permuted_indices,
-                num_global_tokens_per_local_expert_e,
-            ) = self._permute(
-                routed_input_RD,
-                num_global_tokens_per_local_expert_E,
+            # Fused CANN reroute replaces inherited _permute. The returned
+            # restore indices are consumed by the matching unpermute op in
+            # combine and by the reroute autograd formula.
+            expert_token_num_per_rank = num_global_tokens_per_local_expert_E.view(
+                ep_size,
+                -1,
             )
+            routed_input_RD, restore_indices, num_global_tokens_per_local_expert_e = npu_moe_re_routing(
+                routed_input_RD,
+                expert_token_num_per_rank,
+            )
+            input_shape = routed_input_RD.shape
 
         metadata = AllToAllDispatchMetadata(
             token_indices_experts_sorted_N=sorted_indices_N,
             topk_scores_experts_sorted_N=topk_scores_TK,
             input_shape=input_shape,
-            permuted_indices=permuted_indices,
+            permuted_indices=restore_indices,
             input_splits=input_splits_list,
             output_splits=output_splits_list,
         )
@@ -215,7 +222,7 @@ class NPUAllToAllTokenDispatcher(AllToAllTokenDispatcher):
         """
         # EP=1: fused NPU unpermute — no all-to-all to reverse.
         if self.ep_mesh is None:
-            return torch_npu.npu_moe_token_unpermute(
+            return npu_moe_token_unpermute(
                 routed_output_RD,
                 metadata.token_indices_experts_sorted_N,
                 probs=metadata.topk_scores_experts_sorted_N,  # topk_scores_TK
@@ -229,8 +236,15 @@ class NPUAllToAllTokenDispatcher(AllToAllTokenDispatcher):
                 if get_spmd_backend() == "spmd_types"
                 else self.ep_mesh.get_group()
             )
-            # Reverse expert-major reordering (inherited)
-            routed_output_RD = self._unpermute(routed_output_RD, metadata.input_shape, metadata.permuted_indices)
+            # Reverse the fused rank-major -> expert-major reroute. This case
+            # has no routing map, probabilities, or drop-and-pad slots, so the
+            # plain unpermute kernel is the exact inverse and avoids the
+            # restore_shape/SymInt path of the routing-map variant.
+            routed_output_RD = npu_moe_token_unpermute(
+                routed_output_RD,
+                metadata.permuted_indices,
+                probs=None,
+            )
             # All-to-all combine: returns AsyncCollectiveTensor — the a2a runs
             # on the HCCL stream and won't block until the tensor is accessed.
             routed_output_RD = self._combine_token_exchange(
@@ -245,7 +259,7 @@ class NPUAllToAllTokenDispatcher(AllToAllTokenDispatcher):
             routed_output_RD = spmd.reinterpret_mesh(routed_output_RD, spmd.current_mesh())
 
         # Fused NPU unpermute: scatter + score x probs + sum over top-K.
-        local_out = torch_npu.npu_moe_token_unpermute(
+        local_out = npu_moe_token_unpermute(
             routed_output_RD,
             metadata.token_indices_experts_sorted_N,
             probs=metadata.topk_scores_experts_sorted_N,  # topk_scores_TK
