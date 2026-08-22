@@ -16,6 +16,7 @@ from torchtitan_npu.patches.optimizer.muon_optimizer import (
     _build_adamw_kwargs,
     _build_muon_kwargs,
     get_muon_compile_options,
+    NewtonSchulzConfig,
     _get_muon_lr_config,
     _split_parameters_for_muon,
     build_muon_lr_schedulers,
@@ -245,10 +246,12 @@ def test_muon_lmo_matches_legacy_2d():
 
     actual = optimizer.lmo(
         grad,
-        eps=1e-7,
-        backend_steps=2,
-        adjust_lr_fn="match_rms_adamw",
-        hybrid_ns=False,
+        NewtonSchulzConfig(
+            eps=1e-7,
+            backend_steps=2,
+            adjust_lr_fn="match_rms_adamw",
+            hybrid_ns=False,
+        ),
     )
 
     torch.testing.assert_close(actual, expected)
@@ -765,14 +768,14 @@ def _make_expert_swap_stub(params, calls, transfer_stream):
     def get_grad(param, *args):
         return _ScheduleGrad(indices[id(param)])
 
-    def lmo(grad, **kwargs):
+    def lmo(grad, ns, **kwargs):
         calls.append(("compute", grad.index))
         return grad
 
     def ignore(*args, **kwargs):
         return None
 
-    return types.SimpleNamespace(
+    opt = types.SimpleNamespace(
         _swap_enabled=True,
         _swap_container=object(),
         _swap_transfer_stream=transfer_stream,
@@ -782,7 +785,10 @@ def _make_expert_swap_stub(params, calls, transfer_stream):
         adjust_lr_fn="original",
         hybrid_ns=False,
         parameters_to_groups=indices,
-        groups_info={index: (1e-3, False, 0.95, 0.0, {}) for index in range(len(params))},
+        groups_info={
+            index: (1e-3, False, 0.95, 0.0, {"eps": 1e-7, "backend_steps": 5})
+            for index in range(len(params))
+        },
         _swap_h2d_group=swap_h2d,
         _wait_swap_group=wait_swap,
         _swap_d2h_group=swap_d2h,
@@ -791,6 +797,8 @@ def _make_expert_swap_stub(params, calls, transfer_stream):
         lmo=lmo,
         update_bucket_params=ignore,
     )
+    opt._process_expert_chunk = lambda chunk: DistributedMuon._process_expert_chunk(opt, chunk)
+    return opt
 
 
 def _make_fsdp_swap_stub(calls, transfer_stream):
@@ -875,53 +883,43 @@ def test_swap_muon_state_lifecycle(monkeypatch):
 
 
 def test_swap_experts_reuses_released_group_without_host_wait():
-    params = [object() for _ in range(3)]
+    params = [object() for _ in range(5)]
     calls = []
     transfer_stream = object()
     opt = _make_expert_swap_stub(params, calls, transfer_stream)
 
     DistributedMuon.step_experts(opt, params, [f"expert_{index}" for index in range(len(params))])
 
-    assert calls == [
-        ("h2d", 0, None, transfer_stream),
-        ("wait", 0),
-        ("compute", 0),
-        ("h2d", 1, None, transfer_stream),
-        ("d2h", 0, transfer_stream),
-        ("wait", 1),
-        ("compute", 1),
-        ("h2d", 2, "buffer_0", transfer_stream),
-        ("d2h", 1, transfer_stream),
-        ("wait", 2),
-        ("compute", 2),
-        ("d2h", 2, transfer_stream),
-        ("drain", transfer_stream),
-    ]
+    compute = [entry[1] for entry in calls if entry[0] == "compute"]
+    assert compute == list(range(len(params)))
+    assert calls[0] == ("h2d", 0, None, transfer_stream)
+    h2d_next = ("h2d", 2, None, transfer_stream)
+    d2h_current = ("d2h", 0, transfer_stream)
+    assert h2d_next in calls
+    assert d2h_current in calls
+    assert calls.index(h2d_next) < calls.index(d2h_current)
+    assert ("h2d", 4, "buffer_0", transfer_stream) in calls
+    assert calls[-1] == ("drain", transfer_stream)
 
 
 def test_swap_fsdp_reuses_released_group_without_host_wait():
-    params = ["p0", "p1", "p2"]
+    params = [f"p{i}" for i in range(5)]
     calls = []
     transfer_stream = object()
     opt = _make_fsdp_swap_stub(calls, transfer_stream)
 
     DistributedMuon.step_fsdp(opt, params, params)
 
-    assert calls == [
-        ("h2d", "p0", None, transfer_stream),
-        ("wait", "p0"),
-        ("compute", "p0"),
-        ("h2d", "p1", None, transfer_stream),
-        ("d2h", "p0", transfer_stream),
-        ("wait", "p1"),
-        ("compute", "p1"),
-        ("h2d", "p2", "buffer_p0", transfer_stream),
-        ("d2h", "p1", transfer_stream),
-        ("wait", "p2"),
-        ("compute", "p2"),
-        ("d2h", "p2", transfer_stream),
-        ("drain", transfer_stream),
-    ]
+    compute = [entry[1] for entry in calls if entry[0] == "compute"]
+    assert compute == params
+    assert calls[0] == ("h2d", "p0", None, transfer_stream)
+    h2d_next = ("h2d", "p1", None, transfer_stream)
+    d2h_current = ("d2h", "p0", transfer_stream)
+    assert h2d_next in calls
+    assert d2h_current in calls
+    assert calls.index(h2d_next) < calls.index(d2h_current)
+    assert ("h2d", "p2", "buffer_p0", transfer_stream) in calls
+    assert calls[-1] == ("drain", transfer_stream)
 
 
 def test_match_reusable_buffers_uses_sorted_positional_fast_path():

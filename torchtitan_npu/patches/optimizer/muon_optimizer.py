@@ -21,6 +21,7 @@ from typing import Any, ClassVar, Literal
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.distributed.checkpoint.state_dict import (
     StateDictOptions,
     get_optimizer_state_dict,
@@ -42,6 +43,17 @@ COEFF_PRIMARY = (3.4445, -4.7750, 2.0315)
 # for rapid convergence, last 2 steps switch to secondary coefficients
 # to stabilize singular values precisely at 1.
 COEFF_SECONDARY = (2.0, -1.5, 0.5)
+
+_EXPERT_GMM_MAX_PARAM_GROUP_SIZE = 2
+_FSDP_GMM_BF16_ALIGNMENT_ELEMENTS = 8
+
+
+@dataclass
+class NewtonSchulzConfig:
+    eps: float
+    backend_steps: int
+    adjust_lr_fn: str = "original"
+    hybrid_ns: bool = False
 
 
 def zeropower_via_newtonschulz5(grad, steps=10, eps=1e-7, hybrid_ns=False):
@@ -87,6 +99,37 @@ def zeropower_via_newtonschulz5(grad, steps=10, eps=1e-7, hybrid_ns=False):
     return x.to(original_dtype)
 
 
+def _packed_grouped_mm(lhs, rhs, offsets):
+    """Grouped equivalent of BMM for a packed, same-shaped 3D tensor."""
+    groups, rows, inner = lhs.shape
+    if rhs.ndim != 3 or rhs.shape[0] != groups or rhs.shape[1] != inner:
+        raise ValueError(f"Incompatible grouped matmul shapes: {lhs.shape} @ {rhs.shape}")
+
+    output = torch._grouped_mm(
+        lhs.view(groups * rows, inner),
+        rhs,
+        offs=offsets,
+    )  # pyrefly: ignore [no-matching-overload]
+    return output.view(groups, rows, rhs.shape[-1])
+
+
+def zeropower_via_newtonschulz5_grouped_core(x, offsets, steps=10, hybrid_ns=False):
+    """Newton-Schulz core for an already normalized packed Expert tensor."""
+    if steps >= 100:
+        raise ValueError(f"Number of NS steps must be < 100 for computational efficiency, got {steps}")
+    if x.ndim != 3:
+        raise ValueError(f"Grouped NS expects a 3D packed tensor, got shape: {x.shape}")
+    a, b, c = COEFF_PRIMARY
+    for i in range(steps):
+        if hybrid_ns and i >= 8:
+            a, b, c = COEFF_SECONDARY
+        gram = _packed_grouped_mm(x, x.transpose(1, 2), offsets)
+        gram2 = _packed_grouped_mm(gram, gram, offsets)
+        poly = b * gram + c * gram2
+        x = a * x + _packed_grouped_mm(poly, x, offsets)
+    return x
+
+
 _EXPERT_KEYWORDS = ("experts", "expert")
 
 
@@ -97,12 +140,9 @@ class ParamType(Enum):
 
 
 def get_param_type(p, param_name, fsdp_enabled, expert_enabled):
-    """Classify parameter for distributed Muon routing.
+    """Classify parameters for distributed Muon routing."""
+    is_expert_param = p.ndim == 3 and expert_enabled and any(keyword in param_name for keyword in _EXPERT_KEYWORDS)
 
-    Uses dimension + name heuristics for robust Expert detection.
-    Falls back to FSDP/DDP based on parallelism config.
-    """
-    is_expert_param = p.ndim == 3 and expert_enabled and any(kw in param_name for kw in _EXPERT_KEYWORDS)
     if is_expert_param:
         return ParamType.Expert
     if fsdp_enabled:
@@ -265,6 +305,7 @@ class DistributedMuon(Optimizer):
         self.adjust_lr_fn = adjust_lr_fn
         self.hybrid_ns = hybrid_ns
         self._zeropower_fn = zeropower_via_newtonschulz5
+        self._zeropower_grouped_fn = zeropower_via_newtonschulz5_grouped_core
         if compile_enabled:
             logger.info(
                 "Compiling Muon Newton-Schulz tensor function with torch.compile backend=%s",
@@ -272,6 +313,12 @@ class DistributedMuon(Optimizer):
             )
             self._zeropower_fn = torch.compile(
                 zeropower_via_newtonschulz5,
+                backend=compile_backend,
+                fullgraph=True,
+                dynamic=True,
+            )
+            self._zeropower_grouped_fn = torch.compile(
+                zeropower_via_newtonschulz5_grouped_core,
                 backend=compile_backend,
                 fullgraph=True,
                 dynamic=True,
@@ -296,10 +343,12 @@ class DistributedMuon(Optimizer):
 
         self._swap_enabled: bool = False
         self._swap_container: Any = None
-        self._swap_merge_buckets: int = 1
+        self._swap_merge_buckets: int = 32
 
         self._device_module: Any = None
         self._swap_transfer_stream: Any = None
+
+        self._gmm_offsets_cache: dict[tuple[torch.device, int, int], torch.Tensor] = {}
 
     @staticmethod
     @torch.no_grad()
@@ -402,11 +451,8 @@ class DistributedMuon(Optimizer):
     def lmo(
         self,
         g,
-        eps,
-        backend_steps,
+        ns: NewtonSchulzConfig,
         transpose_experts=False,
-        adjust_lr_fn="original",
-        hybrid_ns=False,
     ):
         """LMO: Low-orthogonal Matrix Operation (zeropower + normalise).
 
@@ -415,8 +461,8 @@ class DistributedMuon(Optimizer):
         g = g.to_local() if isinstance(g, DTensor) else g
 
         def _orth_and_norm(x):
-            x = self._zeropower_fn(x, steps=backend_steps, eps=eps, hybrid_ns=hybrid_ns)
-            x = DistributedMuon.normalise_grad(x, eps=eps, adjust_lr_fn=adjust_lr_fn)
+            x = self._zeropower_fn(x, steps=ns.backend_steps, eps=ns.eps, hybrid_ns=ns.hybrid_ns)
+            x = DistributedMuon.normalise_grad(x, eps=ns.eps, adjust_lr_fn=ns.adjust_lr_fn)
             return x
 
         if g.ndim == 2:
@@ -429,6 +475,99 @@ class DistributedMuon(Optimizer):
             return g
         else:
             raise ValueError(f"lmo expects 2D or 3D grad, got shape: {g.shape}")
+
+    @torch.no_grad()
+    def lmo_grouped(
+        self,
+        grads,
+        ns: NewtonSchulzConfig,
+        transpose_experts=False,
+    ):
+        """Pack two to four same-shaped Expert gradients and run GMM NS."""
+        if len(grads) < 2:
+            raise ValueError(f"Grouped Expert LMO expects two to four parameters, got {len(grads)}")
+
+        oriented = [g.transpose(1, 2) if transpose_experts else g for g in grads]
+        ns_transposed = oriented[0].shape[-2] > oriented[0].shape[-1]
+        if ns_transposed:
+            oriented = [g.transpose(1, 2) for g in oriented]
+
+        x = torch.cat(oriented, dim=0).bfloat16()
+        groups, rows, _ = x.shape
+        offsets = self._get_gmm_offsets(x.device, groups, rows)
+        norm = torch.linalg.norm(x, dim=(-2, -1), keepdim=True)
+        x = x / (norm + ns.eps)
+        x = self._zeropower_grouped_fn(
+            x,
+            offsets,
+            steps=ns.backend_steps,
+            hybrid_ns=ns.hybrid_ns,
+        )
+
+        if ns_transposed:
+            x = x.transpose(1, 2)
+        x = DistributedMuon.normalise_grad(x, eps=ns.eps, adjust_lr_fn=ns.adjust_lr_fn)
+        x = x.to(grads[0].dtype)
+
+        updates = list(x.split(grads[0].shape[0], dim=0))
+        if len(updates) != len(grads):
+            raise RuntimeError(f"Grouped LMO split produced {len(updates)} updates for {len(grads)} gradients")
+        if transpose_experts:
+            updates = [u.transpose(1, 2) for u in updates]
+        return updates
+
+    @torch.no_grad()
+    def lmo_grouped_fsdp_heterogeneous(
+        self,
+        grads,
+        ns: NewtonSchulzConfig,
+    ):
+        if len(grads) < 1:
+            raise ValueError(f"FSDP same-shape GMM expects at least one gradient, got {len(grads)}")
+        if any(g.ndim != 2 for g in grads) or len({tuple(g.shape) for g in grads}) != 1:
+            raise ValueError("FSDP GMM requires identical 2D, same-shape gradients")
+        oriented, oriented_shapes, transposed, original_dtypes = [], [], [], []
+        for grad in grads:
+            if grad.device != grads[0].device or grad.dtype != grads[0].dtype:
+                raise ValueError("FSDP heterogeneous GMM requires identical device and dtype")
+            rows, cols = grad.shape
+            was_transposed = rows > cols
+            value = grad.transpose(0, 1) if was_transposed else grad
+            value = value.bfloat16()
+            norm = torch.linalg.norm(value, dim=(-2, -1), keepdim=True)
+            oriented.append(value / (norm + ns.eps))
+            oriented_shapes.append(tuple(value.shape))
+            transposed.append(was_transposed)
+            original_dtypes.append(grad.dtype)
+        x = torch.stack(oriented, dim=0)
+        max_rows = max(shape[0] for shape in oriented_shapes)
+        max_cols = max(shape[1] for shape in oriented_shapes)
+        alignment = _FSDP_GMM_BF16_ALIGNMENT_ELEMENTS
+        aligned_rows = (max_rows + alignment - 1) // alignment * alignment
+        aligned_cols = (max_cols + alignment - 1) // alignment * alignment
+        if aligned_rows > x.shape[1] or aligned_cols > x.shape[2]:
+            x = F.pad(x, (0, aligned_cols - x.shape[2], 0, aligned_rows - x.shape[1]))
+        offsets = self._get_gmm_offsets(x.device, len(grads), aligned_rows)
+        x = self._zeropower_grouped_fn(
+            x,
+            offsets,
+            steps=ns.backend_steps,
+            hybrid_ns=ns.hybrid_ns,
+        )
+        updates = []
+        for value, (rows, cols), was_transposed, dtype in zip(
+            x,
+            oriented_shapes,
+            transposed,
+            original_dtypes,
+            strict=True,
+        ):
+            value = value[:rows, :cols]
+            if was_transposed:
+                value = value.transpose(0, 1)
+            value = DistributedMuon.normalise_grad(value, eps=ns.eps, adjust_lr_fn=ns.adjust_lr_fn)
+            updates.append(value.to(dtype))
+        return updates
 
     @torch.no_grad()
     def prepare_gradients_and_momentum(self, skip_param_types=None):
@@ -542,50 +681,37 @@ class DistributedMuon(Optimizer):
             del merge_updates
 
     def step_experts(self, expert_params, expert_param_names):
-        if len(expert_params) == 0:
+        if not expert_params:
             return
 
-        transpose = self.experts_need_transpose
         use_swap = self._swap_enabled and self._swap_container is not None
-        transfer_stream: Any = None
-        reusable_group: SwapBufferGroup | None = None
-        if use_swap:
-            transfer_stream = self._swap_transfer_stream
-            self._swap_h2d_group(expert_params[:1], transfer_stream)
+        transfer_stream = self._swap_transfer_stream if use_swap else None
 
-        for index, (p, p_name) in enumerate(zip(expert_params, expert_param_names, strict=True)):
-            validate_expert_shards_on_dim0(p, p_name)
-            _, nesterov, momentum, _, param_kwargs = self.groups_info[self.parameters_to_groups[id(p)]]
+        chunk_size = _EXPERT_GMM_MAX_PARAM_GROUP_SIZE
+        entries = list(zip(expert_params, expert_param_names, strict=True))
+        chunks = [entries[i : i + chunk_size] for i in range(0, len(entries), chunk_size)]
+
+        if use_swap and chunks:
+            self._swap_h2d_group([p for p, _ in chunks[0]], transfer_stream)
+
+        reusable_group = None
+        for idx, chunk in enumerate(chunks):
+            if use_swap:
+                self._wait_swap_group([p for p, _ in chunk])
+
+            self._process_expert_chunk(chunk)
 
             if use_swap:
-                self._wait_swap_group((p,))
-                self._update_momentum_single(p, momentum)
-
-            g = self.get_momentum_or_grad(p, momentum, nesterov)
-            if g is not None:
-                u = self.lmo(
-                    g.to(dtype=self.communication_dtype),
-                    **param_kwargs,
-                    transpose_experts=transpose,
-                    adjust_lr_fn=self.adjust_lr_fn,
-                    hybrid_ns=self.hybrid_ns,
-                )
-                self.update_bucket_params([p], [u])
-
-            if use_swap:
-                # Serialize H2D(next) before D2H(current) to avoid copy contention.
-                if index + 1 < len(expert_params):
-                    self._swap_h2d_group(
-                        (expert_params[index + 1],),
-                        transfer_stream,
-                        reusable_group=reusable_group,
-                    )
-                reusable_group = self._swap_d2h_group((p,), transfer_stream)
+                current_params = [p for p, _ in chunk]
+                # Prefetch next expert chunk before scheduling current D2H so
+                # H2D(next) overlaps compute(current), matching master.
+                if idx + 1 < len(chunks):
+                    next_params = [p for p, _ in chunks[idx + 1]]
+                    self._swap_h2d_group(next_params, transfer_stream, reusable_group=reusable_group)
+                reusable_group = self._swap_d2h_group(current_params, transfer_stream)
 
         if use_swap:
-            self._device_module.current_stream().wait_stream(
-                transfer_stream
-            )  # pyrefly: ignore[missing-attribute,unbound-name]
+            self._device_module.current_stream().wait_stream(transfer_stream)  # pyrefly: ignore[missing-attribute]
 
     def step_fsdp(self, fsdp_params, fsdp_param_names):
         if not fsdp_params:
@@ -597,6 +723,7 @@ class DistributedMuon(Optimizer):
 
         use_swap = self._swap_enabled and self._swap_container is not None
 
+        # FSDP produces one reconstructed matrix per communication bucket.
         swap_merge_buckets = getattr(self, "_swap_merge_buckets", 1)
         swap_ctx = SwapMergeContext(
             merge_buckets=swap_merge_buckets,
@@ -682,6 +809,73 @@ class DistributedMuon(Optimizer):
             torch._foreach_add_(  # pyrefly: ignore [no-matching-overload]
                 data["locals"], data["updates"], alpha=-lr
             )
+
+    def _process_expert_chunk(self, chunk):
+        shape_groups: OrderedDict[Any, list[tuple[nn.Parameter, str, Any, dict[str, Any]]]] = OrderedDict()
+        use_swap = self._swap_enabled and self._swap_container is not None
+
+        for p, p_name in chunk:
+            validate_expert_shards_on_dim0(p, p_name)
+            _, nesterov, momentum, _, param_kwargs = self.groups_info[self.parameters_to_groups[id(p)]]
+            if use_swap:
+                self._update_momentum_single(p, momentum)
+            g = self.get_momentum_or_grad(p, momentum, nesterov)
+            if g is None:
+                continue
+            g_local = g.to_local() if isinstance(g, DTensor) else g
+            g_local = g_local.to(dtype=self.communication_dtype)
+            key = (
+                getattr(g_local, "device", None),
+                getattr(g_local, "dtype", None),
+                tuple(g_local.shape) if hasattr(g_local, "shape") else (),
+                float(param_kwargs.get("eps", 0.0)),
+                int(param_kwargs.get("backend_steps", 0)),
+            )
+            shape_groups.setdefault(key, []).append((p, p_name, g_local, param_kwargs))
+
+        for entries in shape_groups.values():
+            if len(entries) >= 2 and getattr(entries[0][2], "ndim", None) == 3:
+                params = [e[0] for e in entries]
+                grads = [e[2] for e in entries]
+                kwargs = entries[0][3]
+                ns = NewtonSchulzConfig(
+                    **kwargs,
+                    adjust_lr_fn=self.adjust_lr_fn,
+                    hybrid_ns=self.hybrid_ns,
+                )
+                updates = self.lmo_grouped(
+                    grads,
+                    ns,
+                    transpose_experts=self.experts_need_transpose,
+                )
+                self.update_bucket_params(params, updates)
+            else:
+                for p, _p_name, g, kwargs in entries:
+                    ns = NewtonSchulzConfig(
+                        **kwargs,
+                        adjust_lr_fn=self.adjust_lr_fn,
+                        hybrid_ns=self.hybrid_ns,
+                    )
+                    u = self.lmo(
+                        g,
+                        ns,
+                        transpose_experts=self.experts_need_transpose,
+                    )
+                    self.update_bucket_params([p], [u])
+
+    def _get_gmm_offsets(self, device, groups, rows):
+        key = (device, groups, rows)
+        offsets = self._gmm_offsets_cache.get(key)
+        if offsets is None:
+            offsets = torch.arange(
+                rows,
+                (groups + 1) * rows,
+                rows,
+                dtype=torch.int32,
+                device=device,
+            )
+            self._gmm_offsets_cache[key] = offsets
+        return offsets
 
     @torch.no_grad()
     def _slice_update_for_tp(self, p, u, tp_group):
@@ -805,19 +999,27 @@ class DistributedMuon(Optimizer):
         merge_start_idx = merge_start_bucket * ctx.world_size
         merge_updates: list[Any] = [None] * len(merge_params)
 
-        for bucket_idx in range(merge_start_bucket, merge_end_bucket):
-            start_idx = bucket_idx * ctx.world_size
-            end_idx = min(start_idx + ctx.world_size, len(fsdp_params))
+        bucket_entries = self._collect_fsdp_bucket_entries(
+            merge_start_bucket, merge_end_bucket, fsdp_params, ctx, swap_ctx
+        )
 
-            if swap_ctx.use_swap:
-                self._swap_momentum_update(fsdp_params[start_idx:end_idx])
+        updates_by_bucket = self._apply_grouped_fsdp_optimization(bucket_entries)
 
-            u, recv_shapes, send_shapes = self._fsdp_alltoall_and_lmo(
-                fsdp_params,
-                start_idx,
-                end_idx,
-                ctx,
-            )
+        for bucket_idx, start_idx, end_idx, full_g, recv_shapes, send_shapes, param_kwargs in bucket_entries:
+            if bucket_idx in updates_by_bucket:
+                u = updates_by_bucket[bucket_idx]
+            else:
+                u = self.lmo(
+                    full_g,
+                    NewtonSchulzConfig(
+                        eps=param_kwargs["eps"],
+                        backend_steps=param_kwargs["backend_steps"],
+                        adjust_lr_fn=self.adjust_lr_fn,
+                        hybrid_ns=self.hybrid_ns,
+                    ),
+                )
+            if ctx.dp_replicate_group and self.extra_reduce_for_hsdp:
+                dist.all_reduce(u, group=ctx.dp_replicate_group, op=dist.ReduceOp.AVG)
             recv_list_updates = self._fsdp_scatter_updates(
                 u,
                 recv_shapes,
@@ -830,6 +1032,60 @@ class DistributedMuon(Optimizer):
 
         self.update_bucket_params(merge_params, merge_updates, tp_group=ctx.tp_group)
         del merge_updates
+
+    def _collect_fsdp_bucket_entries(
+        self,
+        merge_start_bucket,
+        merge_end_bucket,
+        fsdp_params,
+        ctx,
+        swap_ctx: SwapMergeContext,
+    ):
+        bucket_entries = []
+        for bucket_idx in range(merge_start_bucket, merge_end_bucket):
+            start_idx = bucket_idx * ctx.world_size
+            end_idx = min(start_idx + ctx.world_size, len(fsdp_params))
+
+            if swap_ctx.use_swap:
+                self._swap_momentum_update(fsdp_params[start_idx:end_idx])
+
+            full_g, recv_shapes, send_shapes, param_kwargs = self._fsdp_alltoall(
+                fsdp_params,
+                start_idx,
+                end_idx,
+                ctx,
+            )
+            bucket_entries.append((bucket_idx, start_idx, end_idx, full_g, recv_shapes, send_shapes, param_kwargs))
+        return bucket_entries
+
+    def _apply_grouped_fsdp_optimization(self, bucket_entries):
+        valid_entries = [entry for entry in bucket_entries if entry[3].numel() > 0]
+        entries_by_shape: dict[tuple[int, ...], list[Any]] = defaultdict(list)
+        for entry in valid_entries:
+            entries_by_shape[tuple(int(dim) for dim in entry[3].shape)].append(entry)
+
+        updates_by_bucket = {}
+        for shape_entries in entries_by_shape.values():
+            if len(shape_entries) < 1:
+                continue
+            first_kwargs = shape_entries[0][6]
+            same_ns_config = all(
+                entry[6]["eps"] == first_kwargs["eps"] and entry[6]["backend_steps"] == first_kwargs["backend_steps"]
+                for entry in shape_entries
+            )
+            if not same_ns_config or not all(entry[3].device.type == "npu" for entry in shape_entries):
+                continue
+            updates = self.lmo_grouped_fsdp_heterogeneous(
+                [entry[3] for entry in shape_entries],
+                NewtonSchulzConfig(
+                    eps=first_kwargs["eps"],
+                    backend_steps=first_kwargs["backend_steps"],
+                    adjust_lr_fn=self.adjust_lr_fn,
+                    hybrid_ns=self.hybrid_ns,
+                ),
+            )
+            updates_by_bucket.update({entry[0]: update for entry, update in zip(shape_entries, updates, strict=True)})
+        return updates_by_bucket
 
     def _build_defaults(self, **kwargs):
         return dict(
@@ -921,7 +1177,12 @@ class DistributedMuon(Optimizer):
         for p_name, p in named_params:
             if not p.requires_grad:
                 continue
-            ptype = get_param_type(p, p_name, self.fsdp_enabled, self.expert_enabled)
+            ptype = get_param_type(
+                p,
+                p_name,
+                self.fsdp_enabled,
+                self.expert_enabled,
+            )
             if ptype == ParamType.DDP:
                 self.ddp_params.append(p)
                 self.ddp_param_names.append(p_name)
@@ -932,10 +1193,16 @@ class DistributedMuon(Optimizer):
                 self.expert_params.append(p)
                 self.expert_param_names.append(p_name)
 
-        # Sort FSDP params by numel (big first) to reduce padding
+        # Sort FSDP params by numel and exact shape.  Equal-sized matrices
+        # with different shapes must not be interleaved, otherwise an
+        # forty-four-bucket window may contain too few same-shape matrices for GMM.
         fsdp_pairs = list(zip(self.fsdp_params, self.fsdp_param_names, strict=True))
         self.fsdp_params, self.fsdp_param_names = self._sort_pairs_by_numel(
-            fsdp_pairs  # pyrefly: ignore[bad-assignment]
+            fsdp_pairs,
+            key_fn=lambda x: (
+                x[0].numel(),
+                tuple(int(dim) for dim in x[0].shape),
+            ),  # pyrefly: ignore[bad-assignment]
         )
 
         # Sort expert params
@@ -1058,7 +1325,7 @@ class DistributedMuon(Optimizer):
             )
             self.log_parameters_types = False
 
-    def _fsdp_alltoall_and_lmo(
+    def _fsdp_alltoall(
         self,
         fsdp_params,
         start_idx,
@@ -1086,20 +1353,11 @@ class DistributedMuon(Optimizer):
         full_g = torch.cat(recv_list_grads, dim=0)
         if param_kwargs_me is None:
             raise RuntimeError("Failed to resolve Muon parameter kwargs for the FSDP bucket.")
-        u = self.lmo(
-            full_g,
-            eps=param_kwargs_me["eps"],
-            backend_steps=param_kwargs_me["backend_steps"],
-            adjust_lr_fn=self.adjust_lr_fn,
-            hybrid_ns=self.hybrid_ns,
-        )
-        if ctx.dp_replicate_group and self.extra_reduce_for_hsdp:
-            dist.all_reduce(u, group=ctx.dp_replicate_group, op=dist.ReduceOp.AVG)
-        return u, recv_shapes, send_shapes
+        return full_g, recv_shapes, send_shapes, param_kwargs_me
 
     def _fsdp_scatter_updates(self, u, recv_shapes, send_shapes, ctx: CommContext):
         split_rows = [s[0] for s in recv_shapes]
-        updates_send_list = list(torch.split(u, split_rows, dim=0))
+        updates_send_list = [chunk.contiguous() for chunk in torch.split(u, split_rows, dim=0)]
         recv_list_updates = [torch.empty(s, dtype=ctx.cast_dtype, device=ctx.device) for s in send_shapes]
 
         dist.all_to_all(recv_list_updates, updates_send_list, group=ctx.fsdp_group)
@@ -1165,9 +1423,11 @@ class DistributedMuon(Optimizer):
                 g = g.to_local() if isinstance(g, DTensor) else g
             u = self.lmo(
                 g.to(dtype=ctx.cast_dtype),
-                **param_kwargs,
-                adjust_lr_fn=self.adjust_lr_fn,
-                hybrid_ns=self.hybrid_ns,
+                NewtonSchulzConfig(
+                    **param_kwargs,
+                    adjust_lr_fn=self.adjust_lr_fn,
+                    hybrid_ns=self.hybrid_ns,
+                ),
             )
             local_updates[i] = u
         return local_updates
