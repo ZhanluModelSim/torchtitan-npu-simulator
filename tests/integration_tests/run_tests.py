@@ -16,6 +16,7 @@ from pathlib import Path
 
 # torchtitan-npu override: the runner consumes the case definition at runtime.
 from tests.integration_tests import OverrideDefinitions  # noqa: TC001
+from tests.integration_tests.deepseek_v3_2 import build_deepseek_v3_2_test_list
 from tests.integration_tests.deepseek_v4 import build_deepseek_v4_test_list
 from tests.integration_tests.loss_compare import (
     assert_losses_equal,
@@ -24,9 +25,17 @@ from tests.integration_tests.loss_compare import (
     read_losses_from_file,
 )
 
-# torchtitan-npu override: this runner currently registers
-# the DeepSeek-V4 NPU suite instead of Torchtitan's generic suites.
+
+def build_models_test_list() -> list[OverrideDefinitions]:
+    """Return the model integration cases for the default smoke suite."""
+
+    return build_deepseek_v4_test_list() + build_deepseek_v3_2_test_list()
+
+
+# torchtitan-npu override: register the DeepSeek-V4 and DeepSeek-V3.2 NPU suites.
 _TEST_SUITES_FUNCTION = {
+    "models": build_models_test_list,
+    "deepseek_v3_2": build_deepseek_v3_2_test_list,
     "deepseek_v4": build_deepseek_v4_test_list,
 }
 # torchtitan-npu override: reference losses are selected

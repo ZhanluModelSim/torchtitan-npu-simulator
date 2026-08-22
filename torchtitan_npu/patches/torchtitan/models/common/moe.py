@@ -1,4 +1,5 @@
 # Pending upstream PR: https://github.com/pytorch/torchtitan/pull/3634
+# Pending upstream PR: https://github.com/pytorch/torchtitan/pull/4095
 
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 #
@@ -30,15 +31,18 @@ import spmd_types as spmd
 import torch
 import torch.nn.functional as F
 from torch.distributed.tensor import DTensor
-from torchtitan.distributed.spmd_types import spmd_mesh_size
+from torchtitan.distributed.spmd_types import maybe_set_sparse_mesh, spmd_mesh_size
 from torchtitan.distributed.utils import get_spmd_backend
 from torchtitan.models.common.feed_forward import FeedForward
 from torchtitan.models.common.moe import (
     GroupedExperts,
     MoE,
+    RoutedExperts,
     TokenChoiceTopKRouter,
 )
-from torchtitan.models.common.token_dispatcher import DeepEPTokenDispatcher
+from torchtitan.models.common.token_dispatcher import (
+    DeepEPTokenDispatcher,
+)
 
 __all__ = ["HashMoE", "HashRouter"]
 
@@ -219,6 +223,62 @@ class HashMoE(MoE):
         return out_BLD
 
 
+class _RouterScoreAbsorbingRoutedExperts(RoutedExperts):
+    """RoutedExperts that absorbs dispatcher-aligned router scores before w2."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(RoutedExperts.Config):
+        pass
+
+    def forward(
+        self,
+        x_BLD: torch.Tensor,
+        topk_scores_BLK: torch.Tensor,
+        topk_expert_ids_BLK: torch.Tensor,
+        num_local_tokens_per_expert_E: torch.Tensor,
+        *,
+        num_local_tokens_after_seq_dim_padding: int,
+    ) -> torch.Tensor:
+        B, L, D = x_BLD.shape
+        K = topk_scores_BLK.size(-1)
+        T = B * L
+        local_seq_len_after_padding = num_local_tokens_after_seq_dim_padding // B
+        x_TD = x_BLD.view(T, D)
+
+        topk_scores_TK = topk_scores_BLK.view(T, K)
+        topk_expert_ids_TK = topk_expert_ids_BLK.view(T, K)
+        dispatcher = self.token_dispatcher
+        (
+            routed_input_RD,
+            num_global_tokens_per_local_expert_e,
+            metadata,
+        ) = dispatcher.dispatch(
+            x_TD,
+            topk_scores_TK,
+            topk_expert_ids_TK,
+            num_local_tokens_per_expert_E,
+        )
+        # Patch override: consume scores carried by dispatcher metadata and pass
+        # them into grouped experts before the down projection.
+        routed_scores_R = getattr(metadata, "routed_scores_R", None)
+
+        with maybe_set_sparse_mesh():
+            routed_output_RD = self.inner_experts(
+                routed_input_RD,
+                num_global_tokens_per_local_expert_e,
+                routed_scores_R=routed_scores_R,
+            )
+
+        out_TD = dispatcher.combine(
+            routed_output_RD,
+            metadata,
+            x_TD,
+            num_local_tokens_after_padding=num_local_tokens_after_seq_dim_padding,
+            local_seq_len_after_padding=local_seq_len_after_padding,
+        )
+        return out_TD.view(B, -1, D)
+
+
 class _ClampGroupedExperts(GroupedExperts):
     """GroupedExperts with the optional DeepSeek-V4 SwiGLU clamp."""
 
@@ -236,6 +296,8 @@ class _ClampGroupedExperts(GroupedExperts):
         self,
         x_RD: torch.Tensor,
         num_tokens_per_expert_E: torch.Tensor,
+        *,
+        routed_scores_R: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Raw expert computation; the gate/up grouped-mms are clamped
         before the SiLU when ``swiglu_limit > 0``."""
@@ -271,6 +333,8 @@ class _ClampGroupedExperts(GroupedExperts):
             u_RF = torch.clamp(u_RF, min=-self.swiglu_limit, max=self.swiglu_limit)
             g_RF = torch.clamp(g_RF, max=self.swiglu_limit)
         h_RF = F.silu(g_RF) * u_RF
+        if routed_scores_R is not None:
+            h_RF = (h_RF.float() * routed_scores_R.float().reshape(-1, 1)).to(h_RF.dtype)
         return torch._grouped_mm(h_RF, w2_EDF.bfloat16().transpose(-2, -1), offs=offsets_E).type_as(x_RD)
 
 
@@ -294,12 +358,23 @@ class _ClampFeedForward(FeedForward):
         return self.w2(F.silu(gate) * up)
 
 
-def _clamp_make_routed_experts_config(*, swiglu_limit: float = 0.0, **kwargs):
+def _clamp_make_routed_experts_config(
+    *,
+    swiglu_limit: float = 0.0,
+    absorb_router_scores: bool = True,
+    **kwargs,
+):
     """``make_routed_experts_config`` with the clamp passthrough."""
     cfg = _original_make_routed_experts_config(**kwargs)
+    dispatcher_config = cfg.token_dispatcher
+    dispatcher_config = dataclasses.replace(
+        dispatcher_config,
+        absorb_router_scores=absorb_router_scores,
+    )
     return dataclasses.replace(
         cfg,
         inner_experts=dataclasses.replace(cfg.inner_experts, swiglu_limit=swiglu_limit),
+        token_dispatcher=dispatcher_config,
     )
 
 
@@ -334,9 +409,13 @@ def apply() -> None:
     torchtitan.models.common.moe.TokenChoiceTopKRouter = HashRouter
     torchtitan.models.common.moe.MoE = HashMoE
     torchtitan.models.common.moe.GroupedExperts = _ClampGroupedExperts
+    torchtitan.models.common.moe.RoutedExperts = _RouterScoreAbsorbingRoutedExperts
     torchtitan.models.common.feed_forward.FeedForward = _ClampFeedForward
 
     import torchtitan.models.common.config_utils
+
+    torchtitan.models.common.config_utils.GroupedExperts = _ClampGroupedExperts
+    torchtitan.models.common.config_utils.RoutedExperts = _RouterScoreAbsorbingRoutedExperts
 
     global _original_make_routed_experts_config, _original_make_ffn_config
     _original_make_routed_experts_config = torchtitan.models.common.config_utils.make_routed_experts_config

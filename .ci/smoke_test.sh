@@ -55,7 +55,7 @@ export PYTHON_BIN
 
 "${PYTHON_BIN}" -m tests.integration_tests.run_tests \
     "${OUTPUT_DIR}" \
-    --test_suite deepseek_v4 \
+    --test_suite models \
     --module "${MODULE}" \
     --config "${CONFIG}" \
     --ngpu "${NGPU}"

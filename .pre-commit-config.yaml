@@ -54,7 +54,6 @@ repos:
           [
             "--output-format",
             "github",
-            "--fix",
             "--line-length",
             "120",
             "--exclude",
