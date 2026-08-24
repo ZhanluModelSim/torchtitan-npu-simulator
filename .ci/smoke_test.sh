@@ -5,6 +5,7 @@
 
 set -e
 
+# Please adjust the path below to match your CANN installation.
 source /usr/local/Ascend/cann/set_env.sh
 
 export TORCHINDUCTOR_FX_GRAPH_CACHE=0
@@ -260,26 +261,6 @@ run_torchtitan_smoke() {
 _setup_env
 _prepare_deepseek_tokenizers
 
-_wait_npu_idle() {
-    local max_wait=${1:-10}
-    local threshold=${2:-500}
-    for i in $(seq 1 "$max_wait"); do
-        local used
-        used=$(npu-smi info 2>/dev/null | grep -oP '\d+(?=\s+/\s+\d+)' | sort -n | tail -1)
-        used=${used:-0}
-        if [ "$used" -lt "$threshold" ]; then
-            echo "NPU idle (max HBM: ${used}MB)"
-            return 0
-        fi
-        echo "Waiting for NPU memory to free... (${used}MB used, attempt $i/$max_wait)"
-        sleep 1
-    done
-    echo "Warning: NPU memory still not idle after ${max_wait}s"
-    return 1
-}
-
-# run_torchtitan_smoke
-_wait_npu_idle 10 5000
 run_torchtitan_npu_smoke
 pytest -v --tb=short tests/smoke_tests
 

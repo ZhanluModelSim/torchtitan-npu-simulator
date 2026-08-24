@@ -1,5 +1,18 @@
 # 测试使用指南
 
+## 测试前置条件
+
+运行 `.ci/unit_test.sh` 或 `.ci/smoke_test.sh` 前，请在同一 shell 中加载与 `torch_npu`
+匹配的 CANN 环境：
+
+```bash
+source /实际安装目录/set_env.sh
+# 例如：source /usr/local/Ascend/cann/set_env.sh
+```
+
+冒烟测试还需要可用的 NPU 和匹配驱动。请从仓库根目录执行脚本；CANN 安装在其他路径时
+直接替换上述路径，无需创建符号链接。
+
 ## 常用命令
 ### 单元测试
 ```bash
@@ -19,7 +32,8 @@ bash .ci/smoke_test.sh
 ```
 
 > 注意：`.ci/smoke_test.sh` 中 `run_torchtitan_smoke`（上游集成 smoke 路径）当前被注释掉，
-> 因此默认运行只执行 torchtitan-npu 集成 smoke 和 `pytest tests/smoke_tests`。
+> 因此默认运行只执行 torchtitan-npu 集成 smoke 和 `pytest tests/smoke_tests`。脚本不会再用固定
+> 的 NPU 内存阈值阻止测试。
 
 ### 集成测试 (Integration Test)
 

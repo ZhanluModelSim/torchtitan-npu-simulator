@@ -5,6 +5,7 @@
 
 set -e
 
+# Please adjust the path below to match your CANN installation.
 source /usr/local/Ascend/cann/set_env.sh
 
 pip install -r requirements.txt
