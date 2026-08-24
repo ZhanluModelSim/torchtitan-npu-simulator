@@ -16,6 +16,8 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn.functional as F
 
+from torchtitan_npu.ops.ascendc import moe_re_routing, moe_token_unpermute
+from torchtitan_npu.override.common import token_dispatcher as npu_token_dispatcher
 from torchtitan_npu.patches.torchtitan.models.common import moe as moe_patch
 from torchtitan_npu.patches.torchtitan.models.common import (
     token_dispatcher as dispatcher_patch,
@@ -396,18 +398,21 @@ def _expert_forward(
     tokens_per_expert: torch.Tensor,
     weights: _ExpertWeights,
     routed_scores: torch.Tensor | None = None,
+    *,
+    expert_offset: int = 0,
 ) -> torch.Tensor:
     outputs = []
     start = 0
     for expert, count in enumerate(tokens_per_expert.tolist()):
         end = start + count
         x = routed_input[start:end]
-        gate = x @ weights.w1[expert].transpose(-2, -1)
-        up = x @ weights.w3[expert].transpose(-2, -1)
+        global_expert = expert_offset + expert
+        gate = x @ weights.w1[global_expert].transpose(-2, -1)
+        up = x @ weights.w3[global_expert].transpose(-2, -1)
         hidden = F.silu(gate) * up
         if routed_scores is not None:
             hidden = hidden * routed_scores[start:end, None]
-        outputs.append(hidden @ weights.w2[expert].transpose(-2, -1))
+        outputs.append(hidden @ weights.w2[global_expert].transpose(-2, -1))
         start = end
     return torch.cat(outputs, dim=0) if outputs else routed_input.new_empty((0, routed_input.shape[-1]))
 
@@ -456,6 +461,38 @@ def _run_local_path(
     return _PathResult(output.detach(), grads)
 
 
+def _reference_local_oracle(x, scores, expert_ids, weights, pre_w2):
+    out = torch.zeros_like(x)
+    for t in range(x.shape[0]):
+        for k in range(scores.shape[1]):
+            e = int(expert_ids[t, k])
+            hidden = F.silu(x[t] @ weights.w1[e].T) * (x[t] @ weights.w3[e].T)
+            if pre_w2:
+                hidden = hidden * scores[t, k]
+                out[t] += hidden @ weights.w2[e].T
+            else:
+                out[t] += (hidden @ weights.w2[e].T) * scores[t, k]
+    return out
+
+
+def _reference_local_path_result(x, scores, expert_ids, weights, pre_w2):
+    xo = x.detach().clone().requires_grad_()
+    so = scores.detach().clone().requires_grad_()
+    wo = _clone_weights(weights)
+    out = _reference_local_oracle(xo, so, expert_ids, wo, pre_w2)
+    out.square().sum().backward()
+    return _PathResult(
+        out.detach(),
+        (
+            xo.grad.detach().clone(),
+            so.grad.detach().clone(),
+            wo.w1.grad.detach().clone(),
+            wo.w2.grad.detach().clone(),
+            wo.w3.grad.detach().clone(),
+        ),
+    )
+
+
 def test_local_dispatch_pre_w2_matches_post_w2_in_float64():
     dispatcher_patch.apply()
     x = torch.tensor(
@@ -474,7 +511,7 @@ def test_local_dispatch_pre_w2_matches_post_w2_in_float64():
         requires_grad=True,
     )
     expert_ids = torch.tensor([[2, 0], [1, 2], [0, 1], [2, 0]])
-    counts = torch.tensor([3, 3, 2])
+    counts = torch.bincount(expert_ids.reshape(-1), minlength=3)
     weights = _weights(3)
 
     # Independent autograd graphs make gradient equality meaningful instead of
@@ -495,12 +532,75 @@ def test_local_dispatch_pre_w2_matches_post_w2_in_float64():
         _clone_weights(weights),
         pre_w2=True,
     )
+    oracle_post = _reference_local_path_result(x, scores, expert_ids, weights, pre_w2=False)
+    oracle_pre = _reference_local_path_result(x, scores, expert_ids, weights, pre_w2=True)
+    torch.testing.assert_close(baseline.output, oracle_post.output, rtol=1e-12, atol=1e-12)
+    for left, right in zip(baseline.grads, oracle_post.grads, strict=True):
+        torch.testing.assert_close(left, right, rtol=1e-12, atol=1e-12)
+
+    torch.testing.assert_close(candidate.output, oracle_pre.output, rtol=1e-12, atol=1e-12)
+    for left, right in zip(candidate.grads, oracle_pre.grads, strict=True):
+        torch.testing.assert_close(left, right, rtol=1e-12, atol=1e-12)
+
     torch.testing.assert_close(candidate.output, baseline.output, rtol=1e-12, atol=1e-12)
     for left, right in zip(baseline.grads, candidate.grads, strict=True):
         torch.testing.assert_close(left, right, rtol=1e-12, atol=1e-12)
 
 
-def _alltoall_worker(rank: int, rendezvous: str, result_file: str):
+def _install_cpu_npu_moe_fakes():
+    def fake_permute(tokens, expert_ids):
+        top_k = expert_ids.shape[1]
+        order = torch.argsort(expert_ids.reshape(-1), stable=True)
+        routed = tokens.repeat_interleave(top_k, dim=0)[order]
+        return routed, torch.argsort(order)
+
+    def fake_unpermute(permuted_tokens, sorted_indices, probs=None):
+        restored = permuted_tokens[sorted_indices.to(torch.long)]
+        if probs is None:
+            return restored
+        return (restored.view(probs.shape[0], probs.shape[1], -1) * probs.unsqueeze(-1)).sum(1)
+
+    def fake_unpermute_grad(permuted_tokens, grad_output, sorted_indices, *, probs):
+        sorted_indices = sorted_indices.to(torch.long)
+        restored = permuted_tokens[sorted_indices]
+        if probs is None:
+            grad_restored = grad_output
+            grad_probs = None
+        else:
+            restored = restored.view(probs.shape[0], probs.shape[1], -1)
+            grad_restored = (grad_output[:, None, :] * probs[:, :, None]).reshape_as(permuted_tokens)
+            grad_probs = (restored * grad_output[:, None, :]).sum(-1)
+        grad_tokens = torch.empty_like(permuted_tokens)
+        grad_tokens[sorted_indices] = grad_restored
+        return grad_tokens, grad_probs
+
+    def fake_re_routing(tokens, counts, *, per_token_scales, expert_token_num_type, idx_type):
+        del expert_token_num_type, idx_type
+        counts = counts.to(torch.long)
+        chunks = []
+        offset = 0
+        for expert in range(counts.shape[1]):
+            for rank in range(counts.shape[0]):
+                count = counts[rank, expert]
+                end = offset + int(count)
+                chunks.append(torch.arange(offset, end, device=tokens.device))
+                offset = end
+        order = torch.cat(chunks)
+        permuted_scales = tokens.new_empty(0) if per_token_scales is None else per_token_scales[order]
+        return (
+            tokens[order],
+            permuted_scales,
+            order.to(torch.int32),
+            counts.sum(0).to(torch.int32),
+        )
+
+    npu_token_dispatcher.torch_npu.npu_moe_token_permute = fake_permute
+    moe_token_unpermute.torch_npu.npu_moe_token_unpermute = fake_unpermute
+    moe_token_unpermute.torch_npu.npu_moe_token_unpermute_grad = fake_unpermute_grad
+    moe_re_routing.torch_npu.npu_moe_re_routing = fake_re_routing
+
+
+def _alltoall_worker(rank: int, rendezvous: str, result_file: str, use_npu: bool = False):
     dist.init_process_group(
         "gloo",
         init_method=f"file://{rendezvous}",
@@ -509,6 +609,8 @@ def _alltoall_worker(rank: int, rendezvous: str, result_file: str):
     )
     try:
         dispatcher_patch.apply()
+        if use_npu:
+            _install_cpu_npu_moe_fakes()
         mesh = torch.distributed.device_mesh.init_device_mesh("cpu", (2,), mesh_dim_names=("ep",))
         x = torch.tensor(
             [[10.0 + rank, 0.2], [20.0 + rank, 1.1], [30.0 + rank, -0.6]],
@@ -520,11 +622,37 @@ def _alltoall_worker(rank: int, rendezvous: str, result_file: str):
         counts = torch.bincount(expert_ids.reshape(-1), minlength=4)
         base_weights = _weights(4, dim=2, hidden=3)
 
-        def run(pre_w2: bool, weights: _ExpertWeights):
-            dispatcher = AllToAllTokenDispatcher(
-                AllToAllTokenDispatcher.Config(num_experts=4, top_k=1, absorb_router_scores=True)
+        def reference_oracle(x, expert_ids, scores, weights, pre_w2):
+            out = torch.zeros_like(x)
+            for i, expert in enumerate(expert_ids.reshape(-1).tolist()):
+                hidden = F.silu(x[i] @ weights.w1[expert].T) * (x[i] @ weights.w3[expert].T)
+                if pre_w2:
+                    hidden = hidden * scores[i]
+                    out[i] += hidden @ weights.w2[expert].T
+                else:
+                    out[i] += (hidden @ weights.w2[expert].T) * scores[i]
+            return out
+
+        def oracle_run(pre_w2, x, expert_ids, scores, weights, expert_offset, num_local_experts):
+            xo = x.detach().clone().requires_grad_()
+            so = scores.detach().clone().requires_grad_()
+            wo = _clone_weights(weights)
+            out = reference_oracle(xo, expert_ids, so, wo, pre_w2)
+            out.square().sum().backward()
+            end = expert_offset + num_local_experts
+            return out.detach(), (
+                xo.grad.detach().clone(),
+                so.grad.detach().clone(),
+                wo.w1.grad.detach().clone()[expert_offset:end],
+                wo.w2.grad.detach().clone()[expert_offset:end],
+                wo.w3.grad.detach().clone()[expert_offset:end],
             )
+
+        def run(pre_w2: bool, weights: _ExpertWeights):
+            dispatcher_cls = npu_token_dispatcher.NPUAllToAllTokenDispatcher if use_npu else AllToAllTokenDispatcher
+            dispatcher = dispatcher_cls(dispatcher_cls.Config(num_experts=4, top_k=1, absorb_router_scores=True))
             dispatcher.wire_meshes(ep_mesh=mesh, tp_mesh=None)
+            dispatcher.sp_size = 1
             local_x = x.detach().clone().requires_grad_()
             local_scores = scores.detach().clone().requires_grad_()
             routed, local_counts, metadata = dispatcher.dispatch(local_x, local_scores[:, None], expert_ids, counts)
@@ -544,6 +672,7 @@ def _alltoall_worker(rank: int, rendezvous: str, result_file: str):
                 local_counts,
                 weights,
                 aligned_scores if pre_w2 else None,
+                expert_offset=rank * (weights.w1.shape[0] // mesh.size()),
             )
             if not pre_w2:
                 routed_output = routed_output * aligned_scores[:, None]
@@ -555,12 +684,15 @@ def _alltoall_worker(rank: int, rendezvous: str, result_file: str):
                 local_seq_len_after_padding=local_x.shape[0],
             )
             output.square().sum().backward()
+            num_local_experts = weights.w1.shape[0] // mesh.size()
+            start = rank * num_local_experts
+            end = start + num_local_experts
             return output.detach(), (
-                local_x.grad.detach(),
-                local_scores.grad.detach(),
-                weights.w1.grad.detach(),
-                weights.w2.grad.detach(),
-                weights.w3.grad.detach(),
+                local_x.grad.detach().clone(),
+                local_scores.grad.detach().clone(),
+                weights.w1.grad.detach().clone()[start:end],
+                weights.w2.grad.detach().clone()[start:end],
+                weights.w3.grad.detach().clone()[start:end],
             )
 
         post = run(False, _clone_weights(base_weights))
@@ -568,6 +700,23 @@ def _alltoall_worker(rank: int, rendezvous: str, result_file: str):
         torch.testing.assert_close(candidate[0], post[0], rtol=1e-12, atol=1e-12)
         for left, right in zip(candidate[1], post[1], strict=True):
             torch.testing.assert_close(left, right, rtol=1e-12, atol=1e-12)
+
+        if not use_npu:
+            num_local_experts = base_weights.w1.shape[0] // mesh.size()
+            expert_offset = rank * num_local_experts
+            oracle_post = oracle_run(False, x, expert_ids, scores, base_weights, expert_offset, num_local_experts)
+            torch.testing.assert_close(post[0], oracle_post[0], rtol=1e-12, atol=1e-12)
+            # x/score grads are local and directly comparable; expert-weight
+            # grads in EP aggregate tokens from all ranks, so they are validated
+            # by candidate-vs-baseline and the Local oracle test instead.
+            for left, right in zip(post[1][:2], oracle_post[1][:2], strict=True):
+                torch.testing.assert_close(left, right, rtol=1e-12, atol=1e-12)
+
+            oracle_pre = oracle_run(True, x, expert_ids, scores, base_weights, expert_offset, num_local_experts)
+            torch.testing.assert_close(candidate[0], oracle_pre[0], rtol=1e-12, atol=1e-12)
+            for left, right in zip(candidate[1][:2], oracle_pre[1][:2], strict=True):
+                torch.testing.assert_close(left, right, rtol=1e-12, atol=1e-12)
+
         torch.save(candidate[0], f"{result_file}.{rank}")
     finally:
         dist.destroy_process_group()
@@ -583,6 +732,23 @@ def test_alltoall_dispatch_pre_w2_matches_post_w2_in_float64():
             args=(rendezvous, result_file),
             nprocs=2,
             join=True,
+            start_method="spawn",
+        )
+        assert os.path.exists(f"{result_file}.0")
+        assert os.path.exists(f"{result_file}.1")
+
+
+def test_npu_alltoall_dispatch_pre_w2_matches_post_w2_in_float64():
+    dispatcher_patch.apply()
+    with tempfile.TemporaryDirectory() as tmp:
+        rendezvous = os.path.join(tmp, "rendezvous")
+        result_file = os.path.join(tmp, "result")
+        mp.spawn(
+            _alltoall_worker,
+            args=(rendezvous, result_file, True),
+            nprocs=2,
+            join=True,
+            start_method="spawn",
         )
         assert os.path.exists(f"{result_file}.0")
         assert os.path.exists(f"{result_file}.1")

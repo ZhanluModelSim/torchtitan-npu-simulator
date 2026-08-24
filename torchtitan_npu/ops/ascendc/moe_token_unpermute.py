@@ -36,11 +36,7 @@ def _npu_moe_token_unpermute_fake(permuted_tokens, sorted_indices, probs=None):
         return torch.empty_like(permuted_tokens)
 
     output_shape = (*probs.shape[:-1], *permuted_tokens.shape[1:])
-    return torch.empty(
-        output_shape,
-        dtype=permuted_tokens.dtype,
-        device=permuted_tokens.device,
-    )
+    return permuted_tokens.new_empty(output_shape)
 
 
 def _npu_moe_token_unpermute_setup_context(ctx, inputs, output):
