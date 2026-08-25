@@ -2,7 +2,7 @@
 torch==2.14.0.dev20260719
 --find-links https://cann-ai.obs.cn-north-4.myhuaweicloud.com/torchtitan-npu/simple/torch-npu/index.html
 torch_npu==2.14.0.dev20260808
-torchtitan @ git+https://gitcode.com/GitHub_Trending/to/torchtitan.git@c91448d20480c7b294314e68976823050002ebec
+torchtitan @ git+https://gitcode.com/GitHub_Trending/to/torchtitan.git@2807d3f550fe27db18bd9395ba63176364eaed6d
 pybind11==3.0.4
 numpy
 PyYAML

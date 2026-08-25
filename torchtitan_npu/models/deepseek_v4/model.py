@@ -120,6 +120,9 @@ class DeepSeekV4Model(Decoder):
 
     def __init__(self, config: Config):
         super().__init__(config)
+        # TorchTitan 2807d3f invokes the MTP parallelization hook for all
+        # DeepSeek-V3-compatible models; DeepSeek-V4 does not use MTP.
+        self.mtp_layers = None
         cfg = config
 
         self.hc_mult = cfg.hc_mult

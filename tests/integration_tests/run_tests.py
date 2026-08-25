@@ -48,6 +48,7 @@ DEFAULT_TRAIN_ARGS = (
     "--metrics.log_freq=1",
     "--metrics.save_tb_folder=tb",
     "--dataloader.dataset-path=tests/assets/c4_test",
+    "--training.disable-cuda-graphs",
 )
 DETERMINISTIC_ARGS = (
     "--debug.deterministic",

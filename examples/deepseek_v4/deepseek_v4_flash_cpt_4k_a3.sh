@@ -80,6 +80,7 @@ TRAINING_ARGS="
     --training.global-batch-size ${GBS}
     --training.seq-len ${SEQ_LEN}
     --training.steps ${STEPS}
+    --training.disable-cuda-graphs
 "
 
 # Checkpoint

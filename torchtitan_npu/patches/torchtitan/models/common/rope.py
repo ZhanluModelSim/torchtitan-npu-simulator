@@ -5,19 +5,19 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Backport the unified single-tensor RoPE API and the unconditional YaRN
-policy from TorchTitan PR #3634.
+"""Backport the unified single-tensor RoPE API and TorchTitan's YaRN policy
+from PR #3634.
 
 ``RoPE.forward`` accepts ``key=None`` (rotate a single tensor, returning it
 directly) and ``inverse`` (conjugate rotation, for backward passes); the
-YaRN correction in ``ComplexRoPE._precompute_cache`` is applied whenever
-``scaling == "yarn"`` and ``original_seq_len > 0`` — the HF/Megatron
-convention where the correction is the encoding itself — replacing the
-``end > original_seq_len`` context-extension gate (which silently disabled
-YaRN for models whose max_seq_len does not exceed their original_seq_len).
-The ``> 0`` guard shields ``_yarn_inv_freq``'s ``log(original_seq_len)``
-from degenerate configs.  The previous ``SingleComplexRoPE`` backport is
-superseded by this unified API.
+YaRN correction in ``ComplexRoPE._precompute_cache`` is applied when
+``scaling == "yarn"`` and ``rope_factor > 1.0``, matching TorchTitan's
+configuration semantics.  The previous ``end > original_seq_len``
+context-extension gate silently disabled YaRN for models whose max_seq_len
+does not exceed their original_seq_len.  ``original_seq_len`` remains a
+parameter of the correction itself.
+
+The previous ``SingleComplexRoPE`` backport is superseded by this unified API.
 
 Remove this module after the TorchTitan dependency includes the PR.
 """
@@ -29,7 +29,7 @@ import torchtitan.models.common.rope
 
 
 def _yarn_precompute_cache(self) -> torch.Tensor:
-    """ComplexRoPE._precompute_cache with the unconditional YaRN policy."""
+    """Compute the RoPE cache using TorchTitan's YaRN policy."""
     cfg = self.config
     dim = cfg.dim
     end = cfg.max_seq_len
@@ -52,10 +52,8 @@ def _yarn_precompute_cache(self) -> torch.Tensor:
         smoothed_freqs = (1 - smooth_factor) * freqs / scaling_factor + smooth_factor * freqs
         is_medium_freqs = ~(wavelen < high_freq_wavelen) * ~(wavelen > low_freq_wavelen)
         freqs = torch.where(is_medium_freqs, smoothed_freqs, freqs)
-    elif cfg.scaling == "yarn" and cfg.original_seq_len > 0:
-        # YaRN: the correction is the encoding itself (HF/Megatron
-        # convention), applied at every position — original_seq_len is a
-        # parameter of the correction range, not a length gate.
+    elif cfg.scaling == "yarn" and cfg.rope_factor > 1.0:
+        # YaRN correction is enabled only for an actual scaling factor.
         freqs = torchtitan.models.common.rope._yarn_inv_freq(
             dim,
             theta,

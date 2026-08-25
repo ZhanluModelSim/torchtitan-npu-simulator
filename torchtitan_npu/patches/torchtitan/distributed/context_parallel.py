@@ -11,7 +11,7 @@ import logging
 import torch
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor.experimental._attention import _HeadTailLoadBalancer
-from torchtitan.distributed.context_parallel import cp_shard as original_cp_shard
+from torchtitan.distributed.context_parallel.api import cp_shard as original_cp_shard
 from torchtitan.models.common.attention import AttentionMasksType, VarlenMetadata
 
 from torchtitan_npu.patches.torchtitan.distributed.varlen_cp import (
@@ -66,10 +66,10 @@ def patched_cp_shard(
 
 
 def apply() -> None:
-    import torchtitan.distributed.context_parallel
+    import torchtitan.distributed.context_parallel.api as context_parallel_api
 
-    logger.info("[PATCH] torchtitan.distributed.context_parallel.cp_shard -> patched_cp_shard")
-    torchtitan.distributed.context_parallel.cp_shard = patched_cp_shard  # pyrefly: ignore [bad-assignment]
+    logger.info("[PATCH] torchtitan.distributed.context_parallel.api.cp_shard -> patched_cp_shard")
+    context_parallel_api.cp_shard = patched_cp_shard  # pyrefly: ignore [bad-assignment]
 
 
 apply()

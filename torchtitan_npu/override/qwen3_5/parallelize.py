@@ -82,7 +82,7 @@ def parallelize_qwen3_5_cp(model, *, parallel_dims, **kwargs):
         if ac_policy is not None:
             ac_policy.apply(module)
         if model_compile_enabled:
-            apply_compile(module, compile_config)
+            apply_compile(module, parallel_dims=parallel_dims, compile_config=compile_config)
     fsdp_mesh = parallel_dims.get_mesh("fsdp")
     param_dtype = TORCH_DTYPE_MAP[training.mixed_precision_param]
     reduce_dtype = TORCH_DTYPE_MAP[training.mixed_precision_reduce]

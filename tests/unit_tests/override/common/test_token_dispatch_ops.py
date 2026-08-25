@@ -196,8 +196,6 @@ def test_dispatcher_absorption_local_path_matches_post_w2_reference(monkeypatch)
             routed_output,
             metadata,
             x,
-            num_local_tokens_after_padding=x.shape[0],
-            local_seq_len_after_padding=x.shape[0],
         )
         output.square().sum().backward()
         return (

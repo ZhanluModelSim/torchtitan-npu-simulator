@@ -15,10 +15,11 @@ rank-major -> expert-major reroute after all-to-all is replaced by
 
 Semantics of the upstream metadata fields under this override:
 
-- ``token_indices_experts_sorted_N`` stores the ``sorted_indices`` tensor
-  returned by ``npu_moe_token_permute``. It is passed unchanged to
-  ``npu_moe_token_unpermute``; the dispatcher does not reinterpret it as the
-  upstream ``_local_reorder`` argsort tensor.
+- ``token_indices_experts_sorted_N`` stores the *inverse* permutation Q
+  returned by ``npu_moe_token_permute`` (the double-argsorted forward
+  permutation), NOT the forward argsort P of the upstream ``_local_reorder``.
+  Q is exactly the ``sorted_indices`` input consumed by
+  ``npu_moe_token_unpermute``.
 - ``topk_scores_experts_sorted_N`` stores the original ``topk_scores_TK``
   ``(T, K)`` tensor, NOT the per-row gathered scores of the upstream
   ``_local_reorder``. ``npu_moe_token_unpermute`` expects ``probs`` shaped
@@ -62,9 +63,9 @@ class NPUAllToAllTokenDispatcher(AllToAllTokenDispatcher):
 
     Overrides only ``dispatch`` and ``combine``. The all-to-all exchange
     helpers (``_token_count_exchange``, ``_sync_token_count_exchange``,
-    ``_dispatch_token_exchange``, ``_combine_token_exchange``),
-    ``_permute`` / ``_unpermute`` (rank-major <-> expert-major), and the
-    SP coordinate helpers are inherited from ``AllToAllTokenDispatcher``.
+    ``_dispatch_token_exchange``, ``_combine_token_exchange``) and
+    ``_permute`` / ``_unpermute`` (rank-major <-> expert-major) are inherited
+    from ``AllToAllTokenDispatcher``.
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -105,8 +106,8 @@ class NPUAllToAllTokenDispatcher(AllToAllTokenDispatcher):
             metadata: dispatch metadata for combine()
         """
         # Fused NPU permute: replaces _local_reorder (argsort + index_select).
-        # Keep the kernel-returned sorted_indices opaque; the matching
-        # unpermute kernel consumes it directly in combine.
+        # sorted_indices_N is the inverse permutation Q; npu_moe_token_unpermute
+        # consumes Q directly in combine.
         routed_input_ND, sorted_indices_N = torch_npu.npu_moe_token_permute(
             x_TD,
             topk_expert_ids_TK,
@@ -134,7 +135,6 @@ class NPUAllToAllTokenDispatcher(AllToAllTokenDispatcher):
             )
 
         ep_size = self.ep_mesh.size()
-        # EP all-to-all below produces (R, D) where R != N = T*K.
 
         if get_spmd_backend() == "spmd_types" and spmd.is_type_checking():  # sparse mesh reinterpret
             for axis in ["dp", "cp", "tp"]:
@@ -225,9 +225,6 @@ class NPUAllToAllTokenDispatcher(AllToAllTokenDispatcher):
         routed_output_RD: torch.Tensor,
         metadata: AllToAllDispatchMetadata,
         x_TD: torch.Tensor,
-        *,
-        num_local_tokens_after_padding: int,
-        local_seq_len_after_padding: int,
     ) -> torch.Tensor:
         """Reverse the dispatch: unpermute + all-to-all + fused unpermute.
 
@@ -237,24 +234,13 @@ class NPUAllToAllTokenDispatcher(AllToAllTokenDispatcher):
         over top-K, accumulating internally in fp32. The output dtype follows
         the first argument.
 
-        When sp_size > 1, dispatch uses local token indices. The fused
-        unpermute reconstructs the local ``(T, D)`` shard; combine then
-        scatters it to global positions so the full SP view is correct.
-
         Args:
             routed_output_RD: ``(R, D)`` expert outputs in expert-major order
             metadata: AllToAllDispatchMetadata from dispatch()
             x_TD: ``(T, D)`` original input tokens
-            num_local_tokens_after_padding: Local token count to use for the
-                combined SP view after logical padding. MoE padding passes this
-                count without materializing pad rows.
-            local_seq_len_after_padding: Per-batch local sequence length after
-                logical padding, used to map local token indices to global SP
-                positions.
 
         Returns:
-            out_TD: Combined output. With SP, shape is
-                ``(num_local_tokens_after_padding * sp_size, D)``.
+            out_TD: ``(T, D)`` combined output.
         """
         probs = (
             torch.ones_like(metadata.topk_scores_experts_sorted_N)
@@ -278,17 +264,11 @@ class NPUAllToAllTokenDispatcher(AllToAllTokenDispatcher):
                 if get_spmd_backend() == "spmd_types"
                 else self.ep_mesh.get_group()
             )
-            # Reverse the fused rank-major -> expert-major reroute. This case
-            # has no routing map, probabilities, or drop-and-pad slots, so the
-            # plain unpermute kernel is the exact inverse and avoids the
-            # restore_shape/SymInt path of the routing-map variant.
             routed_output_RD = npu_moe_token_unpermute(
                 routed_output_RD,
                 metadata.permuted_indices,
                 probs=None,
             )
-            # All-to-all combine: returns AsyncCollectiveTensor — the a2a runs
-            # on the HCCL stream and won't block until the tensor is accessed.
             routed_output_RD = self._combine_token_exchange(
                 routed_output_RD,
                 pg,
@@ -301,34 +281,11 @@ class NPUAllToAllTokenDispatcher(AllToAllTokenDispatcher):
             routed_output_RD = spmd.reinterpret_mesh(routed_output_RD, spmd.current_mesh())
 
         # Fused NPU unpermute: scatter + score x probs + sum over top-K.
-        local_out = npu_moe_token_unpermute(
+        return npu_moe_token_unpermute(
             routed_output_RD,
             metadata.token_indices_experts_sorted_N,
             probs=probs,
         )
-
-        # SP: scatter local [T, D] output to global [T*sp_size, D] buffer.
-        if self.sp_size > 1:
-            T = local_out.shape[0]
-            out_TD = torch.zeros(
-                num_local_tokens_after_padding * self.sp_size,
-                local_out.shape[-1],
-                device=local_out.device,
-                dtype=local_out.dtype,
-            )
-            local_indices = torch.arange(T, device=local_out.device)
-            global_indices = self._sp_global_token_indices(
-                local_indices,
-                local_seq_len_after_padding,
-            )
-            out_TD.scatter_(
-                0,
-                global_indices.unsqueeze(-1).expand(-1, local_out.shape[-1]),
-                local_out,
-            )
-            return out_TD
-
-        return local_out
 
 
 @override(

@@ -282,7 +282,7 @@ def _make_v4_attn_config(
 
 # SwiGLU gate/up clamp shared by all DSV4 flavors; 10.0 is the transformers
 # config default (``swiglu_limit: float = 10.0``) and the inference repo's
-# ``config.json`` value.  Zero disables the clamp.
+# ``config.json`` value. Zero disables the clamp.
 _SWIGLU_LIMIT = 10.0
 
 

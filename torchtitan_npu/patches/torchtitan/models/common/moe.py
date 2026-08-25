@@ -40,9 +40,6 @@ from torchtitan.models.common.moe import (
     RoutedExperts,
     TokenChoiceTopKRouter,
 )
-from torchtitan.models.common.token_dispatcher import (
-    DeepEPTokenDispatcher,
-)
 
 __all__ = ["HashMoE", "HashRouter"]
 
@@ -154,7 +151,7 @@ class HashMoE(MoE):
         super().__init__(config)
         # [TODO] need to add https://github.com/pytorch/torchtitan/pull/3634
         if getattr(self.router, "hash", False):
-            del self.expert_bias_E
+            self.expert_bias_E = None
 
     def forward(self, x_BLD: torch.Tensor, *, input_ids: torch.Tensor | None = None) -> torch.Tensor:
         """Forward through the router (with optional ``input_ids``) and experts.
@@ -162,26 +159,27 @@ class HashMoE(MoE):
         The body mirrors upstream ``MoE.forward``; ``input_ids`` is only
         consumed by the router's hash path.
         """
-        B, L, _D = x_BLD.shape
+        _B, L, _D = x_BLD.shape
         sp_size = getattr(self.routed_experts.token_dispatcher, "sp_size", 1)
-        if not isinstance(x_BLD, DTensor) and self.seq_dim_tp_sharded:
+        if not isinstance(x_BLD, DTensor) and getattr(self, "seq_dim_tp_sharded", False):
             seq_pad = 0
             seq_dim_pad_tokens = 0
-            num_local_tokens_after_seq_dim_padding = B * L
         else:
             seq_pad = sp_size - L if sp_size > L else 0
             if seq_pad:
                 x_BLD = F.pad(x_BLD, (0, 0, 0, seq_pad))
                 L = L + seq_pad
             seq_dim_pad_tokens = (-L) % sp_size
-            local_batch_size = x_BLD._local_tensor.shape[0] if isinstance(x_BLD, DTensor) else B
-            num_local_tokens_after_seq_dim_padding = local_batch_size * (L + seq_dim_pad_tokens) // sp_size
 
         (
             topk_scores_BLK,
             topk_expert_ids_BLK,
             scores_BLE,
-        ) = self.router(x_BLD, self.expert_bias_E, input_ids=input_ids)
+        ) = self.router(
+            x_BLD,
+            getattr(self, "expert_bias_E", None),
+            input_ids=input_ids,
+        )
 
         routing_map_BLE = torch.zeros_like(scores_BLE, dtype=torch.bool).scatter_(
             -1,
@@ -198,24 +196,15 @@ class HashMoE(MoE):
             topk_scores_BLK,
             topk_expert_ids_BLK,
             num_local_tokens_per_expert_E,
-            num_local_tokens_after_seq_dim_padding=(num_local_tokens_after_seq_dim_padding),
         )
 
         shared_out_BLD = self.shared_experts(x_BLD) if self.shared_experts is not None else None
 
-        if (
-            isinstance(self.routed_experts.token_dispatcher, DeepEPTokenDispatcher)
-            and self.routed_experts.token_dispatcher.sp_size == 1
-        ):
-            from torchtitan.distributed.deepep.deepep import sync_combine
-
-            sync_combine()
+        if shared_out_BLD is not None:
+            out_BLD = out_BLD + shared_out_BLD
 
         if seq_dim_pad_tokens:
             out_BLD = out_BLD[:, :L, :]
-
-        if shared_out_BLD is not None:
-            out_BLD = out_BLD + shared_out_BLD
 
         if seq_pad:
             out_BLD = out_BLD[:, : L - seq_pad, :]
@@ -236,13 +225,10 @@ class _RouterScoreAbsorbingRoutedExperts(RoutedExperts):
         topk_scores_BLK: torch.Tensor,
         topk_expert_ids_BLK: torch.Tensor,
         num_local_tokens_per_expert_E: torch.Tensor,
-        *,
-        num_local_tokens_after_seq_dim_padding: int,
     ) -> torch.Tensor:
         B, L, D = x_BLD.shape
         K = topk_scores_BLK.size(-1)
         T = B * L
-        local_seq_len_after_padding = num_local_tokens_after_seq_dim_padding // B
         x_TD = x_BLD.view(T, D)
 
         topk_scores_TK = topk_scores_BLK.view(T, K)
@@ -269,13 +255,7 @@ class _RouterScoreAbsorbingRoutedExperts(RoutedExperts):
                 routed_scores_R=routed_scores_R,
             )
 
-        out_TD = dispatcher.combine(
-            routed_output_RD,
-            metadata,
-            x_TD,
-            num_local_tokens_after_padding=num_local_tokens_after_seq_dim_padding,
-            local_seq_len_after_padding=local_seq_len_after_padding,
-        )
+        out_TD = dispatcher.combine(routed_output_RD, metadata, x_TD)
         return out_TD.view(B, -1, D)
 
 
@@ -319,14 +299,14 @@ class _ClampGroupedExperts(GroupedExperts):
             for axis in ("dp", "cp"):
                 spmd.mutate_type(offsets_E, axis, src=spmd.P, dst=spmd.V)
 
-        g_RF = torch._grouped_mm(
-            x_RD.bfloat16(),
-            w1_EFD.bfloat16().transpose(-2, -1),
+        g_RF = self._grouped_mm(
+            A=x_RD.bfloat16(),
+            B_t=w1_EFD.bfloat16().transpose(-2, -1),
             offs=offsets_E,
         )
-        u_RF = torch._grouped_mm(
-            x_RD.bfloat16(),
-            w3_EFD.bfloat16().transpose(-2, -1),
+        u_RF = self._grouped_mm(
+            A=x_RD.bfloat16(),
+            B_t=w3_EFD.bfloat16().transpose(-2, -1),
             offs=offsets_E,
         )
         if self.swiglu_limit > 0:
@@ -335,7 +315,11 @@ class _ClampGroupedExperts(GroupedExperts):
         h_RF = F.silu(g_RF) * u_RF
         if routed_scores_R is not None:
             h_RF = (h_RF.float() * routed_scores_R.float().reshape(-1, 1)).to(h_RF.dtype)
-        return torch._grouped_mm(h_RF, w2_EDF.bfloat16().transpose(-2, -1), offs=offsets_E).type_as(x_RD)
+        return self._grouped_mm(
+            A=h_RF,
+            B_t=w2_EDF.bfloat16().transpose(-2, -1),
+            offs=offsets_E,
+        ).type_as(x_RD)
 
 
 class _ClampFeedForward(FeedForward):

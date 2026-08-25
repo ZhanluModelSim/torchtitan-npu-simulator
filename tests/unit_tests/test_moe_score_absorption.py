@@ -75,15 +75,11 @@ def test_standard_dispatch_preserves_default_api_and_exposes_aligned_scores():
         expert_output_RD,
         default_result[2],
         x_TD,
-        num_local_tokens_after_padding=2,
-        local_seq_len_after_padding=2,
     )
     candidate = absorbed_dispatcher.combine(
         expert_output_RD * routed_scores_R.to(expert_output_RD.dtype).reshape(-1, 1),
         metadata,
         x_TD,
-        num_local_tokens_after_padding=2,
-        local_seq_len_after_padding=2,
     )
     torch.testing.assert_close(candidate, baseline, atol=0.02, rtol=0.02)
 
@@ -261,7 +257,6 @@ def test_routed_experts_forward_absorbs_scores_through_local_dispatcher(monkeypa
         scores,
         expert_ids,
         counts_E,
-        num_local_tokens_after_seq_dim_padding=4,
     )
 
     sorted_scores = torch.tensor([0.25, 0.75, 0.5, 1.0]).bfloat16()
@@ -295,7 +290,6 @@ def test_routed_experts_forward_default_path_without_absorption(monkeypatch):
         scores,
         expert_ids,
         counts_E,
-        num_local_tokens_after_seq_dim_padding=4,
     )
 
     expected_w2_input = F.silu(gate) * up
@@ -332,7 +326,6 @@ def test_routed_experts_forward_falls_back_for_unsupported_dispatcher(monkeypatc
         scores,
         expert_ids,
         counts_E,
-        num_local_tokens_after_seq_dim_padding=4,
     )
 
     expected_w2_input = F.silu(gate) * up
@@ -449,8 +442,6 @@ def _run_local_path(
         routed_output,
         metadata,
         x,
-        num_local_tokens_after_padding=x.shape[0],
-        local_seq_len_after_padding=x.shape[0],
     )
     output.square().sum().backward()
     grads = (
@@ -651,7 +642,7 @@ def _alltoall_worker(rank: int, rendezvous: str, result_file: str, use_npu: bool
         def run(pre_w2: bool, weights: _ExpertWeights):
             dispatcher_cls = npu_token_dispatcher.NPUAllToAllTokenDispatcher if use_npu else AllToAllTokenDispatcher
             dispatcher = dispatcher_cls(dispatcher_cls.Config(num_experts=4, top_k=1, absorb_router_scores=True))
-            dispatcher.wire_meshes(ep_mesh=mesh, tp_mesh=None)
+            dispatcher.wire_meshes(ep_mesh=mesh)
             dispatcher.sp_size = 1
             local_x = x.detach().clone().requires_grad_()
             local_scores = scores.detach().clone().requires_grad_()
@@ -680,8 +671,6 @@ def _alltoall_worker(rank: int, rendezvous: str, result_file: str, use_npu: bool
                 routed_output,
                 metadata,
                 local_x,
-                num_local_tokens_after_padding=local_x.shape[0],
-                local_seq_len_after_padding=local_x.shape[0],
             )
             output.square().sum().backward()
             num_local_experts = weights.w1.shape[0] // mesh.size()
