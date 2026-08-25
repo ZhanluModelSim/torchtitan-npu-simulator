@@ -102,8 +102,14 @@ venv.bak/
 
 # mypy
 .mypy_cache/
-.claude/
-.opencode/
+.claude/*
+!.claude/CLAUDE.md
+!.claude/skills/
+!.claude/skills/*
+.opencode/*
+!.opencode/AGENTS.md
+!.opencode/skills/
+!.opencode/skills/*
 outputs/
 
 oat_reports/
