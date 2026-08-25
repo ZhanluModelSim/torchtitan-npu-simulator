@@ -66,8 +66,10 @@ def _apply_interleaved_rope(
     sin: torch.Tensor,
 ) -> torch.Tensor:
     x_float = x.float()
-    pairs = x_float.reshape(*x.shape[:-1], -1, 2)
-    rotated = torch.stack((-pairs[..., 1], pairs[..., 0]), dim=-1).flatten(-2)
+    rotated = torch.stack(
+        (-x_float[..., 1::2], x_float[..., ::2]),
+        dim=-1,
+    ).flatten(-2)
     return (x_float * cos + rotated * sin).type_as(x)
 
 

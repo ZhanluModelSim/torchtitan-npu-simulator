@@ -3,13 +3,18 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import importlib
+
 import pytest
 import torch
 from torch.fx.subgraph_rewriter import replace_pattern_with_filters
 
 _previous_pre_grad_pass = torch._inductor.config.pre_grad_custom_pass
-import torchtitan_npu.compile.patterns.deepseek_v4.inplace_partial_rope as inplace_partial_rope  # noqa: E402
+inplace_partial_rope = importlib.import_module("torchtitan_npu.compile.patterns.deepseek_v4.inplace_partial_rope")
+
 _make_parent_rope_pattern = inplace_partial_rope._make_parent_rope_pattern
+_make_kv_rope_pattern = inplace_partial_rope._make_kv_rope_pattern
+_make_compressor_rope_pattern = inplace_partial_rope._make_compressor_rope_pattern
 
 
 def teardown_module():
@@ -52,10 +57,56 @@ def _reference_partial_rope(x, cos, sin, inverse):
 def _partial_rope_with_different_literals(x, cos, sin):
     prefix, rotary = torch.split(x, [448, 64], dim=-1)
     rotary_float = rotary.float()
-    pairs = rotary_float.reshape(1, 2048, 1, -1, 2)
-    rotated = torch.stack((-pairs[..., 1], pairs[..., 0]), dim=-1).flatten(-2)
+    rotated = torch.stack(
+        (-rotary_float[..., 1::2], rotary_float[..., ::2]),
+        dim=-1,
+    ).flatten(-2)
     rotated = rotary_float * cos + rotated * sin
     return torch.cat([prefix, rotated.type_as(rotary)], dim=-1)
+
+
+def _kv_rope_with_layout(x, cos, sin):
+    prefix, rotary = torch.split(x, [448, 64], dim=-1)
+    rotary_u = rotary.unsqueeze(2)
+    rotary_float = rotary_u.float()
+    rotated = torch.stack(
+        (-rotary_float[..., 1::2], rotary_float[..., ::2]),
+        dim=-1,
+    ).flatten(-2)
+    rotated = (rotary_float * cos + rotated * sin).type_as(rotary_u)
+    rotated = rotated.squeeze(2)
+    return torch.cat([prefix, rotated], dim=-1)
+
+
+def _compressor_rope_with_shape_users(x, cos, sin):
+    prefix, rotary = torch.split(x, [448, 64], dim=-1)
+    rotary_u = rotary.unsqueeze(0).unsqueeze(2)
+    size = rotary_u.size()
+    size[0]
+    size[1]
+    size[2]
+    size[3]
+    rotary_float = rotary_u.float()
+    rotated = torch.stack(
+        (-rotary_float[..., 1::2], rotary_float[..., ::2]),
+        dim=-1,
+    ).flatten(-2)
+    rotated = (rotary_float * cos + rotated * sin).type_as(rotary_u)
+    rotated = rotated.squeeze(0).squeeze(1)
+    return torch.cat([prefix, rotated], dim=-1)
+
+
+def _assert_pattern_matches(pattern, fn):
+    graph_module = torch.fx.symbolic_trace(fn)
+    matches = replace_pattern_with_filters(
+        graph_module,
+        pattern.search_fn,
+        pattern.replacement_fn,
+        ignore_literals=pattern.ignore_literals,
+    )
+    assert len(matches) == 1
+
+
 
 
 @pytest.mark.parametrize(
@@ -122,17 +173,24 @@ def test_replacement_calls_inplace_partial_rotary_mul(monkeypatch):
 
 
 def test_search_pattern_ignores_shape_literals():
-    pattern = _make_parent_rope_pattern(inverse=False)
-    graph_module = torch.fx.symbolic_trace(_partial_rope_with_different_literals)
-
-    matches = replace_pattern_with_filters(
-        graph_module,
-        pattern.search_fn,
-        pattern.replacement_fn,
-        ignore_literals=pattern.ignore_literals,
+    _assert_pattern_matches(
+        _make_parent_rope_pattern(inverse=False),
+        _partial_rope_with_different_literals,
     )
 
-    assert len(matches) == 1
+
+def test_kv_rope_pattern_matches_layout():
+    _assert_pattern_matches(
+        _make_kv_rope_pattern(),
+        _kv_rope_with_layout,
+    )
+
+
+def test_compressor_pattern_ignores_external_shape_consumers():
+    _assert_pattern_matches(
+        _make_compressor_rope_pattern(),
+        _compressor_rope_with_shape_users,
+    )
 
 
 def test_replacement_does_not_repeat_rope_cache():
