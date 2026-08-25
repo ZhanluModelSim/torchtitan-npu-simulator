@@ -122,7 +122,8 @@ class DeepSeekV32ModelNpu(DeepSeekV3ModelNpu):
 
     def forward(
         self,
-        tokens: torch.Tensor,
+        tokens: torch.Tensor | tuple[torch.Tensor, ...],
+        *pipeline_args: torch.Tensor,
         attention_masks: AttentionMasksType | None = None,
         positions: torch.Tensor | None = None,
     ):
@@ -141,42 +142,132 @@ class DeepSeekV32ModelNpu(DeepSeekV3ModelNpu):
             torch.Tensor: Logits tensor of shape (batch_size, vocab_size).
         """
         residual = None
-        seq_len = tokens.shape[1]
-        seq_len -= self.num_mtp_modules
-        h = self.tok_embeddings(tokens[:, :seq_len]) if self.tok_embeddings is not None else tokens[:, :seq_len]
-        # Main model calculate
-        for layer_id, layer in enumerate(self.layers.values()):
-            if layer_id < self.n_main_layers:
-                h, residual = layer(h, residual, self.freqs_cis, attention_masks, positions)
+        mtp_inputs: tuple[torch.Tensor, ...] = ()
+        if isinstance(tokens, tuple):
+            h, prev_topk_indices, *mtp_input_list = tokens
+            mtp_inputs = tuple(mtp_input_list)
+            seq_len = h.shape[1]
+        elif self.tok_embeddings is None:
+            # PipelineStage forwards tuple outputs as positional arguments.
+            # For the GLM PP payload the second argument is top-k metadata and
+            # the remaining arguments are MTP input embeddings, not attention
+            # masks/positions.
+            prev_topk_indices = pipeline_args[0] if pipeline_args else None
+            mtp_inputs = tuple(
+                item for item in pipeline_args[1:] if item is not None
+            )
+            h = tokens
+            seq_len = h.shape[1]
+        else:
+            # Non-pipeline calls may pass masks/positions positionally. Keep
+            # accepting that legacy form while leaving keyword-only CP
+            # positions unambiguous for pipeline calls carrying metadata.
+            if pipeline_args:
+                if attention_masks is None:
+                    attention_masks = pipeline_args[0]
+                if len(pipeline_args) > 1 and positions is None:
+                    positions = pipeline_args[1]
+            prev_topk_indices = None
+            seq_len = tokens.shape[1] - self.num_mtp_modules
+            if self.tok_embeddings is not None:
+                h = self.tok_embeddings(tokens[:, :seq_len])
+                if self.num_mtp_modules > 0:
+                    mtp_inputs = tuple(
+                        self.tok_embeddings(
+                            tokens[:, offset : offset + seq_len]
+                        )
+                        for offset in range(1, self.num_mtp_modules + 1)
+                    )
             else:
-                break
+                h = tokens[:, :seq_len]
+
+        # A pipeline stage owns only a subset of the global ModuleDict.  Use
+        # the numeric ModuleDict keys instead of the local enumeration index.
+        local_main_layers = [
+            (int(layer_id), layer)
+            for layer_id, layer in self.layers.items()
+            if int(layer_id) < self.n_main_layers
+        ]
+        for _layer_id, layer in local_main_layers:
+            h, residual = layer(
+                h,
+                residual,
+                self.freqs_cis,
+                attention_masks,
+                positions,
+                prev_topk_indices=prev_topk_indices,
+            )
+            prev_topk_indices = getattr(layer, "last_topk_indices", None)
         if residual is not None:
             h = h + residual
+
+        # Non-final stages return the activation plus the DSA/MTP metadata
+        # needed by later stages.  The tuple is a normal pipeline payload, so
+        # the metadata follows the same P2P boundary as the hidden state.
+        if self.output is None:
+            if self.num_mtp_modules > 0:
+                if (
+                    prev_topk_indices is not None
+                    and not prev_topk_indices.requires_grad
+                ):
+                    # PipelineStage sends a gradient slot for every tensor
+                    # received from the previous stage.  IndexShare top-k is
+                    # integer metadata, so attach it to a zero-valued scalar
+                    # dependency and carry it as a floating meta activation;
+                    # the next stage casts it back to int64 before indexing.
+                    prev_topk_indices = prev_topk_indices.to(dtype=h.dtype)
+                    if type(prev_topk_indices) is type(h):
+                        prev_topk_indices = (
+                            prev_topk_indices + h.reshape(-1)[:1].sum() * 0
+                        )
+                return (h, prev_topk_indices, *mtp_inputs)
+            return h
+
         prev_embed = h
         h = self.norm(h) if self.norm is not None else h
         output = self.output(h.float()) if self.output is not None else h
-        if self.num_mtp_modules <= 0:
+        if self.tok_embeddings is None and h.device.type == "meta":
+            # The simulator's shape-only kernels intentionally do not model
+            # numerical values.  Preserve the pipeline autograd edges for
+            # every received activation without changing the forward value.
+            if type(output) is type(h):
+                output = output + h.reshape(-1)[:1].sum() * 0
+            for mtp_input in mtp_inputs:
+                if type(output) is type(mtp_input):
+                    output = output + mtp_input.reshape(-1)[:1].sum() * 0
+        local_mtp_layers = [
+            (int(layer_id), layer)
+            for layer_id, layer in self.layers.items()
+            if int(layer_id) >= self.n_main_layers
+        ]
+        if self.num_mtp_modules <= 0 or not local_mtp_layers:
             return output
         else:
-            output_list = [None] * (1 + self.num_mtp_modules)
+            output_list = [None] * (1 + len(local_mtp_layers))
             output_list[0] = output  # pyrefly: ignore [unsupported-operation]
         # MTP module calculate
-        for mtp_layer_id in range(self.num_mtp_modules):
-            token_offset_id = mtp_layer_id + 1
-            token_end_idx = token_offset_id + seq_len
-            token_offset = tokens[:, token_offset_id:token_end_idx]
-            input_offset = self.tok_embeddings(  # pyrefly: ignore [not-callable]
-                token_offset
+        for mtp_layer_id, (layer_id, layer) in enumerate(local_mtp_layers):
+            input_offset = mtp_inputs[mtp_layer_id]
+            h, residual = layer(
+                input_offset,
+                prev_embed,
+                self.freqs_cis,
+                attention_masks,
+                positions,
+                prev_topk_indices=prev_topk_indices,
             )
-            layer_id = mtp_layer_id + self.n_main_layers
-            h, residual = self.layers[str(layer_id)](
-                input_offset, prev_embed, self.freqs_cis, attention_masks, positions
-            )
+            prev_topk_indices = getattr(layer, "last_topk_indices", None)
             if residual is not None:
                 h = h + residual
             prev_embed = h
             h = self.norm(h) if self.norm is not None else h
             output = self.output(h.float()) if self.output is not None else h
+            if (
+                self.tok_embeddings is None
+                and h.device.type == "meta"
+                and type(output) is type(h)
+            ):
+                output = output + h.reshape(-1)[:1].sum() * 0
             output_list[mtp_layer_id + 1] = output
         return output_list
 
@@ -258,6 +349,7 @@ class Indexer(Module):
         self.rope_head_dim: int = config.qk_rope_head_dim
         self.index_topk: int = config.index_topk
         self.q_lora_rank: int = config.q_lora_rank
+        self.rope_interleave: bool = getattr(config, "indexer_rope_interleave", False)
         self.wq_b = _Linear(self.q_lora_rank, self.n_heads * self.head_dim, bias=False)
         self.wk = _Linear(self.dim, self.head_dim, bias=False)
         self.k_norm = _LayerNorm(self.head_dim)
@@ -280,13 +372,18 @@ class Indexer(Module):
         q = q.view(bsz, seqlen, self.n_heads, self.head_dim)
         q_pe, q_nope = torch.split(q, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1)
         # rope in indexer is not interleaved
-        q_pe = apply_rotary_emb(q_pe, freqs_cis, positions, interleaved=False)
+        q_pe = apply_rotary_emb(q_pe, freqs_cis, positions, interleaved=self.rope_interleave)
         q = torch.cat([q_pe, q_nope], dim=-1)
         k = self.wk(x)
         k = self.k_norm(k)
         k_pe, k_nope = torch.split(k, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1)
         # rope in indexer is not interleaved
-        k_pe = apply_rotary_emb(k_pe.unsqueeze(2), freqs_cis, positions, interleaved=False).squeeze(2)
+        k_pe = apply_rotary_emb(
+            k_pe.unsqueeze(2),
+            freqs_cis,
+            positions,
+            interleaved=self.rope_interleave,
+        ).squeeze(2)
         k = torch.cat([k_pe, k_nope], dim=-1).unsqueeze(2)
         q = rotate_activation(q)
         k = rotate_activation(k)
@@ -336,6 +433,7 @@ class DSV32_SDPA(Module):  # noqa: N801
     def __init__(self, config: "Attention.Config") -> None:
         super().__init__()
         self.config = config
+        self.last_topk_indices: torch.Tensor | None = None
         self.compute_dsa_indexer_loss = DSAIndexerLoss.Config().build()
         if not self.sdpa_backends:
             # pyrefly: ignore [read-only]
@@ -357,10 +455,12 @@ class DSV32_SDPA(Module):  # noqa: N801
         weights: torch.Tensor | None = None,
         end_pos: torch.Tensor | None = None,
         index_topk: torch.Tensor | None = None,
+        topk_indices: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         bsz = q.size(0)
 
-        if q_indexer is None:
+        if q_indexer is None and topk_indices is None:
+            self.last_topk_indices = None
             with sdpa_kernel(self.sdpa_backends, set_priority=True):
                 output = F.scaled_dot_product_attention(
                     q,
@@ -372,22 +472,33 @@ class DSV32_SDPA(Module):  # noqa: N801
                 )
             return q.new_zeros(1), output
 
-        # prepare attention_mask for sparse attention according to lightning_indexer score
-        index_score = bf16_index(
-            q_indexer.contiguous(),
-            # pyrefly: ignore [missing-attribute]
-            weights.unsqueeze(-1),
-            # pyrefly: ignore [missing-attribute]
-            k_indexer.contiguous(),
-        )
-
-        seqlen = index_score.size(1)
+        # A full DSA layer computes top-k from the indexer projections.  A
+        # GLM-5.2 shared layer receives the previous full layer's top-k and
+        # must not instantiate or execute its own indexer.
+        if topk_indices is None:
+            if q_indexer is None or k_indexer is None or weights is None:
+                raise ValueError("DSA requires either indexer projections or shared top-k indices")
+            index_score = bf16_index(
+                q_indexer.contiguous(),
+                weights.unsqueeze(-1),
+                k_indexer.contiguous(),
+            )
+            seqlen = index_score.size(1)
+        else:
+            seqlen = topk_indices.size(1)
         if q.size(2) != seqlen:
             q = q.narrow(2, 0, seqlen)
         if k.size(2) != seqlen:
             k = k.narrow(2, 0, seqlen)
         if v.size(2) != seqlen:
             v = v.narrow(2, 0, seqlen)
+        if topk_indices is None:
+            topk_score, topk_indices = index_score.topk(min(index_topk, end_pos), dim=-1)
+        else:
+            topk_indices = topk_indices.to(device=q.device, dtype=torch.int64)
+            topk_score = None
+
+        self.last_topk_indices = topk_indices
         if attn_mask is None:
             attn_mask = torch.where(
                 torch.triu(
@@ -398,9 +509,8 @@ class DSV32_SDPA(Module):  # noqa: N801
                 float("-inf"),
                 0.0,
             )
-        index_score += attn_mask
-        # pyrefly: ignore [bad-argument-type]
-        topk_score, topk_indices = index_score.topk(min(index_topk, end_pos), dim=-1)
+        if topk_score is not None:
+            index_score += attn_mask
         query_positions = torch.arange(seqlen, device=topk_indices.device).unsqueeze(0).unsqueeze(-1)
         valid_positions = topk_indices <= query_positions
         # scatter_/gather reject -1; invalid slots use seqlen-1, a causal-masked
@@ -424,12 +534,18 @@ class DSV32_SDPA(Module):  # noqa: N801
         # Zero out sentinel-slot reads so the indexer KL loss does not depend on the
         # implicit softmax(-inf)=0 invariant of main_attn_dist[..., seqlen-1].
         selected_main_attn_dist = selected_main_attn_dist.masked_fill(~valid_positions, 0.0)
-        loss = self.compute_dsa_indexer_loss(
-            selected_main_attn_dist,
-            topk_score,
-            topk_indices,
-            1.0,
-        )
+        if q_indexer is None:
+            # Shared IndexShare layers have no indexer parameters and hence no
+            # indexer auxiliary loss or indexer gradients.
+            loss = q.new_zeros(())
+        else:
+            assert topk_score is not None
+            loss = self.compute_dsa_indexer_loss(
+                selected_main_attn_dist,
+                topk_score,
+                topk_indices,
+                1.0,
+            )
         return loss, output
 
 
@@ -451,6 +567,7 @@ class PreAttention(Module):
         self.qk_rope_head_dim = config.qk_rope_head_dim
         self.qk_head_dim = config.qk_nope_head_dim + config.qk_rope_head_dim
         self.v_head_dim = config.v_head_dim
+        self.index_topk = config.index_topk
         self.enable_mla_absorb = config.enable_mla_absorb
 
         # v32 always uses LoRA query projection (q_lora_rank > 0).
@@ -468,7 +585,7 @@ class PreAttention(Module):
         if config.rope_max_seq_len > config.rope_original_seq_len:
             mscale = 0.1 * config.mscale * math.log(config.rope_factor) + 1.0
             self.softmax_scale = self.softmax_scale * mscale * mscale
-        self.indexer = Indexer(config)
+        self.indexer = None if getattr(config, "skip_topk", False) else Indexer(config)
 
     def forward(
         self,
@@ -513,9 +630,12 @@ class PreAttention(Module):
             k = k.transpose(1, 2)  # (bsz, n_heads, seqlen, qk_head_dim)
             v = v.transpose(1, 2)  # (bsz, n_heads, seqlen, v_head_dim)
 
-            q_indexer, weights, k_indexer, end_pos = self.indexer(
-                x.detach(), qr.detach(), 0, freqs_cis, attention_masks, positions
-            )
+            if self.indexer is None:
+                q_indexer = weights = k_indexer = end_pos = None
+            else:
+                q_indexer, weights, k_indexer, end_pos = self.indexer(
+                    x.detach(), qr.detach(), 0, freqs_cis, attention_masks, positions
+                )
             return (
                 q,
                 k,
@@ -526,7 +646,7 @@ class PreAttention(Module):
                 k_indexer,
                 weights,
                 end_pos,
-                self.indexer.index_topk,
+                self.index_topk,
                 None,
             )
         else:
@@ -547,9 +667,12 @@ class PreAttention(Module):
             k = k.transpose(1, 2)  # (bsz, 1, seqlen, qk_head_dim)
             v = v.transpose(1, 2)  # (bsz, 1, seqlen, v_head_dim)
 
-            q_indexer, weights, k_indexer, end_pos = self.indexer(
-                x.detach(), qr.detach(), 0, freqs_cis, attention_masks, positions
-            )
+            if self.indexer is None:
+                q_indexer = weights = k_indexer = end_pos = None
+            else:
+                q_indexer, weights, k_indexer, end_pos = self.indexer(
+                    x.detach(), qr.detach(), 0, freqs_cis, attention_masks, positions
+                )
 
             return (
                 q,
@@ -561,7 +684,7 @@ class PreAttention(Module):
                 k_indexer,
                 weights,
                 end_pos,
-                self.indexer.index_topk,
+                self.index_topk,
                 w_uv_t,
             )
 
@@ -612,6 +735,11 @@ class Attention(Module):
         index_head_dim: int = 128
         index_topk: int = 2048
         enable_mla_absorb: bool = True
+        # GLM-5.2 IndexShare layers reuse the preceding full layer's top-k and
+        # therefore do not own indexer parameters.
+        skip_topk: bool = False
+        indexer_rope_interleave: bool = False
+        rope_scaling: str = "yarn"
 
     def __init__(self, config: Config, num_total_layers: int):
         super().__init__()
@@ -626,6 +754,8 @@ class Attention(Module):
         attention_masks: AttentionMasksType | None,
         layer_id,
         positions: torch.Tensor | None = None,
+        *,
+        prev_topk_indices: torch.Tensor | None = None,
     ):
         (
             q,
@@ -651,7 +781,13 @@ class Attention(Module):
             weights=weights,
             end_pos=end_pos,
             index_topk=index_topk,
+            topk_indices=(
+                prev_topk_indices
+                if self.pre_attention.indexer is None
+                else None
+            ),
         )
+        self.last_topk_indices = self.inner_attention.last_topk_indices
         final_output = self.post_attention(x, output, w_uv_t, loss, layer_id)
         return final_output
 
@@ -695,6 +831,8 @@ class TransformerBlockV32(DeepSeekV3TransformerBlock):
         freqs_cis: torch.Tensor,
         attention_masks: AttentionMasksType | None,
         positions: torch.Tensor | None = None,
+        *,
+        prev_topk_indices: torch.Tensor | None = None,
     ):
         """
         Forward pass for the Transformer block.
@@ -710,7 +848,15 @@ class TransformerBlockV32(DeepSeekV3TransformerBlock):
             x = x + residual
         residual = x
         x = self.attention_norm(x)
-        x = self.attention(x, freqs_cis, attention_masks, self.layer_id, positions)
+        x = self.attention(
+            x,
+            freqs_cis,
+            attention_masks,
+            self.layer_id,
+            positions,
+            prev_topk_indices=prev_topk_indices,
+        )
+        self.last_topk_indices = self.attention.last_topk_indices
         x = x + residual
         residual = x
         x = self.ffn_norm(x)
@@ -745,6 +891,8 @@ class MTPModule(TransformerBlockV32):
         freqs_cis: torch.Tensor,
         attention_masks: AttentionMasksType | None,
         positions: torch.Tensor | None = None,
+        *,
+        prev_topk_indices: torch.Tensor | None = None,
     ):
         """
         Forward pass for the Transformer block.
@@ -762,7 +910,15 @@ class MTPModule(TransformerBlockV32):
         h = torch.cat([input_offset, prev_embed], dim=-1)
         h = self.eh_proj(h)
         h, residual = self.attention_norm(h), h
-        h = self.attention(h, freqs_cis, attention_masks, self.layer_id, positions)
+        h = self.attention(
+            h,
+            freqs_cis,
+            attention_masks,
+            self.layer_id,
+            positions,
+            prev_topk_indices=prev_topk_indices,
+        )
+        self.last_topk_indices = self.attention.last_topk_indices
         h = h + residual
         residual = h
         h = self.ffn_norm(h)

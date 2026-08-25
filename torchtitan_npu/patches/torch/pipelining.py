@@ -49,7 +49,13 @@ def _patch_fork_rng_for_npu_pipeline() -> None:
         # device_type calls untouched, and only redirect device-scoped calls used
         # by pipeline execution to NPU.
         if devices is not None and "device_type" not in kwargs:
-            kwargs["device_type"] = "npu"
+            try:
+                torch.device("npu")
+            except RuntimeError:
+                # CPU-only simulator runs use CPU RNG state with meta tensors.
+                kwargs["device_type"] = "cpu"
+            else:
+                kwargs["device_type"] = "npu"
         return original_fork_rng(devices, *args, **kwargs)
 
     vars(fork_rng_with_npu_device_type)["npu_pipeline_rng_patched"] = True

@@ -242,15 +242,19 @@ def sim_dsa_forward(
     weights: torch.Tensor | None = None,
     end_pos: torch.Tensor | None = None,
     index_topk: int | None = None,
+    topk_indices: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run the V3.2 fused DSA contract without numerical kernel work."""
     del attn_mask, end_pos
-    required = {
-        "q_indexer": q_indexer,
-        "k_indexer": k_indexer,
-        "weights": weights,
-        "index_topk": index_topk,
-    }
+    required = {"index_topk": index_topk}
+    if topk_indices is None:
+        required.update(
+            {
+                "q_indexer": q_indexer,
+                "k_indexer": k_indexer,
+                "weights": weights,
+            }
+        )
     missing = [name for name, value in required.items() if value is None]
     if missing:
         raise ValueError("DeepSeek V3.2 DSA simulation requires " + ", ".join(missing))
@@ -265,16 +269,19 @@ def sim_dsa_forward(
     q_indexer_tensor = q_indexer
     k_indexer_tensor = k_indexer
     weights_tensor = weights
-    assert isinstance(q_indexer_tensor, torch.Tensor)
-    assert isinstance(k_indexer_tensor, torch.Tensor)
-    assert isinstance(weights_tensor, torch.Tensor)
-    sparse_indices = _SimLightningIndexer.apply(
-        q_indexer_tensor,
-        k_indexer_tensor,
-        weights_tensor,
-        int(index_topk),
-        module_path,
-    )
+    if topk_indices is None:
+        assert isinstance(q_indexer_tensor, torch.Tensor)
+        assert isinstance(k_indexer_tensor, torch.Tensor)
+        assert isinstance(weights_tensor, torch.Tensor)
+        sparse_indices = _SimLightningIndexer.apply(
+            q_indexer_tensor,
+            k_indexer_tensor,
+            weights_tensor,
+            int(index_topk),
+            module_path,
+        )
+    else:
+        sparse_indices = topk_indices.to(dtype=torch.int64)
 
     q_bsnd = q.transpose(1, 2)
     k_bsnd = k.transpose(1, 2)
@@ -300,15 +307,21 @@ def sim_dsa_forward(
         scale_value,
         module_path,
     )
-    loss = _SimSparseLightningIndexerKLLoss.apply(
-        q_nope.detach(),
-        k_nope.detach(),
-        q_indexer_tensor,
-        k_indexer_tensor,
-        weights_tensor,
-        sparse_indices,
-        softmax_max,
-        softmax_sum,
-        module_path,
-    )
+    if q_indexer_tensor is None:
+        loss = _empty((), q, dtype=torch.float32)
+    else:
+        assert isinstance(k_indexer_tensor, torch.Tensor)
+        assert isinstance(weights_tensor, torch.Tensor)
+        loss = _SimSparseLightningIndexerKLLoss.apply(
+            q_nope.detach(),
+            k_nope.detach(),
+            q_indexer_tensor,
+            k_indexer_tensor,
+            weights_tensor,
+            sparse_indices,
+            softmax_max,
+            softmax_sum,
+            module_path,
+        )
+    module.last_topk_indices = sparse_indices
     return loss, output.transpose(1, 2)

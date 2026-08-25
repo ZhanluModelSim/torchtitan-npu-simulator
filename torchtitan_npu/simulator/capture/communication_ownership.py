@@ -169,6 +169,57 @@ def _has_path(graph: StepGraph, start_op_id: int, target_op_id: int) -> bool:
     return False
 
 
+def _try_add_predecessor(
+    graph: StepGraph,
+    node_id: int,
+    predecessor_id: int,
+) -> bool:
+    """Add ``predecessor_id -> node_id`` unless it would create a cycle."""
+    node = graph.nodes.get(node_id)
+    if node is None or predecessor_id not in graph.nodes:
+        return False
+    if predecessor_id == node_id or _has_path(
+        graph, node_id, predecessor_id
+    ):
+        return False
+    if predecessor_id not in node.predecessors:
+        node.predecessors.append(predecessor_id)
+        _rebuild_successors(graph.nodes)
+    return True
+
+
+def _find_cycle_path(graph: StepGraph) -> list[int]:
+    """Return one directed cycle for diagnostics, if the graph has one."""
+    state: dict[int, int] = {}
+    stack: list[int] = []
+    stack_index: dict[int, int] = {}
+
+    def visit(op_id: int) -> list[int]:
+        state[op_id] = 1
+        stack_index[op_id] = len(stack)
+        stack.append(op_id)
+        for successor in graph.nodes[op_id].successors:
+            if successor not in graph.nodes:
+                continue
+            if state.get(successor, 0) == 0:
+                cycle = visit(successor)
+                if cycle:
+                    return cycle
+            elif state.get(successor) == 1:
+                return [*stack[stack_index[successor]:], successor]
+        stack.pop()
+        stack_index.pop(op_id, None)
+        state[op_id] = 2
+        return []
+
+    for op_id in graph.nodes:
+        if state.get(op_id, 0) == 0:
+            cycle = visit(op_id)
+            if cycle:
+                return cycle
+    return []
+
+
 def _copy_without_nodes(
     template: StepGraph,
     removed_op_ids: set[int],
@@ -371,18 +422,24 @@ def _fsdp_prefetch_anchor(
             f"source_module={prefetch_source_fqn!r}"
         )
 
-    predecessor_op_ids = list(
+    external_predecessor_op_ids = list(
         dict.fromkeys(
             predecessor
             for region in source_regions
             for predecessor in region.external_predecessors
         )
     )
-    predecessor_op_ids.extend(
-        comm_id
-        for region in source_regions
-        if (comm_id := comm_id_by_group.get(region.group_id)) is not None
+    comm_predecessor_op_ids = tuple(
+        dict.fromkeys(
+            comm_id
+            for region in source_regions
+            if (comm_id := comm_id_by_group.get(region.group_id)) is not None
+        )
     )
+    predecessor_op_ids = [
+        *external_predecessor_op_ids,
+        *comm_predecessor_op_ids,
+    ]
     source_entry_op_ids = tuple(
         dict.fromkeys(
             entry
@@ -654,10 +711,28 @@ def _add_fsdp_backward_reduction_syncs(
                 for predecessor in graph.nodes[op_id].predecessors
             )
         }
+        _rebuild_successors(graph.nodes)
+        skipped_gated_node_ids: list[int] = []
         for gated_id in gated_node_ids:
             gated = graph.nodes.get(gated_id)
-            if gated is not None and sync_id not in gated.predecessors:
-                gated.predecessors.append(sync_id)
+            if gated is None or sync_id in gated.predecessors:
+                continue
+            # The sync node is deliberately placed at the barrier release,
+            # but some FSDP/CP layouts already have a path from a later
+            # frontier node back to that release through a cloned all-gather
+            # or prefetch gate.  Adding sync -> frontier in that case closes
+            # the L1 graph.  Keep the existing reachability and omit only
+            # this redundant gate; the reduce-scatter dependency itself is
+            # still represented by the sync node's predecessors.
+            if _has_path(graph, gated_id, sync_id):
+                skipped_gated_node_ids.append(gated_id)
+                continue
+            gated.predecessors.append(sync_id)
+            _rebuild_successors(graph.nodes)
+        if skipped_gated_node_ids:
+            graph.nodes[sync_id].annotations[
+                "fsdp_sync_skipped_gated_node_ids"
+            ] = skipped_gated_node_ids
         sync_count += 1
 
     return next_synthetic_id, sync_count
@@ -1056,6 +1131,7 @@ class FSDPStageOwnershipPlugin:
                     )
                 successor_links: dict[int, list[int]] = defaultdict(list)
                 prefetch_source_entry_links: list[tuple[int, tuple[int, ...]]] = []
+                prefetch_launch_anchor_links: list[tuple[int, tuple[int, ...]]] = []
                 residency_intervals: list[dict[str, object]] = []
                 for item in owned:
                     source = item.source_node
@@ -1232,7 +1308,7 @@ class FSDPStageOwnershipPlugin:
                             inputs=[],
                             outputs=[],
                             attrs={},
-                            predecessors=list(anchor.predecessor_op_ids),
+                            predecessors=[],
                             successors=[],
                             flops=0,
                             peak_mem=0,
@@ -1261,6 +1337,17 @@ class FSDPStageOwnershipPlugin:
                                 anchor.source_entry_op_ids,
                             )
                         )
+                        prefetch_launch_anchor_links.append(
+                            (
+                                prefetch_launch_op_id,
+                                anchor.predecessor_op_ids,
+                            )
+                        )
+                        # Anchor predecessors are applied after all
+                        # cloned collectives exist. Applying them here can
+                        # create a cross-group cycle because a source
+                        # collective may itself wait on a later prefetch
+                        # launch.
                         predecessors.append(prefetch_launch_op_id)
                     predecessors = list(dict.fromkeys(predecessors))
                     annotations = dict(source.annotations)
@@ -1315,6 +1402,19 @@ class FSDPStageOwnershipPlugin:
                             pure.nodes[successor].predecessors.append(comm_id)
 
                 _refresh_graph_topology(pure)
+                for launch_op_id, anchor_predecessors in (
+                    prefetch_launch_anchor_links
+                ):
+                    skipped_predecessors: list[int] = []
+                    for predecessor_id in anchor_predecessors:
+                        if not _try_add_predecessor(
+                            pure, launch_op_id, predecessor_id
+                        ):
+                            skipped_predecessors.append(predecessor_id)
+                    if skipped_predecessors:
+                        pure.nodes[launch_op_id].annotations[
+                            "fsdp_prefetch_anchor_gate_skipped_predecessors"
+                        ] = skipped_predecessors
                 for launch_op_id, source_entries in prefetch_source_entry_links:
                     skipped_entries: list[int] = []
                     for source_entry_id in source_entries:
@@ -1322,22 +1422,10 @@ class FSDPStageOwnershipPlugin:
                         # after a source-region entry. Gating that entry on a
                         # launch which already waits for the all-gather closes
                         # launch -> entry -> all-gather -> launch.
-                        if _has_path(pure, source_entry_id, launch_op_id):
-                            skipped_entries.append(source_entry_id)
-                            continue
-                        source_entry = pure.nodes.get(source_entry_id)
-                        if (
-                            source_entry is not None
-                            and launch_op_id not in source_entry.predecessors
+                        if not _try_add_predecessor(
+                            pure, source_entry_id, launch_op_id
                         ):
-                            source_entry.predecessors.append(launch_op_id)
-                            # Keep reachability current for later cycle checks
-                            # without rebuilding the full graph per prefetch
-                            # source entry. The final topology refresh below
-                            # remains the canonical rebuild.
-                            pure.nodes[launch_op_id].successors.append(
-                                source_entry_id
-                            )
+                            skipped_entries.append(source_entry_id)
                     if skipped_entries:
                         pure.nodes[launch_op_id].annotations[
                             "fsdp_prefetch_source_gate_skipped_entries"
@@ -1354,9 +1442,33 @@ class FSDPStageOwnershipPlugin:
 
                 _refresh_graph_topology(pure)
                 if not pure.is_acyclic:
+                    cycle_path = _find_cycle_path(pure)
+                    cycle_ops = [
+                        {
+                            "op_id": op_id,
+                            "op_type": pure.nodes[op_id].op_type,
+                            "raw_op_type": pure.nodes[op_id].annotations.get(
+                                "raw_op_type"
+                            ),
+                            "seq_idx": pure.nodes[op_id].seq_idx,
+                            "fsdp_group_id": pure.nodes[op_id].annotations.get(
+                                "fsdp_group_id"
+                            ),
+                            "prefetch_source_fqn": pure.nodes[op_id].annotations.get(
+                                "fsdp_prefetch_source_fqn"
+                            ),
+                            "prefetch_launch_op_id": pure.nodes[op_id].annotations.get(
+                                "fsdp_prefetch_launch_op_id"
+                            ),
+                            "predecessors": pure.nodes[op_id].predecessors,
+                            "successors": pure.nodes[op_id].successors,
+                        }
+                        for op_id in cycle_path
+                        if op_id in pure.nodes
+                    ]
                     raise RuntimeError(
                         "communication ownership produced a cyclic L1 "
-                        f"template {template_id!r}"
+                        f"template {template_id!r}; cycle={cycle_ops}"
                     )
                 pure.step_id = template_id
                 pure.annotations.update({

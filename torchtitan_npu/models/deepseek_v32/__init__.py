@@ -48,6 +48,9 @@ def _make_dsv32_attn_config(
     index_head_dim: int = 128,
     index_topk: int = 2048,
     enable_mla_absorb: bool = True,
+    skip_topk: bool = False,
+    indexer_rope_interleave: bool = False,
+    rope_scaling: str = "yarn",
     inner_attention=None,
     mask_type: str = "causal",
 ) -> Attention.Config:
@@ -99,6 +102,9 @@ def _make_dsv32_attn_config(
         index_head_dim=index_head_dim,
         index_topk=index_topk,
         enable_mla_absorb=enable_mla_absorb,
+        skip_topk=skip_topk,
+        indexer_rope_interleave=indexer_rope_interleave,
+        rope_scaling=rope_scaling,
     )
 
 
@@ -131,6 +137,10 @@ def _build_dsv32_layers(
     index_head_dim: int = 128,
     index_topk: int = 2048,
     enable_mla_absorb: bool = True,
+    indexer_types: list[str] | None = None,
+    indexer_rope_interleave: bool = False,
+    index_share_for_mtp_iteration: bool = False,
+    rope_scaling: str = "yarn",
     inner_attention=None,
     mask_type: str = "causal",
 ) -> list:
@@ -164,6 +174,16 @@ def _build_dsv32_layers(
             index_head_dim=index_head_dim,
             index_topk=index_topk,
             enable_mla_absorb=enable_mla_absorb,
+            skip_topk=(
+                (layer_id >= n_layers and index_share_for_mtp_iteration)
+                or (
+                    indexer_types is not None
+                    and layer_id < len(indexer_types)
+                    and indexer_types[layer_id] == "shared"
+                )
+            ),
+            indexer_rope_interleave=indexer_rope_interleave,
+            rope_scaling=rope_scaling,
             inner_attention=inner_attention,
             mask_type=mask_type,
         )
@@ -272,6 +292,15 @@ def _extend_dsv32_layers_with_mtp(
         index_head_dim=attn.index_head_dim,
         index_topk=attn.index_topk,
         enable_mla_absorb=attn.enable_mla_absorb,
+        indexer_types=[
+            "shared" if getattr(layer.attention, "skip_topk", False) else "full"
+            for layer in layers
+        ],
+        indexer_rope_interleave=getattr(attn, "indexer_rope_interleave", False),
+        rope_scaling=getattr(attn, "rope_scaling", "yarn"),
+        index_share_for_mtp_iteration=any(
+            getattr(layer.attention, "skip_topk", False) for layer in layers
+        ),
         inner_attention=attn.inner_attention,
         mask_type=attn.mask_type,
     )
@@ -309,7 +338,11 @@ def _make_dsv32_model_config(
     index_head_dim: int = 128,
     index_topk: int = 2048,
     enable_mla_absorb: bool = True,
+    indexer_types: list[str] | None = None,
+    indexer_rope_interleave: bool = False,
+    index_share_for_mtp_iteration: bool = False,
     rope_max_seq_len: int = 4096 * 4,
+    rope_scaling: Literal["none", "llama", "yarn"] = "yarn",
     rope_theta: float = 10000.0,
     rope_factor: float = 40.0,
     rope_beta_fast: float = 32.0,
@@ -347,6 +380,10 @@ def _make_dsv32_model_config(
         index_head_dim=index_head_dim,
         index_topk=index_topk,
         enable_mla_absorb=enable_mla_absorb,
+        indexer_types=indexer_types,
+        indexer_rope_interleave=indexer_rope_interleave,
+        index_share_for_mtp_iteration=index_share_for_mtp_iteration,
+        rope_scaling=rope_scaling,
         mask_type=mask_type,
         inner_attention=inner_attention,
     )
@@ -365,7 +402,7 @@ def _make_dsv32_model_config(
             max_seq_len=rope_max_seq_len,
             theta=rope_theta,
             backend="complex",
-            scaling="yarn",
+            scaling=rope_scaling,
             rope_factor=rope_factor,
             beta_fast=rope_beta_fast,
             beta_slow=rope_beta_slow,

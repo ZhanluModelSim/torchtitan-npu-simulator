@@ -1664,11 +1664,61 @@ def _patch_pipeline_stage_meta_exchange_for_fake_pg() -> None:
         if not _is_fake(self.group) and not _is_meta_simulation:
             return orig_prepare_backward(self, num_microbatches, loss_fn=loss_fn, target=target, received_grad_meta=received_grad_meta)
 
-        # For multi_proc_meta (gloo, not fake), DYNAMIC mode handles
-        # backward metadata via _send_meta/_recv_meta. Bracket with the
-        # metadata-inference flag so the backward metadata inference (and any
-        # FSDP setup it triggers) is not recorded as training compute.
+        # For multi_proc_meta (gloo, not fake), derive backward metadata from
+        # the already inferred tensor shapes.  Running PyTorch's dynamic
+        # autograd metadata pass is not valid for a shape-only meta graph:
+        # some simulator kernels intentionally have no numerical dependency,
+        # so autograd raises before the structural PP graph can be captured.
         global _in_metadata_inference
+        if not _is_fake(self.group) and _is_meta_simulation:
+            from torch.distributed.pipelining._utils import (
+                _StageBackwardMeta,
+                _derive_grad_metas,
+            )
+
+            if self._stage_meta.inputs is None or self._stage_meta.outputs is None:
+                return orig_prepare_backward(
+                    self,
+                    num_microbatches,
+                    loss_fn=loss_fn,
+                    target=target,
+                    received_grad_meta=received_grad_meta,
+                )
+            if self.is_last:
+                self._stage_meta.output_grads = _derive_grad_metas(
+                    self._stage_meta.outputs
+                )
+            else:
+                # Match the real pipeline protocol: every non-last stage
+                # receives output-gradient metadata from the next stage
+                # before deriving the gradient shapes for its own inputs.
+                received_meta = self._recv_meta(self.stage_index + 1)
+                if not isinstance(received_meta, _StageBackwardMeta):
+                    return orig_prepare_backward(
+                        self,
+                        num_microbatches,
+                        loss_fn=loss_fn,
+                        target=target,
+                        received_grad_meta=received_grad_meta,
+                    )
+                self._stage_meta.output_grads = received_meta.backward_metas
+            self._stage_meta.input_grads = _derive_grad_metas(
+                self._stage_meta.inputs
+            )
+            self._stage_meta.output_grads = _derive_grad_metas(
+                self._stage_meta.outputs
+            ) if self.is_last else self._stage_meta.output_grads
+            self._setup_backward_recv_info(num_microbatches)
+            if self.is_first or self._is_same_rank(self.stage_index - 1):
+                return _StageBackwardMeta(
+                    backward_metas=self._stage_meta.input_grads
+                )
+            self._send_meta(
+                _StageBackwardMeta(backward_metas=self._stage_meta.input_grads),
+                self.stage_index - 1,
+            )
+            return None
+
         if not _is_fake(self.group):
             prev = _in_metadata_inference
             _in_metadata_inference = True
@@ -2044,6 +2094,25 @@ def _patch_pipeline_p2p_context() -> None:
         original = getattr(PipelineStage, method_name)
 
         def _wrapped(self, *args, **kwargs):  # noqa: ANN001
+            if method_name == "get_bwd_send_ops" and _is_meta_simulation:
+                chunk_id = args[0] if args else kwargs.get(chunk_name)
+                cached = getattr(self, "bwd_cache", {}).get(chunk_id)
+                recv_info = getattr(self, "args_recv_info", {}).get(chunk_id)
+                if isinstance(chunk_id, int) and cached is not None and recv_info:
+                    # PipelineStage requires a tensor gradient for every
+                    # received activation, including non-differentiable
+                    # IndexShare metadata.  For meta capture, synthesize the
+                    # shape-only payload so the P2P event is still recorded.
+                    replacement = list(cached)
+                    for index, info in enumerate(recv_info):
+                        if (
+                            index < len(replacement)
+                            and replacement[index] is None
+                            and not getattr(info, "is_root_arg", False)
+                            and getattr(info, "buffer", None) is not None
+                        ):
+                            replacement[index] = torch.empty_like(info.buffer)
+                    self.bwd_cache[chunk_id] = tuple(replacement)
             ops = original(self, *args, **kwargs)
             chunk_id = args[0] if args else kwargs.get(chunk_name)
             if isinstance(chunk_id, int):

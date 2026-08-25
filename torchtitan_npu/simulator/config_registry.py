@@ -204,6 +204,88 @@ def deepseek_v32_671b_61layers_32k_128die(
 
 
 # ---------------------------------------------------------------------------
+# GLM-5.2 simulator configs
+# ---------------------------------------------------------------------------
+
+from torchtitan_npu.models.glm5_2 import (  # noqa: E402
+    config_registry as _glm5_2_configs,
+)
+from torchtitan_npu.models.glm5_2.config_overrides import (  # noqa: E402
+    GLM52ModelOverrides,
+    apply_model_overrides as apply_glm5_2_model_overrides,
+)
+
+
+@dataclasses.dataclass(kw_only=True, slots=True)
+class GLM52SimulationTrainerConfig(SimulationTrainerConfig):
+    """GLM-5.2 simulator config with stable model overrides."""
+
+    model_overrides: GLM52ModelOverrides = dataclasses.field(
+        default_factory=GLM52ModelOverrides
+    )
+
+    def __post_init__(self) -> None:
+        baseline_mtp = self.model_spec.model.num_mtp_modules
+        override_mtp = self.model_overrides.num_mtp_modules
+        training_mtp = self.training.num_mtp_modules
+        if override_mtp != baseline_mtp:
+            if training_mtp not in {baseline_mtp, override_mtp}:
+                raise ValueError(
+                    "model_overrides.num_mtp_modules conflicts with "
+                    "training.num_mtp_modules"
+                )
+            if training_mtp == baseline_mtp:
+                self.training.num_mtp_modules = override_mtp
+        self.model_spec = apply_glm5_2_model_overrides(
+            self.model_spec,
+            self.model_overrides,
+        )
+
+
+def _glm5_2_simulation_config(
+    factory: Callable[[], _glm5_2_configs.TrainerConfig],
+    *,
+    output_name: str,
+) -> GLM52SimulationTrainerConfig:
+    base_config = factory()
+    base_fields = {
+        field.name: getattr(base_config, field.name)
+        for field in dataclasses.fields(base_config)
+        if field.name != "model_overrides"
+    }
+    base_fields["compile"] = dataclasses.replace(
+        base_config.compile,
+        enable=False,
+    )
+    return GLM52SimulationTrainerConfig(
+        **base_fields,
+        model_overrides=base_config.model_overrides,
+        simulation=SimulationConfig(output_dir=f"./simulator_output/{output_name}"),
+    )
+
+
+def glm5_2_smoketest() -> GLM52SimulationTrainerConfig:
+    return _glm5_2_simulation_config(
+        _glm5_2_configs.glm5_2_smoketest,
+        output_name="glm5_2_smoketest",
+    )
+
+
+def glm5_2_tp_smoketest() -> GLM52SimulationTrainerConfig:
+    return _glm5_2_simulation_config(
+        _glm5_2_configs.glm5_2_tp_smoketest,
+        output_name="glm5_2_tp_smoketest",
+    )
+
+
+def glm5_2_78layers_1mtp() -> GLM52SimulationTrainerConfig:
+    return _glm5_2_simulation_config(
+        _glm5_2_configs.glm5_2_78layers_1mtp,
+        output_name="glm5_2_78layers_1mtp",
+    )
+
+
+# ---------------------------------------------------------------------------
 # Kimi K3 simulator configs
 # ---------------------------------------------------------------------------
 

@@ -5,6 +5,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import torch
 import torch.distributed as dist
 from torch._C._distributed_c10d import FakeProcessGroup
 
@@ -31,9 +32,22 @@ def _create_fake_pg(common_opts, backend_opts):
     )
 
 
+# CPU-only PyTorch does not register ``torch.device("npu")``.  Passing an
+# unknown device type here makes c10d fail while it enumerates backend
+# devices, even though the simulator itself only needs a logical fake PG.
+# Keep NPU support when torch_npu registers the device, but make the meta
+# simulator usable in a CPU virtual environment as well.
+_fake_backend_devices = ["cpu"]
+try:
+    torch.device("npu")
+except RuntimeError:
+    pass
+else:
+    _fake_backend_devices.append("npu")
+
 dist.Backend.register_backend(
     dist.Backend.FAKE,
     _create_fake_pg,
     extended_api=True,
-    devices=["cpu", "npu"],
+    devices=_fake_backend_devices,
 )

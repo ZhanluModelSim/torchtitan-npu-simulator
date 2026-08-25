@@ -455,17 +455,33 @@ def apply_non_moe_tp(
             "attention.pre_attention.wkv_a": NoParallel(),
             "attention.pre_attention.wkv_b": colwise_parallel(use_local_output=False),
             "attention.pre_attention.kv_norm": NoParallel(),
-            # the indxer module params are not parallelized
-            "attention.pre_attention.indexer": indexer_plan,
-            "attention.pre_attention.indexer.wq_b": NoParallel(local_output_grad_placements=(Replicate(),)),
-            "attention.pre_attention.indexer.wk": NoParallel(local_output_grad_placements=(Replicate(),)),
-            "attention.pre_attention.indexer.k_norm": NoParallel(local_output_grad_placements=(Replicate(),)),
-            "attention.pre_attention.indexer.weights_proj": NoParallel(local_output_grad_placements=(Replicate(),)),
             "attention.inner_attention": attention_kernel_plan,
             "attention.inner_attention.compute_dsa_indexer_loss": indexer_loss_plan,
             "attention.post_attention.wo": rowwise_parallel(output_layouts=Shard(1)),
             "ffn_norm": SequenceParallel(),
         }
+
+        # GLM-5.2 IndexShare layers intentionally have no indexer module.
+        # Keep the DSV3.2 plan for full layers, but do not register missing
+        # FQNs on shared layers.
+        if transformer_block.attention.pre_attention.indexer is not None:
+            layer_plan.update(
+                {
+                    "attention.pre_attention.indexer": indexer_plan,
+                    "attention.pre_attention.indexer.wq_b": NoParallel(
+                        local_output_grad_placements=(Replicate(),)
+                    ),
+                    "attention.pre_attention.indexer.wk": NoParallel(
+                        local_output_grad_placements=(Replicate(),)
+                    ),
+                    "attention.pre_attention.indexer.k_norm": NoParallel(
+                        local_output_grad_placements=(Replicate(),)
+                    ),
+                    "attention.pre_attention.indexer.weights_proj": NoParallel(
+                        local_output_grad_placements=(Replicate(),)
+                    ),
+                }
+            )
 
         # pyrefly: ignore [missing-attribute]
         if transformer_block.attention.pre_attention.q_lora_rank == 0:

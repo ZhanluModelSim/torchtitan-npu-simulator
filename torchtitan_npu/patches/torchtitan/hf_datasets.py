@@ -8,8 +8,8 @@ Patch for torchtitan/hf_datasets/text_datasets.py
 
 1. Registers extra datasets (enwiki-eod, alpaca) into DATASETS.
 2. Wraps HuggingFaceTextDataLoader.__init__ to extend `seq_len` by
-   `num_mtp_modules` for deepseek_v32 / deepseek_v4 when Multi-Token
-   Prediction is enabled.
+   `num_mtp_modules` for DSA/MTP models when Multi-Token Prediction is
+   enabled.
 
 The active Trainer.Config is recovered via `_trainer_config_stash` (shared
 with the loss patch). Upstream TrainingConfig has no `num_mtp_modules`
@@ -65,7 +65,7 @@ else:
     logger.info(f"[Dataset Patch] No new datasets to add, current supported: {list(DATASETS.keys())}")
 
 
-_MTP_ALLOWED_MODELS = frozenset({"deepseek_v32", "deepseek_v4"})
+_MTP_ALLOWED_MODELS = frozenset({"deepseek_v32", "deepseek_v4", "glm5_2"})
 
 
 def _mtp_seq_len_delta() -> int:

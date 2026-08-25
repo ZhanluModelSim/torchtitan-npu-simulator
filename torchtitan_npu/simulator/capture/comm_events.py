@@ -877,6 +877,7 @@ def capture_fake_collectives(
     orig_irecv = dist.irecv
     orig_send = dist.send
     orig_recv = dist.recv
+    orig_batch_isend_irecv = dist.batch_isend_irecv
 
     @contextmanager
     def _p2p_context(tensor: torch.Tensor, direction: str) -> Iterator[object | None]:
@@ -965,10 +966,57 @@ def capture_fake_collectives(
             _finalize_pp_transfer_id(event)
         return 0
 
+    def patched_batch_isend_irecv(p2p_ops):  # noqa: ANN001
+        """Route batched pipeline P2P through the meta-safe wrappers.
+
+        ``dist.batch_isend_irecv`` normally asks the ProcessGroup backend for
+        a coalescing capability before invoking each ``P2POp``.  A CPU gloo
+        backend has no ``meta`` device backend, so that probe fails before the
+        already-patched ``isend``/``irecv`` functions can no-op the transfer.
+        The simulator only needs the per-tensor communication events; replay
+        each operation through those wrappers instead.
+        """
+        if not any(_should_intercept(getattr(op, "group", None)) for op in p2p_ops):
+            return orig_batch_isend_irecv(p2p_ops)
+        works = []
+        for p2p_op in p2p_ops:
+            group = getattr(p2p_op, "group", None)
+            peer = getattr(p2p_op, "peer", None)
+            group_peer = getattr(p2p_op, "group_peer", None)
+            tag = getattr(p2p_op, "tag", 0)
+            op = getattr(p2p_op, "op", None)
+            if op in (patched_isend, orig_isend):
+                works.append(
+                    patched_isend(
+                        p2p_op.tensor,
+                        dst=peer,
+                        group=group,
+                        tag=tag,
+                        group_dst=group_peer,
+                    )
+                )
+            elif op in (patched_irecv, orig_irecv):
+                works.append(
+                    patched_irecv(
+                        p2p_op.tensor,
+                        src=peer,
+                        group=group,
+                        tag=tag,
+                        group_src=group_peer,
+                    )
+                )
+            else:
+                raise RuntimeError(
+                    "simulator batch P2P received an unsupported operation: "
+                    f"{op!r}"
+                )
+        return works
+
     dist.isend = patched_isend
     dist.irecv = patched_irecv
     dist.send = patched_send
     dist.recv = patched_recv
+    dist.batch_isend_irecv = patched_batch_isend_irecv
 
     # P2POp.__new__ checks `op in [isend, irecv]` by identity, but we replaced
     # dist.isend/irecv with wrappers.  Patch _check_op to accept our wrappers.
@@ -1003,6 +1051,7 @@ def capture_fake_collectives(
         dist.irecv = orig_irecv
         dist.send = orig_send
         dist.recv = orig_recv
+        dist.batch_isend_irecv = orig_batch_isend_irecv
         funcol.all_reduce = orig_funcol_all_reduce
         funcol.all_gather_tensor = orig_funcol_all_gather_tensor
         funcol.reduce_scatter_tensor = orig_funcol_reduce_scatter_tensor

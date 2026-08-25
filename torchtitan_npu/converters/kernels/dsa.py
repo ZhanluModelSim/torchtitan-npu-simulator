@@ -204,6 +204,7 @@ def dsa_forward(
     weights: torch.Tensor | None = None,
     end_pos: torch.Tensor | None = None,
     index_topk: torch.Tensor | None = None,
+    topk_indices: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Forward pass of the dsa module.
@@ -211,20 +212,25 @@ def dsa_forward(
     if k.shape[1] != 1 or v.shape[1] != 1:
         raise NotImplementedError("Only support num_head_kv == 1 in dsa forward under absorb mode.")
 
-    # Fuse LILossTrain includes LIG
-    # NOTE: set return_value=False to avoid torch.compile / DTensor meta path failure
-    # ("when return_value is true, not support pytorch compile").
-    ret = torch_npu.npu_lightning_indexer(
-        q_indexer,
-        k_indexer,
-        weights,
-        layout_query="BSND",
-        layout_key="BSND",
-        sparse_count=index_topk,
-        sparse_mode=3,
-        return_value=False,
-    )
-    topk_indices = ret[0] if isinstance(ret, tuple) else ret
+    if topk_indices is None:
+        if q_indexer is None or k_indexer is None or weights is None:
+            raise ValueError("DSA requires indexer projections when shared top-k is not provided")
+        # Fuse LILossTrain includes LIG
+        # NOTE: set return_value=False to avoid torch.compile / DTensor meta path failure
+        # ("when return_value is true, not support pytorch compile").
+        ret = torch_npu.npu_lightning_indexer(
+            q_indexer,
+            k_indexer,
+            weights,
+            layout_query="BSND",
+            layout_key="BSND",
+            sparse_count=index_topk,
+            sparse_mode=3,
+            return_value=False,
+        )
+        topk_indices = ret[0] if isinstance(ret, tuple) else ret
+    else:
+        topk_indices = topk_indices.to(torch.int32)
 
     # To BSND
     q = q.transpose(1, 2)
@@ -255,24 +261,28 @@ def dsa_forward(
     # The loss is actually computed by SparseLightningIndexerKLLoss.forward
     # If tp is enabled, inner_attention.compute_dsa_indexer_loss is patched in deepseek_v32_parallelize.py
     # Otherwise, inner_attention.compute_dsa_indexer_loss is patched in this file
-    loss = self.compute_dsa_indexer_loss(
-        q_nope.detach(),
-        k_nope.detach(),
-        q_indexer,
-        k_indexer,
-        weights,
-        topk_indices,
-        softmax_max,
-        softmax_sum,
-        scale_value=scale,
-        query_rope=q_pe.detach(),
-        key_rope=k_pe.detach(),
-        actual_seq_qlen=None,
-        actual_seq_klen=None,
-        layout="BSND",
-        layer_number=self.layer_number,
-        num_layers=self.num_layers,
-    )
+    if q_indexer is None:
+        loss = q.new_zeros(())
+    else:
+        loss = self.compute_dsa_indexer_loss(
+            q_nope.detach(),
+            k_nope.detach(),
+            q_indexer,
+            k_indexer,
+            weights,
+            topk_indices,
+            softmax_max,
+            softmax_sum,
+            scale_value=scale,
+            query_rope=q_pe.detach(),
+            key_rope=k_pe.detach(),
+            actual_seq_qlen=None,
+            actual_seq_klen=None,
+            layout="BSND",
+            layer_number=self.layer_number,
+            num_layers=self.num_layers,
+        )
+    self.last_topk_indices = topk_indices
     output = output.transpose(1, 2)
     return loss, output  # pyrefly: ignore [bad-return]
 
@@ -282,8 +292,11 @@ _DSV32_MODEL_PACKAGE = "torchtitan_npu.models.deepseek_v32"
 
 class NpuDSAConverter(ModelCustomConverter):
     def convert(self, model: nn.Module) -> None:
-        if self.model_name != "deepseek_v32":
-            logger.info(f"NpuDSAConverter: skipped for model {self.model_name!r} (only deepseek_v32 is supported)")
+        if self.model_name not in {"deepseek_v32", "glm5_2"}:
+            logger.info(
+                f"NpuDSAConverter: skipped for model {self.model_name!r} "
+                "(supported: deepseek_v32, glm5_2)"
+            )
             return
 
         count = replace_methods("DSV32_SDPA", "forward", dsa_forward, package=_DSV32_MODEL_PACKAGE)

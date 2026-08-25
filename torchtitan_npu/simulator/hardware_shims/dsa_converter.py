@@ -26,7 +26,7 @@ class SimDSAConverter(ModelCustomConverter):
     """Bind shape-only DSA methods without replacing parallelized modules."""
 
     def convert(self, model: nn.Module) -> None:
-        if self.model_name != "deepseek_v32":
+        if self.model_name not in {"deepseek_v32", "glm5_2"}:
             return
         for module in model.modules():
             if isinstance(module, DSV32_SDPA) and not getattr(
