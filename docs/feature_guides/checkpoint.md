@@ -290,7 +290,7 @@ python scripts/checkpoint_conversion/convert_to_hf.py \
   ./outputs/dsv32_4layers/checkpoint/step-1000 \
   ./outputs/dsv32_4layers/hf_output \
   --model_name deepseek_v32 \
-  --model_flavor deepseek_v32_671b_4layers_debug \
+  --model_flavor 671B_debug_4_layers \
   --hf_assets_path ./assets/hf/DeepSeek-V3.2 \
   --export_dtype bfloat16
 ```

@@ -83,7 +83,7 @@ HF_ASSETS_PATH=/data/models/deepseek-v4-mini-1B-init \
 CHECKPOINT_INITIAL_LOAD_PATH=/data/models/deepseek-v4-mini-1B-init \
 DATA_FILES=/data/dataset/Daring-Anteater/train.jsonl \
 CHECKPOINT_FOLDER=./outputs/deepseek_v4_1b_sft/checkpoint \
-  bash examples/deepseek_v4/sft_deepseek_v4_1k_A3.sh
+  bash examples/deepseek_v4/sft_deepseek_v4_mini_1k_A3.sh
 ```
 
 ---
