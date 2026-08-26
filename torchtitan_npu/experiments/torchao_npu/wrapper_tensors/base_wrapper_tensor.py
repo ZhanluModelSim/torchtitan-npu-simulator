@@ -270,13 +270,13 @@ class BaseTrainingWeightWrapperTensor(TorchAOBaseTensor):
             weight_config=tensor_attributes["weight_config"],
         )
 
-    def requires_grad_(self, requires_grad: bool = True):
+    def requires_grad_(self, mode: bool = True):
         # requires_grad_ bypasses both __torch_function__ and __torch_dispatch__,
         # so it only sets the flag on the wrapper. Need to keep _data in sync, otherwise
         # Dynamo sees _data.requires_grad=False and may drop custom autograd.Function
         # backward during tracing, causing eager/compile gradient mismatches.
-        super().requires_grad_(requires_grad)
-        self._data.requires_grad_(requires_grad)
+        super().requires_grad_(mode)
+        self._data.requires_grad_(mode)
         return self
 
     def to_tensor(self) -> torch.Tensor:

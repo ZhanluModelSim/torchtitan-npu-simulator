@@ -7,7 +7,8 @@
 
 These are pure tensor helpers (no autograd, no matmul) used by higher-level
 ops in :mod:`torchao_npu.ops.block_ops`
-(e.g., ``_BlockFP8QuantMM.forward`` calls :func:`block_fp8_quantize`).
+(e.g., ``_BlockFP8QuantMM.forward`` calls
+:func:`block_fp8_mxfp4_fake_quantize`).
 """
 
 import importlib
@@ -18,6 +19,36 @@ import torch_npu
 from ..quant_configs import BlockQuantizeConfig
 
 importlib.import_module("cann_ops_nn.ops")
+
+
+def block_fp8_mxfp4_fake_quantize(
+    tensor: torch.Tensor,
+    axis: int,
+    config: BlockQuantizeConfig,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Apply MXFP4 fake quantization, then block FP8 quantize a matmul operand.
+
+    Returns the quantized tensor and the two scale tensors produced by
+    ``npu_dynamic_block_mx_quant``.
+    """
+    if config.mxfp4_fake_quantize_config is not None:
+        # Lazy import to avoid circular dependency: ops.mx_ops imports
+        # quant_primitives.mx (for mxfp4_dequantize), and quant_primitives.block_fp8
+        # imports ops.mx_ops (for mxfp4_fake_quantize). Loading mxfp4_fake_quantize
+        # lazily breaks the cycle.
+        from ...ops.mx_ops import mxfp4_fake_quantize
+
+        tensor = mxfp4_fake_quantize(
+            tensor,
+            config.mxfp4_fake_quantize_config,
+            axis=axis,
+        )
+    return torch_npu.npu_dynamic_block_mx_quant(
+        tensor,
+        dst_type=config.elem_dtype,
+        scale_alg=config.scale_alg,
+        dst_type_max=config.dst_type_max,
+    )
 
 
 def block_fp8_quantize(

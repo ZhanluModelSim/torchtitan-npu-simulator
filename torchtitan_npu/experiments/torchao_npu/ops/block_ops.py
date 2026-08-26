@@ -28,7 +28,9 @@ from ..quantization.quant_configs import (
     BlockQuantizeConfig,
     MXQuantizeConfig,
 )
-from ..quantization.quant_primitives.block_fp8 import block_fp8_quantize
+from ..quantization.quant_primitives.block_fp8 import (
+    block_fp8_mxfp4_fake_quantize,
+)
 
 __all__ = [
     "to_block_fp8_then_bmm",
@@ -89,7 +91,7 @@ class _BlockFP8QuantMM(torch.autograd.Function):
         # --- Step 2: block FP8 quantize B (with optional mxfp4 fake-quant pre-pass) ---
         # B [K, N] → B_s1 (N-dim scale) [K, ceil(ceil(N/32)/2), 2]
         #           → B_s2 (K-dim scale) [ceil(ceil(K/32)/2), N, 2]
-        B_q, B_s1, B_s2 = block_fp8_quantize(B, axis=-2, config=config_B)
+        B_q, B_s1, B_s2 = block_fp8_mxfp4_fake_quantize(B, axis=-2, config=config_B)
 
         # --- Step 3: low-precision matmul, contracting over K ---
         # x1 = A_q1 [M, K] → pertoken_scale = A_s1 [M, ceil(ceil(K/32)/2), 2]
@@ -278,7 +280,7 @@ class _BlockFP8QuantGroupedMM(torch.autograd.Function):
         # --- Step 3: block FP8 quantize B (with optional mxfp4 fake-quant pre-pass) ---
         # B [E, K, N] → B_s1 (N-dim scale) [E, K, ceil(ceil(N/32)/2), 2]
         #              → B_s2 (K-dim scale) [E, ceil(ceil(K/32)/2), N, 2]
-        B_q, B_s1, B_s2 = block_fp8_quantize(B, axis=-2, config=config_B)
+        B_q, B_s1, B_s2 = block_fp8_mxfp4_fake_quantize(B, axis=-2, config=config_B)
 
         # --- Step 4: grouped low-precision matmul, group_type=0 (contract over K) ---
         # x = A_q1 [M, K]    → per_token_scale = A_s1 [M, ceil(K/64), 2]
@@ -417,7 +419,7 @@ class _BlockFP8QuantBMM(torch.autograd.Function):
     Both operands are 3D and share the leading batch dimension. The forward
     dual-axis quantizes ``A`` (params from ``config_A``) and block quantizes
     ``B`` in 32×32 blocks (params from ``config_B``, via
-    ``block_fp8_quantize``), then performs the low-precision matmul
+    ``block_fp8_mxfp4_fake_quantize``), then performs the low-precision matmul
     contracting over K. The backward reuses the forward-quantized ``A_q2/A_s2``
     and ``B_q/B_s1`` transposed and only quantizes ``dY`` fresh.
     """
@@ -454,7 +456,7 @@ class _BlockFP8QuantBMM(torch.autograd.Function):
         )
 
         # --- Step 2: block FP8 quantize B (right operand, optional mxfp4 pre-pass) ---
-        B_q, B_s1, B_s2 = block_fp8_quantize(B, axis=-2, config=config_B)
+        B_q, B_s1, B_s2 = block_fp8_mxfp4_fake_quantize(B, axis=-2, config=config_B)
 
         # --- Step 3: low-precision batched matmul, contracting over K ---
         Y = torch_npu.npu_quant_matmul(
