@@ -65,6 +65,7 @@ fi
 
 MODULE=${MODULE:-"torchtitan.models.deepseek_v3"}
 CONFIG=${CONFIG:-"deepseek_v3_debugmodel"}
+TRAIN_FILE=${TRAIN_FILE:-torchtitan_npu.train}
 time=$(date +%Y%m%d%H%M)
 logfile=${LOG_PREFIX:-${CONFIG}}_${time}_node${NODE_RANK}_${LOCAL_HOST//./_}.log
 mkdir -p logs
@@ -89,7 +90,7 @@ torchrun \
     --local-ranks-filter ${LOG_RANK} \
     --role rank \
     --tee 3 \
-    -m torchtitan.train \
+    -m "${TRAIN_FILE}" \
     --module "${MODULE}" \
     --config "${CONFIG}" \
     "${ARGS[@]}" "$@" 2>&1 | tee -a logs/${logfile}

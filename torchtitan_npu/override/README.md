@@ -15,7 +15,7 @@ DeepSeek-V4 的训练示例 wrapper（`examples/deepseek_v4/*.sh`）会按 `USE_
 对应的工厂函数，不会启用同一模块中的其他 override。
 
 ```bash
-python -m torchtitan.train \
+python -m torchtitan_npu.train \
   --module torchtitan_npu.models.deepseek_v4 \
   --config deepseek_v4_debugmodel \
   --override.imports \

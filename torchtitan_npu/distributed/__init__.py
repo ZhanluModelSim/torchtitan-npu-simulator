@@ -3,4 +3,6 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from . import determinism  # noqa: F401
+__all__ = ["set_allow_hf32"]
+
+from .utils import set_allow_hf32

@@ -53,7 +53,7 @@ Virtual Optimizer 通过 TorchTitan 的配置级 override 启用，不增加 `vi
 ### 命令行示例
 
 ```bash
-python -m torchtitan.train \
+python -m torchtitan_npu.train \
   --module torchtitan_npu.models.deepseek_v4 \
   --config deepseek_v4_debugmodel \
   --override.imports "torchtitan_npu.override.common.optimizer.virtual,torchtitan_npu.override.common.optimizer.checkpoint_virtual" \

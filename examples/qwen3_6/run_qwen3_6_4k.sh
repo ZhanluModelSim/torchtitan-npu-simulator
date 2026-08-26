@@ -19,6 +19,7 @@ fi
 
 NGPU=${NGPU:-16}
 SEQ_LEN=${SEQ_LEN:-4096}
+TRAIN_FILE=${TRAIN_FILE:-torchtitan_npu.train}
 ((SEQ_LEN >= 64 && SEQ_LEN <= 4096 && SEQ_LEN % 64 == 0)) || {
     echo "SEQ_LEN must be a multiple of 64 in [64, 4096], got ${SEQ_LEN}" >&2
     exit 1
@@ -48,5 +49,5 @@ PYTORCH_NPU_ALLOC_CONF=${PYTORCH_NPU_ALLOC_CONF:-expandable_segments:True} \
     STREAMS_PER_DEVICE=${STREAMS_PER_DEVICE:-32} \
     MULTI_STREAM_MEMORY_RESERVE=${MULTI_STREAM_MEMORY_RESERVE:-1} \
     torchrun --nproc-per-node "${NGPU}" --rdzv-backend c10d --rdzv-endpoint localhost:0 \
-    --local-ranks-filter "${LOG_RANK}" --role rank --tee 3 -m torchtitan.train \
+    --local-ranks-filter "${LOG_RANK}" --role rank --tee 3 -m "${TRAIN_FILE}" \
     "${ARGS[@]}"

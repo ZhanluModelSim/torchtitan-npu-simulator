@@ -75,7 +75,7 @@ bash scripts/run_train.sh \
 > - `NGPU`：当前节点参与训练的 NPU 数量，默认为 `1`。
 > - `HF_ASSETS_PATH`：Tokenizer 目录，默认为仓内 `tests/assets/deepseek_v3`。
 > - `DATASET` 和 `DATASET_PATH`：数据集名称和目录，默认使用仓内的 `tests/assets/c4_test/`。
-> - 脚本后的其他参数会原样传给 `torchtitan.train`，可用于覆盖配置函数中的训练和并行参数。
+> - 脚本后的其他参数会原样传给 `torchtitan_npu.train`，可用于覆盖配置函数中的训练和并行参数。
 
 
 ### 单机 8 卡 EP8 训练任务

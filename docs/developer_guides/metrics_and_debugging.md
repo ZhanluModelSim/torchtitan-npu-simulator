@@ -36,7 +36,7 @@ torchtitan 原生内存快照功能会按照 `--profiler.profile-freq` 指定的
 通过训练命令的分层 CLI 参数启用内存快照：
 
 ```bash
-torchrun --nproc_per_node=2 -m torchtitan.train \
+torchrun --nproc_per_node=2 -m torchtitan_npu.train \
   --module torchtitan_npu.models.deepseek_v4 \
   --config deepseek_v4_debugmodel \
   --profiler.enable-memory-snapshot \
@@ -126,7 +126,7 @@ python3 scripts/parse_profiling_data.py path/to/save_traces_folder
 使用 CLI 启用 CANN profiler，并配置原生的周期采集模式：
 
 ```bash
-torchrun --nproc_per_node=2 -m torchtitan.train \
+torchrun --nproc_per_node=2 -m torchtitan_npu.train \
   --module torchtitan_npu.models.deepseek_v4 \
   --config deepseek_v4_debugmodel \
   --profiler.enable-profiling \
@@ -142,7 +142,7 @@ torchrun --nproc_per_node=2 -m torchtitan.train \
 `cann` override 的 JSON 参数传入：
 
 ```bash
-torchrun --nproc_per_node=2 -m torchtitan.train \
+torchrun --nproc_per_node=2 -m torchtitan_npu.train \
   --module torchtitan_npu.models.deepseek_v4 \
   --config deepseek_v4_debugmodel \
   --profiler.enable-profiling \
