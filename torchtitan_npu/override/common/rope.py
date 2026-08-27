@@ -10,6 +10,7 @@ The workaround variant uses pre-expanded cosine/sine caches; the AscendC fused
 variants call ``torch_npu.npu_rotary_mul``. Select one per RoPE config.
 """
 
+import weakref
 from dataclasses import dataclass
 
 import torch
@@ -22,11 +23,43 @@ from torchtitan.models.common.rope import (
     _reshape_for_broadcast,
 )
 
+_ROPE_CACHE_FIELDS = (
+    "dim",
+    "max_seq_len",
+    "theta",
+    "scaling",
+    "scaling_factor",
+    "low_freq_factor",
+    "high_freq_factor",
+    "original_max_position_embeddings",
+    "rope_factor",
+    "beta_fast",
+    "beta_slow",
+    "original_seq_len",
+    "truncate",
+)
+_INTERLEAVED_CACHE_POOL: weakref.WeakValueDictionary[tuple[object, ...], torch.Tensor] = weakref.WeakValueDictionary()
+
+
+def _interleaved_cache_key(rope) -> tuple[object, ...]:
+    config = rope.config
+    return (
+        *(getattr(config, name, None) for name in _ROPE_CACHE_FIELDS),
+        rope.cache.device,
+        rope.cache.dtype,
+    )
+
 
 class _InterleavedCacheMixin:
     def __init__(self, config: ComplexRoPE.Config):
         super().__init__(config)  # pyrefly: ignore [bad-argument-count]
-        self._expand_interleaved_cache()
+        if self.cache.device.type == "meta":
+            # ``to_empty`` materializes every buffer in the meta-built model.
+            # Keep only a device-bearing placeholder here so long-context
+            # caches are created once per pool key during ``init_states``.
+            self.cache = self.cache.new_empty(1)
+        else:
+            self._expand_interleaved_cache()
 
     def _init_self_buffers(
         self,
@@ -40,12 +73,17 @@ class _InterleavedCacheMixin:
 
     def _expand_interleaved_cache(self) -> None:
         complex_cache = self.cache
-        self.cache = torch.stack(
-            (
-                complex_cache.real.repeat_interleave(2, dim=-1),
-                complex_cache.imag.repeat_interleave(2, dim=-1),
+        key = _interleaved_cache_key(self)
+        cache = _INTERLEAVED_CACHE_POOL.get(key)
+        if cache is None:
+            cache = torch.stack(
+                (
+                    complex_cache.real.repeat_interleave(2, dim=-1),
+                    complex_cache.imag.repeat_interleave(2, dim=-1),
+                )
             )
-        )
+            _INTERLEAVED_CACHE_POOL[key] = cache
+        self.cache = cache
 
     def _reshape_cache(
         self,

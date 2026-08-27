@@ -15,6 +15,7 @@ from torchtitan.distributed.context_parallel import cp_shard
 from torchtitan.models.common.attention import AttentionMasksType, VarlenMetadata
 from torchtitan.models.common.decoder import Decoder, TransformerBlock
 from torchtitan.models.common.moe import MoE
+from torchtitan.models.common.rope import RoPE
 
 from torchtitan_npu.models.common.metadata_extension import MetadataExtension
 
@@ -79,6 +80,11 @@ class DeepSeekV4Model(Decoder):
         hc_head: HcHead.Config
 
         def update_from_config(self, *, config, **kwargs):
+            if hasattr(config, "training"):
+                seq_len = config.training.seq_len
+                for _, rope_cfg, _, _ in self.traverse(RoPE.Config):
+                    setattr(rope_cfg, "max_seq_len", seq_len)  # noqa: B010
+
             Decoder.Config.update_from_config(self, config=config, **kwargs)
             parallelism = config.parallelism
 

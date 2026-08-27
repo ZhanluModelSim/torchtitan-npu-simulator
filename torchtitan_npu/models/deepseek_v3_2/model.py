@@ -406,6 +406,11 @@ class DeepSeekV32Model(DeepSeekV3Model):
         metadata_extension: MetadataExtension.Config = field(default_factory=MetadataExtension.Config)
 
         def update_from_config(self, *, config, **kwargs):
+            if hasattr(config, "training"):
+                seq_len = config.training.seq_len
+                for _, rope_cfg, _, _ in self.traverse(RoPE.Config):
+                    setattr(rope_cfg, "max_seq_len", seq_len)  # noqa: B010
+
             Decoder.Config.update_from_config(self, config=config, **kwargs)
             parallelism = config.parallelism
 
