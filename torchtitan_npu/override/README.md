@@ -66,6 +66,10 @@ torchtitan_npu/override/
 │   ├── rms_norm.py
 │   ├── rope.py
 │   └── token_dispatcher.py
+├── checkpoint/
+│   ├── __init__.py
+│   ├── checkpoint.py
+│   └── validation.py
 ├── deepseek_v3_2/
 │   ├── __init__.py
 │   └── sparse_attn/
@@ -85,6 +89,7 @@ torchtitan_npu/override/
 ```
 
 - `common/` 存放只依赖 TorchTitan 公共组件、不依赖具体模型配置或元数据契约的实现。
+- `checkpoint/` 存放 checkpoint manager replacement 及其文件级完整性校验逻辑。
 - `<model>/` 存放依赖模型专属 target、配置字段、张量布局或元数据契约的实现。
 - 模型专属实现不得跨模型目录引用。可复用部分应先下移到 `common/` 或其他公共模块。
 - 简单 target 使用单文件，文件名采用 target 的 snake_case 语义，例如
@@ -180,6 +185,42 @@ Float8、LoRA 等 converter 在 override 前执行。两者可能修改同一节
 converter 处理后的实际配置类型和 FQN 核对匹配结果。
 
 ## 当前入口
+
+### Checkpoint 完整性校验
+
+`torchtitan_npu.override.checkpoint.npu` 为基础 `CheckpointManager` 增加文件级 SHA-256
+manifest。该入口默认不启用校验；使用以下参数后，保存会生成
+`_checkpoint_hash_manifest.json`，加载会在物化 checkpoint state 前验证清单：
+
+```bash
+--override.imports \
+  'torchtitan_npu.override.checkpoint.npu={"verify_hash_manifest":true}'
+```
+
+| 入口 | Target | Replacement | 适用范围 |
+| --- | --- | --- | --- |
+| `torchtitan_npu.override.checkpoint.npu` | `CheckpointManager.Config`（精确匹配） | `NPUCheckpointManager.Config` | 基础 checkpoint manager |
+| `torchtitan_npu.override.checkpoint.npu_virtual` | `CheckpointManager.Config`（精确匹配） | `NPUVirtualCheckpointManager.Config` | 同时需要 SHA-256 manifest 和 Virtual Optimizer checkpoint writer |
+
+Virtual Optimizer 组合场景使用单一 checkpoint replacement，不能再同时启用
+`optimizer.checkpoint_virtual`：
+
+```bash
+--override.imports \
+  torchtitan_npu.override.common.optimizer.virtual,\
+  'torchtitan_npu.override.checkpoint.npu_virtual={"verify_hash_manifest":true}'
+```
+
+两个 checkpoint 入口均使用精确匹配，不会替换 `TorchFTCheckpointManager.Config` 等上游
+特化配置；当前不为 TorchFT 提供 SHA-256 manifest variant。基础 `npu` 入口的 manifest I/O
+支持本地路径和 TorchTitan 支持的 fsspec 远程 native DCP 路径；`npu_virtual` 仍受 Virtual
+Optimizer writer 的同步、本地 native DCP 限制。异步保存只有在 DCP 和 manifest 均成功后
+才完成；遗留 pending 标记会使加载失败。没有 manifest 且没有 pending 标记时，checkpoint
+按旧格式加载并跳过校验。
+
+清单只接受 checkpoint 目录中的单层普通文件，不读取绝对路径、父目录、符号链接或其他
+非普通文件。CPU 单元测试覆盖本地路径、fsspec `memory://`、异步完成与失败传播，以及路径
+边界；实际 S3/GCS backend 和 NPU 分布式训练尚未在本特性中完成验证。
 
 ### Common
 

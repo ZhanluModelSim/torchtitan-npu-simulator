@@ -85,6 +85,23 @@ cfg.checkpoint.async_mode = "disabled"
 
 只需要使用 Virtual Optimizer、但不保存 checkpoint 时，可以只启用 `optimizer.virtual`。需要同步保存并恢复完整训练状态时，应同时启用两个入口。
 
+如果还需要 checkpoint SHA-256 manifest 校验，应使用单一的组合 checkpoint replacement
+替换 `optimizer.checkpoint_virtual`，避免两个 override 同时声明 `config.checkpoint`：
+
+```bash
+--override.imports \
+  torchtitan_npu.override.common.optimizer.virtual,\
+  'torchtitan_npu.override.checkpoint.npu_virtual={"verify_hash_manifest":true}' \
+--checkpoint.enable \
+--checkpoint.async-mode disabled
+```
+
+`torchtitan_npu.override.checkpoint.npu_virtual` 同时保留同步 native DCP 的
+`per_thread_copy_ahead=0` writer 和 manifest 生成、加载校验行为。不要再追加
+`torchtitan_npu.override.common.optimizer.checkpoint_virtual` 或
+`torchtitan_npu.override.checkpoint.npu`。该组合入口与原 Virtual Optimizer writer 一样，
+只支持同步、本地 native DCP 保存。
+
 ## Virtual Optimizer 与 Checkpoint
 
 TorchTitan 在保存 optimizer checkpoint 前会初始化尚未创建的 optimizer state，因此即使保存发生在第一次真实 optimizer step 之前，也能先建立形状和分片正确的 swap-backed moments。
