@@ -193,7 +193,7 @@ class VirtualAllocator:
             self.swap_size_this_pp_rank -= tensor_bytes
             return swap_tensor
         except Exception as e:
-            logger.info(f"[Warning] Swap memory alloc failed: {e}")
+            logger.warning(f"Swap memory alloc failed: {e}")
             return self.get_memory(p)
 
 

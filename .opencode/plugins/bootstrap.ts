@@ -39,7 +39,7 @@ export const BootstrapPlugin: Plugin = async ({ $, directory }) => {
 
     if (!hasBash()) {
       process.stdout.write(
-        `💡 当前环境缺少 bash，请手动执行 ${setupScript} --agent opencode\n\n`,
+        `💡 bash is missing in the current environment, please manually run ${setupScript} --agent opencode\n\n`,
       )
       return
     }
@@ -59,7 +59,7 @@ export const BootstrapPlugin: Plugin = async ({ $, directory }) => {
       } catch {}
       setTimeout(() => {
         process.stdout.write(
-          `❌ .agents/setup_agent.sh 执行失败，详见 ${logFile}\n`,
+          `❌ .agents/setup_agent.sh failed, see ${logFile}\n`,
         )
       }, 1500)
     }

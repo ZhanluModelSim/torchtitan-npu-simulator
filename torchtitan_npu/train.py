@@ -123,14 +123,14 @@ def _patch_for_garbage_collection_run():
             gc.collect()
             # pyrefly: ignore [missing-attribute]
             torch.npu.empty_cache()
-            print(f"[NPU] Cleared NPU cache at step {step_count}")
+            logger.info(f"[NPU] Cleared NPU cache at step {step_count}")
 
         # Call original method
         return original_run(self, step_count)
 
     # Apply the patch
     utils.GarbageCollection.run = patched_run
-    print("[PATCH] Successfully patched GarbageCollection.run method")
+    logger.info("[PATCH] Successfully patched GarbageCollection.run method")
 
 
 def _patch_for_parallel_dims_build_mesh():
@@ -172,4 +172,4 @@ def _patch_for_parallel_dims_build_mesh():
 
     # Apply the patch
     ParallelDims.build_mesh = patched_build_mesh
-    print("[PATCH] Successfully patched ParallelDims.build_mesh method")
+    logger.info("[PATCH] Successfully patched ParallelDims.build_mesh method")

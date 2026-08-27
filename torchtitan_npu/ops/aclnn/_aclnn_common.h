@@ -276,7 +276,7 @@ inline aclTensor *ConvertType(const at::Tensor &at_tensor) {
   // if acl_data_type is ACL_STRING, storageDims is empty.
   auto itemsize = at_tensor.itemsize();
   if (itemsize == 0) {
-    AT_ERROR("When ConvertType, tensor item size of cannot be zero.");
+    AT_ERROR("When ConvertType, tensor item size cannot be zero.");
     return nullptr;
   }
   if (acl_data_type != ACL_STRING) {
