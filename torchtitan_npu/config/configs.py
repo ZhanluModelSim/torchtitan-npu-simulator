@@ -11,6 +11,8 @@ from typing import Any, ClassVar
 from torchtitan.config import TrainingConfig as _BaseTrainingConfig
 from torchtitan.trainer import Trainer
 
+from torchtitan_npu.extension.trainer import TrainerEx
+
 
 @dataclass(kw_only=True, slots=True)
 class ExtensionConfig:
@@ -79,7 +81,7 @@ def _convert_config(source: object, target_type: type[Any]) -> Any:
 
 
 @dataclass(kw_only=True, slots=True)
-class TrainerConfig(Trainer.Config):
+class TrainerConfig(TrainerEx.Config):
     """The standard TorchTitan trainer config with NPU training settings."""
 
     _CONFIG_EXTENSIONS: ClassVar[dict[str, type[Any]]] = {
@@ -112,4 +114,4 @@ class TrainerConfig(Trainer.Config):
         from torchtitan_npu.distributed.utils import set_allow_hf32
 
         set_allow_hf32(self.training.extension.allow_hf32)
-        return Trainer.Config.build(self, **kwargs)
+        return TrainerEx.Config.build(self, **kwargs)

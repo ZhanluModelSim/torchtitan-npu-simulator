@@ -12,7 +12,7 @@ upstream config factory
     -> TrainerConfig.from_trainer_config()
     -> ConfigManager / tyro.cli()
     -> TrainerConfig.build()
-    -> component Config.build()
+    -> TrainerEx
 ```
 
 这里的「扩展配置」是指 Tyro 解析前加入的 NPU 配置类型，不是运行时逻辑。配置工厂
@@ -21,7 +21,7 @@ upstream config factory
 
 ## 扩展命名空间
 
-只负责提供配置入口，新增字段仍需要由 Trainer 或对应实现主动读取和应用。
+只负责提供配置入口，新增字段仍需要由 `TrainerEx` 或对应实现主动读取和应用。
 
 ### 已有组件扩展配置
 
@@ -61,7 +61,7 @@ extension.<config-group>.<field>
 ```python
 from dataclasses import dataclass, field
 
-from torchtitan.trainer import Trainer
+from torchtitan_npu.extension.trainer import TrainerEx
 
 
 @dataclass(kw_only=True, slots=True)
@@ -77,7 +77,7 @@ class ExtensionConfig:
 
 
 @dataclass(kw_only=True, slots=True)
-class TrainerConfig(Trainer.Config):
+class TrainerConfig(TrainerEx.Config):
     extension: ExtensionConfig = field(
         default_factory=ExtensionConfig,
     )
@@ -88,7 +88,7 @@ class TrainerConfig(Trainer.Config):
 
 ## 特殊 Trainer 类型
 
-当前 manager patch 只包装精确的标准 `Trainer.Config`。`FluxTrainer.Config`、
-`GraphTrainer.Config` 等带有额外字段的顶层类型不会自动转换；如需 NPU 扩展，应为该
-Trainer 家族定义保留全部字段的专用 Config，并通过其自己的入口接入，而不是套用标准
-`TrainerConfig`。
+标准 `Trainer.Config` 会被包装为继承 `TrainerEx.Config` 的 `TrainerConfig`，因此
+标准 NPU 训练最终由 `TrainerEx` 构建。`FluxTrainer.Config`、`GraphTrainer.Config`
+等带有额外字段的顶层类型不应套用标准 `TrainerConfig`，否则转换时无法保留专有字段；
+这类 Trainer 应定义保留全部字段的专用 Config，并通过自己的入口接入。

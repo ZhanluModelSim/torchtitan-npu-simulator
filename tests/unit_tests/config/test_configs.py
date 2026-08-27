@@ -7,16 +7,20 @@ import sys
 import types
 from dataclasses import fields
 
-from torchtitan.config import ConfigManager, TrainingConfig as UpstreamTrainingConfig
+from torchtitan.config import ConfigManager
+from torchtitan.config import TrainingConfig as UpstreamTrainingConfig
 from torchtitan.trainer import Trainer
 
 from torchtitan_npu.config import (
     ExtensionConfig,
     TrainerConfig,
-    TrainingConfig as NPUTrainingConfig,
     TrainingExtensionConfig,
 )
+from torchtitan_npu.config import (
+    TrainingConfig as NPUTrainingConfig,
+)
 from torchtitan_npu.distributed import utils as distributed_utils
+from torchtitan_npu.extension.trainer import TrainerEx
 
 
 def test_from_trainer_config_wraps_training_extension():
@@ -41,12 +45,10 @@ def test_from_trainer_config_wraps_training_extension():
             continue
         assert getattr(adapted, config_field.name) == getattr(source, config_field.name)
     for config_field in fields(UpstreamTrainingConfig):
-        assert getattr(adapted.training, config_field.name) == getattr(
-            source.training, config_field.name
-        )
+        assert getattr(adapted.training, config_field.name) == getattr(source.training, config_field.name)
 
 
-def test_config_manager_parses_training_extension(monkeypatch, tmp_path):
+def test_config_manager_parses_training_extension_into_trainer_ex_config(monkeypatch, tmp_path):
     module_name = "_torchtitan_npu_test_config_registry"
     registry = types.ModuleType(module_name)
 
@@ -70,12 +72,13 @@ def test_config_manager_parses_training_extension(monkeypatch, tmp_path):
     )
 
     assert isinstance(config, TrainerConfig)
+    assert isinstance(config, TrainerEx.Config)
     assert isinstance(config.training, NPUTrainingConfig)
     assert config.training.extension.allow_hf32 is False
     assert config.training.steps == 23
 
 
-def test_trainer_config_build_applies_extension_before_parent(monkeypatch):
+def test_trainer_config_build_applies_extension_before_trainer_ex_build(monkeypatch):
     events = []
     expected_result = object()
 
@@ -87,7 +90,7 @@ def test_trainer_config_build_applies_extension_before_parent(monkeypatch):
         return expected_result
 
     monkeypatch.setattr(distributed_utils, "set_allow_hf32", apply_runtime)
-    monkeypatch.setattr(Trainer.Config, "build", parent_build)
+    monkeypatch.setattr(TrainerEx.Config, "build", parent_build)
 
     config = TrainerConfig(
         training=NPUTrainingConfig(
@@ -101,3 +104,19 @@ def test_trainer_config_build_applies_extension_before_parent(monkeypatch):
         ("apply", False),
         ("build", {"example": "value"}),
     ]
+
+
+def test_trainer_config_build_constructs_trainer_ex(monkeypatch):
+    built_configs = []
+
+    def capture_config(_self, config):
+        built_configs.append(config)
+
+    monkeypatch.setattr(distributed_utils, "set_allow_hf32", lambda _: None)
+    monkeypatch.setattr(TrainerEx, "__init__", capture_config)
+
+    trainer = TrainerConfig().build()
+
+    assert isinstance(trainer, TrainerEx)
+    assert len(built_configs) == 1
+    assert isinstance(built_configs[0], TrainerConfig)
