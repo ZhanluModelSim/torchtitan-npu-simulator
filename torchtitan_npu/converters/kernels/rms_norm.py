@@ -16,6 +16,7 @@ from torchtitan_npu.converters.model_custom_interface import (
     ModelCustomConverter,
 )
 from torchtitan_npu.converters.registry import register_model_converter
+from torchtitan_npu.models.magi2_preview.norms import MultiModalityRMSNorm
 
 logger = logging.getLogger(__name__)
 
@@ -62,12 +63,74 @@ class NPURMSNorm(RMSNorm):
             self.reset_parameters()
 
 
+class NpuMultiModalityRMSNorm(MultiModalityRMSNorm):
+    """MAGI-2 MultiModalityRMSNorm backed by ``torch_npu.npu_rms_norm``.
+
+    ``num_modality == 1`` maps to a single fused call with the gain
+    (``weight + weight_bias``) as the kernel gamma. ``num_modality > 1``
+    runs one fused call per modality segment (rows arrive modality-sorted
+    and ``m_splits`` gives the per-modality row counts; the math is
+    row-local, so segmenting is exact). With ``num_patterns > 1`` the gain
+    is per-pattern and cannot fold into the kernel gamma, so the kernel
+    runs with an all-ones gamma and the gain multiplies afterwards.
+    """
+
+    def __init__(self, parent: MultiModalityRMSNorm) -> None:
+        nn.Module.__init__(self)
+        self.dim = parent.dim
+        self.eps = parent.eps
+        self.num_modality = parent.num_modality
+        self.num_patterns = parent.num_patterns
+        self.out_dtype = parent.out_dtype
+        self.weight_bias = parent.weight_bias
+        self.register_parameter("weight", parent.weight)
+
+    def _norm_with_gain(self, x: torch.Tensor, gain: torch.Tensor) -> torch.Tensor:
+        if self.num_patterns == 1:
+            return torch_npu.npu_rms_norm(x, gain.reshape(-1), self.eps)[0]
+        ones = torch.ones(self.dim, device=x.device, dtype=torch.float32)
+        return torch_npu.npu_rms_norm(x, ones, self.eps)[0] * gain
+
+    def forward(
+        self, x: torch.Tensor, m_splits: list[int] | None = None
+    ) -> torch.Tensor:
+        out_dtype = self.out_dtype if self.out_dtype is not None else x.dtype
+        if self.num_modality == 1:
+            gain = self.weight.view(self.num_patterns, self.dim) + self.weight_bias
+            return self._norm_with_gain(x, gain).to(out_dtype)
+
+        if m_splits is None:
+            raise ValueError("m_splits is required when num_modality > 1")
+        splits = m_splits.tolist() if isinstance(m_splits, torch.Tensor) else m_splits
+        splits = [int(s) for s in splits]
+        if len(splits) != self.num_modality:
+            raise ValueError(
+                f"Expected {self.num_modality} m_splits entries, got {len(splits)}"
+            )
+
+        scaled = []
+        for chunk, w in zip(
+            torch.split(x, splits, dim=0),
+            self.weight.chunk(self.num_modality),
+            strict=True,
+        ):
+            if chunk.shape[0] == 0:
+                scaled.append(chunk)
+                continue
+            gain = w.view(self.num_patterns, self.dim) + self.weight_bias
+            scaled.append(self._norm_with_gain(chunk, gain))
+        return torch.cat(scaled, dim=0).to(out_dtype)
+
+
 class NpuRMSNormConverter(ModelCustomConverter):
     def convert(self, model: nn.Module):
-        for name, module in model.named_modules():
-            if not isinstance(module, RMSNorm):
-                continue
-            replace_module_with_name(model, name, NPURMSNorm(module))
+        for name, module in list(model.named_modules()):
+            if type(module) is MultiModalityRMSNorm:
+                replace_module_with_name(
+                    model, name, NpuMultiModalityRMSNorm(module)
+                )
+            elif isinstance(module, RMSNorm):
+                replace_module_with_name(model, name, NPURMSNorm(module))
 
 
 @register_model_converter("npu_rms_norm")
