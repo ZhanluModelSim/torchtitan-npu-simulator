@@ -25,6 +25,7 @@ pipeline schedule class or branch on schedule names.
 
 from __future__ import annotations
 
+from bisect import bisect_left
 from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
@@ -353,16 +354,106 @@ class _FSDPPrefetchAnchor:
     seq_idx: int
 
 
+def _fsdp_region_for_collective(
+    *,
+    regions_by_group: dict[str, list[_FSDPGroupRegion]],
+    wait_seq_idxs_by_group: dict[str, tuple[int, ...]],
+    group_id: str,
+    collective_seq_idx: int,
+) -> _FSDPGroupRegion | None:
+    """Return the first parameter residency region following an all-gather.
+
+    An FSDP group can be entered more than once within a single captured
+    template (for example, ``tok_embeddings`` is reused by an MTP module).
+    Resolving that group solely by its id loses this occurrence information and
+    can attach a later invocation's external predecessors to an earlier
+    all-gather.  The L0 sequence number gives the missing occurrence key:
+    depending on the capture boundary, an all-gather is either inside its
+    matching region or immediately before its ``unshard_wait`` marker.
+
+    The sequence arrays are built once per template variant, so this lookup is
+    O(log R) for R lifetimes of one group rather than a graph traversal.
+    """
+    regions = regions_by_group.get(group_id)
+    if not regions:
+        return None
+    wait_seq_idxs = wait_seq_idxs_by_group[group_id]
+    index = bisect_left(wait_seq_idxs, collective_seq_idx)
+    if index:
+        preceding = regions[index - 1]
+        if collective_seq_idx < preceding.release_seq_idx:
+            return preceding
+    if index == len(regions):
+        return None
+    return regions[index]
+
+
+def _fsdp_prefetch_source_regions(
+    *,
+    source_regions: list[_FSDPGroupRegion],
+    source_wait_seq_idxs: tuple[int, ...],
+    source_invocation_starts: tuple[int, ...],
+    target_region: _FSDPGroupRegion | None,
+    target_collective_seq_idx: int,
+) -> list[_FSDPGroupRegion]:
+    """Select the source module invocation immediately before a prefetch.
+
+    A module can have multiple parameter groups, which must stay together, but
+    it can also be invoked multiple times in one template.  Restrict the
+    anchor to the latest invocation that precedes the target residency region;
+    otherwise a later reuse contributes backward-in-time predecessors.
+    """
+    if not source_regions:
+        return []
+    cutoff = (
+        target_region.wait_seq_idx
+        if target_region is not None
+        else target_collective_seq_idx
+    )
+    end = bisect_left(source_wait_seq_idxs, cutoff)
+    if end == 0:
+        return []
+
+    start_index = bisect_left(source_invocation_starts, end) - 1
+    start = (
+        source_invocation_starts[start_index]
+        if start_index >= 0
+        else end - 1
+    )
+    next_start = (
+        source_invocation_starts[start_index + 1]
+        if start_index + 1 < len(source_invocation_starts)
+        else len(source_regions)
+    )
+    return source_regions[start : min(end, next_start)]
+
+
 def _fsdp_prefetch_anchor(
     *,
     template_id: str,
     target_group_id: str,
     target_module_fqn: str,
+    target_region: _FSDPGroupRegion | None,
+    target_collective_seq_idx: int,
     prefetch_source_fqn: str,
     regions_by_module: dict[str, list[_FSDPGroupRegion]],
-    comm_id_by_group: dict[str, int],
+    wait_seq_idxs_by_module: dict[str, tuple[int, ...]],
+    invocation_starts_by_module: dict[str, tuple[int, ...]],
+    comm_id_by_region: dict[_FSDPGroupRegion, int],
 ) -> _FSDPPrefetchAnchor:
-    source_regions = regions_by_module.get(prefetch_source_fqn, [])
+    source_regions = _fsdp_prefetch_source_regions(
+        source_regions=regions_by_module.get(prefetch_source_fqn, []),
+        source_wait_seq_idxs=wait_seq_idxs_by_module.get(
+            prefetch_source_fqn,
+            (),
+        ),
+        source_invocation_starts=invocation_starts_by_module.get(
+            prefetch_source_fqn,
+            (),
+        ),
+        target_region=target_region,
+        target_collective_seq_idx=target_collective_seq_idx,
+    )
     if not source_regions:
         raise RuntimeError(
             "FSDP prefetch has no source parameter-group compute region: "
@@ -381,7 +472,7 @@ def _fsdp_prefetch_anchor(
     predecessor_op_ids.extend(
         comm_id
         for region in source_regions
-        if (comm_id := comm_id_by_group.get(region.group_id)) is not None
+        if (comm_id := comm_id_by_region.get(region)) is not None
     )
     source_entry_op_ids = tuple(
         dict.fromkeys(
@@ -1025,18 +1116,71 @@ class FSDPStageOwnershipPlugin:
                         next_synthetic_id -= 1
                     node_id_map[original_id] = new_id
 
-                region_by_group = {
-                    region.group_id: region for region in regions
-                }
+                regions_by_group: dict[
+                    str, list[_FSDPGroupRegion]
+                ] = defaultdict(list)
                 regions_by_module: dict[
                     str, list[_FSDPGroupRegion]
                 ] = defaultdict(list)
                 for region in regions:
+                    regions_by_group[region.group_id].append(region)
                     if region.module_fqn:
                         regions_by_module[region.module_fqn].append(region)
+                for grouped_regions in regions_by_group.values():
+                    grouped_regions.sort(
+                        key=lambda region: (
+                            region.wait_seq_idx,
+                            region.release_seq_idx,
+                            region.group_id,
+                        )
+                    )
+                for module_regions in regions_by_module.values():
+                    module_regions.sort(
+                        key=lambda region: (
+                            region.wait_seq_idx,
+                            region.param_group_index,
+                            region.group_id,
+                        )
+                    )
+                wait_seq_idxs_by_module = {
+                    module_fqn: tuple(
+                        region.wait_seq_idx for region in module_regions
+                    )
+                    for module_fqn, module_regions in regions_by_module.items()
+                }
+                # Param-group zero begins an FSDP module invocation.  Older
+                # traces lack this index, so each such region is its own
+                # conservative invocation boundary.
+                invocation_starts_by_module = {
+                    module_fqn: tuple(
+                        index
+                        for index, region in enumerate(module_regions)
+                        if region.param_group_index in {-1, 0}
+                    )
+                    for module_fqn, module_regions in regions_by_module.items()
+                }
+                wait_seq_idxs_by_group = {
+                    group_id: tuple(
+                        region.wait_seq_idx for region in grouped_regions
+                    )
+                    for group_id, grouped_regions in regions_by_group.items()
+                }
 
-                comm_id_by_group: dict[str, int] = {}
+                region_by_source_op_id: dict[
+                    int, _FSDPGroupRegion | None
+                ] = {}
+                comm_id_by_region: dict[_FSDPGroupRegion, int] = {}
                 for item in owned:
+                    group_id = str(
+                        item.spec.annotations.get("fsdp_group_id", "")
+                    )
+                    region = _fsdp_region_for_collective(
+                        regions_by_group=regions_by_group,
+                        wait_seq_idxs_by_group=wait_seq_idxs_by_group,
+                        group_id=group_id,
+                        collective_seq_idx=item.source_node.seq_idx,
+                    )
+                    region_by_source_op_id[item.source_node.op_id] = region
                     target_parent_id = str(
                         item.spec.annotations.get(
                             "parent_compute_instance_id",
@@ -1047,13 +1191,11 @@ class FSDPStageOwnershipPlugin:
                         continue
                     # A later action may prefetch the same group again. Only
                     # this action's all-gather proves its source params ready.
-                    group_id = str(
-                        item.spec.annotations.get("fsdp_group_id", "")
-                    )
-                    comm_id_by_group.setdefault(
-                        group_id,
-                        node_id_map[item.source_node.op_id],
-                    )
+                    if region is not None:
+                        comm_id_by_region.setdefault(
+                            region,
+                            node_id_map[item.source_node.op_id],
+                        )
                 successor_links: dict[int, list[int]] = defaultdict(list)
                 prefetch_source_entry_links: list[tuple[int, tuple[int, ...]]] = []
                 residency_intervals: list[dict[str, object]] = []
@@ -1090,7 +1232,7 @@ class FSDPStageOwnershipPlugin:
                             )
                         )
                     )
-                    region = region_by_group.get(group_id)
+                    region = region_by_source_op_id[source.op_id]
                     if region is None and module_fqn:
                         module_regions = regions_by_module.get(
                             module_fqn,
@@ -1220,9 +1362,15 @@ class FSDPStageOwnershipPlugin:
                             template_id=base_id,
                             target_group_id=group_id,
                             target_module_fqn=module_fqn,
+                            target_region=region,
+                            target_collective_seq_idx=source.seq_idx,
                             prefetch_source_fqn=prefetch_source_fqn,
                             regions_by_module=regions_by_module,
-                            comm_id_by_group=comm_id_by_group,
+                            wait_seq_idxs_by_module=wait_seq_idxs_by_module,
+                            invocation_starts_by_module=(
+                                invocation_starts_by_module
+                            ),
+                            comm_id_by_region=comm_id_by_region,
                         )
                         prefetch_launch_op_id = next_synthetic_id
                         next_synthetic_id -= 1

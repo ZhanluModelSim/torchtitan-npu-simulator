@@ -1399,6 +1399,161 @@ def test_fsdp_allgather_is_anchored_to_its_parameter_group(
     )
 
 
+def test_fsdp_reused_group_uses_the_matching_residency_occurrence() -> None:
+    """An MTP reuse must not attach its output dependency to the first AG."""
+
+    def op(
+        op_id: int,
+        seq_idx: int,
+        *,
+        predecessors: list[int] | None = None,
+        raw_op_type: str = "aten.mm.default",
+    ) -> OpNode:
+        return OpNode(
+            op_id=op_id,
+            op_type=raw_op_type.removeprefix("comm."),
+            inputs=[],
+            outputs=[],
+            attrs={},
+            predecessors=list(predecessors or []),
+            successors=[],
+            seq_idx=seq_idx,
+            comm_bytes=128 if raw_op_type.startswith("comm.") else 0,
+            annotations={"raw_op_type": raw_op_type},
+        )
+
+    initial_tok_allgather = 500
+    layer0_allgather = 501
+    mtp_tok_allgather = 502
+    final_output = 900
+    templates = {
+        "s0_F": StepGraph(
+            "s0_F",
+            "F",
+            {
+                10: _fsdp_marker(
+                    10, 20, "unshard_wait", "tok", "tok_embeddings"
+                ),
+                11: _fsdp_marker(
+                    11, 40, "reshard_release", "tok", "tok_embeddings"
+                ),
+                12: _fsdp_marker(
+                    12, 50, "unshard_wait", "layer0", "layers.0"
+                ),
+                13: _fsdp_marker(
+                    13, 80, "reshard_release", "layer0", "layers.0"
+                ),
+                14: _fsdp_marker(
+                    14, 100, "unshard_wait", "tok", "tok_embeddings"
+                ),
+                15: _fsdp_marker(
+                    15, 120, "reshard_release", "tok", "tok_embeddings"
+                ),
+                100: op(100, 30),
+                300: op(300, 60, predecessors=[100]),
+                final_output: op(final_output, 90, predecessors=[300]),
+                200: op(200, 110, predecessors=[final_output]),
+                initial_tok_allgather: op(
+                    initial_tok_allgather,
+                    10,
+                    raw_op_type="comm.allgather",
+                ),
+                layer0_allgather: op(
+                    layer0_allgather,
+                    45,
+                    raw_op_type="comm.allgather",
+                ),
+                mtp_tok_allgather: op(
+                    mtp_tok_allgather,
+                    95,
+                    raw_op_type="comm.allgather",
+                ),
+            },
+        )
+    }
+    compute = ActionSpec(
+        action_type="COMPUTE",
+        stage=0,
+        mb_idx=0,
+        seq_idx=1,
+        order_key=(1, 0, 0),
+        comp_type="F",
+        template_ref="s0_F",
+        annotations={"compute_instance_id": "s0_F_mb0"},
+    )
+    transitions = [
+        ("tok-first", "tok", "tok_embeddings", initial_tok_allgather, ""),
+        ("layer0", "layer0", "layers.0", layer0_allgather, "tok_embeddings"),
+        ("tok-mtp", "tok", "tok_embeddings", mtp_tok_allgather, ""),
+    ]
+    unshards = [
+        ActionSpec(
+            action_type="UNSHARD",
+            stage=0,
+            mb_idx=0,
+            seq_idx=2 + index,
+            order_key=(2 + index, 0, index),
+            annotations={
+                "fsdp_schedule_source": "state",
+                "fsdp_transition_id": transition_id,
+                "fsdp_group_id": group_id,
+                "fsdp_module_fqn": module_fqn,
+                "fsdp_prefetch_source_fqn": source_fqn,
+                "fsdp_prefetch_type": "FORWARD" if source_fqn else "",
+                "parent_compute_instance_id": "s0_F_mb0",
+                "residency_comp_type": "F",
+                "shard_world_size": 2,
+            },
+        )
+        for index, (transition_id, group_id, module_fqn, _, source_fqn) in enumerate(
+            transitions
+        )
+    ]
+    comm_events = [
+        CommEvent(
+            event_id=transition_id,
+            comm_primitive="allgather",
+            group_name="fsdp",
+            world_size=2,
+            tensor_shape=(64,),
+            dtype="bfloat16",
+            volume_bytes=128,
+            op_id=op_id,
+            p2p_stage=0,
+            comp_type="F",
+            fsdp_group_id=group_id,
+            fsdp_transition_id=transition_id,
+            fsdp_module_fqn=module_fqn,
+            fsdp_prefetch_source_fqn=source_fqn,
+            fsdp_prefetch_type="FORWARD" if source_fqn else "",
+        )
+        for transition_id, group_id, module_fqn, op_id, source_fqn in transitions
+    ]
+
+    normalize_communication_ownership(
+        step_templates=templates,
+        specs=[compute, *unshards],
+        comm_events=comm_events,
+    )
+
+    graph = templates["s0_F"]
+    allgathers = {
+        node.annotations["source_op_id"]: node
+        for node in graph.nodes.values()
+        if node.annotations.get("communication_owner") == "L1_STAGE"
+    }
+    launch = next(
+        node
+        for node in graph.nodes.values()
+        if node.op_type == "FSDP_PREFETCH_LAUNCH"
+    )
+    assert graph.is_acyclic
+    assert final_output not in allgathers[initial_tok_allgather].predecessors
+    assert final_output not in launch.predecessors
+    assert launch.predecessors == [initial_tok_allgather]
+    assert allgathers[layer0_allgather].predecessors == [launch.op_id]
+
+
 @pytest.mark.parametrize(
     ("comp_type", "layer_order", "prefetch_type"),
     [
