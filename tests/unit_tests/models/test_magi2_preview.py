@@ -473,7 +473,7 @@ class TestParallelize:
 
     @pytest.mark.parametrize(
         "flag",
-        ("pp_enabled", "tp_enabled", "cp_enabled", "ep_enabled"),
+        ("pp_enabled", "tp_enabled"),
     )
     def test_deferred_parallelism_raises(self, flag):
         from torchtitan_npu.models.magi2_preview.parallelize import (
@@ -488,3 +488,83 @@ class TestParallelize:
                     SimpleNamespace(mode="none"),
                 ),
             )
+
+    def test_cp_enabled_invokes_ulysses_wiring(self):
+        from torchtitan_npu.models.magi2_preview.parallelize import (
+            parallelize_magi2_preview,
+        )
+
+        cp_mesh = MagicMock()
+        parallel_dims = _mock_parallel_dims(
+            cp_enabled=True,
+            cp=2,
+            get_mesh=lambda dims: cp_mesh if dims == "cp" else MagicMock(),
+        )
+        mock_model = MagicMock()
+        with patch(
+            "torchtitan_npu.models.magi2_preview.parallelize."
+            "apply_magi2_ulysses_cp"
+        ) as apply_cp, patch(
+            "torchtitan_npu.models.magi2_preview.parallelize._apply_fsdp"
+        ):
+            parallelize_magi2_preview(
+                mock_model,
+                **_parallelize_kwargs(
+                    parallel_dims, SimpleNamespace(mode="none")
+                ),
+            )
+
+        apply_cp.assert_called_once_with(
+            mock_model, cp_mesh=cp_mesh, ep_degree=1
+        )
+
+    def test_ep_enabled_invokes_moe_parallel_with_meshes(self):
+        from torchtitan_npu.models.magi2_preview.parallelize import (
+            parallelize_magi2_preview,
+        )
+
+        ep_mesh, etp_mesh = MagicMock(), MagicMock()
+        meshes = {"ep": ep_mesh, "etp": etp_mesh}
+        parallel_dims = _mock_parallel_dims(
+            ep_enabled=True,
+            get_optional_mesh=lambda name: meshes[name],
+        )
+        mock_model = MagicMock()
+        with patch(
+            "torchtitan_npu.models.magi2_preview.parallelize._apply_moe_parallel"
+        ) as apply_moe_parallel, patch(
+            "torchtitan_npu.models.magi2_preview.parallelize._apply_fsdp"
+        ):
+            parallelize_magi2_preview(
+                mock_model,
+                **_parallelize_kwargs(
+                    parallel_dims, SimpleNamespace(mode="none")
+                ),
+            )
+
+        apply_moe_parallel.assert_called_once_with(
+            mock_model, ep_mesh=ep_mesh, etp_mesh=etp_mesh
+        )
+
+    def test_ep_disabled_passes_no_moe_meshes(self):
+        from torchtitan_npu.models.magi2_preview.parallelize import (
+            parallelize_magi2_preview,
+        )
+
+        mock_model = MagicMock()
+        with patch(
+            "torchtitan_npu.models.magi2_preview.parallelize._apply_moe_parallel"
+        ) as apply_moe_parallel, patch(
+            "torchtitan_npu.models.magi2_preview.parallelize._apply_fsdp"
+        ):
+            parallelize_magi2_preview(
+                mock_model,
+                **_parallelize_kwargs(
+                    _mock_parallel_dims(), SimpleNamespace(mode="none")
+                ),
+            )
+
+        # Baseline keeps EP/ETP disabled: no sharding work may happen.
+        apply_moe_parallel.assert_called_once_with(
+            mock_model, ep_mesh=None, etp_mesh=None
+        )

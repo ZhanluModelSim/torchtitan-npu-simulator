@@ -8,12 +8,18 @@
 import logging
 
 import torch
+from torch import nn
 from torch.distributed._composable.replicate_with_fsdp import replicate
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import (
     CPUOffloadPolicy,
     MixedPrecisionPolicy,
     fully_shard,
+)
+from torch.distributed.tensor import (
+    Shard,
+    distribute_module,
+    distribute_tensor,
 )
 from torchtitan.config import (
     TORCH_DTYPE_MAP,
@@ -29,6 +35,15 @@ from torchtitan.protocols import ModelConvertersContainer
 
 from torchtitan_npu.models.common.activation_checkpoint import apply_moe_ac
 
+from .cp_ulysses import apply_magi2_ulysses_cp
+from .expert_parallel import (
+    EXPERT_PARAM_NAMES,
+    ROUTER_BUFFER_NAMES,
+    all_reduce_head_parallel_input_grad,
+    all_reduce_head_parallel_output,
+    head_range_for_rank,
+)
+from .feed_forward import CoreMultiHeadMoE, MultiHeadMoELayer
 from .model import Magi2PreviewModel
 
 logger = logging.getLogger(__name__)
@@ -92,6 +107,120 @@ def _apply_replicate(
     disable_fsdp_gradient_division(model)
 
 
+def _partition_head_parallel_moe(
+    name: str, module: nn.Module, device_mesh: DeviceMesh
+) -> None:
+    """Shard the fused expert tensors as DTensors along the leading dim.
+
+    Expert rows are head-major (global expert id ``h * E + e``), so
+    ``Shard(0)`` over a mesh whose degree divides ``moe_num_heads`` splits
+    exactly at head boundaries (asserted in :func:`_apply_moe_parallel`);
+    each rank's local shard holds whole heads. The router buffers share
+    the same leading ``H * E`` dim and are sharded identically.
+    """
+    del name
+    # distribute_module visits every submodule; only the MoE core carries
+    # the fused expert tensors.
+    if not isinstance(module, CoreMultiHeadMoE):
+        return
+    moe_mlp = module
+    for param_name in EXPERT_PARAM_NAMES:
+        param = getattr(moe_mlp, param_name)
+        moe_mlp.register_parameter(
+            param_name,
+            nn.Parameter(distribute_tensor(param, device_mesh, [Shard(0)])),
+        )
+    for buffer_name in ROUTER_BUFFER_NAMES:
+        buffer = getattr(moe_mlp.router, buffer_name)
+        moe_mlp.router.register_buffer(
+            buffer_name, distribute_tensor(buffer, device_mesh, [Shard(0)])
+        )
+
+
+def _prepare_head_parallel_input(
+    moe_mlp: CoreMultiHeadMoE,
+    inputs: tuple,
+    device_mesh: DeviceMesh,
+) -> tuple:
+    """Regime-(a) input handling for the replicated token stream.
+
+    The MoE input is replicated across the expert mesh and every rank only
+    back-propagates its own heads, so the input gradient must be summed
+    across the mesh before it reaches the (replicated) modules upstream of
+    the MoE. The forward passes the input through untouched.
+    """
+    del moe_mlp
+    x = all_reduce_head_parallel_input_grad(inputs[0], device_mesh.get_group())
+    return (x,) + tuple(inputs[1:])
+
+
+def _combine_head_parallel_output(
+    moe_mlp: CoreMultiHeadMoE, output: torch.Tensor, device_mesh: DeviceMesh
+) -> torch.Tensor:
+    """Regime-(a) assembly of the local-head partial MoE output."""
+    return all_reduce_head_parallel_output(
+        output, moe_mlp.head_range, moe_mlp.num_heads, device_mesh.get_group()
+    )
+
+
+def _apply_moe_parallel(
+    model: Magi2PreviewModel,
+    *,
+    ep_mesh: DeviceMesh | None,
+    etp_mesh: DeviceMesh | None,
+) -> None:
+    """Shard the routed MoE across the head axis on the EP (or ETP) mesh.
+
+    MAGI-2 routes per head, so expert parallelism is head-parallel: every
+    rank owns ``moe_num_heads / degree`` whole heads of each MoE layer's
+    fused expert tensors and computes them over all (replicated) tokens;
+    the zero-padded partial outputs are all-reduced over the mesh
+    (regime (a), see ``expert_parallel.py``). The Ulysses seq<->head
+    all-to-all regime (b) needs sequence-sharded tokens and is wired once
+    context parallelism lands.
+
+    State-dict keys never change: the expert tensors become ``Shard(0)``
+    DTensors with unchanged global shapes, so loading a full checkpoint
+    still distributes through DTensor.
+    """
+    if ep_mesh is None and etp_mesh is None:
+        return
+    if ep_mesh is not None and etp_mesh is not None:
+        raise NotImplementedError(
+            "MAGI-2-preview combined EP+ETP would shard the head axis "
+            "across two meshes and needs tensor parallelism, which is not "
+            "implemented yet"
+        )
+    mesh = ep_mesh if ep_mesh is not None else etp_mesh
+    if mesh.ndim != 1:
+        raise ValueError(
+            f"MAGI-2 head-parallel MoE expects a 1D mesh, got {mesh.ndim}D"
+        )
+    degree = mesh.size()
+    for layer in model.block.layers.values():
+        if not isinstance(layer.mlp, MultiHeadMoELayer):
+            continue
+        moe_mlp = layer.mlp.moe_mlp
+        if moe_mlp.num_heads % degree != 0:
+            raise ValueError(
+                f"moe_num_heads={moe_mlp.num_heads} must be divisible by "
+                f"the head-parallel degree={degree}"
+            )
+        moe_mlp.set_head_range(
+            head_range_for_rank(
+                mesh.get_local_rank(), degree, moe_mlp.num_heads
+            )
+        )
+        distribute_module(
+            moe_mlp,
+            mesh,
+            partition_fn=_partition_head_parallel_moe,
+            input_fn=_prepare_head_parallel_input,
+            output_fn=_combine_head_parallel_output,
+        )
+    logger.info("Applied MAGI-2-preview head-parallel MoE (regime a)")
+
+
 def parallelize_magi2_preview(
     model: Magi2PreviewModel,
     *,
@@ -103,7 +232,16 @@ def parallelize_magi2_preview(
     ac_config: ActivationCheckpointConfig,
     dump_folder: str,
 ):
-    """Apply AC and FSDP to MAGI-2-preview; TP/CP/EP/PP are deferred."""
+    """Apply Ulysses CP, head-parallel MoE (EP/ETP), AC and FSDP.
+
+    TP/PP remain deferred. CP shards the packed sequence in original token
+    order across the cp mesh (Ulysses head-split all-to-all inside
+    attention, autograd exit gather with gradient compensation; see
+    ``cp_ulysses.py``). EP shards the routed MoE along the head axis
+    (regime (a): replicated tokens + all-reduce); the Ulysses all-to-all
+    MoE regime needs CP, so combining CP with EP raises until that
+    integration lands.
+    """
     del model_converters
 
     if parallel_dims.pp_enabled:
@@ -117,20 +255,28 @@ def parallelize_magi2_preview(
             "packed-token grouped projections have no TP sharding plan"
         )
     if parallel_dims.cp_enabled:
-        raise NotImplementedError(
-            "MAGI-2-preview context parallelism is not implemented yet; the "
-            "varlen packed sequences have no CP sharding plan"
-        )
-    if parallel_dims.ep_enabled:
-        raise NotImplementedError(
-            "MAGI-2-preview expert parallelism is not implemented yet; the "
-            "fused CoreMultiHeadMoE expert tensors have no EP sharding plan"
+        # Ulysses CP before MoE/AC/FSDP: installs the model cp_context and
+        # the attention hooks; torchtitan's "fsdp" mesh spans dp_shard x cp,
+        # so CP-replicated parameter grads reduce there during FSDP.
+        # Combining CP with EP (regime (b) all-to-all MoE) raises inside.
+        apply_magi2_ulysses_cp(
+            model,
+            cp_mesh=parallel_dims.get_mesh("cp"),
+            ep_degree=parallel_dims.ep,
         )
     if compile_config.enable and "model" in compile_config.components:
         logger.warning(
             "MAGI-2-preview model compilation has not been validated with "
             "distributed parallelism; continuing without applying torch.compile"
         )
+
+    # Head-parallel MoE before AC/FSDP, mirroring kimi_k3's ordering of
+    # expert parallelism ahead of activation checkpointing and FSDP.
+    _apply_moe_parallel(
+        model,
+        ep_mesh=parallel_dims.get_optional_mesh("ep"),
+        etp_mesh=parallel_dims.get_optional_mesh("etp"),
+    )
 
     # Model compilation is deliberately skipped above, so activation
     # checkpointing must not assume it is wrapping a compiled model.

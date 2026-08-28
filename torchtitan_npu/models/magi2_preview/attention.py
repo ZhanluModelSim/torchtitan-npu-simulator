@@ -11,16 +11,29 @@ per-head q/k RMSNorm, partial RoPE (first 96 of 128 head dims), non-causal
 varlen attention, and one learned sink logit per head that acts as an extra
 zero-valued key in the softmax.
 Reference: MAGI-2-preview official inference/model/magi2_preview.py (Attention)
+
+Ulysses context parallelism: ``Magi2Attention.forward`` accepts a CP
+context (``cp_context``) and/or carries one installed by
+``Magi2UlyssesAttentionCP`` (see ``cp_ulysses.py``). In CP mode the
+attention core runs on the full sequence with a head subset per rank: the
+sequence<->head all-to-all swaps and the RoPE gather are applied as hooks
+on the parameter-free ``attn_core`` submodule (or inline when a
+``cp_context`` is passed to forward directly), so RoPE is applied after
+the swap and every attention backend stays usable under CP.
 """
 
 import logging
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
 from torchtitan.protocols.module import Module
+
+if TYPE_CHECKING:
+    from .cp_ulysses import CpContext
 
 from .grouped_linear import GroupedLinear
 from .norms import MultiModalityRMSNorm
@@ -56,6 +69,56 @@ def _apply_rotary_emb(
     return torch.cat([rotated, x_pass], dim=-1)
 
 
+class _AttentionCore(nn.Module):
+    """Parameter-free RoPE + attention-core stage of ``Magi2Attention``.
+
+    Exists as its own module so ``Magi2UlyssesAttentionCP`` can hook the
+    Ulysses all-to-all swaps around it: the pre-hook replaces q/k/v with
+    their (full sequence, head subset) all-to-all images (and gathers the
+    RoPE embed to the full sequence), the post-hook swaps the output back.
+    Without CP the hooks are simply absent and this runs the original
+    inline math. Holds no parameters/buffers, so state-dict keys of the
+    owning attention module are unchanged; the owner reference is stored
+    as a plain attribute (``object.__setattr__``) because registering the
+    parent as a submodule would create a module-tree cycle.
+    """
+
+    def __init__(self, owner: "Magi2Attention") -> None:
+        super().__init__()
+        object.__setattr__(self, "_owner", owner)
+
+    def forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        rope: torch.Tensor,
+        cu_seqlens: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Apply RoPE then run the attention core in original token order.
+
+        Args:
+            q, k, v: (T, num_heads, head_dim) — full heads without CP, or
+                the swapped (full T, local head group) layout under CP.
+            rope: (T, rotary_dim) RoPE embed matching q/k rows (gathered
+                to the full sequence under CP by the pre-hook).
+            cu_seqlens: optional packed-segment boundaries (full sequence).
+
+        Returns:
+            (T, num_heads, head_dim) attention output, original order.
+        """
+        attention = self._owner
+        sin_emb, cos_emb = rope.tensor_split(2, -1)
+        q = _apply_rotary_emb(q, sin_emb, cos_emb)
+        k = _apply_rotary_emb(k, sin_emb, cos_emb)
+
+        # fp32 accumulation throughout the attention core.
+        v = v.to(q.dtype)
+        if attention.attn_backend == "flex":
+            return attention._flex_attention_with_sinks(q, k, v, cu_seqlens)
+        return attention._segment_attention_with_sinks(q, k, v, cu_seqlens)
+
+
 class Magi2Attention(Module):
     """Modality-grouped multi-head self-attention with sinks (MAGI-2-preview).
 
@@ -84,6 +147,15 @@ class Magi2Attention(Module):
       logits; on CPU (eager flex_attention has no CPU backward kernel as of
       torch 2.12) the same sink-extended math runs as a single masked SDPA
       call instead. Both mechanisms are numerically equivalent to "sdpa".
+
+    Ulysses CP mode: ``self.cp_context`` is installed by
+    ``Magi2UlyssesAttentionCP`` (None = CP disabled, the default). In CP
+    mode ``forward`` runs in head-subset/full-sequence mode: hooks on
+    ``self.attn_core`` all-to-all q/k/v from ``(T/cp, H, D)`` to
+    ``(T, H/cp, D)``, gather the RoPE embed to the full sequence, and
+    swap the core output back; ``sinks`` is head-sharded by the style.
+    ``forward`` also accepts an explicit ``cp_context`` argument for
+    hook-free CP invocations (used by single-process tests).
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -143,6 +215,11 @@ class Magi2Attention(Module):
             num_modality=config.num_modality,
             out_dtype=torch.float32,
         )
+        # RoPE + attention-core stage; hook target of the Ulysses CP style.
+        self.attn_core = _AttentionCore(self)
+        # Ulysses CP state (CpContext), installed by Magi2UlyssesAttentionCP;
+        # None keeps the non-CP path (the default).
+        self.cp_context: "CpContext | None" = None
 
     def forward(
         self,
@@ -152,19 +229,27 @@ class Magi2Attention(Module):
         sort_idx: torch.Tensor,
         inv_sort_idx: torch.Tensor,
         cu_seqlens: torch.Tensor | None = None,
+        cp_context: "CpContext | None" = None,
     ) -> torch.Tensor:
         """Run the attention sublayer on modality-sorted packed tokens.
 
         Args:
             x_sorted: (T, hidden_size) stream slice in sorted (modality-major)
-                token order.
+                token order; T is the local sequence shard under CP.
             rope: (T, rotary_dim) Fourier RoPE embed in ORIGINAL token order
-                (as produced by the pre-adapter).
+                (as produced by the pre-adapter); local shard under CP.
             m_splits: per-modality token counts of the sorted rows.
             sort_idx: (T,) long indices mapping original -> sorted order.
             inv_sort_idx: (T,) long indices mapping sorted -> original order.
             cu_seqlens: optional (S+1,) int cumulative segment boundaries for
-                packed varlen attention; None means one whole-sequence segment.
+                packed varlen attention; None means one whole-sequence
+                segment. Under CP this stays the FULL-sequence boundary
+                tensor: the attention core runs on the all-to-all'd full
+                sequence.
+            cp_context: optional Ulysses CP context for hook-free CP
+                invocations (single-process tests). When ``self.cp_context``
+                is set by the parallelize wiring, its hooks already perform
+                the swaps inside ``attn_core`` and this argument is ignored.
 
         Returns:
             (T, hidden_size) attention output in sorted token order.
@@ -183,16 +268,24 @@ class Magi2Attention(Module):
         q = q[inv_sort_idx]
         k = k[inv_sort_idx]
         v = v[inv_sort_idx]
-        sin_emb, cos_emb = rope.tensor_split(2, -1)
-        q = _apply_rotary_emb(q, sin_emb, cos_emb)
-        k = _apply_rotary_emb(k, sin_emb, cos_emb)
+        if self.cp_context is not None:
+            # CP hooks on attn_core swap q/k/v to (full T, local head
+            # group), gather the RoPE embed to the full sequence, and
+            # swap the core output back to the local shard.
+            out = self.attn_core(q, k, v, rope, cu_seqlens)
+        elif cp_context is not None:
+            # Hook-free CP invocation: the same Ulysses swaps, applied
+            # inline around the attention core.
+            from .cp_ulysses import (
+                cp_post_attention_swap,
+                cp_pre_attention_swap,
+            )
 
-        # fp32 accumulation throughout the attention core.
-        v = v.to(q.dtype)
-        if self.attn_backend == "flex":
-            out = self._flex_attention_with_sinks(q, k, v, cu_seqlens)
+            q, k, v, rope = cp_pre_attention_swap(q, k, v, rope, cp_context)
+            out = self.attn_core(q, k, v, rope, cu_seqlens)
+            out = cp_post_attention_swap(out, cp_context)
         else:
-            out = self._segment_attention_with_sinks(q, k, v, cu_seqlens)
+            out = self.attn_core(q, k, v, rope, cu_seqlens)
 
         # Back to sorted order, gate per head, then the grouped out projection.
         out = out[sort_idx]

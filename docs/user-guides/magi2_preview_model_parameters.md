@@ -67,7 +67,18 @@ MAGI-2-preview（sandai/magi-2-preview，114B 视频+音频扩散 MoE Transforme
 
 ## 当前能力边界
 
-- 并行：FSDP2 + activation checkpoint；TP/CP/EP/PP 逐步交付中（启用会显式报错说明）。
+- 并行：
+  - FSDP2 + activation checkpoint 为默认路径。
+  - EP：head-parallel MoE（`expert_parallel_degree > 1` 时沿头轴按整头切分
+    各层路由专家，要求 `moe_num_heads % expert_parallel_degree == 0`；token
+    全复制、本地头计算后零填充 + all-reduce 组合，checkpoint 键不变、全量
+    权重经 DTensor Shard(0) 分发）。EP+FSDP 组合（eFSDP）尚未在真实硬件
+    联调。
+  - CP：Ulysses 上下文并行（序列按原始 token 顺序分片，注意力内部做序列↔头
+    all-to-all，出口 autograd all-gather 并自动做 `1 / cp_degree` 梯度补偿，
+    训练损失无需改动；要求序列长度与注意力头数均可被 `cp_degree` 整除）。
+    CP 与 EP 暂不支持同时启用（显式报错）。
+  - TP/PP：逐步交付中（启用会显式报错说明）。
 - 数据：合成 latent（冒烟）与离线真实 latent 数据集；在线编码不支持。
 - MoE 专家计算为按专家分段的纯 torch 实现（正确但非融合内核），全量 12×256
   规模建议配合 converter/EP 交付后再上真实集群。

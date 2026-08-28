@@ -21,17 +21,40 @@ Training-port deviations from the official inference code:
   training; the official skip-load scheme zeroes the MoE expert tensors
   (W_gate/W_up/W_down) which would produce a dead network without a
   checkpoint. Official checkpoints are loaded via the state dict adapter.
+
+Ulysses context parallelism (see ``cp_ulysses.py``): the parallelize
+wiring sets ``cp_context``/``cp_degree``/``cp_rank`` on this model
+(attributes; CP disabled by default). With CP enabled, ``forward`` slices
+the incoming FULL batch tensors to the local sequence shard at entry
+(tokens stay in original order; the per-rank modality sort, m_splits,
+grouped linears, MHC and norms are all per-token and run unchanged on the
+shard) and all-gathers the ``(T_local, 64)`` prediction back to the full
+sequence at exit so the trainer's full-label MSE loss stays correct.
+v1 loss decision: every CP rank computes the same full-sequence loss and
+``funcol.all_gather_tensor_autograd``'s backward is a reduce-scatter with
+sum, so rank-local gradients upstream of the exit gather would be scaled
+by ``cp_degree`` relative to CP=1 training with the same loss; the exit
+gather therefore applies a ``1 / cp_degree`` gradient-only compensation
+(``_CpGradCompensation``) so the trainer's loss needs no CP-specific
+scaling. The attention
+sublayers run Ulysses all-to-all swaps (``cp_ulysses.py``); cu_seqlens
+stays the full-sequence boundary tensor because attention runs on the
+reconstructed full sequence.
 """
 
 import logging
 import math
 from dataclasses import dataclass, field
 from enum import IntEnum
+from typing import TYPE_CHECKING
 
 import torch
 from torch import nn
 
 from torchtitan.protocols.module import Module, ModuleDict
+
+if TYPE_CHECKING:
+    from .cp_ulysses import CpContext
 
 from .attention import Magi2Attention
 from .embeddings import ElementWiseFourierEmbed
@@ -355,6 +378,48 @@ class TransformerBlock(nn.Module):
         return x
 
 
+def _cp_shard(tensor: torch.Tensor, cp_context: "CpContext") -> torch.Tensor:
+    """Slice this rank's contiguous sequence shard from a full (T, ...) tensor.
+
+    Args:
+        tensor: full batch tensor whose leading dim is the packed sequence.
+        cp_context: installed Ulysses CP context (degree/rank).
+
+    Returns:
+        The rank's ``(T // degree, ...)`` shard; rows stay in original
+        token order, matching the official CP placement.
+    """
+    degree, rank = cp_context.degree, cp_context.rank
+    total = tensor.shape[0]
+    if total % degree != 0:
+        raise ValueError(
+            f"MAGI-2-preview CP requires the sequence length ({total}) to "
+            f"be divisible by the CP degree ({degree})"
+        )
+    shard_len = total // degree
+    return tensor.narrow(0, rank * shard_len, shard_len)
+
+
+class _CpGradCompensation(torch.autograd.Function):
+    """Gradient-only scaling that compensates the CP v1 loss duplication.
+
+    With CP every rank computes the same full-sequence loss and the exit
+    all-gather's backward sums each rank's gradient contribution, so local
+    gradients would be ``cp_degree`` x the CP=1 gradients. Scaling the
+    backward by ``1 / cp_degree`` restores the CP=1 gradient scale without
+    changing forward values (loss values/logs stay untouched).
+    """
+
+    @staticmethod
+    def forward(ctx, pred: torch.Tensor, scale: float) -> torch.Tensor:
+        ctx.scale = scale
+        return pred
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        return grad_output * ctx.scale, None
+
+
 class Magi2PreviewModel(Module):
     """MAGI-2-preview: joint video/audio diffusion transformer.
 
@@ -363,6 +428,15 @@ class Magi2PreviewModel(Module):
     timestep embedding and varlen ``cu_seqlens``. Tokens are remapped
     TIME->TEXT, modality-sorted for the grouped layers, and the predictions
     are returned in original order as ``(T, 64)``.
+
+    Ulysses CP: disabled by default (``cp_degree == 1``); the parallelize
+    wiring (``cp_ulysses.apply_magi2_ulysses_cp``) installs ``cp_context``
+    and the mirrored ``cp_degree``/``cp_rank`` attributes. With CP enabled,
+    forward receives FULL batch tensors on every rank, slices them to the
+    local sequence shard at entry and all-gathers the ``(T_local, 64)``
+    prediction back to the full sequence at exit, with a gradient-only
+    ``1 / cp_degree`` compensation so the trainer's loss stays unchanged
+    (see the module docstring v1 loss decision).
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -442,6 +516,11 @@ class Magi2PreviewModel(Module):
             config.audio_in_channels,
             config.norm_eps,
         )
+        # Ulysses CP state, installed by the parallelize wiring
+        # (cp_ulysses.apply_magi2_ulysses_cp); these defaults keep CP off.
+        self.cp_context: "CpContext | None" = None
+        self.cp_degree = 1
+        self.cp_rank = 0
 
     def verify_module_protocol(self) -> None:
         """Verify model conforms to torchtitan's module protocol."""
@@ -497,11 +576,31 @@ class Magi2PreviewModel(Module):
         time_embedding: torch.Tensor | None = None,
         cu_seqlens: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        """Run the full model on packed tokens (or this rank's CP view of them).
+
+        Without CP, inputs/outputs are the full packed sequence. With CP
+        enabled, every rank receives the FULL ``x``/``coords_mapping``/
+        ``modality_mapping``/``time_embedding`` tensors, forward slices them
+        to the local sequence shard at entry (``cu_seqlens`` stays full),
+        and the returned ``(T_full, 64)`` prediction is all-gathered from
+        the per-rank shards with autograd so the trainer's full-label loss
+        runs unchanged (see the class docstring v1 loss decision).
+        """
         if coords_mapping is None or modality_mapping is None:
             raise ValueError(
                 "magi2_preview forward requires coords_mapping and "
                 "modality_mapping"
             )
+        cp = self.cp_context
+        if cp is not None and cp.degree > 1:
+            # CP entry: keep this rank's contiguous shard of the original
+            # token order; the modality sort and m_splits below are then
+            # per-rank local (per-token ops have no cross-rank dependency).
+            x = _cp_shard(x, cp)
+            coords_mapping = _cp_shard(coords_mapping, cp)
+            modality_mapping = _cp_shard(modality_mapping, cp)
+            if time_embedding is not None:
+                time_embedding = _cp_shard(time_embedding, cp)
         # TIME marks tokens carrying the timestep embedding; the official
         # model has no TIME tokens internally, remap to TEXT for parity.
         modality_mapping = modality_mapping.clone()
@@ -527,4 +626,15 @@ class Magi2PreviewModel(Module):
         h = x_emb.index_select(0, sort_idx)
         h = self.block(h, rope, sort_idx, inv_sort_idx, m_splits, cu_seqlens)
         h = h.index_select(0, inv_sort_idx)
-        return self.post_adapter(h, video_idx, audio_idx)
+        pred = self.post_adapter(h, video_idx, audio_idx)
+        if cp is not None and cp.degree > 1:
+            # CP exit: all-gather the (T_local, 64) shard back to the full
+            # sequence with autograd (reduce-scatter-sum backward; see the
+            # module docstring v1 loss decision), then compensate the
+            # cp_degree gradient duplication so the trainer's loss needs no
+            # CP-specific scaling.
+            from .cp_ulysses import gather_seq
+
+            pred = gather_seq(pred, mesh=cp.mesh)
+            pred = _CpGradCompensation.apply(pred, 1.0 / cp.degree)
+        return pred
