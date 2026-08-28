@@ -11,6 +11,11 @@ MAGI-2-preview packing layout (video/audio/text segments in original order,
 channel-padded tokens, RoPE coords mapping, sinusoidal diffusion-time
 embedding) so every ``Magi2PreviewModel`` forward kwarg is populated.
 Reference: SandAI-org/MAGI-2 inference/pipeline/preview_data_proxy.py
+
+The flow-matching sample construction (``_flow_matching_sample``), the RoPE
+coordinate blocks (``_build_*_coords``) and multi-sample packing
+(``_pack_packed_samples``) are shared with ``latent_dataset.py`` so the
+offline-latent loader emits exactly the same input_dict contract.
 """
 
 import logging
@@ -67,6 +72,150 @@ def _grid_coords(
     return torch.cat([coords, sizes, refs], dim=1)
 
 
+def _build_video_coords(
+    video_frames: int, video_height: int, video_width: int
+) -> torch.Tensor:
+    """RoPE coords block for one video latent grid (reference == grid shape)."""
+    return _grid_coords(
+        (video_frames, video_height, video_width),
+        (video_frames, video_height, video_width),
+    )
+
+
+def _build_audio_coords(audio_len: int) -> torch.Tensor:
+    """RoPE coords block for audio tokens.
+
+    The audio time axis is compressed 8x through its reference length,
+    mirroring the official ``magic_audio_ref_t`` convention.
+    """
+    audio_ref_t = (audio_len - 1) // AUDIO_TIME_COMPRESSION + 1
+    return _grid_coords((audio_len, 1, 1), (audio_ref_t, 1, 1))
+
+
+def _build_text_coords(text_len: int) -> torch.Tensor:
+    """RoPE coords block for text tokens at negative times, ref (1, 1, 1)."""
+    return _grid_coords((text_len, 1, 1), (1, 1, 1), offset=(-text_len, 0, 0))
+
+
+def _flow_matching_sample(
+    video_x0: torch.Tensor,
+    audio_x0: torch.Tensor,
+    text_x0: torch.Tensor,
+    video_eps: torch.Tensor,
+    audio_eps: torch.Tensor,
+    text_eps: torch.Tensor,
+    sigma: torch.Tensor,
+) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+    """Pack one clean-latent sample into a noisy flow-matching training pair.
+
+    Pure construction (no RNG): given clean latents ``x0``, noise ``eps`` and
+    the sample's diffusion time ``sigma``, builds the noisy input
+    ``x_t = (1 - sigma) * x0 + sigma * eps`` and the velocity labels
+    ``v = eps - x0`` packed exactly as ``Magi2PreviewModel.forward`` consumes
+    them. Shared by the synthetic and offline-latent datasets.
+
+    Args:
+        video_x0: clean video latents ``(T, H, W, 48)``.
+        audio_x0: clean audio latents ``(L_a, 64)``.
+        text_x0: clean text embeddings ``(L_t, 5120)``.
+        video_eps: noise matching ``video_x0``.
+        audio_eps: noise matching ``audio_x0``.
+        text_eps: noise matching ``text_x0``.
+        sigma: scalar flow-matching time shared by the sample's noisy tokens.
+
+    Returns:
+        ``(input_dict, labels)`` where ``input_dict`` carries the exact
+        forward kwargs ``input``/``coords_mapping``/``modality_mapping``/
+        ``time_embedding``/``cu_seqlens`` (single segment) and ``labels`` is
+        ``(T_total, 64)`` with zero text rows.
+    """
+    video_frames, video_height, video_width, _ = video_x0.shape
+    video_x0 = video_x0.to(torch.float32)
+    audio_x0 = audio_x0.to(torch.float32)
+    text_x0 = text_x0.to(torch.float32)
+    video_eps = video_eps.to(torch.float32)
+    audio_eps = audio_eps.to(torch.float32)
+    text_eps = text_eps.to(torch.float32)
+
+    video_xt = (1 - sigma) * video_x0 + sigma * video_eps
+    audio_xt = (1 - sigma) * audio_x0 + sigma * audio_eps
+    text_xt = (1 - sigma) * text_x0 + sigma * text_eps
+    video_velocity = video_eps - video_x0
+    audio_velocity = audio_eps - audio_x0
+
+    n_video = video_frames * video_height * video_width
+    n_audio = audio_x0.shape[0]
+    n_text = text_x0.shape[0]
+    total = n_video + n_audio + n_text
+
+    input_tokens = torch.zeros(total, MAX_IN_CHANNELS)
+    input_tokens[:n_video, :VIDEO_CHANNELS] = video_xt.reshape(n_video, VIDEO_CHANNELS)
+    input_tokens[n_video : n_video + n_audio, :AUDIO_CHANNELS] = audio_xt
+    input_tokens[n_video + n_audio :] = text_xt
+
+    modality_mapping = torch.cat(
+        [
+            torch.full((n_video,), MODALITY_VIDEO, dtype=torch.int32),
+            torch.full((n_audio,), MODALITY_AUDIO, dtype=torch.int32),
+            torch.full((n_text,), MODALITY_TEXT, dtype=torch.int32),
+        ]
+    )
+
+    # Text sits at negative times with ref (1, 1, 1), so every RoPE axis
+    # either scales to zero (time) or sits at its center (h, w).
+    coords_mapping = torch.cat(
+        [
+            _build_video_coords(video_frames, video_height, video_width),
+            _build_audio_coords(n_audio),
+            _build_text_coords(n_text),
+        ],
+        dim=0,
+    )
+
+    per_token_sigma = torch.cat([sigma.expand(n_video + n_audio), torch.zeros(n_text)])
+    time_embedding = sinusoidal_embedding_1d(TIME_CHANNEL_DIM, per_token_sigma)
+
+    cu_seqlens = torch.tensor([0, total], dtype=torch.int32)
+
+    labels = torch.zeros(total, LABEL_CHANNELS)
+    labels[:n_video, :VIDEO_CHANNELS] = video_velocity.reshape(n_video, VIDEO_CHANNELS)
+    labels[n_video : n_video + n_audio, :AUDIO_CHANNELS] = audio_velocity
+
+    input_dict = {
+        "input": input_tokens,
+        "coords_mapping": coords_mapping,
+        "modality_mapping": modality_mapping,
+        "time_embedding": time_embedding,
+        "cu_seqlens": cu_seqlens,
+    }
+    return input_dict, labels
+
+
+def _pack_packed_samples(
+    samples: list[tuple[dict[str, torch.Tensor], torch.Tensor]],
+) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+    """Concatenate single-sample packed pairs into one multi-sample pack.
+
+    Each entry is an ``(input_dict, labels)`` pair from
+    ``_flow_matching_sample``; per-token fields are concatenated in sample
+    order and ``cu_seqlens`` is rebuilt as the cumulative segment ends,
+    mirroring the official ``SimplePackedData`` layout.
+    """
+    input_dict = {
+        key: torch.cat([sample[0][key] for sample in samples], dim=0)
+        for key in ("input", "coords_mapping", "modality_mapping", "time_embedding")
+    }
+    seqlens = torch.tensor(
+        [int(sample[0]["cu_seqlens"][-1]) for sample in samples], dtype=torch.int32
+    )
+    # torch.cumsum promotes int32 to int64 on CPU; the model contract is int32.
+    input_dict["cu_seqlens"] = torch.cat(
+        [torch.zeros(1, dtype=torch.int32), torch.cumsum(seqlens, dim=0).to(torch.int32)]
+    )
+    labels = torch.cat([sample[1] for sample in samples], dim=0)
+    return input_dict, labels
+
+
 class Magi2SyntheticDataset(IterableDataset):
     """Infinite synthetic flow-matching dataset for MAGI-2-preview.
 
@@ -116,62 +265,9 @@ class Magi2SyntheticDataset(IterableDataset):
         audio_eps = torch.randn_like(audio_x0, generator=gen)
         text_eps = torch.randn_like(text_x0, generator=gen)
 
-        video_xt = (1 - sigma) * video_x0 + sigma * video_eps
-        audio_xt = (1 - sigma) * audio_x0 + sigma * audio_eps
-        text_xt = (1 - sigma) * text_x0 + sigma * text_eps
-        video_velocity = video_eps - video_x0
-        audio_velocity = audio_eps - audio_x0
-
-        n_video = self.video_frames * self.video_height * self.video_width
-        n_audio = self.audio_len
-        n_text = self.text_len
-        total = n_video + n_audio + n_text
-
-        input_tokens = torch.zeros(total, MAX_IN_CHANNELS)
-        input_tokens[:n_video, :VIDEO_CHANNELS] = video_xt.reshape(n_video, VIDEO_CHANNELS)
-        input_tokens[n_video : n_video + n_audio, :AUDIO_CHANNELS] = audio_xt
-        input_tokens[n_video + n_audio :] = text_xt
-
-        modality_mapping = torch.cat(
-            [
-                torch.full((n_video,), MODALITY_VIDEO, dtype=torch.int32),
-                torch.full((n_audio,), MODALITY_AUDIO, dtype=torch.int32),
-                torch.full((n_text,), MODALITY_TEXT, dtype=torch.int32),
-            ]
+        return _flow_matching_sample(
+            video_x0, audio_x0, text_x0, video_eps, audio_eps, text_eps, sigma
         )
-
-        # Text sits at negative times with ref (1, 1, 1), so every RoPE axis
-        # either scales to zero (time) or sits at its center (h, w).
-        audio_ref_t = (self.audio_len - 1) // AUDIO_TIME_COMPRESSION + 1
-        coords_mapping = torch.cat(
-            [
-                _grid_coords(
-                    (self.video_frames, self.video_height, self.video_width),
-                    (self.video_frames, self.video_height, self.video_width),
-                ),
-                _grid_coords((self.audio_len, 1, 1), (audio_ref_t, 1, 1)),
-                _grid_coords((self.text_len, 1, 1), (1, 1, 1), offset=(-self.text_len, 0, 0)),
-            ],
-            dim=0,
-        )
-
-        per_token_sigma = torch.cat([sigma.expand(n_video + n_audio), torch.zeros(n_text)])
-        time_embedding = sinusoidal_embedding_1d(TIME_CHANNEL_DIM, per_token_sigma)
-
-        cu_seqlens = torch.tensor([0, total], dtype=torch.int32)
-
-        labels = torch.zeros(total, LABEL_CHANNELS)
-        labels[:n_video, :VIDEO_CHANNELS] = video_velocity.reshape(n_video, VIDEO_CHANNELS)
-        labels[n_video : n_video + n_audio, :AUDIO_CHANNELS] = audio_velocity
-
-        input_dict = {
-            "input": input_tokens,
-            "coords_mapping": coords_mapping,
-            "modality_mapping": modality_mapping,
-            "time_embedding": time_embedding,
-            "cu_seqlens": cu_seqlens,
-        }
-        return input_dict, labels
 
     def __iter__(self) -> Iterator[tuple[dict[str, torch.Tensor], torch.Tensor]]:
         iteration = self.iteration

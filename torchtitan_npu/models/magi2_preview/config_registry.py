@@ -33,6 +33,7 @@ from .config_overrides import (
     build_model_spec_with_overrides,
 )
 from .dataset import Magi2SyntheticDataLoader
+from .latent_dataset import Magi2LatentDataLoader
 
 
 @dataclass(kw_only=True, slots=True)
@@ -76,7 +77,7 @@ def _trainer_config(
     lr_scheduler: LRSchedulersContainer.Config,
     parallelism: ParallelismConfig,
     activation_checkpoint: ActivationCheckpointConfig,
-    dataloader: Magi2SyntheticDataLoader.Config,
+    dataloader: Magi2SyntheticDataLoader.Config | Magi2LatentDataLoader.Config,
     print_config: bool,
 ) -> TrainerConfig:
     model_spec, model_overrides = build_model_spec_with_overrides(
@@ -133,6 +134,49 @@ def magi2_preview_smoketest() -> TrainerConfig:
             video_width=4,
             audio_len=16,
             text_len=16,
+        ),
+        print_config=True,
+    )
+
+
+def magi2_preview_latent_smoketest() -> TrainerConfig:
+    """Debug-flavor recipe on pre-encoded latents for local bring-up.
+
+    Identical to :func:`magi2_preview_smoketest` but streams from an offline
+    latent shard directory via :class:`Magi2LatentDataLoader` instead of
+    synthetic samples. ``data_path`` defaults to the directory written by
+    ``scripts/magi2_preprocess_latents.py --dry-run``; point it at your own
+    pre-encoded shards (see docs/user-guides/magi2_preview_data_pipeline.md)
+    for real training. Kept out of the simulator registry on purpose: it
+    needs a materialized shard directory to build.
+    """
+    return _trainer_config(
+        flavor="debug",
+        training=TrainingConfig(
+            local_batch_size=1,
+            # Packs hold up to max_tokens_per_pack latent tokens; seq_len
+            # only feeds MFU accounting.
+            seq_len=64,
+            max_norm=1.0,
+            steps=2,
+        ),
+        optimizer=OptimizerConfig(
+            name="AdamW",
+            lr=1e-4,
+            eps=1e-8,
+        ),
+        lr_scheduler=LRSchedulersContainer.Config(
+            warmup_steps=1,
+            decay_ratio=0.8,
+            decay_type="cosine",
+            min_lr_factor=0.1,
+        ),
+        parallelism=_parallelism(),
+        activation_checkpoint=ActivationCheckpointConfig(mode="selective"),
+        dataloader=Magi2LatentDataLoader.Config(
+            data_path="./magi2_latent_shards",
+            max_tokens_per_pack=4096,
+            seed=0,
         ),
         print_config=True,
     )

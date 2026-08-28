@@ -200,10 +200,10 @@ DeepSeek-V4、Kimi K3 和 MAGI-2-preview 的内置配置作为 preset 使用，�
 各模型的 typed override schema 保持一致，CLI 中仅将下划线转换为连字符。
 DeepSeek-V4 字段详见
 [DeepSeek-V4 模型参数目录](deepseek_v4_model_parameters.md)，Kimi K3 字段详见
-[Kimi K3 模型参数目录](kimi_k3_model_parameters.md)，MAGI-2-preview 字段与
-`Magi2PreviewModel.Config` 一一对应（如 `num_layers`、`hidden_size`、
-`mm_layers`、`moe_layers`、`num_experts`、`moe_top_k`），可用下方
-`--help` 命令查看完整列表。
+[Kimi K3 模型参数目录](kimi_k3_model_parameters.md)，MAGI-2-preview 字段详见
+[MAGI-2-preview 模型参数目录](magi2_preview_model_parameters.md)。
+MAGI-2-preview 的离线 latent 数据格式、预处理与
+打包行为详见 [MAGI-2-preview 数据流水线](magi2_preview_data_pipeline.md)。
 
 DeepSeek-V4 示例：
 
