@@ -203,12 +203,22 @@ class OpDispatchCapture(TorchDispatchMode):
         self._autograd_saved_tensor_events: list[AutogradSavedTensorEvent] = []
         self._pending_saved_tensor_unpacks: list[int] = []
         self._producer: dict[int, int] = {}
+        # Dispatcher ops hidden by a scaffold scope still need to forward
+        # their data dependencies to the synthetic collective that consumes
+        # their result. A value may depend on more than one retained op.
+        self._suppressed_tensor_predecessors: dict[int, set[int]] = {}
         self._mutation_frontier: dict[int, int] = {}
         self._tensor_identities: dict[int, tuple[weakref.ReferenceType[torch.Tensor], int]] = {}
         self._reused_tensor_ids = itertools.count(1)
         self._last_signature: tuple | None = None
         self._previous_active_capture: OpDispatchCapture | None = None
         self._capture_l0: bool = True  # pass-through when False (duplicate class)
+        # A scoped suppression channel for framework bookkeeping. Unlike
+        # ``suspend_recording()``, this affects only dispatcher-originated
+        # events: callers may still add an explicit synthetic collective node
+        # that represents the whole operation.
+        self._dispatch_suppression_scopes: list[str] = []
+        self._suppressed_dispatch_counts: dict[tuple[str, str], int] = {}
         self._pending_comm_links: dict[int, object] = {}  # id(tensor) → CommEvent for dst_entry_op resolution
         # Per-(stage, comp_type) class dedup: the FIRST occurrence of each
         # class is captured in full (becomes a StepGraph template), every later
@@ -253,6 +263,27 @@ class OpDispatchCapture(TorchDispatchMode):
         finally:
             self._capture_l0 = previous
 
+    @contextmanager
+    def suppress_dispatch_events(self, provenance: str) -> Iterator[None]:
+        """Exclude framework scaffolding while preserving synthetic capture.
+
+        FSDP and fake collective wrappers may allocate temporary buffers or
+        perform copies solely to implement a collective.  The simulator emits
+        one synthetic ``comm.*`` node for that collective instead.  This scope
+        keeps the implementation-detail dispatcher ops out of the L1 graph
+        without suppressing that explicit synthetic node.
+        """
+        self._dispatch_suppression_scopes.append(provenance)
+        try:
+            yield
+        finally:
+            self._dispatch_suppression_scopes.pop()
+
+    @property
+    def suppressed_dispatch_counts(self) -> dict[tuple[str, str], int]:
+        """Audit counts for dispatcher ops excluded by scoped suppression."""
+        return dict(self._suppressed_dispatch_counts)
+
     @property
     def class_instance_counts(self) -> dict[tuple[int, str], int]:
         """Per-class instance counts (number of microbatches that executed
@@ -264,6 +295,28 @@ class OpDispatchCapture(TorchDispatchMode):
         kwargs = kwargs or {}
         mutated_inputs = _schema_mutated_tensors(func, args, kwargs)
         result = func(*args, **kwargs)
+
+        if self._capture_l0 and self._dispatch_suppression_scopes:
+            flat_inputs = _flatten_tensors(args) + _flatten_tensors(tuple(kwargs.values()))
+            flat_outputs = _flatten_tensors(
+                result if isinstance(result, (tuple, list)) else (result,)
+            )
+            predecessor_ids = {
+                predecessor
+                for tensor in flat_inputs
+                for predecessor in self._predecessors_for_tensor_id(
+                    self.tensor_id(tensor)
+                )
+            }
+            key = (self._dispatch_suppression_scopes[-1], str(func))
+            self._suppressed_dispatch_counts[key] = (
+                self._suppressed_dispatch_counts.get(key, 0) + 1
+            )
+            for tensor in flat_outputs:
+                self._suppressed_tensor_predecessors[self.tensor_id(tensor)] = set(
+                    predecessor_ids
+                )
+            return result
 
         flat_inputs = _flatten_tensors(args) + _flatten_tensors(tuple(kwargs.values()))
         flat_outputs = _flatten_tensors(result if isinstance(result, (tuple, list)) else (result,))
@@ -462,9 +515,9 @@ class OpDispatchCapture(TorchDispatchMode):
         memory_output_ids = [self.tensor_id(tensor) for tensor in memory_flat_outputs]
         predecessors = sorted(
             {
-                self._producer[tensor_id]
+                predecessor
                 for tensor_id in (*input_ids, *dependency_input_ids)
-                if tensor_id in self._producer
+                for predecessor in self._predecessors_for_tensor_id(tensor_id)
             }
             | alias_frontier_ids
         )
@@ -586,6 +639,7 @@ class OpDispatchCapture(TorchDispatchMode):
         self._last_signature = signature
 
         for tid in output_ids:
+            self._suppressed_tensor_predecessors.pop(tid, None)
             self._producer[tid] = op_id
         for tensor in mutated_inputs or ():
             self._mutation_frontier[self._alias_root_id(tensor)] = op_id
@@ -677,7 +731,13 @@ class OpDispatchCapture(TorchDispatchMode):
         mutation = self._mutation_frontier.get(self._alias_root_id(tensor))
         if mutation is not None:
             return mutation
-        return self._producer.get(self.tensor_id(tensor))
+        predecessors = self._predecessors_for_tensor_id(self.tensor_id(tensor))
+        return next(iter(predecessors)) if len(predecessors) == 1 else None
+
+    def _predecessors_for_tensor_id(self, tensor_id: int) -> set[int]:
+        if tensor_id in self._producer:
+            return {self._producer[tensor_id]}
+        return self._suppressed_tensor_predecessors.get(tensor_id, set())
 
     def __enter__(self) -> "OpDispatchCapture":
         super().__enter__()

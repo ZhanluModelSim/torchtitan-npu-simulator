@@ -351,6 +351,41 @@ def test_funcol_all_gather_tensor_returns_correctly_shaped_new_tensor():
     assert recorder.events[0].comm_primitive == "allgather"
 
 
+def test_functional_collective_outputs_do_not_add_scaffold_l0_ops():
+    capture = OpDispatchCapture()
+    tensor = torch.randn(8, device="meta")
+
+    with capture, capture_fake_collectives() as recorder:
+        gathered = funcol.all_gather_tensor(
+            tensor,
+            gather_dim=0,
+            group=dist.group.WORLD,
+        )
+        reduced = funcol.all_reduce(
+            tensor,
+            dist.ReduceOp.SUM,
+            dist.group.WORLD,
+        )
+        gathered.sin()
+        reduced.cos()
+
+    raw_op_types = [
+        node.annotations["raw_op_type"] for node in capture.build_nodes().values()
+    ]
+    assert [event.comm_primitive for event in recorder.events] == [
+        "allgather",
+        "allreduce",
+    ]
+    assert "comm.allgather" in raw_op_types
+    assert "comm.allreduce" in raw_op_types
+    assert not any(
+        raw_op_type.startswith("aten.empty")
+        or raw_op_type == "aten.clone.default"
+        for raw_op_type in raw_op_types
+    )
+    assert capture.suppressed_dispatch_counts
+
+
 def test_funcol_all_to_all_single_respects_output_split_sizes():
     t = torch.randn(10, device="meta")
     with capture_fake_collectives() as recorder:

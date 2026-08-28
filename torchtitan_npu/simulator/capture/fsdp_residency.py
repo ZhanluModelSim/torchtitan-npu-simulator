@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextvars
 import itertools
+from contextlib import nullcontext
 from typing import Any
 
 import torch
@@ -219,6 +220,7 @@ def install_fsdp_residency_hooks() -> None:
 
     def patched_unshard(self, async_op=False):  # noqa: ANN001, ANN202
         from torchtitan_npu.simulator.capture.comm_events import get_active_recorder
+        from torchtitan_npu.simulator.capture.dispatch_capture import get_active_capture
 
         recorder = get_active_recorder()
         capture_rank = recorder.capture_process_rank if recorder is not None else -1
@@ -246,8 +248,17 @@ def install_fsdp_residency_hooks() -> None:
         communication_token = _active_fsdp_communication_context.set(
             (_module_fqn(self), prefetch_source_fqn, prefetch_type)
         )
+        capture = get_active_capture()
+        scaffold_scope = (
+            capture.suppress_dispatch_events("fsdp_unshard_scaffold")
+            if capture is not None
+            else nullcontext()
+        )
         try:
-            result = FSDPParamGroup._sim_orig_unshard(self, async_op)
+            # Keep the synthetic comm.allgather emitted by the collective
+            # interception, but hide FSDP's temporary buffers/copies from L1.
+            with scaffold_scope:
+                result = FSDPParamGroup._sim_orig_unshard(self, async_op)
         finally:
             _active_fsdp_communication_context.reset(communication_token)
             _active_fsdp_transition.reset(token)
@@ -293,11 +304,20 @@ def install_fsdp_residency_hooks() -> None:
         return result
 
     def patched_wait_for_unshard(self):  # noqa: ANN001, ANN202
+        from torchtitan_npu.simulator.capture.dispatch_capture import get_active_capture
+
         was_unsharded = self.is_unsharded
         shard_world_size = _shard_world_size(self)
         track_memory = _memory_tracking_enabled()
         _, sharded_tensors = _residency_metadata(self) if track_memory else (0, ())
-        result = FSDPParamGroup._sim_orig_wait_for_unshard(self)
+        capture = get_active_capture()
+        scaffold_scope = (
+            capture.suppress_dispatch_events("fsdp_unshard_wait_scaffold")
+            if capture is not None
+            else nullcontext()
+        )
+        with scaffold_scope:
+            result = FSDPParamGroup._sim_orig_wait_for_unshard(self)
         if not was_unsharded and self.is_unsharded:
             _set_stage_fsdp_state(meta_env, "UNSHARDED")
             if not getattr(self, "_sim_active_transition_id", ""):
@@ -331,6 +351,8 @@ def install_fsdp_residency_hooks() -> None:
         return result
 
     def patched_reshard(self):  # noqa: ANN001, ANN202
+        from torchtitan_npu.simulator.capture.dispatch_capture import get_active_capture
+
         previous_comm_layer = meta_env._comm_layer
         meta_env._comm_layer = "L2"
         was_unsharded = self.is_unsharded
@@ -351,8 +373,15 @@ def install_fsdp_residency_hooks() -> None:
                 include_memory=False,
                 schedule_source="intent",
             )
+        capture = get_active_capture()
+        scaffold_scope = (
+            capture.suppress_dispatch_events("fsdp_reshard_scaffold")
+            if capture is not None
+            else nullcontext()
+        )
         try:
-            result = FSDPParamGroup._sim_orig_reshard(self)
+            with scaffold_scope:
+                result = FSDPParamGroup._sim_orig_reshard(self)
         finally:
             meta_env._comm_layer = previous_comm_layer
         if was_unsharded and not self.is_unsharded:

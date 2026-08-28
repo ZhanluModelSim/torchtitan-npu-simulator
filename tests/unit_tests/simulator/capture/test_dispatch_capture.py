@@ -39,6 +39,51 @@ def test_capture_builds_predecessor_successor_edges():
     assert relu_node.op_id in producer.successors
 
 
+def test_scaffold_suppression_keeps_synthetic_collective_data_path():
+    capture = OpDispatchCapture()
+    input_tensor = torch.randn(4, device="meta", dtype=torch.bfloat16)
+    with capture:
+        source = input_tensor.sin()
+        with capture.suppress_dispatch_events("fsdp_unshard_scaffold"):
+            transport = source.to(torch.float32)
+            gathered = torch.empty_like(transport)
+        capture.record_synthetic_op(
+            "comm.allgather",
+            inputs=[transport],
+            outputs=[gathered],
+        )
+        gathered.cos()
+
+    nodes = capture.build_nodes()
+    source_node = next(
+        node
+        for node in nodes.values()
+        if node.annotations["raw_op_type"] == "aten.sin.default"
+    )
+    collective = next(
+        node
+        for node in nodes.values()
+        if node.annotations["raw_op_type"] == "comm.allgather"
+    )
+    consumer = next(
+        node
+        for node in nodes.values()
+        if node.annotations["raw_op_type"] == "aten.cos.default"
+    )
+
+    assert source_node.op_id in collective.predecessors
+    assert collective.op_id in consumer.predecessors
+    assert not any(
+        "_to_copy" in node.annotations["raw_op_type"]
+        or node.annotations["raw_op_type"].startswith("aten.empty")
+        for node in nodes.values()
+    )
+    assert any(
+        provenance == "fsdp_unshard_scaffold"
+        for provenance, _ in capture.suppressed_dispatch_counts
+    )
+
+
 def test_capture_links_mutated_view_to_later_base_consumer():
     # FSDP packs parameter gradients into a view of its flat input buffer.
     # chunk_cat has no tensor output, so the writable schema argument is the

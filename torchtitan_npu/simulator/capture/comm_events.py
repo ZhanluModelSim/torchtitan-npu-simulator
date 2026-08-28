@@ -545,8 +545,21 @@ def _uncaptured_empty(
     capture = get_active_capture()
     if capture is None:
         return torch.empty(shape, dtype=dtype, device=device)
-    with capture.suspend_recording():
+    with capture.suppress_dispatch_events("collective_output_allocation"):
         return torch.empty(shape, dtype=dtype, device=device)
+
+
+def _uncaptured_clone(tensor: torch.Tensor) -> torch.Tensor:
+    """Clone a fake collective result without exporting clone as L0 work."""
+    from torchtitan_npu.simulator.capture.dispatch_capture import (
+        get_active_capture,
+    )
+
+    capture = get_active_capture()
+    if capture is None:
+        return tensor.clone()
+    with capture.suppress_dispatch_events("collective_output_clone"):
+        return tensor.clone()
 
 
 def _require_sequence_fallback(comm_event: CommEvent) -> None:
@@ -803,7 +816,7 @@ def capture_fake_collectives(
         return _NoOpWork() if async_op else None
 
     def patched_funcol_all_reduce(self_tensor, reduceOp, group, tag=""):  # noqa: ANN001, N803
-        out = self_tensor.clone()
+        out = _uncaptured_clone(self_tensor)
         comm_event = _record_comm_with_l0(
             recorder,
             "allreduce",
@@ -818,7 +831,11 @@ def capture_fake_collectives(
         world_size = _resolve_world_size(group)
         out_shape = list(self_tensor.shape)
         out_shape[gather_dim] *= world_size
-        out = torch.empty(out_shape, dtype=self_tensor.dtype, device=self_tensor.device)
+        out = _uncaptured_empty(
+            out_shape,
+            dtype=self_tensor.dtype,
+            device=self_tensor.device,
+        )
         _record_comm_with_l0(recorder, "allgather", group, self_tensor, out); return out
 
     def patched_funcol_reduce_scatter_tensor(self_tensor, reduceOp, scatter_dim, group, tag=""):  # noqa: ANN001, N803
@@ -831,14 +848,22 @@ def capture_fake_collectives(
                 f"world_size {world_size}; check parallelism config / tensor shapes"
             )
         out_shape[scatter_dim] = dim_size // world_size
-        out = torch.empty(out_shape, dtype=self_tensor.dtype, device=self_tensor.device)
+        out = _uncaptured_empty(
+            out_shape,
+            dtype=self_tensor.dtype,
+            device=self_tensor.device,
+        )
         _record_comm_with_l0(recorder, "reduce_scatter", group, self_tensor, out); return out
 
     def patched_funcol_all_to_all_single(self_tensor, output_split_sizes, input_split_sizes, group, tag=""):  # noqa: ANN001
         out_shape = list(self_tensor.shape)
         if output_split_sizes:
             out_shape[0] = int(sum(output_split_sizes))
-        out = torch.empty(out_shape, dtype=self_tensor.dtype, device=self_tensor.device)
+        out = _uncaptured_empty(
+            out_shape,
+            dtype=self_tensor.dtype,
+            device=self_tensor.device,
+        )
         _record_comm_with_l0(recorder, "all_to_all", group, self_tensor, out); return out
 
     def patched_funcol_all_gather_tensor_autograd(self_tensor, gather_dim, group, tag=""):  # noqa: ANN001
