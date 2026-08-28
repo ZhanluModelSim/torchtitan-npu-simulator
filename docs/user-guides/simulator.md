@@ -195,12 +195,15 @@ NGPU=384 python3 -m torchtitan_npu.entry \
 
 ### 4. 覆盖模型参数
 
-DeepSeek-V4 和 Kimi K3 的内置配置作为 preset 使用，模型参数可通过
+DeepSeek-V4、Kimi K3 和 MAGI-2-preview 的内置配置作为 preset 使用，模型参数可通过
 `--model-overrides.<字段名>` 覆盖。字段名与
 各模型的 typed override schema 保持一致，CLI 中仅将下划线转换为连字符。
 DeepSeek-V4 字段详见
 [DeepSeek-V4 模型参数目录](deepseek_v4_model_parameters.md)，Kimi K3 字段详见
-[Kimi K3 模型参数目录](kimi_k3_model_parameters.md)。
+[Kimi K3 模型参数目录](kimi_k3_model_parameters.md)，MAGI-2-preview 字段与
+`Magi2PreviewModel.Config` 一一对应（如 `num_layers`、`hidden_size`、
+`mm_layers`、`moe_layers`、`num_experts`、`moe_top_k`），可用下方
+`--help` 命令查看完整列表。
 
 DeepSeek-V4 示例：
 
@@ -230,6 +233,19 @@ NGPU=8 python3 -m torchtitan_npu.entry \
     --model-overrides.router-top-k 4
 ```
 
+MAGI-2-preview 示例：
+
+```bash
+NGPU=8 python3 -m torchtitan_npu.entry \
+    --module torchtitan_npu.simulator \
+    --config magi2_preview_smoketest \
+    --model-overrides.num-layers 3 \
+    --model-overrides.hidden-size 256 \
+    --model-overrides.mm-layers 0 \
+    --model-overrides.moe-layers 1 2 \
+    --model-overrides.moe-top-k 4
+```
+
 布尔字段使用 `--model-overrides.<字段名>` 和
 `--model-overrides.no-<字段名>`；可空字段传 `None`。运行以下命令可查看
 当前版本支持的全部字段及所选 preset 的默认值：
@@ -243,8 +259,10 @@ python3 -m torchtitan_npu.entry \
 
 配置解析阶段会执行对应模型的正数范围和字段联动校验。DeepSeek-V4 会检查
 `compress_ratios`、RoPE/Hadamard 维度和 MoE 分组；Kimi K3 会检查
-KDA/MLA 维度、dense 前缀、KDA 层索引、LatentMoE 和专家分组。具体边界以
-上述两个模型参数目录为准。
+KDA/MLA 维度、dense 前缀、KDA 层索引、LatentMoE 和专家分组；
+MAGI-2-preview 会检查维度整除关系（`hidden_size` 对 `head_dim`/
+`moe_num_heads`）、`moe_top_k` 范围和 `mm_layers`/`moe_layers` 层索引的
+合法性与互斥。具体边界以上述模型参数目录为准。
 
 ### 5. 获取输出文件
 

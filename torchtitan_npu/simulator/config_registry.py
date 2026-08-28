@@ -172,3 +172,53 @@ def kimi_k3_smoketest() -> KimiK3SimulationTrainerConfig:
         _kimi_k3_configs.kimi_k3_smoketest,
         output_name="kimi_k3_smoketest",
     )
+
+
+# ---------------------------------------------------------------------------
+# MAGI-2-preview simulator configs
+# ---------------------------------------------------------------------------
+
+from torchtitan_npu.models.magi2_preview import config_registry as _magi2_configs  # noqa: E402
+from torchtitan_npu.models.magi2_preview.config_overrides import (  # noqa: E402
+    Magi2PreviewModelOverrides,
+    apply_model_overrides as apply_magi2_model_overrides,
+)
+
+
+@dataclasses.dataclass(kw_only=True, slots=True)
+class Magi2SimulationTrainerConfig(SimulationTrainerConfig):
+    """MAGI-2-preview simulator config with stable model CLI overrides."""
+
+    model_overrides: Magi2PreviewModelOverrides = dataclasses.field(
+        default_factory=Magi2PreviewModelOverrides
+    )
+
+    def __post_init__(self) -> None:
+        self.model_spec = apply_magi2_model_overrides(
+            self.model_spec,
+            self.model_overrides,
+        )
+
+
+def _magi2_simulation_config(
+    factory: Callable[[], TrainerConfig],
+    *,
+    output_name: str,
+) -> Magi2SimulationTrainerConfig:
+    base_config = factory()
+    base_fields = {
+        field.name: getattr(base_config, field.name)
+        for field in dataclasses.fields(base_config)
+    }
+    base_fields["compile"] = dataclasses.replace(base_config.compile, enable=False)
+    return Magi2SimulationTrainerConfig(
+        **base_fields,
+        simulation=SimulationConfig(output_dir=f"./simulator_output/{output_name}"),
+    )
+
+
+def magi2_preview_smoketest() -> Magi2SimulationTrainerConfig:
+    return _magi2_simulation_config(
+        _magi2_configs.magi2_preview_smoketest,
+        output_name="magi2_preview_smoketest",
+    )

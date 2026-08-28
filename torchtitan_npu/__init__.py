@@ -56,7 +56,7 @@ def _apply_patches():
     from . import converters, ops  # noqa: F401
 
     # module injection: register NPU-only model variants
-    from .models import deepseek_v4, deepseek_v32, kimi_k3, vlm
+    from .models import deepseek_v4, deepseek_v32, kimi_k3, magi2_preview, vlm
     from .patches.distributed import cp_shard_mask, utils  # noqa: F401
 
     # patching step timing
@@ -97,12 +97,13 @@ def _apply_patches():
     from .tools import flight_recorder, profiling  # noqa: F401
 
     new_set = set(titan_models._supported_models)
-    new_set.update({"deepseek_v32", "deepseek_v4", "kimi_k3", "vlm"})
+    new_set.update({"deepseek_v32", "deepseek_v4", "kimi_k3", "magi2_preview", "vlm"})
     titan_models._supported_models = frozenset(new_set)
 
     _inject_module("torchtitan.models.deepseek_v32", deepseek_v32)
     _inject_module("torchtitan.models.deepseek_v4", deepseek_v4)
     _inject_module("torchtitan.models.kimi_k3", kimi_k3)
+    _inject_module("torchtitan.models.magi2_preview", magi2_preview)
     _inject_module("torchtitan.models.vlm", vlm)
 
 
