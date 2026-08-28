@@ -71,6 +71,30 @@ python3 -m pip install -r requirements.txt
 python3 -m pip install -e .
 ```
 
+### 4. 安装 torchao-npu（可选）
+
+仓库已在 `torchtitan_npu/experiments/torchao_npu` 中内置 TorchAO-NPU 适配代码，
+默认无需单独克隆 `torchao-npu` 仓库。从 torchtitan-npu 仓库根目录执行：
+
+```shell
+python3 -m pip install -e ./torchtitan_npu/experiments
+```
+
+该命令以 editable 模式安装仓内 `torchao_npu` 包，并安装其声明的
+`torchao==0.17.0` 依赖。
+
+不安装适配包时，也可以将源码的父目录加入 `PYTHONPATH`：
+
+```shell
+python3 -m pip install torchao==0.17.0
+export PYTHONPATH="/path/to/custom/parent${PYTHONPATH:+:${PYTHONPATH}}"
+```
+
+`/path/to/custom/parent` 必须直接包含 `torchao_npu/__init__.py`。使用仓内源码时，可将其
+替换为 `<torchtitan-npu>/torchtitan_npu/experiments`。通用训练脚本只透传量化 CLI，
+不会自动修改可选依赖路径。具体命令见
+[快速上手](./quickstart.md#deepseek-v4-torchao-npu-低精度训练)。
+
 ## PyPI 安装
 
 > 主线暂未提供此安装方式，待 torchtitan 发布稳定版本后提供

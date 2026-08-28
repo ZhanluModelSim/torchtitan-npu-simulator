@@ -6,6 +6,8 @@
 from . import manager as _manager  # noqa: F401
 from .configs import (
     ExtensionConfig,
+    QuantizationExtensionConfig,
+    QuantizationRecipe,
     TrainerConfig,
     TrainingConfig,
     TrainingExtensionConfig,
@@ -13,6 +15,8 @@ from .configs import (
 
 __all__ = [
     "ExtensionConfig",
+    "QuantizationExtensionConfig",
+    "QuantizationRecipe",
     "TrainerConfig",
     "TrainingConfig",
     "TrainingExtensionConfig",

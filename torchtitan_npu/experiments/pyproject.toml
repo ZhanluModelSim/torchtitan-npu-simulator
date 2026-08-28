@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "torchao-npu"
+version = "0.1.0"
+description = "Experimental TorchAO integrations for torchtitan-npu"
+requires-python = ">=3.12"
+dependencies = ["torchao==0.17.0"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["torchao_npu*"]

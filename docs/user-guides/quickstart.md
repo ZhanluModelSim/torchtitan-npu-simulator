@@ -1,6 +1,6 @@
 # 快速上手
 
-参考 [软件安装](./installation.md) 准备环境后，进入 `torchtitan-npu` 仓库根目录。除另有说明外，本文中的相对路径和命令均以仓库根目录为基准。以下步骤以 DeepSeek V3 模型为例，在 NPU 平台上运行 torchtitan-npu。
+参考 [软件安装](./installation.md) 准备环境后，进入 `torchtitan-npu` 仓库根目录。除另有说明外，本文中的相对路径和命令均以仓库根目录为基准。本文先以 DeepSeek V3 说明通用启动方式，再给出 DeepSeek-V4 多卡训练和 TorchAO-NPU 低精度训练入口。
 
 ## 数据准备
 
@@ -88,6 +88,75 @@ bash examples/deepseek_v4/debug/deepseek_v4_flash_8p_cpt_4k_a3.sh \
 ```
 
 DeepSeek-V4 的 SMLA 融合路径和 TND 数据约定见 [DeepSeek-V4 TND 适配](../feature_guides/deepseek_v4_tnd.md)。
+
+### DeepSeek-V4 TorchAO-NPU 低精度训练
+
+先按[软件安装](./installation.md#4-安装-torchao-npu可选)安装仓内适配包，或将
+`torchao_npu` 源码的父目录加入 `PYTHONPATH`。随后在普通训练命令后显式增加量化 CLI：
+
+> [!NOTE]
+> 当前低精度训练仅支持 A5（Ascend 950）硬件。
+
+```bash
+HF_ASSETS_PATH=/path/to/DeepSeek-V4-Flash \
+bash examples/deepseek_v4/debug/deepseek_v4_flash_8p_cpt_4k_a3.sh \
+  --training.steps 5 \
+  --extension.quantization.enable-quantized-training \
+  --extension.quantization.recipe all_block_fp8
+```
+
+源码方式示例：
+
+```bash
+python3 -m pip install torchao==0.17.0
+export PYTHONPATH="/path/to/custom/parent${PYTHONPATH:+:${PYTHONPATH}}"
+```
+
+自定义目录必须直接包含 `torchao_npu/__init__.py`；使用仓内源码时，对应目录为
+`<torchtitan-npu>/torchtitan_npu/experiments`。单机和多机示例分别调用
+`scripts/run_train.sh` 和 `scripts/run_train_multinodes.sh`，脚本只透传量化 CLI。
+未设置 `--extension.quantization.enable-quantized-training` 时，配置树保持高精度版本。
+
+该入口复用 torchtitan 的预训练/续训练循环，并不表示已经提供 SFT 专用数据处理或训练入口。
+
+启用低精度训练时，每个节点需使用
+A5（Ascend 950）硬件，安装相同版本的 `torchao_npu` 及其依赖，并执行相同命令；
+`NODE_IPS` 的顺序决定节点 rank：
+
+```bash
+NODE_IPS=your_ip1,your_ip2,... \
+HF_ASSETS_PATH=/path/to/DeepSeekV4_tokenizer \
+CKPT_SAVE_LOAD_PATH=/path/to/save_ckpt \
+CKPT_INIT_LOAD_PATH=/path/to/init_load_ckpt \
+bash examples/deepseek_v4/deepseek_v4_flash_cpt_4k_a3.sh \
+  --extension.quantization.enable-quantized-training \
+  --extension.quantization.recipe all_block_fp8 \
+  --extension.quantization.no-enable-mxfp4-qat \
+  --training.steps 5
+```
+
+两份 A3 示例均默认运行高精度训练。只有显式传入
+`--extension.quantization.enable-quantized-training` 时，配置构建阶段才会导入并应用 TorchAO-NPU Converter。
+
+低精度 recipe 的目标范围如下：
+
+| `RECIPE` | Attention 和 shared expert | Routed grouped experts |
+| --- | --- | --- |
+| `all_mxfp8` | MXFP8 | MXFP8 |
+| `mix`（默认） | MXFP8 | Block FP8 |
+| `all_block_fp8` | Block FP8 | Block FP8 |
+
+量化相关 CLI 参数：
+
+- `--extension.quantization.enable-quantized-training` 与 `--extension.quantization.no-enable-quantized-training`：选择低精度或高精度通路；默认使用高精度，只有显式传入 enable 开关才启用低精度。
+- `--extension.quantization.recipe`：选择 `all_mxfp8`、`mix` 或 `all_block_fp8`，默认使用 `mix`。
+- `--extension.quantization.enable-mxfp4-qat` 与 `--extension.quantization.no-enable-mxfp4-qat`：控制 routed expert 的 Block FP8 weight 是否增加 MXFP4 QAT fake quant 数值约束，默认关闭，仅对包含 Block FP8 的 recipe 生效。该选项不是持久化 4-bit 参数训练，也不会把算子替换为原生 A8W4 GEMM。
+- `--extension.quantization.dst-type-max`：MXFP4 fake quant 的目标数据类型最大值，默认 `0.0`，由数据类型自动推导。
+- `--profiler.enable-profiling`：启用 profiler；如需 CANN profiler override，还需将 `torchtitan_npu.override.common.profiler.cann` 加入 override imports。
+- `USE_GOLDEN`：设为 `1` 时选择 golden attention override；默认使用 Ascend 融合算子路径。
+
+启动日志中应出现 `Applied TorchAO-NPU recipe=...` 和
+`Converted ... config node(s) for torchao-npu`，分别表示 recipe 已读取以及目标模型配置已转换。
 
 ### 排查启动报错：查看更多 rank 日志
 

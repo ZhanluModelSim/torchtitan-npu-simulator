@@ -29,6 +29,7 @@ SIG 例会：[sig-framework-adapter](https://meeting.osinfra.cn/cann?sig=sig-fra
 # 最新消息
 
 ---
+- [Aug. 2026]: 🚀 **基于torchao_npu的DeepSeek-V4模型原生FP8训练/QAT训练支持**。
 - [Aug. 2026]: ⚠️ **override-refactor分支基于torchtitan override机制重构**。
 - [May. 2026]: 🚀 **[DeepSeek-V4-Pro 模型续训练支持](https://gitcode.com/cann/cann-recipes-train/blob/master/llm_pretrain/deepseekv4/README.md)**：基于纯FSDP + 大EP极简切分，使能AutoFuse特性，达成训练入图。
 - [May. 2026]: ⚠️ **配置系统重构**：master 分支对齐 torchtitan main 的 `config_registry.py` / `ConfigManager` 机制，模型训练使用 `--module` 和 `--config` 启动，不再通过 `--job.config_file` 加载 TOML。
@@ -106,10 +107,20 @@ pip install -e .
     </tr>
     <!-- 训练精度 -->
     <tr>
-      <td>训练精度</td>
-      <td>MxFP8 量化</td>
+      <td rowspan="3">低精度训练</td>
+      <td><a href="docs/user-guides/quickstart.md#deepseek-v4-torchao-npu-低精度训练">MXFP8 低精度训练</a></td>
       <td>✅</td>
+      <td>✅（Ascend 950）</td>
+    </tr>
+    <tr>
+      <td><a href="docs/user-guides/quickstart.md#deepseek-v4-torchao-npu-低精度训练">Block FP8 低精度训练</a></td>
       <td>❌</td>
+      <td>✅（Ascend 950）</td>
+    </tr>
+    <tr>
+      <td><a href="docs/user-guides/quickstart.md#deepseek-v4-torchao-npu-低精度训练">MXFP4 QAT</a></td>
+      <td>❌</td>
+      <td>✅（Ascend 950）</td>
     </tr>
     <!-- 训练调试与监控 -->
     <tr>

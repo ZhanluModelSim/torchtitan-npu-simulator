@@ -6,12 +6,29 @@
 """Typed NPU extensions to TorchTitan's training configuration."""
 
 from dataclasses import dataclass, field, fields, is_dataclass
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Literal
 
 from torchtitan.config import TrainingConfig as _BaseTrainingConfig
 from torchtitan.trainer import Trainer
 
 from torchtitan_npu.extension.trainer import TrainerEx
+
+QuantizationRecipe = Literal["all_mxfp8", "mix", "all_block_fp8"]
+
+
+@dataclass(kw_only=True, slots=True)
+class QuantizationExtensionConfig:
+    """TorchAO-NPU quantized-training options.
+
+    These fields define the public CLI schema. The quantization integration can
+    consume them after CLI parsing without adding model-specific options to the
+    upstream TorchTitan configuration.
+    """
+
+    enable_quantized_training: bool = False
+    recipe: QuantizationRecipe = "mix"
+    enable_mxfp4_qat: bool = False
+    dst_type_max: float = 0.0
 
 
 @dataclass(kw_only=True, slots=True)
@@ -33,6 +50,10 @@ class ExtensionConfig:
 
     This produces the CLI option ``--extension.runtime.enable-feature``.
     """
+
+    quantization: QuantizationExtensionConfig = field(
+        default_factory=QuantizationExtensionConfig,
+    )
 
 
 @dataclass(kw_only=True, slots=True)
@@ -113,5 +134,15 @@ class TrainerConfig(TrainerEx.Config):
 
         from torchtitan_npu.distributed.utils import set_allow_hf32
 
+        quantization_config = self.extension.quantization
+        if quantization_config.enable_quantized_training:
+            from interfaces.torchao_converter import apply_quantization_converter
+
+            model_compile_enabled = self.compile.enable and "model" in self.compile.components
+            self.model_spec = apply_quantization_converter(
+                self.model_spec,
+                quantization_config,
+                model_compile_enabled=model_compile_enabled,
+            )
         set_allow_hf32(self.training.extension.allow_hf32)
         return TrainerEx.Config.build(self, **kwargs)
