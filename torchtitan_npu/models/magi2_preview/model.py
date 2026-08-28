@@ -13,8 +13,10 @@ partial RoPE, and a multi-head core MoE with sigmoid routing.
 Reference: /tmp/magi2-preview/inference/model/magi2_preview.py (Apache-2.0)
 
 Training-port deviations from the official inference code:
-- Plain torch everywhere (no triton / flash-attn); attention is a plain
-  per-segment softmax implementation, autograd friendly.
+- Plain torch everywhere (no triton / flash-attn); attention defaults to a
+  plain per-segment softmax implementation (``attn_backend="sdpa"``) and can
+  switch to the sink-extended single-call ``"flex"`` backend; both are
+  autograd friendly and numerically equivalent.
 - ``init_weights`` gives a live randomly-initialized network for smoke
   training; the official skip-load scheme zeroes the MoE expert tensors
   (W_gate/W_up/W_down) which would produce a dead network without a
@@ -185,6 +187,7 @@ class TransformerLayer(nn.Module):
                 num_modality=num_modality,
                 norm_eps=config.norm_eps,
                 sink_token_num=config.sink_token_num,
+                attn_backend=config.attn_backend,
             )
         )
         self.mlp: MultiHeadMoELayer | Magi2MLP
@@ -382,6 +385,9 @@ class Magi2PreviewModel(Module):
         shared_expert_intermediate_size: int = 1280
         route_scale: float = 4.9
         sink_token_num: int = 1
+        # Attention core backend for every layer: "sdpa" (reference
+        # per-segment softmax) or "flex" (sink-extended single-call path).
+        attn_backend: str = "sdpa"
         norm_eps: float = 1e-6
         alpha_init: float = 0.01
 

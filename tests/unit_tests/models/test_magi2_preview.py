@@ -48,6 +48,7 @@ class TestModelRegistry:
             "sink_token_num",
             "norm_eps",
             "alpha_init",
+            "attn_backend",
         }
 
     @pytest.mark.parametrize("flavor", ("debug", "full"))

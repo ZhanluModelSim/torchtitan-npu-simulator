@@ -17,6 +17,7 @@ import logging
 from dataclasses import dataclass
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from torchtitan.protocols.module import Module
@@ -25,6 +26,9 @@ from .grouped_linear import GroupedLinear
 from .norms import MultiModalityRMSNorm
 
 logger = logging.getLogger(__name__)
+
+# Supported attention backends for Magi2Attention.Config.attn_backend.
+ATTN_BACKENDS = ("sdpa", "flex")
 
 
 def _apply_rotary_emb(
@@ -69,6 +73,17 @@ class Magi2Attention(Module):
     and the ``sinks`` parameter) match the official checkpoint keys exactly.
     Meta-init safe: only parameters are materialized in ``__init__``; values
     are filled by the model-level ``init_weights``.
+
+    Attention core backends (``config.attn_backend``):
+    - ``"sdpa"`` (default): the reference python per-segment softmax loop
+      (``_segment_attention_with_sinks``), kept for parity checks.
+    - ``"flex"``: one attention call over keys extended by per-segment
+      zero-valued sink keys (no python segment loop). On accelerator devices
+      this runs ``torch.nn.attention.flex_attention`` with a segment
+      ``create_block_mask`` and a score_mod that injects the learned sink
+      logits; on CPU (eager flex_attention has no CPU backward kernel as of
+      torch 2.12) the same sink-extended math runs as a single masked SDPA
+      call instead. Both mechanisms are numerically equivalent to "sdpa".
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -78,15 +93,25 @@ class Magi2Attention(Module):
         num_modality: int = 3
         norm_eps: float = 1e-6
         sink_token_num: int = 1
+        # "sdpa": reference per-segment softmax path. "flex": sink-extended
+        # single-call path (flex_attention on accelerators, masked SDPA on
+        # CPU); numerically equivalent to "sdpa" (see the unit tests).
+        attn_backend: str = "sdpa"
 
     def __init__(self, config: Config):
         super().__init__()
+        if config.attn_backend not in ATTN_BACKENDS:
+            raise ValueError(
+                f"Magi2Attention.Config.attn_backend must be one of "
+                f"{ATTN_BACKENDS}, got {config.attn_backend!r}"
+            )
         self.config = config
         self.hidden_size = config.hidden_size
         self.head_dim = config.head_dim
         self.num_heads = config.hidden_size // config.head_dim
         self.num_modality = config.num_modality
         self.softmax_scale = self.head_dim ** -0.5
+        self.attn_backend = config.attn_backend
 
         self.pre_norm = MultiModalityRMSNorm(
             config.hidden_size, eps=config.norm_eps, num_modality=config.num_modality
@@ -164,7 +189,10 @@ class Magi2Attention(Module):
 
         # fp32 accumulation throughout the attention core.
         v = v.to(q.dtype)
-        out = self._segment_attention_with_sinks(q, k, v, cu_seqlens)
+        if self.attn_backend == "flex":
+            out = self._flex_attention_with_sinks(q, k, v, cu_seqlens)
+        else:
+            out = self._segment_attention_with_sinks(q, k, v, cu_seqlens)
 
         # Back to sorted order, gate per head, then the grouped out projection.
         out = out[sort_idx]
@@ -217,3 +245,183 @@ class Magi2Attention(Module):
             probs = torch.softmax(scores_ext, dim=-1)
             outputs.append(torch.einsum("hlm,mhd->lhd", probs[..., :L], vs))
         return torch.cat(outputs, dim=0)
+
+    def _flex_attention_with_sinks(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cu_seqlens: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Non-causal packed attention with sinks via sink-extended keys.
+
+        Instead of looping over packed segments in python, the key/value
+        sequence is extended by ``num_segments * num_sinks`` zero-valued sink
+        keys (one group per segment) and attention runs in a single call
+        restricted to same-segment pairs. Mechanism selection:
+
+        - accelerator devices: ``flex_attention`` with a segment block mask
+          (``doc_id[q_idx] == kv_doc[kv_idx]``) and a score_mod that
+          replaces the sink columns' scores with the learned per-head sink
+          logits (score_mod receives already-scaled scores, so the logits
+          enter exactly as in the "sdpa" path);
+        - CPU: eager flex_attention has no backward kernel there (as of
+          torch 2.12), so the same sink-extended math runs as one masked
+          SDPA call (``_flex_attention_masked_sdpa``).
+
+        Both mechanisms are numerically equivalent to
+        ``_segment_attention_with_sinks``; see
+        tests/unit_tests/models/test_magi2_attention_backend.py.
+
+        Args:
+            q, k, v: (T, num_heads, head_dim) in original token order.
+            cu_seqlens: optional (S+1,) boundaries; None = single segment.
+
+        Returns:
+            (T, num_heads, head_dim) attention output in original order.
+        """
+        if q.device.type == "cpu":
+            return self._flex_attention_masked_sdpa(q, k, v, cu_seqlens)
+        return self._flex_attention_kernel(q, k, v, cu_seqlens)
+
+    def _sink_key_layout(
+        self,
+        seq_len: int,
+        device: torch.device,
+        cu_seqlens: torch.Tensor | list[int] | None,
+    ) -> tuple[int, torch.Tensor, torch.Tensor]:
+        """Derive segment ids for the sink-extended KV layout.
+
+        Args:
+            seq_len: packed token count T.
+            device: device for the created index tensors.
+            cu_seqlens: optional (S+1,) cumulative segment boundaries.
+
+        Returns:
+            (num_segments, doc_id, kv_doc) where doc_id is (T,) int32
+            (segment id per token) and kv_doc is (T + S * num_sinks,) int32:
+            real keys carry their token's segment id and each segment's
+            num_sinks appended sink keys carry that segment's id.
+        """
+        if cu_seqlens is None:
+            lengths = torch.tensor([seq_len], dtype=torch.int32, device=device)
+        else:
+            if not isinstance(cu_seqlens, torch.Tensor):
+                cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int32)
+            cu = cu_seqlens.to(device=device, dtype=torch.int32)
+            lengths = cu[1:] - cu[:-1]
+        num_segments = lengths.numel()
+        segments = torch.arange(num_segments, dtype=torch.int32, device=device)
+        doc_id = torch.repeat_interleave(segments, lengths)
+        num_sinks = self.sinks.shape[0]
+        kv_doc = torch.cat(
+            [doc_id, torch.repeat_interleave(segments, num_sinks)]
+        )
+        return num_segments, doc_id, kv_doc
+
+    def _flex_attention_kernel(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cu_seqlens: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """flex_attention mechanism of the "flex" backend (accelerators).
+
+        The block mask is created per forward because packed segment
+        boundaries vary per batch; under ``torch.compile`` this call is a
+        graph break (correct, not fused) — hoisting BlockMask creation out
+        of the compiled region is left as a perf follow-up.
+        """
+        from torch.nn.attention.flex_attention import (
+            create_block_mask,
+            flex_attention,
+        )
+
+        T, num_heads, head_dim = q.shape
+        num_sinks = self.sinks.shape[0]
+        num_segments, doc_id, kv_doc = self._sink_key_layout(
+            T, q.device, cu_seqlens
+        )
+        num_sink_keys = num_segments * num_sinks
+        k_ext = torch.cat([k, k.new_zeros(num_sink_keys, num_heads, head_dim)])
+        v_ext = torch.cat([v, v.new_zeros(num_sink_keys, num_heads, head_dim)])
+
+        def mask_mod(b, h, q_idx, kv_idx):
+            return doc_id[q_idx] == kv_doc[kv_idx]
+
+        # The sink columns' qk scores are meaningless (sink keys are zero);
+        # replace them with the learned sink logits. score_mod receives
+        # already-scaled scores, so the logits are used as-is, exactly like
+        # the sink columns of the "sdpa" path.
+        sink_logits = self.sinks.t().to(q.dtype)  # (num_heads, num_sinks)
+
+        def score_mod(score, b, h, q_idx, kv_idx):
+            return torch.where(
+                kv_idx >= T, sink_logits[h, (kv_idx - T) % num_sinks], score
+            )
+
+        block_mask = create_block_mask(
+            mask_mod,
+            B=1,
+            H=None,
+            Q_LEN=T,
+            KV_LEN=T + num_sink_keys,
+            device=q.device,
+            # Mask creation is O(T + S); keep it eager for portability.
+            _compile=False,
+        )
+        out = flex_attention(
+            q.unsqueeze(0).transpose(1, 2),
+            k_ext.unsqueeze(0).transpose(1, 2),
+            v_ext.unsqueeze(0).transpose(1, 2),
+            score_mod=score_mod,
+            block_mask=block_mask,
+            scale=self.softmax_scale,
+        )
+        return out.transpose(1, 2).squeeze(0)
+
+    def _flex_attention_masked_sdpa(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        cu_seqlens: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Masked-SDPA mechanism of the "flex" backend (CPU fallback).
+
+        Eager flex_attention has no CPU backward kernel (torch 2.12), so on
+        CPU the sink-extended math runs as one ``scaled_dot_product_attention``
+        call: sink keys are zero-valued, hence their scaled qk scores are 0
+        and the additive attention mask carries the learned sink logits on
+        sink columns while blocking cross-segment pairs.
+        """
+        T, num_heads, head_dim = q.shape
+        num_sinks = self.sinks.shape[0]
+        num_segments, doc_id, kv_doc = self._sink_key_layout(
+            T, q.device, cu_seqlens
+        )
+        num_sink_keys = num_segments * num_sinks
+        k_ext = torch.cat([k, k.new_zeros(num_sink_keys, num_heads, head_dim)])
+        v_ext = torch.cat([v, v.new_zeros(num_sink_keys, num_heads, head_dim)])
+
+        # Per-(head, kv-col) additive score contribution: 0 for real keys,
+        # the learned sink logit for sink keys (their qk score is 0).
+        sink_logits = self.sinks.t().to(q.dtype)  # (num_heads, num_sinks)
+        sink_col_idx = torch.arange(num_sink_keys, device=q.device) % num_sinks
+        col_bias = torch.cat(
+            [sink_logits.new_zeros(num_heads, T), sink_logits[:, sink_col_idx]],
+            dim=-1,
+        )
+        allowed = (doc_id.unsqueeze(1) == kv_doc.unsqueeze(0)).unsqueeze(0)
+        blocked = q.new_full((), torch.finfo(q.dtype).min)
+        attn_mask = torch.where(allowed, col_bias.unsqueeze(1), blocked)
+
+        out = F.scaled_dot_product_attention(
+            q.unsqueeze(0).transpose(1, 2),
+            k_ext.unsqueeze(0).transpose(1, 2),
+            v_ext.unsqueeze(0).transpose(1, 2),
+            attn_mask=attn_mask.unsqueeze(0),
+            scale=self.softmax_scale,
+        )
+        return out.transpose(1, 2).squeeze(0)

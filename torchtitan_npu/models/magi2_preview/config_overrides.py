@@ -12,6 +12,7 @@ import dataclasses
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from .attention import ATTN_BACKENDS
 from .model import Magi2PreviewModel
 
 if TYPE_CHECKING:
@@ -70,6 +71,12 @@ def apply_model_overrides(
 
 
 def validate_model_overrides(config: Magi2PreviewModelOverrides) -> None:
+    if config.attn_backend not in ATTN_BACKENDS:
+        raise ValueError(
+            "model_overrides.attn_backend must be one of "
+            f"{ATTN_BACKENDS}, got {config.attn_backend!r}"
+        )
+
     positive_int_fields = (
         "num_layers",
         "hidden_size",
