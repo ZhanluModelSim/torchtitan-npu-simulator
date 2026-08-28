@@ -275,12 +275,15 @@ class Compressor(Module):
         x: torch.Tensor,
         freqs_cis: torch.Tensor,
         positions: torch.Tensor,
-        block_starts: torch.Tensor | None = None,
+        attention_masks: AttentionMasksType | None = None,
     ) -> torch.Tensor:
         ratio, overlap = self.compress_ratio, self.overlap
         dtype = x.dtype
         flat_x = x.reshape(-1, x.shape[-1])
         flat_positions = positions.reshape(-1)
+        if attention_masks is None:
+            raise RuntimeError("DeepSeekV4 TND compressor requires SMLA attention_masks.")
+        block_starts = cast("Any", attention_masks).block_starts_by_ratio.get(ratio)
         if block_starts is None:
             raise RuntimeError("DeepSeekV4 TND compressor requires cached block_starts from attention_masks.")
 
@@ -332,10 +335,15 @@ class Compressor(Module):
         x: torch.Tensor,
         freqs_cis: torch.Tensor,
         positions: torch.Tensor | None = None,
-        block_starts: torch.Tensor | None = None,
+        attention_masks: AttentionMasksType | None = None,
     ):
         if self.use_tnd_metadata and positions is not None:
-            return self._forward_tnd(x, freqs_cis, positions, block_starts=block_starts)
+            return self._forward_tnd(
+                x,
+                freqs_cis,
+                positions,
+                attention_masks=attention_masks,
+            )
         return self._forward_bsnd(x, freqs_cis, positions=positions)
 
     def init_weights(self, init_std: float):
@@ -390,7 +398,7 @@ class Indexer(Module):
         freqs_cis: torch.Tensor,
         hadamard_mat: torch.Tensor,
         positions: torch.Tensor | None = None,
-        block_starts: torch.Tensor | None = None,
+        attention_masks: AttentionMasksType | None = None,
     ):
         is_tnd = x.dim() == 2
         rd = self.rope_head_dim
@@ -407,7 +415,12 @@ class Indexer(Module):
             positions=positions,
         )
         q = rotate_activation(q, hadamard_mat)
-        k = self.compressor(x, freqs_cis, positions=positions, block_starts=block_starts)
+        k = self.compressor(
+            x,
+            freqs_cis,
+            positions=positions,
+            attention_masks=attention_masks,
+        )
         k = rotate_activation(k, hadamard_mat)
         weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads**-0.5)
         return q, k, weights
@@ -770,7 +783,7 @@ class PreAttention(Module):
         freqs_cis: torch.Tensor,
         hadamard_mat: torch.Tensor,
         positions: torch.Tensor | None = None,
-        block_starts: torch.Tensor | None = None,
+        attention_masks: AttentionMasksType | None = None,
     ):
         rd = self.rope_head_dim
         # Q projection
@@ -802,7 +815,7 @@ class PreAttention(Module):
                 freqs_cis,
                 hadamard_mat,
                 positions=positions,
-                block_starts=block_starts,
+                attention_masks=attention_masks,
             )
 
         if self.compress_ratio == 4:
@@ -810,14 +823,14 @@ class PreAttention(Module):
                 x,
                 freqs_cis,
                 positions=positions,
-                block_starts=block_starts,
+                attention_masks=attention_masks,
             )
         elif self.compress_ratio > 1:
             kv_compress = self.compressor_128(
                 x,
                 freqs_cis,
                 positions=positions,
-                block_starts=block_starts,
+                attention_masks=attention_masks,
             )
 
         return q, kv, kv_compress, q_indexer, k_indexer, weights
@@ -1046,14 +1059,13 @@ class Attention(Module):
         positions: torch.Tensor | None = None,
     ):
         input_layout = "TND" if x.dim() == 2 else "BSND"
-        block_starts = None
+        smla_attention_masks = None
         if input_layout == "TND":
             if attention_masks is None:
                 raise RuntimeError("DeepSeekV4 TND attention requires SMLA attention_masks.")
             smla_attention_masks = cast("Any", attention_masks)
             bsz = smla_attention_masks.batch_size
             seqlen = smla_attention_masks.max_seqlen_q
-            block_starts = smla_attention_masks.block_starts_by_ratio.get(self.compress_ratio)
         else:
             bsz, seqlen, _ = x.size()
         freqs_cis = freqs_cis.to(x.device)
@@ -1063,7 +1075,7 @@ class Attention(Module):
             freqs_cis,
             hadamard_mat,
             positions=positions,
-            block_starts=block_starts,
+            attention_masks=smla_attention_masks,
         )
 
         local_heads = q.shape[1] if input_layout == "TND" else q.shape[2]
@@ -1491,6 +1503,7 @@ class DeepSeekV4Model(BaseModel):
         beta_slow: int = 1
         n_layers: int = 4
         use_smla: bool = False
+        use_compressor: bool = False
         use_npu_rope: bool = False
         use_global_tnd: bool = False
         num_mtp_modules: int = 0
@@ -1523,6 +1536,7 @@ class DeepSeekV4Model(BaseModel):
 
             converters = trainer_config.model_converters.converters
             self.use_smla = has_npu_converter(converters, "npu_smla")
+            self.use_compressor = has_npu_converter(converters, "npu_compressor")
             self.use_npu_rope = has_npu_converter(converters, "npu_rope") or has_npu_converter(
                 converters,
                 "npu_rope_inplace_partial",
@@ -1544,6 +1558,8 @@ class DeepSeekV4Model(BaseModel):
                     "to enable global TND; missing converter(s): " + ", ".join(missing_converters)
                 )
             self.use_global_tnd = use_a5 and self.use_smla and use_mhc_pre and use_mhc_post
+            if self.use_compressor and not self.use_global_tnd:
+                raise ValueError("DeepSeekV4 npu_compressor requires npu_smla global TND.")
             self.num_mtp_modules = trainer_config.training.num_mtp_modules
             if trainer_config.parallelism.pipeline_parallel_degree > 1 and self.num_mtp_modules > 0:
                 raise NotImplementedError(

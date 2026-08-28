@@ -92,23 +92,23 @@ class DeepSeekV4TNDTest(unittest.TestCase):
             torch.arange(0, 4096, 4, dtype=torch.int64),
         )
 
-    def test_tnd_ratio4_reuses_supplied_compressor_block_starts(self):
+    def test_tnd_ratio4_reuses_supplied_attention_masks(self):
         from torchtitan_npu.models.deepseek_v4 import model as deepseek_model
 
         class RecordingCompressor(torch.nn.Module):
             def __init__(self):
                 super().__init__()
                 self.use_tnd_metadata = True
-                self.block_starts = None
+                self.attention_masks = None
 
-            def forward(self, x, freqs_cis, positions=None, block_starts=None):
-                self.block_starts = block_starts
+            def forward(self, x, freqs_cis, positions=None, attention_masks=None):
+                self.attention_masks = attention_masks
                 return x
 
         class RecordingIndexer(torch.nn.Module):
             def __init__(self):
                 super().__init__()
-                self.block_starts = None
+                self.attention_masks = None
 
             def forward(
                 self,
@@ -117,9 +117,9 @@ class DeepSeekV4TNDTest(unittest.TestCase):
                 freqs_cis,
                 hadamard_mat,
                 positions=None,
-                block_starts=None,
+                attention_masks=None,
             ):
-                self.block_starts = block_starts
+                self.attention_masks = attention_masks
                 return x, x, x
 
         pre_attention = deepseek_model.PreAttention.__new__(deepseek_model.PreAttention)
@@ -139,18 +139,18 @@ class DeepSeekV4TNDTest(unittest.TestCase):
         pre_attention.indexer = RecordingIndexer()
 
         positions = torch.arange(8)
-        expected_block_starts = torch.tensor([0, 4])
+        expected_attention_masks = object()
         with patch.object(deepseek_model, "apply_rotary_emb", side_effect=lambda x, *args, **kwargs: x):
             pre_attention(
                 torch.randn(8, 4),
                 torch.empty(0),
                 torch.eye(4),
                 positions=positions,
-                block_starts=expected_block_starts,
+                attention_masks=expected_attention_masks,
             )
 
-        self.assertIs(pre_attention.indexer.block_starts, pre_attention.compressor.block_starts)
-        torch.testing.assert_close(pre_attention.compressor.block_starts, expected_block_starts)
+        self.assertIs(pre_attention.indexer.attention_masks, pre_attention.compressor.attention_masks)
+        self.assertIs(pre_attention.compressor.attention_masks, expected_attention_masks)
 
     def test_mtp_shifts_do_not_cross_packed_request_boundaries(self):
         inputs = torch.tensor([[10, 11, 12, 13, 20, 21, 22, 23]])

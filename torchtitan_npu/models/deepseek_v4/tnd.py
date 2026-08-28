@@ -16,12 +16,23 @@ from torchtitan.models.common import VarlenAttention
 _SMLA_ATTENTION_MASK_CACHE_IDS = count()
 
 
+class DeepSeekV4CompressorMetadata(NamedTuple):
+    flat_positions: torch.Tensor
+    compressed_positions: dict[int, torch.Tensor]
+    cu_seqlens_q: torch.Tensor
+    seqused: torch.Tensor
+    start_pos: torch.Tensor
+    state_block_table: dict[int, torch.Tensor]
+    state_cache: dict[tuple[int, int], torch.Tensor]
+
+
 class DeepSeekV4SMLAAttentionMasks(NamedTuple):
     cu_seqlens_q: torch.Tensor
     cu_seqlens_ori_kv: torch.Tensor
     cu_seqlens_cmp_kv: dict[int, torch.Tensor]
     cmp_residual_k: dict[int, torch.Tensor]
     block_starts_by_ratio: dict[int, torch.Tensor]
+    compressor_metadata: DeepSeekV4CompressorMetadata | None
     max_seqlen_q: int
     max_seqlen_cmp_kv: dict[int, int]
     batch_size: int
@@ -136,6 +147,7 @@ def build_smla_attention_masks(
     residual_cmp_ratios = _residual_cmp_ratios(model_args)
     if use_tnd_metadata is None:
         use_tnd_metadata = getattr(model_args, "use_global_tnd", True)
+    request_layout = None
     if use_tnd_metadata:
         request_layout = _request_layout_from_positions(
             positions,
@@ -171,12 +183,53 @@ def build_smla_attention_masks(
         cmp_lengths = {ratio: torch.div(actual_seq_q, ratio, rounding_mode="floor") for ratio in residual_cmp_ratios}
         block_starts_by_ratio = {}
     actual_seq_ori_kv = actual_seq_q.clone()
+    cu_seqlens_q = lengths_to_cu_seqlens(actual_seq_q)
+    compressor_metadata = None
+    if getattr(model_args, "use_compressor", False):
+        if request_layout is None:
+            raise ValueError("DeepSeek-V4 npu_compressor requires SMLA global TND metadata.")
+        start_pos = request_layout.flat_positions[request_layout.starts].to(dtype=torch.int32)
+        max_state_len = int((start_pos + actual_seq_q).max().item())
+        state_block_table = {}
+        state_cache = {}
+        # Zero block IDs disable state-cache updates, so these training buffers are reusable across layers.
+        for ratio in residual_cmp_ratios:
+            state_block_size = 8 if ratio == 4 else 16
+            num_state_blocks = (max_state_len + state_block_size - 1) // state_block_size
+            state_block_table[ratio] = torch.zeros(
+                (actual_seq_q.numel(), num_state_blocks),
+                device=device,
+                dtype=torch.int32,
+            )
+            head_dims = {model_args.head_dim}
+            if ratio == 4:
+                head_dims.add(model_args.index_head_dim)
+            coff = 2 if ratio == 4 else 1
+            for head_dim in head_dims:
+                state_cache[(ratio, head_dim)] = torch.zeros(
+                    (1, state_block_size, 2 * coff * head_dim),
+                    device=device,
+                    dtype=torch.float32,
+                )
+        compressor_metadata = DeepSeekV4CompressorMetadata(
+            flat_positions=request_layout.flat_positions,
+            compressed_positions={
+                ratio: request_layout.flat_positions[block_starts].unsqueeze(0)
+                for ratio, block_starts in block_starts_by_ratio.items()
+            },
+            cu_seqlens_q=cu_seqlens_q,
+            seqused=actual_seq_q,
+            start_pos=start_pos,
+            state_block_table=state_block_table,
+            state_cache=state_cache,
+        )
     return DeepSeekV4SMLAAttentionMasks(
-        cu_seqlens_q=lengths_to_cu_seqlens(actual_seq_q),
+        cu_seqlens_q=cu_seqlens_q,
         cu_seqlens_ori_kv=lengths_to_cu_seqlens(actual_seq_ori_kv),
         cu_seqlens_cmp_kv={ratio: lengths_to_cu_seqlens(lengths) for ratio, lengths in cmp_lengths.items()},
         cmp_residual_k={ratio: actual_seq_ori_kv - ratio * cmp_lengths[ratio] for ratio in residual_cmp_ratios},
         block_starts_by_ratio=block_starts_by_ratio,
+        compressor_metadata=compressor_metadata,
         max_seqlen_q=int(actual_seq_q.max().item()) if actual_seq_q.numel() > 0 else 0,
         max_seqlen_cmp_kv={
             ratio: int(lengths.max().item()) if lengths.numel() > 0 else 0 for ratio, lengths in cmp_lengths.items()
