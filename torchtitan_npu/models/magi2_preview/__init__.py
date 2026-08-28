@@ -15,6 +15,7 @@ from torchtitan.protocols.model_spec import ModelSpec
 
 from .model import Magi2PreviewModel
 from .parallelize import parallelize_magi2_preview
+from .pipeline_parallel import pipeline_magi2
 from .state_dict_adapter import Magi2PreviewStateDictAdapter
 
 
@@ -80,7 +81,7 @@ def model_registry(flavor: str) -> ModelSpec:
         flavor=flavor,
         model=model_config,
         parallelize_fn=parallelize_magi2_preview,
-        pipelining_fn=None,
+        pipelining_fn=pipeline_magi2,
         build_loss_fn=build_mse_loss,
         post_optimizer_build_fn=None,
         state_dict_adapter=Magi2PreviewStateDictAdapter,

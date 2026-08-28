@@ -54,9 +54,15 @@ class TrainerConfig(NpuTrainerConfig):
 def _parallelism() -> ParallelismConfig:
     """Return the MAGI-2-preview baseline parallel layout.
 
-    Only FSDP sharding is exercised end to end for now; tensor/pipeline/
-    context parallel are deferred and parallelize raises
-    NotImplementedError when any of them is enabled.
+    The baseline exercises FSDP sharding only; the other degrees are kept
+    at 1 but are implemented and can be enabled via CLI:
+
+    - ``tensor_parallel_degree``: sequence-replicated TP v1 (head/column
+      splits with all-reduced outputs; TP+CP and TP+EP raise for now).
+    - ``pipeline_parallel_degree``: ``pipeline_magi2`` stage splitting
+      (v1: single microbatch, GPipe for pp>1; PP+CP/TP/EP raise).
+    - ``context_parallel_degree``: Ulysses CP (sequence shards in original
+      token order; CP+EP raises until the combined head mesh lands).
 
     ``expert_parallel_degree`` is wired but kept at 1 in the baseline:
     setting it above 1 enables head-parallel MoE
@@ -65,8 +71,8 @@ def _parallelism() -> ParallelismConfig:
     expert_parallel_degree == 0``. That regime (a) assumes replicated
     tokens (zero-padded partial outputs all-reduced over the EP mesh); the
     Ulysses seq<->head all-to-all regime needs context parallelism, so EP
-    beyond it awaits CP. ``expert_tensor_parallel_degree`` must stay 1
-    until tensor parallelism exists (parallelize rejects TP).
+    beyond it awaits the CP+EP combination.
+    ``expert_tensor_parallel_degree`` must stay 1 (raises with TP/EP).
     """
     return ParallelismConfig(
         data_parallel_replicate_degree=1,

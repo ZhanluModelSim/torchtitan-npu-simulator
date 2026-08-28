@@ -78,7 +78,15 @@ MAGI-2-preview（sandai/magi-2-preview，114B 视频+音频扩散 MoE Transforme
     all-to-all，出口 autograd all-gather 并自动做 `1 / cp_degree` 梯度补偿，
     训练损失无需改动；要求序列长度与注意力头数均可被 `cp_degree` 整除）。
     CP 与 EP 暂不支持同时启用（显式报错）。
-  - TP/PP：逐步交付中（启用会显式报错说明）。
+  - TP：v1 为序列复制式张量并行（注意力头/专家头按 TP 切分，稠密与共享
+    专家按中间维切分并保持 swiglu7 gate/up 配对，行切分输出 all-reduce；
+    分组权重中无法用单一 DTensor 放置表达的部分以本地切片保存）。
+    TP+CP、TP+EP 暂不支持同时启用（显式报错）。
+  - PP：`pipeline_magi2` 级切分（stage 0 持 pre_adapter，末级持
+    post_adapter，flow-matching 损失在末级计算）。v1 限制：单微批
+    （`local_batch_size == pipeline_parallel_microbatch_size`），pp>1
+    使用 GPipe 调度，`num_layers % pp == 0`；PP+CP/TP/EP 暂不支持。
+  - 组合限制外的其他并行组合会显式报错说明。
 - 数据：合成 latent（冒烟）与离线真实 latent 数据集；在线编码不支持。
 - MoE 专家计算为按专家分段的纯 torch 实现（正确但非融合内核），全量 12×256
   规模建议配合 converter/EP 交付后再上真实集群。

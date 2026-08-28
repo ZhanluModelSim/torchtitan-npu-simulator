@@ -471,9 +471,12 @@ class TestParallelize:
         )
         apply_fsdp.assert_called_once()
 
-    # tp_enabled is no longer deferred: _apply_tensor_parallel implements
-    # sequence-replicated TP v1 (see tests/unit_tests/models/test_magi2_tp.py,
-    # including the tp+cp/ep/etp combination guards).
+    # pp_enabled is no longer deferred: pipeline_magi2 implements it
+    # (see tests/unit_tests/models/test_magi2_pp.py, including the
+    # pp-alone-runs path and the pp+cp/tp/ep combination guards).
+    # tp_enabled is no longer deferred either: _apply_tensor_parallel
+    # implements sequence-replicated TP v1 (see tests/unit_tests/models/
+    # test_magi2_tp.py, including the tp+cp/ep/etp combination guards).
 
     def test_tp_enabled_invokes_tensor_parallel(self):
         from torchtitan_npu.models.magi2_preview.parallelize import (
