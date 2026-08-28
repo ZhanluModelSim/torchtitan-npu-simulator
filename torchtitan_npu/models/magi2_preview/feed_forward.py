@@ -19,6 +19,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.distributed.tensor import DTensor
 
 from torchtitan.protocols.module import Module
 
@@ -26,6 +27,18 @@ from .grouped_linear import GroupedLinear
 from .norms import MultiModalityRMSNorm
 
 logger = logging.getLogger(__name__)
+
+
+def _maybe_local(tensor: torch.Tensor) -> torch.Tensor:
+    """Return the local shard of a DTensor, or the tensor itself.
+
+    Head-parallel MoE (see ``expert_parallel.py``) replaces the fused
+    expert tensors with ``Shard(0)`` DTensors over the expert mesh; the
+    routing/expert math always runs on the plain local shard.
+    """
+    if isinstance(tensor, DTensor):
+        return tensor.to_local()
+    return tensor
 
 
 def swiglu7(
@@ -153,7 +166,8 @@ class Magi2Router(nn.Module):
         gate_f = gate.view(num_heads, num_experts, -1).float()
         logits = torch.einsum("shd,hed->hse", x_heads.float(), gate_f)
         scores = torch.sigmoid(logits)
-        biased = scores + self.expert_bias.view(num_heads, 1, num_experts)
+        expert_bias = _maybe_local(self.expert_bias)
+        biased = scores + expert_bias.view(num_heads, 1, num_experts)
         topk_indices = biased.topk(self.top_k, dim=-1).indices
         # Unbiased probs: gather from the scores *without* expert_bias.
         topk_probs = scores.gather(-1, topk_indices)
@@ -166,13 +180,25 @@ class Magi2Router(nn.Module):
 class CoreMultiHeadMoE(Module):
     """Multi-head MoE core: per-head sigmoid routing over flattened experts.
 
-    Expert weights are stored flattened, expert-major: ``gate`` is
+    Expert weights are stored flattened, head-major: ``gate`` is
     ``(H * E, d_head)`` fp32, ``W_gate`` / ``W_up`` are
     ``(H * E, d_head, d_expert)`` and ``W_down`` is
-    ``(H * E, d_expert, d_head)``; global expert id is ``h * E + e``.
+    ``(H * E, d_expert, d_head)``; global expert id is ``h * E + e``, so
+    head ``h`` owns the contiguous row range ``[h * E, (h + 1) * E)``.
     Tokens are grouped per head by expert id (argsort + segment boundaries)
     and accumulated with ``index_add_`` so the whole path is autograd
     friendly. Routing runs in fp32; expert matmuls run in parameter dtype.
+
+    Head-parallel sharding (see ``expert_parallel.py``) is expressed via
+    the ``head_range`` attribute. When it is ``None`` (default), the module
+    owns all ``H`` heads and behaves exactly as the unsharded model. When
+    it is ``(head_start, head_end)``, the expert params/buffers already
+    hold only the local heads (leading dim ``(head_end - head_start) * E``,
+    e.g. a ``Shard(0)`` DTensor local shard) and ``forward`` routes and
+    computes only those heads of the full-width input ``(T, H * d_head)``,
+    returning the partial output ``(T, (head_end - head_start) * d_head)``;
+    assembling the full-width result is the caller's job (regime (a)
+    zero-pad + all-reduce, or regime (b) Ulysses all-to-all).
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -216,6 +242,24 @@ class CoreMultiHeadMoE(Module):
             route_norm=self.route_norm,
             route_scale=self.route_scale,
         )
+        # Head-parallel sharding state (see ``expert_parallel.py``); None
+        # keeps the full-head behavior, a range restricts routing and expert
+        # compute to that contiguous global-head slice.
+        self.head_range: tuple[int, int] | None = None
+
+    def set_head_range(self, head_range: tuple[int, int]) -> None:
+        """Restrict routing/expert compute to ``[head_start, head_end)``.
+
+        The expert params/buffers must already hold only the local heads
+        (leading dim ``(head_end - head_start) * num_experts``).
+        """
+        head_start, head_end = head_range
+        if not 0 <= head_start < head_end <= self.num_heads:
+            raise ValueError(
+                f"head_range {head_range} must satisfy "
+                f"0 <= start < end <= num_heads={self.num_heads}"
+            )
+        self.head_range = (head_start, head_end)
 
     def _expert_forward(
         self,
@@ -223,18 +267,25 @@ class CoreMultiHeadMoE(Module):
         topk_probs: torch.Tensor,
         topk_indices: torch.Tensor,
     ) -> torch.Tensor:
-        # Expert matmuls run in parameter dtype (routing stays fp32).
-        x_heads = x_heads.to(self.W_gate.dtype)
+        # Expert matmuls run in parameter dtype (routing stays fp32). Under
+        # head-parallel sharding the params are DTensor local shards already
+        # holding only the local heads, so expert row ``h * E + e`` here is
+        # LOCAL head ``h`` (global head ``head_start + h``).
+        w_gate = _maybe_local(self.W_gate)
+        w_up = _maybe_local(self.W_up)
+        w_down = _maybe_local(self.W_down)
+        x_heads = x_heads.to(w_gate.dtype)
         num_tokens = x_heads.shape[0]
+        local_num_heads = topk_indices.shape[0]
         out = torch.zeros(
-            (num_tokens, self.num_heads, self.d_head),
+            (num_tokens, local_num_heads, self.d_head),
             dtype=torch.float32,
             device=x_heads.device,
         )
         token_ids = torch.arange(
             num_tokens, device=x_heads.device
         ).repeat_interleave(self.top_k)
-        for h in range(self.num_heads):
+        for h in range(local_num_heads):
             expert_ids = topk_indices[h].reshape(-1)
             probs = topk_probs[h].reshape(-1)
             order = expert_ids.argsort(stable=True)
@@ -252,9 +303,9 @@ class CoreMultiHeadMoE(Module):
                 expert_id = h * self.num_experts + e
                 xs = x_heads[toks, h, :]
                 h_act = swiglu7(
-                    xs @ self.W_gate[expert_id], xs @ self.W_up[expert_id]
+                    xs @ w_gate[expert_id], xs @ w_up[expert_id]
                 )
-                contrib = h_act.to(xs.dtype) @ self.W_down[expert_id]
+                contrib = h_act.to(xs.dtype) @ w_down[expert_id]
                 out[:, h, :].index_add_(
                     0, toks, contrib.float() * p.unsqueeze(-1)
                 )
@@ -262,10 +313,17 @@ class CoreMultiHeadMoE(Module):
         return out
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.head_range is None:
+            head_start, local_num_heads = 0, self.num_heads
+        else:
+            head_start, head_end = self.head_range
+            local_num_heads = head_end - head_start
         x_heads = x.view(-1, self.num_heads, self.d_head)
-        topk_probs, topk_indices = self.router(x_heads, self.gate)
+        if local_num_heads != self.num_heads:
+            x_heads = x_heads[:, head_start : head_start + local_num_heads]
+        topk_probs, topk_indices = self.router(x_heads, _maybe_local(self.gate))
         out = self._expert_forward(x_heads, topk_probs, topk_indices)
-        return out.to(x.dtype).reshape(-1, self.num_heads * self.d_head)
+        return out.to(x.dtype).reshape(-1, local_num_heads * self.d_head)
 
 
 class MultiHeadMoELayer(Module):

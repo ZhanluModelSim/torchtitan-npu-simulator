@@ -54,9 +54,19 @@ class TrainerConfig(NpuTrainerConfig):
 def _parallelism() -> ParallelismConfig:
     """Return the MAGI-2-preview baseline parallel layout.
 
-    Only FSDP sharding is supported for now; tensor/pipeline/context/expert
-    parallel are deferred and parallelize raises NotImplementedError when any
-    of them is enabled.
+    Only FSDP sharding is exercised end to end for now; tensor/pipeline/
+    context parallel are deferred and parallelize raises
+    NotImplementedError when any of them is enabled.
+
+    ``expert_parallel_degree`` is wired but kept at 1 in the baseline:
+    setting it above 1 enables head-parallel MoE
+    (``parallelize._apply_moe_parallel``), which shards every routed-MoE
+    layer along the head axis and requires ``moe_num_heads %
+    expert_parallel_degree == 0``. That regime (a) assumes replicated
+    tokens (zero-padded partial outputs all-reduced over the EP mesh); the
+    Ulysses seq<->head all-to-all regime needs context parallelism, so EP
+    beyond it awaits CP. ``expert_tensor_parallel_degree`` must stay 1
+    until tensor parallelism exists (parallelize rejects TP).
     """
     return ParallelismConfig(
         data_parallel_replicate_degree=1,
