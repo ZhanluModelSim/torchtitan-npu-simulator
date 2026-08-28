@@ -471,23 +471,36 @@ class TestParallelize:
         )
         apply_fsdp.assert_called_once()
 
-    @pytest.mark.parametrize(
-        "flag",
-        ("pp_enabled", "tp_enabled"),
-    )
-    def test_deferred_parallelism_raises(self, flag):
+    # tp_enabled is no longer deferred: _apply_tensor_parallel implements
+    # sequence-replicated TP v1 (see tests/unit_tests/models/test_magi2_tp.py,
+    # including the tp+cp/ep/etp combination guards).
+
+    def test_tp_enabled_invokes_tensor_parallel(self):
         from torchtitan_npu.models.magi2_preview.parallelize import (
             parallelize_magi2_preview,
         )
 
-        with pytest.raises(NotImplementedError):
+        tp_mesh = MagicMock()
+        parallel_dims = _mock_parallel_dims(
+            tp_enabled=True,
+            tp=2,
+            get_mesh=lambda dims: tp_mesh if dims == "tp" else MagicMock(),
+        )
+        mock_model = MagicMock()
+        with patch(
+            "torchtitan_npu.models.magi2_preview.parallelize."
+            "_apply_tensor_parallel"
+        ) as apply_tp, patch(
+            "torchtitan_npu.models.magi2_preview.parallelize._apply_fsdp"
+        ):
             parallelize_magi2_preview(
-                MagicMock(),
+                mock_model,
                 **_parallelize_kwargs(
-                    _mock_parallel_dims(**{flag: True}),
-                    SimpleNamespace(mode="none"),
+                    parallel_dims, SimpleNamespace(mode="none")
                 ),
             )
+
+        apply_tp.assert_called_once_with(mock_model, tp_mesh=tp_mesh)
 
     def test_cp_enabled_invokes_ulysses_wiring(self):
         from torchtitan_npu.models.magi2_preview.parallelize import (

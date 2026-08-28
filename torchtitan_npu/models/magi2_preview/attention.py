@@ -20,6 +20,18 @@ sequence<->head all-to-all swaps and the RoPE gather are applied as hooks
 on the parameter-free ``attn_core`` submodule (or inline when a
 ``cp_context`` is passed to forward directly), so RoPE is applied after
 the swap and every attention backend stays usable under CP.
+
+Tensor parallelism: ``parallelize._apply_tensor_parallel`` splits the
+attention heads across the tp mesh with the sequence REPLICATED (v1 has
+no sequence parallel; Shard(seq) norm-boundary layouts like kimi's are a
+later optimization). Per rank: ``linear_g`` and ``linear_qkv`` keep only
+the local heads' out rows of every modality expert (the qkv section
+layout ``(3, heads, head_dim)`` is sliced per section), ``linear_proj``
+keeps only the local heads' input columns and its partial output is
+all-reduced at the module boundary, ``sinks`` is head-sharded on dim 1,
+the replicated q/k norms are unchanged (their gain is per head_dim and
+broadcasts over heads), and ``num_heads`` becomes the rank-local head
+count. Combining TP with CP raises in parallelize (v1).
 """
 
 import logging
@@ -35,7 +47,7 @@ from torchtitan.protocols.module import Module
 if TYPE_CHECKING:
     from .cp_ulysses import CpContext
 
-from .grouped_linear import GroupedLinear
+from .grouped_linear import GroupedLinear, _maybe_local
 from .norms import MultiModalityRMSNorm
 
 logger = logging.getLogger(__name__)
@@ -156,6 +168,15 @@ class Magi2Attention(Module):
     swap the core output back; ``sinks`` is head-sharded by the style.
     ``forward`` also accepts an explicit ``cp_context`` argument for
     hook-free CP invocations (used by single-process tests).
+
+    TP mode (sequence replicated): installed by
+    ``parallelize._apply_tensor_parallel`` — the projections and ``sinks``
+    are replaced with rank-local head shards (DTensor where a single
+    placement expresses the slice, plain local slices otherwise; state
+    dict keys unchanged), ``num_heads`` is the rank-local head count and
+    forward runs unchanged on local heads; module-boundary hooks all-reduce
+    the input gradient (replicated stream) and the ``linear_proj`` partial
+    output.
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -321,8 +342,11 @@ class Magi2Attention(Module):
         else:
             bounds = list(cu_seqlens)
 
-        num_sinks = self.sinks.shape[0]
-        sink_logits = self.sinks.t()  # (num_heads, num_sinks)
+        # TP shards sinks on the head dim (DTensor); the math runs on the
+        # local shard, whose head axis matches the local-head q/k/v.
+        sinks = _maybe_local(self.sinks)
+        num_sinks = sinks.shape[0]
+        sink_logits = sinks.t()  # (num_heads, num_sinks)
 
         outputs = []
         for start, end in zip(bounds[:-1], bounds[1:], strict=True):
@@ -406,7 +430,8 @@ class Magi2Attention(Module):
         num_segments = lengths.numel()
         segments = torch.arange(num_segments, dtype=torch.int32, device=device)
         doc_id = torch.repeat_interleave(segments, lengths)
-        num_sinks = self.sinks.shape[0]
+        # Dim 0 is never sharded, so the local and global counts agree.
+        num_sinks = _maybe_local(self.sinks).shape[0]
         kv_doc = torch.cat(
             [doc_id, torch.repeat_interleave(segments, num_sinks)]
         )
@@ -432,7 +457,8 @@ class Magi2Attention(Module):
         )
 
         T, num_heads, head_dim = q.shape
-        num_sinks = self.sinks.shape[0]
+        sinks = _maybe_local(self.sinks)
+        num_sinks = sinks.shape[0]
         num_segments, doc_id, kv_doc = self._sink_key_layout(
             T, q.device, cu_seqlens
         )
@@ -447,7 +473,7 @@ class Magi2Attention(Module):
         # replace them with the learned sink logits. score_mod receives
         # already-scaled scores, so the logits are used as-is, exactly like
         # the sink columns of the "sdpa" path.
-        sink_logits = self.sinks.t().to(q.dtype)  # (num_heads, num_sinks)
+        sink_logits = sinks.t().to(q.dtype)  # (num_heads, num_sinks)
 
         def score_mod(score, b, h, q_idx, kv_idx):
             return torch.where(
@@ -490,7 +516,8 @@ class Magi2Attention(Module):
         sink columns while blocking cross-segment pairs.
         """
         T, num_heads, head_dim = q.shape
-        num_sinks = self.sinks.shape[0]
+        sinks = _maybe_local(self.sinks)
+        num_sinks = sinks.shape[0]
         num_segments, doc_id, kv_doc = self._sink_key_layout(
             T, q.device, cu_seqlens
         )
@@ -500,7 +527,7 @@ class Magi2Attention(Module):
 
         # Per-(head, kv-col) additive score contribution: 0 for real keys,
         # the learned sink logit for sink keys (their qk score is 0).
-        sink_logits = self.sinks.t().to(q.dtype)  # (num_heads, num_sinks)
+        sink_logits = sinks.t().to(q.dtype)  # (num_heads, num_sinks)
         sink_col_idx = torch.arange(num_sink_keys, device=q.device) % num_sinks
         col_bias = torch.cat(
             [sink_logits.new_zeros(num_heads, T), sink_logits[:, sink_col_idx]],

@@ -19,26 +19,13 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 from torch import nn
-from torch.distributed.tensor import DTensor
 
 from torchtitan.protocols.module import Module
 
-from .grouped_linear import GroupedLinear
+from .grouped_linear import GroupedLinear, _maybe_local
 from .norms import MultiModalityRMSNorm
 
 logger = logging.getLogger(__name__)
-
-
-def _maybe_local(tensor: torch.Tensor) -> torch.Tensor:
-    """Return the local shard of a DTensor, or the tensor itself.
-
-    Head-parallel MoE (see ``expert_parallel.py``) replaces the fused
-    expert tensors with ``Shard(0)`` DTensors over the expert mesh; the
-    routing/expert math always runs on the plain local shard.
-    """
-    if isinstance(tensor, DTensor):
-        return tensor.to_local()
-    return tensor
 
 
 def swiglu7(
@@ -195,10 +182,18 @@ class CoreMultiHeadMoE(Module):
     it is ``(head_start, head_end)``, the expert params/buffers already
     hold only the local heads (leading dim ``(head_end - head_start) * E``,
     e.g. a ``Shard(0)`` DTensor local shard) and ``forward`` routes and
-    computes only those heads of the full-width input ``(T, H * d_head)``,
-    returning the partial output ``(T, (head_end - head_start) * d_head)``;
-    assembling the full-width result is the caller's job (regime (a)
-    zero-pad + all-reduce, or regime (b) Ulysses all-to-all).
+    computes only those heads, returning the partial output
+    ``(T, (head_end - head_start) * d_head)``; assembling the full-width
+    result is the caller's job (regime (a) zero-pad + all-reduce, regime
+    (b) Ulysses all-to-all, or the TP ``merge_linear`` row split).
+
+    Input modes under head sharding (``sharded_input``):
+    - ``False`` (EP regime (a), the default): the input is replicated and
+      full width ``(T, H * d_head)``; forward slices out the local heads'
+      columns.
+    - ``True`` (TP): the column-split ``split_linear`` upstream already
+      emits only this rank's head columns ``(T, local_heads * d_head)``,
+      so forward views the input directly with no slicing.
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -246,12 +241,23 @@ class CoreMultiHeadMoE(Module):
         # keeps the full-head behavior, a range restricts routing and expert
         # compute to that contiguous global-head slice.
         self.head_range: tuple[int, int] | None = None
+        # False (EP regime a): the input is replicated full-width and the
+        # local heads' columns are sliced in forward. True (TP): the input
+        # already carries only the local heads' columns.
+        self.sharded_input = False
 
-    def set_head_range(self, head_range: tuple[int, int]) -> None:
+    def set_head_range(
+        self,
+        head_range: tuple[int, int],
+        *,
+        sharded_input: bool = False,
+    ) -> None:
         """Restrict routing/expert compute to ``[head_start, head_end)``.
 
         The expert params/buffers must already hold only the local heads
         (leading dim ``(head_end - head_start) * num_experts``).
+        ``sharded_input`` selects the input mode documented on the class
+        (full-width replicated vs. already head-column-sliced).
         """
         head_start, head_end = head_range
         if not 0 <= head_start < head_end <= self.num_heads:
@@ -260,6 +266,7 @@ class CoreMultiHeadMoE(Module):
                 f"0 <= start < end <= num_heads={self.num_heads}"
             )
         self.head_range = (head_start, head_end)
+        self.sharded_input = sharded_input
 
     def _expert_forward(
         self,
@@ -318,9 +325,14 @@ class CoreMultiHeadMoE(Module):
         else:
             head_start, head_end = self.head_range
             local_num_heads = head_end - head_start
-        x_heads = x.view(-1, self.num_heads, self.d_head)
-        if local_num_heads != self.num_heads:
-            x_heads = x_heads[:, head_start : head_start + local_num_heads]
+        if local_num_heads != self.num_heads and self.sharded_input:
+            # TP: the input already holds only the local heads' columns
+            # (column-split ``split_linear`` output).
+            x_heads = x.view(-1, local_num_heads, self.d_head)
+        else:
+            x_heads = x.view(-1, self.num_heads, self.d_head)
+            if local_num_heads != self.num_heads:
+                x_heads = x_heads[:, head_start : head_start + local_num_heads]
         topk_probs, topk_indices = self.router(x_heads, _maybe_local(self.gate))
         out = self._expert_forward(x_heads, topk_probs, topk_indices)
         return out.to(x.dtype).reshape(-1, local_num_heads * self.d_head)
