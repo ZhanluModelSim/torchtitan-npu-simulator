@@ -21,7 +21,7 @@ from torchtitan_npu.config import (
     TrainingConfig as NPUTrainingConfig,
 )
 from torchtitan_npu.distributed import utils as distributed_utils
-from torchtitan_npu.extension.trainer import TrainerEx
+from torchtitan_npu.extensions.trainer import TrainerEx
 
 
 def test_from_trainer_config_wraps_training_extension():

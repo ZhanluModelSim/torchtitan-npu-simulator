@@ -61,7 +61,7 @@ extension.<config-group>.<field>
 ```python
 from dataclasses import dataclass, field
 
-from torchtitan_npu.extension.trainer import TrainerEx
+from torchtitan_npu.extensions.trainer import TrainerEx
 
 
 @dataclass(kw_only=True, slots=True)

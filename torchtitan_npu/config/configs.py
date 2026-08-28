@@ -11,7 +11,7 @@ from typing import Any, ClassVar, Literal
 from torchtitan.config import TrainingConfig as _BaseTrainingConfig
 from torchtitan.trainer import Trainer
 
-from torchtitan_npu.extension.trainer import TrainerEx
+from torchtitan_npu.extensions.trainer import TrainerEx
 
 QuantizationRecipe = Literal["all_mxfp8", "mix", "all_block_fp8"]
 

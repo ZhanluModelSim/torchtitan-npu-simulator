@@ -12,6 +12,9 @@ from torchtitan_npu import (
     config as _config,  # noqa: F401
 )
 from torchtitan_npu import (
+    extensions as _extensions,  # noqa: F401
+)
+from torchtitan_npu import (
     ops as _ops,  # noqa: F401
 )
 from torchtitan_npu import (

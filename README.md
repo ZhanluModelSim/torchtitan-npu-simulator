@@ -151,7 +151,7 @@ pip install -e .
 
 # 项目结构
 
-`torchtitan-npu` 是 `torchtitan` 的 Ascend NPU 适配层，主要通过两类机制扩展上游能力：`override/` 使用配置级 `@override` 替换组件，并通过 `override.imports` 显式启用；`patches/` 补齐 PyTorch NPU backend 缺口，以及当前依赖版本尚未包含的临时上游能力。模型实现与并行化策略放在 `models/`，CANN 和设备专属算子封装放在 `ops/`。
+`torchtitan-npu` 是 `torchtitan` 的 Ascend NPU 适配层，主要通过三类机制扩展上游能力：`override/` 使用配置级 `@override` 替换组件，并通过 `override.imports` 显式启用；`patches/` 补齐 PyTorch NPU backend 缺口，以及当前依赖版本尚未包含的临时上游能力；`extensions/` 提供 NPU 的扩展能力。模型实现与并行化策略放在 `models/`，CANN 和设备专属算子封装放在 `ops/`。
 
 ```text
 torchtitan-npu/
@@ -160,13 +160,15 @@ torchtitan-npu/
 │   ├── override/
 │   │   ├── common/                # 模型无关的 NPU 组件替换
 │   │   ├── deepseek_v3_2/         # DeepSeek-V3.2 专属 override
-│   │   └── deepseek_v4/           # DeepSeek-V4 专属 override 与数值基线
+│   │   └── deepseek_v4/           # DeepSeek-V4 专属 override
 │   ├── patches/
 │   │   ├── torchtitan/            # 尚未进入当前上游版本的临时补丁
 │   │   └── workaround/            # NPU 运行时兼容处理
+│   ├── extensions/                # 随 package 导入自动生效的运行时扩展
 │   ├── ops/                       # CANN 与 NPU 专属算子封装
 │   │   └── ascendc/               # AscendC 算子适配（导入时自动加载）
-│   └── __init__.py                # 导入 package patch
+│   ├── __init__.py                # 导入 package patch 与 extension
+│   └── train.py                   # 训练入口
 ├── scripts/                       # 训练与仓库辅助脚本
 ├── tests/                         # 单元测试和测试数据
 └── docs/                          # 使用指南与设计说明

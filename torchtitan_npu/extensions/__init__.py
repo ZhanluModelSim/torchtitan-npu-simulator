@@ -3,11 +3,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""NPU-aware torchtitan training entry point."""
+"""extensions for torchtitan-npu."""
 
-from torchtitan.train import main
-
-import torchtitan_npu  # noqa: F401
-
-if __name__ == "__main__":
-    main()
+from . import (
+    ep_process_group,  # noqa: F401
+)

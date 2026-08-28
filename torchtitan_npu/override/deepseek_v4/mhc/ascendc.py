@@ -63,6 +63,7 @@ class AscHcPre(HcPre):
             norm_eps=self.norm_eps,
             hc_eps=self.eps,
             out_flag=1,
+            inner_precise=1,
         )
         h_res, _, _ = torch_npu.npu_mhc_sinkhorn(
             h_res,
