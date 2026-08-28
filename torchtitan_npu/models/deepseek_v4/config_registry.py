@@ -23,7 +23,10 @@ from torchtitan.protocols.model_spec import ModelSpec
 from torchtitan.tools.profiler import Profiler
 from torchtitan.trainer import Trainer
 
-from . import model_registry
+from . import (
+    memory_policy,  # noqa: F401
+    model_registry,
+)
 from .model import GraphTrainerDeepSeekV4Model
 from .parallelize import parallelize_graph_trainer_deepseek_v4
 
