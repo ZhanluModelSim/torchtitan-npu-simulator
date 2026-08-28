@@ -105,6 +105,7 @@ python -m pre_commit run --all-files --show-diff-on-failure
 
 ### 4. 测试与数值验证
 
+- 新增、修正、重构或 review 测试时，使用 `.agents/skills/developer-tests-review/` 选择「更新测试」或「review测试」 workflow；前者修改并执行相关测试，后者只做静态审查，不修改或执行测试。
 - Python 逻辑改动至少运行相关单元测试；CPU 单测使用 `TORCH_DEVICE_BACKEND_AUTOLOAD=0 python -m pytest -v --tb=short tests/unit_tests -x`。
 - 涉及分布式、NPU kernel、override、patch 或模型训练行为时，补充对应 NPU 冒烟或集成测试。
 - 数值验证：
