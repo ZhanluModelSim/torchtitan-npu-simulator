@@ -604,14 +604,17 @@ class CPTokenDispatcher(Configurable):
     def select(self, x: torch.Tensor, plan: CompressedBlockLayout) -> torch.Tensor:
         """The plan-indexed container packing: selects the pooled stream's
         ``compressed_rows`` (the kept blocks) and zero-pads them into the
-        uniform container grid ``[1, out_width, D]``."""
+        uniform container grid ``[1, out_width, D]``.
+
+        Functional padding (``torch.cat``): a pre-allocated zero container
+        filled behind a data-dependent ``if out.shape[0]:`` is rejected by
+        the tracer and dropped by aot_autograd recompute.
+        """
         # Flatten only the batch+sequence of the 3-D tensors; the 2-D
         # pooled streams select directly.
         x2 = x.flatten(0, 1) if x.ndim > 2 else x
         out = x2 if plan.compressed_rows is None else x2[plan.compressed_rows]
         out_width = plan.out_width
         assert out_width is not None, "select requires the container width"
-        container = x.new_zeros((1, out_width, x.shape[-1]))
-        if out.shape[0]:
-            container[0, : out.shape[0]] = out
-        return container
+        pad = x.new_zeros((out_width - out.shape[0], x.shape[-1]))
+        return torch.cat([out, pad], dim=0).unsqueeze(0)

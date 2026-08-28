@@ -42,6 +42,7 @@ from torchtitan_npu.models.deepseek_v4.attention import CompressedSparseInnerAtt
 from torchtitan_npu.models.deepseek_v4.metadata import (
     CompressedBlockLayout,
     CompressedVarlenMetadata,
+    register_pytree_node_for_dataclass,
 )
 from torchtitan_npu.override import _IS_A5
 
@@ -113,6 +114,12 @@ class AscCompressedVarlenMetadata(CompressedVarlenMetadata):
     """
 
     asc_plans: dict[int, AscBlockLayoutMetadata] = field(default_factory=dict)
+
+
+# Register the fused-path slim metadata as pytree nodes (see
+# ``register_pytree_node_for_dataclass`` in metadata.py).
+register_pytree_node_for_dataclass(AscBlockLayoutMetadata)
+register_pytree_node_for_dataclass(AscCompressedVarlenMetadata)
 
 
 def _fill_asc_metadata(
@@ -230,6 +237,11 @@ def _mark_dynamic(metadata: AscCompressedVarlenMetadata) -> None:
         ]
     for tensor in tensors:
         torch._dynamo.maybe_mark_dynamic(tensor, 0)
+        # Written via setattr: "_dynamo_unbacked_indices" is the dynamo shape
+        # annotation the GraphTrainer tracer reads (torchtitan
+        # experiments/graph_trainer/dynamic_shapes.py); the underscore name is
+        # deliberate and must stay off the codecheck protected-member list.
+        setattr(tensor, "_dynamo_unbacked_indices", {0})  # noqa: B010
 
 
 class AscMetadataExtension(MetadataExtension):
@@ -555,7 +567,9 @@ class _SparseFlashMLATND(torch.autograd.Function):
             )
             ctx.indexer_loss_accumulator.add_(li_loss.detach())
         query_rows = cmp_softmax_l1.sum(dim=-1).numel()
-        grad_scale = ctx.indexer_loss_coeff * ctx.softmax_scale / float(query_rows)
+        # Keep the row count symbolic while GraphTrainer captures sequence
+        # chunks; converting it to float creates a data-shape guard.
+        grad_scale = ctx.indexer_loss_coeff * ctx.softmax_scale / query_rows
         didx_q = (didx_q * grad_scale).to(idx_q.dtype)
         didx_k = (didx_k * grad_scale).to(idx_k.dtype)
         didx_w = (didx_w * grad_scale).to(idx_w.dtype)

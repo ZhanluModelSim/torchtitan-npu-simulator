@@ -103,8 +103,19 @@ class Compressor(Module):
         """
         assert state.size(-1) % 2 == 0, "the overlap window needs the 2*head_dim split"
         head_dim = state.size(-1) // 2
-        state_a = torch.roll(state[:, :, :head_dim], 1, 0)
-        state_a[first_indices] = value
+        n_blocks = state.size(0)
+        # Functional roll/fill (gather + ``torch.where``) instead of
+        # ``torch.roll`` + in-place scatter: the in-place write is dropped by
+        # aot_autograd recompute and its data-dependent guard trips make_fx.
+        prev_idx = (torch.arange(n_blocks, device=state.device) - 1).clamp_min(0)
+        state_a = state[prev_idx, :, :head_dim]
+        first_mask = torch.index_fill(
+            torch.zeros(n_blocks, dtype=torch.bool, device=state.device),
+            0,
+            first_indices,
+            True,
+        )
+        state_a = torch.where(first_mask.view(-1, 1, 1), state.new_full((1,), value), state_a)
         state_b = state[:, :, head_dim:]
         return torch.cat([state_a, state_b], dim=1)
 
@@ -140,11 +151,13 @@ class Compressor(Module):
         with torch.autocast(device_type=x.device.type, dtype=torch.float32):
             kv_rows = self.token_dispatcher.gather(self.wkv(x), plan).flatten(0, 1)
             score_rows = self.token_dispatcher.gather(self.wgate(x), plan).flatten(0, 1)
-        if kv_rows.numel() == 0:
-            return x.new_zeros((0, self.head_dim))
-        n_blocks = kv_rows.shape[0] // ratio
-        kv = kv_rows.reshape(n_blocks, ratio, -1)
-        score = score_rows.reshape(n_blocks, ratio, -1) + self.ape
+        # Block count from the plan's (dynamic) gather_indices, not the
+        # gathered rows' runtime shape, which would specialize the trace.
+        # An empty plan flows through reshape(0, ...) without a numel() guard.
+        n_blocks = plan.gather_indices.numel() // ratio
+        # Explicit last dim: a ``-1`` fold trips a data-dependent guard.
+        kv = kv_rows.reshape(n_blocks, ratio, kv_rows.size(-1))
+        score = score_rows.reshape(n_blocks, ratio, score_rows.size(-1)) + self.ape
         first_indices = plan.first_indices
         block_positions = plan.block_positions
         assert first_indices is not None and block_positions is not None, (

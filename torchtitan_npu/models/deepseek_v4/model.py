@@ -236,3 +236,28 @@ class DeepSeekV4Model(Decoder):
         # Follow the dsv3/common-decoder convention: lm_head stays in BF16
         # (checkpoint dtype) and is applied as a plain module call.
         return self.lm_head(h)
+
+
+class GraphTrainerDeepSeekV4Model(DeepSeekV4Model):
+    """DeepSeek V4 model variant for the GraphTrainer compilation path.
+
+    Wraps ``init_states`` with ``disable_active_parametrization`` so that
+    lazy-init parametrizations (e.g., RoPE freq buffers) are materialized
+    before the FX tracer records the graph.
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(DeepSeekV4Model.Config):
+        pass
+
+    def init_states(
+        self,
+        *,
+        buffer_device: torch.device | None = None,
+    ) -> None:
+        from torchtitan.experiments.graph_trainer.simple_fsdp import (
+            disable_active_parametrization,
+        )
+
+        with disable_active_parametrization():
+            super().init_states(buffer_device=buffer_device)

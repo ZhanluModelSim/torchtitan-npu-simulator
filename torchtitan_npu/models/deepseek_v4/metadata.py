@@ -39,8 +39,8 @@ compressed region is the concatenation of its documents' complete blocks,
 padded to ``S // ratio`` slots.
 """
 
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from dataclasses import dataclass, fields
+from typing import TYPE_CHECKING, Any, Protocol, cast, runtime_checkable
 
 import torch
 from torchtitan.models.common.attention import VarlenMetadata
@@ -323,3 +323,44 @@ def build_compressed_varlen_metadata(
         plans=plans,
         seq_len_host=int(varlen.cu_seq_q[-1].item()),
     )
+
+
+def register_pytree_node_for_dataclass(cls: type) -> None:
+    """Register a kw-only dataclass as a pytree node (idempotent).
+
+    The graph_trainer's ``minimal_fx_tracer`` requires every ``attention_masks``
+    leaf to be a tensor/primitive; an unregistered dataclass is rejected as a
+    single non-primitive leaf.
+    """
+    from torch.utils._pytree import SUPPORTED_NODES, GetAttrKey, KeyEntry, register_pytree_node
+
+    if cls in SUPPORTED_NODES:
+        return
+    field_names = [f.name for f in fields(cls)]
+
+    def flatten(obj):
+        return [getattr(obj, name) for name in field_names], None
+
+    def flatten_with_keys(obj) -> tuple[list[tuple[KeyEntry, Any]], None]:
+        # ``GetAttrKey`` is structurally assignable to the ``KeyEntry`` protocol
+        # at runtime, but pyrefly treats list as invariant, so cast the list.
+        keys = cast(
+            "list[tuple[KeyEntry, Any]]",
+            [(GetAttrKey(name), getattr(obj, name)) for name in field_names],
+        )
+        return keys, None
+
+    def unflatten(values, context):
+        return cls(**dict(zip(field_names, values, strict=True)))
+
+    register_pytree_node(
+        cls,
+        flatten,
+        unflatten,
+        flatten_with_keys_fn=flatten_with_keys,
+        serialized_type_name=f"{cls.__module__}.{cls.__name__}",
+    )
+
+
+register_pytree_node_for_dataclass(CompressedBlockLayout)
+register_pytree_node_for_dataclass(CompressedVarlenMetadata)

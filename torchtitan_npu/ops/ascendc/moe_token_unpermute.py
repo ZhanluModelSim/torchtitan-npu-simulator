@@ -3,7 +3,15 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Compile-safe custom op for MoE token unpermutation."""
+"""Compile-safe custom op for MoE token unpermutation.
+
+Backward (both eager and compiled):
+- probs present: native ``npu_moe_token_unpermute_grad`` (safe on zero-row
+  inputs).
+- probs=None (EP paths): exact ``scatter_add`` inverse — the native grad
+  crashes on zero-row inputs (error 561002), and neither ``torch.cond`` nor
+  a ``numel()==0`` guard survives the compile chain.
+"""
 
 __all__ = ["npu_moe_token_unpermute"]
 
@@ -50,14 +58,30 @@ def _npu_moe_token_unpermute_backward(ctx, grad_output):
         return None, None, None
 
     permuted_tokens, sorted_indices = ctx.saved_tensors
-    grad_tokens, grad_probs = torch_npu.npu_moe_token_unpermute_grad(
-        permuted_tokens,
+    probs = ctx.probs
+
+    if probs is not None:
+        # With probs present, CANN's MoeTokenUnpermuteGrad handles zero-row
+        # inputs (verified: an empty (0, K) probs tensor passes). Keep the
+        # native kernel for the weighted combine path.
+        grad_tokens, grad_probs = torch_npu.npu_moe_token_unpermute_grad(
+            permuted_tokens,
+            grad_output,
+            sorted_indices,
+            probs=probs,
+        )
+        return grad_tokens, None, grad_probs
+
+    # probs=None: a plain (unweighted) scatter; the backward is its exact
+    # inverse gather-scatter. The native grad crashes on zero-row inputs
+    # (error 561002), and a rank can legitimately receive zero tokens in EP.
+    grad_tokens = torch.zeros_like(permuted_tokens)
+    grad_tokens.scatter_add_(
+        0,
+        sorted_indices.unsqueeze(-1).expand(-1, permuted_tokens.size(1)),
         grad_output,
-        sorted_indices,
-        probs=ctx.probs,
     )
-    # Some torch_npu versions return a placeholder grad for omitted probs.
-    return grad_tokens, None, grad_probs if ctx.probs is not None else None
+    return grad_tokens, None, None
 
 
 npu_moe_token_unpermute.register_autograd(
