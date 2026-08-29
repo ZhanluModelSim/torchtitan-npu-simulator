@@ -12,15 +12,8 @@ from pathlib import Path
 
 import pytest
 
-ROOT = Path(__file__).resolve().parents[3]
-PARSER_PATH = (
-    ROOT
-    / ".agents"
-    / "skills"
-    / "training-log-visualization"
-    / "scripts"
-    / "train_log_plot.py"
-)
+ROOT = Path(__file__).resolve().parents[4]
+PARSER_PATH = ROOT / ".agents" / "skills" / "training-log-visualization" / "scripts" / "train_log_plot.py"
 
 
 def _load_parser_module():
@@ -35,6 +28,8 @@ def _load_parser_module():
 
 
 PARSER = _load_parser_module()
+
+pytestmark = pytest.mark.tooling
 
 
 def test_parser_supports_scientific_notation_and_nonfinite_values(tmp_path):

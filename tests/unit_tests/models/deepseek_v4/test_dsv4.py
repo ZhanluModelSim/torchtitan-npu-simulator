@@ -404,6 +404,23 @@ def test_layout_cu_seqs_and_remainders(dsv4):
     )
 
 
+def test_layout_host_cached_lengths(dsv4):
+    """Metadata builders cache scalar lengths before entering compiled layers.
+
+    The cached values must agree with the device-side cumulative-sequence
+    tensors: ``seq_len`` is the total token count and each compressed plan
+    records its document-wise complete-block count.  This guards the host
+    cache introduced to remove repeated ``.item()`` synchronizations.
+    """
+    varlen = VarlenMetadata(cu_seq_q=_CU, cu_seq_k=_CU.clone(), max_q=17, max_k=17)
+    md = dsv4.metadata.build_compressed_varlen_metadata(varlen, (1, 4, 128))
+    assert md.seq_len_host == 64
+    assert md.seq_len == 64
+    assert md.plans[1].n_cmp_blocks_host is None
+    assert md.plans[4].n_cmp_blocks_host == 15
+    assert md.plans[128].n_cmp_blocks_host == 0
+
+
 def test_layout_gather_indices(dsv4):
     p4 = _build_layout(dsv4, window_size=16).plans[4]
     assert torch.equal(

@@ -20,7 +20,7 @@
 ## 插件仓专属原则
 
 1. **不修改上游 checkout。** torchtitan-npu 不直接编辑 torchtitan 源码。适配按职责放入以下位置：
-   - **Package patch**（`torchtitan_npu/patches/`）：补齐 PyTorch PrivateUse1 backend，或临时替换当前上游版本中的 Python 符号
+   - **Package patch**（`torchtitan_npu/patches/`）：补齐 PyTorch PrivateUse1 backend，或替换当前运行时中缺失的 Python/CANN 符号。`patches/torchtitan/` 只允许有上游依据的临时 patch；`patches/torch_npu/` 和 `patches/workaround/` 用于当前有效的 NPU runtime compatibility patch
    - **配置级 override**（`torchtitan_npu/override/`）：使用 `@override` 声明组件替换，通过 `override.imports` 显式启用
    - **模型模块**（`torchtitan_npu/models/`）：提供 DeepSeek-V3.2 和 DeepSeek-V4 的模型配置、并行化与 checkpoint 适配
    - **NPU 算子**（`torchtitan_npu/ops/`）：封装 CANN 或设备专属算子能力
@@ -32,6 +32,8 @@
 4. **固定上游基线。** 当前 torchtitan commit 同时记录在 `requirements.txt` 和 `.ci/lint.sh`。调整上游版本时同步更新两处，并检查 patch 目标、函数签名、模型接口和测试是否仍有效。
 
 5. **临时 patch 可删除。** `torchtitan_npu/patches/torchtitan/` 只保存已提交上游但当前依赖版本尚未包含的临时补丁。补丁文件必须记录对应 PR；上游合入并更新依赖后删除相关补丁和导入。
+
+6. **测试目录与执行入口同时维护。** `tests/unit_tests/` 是 CPU 测试的统一执行根；生产语义测试按 `torchtitan_npu/` 镜像，仓库脚本和 skill 自测放在 `tests/unit_tests/tooling/`，执行时不计入产品 UT 覆盖。NPU 模型 ST 只放在 `tests/integration_tests/`，不以 CPU UT、kernel smoke 或 runner 自测替代。详细的目录迁移方案见 [`docs/developer_guides/unit-test-architecture.md`](../docs/developer_guides/unit-test-architecture.md)，低价值测试筛选见 [`docs/developer_guides/low-value-ut-principles.md`](../docs/developer_guides/low-value-ut-principles.md)。
 
 ## 代码风格（继承上游 torchtitan）
 
@@ -47,7 +49,8 @@
 
 | 目录 | 职责 |
 | --- | --- |
-| `torchtitan_npu/patches/` | 包导入时生效的 backend 注册、上游临时补丁和 workaround |
+| `torchtitan_npu/patches/torchtitan/` | 包导入时生效的上游临时补丁 |
+| `torchtitan_npu/patches/torch_npu/`、`workaround/` | 当前有效的 NPU runtime compatibility patch；保留其自动加载和生效时机 |
 | `torchtitan_npu/override/` | 通过 `override.imports` 显式启用的配置级组件替换 |
 | `torchtitan_npu/models/` | DeepSeek-V3.2、DeepSeek-V4 模型配置、实现、并行化和 checkpoint 适配 |
 | `torchtitan_npu/ops/` | CANN 与 NPU 专属算子封装 |

@@ -19,6 +19,7 @@ markers = [
     "cpu: CPU-only unit test",
     "smoke: NPU smoke test",
     "static: source and declaration contract test",
+    "tooling: repository tooling or skill self-test; excluded from product UT coverage",
 ]
 
 [tool.pyrefly]

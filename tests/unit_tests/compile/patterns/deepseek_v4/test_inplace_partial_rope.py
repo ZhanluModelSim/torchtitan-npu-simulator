@@ -186,11 +186,49 @@ def test_kv_rope_pattern_matches_layout():
     )
 
 
+def test_kv_replacement_matches_search_numerically(monkeypatch):
+    monkeypatch.setattr(
+        inplace_partial_rope,
+        "inplace_partial_rotary_mul",
+        _fake_inplace_partial_rotary_mul,
+    )
+    pattern = _make_kv_rope_pattern()
+    x = torch.randn(2, 3, 4, 4, dtype=torch.bfloat16)
+    angles = torch.randn(2, 3, 1, 4, 1)
+    cos = angles.cos().expand(2, 3, 1, 4, 2)
+    sin = angles.sin().expand_as(cos)
+
+    expected = pattern.search_fn(x, cos, sin)
+    actual = pattern.replacement_fn(x.clone(), cos, sin)
+
+    torch.testing.assert_close(actual, expected)
+
+
 def test_compressor_pattern_ignores_external_shape_consumers():
     _assert_pattern_matches(
         _make_compressor_rope_pattern(),
         _compressor_rope_with_shape_users,
     )
+
+
+def test_compressor_replacement_matches_search_numerically(monkeypatch):
+    monkeypatch.setattr(
+        inplace_partial_rope,
+        "inplace_partial_rotary_mul",
+        _fake_inplace_partial_rotary_mul,
+    )
+    pattern = _make_compressor_rope_pattern()
+    x = torch.randn(2, 3, 4, 4, dtype=torch.bfloat16)
+    prefix, rotary = torch.split(x, [2, 2], dim=-1)
+    rotary_u = rotary.unsqueeze(0).unsqueeze(2)
+    angles = torch.randn(1, 2, 1, 3, 4, 1)
+    cos = angles.cos().expand(1, 2, 1, 3, 4, 2)
+    sin = angles.sin().expand_as(cos)
+
+    expected = pattern.search_fn(prefix, rotary_u, cos, sin)
+    actual = pattern.replacement_fn(prefix, rotary_u.clone(), cos, sin)
+
+    torch.testing.assert_close(actual, expected)
 
 
 def test_replacement_does_not_repeat_rope_cache():

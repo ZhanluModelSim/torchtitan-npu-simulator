@@ -193,9 +193,9 @@ pytest tests/unit_tests
 | `test_cp_dispatch.py::test_asc_extension_cp_metadata` | AscendC metadata 内核的填充参数（窗口打包的 `cu_seqlens_ori_kv`） |
 | `test_cp_dispatch.py::test_cp_attention_flow` | 前向全流程的形状契约与容器内容（保留块 vs oracle） |
 | `test_cp_dispatch.py::test_multiprocess_gloo` | 真实双进程集合通信（不均衡 alltoallv、压缩级 all-gather）的分组与偏移语义 |
-| `test_cp_compressor.py`（矩阵） | 压缩数学本身：plain/headtail、cp 1~8、ratio 4/128，f32/f64 双精度矩阵；f64 预算在浮点噪声底（逐位量级），f32 在单精度舍入量级 |
-| `test_cp_compressor.py::test_degeneracy` | 计划推导的无漂移护栏：cp=1 的 `build_cp_plan` 与非 CP `build_kernel_layout` 五个契约字段逐位一致 |
-| `test_dsv4.py`（数值系列） | 非 CP 基线：压缩器对独立逐文档参考、重叠掩码逐位、索引器选择、参考内核对 golden 的舍入底比对 |
+| `tests/unit_tests/models/deepseek_v4/test_cp_compressor.py`（矩阵） | 压缩数学本身：plain/headtail、cp 1~8、ratio 4/128，f32/f64 双精度矩阵；f64 预算在浮点噪声底（逐位量级），f32 在单精度舍入量级 |
+| `tests/unit_tests/models/deepseek_v4/test_cp_compressor.py::test_degeneracy` | 计划推导的无漂移护栏：cp=1 的 `build_cp_plan` 与非 CP `build_kernel_layout` 五个契约字段逐位一致 |
+| `tests/unit_tests/models/deepseek_v4/test_dsv4.py`（数值系列） | 非 CP 基线：压缩器对独立逐文档参考、重叠掩码逐位、索引器选择、参考内核对 golden 的舍入底比对 |
 
 定位路径与「已知数值边界」对应：上述用例全部通过时，组装的数据与键对 oracle 一致，发散必然位于内核层（几何 / 选择 / 梯度三类来源）；任一失败则说明 CP 数据路径本身被改坏，按失败用例定位。
 

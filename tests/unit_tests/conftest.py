@@ -1,11 +1,12 @@
-"""Shared pytest fixtures for the DSV4 CPU unit tests.
+"""Shared pytest fixtures for the CPU unit-test suite.
 
 The plugin's model-dir and override host logic import against the real
 torchtitan checkout (env ``TORCHTITAN_DIR`` or the default) with the
 plugin's patches applied by the package chain.  The only faked surface is
 ``cann_ops_transformer`` (the NPU op boundary): the ``dsv4`` fixture
 installs the call recorder and lazily imports the model-dir/override
-modules.
+modules. Tooling tests also run below this directory, but remain separate from
+product UT accounting.
 """
 
 import os
@@ -18,9 +19,7 @@ import torch
 
 _REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(_REPO))
-sys.path.insert(
-    0, os.environ.get("TORCHTITAN_DIR", os.path.expanduser("~/workspace/torchtitan"))
-)
+sys.path.insert(0, os.environ.get("TORCHTITAN_DIR", os.path.expanduser("~/workspace/torchtitan")))
 
 
 # ---------------------------------------------------------------------------
@@ -31,8 +30,9 @@ sys.path.insert(
 # ``sys.modules`` and injects the missing ``torch.ops.cann_ops_transformer``
 # attributes with the recorder: every call is appended to ``ct.calls`` as
 # ``(fn_name, args, kwargs)``.  No real ``cann_ops_transformer`` package is
-# required; the recorder is installed at conftest import time so every test
-# module (including the compile-pattern tests) imports against it.
+# required. Normal product collection installs the recorder in
+# ``pytest_configure``; tooling-only collection skips it so repository tooling
+# sees its real optional imports.
 # ---------------------------------------------------------------------------
 
 _FAKE_FUNCTIONS = (
@@ -111,10 +111,21 @@ def install():
             setattr(ns, fn_name, getattr(recorder, fn_name))
 
 
-# Installed at import time so every test module in this tree (including the
-# compile-pattern tests, whose collection precedes any fixture) imports
-# against the recorder rather than the real package.
-install()
+def _requested_only_tooling(config):
+    """Return whether pytest was asked to collect only tooling tests.
+
+    A tooling-only invocation should not install the product-suite CANN fake:
+    importing a repository parser must see the real optional dependencies and
+    must not inherit product test state.  The normal ``pytest tests/unit_tests``
+    invocation still installs the fake before collection of product modules.
+    """
+    args = [str(arg).split("::", 1)[0] for arg in config.args if not str(arg).startswith("-")]
+    return bool(args) and all("tests/unit_tests/tooling" in Path(arg).as_posix() for arg in args)
+
+
+def pytest_configure(config):
+    if not _requested_only_tooling(config):
+        install()
 
 
 @pytest.fixture(scope="module")
@@ -130,29 +141,14 @@ def dsv4():
 
     ns = types.SimpleNamespace()
     ns.metadata = importlib.import_module("torchtitan_npu.models.deepseek_v4.metadata")
-    ns.token_dispatcher = importlib.import_module(
-        "torchtitan_npu.models.deepseek_v4.token_dispatcher"
-    )
-    ns.reference = importlib.import_module(
-        "torchtitan_npu.models.deepseek_v4.reference"
-    )
-    ns.attention = importlib.import_module(
-        "torchtitan_npu.models.deepseek_v4.attention"
-    )
-    ns.compressor = importlib.import_module(
-        "torchtitan_npu.models.deepseek_v4.compressor"
-    )
-    ns.golden = importlib.import_module(
-        "torchtitan_npu.override.deepseek_v4.sparse_attn.golden"
-    )
+    ns.token_dispatcher = importlib.import_module("torchtitan_npu.models.deepseek_v4.token_dispatcher")
+    ns.reference = importlib.import_module("torchtitan_npu.models.deepseek_v4.reference")
+    ns.attention = importlib.import_module("torchtitan_npu.models.deepseek_v4.attention")
+    ns.compressor = importlib.import_module("torchtitan_npu.models.deepseek_v4.compressor")
+    ns.golden = importlib.import_module("torchtitan_npu.override.deepseek_v4.sparse_attn.golden")
     spec = importlib.util.spec_from_file_location(
         "varlen_cp_backport",
-        _REPO
-        / "torchtitan_npu"
-        / "patches"
-        / "torchtitan"
-        / "distributed"
-        / "varlen_cp.py",
+        _REPO / "torchtitan_npu" / "patches" / "torchtitan" / "distributed" / "varlen_cp.py",
     )
     varlen_cp = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(varlen_cp)

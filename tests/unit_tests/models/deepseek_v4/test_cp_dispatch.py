@@ -47,7 +47,7 @@ tcc.comp_mod = comp_mod
 
 torch.manual_seed(0)
 DIM, HD, RD = 8, 16, 4
-_REPO = Path(__file__).resolve().parents[2]
+_REPO = Path(__file__).resolve().parents[4]
 
 
 # ---------------------------------------------------------------------------
@@ -881,7 +881,7 @@ def test_multiprocess_gloo(tmp_path):
     per-layer dispatch against the oracle and writes a result file.
     """
     python = sys.executable
-    worker = _REPO / "tests" / "unit_tests" / "cp_dispatch_worker.py"
+    worker = _REPO / "tests" / "unit_tests" / "models" / "deepseek_v4" / "cp_dispatch_worker.py"
     assert worker.exists()
     port = _free_port()
     env = dict(os.environ)
@@ -894,7 +894,7 @@ def test_multiprocess_gloo(tmp_path):
         filter(
             None,
             [
-                str(_REPO / "tests" / "unit_tests"),
+                str(_REPO / "tests" / "unit_tests" / "models" / "deepseek_v4"),
                 str(_REPO),
                 env.get("PYTHONPATH", ""),
             ],

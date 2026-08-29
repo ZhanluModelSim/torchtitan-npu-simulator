@@ -62,4 +62,30 @@ def build_deepseek_v3_2_test_list() -> list[OverrideDefinitions]:
                 "CONFIG": "deepseek_v3_2_debugmodel",
             },
         ),
+        OverrideDefinitions(
+            override_args=[
+                (
+                    "--training.steps=1",
+                    "--parallelism.context-parallel-degree=2",
+                    "--parallelism.context-parallel-load-balancer=headtail",
+                    "--parallelism.spmd-backend=spmd_types",
+                    "--hf-assets-path=tests/assets/deepseek_v3",
+                    "--training.local-batch-size=2",
+                    "--training.global-batch-size=4",
+                    "--training.seq-len=128",
+                    "--optimizer.param-groups.0.optimizer-kwargs.lr=1e-5",
+                    "--override.imports",
+                    _DSA_OVERRIDES,
+                )
+            ],
+            test_descr="DeepSeek-V3.2 DSA CP2 smoke",
+            test_name="dsv3_2_dsa_cp2",
+            ngpu=2,
+            use_golden=False,
+            check_loss=False,
+            env_vars={
+                "MODULE": "torchtitan_npu.models.deepseek_v3_2",
+                "CONFIG": "deepseek_v3_2_debugmodel",
+            },
+        ),
     ]
