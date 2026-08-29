@@ -364,13 +364,17 @@ class TestStateDictAdapter:
         config = magi2_preview_configs["debug"]()
         model = Magi2PreviewModel(config)
         model.init_weights()
+        adapter = Magi2PreviewStateDictAdapter(model_config=config)
+        # Official (HF) layout: multi-expert grouped weights are stored
+        # fused expert-major 2D, so draw the HF tensors in the official
+        # shapes derived from the model's internal state dict via to_hf.
+        official = adapter.to_hf(model.state_dict())
         generator = torch.Generator().manual_seed(0)
         hf_dict = {
             key: torch.randn(value.shape, generator=generator).to(value.dtype)
-            for key, value in model.state_dict().items()
+            for key, value in official.items()
         }
 
-        adapter = Magi2PreviewStateDictAdapter(model_config=config)
         result = adapter.to_hf(adapter.from_hf(hf_dict))
 
         assert result.keys() == hf_dict.keys()
@@ -543,7 +547,11 @@ class TestParallelize:
         meshes = {"ep": ep_mesh, "etp": etp_mesh}
         parallel_dims = _mock_parallel_dims(
             ep_enabled=True,
-            get_optional_mesh=lambda name: meshes[name],
+            # get_optional_mesh accepts a string or a list of strings
+            # (eFSDP mesh names); EP test doesn't need the eFSDP mesh.
+            get_optional_mesh=lambda name: (
+                meshes.get(name) if isinstance(name, str) else None
+            ),
         )
         mock_model = MagicMock()
         with patch(

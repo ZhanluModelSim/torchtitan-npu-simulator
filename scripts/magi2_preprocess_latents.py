@@ -44,6 +44,7 @@ is missing.
 import argparse
 import json
 import logging
+import os
 import sys
 import zlib
 from collections.abc import Sequence
@@ -80,6 +81,178 @@ DRY_RUN_TEXT_LEN = 16
 SELF_TEST_SHAPES = ((9, 32, 32), (17, 48, 48), (9, 32, 64), (17, 64, 32))
 
 
+# ---------------------------------------------------------------------------
+# Pluggable encoder registry
+# ---------------------------------------------------------------------------
+#
+# Each encoder wraps one modality (video / text / audio) and lazy-imports its
+# dependencies so that a missing weight or library only raises when the
+# encoder is actually used.  Alternative encoders can be swapped in via
+# ``EncoderRegistry.register``.
+#
+# CLI environment-variable fallbacks (checked when the matching flag is not
+# passed on the command line):
+#   MAGI2_VIDEO_CKPT  ->  --video-ckpt / --vae-ckpt
+#   MAGI2_TEXT_CKPT   ->  --text-ckpt / --text-encoder-path
+#   MAGI2_AUDIO_CKPT  ->  --audio-ckpt / --audio-vae-ckpt
+
+
+class BaseEncoder:
+    """Base class for one modality encoder in the preprocessing pipeline.
+
+    Subclasses must override :meth:`from_config` (to load the real encoder
+    from a checkpoint path) and :meth:`encode` (to run the encoding).
+    Registration with :class:`EncoderRegistry` makes the encoder swappable.
+    """
+
+    name: str = ""
+
+    @classmethod
+    def from_config(cls, *, ckpt: str, device: str = "cpu", **kwargs):
+        """Construct the encoder from a checkpoint path and device."""
+        raise NotImplementedError
+
+    def encode(self, *args, **kwargs):
+        """Encode one input and return the result tensor."""
+        raise NotImplementedError
+
+    @staticmethod
+    def _encoder_device(encoder) -> str:
+        module = getattr(encoder, "vae", encoder)
+        try:
+            return str(next(module.parameters()).device)
+        except (AttributeError, StopIteration):
+            return str(getattr(encoder, "device", "cpu"))
+
+
+class EncoderRegistry:
+    """Module-level registry mapping encoder names to their classes.
+
+    The three built-in entries (``video_vae``, ``text``, ``audio_vae``) wrap
+    the official MAGI-2-preview encoders; alternative encoders can be
+    registered at import time or from third-party plugins.
+    """
+
+    _encoders: dict[str, type[BaseEncoder]] = {}
+
+    @classmethod
+    def register(cls, encoder_cls: type[BaseEncoder]) -> type[BaseEncoder]:
+        """Register an encoder class under its ``name`` attribute."""
+        if not encoder_cls.name:
+            raise ValueError(f"Encoder {encoder_cls.__name__} must set a non-empty 'name'")
+        cls._encoders[encoder_cls.name] = encoder_cls
+        return encoder_cls
+
+    @classmethod
+    def get(cls, name: str) -> type[BaseEncoder]:
+        """Look up one encoder by name; ``KeyError`` when unknown."""
+        if name not in cls._encoders:
+            raise KeyError(
+                f"Unknown encoder {name!r}; registered: {sorted(cls._encoders)}"
+            )
+        return cls._encoders[name]
+
+    @classmethod
+    def names(cls) -> list[str]:
+        """Sorted list of registered encoder names."""
+        return sorted(cls._encoders)
+
+    @classmethod
+    def build(cls, name: str, **kwargs) -> BaseEncoder:
+        """Look up and construct one encoder from keyword arguments."""
+        return cls.get(name).from_config(**kwargs)
+
+    @classmethod
+    def clear(cls) -> None:
+        """Drop every registered encoder (test helper)."""
+        cls._encoders.clear()
+
+
+def _resolve_encoder_ckpt(
+    cli_value: str | None,
+    legacy_value: str | None,
+    env_var: str,
+) -> str | None:
+    """Merge new/legacy CLI flags with the matching environment variable.
+
+    Priority: new CLI flag > legacy CLI flag > environment variable > None.
+    """
+    if cli_value:
+        return cli_value
+    if legacy_value:
+        return legacy_value
+    return os.environ.get(env_var) or None
+
+
+@EncoderRegistry.register
+class Wan22VideoEncoder(BaseEncoder):
+    """Wan2.2 video VAE encoder (official ``get_vae2_2`` builder)."""
+
+    name = "video_vae"
+
+    def __init__(self, model):
+        self._model = model
+
+    @classmethod
+    def from_config(cls, *, ckpt: str, device: str = "cpu", **kwargs):
+        return cls(_load_video_vae(ckpt, device))
+
+    def encode(self, video):
+        return self._model.encode(video)
+
+
+@EncoderRegistry.register
+class Qwen35TextEncoderWrapper(BaseEncoder):
+    """Qwen3.5 text encoder (official ``Qwen35TextEncoder``)."""
+
+    name = "text"
+
+    def __init__(self, model):
+        self._model = model
+
+    @classmethod
+    def from_config(cls, *, ckpt: str, device: str = "cpu", **kwargs):
+        return cls(_load_text_encoder(ckpt, device))
+
+    def encode(self, caption: str):
+        return self._model.encode(caption)
+
+
+@EncoderRegistry.register
+class StableAudioEncoder(BaseEncoder):
+    """Stable Audio Open VAE feature extractor."""
+
+    name = "audio_vae"
+
+    def __init__(self, model):
+        self._model = model
+        # Expose the wrapped model's device so _encoder_device() finds it.
+        inner_device = getattr(model, "device", None)
+        if inner_device is None:
+            inner_module = getattr(model, "vae_model", None)
+            if inner_module is not None:
+                try:
+                    inner_device = next(inner_module.parameters()).device
+                except (AttributeError, StopIteration):
+                    inner_device = None
+        self.device = str(inner_device) if inner_device is not None else "cpu"
+
+    @classmethod
+    def from_config(cls, *, ckpt: str, device: str = "cpu", **kwargs):
+        return cls(_load_audio_vae(ckpt))
+
+    def encode(self, waveform):
+        return self._model.encode(waveform)
+
+    @property
+    def sample_rate(self):
+        return getattr(self._model, "sample_rate", 44100)
+
+    @property
+    def vae_model(self):
+        return getattr(self._model, "vae_model", None)
+
+
 def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument(
@@ -114,24 +287,41 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--video-ckpt",
         "--vae-ckpt",
+        dest="video_ckpt",
         type=str,
         default=None,
-        help="Official Wan2.2 video VAE: the ckpt/vae directory or its Wan2.2_VAE.pth.",
+        help=(
+            "Official Wan2.2 video VAE: the ckpt/vae directory or its "
+            "Wan2.2_VAE.pth. Also accepts --vae-ckpt (legacy alias). "
+            "Falls back to MAGI2_VIDEO_CKPT when neither flag is passed."
+        ),
     )
     parser.add_argument(
+        "--text-ckpt",
         "--text-encoder-path",
+        dest="text_ckpt",
         type=str,
         default=None,
-        help="HuggingFace directory of the Qwen3.5 text encoder (ckpt/text_encoder).",
+        help=(
+            "HuggingFace directory of the Qwen3.5 text encoder "
+            "(ckpt/text_encoder). Also accepts --text-encoder-path "
+            "(legacy alias). Falls back to MAGI2_TEXT_CKPT when neither "
+            "flag is passed."
+        ),
     )
     parser.add_argument(
+        "--audio-ckpt",
         "--audio-vae-ckpt",
+        dest="audio_ckpt",
         type=str,
         default=None,
         help=(
             "Audio VAE directory with model_config.json + model.safetensors "
-            "(ckpt/stable-audio-open-1.0); omit for video+text only."
+            "(ckpt/stable-audio-open-1.0); omit for video+text only. Also "
+            "accepts --audio-vae-ckpt (legacy alias). Falls back to "
+            "MAGI2_AUDIO_CKPT when neither flag is passed."
         ),
     )
     parser.add_argument("--device", type=str, default="cuda")
@@ -156,13 +346,23 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         parser.error("--dry-run and --self-test are mutually exclusive")
     if args.output_dir is None and not args.self_test:
         parser.error("--output-dir is required")
+    # Resolve encoder checkpoints: new flag > legacy flag > env var.
+    args.video_ckpt = _resolve_encoder_ckpt(
+        args.video_ckpt, None, "MAGI2_VIDEO_CKPT"
+    )
+    args.text_ckpt = _resolve_encoder_ckpt(
+        args.text_ckpt, None, "MAGI2_TEXT_CKPT"
+    )
+    args.audio_ckpt = _resolve_encoder_ckpt(
+        args.audio_ckpt, None, "MAGI2_AUDIO_CKPT"
+    )
     if not args.dry_run and not args.self_test:
         if bool(args.input) == bool(args.input_manifest):
             parser.error("real encoding needs exactly one of --input / --input-manifest")
         missing = [
             name
-            for name, value in (("--vae-ckpt", args.vae_ckpt),
-                                ("--text-encoder-path", args.text_encoder_path))
+            for name, value in (("--video-ckpt / MAGI2_VIDEO_CKPT", args.video_ckpt),
+                                ("--text-ckpt / MAGI2_TEXT_CKPT", args.text_ckpt))
             if not value
         ]
         if missing:
@@ -664,6 +864,66 @@ class StubAudioVAE:
         return latent.repeat(1, 32, 1)  # 2 -> 64 channels
 
 
+# Register the stub encoders now that StubVideoVAE / StubTextEncoder /
+# StubAudioVAE are defined (they are forward-referenced from the registry
+# section at module top, so registration must happen here).
+
+
+@EncoderRegistry.register
+class StubVideoEncoder(BaseEncoder):
+    """Weight-less deterministic video VAE stand-in (for --self-test)."""
+
+    name = "stub_video_vae"
+
+    def __init__(self):
+        self.device = "cpu"
+        self._impl = StubVideoVAE()
+
+    @classmethod
+    def from_config(cls, **kwargs):
+        return cls()
+
+    def encode(self, video):
+        return self._impl.encode(video)
+
+
+@EncoderRegistry.register
+class StubTextEncoderWrapper(BaseEncoder):
+    """Weight-less deterministic text encoder stand-in (for --self-test)."""
+
+    name = "stub_text"
+
+    def __init__(self):
+        self._impl = StubTextEncoder()
+
+    @classmethod
+    def from_config(cls, **kwargs):
+        return cls()
+
+    def encode(self, caption: str):
+        return self._impl.encode(caption)
+
+
+@EncoderRegistry.register
+class StubAudioEncoder(BaseEncoder):
+    """Weight-less deterministic audio VAE stand-in (for --self-test)."""
+
+    name = "stub_audio_vae"
+
+    def __init__(self):
+        self.device = "cpu"
+        self.sample_rate = StubAudioVAE.sample_rate
+        self.vae_model = StubAudioVAE.vae_model
+        self._impl = StubAudioVAE()
+
+    @classmethod
+    def from_config(cls, **kwargs):
+        return cls()
+
+    def encode(self, waveform):
+        return self._impl.encode(waveform)
+
+
 def _self_test_entries(num_samples: int) -> list[dict]:
     """Synthetic manifest entries; the paths are never opened by the stubs."""
     entries = []
@@ -751,16 +1011,22 @@ def _run_encode(args: argparse.Namespace) -> None:
     if args.input_manifest:
         entries = read_manifest(args.input_manifest)
     else:
-        entries = _directory_entries(args.input, audio_expected=args.audio_vae_ckpt is not None)
+        entries = _directory_entries(args.input, audio_expected=args.audio_ckpt is not None)
     audio_entries = sum(1 for entry in entries if entry["audio"] is not None)
-    if audio_entries and args.audio_vae_ckpt is None:
+    if audio_entries and args.audio_ckpt is None:
         raise ValueError(
             f"{audio_entries} sample(s) carry audio tracks but --audio-vae-ckpt is not set"
         )
 
-    video_vae = _load_video_vae(args.vae_ckpt, args.device)
-    text_encoder = _load_text_encoder(args.text_encoder_path, args.device)
-    audio_vae = _load_audio_vae(args.audio_vae_ckpt) if args.audio_vae_ckpt else None
+    # Build encoders through the registry so alternative implementations
+    # registered via ``EncoderRegistry.register`` are swapped in transparently.
+    video_vae = EncoderRegistry.build("video_vae", ckpt=args.video_ckpt, device=args.device)
+    text_encoder = EncoderRegistry.build("text", ckpt=args.text_ckpt, device=args.device)
+    audio_vae = (
+        EncoderRegistry.build("audio_vae", ckpt=args.audio_ckpt, device=args.device)
+        if args.audio_ckpt
+        else None
+    )
     write_dtype = getattr(torch, LATENT_DTYPE)
 
     samples = []

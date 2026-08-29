@@ -187,6 +187,14 @@ class CoreMultiHeadMoE(Module):
     result is the caller's job (regime (a) zero-pad + all-reduce, regime
     (b) Ulysses all-to-all, or the TP ``merge_linear`` row split).
 
+    The head range supports any combined head-parallel degree: when CP
+    and EP are both enabled, the caller sets a head range of width
+    ``moe_num_heads / (cp * ep)`` (asserting divisibility) and the routed
+    core computes only those heads over the dispatched full sequence
+    (regime (b), see ``MultiHeadMoELayer._dispatched_routed_core``). The
+    routing and expert math are agnostic to the degree — they operate on
+    whatever contiguous head slice ``head_range`` selects.
+
     Input modes under head sharding (``sharded_input``):
     - ``False`` (EP regime (a), the default): the input is replicated and
       full width ``(T, H * d_head)``; forward slices out the local heads'
@@ -258,6 +266,11 @@ class CoreMultiHeadMoE(Module):
         (leading dim ``(head_end - head_start) * num_experts``).
         ``sharded_input`` selects the input mode documented on the class
         (full-width replicated vs. already head-column-sliced).
+
+        The range width may equal ``num_heads / (cp * ep)`` when CP and
+        EP are combined — routing and expert compute operate on whatever
+        contiguous head slice is selected, agnostic to the parallelism
+        degree that produced it.
         """
         head_start, head_end = head_range
         if not 0 <= head_start < head_end <= self.num_heads:

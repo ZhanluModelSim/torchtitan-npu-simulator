@@ -517,6 +517,101 @@ class Magi2LatentDataset(IterableDataset):
             self.sample_pointer = int(state_dict["sample_pointer"])
 
 
+class Magi2LatentShardReader:
+    """Lightweight shard-directory reader for validation and tooling.
+
+    Mirrors the shard format consumed by :class:`Magi2LatentDataset` and
+    produced by ``scripts/magi2_preprocess_latents.py``.  Unlike the full
+    dataset it does **not** apply flow-matching noise or pack samples —
+    it just exposes the stored tensors and listing metadata, which makes
+    it suitable for ``--dry-run`` round-trip validation in the
+    preprocessing script and for ad-hoc inspection of shard directories.
+
+    Args:
+        data_path: directory of ``.safetensors`` / ``.pt`` shard files.
+    """
+
+    def __init__(self, data_path: str):
+        self.data_path = data_path
+        self.shard_files: list[str] = _list_shard_files(data_path)
+        self._listings: dict[str, list[dict[str, Any]]] = {}
+        self._samples: list[_ShardSample] = []
+        for shard in self.shard_files:
+            listing = _read_shard_listing(shard)
+            self._listings[shard] = listing
+            for entry in listing:
+                self._samples.append(
+                    _ShardSample(
+                        shard=shard,
+                        sample_id=entry["id"],
+                        video_shape=tuple(entry["video_shape"]),
+                        audio_len=entry["audio_len"],
+                        text_len=entry["text_len"],
+                        attrs=entry["attrs"],
+                    )
+                )
+
+    @property
+    def num_shards(self) -> int:
+        return len(self.shard_files)
+
+    @property
+    def num_samples(self) -> int:
+        return len(self._samples)
+
+    def shard_listing(self, shard_path: str) -> list[dict[str, Any]]:
+        """Canonical per-sample listing of one shard file."""
+        return self._listings[shard_path]
+
+    def sample_ids(self) -> list[str]:
+        """Deterministic (shard-major) list of every sample id."""
+        return [sample.sample_id for sample in self._samples]
+
+    def load_sample(self, sample: _ShardSample) -> dict[str, Any]:
+        """Load one sample's tensors and attrs into a write-compatible dict.
+
+        The returned mapping carries ``id``, ``video_latent``,
+        ``audio_latent``, ``text_emb`` plus every stored attr (``fps``,
+        ``num_frames``, ...) at the top level, matching the input contract
+        of :func:`write_latent_shard`.
+        """
+        prefix = f"{sample.sample_id}."
+        if sample.shard.endswith(".safetensors"):
+            if safe_open is None:
+                raise RuntimeError(
+                    "safetensors is required but not importable "
+                    f"({_SAFETENSORS_IMPORT_ERROR})"
+                )
+            with safe_open(sample.shard, framework="pt") as handle:
+                video = handle.get_tensor(prefix + VIDEO_KEY)
+                audio = handle.get_tensor(prefix + AUDIO_KEY)
+                text = handle.get_tensor(prefix + TEXT_KEY)
+        else:
+            tensors = _read_pt_shard(sample.shard)["tensors"]
+            video = tensors[prefix + VIDEO_KEY]
+            audio = tensors[prefix + AUDIO_KEY]
+            text = tensors[prefix + TEXT_KEY]
+        result: dict[str, Any] = {
+            "id": sample.sample_id,
+            VIDEO_KEY: video,
+            AUDIO_KEY: audio,
+            TEXT_KEY: text,
+        }
+        # Flatten stored attrs into the top level so the returned dict is
+        # directly compatible with write_latent_shard's input contract.
+        for key, value in sample.attrs.items():
+            result[key] = value
+        return result
+
+    def __iter__(self) -> Iterator[dict[str, Any]]:
+        """Iterate over every sample in shard-major order."""
+        for sample in self._samples:
+            yield self.load_sample(sample)
+
+    def __len__(self) -> int:
+        return self.num_samples
+
+
 class Magi2LatentDataLoader(BaseDataLoader):
     """Infinite dataloader over pre-encoded MAGI-2-preview latent shards.
 

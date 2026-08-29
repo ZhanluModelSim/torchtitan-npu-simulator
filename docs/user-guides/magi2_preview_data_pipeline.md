@@ -184,6 +184,106 @@ python3 scripts/magi2_preprocess_latents.py \
 `--num-self-test-samples` 控制样本数（轮流使用几种合法形状以覆盖分桶），
 不指定 `--output-dir` 时写入临时目录。
 
+### 2.5 编码器注册与环境变量
+
+预处理脚本在内部采用**可插拔的三阶段编码器管线**：视频 VAE、文本编码器、
+音频 VAE 各自由一个注册在 `EncoderRegistry` 中的类承载（见
+`scripts/magi2_preprocess_latents.py` 的 `BaseEncoder` / `EncoderRegistry`）。
+默认注册的三个编码器分别是 `Wan22VideoEncoder`（`video_vae`）、
+`Qwen35TextEncoderWrapper`（`text`）和 `StableAudioEncoder`（`audio_vae`），
+对应官方 MAGI-2-preview 推理仓库中的 `get_vae2_2`、`Qwen35TextEncoder` 和
+`SAAudioFeatureExtractor`。每个编码器类通过 `importlib` 延迟导入其依赖，
+只有在实际使用到该编码器时才会触发导入，缺少仓库或依赖时报出可操作的错误。
+
+#### CLI 参数别名
+
+三组编码器参数同时支持新名与旧名（旧名仍然有效）：
+
+| 新名 | 旧名（别名） | 环境变量 |
+| --- | --- | --- |
+| `--video-ckpt` | `--vae-ckpt` | `MAGI2_VIDEO_CKPT` |
+| `--text-ckpt` | `--text-encoder-path` | `MAGI2_TEXT_CKPT` |
+| `--audio-ckpt` | `--audio-vae-ckpt` | `MAGI2_AUDIO_CKPT` |
+
+优先级：新 CLI 参数 > 旧 CLI 参数 > 环境变量 > 无（`None`）。
+
+#### 环境变量用法
+
+当 CLI 参数未传入时，脚本会从环境变量读取。适合在 shell profile 或 CI 配置
+中一次设定：
+
+```bash
+export MAGI2_VIDEO_CKPT=/weights/ckpt/vae
+export MAGI2_TEXT_CKPT=/weights/ckpt/text_encoder
+export MAGI2_AUDIO_CKPT=/weights/ckpt/stable-audio-open-1.0
+
+# 无需重复传入 --video-ckpt / --text-ckpt / --audio-ckpt
+python3 scripts/magi2_preprocess_latents.py \
+    --magi2-repo ./MAGI-2-preview \
+    --input-manifest ./data/train_manifest.jsonl \
+    --output-dir ./magi2_latent_shards
+```
+
+#### 各编码器单独使用示例
+
+只编码视频+文本（跳过音频）：
+
+```bash
+python3 scripts/magi2_preprocess_latents.py \
+    --magi2-repo ./MAGI-2-preview \
+    --input-manifest ./data/manifest.jsonl \
+    --output-dir ./shards \
+    --video-ckpt /weights/ckpt/vae \
+    --text-ckpt /weights/ckpt/text_encoder
+```
+
+编码含音频的完整三模态样本：
+
+```bash
+python3 scripts/magi2_preprocess_latents.py \
+    --magi2-repo ./MAGI-2-preview \
+    --input-manifest ./data/manifest.jsonl \
+    --output-dir ./shards \
+    --video-ckpt /weights/ckpt/vae \
+    --text-ckpt /weights/ckpt/text_encoder \
+    --audio-ckpt /weights/ckpt/stable-audio-open-1.0
+```
+
+#### 替换编码器
+
+第三方或自定义编码器可以通过在导入脚本前注册来替换默认实现。编码器类必须
+继承 `BaseEncoder`、设置 `name` 属性、实现 `from_config` 和 `encode`：
+
+```python
+from magi2_preprocess_latents import BaseEncoder, EncoderRegistry
+
+@EncoderRegistry.register
+class MyCustomVideoEncoder(BaseEncoder):
+    name = "video_vae"   # 覆盖默认的视频编码器
+
+    @classmethod
+    def from_config(cls, *, ckpt, device="cpu", **kw):
+        ...  # 自定义加载逻辑
+
+    def encode(self, video):
+        ...  # 返回 (48, T, H, W) 的视频 latent
+```
+
+#### 缺依赖时的排错
+
+每个编码器的依赖只在被实际使用时导入，因此缺失某个依赖不会阻止其他编码器
+（或 `--dry-run` / `--self-test`）运行。常见报错及对应处理：
+
+| 报错关键字 | 原因 | 解决 |
+| --- | --- | --- |
+| `Cannot import inference.model.vae2_2` | `--magi2-repo` 未传或路径不对 | `git clone https://github.com/SandAI-org/MAGI-2-preview` 并传 `--magi2-repo` |
+| `Wan2.2_VAE.pth` not found | 视频 VAE 权重缺失 | `hf download sand-ai/MAGI-2-preview --include 'vae/*'` |
+| `--text-encoder-path not found` | 文本编码器目录不存在 | `hf download sand-ai/MAGI-2-preview --include 'text_encoder/*'` |
+| `model_config.json` / `model.safetensors` | 音频 VAE 目录不完整 | `hf download sand-ai/MAGI-2-preview --include 'stable-audio-open-1.0/*'` |
+| `torchvision unavailable` | 视频解码缺 torchvision | `pip install torchvision` 或安装 `imageio` + `imageio-ffmpeg` |
+| `scipy is required` | 音频波形读取缺 scipy | `pip install scipy` |
+| `Qwen3_5TextModel support` | transformers 版本太旧 | 升级 transformers 到支持 Qwen3.5 的版本 |
+
 ## 3. 分桶与打包行为
 
 `Magi2LatentDataset` 是一个**无限迭代**的 `IterableDataset`：

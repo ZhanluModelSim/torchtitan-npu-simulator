@@ -24,15 +24,14 @@ CI-safe single-process coverage:
 - single-rank gloo wiring (degree 1): state-dict keys/placements,
   fwd/bwd parity, TP+FSDP composition and full-checkpoint loading.
 
-Checkpoint note: every weight whose TP slice a single DTensor placement
-expresses becomes a Shard DTensor (full-checkpoint loading distributes
-through DTensor); the multi-expert column splits whose per-expert slices
-have no honest placement (linear_qkv always; linear_g/up_gate_proj with
-num_modality > 1; modality_specific_shared_expert_fc1) stay plain local
-slices — state-dict keys unchanged, but full-state-dict loading of those
-keys at TP > 1 needs loader-side slicing (documented follow-up, mirroring
-cp_ulysses' head-sharded sinks note). The equivalence tests pin the local
-contents directly against the full weights.
+Checkpoint note: with the per-expert ``(num_experts, out, in)`` internal
+layout every TP-split grouped weight is an honest single-placement Shard
+DTensor (column splits shard the out dim, row splits the in dim), so
+full-state-dict loading/saving at TP > 1 distributes through DTensor with
+no loader-side slicing. The state-dict keys are unchanged; the adapter maps
+the official fused 2D grouped weights to/from the internal 3D layout (see
+``state_dict_adapter.py``). The equivalence tests pin the local contents
+directly against the full weights.
 
 Nightly-gated real-collective coverage (RUN_MODEL_PARALLEL_MULTI_RANK,
 following tests/smoke_tests/model_parallel/_multi_rank.py conventions):
@@ -246,6 +245,13 @@ def _head_range(rank: int, num_heads: int, degree: int = TP):
     return rank * per_rank, (rank + 1) * per_rank
 
 
+def _in_slice(weight, col_start, col_end):
+    """Row-split (in-dim) slice, aware of the 2D/3D grouped layout."""
+    if weight.ndim == 3:
+        return weight[:, :, col_start:col_end]
+    return weight[:, col_start:col_end]
+
+
 def _expected_local_grad(name, ref_grad, rank, degree, config):
     """Rank-local expectation for a parameter's reference gradient.
 
@@ -254,6 +260,10 @@ def _expected_local_grad(name, ref_grad, rank, degree, config):
     are summed by the TP grad hooks, so the wired value equals the
     reference gradient directly). Also used for full-weight slicing in the
     checkpoint-distribution check (values and gradients share the layout).
+    The reference gradient is in the internal grouped layout (3D
+    ``(num_experts, out, in)`` for multi-expert weights, 2D otherwise), so
+    row splits slice the in dim and column splits use the head/pair
+    helpers.
     """
     from torchtitan_npu.models.magi2_preview.grouped_linear import (
         slice_grouped_linear_by_heads,
@@ -271,7 +281,7 @@ def _expected_local_grad(name, ref_grad, rank, degree, config):
     if name.endswith("attention.sinks"):
         return ref_grad[:, hs_a:he_a]
     if name.endswith("attention.linear_proj.weight"):
-        return ref_grad[:, hs_a * head_dim : he_a * head_dim]
+        return _in_slice(ref_grad, hs_a * head_dim, he_a * head_dim)
     if name.endswith("attention.linear_g.weight"):
         return slice_grouped_linear_by_heads(
             ref_grad, num_modality, attn_heads, 1, 1, (hs_a, he_a)
@@ -292,7 +302,7 @@ def _expected_local_grad(name, ref_grad, rank, degree, config):
                 ref_grad, num_modality, pairs, (p0, p1)
             )
         if name.endswith("mlp.down_proj.weight"):
-            return ref_grad[:, p0:p1]
+            return _in_slice(ref_grad, p0, p1)
         return ref_grad
 
     # MoE layer.
@@ -301,7 +311,7 @@ def _expected_local_grad(name, ref_grad, rank, degree, config):
     if name.endswith("mlp.split_linear.weight"):
         return ref_grad[c0:c1]
     if name.endswith("mlp.merge_linear.weight"):
-        return ref_grad[:, c0:c1]
+        return _in_slice(ref_grad, c0, c1)
     if ".moe_mlp." in name:
         hs_m, he_m = _head_range(rank, config.moe_num_heads, degree)
         return ref_grad[hs_m * config.num_experts : he_m * config.num_experts]
@@ -314,7 +324,7 @@ def _expected_local_grad(name, ref_grad, rank, degree, config):
     if name.endswith("shared_expert_fc2.weight") or name.endswith(
         "modality_specific_shared_expert_fc2.weight"
     ):
-        return ref_grad[:, p0:p1]
+        return _in_slice(ref_grad, p0, p1)
     return ref_grad  # mlp.pre_norm and MHC params: replicated
 
 
@@ -333,25 +343,32 @@ def _local_value(param):
 
 
 class TestGroupedLinearTpSlicing:
-    def test_by_heads_slices_per_expert_and_section(self):
+    def test_by_heads_slices_per_expert_and_head(self):
         from torchtitan_npu.models.magi2_preview.grouped_linear import (
             slice_grouped_linear_by_heads,
         )
 
         E, S, H, Dh, Cin = 3, 3, 4, 2, 5
+        rows_per_head = S * Dh
+        # Multi-expert internal layout: 3D head-major (E, H*rows_per_head, in).
         weight = torch.arange(
-            E * S * H * Dh * Cin, dtype=torch.float32
-        ).reshape(E * S * H * Dh, Cin)
+            E * H * rows_per_head * Cin, dtype=torch.float32
+        ).reshape(E, H * rows_per_head, Cin)
         per_rank = H // TP
         for rank in range(TP):
             hs, he = _head_range(rank, H)
             sliced = slice_grouped_linear_by_heads(
                 weight, E, H, Dh, S, (hs, he)
             )
-            assert sliced.shape == (E * S * per_rank * Dh, Cin)
-            w = weight.view(E, S, H, Dh, Cin)
-            expected = w[:, :, hs:he].reshape(E * S * per_rank * Dh, Cin)
+            assert sliced.shape == (E, per_rank * rows_per_head, Cin)
+            expected = weight[:, hs * rows_per_head : he * rows_per_head]
             assert torch.equal(sliced, expected)
+        # Single-expert weights stay 2D and slice the same rows.
+        weight_2d = weight[0]
+        hs, he = _head_range(0, H)
+        sliced_2d = slice_grouped_linear_by_heads(weight_2d, 1, H, Dh, S, (hs, he))
+        assert sliced_2d.shape == (per_rank * rows_per_head, Cin)
+        assert torch.equal(sliced_2d, weight_2d[hs * rows_per_head : he * rows_per_head])
 
     def test_by_heads_rejects_bad_inputs(self):
         from torchtitan_npu.models.magi2_preview.grouped_linear import (
@@ -361,7 +378,7 @@ class TestGroupedLinearTpSlicing:
         weight = torch.randn(6, 4)
         with pytest.raises(ValueError, match="head_range"):
             slice_grouped_linear_by_heads(weight, 1, 4, 1, 1, (2, 2))
-        with pytest.raises(ValueError, match="leading dim"):
+        with pytest.raises(ValueError, match="out dim"):
             slice_grouped_linear_by_heads(weight, 1, 3, 1, 1, (0, 1))
 
     def test_by_pairs_keeps_gate_up_together(self):
@@ -370,17 +387,22 @@ class TestGroupedLinearTpSlicing:
         )
 
         E, P, Cin = 2, 4, 3
+        # Multi-expert internal layout: 3D pair-major (E, 2*P, in).
         weight = torch.arange(E * 2 * P * Cin, dtype=torch.float32).reshape(
-            E * 2 * P, Cin
+            E, 2 * P, Cin
         )
         per_rank = P // TP
         for rank in range(TP):
             p0, p1 = _head_range(rank, P)
             sliced = slice_grouped_linear_by_pairs(weight, E, P, (p0, p1))
-            assert sliced.shape == (E * 2 * per_rank, Cin)
-            w = weight.view(E, P, 2, Cin)
-            expected = w[:, p0:p1].reshape(E * 2 * per_rank, Cin)
+            assert sliced.shape == (E, 2 * per_rank, Cin)
+            expected = weight[:, 2 * p0 : 2 * p1]
             assert torch.equal(sliced, expected)
+            # gate/up of every kept pair stay adjacent (even offsets).
+            assert torch.equal(
+                sliced.view(E, per_rank, 2, Cin),
+                weight.view(E, P, 2, Cin)[:, p0:p1],
+            )
 
     def test_by_pairs_rejects_bad_inputs(self):
         from torchtitan_npu.models.magi2_preview.grouped_linear import (
@@ -390,7 +412,7 @@ class TestGroupedLinearTpSlicing:
         weight = torch.randn(8, 4)
         with pytest.raises(ValueError, match="pair_range"):
             slice_grouped_linear_by_pairs(weight, 1, 4, (0, 5))
-        with pytest.raises(ValueError, match="leading dim"):
+        with pytest.raises(ValueError, match="out dim"):
             slice_grouped_linear_by_pairs(weight, 1, 5, (0, 1))
 
     def test_head_column_split_matmul_equivalence(self):
@@ -406,11 +428,11 @@ class TestGroupedLinearTpSlicing:
         m_splits = [1, 2, 3]
         for sections in (1, 3):
             out_full = sections * H * Dh
-            weight = torch.randn(E * out_full, Cin)
+            weight = torch.randn(E, out_full, Cin)
             full = GroupedLinear(Cin, out_full, num_experts=E)
             with torch.no_grad():
                 full.weight.copy_(weight)
-            y_full = full(x, m_splits).view(6, sections, H, Dh)
+            y_full = full(x, m_splits).view(6, H, sections, Dh)
             for rank in range(TP):
                 hs, he = _head_range(rank, H)
                 local = GroupedLinear(
@@ -423,7 +445,7 @@ class TestGroupedLinearTpSlicing:
                         )
                     )
                 y_local = local(x, m_splits)
-                expected = y_full[:, :, hs:he].reshape(
+                expected = y_full[:, hs:he].reshape(
                     6, sections * (he - hs) * Dh
                 )
                 assert torch.equal(y_local, expected)
@@ -440,7 +462,7 @@ class TestGroupedLinearTpSlicing:
         torch.manual_seed(1)
         x = torch.randn(6, Cin)
         m_splits = [1, 2, 3]
-        weight = torch.randn(E * 2 * P, Cin)
+        weight = torch.randn(E, 2 * P, Cin)
         full = GroupedLinear(Cin, 2 * P, num_experts=E)
         with torch.no_grad():
             full.weight.copy_(weight)
@@ -454,7 +476,7 @@ class TestGroupedLinearTpSlicing:
                     slice_grouped_linear_by_pairs(weight, E, P, (p0, p1))
                 )
             raw_local = local(x, m_splits)
-            # The raw projection is an exact row subset of the full one ...
+            # The raw projection is an exact pair subset of the full one ...
             assert torch.equal(
                 raw_local,
                 raw_full.view(6, P, 2)[:, p0:p1].reshape(6, 2 * (p1 - p0)),
@@ -474,7 +496,7 @@ class TestGroupedLinearTpSlicing:
         torch.manual_seed(2)
         x = torch.randn(6, Cin)
         m_splits = [1, 2, 3]
-        weight = torch.randn(E * out, Cin)
+        weight = torch.randn(E, out, Cin)
         full = GroupedLinear(Cin, out, num_experts=E)
         with torch.no_grad():
             full.weight.copy_(weight)
@@ -486,7 +508,7 @@ class TestGroupedLinearTpSlicing:
             local = GroupedLinear(width, out, num_experts=E)
             with torch.no_grad():
                 local.weight.copy_(
-                    weight[:, rank * width : (rank + 1) * width].contiguous()
+                    weight[:, :, rank * width : (rank + 1) * width].contiguous()
                 )
             partial = partial + local(x[:, rank * width : (rank + 1) * width], m_splits)
         assert torch.allclose(partial, y_full)
@@ -584,9 +606,9 @@ class TestAttentionTpEmulatedEquivalence:
             assert torch.allclose(
                 grads["linear_qkv.weight"], expected, atol=1e-4, rtol=1e-4
             )
-            expected = ref_grads["linear_proj.weight"][
-                :, hs * head_dim : he * head_dim
-            ]
+            expected = _in_slice(
+                ref_grads["linear_proj.weight"], hs * head_dim, he * head_dim
+            )
             assert torch.allclose(
                 grads["linear_proj.weight"], expected, atol=1e-4, rtol=1e-4
             )
@@ -651,7 +673,7 @@ class TestDenseMlpTpEmulatedEquivalence:
             assert torch.allclose(
                 grads["up_gate_proj.weight"], expected, atol=1e-4, rtol=1e-4
             )
-            expected = ref_grads["down_proj.weight"][:, p0:p1]
+            expected = _in_slice(ref_grads["down_proj.weight"], p0, p1)
             assert torch.allclose(
                 grads["down_proj.weight"], expected, atol=1e-4, rtol=1e-4
             )
@@ -712,7 +734,7 @@ class TestMoeLayerTpEmulatedEquivalence:
             )
             assert torch.allclose(
                 grads["merge_linear.weight"],
-                ref_grads["merge_linear.weight"][:, c0:c1],
+                _in_slice(ref_grads["merge_linear.weight"], c0, c1),
                 atol=1e-4,
                 rtol=1e-4,
             )
@@ -742,7 +764,7 @@ class TestMoeLayerTpEmulatedEquivalence:
             for name in ("shared_expert_fc2", "modality_specific_shared_expert_fc2"):
                 assert torch.allclose(
                     grads[f"{name}.weight"],
-                    ref_grads[f"{name}.weight"][:, p0:p1],
+                    _in_slice(ref_grads[f"{name}.weight"], p0, p1),
                     atol=1e-4,
                     rtol=1e-4,
                 ), name
@@ -931,33 +953,34 @@ class TestApplyTensorParallelSingleRank:
         )
 
         layers = model.block.layers
-        # Layer 0 is mm (num_modality=3): grouped column splits stay plain
-        # local slices; row splits and sinks are honest Shard DTensors.
+        # Layer 0 is mm (num_modality=3): multi-expert grouped weights are
+        # 3D and every split is an honest single-placement Shard DTensor.
         attn0 = layers["0"].attention
-        assert not isinstance(attn0.linear_g.weight, DTensor)
-        assert not isinstance(attn0.linear_qkv.weight, DTensor)
-        assert attn0.linear_proj.weight.placements == (Shard(1),)
+        assert attn0.linear_g.weight.placements == (Shard(1),)
+        assert attn0.linear_qkv.weight.placements == (Shard(1),)
+        assert attn0.linear_proj.weight.placements == (Shard(2),)
         assert attn0.sinks.placements == (Shard(1),)
         assert attn0.num_heads == config.hidden_size // config.head_dim
-        # Layer 1 attention has num_modality=1: linear_g is Shard(0).
+        # Layer 1 attention has num_modality=1: single-expert 2D weights.
         attn1 = layers["1"].attention
         assert attn1.linear_g.weight.placements == (Shard(0),)
-        assert not isinstance(attn1.linear_qkv.weight, DTensor)
-        # Dense MLP on the mm layer: E=3 up_gate stays a plain slice.
+        assert attn1.linear_qkv.weight.placements == (Shard(0),)
+        assert attn1.linear_proj.weight.placements == (Shard(1),)
+        # Dense MLP on the mm layer (E=3): honest out/in placements.
         mlp0 = layers["0"].mlp
-        assert not isinstance(mlp0.up_gate_proj.weight, DTensor)
-        assert mlp0.down_proj.weight.placements == (Shard(1),)
+        assert mlp0.up_gate_proj.weight.placements == (Shard(1),)
+        assert mlp0.down_proj.weight.placements == (Shard(2),)
         # MoE layer placements.
         mlp1 = layers["1"].mlp
         assert mlp1.split_linear.weight.placements == (Shard(0),)
         assert mlp1.merge_linear.weight.placements == (Shard(1),)
         assert mlp1.shared_expert_fc1.weight.placements == (Shard(0),)
         assert mlp1.shared_expert_fc2.weight.placements == (Shard(1),)
-        assert not isinstance(
-            mlp1.modality_specific_shared_expert_fc1.weight, DTensor
+        assert mlp1.modality_specific_shared_expert_fc1.weight.placements == (
+            Shard(1),
         )
         assert mlp1.modality_specific_shared_expert_fc2.weight.placements == (
-            Shard(1),
+            Shard(2),
         )
         moe = mlp1.moe_mlp
         assert moe.head_range == (0, config.moe_num_heads)

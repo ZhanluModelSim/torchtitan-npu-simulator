@@ -1068,6 +1068,54 @@ def _debug_model():
     return model
 
 
+def _ci_model_inputs(config, seq_len: int = 16, seed: int = 5):
+    """Full packed batch sized for the debug config (all modalities).
+
+    Module-level (not gated on the nightly multi-rank import) so the
+    CI-safe single-rank tests can build inputs too.
+    """
+    from torchtitan_npu.models.magi2_preview.model import Modality
+
+    generator = torch.Generator().manual_seed(seed)
+    pattern = [
+        Modality.VIDEO,
+        Modality.AUDIO,
+        Modality.TEXT,
+        Modality.TIME,
+    ]
+    modality = torch.tensor(
+        [pattern[i % len(pattern)].value for i in range(seq_len)],
+        dtype=torch.int32,
+    )
+    channels = max(
+        config.video_in_channels,
+        config.audio_in_channels,
+        config.text_in_channels,
+    )
+    x = torch.randn(seq_len, channels, generator=generator)
+    coords = torch.randn(seq_len, 9, generator=generator)
+    time_embedding = torch.randn(
+        seq_len, config.time_channel_dim, generator=generator
+    )
+    cu_seqlens = torch.tensor([0, 6, seq_len], dtype=torch.int32)
+    labels = torch.zeros(seq_len, channels)
+    video_rows = modality == Modality.VIDEO
+    audio_rows = modality == Modality.AUDIO
+    labels[video_rows, : config.video_in_channels] = torch.randn(
+        int(video_rows.sum()), config.video_in_channels, generator=generator
+    )
+    labels[audio_rows, : config.audio_in_channels] = torch.randn(
+        int(audio_rows.sum()), config.audio_in_channels, generator=generator
+    )
+    inputs = dict(
+        coords_mapping=coords,
+        modality_mapping=modality,
+        time_embedding=time_embedding,
+        cu_seqlens=cu_seqlens,
+    )
+    return x, inputs, labels
+
+
 class TestApplyMoeParallelValidation:
     def test_noop_without_meshes(self):
         from torchtitan_npu.models.magi2_preview.parallelize import (
@@ -1272,6 +1320,81 @@ class TestApplyMoeParallelSingleRank:
         out = model.block.layers[layer_id].mlp(x, m_splits)
         ref_out = reference.block.layers[layer_id].mlp(x, m_splits)
         assert torch.allclose(out, ref_out)
+
+
+class TestApplyFsdpEFSDPWiring:
+    """CI-safe wiring decisions of ``_apply_fsdp``'s eFSDP path.
+
+    Single-rank gloo only exercises the ep_degree=1 branch and the guard
+    that eFSDP (ep_degree > 1) requires an edp_mesh; the actual ep x dp
+    composition needs the nightly multi-rank tests below.
+    """
+
+    def _fsdp_kwargs(self):
+        return dict(
+            training=SimpleNamespace(
+                mixed_precision_param="float32",
+                mixed_precision_reduce="float32",
+                enable_cpu_offload=False,
+            ),
+            parallelism=SimpleNamespace(fsdp_reshard_after_forward="default"),
+            pp_enabled=False,
+        )
+
+    def test_efsdP_requires_edp_mesh(self, single_rank_process_group):
+        from torch.distributed.device_mesh import DeviceMesh
+
+        from torchtitan_npu.models.magi2_preview.parallelize import _apply_fsdp
+
+        model = _debug_model()
+        dp_mesh = DeviceMesh("cpu", [0], mesh_dim_names=("fsdp",))
+        with pytest.raises(ValueError, match="edp_mesh"):
+            _apply_fsdp(
+                model,
+                dp_mesh,
+                ep_degree=2,
+                edp_mesh=None,
+                **self._fsdp_kwargs(),
+            )
+
+    def test_ep1_fsdp_forward_backward_match_unsharded(
+        self, single_rank_process_group
+    ):
+        from torch.distributed.device_mesh import DeviceMesh
+        from torch.distributed.tensor import DTensor
+
+        from torchtitan_npu.models.magi2_preview.parallelize import (
+            _apply_fsdp,
+            _apply_moe_parallel,
+        )
+
+        config = magi2_preview_configs["debug"]()
+        model = _debug_model()
+        model.train()
+        reference = copy.deepcopy(model)
+
+        ep_mesh = DeviceMesh("cpu", [0], mesh_dim_names=("ep",))
+        _apply_moe_parallel(model, ep_mesh=ep_mesh, etp_mesh=None)
+        dp_mesh = DeviceMesh("cpu", [0], mesh_dim_names=("fsdp",))
+        _apply_fsdp(
+            model, dp_mesh, ep_degree=1, edp_mesh=None, **self._fsdp_kwargs()
+        )
+
+        x, inputs, labels = _ci_model_inputs(config)
+        pred = model(x, **inputs)
+        pred_ref = reference(x, **inputs)
+        assert torch.allclose(pred, pred_ref, atol=1e-4, rtol=1e-4)
+        torch.nn.functional.mse_loss(pred, labels).backward()
+        torch.nn.functional.mse_loss(pred_ref, labels).backward()
+        ref_params = dict(reference.named_parameters())
+        for name, param in model.named_parameters():
+            assert param.grad is not None, name
+            grad = param.grad
+            if isinstance(grad, DTensor):
+                grad = grad.to_local()
+            assert torch.allclose(
+                grad, ref_params[name].grad, atol=1e-4, rtol=1e-4
+            ), name
 
 
 # ---------------------------------------------------------------------------

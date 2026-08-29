@@ -29,6 +29,7 @@ from unittest import mock
 
 import pytest
 import torch
+from torch.distributed.tensor import DTensor
 
 CP = 2  # virtual CP degree used throughout the single-process tests
 
@@ -719,8 +720,12 @@ class TestCpWiringSingleRank:
         ref_params = dict(ref.named_parameters())
         for name, param in model.named_parameters():
             assert param.grad is not None, name
+            grad = param.grad
+            if isinstance(grad, DTensor):
+                # CP-sharded sinks carry a DTensor grad on the cp mesh.
+                grad = grad.to_local()
             assert torch.allclose(
-                param.grad, ref_params[name].grad, atol=1e-5, rtol=1e-5
+                grad, ref_params[name].grad, atol=1e-5, rtol=1e-5
             ), f"grad mismatch for {name}"
 
     @pytest.mark.usefixtures("single_rank_process_group")
@@ -940,8 +945,11 @@ if MULTI_RANK_AVAILABLE:
                     expected = expected[
                         :, rank * heads_per_rank : (rank + 1) * heads_per_rank
                     ]
+                    grad = param.grad
+                    if isinstance(grad, DTensor):
+                        grad = grad.to_local()
                     assert torch.allclose(
-                        param.grad, expected, atol=1e-4, rtol=1e-4
+                        grad, expected, atol=1e-4, rtol=1e-4
                     ), name
                     continue
                 grad_sum = param.grad.clone()

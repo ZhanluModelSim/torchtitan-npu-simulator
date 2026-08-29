@@ -24,7 +24,9 @@ Layout contract (cp = CP degree, S = T // cp local tokens, H heads):
 - post-hook: attention output ``(cp*S, H/cp, D)`` -> all_to_all back ->
   ``(S, H, D)``, original local order, full heads.
 - ``sinks`` parameter: sharded on the HEAD dim (each rank keeps the
-  logits of its local head group); state-dict key unchanged.
+  logits of its local head group) and recorded as a DTensor ``Shard(1)``
+  on the cp mesh; state-dict key unchanged, full shape
+  ``(sink_token_num, H)``.
 
 Model-level entry/exit lives in model.py: forward slices the incoming
 FULL batch tensors to the local sequence shard and all-gathers the
@@ -54,9 +56,9 @@ Integration status:
   (``expert_parallel.MoEDispatchContext``, wired by
   ``parallelize._apply_moe_parallel``). ``apply_magi2_ulysses_cp``
   accepts ``ep_degree > 1`` and leaves that wiring to the MoE step.
-- Checkpointing with sharded ``sinks``: keys are unchanged but shapes are
-  head-sharded per rank; DTensor Shard(1)-aware save/restore is a
-  follow-up.
+- Checkpointing with sharded ``sinks``: keys are unchanged; ``sinks`` is a
+  DTensor ``Shard(1)`` on the cp mesh, so full-state-dict save/restore
+  redistributes it through DTensor.
 """
 
 import logging
@@ -68,6 +70,7 @@ import torch
 import torch.distributed._functional_collectives as funcol
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.tensor import DTensor, Shard
 from torch.distributed.tensor.parallel import ParallelStyle, parallelize_module
 
 from .attention import Magi2Attention
@@ -257,7 +260,10 @@ class Magi2UlyssesAttentionCP(ParallelStyle):
             )
 
         # Head-shard the learned sink logits; the state-dict key stays
-        # "attention.sinks", only its head dim shrinks to the local group.
+        # "attention.sinks". On a real cp mesh the shard is recorded as an
+        # honest DTensor Shard(1) so checkpoint save/restore redistributes
+        # it through DTensor (the full shape is (sink_token_num, H));
+        # lightweight stand-in meshes keep a plain local shard.
         rank = device_mesh.get_local_rank()
         heads_per_rank = module.num_heads // cp
         with torch.no_grad():
@@ -266,7 +272,12 @@ class Magi2UlyssesAttentionCP(ParallelStyle):
                 .contiguous()
                 .clone()
             )
-        module.sinks = nn.Parameter(shard)
+        if isinstance(device_mesh, DeviceMesh):
+            module.sinks = nn.Parameter(
+                DTensor.from_local(shard, device_mesh, [Shard(1)], run_check=False)
+            )
+        else:
+            module.sinks = nn.Parameter(shard)
 
         ctx = CpContext(mesh=device_mesh, degree=cp, rank=rank)
         module.cp_context = ctx

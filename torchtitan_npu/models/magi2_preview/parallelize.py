@@ -17,6 +17,10 @@ from torch.distributed.fsdp import (
     MixedPrecisionPolicy,
     fully_shard,
 )
+from torch.distributed.fsdp._fully_shard._fsdp_common import (
+    FSDPMeshInfo,
+    ShardPlacementResult,
+)
 from torch.distributed.tensor import (
     DTensor,
     Shard,
@@ -67,6 +71,8 @@ def _apply_fsdp(
     training: TrainingConfig,
     parallelism: ParallelismConfig,
     pp_enabled: bool,
+    ep_degree: int = 1,
+    edp_mesh: DeviceMesh | None = None,
 ) -> None:
     """Shard every transformer layer with FSDP2, then the root model.
 
@@ -75,6 +81,16 @@ def _apply_fsdp(
     ``fully_shard`` is applied directly here instead. Under PP this runs
     per stage model part (``pipeline_magi2`` calls the parallelize fn on
     each part), so ``model`` may be a pruned stage chunk.
+
+    With ``ep_degree > 1`` (eFSDP) the routed MoE expert params are already
+    DTensor ``Shard(0)`` on the head-parallel ep mesh (see
+    ``_apply_moe_parallel``); mirroring llama4's ``apply_fsdp``, a
+    ``shard_placement_fn`` routes those params to ``edp_mesh`` (the dp mesh
+    the experts shard over) while every other param uses ``dp_mesh``. FSDP2
+    then composes the dp shard with the existing ep head shard into a
+    multi-dim DTensor, so experts shard over dp AND keep their ep head
+    shard. Gradient division is disabled below exactly like llama4 (the
+    training loop scales by the global valid-token count).
     """
     mp_policy = MixedPrecisionPolicy(
         param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
@@ -91,11 +107,47 @@ def _apply_fsdp(
     )
 
     for layer in model.block.layers.values():
-        fully_shard(
-            layer,
-            **fsdp_config,
-            reshard_after_forward=reshard_after_forward,
+        moe_mlp = (
+            layer.mlp.moe_mlp
+            if isinstance(layer.mlp, MultiHeadMoELayer)
+            else None
         )
+        if moe_mlp is not None and ep_degree > 1:
+            if edp_mesh is None:
+                raise ValueError(
+                    "MAGI-2-preview eFSDP (ep_degree > 1) requires an "
+                    "edp_mesh to shard the routed experts over"
+                )
+            expert_params = set(moe_mlp.parameters())
+            edp_mesh_info = FSDPMeshInfo(mesh=edp_mesh, shard_mesh_dim=0)
+            dp_mesh_info = FSDPMeshInfo(mesh=dp_mesh, shard_mesh_dim=0)
+
+            def _shard_placement_fn(
+                param: nn.Parameter,
+                _expert_params: set = expert_params,
+                _edp_info: FSDPMeshInfo = edp_mesh_info,
+                _dp_info: FSDPMeshInfo = dp_mesh_info,
+            ):
+                if param in _expert_params:
+                    return ShardPlacementResult(
+                        placement=Shard(0), mesh_info=_edp_info
+                    )
+                return ShardPlacementResult(
+                    placement=Shard(0), mesh_info=_dp_info
+                )
+
+            fully_shard(
+                layer,
+                **fsdp_config,
+                reshard_after_forward=reshard_after_forward,
+                shard_placement_fn=_shard_placement_fn,
+            )
+        else:
+            fully_shard(
+                layer,
+                **fsdp_config,
+                reshard_after_forward=reshard_after_forward,
+            )
     fully_shard(model, **fsdp_config)
 
     # Disable FSDP's automatic gradient division; the training loop scales
@@ -349,6 +401,26 @@ def _tp_local_param(
     return nn.Parameter(wrapped)
 
 
+def _out_shard_placement(weight: torch.Tensor) -> Shard:
+    """Out-dim shard placement for a column-split GroupedLinear weight.
+
+    The out dim is dim 0 of a single-expert 2D ``(out, in)`` weight and
+    dim 1 of a multi-expert 3D ``(num_experts, out, in)`` weight (see
+    ``grouped_linear.py``); in both cases the rank-local shard is a
+    contiguous out-dim range, so a single ``Shard`` expresses it.
+    """
+    return Shard(0) if weight.ndim == 2 else Shard(1)
+
+
+def _in_shard_placement(weight: torch.Tensor) -> Shard:
+    """In-dim shard placement for a row-split GroupedLinear weight.
+
+    The in dim is dim 1 of a single-expert 2D ``(out, in)`` weight and
+    dim 2 of a multi-expert 3D ``(num_experts, out, in)`` weight.
+    """
+    return Shard(1) if weight.ndim == 2 else Shard(2)
+
+
 def _shard_grouped_linear_columns(
     linear: GroupedLinear, row_start: int, row_end: int
 ) -> None:
@@ -367,11 +439,16 @@ def _shard_grouped_linear_rows(
 
     The same input-column range is kept for every modality expert; the
     output is a partial sum over the mesh that the module-boundary hook
-    all-reduces.
+    all-reduces. Handles the single-expert 2D ``(out, in)`` layout and the
+    multi-expert 3D ``(num_experts, out, in)`` layout alike.
     """
     weight = linear.weight.data
+    if weight.ndim == 3:
+        local = weight[:, :, col_start:col_end]
+    else:
+        local = weight[:, col_start:col_end]
     linear.register_parameter(
-        "weight", nn.Parameter(weight[:, col_start:col_end].contiguous())
+        "weight", nn.Parameter(local.contiguous())
     )
     linear.in_features = col_end - col_start
 
@@ -412,15 +489,15 @@ def _shard_grouped_linear_pairs(
 def _shard_attention_tp(
     attention: Magi2Attention, tp_degree: int, tp_rank: int
 ) -> None:
-    """Slice one Magi2Attention to its TP rank's heads (plain local weights).
+    """Slice one Magi2Attention to its TP rank's heads.
 
-    ``linear_g`` (one out row per head) and ``linear_qkv`` (the
-    ``(3, H, head_dim)`` section layout, sliced per section) are
-    column-split per modality expert on the head axis, ``linear_proj`` is
-    row-split on the head-concatenated input dim (partial output),
-    ``sinks`` is sliced on its head dim, and ``num_heads`` becomes the
-    rank-local count; the replicated pre/q/k norms are unchanged. DTensor
-    wrapping and the boundary hooks are added by the wiring step.
+    ``linear_g`` (one out row per head) and ``linear_qkv`` (head-major
+    q/k/v per head) are column-split per modality expert on the head axis,
+    ``linear_proj`` is row-split on the head-concatenated input dim
+    (partial output), ``sinks`` is sliced on its head dim, and
+    ``num_heads`` becomes the rank-local count; the replicated pre/q/k
+    norms are unchanged. DTensor wrapping and the boundary hooks are added
+    by the wiring step.
     """
     num_heads = attention.num_heads
     _tp_require_divisible(num_heads, tp_degree, "num attention heads")
@@ -508,31 +585,48 @@ def _shard_moe_layer_tp(
 def _wrap_attention_tp(attention: Magi2Attention, mesh: DeviceMesh) -> None:
     """Record honest DTensor placements over the TP-sliced attention weights.
 
-    ``linear_qkv`` (any num_modality) and ``linear_g`` with
-    ``num_modality > 1`` keep plain local slices: their per-expert head
-    slices are not expressible by a single placement on the fused
-    expert-major layout, so DTensor-aware save/restore of those keys is a
-    documented follow-up (same note as ``cp_ulysses`` carries for the
-    head-sharded ``sinks``).
+    Every attention weight becomes a single-placement DTensor: ``linear_g``
+    and ``linear_qkv`` shard the out dim (head-major, so each rank's heads
+    are a contiguous out range), ``linear_proj`` shards the in dim, and
+    ``sinks`` shards its head dim. Multi-expert weights use the 3D
+    ``(num_experts, out, in)`` layout, single-expert weights the 2D
+    ``(out, in)`` layout (see ``grouped_linear.py``); the shard dim
+    follows accordingly.
     """
-    if attention.linear_g.num_experts == 1:
-        attention.linear_g.weight = _tp_local_param(
-            attention.linear_g.weight.data, mesh, Shard(0)
-        )
+    attention.linear_g.weight = _tp_local_param(
+        attention.linear_g.weight.data,
+        mesh,
+        _out_shard_placement(attention.linear_g.weight),
+    )
+    attention.linear_qkv.weight = _tp_local_param(
+        attention.linear_qkv.weight.data,
+        mesh,
+        _out_shard_placement(attention.linear_qkv.weight),
+    )
     attention.linear_proj.weight = _tp_local_param(
-        attention.linear_proj.weight.data, mesh, Shard(1)
+        attention.linear_proj.weight.data,
+        mesh,
+        _in_shard_placement(attention.linear_proj.weight),
     )
     attention.sinks = _tp_local_param(attention.sinks.data, mesh, Shard(1))
 
 
 def _wrap_dense_mlp_tp(mlp: Magi2MLP, mesh: DeviceMesh) -> None:
-    """DTensor placements over the TP-sliced dense MLP weights."""
-    if mlp.up_gate_proj.num_experts == 1:
-        mlp.up_gate_proj.weight = _tp_local_param(
-            mlp.up_gate_proj.weight.data, mesh, Shard(0)
-        )
+    """DTensor placements over the TP-sliced dense MLP weights.
+
+    ``up_gate_proj`` shards the out dim at swiglu7 pair granularity and
+    ``down_proj`` the in dim; both are honest single placements on the
+    per-expert layout (see ``grouped_linear.py``).
+    """
+    mlp.up_gate_proj.weight = _tp_local_param(
+        mlp.up_gate_proj.weight.data,
+        mesh,
+        _out_shard_placement(mlp.up_gate_proj.weight),
+    )
     mlp.down_proj.weight = _tp_local_param(
-        mlp.down_proj.weight.data, mesh, Shard(1)
+        mlp.down_proj.weight.data,
+        mesh,
+        _in_shard_placement(mlp.down_proj.weight),
     )
 
 
@@ -540,10 +634,11 @@ def _wrap_moe_layer_tp(mlp: MultiHeadMoELayer, mesh: DeviceMesh) -> None:
     """DTensor placements over the TP-sliced MoE layer weights.
 
     The routed core reuses the head-parallel ``Shard(0)`` sharding of
-    ``_apply_moe_parallel`` (head-major rows divide at head boundaries);
-    ``modality_specific_shared_expert_fc1`` keeps a plain local slice
-    (per-expert pair blocks, no honest single placement — see
-    ``_wrap_attention_tp``).
+    ``_apply_moe_parallel`` (head-major rows divide at head boundaries).
+    The shared experts use the grouped placements: ``fc1`` shards the out
+    dim at pair granularity and ``fc2`` the in dim, honest single
+    placements on the per-expert layout for the E=3 modality-specific
+    weights as well as the single-expert shared/split/merge weights.
     """
     moe = mlp.moe_mlp
     for param_name in EXPERT_PARAM_NAMES:
@@ -569,8 +664,15 @@ def _wrap_moe_layer_tp(mlp: MultiHeadMoELayer, mesh: DeviceMesh) -> None:
     mlp.shared_expert_fc2.weight = _tp_local_param(
         mlp.shared_expert_fc2.weight.data, mesh, Shard(1)
     )
+    mlp.modality_specific_shared_expert_fc1.weight = _tp_local_param(
+        mlp.modality_specific_shared_expert_fc1.weight.data,
+        mesh,
+        _out_shard_placement(mlp.modality_specific_shared_expert_fc1.weight),
+    )
     mlp.modality_specific_shared_expert_fc2.weight = _tp_local_param(
-        mlp.modality_specific_shared_expert_fc2.weight.data, mesh, Shard(1)
+        mlp.modality_specific_shared_expert_fc2.weight.data,
+        mesh,
+        _in_shard_placement(mlp.modality_specific_shared_expert_fc2.weight),
     )
 
 
@@ -654,20 +756,20 @@ def _apply_tensor_parallel(
     the module boundary (and, conjugately, its input gradient); state-dict
     keys never change.
 
-    Per-rank placements after the partition:
-    - attention: ``linear_g``/``linear_qkv`` column-split per modality
-      expert on the head axis (``linear_g`` with a single modality becomes
-      ``Shard(0)``, the multi-expert and the qkv per-section slices stay
-      plain local slices), ``linear_proj`` ``Shard(1)``, ``sinks``
-      ``Shard(1)`` on the head dim, q/k norms replicated unchanged;
-    - dense MLP: ``up_gate_proj`` column-split at swiglu7 pair granularity
-      (``Shard(0)`` with one modality, else local slice), ``down_proj``
-      ``Shard(1)``;
+    Per-rank placements after the partition (all honest single-placement
+    DTensors; multi-expert weights use the 3D ``(num_experts, out, in)``
+    layout, single-expert weights the 2D ``(out, in)`` layout, and the
+    shard dim follows):
+    - attention: ``linear_g``/``linear_qkv`` shard the out dim on the head
+      axis, ``linear_proj`` the in dim, ``sinks`` ``Shard(1)`` on the head
+      dim, q/k norms replicated unchanged;
+    - dense MLP: ``up_gate_proj`` shards the out dim at swiglu7 pair
+      granularity, ``down_proj`` the in dim;
     - MoE layer: ``split_linear`` ``Shard(0)``, routed core head-sharded
       ``Shard(0)`` like ``_apply_moe_parallel`` (regime (a) compute; the
       TP communication moves to the ``merge_linear`` row split, which is
-      ``Shard(1)``), shared/modality shared experts fc1 pair-split / fc2
-      ``Shard(1)`` (the E=3 fc1 stays a local slice).
+      ``Shard(1)``), shared/modality shared experts fc1 shard the out dim
+      at pair granularity / fc2 the in dim.
 
     Divisibility (asserted with clear errors): attention heads,
     moe_num_heads, hidden size, dense intermediate and shared expert
@@ -860,12 +962,24 @@ def parallelize_magi2_preview(
             else ["fsdp"]
         )
         dp_mesh = parallel_dims.get_mesh(dp_mesh_names)
+        # eFSDP: with EP enabled the routed experts shard over the efsdp
+        # mesh (mirroring llama4's edp_mesh); otherwise no expert mesh.
+        edp_mesh = None
+        if parallel_dims.ep_enabled:
+            edp_mesh_names = (
+                ["dp_replicate", "efsdp"]
+                if parallel_dims.dp_replicate_enabled
+                else ["efsdp"]
+            )
+            edp_mesh = parallel_dims.get_optional_mesh(edp_mesh_names)
         _apply_fsdp(
             model,
             dp_mesh,
             training=training,
             parallelism=parallelism,
             pp_enabled=parallel_dims.pp_enabled,
+            ep_degree=parallel_dims.ep,
+            edp_mesh=edp_mesh,
         )
         logger.info("Applied MAGI-2-preview FSDP")
     elif parallel_dims.dp_replicate_enabled:

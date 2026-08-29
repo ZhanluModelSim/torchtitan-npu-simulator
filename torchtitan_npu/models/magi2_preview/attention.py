@@ -25,13 +25,14 @@ Tensor parallelism: ``parallelize._apply_tensor_parallel`` splits the
 attention heads across the tp mesh with the sequence REPLICATED (v1 has
 no sequence parallel; Shard(seq) norm-boundary layouts like kimi's are a
 later optimization). Per rank: ``linear_g`` and ``linear_qkv`` keep only
-the local heads' out rows of every modality expert (the qkv section
-layout ``(3, heads, head_dim)`` is sliced per section), ``linear_proj``
-keeps only the local heads' input columns and its partial output is
-all-reduced at the module boundary, ``sinks`` is head-sharded on dim 1,
-the replicated q/k norms are unchanged (their gain is per head_dim and
-broadcasts over heads), and ``num_heads`` becomes the rank-local head
-count. Combining TP with CP raises in parallelize (v1).
+the local heads' out rows of every modality expert (the internal
+``linear_qkv`` layout is head-major, so each rank's heads are a
+contiguous out range), ``linear_proj`` keeps only the local heads' input
+columns and its partial output is all-reduced at the module boundary,
+``sinks`` is head-sharded on dim 1, the replicated q/k norms are
+unchanged (their gain is per head_dim and broadcasts over heads), and
+``num_heads`` becomes the rank-local head count. Combining TP with CP
+raises in parallelize (v1).
 """
 
 import logging
@@ -278,8 +279,11 @@ class Magi2Attention(Module):
         T = x_sorted.shape[0]
         h = self.pre_norm(x_sorted, m_splits)
         g = self.linear_g(h, m_splits)  # (T, num_heads)
-        qkv = self.linear_qkv(h, m_splits)  # (T, 3 * num_heads * head_dim)
-        q, k, v = qkv.view(T, 3, self.num_heads, self.head_dim).unbind(1)
+        qkv = self.linear_qkv(h, m_splits)  # (T, num_heads * 3 * head_dim)
+        # The internal linear_qkv layout is head-major (each head's q/k/v
+        # rows are contiguous; see grouped_linear.py and the state-dict
+        # adapter), so the q/k/v sections unbind on the last-but-one dim.
+        q, k, v = qkv.view(T, self.num_heads, 3, self.head_dim).unbind(2)
 
         # Per-head RMSNorm over the last dim; fp32 output.
         q = self.q_norm(q, m_splits)

@@ -9,16 +9,26 @@ Fork reason: MAGI-2-preview uses per-modality expert weights for its
 attention/MLP projections; upstream torchtitan has no equivalent.
 Reference: inference/model/magi2_preview.py::GroupedLinearBase
 
+Internal weight layout (checkpoint contract):
+- ``num_experts == 1``: the weight is the plain 2D ``(out_features,
+  in_features)`` matrix (a regular bias-less linear).
+- ``num_experts > 1``: the weight is ALWAYS stored with a per-expert
+  leading dim, shape ``(num_experts, out_features, in_features)``, with or
+  without tensor parallelism. This is the single internal layout the
+  checkpoint code path relies on: the official MAGI-2 checkpoint keeps the
+  fused expert-major 2D shape ``(num_experts * out_features, in_features)``,
+  and ``state_dict_adapter.Magi2PreviewStateDictAdapter`` converts bijectively
+  between that 2D form and this 3D form (its only layout rule).
+
 Tensor parallelism: ``parallelize._apply_tensor_parallel`` shards these
-weights across the TP mesh. Row (input-dim) splits become ``Shard(1)``
-DTensors and single-expert column splits ``Shard(0)`` DTensors; the
-multi-expert column splits (per-modality expert out-dim slices) are plain
-rank-local slices because no single DTensor placement expresses them on
-the fused expert-major layout. The rank-local weights keep the exact
-layout ``forward`` expects, so the math below is unchanged: slicing at
-head/pair granularity plus rank-local ``in_features``/``out_features``
-bookkeeping is all the parallelize step needs (see the ``slice_*``
-helpers).
+weights across the TP mesh, and the per-expert leading dim makes every split
+an honest, single DTensor placement (no plain local slices): column splits
+shard the out dim (``Shard(1)`` on the 3D layout, ``Shard(0)`` for a
+single-expert 2D weight) and row splits shard the in dim (``Shard(2)`` /
+``Shard(1)``). The out dim is ordered so each rank-local shard is a
+contiguous range: one row per head for head-indexed weights, contiguous
+gate/up pairs for the swiglu7 weights (see the ``slice_*`` helpers), so the
+forward math below is unchanged by parallelism.
 """
 
 import torch
@@ -39,6 +49,16 @@ def _maybe_local(tensor: torch.Tensor) -> torch.Tensor:
     return tensor
 
 
+def _grouped_weight_rows(weight: torch.Tensor, num_experts: int) -> torch.Tensor:
+    """View a GroupedLinear weight as ``(leading, out_features, in_features)``.
+
+    ``leading`` is ``num_experts`` for the multi-expert 3D layout and 1 for
+    the single-expert 2D layout; the last dim is always ``in_features``.
+    """
+    leading = num_experts if num_experts > 1 else 1
+    return weight.reshape(leading, -1, weight.shape[-1])
+
+
 def slice_grouped_linear_by_heads(
     weight: torch.Tensor,
     num_experts: int,
@@ -49,28 +69,28 @@ def slice_grouped_linear_by_heads(
 ) -> torch.Tensor:
     """Head-granular out-dim slice of a GroupedLinear weight for TP.
 
-    The fused weight ``(num_experts * num_sections * num_heads * head_dim,
-    in_features)`` holds, per expert, ``num_sections`` consecutive sections
-    of ``num_heads * head_dim`` rows each, head-major inside a section
-    (head ``h`` owns rows ``[h * head_dim, (h + 1) * head_dim)``). The
-    slice keeps heads ``[head_start, head_end)`` of every expert and
-    section, concatenated per expert in section order — the exact layout a
-    GroupedLinear with ``out_features = num_sections * local_heads *
-    head_dim`` consumes unchanged (e.g. attention ``linear_g`` uses
-    ``num_sections=1, head_dim=1`` and ``linear_qkv`` ``num_sections=3``
-    with the q/k/v section layout).
+    Operates on the internal layout: 2D ``(out_features, in_features)`` for a
+    single expert, 3D ``(num_experts, out_features, in_features)`` otherwise.
+    The out dim is head-major with ``num_sections`` consecutive sections of
+    ``head_dim`` rows per head, so head ``h`` owns the contiguous rows
+    ``[h * num_sections * head_dim, (h + 1) * num_sections * head_dim)``.
+    The slice keeps heads ``[head_start, head_end)`` of every expert — a
+    contiguous out-dim range, hence expressible as one honest ``Shard`` on the
+    out dim. Attention ``linear_g`` uses ``num_sections=1, head_dim=1`` and
+    ``linear_qkv`` ``num_sections=3`` (head-major q/k/v per head).
 
     Args:
-        weight: full (unsharded) fused weight.
+        weight: full (unsharded) weight in the internal layout.
         num_experts: number of modality experts.
-        num_heads: global head count of each section.
-        head_dim: rows per head.
-        num_sections: consecutive head-indexed sections per expert.
+        num_heads: global head count.
+        head_dim: rows per head per section.
+        num_sections: consecutive sections per head.
         head_range: (head_start, head_end) owned by this rank.
 
     Returns:
-        ``(num_experts * num_sections * local_heads * head_dim,
-        in_features)`` contiguous slice.
+        The rank-local slice, out dim narrowed to
+        ``(head_end - head_start) * num_sections * head_dim`` rows (3D for a
+        multi-expert weight, 2D for a single expert).
     """
     head_start, head_end = head_range
     if not 0 <= head_start < head_end <= num_heads:
@@ -78,19 +98,20 @@ def slice_grouped_linear_by_heads(
             f"head_range {head_range} must satisfy "
             f"0 <= start < end <= num_heads={num_heads}"
         )
-    out_features = num_sections * num_heads * head_dim
-    expected = num_experts * out_features
-    if weight.shape[0] != expected:
+    rows_per_head = num_sections * head_dim
+    out_features = num_heads * rows_per_head
+    flat = _grouped_weight_rows(weight, num_experts)
+    if flat.shape[1] != out_features:
         raise ValueError(
-            f"GroupedLinear weight leading dim {weight.shape[0]} does not "
-            f"match num_experts={num_experts} * num_sections={num_sections}"
-            f" * num_heads={num_heads} * head_dim={head_dim} = {expected}"
+            f"GroupedLinear weight out dim {flat.shape[1]} does not match "
+            f"num_heads={num_heads} * num_sections={num_sections}"
+            f" * head_dim={head_dim} = {out_features}"
         )
-    w = weight.view(num_experts, num_sections, num_heads, head_dim, -1)
-    sliced = w[:, :, head_start:head_end]
+    sliced = flat[:, head_start * rows_per_head : head_end * rows_per_head]
+    if num_experts > 1:
+        return sliced.contiguous()
     return sliced.reshape(
-        num_experts * num_sections * (head_end - head_start) * head_dim,
-        weight.shape[1],
+        (head_end - head_start) * rows_per_head, weight.shape[-1]
     ).contiguous()
 
 
@@ -102,22 +123,22 @@ def slice_grouped_linear_by_pairs(
 ) -> torch.Tensor:
     """Pair-granular out-dim slice of a GroupedLinear weight for TP.
 
-    For swiglu7-fused projections (``up_gate_proj``, shared expert
-    ``fc1``), the per-expert out dim interleaves gate/up pairs: rows
-    ``2 * i`` (gate) and ``2 * i + 1`` (up) of pair ``i``. The slice keeps
-    pairs ``[pair_start, pair_end)`` of every expert — an even-offset,
-    even-length row range per expert, so the swiglu7 ``0::2``/``1::2``
-    pairing of the local output is preserved exactly.
+    For swiglu7-fused projections (``up_gate_proj``, shared expert ``fc1``)
+    the out dim interleaves gate/up pairs: rows ``2 * i`` (gate) and
+    ``2 * i + 1`` (up) of pair ``i``. Operates on the internal layout and
+    keeps pairs ``[pair_start, pair_end)`` of every expert — a contiguous
+    out-dim range, so the swiglu7 ``0::2``/``1::2`` pairing of the local
+    output is preserved exactly and the split is one honest out-dim ``Shard``.
 
     Args:
-        weight: full (unsharded) fused weight
-            ``(num_experts * 2 * num_pairs, in_features)``.
+        weight: full (unsharded) weight in the internal layout.
         num_experts: number of modality experts.
         num_pairs: global gate/up pair count of each expert.
         pair_range: (pair_start, pair_end) owned by this rank.
 
     Returns:
-        ``(num_experts * 2 * local_pairs, in_features)`` contiguous slice.
+        The rank-local slice, out dim narrowed to ``2 * (pair_end -
+        pair_start)`` rows (3D for a multi-expert weight, 2D otherwise).
     """
     pair_start, pair_end = pair_range
     if not 0 <= pair_start < pair_end <= num_pairs:
@@ -125,31 +146,35 @@ def slice_grouped_linear_by_pairs(
             f"pair_range {pair_range} must satisfy "
             f"0 <= start < end <= num_pairs={num_pairs}"
         )
-    expected = num_experts * 2 * num_pairs
-    if weight.shape[0] != expected:
+    out_features = 2 * num_pairs
+    flat = _grouped_weight_rows(weight, num_experts)
+    if flat.shape[1] != out_features:
         raise ValueError(
-            f"GroupedLinear weight leading dim {weight.shape[0]} does not "
-            f"match num_experts={num_experts} * 2 * num_pairs={num_pairs}"
-            f" = {expected}"
+            f"GroupedLinear weight out dim {flat.shape[1]} does not match "
+            f"2 * num_pairs={num_pairs} = {out_features}"
         )
-    w = weight.view(num_experts, num_pairs, 2, weight.shape[1])
-    return w[:, pair_start:pair_end].reshape(
-        num_experts * 2 * (pair_end - pair_start), weight.shape[1]
+    sliced = flat[:, 2 * pair_start : 2 * pair_end]
+    if num_experts > 1:
+        return sliced.contiguous()
+    return sliced.reshape(
+        2 * (pair_end - pair_start), weight.shape[-1]
     ).contiguous()
 
 
 class GroupedLinear(nn.Module):
     """Bias-less linear with one expert weight per modality.
 
-    The flat weight layout ``(num_experts * out_features, in_features)``
-    matches the official MAGI-2-preview checkpoint. Rows arrive sorted by
-    modality and are split with ``m_splits`` (row count per expert); each
-    chunk is projected by its own expert slice of the weight. With a single
-    expert this is a plain ``F.linear`` and ``m_splits`` is ignored.
+    The weight layout is documented in the module docstring: a single expert
+    keeps the plain 2D ``(out_features, in_features)`` matrix, while multiple
+    experts always use the per-expert leading dim ``(num_experts,
+    out_features, in_features)``. Rows arrive sorted by modality and are split
+    with ``m_splits`` (row count per expert); each chunk is projected by its
+    own expert slice of the weight. With a single expert this is a plain
+    ``F.linear`` and ``m_splits`` is ignored.
 
-    Under TP the weight becomes a rank-local slice (plain or DTensor, see
-    the module docstring) and ``in_features``/``out_features`` hold the
-    rank-local dims; the forward math is identical.
+    Under TP the weight becomes a rank-local DTensor shard (see the module
+    docstring) and ``in_features``/``out_features`` hold the rank-local dims;
+    the forward math is identical.
 
     Args:
         in_features: input feature dim.
@@ -168,9 +193,11 @@ class GroupedLinear(nn.Module):
         self.in_features = in_features
         self.out_features = out_features
         self.num_experts = num_experts
-        self.weight = nn.Parameter(
-            torch.empty(num_experts * out_features, in_features)
-        )
+        if num_experts > 1:
+            weight = torch.empty(num_experts, out_features, in_features)
+        else:
+            weight = torch.empty(out_features, in_features)
+        self.weight = nn.Parameter(weight)
 
     def forward(
         self, x: torch.Tensor, m_splits: list[int] | None = None
@@ -187,7 +214,7 @@ class GroupedLinear(nn.Module):
                 f"Expected {self.num_experts} m_splits entries, got {len(splits)}"
             )
 
-        weight = weight.view(self.num_experts, self.out_features, self.in_features)
+        weight = weight.reshape(self.num_experts, self.out_features, self.in_features)
         outs = [
             F.linear(chunk, weight[i])
             for i, chunk in enumerate(torch.split(x, splits, dim=0))
