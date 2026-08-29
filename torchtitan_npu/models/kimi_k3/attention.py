@@ -19,6 +19,7 @@ import torch.nn.functional as F
 from torch import nn
 from torch.distributed.tensor import DTensor
 
+from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.rmsnorm import RMSNorm
 from torchtitan.protocols.module import Module
 
@@ -103,9 +104,21 @@ class KimiDeltaAttention(nn.Module):
         self.head_dim = config.head_dim
         projection_size = self.num_heads * self.head_dim
 
-        self.q_proj = nn.Linear(self.hidden_size, projection_size, bias=False)
-        self.k_proj = nn.Linear(self.hidden_size, projection_size, bias=False)
-        self.v_proj = nn.Linear(self.hidden_size, projection_size, bias=False)
+        self.q_proj = Linear.Config(
+            in_features=self.hidden_size,
+            out_features=projection_size,
+            bias=False,
+        ).build()
+        self.k_proj = Linear.Config(
+            in_features=self.hidden_size,
+            out_features=projection_size,
+            bias=False,
+        ).build()
+        self.v_proj = Linear.Config(
+            in_features=self.hidden_size,
+            out_features=projection_size,
+            bias=False,
+        ).build()
 
         self.q_conv1d = ShortConvolution(projection_size, config.conv_kernel_size, activation="silu")
         self.k_conv1d = ShortConvolution(projection_size, config.conv_kernel_size, activation="silu")
@@ -115,22 +128,50 @@ class KimiDeltaAttention(nn.Module):
         self.dt_bias = nn.Parameter(torch.empty(projection_size))
 
         # Gate: f_a_proj -> f_b_proj produces per-head gate
-        self.f_a_proj = nn.Linear(self.hidden_size, self.head_dim, bias=False)
-        self.f_b_proj = nn.Linear(self.head_dim, projection_size, bias=False)
+        self.f_a_proj = Linear.Config(
+            in_features=self.hidden_size,
+            out_features=self.head_dim,
+            bias=False,
+        ).build()
+        self.f_b_proj = Linear.Config(
+            in_features=self.head_dim,
+            out_features=projection_size,
+            bias=False,
+        ).build()
 
         # Beta projection
-        self.b_proj = nn.Linear(self.hidden_size, self.num_heads, bias=False)
+        self.b_proj = Linear.Config(
+            in_features=self.hidden_size,
+            out_features=self.num_heads,
+            bias=False,
+        ).build()
 
         # Output gate
         self.use_full_rank_gate = config.use_full_rank_gate
         if self.use_full_rank_gate:
-            self.g_proj = nn.Linear(self.hidden_size, projection_size, bias=False)
+            self.g_proj = Linear.Config(
+                in_features=self.hidden_size,
+                out_features=projection_size,
+                bias=False,
+            ).build()
         else:
-            self.g_a_proj = nn.Linear(self.hidden_size, self.head_dim, bias=False)
-            self.g_b_proj = nn.Linear(self.head_dim, projection_size, bias=False)
+            self.g_a_proj = Linear.Config(
+                in_features=self.hidden_size,
+                out_features=self.head_dim,
+                bias=False,
+            ).build()
+            self.g_b_proj = Linear.Config(
+                in_features=self.head_dim,
+                out_features=projection_size,
+                bias=False,
+            ).build()
 
         self.o_norm = RMSNormGated(self.head_dim, eps=config.norm_eps)
-        self.o_proj = nn.Linear(projection_size, self.hidden_size, bias=False)
+        self.o_proj = Linear.Config(
+            in_features=projection_size,
+            out_features=self.hidden_size,
+            bias=False,
+        ).build()
 
         self.gate_lower_bound = config.gate_lower_bound
 
@@ -247,30 +288,49 @@ class KimiGatedMLA(nn.Module):
         self.scaling = self.q_head_dim ** (-0.5)
 
         # Query projection with LoRA
-        self.q_a_proj = nn.Linear(self.hidden_size, self.q_lora_rank, bias=False)
+        self.q_a_proj = Linear.Config(
+            in_features=self.hidden_size,
+            out_features=self.q_lora_rank,
+            bias=False,
+        ).build()
         self.q_a_layernorm = RMSNorm.Config(
             normalized_shape=self.q_lora_rank,
             eps=config.norm_eps,
         ).build()
-        self.q_b_proj = nn.Linear(self.q_lora_rank, self.num_heads * self.q_head_dim, bias=False)
+        self.q_b_proj = Linear.Config(
+            in_features=self.q_lora_rank,
+            out_features=self.num_heads * self.q_head_dim,
+            bias=False,
+        ).build()
 
         # KV projection with MQA compression
-        self.kv_a_proj_with_mqa = nn.Linear(
-            self.hidden_size, self.kv_lora_rank + self.qk_rope_head_dim, bias=False
-        )
+        self.kv_a_proj_with_mqa = Linear.Config(
+            in_features=self.hidden_size,
+            out_features=self.kv_lora_rank + self.qk_rope_head_dim,
+            bias=False,
+        ).build()
         self.kv_a_layernorm = RMSNorm.Config(
             normalized_shape=self.kv_lora_rank,
             eps=config.norm_eps,
         ).build()
-        self.kv_b_proj = nn.Linear(
-            self.kv_lora_rank,
-            self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
+        self.kv_b_proj = Linear.Config(
+            in_features=self.kv_lora_rank,
+            out_features=self.num_heads
+            * (self.qk_nope_head_dim + self.v_head_dim),
             bias=False,
-        )
+        ).build()
 
         # Output gate (K3-specific)
-        self.g_proj = nn.Linear(self.hidden_size, self.num_heads * self.v_head_dim, bias=False)
-        self.o_proj = nn.Linear(self.num_heads * self.v_head_dim, self.hidden_size, bias=False)
+        self.g_proj = Linear.Config(
+            in_features=self.hidden_size,
+            out_features=self.num_heads * self.v_head_dim,
+            bias=False,
+        ).build()
+        self.o_proj = Linear.Config(
+            in_features=self.num_heads * self.v_head_dim,
+            out_features=self.hidden_size,
+            bias=False,
+        ).build()
 
     def forward(
         self,

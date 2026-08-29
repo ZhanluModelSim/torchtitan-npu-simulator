@@ -361,6 +361,25 @@ class TestModelRegistry:
 
 
 class TestModelInstantiation:
+    def test_all_linear_modules_satisfy_linear_protocol(self):
+        import torch.nn as nn
+        from torchtitan.components.quantization.module_utils import (
+            verify_module_protocol,
+        )
+        from torchtitan.models.common.linear import Linear
+
+        from torchtitan_npu.models.kimi_k3 import kimi_k3_configs
+        from torchtitan_npu.models.kimi_k3.model import KimiK3Model
+
+        model = KimiK3Model(kimi_k3_configs["debug"]())
+
+        verify_module_protocol(model, nn.Linear, Linear)
+        assert all(
+            isinstance(module, Linear)
+            for module in model.modules()
+            if isinstance(module, nn.Linear)
+        )
+
     def test_npu_converters_cover_all_kimi_rmsnorm_variants(self):
         from torchtitan.models.common.rmsnorm import RMSNorm
 

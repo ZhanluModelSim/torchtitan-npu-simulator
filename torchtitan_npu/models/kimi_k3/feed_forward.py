@@ -13,6 +13,7 @@ import torch.nn.functional as F
 from torch import nn
 from torch.distributed.tensor import DTensor, Partial
 
+from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.rmsnorm import RMSNorm
 from torchtitan.protocols.module import Module
 
@@ -53,21 +54,21 @@ class KimiMLP(Module):
 
     def __init__(self, config: Config):
         super().__init__()
-        self.gate_proj = nn.Linear(
-            config.hidden_size,
-            config.intermediate_size,
+        self.gate_proj = Linear.Config(
+            in_features=config.hidden_size,
+            out_features=config.intermediate_size,
             bias=False,
-        )
-        self.up_proj = nn.Linear(
-            config.hidden_size,
-            config.intermediate_size,
+        ).build()
+        self.up_proj = Linear.Config(
+            in_features=config.hidden_size,
+            out_features=config.intermediate_size,
             bias=False,
-        )
-        self.down_proj = nn.Linear(
-            config.intermediate_size,
-            config.hidden_size,
+        ).build()
+        self.down_proj = Linear.Config(
+            in_features=config.intermediate_size,
+            out_features=config.hidden_size,
             bias=False,
-        )
+        ).build()
         self.act_fn = SituGLU(
             beta=config.beta,
             linear_beta=config.linear_beta,
@@ -161,17 +162,6 @@ class KimiGroupedExperts(nn.Module):
         return torch.cat(outputs, dim=0) if outputs else torch.empty_like(x)
 
 
-class KimiRouterLinear(nn.Linear):
-    """Router projection evaluated in float32, matching the reference model."""
-
-    def forward(self, input_tensor: torch.Tensor) -> torch.Tensor:
-        return F.linear(
-            input_tensor.float(),
-            self.weight.float(),
-            None,
-        )
-
-
 class KimiMoEGate(nn.Module):
     """Kimi sigmoid router with correction bias and optional group limiting."""
 
@@ -197,11 +187,11 @@ class KimiMoEGate(nn.Module):
         self.renormalize = renormalize
         self.debug_force_load_balance = debug_force_load_balance
 
-        self.gate = KimiRouterLinear(
-            hidden_size,
-            num_experts,
+        self.gate = Linear.Config(
+            in_features=hidden_size,
+            out_features=num_experts,
             bias=False,
-        )
+        ).build()
         self.register_parameter(
             "e_score_correction_bias",
             nn.Parameter(torch.zeros(num_experts)),
@@ -213,7 +203,11 @@ class KimiMoEGate(nn.Module):
         hidden_states: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         hidden_flat = hidden_states.view(-1, hidden_states.shape[-1])
-        logits = self.gate(hidden_flat)
+        logits = F.linear(
+            hidden_flat.float(),
+            self.gate.weight.float(),
+            None,
+        )
         if self.score_func == "sigmoid":
             scores = logits.sigmoid()
         elif self.score_func == "softmax":
@@ -361,16 +355,16 @@ class KimiSparseMoeBlock(nn.Module):
         )
 
         if self.use_latent_moe:
-            self.routed_expert_down_proj = nn.Linear(
-                config.hidden_size,
-                self.moe_hidden_size,
+            self.routed_expert_down_proj = Linear.Config(
+                in_features=config.hidden_size,
+                out_features=self.moe_hidden_size,
                 bias=False,
-            )
-            self.routed_expert_up_proj = nn.Linear(
-                self.moe_hidden_size,
-                config.hidden_size,
+            ).build()
+            self.routed_expert_up_proj = Linear.Config(
+                in_features=self.moe_hidden_size,
+                out_features=config.hidden_size,
                 bias=False,
-            )
+            ).build()
             if config.latent_moe_use_norm:
                 self.routed_expert_norm = RMSNorm.Config(
                     normalized_shape=self.moe_hidden_size,

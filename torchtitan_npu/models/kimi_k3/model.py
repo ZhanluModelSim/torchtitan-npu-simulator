@@ -19,6 +19,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from torchtitan.models.common.attention import AttentionMasksType
+from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.rmsnorm import RMSNorm
 from torchtitan.protocols.module import Module, ModuleDict
 
@@ -37,7 +38,11 @@ class KimiAttentionResidual(nn.Module):
             normalized_shape=dim,
             eps=eps,
         ).build()
-        self.proj = nn.Linear(dim, 1, bias=False)
+        self.proj = Linear.Config(
+            in_features=dim,
+            out_features=1,
+            bias=False,
+        ).build()
 
     def forward(
         self,
@@ -263,7 +268,11 @@ class KimiK3Model(Module):
             normalized_shape=config.dim,
             eps=config.norm_eps,
         ).build()
-        self.output = nn.Linear(config.dim, config.vocab_size, bias=False)
+        self.output = Linear.Config(
+            in_features=config.dim,
+            out_features=config.vocab_size,
+            bias=False,
+        ).build()
 
     def verify_module_protocol(self) -> None:
         """Verify model conforms to torchtitan's module protocol."""
