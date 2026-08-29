@@ -31,6 +31,10 @@ from torchtitan_npu.models.deepseek_v4.pipeline_parallel import (
     _is_deepseek_v4_pp_target,
     _with_deepseek_v4_pp_input_ids,
 )
+from torchtitan_npu.models.magi2_preview.pipeline_parallel import (
+    _is_magi2_preview_pp_target,
+    _with_magi2_preview_pp_kwargs,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -79,6 +83,27 @@ def _patch_post_dataloading_process_for_deepseek_v4_pp_input_ids() -> None:
 
 
 _patch_post_dataloading_process_for_deepseek_v4_pp_input_ids()
+
+
+def _patch_post_dataloading_process_for_magi2_preview_pp_kwargs() -> None:
+    if getattr(titan_trainer.Trainer, "npu_magi2_pp_kwargs_patched", False):
+        return
+
+    original = titan_trainer.Trainer.post_dataloading_process
+
+    @wraps(original)
+    def wrapper(self, *args, **kwargs):
+        result = original(self, *args, **kwargs)
+        if _is_magi2_preview_pp_target(self):
+            result = _with_magi2_preview_pp_kwargs(self, result)
+        return result
+
+    titan_trainer.Trainer.post_dataloading_process = wrapper
+    titan_trainer.Trainer.npu_magi2_pp_kwargs_patched = True
+    logger.info("[Patch] Registered MAGI-2-preview PP kwargs forwarding hook.")
+
+
+_patch_post_dataloading_process_for_magi2_preview_pp_kwargs()
 
 
 def backward_maybe_with_nosync(

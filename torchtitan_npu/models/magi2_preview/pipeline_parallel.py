@@ -31,14 +31,51 @@ Adapts torchtitan's ``pipeline_llm`` protocol (see the pinned torchtitan
   unchanged and the trainer rescales by ``global_valid_tokens`` exactly
   as in the non-PP path.
 
-v1 restrictions (asserted):
-- A single microbatch (``local_batch_size ==
-  pipeline_parallel_microbatch_size``): packed ``cu_seqlens`` /
-  ``coords_mapping`` boundary tensors cannot be re-chunked across pack
-  boundaries, so multi-microbatch PP needs pack-aware microbatching
-  first. Consequently pp > 1 must use a schedule that runs with one
-  microbatch (e.g. ``GPipe``): torch's 1F1B rejects ``n_microbatches <
-  num_stages``.
+Microbatches (pack-aware):
+- ``n_microbatches = local_batch_size // pipeline_parallel_microbatch_size``
+  (same formula as torchtitan's ``build_pipeline_schedule``). The MAGI-2
+  dataloaders yield one packed sequence per iteration, so one
+  ``pp_schedule.step()`` call receives one packed batch and the schedule
+  runs it as ``n_microbatches`` pipeline microbatches.
+- torch pipelining's own ``step()`` chunks positional args/target
+  uniformly along dim 0, which cannot respect ``cu_seqlens`` pack
+  boundaries. For ``n_microbatches > 1`` the built schedule is therefore
+  given a pack-aware ``step()`` (``_pack_aware_step``): the packed
+  batch is split into ``n_microbatches`` sub-packs at pack boundaries
+  (``split_packed_batch``; contiguous, token-balanced pack grouping, so
+  every microbatch is itself a valid packed batch with rebased
+  ``cu_seqlens``) and the pre-split microbatches are fed to the
+  schedule's internal ``_step_microbatches``. Gradients accumulate
+  across the microbatches of a ``step()`` call exactly like the
+  trainer's gradient accumulation, so sum-MSE losses add up to the
+  unsplit-batch loss (the trainer then divides by
+  ``global_valid_tokens`` as in the non-PP path).
+- Inter-stage activation shapes must be identical across all
+  microbatches of a step AND across step() calls (torch pipelining
+  sizes its recv buffers once from the first microbatch's metadata).
+  Sub-packs have different token counts, so for multi-stage pipelines
+  every stage pads ``(h, rope)`` to the whole-batch token count before
+  sending and slices back to its own sub-pack's ``cu_seqlens[-1]``
+  after receiving (``pp_padded_seq_len`` kwarg injected per
+  microbatch); each stage's actual computation stays on its exact
+  sub-pack tokens, so the padding is transport-only and numerically
+  inert. When a later step() call carries a different total token
+  count, the stage metadata is re-inferred (resetting the schedule's
+  forward/backward-initialized flags) at the cost of one probe
+  fwd/bwd.
+
+Constraint set (checked here and in torch pipelining):
+- ``local_batch_size`` must be divisible by
+  ``pipeline_parallel_microbatch_size``.
+- ``n_microbatches > 1`` requires a single-stage schedule class
+  (``GPipe``/``1F1B``): the pack-aware step drives
+  ``PipelineScheduleSingle._step_microbatches``. Looped/V schedules
+  raise ``NotImplementedError``.
+- 1F1B itself requires ``n_microbatches >= num_total_stages``
+  (enforced by ``Schedule1F1B``); GPipe runs with any count >= 1.
+- Every packed batch must contain at least ``n_microbatches`` complete
+  packs (asserted by ``split_packed_batch``); packs are never split
+  across microbatches.
 - Combining PP with CP/TP/EP/ETP raises ``NotImplementedError`` in
   ``parallelize.parallelize_magi2_preview`` (called per stage part).
 """
@@ -83,6 +120,8 @@ __all__ = [
     "pipeline_magi2",
     "generate_magi2_fqn_per_model_part",
     "magi2_pipeline_module_split",
+    "partition_pack_boundaries",
+    "split_packed_batch",
 ]
 
 
@@ -189,6 +228,162 @@ def generate_magi2_fqn_per_model_part(
     return module_names_per_stage
 
 
+def _groups_needed(pack_lens: list[int], cap: int) -> int:
+    """Number of contiguous groups with sum <= ``cap`` (first-fit greedy)."""
+    groups, current = 1, 0
+    for length in pack_lens:
+        if current + length > cap:
+            groups += 1
+            current = length
+        else:
+            current += length
+    return groups
+
+
+def partition_pack_boundaries(pack_lens: list[int], n_groups: int) -> list[int]:
+    """Contiguous pack-index boundaries for a token-balanced partition.
+
+    Splits ``pack_lens`` (per-pack token counts, original pack order)
+    into ``n_groups`` non-empty contiguous groups minimizing the maximum
+    group token sum (binary search over the smallest feasible cap, then
+    a greedy cut that leaves at least one pack for every remaining
+    group). Deterministic; group sums never exceed the optimal cap.
+
+    Returns:
+        ``n_groups + 1`` pack indices ``b`` with group ``i`` covering
+        packs ``[b[i], b[i+1])``.
+    """
+    if n_groups < 1:
+        raise ValueError(f"n_groups must be >= 1, got {n_groups}")
+    if len(pack_lens) < n_groups:
+        raise ValueError(
+            f"Cannot split {len(pack_lens)} packs into {n_groups} non-empty groups"
+        )
+    lo, hi = max(pack_lens), sum(pack_lens)
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if _groups_needed(pack_lens, mid) <= n_groups:
+            hi = mid
+        else:
+            lo = mid + 1
+    cap = lo
+
+    bounds = [0]
+    current = 0
+    groups_left = n_groups
+    for i, length in enumerate(pack_lens):
+        packs_left = len(pack_lens) - i
+        # Close the current group before pack i when adding it would
+        # overflow the cap, or when taking it would leave fewer packs
+        # than the remaining groups still need (packs_left < groups_left
+        # means the open group plus every later group could no longer
+        # each receive at least one pack).
+        cut = groups_left > 1 and i > 0 and (
+            current + length > cap or packs_left < groups_left
+        )
+        if cut:
+            bounds.append(i)
+            groups_left -= 1
+            current = length
+        else:
+            current += length
+    bounds.append(len(pack_lens))
+    return bounds
+
+
+def split_packed_batch(
+    args: tuple,
+    kwargs: dict | None,
+    target: torch.Tensor | None,
+    n_microbatches: int,
+) -> tuple[list[tuple], list[dict], list | None]:
+    """Split one packed MAGI-2-preview batch into pipeline microbatches.
+
+    The split happens at ``cu_seqlens`` pack boundaries, so every
+    microbatch is itself a valid packed batch: per-token fields
+    (``x``/``coords_mapping``/``modality_mapping``/``time_embedding``/
+    ``labels``) are sliced to the group's token range and ``cu_seqlens``
+    is rebased to start at 0. Packs are grouped with
+    ``partition_pack_boundaries`` (contiguous, token-balanced).
+
+    Args:
+        args: positional step() args (first-stage view: the packed token
+            tensor ``(T, C)``); every tensor must span the full sequence.
+        kwargs: step() kwargs carrying the boundary tensors; must include
+            ``cu_seqlens``. Tensors with ``T`` rows are token-sliced,
+            ``num_packs`` rows are pack-sliced, anything else is passed
+            through per microbatch (scalars) or rejected.
+        target: ``(T, ...)`` labels on the last stage, or ``None``.
+        n_microbatches: number of microbatches to split into.
+
+    Returns:
+        ``(arg_mbs, kwarg_mbs, target_mbs)`` lists of length
+        ``n_microbatches`` (``target_mbs`` is ``None`` when ``target``
+        is), ready for ``_PipelineSchedule._step_microbatches``.
+    """
+    kwargs = dict(kwargs) if kwargs else {}
+    cu_seqlens = kwargs.get("cu_seqlens")
+    if cu_seqlens is None:
+        raise ValueError(
+            "magi2_preview pack-aware PP microbatching requires the cu_seqlens "
+            "kwarg (packed batch boundaries) on every pipeline rank"
+        )
+    cu = [int(v) for v in cu_seqlens.tolist()]
+    num_packs = len(cu) - 1
+    if num_packs < n_microbatches:
+        raise ValueError(
+            f"magi2_preview PP needs at least {n_microbatches} complete packs "
+            f"per packed batch to form {n_microbatches} microbatches, got "
+            f"{num_packs} (cu_seqlens={cu}); packs are never split across "
+            f"microbatches. Reduce pipeline microbatches or pack more samples."
+        )
+    total = cu[-1]
+    for value in args:
+        if torch.is_tensor(value) and value.shape[0] != total:
+            raise ValueError(
+                f"magi2_preview pack-aware PP expects positional args spanning the "
+                f"full packed sequence ({total} tokens), got shape {tuple(value.shape)}"
+            )
+    if target is not None and target.shape[0] != total:
+        raise ValueError(
+            f"magi2_preview pack-aware PP expects target spanning the full packed "
+            f"sequence ({total} tokens), got shape {tuple(target.shape)}"
+        )
+
+    pack_lens = [cu[i + 1] - cu[i] for i in range(num_packs)]
+    bounds = partition_pack_boundaries(pack_lens, n_microbatches)
+
+    arg_mbs: list[tuple] = []
+    kwarg_mbs: list[dict] = []
+    target_mbs: list = []
+    for lo_pack, hi_pack in zip(bounds[:-1], bounds[1:], strict=True):
+        lo, hi = cu[lo_pack], cu[hi_pack]
+        sub_kwargs = {}
+        for name, value in kwargs.items():
+            if name == "cu_seqlens":
+                sub_kwargs[name] = cu_seqlens[lo_pack : hi_pack + 1] - cu_seqlens[lo_pack]
+            elif torch.is_tensor(value):
+                if value.shape[0] == total:
+                    sub_kwargs[name] = value[lo:hi]
+                elif value.shape[0] == num_packs:
+                    sub_kwargs[name] = value[lo_pack:hi_pack]
+                else:
+                    raise ValueError(
+                        f"magi2_preview pack-aware PP cannot split kwarg {name!r} "
+                        f"with shape {tuple(value.shape)}: leading dim must be the "
+                        f"packed token count ({total}) or the pack count ({num_packs})"
+                    )
+            else:
+                sub_kwargs[name] = value
+        arg_mbs.append(
+            tuple(value[lo:hi] if torch.is_tensor(value) else value for value in args)
+        )
+        kwarg_mbs.append(sub_kwargs)
+        if target is not None:
+            target_mbs.append(target[lo:hi])
+    return arg_mbs, kwarg_mbs, target_mbs if target is not None else None
+
+
 def _stage_bookkeeping(
     modality_mapping: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, list[int], torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -223,6 +418,7 @@ def _magi2_stage_forward(
     modality_mapping: torch.Tensor | None = None,
     time_embedding: torch.Tensor | None = None,
     cu_seqlens: torch.Tensor | None = None,
+    pp_padded_seq_len: int | None = None,
 ):
     """PP-aware forward bound onto each stage model part.
 
@@ -241,6 +437,17 @@ def _magi2_stage_forward(
 
     A single-stage split (num_stages == 1) keeps both adapters and
     reproduces the full model forward.
+
+    Multi-microbatch transport (``pp_padded_seq_len`` set by the
+    pack-aware schedule step, multi-stage pipelines only): torch
+    pipelining fixes inter-stage activation shapes from the first
+    microbatch, but sub-packs have different token counts. Non-last
+    stages therefore pad ``(h, rope)`` with zeros to the whole-batch
+    token count before returning them, and non-first stages slice the
+    received activations back to their sub-pack's ``cu_seqlens[-1]``
+    before any computation. The padding never enters the math (every
+    stage computes on its exact sub-pack rows), it only makes the P2P
+    shapes uniform.
     """
     is_first = self.pre_adapter is not None
     is_last = self.post_adapter is not None
@@ -252,6 +459,10 @@ def _magi2_stage_forward(
     if is_first and coords_mapping is None:
         raise ValueError(
             "magi2_preview PP first stage forward requires the coords_mapping kwarg"
+        )
+    if pp_padded_seq_len is not None and cu_seqlens is None:
+        raise ValueError(
+            "magi2_preview PP padded transport requires the cu_seqlens kwarg"
         )
 
     sort_idx, inv_sort_idx, m_splits, video_idx, audio_idx, text_idx = (
@@ -273,6 +484,11 @@ def _magi2_stage_forward(
         rope = rope.detach().requires_grad_(True)
         h = x_emb.index_select(0, sort_idx)
     else:
+        if pp_padded_seq_len is not None:
+            sub_seq_len = int(cu_seqlens[-1])
+            x = x[:sub_seq_len]
+            if rope is not None:
+                rope = rope[:sub_seq_len]
         h = x
 
     h = self.block(h, rope, sort_idx, inv_sort_idx, m_splits, cu_seqlens)
@@ -280,6 +496,10 @@ def _magi2_stage_forward(
     if is_last:
         h = h.index_select(0, inv_sort_idx)
         return self.post_adapter(h, video_idx, audio_idx)
+    if pp_padded_seq_len is not None:
+        pad = pp_padded_seq_len - h.shape[0]
+        h = nn.functional.pad(h, (0, 0, 0, pad))
+        rope = nn.functional.pad(rope, (0, 0, 0, pad))
     return h, rope
 
 
@@ -433,6 +653,95 @@ def magi2_pipeline_module_split(
     return stages, models
 
 
+def _pack_aware_step(
+    self,
+    *args,
+    target=None,
+    losses: list | None = None,
+    return_outputs: bool = True,
+    **kwargs,
+):
+    """Pack-aware ``step()`` for ``PipelineScheduleSingle`` schedules.
+
+    torch pipelining's own ``step()`` chunks positional args and target
+    uniformly along dim 0 (``split_args_kwargs_into_chunks`` /
+    ``torch.tensor_split``), which would cut packs mid-sequence and
+    invalidate the ``cu_seqlens`` bookkeeping. This step instead splits
+    the packed batch at pack boundaries (``split_packed_batch``) and
+    drives the schedule's internal ``_step_microbatches`` with the
+    pre-split lists, mirroring the surrounding bookkeeping of
+    ``PipelineScheduleSingle.step``.
+
+    Multi-stage transport: it also injects the per-microbatch
+    ``pp_padded_seq_len`` kwarg (whole-batch token count) so stage
+    forwards pad/slice inter-stage activations to a uniform shape, and
+    re-initializes the stage metadata whenever the whole-batch token
+    count changes between step() calls (torch pipelining sizes recv
+    buffers from the first microbatch's metadata; see the module
+    docstring).
+    """
+    if self._has_backward and not torch.is_grad_enabled():
+        raise RuntimeError(
+            "step() requires gradients to be enabled for backward computation; "
+            "it should not be used under torch.no_grad() context. "
+            "Please call eval() instead."
+        )
+
+    arg_mbs, kwarg_mbs, target_mbs = split_packed_batch(
+        args, kwargs, target, self._n_microbatches
+    )
+    width = int(kwargs["cu_seqlens"][-1])
+    if self._stage.num_stages > 1:
+        packed_width = getattr(self, "_magi2_packed_width", None)
+        if packed_width is not None and packed_width != width:
+            # Recv buffers are sized by the first step's metadata; a
+            # different whole-batch token count needs a re-inference
+            # (one probe fwd/bwd through the stages).
+            logger.info(
+                f"magi2_preview PP re-initializing pipeline metadata: "
+                f"packed batch width changed {packed_width} -> {width}"
+            )
+            self._stage_forward_initialized = False
+            self._stage_backward_initialized = False
+        self._magi2_packed_width = width
+        for kwarg_mb in kwarg_mbs:
+            kwarg_mb["pp_padded_seq_len"] = width
+
+    # Mirror PipelineScheduleSingle.step around _step_microbatches.
+    self._stage.has_backward = self._has_backward
+    self._stage.clear_runtime_states()
+    self._step_microbatches(
+        arg_mbs, kwarg_mbs, target_mbs, losses, return_outputs
+    )
+    if self._stage.is_last and return_outputs:
+        return self._merge_outputs(self._stage.output_chunks)
+    return None
+
+
+_PACK_AWARE_SCHEDULE_CLASSES: dict[type, type] = {}
+
+
+def _pack_aware_schedule_class(base_class: type) -> type:
+    """Cached subclass of a schedule class with the pack-aware step().
+
+    The subclass adds no instance state, so a constructed schedule can
+    be converted in place with ``schedule.__class__ = ...`` (keeps the
+    construction path — including simulator patches — identical to the
+    single-microbatch case). It must stay a single-base subclass: any
+    additional base changes the object layout and ``__class__``
+    assignment rejects it.
+    """
+    cls = _PACK_AWARE_SCHEDULE_CLASSES.get(base_class)
+    if cls is None:
+        cls = type(
+            f"Magi2PackAware{base_class.__name__}",
+            (base_class,),
+            {"step": _pack_aware_step},
+        )
+        _PACK_AWARE_SCHEDULE_CLASSES[base_class] = cls
+    return cls
+
+
 def pipeline_magi2(
     model: nn.Module,
     *,
@@ -453,7 +762,9 @@ def pipeline_magi2(
     Splits ``model`` into stages over the pp mesh, applies the SPMD
     parallelisms per stage part through ``parallelize_fn`` and builds the
     pipeline schedule with the flow-matching loss on the last stage.
-    See the module docstring for the stage dataflow and v1 restrictions.
+    With more than one microbatch the schedule additionally gains the
+    pack-aware ``step()`` (see the module docstring for the stage
+    dataflow and the full constraint set).
     """
     pp_mesh = parallel_dims.get_mesh("pp")
 
@@ -519,20 +830,22 @@ def pipeline_magi2(
                 f"({parallel_dims.pp}) to divide num_layers ({num_layers})"
             )
 
-    # v1 microbatch restriction: the packed cu_seqlens/coords_mapping
-    # boundary tensors cannot be re-chunked across pack boundaries, so PP
-    # runs a single microbatch (one whole pack) per step.
+    # Microbatch contract: one step() call receives one packed batch and
+    # runs it as n_microbatches pack-aware sub-packs (module docstring).
     microbatch_size = parallelism.pipeline_parallel_microbatch_size
-    if (
-        training.local_batch_size % microbatch_size != 0
-        or training.local_batch_size // microbatch_size != 1
-    ):
+    if training.local_batch_size % microbatch_size != 0:
         raise ValueError(
-            f"MAGI-2-preview PP v1 runs exactly one microbatch per step: "
-            f"packed cu_seqlens/coords_mapping cannot be re-chunked across pack "
-            f"boundaries. Set pipeline_parallel_microbatch_size "
-            f"({microbatch_size}) equal to local_batch_size "
-            f"({training.local_batch_size})."
+            f"MAGI-2-preview PP requires local_batch_size "
+            f"({training.local_batch_size}) to be divisible by "
+            f"pipeline_parallel_microbatch_size ({microbatch_size})."
+        )
+    n_microbatches = training.local_batch_size // microbatch_size
+    if n_microbatches > 1 and not is_single_stage_schedule:
+        raise NotImplementedError(
+            f"MAGI-2-preview multi-microbatch PP ({n_microbatches} microbatches) "
+            f"pack-splits one packed batch at cu_seqlens boundaries, which is "
+            f"only wired for single-stage schedules (GPipe/1F1B), not "
+            f"{parallelism.pipeline_parallel_schedule!r}."
         )
 
     module_names_per_stage = parallelism.module_fqns_per_model_part
@@ -577,6 +890,11 @@ def pipeline_magi2(
         stages=stages,
         loss_fn=loss_fn,
     )
+    if n_microbatches > 1:
+        # Replace torch's uniform-dim-0 chunking step() with the
+        # pack-aware one (single-stage schedules only; checked above).
+        assert isinstance(pp_schedule, PipelineScheduleSingle)
+        pp_schedule.__class__ = _pack_aware_schedule_class(type(pp_schedule))
 
     # The train loop uses these to decide whether to pass inputs/labels.
     has_first_stage = False
@@ -588,3 +906,47 @@ def pipeline_magi2(
             has_last_stage = True
 
     return pp_schedule, model_parts, has_first_stage, has_last_stage
+
+
+_MAGI2_PP_FORWARD_KWARG_NAMES = (
+    "coords_mapping",
+    "modality_mapping",
+    "time_embedding",
+    "cu_seqlens",
+)
+
+
+def _is_magi2_preview_pp_target(trainer) -> bool:
+    """True when this trainer runs MAGI-2-preview with PP enabled."""
+    parallel_dims = getattr(trainer, "parallel_dims", None)
+    if not getattr(parallel_dims, "pp_enabled", False):
+        return False
+
+    model_spec = getattr(trainer.config, "model_spec", None)
+    return getattr(model_spec, "name", None) == "magi2_preview"
+
+
+def _with_magi2_preview_pp_kwargs(trainer, result):
+    """Move MAGI-2 boundary tensors into ``extra_kwargs`` for all stages.
+
+    The trainer's PP branch calls ``pp_schedule.step(**extra_kwargs, ...)``
+    on non-first stages, so only ``extra_kwargs`` reach intermediate
+    stages; the packed-token boundary tensors (which the default
+    ``post_dataloading_process`` leaves in ``extra_inputs``) must travel
+    as extra kwargs for every stage to recompute its modality
+    bookkeeping. Float tensors are detached (they feed no parameters).
+    """
+    del trainer
+    inputs, labels, extra_inputs, extra_kwargs = result
+    extra_inputs = extra_inputs or {}
+    extra_kwargs = extra_kwargs or {}
+
+    for name in _MAGI2_PP_FORWARD_KWARG_NAMES:
+        if name not in extra_inputs:
+            continue
+        tensor = extra_inputs.pop(name)
+        if extra_kwargs.get(name) is None:
+            if tensor.is_floating_point():
+                tensor = tensor.detach()
+            extra_kwargs[name] = tensor
+    return inputs, labels, extra_inputs, extra_kwargs
