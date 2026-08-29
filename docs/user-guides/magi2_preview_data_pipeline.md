@@ -57,7 +57,11 @@ magi2_latent_shards/
 ## 2. 预处理脚本
 
 脚本：`scripts/magi2_preprocess_latents.py`。编码器相关依赖全部**延迟导入**，
-缺少依赖或权重时给出可操作的报错。
+缺少仓库、依赖或权重时给出可操作的报错。三种模式：
+
+- `--dry-run`：随机 latent 冒烟（无需权重，CPU 可跑）；
+- `--self-test`：stub 编码器打通完整管线（无需权重/视频文件，CPU 确定性）；
+- 真实编码：对接官方 MAGI-2-preview 推理仓库与权重（`--magi2-repo` + manifest）。
 
 ### 2.1 `--dry-run`（无需权重，CPU 可跑）
 
@@ -75,25 +79,110 @@ python3 scripts/magi2_preprocess_latents.py \
 `--dry-run` 会轮流使用几种小的 `(T, H, W)` 形状，以便同时覆盖分桶与多形状打包
 路径。生成的目录可直接被 `Magi2LatentDataLoader` 读取（单元测试即如此验证）。
 
-### 2.2 真实编码
+### 2.2 权重目录（官方 `hf download` 布局）
 
-真实编码需要官方 MAGI-2 推理仓库在 `PYTHONPATH` 上，且提供视频 VAE、文本
-编码器（及可选音频 VAE）权重：
+真实编码需要三组权重，目录名与官方仓库 README 的 `ckpt/` 布局一致
+（`hf download sand-ai/MAGI-2-preview --local-dir ckpt`；完整仓库约 307 GB，
+预处理只需要其中三个子目录）：
 
-```bash
-PYTHONPATH=/path/to/MAGI-2 python3 scripts/magi2_preprocess_latents.py \
-    --input ./videos \
-    --output-dir ./magi2_latent_shards \
-    --vae-ckpt /weights/Wan2.2_VAE.pth \
-    --text-encoder-path /weights/qwen3.5 \
-    [--audio-vae-ckpt /weights/sa_audio_vae] \
-    --device cuda
+```
+ckpt/
+├── text_encoder/                # Qwen3.5 文本编码器（--text-encoder-path）
+├── vae/                         # 视频 VAE（--vae-ckpt）
+│   └── Wan2.2_VAE.pth
+└── stable-audio-open-1.0/       # 音频 VAE（--audio-vae-ckpt）
+    ├── model_config.json
+    └── model.safetensors
 ```
 
-- `--input` 目录中每个 `<name>.mp4` 需配一个 `<name>.txt` 字幕；提供
-  `--audio-vae-ckpt` 时还需 `<name>.wav` 波形。
-- 编码器导入是惰性的；未提供权重或依赖缺失时会明确报错并提示如何补齐。
-- 未提供 `--audio-vae-ckpt` 时，音频张量写为 0 行，加载端按纯视频+文本处理。
+| 参数 | 目录 | 官方内容 | 大小 |
+| --- | --- | --- | --- |
+| `--text-encoder-path` | `ckpt/text_encoder` | Qwen/Qwen3.5-27B 文本编码器 | ~56 GB |
+| `--vae-ckpt` | `ckpt/vae` | Wan2.2 视频 VAE（`Wan2.2_VAE.pth`） | ~3 GB |
+| `--audio-vae-ckpt` | `ckpt/stable-audio-open-1.0` | Stable Audio Open 音频 VAE | ~5 GB |
+
+只下载预处理所需子目录：
+
+```bash
+pip install huggingface_hub
+hf download sand-ai/MAGI-2-preview --local-dir ckpt \
+    --include "vae/*" "text_encoder/*" "stable-audio-open-1.0/*"
+```
+
+（`preview/`、`refiner/`、`turbo_vae/` 为推理/精修权重，预处理不需要。）
+
+### 2.3 真实编码（官方编码器）
+
+需要官方推理仓库的本地克隆，经 `--magi2-repo` 传入（脚本会把它插入
+`sys.path` 并惰性导入：`inference/model/vae2_2.py` 的 `get_vae2_2`、
+`inference/model/qwen35.py` 的 `Qwen35TextEncoder`、
+`inference/pipeline/audio_decoder.py` 的 `SAAudioFeatureExtractor`）。
+输入用 JSON Lines manifest，每行一个样本：
+
+```jsonl
+{"video": "videos/clip0001.mp4", "caption": "A red fox runs through the snow.", "audio": "audio/clip0001.wav", "id": "clip0001"}
+{"video": "videos/clip0002.mp4", "caption": "Waves crash on a black-sand beach."}
+```
+
+- `video`/`caption` 必填；`audio` 可选（提供 `--audio-vae-ckpt` 时才编码）；
+  `id` 可选，缺省取视频文件名主干（确定性；id 不得含 `.`、不得重复）。
+- 相对路径按 manifest 所在目录解析。
+- 兼容旧的目录模式 `--input`：`<name>.mp4` + `<name>.txt`
+  （提供 `--audio-vae-ckpt` 时还需 `<name>.wav`）。
+
+完整示例：
+
+```bash
+git clone https://github.com/SandAI-org/MAGI-2-preview
+
+python3 scripts/magi2_preprocess_latents.py \
+    --magi2-repo ./MAGI-2-preview \
+    --input-manifest ./data/train_manifest.jsonl \
+    --output-dir ./magi2_latent_shards \
+    --vae-ckpt ./ckpt/vae \
+    --text-encoder-path ./ckpt/text_encoder \
+    --audio-vae-ckpt ./ckpt/stable-audio-open-1.0 \
+    --device cuda \
+    --samples-per-shard 64
+```
+
+#### 帧采样与张量约定
+
+与官方推理配置一致（`inference/common/magi2_config.py` 的 `video_fps=25` /
+`vae_stride=(8,16,16)` / `audio_latent_fps=25`）：
+
+- **时间**：按 25 fps 抽帧（源帧率更高时按 `round(fps_src / 25)` 抽稀，
+  不做上采样），再裁剪到 `T ≡ 1 (mod 8)`；VAE 时间下采样 8×（因果，首帧
+  自成一段），得 `T_latent = (T - 1) / 8 + 1` 帧 latent。过短（不足一个
+  时间窗）的视频报错。
+- **空间**：中心裁剪到 16 的倍数（patchify 2× + 三次 2× 下采样）。
+- **视频**：像素归一化到 `[-1, 1]`，`Wan2_2_VAE.encode`（float32）输出
+  `(48, T, H, W)`，以 `float16` 写入分片。
+- **文本**：`Qwen35TextEncoder`（bf16、`skip_layer=2`，与官方推理管线一致），
+  输出 `(L_t, 5120)`。
+- **音频**：波形经 `SAAudioFeatureExtractor` 编码后，沿时间轴重采样到
+  25 行/秒（`scipy.signal.resample`，与官方 `resample_audio_sinc` 同一实现），
+  长度与视频时长对齐（行数 = 抽帧后的像素帧数），输出 `(L_a, 64)`；
+  无音频的样本写 0 行，加载端按纯视频+文本处理。
+- 视频解码惰性导入：优先 `torchvision.io.read_video`，否则 `imageio` +
+  `imageio-ffmpeg`（官方仓库 requirements 自带 torchvision）；音频波形经
+  `scipy.io.wavfile` 读取（wav）。
+
+### 2.4 `--self-test`（stub 编码器，CPU 确定性）
+
+无权重、无视频文件：用确定性的无权重 stub 编码器（以均值池化近似各编码器
+的下采样行为）在合成张量上跑通 解码 → 编码 → 分片 → `Magi2LatentDataset`
+加载 全流程，适合 CI 冒烟：
+
+```bash
+python3 scripts/magi2_preprocess_latents.py \
+    --self-test \
+    --output-dir /tmp/magi2_self_test \
+    --samples-per-shard 2
+```
+
+`--num-self-test-samples` 控制样本数（轮流使用几种合法形状以覆盖分桶），
+不指定 `--output-dir` 时写入临时目录。
 
 ## 3. 分桶与打包行为
 
