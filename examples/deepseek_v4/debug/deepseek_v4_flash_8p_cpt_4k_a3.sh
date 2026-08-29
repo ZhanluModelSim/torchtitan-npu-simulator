@@ -12,6 +12,9 @@
 
 set -euo pipefail
 
+# Enable model compilation by default; callers can override the backend.
+export COMPILE_BACKEND="${COMPILE_BACKEND:-aot_eager}"
+
 NGPU="${NGPU:-8}"
 WORLD_SIZE="${NGPU}"
 
@@ -44,6 +47,7 @@ STEPS=100
 USE_GOLDEN="${USE_GOLDEN:-0}"
 DEBUG_ARGS="
     --debug.no-moe-force-load-balance
+    --debug.print-config
 "
 
 # HF assets
@@ -78,7 +82,7 @@ TRAINING_ARGS="
 "
 
 # Checkpoint
-# `checkpoint.folder` is the save/load root (`CKPT_SAVE_LOAD_PATH`).  If it
+# `checkpoint.folder` is the save/load root (`CKPT_SAVE_LOAD_PATH`). If it
 # already contains a valid step-* checkpoint, upstream TorchTitan resumes from
 # it; use a new/empty folder when starting a fresh run.
 CHECKPOINT_ARGS="
@@ -90,10 +94,20 @@ CHECKPOINT_ARGS="
 # Profiler
 PROFILER_ARGS="
     --profiler.no-enable-profiling
-    --profiler.profile-freq 10
-    --profiler.profiler-warmup 3
+    --profiler.profile-freq 1
+    --profiler.profiler-warmup 0
     --profiler.profiler-active 1
+    --profiler.profiler-repeat 1
+    --profiler.profiler-skip-first 4
 "
+PROFILER_OVERRIDES=(
+    'torchtitan_npu.override.common.profiler.cann={
+        "profile_ranks": [0],
+        "profile_with_memory": false,
+        "profile_with_stack": false,
+        "enable_online_parse": false
+    }'
+)
 
 # Communication
 COMM_ARGS="
@@ -153,5 +167,5 @@ bash scripts/run_train.sh \
     $PROFILER_ARGS \
     $COMM_ARGS \
     $CHECKPOINT_ARGS \
-    --override.imports "${NPU_OPS_OVERRIDES[@]}" $OPTIMIZER_OVERRIDES \
+    --override.imports "${NPU_OPS_OVERRIDES[@]}" "${PROFILER_OVERRIDES[@]}" $OPTIMIZER_OVERRIDES \
     "$@"

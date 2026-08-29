@@ -131,6 +131,18 @@ def deepseek_v4_pro(*, num_mtp_layers: int = 1) -> Trainer.Config:
     )
 
 
+def deepseek_v4_pro_61layers_32experts(
+    *,
+    num_mtp_layers: int = 1,
+) -> Trainer.Config:
+    return _make_trainer_config(
+        "deepseek_v4_pro_61layers_32experts",
+        local_batch_size=1,
+        seq_len=4096,
+        num_mtp_layers=num_mtp_layers,
+    )
+
+
 # --- GraphTrainer config factories ---
 
 
@@ -211,6 +223,16 @@ def graph_trainer_deepseek_v4_pro() -> GraphTrainer.Config:
     """GraphTrainer config for the DeepSeek V4 Pro model"""
     config = to_graph_trainer_config(
         deepseek_v4_pro(num_mtp_layers=0),
+        _graph_trainer_model_registry,
+    )
+    config.compile = _graph_trainer_compile_config()
+    return config
+
+
+def graph_trainer_deepseek_v4_pro_61layers_32experts() -> GraphTrainer.Config:
+    """GraphTrainer config for the DeepSeek V4 Pro 61 Layers 32 experts model"""
+    config = to_graph_trainer_config(
+        deepseek_v4_pro_61layers_32experts(num_mtp_layers=0),
         _graph_trainer_model_registry,
     )
     config.compile = _graph_trainer_compile_config()
