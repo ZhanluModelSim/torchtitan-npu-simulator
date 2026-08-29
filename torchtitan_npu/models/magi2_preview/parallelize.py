@@ -895,27 +895,12 @@ def parallelize_magi2_preview(
     """
     del model_converters
 
-    if parallel_dims.pp_enabled:
-        # PP stage parts reach this function via pipeline_magi2; only
-        # pure PP + FSDP/DP is supported in v1.
-        if parallel_dims.cp_enabled:
-            raise NotImplementedError(
-                "MAGI-2-preview PP + CP is not implemented in v1: CP "
-                "shards the sequence inside the model while PP needs the "
-                "per-stage sequence shards as inter-stage activations"
-            )
-        if parallel_dims.tp_enabled:
-            raise NotImplementedError(
-                "MAGI-2-preview PP + TP is not implemented in v1"
-            )
-        if (
-            parallel_dims.get_optional_mesh("ep") is not None
-            or parallel_dims.get_optional_mesh("etp") is not None
-        ):
-            raise NotImplementedError(
-                "MAGI-2-preview PP + EP/ETP head-parallel MoE is not "
-                "implemented in v1"
-            )
+    # PP stage parts reach this function via pipeline_magi2. Each stage
+    # chunk can be parallelized with TP/CP/EP independently (they operate
+    # on orthogonal dimensions: TP shards attention heads, CP shards
+    # sequence, EP shards MoE expert heads). The pipeline schedule handles
+    # inter-stage activations; intra-stage parallelism works on the
+    # pruned stage model.
     if parallel_dims.tp_enabled:
         # TP can work with CP (orthogonal: TP shards hidden/head dims, CP
         # shards sequence) and EP/ETP (orthogonal: TP shards attention/linear

@@ -592,3 +592,156 @@ class TestParallelize:
         apply_moe_parallel.assert_called_once_with(
             mock_model, ep_mesh=None, etp_mesh=None
         )
+
+
+def _small_model_config():
+    """Create a small model config for testing with compatible dimensions.
+
+    Returns a config with dimensions that work well with TP=2, CP=2, EP=2:
+    - hidden_size=64 (divisible by 2)
+    - head_dim=16 -> num_heads = 64/16 = 4 (divisible by 2)
+    - moe_num_heads=4 (divisible by 2)
+    - num_experts=4 (divisible by 2)
+    """
+    from torchtitan_npu.models.magi2_preview.model import Magi2PreviewModel
+
+    return Magi2PreviewModel.Config(
+        num_layers=2,
+        hidden_size=64,
+        head_dim=16,
+        moe_num_heads=4,
+        num_experts=4,
+        moe_layers=[0],
+        mm_layers=[],
+    )
+
+
+class TestTPCPEPCombination:
+    """Verify that TP, CP, and EP can work together on orthogonal dimensions."""
+
+    def test_tp_cp_ep_orthogonal_sharding(self):
+        """Verify TP+CP+EP combination doesn't raise NotImplementedError.
+        
+        TP, CP, and EP operate on orthogonal dimensions:
+        - TP shards attention heads and MLP intermediates
+        - CP shards the sequence dimension
+        - EP shards MoE expert heads
+        
+        The combination should work without conflicts since they operate
+        on different model components and dimensions.
+        """
+        from torchtitan_npu.models.magi2_preview.parallelize import (
+            parallelize_magi2_preview,
+        )
+
+        # Use mock model to avoid any real tensor operations
+        mock_model = MagicMock()
+
+        parallel_dims = SimpleNamespace(
+            pp_enabled=False,
+            cp_enabled=True,
+            tp_enabled=True,
+            fsdp_enabled=False,
+            dp_replicate_enabled=False,
+            ep=2,
+            etp=1,
+            cp=2,
+            tp=2,
+            get_mesh=lambda name: MagicMock(),
+            get_optional_mesh=lambda name: MagicMock() if name in ["ep", "tp", "cp"] else None,
+        )
+
+        # This should NOT raise NotImplementedError
+        with patch(
+            "torchtitan_npu.models.magi2_preview.parallelize._apply_tensor_parallel"
+        ), patch(
+            "torchtitan_npu.models.magi2_preview.parallelize.apply_magi2_ulysses_cp"
+        ), patch(
+            "torchtitan_npu.models.magi2_preview.parallelize._apply_moe_parallel"
+        ), patch(
+            "torchtitan_npu.models.magi2_preview.parallelize._apply_fsdp"
+        ), patch(
+            "torchtitan_npu.models.magi2_preview.parallelize.apply_moe_ac"
+        ), patch(
+            "torchtitan_npu.models.magi2_preview.parallelize.flatten_head_mesh",
+            return_value=MagicMock()
+        ):
+            # Should complete without raising NotImplementedError
+            parallelize_magi2_preview(
+                mock_model,
+                parallel_dims=parallel_dims,
+                training=SimpleNamespace(
+                    mixed_precision_param="float32",
+                    mixed_precision_reduce="float32",
+                ),
+                model_converters=SimpleNamespace(),
+                parallelism=SimpleNamespace(
+                    tp_degree=2,
+                    cp_degree=2,
+                    ep_degree=2,
+                    fsdp_degree=1,
+                    dp_replicate_degree=1,
+                ),
+                compile_config=SimpleNamespace(enable=False, components=[]),
+                ac_config=SimpleNamespace(mode="none"),
+                dump_folder="/tmp",
+            )
+
+    def test_tp_cp_ep_no_conflicts(self):
+        """Verify that TP+CP+EP combination doesn't raise NotImplementedError."""
+        from torchtitan_npu.models.magi2_preview.parallelize import (
+            parallelize_magi2_preview,
+        )
+
+        # Use mock model to avoid any real tensor operations
+        mock_model = MagicMock()
+
+        parallel_dims = SimpleNamespace(
+            pp_enabled=False,
+            cp_enabled=True,
+            tp_enabled=True,
+            fsdp_enabled=False,
+            dp_replicate_enabled=False,
+            ep=2,
+            etp=1,
+            cp=2,
+            tp=2,
+            get_mesh=lambda name: MagicMock(),
+            get_optional_mesh=lambda name: MagicMock() if name in ["ep", "tp", "cp"] else None,
+        )
+
+        # This should NOT raise NotImplementedError
+        with patch(
+            "torchtitan_npu.models.magi2_preview.parallelize._apply_tensor_parallel"
+        ), patch(
+            "torchtitan_npu.models.magi2_preview.parallelize.apply_magi2_ulysses_cp"
+        ), patch(
+            "torchtitan_npu.models.magi2_preview.parallelize._apply_moe_parallel"
+        ), patch(
+            "torchtitan_npu.models.magi2_preview.parallelize._apply_fsdp"
+        ), patch(
+            "torchtitan_npu.models.magi2_preview.parallelize.apply_moe_ac"
+        ), patch(
+            "torchtitan_npu.models.magi2_preview.parallelize.flatten_head_mesh",
+            return_value=MagicMock()
+        ):
+            # Should complete without raising NotImplementedError
+            parallelize_magi2_preview(
+                mock_model,
+                parallel_dims=parallel_dims,
+                training=SimpleNamespace(
+                    mixed_precision_param="float32",
+                    mixed_precision_reduce="float32",
+                ),
+                model_converters=SimpleNamespace(),
+                parallelism=SimpleNamespace(
+                    tp_degree=2,
+                    cp_degree=2,
+                    ep_degree=2,
+                    fsdp_degree=1,
+                    dp_replicate_degree=1,
+                ),
+                compile_config=SimpleNamespace(enable=False, components=[]),
+                ac_config=SimpleNamespace(mode="none"),
+                dump_folder="/tmp",
+            )

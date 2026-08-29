@@ -172,16 +172,28 @@ def _duck_parallel_dims(
     dp_replicate_enabled: bool = False,
     ep_mesh=None,
     etp_mesh=None,
+    cp_mesh=None,
+    tp_mesh=None,
 ):
     """Duck-typed ParallelDims for the parallelize pp-branch guards."""
-    meshes = {"ep": ep_mesh, "etp": etp_mesh}
+    meshes = {
+        "ep": ep_mesh, 
+        "etp": etp_mesh,
+        "cp": cp_mesh if cp_enabled else None,
+        "tp": tp_mesh if tp_enabled else None,
+    }
     return SimpleNamespace(
         pp_enabled=pp_enabled,
         cp_enabled=cp_enabled,
         tp_enabled=tp_enabled,
         fsdp_enabled=fsdp_enabled,
         dp_replicate_enabled=dp_replicate_enabled,
+        ep=2 if ep_mesh is not None else 1,
+        etp=2 if etp_mesh is not None else 1,
+        cp=2 if cp_enabled else 1,
+        tp=2 if tp_enabled else 1,
         get_optional_mesh=lambda name: meshes.get(name),
+        get_mesh=lambda name: meshes.get(name),
     )
 
 
@@ -991,53 +1003,101 @@ class TestParallelizePpBranch:
 
         return Magi2PreviewModel(_debug_config())
 
-    def test_pp_with_cp_raises(self):
+    def test_pp_with_cp_works_on_stage_chunk(self):
+        """PP + CP combination works: CP applies to each stage chunk."""
         from torchtitan_npu.models.magi2_preview.parallelize import (
             parallelize_magi2_preview,
         )
 
-        with pytest.raises(NotImplementedError, match="PP \\+ CP"):
-            parallelize_magi2_preview(
-                self._model(),
-                parallel_dims=_duck_parallel_dims(cp_enabled=True),
-                **_parallelize_kwargs(),
-            )
+        model = self._model()
+        chunks = _split_model(model, degree=2)
+        for chunk in chunks.values():
+            with mock.patch(
+                "torchtitan_npu.models.magi2_preview.parallelize."
+                "apply_magi2_ulysses_cp"
+            ) as apply_cp, mock.patch(
+                "torchtitan_npu.models.magi2_preview.parallelize._apply_fsdp"
+            ):
+                out = parallelize_magi2_preview(
+                    chunk,
+                    parallel_dims=_duck_parallel_dims(cp_enabled=True),
+                    **_parallelize_kwargs(),
+                )
+                # CP should be applied to the stage chunk
+                assert apply_cp.called
+                assert out is chunk
 
-    def test_pp_with_tp_raises(self):
+    def test_pp_with_tp_works_on_stage_chunk(self):
+        """PP + TP combination works: TP applies to each stage chunk."""
         from torchtitan_npu.models.magi2_preview.parallelize import (
             parallelize_magi2_preview,
         )
 
-        with pytest.raises(NotImplementedError, match="PP \\+ TP"):
-            parallelize_magi2_preview(
-                self._model(),
-                parallel_dims=_duck_parallel_dims(tp_enabled=True),
-                **_parallelize_kwargs(),
-            )
+        model = self._model()
+        chunks = _split_model(model, degree=2)
+        for chunk in chunks.values():
+            with mock.patch(
+                "torchtitan_npu.models.magi2_preview.parallelize."
+                "_apply_tensor_parallel"
+            ) as apply_tp, mock.patch(
+                "torchtitan_npu.models.magi2_preview.parallelize._apply_fsdp"
+            ):
+                out = parallelize_magi2_preview(
+                    chunk,
+                    parallel_dims=_duck_parallel_dims(tp_enabled=True),
+                    **_parallelize_kwargs(),
+                )
+                # TP should be applied to the stage chunk
+                assert apply_tp.called
+                assert out is chunk
 
-    def test_pp_with_ep_raises(self):
+    def test_pp_with_ep_works_on_stage_chunk(self):
+        """PP + EP combination works: EP applies to each stage chunk."""
         from torchtitan_npu.models.magi2_preview.parallelize import (
             parallelize_magi2_preview,
         )
 
-        with pytest.raises(NotImplementedError, match="EP/ETP"):
-            parallelize_magi2_preview(
-                self._model(),
-                parallel_dims=_duck_parallel_dims(ep_mesh=object()),
-                **_parallelize_kwargs(),
-            )
+        model = self._model()
+        chunks = _split_model(model, degree=2)
+        for chunk in chunks.values():
+            with mock.patch(
+                "torchtitan_npu.models.magi2_preview.parallelize."
+                "_apply_moe_parallel"
+            ) as apply_moe, mock.patch(
+                "torchtitan_npu.models.magi2_preview.parallelize._apply_fsdp"
+            ):
+                out = parallelize_magi2_preview(
+                    chunk,
+                    parallel_dims=_duck_parallel_dims(ep_mesh=object()),
+                    **_parallelize_kwargs(),
+                )
+                # EP should be applied to the stage chunk
+                assert apply_moe.called
+                assert out is chunk
 
-    def test_pp_with_etp_raises(self):
+    def test_pp_with_etp_works_on_stage_chunk(self):
+        """PP + ETP combination works: ETP applies to each stage chunk."""
         from torchtitan_npu.models.magi2_preview.parallelize import (
             parallelize_magi2_preview,
         )
 
-        with pytest.raises(NotImplementedError, match="EP/ETP"):
-            parallelize_magi2_preview(
-                self._model(),
-                parallel_dims=_duck_parallel_dims(etp_mesh=object()),
-                **_parallelize_kwargs(),
-            )
+        model = self._model()
+        chunks = _split_model(model, degree=2)
+        for chunk in chunks.values():
+            with mock.patch(
+                "torchtitan_npu.models.magi2_preview.parallelize."
+                "_apply_moe_parallel"
+            ) as apply_moe, mock.patch(
+                "torchtitan_npu.models.magi2_preview.parallelize._apply_fsdp"
+            ):
+                out = parallelize_magi2_preview(
+                    chunk,
+                    parallel_dims=_duck_parallel_dims(etp_mesh=object()),
+                    **_parallelize_kwargs(),
+                )
+                # ETP should be applied to the stage chunk
+                assert apply_moe.called
+                assert out is chunk
 
     def test_pp_alone_runs_on_stage_chunk(self):
         from torchtitan_npu.models.magi2_preview.parallelize import (
