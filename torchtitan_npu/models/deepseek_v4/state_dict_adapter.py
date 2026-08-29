@@ -23,6 +23,7 @@ class DeepSeekV4StateDictAdapter(DeepSeekV3StateDictAdapter):
             model_config,  # pyrefly: ignore [bad-argument-type]
             hf_assets_path,
         )
+        self._num_mtp_layers = len(model_config.mtp_layers)
 
         self.from_hf_map = {
             "embed.weight": "tok_embeddings.weight",
@@ -55,6 +56,16 @@ class DeepSeekV4StateDictAdapter(DeepSeekV3StateDictAdapter):
             "layers.{}.hc_ffn_base": "layers.{}.hc_ffn_pre.hc_base",
             "layers.{}.hc_ffn_fn": "layers.{}.hc_ffn_pre.hc_fn",
             "layers.{}.hc_ffn_scale": "layers.{}.hc_ffn_pre.hc_scale",
+            # MTP-only tensors. Native ``mtp.{depth}.*`` keys map directly to
+            # the local ``mtp_layers.{depth}.*`` namespace.
+            "layers.{}.enorm.weight": "layers.{}.enorm.weight",
+            "layers.{}.hnorm.weight": "layers.{}.hnorm.weight",
+            "layers.{}.e_proj.weight": "layers.{}.e_proj.weight",
+            "layers.{}.h_proj.weight": "layers.{}.h_proj.weight",
+            "layers.{}.norm.weight": "layers.{}.mtp_norm.weight",
+            "layers.{}.hc_head_base": "layers.{}.hc_head.hc_base",
+            "layers.{}.hc_head_fn": "layers.{}.hc_head.hc_fn",
+            "layers.{}.hc_head_scale": "layers.{}.hc_head.hc_scale",
             "hc_head_base": "hc_head.hc_base",
             "hc_head_fn": "hc_head.hc_fn",
             "hc_head_scale": "hc_head.hc_scale",
@@ -124,10 +135,10 @@ class DeepSeekV4StateDictAdapter(DeepSeekV3StateDictAdapter):
 
             elif "moe.routed_experts.inner_experts" in key:
                 abstract_key = re.sub(r"(\d+)", "{}", key, count=1)
-                layer_num = re.search(  # pyrefly: ignore [missing-attribute]
-                    r"\d+", key
-                ).group(0)
-                new_abstract = to_hf_map[abstract_key]
+                new_abstract, layer_num = self._map_to_hf_layer_key(
+                    key,
+                    to_hf_map,
+                )
 
                 if isinstance(value, DTensor):
                     self.grouped_expert_weight_placements[abstract_key] = value.placements
@@ -149,11 +160,8 @@ class DeepSeekV4StateDictAdapter(DeepSeekV3StateDictAdapter):
                         hf_state_dict[new_abstract.format(layer_num, e)] = split_values[e].squeeze()
 
             elif "layers" in key:
-                abstract_key = re.sub(r"(\d+)", "{}", key, count=1)
-                layer_num = re.search(  # pyrefly: ignore [missing-attribute]
-                    r"\d+", key
-                ).group(0)
-                new_key = to_hf_map[abstract_key].format(layer_num)
+                new_key, layer_num = self._map_to_hf_layer_key(key, to_hf_map)
+                new_key = new_key.format(layer_num)
                 hf_state_dict[new_key] = value
 
             else:
@@ -178,7 +186,10 @@ class DeepSeekV4StateDictAdapter(DeepSeekV3StateDictAdapter):
             elif "ffn.experts" in key:
                 abstract_key = re.sub(r"(\d+)", "{}", key, count=2)
                 layer_num, expert_num, _ = re.findall(r"\d+", key)
-                titan_abstract = self.from_hf_map[abstract_key]
+                titan_abstract, layer_num = self._map_from_hf_layer_key(
+                    abstract_key,
+                    layer_num,
+                )
                 new_key = titan_abstract.format(layer_num)
 
                 if layer_num not in expert_weights:
@@ -206,12 +217,16 @@ class DeepSeekV4StateDictAdapter(DeepSeekV3StateDictAdapter):
                 if stacked is not None:
                     state_dict[new_key] = stacked
 
-            elif "layers" in key:
+            elif key.startswith(("layers.", "mtp.")):
                 abstract_key = re.sub(r"(\d+)", "{}", key, count=1)
                 layer_num = re.search(  # pyrefly: ignore [missing-attribute]
                     r"\d+", key
                 ).group(0)
-                new_key = self.from_hf_map[abstract_key].format(layer_num)
+                new_key, layer_num = self._map_from_hf_layer_key(
+                    abstract_key,
+                    layer_num,
+                )
+                new_key = new_key.format(layer_num)
                 state_dict[new_key] = value
 
             else:
@@ -221,3 +236,54 @@ class DeepSeekV4StateDictAdapter(DeepSeekV3StateDictAdapter):
                     state_dict[key] = value
 
         return state_dict
+
+    def _map_from_hf_layer_key(
+        self,
+        abstract_key: str,
+        layer_num: str,
+    ) -> tuple[str, str]:
+        """Map a checkpoint layer key to the corresponding local layer key."""
+        is_mtp = abstract_key.startswith("mtp.{}.")
+        if is_mtp:
+            num_mtp_layers = self._num_mtp_layers
+            if int(layer_num) >= num_mtp_layers:
+                raise ValueError(
+                    f"Checkpoint MTP stage {layer_num} is not present in the "
+                    f"model config, which owns {num_mtp_layers} stage(s)."
+                )
+            abstract_key = abstract_key.replace("mtp.{}.", "layers.{}.", 1)
+
+        new_key = self.from_hf_map[abstract_key]
+        if is_mtp:
+            new_key = new_key.replace("layers.{}.", "mtp_layers.{}.", 1)
+        return new_key, layer_num
+
+    def _map_to_hf_layer_key(
+        self,
+        key: str,
+        to_hf_map: dict[str, str],
+    ) -> tuple[str, str]:
+        """Map a local layer key to the corresponding checkpoint layer key."""
+        abstract_key = re.sub(r"(\d+)", "{}", key, count=1)
+        layer_num = re.search(r"\d+", key).group(0)  # pyrefly: ignore [missing-attribute]
+
+        if key.startswith("mtp_layers."):
+            num_mtp_layers = self._num_mtp_layers
+            if int(layer_num) >= num_mtp_layers:
+                raise ValueError(
+                    f"Local MTP stage {layer_num} is not present in the model "
+                    f"config, which owns {num_mtp_layers} stage(s)."
+                )
+            abstract_key = abstract_key.replace(
+                "mtp_layers.{}.",
+                "layers.{}.",
+                1,
+            )
+            new_key = to_hf_map[abstract_key].replace(
+                "layers.{}.",
+                "mtp.{}.",
+                1,
+            )
+            return new_key, layer_num
+
+        return to_hf_map[abstract_key], layer_num

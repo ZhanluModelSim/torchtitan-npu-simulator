@@ -4,6 +4,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from typing import cast
+
 from torchtitan.components.optimizer import register_moe_load_balancing_hook
 from torchtitan.config import derive
 from torchtitan.distributed.pipeline_parallel import pipeline_llm
@@ -19,7 +21,9 @@ from torchtitan.models.deepseek_v3 import (
     _EMBEDDING_INIT,
     _LINEAR_INIT,
     _NORM_INIT,
+    DeepSeekV3TransformerBlock,
     _build_dsv3_layers,
+    _build_mtp_layers,
     _output_linear_init,
 )
 from torchtitan.models.utils import validate_converter_order
@@ -127,6 +131,7 @@ def _debugmodel_v3_2(
     attn_backend: str,
     moe_comm_backend: str,
     non_blocking_capacity_factor: float | None = None,
+    num_mtp_layers: int = 0,
 ) -> DeepSeekV32Model.Config:
     dim = 7168
     n_layers = 1
@@ -191,6 +196,11 @@ def _debugmodel_v3_2(
             param_init=_output_linear_init(dim),
         ),
         layers=layers,
+        mtp_layers=_build_mtp_layers(
+            cast("DeepSeekV3TransformerBlock.Config", layers[-1]),
+            dim=dim,
+            num_mtp_layers=num_mtp_layers,
+        ),
     )
 
 
@@ -208,12 +218,14 @@ def model_registry(
     flavor: str,
     moe_comm_backend: str = "standard",
     non_blocking_capacity_factor: float | None = None,
+    num_mtp_layers: int = 0,
     converters: list[ModelConfigConverter.Config] | None = None,
 ) -> ModelSpec:
     config = deepseekv3_2_configs[flavor](
         attn_backend="flex",
         moe_comm_backend=moe_comm_backend,
         non_blocking_capacity_factor=non_blocking_capacity_factor,
+        num_mtp_layers=num_mtp_layers,
     )
     if converters is not None:
         validate_converter_order(converters)

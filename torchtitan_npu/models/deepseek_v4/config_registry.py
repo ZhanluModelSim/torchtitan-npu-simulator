@@ -28,6 +28,7 @@ from . import (
     model_registry,
 )
 from .model import GraphTrainerDeepSeekV4Model
+from .mtp import MTPChunkedLossWrapper
 from .parallelize import parallelize_graph_trainer_deepseek_v4
 
 
@@ -36,14 +37,24 @@ def _make_trainer_config(
     *,
     local_batch_size: int,
     seq_len: int,
+    num_mtp_layers: int = 1,
 ) -> Trainer.Config:
-    model_spec = model_registry(flavor)
-    return Trainer.Config(
-        loss=ChunkedLossWrapper.Config(
+    model_spec = model_registry(flavor, num_mtp_layers=num_mtp_layers)
+    if num_mtp_layers > 0:
+        loss = MTPChunkedLossWrapper.Config(
+            mtp_scale=0.3,
             loss_fn=CrossEntropyLoss.Config(
                 global_vocab_size=decoder_vocab_size(model_spec),
             ),
-        ),
+        )
+    else:
+        loss = ChunkedLossWrapper.Config(
+            loss_fn=CrossEntropyLoss.Config(
+                global_vocab_size=decoder_vocab_size(model_spec),
+            ),
+        )
+    return Trainer.Config(
+        loss=loss,
         profiler=Profiler.Config(
             enable_profiling=False,
             profile_freq=10,
@@ -81,24 +92,43 @@ def _make_trainer_config(
     )
 
 
-def deepseek_v4_debugmodel() -> Trainer.Config:
-    return _make_trainer_config("debugmodel", local_batch_size=1, seq_len=2048)
+def deepseek_v4_debugmodel(*, num_mtp_layers: int = 1) -> Trainer.Config:
+    return _make_trainer_config(
+        "debugmodel",
+        local_batch_size=1,
+        seq_len=2048,
+        num_mtp_layers=num_mtp_layers,
+    )
 
 
-def deepseek_v4_flash() -> Trainer.Config:
-    return _make_trainer_config("deepseek_v4_flash", local_batch_size=1, seq_len=4096)
+def deepseek_v4_flash(*, num_mtp_layers: int = 1) -> Trainer.Config:
+    return _make_trainer_config(
+        "deepseek_v4_flash",
+        local_batch_size=1,
+        seq_len=4096,
+        num_mtp_layers=num_mtp_layers,
+    )
 
 
-def deepseek_v4_flash_43layers_16experts() -> Trainer.Config:
+def deepseek_v4_flash_43layers_16experts(
+    *,
+    num_mtp_layers: int = 1,
+) -> Trainer.Config:
     return _make_trainer_config(
         "deepseek_v4_flash_43layers_16experts",
         local_batch_size=1,
         seq_len=4096,
+        num_mtp_layers=num_mtp_layers,
     )
 
 
-def deepseek_v4_pro() -> Trainer.Config:
-    return _make_trainer_config("deepseek_v4_pro", local_batch_size=1, seq_len=4096)
+def deepseek_v4_pro(*, num_mtp_layers: int = 1) -> Trainer.Config:
+    return _make_trainer_config(
+        "deepseek_v4_pro",
+        local_batch_size=1,
+        seq_len=4096,
+        num_mtp_layers=num_mtp_layers,
+    )
 
 
 # --- GraphTrainer config factories ---
@@ -142,7 +172,7 @@ def _graph_trainer_compile_config() -> GraphTrainerCompileConfig:
 def graph_trainer_deepseek_v4_debugmodel() -> GraphTrainer.Config:
     """GraphTrainer config for the DeepSeek V4 debug model"""
     config = to_graph_trainer_config(
-        deepseek_v4_debugmodel(),
+        deepseek_v4_debugmodel(num_mtp_layers=0),
         _graph_trainer_model_registry,
     )
     config.compile = GraphTrainerCompileConfig(
@@ -160,7 +190,7 @@ def graph_trainer_deepseek_v4_debugmodel() -> GraphTrainer.Config:
 def graph_trainer_deepseek_v4_flash() -> GraphTrainer.Config:
     """GraphTrainer config for the DeepSeek V4 Flash model"""
     config = to_graph_trainer_config(
-        deepseek_v4_flash(),
+        deepseek_v4_flash(num_mtp_layers=0),
         _graph_trainer_model_registry,
     )
     config.compile = _graph_trainer_compile_config()
@@ -170,7 +200,7 @@ def graph_trainer_deepseek_v4_flash() -> GraphTrainer.Config:
 def graph_trainer_deepseek_v4_flash_43layers_16experts() -> GraphTrainer.Config:
     """GraphTrainer config for the DeepSeek V4 Flash 43 Layers 16 experts model"""
     config = to_graph_trainer_config(
-        deepseek_v4_flash_43layers_16experts(),
+        deepseek_v4_flash_43layers_16experts(num_mtp_layers=0),
         _graph_trainer_model_registry,
     )
     config.compile = _graph_trainer_compile_config()
@@ -180,7 +210,7 @@ def graph_trainer_deepseek_v4_flash_43layers_16experts() -> GraphTrainer.Config:
 def graph_trainer_deepseek_v4_pro() -> GraphTrainer.Config:
     """GraphTrainer config for the DeepSeek V4 Pro model"""
     config = to_graph_trainer_config(
-        deepseek_v4_pro(),
+        deepseek_v4_pro(num_mtp_layers=0),
         _graph_trainer_model_registry,
     )
     config.compile = _graph_trainer_compile_config()

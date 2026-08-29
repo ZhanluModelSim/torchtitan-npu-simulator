@@ -14,7 +14,7 @@ torchtitan 迁移而来。
 | `dsv4_smla_1rank_aot_eager` | DeepSeek-V4 | 1 Rank | 1 | `aot_eager` | 否 | SMLA 暂不支持 `--debug.deterministic` |
 | `dsv4_smla_ep2_fsdp2` | DeepSeek-V4 | EP2 + FSDP2 | 2 | `aot_eager` | 否 | SMLA 暂不支持 `--debug.deterministic` |
 | `dsv4_smla_cp2_ep2_fsdp2` | DeepSeek-V4 | CP2 + EP2 + FSDP2 | 4 | `aot_eager` | 否 | SMLA 暂不支持 `--debug.deterministic` |
-| `dsv4_smla_cp2` | DeepSeek-V4 | CP2 | 2 | - | 否 | SMLA 暂不支持 `--debug.deterministic` |
+| `dsv4_mtp_smla_cp2_headtail` | DeepSeek-V4 MTP | CP2 + headtail | 2 | - | 否 | SMLA 暂不支持 `--debug.deterministic` |
 | `dsv3_2_dsa_1rank` | DeepSeek-V3.2 | 1 Rank，DSA | 1 | - | 是 | - |
 | `dsv3_2_dsa_ep2_fsdp2` | DeepSeek-V3.2 | DSA + EP2/FSDP2 | 2 | - | 是 | - |
 
@@ -30,8 +30,10 @@ metadata/attention override，并分别对 1-rank 和 EP2/FSDP2 的 100-step los
 
 四个 SMLA case 都设置 `check_loss=False`，因此不会启用 `--debug.deterministic`，也不会
 读取 golden loss。它们用于覆盖 SMLA/NPU override 在单卡、EP+FSDP、CP+EP+FSDP 以及
-CP 场景下的实际构图、编译和训练执行路径；单卡、EP2 和 CP2+EP2 场景均使用
-`aot_eager`，并默认覆盖 fused MoE token dispatcher。
+MTP+CP 场景下的实际构图、编译和训练执行路径；单卡、EP2 和 CP2+EP2 场景均使用
+`aot_eager`，并默认覆盖 fused MoE token dispatcher。MTP+CP 用例固定使用
+`deepseek_v4_debugmodel`、CP2 和 headtail，在 C4 packed sequence 上执行完整的
+MTP forward、chunked loss 和 backward。
 
 这里的 integration recipe 聚焦 sparse-attention / MHC 回归边界。端到端 example 脚本
 额外启用 Virtual Optimizer / checkpoint override；这些 storage/checkpoint override 不属于

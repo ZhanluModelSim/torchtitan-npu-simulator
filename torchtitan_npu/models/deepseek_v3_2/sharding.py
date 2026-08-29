@@ -14,7 +14,10 @@ from torchtitan.models.common.decoder_sharding import (
     dense_param_placement,
     set_decoder_sharding_config,
 )
-from torchtitan.models.deepseek_v3.sharding import _set_deepseek_v3_layer_sharding
+from torchtitan.models.deepseek_v3.sharding import (
+    _set_deepseek_v3_layer_sharding,
+    _set_deepseek_v3_mtp_sharding,
+)
 from torchtitan.protocols.sharding import LocalMapConfig, ShardingConfig
 
 if TYPE_CHECKING:
@@ -34,6 +37,15 @@ def set_deepseek_v3_2_sharding_config(
     for layer_cfg in config.layers:
         _set_deepseek_v3_layer_sharding(layer_cfg, enable_sp=enable_sp, enable_ep=enable_ep)
         _apply_v3_2_attention_sharding(layer_cfg.attention, enable_sp=enable_sp)
+
+    if config.mtp_layers:
+        _set_deepseek_v3_mtp_sharding(
+            config,
+            enable_sp=enable_sp,
+            enable_ep=enable_ep,
+        )
+        for mtp_layer_cfg in config.mtp_layers:
+            _apply_v3_2_attention_sharding(mtp_layer_cfg.attention, enable_sp=enable_sp)
 
 
 def _apply_v3_2_attention_sharding(

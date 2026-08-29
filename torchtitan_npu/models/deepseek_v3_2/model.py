@@ -17,7 +17,6 @@ from torchtitan.distributed.context_parallel import prepare_context_parallel_inp
 from torchtitan.distributed.utils import get_spmd_backend
 from torchtitan.models.common import LayerNorm, Linear
 from torchtitan.models.common.attention import AttentionMasksType, FlexAttention
-from torchtitan.models.common.decoder import Decoder
 from torchtitan.models.common.rope import RoPE
 from torchtitan.models.deepseek_v3.model import (
     Attention as V3Attention,
@@ -25,6 +24,7 @@ from torchtitan.models.deepseek_v3.model import (
 from torchtitan.models.deepseek_v3.model import (
     DeepSeekV3Model,
 )
+from torchtitan.models.deepseek_v3.mtp import MTPDecoder
 from torchtitan.protocols.module import Module
 
 from torchtitan_npu.models.common.metadata_extension import MetadataExtension
@@ -411,7 +411,7 @@ class DeepSeekV32Model(DeepSeekV3Model):
                 for _, rope_cfg, _, _ in self.traverse(RoPE.Config):
                     setattr(rope_cfg, "max_seq_len", seq_len)  # noqa: B010
 
-            Decoder.Config.update_from_config(self, config=config, **kwargs)
+            MTPDecoder.Config.update_from_config(self, config=config, **kwargs)
             parallelism = config.parallelism
 
             from torchtitan_npu.models.deepseek_v3_2.sharding import (

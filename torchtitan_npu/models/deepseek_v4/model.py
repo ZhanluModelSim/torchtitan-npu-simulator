@@ -13,14 +13,15 @@ from torch.distributed.tensor.experimental._context_parallel._load_balancer impo
 from torch.nn.attention.flex_attention import _DEFAULT_SPARSE_BLOCK_SIZE
 from torchtitan.distributed.context_parallel import cp_shard
 from torchtitan.models.common.attention import AttentionMasksType, VarlenMetadata
-from torchtitan.models.common.decoder import Decoder, TransformerBlock
+from torchtitan.models.common.decoder import TransformerBlock
 from torchtitan.models.common.moe import MoE
 from torchtitan.models.common.rope import RoPE
 
 from torchtitan_npu.models.common.metadata_extension import MetadataExtension
 
 from .metadata import CompressedVarlenMetadata, build_compressed_varlen_metadata
-from .mhc import HcHead, HcPost, HcPre
+from .mhc import HcPost, HcPre
+from .mtp import DeepSeekV4MTPDecoder, MTPBatch, prepare_mtp_batch
 from .token_dispatcher import build_cp_plan
 
 
@@ -67,17 +68,15 @@ class DeepSeekV4TransformerBlock(TransformerBlock):
         return x
 
 
-class DeepSeekV4Model(Decoder):
+class DeepSeekV4Model(DeepSeekV4MTPDecoder):
     @dataclass(kw_only=True, slots=True)
-    class Config(Decoder.Config):
+    class Config(DeepSeekV4MTPDecoder.Config):
         vocab_size: int
-        hc_mult: int = 4
         compress_ratios: tuple[int, ...]
         n_layers: int
         window_size: int
         block_size: int | tuple[int, int] = _DEFAULT_SPARSE_BLOCK_SIZE
         metadata_extension: MetadataExtension.Config = field(default_factory=MetadataExtension.Config)
-        hc_head: HcHead.Config
 
         def update_from_config(self, *, config, **kwargs):
             if hasattr(config, "training"):
@@ -85,7 +84,7 @@ class DeepSeekV4Model(Decoder):
                 for _, rope_cfg, _, _ in self.traverse(RoPE.Config):
                     setattr(rope_cfg, "max_seq_len", seq_len)  # noqa: B010
 
-            Decoder.Config.update_from_config(self, config=config, **kwargs)
+            DeepSeekV4MTPDecoder.Config.update_from_config(self, config=config, **kwargs)
             parallelism = config.parallelism
 
             tp = parallelism.tensor_parallel_degree
@@ -126,19 +125,15 @@ class DeepSeekV4Model(Decoder):
 
     def __init__(self, config: Config):
         super().__init__(config)
-        # TorchTitan 2807d3f invokes the MTP parallelization hook for all
-        # DeepSeek-V3-compatible models; DeepSeek-V4 does not use MTP.
-        self.mtp_layers = None
         cfg = config
 
-        self.hc_mult = cfg.hc_mult
-        self.compress_ratios = tuple(cfg.compress_ratios)
+        self.compress_ratios = tuple(cfg.compress_ratios) + tuple(
+            layer.attention.compress_ratio for layer in cfg.mtp_layers
+        )
         self.window_size = cfg.window_size
         self.block_size = cfg.block_size
 
         self._metadata_extension = cfg.metadata_extension.build()
-
-        self.hc_head = cfg.hc_head.build()
 
     def build_attention_masks(
         self,
@@ -160,6 +155,14 @@ class DeepSeekV4Model(Decoder):
         kernel metadata) runs last.
         """
         positions = extra_kwargs.get("positions")
+        mtp_batch = None
+        if cp_mesh is not None and self.mtp_layers is not None:
+            mtp_batch = prepare_mtp_batch(
+                inputs,
+                labels,
+                positions,
+                len(self.mtp_layers),
+            )
         masks = self.get_attention_masks(positions=positions)
         if not isinstance(masks, VarlenMetadata):
             raise TypeError(
@@ -169,34 +172,57 @@ class DeepSeekV4Model(Decoder):
             )
         common = build_compressed_varlen_metadata(masks, self.compress_ratios)
         if cp_mesh is not None:
-            inputs, labels, positions, common = self._build_cp_metadata(
-                inputs, labels, positions, common, cp_mesh, load_balancer_type
+            inputs, labels, positions, common, mtp_batch = self._build_cp_metadata(
+                inputs,
+                labels,
+                positions,
+                common,
+                cp_mesh,
+                load_balancer_type,
+                mtp_batch,
             )
             extra_kwargs["positions"] = positions
+        if mtp_batch is not None:
+            extra_kwargs["mtp_batch"] = mtp_batch
         if self._metadata_extension is not None:
             common = self._metadata_extension(common)
         extra_kwargs["attention_masks"] = common
         return inputs, labels, extra_kwargs
 
-    def _build_cp_metadata(self, inputs, labels, positions, common, cp_mesh, load_balancer_type):
+    def _build_cp_metadata(
+        self,
+        inputs,
+        labels,
+        positions,
+        common,
+        cp_mesh,
+        load_balancer_type,
+        mtp_batch,
+    ):
         """The context-parallel metadata: shard the tensors via the generic
         path and derive the rank-local plan from the global context (the
         common metadata's varlen + the load-balancer permutation).
 
-        Returns ``(inputs, labels, positions, metadata)``."""
+        Returns ``(inputs, labels, positions, metadata, mtp_batch)``."""
         seq_len = common.seq_len
         cp_size = cp_mesh.size(0)
         if seq_len % cp_size != 0:
             raise ValueError(f"seq_len ({seq_len}) must be divisible by cp_size ({cp_size}).")
         shard_len = seq_len // cp_size
         lb = _HeadTailLoadBalancer(seq_len, cp_size, cp_mesh.device_type) if load_balancer_type == "headtail" else None
-        (inputs, labels, positions), _ = cp_shard(
+        tensors = (inputs, labels, positions)
+        if mtp_batch is not None:
+            tensors += tuple(mtp_batch)
+        tensors, _ = cp_shard(
             cp_mesh,
-            (inputs, labels, positions),
+            tensors,
             None,
             load_balancer_type,
             1,
         )
+        inputs, labels, positions = tensors[:3]
+        if mtp_batch is not None:
+            mtp_batch = MTPBatch(*tensors[3:])
         rank = cp_mesh.get_local_rank()
         cp_meta, plans, window = build_cp_plan(
             common.varlen,
@@ -212,30 +238,8 @@ class DeepSeekV4Model(Decoder):
             labels,
             positions,
             CompressedVarlenMetadata(varlen=cp_meta, plans=plans, window=window),
+            mtp_batch,
         )
-
-    def forward(
-        self,
-        tokens: torch.Tensor,
-        positions: torch.Tensor | None = None,
-        attention_masks: AttentionMasksType | None = None,
-    ):
-        input_ids = tokens.detach().long()
-        h = self.tok_embeddings(tokens) if self.tok_embeddings is not None else tokens
-        h = h.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
-
-        for layer in self.layers.values():
-            h = layer(h, input_ids, attention_masks, positions)
-
-        h = self.hc_head(h)
-        h = self.norm(h) if self.norm is not None else h
-        if self._skip_lm_head:
-            return h
-        if self.lm_head is None:
-            return h
-        # Follow the dsv3/common-decoder convention: lm_head stays in BF16
-        # (checkpoint dtype) and is applied as a plain module call.
-        return self.lm_head(h)
 
 
 class GraphTrainerDeepSeekV4Model(DeepSeekV4Model):

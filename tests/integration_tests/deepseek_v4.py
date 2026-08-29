@@ -129,12 +129,13 @@ def build_deepseek_v4_test_list() -> list[OverrideDefinitions]:
             check_loss=False,
         ),
         _build_case(
-            test_name="dsv4_smla_cp2",
-            test_descr="DeepSeek-V4 SMLA cp2",
+            test_name="dsv4_mtp_smla_cp2_headtail",
+            test_descr="DeepSeek-V4 MTP SMLA cp2 headtail",
             ngpu=2,
             extra_args=(
                 "--training.steps=1",
                 "--parallelism.context-parallel-degree=2",
+                "--parallelism.context-parallel-load-balancer=headtail",
                 "--parallelism.spmd-backend=spmd_types",
                 "--hf-assets-path=tests/assets/deepseek_v3",
                 "--training.global-batch-size=2",

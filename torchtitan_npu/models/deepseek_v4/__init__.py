@@ -3,9 +3,11 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import copy
 import dataclasses
 from collections.abc import Callable
 from functools import partial
+from typing import cast
 
 import torch.nn as nn
 from torch.nn.attention.flex_attention import _DEFAULT_SPARSE_BLOCK_SIZE
@@ -27,13 +29,24 @@ from torchtitan_npu.patches.torchtitan.models.common.linear import BatchedLinear
 from .attention import Attention, CompressedSparseInnerAttention
 from .compressor import Compressor, Indexer
 from .mhc import HcHead, HcPost, HcPre
-from .model import DeepSeekV4Model, DeepSeekV4TransformerBlock
+from .model import (
+    DeepSeekV4Model,
+    DeepSeekV4TransformerBlock,
+)
+from .mtp import (
+    DeepSeekV4MTPDecoder,
+    DeepSeekV4MTPTransformerBlock,
+    MTPLoss,
+)
 from .parallelize import parallelize_deepseek_v4
 from .reference import ReferenceMetadataExtension
 from .state_dict_adapter import DeepSeekV4StateDictAdapter
 
 __all__ = [
+    "DeepSeekV4MTPDecoder",
+    "DeepSeekV4MTPTransformerBlock",
     "DeepSeekV4Model",
+    "MTPLoss",
     "deepseek_v4_configs",
     "model_registry",
     "parallelize_deepseek_v4",
@@ -453,6 +466,79 @@ def _build_v4_layers(
     return layers
 
 
+def _build_mtp_layers(
+    inner_cfg: DeepSeekV4TransformerBlock.Config,
+    *,
+    dim: int,
+    n_main_layers: int,
+    num_mtp_layers: int,
+    rope: RoPE.Config,
+) -> list[DeepSeekV4MTPTransformerBlock.Config]:
+    """Build independent, non-compressed DSV4 MTP depths."""
+    if num_mtp_layers < 0:
+        raise ValueError(f"num_mtp_layers must be non-negative, got {num_mtp_layers}.")
+
+    mtp_layers = []
+    for depth in range(num_mtp_layers):
+        layer_id = n_main_layers + depth
+
+        attention = cast("Attention.Config", copy.deepcopy(inner_cfg.attention))
+        attention.compress_ratio = 1
+        attention.compressor = None
+        attention.indexer = None
+        attention.rope = copy.deepcopy(rope)
+        inner_attention = cast(
+            "CompressedSparseInnerAttention.Config",
+            attention.inner_attention,
+        )
+        inner_attention.compress_ratio = 1
+
+        moe = copy.deepcopy(inner_cfg.moe)
+        moe.router.gate.param_init = _depth_init(layer_id)
+        moe.router.hash = False  # pyrefly: ignore [missing-attribute]
+        moe.routed_experts.inner_experts.param_init = _depth_experts_init(layer_id)
+        if moe.shared_experts is not None:
+            depth_init = _depth_init(layer_id)
+            moe.shared_experts.w2.param_init = depth_init
+            moe.shared_experts.w3.param_init = depth_init
+
+        hc_attn_pre = copy.deepcopy(inner_cfg.hc_attn_pre)
+        projection = _build_mtp_projection(dim)
+        mtp_layers.append(
+            DeepSeekV4MTPTransformerBlock.Config(
+                attention=attention,
+                attention_norm=copy.deepcopy(inner_cfg.attention_norm),
+                ffn_norm=copy.deepcopy(inner_cfg.ffn_norm),
+                moe=moe,
+                enorm=copy.deepcopy(inner_cfg.attention_norm),
+                hnorm=copy.deepcopy(inner_cfg.attention_norm),
+                e_proj=copy.deepcopy(projection),
+                h_proj=copy.deepcopy(projection),
+                mtp_norm=copy.deepcopy(inner_cfg.attention_norm),
+                hc_attn_pre=hc_attn_pre,
+                hc_ffn_pre=copy.deepcopy(inner_cfg.hc_ffn_pre),
+                hc_post=copy.deepcopy(inner_cfg.hc_post),
+                hc_head=HcHead.Config(
+                    hc_mult=hc_attn_pre.hc_mult,
+                    dim=dim,
+                    norm_eps=hc_attn_pre.norm_eps,
+                    eps=hc_attn_pre.eps,
+                    param_init=_HC_PARAM_INIT,
+                ),
+            )
+        )
+    return mtp_layers
+
+
+def _build_mtp_projection(dim: int) -> Linear.Config:
+    return Linear.Config(
+        in_features=dim,
+        out_features=dim,
+        bias=False,
+        param_init=_LINEAR_INIT,
+    )
+
+
 def _make_v4_config(
     *,
     dim: int,
@@ -489,6 +575,7 @@ def _make_v4_config(
     rope_factor: float = 4.0,
     moe_comm_backend: str = "standard",
     non_blocking_capacity_factor: float | None = None,
+    num_mtp_layers: int = 0,
 ) -> DeepSeekV4Model.Config:
     """Build a DSV4 model config from the flavor constants."""
 
@@ -542,6 +629,15 @@ def _make_v4_config(
         hc_eps=hc_eps,
     )
 
+    mtp_layers = []
+    if num_mtp_layers > 0:
+        mtp_layers = _build_mtp_layers(
+            layers[-1],
+            dim=dim,
+            n_main_layers=n_layers,
+            num_mtp_layers=num_mtp_layers,
+            rope=rope,
+        )
     return DeepSeekV4Model.Config(
         dim=dim,
         vocab_size=vocab_size,
@@ -578,12 +674,14 @@ def _make_v4_config(
             eps=hc_eps,
             param_init=_HC_PARAM_INIT,
         ),
+        mtp_layers=mtp_layers,
     )
 
 
 def _debugmodel(
     moe_comm_backend: str = "standard",
     non_blocking_capacity_factor: float | None = None,
+    num_mtp_layers: int = 0,
 ) -> DeepSeekV4Model.Config:
     return _make_v4_config(
         dim=256,
@@ -619,6 +717,7 @@ def _debugmodel(
         rope_factor=4.0,
         moe_comm_backend=moe_comm_backend,
         non_blocking_capacity_factor=non_blocking_capacity_factor,
+        num_mtp_layers=num_mtp_layers,
     )
 
 
@@ -627,6 +726,7 @@ def _deepseek_v4_flash(
     non_blocking_capacity_factor: float | None = None,
     *,
     num_experts: int = 256,
+    num_mtp_layers: int = 0,
 ) -> DeepSeekV4Model.Config:
     return _make_v4_config(
         dim=4096,
@@ -662,12 +762,14 @@ def _deepseek_v4_flash(
         rope_factor=16.0,
         moe_comm_backend=moe_comm_backend,
         non_blocking_capacity_factor=non_blocking_capacity_factor,
+        num_mtp_layers=num_mtp_layers,
     )
 
 
 def _deepseek_v4_pro(
     moe_comm_backend: str = "standard",
     non_blocking_capacity_factor: float | None = None,
+    num_mtp_layers: int = 0,
 ) -> DeepSeekV4Model.Config:
     return _make_v4_config(
         dim=7168,
@@ -703,6 +805,7 @@ def _deepseek_v4_pro(
         rope_factor=16.0,
         moe_comm_backend=moe_comm_backend,
         non_blocking_capacity_factor=non_blocking_capacity_factor,
+        num_mtp_layers=num_mtp_layers,
     )
 
 
@@ -721,6 +824,7 @@ def model_registry(
     flavor: str,
     moe_comm_backend: str = "standard",
     non_blocking_capacity_factor: float | None = None,
+    num_mtp_layers: int = 0,
     converters: list[ModelConfigConverter.Config] | None = None,
 ) -> ModelSpec:
     if flavor not in deepseek_v4_configs:
@@ -728,6 +832,7 @@ def model_registry(
     config = deepseek_v4_configs[flavor](
         moe_comm_backend=moe_comm_backend,
         non_blocking_capacity_factor=non_blocking_capacity_factor,
+        num_mtp_layers=num_mtp_layers,
     )
     if converters is not None:
         validate_converter_order(converters)
