@@ -663,10 +663,10 @@ def main() -> int:
     try:
         records_a, warnings_a = module.read_training_metrics(args.log_a)
     except OSError as error:
-        logger.info(f"[error] failed to read log-a '{args.log_a}': {error}")
+        logger.error(f"[error] failed to read log-a '{args.log_a}': {error}")
         return 1
     if not records_a:
-        logger.info(f"[error] no valid training metrics found in log-a: {args.log_a}")
+        logger.error(f"[error] no valid training metrics found in log-a: {args.log_a}")
         return 1
 
     records_b = None
@@ -675,10 +675,10 @@ def main() -> int:
         try:
             records_b, warnings_b = module.read_training_metrics(args.log_b)
         except OSError as error:
-            logger.info(f"[error] failed to read log-b '{args.log_b}': {error}")
+            logger.error(f"[error] failed to read log-b '{args.log_b}': {error}")
             return 1
         if not records_b:
-            logger.info(f"[error] no valid training metrics found in log-b: {args.log_b}")
+            logger.error(f"[error] no valid training metrics found in log-b: {args.log_b}")
             return 1
 
     output = Path(args.output) if args.output else _default_output_path(args.log_a, args.log_b, args.format)
@@ -704,7 +704,7 @@ def main() -> int:
     try:
         plt = _require_matplotlib(args.no_show)
     except RuntimeError as error:
-        logger.info(f"[error] {error}")
+        logger.error(f"[error] {error}")
         return 1
 
     warnings = [*warnings_a, *warnings_b]
@@ -740,11 +740,11 @@ def main() -> int:
                 )
             )
     except RuntimeError as error:
-        logger.info(f"[error] {error}")
+        logger.error(f"[error] {error}")
         return 1
 
     if records_b is not None and "no common steps between log-a and log-b" in warnings:
-        logger.info("[error] no common steps between log-a and log-b")
+        logger.error("[error] no common steps between log-a and log-b")
         return 1
 
     logger.info(f"[ok] plot saved to: {output}")
@@ -767,7 +767,7 @@ def main() -> int:
         )
 
     for warning in warnings:
-        logger.info(f"[warning] {warning}")
+        logger.warning(f"[warning] {warning}")
 
     return 0
 
