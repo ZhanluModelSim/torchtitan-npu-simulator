@@ -5,18 +5,22 @@
 # LICENSE file in the root directory of this source tree.
 
 
+# ruff: noqa: I001,F401
+
+# `patches` contains code that should considered as upstream,
+# and therefore MUST be imported earlier than anything else.
 from torchtitan_npu import (
-    compile as _compile,  # noqa: F401
+    patches as _patches,
 )
 from torchtitan_npu import (
-    config as _config,  # noqa: F401
+    compile as _compile,
 )
 from torchtitan_npu import (
-    extensions as _extensions,  # noqa: F401
+    config as _config,
 )
 from torchtitan_npu import (
-    ops as _ops,  # noqa: F401
+    extensions as _extensions,
 )
 from torchtitan_npu import (
-    patches as _patches,  # noqa: F401
+    ops as _ops,
 )
