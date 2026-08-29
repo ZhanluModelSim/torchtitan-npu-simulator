@@ -47,9 +47,13 @@ Integration status:
 - Sequence divisibility (seq_len % cp_degree == 0) is asserted per batch
   in ``Magi2PreviewModel.forward``; the loaders emit full sequences on
   every rank and the model slices at entry (no loader changes needed).
-- CP + EP combination (head mesh cp x ep, head-parallel MoE regime (b))
-  is a later integration: ``apply_magi2_ulysses_cp`` raises
-  NotImplementedError when both are requested.
+- CP + EP combination (head mesh cp x ep, head-parallel MoE regime (b)):
+  attention keeps the Ulysses swaps on the cp mesh; the MoE head axis is
+  sharded over the FLATTENED cp x ep mesh and each MoE layer dispatches
+  its routed core around the official seq<->head all-to-all
+  (``expert_parallel.MoEDispatchContext``, wired by
+  ``parallelize._apply_moe_parallel``). ``apply_magi2_ulysses_cp``
+  accepts ``ep_degree > 1`` and leaves that wiring to the MoE step.
 - Checkpointing with sharded ``sinks``: keys are unchanged but shapes are
   head-sharded per rank; DTensor Shard(1)-aware save/restore is a
   follow-up.
@@ -292,18 +296,15 @@ def apply_magi2_ulysses_cp(
         model: a ``Magi2PreviewModel``.
         cp_mesh: 1D "cp" DeviceMesh.
         ep_degree: expert parallel degree requested alongside CP; the
-            CP+EP combination (head mesh cp x ep) is a later integration.
+            CP+EP combination (regime (b) on the flattened cp x ep head
+            mesh) is wired by ``parallelize._apply_moe_parallel`` after
+            this function, so it only passes through here.
 
     Returns:
         The same model, CP-enabled (in-place).
     """
+    del ep_degree
     degree = cp_mesh.size()
-    if degree > 1 and ep_degree > 1:
-        raise NotImplementedError(
-            "MAGI-2-preview does not support CP and EP together yet; the "
-            "combined cp x ep head mesh (Item-4 regime b) is a later "
-            "integration"
-        )
     num_heads = model.config.hidden_size // model.config.head_dim
     if num_heads % degree != 0:
         raise ValueError(

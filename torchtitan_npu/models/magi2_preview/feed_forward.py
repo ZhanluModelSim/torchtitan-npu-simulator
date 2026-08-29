@@ -348,6 +348,16 @@ class MultiHeadMoELayer(Module):
     back for the two fc2 projections. Checkpoint keys: ``mlp.pre_norm``,
     ``mlp.split_linear``, ``mlp.merge_linear``, ``mlp.moe_mlp.*``,
     ``mlp.shared_expert_fc1/fc2``, ``mlp.modality_specific_shared_expert_fc1/fc2``.
+
+    Head-parallel dispatch (regime (b), CP x EP): when the parallelize
+    wiring sets ``moe_dispatch_context`` (an
+    ``expert_parallel.MoEDispatchContext`` on the flattened cp x ep mesh),
+    the routed core runs between the official seq<->head all-to-all
+    dispatch/undispatch, mirroring the official inference model
+    (``split_linear`` before the dispatch, ``merge_linear`` and the shared
+    experts after the undispatch, all per-token on the local sequence
+    shard); the routed core then carries only this rank's head shard
+    (``CoreMultiHeadMoE.set_head_range(..., sharded_input=True)``).
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -393,6 +403,11 @@ class MultiHeadMoELayer(Module):
             inter, config.hidden_size, config.num_modality
         )
         self._shared_intermediate_size = inter
+        # Regime-(b) CP x EP dispatch state (an
+        # expert_parallel.MoEDispatchContext, duck-typed to avoid the
+        # circular import); None keeps the routed core local. Installed by
+        # parallelize._apply_moe_parallel, never part of the state dict.
+        self.moe_dispatch_context = None
 
     def _shared_expert_forward(
         self, norm_output: torch.Tensor, m_splits: list[int] | None
@@ -405,11 +420,42 @@ class MultiHeadMoELayer(Module):
         x2 = self.modality_specific_shared_expert_fc2(x2.contiguous(), m_splits)
         return x1 + x2
 
+    def _dispatched_routed_core(
+        self, moe_input: torch.Tensor, dispatch_context
+    ) -> torch.Tensor:
+        """Regime-(b) routed path: dispatch -> local-head core -> undispatch.
+
+        ``moe_input`` is this rank's ``(S, hidden)`` sequence shard after
+        ``split_linear``; the dispatch swaps the sequence axis for the
+        head axis over the flattened cp x ep mesh so the routed core
+        computes its local heads over the received full sequence, and the
+        undispatch restores the ``(S, hidden)`` layout for the per-token
+        ``merge_linear`` (official ``CoreMultiHeadMoE._forward_impl``
+        layout, magi2-preview inference/model/magi2_preview.py:2624-2655).
+        """
+        num_heads = self.moe_mlp.num_heads
+        d_head = self.moe_mlp.d_head
+        dispatched = dispatch_context.dispatch(
+            moe_input.view(-1, num_heads, d_head)
+        )
+        tokens, local_num_heads, _ = dispatched.shape
+        partial = self.moe_mlp(
+            dispatched.reshape(tokens, local_num_heads * d_head)
+        )
+        combined = dispatch_context.undispatch(
+            partial.view(tokens, local_num_heads, d_head)
+        )
+        return combined.reshape(-1, num_heads * d_head)
+
     def forward(
         self, x: torch.Tensor, m_splits: list[int] | None = None
     ) -> torch.Tensor:
         norm_output = self.pre_norm(x, m_splits)
-        moe_out = self.merge_linear(
-            self.moe_mlp(self.split_linear(norm_output, None)), None
-        )
+        moe_input = self.split_linear(norm_output, None)
+        dispatch_context = self.moe_dispatch_context
+        if dispatch_context is None:
+            moe_out = self.moe_mlp(moe_input)
+        else:
+            moe_out = self._dispatched_routed_core(moe_input, dispatch_context)
+        moe_out = self.merge_linear(moe_out, None)
         return moe_out + self._shared_expert_forward(norm_output, m_splits)

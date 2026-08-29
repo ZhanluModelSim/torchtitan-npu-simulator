@@ -23,9 +23,16 @@ mirroring the official inference model
   :func:`ep_undispatch` port the official ``ep_dispatch`` / ``ep_undispatch``
   (lines 3277-3330 of the reference file, used by
   ``CoreMultiHeadMoE._forward_impl`` at lines 2624-2655) with autograd
-  support. They are currently function-level primitives: wiring them needs
-  sequence-sharded tokens, which arrives with context parallelism.
+  support. With CP and EP combined, the heads shard across the FLATTENED
+  cp x ep mesh (:func:`flatten_head_mesh`): each rank dispatches its
+  ``(T/cp, H, D)`` token shard over the combined mesh, computes its local
+  head group over the received sequence, and undispatch restores the
+  ``(T/cp, H, D)`` layout (see :class:`MoEDispatchContext` and
+  ``MultiHeadMoELayer``). The wiring lives in
+  ``parallelize._apply_moe_parallel``.
 """
+
+from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
@@ -45,6 +52,8 @@ __all__ = [
     "head_seq_undispatch_permute",
     "ep_dispatch",
     "ep_undispatch",
+    "flatten_head_mesh",
+    "MoEDispatchContext",
 ]
 
 # Fused expert params of CoreMultiHeadMoE, all shaped (H * E, ...) leading.
@@ -362,3 +371,116 @@ def ep_undispatch(x: torch.Tensor, group: "dist.ProcessGroup | None") -> torch.T
             f"ep_size ({ep_size})"
         )
     return _EpUndispatch.apply(x, group)
+
+
+def flatten_head_mesh(parallel_dims) -> "DeviceMesh":
+    """Build the flattened CP x EP MoE head mesh for regime (b).
+
+    torchtitan's ``ParallelDims`` derives the "cp" mesh and the "ep" mesh
+    from separate unflattenings of the world mesh (cp lives in the
+    dataloading mesh, ep in the sparse mesh), so no single global mesh
+    carries both dims and ``get_optional_mesh(["cp", "ep"])`` cannot
+    resolve them. The combined head mesh of regime (b) is therefore built
+    as the connected component of this rank in the graph whose edges join
+    ranks sharing a cp group or an ep group: with independent cp x ep
+    axes the component spans ``cp * ep`` ranks (one per (cp, ep) pair;
+    every rank keeps its ``T/cp`` token shard and the dispatch delivers
+    the full sequence), while when EP is carved out of the same rank span
+    as CP (e.g. ``cp == ep`` with ``dp_shard > 1``) the component
+    collapses to that shared block and the dispatch degenerates gracefully
+    toward the CP-only swap.
+
+    All ranks all-gather their (global rank, cp coord, ep coord, cp group,
+    ep group) and derive the SAME ordered row layout before constructing
+    the mesh, because ``DeviceMesh`` construction is collective. Members
+    of one row are ordered cp-major (by (cp coord, ep coord)); the
+    returned 1D mesh is the row containing this rank.
+    """
+    from torch.distributed.device_mesh import DeviceMesh
+
+    cp_mesh = parallel_dims.get_mesh("cp")
+    ep_mesh = parallel_dims.get_mesh("ep")
+    cp_ranks = dist.get_process_group_ranks(cp_mesh.get_group())
+    ep_ranks = dist.get_process_group_ranks(ep_mesh.get_group())
+    rank = dist.get_rank()
+
+    gathered = [None] * dist.get_world_size()
+    dist.all_gather_object(
+        gathered,
+        (
+            rank,
+            cp_ranks.index(rank),
+            ep_ranks.index(rank),
+            tuple(cp_ranks),
+            tuple(ep_ranks),
+        ),
+    )
+    coords = {entry[0]: (entry[1], entry[2]) for entry in gathered}
+
+    # Union-find over the world ranks: same cp group or same ep group.
+    parent = list(range(dist.get_world_size()))
+
+    def find(node: int) -> int:
+        while parent[node] != node:
+            parent[node] = parent[parent[node]]
+            node = parent[node]
+        return node
+
+    def union(a: int, b: int) -> None:
+        root_a, root_b = find(a), find(b)
+        if root_a != root_b:
+            parent[root_b] = root_a
+
+    for _, _, _, group_cp, group_ep in gathered:
+        for group in (group_cp, group_ep):
+            for member in group[1:]:
+                union(group[0], member)
+    components: dict[int, list[int]] = {}
+    for entry_rank, _, _, _, _ in gathered:
+        components.setdefault(find(entry_rank), []).append(entry_rank)
+
+    ordered_rows = []
+    for members in sorted(sorted(group) for group in components.values()):
+        ordered = sorted(members, key=lambda r: coords[r])
+        if len({coords[r] for r in ordered}) != len(ordered):
+            raise ValueError(
+                "cp x ep coordinate collision while building the combined "
+                f"MoE head mesh (row {ordered}); the cp and ep meshes do "
+                "not shard the head axis independently"
+            )
+        ordered_rows.append(ordered)
+    combined = DeviceMesh(
+        cp_mesh.device_type, ordered_rows, mesh_dim_names=("slice", "cp_ep")
+    )
+    return combined["cp_ep"]
+
+
+@dataclass(frozen=True)
+class MoEDispatchContext:
+    """Regime-(b) dispatch state of one MoE layer on the combined mesh.
+
+    Installed by ``parallelize._apply_moe_parallel`` on each
+    ``MultiHeadMoELayer`` when CP and EP are combined: the layer runs its
+    routed core between :func:`ep_dispatch`/:func:`ep_undispatch` over the
+    flattened cp x ep mesh (official ``CoreMultiHeadMoE._forward_impl``
+    layout), while ``split_linear``/``merge_linear``/shared experts stay
+    per-token local on the ``(T/cp, C)`` sequence shard.
+
+    Args:
+        mesh: flattened 1D cp x ep DeviceMesh (or a duck-typed stand-in
+            exposing ``size()``/``get_local_rank()``/``get_group()``).
+        head_range: the global head range this rank owns on that mesh; the
+            layer's routed core must carry the matching head shard
+            (``CoreMultiHeadMoE.set_head_range(..., sharded_input=True)``).
+    """
+
+    mesh: "DeviceMesh"
+    head_range: tuple[int, int]
+
+    def dispatch(self, x: torch.Tensor) -> torch.Tensor:
+        """(S, H, D) -> (S * degree, H // degree, D) over the combined mesh."""
+        return ep_dispatch(x, self.mesh.get_group())
+
+    def undispatch(self, x: torch.Tensor) -> torch.Tensor:
+        """(S * degree, H // degree, D) -> (S, H, D) over the combined mesh."""
+        return ep_undispatch(x, self.mesh.get_group())

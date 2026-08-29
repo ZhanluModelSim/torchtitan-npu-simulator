@@ -42,8 +42,10 @@ from .cp_ulysses import apply_magi2_ulysses_cp
 from .expert_parallel import (
     EXPERT_PARAM_NAMES,
     ROUTER_BUFFER_NAMES,
+    MoEDispatchContext,
     all_reduce_head_parallel_input_grad,
     all_reduce_head_parallel_output,
+    flatten_head_mesh,
     head_range_for_rank,
     shard_moe_core_by_head,
 )
@@ -175,21 +177,83 @@ def _combine_head_parallel_output(
     )
 
 
+def _register_regime_b_expert_grad_compensation(
+    moe_mlp: CoreMultiHeadMoE, scale: float
+) -> None:
+    """Restore unsharded expert-gradient scale under regime (b).
+
+    The combined-mesh dispatch delivers every rank's token shard once per
+    mesh member, so when EP peers replicate the CP token shard
+    (``degree > cp_degree``) the routed core computes each token
+    ``degree / cp_degree`` times and the expert parameter gradients
+    accumulate that factor; scale them back down to the unsharded value.
+    A no-op when the mesh spans only the CP axis (``scale == 1``).
+    """
+    if scale == 1.0:
+        return
+
+    def hook(param):
+        if param.grad is None:
+            return
+        grad = param.grad
+        if isinstance(grad, DTensor):
+            grad = grad.to_local()
+        grad.mul_(scale)
+
+    for param_name in EXPERT_PARAM_NAMES:
+        moe_mlp.get_parameter(param_name).register_post_accumulate_grad_hook(
+            hook
+        )
+
+
+def _wire_moe_regime_b_layer(
+    mlp: MultiHeadMoELayer, *, mesh: DeviceMesh, cp_degree: int
+) -> None:
+    """Regime-(b) state of one MoE layer on the combined cp x ep mesh.
+
+    Sets the routed core's local head range (sharded-input mode: the
+    dispatched tensor already carries only the local head columns),
+    installs the layer's dispatch context and registers the expert
+    gradient compensation. The expert params/buffers must be sharded
+    separately (``distribute_module`` in production, the plain
+    ``shard_moe_core_by_head`` slice in collective-free tests).
+    """
+    degree = mesh.size()
+    moe_mlp = mlp.moe_mlp
+    head_range = head_range_for_rank(
+        mesh.get_local_rank(), degree, moe_mlp.num_heads
+    )
+    moe_mlp.set_head_range(head_range, sharded_input=True)
+    mlp.moe_dispatch_context = MoEDispatchContext(
+        mesh=mesh, head_range=head_range
+    )
+    _register_regime_b_expert_grad_compensation(moe_mlp, cp_degree / degree)
+
+
 def _apply_moe_parallel(
     model: Magi2PreviewModel,
     *,
     ep_mesh: DeviceMesh | None,
     etp_mesh: DeviceMesh | None,
+    cp_degree: int = 1,
 ) -> None:
     """Shard the routed MoE across the head axis on the EP (or ETP) mesh.
 
     MAGI-2 routes per head, so expert parallelism is head-parallel: every
     rank owns ``moe_num_heads / degree`` whole heads of each MoE layer's
-    fused expert tensors and computes them over all (replicated) tokens;
-    the zero-padded partial outputs are all-reduced over the mesh
-    (regime (a), see ``expert_parallel.py``). The Ulysses seq<->head
-    all-to-all regime (b) needs sequence-sharded tokens and is wired once
-    context parallelism lands.
+    fused expert tensors. Two communication regimes exist (see
+    ``expert_parallel.py``):
+
+    * Regime (a) — tokens replicated (no CP, or an ETP mesh beside CP):
+      the zero-padded local-head partial outputs are all-reduced over the
+      mesh.
+    * Regime (b) — CP and EP combined (``cp_degree > 1`` with an EP
+      mesh): the mesh must be the FLATTENED cp x ep head mesh
+      (``expert_parallel.flatten_head_mesh``); each layer runs its routed
+      core between the official seq<->head dispatch/undispatch
+      (``MoEDispatchContext``), computing its local heads over the
+      received sequence while ``split_linear``/``merge_linear``/shared
+      experts stay per-token local on the ``(T/cp, C)`` shard.
 
     State-dict keys never change: the expert tensors become ``Shard(0)``
     DTensors with unchanged global shapes, so loading a full checkpoint
@@ -209,6 +273,13 @@ def _apply_moe_parallel(
             f"MAGI-2 head-parallel MoE expects a 1D mesh, got {mesh.ndim}D"
         )
     degree = mesh.size()
+    regime_b = cp_degree > 1 and ep_mesh is not None
+    if regime_b and degree % cp_degree != 0:
+        raise ValueError(
+            "MAGI-2-preview regime-(b) MoE dispatch expects the flattened "
+            f"cp x ep head mesh (degree divisible by the CP degree "
+            f"{cp_degree}), got degree {degree}"
+        )
     for layer in model.block.layers.values():
         if not isinstance(layer.mlp, MultiHeadMoELayer):
             continue
@@ -218,19 +289,35 @@ def _apply_moe_parallel(
                 f"moe_num_heads={moe_mlp.num_heads} must be divisible by "
                 f"the head-parallel degree={degree}"
             )
-        moe_mlp.set_head_range(
-            head_range_for_rank(
-                mesh.get_local_rank(), degree, moe_mlp.num_heads
+        if regime_b:
+            distribute_module(
+                moe_mlp,
+                mesh,
+                partition_fn=_partition_head_parallel_moe,
             )
+            _wire_moe_regime_b_layer(
+                layer.mlp, mesh=mesh, cp_degree=cp_degree
+            )
+        else:
+            moe_mlp.set_head_range(
+                head_range_for_rank(
+                    mesh.get_local_rank(), degree, moe_mlp.num_heads
+                )
+            )
+            distribute_module(
+                moe_mlp,
+                mesh,
+                partition_fn=_partition_head_parallel_moe,
+                input_fn=_prepare_head_parallel_input,
+                output_fn=_combine_head_parallel_output,
+            )
+    if regime_b:
+        logger.info(
+            "Applied MAGI-2-preview head-parallel MoE (regime b, cp x ep "
+            f"degree {degree})"
         )
-        distribute_module(
-            moe_mlp,
-            mesh,
-            partition_fn=_partition_head_parallel_moe,
-            input_fn=_prepare_head_parallel_input,
-            output_fn=_combine_head_parallel_output,
-        )
-    logger.info("Applied MAGI-2-preview head-parallel MoE (regime a)")
+    else:
+        logger.info("Applied MAGI-2-preview head-parallel MoE (regime a)")
 
 
 # ---------------------------------------------------------------------------
@@ -671,9 +758,12 @@ def parallelize_magi2_preview(
     CP shards the packed sequence in original token order across the cp
     mesh (Ulysses head-split all-to-all inside attention, autograd exit
     gather with gradient compensation; see ``cp_ulysses.py``). EP shards
-    the routed MoE along the head axis (regime (a): replicated tokens +
-    all-reduce); the Ulysses all-to-all MoE regime needs CP, so combining
-    CP with EP raises until that integration lands.
+    the routed MoE along the head axis: regime (a) (replicated tokens +
+    all-reduce) without CP, and regime (b) when CP and EP are combined —
+    the head axis then shards over the flattened cp x EP mesh and each
+    MoE layer dispatches its routed core around the official seq<->head
+    all-to-all (see ``_apply_moe_parallel`` and
+    ``expert_parallel.MoEDispatchContext``).
     """
     del model_converters
 
@@ -718,8 +808,9 @@ def parallelize_magi2_preview(
     if parallel_dims.cp_enabled:
         # Ulysses CP before MoE/AC/FSDP: installs the model cp_context and
         # the attention hooks; torchtitan's "fsdp" mesh spans dp_shard x cp,
-        # so CP-replicated parameter grads reduce there during FSDP.
-        # Combining CP with EP (regime (b) all-to-all MoE) raises inside.
+        # so CP-replicated parameter grads reduce there during FSDP. A CP+EP
+        # combination is wired by the MoE step below (regime (b) on the
+        # flattened cp x ep head mesh).
         apply_magi2_ulysses_cp(
             model,
             cp_mesh=parallel_dims.get_mesh("cp"),
@@ -732,11 +823,21 @@ def parallelize_magi2_preview(
         )
 
     # Head-parallel MoE before AC/FSDP, mirroring kimi_k3's ordering of
-    # expert parallelism ahead of activation checkpointing and FSDP.
+    # expert parallelism ahead of activation checkpointing and FSDP. With
+    # CP enabled the EP mesh becomes the flattened cp x ep head mesh and
+    # the MoE layers run regime (b) dispatch (Ulysses all-to-all); the
+    # cp_degree kwarg is only forwarded in that combined case, keeping the
+    # regime-(a) call shape untouched.
+    ep_mesh = parallel_dims.get_optional_mesh("ep")
+    moe_kwargs = {}
+    if ep_mesh is not None and parallel_dims.cp_enabled:
+        ep_mesh = flatten_head_mesh(parallel_dims)
+        moe_kwargs["cp_degree"] = parallel_dims.cp
     _apply_moe_parallel(
         model,
-        ep_mesh=parallel_dims.get_optional_mesh("ep"),
+        ep_mesh=ep_mesh,
         etp_mesh=parallel_dims.get_optional_mesh("etp"),
+        **moe_kwargs,
     )
 
     # Model compilation is deliberately skipped above, so activation

@@ -743,15 +743,22 @@ class TestCpWiringSingleRank:
 
 
 class TestWiringGuards:
-    def test_cp_and_ep_together_raise_not_implemented(self):
+    def test_cp_and_ep_together_wired(self):
+        """CP+EP no longer raises: attention keeps the Ulysses swaps on the
+        cp mesh and the combined cp x ep MoE dispatch (regime b) is wired
+        by parallelize._apply_moe_parallel afterwards."""
         from torchtitan_npu.models.magi2_preview.cp_ulysses import (
             apply_magi2_ulysses_cp,
         )
         from torchtitan_npu.models.magi2_preview.model import Magi2PreviewModel
 
         model = Magi2PreviewModel(_small_model_config())
-        with pytest.raises(NotImplementedError, match="CP and EP"):
-            apply_magi2_ulysses_cp(model, cp_mesh=_fake_mesh(0), ep_degree=2)
+        model = apply_magi2_ulysses_cp(
+            model, cp_mesh=_fake_mesh(0), ep_degree=2
+        )
+        assert model.cp_degree == CP and model.cp_rank == 0
+        for layer in model.block.layers.values():
+            assert layer.attention.cp_context is not None
 
     def test_requires_head_divisibility(self):
         from torchtitan_npu.models.magi2_preview.cp_ulysses import (
