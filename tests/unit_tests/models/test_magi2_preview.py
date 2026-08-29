@@ -507,7 +507,7 @@ class TestParallelize:
                 ),
             )
 
-        apply_tp.assert_called_once_with(mock_model, tp_mesh=tp_mesh)
+        apply_tp.assert_called_once_with(mock_model, tp_mesh=tp_mesh, sequence_parallel=False)
 
     def test_cp_enabled_invokes_ulysses_wiring(self):
         from torchtitan_npu.models.magi2_preview.parallelize import (

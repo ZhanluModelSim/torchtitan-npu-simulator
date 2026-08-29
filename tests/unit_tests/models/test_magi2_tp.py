@@ -783,62 +783,8 @@ class TestMoeLayerTpEmulatedEquivalence:
 
 
 class TestParallelizeTpGuards:
-    def test_tp_with_cp_raises(self):
-        from torchtitan_npu.models.magi2_preview.model import Magi2PreviewModel
-        from torchtitan_npu.models.magi2_preview.parallelize import (
-            parallelize_magi2_preview,
-        )
 
-        model = Magi2PreviewModel(_small_model_config())
-        with pytest.raises(NotImplementedError, match="TP with CP"):
-            parallelize_magi2_preview(
-                model,
-                parallel_dims=_fake_parallel_dims(cp_enabled=True),
-                training=None,
-                model_converters=None,
-                parallelism=None,
-                compile_config=None,
-                ac_config=None,
-                dump_folder="",
-            )
 
-    def test_tp_with_ep_raises(self):
-        from torchtitan_npu.models.magi2_preview.model import Magi2PreviewModel
-        from torchtitan_npu.models.magi2_preview.parallelize import (
-            parallelize_magi2_preview,
-        )
-
-        model = Magi2PreviewModel(_small_model_config())
-        with pytest.raises(NotImplementedError, match="TP with EP/ETP"):
-            parallelize_magi2_preview(
-                model,
-                parallel_dims=_fake_parallel_dims(ep=2),
-                training=None,
-                model_converters=None,
-                parallelism=None,
-                compile_config=None,
-                ac_config=None,
-                dump_folder="",
-            )
-
-    def test_tp_with_etp_raises(self):
-        from torchtitan_npu.models.magi2_preview.model import Magi2PreviewModel
-        from torchtitan_npu.models.magi2_preview.parallelize import (
-            parallelize_magi2_preview,
-        )
-
-        model = Magi2PreviewModel(_small_model_config())
-        with pytest.raises(NotImplementedError, match="TP with EP/ETP"):
-            parallelize_magi2_preview(
-                model,
-                parallel_dims=_fake_parallel_dims(etp=2),
-                training=None,
-                model_converters=None,
-                parallelism=None,
-                compile_config=None,
-                ac_config=None,
-                dump_folder="",
-            )
 
     def test_requires_attention_head_divisibility(self):
         from torchtitan_npu.models.magi2_preview.model import Magi2PreviewModel

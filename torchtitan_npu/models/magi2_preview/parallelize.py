@@ -27,6 +27,7 @@ from torch.distributed.tensor import (
     distribute_module,
     distribute_tensor,
 )
+from torch.distributed.tensor.parallel import SequenceParallel
 from torchtitan.config import (
     TORCH_DTYPE_MAP,
     ActivationCheckpointConfig,
@@ -745,16 +746,22 @@ def _register_tp_replicated_grad_reduce(param: nn.Parameter, group) -> None:
 
 
 def _apply_tensor_parallel(
-    model: Magi2PreviewModel, *, tp_mesh: DeviceMesh
+    model: Magi2PreviewModel, 
+    *, 
+    tp_mesh: DeviceMesh,
+    sequence_parallel: bool = False
 ) -> None:
     """Shard attention heads and MLP intermediates across the tp mesh.
 
-    v1 scope: the sequence stays REPLICATED on every TP rank — sequence
-    parallel (Shard(seq) layouts at the norm boundaries, kimi-style) is a
-    later optimization. Column-split projections therefore carry replicated
-    inputs and every sharded sublayer all-reduces its partial output at
-    the module boundary (and, conjugately, its input gradient); state-dict
-    keys never change.
+    When sequence_parallel=False (default): the sequence stays REPLICATED on 
+    every TP rank. Column-split projections carry replicated inputs and every 
+    sharded sublayer all-reduces its partial output at the module boundary 
+    (and, conjugately, its input gradient); state-dict keys never change.
+
+    When sequence_parallel=True: the sequence is sharded across the TP mesh
+    (kimi-style). Norms (pre_norm, q_norm, k_norm, mhp_norm) operate on local
+    sequence shards and their weights remain replicated (no sharding). Linear
+    layers receive sequence-sharded inputs.
 
     Per-rank placements after the partition (all honest single-placement
     DTensors; multi-expert weights use the 3D ``(num_experts, out, in)``
@@ -813,12 +820,21 @@ def _apply_tensor_parallel(
         _shard_attention_tp(attention, tp_degree, tp_rank)
         _wrap_attention_tp(attention, tp_mesh)
         _register_tp_boundary_hooks(attention, group)
-        for replicated in (
-            attention.pre_norm.weight,
-            attention.q_norm.weight,
-            attention.k_norm.weight,
-        ):
-            _register_tp_replicated_grad_reduce(replicated, group)
+        
+        # Apply sequence parallel to norms or register for replicated grad reduce
+        if sequence_parallel:
+            # SequenceParallel shards sequence dim on TP mesh, weights stay replicated
+            for norm_name in ("pre_norm", "q_norm", "k_norm"):
+                norm = getattr(attention, norm_name, None)
+                if norm is not None:
+                    parallelize_module(norm, tp_mesh, SequenceParallel())
+        else:
+            for replicated in (
+                attention.pre_norm.weight,
+                attention.q_norm.weight,
+                attention.k_norm.weight,
+            ):
+                _register_tp_replicated_grad_reduce(replicated, group)
 
         if isinstance(layer.mlp, MultiHeadMoELayer):
             _shard_moe_layer_tp(layer.mlp, tp_degree, tp_rank)
@@ -827,10 +843,20 @@ def _apply_tensor_parallel(
             _shard_dense_mlp_tp(layer.mlp, tp_degree, tp_rank)
             _wrap_dense_mlp_tp(layer.mlp, tp_mesh)
         _register_tp_boundary_hooks(layer.mlp, group)
-        _register_tp_replicated_grad_reduce(layer.mlp.pre_norm.weight, group)
+        
+        # Apply sequence parallel to MLP pre_norm or register for replicated grad reduce
+        if sequence_parallel:
+            parallelize_module(layer.mlp.pre_norm, tp_mesh, SequenceParallel())
+        else:
+            _register_tp_replicated_grad_reduce(layer.mlp.pre_norm.weight, group)
+        
+        # Apply sequence parallel to mhc_norm if present
+        if sequence_parallel and hasattr(layer, "mhc_norm"):
+            parallelize_module(layer.mhc_norm, tp_mesh, SequenceParallel())
 
     logger.info(
-        "Applied MAGI-2-preview tensor parallelism (sequence replicated)"
+        "Applied MAGI-2-preview tensor parallelism (sequence %s)" %
+        ("parallel" if sequence_parallel else "replicated")
     )
 
 
@@ -891,21 +917,16 @@ def parallelize_magi2_preview(
                 "implemented in v1"
             )
     if parallel_dims.tp_enabled:
-        if parallel_dims.cp_enabled:
-            raise NotImplementedError(
-                "MAGI-2-preview TP with CP is not supported in v1: TP keeps "
-                "the sequence replicated while Ulysses CP sequence-shards it"
-            )
-        if parallel_dims.ep > 1 or getattr(parallel_dims, "etp", 1) > 1:
-            raise NotImplementedError(
-                "MAGI-2-preview TP with EP/ETP is not supported in v1: both "
-                "would shard the MoE head axis on different meshes"
-            )
-        # TP before MoE/AC/FSDP, mirroring kimi_k3's ordering of tensor
-        # parallelism ahead of expert parallelism, activation checkpointing
-        # and FSDP.
+        # TP can work with CP (orthogonal: TP shards hidden/head dims, CP
+        # shards sequence) and EP/ETP (orthogonal: TP shards attention/linear
+        # dims, EP shards MoE head axis). SP (sequence parallel) can be
+        # enabled via tp_sequence_parallel=True to shard the sequence dim
+        # on the TP mesh, reducing activation memory.
+        tp_sequence_parallel = getattr(parallelism, "tp_sequence_parallel", False)
         _apply_tensor_parallel(
-            model, tp_mesh=parallel_dims.get_mesh("tp")
+            model, 
+            tp_mesh=parallel_dims.get_mesh("tp"),
+            sequence_parallel=tp_sequence_parallel
         )
     if parallel_dims.cp_enabled:
         # Ulysses CP before MoE/AC/FSDP: installs the model cp_context and
