@@ -222,6 +222,14 @@ class DeepSeekV4StateDictAdapter(DeepSeekV3StateDictAdapter):
                 layer_num = re.search(  # pyrefly: ignore [missing-attribute]
                     r"\d+", key
                 ).group(0)
+                if (
+                    key.startswith("layers.")
+                    and key.endswith("ffn.gate.bias")
+                    and self.model_config.layers[  # pyrefly: ignore [missing-attribute]
+                        int(layer_num)
+                    ].moe.router.hash
+                ):
+                    continue
                 new_key, layer_num = self._map_from_hf_layer_key(
                     abstract_key,
                     layer_num,
