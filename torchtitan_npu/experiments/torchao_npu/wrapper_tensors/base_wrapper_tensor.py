@@ -283,6 +283,14 @@ class BaseTrainingWeightWrapperTensor(TorchAOBaseTensor):
         """Return the underlying raw tensor, unwrapping the subclass."""
         return self._data
 
+    def untyped_storage(self):
+        # Wrapper has no storage of its own. Pass the call to where the data actually is, _data
+        return self._data.untyped_storage()
+
+    def data_ptr(self):
+        # Wrapper has no storage of its own. Pass the call to where the data actually is, _data
+        return self._data.data_ptr()
+
     def fsdp_pre_all_gather(
         self,
         mesh: DeviceMesh,

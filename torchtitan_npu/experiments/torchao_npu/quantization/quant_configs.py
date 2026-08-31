@@ -102,3 +102,7 @@ class BlockQuantizeConfig(FakeQuantizeConfigBase):
                 f"mxfp4_fake_quantize_config.elem_dtype must be FP4 (torch.float4_e2m1fn_x2), "
                 f"got {self.mxfp4_fake_quantize_config.elem_dtype}"
             )
+
+
+# Safe-unpickling allowlist: DCP loads checkpoints with torch.load(weights_only=True).
+torch.serialization.add_safe_globals([MXQuantizeConfig, BlockQuantizeConfig])
