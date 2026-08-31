@@ -28,7 +28,7 @@ from torchtitan_npu.override.qwen3_5.parallelize import (
 )
 
 
-class NPUGatedDeltaKernel(GatedDeltaKernel):
+class TritonGatedDeltaKernel(GatedDeltaKernel):
     @dataclass(kw_only=True, slots=True)
     class Config(GatedDeltaKernel.Config):
         pass
@@ -52,8 +52,8 @@ class NPUGatedDeltaKernel(GatedDeltaKernel):
 
 
 @override(target=GatedDeltaKernel.Config, exact=True, description="Use the Triton-Ascend GDN kernel")
-def npu_gated_delta(cfg: GatedDeltaKernel.Config) -> NPUGatedDeltaKernel.Config:
-    return derive(cfg, NPUGatedDeltaKernel.Config)
+def triton(cfg: GatedDeltaKernel.Config) -> TritonGatedDeltaKernel.Config:
+    return derive(cfg, TritonGatedDeltaKernel.Config)
 
 
 class ContextParallelGatedDeltaNet(qwen3_5.GatedDeltaNet):
@@ -102,4 +102,4 @@ class ContextParallelGatedDeltaNet(qwen3_5.GatedDeltaNet):
 
 @override(target=qwen3_5.GatedDeltaNet.Config, exact=True, description="Use Triton GDN with Context Parallel")
 def context_parallel(cfg: qwen3_5.GatedDeltaNet.Config) -> ContextParallelGatedDeltaNet.Config:
-    return derive(cfg, ContextParallelGatedDeltaNet.Config, kernel=derive(cfg.kernel, NPUGatedDeltaKernel.Config))
+    return derive(cfg, ContextParallelGatedDeltaNet.Config, kernel=derive(cfg.kernel, TritonGatedDeltaKernel.Config))

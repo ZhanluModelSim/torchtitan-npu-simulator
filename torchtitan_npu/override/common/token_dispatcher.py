@@ -58,7 +58,7 @@ from torchtitan_npu.patches.torchtitan.models.common.token_dispatcher import (
 )
 
 
-class NPUAllToAllTokenDispatcher(AllToAllTokenDispatcher):
+class AscAllToAllTokenDispatcher(AllToAllTokenDispatcher):
     """Token dispatcher for EP>1 with NPU fused permute/unpermute kernels.
 
     Overrides only ``dispatch`` and ``combine``. The all-to-all exchange
@@ -293,7 +293,7 @@ class NPUAllToAllTokenDispatcher(AllToAllTokenDispatcher):
     exact=True,
     description="NPU fused npu_moe_token_permute/unpermute for MoE dispatch/combine",
 )
-def npu_all_to_all_token_dispatcher(
+def asc(
     cfg: AllToAllTokenDispatcher.Config,
-) -> NPUAllToAllTokenDispatcher.Config:
-    return derive(cfg, NPUAllToAllTokenDispatcher.Config)
+) -> AscAllToAllTokenDispatcher.Config:
+    return derive(cfg, AscAllToAllTokenDispatcher.Config)

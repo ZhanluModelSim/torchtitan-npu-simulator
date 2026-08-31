@@ -149,7 +149,7 @@ else
         torchtitan_npu.override.deepseek_v4.mhc.asc_hc_pre
         torchtitan_npu.override.deepseek_v4.mhc.asc_hc_post
         # MoE token dispatcher
-        torchtitan_npu.override.common.token_dispatcher.npu_all_to_all_token_dispatcher
+        torchtitan_npu.override.common.token_dispatcher.asc
     )
 fi
 

@@ -31,7 +31,7 @@ ARGS=(
     --module torchtitan_npu.models.qwen3_5.config_registry
     --config qwen35_27b_4k_sft
     --hf-assets-path "${HF_ASSETS_PATH}"
-    --override.imports torchtitan_npu.override.qwen3_5.gated_delta.npu_gated_delta
+    --override.imports torchtitan_npu.override.qwen3_5.gated_delta.triton
     --checkpoint.enable
     --checkpoint.initial-load-path "${CHECKPOINT_INITIAL_LOAD_PATH:-${HF_ASSETS_PATH}}"
     --checkpoint.initial-load-in-hf

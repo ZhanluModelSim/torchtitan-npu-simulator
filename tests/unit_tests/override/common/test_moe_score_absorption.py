@@ -640,7 +640,7 @@ def _alltoall_worker(rank: int, rendezvous: str, result_file: str, use_npu: bool
             )
 
         def run(pre_w2: bool, weights: _ExpertWeights):
-            dispatcher_cls = npu_token_dispatcher.NPUAllToAllTokenDispatcher if use_npu else AllToAllTokenDispatcher
+            dispatcher_cls = npu_token_dispatcher.AscAllToAllTokenDispatcher if use_npu else AllToAllTokenDispatcher
             dispatcher = dispatcher_cls(dispatcher_cls.Config(num_experts=4, top_k=1, absorb_router_scores=True))
             dispatcher.wire_meshes(ep_mesh=mesh)
             dispatcher.sp_size = 1

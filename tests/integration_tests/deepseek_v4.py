@@ -15,7 +15,7 @@ NPU_OVERRIDES = (
     "torchtitan_npu.override.deepseek_v4.sparse_attn.asc",
     "torchtitan_npu.override.deepseek_v4.mhc.asc_hc_pre",
     "torchtitan_npu.override.deepseek_v4.mhc.asc_hc_post",
-    "torchtitan_npu.override.common.token_dispatcher.npu_all_to_all_token_dispatcher",
+    "torchtitan_npu.override.common.token_dispatcher.asc",
 )
 
 # DeepSeek-V4 golden reference recipe. Golden uses the reference MoE token

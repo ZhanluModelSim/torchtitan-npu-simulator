@@ -300,7 +300,7 @@ def test_dispatcher_absorption_local_path_matches_post_w2_reference(monkeypatch)
         )
 
     def run(absorb_scores, x, scores, weights, seen_probs):
-        dispatcher = object.__new__(token_dispatcher.NPUAllToAllTokenDispatcher)
+        dispatcher = object.__new__(token_dispatcher.AscAllToAllTokenDispatcher)
         dispatcher.ep_mesh = None
         dispatcher.absorb_router_scores = absorb_scores
         routed, _, metadata = dispatcher.dispatch(x, scores, expert_ids, counts)
