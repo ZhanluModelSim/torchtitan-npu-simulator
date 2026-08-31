@@ -65,6 +65,17 @@ def test_from_hf_ignores_gate_bias_for_hash_layers(adapter, layer_id):
     assert adapter.from_hf(hf_state_dict) == {}
 
 
+@pytest.mark.parametrize("layer_id", range(N_HASH_LAYERS))
+def test_to_hf_omits_expert_bias_for_hash_layers(adapter, layer_id):
+    local_state_dict = {
+        f"layers.{layer_id}.moe.expert_bias_E": torch.arange(
+            NUM_EXPERTS, dtype=torch.float32
+        )
+    }
+
+    assert adapter.to_hf(local_state_dict) == {}
+
+
 def test_from_hf_keeps_gate_bias_for_non_hash_layer(adapter):
     hf_state_dict = {
         "layers.3.ffn.gate.bias": torch.arange(NUM_EXPERTS, dtype=torch.float32)
@@ -81,6 +92,24 @@ def test_from_hf_keeps_gate_bias_for_non_hash_layer(adapter):
     )
 
 
+def test_to_hf_keeps_expert_bias_for_non_hash_layer(adapter):
+    local_state_dict = {
+        "layers.3.moe.expert_bias_E": torch.arange(
+            NUM_EXPERTS, dtype=torch.float32
+        )
+    }
+
+    hf_state_dict = adapter.to_hf(local_state_dict)
+
+    assert "layers.3.ffn.gate.bias" in hf_state_dict
+    torch.testing.assert_close(
+        hf_state_dict["layers.3.ffn.gate.bias"],
+        local_state_dict["layers.3.moe.expert_bias_E"],
+        rtol=0,
+        atol=0,
+    )
+
+
 def test_from_hf_keeps_gate_bias_for_mtp_layer(adapter):
     hf_state_dict = {
         "mtp.0.ffn.gate.bias": torch.arange(NUM_EXPERTS, dtype=torch.float32)
@@ -92,6 +121,24 @@ def test_from_hf_keeps_gate_bias_for_mtp_layer(adapter):
     torch.testing.assert_close(
         restored["mtp_layers.0.moe.expert_bias_E"],
         hf_state_dict["mtp.0.ffn.gate.bias"],
+        rtol=0,
+        atol=0,
+    )
+
+
+def test_to_hf_keeps_expert_bias_for_mtp_layer(adapter):
+    local_state_dict = {
+        "mtp_layers.0.moe.expert_bias_E": torch.arange(
+            NUM_EXPERTS, dtype=torch.float32
+        )
+    }
+
+    hf_state_dict = adapter.to_hf(local_state_dict)
+
+    assert "mtp.0.ffn.gate.bias" in hf_state_dict
+    torch.testing.assert_close(
+        hf_state_dict["mtp.0.ffn.gate.bias"],
+        local_state_dict["mtp_layers.0.moe.expert_bias_E"],
         rtol=0,
         atol=0,
     )

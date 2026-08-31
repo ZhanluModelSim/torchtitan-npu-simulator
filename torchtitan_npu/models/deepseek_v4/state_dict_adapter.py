@@ -161,6 +161,14 @@ class DeepSeekV4StateDictAdapter(DeepSeekV3StateDictAdapter):
 
             elif "layers" in key:
                 new_key, layer_num = self._map_to_hf_layer_key(key, to_hf_map)
+                if (
+                    key.startswith("layers.")
+                    and key.endswith(".moe.expert_bias_E")
+                    and self.model_config.layers[  # pyrefly: ignore [missing-attribute]
+                        int(layer_num)
+                    ].moe.router.hash
+                ):
+                    continue
                 new_key = new_key.format(layer_num)
                 hf_state_dict[new_key] = value
 
