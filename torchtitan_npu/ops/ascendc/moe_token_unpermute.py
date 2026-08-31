@@ -5,12 +5,19 @@
 
 """Compile-safe custom op for MoE token unpermutation.
 
-Backward (both eager and compiled):
-- probs present: native ``npu_moe_token_unpermute_grad`` (safe on zero-row
-  inputs).
-- probs=None (EP paths): exact ``scatter_add`` inverse — the native grad
-  crashes on zero-row inputs (error 561002), and neither ``torch.cond`` nor
-  a ``numel()==0`` guard survives the compile chain.
+Backward strategy, chosen by ``probs``:
+
+- ``probs`` requires grad: native ``npu_moe_token_unpermute_grad`` with the
+  saved ``permuted_tokens``, which is needed for ``grad_probs``.
+- ``probs`` frozen (pre-W2 absorption passes ``ones_like``): the same kernel
+  with a zero placeholder — ``grad_tokens`` does not read the forward values,
+  so the GMM2/W2 output need not stay alive.
+- ``probs is None`` (unweighted EP paths): the same native kernel under
+  ``torch.cond`` — for non-empty inputs it is bitwise-equal to the scatter
+  inverse and does not read forward values; CANN tiling rejects zero-row
+  inputs (error 561002), so ranks with zero routed tokens take the zero
+  branch. ``torch.cond`` keeps that runtime branch alive under the graph
+  trainer's aot_fx_trace chain.
 """
 
 __all__ = ["npu_moe_token_unpermute"]
@@ -49,39 +56,55 @@ def _npu_moe_token_unpermute_fake(permuted_tokens, sorted_indices, probs=None):
 
 def _npu_moe_token_unpermute_setup_context(ctx, inputs, output):
     permuted_tokens, sorted_indices, probs = inputs
-    ctx.save_for_backward(permuted_tokens, sorted_indices)
     ctx.probs = probs
+    # permuted_tokens is only needed for grad_probs.
+    if probs is not None and probs.requires_grad:
+        ctx.save_for_backward(permuted_tokens, sorted_indices)
+    else:
+        ctx.save_for_backward(sorted_indices)
 
 
 def _npu_moe_token_unpermute_backward(ctx, grad_output):
     if grad_output is None:
         return None, None, None
 
-    permuted_tokens, sorted_indices = ctx.saved_tensors
     probs = ctx.probs
+    if probs is None:
+        (sorted_indices,) = ctx.saved_tensors
 
-    if probs is not None:
-        # With probs present, CANN's MoeTokenUnpermuteGrad handles zero-row
-        # inputs (verified: an empty (0, K) probs tensor passes). Keep the
-        # native kernel for the weighted combine path.
-        grad_tokens, grad_probs = torch_npu.npu_moe_token_unpermute_grad(
-            permuted_tokens,
-            grad_output,
-            sorted_indices,
-            probs=probs,
-        )
-        return grad_tokens, None, grad_probs
+        def native_branch():
+            # grad_tokens does not read forward values in the unweighted path,
+            # so grad_output doubles as the shape-only permuted_tokens argument.
+            grad_tokens, _ = torch_npu.npu_moe_token_unpermute_grad(
+                grad_output,
+                grad_output,
+                sorted_indices,
+                probs=None,
+            )
+            return grad_tokens
 
-    # probs=None: a plain (unweighted) scatter; the backward is its exact
-    # inverse gather-scatter. The native grad crashes on zero-row inputs
-    # (error 561002), and a rank can legitimately receive zero tokens in EP.
-    grad_tokens = torch.zeros_like(permuted_tokens)
-    grad_tokens.scatter_add_(
-        0,
-        sorted_indices.unsqueeze(-1).expand(-1, permuted_tokens.size(1)),
+        def zero_branch():
+            # CANN tiling rejects num_out_tokens == 0 (error 561002): a rank
+            # can legitimately receive zero routed tokens in EP.
+            return torch.zeros_like(grad_output)
+
+        grad_tokens = torch.cond(grad_output.numel() == 0, zero_branch, native_branch)
+        return grad_tokens, None, None
+
+    if probs.requires_grad:
+        permuted_tokens, sorted_indices = ctx.saved_tensors
+    else:
+        # probs is (T, K); permuted_tokens is (T*K, D).
+        permuted_tokens = grad_output.new_zeros((probs.numel(), grad_output.size(1)))
+        (sorted_indices,) = ctx.saved_tensors
+
+    grad_tokens, grad_probs = torch_npu.npu_moe_token_unpermute_grad(
+        permuted_tokens,
         grad_output,
+        sorted_indices,
+        probs=probs,
     )
-    return grad_tokens, None, None
+    return grad_tokens, None, grad_probs
 
 
 npu_moe_token_unpermute.register_autograd(

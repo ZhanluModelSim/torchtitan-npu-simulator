@@ -61,8 +61,19 @@ def test_re_routing_autograd_uses_restore_indices(monkeypatch):
         assert probs is None
         return tokens[sorted_indices.to(torch.long)]
 
+    def fake_unpermute_grad(permuted_tokens, grad_output, sorted_indices, *, probs):
+        assert probs is None
+        grad_tokens = torch.zeros_like(grad_output)
+        grad_tokens.scatter_add_(
+            0,
+            sorted_indices.unsqueeze(-1).expand(-1, grad_output.size(1)),
+            grad_output,
+        )
+        return grad_tokens, None
+
     monkeypatch.setattr(moe_re_routing.torch_npu, "npu_moe_re_routing", fake_re_routing)
     monkeypatch.setattr(moe_token_unpermute.torch_npu, "npu_moe_token_unpermute", fake_unpermute)
+    monkeypatch.setattr(moe_token_unpermute.torch_npu, "npu_moe_token_unpermute_grad", fake_unpermute_grad)
 
     tokens = torch.arange(12, dtype=torch.float32).view(4, 3).requires_grad_()
     counts = torch.tensor([[1, 1], [1, 1]])
@@ -89,8 +100,19 @@ def test_re_routing_transports_scales_and_backward(monkeypatch):
         assert probs is None
         return tokens[sorted_indices.to(torch.long)]
 
+    def fake_unpermute_grad(permuted_tokens, grad_output, sorted_indices, *, probs):
+        assert probs is None
+        grad_tokens = torch.zeros_like(grad_output)
+        grad_tokens.scatter_add_(
+            0,
+            sorted_indices.unsqueeze(-1).expand(-1, grad_output.size(1)),
+            grad_output,
+        )
+        return grad_tokens, None
+
     monkeypatch.setattr(moe_re_routing.torch_npu, "npu_moe_re_routing", fake_re_routing)
     monkeypatch.setattr(moe_token_unpermute.torch_npu, "npu_moe_token_unpermute", fake_unpermute)
+    monkeypatch.setattr(moe_token_unpermute.torch_npu, "npu_moe_token_unpermute_grad", fake_unpermute_grad)
 
     tokens = torch.arange(12, dtype=torch.float32).view(4, 3).requires_grad_()
     scales = torch.tensor([1.0, 2.0, 3.0, 4.0], requires_grad=True)
@@ -115,6 +137,115 @@ def test_re_routing_transports_scales_and_backward(monkeypatch):
     expected_scales_grad[order] = tokens[order].sum(dim=1)
     torch.testing.assert_close(tokens.grad, expected_tokens_grad)
     torch.testing.assert_close(scales.grad, expected_scales_grad)
+
+
+def test_unpermute_empty_rows_backward_skips_native_kernel(monkeypatch):
+    """Zero routed rows take the zero branch: the native grad kernel is not called."""
+
+    def fake_unpermute(permuted_tokens, sorted_indices, probs):
+        assert probs is None
+        return permuted_tokens[sorted_indices.to(torch.long)]
+
+    def fail_unpermute_grad(*args, **kwargs):
+        raise AssertionError("native grad kernel must not run on empty input")
+
+    monkeypatch.setattr(moe_token_unpermute.torch_npu, "npu_moe_token_unpermute", fake_unpermute)
+    monkeypatch.setattr(moe_token_unpermute.torch_npu, "npu_moe_token_unpermute_grad", fail_unpermute_grad)
+
+    routed = torch.empty(0, 3, requires_grad=True)
+    sorted_indices = torch.empty(0, dtype=torch.long)
+
+    output = moe_token_unpermute.npu_moe_token_unpermute(routed, sorted_indices, None)
+    output.sum().backward()
+
+    assert output.shape == (0, 3)
+    assert routed.grad is not None
+    assert routed.grad.shape == routed.shape
+
+
+def test_unpermute_frozen_probs_backward_skips_saved_permuted_tokens(monkeypatch):
+    """Frozen probs backward passes a zero placeholder, not the saved GMM2/W2 output."""
+
+    def fake_unpermute(permuted_tokens, sorted_indices, probs):
+        restored = permuted_tokens[sorted_indices.to(torch.long)]
+        if probs is None:
+            return restored
+        return (restored.view(probs.shape[0], probs.shape[1], -1) * probs.unsqueeze(-1)).sum(1)
+
+    seen_grad_calls = []
+
+    def fake_unpermute_grad(permuted_tokens, grad_output, sorted_indices, *, probs):
+        seen_grad_calls.append((permuted_tokens, grad_output, sorted_indices, probs))
+        grad_tokens = grad_output.repeat_interleave(2, dim=0)[sorted_indices.to(torch.long)]
+        return grad_tokens, None
+
+    monkeypatch.setattr(moe_token_unpermute.torch_npu, "npu_moe_token_unpermute", fake_unpermute)
+    monkeypatch.setattr(moe_token_unpermute.torch_npu, "npu_moe_token_unpermute_grad", fake_unpermute_grad)
+
+    tokens = torch.arange(12, dtype=torch.float32).view(4, 3).requires_grad_()
+    # Frozen probs: pre-W2 absorption defaults to ones_like without grad.
+    probs = torch.full((4, 2), 0.5)
+
+    # Local permute equivalent: routed is (T*K, D) in expert-major order,
+    # sorted_indices is the inverse permutation Q consumed by unpermute.
+    expert_ids = torch.tensor([[1, 0], [0, 1], [1, 0], [0, 1]])
+    forward = torch.argsort(expert_ids.reshape(-1), stable=True)
+    routed = tokens.repeat_interleave(2, dim=0)[forward]
+    sorted_indices = torch.argsort(forward)
+
+    output = moe_token_unpermute.npu_moe_token_unpermute(routed, sorted_indices, probs)
+    output.sum().backward()
+
+    assert output.shape == tokens.shape
+    assert tokens.grad is not None
+    assert tokens.grad.shape == tokens.shape
+    assert len(seen_grad_calls) == 1
+    placeholder, grad_output_arg, indices_arg, seen_probs = seen_grad_calls[0]
+    assert seen_probs is probs
+    assert placeholder.shape == routed.shape
+    assert torch.count_nonzero(placeholder) == 0
+    torch.testing.assert_close(grad_output_arg, torch.ones_like(tokens))
+    torch.testing.assert_close(indices_arg, sorted_indices)
+    torch.testing.assert_close(tokens.grad, torch.full(tokens.shape, 2.0))
+
+
+def test_unpermute_grad_probs_backward_passes_real_permuted_tokens(monkeypatch):
+    """probs with grad must save and pass the real GMM2/W2 output for grad_probs."""
+
+    def fake_unpermute(permuted_tokens, sorted_indices, probs):
+        restored = permuted_tokens[sorted_indices.to(torch.long)]
+        return (restored.view(probs.shape[0], probs.shape[1], -1) * probs.unsqueeze(-1)).sum(1)
+
+    seen_grad_calls = []
+
+    def fake_unpermute_grad(permuted_tokens, grad_output, sorted_indices, *, probs):
+        seen_grad_calls.append((permuted_tokens, grad_output, sorted_indices, probs))
+        grad_tokens = grad_output.repeat_interleave(2, dim=0)[sorted_indices.to(torch.long)]
+        return grad_tokens, torch.full_like(probs, 7.0)
+
+    monkeypatch.setattr(moe_token_unpermute.torch_npu, "npu_moe_token_unpermute", fake_unpermute)
+    monkeypatch.setattr(moe_token_unpermute.torch_npu, "npu_moe_token_unpermute_grad", fake_unpermute_grad)
+
+    tokens = torch.arange(12, dtype=torch.float32).view(4, 3).requires_grad_()
+    # Router scores participate in training: probs requires grad and the
+    # wrapper must hand the saved permuted_tokens to the grad kernel.
+    probs = torch.full((4, 2), 0.5, requires_grad=True)
+
+    expert_ids = torch.tensor([[1, 0], [0, 1], [1, 0], [0, 1]])
+    forward = torch.argsort(expert_ids.reshape(-1), stable=True)
+    routed = tokens.repeat_interleave(2, dim=0)[forward]
+    sorted_indices = torch.argsort(forward)
+
+    output = moe_token_unpermute.npu_moe_token_unpermute(routed, sorted_indices, probs)
+    output.sum().backward()
+
+    assert len(seen_grad_calls) == 1
+    passed_tokens, _grad_output, _indices, seen_probs = seen_grad_calls[0]
+    assert seen_probs is probs
+    assert torch.count_nonzero(passed_tokens) > 0
+    torch.testing.assert_close(passed_tokens, routed)
+    torch.testing.assert_close(probs.grad, torch.full(probs.shape, 7.0))
+    torch.testing.assert_close(tokens.grad, torch.full(tokens.shape, 2.0))
 
 
 def test_dispatcher_absorption_local_path_matches_post_w2_reference(monkeypatch):
