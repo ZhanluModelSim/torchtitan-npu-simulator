@@ -14,6 +14,8 @@ from torchtitan.trainer import Trainer
 
 from torchtitan_npu.config import (
     ExtensionConfig,
+    MuonOptimizerProfile,
+    OptimizerConfig,
     QuantizationExtensionConfig,
     TrainerConfig,
     TrainingExtensionConfig,
@@ -25,7 +27,7 @@ from torchtitan_npu.distributed import utils as distributed_utils
 from torchtitan_npu.extensions.trainer import TrainerEx
 
 
-def test_from_trainer_config_wraps_training_extension():
+def test_from_trainer_config_wraps_npu_extensions():
     source = Trainer.Config(
         dump_folder="custom-output",
         training=UpstreamTrainingConfig(
@@ -47,10 +49,16 @@ def test_from_trainer_config_wraps_training_extension():
     assert isinstance(adapted.training, NPUTrainingConfig)
     assert isinstance(adapted.training.extension, TrainingExtensionConfig)
     assert adapted.training.extension.allow_hf32 is True
+    assert isinstance(adapted.optimizer, OptimizerConfig)
+    assert adapted.optimizer.name == "native"
     for config_field in fields(Trainer.Config):
-        if config_field.name == "training":
+        if config_field.name in ("optimizer", "training"):
             continue
         assert getattr(adapted, config_field.name) == getattr(source, config_field.name)
+    for config_field in fields(source.optimizer):
+        assert getattr(adapted.optimizer, config_field.name) == getattr(
+            source.optimizer, config_field.name
+        )
     for config_field in fields(UpstreamTrainingConfig):
         assert getattr(adapted.training, config_field.name) == getattr(source.training, config_field.name)
 
@@ -115,6 +123,63 @@ def test_config_manager_parses_quantization_extension(monkeypatch, tmp_path):
     assert quantization.recipe == "all_block_fp8"
     assert quantization.enable_mxfp4_qat is True
     assert quantization.dst_type_max == 7.0
+
+
+def test_config_manager_materializes_muon_from_cli(monkeypatch, tmp_path):
+    module_name = "_torchtitan_npu_muon_config_registry"
+    registry = types.ModuleType(module_name)
+    profile = MuonOptimizerProfile(
+        muon_pattern=r"matrix\\.weight",
+        optimizer_factory_kwargs={
+            "DistributedMuon": {
+                "compute_sharding_by_fqn": {},
+                "bucket_configs": (),
+            }
+        },
+    )
+
+    def test_config() -> TrainerConfig:
+        return TrainerConfig(
+            hf_assets_path=str(tmp_path),
+            optimizer=OptimizerConfig(_muon_profile=profile),
+        )
+
+    registry.test_config = test_config
+    monkeypatch.setitem(sys.modules, module_name, registry)
+
+    config = ConfigManager().parse_args(
+        [
+            "--module",
+            module_name,
+            "--config",
+            "test_config",
+            "--optimizer.name",
+            "Muon",
+            "--optimizer.lr",
+            "2.2e-4",
+            "--optimizer.weight_decay",
+            "0.1",
+            "--optimizer.muon_momentum",
+            "0.95",
+            "--optimizer.muon_enable_nesterov",
+            "--optimizer.muon_ns_steps",
+            "10",
+            "--optimizer.muon_adjust_lr_fn",
+            "match_rms_adamw",
+        ]
+    )
+
+    assert config.optimizer.name == "Muon"
+    assert len(config.optimizer.param_groups) == 2
+    muon_group, adamw_group = config.optimizer.param_groups
+    assert muon_group.optimizer_name == "DistributedMuon"
+    assert muon_group.optimizer_kwargs["lr"] == pytest.approx(2.2e-4)
+    assert muon_group.optimizer_kwargs["momentum"] == pytest.approx(0.95)
+    assert muon_group.optimizer_kwargs["nesterov"] is True
+    assert muon_group.optimizer_kwargs["ns_steps"] == 10
+    assert muon_group.optimizer_kwargs["foreach"] is False
+    assert adamw_group.optimizer_name == "AdamW"
+    assert adamw_group.optimizer_kwargs["foreach"] is False
 
 
 def test_trainer_config_build_applies_extension_before_parent(monkeypatch):
