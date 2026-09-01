@@ -30,6 +30,16 @@ jobs:
           key: "${{ env.obs_path }}/pr_filelist_precommit.txt"
           path: ${{ steps.process_checkout.outputs.path }}
       -
+        name: install torchtitan
+        run: |
+          set -e
+          workspace="${{ steps.process_checkout.outputs.path }}"
+          source "${workspace}/.ci/setup_torchtitan.sh"
+          _setup_torchtitan /tmp/torchtitan
+          export PIP_EXTRA_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+          python3 -m pip install -r /tmp/torchtitan/requirements.txt
+          python3 -m pip install -e /tmp/torchtitan
+      -
         name: precommit
         identifier: precommit
         uses: cann/.gitcode/actions/precommit@master

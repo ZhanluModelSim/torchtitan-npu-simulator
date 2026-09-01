@@ -7,20 +7,24 @@
 # Usage: source .ci/setup_torchtitan.sh
 
 TORCHTITAN_BRANCH="main"
-TORCHTITAN_COMMIT="ac13e536c84e7f6647b14fa9375c3c8a8a2b8578"
+TORCHTITAN_REPOSITORY="https://gitcode.com/GitHub_Trending/to/torchtitan.git"
 
 _setup_torchtitan() {
     local target_dir="${1:-/tmp/torchtitan}"
+    local script_dir
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    local requirements_file="${script_dir}/../requirements.txt"
+    local requirement_pattern='^[[:space:]]*torchtitan[[:space:]]+@[[:space:]]*[^[:space:]]+@[0-9a-f]{40}[[:space:]]*$'
+    local torchtitan_requirement
+    torchtitan_requirement="$(grep -E "${requirement_pattern}" "${requirements_file}")"
+    local torchtitan_commit="${torchtitan_requirement##*@}"
 
-    if [[ -d "$target_dir" ]] && git -C "$target_dir" rev-parse --verify HEAD 2>/dev/null; then
-        git -C "$target_dir" fetch origin "$TORCHTITAN_BRANCH"
-        git -C "$target_dir" checkout "$TORCHTITAN_COMMIT"
-        return 0
-    fi
+    echo "Preparing torchtitan at ${torchtitan_commit}..."
 
     echo "Cloning torchtitan source..."
     mkdir -p "$(dirname "$target_dir")"
     git clone --branch "$TORCHTITAN_BRANCH" \
-        https://gitcode.com/GitHub_Trending/to/torchtitan.git "$target_dir"
-    git -C "$target_dir" checkout "$TORCHTITAN_COMMIT"
+        "$TORCHTITAN_REPOSITORY" "$target_dir"
+
+    git -C "$target_dir" checkout "$torchtitan_commit"
 }

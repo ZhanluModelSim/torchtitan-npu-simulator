@@ -64,13 +64,6 @@ stages:
         with:
           precommit_image_version: ubuntu24.04_x86_64:wdy05
           codecheck_image_version: ${{ jobs.JOB_image.outputs.codecheck }}
-      JOB_Compile_lint:
-        name: Compile_lint
-        uses: .gitcode/workflows/compile_action.yml
-        with:
-          task_name: 'Lint'
-          image_version: ${{ jobs.JOB_image.outputs.lint }}
-          arch: 'x64'
       JOB_staticcheck_md_check:
         name: CodeCheck_staticcheck_md_check
         uses: .gitcode/workflows/staticcheck_action.yml
