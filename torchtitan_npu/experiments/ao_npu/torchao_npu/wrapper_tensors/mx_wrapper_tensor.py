@@ -180,3 +180,7 @@ def _(
         ),
         requires_grad=param.requires_grad,
     )
+
+
+# Safe-unpickling allowlist: DCP loads checkpoints with torch.load(weights_only=True).
+torch.serialization.add_safe_globals([MXTrainingWeightWrapperTensor])

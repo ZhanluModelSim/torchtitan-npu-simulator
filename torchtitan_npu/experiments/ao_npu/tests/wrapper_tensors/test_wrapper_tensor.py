@@ -306,6 +306,52 @@ def test_wrapper_to_tensor(wrapper_cls, weight_config, act_config, device):
 
 
 # =========================================================================
+# untyped_storage / data_ptr
+# =========================================================================
+
+
+@pytest.mark.parametrize(
+    "wrapper_cls, weight_config, act_config",
+    [
+        (BaseTrainingWeightWrapperTensor, Float8FakeQuantizeConfig(), None),
+        (Float8TrainingWeightWrapperTensor, Float8FakeQuantizeConfig(), None),
+        (MXTrainingWeightWrapperTensor, MXQuantizeConfig(), MXQuantizeConfig()),
+        (BlockTrainingWeightWrapperTensor, BlockQuantizeConfig(), MXQuantizeConfig()),
+    ],
+)
+def test_wrapper_untyped_storage_delegates_to_data(wrapper_cls, weight_config, act_config):
+    """untyped_storage delegates to _data, exposing the real (valid) data storage."""
+    w = torch.randn(64, 128)
+    wrapper = wrapper_cls(w, weight_config=weight_config, activation_config=act_config)
+
+    # The wrapper holds no storage of its own; it must return _data's storage.
+    assert wrapper.untyped_storage().data_ptr() == w.untyped_storage().data_ptr()
+    # That storage must be a valid, non-null address (not an "invalid python storage").
+    assert wrapper.untyped_storage().data_ptr() != 0
+
+
+@pytest.mark.parametrize(
+    "wrapper_cls, weight_config, act_config",
+    [
+        (BaseTrainingWeightWrapperTensor, Float8FakeQuantizeConfig(), None),
+        (Float8TrainingWeightWrapperTensor, Float8FakeQuantizeConfig(), None),
+        (MXTrainingWeightWrapperTensor, MXQuantizeConfig(), MXQuantizeConfig()),
+        (BlockTrainingWeightWrapperTensor, BlockQuantizeConfig(), MXQuantizeConfig()),
+    ],
+)
+def test_wrapper_data_ptr_delegates_to_data(wrapper_cls, weight_config, act_config):
+    """data_ptr delegates to _data, reporting the real data address instead of 0."""
+    w = torch.randn(64, 128)
+    wrapper = wrapper_cls(w, weight_config=weight_config, activation_config=act_config)
+
+    assert wrapper.data_ptr() == w.data_ptr()
+    # Regression: a storage-less wrapper used to silently return 0x0 here.
+    assert wrapper.data_ptr() != 0
+    # For a zero-offset contiguous tensor, data_ptr and the storage pointer agree.
+    assert wrapper.data_ptr() == wrapper.untyped_storage().data_ptr()
+
+
+# =========================================================================
 # __repr__
 # =========================================================================
 

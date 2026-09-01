@@ -124,3 +124,7 @@ class HiF8QuantizeConfig(FakeQuantizeConfigBase):
         assert self.elem_dtype == torch_npu.hifloat8, (
             f"For HiF8, elem_dtype must be torch_npu.hifloat8, got {self.elem_dtype}"
         )
+
+
+# Safe-unpickling allowlist: DCP loads checkpoints with torch.load(weights_only=True).
+torch.serialization.add_safe_globals([MXQuantizeConfig, BlockQuantizeConfig])
