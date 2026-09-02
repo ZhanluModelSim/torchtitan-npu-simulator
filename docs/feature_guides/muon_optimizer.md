@@ -1,251 +1,161 @@
-# Muon 优化器特性
+# DeepSeek-V4 Muon 优化器
 
-在大规模语言模型的训练中，优化器的选择对收敛速度和最终性能有着重要影响。传统的 Adam/AdamW 优化器虽然通用性强，但将参数视为独立的一维向量进行更新，忽略了矩阵参数的结构信息。Muon 优化器通过引入动量正交化（Momentum Orthogonalization）技术，针对 2D/3D 矩阵参数实现了更高效的梯度下降策略，在大模型训练中展现出更快的收敛速度。
+本文说明当前 `override-refactor` 工作区中的 Muon 方案、使用方法和能力边界。
+实现以 TorchTitan 上游 `DistributedMuon`/FlexShard 为核心；上游 FlexShard 的
+`ComputeLayout`、`Owned`、`BlockShard`、bucket 和 storage-to-compute 语义，参见
+[TorchTitan FlexShard README](https://github.com/pytorch/torchtitan/blob/main/torchtitan/distributed/flex_shard/README.md)。
 
-## 实现原理
+## 当前方案
 
-torchtitan-npu 采用了 **Muon + AdamW 混合优化器**策略，核心代码定义在 `torchtitan_npu/patches/optimizer/muon_optimizer.py` 。
+DSV4 使用一个混合优化器容器：匹配 Muon 规则的矩阵参数交给
+`DistributedMuon`，其余参数交给 AdamW。配置入口是
+`torchtitan_npu/models/deepseek_v4/config_registry.py` 中的
+`_dsv4_muon_profile()`。该 profile 只承载模型参数匹配、FlexShard compute
+layout 和 bucket 元数据；所有可调优化器标量由 CLI schema 提供。
 
-### 参数分配策略
+Muon 参数主要包括：
 
-模型参数根据维度和语义自动路由到不同的优化器：
+- attention 投影、压缩器和 indexer 投影；
+- shared experts、routed experts 和 router；
+- mHC 的 `hc_fn` 以及全局 `hc_head.hc_fn`。
+- 主干 compressor 与 indexer compressor 的二维 `ape` 参数。
 
-- **2D 参数**（如 Linear 层的权重矩阵）→ 使用 Muon 优化器
-  - 例外：名称中包含 `embed`、`lm_head`、`output` 的 2D 参数 → 使用 AdamW（此类层不适合正交化更新）
-- **3D 参数**（如 MoE 专家权重）→ 使用 Muon 优化器
-- **1D 及其他参数**（如偏置、LayerNorm 参数）→ 使用 AdamW 优化器
+未匹配的参数（例如 embedding、输出头、归一化参数和其他 1D 参数）落入 AdamW
+组。Muon 使用上游 Newton-Schulz 实现；DSV4 recipe 的默认 CLI 值为：
 
-两种优化器被统一封装在 `MuonHybridOptimizersContainer` 中，对外提供与标准优化器一致的 `step()`、`zero_grad()`、`state_dict()` / `load_state_dict()` 接口。
-
-### Newton-Schulz 正交化
-
-Muon 的核心操作是对动量梯度进行正交化（LMO，Low-orthogonal Matrix Operation），通过 Newton-Schulz 迭代算法实现矩阵的零次幂近似（即投影到正交矩阵流形上）：
-
-$$X_{k+1} = a \cdot X_k + b \cdot X_k X_k^T X_k + c \cdot (X_k X_k^T)^2 X_k$$
-
-其中主系数为 $(a, b, c) = (3.4445, -4.7750, 2.0315)$，在零点处具有最大斜率，确保快速收敛。
-
-#### 混合 Newton-Schulz（hybrid_ns）
-
-当启用 `muon_hybrid_ns = true` 时，采用 DeepSeek-V4 提出的混合迭代策略：
-
-- **前 8 步**：使用主系数 $(3.4445, -4.7750, 2.0315)$
-- **后 2 步**：切换到次系数 $(2.0, -1.5, 0.5)$
-
-此策略在保持收敛速度的同时，提升了正交化结果的数值稳定性。
-
-#### 编译 Newton-Schulz
-
-Muon 支持只对 Newton-Schulz 张量函数启用 `torch.compile`，编译边界只覆盖 `zeropower_via_newtonschulz5()`，其余逻辑仍保持 eager 执行。
-
-启用方式是打开全局 compile，并在 `components` 中包含 `"muon"`：
-
-```python
-from torchtitan.config import CompileConfig
-
-compile = CompileConfig(
-    enable=True,
-    components=["muon"],
-)
+```text
+momentum=0.95
+weight_decay=0.1
+ns_steps=10
+adjust_lr_fn="match_rms_adamw"
+foreach=False
 ```
 
-启动时也可以通过命令行覆盖：
+`match_rms_adamw` 使 Muon 更新幅度与 AdamW 超参数处于相近尺度；当前实现没有在
+DSV4 配置中暴露独立的 `muon_lr` 或 `hybrid_ns` 开关。
+
+## 如何使用 Muon
+
+使用常规 DSV4 配方，并显式选择 Muon。例如 8 卡 DSV4 Flash（43 层、16
+experts）：
 
 ```bash
+MODULE=torchtitan_npu.models.deepseek_v4 \
+CONFIG=deepseek_v4_flash_43layers_16experts \
+NGPU=8 \
 bash scripts/run_train.sh \
-  --compile.enable \
-  --compile.components muon
-```
-
-Muon compile 当前使用如下策略：
-
-- `fullgraph=True`：要求 Newton-Schulz 函数完整成图，避免编译边界内出现 graph break
-- `dynamic=True`：允许 Newton-Schulz 在不同矩阵尺寸间复用动态图编译结果，减少 shape specialization 导致的重复编译
-- `backend=<compile.backend>`：若 `CompileConfig.backend` 已配置，则透传给 `torch.compile`
-
-启用 `dynamic=True` 后，Muon Newton-Schulz 可覆盖 2D 与 3D 输入以及不同矩阵尺寸，避免仅因 batch 或矩阵形状变化触发大量 rank/shape specialization。
-
-### 学习率调整模式
-
-Muon 优化器支持两种学习率调整模式（通过 `muon_adjust_lr_fn` 配置），其核心区别在于如何根据矩阵形状调整学习率，以及是否需要独立的超参数调优。
-
-| 模式 | 调整公式 | 说明 |
-|------|----------|------|
-| `original` | $\gamma \leftarrow \gamma \cdot \sqrt{\max(1, A/B)}$ | Keller Jordan 原始实现，根据矩阵宽高比调整 |
-| `match_rms_adamw` | $\gamma \leftarrow 0.18 \cdot \gamma \cdot \sqrt{\max(A, B)}$ | Moonshot 实现，直接复用 AdamW 的 lr 和 weight_decay |
-
-#### original 模式
-
-该模式源自 Muon 创始人 Keller Jordan 的原始实现。调整公式为：
-
-$$\gamma_{\text{adjusted}} = \gamma \times \sqrt{\max\left(1, \frac{A}{B}\right)}$$
-
-其中 $A$ 和 $B$ 是矩阵的两个维度。这个调整的目的是：**让正交化后的梯度更新在不同形状的矩形矩阵上具有一致的 RMS（Root Mean Square）**。
-
-- 当 $A \le B$（宽矩阵，如 FFN 中的中间层）时，系数为 1，不做额外调整
-- 当 $A > B$（高矩阵，如输出层）时，按 $\sqrt{A/B}$ 缩放
-
-由于调整幅度较大，通常需要单独为 Muon 调优学习率（即配置 `muon_lr`），一般来说可以将 AdamW 的学习率放大 10 倍来作为 Muon 的学习率。
-
-#### match_rms_adamw 模式
-
-该模式来自 Moonshot 团队的论文 [Muon is Scalable for LLM Training](https://arxiv.org/pdf/2502.16982)。调整公式为：
-
-$$\gamma_{\text{adjusted}} = 0.18 \times \gamma \times \sqrt{\max(A, B)}$$
-
-> 注：当前实现使用系数 0.18（与 DeepSeek-V4 一致），Moonshot 原始论文使用 0.2。
-
-这个模式的设计目标是：**让 Muon 可以直接复用已经为 AdamW 调优好的学习率和权重衰减超参数**，无需额外的超参数搜索。
-
-#### 模式选择建议
-
-- **使用 `match_rms_adamw`**（默认）：如果你已经为 AdamW 调优好了超参数，希望直接尝试 Muon 而不想重新调参
-- **使用 `original`**：如果你愿意投入时间单独调优 Muon 的学习率，追求可能的更好收敛效果
-
-### 分布式通信机制
-
-`DistributedMuon` 优化器针对不同的并行策略实现了三种参数更新路径：
-
-| 并行策略 | 通信方式 | 适用场景 |
-|----------|----------|----------|
-| FSDP | all_to_all 双向通信 | FSDP 分片的 2D 参数 |
-| DDP | all_gather 通信 | DDP 复制的 2D 参数 |
-| Expert/MoE | 本地 LMO（无跨卡通信） | 3D 专家权重（已通过 EP 切分） |
-
-**FSDP 路径**（`step_fsdp`）：采用 owner-per-bucket 方案，每个 rank 负责一组参数的完整 LMO 计算。通过两轮 all_to_all 通信：第一轮将各 rank 的梯度分片汇聚到参数 owner，owner 完成正交化后，第二轮将更新分片发回各 rank。
-
-**DDP 路径**（`step_ddp`）：每个 rank 先对本地负责的参数计算 LMO 更新，然后通过 all_gather 将更新广播给所有 rank。支持与 TP 的联合使用，在 LMO 计算前先通过 all_gather 收集 TP 分片。
-
-**Expert 路径**（`step_experts`）：专家权重已通过 Expert Parallel 切分到各 rank，每个 rank 独立对本地专家参数执行 LMO，无需跨卡通信。
-
-### Swap Optimizer（推荐）
-
-对于显存受限的场景，Muon 优化器支持通过 `swap_optimizer = true` 启用优化器状态 CPU 卸载，将 Muon 的 `momentum_buffer` 和 AdamW 的 `exp_avg`、`exp_avg_sq` 卸载到 CPU，仅在优化器 step 期间按需换入 NPU。
-
-`virtual_optimizer` 当前不支持与 Muon 联用。若 `optimizer.name = "Muon"` 且同时设置 `virtual_optimizer = true`，框架会在 optimizer 构建阶段直接报错。
-
-#### swap_merge_buckets 配置
-
-`swap_merge_buckets` 控制 Muon momentum_buffer H2D/D2H 操作的合并粒度。Muon 参数被分成多个 bucket（由 FSDP all_to_all 通信决定），每个 bucket 独立执行一次 H2D（step 前）和 D2H（step 后）。`swap_merge_buckets` 决定将多少个连续 bucket 的 H2D/D2H 合并为一次 stream 操作。
-
-## 配置选项
-
-Muon 优化器在模型的 `config_registry.py` 中配置，由 `torchtitan_npu.config.configs.OptimizerConfig` 相关字段进行配置：
-
-| 配置项 | 类型 | 默认值 | 说明 |
-|--------|------|--------|------|
-| `name` | str | "AdamW" | 优化器类型，设置为 `"Muon"` 启用本特性 |
-| `lr` | float | — | 基础学习率，AdamW 部分直接使用；Muon 部分取决于 `muon_adjust_lr_fn` |
-| `muon_lr` | float | None | Muon 专用学习率。仅当 `muon_adjust_lr_fn = "original"` 时生效；若不设置则回退到 `lr`；当 `muon_adjust_lr_fn = "match_rms_adamw"` 时此值被忽略 |
-| `muon_momentum` | float | 0.95 | Muon 的动量因子 |
-| `muon_enable_nesterov` | bool | True | 是否启用 Nesterov 动量 |
-| `muon_ns_steps` | int | 5 | Newton-Schulz 正交化迭代步数，影响正交化精度与计算开销。值越大正交化越精确，但计算量也越大 |
-| `muon_adjust_lr_fn` | str | "match_rms_adamw" | 学习率调整模式：`"original"` 或 `"match_rms_adamw"` |
-| `muon_hybrid_ns` | bool | False | 是否启用混合 Newton-Schulz 迭代（前 8 步用主系数，后续步用次系数） |
-| `swap_optimizer` | bool | False | 是否启用 Swap Optimizer，将优化器状态卸载到 CPU 并异步换入换出以节省显存 |
-| `swap_merge_buckets` | int | 1 | Swap H2D/D2H 合并桶数。值越大 stream 同步开销越低但峰值显存略增。推荐 4~16 |
-
-### 配置示例
-
-#### 示例 1：match_rms_adamw 模式
-
-最简配置，直接复用 AdamW 超参，无需额外调参即可使用 Muon：
-
-在 `torchtitan_npu/models/<model>/config_registry.py` 的配置函数中设置：
-
-```python
-from torchtitan_npu.config.configs import OptimizerConfig
-
-optimizer = OptimizerConfig(
-    name="Muon",                          # 使用 Muon 混合优化器
-    lr=2.2e-4,                            # 基础学习率（Muon 和 AdamW 共用）
-    weight_decay=0.1,
-    muon_momentum=0.95,                   # Muon 动量因子
-    muon_enable_nesterov=True,            # 启用 Nesterov 动量
-    muon_ns_steps=10,                     # 正交化步数
-    muon_adjust_lr_fn="match_rms_adamw",  # 复用 AdamW 超参（默认值，可省略）
-    muon_hybrid_ns=True,                  # 启用混合 NS
-)
-```
-
-启动时也可以通过命令行覆盖同名字段：
-
-```bash
-bash scripts/run_train.sh \
+  --hf-assets-path tests/assets/deepseek_v3 \
+  --dataloader.dataset c4_test \
+  --dataloader.dataset-path tests/assets/c4_test \
+  --parallelism.spmd-backend spmd_types \
+  --parallelism.data-parallel-shard-degree 8 \
+  --parallelism.data-parallel-replicate-degree 1 \
+  --parallelism.expert-parallel-degree 8 \
+  --parallelism.tensor-parallel-degree 1 \
+  --parallelism.context-parallel-degree 1 \
+  --parallelism.pipeline-parallel-degree 1 \
+  --training.local-batch-size 1 \
+  --training.global-batch-size -1 \
+  --training.seq-len 4096 \
+  --training.steps 100 \
   --optimizer.name Muon \
   --optimizer.lr 2.2e-4 \
+  --optimizer.weight_decay 0.1 \
   --optimizer.muon_momentum 0.95 \
-  --optimizer.muon_ns_steps 10
+  --optimizer.muon_enable_nesterov \
+  --optimizer.muon_ns_steps 10 \
+  --optimizer.muon_adjust_lr_fn match_rms_adamw \
+  --debug.no-moe-force-load-balance \
+  --checkpoint.no-enable \
+  --override.imports \
+    torchtitan_npu.override.common.rms_norm.asc \
+    torchtitan_npu.override.common.rope.asc_complex \
+    torchtitan_npu.override.deepseek_v4.sparse_attn.asc_metadata \
+    torchtitan_npu.override.deepseek_v4.sparse_attn.asc \
+    torchtitan_npu.override.deepseek_v4.mhc.asc_hc_post \
+    torchtitan_npu.override.common.token_dispatcher.npu_all_to_all_token_dispatcher
 ```
 
-#### 示例 2：original 模式
+`--optimizer.name` 默认为 `native`，保持常规 recipe 原有的 AdamW 行为；设为
+`Muon` 时才生成 DistributedMuon 与 AdamW fallback 两组。不存在 `_muon` 专用
+recipe。DSV4 Muon 当前要求：
 
-需要为 Muon 单独设置学习率，适合愿意投入调参资源的场景：
+- `tensor_parallel_degree=1`；
+- `pipeline_parallel_degree=1`；
+- optimizer 使用 `DistributedMuon` 的 FlexShard compute layout；
+- routed experts 的布局同时声明 DP shard、EFSDP 和 EP，以覆盖当前 EP=8/EP=1
+  的存储 mesh；
+- AdamW 组保持 `foreach=False`。Ascend 上 `foreach=True` 可能触发
+  `aclnnForeachLerpScalar` 不支持错误。
 
-```python
-from torchtitan_npu.config.configs import OptimizerConfig
+## 如何开启 swap
 
-optimizer = OptimizerConfig(
-    name="Muon",                          # 使用 Muon 混合优化器
-    lr=3e-4,                              # AdamW 部分的学习率
-    muon_lr=3e-3,                         # Muon 专用学习率（通常为 AdamW lr 的 10 倍）
-    weight_decay=0.01,
-    muon_momentum=0.95,                   # Muon 动量因子
-    muon_enable_nesterov=True,            # 启用 Nesterov 动量
-    muon_ns_steps=5,                      # 正交化步数
-    muon_adjust_lr_fn="original",         # 使用独立的 lr 调度器
-)
+swap 是显式 opt-in 的 override，不是当前 recipe 中的 `swap_optimizer=true` 字段。
+在同一条命令的 `--override.imports` 末尾增加：
+
+```text
+torchtitan_npu.override.common.muon_state_swap.muon_state_swap
+torchtitan_npu.override.common.muon_state_swap.muon_state_swap_checkpoint
 ```
 
-#### 示例 3：启用 Swap Optimizer
-
-在显存受限的场景下，将优化器状态卸载到 CPU，通过异步 H2D/D2H 流水线减少性能损失：
-
-```python
-from torchtitan_npu.config.configs import OptimizerConfig
-
-optimizer = OptimizerConfig(
-    name="Muon",                          # 使用 Muon 混合优化器
-    lr=2.2e-4,
-    weight_decay=0.1,
-    muon_momentum=0.95,
-    muon_enable_nesterov=True,
-    muon_ns_steps=10,
-    muon_adjust_lr_fn="match_rms_adamw",
-    muon_hybrid_ns=True,
-    swap_optimizer=True,                  # 启用 Swap Optimizer，优化器状态卸载到 CPU
-    swap_merge_buckets=4,                 # 每 4 个 bucket 合并一次 H2D/D2H，平衡性能与显存
-)
-```
-
-如果同时开启 `virtual_optimizer=True`，当前实现会直接拒绝构建，因为 Muon 尚未适配 Virtual Optimizer 的状态分片和 step 路径。
-
-#### 示例 4：只编译 Muon Newton-Schulz
-
-该配置适合验证 optimizer 侧 compile，不影响 model/loss 的 eager 或原有 compile 策略：
-
-```python
-from torchtitan.config import CompileConfig
-
-compile = CompileConfig(
-    enable=True,
-    components=["muon"],
-)
-```
-
-启动时也可以通过命令行覆盖同名字段：
+完整示例（省略与上例相同的模型、数据和并行参数）：
 
 ```bash
-bash scripts/run_train.sh \
-  --compile.enable \
-  --compile.components muon
+--override.imports \
+  ... \
+  torchtitan_npu.override.common.muon_state_swap.muon_state_swap \
+  torchtitan_npu.override.common.muon_state_swap.muon_state_swap_checkpoint
 ```
 
-Muon compile 默认使用 `dynamic=True`，通常不需要额外提高 `torch._dynamo.config.recompile_limit`。
+启用后：
 
-## 参考文献
+- Muon 的 `momentum_buffer` 在首次创建后注册为 NovaSwap tensor，并在 step 前
+  H2D、step 后 D2H；
+- AdamW 的 `exp_avg` 和 `exp_avg_sq` 在 step 前换入、step 后换出；
+- optimizer state 仍由 PyTorch optimizer 懒创建，swap 不会在模型初始化阶段提前
+  生成完整 state storage；
+- AdamW 和 Muon 使用不同的唯一 swap name，避免多个 optimizer 实例互相覆盖；
+- Muon 使用 FlexShard 的 compute layout 和 per-layer bucket，swap 只包裹 state
+  tensor 的生命周期，不改变参数 storage layout。
 
-- [DeepSeek-V4 Technical Report](https://arxiv.org/pdf/2606.19348)
-- [Muon is Scalable for LLM Training](https://arxiv.org/pdf/2502.16982)
-- [Muon 优化器指南：快速上手与关键细节](https://kexue.fm/archives/11416)
-- [Muon 优化器赏析：从向量到矩阵的本质跨越](https://www.spaces.ac.cn/archives/10592)
+推荐同时关闭 checkpoint：
+
+```bash
+--checkpoint.no-enable
+```
+
+当前 `muon_state_swap_checkpoint` 会拒绝 checkpoint save/load，以及
+`checkpoint.initial_load_path`。因此当前 swap 方案不能用于带 optimizer state 的
+断点续训；需要 checkpoint 互操作时，应先关闭该 swap override 并使用普通 optimizer
+路径。
+
+## DSV4 与上游方案的差异
+
+上游 FlexShard README 描述的是通用 optimizer-compute 基础设施和 Kimi 集成：
+`ComputeLayout` 可以表达 `Owned`、`BlockShard`、多 mesh axis 的 storage-to-compute
+重分布，`BucketConfig` 用于打包通信并与 optimizer compute 重叠。当前 DSV4 复用这些
+上游 API，但配置和运行边界更窄：
+
+| 维度 | 上游 FlexShard / DistMuon | 当前 DSV4 适配 |
+|---|---|---|
+| 参数选择 | 由具体模型 registry 定义 | 固定 DSV4 attention、experts、router、mHC 参数正则 |
+| compute layout | 支持 `Owned`、`BlockShard`、per-head 等通用布局 | 主要使用 `Owned`，attention `wq_b/wo_a` 使用 per-head `Shard(0)`，routed experts 使用 DP/EFSDP/EP `Shard(0)` |
+| bucket | 通用 bucket API | 每层一个 bucket，`hc_head` 单独一个 bucket |
+| TP/PP | 由上游集成决定 | 当前明确拒绝 TP>1 或 PP>1 |
+| swap | 上游 FlexShard 不提供 NPU state offload | 由 `muon_state_swap` + `extension/novaswap` 额外提供，且暂不支持 optimizer checkpoint |
+| AdamW | 上游 Muon 集成通常只描述参数路由 | 当前同时对混合容器中的 AdamW moments 做 whole-step swap |
+| 迭代步数 | 由上游 recipe 决定 | DSV4 默认 `ns_steps=10`，可用 CLI 覆盖 |
+
+## 能力边界
+
+当前方案适合 DSV4 单机 8 卡、TP/PP=1、EP/DP-shard 并行的实验和训练。以下能力
+尚未由当前实现证明：
+
+- TP>1 或 PP>1 的 DistributedMuon；
+- swap 开启时的 optimizer checkpoint 保存、加载和断点续训；
+- 长程收敛与无 swap 基线的数值等价；
+- all-rank profiling skew 和多机 HCCL 场景；
+- Muon 独立学习率或 bucket 合并策略。
+
+关闭 swap 时，仍可使用同一 DSV4 recipe 的 Muon CLI 选择，移除上述两个
+`muon_state_swap.*` override 即可。

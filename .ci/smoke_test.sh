@@ -1,268 +1,69 @@
+#!/usr/bin/env bash
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-set -e
+# CI supplies the interpreter, dependencies, accelerator runtime, and data
+# assets. This entrypoint is a thin adapter that applies contract defaults and
+# delegates execution to the integration-test runner.
+set -euo pipefail
 
-# Please adjust the path below to match your CANN installation.
-source /usr/local/Ascend/cann/set_env.sh
+readonly CANN_ENV_PATH=/usr/local/Ascend/cann/set_env.sh
+source "${CANN_ENV_PATH}"
+echo "[CANN] sourced ${CANN_ENV_PATH}"
+echo "[CANN] ASCEND_HOME_PATH=${ASCEND_HOME_PATH:-<unset>}"
+echo "[CANN] LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-<unset>}"
 
-export TORCHINDUCTOR_FX_GRAPH_CACHE=0
-export TORCHINDUCTOR_AUTOGRAD_CACHE=0
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "${PROJECT_ROOT}"
 
-pip install -r requirements_dev.txt
-pip install triton-ascend==3.2.1 --extra-index-url https://triton-ascend.osinfra.cn/pypi/simple
+PYTHON_BIN="${PYTHON_BIN:-python3.12}"
+TORCHTITAN_REPO="${TORCHTITAN_REPO:-https://gitcode.com/GitHub_Trending/to/torchtitan.git}"
+TORCHTITAN_COMMIT="${TORCHTITAN_COMMIT:-$(grep '^torchtitan @ ' requirements.txt | cut -d@ -f3)}"
+TORCHTITAN_DIR="${TORCHTITAN_DIR:-${PROJECT_ROOT}/third_party/torchtitan}"
+OUTPUT_DIR="${OUTPUT_DIR:-${PROJECT_ROOT}/test_reports/smoke}"
+NGPU="${NGPU:-8}"
 
-# Global variable
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-OUTPUT_DIR="${PROJECT_ROOT}/output"
-REPORT_DIR="${PROJECT_ROOT}/test_reports"
-INTEGRATION_REPORT_DIR="${PROJECT_ROOT}/test_reports/integration_tests"
-TORCHTITAN_BRANCH="main"
-TORCHTITAN_COMMIT="ac13e536c84e7f6647b14fa9375c3c8a8a2b8578"
-TORCHTITAN_DIR="${PROJECT_ROOT}/third_party/torchtitan"
-DEEPSEEK_TOKENIZER_REPO="${DEEPSEEK_TOKENIZER_REPO:-https://gitcode.com/hitwdy/deepseekv4.git}"
-DEEPSEEK_V4_TOKENIZER_DIR="${PROJECT_ROOT}/tests/assets/tokenizer/deepseekv4_tokenizer"
-DEEPSEEK_V32_TOKENIZER_DIR="${PROJECT_ROOT}/tests/assets/tokenizer/deepseekv32_tokenizer"
-TIMEOUT_SECONDS=${TIMEOUT_SECONDS:-300}
-SMOKE_STEPS=${SMOKE_STEPS:-1}
-# Known false-positive patterns to exclude from error detection
-ERROR_EXCLUDE_PATTERNS=(
-    "TORCH_NCCL_ASYNC_ERROR_HANDLING"
-    "HCCL_ASYNC_ERROR_HANDLING is deprecated"
-)
+if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
+    echo "Required interpreter not found: ${PYTHON_BIN}" >&2
+    exit 1
+fi
 
-export PYTHONPATH="${PROJECT_ROOT}/tests/smoke_tests/npu_bypass_triton_codegen:${PYTHONPATH:-}"
+# Binding torchrun/python launchers to the CI's python 3.12 interpreter.
+PYTHON_SHIMS="$(mktemp -d)"
+trap 'rm -rf "${PYTHON_SHIMS}"' EXIT
+ln -s "$(command -v "${PYTHON_BIN}")" "${PYTHON_SHIMS}/python3"
+cat >"${PYTHON_SHIMS}/torchrun" <<EOF
+#!/usr/bin/env bash
+exec "$(command -v "${PYTHON_BIN}")" -m torch.distributed.run "\$@"
+EOF
+chmod +x "${PYTHON_SHIMS}/torchrun"
+export PATH="${PYTHON_SHIMS}:${PATH}"
 
-# Prepare environment: install packages and clone torchtitan source.
-_setup_env() {
-    cd "$PROJECT_ROOT"
+# Clone and install torchtitan.
+if [[ ! -d "${TORCHTITAN_DIR}/.git" ]]; then
+    mkdir -p "$(dirname "${TORCHTITAN_DIR}")"
+    git clone --filter=blob:none --no-checkout "${TORCHTITAN_REPO}" "${TORCHTITAN_DIR}"
+fi
+git -C "${TORCHTITAN_DIR}" fetch --depth 1 origin "${TORCHTITAN_COMMIT}"
+git -C "${TORCHTITAN_DIR}" checkout --detach --quiet "${TORCHTITAN_COMMIT}"
 
-    # Ensure torchtitan_npu is installed
-    if ! python3 -c "import torchtitan_npu" 2>/dev/null; then
-        python3 -m pip install -e .
-    fi
+"${PYTHON_BIN}" -m pip install --break-system-packages --no-deps --no-cache-dir -e "${TORCHTITAN_DIR}"
+"${PYTHON_BIN}" -m pip install --break-system-packages --no-deps --no-cache-dir -e "${PROJECT_ROOT}"
+"${PYTHON_BIN}" -c 'import torchtitan, torchtitan_npu'
 
-    # Clone torchtitan source if not exists
-    if [[ ! -d "$TORCHTITAN_DIR/.git" ]]; then
-        echo "Cloning torchtitan source..."
-        git clone --branch "$TORCHTITAN_BRANCH" \
-            https://gitcode.com/GitHub_Trending/to/torchtitan.git "$TORCHTITAN_DIR"
-    fi
+export MODULE="${MODULE:-torchtitan_npu.models.deepseek_v4}"
+export CONFIG="${CONFIG:-deepseek_v4_debugmodel}"
+export NGPU
+export LOG_RANK="${LOG_RANK:-0}"
+export PYTHON_BIN
 
-    git -C "$TORCHTITAN_DIR" fetch origin "$TORCHTITAN_BRANCH"
-    git -C "$TORCHTITAN_DIR" checkout "$TORCHTITAN_COMMIT"
-}
+"${PYTHON_BIN}" -m tests.integration_tests.run_tests \
+    "${OUTPUT_DIR}" \
+    --test_suite models \
+    --module "${MODULE}" \
+    --config "${CONFIG}" \
+    --ngpu "${NGPU}"
 
-_copy_deepseek_tokenizer() {
-    local name="$1"
-    local source_dir="$2"
-    local target_dir="$3"
-    local tokenizer_json="${target_dir}/tokenizer.json"
-    local tokenizer_config="${target_dir}/tokenizer_config.json"
-
-    if [[ -s "$tokenizer_json" && -s "$tokenizer_config" ]]; then
-        echo "${name} tokenizer already exists: ${target_dir}"
-        return 0
-    fi
-
-    if [[ ! -s "${source_dir}/tokenizer.json" || ! -s "${source_dir}/tokenizer_config.json" ]]; then
-        echo "${name} tokenizer is incomplete in ${source_dir}"
-        find "$source_dir" -maxdepth 1 -type f -print 2>/dev/null || true
-        return 1
-    fi
-
-    echo "Preparing ${name} tokenizer..."
-    mkdir -p "$target_dir"
-    cp "${source_dir}/tokenizer.json" "${source_dir}/tokenizer_config.json" \
-        "$target_dir"/
-
-    if [[ ! -s "$tokenizer_json" || ! -s "$tokenizer_config" ]]; then
-        echo "${name} tokenizer is incomplete in ${target_dir}"
-        find "$target_dir" -maxdepth 1 -type f -print || true
-        return 1
-    fi
-
-    echo "${name} tokenizer prepared: ${target_dir}"
-}
-
-_prepare_deepseek_tokenizers() {
-    local tokenizer_repo="$DEEPSEEK_TOKENIZER_REPO"
-    local source_dir="$tokenizer_repo"
-    local tmp_dir=""
-
-    if [[ ! -d "$source_dir" ]]; then
-        echo "Downloading DeepSeek tokenizers..."
-        tmp_dir=$(mktemp -d)
-        git clone --depth 1 --filter=blob:none --no-checkout \
-            "$tokenizer_repo" "$tmp_dir"
-        git -C "$tmp_dir" sparse-checkout set --no-cone \
-            "/deepseekv4/tokenizer.json" \
-            "/deepseekv4/tokenizer_config.json" \
-            "/deepseekv32/tokenizer.json" \
-            "/deepseekv32/tokenizer_config.json"
-        git -C "$tmp_dir" checkout
-        source_dir="$tmp_dir"
-    fi
-
-    _copy_deepseek_tokenizer \
-        "DeepSeek V4" \
-        "${source_dir}/deepseekv4" \
-        "$DEEPSEEK_V4_TOKENIZER_DIR"
-    _copy_deepseek_tokenizer \
-        "DeepSeek V3.2" \
-        "${source_dir}/deepseekv32" \
-        "$DEEPSEEK_V32_TOKENIZER_DIR"
-
-    if [[ -n "$tmp_dir" ]]; then
-        rm -rf "$tmp_dir"
-    fi
-}
-
-# Run integrated test: end-to-end training configurations.
-run_torchtitan_npu_smoke() {
-    echo "Running torchtitan-npu smoke test..."
-
-    mkdir -p "$REPORT_DIR"
-
-    local smoke_log="${REPORT_DIR}/smoke_test.log"
-    local start_time=$(date +%s)
-    local integration_test="${PROJECT_ROOT}/tests/smoke_tests/integration_test.py"
-    echo "Verifying torchtitan..."
-    python -c "import torchtitan; print('torchtitan ok')"
-
-    echo "Done."
-
-    cd "$PROJECT_ROOT"
-
-    echo "Starting torchtitan-npu integration test..."
-
-    set +e
-    timeout $TIMEOUT_SECONDS bash -c "
-        python "${integration_test}" "${INTEGRATION_REPORT_DIR}" --ngpu 2
-    " 2>&1 | tee "$smoke_log"
-    local exit_code
-    exit_code=${PIPESTATUS[0]}
-    set -e
-
-    local end_time=$(date +%s)
-    local duration=$((end_time - start_time))
-    echo "torchtitan-npu smoke test finished in ${duration}s"
-    if ! analyse_smoke_result "$smoke_log" "$exit_code"; then
-        echo "torchtitan-npu smoke test failed."
-        echo "--- Error details ---"
-        grep -iE "error|exception|traceback" "$smoke_log" 2>/dev/null \
-            | grep -vE "$(IFS='|'; echo "${ERROR_EXCLUDE_PATTERNS[*]}")" || true
-        grep -iE "loss:\s*(nan|inf)" "$smoke_log" 2>/dev/null || true
-        echo "--- End error details ---"
-        exit 1
-    fi
-}
-
-analyse_smoke_result() {
-    local log_file="$1"
-    local exit_code="$2"
-
-    echo "Analyzing smoke test results..."
-    local has_error=false
-
-    if [[ "$exit_code" -eq 124 ]]; then
-        echo "Timeout!"
-        has_error=true
-    fi
-
-    if grep -iE "error|exception|traceback" "$log_file" 2>/dev/null \
-       | grep -qvE "$(IFS='|'; echo "${ERROR_EXCLUDE_PATTERNS[*]}")"; then
-        has_error=true
-    fi
-
-    if grep -qiE "loss:\s*(nan|inf)" "$log_file" 2>/dev/null; then
-        echo "loss error (NAN/Inf)"
-        has_error=true
-    fi
-
-    # grepping mstep to match colored output. Example log line:
-    # [2024-06-17 10:00:00] INFO: \e[0;31mstep: 10
-    local complete_steps=$(grep -oP "mstep[:\s]*\K\d+" "$log_file" 2>/dev/null | tail -1)
-    complete_steps=${complete_steps:-0}
-    if [[ "$complete_steps" -ge "$SMOKE_STEPS" ]]; then
-        echo "Completed $complete_steps steps"
-    elif [[ "$complete_steps" -gt 0 ]]; then
-        echo "Only finished $complete_steps/$SMOKE_STEPS steps"
-    else
-        echo "No output steps detected"
-    fi
-
-    if [[ "$has_error" == "true" ]] || [[ "$exit_code" -ne 0 ]]; then
-        return 1
-    fi
-
-    return 0
-}
-
-# Run upstream integration tests with NPU.
-run_torchtitan_smoke() {
-    echo "Running torchtitan upstream integration tests..."
-
-    mkdir -p "$REPORT_DIR"
-
-    local smoke_log="${REPORT_DIR}/upstream_smoke.log"
-    local upstream_output_dir="${REPORT_DIR}/upstream_integration_output"
-    local start_time=$(date +%s)
-    local saved_pythonpath="$PYTHONPATH"
-
-    # Disable tests that use torch.compile (Autofuse takes too long to compile on CI).
-    local features_py="${TORCHTITAN_DIR}/tests/integration_tests/features.py"
-    for name in "1d_compile" "1d_compile_sac_op" "2d_compile" "3d_compile"; do
-        if ! grep -q "\"$name\",.*disabled=True" "$features_py" 2>/dev/null; then
-            sed -i "/\"$name\",/s/$/ disabled=True,/" "$features_py"
-        fi
-    done
-
-    cd "$TORCHTITAN_DIR"
-
-    rm -rf "$upstream_output_dir"
-    mkdir -p "$upstream_output_dir"
-
-    export PYTHONPATH="${TORCHTITAN_DIR}:${PROJECT_ROOT}:${PYTHONPATH}"
-
-    # Run upstream integration tests with torchtitan_npu patches applied.
-    local cmd=(
-        python3 -m tests.integration_tests.run_tests
-        "$upstream_output_dir"
-        --test_suite features
-        --test_name all
-        --ngpu 2
-    )
-
-    set +e
-    "${cmd[@]}" 2>&1 | tee "$smoke_log"
-    local exit_code=${PIPESTATUS[0]}
-    set -e
-
-    cd "$PROJECT_ROOT"
-    export PYTHONPATH="$saved_pythonpath"
-
-    local end_time=$(date +%s)
-    local duration=$((end_time - start_time))
-    echo "torchtitan integration test duration: ${duration}s"
-
-    if [[ $exit_code -eq 0 ]]; then
-        echo "torchtitan integration tests passed!"
-    else
-        echo "torchtitan integration tests failed (exit_code=$exit_code)"
-        exit $exit_code
-    fi
-}
-
-
-_setup_env
-_prepare_deepseek_tokenizers
-
-run_torchtitan_npu_smoke
-pytest -v --tb=short tests/smoke_tests
-
-# Smoke test success sentinel, grepped by gitcode ci. Do not modify.
 echo "smoke test passed."

@@ -1,83 +1,42 @@
-# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
-#
-# This source code is licensed under the BSD-style license found in the
-# LICENSE file in the root directory of this source tree.
-
-# ---- All project specifications ---- #
-[project]
-name = "torchtitan_npu"
-description = "Ascend End-to-End Large Model Training Adaptation Framework Based on torchtitan"
-readme = "README.md"
-requires-python = ">=3.10"
-license = {file = "LICENSE"}
-authors = [
-    { name = "Huawei Hisilicon" },
-]
-keywords = ["pytorch", "training", "llm", "npu", "ascend"]
-dependencies = [
-    "torch",
-    "torch_npu",
-]
-dynamic = ["version"]
-
-[project.urls]
-Homepage = "https://gitcode.com/cann/torchtitan-npu"
-Documentation = "https://gitcode.com/cann/torchtitan-npu/tree/master/docs"
-Issues = "https://gitcode.com/cann/torchtitan-npu/issues"
-Repository = "https://gitcode.com/cann/torchtitan-npu.git"
-
-[project.optional-dependencies]
-testing = [
-    "pytest>=7.0",
-    "pytest-html>=4.0",
-    "pytest-cov>=4.0",
-    "pytest-mock>=3.10",
-    "hypothesis>=6.0",
-]
-dev = [
-    "pre-commit",
-    "pytest",
-    "pytest-cov",
-    "expecttest", # test_tokenizer
-    "pyrefly==0.45.1",
-]
-
-[tool.setuptools.dynamic]
-version = {file = "assets/version.txt"}
-
-[tool.codespell]
-skip = ["*.json", "*.py", "*.cpp", "*.hpp", "*.c", "*.h"]
-ignore-words-list = ["cann", "nD", "dOut", "CANN", "NNAL", "nnal", "ASCEND", "ascend", "EnQue", "CopyIn", "ArchType", "AND", "ND", "tbe", "copyin", "alog"]
-
-# ---- Explicit project build information ---- #
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=64"]
 build-backend = "setuptools.build_meta"
 
+[project]
+name = "torchtitan-npu"
+version = "0.1.0"
+description = "Ascend NPU overrides for torchtitan"
+requires-python = ">=3.12"
+dependencies = ["torchtitan", "torch-npu"]
+
 [tool.setuptools.packages.find]
-where = [""]
 include = ["torchtitan_npu*"]
-exclude = ["CI*", "test_reports*", "cloudcache*", "third_party*"]
+exclude = ["tests*", "CI*", "third_party*"]
 
 [tool.pytest.ini_options]
-addopts = ["--showlocals", "-v", "--tb=short", "--import-mode=importlib"]
-testpaths = ["tests"]
-python_files = ["test_*.py"]
-python_classes = ["Test*"]
-python_functions = ["test_*"]
+pythonpath = ["."]
 markers = [
-    "nightly: heavy-weight validation reserved for nightly or dedicated multi-card environments",
-    "smoke: integration/e2e smoke coverage for NPU features and training paths",
+    "cpu: CPU-only unit test",
+    "smoke: NPU smoke test",
+    "static: source and declaration contract test",
+    "tooling: repository tooling or skill self-test; excluded from product UT coverage",
 ]
 
 [tool.pyrefly]
-project-excludes = ["**/tests/**", "CI", "torchtitan_npu/ops/triton", "scripts"]
-ignore-missing-imports = ["torchao.*", "torchft"]  # optional dependencies
+project-excludes = ["**/tests/**", "CI", "torchtitan_npu/ops/pypto", "torchtitan_npu/ops/triton", "scripts"]
+ignore-missing-imports = ["torchao.*", "torchao_npu.*", "torchft", "cann_ops_transformer", "cann_ops_transformer.*"]
 search-path = ["/tmp/torchtitan"]
 replace-imports-with-any = ["torch_npu", "torch.npu"]
 
+[[tool.pyrefly.sub-config]]
+# Patch files deliberately monkey-patch upstream modules through full
+# ``torchtitan...`` / ``torch...`` paths without importing each submodule.
+matches = "torchtitan_npu/patches/**"
+[tool.pyrefly.sub-config.errors]
+implicit-import = false
+
 [tool.ruff]
-target-version = "py310"
+target-version = "py312"
 line-length = 120
 
 [tool.ruff.lint]
@@ -87,7 +46,6 @@ ignore = [
     "E302",
     "E305",
     "E402",
-    "E501",
     "E721",
     "E731",
     "E741",
@@ -122,6 +80,9 @@ exclude = [
     "torchtitan_npu/ops/triton",
 ]
 fixable = ["ALL"]
+
+[tool.ruff.lint.pycodestyle]
+max-line-length = 120
 
 [tool.ruff.lint.isort]
 known-first-party = ["torchtitan_npu", "tests"]

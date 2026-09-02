@@ -12,6 +12,7 @@ import logging
 import math
 import sys
 from datetime import datetime
+from io import BytesIO
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -47,9 +48,18 @@ def _parse_metric_list(raw: str) -> list[str]:
     return [_normalize_metric(item.strip()) for item in raw.split(",") if item.strip()]
 
 
-PR_IMAGE_WIDTH = 1024
-PR_IMAGE_HEIGHT = 768
-PR_IMAGE_DPI = 100
+PR_IMAGE_MAX_BYTES = 200_000
+PR_IMAGE_INITIAL_DPI = 150.0
+PR_IMAGE_MIN_DPI = 1.0
+PR_IMAGE_MAX_ATTEMPTS = 12
+
+
+def _default_output_dir() -> Path:
+    for parent in Path(__file__).resolve().parents:
+        if parent.name == ".agents":
+            return parent.parent / "outputs"
+
+    return Path.cwd() / "outputs"
 
 
 def _default_output_path(log_a: str, log_b: str | None, output_format: str) -> Path:
@@ -60,11 +70,11 @@ def _default_output_path(log_a: str, log_b: str | None, output_format: str) -> P
         filename = f"{base_a}_vs_{base_b}_{stamp}.{output_format}"
     else:
         filename = f"{base_a}_{stamp}.{output_format}"
-    return Path.cwd() / filename
+    return _default_output_dir() / filename
 
 
 def _default_pr_image_output_path(output: Path) -> Path:
-    return output.with_name(f"{output.stem}_pr_1024x768.png")
+    return output.with_name(f"{output.stem}_pr_under_200kb.png")
 
 
 def _resolve_pr_image_output(
@@ -79,6 +89,56 @@ def _resolve_pr_image_output(
     if pr_output.suffix.lower() != ".png":
         pr_output = pr_output.with_suffix(".png")
     return pr_output
+
+
+def _render_png_bytes(figure, *, dpi: float) -> bytes:
+    buffer = BytesIO()
+    figure.savefig(
+        buffer,
+        format="png",
+        dpi=dpi,
+        bbox_inches="tight",
+        pil_kwargs={"compress_level": 9},
+    )
+    return buffer.getvalue()
+
+
+def _save_pr_image_under_limit(
+    figure,
+    output: Path,
+    *,
+    max_bytes: int = PR_IMAGE_MAX_BYTES,
+) -> int:
+    """Save a PNG below max_bytes without forcing a fixed aspect ratio."""
+    if max_bytes <= 0:
+        raise ValueError("max_bytes must be positive")
+
+    dpi = PR_IMAGE_INITIAL_DPI
+    png_data = b""
+    for _attempt in range(PR_IMAGE_MAX_ATTEMPTS):
+        try:
+            png_data = _render_png_bytes(figure, dpi=dpi)
+        except OSError as error:
+            raise RuntimeError(f"failed to render PR image '{output}': {error}") from error
+
+        if len(png_data) < max_bytes:
+            try:
+                output.parent.mkdir(parents=True, exist_ok=True)
+                output.write_bytes(png_data)
+            except OSError as error:
+                raise RuntimeError(f"failed to save PR image to '{output}': {error}") from error
+            return len(png_data)
+
+        scale = math.sqrt((max_bytes - 1) / len(png_data)) * 0.95
+        next_dpi = max(PR_IMAGE_MIN_DPI, dpi * min(0.9, scale))
+        if next_dpi == dpi:
+            break
+        dpi = next_dpi
+
+    raise RuntimeError(
+        f"failed to compress PR image below {max_bytes / 1000:.0f} KB; "
+        f"smallest render was {len(png_data) / 1000:.1f} KB"
+    )
 
 
 def _require_matplotlib(no_show: bool):
@@ -154,6 +214,41 @@ def _compute_error_stats(errors: list[float]) -> dict[str, float]:
     }
 
 
+def _extract_paired_metric_values(
+    aligned,
+    metric_key: str,
+) -> tuple[list[int], list[float], list[float], list[int]]:
+    """Return common-step metric pairs, skipping steps missing either value."""
+    steps: list[int] = []
+    values_a: list[float] = []
+    values_b: list[float] = []
+    skipped_steps: list[int] = []
+
+    for step, record_a, record_b in zip(
+        aligned.steps,
+        aligned.records_a,
+        aligned.records_b,
+        strict=True,
+    ):
+        value_a = record_a.get(metric_key)
+        value_b = record_b.get(metric_key)
+        if value_a is None or value_b is None:
+            skipped_steps.append(step)
+            continue
+
+        float_a = float(value_a)
+        float_b = float(value_b)
+        if math.isnan(float_a) or math.isnan(float_b):
+            skipped_steps.append(step)
+            continue
+
+        steps.append(step)
+        values_a.append(float_a)
+        values_b.append(float_b)
+
+    return steps, values_a, values_b, skipped_steps
+
+
 def _plot_single_log(
     plt,
     module,
@@ -183,7 +278,11 @@ def _plot_single_log(
     if n_rows == 1:
         axes_flat = list(axes[0])
     else:
-        axes_flat = [axes[r][c] for r in range(n_rows) for c in range(n_cols)]
+        axes_flat = [
+            axes[row][column]
+            for row in range(n_rows)
+            for column in range(n_cols)
+        ]
 
     warnings: list[str] = []
     for idx, metric in enumerate(selected):
@@ -216,24 +315,18 @@ def _plot_single_log(
     figure.suptitle(title, fontsize=12)
     figure.tight_layout(rect=(0.02, 0.03, 1, 0.97))
     try:
+        output.parent.mkdir(parents=True, exist_ok=True)
         figure.savefig(output, dpi=150, bbox_inches="tight")
     except OSError as error:
         plt.close(figure)
         raise RuntimeError(f"failed to save plot to '{output}': {error}") from error
 
     if pr_image_output is not None:
-        original_width, original_height = figure.get_size_inches()
         try:
-            figure.set_size_inches(
-                PR_IMAGE_WIDTH / PR_IMAGE_DPI,
-                PR_IMAGE_HEIGHT / PR_IMAGE_DPI,
-            )
-            figure.savefig(pr_image_output, dpi=PR_IMAGE_DPI)
-        except OSError as error:
+            _save_pr_image_under_limit(figure, pr_image_output)
+        except RuntimeError:
             plt.close(figure)
-            raise RuntimeError(f"failed to save PR image to '{pr_image_output}': {error}") from error
-        finally:
-            figure.set_size_inches(original_width, original_height)
+            raise
 
     if not no_show:
         plt.show()
@@ -271,14 +364,28 @@ def _plot_compare(
     required_metrics = ["loss", "grad_norm"]
     optional_metrics = [m for m in metrics if m not in required_metrics]
 
-    # Compute signed errors for loss and grad_norm
+    # Compute absolute errors and signed relative errors for loss and grad_norm
     losses_a = [float(r["loss"]) for r in aligned.records_a]
     losses_b = [float(r["loss"]) for r in aligned.records_b]
-    loss_abs_err, loss_rel_err = module.compute_signed_errors(losses_a, losses_b, baseline=baseline)
+    loss_abs_err, loss_rel_err = module.compute_errors(losses_a, losses_b, baseline=baseline)
 
-    grad_norms_a = [float(r.get("grad_norm", 0)) for r in aligned.records_a]
-    grad_norms_b = [float(r.get("grad_norm", 0)) for r in aligned.records_b]
-    grad_abs_err, grad_rel_err = module.compute_signed_errors(grad_norms_a, grad_norms_b, baseline=baseline)
+    grad_error_steps, grad_norms_a, grad_norms_b, skipped_grad_steps = _extract_paired_metric_values(
+        aligned,
+        "grad_norm",
+    )
+    if skipped_grad_steps:
+        warnings.append(
+            f"grad_norm missing in either log for {len(skipped_grad_steps)} common steps; "
+            "skipped those steps in grad_norm error curves and statistics"
+        )
+    if grad_error_steps:
+        grad_abs_err, grad_rel_err = module.compute_errors(
+            grad_norms_a,
+            grad_norms_b,
+            baseline=baseline,
+        )
+    else:
+        grad_abs_err, grad_rel_err = [], []
 
     # Compute error statistics
     loss_abs_stats = _compute_error_stats(loss_abs_err)
@@ -351,7 +458,7 @@ def _plot_compare(
     # Grad norm abs error
     ax_grad_abs = axes[1][1]
     ax_grad_abs.plot(
-        aligned.steps,
+        grad_error_steps,
         grad_abs_err,
         label="grad_norm abs error",
         color="blue",
@@ -364,10 +471,12 @@ def _plot_compare(
     _apply_integer_xaxis(ax_grad_abs)
 
     # Add statistics text (larger font)
-    stats_text = (
-        f"mean={grad_abs_stats['mean']:.5f}, mse={grad_abs_stats['mse']:.5f}, "
-        f"min={grad_abs_stats['min']:.5f}, max={grad_abs_stats['max']:.5f}"
-    )
+    stats_text = "no valid paired grad_norm values"
+    if grad_abs_err:
+        stats_text = (
+            f"mean={grad_abs_stats['mean']:.5f}, mse={grad_abs_stats['mse']:.5f}, "
+            f"min={grad_abs_stats['min']:.5f}, max={grad_abs_stats['max']:.5f}"
+        )
     ax_grad_abs.annotate(
         stats_text,
         xy=(0.5, -0.18),
@@ -415,7 +524,7 @@ def _plot_compare(
     # Grad norm rel error with threshold lines
     ax_grad_rel = axes[2][1]
     ax_grad_rel.plot(
-        aligned.steps,
+        grad_error_steps,
         grad_rel_err,
         label=f"grad_norm relative error (baseline={baseline_name})",
         color="green",
@@ -430,10 +539,12 @@ def _plot_compare(
     _apply_integer_xaxis(ax_grad_rel)
 
     # Add statistics text (larger font)
-    stats_text = (
-        f"mean={grad_rel_stats['mean']:.5f}, mse={grad_rel_stats['mse']:.5f}, "
-        f"min={grad_rel_stats['min']:.5f}, max={grad_rel_stats['max']:.5f}"
-    )
+    stats_text = "no valid paired grad_norm values"
+    if grad_rel_err:
+        stats_text = (
+            f"mean={grad_rel_stats['mean']:.5f}, mse={grad_rel_stats['mse']:.5f}, "
+            f"min={grad_rel_stats['min']:.5f}, max={grad_rel_stats['max']:.5f}"
+        )
     ax_grad_rel.annotate(
         stats_text,
         xy=(0.5, -0.18),
@@ -497,16 +608,16 @@ def _plot_compare(
     figure.suptitle(title, fontsize=12)
     figure.tight_layout(rect=(0.02, 0.03, 1, 0.97))
     try:
+        output.parent.mkdir(parents=True, exist_ok=True)
         figure.savefig(output, dpi=150, bbox_inches="tight")
         if pr_image_output is not None:
-            figure.set_size_inches(
-                PR_IMAGE_WIDTH / PR_IMAGE_DPI,
-                PR_IMAGE_HEIGHT / PR_IMAGE_DPI,
-            )
-            figure.savefig(pr_image_output, dpi=PR_IMAGE_DPI)
+            _save_pr_image_under_limit(figure, pr_image_output)
     except OSError as error:
         plt.close(figure)
         raise RuntimeError(f"failed to save plot to '{output}': {error}") from error
+    except RuntimeError:
+        plt.close(figure)
+        raise
 
     if not no_show:
         plt.show()
@@ -515,6 +626,8 @@ def _plot_compare(
 
 
 def main() -> int:
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+
     parser = argparse.ArgumentParser(description="Plot training metrics from torchtitan-npu logs")
     parser.add_argument("--log-a", required=True, help="path to primary log")
     parser.add_argument("--log-b", default=None, help="path to comparison log")
@@ -527,12 +640,12 @@ def main() -> int:
     parser.add_argument(
         "--generate-pr-image",
         action="store_true",
-        help="also export an extra 1024x768 PNG for PR embedding",
+        help="also export an extra PNG below 200 KB for PR embedding",
     )
     parser.add_argument(
         "--pr-image-output",
         default=None,
-        help="optional path for the 1024x768 PR image (.png)",
+        help="optional path for the PR image below 200 KB (.png)",
     )
     parser.add_argument("--title", default=None, help="figure title")
     parser.add_argument(
@@ -550,10 +663,10 @@ def main() -> int:
     try:
         records_a, warnings_a = module.read_training_metrics(args.log_a)
     except OSError as error:
-        logger.info(f"[error] failed to read log-a '{args.log_a}': {error}")
+        logger.error(f"[error] failed to read log-a '{args.log_a}': {error}")
         return 1
     if not records_a:
-        logger.info(f"[error] no valid training metrics found in log-a: {args.log_a}")
+        logger.error(f"[error] no valid training metrics found in log-a: {args.log_a}")
         return 1
 
     records_b = None
@@ -562,10 +675,10 @@ def main() -> int:
         try:
             records_b, warnings_b = module.read_training_metrics(args.log_b)
         except OSError as error:
-            logger.info(f"[error] failed to read log-b '{args.log_b}': {error}")
+            logger.error(f"[error] failed to read log-b '{args.log_b}': {error}")
             return 1
         if not records_b:
-            logger.info(f"[error] no valid training metrics found in log-b: {args.log_b}")
+            logger.error(f"[error] no valid training metrics found in log-b: {args.log_b}")
             return 1
 
     output = Path(args.output) if args.output else _default_output_path(args.log_a, args.log_b, args.format)
@@ -591,7 +704,7 @@ def main() -> int:
     try:
         plt = _require_matplotlib(args.no_show)
     except RuntimeError as error:
-        logger.info(f"[error] {error}")
+        logger.error(f"[error] {error}")
         return 1
 
     warnings = [*warnings_a, *warnings_b]
@@ -627,11 +740,11 @@ def main() -> int:
                 )
             )
     except RuntimeError as error:
-        logger.info(f"[error] {error}")
+        logger.error(f"[error] {error}")
         return 1
 
     if records_b is not None and "no common steps between log-a and log-b" in warnings:
-        logger.info("[error] no common steps between log-a and log-b")
+        logger.error("[error] no common steps between log-a and log-b")
         return 1
 
     logger.info(f"[ok] plot saved to: {output}")
@@ -654,7 +767,7 @@ def main() -> int:
         )
 
     for warning in warnings:
-        logger.info(f"[warning] {warning}")
+        logger.warning(f"[warning] {warning}")
 
     return 0
 

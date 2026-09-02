@@ -2,18 +2,22 @@
 
 ## 版本配套表
 
-torchtitan-npu支持Atlas 800T A3等昇腾训练硬件形态。软件版本配套表如下：
+torchtitan-npu 支持 Atlas 800T A3 等昇腾训练硬件。软件版本配套表如下：
 
-| torchtitan-npu版本            | torchtitan版本  | PyTorch版本    | torch_npu版本 | CANN版本  | Python版本                               |      Triton Ascend        |
+| torchtitan-npu 版本            | torchtitan 分支  | PyTorch 版本    | torch_npu 版本 | CANN 版本  | Python 版本                               |      Triton Ascend        |
 |------------------------|-------------|--------------|-------------|---------|----------------------------------------|--------------|
-| master | main `ac13e536c84e7f6647b14fa9375c3c8a8a2b8578` | 2.12.0 | 2.12 daily版本（详见requirements.txt文件） | [9.2.0_daily0805](https://ascend.devcloud.huaweicloud.com/artifactory/cann-run-mirror/software/legacy/20260805101249091/) | Python3.11.x | 3.2.1 |
-| v0.2.2-dev | v0.2.2 `73a0e6979dd10b6b1904098eb3c8f62c18ab87ce` | 2.10.0 | 2.10.0       | 9.0.0    |  Python3.11.x        |   3.2.1
+| master | main | 2.12.0 | 2.12.0rc1 | 9.0.0 | Python 3.11.x | 3.2.1 |
+| v0.2.2-dev | v0.2.2 | 2.10.0 | 2.10.0 | 9.0.0 |  Python 3.11.x |   3.2.1  |
+| override-refactor | main | 2.14.0(daily) | 2.14.0(daily) | 9.2.0 |  Python 3.12.x |   3.2.1  |
+
+> [!NOTE]
+> 安装所需的 Python 包依赖及版本见 [requirements.txt](../../requirements.txt)
 
 ## 源码安装
 
-### 1.安装依赖的软件
+### 1. 安装依赖的软件
 
-在安装torchtitan-npu之前，请参考版本配套表，安装配套的昇腾软件栈，软件列表如下：
+在安装 torchtitan-npu 之前，请参考版本配套表，安装配套的昇腾软件栈，软件列表如下：
 
 <table>
   <thead>
@@ -24,11 +28,11 @@ torchtitan-npu支持Atlas 800T A3等昇腾训练硬件形态。软件版本配�
   </thead>
   <tbody>
     <tr>
-      <td>昇腾NPU驱动</td>
+      <td>昇腾 NPU 驱动</td>
       <td rowspan="2">《<a href="https://www.hiascend.com/document/detail/zh/canncommercial/82RC1/softwareinst/instg/instg_0005.html?Mode=PmIns&InstallType=local&OS=Debian&Software=cannToolKit">驱动固件安装指南</a>》</td>
     </tr>
     <tr>
-      <td>昇腾NPU固件</td>
+      <td>昇腾 NPU 固件</td>
     </tr>
     <tr>
       <td>Toolkit（开发套件）</td>
@@ -38,28 +42,28 @@ torchtitan-npu支持Atlas 800T A3等昇腾训练硬件形态。软件版本配�
       <td>Kernel（算子包）</td>
     </tr>
     <tr>
-      <td>NNAL（Ascend Transformer Boost加速库）</td>
+      <td>NNAL（Ascend Transformer Boost 加速库）</td>
     </tr>
     <tr>
       <td>PyTorch</td>
       <td rowspan="2">《<a href="https://www.hiascend.com/document/detail/zh/Pytorch/710/configandinstg/instg/insg_0001.html">Ascend Extension for PyTorch 配置与安装</a>》</td>
     </tr>
     <tr>
-      <td>torch_npu插件</td>
+      <td>torch_npu 插件</td>
     </tr>
   </tbody>
 </table>
 
-> 注：安装 NNAL（Ascend Transformer Boost加速库）前，请先执行 `source /usr/local/Ascend/cann/set_env.sh` 配置 CANN 环境变量。
+> 注：安装 NNAL（Ascend Transformer Boost 加速库）前，请先执行 `source /usr/local/Ascend/cann/set_env.sh` 配置 CANN 环境变量。
 
-### 2. 下载torchtitan-npu源码master分支（请注意下列命令的大小写）
+### 2. 下载 torchtitan-npu 源码
 
 
  ```shell
 git clone https://gitcode.com/cann/torchtitan-npu.git
  ```
 
-### 3. 安装torchtitan-npu
+### 3. 安装 torchtitan-npu
 
 ```shell
 cd torchtitan-npu
@@ -67,21 +71,33 @@ python3 -m pip install -r requirements.txt
 python3 -m pip install -e .
 ```
 
-> 注：如有旧版本torchtitan-npu，请先[卸载](#卸载)，再进行安装
+### 4. 安装 torchao-npu（可选）
 
-> 注：`requirements.txt` 已为 `triton-ascend==3.2.1` 配置 `--extra-index-url https://triton-ascend.osinfra.cn/pypi/simple`；默认 PyPI 源当前不提供该版本，单独安装时请使用 `pip install --extra-index-url https://triton-ascend.osinfra.cn/pypi/simple triton-ascend==3.2.1`。`triton-ascend` 是安装包名，实际 Python 模块名为 `triton`，代码中请使用 `import triton`，不要使用 `import triton_ascend`。
+仓库已在 `torchtitan_npu/experiments/torchao_npu` 中内置 TorchAO-NPU 适配代码，
+默认无需单独克隆 `torchao-npu` 仓库。从 torchtitan-npu 仓库根目录执行：
 
+```shell
+python3 -m pip install -e ./torchtitan_npu/experiments
+```
 
-### 4. 配置torch.compile（可选）
+该命令以 editable 模式安装仓内 `torchao_npu` 包，并安装其声明的
+`torchao==0.17.0` 依赖。
 
-AscendC Codegen 后端已随兼容版本的 `torch_npu` 打包在 `torch_npu/_inductor/ascendc` 中，无需单独安装。通过 `torchtitan_npu.entry` 启动训练并开启 `torch.compile` 时，本仓会自动选择该后端。
+不安装适配包时，也可以将源码的父目录加入 `PYTHONPATH`：
 
-具体配置和启动方式请参考 [torch.compile 说明文档](../feature_guides/torch_compile.md)。
+```shell
+python3 -m pip install torchao==0.17.0
+export PYTHONPATH="/path/to/custom/parent${PYTHONPATH:+:${PYTHONPATH}}"
+```
 
+`/path/to/custom/parent` 必须直接包含 `torchao_npu/__init__.py`。使用仓内源码时，可将其
+替换为 `<torchtitan-npu>/torchtitan_npu/experiments`。通用训练脚本只透传量化 CLI，
+不会自动修改可选依赖路径。具体命令见
+[快速上手](./quickstart.md#deepseek-v4-torchao-npu-低精度训练)。
 
-## PyPI安装
+## PyPI 安装
 
-> 主线暂未提供此安装方式，待torchtitan发布稳定版本后提供
+> 主线暂未提供此安装方式，待 torchtitan 发布稳定版本后提供
 
 ## 卸载
 

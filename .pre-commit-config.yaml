@@ -9,6 +9,7 @@
 minimum_pre_commit_version: 4.0.0
 exclude: ^LICENSES/|\.(html|csv|svg)$
 
+default_install_hook_types: [pre-commit]
 default_stages: [pre-commit]
 ci:
   autofix_prs: false
@@ -49,10 +50,18 @@ repos:
     rev: v0.14.14
     hooks:
       - id: ruff-check
-        args: ["--output-format", "github", "--fix", "--exclude", ".agents/**,tests/**"]
+        args:
+          [
+            "--output-format",
+            "github",
+            "--line-length",
+            "120",
+            "--exclude",
+            ".agents/**,tests/**",
+          ]
         types: [python]
       - id: ruff-format
-        args: ["--exclude", ".agents/**,tests/**"]
+        args: ["--line-length", "120", "--exclude", ".agents/**,tests/**"]
         types: [python]
 
   # Spell check
@@ -60,11 +69,12 @@ repos:
     rev: v2.4.1
     hooks:
       - id: codespell
+        exclude: ^tests/assets/
         args: [
             "-L",
             "CANN,cann,NNAL,nnal,ASCEND,ascend,EnQue,CopyIn,ArchType,AND,ND,tbe,copyin,alog",
             "--skip",
-            "*.py,*.cpp,*.hpp,*.c,*.h,tests/assets/tokenizer/qwen3-tokenizer/merges.txt",
+            "*.py,*.cpp,*.hpp,*.c,*.h,tests/assets/tokenizer/qwen3-tokenizer/merges.txt,tests/assets/c4_test/data.json",
           ]
 
   # OAT compliance check (Open Source Audit Tool)
@@ -86,5 +96,6 @@ repos:
         entry: python3 -m pyrefly check
         language: system
         types: [python]
+        exclude: ^tests/assets/
         pass_filenames: false
         args: [--config, pyproject.toml]

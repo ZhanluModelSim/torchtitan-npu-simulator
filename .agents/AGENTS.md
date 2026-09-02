@@ -1,42 +1,45 @@
 # torchtitan-npu 开发指南
 
 `torchtitan-npu` 是 [torchtitan](https://github.com/pytorch/torchtitan) 的 **Ascend NPU 插件仓**。
-本仓不直接修改上游 torchtitan 代码，而是通过 monkey-patch、ModelConverter、模型注入等机制将 NPU 适配能力叠加到上游之上。
+本仓不直接修改上游 torchtitan checkout，而是通过包导入 patch、配置级 `@override`、模型模块和 NPU 算子将适配能力叠加到上游之上。
 
 ## 核心原则
 
-1. **PyTorch 原生训练技术。** torchtitan 核心的训练基础设施和并行代码不依赖非 PyTorch 库。作为插件仓，torchtitan-npu 可使用 torch_npu 等外部库，但应尽可能复用 PyTorch 原生接口。
+1. **PyTorch 原生训练技术。** torchtitan 核心的训练基础设施和并行代码不依赖非 PyTorch 库。作为插件仓，torchtitan-npu 可使用 `torch_npu` 等外部库，但应尽可能复用 PyTorch 原生接口。
 
-2. **查明根因再修复。** 不做绷带式修补。在提出方案前理解 *为什么* 出错。如果一个改动看似有效但无法解释原因，需要更深入排查。
+2. **查明根因再修复。** 不做绷带式修补。在提出方案前理解「为什么」出错。如果一个改动看似有效但无法解释原因，需要更深入排查。
 
 3. **复用优于重复。** 新写代码前，检查已有实现是否已覆盖需求。尽量统一跨模型的相似代码路径，不要给每个模型创建独立 wrapper。若上游（torchao、PyTorch）已提供功能，优先使用。
 
-4. **不要将实验泄漏到核心。** 插件仓中如需实验性代码，务必与核心适配逻辑隔离，不要在核心 patch/converter 文件中添加 `if experiment_x:` 分支。
+4. **不要将实验泄漏到核心。** 实验性代码应与公共适配逻辑隔离，不要在核心 patch、override 或模型文件中添加 `if experiment_x:` 分支。
 
 5. **保护已验证的代码路径。** 修改已收敛的代码时务必谨慎。标记可能导致现有用户代码或 checkpoint 静默失效的改动。存疑时主动询问。
 
-6. **审计所有调用点。** 修改共享代码（公共模型组件、配置字段、分布式工具）时，检查并更新所有调用点。这包括所有模型变体如 llama3、llama4、qwen3、deepseek_v3、deepseek_v32 等。
+6. **审计所有调用点。** 修改共享代码（公共模型组件、配置字段、分布式工具）时，检查并更新所有调用点，包括当前维护的 DeepSeek-V3.2、DeepSeek-V4、对应 override 和 patch 注册入口。
 
 ## 插件仓专属原则
 
-1. **绝不修改上游代码。** torchtitan-npu 不直接修改 torchtitan 源码。所有适配通过以下机制实现：
-   - **Patches**（`torchtitan_npu/patches/`）：monkey-patch 上游模块的函数或类
-   - **Converters**（`torchtitan_npu/converters/`）：通过 ModelConverter 注册表替换算子或注入自定义 kernel
-   - **模型注入**（`torchtitan_npu/models/`）：补充或覆盖上游模型实现
+1. **不修改上游 checkout。** torchtitan-npu 不直接编辑 torchtitan 源码。适配按职责放入以下位置：
+   - **Package patch**（`torchtitan_npu/patches/`）：补齐 PyTorch PrivateUse1 backend，或替换当前运行时中缺失的 Python/CANN 符号。`patches/torchtitan/` 只允许有上游依据的临时 patch；`patches/torch_npu/` 和 `patches/workaround/` 用于当前有效的 NPU runtime compatibility patch
+   - **配置级 override**（`torchtitan_npu/override/`）：使用 `@override` 声明组件替换，通过 `override.imports` 显式启用
+   - **模型模块**（`torchtitan_npu/models/`）：提供 DeepSeek-V3.2 和 DeepSeek-V4 的模型配置、并行化与 checkpoint 适配
+   - **NPU 算子**（`torchtitan_npu/ops/`）：封装 CANN 或设备专属算子能力
 
-2. **理解 patch 生效机制。** 所有 patch 在 `torchtitan_npu/__init__.py` 的 `_apply_patches()` 中注册，包导入即生效。新增 patch 必须在此函数中添加对应 import。
+2. **理解 patch 生效机制。** `torchtitan_npu/__init__.py` 导入 `torchtitan_npu.patches`，后者继续导入 `torch_npu`、`torchtitan` 和 `workaround` 子包，因此导入 `torchtitan_npu` 即会注册或应用其中的入口 patch。只有需要随包导入生效的 patch 才应加入对应的 `__init__.py`；供模型或 override 直接复用的兼容模块按调用路径显式导入。
 
-3. **Converter 遵循注册表模式。** 自定义算子转换必须通过 `torchtitan_npu/converters/registry.py` 的 `@register_model_converter()` 注册。不要在模型文件中硬编码算子替换逻辑。
+3. **Override 显式启用。** 每个 override 工厂使用 `@override` 注册，并以完整的 `module.function` 写入 `override.imports`。不要在 `__init__.py` 中批量导入具体 override。
 
-4. **上游同步是常态。** 本仓需定期跟踪上游 torchtitan 变更。同步基线信息维护在 `docs/community/versioning_policy.md` 的分支同步表。每次同步后必须更新此表。
+4. **固定上游基线。** 当前 torchtitan commit 同时记录在 `requirements.txt` 和 `.ci/lint.sh`。调整上游版本时同步更新两处，并检查 patch 目标、函数签名、模型接口和测试是否仍有效。
 
-5. **Patch 目标随上游变化。** 上游重构后，patch 的目标函数/类可能已不存在或签名已变。每次上游同步必须检查所有 patch 是否仍有效。
+5. **临时 patch 可删除。** `torchtitan_npu/patches/torchtitan/` 只保存已提交上游但当前依赖版本尚未包含的临时补丁。补丁文件必须记录对应 PR；上游合入并更新依赖后删除相关补丁和导入。
+
+6. **测试目录与执行入口同时维护。** `tests/unit_tests/` 是 CPU 测试的统一执行根；生产语义测试按 `torchtitan_npu/` 镜像，仓库脚本和 skill 自测放在 `tests/unit_tests/tooling/`，执行时不计入产品 UT 覆盖。NPU 模型 ST 只放在 `tests/integration_tests/`，不以 CPU UT、kernel smoke 或 runner 自测替代。详细的目录迁移方案见 [`docs/developer_guides/unit-test-architecture.md`](../docs/developer_guides/unit-test-architecture.md)，低价值测试筛选见 [`docs/developer_guides/low-value-ut-principles.md`](../docs/developer_guides/low-value-ut-principles.md)。
 
 ## 代码风格（继承上游 torchtitan）
 
 ### 命名
 
-- 名称必须 **准确、描述性、反映实际作用域**。不要在生产代码中使用 "toy/test/temp" — 这类上下文放在 docstring 中。
+- 名称必须 **准确、描述性、反映实际作用域**。不要在生产代码中使用 `toy`、`test` 或 `temp`；这类上下文放在 docstring 中。
 - 遵循上游约定：匹配 torchao 和 PyTorch 的命名。
 - 计数使用 `num_` 前缀（如 `num_expert_groups` 而非 `n_expert_groups`）。
 
@@ -46,14 +49,13 @@
 
 | 目录 | 职责 |
 | --- | --- |
-| `torchtitan_npu/patches/` | 对上游 torchtitan、PyTorch、torch_npu 等模块的 monkey-patch，按 patch 目标分子目录 |
-| `torchtitan_npu/converters/` | 算子转换器注册表与自定义 kernel，通过 registry 机制注入 |
-| `torchtitan_npu/models/` | 模型实现（覆盖或扩展torchtitan），含并行化策略与训练配置 |
-| `torchtitan_npu/distributed/` | NPU 专属分布式工具 |
-| `torchtitan_npu/config/` | NPU 自定义配置扩展 |
-| `torchtitan_npu/tools/` | 训练辅助工具（flight_recorder、profiling 等） |
-| `torchtitan_npu/train.py` | 训练流程 patch（如模型专属训练逻辑） |
-| `torchtitan_npu/entry.py` | 训练入口点 |
+| `torchtitan_npu/patches/torchtitan/` | 包导入时生效的上游临时补丁 |
+| `torchtitan_npu/patches/torch_npu/`、`workaround/` | 当前有效的 NPU runtime compatibility patch；保留其自动加载和生效时机 |
+| `torchtitan_npu/override/` | 通过 `override.imports` 显式启用的配置级组件替换 |
+| `torchtitan_npu/models/` | DeepSeek-V3.2、DeepSeek-V4 模型配置、实现、并行化和 checkpoint 适配 |
+| `torchtitan_npu/ops/` | CANN 与 NPU 专属算子封装 |
+| `tests/unit_tests/` | CPU 单测和静态契约测试 |
+| `scripts/` | 训练、合规检查及其他仓库级脚本 |
 
 不要把模型无关的功能放在模型特定文件中。
 
@@ -78,48 +80,44 @@
 - 描述放在 docstring 中，不要放在名称里。
 - 注释使用英文，文档优先使用中文。
 
-## 标准开发 Pipeline
+## 标准开发流程
 
 ### 1. 获取上下文
 
 - 先确认任务涉及的目录、模型、并行策略和是否影响训练数值。
-- 修改 `torchtitan_npu/` 下代码时，按路径加载 `.agents/rules/` 中的专项规则；如果同一改动命中多个领域，规则全部适用。
-- 涉及上游同步时使用 `torchtitan-sync` skill。
+- 先读取相关源码、配置、测试和脚本；涉及 override 或 patch 时再读取对应目录的说明文档。
+- 文档任务使用 `.agents/skills/write-torchtitan-npu-docs/` 中的项目规范。
+- 涉及上游同步时，先核对 `requirements.txt` 与 `.ci/lint.sh` 中的固定 commit。
 
 ### 2. 实施修改
 
 - 保持改动最小，只改完成目标所需的文件。
-- 复用现有 patch、converter、model injection、distributed helper 和 config 模式。
-- 新增或修改 patch/converter/model/config 后，同步检查注册入口和所有调用点。
+- 复用现有 patch、override、模型和 `ops` 实现。
+- 新增或修改 patch、override、模型或算子后，同步检查注册入口和所有调用点。
 - 对数值、分布式、checkpoint、模型加载路径保持保守；存疑时先给出风险和验证方案。
 
-### 3. Codecheck
+### 3. 代码检查
 
-step1: 运行pre-commit
+先确认 `/tmp/torchtitan` 指向仓库约定的 `torchtitan` checkout，再从仓库根目录运行完整 Lint：
 
 ```bash
-pip install -r requirements.txt -r requirements_dev.txt
-# 快速迭代，可先只检查改动文件
-pre-commit run --files <changed files>
-# 提交或发 PR 前必须通过
-pre-commit run --all-files
+python -m pre_commit run --all-files --show-diff-on-failure
 ```
-step2: 代码审查
 
-代码审查或定位 codecheck 失败时使用 `torchtitan-npu-code-reviewer` skill。
+完整 `pre-commit run --all-files` 通过后，才视为 Lint 通过。定位失败时直接依据 hook 输出、相关配置和改动内容分析。
 
 ### 4. 测试与数值验证
 
-- Python 逻辑改动至少运行相关单元测试；影响共享逻辑时扩大到 `pytest tests/ -x`。
-- 涉及分布式、NPU kernel、converter、patch 或模型训练行为时，补充对应 NPU 冒烟/集成测试。
+- 新增、修正、重构或 review 测试时，使用 `.agents/skills/developer-tests-review/` 选择「更新测试」或「review测试」 workflow；前者修改并执行相关测试，后者只做静态审查，不修改或执行测试。
+- Python 逻辑改动至少运行相关单元测试；CPU 单测使用 `TORCH_DEVICE_BACKEND_AUTOLOAD=0 python -m pytest -v --tb=short tests/unit_tests -x`。
+- 涉及分布式、NPU kernel、override、patch 或模型训练行为时，补充对应 NPU 冒烟或集成测试。
 - 数值验证：
   - 非计算性改动（重构、activation checkpointing 调整等）必须保证修改前后 **loss 完全一致**；计算性改动需在代表性数据集（如 C4）上展示 loss 收敛。
   - 对齐验证须加载同一 checkpoint 并固定 NPU 随机性，相同并行策略下两次运行的 loss 和 grad_norm 应一致；**禁止** 使用 `--debug.deterministic_warn_only`。
-  - 优先用 `premerge-accuracy-check` skill 生成 loss/grad_norm 对比报告，仅对已有日志作图可用 `training-log-visualization`；证明 bit-wise 一致需保留更高精度来源，stdout 的 5 位有效数字不能作为唯一依据。
+  - 证明 bit-wise 一致时，应比较 TensorBoard 中未截断的逐 step `loss` 和 `grad_norm`；stdout 的有限显示精度不能作为唯一依据。
 
 ### 5. PR 与流水线
 
-- **提 PR 前必须调用 `torchtitan-npu-code-reviewer` skill 审查本次改动**，建议修复其报告的 S1/S2 问题后再创建 PR。
-- PR 描述解释“为什么”而非只是“做了什么”；非 trivial 改动附 loss 对比曲线，模型变更说明 checkpoint 兼容性。
-- 用 `gitcode-pr` 创建/推送 PR、读取改动与评论，并严格按 `.gitcode/PULL_REQUEST_TEMPLATE/PULL_REQUEST_TEMPLATE.md` 填写：标题用英文类型标签 `[type] 描述`，`类型` 只勾一个主类型，`Checklist` 只勾真实完成项，`如何测试` 写实际执行的命令或说明未执行原因。
-- 用 `gitcode-pipeline` 触发/等待 CI 并拉取失败日志，失败后结合失败类型与专项规则修复或判断 CodeCheck 屏蔽；缺少上述远程 skills 时先用 `default-skills` 安装。
+- PR 描述解释「为什么」而非只写「做了什么」；非简单改动附数值证据，模型变更说明 checkpoint 兼容性。
+- 创建或推送 PR、读取改动与评论时使用 `gitcode-pr`，并按 `.gitcode/PULL_REQUEST_TEMPLATE/PULL_REQUEST_TEMPLATE.md` 填写。标题使用正确的英文类型标签，如 `feat`、`fix`、`refactor`、`docs` 或 `test`；`类型` 和 `Checklist` 只勾选真实完成项，`如何测试` 写实际命令或未执行原因。
+- 用户要求触发或等待 CI 时使用 `gitcode-pipeline`，根据实际失败日志定位问题。

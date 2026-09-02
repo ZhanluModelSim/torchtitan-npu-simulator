@@ -1,74 +1,118 @@
-__pycache__
-.idea
-.DS_Store
-*.egg-info
-build
-outputs
-dist/*
-.vscode
-.vs
-.claude/
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
 
-# data
-data
-out
-wandb
+# C extensions
+*.so
 
-torchtitan/datasets/**/*.model
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
 
-# hf assets
-assets/hf/*
-assets/tokenizer/*
-torchtitan/experiments/flux/assets/*
+# PyInstaller
+#  Usually these files are written by a python script from a template
+#  before PyInstaller builds the exe, so as to inject date/other infos into it.
+*.manifest
+*.spec
 
-# temp files
-/.venv
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
+
+# Translations
+*.mo
+*.pot
+
+# Django stuff:
 *.log
-error.json
-_remote_module_non_scriptable.py
-pipeline_logs
-kernel_meta/
-.static_kernel_records.json
+local_settings.py
+db.sqlite3
 
-# Editor temporaries (VIM)
-[._]*.s[a-v][a-z]
-[._]*.sw[a-p]
-[._]s[a-rt-v][a-z]
-[._]ss[a-gi-z]
-[._]sw[a-p]
-Session.vim
-Sessionx.vim
-.netrwhist
-*~
-.~lock.*
+# Flask stuff:
+instance/
+.webassets-cache
 
-# macOS dir files
-.DS_Store
+# Scrapy stuff:
+.scrapy
 
-# torchtitan
-/torchtitan
-# agent
-.claude/skills
-.claude/CLAUDE.md
-.claude/rules
-.claude/settings.local.json
-.claude/*.bak.*
-.opencode/skills
-.opencode/rules
-.opencode/AGENTS.md
-.opencode/node_modules
-.opencode/bootstrap.log
-.opencode/*.bak.*
-.codex/skills
-.codex/rules
-.codex/*.bak.*
-AGENTS.md
-.agents/skills/_remote/
-.agents/skills/gitcode-pr
-.agents/skills/gitcode-pipeline
-.agents/skills/cann-operator-env-config
-tokenizer.json
+# Sphinx documentation
+docs/_build/
+
+# PyBuilder
+target/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# pyenv
+.python-version
+
+# celery beat schedule file
+celerybeat-schedule
+
+# SageMath parsed files
+*.sage.py
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Spyder project settings
+.spyderproject
+.spyproject
+
+# Rope project settings
+.ropeproject
+
+# mkdocs documentation
+/site
+
+# mypy
+.mypy_cache/
+.claude/*
+!.claude/CLAUDE.md
+!.claude/skills
+.opencode/*
+!.opencode/AGENTS.md
+!.opencode/skills
+outputs/
 
 oat_reports/
 
 log/
+
+# Generated training-log visualizations (created lazily by the skill).
+/outputs/

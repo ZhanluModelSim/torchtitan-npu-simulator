@@ -5,119 +5,52 @@
 
 set -e
 
-# Please adjust the path below to match your CANN installation.
-source /usr/local/Ascend/cann/set_env.sh
+# set python3.12 and pip3.12 as default
+if ! PYTHON_BIN="$(command -v python3.12)"; then
+    echo "python3.12 not found" >&2
+    exit 1
+fi
+if ! PIP_BIN="$(command -v pip3.12)"; then
+    echo "pip3.12 not found" >&2
+    exit 1
+fi
+readonly PYTHON_BIN PIP_BIN
+readonly PYTHON_SHIM_DIR="$(mktemp -d "${TMPDIR:-/tmp}/torchtitan-npu-python.XXXXXX")"
+ln -s "${PYTHON_BIN}" "${PYTHON_SHIM_DIR}/python"
+ln -s "${PYTHON_BIN}" "${PYTHON_SHIM_DIR}/python3"
+ln -s "${PIP_BIN}" "${PYTHON_SHIM_DIR}/pip"
+export PATH="${PYTHON_SHIM_DIR}:${PATH}"
 
-pip install -r requirements.txt
-pip install -r requirements_dev.txt
-
-# Global variable
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-OUTPUT_DIR="${PROJECT_ROOT}/output"
-INTEGRATION_REPORT_DIR="${PROJECT_ROOT}/test_reports/integration_tests"
-TORCHTITAN_BRANCH="main"
-TORCHTITAN_COMMIT="ac13e536c84e7f6647b14fa9375c3c8a8a2b8578"
-TITAN_DIR="${PROJECT_ROOT}/third_party/torchtitan"
-TIMEOUT_SECONDS=${TIMEOUT_SECONDS:-300}
-upstream_exit_code=0
-
-
-# Run torchtitan upstream unit tests (with NPU patches applied)
-run_upstream_ut() {
-    echo "Running torchtitan upstream unit tests..."
-
-    # Ensure torchtitan_npu is installed (applies patches on import)
-    if ! python3 -c "import torchtitan_npu" 2>/dev/null; then
-        python3 -m pip install -e .
-    fi
-
-    # Clone torchtitan source if not exists
-    if [ ! -d "$TITAN_DIR" ]; then
-        echo "Cloning torchtitan source..."
-        mkdir -p third_party
-        git clone --branch "$TORCHTITAN_BRANCH" \
-            https://gitcode.com/GitHub_Trending/to/torchtitan.git "$TITAN_DIR"
-    fi
-
-    git -C "$TITAN_DIR" fetch origin "$TORCHTITAN_BRANCH"
-    git -C "$TITAN_DIR" checkout "$TORCHTITAN_COMMIT"
-
-    # Create conftest.py in torchtitan test dir to ensure import torchtitan_npu before each test
-    local titan_test_dir="${TITAN_DIR}/tests/unit_tests"
-    local conftest_file="${titan_test_dir}/conftest.py"
-
-    if [[ ! -d "$titan_test_dir" ]]; then
-        echo "Torchtitan unit test directory not found: $titan_test_dir"
-        return 1
-    fi
-    cat > "$conftest_file" << 'EOF'
-# Auto-generated conftest for torchtitan-npu patch testing
-import pytest
-
-def pytest_configure(config):
-    """Import torchtitan_npu to apply NPU patches before running tests."""
-    import torchtitan_npu  # noqa: F401
-EOF
-
-    # Save original PYTHONPATH and set torchtitan source path
-    local saved_pythonpath="$PYTHONPATH"
-    export PYTHONPATH="${TITAN_DIR}:${PROJECT_ROOT}:${PYTHONPATH}"
-
-    pytest_args="-v --tb=short --import-mode=importlib"
-
-    # Skip tests incompatible with NPU environment (ut runs off-device)
-    pytest_args="$pytest_args --ignore=tests/unit_tests/test_tokenizer.py"
-    pytest_args="$pytest_args --ignore=tests/unit_tests/test_activation_checkpoint.py"
-    pytest_args="$pytest_args --ignore=tests/unit_tests/test_download_hf_assets.py"
-    pytest_args="$pytest_args --ignore=tests/unit_tests/test_fsdp_moe_sharding.py"
-    # Skip tests conflicting with the multiturn-chat patch
-    pytest_args="$pytest_args --deselect=tests/unit_tests/test_chat_dataset.py"
-
-    # Test target: torchtitan upstream unit tests
-    local test_target="tests/unit_tests/"
-
-    # Switch to torchtitan directory (tests use relative paths like ./torchtitan/models/...)
-    cd "${TITAN_DIR}"
-    echo "Running torchtitan tests from: $(pwd)"
-    set +e
-    python3 -m pytest $pytest_args $test_target
-    local exit_code=$?
-    set -e
-
-    # Return to project root
-    cd "$PROJECT_ROOT"
-
-    # Cleanup: remove the generated conftest file
-    rm -f "$conftest_file"
-
-    # Restore PYTHONPATH
-    export PYTHONPATH="$saved_pythonpath"
-
-    if [[ $exit_code -eq 0 ]]; then
-        echo "Torchtitan upstream tests passed!"
-    elif [[ $exit_code -eq 5 ]]; then
-        echo "No torchtitan tests found to run."
-    else
-        echo "Torchtitan upstream tests failed (exit_code=$exit_code)"
-        upstream_exit_code=$exit_code
-    fi
-
-    return 0
+_cleanup_python_shims() {
+    rm -f -- \
+        "${PYTHON_SHIM_DIR}/python" \
+        "${PYTHON_SHIM_DIR}/python3" \
+        "${PYTHON_SHIM_DIR}/pip"
+    rmdir -- "${PYTHON_SHIM_DIR}"
 }
+trap _cleanup_python_shims EXIT
 
-run_upstream_ut
-cd "$PROJECT_ROOT"
-if PYTHONPATH="${TITAN_DIR}:${PROJECT_ROOT}:${PYTHONPATH}" \
-    python3 -m pytest -v --tb=short tests/unit_tests; then
-    local_exit_code=0
-else
-    local_exit_code=$?
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+TORCHTITAN_REPO="${TORCHTITAN_REPO:-https://gitcode.com/GitHub_Trending/to/torchtitan.git}"
+TORCHTITAN_COMMIT="${TORCHTITAN_COMMIT:-$(grep '^torchtitan @ ' "${PROJECT_ROOT}/requirements.txt" | cut -d@ -f3)}"
+TORCHTITAN_DIR="${TORCHTITAN_DIR:-${PROJECT_ROOT}/third_party/torchtitan}"
+
+source /home/jenkins/Ascend/cann-9.2.0/set_env.sh
+# Prevent torch from eagerly importing torch_npu while spmd_types is initializing.
+export TORCH_DEVICE_BACKEND_AUTOLOAD=0
+
+cd "${PROJECT_ROOT}"
+export PYTHONPATH="${PROJECT_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+pip install -r requirements-dev.txt
+
+if [[ ! -d "${TORCHTITAN_DIR}/.git" ]]; then
+    mkdir -p "$(dirname "${TORCHTITAN_DIR}")"
+    git clone --filter=blob:none --no-checkout "${TORCHTITAN_REPO}" "${TORCHTITAN_DIR}"
 fi
+git -C "${TORCHTITAN_DIR}" fetch --depth 1 origin "${TORCHTITAN_COMMIT}"
+git -C "${TORCHTITAN_DIR}" checkout --detach --quiet "${TORCHTITAN_COMMIT}"
+pip install --no-deps -e "${TORCHTITAN_DIR}"
 
-echo "Unit test summary: upstream=${upstream_exit_code}, torchtitan-npu=${local_exit_code}"
-
-if [[ $upstream_exit_code -ne 0 ]]; then
-    exit "$upstream_exit_code"
-fi
-exit "$local_exit_code"
+python -c 'from torchtitan.distributed.context_parallel.api import cp_shard; print(cp_shard.__module__)'
+python -m pytest -v --tb=short tests/unit_tests

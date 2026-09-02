@@ -1,156 +1,170 @@
 # 快速上手
 
-参考 [软件安装](./installation.md) 准备环境后，即可在 NPU 平台上运行 torchtitan-npu。
-`scripts/run_train.sh` 默认使用 Qwen3-0.6B debug 配置；下文同时提供 DeepSeek-V3.2 示例。
+参考 [软件安装](./installation.md) 准备环境后，进入 `torchtitan-npu` 仓库根目录。除另有说明外，本文中的相对路径和命令均以仓库根目录为基准。本文先以 DeepSeek V3 说明通用启动方式，再给出 DeepSeek-V4 多卡训练和 TorchAO-NPU 低精度训练入口。
 
-## 数据准备（DeepSeek-V3.2 示例）
+## 数据准备
 
-1. 准备 Tokenizer [（以 DeepSeek-V3.2 网络为例）](https://huggingface.co/deepseek-ai/DeepSeek-V3.2/tree/main)。
+1. 使用仓库预置的 DeepSeek V3 Tokenizer，目录为 `tests/assets/deepseek_v3/`，单卡默认命令会直接使用该目录，无需额外下载。
 
-新建 "deepseekv3.2-tokenizer" 目录，将 `tokenizer.json` 和 `tokenizer_config.json` 文件下载至该目录。
-
-也可以通过以下方式下载 tokenizer：
-
-```bash
-# 从huggingface下载 DeepSeek V3.2 tokenizer https://huggingface.co/settings/tokens
-python scripts/download_hf_assets.py --repo_id deepseek-ai/DeepSeek-V3.2 --assets tokenizer
+```text
+tests/assets/deepseek_v3/
+├── tokenizer.json
+└── tokenizer_config.json
 ```
 
-`torchtitan_npu/models/deepseek_v32/config_registry.py` 中的 `hf_assets_path` 默认指向
-`./assets/hf/DeepSeek-V3.2`，使用上面的下载命令时无需修改。如果手动下载到 `deepseekv3.2-tokenizer`，
-则将实际使用的配置函数中的路径改为：
-
-```python
-hf_assets_path="./deepseekv3.2-tokenizer",
-```
-
-测试场景可直接使用项目预置在 `tests/assets/tokenizer/deepseekv3_tokenizer/` 的 tokenizer，无需重复下载：
+如需使用其他 Tokenizer，可通过 `HF_ASSETS_PATH` 指定：
 
 ```bash
-MODULE=torchtitan_npu.models.deepseek_v32 \
-CONFIG=deepseek_v32_671b_4layers_debug \
-bash scripts/run_train.sh --hf_assets_path ./tests/assets/tokenizer/deepseekv3_tokenizer
+export HF_ASSETS_PATH=/path/to/tokenizer
 ```
 
-2. 下载数据集。以 [enwiki 数据集](https://huggingface.co/datasets/lsb/enwiki20230101)
-   为例：
+2. 准备数据集。
+
+已在 `tests/assets/c4_test/` 中预置 `c4_test` 测试数据集，示例 wrapper 默认使用该目录，无需额外下载。
+
+使用其他数据集时，需同时指定数据集名称和目录：
 
 ```bash
-cd ./tests/assets
-hf download lsb/enwiki20230101 --repo-type=dataset --local-dir .
-cd ../..
+export DATASET=dataset_name
+export DATASET_PATH=/path/to/dataset
 ```
 
 ## 配置 CANN 环境变量
 
-启动训练前，需要先在当前 shell 中加载 CANN 相关环境变量。启动脚本（`run_train.sh` /
-`run_train_multinodes.sh`）本身不再内置这些 `source` 命令，请按需自行执行：
+当 CANN 安装在其他目录时，推荐通过 `ASCEND_SET_ENV_PATH` 指定 `set_env.sh` 的路径，并将其传给脚本：
 
 ```bash
-# CANN 基础环境（必需）
-source /usr/local/Ascend/cann/set_env.sh
-
-# ATB 加速库环境（使用 ATB 融合算子时必需）
-source /usr/local/Ascend/nnal/atb/set_env.sh
-
-# 自定义算子环境（仅在启用 custom operators 时需要）
-source /usr/local/Ascend/cann/opp/vendors/custom_transformer/bin/set_env.bash
+ASCEND_SET_ENV_PATH=/path/to/ascend-toolkit/set_env.sh \
+  bash scripts/run_train.sh
 ```
+
+未设置该变量时，`scripts/run_train.sh` 会自动按以下顺序查找可用的 `set_env.sh`：
+
+```text
+/usr/local/Ascend/cann/set_env.sh
+/usr/local/Ascend/ascend-toolkit/set_env.sh
+/home/developer/Ascend/ascend-toolkit/set_env.sh
+```
+
+无需在当前 shell 中重复执行 `source`。
 
 ## 启动训练任务
 
-启动 torchtitan-npu 训练任务时，推荐使用以下脚本：单机环境使用 `scripts/run_train.sh`，多机环境使用
-`scripts/run_train_multinodes.sh`。以下展示了一些常见任务的启动方式。
+DeepSeek V3 单卡训练任务可直接使用 `scripts/run_train.sh` 启动。`scripts/run_train.sh` 默认使用 1 张 NPU 和 `deepseek_v3_debugmodel` 配置，并把额外命令行参数原样透传给训练入口。
 
-### 单机训练任务
+### 单卡训练任务
 
-脚本默认配置以 16 NPU 启动 Qwen3-0.6B debug 模型训练任务：
-```bash
-bash scripts/run_train.sh
-```
-该默认配置使用项目预置的 `tests/assets/tokenizer/qwen3-tokenizer/` 和 `tests/assets/c4_test/`，不依赖上方的 DeepSeek tokenizer。
-
-本页前面的数据准备以 DeepSeek-V3.2 为例。如需启动 DeepSeek-V3.2 4 层 debug
-模型，请显式指定对应的模块和配置：
+使用默认配置启动训练：
 
 ```bash
-MODULE=torchtitan_npu.models.deepseek_v32 \
-CONFIG=deepseek_v32_671b_4layers_debug \
-bash scripts/run_train.sh
-```
-
-自定义配置，调整训练步数和全局 batch size：
-
-```bash
+NGPU=1 \
 bash scripts/run_train.sh \
-  --training.steps 100 \
-  --training.global_batch_size 32
+  --hf-assets-path tests/assets/deepseek_v3 \
+  --dataloader.dataset c4_test \
+  --dataloader.dataset-path tests/assets/c4_test \
+  --training.local-batch-size 1 \
+  --training.seq-len 2048 \
+  --training.steps 5
 ```
 
 > [!NOTE]
-> * `MODULE`: 指定模型 Python 模块，默认 `torchtitan_npu.models.qwen3`。切换模型时改为对应模块，例如 DeepSeek-V3.2 改为 `torchtitan_npu.models.deepseek_v32`，DeepSeek-V4 改为 `torchtitan_npu.models.deepseek_v4`。
-> * `CONFIG`: 指定 `config_registry.py` 中的配置函数，默认 `debug_qwen3_06b_single_node`。需与 `MODULE` 对应同一模型，例如 DeepSeek-V3.2 4 层 debug 配置为 `deepseek_v32_671b_4layers_debug`，DeepSeek-V4 改为 `debug_deepseek_v4_flash_single_node`。
-> * `NGPU`: 指定单机或多机每节点参与训练的 NPU 数量；`scripts/run_train.sh` 默认值为 16，`scripts/run_train_multinodes.sh` 默认值为 8。
-> * `training.allow_hf32`：控制 NPU MatMul、Conv、aclnn 算子是否启用 HF32，默认启用，无需传参；关闭时添加 `--training.no-allow_hf32`，这是 Tyro 为该布尔字段自动生成的反向选项。
-> * `--training.steps` 与 `--training.global_batch_size`: 动态覆盖 registry 配置中的字段。
+> 示例 wrapper / 底层 launcher 配置项说明：
+> - `ASCEND_SET_ENV_PATH`：可选，自定义 CANN `set_env.sh` 路径；设置后优先加载该文件。
+> - `MODULE`：模型 Python 模块，默认为 `torchtitan.models.deepseek_v3`。
+> - `CONFIG`：`torchtitan/models/deepseek_v3/config_registry.py` 中注册的配置函数，默认为 `deepseek_v3_debugmodel`。
+> - `NGPU`：当前节点参与训练的 NPU 数量，默认为 `1`。
+> - `HF_ASSETS_PATH`：Tokenizer 目录，默认为仓内 `tests/assets/deepseek_v3`。
+> - `DATASET` 和 `DATASET_PATH`：数据集名称和目录，默认使用仓内的 `tests/assets/c4_test/`。
+> - 脚本后的其他参数会原样传给 `torchtitan_npu.train`，可用于覆盖配置函数中的训练和并行参数。
 
 
-### 多机训练任务
+### 单机 8 卡 EP8 训练任务
 
-在执行启动命令前，按照集群的实际情况编辑 `scripts/run_train_multinodes.sh` 文件中的网络与节点配置：
+直接复用 DeepSeek-V4 单机 8 卡示例脚本。该脚本默认使用 8 卡、EP8/DP8 并行配置和 `deepseek_v4_flash_43layers_16experts` 模型配置：
 
 ```bash
-# TODO change to your network interface
-Network_Interface=enp23s0f3 # 填入 ifconfig 的驱动名
-...
-# TODO change to your device ips
-NODE_IPS="192.168.xxx.xxx,192.168.xxx.xxx" # 填入集群的所有IP
+bash examples/deepseek_v4/debug/deepseek_v4_flash_8p_cpt_4k_a3.sh \
+  --training.steps 5
 ```
 
-在所有参与训练的节点上同时执行 `scripts/run_train_multinodes.sh`，以启动多机预训练任务。以 DeepSeek-V3.2 完整模型为例：
-```bash
-NODE_IPS="192.168.xxx.xxx,192.168.xxx.xxx" Network_Interface=enp189s0f0 bash scripts/run_train_multinodes.sh
-```
+DeepSeek-V4 的 SMLA 融合路径和 TND 数据约定见 [DeepSeek-V4 TND 适配](../feature_guides/deepseek_v4_tnd.md)。
+
+### DeepSeek-V4 TorchAO-NPU 低精度训练
+
+先按[软件安装](./installation.md#4-安装-torchao-npu可选)安装仓内适配包，或将
+`torchao_npu` 源码的父目录加入 `PYTHONPATH`。随后在普通训练命令后显式增加量化 CLI：
 
 > [!NOTE]
-> * 脚本会自动通过 `LOCAL_HOST` 匹配 `IPs` 数组以推导当前机器的 `NODE_RANK`。若提取规则错误导致未匹配成功，脚本将报错退出。
-> * 多机通信依赖相应的端口开放，请确保 `MASTER_PORT` (默认 6300) 以及 HCCL 通信基础端口 (默认 30000) 不被防火墙拦截。
-> * 脚本中设置的 `HCCL_CONNECT_TIMEOUT`、`HCCL_EXEC_TIMEOUT`、`ACL_DEVICE_SYNC_TIMEOUT` 等通信与超时相关环境变量，可按集群规模和网络状况调整，各变量含义详见[《CANN 环境变量参考》](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/900/maintenref/envvar/envref_07_0001.html)。
+> 当前低精度训练仅支持 A5（Ascend 950）硬件。
 
+```bash
+HF_ASSETS_PATH=/path/to/DeepSeek-V4-Flash \
+bash examples/deepseek_v4/debug/deepseek_v4_flash_8p_cpt_4k_a3.sh \
+  --training.steps 5 \
+  --extension.quantization.enable-quantized-training \
+  --extension.quantization.recipe all_block_fp8
+```
+
+源码方式示例：
+
+```bash
+python3 -m pip install torchao==0.17.0
+export PYTHONPATH="/path/to/custom/parent${PYTHONPATH:+:${PYTHONPATH}}"
+```
+
+自定义目录必须直接包含 `torchao_npu/__init__.py`；使用仓内源码时，对应目录为
+`<torchtitan-npu>/torchtitan_npu/experiments`。单机和多机示例分别调用
+`scripts/run_train.sh` 和 `scripts/run_train_multinodes.sh`，脚本只透传量化 CLI。
+未设置 `--extension.quantization.enable-quantized-training` 时，配置树保持高精度版本。
+
+该入口复用 torchtitan 的预训练/续训练循环，并不表示已经提供 SFT 专用数据处理或训练入口。
+
+启用低精度训练时，每个节点需使用
+A5（Ascend 950）硬件，安装相同版本的 `torchao_npu` 及其依赖，并执行相同命令；
+`NODE_IPS` 的顺序决定节点 rank：
+
+```bash
+NODE_IPS=your_ip1,your_ip2,... \
+HF_ASSETS_PATH=/path/to/DeepSeekV4_tokenizer \
+CKPT_SAVE_LOAD_PATH=/path/to/save_ckpt \
+CKPT_INIT_LOAD_PATH=/path/to/init_load_ckpt \
+bash examples/deepseek_v4/deepseek_v4_flash_cpt_4k_a3.sh \
+  --extension.quantization.enable-quantized-training \
+  --extension.quantization.recipe all_block_fp8 \
+  --extension.quantization.no-enable-mxfp4-qat \
+  --training.steps 5
+```
+
+两份 A3 示例均默认运行高精度训练。只有显式传入
+`--extension.quantization.enable-quantized-training` 时，配置构建阶段才会导入并应用 TorchAO-NPU Converter。
+
+低精度 recipe 的目标范围如下：
+
+| `RECIPE` | Attention 和 shared expert | Routed grouped experts |
+| --- | --- | --- |
+| `all_mxfp8` | MXFP8 | MXFP8 |
+| `mix`（默认） | MXFP8 | Block FP8 |
+| `all_block_fp8` | Block FP8 | Block FP8 |
+
+量化相关 CLI 参数：
+
+- `--extension.quantization.enable-quantized-training` 与 `--extension.quantization.no-enable-quantized-training`：选择低精度或高精度通路；默认使用高精度，只有显式传入 enable 开关才启用低精度。
+- `--extension.quantization.recipe`：选择 `all_mxfp8`、`mix` 或 `all_block_fp8`，默认使用 `mix`。
+- `--extension.quantization.enable-mxfp4-qat` 与 `--extension.quantization.no-enable-mxfp4-qat`：控制 routed expert 的 Block FP8 weight 是否增加 MXFP4 QAT fake quant 数值约束，默认关闭，仅对包含 Block FP8 的 recipe 生效。该选项不是持久化 4-bit 参数训练，也不会把算子替换为原生 A8W4 GEMM。
+- `--extension.quantization.dst-type-max`：MXFP4 fake quant 的目标数据类型最大值，默认 `0.0`，由数据类型自动推导。
+- `--profiler.enable-profiling`：启用 profiler；如需 CANN profiler override，还需将 `torchtitan_npu.override.common.profiler.cann` 加入 override imports。
+- `USE_GOLDEN`：设为 `1` 时选择 golden attention override；默认使用 Ascend 融合算子路径。
+
+启动日志中应出现 `Applied TorchAO-NPU recipe=...` 和
+`Converted ... config node(s) for torchao-npu`，分别表示 recipe 已读取以及目标模型配置已转换。
 
 ### 排查启动报错：查看更多 rank 日志
 
 > [!TIP]
-> 默认启动脚本只在控制台打印 `LOG_RANK=0`(即 rank 0)的日志。若任务异常退出、但控制台没有具体的 Python 报错，真正报错可能记录在其他 rank。此时可临时通过 `LOG_RANK` 指定需要打印日志的 rank (用逗号分隔)后重新运行，以定位报错。例如同时查看本机 8 个 rank:
+> `scripts/run_train.sh` 默认只在控制台打印 `LOG_RANK=0`，即 rank 0 的日志。多卡任务异常退出但控制台没有具体 Python 报错时，可指定需要打印的 rank 后重新运行：
 >
 > ```bash
-> LOG_RANK=0,1,2,3,4,5,6,7 bash scripts/run_train.sh
+> export LOG_RANK=0,1,2,3
 > ```
 >
-> > 排查时建议覆盖本机全部rank。多机任务中,各节点日志会自动写入本节点 `logs/` 目录，需登录对应节点查看(同样默认只记录local rank 0)。
-
-### torchtitan 仓库内置训练任务
-除了 torchtitan-npu 已经适配的模型外，还可以直接下载 torchtitan 代码，使用原生配置启动训练任务：
-
-1. 拉取 torchtitan 代码
-
-```bash
-git clone https://github.com/pytorch/torchtitan.git
-git -C torchtitan checkout ac13e536c84e7f6647b14fa9375c3c8a8a2b8578
-```
-
-2. 将 torchtitan 源代码移动至 torchtitan-npu 项目中
-
-```bash
-cp ./torchtitan/torchtitan ./torchtitan-npu/ -r
-```
-
-3. 在 torchtitan-npu 项目中，使用 torchtitan 原生 `config_registry.py` 配置函数启动训练。以 llama3 的 debug_model 配置为例:
-
-```bash
-NGPU=8 \
-TRAIN_FILE=torchtitan_npu.entry \
-MODULE=llama3 \
-CONFIG=llama3_debugmodel \
-bash scripts/run_train.sh
-```
+> 排查完成后，可执行 `unset LOG_RANK` 恢复默认设置。
