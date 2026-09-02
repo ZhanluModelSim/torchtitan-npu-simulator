@@ -12,3 +12,7 @@ dependencies = ["torchao==0.17.0"]
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["torchao_npu*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

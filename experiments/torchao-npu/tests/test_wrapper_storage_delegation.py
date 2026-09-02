@@ -10,19 +10,19 @@ from ``untyped_storage()`` and a silent 0x0 from ``data_ptr()``, which broke
 the HF safetensors save path (``storage_ptr`` / ``_to_ndarray``). These tests
 assert both calls delegate to the wrapped ``_data`` tensor.
 
-Self-contained on purpose: kept alongside the experiments package so it moves
-with the package when the ao_npu test tree is relocated.
+Self-contained on purpose: kept in the torchao-npu subproject so its test suite
+can run independently from the torchtitan-npu package tests.
 """
 
 import pytest
 import torch
 from torchao.quantization.qat.fake_quantize_config import Float8FakeQuantizeConfig
 
-from torchtitan_npu.experiments.torchao_npu.quantization.quant_configs import (
+from torchao_npu.quantization.quant_configs import (
     BlockQuantizeConfig,
     MXQuantizeConfig,
 )
-from torchtitan_npu.experiments.torchao_npu.wrapper_tensors import (
+from torchao_npu.wrapper_tensors import (
     BaseTrainingWeightWrapperTensor,
     BlockTrainingWeightWrapperTensor,
     Float8TrainingWeightWrapperTensor,

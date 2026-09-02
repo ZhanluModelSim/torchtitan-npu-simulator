@@ -113,7 +113,7 @@ export PYTHONPATH="/path/to/custom/parent${PYTHONPATH:+:${PYTHONPATH}}"
 ```
 
 自定义目录必须直接包含 `torchao_npu/__init__.py`；使用仓内源码时，对应目录为
-`<torchtitan-npu>/torchtitan_npu/experiments`。单机和多机示例分别调用
+`<torchtitan-npu>/experiments/torchao-npu`。单机和多机示例分别调用
 `scripts/run_train.sh` 和 `scripts/run_train_multinodes.sh`，脚本只透传量化 CLI。
 未设置 `--extension.quantization.enable-quantized-training` 时，配置树保持高精度版本。
 
