@@ -5,7 +5,7 @@
 <h4>基于 torchtitan 的昇腾全流程大模型训练适配插件</h4>
 
 [![Documentation](https://img.shields.io/badge/docs-latest-brightgreen.svg?style=flat)](#特性支持概览)
-[![license](https://img.shields.io/badge/license-BSD_3--Clause-lightgrey.svg)](https://gitcode.com/cann/torchtitan-npu/tree/override-refactor/LICENSE)
+[![license](https://img.shields.io/badge/license-BSD_3--Clause-lightgrey.svg)](https://gitcode.com/cann/torchtitan-npu/tree/master/LICENSE)
 [![contributing](https://img.shields.io/badge/CONTRIBUTING-teal)](https://gitcode.com/cann/torchtitan-npu/blob/master/CONTRIBUTING.md)
 [![SIG](https://img.shields.io/badge/SIG-framework--adapter-yellow)](https://gitcode.com/cann/community/tree/master/CANN/sigs/framework-adapter)
 [![pypi](https://img.shields.io/badge/pypi-0.2.2.post1-blue)](https://pypi.org/project/torchtitan-npu/)
@@ -29,8 +29,8 @@ SIG 例会：[sig-framework-adapter](https://meeting.osinfra.cn/cann?sig=sig-fra
 # 最新消息
 
 ---
+- [Aug. 2026]: 🚀 **master分支完成override插件机制解耦重构。**
 - [Aug. 2026]: 🚀 **基于torchao_npu的DeepSeek-V4模型原生FP8训练/QAT训练支持**。
-- [Aug. 2026]: ⚠️ **override-refactor分支基于torchtitan override机制重构**。
 - [May. 2026]: 🚀 **[DeepSeek-V4-Pro 模型续训练支持](https://gitcode.com/cann/cann-recipes-train/blob/master/llm_pretrain/deepseekv4/README.md)**：基于纯FSDP + 大EP极简切分，使能AutoFuse特性，达成训练入图。
 - [May. 2026]: ⚠️ **配置系统重构**：master 分支对齐 torchtitan main 的 `config_registry.py` / `ConfigManager` 机制，模型训练使用 `--module` 和 `--config` 启动，不再通过 `--job.config_file` 加载 TOML。
 - [Apr. 2026]: 🚀 **[DeepSeek-V4-Flash 续训练 0day 支持](https://gitcode.com/cann/cann-recipes-train/blob/master/llm_pretrain/deepseekv4/README.md)**：基于纯FSDP + 大EP极简切分，使能AutoFuse特性，达成训练入图，开箱即优。
@@ -53,16 +53,16 @@ SIG 例会：[sig-framework-adapter](https://meeting.osinfra.cn/cann?sig=sig-fra
 ```shell
 git clone https://gitcode.com/cann/torchtitan-npu.git
 cd torchtitan-npu
-git checkout override-refactor
+git checkout master
 pip install -e .
 ```
 
-详情参见 [安装教程](https://gitcode.com/cann/torchtitan-npu/tree/override-refactor/docs/user-guides/installation.md) 。
+详情参见 [安装教程](https://gitcode.com/cann/torchtitan-npu/tree/master/docs/user-guides/installation.md) 。
 
 
 # 快速上手
 快速启动大语言模型的训练任务，参见
-[快速上手文档](https://gitcode.com/cann/torchtitan-npu/tree/override-refactor/docs/user-guides/quickstart.md) 。
+[快速上手文档](https://gitcode.com/cann/torchtitan-npu/tree/master/docs/user-guides/quickstart.md) 。
 
 
 <a id="特性支持概览"></a>
@@ -201,7 +201,7 @@ torchtitan‑npu 功能依赖的 PyTorch 等第三方开源软件，均由第三
 
 ---
 
-- torchtitan‑npu 产品的使用许可证，具体请参见 [LICENSE](https://gitcode.com/cann/torchtitan-npu/tree/override-refactor/LICENSE)。
+- torchtitan‑npu 产品的使用许可证，具体请参见 [LICENSE](https://gitcode.com/cann/torchtitan-npu/tree/master/LICENSE)。
 - torchtitan‑npu 工具 docs 目录下的文档适用相应许可证，具体请参见根目录下的 LICENSE 文件。
 
 ## 🤝联系我们

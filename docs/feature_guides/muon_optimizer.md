@@ -1,6 +1,6 @@
 # DeepSeek-V4 Muon 优化器
 
-本文说明当前 `override-refactor` 工作区中的 Muon 方案、使用方法和能力边界。
+本文说明当前 `master` 分支中的 Muon 方案、使用方法和能力边界。
 实现以 TorchTitan 上游 `DistributedMuon`/FlexShard 为核心；上游 FlexShard 的
 `ComputeLayout`、`Owned`、`BlockShard`、bucket 和 storage-to-compute 语义，参见
 [TorchTitan FlexShard README](https://github.com/pytorch/torchtitan/blob/main/torchtitan/distributed/flex_shard/README.md)。

@@ -4,11 +4,10 @@
 
 torchtitan-npu 支持 Atlas 800T A3 等昇腾训练硬件。软件版本配套表如下：
 
-| torchtitan-npu 版本            | torchtitan 分支  | PyTorch 版本    | torch_npu 版本 | CANN 版本  | Python 版本                               |      Triton Ascend        |
-|------------------------|-------------|--------------|-------------|---------|----------------------------------------|--------------|
-| master | main | 2.12.0 | 2.12.0rc1 | 9.0.0 | Python 3.11.x | 3.2.1 |
-| v0.2.2-dev | v0.2.2 | 2.10.0 | 2.10.0 | 9.0.0 |  Python 3.11.x |   3.2.1  |
-| override-refactor | main | 2.14.0(daily) | 2.14.0(daily) | 9.2.0 |  Python 3.12.x |   3.2.1  |
+| torchtitan-npu 版本 | torchtitan 分支 | PyTorch 版本 | torch_npu 版本 | CANN 版本 | Python 版本 | Triton Ascend |
+|---------------------|-----------------|--------------|----------------|-----------|-------------|---------------|
+| master | main | 2.14.0(daily) | 2.14.0(daily) | 9.2.0 | Python 3.12.x | 3.2.1 |
+| v0.2.2-dev | v0.2.2 | 2.10.0 | 2.10.0 | 9.0.0 | Python 3.11.x | 3.2.1 |
 
 > [!NOTE]
 > 安装所需的 Python 包依赖及版本见 [requirements.txt](../../requirements.txt)
