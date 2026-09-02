@@ -214,6 +214,7 @@ def install_fsdp_residency_hooks() -> None:
     FSDPParamGroup._sim_orig_unshard = FSDPParamGroup.unshard
     FSDPParamGroup._sim_orig_wait_for_unshard = FSDPParamGroup.wait_for_unshard
     FSDPParamGroup._sim_orig_reshard = FSDPParamGroup.reshard
+    FSDPParamGroup._sim_orig_post_backward = FSDPParamGroup.post_backward
     orig_prefetch_unshard = FSDPParamGroup._prefetch_unshard
     orig_state_pre_forward = FSDPState._pre_forward
     orig_state_pre_backward = FSDPState._pre_backward
@@ -411,6 +412,27 @@ def install_fsdp_residency_hooks() -> None:
             self._sim_pending_transition_id = ""
         return result
 
+    def patched_post_backward(self, *args: Any, **kwargs: Any):  # noqa: ANN202
+        """Keep FSDP's post-reduction bookkeeping out of the captured graph.
+
+        In HSDP, upstream FSDP performs reduce-scatter, all-reduce, then may
+        cast the reduced gradient from ``reduce_dtype`` back to its original
+        dtype.  The collective interception still emits synthetic ``comm.*``
+        nodes inside this scope, while dispatcher-captured buffer operations
+        (including that dtype ``_to_copy``) are framework implementation
+        details and are suppressed with their provenance intact.
+        """
+        from torchtitan_npu.simulator.capture.dispatch_capture import get_active_capture
+
+        capture = get_active_capture()
+        scaffold_scope = (
+            capture.suppress_dispatch_events("fsdp_post_backward_scaffold")
+            if capture is not None
+            else nullcontext()
+        )
+        with scaffold_scope:
+            return FSDPParamGroup._sim_orig_post_backward(self, *args, **kwargs)
+
     def _state_module_fqn(state: Any) -> str:
         for param_group in getattr(state, "_fsdp_param_groups", ()):
             if module_fqn := _module_fqn(param_group):
@@ -453,6 +475,7 @@ def install_fsdp_residency_hooks() -> None:
     FSDPParamGroup.unshard = patched_unshard
     FSDPParamGroup.wait_for_unshard = patched_wait_for_unshard
     FSDPParamGroup.reshard = patched_reshard
+    FSDPParamGroup.post_backward = patched_post_backward
     FSDPParamGroup._prefetch_unshard = staticmethod(
         patched_prefetch_unshard
     )
