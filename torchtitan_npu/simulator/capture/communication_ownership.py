@@ -27,7 +27,7 @@ from __future__ import annotations
 
 from bisect import bisect_left
 from collections import defaultdict
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
 from typing import Protocol
 
@@ -352,6 +352,7 @@ class _FSDPPrefetchAnchor:
     predecessor_op_ids: tuple[int, ...]
     source_entry_op_ids: tuple[int, ...]
     seq_idx: int
+    filtered_post_backward_allreduce_op_ids: tuple[int, ...] = ()
 
 
 def _fsdp_region_for_collective(
@@ -428,6 +429,23 @@ def _fsdp_prefetch_source_regions(
     return source_regions[start : min(end, next_start)]
 
 
+def _is_hsdp_post_backward_allreduce(node: OpNode | None) -> bool:
+    """Identify the data-replica all-reduce issued after an HSDP RS.
+
+    This is intentionally narrower than matching every all-reduce: tensor- or
+    expert-parallel all-reduces may carry a real compute dependency, while the
+    HSDP data-replica result is only consumed by later gradient handling.
+    """
+    if node is None or node.annotations.get("raw_op_type") != "comm.allreduce":
+        return False
+    parallel_dim = str(
+        node.annotations.get("comm_dim")
+        or node.annotations.get("group_name")
+        or ""
+    )
+    return parallel_dim == "dp_replicate"
+
+
 def _fsdp_prefetch_anchor(
     *,
     template_id: str,
@@ -440,6 +458,7 @@ def _fsdp_prefetch_anchor(
     wait_seq_idxs_by_module: dict[str, tuple[int, ...]],
     invocation_starts_by_module: dict[str, tuple[int, ...]],
     comm_id_by_region: dict[_FSDPGroupRegion, int],
+    nodes_by_id: Mapping[int, OpNode],
 ) -> _FSDPPrefetchAnchor:
     source_regions = _fsdp_prefetch_source_regions(
         source_regions=regions_by_module.get(prefetch_source_fqn, []),
@@ -462,13 +481,31 @@ def _fsdp_prefetch_anchor(
             f"source_module={prefetch_source_fqn!r}"
         )
 
-    predecessor_op_ids = list(
+    external_predecessors = list(
         dict.fromkeys(
             predecessor
             for region in source_regions
             for predecessor in region.external_predecessors
         )
     )
+    # HSDP's post-backward all-reduce makes the reduced gradient available to
+    # the optimizer, not to the next module's backward compute.  It can be an
+    # external predecessor of the source FSDP region in the captured graph,
+    # but must not turn into a prefetch-launch dependency: doing so serializes
+    # the next all-gather and compute behind the all-reduce.
+    filtered_post_backward_allreduce_op_ids = tuple(
+        predecessor
+        for predecessor in external_predecessors
+        if _is_hsdp_post_backward_allreduce(nodes_by_id.get(predecessor))
+    )
+    filtered_post_backward_allreduce_op_id_set = set(
+        filtered_post_backward_allreduce_op_ids
+    )
+    predecessor_op_ids = [
+        predecessor
+        for predecessor in external_predecessors
+        if predecessor not in filtered_post_backward_allreduce_op_id_set
+    ]
     predecessor_op_ids.extend(
         comm_id
         for region in source_regions
@@ -485,6 +522,9 @@ def _fsdp_prefetch_anchor(
         predecessor_op_ids=tuple(dict.fromkeys(predecessor_op_ids)),
         source_entry_op_ids=source_entry_op_ids,
         seq_idx=min(region.wait_seq_idx for region in source_regions),
+        filtered_post_backward_allreduce_op_ids=(
+            filtered_post_backward_allreduce_op_ids
+        ),
     )
 
 
@@ -1371,6 +1411,7 @@ class FSDPStageOwnershipPlugin:
                                 invocation_starts_by_module
                             ),
                             comm_id_by_region=comm_id_by_region,
+                            nodes_by_id=base_template.nodes,
                         )
                         prefetch_launch_op_id = next_synthetic_id
                         next_synthetic_id -= 1
@@ -1399,6 +1440,11 @@ class FSDPStageOwnershipPlugin:
                                 "ownership_placement": placement,
                                 "fsdp_target_compute_instance_id": (
                                     target_parent_id
+                                ),
+                                "fsdp_prefetch_filtered_post_backward_allreduce_op_ids": (
+                                    list(
+                                        anchor.filtered_post_backward_allreduce_op_ids
+                                    )
                                 ),
                             },
                             seq_idx=anchor.seq_idx,

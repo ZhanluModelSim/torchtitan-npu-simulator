@@ -1744,17 +1744,45 @@ def test_fsdp_prefetch_launch_blocks_recursive_layer_runahead(
     assert compute_ids[0] in launches[f"group{layer_order[2]}"].predecessors
 
 
-def test_fsdp_prefetch_skips_a_source_gate_that_would_form_a_cycle() -> None:
+def test_fsdp_prefetch_filters_post_backward_allreduce_and_skips_cycles() -> None:
     source_entry = OpNode(
         op_id=100,
         op_type="matmul",
         inputs=[],
         outputs=[],
         attrs={},
-        predecessors=[],
+        predecessors=[400, 401],
         successors=[300],
         seq_idx=20,
         annotations={"raw_op_type": "aten.mm.default"},
+    )
+    post_backward_allreduce = OpNode(
+        op_id=400,
+        op_type="allreduce",
+        inputs=[],
+        outputs=[],
+        attrs={},
+        predecessors=[],
+        successors=[100],
+        seq_idx=9,
+        annotations={
+            "raw_op_type": "comm.allreduce",
+            "comm_dim": "dp_replicate",
+        },
+    )
+    tensor_parallel_allreduce = OpNode(
+        op_id=401,
+        op_type="allreduce",
+        inputs=[],
+        outputs=[],
+        attrs={},
+        predecessors=[],
+        successors=[100],
+        seq_idx=9,
+        annotations={
+            "raw_op_type": "comm.allreduce",
+            "comm_dim": "tp",
+        },
     )
     source_allgather = OpNode(
         op_id=300,
@@ -1824,6 +1852,8 @@ def test_fsdp_prefetch_skips_a_source_gate_that_would_form_a_cycle() -> None:
                 200: target_entry,
                 300: source_allgather,
                 301: target_allgather,
+                400: post_backward_allreduce,
+                401: tensor_parallel_allreduce,
             },
         )
     }
@@ -1895,9 +1925,20 @@ def test_fsdp_prefetch_skips_a_source_gate_that_would_form_a_cycle() -> None:
         node.annotations["fsdp_group_id"]: node
         for node in graph.nodes.values()
         if node.annotations.get("communication_owner") == "L1_STAGE"
+        and node.annotations.get("raw_op_type") == "comm.allgather"
     }
     assert graph.is_acyclic
-    assert launch.predecessors == [allgathers["group0"].op_id]
+    assert launch.predecessors == [
+        tensor_parallel_allreduce.op_id,
+        allgathers["group0"].op_id,
+    ]
+    assert post_backward_allreduce.op_id not in launch.predecessors
+    assert (
+        launch.annotations[
+            "fsdp_prefetch_filtered_post_backward_allreduce_op_ids"
+        ]
+        == [post_backward_allreduce.op_id]
+    )
     assert allgathers["group1"].predecessors == [launch.op_id]
     assert launch.op_id not in graph.nodes[100].predecessors
     assert launch.annotations["fsdp_prefetch_source_gate_skipped_entries"] == [100]
