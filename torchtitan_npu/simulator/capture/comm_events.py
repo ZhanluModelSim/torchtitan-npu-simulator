@@ -447,6 +447,7 @@ def _record_comm_with_l0(
     try:
         from torchtitan_npu.simulator.capture.fsdp_residency import (
             get_active_fsdp_communication_context,
+            get_active_fsdp_reduction_dependencies,
             get_active_fsdp_transition,
         )
 
@@ -458,6 +459,13 @@ def _record_comm_with_l0(
             event.fsdp_prefetch_source_fqn,
             event.fsdp_prefetch_type,
         ) = get_active_fsdp_communication_context()
+        if comm_primitive == "reduce_scatter" and event.fsdp_group_id:
+            fsdp_dependencies = get_active_fsdp_reduction_dependencies()
+            if fsdp_dependencies:
+                dependency_inputs = [
+                    *(dependency_inputs or ()),
+                    *fsdp_dependencies,
+                ]
     except ImportError:
         pass
     # For FSDP collective comm (allgather/reduce_scatter), record the active

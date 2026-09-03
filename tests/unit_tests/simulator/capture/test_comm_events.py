@@ -343,6 +343,49 @@ def test_reduce_scatter_uses_flat_buffer_mutation_as_source_op():
     assert chunk_cat.op_id in reduce_scatter.predecessors
 
 
+def test_fsdp_reduce_scatter_keeps_parameter_gradient_dependencies():
+    from torchtitan_npu.simulator.capture.fsdp_residency import (
+        _active_fsdp_communication_context,
+        _active_fsdp_reduction_dependencies,
+        _active_fsdp_transition,
+    )
+
+    capture = OpDispatchCapture(phase_provider=lambda: "backward")
+    with capture, capture_fake_collectives():
+        parameter_gradient = torch.ones(4, device="meta").sin()
+        packed_buffer = torch.empty(8, device="meta")
+        reduced = torch.empty(1, device="meta")
+        transition_token = _active_fsdp_transition.set(("", "group0"))
+        communication_token = _active_fsdp_communication_context.set(
+            ("layers.0", "", "")
+        )
+        dependency_token = _active_fsdp_reduction_dependencies.set(
+            (parameter_gradient,)
+        )
+        try:
+            dist.reduce_scatter_tensor(reduced, packed_buffer)
+        finally:
+            _active_fsdp_reduction_dependencies.reset(dependency_token)
+            _active_fsdp_communication_context.reset(communication_token)
+            _active_fsdp_transition.reset(transition_token)
+
+    nodes = capture.build_nodes()
+    gradient_producer = next(
+        node
+        for node in nodes.values()
+        if node.annotations["raw_op_type"] == "aten.sin.default"
+    )
+    reduce_scatter = next(
+        node
+        for node in nodes.values()
+        if node.annotations["raw_op_type"] == "comm.reduce_scatter"
+    )
+
+    assert gradient_producer.op_id in reduce_scatter.predecessors
+    assert reduce_scatter.annotations["fsdp_group_id"] == "group0"
+    assert reduce_scatter.annotations["fsdp_module_fqn"] == "layers.0"
+
+
 def test_funcol_all_gather_tensor_returns_correctly_shaped_new_tensor():
     t = torch.randn(4, 8, device="meta")
     with capture_fake_collectives() as recorder:

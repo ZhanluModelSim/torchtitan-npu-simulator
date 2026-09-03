@@ -824,6 +824,17 @@ class OpDispatchCapture(TorchDispatchMode):
                 or node.successors
             ):
                 continue
+            if (
+                node.annotations.get("raw_op_type") == "comm.allreduce"
+                and node.annotations.get("comm_dim") == "dp_replicate"
+                and node.annotations.get("fsdp_group_id")
+            ):
+                # Native HSDP launches this all-reduce on its dedicated AR
+                # stream and retains the result for gradient handling. It is
+                # not a data dependency of the next backward compute chain.
+                # Stream order is restored by FSDP communication ownership.
+                node.annotations["fsdp_async_allreduce"] = True
+                continue
             for candidate in ordered_nodes[index + 1 :]:
                 if (
                     candidate.annotations.get("phase")

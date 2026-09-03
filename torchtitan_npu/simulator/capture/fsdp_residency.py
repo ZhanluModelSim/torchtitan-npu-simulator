@@ -40,6 +40,12 @@ _active_fsdp_state_source: contextvars.ContextVar[str] = (
         default="",
     )
 )
+_active_fsdp_reduction_dependencies: contextvars.ContextVar[
+    tuple[torch.Tensor, ...]
+] = contextvars.ContextVar(
+    "simulator_active_fsdp_reduction_dependencies",
+    default=(),
+)
 
 
 def get_active_fsdp_transition() -> tuple[str, str]:
@@ -48,6 +54,11 @@ def get_active_fsdp_transition() -> tuple[str, str]:
 
 def get_active_fsdp_communication_context() -> tuple[str, str, str]:
     return _active_fsdp_communication_context.get()
+
+
+def get_active_fsdp_reduction_dependencies() -> tuple[torch.Tensor, ...]:
+    """Return parameter gradients consumed by the active FSDP reduction."""
+    return _active_fsdp_reduction_dependencies.get()
 
 
 def _module_fqn(param_group: Any) -> str:
@@ -144,6 +155,34 @@ def _residency_metadata(param_group: Any) -> tuple[int, tuple[torch.Tensor, ...]
 
     num_bytes = sum(tensor.numel() * tensor.element_size() for tensor in byte_tensors.values())
     return num_bytes, tuple(tracked_tensors.values())
+
+
+def _post_backward_dependency_tensors(
+    param_group: Any,
+) -> tuple[torch.Tensor, ...]:
+    """Collect the parameter-group gradients that make its RS launchable.
+
+    FSDP packs these gradients into a temporary flat reduce-scatter buffer.
+    That packing is framework scaffolding and is intentionally hidden from
+    L0, so the original gradients must be carried as dependency-only inputs
+    to the synthetic collective node.
+    """
+    dependencies: dict[int, torch.Tensor] = {}
+    for fsdp_param in getattr(param_group, "fsdp_params", ()):
+        gradient: object | None = None
+        if getattr(fsdp_param, "unsharded_accumulated_grad", None) is not None:
+            gradient = getattr(
+                fsdp_param,
+                "unsharded_accumulated_grad_data",
+                None,
+            )
+        if gradient is None:
+            unsharded_param = getattr(fsdp_param, "unsharded_param", None)
+            gradient = getattr(unsharded_param, "grad", None)
+        tensor = _to_local_tensor(gradient)
+        if tensor is not None:
+            dependencies[id(tensor)] = tensor
+    return tuple(dependencies.values())
 
 
 def _record_residency(
@@ -425,13 +464,31 @@ def install_fsdp_residency_hooks() -> None:
         from torchtitan_npu.simulator.capture.dispatch_capture import get_active_capture
 
         capture = get_active_capture()
+        group_id = str(id(self))
+        module_fqn = _module_fqn(self)
+        transition_token = _active_fsdp_transition.set(("", group_id))
+        communication_token = _active_fsdp_communication_context.set(
+            (module_fqn, "", "")
+        )
+        dependency_token = _active_fsdp_reduction_dependencies.set(
+            _post_backward_dependency_tensors(self)
+        )
         scaffold_scope = (
             capture.suppress_dispatch_events("fsdp_post_backward_scaffold")
             if capture is not None
             else nullcontext()
         )
-        with scaffold_scope:
-            return FSDPParamGroup._sim_orig_post_backward(self, *args, **kwargs)
+        try:
+            with scaffold_scope:
+                return FSDPParamGroup._sim_orig_post_backward(
+                    self,
+                    *args,
+                    **kwargs,
+                )
+        finally:
+            _active_fsdp_reduction_dependencies.reset(dependency_token)
+            _active_fsdp_communication_context.reset(communication_token)
+            _active_fsdp_transition.reset(transition_token)
 
     def _state_module_fqn(state: Any) -> str:
         for param_group in getattr(state, "_fsdp_param_groups", ()):

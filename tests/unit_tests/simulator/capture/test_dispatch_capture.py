@@ -287,6 +287,41 @@ def test_capture_does_not_deduplicate_recompute_with_normal_backward():
     assert [node.annotations["execution_kind"] for node in same_ops] == ["backward", "recompute"]
 
 
+def test_hsdp_allreduce_does_not_gate_next_backward_compute_chain():
+    capture = OpDispatchCapture(phase_provider=lambda: "backward")
+    reduced = torch.empty(4, device="meta")
+    unrelated = torch.empty(4, device="meta")
+    with capture:
+        capture.record_synthetic_op(
+            "comm.allreduce",
+            inputs=[reduced],
+            outputs=[reduced],
+            extra_annotations={
+                "comm_dim": "dp_replicate",
+                "fsdp_group_id": "group0",
+                "sync_collective_sequence_fallback": True,
+            },
+        )
+        next_compute = unrelated.sin()
+        next_compute.sum()
+
+    nodes = capture.build_nodes()
+    allreduce = next(
+        node
+        for node in nodes.values()
+        if node.annotations["raw_op_type"] == "comm.allreduce"
+    )
+    sine = next(
+        node
+        for node in nodes.values()
+        if node.annotations["raw_op_type"] == "aten.sin.default"
+    )
+
+    assert allreduce.annotations["fsdp_async_allreduce"] is True
+    assert allreduce.op_id not in sine.predecessors
+    assert sine.op_id not in allreduce.successors
+
+
 def test_record_synthetic_op_creates_a_node_with_given_raw_op_type():
     capture = OpDispatchCapture()
     with capture:

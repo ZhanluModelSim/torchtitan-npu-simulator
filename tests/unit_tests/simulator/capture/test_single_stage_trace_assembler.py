@@ -2142,7 +2142,11 @@ def test_fsdp_backward_sync_waits_prior_rs_but_not_hsdp_allreduce() -> None:
             predecessors=[reduce_scatter_ids[position]],
             successors=[],
             seq_idx=36 + 40 * position,
-            annotations={"raw_op_type": "comm.allreduce"},
+            annotations={
+                "raw_op_type": "comm.allreduce",
+                "comm_dim": "dp_replicate",
+                "fsdp_group_id": f"group{layer}",
+            },
         )
 
     templates = {
@@ -2257,10 +2261,13 @@ def test_fsdp_backward_sync_waits_prior_rs_but_not_hsdp_allreduce() -> None:
     assert reduce_scatter_ids[0] in syncs[0].predecessors
     assert allreduce_ids[0] not in syncs[0].predecessors
     assert syncs[0].op_id in graph.nodes[reduce_scatter_ids[1]].predecessors
-    assert syncs[0].op_id in graph.nodes[102].predecessors
+    assert syncs[0].op_id not in graph.nodes[102].predecessors
+    assert allreduce_ids[0] not in graph.nodes[reduce_scatter_ids[1]].predecessors
+    assert allreduce_ids[0] in graph.nodes[allreduce_ids[1]].predecessors
     assert reduce_scatter_ids[1] in syncs[1].predecessors
     assert allreduce_ids[1] not in syncs[1].predecessors
     assert syncs[1].op_id in graph.nodes[reduce_scatter_ids[2]].predecessors
+    assert allreduce_ids[1] in graph.nodes[allreduce_ids[2]].predecessors
     assert all(sync.annotations["zero_cost"] is True for sync in syncs)
 
 
@@ -2378,12 +2385,96 @@ def test_fsdp_backward_sync_handles_overlapping_param_group_regions() -> None:
     )
     assert sync_count == 2
     assert graph.is_acyclic
-    assert syncs[0].seq_idx == 70
-    assert set(syncs[0].predecessors) == {200, 600}
-    assert syncs[0].op_id in graph.nodes[201].predecessors
+    assert syncs[0].seq_idx == 95
+    assert set(syncs[0].predecessors) == {600}
+    assert syncs[0].op_id in graph.nodes[601].predecessors
+    assert syncs[0].op_id not in graph.nodes[201].predecessors
     assert syncs[0].op_id not in graph.nodes[200].predecessors
-    assert set(syncs[1].predecessors) == {300, 601}
+    assert syncs[1].seq_idx == 135
+    assert set(syncs[1].predecessors) == {601}
     assert syncs[1].op_id in graph.nodes[602].predecessors
+
+
+def test_fsdp_single_module_preserves_independent_rs_and_ar_streams() -> None:
+    from torchtitan_npu.simulator.capture.communication_ownership import (
+        _FSDPGroupRegion,
+        _add_fsdp_backward_reduction_syncs,
+        _refresh_graph_topology,
+    )
+
+    def node(
+        op_id: int,
+        seq_idx: int,
+        *,
+        predecessors: list[int] | None = None,
+        raw_op_type: str = "aten.mm.default",
+        annotations: dict | None = None,
+    ) -> OpNode:
+        return OpNode(
+            op_id=op_id,
+            op_type=raw_op_type.removeprefix("comm."),
+            inputs=[],
+            outputs=[],
+            attrs={},
+            predecessors=list(predecessors or []),
+            successors=[],
+            seq_idx=seq_idx,
+            annotations={"raw_op_type": raw_op_type, **(annotations or {})},
+        )
+
+    hsdp = {"comm_dim": "dp_replicate", "fsdp_group_id": "group0"}
+    graph = StepGraph(
+        "s0_B",
+        "B",
+        {
+            100: node(100, 10),
+            200: node(200, 20),
+            600: node(
+                600,
+                30,
+                predecessors=[100],
+                raw_op_type="comm.reduce_scatter",
+            ),
+            700: node(
+                700,
+                31,
+                predecessors=[600],
+                raw_op_type="comm.allreduce",
+                annotations=hsdp,
+            ),
+            601: node(
+                601,
+                40,
+                predecessors=[200],
+                raw_op_type="comm.reduce_scatter",
+            ),
+            701: node(
+                701,
+                41,
+                predecessors=[601],
+                raw_op_type="comm.allreduce",
+                annotations={**hsdp, "fsdp_group_id": "group1"},
+            ),
+        },
+    )
+    regions = [
+        _FSDPGroupRegion(
+            "group0", "layers.0", 1, 35, (100,), (100,), (), 0, 2
+        ),
+        _FSDPGroupRegion(
+            "group1", "layers.0", 2, 45, (200,), (200,), (), 1, 2
+        ),
+    ]
+
+    _, sync_count = _add_fsdp_backward_reduction_syncs(graph, regions, -1)
+    _refresh_graph_topology(graph)
+
+    assert sync_count == 0
+    assert graph.is_acyclic
+    assert 600 in graph.nodes[601].predecessors
+    assert 700 not in graph.nodes[601].predecessors
+    assert 700 in graph.nodes[701].predecessors
+    assert set(graph.nodes[701].predecessors) == {601, 700}
 
 
 def test_cross_action_fsdp_prefetch_belongs_to_launch_compute() -> None:

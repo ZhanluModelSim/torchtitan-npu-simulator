@@ -654,7 +654,18 @@ def _add_fsdp_backward_reduction_syncs(
     regions: list[_FSDPGroupRegion],
     next_synthetic_id: int,
 ) -> tuple[int, int]:
-    """Model FSDP2's one-module reduce-scatter backpressure."""
+    """Restore FSDP reduction-stream order without serializing compute.
+
+    FSDP packs each parameter group's gradients and launches its RS once those
+    gradients are ready. RS collectives share one stream, while HSDP AR
+    collectives share a separate stream. The current/default stream only waits
+    for the preceding module's RS backpressure; it does not wait for AR.
+
+    The captured parameter-gradient predecessors remain directly on each RS.
+    This helper adds only communication-stream order and the inter-module RS
+    wait. In particular, it must never gate a whole FSDP region or a later
+    compute entry on AR completion.
+    """
     if graph.step_type not in {"B", "W"}:
         return next_synthetic_id, 0
 
@@ -671,28 +682,6 @@ def _add_fsdp_backward_reduction_syncs(
             module_blocks.append([region])
         else:
             module_blocks[-1].append(region)
-    if len(module_blocks) < 2:
-        return next_synthetic_id, 0
-
-    barrier_regions: list[_FSDPGroupRegion] = []
-    for block in module_blocks:
-        explicit_barriers = [
-            region
-            for region in block
-            if region.num_param_groups > 0
-            and region.param_group_index == region.num_param_groups - 1
-        ]
-        barrier_regions.append(
-            min(
-                explicit_barriers or block,
-                key=lambda region: (
-                    region.release_seq_idx,
-                    -region.wait_seq_idx,
-                    region.group_id,
-                ),
-            )
-        )
-
     reduce_scatters = sorted(
         (
             node
@@ -718,33 +707,49 @@ def _add_fsdp_backward_reduction_syncs(
             ]
         )
 
+    # Parameter groups of one FSDP module share the reduce-scatter stream.
+    # Preserve only that stream order; their compute readiness is represented
+    # by the gradient-producer predecessors captured on each RS node.
+    for reductions in reductions_by_block:
+        for previous, current in zip(reductions, reductions[1:]):
+            if previous.op_id not in current.predecessors:
+                current.predecessors.append(previous.op_id)
+
+    # Native HSDP uses a dedicated all-reduce stream. Each AR already depends
+    # on its corresponding RS through the collective tensor data path; add the
+    # independent AR-stream order without making RS or compute wait for AR.
+    all_reduces = sorted(
+        (
+            node
+            for node in graph.nodes.values()
+            if _is_hsdp_post_backward_allreduce(node)
+            and node.annotations.get("fsdp_group_id")
+        ),
+        key=lambda node: (node.seq_idx, node.op_id),
+    )
+    for previous, current in zip(all_reduces, all_reduces[1:]):
+        if previous.op_id not in current.predecessors:
+            current.predecessors.append(previous.op_id)
+
     sync_count = 0
     for block_index in range(1, len(module_blocks)):
         prior_reductions = reductions_by_block[block_index - 1]
-        if not prior_reductions:
-            continue
-        barrier_region = barrier_regions[block_index]
-        predecessor_ids = list(
-            dict.fromkeys(
-                [
-                    *barrier_region.exit_op_ids,
-                    *(node.op_id for node in prior_reductions),
-                ]
-            )
-        )
-        if not predecessor_ids:
+        current_reductions = reductions_by_block[block_index]
+        if not prior_reductions or not current_reductions:
             continue
 
         sync_id = next_synthetic_id
         next_synthetic_id -= 1
         prior_module_fqn = module_blocks[block_index - 1][0].module_fqn
+        current_module_fqn = module_blocks[block_index][0].module_fqn
+        first_current_reduction = current_reductions[0]
         graph.nodes[sync_id] = OpNode(
             op_id=sync_id,
             op_type=_FSDP_POST_BACKWARD_SYNC_OP,
             inputs=[],
             outputs=[],
             attrs={},
-            predecessors=predecessor_ids,
+            predecessors=[node.op_id for node in prior_reductions],
             successors=[],
             flops=0,
             peak_mem=0,
@@ -754,41 +759,18 @@ def _add_fsdp_backward_reduction_syncs(
                 "raw_op_type": _FSDP_POST_BACKWARD_SYNC_OP,
                 "control_op": True,
                 "zero_cost": True,
-                "fsdp_module_fqn": barrier_region.module_fqn,
+                "fsdp_module_fqn": current_module_fqn,
                 "fsdp_prior_module_fqn": prior_module_fqn,
-                "fsdp_barrier_group_id": barrier_region.group_id,
+                "fsdp_barrier_group_id": module_blocks[block_index][0].group_id,
                 "fsdp_waited_reduce_scatter_op_ids": [
                     node.op_id for node in prior_reductions
                 ],
                 "fsdp_sync_scope": "prior_module_reduce_scatter",
             },
-            seq_idx=barrier_region.release_seq_idx,
+            seq_idx=first_current_reduction.seq_idx,
         )
-
-        next_barrier_seq = (
-            barrier_regions[block_index + 1].release_seq_idx
-            if block_index + 1 < len(barrier_regions)
-            else float("inf")
-        )
-        post_barrier_ids = {
-            op_id
-            for op_id, node in graph.nodes.items()
-            if barrier_region.release_seq_idx
-            < node.seq_idx
-            < next_barrier_seq
-        }
-        gated_node_ids = {
-            op_id
-            for op_id in post_barrier_ids
-            if not any(
-                predecessor in post_barrier_ids
-                for predecessor in graph.nodes[op_id].predecessors
-            )
-        }
-        for gated_id in gated_node_ids:
-            gated = graph.nodes.get(gated_id)
-            if gated is not None and sync_id not in gated.predecessors:
-                gated.predecessors.append(sync_id)
+        if sync_id not in first_current_reduction.predecessors:
+            first_current_reduction.predecessors.append(sync_id)
         sync_count += 1
 
     return next_synthetic_id, sync_count

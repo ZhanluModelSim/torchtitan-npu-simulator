@@ -91,11 +91,32 @@ exit of that template when the target use is in a later action; the later
 action must not contain a duplicate all-gather. Rank-local action order then
 provides target readiness.
 
-Multiple independent FSDP groups remain parallel unless the captured graph
-records a dependency between them. There is no fallback that connects a
-missing all-gather to every stage entry. A sharded transition without either
-captured tensor edges or a matching parameter-group boundary is a capture
-error.
+Multiple independent FSDP all-gather groups remain parallel unless the
+captured graph records a dependency between them. There is no fallback that
+connects a missing all-gather to every stage entry. A sharded transition
+without either captured tensor edges or a matching parameter-group boundary
+is a capture error.
+
+FSDP gradient reduction keeps a different dependency contract. Packing and
+dtype-conversion scaffolding is hidden, but every parameter gradient consumed
+by a parameter-group reduce-scatter remains a dependency-only input of that
+RS node. Therefore an expert/eFSDP RS becomes runnable after its expert
+gradient producers finish; it does not wait for unrelated attention backward
+operators or for the entire transformer-block region to exit.
+
+Reduction stream order is explicit:
+
+```text
+RS(group N) -> RS(group N+1)       # reduce-scatter stream
+RS(group N) -> AR(group N)         # corresponding HSDP data path
+AR(group N) -> AR(group N+1)       # all-reduce stream
+```
+
+`FSDP_POST_BACKWARD_SYNC` represents only the preceding module's RS
+backpressure and gates the first RS of the current module. It must not collect
+the current module's whole-region exits. HSDP AR completion is retained for
+gradient handling and final backward completion, but never gates a later RS,
+all-gather, or backward compute node.
 
 ## 3. L2 Communication
 
@@ -174,6 +195,10 @@ For 1F1B and DualPipeV with `reshard_after_forward=always`:
    entry of the stage;
 9. a cross-action prefetch appears in the launch template and not the target
    template.
+10. every FSDP RS depends on its own parameter-group gradient producers, not
+    on all exits of the containing transformer block;
+11. HSDP RS and AR form independent ordered streams: AR may depend on RS, but
+    AR never gates a later RS, all-gather, or backward compute node.
 
 For non-PP capture, stage-local communication remains in the ordinary F/B
 templates and no PP fragment is created.
