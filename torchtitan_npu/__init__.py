@@ -24,3 +24,8 @@ from torchtitan_npu import (
 from torchtitan_npu import (
     ops as _ops,
 )
+
+# Default the Inductor NPU codegen to AscendC after every subpackage is
+# imported; torch_npu (loaded via patches) must be initialized first because
+# it owns the npu_backend config key.
+_compile.configure_npu_backend()
