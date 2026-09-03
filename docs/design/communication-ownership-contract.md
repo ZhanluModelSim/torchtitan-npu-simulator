@@ -102,7 +102,9 @@ dtype-conversion scaffolding is hidden, but every parameter gradient consumed
 by a parameter-group reduce-scatter remains a dependency-only input of that
 RS node. Therefore an expert/eFSDP RS becomes runnable after its expert
 gradient producers finish; it does not wait for unrelated attention backward
-operators or for the entire transformer-block region to exit.
+operators or for the entire transformer-block region to exit. Only
+reduce-scatter nodes carrying an `fsdp_group_id` participate in this stream;
+CP/TP reduce-scatter nodes keep their own communication dependencies.
 
 Reduction stream order is explicit:
 
@@ -199,6 +201,8 @@ For 1F1B and DualPipeV with `reshard_after_forward=always`:
     on all exits of the containing transformer block;
 11. HSDP RS and AR form independent ordered streams: AR may depend on RS, but
     AR never gates a later RS, all-gather, or backward compute node.
+12. CP/TP reduce-scatter nodes never become an FSDP RS predecessor merely
+    because they occur between two FSDP reductions in capture order.
 
 For non-PP capture, stage-local communication remains in the ordinary F/B
 templates and no PP fragment is created.

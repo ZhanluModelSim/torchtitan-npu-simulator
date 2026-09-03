@@ -2131,7 +2131,10 @@ def test_fsdp_backward_sync_waits_prior_rs_but_not_hsdp_allreduce() -> None:
             predecessors=[compute_id],
             successors=[allreduce_ids[position]],
             seq_idx=35 + 40 * position,
-            annotations={"raw_op_type": "comm.reduce_scatter"},
+            annotations={
+                "raw_op_type": "comm.reduce_scatter",
+                "fsdp_group_id": f"group{layer}",
+            },
         )
         nodes[allreduce_ids[position]] = OpNode(
             op_id=allreduce_ids[position],
@@ -2284,6 +2287,7 @@ def test_fsdp_backward_sync_handles_overlapping_param_group_regions() -> None:
         *,
         predecessors: list[int] | None = None,
         raw_op_type: str = "aten.mm.default",
+        annotations: dict | None = None,
     ) -> OpNode:
         return OpNode(
             op_id=op_id,
@@ -2294,7 +2298,7 @@ def test_fsdp_backward_sync_handles_overlapping_param_group_regions() -> None:
             predecessors=list(predecessors or []),
             successors=[],
             seq_idx=seq_idx,
-            annotations={"raw_op_type": raw_op_type},
+            annotations={"raw_op_type": raw_op_type, **(annotations or {})},
         )
 
     graph = StepGraph(
@@ -2307,6 +2311,7 @@ def test_fsdp_backward_sync_handles_overlapping_param_group_regions() -> None:
                 35,
                 predecessors=[100],
                 raw_op_type="comm.reduce_scatter",
+                annotations={"fsdp_group_id": "prior"},
             ),
             200: node(200, 60, predecessors=[100]),
             201: node(201, 80, predecessors=[200]),
@@ -2315,6 +2320,7 @@ def test_fsdp_backward_sync_handles_overlapping_param_group_regions() -> None:
                 95,
                 predecessors=[201],
                 raw_op_type="comm.reduce_scatter",
+                annotations={"fsdp_group_id": "inner"},
             ),
             300: node(300, 120, predecessors=[201]),
             602: node(
@@ -2322,6 +2328,7 @@ def test_fsdp_backward_sync_handles_overlapping_param_group_regions() -> None:
                 135,
                 predecessors=[300],
                 raw_op_type="comm.reduce_scatter",
+                annotations={"fsdp_group_id": "next"},
             ),
         },
     )
@@ -2395,7 +2402,7 @@ def test_fsdp_backward_sync_handles_overlapping_param_group_regions() -> None:
     assert syncs[1].op_id in graph.nodes[602].predecessors
 
 
-def test_fsdp_single_module_preserves_independent_rs_and_ar_streams() -> None:
+def test_fsdp_streams_exclude_context_parallel_reduce_scatter() -> None:
     from torchtitan_npu.simulator.capture.communication_ownership import (
         _FSDPGroupRegion,
         _add_fsdp_backward_reduction_syncs,
@@ -2429,28 +2436,38 @@ def test_fsdp_single_module_preserves_independent_rs_and_ar_streams() -> None:
         {
             100: node(100, 10),
             200: node(200, 20),
+            300: node(300, 25),
+            500: node(
+                500,
+                30,
+                predecessors=[300],
+                raw_op_type="comm.reduce_scatter",
+                annotations={"comm_dim": "cp"},
+            ),
             600: node(
                 600,
-                30,
+                40,
                 predecessors=[100],
                 raw_op_type="comm.reduce_scatter",
+                annotations={"fsdp_group_id": "group0"},
             ),
             700: node(
                 700,
-                31,
+                41,
                 predecessors=[600],
                 raw_op_type="comm.allreduce",
                 annotations=hsdp,
             ),
             601: node(
                 601,
-                40,
+                50,
                 predecessors=[200],
                 raw_op_type="comm.reduce_scatter",
+                annotations={"fsdp_group_id": "group1"},
             ),
             701: node(
                 701,
-                41,
+                51,
                 predecessors=[601],
                 raw_op_type="comm.allreduce",
                 annotations={**hsdp, "fsdp_group_id": "group1"},
@@ -2471,6 +2488,8 @@ def test_fsdp_single_module_preserves_independent_rs_and_ar_streams() -> None:
 
     assert sync_count == 0
     assert graph.is_acyclic
+    assert graph.nodes[500].predecessors == [300]
+    assert 500 not in graph.nodes[600].predecessors
     assert 600 in graph.nodes[601].predecessors
     assert 700 not in graph.nodes[601].predecessors
     assert 700 in graph.nodes[701].predecessors

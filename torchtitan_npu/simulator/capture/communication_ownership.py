@@ -688,22 +688,18 @@ def _add_fsdp_backward_reduction_syncs(
             for node in graph.nodes.values()
             if node.annotations.get("raw_op_type")
             == "comm.reduce_scatter"
+            and node.annotations.get("fsdp_group_id")
         ),
         key=lambda node: (node.seq_idx, node.op_id),
     )
     reductions_by_block: list[list[OpNode]] = []
-    for block_index, block in enumerate(module_blocks):
-        start_seq = block[0].wait_seq_idx
-        end_seq = (
-            module_blocks[block_index + 1][0].wait_seq_idx
-            if block_index + 1 < len(module_blocks)
-            else float("inf")
-        )
+    for block in module_blocks:
+        block_group_ids = {region.group_id for region in block}
         reductions_by_block.append(
             [
                 node
                 for node in reduce_scatters
-                if start_seq < node.seq_idx < end_seq
+                if node.annotations.get("fsdp_group_id") in block_group_ids
             ]
         )
 
