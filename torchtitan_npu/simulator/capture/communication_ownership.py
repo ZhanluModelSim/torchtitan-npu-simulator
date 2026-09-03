@@ -39,9 +39,6 @@ from torchtitan_npu.simulator.ir.step_graph import StepGraph
 
 _COMPUTE_TYPES = {"F", "B", "I", "W", "F_RECOMPUTE"}
 _STAGE_TEMPLATE_TYPES = _COMPUTE_TYPES | {"OPTIMIZER"}
-_FSDP_PREFETCH_LAUNCH_OP = "FSDP_PREFETCH_LAUNCH"
-_FSDP_POST_BACKWARD_SYNC_OP = "FSDP_POST_BACKWARD_SYNC"
-_FSDP_CONTROL_GROUP_NAME = "fsdp"
 _P2P_ACTION_BY_DIRECTION = {
     "forward_send": "SEND_F",
     "forward_recv": "RECV_F",
@@ -152,23 +149,6 @@ def _refresh_graph_topology(graph: StepGraph) -> None:
         node.comm_bytes * int(node.annotations.get("repeat_count", 1))
         for node in graph.nodes.values()
     )
-
-
-def _has_path(graph: StepGraph, start_op_id: int, target_op_id: int) -> bool:
-    """Return whether adding ``target -> start`` would create a cycle."""
-    pending = [start_op_id]
-    visited: set[int] = set()
-    while pending:
-        op_id = pending.pop()
-        if op_id == target_op_id:
-            return True
-        if op_id in visited:
-            continue
-        visited.add(op_id)
-        node = graph.nodes.get(op_id)
-        if node is not None:
-            pending.extend(node.successors)
-    return False
 
 
 def _copy_without_nodes(
@@ -352,8 +332,7 @@ class _FSDPGroupRegion:
 class _FSDPPrefetchAnchor:
     predecessor_op_ids: tuple[int, ...]
     source_entry_op_ids: tuple[int, ...]
-    seq_idx: int
-    filtered_post_backward_allreduce_op_ids: tuple[int, ...] = ()
+    filtered_gradient_reduction_op_ids: tuple[int, ...] = ()
 
 
 def _fsdp_region_for_collective(
@@ -430,21 +409,27 @@ def _fsdp_prefetch_source_regions(
     return source_regions[start : min(end, next_start)]
 
 
-def _is_hsdp_post_backward_allreduce(node: OpNode | None) -> bool:
-    """Identify the data-replica all-reduce issued after an HSDP RS.
+def _is_fsdp_gradient_reduction(node: OpNode | None) -> bool:
+    """Return whether ``node`` reduces an FSDP parameter gradient.
 
-    This is intentionally narrower than matching every all-reduce: tensor- or
-    expert-parallel all-reduces may carry a real compute dependency, while the
-    HSDP data-replica result is only consumed by later gradient handling.
+    These collectives may be issued while another FSDP parameter group is
+    resident, but they are not compute using that group's full parameters.
+    Including them in the temporal residency body can therefore make an
+    unrelated all-gather gate the reduction.
     """
-    if node is None or node.annotations.get("raw_op_type") != "comm.allreduce":
+    if node is None:
         return False
-    parallel_dim = str(
-        node.annotations.get("comm_dim")
-        or node.annotations.get("group_name")
-        or ""
+    raw_op_type = node.annotations.get("raw_op_type")
+    comm_dim = node.annotations.get("comm_dim")
+    if raw_op_type == "comm.reduce_scatter":
+        return comm_dim == "fsdp" or bool(
+            node.annotations.get("fsdp_group_id")
+        )
+    return bool(
+        raw_op_type == "comm.allreduce"
+        and comm_dim == "dp_replicate"
+        and node.annotations.get("fsdp_group_id")
     )
-    return parallel_dim == "dp_replicate"
 
 
 def _fsdp_prefetch_anchor(
@@ -489,42 +474,39 @@ def _fsdp_prefetch_anchor(
             for predecessor in region.external_predecessors
         )
     )
-    # HSDP's post-backward all-reduce makes the reduced gradient available to
-    # the optimizer, not to the next module's backward compute.  It can be an
-    # external predecessor of the source FSDP region in the captured graph,
-    # but must not turn into a prefetch-launch dependency: doing so serializes
-    # the next all-gather and compute behind the all-reduce.
-    filtered_post_backward_allreduce_op_ids = tuple(
+    # FSDP gradient reductions make gradients available to later gradient
+    # handling, not to the next module's backward compute. They can appear as
+    # external predecessors of a temporal source region in the captured graph,
+    # but must not serialize the next all-gather and compute.
+    filtered_gradient_reduction_op_ids = tuple(
         predecessor
         for predecessor in external_predecessors
-        if _is_hsdp_post_backward_allreduce(nodes_by_id.get(predecessor))
+        if _is_fsdp_gradient_reduction(nodes_by_id.get(predecessor))
     )
-    filtered_post_backward_allreduce_op_id_set = set(
-        filtered_post_backward_allreduce_op_ids
+    filtered_gradient_reduction_op_id_set = set(
+        filtered_gradient_reduction_op_ids
     )
     predecessor_op_ids = [
         predecessor
         for predecessor in external_predecessors
-        if predecessor not in filtered_post_backward_allreduce_op_id_set
+        if predecessor not in filtered_gradient_reduction_op_id_set
     ]
     predecessor_op_ids.extend(
         comm_id
         for region in source_regions
         if (comm_id := comm_id_by_region.get(region)) is not None
     )
-    source_entry_op_ids = tuple(
-        dict.fromkeys(
-            entry
-            for region in source_regions
-            for entry in region.entry_op_ids
-        )
-    )
     return _FSDPPrefetchAnchor(
         predecessor_op_ids=tuple(dict.fromkeys(predecessor_op_ids)),
-        source_entry_op_ids=source_entry_op_ids,
-        seq_idx=min(region.wait_seq_idx for region in source_regions),
-        filtered_post_backward_allreduce_op_ids=(
-            filtered_post_backward_allreduce_op_ids
+        source_entry_op_ids=tuple(
+            dict.fromkeys(
+                op_id
+                for region in source_regions
+                for op_id in region.entry_op_ids
+            )
+        ),
+        filtered_gradient_reduction_op_ids=(
+            filtered_gradient_reduction_op_ids
         ),
     )
 
@@ -580,6 +562,7 @@ def _fsdp_group_regions(
             op_id
             for op_id, node in template.nodes.items()
             if op_id not in removed_op_ids
+            and not _is_fsdp_gradient_reduction(node)
             and wait.seq_idx < node.seq_idx < release_seq_idx
         }
         if not body:
@@ -648,131 +631,6 @@ def _fsdp_group_regions(
             )
         )
     return regions
-
-
-def _add_fsdp_backward_reduction_syncs(
-    graph: StepGraph,
-    regions: list[_FSDPGroupRegion],
-    next_synthetic_id: int,
-) -> tuple[int, int]:
-    """Restore FSDP reduction-stream order without serializing compute.
-
-    FSDP packs each parameter group's gradients and launches its RS once those
-    gradients are ready. RS collectives share one stream, while HSDP AR
-    collectives share a separate stream. The current/default stream only waits
-    for the preceding module's RS backpressure; it does not wait for AR.
-
-    The captured parameter-gradient predecessors remain directly on each RS.
-    This helper adds only communication-stream order and the inter-module RS
-    wait. In particular, it must never gate a whole FSDP region or a later
-    compute entry on AR completion.
-    """
-    if graph.step_type not in {"B", "W"}:
-        return next_synthetic_id, 0
-
-    ordered_regions = sorted(
-        regions,
-        key=lambda region: (region.wait_seq_idx, region.group_id),
-    )
-    module_blocks: list[list[_FSDPGroupRegion]] = []
-    for region in ordered_regions:
-        if (
-            not module_blocks
-            or module_blocks[-1][0].module_fqn != region.module_fqn
-        ):
-            module_blocks.append([region])
-        else:
-            module_blocks[-1].append(region)
-    reduce_scatters = sorted(
-        (
-            node
-            for node in graph.nodes.values()
-            if node.annotations.get("raw_op_type")
-            == "comm.reduce_scatter"
-            and node.annotations.get("fsdp_group_id")
-        ),
-        key=lambda node: (node.seq_idx, node.op_id),
-    )
-    reductions_by_block: list[list[OpNode]] = []
-    for block in module_blocks:
-        block_group_ids = {region.group_id for region in block}
-        reductions_by_block.append(
-            [
-                node
-                for node in reduce_scatters
-                if node.annotations.get("fsdp_group_id") in block_group_ids
-            ]
-        )
-
-    # Parameter groups of one FSDP module share the reduce-scatter stream.
-    # Preserve only that stream order; their compute readiness is represented
-    # by the gradient-producer predecessors captured on each RS node.
-    for reductions in reductions_by_block:
-        for previous, current in zip(reductions, reductions[1:]):
-            if previous.op_id not in current.predecessors:
-                current.predecessors.append(previous.op_id)
-
-    # Native HSDP uses a dedicated all-reduce stream. Each AR already depends
-    # on its corresponding RS through the collective tensor data path; add the
-    # independent AR-stream order without making RS or compute wait for AR.
-    all_reduces = sorted(
-        (
-            node
-            for node in graph.nodes.values()
-            if _is_hsdp_post_backward_allreduce(node)
-            and node.annotations.get("fsdp_group_id")
-        ),
-        key=lambda node: (node.seq_idx, node.op_id),
-    )
-    for previous, current in zip(all_reduces, all_reduces[1:]):
-        if previous.op_id not in current.predecessors:
-            current.predecessors.append(previous.op_id)
-
-    sync_count = 0
-    for block_index in range(1, len(module_blocks)):
-        prior_reductions = reductions_by_block[block_index - 1]
-        current_reductions = reductions_by_block[block_index]
-        if not prior_reductions or not current_reductions:
-            continue
-
-        sync_id = next_synthetic_id
-        next_synthetic_id -= 1
-        prior_module_fqn = module_blocks[block_index - 1][0].module_fqn
-        current_module_fqn = module_blocks[block_index][0].module_fqn
-        first_current_reduction = current_reductions[0]
-        graph.nodes[sync_id] = OpNode(
-            op_id=sync_id,
-            op_type=_FSDP_POST_BACKWARD_SYNC_OP,
-            inputs=[],
-            outputs=[],
-            attrs={},
-            predecessors=[node.op_id for node in prior_reductions],
-            successors=[],
-            flops=0,
-            peak_mem=0,
-            param_mem=0,
-            comm_bytes=0,
-            annotations={
-                "raw_op_type": _FSDP_POST_BACKWARD_SYNC_OP,
-                "control_op": True,
-                "zero_cost": True,
-                "group_name": _FSDP_CONTROL_GROUP_NAME,
-                "comm_dim": _FSDP_CONTROL_GROUP_NAME,
-                "fsdp_module_fqn": current_module_fqn,
-                "fsdp_prior_module_fqn": prior_module_fqn,
-                "fsdp_barrier_group_id": module_blocks[block_index][0].group_id,
-                "fsdp_waited_reduce_scatter_op_ids": [
-                    node.op_id for node in prior_reductions
-                ],
-                "fsdp_sync_scope": "prior_module_reduce_scatter",
-            },
-            seq_idx=first_current_reduction.seq_idx,
-        )
-        if sync_id not in first_current_reduction.predecessors:
-            first_current_reduction.predecessors.append(sync_id)
-        sync_count += 1
-
-    return next_synthetic_id, sync_count
 
 
 class FSDPStageOwnershipPlugin:
@@ -1218,7 +1076,6 @@ class FSDPStageOwnershipPlugin:
                             node_id_map[item.source_node.op_id],
                         )
                 successor_links: dict[int, list[int]] = defaultdict(list)
-                prefetch_source_entry_links: list[tuple[int, tuple[int, ...]]] = []
                 residency_intervals: list[dict[str, object]] = []
                 for item in owned:
                     source = item.source_node
@@ -1377,7 +1234,8 @@ class FSDPStageOwnershipPlugin:
                                     predecessors.extend(
                                         previous.exit_op_ids
                                     )
-                    prefetch_launch_op_id: int | None = None
+                    filtered_gradient_reduction_op_ids: tuple[int, ...] = ()
+                    source_entry_op_ids: tuple[int, ...] = ()
                     if prefetch_source_fqn:
                         anchor = _fsdp_prefetch_anchor(
                             template_id=base_id,
@@ -1394,51 +1252,11 @@ class FSDPStageOwnershipPlugin:
                             comm_id_by_region=comm_id_by_region,
                             nodes_by_id=base_template.nodes,
                         )
-                        prefetch_launch_op_id = next_synthetic_id
-                        next_synthetic_id -= 1
-                        pure.nodes[prefetch_launch_op_id] = OpNode(
-                            op_id=prefetch_launch_op_id,
-                            op_type=_FSDP_PREFETCH_LAUNCH_OP,
-                            inputs=[],
-                            outputs=[],
-                            attrs={},
-                            predecessors=list(anchor.predecessor_op_ids),
-                            successors=[],
-                            flops=0,
-                            peak_mem=0,
-                            param_mem=0,
-                            comm_bytes=0,
-                            annotations={
-                                "raw_op_type": _FSDP_PREFETCH_LAUNCH_OP,
-                                "control_op": True,
-                                "zero_cost": True,
-                                "group_name": _FSDP_CONTROL_GROUP_NAME,
-                                "comm_dim": _FSDP_CONTROL_GROUP_NAME,
-                                "fsdp_group_id": group_id,
-                                "fsdp_module_fqn": module_fqn,
-                                "fsdp_prefetch_source_fqn": (
-                                    prefetch_source_fqn
-                                ),
-                                "fsdp_prefetch_type": prefetch_type,
-                                "ownership_placement": placement,
-                                "fsdp_target_compute_instance_id": (
-                                    target_parent_id
-                                ),
-                                "fsdp_prefetch_filtered_post_backward_allreduce_op_ids": (
-                                    list(
-                                        anchor.filtered_post_backward_allreduce_op_ids
-                                    )
-                                ),
-                            },
-                            seq_idx=anchor.seq_idx,
+                        predecessors.extend(anchor.predecessor_op_ids)
+                        filtered_gradient_reduction_op_ids = (
+                            anchor.filtered_gradient_reduction_op_ids
                         )
-                        prefetch_source_entry_links.append(
-                            (
-                                prefetch_launch_op_id,
-                                anchor.source_entry_op_ids,
-                            )
-                        )
-                        predecessors.append(prefetch_launch_op_id)
+                        source_entry_op_ids = anchor.source_entry_op_ids
                     predecessors = list(dict.fromkeys(predecessors))
                     annotations = dict(source.annotations)
                     annotations.update({
@@ -1454,8 +1272,11 @@ class FSDPStageOwnershipPlugin:
                         "fsdp_target_compute_instance_id": (
                             target_parent_id
                         ),
-                        "fsdp_prefetch_launch_op_id": (
-                            prefetch_launch_op_id
+                        "fsdp_prefetch_filtered_gradient_reduction_op_ids": (
+                            list(filtered_gradient_reduction_op_ids)
+                        ),
+                        "fsdp_prefetch_source_entry_op_ids": list(
+                            source_entry_op_ids
                         ),
                     })
                     pure.nodes[new_id] = _clone_node(
@@ -1479,55 +1300,19 @@ class FSDPStageOwnershipPlugin:
                             prefetch_source_fqn
                         ),
                         "fsdp_prefetch_type": prefetch_type,
+                        "fsdp_prefetch_source_entry_op_ids": list(
+                            source_entry_op_ids
+                        ),
                         "ownership_placement": placement,
                         "fsdp_target_compute_instance_id": (
                             target_parent_id
                         ),
-                        "prefetch_launch_op_id": prefetch_launch_op_id,
                     })
 
                 for comm_id, successors in successor_links.items():
                     for successor in successors:
                         if comm_id not in pure.nodes[successor].predecessors:
                             pure.nodes[successor].predecessors.append(comm_id)
-
-                _refresh_graph_topology(pure)
-                for launch_op_id, source_entries in prefetch_source_entry_links:
-                    skipped_entries: list[int] = []
-                    for source_entry_id in source_entries:
-                        # Some TP/FSDP layouts place the source all-gather
-                        # after a source-region entry. Gating that entry on a
-                        # launch which already waits for the all-gather closes
-                        # launch -> entry -> all-gather -> launch.
-                        if _has_path(pure, source_entry_id, launch_op_id):
-                            skipped_entries.append(source_entry_id)
-                            continue
-                        source_entry = pure.nodes.get(source_entry_id)
-                        if (
-                            source_entry is not None
-                            and launch_op_id not in source_entry.predecessors
-                        ):
-                            source_entry.predecessors.append(launch_op_id)
-                            # Keep reachability current for later cycle checks
-                            # without rebuilding the full graph per prefetch
-                            # source entry. The final topology refresh below
-                            # remains the canonical rebuild.
-                            pure.nodes[launch_op_id].successors.append(
-                                source_entry_id
-                            )
-                    if skipped_entries:
-                        pure.nodes[launch_op_id].annotations[
-                            "fsdp_prefetch_source_gate_skipped_entries"
-                        ] = skipped_entries
-
-                (
-                    next_synthetic_id,
-                    backward_sync_count,
-                ) = _add_fsdp_backward_reduction_syncs(
-                    pure,
-                    regions,
-                    next_synthetic_id,
-                )
 
                 _refresh_graph_topology(pure)
                 if not pure.is_acyclic:
@@ -1543,7 +1328,6 @@ class FSDPStageOwnershipPlugin:
                         list(item.signature) for item in owned
                     ],
                     "fsdp_residency_intervals": residency_intervals,
-                    "fsdp_post_backward_syncs": backward_sync_count,
                 })
                 step_templates[template_id] = pure
                 normalized_templates[signature] = template_id

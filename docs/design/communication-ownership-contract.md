@@ -71,20 +71,23 @@ The placement values are:
 | `layer_prefetch` | all-gather starts when the source group is ready and overlaps source compute |
 | `cross_action_prefetch` | all-gather is launched by one compute action for a later compute action |
 
-Every layer or cross-action prefetch has an explicit zero-cost control operator
-in the exported L1 graph:
+Every layer or cross-action prefetch is anchored directly to the real
+predecessors of the source module invocation:
 
 ```text
 source input/gradient readiness + source parameter all-gather
-                         -> FSDP_PREFETCH_LAUNCH -> source compute
-                                                   -> target all-gather
+                         +--> source compute
+                         +--> target all-gather --> target compute
 ```
 
-`FSDP_PREFETCH_LAUNCH` has zero FLOPs, peak memory, parameter memory, and
-communication bytes. It models the source module hook: the target all-gather
-may overlap source compute, but a chain of fast all-gathers cannot recursively
-prefetch later layers before each source module is reached. A prefetch without
-a matching source parameter-group region is a capture error.
+The source compute and target all-gather are siblings: neither is a predecessor
+of the other. This models the FSDP pre-forward/pre-backward hook, which launches
+the target all-gather after the source module's own unshard wait and immediately
+before entering source compute. The target all-gather gates only the target
+module's compute. Consequently, a chain of fast all-gathers cannot recursively
+prefetch later layers before each source module invocation is reached. No
+synthetic FSDP control operator is exported. A prefetch without a matching
+source parameter-group region is a capture error.
 
 `cross_action_prefetch` belongs to the launch action's L1 template. It is an
 exit of that template when the target use is in a later action; the later
@@ -102,23 +105,25 @@ dtype-conversion scaffolding is hidden, but every parameter gradient consumed
 by a parameter-group reduce-scatter remains a dependency-only input of that
 RS node. Therefore an expert/eFSDP RS becomes runnable after its expert
 gradient producers finish; it does not wait for unrelated attention backward
-operators or for the entire transformer-block region to exit. Only
-reduce-scatter nodes carrying an `fsdp_group_id` participate in this stream;
-CP/TP reduce-scatter nodes keep their own communication dependencies.
+operators or for the entire transformer-block region to exit. A reduce-scatter
+carrying an `fsdp_group_id` is treated as an FSDP gradient reduction; CP/TP
+reduce-scatter nodes keep their own communication dependencies.
 
-Reduction stream order is explicit:
+Reduction dependencies come only from the captured gradient data flow:
 
 ```text
-RS(group N) -> RS(group N+1)       # reduce-scatter stream
+parameter gradient producers -> RS(group N)
 RS(group N) -> AR(group N)         # corresponding HSDP data path
-AR(group N) -> AR(group N+1)       # all-reduce stream
 ```
 
-`FSDP_POST_BACKWARD_SYNC` represents only the preceding module's RS
-backpressure and gates the first RS of the current module. It must not collect
-the current module's whole-region exits. HSDP AR completion is retained for
-gradient handling and final backward completion, but never gates a later RS,
-all-gather, or backward compute node.
+There is no synthetic RS stream, AR stream, or post-backward control node in
+the exported graph. In particular, an RS/AR from one parameter group must not
+be added as a predecessor of an unrelated group's RS/AR merely because the
+collectives were observed in that order. Backend stream assignment may
+serialize their execution later; the workload graph expresses readiness only.
+HSDP AR completion remains part of gradient handling and backward action
+completion, but does not gate a later RS, all-gather, or backward compute node
+unless an actual tensor dependency was captured.
 
 ## 3. L2 Communication
 

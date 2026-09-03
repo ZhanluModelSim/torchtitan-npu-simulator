@@ -1370,31 +1370,11 @@ def test_fsdp_allgather_is_anchored_to_its_parameter_group(
     assert group1.op_id in graph.nodes[200].predecessors
     assert group1.annotations["ownership_placement"] == expected_placement
     if prefetch_source_fqn:
-        launch_nodes = [
-            node
-            for node in graph.nodes.values()
-            if node.op_type == "FSDP_PREFETCH_LAUNCH"
-        ]
-        assert len(launch_nodes) == 1
-        launch = launch_nodes[0]
-        assert launch.predecessors == [group0.op_id]
-        assert group1.predecessors == [launch.op_id]
-        assert launch.op_id in graph.nodes[100].predecessors
-        assert (
-            launch.flops,
-            launch.peak_mem,
-            launch.param_mem,
-            launch.comm_bytes,
-        ) == (0, 0, 0, 0)
-        assert launch.annotations["zero_cost"] is True
-        assert launch.annotations["group_name"] == "fsdp"
-        assert launch.annotations["comm_dim"] == "fsdp"
+        assert group1.predecessors == [group0.op_id]
+        assert group1.op_id not in graph.nodes[100].predecessors
     else:
         assert group1.predecessors == [100]
-        assert all(
-            node.op_type != "FSDP_PREFETCH_LAUNCH"
-            for node in graph.nodes.values()
-        )
+    assert all(not node.annotations.get("control_op") for node in graph.nodes.values())
     assert all(
         not node.annotations.get("fsdp_marker")
         for node in graph.nodes.values()
@@ -1544,16 +1524,13 @@ def test_fsdp_reused_group_uses_the_matching_residency_occurrence() -> None:
         for node in graph.nodes.values()
         if node.annotations.get("communication_owner") == "L1_STAGE"
     }
-    launch = next(
-        node
-        for node in graph.nodes.values()
-        if node.op_type == "FSDP_PREFETCH_LAUNCH"
-    )
     assert graph.is_acyclic
     assert final_output not in allgathers[initial_tok_allgather].predecessors
-    assert final_output not in launch.predecessors
-    assert launch.predecessors == [initial_tok_allgather]
-    assert allgathers[layer0_allgather].predecessors == [launch.op_id]
+    assert final_output not in allgathers[layer0_allgather].predecessors
+    assert allgathers[layer0_allgather].predecessors == [
+        initial_tok_allgather
+    ]
+    assert all(not node.annotations.get("control_op") for node in graph.nodes.values())
 
 
 @pytest.mark.parametrize(
@@ -1563,7 +1540,7 @@ def test_fsdp_reused_group_uses_the_matching_residency_occurrence() -> None:
         ("B", (2, 1, 0), "BACKWARD"),
     ],
 )
-def test_fsdp_prefetch_launch_blocks_recursive_layer_runahead(
+def test_fsdp_prefetch_allgather_shares_source_layer_entry(
     comp_type: str,
     layer_order: tuple[int, ...],
     prefetch_type: str,
@@ -1720,43 +1697,51 @@ def test_fsdp_prefetch_launch_blocks_recursive_layer_runahead(
         for node in graph.nodes.values()
         if node.annotations.get("communication_owner") == "L1_STAGE"
     }
-    launches = {
-        node.annotations["fsdp_group_id"]: node
-        for node in graph.nodes.values()
-        if node.op_type == "FSDP_PREFETCH_LAUNCH"
-    }
-    assert len(launches) == 2
     assert graph.is_acyclic
     for position in (1, 2):
         source_layer = layer_order[position - 1]
         target_layer = layer_order[position]
-        launch = launches[f"group{target_layer}"]
         source_allgather = allgathers[f"group{source_layer}"]
         target_allgather = allgathers[f"group{target_layer}"]
-        assert source_allgather.op_id in launch.predecessors
-        assert launch.op_id in graph.nodes[compute_ids[position - 1]].predecessors
-        assert target_allgather.predecessors == [launch.op_id]
+        source_compute = graph.nodes[compute_ids[position - 1]]
+        assert source_allgather.op_id in target_allgather.predecessors
+        assert set(target_allgather.predecessors) == set(
+            source_compute.predecessors
+        )
+        assert target_allgather.annotations[
+            "fsdp_prefetch_source_entry_op_ids"
+        ] == [source_compute.op_id]
+        assert target_allgather.op_id not in source_compute.predecessors
         assert target_allgather.op_id in graph.nodes[compute_ids[position]].predecessors
-        assert (
-            launch.flops,
-            launch.peak_mem,
-            launch.param_mem,
-            launch.comm_bytes,
-        ) == (0, 0, 0, 0)
-    assert compute_ids[0] in launches[f"group{layer_order[2]}"].predecessors
+    assert all(not node.annotations.get("control_op") for node in graph.nodes.values())
 
 
-def test_fsdp_prefetch_filters_post_backward_allreduce_and_skips_cycles() -> None:
+def test_fsdp_prefetch_uses_real_entry_dependencies_without_control_node() -> None:
     source_entry = OpNode(
         op_id=100,
         op_type="matmul",
         inputs=[],
         outputs=[],
         attrs={},
-        predecessors=[400, 401],
+        predecessors=[399, 400, 401],
         successors=[300],
         seq_idx=20,
         annotations={"raw_op_type": "aten.mm.default"},
+    )
+    post_backward_reduce_scatter = OpNode(
+        op_id=399,
+        op_type="reduce_scatter",
+        inputs=[],
+        outputs=[],
+        attrs={},
+        predecessors=[],
+        successors=[100],
+        seq_idx=8,
+        annotations={
+            "raw_op_type": "comm.reduce_scatter",
+            "comm_dim": "fsdp",
+            "fsdp_group_id": "prior_group",
+        },
     )
     post_backward_allreduce = OpNode(
         op_id=400,
@@ -1770,6 +1755,7 @@ def test_fsdp_prefetch_filters_post_backward_allreduce_and_skips_cycles() -> Non
         annotations={
             "raw_op_type": "comm.allreduce",
             "comm_dim": "dp_replicate",
+            "fsdp_group_id": "prior_group",
         },
     )
     tensor_parallel_allreduce = OpNode(
@@ -1854,6 +1840,7 @@ def test_fsdp_prefetch_filters_post_backward_allreduce_and_skips_cycles() -> Non
                 200: target_entry,
                 300: source_allgather,
                 301: target_allgather,
+                399: post_backward_reduce_scatter,
                 400: post_backward_allreduce,
                 401: tensor_parallel_allreduce,
             },
@@ -1918,11 +1905,6 @@ def test_fsdp_prefetch_filters_post_backward_allreduce_and_skips_cycles() -> Non
     )
 
     graph = templates["s0_B"]
-    launch = next(
-        node
-        for node in graph.nodes.values()
-        if node.op_type == "FSDP_PREFETCH_LAUNCH"
-    )
     allgathers = {
         node.annotations["fsdp_group_id"]: node
         for node in graph.nodes.values()
@@ -1930,23 +1912,32 @@ def test_fsdp_prefetch_filters_post_backward_allreduce_and_skips_cycles() -> Non
         and node.annotations.get("raw_op_type") == "comm.allgather"
     }
     assert graph.is_acyclic
-    assert launch.predecessors == [
+    assert allgathers["group1"].predecessors == [
         tensor_parallel_allreduce.op_id,
         allgathers["group0"].op_id,
     ]
-    assert post_backward_allreduce.op_id not in launch.predecessors
     assert (
-        launch.annotations[
-            "fsdp_prefetch_filtered_post_backward_allreduce_op_ids"
-        ]
-        == [post_backward_allreduce.op_id]
+        post_backward_reduce_scatter.op_id
+        not in allgathers["group1"].predecessors
     )
-    assert allgathers["group1"].predecessors == [launch.op_id]
-    assert launch.op_id not in graph.nodes[100].predecessors
-    assert launch.annotations["fsdp_prefetch_source_gate_skipped_entries"] == [100]
+    assert (
+        post_backward_allreduce.op_id
+        not in allgathers["group1"].predecessors
+    )
+    assert (
+        allgathers["group1"].annotations[
+            "fsdp_prefetch_filtered_gradient_reduction_op_ids"
+        ]
+        == [
+            post_backward_reduce_scatter.op_id,
+            post_backward_allreduce.op_id,
+        ]
+    )
+    assert allgathers["group1"].op_id not in graph.nodes[100].predecessors
+    assert all(not node.annotations.get("control_op") for node in graph.nodes.values())
 
 
-def test_non_pipeline_fsdp_prefetch_launch_survives_workload_build() -> None:
+def test_non_pipeline_fsdp_prefetch_dependencies_survive_workload_build() -> None:
     layer0 = OpNode(
         op_id=100,
         op_type="matmul",
@@ -2081,16 +2072,21 @@ def test_non_pipeline_fsdp_prefetch_launch_survives_workload_build() -> None:
         for action in plan.actions
         if action.comp_type == "F"
     )
-    launches = [
-        node
+    allgathers = {
+        node.annotations["fsdp_group_id"]: node
         for node in workload.step_templates[forward_ref].nodes.values()
-        if node.op_type == "FSDP_PREFETCH_LAUNCH"
+        if node.annotations.get("communication_owner") == "L1_STAGE"
+    }
+    assert allgathers["group1"].predecessors == [
+        allgathers["group0"].op_id
     ]
-    assert len(launches) == 1
-    assert launches[0].annotations["zero_cost"] is True
+    assert all(
+        not node.annotations.get("control_op")
+        for node in workload.step_templates[forward_ref].nodes.values()
+    )
 
 
-def test_fsdp_backward_sync_waits_prior_rs_but_not_hsdp_allreduce() -> None:
+def test_fsdp_reductions_keep_only_captured_data_dependencies() -> None:
     layer_order = (2, 1, 0)
     nodes: dict[int, OpNode] = {}
     allgather_ids = [500, 501, 502]
@@ -2253,254 +2249,137 @@ def test_fsdp_backward_sync_waits_prior_rs_but_not_hsdp_allreduce() -> None:
     )
 
     graph = templates["s0_B"]
-    syncs = sorted(
-        (
-            node
-            for node in graph.nodes.values()
-            if node.op_type == "FSDP_POST_BACKWARD_SYNC"
-        ),
-        key=lambda node: node.seq_idx,
-    )
-    assert len(syncs) == 2
     assert graph.is_acyclic
-    assert reduce_scatter_ids[0] in syncs[0].predecessors
-    assert allreduce_ids[0] not in syncs[0].predecessors
-    assert syncs[0].op_id in graph.nodes[reduce_scatter_ids[1]].predecessors
-    assert syncs[0].op_id not in graph.nodes[102].predecessors
-    assert allreduce_ids[0] not in graph.nodes[reduce_scatter_ids[1]].predecessors
-    assert allreduce_ids[0] in graph.nodes[allreduce_ids[1]].predecessors
-    assert reduce_scatter_ids[1] in syncs[1].predecessors
-    assert allreduce_ids[1] not in syncs[1].predecessors
-    assert syncs[1].op_id in graph.nodes[reduce_scatter_ids[2]].predecessors
-    assert allreduce_ids[1] in graph.nodes[allreduce_ids[2]].predecessors
-    assert all(sync.annotations["zero_cost"] is True for sync in syncs)
-    assert all(sync.annotations["group_name"] == "fsdp" for sync in syncs)
-    assert all(sync.annotations["comm_dim"] == "fsdp" for sync in syncs)
-
-
-def test_fsdp_backward_sync_handles_overlapping_param_group_regions() -> None:
-    from torchtitan_npu.simulator.capture.communication_ownership import (
-        _FSDPGroupRegion,
-        _add_fsdp_backward_reduction_syncs,
-        _refresh_graph_topology,
+    assert all(
+        not node.annotations.get("control_op")
+        for node in graph.nodes.values()
     )
+    for position in range(len(layer_order)):
+        assert graph.nodes[reduce_scatter_ids[position]].predecessors == [
+            100 + position
+        ]
+        assert graph.nodes[allreduce_ids[position]].predecessors == [
+            reduce_scatter_ids[position]
+        ]
+    assert set(allreduce_ids) <= set(graph.exit_nodes)
 
-    def node(
-        op_id: int,
-        seq_idx: int,
-        *,
-        predecessors: list[int] | None = None,
-        raw_op_type: str = "aten.mm.default",
-        annotations: dict | None = None,
-    ) -> OpNode:
-        return OpNode(
-            op_id=op_id,
-            op_type=raw_op_type.removeprefix("comm."),
-            inputs=[],
-            outputs=[],
-            attrs={},
-            predecessors=list(predecessors or []),
-            successors=[],
-            seq_idx=seq_idx,
-            annotations={"raw_op_type": raw_op_type, **(annotations or {})},
+    reduction_ids = set(reduce_scatter_ids) | set(allreduce_ids)
+    for position in range(1, len(layer_order)):
+        assert not (
+            set(graph.nodes[reduce_scatter_ids[position]].predecessors)
+            & reduction_ids
         )
 
+
+def test_fsdp_region_excludes_gradient_reductions_but_keeps_cp_dataflow() -> None:
+    from torchtitan_npu.simulator.capture.communication_ownership import (
+        _fsdp_group_regions,
+    )
+
+    wait = _fsdp_marker(
+        1,
+        1,
+        "unshard_wait",
+        "embedding_group",
+        "tok_embeddings",
+    )
+    release = _fsdp_marker(
+        2,
+        50,
+        "reshard_release",
+        "embedding_group",
+        "tok_embeddings",
+    )
+    compute_in = OpNode(
+        op_id=100,
+        op_type="matmul",
+        inputs=[],
+        outputs=[],
+        attrs={},
+        predecessors=[],
+        successors=[200],
+        seq_idx=10,
+        annotations={"raw_op_type": "aten.mm.default"},
+    )
+    cp_send = OpNode(
+        op_id=200,
+        op_type="p2p_send",
+        inputs=[],
+        outputs=[],
+        attrs={},
+        predecessors=[100],
+        successors=[300],
+        seq_idx=20,
+        annotations={"raw_op_type": "comm.p2p_send", "comm_dim": "cp"},
+    )
+    compute_out = OpNode(
+        op_id=300,
+        op_type="matmul",
+        inputs=[],
+        outputs=[],
+        attrs={},
+        predecessors=[200],
+        successors=[],
+        seq_idx=30,
+        annotations={"raw_op_type": "aten.mm.default"},
+    )
+    unrelated_rs = OpNode(
+        op_id=600,
+        op_type="reduce_scatter",
+        inputs=[],
+        outputs=[],
+        attrs={},
+        predecessors=[],
+        successors=[700],
+        seq_idx=25,
+        annotations={
+            "raw_op_type": "comm.reduce_scatter",
+            "comm_dim": "fsdp",
+            "fsdp_group_id": "root_group",
+        },
+    )
+    unrelated_ar = OpNode(
+        op_id=700,
+        op_type="allreduce",
+        inputs=[],
+        outputs=[],
+        attrs={},
+        predecessors=[600],
+        successors=[],
+        seq_idx=27,
+        annotations={
+            "raw_op_type": "comm.allreduce",
+            "comm_dim": "dp_replicate",
+            "fsdp_group_id": "root_group",
+        },
+    )
     graph = StepGraph(
         "s0_B",
         "B",
         {
-            100: node(100, 10),
-            600: node(
-                600,
-                35,
-                predecessors=[100],
-                raw_op_type="comm.reduce_scatter",
-                annotations={"fsdp_group_id": "prior"},
-            ),
-            200: node(200, 60, predecessors=[100]),
-            201: node(201, 80, predecessors=[200]),
-            601: node(
-                601,
-                95,
-                predecessors=[201],
-                raw_op_type="comm.reduce_scatter",
-                annotations={"fsdp_group_id": "inner"},
-            ),
-            300: node(300, 120, predecessors=[201]),
-            602: node(
-                602,
-                135,
-                predecessors=[300],
-                raw_op_type="comm.reduce_scatter",
-                annotations={"fsdp_group_id": "next"},
-            ),
+            node.op_id: node
+            for node in (
+                wait,
+                release,
+                compute_in,
+                cp_send,
+                compute_out,
+                unrelated_rs,
+                unrelated_ar,
+            )
         },
     )
-    regions = [
-        _FSDPGroupRegion(
-            "prior",
-            "layers.2",
-            1,
-            30,
-            (100,),
-            (100,),
-            (),
-            0,
-            1,
-        ),
-        _FSDPGroupRegion(
-            "outer",
-            "layers.1",
-            40,
-            90,
-            (200,),
-            (201,),
-            (100,),
-            0,
-            2,
-        ),
-        _FSDPGroupRegion(
-            "inner",
-            "layers.1",
-            50,
-            70,
-            (200,),
-            (200,),
-            (100,),
-            1,
-            2,
-        ),
-        _FSDPGroupRegion(
-            "next",
-            "layers.0",
-            110,
-            130,
-            (300,),
-            (300,),
-            (201,),
-            0,
-            1,
-        ),
-    ]
 
-    _, sync_count = _add_fsdp_backward_reduction_syncs(graph, regions, -1)
-    _refresh_graph_topology(graph)
+    [region] = _fsdp_group_regions(graph, {wait.op_id, release.op_id})
 
-    syncs = sorted(
-        (
-            item
-            for item in graph.nodes.values()
-            if item.op_type == "FSDP_POST_BACKWARD_SYNC"
-        ),
-        key=lambda item: item.seq_idx,
-    )
-    assert sync_count == 2
-    assert graph.is_acyclic
-    assert syncs[0].seq_idx == 95
-    assert set(syncs[0].predecessors) == {600}
-    assert syncs[0].op_id in graph.nodes[601].predecessors
-    assert syncs[0].op_id not in graph.nodes[201].predecessors
-    assert syncs[0].op_id not in graph.nodes[200].predecessors
-    assert syncs[1].seq_idx == 135
-    assert set(syncs[1].predecessors) == {601}
-    assert syncs[1].op_id in graph.nodes[602].predecessors
+    assert region.entry_op_ids == (compute_in.op_id,)
+    assert region.exit_op_ids == (compute_out.op_id,)
+    assert cp_send.op_id not in region.entry_op_ids
+    assert unrelated_rs.op_id not in region.entry_op_ids
+    assert unrelated_ar.op_id not in region.exit_op_ids
 
 
-def test_fsdp_streams_exclude_context_parallel_reduce_scatter() -> None:
-    from torchtitan_npu.simulator.capture.communication_ownership import (
-        _FSDPGroupRegion,
-        _add_fsdp_backward_reduction_syncs,
-        _refresh_graph_topology,
-    )
-
-    def node(
-        op_id: int,
-        seq_idx: int,
-        *,
-        predecessors: list[int] | None = None,
-        raw_op_type: str = "aten.mm.default",
-        annotations: dict | None = None,
-    ) -> OpNode:
-        return OpNode(
-            op_id=op_id,
-            op_type=raw_op_type.removeprefix("comm."),
-            inputs=[],
-            outputs=[],
-            attrs={},
-            predecessors=list(predecessors or []),
-            successors=[],
-            seq_idx=seq_idx,
-            annotations={"raw_op_type": raw_op_type, **(annotations or {})},
-        )
-
-    hsdp = {"comm_dim": "dp_replicate", "fsdp_group_id": "group0"}
-    graph = StepGraph(
-        "s0_B",
-        "B",
-        {
-            100: node(100, 10),
-            200: node(200, 20),
-            300: node(300, 25),
-            500: node(
-                500,
-                30,
-                predecessors=[300],
-                raw_op_type="comm.reduce_scatter",
-                annotations={"comm_dim": "cp"},
-            ),
-            600: node(
-                600,
-                40,
-                predecessors=[100],
-                raw_op_type="comm.reduce_scatter",
-                annotations={"fsdp_group_id": "group0"},
-            ),
-            700: node(
-                700,
-                41,
-                predecessors=[600],
-                raw_op_type="comm.allreduce",
-                annotations=hsdp,
-            ),
-            601: node(
-                601,
-                50,
-                predecessors=[200],
-                raw_op_type="comm.reduce_scatter",
-                annotations={"fsdp_group_id": "group1"},
-            ),
-            701: node(
-                701,
-                51,
-                predecessors=[601],
-                raw_op_type="comm.allreduce",
-                annotations={**hsdp, "fsdp_group_id": "group1"},
-            ),
-        },
-    )
-    regions = [
-        _FSDPGroupRegion(
-            "group0", "layers.0", 1, 35, (100,), (100,), (), 0, 2
-        ),
-        _FSDPGroupRegion(
-            "group1", "layers.0", 2, 45, (200,), (200,), (), 1, 2
-        ),
-    ]
-
-    _, sync_count = _add_fsdp_backward_reduction_syncs(graph, regions, -1)
-    _refresh_graph_topology(graph)
-
-    assert sync_count == 0
-    assert graph.is_acyclic
-    assert graph.nodes[500].predecessors == [300]
-    assert 500 not in graph.nodes[600].predecessors
-    assert 600 in graph.nodes[601].predecessors
-    assert 700 not in graph.nodes[601].predecessors
-    assert 700 in graph.nodes[701].predecessors
-    assert set(graph.nodes[701].predecessors) == {601, 700}
-
-
-def test_cross_action_fsdp_prefetch_belongs_to_launch_compute() -> None:
+def test_cross_action_fsdp_prefetch_belongs_to_source_compute() -> None:
     prefetch = OpNode(
         op_id=300,
         op_type="allgather",
@@ -2649,15 +2528,15 @@ def test_cross_action_fsdp_prefetch_belongs_to_launch_compute() -> None:
         ]
         == "s0_F_mb1"
     )
-    launch_nodes = [
-        node
+    assert backward_allgathers[0].predecessors == []
+    assert templates["s0_B"].nodes[100].predecessors == []
+    assert backward_allgathers[0].op_id not in templates["s0_B"].nodes[
+        100
+    ].predecessors
+    assert all(
+        not node.annotations.get("control_op")
         for node in templates["s0_B"].nodes.values()
-        if node.op_type == "FSDP_PREFETCH_LAUNCH"
-    ]
-    assert len(launch_nodes) == 1
-    launch = launch_nodes[0]
-    assert launch.op_id in templates["s0_B"].nodes[100].predecessors
-    assert backward_allgathers[0].predecessors == [launch.op_id]
+    )
     assert all(
         node.annotations.get("raw_op_type") != "comm.allgather"
         for node in templates["s0_F"].nodes.values()
