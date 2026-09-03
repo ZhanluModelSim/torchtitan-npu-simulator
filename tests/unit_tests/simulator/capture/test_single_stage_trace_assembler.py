@@ -1387,6 +1387,8 @@ def test_fsdp_allgather_is_anchored_to_its_parameter_group(
             launch.comm_bytes,
         ) == (0, 0, 0, 0)
         assert launch.annotations["zero_cost"] is True
+        assert launch.annotations["group_name"] == "fsdp"
+        assert launch.annotations["comm_dim"] == "fsdp"
     else:
         assert group1.predecessors == [100]
         assert all(
@@ -2272,6 +2274,8 @@ def test_fsdp_backward_sync_waits_prior_rs_but_not_hsdp_allreduce() -> None:
     assert syncs[1].op_id in graph.nodes[reduce_scatter_ids[2]].predecessors
     assert allreduce_ids[1] in graph.nodes[allreduce_ids[2]].predecessors
     assert all(sync.annotations["zero_cost"] is True for sync in syncs)
+    assert all(sync.annotations["group_name"] == "fsdp" for sync in syncs)
+    assert all(sync.annotations["comm_dim"] == "fsdp" for sync in syncs)
 
 
 def test_fsdp_backward_sync_handles_overlapping_param_group_regions() -> None:

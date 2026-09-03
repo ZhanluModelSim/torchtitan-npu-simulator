@@ -41,6 +41,7 @@ _COMPUTE_TYPES = {"F", "B", "I", "W", "F_RECOMPUTE"}
 _STAGE_TEMPLATE_TYPES = _COMPUTE_TYPES | {"OPTIMIZER"}
 _FSDP_PREFETCH_LAUNCH_OP = "FSDP_PREFETCH_LAUNCH"
 _FSDP_POST_BACKWARD_SYNC_OP = "FSDP_POST_BACKWARD_SYNC"
+_FSDP_CONTROL_GROUP_NAME = "fsdp"
 _P2P_ACTION_BY_DIRECTION = {
     "forward_send": "SEND_F",
     "forward_recv": "RECV_F",
@@ -755,6 +756,8 @@ def _add_fsdp_backward_reduction_syncs(
                 "raw_op_type": _FSDP_POST_BACKWARD_SYNC_OP,
                 "control_op": True,
                 "zero_cost": True,
+                "group_name": _FSDP_CONTROL_GROUP_NAME,
+                "comm_dim": _FSDP_CONTROL_GROUP_NAME,
                 "fsdp_module_fqn": current_module_fqn,
                 "fsdp_prior_module_fqn": prior_module_fqn,
                 "fsdp_barrier_group_id": module_blocks[block_index][0].group_id,
@@ -1409,6 +1412,8 @@ class FSDPStageOwnershipPlugin:
                                 "raw_op_type": _FSDP_PREFETCH_LAUNCH_OP,
                                 "control_op": True,
                                 "zero_cost": True,
+                                "group_name": _FSDP_CONTROL_GROUP_NAME,
+                                "comm_dim": _FSDP_CONTROL_GROUP_NAME,
                                 "fsdp_group_id": group_id,
                                 "fsdp_module_fqn": module_fqn,
                                 "fsdp_prefetch_source_fqn": (
