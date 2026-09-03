@@ -338,11 +338,13 @@ prefetch。例如 B 或 W 尾部发起 all-gather，为稍后的 F 准备参数�
 <li>继续遵守 rank-local 顶层 <code>schedule_order</code>；</li>
 <li>不要因为目标 F 中没有相同 all-gather 而在 L2 补通信。</li>
 </ol>
-<p>层内和跨 action 的 prefetch 都通过零开销控制算子 <code>FSDP_PREFETCH_LAUNCH</code> 表达：来源层的
-输入/梯度 readiness 和本层参数 all-gather 共同依赖到该算子，随后来源层 compute 与目标层
-all-gather 从该算子分叉并行，目标层 compute 再等待目标 all-gather。它的 FLOPs、显存和通信量
-均为 0，只用于阻止 all-gather 链在尚未到达来源层 hook 时继续向后预取。即使后端暂时把
-DualPipeV 的双图 overlap 串行化，也必须保留单张 L1 图内部的这些依赖与通信/计算并行关系。</p>
+<p>层内和跨 action 的 prefetch 都直接使用来源模块入口的真实前驱：来源层输入/梯度 readiness
+与本层参数 all-gather 同时连接到来源层 compute 和目标层 all-gather，二者从同一入口并行，
+目标层 compute 再等待目标层 all-gather。导出的 L1 图不包含 FSDP 零开销控制算子。这样既能
+阻止 all-gather 链在尚未到达来源层 hook 时继续向后预取，也不会把目标 all-gather 错误推迟到
+来源层 attention 或整层计算完成之后。RS 只等待对应参数梯度生产者，HSDP AR 只等待对应 RS；
+不同参数组的 RS/AR 不因捕获顺序而互相串行。即使后端暂时把 DualPipeV 的双图 overlap
+串行化，也必须保留单张 L1 图内部的这些依赖与通信/计算并行关系。</p>
 <p>一个物理 rank 拥有多个虚拟 stage 时，参数基线和 FSDP residency 都按物理 rank 汇总。小模型中
 embedding/output 可能远大于 transformer layer，因此 V 形切分可能产生明显 rank 间显存不均；
 不能据此把较小 rank 的参数补齐到平均值。</p>

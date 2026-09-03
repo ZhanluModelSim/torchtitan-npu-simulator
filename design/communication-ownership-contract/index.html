@@ -314,26 +314,49 @@ all-gather node, target entries, release exits, prefetch source, and placement.<
 </tr>
 </tbody>
 </table>
-<p>Every layer or cross-action prefetch has an explicit zero-cost control operator
-in the exported L1 graph:</p>
+<p>Every layer or cross-action prefetch is anchored directly to the real
+predecessors of the source module invocation:</p>
 <pre><code class="language-text">source input/gradient readiness + source parameter all-gather
-                         -&gt; FSDP_PREFETCH_LAUNCH -&gt; source compute
-                                                   -&gt; target all-gather
+                         +--&gt; source compute
+                         +--&gt; target all-gather --&gt; target compute
 </code></pre>
-<p><code>FSDP_PREFETCH_LAUNCH</code> has zero FLOPs, peak memory, parameter memory, and
-communication bytes. It models the source module hook: the target all-gather
-may overlap source compute, but a chain of fast all-gathers cannot recursively
-prefetch later layers before each source module is reached. A prefetch without
-a matching source parameter-group region is a capture error.</p>
+<p>The source compute and target all-gather are siblings: neither is a predecessor
+of the other. This models the FSDP pre-forward/pre-backward hook, which launches
+the target all-gather after the source module's own unshard wait and immediately
+before entering source compute. The target all-gather gates only the target
+module's compute. Consequently, a chain of fast all-gathers cannot recursively
+prefetch later layers before each source module invocation is reached. No
+synthetic FSDP control operator is exported. A prefetch without a matching
+source parameter-group region is a capture error.</p>
 <p><code>cross_action_prefetch</code> belongs to the launch action's L1 template. It is an
 exit of that template when the target use is in a later action; the later
 action must not contain a duplicate all-gather. Rank-local action order then
 provides target readiness.</p>
-<p>Multiple independent FSDP groups remain parallel unless the captured graph
-records a dependency between them. There is no fallback that connects a
-missing all-gather to every stage entry. A sharded transition without either
-captured tensor edges or a matching parameter-group boundary is a capture
-error.</p>
+<p>Multiple independent FSDP all-gather groups remain parallel unless the
+captured graph records a dependency between them. There is no fallback that
+connects a missing all-gather to every stage entry. A sharded transition
+without either captured tensor edges or a matching parameter-group boundary
+is a capture error.</p>
+<p>FSDP gradient reduction keeps a different dependency contract. Packing and
+dtype-conversion scaffolding is hidden, but every parameter gradient consumed
+by a parameter-group reduce-scatter remains a dependency-only input of that
+RS node. Therefore an expert/eFSDP RS becomes runnable after its expert
+gradient producers finish; it does not wait for unrelated attention backward
+operators or for the entire transformer-block region to exit. A reduce-scatter
+carrying an <code>fsdp_group_id</code> is treated as an FSDP gradient reduction; CP/TP
+reduce-scatter nodes keep their own communication dependencies.</p>
+<p>Reduction dependencies come only from the captured gradient data flow:</p>
+<pre><code class="language-text">parameter gradient producers -&gt; RS(group N)
+RS(group N) -&gt; AR(group N)         # corresponding HSDP data path
+</code></pre>
+<p>There is no synthetic RS stream, AR stream, or post-backward control node in
+the exported graph. In particular, an RS/AR from one parameter group must not
+be added as a predecessor of an unrelated group's RS/AR merely because the
+collectives were observed in that order. Backend stream assignment may
+serialize their execution later; the workload graph expresses readiness only.
+HSDP AR completion remains part of gradient handling and backward action
+completion, but does not gate a later RS, all-gather, or backward compute node
+unless an actual tensor dependency was captured.</p>
 <h2 id="3-l2-communication">3. L2 Communication</h2>
 <h3 id="pipeline-p2p">Pipeline P2P</h3>
 <p>PP P2P never remains in F/B/I/W. It is extracted into an immutable fragment
@@ -391,6 +414,12 @@ stage_owned_collectives
    entry of the stage;</li>
 <li>a cross-action prefetch appears in the launch template and not the target
    template.</li>
+<li>every FSDP RS depends on its own parameter-group gradient producers, not
+    on all exits of the containing transformer block;</li>
+<li>HSDP RS and AR form independent ordered streams: AR may depend on RS, but
+    AR never gates a later RS, all-gather, or backward compute node.</li>
+<li>CP/TP reduce-scatter nodes never become an FSDP RS predecessor merely
+    because they occur between two FSDP reductions in capture order.</li>
 </ol>
 <p>For non-PP capture, stage-local communication remains in the ordinary F/B
 templates and no PP fragment is created.</p>
