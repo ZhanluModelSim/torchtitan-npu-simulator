@@ -299,10 +299,10 @@ def apply_quantization_converter(
 ) -> ModelSpec:
     """Apply the selected TorchAO-NPU recipe to an existing BF16 model spec.
 
-    This runs after CLI parsing and before ``Trainer.Config.build()``.  The
-    regular model registry therefore remains responsible only for constructing
-    the high-precision config tree, while this function performs the optional
-    low-precision config replacement.
+    This runs during ``TrainerEx`` construction and before base ``Trainer``
+    initialization.  The regular model registry therefore remains responsible
+    only for constructing the high-precision config tree, while this function
+    performs the optional low-precision config replacement.
     """
 
     if model_spec is None:

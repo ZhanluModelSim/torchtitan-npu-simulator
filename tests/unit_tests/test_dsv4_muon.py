@@ -8,7 +8,6 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
-
 _ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -56,9 +55,9 @@ def test_dsv4_muon_profile_uses_validated_phase_one_policy():
     assert "muon_ns_steps=10" in optimizer_source
     assert "beta1=0.9" in optimizer_source
     assert "eps=1e-8" in optimizer_source
-    config_source = (_ROOT / "torchtitan_npu/config/configs.py").read_text()
-    assert "tensor_parallel_degree=1" in config_source
-    assert "pipeline_parallel_degree=1" in config_source
+    trainer_source = (_ROOT / "torchtitan_npu/extensions/trainer.py").read_text()
+    assert "tensor_parallel_degree=1" in trainer_source
+    assert "pipeline_parallel_degree=1" in trainer_source
     assert "def deepseek_v4_debugmodel_muon" not in file_source
     assert "def deepseek_v4_flash_muon" not in file_source
     assert "def deepseek_v4_flash_43layers_16experts_muon" not in file_source
@@ -105,13 +104,10 @@ def test_dsv4_unified_muon_policy_follows_paper_parameter_split():
 
 def test_graph_trainer_conversion_strips_only_npu_top_level_extension():
     registry_path = _ROOT / "torchtitan_npu/models/deepseek_v4/config_registry.py"
-    manager_source = (_ROOT / "torchtitan_npu/config/manager.py").read_text()
     conversion_source = _function_source(registry_path, "to_graph_trainer_config")
 
-    assert "isinstance(base_config, TrainerConfig)" in conversion_source
+    assert "isinstance(base_config, TrainerEx.Config)" in conversion_source
     assert "for config_field in fields(Trainer.Config)" in conversion_source
-    assert "isinstance(config, Trainer.Config)" in manager_source
-    assert "not isinstance(config, GraphTrainer.Config)" in manager_source
 
     for graph_recipe in (
         "graph_trainer_deepseek_v4_debugmodel",

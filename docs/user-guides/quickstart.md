@@ -115,7 +115,8 @@ export PYTHONPATH="/path/to/custom/parent${PYTHONPATH:+:${PYTHONPATH}}"
 自定义目录必须直接包含 `torchao_npu/__init__.py`；使用仓内源码时，对应目录为
 `<torchtitan-npu>/experiments/torchao-npu`。单机和多机示例分别调用
 `scripts/run_train.sh` 和 `scripts/run_train_multinodes.sh`，脚本只透传量化 CLI。
-未设置 `--extension.quantization.enable-quantized-training` 时，配置树保持高精度版本。
+未设置
+`--extension.quantization.enable-quantized-training` 时，仍使用高精度训练。
 
 该入口复用 torchtitan 的预训练/续训练循环，并不表示已经提供 SFT 专用数据处理或训练入口。
 
@@ -135,9 +136,6 @@ bash examples/deepseek_v4/deepseek_v4_flash_cpt_4k_a3.sh \
   --training.steps 5
 ```
 
-两份 A3 示例均默认运行高精度训练。只有显式传入
-`--extension.quantization.enable-quantized-training` 时，配置构建阶段才会导入并应用 TorchAO-NPU Converter。
-
 低精度 recipe 的目标范围如下：
 
 | `RECIPE` | Attention 和 shared expert | Routed grouped experts |
@@ -155,8 +153,7 @@ bash examples/deepseek_v4/deepseek_v4_flash_cpt_4k_a3.sh \
 - `--profiler.enable-profiling`：启用 profiler；如需 CANN profiler override，还需将 `torchtitan_npu.override.common.profiler.cann` 加入 override imports。
 - `USE_GOLDEN`：设为 `1` 时选择 golden attention override；默认使用 Ascend 融合算子路径。
 
-启动日志中应出现 `Applied TorchAO-NPU recipe=...` 和
-`Converted ... config node(s) for torchao-npu`，分别表示 recipe 已读取以及目标模型配置已转换。
+启动日志中出现 `Applied TorchAO-NPU recipe=...` 表示低精度 recipe 已生效。
 
 ### 排查启动报错：查看更多 rank 日志
 

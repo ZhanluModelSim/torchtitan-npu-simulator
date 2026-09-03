@@ -39,9 +39,9 @@ from torchtitan.trainer import Trainer
 from torchtitan_npu.config import (
     MuonOptimizerProfile,
     OptimizerConfig,
-    TrainerConfig,
     TrainingConfig,
 )
+from torchtitan_npu.extensions.trainer import TrainerEx
 
 from . import (
     memory_policy,  # noqa: F401
@@ -219,7 +219,7 @@ def _make_trainer_config(
                 global_vocab_size=decoder_vocab_size(model_spec),
             ),
         )
-    return TrainerConfig(
+    return TrainerEx.Config(
         loss=loss,
         profiler=Profiler.Config(
             enable_profiling=False,
@@ -314,7 +314,7 @@ def to_graph_trainer_config(
     graph_model_registry: Callable[[str], ModelSpec],
 ) -> GraphTrainer.Config:
     """Project DSV4's NPU recipe config onto GraphTrainer's upstream schema."""
-    if isinstance(base_config, TrainerConfig):
+    if isinstance(base_config, TrainerEx.Config):
         base_config = Trainer.Config(
             **{config_field.name: getattr(base_config, config_field.name) for config_field in fields(Trainer.Config)}
         )

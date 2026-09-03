@@ -10,7 +10,6 @@ from .configs import (
     OptimizerConfig,
     QuantizationExtensionConfig,
     QuantizationRecipe,
-    TrainerConfig,
     TrainingConfig,
     TrainingExtensionConfig,
 )
@@ -21,7 +20,6 @@ __all__ = [
     "OptimizerConfig",
     "QuantizationExtensionConfig",
     "QuantizationRecipe",
-    "TrainerConfig",
     "TrainingConfig",
     "TrainingExtensionConfig",
 ]

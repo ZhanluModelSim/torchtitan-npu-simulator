@@ -7,4 +7,5 @@
 
 from . import (
     ep_process_group,  # noqa: F401
+    trainer,  # noqa: F401
 )

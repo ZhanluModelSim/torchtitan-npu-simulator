@@ -5,30 +5,47 @@
 
 import sys
 import types
-from dataclasses import fields
+from collections.abc import Callable
+from dataclasses import dataclass, fields
 
 import pytest
 from torchtitan.config import ConfigManager
 from torchtitan.config import TrainingConfig as UpstreamTrainingConfig
 from torchtitan.trainer import Trainer
 
+import torchtitan_npu.config as npu_config
+import torchtitan_npu.extensions.trainer as trainer_module
 from torchtitan_npu.config import (
     ExtensionConfig,
     MuonOptimizerProfile,
     OptimizerConfig,
     QuantizationExtensionConfig,
-    TrainerConfig,
     TrainingExtensionConfig,
 )
-from torchtitan_npu.config import (
-    TrainingConfig as NPUTrainingConfig,
-)
+from torchtitan_npu.config import TrainingConfig as NPUTrainingConfig
+from torchtitan_npu.config import manager as config_manager
+from torchtitan_npu.config.converters import TrainerConfigConverter
 from torchtitan_npu.distributed import utils as distributed_utils
 from torchtitan_npu.extensions.trainer import TrainerEx
 
 
-def test_from_trainer_config_wraps_npu_extensions():
+def _install_config_registry(
+    monkeypatch,
+    module_name: str,
+    factory: Callable[[], Trainer.Config],
+) -> None:
+    registry = types.ModuleType(module_name)
+    registry.test_config = factory
+    monkeypatch.setitem(sys.modules, module_name, registry)
+
+
+def test_config_manager_adapts_standard_component_configs_without_changing_values(
+    monkeypatch,
+    tmp_path,
+):
+    module_name = "_torchtitan_npu_standard_config_registry"
     source = Trainer.Config(
+        hf_assets_path=str(tmp_path),
         dump_folder="custom-output",
         training=UpstreamTrainingConfig(
             local_batch_size=3,
@@ -37,44 +54,77 @@ def test_from_trainer_config_wraps_npu_extensions():
         ),
     )
 
-    adapted = TrainerConfig.from_trainer_config(source)
+    def test_config() -> Trainer.Config:
+        return source
 
-    assert isinstance(adapted, TrainerConfig)
-    assert isinstance(adapted.extension, ExtensionConfig)
-    assert isinstance(adapted.extension.quantization, QuantizationExtensionConfig)
-    assert adapted.extension.quantization.enable_quantized_training is False
-    assert adapted.extension.quantization.recipe == "mix"
-    assert adapted.extension.quantization.enable_mxfp4_qat is False
-    assert adapted.extension.quantization.dst_type_max == 0.0
-    assert isinstance(adapted.training, NPUTrainingConfig)
-    assert isinstance(adapted.training.extension, TrainingExtensionConfig)
-    assert adapted.training.extension.allow_hf32 is True
-    assert isinstance(adapted.optimizer, OptimizerConfig)
-    assert adapted.optimizer.name == "native"
+    _install_config_registry(monkeypatch, module_name, test_config)
+
+    config = ConfigManager().parse_args(["--module", module_name, "--config", "test_config"])
+
+    assert isinstance(config, TrainerEx.Config)
+    assert isinstance(config.extension, ExtensionConfig)
+    assert isinstance(config.extension.quantization, QuantizationExtensionConfig)
+    assert config.extension.quantization.enable_quantized_training is False
+    assert isinstance(config.training, NPUTrainingConfig)
+    assert isinstance(config.training.extension, TrainingExtensionConfig)
+    assert config.training.extension.allow_hf32 is True
+    assert isinstance(config.optimizer, OptimizerConfig)
+    assert config.optimizer.name == "native"
     for config_field in fields(Trainer.Config):
         if config_field.name in ("optimizer", "training"):
             continue
-        assert getattr(adapted, config_field.name) == getattr(source, config_field.name)
+        assert getattr(config, config_field.name) == getattr(source, config_field.name)
     for config_field in fields(source.optimizer):
-        assert getattr(adapted.optimizer, config_field.name) == getattr(
-            source.optimizer, config_field.name
+        assert getattr(config.optimizer, config_field.name) == getattr(
+            source.optimizer,
+            config_field.name,
         )
     for config_field in fields(UpstreamTrainingConfig):
-        assert getattr(adapted.training, config_field.name) == getattr(source.training, config_field.name)
-
-
-def test_config_manager_parses_training_extension_into_trainer_ex_config(monkeypatch, tmp_path):
-    module_name = "_torchtitan_npu_test_config_registry"
-    registry = types.ModuleType(module_name)
-
-    def test_config() -> Trainer.Config:
-        return Trainer.Config(
-            hf_assets_path=str(tmp_path),
-            training=UpstreamTrainingConfig(steps=23),
+        assert getattr(config.training, config_field.name) == getattr(
+            source.training,
+            config_field.name,
         )
 
-    registry.test_config = test_config
-    monkeypatch.setitem(sys.modules, module_name, registry)
+
+def test_config_manager_reapplying_patch_does_not_stack_registered_converter(
+    monkeypatch,
+    tmp_path,
+):
+    module_name = "_torchtitan_npu_reapplied_config_converter_registry"
+    source = Trainer.Config(hf_assets_path=str(tmp_path))
+    converted_configs: list[Trainer.Config] = []
+
+    def test_config() -> Trainer.Config:
+        return source
+
+    def record_conversion(
+        _converter: TrainerConfigConverter,
+        config: Trainer.Config,
+    ) -> Trainer.Config:
+        converted_configs.append(config)
+        return config
+
+    _install_config_registry(monkeypatch, module_name, test_config)
+    monkeypatch.setattr(TrainerConfigConverter, "convert", record_conversion)
+    config_manager.apply()
+    config_manager.apply()
+
+    config = ConfigManager().parse_args(["--module", module_name, "--config", "test_config"])
+
+    assert converted_configs == [source]
+    assert isinstance(config, Trainer.Config)
+
+
+def test_config_manager_parses_training_extension_hf32_option(
+    monkeypatch,
+    tmp_path,
+):
+    module_name = "_torchtitan_npu_hf32_config_registry"
+
+    def test_config() -> Trainer.Config:
+        return Trainer.Config(hf_assets_path=str(tmp_path))
+
+    _install_config_registry(monkeypatch, module_name, test_config)
 
     config = ConfigManager().parse_args(
         [
@@ -86,22 +136,20 @@ def test_config_manager_parses_training_extension_into_trainer_ex_config(monkeyp
         ]
     )
 
-    assert isinstance(config, TrainerConfig)
     assert isinstance(config, TrainerEx.Config)
-    assert isinstance(config.training, NPUTrainingConfig)
     assert config.training.extension.allow_hf32 is False
-    assert config.training.steps == 23
 
 
-def test_config_manager_parses_quantization_extension(monkeypatch, tmp_path):
+def test_config_manager_parses_quantization_extension(
+    monkeypatch,
+    tmp_path,
+):
     module_name = "_torchtitan_npu_quantization_config_registry"
-    registry = types.ModuleType(module_name)
 
     def test_config() -> Trainer.Config:
         return Trainer.Config(hf_assets_path=str(tmp_path))
 
-    registry.test_config = test_config
-    monkeypatch.setitem(sys.modules, module_name, registry)
+    _install_config_registry(monkeypatch, module_name, test_config)
 
     config = ConfigManager().parse_args(
         [
@@ -127,7 +175,6 @@ def test_config_manager_parses_quantization_extension(monkeypatch, tmp_path):
 
 def test_config_manager_materializes_muon_from_cli(monkeypatch, tmp_path):
     module_name = "_torchtitan_npu_muon_config_registry"
-    registry = types.ModuleType(module_name)
     profile = MuonOptimizerProfile(
         muon_pattern=r"matrix\\.weight",
         optimizer_factory_kwargs={
@@ -138,14 +185,13 @@ def test_config_manager_materializes_muon_from_cli(monkeypatch, tmp_path):
         },
     )
 
-    def test_config() -> TrainerConfig:
-        return TrainerConfig(
+    def test_config() -> TrainerEx.Config:
+        return TrainerEx.Config(
             hf_assets_path=str(tmp_path),
             optimizer=OptimizerConfig(_muon_profile=profile),
         )
 
-    registry.test_config = test_config
-    monkeypatch.setitem(sys.modules, module_name, registry)
+    _install_config_registry(monkeypatch, module_name, test_config)
 
     config = ConfigManager().parse_args(
         [
@@ -182,35 +228,78 @@ def test_config_manager_materializes_muon_from_cli(monkeypatch, tmp_path):
     assert adamw_group.optimizer_kwargs["foreach"] is False
 
 
-def test_trainer_config_build_applies_extension_before_parent(monkeypatch):
-    events = []
-    expected_result = object()
+def test_config_package_does_not_reexport_trainer_config():
+    assert not hasattr(npu_config, "TrainerConfig")
 
-    def apply_runtime(allow_hf32):
-        events.append(("apply", allow_hf32))
 
-    def parent_build(config, **kwargs):
-        events.append(("build", kwargs))
-        return expected_result
+def test_trainer_ex_config_exposes_hf32_only_under_training_extension():
+    config = TrainerEx.Config()
 
-    monkeypatch.setattr(distributed_utils, "set_allow_hf32", apply_runtime)
-    monkeypatch.setattr(TrainerEx.Config, "build", parent_build)
+    assert not hasattr(config, "allow_hf32")
+    assert config.training.extension.allow_hf32 is True
 
-    config = TrainerConfig(
-        training=NPUTrainingConfig(
-            extension=TrainingExtensionConfig(allow_hf32=False),
+
+def test_config_manager_preserves_explicit_npu_training_extension(
+    monkeypatch,
+    tmp_path,
+):
+    module_name = "_torchtitan_npu_explicit_training_extension_registry"
+
+    def test_config() -> Trainer.Config:
+        return Trainer.Config(
+            hf_assets_path=str(tmp_path),
+            training=NPUTrainingConfig(
+                steps=23,
+                extension=TrainingExtensionConfig(allow_hf32=False),
+            ),
         )
-    )
-    result = config.build(example="value")
 
-    assert result is expected_result
-    assert events == [
-        ("apply", False),
-        ("build", {"example": "value"}),
-    ]
+    _install_config_registry(monkeypatch, module_name, test_config)
+
+    config = ConfigManager().parse_args(["--module", module_name, "--config", "test_config"])
+
+    assert isinstance(config, TrainerEx.Config)
+    assert isinstance(config.training, NPUTrainingConfig)
+    assert config.training.steps == 23
+    assert config.training.extension.allow_hf32 is False
 
 
-def test_trainer_config_build_quantizes_after_cli_config(monkeypatch):
+def test_config_manager_preserves_specialized_trainer_config(
+    monkeypatch,
+    tmp_path,
+):
+    module_name = "_torchtitan_npu_specialized_config_registry"
+
+    class SpecializedTrainer(Trainer):
+        @dataclass(kw_only=True, slots=True)
+        class Config(Trainer.Config):
+            specialized_option: int = 7
+
+    built_configs: list[Trainer.Config] = []
+
+    def test_config() -> Trainer.Config:
+        return SpecializedTrainer.Config(
+            hf_assets_path=str(tmp_path),
+            specialized_option=11,
+        )
+
+    def capture_config(_self, config: Trainer.Config) -> None:
+        built_configs.append(config)
+
+    _install_config_registry(monkeypatch, module_name, test_config)
+    monkeypatch.setattr(SpecializedTrainer, "__init__", capture_config)
+
+    config = ConfigManager().parse_args(["--module", module_name, "--config", "test_config"])
+    trainer = config.build()
+
+    assert isinstance(config, SpecializedTrainer.Config)
+    assert config.specialized_option == 11
+    assert isinstance(trainer, SpecializedTrainer)
+    assert len(built_configs) == 1
+    assert isinstance(built_configs[0], SpecializedTrainer.Config)
+
+
+def test_trainer_ex_applies_enabled_quantization_before_base_initialization(monkeypatch):
     events = []
     source_model_spec = object()
     quantized_model_spec = object()
@@ -229,19 +318,18 @@ def test_trainer_config_build_quantizes_after_cli_config(monkeypatch):
         )
         return quantized_model_spec
 
-    def apply_runtime(allow_hf32):
-        events.append(("apply", allow_hf32))
+    def apply_hf32(allow_hf32):
+        events.append(("apply_hf32", allow_hf32))
 
-    def parent_build(config, **kwargs):
-        events.append(("build", config.model_spec, kwargs))
-        return config.model_spec
+    def initialize_base_trainer(_self, base_config):
+        events.append(("initialize_base", base_config.model_spec))
 
     converter_module.apply_quantization_converter = apply_quantization
     monkeypatch.setitem(sys.modules, "interfaces.torchao_converter", converter_module)
-    monkeypatch.setattr(distributed_utils, "set_allow_hf32", apply_runtime)
-    monkeypatch.setattr(Trainer.Config, "build", parent_build)
+    monkeypatch.setattr(trainer_module, "set_allow_hf32", apply_hf32)
+    monkeypatch.setattr(Trainer, "__init__", initialize_base_trainer)
 
-    config = TrainerConfig(
+    config = TrainerEx.Config(
         model_spec=source_model_spec,
         extension=ExtensionConfig(
             quantization=QuantizationExtensionConfig(
@@ -252,60 +340,90 @@ def test_trainer_config_build_quantizes_after_cli_config(monkeypatch):
             ),
         ),
     )
-    result = config.build(example="value")
 
-    assert result is quantized_model_spec
+    trainer = config.build()
+
+    assert isinstance(trainer, TrainerEx)
     assert events == [
         ("quantize", source_model_spec, "all_block_fp8", True, 7.0, False),
-        ("apply", True),
-        ("build", quantized_model_spec, {"example": "value"}),
+        ("apply_hf32", True),
+        ("initialize_base", quantized_model_spec),
     ]
 
 
-def test_trainer_config_build_skips_quantization_when_disabled(monkeypatch):
+def test_trainer_ex_skips_disabled_quantization_and_preserves_model_spec(monkeypatch):
     source_model_spec = object()
+    initialized_model_specs = []
     converter_module = types.ModuleType("interfaces.torchao_converter")
 
     def unexpected_quantization(*args, **kwargs):
         raise AssertionError("quantization converter must remain disabled")
 
-    def parent_build(config, **kwargs):
-        return config.model_spec
+    def initialize_base_trainer(_self, base_config):
+        initialized_model_specs.append(base_config.model_spec)
 
     converter_module.apply_quantization_converter = unexpected_quantization
     monkeypatch.setitem(sys.modules, "interfaces.torchao_converter", converter_module)
-    monkeypatch.setattr(distributed_utils, "set_allow_hf32", lambda _: None)
-    monkeypatch.setattr(Trainer.Config, "build", parent_build)
+    monkeypatch.setattr(trainer_module, "set_allow_hf32", lambda _allow_hf32: None)
+    monkeypatch.setattr(Trainer, "__init__", initialize_base_trainer)
 
-    config = TrainerConfig(
-        model_spec=source_model_spec,
-        extension=ExtensionConfig(
-            quantization=QuantizationExtensionConfig(
-                enable_quantized_training=False,
-            ),
-        ),
+    config = TrainerEx.Config(model_spec=source_model_spec)
+    trainer = config.build()
+
+    assert isinstance(trainer, TrainerEx)
+    assert initialized_model_specs == [source_model_spec]
+
+
+def test_trainer_ex_applies_training_hf32_before_base_initialization(monkeypatch):
+    events = []
+    config = TrainerEx.Config(
+        training=NPUTrainingConfig(
+            extension=TrainingExtensionConfig(allow_hf32=False),
+        )
     )
 
-    assert config.build() is source_model_spec
+    def apply_hf32(allow_hf32):
+        events.append(("apply_hf32", allow_hf32))
+
+    def initialize_base_trainer(_self, base_config):
+        events.append(("initialize_base", base_config))
+
+    monkeypatch.setattr(trainer_module, "set_allow_hf32", apply_hf32)
+    monkeypatch.setattr(Trainer, "__init__", initialize_base_trainer)
+
+    TrainerEx(config)
+
+    assert events == [
+        ("apply_hf32", False),
+        ("initialize_base", config),
+    ]
 
 
-def test_trainer_config_build_constructs_trainer(monkeypatch):
+def test_trainer_ex_config_build_constructs_trainer_ex(monkeypatch):
     built_configs = []
 
     def capture_config(_self, config):
         built_configs.append(config)
 
-    monkeypatch.setattr(distributed_utils, "set_allow_hf32", lambda _: None)
-    monkeypatch.setattr(Trainer, "__init__", capture_config)
+    monkeypatch.setattr(TrainerEx, "__init__", capture_config)
 
-    trainer = TrainerConfig().build()
+    trainer = TrainerEx.Config(
+        training=NPUTrainingConfig(
+            extension=TrainingExtensionConfig(allow_hf32=False),
+        )
+    ).build()
 
-    assert isinstance(trainer, Trainer)
+    assert isinstance(trainer, TrainerEx)
     assert len(built_configs) == 1
-    assert isinstance(built_configs[0], TrainerConfig)
+    assert isinstance(built_configs[0], TrainerEx.Config)
+    assert built_configs[0].training.extension.allow_hf32 is False
 
 
-@pytest.mark.parametrize("allow_hf32", [False, True])
+@pytest.mark.parametrize(
+    "allow_hf32",
+    [False, True],
+    ids=("disabled", "enabled"),
+)
 def test_set_allow_hf32_updates_all_backends(monkeypatch, allow_hf32):
     fake_torch_npu = types.SimpleNamespace(
         npu=types.SimpleNamespace(

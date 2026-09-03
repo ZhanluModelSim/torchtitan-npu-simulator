@@ -6,15 +6,12 @@
 """Typed NPU extensions to TorchTitan's training configuration."""
 
 from collections.abc import Mapping
-from dataclasses import dataclass, field, fields, is_dataclass
-from typing import Annotated, Any, ClassVar, Literal
+from dataclasses import dataclass, field
+from typing import Annotated, Any, Literal
 
 import tyro
 from torchtitan.components.optimizer import OptimizersContainer, ParamGroupConfig
 from torchtitan.config import TrainingConfig as _BaseTrainingConfig
-from torchtitan.trainer import Trainer
-
-from torchtitan_npu.extensions.trainer import TrainerEx
 
 QuantizationRecipe = Literal["all_mxfp8", "mix", "all_block_fp8"]
 
@@ -142,14 +139,10 @@ class ExtensionConfig:
 
 @dataclass(kw_only=True, slots=True)
 class TrainingExtensionConfig:
-    """
-    NPU extensions owned by the training configuration.
-    """
+    """NPU extensions owned by the training configuration."""
 
     allow_hf32: bool = True
-    """
-    Enable HF32 for the NPU matmul, convolution, and ACLNN backends.
-    """
+    """Enable HF32 for the NPU matmul, convolution, and ACLNN backends."""
 
 
 @dataclass(kw_only=True, slots=True)
@@ -159,93 +152,3 @@ class TrainingConfig(_BaseTrainingConfig):
     extension: TrainingExtensionConfig = field(
         default_factory=TrainingExtensionConfig,
     )
-
-
-def _dataclass_values(source: object, target_type: type[Any]) -> dict[str, Any]:
-    """Collect init fields shared by two dataclass configuration types."""
-
-    if not is_dataclass(source) or isinstance(source, type):
-        raise TypeError(f"{type(source).__name__} must be a dataclass instance")
-    if not is_dataclass(target_type):
-        raise TypeError(f"{target_type.__name__} must be a dataclass type")
-
-    target_fields = {config_field.name for config_field in fields(target_type) if config_field.init}
-    return {
-        config_field.name: getattr(source, config_field.name)
-        for config_field in fields(source)
-        if config_field.init and config_field.name in target_fields
-    }
-
-
-def _convert_config(source: object, target_type: type[Any]) -> Any:
-    """Convert an upstream config to an extension config when necessary."""
-
-    if isinstance(source, target_type):
-        return source
-    return target_type(**_dataclass_values(source, target_type))
-
-
-@dataclass(kw_only=True, slots=True)
-class TrainerConfig(TrainerEx.Config):
-    """The standard TorchTitan trainer config with NPU training settings."""
-
-    _CONFIG_EXTENSIONS: ClassVar[dict[str, type[Any]]] = {
-        "optimizer": OptimizerConfig,
-        "training": TrainingConfig,
-    }
-
-    extension: ExtensionConfig = field(default_factory=ExtensionConfig)
-    optimizer: OptimizerConfig = field(  # pyrefly: ignore [bad-override]
-        default_factory=OptimizerConfig
-    )
-    training: TrainingConfig = field(  # pyrefly: ignore [bad-override]
-        default_factory=TrainingConfig
-    )
-
-    def __post_init__(self) -> None:
-        # ``slots=True`` dataclasses are recreated by the decorator, so a
-        # zero-argument ``super()`` can retain the pre-decoration class cell.
-        # TrainerEx.Config currently adds no post-init behavior.
-        Trainer.Config.__post_init__(self)
-        self.optimizer.materialize()
-        if self.optimizer.name == "Muon" and (
-            self.parallelism.tensor_parallel_degree > 1 or self.parallelism.pipeline_parallel_degree > 1
-        ):
-            raise ValueError(
-                "DeepSeek-V4 DistributedMuon requires "
-                "tensor_parallel_degree=1 and pipeline_parallel_degree=1; "
-                "TP _StridedShard and PP stage-local parameter groups are not admitted yet"
-            )
-
-    @classmethod
-    def from_trainer_config(cls, config: Trainer.Config) -> "TrainerConfig":
-        """Wrap an upstream trainer config with the NPU config schema."""
-
-        if isinstance(config, cls):
-            return config
-
-        values = _dataclass_values(config, cls)
-        for field_name, target_type in cls._CONFIG_EXTENSIONS.items():
-            values[field_name] = _convert_config(
-                getattr(config, field_name),
-                target_type,
-            )
-        return cls(**values)
-
-    def build(self, **kwargs):
-        """Apply NPU training settings before constructing the trainer."""
-
-        from torchtitan_npu.distributed.utils import set_allow_hf32
-
-        quantization_config = self.extension.quantization
-        if quantization_config.enable_quantized_training:
-            from interfaces.torchao_converter import apply_quantization_converter
-
-            model_compile_enabled = self.compile.enable and "model" in self.compile.components
-            self.model_spec = apply_quantization_converter(
-                self.model_spec,
-                quantization_config,
-                model_compile_enabled=model_compile_enabled,
-            )
-        set_allow_hf32(self.training.extension.allow_hf32)
-        return TrainerEx.Config.build(self, **kwargs)
