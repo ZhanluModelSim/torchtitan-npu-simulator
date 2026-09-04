@@ -10,9 +10,12 @@
 
 The TorchTitan revision pinned by ``requirements.txt`` applies scores after
 combine. This patch adds the opt-in score transport needed by standard EP1/EP2
-dispatch while keeping the default path numerically identical. DeepEP,
-HybridEP, MinimalAsyncEP, and TorchAO keep their pinned behavior and are not
-patched here. The dispatcher contract follows the upstream design in
+dispatch while keeping the default path numerically identical. DeepEP keeps
+its pinned dispatch/combine behavior for now, but exposes the same
+``absorb_router_scores`` configuration knob for NPU dispatcher composition;
+score absorption remains disabled by default. HybridEP, MinimalAsyncEP, and
+TorchAO keep their pinned behavior and are not patched here. The dispatcher
+contract follows the upstream design in
 https://github.com/pytorch/torchtitan/pull/4095.
 """
 
@@ -27,6 +30,9 @@ from torchtitan.models.common.token_dispatcher import (
 )
 from torchtitan.models.common.token_dispatcher import (
     AllToAllTokenDispatcher as TorchTitanAllToAllTokenDispatcher,
+)
+from torchtitan.models.common.token_dispatcher import (
+    DeepEPTokenDispatcher as TorchTitanDeepEPTokenDispatcher,
 )
 from torchtitan.models.common.token_dispatcher import (
     LocalDispatchMetadata as TorchTitanLocalDispatchMetadata,
@@ -291,22 +297,45 @@ class AllToAllTokenDispatcher(TorchTitanAllToAllTokenDispatcher):
         )
 
 
+class DeepEPTokenDispatcher(TorchTitanDeepEPTokenDispatcher):
+    """DeepEP dispatcher with a forward-compatible absorption config knob.
+
+    DeepEP's score transport is owned by its backend-specific dispatch state,
+    so this patch intentionally does not alter dispatch or combine. The
+    ``absorb_router_scores`` field is exposed for dispatcher config composition
+    and remains disabled by default until DeepEP pre-W2 absorption is wired.
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(TorchTitanDeepEPTokenDispatcher.Config):
+        absorb_router_scores: bool = False
+
+    def __init__(self, config: Config):
+        super().__init__(config)
+        self.absorb_router_scores = config.absorb_router_scores
+
+
 def apply() -> None:
     import torchtitan.models.common.config_utils
     import torchtitan.models.common.token_dispatcher as token_dispatcher_module
 
     token_dispatcher_module.LocalTokenDispatcher = LocalTokenDispatcher  # pyrefly: ignore [bad-assignment]
     token_dispatcher_module.AllToAllTokenDispatcher = AllToAllTokenDispatcher  # pyrefly: ignore [bad-assignment]
+    token_dispatcher_module.DeepEPTokenDispatcher = DeepEPTokenDispatcher  # pyrefly: ignore [bad-assignment]
 
     # Patch override: DeepSeek-V4's ``_make_moe_config()`` calls
     # ``config_utils.make_routed_experts_config()``, whose module-level
     # ``from`` imports cached the upstream dispatcher classes. Refresh those
-    # bindings so its factory builds configs with ``absorb_router_scores``.
+    # bindings so its factory builds configs with the patched dispatcher
+    # contracts.
     torchtitan.models.common.config_utils.LocalTokenDispatcher = (  # pyrefly: ignore [bad-assignment]
         LocalTokenDispatcher
     )
     torchtitan.models.common.config_utils.AllToAllTokenDispatcher = (  # pyrefly: ignore [bad-assignment]
         AllToAllTokenDispatcher
+    )
+    torchtitan.models.common.config_utils.DeepEPTokenDispatcher = (  # pyrefly: ignore [bad-assignment]
+        DeepEPTokenDispatcher
     )
 
 

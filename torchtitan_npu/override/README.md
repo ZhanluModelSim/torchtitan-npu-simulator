@@ -31,6 +31,15 @@ python -m torchtitan_npu.train \
   'torchtitan_npu.override.deepseek_v4.sparse_attn.asc={"indexer_loss_coeff": 2.0}'
 ```
 
+NPU DeepEP dispatcher 与上游 `moe_comm_backend="deepep"` 配置绑定。模型配置选择
+`deepep` 后，显式启用以下 override 即可；`hidden_dim` 和
+`num_max_tokens_per_rank` 会由 `update_from_config()` 根据模型及训练形状填充。
+
+```bash
+--override.imports \
+  torchtitan_npu.override.common.token_dispatcher.asc_deepep
+```
+
 也可以直接设置配置：
 
 ```python
@@ -236,6 +245,7 @@ Optimizer writer 的同步、本地 native DCP 限制。异步保存只有在 DC
 | `rope.asc_complex` | `ComplexRoPE.Config` | `AscComplexRoPE.Config` | 使用 interleave 模式的 `torch_npu.npu_rotary_mul`；仅精确匹配 |
 | `rope.asc_cossin` | `CosSinRoPE.Config` | `AscCosSinRoPE.Config` | 使用 half 模式的 `torch_npu.npu_rotary_mul` |
 | `token_dispatcher.asc` | `AllToAllTokenDispatcher.Config` | `AscAllToAllTokenDispatcher.Config` | 使用 `torch_npu.npu_moe_token_permute` `npu_moe_token_unpermute` 融合 MoE dispatch/combine |
+| `token_dispatcher.asc_deepep` | `DeepEPTokenDispatcher.Config` | `AscDeepEPTokenDispatcher.Config` | 使用 `cann_ops_transformer.ElasticBuffer` 实现训练路径的 MoE DeepEP dispatch/combine；当前要求 `expert_parallel_degree > 1` |
 
 
 `rope.workaround` 与 `rope.asc_complex` 会声明同一 target，不能同时启用。
