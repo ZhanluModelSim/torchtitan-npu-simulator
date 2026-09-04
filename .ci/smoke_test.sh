@@ -59,11 +59,20 @@ export NGPU
 export LOG_RANK="${LOG_RANK:-0}"
 export PYTHON_BIN
 
+SMOKE_TESTS_START="$(date +%s)"
+"${PYTHON_BIN}" -m pytest -v --tb=short tests/smoke_tests
+SMOKE_TESTS_END="$(date +%s)"
+
+INTEGRATION_TESTS_START="$(date +%s)"
 "${PYTHON_BIN}" -m tests.integration_tests.run_tests \
     "${OUTPUT_DIR}" \
     --test_suite models \
     --module "${MODULE}" \
     --config "${CONFIG}" \
     --ngpu "${NGPU}"
+INTEGRATION_TESTS_END="$(date +%s)"
+
+echo "tests.smoke_tests finished in $((SMOKE_TESTS_END - SMOKE_TESTS_START))s"
+echo "tests.integration_tests finished in $((INTEGRATION_TESTS_END - INTEGRATION_TESTS_START))s"
 
 echo "smoke test passed."
