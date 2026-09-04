@@ -78,6 +78,14 @@ _ops_to_preserve_subclass = {
     torch.ops.c10d.scatter_.default,
 }
 
+# required for spmd_types sharding - this custom op splits parameters per rank
+try:
+    import spmd_types  # noqa: F401
+except ImportError:
+    pass
+else:
+    _ops_to_preserve_subclass.add(torch.ops.spmd_types.replicate_to_varying.default)
+
 
 class BaseTrainingWeightWrapperTensor(TorchAOBaseTensor):
     """
