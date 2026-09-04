@@ -4,8 +4,10 @@
 # LICENSE file in the root directory of this source tree.
 
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, cast
 
 import torch
+from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor.experimental._context_parallel._load_balancer import (
     _HeadTailLoadBalancer,
@@ -16,6 +18,7 @@ from torchtitan.models.common.attention import AttentionMasksType, VarlenMetadat
 from torchtitan.models.common.decoder import TransformerBlock
 from torchtitan.models.common.moe import MoE
 from torchtitan.models.common.rope import RoPE
+from torchtitan.models.utils import get_moe_model_nparams_and_flops
 
 from torchtitan_npu.models.common.metadata_extension import MetadataExtension
 
@@ -23,6 +26,10 @@ from .metadata import CompressedVarlenMetadata, build_compressed_varlen_metadata
 from .mhc import HcPost, HcPre
 from .mtp import DeepSeekV4MTPDecoder, MTPBatch, prepare_mtp_batch
 from .token_dispatcher import build_cp_plan
+
+if TYPE_CHECKING:
+    from .compressor import Indexer
+    from .mtp import DeepSeekV4MTPTransformerBlock
 
 
 class DeepSeekV4TransformerBlock(TransformerBlock):
@@ -110,18 +117,59 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
                 enable_ep=parallelism.expert_parallel_degree > 1,
             )
 
-        def get_nparams_and_flops(self, model, seq_len):
-            total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-            non_embed_params = sum(
-                p.numel()
-                for n, p in model.named_parameters()
-                if p.requires_grad and "tok_embeddings" not in n and "lm_head" not in n
+        # Pending upstream PR: https://github.com/pytorch/torchtitan/pull/4441
+        # Temporary backport of the upstream DeepSeek-V4 sparse FLOPs
+        # estimation, adapted to the pinned TorchTitan dependency.
+        # Remove this implementation after the TorchTitan dependency includes
+        # the PR.
+
+        def get_nparams_and_flops(self, model: nn.Module, seq_len: int) -> tuple[int, int]:
+            deepseek_v4_model = cast("DeepSeekV4Model", model)
+            first_attention = self.layers[0].attention
+            head_dims = 2 * first_attention.head_dim
+            nparams, num_flops_per_token = get_moe_model_nparams_and_flops(
+                self,
+                deepseek_v4_model,
+                first_attention.n_heads,
+                head_dims,
+                seq_len,
             )
-            n_layers = self.n_layers
-            head_dim = self.layers[0].attention.head_dim
-            n_heads = self.layers[0].attention.n_heads
-            flops_per_token = 6 * non_embed_params + 12 * n_layers * n_heads * head_dim * seq_len
-            return total_params, int(flops_per_token)
+
+            num_flops_per_token -= 6 * len(self.layers) * first_attention.n_heads * head_dims * seq_len
+
+            for layers in (self.layers, self.mtp_layers):
+                for layer in layers:
+                    attention = layer.attention
+                    inner_attention = attention.inner_attention
+                    num_flops_per_token += (
+                        6 * attention.n_heads * (2 * attention.head_dim) * min(seq_len, inner_attention.window_size)
+                    )
+
+                    if attention.compress_ratio > 1:
+                        compressed_seq_len = seq_len // attention.compress_ratio
+                        if attention.compress_ratio == 4:
+                            indexer = cast("Indexer.Config", attention.indexer)
+                            num_flops_per_token += (
+                                6 * indexer.num_index_heads * indexer.index_head_dim * compressed_seq_len
+                            )
+                            compressed_seq_len = min(compressed_seq_len, inner_attention.index_topk)
+                        num_flops_per_token += 6 * attention.n_heads * (2 * attention.head_dim) * compressed_seq_len
+
+            model_mtp_layers = deepseek_v4_model.mtp_layers
+            if model_mtp_layers is not None:
+                lm_head = cast("nn.Module", deepseek_v4_model.lm_head)
+                num_flops_per_token += 6 * len(model_mtp_layers) * sum(param.numel() for param in lm_head.parameters())
+                num_flops_per_token += (
+                    6
+                    * (self.hc_mult - 1)
+                    * sum(
+                        param.numel()
+                        for mtp_layer in model_mtp_layers
+                        for param in cast("DeepSeekV4MTPTransformerBlock", mtp_layer).h_proj.parameters()
+                    )
+                )
+
+            return nparams, num_flops_per_token
 
     def __init__(self, config: Config):
         super().__init__(config)
