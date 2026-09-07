@@ -45,7 +45,20 @@ def _run_experts_grouped_mm(
     num_tokens_per_expert: torch.Tensor,
     swiglu_limit: float | None = None,
     routed_scores: torch.Tensor | None = None,
-) -> torch.Tensor:
+    *,
+    return_backward_saved_tensors: bool = False,
+) -> (
+    torch.Tensor
+    | tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
+):
+    """Run the two expert GMMs.
+
+    ``return_backward_saved_tensors`` is used only by the meta simulator's
+    custom-autograd bridge.  It exposes the actual forward values consumed by
+    its modeled backward, rather than manufacturing shape-only placeholders.
+    Keeping their tensor identities preserves the normal capture path from
+    producer event -> autograd saved slot -> activation lifetime.
+    """
     offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int64)
     if w13 is None:
         raise ValueError("w13 cannot be None for grouped_mm experts")
@@ -59,11 +72,16 @@ def _run_experts_grouped_mm(
         up = torch.clamp(up, min=-swiglu_limit, max=swiglu_limit)
         gate = torch.clamp(gate, max=swiglu_limit)
         h = torch.cat([gate, up], dim=-1)
+    pre_activation = h
     h = torch_npu.npu_swiglu(h, dim=-1)
+    activated_hidden = h
     if routed_scores is not None:
         h = h * routed_scores.to(h.dtype)
+    scaled_hidden = h
     out = torch._grouped_mm(h, w2.bfloat16().transpose(-2, -1), offs=offsets).type_as(x)
 
+    if return_backward_saved_tensors:
+        return out, (pre_activation, activated_hidden, scaled_hidden)
     return out
 
 
@@ -118,8 +136,28 @@ def npu_grouped_experts_forward(
             run_meta_grouped_experts,
         )
 
+        def _run_meta_forward(
+            meta_w13: torch.Tensor,
+            meta_w2: torch.Tensor,
+            _meta_w3: torch.Tensor | None,
+            meta_x: torch.Tensor,
+            meta_num_tokens_per_expert: torch.Tensor,
+            meta_swiglu_limit: float | None,
+            meta_routed_scores: torch.Tensor | None,
+        ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+            return _run_experts_grouped_mm(
+                meta_w13,
+                meta_w2,
+                _meta_w3,
+                meta_x,
+                meta_num_tokens_per_expert,
+                meta_swiglu_limit,
+                meta_routed_scores,
+                return_backward_saved_tensors=True,
+            )
+
         out = run_meta_grouped_experts(
-            _run_experts_grouped_mm,
+            _run_meta_forward,
             w13,
             w2,
             x,

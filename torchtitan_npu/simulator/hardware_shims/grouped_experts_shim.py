@@ -108,15 +108,15 @@ class _SimGroupedExperts(torch.autograd.Function):
         swiglu_limit,
         routed_scores,
     ):
-        pre_activation = _uncaptured_empty(
-            (x.shape[0], w13.shape[-2]),
+        out, (pre_activation, activated_hidden, scaled_hidden) = run_forward(
+            w13,
+            w2,
+            None,
             x,
+            num_tokens_per_expert,
+            swiglu_limit,
+            routed_scores,
         )
-        activated_hidden = _uncaptured_empty(
-            (x.shape[0], w2.shape[-1]),
-            x,
-        )
-        scaled_hidden = _uncaptured_empty_like(activated_hidden)
         ctx.save_for_backward(
             w13,
             w2,
@@ -128,15 +128,7 @@ class _SimGroupedExperts(torch.autograd.Function):
         )
         ctx.routed_scores = routed_scores
         ctx.module_path = _current_module_path()
-        return run_forward(
-            w13,
-            w2,
-            None,
-            x,
-            num_tokens_per_expert,
-            swiglu_limit,
-            routed_scores,
-        )
+        return out
 
     @staticmethod
     # pyrefly: ignore [bad-override]
