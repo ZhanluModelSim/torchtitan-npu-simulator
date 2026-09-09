@@ -31,6 +31,7 @@ from torchtitan_npu.simulator.capture.schedule_builder import (
 from torchtitan_npu.simulator.capture.step_boundary import StepBoundaryTracker, build_step_graphs
 from torchtitan_npu.simulator.capture.graph_normalization import fold_metadata_views
 from torchtitan_npu.simulator.capture.workload_builder import build_workload_graph
+from torchtitan_npu.simulator.hardware_shims.ar_llm_shim import apply_ar_llm_shims
 from torchtitan_npu.simulator.hardware_shims.kda_converter import (
     apply_kimi_k3_shims,
 )
@@ -554,10 +555,12 @@ class SimulationTrainer(Trainer):
             config.simulation.selective_ac_save_ops
         ):
             super().__init__(config)
-        # Bind Kimi shims after model construction so TP/CP/FSDP hooks and
-        # distributed parameters remain attached to the original modules.
+        # Bind model-specific shims after model construction so TP/CP/FSDP
+        # hooks and distributed parameters remain attached to the original
+        # modules.
         for model_part in self.model_parts:
             apply_kimi_k3_shims(model_part)
+            apply_ar_llm_shims(model_part)
         self.simulation_config = config.simulation
         self.workload_graph: WorkloadGraph | None = None
 
