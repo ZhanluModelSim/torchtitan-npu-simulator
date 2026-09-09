@@ -172,3 +172,74 @@ def kimi_k3_smoketest() -> KimiK3SimulationTrainerConfig:
         _kimi_k3_configs.kimi_k3_smoketest,
         output_name="kimi_k3_smoketest",
     )
+
+
+# ---------------------------------------------------------------------------
+# ar_llm (DeepSeekV4-Sparse) simulator configs
+# ---------------------------------------------------------------------------
+
+from torchtitan_npu.models.ar_llm import config_registry as _ar_llm_configs  # noqa: E402
+from torchtitan_npu.models.ar_llm.config_overrides import (  # noqa: E402
+    ArLlmModelOverrides,
+    apply_model_overrides as apply_ar_llm_model_overrides,
+)
+
+
+@dataclasses.dataclass(kw_only=True, slots=True)
+class ArLlmSimulationTrainerConfig(SimulationTrainerConfig):
+    """ar_llm simulator config with stable model CLI overrides."""
+
+    model_overrides: ArLlmModelOverrides = dataclasses.field(
+        default_factory=ArLlmModelOverrides
+    )
+
+    def __post_init__(self) -> None:
+        self.model_spec = apply_ar_llm_model_overrides(
+            self.model_spec,
+            self.model_overrides,
+        )
+
+
+def _ar_llm_simulation_config(
+    factory: Callable[[], TrainerConfig],
+    *,
+    output_name: str,
+) -> ArLlmSimulationTrainerConfig:
+    base_config = factory()
+    base_fields = {
+        field.name: getattr(base_config, field.name)
+        for field in dataclasses.fields(base_config)
+    }
+    base_fields["compile"] = dataclasses.replace(base_config.compile, enable=False)
+    return ArLlmSimulationTrainerConfig(
+        **base_fields,
+        simulation=SimulationConfig(output_dir=f"./simulator_output/{output_name}"),
+    )
+
+
+def ar_llm_debug() -> ArLlmSimulationTrainerConfig:
+    return _ar_llm_simulation_config(
+        _ar_llm_configs.ar_llm_debug,
+        output_name="ar_llm_debug",
+    )
+
+
+def ar_llm_reduced() -> ArLlmSimulationTrainerConfig:
+    return _ar_llm_simulation_config(
+        _ar_llm_configs.ar_llm_reduced,
+        output_name="ar_llm_reduced",
+    )
+
+
+def ar_llm_50t() -> ArLlmSimulationTrainerConfig:
+    return _ar_llm_simulation_config(
+        _ar_llm_configs.ar_llm_50t,
+        output_name="ar_llm_50t",
+    )
+
+
+def ar_llm_100t() -> ArLlmSimulationTrainerConfig:
+    return _ar_llm_simulation_config(
+        _ar_llm_configs.ar_llm_100t,
+        output_name="ar_llm_100t",
+    )

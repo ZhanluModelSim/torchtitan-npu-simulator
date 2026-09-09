@@ -286,14 +286,27 @@ def _resolve_world_size(group: object) -> int:
     dist not initialized)."""
     active_context = _default_collective_context.get()
     group_name = getattr(group, "group_name", None)
-    if active_context is not None and (
-        group is None
-        or group is dist.group.WORLD
-        or isinstance(group, (list, tuple))
-        or str(group) == "default"
-        or str(group_name) == "default"
+    # Substitute default-ish groups with the logical collective context group.
+    # Bounded loop instead of recursion: when the context group is the same
+    # object (e.g. a whole-world TP mesh reusing the default process group)
+    # the recursive rewrite would never terminate.
+    hops = 0
+    while (
+        active_context is not None
+        and hops < 8
+        and (
+            group is None
+            or group is dist.group.WORLD
+            or isinstance(group, (list, tuple))
+            or str(group) == "default"
+            or str(group_name) == "default"
+        )
+        and active_context[1] is not None
+        and active_context[1] is not group
     ):
-        return _resolve_world_size(active_context[1])
+        group = active_context[1]
+        group_name = getattr(group, "group_name", None)
+        hops += 1
     if group is None:
         return dist.get_world_size() if dist.is_initialized() else 1
     # ProcessGroup
@@ -362,14 +375,25 @@ def _resolve_comm_ranks(group: object) -> list[list[int]]:
     groups of size 4).  Returns ``[]`` when unresolvable."""
     active_context = _default_collective_context.get()
     group_name = getattr(group, "group_name", None)
-    if active_context is not None and (
-        group is None
-        or group is dist.group.WORLD
-        or isinstance(group, (list, tuple))
-        or str(group) == "default"
-        or str(group_name) == "default"
+    # Substitute default-ish groups with the logical collective context group
+    # (bounded loop, same rationale as _resolve_world_size).
+    hops = 0
+    while (
+        active_context is not None
+        and hops < 8
+        and (
+            group is None
+            or group is dist.group.WORLD
+            or isinstance(group, (list, tuple))
+            or str(group) == "default"
+            or str(group_name) == "default"
+        )
+        and active_context[1] is not None
+        and active_context[1] is not group
     ):
-        return _resolve_comm_ranks(active_context[1])
+        group = active_context[1]
+        group_name = getattr(group, "group_name", None)
+        hops += 1
     if group is None:
         ws = dist.get_world_size() if dist.is_initialized() else 1
         return [list(range(ws))] if ws > 1 else []
