@@ -255,8 +255,15 @@ def _sim_hca_forward(module, q, k, v, hidden_states, sink_bias):  # noqa: ANN001
     cl = k.shape[1] // module.compress_ratio
     cmp_kv = _uncaptured_empty((b, cl, 1, ori_kv.shape[-1]), q.dtype, q.device)
     idx_q = module.indexer_q_norm(module.indexer_q(hidden_states))
-    idx_k_c = module.indexer_k_norm(module.indexer_k(hidden_states))[:, :: module.compress_ratio]
-    weights = _uncaptured_empty((b, s, 1, 1), torch.float32, q.device)
+    idx_k = module.indexer_k_norm(module.indexer_k(hidden_states))
+    idx_k_c = idx_k[:, :: module.compress_ratio]
+    # DSV4 indexer convention (sparse_lightning_indexer_grad_kl_loss parser):
+    # query_index [B, S, N_idx, D_idx] (4-D), key_index [B, S2, 1, D_idx]
+    # (head-collapsed 4-D), weights [B, S, N_idx] (3-D). ar_llm's indexer is a
+    # single dot-product head of width idx_dim -> N_idx = 1.
+    idx_q = idx_q.view(b, s, 1, -1)
+    idx_k_c = idx_k_c.view(b, cl, 1, -1)
+    weights = _uncaptured_empty((b, s, 1), torch.float32, q.device)
     sinks = _sinks_float(sink_bias, nh, q.device, torch.float32)
     # The real kernel selects at most cl candidates (compress_topk_idxs spans
     # the compressed KV); record the effective top-k, not the config value.
