@@ -20,6 +20,7 @@ All modules avoid ``.item()``/``.tolist()``/data-dependent control flow so they
 run on meta tensors.
 """
 
+import logging
 import math
 
 import torch
@@ -29,6 +30,8 @@ from torch.distributed.tensor import DTensor
 
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.rmsnorm import RMSNorm
+
+logger = logging.getLogger(__name__)
 
 
 def _local(tensor: torch.Tensor) -> torch.Tensor:
@@ -164,6 +167,7 @@ class GlmDeltaAttention(nn.Module):
         self.g_b_proj = Linear.Config(in_features=head_dim, out_features=qkv_dim, bias=False).build()
         self.o_norm = RMSNormGated(head_dim, eps=norm_eps)
         self.o_proj = Linear.Config(in_features=qkv_dim, out_features=hidden_size, bias=False).build()
+        self._warned_no_fused_kernel = False
 
     def forward(
         self,

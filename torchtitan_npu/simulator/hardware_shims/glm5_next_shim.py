@@ -145,15 +145,10 @@ class _SimDsaIndexerFn(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):  # noqa: ANN001
-        hidden_states, q_resid = ctx.saved_tensors
-        grads = [_uncaptured_empty_like(t) for t in (hidden_states, q_resid)]
-        _record(
-            "aclnn.npu_lightning_indexer_grad",
-            [grad_output],
-            grads,
-            ctx.module_path,
-        )
-        return *grads, None, None
+        # Never fires: the glm5_next indexer is frozen and invoked under
+        # ``torch.no_grad`` (MODEL_CONTRACT.md section 4.2), so no autograd
+        # node exists for this Function. Kept for interface completeness.
+        raise RuntimeError("glm5_next indexer is frozen; no backward expected")
 
 
 class _SimDsaCoreFn(torch.autograd.Function):

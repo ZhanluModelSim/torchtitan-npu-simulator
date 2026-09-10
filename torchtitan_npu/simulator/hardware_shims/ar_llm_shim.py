@@ -68,9 +68,16 @@ def _uncaptured_empty(shape, dtype, device):  # noqa: ANN001
 
 
 def _pack_kv(k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-    """Pack K/V into DSV4's ``ori_kv``/``cmp_kv`` layout ``[B, T, 1, 2, N, D]``."""
-    b, t, nh, hd = k.shape
-    return _uncaptured_empty((b, t, 1, 2, nh, hd), k.dtype, k.device)
+    """Pack K/V into DSV4's ``ori_kv``/``cmp_kv`` layout ``[B, T, 1, kv_dim]``.
+
+    DSV4 records a head-collapsed shared-KV latent (4-D, ``kv = wkv(x)`` then
+    ``unsqueeze(2)``); ar_llm's per-head K/V are flattened into the last dim
+    (``kv_dim = nh * (k_dim + v_dim)``), which honestly reflects ar_llm's
+    per-token KV bandwidth while keeping the parser's 4-D convention.
+    """
+    b, t, nh, k_dim = k.shape
+    v_dim = v.shape[-1]
+    return _uncaptured_empty((b, t, 1, nh * (k_dim + v_dim)), k.dtype, k.device)
 
 
 def _sinks_float(sink_bias: torch.Tensor | None, num_heads: int, device, dtype) -> torch.Tensor:
@@ -158,9 +165,7 @@ def _sim_csa_forward(module, q, k, v, sink_bias):  # noqa: ANN001
     query = q.contiguous()
     ori_kv = _pack_kv(k, v)
     cl = k.shape[1] // module.compress_ratio
-    cmp_kv = _uncaptured_empty(
-        (b, cl, 1, 2, nh, hd), q.dtype, q.device
-    )
+    cmp_kv = _uncaptured_empty((b, cl, 1, ori_kv.shape[-1]), q.dtype, q.device)
     sinks = _sinks_float(sink_bias, nh, q.device, torch.float32)
     return _SimCSAFn.apply(query, ori_kv, cmp_kv, sinks, _current_module_path())
 
@@ -248,13 +253,16 @@ def _sim_hca_forward(module, q, k, v, hidden_states, sink_bias):  # noqa: ANN001
     query = q.contiguous()
     ori_kv = _pack_kv(k, v)
     cl = k.shape[1] // module.compress_ratio
-    cmp_kv = _uncaptured_empty((b, cl, 1, 2, nh, hd), q.dtype, q.device)
+    cmp_kv = _uncaptured_empty((b, cl, 1, ori_kv.shape[-1]), q.dtype, q.device)
     idx_q = module.indexer_q_norm(module.indexer_q(hidden_states))
     idx_k_c = module.indexer_k_norm(module.indexer_k(hidden_states))[:, :: module.compress_ratio]
     weights = _uncaptured_empty((b, s, 1, 1), torch.float32, q.device)
     sinks = _sinks_float(sink_bias, nh, q.device, torch.float32)
+    # The real kernel selects at most cl candidates (compress_topk_idxs spans
+    # the compressed KV); record the effective top-k, not the config value.
+    actual_topk = min(module.topk, cl)
     return _SimHCACoreFn.apply(
-        query, ori_kv, cmp_kv, idx_q, idx_k_c, weights, sinks, module.topk, _current_module_path()
+        query, ori_kv, cmp_kv, idx_q, idx_k_c, weights, sinks, actual_topk, _current_module_path()
     )
 
 
