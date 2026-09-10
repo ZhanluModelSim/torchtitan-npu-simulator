@@ -17,8 +17,10 @@ import math
 from dataclasses import dataclass, field
 
 import torch
+import torch.distributed._functional_collectives as funcol
 import torch.nn.functional as F
 from torch import nn
+from torch.distributed.tensor import DTensor
 
 from torchtitan.models.common.attention import AttentionMasksType
 from torchtitan.models.common.linear import Linear
@@ -101,7 +103,15 @@ class PolynomialRollingHash(nn.Module):
 
 
 class MultiHeadHashTable(nn.Module):
-    """Per-head hash embedding table: ``[num_heads * capacity, per_head_dim]``."""
+    """Per-head hash embedding table: ``[num_heads * capacity, per_head_dim]``.
+
+    Deployment follows the Engram paper's training scheme (MODEL_CONTRACT.md
+    §6): the table is sharded by hash bucket (contiguous ``Shard(0)``) across
+    the EP/TP mesh, the lookup dispatches keys to the owning rank via
+    All-to-All (forward gather) and autograd returns the row gradients via the
+    reverse All-to-All (backward dispatch). With no sharding mesh the lookup
+    degenerates to a local embedding gather.
+    """
 
     def __init__(self, capacity: int, num_heads: int, memory_dim: int):
         super().__init__()
@@ -110,12 +120,66 @@ class MultiHeadHashTable(nn.Module):
         self.per_head_dim = memory_dim // num_heads
         self.embedding = nn.Embedding(num_heads * capacity, self.per_head_dim)
         self.register_buffer("head_offsets", (torch.arange(num_heads) * capacity).to(torch.int64))
+        self._table_group = None
+        self._table_world_size = 1
+        self._table_rank = 0
+        self._table_local_size = num_heads * capacity
+        self._table_local_offset = 0
+        self._force_balance = False
 
     def forward(self, hash_indices: torch.Tensor) -> torch.Tensor:
         b, s, nh = hash_indices.shape
         idx = hash_indices + self.head_offsets
-        out = self.embedding(idx)
+        if self._table_group is None or self._table_world_size <= 1:
+            out = self.embedding(idx)
+            return out.reshape(b, s, nh * self.per_head_dim)
+        return self._forward_sharded(idx, b, s, nh)
+
+    def _forward_sharded(self, idx: torch.Tensor, b: int, s: int, nh: int) -> torch.Tensor:
+        world = self._table_world_size
+        keys = idx.reshape(-1)
+        total_keys = keys.shape[0]
+        if self._force_balance:
+            # Deterministic round-robin routing (simulator / forced load
+            # balance): owner assignments and All-to-All splits become pure
+            # functions of shapes, so no tensor values are ever read on meta.
+            if total_keys % world != 0:
+                raise ValueError(
+                    f"Engram lookup keys ({total_keys}) must be divisible by the "
+                    f"table-sharding world size ({world}) under forced load balance"
+                )
+            ar = torch.arange(total_keys, device=keys.device, dtype=torch.int64)
+            owner = ar % world
+            keys = (owner * self._table_local_size) + ((ar // world) % self._table_local_size)
+            splits = [total_keys // world] * world
+        else:
+            if keys.device.type == "meta":
+                raise RuntimeError(
+                    "Engram sharded lookup on meta tensors requires forced load "
+                    "balance (debug.moe_force_load_balance)"
+                )
+            owner = keys // self._table_local_size
+            counts = torch.histc(owner.float(), bins=world, min=0, max=world - 1).to(torch.int64)
+            splits = counts.tolist()
+
+        send_perm = torch.argsort(owner, stable=True)
+        sorted_keys = keys[send_perm].contiguous()
+        recv_keys = funcol.all_to_all_single_autograd(
+            sorted_keys, splits, splits, self._table_group
+        )
+        local_rows = F.embedding(
+            (recv_keys - self._table_local_offset), self._weight_local()
+        )
+        recv_rows = funcol.all_to_all_single_autograd(
+            local_rows.contiguous(), splits, splits, self._table_group
+        )
+        out = torch.zeros_like(recv_rows)
+        out.index_add_(0, send_perm, recv_rows.to(out.dtype))
         return out.reshape(b, s, nh * self.per_head_dim)
+
+    def _weight_local(self) -> torch.Tensor:
+        weight = self.embedding.weight
+        return weight.to_local() if isinstance(weight, DTensor) else weight
 
 
 class ContextAwareGate(nn.Module):
@@ -179,12 +243,23 @@ class EngramModule(nn.Module):
         self.input_norm = RMSNorm.Config(normalized_shape=d, eps=model_args.norm_eps).build()
         self.memory_norm = RMSNorm.Config(normalized_shape=d, eps=model_args.norm_eps).build()
         self.gate_bias = nn.Parameter(torch.zeros(1))
+        # Sequence window of the local rank inside the GLOBAL token ids under
+        # TP/CP sequence sharding (set by parallelize). Hash windows are
+        # evaluated on the global ids and sliced to the local positions, so
+        # n-grams keep cross-rank context without gathering hidden states.
+        self._ids_window: tuple[int, int] | None = None
 
     def forward(self, hidden_states: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
         residual = hidden_states
         h = self.input_norm(hidden_states)
 
-        memory_parts = [table(hash_fn(input_ids)) for hash_fn, table in zip(self.hash_fns, self.hash_tables)]
+        memory_parts = []
+        for hash_fn, table in zip(self.hash_fns, self.hash_tables):
+            indices = hash_fn(input_ids)
+            if self._ids_window is not None:
+                start, end = self._ids_window
+                indices = indices[:, start:end]
+            memory_parts.append(table(indices))
         memory_vectors = torch.cat(memory_parts, dim=-1)
 
         gate = self.gate(h, memory_vectors) + self.gate_bias

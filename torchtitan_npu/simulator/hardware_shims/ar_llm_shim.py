@@ -5,21 +5,33 @@
 
 """Shape-only simulator shims for ar_llm model-specific fused ops.
 
-Records the real production op names (see MODEL_CONTRACT.md section 9) into
-the active OpDispatchCapture with analytically-correct shapes:
+All raw op names and input signatures are REUSED from the DeepSeek-V4 SMLA/MHC
+shim set (``smla_shim.py`` / ``mhc_shim.py``) so downstream op mapping and
+shape parsing stay unified:
 
-- KDA core:              ``triton_ascend_kernels.chunk_kda[_grad]``
-- CSA core:              ``aclnn.npu_sparse_attn_sharedkv[_grad]``
-- HCA indexer + core:    ``aclnn.npu_lightning_indexer[_grad]`` +
-                         ``aclnn.npu_sparse_attn_sharedkv[_grad]``
-- mHC Sinkhorn mix:      ``triton._triton_hc_sinkhorn_[fwd|bwd]_kernel``
+- Sparse attention (both CSA and HCA cores): ``aclnn.npu_sparse_attn_sharedkv``
+  with the DSV4 input-count convention -- the parser distinguishes variants by
+  tensor count:
+      [query, ori_kv, sinks, metadata]                      (4, no compression)
+      [query, ori_kv, sinks, metadata, cmp_kv]              (5, CSA: strided KV)
+      [..., cmp_kv, cmp_sparse_indices]                     (6, HCA: indexer topk)
+  Each forward also records ``aclnn.npu_sparse_attn_sharedkv_metadata`` and
+  outputs ``[result, softmax_lse]`` like DSV4; backward records
+  ``aclnn.npu_sparse_attn_sharedkv_grad`` with the same packing.
+- Lightning indexer: forward ``aclnn.npu_lightning_indexer``
+  [query, key, weights] -> [sparse_indices, sparse_values] with NO backward op
+  (DSV4 non-A5 behavior); the indexer gradient is represented by
+  ``aclnn.npu_sparse_lightning_indexer_grad_kl_loss`` in backward.
+- mHC: ``triton._triton_hc_sinkhorn_comb_fwd/bwd_kernel`` for the Sinkhorn
+  comb and ``triton.hc_pre_bmm_forward/backward`` for the channel mixing bmm
+  (rms_norm/matmul steps run as real meta ops via the Sim RMSNorm converter
+  and aten matmul, matching DSV4's decomposition).
 
 Shims are bound after model construction and parallelization (same seam as
 ``apply_kimi_k3_shims``) so FQN, DTensor placements, and hooks stay intact.
-The per-head ``attn_sink`` bias participates in the forward record but is
-omitted from the backward record (zero-gradient, negligible byte volume).
-The LatentMoE GMM path needs no shim: its real forward is ``aten._grouped_mm``
-calls, which are captured directly.
+Deviations from DSV4 signatures are shape-level only and documented inline:
+ar_llm packs K/V into ``ori_kv``/``cmp_kv``'s dim-2 and has no indexer
+``weights`` projection (recorded as ones).
 """
 
 from __future__ import annotations
@@ -55,15 +67,22 @@ def _uncaptured_empty(shape, dtype, device):  # noqa: ANN001
         return torch.empty(shape, dtype=dtype, device=device)
 
 
-def _current_module_path() -> str:
-    capture = get_active_capture()
-    if capture is not None and capture.module_path_tracker is not None:
-        return capture.module_path_tracker.current_path()
-    return ""
+def _pack_kv(k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """Pack K/V into DSV4's ``ori_kv``/``cmp_kv`` layout ``[B, T, 1, 2, N, D]``."""
+    b, t, nh, hd = k.shape
+    return _uncaptured_empty((b, t, 1, 2, nh, hd), k.dtype, k.device)
+
+
+def _sinks_float(sink_bias: torch.Tensor | None, num_heads: int, device, dtype) -> torch.Tensor:
+    if sink_bias is not None:
+        return sink_bias.float()
+    return torch.zeros(num_heads, dtype=dtype, device=device)
 
 
 class _SimChunkKDAFn(torch.autograd.Function):
-    """Shape-only bridge for the KDA chunk kernel on meta tensors."""
+    """Shape-only bridge for the KDA chunk kernel on meta tensors (same raw
+    op name as kimi_k3's chunk_kda; ar_llm's double-gate variant passes
+    alpha/beta_erase/beta_write instead of g/A_log/dt_bias)."""
 
     @staticmethod
     def forward(ctx, q, k, v, alpha, beta_erase, beta_write, module_path):  # noqa: ANN001
@@ -98,109 +117,206 @@ def sim_ar_llm_chunk_kda(module, q, k, v, alpha, beta_erase, beta_write):  # noq
 
 
 class _SimCSAFn(torch.autograd.Function):
-    """Window + strided-global attention as one fused op."""
+    """CSA core: window + strided-global attention = DSV4's compressed-KV
+    variant (5-input sharedkv, no sparse indices)."""
 
     @staticmethod
-    def forward(ctx, q, k, v, sink_bias, module_path):  # noqa: ANN001
-        output = _uncaptured_empty_like(v)
-        inputs = [q, k, v] + ([sink_bias] if sink_bias is not None else [])
-        _record("aclnn.npu_sparse_attn_sharedkv", inputs, [output], module_path)
+    def forward(ctx, query, ori_kv, cmp_kv, sinks, module_path):  # noqa: ANN001
+        b, s, nh, hd = query.shape
+        metadata = _uncaptured_empty((1024,), torch.int32, query.device)
+        _record("aclnn.npu_sparse_attn_sharedkv_metadata", [query], [metadata], module_path)
+        result = _uncaptured_empty_like(query)
+        softmax_lse = _uncaptured_empty((b, s, nh, 1), torch.float32, query.device)
+        _record(
+            "aclnn.npu_sparse_attn_sharedkv",
+            [query, ori_kv, sinks, metadata, cmp_kv],
+            [result, softmax_lse],
+            module_path,
+        )
+        ctx.save_for_backward(query, ori_kv, cmp_kv, result, softmax_lse, sinks)
         ctx.module_path = module_path
-        return output
+        return result
 
     @staticmethod
-    def backward(ctx, grad_output):  # noqa: ANN001
-        empty = _uncaptured_empty_like(grad_output)
+    def backward(ctx, grad_result):  # noqa: ANN001
+        query, ori_kv, cmp_kv, result, softmax_lse, sinks = ctx.saved_tensors
+        d_query = _uncaptured_empty_like(query)
+        d_ori_kv = _uncaptured_empty_like(ori_kv)
+        d_cmp_kv = _uncaptured_empty_like(cmp_kv)
+        d_sinks = _uncaptured_empty_like(sinks)
         _record(
             "aclnn.npu_sparse_attn_sharedkv_grad",
-            [grad_output],
-            [empty, empty, empty],
+            [query, ori_kv, result, softmax_lse, sinks, grad_result, cmp_kv],
+            [d_query, d_ori_kv, d_sinks, d_cmp_kv],
             ctx.module_path,
         )
-        return empty, empty, empty, None, None
+        return d_query, d_ori_kv, d_cmp_kv, d_sinks, None
 
 
 def _sim_csa_forward(module, q, k, v, sink_bias):  # noqa: ANN001
-    return _SimCSAFn.apply(q, k, v, sink_bias, _current_module_path())
+    b, s, nh, hd = q.shape
+    query = q.contiguous()
+    ori_kv = _pack_kv(k, v)
+    cl = k.shape[1] // module.compress_ratio
+    cmp_kv = _uncaptured_empty(
+        (b, cl, 1, 2, nh, hd), q.dtype, q.device
+    )
+    sinks = _sinks_float(sink_bias, nh, q.device, torch.float32)
+    return _SimCSAFn.apply(query, ori_kv, cmp_kv, sinks, _current_module_path())
+
+
+class _SimLightningIndexerFn(torch.autograd.Function):
+    """HCA indexer: DSV4's lightning indexer, forward record only (no
+    backward op exists for npu_lightning_indexer; the gradient op is the
+    sparse_lightning_indexer_grad_kl_loss recorded by the core backward)."""
+
+    @staticmethod
+    def forward(ctx, idx_q, idx_k_c, weights, topk, module_path):  # noqa: ANN001
+        b, s = idx_q.shape[0], idx_q.shape[1]
+        sparse_indices = _uncaptured_empty((b, s, 1, topk), torch.int32, idx_q.device)
+        sparse_values = _uncaptured_empty((b, s, 1, topk), idx_q.dtype, idx_q.device)
+        _record(
+            "aclnn.npu_lightning_indexer",
+            [idx_q, idx_k_c, weights],
+            [sparse_indices, sparse_values],
+            module_path,
+        )
+        return sparse_indices.squeeze(2), sparse_values.squeeze(2)
+
+    @staticmethod
+    def backward(ctx, grad_indices, grad_values):  # noqa: ANN001
+        return None, None, None, None, None
 
 
 class _SimHCACoreFn(torch.autograd.Function):
-    """Indexer top-k scoring + attention over selected KV as two fused ops."""
+    """HCA core: indexer top-k + attention over selected KV = DSV4's
+    topk-indexed variant (6-input sharedkv). Backward records the sharedkv
+    grad plus DSV4's sparse_lightning_indexer_grad_kl_loss for the indexer
+    gradients."""
 
     @staticmethod
-    def forward(ctx, q, k_c, v_c, idx_q, idx_k_c, sink_bias, module_path):  # noqa: ANN001
-        scores = _uncaptured_empty(
-            (q.shape[0], q.shape[1], k_c.shape[1]), q.dtype, q.device
-        )
-        _record("aclnn.npu_lightning_indexer", [idx_q, idx_k_c], [scores], module_path)
-        output = _uncaptured_empty_like(q)
-        inputs = [q, k_c, v_c, scores] + ([sink_bias] if sink_bias is not None else [])
-        _record("aclnn.npu_sparse_attn_sharedkv", inputs, [output], module_path)
-        ctx.save_for_backward(q, k_c, v_c, idx_q, idx_k_c)
-        ctx.module_path = module_path
-        return output
+    def forward(ctx, query, ori_kv, cmp_kv, idx_q, idx_k_c, weights, sinks, topk, module_path):  # noqa: ANN001
+        b, s, nh, hd = query.shape
+        metadata = _uncaptured_empty((1024,), torch.int32, query.device)
+        _record("aclnn.npu_sparse_attn_sharedkv_metadata", [query], [metadata], module_path)
 
-    @staticmethod
-    def backward(ctx, grad_output):  # noqa: ANN001
-        q, k_c, v_c, idx_q, idx_k_c = ctx.saved_tensors
-        grad_scores = _uncaptured_empty(
-            (q.shape[0], q.shape[1], k_c.shape[1]), q.dtype, q.device
+        sparse_indices, _ = _SimLightningIndexerFn.apply(
+            idx_q.to(torch.bfloat16), idx_k_c.to(torch.bfloat16), weights.to(torch.bfloat16), topk, module_path
         )
-        grad_q = _uncaptured_empty_like(q)
-        grad_k_c = _uncaptured_empty_like(k_c)
-        grad_v_c = _uncaptured_empty_like(v_c)
-        grad_idx_q = _uncaptured_empty_like(idx_q)
-        grad_idx_k_c = _uncaptured_empty_like(idx_k_c)
+        sparse_indices = sparse_indices.unsqueeze(2).contiguous()
+
+        result = _uncaptured_empty_like(query)
+        softmax_lse = _uncaptured_empty((b, s, nh, 1), torch.float32, query.device)
         _record(
-            "aclnn.npu_lightning_indexer_grad",
-            [grad_scores, idx_q, idx_k_c],
-            [grad_idx_q, grad_idx_k_c],
-            ctx.module_path,
+            "aclnn.npu_sparse_attn_sharedkv",
+            [query, ori_kv, sinks, metadata, cmp_kv, sparse_indices],
+            [result, softmax_lse],
+            module_path,
         )
+        ctx.save_for_backward(query, ori_kv, cmp_kv, idx_q, idx_k_c, weights, sparse_indices, result, softmax_lse, sinks)
+        ctx.module_path = module_path
+        return result
+
+    @staticmethod
+    def backward(ctx, grad_result):  # noqa: ANN001
+        query, ori_kv, cmp_kv, idx_q, idx_k_c, weights, sparse_indices, result, softmax_lse, sinks = ctx.saved_tensors
+        d_query = _uncaptured_empty_like(query)
+        d_ori_kv = _uncaptured_empty_like(ori_kv)
+        d_cmp_kv = _uncaptured_empty_like(cmp_kv)
+        d_sinks = _uncaptured_empty_like(sinks)
         _record(
             "aclnn.npu_sparse_attn_sharedkv_grad",
-            [grad_output, q, k_c, v_c, grad_scores],
-            [grad_q, grad_k_c, grad_v_c, grad_scores],
+            [query, ori_kv, result, softmax_lse, sinks, grad_result, cmp_kv],
+            [d_query, d_ori_kv, d_sinks, d_cmp_kv],
             ctx.module_path,
         )
-        return grad_q, grad_k_c, grad_v_c, grad_idx_q, grad_idx_k_c, None, None
+        d_idx_q = _uncaptured_empty_like(idx_q)
+        d_idx_k_c = _uncaptured_empty_like(idx_k_c)
+        d_weights = _uncaptured_empty_like(weights)
+        loss = _uncaptured_empty((1,), torch.float32, query.device)
+        _record(
+            "aclnn.npu_sparse_lightning_indexer_grad_kl_loss",
+            [query, cmp_kv, idx_q, idx_k_c, weights, sparse_indices],
+            [d_idx_q, d_idx_k_c, d_weights, loss],
+            ctx.module_path,
+        )
+        return d_query, d_ori_kv, d_cmp_kv, d_idx_q, d_idx_k_c, d_weights, d_sinks, None, None
 
 
 def _sim_hca_forward(module, q, k, v, hidden_states, sink_bias):  # noqa: ANN001
+    b, s, nh, hd = q.shape
+    query = q.contiguous()
+    ori_kv = _pack_kv(k, v)
+    cl = k.shape[1] // module.compress_ratio
+    cmp_kv = _uncaptured_empty((b, cl, 1, 2, nh, hd), q.dtype, q.device)
     idx_q = module.indexer_q_norm(module.indexer_q(hidden_states))
-    idx_k = module.indexer_k_norm(module.indexer_k(hidden_states))
-    k_c = k[:, :: module.compress_ratio]
-    v_c = v[:, :: module.compress_ratio]
-    idx_k_c = idx_k[:, :: module.compress_ratio]
+    idx_k_c = module.indexer_k_norm(module.indexer_k(hidden_states))[:, :: module.compress_ratio]
+    weights = _uncaptured_empty((b, s, 1, 1), torch.float32, q.device)
+    sinks = _sinks_float(sink_bias, nh, q.device, torch.float32)
     return _SimHCACoreFn.apply(
-        q, k_c, v_c, idx_q, idx_k_c, sink_bias, _current_module_path()
+        query, ori_kv, cmp_kv, idx_q, idx_k_c, weights, sinks, module.topk, _current_module_path()
     )
 
 
-class _SimSinkhornFn(torch.autograd.Function):
+class _SimSinkhornCombFn(torch.autograd.Function):
+    """mHC Sinkhorn comb (ar_llm's SinkhornIteration over the [hc, hc] mix
+    weights) recorded with DSV4's sinkhorn_comb kernel name."""
+
     @staticmethod
-    def forward(ctx, mix_weights, n_iters, module_path):  # noqa: ANN001
-        del n_iters
+    def forward(ctx, mix_weights, module_path):  # noqa: ANN001
         mixed = _uncaptured_empty_like(mix_weights)
         _record(
-            "triton._triton_hc_sinkhorn_fwd_kernel",
+            "triton._triton_hc_sinkhorn_comb_fwd_kernel",
             [mix_weights],
             [mixed],
             module_path,
         )
+        ctx.save_for_backward(mix_weights)
         ctx.module_path = module_path
         return mixed
 
     @staticmethod
-    def backward(ctx, grad_output):  # noqa: ANN001
-        grad_weights = _uncaptured_empty_like(grad_output)
+    def backward(ctx, grad_mixed):  # noqa: ANN001
+        (mix_weights,) = ctx.saved_tensors
+        grad_weights = _uncaptured_empty_like(mix_weights)
         _record(
-            "triton._triton_hc_sinkhorn_bwd_kernel",
-            [grad_output],
+            "triton._triton_hc_sinkhorn_comb_bwd_kernel",
+            [grad_mixed, mix_weights],
             [grad_weights],
             ctx.module_path,
         )
-        return grad_weights, None, None
+        return grad_weights, None
+
+
+class _SimHcBmmFn(torch.autograd.Function):
+    """mHC channel mixing (ar_llm's expand-channel einsum with the comb
+    weights) recorded with DSV4's hc_pre_bmm kernel name."""
+
+    @staticmethod
+    def forward(ctx, mix, expanded, module_path):  # noqa: ANN001
+        mixed = _uncaptured_empty_like(expanded)
+        _record(
+            "triton.hc_pre_bmm_forward",
+            [mix, expanded],
+            [mixed],
+            module_path,
+        )
+        ctx.save_for_backward(mix, expanded)
+        ctx.module_path = module_path
+        return mixed
+
+    @staticmethod
+    def backward(ctx, grad_mixed):  # noqa: ANN001
+        mix, expanded = ctx.saved_tensors
+        grad_mix = _uncaptured_empty_like(mix)
+        grad_expanded = _uncaptured_empty_like(expanded)
+        _record(
+            "triton.hc_pre_bmm_backward",
+            [mix, expanded, grad_mixed],
+            [grad_mix, grad_expanded],
+            ctx.module_path,
+        )
+        return grad_mix, grad_expanded, None
 
 
 def _sim_hc_block_forward(module, x):  # noqa: ANN001
@@ -208,10 +324,8 @@ def _sim_hc_block_forward(module, x):  # noqa: ANN001
     residual = x
     xn = module.pre_norm(x)
     expanded = module.expand(xn).view(b, s, module.hc_mult, d)
-    mix = _SimSinkhornFn.apply(
-        module.mix_weights, module.sinkhorn.n_iters, _current_module_path()
-    )
-    mixed = torch.einsum("bshd,ho->bsod", expanded, mix)
+    mix = _SimSinkhornCombFn.apply(module.mix_weights, _current_module_path())
+    mixed = _SimHcBmmFn.apply(mix, expanded, _current_module_path())
     merged = mixed.reshape(b, s, module.hc_mult * d)
     return residual + module.post_norm(module.contract(merged))
 

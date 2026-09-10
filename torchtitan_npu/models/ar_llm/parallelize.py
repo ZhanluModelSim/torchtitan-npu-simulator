@@ -16,6 +16,7 @@ import logging
 from functools import partial
 
 import torch
+import torch.distributed as dist
 import torch.distributed._functional_collectives as funcol
 from torch import nn
 from torch.distributed.device_mesh import DeviceMesh
@@ -40,7 +41,6 @@ from torchtitan.distributed import ParallelDims
 from torchtitan.distributed.expert_parallel import ExpertParallel, TensorParallel
 from torchtitan.distributed.tensor_parallel import NoParallel, maybe_enable_async_tp
 from torchtitan.models.llama3.parallelize import apply_replicate
-from torchtitan.models.llama4.parallelize import apply_fsdp
 from torchtitan.protocols import ModelConvertersContainer
 
 from torchtitan_npu.models.common.activation_checkpoint import apply_moe_ac
@@ -52,6 +52,142 @@ from .model import ArLlmModel
 logger = logging.getLogger(__name__)
 
 _EXPERT_WEIGHT_NAMES = ("w1", "w2", "w3", "w4", "w5")
+
+
+def _apply_ar_llm_fsdp(
+    model: ArLlmModel,
+    dp_mesh: DeviceMesh,
+    *,
+    param_dtype: torch.dtype,
+    reduce_dtype: torch.dtype,
+    cpu_offload: bool = False,
+    reshard_after_forward_policy: str = "default",
+    ep_degree: int = 1,
+    edp_mesh: DeviceMesh | None = None,
+    gradient_divide_factor: int | None = None,
+) -> None:
+    """FSDP/eFSDP application for ar_llm.
+
+    Mirrors upstream ``apply_fsdp`` (llama4) with one extension required by
+    the Engram table deployment (MODEL_CONTRACT.md §6): Engram hash-table
+    parameters are routed to the edp/eFSDP mesh like routed-expert parameters
+    so the tables stay sharded at compute time. All other parameters follow
+    the standard dp-mesh Shard(0) policy.
+    """
+    from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy, fully_shard
+    from torch.distributed.fsdp._fully_shard._fsdp_common import (
+        FSDPMeshInfo,
+        ShardPlacementResult,
+    )
+    from torchtitan.distributed.fsdp import get_fsdp_reshard_after_forward_policy
+    from torchtitan.models.llama3.parallelize import disable_fsdp_gradient_division
+
+    mp_policy = MixedPrecisionPolicy(param_dtype=param_dtype, reduce_dtype=reduce_dtype)
+    fsdp_config: dict[str, Any] = {"mesh": dp_mesh, "mp_policy": mp_policy}
+    if cpu_offload:
+        fsdp_config["offload_policy"] = CPUOffloadPolicy()
+
+    reshard_after_forward = get_fsdp_reshard_after_forward_policy(
+        reshard_after_forward_policy, pp_enabled=False
+    )
+
+    fully_shard(model.tok_embeddings, **fsdp_config, reshard_after_forward=reshard_after_forward)
+    fully_shard(
+        [model.norm, model.output],
+        **fsdp_config,
+        reshard_after_forward=reshard_after_forward_policy == "always",
+    )
+
+    for transformer_block in model.layers.values():
+        expert_params = set(transformer_block.moe.experts.parameters())
+        engram_table_params: set[nn.Parameter] = set()
+        if transformer_block.has_engram:
+            for table in transformer_block.engram.hash_tables:
+                engram_table_params.update(table.parameters())
+
+        if ep_degree > 1:
+            assert edp_mesh is not None
+            efsdp_ep_size = edp_mesh["efsdp"].size() * ep_degree
+            expert_shard_placement = (
+                Shard(1) if efsdp_ep_size > transformer_block.moe.experts.num_experts else Shard(0)
+            )
+            edp_mesh_info = FSDPMeshInfo(mesh=edp_mesh, shard_mesh_dim=0)
+            dp_mesh_info = FSDPMeshInfo(mesh=dp_mesh, shard_mesh_dim=0)
+
+            def _shard_placement_fn(
+                param: nn.Parameter,
+                _expert_params: set = expert_params,
+                _engram_params: set = engram_table_params,
+                _expert_placement: Shard = expert_shard_placement,
+                _edp_mesh_info: FSDPMeshInfo = edp_mesh_info,
+                _dp_mesh_info: FSDPMeshInfo = dp_mesh_info,
+            ) -> ShardPlacementResult:
+                if param in _engram_params:
+                    # Hash tables are bucket-sharded and stay sharded at
+                    # compute time (a2a lookup addresses the owning rank).
+                    return ShardPlacementResult(placement=Shard(0), mesh_info=_edp_mesh_info)
+                if param in _expert_params:
+                    return ShardPlacementResult(placement=_expert_placement, mesh_info=_edp_mesh_info)
+                return ShardPlacementResult(placement=Shard(0), mesh_info=_dp_mesh_info)
+
+            fully_shard(
+                transformer_block,
+                **fsdp_config,
+                reshard_after_forward=reshard_after_forward,
+                shard_placement_fn=_shard_placement_fn,
+            )
+        elif fsdp_config["mesh"].size() > transformer_block.moe.experts.num_experts:
+            def _experts_shard_placement_fn(
+                param: nn.Parameter,
+                _expert_params: set = expert_params,
+            ) -> Shard | None:
+                if param in _expert_params:
+                    return Shard(1)
+                return None
+
+            fully_shard(
+                transformer_block,
+                **fsdp_config,
+                reshard_after_forward=reshard_after_forward,
+                shard_placement_fn=_experts_shard_placement_fn,
+            )
+        else:
+            fully_shard(
+                transformer_block,
+                **fsdp_config,
+                reshard_after_forward=reshard_after_forward,
+            )
+
+    fully_shard(model, **fsdp_config)
+    disable_fsdp_gradient_division(model)
+    del gradient_divide_factor
+
+    # Explicit prefetching under EP (mirrors upstream; D2H syncs in EP can
+    # interfere with FSDP's implicit prefetching).
+    if ep_degree == 1:
+        return
+
+    transformer_blocks = list(model.layers.values())
+    next_transformer_blocks = transformer_blocks[1:] + [None]
+
+    model.tok_embeddings.set_modules_to_forward_prefetch([transformer_blocks[0]])
+    for transformer_block, next_transformer_block in zip(transformer_blocks, next_transformer_blocks):
+        if next_transformer_block is not None:
+            transformer_block.set_modules_to_forward_prefetch([next_transformer_block])
+        else:
+            transformer_block.set_modules_to_forward_prefetch([model.norm, model.output])
+
+    reversed_transformer_blocks = list(reversed(list(model.layers.values())))
+    prev_transformer_blocks = reversed_transformer_blocks[1:] + [None]
+
+    model.output.set_modules_to_backward_prefetch([reversed_transformer_blocks[0]])
+    for transformer_block, prev_transformer_block in zip(
+        reversed_transformer_blocks, prev_transformer_blocks
+    ):
+        if prev_transformer_block is not None:
+            transformer_block.set_modules_to_backward_prefetch([prev_transformer_block])
+        else:
+            transformer_block.set_modules_to_backward_prefetch([model.tok_embeddings])
 
 
 def _replicated_local_output() -> ParallelStyle:
@@ -188,45 +324,72 @@ class _ArLlmAttentionContextParallel(ParallelStyle):
         return module
 
 
-class _ArLlmEngramContextParallel(ParallelStyle):
-    """All-gather hidden states and token ids for the Engram module.
+class _ArLlmEngramIdsContextParallel(ParallelStyle):
+    """All-gather the token ids for the Engram module under CP.
 
-    The n-gram rolling hash needs left-halo tokens and the dilated short conv
-    needs cross-rank sequence context, so both the block hidden states and the
-    raw input ids are gathered before the module runs.
+    The hash windows need cross-rank token context, but ids are int64 and
+    negligible in volume. Hidden states are NOT gathered: hash indices are
+    sliced to the local sequence window and gate/conv run on the local hidden
+    states (see the Engram deployment contract in MODEL_CONTRACT.md §6).
     """
-
-    @staticmethod
-    def _gather_sequence(tensor, mesh):  # noqa: ANN001
-        gathered = funcol.all_gather_tensor_autograd(
-            tensor.contiguous(),
-            gather_dim=0,
-            group=mesh.get_group(),
-        )
-        return torch.cat(torch.chunk(gathered, mesh.size(), dim=0), dim=1)
 
     @staticmethod
     def _pre_hook(module, args, kwargs, mesh):  # noqa: ANN001
         if mesh.ndim != 1:
             raise ValueError(f"ar_llm CP expects a 1D mesh, got {mesh.ndim}D")
-        hidden_states = _ArLlmEngramContextParallel._gather_sequence(args[0], mesh)
-        input_ids = _ArLlmEngramContextParallel._gather_sequence(args[1], mesh)
+        hidden_states, input_ids = args[0], args[1]
+        gathered = funcol.all_gather_tensor_autograd(
+            input_ids.contiguous(),
+            gather_dim=0,
+            group=mesh.get_group(),
+        )
+        input_ids = torch.cat(torch.chunk(gathered, mesh.size(), dim=0), dim=1)
         return (hidden_states, input_ids), kwargs
-
-    @staticmethod
-    def _post_hook(module, args, output, mesh):  # noqa: ANN001
-        return output.chunk(mesh.size(), dim=1)[mesh.get_local_rank()].contiguous()
 
     def _apply(self, module, device_mesh):  # noqa: ANN001
         module.register_forward_pre_hook(
             partial(self._pre_hook, mesh=device_mesh),
             with_kwargs=True,
         )
-        module.register_forward_hook(
-            partial(self._post_hook, mesh=device_mesh),
-            prepend=True,
-        )
         return module
+
+
+def _apply_engram_table_parallel(
+    model: ArLlmModel,
+    mesh: DeviceMesh | None,
+    *,
+    force_balance: bool,
+) -> None:
+    """Shard Engram hash tables by hash bucket across the EP/TP mesh.
+
+    Owner = ``bucket // E_local`` (contiguous Shard(0)); the forward dispatches
+    keys to owners via All-to-All and autograd returns row gradients via the
+    reverse All-to-All (Engram paper's training deployment). Tables stay
+    sharded at compute time, mirroring expert-parameter treatment.
+    """
+    if mesh is None or mesh.size() <= 1:
+        return
+    for layer in model.layers.values():
+        if not layer.has_engram:
+            continue
+        for table in layer.engram.hash_tables:
+            total = table.embedding.weight.shape[0]
+            if total % mesh.size() != 0:
+                raise ValueError(
+                    f"Engram table size ({total}) must be divisible by the "
+                    f"sharding world size ({mesh.size()})"
+                )
+            table.embedding.weight = nn.Parameter(
+                distribute_tensor(table.embedding.weight, mesh, [Shard(0)])
+            )
+            table._table_group = mesh.get_group()
+            table._table_world_size = mesh.size()
+            table._table_rank = dist.get_rank(mesh.get_group())
+            table._table_local_size = total // mesh.size()
+            table._table_local_offset = table._table_rank * table._table_local_size
+            table._force_balance = force_balance
+
+    logger.info("Applied ar_llm Engram table sharding (world=%d)", mesh.size())
 
 
 def _apply_context_parallel(
@@ -234,6 +397,7 @@ def _apply_context_parallel(
     *,
     parallel_dims: ParallelDims,
     parallelism: ParallelismConfig,
+    training_seq_len: int,
 ) -> None:
     if not parallel_dims.cp_enabled:
         return
@@ -245,6 +409,11 @@ def _apply_context_parallel(
     cp_mesh = parallel_dims.get_mesh("cp")
     if cp_mesh.ndim != 1:
         raise ValueError(f"ar_llm CP expects a 1D mesh, got {cp_mesh.ndim}D")
+    cp_degree = cp_mesh.size()
+    if training_seq_len % cp_degree != 0:
+        raise ValueError(
+            f"seq_len={training_seq_len} must be divisible by CP degree={cp_degree}"
+        )
     for layer in model.layers.values():
         parallelize_module(
             layer.attention,
@@ -252,10 +421,13 @@ def _apply_context_parallel(
             _ArLlmAttentionContextParallel(),
         )
         if layer.has_engram:
+            cp_rank = cp_mesh.get_local_rank()
+            local_seq = training_seq_len // cp_degree
+            layer.engram._ids_window = (cp_rank * local_seq, (cp_rank + 1) * local_seq)
             parallelize_module(
                 layer.engram,
                 cp_mesh,
-                _ArLlmEngramContextParallel(),
+                _ArLlmEngramIdsContextParallel(),
             )
 
     logger.info("Applied ar_llm all-gather context parallelism")
@@ -338,6 +510,7 @@ def _apply_non_moe_tp(
     tp_mesh: DeviceMesh,
     *,
     loss_parallel: bool,
+    training_seq_len: int,
 ) -> None:
     if model.tok_embeddings.embedding_dim % tp_mesh.size() != 0:
         raise ValueError(
@@ -381,21 +554,12 @@ def _apply_non_moe_tp(
         else:
             _apply_mla_tp(layer.attention, tp_mesh)
         if layer.has_engram:
-            # The n-gram hash lookup and the dilated short conv need
-            # cross-rank sequence context: gather the full sequence for the
-            # engram module and re-shard its output.
-            parallelize_module(
-                layer.engram,
-                tp_mesh,
-                PrepareModuleInputOutput(
-                    input_layouts=(sequence_shard, Replicate()),
-                    desired_input_layouts=(Replicate(), Replicate()),
-                    use_local_input=True,
-                    output_layouts=(Replicate(),),
-                    desired_output_layouts=(sequence_shard,),
-                    use_local_output=True,
-                ),
-            )
+            # Ids are global under TP: slice the hash windows to the local
+            # sequence range. No hidden-state gather is needed -- the table
+            # lookup dispatches keys over the table-sharding mesh instead.
+            tp_rank = tp_mesh.get_local_rank()
+            local_seq = training_seq_len // tp_mesh.size()
+            layer.engram._ids_window = (tp_rank * local_seq, (tp_rank + 1) * local_seq)
 
         parallelize_module(
             layer.moe,
@@ -513,6 +677,7 @@ def parallelize_ar_llm(
             model,
             tp_mesh,
             loss_parallel=not parallelism.disable_loss_parallel,
+            training_seq_len=training.seq_len,
         )
         maybe_enable_async_tp(parallelism, compile_config, tp_mesh)
 
@@ -520,9 +685,20 @@ def parallelize_ar_llm(
         model,
         parallel_dims=parallel_dims,
         parallelism=parallelism,
+        training_seq_len=training.seq_len,
     )
 
     _apply_moe_parallel(model, tp_mesh=tp_mesh, ep_mesh=ep_mesh)
+
+    # Engram tables shard over a compute-time-stable mesh dim: EP (expert
+    # treatment) when enabled, else TP; under pure DP/FSDP they stay FSDP
+    # sharded and lookups are local.
+    engram_mesh = ep_mesh if ep_mesh is not None else tp_mesh
+    _apply_engram_table_parallel(
+        model,
+        engram_mesh,
+        force_balance=model.model_args.debug_force_load_balance,
+    )
 
     if ac_config.mode != "none":
         apply_moe_ac(
@@ -541,12 +717,11 @@ def parallelize_ar_llm(
             ["dp_replicate", "efsdp"] if parallel_dims.dp_replicate_enabled else ["efsdp"]
         )
         edp_mesh = parallel_dims.get_optional_mesh(edp_mesh_names)
-        apply_fsdp(
+        _apply_ar_llm_fsdp(
             model,
             dp_mesh,
             param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
             reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
-            pp_enabled=False,
             cpu_offload=training.enable_cpu_offload,
             reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
             ep_degree=parallel_dims.ep,
