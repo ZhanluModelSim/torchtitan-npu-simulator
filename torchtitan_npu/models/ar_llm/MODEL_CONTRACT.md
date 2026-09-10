@@ -65,7 +65,9 @@
 ## 6. mHC / Engram / 其他
 
 - mHC：每层 2 个 HyperConnectionBlock（expand d→hc_mult·d → Sinkhorn(20) 混合 [hc,hc] → contract → 残差+post norm）；TP 下权重 Replicate、按 sequence-shard 本地计算；模拟器以融合 kernel 名记录。
-- Engram：10/20 个指定层；每层 = 多头多项式 rolling hash（n-gram orders [2,3]）→ `nn.Embedding(num_hash_heads × capacity, per_head_dim)` 查表 → context gate → memory proj + 深度可分离 Conv1d。hash 乘法在 int64 下允许回绕（仅影响 hash 分布）。Engram hash 表参与训练（可训练参数），必须进入 FSDP 分片与显存模型。TP 下 Engram 需要 n-gram 窗口与卷积 halo 的跨 rank 上下文：模块边界 all-gather 全序列、输出重新按 sequence shard。
+- Engram：10/20 个指定层；每层 = 多头多项式 rolling hash（n-gram orders [2,3]）→ `nn.Embedding(num_hash_heads × capacity, per_head_dim)` 查表 → context gate → memory proj + 深度可分离 Conv1d。hash 乘法在 int64 下允许回绕（仅影响 hash 分布）。Engram hash 表参与训练（可训练参数），必须进入 FSDP 分片与显存模型。
+- **Engram 部署（训练，按 Engram paper §2.5）**：hash 表按**桶维连续分片**（`Shard(0)`，owner = `bucket // E_local`）分布到 EP mesh（EP 开启时，与专家同待遇、计算期保持分片）或 TP mesh（无 EP 时）；前向 = 本地 hash → **All-to-All gather**（发 keys / 回 embedding 行，两次 a2a，autograd 自动完成反向 **All-to-All dispatch** 梯度）；模拟器强制负载均衡下 owner/splits 为形状纯函数（round-robin，meta 不读值）。TP/CP 下不再 all-gather hidden：hash 在全局 ids 上求值后按本地序列窗口切片（CP 下仅 all-gather 微量 int64 ids）；门控/卷积在本地 hidden 上计算；**短卷积的跨 rank halo 以零填充近似**（paper 消融显示 conv 贡献边际，随计算流对齐后置）。纯 DP/FSDP（无 EP/TP）时表退化为本地查表。
+- **计算流与 paper 的偏差（后置对齐，不影响部署方式）**：hash 函数（multiplicative-XOR vs 多项式 rolling）、mHC 分支特异 W_K^(m)/共享 W_V 门控、conv 的 SiLU 包裹结构。
 - KDA 双写门在框架模型中拆分为 `erase_gate`/`write_gate` 两个 head-major Linear（融合的 `[2, H, ds]` 输出在 TP colwise 下会切错维度）；参数量不变。
 - TP 下的 HCA indexer 保持 Replicate（输入本就是全序列，避免 indexer 分数 partial-sum 通信）；O 分组投影按 group 切分后以 all-gather 恢复 sequence shard。
 - 稳定性项：attn_sink（每 head 可学习 bias，仅 CSA/HCA）、attn softmax clamp=50、swiglu clamp=10。
@@ -115,14 +117,17 @@ Engram 每层: n_orders·nh·cap·(mem_dim/n_orders/nh) + 2·d·mem_dim
 
 ## 9. 模拟器建模契约（raw op 名）
 
-| 模型点 | 捕获 raw op | 说明 |
+**全部复用 DSV4（smla/mhc shim）与 kimi_k3（kda shim）已建模的真算子名与输入签名**，不引入自造名字：
+
+| 模型点 | 捕获 raw op | 签名约定（与 DSV4 对齐） |
 | --- | --- | --- |
-| KDA 核心 | `triton_ascend_kernels.chunk_kda` / `_grad` | 与 kimi_k3 生产 kernel 同族，shape-only shim |
-| CSA 核心 | `aclnn.npu_sparse_attn_sharedkv` / `_grad` | 窗口+压缩全局合一融合算子 |
-| HCA indexer | `aclnn.npu_lightning_indexer` | top-k 选择打分 |
-| HCA 核心 | `aclnn.npu_sparse_attn_sharedkv` / `_grad` | 选中 KV 的 attention |
-| mHC | `triton._triton_hc_prepost_fwd_kernel` 族 | 参照 deepseek_v4 mHC shim 命名 |
-| LatentMoE | `aten._grouped_mm.default` ×5 + `npu.npu_swiglu*` | 真实 meta kernel 执行即被捕获 |
+| CSA 核心 | `aclnn.npu_sparse_attn_sharedkv[_grad]` + `..._metadata` | 5 输入 `[query, ori_kv, sinks, metadata, cmp_kv]`（压缩 KV、无 topk 索引），输出 `[result, softmax_lse]`；ori_kv/cmp_kv 按 DSV4 布局打包 K/V（dim-2=2） |
+| HCA 核心 | 同上 | 6 输入 `[..., cmp_kv, cmp_sparse_indices]`（topk 索引变体）；**按输入 tensor 个数区分 CSA/HCA** |
+| HCA indexer | `aclnn.npu_lightning_indexer` | `[query, key, weights]` → `[sparse_indices(int32), sparse_values]`；**无反向算子**（DSV4 非 A5 行为） |
+| indexer 梯度 | `aclnn.npu_sparse_lightning_indexer_grad_kl_loss` | 反向记录，`[query, key, query_index, key_index, weights, sparse_indices]` → `[d_query_index, d_key_index, d_weights, loss]` |
+| KDA 核心 | `triton_ascend_kernels.chunk_kda` / `_grad` | kimi_k3 同族；ar_llm 双门变体传 `alpha/beta_erase/beta_write` |
+| mHC | `triton._triton_hc_sinkhorn_comb_fwd/bwd_kernel` + `triton.hc_pre_bmm_forward/backward` | Sinkhorn comb 与通道混合 bmm 分别复用 DSV4 核名；rms_norm/matmul 步骤走 SimRMSNorm converter 与真实 meta matmul |
+| LatentMoE | `aten._grouped_mm.default` ×6/层 + swiglu | 真实 meta kernel 执行即被捕获 |
 | Engram / router / hash | aten 原生算子 | 生产形态即 embedding gather + 小算子，不合成融合名 |
 
 shape-only shim 在模型构造与并行化完成后绑定（`apply_ar_llm_shims`），保持 FQN、DTensor placement 与既有 hook 不变。
