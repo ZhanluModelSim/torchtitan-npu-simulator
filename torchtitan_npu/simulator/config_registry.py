@@ -243,3 +243,74 @@ def ar_llm_100t() -> ArLlmSimulationTrainerConfig:
         _ar_llm_configs.ar_llm_100t,
         output_name="ar_llm_100t",
     )
+
+
+# ---------------------------------------------------------------------------
+# glm5_next (GLM-5.3-Flash) simulator configs
+# ---------------------------------------------------------------------------
+
+from torchtitan_npu.models.glm5_next import config_registry as _glm5_next_configs  # noqa: E402
+from torchtitan_npu.models.glm5_next.config_overrides import (  # noqa: E402
+    Glm5NextModelOverrides,
+    apply_model_overrides as apply_glm5_next_model_overrides,
+)
+
+
+@dataclasses.dataclass(kw_only=True, slots=True)
+class Glm5NextSimulationTrainerConfig(SimulationTrainerConfig):
+    """glm5_next simulator config with stable model CLI overrides."""
+
+    model_overrides: Glm5NextModelOverrides = dataclasses.field(
+        default_factory=Glm5NextModelOverrides
+    )
+
+    def __post_init__(self) -> None:
+        self.model_spec = apply_glm5_next_model_overrides(
+            self.model_spec,
+            self.model_overrides,
+        )
+
+
+def _glm5_next_simulation_config(
+    factory: Callable[[], TrainerConfig],
+    *,
+    output_name: str,
+) -> Glm5NextSimulationTrainerConfig:
+    base_config = factory()
+    base_fields = {
+        field.name: getattr(base_config, field.name)
+        for field in dataclasses.fields(base_config)
+    }
+    base_fields["compile"] = dataclasses.replace(base_config.compile, enable=False)
+    return Glm5NextSimulationTrainerConfig(
+        **base_fields,
+        simulation=SimulationConfig(output_dir=f"./simulator_output/{output_name}"),
+    )
+
+
+def glm5_next_debug() -> Glm5NextSimulationTrainerConfig:
+    return _glm5_next_simulation_config(
+        _glm5_next_configs.glm5_next_debug,
+        output_name="glm5_next_debug",
+    )
+
+
+def glm5_next_reduced() -> Glm5NextSimulationTrainerConfig:
+    return _glm5_next_simulation_config(
+        _glm5_next_configs.glm5_next_reduced,
+        output_name="glm5_next_reduced",
+    )
+
+
+def glm5_next_full() -> Glm5NextSimulationTrainerConfig:
+    return _glm5_next_simulation_config(
+        _glm5_next_configs.glm5_next_full,
+        output_name="glm5_next_full",
+    )
+
+
+def glm5_next_debug_mm() -> Glm5NextSimulationTrainerConfig:
+    return _glm5_next_simulation_config(
+        _glm5_next_configs.glm5_next_debug_mm,
+        output_name="glm5_next_debug_mm",
+    )
