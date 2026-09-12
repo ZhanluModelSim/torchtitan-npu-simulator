@@ -69,6 +69,30 @@ class TestModelRegistry:
         with pytest.raises(ValueError, match="loop_train_steps"):
             validate_model_overrides(overrides)
 
+    def test_mxfp8_fqn_targets_match_module_paths(self):
+        """Substring FQN list must hit exactly the intended Linear/3D-param
+        modules and never the router, dense MLP, embeddings or vision."""
+        from torchtitan_npu.models.glm5_next.config_registry import _GLM5_NEXT_MXFP8_FQNS
+
+        config = glm5_next_configs["reduced"]()
+        model = Glm5NextModel(config)
+        fqn_to_module = dict(model.named_modules())
+
+        hit = {
+            fqn
+            for fqn, mod in fqn_to_module.items()
+            if any(t in fqn for t in _GLM5_NEXT_MXFP8_FQNS)
+            and (isinstance(mod, torch.nn.Linear) or isinstance(mod, torch.nn.Parameter))
+        }
+        # every targeted fqn lives under an attention or moe module
+        assert hit, "no modules matched"
+        assert all((".attention." in fqn or ".moe." in fqn) for fqn in hit), sorted(hit)
+        # router / dense mlp / output / vision must never match
+        for fqn in hit:
+            assert ".mlp." not in fqn, fqn
+            assert not fqn.startswith("visual."), fqn
+            assert fqn != "output", fqn
+
     def test_non_shared_loop_fails_fast(self):
         config = glm5_next_configs["debug"]()
         config.share_loop_weights = False

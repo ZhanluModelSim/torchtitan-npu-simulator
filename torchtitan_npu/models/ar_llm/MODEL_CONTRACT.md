@@ -113,7 +113,8 @@ Engram 每层: n_orders·nh·cap·(mem_dim/n_orders/nh) + 2·d·mem_dim
 | ETP（EP+ETP 组合） | 首版不支持，fail fast |
 | PP | 首版不支持（MoR 跨 stage cache 契约未定），fail fast |
 | AC none/full/selective | 支持（复用 `apply_moe_ac`） |
-| compile / offload / MTP / MXFP8 | 首版不支持，fail fast 或显式关闭 |
+| MXFP8 | 支持（`ar_llm_debug_mxfp8` / `ar_llm_reduced_mxfp8`；`--mxfp8-fqns` 逗号分隔自定义覆盖，fqn 子串匹配） |
+| compile / offload / MTP | 首版不支持，fail fast 或显式关闭 |
 
 ## 9. 模拟器建模契约（raw op 名）
 
@@ -121,10 +122,10 @@ Engram 每层: n_orders·nh·cap·(mem_dim/n_orders/nh) + 2·d·mem_dim
 
 | 模型点 | 捕获 raw op | 签名约定（与 DSV4 对齐） |
 | --- | --- | --- |
-| CSA 核心 | `aclnn.npu_sparse_attn_sharedkv[_grad]` + `..._metadata` | 5 输入 `[query, ori_kv, sinks, metadata, cmp_kv]`（压缩 KV、无 topk 索引），输出 `[result, softmax_lse]`；ori_kv/cmp_kv 按 DSV4 布局打包 K/V（dim-2=2） |
-| HCA 核心 | 同上 | 6 输入 `[..., cmp_kv, cmp_sparse_indices]`（topk 索引变体）；**按输入 tensor 个数区分 CSA/HCA** |
-| HCA indexer | `aclnn.npu_lightning_indexer` | `[query, key, weights]` → `[sparse_indices(int32), sparse_values]`；**无反向算子**（DSV4 非 A5 行为） |
-| indexer 梯度 | `aclnn.npu_sparse_lightning_indexer_grad_kl_loss` | 反向记录，`[query, key, query_index, key_index, weights, sparse_indices]` → `[d_query_index, d_key_index, d_weights, loss]` |
+| CSA 核心 | `aclnn.npu_sparse_attn_sharedkv[_grad]` + `..._metadata` | 5 输入 `[query, ori_kv, sinks, metadata, cmp_kv]`（压缩 KV、无 topk 索引），输出 `[result, softmax_lse]`；**ori_kv/cmp_kv 为 4-D `[B, T, 1, kv_dim]`**（DSV4 的 head-collapsed shared-KV 约定，dim1=kv_seq_len；ar_llm 的 per-head K/V 展平进 kv_dim = nh×(k_dim+v_dim)，诚实反映每 token KV 带宽） |
+| HCA 核心 | 同上 | 6 输入 `[..., cmp_kv, cmp_sparse_indices]`（topk 索引变体）；**按输入 tensor 个数区分 CSA/HCA**，indices `[B,S,1,K]` |
+| HCA indexer | `aclnn.npu_lightning_indexer` | `[query_idx [B,S,1,D_idx], key_idx [B,S2,1,D_idx], weights [B,S,1]]` → `[sparse_indices(int32), sparse_values]`；**无反向算子**（DSV4 非 A5 行为）；ar_llm 的 indexer 为单 dot-product 头（N_idx=1，D_idx=idx_dim） |
+| indexer 梯度 | `aclnn.npu_sparse_lightning_indexer_grad_kl_loss` | 反向记录，6 输入 `[query [B,S1,N,D], key [B,S2,1,D], query_idx [B,S1,1,D_idx], key_idx [B,S2,1,D_idx], weights [B,S1,1], sparse_indices [B,S1,1,topK]]` → `[d_query_idx, d_key_idx, d_weights, loss]`；softmax_max/sum 不记（解析器 len<7 默认分支） |
 | KDA 核心 | `triton_ascend_kernels.chunk_kda` / `_grad` | kimi_k3 同族；ar_llm 双门变体传 `alpha/beta_erase/beta_write` |
 | mHC | `triton._triton_hc_sinkhorn_comb_fwd/bwd_kernel` + `triton.hc_pre_bmm_forward/backward` | Sinkhorn comb 与通道混合 bmm 分别复用 DSV4 核名；rms_norm/matmul 步骤走 SimRMSNorm converter 与真实 meta matmul |
 | LatentMoE | `aten._grouped_mm.default` ×6/层 + swiglu | 真实 meta kernel 执行即被捕获 |
@@ -132,13 +133,21 @@ Engram 每层: n_orders·nh·cap·(mem_dim/n_orders/nh) + 2·d·mem_dim
 
 shape-only shim 在模型构造与并行化完成后绑定（`apply_ar_llm_shims`），保持 FQN、DTensor placement 与既有 hook 不变。
 
+### 9.1 MXFP8 量化建模
+
+- 机制：`MXFP8Converter`（torchao）按 **module fqn 子串匹配**包装目标模块下的 `nn.Linear` 权重与 3D `nn.Parameter` 为 `MXFP8TrainingWeightWrapperTensor`；wrapper 只拦截 `linear/mm/matmul/addmm/_grouped_mm`，故命中模块的矩阵乘真实派发为 `npu.npu_dynamic_mx_quant ×2 + npu.npu_quant_matmul`（Linear 的 F/dx/dw）或 `npu.npu_grouped_dynamic_mx_quant + npu.npu_grouped_matmul`（routed experts 的 `_grouped_mm`），meta kernel 直接执行并进入算子/内存/依赖账本。
+- 默认范围（`DEFAULT_MXFP8_FQNS`）：`moe.experts`、`moe.shared_experts`、`attention.q_proj`、`attention.kv_proj`、`attention.core`（indexer）、`attention.kda`。CSA/HCA 的 fused core 本身仍走 shape-only shim，不受影响。
+- **einsum 覆盖**：wrapper 原生不拦截 einsum。`patches/torchao_npu/mxfp8_wrapper_einsum.py` 将「单个 3D `[n,out,in]` 包装权重、逐 expert 线性形（`A @ W[i].t()`）」的 einsum 降级为 `n` 次 `NpuMXFP8MM` 后 stack——`moe.shared_experts` 的 6 个投影由此全部走 FP8；`attention.o_proj`（GroupedOProjection，einsum 含交叉维度重排）不匹配该模式，保持 BF16 回退（显式排除于默认清单）。
+- 内存口径：wrapper 保留 fp32 主权重（FP8 副本为瞬态），`persistent_param_bytes` 不变；激活侧新增量化 scale/FP8 输入的瞬态占用。
+- CLI：`--mxfp8-fqns "moe.experts,moe.shared_experts"`（逗号分隔）整体替换默认清单；要求 config 恰含一个 MXFP8 converter，否则报错。
+
 ## 10. 首版实现状态
 
 - 已落地：`torchtitan_npu/models/ar_llm/`（model/attention/feed_forward/parallelize/state_dict_adapter/config_overrides/config_registry），`--module ar_llm` 注册，flavors：`debug`（1 个 6 层单元，全路径覆盖）/`reduced`（2 个单元）/`50t`/`100t`（正式规格，仅 meta）。
 - 训练配置工厂：`ar_llm_debug / ar_llm_reduced / ar_llm_50t / ar_llm_100t`；模拟器配置：`torchtitan_npu/simulator/config_registry.py` 同名包装。
 - 模拟器 shim：`torchtitan_npu/simulator/hardware_shims/ar_llm_shim.py`（KDA/CSA/HCA/mHC 融合算子 shape-only 记录）；LatentMoE GMM 走真实 `aten._grouped_mm` meta kernel 捕获。
 - 已知首版限制（验收口径为 Conditionally ready 的声明范围）：
-  - CP/PP/ETP/DeepEP/compile/MXFP8 fail fast（错误信息指向本契约）。
+  - CP/PP/ETP/DeepEP/compile fail fast（错误信息指向本契约）；MXFP8 已支持（§9.1）。
   - KDA 真实融合 kernel 未接入（顺序参考实现仅 debug 规格可负担）；模拟器/大规模验证依赖 shim。
   - MoR 训练态不建模 KV 复用（见第 4 节）。
   - `ExpertParallel` 分区假设上游通过 `self._partition_fn` 分发，`parallelize` 内有 DTensor 校验 fail-fast 兜底。

@@ -324,31 +324,57 @@ class GlmDsaIndexer(nn.Module):
         for param in self.parameters():
             param.requires_grad_(False)
 
+    def project_pool_keys(
+        self,
+        hidden_states: torch.Tensor,
+        q_resid: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Real indexer projections + k-pool compression.
+
+        Returns the operands of the fused selection op
+        (``npu_lightning_indexer``): ``query_idx [B, S, nh, hd]``,
+        ``key_idx [B, pools, 1, hd]`` (head-folded pooled key) and
+        ``weights [B, S, nh]``.
+
+        Shared by the sequential reference path (:meth:`forward`) and the
+        simulator shim so both capture the same real ops -- mirroring DSv4's
+        ``Indexer`` -> ``LiCompute`` split (MODEL_CONTRACT.md section 11).
+        """
+        b, s, _ = hidden_states.shape
+        hd, nh = self.head_dim, self.n_heads
+        pools = s // self.kpool
+
+        query_idx = self.wq_b(q_resid).view(b, s, nh, hd)
+        k = self.k_norm(self.wk(hidden_states))  # [B, S, hd]
+        gate_scores = F.linear(hidden_states, _local(self.kpool_gate))  # [B, S, hd]
+
+        # Pool compression: learn a weighted average over each complete pool.
+        keys_r = k.view(b, pools, self.kpool, hd)
+        logits = (
+            gate_scores.view(b, pools, self.kpool, hd).float()
+            + _local(self.kpool_ape).float()[None, None]
+        ).to(keys_r.dtype)
+        probabilities = logits.softmax(dim=2)
+        pool_keys = (probabilities * keys_r).sum(dim=2)  # [B, P, hd]
+        weights = self.weights_proj(hidden_states)  # [B, S, nh]
+        return query_idx, pool_keys.unsqueeze(2), weights
+
     def forward(self, hidden_states: torch.Tensor, q_resid: torch.Tensor) -> torch.Tensor:
         """Return int64 top-k token indices ``[B, S, K]``; -1 marks invalid."""
         b, s, _ = hidden_states.shape
-        hd, nh = self.head_dim, self.n_heads
+        nh = self.n_heads
         if s % self.kpool != 0:
             raise ValueError(
                 f"DSA indexer requires seq_len={s} divisible by index_kpool={self.kpool}"
             )
         pools = s // self.kpool
 
-        q = self.wq_b(q_resid).view(b, s, nh, hd)
-        k = self.k_norm(self.wk(hidden_states))  # [B, S, hd]
-        gate_scores = F.linear(hidden_states, _local(self.kpool_gate))  # [B, S, hd]
-
-        # Pool compression: learn a weighted average over each complete pool.
-        keys_r = k.view(b, pools, self.kpool, hd)
-        logits = (gate_scores.view(b, pools, self.kpool, hd).float() + _local(self.kpool_ape).float()[None, None]).to(
-            keys_r.dtype
-        )
-        probabilities = logits.softmax(dim=2)
-        pool_keys = (probabilities * keys_r).sum(dim=2)  # [B, P, hd]
+        q, key_idx, raw_weights = self.project_pool_keys(hidden_states, q_resid)
+        pool_keys = key_idx.squeeze(2)  # [B, P, hd]
 
         scores = torch.matmul(q.float(), pool_keys.float().transpose(-1, -2).unsqueeze(1))  # [B, nh, S, P]
         scores = F.relu(scores * self.softmax_scale)
-        weights = self.weights_proj(hidden_states).float() * (nh**-0.5)  # [B, S, nh]
+        weights = raw_weights.float() * (nh**-0.5)  # [B, S, nh]
         index_scores = torch.matmul(weights.unsqueeze(-2), scores).squeeze(-2)  # [B, S, P]
 
         # Causality: a pool is selectable only if its last token <= query pos.

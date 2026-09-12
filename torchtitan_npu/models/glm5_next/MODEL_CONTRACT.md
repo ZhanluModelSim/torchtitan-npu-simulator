@@ -7,7 +7,7 @@
 
 - 参考实现自带 `config.json` 与 `model.py`（纯 HF 风格，依赖 transformers 内部模块），无独立权重文件、无 tokenizer；以随机初始化 + state-dict schema 闭环为 meta 验收目标。
 - 训练/模拟 tokenizer 复用 `./tests/assets/tokenizer/deepseekv3_tokenizer`（c4_test 通道）；多模态数据通道复用 `cc12m-test`（NLD collator：`pixel_values [N, L, D_patch]`、`grid_thw [N, L, 3]`）。
-- `quantization_config`（fp8 e4m3, block 128×128, activation dynamic）是 **checkpoint 存储格式**，v1 不参与显存/参数建模（与 deepseek_v4/kimi_k3 的 MXFP8 口径一致：计算侧量化不改变参数 storage dtype）。若需 checkpoint 忠实字节数，另行扩展 per-FQN storage dtype。
+- `quantization_config`（fp8 e4m3, block 128×128, activation dynamic）是 **checkpoint 存储格式**，不参与显存/参数建模（MXFP8 口径：计算侧量化不改变参数 storage dtype）。**计算侧量化**：`MXFP8Converter`（mxfp8_rceil）作用于 attention/MoE 矩阵乘（FQN 见下），与 DSv4/K3 同机制；router gate、前 4 层 dense MLP、embedding/lm_head、vision tower 保持高精度。能力门（`has_mx_capability` 要求 A5）在模拟器下由 `meta_env` 的 meta-safe 补丁放行（非 A5 宿主机可跑 mxfp8 meta 模拟），真机训练仍由原门把关 Ascend950；capture 中量化路径记录 `npu.npu_dynamic_mx_quant`、`npu.npu_quant_matmul`、`npu.npu_grouped_matmul`（MoE grouped 替换 `aten._grouped_mm`）。
 
 ## 2. 网络结构（名义 96 层 → 框架 41 个唯一 block）
 
@@ -38,7 +38,7 @@ config `loop_config`：`looped_layer_start=16, end=71, num_looped_layers=56, sha
 - 投影：`q/k/v_proj: d→192·128`；**fused qkv 短卷积**：单条 depthwise `Conv1d(3·qkv_dim, kernel=4, groups=3·qkv_dim)` + silu（kimi_k3 为 3 条独立 ShortConv，本模型为 1 条 fused，契约按 1 条）。
 - Forget gate（低秩 + lower bound）：`f_a_proj d→128` → `f_b_proj 128→qkv_dim`；`g = lower_bound·sigmoid(exp(A_log)·(f_b(f_a(x)) + dt_bias))`，`lower_bound=-5.0`，`A_log/dt_bias` fp32。
 - Beta：`b_proj d→192`，sigmoid。输出门（低秩）：`g_a d→128` → `g_b 128→qkv_dim`；输出 `RMSNormGated(head_dim=128)`（sigmoid 门控）→ `o_proj qkv_dim→d`。
-- 核心 kernel：`chunk_kda`（chunk 64，`use_qk_l2norm_in_kernel=true`，g 为**预计算值**传入 kernel，即 `use_gate_in_kernel=false` 语义；A_log/dt_bias/lower_bound 在 gate 模块内完成）。生产 op 名 `triton_ascend_kernels.chunk_kda[_grad]`；框架提供逐 token 顺序参考实现（仅 debug 可负担），模拟器以 shape-only shim 记录。
+- 核心 kernel：`chunk_kda`（chunk 64，`use_qk_l2norm_in_kernel=true`，g 为**预计算值**传入 kernel，即 `use_gate_in_kernel=false` 语义；A_log/dt_bias/lower_bound 在 gate 模块内完成）。生产路径按 kimi_k3 同一 seam 接入：`_chunk_kda` 懒加载 `triton_ascend_kernels.attention.fla.kda.chunk.chunk_kda` 并以预计算 g 调用（`use_gate_in_kernel=false, safe_gate=false`）；包缺失时（CPU/debug 环境）回退到逐 token 顺序参考实现并告警一次（数学精确，非性能等价）。模拟器由 `apply_glm5_next_shims` 将同一 seam 替换为 shape-only shim 记录 `triton_ascend_kernels.chunk_kda[_grad]`（shim 单测 + 端到端 capture 验证）。
 - 状态语义：训练态无 cache（与 kimi_k3 相同）；`initial_state=None, output_final_state=False`。
 
 ### 4.2 DSA 稀疏全注意力（24/96 名义层；框架：pre 4 + post 6 = 10 个唯一 block）
@@ -152,24 +152,37 @@ backward 次数按 autograd 规则对称；AC full 时 recompute 段整体翻倍
 | CP | 支持（kimi_k3/ar_llm 保守 all-gather 方案，仅无 TP 组合） |
 | PP | v1 fail fast（loop 区 + hc_head 跨 stage 契约未定义） |
 | AC none/full/selective | 支持（复用 apply_moe_ac；loop block 执行 T 次，AC 包裹每次迭代） |
-| compile / offload / MTP / MXFP8 / video 通路 / 非均匀 vision 网格 | v1 fail fast 或显式关闭 |
+| MXFP8（attention/MoE 矩阵乘计算侧量化） | 支持（`glm5_next_debug_mxfp8` / `glm5_next_reduced_mxfp8` flavor；CLI `--mxfp8-fqns` 覆盖） |
+| compile / offload / MTP / video 通路 / 非均匀 vision 网格 | v1 fail fast 或显式关闭 |
 | halting / kv_mirror | 不支持（见 §3），fail fast |
 
 ## 11. 模拟器建模契约（raw op 名）
 
 | 模型点 | 捕获 raw op | 说明 |
 | --- | --- | --- |
-| KDA conv1d | `triton_ascend_kernels.causal_conv1d[_grad]`（fused qkv 单条） | shape-only shim |
-| KDA 核心 | `triton_ascend_kernels.chunk_kda[_grad]` | 与 kimi_k3 同族，shape-only shim |
-| DSA indexer 选择 | `aclnn.npu_lightning_indexer[_grad]` | pool 打分 + topk 汇总 shim |
-| DSA 核心 | `aclnn.npu_sparse_attn_sharedkv[_grad]` | gather 稀疏 attention shim |
+| KDA conv1d | `aten.convolution.default` / `aten.convolution_backward.default` | **不 shim**：与 kimi_k3 的 `ShortConvolution` 一致，fused qkv 单条 depthwise conv 走真实 aten 算子（`causal_conv1d` 不在已建模算子集合内，参考文档 §0.1 禁止自造名） |
+| KDA 核心 | `triton_ascend_kernels.chunk_kda`（5 进 1 出）/ `chunk_kda_grad`（**6 进 `[q,k,v,g,beta,do]` 5 出同形梯度**） | 与 kimi_k3 同族；接口对齐 `hardware_shims/OP_INTERFACE_REFERENCE.md` §1 |
+| DSA indexer 选择 | `aclnn.npu_lightning_indexer`（**3 进 `[query_idx 4D, key_idx 4D, weights 3D]` → 2 出 `[sparse_indices 4D int32, sparse_values]`**；无反向算子，indexer 冻结） | pool 打分 + topk 汇总；K=有效 topk（pool 级 `min(topk//kpool, cl)`）；接口对齐 §3 |
+| DSA 核心 | `aclnn.npu_sparse_attn_sharedkv_metadata`（先行）+ **6 输入主 op** `[query, ori_kv, sinks, metadata, cmp_kv, cmp_sparse_indices]` → `[result, softmax_lse]`；grad **7 进 → 4 出 `[d_query, d_ori_kv, d_sinks, d_cmp_kv]`** | 接口对齐 §2；ori_kv 头折叠 per-head KV 约定 `nh×(k_dim+v_dim)`；sinks 记 `zeros[N]` f32 占位；ratio=1 时 cmp_kv 镜像 ori_kv 以携带 topk 索引 |
 | mHC pre/post | DSv4 `npu_mhc_pre/post` shim（isinstance 复用） | 直接生效 |
 | MoE 路由/GMM | aten 原生（router/topk/`_grouped_mm`） | 不合成融合名 |
 | clamp-swiglu / RMSNormGated | aten 原生（v1） | 生产融合 converter 列后续项 |
 
 shim 在模型构造 + 并行化完成后绑定（`apply_glm5_next_shims`），保持 FQN/DTensor/hook 不变。
 
-## 12. 已知首版限制（Conditionally ready 声明范围）
+## 12. MXFP8 FQN 清单（config_registry `_GLM5_NEXT_MXFP8_FQNS`，子串匹配）
+
+```
+attention.q_proj / k_proj / v_proj / o_proj            # KDA
+attention.q_a_proj / q_b_proj / kv_a_proj_with_mqa / kv_b_proj / o_proj   # DSA（NoPE MLA）
+attention.indexer.wq_b / weights_proj                  # DSA indexer
+moe.experts                                            # routed experts（3D w1/w2/w3）
+moe.shared_experts                                     # shared expert MLP
+```
+
+排除项（高精度）：`moe.gate`（router）、`layers.*.mlp`（前 4 层 dense）、`tok_embeddings`/`output`、`visual.*`、KDA 门控（f_a/f_b/g_a/g_b/b_proj）与 conv1d。vision tower 的 nn.Linear 已统一为 torchtitan `Linear` 以满足 `verify_module_protocol`。
+
+## 13. 已知首版限制（Conditionally ready 声明范围）
 
 - loop 语义按 §3 固定步数共享块建模；halting/动态深度/kv_mirror 不建模。
 - DSA 走 gather 精确稀疏路径；生产 fused kernel 未接入（模拟器经 shim 记录融合名）。

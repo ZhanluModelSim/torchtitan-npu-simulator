@@ -36,6 +36,7 @@ from torchtitan_npu.simulator.hardware_shims.glm5_next_shim import apply_glm5_ne
 from torchtitan_npu.simulator.hardware_shims.kda_converter import (
     apply_kimi_k3_shims,
 )
+from torchtitan_npu.simulator.hardware_shims.mm_gc_shim import apply_mm_gc_shims
 from torchtitan_npu.simulator.hardware_shims.mhc_converter import apply_mhc_shims
 from torchtitan_npu.simulator.hardware_shims.moe_dispatch_shim import (
     fp8_dispatch_transport_context,
@@ -563,6 +564,7 @@ class SimulationTrainer(Trainer):
             apply_kimi_k3_shims(model_part)
             apply_ar_llm_shims(model_part)
             apply_glm5_next_shims(model_part)
+            apply_mm_gc_shims(model_part)
         self.simulation_config = config.simulation
         self.workload_graph: WorkloadGraph | None = None
 
