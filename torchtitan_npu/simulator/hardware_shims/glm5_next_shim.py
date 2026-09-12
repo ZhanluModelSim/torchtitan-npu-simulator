@@ -10,10 +10,11 @@ analytically-correct shapes. The op interfaces follow
 ``hardware_shims/OP_INTERFACE_REFERENCE.md`` (the contract the downstream
 cost model parses):
 
-- KDA fused qkv conv:    ``triton_ascend_kernels.causal_conv1d[_grad]``
 - KDA core:              ``triton_ascend_kernels.chunk_kda`` (fwd 5 inputs)
                          ``triton_ascend_kernels.chunk_kda_grad`` (bwd inputs
                          ``[q, k, v, g, beta, grad_output]``, 5 same-shape grads)
+                         (the fused qkv short conv stays a real aten conv1d,
+                         same as kimi_k3 -- no causal_conv1d op is modeled)
 - DSA indexer selection: ``aclnn.npu_lightning_indexer``
                          inputs ``[query_idx [B,S,N_idx,D_idx],
                          key_idx [B,cl,1,D_idx], weights [B,S,N_idx]]`` ->
@@ -42,7 +43,7 @@ from types import MethodType
 import torch
 from torch.distributed.tensor import DTensor
 
-from torchtitan_npu.models.glm5_next.attention import GlmDeltaAttention, GlmDsaAttention, ShortConv1d
+from torchtitan_npu.models.glm5_next.attention import GlmDeltaAttention, GlmDsaAttention
 from torchtitan_npu.simulator.capture.dispatch_capture import get_active_capture
 from torchtitan_npu.simulator.hardware_shims.kda_shim import (
     _current_module_path,
@@ -51,7 +52,6 @@ from torchtitan_npu.simulator.hardware_shims.kda_shim import (
 )
 
 _KDA_SHIM_MARKER = "_simulator_glm5_next_kda_shim_installed"
-_CONV_SHIM_MARKER = "_simulator_glm5_next_conv_shim_installed"
 _DSA_SHIM_MARKER = "_simulator_glm5_next_dsa_shim_installed"
 
 
@@ -103,43 +103,6 @@ class _SimChunkKDAFn(torch.autograd.Function):
 
 def _sim_chunk_kda(module, q, k, v, g, beta):  # noqa: ANN001
     return _SimChunkKDAFn.apply(q, k, v, g, beta, _current_module_path())
-
-
-class _SimCausalConv1dFn(torch.autograd.Function):
-    """Shape-only bridge for the fused depthwise qkv short conv."""
-
-    @staticmethod
-    def forward(ctx, x, weight, module_path):  # noqa: ANN001
-        output = _uncaptured_empty_like(x)
-        _record(
-            "triton_ascend_kernels.causal_conv1d",
-            [x, weight],
-            [output],
-            module_path,
-        )
-        ctx.save_for_backward(x, weight)
-        ctx.module_path = module_path
-        return output
-
-    @staticmethod
-    def backward(ctx, grad_output):  # noqa: ANN001
-        x, weight = ctx.saved_tensors
-        grads = [_uncaptured_empty_like(t) for t in (x, weight)]
-        _record(
-            "triton_ascend_kernels.causal_conv1d_grad",
-            [grad_output],
-            grads,
-            ctx.module_path,
-        )
-        return (*grads, None)
-
-
-def _sim_short_conv_forward(self, x: torch.Tensor) -> torch.Tensor:
-    weight = _local(self.conv.weight)
-    if self._local_channels is not None:
-        lc = self._local_channels
-        weight = torch.cat([weight[s : s + lc] for s in self._channel_starts], dim=0)
-    return _SimCausalConv1dFn.apply(x, weight, _current_module_path())
 
 
 class _SimDsaIndexerFn(torch.autograd.Function):
@@ -260,16 +223,18 @@ def _sim_dsa_forward(self, hidden_states, attention_masks=None, positions=None):
 
 
 def apply_glm5_next_shims(model) -> None:
-    """Bind glm5_next shape-only shims while preserving module hooks."""
+    """Bind glm5_next shape-only shims while preserving module hooks.
+
+    The fused qkv short conv is intentionally NOT shimmed: like kimi_k3's
+    ``ShortConvolution`` it stays a real depthwise ``F.conv1d`` and is
+    captured as ``aten.convolution.default`` (no ``causal_conv1d`` fused op
+    exists in the modeled op set).
+    """
     for module in model.modules():
         if isinstance(module, GlmDeltaAttention):
             if not getattr(module, _KDA_SHIM_MARKER, False):
                 module._chunk_kda = MethodType(_sim_chunk_kda, module)
                 setattr(module, _KDA_SHIM_MARKER, True)
-        elif isinstance(module, ShortConv1d):
-            if not getattr(module, _CONV_SHIM_MARKER, False):
-                module.forward = MethodType(_sim_short_conv_forward, module)
-                setattr(module, _CONV_SHIM_MARKER, True)
         elif isinstance(module, GlmDsaAttention):
             if not getattr(module, _DSA_SHIM_MARKER, False):
                 module.forward = MethodType(_sim_dsa_forward, module)

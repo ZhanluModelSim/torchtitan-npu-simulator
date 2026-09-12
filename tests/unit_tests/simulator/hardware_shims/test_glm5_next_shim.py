@@ -12,7 +12,7 @@ and forward/backward must record the real production op names
 
 import torch
 
-from torchtitan_npu.models.glm5_next.attention import GlmDeltaAttention, GlmDsaAttention, ShortConv1d
+from torchtitan_npu.models.glm5_next.attention import GlmDeltaAttention, GlmDsaAttention
 from torchtitan_npu.simulator.capture.dispatch_capture import OpDispatchCapture
 from torchtitan_npu.simulator.hardware_shims.glm5_next_shim import apply_glm5_next_shims
 
@@ -53,7 +53,8 @@ def test_kda_binding_preserves_module_identity_and_hooks():
     assert id(attention) == module_id
     assert set(attention._forward_hooks) == hook_ids
     assert attention._simulator_glm5_next_kda_shim_installed is True
-    assert attention.conv1d._simulator_glm5_next_conv_shim_installed is True
+    # The qkv short conv is intentionally NOT shimmed (kimi_k3 parity).
+    assert not hasattr(attention.conv1d, "_simulator_glm5_next_conv_shim_installed")
     hook.remove()
 
 
@@ -67,8 +68,11 @@ def test_kda_records_chunk_kda_and_conv_fused_ops():
     raw_names = [node.annotations["raw_op_type"] for node in nodes]
     assert raw_names.count("triton_ascend_kernels.chunk_kda") == 1
     assert raw_names.count("triton_ascend_kernels.chunk_kda_grad") == 1
-    assert raw_names.count("triton_ascend_kernels.causal_conv1d") == 1
-    assert raw_names.count("triton_ascend_kernels.causal_conv1d_grad") == 1
+    # The qkv short conv stays a real aten conv (kimi_k3 parity): no
+    # invented causal_conv1d fused op may appear.
+    assert raw_names.count("aten.convolution.default") == 1
+    assert raw_names.count("aten.convolution_backward.default") == 1
+    assert not any("causal_conv1d" in n for n in raw_names)
     # chunk_kda_grad cost-model interface: [q, k, v, g, beta, do]
     grad = next(n for n in nodes if n.annotations["raw_op_type"] == "triton_ascend_kernels.chunk_kda_grad")
     grad_in = [t.shape for t in grad.inputs]
@@ -143,7 +147,9 @@ def test_dsa_records_indexer_and_sparse_attn_fused_ops():
     assert len(grad_out) == 4  # d_query, d_ori_kv, d_sinks, d_cmp_kv
 
 
-def test_conv_shim_respects_tp_local_slice():
+def test_conv_is_not_shimmed_and_tp_slice_still_applies():
+    from torchtitan_npu.models.glm5_next.attention import ShortConv1d
+
     conv = ShortConv1d(24, kernel_size=4).to("meta")
     # Simulate the TP partition state: three contiguous slices of the global
     # channels (q/k/v), 8 local channels each.
@@ -156,5 +162,6 @@ def test_conv_shim_respects_tp_local_slice():
     with capture:
         output = conv(x)
     raw_names = [node.annotations["raw_op_type"] for node in capture.build_nodes().values()]
-    assert raw_names.count("triton_ascend_kernels.causal_conv1d") == 1
+    assert raw_names.count("aten.convolution.default") == 1
+    assert not any("causal_conv1d" in n for n in raw_names)
     assert output.shape == x.shape
