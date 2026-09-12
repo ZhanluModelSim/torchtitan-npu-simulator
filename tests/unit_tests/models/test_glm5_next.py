@@ -161,7 +161,9 @@ class TestForwardPass:
         merged_per_image = (merged_per_image) ** 2
         patch_len = (vision.image_size // vision.patch_size) ** 2
 
-        tokens = torch.randint(0, text.vocab_size, (1, 64))
+        # Draw regular tokens above the special-token ids (100/101) so the
+        # random fill cannot collide with the image/video markers.
+        tokens = torch.randint(102, text.vocab_size, (1, 64))
         image_id = model.config.image_token_id
         tokens[0, 10 : 10 + num_images * merged_per_image] = image_id
         pixel_values = torch.randn(num_images, patch_len, vision.in_channels * vision.patch_size**2)
