@@ -30,8 +30,10 @@
 | 10 | 核心组合 FSDP+TP+EP | world=4, tp=2, ep=2 | full | PASS | `glm5_next_ev_reduced_combo` |
 | 11 | 多模态通路（vision 进 meta capture） | world=2（FSDP） | selective | PASS | `glm5_next_ev_mm_fsdp2` |
 | 12 | 容量级 full（96 层名义/41 唯一块） | world=8, ep=8, seq=2048 | full | PASS | `glm5_next_ev_full_capacity` |
+| 13 | MXFP8（attention/MoE 量化） | world=2（FSDP, target A5） | selective | PASS | `simulator_output/glm5_next_debug_mxfp8` |
+| 14 | MXFP8 | world=2（FSDP, target A5） | full | PASS | `glm5_next_ev_reduced_mxfp8` |
 
-单测（`tests/unit_tests/models/test_glm5_next.py`，22 项全过）：flavor 注册/round-trip、层布局、参数量公式逐字节对账（debug/reduced）、前反向、多模态前向、DSA 输出宽度、indexer 冻结、state-dict round-trip、HF 命名。
+单测（`tests/unit_tests/models/test_glm5_next.py` 22 项 + `tests/unit_tests/simulator/hardware_shims/test_glm5_next_shim.py` 4 项，全过）：flavor 注册/round-trip、层布局、参数量公式逐字节对账（debug/reduced）、前反向、多模态前向、DSA 输出宽度、indexer 冻结、state-dict round-trip、HF 命名。
 
 **fail fast 探针**（均以明确错误退出，指向 MODEL_CONTRACT.md）：
 
@@ -79,15 +81,17 @@ mHC（hc_prepost 族） = (块数 × 2 站点) + (T-1) × 2
 
 | op | debug 理论/实测 | reduced 理论/实测 | full(ep=8, T=4) 理论/实测 |
 | --- | --- | --- | --- |
-| `triton_ascend_kernels.causal_conv1d[_grad]` | 8 / 8 ✓（3+2+3） | 11 / 11 ✓（3+4+4） | 34 / 34 ✓（12+4+18） |
 | `triton_ascend_kernels.chunk_kda[_grad]` | 8 / 8 ✓ | 11 / 11 ✓ | 34 / 34 ✓ |
+| `aten.convolution[_backward].default`（KDA fused qkv conv，不 shim，与 kimi_k3 一致） | 8 / 8 ✓ | 11 / 11 ✓ | 34 / 34 ✓ |
 | `aclnn.npu_lightning_indexer` | 2 / 2 ✓ | 3 / 3 ✓ | 10 / 10 ✓ |
 | `aclnn.npu_sparse_attn_sharedkv[_grad]` | 2 / 2 ✓ | 3 / 3 ✓ | 10 / 10 ✓ |
 | `aten._grouped_mm.default` | 24 / 24 ✓（8×3） | 36 / 36 ✓（12×3） | 120 / 120 ✓（40×3） |
 | `triton._triton_hc_prepost_fwd_kernel` 族（DSv4 shim） | 20 / 20 ✓ | 28 / 28 ✓ | 88 / 88 ✓ |
 | `aten.convolution.default`（vision patch_embed+downsample，仅 mm 配置） | — | — | —（mm_fsdp2：2 / 2 ✓） |
 
-backward 侧 `*_grad` 与 forward 同数（debug 实测 conv_grad=8、chunk_kda_grad=8、sharedkv_grad=2 ✓）；冻结 indexer 的 `lightning_indexer_grad` 仅作依赖图占位（契约 §4.2）。MoE 路由直方图由 `debug_force_load_balance` round-robin 保证静态（每 expert `m·S·topk/E`），无空 expert padding。
+backward 侧 `*_grad` 与 forward 同数（debug 实测 conv_grad=8、chunk_kda_grad=8、sharedkv_grad=2 ✓）；冻结 indexer 无反向算子（`lightning_indexer` 仅前向，契约 §4.2）。
+
+**接口对齐自检**（`hardware_shims/OP_INTERFACE_REFERENCE.md` §0.9）：12 个证据运行逐一解析 `memory_events.csv`，断言模型特有 op 的输入/输出个数与 rank 全部符合 §1–§3 表格——`chunk_kda_grad` 6 进（v 4-D 于位 2）5 出、`lightning_indexer` 3 进（4D/4D/3D）2 出（4-D int32 indices）、`sparse_attn_sharedkv` 先 metadata 后 6 输入主 op（ori_kv 4-D 头折叠 `nh×(k_dim+v_dim)`，softmax_lse 4-D）、`sharedkv_grad` 7 进 4 出；无自造 op 名。此前的记录签名（grad 单输入、indexer 2 进、缺 softmax_lse/sinks 占位）不满足下游 cost model 解析契约，已按参考文档修正并以 `test_glm5_next_shim.py` 4 项单测固化。MoE 路由直方图由 `debug_force_load_balance` round-robin 保证静态（每 expert `m·S·topk/E`），无空 expert padding。
 
 ## 5. 显存与 AC 对照（验收 4.5）
 
@@ -107,11 +111,19 @@ saved activations（logical bytes）随 AC 模式变化，peak 由 optimizer 阶
 
 趋势核对：full AC 使 saved activations 降一个量级（87→7、2820→256）✓；selective 额外引入 recompute saved 张量 ✓；TP/EP/组合按语义维切分 local tensor 而非整体除 world size ✓；loop block 的 ckpt 实例数 = T（debug 2、reduced/full 4）✓ 执行期语义正确进入显存模型。
 
-## 6. 多模态通路（验收补充）
+## 6. MXFP8 量化通路（验收补充）
+
+`MXFP8Converter`（mxfp8_rceil，FQN 清单见契约 §12）端到端跑通（能力门由 simulator `meta_env` 的 meta-safe 补丁放行，真机仍按 Ascend950 把关）：
+
+- capture 记录 `npu.npu_dynamic_mx_quant`（debug 188 / reduced 274 次）、`npu.npu_quant_matmul`（70 / 101 次）——module_path 确认命中 KDA q/k/v/o、DSA q_a/q_b/kv_a/kv_b、indexer wq_b/weights_proj、shared experts gate/up/down，**未命中** router、dense MLP、embedding/output、vision；
+- MoE grouped GMM 替换为 `npu.npu_grouped_matmul`（debug 24 / reduced 36 次）；
+- 单测 `test_mxfp8_fqn_targets_match_module_paths` 固化 FQN 子串匹配语义（只命中 attention/moe 域）。
+
+## 7. 多模态通路（验收补充）
 
 `glm5_next_debug_mm`（world=2，FSDP）：vision tower（patch_embed conv → 32→2 blocks SDPA → downsample conv → merger）进入 meta capture（`aten.convolution.default` ×2 前向 + backward ✓）；离线数据管线核对：cc12m-test 4 样本批 `pixel_values [2,16,588]`、grid 全有效，**有效 merged patch 数 8 == 文本 image token 数 8**（token id 1998），scatter 顺序一致。早期融合改用 cumsum-order gather（`masked_select` 无 meta kernel，数学等价，MODEL_CONTRACT.md §7 已记录）。
 
-## 7. 复现命令
+## 8. 复现命令
 
 ```bash
 # 矩阵（<name>/并行/AC 见第 2 节表；每个配置）
@@ -123,10 +135,10 @@ python3 -m pytest tests/unit_tests/models/test_glm5_next.py -q
 # fail fast 探针见第 2 节表（PP/ETP/CP+TP/loop overrides）
 ```
 
-## 8. 首版限制（Conditionally ready 声明范围）
+## 9. 首版限制（Conditionally ready 声明范围）
 
 - loop 固定步数建模（T=4 默认）；adaptive halting / kv_mirror / 非共享 loop fail fast（契约 §3）。
-- KDA/DSA 生产融合 kernel 未接入真实 NPU 路径（模拟器以 shape-only shim 记录融合名；chunk_kda 顺序参考实现仅 debug 规格可负担）。
+- MXFP8 真实 NPU 训练路径依赖 Ascend950（`has_mx_capability`）；模拟器以 `target_npu_device_type="A5"` 声明后走 torchao meta 包装，真机数值未实测。模拟器捕获经 shim 单测（`test_glm5_next_shim.py` 4 项：绑定保持 FQN/hook、chunk_kda/causal_conv1d/lightning_indexer/sparse_attn 融合名记录、TP 局部切片）与端到端账本双重验证。
 - 真实 NPU 数值训练与硬件 profiler 不在本验收目标内（验收规范 §1）。
 - video 通路、非均匀 vision 网格、MTP、fp8 参数存储、CP+TP、ETP、PP、offload、compile 均声明不支持并 fail fast。
 - 多模态通道仅 image（video token 出现即报错）；vision 仅随 FSDP 分片，不支持 vision TP/CP。

@@ -147,13 +147,17 @@ class _SimDsaCoreFn(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, query, ori_kv, cmp_kv, cmp_sparse_indices, sinks, module_path):  # noqa: ANN001
-        b, s, n, d = query.shape
+    def forward(ctx, query, ori_kv, cmp_kv, cmp_sparse_indices, sinks, v_head_dim, module_path):  # noqa: ANN001
+        b, s, n, _ = query.shape
 
         metadata = _uncaptured_empty((1024,), torch.int32, query.device)
         _record("aclnn.npu_sparse_attn_sharedkv_metadata", [query], [metadata], module_path)
 
-        result = _uncaptured_empty((b, s, n, d), query.dtype, query.device)
+        # The attention result head width is v_head_dim, NOT the query's qk
+        # head width. glm5_next currently enforces qk_nope_head_dim == v_head_dim,
+        # but deriving it from ``query`` would silently record the wrong output
+        # shape if that constraint is ever relaxed.
+        result = _uncaptured_empty((b, s, n, v_head_dim), query.dtype, query.device)
         softmax_lse = _uncaptured_empty((b, s, n, 1), torch.float32, query.device)
         _record(
             "aclnn.npu_sparse_attn_sharedkv",
@@ -178,7 +182,7 @@ class _SimDsaCoreFn(torch.autograd.Function):
             [d_query, d_ori_kv, d_sinks, d_cmp_kv],
             ctx.module_path,
         )
-        return d_query, d_ori_kv, d_cmp_kv, None, d_sinks, None
+        return d_query, d_ori_kv, d_cmp_kv, None, d_sinks, None, None
 
 
 def _sim_dsa_forward(self, hidden_states, attention_masks=None, positions=None):  # noqa: ANN001
@@ -194,17 +198,15 @@ def _sim_dsa_forward(self, hidden_states, attention_masks=None, positions=None):
     kv = self.kv_b_proj(kv_pass).view(b, s, self.num_heads, self.qk_nope_head_dim + self.v_head_dim)
     key, value = torch.split(kv, [self.qk_nope_head_dim, self.v_head_dim], dim=-1)
 
-    # ---- lightning indexer (pool scoring + top-k), effective top-k only ----
+    # ---- lightning indexer (real projections/pooling, fused scoring+top-k) ----
     # Frozen indexer: projections and selection run under no_grad (no autograd
-    # node, hence no invented backward op).
+    # node, hence no invented backward op). Keeping the projections and k-pool
+    # compression as real ops mirrors DSv4's Indexer -> LiCompute split: only
+    # the terminal fused selection is recorded by the shim.
     with torch.no_grad():
-        query_idx = self.indexer.wq_b(q_resid).view(b, s, indexer.n_heads, indexer.head_dim)
-        weights = self.indexer.weights_proj(hidden_states)
+        query_idx, key_idx, weights = indexer.project_pool_keys(hidden_states, q_resid)
         pools = s // indexer.kpool
         select_pools = min(indexer.topk // indexer.kpool, pools)
-        # GLM scores compressed k-pool candidates: the head-folded indexer key
-        # is the pooled key [B, pools, 1, D_idx] (pooling fused into the kernel).
-        key_idx = _uncaptured_empty((b, pools, 1, indexer.head_dim), query_idx.dtype, query_idx.device)
         pool_indices, _ = _SimDsaIndexerFn.apply(query_idx, key_idx, weights, select_pools, module_path)
 
     # ---- sparse attention main op (6-input top-k variant, differentiable) ----
@@ -217,7 +219,9 @@ def _sim_dsa_forward(self, hidden_states, attention_masks=None, positions=None):
     # variant carries the pool top-k indices.
     cmp_kv = _uncaptured_empty_like(ori_kv)
     cmp_sparse_indices = pool_indices.unsqueeze(2)
-    result = _SimDsaCoreFn.apply(query, ori_kv, cmp_kv, cmp_sparse_indices, sinks, module_path)
+    result = _SimDsaCoreFn.apply(
+        query, ori_kv, cmp_kv, cmp_sparse_indices, sinks, self.v_head_dim, module_path
+    )
 
     return self.o_proj(result.reshape(b, s, self.num_heads * self.v_head_dim))
 

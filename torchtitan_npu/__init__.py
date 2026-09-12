@@ -56,7 +56,7 @@ def _apply_patches():
     from . import converters, ops  # noqa: F401
 
     # module injection: register NPU-only model variants
-    from .models import ar_llm, deepseek_v4, deepseek_v32, glm5_next, kimi_k3, vlm
+    from .models import ar_llm, deepseek_v4, deepseek_v32, glm5_next, kimi_k3, mm_gc, vlm
     from .patches.distributed import cp_shard_mask, utils  # noqa: F401
 
     # patching step timing
@@ -85,6 +85,7 @@ def _apply_patches():
         mx_capability_check,
         mx_linear,
         mxfp8_grouped_mm,
+        mxfp8_wrapper_einsum,
     )
 
     # Patch Qwen3StateDictAdapter.to_hf to sync fqn_to_index_mapping.
@@ -97,7 +98,9 @@ def _apply_patches():
     from .tools import flight_recorder, profiling  # noqa: F401
 
     new_set = set(titan_models._supported_models)
-    new_set.update({"ar_llm", "deepseek_v32", "deepseek_v4", "glm5_next", "kimi_k3", "vlm"})
+    new_set.update(
+        {"ar_llm", "deepseek_v32", "deepseek_v4", "glm5_next", "kimi_k3", "mm_gc", "vlm"}
+    )
     titan_models._supported_models = frozenset(new_set)
 
     _inject_module("torchtitan.models.ar_llm", ar_llm)
@@ -105,6 +108,7 @@ def _apply_patches():
     _inject_module("torchtitan.models.deepseek_v4", deepseek_v4)
     _inject_module("torchtitan.models.glm5_next", glm5_next)
     _inject_module("torchtitan.models.kimi_k3", kimi_k3)
+    _inject_module("torchtitan.models.mm_gc", mm_gc)
     _inject_module("torchtitan.models.vlm", vlm)
 
 

@@ -85,8 +85,12 @@ class GlmVisionAttention(nn.Module):
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
         self.scaling = self.head_dim**-0.5
-        self.qkv = nn.Linear(hidden_size, hidden_size * 3, bias=attention_bias)
-        self.proj = nn.Linear(hidden_size, hidden_size, bias=attention_bias)
+        self.qkv = Linear.Config(
+            in_features=hidden_size, out_features=hidden_size * 3, bias=attention_bias
+        ).build()
+        self.proj = Linear.Config(
+            in_features=hidden_size, out_features=hidden_size, bias=attention_bias
+        ).build()
         self.q_norm = RMSNorm.Config(normalized_shape=self.head_dim, eps=rms_norm_eps).build()
         self.k_norm = RMSNorm.Config(normalized_shape=self.head_dim, eps=rms_norm_eps).build()
         self.inner_attention = DenseMaskSDPA.Config().build()
@@ -141,9 +145,15 @@ class GlmVisionMLP(nn.Module):
     def __init__(self, hidden_size: int, intermediate_size: int, swiglu_limit: float, bias: bool = True):
         super().__init__()
         self.swiglu_limit = swiglu_limit
-        self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=bias)
-        self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=bias)
-        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=bias)
+        self.gate_proj = Linear.Config(
+            in_features=hidden_size, out_features=intermediate_size, bias=bias
+        ).build()
+        self.up_proj = Linear.Config(
+            in_features=hidden_size, out_features=intermediate_size, bias=bias
+        ).build()
+        self.down_proj = Linear.Config(
+            in_features=intermediate_size, out_features=hidden_size, bias=bias
+        ).build()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate = self.gate_proj(x).clamp(max=self.swiglu_limit)
@@ -180,11 +190,17 @@ class GlmVisionPatchMerger(nn.Module):
     def __init__(self, dim: int, projection_intermediate_size: int, swiglu_limit: float):
         super().__init__()
         self.swiglu_limit = swiglu_limit
-        self.proj = nn.Linear(dim, dim, bias=False)
+        self.proj = Linear.Config(in_features=dim, out_features=dim, bias=False).build()
         self.post_projection_norm = nn.LayerNorm(dim)
-        self.gate_proj = nn.Linear(dim, projection_intermediate_size, bias=False)
-        self.up_proj = nn.Linear(dim, projection_intermediate_size, bias=False)
-        self.down_proj = nn.Linear(projection_intermediate_size, dim, bias=False)
+        self.gate_proj = Linear.Config(
+            in_features=dim, out_features=projection_intermediate_size, bias=False
+        ).build()
+        self.up_proj = Linear.Config(
+            in_features=dim, out_features=projection_intermediate_size, bias=False
+        ).build()
+        self.down_proj = Linear.Config(
+            in_features=projection_intermediate_size, out_features=dim, bias=False
+        ).build()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.proj(x)

@@ -192,11 +192,16 @@ class ArLlmSimulationTrainerConfig(SimulationTrainerConfig):
     model_overrides: ArLlmModelOverrides = dataclasses.field(
         default_factory=ArLlmModelOverrides
     )
+    mxfp8_fqns: list[str] | None = None
 
     def __post_init__(self) -> None:
         self.model_spec = apply_ar_llm_model_overrides(
             self.model_spec,
             self.model_overrides,
+        )
+        _ar_llm_configs._apply_mxfp8_fqns_override(
+            self.model_converters,
+            self.mxfp8_fqns,
         )
 
 
@@ -224,10 +229,24 @@ def ar_llm_debug() -> ArLlmSimulationTrainerConfig:
     )
 
 
+def ar_llm_debug_mxfp8() -> ArLlmSimulationTrainerConfig:
+    return _ar_llm_simulation_config(
+        _ar_llm_configs.ar_llm_debug_mxfp8,
+        output_name="ar_llm_debug_mxfp8",
+    )
+
+
 def ar_llm_reduced() -> ArLlmSimulationTrainerConfig:
     return _ar_llm_simulation_config(
         _ar_llm_configs.ar_llm_reduced,
         output_name="ar_llm_reduced",
+    )
+
+
+def ar_llm_reduced_mxfp8() -> ArLlmSimulationTrainerConfig:
+    return _ar_llm_simulation_config(
+        _ar_llm_configs.ar_llm_reduced_mxfp8,
+        output_name="ar_llm_reduced_mxfp8",
     )
 
 
@@ -263,11 +282,16 @@ class Glm5NextSimulationTrainerConfig(SimulationTrainerConfig):
     model_overrides: Glm5NextModelOverrides = dataclasses.field(
         default_factory=Glm5NextModelOverrides
     )
+    mxfp8_fqns: list[str] | None = None
 
     def __post_init__(self) -> None:
         self.model_spec = apply_glm5_next_model_overrides(
             self.model_spec,
             self.model_overrides,
+        )
+        _glm5_next_configs._apply_mxfp8_fqns_override(
+            self.model_converters,
+            self.mxfp8_fqns,
         )
 
 
@@ -275,6 +299,7 @@ def _glm5_next_simulation_config(
     factory: Callable[[], TrainerConfig],
     *,
     output_name: str,
+    target_npu_device_type: str | None = None,
 ) -> Glm5NextSimulationTrainerConfig:
     base_config = factory()
     base_fields = {
@@ -282,9 +307,15 @@ def _glm5_next_simulation_config(
         for field in dataclasses.fields(base_config)
     }
     base_fields["compile"] = dataclasses.replace(base_config.compile, enable=False)
+    simulation_kwargs = {}
+    if target_npu_device_type is not None:
+        simulation_kwargs["target_npu_device_type"] = target_npu_device_type
     return Glm5NextSimulationTrainerConfig(
         **base_fields,
-        simulation=SimulationConfig(output_dir=f"./simulator_output/{output_name}"),
+        simulation=SimulationConfig(
+            output_dir=f"./simulator_output/{output_name}",
+            **simulation_kwargs,
+        ),
     )
 
 
@@ -313,4 +344,169 @@ def glm5_next_debug_mm() -> Glm5NextSimulationTrainerConfig:
     return _glm5_next_simulation_config(
         _glm5_next_configs.glm5_next_debug_mm,
         output_name="glm5_next_debug_mm",
+    )
+
+
+def glm5_next_debug_mxfp8() -> Glm5NextSimulationTrainerConfig:
+    return _glm5_next_simulation_config(
+        _glm5_next_configs.glm5_next_debug_mxfp8,
+        output_name="glm5_next_debug_mxfp8",
+        target_npu_device_type="A5",
+    )
+
+
+def glm5_next_reduced_mxfp8() -> Glm5NextSimulationTrainerConfig:
+    return _glm5_next_simulation_config(
+        _glm5_next_configs.glm5_next_reduced_mxfp8,
+        output_name="glm5_next_reduced_mxfp8",
+        target_npu_device_type="A5",
+    )
+
+
+# ---------------------------------------------------------------------------
+# mm_gc (SLA2 + Multi-Head MoE) simulator configs
+# ---------------------------------------------------------------------------
+
+from torchtitan_npu.models.mm_gc import config_registry as _mm_gc_configs  # noqa: E402
+
+
+def _mm_gc_simulation_config(
+    factory: Callable[[], TrainerConfig],
+    *,
+    output_name: str,
+) -> SimulationTrainerConfig:
+    base_config = factory()
+    base_fields = {
+        field.name: getattr(base_config, field.name)
+        for field in dataclasses.fields(base_config)
+    }
+    base_fields["compile"] = dataclasses.replace(base_config.compile, enable=False)
+    return SimulationTrainerConfig(
+        **base_fields,
+        simulation=SimulationConfig(output_dir=f"./simulator_output/{output_name}"),
+    )
+
+
+def mm_gc_smoketest() -> SimulationTrainerConfig:
+    return _mm_gc_simulation_config(
+        _mm_gc_configs.mm_gc_smoketest,
+        output_name="mm_gc_smoketest",
+    )
+
+
+def mm_gc_reduced() -> SimulationTrainerConfig:
+    return _mm_gc_simulation_config(
+        _mm_gc_configs.mm_gc_reduced,
+        output_name="mm_gc_reduced",
+    )
+
+
+def mm_gc_baseline() -> SimulationTrainerConfig:
+    return _mm_gc_simulation_config(
+        _mm_gc_configs.mm_gc_baseline,
+        output_name="mm_gc_baseline",
+    )
+
+
+def mm_gc_smoketest_mxfp8() -> SimulationTrainerConfig:
+    return _mm_gc_simulation_config(
+        _mm_gc_configs.mm_gc_smoketest_mxfp8,
+        output_name="mm_gc_smoketest_mxfp8",
+    )
+
+
+def mm_gc_reduced_mxfp8() -> SimulationTrainerConfig:
+    return _mm_gc_simulation_config(
+        _mm_gc_configs.mm_gc_reduced_mxfp8,
+        output_name="mm_gc_reduced_mxfp8",
+    )
+
+
+def mm_gc_baseline_mxfp8() -> SimulationTrainerConfig:
+    return _mm_gc_simulation_config(
+        _mm_gc_configs.mm_gc_baseline_mxfp8,
+        output_name="mm_gc_baseline_mxfp8",
+    )
+
+
+def _mm_gc_smoketest_with_parallelism(
+    output_name: str,
+    *,
+    world_size: int,
+    data_parallel_shard_degree: int = 1,
+    tensor_parallel_degree: int = 1,
+    expert_parallel_degree: int = 1,
+    expert_tensor_parallel_degree: int = 1,
+    context_parallel_degree: int = 1,
+) -> SimulationTrainerConfig:
+    base_config = _mm_gc_configs.mm_gc_smoketest()
+    base_config = dataclasses.replace(
+        base_config,
+        parallelism=dataclasses.replace(
+            base_config.parallelism,
+            data_parallel_shard_degree=data_parallel_shard_degree,
+            tensor_parallel_degree=tensor_parallel_degree,
+            expert_parallel_degree=expert_parallel_degree,
+            expert_tensor_parallel_degree=expert_tensor_parallel_degree,
+            context_parallel_degree=context_parallel_degree,
+        ),
+    )
+    base_fields = {
+        field.name: getattr(base_config, field.name)
+        for field in dataclasses.fields(base_config)
+    }
+    base_fields["compile"] = dataclasses.replace(base_config.compile, enable=False)
+    return SimulationTrainerConfig(
+        **base_fields,
+        simulation=SimulationConfig(
+            output_dir=f"./simulator_output/{output_name}",
+            world_size=world_size,
+        ),
+    )
+
+
+def mm_gc_smoketest_fsdp2() -> SimulationTrainerConfig:
+    return _mm_gc_smoketest_with_parallelism(
+        "mm_gc_smoketest_fsdp2", world_size=2, data_parallel_shard_degree=2
+    )
+
+
+def mm_gc_smoketest_tp2() -> SimulationTrainerConfig:
+    return _mm_gc_smoketest_with_parallelism(
+        "mm_gc_smoketest_tp2", world_size=2, tensor_parallel_degree=2
+    )
+
+
+def mm_gc_smoketest_ep2() -> SimulationTrainerConfig:
+    return _mm_gc_smoketest_with_parallelism(
+        "mm_gc_smoketest_ep2",
+        world_size=2,
+        data_parallel_shard_degree=-1,
+        expert_parallel_degree=2,
+    )
+
+
+def mm_gc_smoketest_cp2() -> SimulationTrainerConfig:
+    return _mm_gc_smoketest_with_parallelism(
+        "mm_gc_smoketest_cp2", world_size=2, context_parallel_degree=2
+    )
+
+
+def mm_gc_smoketest_tp2ep2() -> SimulationTrainerConfig:
+    return _mm_gc_smoketest_with_parallelism(
+        "mm_gc_smoketest_tp2ep2",
+        world_size=4,
+        data_parallel_shard_degree=-1,
+        tensor_parallel_degree=2,
+        expert_tensor_parallel_degree=2,
+        expert_parallel_degree=2,
+    )
+
+
+def mm_gc_smoketest_fsdp2ep2() -> SimulationTrainerConfig:
+    return _mm_gc_smoketest_with_parallelism(
+        "mm_gc_smoketest_fsdp2ep2",
+        world_size=4,
+        data_parallel_shard_degree=4,
+        expert_parallel_degree=2,
     )
