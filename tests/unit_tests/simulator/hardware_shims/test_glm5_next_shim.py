@@ -63,11 +63,19 @@ def test_kda_records_chunk_kda_and_conv_fused_ops():
     x = _meta(1, 8, 32)
 
     capture = _capture_fwd_bwd(lambda: attention(x))
-    raw_names = [node.annotations["raw_op_type"] for node in capture.build_nodes().values()]
+    nodes = list(capture.build_nodes().values())
+    raw_names = [node.annotations["raw_op_type"] for node in nodes]
     assert raw_names.count("triton_ascend_kernels.chunk_kda") == 1
     assert raw_names.count("triton_ascend_kernels.chunk_kda_grad") == 1
     assert raw_names.count("triton_ascend_kernels.causal_conv1d") == 1
     assert raw_names.count("triton_ascend_kernels.causal_conv1d_grad") == 1
+    # chunk_kda_grad cost-model interface: [q, k, v, g, beta, do]
+    grad = next(n for n in nodes if n.annotations["raw_op_type"] == "triton_ascend_kernels.chunk_kda_grad")
+    grad_in = [t.shape for t in grad.inputs]
+    grad_out = [t.shape for t in grad.outputs]
+    assert len(grad_in) == 6
+    assert list(grad_in[2]) == [1, 8, 2, 16]  # v [B,S,H,Dv] at index 2
+    assert len(grad_out) == 5  # same-shape grads
     # The shim must not leak uncaptured internal allocations (the sequential
     # fallback's empties); the surrounding projections legitimately capture
     # as aten.mm.
@@ -91,12 +99,48 @@ def test_dsa_records_indexer_and_sparse_attn_fused_ops():
     x = _meta(1, 8, 32)
 
     capture = _capture_fwd_bwd(lambda: attention(x))
-    raw_names = [node.annotations["raw_op_type"] for node in capture.build_nodes().values()]
+    nodes = list(capture.build_nodes().values())
+    raw_names = [node.annotations["raw_op_type"] for node in nodes]
+    # §3 lightning indexer: fwd only, 3 inputs / 2 outputs, no invented
+    # backward op (frozen indexer, no_grad).
     assert raw_names.count("aclnn.npu_lightning_indexer") == 1
-    # The indexer is frozen (no_grad): no indexer backward node exists.
     assert raw_names.count("aclnn.npu_lightning_indexer_grad") == 0
+    # §2 metadata first, then the 6-input top-k variant.
+    assert raw_names.count("aclnn.npu_sparse_attn_sharedkv_metadata") == 1
     assert raw_names.count("aclnn.npu_sparse_attn_sharedkv") == 1
     assert raw_names.count("aclnn.npu_sparse_attn_sharedkv_grad") == 1
+
+    def _node(name):
+        return next(n for n in nodes if n.annotations["raw_op_type"] == name)
+
+    def _shapes(node, attr="inputs"):
+        return [tuple(t.shape) for t in getattr(node, attr)]
+
+    # input counts / ranks per OP_INTERFACE_REFERENCE.md §2/§3.
+    indexer = _node("aclnn.npu_lightning_indexer")
+    indexer_in = _shapes(indexer)
+    indexer_out = _shapes(indexer, "outputs")
+    assert len(indexer_in) == 3
+    assert len(indexer_in[0]) == 4  # query_idx [B,S,N_idx,D_idx]
+    assert len(indexer_in[1]) == 4  # key_idx [B,cl,1,D_idx]
+    assert len(indexer_in[2]) == 3  # weights [B,S,N_idx]
+    assert len(indexer_out[0]) == 4 and indexer_out[0][-1] == 2  # K=select_pools
+
+    main = _node("aclnn.npu_sparse_attn_sharedkv")
+    main_in = _shapes(main)
+    main_out = _shapes(main, "outputs")
+    assert len(main_in) == 6  # 6-input top-k variant
+    assert len(main_in[1]) == 4  # ori_kv [B,S,1,nh*(k+v)]
+    assert main_in[1][-1] == 2 * (8 + 8)  # nh*(k_dim+v_dim)
+    assert main_in[3] == (1024,)  # metadata
+    assert len(main_in[5]) == 4  # cmp_sparse_indices [B,S,1,K]
+    assert len(main_out) == 2 and len(main_out[1]) == 4  # softmax_lse
+
+    grad = _node("aclnn.npu_sparse_attn_sharedkv_grad")
+    grad_in = _shapes(grad)
+    grad_out = _shapes(grad, "outputs")
+    assert len(grad_in) == 7  # q, ori_kv, result, lse, sinks, do, cmp_kv
+    assert len(grad_out) == 4  # d_query, d_ori_kv, d_sinks, d_cmp_kv
 
 
 def test_conv_shim_respects_tp_local_slice():
