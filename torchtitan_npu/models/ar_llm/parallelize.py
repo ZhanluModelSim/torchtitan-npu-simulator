@@ -54,6 +54,21 @@ logger = logging.getLogger(__name__)
 _EXPERT_WEIGHT_NAMES = ("w1", "w2", "w3", "w4", "w5")
 
 
+def _stacked_weight_shard_placement(shape: torch.Size, world_size: int) -> Shard:
+    """Pick an FSDP shard dim that the dp mesh divides evenly.
+
+    The grouped-O weights are stacked over ``o_groups`` (a tiny leading dim):
+    the default ``Shard(0)`` pads every rank to a full group slice once the
+    mesh outgrows the group count (a 2048-way mesh turns ``[32, 4096, 1024]``
+    into a 2048-row padded all-gather). Shard on the first trailing dim the
+    mesh divides evenly instead; fall back to ``Shard(0)`` when none does.
+    """
+    for dim in range(1, len(shape)):
+        if shape[dim] > 0 and shape[dim] % world_size == 0:
+            return Shard(dim)
+    return Shard(0)
+
+
 def _apply_ar_llm_fsdp(
     model: ArLlmModel,
     dp_mesh: DeviceMesh,
@@ -104,6 +119,9 @@ def _apply_ar_llm_fsdp(
         if transformer_block.has_engram:
             for table in transformer_block.engram.hash_tables:
                 engram_table_params.update(table.parameters())
+        o_proj_params: set[nn.Parameter] = set()
+        if transformer_block.attention.o_proj is not None:
+            o_proj_params.update(transformer_block.attention.o_proj.parameters())
 
         if ep_degree > 1:
             assert edp_mesh is not None
@@ -113,14 +131,17 @@ def _apply_ar_llm_fsdp(
             )
             edp_mesh_info = FSDPMeshInfo(mesh=edp_mesh, shard_mesh_dim=0)
             dp_mesh_info = FSDPMeshInfo(mesh=dp_mesh, shard_mesh_dim=0)
+            dp_world_size = dp_mesh.size()
 
             def _shard_placement_fn(
                 param: nn.Parameter,
                 _expert_params: set = expert_params,
                 _engram_params: set = engram_table_params,
+                _o_proj_params: set = o_proj_params,
                 _expert_placement: Shard = expert_shard_placement,
                 _edp_mesh_info: FSDPMeshInfo = edp_mesh_info,
                 _dp_mesh_info: FSDPMeshInfo = dp_mesh_info,
+                _dp_world_size: int = dp_world_size,
             ) -> ShardPlacementResult:
                 if param in _engram_params:
                     # Hash tables are bucket-sharded and stay sharded at
@@ -128,6 +149,13 @@ def _apply_ar_llm_fsdp(
                     return ShardPlacementResult(placement=Shard(0), mesh_info=_edp_mesh_info)
                 if param in _expert_params:
                     return ShardPlacementResult(placement=_expert_placement, mesh_info=_edp_mesh_info)
+                if param in _o_proj_params:
+                    return ShardPlacementResult(
+                        placement=_stacked_weight_shard_placement(
+                            param.shape, _dp_world_size
+                        ),
+                        mesh_info=_dp_mesh_info,
+                    )
                 return ShardPlacementResult(placement=Shard(0), mesh_info=_dp_mesh_info)
 
             fully_shard(
