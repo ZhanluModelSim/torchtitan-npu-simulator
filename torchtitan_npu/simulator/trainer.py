@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
+from torchtitan.components.loss import IGNORE_INDEX
 from torchtitan.trainer import Trainer
 
 from torchtitan_npu.simulator.capture.checkpoint_execution import install_checkpoint_execution_tracking
@@ -194,6 +195,7 @@ def run_simulation_step(
     fsdp_allgather_transport_dtype: str = "",
     synthetic_ac_patterns: tuple[str, ...] = (),
     pp_schedule: Any | None = None,
+    valid_token_count: int | float | None = None,
 ) -> WorkloadGraph:
     """Run one forward+backward+optimizer step under full capture and
     return the resulting four-layer WorkloadGraph. Bypasses
@@ -201,7 +203,8 @@ def run_simulation_step(
     token counting and loss/grad-norm logging both call `.item()` on
     device tensors, which raises under meta-device execution (see design
     doc §9) -- `global_valid_tokens` is instead supplied here as a plain
-    Python float derived from the static input shape.
+    Python float. Callers with masked labels should calculate it before
+    moving labels to meta and pass ``valid_token_count``.
 
     Calls `patch_device_type_to_meta()` unconditionally (idempotent) so
     this function is safe to call standalone -- not just via
@@ -215,7 +218,11 @@ def run_simulation_step(
 
     patch_device_type_to_meta()
     install_checkpoint_execution_tracking(model_parts)
-    global_valid_tokens = float(labels.numel())
+    global_valid_tokens = float(
+        labels.numel() if valid_token_count is None else valid_token_count
+    )
+    if global_valid_tokens <= 0:
+        raise ValueError("simulation requires at least one valid loss token")
 
     # Default PP stage attribution: non-PP steps use stage 0 (the single
     # stage); PP steps use -1 ("unattributed") so framework setup ops captured
@@ -582,6 +589,7 @@ class SimulationTrainer(Trainer):
 
         data_iterator = iter(self.dataloader)
         input_dict, labels = next(data_iterator)
+        valid_token_count = int((labels != IGNORE_INDEX).sum().item())
         for key, value in list(input_dict.items()):
             if isinstance(value, torch.Tensor):
                 input_dict[key] = value.to(self.device)
@@ -620,6 +628,7 @@ class SimulationTrainer(Trainer):
                 memory_parameter_storage_dtype=(
                     self.simulation_config.memory_parameter_storage_dtype
                 ),
+                valid_token_count=valid_token_count,
                 memory_offload_ac_saved_tensors=(
                     self.simulation_config.memory_offload_ac_saved_tensors
                 ),

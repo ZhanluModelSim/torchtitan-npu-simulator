@@ -172,3 +172,57 @@ def kimi_k3_smoketest() -> KimiK3SimulationTrainerConfig:
         _kimi_k3_configs.kimi_k3_smoketest,
         output_name="kimi_k3_smoketest",
     )
+
+
+# ---------------------------------------------------------------------------
+# Block Diffusion simulator configs
+# ---------------------------------------------------------------------------
+
+from torchtitan_npu.models.block_diffusion import (  # noqa: E402
+    config_registry as _block_diffusion_configs,
+)
+
+
+def _block_diffusion_simulation_config(
+    factory: Callable[[], TrainerConfig],
+    *,
+    output_name: str,
+) -> SimulationTrainerConfig:
+    base_config = factory()
+    base_fields = {
+        field.name: getattr(base_config, field.name)
+        for field in dataclasses.fields(base_config)
+    }
+    base_fields["compile"] = dataclasses.replace(base_config.compile, enable=False)
+    return SimulationTrainerConfig(
+        **base_fields,
+        simulation=SimulationConfig(output_dir=f"./simulator_output/{output_name}"),
+    )
+
+
+def block_diffusion_smoketest() -> SimulationTrainerConfig:
+    return _block_diffusion_simulation_config(
+        _block_diffusion_configs.block_diffusion_smoketest,
+        output_name="block_diffusion_smoketest",
+    )
+
+
+def block_diffusion_dense_smoketest() -> SimulationTrainerConfig:
+    return _block_diffusion_simulation_config(
+        _block_diffusion_configs.block_diffusion_dense_smoketest,
+        output_name="block_diffusion_dense_smoketest",
+    )
+
+
+def block_diffusion_reduced() -> SimulationTrainerConfig:
+    return _block_diffusion_simulation_config(
+        _block_diffusion_configs.block_diffusion_reduced,
+        output_name="block_diffusion_reduced",
+    )
+
+
+def block_diffusion_baseline() -> SimulationTrainerConfig:
+    return _block_diffusion_simulation_config(
+        _block_diffusion_configs.block_diffusion_baseline,
+        output_name="block_diffusion_baseline",
+    )

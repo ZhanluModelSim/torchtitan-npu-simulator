@@ -13,7 +13,12 @@ import torch_npu
 from torch.distributed import _functional_collectives as funcol
 from torch.distributed.pipelining import schedules
 
-from torchtitan_npu.simulator.capture.comm_events import capture_fake_collectives
+from torchtitan_npu.simulator.capture.comm_events import (
+    _resolve_comm_ranks,
+    _resolve_world_size,
+    capture_fake_collectives,
+    default_collective_context,
+)
 from torchtitan_npu.simulator.capture.dispatch_capture import OpDispatchCapture
 from torchtitan_npu.simulator.capture.module_path import ModulePathTracker
 from torchtitan_npu.simulator.hardware_shims.grouped_experts_shim import (
@@ -54,6 +59,14 @@ def test_all_reduce_on_meta_tensor_is_noop_and_recorded():
     assert len(recorder.events) == 1
     assert recorder.events[0].comm_primitive == "allreduce"
     assert recorder.events[0].tensor_shape == (16, 16)
+
+
+def test_default_collective_context_does_not_recurse_on_its_own_group():
+    group = dist.group.WORLD
+
+    with default_collective_context("tp", group):
+        assert _resolve_world_size(group) == 8
+        assert _resolve_comm_ranks(group) == [list(range(8))]
 
 
 def test_all_gather_into_tensor_on_meta_is_noop_and_recorded():
@@ -232,7 +245,18 @@ def test_meta_moe_backward_dependencies_connect_gmms_to_all_to_all():
         _limit,
         _scores,
     ):
-        return torch.empty_like(routed_tokens)
+        pre_activation = torch.empty(
+            (*routed_tokens.shape[:-1], routed_tokens.shape[-1] * 2),
+            device=routed_tokens.device,
+            dtype=routed_tokens.dtype,
+        )
+        activated_hidden = torch.empty_like(routed_tokens)
+        scaled_hidden = torch.empty_like(routed_tokens)
+        return torch.empty_like(routed_tokens), (
+            pre_activation,
+            activated_hidden,
+            scaled_hidden,
+        )
 
     with capture, capture_fake_collectives():
         routed_tokens = run_meta_all_to_all(tokens, dist.group.WORLD)

@@ -279,21 +279,25 @@ class CommEventRecorder:
             self.fsdp_residency_events.append(event)
 
 
-def _resolve_world_size(group: object) -> int:
+def _resolve_world_size(
+    group: object,
+    *,
+    _consult_context: bool = True,
+) -> int:
     """Best-effort world-size extraction from any group type the functional
     collectives API accepts: ProcessGroup, DeviceMesh, list of ranks, or
     group-name string. Returns 1 if unresolvable (e.g. None or
     dist not initialized)."""
     active_context = _default_collective_context.get()
     group_name = getattr(group, "group_name", None)
-    if active_context is not None and (
+    if _consult_context and active_context is not None and (
         group is None
         or group is dist.group.WORLD
         or isinstance(group, (list, tuple))
         or str(group) == "default"
         or str(group_name) == "default"
     ):
-        return _resolve_world_size(active_context[1])
+        return _resolve_world_size(active_context[1], _consult_context=False)
     if group is None:
         return dist.get_world_size() if dist.is_initialized() else 1
     # ProcessGroup
@@ -355,21 +359,25 @@ def _group_name(group: object) -> str:
     return "default"
 
 
-def _resolve_comm_ranks(group: object) -> list[list[int]]:
+def _resolve_comm_ranks(
+    group: object,
+    *,
+    _consult_context: bool = True,
+) -> list[list[int]]:
     """Best-effort extraction of the rank lists that belong to this
     communication domain.  Returns a list of groups, where each group is a
     list of global rank IDs (e.g. ``[[0,1,2,3],[4,5,6,7]]`` for two TP
     groups of size 4).  Returns ``[]`` when unresolvable."""
     active_context = _default_collective_context.get()
     group_name = getattr(group, "group_name", None)
-    if active_context is not None and (
+    if _consult_context and active_context is not None and (
         group is None
         or group is dist.group.WORLD
         or isinstance(group, (list, tuple))
         or str(group) == "default"
         or str(group_name) == "default"
     ):
-        return _resolve_comm_ranks(active_context[1])
+        return _resolve_comm_ranks(active_context[1], _consult_context=False)
     if group is None:
         ws = dist.get_world_size() if dist.is_initialized() else 1
         return [list(range(ws))] if ws > 1 else []

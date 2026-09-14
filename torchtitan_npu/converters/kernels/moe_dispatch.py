@@ -4,6 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from contextlib import nullcontext
 from typing import Any, NamedTuple, cast
 
 import torch
@@ -60,7 +61,12 @@ def _local_gate_scores(router, x: torch.Tensor) -> torch.Tensor:
     if gate_bias is not None and isinstance(gate_bias, DTensor):
         gate_bias = gate_bias.to_local()
 
-    with torch.autocast(device_type=x.device.type, dtype=torch.float32):
+    autocast = (
+        nullcontext()
+        if x.device.type in {"cpu", "meta"}
+        else torch.autocast(device_type=x.device.type, dtype=torch.float32)
+    )
+    with autocast:
         return torch.nn.functional.linear(x, gate_weight, gate_bias)
 
 
@@ -105,7 +111,7 @@ def _select_standard_moe_experts(self, x: torch.Tensor) -> tuple[torch.Tensor, t
     top_scores = top_scores * self.router.route_scale
 
     num_tokens_per_expert = torch.histc(
-        selected_experts_indices.view(-1),
+        selected_experts_indices.to(torch.float32).view(-1),
         bins=self.router.num_experts,
         min=0,
         max=self.router.num_experts,

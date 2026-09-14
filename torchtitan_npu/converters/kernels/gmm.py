@@ -183,7 +183,11 @@ def npu_grouped_experts_forward(
         # (dynamo cannot trace setattr on a function) and avoid the .item()
         # device syncs on every step once it has been logged.
         ar_logged_attr = "_ar_logged"
-        log_ar = not torch.compiler.is_compiling() and not hasattr(npu_grouped_experts_forward, ar_logged_attr)
+        log_ar = (
+            out.device.type != "meta"
+            and not torch.compiler.is_compiling()
+            and not hasattr(npu_grouped_experts_forward, ar_logged_attr)
+        )
         pre_ar = out.mean().item() if log_ar else None
 
         dist.all_reduce(out, group=tp_group)
