@@ -119,8 +119,9 @@ class BlockDiffusionDataset(HuggingFaceTextDataset):
                         max_mask_ratio=self.max_mask_ratio,
                     )
 
-                    # A stride of one canvas makes every source block a target
-                    # while preserving a fixed seq_len for compile and CP.
+                    # After the initial prefix warmup, a one-canvas stride
+                    # makes each subsequent source block a target while
+                    # preserving a fixed seq_len for compile and CP.
                     del self._inputs_buffer[: self.block_size]
                     del self._positions_buffer[: self.block_size]
                     yield {"input": corrupted, "positions": positions}, labels

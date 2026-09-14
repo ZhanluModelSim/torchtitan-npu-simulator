@@ -7,6 +7,7 @@
 
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import MetricsProcessor
+from torchtitan.components.validate import Validator
 from torchtitan.protocols.model_converter import ModelConvertersContainer
 
 from torchtitan_npu.config.configs import (
@@ -32,6 +33,7 @@ from .data import BlockDiffusionDataLoader
 
 def _converters() -> list:
     return [
+        get_model_converter_config("npu_block_diffusion_attention"),
         get_model_converter_config("npu_rms_norm"),
         get_model_converter_config("npu_rope"),
         get_model_converter_config("npu_moe_dispatch"),
@@ -69,6 +71,18 @@ def _trainer_config(
 ) -> TrainerConfig:
     model_spec = model_registry(flavor)
     model_config = model_spec.model
+    train_dataloader = BlockDiffusionDataLoader.Config(
+        dataset="c4_test",
+        block_size=model_config.block_size,
+        mask_token_id=model_config.mask_token_id,
+    )
+    validation_dataloader = BlockDiffusionDataLoader.Config(
+        dataset="c4_validation",
+        infinite=False,
+        block_size=model_config.block_size,
+        mask_token_id=model_config.mask_token_id,
+        corruption_seed=43,
+    )
     return TrainerConfig(
         hf_assets_path="./tests/assets/tokenizer/deepseekv3_tokenizer",
         model_spec=model_spec,
@@ -76,11 +90,7 @@ def _trainer_config(
         comm=CommConfig(trace_buf_size=0),
         model_converters=ModelConvertersContainer.Config(converters=_converters()),
         metrics=MetricsProcessor.Config(log_freq=1),
-        dataloader=BlockDiffusionDataLoader.Config(
-            dataset="c4_test",
-            block_size=model_config.block_size,
-            mask_token_id=model_config.mask_token_id,
-        ),
+        dataloader=train_dataloader,
         optimizer=OptimizerConfig(name="AdamW", lr=1e-4, eps=1e-8),
         lr_scheduler=LRSchedulersContainer.Config(
             warmup_steps=1,
@@ -99,6 +109,7 @@ def _trainer_config(
         activation_checkpoint=ActivationCheckpointConfig(mode=ac_mode),
         compile=CompileConfig(enable=False, components=["model", "loss"]),
         profiling=ProfilingConfig(enable_profiling=False),
+        validator=Validator.Config(enable=False, dataloader=validation_dataloader),
     )
 
 

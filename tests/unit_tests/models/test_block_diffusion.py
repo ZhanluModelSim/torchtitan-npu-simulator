@@ -62,16 +62,27 @@ def test_model_registry_rejects_unknown_flavor():
     (("dense_debug", 16), ("debug", 32)),
 )
 def test_prefix_canvas_forward_backward_and_parameter_formula(flavor, seq_len):
+    from torchtitan.components.loss import cross_entropy_loss
     from torchtitan_npu.models.block_diffusion import model_registry
+    from torchtitan_npu.models.block_diffusion.data import corrupt_last_canvas
 
     config = model_registry(flavor).model
     model = config.build()
     model.init_states(buffer_device=torch.device("cpu"))
     tokens = torch.randint(0, config.vocab_size, (1, seq_len))
-    logits = model(tokens)
-    logits.float().mean().backward()
+    corrupted, labels, masked = corrupt_last_canvas(
+        tokens[0],
+        block_size=config.block_size,
+        mask_token_id=config.mask_token_id,
+        generator=torch.Generator().manual_seed(0),
+        min_mask_ratio=0.5,
+        max_mask_ratio=0.5,
+    )
+    logits = model(corrupted.unsqueeze(0))
+    cross_entropy_loss(logits, labels.unsqueeze(0)).backward()
 
     assert logits.shape == (1, seq_len, config.vocab_size)
+    assert masked.sum() == config.block_size // 2
     assert sum(parameter.numel() for parameter in model.parameters()) == (
         _expected_parameter_count(config)
     )
@@ -99,6 +110,109 @@ def test_attention_splits_causal_prefix_and_bidirectional_canvas(monkeypatch):
         (torch.Size([1, 2, 4, 8]), torch.Size([1, 2, 4, 8]), True),
         (torch.Size([1, 2, 4, 8]), torch.Size([1, 2, 8, 8]), False),
     ]
+
+
+def test_npu_attention_converter_emits_two_fused_kernels(monkeypatch):
+    import torch_npu
+
+    from torchtitan_npu.converters.kernels.block_diffusion_attention import (
+        NPUBlockDiffusionAttention,
+        NPUBlockDiffusionAttentionConverter,
+    )
+    from torchtitan_npu.models.block_diffusion.attention import PrefixCanvasSDPA
+
+    class AttentionHolder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(1))
+            self.attention = PrefixCanvasSDPA.Config(block_size=4).build()
+
+    captured = []
+
+    def fake_fusion_attention(q, k, v, **kwargs):
+        captured.append((q.shape, k.shape, kwargs))
+        stats = torch.zeros((q.shape[0], q.shape[2], q.shape[1], 8), dtype=torch.float32)
+        return torch.zeros_like(q), stats, stats, torch.empty(0), 0, 0, 0
+
+    captured_grads = []
+
+    def fake_fusion_attention_grad(q, k, v, grad_output, **kwargs):
+        captured_grads.append((q.shape, k.shape, kwargs))
+        return torch.ones_like(q), torch.ones_like(k), torch.ones_like(v), None, None
+
+    monkeypatch.setattr(torch_npu, "npu_fusion_attention", fake_fusion_attention)
+    monkeypatch.setattr(torch_npu, "npu_fusion_attention_grad", fake_fusion_attention_grad)
+    model = AttentionHolder()
+    NPUBlockDiffusionAttentionConverter(SimpleNamespace(name="block_diffusion")).convert(model)
+
+    q = torch.randn(1, 8, 4, 8, requires_grad=True)
+    k = torch.randn(1, 8, 2, 8, requires_grad=True)
+    v = torch.randn(1, 8, 2, 8, requires_grad=True)
+    output = model.attention(q, k, v, enable_gqa=True)
+    output.sum().backward()
+
+    assert isinstance(model.attention, NPUBlockDiffusionAttention)
+    assert output.shape == q.shape
+    assert [(q_shape, k_shape) for q_shape, k_shape, _ in captured] == [
+        (torch.Size([1, 4, 4, 8]), torch.Size([1, 4, 2, 8])),
+        (torch.Size([1, 4, 4, 8]), torch.Size([1, 8, 2, 8])),
+    ]
+    prefix_kwargs, canvas_kwargs = captured[0][2], captured[1][2]
+    assert prefix_kwargs["input_layout"] == canvas_kwargs["input_layout"] == "BSND"
+    assert prefix_kwargs["sparse_mode"] == 2
+    assert prefix_kwargs["atten_mask"].shape == (2048, 2048)
+    assert canvas_kwargs["sparse_mode"] == 0
+    assert canvas_kwargs["atten_mask"] is None
+    assert prefix_kwargs["scale"] == pytest.approx(8**-0.5)
+    assert canvas_kwargs["scale"] == pytest.approx(8**-0.5)
+    assert len(captured_grads) == 2
+    assert [kwargs["sparse_mode"] for _, _, kwargs in captured_grads] == [0, 2]
+    assert all(tensor.grad is not None for tensor in (q, k, v))
+
+
+def test_simulated_block_diffusion_attention_preserves_fused_boundaries():
+    from torchtitan_npu.simulator.capture.dispatch_capture import OpDispatchCapture
+    from torchtitan_npu.simulator.hardware_shims.block_diffusion_attention import (
+        SimBlockDiffusionAttention,
+    )
+
+    attention = SimBlockDiffusionAttention(
+        SimBlockDiffusionAttention.Config(block_size=4)
+    )
+    q, k, v = [
+        torch.empty((1, 8, 2, 8), device="meta", requires_grad=True)
+        for _ in range(3)
+    ]
+    phase = {"value": "forward"}
+    capture = OpDispatchCapture(phase_provider=lambda: phase["value"])
+
+    with capture:
+        output = attention(q, k, v, enable_gqa=True)
+        phase["value"] = "backward"
+        output.sum().backward()
+
+    nodes = list(capture.build_nodes().values())
+    fused_forward = [
+        node
+        for node in nodes
+        if node.annotations["raw_op_type"] == "npu.npu_fusion_attention.default"
+    ]
+    fused_backward = [
+        node
+        for node in nodes
+        if node.annotations["raw_op_type"] == "npu.npu_fusion_attention_grad.default"
+    ]
+    assert output.shape == q.shape
+    assert len(fused_forward) == len(fused_backward) == 2
+    assert [node.attrs["sparse_mode"] for node in fused_forward] == [2, 0]
+    assert [node.op_type for node in [*fused_forward, *fused_backward]] == ["fusion_attention"] * 4
+    assert [meta.shape for meta in fused_forward[0].inputs] == [(1, 4, 2, 8)] * 3
+    assert [meta.shape for meta in fused_forward[1].inputs] == [
+        (1, 4, 2, 8),
+        (1, 8, 2, 8),
+        (1, 8, 2, 8),
+    ]
+    assert all(tensor.grad is not None for tensor in (q, k, v))
 
 
 def test_prefix_canvas_attention_matches_explicit_reference_mask():
@@ -148,6 +262,45 @@ def test_corruption_only_targets_masked_positions_in_final_canvas():
     assert (corrupted[masked] == 100).all()
     assert (labels[~masked] == IGNORE_INDEX).all()
     assert torch.equal(labels[masked], tokens[masked])
+
+
+def test_dataloader_slides_by_one_canvas_and_restores_corruption_rng():
+    from torchtitan.components.loss import IGNORE_INDEX
+    from torchtitan_npu.models.block_diffusion.config_registry import (
+        block_diffusion_smoketest,
+    )
+
+    config = block_diffusion_smoketest()
+    tokenizer = config.tokenizer.build(tokenizer_path=config.hf_assets_path)
+
+    def build_loader():
+        return config.dataloader.build(
+            dp_world_size=1,
+            dp_rank=0,
+            tokenizer=tokenizer,
+            seq_len=config.training.seq_len,
+            local_batch_size=1,
+        )
+
+    loader = build_loader()
+    iterator = iter(loader)
+    first_inputs, first_labels = next(iterator)
+    checkpoint = loader.state_dict()
+    second_inputs, second_labels = next(iterator)
+
+    restored_loader = build_loader()
+    restored_loader.load_state_dict(checkpoint)
+    restored_inputs, restored_labels = next(iter(restored_loader))
+    assert torch.equal(second_inputs["input"], restored_inputs["input"])
+    assert torch.equal(second_labels, restored_labels)
+
+    def reconstruct(inputs, labels):
+        return torch.where(labels != IGNORE_INDEX, labels, inputs["input"])
+
+    block_size = config.dataloader.block_size
+    first_clean = reconstruct(first_inputs, first_labels)
+    second_clean = reconstruct(second_inputs, second_labels)
+    assert torch.equal(first_clean[:, block_size:], second_clean[:, :-block_size])
 
 
 def test_npu_moe_gate_score_is_meta_safe():
@@ -274,6 +427,8 @@ def test_training_and_simulator_configs_share_model_and_parallelism():
         )
     assert simulation.parallelism == training.parallelism
     assert simulation.training == training.training
+    assert type(simulation.dataloader) is type(training.dataloader)
+    assert type(training.validator.dataloader) is type(training.dataloader)
     assert simulation.compile.enable is False
     assert simulation.simulation.output_dir.endswith("block_diffusion_smoketest")
 

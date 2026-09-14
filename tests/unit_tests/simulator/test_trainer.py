@@ -77,7 +77,10 @@ def test_run_simulation_step_produces_complete_workload_graph(fake_world):
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
     lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda step: 1.0)
 
+    captured = {}
+
     def forward_backward_step(*, input_dict, labels, global_valid_tokens):
+        captured["global_valid_tokens"] = global_valid_tokens
         pred = model(input_dict["input"])
         loss = pred.sum() / global_valid_tokens
         loss.backward()
@@ -96,8 +99,10 @@ def test_run_simulation_step_produces_complete_workload_graph(fake_world):
         lr_scheduler_step=lr_scheduler.step,
         local_batch_size=2,
         seq_len=8,
+        valid_token_count=3,
     )
 
+    assert captured["global_valid_tokens"] == 3.0
     assert graph.num_iterations == 1
     assert {"s0_F", "s0_B", "s0_OPTIMIZER"} <= graph.step_templates.keys()
     assert {template.step_type for template in graph.step_templates.values()} >= {

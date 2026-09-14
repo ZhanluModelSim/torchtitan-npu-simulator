@@ -62,9 +62,10 @@ class BlockDiffusionTransformerBlock(TransformerBlock):
 class BlockDiffusionModel(Decoder):
     """Block-diffusion denoiser used by the training/meta-simulator path.
 
-    One call performs a bidirectional denoising pass over the supplied block.
-    The iterative inference scheduler from ``simulator/raw_model`` is not part
-    of the training contract and is intentionally kept outside this model.
+    One call encodes a causal clean prefix followed by one bidirectional
+    denoising canvas. The iterative inference scheduler from ``simulator/raw_model``
+    is not part of the training contract and is intentionally kept outside this
+    model.
     """
 
     @dataclass(kw_only=True, slots=True)

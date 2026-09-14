@@ -145,12 +145,19 @@ class OpCostModel:
         outputs: list[TensorMeta],
         attrs: dict[str, Any],
     ) -> CostEstimate:
-        if not outputs or len(outputs[0].shape) < 2:
+        if len(inputs) < 2 or not outputs or len(outputs[0].shape) < 2:
             return CostEstimate.unknown_cost()
         output = outputs[0]
-        seq_len = output.shape[-2]
+        key = inputs[1]
+        layout = attrs.get("layout", "BNSD")
+        if layout == "BSND":
+            if len(key.shape) < 2:
+                return CostEstimate.unknown_cost()
+            seq_k = key.shape[1]
+        else:
+            seq_k = key.shape[-2]
         return CostEstimate(
-            flops=4 * _numel(output.shape) * seq_len,
+            flops=4 * _numel(output.shape) * seq_k,
             peak_mem=tensor_volume_bytes(output.shape, output.dtype),
         )
 

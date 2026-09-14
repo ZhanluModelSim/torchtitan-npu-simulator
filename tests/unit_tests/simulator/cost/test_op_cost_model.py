@@ -76,6 +76,24 @@ def test_rms_norm_cost():
     assert result.peak_mem == 2 * 8 * 16 * 4
 
 
+def test_bsnd_fusion_attention_uses_key_length_for_rectangular_canvas():
+    model = OpCostModel()
+    query = TensorMeta(name="q", shape=(1, 64, 8, 128), dtype="bfloat16", device="meta")
+    key = TensorMeta(name="k", shape=(1, 256, 2, 128), dtype="bfloat16", device="meta")
+    value = TensorMeta(name="v", shape=(1, 256, 2, 128), dtype="bfloat16", device="meta")
+    output = TensorMeta(name="out", shape=(1, 64, 8, 128), dtype="bfloat16", device="meta")
+
+    result = model.compute(
+        "fusion_attention",
+        [query, key, value],
+        [output],
+        {"layout": "BSND"},
+    )
+
+    assert result.flops == 4 * 1 * 64 * 8 * 128 * 256
+    assert result.peak_mem == 1 * 64 * 8 * 128 * 2
+
+
 def test_allreduce_cost_doubles_bytes():
     model = OpCostModel()
     t = TensorMeta(name="t", shape=(1024,), dtype="bfloat16", device="meta")

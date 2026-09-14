@@ -27,6 +27,7 @@
 | routed expert intermediate | 4096 |
 | shared experts | 1 |
 | shared expert intermediate | 14336 |
+| training sequence | 4096 |
 | block size | 256 |
 | RoPE theta | 1000000 |
 | tied embedding | false |
@@ -35,15 +36,28 @@
 SwiGLU expert。`num_experts=0` 时切换为 dense SwiGLU，用于单独验证 dense
 路径。
 
-一次训练 `forward` 表示对一个完整 canvas 的去噪网络求值，canvas 内使用
-双向 attention。当前训练/meta 接口要求 `seq_len == block_size`。raw workload
-中的多轮置信度提交、causal boundary pass 和跨 block KV cache 属于推理调度，
-不在本次训练模拟器的声明范围内。
+训练数据使用固定长度滑动窗口，stride 等于 `block_size`。每个窗口的最后一个
+block 是当前 canvas，之前的 token 是已完成的 clean prefix。正式配置因此把
+4096 tokens 解释为 3840-token prefix 加 256-token canvas；每向前滑动 256
+tokens，初始 prefix 之后的下一个 block 成为训练目标。
 
-当前 recipe 使用仓库公共 cross-entropy loss，仅用于打通结构级 meta
-前向、反向和内存/通信捕获。原始文件没有提供 mask corruption、目标构造或
-训练 loss 的数值契约，因此本次接入不声明真实 Block Diffusion 训练语义或
-loss 数值等价。
+每条样本均匀采样 `[0.01, 1.0]` 的 mask ratio，在 canvas 中精确选择相应数量的
+位置并替换为 `mask_token_id`。label 与原 token 同位置对齐；prefix 和未被 mask
+的位置写为 `IGNORE_INDEX`，所以公共 sum-reduction cross-entropy 只在 masked
+positions 上计算，并按全局有效 label 数归一化。
+
+Attention 使用 prefix-causal/canvas-bidirectional 可见域。CPU/reference 路径不物化
+`seq_len x seq_len` mask，而是执行两次等价的 SDPA：prefix query 对 prefix KV
+使用 causal SDPA，canvas query 对全部 prefix+canvas KV 使用 non-causal SDPA，
+最后沿 sequence 维拼接。NPU converter 保留相同的两段 shape，但分别转换为
+`npu_fusion_attention`：prefix 使用压缩 causal mask 和 `sparse_mode=2`，canvas
+不传 mask 并使用 `sparse_mode=0`。因此训练 step 中不会再把 attention 展开为
+`SafeSoftmax/Tril/WhereSelf` 等算子。`seq_len` 必须不小于 `block_size` 且能被其整除。
+
+上述 corruption 和 loss 是根据 raw workload 的逐 block 生成语义补齐的训练
+契约。由于原始文件没有给出权威训练代码或 checkpoint，本接入不声明 mask-ratio
+分布、loss weighting 或梯度与某个外部实现数值等价。raw workload 中的多轮
+置信度提交、causal boundary pass 和跨 block KV cache 仍属于推理调度范围。
 
 ## 参数量公式
 
@@ -75,10 +89,10 @@ total_dense = embedding + output + final_norm
 
 ## 配置规格
 
-- `dense_debug`：两层 dense，小维度 CPU/meta 单测。
-- `debug`：两层、8 experts、top-2，验证 MoE 和 converter 路径。
-- `reduced`：八层、32 experts、top-4，用于核心并行组合。
-- `full`：97 层、1024 experts、top-8，正式结构容量验证。
+- `dense_debug`：两层 dense，seq 16 / block 8，小维度 CPU/meta 单测。
+- `debug`：两层、8 experts、top-2，seq 32 / block 16。
+- `reduced`：八层、32 experts、top-4，seq 256 / block 64。
+- `full`：97 层、1024 experts、top-8，seq 4096 / block 256。
 
 训练/模拟器配置名称为：
 
@@ -91,7 +105,10 @@ total_dense = embedding + output + final_norm
 
 | 能力 | 状态 | 实现依据 |
 | --- | --- | --- |
-| 单卡 meta 前向/反向 | 支持 | 原生 Module/ModelSpec 和双向 SDPA |
+| sliding-window corruption | 支持 | 一个 canvas stride，最后 block 精确随机 mask |
+| masked-only same-position loss | 支持 | `IGNORE_INDEX` labels 和有效 token 归一化 |
+| prefix-causal/canvas-bidirectional attention | 支持 | reference 两段 SDPA；NPU 两段融合 attention |
+| 单卡 meta 前向/反向 | 支持 | 原生 Module/ModelSpec 和 prefix/canvas SDPA |
 | TP / sequence parallel | 支持 | TorchTitan sparse decoder 公共计划 |
 | EP / ETP（分别启用） | 支持 | common MoE 的 ExpertParallel/ExpertTensorParallel |
 | EP > 1 与 ETP > 1 同时启用 | 不支持、fail fast | 当前公共 ExpertParallel 不能处理二维 expert mesh |
@@ -99,10 +116,10 @@ total_dense = embedding + output + final_norm
 | FSDP/eFSDP | 支持 | sparse decoder 公共 fully_shard 计划 |
 | activation checkpoint | 支持 | 公共 sparse AC 计划 |
 | PP | 支持 | `pipeline_llm`，需在最终组合单独验收 |
-| NPU RMSNorm/RoPE/GMM/EP dispatch | 支持 | 仓库现有通用 converter |
+| NPU Attention/RMSNorm/RoPE/GMM/EP dispatch | 支持 | 两段 attention 专用 converter 和仓库通用 converter |
 | raw schema state-dict round trip | 支持 | `BlockDiffusionStateDictAdapter` |
 | 真实 NPU 数值训练 | 未声明 | 不属于 meta 模拟器验收范围 |
-| DLM 多轮生成和 KV cache | 不支持 | 训练模型 fail-fast 限定为单 canvas |
+| DLM 多轮生成和 KV cache | 不支持 | 本次实现训练范式，不含推理解码循环 |
 | 公开 HF checkpoint 数值兼容 | 不支持 | 原始实现未提供 checkpoint 契约 |
 
 上述“支持”表示已接入对应公共实现，最终能否标记为 Ready 仍以验收证据矩阵
