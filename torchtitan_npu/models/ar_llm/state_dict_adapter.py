@@ -117,7 +117,6 @@ class ArLlmStateDictAdapter(StateDictAdapter):
     def from_hf(self, hf_state_dict: dict[str, Any]) -> dict[str, Any]:
         state_dict: dict[str, Any] = {}
         routed_experts: dict[tuple[str, str], dict[int, Any]] = {}
-        shared_experts: dict[tuple[str, str], dict[int, Any]] = {}
         engram_buffers: dict[str, Any] = {}
 
         for hf_key, tensor in hf_state_dict.items():
@@ -152,7 +151,9 @@ class ArLlmStateDictAdapter(StateDictAdapter):
             )
             if shared_match:
                 layer_idx, expert_idx, weight_name = shared_match.groups()
-                shared_experts.setdefault((layer_idx, weight_name), {})[int(expert_idx)] = tensor
+                state_dict[
+                    f"layers.{layer_idx}.moe.shared_experts.{expert_idx}.{weight_name}"
+                ] = tensor
                 continue
 
             engram_match = re.match(
@@ -169,10 +170,6 @@ class ArLlmStateDictAdapter(StateDictAdapter):
 
         for (layer_idx, weight_name), weights_by_expert in routed_experts.items():
             state_dict[f"layers.{layer_idx}.moe.experts.{weight_name}"] = torch.stack(
-                [weights_by_expert[index] for index in sorted(weights_by_expert)], dim=0
-            )
-        for (layer_idx, weight_name), weights_by_expert in shared_experts.items():
-            state_dict[f"layers.{layer_idx}.moe.shared_experts.{weight_name}"] = torch.stack(
                 [weights_by_expert[index] for index in sorted(weights_by_expert)], dim=0
             )
         state_dict.update(engram_buffers)
@@ -210,17 +207,16 @@ class ArLlmStateDictAdapter(StateDictAdapter):
                 continue
 
             shared_match = re.match(
-                r"layers\.(\d+)\.moe\.shared_experts\."
+                r"layers\.(\d+)\.moe\.shared_experts\.(\d+)\."
                 r"(gate_down|up_down|latent_to_inter|inter_to_latent|latent_to_out)$",
                 key,
             )
             if shared_match:
-                layer_idx, weight_name = shared_match.groups()
-                for expert_idx, expert_weight in enumerate(value.unbind(0)):
-                    hf_state_dict[
-                        f"model.layers.{layer_idx}.block_sparse_moe.shared_experts."
-                        f"{expert_idx}.{weight_name}.weight"
-                    ] = expert_weight
+                layer_idx, expert_idx, weight_name = shared_match.groups()
+                hf_state_dict[
+                    f"model.layers.{layer_idx}.block_sparse_moe.shared_experts."
+                    f"{expert_idx}.{weight_name}.weight"
+                ] = value
                 continue
 
             buffer_match = re.match(

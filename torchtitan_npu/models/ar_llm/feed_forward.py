@@ -77,22 +77,29 @@ def compute_load_balance_loss(
 
 
 class LatentExpertMLP(nn.Module):
-    """Dense latent expert (used for the shared-expert group)."""
+    """Single dense latent expert (one shared expert).
+
+    Weights are registered per expert (``[out, in]`` matrices, standard Linear
+    layout) instead of stacked along a leading ``[num_shared_experts, ...]``
+    dim: FSDP shards ``dim 0``, so a stacked tensor whose leading dim is
+    smaller than the mesh size degenerates into per-rank padding (every rank
+    allocates a full expert row). Per-expert params shard evenly and the TP
+    inter-dim plan aligns exactly as before.
+    """
 
     _tp_group = None
 
-    def __init__(self, model_args: "ArLlmModel.Config", num_experts: int = 1):
+    def __init__(self, model_args: "ArLlmModel.Config"):
         super().__init__()
         d = model_args.dim
         latent = model_args.moe_latent_dim
         inter = model_args.moe_intermediate_size
-        self.num_experts = num_experts
         self.clamp_val = model_args.swiglu_clamp
-        self.gate_down = nn.Parameter(torch.empty(num_experts, latent, d))
-        self.up_down = nn.Parameter(torch.empty(num_experts, latent, d))
-        self.latent_to_inter = nn.Parameter(torch.empty(num_experts, inter, latent))
-        self.inter_to_latent = nn.Parameter(torch.empty(num_experts, latent, inter))
-        self.latent_to_out = nn.Parameter(torch.empty(num_experts, d, latent))
+        self.gate_down = nn.Parameter(torch.empty(latent, d))
+        self.up_down = nn.Parameter(torch.empty(latent, d))
+        self.latent_to_inter = nn.Parameter(torch.empty(inter, latent))
+        self.inter_to_latent = nn.Parameter(torch.empty(latent, inter))
+        self.latent_to_out = nn.Parameter(torch.empty(d, latent))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = self._forward_weights(
@@ -103,7 +110,7 @@ class LatentExpertMLP(nn.Module):
             self._local(self.inter_to_latent),
             self._local(self.latent_to_out),
         )
-        return out.sum(dim=0) if self.num_experts > 1 else out.squeeze(0)
+        return out
 
     @staticmethod
     def _local(w: torch.Tensor) -> torch.Tensor:
@@ -118,17 +125,20 @@ class LatentExpertMLP(nn.Module):
         inter_to_latent: torch.Tensor,
         latent_to_out: torch.Tensor,
     ) -> torch.Tensor:
-        gate = torch.einsum("bsd,nld->nbsl", x, gate_down)
-        up = torch.einsum("bsd,nld->nbsl", x, up_down)
-        gate_inter = torch.einsum("nbsl,nil->nbsi", gate, latent_to_inter)
-        up_inter = torch.einsum("nbsl,nil->nbsi", up, latent_to_inter)
+        lead_shape = x.shape[:-1]
+        x2 = x.reshape(-1, x.shape[-1])
+        gate = F.linear(x2, gate_down)
+        up = F.linear(x2, up_down)
+        gate_inter = F.linear(gate, latent_to_inter)
+        up_inter = F.linear(up, latent_to_inter)
         act = swiglu(up_inter, gate_inter, self.clamp_val)
-        latent_out = torch.einsum("nbsi,nli->nbsl", act, inter_to_latent)
+        latent_out = F.linear(act, inter_to_latent)
         if self._tp_group is not None:
             import torch.distributed.nn.functional as dist_nn
 
             latent_out = dist_nn.all_reduce(latent_out, group=self._tp_group)
-        return torch.einsum("nbsl,ndl->nbsd", latent_out, latent_to_out)
+        out = F.linear(latent_out, latent_to_out)
+        return out.reshape(*lead_shape, out.shape[-1])
 
 
 class LatentGroupedExperts(nn.Module):
@@ -368,7 +378,9 @@ class ArLlmMoE(nn.Module):
         self.reorderer = ArLlmTokenReorderer(model_args.num_routed_experts, model_args.num_experts_per_token)
         self.experts = LatentGroupedExperts(model_args)
         if model_args.num_shared_experts > 0:
-            self.shared_experts = LatentExpertMLP(model_args, num_experts=model_args.num_shared_experts)
+            self.shared_experts = nn.ModuleList(
+                [LatentExpertMLP(model_args) for _ in range(model_args.num_shared_experts)]
+            )
         else:
             self.shared_experts = None
         # Routing histogram consumed by the MoE load-balancing optimizer hook
@@ -404,7 +416,8 @@ class ArLlmMoE(nn.Module):
         combined.index_add_(0, token_indices, routed_output.to(combined.dtype))
         output = combined.view(original_shape)
         if self.shared_experts is not None:
-            output = output + self.shared_experts(identity)
+            for shared_expert in self.shared_experts:
+                output = output + shared_expert(identity)
         return output
 
 

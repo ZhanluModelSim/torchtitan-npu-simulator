@@ -137,7 +137,8 @@ shape-only shim 在模型构造与并行化完成后绑定（`apply_ar_llm_shims
 
 - 机制：`MXFP8Converter`（torchao）按 **module fqn 子串匹配**包装目标模块下的 `nn.Linear` 权重与 3D `nn.Parameter` 为 `MXFP8TrainingWeightWrapperTensor`；wrapper 只拦截 `linear/mm/matmul/addmm/_grouped_mm`，故命中模块的矩阵乘真实派发为 `npu.npu_dynamic_mx_quant ×2 + npu.npu_quant_matmul`（Linear 的 F/dx/dw）或 `npu.npu_grouped_dynamic_mx_quant + npu.npu_grouped_matmul`（routed experts 的 `_grouped_mm`），meta kernel 直接执行并进入算子/内存/依赖账本。
 - 默认范围（`DEFAULT_MXFP8_FQNS`）：`moe.experts`、`moe.shared_experts`、`attention.q_proj`、`attention.kv_proj`、`attention.core`（indexer）、`attention.kda`。CSA/HCA 的 fused core 本身仍走 shape-only shim，不受影响。
-- **einsum 覆盖**：wrapper 原生不拦截 einsum。`patches/torchao_npu/mxfp8_wrapper_einsum.py` 将「单个 3D `[n,out,in]` 包装权重、逐 expert 线性形（`A @ W[i].t()`）」的 einsum 降级为 `n` 次 `NpuMXFP8MM` 后 stack——`moe.shared_experts` 的 6 个投影由此全部走 FP8；`attention.o_proj`（GroupedOProjection，einsum 含交叉维度重排）不匹配该模式，保持 BF16 回退（显式排除于默认清单）。
+- **einsum 覆盖**：wrapper 原生不拦截 einsum。`patches/torchao_npu/mxfp8_wrapper_einsum.py` 将「单个 3D `[n,out,in]` 包装权重、逐 expert 线性形（`A @ W[i].t()`）」的 einsum 降级为 `n` 次 `NpuMXFP8MM` 后 stack——`attention.o_proj`（GroupedOProjection，einsum 含交叉维度重排）不匹配该模式，保持 BF16 回退（显式排除于默认清单）。
+- **shared experts 走原生 linear 覆盖**：共享专家参数按专家拆分（每个 `[out, in]`，不沿 `num_shared_experts` 维堆叠；堆叠维小于 FSDP mesh 时 Shard(0) 会退化为每 rank 一整行 padding），前向用 `F.linear` 表达，wrapper 原生拦截 `aten.linear`，无需 einsum patch 即走 FP8。
 - 内存口径：wrapper 保留 fp32 主权重（FP8 副本为瞬态），`persistent_param_bytes` 不变；激活侧新增量化 scale/FP8 输入的瞬态占用。
 - CLI：`--mxfp8-fqns "moe.experts,moe.shared_experts"`（逗号分隔）整体替换默认清单；要求 config 恰含一个 MXFP8 converter，否则报错。
 

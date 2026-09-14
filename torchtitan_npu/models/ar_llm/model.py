@@ -520,14 +520,15 @@ class ArLlmModel(Module):
                 if layer.attention.attn_sink is not None:
                     nn.init.zeros_(layer.attention.attn_sink)
             if layer.moe.shared_experts is not None:
-                for weight in (
-                    layer.moe.shared_experts.gate_down,
-                    layer.moe.shared_experts.up_down,
-                    layer.moe.shared_experts.latent_to_inter,
-                    layer.moe.shared_experts.inter_to_latent,
-                    layer.moe.shared_experts.latent_to_out,
-                ):
-                    nn.init.normal_(weight, mean=0.0, std=init_std)
+                for shared_expert in layer.moe.shared_experts:
+                    for weight in (
+                        shared_expert.gate_down,
+                        shared_expert.up_down,
+                        shared_expert.latent_to_inter,
+                        shared_expert.inter_to_latent,
+                        shared_expert.latent_to_out,
+                    ):
+                        nn.init.normal_(weight, mean=0.0, std=init_std)
             nn.init.normal_(
                 layer.moe.router.gate.weight,
                 mean=0.0,

@@ -242,10 +242,10 @@ class _LatentInterTP(ParallelStyle):
                 mod.w5 = nn.Parameter(distribute_tensor(mod.w5, mesh, [Shard(2)]))
             elif isinstance(mod, LatentExpertMLP):
                 mod.latent_to_inter = nn.Parameter(
-                    distribute_tensor(mod.latent_to_inter, mesh, [Shard(1)])
+                    distribute_tensor(mod.latent_to_inter, mesh, [Shard(0)])
                 )
                 mod.inter_to_latent = nn.Parameter(
-                    distribute_tensor(mod.inter_to_latent, mesh, [Shard(2)])
+                    distribute_tensor(mod.inter_to_latent, mesh, [Shard(1)])
                 )
             else:
                 raise TypeError(f"Unsupported latent-expert module: {type(mod).__name__}")
@@ -609,13 +609,15 @@ def _apply_moe_parallel(
                     "the expert parallel plan did not apply"
                 )
         if tp_mesh is not None and moe.shared_experts is not None:
-            if moe.shared_experts.latent_to_inter.shape[1] % tp_mesh.size() != 0:
+            inter_dim = moe.shared_experts[0].latent_to_inter.shape[0]
+            if inter_dim % tp_mesh.size() != 0:
                 raise ValueError(
                     "moe_intermediate_size="
-                    f"{moe.shared_experts.latent_to_inter.shape[1]} must be divisible by "
+                    f"{inter_dim} must be divisible by "
                     f"TP degree={tp_mesh.size()}"
                 )
-            parallelize_module(moe.shared_experts, tp_mesh, _LatentInterTP())
+            for shared_expert in moe.shared_experts:
+                parallelize_module(shared_expert, tp_mesh, _LatentInterTP())
 
     logger.info("Applied ar_llm expert parallelism")
 
