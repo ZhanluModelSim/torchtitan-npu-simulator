@@ -53,7 +53,9 @@ from torchtitan_npu.simulator.rank_table import build_rank_table
 from torchtitan_npu.simulator.selective_ac import (
     SelectiveACSaveOp,
     selective_ac_save_ops_context,
+    synthetic_ac_save_patterns,
 )
+from torchtitan_npu.simulator.synthetic_ac import synthetic_ac_policy_context
 from torchtitan_npu.simulator.viz.csv_export import export_kernel_summary_csv
 from torchtitan_npu.simulator.viz.dot_export import export_dot
 from torchtitan_npu.simulator.viz.html_export import export_html
@@ -190,6 +192,7 @@ def run_simulation_step(
     memory_parameter_storage_dtype: str = "",
     memory_offload_ac_saved_tensors: bool = False,
     fsdp_allgather_transport_dtype: str = "",
+    synthetic_ac_patterns: tuple[str, ...] = (),
     pp_schedule: Any | None = None,
 ) -> WorkloadGraph:
     """Run one forward+backward+optimizer step under full capture and
@@ -284,10 +287,17 @@ def run_simulation_step(
         if enable_memory_tracking
         else nullcontext()
     )
-    with capture_fake_collectives(
-        memory_tracking_enabled=enable_memory_tracking,
-        capture_process_rank=rank,
-    ) as comm_recorder, boundary, module_path_tracker, capture, saved_tensor_context:
+    with (
+        capture_fake_collectives(
+            memory_tracking_enabled=enable_memory_tracking,
+            capture_process_rank=rank,
+        ) as comm_recorder,
+        boundary,
+        module_path_tracker,
+        capture,
+        saved_tensor_context,
+        synthetic_ac_policy_context(synthetic_ac_patterns),
+    ):
         boundary.mark("forward")
         with tp_collective_context:
             forward_backward_step(
@@ -559,6 +569,11 @@ class SimulationTrainer(Trainer):
         for model_part in self.model_parts:
             apply_kimi_k3_shims(model_part)
         self.simulation_config = config.simulation
+        self._synthetic_ac_save_patterns = (
+            synthetic_ac_save_patterns(config.simulation.selective_ac_save_ops)
+            if config.activation_checkpoint.mode == "selective"
+            else ()
+        )
         self.workload_graph: WorkloadGraph | None = None
 
     def train(self) -> None:
@@ -611,6 +626,7 @@ class SimulationTrainer(Trainer):
                 fsdp_allgather_transport_dtype=(
                     "float8_e4m3fn" if self.simulation_config.enable_fsdp_allgather_fp8 else ""
                 ),
+                synthetic_ac_patterns=self._synthetic_ac_save_patterns,
                 pp_schedule=pp_schedule,
             )
 

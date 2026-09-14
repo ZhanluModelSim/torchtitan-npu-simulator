@@ -11,6 +11,7 @@ from torchtitan_npu.simulator.selective_ac import (
     _FULL_CHOICES,
     _normalized_selection,
     selective_ac_save_ops_context,
+    synthetic_ac_save_patterns,
 )
 
 
@@ -46,3 +47,17 @@ def test_mm_uses_upstream_policy_while_gmm_is_added_to_save_ops():
         assert torch.ops.aten.mm.default in save_ops
         assert torch.ops.aten._grouped_mm.default in save_ops
         assert activation_checkpoint.create_selective_checkpoint_contexts is original_context_factory
+
+
+@pytest.mark.parametrize("selection", [None, ["default"], ["attention"], ["full"]])
+def test_attention_choices_save_synthetic_attention_ops(selection):
+    patterns = synthetic_ac_save_patterns(selection)
+
+    assert "aclnn.npu_sparse_attn_sharedkv" in patterns
+    assert "triton_ascend_kernels.chunk_kda" in patterns
+    assert "fusion_attention" in patterns
+
+
+@pytest.mark.parametrize("selection", [["none"], ["mm"], ["gmm", "quant-mm"]])
+def test_non_attention_choices_recompute_synthetic_attention_ops(selection):
+    assert synthetic_ac_save_patterns(selection) == ()

@@ -16,6 +16,7 @@ import torch
 from torch.distributed.tensor import DTensor
 
 from torchtitan_npu.simulator.capture.dispatch_capture import get_active_capture
+from torchtitan_npu.simulator.synthetic_ac import run_synthetic_op
 
 
 def _record(raw_op_type: str, inputs: list[torch.Tensor], outputs: list[torch.Tensor], module_path: str) -> None:
@@ -45,12 +46,11 @@ class _SimChunkKDAFn(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, v, g, beta, A_log, dt_bias, module_path):  # noqa: ANN001
         # Output shape: same as v (B, S, H, D)
-        output = _uncaptured_empty_like(v)
-        _record(
+        output = run_synthetic_op(
             "triton_ascend_kernels.chunk_kda",
-            [q, k, v, g, beta, A_log, dt_bias],
-            [output],
-            module_path,
+            inputs=[q, k, v, g, beta, A_log, dt_bias],
+            output_factory=lambda: _uncaptured_empty_like(v),
+            module_path=module_path,
         )
         ctx.save_for_backward(q, k, v, g, beta, A_log, dt_bias)
         ctx.module_path = module_path

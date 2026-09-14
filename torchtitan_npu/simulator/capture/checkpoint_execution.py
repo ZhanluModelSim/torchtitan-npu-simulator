@@ -81,18 +81,50 @@ class _ExecutionKindContext(contextlib.AbstractContextManager):
             kind_context.__exit__(exc_type, exc_value, traceback)
 
 
+class _CombinedContext(contextlib.AbstractContextManager):
+    """Enter reusable contexts together without a one-shot generator."""
+
+    def __init__(self, *contexts: contextlib.AbstractContextManager) -> None:
+        self._contexts = contexts
+        self._stacks: list[contextlib.ExitStack] = []
+
+    def __enter__(self) -> "_CombinedContext":
+        stack = contextlib.ExitStack()
+        try:
+            for context in self._contexts:
+                stack.enter_context(context)
+        except BaseException:
+            stack.close()
+            raise
+        self._stacks.append(stack)
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):  # noqa: ANN001, ANN204
+        return self._stacks.pop().__exit__(exc_type, exc_value, traceback)
+
+
 def _compose_context_fn(
     context_fn: Callable[[], tuple[contextlib.AbstractContextManager, contextlib.AbstractContextManager]] | None,
 ) -> Callable[[], tuple[contextlib.AbstractContextManager, contextlib.AbstractContextManager]]:
     def tracked_contexts() -> tuple[contextlib.AbstractContextManager, contextlib.AbstractContextManager]:
+        from torchtitan_npu.simulator.synthetic_ac import synthetic_ac_contexts
+
         if context_fn is None:
             forward_context = contextlib.nullcontext()
             recompute_context = contextlib.nullcontext()
         else:
             forward_context, recompute_context = context_fn()
+        synthetic_forward, synthetic_recompute = synthetic_ac_contexts()
+
         return (
-            _ExecutionKindContext(forward_context, ORIGINAL_FORWARD),
-            _ExecutionKindContext(recompute_context, RECOMPUTE),
+            _ExecutionKindContext(
+                _CombinedContext(forward_context, synthetic_forward),
+                ORIGINAL_FORWARD,
+            ),
+            _ExecutionKindContext(
+                _CombinedContext(recompute_context, synthetic_recompute),
+                RECOMPUTE,
+            ),
         )
 
     return tracked_contexts

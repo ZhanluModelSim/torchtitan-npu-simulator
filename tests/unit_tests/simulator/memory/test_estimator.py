@@ -133,7 +133,9 @@ def test_checkpoint_plugin_releases_internal_forward_tensor_before_backward():
         event(5, 20, "aten.relu_backward.default", inputs=[internal], outputs=[grad], phase="backward"),
     ])
 
-    lifetime = next(item for item in plan.tensor_lifetimes if item.tensor_id == "tensor:2")
+    lifetime = next(
+        item for item in plan.tensor_lifetimes if item.tensor_id == "tensor:2"
+    )
     assert lifetime.kind == "checkpoint_recompute_temp"
     assert lifetime.death_seq == 1
     release = next(item for item in plan.timeline_events if item.tensor_id == "tensor:2" and item.action == "free")
@@ -963,6 +965,24 @@ def test_alias_consumer_extends_base_lifetime():
     base_lifetime = next(item for item in plan.tensor_lifetimes if item.tensor_id == "tensor:2")
     assert base_lifetime.death_seq == 5
     assert base_lifetime.consumer_ops[-1] == 12
+
+
+def test_repeat_allocates_distinct_storage_instead_of_matching_t_alias_rule():
+    source = tref(1, 16)
+    repeated = tref(2, 64)
+    plan = estimate_static_memory([
+        event(
+            0,
+            10,
+            "aten.repeat.default",
+            inputs=[source],
+            outputs=[repeated],
+        )
+    ])
+
+    lifetime = next(item for item in plan.tensor_lifetimes if item.tensor_id == "tensor:2")
+    assert lifetime.kind != "alias"
+    assert lifetime.num_bytes == 64
 
 
 def test_parameter_alias_is_not_counted_as_external_input():

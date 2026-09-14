@@ -414,6 +414,22 @@ class OpDispatchCapture(TorchDispatchMode):
             extra_annotations=extra_annotations,
         )
 
+    def record_synthetic_ac_cache_hit(
+        self,
+        raw_op_type: str,
+        outputs: Any,
+        *,
+        module_path: str = "",
+    ) -> None:
+        """Record a memory-only use of outputs restored by synthetic SAC."""
+        self._record_event(
+            f"simulator.synthetic_ac_cache_hit[{raw_op_type}]",
+            _flatten_tensors(outputs),
+            [],
+            module_path,
+            visible_in_ir=False,
+        )
+
     def record_checkpoint_boundary(
         self,
         checkpoint_id: str,
@@ -480,6 +496,7 @@ class OpDispatchCapture(TorchDispatchMode):
         attrs: dict[str, Any] | None = None,
         extra_annotations: dict[str, Any] | None = None,
         mutated_inputs: list[torch.Tensor] | None = None,
+        visible_in_ir: bool = True,
     ) -> None:
         if not self._capture_l0:
             return  # pass-through: duplicate (stage, comp_type) class skips L0 capture
@@ -583,7 +600,10 @@ class OpDispatchCapture(TorchDispatchMode):
         )
         signature = _shape_signature(candidate)
 
-        if self._events and signature == self._last_signature:
+        if not visible_in_ir:
+            op_id = _next_op_id()
+            candidate.op_id = op_id
+        elif self._events and signature == self._last_signature:
             retained = self._events[-1]
             retained.repeat_count += 1
             op_id = retained.op_id
@@ -636,7 +656,8 @@ class OpDispatchCapture(TorchDispatchMode):
             if tid in self._pending_comm_links:
                 event = self._pending_comm_links.pop(tid)
                 event.dst_entry_op = op_id
-        self._last_signature = signature
+        if visible_in_ir:
+            self._last_signature = signature
 
         for tid in output_ids:
             self._suppressed_tensor_predecessors.pop(tid, None)

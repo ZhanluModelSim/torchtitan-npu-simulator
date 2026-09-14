@@ -64,6 +64,11 @@ _OP_PATHS: dict[str, tuple[str, ...]] = {
     ),
     "max": ("aten.max.default",),
 }
+_SYNTHETIC_ATTENTION_SAVE_PATTERNS = (
+    "aclnn.npu_sparse_attn_sharedkv",
+    "triton_ascend_kernels.chunk_kda",
+    "fusion_attention",
+)
 _PATCH_LOCK = threading.RLock()
 _explicit_selection_active: ContextVar[bool] = ContextVar(
     "simulator_explicit_selective_ac_save_ops", default=False
@@ -111,6 +116,22 @@ def _normalized_selection(save_ops: list[SelectiveACSaveOp]) -> set[SelectiveACS
         selected.remove("full")
         selected.update(_FULL_CHOICES)
     return selected
+
+
+def synthetic_ac_save_patterns(
+    save_ops: list[SelectiveACSaveOp] | None,
+) -> tuple[str, ...]:
+    """Map simulator SAC choices to synthetic forward-op name patterns."""
+    if save_ops is None:
+        # TorchTitan's default policy saves attention operators. Synthetic
+        # attention kernels should preserve the same semantic default.
+        return _SYNTHETIC_ATTENTION_SAVE_PATTERNS
+    selected = _normalized_selection(save_ops)
+    if "none" in selected:
+        return ()
+    if "default" in selected or "attention" in selected:
+        return _SYNTHETIC_ATTENTION_SAVE_PATTERNS
+    return ()
 
 
 def _selected_save_ops(

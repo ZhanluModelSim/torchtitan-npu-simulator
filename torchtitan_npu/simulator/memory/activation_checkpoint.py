@@ -101,6 +101,22 @@ class ActivationCheckpointPlugin(MemoryModelPlugin):
 
     def apply(self, context: MemoryModelContext) -> list[TensorLifetime]:
         event_by_seq = {event.seq_idx: event for event in context.events}
+        saved_unpack_seq_by_tensor_id: dict[int, int] = {}
+        for saved in context.autograd_saved_tensors:
+            if (
+                saved.phase != "forward"
+                or saved.execution_kind != "original_forward"
+                or saved.unpack_seq < 0
+            ):
+                continue
+            root_tensor_id = _resolve_alias(
+                saved.tensor_id,
+                context.alias_base_by_tensor_id,
+            )
+            saved_unpack_seq_by_tensor_id[root_tensor_id] = max(
+                saved_unpack_seq_by_tensor_id.get(root_tensor_id, -1),
+                saved.unpack_seq,
+            )
         boundaries_by_scope: dict[str, list[CheckpointBoundaryEvent]] = {}
         for boundary in context.checkpoint_boundary_events:
             boundaries_by_scope.setdefault(
@@ -248,6 +264,14 @@ class ActivationCheckpointPlugin(MemoryModelPlugin):
                     if is_saved_activation and lifetime is not None:
                         lifetime.kind = "checkpoint_saved_activation"
                         lifetime.reason = "checkpoint_boundary_input"
+                        unpack_seq = saved_unpack_seq_by_tensor_id.get(root_tensor_id)
+                        if unpack_seq is not None:
+                            # Non-reentrant checkpointing saves a detached alias of
+                            # the boundary input.  That alias is unpacked during
+                            # backward without appearing as a normal dispatcher
+                            # consumer of the original storage, so raw use-def alone
+                            # otherwise frees the AC point in forward.
+                            lifetime.death_seq = max(lifetime.death_seq, unpack_seq)
                         saved_tensor_ids.add(root_tensor_id)
                         if context.offload_ac_saved_tensors:
                             lifetime.modeled_num_bytes = 0

@@ -7,6 +7,7 @@ from __future__ import annotations
 import torch
 
 from torchtitan_npu.simulator.capture.dispatch_capture import get_active_capture
+from torchtitan_npu.simulator.synthetic_ac import run_synthetic_op
 
 
 def _empty_like(tensor: torch.Tensor) -> torch.Tensor:
@@ -54,11 +55,17 @@ def _record(
 class _SimGatedMLA(torch.autograd.Function):
     @staticmethod
     def forward(ctx, query, key, value, module_path):  # noqa: ANN001
-        output = _empty_like(query)
+        attrs = {"num_heads": int(query.shape[1]), "layout": "BNSD"}
+        output = run_synthetic_op(
+            "fusion_attention",
+            inputs=[query, key, value],
+            output_factory=lambda: _empty_like(query),
+            module_path=module_path,
+            attrs=attrs,
+        )
         ctx.save_for_backward(query, key, value)
         ctx.module_path = module_path
-        ctx.attrs = {"num_heads": int(query.shape[1]), "layout": "BNSD"}
-        _record("fusion_attention", [query, key, value], [output], module_path, attrs=ctx.attrs)
+        ctx.attrs = attrs
         return output
 
     @staticmethod

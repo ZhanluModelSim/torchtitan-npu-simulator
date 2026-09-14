@@ -22,7 +22,7 @@ _ALIAS_TOKENS = (
     "squeeze",
     "unsqueeze",
     "detach",
-    "t.default",
+    ".t.default",
 )
 
 _ALLOC_TOKENS = (

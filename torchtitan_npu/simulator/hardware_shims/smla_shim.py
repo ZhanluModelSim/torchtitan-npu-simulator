@@ -17,6 +17,7 @@ import torch
 from torchtitan_npu.converters.kernels.npu_smla import _add_offset_to_valid_sparse_indices
 from torchtitan_npu.models.deepseek_v4.model import LiCompute, LiLoss, SparseAttention
 from torchtitan_npu.simulator.capture.dispatch_capture import get_active_capture
+from torchtitan_npu.simulator.synthetic_ac import run_synthetic_op
 
 
 def _record(raw_op_type: str, inputs: list[torch.Tensor], outputs: list[torch.Tensor], module_path: str) -> None:
@@ -43,14 +44,24 @@ class _SimSparseAttnFn(torch.autograd.Function):
         metadata = torch.empty(1024, dtype=torch.int32, device=query.device)
         _record("aclnn.npu_sparse_attn_sharedkv_metadata", [query], [metadata], module_path)
 
-        result = torch.empty((B, S, N, D), dtype=dtype, device=query.device)
-        softmax_lse = torch.empty((B, S, N, 1), dtype=torch.float32, device=query.device)
         fwd_inputs = [query, ori_kv, sinks, metadata]
         if cmp_kv is not None:
             fwd_inputs.append(cmp_kv)
         if cmp_sparse_indices is not None:
             fwd_inputs.append(cmp_sparse_indices)
-        _record("aclnn.npu_sparse_attn_sharedkv", fwd_inputs, [result, softmax_lse], module_path)
+        result, softmax_lse = run_synthetic_op(
+            "aclnn.npu_sparse_attn_sharedkv",
+            inputs=fwd_inputs,
+            output_factory=lambda: (
+                torch.empty((B, S, N, D), dtype=dtype, device=query.device),
+                torch.empty(
+                    (B, S, N, 1),
+                    dtype=torch.float32,
+                    device=query.device,
+                ),
+            ),
+            module_path=module_path,
+        )
 
         ctx.save_for_backward(query, ori_kv, cmp_kv, result, softmax_lse, sinks)
         ctx.module_path = module_path
