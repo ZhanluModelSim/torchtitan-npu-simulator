@@ -13,10 +13,11 @@ import torch.nn as nn
 from torchtitan_npu.converters.convert_utils import replace_module_with_name
 from torchtitan_npu.converters.kernels.block_diffusion_attention import BlockDiffusionAttentionModelConfig
 from torchtitan_npu.converters.model_custom_interface import ModelCustomConverter
-from torchtitan_npu.models.block_diffusion.attention import PrefixCanvasSDPA
+from torchtitan_npu.models.block_diffusion.attention import ScaledCausalSDPA
 from torchtitan_npu.simulator.capture.dispatch_capture import get_active_capture
 
 _original_converter: type | None = None
+_TORCH_MAX_INT = 2_147_483_647
 
 
 def _empty_like(tensor: torch.Tensor) -> torch.Tensor:
@@ -55,13 +56,42 @@ def _record(
 class _SimFusionAttention(torch.autograd.Function):
     @staticmethod
     # pyrefly: ignore [bad-override]
-    def forward(ctx, q, k, v, scale, sparse_mode, head_num, module_path):
+    def forward(
+        ctx,
+        q,
+        k,
+        v,
+        scale,
+        sparse_mode,
+        head_num,
+        kv_head_num,
+        head_dim,
+        compute_alpha,
+        module_path,
+    ):
         output = _empty_like(q)
         attrs = {
             "num_heads": int(head_num),
+            "head_num": int(head_num),
+            "num_kv_heads": int(kv_head_num),
+            "head_dim": int(head_dim),
             "layout": "BSH",
+            "input_layout": "BSH",
             "scale": float(scale),
+            "scale_value": float(scale),
+            "keep_prob": 1.0,
+            "pre_tokens": _TORCH_MAX_INT,
+            "pre_tockens": _TORCH_MAX_INT,
+            "next_tokens": 0,
+            "next_tockens": 0,
+            "inner_precise": 0,
             "sparse_mode": int(sparse_mode),
+            "is_causal": True,
+            "q_seq_len": int(q.shape[1]),
+            "kv_seq_len": int(k.shape[1]),
+            "gen_mask_parallel": True,
+            "sync": False,
+            "compute_alpha": float(compute_alpha),
         }
         _record("npu.npu_fusion_attention.default", [q, k, v], [output], module_path, attrs)
         ctx.save_for_backward(q, k, v)
@@ -81,10 +111,10 @@ class _SimFusionAttention(torch.autograd.Function):
             ctx.module_path,
             ctx.attrs,
         )
-        return *grads, None, None, None, None
+        return *grads, None, None, None, None, None, None, None
 
 
-class SimBlockDiffusionAttention(PrefixCanvasSDPA):
+class SimBlockDiffusionAttention(ScaledCausalSDPA):
     def _fused_attention(
         self,
         q: torch.Tensor,
@@ -104,6 +134,9 @@ class SimBlockDiffusionAttention(PrefixCanvasSDPA):
             resolved_scale,
             2 if causal else 0,
             query_heads,
+            k.shape[2],
+            q.shape[-1],
+            self.compute_alpha,
             _module_path(),
         )
         return output.reshape(batch_size, query_len, query_heads, value_dim)
@@ -127,34 +160,15 @@ class SimBlockDiffusionAttention(PrefixCanvasSDPA):
         if enable_gqa and q.shape[2] % k.shape[2] != 0:
             raise ValueError("query heads must be divisible by key/value heads for GQA")
 
-        seq_len = q.shape[1]
-        if seq_len < self.block_size or seq_len % self.block_size != 0:
-            raise ValueError(
-                "sequence length must be a multiple of block_size and contain "
-                f"one canvas, got seq_len={seq_len}, block_size={self.block_size}"
-            )
-        prefix_len = seq_len - self.block_size
-        outputs = []
-        if prefix_len:
-            outputs.append(
-                self._fused_attention(
-                    q[:, :prefix_len],
-                    k[:, :prefix_len],
-                    v[:, :prefix_len],
-                    scale=scale,
-                    causal=True,
-                )
-            )
-        outputs.append(self._fused_attention(q[:, prefix_len:], k, v, scale=scale, causal=False))
-        return torch.cat(outputs, dim=1) if prefix_len else outputs[0]
+        return self._fused_attention(q, k, v, scale=scale, causal=True)
 
 
 class SimBlockDiffusionAttentionConverter(ModelCustomConverter):
     def convert(self, model: nn.Module) -> None:
         for name, module in list(model.named_modules()):
-            if name and type(module) is PrefixCanvasSDPA:
+            if name and type(module) is ScaledCausalSDPA:
                 replacement = SimBlockDiffusionAttention(
-                    PrefixCanvasSDPA.Config(block_size=module.block_size)
+                    ScaledCausalSDPA.Config(compute_alpha=module.compute_alpha)
                 )
                 replace_module_with_name(model, name, replacement)
 

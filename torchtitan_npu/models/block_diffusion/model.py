@@ -14,6 +14,8 @@ from torchtitan.models.common.attention import AttentionMasksType
 from torchtitan.models.common.decoder import Decoder, TransformerBlock
 from torchtitan.protocols.module import Module
 
+from .attention import ScaledCausalSDPA
+
 
 class BlockDiffusionTransformerBlock(TransformerBlock):
     """Pre-norm GQA block with either dense SwiGLU or token-choice MoE."""
@@ -62,10 +64,10 @@ class BlockDiffusionTransformerBlock(TransformerBlock):
 class BlockDiffusionModel(Decoder):
     """Block-diffusion denoiser used by the training/meta-simulator path.
 
-    One call encodes a causal clean prefix followed by one bidirectional
-    denoising canvas. The iterative inference scheduler from ``simulator/raw_model``
-    is not part of the training contract and is intentionally kept outside this
-    model.
+    For compute simulation, one call uses ordinary full-sequence causal
+    attention. The attention ledger is scaled by ``attention_compute_alpha``
+    to approximate the target block-diffusion workload without materializing
+    its block mask.
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -79,6 +81,7 @@ class BlockDiffusionModel(Decoder):
         moe_intermediate_size: int = 0
         num_experts_per_tok: int = 1
         block_size: int = 256
+        attention_compute_alpha: float = 1.0
         mask_token_id: int = 100
         max_denoise_steps: int = 48
         enable_weight_tying: bool = False
@@ -94,6 +97,8 @@ class BlockDiffusionModel(Decoder):
                 raise ValueError("n_kv_heads must divide n_heads for GQA")
             if self.block_size <= 0 or self.max_denoise_steps <= 0:
                 raise ValueError("block_size and max_denoise_steps must be positive")
+            if self.attention_compute_alpha <= 0:
+                raise ValueError("attention_compute_alpha must be greater than zero")
             if not 0 <= self.mask_token_id < self.vocab_size:
                 raise ValueError("mask_token_id must be inside the vocabulary")
             if self.num_experts < 0:
@@ -173,6 +178,11 @@ class BlockDiffusionModel(Decoder):
 
     def __init__(self, config: Config):
         super().__init__(config)
+        # The top-level field is CLI-overridable after the flavor's nested
+        # layer configs have been created, so synchronize the built modules.
+        for module in self.modules():
+            if isinstance(module, ScaledCausalSDPA):
+                module.compute_alpha = float(config.attention_compute_alpha)
         self.enable_weight_tying = config.enable_weight_tying
         if self.enable_weight_tying:
             self.tok_embeddings.weight = self.output.weight

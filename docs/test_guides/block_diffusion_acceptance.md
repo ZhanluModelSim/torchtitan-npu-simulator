@@ -1,7 +1,7 @@
 # Block Diffusion 接入验收记录
 
 本文按[新模型最终验收规范](model_acceptance.md)记录 `block_diffusion` 的可复现
-证据。验收对象包含 prefix/canvas attention、sliding-window corruption、
+证据。验收对象包含 full-causal Attention 计算代理、sliding-window corruption、
 masked-only loss 和 simulator 的结构级/meta 训练接入；没有外推到原始 workload
 未提供的 checkpoint 数值等价、真实 NPU 数值结果或 DLM 推理调度。
 
@@ -33,9 +33,10 @@ masked-only loss 和 simulator 的结构级/meta 训练接入；没有外推到�
 | attention `q_proj` | `[8192, 8192]` |
 | output projection | `[262144, 8192]` |
 
-正式训练输入为 4096 tokens：前 3840 tokens 使用 causal attention，最后 256-token
-canvas 对完整输入双向可见。单测同时覆盖四种 flavor、未知 flavor 拒绝、block
-aligned sequence 约束、显式参考 mask 等价、masked-only corruption/loss、TP/CP
+正式训练输入为 4096 tokens；计算代理把它作为单条 causal 序列，并以 alpha 只折算
+Attention FLOPs。数据侧仍把最后 256-token block 作为 canvas。单测同时覆盖四种
+flavor、未知 flavor 拒绝、block aligned sequence 约束、full-causal 等价、alpha
+透传与成本折算、masked-only corruption/loss、TP/CP
 head 整除、expert degree 约束，以及 raw schema state-dict 双向 round trip。
 此外，使用真实 `c4_test` dataloader batch 在 CPU 上完成 debug MoE 数值前向、
 masked-only loss 和反向：输出 shape 为 `[1, 32, 2048]`，15 个有效目标，所有
@@ -45,9 +46,12 @@ trainable parameters 均获得梯度。
 
 `persistent/active/model` 均为 simulator 报告的峰值字节数。`debug` 为 2 层、8
 experts、top-2；`reduced` 为 8 层、32 experts、top-4。
+“全长 causal + alpha”是本轮计算代理的复验数据；其余行是接入阶段的并行结构
+证据，算子数仍对应旧 prefix/canvas Attention，需在需要更新精确账本时重新执行。
 
 | 场景 | flavor / 并行 | 结果 | ops / comm | persistent / active / model peak |
 | --- | --- | --- | --- | --- |
+| 全长 causal + alpha | reduced, seq256/block64, 单卡 | 通过 | 1564 / 0 | 本轮关闭内存跟踪 |
 | 单卡 | debug, seq32/block16 | 通过 | 403 / 0 | 6,433,280 / 25,733,228 / 12,883,328 |
 | FSDP2 | debug, DP shard=2 | 通过 | 508 / 12 | 3,216,640 / 9,650,028 / 5,961,024 |
 | TP2 | debug | 通过 | 434 / 5 | 3,222,016 / 13,412,460 / 6,985,088 |
@@ -77,29 +81,39 @@ recompute 分别捕获 11,874、12,153、9,797 calls。该结果验证 10.05T/4K
 
 针对 Zhanlu 在 `ZHANLU_DISABLE_PRUNE_OP=1` 下报告的 `SafeSoftmax`、`Tril`、
 `ScalarTensor` 和 `WhereSelf`，新增 `npu_block_diffusion_attention` converter。该
-converter 没有使用模糊算子别名，而是把 prefix 和 canvas 分别保留为两个融合
+converter 没有使用模糊算子别名，而是把整条序列转换为一个 causal 融合
 Attention kernel；显式 autograd bridge 在 backward 调用
 `npu_fusion_attention_grad`，避免裸算子缺少 Autograd dispatch 时静默丢梯度。
 
-单卡 `block_diffusion_reduced`（8 layers、seq 256、block 64、full AC）的本仓库
-meta 复验捕获到：原始 forward 16 个融合 Attention，recompute 16 个融合
-Attention，backward 16 个融合 Attention grad。Attention 路径中不再出现 SDPA、
-`Tril`、`WhereSelf` 或 mask 构造算子；剩余 forward softmax 为每层一个 MoE router
-softmax，另有 loss 的 log-softmax，不属于 Attention 分解。该次结构复验捕获
-1660 ops / 0 comm，较融合前的未剪枝算子数量不可直接作性能比较。
+计算代理不再复现 prefix/canvas mask。`block_diffusion_reduced` 的 seq 256 作为一条
+完整自回归序列进入 causal FlashAttention，不再拆成 Q/KV 长度为 192/192 和
+64/256 的两个算子。forward、recompute 和 backward 每层各只有一个融合 Attention
+边界。
 
 复验发现外部 Zhanlu FlashAttention cost model 虽能找到融合算子模型，但不支持
 四维 BSND 输入，导致 32 个 forward/recompute 和 16 个 grad 在模型内部断言后返回
 零成本。为兼容该真实消费端，converter 进一步将 Q/K/V 从 BSND 仅作 metadata
-reshape 后，以三维 BSH 调用同一个 NPU kernel，输出再恢复 BSND；这不改变 GQA、
-mask 或 attention 数学。
+reshape 后，以三维 BSH 调用同一个 NPU kernel，输出再恢复 BSND；这不改变 GQA 或
+causal attention 数学。
 
-单卡 reduced meta 复验中，每层 prefix 输入为
-`Q=[1,192,1024], K/V=[1,192,512]`，每层 canvas 输入为
-`Q=[1,64,1024], K/V=[1,256,512]`。内部 CostModel 按 key sequence length 分别计算
-`192 x 192` 和 `64 x 256`，单层记录 150,994,944 和 67,108,864 FLOPs；完整训练图
-仍为 1660 ops，融合边界数量保持 16 forward、16 recompute、16 grad。真实 Zhanlu
-命中率仍需在其运行镜像中重新执行并归档；本记录不以 meta 结果替代外部 cost-model 验收。
+reduced 每层输入统一为 `Q=[1,256,1024], K/V=[1,256,512]`。内部 CostModel 先按
+全长 Attention 计算，再仅对 Attention FLOPs 乘 `attention_compute_alpha=0.8125`；
+投影、MoE、Norm、loss 和优化器不参与折算。full 的默认 alpha 为 `0.94140625`。
+alpha 通过模拟融合算子的 metadata 传给仓库内 CostModel；真实 Zhanlu 若忽略未知
+metadata，需要在其汇总侧对 Attention 项后处理。真实命中率与折算结果仍需在其
+运行镜像中重新执行并归档；本记录不以 meta 结果替代外部 cost-model 验收。
+
+本轮单卡 reduced 复验捕获 1564 ops / 0 comm。8 层分别产生 8 个 original-forward、
+8 个 recompute 和 8 个 backward 融合 Attention；每个算子均为上述 256-token BSH
+shape、`sparse_mode=2`、`compute_alpha=0.8125`，单算子 FLOPs 从未折算的
+268,435,456 降为 218,103,808。复验同时修正了 capture 在构建节点时丢弃 synthetic
+op attrs 的问题，否则 alpha 虽出现在 JSON 中却不会进入成本计算。
+
+为满足外部 FlashAttention cost model 的特征提取，融合算子同时显式携带
+`head_num/num_heads=16`、`num_kv_heads=8`、`head_dim=64`、`input_layout/layout=BSH`、
+`q_seq_len=kv_seq_len=256`、scale、causal window 和 sparse-mode 参数。真实 torch-npu
+接口使用其原生拼写 `pre_tockens/next_tockens`；synthetic metadata 同时提供
+`pre_tokens/next_tokens`，兼容下游成本模型的标准拼写。
 
 ## 回归测试
 
@@ -111,7 +125,7 @@ pytest -q \
   tests/unit_tests/simulator/capture/test_op_mapping.py \
   tests/unit_tests/simulator/cost/test_op_cost_model.py \
   tests/unit_tests/simulator/test_trainer.py
-# 51 passed
+# 54 passed
 
 pytest -q \
   tests/unit_tests/simulator/test_trainer.py \
@@ -139,7 +153,7 @@ pytest -q \
 结论：**Conditionally Ready（结构级/meta simulator 范围）**。
 
 已满足原生 ModelSpec、配置注册、模型构建、参数公式、state-dict schema 闭环、
-sliding-window corruption、prefix/canvas mask、masked-only loss、CPU 前后向、核心
+sliding-window corruption、full-causal Attention 计算代理、masked-only loss、CPU 前后向、核心
 并行、PP 最终组合、AC 与内存/通信捕获。以下能力明确不属于本结论：
 
 - 真实 NPU 数值训练与单步 loss/梯度参考对齐；

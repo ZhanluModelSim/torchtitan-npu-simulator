@@ -776,7 +776,12 @@ class OpDispatchCapture(TorchDispatchMode):
         """Assemble captured events into OpNode objects with cost annotations."""
         nodes: dict[str, OpNode] = {}
         for event in self._events:
-            cost = self.cost_model.compute(event.op_type, event.inputs, event.outputs, {})
+            cost = self.cost_model.compute(
+                event.op_type,
+                event.inputs,
+                event.outputs,
+                event.attrs or {},
+            )
             annotations: dict[str, Any] = {
                 "raw_op_type": event.raw_op_type,
                 "phase": event.phase,

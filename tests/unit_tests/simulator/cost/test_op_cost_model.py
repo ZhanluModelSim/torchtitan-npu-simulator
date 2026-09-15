@@ -112,6 +112,24 @@ def test_bsh_fusion_attention_uses_key_length_for_rectangular_canvas():
     assert result.peak_mem == 1 * 64 * 1024 * 2
 
 
+def test_fusion_attention_applies_compute_alpha_only_to_flops():
+    model = OpCostModel()
+    query = TensorMeta(name="q", shape=(1, 256, 1024), dtype="bfloat16", device="meta")
+    key = TensorMeta(name="k", shape=(1, 256, 512), dtype="bfloat16", device="meta")
+    value = TensorMeta(name="v", shape=(1, 256, 512), dtype="bfloat16", device="meta")
+    output = TensorMeta(name="out", shape=(1, 256, 1024), dtype="bfloat16", device="meta")
+
+    result = model.compute(
+        "fusion_attention",
+        [query, key, value],
+        [output],
+        {"layout": "BSH", "num_heads": 16, "compute_alpha": 0.8125},
+    )
+
+    assert result.flops == round(4 * 1 * 256 * 1024 * 256 * 0.8125)
+    assert result.peak_mem == 1 * 256 * 1024 * 2
+
+
 def test_allreduce_cost_doubles_bytes():
     model = OpCostModel()
     t = TensorMeta(name="t", shape=(1024,), dtype="bfloat16", device="meta")

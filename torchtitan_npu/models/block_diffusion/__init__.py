@@ -21,7 +21,7 @@ from torchtitan.models.common.config_utils import (
 )
 from torchtitan.protocols.model_spec import ModelSpec
 
-from .attention import PrefixCanvasSDPA
+from .attention import ScaledCausalSDPA
 from .feed_forward import BlockDiffusionGroupedExperts, BlockDiffusionMoE
 from .model import BlockDiffusionModel, BlockDiffusionTransformerBlock
 from .parallelize import parallelize_block_diffusion
@@ -54,7 +54,7 @@ def _build_layers(
     num_experts: int,
     moe_intermediate_size: int,
     num_experts_per_tok: int,
-    block_size: int,
+    attention_compute_alpha: float,
     use_grouped_mm: bool,
 ) -> list[BlockDiffusionTransformerBlock.Config]:
     layers = []
@@ -66,7 +66,7 @@ def _build_layers(
             head_dim=head_dim,
             wqkv_param_init=_LINEAR_INIT,
             wo_param_init=_LINEAR_INIT,
-            inner_attention=PrefixCanvasSDPA.Config(block_size=block_size),
+            inner_attention=ScaledCausalSDPA.Config(compute_alpha=attention_compute_alpha),
             mask_type="causal",
             rope_backend="complex",
         )
@@ -145,6 +145,7 @@ def make_block_diffusion_config(
     moe_intermediate_size: int,
     num_experts_per_tok: int,
     block_size: int,
+    attention_compute_alpha: float,
     mask_token_id: int,
     max_seq_len: int,
     max_denoise_steps: int = 48,
@@ -163,6 +164,7 @@ def make_block_diffusion_config(
         moe_intermediate_size=moe_intermediate_size,
         num_experts_per_tok=num_experts_per_tok,
         block_size=block_size,
+        attention_compute_alpha=attention_compute_alpha,
         mask_token_id=mask_token_id,
         max_denoise_steps=max_denoise_steps,
         enable_weight_tying=enable_weight_tying,
@@ -199,7 +201,7 @@ def make_block_diffusion_config(
             num_experts=num_experts,
             moe_intermediate_size=moe_intermediate_size,
             num_experts_per_tok=num_experts_per_tok,
-            block_size=block_size,
+            attention_compute_alpha=attention_compute_alpha,
             use_grouped_mm=use_grouped_mm,
         ),
     )
@@ -218,6 +220,7 @@ def _debug_model() -> BlockDiffusionModel.Config:
         moe_intermediate_size=128,
         num_experts_per_tok=2,
         block_size=16,
+        attention_compute_alpha=0.75,
         mask_token_id=100,
         max_seq_len=512,
         use_grouped_mm=False,
@@ -237,6 +240,7 @@ def _dense_debug_model() -> BlockDiffusionModel.Config:
         moe_intermediate_size=0,
         num_experts_per_tok=1,
         block_size=8,
+        attention_compute_alpha=0.75,
         mask_token_id=100,
         max_seq_len=256,
         use_grouped_mm=False,
@@ -256,6 +260,7 @@ def _reduced_model() -> BlockDiffusionModel.Config:
         moe_intermediate_size=512,
         num_experts_per_tok=4,
         block_size=64,
+        attention_compute_alpha=0.8125,
         mask_token_id=100,
         max_seq_len=4096,
     )
@@ -274,6 +279,7 @@ def _full_model() -> BlockDiffusionModel.Config:
         moe_intermediate_size=4096,
         num_experts_per_tok=8,
         block_size=256,
+        attention_compute_alpha=0.94140625,
         mask_token_id=100,
         max_seq_len=262144,
     )

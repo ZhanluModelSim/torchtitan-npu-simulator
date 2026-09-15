@@ -46,15 +46,25 @@ tokens，初始 prefix 之后的下一个 block 成为训练目标。
 的位置写为 `IGNORE_INDEX`，所以公共 sum-reduction cross-entropy 只在 masked
 positions 上计算，并按全局有效 label 数归一化。
 
-Attention 使用 prefix-causal/canvas-bidirectional 可见域。CPU/reference 路径不物化
-`seq_len x seq_len` mask，而是执行两次等价的 SDPA：prefix query 对 prefix KV
-使用 causal SDPA，canvas query 对全部 prefix+canvas KV 使用 non-causal SDPA，
-最后沿 sequence 维拼接。NPU converter 保留相同的两段 shape，但分别转换为
-`npu_fusion_attention`：进入算子前将 BSND 仅作 metadata reshape 为三维 BSH，
-prefix 使用压缩 causal mask 和 `sparse_mode=2`，canvas 不传 mask 并使用
-`sparse_mode=0`，算子返回后恢复 BSND。三维接口与四维接口数学等价，并兼容仅实现
-3-D 输入解析的下游 FlashAttention cost model。因此训练 step 中不会再把 attention 展开为
-`SafeSoftmax/Tril/WhereSelf` 等算子。`seq_len` 必须不小于 `block_size` 且能被其整除。
+本接入的目标是计算量建模，不复现 block attention mask。CPU/reference 路径把整个
+`seq_len` 作为一条普通自回归序列，执行一次 causal SDPA；NPU converter 对应执行一次
+`npu_fusion_attention`，进入算子前将 BSND 仅作 metadata reshape 为三维 BSH，使用
+压缩 causal mask 和 `sparse_mode=2`，返回后恢复 BSND。这样 reduced 的 seq 256 不再
+拆成 192/64 两段，并兼容只解析 3-D 输入的下游 FlashAttention cost model。
+真实 NPU 调用显式传入 `head_num`、`input_layout=BSH`、`scale`、`keep_prob`、
+`pre_tockens=INT_MAX`、`next_tockens=0`、`inner_precise=0`、`sparse_mode=2`、
+`gen_mask_parallel=true` 和 `sync=false`。模拟算子另外记录 `head_dim`、KV head 数、
+Q/KV sequence length，并同时保留 torch-npu 与成本模型常见的参数名别名，避免
+下游把 `[B,S,H]` 错解为 `[B,H,S]`。
+
+配置项 `attention_compute_alpha` 只折算 Attention 的 QK/Softmax/PV FLOPs，不改变
+数值前向，也不折算 QKV/输出投影、MoE、Norm 或优化器计算。默认值按照原两段融合
+kernel 的 score-matrix 面积与全长 kernel 面积之比设定：
+`alpha=((S-B)^2+B*S)/S^2`。因此 debug/dense_debug 为 `0.75`，reduced 为
+`0.8125`，full 为 `0.94140625`。该值是可覆盖的计算建模参数，不是模型权重或训练
+超参数。仓库内 simulator 从融合算子的 `compute_alpha` metadata 读取并应用折算；
+外部 Zhanlu 若未消费该自定义属性，应先得到标准全长 causal Attention 成本，再在
+Attention 项上做同样的 alpha 后处理。
 
 上述 corruption 和 loss 是根据 raw workload 的逐 block 生成语义补齐的训练
 契约。由于原始文件没有给出权威训练代码或 checkpoint，本接入不声明 mask-ratio
@@ -109,8 +119,9 @@ total_dense = embedding + output + final_norm
 | --- | --- | --- |
 | sliding-window corruption | 支持 | 一个 canvas stride，最后 block 精确随机 mask |
 | masked-only same-position loss | 支持 | `IGNORE_INDEX` labels 和有效 token 归一化 |
-| prefix-causal/canvas-bidirectional attention | 支持 | reference 两段 SDPA；NPU 两段融合 attention |
-| 单卡 meta 前向/反向 | 支持 | 原生 Module/ModelSpec 和 prefix/canvas SDPA |
+| full causal attention compute proxy | 支持 | 单次全长 SDPA/NPU 融合 attention，Attention FLOPs 按 alpha 折算 |
+| 精确 block attention mask 数值语义 | 不支持 | 计算量建模主动省略该 mask |
+| 单卡 meta 前向/反向 | 支持 | 原生 Module/ModelSpec 和 full causal SDPA |
 | TP / sequence parallel | 支持 | TorchTitan sparse decoder 公共计划 |
 | EP / ETP（分别启用） | 支持 | common MoE 的 ExpertParallel/ExpertTensorParallel |
 | EP > 1 与 ETP > 1 同时启用 | 不支持、fail fast | 当前公共 ExpertParallel 不能处理二维 expert mesh |
@@ -118,7 +129,7 @@ total_dense = embedding + output + final_norm
 | FSDP/eFSDP | 支持 | sparse decoder 公共 fully_shard 计划 |
 | activation checkpoint | 支持 | 公共 sparse AC 计划 |
 | PP | 支持 | `pipeline_llm`，需在最终组合单独验收 |
-| NPU Attention/RMSNorm/RoPE/GMM/EP dispatch | 支持 | 两段 attention 专用 converter 和仓库通用 converter |
+| NPU Attention/RMSNorm/RoPE/GMM/EP dispatch | 支持 | 全长 causal attention 专用 converter 和仓库通用 converter |
 | raw schema state-dict round trip | 支持 | `BlockDiffusionStateDictAdapter` |
 | 真实 NPU 数值训练 | 未声明 | 不属于 meta 模拟器验收范围 |
 | DLM 多轮生成和 KV cache | 不支持 | 本次实现训练范式，不含推理解码循环 |

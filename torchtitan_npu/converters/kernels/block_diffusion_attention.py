@@ -3,7 +3,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Fused NPU attention for Block Diffusion's prefix/canvas visibility."""
+"""Full-sequence causal fused attention for Block Diffusion simulation."""
 
 from __future__ import annotations
 
@@ -16,9 +16,10 @@ import torch_npu
 from torchtitan_npu.converters.convert_utils import replace_module_with_name
 from torchtitan_npu.converters.model_custom_interface import ModelCustomConfig, ModelCustomConverter
 from torchtitan_npu.converters.registry import register_model_converter
-from torchtitan_npu.models.block_diffusion.attention import PrefixCanvasSDPA
+from torchtitan_npu.models.block_diffusion.attention import ScaledCausalSDPA
 
 _COMPRESSED_CAUSAL_MASK_SIZE = 2048
+_TORCH_MAX_INT = 2_147_483_647
 
 
 def _compressed_causal_mask(device: torch.device) -> torch.Tensor:
@@ -39,11 +40,11 @@ def _compressed_causal_mask(device: torch.device) -> torch.Tensor:
     )
 
 
-class NPUBlockDiffusionAttention(PrefixCanvasSDPA):
-    """Execute the prefix and canvas as two NPU fused-attention kernels."""
+class NPUBlockDiffusionAttention(ScaledCausalSDPA):
+    """Execute one full-sequence causal NPU fused-attention kernel."""
 
-    def __init__(self, parent: PrefixCanvasSDPA, causal_mask: torch.Tensor) -> None:
-        super().__init__(PrefixCanvasSDPA.Config(block_size=parent.block_size))
+    def __init__(self, parent: ScaledCausalSDPA, causal_mask: torch.Tensor) -> None:
+        super().__init__(ScaledCausalSDPA.Config(compute_alpha=parent.compute_alpha))
         self.register_buffer("causal_mask", causal_mask, persistent=False)
 
     @staticmethod
@@ -102,35 +103,7 @@ class NPUBlockDiffusionAttention(PrefixCanvasSDPA):
         if enable_gqa and q.shape[2] % k.shape[2] != 0:
             raise ValueError("query heads must be divisible by key/value heads for GQA")
 
-        seq_len = q.shape[1]
-        if seq_len < self.block_size or seq_len % self.block_size != 0:
-            raise ValueError(
-                "sequence length must be a multiple of block_size and contain "
-                f"one canvas, got seq_len={seq_len}, block_size={self.block_size}"
-            )
-
-        prefix_len = seq_len - self.block_size
-        outputs = []
-        if prefix_len:
-            outputs.append(
-                self._fused_attention(
-                    q[:, :prefix_len],
-                    k[:, :prefix_len],
-                    v[:, :prefix_len],
-                    scale=scale,
-                    causal=True,
-                )
-            )
-        outputs.append(
-            self._fused_attention(
-                q[:, prefix_len:],
-                k,
-                v,
-                scale=scale,
-                causal=False,
-            )
-        )
-        return torch.cat(outputs, dim=1) if prefix_len else outputs[0]
+        return self._fused_attention(q, k, v, scale=scale, causal=True)
 
 
 class _NPUFusionAttention(torch.autograd.Function):
@@ -149,7 +122,12 @@ class _NPUFusionAttention(torch.autograd.Function):
                 atten_mask=atten_mask,
                 scale=scale,
                 keep_prob=1.0,
+                pre_tockens=_TORCH_MAX_INT,
+                next_tockens=0,
+                inner_precise=0,
                 sparse_mode=sparse_mode,
+                gen_mask_parallel=True,
+                sync=False,
             )
         )
         ctx.save_for_backward(q, k, v, attention, softmax_max, softmax_sum)
@@ -179,10 +157,15 @@ class _NPUFusionAttention(torch.autograd.Function):
             attention_in=attention,
             scale_value=ctx.scale,
             keep_prob=1.0,
+            pre_tockens=_TORCH_MAX_INT,
+            next_tockens=0,
+            inner_precise=0,
             seed=ctx.seed,
             offset=ctx.offset,
             numels=ctx.numels,
             sparse_mode=ctx.sparse_mode,
+            gen_mask_parallel=True,
+            sync=False,
         )
         return grad_q, grad_k, grad_v, None, None, None, None
 
@@ -192,7 +175,7 @@ class NPUBlockDiffusionAttentionConverter(ModelCustomConverter):
         modules = [
             (name, module)
             for name, module in model.named_modules()
-            if name and type(module) is PrefixCanvasSDPA
+            if name and type(module) is ScaledCausalSDPA
         ]
         if not modules:
             return

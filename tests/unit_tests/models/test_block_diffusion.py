@@ -93,8 +93,8 @@ def test_prefix_canvas_forward_backward_and_parameter_formula(flavor, seq_len):
     )
 
 
-def test_attention_splits_causal_prefix_and_bidirectional_canvas(monkeypatch):
-    from torchtitan_npu.models.block_diffusion.attention import PrefixCanvasSDPA
+def test_attention_uses_one_full_sequence_causal_call(monkeypatch):
+    from torchtitan_npu.models.block_diffusion.attention import ScaledCausalSDPA
 
     captured = []
 
@@ -103,29 +103,26 @@ def test_attention_splits_causal_prefix_and_bidirectional_canvas(monkeypatch):
         return torch.zeros_like(q)
 
     monkeypatch.setattr(torch.nn.functional, "scaled_dot_product_attention", fake_sdpa)
-    attention = PrefixCanvasSDPA.Config(block_size=4).build()
+    attention = ScaledCausalSDPA.Config(compute_alpha=0.75).build()
     q = torch.randn(1, 8, 2, 8)
     attention(q, q, q)
-    assert captured == [
-        (torch.Size([1, 2, 4, 8]), torch.Size([1, 2, 4, 8]), True),
-        (torch.Size([1, 2, 4, 8]), torch.Size([1, 2, 8, 8]), False),
-    ]
+    assert captured == [(torch.Size([1, 2, 8, 8]), torch.Size([1, 2, 8, 8]), True)]
 
 
-def test_npu_attention_converter_emits_two_fused_kernels(monkeypatch):
+def test_npu_attention_converter_emits_one_full_causal_fused_kernel(monkeypatch):
     import torch_npu
 
     from torchtitan_npu.converters.kernels.block_diffusion_attention import (
         NPUBlockDiffusionAttention,
         NPUBlockDiffusionAttentionConverter,
     )
-    from torchtitan_npu.models.block_diffusion.attention import PrefixCanvasSDPA
+    from torchtitan_npu.models.block_diffusion.attention import ScaledCausalSDPA
 
     class AttentionHolder(torch.nn.Module):
         def __init__(self):
             super().__init__()
             self.weight = torch.nn.Parameter(torch.ones(1))
-            self.attention = PrefixCanvasSDPA.Config(block_size=4).build()
+            self.attention = ScaledCausalSDPA.Config(compute_alpha=0.75).build()
 
     captured = []
 
@@ -157,20 +154,24 @@ def test_npu_attention_converter_emits_two_fused_kernels(monkeypatch):
     assert isinstance(model.attention, NPUBlockDiffusionAttention)
     assert output.shape == q.shape
     assert [(q_shape, k_shape) for q_shape, k_shape, _ in captured] == [
-        (torch.Size([1, 4, 32]), torch.Size([1, 4, 16])),
-        (torch.Size([1, 4, 32]), torch.Size([1, 8, 16])),
+        (torch.Size([1, 8, 32]), torch.Size([1, 8, 16])),
     ]
-    prefix_kwargs, canvas_kwargs = captured[0][2], captured[1][2]
-    assert prefix_kwargs["input_layout"] == canvas_kwargs["input_layout"] == "BSH"
-    assert prefix_kwargs["head_num"] == canvas_kwargs["head_num"] == 4
-    assert prefix_kwargs["sparse_mode"] == 2
-    assert prefix_kwargs["atten_mask"].shape == (2048, 2048)
-    assert canvas_kwargs["sparse_mode"] == 0
-    assert canvas_kwargs["atten_mask"] is None
-    assert prefix_kwargs["scale"] == pytest.approx(8**-0.5)
-    assert canvas_kwargs["scale"] == pytest.approx(8**-0.5)
-    assert len(captured_grads) == 2
-    assert [kwargs["sparse_mode"] for _, _, kwargs in captured_grads] == [0, 2]
+    kwargs = captured[0][2]
+    assert kwargs["input_layout"] == "BSH"
+    assert kwargs["head_num"] == 4
+    assert kwargs["sparse_mode"] == 2
+    assert kwargs["atten_mask"].shape == (2048, 2048)
+    assert kwargs["scale"] == pytest.approx(8**-0.5)
+    assert kwargs["pre_tockens"] == 2_147_483_647
+    assert kwargs["next_tockens"] == 0
+    assert kwargs["inner_precise"] == 0
+    assert kwargs["gen_mask_parallel"] is True
+    assert kwargs["sync"] is False
+    assert len(captured_grads) == 1
+    assert captured_grads[0][2]["sparse_mode"] == 2
+    assert captured_grads[0][2]["pre_tockens"] == 2_147_483_647
+    assert captured_grads[0][2]["next_tockens"] == 0
+    assert captured_grads[0][2]["inner_precise"] == 0
     assert all(tensor.grad is not None for tensor in (q, k, v))
 
 
@@ -181,7 +182,7 @@ def test_simulated_block_diffusion_attention_preserves_fused_boundaries():
     )
 
     attention = SimBlockDiffusionAttention(
-        SimBlockDiffusionAttention.Config(block_size=4)
+        SimBlockDiffusionAttention.Config(compute_alpha=0.75)
     )
     q, k, v = [
         torch.empty((1, 8, 2, 8), device="meta", requires_grad=True)
@@ -207,44 +208,61 @@ def test_simulated_block_diffusion_attention_preserves_fused_boundaries():
         if node.annotations["raw_op_type"] == "npu.npu_fusion_attention_grad.default"
     ]
     assert output.shape == q.shape
-    assert len(fused_forward) == len(fused_backward) == 2
-    assert [node.attrs["sparse_mode"] for node in fused_forward] == [2, 0]
-    assert [node.op_type for node in [*fused_forward, *fused_backward]] == ["fusion_attention"] * 4
+    assert len(fused_forward) == len(fused_backward) == 1
+    assert fused_forward[0].attrs["sparse_mode"] == 2
+    assert fused_forward[0].attrs["compute_alpha"] == pytest.approx(0.75)
+    assert fused_forward[0].attrs["head_num"] == 2
+    assert fused_forward[0].attrs["num_kv_heads"] == 2
+    assert fused_forward[0].attrs["head_dim"] == 8
+    assert fused_forward[0].attrs["input_layout"] == "BSH"
+    assert fused_forward[0].attrs["pre_tokens"] == 2_147_483_647
+    assert fused_forward[0].attrs["next_tokens"] == 0
+    assert fused_forward[0].attrs["is_causal"] is True
+    assert fused_forward[0].flops == round(4 * 1 * 8 * 16 * 8 * 0.75)
+    assert [node.op_type for node in [*fused_forward, *fused_backward]] == ["fusion_attention"] * 2
     assert fused_forward[0].attrs["layout"] == "BSH"
-    assert [meta.shape for meta in fused_forward[0].inputs] == [(1, 4, 16)] * 3
-    assert [meta.shape for meta in fused_forward[1].inputs] == [
-        (1, 4, 16),
-        (1, 8, 16),
-        (1, 8, 16),
-    ]
+    assert [meta.shape for meta in fused_forward[0].inputs] == [(1, 8, 16)] * 3
     assert all(tensor.grad is not None for tensor in (q, k, v))
 
 
-def test_prefix_canvas_attention_matches_explicit_reference_mask():
-    from torchtitan_npu.models.block_diffusion.attention import (
-        build_prefix_canvas_attention_mask,
-        PrefixCanvasSDPA,
-    )
+def test_attention_compute_alpha_does_not_change_numerical_forward():
+    from torchtitan_npu.models.block_diffusion.attention import ScaledCausalSDPA
 
     torch.manual_seed(0)
     q = torch.randn(2, 8, 2, 4)
     k = torch.randn(2, 8, 2, 4)
     v = torch.randn(2, 8, 2, 4)
-    attention = PrefixCanvasSDPA.Config(block_size=4).build()
+    attention = ScaledCausalSDPA.Config(compute_alpha=0.25).build()
     actual = attention(q, k, v)
 
-    visible = build_prefix_canvas_attention_mask(8, 4)
     expected = torch.nn.functional.scaled_dot_product_attention(
         q.transpose(1, 2),
         k.transpose(1, 2),
         v.transpose(1, 2),
-        attn_mask=visible,
-        is_causal=False,
+        is_causal=True,
     ).transpose(1, 2)
     torch.testing.assert_close(actual, expected)
 
-    assert visible[:4].equal(torch.ones(4, 8, dtype=torch.bool).tril())
-    assert visible[4:].all()
+
+def test_top_level_attention_compute_alpha_override_reaches_built_layers():
+    from torchtitan_npu.models.block_diffusion import model_registry
+    from torchtitan_npu.models.block_diffusion.attention import ScaledCausalSDPA
+
+    config = model_registry("dense_debug").model
+    config.attention_compute_alpha = 0.5
+    model = config.build()
+    alphas = [module.compute_alpha for module in model.modules() if isinstance(module, ScaledCausalSDPA)]
+
+    assert alphas == [0.5] * config.n_layers
+
+
+def test_attention_compute_alpha_must_be_positive():
+    from torchtitan_npu.models.block_diffusion import model_registry
+
+    config = model_registry("dense_debug").model
+    config.attention_compute_alpha = 0.0
+    with pytest.raises(ValueError, match="attention_compute_alpha"):
+        config.__post_init__()
 
 
 def test_corruption_only_targets_masked_positions_in_final_canvas():
@@ -426,6 +444,7 @@ def test_training_and_simulator_configs_share_model_and_parallelism():
         "n_kv_heads",
         "num_experts",
         "block_size",
+        "attention_compute_alpha",
     ):
         assert getattr(simulation.model_spec.model, field) == getattr(
             training.model_spec.model, field

@@ -156,8 +156,11 @@ class OpCostModel:
             seq_k = key.shape[1]
         else:
             seq_k = key.shape[-2]
+        compute_alpha = float(attrs.get("compute_alpha", 1.0))
+        if compute_alpha <= 0:
+            return CostEstimate.unknown_cost()
         return CostEstimate(
-            flops=4 * _numel(output.shape) * seq_k,
+            flops=round(4 * _numel(output.shape) * seq_k * compute_alpha),
             peak_mem=tensor_volume_bytes(output.shape, output.dtype),
         )
 
