@@ -83,6 +83,8 @@ Indexer（k-pool 压缩版 DSA indexer；`indexer_types` 全为 `"full"`，跨�
 - 融合：`image_token_id`（154854）占位 mask + `scatter_visual_embeddings` 早期融合进 text embedding；video token（同 id 经 start/end span 区分）v1 **fail fast**（仅声明 image 通路）。
 - **v1 形状约束**：批内**均匀网格**（每图 patch 数相同，`h·w == L`，`h/w` 由 config `vision_image_size` 推出），否则 fail fast；非均匀网格需要 per-image bucketing（数据侧能力），列为后续项。meta 下禁止读取 grid 数值（RoPE 坐标、valid mask 全部走张量运算；h/w 来自 config）。
 - 并行：v1 vision tower 跟随外层 FSDP 分片，**不支持 vision TP/CP**（fail fast）；vision 激活随微批次进入显存模型。
+- 数据/配置入口：多模态通道注册配置为 `glm5_next_baseline_mm`（full 规格 + `cc12m-test`，vlm tokenizer，
+  `image_token_id=1998`，均匀方格 `image_size=672` → 每图 2304 patch / 576 merged token）。
 
 ## 8. 参数量公式（独立基线，41 个唯一 block）
 
@@ -152,7 +154,7 @@ backward 次数按 autograd 规则对称；AC full 时 recompute 段整体翻倍
 | CP | 支持（kimi_k3/ar_llm 保守 all-gather 方案，仅无 TP 组合） |
 | PP | v1 fail fast（loop 区 + hc_head 跨 stage 契约未定义） |
 | AC none/full/selective | 支持（复用 apply_moe_ac；loop block 执行 T 次，AC 包裹每次迭代） |
-| MXFP8（attention/MoE 矩阵乘计算侧量化） | 支持（`glm5_next_debug_mxfp8` / `glm5_next_reduced_mxfp8` flavor；CLI `--mxfp8-fqns` 覆盖） |
+| MXFP8（attention/MoE 矩阵乘计算侧量化） | 支持（`glm5_next_baseline_mxfp8`，模拟器以 `target_npu_device_type="A5"` 声明；CLI `--mxfp8-fqns` 覆盖） |
 | compile / offload / MTP / video 通路 / 非均匀 vision 网格 | v1 fail fast 或显式关闭 |
 | halting / kv_mirror | 不支持（见 §3），fail fast |
 

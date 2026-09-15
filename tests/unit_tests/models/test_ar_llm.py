@@ -171,3 +171,53 @@ class TestStateDictAdapter:
             assert recovered[key].dtype == value.dtype, key
             if value.is_floating_point():
                 assert torch.equal(recovered[key], value), key
+
+
+class TestConfigRegistry:
+    CONFIG_NAMES = (
+        "ar_llm_smoketest",
+        "ar_llm_50t",
+        "ar_llm_50t_mxfp8",
+        "ar_llm_100t",
+        "ar_llm_100t_mxfp8",
+    )
+
+    @pytest.mark.parametrize("config_name", CONFIG_NAMES)
+    def test_simulator_config_preserves_training_config(self, config_name):
+        import dataclasses
+
+        from torchtitan_npu.models.ar_llm import config_registry as model_configs
+        from torchtitan_npu.simulator import config_registry as simulator_configs
+
+        base_config = getattr(model_configs, config_name)()
+        sim_config = getattr(simulator_configs, config_name)()
+
+        for field in dataclasses.fields(base_config):
+            if field.name == "compile":
+                assert sim_config.compile.components == base_config.compile.components
+                assert sim_config.compile.enable is False
+            else:
+                assert getattr(sim_config, field.name) == getattr(base_config, field.name), (
+                    field.name
+                )
+
+        assert sim_config.simulation.output_dir == f"./simulator_output/{config_name}"
+        assert sim_config.simulation.world_size is None
+
+    @pytest.mark.parametrize("config_name", CONFIG_NAMES)
+    def test_mxfp8_scope_matches_config_name(self, config_name):
+        from torchtitan.components.quantization.mx import MXFP8Converter
+
+        from torchtitan_npu.models.ar_llm import config_registry as model_configs
+
+        config = getattr(model_configs, config_name)()
+        mxfp8_configs = [
+            converter
+            for converter in config.model_converters.converters
+            if isinstance(converter, MXFP8Converter.Config)
+        ]
+        if config_name.endswith("_mxfp8"):
+            assert len(mxfp8_configs) == 1
+            assert mxfp8_configs[0].fqns
+        else:
+            assert mxfp8_configs == []

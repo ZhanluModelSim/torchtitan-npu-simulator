@@ -113,7 +113,7 @@ Engram 每层: n_orders·nh·cap·(mem_dim/n_orders/nh) + 2·d·mem_dim
 | ETP（EP+ETP 组合） | 首版不支持，fail fast |
 | PP | 首版不支持（MoR 跨 stage cache 契约未定），fail fast |
 | AC none/full/selective | 支持（复用 `apply_moe_ac`） |
-| MXFP8 | 支持（`ar_llm_debug_mxfp8` / `ar_llm_reduced_mxfp8`；`--mxfp8-fqns` 逗号分隔自定义覆盖，fqn 子串匹配） |
+| MXFP8 | 支持（`ar_llm_50t_mxfp8` / `ar_llm_100t_mxfp8`；`--mxfp8-fqns` 逗号分隔自定义覆盖，fqn 子串匹配） |
 | compile / offload / MTP | 首版不支持，fail fast 或显式关闭 |
 
 ## 9. 模拟器建模契约（raw op 名）
@@ -145,7 +145,7 @@ shape-only shim 在模型构造与并行化完成后绑定（`apply_ar_llm_shims
 ## 10. 首版实现状态
 
 - 已落地：`torchtitan_npu/models/ar_llm/`（model/attention/feed_forward/parallelize/state_dict_adapter/config_overrides/config_registry），`--module ar_llm` 注册，flavors：`debug`（1 个 6 层单元，全路径覆盖）/`reduced`（2 个单元）/`50t`/`100t`（正式规格，仅 meta）。
-- 训练配置工厂：`ar_llm_debug / ar_llm_reduced / ar_llm_50t / ar_llm_100t`；模拟器配置：`torchtitan_npu/simulator/config_registry.py` 同名包装。
+- 训练配置工厂：`ar_llm_smoketest / ar_llm_50t / ar_llm_50t_mxfp8 / ar_llm_100t / ar_llm_100t_mxfp8`；模拟器配置：`torchtitan_npu/simulator/config_registry.py` 同名包装。flavors 仍含 `debug`/`reduced`（单测与契约对账用），仅 `50t`/`100t`/`debug` 提供训练配置入口。
 - 模拟器 shim：`torchtitan_npu/simulator/hardware_shims/ar_llm_shim.py`（KDA/CSA/HCA/mHC 融合算子 shape-only 记录）；LatentMoE GMM 走真实 `aten._grouped_mm` meta kernel 捕获。
 - 已知首版限制（验收口径为 Conditionally ready 的声明范围）：
   - CP/PP/ETP/DeepEP/compile fail fast（错误信息指向本契约）；MXFP8 已支持（§9.1）。

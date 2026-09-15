@@ -222,31 +222,10 @@ def _ar_llm_simulation_config(
     )
 
 
-def ar_llm_debug() -> ArLlmSimulationTrainerConfig:
+def ar_llm_smoketest() -> ArLlmSimulationTrainerConfig:
     return _ar_llm_simulation_config(
-        _ar_llm_configs.ar_llm_debug,
-        output_name="ar_llm_debug",
-    )
-
-
-def ar_llm_debug_mxfp8() -> ArLlmSimulationTrainerConfig:
-    return _ar_llm_simulation_config(
-        _ar_llm_configs.ar_llm_debug_mxfp8,
-        output_name="ar_llm_debug_mxfp8",
-    )
-
-
-def ar_llm_reduced() -> ArLlmSimulationTrainerConfig:
-    return _ar_llm_simulation_config(
-        _ar_llm_configs.ar_llm_reduced,
-        output_name="ar_llm_reduced",
-    )
-
-
-def ar_llm_reduced_mxfp8() -> ArLlmSimulationTrainerConfig:
-    return _ar_llm_simulation_config(
-        _ar_llm_configs.ar_llm_reduced_mxfp8,
-        output_name="ar_llm_reduced_mxfp8",
+        _ar_llm_configs.ar_llm_smoketest,
+        output_name="ar_llm_smoketest",
     )
 
 
@@ -257,10 +236,24 @@ def ar_llm_50t() -> ArLlmSimulationTrainerConfig:
     )
 
 
+def ar_llm_50t_mxfp8() -> ArLlmSimulationTrainerConfig:
+    return _ar_llm_simulation_config(
+        _ar_llm_configs.ar_llm_50t_mxfp8,
+        output_name="ar_llm_50t_mxfp8",
+    )
+
+
 def ar_llm_100t() -> ArLlmSimulationTrainerConfig:
     return _ar_llm_simulation_config(
         _ar_llm_configs.ar_llm_100t,
         output_name="ar_llm_100t",
+    )
+
+
+def ar_llm_100t_mxfp8() -> ArLlmSimulationTrainerConfig:
+    return _ar_llm_simulation_config(
+        _ar_llm_configs.ar_llm_100t_mxfp8,
+        output_name="ar_llm_100t_mxfp8",
     )
 
 
@@ -319,47 +312,32 @@ def _glm5_next_simulation_config(
     )
 
 
-def glm5_next_debug() -> Glm5NextSimulationTrainerConfig:
+def glm5_next_smoketest() -> Glm5NextSimulationTrainerConfig:
     return _glm5_next_simulation_config(
-        _glm5_next_configs.glm5_next_debug,
-        output_name="glm5_next_debug",
+        _glm5_next_configs.glm5_next_smoketest,
+        output_name="glm5_next_smoketest",
     )
 
 
-def glm5_next_reduced() -> Glm5NextSimulationTrainerConfig:
+def glm5_next_baseline() -> Glm5NextSimulationTrainerConfig:
     return _glm5_next_simulation_config(
-        _glm5_next_configs.glm5_next_reduced,
-        output_name="glm5_next_reduced",
+        _glm5_next_configs.glm5_next_baseline,
+        output_name="glm5_next_baseline",
     )
 
 
-def glm5_next_full() -> Glm5NextSimulationTrainerConfig:
+def glm5_next_baseline_mxfp8() -> Glm5NextSimulationTrainerConfig:
     return _glm5_next_simulation_config(
-        _glm5_next_configs.glm5_next_full,
-        output_name="glm5_next_full",
-    )
-
-
-def glm5_next_debug_mm() -> Glm5NextSimulationTrainerConfig:
-    return _glm5_next_simulation_config(
-        _glm5_next_configs.glm5_next_debug_mm,
-        output_name="glm5_next_debug_mm",
-    )
-
-
-def glm5_next_debug_mxfp8() -> Glm5NextSimulationTrainerConfig:
-    return _glm5_next_simulation_config(
-        _glm5_next_configs.glm5_next_debug_mxfp8,
-        output_name="glm5_next_debug_mxfp8",
+        _glm5_next_configs.glm5_next_baseline_mxfp8,
+        output_name="glm5_next_baseline_mxfp8",
         target_npu_device_type="A5",
     )
 
 
-def glm5_next_reduced_mxfp8() -> Glm5NextSimulationTrainerConfig:
+def glm5_next_baseline_mm() -> Glm5NextSimulationTrainerConfig:
     return _glm5_next_simulation_config(
-        _glm5_next_configs.glm5_next_reduced_mxfp8,
-        output_name="glm5_next_reduced_mxfp8",
-        target_npu_device_type="A5",
+        _glm5_next_configs.glm5_next_baseline_mm,
+        output_name="glm5_next_baseline_mm",
     )
 
 
@@ -394,13 +372,6 @@ def mm_gc_smoketest() -> SimulationTrainerConfig:
     )
 
 
-def mm_gc_reduced() -> SimulationTrainerConfig:
-    return _mm_gc_simulation_config(
-        _mm_gc_configs.mm_gc_reduced,
-        output_name="mm_gc_reduced",
-    )
-
-
 def mm_gc_baseline() -> SimulationTrainerConfig:
     return _mm_gc_simulation_config(
         _mm_gc_configs.mm_gc_baseline,
@@ -408,105 +379,8 @@ def mm_gc_baseline() -> SimulationTrainerConfig:
     )
 
 
-def mm_gc_smoketest_mxfp8() -> SimulationTrainerConfig:
-    return _mm_gc_simulation_config(
-        _mm_gc_configs.mm_gc_smoketest_mxfp8,
-        output_name="mm_gc_smoketest_mxfp8",
-    )
-
-
-def mm_gc_reduced_mxfp8() -> SimulationTrainerConfig:
-    return _mm_gc_simulation_config(
-        _mm_gc_configs.mm_gc_reduced_mxfp8,
-        output_name="mm_gc_reduced_mxfp8",
-    )
-
-
 def mm_gc_baseline_mxfp8() -> SimulationTrainerConfig:
     return _mm_gc_simulation_config(
         _mm_gc_configs.mm_gc_baseline_mxfp8,
         output_name="mm_gc_baseline_mxfp8",
-    )
-
-
-def _mm_gc_smoketest_with_parallelism(
-    output_name: str,
-    *,
-    world_size: int,
-    data_parallel_shard_degree: int = 1,
-    tensor_parallel_degree: int = 1,
-    expert_parallel_degree: int = 1,
-    expert_tensor_parallel_degree: int = 1,
-    context_parallel_degree: int = 1,
-) -> SimulationTrainerConfig:
-    base_config = _mm_gc_configs.mm_gc_smoketest()
-    base_config = dataclasses.replace(
-        base_config,
-        parallelism=dataclasses.replace(
-            base_config.parallelism,
-            data_parallel_shard_degree=data_parallel_shard_degree,
-            tensor_parallel_degree=tensor_parallel_degree,
-            expert_parallel_degree=expert_parallel_degree,
-            expert_tensor_parallel_degree=expert_tensor_parallel_degree,
-            context_parallel_degree=context_parallel_degree,
-        ),
-    )
-    base_fields = {
-        field.name: getattr(base_config, field.name)
-        for field in dataclasses.fields(base_config)
-    }
-    base_fields["compile"] = dataclasses.replace(base_config.compile, enable=False)
-    return SimulationTrainerConfig(
-        **base_fields,
-        simulation=SimulationConfig(
-            output_dir=f"./simulator_output/{output_name}",
-            world_size=world_size,
-        ),
-    )
-
-
-def mm_gc_smoketest_fsdp2() -> SimulationTrainerConfig:
-    return _mm_gc_smoketest_with_parallelism(
-        "mm_gc_smoketest_fsdp2", world_size=2, data_parallel_shard_degree=2
-    )
-
-
-def mm_gc_smoketest_tp2() -> SimulationTrainerConfig:
-    return _mm_gc_smoketest_with_parallelism(
-        "mm_gc_smoketest_tp2", world_size=2, tensor_parallel_degree=2
-    )
-
-
-def mm_gc_smoketest_ep2() -> SimulationTrainerConfig:
-    return _mm_gc_smoketest_with_parallelism(
-        "mm_gc_smoketest_ep2",
-        world_size=2,
-        data_parallel_shard_degree=-1,
-        expert_parallel_degree=2,
-    )
-
-
-def mm_gc_smoketest_cp2() -> SimulationTrainerConfig:
-    return _mm_gc_smoketest_with_parallelism(
-        "mm_gc_smoketest_cp2", world_size=2, context_parallel_degree=2
-    )
-
-
-def mm_gc_smoketest_tp2ep2() -> SimulationTrainerConfig:
-    return _mm_gc_smoketest_with_parallelism(
-        "mm_gc_smoketest_tp2ep2",
-        world_size=4,
-        data_parallel_shard_degree=-1,
-        tensor_parallel_degree=2,
-        expert_tensor_parallel_degree=2,
-        expert_parallel_degree=2,
-    )
-
-
-def mm_gc_smoketest_fsdp2ep2() -> SimulationTrainerConfig:
-    return _mm_gc_smoketest_with_parallelism(
-        "mm_gc_smoketest_fsdp2ep2",
-        world_size=4,
-        data_parallel_shard_degree=4,
-        expert_parallel_degree=2,
     )

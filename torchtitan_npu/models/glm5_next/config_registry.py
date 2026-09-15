@@ -172,7 +172,7 @@ def _trainer_config(
     )
 
 
-def glm5_next_debug() -> TrainerConfig:
+def glm5_next_smoketest() -> TrainerConfig:
     """Minimal 9-block (4 pre + 1 looped x2 + 4 post) recipe for local debugging."""
     return _trainer_config(
         flavor="debug",
@@ -186,21 +186,7 @@ def glm5_next_debug() -> TrainerConfig:
     )
 
 
-def glm5_next_reduced() -> TrainerConfig:
-    """12-block reduced spec for meta single-step and AC toggle tests."""
-    return _trainer_config(
-        flavor="reduced",
-        training=TrainingConfig(
-            local_batch_size=1,
-            seq_len=512,
-            max_norm=1.0,
-            steps=2,
-        ),
-        activation_checkpoint=ActivationCheckpointConfig(mode="full"),
-    )
-
-
-def glm5_next_full() -> TrainerConfig:
+def glm5_next_baseline() -> TrainerConfig:
     """Official 96-layer spec (meta/capacity validation only, never real training)."""
     return _trainer_config(
         flavor="full",
@@ -214,28 +200,13 @@ def glm5_next_full() -> TrainerConfig:
     )
 
 
-def glm5_next_debug_mxfp8() -> TrainerConfig:
-    """Debug spec with MXFP8 dynamic quantization on attention/MoE matmuls."""
+def glm5_next_baseline_mxfp8() -> TrainerConfig:
+    """Official 96-layer spec with MXFP8 dynamic quantization (A5 target)."""
     return _trainer_config(
-        flavor="debug",
+        flavor="full",
         training=TrainingConfig(
             local_batch_size=1,
-            seq_len=128,
-            max_norm=1.0,
-            steps=2,
-        ),
-        activation_checkpoint=ActivationCheckpointConfig(mode="selective"),
-        enable_mxfp8=True,
-    )
-
-
-def glm5_next_reduced_mxfp8() -> TrainerConfig:
-    """Reduced spec with MXFP8 for meta single-step and AC toggle tests."""
-    return _trainer_config(
-        flavor="reduced",
-        training=TrainingConfig(
-            local_batch_size=1,
-            seq_len=512,
+            seq_len=8192,
             max_norm=1.0,
             steps=2,
         ),
@@ -244,15 +215,17 @@ def glm5_next_reduced_mxfp8() -> TrainerConfig:
     )
 
 
-def glm5_next_debug_mm() -> TrainerConfig:
-    """Debug spec with the cc12m-test multimodal channel (uniform square grid).
+def glm5_next_baseline_mm() -> TrainerConfig:
+    """Official 96-layer spec with the cc12m-test multimodal channel.
 
     Uses the vlm tokenizer whose ``<|image|>`` special token id (1998) must
     match the model's ``image_token_id``. Vision v1 requires a uniform square
-    grid, so the loader forces ``image_size=56`` (4x4 patches, 4 merged
-    tokens per image); see MODEL_CONTRACT.md section 7.
+    grid; the official vision config (image_size=672, patch 14, merge 2)
+    yields 48x48 = 2304 patches (576 merged tokens) per image, so the loader
+    forces ``image_size=672`` and ``max_patches_per_image=2304``; see
+    MODEL_CONTRACT.md section 7.
     """
-    model_spec, model_overrides = build_model_spec_with_overrides(model_registry("debug"))
+    model_spec, model_overrides = build_model_spec_with_overrides(model_registry("full"))
     model_overrides.image_token_id = 1998
     return TrainerConfig(
         hf_assets_path="./tests/assets/tokenizer/vlm_tokenizer",
@@ -261,16 +234,16 @@ def glm5_next_debug_mm() -> TrainerConfig:
         debug=DebugConfig(print_config=True),
         comm=CommConfig(trace_buf_size=0),
         model_converters=ModelConvertersContainer.Config(
-            converters=_default_converters(enable_mxfp8=enable_mxfp8)
+            converters=_default_converters()
         ),
         metrics=MetricsProcessor.Config(log_freq=1),
         dataloader=Glm5NextMultiModalDataLoader.Config(
             dataset="cc12m-test",
             patch_size=14,
             spatial_merge_size=2,
-            max_patches_per_image=16,
+            max_patches_per_image=2304,
             max_images_per_batch=2,
-            image_size=56,
+            image_size=672,
         ),
         optimizer=OptimizerConfig(
             name="AdamW",
@@ -285,13 +258,13 @@ def glm5_next_debug_mm() -> TrainerConfig:
         ),
         training=TrainingConfig(
             local_batch_size=1,
-            seq_len=128,
+            seq_len=8192,
             max_norm=1.0,
             steps=2,
         ),
         parallelism=_parallelism(),
         checkpoint=CheckpointConfig(enable=False),
-        activation_checkpoint=ActivationCheckpointConfig(mode="selective"),
+        activation_checkpoint=ActivationCheckpointConfig(mode="full"),
         compile=CompileConfig(enable=False, components=["model", "loss"]),
         profiling=ProfilingConfig(enable_profiling=False),
     )

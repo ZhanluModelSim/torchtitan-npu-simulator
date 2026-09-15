@@ -93,9 +93,12 @@ MoE 层                    = 2×D×(S×hs) (proj_in/out) + S×hs×Es (router) + 
 - debug 单卡 CPU：参数量与公式一致；前向/反向/loss 有限值；关键参数梯度齐全；
   state-dict 保存/加载回路一致；层类型分布（4 dense / 2 MoE）符合规则。
 - debug/reduced/full meta 构造与前向 shape 正确（logits `[B, S, V]`）。
-- 模拟器配置矩阵（全部单步跑通，`--simulation.output_formats mem`）：
+- 模拟器配置矩阵（全部单步跑通，`--simulation.output_formats mem`）。配置精简后注册入口为
+  `mm_gc_smoketest` / `mm_gc_baseline` / `mm_gc_baseline_mxfp8`（模拟器同名）；下表并行变体
+  配置（fsdp2/tp2/ep2/cp2/tp2ep2/fsdp2ep2）已移除，其通信证据为历史记录，可用
+  `--parallelism.*` CLI 在 smoketest 上复现：
 
-| 配置 | world | 并行 | 通信事件（memory_events.csv） |
+| 配置（历史） | world | 并行 | 通信事件（memory_events.csv） |
 | --- | --- | --- | --- |
 | `mm_gc_smoketest` | 1 | - | 无 |
 | `mm_gc_smoketest_fsdp2` | 2 | dp_shard=2 | allgather + reduce_scatter（FSDP） |
@@ -109,10 +112,10 @@ MoE 层                    = 2×D×(S×hs) (proj_in/out) + S×hs×Es (router) + 
   `sla2_block_route_topk`/`sla2_sparse_attn`/`sla2_linear_attn` 各 12 次
   （6 层 × original+recompute），`*_grad` 各 6 次；`mh_moe_route_topk` 4 次
   （2 MoE 层 × 2），grad 2 次；`aten._grouped_mm` 24 次（2 层 × 3 GMM × 4）。
-- MXFP8 量化核对（`mm_gc_smoketest_mxfp8`）：`npu_dynamic_mx_quant` 404、
+- MXFP8 量化核对（`mm_gc_smoketest_mxfp8`，该配置已并入 `mm_gc_baseline_mxfp8`）：
+  `npu_dynamic_mx_quant` 404、
   `npu_quant_matmul` 184（覆盖全部受控 MM）、`npu_grouped_matmul` 24 +
   `npu_grouped_dynamic_mx_quant` 12（专家 grouped MM）；路由器权重保持原生
-  fp32 tensor（converter 内建守卫）；`mm_gc_smoketest_mxfp8` + CLI
-  EP=2 组合验证量化算子与 EP all-reduce 共存。配置入口：
-  `mm_gc_smoketest_mxfp8` / `mm_gc_reduced_mxfp8` / `mm_gc_baseline_mxfp8`
-  （模拟器同名）。
+  fp32 tensor（converter 内建守卫）；smoketest + CLI
+  EP=2 组合验证量化算子与 EP all-reduce 共存。当前配置入口：
+  `mm_gc_baseline_mxfp8`（模拟器同名）。

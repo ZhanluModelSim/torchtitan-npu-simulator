@@ -110,22 +110,6 @@ def mm_gc_smoketest() -> TrainerConfig:
     )
 
 
-def mm_gc_reduced() -> TrainerConfig:
-    """16-layer reduced model for meta/simulator validation."""
-    return _trainer_config(
-        flavor="reduced",
-        training=TrainingConfig(
-            local_batch_size=1,
-            seq_len=4096,
-            max_norm=1.0,
-            steps=20,
-        ),
-        parallelism=_single_rank_parallelism(),
-        activation_checkpoint=ActivationCheckpointConfig(mode="full"),
-        print_config=False,
-    )
-
-
 def mm_gc_baseline() -> TrainerConfig:
     """Full enlarged-spec baseline (96 layers, 32 heads x 1024 experts)."""
     return _trainer_config(
@@ -139,40 +123,6 @@ def mm_gc_baseline() -> TrainerConfig:
         parallelism=_single_rank_parallelism(),
         activation_checkpoint=ActivationCheckpointConfig(mode="full"),
         print_config=True,
-    )
-
-
-def mm_gc_smoketest_mxfp8() -> TrainerConfig:
-    """Debug recipe with MXFP8 on all matmuls + routed-expert grouped MM."""
-    return _trainer_config(
-        flavor="debug",
-        training=TrainingConfig(
-            local_batch_size=1,
-            seq_len=128,
-            max_norm=1.0,
-            steps=2,
-        ),
-        parallelism=_single_rank_parallelism(),
-        activation_checkpoint=ActivationCheckpointConfig(mode="selective"),
-        print_config=True,
-        enable_mxfp8=True,
-    )
-
-
-def mm_gc_reduced_mxfp8() -> TrainerConfig:
-    """Reduced spec with MXFP8; single-rank meta validation."""
-    return _trainer_config(
-        flavor="reduced",
-        training=TrainingConfig(
-            local_batch_size=1,
-            seq_len=4096,
-            max_norm=1.0,
-            steps=20,
-        ),
-        parallelism=_single_rank_parallelism(),
-        activation_checkpoint=ActivationCheckpointConfig(mode="full"),
-        print_config=False,
-        enable_mxfp8=True,
     )
 
 

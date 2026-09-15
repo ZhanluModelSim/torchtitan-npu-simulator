@@ -163,7 +163,7 @@ def _trainer_config(
     )
 
 
-def ar_llm_debug() -> TrainerConfig:
+def ar_llm_smoketest() -> TrainerConfig:
     """Minimal 6-layer (one CSA/HCA/KDA unit) recipe for local debugging."""
     return _trainer_config(
         flavor="debug",
@@ -174,50 +174,6 @@ def ar_llm_debug() -> TrainerConfig:
             steps=2,
         ),
         activation_checkpoint=ActivationCheckpointConfig(mode="selective"),
-    )
-
-
-def ar_llm_debug_mxfp8() -> TrainerConfig:
-    """ar_llm_debug with MXFP8 quantized MoE + attention projections."""
-    return _trainer_config(
-        flavor="debug",
-        training=TrainingConfig(
-            local_batch_size=1,
-            seq_len=128,
-            max_norm=1.0,
-            steps=2,
-        ),
-        activation_checkpoint=ActivationCheckpointConfig(mode="selective"),
-        enable_mxfp8=True,
-    )
-
-
-def ar_llm_reduced() -> TrainerConfig:
-    """12-layer reduced spec for meta single-step and AC toggle tests."""
-    return _trainer_config(
-        flavor="reduced",
-        training=TrainingConfig(
-            local_batch_size=1,
-            seq_len=512,
-            max_norm=1.0,
-            steps=2,
-        ),
-        activation_checkpoint=ActivationCheckpointConfig(mode="full"),
-    )
-
-
-def ar_llm_reduced_mxfp8() -> TrainerConfig:
-    """ar_llm_reduced with MXFP8 quantized MoE + attention projections."""
-    return _trainer_config(
-        flavor="reduced",
-        training=TrainingConfig(
-            local_batch_size=1,
-            seq_len=512,
-            max_norm=1.0,
-            steps=2,
-        ),
-        activation_checkpoint=ActivationCheckpointConfig(mode="full"),
-        enable_mxfp8=True,
     )
 
 
@@ -235,6 +191,21 @@ def ar_llm_50t() -> TrainerConfig:
     )
 
 
+def ar_llm_50t_mxfp8() -> TrainerConfig:
+    """ar_llm_50t with MXFP8 quantized MoE + attention projections."""
+    return _trainer_config(
+        flavor="50t",
+        training=TrainingConfig(
+            local_batch_size=1,
+            seq_len=65536,
+            max_norm=1.0,
+            steps=2,
+        ),
+        activation_checkpoint=ActivationCheckpointConfig(mode="full"),
+        enable_mxfp8=True,
+    )
+
+
 def ar_llm_100t() -> TrainerConfig:
     """Official 100T spec (meta/capacity validation only, never real training)."""
     return _trainer_config(
@@ -246,4 +217,19 @@ def ar_llm_100t() -> TrainerConfig:
             steps=2,
         ),
         activation_checkpoint=ActivationCheckpointConfig(mode="full"),
+    )
+
+
+def ar_llm_100t_mxfp8() -> TrainerConfig:
+    """ar_llm_100t with MXFP8 quantized MoE + attention projections."""
+    return _trainer_config(
+        flavor="100t",
+        training=TrainingConfig(
+            local_batch_size=1,
+            seq_len=65536,
+            max_norm=1.0,
+            steps=2,
+        ),
+        activation_checkpoint=ActivationCheckpointConfig(mode="full"),
+        enable_mxfp8=True,
     )

@@ -343,13 +343,13 @@ class TestMXFP8ConverterConfig:
     def test_mxfp8_trainer_configs_registered(self):
         from torchtitan_npu.models.mm_gc import config_registry
 
-        cfg = config_registry.mm_gc_smoketest_mxfp8()
+        cfg = config_registry.mm_gc_baseline_mxfp8()
         owners = [
             getattr(c, "_owner", None).__name__
             for c in cfg.model_converters.converters
         ]
         assert any("MMGcMXFP8Converter" in (o or "") for o in owners)
-        plain = config_registry.mm_gc_smoketest()
+        plain = config_registry.mm_gc_baseline()
         assert list(plain.model_converters.converters) == []
 
 
@@ -383,3 +383,33 @@ class TestStateDict:
         assert moe.experts.w1.shape[0] == moe.flatten_num_experts
         assert moe.experts.w1.shape[2] == moe.head_hidden_size
         assert moe.experts.w2.shape[1] == moe.head_hidden_size
+
+
+class TestConfigRegistry:
+    CONFIG_NAMES = (
+        "mm_gc_smoketest",
+        "mm_gc_baseline",
+        "mm_gc_baseline_mxfp8",
+    )
+
+    @pytest.mark.parametrize("config_name", CONFIG_NAMES)
+    def test_simulator_config_preserves_training_config(self, config_name):
+        import dataclasses
+
+        from torchtitan_npu.models.mm_gc import config_registry as model_configs
+        from torchtitan_npu.simulator import config_registry as simulator_configs
+
+        base_config = getattr(model_configs, config_name)()
+        sim_config = getattr(simulator_configs, config_name)()
+
+        for field in dataclasses.fields(base_config):
+            if field.name == "compile":
+                assert sim_config.compile.components == base_config.compile.components
+                assert sim_config.compile.enable is False
+            else:
+                assert getattr(sim_config, field.name) == getattr(base_config, field.name), (
+                    field.name
+                )
+
+        assert sim_config.simulation.output_dir == f"./simulator_output/{config_name}"
+        assert sim_config.simulation.world_size is None
