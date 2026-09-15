@@ -88,10 +88,18 @@ Attention，backward 16 个融合 Attention grad。Attention 路径中不再出�
 softmax，另有 loss 的 log-softmax，不属于 Attention 分解。该次结构复验捕获
 1660 ops / 0 comm，较融合前的未剪枝算子数量不可直接作性能比较。
 
-内部 CostModel 按 layout 读取 key sequence length：prefix 使用 `P x P`，canvas
-使用 `B x S`，避免把 BSND 的 head 维误当成 sequence，也避免把矩形 canvas
-Attention 错算成 `B x B`。真实 Zhanlu 的算子命中率仍需在其运行镜像中重新执行
-并归档；本记录不以 meta 结果替代 Zhanlu cost-model 验收。
+复验发现外部 Zhanlu FlashAttention cost model 虽能找到融合算子模型，但不支持
+四维 BSND 输入，导致 32 个 forward/recompute 和 16 个 grad 在模型内部断言后返回
+零成本。为兼容该真实消费端，converter 进一步将 Q/K/V 从 BSND 仅作 metadata
+reshape 后，以三维 BSH 调用同一个 NPU kernel，输出再恢复 BSND；这不改变 GQA、
+mask 或 attention 数学。
+
+单卡 reduced meta 复验中，每层 prefix 输入为
+`Q=[1,192,1024], K/V=[1,192,512]`，每层 canvas 输入为
+`Q=[1,64,1024], K/V=[1,256,512]`。内部 CostModel 按 key sequence length 分别计算
+`192 x 192` 和 `64 x 256`，单层记录 150,994,944 和 67,108,864 FLOPs；完整训练图
+仍为 1660 ops，融合边界数量保持 16 forward、16 recompute、16 grad。真实 Zhanlu
+命中率仍需在其运行镜像中重新执行并归档；本记录不以 meta 结果替代外部 cost-model 验收。
 
 ## 回归测试
 
@@ -103,7 +111,7 @@ pytest -q \
   tests/unit_tests/simulator/capture/test_op_mapping.py \
   tests/unit_tests/simulator/cost/test_op_cost_model.py \
   tests/unit_tests/simulator/test_trainer.py
-# 50 passed
+# 51 passed
 
 pytest -q \
   tests/unit_tests/simulator/test_trainer.py \

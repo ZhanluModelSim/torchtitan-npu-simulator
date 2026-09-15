@@ -131,7 +131,10 @@ def test_npu_attention_converter_emits_two_fused_kernels(monkeypatch):
 
     def fake_fusion_attention(q, k, v, **kwargs):
         captured.append((q.shape, k.shape, kwargs))
-        stats = torch.zeros((q.shape[0], q.shape[2], q.shape[1], 8), dtype=torch.float32)
+        stats = torch.zeros(
+            (q.shape[0], kwargs["head_num"], q.shape[1], 8),
+            dtype=torch.float32,
+        )
         return torch.zeros_like(q), stats, stats, torch.empty(0), 0, 0, 0
 
     captured_grads = []
@@ -154,11 +157,12 @@ def test_npu_attention_converter_emits_two_fused_kernels(monkeypatch):
     assert isinstance(model.attention, NPUBlockDiffusionAttention)
     assert output.shape == q.shape
     assert [(q_shape, k_shape) for q_shape, k_shape, _ in captured] == [
-        (torch.Size([1, 4, 4, 8]), torch.Size([1, 4, 2, 8])),
-        (torch.Size([1, 4, 4, 8]), torch.Size([1, 8, 2, 8])),
+        (torch.Size([1, 4, 32]), torch.Size([1, 4, 16])),
+        (torch.Size([1, 4, 32]), torch.Size([1, 8, 16])),
     ]
     prefix_kwargs, canvas_kwargs = captured[0][2], captured[1][2]
-    assert prefix_kwargs["input_layout"] == canvas_kwargs["input_layout"] == "BSND"
+    assert prefix_kwargs["input_layout"] == canvas_kwargs["input_layout"] == "BSH"
+    assert prefix_kwargs["head_num"] == canvas_kwargs["head_num"] == 4
     assert prefix_kwargs["sparse_mode"] == 2
     assert prefix_kwargs["atten_mask"].shape == (2048, 2048)
     assert canvas_kwargs["sparse_mode"] == 0
@@ -206,11 +210,12 @@ def test_simulated_block_diffusion_attention_preserves_fused_boundaries():
     assert len(fused_forward) == len(fused_backward) == 2
     assert [node.attrs["sparse_mode"] for node in fused_forward] == [2, 0]
     assert [node.op_type for node in [*fused_forward, *fused_backward]] == ["fusion_attention"] * 4
-    assert [meta.shape for meta in fused_forward[0].inputs] == [(1, 4, 2, 8)] * 3
+    assert fused_forward[0].attrs["layout"] == "BSH"
+    assert [meta.shape for meta in fused_forward[0].inputs] == [(1, 4, 16)] * 3
     assert [meta.shape for meta in fused_forward[1].inputs] == [
-        (1, 4, 2, 8),
-        (1, 8, 2, 8),
-        (1, 8, 2, 8),
+        (1, 4, 16),
+        (1, 8, 16),
+        (1, 8, 16),
     ]
     assert all(tensor.grad is not None for tensor in (q, k, v))
 

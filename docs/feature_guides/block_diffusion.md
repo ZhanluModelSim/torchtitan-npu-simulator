@@ -50,8 +50,10 @@ Attention 使用 prefix-causal/canvas-bidirectional 可见域。CPU/reference �
 `seq_len x seq_len` mask，而是执行两次等价的 SDPA：prefix query 对 prefix KV
 使用 causal SDPA，canvas query 对全部 prefix+canvas KV 使用 non-causal SDPA，
 最后沿 sequence 维拼接。NPU converter 保留相同的两段 shape，但分别转换为
-`npu_fusion_attention`：prefix 使用压缩 causal mask 和 `sparse_mode=2`，canvas
-不传 mask 并使用 `sparse_mode=0`。因此训练 step 中不会再把 attention 展开为
+`npu_fusion_attention`：进入算子前将 BSND 仅作 metadata reshape 为三维 BSH，
+prefix 使用压缩 causal mask 和 `sparse_mode=2`，canvas 不传 mask 并使用
+`sparse_mode=0`，算子返回后恢复 BSND。三维接口与四维接口数学等价，并兼容仅实现
+3-D 输入解析的下游 FlashAttention cost model。因此训练 step 中不会再把 attention 展开为
 `SafeSoftmax/Tril/WhereSelf` 等算子。`seq_len` 必须不小于 `block_size` 且能被其整除。
 
 上述 corruption 和 loss 是根据 raw workload 的逐 block 生成语义补齐的训练

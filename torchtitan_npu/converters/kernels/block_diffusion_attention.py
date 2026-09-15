@@ -59,14 +59,24 @@ class NPUBlockDiffusionAttention(PrefixCanvasSDPA):
         scale: float | None,
         causal: bool,
     ) -> torch.Tensor:
-        return _NPUFusionAttention.apply(
-            q,
-            k,
-            v,
+        batch_size, query_len, query_heads, _query_dim = q.shape
+        key_len, value_dim = k.shape[1], v.shape[-1]
+        # BSH is an officially supported equivalent NPU layout and is also
+        # understood by downstream FA cost models that do not parse 4-D BSND.
+        # These reshapes only change metadata; Sq and Skv remain independent.
+        q_bsh = q.reshape(batch_size, query_len, -1)
+        k_bsh = k.reshape(batch_size, key_len, -1)
+        v_bsh = v.reshape(batch_size, key_len, -1)
+        output = _NPUFusionAttention.apply(
+            q_bsh,
+            k_bsh,
+            v_bsh,
             self.causal_mask if causal else None,
             self._resolved_scale(q, scale),
             2 if causal else 0,
+            query_heads,
         )
+        return output.reshape(batch_size, query_len, query_heads, value_dim)
 
     # pyrefly: ignore [bad-override]
     def forward(
@@ -128,14 +138,14 @@ class _NPUFusionAttention(torch.autograd.Function):
 
     @staticmethod
     # pyrefly: ignore [bad-override]
-    def forward(ctx, q, k, v, atten_mask, scale, sparse_mode):
+    def forward(ctx, q, k, v, atten_mask, scale, sparse_mode, head_num):
         attention, softmax_max, softmax_sum, _softmax_out, seed, offset, numels = (
             torch_npu.npu_fusion_attention(
                 q,
                 k,
                 v,
-                head_num=q.shape[2],
-                input_layout="BSND",
+                head_num=head_num,
+                input_layout="BSH",
                 atten_mask=atten_mask,
                 scale=scale,
                 keep_prob=1.0,
@@ -144,7 +154,7 @@ class _NPUFusionAttention(torch.autograd.Function):
         )
         ctx.save_for_backward(q, k, v, attention, softmax_max, softmax_sum)
         ctx.atten_mask = atten_mask
-        ctx.head_num = q.shape[2]
+        ctx.head_num = head_num
         ctx.scale = scale
         ctx.sparse_mode = sparse_mode
         ctx.seed = seed
@@ -162,7 +172,7 @@ class _NPUFusionAttention(torch.autograd.Function):
             v,
             grad_output,
             head_num=ctx.head_num,
-            input_layout="BSND",
+            input_layout="BSH",
             atten_mask=ctx.atten_mask,
             softmax_max=softmax_max,
             softmax_sum=softmax_sum,
@@ -174,7 +184,7 @@ class _NPUFusionAttention(torch.autograd.Function):
             numels=ctx.numels,
             sparse_mode=ctx.sparse_mode,
         )
-        return grad_q, grad_k, grad_v, None, None, None
+        return grad_q, grad_k, grad_v, None, None, None, None
 
 
 class NPUBlockDiffusionAttentionConverter(ModelCustomConverter):

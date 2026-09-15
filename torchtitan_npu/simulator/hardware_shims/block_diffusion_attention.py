@@ -55,11 +55,11 @@ def _record(
 class _SimFusionAttention(torch.autograd.Function):
     @staticmethod
     # pyrefly: ignore [bad-override]
-    def forward(ctx, q, k, v, scale, sparse_mode, module_path):
+    def forward(ctx, q, k, v, scale, sparse_mode, head_num, module_path):
         output = _empty_like(q)
         attrs = {
-            "num_heads": int(q.shape[2]),
-            "layout": "BSND",
+            "num_heads": int(head_num),
+            "layout": "BSH",
             "scale": float(scale),
             "sparse_mode": int(sparse_mode),
         }
@@ -81,7 +81,7 @@ class _SimFusionAttention(torch.autograd.Function):
             ctx.module_path,
             ctx.attrs,
         )
-        return *grads, None, None, None
+        return *grads, None, None, None, None
 
 
 class SimBlockDiffusionAttention(PrefixCanvasSDPA):
@@ -94,8 +94,19 @@ class SimBlockDiffusionAttention(PrefixCanvasSDPA):
         scale: float | None,
         causal: bool,
     ) -> torch.Tensor:
+        batch_size, query_len, query_heads, _query_dim = q.shape
+        key_len, value_dim = k.shape[1], v.shape[-1]
         resolved_scale = float(scale) if scale is not None else q.shape[-1] ** -0.5
-        return _SimFusionAttention.apply(q, k, v, resolved_scale, 2 if causal else 0, _module_path())
+        output = _SimFusionAttention.apply(
+            q.reshape(batch_size, query_len, -1),
+            k.reshape(batch_size, key_len, -1),
+            v.reshape(batch_size, key_len, -1),
+            resolved_scale,
+            2 if causal else 0,
+            query_heads,
+            _module_path(),
+        )
+        return output.reshape(batch_size, query_len, query_heads, value_dim)
 
     # pyrefly: ignore [bad-override]
     def forward(
