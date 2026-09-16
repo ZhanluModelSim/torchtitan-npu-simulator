@@ -96,24 +96,26 @@ Attention kernel；显式 autograd bridge 在 backward 调用
 reshape 后，以三维 BSH 调用同一个 NPU kernel，输出再恢复 BSND；这不改变 GQA 或
 causal attention 数学。
 
-reduced 每层输入统一为 `Q=[1,256,1024], K/V=[1,256,512]`。内部 CostModel 先按
-全长 Attention 计算，再仅对 Attention FLOPs 乘 `attention_compute_alpha=0.8125`；
+reduced 每层输入统一为 `Q=[1,256,1024], K/V=[1,256,512]`。Simulator 先按
+全长 causal AR Attention 计算，再仅对 Attention FLOPs 乘 `attention_compute_alpha=0.8125`；
 投影、MoE、Norm、loss 和优化器不参与折算。full 的默认 alpha 为 `0.94140625`。
-alpha 通过模拟融合算子的 metadata 传给仓库内 CostModel；真实 Zhanlu 若忽略未知
-metadata，需要在其汇总侧对 Attention 项后处理。真实命中率与折算结果仍需在其
-运行镜像中重新执行并归档；本记录不以 meta 结果替代外部 cost-model 验收。
+Simulator 将融合 Attention 分解为正向 `matmul + softmax + matmul` 和反向
+`4 * matmul + softmax_backward`。causal 与 alpha 一起折入这些子节点的有效 key
+维度，Zhanlu 即使忽略 metadata 也能从 shape 得到折算后的计算量。真实命中率仍需在
+其运行镜像中重新执行并归档；本记录不以 meta 结果替代外部 cost-model 验收。
 
-本轮单卡 reduced 复验捕获 1564 ops / 0 comm。8 层分别产生 8 个 original-forward、
-8 个 recompute 和 8 个 backward 融合 Attention；每个算子均为上述 256-token BSH
-shape、`sparse_mode=2`、`compute_alpha=0.8125`，单算子 FLOPs 从未折算的
-268,435,456 降为 218,103,808。复验同时修正了 capture 在构建节点时丢弃 synthetic
-op attrs 的问题，否则 alpha 虽出现在 JSON 中却不会进入成本计算。
+本轮单卡 reduced 复验捕获 1628 ops / 0 comm。8 层分别产生 8 个 original-forward、
+8 个 recompute 和 8 个 backward Attention 边界，共展开为 64 个 matmul、16 个
+softmax 和 8 个 softmax backward 节点。`seq_len=256` 的 causal 平均 key 长度为 128，
+再乘 `compute_alpha=0.8125` 得到 `effective_kv_seq_len=104`；首个 QK Matmul shape 为
+`[16,256,64] x [16,64,104]`。
 
-为满足外部 FlashAttention cost model 的特征提取，融合算子同时显式携带
+为保留原融合边界并方便外部工具检查，每个分解子节点同时显式携带
 `head_num/num_heads=16`、`num_kv_heads=8`、`head_dim=64`、`input_layout/layout=BSH`、
 `q_seq_len=kv_seq_len=256`、scale、causal window 和 sparse-mode 参数。真实 torch-npu
 接口使用其原生拼写 `pre_tockens/next_tockens`；synthetic metadata 同时提供
-`pre_tokens/next_tokens`，兼容下游成本模型的标准拼写。
+`pre_tokens/next_tokens`，兼容下游成本模型的标准拼写。上述字段已写入最终 JSON
+中子节点顶层的 `parameter_inputs`，而不是仅存在于内部 `attrs`。
 
 ## 回归测试
 
@@ -125,7 +127,7 @@ pytest -q \
   tests/unit_tests/simulator/capture/test_op_mapping.py \
   tests/unit_tests/simulator/cost/test_op_cost_model.py \
   tests/unit_tests/simulator/test_trainer.py
-# 54 passed
+# 定向集合通过；完整回归结果见下方
 
 pytest -q \
   tests/unit_tests/simulator/test_trainer.py \
@@ -139,6 +141,8 @@ pytest -q \
   tests/unit_tests/converters/test_registry.py
 # 15 passed
 ```
+
+完整 `tests/unit_tests/simulator/` 加 Block Diffusion 模型测试：`381 passed, 1 skipped`。
 
 额外执行的 simulator config-registry smoke suite 中，本次新增配置均可加载；suite
 整体另有 4 个既有失败：测试期望 `ValueError`，当前 Tyro 将 DeepSeek V4 MXFP8

@@ -131,6 +131,9 @@ class _RawEvent:
     # Non-tensor operator arguments (for example layout and head count on a
     # fused attention kernel). They become OpNode.attrs.
     attrs: dict[str, Any] | None = None
+    # Dedicated analytical-model input channel. Unlike attrs, these values
+    # are exported as OpNode.parameter_inputs for Zhanlu feature extraction.
+    parameter_inputs: dict[str, Any] | None = None
     extra_annotations: dict[str, Any] | None = None
 
 
@@ -151,6 +154,12 @@ def _shape_signature(event: _RawEvent) -> tuple:
         tuple(tuple(o.shape) for o in event.outputs),
         tuple(
             sorted((str(key), repr(value)) for key, value in (event.attrs or {}).items())
+        ),
+        tuple(
+            sorted(
+                (str(key), repr(value))
+                for key, value in (event.parameter_inputs or {}).items()
+            )
         ),
         tuple(
             sorted(
@@ -345,6 +354,7 @@ class OpDispatchCapture(TorchDispatchMode):
         operation_input_metas: list[TensorMeta] | None = None,
         operation_output_metas: list[TensorMeta] | None = None,
         attrs: dict[str, Any] | None = None,
+        parameter_inputs: dict[str, Any] | None = None,
         extra_annotations: dict[str, Any] | None = None,
     ) -> None:
         """Manually register one synthetic L0 event, as if `raw_op_type` had
@@ -366,7 +376,9 @@ class OpDispatchCapture(TorchDispatchMode):
         displayed/costed metadata while retaining ``inputs``/``outputs`` for
         dependency wiring; transport shims use this when wire dtype differs
         from the logical activation dtype.
-        ``attrs`` carries non-tensor operator kwargs into ``OpNode.attrs``.
+        ``attrs`` carries internal non-tensor metadata into ``OpNode.attrs``.
+        ``parameter_inputs`` is the dedicated downstream analytical-model
+        parameter channel and is exported as ``OpNode.parameter_inputs``.
         """
         logical_input_metas = None
         logical_output_metas = None
@@ -411,6 +423,7 @@ class OpDispatchCapture(TorchDispatchMode):
                 else None
             ),
             attrs=attrs,
+            parameter_inputs=parameter_inputs,
             extra_annotations=extra_annotations,
         )
 
@@ -494,6 +507,7 @@ class OpDispatchCapture(TorchDispatchMode):
         memory_flat_outputs: list[torch.Tensor] | None = None,
         dependency_flat_inputs: list[torch.Tensor] | None = None,
         attrs: dict[str, Any] | None = None,
+        parameter_inputs: dict[str, Any] | None = None,
         extra_annotations: dict[str, Any] | None = None,
         mutated_inputs: list[torch.Tensor] | None = None,
         visible_in_ir: bool = True,
@@ -592,6 +606,11 @@ class OpDispatchCapture(TorchDispatchMode):
             fsdp_state=fsdp_state,
             tensor_shape_scope=tensor_shape_scope,
             attrs=dict(attrs) if attrs is not None else None,
+            parameter_inputs=(
+                dict(parameter_inputs)
+                if parameter_inputs is not None
+                else None
+            ),
             extra_annotations=(
                 dict(extra_annotations)
                 if extra_annotations is not None
@@ -776,11 +795,13 @@ class OpDispatchCapture(TorchDispatchMode):
         """Assemble captured events into OpNode objects with cost annotations."""
         nodes: dict[str, OpNode] = {}
         for event in self._events:
+            cost_parameters = dict(event.attrs or {})
+            cost_parameters.update(event.parameter_inputs or {})
             cost = self.cost_model.compute(
                 event.op_type,
                 event.inputs,
                 event.outputs,
-                event.attrs or {},
+                cost_parameters,
             )
             annotations: dict[str, Any] = {
                 "raw_op_type": event.raw_op_type,
@@ -824,6 +845,7 @@ class OpDispatchCapture(TorchDispatchMode):
                 attrs=dict(event.attrs or {}),
                 predecessors=list(event.predecessors),
                 successors=[],
+                parameter_inputs=dict(event.parameter_inputs or {}),
                 flops=cost.flops,
                 peak_mem=cost.peak_mem,
                 param_mem=cost.param_mem,

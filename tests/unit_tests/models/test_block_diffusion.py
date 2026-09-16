@@ -175,7 +175,7 @@ def test_npu_attention_converter_emits_one_full_causal_fused_kernel(monkeypatch)
     assert all(tensor.grad is not None for tensor in (q, k, v))
 
 
-def test_simulated_block_diffusion_attention_preserves_fused_boundaries():
+def test_simulated_block_diffusion_attention_decomposes_fused_boundaries():
     from torchtitan_npu.simulator.capture.dispatch_capture import OpDispatchCapture
     from torchtitan_npu.simulator.hardware_shims.block_diffusion_attention import (
         SimBlockDiffusionAttention,
@@ -196,32 +196,40 @@ def test_simulated_block_diffusion_attention_preserves_fused_boundaries():
         phase["value"] = "backward"
         output.sum().backward()
 
-    nodes = list(capture.build_nodes().values())
-    fused_forward = [
+    nodes = [
         node
-        for node in nodes
-        if node.annotations["raw_op_type"] == "npu.npu_fusion_attention.default"
+        for node in capture.build_nodes().values()
+        if node.attrs.get("decomposed_from") == "npu.npu_fusion_attention.default"
     ]
-    fused_backward = [
-        node
-        for node in nodes
-        if node.annotations["raw_op_type"] == "npu.npu_fusion_attention_grad.default"
-    ]
+    forward = [node for node in nodes if node.annotations["comp_type"] == "F"]
+    backward = [node for node in nodes if node.annotations["comp_type"] == "B"]
+
     assert output.shape == q.shape
-    assert len(fused_forward) == len(fused_backward) == 1
-    assert fused_forward[0].attrs["sparse_mode"] == 2
-    assert fused_forward[0].attrs["compute_alpha"] == pytest.approx(0.75)
-    assert fused_forward[0].attrs["head_num"] == 2
-    assert fused_forward[0].attrs["num_kv_heads"] == 2
-    assert fused_forward[0].attrs["head_dim"] == 8
-    assert fused_forward[0].attrs["input_layout"] == "BSH"
-    assert fused_forward[0].attrs["pre_tokens"] == 2_147_483_647
-    assert fused_forward[0].attrs["next_tokens"] == 0
-    assert fused_forward[0].attrs["is_causal"] is True
-    assert fused_forward[0].flops == round(4 * 1 * 8 * 16 * 8 * 0.75)
-    assert [node.op_type for node in [*fused_forward, *fused_backward]] == ["fusion_attention"] * 2
-    assert fused_forward[0].attrs["layout"] == "BSH"
-    assert [meta.shape for meta in fused_forward[0].inputs] == [(1, 8, 16)] * 3
+    assert [node.op_type for node in forward] == ["matmul", "softmax", "matmul"]
+    assert [node.op_type for node in backward] == ["matmul", "matmul", "softmax", "matmul", "matmul"]
+    assert [node.annotations["raw_op_type"] for node in forward] == [
+        "aten.matmul.default",
+        "aten._softmax.default",
+        "aten.matmul.default",
+    ]
+    assert backward[2].annotations["raw_op_type"] == "aten._softmax_backward_data.default"
+
+    # S=8 causal gives 4 effective keys; alpha=0.75 folds that to 3.
+    assert forward[0].attrs["effective_kv_seq_len"] == 3
+    assert [meta.shape for meta in forward[0].inputs] == [(2, 8, 8), (2, 8, 3)]
+    assert [meta.shape for meta in forward[0].outputs] == [(2, 8, 3)]
+    assert [meta.shape for meta in forward[2].inputs] == [(2, 8, 3), (2, 3, 8)]
+    # The returned BSH tensor is the final matmul output, preserving the
+    # downstream dependency edge while retaining the same element count.
+    assert [meta.shape for meta in forward[2].outputs] == [(1, 8, 16)]
+    assert forward[2].successors
+
+    assert all(node.attrs["layout"] == "BSH" for node in nodes)
+    assert all(node.attrs["compute_alpha"] == pytest.approx(0.75) for node in nodes)
+    assert all(node.parameter_inputs["num_heads"] == 2 for node in nodes)
+    assert all(node.parameter_inputs["num_kv_heads"] == 2 for node in nodes)
+    assert all(node.parameter_inputs["head_dim"] == 8 for node in nodes)
+    assert all(node.parameter_inputs["effective_kv_seq_len"] == 3 for node in nodes)
     assert all(tensor.grad is not None for tensor in (q, k, v))
 
 

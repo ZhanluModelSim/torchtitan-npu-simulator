@@ -27,6 +27,9 @@ class OpNode:
     attrs: dict[str, Any]
     predecessors: list[str]
     successors: list[str]
+    # Non-tensor operator parameters consumed by downstream analytical
+    # models (for example FlashAttention head/layout/window metadata).
+    parameter_inputs: dict[str, Any] = field(default_factory=dict)
     flops: int = 0
     peak_mem: int = 0
     param_mem: int = 0

@@ -40,6 +40,7 @@ OP_MAPPING: dict[str, str] = {
     "aten.silu.default": "silu",
     "aten.softmax.default": "softmax",
     "aten._softmax.default": "softmax",
+    "aten._softmax_backward_data.default": "softmax",
     "npu.npu_swiglu.default": "swiglu",
     "npu.npu_swiglu_backward.default": "swiglu",
     "fusion_attention": "fusion_attention",

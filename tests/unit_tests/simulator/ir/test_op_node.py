@@ -37,6 +37,7 @@ def test_op_node_construction_and_defaults():
     assert node.peak_mem == 0
     assert node.param_mem == 0
     assert node.comm_bytes == 0
+    assert node.parameter_inputs == {}
     assert node.annotations == {}
 
 

@@ -3,7 +3,13 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Shape-only Block Diffusion fused attention used during meta simulation."""
+"""Shape-only Block Diffusion attention used during meta simulation.
+
+The downstream analytical model cannot currently cost the synthetic
+``npu_fusion_attention`` node.  Record the fused kernel as the canonical
+matmul/softmax decomposition instead, while keeping the original fused
+metadata on every child node.
+"""
 
 from __future__ import annotations
 
@@ -28,6 +34,15 @@ def _empty_like(tensor: torch.Tensor) -> torch.Tensor:
         return torch.empty_like(tensor)
 
 
+def _empty(shape: tuple[int, ...], reference: torch.Tensor) -> torch.Tensor:
+    """Allocate a shape-only placeholder without leaking an ``empty`` event."""
+    capture = get_active_capture()
+    if capture is None:
+        return torch.empty(shape, dtype=reference.dtype, device=reference.device)
+    with capture.suspend_recording():
+        return torch.empty(shape, dtype=reference.dtype, device=reference.device)
+
+
 def _module_path() -> str:
     capture = get_active_capture()
     if capture is None or capture.module_path_tracker is None:
@@ -40,7 +55,9 @@ def _record(
     inputs: list[torch.Tensor],
     outputs: list[torch.Tensor],
     module_path: str,
-    attrs: dict[str, int | float | str],
+    attrs: dict[str, int | float | str | bool],
+    parameter_inputs: dict[str, int | float | str | bool] | None = None,
+    dependency_inputs: list[torch.Tensor] | None = None,
 ) -> None:
     capture = get_active_capture()
     if capture is not None:
@@ -50,7 +67,46 @@ def _record(
             outputs=outputs,
             module_path=module_path,
             attrs=attrs,
+            parameter_inputs=parameter_inputs,
+            dependency_inputs=dependency_inputs,
         )
+
+
+def _fused_metadata(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    head_num: int,
+    kv_head_num: int,
+    head_dim: int,
+    scale: float,
+    sparse_mode: int,
+    compute_alpha: float,
+) -> dict[str, int | float | str | bool]:
+    """Describe the fused FA boundary retained on each decomposed sub-op."""
+    return {
+        "num_heads": int(head_num),
+        "head_num": int(head_num),
+        "num_kv_heads": int(kv_head_num),
+        "head_dim": int(head_dim),
+        "layout": "BSH",
+        "input_layout": "BSH",
+        "scale": float(scale),
+        "scale_value": float(scale),
+        "keep_prob": 1.0,
+        "pre_tokens": _TORCH_MAX_INT,
+        "pre_tockens": _TORCH_MAX_INT,
+        "next_tokens": 0,
+        "next_tockens": 0,
+        "inner_precise": 0,
+        "sparse_mode": int(sparse_mode),
+        "is_causal": sparse_mode == 2,
+        "q_seq_len": int(q.shape[1]),
+        "kv_seq_len": int(k.shape[1]),
+        "gen_mask_parallel": True,
+        "sync": False,
+        "compute_alpha": float(compute_alpha),
+        "decomposed_from": "npu.npu_fusion_attention.default",
+    }
 
 
 class _SimFusionAttention(torch.autograd.Function):
@@ -69,47 +125,126 @@ class _SimFusionAttention(torch.autograd.Function):
         compute_alpha,
         module_path,
     ):
+        batch = q.shape[0]
+        q_seq, k_seq = q.shape[1], k.shape[1]
+        value_head_dim = v.shape[-1] // kv_head_num
+        bh = batch * head_num
+
+        # Approximate causal AR work with half of the full key sequence.
+        # Fold Block Diffusion's alpha into that effective key dimension so
+        # downstream matmul/softmax models apply it even if they ignore attrs.
+        causal_key_seq = (k_seq + 1) // 2 if sparse_mode == 2 else k_seq
+        effective_key_seq = max(1, round(causal_key_seq * compute_alpha))
+
+        q_per_head = _empty((bh, q_seq, head_dim), q)
+        k_transposed = _empty((bh, head_dim, effective_key_seq), k)
+        scores = _empty((bh, q_seq, effective_key_seq), q)
+        probabilities = _empty_like(scores)
+        v_per_head = _empty((bh, effective_key_seq, value_head_dim), v)
         output = _empty_like(q)
-        attrs = {
-            "num_heads": int(head_num),
-            "head_num": int(head_num),
-            "num_kv_heads": int(kv_head_num),
-            "head_dim": int(head_dim),
-            "layout": "BSH",
-            "input_layout": "BSH",
-            "scale": float(scale),
-            "scale_value": float(scale),
-            "keep_prob": 1.0,
-            "pre_tokens": _TORCH_MAX_INT,
-            "pre_tockens": _TORCH_MAX_INT,
-            "next_tokens": 0,
-            "next_tockens": 0,
-            "inner_precise": 0,
-            "sparse_mode": int(sparse_mode),
-            "is_causal": True,
-            "q_seq_len": int(q.shape[1]),
-            "kv_seq_len": int(k.shape[1]),
-            "gen_mask_parallel": True,
-            "sync": False,
-            "compute_alpha": float(compute_alpha),
-        }
-        _record("npu.npu_fusion_attention.default", [q, k, v], [output], module_path, attrs)
+        metadata = _fused_metadata(
+            q, k, head_num, kv_head_num, head_dim, scale, sparse_mode, compute_alpha
+        )
+        metadata["effective_kv_seq_len"] = effective_key_seq
+
+        _record(
+            "aten.matmul.default",
+            [q_per_head, k_transposed],
+            [scores],
+            module_path,
+            metadata,
+            metadata,
+            [q, k],
+        )
+        _record("aten._softmax.default", [scores], [probabilities], module_path, metadata, metadata)
+        _record(
+            "aten.matmul.default",
+            [probabilities, v_per_head],
+            [output],
+            module_path,
+            metadata,
+            metadata,
+            [v],
+        )
+
         ctx.save_for_backward(q, k, v)
         ctx.module_path = module_path
-        ctx.attrs = attrs
+        ctx.fused_metadata = metadata
+        ctx.head_num = head_num
+        ctx.kv_head_num = kv_head_num
+        ctx.head_dim = head_dim
+        ctx.effective_key_seq = effective_key_seq
         return output
 
     @staticmethod
     # pyrefly: ignore [bad-override]
     def backward(ctx, grad_output):
         q, k, v = ctx.saved_tensors
+        batch, q_seq = q.shape[:2]
+        bh = batch * ctx.head_num
+        effective_key_seq = ctx.effective_key_seq
+        value_head_dim = v.shape[-1] // ctx.kv_head_num
         grads = [_empty_like(tensor) for tensor in (q, k, v)]
+
+        scores = _empty((bh, q_seq, effective_key_seq), q)
+        probabilities_t = _empty((bh, effective_key_seq, q_seq), q)
+        probabilities = _empty_like(scores)
+        grad_output_per_head = _empty((bh, q_seq, value_head_dim), grad_output)
+        v_transposed = _empty((bh, value_head_dim, effective_key_seq), v)
+        grad_probabilities = _empty_like(scores)
+        grad_scores = _empty_like(scores)
+        grad_scores_t = _empty((bh, effective_key_seq, q_seq), q)
+        k_per_head = _empty((bh, effective_key_seq, ctx.head_dim), k)
+        q_per_head = _empty((bh, q_seq, ctx.head_dim), q)
+        metadata = ctx.fused_metadata
+
+        # dV = P^T @ dO
         _record(
-            "npu.npu_fusion_attention_grad.default",
-            [q, k, v, grad_output],
-            grads,
+            "aten.matmul.default",
+            [probabilities_t, grad_output_per_head],
+            [grads[2]],
             ctx.module_path,
-            ctx.attrs,
+            metadata,
+            metadata,
+            [q, k, v, grad_output],
+        )
+        # dP = dO @ V^T
+        _record(
+            "aten.matmul.default",
+            [grad_output_per_head, v_transposed],
+            [grad_probabilities],
+            ctx.module_path,
+            metadata,
+            metadata,
+            [grad_output, v],
+        )
+        _record(
+            "aten._softmax_backward_data.default",
+            [grad_probabilities, probabilities],
+            [grad_scores],
+            ctx.module_path,
+            metadata,
+            metadata,
+        )
+        # dQ = dS @ K
+        _record(
+            "aten.matmul.default",
+            [grad_scores, k_per_head],
+            [grads[0]],
+            ctx.module_path,
+            metadata,
+            metadata,
+            [k],
+        )
+        # dK = dS^T @ Q
+        _record(
+            "aten.matmul.default",
+            [grad_scores_t, q_per_head],
+            [grads[1]],
+            ctx.module_path,
+            metadata,
+            metadata,
+            [grad_scores, q],
         )
         return *grads, None, None, None, None, None, None, None
 

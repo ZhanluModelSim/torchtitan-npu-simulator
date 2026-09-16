@@ -50,21 +50,25 @@ positions 上计算，并按全局有效 label 数归一化。
 `seq_len` 作为一条普通自回归序列，执行一次 causal SDPA；NPU converter 对应执行一次
 `npu_fusion_attention`，进入算子前将 BSND 仅作 metadata reshape 为三维 BSH，使用
 压缩 causal mask 和 `sparse_mode=2`，返回后恢复 BSND。这样 reduced 的 seq 256 不再
-拆成 192/64 两段，并兼容只解析 3-D 输入的下游 FlashAttention cost model。
+拆成 192/64 两段。Simulator 不直接导出该融合节点，因为 Zhanlu 的
+`FlashAttentionPrediction` 当前无法从该节点建立有效输入 shape；它改为按每头批化的
+`matmul(Q,K^T) -> softmax -> matmul(P,V)` 导出，反向对应 4 个 matmul 和 1 个
+softmax backward，使下游使用已有 Matmul/Softmax cost model。
 真实 NPU 调用显式传入 `head_num`、`input_layout=BSH`、`scale`、`keep_prob`、
 `pre_tockens=INT_MAX`、`next_tockens=0`、`inner_precise=0`、`sparse_mode=2`、
 `gen_mask_parallel=true` 和 `sync=false`。模拟算子另外记录 `head_dim`、KV head 数、
 Q/KV sequence length，并同时保留 torch-npu 与成本模型常见的参数名别名，避免
-下游把 `[B,S,H]` 错解为 `[B,H,S]`。
+下游把 `[B,S,H]` 错解为 `[B,H,S]`。这些建模参数通过 L0 OpNode 顶层的
+`parameter_inputs` 专用通道导出；`attrs` 中保留同值仅用于仓库内兼容。
 
 配置项 `attention_compute_alpha` 只折算 Attention 的 QK/Softmax/PV FLOPs，不改变
 数值前向，也不折算 QKV/输出投影、MoE、Norm 或优化器计算。默认值按照原两段融合
 kernel 的 score-matrix 面积与全长 kernel 面积之比设定：
 `alpha=((S-B)^2+B*S)/S^2`。因此 debug/dense_debug 为 `0.75`，reduced 为
 `0.8125`，full 为 `0.94140625`。该值是可覆盖的计算建模参数，不是模型权重或训练
-超参数。仓库内 simulator 从融合算子的 `compute_alpha` metadata 读取并应用折算；
-外部 Zhanlu 若未消费该自定义属性，应先得到标准全长 causal Attention 成本，再在
-Attention 项上做同样的 alpha 后处理。
+超参数。Simulator 先按 causal AR 取平均有效 key 长度，再将 alpha 直接折入分解节点的
+key 维度；因此即使外部 Zhanlu 不读取自定义属性，Matmul/Softmax 的输入 shape 也已经
+体现折算。完整融合信息仍同时保存在每个子节点的 `attrs` 和 `parameter_inputs` 中。
 
 上述 corruption 和 loss 是根据 raw workload 的逐 block 生成语义补齐的训练
 契约。由于原始文件没有给出权威训练代码或 checkpoint，本接入不声明 mask-ratio

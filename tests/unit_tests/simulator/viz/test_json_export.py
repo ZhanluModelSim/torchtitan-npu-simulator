@@ -38,6 +38,7 @@ def test_workload_graph_to_dict_is_plain_dict():
     assert isinstance(d, dict)
     assert d["workload_id"] == "wl1"
     assert d["step_templates"]["tmpl"]["nodes"]["op1"]["op_type"] == "matmul"
+    assert d["step_templates"]["tmpl"]["nodes"]["op1"]["parameter_inputs"] == {}
     annotations = d["step_templates"]["tmpl"]["nodes"]["op1"]["annotations"]
     assert annotations["execution_kind"] == "recompute"
     assert annotations["is_recompute"] is True
