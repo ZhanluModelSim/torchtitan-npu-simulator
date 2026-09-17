@@ -14,10 +14,16 @@ from typing import Any, cast
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from torch.distributed._composable.replicate_with_fsdp import replicate
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     CheckpointWrapper,
 )
 from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy, fully_shard
+from torch.distributed.fsdp._fully_shard._fsdp_common import (
+    FSDPMeshInfo,
+    ShardPlacementResult,
+)
 from torch.distributed.tensor import (
     Replicate,
     Shard,
@@ -41,10 +47,14 @@ from torchtitan.distributed.expert_parallel import (
     ExpertParallel,
     TensorParallel,
 )
+from torchtitan.distributed.fsdp import get_fsdp_reshard_after_forward_policy
 from torchtitan.distributed.tensor_parallel import NoParallel, maybe_enable_async_tp
 from torchtitan.models.common import FlexAttention, VarlenAttention
 from torchtitan.models.common import moe as moe_module
-from torchtitan.models.llama3.parallelize import apply_replicate
+from torchtitan.models.llama3.parallelize import (
+    apply_replicate,
+    disable_fsdp_gradient_division,
+)
 from torchtitan.models.llama4.parallelize import apply_fsdp
 
 from torchtitan_npu.converters.kernels.rms_norm import NPURMSNorm
@@ -152,6 +162,23 @@ def _model_uses_attention_masks(model_args: Any) -> bool:
         if isinstance(inner_attention, (FlexAttention.Config, VarlenAttention.Config)):
             return True
     return False
+
+
+def _replicate_embedding_and_first_layer_enabled() -> bool:
+    """Read the DeepSeek-V4-only simulator experiment from the active config."""
+    from torchtitan_npu.patches.torchtitan._trainer_config_stash import (
+        get_trainer_config,
+    )
+
+    trainer_config = get_trainer_config()
+    simulation_config = getattr(trainer_config, "simulation", None)
+    return bool(
+        getattr(
+            simulation_config,
+            "replicate_embedding_and_first_layer",
+            False,
+        )
+    )
 
 
 class HcHeadParallelStyle(ParallelStyle):
@@ -309,7 +336,12 @@ def parallelize_deepseek_v4(
         edp_mesh_names = ["dp_replicate", "efsdp"] if parallel_dims.dp_replicate_enabled else ["efsdp"]
         edp_mesh = parallel_dims.get_optional_mesh(edp_mesh_names)
 
-        apply_fsdp(
+        fsdp_fn = (
+            apply_deepseek_v4_fsdp_with_replicated_first_layer
+            if _replicate_embedding_and_first_layer_enabled()
+            else apply_fsdp
+        )
+        fsdp_fn(
             model,
             dp_mesh,
             param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
@@ -342,6 +374,202 @@ def parallelize_deepseek_v4(
         )
 
     return model
+
+
+def _flatten_replicate_mesh(mesh: DeviceMesh, mesh_dim_name: str) -> DeviceMesh:
+    """Return the 1D data-parallel mesh required by ``replicate()``."""
+    if mesh.ndim == 1:
+        return mesh
+    if mesh.ndim != 2:
+        raise ValueError(
+            "DeepSeek-V4 replicated first-layer simulation expects a 1D FSDP "
+            f"mesh or a 2D HSDP mesh, but got {mesh.ndim} dimensions"
+        )
+    return mesh._flatten(mesh_dim_name)
+
+
+def apply_deepseek_v4_fsdp_with_replicated_first_layer(
+    model: Any,
+    dp_mesh: DeviceMesh,
+    param_dtype: torch.dtype,
+    reduce_dtype: torch.dtype,
+    pp_enabled: bool,
+    cpu_offload: bool = False,
+    reshard_after_forward_policy: str = "default",
+    ep_degree: int = 1,
+    edp_mesh: DeviceMesh | None = None,
+    gradient_divide_factor: int | None = None,
+) -> None:
+    """Apply FSDP while replicating the embedding and global layer zero.
+
+    The first layer's routed experts remain partitioned by EP, but replicas of
+    the same experts are synchronized over EDP instead of being EFSDP-sharded.
+    All other first-layer parameters are synchronized over the dense DP mesh.
+    """
+    del gradient_divide_factor  # Gradient division is disabled below, matching upstream.
+
+    if getattr(model, "enable_weight_tying", False):
+        raise ValueError("simulation.replicate_embedding_and_first_layer does not support weight-tied embeddings")
+
+    mp_policy = MixedPrecisionPolicy(
+        param_dtype=param_dtype,
+        reduce_dtype=reduce_dtype,
+    )
+    fsdp_config: dict[str, Any] = {"mesh": dp_mesh, "mp_policy": mp_policy}
+    replicate_config: dict[str, Any] = {
+        "mesh": _flatten_replicate_mesh(dp_mesh, "dsv4_first_layer_dp"),
+        "mp_policy": mp_policy,
+    }
+    if cpu_offload:
+        offload_policy = CPUOffloadPolicy()
+        fsdp_config["offload_policy"] = offload_policy
+        replicate_config["offload_policy"] = offload_policy
+
+    reshard_after_forward = get_fsdp_reshard_after_forward_policy(
+        reshard_after_forward_policy,
+        pp_enabled,
+    )
+
+    if model.tok_embeddings is not None:
+        replicate(model.tok_embeddings, **replicate_config)
+
+    if model.norm is not None and model.output is not None:
+        fully_shard(
+            [model.norm, model.output],
+            **fsdp_config,
+            reshard_after_forward=reshard_after_forward_policy == "always",
+        )
+
+    for layer_id, transformer_block in model.layers.items():
+        is_first_layer = int(layer_id) == 0
+        if is_first_layer:
+            if transformer_block.moe_enabled:
+                if ep_degree > 1:
+                    if edp_mesh is None:
+                        raise ValueError(
+                            "DeepSeek-V4 replicated first-layer experts require "
+                            "an EDP mesh when Expert Parallel is enabled"
+                        )
+                    expert_mesh = edp_mesh
+                else:
+                    expert_mesh = dp_mesh
+                expert_replicate_config = dict(replicate_config)
+                expert_replicate_config["mesh"] = _flatten_replicate_mesh(
+                    expert_mesh,
+                    "dsv4_first_layer_edp",
+                )
+                # Apply bottom-up so the parent replicate group excludes routed
+                # expert params, which use the EP-aligned EDP process group.
+                replicate(
+                    transformer_block.moe.experts,
+                    **expert_replicate_config,
+                )
+            replicate(transformer_block, **replicate_config)
+            continue
+
+        if transformer_block.moe_enabled:
+            expert_params = set(transformer_block.moe.experts.parameters())
+            num_experts = transformer_block.moe.experts.num_experts
+
+            if ep_degree > 1:
+                if edp_mesh is None:
+                    raise ValueError("Expert Parallel requires an EDP mesh")
+                efsdp_ep_size = edp_mesh["efsdp"].size() * ep_degree
+            else:
+                efsdp_ep_size = dp_mesh.size()
+
+            expert_shard_placement = Shard(1) if efsdp_ep_size > num_experts else Shard(0)
+            if ep_degree == 1 and expert_shard_placement == Shard(0):
+                fully_shard(
+                    transformer_block,
+                    **fsdp_config,
+                    reshard_after_forward=reshard_after_forward,
+                )
+            elif ep_degree == 1:
+
+                def _experts_shard_placement_fn(
+                    param: nn.Parameter,
+                    _expert_params: set = expert_params,
+                ) -> Shard | None:
+                    return Shard(1) if param in _expert_params else None
+
+                fully_shard(
+                    transformer_block,
+                    **fsdp_config,
+                    reshard_after_forward=reshard_after_forward,
+                    shard_placement_fn=_experts_shard_placement_fn,
+                )
+            else:
+                assert edp_mesh is not None
+                edp_mesh_info = FSDPMeshInfo(mesh=edp_mesh, shard_mesh_dim=0)
+                dp_mesh_info = FSDPMeshInfo(mesh=dp_mesh, shard_mesh_dim=0)
+
+                def _shard_placement_fn(
+                    param: nn.Parameter,
+                    _expert_params: set = expert_params,
+                    _expert_placement: Shard = expert_shard_placement,
+                    _edp_mesh_info: FSDPMeshInfo = edp_mesh_info,
+                    _dp_mesh_info: FSDPMeshInfo = dp_mesh_info,
+                ) -> ShardPlacementResult:
+                    if param in _expert_params:
+                        return ShardPlacementResult(
+                            placement=_expert_placement,
+                            mesh_info=_edp_mesh_info,
+                        )
+                    return ShardPlacementResult(
+                        placement=Shard(0),
+                        mesh_info=_dp_mesh_info,
+                    )
+
+                fully_shard(
+                    transformer_block,
+                    **fsdp_config,
+                    reshard_after_forward=reshard_after_forward,
+                    shard_placement_fn=_shard_placement_fn,
+                )
+        else:
+            fully_shard(
+                transformer_block,
+                **fsdp_config,
+                reshard_after_forward=reshard_after_forward,
+            )
+
+    fully_shard(model, **fsdp_config)
+    disable_fsdp_gradient_division(model)
+    logger.info(
+        "Replicated DeepSeek-V4 embedding and first layer across their FSDP meshes while preserving Expert Parallel"
+    )
+
+    if ep_degree == 1:
+        return
+
+    transformer_blocks = list(model.layers.values())
+    next_transformer_blocks = [*transformer_blocks[1:], None]
+    if model.tok_embeddings is not None and transformer_blocks:
+        model.tok_embeddings.set_modules_to_forward_prefetch([transformer_blocks[0]])
+    for transformer_block, next_transformer_block in zip(
+        transformer_blocks,
+        next_transformer_blocks,
+        strict=True,
+    ):
+        if next_transformer_block is not None:
+            transformer_block.set_modules_to_forward_prefetch([next_transformer_block])
+        elif model.norm is not None and model.output is not None:
+            transformer_block.set_modules_to_forward_prefetch([model.norm, model.output])
+
+    reversed_transformer_blocks = list(reversed(transformer_blocks))
+    prev_transformer_blocks = [*reversed_transformer_blocks[1:], None]
+    if model.norm is not None and model.output is not None and reversed_transformer_blocks:
+        model.output.set_modules_to_backward_prefetch([reversed_transformer_blocks[0]])
+    for transformer_block, prev_transformer_block in zip(
+        reversed_transformer_blocks,
+        prev_transformer_blocks,
+        strict=True,
+    ):
+        if prev_transformer_block is not None:
+            transformer_block.set_modules_to_backward_prefetch([prev_transformer_block])
+        elif model.tok_embeddings is not None:
+            transformer_block.set_modules_to_backward_prefetch([model.tok_embeddings])
 
 
 def apply_non_moe_tp(

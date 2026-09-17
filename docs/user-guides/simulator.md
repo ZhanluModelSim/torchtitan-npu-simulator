@@ -317,6 +317,17 @@ backward 中重放。可通过
 即使选择了 `full`，`mm` 和 `linear` 仍保留上游的交替重计算策略；其余类别命中后
 保存输出。未传该参数时保持模型原有 policy。
 
+DeepSeek-V4 仿真还可以评估 Embedding 和第 0 层权重常驻副本的方案：
+
+```bash
+--simulation.replicate-embedding-and-first-layer
+```
+
+开启后，Embedding 和第 0 层非 routed-expert 参数不再沿普通 FSDP mesh 切分，
+第 0 层 routed experts 不再沿 EFSDP mesh 切分；这些权重在各自的数据并行组内
+重复存储并通过梯度 all-reduce 保持一致。Expert Parallel、Tensor Parallel 以及
+其余层的 FSDP/EFSDP 排布保持不变。该参数只由 DeepSeek-V4 仿真配置暴露，默认关闭。
+
 ## 输出文件
 
 ### 单进程模式（fake_backend）
