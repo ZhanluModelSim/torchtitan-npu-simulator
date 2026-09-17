@@ -22,6 +22,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy, fully_shard
 from torch.distributed.fsdp._fully_shard._fsdp_common import (
     FSDPMeshInfo,
+    HSDPMeshInfo,
     ShardPlacementResult,
 )
 from torch.distributed.tensor import (
@@ -388,6 +389,33 @@ def _flatten_replicate_mesh(mesh: DeviceMesh, mesh_dim_name: str) -> DeviceMesh:
     return mesh._flatten(mesh_dim_name)
 
 
+def _fsdp_mesh_info(mesh: DeviceMesh) -> FSDPMeshInfo:
+    """Build mesh metadata that preserves the HSDP replicate dimension."""
+    if mesh.ndim == 1:
+        return FSDPMeshInfo(mesh, shard_mesh_dim=0)
+    if mesh.ndim == 2:
+        mesh_dim_names = tuple(mesh.mesh_dim_names or ())
+        if (
+            len(mesh_dim_names) != 2
+            or mesh_dim_names[0] != "dp_replicate"
+            or mesh_dim_names[1] not in {"fsdp", "efsdp"}
+        ):
+            raise ValueError(
+                "DeepSeek-V4 HSDP expects mesh dimensions "
+                "('dp_replicate', 'fsdp' or 'efsdp'), but got "
+                f"{mesh_dim_names}"
+            )
+        return HSDPMeshInfo(
+            mesh,
+            shard_mesh_dim=1,
+            replicate_mesh_dim=0,
+        )
+    raise ValueError(
+        "DeepSeek-V4 FSDP expects a 1D FSDP mesh or a 2D HSDP mesh, "
+        f"but got {mesh.ndim} dimensions"
+    )
+
+
 def apply_deepseek_v4_fsdp_with_replicated_first_layer(
     model: Any,
     dp_mesh: DeviceMesh,
@@ -501,8 +529,8 @@ def apply_deepseek_v4_fsdp_with_replicated_first_layer(
                 )
             else:
                 assert edp_mesh is not None
-                edp_mesh_info = FSDPMeshInfo(mesh=edp_mesh, shard_mesh_dim=0)
-                dp_mesh_info = FSDPMeshInfo(mesh=dp_mesh, shard_mesh_dim=0)
+                edp_mesh_info = _fsdp_mesh_info(edp_mesh)
+                dp_mesh_info = _fsdp_mesh_info(dp_mesh)
 
                 def _shard_placement_fn(
                     param: nn.Parameter,

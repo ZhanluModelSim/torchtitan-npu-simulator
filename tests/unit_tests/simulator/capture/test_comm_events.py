@@ -493,6 +493,27 @@ def test_hsdp_ep_mesh_info_uses_replicate_then_shard_axes():
         unpatch_device_type_to_meta()
 
 
+@pytest.mark.parametrize("shard_dim_name", ["fsdp", "efsdp"])
+def test_deepseek_v4_hsdp_ep_mesh_info_uses_replicate_then_shard_axes(
+    shard_dim_name,
+):
+    from torch.distributed.device_mesh import DeviceMesh
+    from torch.distributed.fsdp._fully_shard._fsdp_common import HSDPMeshInfo
+
+    from torchtitan_npu.models.deepseek_v4.parallelize import _fsdp_mesh_info
+
+    mesh = DeviceMesh(
+        "meta",
+        torch.arange(8).reshape(2, 4),
+        mesh_dim_names=("dp_replicate", shard_dim_name),
+    )
+    mesh_info = _fsdp_mesh_info(mesh)
+
+    assert isinstance(mesh_info, HSDPMeshInfo)
+    assert mesh_info.replicate_mesh_dim == 0
+    assert mesh_info.shard_mesh_dim == 1
+
+
 def test_collectives_restored_after_context_exit():
     original_all_reduce = dist.all_reduce
     with capture_fake_collectives():
