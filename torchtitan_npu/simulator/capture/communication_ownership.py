@@ -459,21 +459,82 @@ def _fsdp_prefetch_anchor(
         target_region=target_region,
         target_collective_seq_idx=target_collective_seq_idx,
     )
-    if not source_regions:
-        raise RuntimeError(
-            "FSDP prefetch has no source parameter-group compute region: "
-            f"template={template_id}, target_group={target_group_id}, "
-            f"target_module={target_module_fqn!r}, "
-            f"source_module={prefetch_source_fqn!r}"
+    if source_regions:
+        external_predecessors = list(
+            dict.fromkeys(
+                predecessor
+                for region in source_regions
+                for predecessor in region.external_predecessors
+            )
         )
-
-    external_predecessors = list(
-        dict.fromkeys(
-            predecessor
+        source_entry_op_ids = tuple(
+            dict.fromkeys(
+                op_id
+                for region in source_regions
+                for op_id in region.entry_op_ids
+            )
+        )
+        source_collective_op_ids = [
+            comm_id
             for region in source_regions
-            for predecessor in region.external_predecessors
+            if (comm_id := comm_id_by_region.get(region)) is not None
+        ]
+    else:
+        # A replicated module has no FSDP residency markers, but it can still
+        # initiate a prefetch for the next sharded module. Anchor the prefetch
+        # to the replicated module's compute entry so that the all-gather can
+        # overlap that compute just like it does for an FSDP source module.
+        cutoff = (
+            target_region.wait_seq_idx
+            if target_region is not None
+            else max(
+                (node.seq_idx for node in nodes_by_id.values()),
+                default=target_collective_seq_idx,
+            )
+            + 1
         )
-    )
+        source_body = {
+            op_id
+            for op_id, node in nodes_by_id.items()
+            if target_collective_seq_idx < node.seq_idx < cutoff
+            and (
+                (module_path := str(node.annotations.get("module_path", "")))
+                == prefetch_source_fqn
+                or module_path.startswith(f"{prefetch_source_fqn}.")
+            )
+            and not node.annotations.get("fsdp_marker")
+            and not _is_fsdp_gradient_reduction(node)
+        }
+        source_entry_op_ids = tuple(
+            sorted(
+                (
+                    op_id
+                    for op_id in source_body
+                    if not any(
+                        predecessor in source_body
+                        for predecessor in nodes_by_id[op_id].predecessors
+                    )
+                ),
+                key=lambda op_id: (nodes_by_id[op_id].seq_idx, op_id),
+            )
+        )
+        if not source_entry_op_ids:
+            raise RuntimeError(
+                "FSDP prefetch has no source compute region: "
+                f"template={template_id}, target_group={target_group_id}, "
+                f"target_module={target_module_fqn!r}, "
+                f"source_module={prefetch_source_fqn!r}"
+            )
+        external_predecessors = list(
+            dict.fromkeys(
+                predecessor
+                for entry in source_entry_op_ids
+                for predecessor in nodes_by_id[entry].predecessors
+                if predecessor not in source_body
+                and predecessor in nodes_by_id
+            )
+        )
+        source_collective_op_ids = []
     # FSDP gradient reductions make gradients available to later gradient
     # handling, not to the next module's backward compute. They can appear as
     # external predecessors of a temporal source region in the captured graph,
@@ -491,20 +552,10 @@ def _fsdp_prefetch_anchor(
         for predecessor in external_predecessors
         if predecessor not in filtered_gradient_reduction_op_id_set
     ]
-    predecessor_op_ids.extend(
-        comm_id
-        for region in source_regions
-        if (comm_id := comm_id_by_region.get(region)) is not None
-    )
+    predecessor_op_ids.extend(source_collective_op_ids)
     return _FSDPPrefetchAnchor(
         predecessor_op_ids=tuple(dict.fromkeys(predecessor_op_ids)),
-        source_entry_op_ids=tuple(
-            dict.fromkeys(
-                op_id
-                for region in source_regions
-                for op_id in region.entry_op_ids
-            )
-        ),
+        source_entry_op_ids=source_entry_op_ids,
         filtered_gradient_reduction_op_ids=(
             filtered_gradient_reduction_op_ids
         ),

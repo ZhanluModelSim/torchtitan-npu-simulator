@@ -235,6 +235,19 @@ def _shard_world_size(param_group: Any) -> int:
         return int(shard_mesh_size) if shard_mesh_size is not None else -1
 
 
+def _uses_fsdp_sharding(param_group: Any) -> bool:
+    """Return whether the composable data-parallel group shards parameters.
+
+    PyTorch's ``replicate()`` and ``fully_shard()`` both use
+    ``FSDPParamGroup`` internally. Replicated groups carry ``DDPMeshInfo`` and
+    perform no parameter all-gather, so they must not emit FSDP residency
+    transitions in the simulator.
+    """
+    from torch.distributed.fsdp._fully_shard._fsdp_common import FSDPMeshInfo
+
+    return isinstance(getattr(param_group, "mesh_info", None), FSDPMeshInfo)
+
+
 def _set_stage_fsdp_state(meta_env: Any, state: str) -> None:
     """Synchronize the PP capture context with an FSDP state transition."""
     stage = meta_env._pp_context.get("stage", -1)
@@ -261,6 +274,16 @@ def install_fsdp_residency_hooks() -> None:
     def patched_unshard(self, async_op=False):  # noqa: ANN001, ANN202
         from torchtitan_npu.simulator.capture.comm_events import get_active_recorder
         from torchtitan_npu.simulator.capture.dispatch_capture import get_active_capture
+
+        if not _uses_fsdp_sharding(self):
+            capture = get_active_capture()
+            scaffold_scope = (
+                capture.suppress_dispatch_events("replicate_unshard_scaffold")
+                if capture is not None
+                else nullcontext()
+            )
+            with scaffold_scope:
+                return FSDPParamGroup._sim_orig_unshard(self, async_op)
 
         recorder = get_active_recorder()
         capture_rank = recorder.capture_process_rank if recorder is not None else -1
@@ -346,6 +369,16 @@ def install_fsdp_residency_hooks() -> None:
     def patched_wait_for_unshard(self):  # noqa: ANN001, ANN202
         from torchtitan_npu.simulator.capture.dispatch_capture import get_active_capture
 
+        if not _uses_fsdp_sharding(self):
+            capture = get_active_capture()
+            scaffold_scope = (
+                capture.suppress_dispatch_events("replicate_unshard_wait_scaffold")
+                if capture is not None
+                else nullcontext()
+            )
+            with scaffold_scope:
+                return FSDPParamGroup._sim_orig_wait_for_unshard(self)
+
         was_unsharded = self.is_unsharded
         shard_world_size = _shard_world_size(self)
         track_memory = _memory_tracking_enabled()
@@ -392,6 +425,16 @@ def install_fsdp_residency_hooks() -> None:
 
     def patched_reshard(self):  # noqa: ANN001, ANN202
         from torchtitan_npu.simulator.capture.dispatch_capture import get_active_capture
+
+        if not _uses_fsdp_sharding(self):
+            capture = get_active_capture()
+            scaffold_scope = (
+                capture.suppress_dispatch_events("replicate_reshard_scaffold")
+                if capture is not None
+                else nullcontext()
+            )
+            with scaffold_scope:
+                return FSDPParamGroup._sim_orig_reshard(self)
 
         previous_comm_layer = meta_env._comm_layer
         meta_env._comm_layer = "L2"
