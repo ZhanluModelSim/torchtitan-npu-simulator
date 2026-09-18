@@ -376,6 +376,7 @@ def _fsdp_prefetch_source_regions(
     source_invocation_starts: tuple[int, ...],
     target_region: _FSDPGroupRegion | None,
     target_collective_seq_idx: int,
+    cross_action_prefetch: bool = False,
 ) -> list[_FSDPGroupRegion]:
     """Select the source module invocation immediately before a prefetch.
 
@@ -386,6 +387,19 @@ def _fsdp_prefetch_source_regions(
     """
     if not source_regions:
         return []
+    if cross_action_prefetch:
+        # Backward prefetch wraps from the final module invocation of one
+        # action to the first module of the next action.  The immutable base
+        # template stores that target invocation before the source invocation,
+        # and copied communication variants may carry sequence numbers from a
+        # different captured instance.  The source FQN is authoritative here:
+        # use its final invocation in the launch action.
+        start = (
+            source_invocation_starts[-1]
+            if source_invocation_starts
+            else len(source_regions) - 1
+        )
+        return source_regions[start:]
     cutoff = (
         target_region.wait_seq_idx
         if target_region is not None
@@ -445,9 +459,11 @@ def _fsdp_prefetch_anchor(
     invocation_starts_by_module: dict[str, tuple[int, ...]],
     comm_id_by_region: dict[_FSDPGroupRegion, int],
     nodes_by_id: Mapping[int, OpNode],
+    cross_action_prefetch: bool = False,
 ) -> _FSDPPrefetchAnchor:
+    all_source_regions = regions_by_module.get(prefetch_source_fqn, [])
     source_regions = _fsdp_prefetch_source_regions(
-        source_regions=regions_by_module.get(prefetch_source_fqn, []),
+        source_regions=all_source_regions,
         source_wait_seq_idxs=wait_seq_idxs_by_module.get(
             prefetch_source_fqn,
             (),
@@ -458,6 +474,7 @@ def _fsdp_prefetch_anchor(
         ),
         target_region=target_region,
         target_collective_seq_idx=target_collective_seq_idx,
+        cross_action_prefetch=cross_action_prefetch,
     )
     if source_regions:
         external_predecessors = list(
@@ -1302,6 +1319,7 @@ class FSDPStageOwnershipPlugin:
                             ),
                             comm_id_by_region=comm_id_by_region,
                             nodes_by_id=base_template.nodes,
+                            cross_action_prefetch=cross_action_prefetch,
                         )
                         predecessors.extend(anchor.predecessor_op_ids)
                         filtered_gradient_reduction_op_ids = (

@@ -3,7 +3,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""SchedulePlan invariants and a structural 1F1B readiness replay."""
+"""SchedulePlan invariants and structural pipeline-readiness replay."""
 
 from __future__ import annotations
 
@@ -74,13 +74,14 @@ def validate_schedule_plan(plan: SchedulePlan, *, strict_1f1b: bool = False) -> 
         if action.is_noop and (action.consumes or action.produces):
             raise RuntimeError(f"no-op action {action.action_id} has blocking DataSlots")
 
-    if not strict_1f1b:
-        return
-
     compute: dict[tuple[int, int], dict[str, ScheduleAction]] = defaultdict(dict)
     stage_microbatches: dict[int, set[int]] = defaultdict(set)
     for action in actions:
-        if action.action_type == "COMPUTE" and action.comp_type in {"F", "B"}:
+        if (
+            strict_1f1b
+            and action.action_type == "COMPUTE"
+            and action.comp_type in {"F", "B"}
+        ):
             if not action.template_ref or action.template_ref not in plan.step_templates:
                 raise RuntimeError(
                     f"1F1B compute action {action.action_id} has missing template "
@@ -120,21 +121,24 @@ def validate_schedule_plan(plan: SchedulePlan, *, strict_1f1b: bool = False) -> 
             if action.comm is None or not action.comm.primitive:
                 raise RuntimeError(f"REDUCE_GRAD action {action.action_id} has no collective")
 
-    for (stage, mb_idx), pair in compute.items():
-        if set(pair) != {"F", "B"}:
-            raise RuntimeError(
-                f"incomplete 1F1B compute pair for stage={stage}, mb={mb_idx}: {sorted(pair)}"
-            )
-        if pair["F"].schedule_order >= pair["B"].schedule_order:
-            raise RuntimeError(f"1F1B backward precedes forward for stage={stage}, mb={mb_idx}")
+    if strict_1f1b:
+        for (stage, mb_idx), pair in compute.items():
+            if set(pair) != {"F", "B"}:
+                raise RuntimeError(
+                    f"incomplete 1F1B compute pair for stage={stage}, mb={mb_idx}: {sorted(pair)}"
+                )
+            if pair["F"].schedule_order >= pair["B"].schedule_order:
+                raise RuntimeError(
+                    f"1F1B backward precedes forward for stage={stage}, mb={mb_idx}"
+                )
 
-    expected_microbatches = set(range(plan.num_micro_batches))
-    for stage, actual_microbatches in stage_microbatches.items():
-        if actual_microbatches != expected_microbatches:
-            raise RuntimeError(
-                f"stage {stage} has incomplete microbatches: "
-                f"expected={sorted(expected_microbatches)}, actual={sorted(actual_microbatches)}"
-            )
+        expected_microbatches = set(range(plan.num_micro_batches))
+        for stage, actual_microbatches in stage_microbatches.items():
+            if actual_microbatches != expected_microbatches:
+                raise RuntimeError(
+                    f"stage {stage} has incomplete microbatches: "
+                    f"expected={sorted(expected_microbatches)}, actual={sorted(actual_microbatches)}"
+                )
 
     adjacency: dict[str, set[str]] = defaultdict(set)
     indegree = {action.action_id: 0 for action in actions}
@@ -159,7 +163,8 @@ def validate_schedule_plan(plan: SchedulePlan, *, strict_1f1b: bool = False) -> 
         raise RuntimeError(f"SchedulePlan has cyclic local dependencies: {cyclic}")
 
 
-def validate_1f1b_transfer_pairs(plans: Iterable[SchedulePlan]) -> None:
+def validate_pp_transfer_pairs(plans: Iterable[SchedulePlan]) -> None:
+    """Validate SEND/RECV rendezvous across any pipeline schedule family."""
     roles: dict[str, dict[str, list[str]]] = defaultdict(lambda: defaultdict(list))
     for plan in plans:
         for action in _flatten(plan.actions):
@@ -174,17 +179,29 @@ def validate_1f1b_transfer_pairs(plans: Iterable[SchedulePlan]) -> None:
             )
 
 
-def replay_1f1b_readiness(plans: Iterable[SchedulePlan]) -> None:
+def validate_1f1b_transfer_pairs(plans: Iterable[SchedulePlan]) -> None:
+    """Backward-compatible alias for :func:`validate_pp_transfer_pairs`."""
+    validate_pp_transfer_pairs(plans)
+
+
+def replay_pp_readiness(
+    plans: Iterable[SchedulePlan],
+    *,
+    strict_1f1b: bool = False,
+) -> None:
     """Prove that local dependencies and P2P rendezvous can complete.
 
     This intentionally assigns zero duration to every action. Hardware timing
     remains the responsibility of the upper DES; this replay catches dangling
-    slots, impossible rank cursors, and unpaired communication.
+    slots, impossible rank cursors, and unpaired communication. ``OVERLAP_F_B``
+    children publish their outputs independently, matching DualPipeV's
+    concurrent-child semantics instead of treating the parent as one atomic
+    action.
     """
     plans = list(plans)
     for plan in plans:
-        validate_schedule_plan(plan, strict_1f1b=True)
-    validate_1f1b_transfer_pairs(plans)
+        validate_schedule_plan(plan, strict_1f1b=strict_1f1b)
+    validate_pp_transfer_pairs(plans)
 
     actions_by_rank = {
         plan.actions[0].rank if plan.actions else index: sorted(plan.actions, key=lambda a: a.schedule_order)
@@ -195,6 +212,7 @@ def replay_1f1b_readiness(plans: Iterable[SchedulePlan]) -> None:
     cursors = {rank: 0 for rank in actions_by_rank}
     done: set[str] = set()
     posted: dict[str, dict[str, ScheduleAction]] = defaultdict(dict)
+    pending_overlap: dict[int, list[ScheduleAction]] = {}
 
     def complete(action: ScheduleAction) -> None:
         done.add(action.action_id)
@@ -207,7 +225,28 @@ def replay_1f1b_readiness(plans: Iterable[SchedulePlan]) -> None:
             if cursor >= len(actions):
                 continue
             action = actions[cursor]
-            if action.action_type in _RECV_TYPES:
+            if action.action_type == "OVERLAP_F_B":
+                if not set(action.consumes).issubset(ready_slots):
+                    continue
+                children = pending_overlap.setdefault(rank, list(action.sub_actions or []))
+                ready_child = next(
+                    (
+                        child
+                        for child in children
+                        if set(child.consumes).issubset(ready_slots)
+                    ),
+                    None,
+                )
+                if ready_child is not None:
+                    complete(ready_child)
+                    children.remove(ready_child)
+                    progressed = True
+                if not children:
+                    complete(action)
+                    pending_overlap.pop(rank, None)
+                    cursors[rank] += 1
+                    progressed = True
+            elif action.action_type in _RECV_TYPES:
                 posted[action.comm.transfer_id]["recv"] = action  # type: ignore[union-attr]
                 cursors[rank] += 1
                 progressed = True
@@ -238,7 +277,12 @@ def replay_1f1b_readiness(plans: Iterable[SchedulePlan]) -> None:
                     blocked.append(f"rank={rank} action={action.action_id} missing={missing}")
             unmatched = sorted(posted)
             raise RuntimeError(
-                "1F1B readiness replay deadlocked: "
+                "pipeline readiness replay deadlocked: "
                 + "; ".join(blocked)
                 + f"; unmatched_transfers={unmatched}"
             )
+
+
+def replay_1f1b_readiness(plans: Iterable[SchedulePlan]) -> None:
+    """Backward-compatible strict 1F1B replay entry point."""
+    replay_pp_readiness(plans, strict_1f1b=True)

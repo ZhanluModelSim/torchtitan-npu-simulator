@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import csv
 
+from torchtitan_npu.simulator.capture.schedule_validation import replay_pp_readiness
 from torchtitan_npu.simulator.ir.schedule_plan import (
     DataSlot,
     ScheduleAction,
@@ -80,3 +81,38 @@ def test_csv_export_includes_overlap_children_and_parent_relation(tmp_path) -> N
     exported_action_ids = {row["action_id"] for row in action_rows}
     assert plan.data_slots["activation"].producer_action_id in exported_action_ids
     assert set(plan.data_slots["activation"].consumer_action_ids) <= exported_action_ids
+
+
+def test_dualpipe_overlap_children_publish_slots_independently() -> None:
+    forward = _action(
+        "child_f",
+        comp_type="F",
+        consumes=["input"],
+        produces=["activation"],
+    )
+    backward = _action("child_b", comp_type="B", consumes=["activation"])
+    overlap = _action("overlap", action_type="OVERLAP_F_B")
+    overlap.sub_actions = [forward, backward]
+    plan = SchedulePlan(
+        plan_id="dualpipe",
+        workload_type="train",
+        step_templates={},
+        actions=[overlap],
+        data_slots={
+            "input": DataSlot(
+                slot_id="input",
+                kind="dataloader_input",
+                consumer_action_ids=[forward.action_id],
+                external=True,
+            ),
+            "activation": DataSlot(
+                slot_id="activation",
+                kind="activation",
+                producer_action_id=forward.action_id,
+                consumer_action_ids=[backward.action_id],
+            ),
+        },
+        pipeline_schedule="DualPipeV",
+    )
+
+    replay_pp_readiness([plan])
