@@ -17,11 +17,29 @@ names, to be registered in the cost model together with
   selected key blocks. 4 inputs; the dtype of the last input (selection)
   discriminates the stage: float32 soft mask (stage 1) vs int64 lut (stage 2).
 - ``triton_ascend_kernels.sla2_linear_attn``: global linear-attention branch
-  with softmax feature map.
+  with softmax feature map. Inputs ``[q, k, v, (, selection,) meta]`` —
+  4 in ``compute_mode="full"``, 5 in the default ``compute_mode="partial"``.
 - ``triton_ascend_kernels.mh_moe_route_topk``: fused Multi-Head MoE routing
   (per-head router bmm + score func + expert-biased top-k + L1 route_norm +
   route_scale). top_k is recovered from the output shape (effective value),
   never from config.
+
+``compute_mode`` ("full" | "partial", default "partial") is threaded from the
+SLA2 attention config (``sla2_compute_mode``, top-level ``MMGcModel.Config``
+field) into the ``sla2_sparse_attn`` / ``sla2_linear_attn`` op records:
+- sparse: ``full`` costs L×L attention; ``partial`` costs only the selected
+  key blocks (``skv``).
+- linear: ``full`` is the global linear attention over the full sequence;
+  ``partial`` (M_not complement) covers only the non-selected key blocks
+  (``l_eff = L - skv``), matching ``SparseLinearAttention._calc_linear_masked``.
+
+The effective key lengths ``skv`` and ``l_eff`` are computed in shim-time
+(``_sla_effective_key_lengths``) and appended to the op record's ``inputs``
+as plain Python ints: sparse ``[q,k,v,selection,mode_val,stage,skv]``, linear
+``[q,k,v,(,selection,)mode_val,l_eff]`` (mode_val=1 partial, 2 full). The cost
+model reads them from ``op.inputs[-3]/-2/-1`` (sparse) and ``op.inputs[-2]/-1``
+(linear) directly — no attrs, no tensor-value, no dtype inference.
+
 
 The SLA2 alpha blend stays eager (production keeps it as small elementwise
 ops). Follows kda_shim.py conventions: real op names recorded into the active
@@ -51,11 +69,13 @@ def _record(
     inputs: list[torch.Tensor],
     outputs: list[torch.Tensor],
     module_path: str,
+    attrs: dict | None = None,
 ) -> None:
     capture = get_active_capture()
     if capture is not None:
         capture.record_synthetic_op(
-            raw_op_type, inputs=inputs, outputs=outputs, module_path=module_path
+            raw_op_type, inputs=inputs, outputs=outputs, module_path=module_path,
+            attrs=attrs,
         )
 
 
@@ -166,16 +186,22 @@ class _SimSla2BlockRouteTopk(torch.autograd.Function):
 
 class _SimSla2SparseAttn(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q, k, v, selection, module_path):  # noqa: ANN001
+    def forward(  # noqa: ANN001
+        ctx, q, k, v, selection, compute_mode, stage, skv, module_path
+    ):
         output = _uncaptured_empty_like(q)
+        mode_val = 1 if compute_mode == "partial" else 2
         _record(
             "triton_ascend_kernels.sla2_sparse_attn",
-            [q, k, v, selection],
+            [q, k, v, selection, mode_val, stage, skv],
             [output],
             module_path,
         )
         ctx.save_for_backward(q, k, v, selection)
         ctx.module_path = module_path
+        ctx.compute_mode = compute_mode
+        ctx.stage = stage
+        ctx.skv = skv
         return output
 
     @staticmethod
@@ -184,42 +210,60 @@ class _SimSla2SparseAttn(torch.autograd.Function):
         d_q = _uncaptured_empty_like(q)
         d_k = _uncaptured_empty_like(k)
         d_v = _uncaptured_empty_like(v)
+        mode_val = 1 if ctx.compute_mode == "partial" else 2
         _record(
             "triton_ascend_kernels.sla2_sparse_attn_grad",
-            [q, k, v, selection, grad_output],
+            [q, k, v, selection, grad_output, mode_val, ctx.stage, ctx.skv],
             [d_q, d_k, d_v],
             ctx.module_path,
         )
-        return d_q, d_k, d_v, None, None
+        return d_q, d_k, d_v, None, None, None, None, None
 
 
 class _SimSla2LinearAttn(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q, k, v, module_path):  # noqa: ANN001
+    def forward(  # noqa: ANN001
+        ctx, q, k, v, selection, compute_mode, l_eff, module_path
+    ):
         output = _uncaptured_empty_like(q)
+        mode_val = 1 if compute_mode == "partial" else 2
+        inputs = [q, k, v]
+        if compute_mode == "partial":
+            inputs.append(selection)
+        inputs.append(mode_val)
+        inputs.append(l_eff)
         _record(
             "triton_ascend_kernels.sla2_linear_attn",
-            [q, k, v],
+            inputs,
             [output],
             module_path,
         )
-        ctx.save_for_backward(q, k, v)
+        ctx.save_for_backward(q, k, v, selection)
         ctx.module_path = module_path
+        ctx.compute_mode = compute_mode
+        ctx.l_eff = l_eff
         return output
 
     @staticmethod
     def backward(ctx, grad_output):  # noqa: ANN001
-        q, k, v = ctx.saved_tensors
+        q, k, v, selection = ctx.saved_tensors
         d_q = _uncaptured_empty_like(q)
         d_k = _uncaptured_empty_like(k)
         d_v = _uncaptured_empty_like(v)
+        mode_val = 1 if ctx.compute_mode == "partial" else 2
+        inputs = [q, k, v]
+        if ctx.compute_mode == "partial":
+            inputs.append(selection)
+        inputs.append(grad_output)
+        inputs.append(mode_val)
+        inputs.append(ctx.l_eff)
         _record(
             "triton_ascend_kernels.sla2_linear_attn_grad",
-            [q, k, v, grad_output],
+            inputs,
             [d_q, d_k, d_v],
             ctx.module_path,
         )
-        return d_q, d_k, d_v, None
+        return d_q, d_k, d_v, None, None, None, None
 
 
 class _SimMhMoeRouteTopk(torch.autograd.Function):
@@ -262,11 +306,33 @@ class _SimMhMoeRouteTopk(torch.autograd.Function):
         return d_x, d_router, None, None, None, None, None, None
 
 
+def _sla_effective_key_lengths(
+    L: int, stage: int, topk_blocks: int, blkk: int, compute_mode: str
+) -> tuple[int, int]:
+    """Return ``(skv_sparse, l_eff_linear)`` 用于稀疏分支与线性分支的计算量建模。
+
+    - full 模式：两分支均覆盖全序列，skv = l_eff = L。
+    - partial + stage 1（soft mask）：两分支均覆盖全序列（soft mask 稠密）。
+    - partial + stage 2（hard top-k）：稀疏分支只算被选中的 key 块
+      （skv = min(L, topk_blocks × BLKK)），线性分支只算其余块
+      （l_eff = L - skv）。
+    """
+    if compute_mode == "full" or stage == 1:
+        return L, L
+    skv_sparse = min(L, topk_blocks * blkk)
+    l_eff_linear = max(0, L - skv_sparse)
+    return skv_sparse, l_eff_linear
+
+
 def _sim_sla2_forward(module, q, k, v, return_sparsity=False):  # noqa: ANN001
     B, H, L, _ = q.shape
     nb_k = (L + module.BLKK - 1) // module.BLKK
     topk_blocks = min(nb_k, int(module.topk * nb_k))
     module_path = _current_module_path()
+    compute_mode = getattr(module, "compute_mode", "partial")
+    skv_sparse, l_eff_linear = _sla_effective_key_lengths(
+        L, module.stage, topk_blocks, module.BLKK, compute_mode
+    )
 
     route_outputs = _SimSla2BlockRouteTopk.apply(
         q,
@@ -287,10 +353,29 @@ def _sim_sla2_forward(module, q, k, v, return_sparsity=False):  # noqa: ANN001
     v_c = _uncaptured_to(v, module.dtype)
 
     if module.stage == 1:
-        o_s = _SimSla2SparseAttn.apply(q_c, k_c, v_c, route_outputs[0], module_path)
+        selection = route_outputs[0]
     else:
-        o_s = _SimSla2SparseAttn.apply(q_c, k_c, v_c, route_outputs[1], module_path)
-    o_l = _SimSla2LinearAttn.apply(q_c, k_c, v_c, module_path)
+        selection = route_outputs[1]
+
+    o_s = _SimSla2SparseAttn.apply(
+        q_c,
+        k_c,
+        v_c,
+        selection,
+        compute_mode,
+        module.stage,
+        skv_sparse,
+        module_path,
+    )
+    o_l = _SimSla2LinearAttn.apply(
+        q_c,
+        k_c,
+        v_c,
+        selection,
+        compute_mode,
+        l_eff_linear,
+        module_path,
+    )
 
     block_indices = torch.arange(L, device=q.device) // module.BLKQ
     alpha_per_position = module.alpha[block_indices].view(1, 1, L, 1)

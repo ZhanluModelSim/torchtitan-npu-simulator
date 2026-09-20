@@ -69,6 +69,7 @@ class SLA2Attention(Module):
         sla2_stage: int = 1
         sla2_mode: str = "train"
         sla2_router_data_path: str | None = None
+        sla2_compute_mode: str = "partial"
         use_bf16: bool = True
         norm_eps: float = 1e-6
         layer_idx: int = 0
@@ -146,9 +147,11 @@ class SLA2Attention(Module):
             mode=config.sla2_mode,
             stage=config.sla2_stage,
             router_data_path=config.sla2_router_data_path,
+            compute_mode=config.sla2_compute_mode,
         )
         self.sla2_topk_blocks = topk_blocks
         self.num_query_blocks = num_blocks
+        self.sla2_compute_mode = config.sla2_compute_mode
         self.tp_group = None
         self.local_n_heads = config.n_heads
 

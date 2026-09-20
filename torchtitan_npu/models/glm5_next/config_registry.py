@@ -225,6 +225,20 @@ def glm5_next_baseline_mm() -> TrainerConfig:
     forces ``image_size=672`` and ``max_patches_per_image=2304``; see
     MODEL_CONTRACT.md section 7.
     """
+    return _glm5_next_mm_config(enable_mxfp8=False)
+
+
+def glm5_next_baseline_mm_mxfp8() -> TrainerConfig:
+    """Official 96-layer multimodal spec with MXFP8 on attention/MoE matmuls.
+
+    Same recipe as ``glm5_next_baseline_mm``; the MXFP8 FQN scope excludes
+    the vision tower (``visual.*`` stays high precision), see
+    MODEL_CONTRACT.md section 12.
+    """
+    return _glm5_next_mm_config(enable_mxfp8=True)
+
+
+def _glm5_next_mm_config(*, enable_mxfp8: bool) -> TrainerConfig:
     model_spec, model_overrides = build_model_spec_with_overrides(model_registry("full"))
     model_overrides.image_token_id = 1998
     return TrainerConfig(
@@ -234,7 +248,7 @@ def glm5_next_baseline_mm() -> TrainerConfig:
         debug=DebugConfig(print_config=True),
         comm=CommConfig(trace_buf_size=0),
         model_converters=ModelConvertersContainer.Config(
-            converters=_default_converters()
+            converters=_default_converters(enable_mxfp8=enable_mxfp8)
         ),
         metrics=MetricsProcessor.Config(log_freq=1),
         dataloader=Glm5NextMultiModalDataLoader.Config(

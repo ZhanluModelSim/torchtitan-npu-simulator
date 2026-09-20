@@ -150,12 +150,17 @@ class SparseLinearAttention(nn.Module):
         mode: str = "infer",
         stage: int = 1,
         router_data_path: str | None = None,
+        compute_mode: str = "partial",
     ):
         super().__init__()
         if stage not in (1, 2):
             raise ValueError(f"stage must be 1 or 2, got {stage}")
         if mode not in ("train", "infer"):
             raise ValueError(f"mode must be 'train' or 'infer', got {mode}")
+        if compute_mode not in ("full", "partial"):
+            raise ValueError(
+                f"compute_mode must be 'full' or 'partial', got {compute_mode}"
+            )
         if stage == 2 and router_data_path is None:
             raise ValueError("stage == 2 requires router_data_path")
         if L <= 0:
@@ -172,6 +177,7 @@ class SparseLinearAttention(nn.Module):
         self.router_data_path = router_data_path
         self.stage = stage
         self.mode = mode
+        self.compute_mode = compute_mode
 
         self.proj_q = nn.Linear(head_dim, head_dim, dtype=torch.float32)
         self.proj_k = nn.Linear(head_dim, head_dim, dtype=torch.float32)
@@ -253,6 +259,46 @@ class SparseLinearAttention(nn.Module):
         )
         return torch.matmul(attention_weights, v)
 
+    def _calc_linear_global(self, q, k, v):
+        """全量线性注意力：k/v 覆盖全序列（compute_mode="full"）。"""
+        kvsum = k.transpose(-1, -2) @ v
+        ksum = torch.sum(k, dim=-2, keepdim=True)
+        return (q @ kvsum) / (1e-5 + (q * ksum).sum(dim=-1, keepdim=True))
+
+    def _calc_linear_masked(self, q, k, v, sparse_map, L):
+        """补集线性注意力（compute_mode="partial"，M_not 语义）。
+
+        线性分支只在稀疏分支未选中的 key 块上聚合 kv，与稀疏分支互补。
+        stage 1（soft）：M_not = 1 - soft_mask（软权重，所有块参与）；
+        stage 2（hard）：M_not = 1 - sparse_map（硬排除选中块）。
+        """
+        B, H, _, head_dim = q.shape
+        if self.stage == 2:
+            m_not = 1.0 - sparse_map.float()
+        else:
+            m_not = 1.0 - sparse_map
+        m_not = m_not.to(self.dtype)
+
+        nb_k = (L + self.BLKK - 1) // self.BLKK
+        pad_len = nb_k * self.BLKK - L
+        if pad_len > 0:
+            k = F.pad(k, (0, 0, 0, pad_len))
+            v = F.pad(v, (0, 0, 0, pad_len))
+
+        phi_k_blk = k.view(B, H, nb_k, self.BLKK, head_dim)
+        phi_v_blk = v.view(B, H, nb_k, self.BLKK, head_dim)
+        phi_k_masked = torch.einsum("bhqk,bhksd->bhqd", m_not, phi_k_blk)
+        phi_v_masked = torch.einsum("bhqk,bhksd->bhqd", m_not, phi_v_blk)
+
+        kv_l = phi_k_masked.transpose(-1, -2) @ phi_v_masked
+        o_l_raw = q @ kv_l
+        phi_k_sum = torch.sum(phi_k_masked, dim=-2)
+        norm = (q * phi_k_sum.unsqueeze(-2)).sum(dim=-1, keepdim=True)
+        o_l = o_l_raw / (norm + 1e-8)
+        if pad_len > 0:
+            o_l = o_l[:, :, :L, :]
+        return o_l
+
     def forward(
         self,
         q: torch.Tensor,
@@ -309,12 +355,10 @@ class SparseLinearAttention(nn.Module):
         q = self.feature_map_q(q).contiguous().to(self.dtype)
         k = self.feature_map_k(k).contiguous().to(self.dtype)
 
-        def calc_linear(q, k, v):
-            kvsum = k.transpose(-1, -2) @ v
-            ksum = torch.sum(k, dim=-2, keepdim=True)
-            return (q @ kvsum) / (1e-5 + (q * ksum).sum(dim=-1, keepdim=True))
-
-        o_l = calc_linear(q, k, v)
+        if self.compute_mode == "partial":
+            o_l = self._calc_linear_masked(q, k, v, sparse_map, L)
+        else:
+            o_l = self._calc_linear_global(q, k, v)
 
         block_indices = torch.arange(L, device=q.device) // self.BLKQ
         alpha_per_position = self.alpha[block_indices].view(1, 1, L, 1)

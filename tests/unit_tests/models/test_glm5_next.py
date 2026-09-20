@@ -269,6 +269,7 @@ class TestConfigRegistry:
         "glm5_next_baseline",
         "glm5_next_baseline_mxfp8",
         "glm5_next_baseline_mm",
+        "glm5_next_baseline_mm_mxfp8",
     )
 
     @pytest.mark.parametrize("config_name", CONFIG_NAMES)

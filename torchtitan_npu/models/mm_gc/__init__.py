@@ -40,6 +40,7 @@ def _make_layer_configs(
     sla2_topk_5m: float,
     sla2_stage: int,
     sla2_router_data_path: str | None,
+    sla2_compute_mode: str = "partial",
 ) -> list[MMGcTransformerBlock.Config]:
     layers = []
     for layer_id in layer_ids:
@@ -54,6 +55,7 @@ def _make_layer_configs(
             sla2_topk_5m=sla2_topk_5m,
             sla2_stage=sla2_stage,
             sla2_router_data_path=sla2_router_data_path,
+            sla2_compute_mode=sla2_compute_mode,
             layer_idx=layer_id,
         )
         if layer_id in dense_layer_ids:
@@ -107,6 +109,7 @@ def _make_model_config(
     sla2_topk_5m: float = 0.001,
     sla2_stage: int = 1,
     sla2_router_data_path: str | None = None,
+    sla2_compute_mode: str = "partial",
 ) -> MMGcModel.Config:
     dense_layer_ids = {i for i in range(n_layers) if i < 2 or i >= n_layers - 2}
     layers = _make_layer_configs(
@@ -129,12 +132,14 @@ def _make_model_config(
         sla2_topk_5m=sla2_topk_5m,
         sla2_stage=sla2_stage,
         sla2_router_data_path=sla2_router_data_path,
+        sla2_compute_mode=sla2_compute_mode,
     )
     return MMGcModel.Config(
         vocab_size=vocab_size,
         dim=dim,
         seq_len=seq_len,
         rope_theta=rope_theta,
+        sla2_compute_mode=sla2_compute_mode,
         layers=layers,
         norm_eps=norm_eps,
     )

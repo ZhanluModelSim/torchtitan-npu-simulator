@@ -341,6 +341,14 @@ def glm5_next_baseline_mm() -> Glm5NextSimulationTrainerConfig:
     )
 
 
+def glm5_next_baseline_mm_mxfp8() -> Glm5NextSimulationTrainerConfig:
+    return _glm5_next_simulation_config(
+        _glm5_next_configs.glm5_next_baseline_mm_mxfp8,
+        output_name="glm5_next_baseline_mm_mxfp8",
+        target_npu_device_type="A5",
+    )
+
+
 # ---------------------------------------------------------------------------
 # mm_gc (SLA2 + Multi-Head MoE) simulator configs
 # ---------------------------------------------------------------------------

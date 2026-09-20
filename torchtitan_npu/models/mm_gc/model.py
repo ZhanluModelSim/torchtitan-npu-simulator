@@ -77,6 +77,7 @@ class MMGcModel(Module):
         dim: int = 12288
         seq_len: int = 4096
         rope_theta: float = 10000.0
+        sla2_compute_mode: str = "partial"
         layers: list[MMGcTransformerBlock.Config] = field(default_factory=list)
         norm_eps: float = 1e-6
 
@@ -85,6 +86,7 @@ class MMGcModel(Module):
             self.seq_len = seq_len
             for layer in self.layers:
                 layer.attention.seq_len = seq_len
+                layer.attention.sla2_compute_mode = self.sla2_compute_mode
 
         def get_nparams_and_flops(self, model, seq_len: int) -> tuple[int, float]:
             nparams = sum(p.numel() for p in model.parameters())
