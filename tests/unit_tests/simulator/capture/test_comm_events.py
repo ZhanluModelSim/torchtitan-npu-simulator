@@ -169,8 +169,9 @@ def test_meta_fp8_dispatch_can_model_reverse_transport_as_fp8():
     assert tensor.grad is not None
     assert [(event.dtype, event.volume_bytes) for event in recorder.events] == [
         ("float8_e4m3fn", 8 * 64),
-        ("float8_e4m3fn", 8 * 64),
         ("uint8", 8 * 2),
+        ("uint8", 8 * 2),
+        ("float8_e4m3fn", 8 * 64),
     ]
 
 
