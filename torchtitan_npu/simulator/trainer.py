@@ -94,8 +94,7 @@ class SimulationConfig:
     # all-gather transport without changing Titan's compute dtypes.
     enable_fsdp_allgather_fp8: bool = False
     # Simulator-only EP optimization. Models FP8 payload plus E8M0 scale
-    # transport for the forward token-dispatch all-to-all. Backward and
-    # combine stay BF16 in P0 until the direct-FP8 GMM autograd bridge exists.
+    # transport for token-dispatch all-to-all while keeping compute tensors BF16.
     enable_ep_dispatch_fp8: bool = False
     selective_ac_save_ops: list[SelectiveACSaveOp] | None = None
     target_npu_device_type: str = "non_a5"
