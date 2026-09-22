@@ -111,8 +111,8 @@ def test_meta_fp8_dispatch_uses_payload_and_scale_only_in_forward():
     assert output.dtype == torch.bfloat16
     assert tensor.grad is not None
     assert [(event.dtype, event.volume_bytes) for event in recorder.events] == [
-        ("uint8", 8 * 2),
         ("float8_e4m3fn", 8 * 64),
+        ("uint8", 8 * 2),
         ("bfloat16", 8 * 64 * 2),
     ]
 
@@ -168,10 +168,9 @@ def test_meta_fp8_dispatch_can_model_reverse_transport_as_fp8():
 
     assert tensor.grad is not None
     assert [(event.dtype, event.volume_bytes) for event in recorder.events] == [
-        ("uint8", 8 * 2),
+        ("float8_e4m3fn", 8 * 64),
         ("float8_e4m3fn", 8 * 64),
         ("uint8", 8 * 2),
-        ("float8_e4m3fn", 8 * 64),
     ]
 
 
