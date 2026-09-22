@@ -228,7 +228,10 @@ def run_simulation_step(
     _pp_context["stage"] = -1 if parallel_dims.pp_enabled else 0
 
     boundary = StepBoundaryTracker()
-    module_path_tracker = ModulePathTracker(model_parts[0])
+    # Interleaved schedules such as DualPipeV place multiple virtual stages
+    # on one physical rank. Track every local model part so the second stage's
+    # forward/backward ops retain stable global module FQNs as well.
+    module_path_tracker = ModulePathTracker(model_parts)
 
     # Phase provider: when PP is active, _pp_context["phase"] is updated by
     # the patched forward_one_chunk / backward_one_chunk (which is called

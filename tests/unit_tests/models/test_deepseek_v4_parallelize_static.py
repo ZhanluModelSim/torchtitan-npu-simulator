@@ -43,6 +43,19 @@ class DeepSeekV4ParallelizeStaticTest(unittest.TestCase):
         self.assertNotIn("__class__.__name__", parallelize_source)
         self.assertNotIn("_smla_metadata_cache", parallelize_source)
 
+    def test_simulator_can_replicate_embedding_and_first_layer_without_disabling_ep(self):
+        parallelize_source = (DSV4_DIR / "parallelize.py").read_text(encoding="utf-8")
+
+        self.assertIn(
+            "apply_deepseek_v4_fsdp_with_replicated_first_layer",
+            parallelize_source,
+        )
+        self.assertIn("replicate(model.tok_embeddings", parallelize_source)
+        self.assertIn("replicate(\n                    transformer_block.moe.experts", parallelize_source)
+        self.assertIn("replicate(transformer_block, **replicate_config)", parallelize_source)
+        self.assertIn("is_first_layer = int(layer_id) == 0", parallelize_source)
+        self.assertIn("apply_moe_ep_tp(", parallelize_source)
+
 
 if __name__ == "__main__":
     unittest.main()

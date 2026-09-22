@@ -111,8 +111,8 @@ def test_meta_fp8_dispatch_uses_payload_and_scale_only_in_forward():
     assert output.dtype == torch.bfloat16
     assert tensor.grad is not None
     assert [(event.dtype, event.volume_bytes) for event in recorder.events] == [
-        ("uint8", 8 * 2),
         ("float8_e4m3fn", 8 * 64),
+        ("uint8", 8 * 2),
         ("bfloat16", 8 * 64 * 2),
     ]
 
@@ -168,10 +168,9 @@ def test_meta_fp8_dispatch_can_model_reverse_transport_as_fp8():
 
     assert tensor.grad is not None
     assert [(event.dtype, event.volume_bytes) for event in recorder.events] == [
-        ("uint8", 8 * 2),
+        ("float8_e4m3fn", 8 * 64),
         ("float8_e4m3fn", 8 * 64),
         ("uint8", 8 * 2),
-        ("float8_e4m3fn", 8 * 64),
     ]
 
 
@@ -491,6 +490,27 @@ def test_hsdp_ep_mesh_info_uses_replicate_then_shard_axes():
         assert mesh_info.shard_mesh_dim == 1
     finally:
         unpatch_device_type_to_meta()
+
+
+@pytest.mark.parametrize("shard_dim_name", ["fsdp", "efsdp"])
+def test_deepseek_v4_hsdp_ep_mesh_info_uses_replicate_then_shard_axes(
+    shard_dim_name,
+):
+    from torch.distributed.device_mesh import DeviceMesh
+    from torch.distributed.fsdp._fully_shard._fsdp_common import HSDPMeshInfo
+
+    from torchtitan_npu.models.deepseek_v4.parallelize import _fsdp_mesh_info
+
+    mesh = DeviceMesh(
+        "meta",
+        torch.arange(8).reshape(2, 4),
+        mesh_dim_names=("dp_replicate", shard_dim_name),
+    )
+    mesh_info = _fsdp_mesh_info(mesh)
+
+    assert isinstance(mesh_info, HSDPMeshInfo)
+    assert mesh_info.replicate_mesh_dim == 0
+    assert mesh_info.shard_mesh_dim == 1
 
 
 def test_collectives_restored_after_context_exit():

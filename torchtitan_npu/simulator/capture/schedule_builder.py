@@ -943,9 +943,18 @@ def build_schedule_plan(
         "fsdp", rank_table.dim_degrees.get("dp_shard", 1)
     )
     from collections import Counter as _Ctr
-    comm_summary = dict(_Ctr(
+    comm_counts = _Ctr(
         (ev.comm_primitive, ev.comm_layer, ev.p2p_stage) for ev in comm_events
-    ))
+    )
+    # Keep annotation keys JSON-safe and give downstream consumers a stable,
+    # structured lookup path: primitive -> ownership layer -> stage -> count.
+    # Tuple keys cannot be represented by JSON and previously made an
+    # otherwise valid PP graph fail during export.
+    comm_summary: dict[str, dict[str, dict[str, int]]] = {}
+    for (primitive, layer, stage), count in sorted(comm_counts.items()):
+        comm_summary.setdefault(primitive, {}).setdefault(layer, {})[
+            str(stage)
+        ] = count
     plan = SchedulePlan(
         plan_id=uuid.uuid4().hex[:12],
         workload_type="train",

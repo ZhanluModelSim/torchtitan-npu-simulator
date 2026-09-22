@@ -151,6 +151,40 @@ def test_capture_tags_module_path_when_tracker_supplied():
     assert any("0" in n.annotations["module_path"] for n in tagged)  # Sequential child "0" (Linear)
 
 
+def test_capture_tracks_every_local_pipeline_model_part():
+    class FirstPart(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.first_stage = nn.Linear(4, 4, device="meta")
+
+        def forward(self, inputs):  # noqa: ANN001, ANN201
+            return self.first_stage(inputs)
+
+    class SecondPart(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.second_stage = nn.Linear(4, 4, device="meta")
+
+        def forward(self, inputs):  # noqa: ANN001, ANN201
+            return self.second_stage(inputs)
+
+    parts = [FirstPart(), SecondPart()]
+    tracker = ModulePathTracker(parts)
+    capture = OpDispatchCapture(module_path_tracker=tracker)
+
+    with tracker, capture:
+        inputs = torch.randn(2, 4, device="meta")
+        parts[0](inputs)
+        parts[1](inputs)
+
+    paths = {
+        node.annotations.get("module_path", "")
+        for node in capture.build_nodes().values()
+    }
+    assert "first_stage" in paths
+    assert "second_stage" in paths
+
+
 def test_capture_tags_normal_backward_ops_with_module_path():
     model = nn.Sequential(
         nn.Linear(4, 8, device="meta"),

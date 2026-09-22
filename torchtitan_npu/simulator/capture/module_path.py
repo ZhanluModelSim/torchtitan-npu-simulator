@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+
 import torch
 import torch.nn as nn
 from torch.utils._pytree import tree_flatten
@@ -21,16 +23,25 @@ class ModulePathTracker:
     insert view operators into the captured graph.
     """
 
-    def __init__(self, root: nn.Module) -> None:
-        self.root = root
+    def __init__(self, root: nn.Module | Iterable[nn.Module]) -> None:
+        roots = (root,) if isinstance(root, nn.Module) else tuple(root)
+        if not roots or not all(isinstance(module, nn.Module) for module in roots):
+            raise ValueError("ModulePathTracker requires at least one module root")
+        self.roots = roots
+        # Preserve the historical attribute for callers that inspect it.
+        self.root = roots[0]
         self.stack: list[str] = []
         self._backward_path = ""
-        self._root_name = type(root).__name__
+        self._root_names = {type(module).__name__ for module in roots}
         self._has_engine_callback = False
         self._handles: list[object] = []
 
     def __enter__(self) -> "ModulePathTracker":
-        names = {id(module): name or module.__class__.__name__ for name, module in self.root.named_modules()}
+        names = {
+            id(module): name or module.__class__.__name__
+            for root in self.roots
+            for name, module in root.named_modules()
+        }
 
         def pre_hook(module: nn.Module, _args: object) -> None:
             self.stack.append(names.get(id(module), module.__class__.__name__))
@@ -58,9 +69,14 @@ class ModulePathTracker:
                     )
                 )
 
-        for _, module in self.root.named_modules():
-            self._handles.append(module.register_forward_pre_hook(pre_hook))
-            self._handles.append(module.register_forward_hook(post_hook))
+        seen: set[int] = set()
+        for root in self.roots:
+            for _, module in root.named_modules():
+                if id(module) in seen:
+                    continue
+                seen.add(id(module))
+                self._handles.append(module.register_forward_pre_hook(pre_hook))
+                self._handles.append(module.register_forward_hook(post_hook))
         return self
 
     def __exit__(self, *_exc: object) -> None:
@@ -83,7 +99,7 @@ class ModulePathTracker:
     ) -> torch.Tensor:
         current = self._backward_path
         incoming_is_ancestor = current != module_path and (
-            module_path == self._root_name
+            module_path in self._root_names
             or current.startswith(f"{module_path}.")
         )
         if not incoming_is_ancestor:

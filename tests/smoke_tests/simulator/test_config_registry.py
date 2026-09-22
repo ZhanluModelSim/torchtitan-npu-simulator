@@ -56,6 +56,7 @@ def test_simulator_config_preserves_training_config(config_name):
 
     assert sim_config.simulation.output_dir == f"./simulator_output/{config_name}"
     assert sim_config.simulation.world_size is None
+    assert sim_config.simulation.replicate_embedding_and_first_layer is False
 
 
 def test_smoketest_uses_production_npu_converter_path():
@@ -149,6 +150,26 @@ def test_ep_dispatch_fp8_cli_override_is_simulator_only():
     )
 
     assert config.simulation.enable_ep_dispatch_fp8 is True
+
+
+def test_replicated_first_layer_cli_override_is_deepseek_v4_only():
+    config = ConfigManager().parse_args(
+        [
+            "--module",
+            "torchtitan_npu.simulator",
+            "--config",
+            "deepseek_v4_smoketest",
+            "--simulation.replicate-embedding-and-first-layer",
+        ]
+    )
+
+    assert config.simulation.replicate_embedding_and_first_layer is True
+
+    kimi_config = simulator_configs.kimi_k3_smoketest()
+    assert not hasattr(
+        kimi_config.simulation,
+        "replicate_embedding_and_first_layer",
+    )
 
 
 def test_mixed_precision_reduce_accepts_bfloat16_from_cli():

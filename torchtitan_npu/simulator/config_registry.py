@@ -15,18 +15,25 @@ from torchtitan_npu.models.deepseek_v4.config_overrides import (
     DeepSeekV4ModelOverrides,
     apply_model_overrides,
 )
-from torchtitan_npu.config.configs import TrainerConfig
 from torchtitan_npu.simulator.trainer import SimulationConfig, SimulationTrainerConfig
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from torchtitan_npu.config.configs import TrainerConfig
+
+
+@dataclasses.dataclass(kw_only=True, slots=True)
+class DeepSeekV4SimulationConfig(SimulationConfig):
+    # Keep the embedding and first transformer layer resident on every rank of
+    # their respective FSDP meshes. Expert Parallel remains unchanged.
+    replicate_embedding_and_first_layer: bool = False
+
 
 @dataclasses.dataclass(kw_only=True, slots=True)
 class DeepSeekV4SimulationTrainerConfig(SimulationTrainerConfig):
-    model_overrides: DeepSeekV4ModelOverrides = dataclasses.field(
-        default_factory=DeepSeekV4ModelOverrides
-    )
+    simulation: DeepSeekV4SimulationConfig = dataclasses.field(default_factory=DeepSeekV4SimulationConfig)
+    model_overrides: DeepSeekV4ModelOverrides = dataclasses.field(default_factory=DeepSeekV4ModelOverrides)
     mxfp8_fqns: list[str] | None = None
 
     def __post_init__(self) -> None:
@@ -52,7 +59,7 @@ def _simulation_config(
     base_fields["compile"] = dataclasses.replace(base_config.compile, enable=False)
     return DeepSeekV4SimulationTrainerConfig(
         **base_fields,
-        simulation=SimulationConfig(output_dir=f"./simulator_output/{output_name}"),
+        simulation=DeepSeekV4SimulationConfig(output_dir=f"./simulator_output/{output_name}"),
     )
 
 
@@ -109,9 +116,11 @@ def deepseek_v4_smoketest() -> SimulationTrainerConfig:
 # Kimi K3 simulator configs
 # ---------------------------------------------------------------------------
 
-from torchtitan_npu.models.kimi_k3 import config_registry as _kimi_k3_configs  # noqa: E402
-from torchtitan_npu.models.kimi_k3.config_overrides import (  # noqa: E402
+from torchtitan_npu.models.kimi_k3 import config_registry as _kimi_k3_configs
+from torchtitan_npu.models.kimi_k3.config_overrides import (
     KimiK3ModelOverrides,
+)
+from torchtitan_npu.models.kimi_k3.config_overrides import (
     apply_model_overrides as apply_kimi_k3_model_overrides,
 )
 
@@ -120,9 +129,7 @@ from torchtitan_npu.models.kimi_k3.config_overrides import (  # noqa: E402
 class KimiK3SimulationTrainerConfig(SimulationTrainerConfig):
     """Kimi K3 simulator config with stable model and MXFP8 CLI overrides."""
 
-    model_overrides: KimiK3ModelOverrides = dataclasses.field(
-        default_factory=KimiK3ModelOverrides
-    )
+    model_overrides: KimiK3ModelOverrides = dataclasses.field(default_factory=KimiK3ModelOverrides)
     mxfp8_fqns: list[str] | None = None
 
     def __post_init__(self) -> None:
@@ -142,10 +149,7 @@ def _kimi_k3_simulation_config(
     output_name: str,
 ) -> KimiK3SimulationTrainerConfig:
     base_config = factory()
-    base_fields = {
-        field.name: getattr(base_config, field.name)
-        for field in dataclasses.fields(base_config)
-    }
+    base_fields = {field.name: getattr(base_config, field.name) for field in dataclasses.fields(base_config)}
     base_fields["compile"] = dataclasses.replace(base_config.compile, enable=False)
     return KimiK3SimulationTrainerConfig(
         **base_fields,

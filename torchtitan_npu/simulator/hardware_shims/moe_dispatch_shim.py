@@ -114,20 +114,22 @@ def _record_fp8_payload_and_scale(
         dtype=torch.uint8,
         device=tensor.device,
     )
-    scale_output = _uncaptured_empty_like(scale)
+    payload_output = _uncaptured_empty_like(tensor)
+    # Payload is issued first; the final logical activation remains unavailable
+    # until the later scale transfer has completed.
     _record_all_to_all(
         tensor,
-        scale_output,
+        payload_output,
         group,
-        transport_tensor=scale,
+        transport_tensor=payload,
         track_memory=False,
     )
     _record_all_to_all(
         tensor,
         output,
         group,
-        transport_tensor=payload,
-        dependency_inputs=[scale_output],
+        transport_tensor=scale,
+        dependency_inputs=[payload_output],
     )
 
 
