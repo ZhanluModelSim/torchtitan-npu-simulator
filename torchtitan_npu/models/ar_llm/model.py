@@ -8,8 +8,10 @@
 Contract: see MODEL_CONTRACT.md. Deviations from the raw reference
 (``torchtitan_npu/simulator/raw_model/ar_llm``) are recorded there: the Engram
 branch input fix, the sampling-loss wiring fix, removal of the unused KDA
-``da_proj`` and indexer Hadamard rotation, untied output head, and MoR being an
-inference-only scheme (training captures per-layer KV as usual).
+``da_proj`` and indexer Hadamard rotation, untied output head, and MoR being a
+weight-sharing recursion (``mor_base_depth`` unique layer weights re-applied
+``mor_num_recursion`` times -- compute stays at ``n_layers`` passes while
+parameter/gradient/optimizer memory scales with ``mor_base_depth``).
 """
 
 import logging
@@ -284,7 +286,7 @@ class ArLlmBlock(Module):
         self.layer_id = config.layer_id
         self.mor_type = model_args.mor_type_for_layer(config.layer_id)
 
-        self.has_engram = config.layer_id in model_args.engram_layers
+        self.has_engram = model_args.has_engram_at(config.layer_id)
         if self.has_engram:
             self.engram = EngramModule(model_args, config.layer_id)
 
@@ -330,6 +332,13 @@ class ArLlmModel(Module):
         vocab_size: int = 524288
         dim: int = 16384
         n_layers: int = 60
+        # MoR (Mixture of Recursions): only ``mor_base_depth`` unique layer
+        # weights exist; the forward pass runs them ``mor_num_recursion`` times
+        # so ``n_layers == mor_base_depth * mor_num_recursion``. Compute stays
+        # at ``n_layers`` passes while parameter/gradient/optimizer memory
+        # scales with ``mor_base_depth`` (MODEL_CONTRACT.md section 4).
+        mor_base_depth: int = 12
+        mor_num_recursion: int = 5
         n_heads: int = 128
         head_dim: int = 256
         qk_nope_head_dim: int = 192
@@ -389,6 +398,14 @@ class ArLlmModel(Module):
         def layers(self):
             return range(self.n_layers)
 
+        def mor_weight_layer_idx(self, layer_idx: int) -> int:
+            """Map a physical (compute-slot) layer index to its shared weight.
+
+            The same base-depth weight set is reused every recursion: physical
+            layer ``p`` is computed by weight layer ``p % mor_base_depth``.
+            """
+            return layer_idx % self.mor_base_depth
+
         def layer_type(self, layer_idx: int) -> str:
             pos = layer_idx % self.unit_size
             if pos < self.csa_per_unit:
@@ -398,9 +415,14 @@ class ArLlmModel(Module):
             return "kda"
 
         def expert_choice_layers(self) -> list[int]:
-            num_expert_layers = max(1, int(self.n_layers * self.mor_expert_ratio))
+            # Expert-choice routing is a property of the *shared* weight layer:
+            # one block weight must keep a single router kind across all its
+            # recursion passes, so the 5% ratio is applied over base_depth.
+            num_expert_layers = max(1, int(self.mor_base_depth * self.mor_expert_ratio))
             candidates = [
-                idx for idx in range(self.n_layers) if self.layer_type(idx) in ("csa", "hca")
+                idx
+                for idx in range(self.mor_base_depth)
+                if self.layer_type(idx) in ("csa", "hca")
             ]
             if num_expert_layers >= len(candidates):
                 return candidates
@@ -408,12 +430,40 @@ class ArLlmModel(Module):
             return sorted({candidates[idx * step] for idx in range(num_expert_layers)})
 
         def mor_type_for_layer(self, layer_idx: int) -> str:
-            return "expert" if layer_idx in self.expert_choice_layers() else "token"
+            return (
+                "expert"
+                if self.mor_weight_layer_idx(layer_idx) in self.expert_choice_layers()
+                else "token"
+            )
+
+        def mor_engram_weight_layers(self) -> list[int]:
+            """Unique weight layers that carry an Engram module.
+
+            ``engram_layers`` lists physical (compute-slot) indices; under MoR
+            weight sharing the same weight layer serves several physical slots,
+            so the Engram module (and its hash table) is instantiated exactly
+            once per covered weight layer.
+            """
+            return sorted({self.mor_weight_layer_idx(idx) for idx in self.engram_layers})
+
+        def has_engram_at(self, layer_idx: int) -> bool:
+            return self.mor_weight_layer_idx(layer_idx) in self.mor_engram_weight_layers()
 
         def validate(self) -> None:
             if self.n_layers % self.unit_size != 0:
                 raise ValueError(
                     f"n_layers={self.n_layers} must be divisible by unit_size={self.unit_size}"
+                )
+            if self.mor_base_depth * self.mor_num_recursion != self.n_layers:
+                raise ValueError(
+                    f"mor_base_depth={self.mor_base_depth} x mor_num_recursion="
+                    f"{self.mor_num_recursion} must equal n_layers={self.n_layers}"
+                )
+            if self.mor_base_depth % self.unit_size != 0:
+                raise ValueError(
+                    f"mor_base_depth={self.mor_base_depth} must be divisible by "
+                    f"unit_size={self.unit_size} (so the per-recursion layer-type "
+                    "pattern stays aligned)"
                 )
             if self.csa_per_unit + self.hca_per_unit >= self.unit_size:
                 raise ValueError("unit must contain at least one KDA layer")
@@ -451,7 +501,9 @@ class ArLlmModel(Module):
         def get_nparams_and_flops(self, model: nn.Module, seq_len: int) -> tuple[int, float]:
             del seq_len
             nparams = sum(p.numel() for p in model.parameters())
-            flops_per_token = 6.0 * nparams
+            # MoR recursion reuses every weight num_recursion times: FLOPs are
+            # 6 * params * num_recursion per token, not 6 * params.
+            flops_per_token = 6.0 * nparams * self.mor_num_recursion
             return nparams, flops_per_token
 
     def __init__(self, config: Config):
@@ -459,10 +511,12 @@ class ArLlmModel(Module):
         config.validate()
         self.model_args = config
         self.tok_embeddings = nn.Embedding(config.vocab_size, config.dim)
+        # MoR weight sharing: only ``mor_base_depth`` unique layer weights are
+        # materialized; ``forward`` applies them ``mor_num_recursion`` times.
         self.layers = ModuleDict(
             {
                 str(idx): ArLlmBlock(ArLlmBlock.Config(model_args=config, layer_id=idx))
-                for idx in range(config.n_layers)
+                for idx in range(config.mor_base_depth)
             }
         )
         self.norm = RMSNorm.Config(normalized_shape=config.dim, eps=config.norm_eps).build()
@@ -544,9 +598,12 @@ class ArLlmModel(Module):
         x = self.tok_embeddings(tokens)
         # Full-length rope buffers: CP gathers the sequence inside attention
         # and re-slices there; attention itself slices to its (possibly
-        # gathered) sequence length.
-        for layer in self.layers.values():
-            x = layer(x, tokens, self.rope_cos, self.rope_sin, attention_masks, positions)
+        # gathered) sequence length. MoR recursion re-applies the base-depth
+        # weight blocks num_recursion times (compute = n_layers passes, weights
+        # stay mor_base_depth sets).
+        for _ in range(self.model_args.mor_num_recursion):
+            for layer in self.layers.values():
+                x = layer(x, tokens, self.rope_cos, self.rope_sin, attention_masks, positions)
         x = self.norm(x)
         return self.output(x)
 
@@ -616,19 +673,22 @@ def estimate_ar_llm_params(config: "ArLlmModel.Config") -> dict[str, int]:
             + 1
         )
 
-    csa_hca_count = sum(1 for idx in range(config.n_layers) if config.layer_type(idx) in ("csa", "hca"))
-    hca_count = sum(1 for idx in range(config.n_layers) if config.layer_type(idx) == "hca")
-    kda_count = sum(1 for idx in range(config.n_layers) if config.layer_type(idx) == "kda")
+    csa_hca_count = sum(1 for idx in range(config.mor_base_depth) if config.layer_type(idx) in ("csa", "hca"))
+    hca_count = sum(1 for idx in range(config.mor_base_depth) if config.layer_type(idx) == "hca")
+    kda_count = sum(1 for idx in range(config.mor_base_depth) if config.layer_type(idx) == "kda")
 
+    # MoR weight sharing: only ``mor_base_depth`` layer-weight sets are stored,
+    # regardless of how many recursion passes reuse them at compute time.
+    layer_count = config.mor_base_depth
     attention_total = (
         csa_hca_count * csa_hca_attn + hca_count * hca_indexer + kda_count * kda_per_layer
     )
-    moe_total = config.n_layers * (
+    moe_total = layer_count * (
         config.num_routed_experts * expert_per + shared_per_layer + router_per_layer
     )
-    mhc_total = config.n_layers * mhc_per_layer
-    norms_total = config.n_layers * block_norms + d
-    engram_total = len(config.engram_layers) * engram_per_layer
+    mhc_total = layer_count * mhc_per_layer
+    norms_total = layer_count * block_norms + d
+    engram_total = len(config.mor_engram_weight_layers()) * engram_per_layer
 
     total = (
         embedding

@@ -34,11 +34,13 @@ field) into the ``sla2_sparse_attn`` / ``sla2_linear_attn`` op records:
   (``l_eff = L - skv``), matching ``SparseLinearAttention._calc_linear_masked``.
 
 The effective key lengths ``skv`` and ``l_eff`` are computed in shim-time
-(``_sla_effective_key_lengths``) and appended to the op record's ``inputs``
-as plain Python ints: sparse ``[q,k,v,selection,mode_val,stage,skv]``, linear
-``[q,k,v,(,selection,)mode_val,l_eff]`` (mode_val=1 partial, 2 full). The cost
-model reads them from ``op.inputs[-3]/-2/-1`` (sparse) and ``op.inputs[-2]/-1``
-(linear) directly — no attrs, no tensor-value, no dtype inference.
+(``_sla_effective_key_lengths``) and recorded into the op's ``attrs`` dict:
+sparse ``{"compute_mode": mode_val, "stage": stage, "skv": skv}`` and linear
+``{"compute_mode": mode_val, "l_eff": l_eff}`` (mode_val=1 partial, 2 full).
+``attrs`` is the designed channel for non-tensor values: plain Python ints
+put directly into ``inputs`` are silently dropped by ``_flatten_tensors``.
+The cost model reads them via ``op.extra_param`` (keyed) — mirrored from
+``OpNode.attrs`` by the zhanlu bridge ``convert_opnode``.
 
 
 The SLA2 alpha blend stays eager (production keeps it as small elementwise
@@ -193,9 +195,10 @@ class _SimSla2SparseAttn(torch.autograd.Function):
         mode_val = 1 if compute_mode == "partial" else 2
         _record(
             "triton_ascend_kernels.sla2_sparse_attn",
-            [q, k, v, selection, mode_val, stage, skv],
+            [q, k, v, selection],
             [output],
             module_path,
+            attrs={"compute_mode": mode_val, "stage": stage, "skv": skv},
         )
         ctx.save_for_backward(q, k, v, selection)
         ctx.module_path = module_path
@@ -213,9 +216,10 @@ class _SimSla2SparseAttn(torch.autograd.Function):
         mode_val = 1 if ctx.compute_mode == "partial" else 2
         _record(
             "triton_ascend_kernels.sla2_sparse_attn_grad",
-            [q, k, v, selection, grad_output, mode_val, ctx.stage, ctx.skv],
+            [q, k, v, selection, grad_output],
             [d_q, d_k, d_v],
             ctx.module_path,
+            attrs={"compute_mode": mode_val, "stage": ctx.stage, "skv": ctx.skv},
         )
         return d_q, d_k, d_v, None, None, None, None, None
 
@@ -230,13 +234,12 @@ class _SimSla2LinearAttn(torch.autograd.Function):
         inputs = [q, k, v]
         if compute_mode == "partial":
             inputs.append(selection)
-        inputs.append(mode_val)
-        inputs.append(l_eff)
         _record(
             "triton_ascend_kernels.sla2_linear_attn",
             inputs,
             [output],
             module_path,
+            attrs={"compute_mode": mode_val, "l_eff": l_eff},
         )
         ctx.save_for_backward(q, k, v, selection)
         ctx.module_path = module_path
@@ -255,13 +258,12 @@ class _SimSla2LinearAttn(torch.autograd.Function):
         if ctx.compute_mode == "partial":
             inputs.append(selection)
         inputs.append(grad_output)
-        inputs.append(mode_val)
-        inputs.append(ctx.l_eff)
         _record(
             "triton_ascend_kernels.sla2_linear_attn_grad",
             inputs,
             [d_q, d_k, d_v],
             ctx.module_path,
+            attrs={"compute_mode": mode_val, "l_eff": ctx.l_eff},
         )
         return d_q, d_k, d_v, None, None, None, None
 

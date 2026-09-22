@@ -14,7 +14,8 @@
 | 项 | 值 |
 | --- | --- |
 | hidden_size | 16384（2^14） |
-| num_layers | 60 = 10 × 6 层单元 |
+| num_layers | 60（计算深度）= 12 × 5 递归 |
+| MoR 权重层数 | **mor_base_depth=12**（同一组 12 层权重循环 5 次；参数量/显存按 12 层计，计算按 60 层计） |
 | 层单元 | `[CSA, HCA, KDA, KDA, KDA, KDA]`（CSA:HCA:KDA = 1:1:4） |
 | num_attention_heads | 128 |
 | head_dim | 256 = nope 192 + rope 64 |
@@ -47,8 +48,12 @@
 
 ## 4. MoR（Mixture of Recursions）训练态语义
 
-- raw 的 `RecursiveDynamicCache`（cycle KV 共享，base_depth=12 × 5 递归）**仅存在于推理路径**；raw 训练 forward 未使用 cache。
-- 契约：**训练/模拟器建模不实现跨层 KV 复用**。MoR 在训练态只体现为 `mor_expert_ratio`（5% 层，仅 CSA/HCA）使用 expert-choice 路由。KV 压缩收益属于推理服务建模，不在本仓 meta 验收范围。
+- **权重共享递归**：真实架构只存在 `mor_base_depth`（=12）组层权重，前向把同一组权重**循环复用 `mor_num_recursion`（=5）次**，`num_layers = mor_base_depth × mor_num_recursion`（=60）。每个物理层 `p` 由权重层 `p % mor_base_depth` 计算。
+- **不省计算量**：计算仍为 60 层 pass（12 权重层 × 5 递归），算子账本与 60 独立层完全一致（GMM=60×6、chunk_kda=40、sparse_attn=20…）。
+- **节省显存**：参数 / 梯度 / optimizer state 只随 `mor_base_depth`（12 层）scale，权重、动量、梯度较 60 独立层缩小 5×。激活按 60 层计算 pass 各自留存，不省。
+- 框架模型只实例化 `mor_base_depth` 个 Block，`forward` 按 `mor_num_recursion` 次循环应用；FSDP/eFSDP、TP、EP、CP 均作用在这组共享权重上。
+- raw 的 `RecursiveDynamicCache`（cycle KV 共享）仍仅存在于推理路径，训练 forward 不使用 cache，KV 压缩收益属于推理服务建模，不在本仓 meta 验收范围。
+- **expert-choice 路由是共享权重层的属性**：同一权重层在多轮递归中被复用，必须保持单一 router 类型，故 `mor_expert_ratio` 按 `mor_base_depth` 计算（50T/100T 为 12 层中 1 层 CSA expert-choice，而非 60 层中 3 层）。`engram_layers` 列出的是物理层索引，Engram 模块（含 hash 表）只在其覆盖的权重层上实例化一次。
 - PP 与 MoR 的跨 stage cache 复用未定义，PP 接入前必须先补充该契约（当前 PP fail fast）。
 
 ## 5. LatentMoE
@@ -57,8 +62,8 @@
 - 单 expert（routed 与 shared 同构）5 矩阵：`gate_down/up_down: d→latent(7168)`，`latent_to_inter: latent→inter(4096)`（gate/up 共享），SwiGLU(clamp=10)，`inter_to_latent: inter→latent`，`latent_to_out: latent→d`。
 - grouped 权重布局 `[E, out, in]`：`w1=gate_down [E,latent,d]`、`w3=up_down [E,latent,d]`、`w4=latent_to_inter [E,inter,latent]`、`w5=inter_to_latent [E,latent,inter]`、`w2=latent_to_out [E,d,latent]`；融合边界 = 5 组权重、6 次 grouped_mm（latent_to_inter 对 gate/up 各一次）+ 1 次 swiglu。
 - 路由：
-  - token-choice（57 层）：top-K + load-balance aux loss（z_loss_alpha=1e-3）。
-  - expert-choice（3 层，均匀分布于深度、仅 CSA/HCA）：每 expert 选 capacity=⌈factor·T·topk/E⌉ 个 token；未选中 token 以 weight=0 经 expert 0 通路（保持 `num_tokens_per_expert ≡ capacity` 静态）；aux loss = 选中计数方差（sampling loss）。
+  - token-choice（其余层）：top-K + load-balance aux loss（z_loss_alpha=1e-3）。
+  - expert-choice（`max(1, int(mor_base_depth×mor_expert_ratio))` 个**权重层**，均匀分布于深度、仅 CSA/HCA）：每 expert 选 capacity=⌈factor·T·topk/E⌉ 个 token；未选中 token 以 weight=0 经 expert 0 通路（保持 `num_tokens_per_expert ≡ capacity` 静态）；aux loss = 选中计数方差（sampling loss）。MoR 权重共享下同一权重层在每轮递归复用同一 router，故 expert-choice 是权重层的属性（见第 4 节）。
   - `debug_force_load_balance=True`（模拟器强制）：所有层退化为 round-robin top-K，路由结果与输入值无关。
 - expert 内部并行：TP/ETP 切 **inter 维**（colwise→swiglu→rowwise+all-reduce，单次 all-reduce）；latent 维切分需两次 all-reduce，不采用。
 
@@ -76,6 +81,8 @@
 ## 7. 参数量公式（独立基线）
 
 框架模型 output 头与 embedding **不 tied**（FSDP/DTensor 下共享参数易引入边界问题），两者各计 `V·d`；HF 权重若为 tied 形式由 state-dict adapter 展开为两个 key。
+
+**MoR 权重共享**：所有「每层」项只按 `mor_base_depth`（12）层计，而不是 `num_layers`（60）——同一组权重被循环复用，参数/梯度/优化器显存只存一份。Engram 只按它覆盖的唯一权重层数计（50T：物理 [3,9,15,…57] → 权重层 {3,9}，2 层）。
 
 ```
 embedding          = V·d
@@ -97,9 +104,10 @@ output(lm_head)    = V·d
 每层 norm: 4·d（block 级）+ 4·d（mHC pre/post）+ 最终 norm·d
 Engram 每层: n_orders·nh·cap·(mem_dim/n_orders/nh) + 2·d·mem_dim
              + 2·mem_dim + 2·d + 4·d(conv) + 1(gate_bias)
+总层数因子 = mor_base_depth（MoR 权重共享）；FLOPs 因子 = num_recursion（每权重复用轮数）
 ```
 
-注意：raw 仓库 `estimate_params_from_config` 将 tied embedding 计了 2 次，且 Engram 数值与 ARCHITECTURE.md 不一致；本仓以模型实参 `sum(p.numel())` 与上述公式对账为准（单测覆盖 debug/reduced 两个规格）。
+注意：raw 仓库 `estimate_params_from_config` 将 tied embedding 计了 2 次、按 60 独立层计参、且 Engram 数值与 ARCHITECTURE.md 不一致；本仓以模型实参 `sum(p.numel())` 与上述公式对账为准（单测覆盖 debug/reduced 两个规格；递归规格由单测覆盖）。
 
 ## 8. 支持范围（首版声明）
 
@@ -144,11 +152,11 @@ shape-only shim 在模型构造与并行化完成后绑定（`apply_ar_llm_shims
 
 ## 10. 首版实现状态
 
-- 已落地：`torchtitan_npu/models/ar_llm/`（model/attention/feed_forward/parallelize/state_dict_adapter/config_overrides/config_registry），`--module ar_llm` 注册，flavors：`debug`（1 个 6 层单元，全路径覆盖）/`reduced`（2 个单元）/`50t`/`100t`（正式规格，仅 meta）。
+- 已落地：`torchtitan_npu/models/ar_llm/`（model/attention/feed_forward/parallelize/state_dict_adapter/config_overrides/config_registry），`--module ar_llm` 注册，flavors：`debug`（6 权重层×1 递归，全路径覆盖）/`reduced`（12 权重层×1 递归）/`50t`/`100t`（正式规格：12 权重层×5 递归，仅 meta）。
 - 训练配置工厂：`ar_llm_smoketest / ar_llm_50t / ar_llm_50t_mxfp8 / ar_llm_100t / ar_llm_100t_mxfp8`；模拟器配置：`torchtitan_npu/simulator/config_registry.py` 同名包装。flavors 仍含 `debug`/`reduced`（单测与契约对账用），仅 `50t`/`100t`/`debug` 提供训练配置入口。
 - 模拟器 shim：`torchtitan_npu/simulator/hardware_shims/ar_llm_shim.py`（KDA/CSA/HCA/mHC 融合算子 shape-only 记录）；LatentMoE GMM 走真实 `aten._grouped_mm` meta kernel 捕获。
 - 已知首版限制（验收口径为 Conditionally ready 的声明范围）：
   - CP/PP/ETP/DeepEP/compile fail fast（错误信息指向本契约）；MXFP8 已支持（§9.1）。
   - KDA 真实融合 kernel 未接入（顺序参考实现仅 debug 规格可负担）；模拟器/大规模验证依赖 shim。
-  - MoR 训练态不建模 KV 复用（见第 4 节）。
+  - MoR 为权重共享递归（12 权重层 × 5 递归，§4）；raw 的推理态 cycle KV 缓存复用仍不建模。
   - `ExpertParallel` 分区假设上游通过 `self._partition_fn` 分发，`parallelize` 内有 DTensor 校验 fail-fast 兜底。

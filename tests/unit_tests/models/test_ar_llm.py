@@ -53,12 +53,26 @@ class TestModelRegistry:
             config = ar_llm_configs[flavor]()
             expert_layers = config.expert_choice_layers()
             assert expert_layers
+            # Expert-choice is a property of the shared weight layer, so the
+            # returned indices lie inside base_depth and are CSA/HCA only.
+            assert all(0 <= idx < config.mor_base_depth for idx in expert_layers)
             assert all(
                 config.layer_type(idx) in ("csa", "hca") for idx in expert_layers
             )
             for idx in range(config.n_layers):
-                expected = "expert" if idx in expert_layers else "token"
+                weight_idx = config.mor_weight_layer_idx(idx)
+                expected = "expert" if weight_idx in expert_layers else "token"
                 assert config.mor_type_for_layer(idx) == expected
+
+    def test_mor_base_depth_maps_engram_weights(self):
+        for flavor in ("debug", "reduced", "50t", "100t"):
+            config = ar_llm_configs[flavor]()
+            covered = {
+                config.mor_weight_layer_idx(p) for p in config.engram_layers
+            }
+            assert set(config.mor_engram_weight_layers()) == covered
+            for weight_idx in range(config.mor_base_depth):
+                assert config.has_engram_at(weight_idx) == (weight_idx in covered)
 
     @pytest.mark.parametrize("flavor", FLAVORS)
     def test_overrides_round_trip(self, flavor):
@@ -79,6 +93,12 @@ class TestModelInstantiation:
     @staticmethod
     def _build(flavor):
         model = ArLlmModel(ar_llm_configs[flavor]())
+        model.init_weights()
+        return model
+
+    @staticmethod
+    def _build_from_config(config):
+        model = ArLlmModel(config)
         model.init_weights()
         return model
 
@@ -118,6 +138,60 @@ class TestModelInstantiation:
         assert experts.w4.shape == (e, inter, latent)
         assert experts.w5.shape == (e, latent, inter)
         assert experts.w2.shape == (e, dim, latent)
+
+
+class TestMorRecursion:
+    """MoR weight sharing: base_depth unique weights, num_recursion passes."""
+
+    @staticmethod
+    def _recursive_config():
+        config = dataclasses.replace(
+            ar_llm_configs["debug"](),
+            n_layers=12,
+            mor_base_depth=6,
+            mor_num_recursion=2,
+            engram_layers=[2, 8],
+        )
+        config.validate()
+        return config
+
+    def test_model_holds_only_base_depth_weights(self):
+        config = self._recursive_config()
+        model = ArLlmModel(config)
+        # Weights: base_depth blocks only, not n_layers.
+        assert len(model.layers) == config.mor_base_depth == 6
+        actual = sum(p.numel() for p in model.parameters())
+        assert actual == estimate_ar_llm_params(config)["total"]
+
+    def test_forward_runs_num_recursion_passes(self):
+        config = self._recursive_config()
+        model = TestModelInstantiation._build_from_config(config)
+        model.eval()
+        calls = {"n": 0}
+
+        def _count_hook(module, args, kwargs):
+            calls["n"] += 1
+
+        for layer in model.layers.values():
+            layer.attention.register_forward_hook(_count_hook)
+        tokens = torch.randint(0, config.vocab_size, (1, 16))
+        with torch.no_grad():
+            logits = model(tokens)
+        assert logits.shape == (1, 16, config.vocab_size)
+        # Every base-depth block runs once per recursion.
+        assert calls["n"] == config.mor_base_depth * config.mor_num_recursion
+
+    def test_recursive_forward_backward(self):
+        config = self._recursive_config()
+        model = TestModelInstantiation._build_from_config(config)
+        model.train()
+        tokens = torch.randint(0, config.vocab_size, (2, 16))
+        logits = model(tokens)
+        loss = logits.float().pow(2).mean()
+        loss.backward()
+        grads = [p.grad for p in model.parameters() if p.grad is not None]
+        assert grads
+        assert all(torch.isfinite(g).all() for g in grads)
 
 
 class TestForwardPass:

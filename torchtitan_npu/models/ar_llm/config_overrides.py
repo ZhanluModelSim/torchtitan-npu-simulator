@@ -25,6 +25,8 @@ class ArLlmModelOverrides:
     vocab_size: int = 524288
     dim: int = 16384
     n_layers: int = 60
+    mor_base_depth: int = 12
+    mor_num_recursion: int = 5
     n_heads: int = 128
     head_dim: int = 256
     qk_nope_head_dim: int = 192
@@ -140,6 +142,8 @@ def validate_model_overrides(config: ArLlmModelOverrides) -> None:
         "vocab_size",
         "dim",
         "n_layers",
+        "mor_base_depth",
+        "mor_num_recursion",
         "n_heads",
         "head_dim",
         "qk_nope_head_dim",

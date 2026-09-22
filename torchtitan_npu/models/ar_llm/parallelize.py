@@ -196,17 +196,30 @@ def _apply_ar_llm_fsdp(
         return
 
     transformer_blocks = list(model.layers.values())
-    next_transformer_blocks = transformer_blocks[1:] + [None]
+    # MoR recursion re-enters block 0 after the last base-depth block, so the
+    # prefetch chain cycles instead of ending on the final norm/output head
+    # (except for the last recursion pass, where the head follows).
+    if model.model_args.mor_num_recursion > 1:
+        next_transformer_blocks = transformer_blocks[1:] + [transformer_blocks[0]]
+        last_follows = [transformer_blocks[0]]
+    else:
+        next_transformer_blocks = transformer_blocks[1:] + [None]
+        last_follows = [model.norm, model.output]
 
     model.tok_embeddings.set_modules_to_forward_prefetch([transformer_blocks[0]])
     for transformer_block, next_transformer_block in zip(transformer_blocks, next_transformer_blocks):
         if next_transformer_block is not None:
             transformer_block.set_modules_to_forward_prefetch([next_transformer_block])
         else:
-            transformer_block.set_modules_to_forward_prefetch([model.norm, model.output])
+            transformer_block.set_modules_to_forward_prefetch(last_follows)
 
     reversed_transformer_blocks = list(reversed(list(model.layers.values())))
-    prev_transformer_blocks = reversed_transformer_blocks[1:] + [None]
+    if model.model_args.mor_num_recursion > 1:
+        prev_transformer_blocks = reversed_transformer_blocks[1:] + [reversed_transformer_blocks[0]]
+        last_prev = reversed_transformer_blocks[0]
+    else:
+        prev_transformer_blocks = reversed_transformer_blocks[1:] + [None]
+        last_prev = None
 
     model.output.set_modules_to_backward_prefetch([reversed_transformer_blocks[0]])
     for transformer_block, prev_transformer_block in zip(
@@ -214,6 +227,8 @@ def _apply_ar_llm_fsdp(
     ):
         if prev_transformer_block is not None:
             transformer_block.set_modules_to_backward_prefetch([prev_transformer_block])
+        elif last_prev is not None:
+            transformer_block.set_modules_to_backward_prefetch([last_prev])
         else:
             transformer_block.set_modules_to_backward_prefetch([model.tok_embeddings])
 
