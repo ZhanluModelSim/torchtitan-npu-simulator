@@ -312,10 +312,21 @@ backward 中重放。可通过
 ```
 
 可选值会显示在 CLI help 中：`full`、`none`、`default`、`compute-intensive`、
-`attention`、`linear`、`mm`、`gmm`、`quant-mm`、`comm`、`max`。`full` 是除
+`attention`、`linear`、`mm`、`gmm`、`quant-mm`、`comm`、`all-to-all`、`max`。`full` 是除
 `none` 外所有类别的便捷别名；`none` 必须单独使用；`default` 复用上游默认集合。
 即使选择了 `full`，`mm` 和 `linear` 仍保留上游的交替重计算策略；其余类别命中后
 保存输出。未传该参数时保持模型原有 policy。
+
+`all-to-all` 仅控制 simulator 在 fake EP 下生成的 `comm.all_to_all`：保存原始前向
+的模拟通信输出，重计算时复用，从而删去对应的重计算通信事件；正常反向的梯度
+AllToAll 仍会记录。显式选择 `comm` 或 `full` 也会保存该模拟输出；`default` 不会改变
+这一模拟路径。若要保留上游默认保存策略并额外保存模拟 AllToAll，使用
+`--simulation.selective-ac-save-ops default all-to-all`。此选项不会修改真实 NPU 的
+通信实现或 TorchTitan 的训练策略。对于 DeepSeek V4，若还要保留模型自己的 GMM 和
+量化 matmul 保存扩展，则使用 `default gmm quant-mm all-to-all`。保存输出
+会增加 checkpoint 激活的逻辑大小；开启
+`--simulation.memory-offload-ac-saved-tensors` 后，设备驻留按零建模，回捞逻辑字节
+仍计入 `checkpoint_prefetch`。
 
 DeepSeek-V4 仿真还可以评估 Embedding 和第 0 层权重常驻副本的方案：
 

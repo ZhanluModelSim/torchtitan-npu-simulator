@@ -61,3 +61,18 @@ def test_attention_choices_save_synthetic_attention_ops(selection):
 @pytest.mark.parametrize("selection", [["none"], ["mm"], ["gmm", "quant-mm"]])
 def test_non_attention_choices_recompute_synthetic_attention_ops(selection):
     assert synthetic_ac_save_patterns(selection) == ()
+
+
+@pytest.mark.parametrize("selection", [["all-to-all"], ["comm"], ["full"]])
+def test_simulator_communication_choices_save_all_to_all(selection):
+    assert "comm.all_to_all" in synthetic_ac_save_patterns(selection)
+
+
+@pytest.mark.parametrize("selection", [None, ["default"], ["gmm"], ["none"]])
+def test_other_choices_do_not_save_simulator_all_to_all(selection):
+    assert "comm.all_to_all" not in synthetic_ac_save_patterns(selection)
+
+
+def test_simulator_all_to_all_choice_does_not_change_torchtitan_save_ops():
+    with selective_ac_save_ops_context(["all-to-all"]):
+        assert activation_checkpoint._get_save_ops() == set()

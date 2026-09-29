@@ -123,6 +123,24 @@ def test_selective_ac_save_ops_cli_override():
     assert config.simulation.selective_ac_save_ops == ["default", "gmm"]
 
 
+def test_simulator_all_to_all_save_op_cli_override():
+    config = ConfigManager().parse_args(
+        [
+            "--module",
+            "torchtitan_npu.simulator",
+            "--config",
+            "deepseek_v4_smoketest",
+            "--activation-checkpoint.mode",
+            "selective",
+            "--simulation.selective-ac-save-ops",
+            "all-to-all",
+        ]
+    )
+
+    assert config.activation_checkpoint.mode == "selective"
+    assert config.simulation.selective_ac_save_ops == ["all-to-all"]
+
+
 def test_fsdp_allgather_fp8_cli_override_is_simulator_only():
     config = ConfigManager().parse_args(
         [

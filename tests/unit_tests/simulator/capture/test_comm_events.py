@@ -11,11 +11,22 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch_npu
 from torch.distributed import _functional_collectives as funcol
+from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
 from torch.distributed.pipelining import schedules
+from torch.utils.checkpoint import (
+    CheckpointPolicy,
+    DefaultDeviceType,
+    create_selective_checkpoint_contexts,
+)
 
+from torchtitan_npu.simulator.capture.checkpoint_execution import (
+    install_checkpoint_execution_tracking,
+)
 from torchtitan_npu.simulator.capture.comm_events import capture_fake_collectives
 from torchtitan_npu.simulator.capture.dispatch_capture import OpDispatchCapture
 from torchtitan_npu.simulator.capture.module_path import ModulePathTracker
+from torchtitan_npu.simulator.capture.saved_tensors import AutogradSavedTensorCapture
+from torchtitan_npu.simulator.capture.step_boundary import StepBoundaryTracker
 from torchtitan_npu.simulator.hardware_shims.grouped_experts_shim import (
     run_meta_grouped_experts,
 )
@@ -35,6 +46,9 @@ from torchtitan_npu.simulator.meta_env import (
     patch_device_type_to_meta,
     unpatch_device_type_to_meta,
 )
+from torchtitan_npu.simulator.memory.estimator import estimate_static_memory
+from torchtitan_npu.simulator.selective_ac import synthetic_ac_save_patterns
+from torchtitan_npu.simulator.synthetic_ac import synthetic_ac_policy_context
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -96,6 +110,151 @@ def test_meta_all_to_all_is_replayed_during_backward():
     ]
     assert tensor.grad is not None
     assert tensor.grad.shape == tensor.shape
+
+
+def _capture_checkpointed_meta_all_to_all(
+    *, save: bool, offload: bool, fp8_dispatch: bool
+):
+    class EPBlock(nn.Module):
+        def forward(self, tensor: torch.Tensor) -> torch.Tensor:
+            run_all_to_all = (
+                run_meta_fp8_dispatch_all_to_all
+                if fp8_dispatch
+                else run_meta_all_to_all
+            )
+            return run_all_to_all(tensor, dist.group.WORLD).square()
+
+    model = nn.Sequential(
+        checkpoint_wrapper(
+            EPBlock(),
+            context_fn=lambda: create_selective_checkpoint_contexts(
+                lambda _ctx, _op, *_args, **_kwargs: CheckpointPolicy.PREFER_RECOMPUTE
+            ),
+            preserve_rng_state=False,
+        )
+    )
+    assert install_checkpoint_execution_tracking([model]) == 1
+    boundary = StepBoundaryTracker()
+    tracker = ModulePathTracker(model)
+    capture = OpDispatchCapture(
+        module_path_tracker=tracker,
+        phase_provider=lambda: boundary.current_phase,
+    )
+    tensor = torch.empty(
+        (8, 64 if fp8_dispatch else 4),
+        device="meta",
+        dtype=torch.bfloat16 if fp8_dispatch else torch.float32,
+        requires_grad=True,
+    )
+    previous_device_type = DefaultDeviceType.get_device_type()
+    DefaultDeviceType.set_device_type("meta")
+    try:
+        with (
+            synthetic_ac_policy_context(
+                synthetic_ac_save_patterns(["all-to-all"] if save else ["none"])
+            ),
+            capture_fake_collectives() as recorder,
+            boundary,
+            tracker,
+            capture,
+            AutogradSavedTensorCapture(),
+        ):
+            model(tensor).sum().backward()
+    finally:
+        DefaultDeviceType.set_device_type(previous_device_type)
+    capture.finalize_autograd_saved_tensors()
+    plan = estimate_static_memory(
+        capture.memory_events(),
+        model_parts=[model],
+        checkpoint_boundary_events=capture.checkpoint_boundary_events(),
+        autograd_saved_tensor_events=capture.autograd_saved_tensor_events(),
+        offload_ac_saved_tensors=offload,
+    )
+    assert tensor.grad is not None
+    return capture, recorder, plan
+
+
+@pytest.mark.parametrize("offload", [False, True])
+@pytest.mark.parametrize("fp8_dispatch", [False, True])
+def test_simulator_selective_all_to_all_saves_recompute_traffic_and_activation(
+    offload, fp8_dispatch
+):
+    baseline_capture, baseline_recorder, baseline_plan = (
+        _capture_checkpointed_meta_all_to_all(
+            save=False, offload=offload, fp8_dispatch=fp8_dispatch
+        )
+    )
+    saved_capture, saved_recorder, saved_plan = (
+        _capture_checkpointed_meta_all_to_all(
+            save=True, offload=offload, fp8_dispatch=fp8_dispatch
+        )
+    )
+
+    def execution_counts(capture):
+        kinds = [
+            node.annotations["execution_kind"]
+            for node in capture.build_nodes().values()
+            if node.annotations["raw_op_type"] == "comm.all_to_all"
+        ]
+        return {kind: kinds.count(kind) for kind in set(kinds)}
+
+    forward_count = 2 if fp8_dispatch else 1
+    assert execution_counts(baseline_capture) == {
+        "original_forward": forward_count,
+        "recompute": forward_count,
+        "backward": 1,
+    }
+    assert execution_counts(saved_capture) == {
+        "original_forward": forward_count,
+        "backward": 1,
+    }
+    assert len(baseline_recorder.events) == 2 * forward_count + 1
+    assert len(saved_recorder.events) == forward_count + 1
+    assert baseline_plan.to_summary_dict()["checkpoint_recompute_saved_tensor_count"] == 0
+
+    saved = [
+        lifetime
+        for lifetime in saved_plan.tensor_lifetimes
+        if lifetime.producer_raw_op == "comm.all_to_all"
+        and lifetime.producer_phase == "forward"
+    ]
+    assert len(saved) == 1
+    saved_bytes = 8 * (64 if fp8_dispatch else 4) * (2 if fp8_dispatch else 4)
+    assert saved[0].kind == "checkpoint_saved_for_recompute"
+    assert saved[0].num_bytes == saved_bytes
+    assert saved[0].resident_num_bytes == (0 if offload else saved_bytes)
+    assert saved[0].residency_policy == ("offloaded" if offload else "resident")
+
+    summary = saved_plan.to_summary_dict()
+    assert summary["checkpoint_recompute_saved_tensor_count"] == 1
+    assert summary["checkpoint_recompute_saved_logical_bytes"] == saved_bytes
+    assert summary["checkpoint_recompute_saved_modeled_bytes"] == (
+        0 if offload else saved_bytes
+    )
+    assert any(
+        item.role == "recompute_saved"
+        and item.num_bytes == saved_bytes
+        and item.modeled_num_bytes == (0 if offload else saved_bytes)
+        for item in saved_plan.checkpoint_tensors
+    )
+    baseline_prefetch = baseline_plan.to_summary_dict()["checkpoint_prefetch"]
+    saved_prefetch = summary["checkpoint_prefetch"]
+    assert sum(
+        marker["prefetch_logical_bytes_total"] for marker in saved_prefetch.values()
+    ) == saved_bytes + sum(
+        marker["prefetch_logical_bytes_total"] for marker in baseline_prefetch.values()
+    )
+    assert sum(
+        marker["recompute_saved_logical_bytes_per_instance"]
+        for marker in saved_prefetch.values()
+    ) == saved_bytes
+    if offload:
+        assert summary["activation_offload_logical_bytes"] >= saved_bytes
+    assert any(
+        event.raw_op_type == "simulator.synthetic_ac_cache_hit[comm.all_to_all]"
+        and event.execution_kind == "recompute"
+        for event in saved_capture.memory_events()
+    )
 
 
 def test_meta_fp8_dispatch_uses_payload_and_scale_only_in_forward():

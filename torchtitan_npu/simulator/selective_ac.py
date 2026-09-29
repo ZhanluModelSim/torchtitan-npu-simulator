@@ -10,11 +10,13 @@ from __future__ import annotations
 import threading
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import Any, Iterator, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import torch
 import torchtitan.distributed.activation_checkpoint as activation_checkpoint
 
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 SelectiveACSaveOp = Literal[
     "full",
@@ -27,6 +29,7 @@ SelectiveACSaveOp = Literal[
     "gmm",
     "quant-mm",
     "comm",
+    "all-to-all",
     "max",
 ]
 
@@ -40,6 +43,7 @@ _FULL_CHOICES = frozenset(
         "gmm",
         "quant-mm",
         "comm",
+        "all-to-all",
         "max",
     }
 )
@@ -69,10 +73,9 @@ _SYNTHETIC_ATTENTION_SAVE_PATTERNS = (
     "triton_ascend_kernels.chunk_kda",
     "fusion_attention",
 )
+_SYNTHETIC_ALL_TO_ALL_SAVE_PATTERN = "comm.all_to_all"
 _PATCH_LOCK = threading.RLock()
-_explicit_selection_active: ContextVar[bool] = ContextVar(
-    "simulator_explicit_selective_ac_save_ops", default=False
-)
+_explicit_selection_active: ContextVar[bool] = ContextVar("simulator_explicit_selective_ac_save_ops", default=False)
 
 
 def has_explicit_selective_ac_save_ops() -> bool:
@@ -96,18 +99,13 @@ def _resolve_ops(paths: tuple[str, ...]) -> set[Any]:
 def _compute_intensive_ops() -> set[Any]:
     from torch._functorch.partitioners import get_default_op_list
 
-    return {
-        op.default
-        for op in get_default_op_list().compute_intensive_ops
-    }
+    return {op.default for op in get_default_op_list().compute_intensive_ops}
 
 
 def _validate_selection(save_ops: list[SelectiveACSaveOp]) -> None:
     selected = set(save_ops)
     if "none" in selected and len(selected) != 1:
-        raise ValueError(
-            "simulation.selective_ac_save_ops 'none' must be used alone"
-        )
+        raise ValueError("simulation.selective_ac_save_ops 'none' must be used alone")
 
 
 def _normalized_selection(save_ops: list[SelectiveACSaveOp]) -> set[SelectiveACSaveOp]:
@@ -129,9 +127,10 @@ def synthetic_ac_save_patterns(
     selected = _normalized_selection(save_ops)
     if "none" in selected:
         return ()
-    if "default" in selected or "attention" in selected:
-        return _SYNTHETIC_ATTENTION_SAVE_PATTERNS
-    return ()
+    patterns = _SYNTHETIC_ATTENTION_SAVE_PATTERNS if "default" in selected or "attention" in selected else ()
+    if "comm" in selected or "all-to-all" in selected:
+        patterns += (_SYNTHETIC_ALL_TO_ALL_SAVE_PATTERN,)
+    return patterns
 
 
 def _selected_save_ops(
@@ -176,6 +175,7 @@ def selective_ac_save_ops_context(
         )
 
     with _PATCH_LOCK:
+
         def _get_selected_save_ops() -> set[Any]:
             return _selected_save_ops(save_ops, set(original_get_save_ops()))
 

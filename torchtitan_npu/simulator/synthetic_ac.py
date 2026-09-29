@@ -12,10 +12,12 @@ from collections import defaultdict
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from fnmatch import fnmatchcase
-from typing import Any, Callable, Iterator
+from typing import TYPE_CHECKING, Any
 
-import torch
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterator
 
+    import torch
 
 _save_patterns: ContextVar[tuple[str, ...]] = ContextVar(
     "simulator_synthetic_ac_save_patterns",
@@ -27,9 +29,7 @@ _save_patterns: ContextVar[tuple[str, ...]] = ContextVar(
 class _SyntheticACSession:
     save_patterns: tuple[str, ...]
     cached_outputs: dict[tuple[str, str, int], Any] = field(default_factory=dict)
-    occurrence_by_op: dict[tuple[str, str], int] = field(
-        default_factory=lambda: defaultdict(int)
-    )
+    occurrence_by_op: dict[tuple[str, str], int] = field(default_factory=lambda: defaultdict(int))
     is_recompute: bool = False
 
     def begin_pass(self, *, is_recompute: bool) -> None:
@@ -70,12 +70,12 @@ class SyntheticACPassContext(contextlib.AbstractContextManager):
         self._is_recompute = is_recompute
         self._tokens: list[Any] = []
 
-    def __enter__(self) -> "SyntheticACPassContext":
+    def __enter__(self) -> SyntheticACPassContext:
         self._session.begin_pass(is_recompute=self._is_recompute)
         self._tokens.append(_active_session.set(self._session))
         return self
 
-    def __exit__(self, exc_type, exc_value, traceback) -> None:  # noqa: ANN001
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
         _active_session.reset(self._tokens.pop())
 
 
@@ -101,12 +101,14 @@ def run_synthetic_op(
     output_factory: Callable[[], Any],
     module_path: str = "",
     attrs: dict[str, Any] | None = None,
+    record_op: bool = True,
 ) -> Any:
     """Execute/record a synthetic op, or reuse its saved forward outputs.
 
     Returning the exact forward tensor objects is intentional: the memory
     model uses tensor identity to recognize values retained across activation
-    checkpoint recomputation.
+    checkpoint recomputation. Set ``record_op=False`` when the output factory
+    records its own L0 operation, such as a simulated collective.
     """
     session = _active_session.get()
     should_save = session is not None and session.should_save(raw_op_type)
@@ -138,7 +140,7 @@ def run_synthetic_op(
     from torchtitan_npu.simulator.capture.dispatch_capture import get_active_capture
 
     capture = get_active_capture()
-    if capture is not None:
+    if capture is not None and record_op:
         capture.record_synthetic_op(
             raw_op_type,
             inputs=inputs,
