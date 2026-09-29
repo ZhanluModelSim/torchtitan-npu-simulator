@@ -313,14 +313,17 @@ backward 中重放。可通过
 
 可选值会显示在 CLI help 中：`full`、`none`、`default`、`compute-intensive`、
 `attention`、`linear`、`mm`、`gmm`、`quant-mm`、`comm`、`all-to-all`、`max`。`full` 是除
-`none` 外所有类别的便捷别名；`none` 必须单独使用；`default` 复用上游默认集合。
+`none` 和需单独开启的 `all-to-all` 外其他类别的便捷别名；`none` 必须单独使用；
+`default` 复用上游默认集合。
 即使选择了 `full`，`mm` 和 `linear` 仍保留上游的交替重计算策略；其余类别命中后
 保存输出。未传该参数时保持模型原有 policy。
 
 `all-to-all` 仅控制 simulator 在 fake EP 下生成的 `comm.all_to_all`：保存原始前向
 的模拟通信输出，重计算时复用，从而删去对应的重计算通信事件；正常反向的梯度
-AllToAll 仍会记录。显式选择 `comm` 或 `full` 也会保存该模拟输出；`default` 不会改变
-这一模拟路径。若要保留上游默认保存策略并额外保存模拟 AllToAll，使用
+AllToAll 仍会记录。`comm`、`default` 和 `full` 均不会保存这一模拟输出，必须显式
+选择 `all-to-all`。`comm` 和 `default` 仍可包含上游的
+`_c10d_functional.all_to_all_single`，它与 fake EP 的 `comm.all_to_all` 是不同的
+保存目标。若要保留上游默认保存策略并额外保存模拟 AllToAll，使用
 `--simulation.selective-ac-save-ops default all-to-all`。此选项不会修改真实 NPU 的
 通信实现或 TorchTitan 的训练策略。对于 DeepSeek V4，若还要保留模型自己的 GMM 和
 量化 matmul 保存扩展，则使用 `default gmm quant-mm all-to-all`。保存输出

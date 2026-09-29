@@ -33,6 +33,7 @@ SelectiveACSaveOp = Literal[
     "max",
 ]
 
+# Fake EP all-to-all must be selected explicitly, even when "full" is used.
 _FULL_CHOICES = frozenset(
     {
         "default",
@@ -43,7 +44,6 @@ _FULL_CHOICES = frozenset(
         "gmm",
         "quant-mm",
         "comm",
-        "all-to-all",
         "max",
     }
 )
@@ -128,7 +128,7 @@ def synthetic_ac_save_patterns(
     if "none" in selected:
         return ()
     patterns = _SYNTHETIC_ATTENTION_SAVE_PATTERNS if "default" in selected or "attention" in selected else ()
-    if "comm" in selected or "all-to-all" in selected:
+    if "all-to-all" in selected:
         patterns += (_SYNTHETIC_ALL_TO_ALL_SAVE_PATTERN,)
     return patterns
 

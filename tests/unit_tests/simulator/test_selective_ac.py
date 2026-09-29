@@ -21,9 +21,11 @@ def test_none_is_exclusive_selective_ac_save_ops():
             pass
 
 
-def test_full_expands_to_all_selectable_save_op_categories():
+def test_full_excludes_explicit_simulator_all_to_all_choice():
     assert _normalized_selection(["full"]) == set(_FULL_CHOICES)
     assert _normalized_selection(["full", "gmm"]) == set(_FULL_CHOICES)
+    assert "all-to-all" not in _normalized_selection(["full"])
+    assert "all-to-all" in _normalized_selection(["full", "all-to-all"])
 
     original_context_factory = activation_checkpoint.create_selective_checkpoint_contexts
     with selective_ac_save_ops_context(["full"]):
@@ -63,12 +65,12 @@ def test_non_attention_choices_recompute_synthetic_attention_ops(selection):
     assert synthetic_ac_save_patterns(selection) == ()
 
 
-@pytest.mark.parametrize("selection", [["all-to-all"], ["comm"], ["full"]])
-def test_simulator_communication_choices_save_all_to_all(selection):
+@pytest.mark.parametrize("selection", [["all-to-all"], ["comm", "all-to-all"], ["full", "all-to-all"]])
+def test_explicit_simulator_all_to_all_choice_saves_all_to_all(selection):
     assert "comm.all_to_all" in synthetic_ac_save_patterns(selection)
 
 
-@pytest.mark.parametrize("selection", [None, ["default"], ["gmm"], ["none"]])
+@pytest.mark.parametrize("selection", [None, ["default"], ["comm"], ["full"], ["gmm"], ["none"]])
 def test_other_choices_do_not_save_simulator_all_to_all(selection):
     assert "comm.all_to_all" not in synthetic_ac_save_patterns(selection)
 
