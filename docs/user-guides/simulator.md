@@ -380,6 +380,12 @@ DeepSeek-V4 仿真还可以评估 Embedding 和第 0 层权重常驻副本的方
 | `memory_actions.csv` | `mem`；PP 调度 action 与展开后内存事件区间的映射；非 PP 不生成 |
 | `memory_trace.json` | `mem`；可由 Chrome Trace 或 Perfetto 打开的阶段趋势图 |
 
+别名去重按 ATen view 算子的精确名称识别，不以 `permute`、`slice` 等子串判断。
+MoE token permutation 的路由输出、排序索引以及 `slice_backward` 等分配型算子
+分别计入独立 tensor；真正的 view/transpose/split 则保留与原 tensor 的别名关系。
+AC `none` 下可用 `autograd_saved_tensors.csv` 核对实际 save/unpack，再与
+`activation_offload_tensors.csv` 对照；`requires_grad` 本身不代表需要保存或卸载。
+
 可通过两个独立开关调整内存建模假设：
 
 ```bash

@@ -7,47 +7,47 @@
 
 from __future__ import annotations
 
-from torchtitan_npu.simulator.memory.records import RawMemoryEvent
+from typing import TYPE_CHECKING
 
-_ALIAS_TOKENS = (
-    "view",
-    "reshape",
-    "transpose",
-    "permute",
-    "slice",
-    "select",
-    "split",
-    "narrow",
-    "as_strided",
-    "squeeze",
-    "unsqueeze",
-    "detach",
-    ".t.default",
-)
+if TYPE_CHECKING:
+    from torchtitan_npu.simulator.memory.records import RawMemoryEvent
 
-_ALLOC_TOKENS = (
-    "clone",
-    "contiguous",
-    "empty",
-    "zeros",
-    "ones",
-    "randn",
-    "rand",
-    "cat",
-    "stack",
+# These operators alias their first tensor input. Match namespace and exact
+# operator name: token_permute, slice_backward and view_copy allocate storage.
+# Conditional views such as reshape are captured as view or clone + _unsafe_view.
+_ALIAS_OPERATORS = frozenset(
+    {
+        "aten._reshape_alias",
+        "aten._unsafe_view",
+        "aten.as_strided",
+        "aten.detach",
+        "aten.narrow",
+        "aten.permute",
+        "aten.select",
+        "aten.slice",
+        "aten.split",
+        "aten.split_with_sizes",
+        "aten.squeeze",
+        "aten.t",
+        "aten.transpose",
+        "aten.unsqueeze",
+        "aten.view",
+        "aten.view_as_complex",
+        "aten.view_as_real",
+    }
 )
 
 
 def is_alias_event(event: RawMemoryEvent) -> bool:
     if not event.inputs or not event.outputs:
         return False
-    raw = event.raw_op_type.lower()
-    if any(token in raw for token in _ALLOC_TOKENS):
-        return False
-    if any(token in raw for token in _ALIAS_TOKENS):
+    operator = ".".join(event.raw_op_type.replace("::", ".").split(".")[:2])
+    if operator in _ALIAS_OPERATORS:
         return True
     input_ids = {ref.tensor_id for ref in event.inputs}
-    return any(ref.tensor_id in input_ids for ref in event.outputs)
+    # Identity-preserving outputs do not prove that other outputs are aliases.
+    # The estimator handles each unchanged input/output ID as a mutation.
+    return all(ref.tensor_id in input_ids for ref in event.outputs)
 
 
 def is_mutation_event(event: RawMemoryEvent) -> bool:

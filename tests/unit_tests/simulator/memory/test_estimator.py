@@ -985,6 +985,115 @@ def test_repeat_allocates_distinct_storage_instead_of_matching_t_alias_rule():
     assert lifetime.num_bytes == 64
 
 
+@pytest.mark.parametrize("raw_op", [
+    "npu.npu_moe_token_permute.default",
+    "npu.npu_moe_token_permute_grad.default",
+    "npu._npu_moe_token_unpermute_with_routing_map.default",
+    "npu.npu_moe_token_unpermute_with_routing_map_grad.default",
+    "aten.slice_backward.default",
+    "aten.select_backward.default",
+    "aten.index_select.default",
+    "aten.masked_select.default",
+    "aten.view_copy.default",
+    "aten.slice_scatter.default",
+    "aten.select_scatter.default",
+    "aten.as_strided_scatter.default",
+    "custom.permute.default",
+])
+def test_view_name_fragments_do_not_alias_allocating_outputs(raw_op):
+    plan = estimate_static_memory([
+        event(0, 10, raw_op, inputs=[tref(1)], outputs=[tref(2, 64), tref(3, 32)]),
+    ])
+    lifetimes = {item.tensor_id: item for item in plan.tensor_lifetimes}
+    assert lifetimes["tensor:2"].num_bytes == 64
+    assert lifetimes["tensor:3"].num_bytes == 32
+    assert not any(item.kind == "alias" for item in plan.tensor_lifetimes)
+
+
+@pytest.mark.parametrize("raw_op", [
+    "aten.view.default", "aten._unsafe_view.default", "aten._reshape_alias.default",
+    "aten.view_as_real.default", "aten.view_as_complex.default", "aten.t.default",
+    "aten.transpose.int", "aten.permute.default", "aten.slice.Tensor",
+    "aten.select.int", "aten.narrow.default", "aten.as_strided.default",
+    "aten.squeeze.dim", "aten.unsqueeze.default", "aten.detach.default",
+    "aten.split.Tensor", "aten.split_with_sizes.default", "aten::view",
+])
+def test_exact_view_operators_preserve_base_and_backward_lifetime(raw_op):
+    source, base, first, second = tref(1), tref(2, 64), tref(3, 32), tref(4, 32)
+    outputs = [first, second] if "split" in raw_op else [first]
+    plan = estimate_static_memory([
+        event(0, 10, "aten.clone.default", inputs=[source], outputs=[base]),
+        event(1, 11, raw_op, inputs=[base], outputs=outputs),
+        event(5, 12, "aten.sum.default", inputs=[outputs[-1]], phase="backward"),
+    ])
+    lifetimes = {item.tensor_id: item for item in plan.tensor_lifetimes}
+    assert lifetimes["tensor:2"].death_seq == 5
+    assert lifetimes["tensor:2"].num_bytes == 64
+    for output in outputs:
+        alias = lifetimes[f"alias:{output.tensor_id}"]
+        assert alias.alias_of == "tensor:2"
+        assert alias.num_bytes == 0
+
+
+def test_identity_output_does_not_alias_independent_sibling():
+    source, result = tref(1), tref(2, 64)
+    plan = estimate_static_memory([
+        event(0, 10, "custom.update.default", inputs=[source], outputs=[source, result]),
+    ])
+    lifetimes = {item.tensor_id: item for item in plan.tensor_lifetimes}
+    assert lifetimes["external:1"].kind == "external_input"
+    assert lifetimes["tensor:2"].num_bytes == 64
+    assert lifetimes["tensor:2"].alias_of == ""
+
+
+@pytest.mark.parametrize("copy_required", [False, True])
+def test_captured_reshape_accounts_for_actual_copy(copy_required):
+    capture = OpDispatchCapture()
+    with capture:
+        source = torch.empty(2, 3, device="meta")
+        reshaped = (source.t() if copy_required else source).reshape(6)
+        reshaped.sum()
+    assert (source.untyped_storage()._cdata != reshaped.untyped_storage()._cdata) == copy_required
+    plan = estimate_static_memory(capture.memory_events())
+    allocated = [item for item in plan.tensor_lifetimes if item.kind != "alias"]
+    # Source, optional clone for a noncontiguous reshape, and scalar sum.
+    assert sum(item.num_bytes for item in allocated) == 24 * (1 + copy_required) + 4
+
+
+@pytest.mark.parametrize("offload", [False, True])
+def test_routed_gmm_input_and_indices_remain_independent_saved_storages(offload, tmp_path):
+    source, routed, indices = tref(2, 32), tref(3, 64), tref(4, 8)
+    saved = [
+        AutogradSavedTensorEvent(
+            slot_id=slot, tensor_id=ref.tensor_id, storage_key=f"storage-{ref.tensor_id}",
+            storage_bytes=ref.num_bytes, num_bytes=ref.num_bytes, shape=ref.shape,
+            dtype=ref.dtype, pack_seq=2, unpack_seq=5, phase="forward",
+            execution_kind="original_forward", module_path="layers.0.moe.experts",
+        )
+        for slot, ref in enumerate((source, routed, indices))
+    ]
+    plan = estimate_static_memory([
+        event(0, 10, "aten.clone.default", inputs=[tref(1, 32)], outputs=[source]),
+        event(1, 11, "npu.npu_moe_token_permute.default", inputs=[source], outputs=[routed, indices]),
+        event(2, 12, "aten._grouped_mm.default", inputs=[routed]),
+        event(5, 13, "aten._grouped_mm.default", inputs=[routed, indices, source], phase="backward"),
+    ], autograd_saved_tensor_events=saved, offload_ac_saved_tensors=offload)
+    lifetimes = {item.tensor_id: item for item in plan.tensor_lifetimes}
+    for ref in (source, routed, indices):
+        lifetime = lifetimes[f"tensor:{ref.tensor_id}"]
+        assert lifetime.num_bytes == ref.num_bytes
+        assert lifetime.resident_num_bytes == (0 if offload else ref.num_bytes)
+        assert lifetime.death_seq == 5
+    if offload:
+        import csv
+
+        export_memory_plan(plan, str(tmp_path))
+        with (tmp_path / "memory" / "activation_offload_tensors.csv").open() as f:
+            records = {row["tensor_id"]: row for row in csv.DictReader(f)}
+        assert set(records) == {"tensor:2", "tensor:3", "tensor:4"}
+        assert int(records["tensor:3"]["num_bytes"]) == 64
+
+
 def test_parameter_alias_is_not_counted_as_external_input():
     model = nn.Linear(4, 8, device="meta")
     capture = OpDispatchCapture()
