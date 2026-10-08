@@ -302,7 +302,7 @@ def build_schedule_plan(
         for i, a in enumerate(plan_obj[rank]):
             actions.append(map_action(a, i))
     else:
-        # non-PP: one action per captured template, ordered F < B < OPTIMIZER
+        # Non-PP: preserve the captured order of microbatch compute instances.
         specs = NonPipelineTraceAssembler(
             step_templates=step_templates,
             fsdp_residency_events=fsdp_residency_events,
@@ -321,7 +321,7 @@ def build_schedule_plan(
                     action_id=f"r{rank}_a{action_id}",
                     rank=rank,
                     stage=rank,
-                    mb_idx=0,
+                    mb_idx=spec.mb_idx,
                     action_type=spec.action_type,
                     comp_type=spec.comp_type,
                     template_ref=spec.template_ref,

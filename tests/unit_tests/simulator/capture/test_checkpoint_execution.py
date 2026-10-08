@@ -315,7 +315,7 @@ def test_full_checkpoint_boundary_input_stays_live_until_backward_unpack():
         and event.unpack_seq >= 0
     )
 
-    assert saved.death_seq == unpack_seq
+    assert saved.death_seq == max(unpack_seq, *saved.consumer_seqs)
     assert saved.death_seq > max(
         event.seq_idx
         for event in capture.memory_events()
@@ -334,6 +334,6 @@ def test_full_checkpoint_boundary_input_stays_live_until_backward_unpack():
         for item in offloaded_plan.tensor_lifetimes
         if item.kind == "checkpoint_saved_activation"
     )
-    assert offloaded.death_seq == unpack_seq
+    assert offloaded.death_seq == max(unpack_seq, *offloaded.consumer_seqs)
     assert offloaded.residency_policy == "offloaded"
     assert offloaded.resident_num_bytes == 0

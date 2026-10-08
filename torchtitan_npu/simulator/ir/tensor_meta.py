@@ -19,3 +19,7 @@ class TensorMeta:
     dtype: str
     device: str
     is_parameter: bool = False
+
+    stride: tuple[int, ...] = ()
+    storage_offset: int = 0
+    layout: str = "torch.strided"

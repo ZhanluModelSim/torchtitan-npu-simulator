@@ -725,12 +725,13 @@ class NonPipelineTraceAssembler:
         ordered_templates = sorted(
             self.step_templates.items(),
             key=lambda item: (
+                min((node.seq_idx for node in item[1].nodes.values()), default=0),
                 self._STEP_ORDER.get(self._comp_type(item[1].step_type), 9),
                 item[0],
             ),
         )
         specs: list[ActionSpec] = []
-        compute_by_type: dict[str, ActionSpec] = {}
+        compute_by_type: dict[tuple[int, str], ActionSpec] = {}
         compute_by_instance: dict[str, ActionSpec] = {}
         for schedule_order, (template_id, template) in enumerate(
             ordered_templates
@@ -741,13 +742,19 @@ class NonPipelineTraceAssembler:
             seqs = [node.seq_idx for node in template.nodes.values()]
             start_seq = min(seqs, default=0)
             end_seq = max(seqs, default=start_seq)
-            instance_id = f"nonpp:r{self.rank}:{template_id}:mb0"
+            microbatches = {int(node.annotations.get("pp_mb_idx", 0)) for node in template.nodes.values()}
+            if len(microbatches) > 1:
+                raise ValueError(f"Non-PP template {template_id} combines multiple microbatches")
+            microbatch = next(iter(microbatches), 0)
+            if comp_type == "OPTIMIZER":
+                microbatch = 0
+            instance_id = f"nonpp:r{self.rank}:{template_id}:mb{microbatch}"
             spec = ActionSpec(
                 action_type=(
                     "OPTIMIZER" if comp_type == "OPTIMIZER" else "COMPUTE"
                 ),
                 stage=self.rank,
-                mb_idx=0,
+                mb_idx=microbatch,
                 seq_idx=start_seq,
                 order_key=(schedule_order, 0, 0),
                 comp_type=comp_type,
@@ -760,7 +767,7 @@ class NonPipelineTraceAssembler:
                 },
             )
             specs.append(spec)
-            compute_by_type.setdefault(comp_type, spec)
+            compute_by_type.setdefault((microbatch, comp_type), spec)
             compute_by_instance[instance_id] = spec
 
         merged_events: dict[
@@ -770,13 +777,13 @@ class NonPipelineTraceAssembler:
             if event.action not in {"alloc", "free"}:
                 continue
             comp_type = "B" if event.phase.lower() == "backward" else "F"
-            parent = compute_by_type.get(comp_type)
+            parent = compute_by_type.get((max(0, event.pp_mb_idx), comp_type))
             if parent is None:
                 continue
             normalized = replace(
                 event,
                 pp_stage=self.rank,
-                pp_mb_idx=0,
+                pp_mb_idx=parent.mb_idx,
                 comp_type=comp_type,
                 parent_compute_instance_id=str(
                     parent.annotations["compute_instance_id"]

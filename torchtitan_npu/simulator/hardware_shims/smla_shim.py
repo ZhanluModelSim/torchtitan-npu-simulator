@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import torch
 
-from torchtitan_npu.converters.kernels.npu_smla import _add_offset_to_valid_sparse_indices
 from torchtitan_npu.models.deepseek_v4.model import LiCompute, LiLoss, SparseAttention
 from torchtitan_npu.simulator.capture.dispatch_capture import get_active_capture
 from torchtitan_npu.simulator.synthetic_ac import run_synthetic_op
@@ -63,13 +62,13 @@ class _SimSparseAttnFn(torch.autograd.Function):
             module_path=module_path,
         )
 
-        ctx.save_for_backward(query, ori_kv, cmp_kv, result, softmax_lse, sinks)
+        ctx.save_for_backward(query, ori_kv, cmp_kv, result, softmax_lse, sinks, cmp_sparse_indices)
         ctx.module_path = module_path
         return result
 
     @staticmethod
     def backward(ctx, grad_result):  # noqa: ANN001
-        query, ori_kv, cmp_kv, result, softmax_lse, sinks = ctx.saved_tensors
+        query, ori_kv, cmp_kv, result, softmax_lse, sinks, cmp_sparse_indices = ctx.saved_tensors
         dquery = torch.empty_like(query)
         dori_kv = torch.empty_like(ori_kv)
         dsinks = torch.empty_like(sinks)
@@ -78,6 +77,8 @@ class _SimSparseAttnFn(torch.autograd.Function):
         bwd_inputs = [query, ori_kv, result, softmax_lse, sinks, grad_result]
         if cmp_kv is not None:
             bwd_inputs.append(cmp_kv)
+        if cmp_sparse_indices is not None:
+            bwd_inputs.append(cmp_sparse_indices)
         bwd_outputs = [dquery, dori_kv, dsinks]
         if dcmp_kv is not None:
             bwd_outputs.append(dcmp_kv)
@@ -149,6 +150,8 @@ class SimNpuLiCompute(LiCompute):
         weights = weights.to(torch.bfloat16)
         module_path = _current_module_path()
         compress_topk_idxs, index_score = _SimLightningIndexerFn.apply(q_indexer, k_indexer, weights, self.index_topk, module_path)
+        from torchtitan_npu.converters.kernels.npu_smla import _add_offset_to_valid_sparse_indices
+
         compress_topk_idxs = _add_offset_to_valid_sparse_indices(compress_topk_idxs, offset)
         return compress_topk_idxs, index_score
 
@@ -187,10 +190,9 @@ class SimNpuLiLoss(LiLoss):
     computation" pattern: forward returns a zero scalar immediately with no hardware call;
     the real ACLNN kernel only fires in backward. `_SimLiLossFn` replicates this exactly.
 
-    Note: subclassing `LiLoss` and defining `forward` here means Python's MRO always resolves
-    a `SimNpuLiLoss` instance's `.forward()` to this method, never to the real base `LiLoss.
-    forward` (even though `meta_env._patch_li_loss_to_skip_buggy_einsum` patches that base
-    method elsewhere) -- no interaction or conflict with that existing patch."""
+    The simulator rejects unconverted base `LiLoss` because its forward cannot be
+    faithfully captured. This override remains supported and records its deferred
+    backward inputs through `_SimLiLossFn`."""
 
     def __init__(self, parent: "LiLoss") -> None:
         self.__dict__.update(parent.__dict__)

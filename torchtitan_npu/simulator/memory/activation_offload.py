@@ -120,11 +120,17 @@ class ActivationOffloadPlugin(MemoryModelPlugin):
             "checkpoint_recompute_temp",
         }
         chosen_by_storage: dict[str, tuple[AutogradSavedTensorEvent, TensorLifetime]] = {}
+        capture_end = max((event.seq_idx for event in context.events), default=0) + 1
+
+        def saved_last_use(saved: AutogradSavedTensorEvent) -> int:
+            # An unconsumed save has no observed release, including truncated
+            # captures and retained graphs. Keep it live through the capture.
+            return saved.unpack_seq if saved.unpack_seq >= 0 else capture_end
+
         for saved in context.autograd_saved_tensors:
             if (
                 saved.phase != "forward"
                 or saved.execution_kind != "original_forward"
-                or saved.unpack_seq < 0
             ):
                 continue
             tensor_id = _resolve_alias(saved.tensor_id, context.alias_base_by_tensor_id)
@@ -132,15 +138,15 @@ class ActivationOffloadPlugin(MemoryModelPlugin):
             if lifetime is None or lifetime.kind in excluded_kinds:
                 continue
             existing = chosen_by_storage.get(saved.storage_key)
-            if existing is None or saved.unpack_seq > existing[0].unpack_seq:
+            if existing is None or saved_last_use(saved) > saved_last_use(existing[0]):
                 chosen_by_storage[saved.storage_key] = (saved, lifetime)
 
         selected_tensor_ids = {
             _resolve_alias(saved.tensor_id, context.alias_base_by_tensor_id)
             for saved, _lifetime in chosen_by_storage.values()
         }
-        released_count = 0
-        released_bytes = 0
+        retained_count = 0
+        retained_bytes = 0
         for tensor_id, lifetime in context.lifetimes_by_tensor_id.items():
             if (
                 lifetime.producer_phase != "forward"
@@ -149,24 +155,18 @@ class ActivationOffloadPlugin(MemoryModelPlugin):
                 or tensor_id in selected_tensor_ids
             ):
                 continue
-            forward_seqs = [
-                seq_idx
-                for seq_idx, phase in zip(
-                    lifetime.consumer_seqs,
-                    lifetime.consumer_phases,
-                    strict=True,
-                )
-                if phase == "forward"
-            ]
-            lifetime.death_seq = max([lifetime.birth_seq, *forward_seqs])
-            lifetime.kind = "temporary"
-            lifetime.reason = "not_autograd_saved"
-            released_count += 1
-            released_bytes += lifetime.num_bytes
+            # Slots observe save_for_backward, not ordinary Python references.
+            # A recorded backward consumer is positive retention evidence.
+            lifetime.reason = "backward_use_without_saved_slot"
+            retained_count += 1
+            retained_bytes += lifetime.num_bytes
 
         recorded: set[int] = set()
         for saved, lifetime in chosen_by_storage.values():
-            lifetime.death_seq = max(lifetime.birth_seq, saved.unpack_seq)
+            lifetime.death_seq = max(
+                lifetime.death_seq, lifetime.birth_seq, saved_last_use(saved),
+                *lifetime.consumer_seqs,
+            )
             lifetime.kind = "activation"
             lifetime.reason = "autograd_saved_tensor"
             if context.offload_ac_saved_tensors:
@@ -226,11 +226,11 @@ class ActivationOffloadPlugin(MemoryModelPlugin):
             f"{len(chosen_by_storage)} unique saved storages "
             f"({selected_bytes} logical bytes) for normal backward."
         )
-        if released_count:
+        if retained_count:
             context.notes.append(
-                "Autograd saved-tensor capture released "
-                f"{released_count} use-def-only forward tensors "
-                f"({released_bytes} bytes) at their final forward consumer."
+                "Autograd saved-tensor capture retained "
+                f"{retained_count} forward tensors with observed backward use "
+                f"({retained_bytes} bytes) outside saved-tensor slots."
             )
         return []
 

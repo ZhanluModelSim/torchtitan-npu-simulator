@@ -16,24 +16,30 @@ import itertools
 import weakref
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Callable, Iterator
+from typing import TYPE_CHECKING, Any
 
 import torch
+from torch.multiprocessing.reductions import StorageWeakRef
 from torch.utils._python_dispatch import TorchDispatchMode
 
 from torchtitan_npu.simulator.capture.checkpoint_execution import current_execution_kind
-from torchtitan_npu.simulator.capture.module_path import ModulePathTracker
 from torchtitan_npu.simulator.capture.op_mapping import is_metadata_view_op, to_canonical_op_type
 from torchtitan_npu.simulator.capture.tensor_utils import dtype_to_str, tensor_volume_bytes, to_tensor_meta
 from torchtitan_npu.simulator.cost.op_cost_model import OpCostModel
 from torchtitan_npu.simulator.ir.op_node import OpNode
-from torchtitan_npu.simulator.ir.tensor_meta import TensorMeta
 from torchtitan_npu.simulator.memory.records import (
     AutogradSavedTensorEvent,
     CheckpointBoundaryEvent,
     RawMemoryEvent,
     TensorRef,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterator
+
+    from torchtitan_npu.simulator.capture.comm_events import CommEvent
+    from torchtitan_npu.simulator.capture.module_path import ModulePathTracker
+    from torchtitan_npu.simulator.ir.tensor_meta import TensorMeta
 
 _id_counter = itertools.count()
 _seq_counter = itertools.count()
@@ -134,34 +140,37 @@ class _RawEvent:
     extra_annotations: dict[str, Any] | None = None
 
 
-def _shape_signature(event: _RawEvent) -> tuple:
-    # `comp_type` is part of the signature so that a full-backward ("B") op
-    # and an input-grad ("I") / weight-grad ("W") op with identical shapes do
-    # NOT collapse into one repeat_count'd entry — they belong to different
-    # compute-graph templates and must stay distinct in the L0 IR.
-    return (
-        event.raw_op_type,
-        event.module_path,
-        event.phase,
-        event.execution_kind,
-        event.comp_type,
-        event.pp_stage,
-        event.tensor_shape_scope,
-        tuple(tuple(i.shape) for i in event.inputs),
-        tuple(tuple(o.shape) for o in event.outputs),
-        tuple(
-            sorted((str(key), repr(value)) for key, value in (event.attrs or {}).items())
-        ),
-        tuple(
-            sorted(
-                (str(key), repr(value))
-                for key, value in (event.extra_annotations or {}).items()
-            )
-        ),
-    )
+def _operator_attributes(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Bind scalar schema arguments, including omitted defaults, without reading tensor values."""
+    def normalize(value: Any) -> Any:
+        if isinstance(value, torch.Tensor):
+            return {"tensor_argument": True}
+        if isinstance(value, (list, tuple)):
+            return [normalize(item) for item in value]
+        if isinstance(value, dict):
+            return {str(key): normalize(item) for key, item in value.items()}
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        if isinstance(value, complex):
+            return {"real": value.real, "imag": value.imag}
+        return str(value)
+
+    attrs: dict[str, Any] = {}
+    schema = getattr(func, "_schema", None)
+    if schema is None:
+        return {key: normalize(value) for key, value in kwargs.items() if not isinstance(value, torch.Tensor)}
+    for index, argument in enumerate(schema.arguments):
+        value = args[index] if index < len(args) else kwargs.get(argument.name, argument.default_value)
+        if "Tensor" in str(argument.type):
+            continue
+        attrs[argument.name] = normalize(value)
+    return attrs
 
 
-def _to_tensor_ref(tensor: torch.Tensor, name: str, tensor_id: int) -> TensorRef:
+def _to_tensor_ref(
+    tensor: torch.Tensor, name: str, tensor_id: int, *,
+    alias_of: int | None = None, storage_key: str = "", storage_bytes: int = 0,
+) -> TensorRef:
     dtype = dtype_to_str(tensor.dtype)
     shape = tuple(int(d) for d in tensor.shape)
     return TensorRef(
@@ -172,6 +181,9 @@ def _to_tensor_ref(tensor: torch.Tensor, name: str, tensor_id: int) -> TensorRef
         device=str(tensor.device),
         num_bytes=tensor_volume_bytes(shape, dtype),
         requires_grad=tensor.requires_grad,
+        alias_of=alias_of,
+        storage_key=storage_key,
+        storage_bytes=storage_bytes,
     )
 
 
@@ -210,7 +222,11 @@ class OpDispatchCapture(TorchDispatchMode):
         self._mutation_frontier: dict[int, int] = {}
         self._tensor_identities: dict[int, tuple[weakref.ReferenceType[torch.Tensor], int]] = {}
         self._reused_tensor_ids = itertools.count(1)
-        self._last_signature: tuple | None = None
+        self._storage_identities: dict[int, tuple[StorageWeakRef, str]] = {}
+        self._storage_generations = itertools.count()
+        self._saved_value_ids: dict[tuple, int] = {}
+        self._value_aliases: dict[int, int] = {}
+        self._storage_mutation_frontier: dict[str, int] = {}
         self._previous_active_capture: OpDispatchCapture | None = None
         self._capture_l0: bool = True  # pass-through when False (duplicate class)
         # A scoped suppression channel for framework bookkeeping. Unlike
@@ -219,32 +235,37 @@ class OpDispatchCapture(TorchDispatchMode):
         # that represents the whole operation.
         self._dispatch_suppression_scopes: list[str] = []
         self._suppressed_dispatch_counts: dict[tuple[str, str], int] = {}
-        self._pending_comm_links: dict[int, object] = {}  # id(tensor) → CommEvent for dst_entry_op resolution
-        # Per-(stage, comp_type) class dedup: the FIRST occurrence of each
-        # class is captured in full (becomes a StepGraph template), every later
-        # occurrence is a pass-through that only bumps the instance count. This
-        # captures every distinct compute graph once while keeping capture cost
-        # proportional to the number of distinct classes (not num_microbatches).
+        self._pending_comm_links: dict[int, CommEvent] = {}  # id(tensor) → CommEvent for dst_entry_op resolution
+        # All compute classes on a stage share one representative microbatch.
+        # Other microbatches remain pass-through schedule instances.
         self._captured_classes: set[tuple[int, str]] = set()
+        self._representative_microbatches: dict[int, int] = {}
         self._class_instance_counts: dict[tuple[int, str], int] = {}
         self._chunk_class_key: tuple[int, str] | None = None
 
     def begin_chunk(self, class_key: tuple[int, str]) -> None:
         """Mark the start of one pipeline compute chunk (one
         forward_one_chunk / backward_one_chunk / backward_weight_one_chunk
-        call). `class_key = (pp_stage, comp_type)`. If this class has not
-        been captured yet, enable full L0 capture for this chunk; otherwise
-        disable it (pass-through) and bump the class's instance count so
-        the L2 schedule can still instantiate the matching template for
-        this microbatch. Pairs with `end_chunk`."""
+        call). `class_key = (pp_stage, comp_type)`. Capture each compute class
+        from the stage's first forward microbatch so its backward inputs
+        remain paired. Other microbatches pass through while contributing
+        instance counts for L2. Pairs with `end_chunk`."""
+        from torchtitan_npu.simulator.meta_env import _pp_context
+
+        stage, comp_type = class_key
+        microbatch = int(_pp_context.get("mb_idx", 0))
+        if comp_type == "F":
+            self._representative_microbatches.setdefault(stage, microbatch)
+        if stage not in self._representative_microbatches:
+            raise ValueError(f"Cannot capture {class_key} without a paired forward microbatch")
         self._chunk_class_key = class_key
-        if class_key in self._captured_classes:
-            self._capture_l0 = False
-            self._class_instance_counts[class_key] = self._class_instance_counts.get(class_key, 1) + 1
-        else:
+        self._class_instance_counts[class_key] = self._class_instance_counts.get(class_key, 0) + 1
+        self._capture_l0 = (
+            microbatch == self._representative_microbatches[stage]
+            and class_key not in self._captured_classes
+        )
+        if self._capture_l0:
             self._captured_classes.add(class_key)
-            self._capture_l0 = True
-            self._class_instance_counts[class_key] = 1
 
     def end_chunk(self) -> None:
         """Mark the end of a compute chunk. Restores L0 capture so that
@@ -291,7 +312,7 @@ class OpDispatchCapture(TorchDispatchMode):
         instantiate StepInstances for every microbatch."""
         return self._class_instance_counts
 
-    def __torch_dispatch__(self, func, types, args=(), kwargs=None):  # noqa: ANN001, ANN201
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
         kwargs = kwargs or {}
         mutated_inputs = _schema_mutated_tensors(func, args, kwargs)
         result = func(*args, **kwargs)
@@ -327,6 +348,7 @@ class OpDispatchCapture(TorchDispatchMode):
             flat_outputs,
             module_path,
             mutated_inputs=mutated_inputs,
+            attrs=_operator_attributes(func, args, kwargs),
         )
 
         return result
@@ -352,7 +374,7 @@ class OpDispatchCapture(TorchDispatchMode):
         torchtitan_npu.simulator.hardware_shims for ops that cannot execute
         for real (raw Triton kernels / JIT-compiled extensions) but whose
         real op name + output shape are known analytically. Participates in
-        the same producer/consumer id(tensor) wiring, repeat_count dedup,
+        the same producer/consumer identity wiring
         and phase tagging as real dispatched events.
 
         ``logical_dtensor_shapes`` keeps local tensors for dependency and
@@ -449,7 +471,7 @@ class OpDispatchCapture(TorchDispatchMode):
                     continue
                 seen.add(tensor_id)
                 result.append(
-                    _to_tensor_ref(
+                    self._memory_ref(
                         tensor,
                         name=f"{role}_{len(result)}",
                         tensor_id=tensor_id,
@@ -526,6 +548,10 @@ class OpDispatchCapture(TorchDispatchMode):
             )
             is not None
         }
+        alias_frontier_ids.update(
+            frontier for tensor in flat_inputs
+            if (frontier := self._storage_mutation_frontier.get(self._storage_identity(tensor)[0])) is not None
+        )
         memory_flat_inputs = flat_inputs if memory_flat_inputs is None else memory_flat_inputs
         memory_flat_outputs = flat_outputs if memory_flat_outputs is None else memory_flat_outputs
         memory_input_ids = [self.tensor_id(tensor) for tensor in memory_flat_inputs]
@@ -570,10 +596,7 @@ class OpDispatchCapture(TorchDispatchMode):
         elif not comp_type or comp_type == "F":
             # Only honor an explicit "F" during forward; otherwise derive from
             # phase so non-PP backward ops are not mislabeled "F" (the default).
-            if phase == "backward":
-                comp_type = "B"
-            else:
-                comp_type = "F"
+            comp_type = "B" if phase == "backward" else "F"
 
         candidate = _RawEvent(
             op_id=0,
@@ -598,26 +621,9 @@ class OpDispatchCapture(TorchDispatchMode):
                 else None
             ),
         )
-        signature = _shape_signature(candidate)
-
-        if not visible_in_ir:
-            op_id = _next_op_id()
-            candidate.op_id = op_id
-        elif self._events and signature == self._last_signature:
-            retained = self._events[-1]
-            retained.repeat_count += 1
-            op_id = retained.op_id
-            retained.predecessors = sorted(
-                set(retained.predecessors)
-                | {
-                    predecessor
-                    for predecessor in predecessors
-                    if predecessor != op_id
-                }
-            )
-        else:
-            op_id = _next_op_id()
-            candidate.op_id = op_id
+        op_id = _next_op_id()
+        candidate.op_id = op_id
+        if visible_in_ir:
             self._events.append(candidate)
 
         if self.record_memory:
@@ -632,11 +638,11 @@ class OpDispatchCapture(TorchDispatchMode):
                     execution_kind=execution_kind,
                     module_path=module_path,
                     inputs=tuple(
-                        _to_tensor_ref(tensor, name=f"in_{idx}", tensor_id=memory_input_ids[idx])
+                        self._memory_ref(tensor, name=f"in_{idx}", tensor_id=memory_input_ids[idx])
                         for idx, tensor in enumerate(memory_flat_inputs)
                     ),
                     outputs=tuple(
-                        _to_tensor_ref(tensor, name=f"out_{idx}", tensor_id=memory_output_ids[idx])
+                        self._memory_ref(tensor, name=f"out_{idx}", tensor_id=memory_output_ids[idx])
                         for idx, tensor in enumerate(memory_flat_outputs)
                     ),
                     pp_stage=pp_stage,
@@ -656,16 +662,16 @@ class OpDispatchCapture(TorchDispatchMode):
             if tid in self._pending_comm_links:
                 event = self._pending_comm_links.pop(tid)
                 event.dst_entry_op = op_id
-        if visible_in_ir:
-            self._last_signature = signature
 
         for tid in output_ids:
             self._suppressed_tensor_predecessors.pop(tid, None)
             self._producer[tid] = op_id
         for tensor in mutated_inputs or ():
             self._mutation_frontier[self._alias_root_id(tensor)] = op_id
+            self._storage_mutation_frontier[self._storage_identity(tensor)[0]] = op_id
 
     def tensor_id(self, tensor: torch.Tensor) -> int:
+        tensor = _flatten_tensors(tensor)[0]
         raw_id = id(tensor)
         identity = self._tensor_identities.get(raw_id)
         if identity is not None and identity[0]() is tensor:
@@ -673,17 +679,42 @@ class OpDispatchCapture(TorchDispatchMode):
 
         stable_id = raw_id if identity is None else -next(self._reused_tensor_ids)
         self._tensor_identities[raw_id] = (weakref.ref(tensor), stable_id)
+        source_id = self._saved_value_ids.get(self._saved_value_key(tensor))
+        if source_id is not None and source_id != stable_id:
+            self._value_aliases[stable_id] = source_id
         return stable_id
 
-    @staticmethod
-    def _storage_identity(tensor: torch.Tensor) -> tuple[str, int]:
+    def _storage_identity(self, tensor: torch.Tensor) -> tuple[str, int]:
+        tensor = _flatten_tensors(tensor)[0]
         storage = tensor.untyped_storage()
-        return str(storage._cdata), int(storage.nbytes())
+        pointer = int(storage._cdata)
+        identity = self._storage_identities.get(pointer)
+        if identity is None or identity[0].expired():
+            identity = (StorageWeakRef(storage), f"{pointer}:{next(self._storage_generations)}")
+            self._storage_identities[pointer] = identity
+        return identity[1], int(storage.nbytes())
+
+    def _saved_value_key(self, tensor: torch.Tensor) -> tuple:
+        tensor = _flatten_tensors(tensor)[0]
+        # Storage identifies allocation; layout identifies the saved value.
+        # A different view of that storage must keep its own producer.
+        return (
+            self._storage_identity(tensor)[0], tuple(tensor.shape),
+            tuple(tensor.stride()), tensor.storage_offset(), tensor.dtype,
+        )
+
+    def _memory_ref(self, tensor: torch.Tensor, name: str, tensor_id: int) -> TensorRef:
+        storage_key, storage_bytes = self._storage_identity(tensor)
+        return _to_tensor_ref(
+            tensor, name, tensor_id, alias_of=self._value_aliases.get(tensor_id),
+            storage_key=storage_key, storage_bytes=storage_bytes,
+        )
 
     def record_autograd_saved_tensor_pack(self, tensor: torch.Tensor) -> int | None:
         """Record a real autograd save without adding a synthetic L0 op."""
         if not self.record_memory or not self._capture_l0:
             return None
+        tensor = _flatten_tensors(tensor)[0]
         storage_key, storage_bytes = self._storage_identity(tensor)
         phase = self.phase_provider() if self.phase_provider else "forward"
         execution_kind = current_execution_kind(phase)
@@ -698,10 +729,12 @@ class OpDispatchCapture(TorchDispatchMode):
         except Exception:
             pass
         slot_id = len(self._autograd_saved_tensor_events)
+        saved_id = self.tensor_id(tensor)
+        self._saved_value_ids[self._saved_value_key(tensor)] = saved_id
         self._autograd_saved_tensor_events.append(
             AutogradSavedTensorEvent(
                 slot_id=slot_id,
-                tensor_id=self.tensor_id(tensor),
+                tensor_id=saved_id,
                 storage_key=storage_key,
                 storage_bytes=storage_bytes,
                 num_bytes=tensor.numel() * tensor.element_size(),
@@ -739,17 +772,19 @@ class OpDispatchCapture(TorchDispatchMode):
     def _alias_root_id(self, tensor: torch.Tensor) -> int:
         root = tensor
         seen: set[int] = set()
-        while isinstance(getattr(root, "_base", None), torch.Tensor):
+        while isinstance(base := getattr(root, "_base", None), torch.Tensor):
             raw_id = id(root)
             if raw_id in seen:
                 break
             seen.add(raw_id)
-            root = root._base
+            root = base
         return self.tensor_id(root)
 
     def producer_op(self, tensor: torch.Tensor) -> int | None:
         """Return the op after which the tensor's current value is ready."""
-        mutation = self._mutation_frontier.get(self._alias_root_id(tensor))
+        mutation = self._storage_mutation_frontier.get(self._storage_identity(tensor)[0])
+        if mutation is None:
+            mutation = self._mutation_frontier.get(self._alias_root_id(tensor))
         if mutation is not None:
             return mutation
         predecessors = self._predecessors_for_tensor_id(self.tensor_id(tensor))
@@ -758,9 +793,11 @@ class OpDispatchCapture(TorchDispatchMode):
     def _predecessors_for_tensor_id(self, tensor_id: int) -> set[int]:
         if tensor_id in self._producer:
             return {self._producer[tensor_id]}
+        if tensor_id in self._value_aliases:
+            return self._predecessors_for_tensor_id(self._value_aliases[tensor_id])
         return self._suppressed_tensor_predecessors.get(tensor_id, set())
 
-    def __enter__(self) -> "OpDispatchCapture":
+    def __enter__(self) -> OpDispatchCapture:
         super().__enter__()
         global _active_capture
         self._previous_active_capture = _active_capture
@@ -771,10 +808,12 @@ class OpDispatchCapture(TorchDispatchMode):
         global _active_capture
         _active_capture = self._previous_active_capture
         super().__exit__(exc_type, exc_val, exc_tb)
+        self._storage_identities.clear()
+        self._saved_value_ids.clear()
 
-    def build_nodes(self) -> dict[str, OpNode]:
+    def build_nodes(self) -> dict[int, OpNode]:
         """Assemble captured events into OpNode objects with cost annotations."""
-        nodes: dict[str, OpNode] = {}
+        nodes: dict[int, OpNode] = {}
         for event in self._events:
             cost = self.cost_model.compute(event.op_type, event.inputs, event.outputs, {})
             annotations: dict[str, Any] = {
@@ -893,10 +932,10 @@ class OpDispatchCapture(TorchDispatchMode):
         return list(self._checkpoint_boundary_events)
 
 
-_active_capture: "OpDispatchCapture | None" = None
+_active_capture: OpDispatchCapture | None = None
 
 
-def get_active_capture() -> "OpDispatchCapture | None":
+def get_active_capture() -> OpDispatchCapture | None:
     """Returns the `OpDispatchCapture` instance currently inside its `with`
     block (there is at most one active at a time -- one step is captured at
     a time), or `None` if no capture is active. Lets code that has no

@@ -3,6 +3,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import pytest
 import torch
 
 from torchtitan_npu.models.deepseek_v4.model import DeepSeekV4Model, LiCompute, LiLoss, SparseAttention
@@ -77,6 +78,32 @@ def test_sim_sparse_attention_works_on_meta_device():
     assert y.device.type == "meta"
     y.sum().backward()
     assert meta_t["query_states"].grad is not None
+
+
+@pytest.mark.parametrize("ratio", [1, 4, 128])
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+def test_sparse_attention_backward_consumes_its_forward_indices(ratio, index_dtype):
+    shim, tensors = _build_sim_sparse_attention(B=1, S=256, N=2, D=4, R=ratio, K=3)
+    tensors = {key: value.detach().to("meta").requires_grad_(value.requires_grad) for key, value in tensors.items()}
+    if ratio == 4:
+        tensors["compress_topk_idxs"] = tensors["compress_topk_idxs"].to(index_dtype)
+    phase = ["forward"]
+    capture = OpDispatchCapture(phase_provider=lambda: phase[0])
+    with capture:
+        result = shim(**tensors)
+        phase[0] = "backward"
+        result.sum().backward()
+    events = capture.memory_events()
+    forward = next(event for event in events if event.raw_op_type == "aclnn.npu_sparse_attn_sharedkv")
+    backward = next(event for event in events if event.raw_op_type == "aclnn.npu_sparse_attn_sharedkv_grad")
+    forward_indices = [ref for ref in forward.inputs if ref.shape == (1, 256, 1, 3)]
+    backward_indices = [ref for ref in backward.inputs if ref.shape == (1, 256, 1, 3)]
+    assert bool(forward_indices) == (ratio == 4)
+    assert [(ref.tensor_id, ref.shape, ref.dtype) for ref in backward_indices] == [
+        (ref.tensor_id, ref.shape, ref.dtype) for ref in forward_indices
+    ]
+    if ratio == 4:
+        assert backward_indices[0].dtype == "int32"
 
 
 def _build_sim_li_compute(B=2, S=8, N_i=4, D_i=8, K=5, ratio=4):

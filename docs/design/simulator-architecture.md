@@ -89,7 +89,7 @@ EP/ETP 重新解释 dense world 的一部分，不是额外 world_size 乘数。
 | L2 `ScheduleGraph` | 从 SchedulePlan 投影的兼容对象，不再独立猜测另一套执行顺序 |
 | L3 `WorkloadGraph` | 一次训练迭代、microbatch 和数据流，并携带 SchedulePlan |
 
-捕获按 `(stage, comp_type)` 首次出现保留完整算子图，重复 chunk 保留调度与通信事实。`comp_type` 区分 F、完整 B、输入梯度 I、权重梯度 W。通信变化会由 ownership 处理生成 `__comm_v*` 模板，不能简单宣称“只有 MB0 一张图”。
+PP 捕获以每个 stage 的首个前向 microbatch 为共同来源，保留它的 F/B/I/W 完整算子图；其他 microbatch 保留调度与通信事实。回放要求 F/B/I/W 来源配对，并按目标 microbatch 重映射 tensor 身份与 saved slots。当前多 MB 且包含 optimizer 的内存回放因缺少累积梯度绑定而显式拒绝；关闭内存抓取只能检查模板，不能视为完整累积梯度图。`comp_type` 区分 F、完整 B、输入梯度 I、权重梯度 W。通信变化会由 ownership 处理生成 `__comm_v*` 模板，不能简单宣称“只有 MB0 一张图”。
 
 当前捕获具备 1F1B、GPipe、运行时/interleaved 调度和 DualPipeV 语义入口；重点演进与消费文档覆盖 1F1B 和 DualPipeV。DualPipeV 保留 `OVERLAP_F_B` parent/sub_actions、同 rank 的 V 形 local transfer、跨 rank SEND/RECV。这表示调度结构被捕获，不代表 meta 捕获测出了真实双图并发时间。
 

@@ -125,7 +125,7 @@ def test_pp_replay_follows_stage0_warmup_steady_and_cooldown_order() -> None:
     assert plan.peak_active_bytes >= 4 * activation.num_bytes
 
 
-def test_pp_model_peak_covers_replayed_microbatches_but_excludes_optimizer() -> None:
+def test_pp_single_microbatch_model_peak_excludes_optimizer() -> None:
     activation = _ref(10)
     grad = _ref(20, 4)
     optimizer_state = _ref(30, 1000)
@@ -156,11 +156,9 @@ def test_pp_model_peak_covers_replayed_microbatches_but_excludes_optimizer() -> 
     ]
     actions = [
         _action(0, "F", 0),
-        _action(1, "F", 1),
-        _action(2, "B", 0),
-        _action(3, "B", 1),
+        _action(1, "B", 0),
         ScheduleAction(
-            id=4,
+            id=2,
             action_id="optimizer",
             rank=0,
             stage=0,
@@ -174,10 +172,10 @@ def test_pp_model_peak_covers_replayed_microbatches_but_excludes_optimizer() -> 
 
     plan = estimate_schedule_memory(
         events,
-        schedule_plan=_plan(actions, pp_degree=2, microbatches=2),
+        schedule_plan=_plan(actions, pp_degree=2, microbatches=1),
     )
 
-    assert plan.model_active_bytes_peak == 204
+    assert plan.model_active_bytes_peak == 104
     assert plan.peak_active_bytes == 1004
     assert plan.model_active_bytes_peak < plan.peak_active_bytes
 
@@ -518,3 +516,62 @@ def test_fsdp_markers_use_raw_comm_positions_not_plan_indices() -> None:
     assert spans["reshard"].source_seq_idx == 20
     assert full_param.birth_seq == spans["unshard"].start_seq
     assert full_param.death_seq == spans["a1"].end_seq
+
+
+def test_replay_rejects_unpaired_forward_backward_source_microbatches():
+    forward = _event(1, 101, comp_type="F", phase="forward", outputs=(_ref(10),))
+    backward = replace(_event(2, 102, comp_type="B", phase="backward", inputs=(_ref(20),)), pp_mb_idx=1)
+    with pytest.raises(ValueError, match="paired.*microbatch"):
+        estimate_schedule_memory([forward, backward], schedule_plan=_plan([_action(0, "F", 0), _action(1, "B", 0)]))
+
+
+def test_replay_selects_common_source_before_largest_individual_template():
+    from torchtitan_npu.simulator.memory.schedule_replay import _select_templates
+    events = [
+        _event(0, 10, comp_type="F", phase="forward"),
+        replace(_event(1, 11, comp_type="F", phase="forward"), pp_mb_idx=1),
+        replace(_event(2, 12, comp_type="F", phase="forward"), pp_mb_idx=1),
+        _event(3, 13, comp_type="B", phase="backward"),
+    ]
+    _, sources, _, _ = _select_templates(events, {(0, "F"), (0, "B")}, set())
+    assert sources == {(0, "F"): 0, (0, "B"): 0}
+
+
+@pytest.mark.parametrize("backward_types", [("B",), ("I", "W")])
+def test_saved_slots_and_hidden_aliases_are_replayed_per_stage_microbatch(backward_types):
+    from torchtitan_npu.simulator.memory.records import AutogradSavedTensorEvent
+    from torchtitan_npu.simulator.memory.schedule_replay import replay_pp_memory_capture
+    activation = replace(_ref(10), storage_key="saved-storage")
+    hidden = replace(_ref(11), alias_of=10, storage_key="saved-storage")
+    events = [_event(1, 101, comp_type="F", phase="forward", outputs=(activation,))]
+    for offset, kind in enumerate(backward_types):
+        events.append(_event(20 + offset, 201 + offset, comp_type=kind, phase="backward", inputs=(hidden,)))
+    slots = [AutogradSavedTensorEvent(slot_id=0, tensor_id=10, storage_key="saved-storage", storage_bytes=100, num_bytes=100, shape=(100,), dtype="uint8", pack_seq=1, unpack_seq=20, phase="forward", pp_stage=0, pp_mb_idx=0, comp_type="F")]
+    actions = [_action(0, "F", 0), _action(1, "F", 1)]
+    actions += [_action(len(actions) + mb * len(backward_types) + index, kind, mb) for mb in (0, 1) for index, kind in enumerate(backward_types)]
+    replayed = replay_pp_memory_capture(events, schedule_plan=_plan(actions, microbatches=2), autograd_saved_tensor_events=slots)
+    assert len(replayed.autograd_saved_tensor_events) == 2
+    assert len({slot.storage_key for slot in replayed.autograd_saved_tensor_events}) == 2
+    for mb in (0, 1):
+        forward = next(event for event in replayed.events if event.pp_mb_idx == mb and event.comp_type == "F")
+        backward = next(event for event in replayed.events if event.pp_mb_idx == mb and event.comp_type == backward_types[0])
+        assert backward.inputs[0].alias_of == forward.outputs[0].tensor_id
+        slot = replayed.autograd_saved_tensor_events[mb]
+        assert slot.tensor_id == forward.outputs[0].tensor_id
+        assert slot.pack_seq == forward.seq_idx
+        assert slot.unpack_seq == backward.seq_idx
+    plan = estimate_schedule_memory(events, schedule_plan=_plan(actions, microbatches=2), autograd_saved_tensor_events=slots)
+    assert len([item for item in plan.tensor_lifetimes if item.kind == "activation"]) == 2
+    assert not [item for item in plan.tensor_lifetimes if item.kind == "external_input"]
+
+
+def test_replay_rejects_microbatch_templates_that_share_optimizer_gradient():
+    events = [
+        _event(1, 10, comp_type="F", phase="forward", outputs=(_ref(10),)),
+        _event(2, 20, comp_type="B", phase="backward", inputs=(_ref(10),), outputs=(_ref(20),)),
+        _event(3, 30, comp_type="OPTIMIZER", phase="optimizer", inputs=(_ref(20),)),
+    ]
+    actions = [_action(0, "F", 0), _action(1, "B", 0), _action(2, "F", 1), _action(3, "B", 1)]
+    actions.append(replace(_action(4, "OPTIMIZER", 0), action_type="OPTIMIZER"))
+    with pytest.raises(ValueError, match="gradient accumulation"):
+        estimate_schedule_memory(events, schedule_plan=_plan(actions, microbatches=2))

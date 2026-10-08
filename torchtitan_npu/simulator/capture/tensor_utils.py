@@ -81,4 +81,7 @@ def to_tensor_meta(tensor: torch.Tensor, name: str, is_parameter: bool = False) 
         dtype=dtype_to_str(tensor.dtype),
         device=str(tensor.device),
         is_parameter=is_parameter,
+        stride=tuple(tensor.stride()) if tensor.layout == torch.strided else (),
+        storage_offset=int(tensor.storage_offset()) if tensor.layout == torch.strided else 0,
+        layout=str(tensor.layout),
     )

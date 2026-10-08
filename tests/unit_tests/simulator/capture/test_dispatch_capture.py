@@ -127,7 +127,7 @@ def test_capture_links_mutated_view_to_later_base_consumer():
     assert capture.producer_op(flat_buffer) == chunk_cat.op_id
 
 
-def test_capture_deduplicates_consecutive_identical_ops():
+def test_capture_retains_consecutive_operator_invocations():
     capture = OpDispatchCapture()
     with capture:
         x = torch.zeros(4, device="meta")
@@ -135,8 +135,8 @@ def test_capture_deduplicates_consecutive_identical_ops():
             x = x.relu()
     nodes = capture.build_nodes()
     relu_nodes = [n for n in nodes.values() if "relu" in n.annotations["raw_op_type"]]
-    assert len(relu_nodes) == 1
-    assert relu_nodes[0].annotations["repeat_count"] == 5
+    assert len(relu_nodes) == 5
+    assert len({node.op_id for node in relu_nodes}) == 5
 
 
 def test_capture_tags_module_path_when_tracker_supplied():
@@ -397,8 +397,8 @@ def test_capture_keeps_uncollapsed_memory_events_for_liveness():
     nodes = capture.build_nodes()
     relu_nodes = [n for n in nodes.values() if "relu" in n.annotations["raw_op_type"]]
     relu_memory_events = [e for e in capture.memory_events() if "relu" in e.raw_op_type]
-    assert len(relu_nodes) == 1
-    assert relu_nodes[0].annotations["repeat_count"] == 3
+    assert len(relu_nodes) == 3
+    assert len({node.op_id for node in relu_nodes}) == 3
     assert len(relu_memory_events) == 3
     assert len({e.seq_idx for e in relu_memory_events}) == 3
 

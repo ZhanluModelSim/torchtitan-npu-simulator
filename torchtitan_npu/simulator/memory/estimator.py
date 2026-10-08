@@ -12,8 +12,7 @@ active tensor bytes that are explainable from static shapes.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn as nn
@@ -44,6 +43,9 @@ from torchtitan_npu.simulator.memory.records import (
     TensorLifetime,
     TensorRef,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
 
 
 def _to_local_tensor(value: object) -> torch.Tensor | None:
@@ -117,6 +119,7 @@ def _snapshot_parameters(
                     num_bytes=num_bytes,
                     shape=shape,
                     dtype=dtype,
+                    storage_key=str(tensor.untyped_storage()._cdata),
                 )
             )
             if param.requires_grad and getattr(param, "grad", None) is None:
@@ -131,15 +134,16 @@ def _snapshot_parameters(
     return lifetimes, param_ids, missing_gradients, parameter_tensors
 
 
-def _is_parameter_materialization(ref: TensorRef, parameter_tensors: Iterable[ParameterTensorMetadata]) -> bool:
-    """Match a local parameter materialized through DTensor ``to_local``.
+def _is_persistent_parameter_alias(ref: TensorRef, parameter_tensors: Iterable[ParameterTensorMetadata]) -> bool:
+    """Only a witnessed persistent storage may be excluded from activation bytes.
 
-    Meta DTensor can return a new local tensor identity without emitting a
-    dispatch-visible alias. Exact metadata matching is safe here: this only
-    applies to first-observed inputs and does not infer expanded FSDP weights.
+    Parameters remain alive while the plan is built, so their storage handles
+    cannot be reused. Capture's generation suffix distinguishes other dead
+    storage handles without conflating same-shaped values or FSDP buffers.
     """
-    return any(
-        ref.shape == parameter.shape and ref.dtype == parameter.dtype and ref.num_bytes == parameter.num_bytes
+    storage_key = ref.storage_key.partition(":")[0]
+    return bool(storage_key) and any(
+        parameter.storage_key == storage_key
         for parameter in parameter_tensors
     )
 
@@ -148,7 +152,7 @@ def _external_lifetime(ref: TensorRef, event: RawMemoryEvent) -> TensorLifetime:
     return TensorLifetime(
         tensor_id=f"external:{ref.tensor_id}",
         kind="external_input",
-        num_bytes=ref.num_bytes,
+        num_bytes=ref.storage_bytes if ref.storage_key and ref.storage_bytes else ref.num_bytes,
         birth_seq=event.seq_idx,
         death_seq=event.seq_idx,
         producer_op=-1,
@@ -164,7 +168,7 @@ def _output_lifetime(ref: TensorRef, event: RawMemoryEvent, kind: str, reason: s
     return TensorLifetime(
         tensor_id=f"tensor:{ref.tensor_id}",
         kind=kind,
-        num_bytes=ref.num_bytes,
+        num_bytes=ref.storage_bytes if ref.storage_key and ref.storage_bytes else ref.num_bytes,
         birth_seq=event.seq_idx,
         death_seq=event.seq_idx,
         producer_op=event.op_id,
@@ -225,10 +229,6 @@ def _classify_output(event: RawMemoryEvent, comm_by_op: dict[int, Any]) -> tuple
 
 
 def _finalize_kind(lifetime: TensorLifetime) -> None:
-    # The autograd saved-tensor plugin has authoritative ownership for these
-    # forward values. A graph edge into backward does not imply retention.
-    if lifetime.reason == "not_autograd_saved":
-        return
     if lifetime.kind in {
         "parameter_shard",
         "external_input",
@@ -251,7 +251,7 @@ def _finalize_kind(lifetime: TensorLifetime) -> None:
         lifetime.reason = "no_consumer"
     elif lifetime.producer_phase == "forward" and "backward" in lifetime.consumer_phases:
         lifetime.kind = "activation"
-        if lifetime.reason != "autograd_saved_tensor":
+        if lifetime.reason not in {"autograd_saved_tensor", "backward_use_without_saved_slot"}:
             lifetime.reason = "forward_to_backward"
     else:
         lifetime.kind = "temporary"
@@ -372,10 +372,9 @@ def estimate_static_memory(
     fsdp_allgather_transport_dtype: str = "",
 ) -> MemoryPlan:
     events = sorted(raw_events, key=lambda event: event.seq_idx)
-    if parameter_storage_dtype:
-        parameter_storage_dtype = normalize_supported_dtype(parameter_storage_dtype)
-    else:
-        parameter_storage_dtype = None
+    parameter_storage_dtype = (
+        normalize_supported_dtype(parameter_storage_dtype) if parameter_storage_dtype else None
+    )
     param_lifetimes, param_ids, missing_parameter_gradients, parameter_tensors = _snapshot_parameters(
         model_parts or [],
         parameter_storage_dtype,
@@ -389,25 +388,37 @@ def estimate_static_memory(
     alias_base_by_tensor_id: dict[int, int] = {}
     alias_lifetimes: list[TensorLifetime] = []
     parameter_materialization_ids: set[int] = set()
+    storage_roots: dict[str, int] = {}
     unclassified_ops: list[dict[str, Any]] = []
     notes = [
         "P0 estimates active tensor bytes from static tensor metadata; it does not model allocator reserved/cache or kernel workspace.",
-        "Alias and mutation handling uses conservative op-name rules.",
+        "Allocation identity uses captured storage provenance, with op-name rules for legacy events.",
     ]
+
+    def storage_root(ref: TensorRef) -> int:
+        root = _resolve_alias(ref.tensor_id, alias_base_by_tensor_id)
+        if ref.storage_key and ref.storage_key in storage_roots:
+            root = _resolve_alias(storage_roots[ref.storage_key], alias_base_by_tensor_id)
+        elif ref.alias_of is not None:
+            root = _resolve_alias(ref.alias_of, alias_base_by_tensor_id)
+        if root != ref.tensor_id:
+            alias_base_by_tensor_id[ref.tensor_id] = root
+        if ref.storage_key:
+            storage_roots[ref.storage_key] = root
+        return root
 
     for event in events:
         for ref in event.inputs:
-            root_tensor_id = _resolve_alias(ref.tensor_id, alias_base_by_tensor_id)
-            if root_tensor_id in param_ids:
-                continue
-            if root_tensor_id in parameter_materialization_ids:
+            root_tensor_id = storage_root(ref)
+            if root_tensor_id in param_ids or root_tensor_id in parameter_materialization_ids:
                 continue
             lifetime = lifetimes_by_tensor_id.get(root_tensor_id)
             if lifetime is None:
-                if _is_parameter_materialization(ref, parameter_tensors):
+                if _is_persistent_parameter_alias(ref, parameter_tensors):
                     parameter_materialization_ids.add(root_tensor_id)
                     continue
                 lifetime = _external_lifetime(ref, event)
+                lifetime.tensor_id = f"external:{root_tensor_id}"
                 lifetimes_by_tensor_id[root_tensor_id] = lifetime
             lifetime.mark_consumer(event.op_id, event.seq_idx, event.phase)
 
@@ -415,19 +426,32 @@ def estimate_static_memory(
         alias = is_alias_event(event)
         mutation = is_mutation_event(event)
         for ref in event.outputs:
-            if ref.tensor_id in param_ids:
+            root_tensor_id = storage_root(ref)
+            if (
+                root_tensor_id in param_ids
+                or root_tensor_id in parameter_materialization_ids
+                or _is_persistent_parameter_alias(ref, parameter_tensors)
+            ):
+                parameter_materialization_ids.add(root_tensor_id)
                 continue
-            if ref.tensor_id in parameter_materialization_ids:
+            if ref.storage_key and root_tensor_id in lifetimes_by_tensor_id:
+                # A returned alias or write does not allocate its storage again.
+                lifetime = lifetimes_by_tensor_id[root_tensor_id]
+                lifetime.mark_consumer(event.op_id, event.seq_idx, event.phase)
+                if ref.tensor_id != root_tensor_id:
+                    alias_lifetimes.append(_alias_lifetime(ref, event, root_tensor_id))
                 continue
             if mutation and ref.tensor_id in input_ids:
                 continue
-            if alias and event.inputs:
+            if alias and event.inputs and not ref.storage_key:
                 base_tensor_id = _resolve_alias(event.inputs[0].tensor_id, alias_base_by_tensor_id)
                 alias_base_by_tensor_id[ref.tensor_id] = base_tensor_id
                 alias_lifetimes.append(_alias_lifetime(ref, event, base_tensor_id))
                 continue
             kind, reason = _classify_output(event, comm_by_op)
-            lifetimes_by_tensor_id[ref.tensor_id] = _output_lifetime(ref, event, kind, reason)
+            lifetime = _output_lifetime(ref, event, kind, reason)
+            lifetime.tensor_id = f"tensor:{root_tensor_id}"
+            lifetimes_by_tensor_id[root_tensor_id] = lifetime
 
         if event.op_type == "unknown" and event.outputs:
             unclassified_ops.append(
@@ -439,6 +463,13 @@ def estimate_static_memory(
                     "output_bytes": sum(ref.num_bytes for ref in event.outputs),
                 }
             )
+
+    unknown_inputs = [item for item in lifetimes_by_tensor_id.values() if item.kind == "external_input"]
+    if unknown_inputs:
+        notes.append(
+            f"Capture observed {len(unknown_inputs)} external inputs without persistent-parameter storage provenance "
+            f"({sum(item.num_bytes for item in unknown_inputs)} logical bytes); kept in the memory inventory."
+        )
 
     plugin_context = MemoryModelContext(
         events=events,

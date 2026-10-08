@@ -23,25 +23,17 @@ from torchtitan_npu.simulator.capture.checkpoint_execution import install_checkp
 from torchtitan_npu.simulator.capture.comm_events import capture_fake_collectives
 from torchtitan_npu.simulator.capture.comm_group_resolver import resolve_comm_event_groups
 from torchtitan_npu.simulator.capture.dispatch_capture import OpDispatchCapture
+from torchtitan_npu.simulator.capture.graph_normalization import fold_metadata_views
 from torchtitan_npu.simulator.capture.module_path import ModulePathTracker
 from torchtitan_npu.simulator.capture.schedule_builder import (
     build_schedule_plan,
     project_schedule_plan_to_graph,
 )
 from torchtitan_npu.simulator.capture.step_boundary import StepBoundaryTracker, build_step_graphs
-from torchtitan_npu.simulator.capture.graph_normalization import fold_metadata_views
 from torchtitan_npu.simulator.capture.workload_builder import build_workload_graph
-from torchtitan_npu.simulator.hardware_shims.kda_converter import (
-    apply_kimi_k3_shims,
-)
-from torchtitan_npu.simulator.hardware_shims.mhc_converter import apply_mhc_shims
 from torchtitan_npu.simulator.hardware_shims.moe_dispatch_shim import (
     fp8_dispatch_transport_context,
 )
-from torchtitan_npu.simulator.hardware_shims.rms_norm_converter import (
-    apply_rms_norm_shims,
-)
-from torchtitan_npu.simulator.hardware_shims.smla_converter import apply_smla_shims
 from torchtitan_npu.simulator.memory.export import (
     export_memory_details,
     export_memory_summary,
@@ -193,6 +185,11 @@ def run_simulation_step(
     fsdp_allgather_transport_dtype: str = "",
     synthetic_ac_patterns: tuple[str, ...] = (),
     pp_schedule: Any | None = None,
+    microbatches: list[tuple[dict[str, torch.Tensor], torch.Tensor]] | None = None,
+    global_valid_tokens: float | torch.Tensor | None = None,
+    local_valid_tokens: int | None = None,
+    optimizer_zero_grad: Callable[[], None] | None = None,
+    clip_grad_norm: Callable[[], Any] | None = None,
 ) -> WorkloadGraph:
     """Run one forward+backward+optimizer step under full capture and
     return the resulting four-layer WorkloadGraph. Bypasses
@@ -212,9 +209,33 @@ def run_simulation_step(
     timings: dict[str, float] = {}
     t0 = time.perf_counter()
 
+    if gradient_accumulation < 1:
+        raise ValueError("gradient_accumulation must be positive")
+    if parallel_dims.pp_enabled and gradient_accumulation > 1:
+        raise ValueError("PP gradient accumulation across multiple schedule steps is not supported by simulator capture")
+    if microbatches is None:
+        if gradient_accumulation != 1:
+            raise ValueError("Supply actual microbatches for gradient_accumulation > 1")
+        microbatches = [(input_dict, labels)]
+    if len(microbatches) != gradient_accumulation:
+        raise ValueError("microbatches must match gradient_accumulation")
+    if not parallel_dims.pp_enabled:
+        num_micro_batches = gradient_accumulation
+    if global_valid_tokens is None and local_valid_tokens is None:
+        from torchtitan.components.loss import IGNORE_INDEX
+        if any(target.device.type == "meta" for _, target in microbatches):
+            raise ValueError("Meta labels require an explicit local_valid_tokens or global_valid_tokens count")
+        local_valid_tokens = sum(
+            int((target != IGNORE_INDEX).sum().item())
+            for _, target in microbatches
+        )
+    if global_valid_tokens is None and not getattr(parallel_dims, "dp_enabled", False):
+        global_valid_tokens = float(local_valid_tokens or 0)
+    if isinstance(global_valid_tokens, (int, float)) and global_valid_tokens <= 0:
+        raise ValueError("A simulation step requires at least one valid target token")
+
     patch_device_type_to_meta()
     install_checkpoint_execution_tracking(model_parts)
-    global_valid_tokens = float(labels.numel())
 
     # Default PP stage attribution: non-PP steps use stage 0 (the single
     # stage); PP steps use -1 ("unattributed") so framework setup ops captured
@@ -225,6 +246,7 @@ def run_simulation_step(
     # is "1F1B" even when PP degree is 1, so it cannot gate this.
     from torchtitan_npu.simulator.meta_env import _pp_context
     _pp_context["stage"] = -1 if parallel_dims.pp_enabled else 0
+    _pp_context.update(mb_idx=0, comp_type="F", phase="forward")
 
     boundary = StepBoundaryTracker()
     # Interleaved schedules such as DualPipeV place multiple virtual stages
@@ -265,6 +287,7 @@ def run_simulation_step(
     timings["setup"] = t1 - t0
 
     from contextlib import nullcontext
+
     from torchtitan_npu.simulator.capture.comm_events import (
         default_collective_context,
     )
@@ -278,12 +301,6 @@ def run_simulation_step(
         if callable(get_optional_mesh)
         else None
     )
-    tp_collective_context = (
-        default_collective_context("tp", tp_mesh.get_group())
-        if tp_mesh is not None
-        else nullcontext()
-    )
-
     saved_tensor_context = (
         AutogradSavedTensorCapture()
         if enable_memory_tracking
@@ -300,13 +317,29 @@ def run_simulation_step(
         saved_tensor_context,
         synthetic_ac_policy_context(synthetic_ac_patterns),
     ):
+        if optimizer_zero_grad is not None:
+            optimizer_zero_grad()
+        else:
+            for part in model_parts:
+                part.zero_grad()
         boundary.mark("forward")
-        with tp_collective_context:
-            forward_backward_step(
-                input_dict=input_dict,
-                labels=labels,
-                global_valid_tokens=global_valid_tokens,
-            )
+        if global_valid_tokens is None:
+            from torch.distributed import _functional_collectives as funcol
+            token_count = torch.tensor(local_valid_tokens, dtype=torch.int64, device=labels.device)
+            global_valid_tokens = funcol.all_reduce(token_count, "sum", parallel_dims.get_mesh("batch")).float()
+        for mb_idx, (batch_inputs, batch_labels) in enumerate(microbatches):
+            boundary.mark("forward")
+            if not parallel_dims.pp_enabled:
+                _pp_context.update(mb_idx=mb_idx, comp_type="F", phase="forward")
+            with (
+                default_collective_context("tp", tp_mesh.get_group())
+                if tp_mesh is not None else nullcontext()
+            ):
+                forward_backward_step(
+                    input_dict=batch_inputs,
+                    labels=batch_labels,
+                    global_valid_tokens=global_valid_tokens,
+                )
         t2 = time.perf_counter()
         timings["forward_backward"] = t2 - t1
         capture.finalize_autograd_saved_tensors()
@@ -314,6 +347,8 @@ def run_simulation_step(
         boundary.mark("optimizer")
         # Always capture L0 for optimizer phase (not controlled by microbatch)
         capture._capture_l0 = True
+        if clip_grad_norm is not None:
+            clip_grad_norm()
         from torchtitan_npu.simulator.hardware_shims.optimizer_shim import (
             capture_optimizer_param_groups,
         )
@@ -349,7 +384,7 @@ def run_simulation_step(
     timings["build_nodes"] = time.perf_counter() - t5
 
     t6 = time.perf_counter()
-    step_templates = build_step_graphs(nodes)
+    step_templates = build_step_graphs(nodes, separate_microbatches=not parallel_dims.pp_enabled and gradient_accumulation > 1)
     timings["build_step_graphs"] = time.perf_counter() - t6
 
     t7 = time.perf_counter()
@@ -518,6 +553,10 @@ class SimulationTrainer(Trainer):
         force_moe_load_balance(config)
         force_deterministic_seed(config)
         config.compile.enable = False  # tracing needs eager dispatch, not a compiled graph
+        from torchtitan_npu.simulator.hardware_shims.mhc_converter import apply_mhc_shims
+        from torchtitan_npu.simulator.hardware_shims.rms_norm_converter import apply_rms_norm_shims
+        from torchtitan_npu.simulator.hardware_shims.smla_converter import apply_smla_shims
+
         apply_mhc_shims()
         apply_rms_norm_shims()
         apply_smla_shims()
@@ -568,6 +607,8 @@ class SimulationTrainer(Trainer):
             super().__init__(config)
         # Bind Kimi shims after model construction so TP/CP/FSDP hooks and
         # distributed parameters remain attached to the original modules.
+        from torchtitan_npu.simulator.hardware_shims.kda_converter import apply_kimi_k3_shims
+
         for model_part in self.model_parts:
             apply_kimi_k3_shims(model_part)
         self.simulation_config = config.simulation
@@ -578,16 +619,31 @@ class SimulationTrainer(Trainer):
         )
         self.workload_graph: WorkloadGraph | None = None
 
+    def _capture_clip_grad_norm(self) -> torch.Tensor:
+        from torchtitan.distributed import utils as dist_utils
+        return dist_utils.clip_grad_norm_(
+            [parameter for part in self.model_parts for parameter in part.parameters()],
+            self.config.training.max_norm, foreach=True,
+            pp_mesh=self.parallel_dims.get_optional_mesh("pp"),
+            ep_enabled=self.parallel_dims.ep_enabled,
+        )
+
     def train(self) -> None:
         import time
         t0 = time.perf_counter()
 
+        from torchtitan.components.loss import IGNORE_INDEX
         data_iterator = iter(self.dataloader)
-        input_dict, labels = next(data_iterator)
-        for key, value in list(input_dict.items()):
-            if isinstance(value, torch.Tensor):
-                input_dict[key] = value.to(self.device)
-        labels = labels.to(self.device)
+        microbatches = []
+        local_valid_tokens = 0
+        for _ in range(self.gradient_accumulation_steps):
+            input_dict, labels = next(data_iterator)
+            local_valid_tokens += int((labels != IGNORE_INDEX).sum().item())
+            for key, value in list(input_dict.items()):
+                if isinstance(value, torch.Tensor):
+                    input_dict[key] = value.to(self.device)
+            microbatches.append((input_dict, labels.to(self.device)))
+        input_dict, labels = microbatches[0]
 
         t1 = time.perf_counter()
 
@@ -610,6 +666,10 @@ class SimulationTrainer(Trainer):
                 forward_backward_step=lambda **kwargs: self.forward_backward_step(**kwargs),
                 input_dict=input_dict,
                 labels=labels,
+                microbatches=microbatches,
+                local_valid_tokens=local_valid_tokens,
+                optimizer_zero_grad=self.optimizers.zero_grad,
+                clip_grad_norm=lambda: self._capture_clip_grad_norm(),
                 optimizer_step=self.optimizers.step,
                 lr_scheduler_step=self.lr_schedulers.step,
                 local_batch_size=self.config.training.local_batch_size,

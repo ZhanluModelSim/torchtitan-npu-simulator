@@ -7,12 +7,10 @@
 
 from __future__ import annotations
 
-from typing import Hashable
-
 from torchtitan_npu.simulator.ir.op_node import OpNode
 
 
-def fold_metadata_views(nodes: dict[Hashable, OpNode]) -> dict[Hashable, OpNode]:
+def fold_metadata_views(nodes: dict[int, OpNode]) -> dict[int, OpNode]:
     """Remove alias-only view nodes and preserve their transitive dependencies.
 
     Dispatcher capture retains views to maintain exact alias and mutation
@@ -30,9 +28,9 @@ def fold_metadata_views(nodes: dict[Hashable, OpNode]) -> dict[Hashable, OpNode]
     if not removed_ids:
         return nodes
 
-    predecessor_cache: dict[Hashable, set[Hashable]] = {}
+    predecessor_cache: dict[int, set[int]] = {}
 
-    def retained_predecessors(op_id: Hashable, visiting: set[Hashable]) -> set[Hashable]:
+    def retained_predecessors(op_id: int, visiting: set[int]) -> set[int]:
         if op_id not in removed_ids:
             return {op_id}
         if op_id in predecessor_cache:
@@ -44,7 +42,7 @@ def fold_metadata_views(nodes: dict[Hashable, OpNode]) -> dict[Hashable, OpNode]
             return set()
 
         node = nodes[op_id]
-        result: set[Hashable] = set()
+        result: set[int] = set()
         for predecessor_id in node.predecessors:
             if predecessor_id in nodes:
                 result.update(retained_predecessors(predecessor_id, visiting | {op_id}))
@@ -57,7 +55,7 @@ def fold_metadata_views(nodes: dict[Hashable, OpNode]) -> dict[Hashable, OpNode]
         op_id: node for op_id, node in nodes.items() if op_id not in removed_ids
     }
     for op_id, node in retained_nodes.items():
-        predecessors: set[Hashable] = set()
+        predecessors: set[int] = set()
         for predecessor_id in node.predecessors:
             if predecessor_id in removed_ids:
                 predecessors.update(retained_predecessors(predecessor_id, set()))

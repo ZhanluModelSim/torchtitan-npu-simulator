@@ -85,7 +85,7 @@ class StepBoundaryTracker:
         self.current_phase = phase
 
 
-def build_step_graphs(nodes: dict[int, OpNode]) -> dict[str, StepGraph]:
+def build_step_graphs(nodes: dict[int, OpNode], *, separate_microbatches: bool = False) -> dict[str, StepGraph]:
     """Bucket OpNodes into per-``(pp_stage, comp_type)`` StepGraphs.
 
     ``comp_type`` (set by ``dispatch_capture._record_event`` from
@@ -103,7 +103,8 @@ def build_step_graphs(nodes: dict[int, OpNode]) -> dict[str, StepGraph]:
     A node missing the ``comp_type`` tag (e.g. captured without a
     ``phase_provider``) falls back to its ``phase`` annotation. The
     template id is ``f"s{stage}_{comp_type}"`` (e.g. ``s0_I``, ``s2_W``)."""
-    buckets: dict[str, dict[str, OpNode]] = {}
+    buckets: dict[str, dict[int, OpNode]] = {}
+    step_types: dict[str, str] = {}
     for op_id, node in nodes.items():
         ann = node.annotations
         comp_type = ann.get("comp_type") or ann.get("phase", "forward")
@@ -120,13 +121,16 @@ def build_step_graphs(nodes: dict[int, OpNode]) -> dict[str, StepGraph]:
         except (TypeError, ValueError):
             stage = -1
         template_id = f"s{stage}_{comp_type}"
+        if separate_microbatches and comp_type != "OPTIMIZER":
+            template_id += f"_mb{int(ann.get('pp_mb_idx', 0))}"
+        step_types[template_id] = comp_type
         buckets.setdefault(template_id, {})[op_id] = node
 
     graphs: dict[str, StepGraph] = {}
     for template_id, phase_nodes in buckets.items():
         # step_type is the comp_type (strip the "s{stage}_" prefix) so
         # viz/exporters can group by compute-graph class.
-        step_type = template_id.split("_", 1)[1] if "_" in template_id else template_id
+        step_type = step_types[template_id]
         graphs[template_id] = StepGraph(
             step_id=uuid.uuid4().hex[:12], step_type=step_type, nodes=phase_nodes
         )

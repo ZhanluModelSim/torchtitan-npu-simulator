@@ -8,8 +8,8 @@
 from __future__ import annotations
 
 from bisect import bisect_left, bisect_right
-from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Any, Iterable
+from dataclasses import dataclass, field, replace
+from typing import TYPE_CHECKING, Any
 
 from torchtitan_npu.simulator.memory.records import (
     AutogradSavedTensorEvent,
@@ -22,6 +22,8 @@ from torchtitan_npu.simulator.memory.records import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
+
     import torch.nn as nn
 
     from torchtitan_npu.simulator.ir.schedule_plan import ScheduleAction, SchedulePlan
@@ -37,6 +39,7 @@ class ReplayedMemoryCapture:
     fsdp_residency_events: list[FSDPResidencyEvent]
     action_spans: list[MemoryActionSpan]
     dropped_duplicate_events: int = 0
+    autograd_saved_tensor_events: list[AutogradSavedTensorEvent] = field(default_factory=list)
 
 
 def _flatten_actions(actions: Iterable[ScheduleAction]) -> list[ScheduleAction]:
@@ -82,7 +85,7 @@ def _select_templates(
     candidates: dict[tuple[int, str], dict[int, list[RawMemoryEvent]]] = {}
     for event in events:
         key = _template_key(event)
-        if key not in compute_keys or event.op_id in non_replayable_op_ids:
+        if key is None or key not in compute_keys or event.op_id in non_replayable_op_ids:
             continue
         candidates.setdefault(key, {}).setdefault(event.pp_mb_idx, []).append(event)
 
@@ -90,23 +93,23 @@ def _select_templates(
     source_microbatches: dict[tuple[int, str], int] = {}
     selected_event_ids: set[int] = set()
     duplicate_count = 0
-    for key, by_microbatch in candidates.items():
-        # Full capture has far more events than a later pass-through chunk. The
-        # earliest microbatch is the deterministic tie-breaker.
-        source_mb, template = min(
-            by_microbatch.items(),
-            key=lambda item: (-len(item[1]), item[0]),
-        )
-        template = sorted(template, key=lambda event: event.seq_idx)
-        templates[key] = template
-        source_microbatches[key] = source_mb
-        selected_event_ids.update(event.event_id for event in template)
-        duplicate_count += sum(len(group) for group in by_microbatch.values()) - len(template)
+    stages = {stage for stage, _ in candidates}
+    for stage in stages:
+        keys = [key for key in candidates if key[0] == stage]
+        if any(key[1] in _BACKWARD_COMP_TYPES for key in keys) and (stage, "F") not in candidates:
+            raise ValueError(f"PP memory replay requires a paired forward microbatch on stage {stage}")
+        common = set.intersection(*(set(candidates[key]) for key in keys))
+        if not common:
+            raise ValueError(f"PP memory replay requires paired templates from one source microbatch on stage {stage}")
+        source_mb = min(common, key=lambda mb: (-sum(len(candidates[key][mb]) for key in keys), mb))
+        for key in keys:
+            by_microbatch = candidates[key]
+            template = sorted(by_microbatch[source_mb], key=lambda event: event.seq_idx)
+            templates[key] = template
+            source_microbatches[key] = source_mb
+            selected_event_ids.update(event.event_id for event in template)
+            duplicate_count += sum(len(group) for group in by_microbatch.values()) - len(template)
     return templates, source_microbatches, selected_event_ids, duplicate_count
-
-
-def _clone_ref(ref: TensorRef, tensor_id: int) -> TensorRef:
-    return replace(ref, tensor_id=tensor_id)
 
 
 def replay_pp_memory_capture(
@@ -117,6 +120,8 @@ def replay_pp_memory_capture(
     fsdp_residency_events: Iterable[FSDPResidencyEvent] | None = None,
     checkpoint_boundary_events: Iterable[CheckpointBoundaryEvent] | None = None,
     persistent_tensor_ids: set[int] | None = None,
+    persistent_storage_keys: set[str] | None = None,
+    autograd_saved_tensor_events: Iterable[AutogradSavedTensorEvent] | None = None,
 ) -> ReplayedMemoryCapture:
     """Replay one captured template for every PP compute action.
 
@@ -125,12 +130,27 @@ def replay_pp_memory_capture(
     single-source records instead of being cloned with compute templates.
     """
     events = sorted(raw_events, key=lambda event: event.seq_idx)
+    autograd_saved_tensor_events = list(autograd_saved_tensor_events or [])
     actions = _flatten_actions(schedule_plan.actions)
     compute_actions = [
         action
         for action in actions
         if action.action_type == "COMPUTE" and action.stage >= 0 and action.mb_idx >= 0 and action.comp_type
     ]
+    microbatches_by_stage: dict[int, set[int]] = {}
+    for action in compute_actions:
+        microbatches_by_stage.setdefault(action.stage, set()).add(action.mb_idx)
+    if any(len(microbatches) > 1 for microbatches in microbatches_by_stage.values()) and any(
+        event.phase == "optimizer" for event in events
+    ):
+        # TODO: capture first/subsequent backward variants and bind accumulated
+        # gradients to the single optimizer step before replaying training.
+        raise ValueError(
+            "PP memory replay with multiple microbatches and an optimizer requires "
+            "gradient accumulation bindings that are not yet supported. "
+            "Disable memory tracking to inspect graph templates only; "
+            "this does not provide a complete accumulated-gradient graph."
+        )
     compute_keys = {(action.stage, action.comp_type) for action in compute_actions}
     comm_events = list(comm_events or [])
     raw_comm_op_ids = {
@@ -176,15 +196,17 @@ def replay_pp_memory_capture(
     next_tensor_id = min(-1, min_tensor_id - 1)
     min_op_id = min((event.op_id for event in events), default=0)
     next_op_id = min(-1, min_op_id - 1)
-    tensor_ids: dict[tuple[int, int], int] = {}
+    tensor_ids: dict[tuple[int, int, int], int] = {}
+    sequence_map: dict[tuple[int, int, int], int] = {}
+    persistent_storage_keys = persistent_storage_keys or set()
     op_ids: dict[tuple[str, int], int] = {}
     canonical_mb = min((action.mb_idx for action in compute_actions), default=0)
 
-    def tensor_id_for(microbatch: int, original: int) -> int:
+    def tensor_id_for(stage: int, microbatch: int, original: int) -> int:
         nonlocal next_tensor_id
         if original in persistent_tensor_ids or microbatch == canonical_mb:
             return original
-        key = (microbatch, original)
+        key = (stage, microbatch, original)
         if key not in tensor_ids:
             tensor_ids[key] = next_tensor_id
             next_tensor_id -= 1
@@ -199,6 +221,20 @@ def replay_pp_memory_capture(
             op_ids[key] = next_op_id
             next_op_id -= 1
         return op_ids[key]
+
+    def storage_key_for(stage: int, microbatch: int, key: str) -> str:
+        if not key or key.partition(":")[0] in persistent_storage_keys:
+            return key
+        return f"pp:s{stage}:mb{microbatch}:{key}"
+
+    def clone_ref(ref: TensorRef, action: ScheduleAction) -> TensorRef:
+        is_persistent = ref.storage_key.partition(":")[0] in persistent_storage_keys
+        return replace(
+            ref,
+            tensor_id=ref.tensor_id if is_persistent else tensor_id_for(action.stage, action.mb_idx, ref.tensor_id),
+            alias_of=(tensor_id_for(action.stage, action.mb_idx, ref.alias_of) if ref.alias_of is not None else None),
+            storage_key=storage_key_for(action.stage, action.mb_idx, ref.storage_key),
+        )
 
     replayed: list[RawMemoryEvent] = []
     replayed_boundaries: list[CheckpointBoundaryEvent] = []
@@ -222,14 +258,16 @@ def replay_pp_memory_capture(
                 pp_mb_idx=action.mb_idx,
                 comp_type=action.comp_type,
                 inputs=tuple(
-                    _clone_ref(ref, tensor_id_for(action.mb_idx, ref.tensor_id))
+                    clone_ref(ref, action)
                     for ref in event.inputs
                 ),
                 outputs=tuple(
-                    _clone_ref(ref, tensor_id_for(action.mb_idx, ref.tensor_id))
+                    clone_ref(ref, action)
                     for ref in event.outputs
                 ),
             )
+        if action is not None:
+            sequence_map[(action.stage, action.mb_idx, event.seq_idx)] = logical_seq
         replayed.append(cloned)
         next_event_id += 1
         logical_seq += 1
@@ -272,11 +310,11 @@ def replay_pp_memory_capture(
                         boundary,
                         seq_idx=max(start_seq, logical_seq - 1),
                         inputs=tuple(
-                            _clone_ref(ref, tensor_id_for(action.mb_idx, ref.tensor_id))
+                            clone_ref(ref, action)
                             for ref in boundary.inputs
                         ),
                         outputs=tuple(
-                            _clone_ref(ref, tensor_id_for(action.mb_idx, ref.tensor_id))
+                            clone_ref(ref, action)
                             for ref in boundary.outputs
                         ),
                         pp_stage=action.stage,
@@ -333,6 +371,30 @@ def replay_pp_memory_capture(
             continue
         append_event(event)
 
+    replayed_slots: list[AutogradSavedTensorEvent] = []
+    for stage, microbatch in sorted({(action.stage, action.mb_idx) for action in compute_actions}):
+        spans = [span for span in action_spans if span.stage == stage and span.microbatch == microbatch and span.action_type == "COMPUTE"]
+        for saved in autograd_saved_tensor_events or ():
+            key = (saved.pp_stage, saved.comp_type)
+            if saved.pp_stage != stage or saved.pp_mb_idx != source_microbatches.get(key):
+                continue
+            pack_span = next((span for span in spans if span.comp_type == saved.comp_type), None)
+            if pack_span is None:
+                raise ValueError(f"Cannot replay saved slot {saved.slot_id} without its pack action")
+            pack_seq = sequence_map.get((stage, microbatch, saved.pack_seq), pack_span.start_seq)
+            unpack_seq = -1
+            if saved.unpack_seq >= 0:
+                mapped = sequence_map.get((stage, microbatch, saved.unpack_seq))
+                if mapped is None:
+                    raise ValueError(f"Cannot replay saved slot {saved.slot_id}: unpack anchor is outside paired microbatch templates")
+                unpack_seq = mapped
+            replayed_slots.append(replace(
+                saved, slot_id=len(replayed_slots),
+                tensor_id=(saved.tensor_id if saved.storage_key.partition(":")[0] in persistent_storage_keys else tensor_id_for(stage, microbatch, saved.tensor_id)),
+                storage_key=storage_key_for(stage, microbatch, saved.storage_key),
+                pack_seq=pack_seq, unpack_seq=unpack_seq, pp_mb_idx=microbatch,
+            ))
+
     remapped_fsdp = _remap_fsdp_residency_events(
         list(fsdp_residency_events or []),
         action_spans,
@@ -343,6 +405,7 @@ def replay_pp_memory_capture(
         fsdp_residency_events=remapped_fsdp,
         action_spans=action_spans,
         dropped_duplicate_events=dropped_duplicates,
+        autograd_saved_tensor_events=replayed_slots,
     )
 
 
@@ -412,6 +475,8 @@ def estimate_schedule_memory(
         fsdp_residency_events=fsdp_residency_events,
         checkpoint_boundary_events=checkpoint_boundary_events,
         persistent_tensor_ids=_persistent_tensor_ids(model_parts or []),
+        persistent_storage_keys=_persistent_storage_keys(model_parts or []),
+        autograd_saved_tensor_events=autograd_saved_tensor_events,
     )
     plan = estimate_static_memory(
         replayed.events,
@@ -419,9 +484,7 @@ def estimate_schedule_memory(
         comm_events=comm_events,
         fsdp_residency_events=replayed.fsdp_residency_events,
         checkpoint_boundary_events=replayed.checkpoint_boundary_events,
-        # Exact slot replay over PP templates is intentionally deferred. A
-        # raw slot cannot be reused for a different microbatch identity.
-        autograd_saved_tensor_events=None,
+        autograd_saved_tensor_events=replayed.autograd_saved_tensor_events,
         parameter_storage_dtype=parameter_storage_dtype,
         offload_ac_saved_tensors=offload_ac_saved_tensors,
         fsdp_allgather_transport_dtype=fsdp_allgather_transport_dtype,
@@ -455,3 +518,14 @@ def _persistent_tensor_ids(model_parts: Iterable[nn.Module]) -> set[int]:
             except Exception:
                 pass
     return persistent
+
+
+def _persistent_storage_keys(model_parts: Iterable[nn.Module]) -> set[str]:
+    from torchtitan_npu.simulator.memory.estimator import _to_local_tensor
+
+    return {
+        str(local.untyped_storage()._cdata)
+        for model in model_parts
+        for value in (*model.parameters(), *model.buffers())
+        if (local := _to_local_tensor(value)) is not None
+    }

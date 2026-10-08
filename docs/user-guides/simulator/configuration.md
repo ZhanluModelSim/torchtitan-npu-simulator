@@ -53,6 +53,10 @@ pipeline_microbatches = local_batch_size / pipeline_parallel_microbatch_size
 global_batch_size = local_batch_size × DP_replicate × DP_shard × gradient_accumulation_steps
 ```
 
+非 PP 路径按 `gradient_accumulation_steps` 读取真实的多个输入批次并依次执行前反向，以所有有效 token 的总数归一化 loss；一次训练 step 只清梯度一次、裁剪一次、更新优化器和学习率一次。独立调用 `run_simulation_step` 时 GA>1 必须提供对应数量的 `microbatches`。若只有 meta labels，必须显式提供 `local_valid_tokens` 或 `global_valid_tokens`，否则报错；不能由 shape 推断 IGNORE_INDEX 的数量。当前 PP 与 GA>1 的组合显式拒绝，PP 内部的 microbatch 切分仍由 schedule 执行。
+
+当前 PP 多 microbatch 且包含 optimizer 的内存回放尚未实现跨 MB 的梯度累积绑定，会显式报错。可关闭 `simulation.enable_memory_tracking` 检查计算模板，但这不代表已捕获完整的累积梯度图；单 microbatch 内存回放和无 optimizer 的激活回放不受此限制。
+
 PP 开启时 local batch 必须能被 PP microbatch size 整除。microbatch 数少于 stage 数不应直接写成非法；具体 schedule 的要求和效率需分别判断。并行参数检查脚本为 `scripts/validate_parallel_config.py`，运行命令仍需满足模型约束。
 
 ## 常用 CLI 覆盖

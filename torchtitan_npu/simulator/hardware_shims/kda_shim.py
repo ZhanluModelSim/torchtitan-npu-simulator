@@ -44,7 +44,8 @@ class _SimChunkKDAFn(torch.autograd.Function):
     """Shape-only autograd bridge for chunk_kda on meta tensors."""
 
     @staticmethod
-    def forward(ctx, q, k, v, g, beta, A_log, dt_bias, module_path):  # noqa: ANN001
+    # pyrefly: ignore [bad-override]
+    def forward(ctx, q, k, v, g, beta, A_log, dt_bias, module_path):
         # Output shape: same as v (B, S, H, D)
         output = run_synthetic_op(
             "triton_ascend_kernels.chunk_kda",
@@ -57,7 +58,8 @@ class _SimChunkKDAFn(torch.autograd.Function):
         return output
 
     @staticmethod
-    def backward(ctx, grad_output):  # noqa: ANN001
+    # pyrefly: ignore [bad-override]
+    def backward(ctx, grad_output):
         q, k, v, g, beta, A_log, dt_bias = ctx.saved_tensors
         grads = [
             _uncaptured_empty_like(q),
@@ -70,14 +72,14 @@ class _SimChunkKDAFn(torch.autograd.Function):
         ]
         _record(
             "triton_ascend_kernels.chunk_kda_grad",
-            [q, k, v, g, beta, grad_output],
+            [q, k, v, g, beta, A_log, dt_bias, grad_output],
             grads,
             ctx.module_path,
         )
         return (*grads, None)  # module_path
 
 
-def sim_chunk_kda(module, q, k, v, g, beta):  # noqa: ANN001
+def sim_chunk_kda(module, q, k, v, g, beta):
     """Record KDA without replacing the already-parallelized module."""
     module_path = _current_module_path()
     A_log = (

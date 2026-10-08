@@ -135,11 +135,14 @@ def run_synthetic_op(
             )
         return outputs
 
-    outputs = output_factory()
-    flat_outputs = list(outputs) if isinstance(outputs, (tuple, list)) else [outputs]
     from torchtitan_npu.simulator.capture.dispatch_capture import get_active_capture
 
     capture = get_active_capture()
+    # Shape-only allocations belong to the synthetic operator, not separate
+    # dispatcher kernels. Self-recording collective factories retain capture.
+    with capture.suspend_recording() if capture is not None and record_op else contextlib.nullcontext():
+        outputs = output_factory()
+    flat_outputs = list(outputs) if isinstance(outputs, (tuple, list)) else [outputs]
     if capture is not None and record_op:
         capture.record_synthetic_op(
             raw_op_type,

@@ -20,6 +20,9 @@ class TensorRef:
     device: str
     num_bytes: int
     requires_grad: bool = False
+    alias_of: int | None = None
+    storage_key: str = ""
+    storage_bytes: int = 0
 
 
 @dataclass(frozen=True, slots=True)

@@ -37,12 +37,13 @@ class MissingParameterGradient:
 
 @dataclass(frozen=True, slots=True)
 class ParameterTensorMetadata:
-    """Local parameter-shard metadata used to recover DTensor aliases."""
+    """Persistent local parameter storage and its logical metadata."""
 
     name: str
     num_bytes: int
     shape: tuple[int, ...]
     dtype: str
+    storage_key: str = ""
 
 
 @dataclass(slots=True)

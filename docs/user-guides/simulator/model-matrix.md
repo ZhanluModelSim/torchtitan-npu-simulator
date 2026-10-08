@@ -44,6 +44,7 @@ kimi_k3_smoketest
 | ETP | 未支持，模型代码显式抛错 | 有 EP+ETP 实现及 mesh/维度校验；本次未运行组合验证 |
 | CP | 需要 `npu_smla`，使用 compressor/window exchange 等路径 | 全序列 all-gather 的保守正确方案；要求 contiguous shards，load balancer 为 None |
 | PP | 有实现，含复杂 schedule/virtual stages | 未支持，parallelize 明确拒绝 |
+| indexer loss | 需 `npu_smla` 转换后的 `SimNpuLiLoss`；未转换的基础 `LiLoss` 显式拒绝捕获 | 不适用 |
 | MTP | 有实现；MTP+PP 明确拒绝，PP 必须设置 `training.num_mtp_modules=0` | 没有与 DeepSeek 等价的专门 MTP 接入 |
 | AC none/full/selective | 有实现和重计算归属 | 有实现和 attention synthetic SAC |
 | AC memory_budget | 未支持，需要 compile，与 eager 捕获冲突 | 同左 |

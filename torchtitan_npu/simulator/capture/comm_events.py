@@ -17,7 +17,7 @@ import itertools
 import contextvars
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Iterator
+from typing import Any, Iterator
 
 import torch
 import torch.distributed as dist
@@ -753,6 +753,9 @@ def capture_fake_collectives(
     )
     _active_recorder = recorder
 
+    from torch.distributed.tensor import _collective_utils
+    orig_shard_dim_alltoall = _collective_utils.shard_dim_alltoall
+
     orig_all_reduce = dist.all_reduce
     orig_all_gather_into_tensor = dist.all_gather_into_tensor
     orig_reduce_scatter_tensor = dist.reduce_scatter_tensor
@@ -1027,9 +1030,35 @@ def capture_fake_collectives(
     funcol.reduce_scatter_tensor_autograd = patched_funcol_reduce_scatter_tensor_autograd
     funcol.all_to_all_single_autograd = patched_funcol_all_to_all_single_autograd
 
+    def patched_shard_dim_alltoall(input_tensor: torch.Tensor, gather_dim: int, shard_dim: int, mesh: Any, mesh_dim: int) -> torch.Tensor:
+        group = mesh.get_group(mesh_dim)
+        if mesh.device_type == "cpu" or not _should_intercept(group):
+            return orig_shard_dim_alltoall(input_tensor, gather_dim, shard_dim, mesh, mesh_dim)
+        shape = [int(dim) for dim in input_tensor.shape]
+        world_size = int(mesh.size(mesh_dim))
+        shape[gather_dim] *= world_size
+        if shape[shard_dim] % world_size:
+            raise ValueError("DTensor shard-axis all-to-all requires planner-padded divisible input")
+        shape[shard_dim] //= world_size
+        output = _uncaptured_empty(shape, dtype=input_tensor.dtype, device=input_tensor.device)
+        _record_comm_with_l0(recorder, "all_to_all", group, input_tensor, output)
+        return output
+
+    # DTensor's non-CPU planner bypasses funcol for this native transport.
+    # Patch its cached Python bindings as well as the defining module.
+    import sys
+    for name, module in tuple(sys.modules.items()):
+        namespace = vars(module) if module is not None else {}
+        if name.startswith("torch.distributed.tensor") and namespace.get("shard_dim_alltoall") is orig_shard_dim_alltoall:
+            namespace["shard_dim_alltoall"] = patched_shard_dim_alltoall
+
     try:
         yield recorder
     finally:
+        for name, module in tuple(sys.modules.items()):
+            namespace = vars(module) if module is not None else {}
+            if name.startswith("torch.distributed.tensor") and namespace.get("shard_dim_alltoall") is patched_shard_dim_alltoall:
+                namespace["shard_dim_alltoall"] = orig_shard_dim_alltoall
         dist.all_reduce = orig_all_reduce
         dist.all_gather_into_tensor = orig_all_gather_into_tensor
         dist.reduce_scatter_tensor = orig_reduce_scatter_tensor

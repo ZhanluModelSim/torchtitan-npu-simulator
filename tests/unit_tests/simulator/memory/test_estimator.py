@@ -228,7 +228,7 @@ def test_activation_offload_covers_none_mode_and_reports_each_layer():
     assert all(item.role == "activation_saved" for item in records.values())
 
 
-def test_autograd_saved_slots_release_use_def_only_activations():
+def test_autograd_saved_slots_preserve_use_def_only_activations():
     x = tref(1)
     saved = tref(2, 64)
     inferred_only = tref(3, 128)
@@ -258,8 +258,9 @@ def test_autograd_saved_slots_release_use_def_only_activations():
     lifetimes = {item.tensor_id: item for item in plan.tensor_lifetimes}
     assert lifetimes["tensor:2"].kind == "activation"
     assert lifetimes["tensor:2"].death_seq == 5
-    assert lifetimes["tensor:3"].kind == "temporary"
-    assert lifetimes["tensor:3"].death_seq == 1
+    assert lifetimes["tensor:3"].kind == "activation"
+    assert lifetimes["tensor:3"].death_seq == 5
+    assert lifetimes["tensor:3"].reason == "backward_use_without_saved_slot"
     assert plan.to_summary_dict()["autograd_saved_activation_count"] == 1
 
 
@@ -292,7 +293,7 @@ def test_exact_autograd_saved_slots_drive_activation_offload():
     lifetimes = {item.tensor_id: item for item in plan.tensor_lifetimes}
     assert lifetimes["tensor:2"].kind == "offloaded_activation"
     assert lifetimes["tensor:2"].resident_num_bytes == 0
-    assert lifetimes["tensor:3"].kind == "temporary"
+    assert lifetimes["tensor:3"].kind == "activation"
     assert [item.tensor_id for item in plan.activation_offload_tensors] == ["tensor:2"]
     summary = plan.to_summary_dict()
     assert summary["autograd_saved_activation_count"] == 1
@@ -309,6 +310,24 @@ def test_autograd_saved_tensor_capture_records_meta_pack_and_unpack():
     assert len(saved) == 2
     assert all(item.shape == (4,) for item in saved)
     assert all(item.unpack_seq >= item.pack_seq for item in saved)
+
+
+@pytest.mark.parametrize("unpack_seq", [5, -1])
+def test_saved_activation_keeps_later_consumers_and_unconsumed_slots(unpack_seq):
+    saved = tref(2, 64)
+    plan = estimate_static_memory([
+        event(0, 10, "aten.clone.default", outputs=[saved]),
+        event(5, 20, "aten.mul.Tensor", inputs=[saved], phase="backward"),
+        event(9, 21, "aten.add.Tensor", inputs=[saved], phase="backward"),
+    ], autograd_saved_tensor_events=[AutogradSavedTensorEvent(
+        slot_id=0, tensor_id=2, storage_key="retained", storage_bytes=64,
+        num_bytes=64, shape=(16,), dtype="float32", pack_seq=0,
+        unpack_seq=unpack_seq, phase="forward", execution_kind="original_forward",
+    )])
+    lifetime = next(item for item in plan.tensor_lifetimes if item.tensor_id == "tensor:2")
+    assert lifetime.death_seq >= 9
+    assert lifetime.reason == "autograd_saved_tensor"
+    assert lifetime.death_seq == (9 if unpack_seq >= 0 else 10)
 
 
 def test_activation_offload_preserves_pipeline_microbatch_instances():
@@ -1017,6 +1036,7 @@ def test_view_name_fragments_do_not_alias_allocating_outputs(raw_op):
     "aten.select.int", "aten.narrow.default", "aten.as_strided.default",
     "aten.squeeze.dim", "aten.unsqueeze.default", "aten.detach.default",
     "aten.split.Tensor", "aten.split_with_sizes.default", "aten::view",
+    "aten.expand.default", "aten.alias.default",
 ])
 def test_exact_view_operators_preserve_base_and_backward_lifetime(raw_op):
     source, base, first, second = tref(1), tref(2, 64), tref(3, 32), tref(4, 32)
@@ -1044,6 +1064,28 @@ def test_identity_output_does_not_alias_independent_sibling():
     assert lifetimes["external:1"].kind == "external_input"
     assert lifetimes["tensor:2"].num_bytes == 64
     assert lifetimes["tensor:2"].alias_of == ""
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.int64])
+@pytest.mark.parametrize("rows", [0, 8])
+def test_expand_shares_storage_until_last_view_use_and_clone_allocates(dtype, rows):
+    capture = OpDispatchCapture()
+    with capture:
+        base = torch.empty(1, 4, dtype=dtype, device="meta")
+        expanded = base.expand(rows, 4)
+        copied = expanded.clone()
+        expanded.sum()
+    plan = estimate_static_memory(capture.memory_events())
+    lifetimes = {item.tensor_id: item for item in plan.tensor_lifetimes}
+    base_lifetime = lifetimes[f"tensor:{capture.tensor_id(base)}"]
+    alias = lifetimes[f"alias:{capture.tensor_id(expanded)}"]
+    copy_lifetime = lifetimes[f"tensor:{capture.tensor_id(copied)}"]
+    last_use = next(event for event in capture.memory_events() if event.raw_op_type == "aten.sum.default")
+    assert alias.alias_of == base_lifetime.tensor_id
+    assert alias.num_bytes == 0
+    assert base_lifetime.num_bytes == 4 * base.element_size()
+    assert base_lifetime.death_seq == last_use.seq_idx
+    assert copy_lifetime.num_bytes == rows * 4 * base.element_size()
 
 
 @pytest.mark.parametrize("copy_required", [False, True])
@@ -1122,6 +1164,7 @@ def test_dtensor_local_parameter_materialization_is_not_counted_as_external_inpu
         dtype="float32",
         device="meta",
         num_bytes=1 * 4 * 8 * 4,
+        storage_key=f"{model.weight.untyped_storage()._cdata}:0",
     )
     plan = estimate_static_memory(
         [event(0, 10, "aten._to_copy.default", inputs=[local_parameter], outputs=[tref(1)])],

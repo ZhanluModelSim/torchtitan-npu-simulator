@@ -19,8 +19,10 @@ _ALIAS_OPERATORS = frozenset(
     {
         "aten._reshape_alias",
         "aten._unsafe_view",
+        "aten.alias",
         "aten.as_strided",
         "aten.detach",
+        "aten.expand",
         "aten.narrow",
         "aten.permute",
         "aten.select",

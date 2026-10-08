@@ -186,6 +186,7 @@ _original_from_torch_tensor_autograd: Any = _MISSING
 _original_rowwise_prepare_output: Any = _MISSING
 _original_torch_split: Any = _MISSING
 _original_redistribute_local_tensor: Any = _MISSING
+_simulator_redistribute_wrapper: Any = _MISSING
 _original_recv_object_list: Any = _MISSING
 _original_send_object_list: Any = _MISSING
 _original_torch_equal: Any = _MISSING
@@ -691,36 +692,12 @@ def _patch_parameter_dtensor_for_meta() -> None:
 
 
 def _patch_li_loss_to_skip_buggy_einsum() -> None:
-    """`LiLoss._current_selected_attn_dist` (the base, pre-conversion
-    class -- used under simulation since `npu_smla` is stripped from
-    `config.model_converters.converters`, see
-    `torchtitan_npu.simulator.trainer._strip_hardware_dependent_model_converters`)
-    has a real, pre-existing shape bug: it concatenates `kv`/`kv_compress`
-    (each shaped `(bsz, seq, head_dim)` -- MLA-style attention shares KV
-    across all heads, so there is no separate heads dimension) into
-    `kv_states`, then computes
-    `torch.einsum("bhsd,bkhd->bhsk", query, kv_states)`, whose equation
-    expects `kv_states` to be 4-dimensional (`bkhd`) -- it is actually
-    3-dimensional, raising `RuntimeError: the number of subscripts in the
-    equation (4) does not match the number of dimensions (3)`. This path
-    is never exercised in real production, which always uses the
-    NPU-converted `LiLoss` (whose own custom op computes this
-    auxiliary loss differently) -- but that NPU-converted form also
-    crashes under meta simulation (a real hardware "Invalid device ID"
-    check, unreachable from Python-level monkeypatching), which is why
-    `npu_smla` is stripped entirely rather than surgically patched.
+    """Reject unconverted indexer loss instead of capturing an inert zero.
 
-    `LiLoss.forward`'s only consumer,
-    `InnerAttention.forward`, uses its return value purely as an
-    auxiliary loss term via `DSAIndexerLossAutoScaler.apply(o, loss)`,
-    whose own `forward()` returns `o` unchanged and only stashes `loss`
-    for the backward pass (`ctx.save_for_backward(aux_loss)`) -- so the
-    main attention output's shape is entirely unaffected by `loss`'s
-    exact value. Replaces `LiLoss.forward` with a version that skips the
-    buggy computation entirely, returning a zero-valued placeholder loss
-    (still calling `self.save_loss(...)` for parity with the original
-    logging side effect). No-op if torch_npu (and therefore this
-    torchtitan_npu submodule) is not importable."""
+    Converted SimNpuLiLoss overrides this method and captures its deferred
+    backward kernel. The base eager implementation is not supported under
+    simulation; its auxiliary-loss dependencies must not silently disappear.
+    """
     global _original_li_loss_forward
     try:
         import torchtitan_npu.models.deepseek_v4.model as model_mod
@@ -735,9 +712,10 @@ def _patch_li_loss_to_skip_buggy_einsum() -> None:
 
     def _meta_safe_forward(self, q, kv, kv_compress, attn_sink, q_indexer, k_indexer, weights,  # noqa: ANN001
                             compress_topk_idxs, index_score, attention_masks, offset):
-        loss = torch.zeros((), device=q.device, dtype=torch.float32)
-        self.save_loss(loss)
-        return loss
+        raise ValueError(
+            "Simulator cannot capture base LiLoss with indexer loss enabled. "
+            "Use the npu_smla converter and SimNpuLiLoss, or disable indexer loss."
+        )
 
     li_loss_cls.forward = _meta_safe_forward
 
@@ -1292,24 +1270,23 @@ def _patch_window_exchange_for_fake_pg() -> None:
         # This ensures _WindowExchange's isend/irecv appear in the captured IR.
         from torchtitan_npu.simulator.capture.comm_events import get_active_recorder, _record_comm_with_l0
         recorder = get_active_recorder()
+        send_buf = tensor[:, -window:]
+        recv_buf = torch.empty_like(send_buf) if ctx.forward_recvd else None
         if recorder is not None:
-            send_buf = tensor[:, -window:]
             if ctx.forward_sent:
                 event = _record_comm_with_l0(recorder, "p2p_send", group, send_buf)
                 event.p2p_peer_rank = rank + 1
                 event.p2p_direction = "cp_forward_send"
                 event.p2p_mb_idx = -1
                 event.p2p_stage = rank
-            if ctx.forward_recvd:
-                recv_buf = torch.empty_like(send_buf)
+            if recv_buf is not None:
                 event = _record_comm_with_l0(recorder, "p2p_recv", group, recv_buf)
                 event.p2p_peer_rank = rank - 1
                 event.p2p_direction = "cp_forward_recv"
                 event.p2p_mb_idx = -1
                 event.p2p_stage = rank
 
-        if ctx.forward_recvd:
-            recv_buf = torch.empty_like(tensor[:, -window:])
+        if recv_buf is not None:
             tensor = torch.cat([recv_buf, tensor], dim=1)
         return tensor
 
@@ -1325,6 +1302,7 @@ def _patch_window_exchange_for_fake_pg() -> None:
         # Record CP P2P backward communication events.
         from torchtitan_npu.simulator.capture.comm_events import get_active_recorder, _record_comm_with_l0
         recorder = get_active_recorder()
+        grad_recv = torch.zeros_like(grad_output[:, :window]) if ctx.forward_sent else None
         if recorder is not None:
             if ctx.forward_recvd:
                 grad_send = grad_output[:, :window]
@@ -1333,16 +1311,14 @@ def _patch_window_exchange_for_fake_pg() -> None:
                 event.p2p_direction = "cp_backward_send"
                 event.p2p_mb_idx = -1
                 event.p2p_stage = rank
-            if ctx.forward_sent:
-                grad_recv = torch.empty_like(grad_output[:, :window])
+            if grad_recv is not None:
                 event = _record_comm_with_l0(recorder, "p2p_recv", ctx.group, grad_recv)
                 event.p2p_peer_rank = rank + 1
                 event.p2p_direction = "cp_backward_recv"
                 event.p2p_mb_idx = -1
                 event.p2p_stage = rank
 
-        if ctx.forward_sent:
-            grad_recv = torch.zeros_like(grad_output[:, :window])
+        if grad_recv is not None:
             grad_output[:, -window:] = grad_output[:, -window:] + grad_recv
         if ctx.forward_recvd:
             grad_output = grad_output[:, window:]
@@ -1353,63 +1329,38 @@ def _patch_window_exchange_for_fake_pg() -> None:
 
 
 def _patch_redistribute_local_tensor_for_meta() -> None:
-    """Under meta-device simulation, ``redistribute_local_tensor`` calls
-    ``funcol.all_gather_tensor`` / ``reduce_scatter_tensor`` etc. to transform
-    a DTensor's sharding.  The fake process group's all_gather does not
-    actually concatenate shards (it returns a tensor of the *local* shape),
-    so the subsequent ``_maybe_unpad_tensor`` sees a shape mismatch and raises
-    ``RuntimeError: narrow unexpectedly changed concrete size``.
+    """Reuse PyTorch's placement planner with simulator collective transport.
 
-    Since values are irrelevant under meta simulation, we short-circuit the
-    entire redistribution: compute the correct *local* shape from the target
-    ``DTensorSpec`` and return an empty meta tensor with that shape.  This
-    preserves correct shape propagation for the captured compute graph while
-    avoiding all collective communication.  Falls back to the original for
-    non-meta tensors."""
-    global _original_redistribute_local_tensor
-    try:
-        from torch.distributed.tensor._redistribute import redistribute_local_tensor
-        from torch.distributed.tensor._dtensor_spec import DTensorSpec
-        from torch.distributed.tensor.placement_types import Shard, Partial, Replicate
-    except Exception:
-        return
+    Imported DTensor entry points cache this helper, so every loaded binding
+    must participate and be restored when leaving simulation.
+    """
+    global _original_redistribute_local_tensor, _simulator_redistribute_wrapper
+    from torch.distributed.tensor import _redistribute
 
     if _original_redistribute_local_tensor is not _MISSING:
         return
-    _original_redistribute_local_tensor = redistribute_local_tensor
+    original = _redistribute.redistribute_local_tensor
+    _original_redistribute_local_tensor = original
 
-    def _meta_safe_redistribute(local_tensor, current_spec, target_spec, *, async_op=False, use_graph_based_transform=None, is_explicit=False):  # noqa: ANN001
-        # Only short-circuit on meta device tensors
+    def _meta_safe_redistribute(local_tensor, current_spec, target_spec, *, async_op=False, use_graph_based_transform=None, is_explicit=False):
+        from torchtitan_npu.simulator.capture.comm_events import capture_fake_collectives, get_active_recorder
+
+        kwargs = dict(async_op=async_op, use_graph_based_transform=use_graph_based_transform, is_explicit=is_explicit)
         if not isinstance(local_tensor, torch.Tensor) or local_tensor.device.type != "meta":
-            return _original_redistribute_local_tensor(
-                local_tensor, current_spec, target_spec,
-                async_op=async_op, use_graph_based_transform=use_graph_based_transform, is_explicit=is_explicit,
-            )
+            return original(local_tensor, current_spec, target_spec, **kwargs)
+        # Initialization can redistribute before the main capture context.
+        # Never enter another recorder when an existing one owns the events.
+        if get_active_recorder() is not None:
+            return original(local_tensor, current_spec, target_spec, **kwargs)
+        with capture_fake_collectives():
+            return original(local_tensor, current_spec, target_spec, **kwargs)
 
-        # Compute the correct local shape for the target spec.
-        # The target spec's .shape is the *global* (logical) shape; we need
-        # the local shape after applying target placements on the mesh.
-        global_shape = tuple(target_spec.shape)
-        mesh = target_spec.mesh
-        placements = target_spec.placements
-        local_shape = list(global_shape)
-        for mesh_dim, placement in enumerate(placements):
-            if isinstance(placement, Shard):
-                dim = placement.dim
-                mesh_size = mesh.size(mesh_dim)
-                if mesh_size > 1 and dim < len(local_shape):
-                    local_shape[dim] = max(1, global_shape[dim] // mesh_size)
-            # Partial -> local shape is same as global (each rank has full size)
-            # Replicate -> local shape is same as global
-        return torch.empty(
-            tuple(local_shape),
-            dtype=local_tensor.dtype,
-            device="meta",
-            requires_grad=local_tensor.requires_grad,
-        )
-
-    import torch.distributed.tensor._redistribute as _redistribute_module
-    _redistribute_module.redistribute_local_tensor = _meta_safe_redistribute
+    import sys
+    _simulator_redistribute_wrapper = _meta_safe_redistribute
+    for name, module in tuple(sys.modules.items()):
+        namespace = vars(module) if module is not None else {}
+        if name.startswith("torch.distributed.tensor") and namespace.get("redistribute_local_tensor") is original:
+            namespace["redistribute_local_tensor"] = _meta_safe_redistribute
 
 
 def _patch_object_collectives_for_fake_pg() -> None:
@@ -1693,7 +1644,7 @@ def _patch_pipeline_stage_for_pp_context() -> None:
     backward_weight_one_chunk to update the global ``_pp_context`` dict
     with the current microbatch index, phase, stage index, and *fine-grained
     compute-graph class* (``comp_type``), and to gate L0 capture on a
-    per-(stage, comp_type) class key instead of ``mb_idx == 0``.
+    per-stage representative microbatch shared by every compute class.
 
     ``comp_type`` maps directly to
     ``torch.distributed.pipelining.schedules._ComputationType``:
@@ -1703,12 +1654,11 @@ def _patch_pipeline_stage_for_pp_context() -> None:
       * backward_weight_one_chunk                      -> "W" (weight-grad only)
 
     The L0 capture gate is ``cap.begin_chunk((stage, comp_type))``:
-    the FIRST occurrence of each (stage, comp_type) class is captured in
-    full, every subsequent occurrence (same class, later microbatch) is a
-    pass-through that only records an L2 timeline event and bumps the
-    class's instance count.  This makes every distinct compute graph
-    appear exactly once in the L0 IR while keeping capture cost
-    proportional to the number of distinct classes (not num_microbatches).
+    each class is captured once from the stage's first forward microbatch,
+    including its paired B or I/W chunks. Other microbatches pass through
+    while recording L2 timeline events and class instance counts. This
+    preserves forward/backward identities at a capture cost proportional
+    to the number of distinct classes.
 
     All PP schedule types (1F1B, GPipe, DualPipe, ZBV, Interleaved, etc.)
     go through these methods, so one set of patches covers every schedule
@@ -2967,7 +2917,7 @@ def patch_device_type_to_meta() -> None:
     `torch.Tensor.npu()` calls, a hardcoded `torch.full(...,
     device="npu")` literal, a grouped-matmul offsets dtype mismatch, MoE
     dispatch's real-data-dependent all-to-all split-size computation, and
-    the base LiLoss class's real shape bug (see
+    reject unsupported base LiLoss capture (see
     `_neutralize_torch_npu_optimizer_device_probe`,
     `_patch_swap_optimizer_get_device_info`,
     `_patch_tensor_npu_method_to_meta`,
@@ -3066,7 +3016,7 @@ def unpatch_device_type_to_meta() -> None:
     global _original_window_exchange, _original_dtensor_meta_to_dtensor, _original_from_torch_tensor_autograd
     global _original_rowwise_prepare_output
     global _original_torch_split
-    global _original_redistribute_local_tensor, _original_recv_object_list, _original_send_object_list
+    global _original_redistribute_local_tensor, _simulator_redistribute_wrapper, _original_recv_object_list, _original_send_object_list
     global _original_torch_equal
     global _original_fused_adamw
     global _original_llama4_fsdp_mesh_info, _original_maybe_enable_amp, _original_parameter_new
@@ -3179,9 +3129,12 @@ def unpatch_device_type_to_meta() -> None:
         _original_torch_split = _MISSING
 
     if _original_redistribute_local_tensor is not _MISSING:
-        import torch.distributed.tensor._redistribute as _redistribute_module
-
-        _redistribute_module.redistribute_local_tensor = _original_redistribute_local_tensor
+        import sys
+        for name, module in tuple(sys.modules.items()):
+            namespace = vars(module) if module is not None else {}
+            if name.startswith("torch.distributed.tensor") and namespace.get("redistribute_local_tensor") is _simulator_redistribute_wrapper:
+                namespace["redistribute_local_tensor"] = _original_redistribute_local_tensor
+        _simulator_redistribute_wrapper = _MISSING
         _original_redistribute_local_tensor = _MISSING
 
     if _original_recv_object_list is not _MISSING:

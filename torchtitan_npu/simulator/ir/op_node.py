@@ -25,8 +25,8 @@ class OpNode:
     inputs: list[TensorMeta]
     outputs: list[TensorMeta]
     attrs: dict[str, Any]
-    predecessors: list[str]
-    successors: list[str]
+    predecessors: list[int]
+    successors: list[int]
     flops: int = 0
     peak_mem: int = 0
     param_mem: int = 0
