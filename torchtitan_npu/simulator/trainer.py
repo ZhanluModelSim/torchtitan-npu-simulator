@@ -623,7 +623,9 @@ class SimulationTrainer(Trainer):
         from torchtitan.distributed import utils as dist_utils
         return dist_utils.clip_grad_norm_(
             [parameter for part in self.model_parts for parameter in part.parameters()],
-            self.config.training.max_norm, foreach=True,
+            # The NPU foreach capability check rejects meta tensors. Use the
+            # equivalent per-tensor path while retaining distributed reductions.
+            self.config.training.max_norm, foreach=False,
             pp_mesh=self.parallel_dims.get_optional_mesh("pp"),
             ep_enabled=self.parallel_dims.ep_enabled,
         )

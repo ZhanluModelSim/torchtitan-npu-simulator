@@ -10,7 +10,26 @@ import torch
 from torch import nn
 
 from torchtitan_npu.simulator.meta_env import unpatch_device_type_to_meta
-from torchtitan_npu.simulator.trainer import run_simulation_step
+from torchtitan_npu.simulator.trainer import SimulationTrainer, run_simulation_step
+
+
+def test_trainer_gradient_clipping_supports_meta_parameters():
+    model = nn.Linear(4, 2, device="meta")
+    for parameter in model.parameters():
+        parameter.grad = torch.ones_like(parameter)
+    trainer = SimpleNamespace(
+        model_parts=[model],
+        config=SimpleNamespace(training=SimpleNamespace(max_norm=0.25)),
+        parallel_dims=SimpleNamespace(
+            get_optional_mesh=lambda name: None, ep_enabled=False,
+        ),
+    )
+
+    norm = SimulationTrainer._capture_clip_grad_norm(trainer)
+
+    assert norm.device.type == "meta"
+    assert norm.ndim == 0
+    assert all(parameter.grad is not None for parameter in model.parameters())
 
 
 def _dims():
