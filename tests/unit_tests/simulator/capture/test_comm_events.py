@@ -545,6 +545,66 @@ def test_fsdp_reduce_scatter_keeps_parameter_gradient_dependencies():
     assert reduce_scatter.annotations["fsdp_module_fqn"] == "layers.0"
 
 
+@pytest.mark.parametrize("use_reduce_scatter", [False, True])
+def test_fsdp_allreduce_keeps_both_gradients_without_serializing_groups(
+    monkeypatch, use_reduce_scatter,
+):
+    from torchtitan_npu.simulator.capture import comm_events
+    from torchtitan_npu.simulator.capture.fsdp_residency import (
+        _active_fsdp_communication_context,
+        _active_fsdp_reduction_dependencies,
+        _active_fsdp_transition,
+    )
+
+    __import__("torch.distributed._composable.fsdp")
+    monkeypatch.setattr(comm_events, "_group_name", lambda group: "dp_replicate")
+    capture = OpDispatchCapture(phase_provider=lambda: "backward")
+    with capture, capture_fake_collectives():
+        for layer in range(2):
+            gradients = (
+                torch.ones(4, device="meta").sin(),
+                torch.ones(4, device="meta").cos(),
+            )
+            transition_token = _active_fsdp_transition.set(("", f"group{layer}"))
+            communication_token = _active_fsdp_communication_context.set(
+                (f"layers.{layer}", "", "")
+            )
+            dependency_token = _active_fsdp_reduction_dependencies.set(gradients)
+            try:
+                with capture.suppress_dispatch_events("fsdp_post_backward_scaffold"):
+                    packed_buffer = torch.empty(8, device="meta")
+                    torch.ops.fsdp.chunk_cat.default(
+                        list(gradients), 0, 1, out=packed_buffer.view(1, 8),
+                    )
+                    reduced = torch.empty(8, device="meta")
+                    if use_reduce_scatter:
+                        dist.reduce_scatter_tensor(reduced, packed_buffer)
+                    else:
+                        reduced.copy_(packed_buffer)
+                    dist.all_reduce(reduced)
+            finally:
+                _active_fsdp_reduction_dependencies.reset(dependency_token)
+                _active_fsdp_communication_context.reset(communication_token)
+                _active_fsdp_transition.reset(transition_token)
+
+    nodes = capture.build_nodes()
+    allreduces = [n for n in nodes.values() if n.annotations["raw_op_type"] == "comm.allreduce"]
+    gradient_producers = [
+        n for n in nodes.values()
+        if n.annotations["raw_op_type"] in {"aten.sin.default", "aten.cos.default"}
+    ]
+    reductions = [n for n in nodes.values() if n.annotations["raw_op_type"] == "comm.reduce_scatter"]
+    assert len(allreduces) == 2
+    assert len(gradient_producers) == 4
+    for layer, allreduce in enumerate(allreduces):
+        expected = {n.op_id for n in gradient_producers[2 * layer:2 * layer + 2]}
+        if use_reduce_scatter:
+            expected.add(reductions[layer].op_id)
+        assert set(allreduce.predecessors) == expected
+        assert allreduce.annotations["fsdp_group_id"] == f"group{layer}"
+        assert not allreduce.successors
+
+
 def test_funcol_all_gather_tensor_returns_correctly_shaped_new_tensor():
     t = torch.randn(4, 8, device="meta")
     with capture_fake_collectives() as recorder:

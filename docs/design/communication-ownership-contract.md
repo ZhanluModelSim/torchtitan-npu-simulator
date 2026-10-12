@@ -114,7 +114,13 @@ Reduction dependencies come only from the captured gradient data flow:
 ```text
 parameter gradient producers -> RS(group N)
 RS(group N) -> AR(group N)         # corresponding HSDP data path
+parameter gradient producers -> AR(group N)  # replicate-only, no actual RS
 ```
+
+Replicate-only parameter groups with a size-one reduce-scatter mesh skip the
+actual RS collective. Their native AR also carries the original parameter
+gradients as dependency-only inputs, since its packed buffer is produced by
+hidden framework scaffolding. When RS is present, its RS-to-AR edge is retained.
 
 There is no synthetic RS stream, AR stream, or post-backward control node in
 the exported graph. In particular, an RS/AR from one parameter group must not

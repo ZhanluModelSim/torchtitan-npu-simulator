@@ -459,7 +459,9 @@ def _record_comm_with_l0(
             event.fsdp_prefetch_source_fqn,
             event.fsdp_prefetch_type,
         ) = get_active_fsdp_communication_context()
-        if comm_primitive == "reduce_scatter" and event.fsdp_group_id:
+        # Replicate-only groups skip RS and all-reduce a packed gradient
+        # buffer whose framework copy operations are hidden from L0.
+        if comm_primitive in {"reduce_scatter", "allreduce"} and event.fsdp_group_id:
             fsdp_dependencies = get_active_fsdp_reduction_dependencies()
             if fsdp_dependencies:
                 dependency_inputs = [
