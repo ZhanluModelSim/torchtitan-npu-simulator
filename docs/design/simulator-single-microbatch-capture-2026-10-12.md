@@ -4,9 +4,9 @@
 
 ## 行为
 
-非 PP 固定读取一个本地批次，执行一次 F/B、梯度裁剪、optimizer 和 LR 更新。原始算子、内存事件、L1 图、L2 执行实例和 L3 iteration 都只覆盖一个 MB，不随配置 GA 展开。模板名保持 `s0_F`、`s0_B`、`s0_OPTIMIZER`。
+非 PP 固定读取一个本地批次，执行一次 F/B、梯度裁剪、optimizer 和 LR 更新。原始算子、内存事件、L1 图和 L2 执行实例只捕获一次，不随配置 GA 展开。模板名保持 `s0_F`、`s0_B`、`s0_OPTIMIZER`。L3 的 `iteration.microbatch_count`、L2 的 `num_micro_batches` / `gradient_accumulation` 均返回原配置的真实值，捕获一次不改变工作负载数量语义。
 
-原配置不改写；SchedulePlan、ScheduleGraph 和内存 summary 的 `capture` 元数据保存：
+原配置不改写，下游直接使用已有数量字段，无需感知实际捕获次数。SchedulePlan、ScheduleGraph 和内存 summary 的可选 `capture` 诊断元数据保存：
 
 - `scope=single_microbatch`、`captured_microbatches=1`。
 - `configured_microbatches` / `configured_gradient_accumulation`：原始 GA。

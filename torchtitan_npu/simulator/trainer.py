@@ -222,7 +222,7 @@ def run_simulation_step(
     if not parallel_dims.pp_enabled:
         input_dict, labels = microbatches[0]
         microbatches = [(input_dict, labels)]
-        gradient_accumulation = num_micro_batches = 1
+        num_micro_batches = configured_gradient_accumulation
         capture_metadata = {
             "scope": "single_microbatch",
             "captured_microbatches": 1,

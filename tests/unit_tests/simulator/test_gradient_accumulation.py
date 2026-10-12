@@ -96,7 +96,11 @@ def test_configured_accumulation_captures_one_batch_and_one_optimizer_step(count
     finally:
         unpatch_device_type_to_meta()
     assert calls == [denominator]
-    assert graph.iteration.microbatch_count == 1
+    assert graph.iteration.microbatch_count == count
+    assert graph.schedule_plan.num_micro_batches == count
+    assert graph.schedule_plan.gradient_accumulation == count
+    assert graph.iteration.schedule.num_micro_batches == count
+    assert graph.iteration.schedule.gradient_accumulation == count
     assert graph.schedule_plan.annotations["capture"]["configured_gradient_accumulation"] == count
     assert len(optimizer_calls) == len(scheduler_calls) == 1
     assert set(graph.step_templates) == {"s0_F", "s0_B", "s0_OPTIMIZER"}

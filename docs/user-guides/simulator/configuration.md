@@ -55,7 +55,7 @@ global_batch_size = local_batch_size × DP_replicate × DP_shard × gradient_acc
 
 非 PP 固定捕获一个 microbatch，执行一次 F/B、裁剪、optimizer 和 LR 更新。数据加载器只读取一个本地批次，不执行其他梯度累积批次；用户配置的 GBS 和 GA 保留在 `capture` 元数据中，多个 MB 的时间折算交给下游。非 PP 调用 `run_simulation_step` 时，`microbatches` 若包含多项，只选择第一项。若只有 meta labels，必须显式提供该 MB 的 `local_valid_tokens` 或 `global_valid_tokens`，不能由 shape 推断 IGNORE_INDEX 数量。
 
-非 PP 的 L1 沿用 `s0_F`、`s0_B` 和单次 `s0_OPTIMIZER` 模板名；L2、原始算子和内存事件也只包含一个 MB。`iteration.microbatch_count`、`SchedulePlan.num_micro_batches` 和实际捕获的 GA 均为 1，原始数量位于 `capture.configured_microbatches` / `capture.configured_gradient_accumulation`。内存 summary 的 `capture.scope=single_microbatch` 表示这个 MB 加 optimizer 的内存。
+非 PP 的 L1 沿用 `s0_F`、`s0_B` 和单次 `s0_OPTIMIZER` 模板名；算子、执行实例和内存事件只捕获一次。`iteration.microbatch_count`、`SchedulePlan.num_micro_batches`、`ScheduleGraph.num_micro_batches` 及 `gradient_accumulation` 均返回原配置的真实数量，不用捕获次数覆盖工作负载语义；下游无需读取 `capture` 才能得到正确 MBN。内存 summary 的 `capture.scope=single_microbatch` 仅用于说明内存口径。
 
 PP 不按上述非 PP 策略截断为 MB0。它仍执行配置的流水线调度，按 rank/stage/计算类型捕获配对模板及通信状态变体；单 rank 可能有多份模板，不能一律认为只有 F/B/O 三份图。当前 PP 与 GA>1 的组合显式拒绝，PP 内部的 microbatch 切分由 schedule 执行。PP 多 MB 加 optimizer 的完整内存回放仍因缺少跨 MB 梯度累积绑定而显式报错；可关闭内存跟踪验证计算模板，但不能据此声称完整训练内存已被验证。PP 按独立模板减少实际执行次数的优化另行处理。
 
