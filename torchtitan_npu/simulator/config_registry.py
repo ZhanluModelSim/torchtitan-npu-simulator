@@ -176,3 +176,38 @@ def kimi_k3_smoketest() -> KimiK3SimulationTrainerConfig:
         _kimi_k3_configs.kimi_k3_smoketest,
         output_name="kimi_k3_smoketest",
     )
+
+
+# ---------------------------------------------------------------------------
+# Qwen3-Next simulator configs
+# ---------------------------------------------------------------------------
+
+from torchtitan_npu.models.qwen3_next import config_registry as _qwen3_next_configs
+
+
+def _qwen3_next_simulation_config(
+    factory: Callable[[], TrainerConfig],
+    *,
+    output_name: str,
+) -> SimulationTrainerConfig:
+    base_config = factory()
+    base_fields = {field.name: getattr(base_config, field.name) for field in dataclasses.fields(base_config)}
+    base_fields["compile"] = dataclasses.replace(base_config.compile, enable=False)
+    return SimulationTrainerConfig(
+        **base_fields,
+        simulation=SimulationConfig(output_dir=f"./simulator_output/{output_name}"),
+    )
+
+
+def qwen3_next_smoketest() -> SimulationTrainerConfig:
+    return _qwen3_next_simulation_config(
+        _qwen3_next_configs.qwen3_next_smoketest,
+        output_name="qwen3_next_smoketest",
+    )
+
+
+def qwen3_next_80b_a3b() -> SimulationTrainerConfig:
+    return _qwen3_next_simulation_config(
+        _qwen3_next_configs.qwen3_next_80b_a3b,
+        output_name="qwen3_next_80b_a3b",
+    )

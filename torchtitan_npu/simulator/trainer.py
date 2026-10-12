@@ -611,6 +611,13 @@ class SimulationTrainer(Trainer):
 
         for model_part in self.model_parts:
             apply_kimi_k3_shims(model_part)
+        # Bind Qwen3-Next GDN shim the same way.
+        from torchtitan_npu.simulator.hardware_shims.gdn_shim import (
+            apply_qwen3_next_shims,
+        )
+
+        for model_part in self.model_parts:
+            apply_qwen3_next_shims(model_part)
         self.simulation_config = config.simulation
         self._synthetic_ac_save_patterns = (
             synthetic_ac_save_patterns(config.simulation.selective_ac_save_ops)
