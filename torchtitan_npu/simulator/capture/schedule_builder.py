@@ -77,6 +77,7 @@ def build_schedule_plan(
     gradient_accumulation: int = 1,
     rank: int = 0,
     captured_trace_primary: bool = False,
+    compute_instance_events: list[dict[str, Any]] | None = None,
 ) -> SchedulePlan:
     """Build the structured L2 SchedulePlan: an ordered action list +
     the DataSlots flowing between actions.
@@ -307,6 +308,7 @@ def build_schedule_plan(
             step_templates=step_templates,
             fsdp_residency_events=fsdp_residency_events,
             rank=rank,
+            compute_instance_events=compute_instance_events or (),
         ).build()
         communication_ownership = normalize_communication_ownership(
             step_templates=step_templates,

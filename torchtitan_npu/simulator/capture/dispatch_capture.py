@@ -16,6 +16,7 @@ import itertools
 import weakref
 from contextlib import contextmanager
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -104,7 +105,7 @@ def _schema_mutated_tensors(
     return mutated
 
 
-@dataclass
+@dataclass(slots=True)
 class _RawEvent:
     op_id: int
     raw_op_type: str
@@ -140,6 +141,18 @@ class _RawEvent:
     extra_annotations: dict[str, Any] | None = None
 
 
+@lru_cache(maxsize=1024)
+def _scalar_schema_arguments(func: Any) -> tuple[tuple[int, str, Any], ...] | None:
+    schema = getattr(func, "_schema", None)
+    if schema is None:
+        return None
+    return tuple(
+        (index, argument.name, argument.default_value)
+        for index, argument in enumerate(schema.arguments)
+        if "Tensor" not in str(argument.type)
+    )
+
+
 def _operator_attributes(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> dict[str, Any]:
     """Bind scalar schema arguments, including omitted defaults, without reading tensor values."""
     def normalize(value: Any) -> Any:
@@ -156,14 +169,12 @@ def _operator_attributes(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any
         return str(value)
 
     attrs: dict[str, Any] = {}
-    schema = getattr(func, "_schema", None)
-    if schema is None:
+    arguments = _scalar_schema_arguments(func)
+    if arguments is None:
         return {key: normalize(value) for key, value in kwargs.items() if not isinstance(value, torch.Tensor)}
-    for index, argument in enumerate(schema.arguments):
-        value = args[index] if index < len(args) else kwargs.get(argument.name, argument.default_value)
-        if "Tensor" in str(argument.type):
-            continue
-        attrs[argument.name] = normalize(value)
+    for index, name, default in arguments:
+        value = args[index] if index < len(args) else kwargs.get(name, default)
+        attrs[name] = normalize(value)
     return attrs
 
 
@@ -229,6 +240,7 @@ class OpDispatchCapture(TorchDispatchMode):
         self._storage_mutation_frontier: dict[str, int] = {}
         self._previous_active_capture: OpDispatchCapture | None = None
         self._capture_l0: bool = True  # pass-through when False (duplicate class)
+        self._compute_instances: dict[tuple[int, int, str], dict[str, Any]] = {}
         # A scoped suppression channel for framework bookkeeping. Unlike
         # ``suspend_recording()``, this affects only dispatcher-originated
         # events: callers may still add an explicit synthetic collective node
@@ -274,6 +286,21 @@ class OpDispatchCapture(TorchDispatchMode):
         self._capture_l0 = True
         self._chunk_class_key = None
 
+    def compute_instance_events(self) -> list[dict[str, Any]]:
+        """Return non-pipeline instance spans independently of L1 templates."""
+        return list(self._compute_instances.values())
+
+    def release_operator_tracking(self) -> None:
+        """Release capture-only indices once nodes and instance spans are built."""
+        self._events.clear()
+        self._producer.clear()
+        self._mutation_frontier.clear()
+        self._storage_mutation_frontier.clear()
+        self._tensor_identities.clear()
+        self._value_aliases.clear()
+        self._suppressed_tensor_predecessors.clear()
+        self._pending_comm_links.clear()
+
     @contextmanager
     def suspend_recording(self) -> Iterator[None]:
         """Temporarily execute dispatches without adding capture events."""
@@ -314,8 +341,10 @@ class OpDispatchCapture(TorchDispatchMode):
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
         kwargs = kwargs or {}
-        mutated_inputs = _schema_mutated_tensors(func, args, kwargs)
+        mutated_inputs = _schema_mutated_tensors(func, args, kwargs) if self._capture_l0 else []
         result = func(*args, **kwargs)
+        if not self._capture_l0:
+            return result
 
         if self._capture_l0 and self._dispatch_suppression_scopes:
             flat_inputs = _flatten_tensors(args) + _flatten_tensors(tuple(kwargs.values()))
@@ -368,7 +397,7 @@ class OpDispatchCapture(TorchDispatchMode):
         operation_output_metas: list[TensorMeta] | None = None,
         attrs: dict[str, Any] | None = None,
         extra_annotations: dict[str, Any] | None = None,
-    ) -> None:
+    ) -> int | None:
         """Manually register one synthetic L0 event, as if `raw_op_type` had
         gone through __torch_dispatch__ normally. Used by
         torchtitan_npu.simulator.hardware_shims for ops that cannot execute
@@ -390,6 +419,8 @@ class OpDispatchCapture(TorchDispatchMode):
         from the logical activation dtype.
         ``attrs`` carries non-tensor operator kwargs into ``OpNode.attrs``.
         """
+        if not self._capture_l0:
+            return None
         logical_input_metas = None
         logical_output_metas = None
         if logical_dtensor_shapes:
@@ -409,7 +440,7 @@ class OpDispatchCapture(TorchDispatchMode):
             logical_input_metas = operation_input_metas
         if operation_output_metas is not None:
             logical_output_metas = operation_output_metas
-        self._record_event(
+        return self._record_event(
             raw_op_type,
             _flatten_tensors(inputs),
             _flatten_tensors(outputs),
@@ -519,7 +550,7 @@ class OpDispatchCapture(TorchDispatchMode):
         extra_annotations: dict[str, Any] | None = None,
         mutated_inputs: list[torch.Tensor] | None = None,
         visible_in_ir: bool = True,
-    ) -> None:
+    ) -> int | None:
         if not self._capture_l0:
             return  # pass-through: duplicate (stage, comp_type) class skips L0 capture
         # Skip the framework metadata-inference forward (DYNAMIC-mode
@@ -565,10 +596,10 @@ class OpDispatchCapture(TorchDispatchMode):
             | alias_frontier_ids
         )
         if input_metas is None:
-            input_metas = [to_tensor_meta(t, name=f"in_{i}") for i, t in enumerate(flat_inputs)]
+            input_metas = [to_tensor_meta(t, name=f"in_{i}") for i, t in enumerate(flat_inputs)] if visible_in_ir else []
         if output_metas is None:
-            output_metas = [to_tensor_meta(t, name=f"out_{i}") for i, t in enumerate(flat_outputs)]
-        if len(input_metas) != len(flat_inputs) or len(output_metas) != len(flat_outputs):
+            output_metas = [to_tensor_meta(t, name=f"out_{i}") for i, t in enumerate(flat_outputs)] if visible_in_ir else []
+        if visible_in_ir and (len(input_metas) != len(flat_inputs) or len(output_metas) != len(flat_outputs)):
             raise ValueError("Logical and local synthetic-op tensor counts must match")
 
         op_type = to_canonical_op_type(raw_op_type)
@@ -598,32 +629,43 @@ class OpDispatchCapture(TorchDispatchMode):
             # phase so non-PP backward ops are not mislabeled "F" (the default).
             comp_type = "B" if phase == "backward" else "F"
 
-        candidate = _RawEvent(
-            op_id=0,
-            raw_op_type=raw_op_type,
-            op_type=op_type,
-            inputs=input_metas,
-            outputs=output_metas,
-            predecessors=predecessors,
-            module_path=module_path,
-            phase=phase,
-            execution_kind=execution_kind,
-            seq_idx=next(_seq_counter),
-            pp_stage=pp_stage,
-            pp_mb_idx=pp_mb_idx,
-            comp_type=comp_type,
-            fsdp_state=fsdp_state,
-            tensor_shape_scope=tensor_shape_scope,
-            attrs=dict(attrs) if attrs is not None else None,
-            extra_annotations=(
-                dict(extra_annotations)
-                if extra_annotations is not None
-                else None
-            ),
-        )
+        seq_idx = next(_seq_counter)
         op_id = _next_op_id()
-        candidate.op_id = op_id
+        key = (pp_stage, pp_mb_idx, comp_type)
+        instance = self._compute_instances.get(key)
+        if instance is None:
+            instance = {
+                "pp_stage": pp_stage,
+                "pp_mb_idx": pp_mb_idx,
+                "comp_type": comp_type,
+                "start_seq_idx": seq_idx,
+            }
+            self._compute_instances[key] = instance
+        instance["end_seq_idx"] = seq_idx
         if visible_in_ir:
+            candidate = _RawEvent(
+                op_id=op_id,
+                raw_op_type=raw_op_type,
+                op_type=op_type,
+                inputs=input_metas,
+                outputs=output_metas,
+                predecessors=predecessors,
+                module_path=module_path,
+                phase=phase,
+                execution_kind=execution_kind,
+                seq_idx=seq_idx,
+                pp_stage=pp_stage,
+                pp_mb_idx=pp_mb_idx,
+                comp_type=comp_type,
+                fsdp_state=fsdp_state,
+                tensor_shape_scope=tensor_shape_scope,
+                attrs=dict(attrs) if attrs is not None else None,
+                extra_annotations=(
+                    dict(extra_annotations)
+                    if extra_annotations is not None
+                    else None
+                ),
+            )
             self._events.append(candidate)
 
         if self.record_memory:
@@ -631,7 +673,7 @@ class OpDispatchCapture(TorchDispatchMode):
                 RawMemoryEvent(
                     event_id=next(_memory_event_counter),
                     op_id=op_id,
-                    seq_idx=candidate.seq_idx,
+                    seq_idx=seq_idx,
                     raw_op_type=raw_op_type,
                     op_type=op_type,
                     phase=phase,
@@ -653,7 +695,7 @@ class OpDispatchCapture(TorchDispatchMode):
 
         if self._pending_saved_tensor_unpacks:
             for slot_id in self._pending_saved_tensor_unpacks:
-                self._autograd_saved_tensor_events[slot_id].unpack_seq = candidate.seq_idx
+                self._autograd_saved_tensor_events[slot_id].unpack_seq = seq_idx
             self._pending_saved_tensor_unpacks.clear()
 
         # Resolve pending comm links: if any input tensor was produced by a
@@ -669,6 +711,7 @@ class OpDispatchCapture(TorchDispatchMode):
         for tensor in mutated_inputs or ():
             self._mutation_frontier[self._alias_root_id(tensor)] = op_id
             self._storage_mutation_frontier[self._storage_identity(tensor)[0]] = op_id
+        return op_id
 
     def tensor_id(self, tensor: torch.Tensor) -> int:
         tensor = _flatten_tensors(tensor)[0]
@@ -895,7 +938,8 @@ class OpDispatchCapture(TorchDispatchMode):
                 # Stream order is restored by FSDP communication ownership.
                 node.annotations["fsdp_async_allreduce"] = True
                 continue
-            for candidate in ordered_nodes[index + 1 :]:
+            for candidate_index in range(index + 1, len(ordered_nodes)):
+                candidate = ordered_nodes[candidate_index]
                 if (
                     candidate.annotations.get("phase")
                     != node.annotations.get("phase")

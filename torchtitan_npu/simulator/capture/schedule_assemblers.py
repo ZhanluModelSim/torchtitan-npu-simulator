@@ -707,10 +707,12 @@ class NonPipelineTraceAssembler:
         step_templates: dict[str, StepGraph],
         fsdp_residency_events: Iterable[FSDPResidencyEvent],
         rank: int,
+        compute_instance_events: Iterable[dict[str, Any]] = (),
     ) -> None:
         self.step_templates = step_templates
         self.fsdp_residency_events = list(fsdp_residency_events)
         self.rank = rank
+        self.compute_instance_events = list(compute_instance_events)
 
     @staticmethod
     def _comp_type(step_type: str) -> str:
@@ -722,30 +724,44 @@ class NonPipelineTraceAssembler:
         }.get(normalized, normalized)
 
     def build(self) -> list[ActionSpec]:
-        ordered_templates = sorted(
-            self.step_templates.items(),
-            key=lambda item: (
-                min((node.seq_idx for node in item[1].nodes.values()), default=0),
-                self._STEP_ORDER.get(self._comp_type(item[1].step_type), 9),
-                item[0],
-            ),
-        )
+        template_instances: list[tuple[str, StepGraph, dict[str, Any] | None]] = []
+        if self.compute_instance_events:
+            for event in sorted(self.compute_instance_events, key=lambda item: item["start_seq_idx"]):
+                template_id = f"s{event['pp_stage']}_{event['comp_type']}"
+                template = self.step_templates.get(template_id)
+                if template is not None:
+                    template_instances.append((template_id, template, event))
+        else:
+            ordered_templates = sorted(
+                self.step_templates.items(),
+                key=lambda item: (
+                    min((node.seq_idx for node in item[1].nodes.values()), default=0),
+                    self._STEP_ORDER.get(self._comp_type(item[1].step_type), 9),
+                    item[0],
+                ),
+            )
+            template_instances = [(template_id, template, None) for template_id, template in ordered_templates]
         specs: list[ActionSpec] = []
         compute_by_type: dict[tuple[int, str], ActionSpec] = {}
         compute_by_instance: dict[str, ActionSpec] = {}
-        for schedule_order, (template_id, template) in enumerate(
-            ordered_templates
+        for schedule_order, (template_id, template, instance) in enumerate(
+            template_instances
         ):
             comp_type = self._comp_type(template.step_type)
             if comp_type not in _COMPUTE_ACTION_TYPES | {"OPTIMIZER"}:
                 continue
-            seqs = [node.seq_idx for node in template.nodes.values()]
-            start_seq = min(seqs, default=0)
-            end_seq = max(seqs, default=start_seq)
-            microbatches = {int(node.annotations.get("pp_mb_idx", 0)) for node in template.nodes.values()}
-            if len(microbatches) > 1:
-                raise ValueError(f"Non-PP template {template_id} combines multiple microbatches")
-            microbatch = next(iter(microbatches), 0)
+            if instance is not None:
+                start_seq = int(instance["start_seq_idx"])
+                end_seq = int(instance["end_seq_idx"])
+                microbatch = int(instance["pp_mb_idx"])
+            else:
+                seqs = [node.seq_idx for node in template.nodes.values()]
+                start_seq = min(seqs, default=0)
+                end_seq = max(seqs, default=start_seq)
+                microbatches = {int(node.annotations.get("pp_mb_idx", 0)) for node in template.nodes.values()}
+                if len(microbatches) > 1:
+                    raise ValueError(f"Non-PP template {template_id} combines multiple microbatches")
+                microbatch = next(iter(microbatches), 0)
             if comp_type == "OPTIMIZER":
                 microbatch = 0
             instance_id = f"nonpp:r{self.rank}:{template_id}:mb{microbatch}"

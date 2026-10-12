@@ -134,7 +134,7 @@ def _snapshot_parameters(
     return lifetimes, param_ids, missing_gradients, parameter_tensors
 
 
-def _is_persistent_parameter_alias(ref: TensorRef, parameter_tensors: Iterable[ParameterTensorMetadata]) -> bool:
+def _is_persistent_parameter_alias(ref: TensorRef, parameter_storage_keys: set[str]) -> bool:
     """Only a witnessed persistent storage may be excluded from activation bytes.
 
     Parameters remain alive while the plan is built, so their storage handles
@@ -142,10 +142,7 @@ def _is_persistent_parameter_alias(ref: TensorRef, parameter_tensors: Iterable[P
     storage handles without conflating same-shaped values or FSDP buffers.
     """
     storage_key = ref.storage_key.partition(":")[0]
-    return bool(storage_key) and any(
-        parameter.storage_key == storage_key
-        for parameter in parameter_tensors
-    )
+    return bool(storage_key) and storage_key in parameter_storage_keys
 
 
 def _external_lifetime(ref: TensorRef, event: RawMemoryEvent) -> TensorLifetime:
@@ -379,6 +376,7 @@ def estimate_static_memory(
         model_parts or [],
         parameter_storage_dtype,
     )
+    parameter_storage_keys = {parameter.storage_key for parameter in parameter_tensors}
     end_seq = max((event.seq_idx for event in events), default=0) + 1
     for lifetime in param_lifetimes:
         lifetime.death_seq = end_seq
@@ -414,7 +412,7 @@ def estimate_static_memory(
                 continue
             lifetime = lifetimes_by_tensor_id.get(root_tensor_id)
             if lifetime is None:
-                if _is_persistent_parameter_alias(ref, parameter_tensors):
+                if _is_persistent_parameter_alias(ref, parameter_storage_keys):
                     parameter_materialization_ids.add(root_tensor_id)
                     continue
                 lifetime = _external_lifetime(ref, event)
@@ -430,7 +428,7 @@ def estimate_static_memory(
             if (
                 root_tensor_id in param_ids
                 or root_tensor_id in parameter_materialization_ids
-                or _is_persistent_parameter_alias(ref, parameter_tensors)
+                or _is_persistent_parameter_alias(ref, parameter_storage_keys)
             ):
                 parameter_materialization_ids.add(root_tensor_id)
                 continue

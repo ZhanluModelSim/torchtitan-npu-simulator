@@ -53,9 +53,11 @@ pipeline_microbatches = local_batch_size / pipeline_parallel_microbatch_size
 global_batch_size = local_batch_size × DP_replicate × DP_shard × gradient_accumulation_steps
 ```
 
-非 PP 路径按 `gradient_accumulation_steps` 读取真实的多个输入批次并依次执行前反向，以所有有效 token 的总数归一化 loss；一次训练 step 只清梯度一次、裁剪一次、更新优化器和学习率一次。独立调用 `run_simulation_step` 时 GA>1 必须提供对应数量的 `microbatches`。若只有 meta labels，必须显式提供 `local_valid_tokens` 或 `global_valid_tokens`，否则报错；不能由 shape 推断 IGNORE_INDEX 的数量。当前 PP 与 GA>1 的组合显式拒绝，PP 内部的 microbatch 切分仍由 schedule 执行。
+非 PP 固定捕获一个 microbatch，执行一次 F/B、裁剪、optimizer 和 LR 更新。数据加载器只读取一个本地批次，不执行其他梯度累积批次；用户配置的 GBS 和 GA 保留在 `capture` 元数据中，多个 MB 的时间折算交给下游。非 PP 调用 `run_simulation_step` 时，`microbatches` 若包含多项，只选择第一项。若只有 meta labels，必须显式提供该 MB 的 `local_valid_tokens` 或 `global_valid_tokens`，不能由 shape 推断 IGNORE_INDEX 数量。
 
-当前 PP 多 microbatch 且包含 optimizer 的内存回放尚未实现跨 MB 的梯度累积绑定，会显式报错。可关闭 `simulation.enable_memory_tracking` 检查计算模板，但这不代表已捕获完整的累积梯度图；单 microbatch 内存回放和无 optimizer 的激活回放不受此限制。
+非 PP 的 L1 沿用 `s0_F`、`s0_B` 和单次 `s0_OPTIMIZER` 模板名；L2、原始算子和内存事件也只包含一个 MB。`iteration.microbatch_count`、`SchedulePlan.num_micro_batches` 和实际捕获的 GA 均为 1，原始数量位于 `capture.configured_microbatches` / `capture.configured_gradient_accumulation`。内存 summary 的 `capture.scope=single_microbatch` 表示这个 MB 加 optimizer 的内存。
+
+PP 不按上述非 PP 策略截断为 MB0。它仍执行配置的流水线调度，按 rank/stage/计算类型捕获配对模板及通信状态变体；单 rank 可能有多份模板，不能一律认为只有 F/B/O 三份图。当前 PP 与 GA>1 的组合显式拒绝，PP 内部的 microbatch 切分由 schedule 执行。PP 多 MB 加 optimizer 的完整内存回放仍因缺少跨 MB 梯度累积绑定而显式报错；可关闭内存跟踪验证计算模板，但不能据此声称完整训练内存已被验证。PP 按独立模板减少实际执行次数的优化另行处理。
 
 PP 开启时 local batch 必须能被 PP microbatch size 整除。microbatch 数少于 stage 数不应直接写成非法；具体 schedule 的要求和效率需分别判断。并行参数检查脚本为 `scripts/validate_parallel_config.py`，运行命令仍需满足模型约束。
 

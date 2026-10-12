@@ -85,7 +85,7 @@ class StepBoundaryTracker:
         self.current_phase = phase
 
 
-def build_step_graphs(nodes: dict[int, OpNode], *, separate_microbatches: bool = False) -> dict[str, StepGraph]:
+def build_step_graphs(nodes: dict[int, OpNode]) -> dict[str, StepGraph]:
     """Bucket OpNodes into per-``(pp_stage, comp_type)`` StepGraphs.
 
     ``comp_type`` (set by ``dispatch_capture._record_event`` from
@@ -121,8 +121,6 @@ def build_step_graphs(nodes: dict[int, OpNode], *, separate_microbatches: bool =
         except (TypeError, ValueError):
             stage = -1
         template_id = f"s{stage}_{comp_type}"
-        if separate_microbatches and comp_type != "OPTIMIZER":
-            template_id += f"_mb{int(ann.get('pp_mb_idx', 0))}"
         step_types[template_id] = comp_type
         buckets.setdefault(template_id, {})[op_id] = node
 

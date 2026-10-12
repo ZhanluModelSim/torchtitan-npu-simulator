@@ -201,6 +201,7 @@ class MemoryPlan:
     action_spans: list[MemoryActionSpan] = field(default_factory=list)
     unclassified_ops: list[dict[str, Any]] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    capture_metadata: dict[str, Any] = field(default_factory=dict)
 
     def _checkpoint_saved_activations_by_marker(self) -> dict[str, dict[str, Any]]:
         instances_by_marker: dict[
@@ -601,6 +602,7 @@ class MemoryPlan:
         ]
         return {
             "metric": self.metric,
+            **({"capture": self.capture_metadata} if self.capture_metadata else {}),
             "parameter_storage_dtype": self.parameter_storage_dtype or "captured",
             "offload_ac_saved_tensors": self.offload_ac_saved_tensors,
             "persistent_param_bytes": self.persistent_param_bytes,

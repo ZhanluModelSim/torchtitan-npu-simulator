@@ -8,6 +8,7 @@ spec/L1-StepGraph.md."""
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -39,10 +40,10 @@ def _check_acyclic(nodes: dict[int, OpNode]) -> bool:
     forward->backward->optimizer step produced `is_acyclic=False` for the
     backward and optimizer graphs before this fix, `True` after)."""
     in_degree = {op_id: sum(1 for p in node.predecessors if p in nodes) for op_id, node in nodes.items()}
-    queue = [op_id for op_id, degree in in_degree.items() if degree == 0]
+    queue = deque(op_id for op_id, degree in in_degree.items() if degree == 0)
     visited = 0
     while queue:
-        op_id = queue.pop(0)
+        op_id = queue.popleft()
         visited += 1
         for succ in nodes[op_id].successors:
             if succ in in_degree:

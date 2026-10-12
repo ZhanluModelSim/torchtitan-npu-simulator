@@ -496,7 +496,7 @@ def _record_comm_with_l0(
             event.src_exit_op = producer_op
 
         event_count_before = len(capture._events)
-        capture.record_synthetic_op(
+        recorded_op_id = capture.record_synthetic_op(
             raw_op_type=f"comm.{comm_primitive}",
             inputs=[tensor],
             outputs=[out],
@@ -515,9 +515,10 @@ def _record_comm_with_l0(
                 "fsdp_prefetch_type": event.fsdp_prefetch_type,
             },
         )
+        if recorded_op_id is not None:
+            event.op_id = recorded_op_id
         # Link the L0 op to this CommEvent and store comm metadata in annotations
         if len(capture._events) > event_count_before:
-            event.op_id = capture._events[-1].op_id
             # Store comm_dim and comm_ranks in the L0 node's annotations
             # so they appear in CSV and JSON exports
             capture._events[-1].group_name = event.group_name

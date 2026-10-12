@@ -40,7 +40,8 @@ def _dims():
 
 @pytest.mark.parametrize("count", [1, 2, 3])
 @pytest.mark.parametrize("device", ["cpu", "meta"])
-def test_gradient_accumulation_executes_real_batches_and_one_optimizer_step(count, device):
+@pytest.mark.parametrize("enable_memory_tracking", [False, True])
+def test_configured_accumulation_captures_one_batch_and_one_optimizer_step(count, device, enable_memory_tracking):
     torch.manual_seed(0)
     reference = nn.Linear(4, 2, device="cpu")
     model = nn.Linear(4, 2, device=device)
@@ -51,18 +52,24 @@ def test_gradient_accumulation_executes_real_batches_and_one_optimizer_step(coun
     for mb in range(count):
         labels = torch.tensor([0, 1, -100] if mb == 1 else [0, 1, 0])
         batches.append(({"input": torch.arange(12, dtype=torch.float32).reshape(3, 4) + mb}, labels))
-    denominator = float(sum((labels != -100).sum().item() for _, labels in batches))
-    for inputs, labels in batches:
-        (nn.functional.cross_entropy(reference(inputs["input"]), labels, reduction="sum") / denominator).backward()
+    denominator = float((batches[0][1] != -100).sum().item())
+    reference_losses = []
+    for inputs, labels in batches[:1]:
+        loss = nn.functional.cross_entropy(reference(inputs["input"]), labels, reduction="sum") / denominator
+        reference_losses.append(loss.item())
+        loss.backward()
     reference_optimizer.step()
     prepared = [({"input": inputs["input"].to(device)}, labels.to(device)) for inputs, labels in batches]
     calls = []
     optimizer_calls = []
     scheduler_calls = []
+    losses = []
 
     def forward_backward_step(*, input_dict, labels, global_valid_tokens):
         calls.append(global_valid_tokens)
         loss = nn.functional.cross_entropy(model(input_dict["input"]), labels, reduction="sum") / global_valid_tokens
+        if device == "cpu":
+            losses.append(loss.item())
         loss.backward()
 
     def optimizer_step():
@@ -84,27 +91,38 @@ def test_gradient_accumulation_executes_real_batches_and_one_optimizer_step(coun
             seq_len=4,
             gradient_accumulation=count,
             num_micro_batches=count,
+            enable_memory_tracking=enable_memory_tracking,
         )
     finally:
         unpatch_device_type_to_meta()
-    assert calls == [denominator] * count
+    assert calls == [denominator]
+    assert graph.iteration.microbatch_count == 1
+    assert graph.schedule_plan.annotations["capture"]["configured_gradient_accumulation"] == count
     assert len(optimizer_calls) == len(scheduler_calls) == 1
+    assert set(graph.step_templates) == {"s0_F", "s0_B", "s0_OPTIMIZER"}
+    for template_id in ("s0_F", "s0_B"):
+        assert {node.annotations["pp_mb_idx"] for node in graph.step_templates[template_id].nodes.values()} == {0}
     compute = [action for action in graph.schedule_plan.actions if action.action_type == "COMPUTE"]
     assert [(action.comp_type, action.mb_idx) for action in compute] == [
-        (kind, mb) for mb in range(count) for kind in ("F", "B")
+        (kind, 0) for kind in ("F", "B")
+    ]
+    assert [action.template_ref for action in compute] == [
+        f"s0_{kind}" for kind in ("F", "B")
     ]
     assert len([action for action in graph.schedule_plan.actions if action.action_type == "OPTIMIZER"]) == 1
-    memory = graph.iteration.schedule.annotations["memory_plan"]
-    assert {event.pp_mb_idx for event in memory.raw_events if event.phase == "forward"} == set(range(count))
+    if enable_memory_tracking:
+        memory = graph.iteration.schedule.annotations["memory_plan"]
+        assert {event.pp_mb_idx for event in memory.raw_events if event.phase == "forward"} == {0}
     if device == "cpu":
+        assert losses == reference_losses
         for actual, expected in zip(model.parameters(), reference.parameters()):
             assert torch.equal(actual.grad, expected.grad)
             assert torch.equal(actual, expected)
 
 
-def test_ga_requires_actual_microbatch_inputs():
+def test_empty_representative_microbatch_is_rejected():
     model = nn.Linear(4, 2, device="meta")
-    with pytest.raises(ValueError, match="microbatches"):
+    with pytest.raises(ValueError, match="representative microbatch"):
         run_simulation_step(
             model_parts=[model],
             parallel_dims=_dims(),
@@ -116,10 +134,11 @@ def test_ga_requires_actual_microbatch_inputs():
             local_batch_size=3,
             seq_len=4,
             gradient_accumulation=2,
+            microbatches=[],
         )
 
 
-def test_ga_reenters_tp_context_and_clips_accumulated_gradients_once():
+def test_single_microbatch_enters_tp_context_and_clips_gradients_once():
     from torchtitan_npu.simulator.capture.comm_events import _default_collective_context
 
     torch.manual_seed(1)
@@ -135,8 +154,8 @@ def test_ga_reenters_tp_context_and_clips_accumulated_gradients_once():
     for parameter in model.parameters():
         parameter.grad = torch.full_like(parameter, 100.0)
     reference_optimizer.zero_grad()
-    for inputs, labels in batches:
-        (nn.functional.cross_entropy(reference(inputs["input"]), labels, reduction="sum") / 9).backward()
+    for inputs, labels in batches[:1]:
+        (nn.functional.cross_entropy(reference(inputs["input"]), labels, reduction="sum") / 3).backward()
     reference_norm = nn.utils.clip_grad_norm_(reference.parameters(), max_norm=0.25)
     reference_optimizer.step()
     group = object()
@@ -179,10 +198,11 @@ def test_ga_reenters_tp_context_and_clips_accumulated_gradients_once():
             local_batch_size=3,
             seq_len=4,
             gradient_accumulation=3,
+            global_valid_tokens=3.0,
         )
     finally:
         unpatch_device_type_to_meta()
-    assert calls == ["zero", "batch", "batch", "batch", "clip", "optimizer", "scheduler"]
+    assert calls == ["zero", "batch", "clip", "optimizer", "scheduler"]
     assert torch.equal(norms[0], reference_norm)
     assert _default_collective_context.get() is None
     for actual, expected in zip(model.parameters(), reference.parameters()):

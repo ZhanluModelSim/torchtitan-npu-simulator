@@ -82,7 +82,7 @@ NGPU=8 python3 -m torchtitan_npu.entry \
     --simulation.output-formats text
 ```
 
-不要将 `training.steps` 解释为捕获 iteration 数；当前 simulator 始终捕获单 step。
+不要将 `training.steps` 解释为捕获 iteration 数。非 PP 固定捕获一次 F/B/optimizer，原始 GA 保留为元数据供下游折算；PP 仍运行配置的流水线调度，按 rank/stage 捕获计算及通信模板。
 
 ## 输出与排查
 

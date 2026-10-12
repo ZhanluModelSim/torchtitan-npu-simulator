@@ -13,7 +13,7 @@ import torch.nn as nn
 
 from torchtitan_npu.simulator.trainer import (
     SimulationTrainer,
-    _capture_num_micro_batches,
+    _configured_num_micro_batches,
     _l0_csv_filename,
     _strip_hardware_dependent_model_converters,
     _validate_activation_checkpoint_mode,
@@ -40,19 +40,19 @@ def _build_parallel_dims(world_size: int):
     return parallel_dims
 
 
-def test_capture_num_micro_batches_uses_pp_schedule_not_gradient_accumulation():
-    assert _capture_num_micro_batches(
+def test_configured_num_micro_batches_uses_pp_schedule_not_gradient_accumulation():
+    assert _configured_num_micro_batches(
         pp_enabled=True,
         pp_schedule=SimpleNamespace(_n_microbatches=4),
         gradient_accumulation_steps=1,
     ) == 4
-    assert _capture_num_micro_batches(
+    assert _configured_num_micro_batches(
         pp_enabled=False,
         pp_schedule=None,
         gradient_accumulation_steps=3,
     ) == 3
     with pytest.raises(RuntimeError, match="_n_microbatches"):
-        _capture_num_micro_batches(
+        _configured_num_micro_batches(
             pp_enabled=True,
             pp_schedule=SimpleNamespace(_n_microbatches=0),
             gradient_accumulation_steps=1,

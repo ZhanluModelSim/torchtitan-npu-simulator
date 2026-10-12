@@ -142,10 +142,10 @@ def _strip_hardware_dependent_model_converters(config: Any) -> None:
     model_converters_config.converters = kept
 
 
-def _capture_num_micro_batches(
+def _configured_num_micro_batches(
     *, pp_enabled: bool, pp_schedule: Any | None, gradient_accumulation_steps: int
 ) -> int:
-    """Return the microbatch count of the schedule being captured."""
+    """Return the configured workload count before capture specialization."""
     if not pp_enabled:
         return gradient_accumulation_steps
     num_micro_batches = getattr(pp_schedule, "_n_microbatches", None)
@@ -191,7 +191,7 @@ def run_simulation_step(
     optimizer_zero_grad: Callable[[], None] | None = None,
     clip_grad_norm: Callable[[], Any] | None = None,
 ) -> WorkloadGraph:
-    """Run one forward+backward+optimizer step under full capture and
+    """Capture one non-PP microbatch, or the configured PP schedule, and
     return the resulting four-layer WorkloadGraph. Bypasses
     `Trainer.train_step()` deliberately: that method's `dist_sum`-based
     token counting and loss/grad-norm logging both call `.item()` on
@@ -213,14 +213,32 @@ def run_simulation_step(
         raise ValueError("gradient_accumulation must be positive")
     if parallel_dims.pp_enabled and gradient_accumulation > 1:
         raise ValueError("PP gradient accumulation across multiple schedule steps is not supported by simulator capture")
+    configured_gradient_accumulation = gradient_accumulation
     if microbatches is None:
-        if gradient_accumulation != 1:
-            raise ValueError("Supply actual microbatches for gradient_accumulation > 1")
         microbatches = [(input_dict, labels)]
-    if len(microbatches) != gradient_accumulation:
-        raise ValueError("microbatches must match gradient_accumulation")
+    if not microbatches:
+        raise ValueError("Supply at least one representative microbatch")
+    capture_metadata = {}
     if not parallel_dims.pp_enabled:
-        num_micro_batches = gradient_accumulation
+        input_dict, labels = microbatches[0]
+        microbatches = [(input_dict, labels)]
+        gradient_accumulation = num_micro_batches = 1
+        capture_metadata = {
+            "scope": "single_microbatch",
+            "captured_microbatches": 1,
+            "configured_microbatches": configured_gradient_accumulation,
+            "configured_gradient_accumulation": configured_gradient_accumulation,
+            "microbatch_batch_size": local_batch_size,
+        }
+        if configured_gradient_accumulation > 1:
+            import logging
+            logging.getLogger(__name__).warning(
+                "Non-PP capture executes one microbatch (configured GA=%s); "
+                "multi-MB time scaling is left to downstream consumers.",
+                configured_gradient_accumulation,
+            )
+    elif len(microbatches) != gradient_accumulation:
+        raise ValueError("microbatches must match gradient_accumulation")
     if global_valid_tokens is None and local_valid_tokens is None:
         from torchtitan.components.loss import IGNORE_INDEX
         if any(target.device.type == "meta" for _, target in microbatches):
@@ -333,7 +351,7 @@ def run_simulation_step(
                 _pp_context.update(mb_idx=mb_idx, comp_type="F", phase="forward")
             with (
                 default_collective_context("tp", tp_mesh.get_group())
-                if tp_mesh is not None else nullcontext()
+                if tp_mesh is not None else nullcontext(),
             ):
                 forward_backward_step(
                     input_dict=batch_inputs,
@@ -370,6 +388,8 @@ def run_simulation_step(
 
     t5 = time.perf_counter()
     nodes = capture.build_nodes()
+    compute_instance_events = capture.compute_instance_events()
+    capture.release_operator_tracking()
     nodes = fold_metadata_views(nodes)
     if fsdp_allgather_transport_dtype:
         from torchtitan_npu.simulator.memory.fsdp_allgather_transport import (
@@ -384,7 +404,7 @@ def run_simulation_step(
     timings["build_nodes"] = time.perf_counter() - t5
 
     t6 = time.perf_counter()
-    step_templates = build_step_graphs(nodes, separate_microbatches=not parallel_dims.pp_enabled and gradient_accumulation > 1)
+    step_templates = build_step_graphs(nodes)
     timings["build_step_graphs"] = time.perf_counter() - t6
 
     t7 = time.perf_counter()
@@ -400,6 +420,7 @@ def run_simulation_step(
         gradient_accumulation=gradient_accumulation,
         rank=rank,
         captured_trace_primary=True,
+        compute_instance_events=compute_instance_events if not parallel_dims.pp_enabled else None,
     )
     timings["build_schedule_plan"] = time.perf_counter() - t7
 
@@ -419,6 +440,9 @@ def run_simulation_step(
         num_micro_batches=num_micro_batches,
         schedule_plan=schedule_plan,
     )
+    if capture_metadata:
+        schedule_plan.annotations["capture"] = capture_metadata
+        wg.iteration.schedule.annotations["capture"] = capture_metadata
     timings["build_workload_graph"] = time.perf_counter() - t8
 
     memory_plan = None
@@ -436,6 +460,9 @@ def run_simulation_step(
             offload_ac_saved_tensors=memory_offload_ac_saved_tensors,
             fsdp_allgather_transport_dtype=fsdp_allgather_transport_dtype,
         )
+        if capture_metadata:
+            memory_plan.capture_metadata = capture_metadata
+            memory_plan.notes.append("Non-PP memory describes one microbatch plus one optimizer update; configured GA is not expanded.")
         wg.iteration.schedule.annotations["memory_plan"] = memory_plan
         wg.iteration.schedule.annotations["memory_summary"] = memory_plan.to_summary_dict()
         for step_graph in wg.step_templates.values():
@@ -636,28 +663,21 @@ class SimulationTrainer(Trainer):
 
         from torchtitan.components.loss import IGNORE_INDEX
         data_iterator = iter(self.dataloader)
-        microbatches = []
-        local_valid_tokens = 0
-        for _ in range(self.gradient_accumulation_steps):
-            input_dict, labels = next(data_iterator)
-            local_valid_tokens += int((labels != IGNORE_INDEX).sum().item())
-            for key, value in list(input_dict.items()):
-                if isinstance(value, torch.Tensor):
-                    input_dict[key] = value.to(self.device)
-            microbatches.append((input_dict, labels.to(self.device)))
-        input_dict, labels = microbatches[0]
-
-        t1 = time.perf_counter()
-
         import torch.distributed as dist
         is_multi_proc = self.config.comm.mode == "multi_proc_meta"
         rank = self.rank_context.capture_process_rank
         pp_schedule = getattr(self, "pp_schedule", None)
-        num_micro_batches = _capture_num_micro_batches(
+        num_micro_batches = _configured_num_micro_batches(
             pp_enabled=self.parallel_dims.pp_enabled,
             pp_schedule=pp_schedule,
             gradient_accumulation_steps=self.gradient_accumulation_steps,
         )
+        input_dict, labels = next(data_iterator)
+        local_valid_tokens = int((labels != IGNORE_INDEX).sum().item())
+        input_dict = {key: value.to(self.device) if isinstance(value, torch.Tensor) else value
+                      for key, value in input_dict.items()}
+        labels = labels.to(self.device)
+        t1 = time.perf_counter()
 
         with fp8_dispatch_transport_context(
             self.simulation_config.enable_ep_dispatch_fp8,
@@ -668,7 +688,6 @@ class SimulationTrainer(Trainer):
                 forward_backward_step=lambda **kwargs: self.forward_backward_step(**kwargs),
                 input_dict=input_dict,
                 labels=labels,
-                microbatches=microbatches,
                 local_valid_tokens=local_valid_tokens,
                 optimizer_zero_grad=self.optimizers.zero_grad,
                 clip_grad_norm=lambda: self._capture_clip_grad_norm(),
@@ -693,6 +712,13 @@ class SimulationTrainer(Trainer):
                 synthetic_ac_patterns=self._synthetic_ac_save_patterns,
                 pp_schedule=pp_schedule,
             )
+        if not self.parallel_dims.pp_enabled:
+            schedule_plan = self.workload_graph.schedule_plan
+            assert schedule_plan is not None
+            schedule_plan.annotations["capture"].update({
+                "configured_global_batch_size": self.config.training.global_batch_size,
+                "configured_local_batch_size": self.config.training.local_batch_size,
+            })
 
         t2 = time.perf_counter()
 
