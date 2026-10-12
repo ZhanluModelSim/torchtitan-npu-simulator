@@ -720,6 +720,50 @@ class _SimAllToAllSingleAutograd(torch.autograd.Function):
 _active_recorder: CommEventRecorder | None = None
 
 
+def _run_autograd_collective(
+    tensor: torch.Tensor,
+    function: type[torch.autograd.Function],
+    *args: Any,
+) -> torch.Tensor:
+    """Run local communication while preserving a DTensor autograd boundary."""
+    from torch.distributed.tensor import DTensor, Shard
+
+    if not isinstance(tensor, DTensor):
+        return function.apply(tensor, *args)
+
+    local_input = tensor.to_local()
+    local_output = function.apply(local_input, *args)
+    global_shape = list(tensor.shape)
+    for dim, (input_size, output_size) in enumerate(zip(local_input.shape, local_output.shape, strict=True)):
+        if input_size == output_size:
+            continue
+        shard_degree = 1
+        for mesh_dim, placement in enumerate(tensor.placements):
+            if isinstance(placement, Shard) and placement.dim == dim:
+                shard_degree *= tensor.device_mesh.size(mesh_dim)
+        if global_shape[dim] != input_size * shard_degree:
+            raise ValueError(
+                "Simulated functional collectives cannot resize an unevenly "
+                f"sharded DTensor dimension: dim={dim}, global_size={global_shape[dim]}, "
+                f"local_size={input_size}, shard_degree={shard_degree}"
+            )
+        global_shape[dim] = output_size * shard_degree
+
+    # Collective placeholders are contiguous; describe their global layout
+    # without allocating an extra tensor or recording a fabricated L0 op.
+    global_stride = [1] * len(global_shape)
+    for dim in range(len(global_shape) - 2, -1, -1):
+        global_stride[dim] = global_stride[dim + 1] * max(global_shape[dim + 1], 1)
+    return DTensor.from_local(
+        local_output,
+        tensor.device_mesh,
+        tensor.placements,
+        run_check=False,
+        shape=torch.Size(global_shape),
+        stride=tuple(global_stride),
+    )
+
+
 def get_active_recorder() -> CommEventRecorder | None:
     """Return the currently active CommEventRecorder, if any."""
     return _active_recorder
@@ -881,24 +925,27 @@ def capture_fake_collectives(
         _record_comm_with_l0(recorder, "all_to_all", group, self_tensor, out); return out
 
     def patched_funcol_all_gather_tensor_autograd(self_tensor, gather_dim, group, tag=""):  # noqa: ANN001
-        return _SimAllGatherTensorAutograd.apply(
+        return _run_autograd_collective(
             self_tensor,
+            _SimAllGatherTensorAutograd,
             gather_dim,
             group,
             recorder,
         )
 
     def patched_funcol_reduce_scatter_tensor_autograd(self_tensor, reduceOp, scatter_dim, group, tag=""):  # noqa: ANN001, N803
-        return _SimReduceScatterTensorAutograd.apply(
+        return _run_autograd_collective(
             self_tensor,
+            _SimReduceScatterTensorAutograd,
             scatter_dim,
             group,
             recorder,
         )
 
     def patched_funcol_all_to_all_single_autograd(self_tensor, output_split_sizes, input_split_sizes, group, tag=""):  # noqa: ANN001
-        return _SimAllToAllSingleAutograd.apply(
+        return _run_autograd_collective(
             self_tensor,
+            _SimAllToAllSingleAutograd,
             output_split_sizes,
             input_split_sizes,
             group,

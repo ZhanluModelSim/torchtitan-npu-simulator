@@ -36,6 +36,15 @@ Each such node has:
 annotations.communication_owner = L1_STAGE
 ```
 
+Simulated functional autograd collectives communicate local tensors and
+restore the input DTensor's mesh and placements around their outputs. This
+preserves distributed gradient types across branched TP/CP computation while
+communication volume remains based on local shard shapes. Global output
+shapes account for every mesh dimension sharding a resized tensor dimension.
+Resizing an unevenly sharded dimension is rejected because a single local
+capture cannot infer its new global shape; unchanged dimensions retain their
+original global metadata.
+
 When repeated microbatches have different communication shapes, capture emits
 immutable variants such as:
 

@@ -673,6 +673,82 @@ def test_meta_dtensor_split_preserves_backward_connectivity():
     assert local.grad.shape == local.shape
 
 
+@pytest.mark.parametrize("primitive", ["allgather", "reduce_scatter", "all_to_all"])
+@pytest.mark.parametrize("layout", ["replicate", "shard_resized_dim", "shard_other_dim", "multidimensional"])
+def test_autograd_collectives_preserve_dtensor_layout_and_local_volume(primitive, layout):
+    from torch.distributed.device_mesh import DeviceMesh
+    from torch.distributed.tensor import DTensor, Replicate, Shard
+
+    mesh = DeviceMesh("cpu", torch.arange(8).reshape(2, 4), mesh_dim_names=("cp", "tp"))
+    tensor_mesh = mesh if layout == "multidimensional" else mesh["tp"]
+    placements = {
+        "replicate": (Replicate(),),
+        "shard_resized_dim": (Shard(0),),
+        "shard_other_dim": (Shard(1),),
+        "multidimensional": (Replicate(), Shard(1)),
+    }[layout]
+    local = torch.ones(4, 4, device="meta", requires_grad=True)
+    tensor = DTensor.from_local(local, tensor_mesh, placements, run_check=False)
+    group = mesh["cp"].get_group()
+    capture = OpDispatchCapture()
+    with capture, capture_fake_collectives() as recorder:
+        if primitive == "allgather":
+            output = funcol.all_gather_tensor_autograd(tensor, 0, group)
+            expected_local_rows = 8
+            backward_primitive = "reduce_scatter"
+        elif primitive == "reduce_scatter":
+            output = funcol.reduce_scatter_tensor_autograd(tensor, "sum", 0, group)
+            expected_local_rows = 2
+            backward_primitive = "allgather"
+        else:
+            output = funcol.all_to_all_single_autograd(tensor, [1, 2], [2, 2], group)
+            expected_local_rows = 3
+            backward_primitive = "all_to_all"
+        assert isinstance(output, DTensor)
+        assert output.device_mesh == tensor_mesh
+        assert output.placements == tensor.placements
+        assert output.to_local().shape == (expected_local_rows, 4)
+        row_shard_degree = 4 if layout == "shard_resized_dim" else 1
+        assert output.shape == (expected_local_rows * row_shard_degree, tensor.shape[1])
+        assert output.stride() == (output.shape[1], 1)
+        output.to_local().sum().backward()
+
+    assert local.grad is not None and local.grad.shape == local.shape
+    assert [event.comm_primitive for event in recorder.events] == [primitive, backward_primitive]
+    assert recorder.events[0].tensor_shape == (4, 4)
+    assert recorder.events[1].tensor_shape == (expected_local_rows, 4)
+    assert recorder.events[0].volume_bytes == 4 * 4 * local.element_size()
+
+
+def test_autograd_allgather_preserves_dtensor_branched_gradients():
+    from torch.distributed.device_mesh import DeviceMesh
+    from torch.distributed.tensor import DTensor, Replicate
+
+    mesh = DeviceMesh("cpu", torch.arange(8).reshape(2, 4), mesh_dim_names=("cp", "tp"))
+    local = torch.ones(1, 4, 8, device="meta", requires_grad=True)
+    tensor = DTensor.from_local(local, mesh["tp"], (Replicate(),), run_check=False)
+    tail = tensor[..., -2:]
+    tail = DTensor.from_local(tail.to_local() * 2, mesh["tp"], (Replicate(),), run_check=False)
+    combined = torch.cat([tensor[..., :-2], tail], dim=-1)
+    with capture_fake_collectives():
+        gathered = funcol.all_gather_tensor_autograd(combined, 0, mesh["cp"].get_group())
+        gathered.to_local().sum().backward()
+    assert local.grad is not None and local.grad.shape == local.shape
+
+
+def test_autograd_collective_rejects_resizing_uneven_dtensor_shard():
+    from torch.distributed.device_mesh import DeviceMesh
+    from torch.distributed.tensor import DTensor, Shard
+
+    mesh = DeviceMesh("cpu", torch.arange(8).reshape(2, 4), mesh_dim_names=("cp", "tp"))
+    tensor = DTensor.from_local(
+        torch.ones(2, 4, device="meta"), mesh["tp"], (Shard(0),),
+        shape=torch.Size((7, 4)), stride=(4, 1), run_check=False,
+    )
+    with capture_fake_collectives(), pytest.raises(ValueError, match="unevenly sharded DTensor dimension"):
+        funcol.all_gather_tensor_autograd(tensor, 0, mesh["cp"].get_group())
+
+
 def test_dtensor_shape_checks_use_local_shape():
     from torch.distributed.device_mesh import DeviceMesh
     from torch.distributed.tensor import DTensor, Shard
