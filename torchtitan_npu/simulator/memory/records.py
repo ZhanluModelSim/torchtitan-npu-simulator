@@ -74,6 +74,7 @@ class FSDPResidencyEvent:
     module_fqn: str = ""
     prefetch_source_fqn: str = ""
     prefetch_type: str = ""
+    storage_keys: tuple[str, ...] = ()
 
 
 @dataclass(slots=True)

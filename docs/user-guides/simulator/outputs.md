@@ -50,6 +50,7 @@ Memory Perfetto/Chrome trace 横轴由事件序号构造，不是设备运行时
 1. 从真实 model_parts 获取本地参数 shard 并去重。
 2. 保留参数 materialization alias 与 FSDP full-parameter/staging 的区别。
 3. FSDP plugin 根据 wait/reshard 状态事件建驻留，不用 schedule intent 冒充驻留开始/释放。
+   驻留事件携带带 generation 的 storage 身份；同一参数的转置、reshape 和 wrapper 内部视图统一归属 FSDP 生命周期，避免被再次计为跨前向/反向的激活。PP 回放保留这些参数 storage 身份，普通激活仍按 microbatch 实例化。
 4. Checkpoint plugin 区分边界保存、内部临时值、selective 保存且在 recompute 中复用的值。
 5. non-PP 下结合 autograd `saved_tensors_hooks` pack/unpack 识别实际保留值，排除参数、输入、通信和 FSDP buffer，再按 storage/alias 去重。
 6. 缺失 meta parameter gradient 由专门 plugin 建模，避免少计训练梯度。

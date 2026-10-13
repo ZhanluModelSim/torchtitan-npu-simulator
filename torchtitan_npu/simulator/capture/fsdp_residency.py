@@ -207,6 +207,13 @@ def _record_residency(
     tensor_ids = tuple(
         sorted(capture.tensor_id(tensor) if capture is not None else id(tensor) for tensor in tensors)
     )
+    # All-gather buffers witness the underlying storage even when a parameter
+    # wrapper exposes a separate tensor identity to the consuming operator.
+    storage_keys = (
+        tuple(sorted({capture._storage_identity(tensor)[0] for tensor in tensors}))
+        if capture is not None and include_memory
+        else ()
+    )
     training_state = str(getattr(param_group, "_training_state", "")).lower()
     phase = "backward" if "backward" in training_state else "forward"
     recorder.record_fsdp_residency(
@@ -215,6 +222,7 @@ def _record_residency(
         phase=phase,
         num_bytes=num_bytes,
         tensor_ids=tensor_ids,
+        storage_keys=storage_keys,
         shard_world_size=shard_world_size,
         transition_id=transition_id,
         include_schedule=include_schedule,

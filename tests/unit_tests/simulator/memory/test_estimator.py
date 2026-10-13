@@ -3,7 +3,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import pytest
 import torch
@@ -1310,6 +1310,38 @@ def test_fsdp_explicit_markers_remove_identity_lost_unsharded_parameter_alias():
     residency = next(item for item in plan.tensor_lifetimes if item.kind == "fsdp_full_param")
     assert (residency.birth_seq, residency.death_seq) == (2, 5)
     assert "1 unsharded parameter aliases removed" in " ".join(plan.notes)
+
+
+@pytest.mark.parametrize("reused_generation", [False, True])
+def test_fsdp_storage_removes_view_outputs_but_preserves_new_allocations(reused_generation):
+    storage_key = "buffer:0"
+    source = replace(tref(1, 128), storage_key=storage_key, storage_bytes=128)
+    view = replace(tref(2, 128), storage_key=storage_key, storage_bytes=128, shape=(2, 4, 4, 1))
+    other = replace(tref(3, 128), shape=(2, 4, 8), storage_key="buffer:1" if reused_generation else "other:0", storage_bytes=128)
+    model = nn.Module()
+    model.weight = nn.Parameter(torch.empty(1, 4, 8, device="meta"))
+    scope = "layers.0._checkpoint_wrapped_module.attention"
+    plan = estimate_static_memory(
+        [
+            event(3, 10, "aten.unsqueeze.default", inputs=[source], outputs=[view], module_path=scope),
+            event(4, 11, "aten.mul.Tensor", inputs=[other, view], outputs=[tref(4)], module_path=scope),
+            event(10, 20, "aten.mul.Tensor", inputs=[other, view], outputs=[tref(5)],
+                  phase="backward", execution_kind="recompute", module_path=scope),
+        ],
+        fsdp_residency_events=[
+            FSDPResidencyEvent("layer0", "alloc", 2, "forward", 128, (99,), storage_keys=(storage_key,)),
+            FSDPResidencyEvent("layer0", "free", 5, "forward", 128, (99,), storage_keys=(storage_key,)),
+            FSDPResidencyEvent("layer0", "alloc", 9, "backward", 128, (99,), storage_keys=(storage_key,)),
+            FSDPResidencyEvent("layer0", "free", 11, "backward", 128, (99,), storage_keys=(storage_key,)),
+        ],
+        model_parts=[model],
+    )
+    assert not any(item.tensor_id in {"external:1", "tensor:2"} for item in plan.tensor_lifetimes)
+    ordinary = next(item for item in plan.tensor_lifetimes if item.tensor_id == "external:3")
+    assert ordinary.num_bytes == 128
+    assert ordinary.death_seq == 10
+    assert not any(item.kind == "checkpoint_saved_for_recompute" for item in plan.tensor_lifetimes)
+    assert [(item.birth_seq, item.death_seq) for item in plan.tensor_lifetimes if item.kind == "fsdp_full_param"] == [(2, 5), (9, 11)]
 
 
 def test_parameter_bytes_are_persistent_and_counted():

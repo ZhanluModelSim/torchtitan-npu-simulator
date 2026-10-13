@@ -425,6 +425,27 @@ def test_checkpoint_saved_activation_offload_replays_for_each_microbatch() -> No
     assert marker["microbatches"] == [0, 1]
 
 
+def test_pp_replay_keeps_fsdp_parameter_storage_owned_by_markers():
+    weight = replace(_ref(10), storage_key="full-weight:0", storage_bytes=100)
+    activation = replace(_ref(11), storage_key="activation:0", storage_bytes=100)
+    events = [
+        _event(10, 100, comp_type="F", phase="forward", inputs=(weight,), outputs=(activation,)),
+        _event(20, 200, comp_type="B", phase="backward", inputs=(weight, activation)),
+    ]
+    markers = [
+        FSDPResidencyEvent("layer0", "alloc", 5, "forward", 100, (99,), storage_keys=("full-weight:0",)),
+        FSDPResidencyEvent("layer0", "free", 25, "backward", 100, (99,), storage_keys=("full-weight:0",)),
+    ]
+    plan = estimate_schedule_memory(
+        events, schedule_plan=_plan([_action(0, "F", 0), _action(1, "F", 1), _action(2, "B", 0), _action(3, "B", 1)]),
+        fsdp_residency_events=markers,
+    )
+    assert not any(item.kind == "external_input" for item in plan.tensor_lifetimes)
+    assert len([item for item in plan.tensor_lifetimes if item.kind == "fsdp_full_param"]) == 1
+    assert len([item for item in plan.tensor_lifetimes if item.kind == "activation"]) == 2
+    assert {ref.storage_key for event in plan.raw_events for ref in event.inputs if ref.tensor_id == 10} == {"full-weight:0"}
+
+
 def test_explicit_fsdp_residency_is_not_multiplied_by_microbatch_replay() -> None:
     events = [
         _event(10, 101, comp_type="F", phase="forward", outputs=(_ref(10),)),

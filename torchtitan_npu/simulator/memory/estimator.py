@@ -480,6 +480,7 @@ def estimate_static_memory(
         checkpoint_boundary_events=list(checkpoint_boundary_events or []),
         autograd_saved_tensors=list(autograd_saved_tensor_events or []),
         alias_base_by_tensor_id=alias_base_by_tensor_id,
+        storage_roots=storage_roots,
         offload_ac_saved_tensors=offload_ac_saved_tensors,
         fsdp_allgather_transport_dtype=fsdp_allgather_transport_dtype,
         notes=notes,

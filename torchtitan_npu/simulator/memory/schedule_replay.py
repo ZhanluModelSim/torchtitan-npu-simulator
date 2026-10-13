@@ -153,6 +153,8 @@ def replay_pp_memory_capture(
         )
     compute_keys = {(action.stage, action.comp_type) for action in compute_actions}
     comm_events = list(comm_events or [])
+    fsdp_residency_events = list(fsdp_residency_events or [])
+    fsdp_storage_keys = {key for event in fsdp_residency_events for key in event.storage_keys}
     raw_comm_op_ids = {
         event.op_id for event in events if event.raw_op_type.startswith("comm.")
     }
@@ -223,7 +225,7 @@ def replay_pp_memory_capture(
         return op_ids[key]
 
     def storage_key_for(stage: int, microbatch: int, key: str) -> str:
-        if not key or key.partition(":")[0] in persistent_storage_keys:
+        if not key or key in fsdp_storage_keys or key.partition(":")[0] in persistent_storage_keys:
             return key
         return f"pp:s{stage}:mb{microbatch}:{key}"
 

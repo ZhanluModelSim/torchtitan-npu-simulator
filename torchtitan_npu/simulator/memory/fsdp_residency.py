@@ -62,10 +62,16 @@ class FSDPFullParamResidencyPlugin(MemoryModelPlugin):
 
     def _apply_explicit_markers(self, context: MemoryModelContext) -> list[TensorLifetime]:
         marked_tensor_ids = {
-            tensor_id
+            context.alias_base_by_tensor_id.get(tensor_id, tensor_id)
             for event in context.fsdp_residency_events
             for tensor_id in event.tensor_ids
         }
+        marked_storage_keys = {key for event in context.fsdp_residency_events for key in event.storage_keys}
+        marked_tensor_ids.update(
+            context.storage_roots[key]
+            for key in marked_storage_keys
+            if key in context.storage_roots
+        )
         removed = 0
         for tensor_id in marked_tensor_ids:
             if context.lifetimes_by_tensor_id.pop(tensor_id, None) is not None:
@@ -79,12 +85,14 @@ class FSDPFullParamResidencyPlugin(MemoryModelPlugin):
         # truth for the full-parameter residency interval and byte count.
         removed_unsharded_aliases = 0
         removed_unsharded_alias_bytes = 0
-        for tensor_id, lifetime in list(context.lifetimes_by_tensor_id.items()):
-            if not _is_unsharded_parameter_alias(lifetime, context):
-                continue
-            context.lifetimes_by_tensor_id.pop(tensor_id)
-            removed_unsharded_aliases += 1
-            removed_unsharded_alias_bytes += lifetime.num_bytes
+        # Shape recovery is only for legacy captures without storage keys.
+        if not marked_storage_keys:
+            for tensor_id, lifetime in list(context.lifetimes_by_tensor_id.items()):
+                if not _is_unsharded_parameter_alias(lifetime, context):
+                    continue
+                context.lifetimes_by_tensor_id.pop(tensor_id)
+                removed_unsharded_aliases += 1
+                removed_unsharded_alias_bytes += lifetime.num_bytes
 
         alloc_seqs = sorted(
             event.seq_idx for event in context.fsdp_residency_events if event.action == "alloc"
