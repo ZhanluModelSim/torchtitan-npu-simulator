@@ -129,13 +129,8 @@ class GatedAttention(nn.Module):
 
         query, key = apply_rotary_emb_cos_sin(query, key, rope_cache, positions)
 
-        attn_output = F.scaled_dot_product_attention(
-            query.transpose(1, 2),
-            key.transpose(1, 2),
-            value.transpose(1, 2),
-            scale=self.scaling,
-            is_causal=True,
-            enable_gqa=self.n_heads != self.n_kv_heads,
+        attn_output = self._attention_core(
+            query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2)
         )
         attn_output = (
             attn_output.transpose(1, 2).reshape(batch_size, seq_len, -1).contiguous()
@@ -143,3 +138,17 @@ class GatedAttention(nn.Module):
         attn_output = attn_output * torch.sigmoid(gate)
 
         return self.o_proj(attn_output)
+
+    def _attention_core(
+        self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
+    ) -> torch.Tensor:
+        """Head-major GQA core. Replaced by the fused ``fusion_attention``
+        virtual operator in simulator mode (see qwen3_next_converter)."""
+        return F.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            scale=self.scaling,
+            is_causal=True,
+            enable_gqa=self.n_heads != self.n_kv_heads,
+        )
