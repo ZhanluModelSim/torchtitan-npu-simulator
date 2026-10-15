@@ -5,10 +5,11 @@
 
 """Install Qwen3-Next shape-only kernel bindings in simulator mode.
 
-Binds the same virtual fused operators used by Kimi K3 (``fusion_attention``
-and ``situ_glu``) so the captured workload matches the NPU fused-kernel
-execution model (cf. MindSpeed ``torch_npu.npu_fusion_attention`` and fused
-SwiGLU) instead of the decomposed SDPA/elementwise chain.
+Binds the MindSpeed ``Qwen3NextMoeExperts`` production op stream as virtual
+fused operators (``npu.npu_moe_token_permute`` / ``npu.npu_swiglu`` /
+``npu.npu_moe_token_unpermute``, mirroring ``mindspeed.ops`` and
+``torch_npu``), plus the fused ``fusion_attention`` virtual operator for the
+gated attention core (mirroring MindSpeed ``torch_npu.npu_fusion_attention``).
 """
 
 from __future__ import annotations
@@ -16,63 +17,304 @@ from __future__ import annotations
 from types import MethodType
 
 import torch
+import torch.nn.functional as F
 from torch.distributed.tensor import DTensor
 
 from torchtitan_npu.models.qwen3_next.attention import GatedAttention
-from torchtitan_npu.models.qwen3_next.feed_forward import (
-    Qwen3NextGroupedExperts,
-    _SharedExpertMLP,
-)
-from torchtitan_npu.simulator.hardware_shims.kimi_k3_fusion_shim import (
-    sim_gated_mla_attention,
-    sim_kimi_situ_glu,
-)
+from torchtitan_npu.models.qwen3_next.feed_forward import Qwen3NextGroupedExperts
+from torchtitan_npu.simulator.capture.dispatch_capture import get_active_capture
+from torchtitan_npu.simulator.synthetic_ac import run_synthetic_op
 
 _FA_SHIM_MARKER = "_simulator_qwen_fa_shim_installed"
-_GROUPED_EXPERTS_SHIM_MARKER = "_simulator_qwen_grouped_experts_shim_installed"
-_MLP_SHIM_MARKER = "_simulator_qwen_mlp_shim_installed"
+_EXPERTS_SHIM_MARKER = "_simulator_qwen_experts_shim_installed"
+
+
+def _suspend():
+    capture = get_active_capture()
+    if capture is None:
+        import contextlib
+
+        return contextlib.nullcontext()
+    return capture.suspend_recording()
+
+
+def _module_path() -> str:
+    capture = get_active_capture()
+    if capture is None or capture.module_path_tracker is None:
+        return ""
+    return capture.module_path_tracker.current_path()
+
+
+class _SimMoeTokenPermute(torch.autograd.Function):
+    """Virtual ``npu_moe_token_permute``: single fused op in the capture."""
+
+    @staticmethod
+    def forward(ctx, tokens: torch.Tensor, indices: torch.Tensor, path: str):
+        def factory():
+            with _suspend():
+                flat = indices.reshape(-1).to(torch.int64)
+                row_ids = torch.argsort(flat, stable=True)
+                permuted = tokens.index_select(0, row_ids)
+                return permuted, row_ids.to(torch.int32)
+
+        permuted, row_ids_map = run_synthetic_op(
+            "npu.npu_moe_token_permute.default",
+            inputs=[tokens, indices],
+            output_factory=factory,
+            module_path=path,
+        )
+        ctx.save_for_backward(row_ids_map)
+        ctx.path = path
+        ctx.num_tokens = tokens.shape[0]
+        return permuted, row_ids_map
+
+    @staticmethod
+    def backward(ctx, grad_permuted: torch.Tensor, grad_map: torch.Tensor | None):
+        (row_ids_map,) = ctx.saved_tensors
+        row_ids = row_ids_map.to(torch.int64)
+
+        def factory():
+            with _suspend():
+                grad_tokens = torch.zeros(
+                    (ctx.num_tokens, grad_permuted.shape[-1]),
+                    dtype=grad_permuted.dtype,
+                    device=grad_permuted.device,
+                )
+                grad_tokens.index_add_(0, row_ids, grad_permuted)
+                return (grad_tokens,)
+
+        (grad_tokens,) = run_synthetic_op(
+            "npu.npu_moe_token_permute_grad.default",
+            inputs=[grad_permuted],
+            output_factory=factory,
+            module_path=ctx.path,
+        )
+        return grad_tokens, None, None
+
+
+class _SimNpuSwiglu(torch.autograd.Function):
+    """Virtual ``torch_npu.npu_swiglu(x, dim=-1)``: single fused op."""
+
+    @staticmethod
+    def forward(ctx, fc1_output: torch.Tensor, path: str):
+        def factory():
+            with _suspend():
+                gate, up = fc1_output.chunk(2, dim=-1)
+                return (F.silu(gate) * up,)
+
+        (out,) = run_synthetic_op(
+            "npu.npu_swiglu.default",
+            inputs=[fc1_output],
+            output_factory=factory,
+            module_path=path,
+        )
+        ctx.save_for_backward(fc1_output)
+        ctx.path = path
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out: torch.Tensor):
+        (fc1_output,) = ctx.saved_tensors
+
+        def factory():
+            with _suspend():
+                gate, up = fc1_output.chunk(2, dim=-1)
+                sig = torch.sigmoid(gate)
+                grad_gate = grad_out * up * sig
+                grad_up = grad_out * sig
+                return (torch.cat([grad_gate, grad_up], dim=-1),)
+
+        (grad_fc1,) = run_synthetic_op(
+            "npu.npu_swiglu_backward.default",
+            inputs=[grad_out],
+            output_factory=factory,
+            module_path=ctx.path,
+        )
+        return grad_fc1, None
+
+
+class _SimMoeTokenUnpermute(torch.autograd.Function):
+    """Virtual ``npu_moe_token_unpermute`` (probs pre-folded into tokens)."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        routed_output: torch.Tensor,
+        row_ids_map: torch.Tensor,
+        num_tokens: int,
+        top_k: int,
+        path: str,
+    ):
+        row_ids = row_ids_map.to(torch.int64)
+
+        def factory():
+            with _suspend():
+                token_ids = row_ids // top_k
+                output = torch.zeros(
+                    (num_tokens, routed_output.shape[-1]),
+                    dtype=routed_output.dtype,
+                    device=routed_output.device,
+                )
+                output.index_add_(0, token_ids, routed_output)
+                return (output,)
+
+        (out,) = run_synthetic_op(
+            "npu.npu_moe_token_unpermute.default",
+            inputs=[routed_output, row_ids_map],
+            output_factory=factory,
+            module_path=path,
+        )
+        ctx.save_for_backward(row_ids_map)
+        ctx.path = path
+        ctx.num_tokens = num_tokens
+        ctx.top_k = top_k
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out: torch.Tensor):
+        (row_ids_map,) = ctx.saved_tensors
+        row_ids = row_ids_map.to(torch.int64)
+
+        def factory():
+            with _suspend():
+                token_ids = row_ids // ctx.top_k
+                grad_tokens = grad_out.index_select(0, token_ids)
+                return (grad_tokens,)
+
+        (grad_routed,) = run_synthetic_op(
+            "npu.npu_moe_token_unpermute_grad.default",
+            inputs=[grad_out],
+            output_factory=factory,
+            module_path=ctx.path,
+        )
+        return grad_routed, None, None, None, None
+
+
+def _sim_moe_token_permute(
+    tokens: torch.Tensor, indices: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _SimMoeTokenPermute.apply(tokens, indices, _module_path())
+
+
+def _sim_npu_swiglu(fc1_output: torch.Tensor) -> torch.Tensor:
+    return _SimNpuSwiglu.apply(fc1_output, _module_path())
+
+
+def _sim_moe_token_unpermute(
+    routed_output: torch.Tensor,
+    row_ids_map: torch.Tensor,
+    num_tokens: int,
+    top_k: int,
+) -> torch.Tensor:
+    return _SimMoeTokenUnpermute.apply(
+        routed_output, row_ids_map, num_tokens, top_k, _module_path()
+    )
 
 
 def _sim_qwen_grouped_experts(
     module: Qwen3NextGroupedExperts,
-    x: torch.Tensor,
+    hidden_states: torch.Tensor,
     num_tokens_per_expert: torch.Tensor,
 ) -> torch.Tensor:
-    if isinstance(module.w1, DTensor):
-        w1, w2, w3 = module.w1.to_local(), module.w2.to_local(), module.w3.to_local()
-    else:
-        w1, w2, w3 = module.w1, module.w2, module.w3
+    """MindSpeed expert core: GMM(gate_up) -> npu_swiglu -> GMM(down)."""
+    if isinstance(hidden_states, DTensor):
+        hidden_states = hidden_states.to_local()
+    gate_up_proj, down_proj = module._view_experts_weight()
 
     offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
-    gate = torch._grouped_mm(
-        x.bfloat16(), w1.bfloat16().transpose(-2, -1), offs=offsets
-    )
-    up = torch._grouped_mm(
-        x.bfloat16(), w3.bfloat16().transpose(-2, -1), offs=offsets
-    )
-    return torch._grouped_mm(
-        sim_kimi_situ_glu(gate, up),
-        w2.bfloat16().transpose(-2, -1),
-        offs=offsets,
-    ).type_as(x)
+    fc1_output = torch._grouped_mm(hidden_states, gate_up_proj, offs=offsets)
+    fc1_activation = _sim_npu_swiglu(fc1_output)
+    fc2_out = torch._grouped_mm(fc1_activation, down_proj, offs=offsets)
+    return fc2_out
 
 
-def _sim_qwen_shared_mlp(module: _SharedExpertMLP, x: torch.Tensor) -> torch.Tensor:
-    return module.down_proj(sim_kimi_situ_glu(module.gate_proj(x), module.up_proj(x)))
+def _virtual_token_permute(
+    hidden_states: torch.Tensor, selected_experts: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _sim_moe_token_permute(hidden_states, selected_experts)
+
+
+def _virtual_token_unpermute(
+    routed_output: torch.Tensor,
+    row_ids_map: torch.Tensor,
+    num_tokens: int,
+    top_k: int,
+) -> torch.Tensor:
+    return _sim_moe_token_unpermute(routed_output, row_ids_map, num_tokens, top_k)
+
+
+def sim_gated_attention(
+    module: GatedAttention,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+) -> torch.Tensor:
+    """Simulator-only fused attention core (GQA head-major q/k/v)."""
+    attrs = {"num_heads": int(query.shape[1]), "layout": "BNSD"}
+    return _SimFusionAttention.apply(query, key, value, _module_path(), attrs)
+
+
+class _SimFusionAttention(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, query, key, value, path, attrs):  # noqa: ANN001
+        def factory():
+            with _suspend():
+                return _empty_like(query)
+
+        output = run_synthetic_op(
+            "fusion_attention",
+            inputs=[query, key, value],
+            output_factory=factory,
+            module_path=path,
+            attrs=attrs,
+        )
+        ctx.save_for_backward(query, key, value)
+        ctx.path = path
+        ctx.attrs = attrs
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):  # noqa: ANN001
+        saved = ctx.saved_tensors
+
+        def factory():
+            with _suspend():
+                return tuple(_empty_like(t) for t in saved)
+
+        grads = run_synthetic_op(
+            "fusion_attention_grad",
+            inputs=[*saved, grad_output],
+            output_factory=factory,
+            module_path=ctx.path,
+            attrs=ctx.attrs,
+        )
+        return (*grads, None, None)
+
+
+def _empty_like(tensor: torch.Tensor) -> torch.Tensor:
+    capture = get_active_capture()
+    if capture is None:
+        return torch.empty_like(tensor)
+    with capture.suspend_recording():
+        return torch.empty_like(tensor)
 
 
 def apply_qwen3_next_fusion_shims(model) -> None:
-    """Bind fused attention / GLU virtual ops while preserving module hooks."""
+    """Bind fused virtual ops while preserving module hooks."""
+    from torchtitan_npu.models.qwen3_next import feed_forward as _ff
+
+    # Virtual fused permute/unpermute at the MoE boundary (module-level
+    # helpers resolve globals at call time, so rebinding swaps in the fused
+    # ops for the whole capture).
+    _ff._token_permute = _virtual_token_permute
+    _ff._token_unpermute = _virtual_token_unpermute
+
     for module in model.modules():
         if isinstance(module, GatedAttention):
             if not getattr(module, _FA_SHIM_MARKER, False):
-                module._attention_core = MethodType(sim_gated_mla_attention, module)
+                module._attention_core = MethodType(sim_gated_attention, module)
                 setattr(module, _FA_SHIM_MARKER, True)
         elif isinstance(module, Qwen3NextGroupedExperts):
-            if not getattr(module, _GROUPED_EXPERTS_SHIM_MARKER, False):
+            if not getattr(module, _EXPERTS_SHIM_MARKER, False):
                 module.forward = MethodType(_sim_qwen_grouped_experts, module)
-                setattr(module, _GROUPED_EXPERTS_SHIM_MARKER, True)
-        elif isinstance(module, _SharedExpertMLP):
-            if not getattr(module, _MLP_SHIM_MARKER, False):
-                module.forward = MethodType(_sim_qwen_shared_mlp, module)
-                setattr(module, _MLP_SHIM_MARKER, True)
+                setattr(module, _EXPERTS_SHIM_MARKER, True)

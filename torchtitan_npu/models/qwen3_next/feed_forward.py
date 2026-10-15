@@ -5,12 +5,23 @@
 
 """Qwen3-Next feed-forward modules: dense MLP (upstream) and sparse MoE.
 
-The MoE block follows the Qwen3-Next design: softmax routing with top-k and
-topk-prob normalization, grouped routed experts, plus a gated shared expert
-(``sigmoid(shared_expert_gate(x)) * shared_expert(x)``).
+The MoE block strictly mirrors the MindSpeed-LLM fsdp2 implementation
+(``mindspeed_llm/fsdp2/models/qwen3_next/modeling_qwen3_next.py``):
 
-Reference: MindSpeed-LLM
-mindspeed_llm/fsdp2/models/qwen3_next/modeling_qwen3_next.py
+- ``Qwen3NextMoeExperts``: fused ``gate_up_proj`` [E*hidden, 2*inter] /
+  ``down_proj`` [E*inter, hidden] parameters and the grouped-GEMM ->
+  ``npu_swiglu`` -> grouped-GEMM core. Token permute/unpermute live at the
+  MoE boundary so the torchtitan ExpertParallel dispatcher (which wraps the
+  experts module with the ``(routed_input, num_tokens_per_expert)`` contract)
+  stays intact; routing probs are folded into the permuted tokens before the
+  first GEMM (numerically equivalent to MindSpeed folding them into the
+  unpermute).
+- ``Qwen3NextMoeSharedExpert``: dense SwiGLU MLP with a sigmoid gate.
+
+The eager helpers below provide the same semantics with plain aten ops so the
+model also runs without the fused NPU kernels; the simulator binds virtual
+fused operators (``qwen3_next_converter``) so the captured workload matches
+the MindSpeed production op stream.
 """
 
 from dataclasses import dataclass
@@ -24,12 +35,48 @@ from torchtitan.models.common.linear import Linear
 from torchtitan.protocols.module import Module
 
 
-class Qwen3NextGroupedExperts(nn.Module):
-    """Routed experts in the ``[E, out, in]`` weight layout.
+def _token_permute(
+    hidden_states: torch.Tensor, selected_experts: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Eager equivalent of ``npu_moe_token_permute`` (expert-major sort)."""
+    flat_indices = selected_experts.reshape(-1).to(torch.int64)
+    row_ids_map = torch.argsort(flat_indices, stable=True)
+    permuted_hidden_states = hidden_states.index_select(0, row_ids_map)
+    return permuted_hidden_states, row_ids_map
 
-    Uses ``torch._grouped_mm`` on NPU/meta devices and a per-expert loop
-    fallback on CPU. The w1/w2/w3 naming and forward signature match
-    torchtitan's ``ExpertParallel`` expectations.
+
+def _swiglu(fc1_output: torch.Tensor) -> torch.Tensor:
+    """Eager equivalent of ``torch_npu.npu_swiglu(x, dim=-1)``."""
+    gate, up = fc1_output.chunk(2, dim=-1)
+    return F.silu(gate) * up
+
+
+def _token_unpermute(
+    routed_output: torch.Tensor,
+    row_ids_map: torch.Tensor,
+    num_tokens: int,
+    top_k: int,
+) -> torch.Tensor:
+    """Eager equivalent of ``npu_moe_token_unpermute`` (probs pre-folded)."""
+    token_ids = row_ids_map // top_k
+    output = torch.zeros(
+        (num_tokens, routed_output.shape[-1]),
+        dtype=routed_output.dtype,
+        device=routed_output.device,
+    )
+    output.index_add_(0, token_ids, routed_output)
+    return output
+
+
+class Qwen3NextGroupedExperts(nn.Module):
+    """Routed experts mirroring MindSpeed ``Qwen3NextMoeExperts``.
+
+    Fused weight layout: ``gate_up_proj`` [E*hidden, 2*inter] (viewed
+    [E, hidden, 2*inter], trans_b=False in the GMM) and ``down_proj``
+    [E*inter, hidden] (viewed [E, inter, hidden]). The expert dimension is
+    dim 0 so ``ExpertParallel`` shards both parameters with Shard(0). The
+    module keeps torchtitan's ``(routed_input, num_tokens_per_expert)``
+    contract: token permute/unpermute are handled at the MoE boundary.
     """
 
     def __init__(
@@ -41,95 +88,54 @@ class Qwen3NextGroupedExperts(nn.Module):
     ):
         super().__init__()
         self.num_experts = num_experts
-        self.w1 = nn.Parameter(torch.empty(num_experts, intermediate_size, hidden_size))
-        self.w2 = nn.Parameter(torch.empty(num_experts, hidden_size, intermediate_size))
-        self.w3 = nn.Parameter(torch.empty(num_experts, intermediate_size, hidden_size))
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+        self.gate_up_proj = nn.Parameter(
+            torch.empty(num_experts * hidden_size, 2 * intermediate_size)
+        )
+        self.down_proj = nn.Parameter(
+            torch.empty(num_experts * intermediate_size, hidden_size)
+        )
+
+    def _view_experts_weight(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        gate_up_proj = (
+            self.gate_up_proj.to_local()
+            if isinstance(self.gate_up_proj, DTensor)
+            else self.gate_up_proj
+        )
+        down_proj = (
+            self.down_proj.to_local()
+            if isinstance(self.down_proj, DTensor)
+            else self.down_proj
+        )
+        # The fused flat layout [E*hidden, 2*inter] shards row-wise under EP
+        # (Shard(0)), which evenly splits whole experts; derive the local
+        # expert count from the actual storage instead of self.num_experts.
+        local_experts = gate_up_proj.shape[0] // self.hidden_size
+        gate_up_proj = gate_up_proj.view(local_experts, self.hidden_size, -1)
+        down_proj = down_proj.view(local_experts, -1, self.hidden_size)
+        return gate_up_proj, down_proj
 
     def forward(
         self,
-        x: torch.Tensor,
+        hidden_states: torch.Tensor,
         num_tokens_per_expert: torch.Tensor,
     ) -> torch.Tensor:
-        if isinstance(self.w1, DTensor):
-            w1 = self.w1.to_local()
-            w2 = self.w2.to_local()
-            w3 = self.w3.to_local()
-        else:
-            w1, w2, w3 = self.w1, self.w2, self.w3
-
-        if x.device.type == "cpu":
-            return self._forward_loop(x, num_tokens_per_expert, w1, w2, w3)
+        if isinstance(hidden_states, DTensor):
+            hidden_states = hidden_states.to_local()
+        gate_up_proj, down_proj = self._view_experts_weight()
 
         offsets = torch.cumsum(num_tokens_per_expert, dim=0, dtype=torch.int32)
-        gate = torch._grouped_mm(
-            x.bfloat16(), w1.bfloat16().transpose(-2, -1), offs=offsets
-        )
-        up = torch._grouped_mm(
-            x.bfloat16(), w3.bfloat16().transpose(-2, -1), offs=offsets
-        )
-        hidden = F.silu(gate) * up
-        return torch._grouped_mm(
-            hidden,
-            w2.bfloat16().transpose(-2, -1),
-            offs=offsets,
-        ).type_as(x)
-
-    def _forward_loop(
-        self,
-        x: torch.Tensor,
-        num_tokens_per_expert: torch.Tensor,
-        w1: torch.Tensor,
-        w2: torch.Tensor,
-        w3: torch.Tensor,
-    ) -> torch.Tensor:
-        token_counts = num_tokens_per_expert.to(torch.int64).tolist()
-        outputs = []
-        offset = 0
-        for expert_idx, token_count in enumerate(token_counts):
-            expert_input = x[offset : offset + token_count]
-            gate = F.linear(expert_input, w1[expert_idx])
-            up = F.linear(expert_input, w3[expert_idx])
-            outputs.append(
-                F.linear(
-                    F.silu(gate) * up,
-                    w2[expert_idx],
-                )
-            )
-            offset += token_count
-        return torch.cat(outputs, dim=0) if outputs else torch.empty_like(x)
-
-
-class Qwen3NextTokenReorderer(nn.Module):
-    """Group routed tokens by expert while preserving token-score alignment."""
-
-    def __init__(self, *, num_experts: int, top_k: int):
-        super().__init__()
-        self.num_experts = num_experts
-        self.top_k = top_k
-
-    def forward(
-        self,
-        top_scores: torch.Tensor,
-        selected_experts_indices: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        flat_expert_indices = selected_experts_indices.reshape(-1)
-        num_tokens_per_expert = torch.histc(
-            flat_expert_indices.float(),
-            bins=self.num_experts,
-            min=0,
-            max=self.num_experts - 1,
-        ).to(torch.int64)
-        sorted_assignment_indices = torch.argsort(
-            flat_expert_indices,
-            stable=True,
-        )
-        sorted_scores = top_scores.reshape(-1)[sorted_assignment_indices]
-        token_indices = sorted_assignment_indices // self.top_k
-        return sorted_scores, token_indices, num_tokens_per_expert
+        fc1_output = torch._grouped_mm(hidden_states, gate_up_proj, offs=offsets)
+        fc1_activation = _swiglu(fc1_output)
+        fc2_out = torch._grouped_mm(fc1_activation, down_proj, offs=offsets)
+        return fc2_out
 
 
 class Qwen3NextMoE(nn.Module):
-    """Sparse MoE block with softmax routing and a gated shared expert."""
+    """Sparse MoE block mirroring MindSpeed ``Qwen3NextSparseFusedMoeBlock``."""
 
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
@@ -147,23 +153,22 @@ class Qwen3NextMoE(nn.Module):
         self.hidden_size = config.hidden_size
         self.num_experts = config.num_experts
         self.top_k = config.top_k
+        self.norm_topk_prob = config.norm_topk_prob
         self.debug_force_load_balance = config.debug_force_load_balance
 
+        # gating
         self.gate = Linear.Config(
             in_features=config.hidden_size,
             out_features=config.num_experts,
             bias=False,
         ).build()
-        self.reorderer = Qwen3NextTokenReorderer(
-            num_experts=config.num_experts,
-            top_k=config.top_k,
-        )
         self.experts = Qwen3NextGroupedExperts(
             num_experts=config.num_experts,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
         )
 
+        # shared expert
         self.shared_expert = _SharedExpertMLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.shared_expert_intermediate_size,
@@ -183,12 +188,18 @@ class Qwen3NextMoE(nn.Module):
                 )
             hidden_states = hidden_states.to_local(grad_placements=(Partial(),))
 
-        original_shape = hidden_states.shape
-        hidden_flat = hidden_states.view(-1, hidden_states.shape[-1])
+        batch_size, sequence_length, hidden_dim = hidden_states.shape
+        hidden_flat = hidden_states.view(-1, hidden_dim)
 
-        # Router: softmax scores, top-k selection, optional probability norm.
-        logits = F.linear(hidden_flat.float(), self.gate.weight.float())
-        scores = logits.softmax(dim=-1)
+        # gating
+        gate_weight = (
+            self.gate.weight.to_local()
+            if isinstance(self.gate.weight, DTensor)
+            else self.gate.weight
+        )
+        router_logits = F.linear(hidden_flat, gate_weight)
+        routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+
         if self.debug_force_load_balance:
             token_offsets = torch.arange(
                 hidden_flat.shape[0], device=hidden_flat.device, dtype=torch.int64
@@ -196,41 +207,55 @@ class Qwen3NextMoE(nn.Module):
             expert_offsets = torch.arange(
                 self.top_k, device=hidden_flat.device, dtype=torch.int64
             )
-            topk_idx = (
+            selected_experts = (
                 token_offsets.unsqueeze(1) + expert_offsets.unsqueeze(0)
             ) % self.num_experts
-        else:
-            topk_idx = torch.topk(scores, k=self.top_k, dim=-1, sorted=False)[1]
-        topk_weight = scores.gather(1, topk_idx)
-        if self.top_k > 1 and self.config.norm_topk_prob:
-            topk_weight = topk_weight / (
-                topk_weight.sum(dim=-1, keepdim=True) + 1e-20
+            routing_weights = torch.full(
+                (hidden_flat.shape[0], self.top_k),
+                1.0 / self.top_k,
+                dtype=torch.float32,
+                device=hidden_flat.device,
             )
-        topk_weight = topk_weight.to(hidden_states.dtype)
+        else:
+            routing_weights, selected_experts = torch.topk(
+                routing_weights, k=self.top_k, dim=-1
+            )
+            if self.norm_topk_prob:
+                routing_weights = routing_weights / (
+                    routing_weights.sum(dim=-1, keepdim=True) + 1e-20
+                )
+        routing_weights = routing_weights.to(hidden_states.dtype)
 
-        (
-            topk_weight,
-            token_indices,
-            num_tokens_per_expert,
-        ) = self.reorderer(topk_weight, topk_idx)
-        routed_input = hidden_flat[token_indices]
-        routed_output = self.experts(routed_input, num_tokens_per_expert)
-        routed_output = routed_output * topk_weight.unsqueeze(-1).to(
-            routed_output.dtype
+        # permute (npu_moe_token_permute semantics, probs pre-folded)
+        permuted_hidden_states, row_ids_map = _token_permute(
+            hidden_flat, selected_experts
+        )
+        tokens_per_expert = torch.histc(
+            selected_experts.reshape(-1).float(),
+            bins=self.num_experts,
+            min=0,
+            max=self.num_experts,
+        )
+        row_probs = routing_weights.reshape(-1).index_select(0, row_ids_map)
+        permuted_hidden_states = (
+            permuted_hidden_states * row_probs.to(permuted_hidden_states.dtype).unsqueeze(-1)
         )
 
-        combined = torch.zeros_like(hidden_flat)
-        combined.index_add_(
-            0,
-            token_indices,
-            routed_output.to(combined.dtype),
+        routed_output = self.experts(permuted_hidden_states, tokens_per_expert)
+
+        # unpermute (npu_moe_token_unpermute semantics)
+        combined = _token_unpermute(
+            routed_output,
+            row_ids_map,
+            num_tokens=hidden_flat.shape[0],
+            top_k=self.top_k,
         )
-        output = combined.view(*original_shape)
 
         shared_expert_output = self.shared_expert(hidden_states)
         shared_gate = torch.sigmoid(self.shared_expert_gate(hidden_states))
-        output = output + shared_gate * shared_expert_output
-        return output
+        combined = combined + shared_gate * shared_expert_output
+
+        return combined.view(batch_size, sequence_length, hidden_dim)
 
 
 class _SharedExpertMLP(nn.Module):

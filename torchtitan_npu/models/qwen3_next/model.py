@@ -203,6 +203,7 @@ class Qwen3NextModel(Decoder):
                 with torch.no_grad():
                     mixer.A_log.uniform_(0, 16).log_()
             if layer.moe is not None:
-                nn.init.normal_(layer.moe.experts.w1, mean=0.0, std=init_std)
-                nn.init.normal_(layer.moe.experts.w2, mean=0.0, std=init_std)
-                nn.init.normal_(layer.moe.experts.w3, mean=0.0, std=init_std)
+                nn.init.normal_(
+                    layer.moe.experts.gate_up_proj, mean=0.0, std=init_std
+                )
+                nn.init.normal_(layer.moe.experts.down_proj, mean=0.0, std=init_std)
