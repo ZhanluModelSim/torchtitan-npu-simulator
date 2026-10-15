@@ -221,8 +221,8 @@ class Qwen3NextMoE(nn.Module):
                 routing_weights, k=self.top_k, dim=-1
             )
             if self.norm_topk_prob:
-                routing_weights = routing_weights / (
-                    routing_weights.sum(dim=-1, keepdim=True) + 1e-20
+                routing_weights = routing_weights / routing_weights.sum(
+                    dim=-1, keepdim=True
                 )
         routing_weights = routing_weights.to(hidden_states.dtype)
 
