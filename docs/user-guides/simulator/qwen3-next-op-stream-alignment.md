@@ -25,13 +25,26 @@
   index_copy/sort/histc/cumsum/topk）——此前 eager scatter 算子已捕获但被归一化成
   `unknown`，呈现为"漏捕获"
 
-### GDN eager 分解（`d8b9536`）
+### GDN triton kernel 序列（`d8b9536` 已被 `6552d68` 取代）
 
-实测参考跑的是 MindSpeed 建模文件内的 pure-torch fallback（逐 chunk for 循环 + in-place
-写）。此前该核心被记成 1 个合成算子（`fla.ops.gated_delta_rule.chunk_gated_delta_rule`），
-内部全部 suspend，导致 elementwise/copy 计数缩水、flops=0 定价缺失。现已删除 shape-only
-shim，逐行移植的分解实现开放跑在 meta 张量上（前反向 autograd 对逐 chunk 循环安全，已
-回归验证）。
+GDN 核心的生产绑定是 `use_triton_gdn=True` →
+`mindspeed_llm/tasks/models/transformer/chunk_gated_delta_rule.py`（triton-ascend
+实现，**每阶段一个 kernel**）。文件内的 `torch_chunk_gated_delta_rule` 只是 fla/triton
+不可用时的 fallback。曾先后试过"整个核心 1 个合成算子"（elementwise 过少）和
+"eager 分解全展开"（elementwise 虚高 6 倍），均与实测不符；最终口径为**逐 kernel 记录**
+生产调用序：
+
+- 前向（8 kernel）：`l2norm_fwd`×2（q,k）→ `chunk_local_cumsum` →
+  `chunk_scaled_dot_kkt_fwd` → `solve_tril` → `recompute_w_u_fwd` →
+  `chunk_gated_delta_rule_fwd_h` → `chunk_fwd_o`
+- 反向（9 kernel + eager）：`recompute_w_u_fwd` → `chunk_gated_delta_rule_fwd_h` →
+  `chunk_bwd_dv_local` → `chunk_gated_delta_rule_bwd_dhu` → `chunk_bwd_dqkwg` →
+  `prepare_wy_repr_bwd` → eager `add_`×2 → `chunk_local_cumsum`(reverse) →
+  `l2norm_bwd`×2 → 输出 cast×5
+
+效果（80B，rank_0）：总节点 17,031；elementwise 3,152（eager 展开时 155,072）；
+triton kernel 记录 900 个（12 种 × 36 层 × 前向/重算/反向倍数）。
+实现：`torchtitan_npu/simulator/hardware_shims/gdn_shim.py`。
 
 ## 效果（80B a3b，world-size 8，rank_0）
 
