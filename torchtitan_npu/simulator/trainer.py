@@ -611,13 +611,8 @@ class SimulationTrainer(Trainer):
 
         for model_part in self.model_parts:
             apply_kimi_k3_shims(model_part)
-        # Bind Qwen3-Next GDN shim the same way.
-        from torchtitan_npu.simulator.hardware_shims.gdn_shim import (
-            apply_qwen3_next_shims,
-        )
-
-        for model_part in self.model_parts:
-            apply_qwen3_next_shims(model_part)
+        # Qwen3-Next GDN runs the MindSpeed-aligned pure-torch eager
+        # decomposition so the internal aten ops are captured as-is.
         # Bind Qwen3-Next fused attention / GLU virtual ops the same way.
         from torchtitan_npu.simulator.hardware_shims.qwen3_next_converter import (
             apply_qwen3_next_fusion_shims,

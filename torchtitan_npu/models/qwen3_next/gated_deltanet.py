@@ -9,11 +9,10 @@ Fork reason: Upstream torchtitan has no Qwen3-Next support. Gated DeltaNet is
 the O(n) token mixer used by 3 out of every 4 Qwen3-Next layers.
 
 The core ``chunk_gated_delta_rule`` is a pure-torch chunked implementation
-ported from the MindSpeed-LLM reference (itself aligned with the FLA
-library's fallback path). It runs on meta tensors, so the simulator can
-either execute it directly or replace it with the shape-only shim in
-``torchtitan_npu/simulator/hardware_shims/gdn_shim.py`` which records the
-production op name (``fla.ops.gated_delta_rule.chunk_gated_delta_rule``).
+ported line-by-line from the MindSpeed-LLM eager fallback (itself aligned
+with the FLA library's fallback path). It runs open on meta tensors so the
+simulator captures the full internal aten op stream, matching reference
+eager measurements.
 
 Reference: MindSpeed-LLM
 mindspeed_llm/fsdp2/models/qwen3_next/modeling_qwen3_next.py
@@ -297,8 +296,9 @@ class GatedDeltaNet(nn.Module):
     ) -> torch.Tensor:
         """Core gated delta rule computation.
 
-        Replaced by the shape-only simulator shim in simulation mode; runs
-        the pure-torch chunked implementation elsewhere.
+        Runs the MindSpeed-aligned pure-torch chunked implementation so the
+        internal aten ops (including the per-chunk loop) are captured as-is,
+        matching the eager torch fallback used in reference measurements.
         """
         return torch_chunk_gated_delta_rule(
             query,
