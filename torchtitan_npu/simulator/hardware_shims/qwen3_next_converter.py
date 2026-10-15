@@ -20,13 +20,23 @@ import torch
 import torch.nn.functional as F
 from torch.distributed.tensor import DTensor
 
-from torchtitan_npu.models.qwen3_next.attention import GatedAttention
+from torchtitan_npu.models.qwen3_next.attention import GatedAttention, RMSNormGated
 from torchtitan_npu.models.qwen3_next.feed_forward import Qwen3NextGroupedExperts
 from torchtitan_npu.simulator.capture.dispatch_capture import get_active_capture
+from torchtitan_npu.simulator.hardware_shims.rms_norm_shim import run_meta_rms_norm
 from torchtitan_npu.simulator.synthetic_ac import run_synthetic_op
 
 _FA_SHIM_MARKER = "_simulator_qwen_fa_shim_installed"
 _EXPERTS_SHIM_MARKER = "_simulator_qwen_experts_shim_installed"
+_GATED_NORM_SHIM_MARKER = "_simulator_qwen_gated_norm_shim_installed"
+
+
+def _sim_qwen_rms_norm_gated(
+    module: RMSNormGated, x: torch.Tensor, gate: torch.Tensor
+) -> torch.Tensor:
+    """MindSpeed ``Qwen3NextRMSNormGated``: fused npu_rms_norm core."""
+    normed = run_meta_rms_norm(x, module.weight, module.eps)
+    return normed * F.silu(gate.to(x.dtype))
 
 
 def _suspend():
@@ -314,6 +324,10 @@ def apply_qwen3_next_fusion_shims(model) -> None:
             if not getattr(module, _FA_SHIM_MARKER, False):
                 module._attention_core = MethodType(sim_gated_attention, module)
                 setattr(module, _FA_SHIM_MARKER, True)
+        elif isinstance(module, RMSNormGated):
+            if not getattr(module, _GATED_NORM_SHIM_MARKER, False):
+                module.forward = MethodType(_sim_qwen_rms_norm_gated, module)
+                setattr(module, _GATED_NORM_SHIM_MARKER, True)
         elif isinstance(module, Qwen3NextGroupedExperts):
             if not getattr(module, _EXPERTS_SHIM_MARKER, False):
                 module.forward = MethodType(_sim_qwen_grouped_experts, module)
