@@ -29,14 +29,42 @@ from torchtitan_npu.simulator.synthetic_ac import run_synthetic_op
 _FA_SHIM_MARKER = "_simulator_qwen_fa_shim_installed"
 _EXPERTS_SHIM_MARKER = "_simulator_qwen_experts_shim_installed"
 _GATED_NORM_SHIM_MARKER = "_simulator_qwen_gated_norm_shim_installed"
+_NORM_SHIM_MARKER = "_simulator_qwen_norm_shim_installed"
+
+
+def _local_param(param):
+    return param.to_local() if isinstance(param, DTensor) else param
+
+
+def _sim_qwen_rms_norm(module, x: torch.Tensor) -> torch.Tensor:
+    """MindSpeed ``Qwen3NextRMSNorm`` fused sequence.
+
+    ``npu_rms_norm(x.float(), 1.0 + weight.float(), eps)[0].type_as(x)``
+    (``use_fused_rmsnorm=True``): the float casts, the ``1.0 + weight``
+    offset add, and the output cast are real eager ops in the measured
+    stream, so they are emitted here instead of hiding inside the fused
+    boundary.
+    """
+    weight = _local_param(module.weight)
+    resolved_eps = (
+        module.eps if module.eps is not None else torch.finfo(x.dtype).eps
+    )
+    out = run_meta_rms_norm(x.float(), 1.0 + weight.float(), resolved_eps)
+    return out.type_as(x)
 
 
 def _sim_qwen_rms_norm_gated(
     module: RMSNormGated, x: torch.Tensor, gate: torch.Tensor
 ) -> torch.Tensor:
-    """MindSpeed ``Qwen3NextRMSNormGated``: fused npu_rms_norm core."""
-    normed = run_meta_rms_norm(x, module.weight, module.eps)
-    return normed * F.silu(gate.to(x.dtype))
+    """MindSpeed ``Qwen3NextRMSNormGated`` fused sequence.
+
+    ``npu_rms_norm(x.float(), weight.float(), eps)[0] * silu(gate.float())``
+    then ``.to(input_dtype)`` — weight has no ``1.0 +`` offset in the gated
+    variant.
+    """
+    weight = _local_param(module.weight)
+    normed = run_meta_rms_norm(x.float(), weight.float(), module.eps)
+    return (normed * F.silu(gate.float())).to(x.dtype)
 
 
 def _suspend():
@@ -318,7 +346,23 @@ def apply_qwen3_next_fusion_shims(model) -> None:
     # ops for the whole capture).
     _ff._token_permute = _virtual_token_permute
     _ff._token_unpermute = _virtual_token_unpermute
+    _apply_qwen3_next_module_shims(model)
 
+
+def _apply_qwen3_next_module_shims(model) -> None:
+    """Bind Qwen3-Next fused virtual ops onto an already-built model.
+
+    The plain-norm rebinding (MindSpeed ``Qwen3NextRMSNorm`` sequence) must
+    not leak into other models sharing the ``NPURMSNorm`` converter class,
+    so it is gated on detecting a Qwen3-Next-specific module.
+    """
+    from types import MethodType
+
+    from torchtitan_npu.converters.kernels.rms_norm import NPURMSNorm
+
+    is_qwen3_next = any(
+        isinstance(m, (GatedAttention, RMSNormGated)) for m in model.modules()
+    )
     for module in model.modules():
         if isinstance(module, GatedAttention):
             if not getattr(module, _FA_SHIM_MARKER, False):
@@ -328,6 +372,10 @@ def apply_qwen3_next_fusion_shims(model) -> None:
             if not getattr(module, _GATED_NORM_SHIM_MARKER, False):
                 module.forward = MethodType(_sim_qwen_rms_norm_gated, module)
                 setattr(module, _GATED_NORM_SHIM_MARKER, True)
+        elif is_qwen3_next and isinstance(module, NPURMSNorm):
+            if not getattr(module, _NORM_SHIM_MARKER, False):
+                module.forward = MethodType(_sim_qwen_rms_norm, module)
+                setattr(module, _NORM_SHIM_MARKER, True)
         elif isinstance(module, Qwen3NextGroupedExperts):
             if not getattr(module, _EXPERTS_SHIM_MARKER, False):
                 module.forward = MethodType(_sim_qwen_grouped_experts, module)

@@ -83,6 +83,8 @@ def qwen3_next_smoketest() -> NpuTrainerConfig:
             seq_len=512,
             max_norm=1.0,
             steps=2,
+            # MindSpeed fsdp2 example uses reduce_dtype bf16
+            mixed_precision_reduce="bfloat16",
         ),
         optimizer=OptimizerConfig(
             name="AdamW",
@@ -96,7 +98,10 @@ def qwen3_next_smoketest() -> NpuTrainerConfig:
             min_lr_factor=0.1,
         ),
         parallelism=_parallelism(expert_parallel_degree=1),
-        activation_checkpoint=ActivationCheckpointConfig(mode="selective"),
+        # MindSpeed example uses full recompute (recompute_modules on all
+        # layers); keep the debug preset on the same mode so its captured
+        # recompute stream matches the measured one.
+        activation_checkpoint=ActivationCheckpointConfig(mode="full"),
         print_config=True,
     )
 
@@ -114,6 +119,8 @@ def qwen3_next_80b_a3b() -> NpuTrainerConfig:
             seq_len=4096,
             max_norm=1.0,
             steps=2000,
+            # MindSpeed fsdp2 example uses reduce_dtype bf16
+            mixed_precision_reduce="bfloat16",
         ),
         optimizer=OptimizerConfig(
             name="AdamW",
