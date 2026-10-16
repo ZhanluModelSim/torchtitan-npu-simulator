@@ -27,6 +27,7 @@ from torchtitan.models.common.linear import Linear
 from torchtitan.protocols.module import Module
 
 from .attention import RMSNormGated
+from .layout_ops import record_split_v
 
 
 def l2norm(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
@@ -233,6 +234,8 @@ class GatedDeltaNet(nn.Module):
             dim=3,
         )
         b, a = torch.split(mixed_ba, [ratio, ratio], dim=3)
+        record_split_v([mixed_qkvz], [query, key, value, z])
+        record_split_v([mixed_ba], [b, a])
 
         value = value.reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim)
         z = z.reshape(batch_size, seq_len, self.num_v_heads, self.head_v_dim)

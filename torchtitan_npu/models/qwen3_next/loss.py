@@ -21,6 +21,8 @@ the static sequence length.
 import torch
 import torch.nn.functional as F
 
+from .layout_ops import record_split_v
+
 CHUNK_LOSS_SIZE = 1024
 
 _active = False
@@ -40,6 +42,9 @@ class _SimChunkLoss(torch.autograd.Function):
         hidden_chunks = torch.split(hidden, CHUNK_LOSS_SIZE, dim=1)
         label_chunks = torch.split(labels, CHUNK_LOSS_SIZE, dim=1)
         grad_input_chunks = torch.split(grad_inputs, CHUNK_LOSS_SIZE, dim=1)
+        record_split_v([hidden], list(hidden_chunks))
+        record_split_v([labels], list(label_chunks))
+        record_split_v([grad_inputs], list(grad_input_chunks))
         with torch.enable_grad():
             for hidden_chunk, label_chunk, grad_input_chunk in zip(
                 hidden_chunks, label_chunks, grad_input_chunks

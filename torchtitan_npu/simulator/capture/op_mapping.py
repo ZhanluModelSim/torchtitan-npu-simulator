@@ -52,6 +52,9 @@ OP_MAPPING: dict[str, str] = {
     "npu.npu_moe_token_unpermute.default": "moe_token_unpermute",
     "npu.npu_moe_token_unpermute_grad.default": "moe_token_unpermute",
     "npu.npu_moe_re_routing.default": "moe_re_routing",
+    # NPU aclnn kernels that view-class dispatcher ops materialize into on
+    # device (split/chunk launch aclnnSplitV; see models/qwen3_next/layout_ops.py)
+    "npu.aclnn_split_v.default": "split_v",
     # gather / scatter / indexing family (MoE token dispatch et al.)
     "aten.index.Tensor": "index",
     "aten.index_select.default": "index_select",

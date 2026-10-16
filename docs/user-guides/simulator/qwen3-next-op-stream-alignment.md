@@ -369,3 +369,47 @@ aclnn 层对 view 类算子的物化内核（GDN qkvz/ba `torch.split`→splitV�
    preset），猴补丁/模块级重绑会静默切换另一条路径的表示。
 6. **验证范围随管理员反馈扩大**：早期只对前向+comm 计数，后期反向 mul、搬运语义
    都要进清单——每轮反馈后把新口径补进本文档。
+
+## 布局算子节点缺失（管理方第五轮反馈：图捕获层甄别）
+
+管理方指出"图捕获层没生成这些布局算子的节点"——**甄别结论：说法正确**。机制：
+
+1. 捕获层（`OpDispatchCapture.__torch_dispatch__`）其实**记录了**所有 view 类 op，
+   并标注 `metadata_view=True`（dispatch_capture.py:835）；
+2. 但 `fold_metadata_views`（trainer.py:373）在导出前把它们折叠掉——设计注释称
+   "not launched device kernels"，该假设对 CPU/meta 成立，**对 NPU 不成立**：
+   split/chunk 在 NPU 上物化为 aclnnSplitV 内核，转置后 contiguous 物化为
+   TransData/TensorMove；
+3. 因此我方 CSV 中 split/transpose/chunk/view 全为 0，实测侧却有——层级假设错误，
+   不是 MoETokenPermute 融合算子归因（那只在旧流/ep=1 成立）。
+
+### 修复：源点合成记录（新提交）
+
+新增 `models/qwen3_next/layout_ops.py` 的 `record_split_v`：在真实 view op 之后
+用 `run_synthetic_op` 记录 `npu.aclnn_split_v.default`（canonical `split_v`，
+成本模型按 `_data_move` 计费），输入/输出用真实张量 → 依赖边与 liveness 一致。
+
+| 源点 | 记录 | 2 层口径频次 |
+|---|---|---|
+| GDN `torch.split(qkvz/ba)`（gated_deltanet.py） | split_v ×2 | [16,768]→4 段 + [16,4]→2 段 |
+| gated attention `chunk(q_and_gate,2)`（attention.py） | split_v ×1 | [16,512]→2×[16,256] |
+| swiglu `chunk(2)`（feed_forward.py，EP eager 路径） | split_v ×1/层 | [81920,1024]→2×[81920,512] |
+| chunked loss 3 个 `torch.split`（loss.py） | split_v ×3 | [1,16384,·]→16 chunks |
+
+2 层口径合计 **split_v ×8**；smoketest ×10。comm/gmm/elementwise 计数不变。
+
+### transdata/tensormove/transpose 的映射说明
+
+这些内核对应的物化点在我方流中**已存在**，只是以 aten 级名字记录
+（clone/contiguous 不在折叠名单里）：
+
+- GDN split 输出的非连续 reshape 物化 → `aten.clone` ×9（token_mixer 桶，
+  如 [1,16384,16,256]/[1,16384,16,2]）
+- attention 出口 `transpose(1,2).reshape().contiguous()` 物化 → aten.clone
+- NPU 侧这些显示为 TransData/TensorMove/Transpose 内核——按 shape 对表即可。
+
+### 未覆盖（如管理方实测有更多再补）
+
+- 非 EP 路径 swiglu 走融合 `npu_swiglu`（无 chunk）→ 无 split_v；
+- FSDP 运行时参数搬运（mindspeed fsdp2 unshard/unpad）：AG 输入通常已连续
+  （contiguous 为空操作），暂无内核；如实测 profiler 在 AG 前有 TensorMove 再加。
