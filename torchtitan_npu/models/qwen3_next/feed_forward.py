@@ -351,11 +351,16 @@ def _eager_grouped_matmul_meta(
         dtype=torch.int64, device=inputs.device,
     )
     torch.cumsum(m_split, dim=0)
+    # Chunk + squeeze views (NOT ``weights[i]`` select): the autograd view
+    # chain accumulates the per-expert weight grads into a single cat
+    # during backward, while select would materialize a full-tensor
+    # select_backward + add per expert (elementwise inflation).
+    weight_chunks = [c.squeeze(0) for c in weights.chunk(num_local_experts, dim=0)]
     for i in range(len(group_list) - 1):
         start_idx = group_list[i]
         end_idx = group_list[i + 1]
         final_hidden_states[start_idx:end_idx, :] = torch.matmul(
-            inputs[start_idx:end_idx, :], weights[i]
+            inputs[start_idx:end_idx, :], weight_chunks[i]
         )
     return final_hidden_states
 
