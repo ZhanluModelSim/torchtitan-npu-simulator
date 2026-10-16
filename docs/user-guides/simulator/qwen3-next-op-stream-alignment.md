@@ -259,3 +259,113 @@ aclnn 层对 view 类算子的物化内核（GDN qkvz/ba `torch.split`→splitV�
 `chunk(2)`→splitV、`transpose.contiguous()`→transpose+tensormove、非连续布局
 →transdata），我方 meta 采集只记录产生计算的 aten 算子（view 类零记录），
 结构上无法自动出现；如需对齐须按实测计数在对应源点加合成记录。
+
+# 适配全程回顾（初始实现 → 最终修改）
+
+按时间线记录 qwen3_next 适配中遇到的每个问题、所做修改、解决了什么、以及为什么
+一开始有问题/没发现——供下一次模型适配对照。
+
+## 时间线与提交链
+
+| 阶段 | 提交 | 内容 |
+|---|---|---|
+| 初始实现 | `5517f8c` | 模型包（GDN 线性注意力 + gated GQA MoE）+ simulator 六处接线 |
+| | `4f1dee9` | 融合 attention/GLU 虚拟算子绑定 |
+| | `fa1ed3d` | MoE 算子流镜像 Qwen3NextMoeExperts（融合 permute 时代） |
+| | `1f4cb6c` | RMSNormGated → npu_rms_norm 融合核 |
+| GDN 口径 | `d8b9536`→`6552d68` | eager torch 分解 → triton kernel 序列（12 种 kernel 逐个记录） |
+| FSDP 对齐 | `5be2808`/`b198a6d` | fsdp_modules 三组计划 + 专家 eFSDP；融合 norm 精确序列 |
+| 实测口径 | `eefd16a` | eager EP dispatcher 镜像 + 实测 fsdp2 config（**遗留非 EP 分支猴补丁**） |
+| 检查 #4 loss | `4bc1460` | chunked loss（ChunkLoss，chunk=1024，前向求梯度） |
+| 检查 #5 add/mul | `62ccfa3` | MoE 权重梯度累加修复（select → chunk+squeeze 视图） |
+| 检查 #1 AG | `3647bfb` | reshard 语义 + LMHead 双调用 + 2 层实测口径 preset |
+| 检查 #5 补充 | `1ab6906` | eager 循环 gmm → 融合 npu_grouped_matmul |
+| 检查 #2 补充 | `e9f7e40` | 无 dense 层（mlp_only_layers=[]） |
+| 检查 #5 再补充 | `cff5694` | router 反向链接回真实 softmax/topk 图（8 次 gate mul） |
+| 检查 #2 搬运 | `ace2013` | 移除非 EP 分支融合 permute 猴补丁 |
+
+## 问题清单：现象 → 修改 → 根因（为什么一开始有问题/没发现）
+
+### 1. 初始表示以融合算子为中心
+- **现象**：早期流把 permute/unpermute/swiglu/attention 各表示为 1 个融合 op。
+- **修改**：逐步按实测改为逐算子 eager（permute/unpermute/swiglu），attention 保留融合。
+- **为什么一开始有问题**：初始研读的是 mindspeed.ops 库（有融合核），误把"库有此核"
+  等同于"实测走此核"。实测配置（ep_dispatcher=eager、无相关开关）才是唯一判据。
+
+### 2. GDN 三种口径试错
+- **现象**：整核 1 合成算子（elementwise 少 6 倍）→ eager torch fallback 全展开
+  （elementwise 虚高）→ 逐 triton kernel 记录才对齐。
+- **修改**：`gdn_shim.py` 按生产调用序记录 12 种 triton kernel（前向 8 + 反向 9 + eager 小算子）。
+- **为什么没一开始就做对**：没先确认参考的**符号绑定**（`use_triton_gdn` 决定
+  `self.chunk_gated_delta_rule` 指向 triton 实现还是 torch fallback）。
+
+### 3. reshard_after_forward 根单元语义（检查 #1，缺 7 个 AG）
+- **现象**：我方全流 AG 9 个，实测 16 个（2 层口径）。
+- **修改**：fsdp_modules 三组（layers/embed/lm_head）共享 `reshard_after_forward=True`
+  → 每单元反向各 1 次 pre-bwd AG；eFSDP(experts) 不传参 → torch 默认 True；根 wrap
+  不传 → torch 默认 None → **根单元 False**（final norm 被根兜底）。AG 清单 =
+  root1+embed2+layers4+experts6+head3=16。
+- **为什么没发现**：假设了统一的 reshard 策略；没读 mindspeed `fully_shard_parallel.py`
+  根 wrap 的实参——"不传参→None→False"是 torch 语义细节，代码里一行都没写。
+
+### 4. LMHead 双调用死分支（同检查 #1）
+- **现象**：lm_head 只有 2 次 AG，实测 3 次。
+- **修改**：镜像实测 `qwen3_next.py:90`——无条件先 `self.lm_head(h)` 算全量 logits
+  （loss_ctx 存在时被覆盖=死分支，但 mm/AG 进流），再带 loss_ctx 调一次；模型返回
+  预计算 loss，trainer 侧 loss_fn 透传。
+- **为什么没发现**：我们实现了"干净"的单调用版本；死分支只有读实测 forward 才看得到。
+
+### 5. MoE 权重梯度累加（检查 #5）
+- **现象**：eager gmm 反向按 `weights[i]` select 逐专家产生独立梯度 → add/mul 数千个。
+- **修改**：chunk+squeeze 视图链，autograd 坍缩为单 cat（实测同构）。
+- **为什么一开始有问题**：视图语义下 select 与 chunk+squeeze 数值等价（meta 无值），
+  但**梯度累积行为完全不同**——meta 仿真不能只对前向数值等价，要对反向图等价。
+
+### 6. 分组 GEMM 融合 vs eager 循环（检查 #5 补充）
+- **现象**：逐专家 python 循环产生全张量 add/select_backward/slice_backward。
+- **修改**：`_SimGroupedMatmul`（npu_grouped_matmul：前向 1 op，反向 2 op）。
+- **为什么没发现**：`ep_dispatcher: eager` 字面误导——它只指 dispatcher（permute/a2a/
+  unpermute），不指 GMM 实现；实测 GMM 是融合核。
+
+### 7. 无 dense 层假设（检查 #2 补充）
+- **现象**：48 层口径 layer0 无 experts 算子，与管理方反馈矛盾。
+- **修改**：`mlp_only_layers=[]`（HF/实测默认，decoder_sparse_step=1 → 全部层 MoE）。
+- **为什么一开始有问题**：`mlp_only_layers=[0]` 是**未核实的假设**——没查 config
+  默认值，也没问管理方。
+
+### 8. router 反向链被切断（检查 #5 再补充，8 次 gate mul）
+- **现象**：实测反向 gate 路径 4 mul/层 ×2 层=8，我方 0。
+- **修改**：debug 负载均衡只强制 selected_experts 的**值**（indices）；routing_weights
+  走真实 softmax→topk→div→cast 图（topk values 保图连通，无需 gather）。
+- **为什么一开始有问题**：debug 分支用 `torch.full` 常量构造权重——**值强制顺带切断
+  了梯度路径**，整个 router 反向链（d(probs) mul、div/softmax 反向）从未入流。此前
+  检查都聚焦前向计数与 comm，没人对反向 mul 计数。
+
+### 9. 非 EP 分支融合 permute 猴补丁（检查 #2 搬运）
+- **现象**：管理方称"仿真被 MoETokenPermute 融合算子代表，实测是 eager index"。
+- **核实**：2 层 preset（ep=2）一直是纯 eager（归因对该流不成立）；**但 smoketest
+  （ep=1，非 EP 分支）确实有此问题**——`apply_qwen3_next_fusion_shims` 把
+  `_token_permute/_token_unpermute` 猴补丁成融合虚拟算子。
+- **修改**：移除猴补丁，非 EP 分支走 eager helpers。
+- **为什么没发现**：`eefd16a` 的修复与验证都基于 2 层 preset（EP 分支，本就 eager）；
+  猴补丁只影响非 EP 分支；管理员检查 #1–#5 全在 2 层配置上验证，smoketest 流从未
+  与实测对照。**修复覆盖一条路径、另一条遗留旧表示，属验证范围缺口。**
+
+### 10. 遗留未解（需管理方输入）
+- transdata/tensormove/transpose/splitV：NPU 对 view 类算子的 aclnn 物化内核，meta
+  采集只记录产生计算的 aten 算子（view 类零记录），结构上无法自动出现；对齐需管理方
+  提供实测计数后在源点加合成记录。
+- 实测 profiler 中的优化器算子（aclnnMul 等）多数被融合优化器覆盖——对表前先请管理方
+  区分反向/前向与优化器来源，避免追错方向。
+
+## 元经验（为什么问题总是这几类）
+
+1. **"库有此核"≠"实测走此核"**：融合/eager 边界逐算子以实测配置判定。
+2. **参考代码的怪癖必须镜像**（死分支双调用、硬编码 reduce fp32）：别实现"更干净"的版本。
+3. **未核实的假设是最大错误源**（mlp_only_layers、GDN 绑定、根单元 reshard）：
+   每个 config 默认值、每个实参缺省都要查源码或问管理方。
+4. **值强制不能切断梯度**：meta 仿真要前向数值与反向图**双重等价**。
+5. **多路径模型每条路径都要验证**：修一处跑全部 config 档位（smoketest + 实测口径
+   preset），猴补丁/模块级重绑会静默切换另一条路径的表示。
+6. **验证范围随管理员反馈扩大**：早期只对前向+comm 计数，后期反向 mul、搬运语义
+   都要进清单——每轮反馈后把新口径补进本文档。
