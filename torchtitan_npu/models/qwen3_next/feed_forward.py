@@ -27,6 +27,7 @@ the MindSpeed production op stream.
 from dataclasses import dataclass
 
 import torch
+import torch.distributed
 import torch.nn.functional as F
 from torch import nn
 from torch.distributed.tensor import DTensor, Partial
@@ -66,6 +67,297 @@ def _token_unpermute(
     )
     output.index_add_(0, token_ids, routed_output)
     return output
+
+
+def _record_all_to_all(tensor: torch.Tensor, output: torch.Tensor, group) -> None:
+    from torchtitan_npu.simulator import meta_env
+    from torchtitan_npu.simulator.capture.comm_events import (
+        _record_comm_with_l0,
+        get_active_recorder,
+    )
+
+    recorder = get_active_recorder()
+    if recorder is None:
+        return
+    meta_env._comm_layer = "L1"
+    _record_comm_with_l0(recorder, "all_to_all", group, tensor, output)
+
+
+def _record_allgather(tensor: torch.Tensor, output: torch.Tensor, group) -> None:
+    from torchtitan_npu.simulator import meta_env
+    from torchtitan_npu.simulator.capture.comm_events import (
+        _record_comm_with_l0,
+        get_active_recorder,
+    )
+
+    recorder = get_active_recorder()
+    if recorder is None:
+        return
+    meta_env._comm_layer = "L1"
+    _record_comm_with_l0(recorder, "allgather", group, tensor, output)
+
+
+def _synthetic_comm(op_name: str, tensor: torch.Tensor, output: torch.Tensor, group):
+    from torchtitan_npu.simulator.capture.dispatch_capture import get_active_capture
+    from torchtitan_npu.simulator.synthetic_ac import run_synthetic_op
+
+    capture = get_active_capture()
+    module_path = (
+        capture.module_path_tracker.current_path()
+        if capture is not None and capture.module_path_tracker is not None
+        else ""
+    )
+
+    def produce_output():
+        if op_name == "allgather":
+            _record_allgather(tensor, output, group)
+        else:
+            _record_all_to_all(tensor, output, group)
+        return output
+
+    return run_synthetic_op(
+        f"comm.{op_name}",
+        inputs=[tensor],
+        output_factory=produce_output,
+        module_path=module_path,
+        record_op=False,
+    )
+
+
+def _sim_all_gather_counts(tensor: torch.Tensor, group) -> torch.Tensor:
+    """``gather_along_first_dim_expert_parallel`` ([E] -> [EP*E] counts)."""
+    ep_size = torch.distributed.get_world_size(group=group)
+    if ep_size == 1:
+        return tensor
+    output = torch.empty(
+        [tensor.shape[0] * ep_size], dtype=tensor.dtype, device=tensor.device
+    )
+    return _synthetic_comm("allgather", tensor, output, group)
+
+
+def _synthetic_all_to_all(tensor: torch.Tensor, group, out_rows: int) -> torch.Tensor:
+    output = torch.empty(
+        [out_rows] + list(tensor.shape[1:]), dtype=tensor.dtype, device=tensor.device
+    )
+    return _synthetic_comm("all_to_all", tensor, output, group)
+
+
+class _SimAllToAllV(torch.autograd.Function):
+    """Simulated a2a-v with an autograd-linked reverse exchange.
+
+    The forward records the dispatch/combine ``comm.all_to_all``; the
+    backward records the reverse exchange so the measured stream's
+    backward a2as appear and gradients flow to the experts.
+    """
+
+    @staticmethod
+    def forward(ctx, tensor: torch.Tensor, group, out_rows: int):
+        ctx.group = group
+        ctx.in_rows = tensor.shape[0]
+        ctx.out_rows = out_rows
+        return _synthetic_all_to_all(tensor, group, out_rows)
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        grad_input = _synthetic_all_to_all(grad_output, ctx.group, ctx.in_rows)
+        return grad_input, None, None
+
+
+def _sim_all_to_all_v(tensor: torch.Tensor, group, out_rows: int) -> torch.Tensor:
+    """MindSpeed ``dist_ops.all_to_all``: a2a-v with unequal splits.
+
+    The simulated exchange records one ``comm.all_to_all`` per direction
+    (the autograd backward records the reverse); the output row count is
+    the analytically derived received-row total.
+    """
+    if torch.distributed.get_world_size(group=group) == 1:
+        return tensor
+    return _SimAllToAllV.apply(tensor, group, out_rows)
+
+
+def _sim_d2h_copy(tensor: torch.Tensor, real_values: list[int]) -> torch.Tensor:
+    """The dispatcher's ``.to("cpu", non_blocking=True)`` split transfer.
+
+    Real execution copies to CPU; under meta capture the copy is recorded
+    (aten._to_copy.default, matching the measured D2H stream) and the
+    python-side ``real_values`` stand in for the unusable meta values.
+    """
+    if tensor.device.type != "meta":
+        return tensor.to(torch.device("cpu"), non_blocking=True)
+    from torchtitan_npu.simulator.capture.dispatch_capture import get_active_capture
+    from torchtitan_npu.simulator.synthetic_ac import run_synthetic_op
+
+    capture = get_active_capture()
+    module_path = (
+        capture.module_path_tracker.current_path()
+        if capture is not None and capture.module_path_tracker is not None
+        else ""
+    )
+    out = torch.tensor(real_values, dtype=tensor.dtype, device="cpu")
+    return run_synthetic_op(
+        "aten._to_copy.default",
+        inputs=[tensor],
+        output_factory=lambda: out,
+        module_path=module_path,
+    )
+
+
+def _eager_permute(
+    tokens: torch.Tensor, indices: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """MindSpeed fsdp2 eager permute: stable argsort + row gather."""
+    topk = 1 if indices.dim() == 1 else indices.size(1)
+    sorted_indices = torch.argsort(indices.float().view(-1), stable=True).to(
+        indices.dtype
+    )
+    permuted_tokens = tokens.index_select(0, sorted_indices // topk)
+    return permuted_tokens, sorted_indices
+
+
+def _eager_unpermute(
+    permuted_tokens: torch.Tensor,
+    sorted_indices: torch.Tensor,
+    probs: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """MindSpeed fsdp2 eager unpermute: zeros + index_copy_ scatter back."""
+    num_tokens, topk = (
+        (permuted_tokens.size(0), 1)
+        if probs is None
+        else (probs.numel(), probs.size(1))
+    )
+    unpermuted_tokens = torch.zeros(
+        [num_tokens, permuted_tokens.shape[-1]],
+        dtype=permuted_tokens.dtype,
+        device=permuted_tokens.device,
+    )
+    unpermuted_tokens.index_copy_(0, sorted_indices.long(), permuted_tokens)
+    unpermuted_tokens = unpermuted_tokens.reshape(-1, topk, permuted_tokens.size(-1))
+    if probs is not None:
+        unpermuted_tokens *= probs.unsqueeze(-1)
+    return unpermuted_tokens.sum(dim=1)
+
+
+def _experts_ep_forward(
+    self, hidden_states: torch.Tensor, top_k_index: torch.Tensor, top_k_weights: torch.Tensor
+) -> torch.Tensor:
+    """MindSpeed eager-dispatcher experts forward (``ep > 1``).
+
+    Mirrors ``mindspeed_llm/fsdp2/distributed/expert_parallel/dispatcher.py``
+    (``dispatch_mlp_combine``) op for op: count preprocess with an
+    all-gather over the EP group, a2a-v token dispatch, per-expert matmul
+    loop, and the combine a2a with the final probs-weighted unpermute.
+
+    Under the simulator's meta capture the routing counts carry no values,
+    but ``debug.moe_force_load_balance`` makes the routing uniform, so the
+    split sizes and grouped-matmul loop bounds are derived analytically
+    (N*K/E tokens per expert, N*K/ep rows exchanged per rank pair) while
+    the recorded op stream keeps the exact dispatcher call pattern.
+    """
+    hidden_states_shape = hidden_states.shape
+    hidden_states = hidden_states.view(-1, hidden_states_shape[-1])
+    gate_up_proj, down_proj = self._view_experts_weight()
+
+    ep_group = self.ep_group
+    ep_size = torch.distributed.get_world_size(ep_group)
+    ep_rank = torch.distributed.get_rank(ep_group)
+    num_global_experts = self.num_global_experts
+    num_local_experts = num_global_experts // ep_size
+    local_experts_start_id = num_local_experts * ep_rank
+    local_experts_end_id = local_experts_start_id + num_local_experts
+
+    num_rows = hidden_states.shape[0]
+    top_k = top_k_index.shape[-1]
+    tokens_per_expert_num = (num_rows * top_k) // num_global_experts
+    if tokens_per_expert_num * num_global_experts != num_rows * top_k:
+        raise ValueError(
+            "Uniform routing assumed by the simulated eager dispatcher is "
+            f"violated: {num_rows}*{top_k} rows over {num_global_experts} "
+            "experts is not divisible"
+        )
+    rows_per_rank = (num_rows * top_k) // ep_size
+
+    # dispatch_preprocess: [B*S*K] -> [E] counts, all-gathered to [EP*E]
+    num_local_tokens_per_expert = torch.bincount(
+        top_k_index.reshape(-1), minlength=num_global_experts
+    )
+    num_global_tokens_per_expert = _sim_all_gather_counts(
+        num_local_tokens_per_expert, ep_group
+    )
+    num_global_tokens_per_local_expert = num_global_tokens_per_expert.reshape(
+        ep_size, num_global_experts
+    )[:, local_experts_start_id:local_experts_end_id]
+    num_tokens_per_local_expert = num_global_tokens_per_local_expert.sum(axis=0)
+    input_split = _sim_d2h_copy(
+        num_local_tokens_per_expert.reshape(ep_size, num_local_experts).sum(axis=1),
+        [tokens_per_expert_num * num_local_experts] * ep_size,
+    )
+    output_splits = _sim_d2h_copy(
+        num_global_tokens_per_local_expert.sum(axis=-1),
+        [rows_per_rank] * ep_size,
+    )
+    global_indices = torch.repeat_interleave(
+        self.expert_ids_per_ep_rank,
+        num_global_tokens_per_local_expert.ravel(),
+        output_size=rows_per_rank,
+    )
+
+    # alltoall_dispatch: permute -> a2a -> permute
+    hidden_states, unpermute_indices1 = _eager_permute(hidden_states, top_k_index)
+    torch.accelerator.current_stream().synchronize()
+    hidden_states = _sim_all_to_all_v(hidden_states, ep_group, rows_per_rank)
+    hidden_states, unpermute_indices2 = _eager_permute(hidden_states, global_indices)
+
+    # eager experts computation: per-expert matmul loop, silu*up between
+    fc1_output = _eager_grouped_matmul_meta(
+        hidden_states, gate_up_proj, tokens_per_expert_num
+    )
+    gate, up = fc1_output.chunk(2, dim=-1)
+    act = F.silu(gate) * up
+    fc2_out = _eager_grouped_matmul_meta(
+        act, down_proj, tokens_per_expert_num
+    )
+
+    # alltoall_combine: unpermute -> a2a -> probs-weighted unpermute
+    hidden_states = _eager_unpermute(fc2_out, unpermute_indices2)
+    hidden_states = _sim_all_to_all_v(hidden_states, ep_group, num_rows * top_k)
+    hidden_states = _eager_unpermute(
+        hidden_states, unpermute_indices1, probs=top_k_weights
+    )
+    return hidden_states.view(*hidden_states_shape)
+
+
+def _eager_grouped_matmul_meta(
+    inputs: torch.Tensor, weights: torch.Tensor, tokens_per_expert: int
+) -> torch.Tensor:
+    """``_eager_grouped_matmul`` under meta capture.
+
+    Same op stream (zeros + cumsum + per-expert matmul with slice
+    assignment); the group boundaries come from the analytic uniform
+    token count because the meta counts tensor carries no values.
+    """
+    batch_size, input_dim = inputs.shape
+    if weights.shape[1] == input_dim:
+        output_dim = weights.shape[2]
+    else:
+        output_dim = weights.shape[1]
+        weights = weights.transpose(1, 2)
+    final_hidden_states = torch.zeros(
+        (batch_size, output_dim), dtype=inputs.dtype, device=inputs.device
+    )
+    num_local_experts = weights.shape[0]
+    group_list = [i * tokens_per_expert for i in range(num_local_experts + 1)]
+    m_split = torch.full(
+        (num_local_experts,), tokens_per_expert,
+        dtype=torch.int64, device=inputs.device,
+    )
+    torch.cumsum(m_split, dim=0)
+    for i in range(len(group_list) - 1):
+        start_idx = group_list[i]
+        end_idx = group_list[i + 1]
+        final_hidden_states[start_idx:end_idx, :] = torch.matmul(
+            inputs[start_idx:end_idx, :], weights[i]
+        )
+    return final_hidden_states
 
 
 class Qwen3NextGroupedExperts(nn.Module):
@@ -226,30 +518,36 @@ class Qwen3NextMoE(nn.Module):
                 )
         routing_weights = routing_weights.to(hidden_states.dtype)
 
-        # permute (npu_moe_token_permute semantics, probs pre-folded)
-        permuted_hidden_states, row_ids_map = _token_permute(
-            hidden_flat, selected_experts
-        )
-        tokens_per_expert = torch.histc(
-            selected_experts.reshape(-1).float(),
-            bins=self.num_experts,
-            min=0,
-            max=self.num_experts,
-        )
-        row_probs = routing_weights.reshape(-1).index_select(0, row_ids_map)
-        permuted_hidden_states = (
-            permuted_hidden_states * row_probs.to(permuted_hidden_states.dtype).unsqueeze(-1)
-        )
+        if getattr(self.experts, "_ep_dispatcher", False):
+            # MindSpeed eager dispatcher (ep > 1): the experts module owns
+            # permute/unpermute and the a2a exchange; probs are applied in
+            # its final unpermute, so the block hands over raw routing.
+            combined = self.experts(hidden_flat, selected_experts, routing_weights)
+        else:
+            # permute (npu_moe_token_permute semantics, probs pre-folded)
+            permuted_hidden_states, row_ids_map = _token_permute(
+                hidden_flat, selected_experts
+            )
+            tokens_per_expert = torch.histc(
+                selected_experts.reshape(-1).float(),
+                bins=self.num_experts,
+                min=0,
+                max=self.num_experts,
+            )
+            row_probs = routing_weights.reshape(-1).index_select(0, row_ids_map)
+            permuted_hidden_states = (
+                permuted_hidden_states * row_probs.to(permuted_hidden_states.dtype).unsqueeze(-1)
+            )
 
-        routed_output = self.experts(permuted_hidden_states, tokens_per_expert)
+            routed_output = self.experts(permuted_hidden_states, tokens_per_expert)
 
-        # unpermute (npu_moe_token_unpermute semantics)
-        combined = _token_unpermute(
-            routed_output,
-            row_ids_map,
-            num_tokens=hidden_flat.shape[0],
-            top_k=self.top_k,
-        )
+            # unpermute (npu_moe_token_unpermute semantics)
+            combined = _token_unpermute(
+                routed_output,
+                row_ids_map,
+                num_tokens=hidden_flat.shape[0],
+                top_k=self.top_k,
+            )
 
         shared_expert_output = self.shared_expert(hidden_states)
         shared_gate = torch.sigmoid(self.shared_expert_gate(hidden_states))

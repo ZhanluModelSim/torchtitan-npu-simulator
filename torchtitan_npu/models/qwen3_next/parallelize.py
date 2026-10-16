@@ -20,7 +20,7 @@ import logging
 import torch
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from torch.distributed.tensor import Shard
-from torch.distributed.tensor.parallel import parallelize_module
+from torch.distributed.tensor.parallel import parallelize_module  # noqa: F401
 from torchtitan.config import (
     TORCH_DTYPE_MAP,
     ActivationCheckpointConfig,
@@ -29,7 +29,6 @@ from torchtitan.config import (
     TrainingConfig,
 )
 from torchtitan.distributed import ParallelDims
-from torchtitan.distributed.expert_parallel import ExpertParallel
 from torchtitan.models.llama3.parallelize import apply_replicate
 from torchtitan.models.llama4.parallelize import disable_fsdp_gradient_division
 from torchtitan.protocols import ModelConvertersContainer
@@ -42,31 +41,57 @@ logger = logging.getLogger(__name__)
 
 
 def _apply_expert_parallel(model: Qwen3NextModel, ep_mesh) -> None:
-    """Shard routed experts across the expert-parallel mesh."""
+    """Mirror MindSpeed ``expert_parallelize_modules`` (eager dispatcher).
+
+    Routed-expert weights are split along dim 0 over the EP mesh
+    (``distribute_tensor`` Shard(0) semantics: contiguous rows = whole
+    experts per rank) and the experts forward is replaced with the eager
+    dispatcher stream (count all-gather + a2a-v dispatch/combine +
+    per-expert matmul loop).
+    """
+    from types import MethodType
+
+    from torchtitan_npu.models.qwen3_next.feed_forward import _experts_ep_forward
+
+    ep_group = ep_mesh.get_group()
+    ep_rank = torch.distributed.get_rank(ep_group)
+    ep_size = torch.distributed.get_world_size(ep_group)
     for layer in model.layers.values():
         if not layer.moe_enabled:
             continue
-        if layer.moe.num_experts % ep_mesh.size() != 0:
+        experts = layer.moe.experts
+        num_global = experts.num_experts
+        if num_global % ep_size != 0:
             raise ValueError(
-                f"num_experts={layer.moe.num_experts} must be divisible by "
-                f"EP degree={ep_mesh.size()}"
+                f"num_experts={num_global} must be divisible by "
+                f"EP degree={ep_size}"
             )
-        parallelize_module(
-            layer.moe.experts,
-            ep_mesh,
-            ExpertParallel(),
+        num_local = num_global // ep_size
+        experts.num_global_experts = num_global
+        experts.ep_group = ep_group
+        experts.expert_ids_per_ep_rank = torch.tensor(
+            [i % num_local for i in range(num_global)],
+            dtype=torch.int32,
+            device=experts.gate_up_proj.device,
         )
-    logger.info("Applied Qwen3-Next expert parallelism")
+        experts.gate_up_proj.data = experts.gate_up_proj.data.chunk(ep_size, dim=0)[
+            ep_rank
+        ]
+        experts.down_proj.data = experts.down_proj.data.chunk(ep_size, dim=0)[ep_rank]
+        experts.forward = MethodType(_experts_ep_forward, experts)
+        experts._ep_dispatcher = True
+    logger.info("Applied Qwen3-Next expert parallelism (eager dispatcher)")
 
 
 def _apply_expert_fsdp(model: Qwen3NextModel, edp_mesh, mp_policy) -> None:
     """Mirror MindSpeed ``expert_fully_shard_modules``.
 
     Each routed-experts module becomes its own FSDP unit over the
-    EP-internal data-parallel mesh, sharded on dim 1
-    (``efsdp_shard_placement_fn='shard_by_dim_1'`` default), so expert
-    weights all-gather when the experts module is entered (forward and
-    activation-checkpoint recompute), matching the measured stream.
+    EP-internal data-parallel mesh (``ep_fsdp_modules``), sharded on dim 1
+    (``efsdp_shard_placement_fn`` default Shard(1)). The measured run uses
+    ``ep_fsdp_size: 4`` with recompute disabled and shows one all-gather
+    per experts unit (forward only), so ``reshard_after_forward=False``
+    keeps the unsharded expert weights resident through backward.
     """
     for layer in model.layers.values():
         if not layer.moe_enabled:
@@ -75,7 +100,7 @@ def _apply_expert_fsdp(model: Qwen3NextModel, edp_mesh, mp_policy) -> None:
             layer.moe.experts,
             mesh=edp_mesh,
             mp_policy=mp_policy,
-            reshard_after_forward=True,
+            reshard_after_forward=False,
             shard_placement_fn=lambda p: Shard(1),
         )
     logger.info("Applied Qwen3-Next expert FSDP (eFSDP) over edp mesh")

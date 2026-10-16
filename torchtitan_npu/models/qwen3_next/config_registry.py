@@ -98,27 +98,26 @@ def qwen3_next_smoketest() -> NpuTrainerConfig:
             min_lr_factor=0.1,
         ),
         parallelism=_parallelism(expert_parallel_degree=1),
-        # MindSpeed example uses full recompute (recompute_modules on all
-        # layers); keep the debug preset on the same mode so its captured
-        # recompute stream matches the measured one.
-        activation_checkpoint=ActivationCheckpointConfig(mode="full"),
+        # Measured fsdp2 config runs with recompute: False
+        activation_checkpoint=ActivationCheckpointConfig(mode="none"),
         print_config=True,
     )
 
 
 def qwen3_next_80b_a3b() -> NpuTrainerConfig:
-    """Qwen3-Next-80B-A3B baseline: FSDP auto-sharding, EP=1 by default.
+    """Qwen3-Next-80B-A3B baseline mirroring the measured fsdp2 run
+    (pretrain_qwen3_next_16k_fsdp2_A3.yaml): FSDP=8, EP=2, eFSDP=4,
+    recompute disabled, reduce bf16.
 
-    Override via CLI for multi-rank simulation, e.g.
-    ``--parallelism.expert_parallel_degree 8``.
+    Override via CLI, e.g. ``--parallelism.expert_parallel_degree 8``.
     """
     return _trainer_config(
         flavor="80B-A3B",
         training=TrainingConfig(
             local_batch_size=1,
-            seq_len=4096,
+            seq_len=16384,
             max_norm=1.0,
-            steps=2000,
+            steps=1,
             # MindSpeed fsdp2 example uses reduce_dtype bf16
             mixed_precision_reduce="bfloat16",
         ),
@@ -133,7 +132,8 @@ def qwen3_next_80b_a3b() -> NpuTrainerConfig:
             decay_type="cosine",
             min_lr_factor=0.1,
         ),
-        parallelism=_parallelism(expert_parallel_degree=1),
-        activation_checkpoint=ActivationCheckpointConfig(mode="full"),
+        parallelism=_parallelism(expert_parallel_degree=2),
+        # Measured config runs with recompute: False
+        activation_checkpoint=ActivationCheckpointConfig(mode="none"),
         print_config=True,
     )

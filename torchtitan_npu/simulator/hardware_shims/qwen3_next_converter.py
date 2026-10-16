@@ -377,6 +377,11 @@ def _apply_qwen3_next_module_shims(model) -> None:
                 module.forward = MethodType(_sim_qwen_rms_norm, module)
                 setattr(module, _NORM_SHIM_MARKER, True)
         elif isinstance(module, Qwen3NextGroupedExperts):
+            if getattr(module, "_ep_dispatcher", False):
+                # The MindSpeed eager dispatcher owns this module's op
+                # stream (permute/a2a/per-expert matmul loop); the fused
+                # gmm virtual ops only apply to the ep=1 path.
+                continue
             if not getattr(module, _EXPERTS_SHIM_MARKER, False):
                 module.forward = MethodType(_sim_qwen_grouped_experts, module)
                 setattr(module, _EXPERTS_SHIM_MARKER, True)
