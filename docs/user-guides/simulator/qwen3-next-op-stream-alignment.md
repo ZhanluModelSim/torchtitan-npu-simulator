@@ -205,3 +205,14 @@ sim 实现：`_SimGroupedMatmul`——前向 1 个 `npu.npu_grouped_matmul.defau
 gmm=12（2 层×[前向2+反向4]）、add/mul 全流 168（此前 ~24.6k）、experts 桶每层仅
 残差 add + probs mul(×4) + silu/silu_bwd/mul [81920,512]，comm 数不变
 （AG16/A2A8/RS7/AR3）。
+
+## 无 dense 层修正（管理方确认）
+
+Qwen3-Next 全系**没有 dense 层**：transformers `Qwen3NextConfig` 默认
+`mlp_only_layers=[]`、`decoder_sparse_step=1`（实测树 modeling_qwen3_next.py:1075
+的判定：不在 mlp_only_layers 且 num_experts>0 且命中 sparse_step → MoE）。
+此前 flavor 里 `mlp_only_layers=[0]` 是未经核实的假设，已改为 `[]`。
+
+修正后计数（48 层、ep=2、seq16k）：AG=246（root1 + embed2 + layers 48×2 +
+experts 48×3 + head3）、A2A=192、RS=99、gmm=288、log_softmax=16；smoketest
+4 层全 MoE：AG26/A2A16/gmm24。

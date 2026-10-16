@@ -173,7 +173,7 @@ def _debugmodel() -> Qwen3NextModel.Config:
             n_layers=n_layers,
             dim=dim,
             layer_types=_hybrid_layer_types(n_layers),
-            mlp_only_layers=[0],
+            mlp_only_layers=[],
             dense_intermediate_size=512,
             gdn_kwargs=dict(
                 num_v_heads=8,
@@ -222,7 +222,7 @@ def _80b_a3b() -> Qwen3NextModel.Config:
             n_layers=n_layers,
             dim=dim,
             layer_types=_hybrid_layer_types(n_layers),
-            mlp_only_layers=[0],
+            mlp_only_layers=[],
             dense_intermediate_size=512,
             gdn_kwargs=dict(
                 num_v_heads=32,
