@@ -340,13 +340,11 @@ def _empty_like(tensor: torch.Tensor) -> torch.Tensor:
 
 def apply_qwen3_next_fusion_shims(model) -> None:
     """Bind fused virtual ops while preserving module hooks."""
-    from torchtitan_npu.models.qwen3_next import feed_forward as _ff
-
-    # Virtual fused permute/unpermute at the MoE boundary (module-level
-    # helpers resolve globals at call time, so rebinding swaps in the fused
-    # ops for the whole capture).
-    _ff._token_permute = _virtual_token_permute
-    _ff._token_unpermute = _virtual_token_unpermute
+    # NOTE: `_token_permute`/`_token_unpermute` in feed_forward.py are eager
+    # (argsort + index_select / zeros + index_add_), mirroring the measured
+    # MindSpeed run (ep_dispatcher=eager records index_copy_/index_select).
+    # Do NOT rebind them to virtual fused npu_moe_token_permute ops — that
+    # cut the eager op stream and hid the data-movement semantics.
     _apply_qwen3_next_module_shims(model)
 
 

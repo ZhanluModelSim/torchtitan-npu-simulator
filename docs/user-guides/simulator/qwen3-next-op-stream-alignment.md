@@ -233,3 +233,29 @@ indices 单独覆盖，因此**前向与实测逐算子一致，无需额外 gat
 修复后 gate 路径反向 Mul/InplaceMul = 3/层（`[16384,10,2048]`×2 + `[16384,10]`×1）
 + shared_expert_gate 反向 1/层 = **4/层 × 2 = 8 次**，与实测精确吻合。
 其余反向 mul（silu [81920,512]、down_proj、GDN norm 等）不变。
+
+## 非 EP 分支融合 permute 猴补丁移除（管理方第四轮反馈）
+
+管理方指出 FSDP 搬运缺 transdata/tensormove/transpose/splitV，归因于"仿真被
+MoETokenPermute 融合算子代表，实测是 eager index copy/select"。核实结果：
+
+- **2 层实测口径 preset（ep=2）一直是干净的 eager**（CSV 无任何融合 permute，
+  index_select/index_copy_ 与实测 `fsdp2/distributed/expert_parallel/utils.py`
+  的 eager_permute/eager_unpermute 逐算子一致），管理方归因对该流不成立。
+- **问题确实存在，但在 smoketest/debugmodel（ep=1，非 EP 分支）**：
+  `apply_qwen3_next_fusion_shims` 曾把 `_ff._token_permute/_token_unpermute`
+  重绑为虚拟融合算子（`npu.npu_moe_token_permute.default` ×4 等），导致 ep=1
+  流被单个融合 op 代表。已移除该猴补丁，非 EP 分支走本就存在的 eager 实现
+  （argsort+index_select / zeros+index_add_）。修复后 smoketest 无融合算子，
+  2 层 preset 计数不变。
+
+为什么此前全量检查未发现：eefd16a 轮的修复与验证都基于 2 层实测口径 preset
+（ep=2 → EP 分支，本就 eager）；猴补丁只影响非 EP 分支，且管理员检查 #1-#5
+均在 2 层配置上验证，smoketest 流从未与实测 eager 语义对照——修复覆盖了一条
+路径，另一条遗留旧表示，属验证范围缺口。
+
+遗留（需管理方提供实测计数）：transdata/tensormove/transpose/splitV 是 NPU
+aclnn 层对 view 类算子的物化内核（GDN qkvz/ba `torch.split`→splitV、attention
+`chunk(2)`→splitV、`transpose.contiguous()`→transpose+tensormove、非连续布局
+→transdata），我方 meta 采集只记录产生计算的 aten 算子（view 类零记录），
+结构上无法自动出现；如需对齐须按实测计数在对应源点加合成记录。
