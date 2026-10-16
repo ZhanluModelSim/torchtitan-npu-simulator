@@ -216,3 +216,20 @@ Qwen3-Next 全系**没有 dense 层**：transformers `Qwen3NextConfig` 默认
 修正后计数（48 层、ep=2、seq16k）：AG=246（root1 + embed2 + layers 48×2 +
 experts 48×3 + head3）、A2A=192、RS=99、gmm=288、log_softmax=16；smoketest
 4 层全 MoE：AG26/A2A16/gmm24。
+
+## router 反向链修复（`cff5694`，管理方第三轮反馈）
+
+管理方指出：shape 缺口（[16384,32]/[16384,8]/[16384,12288] 等）大部分属于优化器部分，已被融合算子覆盖，可忽略；真正差异是**反向 MoE gate/梯度逐元素乘，实测 aclnnMul/InplaceMul 共 8 次**（2 层 = 4/层）。
+
+根因：debug 负载均衡分支用 `torch.full` 常量构造 routing_weights，**梯度路径被切断**——整个 router 反向链缺失：
+- unpermute probs 加权（`u *= probs`）反向的 d(probs) mul：`[16384,10,2048]`
+- norm_topk_prob 除法反向 mul：`[16384,10]`
+- softmax 反向（`_softmax_backward_data`）
+
+修复：仅强制 selected_experts 的值（解析式均匀 split 仍成立）；routing_weights 走真实
+softmax → topk → div → cast 计算图。topk 的 values 保持图连通（meta 下值无关紧要），
+indices 单独覆盖，因此**前向与实测逐算子一致，无需额外 gather**。
+
+修复后 gate 路径反向 Mul/InplaceMul = 3/层（`[16384,10,2048]`×2 + `[16384,10]`×1）
++ shared_expert_gate 反向 1/层 = **4/层 × 2 = 8 次**，与实测精确吻合。
+其余反向 mul（silu [81920,512]、down_proj、GDN norm 等）不变。
