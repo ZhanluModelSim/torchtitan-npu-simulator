@@ -523,9 +523,17 @@ class Qwen3NextMoE(nn.Module):
             else self.gate.weight
         )
         router_logits = F.linear(hidden_flat, gate_weight)
-        routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+        routing_weights_f32 = F.softmax(router_logits, dim=1, dtype=torch.float)
 
         if self.debug_force_load_balance:
+            # Value-forcing for analytic a2a splits: only the selected
+            # indices are overridden; the weights flow through the real
+            # softmax -> topk -> div -> cast graph so the router backward
+            # chain (grad muls) is recorded exactly like the measured run
+            # (a constant weight tensor would cut the gradient path).
+            routing_weights, _ = torch.topk(
+                routing_weights_f32, k=self.top_k, dim=-1
+            )
             token_offsets = torch.arange(
                 hidden_flat.shape[0], device=hidden_flat.device, dtype=torch.int64
             ) * self.top_k
@@ -535,20 +543,17 @@ class Qwen3NextMoE(nn.Module):
             selected_experts = (
                 token_offsets.unsqueeze(1) + expert_offsets.unsqueeze(0)
             ) % self.num_experts
-            routing_weights = torch.full(
-                (hidden_flat.shape[0], self.top_k),
-                1.0 / self.top_k,
-                dtype=torch.float32,
-                device=hidden_flat.device,
-            )
         else:
-            routing_weights, selected_experts = torch.topk(
-                routing_weights, k=self.top_k, dim=-1
+            routing_weights_f32 = F.softmax(
+                router_logits, dim=1, dtype=torch.float
             )
-            if self.norm_topk_prob:
-                routing_weights = routing_weights / routing_weights.sum(
-                    dim=-1, keepdim=True
-                )
+            routing_weights, selected_experts = torch.topk(
+                routing_weights_f32, k=self.top_k, dim=-1
+            )
+        if self.norm_topk_prob:
+            routing_weights = routing_weights / routing_weights.sum(
+                dim=-1, keepdim=True
+            )
         routing_weights = routing_weights.to(hidden_states.dtype)
 
         if getattr(self.experts, "_ep_dispatcher", False):
