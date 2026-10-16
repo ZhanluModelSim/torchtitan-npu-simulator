@@ -190,3 +190,18 @@ linear-attention，均 MoE）**，ep=2。对应 preset `qwen3_next_80b_a3b_2laye
 
 校验数：`log_softmax`/nll 各 16（16k/1024 chunk）、全量死 logits mm 1 个 +
 chunk mm 16 个；A2A=8（2 层×4）、RS=7（root1+embed1+layers2+experts2+head1）。
+
+## 分组 GEMM 为融合 npu_grouped_matmul（管理方第二轮反馈修正）
+
+管理方确认：实测 MoE 段 elementwise 每层仅 ~20 次、shape 为 `[16384,10,2048]` /
+`[81920,512]` 等全 token 维——**逐专家 python 循环（zeros+cumsum+切片写，每层
+255×4 全张量 op）在实测流中不存在**。`ep_dispatcher: eager` 指 dispatcher 路径
+（permute/a2a/unpermute 走 eager index 算子），分组 GEMM 本身是融合
+`npu_grouped_matmul`（`_GroupedMatmul` 自定义 autograd Function）。
+
+sim 实现：`_SimGroupedMatmul`——前向 1 个 `npu.npu_grouped_matmul.default` 合成算子
+（[M,K]×[E,K,N]→[M,N]），反向 2 个（输入梯度用转置权重；权重梯度
+`split_item=3/group_type=2` 输出 [E,K,N]，实测还有 1 次 stack）。2 层配置验证：
+gmm=12（2 层×[前向2+反向4]）、add/mul 全流 168（此前 ~24.6k）、experts 桶每层仅
+残差 add + probs mul(×4) + silu/silu_bwd/mul [81920,512]，comm 数不变
+（AG16/A2A8/RS7/AR3）。

@@ -307,15 +307,12 @@ def _experts_ep_forward(
     hidden_states = _sim_all_to_all_v(hidden_states, ep_group, rows_per_rank)
     hidden_states, unpermute_indices2 = _eager_permute(hidden_states, global_indices)
 
-    # eager experts computation: per-expert matmul loop, silu*up between
-    fc1_output = _eager_grouped_matmul_meta(
-        hidden_states, gate_up_proj, tokens_per_expert_num
-    )
+    # fused experts computation: npu_grouped_matmul (single fused op per
+    # grouped GEMM), silu*up between
+    fc1_output = _fused_grouped_matmul(hidden_states, gate_up_proj, tokens_per_expert_num)
     gate, up = fc1_output.chunk(2, dim=-1)
     act = F.silu(gate) * up
-    fc2_out = _eager_grouped_matmul_meta(
-        act, down_proj, tokens_per_expert_num
-    )
+    fc2_out = _fused_grouped_matmul(act, down_proj, tokens_per_expert_num)
 
     # alltoall_combine: unpermute -> a2a -> probs-weighted unpermute
     hidden_states = _eager_unpermute(fc2_out, unpermute_indices2)
@@ -326,43 +323,74 @@ def _experts_ep_forward(
     return hidden_states.view(*hidden_states_shape)
 
 
-def _eager_grouped_matmul_meta(
+def _record_grouped_matmul(
+    inputs: list[torch.Tensor], out_shape: list[int], dtype: torch.dtype
+) -> torch.Tensor:
+    """Record one fused ``npu_grouped_matmul`` op under meta capture."""
+    from torchtitan_npu.simulator.capture.dispatch_capture import get_active_capture
+    from torchtitan_npu.simulator.synthetic_ac import run_synthetic_op
+
+    capture = get_active_capture()
+    module_path = (
+        capture.module_path_tracker.current_path()
+        if capture is not None and capture.module_path_tracker is not None
+        else ""
+    )
+    out = torch.empty(out_shape, dtype=dtype, device=inputs[0].device)
+    return run_synthetic_op(
+        "npu.npu_grouped_matmul.default",
+        inputs=inputs,
+        output_factory=lambda: out,
+        module_path=module_path,
+    )
+
+
+class _SimGroupedMatmul(torch.autograd.Function):
+    """``mindspeed.ops.grouped_matmul._GroupedMatmul`` (npu_grouped_matmul).
+
+    Forward: one fused grouped-matmul op over the expert segments. The
+    measured backward is explicit (custom autograd Function): one fused
+    op for the input grads (transposed weights) and one fused op for the
+    weight grads (``split_item=3 / group_type=2``), stacked per expert —
+    no per-expert autograd ops (unlike the eager python loop, which the
+    measured stream does not contain).
+    """
+
+    @staticmethod
+    def forward(ctx, inputs, weights, group_list):
+        ctx.save_for_backward(inputs, weights, group_list)
+        out_shape = [inputs.shape[0], weights.shape[2]]
+        return _record_grouped_matmul(
+            [inputs, weights, group_list], out_shape, inputs.dtype
+        )
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        inputs, weights, group_list = ctx.saved_tensors
+        grad_input = _record_grouped_matmul(
+            [grad_output, weights.transpose(1, 2), group_list],
+            [grad_output.shape[0], weights.shape[1]],
+            grad_output.dtype,
+        )
+        grad_weight = _record_grouped_matmul(
+            [inputs.transpose(0, 1), grad_output, group_list],
+            list(weights.shape),
+            weights.dtype,
+        )
+        return grad_input, grad_weight, None
+
+
+def _fused_grouped_matmul(
     inputs: torch.Tensor, weights: torch.Tensor, tokens_per_expert: int
 ) -> torch.Tensor:
-    """``_eager_grouped_matmul`` under meta capture.
-
-    Same op stream (zeros + cumsum + per-expert matmul with slice
-    assignment); the group boundaries come from the analytic uniform
-    token count because the meta counts tensor carries no values.
-    """
-    batch_size, input_dim = inputs.shape
-    if weights.shape[1] == input_dim:
-        output_dim = weights.shape[2]
-    else:
-        output_dim = weights.shape[1]
-        weights = weights.transpose(1, 2)
-    final_hidden_states = torch.zeros(
-        (batch_size, output_dim), dtype=inputs.dtype, device=inputs.device
-    )
-    num_local_experts = weights.shape[0]
-    group_list = [i * tokens_per_expert for i in range(num_local_experts + 1)]
+    """Fused grouped matmul with the analytic uniform group list."""
     m_split = torch.full(
-        (num_local_experts,), tokens_per_expert,
-        dtype=torch.int64, device=inputs.device,
+        (weights.shape[0],),
+        tokens_per_expert,
+        dtype=torch.int64,
+        device=inputs.device,
     )
-    torch.cumsum(m_split, dim=0)
-    # Chunk + squeeze views (NOT ``weights[i]`` select): the autograd view
-    # chain accumulates the per-expert weight grads into a single cat
-    # during backward, while select would materialize a full-tensor
-    # select_backward + add per expert (elementwise inflation).
-    weight_chunks = [c.squeeze(0) for c in weights.chunk(num_local_experts, dim=0)]
-    for i in range(len(group_list) - 1):
-        start_idx = group_list[i]
-        end_idx = group_list[i + 1]
-        final_hidden_states[start_idx:end_idx, :] = torch.matmul(
-            inputs[start_idx:end_idx, :], weight_chunks[i]
-        )
-    return final_hidden_states
+    return _SimGroupedMatmul.apply(inputs, weights, m_split)
 
 
 class Qwen3NextGroupedExperts(nn.Module):
