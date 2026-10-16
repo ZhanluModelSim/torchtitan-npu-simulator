@@ -83,24 +83,27 @@ def _apply_expert_parallel(model: Qwen3NextModel, ep_mesh) -> None:
     logger.info("Applied Qwen3-Next expert parallelism (eager dispatcher)")
 
 
-def _apply_expert_fsdp(model: Qwen3NextModel, edp_mesh, mp_policy) -> None:
+def _apply_expert_fsdp(model: Qwen3NextModel, edp_mesh, param_dtype) -> None:
     """Mirror MindSpeed ``expert_fully_shard_modules``.
 
     Each routed-experts module becomes its own FSDP unit over the
     EP-internal data-parallel mesh (``ep_fsdp_modules``), sharded on dim 1
-    (``efsdp_shard_placement_fn`` default Shard(1)). The measured run uses
-    ``ep_fsdp_size: 4`` with recompute disabled and shows one all-gather
-    per experts unit (forward only), so ``reshard_after_forward=False``
-    keeps the unsharded expert weights resident through backward.
+    (``efsdp_shard_placement_fn`` default Shard(1)). MindSpeed passes no
+    ``reshard_after_forward`` there, so torch's default True applies:
+    every experts unit re-unshards once before backward. The eFSDP
+    precision policy is hardcoded in MindSpeed to param bf16 / reduce
+    fp32 (independent of the main FSDP ``reduce_dtype``).
     """
+    efsdp_policy = MixedPrecisionPolicy(
+        param_dtype=param_dtype, reduce_dtype=torch.float32
+    )
     for layer in model.layers.values():
         if not layer.moe_enabled:
             continue
         fully_shard(
             layer.moe.experts,
             mesh=edp_mesh,
-            mp_policy=mp_policy,
-            reshard_after_forward=False,
+            mp_policy=efsdp_policy,
             shard_placement_fn=lambda p: Shard(1),
         )
     logger.info("Applied Qwen3-Next expert FSDP (eFSDP) over edp mesh")
@@ -117,12 +120,12 @@ def _apply_fsdp(
     """Mirror the MindSpeed fsdp2 default plan.
 
     ``fsdp_modules = ['model.layers.{*}', 'model.embed_tokens', 'lm_head']``
-    with ``reshard_after_forward=True``: the embedding, the (untied)
-    lm_head, and every decoder layer are separate FSDP units; the final
-    norm is left unwrapped (no all-gather of its own). Routed-expert
-    weights live on the edp mesh as their own units (see
-    ``_apply_expert_fsdp``), so the layer units only manage the
-    non-expert parameters.
+    all share ``parallel_args.reshard_after_forward`` whose default is
+    True: every unit (embedding, lm_head, decoder layers) re-unshards
+    once before backward. The final norm is in none of the groups and
+    stays unwrapped (no all-gather of its own). Routed-expert weights
+    live on the edp mesh as their own units (see ``_apply_expert_fsdp``),
+    so the layer units only manage the non-expert parameters.
     """
     mp_policy = MixedPrecisionPolicy(
         param_dtype=param_dtype, reduce_dtype=reduce_dtype
@@ -130,21 +133,18 @@ def _apply_fsdp(
     # MindSpeed applies expert FSDP only when EP > 1
     # (``expert_parallel_size > 1`` gates both EP and eFSDP in their engine).
     if edp_mesh is not None and ep_enabled:
-        _apply_expert_fsdp(model, edp_mesh, mp_policy)
-    # First/last units keep their parameters unsharded through backward
-    # (reshard_after_forward=False -> a single forward all-gather each),
-    # matching the measured all-gather count under the MindSpeed plan.
+        _apply_expert_fsdp(model, edp_mesh, param_dtype)
     fully_shard(
         model.tok_embeddings,
         mesh=dp_mesh,
         mp_policy=mp_policy,
-        reshard_after_forward=False,
+        reshard_after_forward=True,
     )
     fully_shard(
-        [model.norm, model.output],
+        model.output,
         mesh=dp_mesh,
         mp_policy=mp_policy,
-        reshard_after_forward=False,
+        reshard_after_forward=True,
     )
     for layer in model.layers.values():
         fully_shard(
@@ -154,7 +154,7 @@ def _apply_fsdp(
             reshard_after_forward=True,
         )
     # Root wrap owns no parameters (everything is managed above); FSDP
-    # requires it for the multi-module [norm, output] unit to be valid.
+    # requires it for the child-unit layout to be valid.
     fully_shard(model, mesh=dp_mesh, mp_policy=mp_policy)
     disable_fsdp_gradient_division(model)
     logger.info("Applied Qwen3-Next FSDP (MindSpeed fsdp_modules plan)")

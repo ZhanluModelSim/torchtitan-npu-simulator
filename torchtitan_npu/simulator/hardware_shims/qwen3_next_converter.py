@@ -20,6 +20,7 @@ import torch
 import torch.nn.functional as F
 from torch.distributed.tensor import DTensor
 
+from torchtitan_npu.models.qwen3_next import loss as qwen3_next_loss
 from torchtitan_npu.models.qwen3_next.attention import GatedAttention, RMSNormGated
 from torchtitan_npu.models.qwen3_next.feed_forward import Qwen3NextGroupedExperts
 from torchtitan_npu.simulator.capture.dispatch_capture import get_active_capture
@@ -386,16 +387,47 @@ def _apply_qwen3_next_module_shims(model) -> None:
                 module.forward = MethodType(_sim_qwen_grouped_experts, module)
                 setattr(module, _EXPERTS_SHIM_MARKER, True)
 
-    # MindSpeed chunked loss: the measured run computes the LM loss in
-    # 1024-token chunks inside the LM-head module (ChunkLoss with
-    # grads-in-forward). The model therefore returns hidden states; the
-    # head module is bound to an identity forward (its FSDP unit still
-    # all-gathers on entry) and the registered weight feeds the chunked
-    # loss function.
-    from torchtitan_npu.models.qwen3_next import loss as qwen3_next_loss
-
+    # MindSpeed chunked loss: the wrapper's forward calls the LM head
+    # TWICE unconditionally — first ``self.lm_head(h)`` for full logits
+    # (the result is discarded when ``loss_ctx`` is set), then
+    # ``self.lm_head(h, loss_ctx=loss_ctx)`` which runs the chunked loss
+    # inside the module (so its FSDP unit all-gathers on each call), and
+    # the model returns the precomputed loss (the trainer loss fn is a
+    # passthrough). Each FSDP unit re-unshards before backward
+    # (reshard_after_forward=True), so the head sees three all-gathers.
     if qwen3_next_loss.is_active() and getattr(model, "output", None) is not None:
-        qwen3_next_loss.register_lm_head(model.output)
-        model.output.forward = MethodType(
-            qwen3_next_loss.lm_head_identity_forward, model.output
-        )
+        model.output.forward = MethodType(_lm_head_forward, model.output)
+        model.forward = MethodType(_causal_lm_forward, model)
+
+
+def _lm_head_forward(self, x: torch.Tensor, loss_ctx=None):
+    """MindSpeed ``LMHead.forward``: full-logits linear or the chunked
+    loss delegation (``(None, loss_ctx(hidden, weight, bias))``)."""
+    weight = _local_param(self.weight)
+    if loss_ctx is None:
+        return F.linear(x, weight)
+    return None, loss_ctx(x, weight)
+
+
+def _causal_lm_forward(
+    self,
+    tokens: torch.Tensor,
+    attention_masks=None,
+    positions=None,
+):
+    """Mirror MindSpeed ``Qwen3NextForCausalLM.forward`` (chunked-loss
+    path) on top of the torchtitan Decoder layout."""
+    h = self.tok_embeddings(tokens)
+    for layer in self.layers.values():
+        h = layer(h, self.freqs_cis, attention_masks, positions)
+    h = self.norm(h)
+    # logits_to_keep=0 -> slice(None): the wrapper slices before each
+    # head call; the first head call computes full logits whose result
+    # is overwritten (dead) by the loss_ctx call.
+    h_slice = h[:, slice(0, None), :]
+    self.output(h_slice)
+    _, loss = self.output(
+        h_slice,
+        loss_ctx=qwen3_next_loss.make_chunk_loss_ctx(self._sim_labels),
+    )
+    return loss

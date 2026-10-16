@@ -241,9 +241,37 @@ def _80b_a3b() -> Qwen3NextModel.Config:
     )
 
 
+def _80b_a3b_2layer() -> Qwen3NextModel.Config:
+    """80B dims trimmed to 2 layers (one full-attention + one
+    linear-attention), both MoE — the measured comparison config."""
+    cfg = _80b_a3b()
+    cfg.layers = _build_layers(
+        n_layers=2,
+        dim=2048,
+        layer_types=["full_attention", "linear_attention"],
+        mlp_only_layers=[],
+        dense_intermediate_size=512,
+        gdn_kwargs=dict(
+            num_v_heads=32,
+            num_k_heads=16,
+            head_k_dim=128,
+            head_v_dim=128,
+        ),
+        attn_kwargs=dict(n_heads=16, n_kv_heads=2, head_dim=256),
+        moe_kwargs=dict(
+            num_experts=512,
+            top_k=10,
+            moe_intermediate_size=512,
+            shared_expert_intermediate_size=512,
+        ),
+    )
+    return cfg
+
+
 qwen3_next_configs = {
     "debugmodel": _debugmodel,
     "80B-A3B": _80b_a3b,
+    "80B-A3B-2L": _80b_a3b_2layer,
 }
 
 

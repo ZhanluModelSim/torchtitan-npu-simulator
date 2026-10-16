@@ -104,7 +104,14 @@ def qwen3_next_smoketest() -> NpuTrainerConfig:
     )
 
 
-def qwen3_next_80b_a3b() -> NpuTrainerConfig:
+def qwen3_next_80b_a3b_2layer() -> NpuTrainerConfig:
+    """Measured comparison config: full 80B dims with only the layer
+    count reduced to 2 (one full-attention + one linear-attention,
+    both MoE)."""
+    return qwen3_next_80b_a3b(flavor="80B-A3B-2L")
+
+
+def qwen3_next_80b_a3b(flavor: str = "80B-A3B") -> NpuTrainerConfig:
     """Qwen3-Next-80B-A3B baseline mirroring the measured fsdp2 run
     (pretrain_qwen3_next_16k_fsdp2_A3.yaml): FSDP=8, EP=2, eFSDP=4,
     recompute disabled, reduce bf16.
@@ -112,7 +119,7 @@ def qwen3_next_80b_a3b() -> NpuTrainerConfig:
     Override via CLI, e.g. ``--parallelism.expert_parallel_degree 8``.
     """
     return _trainer_config(
-        flavor="80B-A3B",
+        flavor=flavor,
         training=TrainingConfig(
             local_batch_size=1,
             seq_len=16384,

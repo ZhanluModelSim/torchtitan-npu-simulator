@@ -211,3 +211,10 @@ def qwen3_next_80b_a3b() -> SimulationTrainerConfig:
         _qwen3_next_configs.qwen3_next_80b_a3b,
         output_name="qwen3_next_80b_a3b",
     )
+
+
+def qwen3_next_80b_a3b_2layer() -> SimulationTrainerConfig:
+    return _qwen3_next_simulation_config(
+        _qwen3_next_configs.qwen3_next_80b_a3b_2layer,
+        output_name="qwen3_next_80b_a3b_2layer",
+    )

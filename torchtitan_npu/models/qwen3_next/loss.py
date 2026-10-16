@@ -24,26 +24,10 @@ import torch.nn.functional as F
 CHUNK_LOSS_SIZE = 1024
 
 _active = False
-_lm_head_module: torch.nn.Module | None = None
 
 
 def is_active() -> bool:
     return _active
-
-
-def register_lm_head(module: torch.nn.Module) -> None:
-    global _lm_head_module
-    _lm_head_module = module
-
-
-def lm_head_identity_forward(self, x: torch.Tensor) -> torch.Tensor:
-    """Identity forward for the LM-head module.
-
-    The chunked loss owns the head matmul; the module call itself only
-    marks the FSDP unit boundary (all-gather on entry, params stay
-    unsharded through backward with ``reshard_after_forward=False``).
-    """
-    return x
 
 
 class _SimChunkLoss(torch.autograd.Function):
@@ -91,25 +75,35 @@ class _SimChunkLoss(torch.autograd.Function):
         return grad_output * grad_input, grad_output * grad_weight, None, None
 
 
-def chunk_loss_fn(pred: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-    hidden = pred
-    module = _lm_head_module
-    if module is None:
-        raise RuntimeError(
-            "qwen3_next chunk loss requires the LM-head module registered "
-            "by the post-build shims"
-        )
-    weight = module.weight
-    if isinstance(weight, torch.distributed.tensor.DTensor):
-        weight = weight.to_local()
-    loss_mask = labels != -100
-    alpha = loss_mask.sum()
-    return _SimChunkLoss.apply(hidden, weight, labels, alpha)
+def make_chunk_loss_ctx(labels: torch.Tensor):
+    """Build the measured ``loss_ctx`` closure.
+
+    MindSpeed's trainer injects ``loss_ctx`` into the model forward; the
+    LM-head module invokes it as ``loss_ctx(hidden_states, weight, bias)``
+    and the returned tensor IS the model loss (the torchtitan loss fn is
+    therefore a passthrough on the precomputed loss).
+    """
+    def loss_ctx(hidden: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        loss_mask = labels != -100
+        alpha = loss_mask.sum()
+        return _SimChunkLoss.apply(hidden, weight, labels, alpha)
+
+    return loss_ctx
 
 
 def build_qwen3_next_chunk_loss(compile_config=None, **kwargs):
-    """``build_loss_fn`` factory for the qwen3_next model spec."""
+    """``build_loss_fn`` factory for the qwen3_next model spec.
+
+    The model forward computes the chunked loss internally (mirroring
+    MindSpeed's ``loss_ctx`` flow), so the trainer-side loss function is
+    a passthrough on the precomputed loss sum.
+    """
     global _active
     del compile_config, kwargs
     _active = True
-    return chunk_loss_fn
+
+    def passthrough(pred: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        del labels
+        return pred
+
+    return passthrough

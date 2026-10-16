@@ -634,6 +634,16 @@ class SimulationTrainer(Trainer):
         )
         self.workload_graph: WorkloadGraph | None = None
 
+    def forward_backward_step(self, **kwargs):
+        """Stash the microbatch labels on the model parts before the
+        torchtitan forward: the qwen3_next chunked-loss forward consumes
+        them inside ``loss_ctx`` (mirroring MindSpeed's trainer, which
+        closes over the labels when building the loss ctx)."""
+        labels = kwargs.get("labels")
+        for part in self.model_parts:
+            part._sim_labels = labels
+        return super().forward_backward_step(**kwargs)
+
     def _capture_clip_grad_norm(self) -> torch.Tensor:
         from torchtitan.distributed import utils as dist_utils
         return dist_utils.clip_grad_norm_(

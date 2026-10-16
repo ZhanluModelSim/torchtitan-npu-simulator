@@ -152,3 +152,41 @@ EP=1/2 comm 数（AG10/16、A2A0/12、RS6/9）无回归。
 待复核（需实测 trace）：管理方若在 rms_norm 处观察到 add/mul 差异，最可能是实测侧
 把 `1.0+w` 吸进融合边界（实测前向无 `[2048]` add）——当前序列是按实测 CSV 推导的，
 以实测 grep `aten.add` shape `[2048]` 为准。
+
+## 实测对齐配置与 all-gather 全清单（`62ccfa3` 后）
+
+管理方实测口径修正：**完整 80B 维度、仅层数改为 2（1 层 full-attention + 1 层
+linear-attention，均 MoE）**，ep=2。对应 preset `qwen3_next_80b_a3b_2layer`。
+关键语义（读实测树确认）：
+
+- `reshard_after_forward`：fsdp_modules 三组（layers/embed_tokens/lm_head）共用
+  `parallel_args.reshard_after_forward`，**默认 True**——每个单元反向各 1 次
+  pre-bwd AG；eFSDP `fully_shard(experts)` 不传该参 → torch 默认 True → 专家权重
+  反向也有 AG。根 wrap `fully_shard(model, {mesh, ignored_params, mp_policy})`
+  不传 → torch 默认 None → **根单元 False**（final norm 归根单元：前向 1 次 AG、
+  反向无）。final norm 不在 fsdp_modules 里，由根单元兜底捕获（[2048]/8=[256]）。
+- eFSDP 精度策略在 MindSpeed 中硬编码 `MixedPrecisionPolicy(param=bf16,
+  reduce=fp32)`，与主 FSDP 的 `reduce_dtype` 无关（专家梯度 RS 为 fp32）。
+- **LMHead 前向被无条件调用两次**（`qwen3_next.py`：先 `self.lm_head(h)` 算全量
+  logits——loss_ctx 存在时结果被覆盖（死分支，但 mm/AG 都进流），再
+  `self.lm_head(h, loss_ctx=loss_ctx)` 在模块内跑分块 loss）→ lm_head 共 3 次 AG
+  （前向 2 + 反向 1）。模型返回预计算 loss，trainer 侧 loss_fn 为 passthrough。
+
+2 层配置的 16 个 AG（与实测一致）：
+
+| # | phase | 单元 | shape（元素） | 说明 |
+|---|-------|------|--------------|------|
+| 1 | fwd | root(norm) | [256]→[2048] | final norm 归根单元，仅前向 |
+| 2 | fwd | embed | [38895616]→[311164928] | 151936×2048 全表 |
+| 3 | fwd | layer0 | [3934784]→[31478272] | full-attn 层非专家参数 |
+| 4 | fwd | layer0.experts | [201326592]→[805306368] | eFSDP 权重（Shard(1)/4）|
+| 5 | fwd | layer0.experts | [512]→[1024] | dispatcher 计数 AG |
+| 6 | fwd | layer1 | [4741656]→[37933248] | linear-attn 层 |
+| 7/8 | fwd | layer1.experts | 同 4/5 | |
+| 9 | fwd | output | [38895616]→[311164928] | 死 logits 调用 unshard |
+| 10 | fwd | output | 同上 | loss_ctx 调用 unshard |
+| 11 | bwd | output | 同上 | pre-bwd |
+| 12-16 | bwd | layer1 / layer1.experts / layer0 / layer0.experts / embed | 同各自前向 | reshard=True 的反向重 unshard |
+
+校验数：`log_softmax`/nll 各 16（16k/1024 chunk）、全量死 logits mm 1 个 +
+chunk mm 16 个；A2A=8（2 层×4）、RS=7（root1+embed1+layers2+experts2+head1）。
