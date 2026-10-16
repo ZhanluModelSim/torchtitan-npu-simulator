@@ -99,3 +99,56 @@ debug preset 改 full 重算（`recompute_modules` 语义）。
 
 smoketest EP=1/2/8、`kimi_k3_smoketest` 回归、80B 全量捕获均通过；与实测的对表方法：
 按 `module_path` 分解 `kernel_summary/rank_0.csv` 算子计数，逐模块比对。
+
+## EP eager dispatcher 与融合 permute 的分界（`eefd16a`）
+
+实测 ep=2 且 `moe_grouped_gemm=True` 走 **eager dispatcher**（`expert_parallelize_modules`
+整专家 Shard(0) + `_ep_dispatcher` 前向替换：bincount→计数 AG→argsort/index_select→
+all_to_all_single→argsort/index_select→逐专家 matmul 循环→silu*up→gmm→unpermute
+（zeros+index_copy_）→a2a→probs 加权 unpermute）。实现要点：
+
+- 专家权重 `gate_up_proj.data.chunk(ep_size,0)[ep_rank]` 后 `Shard(0)` 切到 ep mesh
+  （连续行=整专家）；eFSDP 在 edp mesh 上 `Shard(1)` + `reshard_after_forward=False`
+  （实测每单元仅 1 次前向 AG）。
+- `aten.bincount` 无 Meta kernel——在 `meta_env` 注册 fake（返回 `[minlength]`）；
+  `repeat_interleave` 需显式 `output_size=`；meta 上 `.to('cpu')` 抛错，D2H 切分用
+  合成 `aten._to_copy.default` 记录；a2a 必须 autograd Function 包装。
+- **ep=1 保留融合 `npu_moe_token_permute/unpermute`**（实测 ep=1 同为融合）。
+  实验佐证融合算子吸收算术：同 preset 下 ep=1 全流 add/mul=236 个，ep=2 eager=283 个，
+  +47 个即融合 permute/unpermute 内部吸收的 probs 加权 mul 与 unpermute 求和。
+
+## 分块 loss（ChunkLoss，实测 `chunk_loss_size: 1024`）
+
+实测语言模型 loss 不在 `lm_head.forward` 里：`_build_chunk_loss` 令 model 返回
+hidden（lm_head 模块仍被调用，[norm,output] FSDP 单元照常 AG，`reshard=False` 保
+权重全量），`ChunkLoss.apply` 在**前向**逐 chunk（1024 token）做
+`torch.func.grad_and_value(calculate_lm_loss)`：`F.linear`→`.float()`→
+`F.cross_entropy(sum, ignore_index)`→`/alpha`（alpha=有效 token 数），梯度经
+`copy_`/`add_` 回填预分配缓冲（grad_inputs chunk copy_、grad_weight add_、loss add_），
+backward 仅按 trainer 预除的 grad_output 缩放。16k 序列 → 16 chunk → 16 个
+log_softmax/nll_loss、16 次 `[1024,151936]` 的 lm_head matmul。
+
+sim 实现（`models/qwen3_next/loss.py`）：`build_loss_fn` 工厂在 post-build shim 中把
+`model.output` 绑定为透传并注册权重；`_SimChunkLoss` 用 `enable_grad` +
+`torch.autograd.grad` 在 Function forward 内求 chunk 梯度（不引 functorch，meta 捕获
+风险）；backward 返回保存梯度×grad_output。验证：80B（ep2/16k）log_softmax /
+`_log_softmax_backward` / nll fwd+bwd 各 16、shape `[1024,151936]`，smoketest 1 chunk，
+EP=1/2 comm 数（AG10/16、A2A0/12、RS6/9）无回归。
+
+## add/mul 对账（管理员检查 #5）
+
+大桶来源与归属（80B，47 MoE+1 dense）：
+
+- 残差 add `[1,16384,2048]`：attn 2/层×48 + moe 47
+- norm 权重 add `[2048]×48 / [256]×12`：`1.0+weight.float()`（实测流中的真实 eager
+  算子，非融合内部）
+- 反向双分支重组 add：gate/up、q/k/o in_proj、GDN token_mixer 的
+  `d_a@Waᵀ + d_b@Wbᵀ`（silu_bwd→mm→mm→add）
+- eager dispatcher 逐专家循环 add `[256,2048,1024]` 等 ×11985（47 层×255 swap）
+- probs 加权 mul `[16384,10,2048]×[16384,10,1]` fwd ×47 + mul_ bwd ×47
+- loss：add_ scalar ×16、add_ `[151936,2048]`×16（grad_weight）、bwd 缩放
+  mul `[]×[151936,2048]` 与 `[]×[1,16384,2048]` 各 1
+
+待复核（需实测 trace）：管理方若在 rms_norm 处观察到 add/mul 差异，最可能是实测侧
+把 `1.0+w` 吸进融合边界（实测前向无 `[2048]` add）——当前序列是按实测 CSV 推导的，
+以实测 grep `aten.add` shape `[2048]` 为准。

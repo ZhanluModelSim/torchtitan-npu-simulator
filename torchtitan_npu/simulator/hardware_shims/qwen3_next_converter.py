@@ -385,3 +385,17 @@ def _apply_qwen3_next_module_shims(model) -> None:
             if not getattr(module, _EXPERTS_SHIM_MARKER, False):
                 module.forward = MethodType(_sim_qwen_grouped_experts, module)
                 setattr(module, _EXPERTS_SHIM_MARKER, True)
+
+    # MindSpeed chunked loss: the measured run computes the LM loss in
+    # 1024-token chunks inside the LM-head module (ChunkLoss with
+    # grads-in-forward). The model therefore returns hidden states; the
+    # head module is bound to an identity forward (its FSDP unit still
+    # all-gathers on entry) and the registered weight feeds the chunked
+    # loss function.
+    from torchtitan_npu.models.qwen3_next import loss as qwen3_next_loss
+
+    if qwen3_next_loss.is_active() and getattr(model, "output", None) is not None:
+        qwen3_next_loss.register_lm_head(model.output)
+        model.output.forward = MethodType(
+            qwen3_next_loss.lm_head_identity_forward, model.output
+        )

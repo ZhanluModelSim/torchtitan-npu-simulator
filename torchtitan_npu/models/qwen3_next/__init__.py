@@ -5,7 +5,7 @@
 
 """Qwen3-Next model package: hybrid Gated DeltaNet / gated attention MoE."""
 
-from torchtitan.components.loss import build_cross_entropy_loss
+from torchtitan_npu.models.qwen3_next.loss import build_qwen3_next_chunk_loss
 from torchtitan.distributed.pipeline_parallel import pipeline_llm
 from torchtitan.models.common import Embedding, Linear, RoPE
 from torchtitan.models.common.feed_forward import FeedForward
@@ -255,7 +255,7 @@ def model_registry(flavor: str) -> ModelSpec:
         model=config,
         parallelize_fn=parallelize_qwen3_next,
         pipelining_fn=pipeline_llm,
-        build_loss_fn=build_cross_entropy_loss,
+        build_loss_fn=build_qwen3_next_chunk_loss,
         post_optimizer_build_fn=None,
         state_dict_adapter=None,
     )
