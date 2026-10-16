@@ -76,6 +76,25 @@ index/index_add/gather/sort 全部消失。
    `npu_rms_norm`）必须有条目，否则对应区块贡献零耗时
 4. GDN eager 分解算子按常规 eager 算子计价即可（shape 元数据齐全）
 
+## FSDP 单元划分与 all-gather 对齐（`5be2808`）
+
+MindSpeed fsdp2 默认计划：`fsdp_modules=['model.layers.{*}', 'model.embed_tokens',
+'lm_head']`（80B `tie_word_embeddings=false`，lm_head 独立单元），专家在 EP>1 时走
+EFSDP（`ep_fsdp_modules`，edp mesh 上 Shard(1)），`recompute_modules` 仅 layers。
+对应结构（EP=2、4 层、3 MoE）：embed 1 + [norm,output] 1 + 4 层×2（前向+重算）+
+3 experts×2 = **16 个 all-gather，与实测一致**。实现：`parallelize.py` 自带
+`_apply_fsdp`/`_apply_expert_fsdp`（首/末单元 `reshard_after_forward=False` → 仅一次
+前向 AG；layers/experts True → 前向+重算 AG；EP=1 不做 EFSDP，与 MindSpeed 门控一致）。
+
+## 融合 norm 的精确算子序列（`b198a6d`）
+
+MindSpeed（`use_fused_rmsnorm=True`）的 `Qwen3NextRMSNorm` =
+`npu_rms_norm(x.float(), 1.0 + weight.float(), eps)[0].type_as(x)`——float cast、
+`1.0+weight` 偏置加法、输出 cast 都是实测流中的真实 eager 算子（80B 每步 ~1.2k 个
+小算子，裸融合边界会藏掉）。已按 qwen3_next 门控绑定 `NPURMSNorm` 实例到该序列；
+GDN 门控 norm 升级为 float32 全序列。同时配置对齐官方示例：`reduce_dtype=bfloat16`、
+debug preset 改 full 重算（`recompute_modules` 语义）。
+
 ## 验证
 
 smoketest EP=1/2/8、`kimi_k3_smoketest` 回归、80B 全量捕获均通过；与实测的对表方法：
