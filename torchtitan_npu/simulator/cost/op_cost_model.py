@@ -63,7 +63,6 @@ class OpCostModel:
             "moe_token_permute": self._data_move,
             "moe_token_unpermute": self._data_move,
             "moe_re_routing": self._data_move,
-            "split_v": self._data_move,
             "allreduce": self._allreduce,
             "reduce_scatter": self._allreduce,
             "allgather": self._allgather,

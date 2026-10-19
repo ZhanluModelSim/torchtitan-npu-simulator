@@ -22,8 +22,6 @@ from dataclasses import dataclass
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.rmsnorm import RMSNorm
 from torchtitan.models.common.rope import apply_rotary_emb_cos_sin
-
-from .layout_ops import record_split_v
 from torchtitan.protocols.module import Module
 
 
@@ -117,7 +115,6 @@ class GatedAttention(nn.Module):
             batch_size, seq_len, self.n_heads, self.head_dim * 2
         )
         query, gate = torch.chunk(q_and_gate, 2, dim=-1)
-        record_split_v([q_and_gate], [query, gate])
         gate = gate.reshape(batch_size, seq_len, -1)
 
         query = self.q_norm(query)

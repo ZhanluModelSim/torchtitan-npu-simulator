@@ -14,7 +14,7 @@ from torchtitan_npu.simulator.capture.op_mapping import display_op_label
 from torchtitan_npu.simulator.ir.workload_graph import WorkloadGraph
 
 _COMM_OP_TYPES = {"allreduce", "allgather", "reduce_scatter", "all_to_all"}
-_DATA_MOVE_OP_TYPES = {"moe_token_permute", "moe_token_unpermute", "moe_re_routing", "view", "reshape", "transpose", "cat", "split", "split_v"}
+_DATA_MOVE_OP_TYPES = {"moe_token_permute", "moe_token_unpermute", "moe_re_routing", "view", "reshape", "transpose", "cat", "split"}
 
 
 def _node_color(op_type: str) -> str:

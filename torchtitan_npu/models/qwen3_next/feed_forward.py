@@ -32,8 +32,6 @@ import torch.nn.functional as F
 from torch import nn
 from torch.distributed.tensor import DTensor, Partial
 
-from .layout_ops import record_split_v
-
 from torchtitan.models.common.linear import Linear
 from torchtitan.protocols.module import Module
 
@@ -313,7 +311,6 @@ def _experts_ep_forward(
     # grouped GEMM), silu*up between
     fc1_output = _fused_grouped_matmul(hidden_states, gate_up_proj, tokens_per_expert_num)
     gate, up = fc1_output.chunk(2, dim=-1)
-    record_split_v([fc1_output], [gate, up])
     act = F.silu(gate) * up
     fc2_out = _fused_grouped_matmul(act, down_proj, tokens_per_expert_num)
 

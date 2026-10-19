@@ -370,46 +370,31 @@ aclnn 层对 view 类算子的物化内核（GDN qkvz/ba `torch.split`→splitV�
 6. **验证范围随管理员反馈扩大**：早期只对前向+comm 计数，后期反向 mul、搬运语义
    都要进清单——每轮反馈后把新口径补进本文档。
 
-## 布局算子节点缺失（管理方第五轮反馈：图捕获层甄别）
+## 已知问题（标记，暂不修复）：布局算子节点缺失
 
-管理方指出"图捕获层没生成这些布局算子的节点"——**甄别结论：说法正确**。机制：
+**状态：已甄别、修复方案已验证、按决策回退，留待后续统一处理。**
 
-1. 捕获层（`OpDispatchCapture.__torch_dispatch__`）其实**记录了**所有 view 类 op，
-   并标注 `metadata_view=True`（dispatch_capture.py:835）；
-2. 但 `fold_metadata_views`（trainer.py:373）在导出前把它们折叠掉——设计注释称
-   "not launched device kernels"，该假设对 CPU/meta 成立，**对 NPU 不成立**：
-   split/chunk 在 NPU 上物化为 aclnnSplitV 内核，转置后 contiguous 物化为
-   TransData/TensorMove；
-3. 因此我方 CSV 中 split/transpose/chunk/view 全为 0，实测侧却有——层级假设错误，
-   不是 MoETokenPermute 融合算子归因（那只在旧流/ep=1 成立）。
+管理方第五轮反馈指出缺 transdata/tensormove/transpose/splitV，并诊断"图捕获层
+没生成这些布局算子的节点"——甄别结论**正确**：
 
-### 修复：源点合成记录（新提交）
+- 捕获层（`OpDispatchCapture`）记录了所有 view 类 op 并标注 `metadata_view=True`
+  （dispatch_capture.py:835），但 `fold_metadata_views`（trainer.py:373）在导出前
+  折叠——设计假设"view 类不产生设备内核"，对 CPU/meta 成立、对 NPU 不成立
+  （split/chunk 物化为 aclnnSplitV，转置拷贝物化为 TransData/TensorMove）；
+- 因此 CSV 中 split/chunk/transpose/view 为 0，实测侧有。转置拷贝类物化在我方流
+  中以 `aten.clone/copy_` 存在（层级命名差，按 shape 对表）；
+- **kimi_k3 与 deepseek_v4 存在同样缺口**（MLA q/kv 拆分、swiglu chunk、kimi 的
+  CP gather→chunk→select 搬运，均为裸 view op，无特殊处理）——该问题不是
+  qwen3_next 专属。
 
-新增 `models/qwen3_next/layout_ops.py` 的 `record_split_v`：在真实 view op 之后
-用 `run_synthetic_op` 记录 `npu.aclnn_split_v.default`（canonical `split_v`，
-成本模型按 `_data_move` 计费），输入/输出用真实张量 → 依赖边与 liveness 一致。
+曾实现修复（`e42d137`，已回退）：`record_split_v` 在 qwen3_next 的 4 类源点
+（GDN qkvz/ba split、attention chunk、EP swiglu chunk、loss split）后加
+`npu.aclnn_split_v.default` 合成节点（canonical `split_v`，成本 `_data_move`），
+2 层口径 ×8、smoketest ×10，comm/gmm/elementwise 计数无影响。
 
-| 源点 | 记录 | 2 层口径频次 |
-|---|---|---|
-| GDN `torch.split(qkvz/ba)`（gated_deltanet.py） | split_v ×2 | [16,768]→4 段 + [16,4]→2 段 |
-| gated attention `chunk(q_and_gate,2)`（attention.py） | split_v ×1 | [16,512]→2×[16,256] |
-| swiglu `chunk(2)`（feed_forward.py，EP eager 路径） | split_v ×1/层 | [81920,1024]→2×[81920,512] |
-| chunked loss 3 个 `torch.split`（loss.py） | split_v ×3 | [1,16384,·]→16 chunks |
-
-2 层口径合计 **split_v ×8**；smoketest ×10。comm/gmm/elementwise 计数不变。
-
-### transdata/tensormove/transpose 的映射说明
-
-这些内核对应的物化点在我方流中**已存在**，只是以 aten 级名字记录
-（clone/contiguous 不在折叠名单里）：
-
-- GDN split 输出的非连续 reshape 物化 → `aten.clone` ×9（token_mixer 桶，
-  如 [1,16384,16,256]/[1,16384,16,2]）
-- attention 出口 `transpose(1,2).reshape().contiguous()` 物化 → aten.clone
-- NPU 侧这些显示为 TransData/TensorMove/Transpose 内核——按 shape 对表即可。
-
-### 未覆盖（如管理方实测有更多再补）
-
-- 非 EP 路径 swiglu 走融合 `npu_swiglu`（无 chunk）→ 无 split_v；
-- FSDP 运行时参数搬运（mindspeed fsdp2 unshard/unpad）：AG 输入通常已连续
-  （contiguous 为空操作），暂无内核；如实测 profiler 在 AG 前有 TensorMove 再加。
+**回退原因**：kimi_k3/deepseek_v4 同样缺失，单改 qwen3_next 会让三个模型的口径
+不一致；统一修复（各模型源点插桩，或改折叠层全局生效）留待与管理方确认实测计数
+后再做。届时两个选项：
+1. 各模型源点插 `record_split_v`（低风险、模型隔离）；
+2. 改捕获/折叠层让 split/chunk 全局不折叠（一处生效，但改变所有模型既有计数，
+   需全量重验）。
