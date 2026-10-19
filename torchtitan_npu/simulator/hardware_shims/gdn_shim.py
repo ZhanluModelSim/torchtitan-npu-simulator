@@ -94,10 +94,11 @@ def _l2norm_fwd(x: torch.Tensor, module_path: str) -> tuple[torch.Tensor, torch.
 
 
 def _l2norm_bwd(y: torch.Tensor, rstd: torch.Tensor, dy: torch.Tensor, module_path: str) -> torch.Tensor:
-    """Reference ``l2norm_bwd``: 2D views + empty_like dx."""
+    """Reference ``l2norm_bwd``: 2D views + f32 dx (the triton bwd kernel
+    computes in f32; the wrapper's ``.to()`` downcast is real device work)."""
     y2d = y.view(-1, y.shape[-1])
     dy2d = dy.view(-1, dy.shape[-1])
-    dx2d = torch.empty_like(y2d)
+    dx2d = torch.empty(y2d.shape, dtype=torch.float32, device=y.device)
     _record(f"{_TRITON}.l2norm_bwd", [y, rstd, dy], [dx2d.view(y.shape)], module_path)
     return dx2d.view(y.shape)
 
@@ -167,8 +168,10 @@ class _SimTritonChunkGatedDeltaRuleFn(torch.autograd.Function):
         w, u = _recompute_w_u(k_norm, v, beta, a, g_cs, module_path)
         h_state, v_new = _fwd_h(k_norm, w, u, g_cs, nc, module_path)
 
-        # fwd_o: empty_like(v_new) + g transpose-contiguous + h contiguous
-        o = torch.empty_like(v_new)
+        # fwd_o: f32 output (triton kernel computes in f32) + g
+        # transpose-contiguous + h contiguous; the wrapper's o.to(q.dtype)
+        # downcast below is a real cast
+        o = torch.empty(v_new.shape, dtype=torch.float32, device=dev)
         g_c = g_cs.transpose(1, 2).contiguous()
         h_c = h_state.contiguous()
         _record(f"{_TRITON}.chunk_fwd_o", [q_norm, k_norm, v_new, h_c, g_c], [o], module_path)
@@ -226,10 +229,11 @@ class _SimTritonChunkGatedDeltaRuleFn(torch.autograd.Function):
         dg = dg.sum(0)
         dg = dg.transpose(1, 2).contiguous()
 
-        # prepare_wy_repr_bwd: beta contiguous copy + empty_like dk/dv/db/dg
+        # prepare_wy_repr_bwd: beta contiguous copy + empty_like dk/db/dg,
+        # f32 dv (kernel computes in f32; dv.to(v) downcast is real)
         beta_c = beta.transpose(1, 2).contiguous()
         dk2 = torch.empty_like(k)
-        dv3 = torch.empty_like(v)
+        dv3 = torch.empty(v.shape, dtype=torch.float32, device=dev)
         db = torch.empty_like(beta)
         dg2 = torch.empty_like(dg)
         _record(

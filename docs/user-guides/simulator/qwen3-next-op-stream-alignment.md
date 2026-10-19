@@ -457,3 +457,27 @@ zeros_like 1、clone 9→37（布局搬运）、sum +1（dg.sum(0)）；comm/gmm
 前向 + silu_backward + mul×2 反向（CSV experts 桶可见）；非 EP（实测 modeling
 `npu_swiglu` 融合）= `npu.npu_swiglu` + `npu.npu_swiglu_backward` 虚拟算子对。
 请管理方指认缺失出现的具体 module_path/shape 以便定位。
+
+## dtypecast 补全与测试口径（管理方第六轮追问）
+
+**".to() 被归一成 _to_copy 是否符合原仓库代码？"——符合。** aten 层
+`Tensor.to(dtype)` 就 dispatch 为 `aten._to_copy.default`（dtype 变换即带拷贝），
+原仓库的 `.to()` 在 torch profiler 里同样是 `_to_copy`，命名语义一致，无需改。
+
+真正根因：gdn_shim 的合成输出此前**继承输入 dtype**，包装层的 `.to()` 全部是
+同 dtype 空转——根本没有 dispatch、没有产生任何 cast 记录。实测有 cast ⇒ 实测
+triton 内核输出为 f32（与参考链路自洽：kkt A 显式 f32、dg f32、final_state f32、
+solve_tril 显式下转 k.dtype），包装层 `.to()` 是真实的 f32→bf16 转换。
+
+修复：fwd_o 的 o、l2norm_bwd 的 dx、prepare_wy 的 dv 按 f32 分配（内核 f32 计算
+约定），使每 GDN 层出现 **1 个前向 cast（o.to(q.dtype)）+ 3 个反向 cast
+（dq/dk 经 l2norm_bwd、dv 经 prepare_wy）**。dg/db 为 f32→f32 同 dtype（无
+cast），与参考一致。2 层口径 token_mixer `_to_copy`：fwd 16→17、bwd 17→20。
+
+**测试口径改为 ep=2**（管理方指示）：smoketest preset
+`expert_parallel_degree` 1→2，回归验证一律按实测对齐口径（ep=2）执行。
+smoketest ep=2 流：AG 26 / A2A 16 / RS 11 / AR 3；GDN 算子按 3 层正确缩放
+（new_empty 3+6、cast 31+40）。
+
+仍待服务器信息：divinplace / catoutout / 显式 zero_ 不在钉住参考版，需服务器
+mindspeed/ops/triton 源码或实测算子行落位。

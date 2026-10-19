@@ -97,7 +97,8 @@ def qwen3_next_smoketest() -> NpuTrainerConfig:
             decay_type="cosine",
             min_lr_factor=0.1,
         ),
-        parallelism=_parallelism(expert_parallel_degree=1),
+        # Measured-aligned tests run with ep=2 (admin round-6 directive)
+        parallelism=_parallelism(expert_parallel_degree=2),
         # Measured fsdp2 config runs with recompute: False
         activation_checkpoint=ActivationCheckpointConfig(mode="none"),
         print_config=True,
