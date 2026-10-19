@@ -405,3 +405,55 @@ kimi_k3/deepseek_v4 同口径 + 最终确认折叠正确而回退（`b71cc6e`）
 后续若管理方再报"缺搬运算子"：先按上表映射甄别，**不要**默认在源点加合成算子；
 仅当管理方明确要求把 NPU 物化细节建模进流时再启用 `record_split_v` 方案
 （实现已验证，回退提交可恢复）。
+
+## GDN triton 包装层 eager 算子镜像（管理方第六轮反馈）
+
+管理方指出：gdn_shim 用 triton 合成算子吸收 GDN 核心时，把 triton **包装层内部的
+eager 算子**也吸收掉了——实测流里有大量 vector/搬运/分配算子
+（zero_ 类填充、new_empty、cat、div_、dtype cast），我方为 0。要求模型代码严格
+按 MindSpeed-LLM（及其依赖的 mindspeed.ops.triton）逐行镜像。
+
+修复：gdn_shim 每个 triton 内核记录点现在**照抄参考包装层的 python**——分配、
+布局 contiguous 拷贝、填充、求和、cast 全部以真实 meta op 执行（自动捕获，
+非合成），合成的只有 triton 内核本身。逐阶段镜像清单（源：mindspeed.ops.triton
+参考版 + ChunkGatedDeltaRuleFunction）：
+
+| 阶段 | 包装层 eager 算子 |
+|---|---|
+| l2norm_fwd ×2 | `empty_like(x)` 输出 + `empty((T,),f32)` rstd（经 `view(-1,D)` 二维形） |
+| l2norm_bwd ×2 | `empty_like` dx |
+| chunk_local_cumsum ×2 | `empty_like(g)` 输出 |
+| kkt | `beta/g.transpose(1,2).contiguous()` ×2 + `A=torch.empty(B,T,H,BT,f32)`（gk=None 分支） |
+| solve_tril | `zeros_like(A, dtype=k.dtype)`（填充） |
+| recompute_w_u_fwd ×2 | `g/beta.transpose(1,2).contiguous()` ×2 + `empty_like` w/u ×2 |
+| fwd_h ×2 | `k.new_empty(B,NT,H,K,V).permute.contiguous()` + `empty_like(u).permute.contiguous()` v_new + `k/w/u/g.permute.contiguous()` 入 ×4 + `h/v_new.permute.contiguous()` 出 ×2（训练无 final_state） |
+| fwd_o | `empty_like(v)` o + `g.transpose(1,2).contiguous()` + `h.contiguous()` |
+| bwd_dv_local | `g.transpose(1,2).contiguous()` + `empty_like(do)` |
+| bwd_dhu | `q.new_empty(B,NT,H,K,V)` dh + `empty_like(dv)` dv2 + `g.permute(0,2,1).contiguous()` |
+| bwd_dqkwg | `empty_like` dq/dk/dw ×3 + `empty(1,*g.shape,f32)` dg + `g.transpose(1,2).contiguous()` + 后处理 `dg.sum(0)` + `dg.transpose(1,2).contiguous()` |
+| prepare_wy_repr_bwd | `beta.transpose(1,2).contiguous()` + `empty_like` dk/dv/db/dg ×4 |
+| 包装函数 | `dk.add_(dk2)`/`dg.add_(dg2)` + 输出 cast ×5（fwd `o.to(q.dtype)`） |
+
+2 层口径 GDN 桶增量：new_empty 3（fwd1+bwd2）、empty_like 22、empty 4、
+zeros_like 1、clone 9→37（布局搬运）、sum +1（dg.sum(0)）；comm/gmm/triton 序列
+不变。shape 说明：g 族的布局转换按模块 [B,T,H] 约定记录（参考版的转置舞步产生
+等价的算子类型/数量，钉住的参考版与服务器版中间 stride 可能不同）。
+
+### 管理方清单对照状态
+
+- **newempty** ✓（new_empty ×3 + empty_like/empty 全套）
+- **dtypecast** ✓（cast 链已在流；empty_like(dtype=f32) 类隐式转换也已入）
+- **zerolnplace（零填充）** 部分 ✓：solve_tril 的 `zeros_like` 已入；若指显式
+  `aten.zero_`，钉住参考版无此调用（疑为服务器版 `new_zeros` 分解），需服务器源
+  确认
+- **divinplace / catoutout** ✗：钉住参考版（/tmp/opencode/MindSpeed）无 `div_`
+  与 `cat(out=)`（唯一 cat 在 chunk_o.py:634 的 padding 分支，16384%64==0 不触发）；
+  需要服务器 mindspeed/ops/triton 源码或实测算子行（raw_op_type+module_path+shape）
+  才能精确落位
+
+### swiglu 前反向核查（管理方同轮反馈）
+
+两路径均有记录、无缺失证据：EP eager（实测 dispatcher 路径）= chunk + silu + mul
+前向 + silu_backward + mul×2 反向（CSV experts 桶可见）；非 EP（实测 modeling
+`npu_swiglu` 融合）= `npu.npu_swiglu` + `npu.npu_swiglu_backward` 虚拟算子对。
+请管理方指认缺失出现的具体 module_path/shape 以便定位。

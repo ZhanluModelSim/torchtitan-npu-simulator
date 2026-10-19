@@ -9,7 +9,10 @@ The production path (``use_triton_gdn=True``) binds
 ``mindspeed_llm.tasks.models.transformer.chunk_gated_delta_rule`` which
 launches one triton-ascend kernel per stage instead of the eager torch
 fallback. This shim records each kernel in the exact production order
-with analytically-derived shapes (mirrors kda_shim.py pattern):
+(mirrors kda_shim.py pattern) AND executes the wrapper-level eager ops the
+reference triton wrappers perform around every kernel, because those are
+real captured device work on NPU (allocations, layout contiguous copies,
+fills, reductions, casts):
 
 forward:  l2norm_fwd(q) l2norm_fwd(k) chunk_local_cumsum
           chunk_scaled_dot_kkt_fwd solve_tril recompute_w_u_fwd
@@ -18,6 +21,37 @@ backward: recompute_w_u_fwd chunk_gated_delta_rule_fwd_h chunk_bwd_dv_local
           chunk_gated_delta_rule_bwd_dhu chunk_bwd_dqkwg
           prepare_wy_repr_bwd add_(dk2) add_(dg2) chunk_local_cumsum(reverse)
           l2norm_bwd(q) l2norm_bwd(k) + output dtype casts
+
+Per-stage wrapper-level ops mirrored from ``mindspeed.ops.triton``:
+- l2norm_fwd/bwd: ``empty_like(x)`` output + ``empty((T,), f32)`` rstd
+  (bwd: ``empty_like`` dx only), driven through ``view(-1, D)`` 2D form
+- chunk_local_cumsum: ``empty_like(g, dtype=...)`` output
+- chunk_scaled_dot_kkt_fwd: ``beta/g.transpose(1,2).contiguous()`` +
+  ``A = torch.empty(B,T,H,BT)`` (gk=None branch)
+- solve_tril: ``Ai = torch.zeros_like(A, dtype=k.dtype)``
+- recompute_w_u_fwd: ``g/beta.transpose(1,2).contiguous()`` +
+  ``w/u = torch.empty_like(k/v)``
+- chunk_gated_delta_rule_fwd_h: ``h = k.new_empty(B,NT,H,K,V).permute.contiguous()``,
+  ``v_new = empty_like(u).permute.contiguous()``,
+  ``k/w/u/g.permute.contiguous()`` layout copies in, ``h/v_new.permute.contiguous()``
+  layout copies out (``output_final_state=False`` in training: no final_state)
+- chunk_fwd_o: ``o = empty_like(v)``, ``g.transpose(1,2).contiguous()``,
+  ``h.contiguous()``
+- chunk_bwd_dv_local: ``g.transpose(1,2).contiguous()``, ``dv = empty_like(do)``
+- chunk_gated_delta_rule_bwd_dhu: ``dh = q.new_empty(B,NT,H,K,V)``,
+  ``dv2 = empty_like(dv)``, ``g.permute(0,2,1).contiguous()``
+- chunk_bwd_dqkwg: ``dq/dk/dw = empty_like(q/k/w)``,
+  ``dg = torch.empty(NK,*g.shape, f32)``, ``g.transpose(1,2).contiguous()``,
+  post-kernel ``dg.sum(0)`` + ``dg.transpose(1,2).contiguous()``
+- prepare_wy_repr_bwd: ``beta.transpose(1,2).contiguous()`` +
+  ``dk/dv/db/dg = empty_like`` x4
+- ChunkGatedDeltaRuleFunction: ``dk.add_(dk2)``, ``dg.add_(dg2)``,
+  output casts ``dq/dk/dv/dg/db .to(...)``
+
+Shape note: the g-family layout conversions are recorded with the module's
+``[B,T,H]`` convention (the reference's in-wrapper transpose dance produces
+equivalent op types/counts; exact intermediate strides differ between the
+pinned reference and the server build).
 """
 
 from __future__ import annotations
@@ -26,7 +60,6 @@ import torch
 
 from torchtitan_npu.models.qwen3_next.gated_deltanet import GatedDeltaNet
 from torchtitan_npu.simulator.capture.dispatch_capture import get_active_capture
-from torchtitan_npu.simulator.synthetic_ac import run_synthetic_op
 
 _GDN_SHIM_MARKER = "_simulator_gdn_shim_installed"
 
@@ -39,27 +72,68 @@ def _record(raw_op_type: str, inputs: list[torch.Tensor], outputs: list[torch.Te
         capture.record_synthetic_op(raw_op_type, inputs=inputs, outputs=outputs, module_path=module_path)
 
 
-def _uncaptured_empty(*shape, dtype=torch.float32, device=None) -> torch.Tensor:
-    capture = get_active_capture()
-    if capture is None:
-        return torch.empty(*shape, dtype=dtype, device=device)
-    with capture.suspend_recording():
-        return torch.empty(*shape, dtype=dtype, device=device)
-
-
-def _uncaptured_empty_like(tensor: torch.Tensor) -> torch.Tensor:
-    capture = get_active_capture()
-    if capture is None:
-        return torch.empty_like(tensor)
-    with capture.suspend_recording():
-        return torch.empty_like(tensor)
-
-
 def _current_module_path() -> str:
     capture = get_active_capture()
     if capture is not None and capture.module_path_tracker is not None:
         return capture.module_path_tracker.current_path()
     return ""
+
+
+def _l2norm_fwd(x: torch.Tensor, module_path: str) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reference ``l2norm_fwd``: 2D view, empty_like output, empty f32 rstd."""
+    x2d = x.view(-1, x.shape[-1])
+    y2d = torch.empty_like(x2d)
+    rstd = torch.empty((x2d.shape[0],), dtype=torch.float32, device=x.device)
+    _record(
+        f"{_TRITON}.l2norm_fwd",
+        [x],
+        [y2d.view(x.shape), rstd.view(x.shape[:-1])],
+        module_path,
+    )
+    return y2d.view(x.shape), rstd.view(x.shape[:-1])
+
+
+def _l2norm_bwd(y: torch.Tensor, rstd: torch.Tensor, dy: torch.Tensor, module_path: str) -> torch.Tensor:
+    """Reference ``l2norm_bwd``: 2D views + empty_like dx."""
+    y2d = y.view(-1, y.shape[-1])
+    dy2d = dy.view(-1, dy.shape[-1])
+    dx2d = torch.empty_like(y2d)
+    _record(f"{_TRITON}.l2norm_bwd", [y, rstd, dy], [dx2d.view(y.shape)], module_path)
+    return dx2d.view(y.shape)
+
+
+def _recompute_w_u(k: torch.Tensor, v: torch.Tensor, beta: torch.Tensor, a: torch.Tensor,
+                   g_cs: torch.Tensor, module_path: str) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reference ``recompute_w_u_fwd`` wrapper: g/beta contiguous + empty_like w/u."""
+    g_c = g_cs.transpose(1, 2).contiguous()
+    beta_c = beta.transpose(1, 2).contiguous()
+    w = torch.empty_like(k)
+    u = torch.empty_like(v)
+    _record(f"{_TRITON}.recompute_w_u_fwd", [k, v, beta_c, a, g_c], [w, u], module_path)
+    return w, u
+
+
+def _fwd_h(k: torch.Tensor, w: torch.Tensor, u: torch.Tensor, g_cs: torch.Tensor,
+           nc: int, module_path: str) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reference ``chunk_gated_delta_rule_fwd_h`` wrapper: new_empty h +
+    empty_like v_new with permute/contiguous layout copies in and out."""
+    b, t, h, kd = k.shape
+    vd = u.shape[-1]
+    h_state = k.new_empty(b, nc, h, kd, vd).permute(0, 2, 1, 3, 4).contiguous()
+    v_new = torch.empty_like(u).permute(0, 2, 1, 3).contiguous()
+    k_c = k.permute(0, 2, 1, 3).contiguous()
+    w_c = w.permute(0, 2, 1, 3).contiguous()
+    u_c = u.permute(0, 2, 1, 3).contiguous()
+    g_c = g_cs.permute(0, 2, 1).contiguous()
+    _record(
+        f"{_TRITON}.chunk_gated_delta_rule_fwd_h",
+        [k_c, w_c, u_c, g_c],
+        [h_state, v_new],
+        module_path,
+    )
+    h_state = h_state.permute(0, 2, 1, 3, 4).contiguous()
+    v_new = v_new.permute(0, 2, 1, 3).contiguous()
+    return h_state, v_new
 
 
 class _SimTritonChunkGatedDeltaRuleFn(torch.autograd.Function):
@@ -73,37 +147,36 @@ class _SimTritonChunkGatedDeltaRuleFn(torch.autograd.Function):
         nc = (t + chunk_size - 1) // chunk_size
         dev = q.device
 
-        q_norm = _uncaptured_empty_like(q)
-        q_rstd = _uncaptured_empty(b, t, h, 1, device=dev)
-        _record(f"{_TRITON}.l2norm_fwd", [q], [q_norm, q_rstd], module_path)
-        k_norm = _uncaptured_empty_like(k)
-        k_rstd = _uncaptured_empty(b, t, h, 1, device=dev)
-        _record(f"{_TRITON}.l2norm_fwd", [k], [k_norm, k_rstd], module_path)
+        q_norm, q_rstd = _l2norm_fwd(q, module_path)
+        k_norm, k_rstd = _l2norm_fwd(k, module_path)
 
-        g_cs = _uncaptured_empty(b, t, h, device=dev)
+        g_cs = torch.empty_like(g)
         _record(f"{_TRITON}.chunk_local_cumsum", [g], [g_cs], module_path)
-        a = _uncaptured_empty(b, nc, h, chunk_size, chunk_size, device=dev)
-        _record(f"{_TRITON}.chunk_scaled_dot_kkt_fwd", [k_norm, g_cs, beta], [a], module_path)
-        _record(f"{_TRITON}.solve_tril", [a], [a], module_path)
-        w = _uncaptured_empty(b, t, h, kd, device=dev)
-        u = _uncaptured_empty(b, t, h, vd, device=dev)
-        _record(f"{_TRITON}.recompute_w_u_fwd", [k_norm, v, beta, a, g_cs], [w, u], module_path)
-        h_state = _uncaptured_empty(b, nc, h, kd, vd, device=dev)
-        v_new = _uncaptured_empty(b, t, h, vd, device=dev)
-        final_state = _uncaptured_empty(b, h, kd, vd, device=dev)
-        _record(
-            f"{_TRITON}.chunk_gated_delta_rule_fwd_h",
-            [k_norm, w, u, g_cs],
-            [h_state, v_new, final_state],
-            module_path,
-        )
-        o = _uncaptured_empty_like(v)
-        _record(f"{_TRITON}.chunk_fwd_o", [q_norm, k_norm, v_new, h_state, g_cs], [o], module_path)
+
+        # kkt (gk=None branch): beta/g contiguous copies + empty A (f32)
+        beta_c = beta.transpose(1, 2).contiguous()
+        g_c = g_cs.transpose(1, 2).contiguous()
+        a = torch.empty(b, t, h, chunk_size, device=dev, dtype=torch.float32)
+        _record(f"{_TRITON}.chunk_scaled_dot_kkt_fwd", [k_norm, g_c, beta_c], [a], module_path)
+
+        # solve_tril: zeros_like with output_dtype=k.dtype
+        ai = torch.zeros_like(a, dtype=k.dtype)
+        _record(f"{_TRITON}.solve_tril", [a], [ai], module_path)
+        a = ai
+
+        w, u = _recompute_w_u(k_norm, v, beta, a, g_cs, module_path)
+        h_state, v_new = _fwd_h(k_norm, w, u, g_cs, nc, module_path)
+
+        # fwd_o: empty_like(v_new) + g transpose-contiguous + h contiguous
+        o = torch.empty_like(v_new)
+        g_c = g_cs.transpose(1, 2).contiguous()
+        h_c = h_state.contiguous()
+        _record(f"{_TRITON}.chunk_fwd_o", [q_norm, k_norm, v_new, h_c, g_c], [o], module_path)
 
         ctx.save_for_backward(q, q_rstd, k, k_rstd, v, g, beta, a, g_cs, w, u, h_state, v_new)
         ctx.module_path = module_path
         ctx.chunk_size = chunk_size
-        return o
+        return o.to(q.dtype)
 
     @staticmethod
     # pyrefly: ignore [bad-override]
@@ -116,62 +189,69 @@ class _SimTritonChunkGatedDeltaRuleFn(torch.autograd.Function):
         nc = (t + chunk_size - 1) // chunk_size
         dev = q.device
 
-        w2 = _uncaptured_empty(b, t, h, kd, device=dev)
-        u2 = _uncaptured_empty(b, t, h, vd, device=dev)
-        _record(f"{_TRITON}.recompute_w_u_fwd", [k, v, beta, a, g_cs], [w2, u2], module_path)
-        h2 = _uncaptured_empty(b, nc, h, kd, vd, device=dev)
-        v_new2 = _uncaptured_empty(b, t, h, vd, device=dev)
-        fs2 = _uncaptured_empty(b, h, kd, vd, device=dev)
-        _record(
-            f"{_TRITON}.chunk_gated_delta_rule_fwd_h",
-            [k, w2, u2, g_cs],
-            [h2, v_new2, fs2],
-            module_path,
-        )
-        dv = _uncaptured_empty(b, t, h, vd, device=dev)
-        _record(f"{_TRITON}.chunk_bwd_dv_local", [q, k, g_cs, do], [dv], module_path)
-        dh = _uncaptured_empty(b, nc, h, kd, vd, device=dev)
-        dh0 = _uncaptured_empty(b, h, kd, vd, device=dev)
+        w2, u2 = _recompute_w_u(k, v, beta, a, g_cs, module_path)
+        h2, v_new2 = _fwd_h(k, w2, u2, g_cs, nc, module_path)
+
+        # bwd_dv_local: g contiguous copy + empty_like dv
+        g_c = g_cs.transpose(1, 2).contiguous()
+        dv = torch.empty_like(do)
+        _record(f"{_TRITON}.chunk_bwd_dv_local", [q, k, g_c, do], [dv], module_path)
+
+        # bwd_dhu: dh new_empty + dv2 empty_like + g contiguous copy
+        dh = q.new_empty(b, nc, h, kd, vd)
+        dv2 = torch.empty_like(dv)
+        g_c = g_cs.permute(0, 2, 1).contiguous()
         _record(
             f"{_TRITON}.chunk_gated_delta_rule_bwd_dhu",
-            [q, k, w2, g_cs, do, dv],
-            [dh, dh0, dv],
+            [q, k, w2, g_c, do, dv],
+            [dh, dv2],
             module_path,
         )
-        dq = _uncaptured_empty(b, t, h, kd, device=dev)
-        dk = _uncaptured_empty(b, t, h, kd, device=dev)
-        dw = _uncaptured_empty(b, t, h, kd, device=dev)
-        dg = _uncaptured_empty(b, t, h, device=dev)
+        dv = dv2
+
+        # bwd_dqkwg: empty_like dq/dk/dw + empty f32 dg (post-g-conversion
+        # shape [1,B,H,T], NK=1) + g contiguous copy, post-kernel sum(0) +
+        # transpose-contiguous landing back on [B,T,H]
+        dq = torch.empty_like(q)
+        dk = torch.empty_like(k)
+        g_c = g_cs.transpose(1, 2).contiguous()
+        dg = torch.empty(1, b, h, t, dtype=torch.float32, device=dev)
+        dw = torch.empty_like(w2)
         _record(
             f"{_TRITON}.chunk_bwd_dqkwg",
-            [q, k, v_new2, w2, g_cs, h2, dv, do, dh],
+            [q, k, v_new2, w2, h2, dv, do, dh],
             [dq, dk, dw, dg],
             module_path,
         )
-        dk2 = _uncaptured_empty(b, t, h, kd, device=dev)
-        dv2 = _uncaptured_empty(b, t, h, vd, device=dev)
-        db = _uncaptured_empty(b, t, h, device=dev)
-        dg2 = _uncaptured_empty(b, t, h, device=dev)
+        dg = dg.sum(0)
+        dg = dg.transpose(1, 2).contiguous()
+
+        # prepare_wy_repr_bwd: beta contiguous copy + empty_like dk/dv/db/dg
+        beta_c = beta.transpose(1, 2).contiguous()
+        dk2 = torch.empty_like(k)
+        dv3 = torch.empty_like(v)
+        db = torch.empty_like(beta)
+        dg2 = torch.empty_like(dg)
         _record(
             f"{_TRITON}.prepare_wy_repr_bwd",
-            [k, v, beta, g_cs, a, dw, dv],
-            [dk2, dv2, db, dg2],
+            [k, v, beta_c, g_cs, a, dw, dv],
+            [dk2, dv3, db, dg2],
             module_path,
         )
+        dv = dv3
         # eager in the reference file: dk.add_(dk2); dg.add_(dg2)
         dk.add_(dk2)
         dg.add_(dg2)
-        dg_cs = _uncaptured_empty(b, t, h, device=dev)
+
+        dg_cs = torch.empty_like(dg)
         _record(f"{_TRITON}.chunk_local_cumsum", [dg], [dg_cs], module_path)
-        dq_raw, dk_raw = dq, dk
-        dq = _uncaptured_empty(b, t, h, kd, device=dev)
-        _record(f"{_TRITON}.l2norm_bwd", [q, q_rstd, dq_raw], [dq], module_path)
-        dk = _uncaptured_empty(b, t, h, kd, device=dev)
-        _record(f"{_TRITON}.l2norm_bwd", [k, k_rstd, dk_raw], [dk], module_path)
+
+        dq = _l2norm_bwd(q, q_rstd, dq, module_path)
+        dk = _l2norm_bwd(k, k_rstd, dk, module_path)
         # eager output casts in the reference file
         dq = dq.to(q.dtype)
         dk = dk.to(k.dtype)
-        dv = dv2.to(v.dtype)
+        dv = dv.to(v.dtype)
         dg = dg_cs.to(g.dtype)
         db = db.to(beta.dtype)
         return dq, dk, dv, dg, db, None, None  # module_path, chunk_size
