@@ -254,11 +254,11 @@ MoETokenPermute 融合算子代表，实测是 eager index copy/select"。核实
 均在 2 层配置上验证，smoketest 流从未与实测 eager 语义对照——修复覆盖了一条
 路径，另一条遗留旧表示，属验证范围缺口。
 
-遗留（需管理方提供实测计数）：transdata/tensormove/transpose/splitV 是 NPU
-aclnn 层对 view 类算子的物化内核（GDN qkvz/ba `torch.split`→splitV、attention
-`chunk(2)`→splitV、`transpose.contiguous()`→transpose+tensormove、非连续布局
-→transdata），我方 meta 采集只记录产生计算的 aten 算子（view 类零记录），
-结构上无法自动出现；如需对齐须按实测计数在对应源点加合成记录。
+收尾结论（管理方确认"这些算子确实需要删除"）：view 类算子折叠是**正确设计**，
+仿真器按 PyTorch 语义建模设备工作——view/split/transpose 只改元数据、零搬运，
+不应入流；NPU 把 split/chunk 物化成 aclnnSplitV、把转置拷贝物化成
+TransData/TensorMove 属于**运行时实现细节**，仿真器不建模。对表时用下述映射
+说明层级差异即可，不补合成记录（详见"已结论"一节）。
 
 # 适配全程回顾（初始实现 → 最终修改）
 
@@ -351,10 +351,14 @@ aclnn 层对 view 类算子的物化内核（GDN qkvz/ba `torch.split`→splitV�
   猴补丁只影响非 EP 分支；管理员检查 #1–#5 全在 2 层配置上验证，smoketest 流从未
   与实测对照。**修复覆盖一条路径、另一条遗留旧表示，属验证范围缺口。**
 
-### 10. 遗留未解（需管理方输入）
-- transdata/tensormove/transpose/splitV：NPU 对 view 类算子的 aclnn 物化内核，meta
-  采集只记录产生计算的 aten 算子（view 类零记录），结构上无法自动出现；对齐需管理方
-  提供实测计数后在源点加合成记录。
+### 10. 布局算子"缺失"（已结论：不是缺陷）
+- 现象：实测 profiler 有 transdata/tensormove/transpose/splitV，我方 CSV 为 0。
+- 甄别：捕获层确实记录了 view 类 op，`fold_metadata_views` 按设计折叠——**该设计
+  正确**（PyTorch 视图语义零设备工作；NPU 侧的 aclnnSplitV/TransData/TensorMove
+  是运行时物化细节，仿真器不建模）。转置拷贝类物化在我方流中本就以
+  `aten.clone/copy_` 存在，按 shape 映射即可。
+- 经历：曾实现源点合成记录（`e42d137`）并验证无副作用，后按决策回退（`b71cc6e`），
+  管理方最终确认"这些算子确实需要删除"。
 - 实测 profiler 中的优化器算子（aclnnMul 等）多数被融合优化器覆盖——对表前先请管理方
   区分反向/前向与优化器来源，避免追错方向。
 
@@ -369,32 +373,35 @@ aclnn 层对 view 类算子的物化内核（GDN qkvz/ba `torch.split`→splitV�
    preset），猴补丁/模块级重绑会静默切换另一条路径的表示。
 6. **验证范围随管理员反馈扩大**：早期只对前向+comm 计数，后期反向 mul、搬运语义
    都要进清单——每轮反馈后把新口径补进本文档。
+7. **先甄别层级再追算子**：实测算子表是 aclnn 内核层，我方是 PyTorch 语义的
+   dispatch 层。同一次调用在两层可以是不同的内核集合（view 类在我方为 0、在实测
+   物化为 SplitV/TransData/TensorMove；clone/copy_ 两层都有）。遇到"缺算子"先做
+   层级映射（clone/copy_ ≙ TensorMove/TransData），再判断是真缺口还是口径差。
 
-## 已知问题（标记，暂不修复）：布局算子节点缺失
+## 已结论：布局算子（view 类）折叠是正确设计，不补节点
 
-**状态：已甄别、修复方案已验证、按决策回退，留待后续统一处理。**
+**最终口径（管理方确认"这些算子确实需要删除"）**：view/split/chunk/transpose/
+reshape 等 16 类前缀（`_METADATA_VIEW_PREFIXES`，op_mapping.py:106）被
+`fold_metadata_views` 折叠是**设计决定，保持不变**。理由：
 
-管理方第五轮反馈指出缺 transdata/tensormove/transpose/splitV，并诊断"图捕获层
-没生成这些布局算子的节点"——甄别结论**正确**：
+- PyTorch 视图语义：共享 storage、只改元数据，零字节搬运、零 FLOPs、无内核；
+- 仿真器建模的是设备工作（内核/通信/内存流量），零工作节点是噪音（80B×48 层
+  每步数千个）；
+- NPU 把部分视图急切物化（split/chunk→aclnnSplitV、转置拷贝→TransData/
+  TensorMove）是**运行时实现细节**，与 PyTorch 语义无关，仿真器不建模。
 
-- 捕获层（`OpDispatchCapture`）记录了所有 view 类 op 并标注 `metadata_view=True`
-  （dispatch_capture.py:835），但 `fold_metadata_views`（trainer.py:373）在导出前
-  折叠——设计假设"view 类不产生设备内核"，对 CPU/meta 成立、对 NPU 不成立
-  （split/chunk 物化为 aclnnSplitV，转置拷贝物化为 TransData/TensorMove）；
-- 因此 CSV 中 split/chunk/transpose/view 为 0，实测侧有。转置拷贝类物化在我方流
-  中以 `aten.clone/copy_` 存在（层级命名差，按 shape 对表）；
-- **kimi_k3 与 deepseek_v4 存在同样缺口**（MLA q/kv 拆分、swiglu chunk、kimi 的
-  CP gather→chunk→select 搬运，均为裸 view op，无特殊处理）——该问题不是
-  qwen3_next 专属。
+对表映射（实测 aclnn 内核 → 我方算子）：
 
-曾实现修复（`e42d137`，已回退）：`record_split_v` 在 qwen3_next 的 4 类源点
-（GDN qkvz/ba split、attention chunk、EP swiglu chunk、loss split）后加
-`npu.aclnn_split_v.default` 合成节点（canonical `split_v`，成本 `_data_move`），
-2 层口径 ×8、smoketest ×10，comm/gmm/elementwise 计数无影响。
+| 实测内核 | 我方流 | 说明 |
+|---|---|---|
+| TensorMove / TransData（转置拷贝） | `aten.clone` / `aten.copy_` | 已存在，按 shape 对表 |
+| SplitV（split/chunk 物化） | 无（有意不建模） | 层级差，非缺口 |
+| Transpose | 无（元数据） | 同上 |
 
-**回退原因**：kimi_k3/deepseek_v4 同样缺失，单改 qwen3_next 会让三个模型的口径
-不一致；统一修复（各模型源点插桩，或改折叠层全局生效）留待与管理方确认实测计数
-后再做。届时两个选项：
-1. 各模型源点插 `record_split_v`（低风险、模型隔离）；
-2. 改捕获/折叠层让 split/chunk 全局不折叠（一处生效，但改变所有模型既有计数，
-   需全量重验）。
+历史：管理方第五轮反馈"缺搬运算子"→ 甄别确认折叠机制（非 MoETokenPermute 归因）
+→ 曾实现源点合成记录（`e42d137`，2 层口径 ×8、smoketest ×10，无副作用）→ 因
+kimi_k3/deepseek_v4 同口径 + 最终确认折叠正确而回退（`b71cc6e`）。
+
+后续若管理方再报"缺搬运算子"：先按上表映射甄别，**不要**默认在源点加合成算子；
+仅当管理方明确要求把 NPU 物化细节建模进流时再启用 `record_split_v` 方案
+（实现已验证，回退提交可恢复）。
