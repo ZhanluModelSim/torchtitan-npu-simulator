@@ -23,7 +23,46 @@
 
 环境要点：容器内跑（本仓无 NPU 也无妨，模拟器走 meta）；先 source CANN
 `set_env.sh`；CPU 验证加 `TORCH_DEVICE_BACKEND_AUTOLOAD=0`；模拟器并行度用
-`NGPU` 环境变量（优先级高于配置默认 world_size）。
+`NGPU` 环境变量（优先级高于配置默认 world_size）。进环境与运行命令见 §12。
+
+## 0.1 开发者上手路径：读什么、怎么驱动 AI
+
+**阅读顺序（开发者开工前按序读完，AI 同样按此顺序建上下文）**：
+
+1. 本指南（工作流总索引 + 每阶段提示词模板 + §11 对话模板实例）；
+2. `docs/feature_guides/new_model_onboarding.md`（各阶段硬性规则）；
+3. `docs/test_guides/model_acceptance.md`（验收判据——决定"什么才算完成"）；
+4. `torchtitan_npu/simulator/hardware_shims/OP_INTERFACE_REFERENCE.md`
+   （阶段 4 前必读：算子建模硬性规则——真名、输入个数判变体、rank 硬解包、
+   meta 安全、autograd 契约、并行化后绑定）；
+5. 先例模型包（kimi_k3 / deepseek_v4 / qwen3_next）：parallelize 写法（TP/EP/
+   FSDP/mxfp8）、state_dict_adapter、单测 `tests/unit_tests/models/test_<model>.py`；
+6. 先例模型的交付物：模型包内 `MODEL_CONTRACT.md` / `OP_REFERENCE.md` /
+   `ZHANLU_HANDOVER.md` + `docs/user-guides/simulator/<model>-*-alignment.md`
+   的"适配全程回顾"章节（先读再开工，避免重踩）。
+
+**如何用 skill 驱动 AI**：
+
+- AI 侧技能名 `torchtitan-npu-model-adapt`，位于
+  `~/.config/opencode/skills/torchtitan-npu-model-adapt/`（换机器需要拷贝该目录）。
+  对话中出现"适配 xx 模型到 titan 模拟器 / 参照 MindSpeed 移植模型 / 新增模型
+  preset"即自动加载；也可以在提示词里显式要求"先读 SKILL.md 的坑清单再动手"。
+- skill 内容 = 工作流程 + 28 条已知坑（实测对齐教训沉淀）+ 实例参考；它不替代
+  上面 6 步阅读，而是把踩过的坑前置到 AI 上下文。
+- 开发者要做的事：按 §11 模板把字段填全发给 AI（尤其"实测算子流"字段——
+  有就给路径，没有就写明，不许 AI 自行臆测口径），然后逐项裁决 AI 提出的
+  sketch/reference 差异表；验证口径（ep/AC/配置名）在开工时写死。
+
+**每个模型的固定产出物（阶段 7 结束时必须齐全）**：
+
+| 产出 | 位置 |
+| --- | --- |
+| 模型契约（参数量公式/支持矩阵/偏差/验证记录） | `torchtitan_npu/models/<model>/MODEL_CONTRACT.md` |
+| 算子账本（真名/FQN/分 phase 次数/融合边界） | `torchtitan_npu/models/<model>/OP_REFERENCE.md` |
+| 黄区交接说明 | `torchtitan_npu/models/<model>/ZHANLU_HANDOVER.md` |
+| 单测 | `tests/unit_tests/models/test_<model>.py` |
+| 模拟配置（含并行/量化变体） | 模型包 `config_registry.py` + `torchtitan_npu/simulator/config_registry.py` **聚合注册** |
+| 算子流对齐记录（实测对齐类模型） | `docs/user-guides/simulator/<model>-op-stream-alignment.md` |
 
 ## 1. 阶段 1：先分析，后动手
 
@@ -170,3 +209,129 @@ storage dtype 字节数、active peak 的阶段与构成（forward/backward/opti
 
 配套自检：`ZHANLU_DISABLE_PRUNE_OP=1` 跑一次 → 未命中清单对照本模型的
 `OP_REFERENCE.md` → 逐条处理（改名复用 / 补建模 / 确认登记），直到清零。
+
+## 11. 对话模板实例与字段核对清单（qwen3_next 实际填充版）
+
+> 用法：接入下一个新模型时，把本节模板中 `<>` 字段换成新模型的真实信息即可。
+> 每个字段标注了 qwen3_next 适配时的真实取值；当时缺失的信息明确写"本次无"，
+> 不要临场编造。
+
+```text
+参考仓库根目录 torchtitan_training_modeling_guide.md（工作流索引）、
+docs/feature_guides/new_model_onboarding.md（接入规则）、
+docs/test_guides/model_acceptance.md（验收标准），
+接入 <模型名>（<架构一句话>）。
+
+- 结构来源（sketch，定规模和结构）：
+  MindSpeed-LLM 仓内建模代码（管理方指令：模型代码严格按该仓库逐行镜像）
+  <参考 modeling 路径>
+  （背景结构：<HF 官方架构 / 内核参考路径，注明参考版与服务器版可能有差异>）
+
+- 部署参考（只取部署/通信/算子语义）：
+  <部署参考仓 + commit + 实测口径 yaml 及关键并行参数>
+
+- 实测算子流：<有则填 CSV 路径；没有则写"本次无"并说明口径替代来源>
+  接入下个模型时若有实测 kernel_summary CSV，在此填路径。
+
+- 支持矩阵：
+  <必须支持的并行/量化组合；v1 不实现的维度 fail fast 并写明原因>
+
+- 测试口径（写死，后续不改）：
+  <实测对齐口径、验证主配置、smoketest、量化验证、AC 双覆盖与并行矩阵变体>
+
+- 范围声明：
+  <蓝/黄区分工；commit/推送纪律>
+
+先分析模型特点、列 sketch 与 reference 的差异表给我逐项确认，再动手。
+```
+
+### 字段核对清单（接入新模型时逐项替换）
+
+| 字段 | qwen3_next 本次取值 | 缺失时 |
+| --- | --- | --- |
+| 模型名/架构一句话 | qwen3_next，hybrid 3/4 GDN + 1/4 门控 GQA，全 MoE | 必填 |
+| 结构来源 | MindSpeed-LLM 建模代码（逐行镜像指令） | 必填 |
+| 部署参考 + commit | MindSpeed-LLM @6082e0de fsdp2 + 实测 yaml | 必填 |
+| **实测算子流 CSV** | **本次无**（以管理方逐轮反馈为口径，记录于 `docs/user-guides/simulator/qwen3-next-op-stream-alignment.md`） | 有则填路径，无则写"本次无"+口径替代 |
+| 支持矩阵 | fsdp+ep+tp / mxfp8 必须支持；CP/PP/ETP fail fast | 必填 |
+| 测试口径 | ep=2、`qwen3_next_80b_a3b_2layer` 主配置（AC=none 基线 + full 对照）、smoketest 4 层 ep=2、量化 `qwen3_next_2l_mxfp8`、并行矩阵按验收 §3 | 必填（写死防止中途漂移） |
+| 范围声明 | 蓝区（建模+契约+账本+单测+验收矩阵）；黄区交接用 `ZHANLU_HANDOVER.md`；只本地 commit，确认后再推 | 必填 |
+
+## 12. 开发者手动进环境与模型运行命令
+
+### 12.1 进入环境
+
+```bash
+# 工作副本 bind-mount 关系：宿主机 /home/l30079348/titan-qwen3.5
+#                = 容器内 /opt/torchtitan-npu-simulator（git 分支 qwen3.5）
+# 宿主机上改代码，容器内立即可见；git 操作在宿主机副本做。
+docker exec -it titan-llf bash
+```
+
+```bash
+# 容器内每次新 shell 先 source CANN 环境
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+cd /opt/torchtitan-npu-simulator
+```
+
+### 12.2 运行模拟器（meta 仿真，无需真实 NPU）
+
+```bash
+# 基线：实测对齐主配置（world=2 由 NGPU 指定，优先级高于配置默认值）
+NGPU=2 python3 scripts/run_simulator_spawn.py \
+  --config qwen3_next_80b_a3b_2layer \
+  --simulation.output-formats text,csv
+
+# 并行矩阵变体（验收 §3；world 跟随 NGPU）
+NGPU=2 python3 scripts/run_simulator_spawn.py --config qwen3_next_2l_tp2  --simulation.output-formats text,csv
+NGPU=2 python3 scripts/run_simulator_spawn.py --config qwen3_next_2l_ep2  --simulation.output-formats text,csv
+NGPU=2 python3 scripts/run_simulator_spawn.py --config qwen3_next_2l_fsdp2 --simulation.output-formats text,csv
+NGPU=4 python3 scripts/run_simulator_spawn.py --config qwen3_next_2l_tp2ep2 --simulation.output-formats text,csv
+NGPU=4 python3 scripts/run_simulator_spawn.py --config qwen3_next_2l_fsdp2ep2 --simulation.output-formats text,csv
+NGPU=8 python3 scripts/run_simulator_spawn.py --config qwen3_next_2l_tp2ep2fsdp2 --simulation.output-formats text,csv
+
+# AC 开启对照（与上面同配置追加一个参数）
+NGPU=2 python3 scripts/run_simulator_spawn.py --config qwen3_next_2l_fsdp2 \
+  --simulation.output-formats text,csv --activation-checkpoint.mode full
+
+# 量化变体（单卡）
+NGPU=1 python3 scripts/run_simulator_spawn.py --config qwen3_next_2l_mxfp8 \
+  --simulation.output-formats text,csv
+
+# 调试小配置（快速冒烟，~1 分钟）
+NGPU=2 python3 scripts/run_simulator_spawn.py --config qwen3_next_smoketest \
+  --simulation.output-formats text,csv
+```
+
+配置名解析自 `torchtitan_npu/simulator/config_registry.py`（聚合注册表，
+新增配置必须在此登记，否则报 "Config function not found"）。
+
+### 12.3 输出物位置
+
+```text
+simulator_output/<config名>/
+├── summary.txt                     # 一步训练汇总（loss/吞吐/时间线）
+├── kernel_summary/rank_*.csv       # 算子账本（raw_op_type/module_path/phase/shape）
+├── memory/memory_summary.json      # 显存分解（persistent/active peak/分阶段）
+├── comm/                           # 通信事件（类型/字节/依赖）
+└── ir_export/                      # 依赖 DAG 导出
+```
+
+字段语义详见 [输出与内存](docs/user-guides/simulator/outputs.md)。
+
+### 12.4 单元测试
+
+```bash
+cd /opt/torchtitan-npu-simulator
+python3 -m pytest tests/unit_tests/models/test_qwen3_next.py -q   # 29 项
+```
+
+### 12.5 注意事项
+
+- **GPU 资源**：模拟器走 meta 设备，NGPU 只是逻辑并行度，不需要真实 NPU；
+  CPU 环境跑仓库通用验证时加 `TORCH_DEVICE_BACKEND_AUTOLOAD=0`。
+- **推送规则**：宿主机副本 commit 后不自动推送；确认后由用户明确指示推送
+  （远程 `qwen3.5:qwen3.5`）。
+- **黄区**：湛卢接入见模型包内 `ZHANLU_HANDOVER.md`，蓝区环境不执行。
+- 仓内既有 5 个单测失败（kimi overrides ×4、multimodal 资产 ×1）与
+  qwen3_next 无关，接入前即失败。
