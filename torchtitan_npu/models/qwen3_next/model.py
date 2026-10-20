@@ -146,11 +146,6 @@ class Qwen3NextModel(Decoder):
                         debug.moe_force_load_balance
                     )
 
-            if parallelism.tensor_parallel_degree > 1:
-                raise NotImplementedError(
-                    "Qwen3-Next tensor parallelism is not implemented yet; "
-                    "use TP=1 with FSDP/EP for now."
-                )
             if parallelism.context_parallel_degree > 1:
                 raise NotImplementedError(
                     "Qwen3-Next context parallelism is not implemented yet."

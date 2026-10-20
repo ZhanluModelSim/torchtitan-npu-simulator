@@ -14,6 +14,7 @@ from torchtitan.protocols.model_spec import ModelSpec
 
 from .model import Qwen3NextModel, Qwen3NextTransformerBlock
 from .parallelize import parallelize_qwen3_next
+from .state_dict_adapter import Qwen3NextStateDictAdapter
 
 __all__ = [
     "parallelize_qwen3_next",
@@ -285,5 +286,5 @@ def model_registry(flavor: str) -> ModelSpec:
         pipelining_fn=pipeline_llm,
         build_loss_fn=build_qwen3_next_chunk_loss,
         post_optimizer_build_fn=None,
-        state_dict_adapter=None,
+        state_dict_adapter=Qwen3NextStateDictAdapter,
     )

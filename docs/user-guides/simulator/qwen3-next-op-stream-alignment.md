@@ -481,3 +481,43 @@ smoketest ep=2 流：AG 26 / A2A 16 / RS 11 / AR 3；GDN 算子按 3 层正确�
 
 仍待服务器信息：divinplace / catoutout / 显式 zero_ 不在钉住参考版，需服务器
 mindspeed/ops/triton 源码或实测算子行落位。
+
+## 文档审计补齐：并行（fsdp+ep+tp）、量化、验收矩阵（蓝区范围）
+
+按《torchtitan_training_modeling_guide》+ onboarding + acceptance 三份文档审计
+后补齐（湛卢/黄区工作显式排除）：
+
+**TP + 序列并行（v1 支持 fsdp+ep+tp）**：llama3 风格计划。关键可行性依据：
+fused qkvz 输出按 k-head 连续块布局（view 成 `(num_k_heads, 2·head_k + 2·ratio·head_v)`）、
+q+gate 同理——`num_k_heads/n_kv_heads % tp == 0` 时均匀 dim-0 colwise 天然整块
+对齐，无需自定义 grouped 边界。每 rank 更新 head 属性（n_heads/n_kv_heads/
+num_k_heads/num_v_heads/key_dim/value_dim），conv1d/dt_bias/A_log 手工按
+tp chunk。norms SequencePartial→SequenceParallel；rowwise 输出显式
+`Shard(1)`（reduce-scatter 融合，torch SequenceParallel 期望输入已分片）。
+ETP/CP/PP 显式 fail fast。
+
+**TP 调试修掉的四个坑**：
+1. `comm_events._resolve_world_size/_resolve_comm_ranks` 对无具体 group 的
+   default-collective context 无限递归（TP funcol 路径触发）——递归前判
+   context group 具体性。
+2. 无 FSDP/replicate 包装时（tp-only、tp+ep、单卡 mxfp8）没人做 mp cast，
+   meta 模型保持 fp32，NPU 算子契约拒绝——parallelize 通用分支 cast。
+3. 模拟器约定：**TP 钩子可有意返回 plain tensor，流中间以 plain local 为主**
+   （meta_env `_patch_from_local_backward_for_meta` 专为 plain 梯度兜底）。
+   moe 输出必须保持 plain；`to_local(grad_placements=(Partial(),))` 是
+   ep-only 时代针对隐式重包的补丁，TP 下与 `_FromTorchTensorBackward` 组合
+   产生形状错乱（4096 vs 8192）——改为裸 `to_local()`。
+4. TP 下 lm_head 入口 `full_tensor()` 一次 AG gather（chunked loss 需全词表
+   本地 logits；MindSpeed 实测 tp=1 无 vocab-parallel 证据，契约声明偏差）。
+
+**量化（mxfp8）**：`MXFP8Converter.Config(mxfp8_rceil)`，FQN 子串匹配语义下
+必须精确到 `moe.shared_expert.gate_proj` 级别（`shared_expert` 会子串命中
+`shared_expert_gate`）；router gate 配置命中即 fail fast；routed experts
+（裸参数 + `torch._grouped_mm`）范围外，bf16 契约声明。quant 算子入账：
+`npu_dynamic_mx_quant`/`npu_quant_matmul`。
+
+**验收矩阵**：8 个 sim 配置变体（_tp2/_ep2/_fsdp2/_tp2ep2/_fsdp2ep2/
+_tp2ep2fsdp2/_mxfp8 + 既有）全部 exit=0，AC none/full 双覆盖；显存
+TP/FSDP 维度单调下降 ✓；EP 维度 persistent 记账未随 EP 再减（公共模拟器
+观察项，契约 §5.2）。单测 29 项（参数量公式精确断言、fail-fast、mxfp8
+守卫）。MODEL_CONTRACT.md / OP_REFERENCE.md 沉淀在模型包目录。

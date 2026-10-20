@@ -5,22 +5,32 @@
 
 """Distributed parallelization for Qwen3-Next.
 
-Initial support matrix (v1):
+Support matrix (v1):
+- Tensor parallelism with sequence parallelism for the non-MoE path
+  (attention / GDN projections + norms + embedding + lm_head)
+- Expert parallelism for the routed MoE experts (routed experts stay
+  replicated across the TP mesh; ETP is rejected)
 - FSDP / eFSDP data parallel sharding (via upstream ``apply_fsdp``)
-- Expert parallelism for the routed MoE experts
 - DP replicate
 - Full / selective activation checkpointing
 
-TP / CP / PP raise ``NotImplementedError`` until the fused qkvz grouped
-sharding boundary is implemented.
+CP / PP raise ``NotImplementedError`` (out of the declared v1 support
+matrix).
 """
 
 import logging
+from typing import Any
 
 import torch
 from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
-from torch.distributed.tensor import Shard
-from torch.distributed.tensor.parallel import parallelize_module  # noqa: F401
+from torch.distributed.tensor import Replicate, Shard
+from torch.distributed.tensor.parallel import (
+    ColwiseParallel,
+    PrepareModuleInput,
+    RowwiseParallel,
+    SequenceParallel,
+    parallelize_module,
+)
 from torchtitan.config import (
     TORCH_DTYPE_MAP,
     ActivationCheckpointConfig,
@@ -35,9 +45,137 @@ from torchtitan.protocols import ModelConvertersContainer
 
 from torchtitan_npu.models.common.activation_checkpoint import apply_moe_ac
 
+from .gated_deltanet import GatedDeltaNet
 from .model import Qwen3NextModel
 
 logger = logging.getLogger(__name__)
+
+
+def _check_tp_divisibility(model: Qwen3NextModel, tp_size: int) -> None:
+    """The fused qkvz / q+gate layouts are contiguous per-head blocks, so a
+    uniform dim-0 column shard aligns exactly iff every head count divides."""
+    for layer in model.layers.values():
+        mixer = layer.token_mixer
+        if isinstance(mixer, GatedDeltaNet):
+            for name in ("num_k_heads", "num_v_heads"):
+                if getattr(mixer, name) % tp_size != 0:
+                    raise ValueError(
+                        f"GDN {name}={getattr(mixer, name)} must be divisible "
+                        f"by TP degree={tp_size}"
+                    )
+        else:
+            for name in ("n_heads", "n_kv_heads"):
+                if getattr(mixer, name) % tp_size != 0:
+                    raise ValueError(
+                        f"Attention {name}={getattr(mixer, name)} must be "
+                        f"divisible by TP degree={tp_size}"
+                    )
+
+
+def _apply_tensor_parallel(model: Qwen3NextModel, tp_mesh, tp_size: int) -> None:
+    """Apply TP + sequence parallelism to the non-MoE path.
+
+    Mirrors the llama3-style plan: the residual stream travels as
+    ``Shard(1)`` (sequence parallel), the row-parallel projections
+    reduce-scatter their partial outputs back to ``Shard(1)``, and the
+    token mixers gather to ``Replicate`` before their column-parallel
+    projections.
+    The fused ``q_proj`` (q|gate) and GDN ``in_proj_qkvz`` / ``in_proj_ba``
+    outputs are contiguous per-head blocks, so a uniform dim-0 column
+    shard keeps whole heads per rank; the per-rank head attributes are
+    updated accordingly. The depthwise ``conv1d`` / ``dt_bias`` / ``A_log``
+    are sharded manually along their head/channel dim. The routed experts
+    stay replicated across the TP mesh (pure EP); the router gate is
+    replicated. The lm_head is column-parallel with a replicated output
+    (all-gather modeled), matching the MindSpeed vocab-parallel head
+    semantics; the loss stays on the full-vocab local logits.
+    """
+    from torch.distributed.device_mesh import DeviceMesh
+
+    assert isinstance(tp_mesh, DeviceMesh)
+    _check_tp_divisibility(model, tp_size)
+
+    parallelize_module(
+        model,
+        tp_mesh,
+        {
+            "tok_embeddings": RowwiseParallel(
+                input_layouts=Replicate(),
+                output_layouts=Shard(1),
+            ),
+            "norm": SequenceParallel(),
+            # The lm_head stays unwrapped: MindSpeed vocab-parallel head has
+            # no measured tp>1 baseline, and the chunked loss needs
+            # full-vocab logits. ``_lm_head_forward`` replicate-wraps the
+            # weight for DTensor inputs (documented in the model contract).
+        },
+    )
+
+    for layer in model.layers.values():
+        mixer = layer.token_mixer
+        layer_plan: dict[str, Any] = {
+            "attention_norm": SequenceParallel(),
+            "ffn_norm": SequenceParallel(),
+            "token_mixer": (
+                PrepareModuleInput(
+                    input_layouts=(Shard(1), None, None),
+                    desired_input_layouts=(Replicate(), None, None),
+                )
+                if not isinstance(mixer, GatedDeltaNet)
+                else PrepareModuleInput(
+                    input_layouts=(Shard(1),),
+                    desired_input_layouts=(Replicate(),),
+                )
+            ),
+        }
+        if isinstance(mixer, GatedDeltaNet):
+            layer_plan.update(
+                {
+                    "token_mixer.in_proj_qkvz": ColwiseParallel(),
+                    "token_mixer.in_proj_ba": ColwiseParallel(),
+                    "token_mixer.out_proj": RowwiseParallel(
+                        output_layouts=Shard(1)
+                    ),
+                }
+            )
+        else:
+            layer_plan.update(
+                {
+                    "token_mixer.q_proj": ColwiseParallel(),
+                    "token_mixer.k_proj": ColwiseParallel(),
+                    "token_mixer.v_proj": ColwiseParallel(),
+                    "token_mixer.o_proj": RowwiseParallel(
+                        output_layouts=Shard(1)
+                    ),
+                }
+            )
+        parallelize_module(layer, tp_mesh, layer_plan)
+
+        # Per-rank head counts: the projections produce local heads, and the
+        # module views read these attributes for the local shapes.
+        if isinstance(mixer, GatedDeltaNet):
+            mixer.num_k_heads //= tp_size
+            mixer.num_v_heads //= tp_size
+            mixer.key_dim = mixer.head_k_dim * mixer.num_k_heads
+            mixer.value_dim = mixer.head_v_dim * mixer.num_v_heads
+            mixer.conv1d.weight.data = mixer.conv1d.weight.data.chunk(tp_size, dim=0)[
+                tp_mesh.get_local_rank()
+            ]
+            mixer.conv1d.in_channels = mixer.conv1d.out_channels = (
+                mixer.conv1d.weight.data.shape[0]
+            )
+            mixer.conv1d.groups = mixer.conv1d.weight.data.shape[0]
+            mixer.dt_bias.data = mixer.dt_bias.data.chunk(tp_size, dim=0)[
+                tp_mesh.get_local_rank()
+            ]
+            mixer.A_log.data = mixer.A_log.data.chunk(tp_size, dim=0)[
+                tp_mesh.get_local_rank()
+            ]
+        else:
+            mixer.n_heads //= tp_size
+            mixer.n_kv_heads //= tp_size
+
+    logger.info("Applied Qwen3-Next TP + sequence parallelism")
 
 
 def _apply_expert_parallel(model: Qwen3NextModel, ep_mesh) -> None:
@@ -171,14 +309,15 @@ def parallelize_qwen3_next(
     ac_config: ActivationCheckpointConfig,
     dump_folder: str,
 ):
-    """Apply EP, AC, and FSDP/eFSDP to the Qwen3-Next model."""
+    """Apply TP, EP, AC, and FSDP/eFSDP to the Qwen3-Next model."""
     del model_converters
 
-    if parallel_dims.tp_enabled:
+    if parallel_dims.etp_enabled:
         raise NotImplementedError(
-            "Qwen3-Next tensor parallelism is not implemented yet; "
-            "the fused in_proj_qkvz projection requires a grouped-shard "
-            "boundary. Use TP=1 with FSDP/EP for now."
+            "Qwen3-Next expert tensor parallelism is not in the v1 support "
+            "matrix: routed experts are replicated across the TP mesh and "
+            "sharded only along the EP dim (use EP, optionally combined "
+            "with TP)."
         )
     if parallel_dims.cp_enabled:
         raise NotImplementedError(
@@ -188,6 +327,22 @@ def parallelize_qwen3_next(
         raise NotImplementedError(
             "Qwen3-Next pipeline parallelism is not implemented yet."
         )
+
+    # Without a data-parallel wrapper (FSDP/replicate) there is no
+    # MixedPrecisionPolicy to cast the meta-built fp32 parameters to the
+    # deployment param dtype; the NPU op contracts require bf16. Mirror
+    # the deployment dtype directly (e.g. TP-only, TP+EP, or
+    # single-rank no-sharding layouts).
+    if not (
+        parallel_dims.fsdp_enabled
+        or parallel_dims.ep_enabled
+        or parallel_dims.dp_replicate_enabled
+    ):
+        model.to(TORCH_DTYPE_MAP[training.mixed_precision_param])
+
+    tp_mesh = parallel_dims.get_optional_mesh("tp")
+    if tp_mesh is not None:
+        _apply_tensor_parallel(model, tp_mesh, tp_mesh.size())
 
     ep_mesh = parallel_dims.get_optional_mesh("ep")
     if ep_mesh is not None:

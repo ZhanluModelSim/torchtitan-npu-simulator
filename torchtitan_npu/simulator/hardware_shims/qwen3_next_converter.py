@@ -18,7 +18,7 @@ from types import MethodType
 
 import torch
 import torch.nn.functional as F
-from torch.distributed.tensor import DTensor
+from torch.distributed.tensor import DTensor, Replicate
 
 from torchtitan_npu.models.qwen3_next import loss as qwen3_next_loss
 from torchtitan_npu.models.qwen3_next.attention import GatedAttention, RMSNormGated
@@ -419,6 +419,12 @@ def _causal_lm_forward(
     for layer in self.layers.values():
         h = layer(h, self.freqs_cis, attention_masks, positions)
     h = self.norm(h)
+    # Under TP + sequence parallelism the head input is sequence-sharded;
+    # the head stays replicated (no measured tp>1 vocab-parallel baseline,
+    # and the chunked loss needs full-vocab local logits), so gather the
+    # stream once (all-gather) before the two head calls.
+    if isinstance(h, DTensor):
+        h = h.full_tensor()
     # logits_to_keep=0 -> slice(None): the wrapper slices before each
     # head call; the first head call computes full logits whose result
     # is overwritten (dead) by the loss_ctx call.

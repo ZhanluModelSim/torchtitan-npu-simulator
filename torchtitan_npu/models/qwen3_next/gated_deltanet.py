@@ -19,6 +19,7 @@ mindspeed_llm/fsdp2/models/qwen3_next/modeling_qwen3_next.py
 """
 
 import torch
+from torch.distributed.tensor import DTensor
 import torch.nn.functional as F
 from torch import nn
 from dataclasses import dataclass
@@ -247,6 +248,13 @@ class GatedDeltaNet(nn.Module):
         positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
         del rope_cache, positions  # linear attention does not use RoPE
+        # Under TP the mixer input is a replicated DTensor and the fused
+        # projections produce per-rank head shards; the sharded GDN core
+        # (local head counts) runs on plain local tensors, and the
+        # row-parallel out_proj re-wraps the local output for the residual
+        # stream.
+        if isinstance(hidden_states, DTensor):
+            hidden_states = hidden_states.to_local()
         batch_size, seq_len, _ = hidden_states.shape
 
         projected_states_qkvz = self.in_proj_qkvz(hidden_states)

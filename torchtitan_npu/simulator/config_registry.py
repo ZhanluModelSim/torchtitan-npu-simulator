@@ -185,15 +185,28 @@ def kimi_k3_smoketest() -> KimiK3SimulationTrainerConfig:
 from torchtitan_npu.models.qwen3_next import config_registry as _qwen3_next_configs
 
 
+@dataclasses.dataclass(kw_only=True, slots=True)
+class Qwen3NextSimulationTrainerConfig(SimulationTrainerConfig):
+    """Qwen3-Next simulator config with MXFP8 FQN CLI overrides."""
+
+    mxfp8_fqns: list[str] | None = None
+
+    def __post_init__(self) -> None:
+        _qwen3_next_configs._apply_mxfp8_fqns_override(
+            self.model_converters,
+            self.mxfp8_fqns,
+        )
+
+
 def _qwen3_next_simulation_config(
     factory: Callable[[], TrainerConfig],
     *,
     output_name: str,
-) -> SimulationTrainerConfig:
+) -> Qwen3NextSimulationTrainerConfig:
     base_config = factory()
     base_fields = {field.name: getattr(base_config, field.name) for field in dataclasses.fields(base_config)}
     base_fields["compile"] = dataclasses.replace(base_config.compile, enable=False)
-    return SimulationTrainerConfig(
+    return Qwen3NextSimulationTrainerConfig(
         **base_fields,
         simulation=SimulationConfig(output_dir=f"./simulator_output/{output_name}"),
     )
@@ -217,4 +230,53 @@ def qwen3_next_80b_a3b_2layer() -> SimulationTrainerConfig:
     return _qwen3_next_simulation_config(
         _qwen3_next_configs.qwen3_next_80b_a3b_2layer,
         output_name="qwen3_next_80b_a3b_2layer",
+    )
+
+
+def qwen3_next_2l_tp2() -> SimulationTrainerConfig:
+    return _qwen3_next_simulation_config(
+        _qwen3_next_configs.qwen3_next_2l_tp2,
+        output_name="qwen3_next_2l_tp2",
+    )
+
+
+def qwen3_next_2l_ep2() -> SimulationTrainerConfig:
+    return _qwen3_next_simulation_config(
+        _qwen3_next_configs.qwen3_next_2l_ep2,
+        output_name="qwen3_next_2l_ep2",
+    )
+
+
+def qwen3_next_2l_fsdp2() -> SimulationTrainerConfig:
+    return _qwen3_next_simulation_config(
+        _qwen3_next_configs.qwen3_next_2l_fsdp2,
+        output_name="qwen3_next_2l_fsdp2",
+    )
+
+
+def qwen3_next_2l_tp2ep2() -> SimulationTrainerConfig:
+    return _qwen3_next_simulation_config(
+        _qwen3_next_configs.qwen3_next_2l_tp2ep2,
+        output_name="qwen3_next_2l_tp2ep2",
+    )
+
+
+def qwen3_next_2l_fsdp2ep2() -> SimulationTrainerConfig:
+    return _qwen3_next_simulation_config(
+        _qwen3_next_configs.qwen3_next_2l_fsdp2ep2,
+        output_name="qwen3_next_2l_fsdp2ep2",
+    )
+
+
+def qwen3_next_2l_tp2ep2fsdp2() -> SimulationTrainerConfig:
+    return _qwen3_next_simulation_config(
+        _qwen3_next_configs.qwen3_next_2l_tp2ep2fsdp2,
+        output_name="qwen3_next_2l_tp2ep2fsdp2",
+    )
+
+
+def qwen3_next_2l_mxfp8() -> SimulationTrainerConfig:
+    return _qwen3_next_simulation_config(
+        _qwen3_next_configs.qwen3_next_2l_mxfp8,
+        output_name="qwen3_next_2l_mxfp8",
     )

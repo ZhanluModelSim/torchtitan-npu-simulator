@@ -511,7 +511,13 @@ class Qwen3NextMoE(nn.Module):
                     "Qwen3-Next MoE expects a 1D TP DTensor input, "
                     f"got {hidden_states.device_mesh.ndim}D"
                 )
-            hidden_states = hidden_states.to_local(grad_placements=(Partial(),))
+            # Plain to_local: the residual stream travels as plain local
+            # tensors between TP style boundaries (the simulator's meta
+            # from_local-backward patch bridges plain grads). The old
+            # grad_placements=(Partial(),) marker only mattered for the
+            # ep-only implicit-rewrap flow and breaks the backward shapes
+            # under TP.
+            hidden_states = hidden_states.to_local()
 
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         hidden_flat = hidden_states.view(-1, hidden_dim)
