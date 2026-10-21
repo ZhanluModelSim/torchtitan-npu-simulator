@@ -87,7 +87,7 @@ $$\gamma_{\text{adjusted}} = 0.18 \times \gamma \times \sqrt{\max(A, B)}$$
 
 **Expert 路径**（`step_experts`）：根据参数的实际 DTensor placement 选择更新方式，不依赖 EP 是否大于 1。
 
-- 仅沿专家维度 `dim0` 切分时，本地专家矩阵完整，继续执行本地 LMO。
+- 仅沿专家维度 `dim0` 切分时，包括 EP+EFSDP 产生的 `_StridedShard(0, ...)`，本地专家矩阵完整，继续执行本地 LMO。`_StridedShard` 在 Torch 2.12 中不是 `Shard` 的子类，分片检查需要显式识别。
 - 在 `efsdp`（EP=1 时也可为 `fsdp`）轴上沿 `dim1` 切分时，在该参数的 EFSDP 子组内执行两轮 `all_to_all_single`。第一轮将矩阵行分片重新分配给完整专家的计算 owner；owner 对完整矩阵做 Muon；第二轮将更新量按原有行分片布局发回。EP 专家归属保持不变，不混合不同 EP 坐标上的专家。
 - 支持不均匀行分片、空行分片和本地专家数少于 EFSDP rank 数的情况。梯度为空的 rank 仍参与通信，但该 rank 不更新参数。动量状态保持原分片布局，checkpoint 格式不变；通信精度使用 `communication_dtype`。
 - 当前矩阵内部的分片仅支持命名为 `efsdp`/`fsdp` 的单个 `Shard(1)` 轴；ETP 等其他矩阵分片组合会明确报错。

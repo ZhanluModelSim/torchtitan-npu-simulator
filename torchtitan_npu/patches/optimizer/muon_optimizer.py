@@ -133,7 +133,8 @@ def _expert_matrix_shard_axis(p, param_name):
     for axis, placement in enumerate(p.placements):
         if isinstance(placement, Replicate):
             continue
-        if not isinstance(placement, Shard):
+        # _StridedShard is a separate placement type in Torch 2.12.
+        if not isinstance(placement, (Shard, _StridedShard)):
             raise ValueError(f"Muon expert {param_name} has unsupported placement {placement}")
         if placement.dim == 0:
             continue

@@ -12,7 +12,8 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.tensor import Replicate, Shard, distribute_tensor
+from torch.distributed.tensor import DTensor, Replicate, Shard, distribute_tensor
+from torch.distributed.tensor.placement_types import _StridedShard
 
 from tests.testing.muon_reshard import check_expert_updates
 from torchtitan_npu.patches.optimizer.muon_optimizer import (
@@ -27,6 +28,9 @@ def _distributed_worker(rank, init_method):
     dist.init_process_group("gloo", rank=rank, world_size=4, init_method=init_method, timeout=timedelta(seconds=90))
     try:
         mesh = init_device_mesh("cpu", (2, 2), mesh_dim_names=("efsdp", "ep"))
+        # FSDP-over-EP uses strided expert ownership, with complete local matrices.
+        check_expert_updates(mesh, (_StridedShard(0, split_factor=2), Shard(0)), (8, 6, 5))
+        check_expert_updates(mesh, (_StridedShard(0, split_factor=2), Shard(0)), (12, 5, 7), transpose=True)
         check_expert_updates(mesh, (Shard(1), Shard(0)), (4, 6, 5))
         # Fewer experts than EFSDP ranks, uneven matrix shards and BF16 transport.
         check_expert_updates(mesh, (Shard(1), Shard(0)), (2, 5, 7), transpose=True, dtype=torch.bfloat16)
@@ -44,6 +48,18 @@ def _distributed_worker(rank, init_method):
         parameter = distribute_tensor(torch.ones(4, 8, 5), invalid_mesh, (Shard(1),))
         with pytest.raises(ValueError, match="expert tensor parallelism"):
             _expert_matrix_shard_axis(parameter, "moe.experts.w1")
+
+        # Recognizing strided expert ownership must not enable strided matrix shards.
+        invalid_parameter = DTensor.from_local(
+            torch.ones(2, 2, 5),
+            init_device_mesh("cpu", (4,), mesh_dim_names=("efsdp",)),
+            (_StridedShard(1, split_factor=2),),
+            shape=torch.Size((2, 8, 5)),
+            stride=(40, 5, 1),
+            run_check=False,
+        )
+        with pytest.raises(ValueError, match="expert tensor parallelism"):
+            _expert_matrix_shard_axis(invalid_parameter, "moe.experts.w1")
     finally:
         dist.destroy_process_group()
 

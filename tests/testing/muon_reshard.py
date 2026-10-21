@@ -6,12 +6,15 @@
 """Shared CPU/NPU numerical oracle for expert Muon redistribution."""
 
 from copy import deepcopy
+from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
-from torch.distributed.tensor import distribute_tensor
+from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor import Shard, distribute_tensor
+from torch.distributed.tensor.placement_types import _StridedShard
 
 from torchtitan_npu.patches.optimizer.muon_optimizer import DistributedMuon, _expert_matrix_shard_axis
 
@@ -93,3 +96,31 @@ def check_expert_updates(mesh, placements, shape, *, transpose=False, dtype=torc
     parameter.grad = None
     optimizer.step()
     torch.testing.assert_close(parameter.full_tensor().cpu(), reference.cpu(), rtol=0, atol=0)
+
+
+def run_npu_expert_matrix_worker(rank, init_method):
+    """Use an importable worker module so pytest import mode does not affect spawn."""
+    torch.npu.set_device(rank)
+    torch.npu.matmul.allow_hf32 = False
+    dist.init_process_group("hccl", rank=rank, world_size=2, init_method=init_method, timeout=timedelta(seconds=90))
+    try:
+        mesh = init_device_mesh("npu", (2,), mesh_dim_names=("fsdp",))
+        check_expert_updates(mesh, (Shard(1),), (4, 8, 16))
+        check_expert_updates(mesh, (Shard(1),), (1, 5, 7), transpose=True, dtype=torch.bfloat16)
+        torch.npu.synchronize()
+    finally:
+        dist.destroy_process_group()
+
+
+def run_npu_expert_strided_worker(rank, init_method):
+    torch.npu.set_device(rank)
+    torch.npu.matmul.allow_hf32 = False
+    dist.init_process_group("hccl", rank=rank, world_size=4, init_method=init_method, timeout=timedelta(seconds=90))
+    try:
+        mesh = init_device_mesh("npu", (2, 2), mesh_dim_names=("efsdp", "ep"))
+        placements = (_StridedShard(0, split_factor=2), Shard(0))
+        check_expert_updates(mesh, placements, (8, 8, 16))
+        check_expert_updates(mesh, placements, (12, 5, 7), transpose=True)
+        torch.npu.synchronize()
+    finally:
+        dist.destroy_process_group()
