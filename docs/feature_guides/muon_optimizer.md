@@ -194,6 +194,17 @@ optimizer = OptimizerConfig(
 
 如果同时开启 `virtual_optimizer=True`，当前实现会直接拒绝构建，因为 Muon 尚未适配 Virtual Optimizer 的状态分片和 step 路径。
 
+## 专家分片数值回归
+
+专家更新的回归测试集中在一个模块级单元测试文件中，使用四个 CPU/Gloo 进程，不需要 NPU：
+
+```bash
+python3 -m pytest -v --tb=short tests/unit_tests/modules/test_muon_expert_reshard.py
+```
+
+该用例将分片后的参数更新与完整专家矩阵上的 Muon 逐元素比较，覆盖 `dim1` 重分配、
+不均匀/空分片、完整专家矩阵的本地路径，以及动量状态恢复。真实 NPU 训练与 profiling 另行验证。
+
 ## 参考文献
 
 - [DeepSeek-V4 Technical Report](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro/blob/main/DeepSeek_V4.pdf)
