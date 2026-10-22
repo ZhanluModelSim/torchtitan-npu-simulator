@@ -28,7 +28,7 @@ from torch.distributed.checkpoint.state_dict import (
 )
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.distributed.tensor import DTensor
-from torch.distributed.tensor.placement_types import Shard, _StridedShard
+from torch.distributed.tensor.placement_types import Replicate, Shard, _StridedShard
 from torch.optim import Optimizer
 from torch.optim.lr_scheduler import LambdaLR
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
@@ -102,7 +102,8 @@ def get_param_type(p, param_name, fsdp_enabled, expert_enabled):
     Uses dimension + name heuristics for robust Expert detection.
     Falls back to FSDP/DDP based on parallelism config.
     """
-    is_expert_param = p.ndim == 3 and expert_enabled and any(kw in param_name for kw in _EXPERT_KEYWORDS)
+    # EFSDP can split an expert matrix even when EP=1.
+    is_expert_param = p.ndim == 3 and any(kw in param_name for kw in _EXPERT_KEYWORDS)
     if is_expert_param:
         return ParamType.Expert
     if fsdp_enabled:
@@ -122,6 +123,41 @@ def validate_expert_shards_on_dim0(p, param_name):
                 "This usually means expert weights are sharded inside each expert matrix; "
                 "step_experts would run local Muon on incomplete matrices."
             )
+
+
+def _expert_matrix_shard_axis(p, param_name):
+    """Find a supported EFSDP matrix shard, preserving the EP expert ownership."""
+    if not isinstance(p, DTensor):
+        return None
+    matrix_axes = []
+    for axis, placement in enumerate(p.placements):
+        if isinstance(placement, Replicate):
+            continue
+        # _StridedShard is a separate placement type in Torch 2.12.
+        if not isinstance(placement, (Shard, _StridedShard)):
+            raise ValueError(f"Muon expert {param_name} has unsupported placement {placement}")
+        if placement.dim == 0:
+            continue
+        matrix_axes.append(axis)
+    if not matrix_axes:
+        return None
+    names = p.device_mesh.mesh_dim_names
+    if len(matrix_axes) != 1 or names is None:
+        raise ValueError(f"Muon expert {param_name} requires one named EFSDP matrix-sharding axis")
+    axis = matrix_axes[0]
+    placement = p.placements[axis]
+    if type(placement) is not Shard or placement.dim != 1 or names[axis] not in {"efsdp", "fsdp"}:
+        raise ValueError(
+            f"Muon expert {param_name} supports matrix sharding only as Shard(1) on efsdp/fsdp, "
+            f"got {placement} on {names[axis]}; expert tensor parallelism is not supported"
+        )
+    return axis
+
+
+def _chunk_sizes(size, chunks):
+    """DTensor Shard uses ceil-sized chunks followed by possibly empty shards."""
+    chunk_size = (size + chunks - 1) // chunks
+    return [max(0, min(chunk_size, size - rank * chunk_size)) for rank in range(chunks)]
 
 
 def tp_axis(placements, tp_enabled=False):
@@ -210,7 +246,7 @@ class DistributedMuon(Optimizer):
     Supports:
     - FSDP: all_to_all communication (step_fsdp)
     - DDP: all_gather communication (step_ddp)
-    - Expert/MoE: local LMO (step_experts)
+    - Expert/MoE: local LMO or EFSDP all_to_all (step_experts)
 
     Core components:
     - lmo(): zeropower + normalise_grad
@@ -501,7 +537,9 @@ class DistributedMuon(Optimizer):
             swap_to_host_stream = self._swap_to_host_stream
 
         for p, p_name in zip(expert_params, expert_param_names, strict=True):
-            validate_expert_shards_on_dim0(p, p_name)
+            matrix_axis = _expert_matrix_shard_axis(p, p_name)
+            if matrix_axis is None:
+                validate_expert_shards_on_dim0(p, p_name)
             _, nesterov, momentum, _, param_kwargs = self.groups_info[self.parameters_to_groups[id(p)]]
 
             if use_swap:
@@ -509,18 +547,21 @@ class DistributedMuon(Optimizer):
                 self._update_momentum_single(p, momentum)
 
             g = self.get_momentum_or_grad(p, momentum, nesterov)
-            if g is None:
+            if g is None and matrix_axis is None:
                 if use_swap:
                     self._swap_d2h_single(swap_state, swap_to_host_stream)
                 continue
 
-            u = self.lmo(
-                g,
-                **param_kwargs,
-                transpose_experts=transpose,
-                adjust_lr_fn=self.adjust_lr_fn,
-                hybrid_ns=self.hybrid_ns,
-            )
+            if matrix_axis is None:
+                u = self.lmo(
+                    g,
+                    **param_kwargs,
+                    transpose_experts=transpose,
+                    adjust_lr_fn=self.adjust_lr_fn,
+                    hybrid_ns=self.hybrid_ns,
+                )
+            else:
+                u = self._expert_alltoall_and_lmo(p, g, matrix_axis, param_kwargs)
 
             self.update_bucket_params([p], [u])
 
@@ -531,6 +572,70 @@ class DistributedMuon(Optimizer):
             self._device_module.current_stream().wait_stream(
                 swap_to_host_stream
             )  # pyrefly: ignore[missing-attribute,unbound-name]
+
+    def _expert_alltoall_and_lmo(self, p, g, matrix_axis, param_kwargs):
+        """Transpose EFSDP row shards to whole-expert owners, then transpose back.
+
+        EP ranks never communicate here: each EFSDP subgroup owns the same
+        EP-local experts. Momentum stays in its checkpoint-compatible storage
+        layout; only the effective gradient and update are redistributed.
+        """
+        mesh = p.device_mesh
+        group = mesh.get_group(matrix_axis)
+        world_size = mesh.size(matrix_axis)
+        rank = mesh.get_local_rank(matrix_axis)
+        local_p = p.to_local()
+        num_experts, local_rows, cols = local_p.shape
+        row_sizes = _chunk_sizes(p.shape[1], world_size)
+        expert_sizes = _chunk_sizes(num_experts, world_size)
+        if local_rows != row_sizes[rank] or cols != p.shape[2]:
+            raise ValueError(f"Unsupported expert shard shape {local_p.shape} for {p.shape}, {p.placements}")
+        if g is None:
+            # All ranks must enter the collectives even when one has no grad.
+            local_g = torch.zeros_like(local_p, dtype=self.communication_dtype)
+        else:
+            if not isinstance(g, DTensor) or g.device_mesh != mesh or g.placements != p.placements:
+                raise ValueError("Expert gradient must have the same DTensor mesh and placements as its parameter")
+            local_g = g.to_local().to(dtype=self.communication_dtype)
+
+        owned_experts = expert_sizes[rank]
+        send_sizes = [count * local_rows * cols for count in expert_sizes]
+        recv_sizes = [owned_experts * rows * cols for rows in row_sizes]
+        received = local_g.new_empty(sum(recv_sizes))
+        dist.all_to_all_single(
+            received,
+            local_g.contiguous().view(-1),
+            output_split_sizes=recv_sizes,
+            input_split_sizes=send_sizes,
+            group=group,
+        )
+        full_g = torch.cat(
+            [
+                part.view(owned_experts, rows, cols)
+                for part, rows in zip(received.split(recv_sizes), row_sizes, strict=True)
+            ],
+            dim=1,
+        )
+        if owned_experts:
+            full_update = self.lmo(
+                full_g,
+                **param_kwargs,
+                transpose_experts=self.experts_need_transpose,
+                adjust_lr_fn=self.adjust_lr_fn,
+                hybrid_ns=self.hybrid_ns,
+            )
+        else:
+            full_update = torch.empty_like(full_g)
+        send_update = torch.cat([part.reshape(-1) for part in full_update.split(row_sizes, dim=1)])
+        local_update = local_g.new_empty(local_g.numel())
+        dist.all_to_all_single(
+            local_update,
+            send_update,
+            output_split_sizes=send_sizes,
+            input_split_sizes=recv_sizes,
+            group=group,
+        )
+        return local_update.view(local_p.shape)
 
     def step_fsdp(self, fsdp_params, fsdp_param_names):
         if not fsdp_params:
