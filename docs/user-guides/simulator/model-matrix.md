@@ -1,10 +1,12 @@
 # Simulator 模型与特性矩阵
 
-> 现状核对：2026-10-07，`feat/npu-simulator`，实现基线 `ecde2f0`。依据源码与 Git 历史静态核对，未执行测试或仿真；后续行为以当前源码为准。
+> 现状核对：2026-10-20，分支 `qwen3.5`（commit `4da194a` 起）。Qwen3-Next 部分依据本轮
+> 验收矩阵实测（8 配置 + AC 双覆盖全过）更新；其余模型部分沿用 2026-10-07 静态核对。
+> 依据源码与 Git 历史核对，未执行真实 NPU 训练；后续行为以当前源码为准。
 
 返回[使用入口](../simulator.md)。以下“有实现”表示注册与代码路径存在，不能替代模型最终验收或所有配置组合的运行验证。
 
-正式 simulator registry 一共 10 个公共工厂：DeepSeek V4 7 个，Kimi K3 3 个。
+正式 simulator registry 一共 20 个公共工厂：DeepSeek V4 7 个，Kimi K3 3 个，Qwen3-Next 10 个。
 
 | 模型 preset | 主干层 / hidden / heads | routed experts / top-k | 精度配置 | 默认 EP | 默认 MTP / AC |
 |---|---|---|---|---|---|
@@ -14,6 +16,10 @@
 | DeepSeek V4 smoketest | 4 / 128 / 4 | 8 / 2 | BF16 | 1 | 0 / full |
 | Kimi K3 full | 93 / 7168 / 96 | 896 / 16 | BF16、MXFP8 | 128 | 无专门 MTP 路径 / full |
 | Kimi K3 smoketest | 4 / 256 / 8 | 8 / 3 | BF16 | 1 | 无专门 MTP 路径 / selective |
+| Qwen3-Next 80B-A3B | 48 / 2048 / 16（GQA head_dim 256） | 512 / 10 | BF16 | 2 | 无专门 MTP 路径 / none（实测口径） |
+| Qwen3-Next 80B-A3B-2L | 2 / 2048 / 16 | 512 / 10 | BF16 | 2 | 无专门 MTP 路径 / none（实测对齐主配置） |
+| Qwen3-Next 2l 并行/量化变体 ×7 | 2 / 2048 / 16 | 512 / 10 | BF16、MXFP8（_2l_mxfp8） | 1 或 2 | 无专门 MTP 路径 / none |
+| Qwen3-Next smoketest | 4 / 256 / 8 | 8 / 2 | BF16 | 2 | 无专门 MTP 路径 / none |
 
 上表层数是主干层数；DeepSeek baseline 的默认 MTP 另加一层。所有精度与 parallel degree 是 preset 默认，可经 typed overrides/CLI 调整，但需符合模型限制。
 
@@ -28,33 +34,45 @@ deepseek_v4_smoketest
 kimi_k3_baseline_bf16
 kimi_k3_baseline_mxfp8
 kimi_k3_smoketest
+qwen3_next_80b_a3b
+qwen3_next_80b_a3b_2layer
+qwen3_next_2l_tp2
+qwen3_next_2l_ep2
+qwen3_next_2l_fsdp2
+qwen3_next_2l_tp2ep2
+qwen3_next_2l_fsdp2ep2
+qwen3_next_2l_tp2ep2fsdp2
+qwen3_next_2l_mxfp8
+qwen3_next_smoketest
 ```
 
-证据：[simulator registry](../../../torchtitan_npu/simulator/config_registry.py)、[DeepSeek 模型默认值](../../../torchtitan_npu/models/deepseek_v4/__init__.py)、[Kimi 模型默认值](../../../torchtitan_npu/models/kimi_k3/__init__.py)。
+证据：[simulator registry](../../../torchtitan_npu/simulator/config_registry.py)、[DeepSeek 模型默认值](../../../torchtitan_npu/models/deepseek_v4/__init__.py)、[Kimi 模型默认值](../../../torchtitan_npu/models/kimi_k3/__init__.py)、[Qwen3-Next 模型默认值](../../../torchtitan_npu/models/qwen3_next/__init__.py)。
 
 ## 模型特性矩阵
 
-| 特性 | DeepSeek V4 家族 | Kimi K3 |
-|---|---|---|
-| 核心架构 | shared-KV sparse attention、compressor、Lightning Indexer/indexer loss、mHC、hash/普通 MoE、SwiGLU | KDA + Gated MLA、ShortConv、AttnRes、dense 前缀、LatentMoE、SiTU-GLU |
-| Attention 层分布 | 由 `compress_ratios` 等参数控制 | full：69 KDA + 24 MLA；debug：3 KDA + 1 MLA |
-| DP/FSDP/EFSDP/HSDP | 有代码路径，含 replica 模块 capture 修复 | 有代码路径，复用通用 FSDP/HSDP |
-| TP/Sequence Parallel | 有代码路径；sequence/head 等整除约束 | 有代码路径；含 KDA conv/head、MLA 和 AttnRes 的专门方案 |
-| EP | NpuExpertParallel fake bridge | 通用 ExpertParallel fake bridge |
-| ETP | 未支持，模型代码显式抛错 | 有 EP+ETP 实现及 mesh/维度校验；本次未运行组合验证 |
-| CP | 需要 `npu_smla`，使用 compressor/window exchange 等路径 | 全序列 all-gather 的保守正确方案；要求 contiguous shards，load balancer 为 None |
-| PP | 有实现，含复杂 schedule/virtual stages | 未支持，parallelize 明确拒绝 |
-| indexer loss | 需 `npu_smla` 转换后的 `SimNpuLiLoss`；未转换的基础 `LiLoss` 显式拒绝捕获 | 不适用 |
-| MTP | 有实现；MTP+PP 明确拒绝，PP 必须设置 `training.num_mtp_modules=0` | 没有与 DeepSeek 等价的专门 MTP 接入 |
-| AC none/full/selective | 有实现和重计算归属 | 有实现和 attention synthetic SAC |
-| AC memory_budget | 未支持，需要 compile，与 eager 捕获冲突 | 同左 |
-| Reentrant AC | 当前 execution tracker 拒绝 | 同左 |
-| MXFP8 默认范围 | 指定 attention/indexer/output projection、MoE/shared experts、MTP e/h projection 等 FQN | 默认仅 `moe.experts`、`moe.shared_experts` |
-| `model_overrides` / `mxfp8_fqns` | 有 typed schema、校验和 CLI | 有稳定 schema，重建逐层 KDA/MLA/dense/MoE 配置 |
-| 参数存储 dtype 假设 / saved activation offload / FSDP AG FP8 | 公共内存/通信建模路径 | 公共内存/通信建模路径 |
-| EP dispatch FP8 假设 | 默认 NpuExpertParallel 路径已接入 | 当前默认 converter/ExpertParallel 路径未接入该开关 |
-| fake AllToAll 输出 SAC 保存扩展 | NpuExpertParallel synthetic bridge 已接入，须显式 `all-to-all` | 通用 funcol A2A shim 未接入同一 synthetic cache；不能直接标为支持 |
-| embedding + 第 0 层 replica 实验 | 专属选项；保留 EP/TP，改用组内 replica + grad AR；不支持 tied embedding | 没有该专属选项 |
+| 特性 | DeepSeek V4 家族 | Kimi K3 | Qwen3-Next |
+|---|---|---|---|
+| 核心架构 | shared-KV sparse attention、compressor、Lightning Indexer/indexer loss、mHC、hash/普通 MoE、SwiGLU | KDA + Gated MLA、ShortConv、AttnRes、dense 前缀、LatentMoE、SiTU-GLU | Gated DeltaNet 线性注意力 + gated GQA（qk-norm/RoPE）、gated shared expert MoE、SwiGLU |
+| Attention 层分布 | 由 `compress_ratios` 等参数控制 | full：69 KDA + 24 MLA；debug：3 KDA + 1 MLA | 每组 4 层：3 GDN + 1 gated attention；debug：3 GDN + 1 gated attention |
+| DP/FSDP/EFSDP/HSDP | 有代码路径，含 replica 模块 capture 修复 | 有代码路径，复用通用 FSDP/HSDP | 有代码路径，复用通用 FSDP/HSDP |
+| TP/Sequence Parallel | 有代码路径；sequence/head 等整除约束 | 有代码路径；含 KDA conv/head、MLA 和 AttnRes 的专门方案 | 已支持（2026-10-20）：llama3 风格 TP+SP 计划，fused qkvz/q+gate 按 head 连续块均匀 colwise（`num_k_heads/n_kv_heads % tp == 0`），rowwise RS 到 Shard(1)；fsdp+ep+tp 组合已验证（2l_tp2ep2、2l_tp2ep2fsdp2） |
+| EP | NpuExpertParallel fake bridge | 通用 ExpertParallel fake bridge | 通用 ExpertParallel fake bridge |
+| ETP | 未支持，模型代码显式抛错 | 有 EP+ETP 实现及 mesh/维度校验；本次未运行组合验证 | 未支持 |
+| CP | 需要 `npu_smla`，使用 compressor/window exchange 等路径 | 全序列 all-gather 的保守正确方案；要求 contiguous shards，load balancer 为 None | 未支持，parallelize 显式拒绝 |
+| PP | 有实现，含复杂 schedule/virtual stages | 未支持，parallelize 明确拒绝 | parallelize 显式拒绝（registry 暂挂 `pipeline_llm`，未验证） |
+| indexer loss | 需 `npu_smla` 转换后的 `SimNpuLiLoss`；未转换的基础 `LiLoss` 显式拒绝捕获 | 不适用 | 不适用 |
+| MTP | 有实现；MTP+PP 明确拒绝，PP 必须设置 `training.num_mtp_modules=0` | 没有与 DeepSeek 等价的专门 MTP 接入 | 没有与 DeepSeek 等价的专门 MTP 接入 |
+| AC none/full/selective | 有实现和重计算归属 | 有实现和 attention synthetic SAC | 有实现（通用 `apply_moe_ac` 路径）；GDN synthetic op 已加入 SAC 保存列表 |
+| AC memory_budget | 未支持，需要 compile，与 eager 捕获冲突 | 同左 | 同左 |
+| Reentrant AC | 当前 execution tracker 拒绝 | 同左 | 同左 |
+| MXFP8 默认范围 | 指定 attention/indexer/output projection、MoE/shared experts、MTP e/h projection 等 FQN | 默认仅 `moe.experts`、`moe.shared_experts` | 已接入（2026-10-20，`qwen3_next_2l_mxfp8`）：mixer 投影（q/k/v/o、in_proj_qkvz/ba、out_proj）+ shared_expert；router gate 强制排除（FQN 命中 fail fast）；routed experts（裸参数 + `torch._grouped_mm`）范围外 |
+| `model_overrides` / `mxfp8_fqns` | 有 typed schema、校验和 CLI | 有稳定 schema，重建逐层 KDA/MLA/dense/MoE 配置 | `mxfp8_fqns` 已提供（CLI override + router 守卫）；`model_overrides` 未提供 |
+| 参数存储 dtype 假设 / saved activation offload / FSDP AG FP8 | 公共内存/通信建模路径 | 公共内存/通信建模路径 | 公共内存/通信建模路径 |
+| EP dispatch FP8 假设 | 默认 NpuExpertParallel 路径已接入 | 当前默认 converter/ExpertParallel 路径未接入该开关 | 当前默认 converter/ExpertParallel 路径未接入该开关 |
+| fake AllToAll 输出 SAC 保存扩展 | NpuExpertParallel synthetic bridge 已接入，须显式 `all-to-all` | 通用 funcol A2A shim 未接入同一 synthetic cache；不能直接标为支持 | 通用 funcol A2A shim 未接入同一 synthetic cache；不能直接标为支持 |
+| embedding + 第 0 层 replica 实验 | 专属选项；保留 EP/TP，改用组内 replica + grad AR；不支持 tied embedding | 没有该专属选项 | 没有该专属选项 |
+
+Qwen3-Next 的 MoE 辅助负载均衡 loss（HF `router_aux_loss_coef`）尚未接入，router 仅支持 `debug.moe_force_load_balance` 强制均衡；state-dict 已提供 `Qwen3NextStateDictAdapter`（DCP 框架名恒等直通，HF 导入/导出显式 NotImplementedError——v1 声明范围）。Qwen3-Next 完整契约/算子账本/验收记录见模型包 `MODEL_CONTRACT.md` / `OP_REFERENCE.md`，黄区交接见 `ZHANLU_HANDOVER.md`。
 
 限制证据：[DeepSeek parallelize](../../../torchtitan_npu/models/deepseek_v4/parallelize.py)、[MTP+PP 检查](../../../torchtitan_npu/models/deepseek_v4/model.py)、[Kimi PP 检查](../../../torchtitan_npu/models/kimi_k3/parallelize.py)。
 

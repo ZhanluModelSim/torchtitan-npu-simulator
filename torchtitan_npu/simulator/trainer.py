@@ -638,6 +638,21 @@ class SimulationTrainer(Trainer):
 
         for model_part in self.model_parts:
             apply_kimi_k3_shims(model_part)
+        # Bind Qwen3-Next GDN shim recording the MindSpeed triton kernel
+        # sequence (production path, use_triton_gdn=True).
+        from torchtitan_npu.simulator.hardware_shims.gdn_shim import (
+            apply_qwen3_next_shims,
+        )
+
+        for model_part in self.model_parts:
+            apply_qwen3_next_shims(model_part)
+        # Bind Qwen3-Next fused attention / GLU virtual ops the same way.
+        from torchtitan_npu.simulator.hardware_shims.qwen3_next_converter import (
+            apply_qwen3_next_fusion_shims,
+        )
+
+        for model_part in self.model_parts:
+            apply_qwen3_next_fusion_shims(model_part)
         self.simulation_config = config.simulation
         self._synthetic_ac_save_patterns = (
             synthetic_ac_save_patterns(config.simulation.selective_ac_save_ops)
@@ -645,6 +660,16 @@ class SimulationTrainer(Trainer):
             else ()
         )
         self.workload_graph: WorkloadGraph | None = None
+
+    def forward_backward_step(self, **kwargs):
+        """Stash the microbatch labels on the model parts before the
+        torchtitan forward: the qwen3_next chunked-loss forward consumes
+        them inside ``loss_ctx`` (mirroring MindSpeed's trainer, which
+        closes over the labels when building the loss ctx)."""
+        labels = kwargs.get("labels")
+        for part in self.model_parts:
+            part._sim_labels = labels
+        return super().forward_backward_step(**kwargs)
 
     def _capture_clip_grad_norm(self) -> torch.Tensor:
         from torchtitan.distributed import utils as dist_utils

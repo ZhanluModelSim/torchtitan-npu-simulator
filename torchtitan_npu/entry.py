@@ -120,7 +120,15 @@ def main() -> None:
         )
     ):
         for layer_cfg in config.model_spec.model.layers:
-            if isinstance(layer_cfg.attention.inner_attention, FlexAttention.Config):
+            # Models with custom token mixers (e.g. qwen3_next's Gated
+            # DeltaNet) have no ``inner_attention`` to rewrite.
+            attention_cfg = getattr(layer_cfg, "attention", None)
+            if attention_cfg is None:
+                continue
+            inner_attention = getattr(attention_cfg, "inner_attention", None)
+            if inner_attention is not None and isinstance(
+                inner_attention, FlexAttention.Config
+            ):
                 layer_cfg.attention.inner_attention = ScaledDotProductAttention.Config()
                 layer_cfg.attention.mask_type = "causal"
                 logger.info("Replaced FlexAttention with ScaledDotProductAttention for NPU compatibility")

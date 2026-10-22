@@ -448,6 +448,27 @@ def _patch_grouped_mm_offsets_dtype() -> None:
     torch._grouped_mm = _meta_safe_grouped_mm
 
 
+def _patch_bincount_meta_kernel() -> None:
+    """`torch.bincount` has no Meta kernel: its output size is
+    data-dependent (`max(minlength, input.max() + 1)`), so the MindSpeed
+    eager MoE dispatcher's `dispatch_preprocess` call fails under the
+    simulator's meta dispatch with NotImplementedError. Expert ids are
+    bounded by `minlength`, so the real kernel returns exactly
+    `[minlength]` rows for every call in this model family; registers a
+    Meta kernel with that shape. The values are never read by the
+    simulator (split sizes are derived analytically from the forced
+    uniform load balance)."""
+    if torch._C._dispatch_has_kernel_for_dispatch_key("aten::bincount", "Meta"):
+        return
+
+    def _meta_bincount(
+        input: torch.Tensor, weights=None, minlength: int = 0
+    ) -> torch.Tensor:
+        return torch.zeros(minlength, dtype=torch.long, device=input.device)
+
+    torch.library.register_fake("aten::bincount")(_meta_bincount)
+
+
 def _neutralize_torch_npu_optimizer_device_probe() -> None:
     """Real `torch_npu` installs (found under a genuine CANN container)
     monkeypatch `torch.optim.optimizer._get_foreach_kernels_supported_devices`
@@ -2976,6 +2997,7 @@ def patch_device_type_to_meta() -> None:
     _patch_torch_full_npu_device_literal()
     _patch_grouped_mm_offsets_dtype()
     _patch_moe_dispatch_to_avoid_meta_tensor_value_reads()
+    _patch_bincount_meta_kernel()
     _patch_parameter_dtensor_for_meta()
     _patch_li_loss_to_skip_buggy_einsum()
     _neutralize_fsdp_meta_param_validation()

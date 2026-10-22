@@ -9,6 +9,9 @@
 | 文档 | 范围 |
 |---|---|
 | [使用入口](../simulator.md) | 环境前提与当前配置启动方式 |
+| [模型接入操作手册（仓库根）](../../../torchtitan_training_modeling_guide.md) | 新模型适配工作流 0–10 阶段、阅读顺序与 AI 驱动方式（§0.1）、对话模板实例（§11）、环境与运行命令（§12） |
+| [模型接入规则](../../feature_guides/new_model_onboarding.md) | 接入各阶段硬性规则（契约/骨架/算子/并行/验收/测试分层） |
+| [模型验收判据](../../test_guides/model_acceptance.md) | "什么才算完成"：配置矩阵、AC 双覆盖、对账与单测要求 |
 | [配置参考](configuration.md) | Simulator 核心字段、SAC、并行公式和假设优化 |
 | [模型矩阵](model-matrix.md) | 正式 registry 与模型特例，区分 raw_model/训练接入 |
 | [输出与内存](outputs.md) | 导出结构、字段语义、峰值与 inventory 区别、PP replay 边界 |

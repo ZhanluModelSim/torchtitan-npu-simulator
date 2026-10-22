@@ -71,6 +71,7 @@ _OP_PATHS: dict[str, tuple[str, ...]] = {
 _SYNTHETIC_ATTENTION_SAVE_PATTERNS = (
     "aclnn.npu_sparse_attn_sharedkv",
     "triton_ascend_kernels.chunk_kda",
+    "mindspeed.ops.triton.",
     "fusion_attention",
 )
 _SYNTHETIC_ALL_TO_ALL_SAVE_PATTERN = "comm.all_to_all"

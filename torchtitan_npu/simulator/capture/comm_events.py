@@ -295,7 +295,13 @@ def _resolve_world_size(group: object) -> int:
         or str(group) == "default"
         or str(group_name) == "default"
     ):
-        return _resolve_world_size(active_context[1])
+        # The context must carry a concrete group, otherwise (e.g. TP
+        # funcol collectives that lower to WORLD/None) fall through to the
+        # default resolution instead of recursing on an unresolvable
+        # context group forever.
+        context_group = active_context[1]
+        if context_group is not None and context_group is not dist.group.WORLD:
+            return _resolve_world_size(context_group)
     if group is None:
         return dist.get_world_size() if dist.is_initialized() else 1
     # ProcessGroup
@@ -371,7 +377,9 @@ def _resolve_comm_ranks(group: object) -> list[list[int]]:
         or str(group) == "default"
         or str(group_name) == "default"
     ):
-        return _resolve_comm_ranks(active_context[1])
+        context_group = active_context[1]
+        if context_group is not None and context_group is not dist.group.WORLD:
+            return _resolve_comm_ranks(context_group)
     if group is None:
         ws = dist.get_world_size() if dist.is_initialized() else 1
         return [list(range(ws))] if ws > 1 else []
