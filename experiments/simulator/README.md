@@ -9,6 +9,8 @@ S5 的完整执行命令、七个 preset 验收入口和输出契约见 [交付�
 各能力的范围与状态见 [能力矩阵](docs/capability-matrix.md)。
 当前实现已按原生 dispatch 优先收敛，具体改动和本轮复验见 [收敛记录](docs/dispatch-first-remediation.md)。
 
+上游平台的同进程函数接入、旧入口迁移及全部参数见 [上游接入指南](docs/upstream-integration.md)。
+
 ## 安装与运行
 
 先准备与目标主线配套的完整 CANN 官方镜像、torch/torch_npu、TorchTitan 和 torchtitan-npu，

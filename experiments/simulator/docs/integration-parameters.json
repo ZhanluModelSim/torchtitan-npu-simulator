@@ -1,0 +1,1002 @@
+{
+  "schema_version": 1,
+  "source_commit": "848c32a",
+  "scope": "Parser and dataclass snapshot; not a complete runtime validation schema",
+  "cli_actions": [
+    {
+      "options": [
+        "-h",
+        "--help"
+      ],
+      "dest": "help",
+      "default": "==SUPPRESS==",
+      "nargs": 0,
+      "type": null,
+      "choices": null,
+      "action": "_HelpAction"
+    },
+    {
+      "options": [
+        "--model-overrides.dim"
+      ],
+      "dest": "model_override__dim",
+      "default": null,
+      "nargs": null,
+      "type": "int",
+      "choices": null,
+      "action": "_StoreAction"
+    },
+    {
+      "options": [
+        "--model-overrides.n-layers"
+      ],
+      "dest": "model_override__n_layers",
+      "default": null,
+      "nargs": null,
+      "type": "int",
+      "choices": null,
+      "action": "_StoreAction"
+    },
+    {
+      "options": [
+        "--model-overrides.vocab-size"
+      ],
+      "dest": "model_override__vocab_size",
+      "default": null,
+      "nargs": null,
+      "type": "int",
+      "choices": null,
+      "action": "_StoreAction"
+    },
+    {
+      "options": [
+        "--model-overrides.n-heads"
+      ],
+      "dest": "model_override__n_heads",
+      "default": null,
+      "nargs": null,
+      "type": "int",
+      "choices": null,
+      "action": "_StoreAction"
+    },
+    {
+      "options": [
+        "--model-overrides.head-dim"
+      ],
+      "dest": "model_override__head_dim",
+      "default": null,
+      "nargs": null,
+      "type": "int",
+      "choices": null,
+      "action": "_StoreAction"
+    },
+    {
+      "options": [
+        "--model-overrides.rope-head-dim"
+      ],
+      "dest": "model_override__rope_head_dim",
+      "default": null,
+      "nargs": null,
+      "type": "int",
+      "choices": null,
+      "action": "_StoreAction"
+    },
+    {
+      "options": [
+        "--model-overrides.q-lora-rank"
+      ],
+      "dest": "model_override__q_lora_rank",
+      "default": null,
+      "nargs": null,
+      "type": "int",
+      "choices": null,
+      "action": "_StoreAction"
+    },
+    {
+      "options": [
+        "--model-overrides.o-lora-rank"
+      ],
+      "dest": "model_override__o_lora_rank",
+      "default": null,
+      "nargs": null,
+      "type": "int",
+      "choices": null,
+      "action": "_StoreAction"
+    },
+    {
+      "options": [
+        "--model-overrides.o-groups"
+      ],
+      "dest": "model_override__o_groups",
+      "default": null,
+      "nargs": null,
+      "type": "int",
+      "choices": null,
+      "action": "_StoreAction"
+    },
+    {
+      "options": [
+        "--model-overrides.window-size"
+      ],
+      "dest": "model_override__window_size",
+      "default": null,
+      "nargs": null,
+      "type": "int",
+      "choices": null,
+      "action": "_StoreAction"
+    },
+    {
+      "options": [
+        "--model-overrides.norm-eps"
+      ],
+      "dest": "model_override__norm_eps",
+      "default": null,
+      "nargs": null,
+      "type": "float",
+      "choices": null,
+      "action": "_StoreAction"
+    },
+    {
+      "options": [
+        "--model-overrides.index-n-heads"
+      ],
+      "dest": "model_override__index_n_heads",
+      "default": null,
+      "nargs": null,
+      "type": "int",
+      "choices": null,
+      "action": "_StoreAction"
+    },
+    {
+      "options": [
+        "--model-overrides.index-head-dim"
+      ],
+      "dest": "model_override__index_head_dim",
+      "default": null,
+      "nargs": null,
+      "type": "int",
+      "choices": null,
+      "action": "_StoreAction"
+    },
+    {
+      "options": [
+        "--model-overrides.index-topk"
+      ],
+      "dest": "model_override__index_topk",
+      "default": null,
+      "nargs": null,
+      "type": "int",
+      "choices": null,
+      "action": "_StoreAction"
+    },
+    {
+      "options": [
+        "--model-overrides.moe-inter-dim"
+      ],
+      "dest": "model_override__moe_inter_dim",
+      "default": null,
+      "nargs": null,
+      "type": "int",
+      "choices": null,
+      "action": "_StoreAction"
+    },
+    {
+      "options": [
+        "--model-overrides.hc-mult"
+      ],
+      "dest": "model_override__hc_mult",
+      "default": null,
+      "nargs": null,
+      "type": "int",
+      "choices": null,
+      "action": "_StoreAction"
+    },
+    {
+      "options": [
+        "--model-overrides.hc-sinkhorn-iters"
+      ],
+      "dest": "model_override__hc_sinkhorn_iters",
+      "default": null,
+      "nargs": null,
+      "type": "int",
+      "choices": null,
+      "action": "_StoreAction"
+    },
+    {
+      "options": [
+        "--model-overrides.hc-eps"
+      ],
+      "dest": "model_override__hc_eps",
+      "default": null,
+      "nargs": null,
+      "type": "float",
+      "choices": null,
+      "action": "_StoreAction"
+    },
+    {
+      "options": [
+        "--model-overrides.compress-rope-theta"
+      ],
+      "dest": "model_override__compress_rope_theta",
+      "default": null,
+      "nargs": null,
+      "type": "float",
+      "choices": null,
+      "action": "_StoreAction"
+    },
+    {
+      "options": [
+        "--model-overrides.original-seq-len"
+      ],
+      "dest": "model_override__original_seq_len",
+      "default": null,
+      "nargs": null,
+      "type": "int",
+      "choices": null,
+      "action": "_StoreAction"
+    },
+    {
+      "options": [
+        "--model-overrides.rope-theta"
+      ],
+      "dest": "model_override__rope_theta",
+      "default": null,
+      "nargs": null,
+      "type": "float",
+      "choices": null,
+      "action": "_StoreAction"
+    },
+    {
+      "options": [
+        "--model-overrides.rope-factor"
+      ],
+      "dest": "model_override__rope_factor",
+      "default": null,
+      "nargs": null,
+      "type": "float",
+      "choices": null,
+      "action": "_StoreAction"
+    },
+    {
+      "options": [
+        "--model-overrides.load-balance-coeff"
+      ],
+      "dest": "model_override__load_balance_coeff",
+      "default": null,
+      "nargs": null,
+      "type": "float",
+      "choices": null,
+      "action": "_StoreAction"
+    },
+    {
+      "options": [
+        "--model-overrides.compress-ratios"
+      ],
+      "dest": "model_override__compress_ratios",
+      "default": null,
+      "nargs": "+",
+      "type": "int",
+      "choices": null,
+      "action": "_StoreAction"
+    },
+    {
+      "options": [
+        "--model-overrides.moe-args.num-experts"
+      ],
+      "dest": "model_override__moe_args.num_experts",
+      "default": null,
+      "nargs": null,
+      "type": "int",
+      "choices": null,
+      "action": "_StoreAction"
+    },
+    {
+      "options": [
+        "--model-overrides.moe-args.num-shared-experts"
+      ],
+      "dest": "model_override__moe_args.num_shared_experts",
+      "default": null,
+      "nargs": null,
+      "type": "int",
+      "choices": null,
+      "action": "_StoreAction"
+    },
+    {
+      "options": [
+        "--model-overrides.moe-args.top-k"
+      ],
+      "dest": "model_override__moe_args.top_k",
+      "default": null,
+      "nargs": null,
+      "type": "int",
+      "choices": null,
+      "action": "_StoreAction"
+    },
+    {
+      "options": [
+        "--model-overrides.moe-args.n-hash-layers"
+      ],
+      "dest": "model_override__moe_args.n_hash_layers",
+      "default": null,
+      "nargs": null,
+      "type": "int",
+      "choices": null,
+      "action": "_StoreAction"
+    },
+    {
+      "options": [
+        "--model-overrides.moe-args.route-norm",
+        "--no-model-overrides.moe-args.route-norm"
+      ],
+      "dest": "model_override__moe_args.route_norm",
+      "default": null,
+      "nargs": 0,
+      "type": null,
+      "choices": null,
+      "action": "BooleanOptionalAction"
+    },
+    {
+      "options": [
+        "--model-overrides.moe-args.no-route-norm"
+      ],
+      "dest": "model_override__moe_args.route_norm",
+      "default": "==SUPPRESS==",
+      "nargs": 0,
+      "type": null,
+      "choices": null,
+      "action": "_StoreFalseAction"
+    },
+    {
+      "options": [
+        "--model-overrides.moe-args.route-scale"
+      ],
+      "dest": "model_override__moe_args.route_scale",
+      "default": null,
+      "nargs": null,
+      "type": "float",
+      "choices": null,
+      "action": "_StoreAction"
+    },
+    {
+      "options": [
+        "--config"
+      ],
+      "dest": "config",
+      "default": "deepseek_v4_smoketest",
+      "nargs": null,
+      "type": null,
+      "choices": null,
+      "action": "_StoreAction"
+    },
+    {
+      "options": [
+        "--simulation.world-size"
+      ],
+      "dest": "world_size",
+      "default": 1,
+      "nargs": null,
+      "type": "int",
+      "choices": null,
+      "action": "_StoreAction"
+    },
+    {
+      "options": [
+        "--simulation.logical-rank"
+      ],
+      "dest": "logical_rank",
+      "default": 0,
+      "nargs": null,
+      "type": "int",
+      "choices": null,
+      "action": "_StoreAction"
+    },
+    {
+      "options": [
+        "--simulation.target-npu-device-type"
+      ],
+      "dest": "target_npu_device_type",
+      "default": "non_a5",
+      "nargs": null,
+      "type": null,
+      "choices": [
+        "non_a5",
+        "a5"
+      ],
+      "action": "_StoreAction"
+    },
+    {
+      "options": [
+        "--training.seq-len"
+      ],
+      "dest": "seq_len",
+      "default": 128,
+      "nargs": null,
+      "type": "int",
+      "choices": null,
+      "action": "_StoreAction"
+    },
+    {
+      "options": [
+        "--training.num-mtp-modules"
+      ],
+      "dest": "num_mtp_modules",
+      "default": 0,
+      "nargs": null,
+      "type": "int",
+      "choices": null,
+      "action": "_StoreAction"
+    },
+    {
+      "options": [
+        "--training.local-batch-size"
+      ],
+      "dest": "local_batch_size",
+      "default": null,
+      "nargs": null,
+      "type": "int",
+      "choices": null,
+      "action": "_StoreAction"
+    },
+    {
+      "options": [
+        "--training.global-batch-size"
+      ],
+      "dest": "global_batch_size",
+      "default": null,
+      "nargs": null,
+      "type": "int",
+      "choices": null,
+      "action": "_StoreAction"
+    },
+    {
+      "options": [
+        "--extension.quantization.enable-quantized-training"
+      ],
+      "dest": "enable_quantized_training",
+      "default": false,
+      "nargs": 0,
+      "type": null,
+      "choices": null,
+      "action": "_StoreTrueAction"
+    },
+    {
+      "options": [
+        "--extension.quantization.recipe"
+      ],
+      "dest": "quantization_recipe",
+      "default": "all_mxfp8",
+      "nargs": null,
+      "type": null,
+      "choices": [
+        "all_mxfp8"
+      ],
+      "action": "_StoreAction"
+    },
+    {
+      "options": [
+        "--simulation.selective-ac-save-ops"
+      ],
+      "dest": "selective_ac_save_ops",
+      "default": null,
+      "nargs": "+",
+      "type": null,
+      "choices": null,
+      "action": "_StoreAction"
+    },
+    {
+      "options": [
+        "--simulation.memory-parameter-storage-dtype"
+      ],
+      "dest": "memory_parameter_storage_dtype",
+      "default": "",
+      "nargs": null,
+      "type": null,
+      "choices": null,
+      "action": "_StoreAction"
+    },
+    {
+      "options": [
+        "--simulation.memory-offload-ac-saved-tensors"
+      ],
+      "dest": "memory_offload_ac_saved_tensors",
+      "default": false,
+      "nargs": 0,
+      "type": null,
+      "choices": null,
+      "action": "_StoreTrueAction"
+    },
+    {
+      "options": [
+        "--activation-checkpoint.mode"
+      ],
+      "dest": "activation_checkpoint_mode",
+      "default": "none",
+      "nargs": null,
+      "type": null,
+      "choices": [
+        "none",
+        "full",
+        "selective"
+      ],
+      "action": "_StoreAction"
+    },
+    {
+      "options": [
+        "--parallelism.pipeline-parallel-degree"
+      ],
+      "dest": "pipeline_parallel_degree",
+      "default": 1,
+      "nargs": null,
+      "type": "int",
+      "choices": null,
+      "action": "_StoreAction"
+    },
+    {
+      "options": [
+        "--simulation.enable-fsdp-allgather-fp8"
+      ],
+      "dest": "enable_fsdp_allgather_fp8",
+      "default": false,
+      "nargs": 0,
+      "type": null,
+      "choices": null,
+      "action": "_StoreTrueAction"
+    },
+    {
+      "options": [
+        "--simulation.enable-ep-dispatch-fp8"
+      ],
+      "dest": "enable_ep_dispatch_fp8",
+      "default": false,
+      "nargs": 0,
+      "type": null,
+      "choices": null,
+      "action": "_StoreTrueAction"
+    },
+    {
+      "options": [
+        "--simulation.output-dir"
+      ],
+      "dest": "output_dir",
+      "default": "./simulator_output",
+      "nargs": null,
+      "type": null,
+      "choices": null,
+      "action": "_StoreAction"
+    },
+    {
+      "options": [
+        "--simulation.output-formats"
+      ],
+      "dest": "output_formats",
+      "default": [],
+      "nargs": "*",
+      "type": null,
+      "choices": null,
+      "action": "_StoreAction"
+    },
+    {
+      "options": [
+        "--simulation.csv-max-ranks"
+      ],
+      "dest": "csv_max_ranks",
+      "default": 1,
+      "nargs": null,
+      "type": "int",
+      "choices": null,
+      "action": "_StoreAction"
+    },
+    {
+      "options": [
+        "--parallelism.data-parallel-replicate-degree"
+      ],
+      "dest": "data_parallel_replicate_degree",
+      "default": 1,
+      "nargs": null,
+      "type": "int",
+      "choices": null,
+      "action": "_StoreAction"
+    },
+    {
+      "options": [
+        "--parallelism.data-parallel-shard-degree"
+      ],
+      "dest": "data_parallel_shard_degree",
+      "default": -1,
+      "nargs": null,
+      "type": "int",
+      "choices": null,
+      "action": "_StoreAction"
+    },
+    {
+      "options": [
+        "--parallelism.tensor-parallel-degree"
+      ],
+      "dest": "tensor_parallel_degree",
+      "default": 1,
+      "nargs": null,
+      "type": "int",
+      "choices": null,
+      "action": "_StoreAction"
+    },
+    {
+      "options": [
+        "--parallelism.context-parallel-degree"
+      ],
+      "dest": "context_parallel_degree",
+      "default": 1,
+      "nargs": null,
+      "type": "int",
+      "choices": null,
+      "action": "_StoreAction"
+    },
+    {
+      "options": [
+        "--parallelism.expert-parallel-degree"
+      ],
+      "dest": "expert_parallel_degree",
+      "default": 1,
+      "nargs": null,
+      "type": "int",
+      "choices": null,
+      "action": "_StoreAction"
+    },
+    {
+      "options": [
+        "--build-only"
+      ],
+      "dest": "build_only",
+      "default": false,
+      "nargs": 0,
+      "type": null,
+      "choices": null,
+      "action": "_StoreTrueAction"
+    }
+  ],
+  "simulation": [
+    {
+      "name": "config",
+      "type": "str",
+      "default": "deepseek_v4_smoketest"
+    },
+    {
+      "name": "world_size",
+      "type": "int",
+      "default": 1
+    },
+    {
+      "name": "logical_rank",
+      "type": "int",
+      "default": 0
+    },
+    {
+      "name": "pipeline_parallel_degree",
+      "type": "int",
+      "default": 1
+    },
+    {
+      "name": "seq_len",
+      "type": "int",
+      "default": 128
+    },
+    {
+      "name": "num_mtp_modules",
+      "type": "int",
+      "default": 0
+    },
+    {
+      "name": "output_dir",
+      "type": "str",
+      "default": "./simulator_output"
+    },
+    {
+      "name": "output_formats",
+      "type": "list[str]",
+      "default": []
+    },
+    {
+      "name": "csv_max_ranks",
+      "type": "int",
+      "default": 1
+    },
+    {
+      "name": "enable_fsdp_allgather_fp8",
+      "type": "bool",
+      "default": false
+    },
+    {
+      "name": "enable_ep_dispatch_fp8",
+      "type": "bool",
+      "default": false
+    },
+    {
+      "name": "target_npu_device_type",
+      "type": "str",
+      "default": "non_a5"
+    },
+    {
+      "name": "override_imports",
+      "type": "list[str] | None",
+      "default": null
+    },
+    {
+      "name": "data_parallel_replicate_degree",
+      "type": "int",
+      "default": 1
+    },
+    {
+      "name": "data_parallel_shard_degree",
+      "type": "int",
+      "default": -1
+    },
+    {
+      "name": "tensor_parallel_degree",
+      "type": "int",
+      "default": 1
+    },
+    {
+      "name": "context_parallel_degree",
+      "type": "int",
+      "default": 1
+    },
+    {
+      "name": "expert_parallel_degree",
+      "type": "int",
+      "default": 1
+    },
+    {
+      "name": "activation_checkpoint_mode",
+      "type": "str",
+      "default": "none"
+    },
+    {
+      "name": "selective_ac_save_ops",
+      "type": "list[SelectiveACSaveOp] | None",
+      "default": null
+    },
+    {
+      "name": "memory_parameter_storage_dtype",
+      "type": "str",
+      "default": ""
+    },
+    {
+      "name": "memory_offload_ac_saved_tensors",
+      "type": "bool",
+      "default": false
+    },
+    {
+      "name": "local_batch_size",
+      "type": "int | None",
+      "default": null
+    },
+    {
+      "name": "global_batch_size",
+      "type": "int | None",
+      "default": null
+    },
+    {
+      "name": "enable_quantized_training",
+      "type": "bool",
+      "default": false
+    },
+    {
+      "name": "quantization_recipe",
+      "type": "str",
+      "default": "all_mxfp8"
+    },
+    {
+      "name": "model_overrides",
+      "type": "ModelOverrides | None",
+      "default": null
+    }
+  ],
+  "model": [
+    {
+      "name": "dim",
+      "type": "int | None",
+      "default": null
+    },
+    {
+      "name": "n_layers",
+      "type": "int | None",
+      "default": null
+    },
+    {
+      "name": "vocab_size",
+      "type": "int | None",
+      "default": null
+    },
+    {
+      "name": "n_heads",
+      "type": "int | None",
+      "default": null
+    },
+    {
+      "name": "head_dim",
+      "type": "int | None",
+      "default": null
+    },
+    {
+      "name": "rope_head_dim",
+      "type": "int | None",
+      "default": null
+    },
+    {
+      "name": "q_lora_rank",
+      "type": "int | None",
+      "default": null
+    },
+    {
+      "name": "o_lora_rank",
+      "type": "int | None",
+      "default": null
+    },
+    {
+      "name": "o_groups",
+      "type": "int | None",
+      "default": null
+    },
+    {
+      "name": "window_size",
+      "type": "int | None",
+      "default": null
+    },
+    {
+      "name": "norm_eps",
+      "type": "float | None",
+      "default": null
+    },
+    {
+      "name": "index_n_heads",
+      "type": "int | None",
+      "default": null
+    },
+    {
+      "name": "index_head_dim",
+      "type": "int | None",
+      "default": null
+    },
+    {
+      "name": "index_topk",
+      "type": "int | None",
+      "default": null
+    },
+    {
+      "name": "moe_inter_dim",
+      "type": "int | None",
+      "default": null
+    },
+    {
+      "name": "hc_mult",
+      "type": "int | None",
+      "default": null
+    },
+    {
+      "name": "hc_sinkhorn_iters",
+      "type": "int | None",
+      "default": null
+    },
+    {
+      "name": "hc_eps",
+      "type": "float | None",
+      "default": null
+    },
+    {
+      "name": "compress_rope_theta",
+      "type": "float | None",
+      "default": null
+    },
+    {
+      "name": "original_seq_len",
+      "type": "int | None",
+      "default": null
+    },
+    {
+      "name": "rope_theta",
+      "type": "float | None",
+      "default": null
+    },
+    {
+      "name": "rope_factor",
+      "type": "float | None",
+      "default": null
+    },
+    {
+      "name": "load_balance_coeff",
+      "type": "float | None",
+      "default": null
+    },
+    {
+      "name": "compress_ratios",
+      "type": "tuple[int, ...] | None",
+      "default": null
+    }
+  ],
+  "moe": [
+    {
+      "name": "num_experts",
+      "type": "int | None",
+      "default": null
+    },
+    {
+      "name": "num_shared_experts",
+      "type": "int | None",
+      "default": null
+    },
+    {
+      "name": "top_k",
+      "type": "int | None",
+      "default": null
+    },
+    {
+      "name": "n_hash_layers",
+      "type": "int | None",
+      "default": null
+    },
+    {
+      "name": "route_norm",
+      "type": "bool | None",
+      "default": null
+    },
+    {
+      "name": "route_scale",
+      "type": "float | None",
+      "default": null
+    }
+  ],
+  "runtime_choices": {
+    "activation_checkpoint_mode": [
+      "none",
+      "full",
+      "selective"
+    ],
+    "target_supported": [
+      "non_a5"
+    ],
+    "quantization_recipe": [
+      "all_mxfp8"
+    ],
+    "output_formats": [
+      "text",
+      "html",
+      "dot",
+      "json",
+      "csv",
+      "mem"
+    ],
+    "selective_ac_save_ops": [
+      "full",
+      "none",
+      "default",
+      "compute-intensive",
+      "attention",
+      "linear",
+      "mm",
+      "gmm",
+      "quant-mm",
+      "comm",
+      "max"
+    ],
+    "selective_ac_rejected": [
+      "all-to-all"
+    ],
+    "memory_parameter_storage_dtype": [
+      "",
+      "float32",
+      "float64",
+      "float16",
+      "bfloat16",
+      "float8_e4m3fn",
+      "float8_e5m2",
+      "int64",
+      "int32",
+      "int16",
+      "int8",
+      "uint8",
+      "bool"
+    ],
+    "pipeline_parallel_degree": [
+      1
+    ]
+  }
+}
