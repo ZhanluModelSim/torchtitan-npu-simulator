@@ -1,0 +1,314 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+"""Activation-checkpoint liveness refinement.
+
+``CheckpointWrapper`` executes its wrapped module again during backward. A
+raw use-def scan cannot distinguish that recomputed use from a saved forward
+activation, so it would retain every internal tensor until backward. The only
+forward tensors that cross the checkpoint boundary are the wrapper inputs and
+outputs; the rest can be released after their final forward consumer.
+"""
+
+from __future__ import annotations
+
+from torchtitan_simulator.memory.plugins import MemoryModelContext, MemoryModelPlugin
+from torchtitan_simulator.memory.records import (
+    CheckpointBoundaryEvent,
+    CheckpointTensorRecord,
+    RawMemoryEvent,
+    TensorLifetime,
+    TensorRef,
+)
+
+_CHECKPOINT_WRAPPED_MODULE = "._checkpoint_wrapped_module"
+
+
+def _checkpoint_scope(module_path: str) -> str:
+    """Return the wrapper path for an op inside a CheckpointWrapper."""
+    prefix, separator, _ = module_path.partition(_CHECKPOINT_WRAPPED_MODULE)
+    return prefix if separator else ""
+
+
+def _resolve_alias(tensor_id: int, alias_base_by_tensor_id: dict[int, int]) -> int:
+    seen: set[int] = set()
+    current = tensor_id
+    while current in alias_base_by_tensor_id and current not in seen:
+        seen.add(current)
+        current = alias_base_by_tensor_id[current]
+    return current
+
+
+def _boundary_scope(checkpoint_id: str) -> str:
+    """Return the module scope encoded in a stable checkpoint marker."""
+    _part, separator, scope = checkpoint_id.partition(":")
+    return scope if separator else checkpoint_id
+
+
+def _same_parallel_instance(
+    event: RawMemoryEvent,
+    boundary: CheckpointBoundaryEvent,
+) -> bool:
+    stage_matches = event.pp_stage < 0 or boundary.pp_stage < 0 or event.pp_stage == boundary.pp_stage
+    microbatch_matches = event.pp_mb_idx < 0 or boundary.pp_mb_idx < 0 or event.pp_mb_idx == boundary.pp_mb_idx
+    return stage_matches and microbatch_matches
+
+
+def _find_checkpoint_boundary(
+    scope: str,
+    producer_event: RawMemoryEvent,
+    boundaries_by_scope: dict[str, list[CheckpointBoundaryEvent]],
+) -> CheckpointBoundaryEvent | None:
+    """Find the wrapper exit belonging to one checkpoint-internal tensor."""
+    candidates = [
+        boundary
+        for boundary in boundaries_by_scope.get(scope, [])
+        if boundary.seq_idx >= producer_event.seq_idx and _same_parallel_instance(producer_event, boundary)
+    ]
+    return min(candidates, key=lambda boundary: boundary.seq_idx) if candidates else None
+
+
+def _producer_ref(
+    tensor_id: int,
+    producer_event: RawMemoryEvent,
+    alias_base_by_tensor_id: dict[int, int],
+) -> TensorRef | None:
+    for ref in producer_event.outputs:
+        if ref.tensor_id == tensor_id:
+            return ref
+    for ref in producer_event.outputs:
+        if _resolve_alias(ref.tensor_id, alias_base_by_tensor_id) == tensor_id:
+            return ref
+    return None
+
+
+class ActivationCheckpointPlugin(MemoryModelPlugin):
+    """Release checkpoint-internal forward tensors before recomputation."""
+
+    def apply(self, context: MemoryModelContext) -> list[TensorLifetime]:
+        event_by_seq = {event.seq_idx: event for event in context.events}
+        saved_roots = {
+            context.tensor_root(saved.tensor_id, saved.storage_key)
+            for saved in context.autograd_saved_tensors
+            if saved.phase == "forward" and saved.execution_kind == "original_forward"
+        }
+        saved_unpack_seq_by_tensor_id: dict[int, int] = {}
+        for saved in context.autograd_saved_tensors:
+            if saved.phase != "forward" or saved.execution_kind != "original_forward" or saved.unpack_seq < 0:
+                continue
+            root_tensor_id = context.tensor_root(saved.tensor_id, saved.storage_key)
+            saved_unpack_seq_by_tensor_id[root_tensor_id] = max(
+                saved_unpack_seq_by_tensor_id.get(root_tensor_id, -1),
+                saved.unpack_seq,
+            )
+        boundaries_by_scope: dict[str, list[CheckpointBoundaryEvent]] = {}
+        for boundary in context.checkpoint_boundary_events:
+            boundaries_by_scope.setdefault(
+                _boundary_scope(boundary.checkpoint_id),
+                [],
+            ).append(boundary)
+        for boundaries in boundaries_by_scope.values():
+            boundaries.sort(key=lambda boundary: boundary.seq_idx)
+
+        released_count = 0
+        released_bytes = 0
+        recompute_saved_count = 0
+        recompute_saved_bytes = 0
+        unattributed_recompute_saved_count = 0
+        unattributed_recompute_saved_bytes = 0
+
+        for tensor_id, lifetime in context.lifetimes_by_tensor_id.items():
+            if lifetime.producer_phase != "forward" or lifetime.kind == "external_input":
+                continue
+            producer_event = event_by_seq.get(lifetime.birth_seq)
+            if producer_event is None:
+                continue
+            scope = _checkpoint_scope(producer_event.module_path)
+            if not scope or "backward" not in lifetime.consumer_phases:
+                continue
+
+            forward_consumers = [
+                event_by_seq[seq_idx]
+                for seq_idx, phase in zip(lifetime.consumer_seqs, lifetime.consumer_phases, strict=False)
+                if phase == "forward" and seq_idx in event_by_seq
+            ]
+            crosses_checkpoint_boundary = any(
+                event.module_path and _checkpoint_scope(event.module_path) != scope for event in forward_consumers
+            )
+            if crosses_checkpoint_boundary:
+                continue
+
+            recompute_consumers = [
+                event_by_seq[seq_idx]
+                for seq_idx in lifetime.consumer_seqs
+                if seq_idx in event_by_seq and event_by_seq[seq_idx].execution_kind == "recompute"
+            ]
+            if recompute_consumers:
+                lifetime.kind = "checkpoint_saved_for_recompute"
+                lifetime.reason = "forward_tensor_reused_during_recompute"
+                if context.offload_ac_saved_tensors:
+                    lifetime.modeled_num_bytes = 0
+                    lifetime.residency_policy = "offloaded"
+                recompute_saved_count += 1
+                recompute_saved_bytes += lifetime.num_bytes
+
+                boundary = _find_checkpoint_boundary(
+                    scope,
+                    producer_event,
+                    boundaries_by_scope,
+                )
+                if boundary is None:
+                    unattributed_recompute_saved_count += 1
+                    unattributed_recompute_saved_bytes += lifetime.num_bytes
+                    continue
+                ref = _producer_ref(
+                    tensor_id,
+                    producer_event,
+                    context.alias_base_by_tensor_id,
+                )
+                context.checkpoint_tensors.append(
+                    CheckpointTensorRecord(
+                        checkpoint_id=boundary.checkpoint_id,
+                        marker_kind=boundary.marker_kind,
+                        seq_idx=boundary.seq_idx,
+                        tensor_id=lifetime.tensor_id,
+                        role="recompute_saved",
+                        shape=ref.shape if ref is not None else lifetime.shape,
+                        dtype=ref.dtype if ref is not None else lifetime.dtype,
+                        num_bytes=lifetime.num_bytes,
+                        modeled_num_bytes=lifetime.resident_num_bytes,
+                        requires_grad=(ref.requires_grad if ref is not None else False),
+                        is_saved_activation=True,
+                        residency_policy=lifetime.residency_policy,
+                        pp_stage=boundary.pp_stage,
+                        pp_mb_idx=boundary.pp_mb_idx,
+                        comp_type=boundary.comp_type,
+                    )
+                )
+                continue
+
+            if any(ref.storage_key for ref in producer_event.outputs):
+                # Storage generations distinguish new recompute allocations
+                # from the original forward value. An actual backward read of
+                # that same allocation is positive retention evidence, even
+                # when the outside consumer has an empty module path.
+                lifetime.reason = "checkpoint_storage_used_by_backward"
+                continue
+
+            lifetime.kind = "checkpoint_recompute_temp"
+            lifetime.reason = "checkpoint_internal_recompute"
+            lifetime.death_seq = max(
+                lifetime.birth_seq,
+                *(event.seq_idx for event in forward_consumers),
+            )
+            released_count += 1
+            released_bytes += lifetime.num_bytes
+
+        if released_count:
+            context.notes.append(
+                "Activation-checkpoint plugin released "
+                f"{released_count} checkpoint-internal forward lifetimes "
+                f"({released_bytes} bytes) before backward recomputation."
+            )
+
+        if recompute_saved_count:
+            policy = (
+                "offloaded from modeled device memory"
+                if context.offload_ac_saved_tensors
+                else "kept resident until their final recompute consumer"
+            )
+            context.notes.append(
+                "Activation-checkpoint plugin identified "
+                f"{recompute_saved_count} forward tensors reused during recompute "
+                f"({recompute_saved_bytes} logical bytes); {policy}."
+            )
+        if unattributed_recompute_saved_count:
+            context.notes.append(
+                "Activation-checkpoint plugin could not attribute "
+                f"{unattributed_recompute_saved_count} recompute-saved tensors "
+                f"({unattributed_recompute_saved_bytes} bytes) to a checkpoint "
+                "boundary; they remain in global totals but not per-checkpoint "
+                "prefetch totals."
+            )
+
+        saved_tensor_ids: set[int] = set()
+        untracked_saved_count = 0
+        for boundary in context.checkpoint_boundary_events:
+            for role, refs in (("input", boundary.inputs), ("output", boundary.outputs)):
+                seen_refs: set[int] = set()
+                for ref in refs:
+                    if ref.tensor_id in seen_refs:
+                        continue
+                    seen_refs.add(ref.tensor_id)
+                    root_tensor_id = context.tensor_root(ref.tensor_id, ref.storage_key)
+                    lifetime = context.lifetimes_by_tensor_id.get(root_tensor_id)
+                    is_saved_activation = role == "input" and (
+                        root_tensor_id in saved_roots if context.autograd_saved_tensors else ref.requires_grad
+                    )
+                    if is_saved_activation and lifetime is not None:
+                        lifetime.kind = "checkpoint_saved_activation"
+                        lifetime.reason = "checkpoint_boundary_input"
+                        unpack_seq = saved_unpack_seq_by_tensor_id.get(root_tensor_id)
+                        if unpack_seq is not None:
+                            # Non-reentrant checkpointing saves a detached alias of
+                            # the boundary input.  That alias is unpacked during
+                            # backward without appearing as a normal dispatcher
+                            # consumer of the original storage, so raw use-def alone
+                            # otherwise frees the AC point in forward.
+                            lifetime.death_seq = max(lifetime.death_seq, unpack_seq)
+                        saved_tensor_ids.add(root_tensor_id)
+                        if context.offload_ac_saved_tensors:
+                            lifetime.modeled_num_bytes = 0
+                            lifetime.residency_policy = "offloaded"
+                    elif is_saved_activation:
+                        untracked_saved_count += 1
+
+                    if is_saved_activation and context.offload_ac_saved_tensors:
+                        modeled_num_bytes = 0
+                        residency_policy = "offloaded"
+                    elif lifetime is not None:
+                        modeled_num_bytes = lifetime.resident_num_bytes
+                        residency_policy = lifetime.residency_policy
+                    else:
+                        modeled_num_bytes = 0
+                        residency_policy = "not_tracked"
+                    context.checkpoint_tensors.append(
+                        CheckpointTensorRecord(
+                            checkpoint_id=boundary.checkpoint_id,
+                            marker_kind=boundary.marker_kind,
+                            seq_idx=boundary.seq_idx,
+                            tensor_id=(lifetime.tensor_id if lifetime is not None else f"tensor:{root_tensor_id}"),
+                            role=role,
+                            shape=ref.shape,
+                            dtype=ref.dtype,
+                            num_bytes=ref.num_bytes,
+                            modeled_num_bytes=modeled_num_bytes,
+                            requires_grad=ref.requires_grad,
+                            is_saved_activation=is_saved_activation,
+                            residency_policy=residency_policy,
+                            pp_stage=boundary.pp_stage,
+                            pp_mb_idx=boundary.pp_mb_idx,
+                            comp_type=boundary.comp_type,
+                        )
+                    )
+
+        saved_logical_bytes = sum(
+            lifetime.num_bytes
+            for tensor_id, lifetime in context.lifetimes_by_tensor_id.items()
+            if tensor_id in saved_tensor_ids
+        )
+        if saved_tensor_ids:
+            policy = "offloaded from modeled device memory" if context.offload_ac_saved_tensors else "kept resident"
+            context.notes.append(
+                "Activation-checkpoint boundary capture identified "
+                f"{len(saved_tensor_ids)} saved activation tensors "
+                f"({saved_logical_bytes} logical bytes); {policy}."
+            )
+        if untracked_saved_count:
+            context.notes.append(
+                f"{untracked_saved_count} checkpoint saved-activation records "
+                "had no use-def lifetime and were retained as metadata only."
+            )
+        return []

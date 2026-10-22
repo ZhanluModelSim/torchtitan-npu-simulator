@@ -34,7 +34,9 @@ markers = [
 ]
 
 [tool.pyrefly]
-project-excludes = ["**/tests/**", "CI", "torchtitan_npu/ops/pypto", "torchtitan_npu/ops/triton", "scripts"]
+# The simulator is checked with its own pyproject.toml and source root.
+# Scanning it here creates a second experiments.simulator.* module identity.
+project-excludes = ["**/tests/**", "CI", "torchtitan_npu/ops/pypto", "torchtitan_npu/ops/triton", "scripts", "experiments/simulator"]
 ignore-missing-imports = [
     "attn_gym",
     "attn_gym.*",

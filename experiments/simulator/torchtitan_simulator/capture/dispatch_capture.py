@@ -1,0 +1,1060 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+"""L0 op-level capture via TorchDispatchMode.
+
+Dependencies are keyed by tensor identity. View/base aliases additionally
+share a mutation frontier so writes such as FSDP ``chunk_cat(..., out=view)``
+remain visible when a later collective reads the base flat buffer.
+"""
+
+from __future__ import annotations
+
+import itertools
+import weakref
+from contextlib import contextmanager
+from dataclasses import dataclass
+from functools import lru_cache
+from typing import TYPE_CHECKING, Any
+
+import torch
+from torch.multiprocessing.reductions import StorageWeakRef
+from torch.utils._python_dispatch import TorchDispatchMode
+
+from torchtitan_simulator.capture.checkpoint_execution import current_execution_kind
+from torchtitan_simulator.capture.op_mapping import is_metadata_view_op, to_canonical_op_type
+from torchtitan_simulator.capture.tensor_utils import dtype_to_str, tensor_volume_bytes, to_tensor_meta
+from torchtitan_simulator.cost.op_cost_model import OpCostModel
+from torchtitan_simulator.ir.op_node import OpNode
+from torchtitan_simulator.memory.records import (
+    AutogradSavedTensorEvent,
+    CheckpointBoundaryEvent,
+    RawMemoryEvent,
+    TensorRef,
+)
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterator
+
+    from torchtitan_simulator.capture.comm_events import CommEvent
+    from torchtitan_simulator.capture.module_path import ModulePathTracker
+    from torchtitan_simulator.ir.tensor_meta import TensorMeta
+
+_id_counter = itertools.count(1)
+_seq_counter = itertools.count()
+_memory_event_counter = itertools.count()
+
+
+def _next_op_id() -> int:
+    return next(_id_counter)
+
+
+def _flatten_tensors(value: Any, *, localize_dtensor: bool = True) -> list[torch.Tensor]:
+    """Recursively extract all tensors from nested lists/tuples/dicts.
+
+    PyTorch operator arguments can nest tensors inside dicts (e.g. some
+    custom ops pass ``{"mask": tensor}``), so we recurse into dict values
+    too -- otherwise those tensors are missed, breaking producer/consumer
+    edge construction and producing incomplete IR dependencies. DTensors are
+    localized by default because dependency and memory tracking are per-rank;
+    callers may retain them to read logical global metadata instead.
+    """
+    tensors: list[torch.Tensor] = []
+
+    from torch.distributed.tensor import DTensor
+
+    if isinstance(value, DTensor):
+        if localize_dtensor:
+            local_tensor = getattr(value, "_local_tensor", None)
+            tensors.append(local_tensor if isinstance(local_tensor, torch.Tensor) else value.to_local())
+        else:
+            tensors.append(value)
+    elif isinstance(value, torch.Tensor):
+        tensors.append(value)
+    elif isinstance(value, dict):
+        for item in value.values():
+            tensors.extend(_flatten_tensors(item, localize_dtensor=localize_dtensor))
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            tensors.extend(_flatten_tensors(item, localize_dtensor=localize_dtensor))
+    return tensors
+
+
+def _schema_mutated_tensors(
+    func: Any,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+) -> list[torch.Tensor]:
+    """Return tensor arguments marked writable by the operator schema."""
+    schema = getattr(func, "_schema", None)
+    if schema is None:
+        return []
+
+    mutated: list[torch.Tensor] = []
+    # c10d's legacy schemas omit alias annotations for their explicit output
+    # buffers. Record the native write contract, including void Work returns.
+    if str(func).startswith("c10d."):
+        from torchtitan_simulator.capture.op_mapping import communication_primitive
+
+        if communication_primitive(str(func)) is not None:
+            mutated.extend(_flatten_tensors(args[0]))
+    for index, argument in enumerate(schema.arguments):
+        alias_info = getattr(argument, "alias_info", None)
+        if alias_info is None or not alias_info.is_write:
+            continue
+        value = args[index] if index < len(args) else kwargs.get(argument.name)
+        mutated.extend(_flatten_tensors(value))
+    return mutated
+
+
+@dataclass(slots=True)
+class _RawEvent:
+    op_id: int
+    raw_op_type: str
+    op_type: str
+    inputs: list[TensorMeta]
+    outputs: list[TensorMeta]
+    predecessors: list[int]
+    module_path: str = ""
+    phase: str = "forward"
+    execution_kind: str = "original_forward"
+    repeat_count: int = 1
+    group_name: str = ""
+    raw_group_name: str = ""
+    comm_dim: str = ""
+    comm_ranks_str: str = ""
+    seq_idx: int = 0
+    pp_stage: int = -1
+    pp_mb_idx: int = -1
+    # Fine-grained compute-graph class (mirrors
+    # torch.distributed.pipelining.schedules._ComputationType):
+    # "F" forward, "B" full backward, "I" input-grad only, "W" weight-grad
+    # only, "F_RECOMPUTE" recompute forward, "OPTIMIZER". For non-PP steps
+    # this derives from `phase` (F/B/OPTIMIZER). Used by build_step_graphs
+    # to bucket L0 ops into per-(stage, comp_type) StepGraphs instead of
+    # the coarse forward/backward/optimizer triple.
+    comp_type: str = "F"
+    # FSDP sharding state active when this op ran ("SHARDED"/"UNSHARDED"/"NA").
+    fsdp_state: str = "NA"
+    tensor_shape_scope: str = "local"
+    # Non-tensor operator arguments (for example layout and head count on a
+    # fused attention kernel). They become OpNode.attrs.
+    attrs: dict[str, Any] | None = None
+    extra_annotations: dict[str, Any] | None = None
+
+
+@lru_cache(maxsize=1024)
+def _scalar_schema_arguments(func: Any) -> tuple[tuple[int, str, Any], ...] | None:
+    schema = getattr(func, "_schema", None)
+    if schema is None:
+        return None
+    return tuple(
+        (index, argument.name, argument.default_value)
+        for index, argument in enumerate(schema.arguments)
+        if "Tensor" not in str(argument.type)
+    )
+
+
+def _operator_attributes(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Bind scalar schema arguments, including omitted defaults, without reading tensor values."""
+
+    def normalize(value: Any) -> Any:
+        if isinstance(value, torch.Tensor):
+            return {"tensor_argument": True}
+        if isinstance(value, (list, tuple)):
+            return [normalize(item) for item in value]
+        if isinstance(value, dict):
+            return {str(key): normalize(item) for key, item in value.items()}
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        if isinstance(value, complex):
+            return {"real": value.real, "imag": value.imag}
+        return str(value)
+
+    attrs: dict[str, Any] = {}
+    arguments = _scalar_schema_arguments(func)
+    if arguments is None:
+        return {key: normalize(value) for key, value in kwargs.items() if not isinstance(value, torch.Tensor)}
+    for index, name, default in arguments:
+        value = args[index] if index < len(args) else kwargs.get(name, default)
+        attrs[name] = normalize(value)
+    return attrs
+
+
+def _to_tensor_ref(
+    tensor: torch.Tensor,
+    name: str,
+    tensor_id: int,
+    *,
+    alias_of: int | None = None,
+    storage_key: str = "",
+    storage_bytes: int = 0,
+) -> TensorRef:
+    dtype = dtype_to_str(tensor.dtype)
+    shape = tuple(int(d) for d in tensor.shape)
+    return TensorRef(
+        tensor_id=tensor_id,
+        name=name,
+        shape=shape,
+        dtype=dtype,
+        device=str(tensor.device),
+        num_bytes=tensor_volume_bytes(shape, dtype),
+        requires_grad=tensor.requires_grad,
+        alias_of=alias_of,
+        storage_key=storage_key,
+        storage_bytes=storage_bytes,
+    )
+
+
+class OpDispatchCapture(TorchDispatchMode):
+    """Records one L0 op stream. Usage::
+
+    capture = OpDispatchCapture()
+    with capture:
+        out = model(x)
+        out.sum().backward()
+    nodes = capture.build_nodes()
+    """
+
+    def __init__(
+        self,
+        cost_model: OpCostModel | None = None,
+        module_path_tracker: ModulePathTracker | None = None,
+        phase_provider: Callable[[], str] | None = None,
+        record_memory: bool = True,
+    ) -> None:
+        super().__init__()
+        self.cost_model = cost_model or OpCostModel()
+        self.module_path_tracker = module_path_tracker
+        self.phase_provider = phase_provider
+        self.record_memory = record_memory
+        self._events: list[_RawEvent] = []
+        self._memory_events: list[RawMemoryEvent] = []
+        self._initial_memory_tensors: list[TensorRef] = []
+        self._checkpoint_boundary_events: list[CheckpointBoundaryEvent] = []
+        self._autograd_saved_tensor_events: list[AutogradSavedTensorEvent] = []
+        self._pending_saved_tensor_unpacks: list[int] = []
+        self._producer: dict[int, int] = {}
+        # Dispatcher ops hidden by a scaffold scope still need to forward
+        # their data dependencies to the synthetic collective that consumes
+        # their result. A value may depend on more than one retained op.
+        self._suppressed_tensor_predecessors: dict[int, set[int]] = {}
+        self._mutation_frontier: dict[int, int] = {}
+        self._tensor_identities: dict[int, tuple[weakref.ReferenceType[torch.Tensor], int]] = {}
+        self._reused_tensor_ids = itertools.count(1)
+        self._storage_identities: dict[int, tuple[StorageWeakRef, str]] = {}
+        self._storage_generations = itertools.count()
+        self._saved_value_ids: dict[tuple, int] = {}
+        self._value_aliases: dict[int, int] = {}
+        self._storage_mutation_frontier: dict[str, int] = {}
+        self._previous_active_capture: OpDispatchCapture | None = None
+        self._capture_l0: bool = True  # pass-through when False (duplicate class)
+        self._compute_instances: dict[tuple[int, int, str], dict[str, Any]] = {}
+        # A scoped suppression channel for framework bookkeeping. Unlike
+        # ``suspend_recording()``, this affects only dispatcher-originated
+        # events: callers may still add an explicit synthetic collective node
+        # that represents the whole operation.
+        self._dispatch_suppression_scopes: list[str] = []
+        self._dispatch_annotation_scopes: list[str] = []
+        self._suppressed_dispatch_counts: dict[tuple[str, str], int] = {}
+        self._pending_comm_links: dict[str, CommEvent] = {}  # output storage → first consumer
+        # All compute classes on a stage share one representative microbatch.
+        # Other microbatches remain pass-through schedule instances.
+        self._captured_classes: set[tuple[int, str]] = set()
+        self._representative_microbatches: dict[int, int] = {}
+        self._class_instance_counts: dict[tuple[int, str], int] = {}
+        self._chunk_class_key: tuple[int, str] | None = None
+        from torchtitan_simulator.capture.storage_lifetimes import StorageLifetimeTracker
+
+        self._storage_lifetimes = StorageLifetimeTracker()
+
+    def begin_chunk(self, class_key: tuple[int, str]) -> None:
+        """Mark the start of one pipeline compute chunk (one
+        forward_one_chunk / backward_one_chunk / backward_weight_one_chunk
+        call). `class_key = (pp_stage, comp_type)`. Capture each compute class
+        from the stage's first forward microbatch so its backward inputs
+        remain paired. Other microbatches pass through while contributing
+        instance counts for L2. Pairs with `end_chunk`."""
+        from torchtitan_simulator.meta_env import _pp_context
+
+        stage, comp_type = class_key
+        microbatch = int(_pp_context.get("mb_idx", 0))
+        if comp_type == "F":
+            self._representative_microbatches.setdefault(stage, microbatch)
+        if stage not in self._representative_microbatches:
+            raise ValueError(f"Cannot capture {class_key} without a paired forward microbatch")
+        self._chunk_class_key = class_key
+        self._class_instance_counts[class_key] = self._class_instance_counts.get(class_key, 0) + 1
+        self._capture_l0 = (
+            microbatch == self._representative_microbatches[stage] and class_key not in self._captured_classes
+        )
+        if self._capture_l0:
+            self._captured_classes.add(class_key)
+
+    def end_chunk(self) -> None:
+        """Mark the end of a compute chunk. Restores L0 capture so that
+        inter-chunk communication / the optimizer phase (which run outside
+        any chunk) are still recorded, matching the pre-existing behavior."""
+        self._capture_l0 = True
+        self._chunk_class_key = None
+
+    def compute_instance_events(self) -> list[dict[str, Any]]:
+        """Return non-pipeline instance spans independently of L1 templates."""
+        return list(self._compute_instances.values())
+
+    def release_operator_tracking(self) -> None:
+        """Release capture-only indices once nodes and instance spans are built."""
+        self._events.clear()
+        self._producer.clear()
+        self._mutation_frontier.clear()
+        self._storage_mutation_frontier.clear()
+        self._tensor_identities.clear()
+        self._value_aliases.clear()
+        self._suppressed_tensor_predecessors.clear()
+        self._pending_comm_links.clear()
+
+    @contextmanager
+    def suspend_recording(self) -> Iterator[None]:
+        """Temporarily execute dispatches without adding capture events."""
+        previous = self._capture_l0
+        self._capture_l0 = False
+        try:
+            yield
+        finally:
+            self._capture_l0 = previous
+
+    @contextmanager
+    def suppress_dispatch_events(self, provenance: str) -> Iterator[None]:
+        """Exclude framework scaffolding while preserving synthetic capture.
+
+        FSDP and fake collective wrappers may allocate temporary buffers or
+        perform copies solely to implement a collective.  The simulator emits
+        one synthetic ``comm.*`` node for that collective instead.  This scope
+        keeps the implementation-detail dispatcher ops out of the L1 graph
+        without suppressing that explicit synthetic node.
+        """
+        self._dispatch_suppression_scopes.append(provenance)
+        try:
+            yield
+        finally:
+            self._dispatch_suppression_scopes.pop()
+
+    @property
+    def suppressed_dispatch_counts(self) -> dict[tuple[str, str], int]:
+        """Audit counts for dispatcher ops excluded by scoped suppression."""
+        return dict(self._suppressed_dispatch_counts)
+
+    @contextmanager
+    def annotate_dispatch_events(self, provenance: str) -> Iterator[None]:
+        """Label framework work without discarding graph or memory events."""
+        self._dispatch_annotation_scopes.append(provenance)
+        try:
+            yield
+        finally:
+            self._dispatch_annotation_scopes.pop()
+
+    @property
+    def class_instance_counts(self) -> dict[tuple[int, str], int]:
+        """Per-class instance counts (number of microbatches that executed
+        each captured template). Consumed by the L2 schedule builder to
+        instantiate StepInstances for every microbatch."""
+        return self._class_instance_counts
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        kwargs = kwargs or {}
+        if self.record_memory and self._capture_l0:
+            self._storage_lifetimes.poll()
+        mutated_inputs = _schema_mutated_tensors(func, args, kwargs) if self._capture_l0 else []
+        result = func(*args, **kwargs)
+        from torchtitan_simulator.capture.native_transport import (
+            record_native_transport,
+            transport_dependencies,
+            transport_operands,
+        )
+
+        if not self._capture_l0:
+            return result
+
+        if self._capture_l0 and self._dispatch_suppression_scopes:
+            flat_inputs = _flatten_tensors(args) + _flatten_tensors(tuple(kwargs.values()))
+            flat_outputs = _flatten_tensors(result if isinstance(result, (tuple, list)) else (result,))
+            predecessor_ids = {
+                predecessor
+                for tensor in flat_inputs
+                for predecessor in self._predecessors_for_tensor_id(self.tensor_id(tensor))
+            }
+            key = (self._dispatch_suppression_scopes[-1], str(func))
+            self._suppressed_dispatch_counts[key] = self._suppressed_dispatch_counts.get(key, 0) + 1
+            for tensor in flat_outputs:
+                self._suppressed_tensor_predecessors[self.tensor_id(tensor)] = set(predecessor_ids)
+            return result
+
+        flat_inputs = _flatten_tensors(args) + _flatten_tensors(tuple(kwargs.values()))
+        flat_outputs = _flatten_tensors(result if isinstance(result, (tuple, list)) else (result,))
+        # Void-returning mutable operators (including fused AdamW) still write
+        # real operands. Expose those values to memory and producer tracking.
+        output_ids = {id(tensor) for tensor in flat_outputs}
+        flat_outputs.extend(tensor for tensor in mutated_inputs if id(tensor) not in output_ids)
+        annotations: dict[str, Any] = {}
+        if self._dispatch_annotation_scopes:
+            annotations["framework_scopes"] = list(self._dispatch_annotation_scopes)
+        if str(func) == "aten._fused_adamw_.default":
+            from torchtitan_simulator.capture.optimizer import optimizer_annotations
+
+            annotations.update(optimizer_annotations(args[0] if args else kwargs["params"]))
+        operands = transport_operands(func, args)
+        source_op_id = self.producer_op(operands.inputs[0]) if operands is not None else None
+        attrs = _operator_attributes(func, args, kwargs)
+        if operands is not None:
+            attrs.update(operands.attributes())
+        module_path = self.module_path_tracker.current_path() if self.module_path_tracker else ""
+        op_id = self._record_event(
+            str(func),
+            flat_inputs,
+            flat_outputs,
+            module_path,
+            mutated_inputs=mutated_inputs,
+            attrs=attrs,
+            extra_annotations=annotations,
+            dependency_flat_inputs=list(transport_dependencies(func, operands)),
+        )
+        record_native_transport(func, operands, result, captured_op_id=op_id, source_op_id=source_op_id)
+
+        return result
+
+    def record_synthetic_op(
+        self,
+        raw_op_type: str,
+        inputs: list[torch.Tensor],
+        outputs: list[torch.Tensor],
+        module_path: str = "",
+        *,
+        logical_dtensor_shapes: bool = False,
+        memory_inputs: list[torch.Tensor] | None = None,
+        memory_outputs: list[torch.Tensor] | None = None,
+        dependency_inputs: list[torch.Tensor] | None = None,
+        operation_input_metas: list[TensorMeta] | None = None,
+        operation_output_metas: list[TensorMeta] | None = None,
+        attrs: dict[str, Any] | None = None,
+        extra_annotations: dict[str, Any] | None = None,
+    ) -> int | None:
+        """Manually register one synthetic L0 event, as if `raw_op_type` had
+        gone through __torch_dispatch__ normally. Used by
+        framework residency markers and low-level legacy trace fixtures.
+        Native compute and transport operators are recorded by dispatch. Participates in
+        the same producer/consumer identity wiring
+        and phase tagging as real dispatched events.
+
+        ``logical_dtensor_shapes`` keeps local tensors for dependency and
+        memory tracking, but uses DTensor global shapes in the OpNode metadata.
+        This is intended for logical fused ops such as optimizer updates.
+
+        ``memory_inputs`` and ``memory_outputs`` may expose additional operands
+        to tensor-lifetime tracking without adding them to the logical OpNode.
+        ``dependency_inputs`` adds producer edges without changing the op's
+        tensor metadata or memory records. ``operation_*_metas`` overrides the
+        displayed/costed metadata while retaining ``inputs``/``outputs`` for
+        dependency wiring; transport shims use this when wire dtype differs
+        from the logical activation dtype.
+        ``attrs`` carries non-tensor operator kwargs into ``OpNode.attrs``.
+        """
+        if not self._capture_l0:
+            return None
+        logical_input_metas = None
+        logical_output_metas = None
+        if logical_dtensor_shapes:
+            logical_input_metas = [
+                to_tensor_meta(tensor, name=f"in_{idx}")
+                for idx, tensor in enumerate(_flatten_tensors(inputs, localize_dtensor=False))
+            ]
+            logical_output_metas = [
+                to_tensor_meta(tensor, name=f"out_{idx}")
+                for idx, tensor in enumerate(_flatten_tensors(outputs, localize_dtensor=False))
+            ]
+        if operation_input_metas is not None:
+            logical_input_metas = operation_input_metas
+        if operation_output_metas is not None:
+            logical_output_metas = operation_output_metas
+        return self._record_event(
+            raw_op_type,
+            _flatten_tensors(inputs),
+            _flatten_tensors(outputs),
+            module_path,
+            input_metas=logical_input_metas,
+            output_metas=logical_output_metas,
+            tensor_shape_scope="global" if logical_dtensor_shapes else "local",
+            memory_flat_inputs=(_flatten_tensors(memory_inputs) if memory_inputs is not None else None),
+            memory_flat_outputs=(_flatten_tensors(memory_outputs) if memory_outputs is not None else None),
+            dependency_flat_inputs=(_flatten_tensors(dependency_inputs) if dependency_inputs is not None else None),
+            attrs=attrs,
+            extra_annotations=extra_annotations,
+        )
+
+    def record_synthetic_ac_cache_hit(
+        self,
+        raw_op_type: str,
+        outputs: Any,
+        *,
+        module_path: str = "",
+    ) -> None:
+        """Record a memory-only use of outputs restored by synthetic SAC."""
+        self._record_event(
+            f"simulator.synthetic_ac_cache_hit[{raw_op_type}]",
+            _flatten_tensors(outputs),
+            [],
+            module_path,
+            visible_in_ir=False,
+        )
+
+    def record_checkpoint_boundary(
+        self,
+        checkpoint_id: str,
+        inputs: Any,
+        outputs: Any,
+    ) -> None:
+        """Record the tensors crossing one original-forward AC boundary."""
+        if not self.record_memory or not self._capture_l0:
+            return
+
+        def refs(value: Any, role: str) -> tuple[TensorRef, ...]:
+            result: list[TensorRef] = []
+            seen: set[int] = set()
+            for tensor in _flatten_tensors(value):
+                tensor_id = self.tensor_id(tensor)
+                if tensor_id in seen:
+                    continue
+                seen.add(tensor_id)
+                result.append(
+                    self._memory_ref(
+                        tensor,
+                        name=f"{role}_{len(result)}",
+                        tensor_id=tensor_id,
+                    )
+                )
+            return tuple(result)
+
+        pp_stage = -1
+        pp_mb_idx = -1
+        comp_type = "F"
+        try:
+            from torchtitan_simulator.meta_env import _pp_context
+
+            pp_stage = int(_pp_context.get("stage", -1))
+            pp_mb_idx = int(_pp_context.get("mb_idx", -1))
+            comp_type = str(_pp_context.get("comp_type", "F")) or "F"
+        except Exception:
+            pass
+
+        self._checkpoint_boundary_events.append(
+            CheckpointBoundaryEvent(
+                checkpoint_id=checkpoint_id,
+                seq_idx=self._memory_events[-1].seq_idx if self._memory_events else -1,
+                inputs=refs(inputs, "input"),
+                outputs=refs(outputs, "output"),
+                pp_stage=pp_stage,
+                pp_mb_idx=pp_mb_idx,
+                comp_type=comp_type,
+            )
+        )
+
+    def _record_event(
+        self,
+        raw_op_type: str,
+        flat_inputs: list[torch.Tensor],
+        flat_outputs: list[torch.Tensor],
+        module_path: str,
+        *,
+        input_metas: list[TensorMeta] | None = None,
+        output_metas: list[TensorMeta] | None = None,
+        tensor_shape_scope: str = "local",
+        memory_flat_inputs: list[torch.Tensor] | None = None,
+        memory_flat_outputs: list[torch.Tensor] | None = None,
+        dependency_flat_inputs: list[torch.Tensor] | None = None,
+        attrs: dict[str, Any] | None = None,
+        extra_annotations: dict[str, Any] | None = None,
+        mutated_inputs: list[torch.Tensor] | None = None,
+        visible_in_ir: bool = True,
+    ) -> int | None:
+        if not self._capture_l0:
+            return  # pass-through: duplicate (stage, comp_type) class skips L0 capture
+        # Skip the framework metadata-inference forward (DYNAMIC-mode
+        # `_compute_outputs` and the FSDP _lazy_init/unshard setup it triggers),
+        # which is a shape-inference artifact, not a training microbatch — see
+        # meta_env._in_metadata_inference (set around _prepare_forward_infra /
+        # _prepare_backward_infra / _compute_outputs).
+        try:
+            from torchtitan_simulator.meta_env import _in_metadata_inference
+
+            if _in_metadata_inference:
+                return
+        except Exception:
+            pass
+        input_ids = [self.tensor_id(tensor) for tensor in flat_inputs]
+        output_ids = [self.tensor_id(tensor) for tensor in flat_outputs]
+        dependency_input_ids = [self.tensor_id(tensor) for tensor in (dependency_flat_inputs or [])]
+        alias_frontier_ids = {
+            frontier
+            for tensor in flat_inputs
+            if (frontier := self._mutation_frontier.get(self._alias_root_id(tensor))) is not None
+        }
+        alias_frontier_ids.update(
+            frontier
+            for tensor in flat_inputs
+            if (frontier := self._storage_mutation_frontier.get(self._storage_identity(tensor)[0])) is not None
+        )
+        memory_flat_inputs = flat_inputs if memory_flat_inputs is None else memory_flat_inputs
+        memory_flat_outputs = flat_outputs if memory_flat_outputs is None else memory_flat_outputs
+        memory_input_ids = [self.tensor_id(tensor) for tensor in memory_flat_inputs]
+        memory_output_ids = [self.tensor_id(tensor) for tensor in memory_flat_outputs]
+        predecessors = sorted(
+            {
+                predecessor
+                for tensor_id in (*input_ids, *dependency_input_ids)
+                for predecessor in self._predecessors_for_tensor_id(tensor_id)
+            }
+            | alias_frontier_ids
+        )
+        if input_metas is None:
+            input_metas = (
+                [to_tensor_meta(t, name=f"in_{i}") for i, t in enumerate(flat_inputs)] if visible_in_ir else []
+            )
+        if output_metas is None:
+            output_metas = (
+                [to_tensor_meta(t, name=f"out_{i}") for i, t in enumerate(flat_outputs)] if visible_in_ir else []
+            )
+        if visible_in_ir and (len(input_metas) != len(flat_inputs) or len(output_metas) != len(flat_outputs)):
+            raise ValueError("Logical and local synthetic-op tensor counts must match")
+
+        op_type = to_canonical_op_type(raw_op_type)
+        phase = self.phase_provider() if self.phase_provider else "forward"
+        execution_kind = current_execution_kind(phase)
+
+        # Read PP context for this op's stage/mb/comp_type/fsdp_state attribution.
+        # `comp_type` is set per-chunk by the patched forward_one_chunk /
+        # backward_one_chunk / backward_weight_one_chunk (see meta_env.py).
+        # For non-PP steps (no chunk patches run), derive comp_type from phase.
+        pp_stage = -1
+        pp_mb_idx = -1
+        comp_type = ""
+        fsdp_state = "NA"
+        _pp_context = {}
+        try:
+            from torchtitan_simulator.meta_env import _pp_context
+
+            pp_stage = int(_pp_context.get("stage", -1))
+            pp_mb_idx = int(_pp_context.get("mb_idx", -1))
+            comp_type = str(_pp_context.get("comp_type", ""))
+            fsdp_state = str(_pp_context.get("fsdp_state", "NA"))
+        except Exception:
+            pass
+        if phase == "optimizer":
+            comp_type = "OPTIMIZER"
+        elif _pp_context.get("compute_owner"):
+            comp_type = str(_pp_context["compute_owner"])
+        elif not comp_type or comp_type == "F":
+            # Only honor an explicit "F" during forward; otherwise derive from
+            # phase so non-PP backward ops are not mislabeled "F" (the default).
+            comp_type = "B" if phase == "backward" else "F"
+
+        seq_idx = next(_seq_counter)
+        op_id = _next_op_id()
+        key = (pp_stage, pp_mb_idx, comp_type)
+        instance = self._compute_instances.get(key)
+        if instance is None:
+            instance = {
+                "pp_stage": pp_stage,
+                "pp_mb_idx": pp_mb_idx,
+                "comp_type": comp_type,
+                "start_seq_idx": seq_idx,
+            }
+            self._compute_instances[key] = instance
+        instance["end_seq_idx"] = seq_idx
+        if visible_in_ir:
+            candidate = _RawEvent(
+                op_id=op_id,
+                raw_op_type=raw_op_type,
+                op_type=op_type,
+                inputs=input_metas,
+                outputs=output_metas,
+                predecessors=predecessors,
+                module_path=module_path,
+                phase=phase,
+                execution_kind=execution_kind,
+                seq_idx=seq_idx,
+                pp_stage=pp_stage,
+                pp_mb_idx=pp_mb_idx,
+                comp_type=comp_type,
+                fsdp_state=fsdp_state,
+                tensor_shape_scope=tensor_shape_scope,
+                attrs=dict(attrs) if attrs is not None else None,
+                extra_annotations=(dict(extra_annotations) if extra_annotations is not None else None),
+            )
+            self._events.append(candidate)
+
+        if self.record_memory:
+            self._memory_events.append(
+                RawMemoryEvent(
+                    event_id=next(_memory_event_counter),
+                    op_id=op_id,
+                    seq_idx=seq_idx,
+                    raw_op_type=raw_op_type,
+                    op_type=op_type,
+                    phase=phase,
+                    execution_kind=execution_kind,
+                    module_path=module_path,
+                    inputs=tuple(
+                        self._memory_ref(tensor, name=f"in_{idx}", tensor_id=memory_input_ids[idx])
+                        for idx, tensor in enumerate(memory_flat_inputs)
+                    ),
+                    outputs=tuple(
+                        self._memory_ref(tensor, name=f"out_{idx}", tensor_id=memory_output_ids[idx])
+                        for idx, tensor in enumerate(memory_flat_outputs)
+                    ),
+                    pp_stage=pp_stage,
+                    pp_mb_idx=pp_mb_idx,
+                    comp_type=comp_type,
+                )
+            )
+
+        if self._pending_saved_tensor_unpacks:
+            for slot_id in self._pending_saved_tensor_unpacks:
+                self._autograd_saved_tensor_events[slot_id].unpack_seq = seq_idx
+            self._pending_saved_tensor_unpacks.clear()
+
+        # Resolve pending comm links: if any input tensor was produced by a
+        # comm op (e.g. recv/unshard), this op is the dst_entry_op consumer.
+        for tensor in flat_inputs:
+            storage_key = self._storage_identity(tensor)[0]
+            if storage_key in self._pending_comm_links:
+                event = self._pending_comm_links.pop(storage_key)
+                if not event.dst_entry_op:
+                    event.dst_entry_op = op_id
+
+        for tid in output_ids:
+            self._suppressed_tensor_predecessors.pop(tid, None)
+            self._producer[tid] = op_id
+        for tensor in mutated_inputs or ():
+            self._mutation_frontier[self._alias_root_id(tensor)] = op_id
+            self._storage_mutation_frontier[self._storage_identity(tensor)[0]] = op_id
+        return op_id
+
+    def tensor_id(self, tensor: torch.Tensor) -> int:
+        tensor = _flatten_tensors(tensor)[0]
+        raw_id = id(tensor)
+        identity = self._tensor_identities.get(raw_id)
+        if identity is not None and identity[0]() is tensor:
+            return identity[1]
+
+        stable_id = raw_id if identity is None else -next(self._reused_tensor_ids)
+        self._tensor_identities[raw_id] = (weakref.ref(tensor), stable_id)
+        source_id = self._saved_value_ids.get(self._saved_value_key(tensor))
+        if source_id is not None and source_id != stable_id:
+            self._value_aliases[stable_id] = source_id
+        return stable_id
+
+    def _storage_identity(self, tensor: torch.Tensor) -> tuple[str, int]:
+        tensor = _flatten_tensors(tensor)[0]
+        storage = tensor.untyped_storage()
+        pointer = int(storage._cdata)
+        identity = self._storage_identities.get(pointer)
+        if identity is None or identity[0].expired():
+            identity = (StorageWeakRef(storage), f"{pointer}:{next(self._storage_generations)}")
+            self._storage_identities[pointer] = identity
+        if self.record_memory and self._capture_l0:
+            self._storage_lifetimes.register(identity[1], identity[0])
+        return identity[1], int(storage.nbytes())
+
+    def _saved_value_key(self, tensor: torch.Tensor) -> tuple:
+        tensor = _flatten_tensors(tensor)[0]
+        # Storage identifies allocation; layout identifies the saved value.
+        # A different view of that storage must keep its own producer.
+        return (
+            self._storage_identity(tensor)[0],
+            tuple(tensor.shape),
+            tuple(tensor.stride()),
+            tensor.storage_offset(),
+            tensor.dtype,
+        )
+
+    def _memory_ref(self, tensor: torch.Tensor, name: str, tensor_id: int) -> TensorRef:
+        storage_key, storage_bytes = self._storage_identity(tensor)
+        return _to_tensor_ref(
+            tensor,
+            name,
+            tensor_id,
+            alias_of=self._value_aliases.get(tensor_id),
+            storage_key=storage_key,
+            storage_bytes=storage_bytes,
+        )
+
+    def record_autograd_saved_tensor_pack(self, tensor: torch.Tensor, *, source: str = "autograd") -> int | None:
+        """Record a real autograd save without adding a synthetic L0 op."""
+        if not self.record_memory or not self._capture_l0:
+            return None
+        tensor = _flatten_tensors(tensor)[0]
+        storage_key, storage_bytes = self._storage_identity(tensor)
+        phase = self.phase_provider() if self.phase_provider else "forward"
+        execution_kind = current_execution_kind(phase)
+        pp_stage = -1
+        pp_mb_idx = -1
+        comp_type = ""
+        try:
+            from torchtitan_simulator.meta_env import _pp_context
+
+            pp_stage = int(_pp_context.get("stage", -1))
+            pp_mb_idx = int(_pp_context.get("mb_idx", -1))
+            comp_type = str(_pp_context.get("comp_type", ""))
+        except Exception:
+            pass
+        slot_id = len(self._autograd_saved_tensor_events)
+        saved_id = self.tensor_id(tensor)
+        self._saved_value_ids[self._saved_value_key(tensor)] = saved_id
+        self._autograd_saved_tensor_events.append(
+            AutogradSavedTensorEvent(
+                slot_id=slot_id,
+                tensor_id=saved_id,
+                storage_key=storage_key,
+                storage_bytes=storage_bytes,
+                num_bytes=tensor.numel() * tensor.element_size(),
+                shape=tuple(int(dim) for dim in tensor.shape),
+                dtype=dtype_to_str(tensor.dtype),
+                pack_seq=(self._memory_events[-1].seq_idx if self._memory_events else -1),
+                phase=phase,
+                execution_kind=execution_kind,
+                module_path=(self.module_path_tracker.current_path() if self.module_path_tracker is not None else ""),
+                pp_stage=pp_stage,
+                pp_mb_idx=pp_mb_idx,
+                comp_type=comp_type,
+                source=source,
+                release_tracking=True,
+            )
+        )
+        return slot_id
+
+    def record_autograd_saved_tensor_unpack(self, slot_id: int | None) -> None:
+        if slot_id is not None and self.record_memory:
+            self._pending_saved_tensor_unpacks.append(slot_id)
+
+    def record_autograd_saved_tensor_release(self, slot_id: int | None) -> None:
+        """Observe packed-slot destruction separately from its unpack/read."""
+        if slot_id is None or not self.record_memory or not self._capture_l0:
+            return
+        saved = self._autograd_saved_tensor_events[slot_id]
+        saved.release_seq = next(_seq_counter)
+        if slot_id in self._pending_saved_tensor_unpacks:
+            saved.unpack_seq = saved.release_seq
+            self._pending_saved_tensor_unpacks = [
+                slot for slot in self._pending_saved_tensor_unpacks if slot != slot_id
+            ]
+
+    def finalize_autograd_saved_tensors(self) -> None:
+        """Anchor unpacks that occur after the final dispatcher-visible op."""
+        fallback_seq = (self._memory_events[-1].seq_idx + 1) if self._memory_events else 0
+        for slot_id in self._pending_saved_tensor_unpacks:
+            self._autograd_saved_tensor_events[slot_id].unpack_seq = fallback_seq
+        self._pending_saved_tensor_unpacks.clear()
+
+    def autograd_saved_tensor_events(self) -> list[AutogradSavedTensorEvent]:
+        return list(self._autograd_saved_tensor_events)
+
+    def storage_lifetime_events(self):
+        return self._storage_lifetimes.records()
+
+    def record_initial_memory_tensors(self, value):
+        """Declare actual caller-owned tensors that predate the first op."""
+        from torchtitan_simulator.metadata import iter_metadata_tensors
+
+        if self._memory_events:
+            raise ValueError("Initial memory inputs must be recorded before the first dispatcher event")
+        if not self.record_memory:
+            return
+        self._initial_memory_tensors = [
+            self._memory_ref(tensor, f"initial_{index}", self.tensor_id(tensor))
+            for index, tensor in enumerate(iter_metadata_tensors(value))
+        ]
+
+    def initial_memory_tensors(self):
+        return list(self._initial_memory_tensors)
+
+    def _alias_root_id(self, tensor: torch.Tensor) -> int:
+        root = tensor
+        seen: set[int] = set()
+        while isinstance(base := getattr(root, "_base", None), torch.Tensor):
+            raw_id = id(root)
+            if raw_id in seen:
+                break
+            seen.add(raw_id)
+            root = base
+        return self.tensor_id(root)
+
+    def producer_op(self, tensor: torch.Tensor) -> int | None:
+        """Return the op after which the tensor's current value is ready."""
+        mutation = self._storage_mutation_frontier.get(self._storage_identity(tensor)[0])
+        if mutation is None:
+            mutation = self._mutation_frontier.get(self._alias_root_id(tensor))
+        if mutation is not None:
+            return mutation
+        predecessors = self._predecessors_for_tensor_id(self.tensor_id(tensor))
+        return next(iter(predecessors)) if len(predecessors) == 1 else None
+
+    def _predecessors_for_tensor_id(self, tensor_id: int) -> set[int]:
+        if tensor_id in self._producer:
+            return {self._producer[tensor_id]}
+        if tensor_id in self._value_aliases:
+            return self._predecessors_for_tensor_id(self._value_aliases[tensor_id])
+        return self._suppressed_tensor_predecessors.get(tensor_id, set())
+
+    def __enter__(self) -> OpDispatchCapture:
+        super().__enter__()
+        global _active_capture
+        self._previous_active_capture = _active_capture
+        _active_capture = self
+        return self
+
+    def __exit__(self, exc_type: object, exc_val: object, exc_tb: object) -> None:
+        global _active_capture
+        self._storage_lifetimes.close()
+        _active_capture = self._previous_active_capture
+        super().__exit__(exc_type, exc_val, exc_tb)
+        self._storage_identities.clear()
+        self._saved_value_ids.clear()
+
+    def build_nodes(self) -> dict[int, OpNode]:
+        """Assemble captured events into OpNode objects with cost annotations."""
+        nodes: dict[int, OpNode] = {}
+        for event in self._events:
+            cost = self.cost_model.compute(event.op_type, event.inputs, event.outputs, event.attrs or {})
+            annotations: dict[str, Any] = {
+                "raw_op_type": event.raw_op_type,
+                "phase": event.phase,
+                "execution_kind": event.execution_kind,
+                "is_recompute": event.execution_kind == "recompute",
+                # Always stamp comp_type/fsdp_state so build_step_graphs can
+                # bucket by (stage, comp_type) regardless of capture order.
+                "comp_type": event.comp_type,
+                "fsdp_state": event.fsdp_state,
+            }
+            if event.module_path:
+                annotations["module_path"] = event.module_path
+            if event.tensor_shape_scope != "local":
+                annotations["tensor_shape_scope"] = event.tensor_shape_scope
+            if event.repeat_count > 1:
+                annotations["repeat_count"] = event.repeat_count
+            if is_metadata_view_op(event.raw_op_type):
+                annotations["metadata_view"] = True
+            if cost.unknown:
+                annotations["cost_unknown"] = True
+            if event.comm_dim:
+                annotations["comm_dim"] = event.comm_dim
+            if event.group_name:
+                annotations["group_name"] = event.group_name
+            if event.raw_group_name:
+                annotations["raw_group_name"] = event.raw_group_name
+            if event.comm_ranks_str:
+                annotations["comm_ranks"] = event.comm_ranks_str
+            if event.pp_stage >= 0:
+                annotations["pp_stage"] = event.pp_stage
+            if event.pp_mb_idx >= 0:
+                annotations["pp_mb_idx"] = event.pp_mb_idx
+            if event.extra_annotations:
+                annotations.update(event.extra_annotations)
+            nodes[event.op_id] = OpNode(
+                op_id=event.op_id,
+                op_type=event.op_type,
+                inputs=event.inputs,
+                outputs=event.outputs,
+                attrs=dict(event.attrs or {}),
+                predecessors=list(event.predecessors),
+                successors=[],
+                flops=cost.flops,
+                peak_mem=cost.peak_mem,
+                param_mem=cost.param_mem,
+                comm_bytes=cost.comm_bytes,
+                annotations=annotations,
+                seq_idx=event.seq_idx,
+            )
+        for op_id, node in nodes.items():
+            for pred_id in node.predecessors:
+                if pred_id in nodes:
+                    nodes[pred_id].successors.append(op_id)
+
+        # Some autograd collectives hand their gradient to the engine through
+        # C++ accumulation without a dispatcher-visible tensor consumer. For
+        # synchronous calls, conservatively gate the next connected backward
+        # chain so replay cannot move it ahead of the collective.
+        ordered_nodes = sorted(nodes.values(), key=lambda node: node.seq_idx)
+        for index, node in enumerate(ordered_nodes):
+            if (
+                not node.annotations.get(
+                    "sync_collective_sequence_fallback",
+                    False,
+                )
+                or node.successors
+            ):
+                continue
+            if (
+                node.op_type == "allreduce"
+                and node.annotations.get("comm_dim") == "dp_replicate"
+                and node.annotations.get("fsdp_group_id")
+            ):
+                # Native HSDP launches this all-reduce on its dedicated AR
+                # stream and retains the result for gradient handling. It is
+                # not a data dependency of the next backward compute chain.
+                # Stream order is restored by FSDP communication ownership.
+                node.annotations["fsdp_async_allreduce"] = True
+                continue
+            for candidate_index in range(index + 1, len(ordered_nodes)):
+                candidate = ordered_nodes[candidate_index]
+                if (
+                    candidate.annotations.get("phase") != node.annotations.get("phase")
+                    or candidate.annotations.get("execution_kind") != node.annotations.get("execution_kind")
+                    or candidate.annotations.get("comp_type") != node.annotations.get("comp_type")
+                    or not candidate.successors
+                ):
+                    continue
+                candidate.predecessors.append(node.op_id)
+                candidate.annotations.setdefault("captured_control_dependencies", []).append(
+                    {
+                        "source_op_id": node.op_id,
+                        "evidence": "synchronous_collective_return_before_dispatch",
+                    }
+                )
+                node.successors.append(candidate.op_id)
+                break
+        return nodes
+
+    def apply_comm_group_names(
+        self,
+        group_names_by_op_id: dict[int, tuple[str, str]],
+    ) -> None:
+        """Apply resolved and raw communication group names to L0 events."""
+        for event in self._events:
+            names = group_names_by_op_id.get(event.op_id)
+            if names is None:
+                continue
+            event.group_name, event.raw_group_name = names
+            event.comm_dim = event.group_name
+
+    def memory_events(self) -> list[RawMemoryEvent]:
+        """Return the uncollapsed op stream used by static memory planning."""
+        return list(self._memory_events)
+
+    def checkpoint_boundary_events(self) -> list[CheckpointBoundaryEvent]:
+        """Return original-forward activation-checkpoint boundary metadata."""
+        return list(self._checkpoint_boundary_events)
+
+
+_active_capture: OpDispatchCapture | None = None
+
+
+def get_active_capture() -> OpDispatchCapture | None:
+    """Returns the `OpDispatchCapture` instance currently inside its `with`
+    block (there is at most one active at a time -- one step is captured at
+    a time), or `None` if no capture is active. Lets code that has no
+    direct reference to the capture instance (for example residency
+    nn.Module replacements, which run deep inside a model's forward/backward
+    with no capture parameter threaded through) reach it to call
+    `record_synthetic_op`."""
+    return _active_capture
