@@ -397,6 +397,8 @@ for _ in range(2):
     # Invoke the actual upstream consumer here as part of integration acceptance.
 ```
 
+环境故障与修正说明见 [CANN metadata 包装签名兼容](cann-metadata-signature-compat.md)，包括 `args/kwargs` 报错、NumPy／PyArrow 配套及首次 C++ 编译。
+
 ## 13. 事实依据与文档验证
 
 源码依据：[CLI](../torchtitan_simulator/cli.py)、[配置及校验](../torchtitan_simulator/config.py)、[执行与导出](../torchtitan_simulator/runner.py)、[几何复写](../torchtitan_simulator/model_overrides.py)、[SAC 选择](../torchtitan_simulator/selective_ac.py)、[dtype 口径](../torchtitan_simulator/capture/tensor_utils.py)、[逻辑 world 生命周期](../torchtitan_simulator/compat/distributed.py)、[WorkloadGraph](../torchtitan_simulator/ir/workload_graph.py)。已验证能力的完整范围见 [能力矩阵](capability-matrix.md) 和 [原生 dispatch 复验](dispatch-first-remediation.md)。

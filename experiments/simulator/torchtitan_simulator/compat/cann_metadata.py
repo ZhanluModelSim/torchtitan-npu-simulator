@@ -39,7 +39,27 @@ class _MetadataDeviceMode(TorchFunctionMode):
 
 
 def _metadata_dispatch(original, operator):
-    signature = inspect.signature(original)
+    try:
+        signature = inspect.signature(original)
+    except (TypeError, ValueError):
+        signature = None
+    if signature is None or any(
+        parameter.kind in {inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD}
+        for parameter in signature.parameters.values()
+    ):
+        # Some vendor decorators hide the Python signature behind *args/**kwargs.
+        # Bind against the actual dispatcher schema, including keyword-only
+        # boundaries and defaults; do not infer shapes or execute device code.
+        signature = inspect.Signature(
+            [
+                inspect.Parameter(
+                    argument.name,
+                    inspect.Parameter.KEYWORD_ONLY if argument.kwarg_only else inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                    default=argument.default_value if argument.has_default_value() else inspect.Parameter.empty,
+                )
+                for argument in operator._schema.arguments
+            ]
+        )
     schema_names = {argument.name for argument in operator._schema.arguments}
 
     @wraps(original)

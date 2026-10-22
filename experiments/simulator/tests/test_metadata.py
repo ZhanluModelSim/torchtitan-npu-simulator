@@ -137,3 +137,103 @@ def test_healthy_vendor_metadata_meta_kernel_is_not_overridden():
         assert torch._C._dispatch_dump("cann_ops_transformer::lightning_indexer_metadata") == kernel
     finally:
         library._destroy()
+
+
+@pytest.mark.parametrize("call_style", ["positional", "keyword"])
+@pytest.mark.parametrize(
+    "name,key_heads,size",
+    [
+        ("lightning_indexer_metadata", "num_heads_k", 1024),
+        ("sparse_flash_mla_metadata", "num_heads_kv", 1024),
+        ("sparse_flash_mla_grad_metadata", "num_heads_kv", 1024),
+        ("sparse_lightning_indexer_kl_loss_grad_metadata", "num_heads_k", 64),
+    ],
+)
+def test_opaque_vendor_metadata_wrapper_uses_schema_and_keeps_native_dependencies(
+    monkeypatch, name, key_heads, size, call_style
+):
+    prepared = prepare_config(SimulationConfig())
+    from torchtitan_npu.override.deepseek_v4.sparse_attn import ascendc
+
+    def opaque(*args, **kwargs):
+        raise AssertionError("Metadata adaptation must dispatch the native operator")
+
+    monkeypatch.setattr(ascendc, name, opaque)
+    cpu_offsets = torch.tensor([0, 128], dtype=torch.int32)
+    arguments = {"num_heads_q": 8, key_heads: 1, "head_dim": 128}
+    if name == "lightning_indexer_metadata":
+        arguments["topk"] = 512
+    positional = list(arguments.values()) if call_style == "positional" else []
+    keywords = {} if call_style == "positional" else arguments
+    capture = OpDispatchCapture()
+    with meta_runtime() as runtime:
+        runtime.configure_model(prepared)
+        with capture:
+            result = getattr(ascendc, name)(*positional, **keywords, cu_seqlens_q=cpu_offsets)
+            result.clone()
+    nodes = capture.build_nodes()
+    native = [
+        node for node in nodes.values() if node.annotations["raw_op_type"] == f"cann_ops_transformer.{name}.default"
+    ]
+    assert len(native) == 1
+    assert native[0].attrs["num_heads_q"] == 8
+    assert native[0].attrs["head_dim"] == 128
+    assert native[0].successors
+    assert all(native[0].op_id in nodes[key].predecessors for key in native[0].successors)
+    assert result.shape == (size,) and result.dtype == torch.int32 and result.device.type == "meta"
+    assert cpu_offsets.device.type == "cpu" and cpu_offsets.tolist() == [0, 128]
+    assert getattr(ascendc, name) is opaque
+
+
+@pytest.mark.parametrize(
+    "invalid_call", ["unknown_keyword", "duplicate_argument", "missing_argument", "extra_positional"]
+)
+def test_opaque_vendor_metadata_wrapper_rejects_invalid_schema_arguments(monkeypatch, invalid_call):
+    prepared = prepare_config(SimulationConfig())
+    from torchtitan_npu.override.deepseek_v4.sparse_attn import ascendc
+
+    def opaque(*args, **kwargs):
+        raise AssertionError("Invalid metadata arguments must not execute the wrapper")
+
+    monkeypatch.setattr(ascendc, "lightning_indexer_metadata", opaque)
+    arguments = [8, 1, 128, 512]
+    keywords = {"cu_seqlens_q": torch.tensor([0, 128], dtype=torch.int32)}
+    if invalid_call == "unknown_keyword":
+        keywords["unsupported_option"] = 1
+    elif invalid_call == "duplicate_argument":
+        keywords["num_heads_q"] = 8
+    elif invalid_call == "missing_argument":
+        arguments = arguments[:3]
+    else:
+        arguments.append(None)
+    with meta_runtime() as runtime:
+        runtime.configure_model(prepared)
+        with pytest.raises(TypeError):
+            ascendc.lightning_indexer_metadata(*arguments, **keywords)
+    assert ascendc.lightning_indexer_metadata is opaque
+
+
+def test_native_smoke_with_opaque_metadata_wrappers_keeps_gradients_and_memory(monkeypatch):
+    from torchtitan_simulator.compat.cann_metadata import METADATA_OPERATORS
+    from torchtitan_simulator.runner import simulate
+
+    from torchtitan_npu.override.deepseek_v4.sparse_attn import ascendc
+
+    options = SimulationConfig(seq_len=128, local_batch_size=1)
+    reference = simulate(options).iteration.schedule.annotations
+
+    def opaque(*args, **kwargs):
+        raise AssertionError("Native model metadata must use the dispatcher")
+
+    for name in METADATA_OPERATORS:
+        monkeypatch.setattr(ascendc, name, opaque)
+    workload = simulate(options)
+    actual = workload.iteration.schedule.annotations
+    assert actual["gradient_validation"] == reference["gradient_validation"]
+    assert len(actual["gradient_validation"]) == 112
+    assert actual["capture_validation"]["saved_slots"] == reference["capture_validation"]["saved_slots"]
+    assert actual["memory_plan"].peak_active_bytes == reference["memory_plan"].peak_active_bytes
+    assert actual["memory_plan"].persistent_param_bytes == reference["memory_plan"].persistent_param_bytes
+    assert actual["capture_validation"]["graph_acyclic"]
+    assert actual["capture_validation"]["peak_storage_unique"]
+    assert all(getattr(ascendc, name) is opaque for name in METADATA_OPERATORS)

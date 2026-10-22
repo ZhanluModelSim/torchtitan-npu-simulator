@@ -26,6 +26,8 @@
 | Kimi/raw_model/首层 replica／其他优化器 | 不属于本次 DSV4 标准路径 | 未迁移；不得据旧版支持推断新版可用 | legacy-patch-inventory.md |
 | CANN metadata 普通 dispatch | 原生 `torch.ops`；按能力探针修正 Meta 分配设备；注册可恢复 | Meta 已验证；准备阶段成本范围仍独立 | [test_metadata.py](../tests/test_metadata.py)、open-questions.md |
 
+CANN metadata 的泛型 Python 包装签名另有 [兼容修正与专项验证](cann-metadata-signature-compat.md)；用户 CANN 9.2.0 整套环境尚未复验，原 21 项结果仍按各自源码哈希解释。
+
 ## DSV4 组件与原生 override
 
 以下实现均通过原生模型配置和默认 `override.imports` 进入；逐配置完成状态以全规模矩阵为准。
