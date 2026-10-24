@@ -39,14 +39,27 @@ _active_param_scope: ContextVar[_OptimizerParamScope | None] = ContextVar(
 )
 
 
-def _optimizer_param_groups(optimizer_step: Callable) -> tuple[tuple[torch.Tensor, ...], ...]:
-    """Read optimizer-owned trainable parameters through public attributes."""
+def _optimizer_owners(optimizer_step: Callable) -> tuple:
     owner = getattr(optimizer_step, "__self__", None)
     if owner is None:
         return ()
-
     nested = getattr(owner, "optimizers", None)
-    optimizers = tuple(nested) if nested is not None else (owner,)
+    return tuple(nested) if nested is not None else (owner,)
+
+
+def optimizer_state_values(optimizer_step: Callable):
+    """Read actual optimizer state; None means the callable exposes no public owner."""
+    from collections.abc import Mapping
+
+    owners = _optimizer_owners(optimizer_step)
+    if not owners or any(not isinstance(getattr(owner, "state", None), Mapping) for owner in owners):
+        return None
+    return [owner.state for owner in owners]
+
+
+def _optimizer_param_groups(optimizer_step: Callable) -> tuple[tuple[torch.Tensor, ...], ...]:
+    """Read optimizer-owned trainable parameters through public attributes."""
+    optimizers = _optimizer_owners(optimizer_step)
     groups: list[tuple[torch.Tensor, ...]] = []
     seen: set[tuple[int, ...]] = set()
     for optimizer in optimizers:

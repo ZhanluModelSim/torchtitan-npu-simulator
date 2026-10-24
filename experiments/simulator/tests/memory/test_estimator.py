@@ -206,7 +206,7 @@ def test_activation_offload_covers_none_mode_and_reports_each_layer():
     assert all(item.resident_num_bytes == 0 for item in offloaded.values())
     assert offloaded_plan.model_active_bytes_peak < resident_plan.model_active_bytes_peak
 
-    summary = offloaded_plan.to_summary_dict()
+    summary = offloaded_plan.to_dict()
     assert summary["activation_offload_tensor_count"] == 2
     assert summary["activation_offload_logical_bytes"] == 192
     assert summary["activation_offload_modeled_bytes"] == 0
@@ -257,7 +257,7 @@ def test_autograd_saved_slots_preserve_use_def_only_activations():
     assert lifetimes["tensor:3"].kind == "activation"
     assert lifetimes["tensor:3"].death_seq == 5
     assert lifetimes["tensor:3"].reason == "backward_use_without_saved_slot"
-    assert plan.to_summary_dict()["autograd_saved_activation_count"] == 1
+    assert plan.to_dict()["autograd_saved_activation_count"] == 1
 
 
 def test_exact_autograd_saved_slots_drive_activation_offload():
@@ -291,7 +291,7 @@ def test_exact_autograd_saved_slots_drive_activation_offload():
     assert lifetimes["tensor:2"].resident_num_bytes == 0
     assert lifetimes["tensor:3"].kind == "activation"
     assert [item.tensor_id for item in plan.activation_offload_tensors] == ["tensor:2"]
-    summary = plan.to_summary_dict()
+    summary = plan.to_dict()
     assert summary["autograd_saved_activation_count"] == 1
     assert summary["autograd_saved_activation_modeled_bytes"] == 0
 
@@ -394,7 +394,7 @@ def test_activation_offload_preserves_pipeline_microbatch_instances():
         offload_ac_saved_tensors=True,
     )
 
-    marker = plan.to_summary_dict()["activation_prefetch"]["part0:layers.0"]
+    marker = plan.to_dict()["activation_prefetch"]["part0:layers.0"]
     assert marker["logical_bytes_per_instance"] == 64
     assert marker["logical_bytes_total"] == 128
     assert marker["instance_count"] == 2
@@ -465,7 +465,7 @@ def test_checkpoint_plugin_keeps_tensor_reused_during_recompute(
     assert lifetime.resident_num_bytes == modeled_bytes
     assert any(item.tensor_id == "tensor:2" for item in plan.timeline_events) is has_timeline
 
-    summary = plan.to_summary_dict()
+    summary = plan.to_dict()
     assert summary["checkpoint_recompute_saved_tensor_count"] == 1
     assert summary["checkpoint_recompute_saved_logical_bytes"] == 64
     assert summary["checkpoint_recompute_saved_modeled_bytes"] == modeled_bytes
@@ -598,7 +598,7 @@ def test_checkpoint_prefetch_matches_recompute_saved_tensors_to_microbatches():
     assert records["tensor:5"].pp_mb_idx == 1
     assert records["tensor:5"].seq_idx == 3
 
-    prefetch = plan.to_summary_dict()["checkpoint_prefetch"]["part0:layers.0"]
+    prefetch = plan.to_dict()["checkpoint_prefetch"]["part0:layers.0"]
     assert prefetch["prefetch_logical_bytes_per_instance"] == 80
     assert prefetch["instance_count"] == 2
     assert prefetch["prefetch_logical_bytes_total"] == 160
@@ -650,7 +650,7 @@ def test_checkpoint_prefetch_does_not_treat_external_context_as_internal_saved()
     external = next(item for item in plan.tensor_lifetimes if item.tensor_id == "external:1")
     assert external.kind == "external_input"
     assert external.resident_num_bytes == context.num_bytes
-    summary = plan.to_summary_dict()
+    summary = plan.to_dict()
     assert summary["checkpoint_recompute_saved_tensor_count"] == 0
     assert summary["checkpoint_prefetch_unattributed_tensor_count"] == 0
     assert "part0:layers.0" not in summary["checkpoint_prefetch"]
@@ -725,7 +725,7 @@ def test_checkpoint_boundary_can_offload_saved_activation_but_keeps_metadata():
     assert saved_record.dtype == "float32"
     assert saved_record.num_bytes == 64
     assert saved_record.modeled_num_bytes == 0
-    summary = plan.to_summary_dict()
+    summary = plan.to_dict()
     assert summary["checkpoint_tensor_logical_bytes"] == 64
     assert summary["checkpoint_tensor_modeled_bytes"] == 0
     marker = summary["checkpoint_saved_activations"]["part0:layers.1"]
@@ -830,7 +830,7 @@ def test_checkpoint_summary_preserves_size_variants_for_one_marker():
         ],
     )
 
-    marker = plan.to_summary_dict()["checkpoint_saved_activations"]["part0:shared_block"]
+    marker = plan.to_dict()["checkpoint_saved_activations"]["part0:shared_block"]
     assert marker["logical_bytes_per_instance"] is None
     assert marker["modeled_bytes_per_instance"] is None
     assert marker["instance_count"] == 2
@@ -839,7 +839,7 @@ def test_checkpoint_summary_preserves_size_variants_for_one_marker():
         64,
         128,
     ]
-    prefetch = plan.to_summary_dict()["checkpoint_prefetch"]["part0:shared_block"]
+    prefetch = plan.to_dict()["checkpoint_prefetch"]["part0:shared_block"]
     assert prefetch["prefetch_logical_bytes_per_instance"] is None
     assert prefetch["modeled_bytes_per_instance"] is None
     assert prefetch["instance_count"] == 2
@@ -926,7 +926,7 @@ def test_model_peak_excludes_optimizer_allocations():
 
     assert plan.model_active_bytes_peak == 48
     assert plan.peak_active_bytes == 528
-    assert plan.to_summary_dict()["model_active_bytes_peak"] == 48
+    assert plan.to_dict()["model_active_bytes_peak"] == 48
 
 
 def test_missing_parameter_gradients_are_reported_without_fabricating_storage():
@@ -1450,10 +1450,11 @@ def test_memory_plan_exports_compact_chrome_trace(tmp_path):
     assert any(item["ph"] == "X" and item["name"] == "backward" for item in events)
     assert any(item["ph"] == "X" and item["name"] == "recompute" for item in events)
     assert any(item["ph"] == "i" and item["name"] == "peak active bytes" for item in events)
-    assert trace["metadata"]["forward_active_bytes_peak"] == 64
-    assert trace["metadata"]["backward_active_bytes_peak"] == 64
-    assert trace["metadata"]["optimizer_active_bytes_peak"] == 0
-    assert trace["metadata"]["model_active_bytes_peak"] == 64
+    assert trace["metadata"] == {
+        "metric": plan.metric,
+        "timeline_scope": "captured_iteration",
+        **plan.to_summary_dict(),
+    }
 
     export_memory_plan(plan, str(tmp_path))
     memory_dir = tmp_path / "memory"

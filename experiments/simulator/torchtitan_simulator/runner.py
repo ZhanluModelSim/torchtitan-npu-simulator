@@ -7,7 +7,6 @@
 
 import logging
 from collections import Counter
-from pathlib import Path
 
 import torch
 
@@ -78,6 +77,13 @@ def _buffer_signature(model):
 
 def simulate(simulation):
     prepared = prepare_config(simulation)
+    if prepared.trainer.training.dtype != "float32":
+        raise ValueError(
+            "DeepSeek V4 capture requires training.dtype=float32: native FSDP expects uniform original "
+            "parameter dtype, but base bfloat16 mixes with explicit float32 attn_sink/ape parameters. "
+            "Use mixed_precision_param=bfloat16 for native BF16 compute, or memory_parameter_storage_dtype "
+            "for a storage-only estimate. Build-only can still inspect the native bfloat16 model."
+        )
     simulation = prepared.simulation
     config = prepared.trainer
     with meta_runtime() as runtime:
@@ -112,6 +118,7 @@ def simulate(simulation):
                 parameter_layouts[name] = {
                     "original_shape": original_shapes[name],
                     "local_shape": tuple(local.shape),
+                    "dtype": str(parameter.dtype),
                     "storage_bytes": local.numel() * local.element_size(),
                     "mesh_dim_names": tuple(mesh.mesh_dim_names) if mesh is not None else (),
                     "mesh_shape": tuple(mesh.shape) if mesh is not None else (),
@@ -283,65 +290,23 @@ def simulate(simulation):
     from torchtitan_simulator.validation import validate_workload
 
     workload.iteration.schedule.annotations["capture_validation"] = validate_workload(workload)
+    workload.iteration.schedule.annotations["precision_configuration"] = {
+        name: getattr(prepared.trainer.training, name)
+        for name in ("dtype", "mixed_precision_param", "mixed_precision_reduce")
+    }
     return workload
 
 
 def export_result(workload, simulation):
-    import json
+    """Write memory artifacts only; an empty format list has no filesystem effects."""
+    from torchtitan_simulator.memory.export import export_memory_plan
 
-    from torchtitan_simulator.memory.export import export_memory_details, export_memory_summary
-    from torchtitan_simulator.viz.json_export import export_json
-
-    directory = Path(simulation.output_dir)
-    directory.mkdir(parents=True, exist_ok=True)
+    unknown = set(simulation.output_formats) - {"mem"}
+    if unknown:
+        raise ValueError(f"Unsupported output formats: {sorted(unknown)}; only mem is supported")
+    if "mem" not in simulation.output_formats:
+        return
     memory = workload.iteration.schedule.annotations.get("memory_plan")
-    if memory is not None:
-        export_memory_summary(memory, str(directory))
-        if "mem" in simulation.output_formats:
-            export_memory_details(memory, str(directory))
-    if "json" in simulation.output_formats:
-        export_json(workload, str(directory / "simulation_result.json"))
-
-    if "text" in simulation.output_formats:
-        from torchtitan_simulator.viz.text_summary import export_text_summary
-
-        (directory / "simulation_result.txt").write_text(export_text_summary(workload))
-    if "html" in simulation.output_formats:
-        from torchtitan_simulator.viz.html_export import export_html
-
-        export_html(workload, str(directory / "simulation_result.html"))
-    if "dot" in simulation.output_formats:
-        from torchtitan_simulator.viz.dot_export import export_dot
-
-        export_dot(workload, str(directory / "simulation_result.dot"))
-    if "csv" in simulation.output_formats:
-        from torchtitan_simulator.viz.csv_export import export_kernel_summary_csv
-
-        export_kernel_summary_csv(workload, str(directory / "kernel_summary.csv"), max_ranks=simulation.csv_max_ranks)
-        for template_id, template in workload.step_templates.items():
-            template.export_l0_csv(str(directory / f"{template_id}_l0.csv"))
-        if workload.schedule_plan is not None:
-            workload.schedule_plan.export_schedule_plan_csv(str(directory / "schedule_plan.csv"))
-    annotations = workload.iteration.schedule.annotations
-    (directory / "export_manifest.json").write_text(
-        json.dumps(
-            {
-                "schema_version": 2,
-                "formats": simulation.output_formats,
-                "capture_coordinates": annotations.get("capture_coordinates", {}),
-                "batch_configuration": annotations.get("batch_configuration", {}),
-                "csv_max_ranks": simulation.csv_max_ranks,
-                "kernel_csv_scope": (
-                    "representative captured templates projected onto the first N logical rank labels; "
-                    "not independent per-rank captures"
-                ),
-                "schedule_authority": "SchedulePlan; schedule_plan.csv contains action and DataSlot sections",
-                "template_reference": "step_templates key equals StepGraph.step_id",
-                "memory_metric": (
-                    "logical active storage; excludes allocator cache/reserved, fragmentation and unmodeled workspace"
-                ),
-            },
-            indent=2,
-        )
-        + "\n"
-    )
+    if memory is None:
+        raise ValueError("Cannot export mem without a captured memory plan")
+    export_memory_plan(memory, simulation.output_dir)

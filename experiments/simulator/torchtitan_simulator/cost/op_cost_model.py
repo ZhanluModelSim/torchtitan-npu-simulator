@@ -74,6 +74,7 @@ class OpCostModel:
             "transpose": self._metadata_view,
             "split": self._metadata_view,
             "metadata_view": self._metadata_view,
+            "stream_wait": self._metadata_view,
         }
 
     def compute(

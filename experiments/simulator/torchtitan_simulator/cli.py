@@ -22,6 +22,12 @@ def main(argv=None):
     parser.add_argument(
         "--simulation.target-npu-device-type", dest="target_npu_device_type", choices=["non_a5", "a5"], default="non_a5"
     )
+    for option, destination, choices in (
+        ("dtype", "training_dtype", ["float32", "bfloat16"]),
+        ("mixed-precision-param", "mixed_precision_param", ["float32", "bfloat16"]),
+        ("mixed-precision-reduce", "mixed_precision_reduce", ["float32"]),
+    ):
+        parser.add_argument(f"--training.{option}", dest=destination, choices=choices)
     parser.add_argument("--training.seq-len", dest="seq_len", type=int, default=128)
     parser.add_argument("--training.num-mtp-modules", dest="num_mtp_modules", type=int, default=0)
     parser.add_argument("--training.local-batch-size", dest="local_batch_size", type=int)
@@ -49,8 +55,7 @@ def main(argv=None):
     parser.add_argument("--simulation.enable-fsdp-allgather-fp8", dest="enable_fsdp_allgather_fp8", action="store_true")
     parser.add_argument("--simulation.enable-ep-dispatch-fp8", dest="enable_ep_dispatch_fp8", action="store_true")
     parser.add_argument("--simulation.output-dir", dest="output_dir", default="./simulator_output")
-    parser.add_argument("--simulation.output-formats", dest="output_formats", nargs="*", default=[])
-    parser.add_argument("--simulation.csv-max-ranks", dest="csv_max_ranks", type=int, default=1)
+    parser.add_argument("--simulation.output-formats", dest="output_formats", nargs="*", choices=["mem"], default=[])
     for name, default in (
         ("data-parallel-replicate-degree", 1),
         ("data-parallel-shard-degree", -1),

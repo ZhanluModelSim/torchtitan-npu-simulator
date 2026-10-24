@@ -10,7 +10,7 @@ from torchtitan_simulator.runtime import meta_runtime
 from torchtitan_simulator.step import run_simulation_step
 
 
-def test_meta_linear_adamw_step_builds_graphs_and_local_parameter_memory():
+def test_meta_linear_adamw_step_builds_graphs_and_local_parameter_memory(capsys):
     model = torch.nn.Linear(3, 2, bias=False, device="meta")
     optimizer = torch.optim.AdamW(model.parameters(), foreach=False)
     inputs = torch.ones(4, 3, device="meta", requires_grad=True)
@@ -53,3 +53,55 @@ def test_meta_linear_adamw_step_builds_graphs_and_local_parameter_memory():
     memory = workload.iteration.schedule.annotations["memory_plan"]
     assert memory.persistent_param_bytes == 24
     assert memory.peak_active_bytes >= 24
+    output = capsys.readouterr().out
+    assert "Static memory:" not in output
+    assert "Timing Breakdown" not in output
+    rows = output.split("单卡内存（GiB；峰值包含常驻优化器状态）", 1)[1].strip().splitlines()
+    assert [row.strip().split(":")[0] for row in rows] == [
+        "稳态总峰值",
+        "前向峰值",
+        "反向峰值",
+        "优化器阶段峰值",
+        "权重大小",
+        "优化器状态大小",
+    ]
+
+
+def test_adamw_state_projection_matches_an_actually_warmed_meta_step():
+    model = torch.nn.Linear(3, 2, bias=False, device="meta")
+    optimizer = torch.optim.AdamW(model.parameters(), foreach=False)
+    dims = SimpleNamespace(
+        world_size=1, pp=1, dp_replicate=1, dp_shard=1, cp=1, tp=1, ep=1, pp_enabled=False, dp_enabled=False
+    )
+
+    def forward_backward_step(*, input_dict, labels, global_valid_tokens):
+        del labels
+        loss = model(input_dict["input"]).sum() / global_valid_tokens
+        loss.backward()
+        return loss
+
+    plans = []
+    for _ in range(2):
+        with meta_runtime():
+            workload = run_simulation_step(
+                model_parts=[model],
+                parallel_dims=dims,
+                forward_backward_step=forward_backward_step,
+                input_dict={"input": torch.ones(4, 3, device="meta")},
+                labels=torch.zeros(4, device="meta"),
+                optimizer_step=optimizer.step,
+                lr_scheduler_step=lambda: None,
+                local_batch_size=4,
+                seq_len=1,
+                local_valid_tokens=4,
+                memory_device_type="meta",
+            )
+        plans.append(workload.iteration.schedule.annotations["memory_plan"])
+    cold, warm = plans
+    # Two FP32 moments for a local 2x3 parameter; the CPU step scalar is excluded.
+    assert cold.optimizer_state_bytes == warm.optimizer_state_bytes == 48
+    assert cold.optimizer_state_storage_count == warm.optimizer_state_storage_count == 2
+    assert cold.steady_state_forward_peak_active_bytes == warm.forward_peak_active_bytes
+    assert cold.steady_state_backward_peak_active_bytes == warm.backward_peak_active_bytes
+    assert cold.steady_state_optimizer_peak_active_bytes == warm.optimizer_peak_active_bytes
+    assert cold.steady_state_peak_active_bytes == warm.peak_active_bytes

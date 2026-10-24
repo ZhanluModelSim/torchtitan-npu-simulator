@@ -136,7 +136,7 @@ def build_step_graphs(nodes: dict[int, OpNode]) -> dict[str, StepGraph]:
     graphs: dict[str, StepGraph] = {}
     for template_id, phase_nodes in buckets.items():
         # step_type is the comp_type (strip the "s{stage}_" prefix) so
-        # viz/exporters can group by compute-graph class.
+        # Consumers can group by compute-graph class.
         step_type = step_types[template_id]
         graphs[template_id] = StepGraph(step_id=template_id, step_type=step_type, nodes=phase_nodes)
     return graphs

@@ -74,7 +74,6 @@ def test_typed_cli_geometry_reaches_quantization_loss_backward_and_optimizer(mod
             "--simulation.output-dir",
             str(tmp_path),
             "--simulation.output-formats",
-            "json",
             "mem",
         ]
     )
@@ -102,7 +101,7 @@ def test_typed_cli_geometry_reaches_quantization_loss_backward_and_optimizer(mod
     raw = annotations["memory_plan"].raw_events
     assert any(event.raw_op_type == "npu.npu_quant_matmul.default" for event in raw)
     assert any(event.raw_op_type == "aten._fused_adamw_.default" for event in raw)
-    assert (tmp_path / "simulation_result.json").is_file()
+    assert (tmp_path / "memory/memory_summary.json").is_file()
 
 
 @pytest.mark.parametrize(

@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import weakref
 from contextlib import contextmanager
 from contextvars import ContextVar
 from types import SimpleNamespace
@@ -29,6 +30,7 @@ class MetaDeviceModule:
     name = "Meta_Simulator"
 
     def __init__(self):
+        self._default_stream = self.Stream()
         self._stream_context: ContextVar[MetaDeviceModule.Stream | None] = ContextVar(
             "simulator_device_stream", default=None
         )
@@ -92,10 +94,7 @@ class MetaDeviceModule:
 
     def current_stream(self, *_args: Any, **_kwargs: Any) -> MetaDeviceModule.Stream:
         stream = self._stream_context.get()
-        if stream is None:
-            stream = self.Stream()
-            self._stream_context.set(stream)
-        return stream
+        return stream if stream is not None else self._default_stream
 
     @contextmanager
     def stream(self, stream=None):
@@ -115,19 +114,32 @@ class MetaDeviceModule:
         these on the Event objects returned by `Stream.record_event()`."""
 
         def __init__(self, *_args: Any, **_kwargs: Any) -> None:
-            pass
+            self._capture_ref = None
+            self._frontier: tuple[int, ...] = ()
+            self._source_stream_id: int | None = None
 
         def query(self) -> bool:
             return True
 
-        def record(self, *_args: Any, **_kwargs: Any):
+        def record(self, stream=None):
+            from torchtitan_simulator.capture.dispatch_capture import get_active_capture
+
+            capture = get_active_capture()
+            self._capture_ref = weakref.ref(capture) if capture is not None else None
+            self._frontier = ()
+            self._source_stream_id = None
+            if capture is not None:
+                stream = stream if stream is not None else _current_stream()
+                self._frontier = capture.stream_frontier(stream)
+                self._source_stream_id = capture.stream_id(stream)
             return self
 
         def synchronize(self, *_args: Any, **_kwargs: Any) -> None:
             return None
 
-        def wait(self, *_args: Any, **_kwargs: Any) -> None:
-            return None
+        def wait(self, stream=None) -> None:
+            stream = stream if stream is not None else _current_stream()
+            stream.wait_event(self)
 
         def elapsed_time(self, *_args: Any, **_kwargs: Any) -> float:
             return 0.0
@@ -155,8 +167,34 @@ class MetaDeviceModule:
         def synchronize(self, *_args: Any, **_kwargs: Any) -> None:
             return None
 
-        def wait_event(self, *_args: Any, **_kwargs: Any) -> None:
-            return None
+        def wait_event(self, event: MetaDeviceModule.Event) -> None:
+            from torchtitan_simulator.capture.dispatch_capture import get_active_capture
 
-        def wait_stream(self, *_args: Any, **_kwargs: Any) -> None:
-            return None
+            capture = get_active_capture()
+            if capture is not None:
+                same_capture = event._capture_ref is not None and event._capture_ref() is capture
+                capture.record_stream_wait(
+                    self,
+                    event._frontier if same_capture else (),
+                    kind="wait_event",
+                    source_stream_id=event._source_stream_id if same_capture else None,
+                )
+
+        def wait_stream(self, stream: MetaDeviceModule.Stream) -> None:
+            from torchtitan_simulator.capture.dispatch_capture import get_active_capture
+
+            capture = get_active_capture()
+            if capture is not None:
+                capture.record_stream_wait(
+                    self,
+                    capture.stream_frontier(stream),
+                    kind="wait_stream",
+                    source_stream_id=capture.stream_id(stream),
+                )
+
+
+def _current_stream() -> MetaDeviceModule.Stream:
+    device = getattr(torch, "meta", None)
+    if not isinstance(device, MetaDeviceModule):
+        raise RuntimeError("Meta stream/event calls require the simulator logical device context")
+    return device.current_stream()

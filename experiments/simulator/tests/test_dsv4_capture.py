@@ -77,8 +77,8 @@ def test_native_dsv4_mtp_capture_has_gradients_closed_graph_and_memory(kwargs):
         == expected_shapes
     )
     assert sum(node.annotations["optimizer_updated_parameter_count"] for node in fused) == len(gradients)
-    source_op_ids = {node.annotations.get("source_op_id", node.op_id) for node in nodes.values()}
-    source_counts = Counter(node.annotations.get("source_op_id", node.op_id) for node in nodes.values())
+    source_op_ids = {node.op_id for node in nodes.values()}
+    source_counts = Counter(node.op_id for node in nodes.values())
     for event in annotations["communication_events"]:
         assert event["op_id"] in source_op_ids, event
         assert source_counts[event["op_id"]] == 1, event
@@ -87,7 +87,7 @@ def test_native_dsv4_mtp_capture_has_gradients_closed_graph_and_memory(kwargs):
     expected_reductions = sum(event["gradient_reduction"] for event in annotations["communication_events"])
     ownership = workload.schedule_plan.annotations["communication_ownership"]
     assert ownership["internal_gradient_reductions"] + ownership["external_gradient_reductions"] == expected_reductions
-    actual_to_graph = {node.annotations.get("source_op_id", node.op_id): node.op_id for node in nodes.values()}
+    actual_to_graph = {node.op_id: node.op_id for node in nodes.values()}
     optimizer_ancestors = set()
     pending = [node.op_id for node in nodes.values() if node.annotations["raw_op_type"] == "aten._fused_adamw_.default"]
     while pending:
@@ -153,7 +153,7 @@ def test_native_dsv4_mtp_capture_has_gradients_closed_graph_and_memory(kwargs):
         assert {"aten._to_copy.default", "aten.add_.Tensor", "fsdp.chunk_cat.default"} <= {
             node.annotations["raw_op_type"] for node in post
         }
-        post_ids = {node.annotations.get("source_op_id", node.op_id) for node in post}
+        post_ids = {node.op_id for node in post}
         casts = [
             event
             for event in memory.raw_events

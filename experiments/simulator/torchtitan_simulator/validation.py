@@ -85,19 +85,11 @@ def validate_workload(workload: WorkloadGraph) -> dict:
         _require(instance.step_ref in templates, "instance references missing template")
     for data_pass in schedule.data_passes:
         _require(data_pass.src_instance in instances and data_pass.dst_instance in instances, "invalid DataPass")
-    sources = Counter(node.annotations.get("source_op_id", node.op_id) for node in nodes.values())
     native_ids = annotations["native_dispatch_op_ids"]
-    _require(all(sources[op_id] == 1 for op_id in native_ids), "native dispatch node lost or duplicated")
-    _require(
-        all(
-            not entry["scope"].startswith(("fsdp_", "replicate_"))
-            for entry in annotations["suppressed_dispatch_counts"]
-        ),
-        "native FSDP dispatch was suppressed",
-    )
+    _require(all(op_id in nodes for op_id in native_ids), "native dispatch node lost or duplicated")
     communication = annotations["communication_events"]
     for event in communication:
-        _require(sources[event["op_id"]] == 1, "communication source missing or duplicated")
+        _require(event["op_id"] in nodes, "communication source missing or duplicated")
         _require(bool(event["comm_ranks"]), "communication group lost its ranks")
         _require(
             any(coordinates["logical_rank"] in ranks for ranks in event["comm_ranks"]),
@@ -112,9 +104,8 @@ def validate_workload(workload: WorkloadGraph) -> dict:
     )
     if expected_dp_reduction:
         _require(any(event["gradient_reduction"] for event in communication), "missing actual DP gradient reduction")
-    actual_to_graph = {node.annotations.get("source_op_id", node.op_id): node.op_id for node in nodes.values()}
     for event in communication:
-        node = nodes[actual_to_graph[event["op_id"]]]
+        node = nodes[event["op_id"]]
         _require(
             communication_primitive(node.annotations["raw_op_type"]) == event["comm_primitive"],
             "communication descriptor differs from native operator",
@@ -165,7 +156,7 @@ def validate_workload(workload: WorkloadGraph) -> dict:
             pending.extend(nodes[op_id].predecessors)
     for event in communication:
         if event.get("gradient_reduction"):
-            _require(actual_to_graph[event["op_id"]] in ancestors, "gradient reduction disconnected from optimizer")
+            _require(event["op_id"] in ancestors, "gradient reduction disconnected from optimizer")
     _require(all(node.op_id in ancestors for node in clipped), "clip disconnected from optimizer")
     memory = annotations["memory_plan"]
     _require(not any("marker imbalance" in note for note in memory.notes), "unbalanced FSDP residency")
@@ -213,6 +204,36 @@ def validate_workload(workload: WorkloadGraph) -> dict:
         for key in ([item.storage_key] if item.storage_key else [key for key, _ in allocations[item.tensor_id]])
     ]
     _require(len(keys) == len(set(keys)), "duplicate peak storage")
+    if memory.optimizer_state_bytes is not None:
+        states = [item for item in memory.tensor_lifetimes if item.kind == "optimizer_state"]
+        _require(len({item.storage_key for item in states}) == len(states), "duplicate optimizer state storage")
+        _require(memory.optimizer_state_storage_count == len(states), "optimizer state count differs")
+        _require(
+            memory.optimizer_state_bytes == sum(item.resident_num_bytes for item in states),
+            "optimizer state bytes differ",
+        )
+        steady_deltas = Counter()
+        end = max((item.death_seq for item in memory.tensor_lifetimes), default=0)
+        for item in memory.tensor_lifetimes:
+            state = item.kind == "optimizer_state"
+            steady_deltas[-1 if state else item.birth_seq] += item.resident_num_bytes
+            steady_deltas[(end if state else item.death_seq) + 1] -= item.resident_num_bytes
+        steady_active = steady_peak = 0
+        for seq in sorted(steady_deltas):
+            steady_active += steady_deltas[seq]
+            steady_peak = max(steady_peak, steady_active)
+        _require(steady_peak == memory.steady_state_peak_active_bytes, "steady-state lifetime sweep peak differs")
+        steady_phases = [
+            value
+            for value in (
+                memory.steady_state_forward_peak_active_bytes,
+                memory.steady_state_backward_peak_active_bytes,
+                memory.steady_state_optimizer_peak_active_bytes,
+            )
+            if value is not None
+        ]
+        _require(len(steady_phases) == 3, "missing steady-state phase peak")
+        _require(memory.steady_state_peak_active_bytes == max(steady_phases), "steady-state phase peaks differ")
     refs = defaultdict(set)
     for ref in memory.initial_tensors:
         refs[ref.tensor_id].add((ref.storage_key, ref.shape, ref.dtype))

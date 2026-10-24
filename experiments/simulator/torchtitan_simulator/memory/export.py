@@ -269,16 +269,8 @@ def memory_plan_to_chrome_trace(plan: MemoryPlan) -> dict:
         "traceEvents": trace_events,
         "metadata": {
             "metric": plan.metric,
-            "parameter_storage_dtype": plan.parameter_storage_dtype or "captured",
-            "offload_ac_saved_tensors": plan.offload_ac_saved_tensors,
-            "persistent_param_bytes": plan.persistent_param_bytes,
-            "active_bytes_peak": plan.peak_active_bytes,
-            "model_active_bytes_peak": plan.model_active_bytes_peak,
-            "forward_active_bytes_peak": plan.forward_peak_active_bytes,
-            "backward_active_bytes_peak": plan.backward_peak_active_bytes,
-            "optimizer_active_bytes_peak": plan.optimizer_peak_active_bytes,
-            "peak_seq_idx": plan.peak_seq_idx,
-            "memory_action_span_count": len(plan.action_spans),
+            "timeline_scope": "captured_iteration",
+            **plan.to_summary_dict(),
         },
     }
 

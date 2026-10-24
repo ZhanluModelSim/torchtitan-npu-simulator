@@ -120,7 +120,6 @@ class _RawEvent:
     module_path: str = ""
     phase: str = "forward"
     execution_kind: str = "original_forward"
-    repeat_count: int = 1
     group_name: str = ""
     raw_group_name: str = ""
     comm_dim: str = ""
@@ -237,10 +236,6 @@ class OpDispatchCapture(TorchDispatchMode):
         self._autograd_saved_tensor_events: list[AutogradSavedTensorEvent] = []
         self._pending_saved_tensor_unpacks: list[int] = []
         self._producer: dict[int, int] = {}
-        # Dispatcher ops hidden by a scaffold scope still need to forward
-        # their data dependencies to the synthetic collective that consumes
-        # their result. A value may depend on more than one retained op.
-        self._suppressed_tensor_predecessors: dict[int, set[int]] = {}
         self._mutation_frontier: dict[int, int] = {}
         self._tensor_identities: dict[int, tuple[weakref.ReferenceType[torch.Tensor], int]] = {}
         self._reused_tensor_ids = itertools.count(1)
@@ -249,16 +244,12 @@ class OpDispatchCapture(TorchDispatchMode):
         self._saved_value_ids: dict[tuple, int] = {}
         self._value_aliases: dict[int, int] = {}
         self._storage_mutation_frontier: dict[str, int] = {}
+        self._stream_ids: dict[object, int] = {}
+        self._stream_frontiers: dict[object, int] = {}
         self._previous_active_capture: OpDispatchCapture | None = None
         self._capture_l0: bool = True  # pass-through when False (duplicate class)
         self._compute_instances: dict[tuple[int, int, str], dict[str, Any]] = {}
-        # A scoped suppression channel for framework bookkeeping. Unlike
-        # ``suspend_recording()``, this affects only dispatcher-originated
-        # events: callers may still add an explicit synthetic collective node
-        # that represents the whole operation.
-        self._dispatch_suppression_scopes: list[str] = []
         self._dispatch_annotation_scopes: list[str] = []
-        self._suppressed_dispatch_counts: dict[tuple[str, str], int] = {}
         self._pending_comm_links: dict[str, CommEvent] = {}  # output storage → first consumer
         # All compute classes on a stage share one representative microbatch.
         # Other microbatches remain pass-through schedule instances.
@@ -307,12 +298,13 @@ class OpDispatchCapture(TorchDispatchMode):
     def release_operator_tracking(self) -> None:
         """Release capture-only indices once nodes and instance spans are built."""
         self._events.clear()
+        self._stream_ids.clear()
+        self._stream_frontiers.clear()
         self._producer.clear()
         self._mutation_frontier.clear()
         self._storage_mutation_frontier.clear()
         self._tensor_identities.clear()
         self._value_aliases.clear()
-        self._suppressed_tensor_predecessors.clear()
         self._pending_comm_links.clear()
 
     @contextmanager
@@ -324,27 +316,6 @@ class OpDispatchCapture(TorchDispatchMode):
             yield
         finally:
             self._capture_l0 = previous
-
-    @contextmanager
-    def suppress_dispatch_events(self, provenance: str) -> Iterator[None]:
-        """Exclude framework scaffolding while preserving synthetic capture.
-
-        FSDP and fake collective wrappers may allocate temporary buffers or
-        perform copies solely to implement a collective.  The simulator emits
-        one synthetic ``comm.*`` node for that collective instead.  This scope
-        keeps the implementation-detail dispatcher ops out of the L1 graph
-        without suppressing that explicit synthetic node.
-        """
-        self._dispatch_suppression_scopes.append(provenance)
-        try:
-            yield
-        finally:
-            self._dispatch_suppression_scopes.pop()
-
-    @property
-    def suppressed_dispatch_counts(self) -> dict[tuple[str, str], int]:
-        """Audit counts for dispatcher ops excluded by scoped suppression."""
-        return dict(self._suppressed_dispatch_counts)
 
     @contextmanager
     def annotate_dispatch_events(self, provenance: str) -> Iterator[None]:
@@ -375,20 +346,6 @@ class OpDispatchCapture(TorchDispatchMode):
         )
 
         if not self._capture_l0:
-            return result
-
-        if self._capture_l0 and self._dispatch_suppression_scopes:
-            flat_inputs = _flatten_tensors(args) + _flatten_tensors(tuple(kwargs.values()))
-            flat_outputs = _flatten_tensors(result if isinstance(result, (tuple, list)) else (result,))
-            predecessor_ids = {
-                predecessor
-                for tensor in flat_inputs
-                for predecessor in self._predecessors_for_tensor_id(self.tensor_id(tensor))
-            }
-            key = (self._dispatch_suppression_scopes[-1], str(func))
-            self._suppressed_dispatch_counts[key] = self._suppressed_dispatch_counts.get(key, 0) + 1
-            for tensor in flat_outputs:
-                self._suppressed_tensor_predecessors[self.tensor_id(tensor)] = set(predecessor_ids)
             return result
 
         flat_inputs = _flatten_tensors(args) + _flatten_tensors(tuple(kwargs.values()))
@@ -559,6 +516,35 @@ class OpDispatchCapture(TorchDispatchMode):
             )
         )
 
+    def stream_id(self, stream: object) -> int:
+        """Capture-local stream identity; retain objects to avoid Python ID reuse."""
+        return self._stream_ids.setdefault(stream, len(self._stream_ids))
+
+    def stream_frontier(self, stream: object) -> tuple[int, ...]:
+        """Snapshot only work already submitted on this stream."""
+        frontier = self._stream_frontiers.get(stream)
+        return (frontier,) if frontier is not None else ()
+
+    def record_stream_wait(
+        self,
+        stream: object,
+        source_frontier: tuple[int, ...],
+        *,
+        kind: str,
+        source_stream_id: int | None,
+    ) -> None:
+        """A zero-duration join orders future stream work without tensor operands."""
+        self._record_event(
+            "simulator.stream_wait",
+            [],
+            [],
+            "",
+            attrs={"kind": kind, "source_stream_id": source_stream_id},
+            extra_annotations={"control_node": True, "zero_duration": True},
+            execution_stream=stream,
+            control_predecessors=source_frontier,
+        )
+
     def _record_event(
         self,
         raw_op_type: str,
@@ -576,6 +562,8 @@ class OpDispatchCapture(TorchDispatchMode):
         extra_annotations: dict[str, Any] | None = None,
         mutated_inputs: list[torch.Tensor] | None = None,
         visible_in_ir: bool = True,
+        execution_stream: object | None = None,
+        control_predecessors: tuple[int, ...] = (),
     ) -> int | None:
         if not self._capture_l0:
             return  # pass-through: duplicate (stage, comp_type) class skips L0 capture
@@ -591,6 +579,17 @@ class OpDispatchCapture(TorchDispatchMode):
                 return
         except Exception:
             pass
+        # Metadata aliases execute on the host, not on a device stream. Making
+        # them stream submissions would turn an async buffer view into a barrier.
+        if execution_stream is None and visible_in_ir and not is_metadata_view_op(raw_op_type):
+            from torchtitan_simulator.compat.device import MetaDeviceModule
+
+            device = getattr(torch, "meta", None)
+            if isinstance(device, MetaDeviceModule) and any(
+                tensor.device.type == "meta" for tensor in (*flat_inputs, *flat_outputs)
+            ):
+                execution_stream = device.current_stream()
+        stream_predecessors = self.stream_frontier(execution_stream) if execution_stream is not None else ()
         input_ids = [self.tensor_id(tensor) for tensor in flat_inputs]
         output_ids = [self.tensor_id(tensor) for tensor in flat_outputs]
         dependency_input_ids = [self.tensor_id(tensor) for tensor in (dependency_flat_inputs or [])]
@@ -615,6 +614,8 @@ class OpDispatchCapture(TorchDispatchMode):
                 for predecessor in self._predecessors_for_tensor_id(tensor_id)
             }
             | alias_frontier_ids
+            | set(control_predecessors)
+            | set(stream_predecessors)
         )
         if input_metas is None:
             input_metas = (
@@ -672,6 +673,12 @@ class OpDispatchCapture(TorchDispatchMode):
             self._compute_instances[key] = instance
         instance["end_seq_idx"] = seq_idx
         if visible_in_ir:
+            extra_annotations = dict(extra_annotations or {})
+            if execution_stream is not None:
+                extra_annotations["stream_id"] = self.stream_id(execution_stream)
+                extra_annotations["stream_predecessors"] = list(stream_predecessors)
+            if control_predecessors:
+                extra_annotations["event_predecessors"] = list(control_predecessors)
             candidate = _RawEvent(
                 op_id=op_id,
                 raw_op_type=raw_op_type,
@@ -692,8 +699,10 @@ class OpDispatchCapture(TorchDispatchMode):
                 extra_annotations=(dict(extra_annotations) if extra_annotations is not None else None),
             )
             self._events.append(candidate)
+            if execution_stream is not None:
+                self._stream_frontiers[execution_stream] = op_id
 
-        if self.record_memory:
+        if self.record_memory and raw_op_type != "simulator.stream_wait":
             self._memory_events.append(
                 RawMemoryEvent(
                     event_id=next(_memory_event_counter),
@@ -733,7 +742,6 @@ class OpDispatchCapture(TorchDispatchMode):
                     event.dst_entry_op = op_id
 
         for tid in output_ids:
-            self._suppressed_tensor_predecessors.pop(tid, None)
             self._producer[tid] = op_id
         for tensor in mutated_inputs or ():
             self._mutation_frontier[self._alias_root_id(tensor)] = op_id
@@ -763,7 +771,7 @@ class OpDispatchCapture(TorchDispatchMode):
             identity = (StorageWeakRef(storage), f"{pointer}:{next(self._storage_generations)}")
             self._storage_identities[pointer] = identity
         if self.record_memory and self._capture_l0:
-            self._storage_lifetimes.register(identity[1], identity[0])
+            self._storage_lifetimes.register(identity[1], identity[0], storage=storage)
         return identity[1], int(storage.nbytes())
 
     def _saved_value_key(self, tensor: torch.Tensor) -> tuple:
@@ -864,15 +872,20 @@ class OpDispatchCapture(TorchDispatchMode):
 
     def record_initial_memory_tensors(self, value):
         """Declare actual caller-owned tensors that predate the first op."""
-        from torchtitan_simulator.metadata import iter_metadata_tensors
-
         if self._memory_events:
             raise ValueError("Initial memory inputs must be recorded before the first dispatcher event")
         if not self.record_memory:
             return
-        self._initial_memory_tensors = [
-            self._memory_ref(tensor, f"initial_{index}", self.tensor_id(tensor))
-            for index, tensor in enumerate(iter_metadata_tensors(value))
+        self._initial_memory_tensors = self.memory_tensor_refs(value, name_prefix="initial")
+
+    def memory_tensor_refs(self, value, *, name_prefix: str) -> list[TensorRef]:
+        """Snapshot local metadata with the same storage generations as dispatch."""
+        from torchtitan_simulator.metadata import iter_metadata_tensors
+
+        tensors = _flatten_tensors(list(iter_metadata_tensors(value)))
+        return [
+            self._memory_ref(tensor, f"{name_prefix}_{index}", self.tensor_id(tensor))
+            for index, tensor in enumerate(tensors)
         ]
 
     def initial_memory_tensors(self):
@@ -904,7 +917,7 @@ class OpDispatchCapture(TorchDispatchMode):
             return {self._producer[tensor_id]}
         if tensor_id in self._value_aliases:
             return self._predecessors_for_tensor_id(self._value_aliases[tensor_id])
-        return self._suppressed_tensor_predecessors.get(tensor_id, set())
+        return set()
 
     def __enter__(self) -> OpDispatchCapture:
         super().__enter__()
@@ -940,8 +953,6 @@ class OpDispatchCapture(TorchDispatchMode):
                 annotations["module_path"] = event.module_path
             if event.tensor_shape_scope != "local":
                 annotations["tensor_shape_scope"] = event.tensor_shape_scope
-            if event.repeat_count > 1:
-                annotations["repeat_count"] = event.repeat_count
             if is_metadata_view_op(event.raw_op_type):
                 annotations["metadata_view"] = True
             if cost.unknown:
@@ -980,49 +991,6 @@ class OpDispatchCapture(TorchDispatchMode):
                 if pred_id in nodes:
                     nodes[pred_id].successors.append(op_id)
 
-        # Some autograd collectives hand their gradient to the engine through
-        # C++ accumulation without a dispatcher-visible tensor consumer. For
-        # synchronous calls, conservatively gate the next connected backward
-        # chain so replay cannot move it ahead of the collective.
-        ordered_nodes = sorted(nodes.values(), key=lambda node: node.seq_idx)
-        for index, node in enumerate(ordered_nodes):
-            if (
-                not node.annotations.get(
-                    "sync_collective_sequence_fallback",
-                    False,
-                )
-                or node.successors
-            ):
-                continue
-            if (
-                node.op_type == "allreduce"
-                and node.annotations.get("comm_dim") == "dp_replicate"
-                and node.annotations.get("fsdp_group_id")
-            ):
-                # Native HSDP launches this all-reduce on its dedicated AR
-                # stream and retains the result for gradient handling. It is
-                # not a data dependency of the next backward compute chain.
-                # Stream order is restored by FSDP communication ownership.
-                node.annotations["fsdp_async_allreduce"] = True
-                continue
-            for candidate_index in range(index + 1, len(ordered_nodes)):
-                candidate = ordered_nodes[candidate_index]
-                if (
-                    candidate.annotations.get("phase") != node.annotations.get("phase")
-                    or candidate.annotations.get("execution_kind") != node.annotations.get("execution_kind")
-                    or candidate.annotations.get("comp_type") != node.annotations.get("comp_type")
-                    or not candidate.successors
-                ):
-                    continue
-                candidate.predecessors.append(node.op_id)
-                candidate.annotations.setdefault("captured_control_dependencies", []).append(
-                    {
-                        "source_op_id": node.op_id,
-                        "evidence": "synchronous_collective_return_before_dispatch",
-                    }
-                )
-                node.successors.append(candidate.op_id)
-                break
         return nodes
 
     def apply_comm_group_names(
@@ -1038,7 +1006,7 @@ class OpDispatchCapture(TorchDispatchMode):
             event.comm_dim = event.group_name
 
     def memory_events(self) -> list[RawMemoryEvent]:
-        """Return the uncollapsed op stream used by static memory planning."""
+        """Return the captured operator events used by static memory planning."""
         return list(self._memory_events)
 
     def checkpoint_boundary_events(self) -> list[CheckpointBoundaryEvent]:

@@ -1,7 +1,11 @@
 # DSV4 迁移能力矩阵
 
-当前实现按原生 dispatch 优先收敛；本轮复验与精确结果见 [收敛记录](dispatch-first-remediation.md)。本轮七个 preset × 三种 AC 共 21 项全规模 Meta 复验及独立导出／分阶段内存审计全部通过。表中「Meta 已验证」仅指固定软件栈下可执行的仿真路径；不代表 NPU 数值或性能已验证。
-当前精确结果见 [本轮结果](dispatch-first-results.json)，复现方式见 [收敛记录](dispatch-first-remediation.md#镜像与复现)；本文末尾与 `s5-results.json` 保留历史对照。
+2026-10-23 已补齐 FSDP stream/event 控制依赖，四组配置复验通过。当前图包含零耗时 `stream_wait` 节点，上游必须保留其前驱约束。详见 [修复与复验](fsdp-dependency-audit.md#修复与复验) 和 [接入合同](stream-control-dependencies.md)。
+
+当前实现已取消图折叠与 mem 以外的导出，FSDP 模板改写和恢复补偿也已删除，见 [精简记录](simulator-cleanup.md)；精度边界见 [mem 与精度审计](mem-only-precision.md)。以下 21 项全规模结果属于此前源码快照，不是本次源码的全规模重跑。
+
+原生 dispatch 优先收敛阶段的复验与精确结果见 [收敛记录](dispatch-first-remediation.md)。本轮七个 preset × 三种 AC 共 21 项全规模 Meta 复验及独立导出／分阶段内存审计全部通过。表中「Meta 已验证」仅指固定软件栈下可执行的仿真路径；不代表 NPU 数值或性能已验证。
+该阶段精确结果见 [本轮结果](dispatch-first-results.json)，复现方式见 [收敛记录](dispatch-first-remediation.md#镜像与复现)；本文末尾与 `s5-results.json` 保留历史对照。
 
 | 能力 | 当前验证范围 | 状态／边界 | 证据入口 |
 | --- | --- | --- | --- |
@@ -11,22 +15,26 @@
 | tensor/storage/generation/alias/mutation | CPU、Meta、DTensor、原生保存值 | 已验证；不伪造同形保存张量 | [capture/test_saved_tensor_identity.py](../tests/capture/test_saved_tensor_identity.py)、[test_s4_mxfp8.py](../tests/test_s4_mxfp8.py) |
 | DP/FSDP/HSDP/EFSDP、EP、TP/SP、CP | 11 个轴／组合；rank 1/8/15 | Meta 已验证；通信由 fake process group 承载 | [test_dsv4_capture.py](../tests/test_dsv4_capture.py) |
 | AG/RS/AR/A2A/wait 与优化器依赖 | 原生 functional/c10d/DTensor transport；全部 chunk、实际 process group；归约→clip→optimizer | Meta 已验证；不替换通信 API/梯度；Gloo 两 rank 契约另验，无真实 HCCL 性能 | [test_dsv4_capture.py](../tests/test_dsv4_capture.py)、[capture/test_fsdp_residency.py](../tests/capture/test_fsdp_residency.py) |
+| FSDP stream/event 等待与同流顺序 | FSDP／HSDP／组合并行／SAC+MXFP8；事件快照、延后传播、独立流重叠 | Meta 已验证；host synchronize、轮询和真实设备时序不在范围 | [流控制依赖](stream-control-dependencies.md)、[原生回归](../tests/test_fsdp_stream_capture.py) |
 | Full/Selective AC 与保存生命周期 | none/full/selective；early stop、重算、save/unpack/release | Meta/CPU 已验证 | [test_s3_native_lifetimes.py](../tests/test_s3_native_lifetimes.py)、[memory/test_s3_lifetime_oracles.py](../tests/memory/test_s3_lifetime_oracles.py) |
 | Selective save-set | default/gmm/quant-mm/comm/none 等已公开选择 | 有限支持；未命中 collective 时 warning；特殊 fake A2A cache 后置 | [test_s3_native_lifetimes.py](../tests/test_s3_native_lifetimes.py)、[test_s4_mxfp8.py](../tests/test_s4_mxfp8.py) |
 | MXFP8 | 原生 TorchAO-NPU recipe；MM/BMM/grouped MM 前后向、真实 code/scale | Meta 已验证；不额外量化原生 recipe 未选中的 MTP 投影 | [test_s4_mxfp8.py](../tests/test_s4_mxfp8.py) |
-| shard dtype 与保存激活 offload | BF16/MXFP8、三种 AC 的内存投影 | 有限支持；不执行 offload／传输建模 | [test_s3_native_lifetimes.py](../tests/test_s3_native_lifetimes.py)、[test_s5_exports.py](../tests/test_s5_exports.py) |
-| GBS/GA | 批配置和 token 分母保留 | 单 microbatch 模板；无完整多 MB 峰值回放 | [test_s3_native_lifetimes.py](../tests/test_s3_native_lifetimes.py)、[test_s5_exports.py](../tests/test_s5_exports.py) |
+| shard dtype 与保存激活 offload | BF16/MXFP8、三种 AC 的内存投影 | 有限支持；不执行 offload／传输建模 | [test_s3_native_lifetimes.py](../tests/test_s3_native_lifetimes.py)、[test_memory_delivery.py](../tests/test_memory_delivery.py) |
+| GBS/GA | 批配置和 token 分母保留 | 单 microbatch 模板；无完整多 MB 峰值回放 | [test_s3_native_lifetimes.py](../tests/test_s3_native_lifetimes.py)、[test_memory_delivery.py](../tests/test_memory_delivery.py) |
 | typed model overrides | 原生配置树重建，构建和量化 F/B/O | 已验证；非支持字段拒绝 | [test_model_overrides.py](../tests/test_model_overrides.py) |
-| L0→L1→L2→L3 | 稳定模板 ID、全局 DAG、双向边、DataSlot/实例引用、通信归属 | 全规模 Meta 已验证 | [validation.py](../torchtitan_simulator/validation.py)、[test_s5_exports.py](../tests/test_s5_exports.py) |
-| text/html/dot/json/csv/mem 与 memory summary | 原生 CLI 完整导出；CSV 限制不改变 world | 已验证；大模型有限格式；CSV rank 行为代表模板投影 | [test_s5_exports.py](../tests/test_s5_exports.py)、[全规模结果](dispatch-first-results.json) |
+| L0→L1→L2→L3 | 稳定模板 ID、全局 DAG、双向边、DataSlot/实例引用、通信归属 | 全规模 Meta 已验证 | [validation.py](../torchtitan_simulator/validation.py)、[test_memory_delivery.py](../tests/test_memory_delivery.py) |
+| mem 导出与完整原始图 | CLI mem-only；[] 无文件副作用；view/alias 不折叠 | Meta 已验证范围见本轮审计；其余图导出移除 | [test_memory_delivery.py](../tests/test_memory_delivery.py)、[本轮审计](mem-only-precision.md) |
+| 原生精度配置 | base FP32，param BF16/FP32，reduce FP32 | DSV4 base BF16 完整捕获拒绝；不支持 FP16/低精度 reduce | [test_precision.py](../tests/test_precision.py)、[精度边界](mem-only-precision.md) |
+| 稳态优化器状态驻留 | 实际本地 state storage 去重；前向／反向／优化器及总峰值 | Meta 投影；汇总仅六项；未知 owner 不猜测 | [稳态内存](steady-state-memory.md)、[状态测试](../tests/memory/test_optimizer_state.py) |
 | 逻辑内存估算 | 实际 storage/保存槽/FSDP 区间、独立峰值求和与去重 | Meta/CPU 已验证；不含 allocator/workspace | [内存测试](../tests/memory/)、validation.py |
+| storage 释放检测 | 弱引用候选队列＋原生过期确认；每个 dispatch 边界；不支持弱引用时退回原生逐边界检查 | CPU／Meta、四并行／AC 组合及完整 Flash 已验证；不改变内存语义 | [生命周期优化](storage-lifetime-optimization.md)、[逐边界测试](../tests/test_storage_lifetime_capture.py) |
 | PP | 原有结构单测保留 | 低优先级；训练入口拒绝 | [test_config.py](../tests/test_config.py) |
 | FP8 EP dispatch／FSDP AG | 与 MXFP8 计算分开 | 低优先级；入口拒绝 | [test_config.py](../tests/test_config.py) |
 | A5、真实训练数值、allocator 峰值 | 当前无真实 NPU | 未验证；A5 入口拒绝 | [test_config.py](../tests/test_config.py)、migration-status.md |
 | Kimi/raw_model/首层 replica／其他优化器 | 不属于本次 DSV4 标准路径 | 未迁移；不得据旧版支持推断新版可用 | legacy-patch-inventory.md |
 | CANN metadata 普通 dispatch | 原生 `torch.ops`；按能力探针修正 Meta 分配设备；注册可恢复 | Meta 已验证；准备阶段成本范围仍独立 | [test_metadata.py](../tests/test_metadata.py)、open-questions.md |
 
-CANN metadata 的泛型 Python 包装签名另有 [兼容修正与专项验证](cann-metadata-signature-compat.md)；用户 CANN 9.2.0 整套环境尚未复验，原 21 项结果仍按各自源码哈希解释。
+CANN metadata 的泛型 Python 包装签名另有 [兼容修正与专项验证](cann-metadata-signature-compat.md)；用户已反馈其 CANN 9.2.0 环境轻量 CLI 运行成功；该反馈不等于完整矩阵复验，原 21 项结果仍按各自源码哈希解释。
 
 ## DSV4 组件与原生 override
 

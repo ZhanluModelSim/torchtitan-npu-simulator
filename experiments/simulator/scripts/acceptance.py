@@ -61,9 +61,8 @@ def run_case(args):
         seq_len=512,
         local_batch_size=1,
         activation_checkpoint_mode=args.mode,
-        csv_max_ranks=1,
         output_dir=str(destination),
-        output_formats=["text", "html", "dot", "json", "csv", "mem"] if small else ["text", "csv", "mem"],
+        output_formats=["mem"],
     )
     started = time.monotonic()
     workload = simulate(options)
@@ -81,37 +80,34 @@ def run_case(args):
         require(kinds["recompute"] > 0, "AC did not execute recomputation")
     export_result(workload, options)
     summary = json.loads((destination / "memory/memory_summary.json").read_text())
-    require(summary["active_bytes_peak"] == report["peak_active_bytes"], "memory consumer peak differs")
-    nodes = {str(node.op_id): node for template in workload.step_templates.values() for node in template.nodes.values()}
-    with (destination / "kernel_summary/rank_0.csv").open() as stream:
-        rows = list(csv.DictReader(stream))
-    expected = {key for key, node in nodes.items() if not node.annotations.get("metadata_view")}
-    require({row["op_id"] for row in rows} == expected and len(rows) == len(expected), "kernel CSV lost/duplicated ops")
-    require(len(list((destination / "kernel_summary").glob("rank_*.csv"))) == 1, "CSV rank limit ineffective")
-    with (destination / "schedule_plan.csv").open() as stream:
-        reader = csv.DictReader(stream)
-        actions = []
-        for row in reader:
-            if row["seq_idx"] == "# DataSlots":
-                break
-            actions.append(row)
+    require(summary == memory.to_summary_dict() and len(summary) == 6, "memory consumer summary differs")
+    require({path.name for path in destination.iterdir()} == {"memory"}, "unexpected non-memory export")
+    with (destination / "memory/memory_timeline.csv").open() as stream:
+        active = peak = 0
+        for row in csv.DictReader(stream):
+            active += int(row["num_bytes"]) * (1 if row["action"] == "alloc" else -1)
+            require(active == int(row["active_bytes_after"]), "memory timeline bytes differ")
+            peak = max(peak, active)
+    require(peak == report["peak_active_bytes"], "exported memory peak differs")
+    require(summary["optimizer_state_bytes"] > 0, "optimizer state inventory missing")
     require(
-        {row["action_id"] for row in actions} == set(workload.schedule_plan.action_map),
-        "schedule CSV differs from plan",
+        summary["steady_state_active_bytes_peak"]
+        == max(summary[f"steady_state_{phase}_active_bytes_peak"] for phase in ("forward", "backward", "optimizer")),
+        "steady-state phase peaks differ",
     )
-    if small:
-        exported = json.loads((destination / "simulation_result.json").read_text())
-        require(set(exported["step_templates"]) == set(workload.step_templates), "JSON template references differ")
+    for phase in ("forward", "backward"):
         require(
-            exported["schedule_plan"]["actions"]
-            == json.loads(json.dumps([asdict(action) for action in workload.schedule_plan.actions])),
-            "JSON schedule differs from authoritative plan",
+            summary[f"steady_state_{phase}_active_bytes_peak"]
+            == getattr(memory, f"{phase}_peak_active_bytes") + summary["optimizer_state_bytes"],
+            "cold-capture phase lacks resident optimizer state",
         )
-        for suffix in ("txt", "html", "dot"):
-            text = (destination / f"simulation_result.{suffix}").read_text()
-            require(bool(text.strip()), f"empty {suffix} output")
+    nodes = [node for template in workload.step_templates.values() for node in template.nodes.values()]
+    views = [node for node in nodes if node.annotations.get("metadata_view")]
+    require(bool(views), "raw metadata views were lost")
+    require(all(node.flops == 0 for node in views), "metadata view has compute cost")
     report.update(
         status="passed",
+        steady_state_memory=memory.to_summary_dict(),
         options=asdict(options),
         model=geometry,
         capture_coordinates=annotations["capture_coordinates"],

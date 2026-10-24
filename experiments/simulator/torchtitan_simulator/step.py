@@ -17,7 +17,6 @@ from torchtitan_simulator.capture.checkpoint_execution import install_checkpoint
 from torchtitan_simulator.capture.comm_events import observe_collectives
 from torchtitan_simulator.capture.comm_group_resolver import resolve_comm_event_groups
 from torchtitan_simulator.capture.dispatch_capture import OpDispatchCapture
-from torchtitan_simulator.capture.graph_normalization import fold_metadata_views
 from torchtitan_simulator.capture.module_path import ModulePathTracker
 from torchtitan_simulator.capture.schedule_builder import (
     build_schedule_plan,
@@ -199,10 +198,12 @@ def run_simulation_step(
     from torchtitan_simulator.capture.comm_events import (
         default_collective_context,
     )
+    from torchtitan_simulator.capture.optimizer import optimizer_state_values
     from torchtitan_simulator.capture.saved_tensors import (
         AutogradSavedTensorCapture,
     )
 
+    optimizer_state_tensors = None
     get_optional_mesh = getattr(parallel_dims, "get_optional_mesh", None)
     tp_mesh = get_optional_mesh("tp") if callable(get_optional_mesh) else None
     saved_tensor_context = AutogradSavedTensorCapture() if enable_memory_tracking else nullcontext()
@@ -216,7 +217,9 @@ def run_simulation_step(
         capture,
         saved_tensor_context,
     ):
-        capture.record_initial_memory_tensors((input_dict, labels, global_valid_tokens))
+        capture.record_initial_memory_tensors(
+            (input_dict, labels, global_valid_tokens, optimizer_state_values(optimizer_step))
+        )
         if optimizer_zero_grad is not None:
             optimizer_zero_grad()
         else:
@@ -256,6 +259,9 @@ def run_simulation_step(
         with capture_optimizer_param_groups(optimizer_step):
             optimizer_step()
         lr_scheduler_step()
+        states = optimizer_state_values(optimizer_step)
+        if enable_memory_tracking and states is not None:
+            optimizer_state_tensors = capture.memory_tensor_refs(states, name_prefix="optimizer_state")
         t3 = time.perf_counter()
         timings["optimizer"] = t3 - t2
 
@@ -273,14 +279,12 @@ def run_simulation_step(
     native_dispatch_ids = [
         node.op_id
         for node in nodes.values()
-        if not node.annotations.get("metadata_view")
-        and str(node.annotations.get("raw_op_type", "")).startswith(
+        if str(node.annotations.get("raw_op_type", "")).startswith(
             ("aten.", "npu.", "cann_ops_", "fsdp.", "c10d.", "_dtensor.", "_c10d_functional.")
         )
     ]
     compute_instance_events = capture.compute_instance_events()
     capture.release_operator_tracking()
-    nodes = fold_metadata_views(nodes)
     timings["build_nodes"] = time.perf_counter() - t5
 
     t6 = time.perf_counter()
@@ -313,16 +317,6 @@ def run_simulation_step(
         action.annotations["capture_process_rank"] = worker_rank
         action.annotations["logical_rank"] = rank
 
-    # Ownership normalization refreshes each template independently. Restore
-    # outgoing cross-template edges from the authoritative predecessor DAG.
-    graph_nodes = {op_id: node for template in step_templates.values() for op_id, node in template.nodes.items()}
-    for node in graph_nodes.values():
-        node.successors = []
-    for op_id, node in graph_nodes.items():
-        for predecessor in node.predecessors:
-            if predecessor in graph_nodes:
-                graph_nodes[predecessor].successors.append(op_id)
-
     t7b = time.perf_counter()
     schedule_graph = project_schedule_plan_to_graph(
         schedule_plan=schedule_plan,
@@ -344,10 +338,6 @@ def run_simulation_step(
         wg.iteration.schedule.annotations["capture"] = capture_metadata
     wg.iteration.schedule.annotations["communication_events"] = [asdict(event) for event in comm_recorder.events]
     wg.iteration.schedule.annotations["native_dispatch_op_ids"] = native_dispatch_ids
-    wg.iteration.schedule.annotations["suppressed_dispatch_counts"] = [
-        {"scope": scope, "operator": operator, "count": count}
-        for (scope, operator), count in sorted(capture.suppressed_dispatch_counts.items())
-    ]
     timings["build_workload_graph"] = time.perf_counter() - t8
 
     memory_plan = None
@@ -363,6 +353,7 @@ def run_simulation_step(
             autograd_saved_tensor_events=capture.autograd_saved_tensor_events(),
             storage_lifetimes=capture.storage_lifetime_events(),
             initial_tensors=capture.initial_memory_tensors(),
+            optimizer_state_tensors=optimizer_state_tensors,
             counted_device_type=memory_device_type,
             parameter_storage_dtype=memory_parameter_storage_dtype or None,
             offload_ac_saved_tensors=memory_offload_ac_saved_tensors,
@@ -382,76 +373,18 @@ def run_simulation_step(
 
     timings["total"] = time.perf_counter() - t0
 
-    # Print timing table
-    print("\n" + "=" * 60)
-    print("Simulation Step Timing Breakdown")
-    print("=" * 60)
-    print(f"{'Stage':<30} {'Time (s)':>10} {'%':>8}")
-    print("-" * 60)
-    total = timings["total"]
-    for name in [
-        "setup",
-        "forward_backward",
-        "optimizer",
-        "build_rank_table",
-        "build_nodes",
-        "build_step_graphs",
-        "build_schedule_graph",
-        "build_schedule_plan",
-        "build_workload_graph",
-        "estimate_memory",
-    ]:
-        if name not in timings:
-            continue
-        t = timings[name]
-        print(f"{name:<30} {t:>10.2f} {t / total * 100:>7.1f}%")
-    print("-" * 60)
-    print(f"{'TOTAL':<30} {total:>10.2f} {'100.0%':>8}")
-    print("=" * 60)
-    print(f"Captured ops: {len(nodes)}, comm events: {len(comm_recorder.events)}")
-    execution_summary: dict[str, dict[str, int]] = {}
-    for node in nodes.values():
-        kind = node.annotations.get("execution_kind", "unknown")
-        repeat_count = int(node.annotations.get("repeat_count", 1))
-        summary = execution_summary.setdefault(kind, {"nodes": 0, "invocations": 0, "flops": 0})
-        summary["nodes"] += 1
-        summary["invocations"] += repeat_count
-        summary["flops"] += node.flops * repeat_count
-    print(
-        "Execution kinds: "
-        + ", ".join(
-            f"{kind}=nodes:{values['nodes']}/calls:{values['invocations']}/flops:{values['flops']}"
-            for kind, values in execution_summary.items()
-        )
-    )
-    print(f"Step templates: {list(step_templates.keys())}")
-    communication_ownership = schedule_plan.annotations.get(
-        "communication_ownership",
-        {},
-    )
-    if communication_ownership:
-        print(
-            "Communication ownership: "
-            f"L1_collectives={communication_ownership.get('stage_owned_collectives', 0)} "
-            f"L1_fsdp_transitions={communication_ownership.get('internal_fsdp_transitions', 0)} "
-            f"L2_fsdp_prefetches={communication_ownership.get('external_fsdp_prefetches', 0)} "
-            f"L1_gradient_reductions={communication_ownership.get('internal_gradient_reductions', 0)} "
-            f"L2_gradient_reductions={communication_ownership.get('external_gradient_reductions', 0)} "
-            f"removed_noop_gradient_intents={communication_ownership.get('removed_noop_gradient_intents', 0)}"
-        )
+    wg.iteration.schedule.annotations["capture_timings"] = timings
     if memory_plan is not None:
-        print(
-            "Static memory: "
-            f"persistent_param_bytes={memory_plan.persistent_param_bytes} "
-            f"active_bytes_peak={memory_plan.peak_active_bytes} "
-            f"model_active_bytes_peak={memory_plan.model_active_bytes_peak} "
-            f"forward_peak={memory_plan.forward_peak_active_bytes} "
-            f"backward_peak={memory_plan.backward_peak_active_bytes} "
-            f"optimizer_peak={memory_plan.optimizer_peak_active_bytes} "
-            f"peak_seq_idx={memory_plan.peak_seq_idx}"
-        )
-    else:
-        print("Static memory tracking: disabled")
-    print()
-
+        print("单卡内存（GiB；峰值包含常驻优化器状态）")
+        summary = memory_plan.to_summary_dict()
+        for label, key in (
+            ("稳态总峰值", "steady_state_active_bytes_peak"),
+            ("前向峰值", "steady_state_forward_active_bytes_peak"),
+            ("反向峰值", "steady_state_backward_active_bytes_peak"),
+            ("优化器阶段峰值", "steady_state_optimizer_active_bytes_peak"),
+            ("权重大小", "persistent_param_bytes"),
+            ("优化器状态大小", "optimizer_state_bytes"),
+        ):
+            value = summary[key]
+            print(f"  {label}: {value / 2**30:.3f}" if value is not None else f"  {label}: 不可用")
     return wg

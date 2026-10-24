@@ -56,7 +56,7 @@ options = SimulationConfig(
     num_mtp_modules=1,
     activation_checkpoint_mode="selective",
     output_dir="/audit/upstream-python",
-    output_formats=["json", "csv", "mem"],
+    output_formats=["mem"],
 )
 options.validate()
 workload_graph = simulate(options)
@@ -105,7 +105,7 @@ argv = [
     "--training.num-mtp-modules", "1",
     "--activation-checkpoint.mode", "selective",
     "--simulation.output-dir", "/audit/upstream-argv",
-    "--simulation.output-formats", "json", "csv", "mem",
+    "--simulation.output-formats", "mem",
 ]
 workload_graph = main(argv)
 assert isinstance(workload_graph, WorkloadGraph)
@@ -137,6 +137,9 @@ assert isinstance(workload_graph, WorkloadGraph)
 | `--simulation.target-npu-device-type` | `target_npu_device_type` | str；`non_a5` | parser 接受 `non_a5`／`a5`，当前运行时只支持 `non_a5`，`a5` 报错 |
 | `--training.seq-len` | `seq_len` | int；128 | ≥1；原生模型、CP、压缩、量化还有 shape 约束；完整矩阵使用 512 |
 | `--training.num-mtp-modules` | `num_mtp_modules` | int；0 | ≥0；已验证 0／1，其他值不等于已验收 |
+| `--training.dtype` | `training_dtype` | str 或 None；None | None 沿用原生 preset（当前 float32）；`float32`／`bfloat16`；DSV4 完整捕获仅支持 float32，bfloat16 只可 build-only |
+| `--training.mixed-precision-param` | `mixed_precision_param` | str 或 None；None | None 沿用原生 preset（当前 bfloat16）；`bfloat16`／`float32`，存在原生 FP32 模块例外 |
+| `--training.mixed-precision-reduce` | `mixed_precision_reduce` | str 或 None；None | None 沿用原生 preset（当前 float32）；当前公开支持仅 `float32` |
 | `--training.local-batch-size` | `local_batch_size` | int 或 None；None | 显式值 ≥1；None 沿用 preset；完整矩阵使用 1 |
 | `--training.global-batch-size` | `global_batch_size` | int 或 None；None | 显式值 ≥1；None 沿用 preset；GBS／GA 约束见下文 |
 | `--parallelism.data-parallel-replicate-degree` | `data_parallel_replicate_degree` | int；1 | ≥1 |
@@ -154,8 +157,7 @@ assert isinstance(workload_graph, WorkloadGraph)
 | `--simulation.enable-fsdp-allgather-fp8` | `enable_fsdp_allgather_fp8` | bool；false | parser 保留，设置 true 会明确拒绝；不是已支持的优化 |
 | `--simulation.enable-ep-dispatch-fp8` | `enable_ep_dispatch_fp8` | bool；false | parser 保留，设置 true 会明确拒绝 |
 | `--simulation.output-dir` | `output_dir` | str；`./simulator_output` | 相对路径按宿主 cwd 解析；接入建议显式绝对路径且每次调用独立目录 |
-| `--simulation.output-formats` | `output_formats` | list[str]；[] | `text html dot json csv mem` 的任意组合；CLI 可传零个值；详见第 10 节 |
-| `--simulation.csv-max-ranks` | `csv_max_ranks` | int；1 | ≥1；仅限制 CSV 展示，不改变 world、mesh 或捕获 rank |
+| `--simulation.output-formats` | `output_formats` | list[str]；[] | 仅 `mem`；默认 [] 不写文件；CLI 可传零个值；详见第 10 节 |
 | `--build-only` | 无；CLI 专用 | bool；false | 仅诊断模型构建，返回 dict；不执行完整 F/B/O |
 | `-h`／`--help` | 无；CLI 专用 | 无值 | 帮助后退出，不执行仿真 |
 
@@ -297,12 +299,14 @@ nodes = {
     for op_id, node in template.nodes.items()
 }
 memory = annotations["memory_plan"]
-peak_bytes = memory.peak_active_bytes
+summary = annotations["memory_summary"]
+peak_bytes = summary["steady_state_active_bytes_peak"]
 phase_peaks = {
-    "forward": memory.forward_peak_active_bytes,
-    "backward": memory.backward_peak_active_bytes,
-    "optimizer": memory.optimizer_peak_active_bytes,
+    phase: summary[f"steady_state_{phase}_active_bytes_peak"]
+    for phase in ("forward", "backward", "optimizer")
 }
+weight_bytes = summary["persistent_param_bytes"]
+optimizer_bytes = summary["optimizer_state_bytes"]
 ```
 
 | 路径／字段 | 对象与消费规则 |
@@ -314,7 +318,8 @@ phase_peaks = {
 | `node.inputs`／`outputs`／`attrs` | TensorMeta 列表和算子属性；包括原地写入 operands；不是可供真实运算的 tensor 数据 |
 | `schedule_plan` | 权威 SchedulePlan；消费 actions、data_slots、template_ref 与实际 op 引用；非 PP 当前可能没有 DataSlot，不要硬性要求非空 |
 | `iteration.schedule` | 保留 ScheduleGraph、实例、数据流与 annotations；不能只按 L0 CSV 行顺序另造调度 |
-| `annotations["memory_plan"]` | Python 内存中为 MemoryPlan 对象，不是 dict；含实际 storage 生命周期、保存槽和各阶段峰值；导出 JSON 后才是序列化结构 |
+| `annotations["memory_summary"]` | 严格六项单卡预算：四个含 optimizer 状态的峰值、权重字节、optimizer 状态字节；与 memory_summary.json 完全一致 |
+| `annotations["memory_plan"]` | Python 内存中为 MemoryPlan 对象，不是 dict；含实际 storage 生命周期、保存槽及捕获／稳态峰值；mem 导出汇总与明细，不序列化整个 MemoryPlan |
 | `annotations["communication_events"]` | 通信记录列表；保留实际 group、ranks、形状／payload 和图引用；原生名称不再固定为旧 `comm.*` |
 | `annotations["capture_coordinates"]` | logical_rank/world、capture worker 和 pipeline_stage；当前单 worker 的 capture_process_rank=0，不等于被模拟 rank=0 |
 | `annotations["batch_configuration"]` | GBS、local batch、DP、GA 与 captured_microbatches；当前 captured_microbatches=1 |
@@ -326,26 +331,41 @@ phase_peaks = {
 
 算子名变化是接入重点：通信现在保留 `c10d.*`、`_c10d_functional.*`、`_dtensor.*` 的原生节点；optimizer 为 `aten._fused_adamw_.default`，不再生成旧 `npu.npu_apply_adam_w` 手工节点。不要按旧 raw name 写死识别；可参考 [communication_primitive](../torchtitan_simulator/capture/op_mapping.py) 的映射。
 
-原始 alias／mutation 事实保留用于身份和内存分析；规范化图会收缩 alias-only metadata 路径。节点 ID 仅用于当前返回图内引用，不应跨运行比较 Python object identity、storage 地址或假定 op_id 稳定。L0 edges 与 L2 action/DataSlot 依赖分别消费，不靠节点列表顺序替代数据依赖。
+原始 alias／mutation 事实及 metadata view 节点保留在返回图中，不再折叠；view 的 FLOPs 为零，但仍有身份、别名和依赖语义。节点 ID 仅用于当前返回图内引用，不应跨运行比较 Python object identity、storage 地址或假定 op_id 稳定。L0 edges 与 L2 action/DataSlot 依赖分别消费，不靠节点列表顺序替代数据依赖。
+
+FSDP 模板变体和预取推断补边已移除，当前直接使用捕获的 `op_id`，不再产生 `source_op_id` 映射。空的 `fused_regions`／`internal_data_passes` 字段和 `communication_ownership.generated_l1_templates` 诊断字段已删除，接入方无需读取，见 [精简记录](simulator-cleanup.md)。
+
+内存汇总只保留六项；旧捕获步峰值和统计字段已从汇总移除。标准入口自动提供四个稳态峰值、权重和优化器状态字节；无公开 owner 的自定义 callback 返回 null 而非零。具体字段和边界见 [单卡内存结果](steady-state-memory.md)。
 
 逻辑内存指标为 bytes；GiB 换算除以 `2**30`。保存槽数量、去重 storage 数、offload inventory 的累计字节都不等于峰值。当前指标不含 allocator reserved/cache、碎片、kernel workspace；metadata 准备在训练捕获前完成，其准备成本不计入训练图。
 
+### 流控制节点
+
+WorkloadGraph 现在包含零耗时 `stream_wait` 节点。上游应以耗时 0 执行该节点，并等待全部跨模板前驱完成后释放后继；不得当成未知算子查性能表，也不得直接丢弃。`annotations.zero_duration=true` 标识此约定，具体字段和 FSDP 语义见 [流控制依赖](stream-control-dependencies.md)。当前没有图折叠或额外图文件导出。
+
 ## 10. 导出行为与可选格式
 
-纯内存接入只调用 `simulate()` 即可；需要标准文件时显式调用 `export_result(workload, options)`。`cli.main(argv)` 自动导出，**即使 output_formats=[] 也会创建 output_dir，写 export_manifest.json 和 memory/memory_summary.json**。
+只取图时调用 `simulate()`；`cli.main(argv)` 返回同一个 WorkloadGraph，并按选项调用 `export_result()`。
+默认 `output_formats=[]` 不创建输出目录、不写文件。显式 `--simulation.output-formats mem` 才写 `memory/`。
 
-| 格式 token | 主要输出 |
-| --- | --- |
-| `text` | `simulation_result.txt` |
-| `html` | `simulation_result.html` |
-| `dot` | `simulation_result.dot`，包含跨模板边 |
-| `json` | `simulation_result.json`，序列化 WorkloadGraph |
-| `csv` | `kernel_summary/rank_*.csv`、`s0_*_l0.csv`、`schedule_plan.csv` |
-| `mem` | `memory/` 下的事件、tensor 生命周期、保存值和 FSDP 驻留明细 |
+mem 保留内存汇总、事件、timeline、tensor/storage 生命周期、autograd 保存值、FSDP 驻留与内存 trace。
+这些文件本身使用 JSON/CSV；删除的是完整图的 JSON/text/HTML/DOT、kernel/schedule CSV、export_manifest 及 IR 上的导出方法。
+原有 `text/html/dot/json/csv` token 和 `--simulation.csv-max-ranks` 均报错，上游必须从调用参数中移除。
+图仍通过同进程 WorkloadGraph 消费；上游自行管理跨进程序列化。
 
-格式列表未知值报错。CSV 的 rank 行为是同一代表性捕获模板的展示投影，不是每个 rank 独立捕获；`csv_max_ranks` 不改变实际模拟 world。`schedule_plan.csv` 包含 Actions 与 `# DataSlots` 分隔的两段，不能把后半部分当成 action 行。export_manifest schema_version=2；跨机器消费者如需序列化应消费该版本契约，而非依赖 dataclass 的私有实现。
+导出不是原子事务，失败可能留下部分文件；每次请求应使用独立目录。旧目录的历史文件不会被自动删除。
 
-导出函数不是原子写入事务，失败时可能留下部分文件；不同请求应使用不同目录。`simulate()` 与导出分离可让上游在导出失败后仍持有已生成的图。
+实际精度与内存假设分开设置，详见 [精度审计](mem-only-precision.md)：
+
+```bash
+--training.dtype float32 \
+--training.mixed-precision-param bfloat16 \
+--training.mixed-precision-reduce float32
+```
+
+`annotations["precision_configuration"]` 返回实际原生配置；`parameter_layouts` 与 `gradient_validation` 均含实际 dtype。
+`memory_parameter_storage_dtype` 仅投影常驻本地参数 shard；不会修改以上配置、梯度、优化器、通信或原生量化选择。
+DSV4 base BF16 会与显式 FP32 的 attn_sink/ape 混合，原生 FSDP 不接受这一组合；完整捕获在初始化前明确拒绝，不静默改成 FP32。
 
 ## 11. 旧参数迁移与不支持项
 
@@ -401,11 +421,13 @@ for _ in range(2):
 
 ## 13. 事实依据与文档验证
 
+下表是 `dd4c245` 文档交付时的历史证据；当前参数快照已随 mem-only 与精度入口更新（60 个 parser action、29 个 SimulationConfig 字段），当前验证以 [本轮审计](mem-only-precision.md) 为准。
+
 源码依据：[CLI](../torchtitan_simulator/cli.py)、[配置及校验](../torchtitan_simulator/config.py)、[执行与导出](../torchtitan_simulator/runner.py)、[几何复写](../torchtitan_simulator/model_overrides.py)、[SAC 选择](../torchtitan_simulator/selective_ac.py)、[dtype 口径](../torchtitan_simulator/capture/tensor_utils.py)、[逻辑 world 生命周期](../torchtitan_simulator/compat/distributed.py)、[WorkloadGraph](../torchtitan_simulator/ir/workload_graph.py)。已验证能力的完整范围见 [能力矩阵](capability-matrix.md) 和 [原生 dispatch 复验](dispatch-first-remediation.md)。
 
 | 文档检查／示例 | 状态 | 结果与边界 |
 | --- | --- | --- |
-| 全部参数与可选值 | passed | 对照当前 parser 的 58 个 action（含 help、负向别名）及 Python 配置字段；逐项确认所有选项拼写都在本文中，机器快照与源码一致 |
+| 全部参数与可选值 | passed | 对照当时 parser 的 58 个 action（含 help、负向别名）及 Python 配置字段；逐项确认所有选项拼写都在本文中，机器快照与源码一致 |
 | 第 2／3 节原样代码块，在同一进程依次执行 | passed | world16/rank15、BF16、MTP1、selective；两次均返回 WorkloadGraph、143 个参数梯度、357 个通信事件、266 个保存槽；调用前后 process group 均未初始化，第一张图在第二次调用后仍可读取 |
 | 两次调用的逻辑内存峰值 | passed | 均为 300,400,844 bytes；不以此推断所有几何和配置在重复调用时均相等 |
 | 参数 help、Markdown 链接与 Python 示例语法 | passed | 固定环境执行模块 help；相对链接与代码语法静态核对 |
@@ -418,4 +440,4 @@ for _ in range(2):
 
 本轮验证证据保存在本机审计目录 `torchtitan-migration-audit-20261020/dispatch-first-remediation/` 的 `integration-contract.json`、`integration-example-validation.json`、`integration-examples.log`、`integration-console-exit.txt` 和 `integration-document-validation.json`。本次只修改文档和导航，运行源码未修改；未重新执行昂贵的 21 项矩阵，历史实现验收结果见上述能力矩阵。
 
-真实 NPU 数值／HCCL、并发宿主混用及 PP 均未由本接入文档验证。本文仅说明现有接口，不补充旧入口兼容层或扩展运行能力。
+真实 NPU 数值／HCCL、并发宿主混用及 PP 均未由本接入文档验证。本文不提供旧入口兼容层。

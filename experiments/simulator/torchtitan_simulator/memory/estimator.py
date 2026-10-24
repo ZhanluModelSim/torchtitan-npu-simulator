@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from bisect import bisect_right
 from collections import defaultdict
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -268,6 +269,7 @@ def _classify_output(event: RawMemoryEvent, comm_by_op: dict[int, Any]) -> tuple
 def _finalize_kind(lifetime: TensorLifetime) -> None:
     if lifetime.kind in {
         "parameter_shard",
+        "optimizer_state",
         "persistent_buffer",
         "external_input",
         "alias",
@@ -395,6 +397,7 @@ def estimate_static_memory(
     autograd_saved_tensor_events: Iterable[AutogradSavedTensorEvent] | None = None,
     storage_lifetimes: Iterable[StorageLifetimeRecord] | None = None,
     initial_tensors: Iterable[TensorRef] | None = None,
+    optimizer_state_tensors: Iterable[TensorRef] | None = None,
     counted_device_type: str = "",
     parameter_storage_dtype: str | None = None,
     offload_ac_saved_tensors: bool = False,
@@ -597,6 +600,25 @@ def estimate_static_memory(
         *alias_lifetimes,
         *plugin_lifetimes,
     ]
+    state_keys = None
+    if optimizer_state_tensors is not None:
+        state_keys = set()
+        for ref in optimizer_state_tensors:
+            if counted_device_type and ref.device.split(":")[0] != counted_device_type:
+                continue
+            if _is_persistent_storage_alias(ref, persistent_storage_keys):
+                continue
+            if not ref.storage_key:
+                raise ValueError("Optimizer state lacks captured storage provenance")
+            state_keys.add(ref.storage_key)
+        witnessed = set()
+        for lifetime in lifetimes:
+            if lifetime.storage_key in state_keys and not lifetime.alias_of:
+                lifetime.kind = "optimizer_state"
+                lifetime.reason = "optimizer_owned_state"
+                witnessed.add(lifetime.storage_key)
+        if witnessed != state_keys:
+            raise ValueError("Optimizer state storage is absent from the captured memory inventory")
     for lifetime in lifetimes:
         _finalize_kind(lifetime)
 
@@ -630,4 +652,24 @@ def estimate_static_memory(
         unclassified_ops=unclassified_ops,
         notes=notes,
     )
+    if state_keys is not None:
+        states = [lifetime for lifetime in lifetimes if lifetime.kind == "optimizer_state"]
+        steady_lifetimes = [
+            replace(lifetime, birth_seq=-1, death_seq=capture_end) if lifetime.kind == "optimizer_state" else lifetime
+            for lifetime in lifetimes
+        ]
+        steady_timeline = _build_timeline(steady_lifetimes, phase_by_seq)
+        steady_peaks = _phase_peak_active_bytes(steady_timeline, events)
+        plan.optimizer_state_bytes = sum(lifetime.resident_num_bytes for lifetime in states)
+        plan.optimizer_state_storage_count = len(states)
+        plan.steady_state_peak_active_bytes = max((event.active_bytes_after for event in steady_timeline), default=0)
+        plan.steady_state_forward_peak_active_bytes = steady_peaks["forward"]
+        plan.steady_state_backward_peak_active_bytes = steady_peaks["backward"]
+        plan.steady_state_optimizer_peak_active_bytes = steady_peaks["optimizer"]
+        notes.append(
+            "Steady-state peaks project actual optimizer-owned device storages as resident from capture start; "
+            "other captured lifetimes are unchanged. This is not a second executed iteration or GA replay."
+        )
+    else:
+        notes.append("Steady-state peaks unavailable: optimizer callable exposes no public state owner.")
     return plan

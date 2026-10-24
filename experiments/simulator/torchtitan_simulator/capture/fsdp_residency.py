@@ -71,39 +71,6 @@ def _transition_prefetch(param_group: Any) -> tuple[str, str]:
     )
 
 
-def _record_fsdp_marker(
-    param_group: Any,
-    marker: str,
-    *,
-    prefetch_source_fqn: str = "",
-    prefetch_type: str = "",
-) -> None:
-    from torchtitan_simulator.capture.dispatch_capture import (
-        get_active_capture,
-    )
-
-    capture = get_active_capture()
-    if capture is None:
-        return
-    module_fqn = _module_fqn(param_group)
-    capture.record_synthetic_op(
-        raw_op_type=f"sim.fsdp_{marker}",
-        inputs=[],
-        outputs=[],
-        module_path=module_fqn,
-        extra_annotations={
-            "fsdp_marker": marker,
-            "fsdp_group_id": str(id(param_group)),
-            "fsdp_module_fqn": module_fqn,
-            "fsdp_param_group_index": int(getattr(param_group, "_param_group_index", -1)),
-            "fsdp_num_param_groups": int(getattr(param_group, "_num_param_groups", -1)),
-            "fsdp_transition_id": str(getattr(param_group, "_sim_active_transition_id", "") or ""),
-            "fsdp_prefetch_source_fqn": prefetch_source_fqn,
-            "fsdp_prefetch_type": prefetch_type,
-        },
-    )
-
-
 def _memory_tracking_enabled() -> bool:
     from torchtitan_simulator.capture.comm_events import get_active_recorder
 
@@ -156,9 +123,8 @@ def _post_backward_dependency_tensors(
     """Collect the parameter-group gradients that make its RS launchable.
 
     FSDP packs these gradients into a temporary flat reduce-scatter buffer.
-    That packing is framework scaffolding and is intentionally hidden from
-    L0, so the original gradients must be carried as dependency-only inputs
-    to the synthetic collective node.
+    Keep the actual gradient producers as additional launch dependencies
+    alongside the dispatch-visible packing and native collective operands.
     """
     dependencies: dict[int, torch.Tensor] = {}
     for fsdp_param in getattr(param_group, "fsdp_params", ()):
@@ -478,14 +444,6 @@ def install_fsdp_residency_hooks(scope) -> None:
             if not retained and getattr(self, "_all_gather_result", None) is not pending:
                 staging_owners.pop(id(pending), None)
                 record_staging_release(self, pending, transition)
-        if self.is_unsharded:
-            prefetch_source_fqn, prefetch_type = _transition_prefetch(self)
-            _record_fsdp_marker(
-                self,
-                "unshard_wait",
-                prefetch_source_fqn=prefetch_source_fqn,
-                prefetch_type=prefetch_type,
-            )
         return result
 
     def patched_finalize_backward(self):
@@ -546,13 +504,6 @@ def install_fsdp_residency_hooks(scope) -> None:
                 metadata,
                 shard_world_size,
                 transition_id,
-            )
-            prefetch_source_fqn, prefetch_type = _transition_prefetch(self)
-            _record_fsdp_marker(
-                self,
-                "reshard_release",
-                prefetch_source_fqn=prefetch_source_fqn,
-                prefetch_type=prefetch_type,
             )
             self._sim_active_transition_id = ""
             self._sim_pending_transition_id = ""
@@ -628,12 +579,6 @@ def install_fsdp_residency_hooks(scope) -> None:
         pass_type,
     ):
         source_fqn = _active_fsdp_state_source.get()
-        _record_fsdp_marker(
-            target_param_group,
-            "prefetch_launch",
-            prefetch_source_fqn=source_fqn,
-            prefetch_type=str(pass_type),
-        )
         token = _active_fsdp_prefetch_source.set((source_fqn, str(pass_type)))
         try:
             return orig_prefetch_unshard(target_param_group, pass_type)

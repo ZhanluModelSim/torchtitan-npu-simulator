@@ -220,6 +220,24 @@ class MemoryPlan:
     notes: list[str] = field(default_factory=list)
     capture_metadata: dict[str, Any] = field(default_factory=dict)
 
+    optimizer_state_bytes: int | None = None
+    optimizer_state_storage_count: int | None = None
+    steady_state_peak_active_bytes: int | None = None
+    steady_state_forward_peak_active_bytes: int | None = None
+    steady_state_backward_peak_active_bytes: int | None = None
+    steady_state_optimizer_peak_active_bytes: int | None = None
+
+    def to_summary_dict(self) -> dict[str, int | None]:
+        """Return only the six per-rank memory budgets, in bytes."""
+        return {
+            "steady_state_active_bytes_peak": self.steady_state_peak_active_bytes,
+            "steady_state_forward_active_bytes_peak": self.steady_state_forward_peak_active_bytes,
+            "steady_state_backward_active_bytes_peak": self.steady_state_backward_peak_active_bytes,
+            "steady_state_optimizer_active_bytes_peak": self.steady_state_optimizer_peak_active_bytes,
+            "persistent_param_bytes": self.persistent_param_bytes,
+            "optimizer_state_bytes": self.optimizer_state_bytes,
+        }
+
     def _checkpoint_saved_activations_by_marker(self) -> dict[str, dict[str, Any]]:
         instances_by_marker: dict[
             str,
@@ -502,7 +520,7 @@ class MemoryPlan:
             }
         return result
 
-    def to_summary_dict(self) -> dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         recompute_saved_records = [item for item in self.checkpoint_tensors if item.role == "recompute_saved"]
         recompute_saved_lifetimes = [
             item for item in self.tensor_lifetimes if item.kind == "checkpoint_saved_for_recompute"
@@ -547,6 +565,7 @@ class MemoryPlan:
             "forward_active_bytes_peak": self.forward_peak_active_bytes,
             "backward_active_bytes_peak": self.backward_peak_active_bytes,
             "optimizer_active_bytes_peak": self.optimizer_peak_active_bytes,
+            **self.to_summary_dict(),
             "peak_seq_idx": self.peak_seq_idx,
             "peak_phase": self.peak_phase,
             "raw_memory_event_count": len(self.raw_events),
@@ -620,18 +639,14 @@ class MemoryPlan:
                 "device internal temporary buffers",
             ],
             "notes": list(self.notes),
+            "tensor_lifetimes": [asdict(item) for item in self.tensor_lifetimes],
+            "checkpoint_tensors": [asdict(item) for item in self.checkpoint_tensors],
+            "autograd_saved_tensors": [asdict(item) for item in self.autograd_saved_tensors],
+            "fsdp_residency_events": [asdict(item) for item in self.fsdp_residency_events],
+            "storage_lifetimes": [asdict(item) for item in self.storage_lifetimes],
+            "initial_tensors": [asdict(item) for item in self.initial_tensors],
+            "activation_offload_tensors": [asdict(item) for item in self.activation_offload_tensors],
+            "timeline_events": [asdict(item) for item in self.timeline_events],
+            "action_spans": [asdict(item) for item in self.action_spans],
+            "unclassified_ops": list(self.unclassified_ops),
         }
-
-    def to_dict(self) -> dict[str, Any]:
-        data = self.to_summary_dict()
-        data["tensor_lifetimes"] = [asdict(item) for item in self.tensor_lifetimes]
-        data["checkpoint_tensors"] = [asdict(item) for item in self.checkpoint_tensors]
-        data["autograd_saved_tensors"] = [asdict(item) for item in self.autograd_saved_tensors]
-        data["fsdp_residency_events"] = [asdict(item) for item in self.fsdp_residency_events]
-        data["storage_lifetimes"] = [asdict(item) for item in self.storage_lifetimes]
-        data["initial_tensors"] = [asdict(item) for item in self.initial_tensors]
-        data["activation_offload_tensors"] = [asdict(item) for item in self.activation_offload_tensors]
-        data["timeline_events"] = [asdict(item) for item in self.timeline_events]
-        data["action_spans"] = [asdict(item) for item in self.action_spans]
-        data["unclassified_ops"] = list(self.unclassified_ops)
-        return data

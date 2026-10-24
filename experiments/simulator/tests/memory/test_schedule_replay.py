@@ -415,7 +415,7 @@ def test_checkpoint_saved_activation_offload_replays_for_each_microbatch() -> No
     saved_lifetimes = [item for item in plan.tensor_lifetimes if item.kind == "checkpoint_saved_activation"]
     assert len(saved_lifetimes) == 2
     assert all(item.resident_num_bytes == 0 for item in saved_lifetimes)
-    marker = plan.to_summary_dict()["checkpoint_saved_activations"]["part0:layers.0"]
+    marker = plan.to_dict()["checkpoint_saved_activations"]["part0:layers.0"]
     assert marker["logical_bytes_per_instance"] == saved.num_bytes
     assert marker["modeled_bytes_per_instance"] == 0
     assert marker["instance_count"] == 2

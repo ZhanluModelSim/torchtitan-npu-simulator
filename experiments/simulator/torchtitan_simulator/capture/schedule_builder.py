@@ -336,7 +336,6 @@ def build_schedule_plan(
             step_templates=step_templates,
             specs=specs,
             comm_events=comm_events,
-            preserve_captured_events=True,
         )
         for schedule_order, spec in enumerate(communication_ownership.specs):
             action_id = next(_action_seq)
@@ -739,7 +738,7 @@ def build_schedule_plan(
             if ev is not None:
                 unshard_iters[context_key] = idx + 1
                 if group_id:
-                    # MB1+ L0 capture is folded. Reuse the MB0 communication
+                    # MB1+ reuses the representative L0 capture. Reuse its communication
                     # template while keeping each residency transition distinct.
                     unshard_event_by_residency[residency_key] = ev
         if ev is not None:
@@ -1062,7 +1061,6 @@ def build_schedule_plan(
                 {
                     "internal_fsdp_transitions": len(communication_ownership.internal_fsdp_transitions),
                     "external_fsdp_prefetches": len(communication_ownership.external_fsdp_transitions),
-                    "generated_l1_templates": list(communication_ownership.generated_templates),
                     "internal_gradient_reductions": (communication_ownership.internal_gradient_reductions),
                     "external_gradient_reductions": (communication_ownership.external_gradient_reductions),
                     "removed_noop_gradient_intents": (communication_ownership.removed_noop_gradient_intents),

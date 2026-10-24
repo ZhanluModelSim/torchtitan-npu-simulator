@@ -242,9 +242,9 @@ def test_native_mxfp8_parallel_ac_preserves_quantized_storage_gradients_and_grap
         assert ready
         visited.update(ready)
         pending -= ready
-    sources = Counter(node.annotations.get("source_op_id", node.op_id) for node in nodes.values())
+    sources = Counter(node.op_id for node in nodes.values())
     assert all(sources[event["op_id"]] == 1 for event in annotations["communication_events"])
-    graph_for_source = {node.annotations.get("source_op_id", node.op_id): key for key, node in nodes.items()}
+    graph_for_source = {node.op_id: key for key, node in nodes.items()}
     pending_updates = [
         key for key, node in nodes.items() if node.annotations.get("raw_op_type") == "aten._fused_adamw_.default"
     ]

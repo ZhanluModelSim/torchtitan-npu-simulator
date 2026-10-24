@@ -1,5 +1,7 @@
 # 原生 dispatch 收敛与能力复验
 
+> 历史验收记录：本文命令和输出对应当时源码。当前已移除 mem 以外的图导出、CSV rank 参数和 view 折叠；当前入口见 [接入指南](upstream-integration.md)，当前验证见 [mem 与精度审计](mem-only-precision.md)。
+
 本轮将 simulator 的计算事实采集收敛到原生 dispatcher，保留必要的 Meta/autograd 能力修正，以及 storage 驻留、通信归属等独立语义。TorchTitan、torchtitan-npu、PyTorch、TorchAO-NPU 的安装源码未编辑。
 
 ## 实现与直接验证

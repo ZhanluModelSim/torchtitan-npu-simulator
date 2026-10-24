@@ -1,5 +1,9 @@
 # Simulator 开发与验收状态
 
+mem 汇总已精简为四个含优化器状态的稳态峰值，以及单卡权重／优化器状态大小，旧统计从结果中移除；口径与验证见 [稳态内存](steady-state-memory.md)。
+
+当前新增收敛：只保留 mem 文件导出，返回图不折叠 metadata view；原生精度参数与 DSV4 base BF16 限制见 [本轮审计](mem-only-precision.md)。此前 21 项全规模结果仍绑定原源码哈希，不代表新源码重跑。
+
 2026-10-22。原生 dispatch 收敛后，七个 DSV4 preset × none/full/selective 共 21 项完整原生几何 Meta 仿真重新通过；独立导出与各阶段内存峰值复核通过。
 范围为 BF16/MXFP8、MTP=1、非 PP、B=1/S=512 与组合并行；真实 NPU 数值、耗时及 allocator 峰值未验证。
 

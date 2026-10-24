@@ -24,10 +24,12 @@ class SimulationConfig:
     logical_rank: int = 0
     pipeline_parallel_degree: int = 1
     seq_len: int = 128
+    training_dtype: str | None = None
+    mixed_precision_param: str | None = None
+    mixed_precision_reduce: str | None = None
     num_mtp_modules: int = 0
     output_dir: str = "./simulator_output"
     output_formats: list[str] = field(default_factory=list)
-    csv_max_ranks: int = 1
     enable_fsdp_allgather_fp8: bool = False
     enable_ep_dispatch_fp8: bool = False
     target_npu_device_type: str = "non_a5"
@@ -48,8 +50,14 @@ class SimulationConfig:
     model_overrides: ModelOverrides | None = None
 
     def validate(self):
-        if self.csv_max_ranks < 1:
-            raise ValueError("csv_max_ranks must be positive; it limits export only, not the logical world")
+        for name, choices in (
+            ("training_dtype", {"float32", "bfloat16"}),
+            ("mixed_precision_param", {"float32", "bfloat16"}),
+            ("mixed_precision_reduce", {"float32"}),
+        ):
+            value = getattr(self, name)
+            if value is not None and value not in choices:
+                raise ValueError(f"{name} must be one of {sorted(choices)}")
         if self.model_overrides is not None:
             self.model_overrides.validate()
         if self.quantization_recipe != "all_mxfp8":
@@ -78,7 +86,7 @@ class SimulationConfig:
             raise ValueError("FP8 communication modeling is deferred; disable FP8 all-gather and EP dispatch")
         if self.target_npu_device_type not in {"non_a5", "a5"}:
             raise ValueError("target_npu_device_type must be 'non_a5' or 'a5'")
-        unknown = set(self.output_formats) - {"text", "html", "dot", "json", "csv", "mem"}
+        unknown = set(self.output_formats) - {"mem"}
         if unknown:
             raise ValueError(f"Unsupported output formats: {sorted(unknown)}")
         degrees = (
@@ -153,6 +161,14 @@ def prepare_config(simulation: SimulationConfig) -> PreparedConfig:
                 "Flat model_overrides require a supported simulator preset; custom factories own their config trees"
             )
         apply_model_overrides(trainer, simulation.model_overrides, num_mtp_modules=simulation.num_mtp_modules)
+    for source, target_name in (
+        ("training_dtype", "dtype"),
+        ("mixed_precision_param", "mixed_precision_param"),
+        ("mixed_precision_reduce", "mixed_precision_reduce"),
+    ):
+        value = getattr(simulation, source)
+        if value is not None:
+            setattr(trainer.training, target_name, value)
     model = trainer.model_spec.model
     if trainer.model_spec.name != "deepseek_v4":
         raise ValueError("This migration stage supports DeepSeek V4 only")
@@ -211,13 +227,22 @@ def prepare_config(simulation: SimulationConfig) -> PreparedConfig:
     from torchtitan.config.override import apply_overrides
 
     adaptations.extend(apply_overrides(trainer.override, trainer))
+    for name, choices in (
+        ("dtype", {"float32", "bfloat16"}),
+        ("mixed_precision_param", {"float32", "bfloat16"}),
+        ("mixed_precision_reduce", {"float32"}),
+    ):
+        if getattr(trainer.training, name) not in choices:
+            raise ValueError(f"Native training.{name} must be one of {sorted(choices)}")
     return PreparedConfig(simulation, trainer, target, adaptations)
 
 
 def build_meta_model(prepared: PreparedConfig):
     import torch
+    from torchtitan.config import TORCH_DTYPE_MAP
+    from torchtitan.tools import utils
 
-    with torch.device("meta"):
+    with utils.set_default_dtype(TORCH_DTYPE_MAP[prepared.trainer.training.dtype]), torch.device("meta"):
         model = prepared.trainer.model_spec.model.build()
         model.init_states(buffer_device=torch.device("meta"))
     return model

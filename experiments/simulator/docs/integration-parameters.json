@@ -1,7 +1,7 @@
 {
-  "schema_version": 1,
-  "source_commit": "848c32a",
-  "scope": "Parser and dataclass snapshot; not a complete runtime validation schema",
+  "schema_version": 2,
+  "source_base_commit": "c990d47",
+  "scope": "Mem-only CLI and native precision update; parser/dataclass snapshot, not a complete runtime validation schema",
   "cli_actions": [
     {
       "options": [
@@ -406,6 +406,47 @@
     },
     {
       "options": [
+        "--training.dtype"
+      ],
+      "dest": "training_dtype",
+      "default": null,
+      "nargs": null,
+      "type": null,
+      "choices": [
+        "float32",
+        "bfloat16"
+      ],
+      "action": "_StoreAction"
+    },
+    {
+      "options": [
+        "--training.mixed-precision-param"
+      ],
+      "dest": "mixed_precision_param",
+      "default": null,
+      "nargs": null,
+      "type": null,
+      "choices": [
+        "float32",
+        "bfloat16"
+      ],
+      "action": "_StoreAction"
+    },
+    {
+      "options": [
+        "--training.mixed-precision-reduce"
+      ],
+      "dest": "mixed_precision_reduce",
+      "default": null,
+      "nargs": null,
+      "type": null,
+      "choices": [
+        "float32"
+      ],
+      "action": "_StoreAction"
+    },
+    {
+      "options": [
         "--training.seq-len"
       ],
       "dest": "seq_len",
@@ -572,18 +613,9 @@
       "default": [],
       "nargs": "*",
       "type": null,
-      "choices": null,
-      "action": "_StoreAction"
-    },
-    {
-      "options": [
-        "--simulation.csv-max-ranks"
+      "choices": [
+        "mem"
       ],
-      "dest": "csv_max_ranks",
-      "default": 1,
-      "nargs": null,
-      "type": "int",
-      "choices": null,
       "action": "_StoreAction"
     },
     {
@@ -680,6 +712,21 @@
       "default": 128
     },
     {
+      "name": "training_dtype",
+      "type": "str | None",
+      "default": null
+    },
+    {
+      "name": "mixed_precision_param",
+      "type": "str | None",
+      "default": null
+    },
+    {
+      "name": "mixed_precision_reduce",
+      "type": "str | None",
+      "default": null
+    },
+    {
       "name": "num_mtp_modules",
       "type": "int",
       "default": 0
@@ -693,11 +740,6 @@
       "name": "output_formats",
       "type": "list[str]",
       "default": []
-    },
-    {
-      "name": "csv_max_ranks",
-      "type": "int",
-      "default": 1
     },
     {
       "name": "enable_fsdp_allgather_fp8",
@@ -943,60 +985,5 @@
       "type": "float | None",
       "default": null
     }
-  ],
-  "runtime_choices": {
-    "activation_checkpoint_mode": [
-      "none",
-      "full",
-      "selective"
-    ],
-    "target_supported": [
-      "non_a5"
-    ],
-    "quantization_recipe": [
-      "all_mxfp8"
-    ],
-    "output_formats": [
-      "text",
-      "html",
-      "dot",
-      "json",
-      "csv",
-      "mem"
-    ],
-    "selective_ac_save_ops": [
-      "full",
-      "none",
-      "default",
-      "compute-intensive",
-      "attention",
-      "linear",
-      "mm",
-      "gmm",
-      "quant-mm",
-      "comm",
-      "max"
-    ],
-    "selective_ac_rejected": [
-      "all-to-all"
-    ],
-    "memory_parameter_storage_dtype": [
-      "",
-      "float32",
-      "float64",
-      "float16",
-      "bfloat16",
-      "float8_e4m3fn",
-      "float8_e5m2",
-      "int64",
-      "int32",
-      "int16",
-      "int8",
-      "uint8",
-      "bool"
-    ],
-    "pipeline_parallel_degree": [
-      1
-    ]
-  }
+  ]
 }

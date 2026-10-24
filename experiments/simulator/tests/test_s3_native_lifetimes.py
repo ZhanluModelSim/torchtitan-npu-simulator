@@ -55,9 +55,9 @@ def test_native_ac_lifetimes_and_accumulation_contract(mode, topology):
         assert ready, "Cross-template AC graph contains a dependency cycle"
         visited.update(ready)
         pending_nodes -= ready
-    source_counts = Counter(node.annotations.get("source_op_id", node.op_id) for node in nodes.values())
+    source_counts = Counter(node.op_id for node in nodes.values())
     assert all(source_counts[event["op_id"]] == 1 for event in annotations["communication_events"])
-    actual_to_graph = {node.annotations.get("source_op_id", node.op_id): node.op_id for node in nodes.values()}
+    actual_to_graph = {node.op_id: node.op_id for node in nodes.values()}
     pending = [
         node.op_id for node in nodes.values() if node.annotations.get("raw_op_type") == "aten._fused_adamw_.default"
     ]
