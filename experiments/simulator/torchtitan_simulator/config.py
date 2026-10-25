@@ -10,7 +10,7 @@ from __future__ import annotations
 import copy
 from dataclasses import dataclass, field
 from importlib import import_module
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
     from torchtitan_simulator.model_overrides import ModelOverrides
@@ -46,7 +46,7 @@ class SimulationConfig:
     local_batch_size: int | None = None
     global_batch_size: int | None = None
     enable_quantized_training: bool = False
-    quantization_recipe: str = "all_mxfp8"
+    quantization_recipe: Literal["all_mxfp8"] = "all_mxfp8"
     model_overrides: ModelOverrides | None = None
 
     def validate(self):
@@ -117,9 +117,13 @@ class PreparedConfig:
     adaptations: list[str]
 
 
-_DSV4_OVERRIDES = [
+_COMMON_OVERRIDES = [
     "torchtitan_npu.override.common.rms_norm.asc",
     "torchtitan_npu.override.common.token_dispatcher.asc",
+]
+
+_DSV4_OVERRIDES = [
+    *_COMMON_OVERRIDES,
     "torchtitan_npu.override.common.rope.asc_complex",
     "torchtitan_npu.override.deepseek_v4.sparse_attn.asc_li_metadata",
     "torchtitan_npu.override.deepseek_v4.sparse_attn.asc_li",
@@ -135,6 +139,9 @@ def prepare_config(simulation: SimulationConfig) -> PreparedConfig:
     simulation.validate()
     simulation = copy.deepcopy(simulation)
     factories = {
+        "kimi_k3_smoketest": "torchtitan_npu.models.kimi_k3.config_registry.kimi_k3_debugmodel",
+        "kimi_k3_full": "torchtitan_npu.models.kimi_k3.config_registry.kimi_k3_full",
+        "kimi_k3_16layer_reduced": "torchtitan_npu.models.kimi_k3.config_registry.kimi_k3_16layer_reduced",
         "deepseek_v4_smoketest": "torchtitan_npu.models.deepseek_v4.config_registry.deepseek_v4_debugmodel",
     }
     for preset, factory in (
@@ -156,7 +163,7 @@ def prepare_config(simulation: SimulationConfig) -> PreparedConfig:
     if simulation.model_overrides is not None:
         from torchtitan_simulator.model_overrides import apply_model_overrides
 
-        if target not in set(factories.values()):
+        if target not in set(factories.values()) or trainer.model_spec.name != "deepseek_v4":
             raise ValueError(
                 "Flat model_overrides require a supported simulator preset; custom factories own their config trees"
             )
@@ -170,8 +177,8 @@ def prepare_config(simulation: SimulationConfig) -> PreparedConfig:
         if value is not None:
             setattr(trainer.training, target_name, value)
     model = trainer.model_spec.model
-    if trainer.model_spec.name != "deepseek_v4":
-        raise ValueError("This migration stage supports DeepSeek V4 only")
+    if trainer.model_spec.name not in {"deepseek_v4", "kimi_k3"}:
+        raise ValueError("Supported model families are deepseek_v4 and kimi_k3")
     adaptations = []
     if simulation.model_overrides is not None:
         adaptations.append("typed geometry overrides rebuilt the complete native model configuration tree")
@@ -210,19 +217,26 @@ def prepare_config(simulation: SimulationConfig) -> PreparedConfig:
     if trainer.debug.seed is None:
         trainer.debug.seed = 42
     trainer.override.imports = list(
-        _DSV4_OVERRIDES if simulation.override_imports is None else simulation.override_imports
+        ({"deepseek_v4": _DSV4_OVERRIDES, "kimi_k3": _COMMON_OVERRIDES}[trainer.model_spec.name])
+        if simulation.override_imports is None
+        else simulation.override_imports
     )
     model.update_from_config(config=trainer)
-    trainer.extension.quantization.enable_quantized_training = simulation.enable_quantized_training
-    trainer.extension.quantization.recipe = simulation.quantization_recipe
+    quantization = None
+    if hasattr(trainer, "extension"):
+        quantization = trainer.extension.quantization
+    elif simulation.enable_quantized_training:
+        from torchtitan_npu.config.configs import QuantizationExtensionConfig
+
+        quantization = QuantizationExtensionConfig()
+    if quantization is not None:
+        quantization.enable_quantized_training = simulation.enable_quantized_training
+        quantization.recipe = simulation.quantization_recipe
     if simulation.enable_quantized_training:
         from torchtitan_npu.extensions.adaptor.torchao.converter import apply_quantization_converter
 
-        trainer.model_spec = apply_quantization_converter(
-            trainer.model_spec,
-            trainer.extension.quantization,
-            model_compile_enabled=False,
-        )
+        assert quantization is not None
+        trainer.model_spec = apply_quantization_converter(trainer.model_spec, quantization, model_compile_enabled=False)
         adaptations.append("native TorchAO-NPU all_mxfp8 recipe; native FQN selection without simulator overrides")
     from torchtitan.config.override import apply_overrides
 

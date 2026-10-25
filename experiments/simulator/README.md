@@ -16,6 +16,8 @@ WorkloadGraph 中的零耗时 `stream_wait` 节点也必须参与依赖调度，
 
 上游平台的同进程函数接入、旧入口迁移及全部参数见 [上游接入指南](docs/upstream-integration.md)。
 
+Kimi K3 文本模型的 preset、原生组件复用、虚拟融合边界与独立验收见 [Kimi K3 接入](docs/kimi-k3-migration.md)。
+
 ## 安装与运行
 
 先准备与目标主线配套的完整 CANN 官方镜像、torch/torch_npu、TorchTitan 和 torchtitan-npu，

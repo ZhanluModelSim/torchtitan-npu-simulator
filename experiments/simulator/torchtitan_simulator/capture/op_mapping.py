@@ -48,6 +48,12 @@ OP_MAPPING: dict[str, str] = {
     "fusion_attention": "fusion_attention",
     "fusion_attention_grad": "fusion_attention",
     "situ_glu": "situ_glu",
+    "kimi_sim.situ_glu.default": "situ_glu",
+    "kimi_sim.situ_glu_backward.default": "situ_glu",
+    "kimi_sim.fusion_attention.default": "fusion_attention",
+    "kimi_sim.fusion_attention_grad.default": "fusion_attention",
+    "kimi_sim.chunk_kda.default": "chunk_kda",
+    "kimi_sim.chunk_kda_grad.default": "chunk_kda",
     "situ_glu_backward": "situ_glu",
     "npu.npu_rotary_mul.default": "rope",
     # MoE dispatch

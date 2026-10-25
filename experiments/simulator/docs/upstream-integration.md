@@ -131,13 +131,13 @@ assert isinstance(workload_graph, WorkloadGraph)
 
 | CLI 参数 | Python 字段 | 类型／默认值 | 可选值、行为与限制 |
 | --- | --- | --- | --- |
-| `--config` | `config` | str；`deepseek_v4_smoketest` | 七个 preset 或 `module.factory`；详见第 5 节 |
+| `--config` | `config` | str；`deepseek_v4_smoketest` | 七个 DSV4、三个 Kimi preset 或 `module.factory`；详见第 5 节 |
 | `--simulation.world-size` | `world_size` | int；1 | ≥1；逻辑 world，不是捕获进程数 |
 | `--simulation.logical-rank` | `logical_rank` | int；0 | `0 <= rank < world_size`；选择被捕获的逻辑 rank |
 | `--simulation.target-npu-device-type` | `target_npu_device_type` | str；`non_a5` | parser 接受 `non_a5`／`a5`，当前运行时只支持 `non_a5`，`a5` 报错 |
 | `--training.seq-len` | `seq_len` | int；128 | ≥1；原生模型、CP、压缩、量化还有 shape 约束；完整矩阵使用 512 |
 | `--training.num-mtp-modules` | `num_mtp_modules` | int；0 | ≥0；已验证 0／1，其他值不等于已验收 |
-| `--training.dtype` | `training_dtype` | str 或 None；None | None 沿用原生 preset（当前 float32）；`float32`／`bfloat16`；DSV4 完整捕获仅支持 float32，bfloat16 只可 build-only |
+| `--training.dtype` | `training_dtype` | str 或 None；None | None 沿用原生 preset（当前 float32）；`float32`／`bfloat16`；DSV4/Kimi 完整捕获仅支持 float32，bfloat16 只可 build-only |
 | `--training.mixed-precision-param` | `mixed_precision_param` | str 或 None；None | None 沿用原生 preset（当前 bfloat16）；`bfloat16`／`float32`，存在原生 FP32 模块例外 |
 | `--training.mixed-precision-reduce` | `mixed_precision_reduce` | str 或 None；None | None 沿用原生 preset（当前 float32）；当前公开支持仅 `float32` |
 | `--training.local-batch-size` | `local_batch_size` | int 或 None；None | 显式值 ≥1；None 沿用 preset；完整矩阵使用 1 |
@@ -207,10 +207,15 @@ GA = GBS / (local_batch_size × DP_degree)
 | `deepseek_v4_pro_baseline_mxfp8` | 同上 | 自动启用 MXFP8 |
 | `deepseek_v4_pro_20t_baseline_bf16` | `torchtitan_simulator.presets.deepseek_v4_pro_20t`；96 层／dim12288／2048 专家 | 默认不开启；保留旧几何的适配 preset，不是上游新官方 preset |
 | `deepseek_v4_pro_20t_baseline_mxfp8` | 同上 | 自动启用 MXFP8 |
+| `kimi_k3_smoketest` | `torchtitan_npu.models.kimi_k3.config_registry.kimi_k3_debugmodel`；4 层／dim256／8 专家 | 默认不开启；显式开关量化 routed/shared experts |
+| `kimi_k3_16layer_reduced` | 同包 `kimi_k3_16layer_reduced`；16 层缩小配置 | 同上 |
+| `kimi_k3_full` | 同包 `kimi_k3_full`；93 层／dim7168／896 专家 | 同上 |
 
 不应仅根据 preset 名称判断实际精度；读取 `annotations["quantization_configuration"]` 的 `enabled`、`recipe` 和实际 `quantized_parameters`。
 
-自定义 `module.factory` 入口会调用 `factory(num_mtp_layers=...)`，返回对象必须符合当前 native Trainer config 结构，且 `model_spec.name == "deepseek_v4"`。这不是任意模型插件接口；自定义工厂还不能使用本 sidecar 的平铺 `model_overrides`。工厂返回的配置仍会被 sidecar 的并行、AC、seq_len、override、量化设置覆盖；compile/CUDA graphs 被关闭，EP 使用均衡路由假设。需要不同能力时先扩展并验证实现，不通过私有对象随意修改字段。
+自定义 `module.factory` 入口会调用 `factory(num_mtp_layers=...)`，返回对象必须符合当前 native Trainer config 结构，且 `model_spec.name` 为 `deepseek_v4` 或 `kimi_k3`。这不是任意模型插件接口；自定义工厂还不能使用本 sidecar 的平铺 `model_overrides`。工厂返回的配置仍会被 sidecar 的并行、AC、seq_len、override、量化设置覆盖；compile/CUDA graphs 被关闭，EP 使用均衡路由假设。需要不同能力时先扩展并验证实现，不通过私有对象随意修改字段。
+
+Kimi 要求 `num_mtp_modules=0`，平铺模型几何复写仍只适用 DSV4。Kimi 的原生组件、raw 算子名变化、CP 连续区间和精度限制见 [Kimi 接入说明](kimi-k3-migration.md)。
 
 ## 6. 全部模型几何复写参数
 

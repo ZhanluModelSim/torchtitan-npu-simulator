@@ -91,7 +91,7 @@ def main(argv=None):
             "parameter_devices": sorted({p.device.type for p in model.parameters()}),
             "num_layers": len(model.layers),
             "token_embedding_shape": list(model.tok_embeddings.weight.shape),
-            "mtp_layers": 0 if model.mtp_layers is None else len(model.mtp_layers),
+            "mtp_layers": len(getattr(model, "mtp_layers", ()) or ()),
             "compile": prepared.trainer.compile.enable,
             "cuda_graphs": not prepared.trainer.training.disable_cuda_graphs,
             "spmd_backend": prepared.trainer.parallelism.spmd_backend,

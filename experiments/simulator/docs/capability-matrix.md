@@ -1,4 +1,6 @@
-# DSV4 迁移能力矩阵
+# Simulator 迁移能力矩阵
+
+Kimi K3 新增范围及当前源码验收另见 [Kimi 接入与验证](kimi-k3-migration.md)。以下历史全规模矩阵仍专指 DSV4。
 
 2026-10-23 已补齐 FSDP stream/event 控制依赖，四组配置复验通过。当前图包含零耗时 `stream_wait` 节点，上游必须保留其前驱约束。详见 [修复与复验](fsdp-dependency-audit.md#修复与复验) 和 [接入合同](stream-control-dependencies.md)。
 
@@ -31,7 +33,8 @@
 | PP | 原有结构单测保留 | 低优先级；训练入口拒绝 | [test_config.py](../tests/test_config.py) |
 | FP8 EP dispatch／FSDP AG | 与 MXFP8 计算分开 | 低优先级；入口拒绝 | [test_config.py](../tests/test_config.py) |
 | A5、真实训练数值、allocator 峰值 | 当前无真实 NPU | 未验证；A5 入口拒绝 | [test_config.py](../tests/test_config.py)、migration-status.md |
-| Kimi/raw_model/首层 replica／其他优化器 | 不属于本次 DSV4 标准路径 | 未迁移；不得据旧版支持推断新版可用 | legacy-patch-inventory.md |
+| Kimi K3 | 原生模型、MoE、FSDP/TP/EP/CP、AC、MXFP8、显式虚拟融合 | Meta/CPU 验证范围见专项记录；无真实 KDA 硬件 provider | [Kimi 验收](kimi-k3-migration.md) |
+| raw_model/首层 replica／其他优化器 | 不属于当前标准路径 | 未迁移；不得据旧版支持推断新版可用 | legacy-patch-inventory.md |
 | CANN metadata 普通 dispatch | 原生 `torch.ops`；按能力探针修正 Meta 分配设备；注册可恢复 | Meta 已验证；准备阶段成本范围仍独立 | [test_metadata.py](../tests/test_metadata.py)、open-questions.md |
 
 CANN metadata 的泛型 Python 包装签名另有 [兼容修正与专项验证](cann-metadata-signature-compat.md)；用户已反馈其 CANN 9.2.0 环境轻量 CLI 运行成功；该反馈不等于完整矩阵复验，原 21 项结果仍按各自源码哈希解释。

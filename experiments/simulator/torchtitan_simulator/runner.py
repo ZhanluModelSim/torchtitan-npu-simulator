@@ -77,12 +77,18 @@ def _buffer_signature(model):
 
 def simulate(simulation):
     prepared = prepare_config(simulation)
-    if prepared.trainer.training.dtype != "float32":
+    if prepared.trainer.model_spec.name == "deepseek_v4" and prepared.trainer.training.dtype != "float32":
         raise ValueError(
             "DeepSeek V4 capture requires training.dtype=float32: native FSDP expects uniform original "
             "parameter dtype, but base bfloat16 mixes with explicit float32 attn_sink/ape parameters. "
             "Use mixed_precision_param=bfloat16 for native BF16 compute, or memory_parameter_storage_dtype "
             "for a storage-only estimate. Build-only can still inspect the native bfloat16 model."
+        )
+    if prepared.trainer.model_spec.name == "kimi_k3" and prepared.trainer.training.dtype != "float32":
+        raise ValueError(
+            "Kimi K3 capture requires training.dtype=float32: native FSDP expects uniform original parameter dtype, "
+            "but the model defines A_log/dt_bias in float32. Use mixed_precision_param=bfloat16 for BF16 compute, "
+            "or memory_parameter_storage_dtype for a storage-only estimate. Build-only can inspect bfloat16."
         )
     simulation = prepared.simulation
     config = prepared.trainer
@@ -263,7 +269,7 @@ def simulate(simulation):
                 "dim": config.model_spec.model.dim,
                 "vocab_size": config.model_spec.model.vocab_size,
                 "num_layers": config.model_spec.model.n_layers,
-                "num_mtp_layers": len(config.model_spec.model.mtp_layers),
+                "num_mtp_layers": len(getattr(config.model_spec.model, "mtp_layers", ())),
             }
             annotations["quantization_configuration"] = {
                 "enabled": simulation.enable_quantized_training,

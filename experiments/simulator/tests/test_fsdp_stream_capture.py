@@ -7,13 +7,17 @@
 
 import inspect
 
+import pytest
 from torchtitan_simulator.capture.dispatch_capture import get_active_capture
 from torchtitan_simulator.compat.device import MetaDeviceModule
 from torchtitan_simulator.config import SimulationConfig
 from torchtitan_simulator.runner import simulate
 
 
-def test_native_hsdp_partial_backward_wait_delays_later_matmul(monkeypatch):
+@pytest.mark.parametrize(
+    "config,num_mtp", [("deepseek_v4_smoketest", 1), ("kimi_k3_smoketest", 0)], ids=["dsv4", "kimi"]
+)
+def test_native_hsdp_partial_backward_wait_delays_later_matmul(monkeypatch, config, num_mtp):
     observed = []
     original = MetaDeviceModule.Stream.wait_event
 
@@ -32,7 +36,9 @@ def test_native_hsdp_partial_backward_wait_delays_later_matmul(monkeypatch):
         return original(stream, event)
 
     monkeypatch.setattr(MetaDeviceModule.Stream, "wait_event", wait_event)
-    workload = simulate(SimulationConfig(world_size=4, data_parallel_replicate_degree=2, num_mtp_modules=1))
+    workload = simulate(
+        SimulationConfig(config=config, world_size=4, data_parallel_replicate_degree=2, num_mtp_modules=num_mtp)
+    )
     nodes = {node.op_id: node for template in workload.step_templates.values() for node in template.nodes.values()}
     sources = {node.op_id: node.op_id for node in nodes.values()}
     for node in nodes.values():
@@ -75,3 +81,41 @@ def test_native_hsdp_partial_backward_wait_delays_later_matmul(monkeypatch):
             assert starts(reduction)[consumer.op_id] > baseline[consumer.op_id] + 900_000
             checked += 1
     assert checked > 0, "Native HSDP post-reduce wait must gate a later loss-chunk matmul"
+
+
+def test_kimi_fsdp_allgather_storage_and_completion_gate_attention_weight_use():
+    workload = simulate(SimulationConfig(config="kimi_k3_smoketest", world_size=2, seq_len=16))
+    annotations = workload.iteration.schedule.annotations
+    memory = annotations["memory_plan"]
+    projection = next(
+        event
+        for event in memory.raw_events
+        if event.module_path.endswith("layers.0.attention.q_proj") and event.raw_op_type == "aten.mm.default"
+    )
+    assert any(
+        projection.inputs[1].storage_key in event.storage_keys
+        for event in memory.fsdp_residency_events
+        if event.action == "alloc" and event.module_fqn == "layers.0"
+    )
+    nodes = {node.op_id: node for template in workload.step_templates.values() for node in template.nodes.values()}
+    gathers = [
+        event
+        for event in annotations["communication_events"]
+        if event["fsdp_module_fqn"] == "layers.0"
+        and event["comp_type"] == "F"
+        and nodes[event["op_id"]].op_type == "allgather"
+    ]
+    assert gathers
+    gather = min(gathers, key=lambda event: event["seq_idx"])["op_id"]
+
+    def compute_start(delay):
+        finishes = {}
+        for node in sorted(nodes.values(), key=lambda item: item.seq_idx):
+            start = max((finishes[parent] for parent in node.predecessors), default=0)
+            duration = 0 if node.op_type == "stream_wait" else (1_000_000 if delay == node.op_id else 1)
+            finishes[node.op_id] = start + duration
+            if node.op_id == projection.op_id:
+                return start
+        raise AssertionError("Attention projection disappeared from the workload graph")
+
+    assert compute_start(gather) > compute_start(None) + 900_000

@@ -554,14 +554,22 @@ _DSV41_CONFIG_FILTERS = {
     "sparse_attention": match_config_fqn_suffix(".attention.inner_attention"),
 }
 
-_ModelType = Literal["v4", "v41"]
+_KIMI_CONFIG_FILTERS = {
+    # Retain the legacy Kimi default: quantize routed/shared experts only.
+    "dense": match_config_fqn_suffix(".moe.shared_experts.w1", ".moe.shared_experts.w2", ".moe.shared_experts.w3"),
+    "routed_expert": match_config_fqn_suffix(*_ROUTED_EXPERT_SCOPE_SUFFIXES),
+}
+
+_ModelType = Literal["v4", "v41", "kimi_k3"]
 _CONFIG_FILTERS_BY_MODEL_TYPE: dict[_ModelType, dict[str, ConfigFilterFn]] = {
     "v4": _DSV4_CONFIG_FILTERS,
     "v41": _DSV41_CONFIG_FILTERS,
+    "kimi_k3": _KIMI_CONFIG_FILTERS,
 }
 _MODEL_TYPE_BY_MODEL_NAME: dict[str, _ModelType] = {
     "deepseek_v4": "v4",
     "deepseek_v4_1": "v41",
+    "kimi_k3": "kimi_k3",
 }
 
 
@@ -645,7 +653,7 @@ def _model_type_for_spec(model_spec: ModelSpec) -> _ModelType:
         return _MODEL_TYPE_BY_MODEL_NAME[model_spec.name]
     except KeyError as exc:
         raise ValueError(
-            "TorchAO-NPU quantization supports DeepSeek V4 and V4.1 model specs, "
+            "TorchAO-NPU quantization supports DeepSeek V4, V4.1 and Kimi K3 model specs, "
             f"got {getattr(model_spec, 'name', type(model_spec).__qualname__)!r}"
         ) from exc
 
@@ -1234,8 +1242,15 @@ def _recipe_converters(
     try:
         filters = _CONFIG_FILTERS_BY_MODEL_TYPE[model_type]
     except KeyError as exc:
-        raise ValueError(f"unsupported DeepSeek model type {model_type!r}; expected 'v4' or 'v41'") from exc
+        raise ValueError(f"unsupported quantization model type {model_type!r}") from exc
     dense_filter = filters["dense"]
+    if model_type == "kimi_k3" and (
+        recipe != "all_mxfp8"
+        or enable_sparse_attention_quantization
+        or li_quantization is not None
+        or (kv_norm_quantization is not None and kv_norm_quantization.format is not None)
+    ):
+        raise ValueError("Kimi K3 supports the all_mxfp8 expert recipe without DeepSeek-specific quantization options")
 
     if recipe == "all_mxfp8":
         converters = [

@@ -193,7 +193,7 @@ def test_recipe_converters_select_filters_for_model_type(
 
 def test_v41_li_quantization_alone_is_refused(converter_module):
     """The quantized selector launches the quantized sparse attention's schedules."""
-    with pytest.raises(ValueError, match="requires .*enable-sparse-attention-quantization"):
+    with pytest.raises(ValueError, match=r"requires .*enable-sparse-attention-quantization"):
         converter_module._recipe_converters(
             "mix",
             model_type="v41",
@@ -225,7 +225,7 @@ def test_recipe_converters_warn_when_sparse_attention_filter_is_unavailable(conv
 
 
 def test_model_type_rejects_unknown_model_spec_name(converter_module):
-    with pytest.raises(ValueError, match=r"supports DeepSeek V4 and V4\.1 model specs"):
+    with pytest.raises(ValueError, match=r"supports DeepSeek V4, V4\.1 and Kimi K3 model specs"):
         converter_module._model_type_for_spec(SimpleNamespace(name="deepseek_v3", model=object()))
 
 
@@ -235,7 +235,7 @@ def test_model_type_comes_from_model_spec_name(converter_module):
 
 
 def test_recipe_converters_reject_unknown_model_type(converter_module):
-    with pytest.raises(ValueError, match="unsupported DeepSeek model type"):
+    with pytest.raises(ValueError, match="unsupported quantization model type"):
         converter_module._recipe_converters(
             "mix",
             model_type="v3",  # type: ignore[arg-type]
@@ -385,7 +385,8 @@ def test_v41_recipe_couples_source_compressor_and_sparse_attention(converter_mod
 
 def _source_compressor_layer(spec, ratio):
     return next(
-        i for i, layer in enumerate(spec.model.layers)
+        i
+        for i, layer in enumerate(spec.model.layers)
         if layer.attention.compressor.is_source and layer.attention.compressor.compress_ratio == ratio
     )
 
@@ -533,3 +534,27 @@ def test_converted_v41_compressor_quantizes_post_rope_and_preserves_gradients(co
     ):
         assert parameter.grad is not None
         torch.testing.assert_close(parameter.grad, reference_parameter.grad, rtol=0, atol=0)
+
+
+def test_kimi_mxfp8_registry_recipe_keeps_situ_and_legacy_expert_selection(converter_module, quantization_calls):
+    from torchtitan_npu.config import QuantizationExtensionConfig
+    from torchtitan_npu.models.kimi_k3.config_registry import kimi_k3_debugmodel
+    from torchtitan_npu.models.kimi_k3.feed_forward import KimiGroupedExperts, SituGLU
+
+    spec = kimi_k3_debugmodel().model_spec
+    dense_type = type(spec.model.layers[0].feed_forward.w1)
+    attention_type = type(spec.model.layers[0].attention.q_proj)
+    converted = converter_module.apply_quantization_converter(
+        spec,
+        QuantizationExtensionConfig(enable_quantized_training=True, recipe="all_mxfp8"),
+        model_compile_enabled=False,
+    )
+    config = converted.model.layers[1].moe.routed_experts.inner_experts
+    experts = config.build()
+
+    assert isinstance(experts, KimiGroupedExperts)
+    assert isinstance(experts.act_fn, SituGLU)
+    assert (experts.act_fn.beta, experts.act_fn.linear_beta) == (4.0, 25.0)
+    assert len(quantization_calls) == 1
+    assert type(converted.model.layers[0].feed_forward.w1) is dense_type
+    assert type(converted.model.layers[0].attention.q_proj) is attention_type
