@@ -377,14 +377,13 @@ def run_simulation_step(
     if memory_plan is not None:
         print("单卡内存（GiB；峰值包含常驻优化器状态）")
         summary = memory_plan.to_summary_dict()
-        for label, key in (
-            ("稳态总峰值", "steady_state_active_bytes_peak"),
-            ("前向峰值", "steady_state_forward_active_bytes_peak"),
-            ("反向峰值", "steady_state_backward_active_bytes_peak"),
-            ("优化器阶段峰值", "steady_state_optimizer_active_bytes_peak"),
-            ("权重大小", "persistent_param_bytes"),
-            ("优化器状态大小", "optimizer_state_bytes"),
+        for label, value in (
+            ("稳态总峰值", summary["steady_state_active_bytes_peak"]),
+            ("前向峰值", summary["steady_state_forward_active_bytes_peak"]),
+            ("反向峰值", summary["steady_state_backward_active_bytes_peak"]),
+            ("优化器阶段峰值", summary["steady_state_optimizer_active_bytes_peak"]),
+            ("权重大小", summary["persistent_param_bytes"]),
+            ("优化器状态大小", summary["optimizer_state_bytes"]),
         ):
-            value = summary[key]
             print(f"  {label}: {value / 2**30:.3f}" if value is not None else f"  {label}: 不可用")
     return wg

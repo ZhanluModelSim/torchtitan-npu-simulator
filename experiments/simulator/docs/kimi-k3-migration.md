@@ -90,7 +90,7 @@ CP 使用连续序列区间，先完成 TP/SP 收集，再经原生 autograd col
 | FSDP 依赖 | `test_fsdp_stream_capture.py`：AG 对应的 full-weight storage 到达投影；延后 AG 会延后计算；HSDP AR 延后通过 wait/event 传播到后续计算 |
 | 数学与状态 | `tests/unit_tests/models/kimi_k3/`：SiTU、LatentMoE、Attention Residual、MLA 输出和梯度、CP/EP Gloo、HF state 映射、KDA provider 参数 |
 
-mem 汇总仍只有 [六个值](steady-state-memory.md)，其中四个峰值均包含稳态优化器状态。
+mem 汇总保留 [六项核心预算](steady-state-memory.md)，其中四个峰值均包含稳态优化器状态；另有逐层 offload payload 列表，未开启 offload 时为 0。
 完整 93 层、B=1/S=512、world2048、TP4/CP2/EP64 的当前源码复验如下，单位为 GiB：
 
 | 单 rank 指标 | rank0，BF16，AC none | rank2047，MXFP8，AC selective |

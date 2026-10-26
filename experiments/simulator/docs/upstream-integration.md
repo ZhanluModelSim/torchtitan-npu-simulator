@@ -323,7 +323,7 @@ optimizer_bytes = summary["optimizer_state_bytes"]
 | `node.inputs`／`outputs`／`attrs` | TensorMeta 列表和算子属性；包括原地写入 operands；不是可供真实运算的 tensor 数据 |
 | `schedule_plan` | 权威 SchedulePlan；消费 actions、data_slots、template_ref 与实际 op 引用；非 PP 当前可能没有 DataSlot，不要硬性要求非空 |
 | `iteration.schedule` | 保留 ScheduleGraph、实例、数据流与 annotations；不能只按 L0 CSV 行顺序另造调度 |
-| `annotations["memory_summary"]` | 严格六项单卡预算：四个含 optimizer 状态的峰值、权重字节、optimizer 状态字节；与 memory_summary.json 完全一致 |
+| `annotations["memory_summary"]` | 六项单卡预算加 `activation_offload_by_layer` 列表；每层仅 `layer` 和单向 `transfer_bytes`，offload 未开启时为 0；与 memory_summary.json 完全一致 |
 | `annotations["memory_plan"]` | Python 内存中为 MemoryPlan 对象，不是 dict；含实际 storage 生命周期、保存槽及捕获／稳态峰值；mem 导出汇总与明细，不序列化整个 MemoryPlan |
 | `annotations["communication_events"]` | 通信记录列表；保留实际 group、ranks、形状／payload 和图引用；原生名称不再固定为旧 `comm.*` |
 | `annotations["capture_coordinates"]` | logical_rank/world、capture worker 和 pipeline_stage；当前单 worker 的 capture_process_rank=0，不等于被模拟 rank=0 |
@@ -340,7 +340,7 @@ optimizer_bytes = summary["optimizer_state_bytes"]
 
 FSDP 模板变体和预取推断补边已移除，当前直接使用捕获的 `op_id`，不再产生 `source_op_id` 映射。空的 `fused_regions`／`internal_data_passes` 字段和 `communication_ownership.generated_l1_templates` 诊断字段已删除，接入方无需读取，见 [精简记录](simulator-cleanup.md)。
 
-内存汇总只保留六项；旧捕获步峰值和统计字段已从汇总移除。标准入口自动提供四个稳态峰值、权重和优化器状态字节；无公开 owner 的自定义 callback 返回 null 而非零。具体字段和边界见 [单卡内存结果](steady-state-memory.md)。
+内存汇总保留六项预算，新增一个逐层卸载／加载 payload 列表；旧捕获步峰值和统计字段不恢复。标准入口自动提供四个稳态峰值、权重和优化器状态字节；无公开 owner 的自定义 callback 返回 null 而非零。具体字段和边界见 [单卡内存结果](steady-state-memory.md)。
 
 逻辑内存指标为 bytes；GiB 换算除以 `2**30`。保存槽数量、去重 storage 数、offload inventory 的累计字节都不等于峰值。当前指标不含 allocator reserved/cache、碎片、kernel workspace；metadata 准备在训练捕获前完成，其准备成本不计入训练图。
 

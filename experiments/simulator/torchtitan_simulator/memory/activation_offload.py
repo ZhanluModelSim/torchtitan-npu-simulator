@@ -7,8 +7,7 @@
 
 from __future__ import annotations
 
-import re
-
+from torchtitan_simulator.memory.layer_scope import activation_layer_scope
 from torchtitan_simulator.memory.plugins import MemoryModelContext, MemoryModelPlugin
 from torchtitan_simulator.memory.records import (
     AutogradSavedTensorEvent,
@@ -17,13 +16,6 @@ from torchtitan_simulator.memory.records import (
     TensorLifetime,
     TensorRef,
 )
-
-_LAYER_PATH_PATTERN = re.compile(r"(?:^|\.)(layers\.\d+)(?:\.|$)")
-
-
-def _layer_scope(module_path: str) -> str:
-    match = _LAYER_PATH_PATTERN.search(module_path)
-    return match.group(1) if match else ""
 
 
 def _resolve_alias(tensor_id: int, alias_base_by_tensor_id: dict[int, int]) -> int:
@@ -58,7 +50,7 @@ def _layer_occurrences(
     for event in events:
         if event.phase != phase:
             continue
-        scope = _layer_scope(event.module_path)
+        scope = activation_layer_scope(event.module_path)
         if not scope:
             continue
         key = (scope, event.pp_stage, event.pp_mb_idx)

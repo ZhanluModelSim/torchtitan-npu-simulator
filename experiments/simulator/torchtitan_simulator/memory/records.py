@@ -8,7 +8,24 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from typing import Any
+from typing import Any, TypedDict
+
+from torchtitan_simulator.memory.layer_scope import activation_layer_scope
+
+
+class LayerOffloadTransfer(TypedDict):
+    layer: str
+    transfer_bytes: int
+
+
+class MemorySummary(TypedDict):
+    steady_state_active_bytes_peak: int | None
+    steady_state_forward_active_bytes_peak: int | None
+    steady_state_backward_active_bytes_peak: int | None
+    steady_state_optimizer_active_bytes_peak: int | None
+    persistent_param_bytes: int
+    optimizer_state_bytes: int | None
+    activation_offload_by_layer: list[LayerOffloadTransfer]
 
 
 @dataclass(frozen=True, slots=True)
@@ -227,8 +244,8 @@ class MemoryPlan:
     steady_state_backward_peak_active_bytes: int | None = None
     steady_state_optimizer_peak_active_bytes: int | None = None
 
-    def to_summary_dict(self) -> dict[str, int | None]:
-        """Return only the six per-rank memory budgets, in bytes."""
+    def to_summary_dict(self) -> MemorySummary:
+        """Return six per-rank budgets and one per-layer offload payload list."""
         return {
             "steady_state_active_bytes_peak": self.steady_state_peak_active_bytes,
             "steady_state_forward_active_bytes_peak": self.steady_state_forward_peak_active_bytes,
@@ -236,7 +253,32 @@ class MemoryPlan:
             "steady_state_optimizer_active_bytes_peak": self.steady_state_optimizer_peak_active_bytes,
             "persistent_param_bytes": self.persistent_param_bytes,
             "optimizer_state_bytes": self.optimizer_state_bytes,
+            "activation_offload_by_layer": self._activation_offload_by_layer(),
         }
+
+    def _activation_offload_by_layer(self) -> list[LayerOffloadTransfer]:
+        layers = {activation_layer_scope(event.module_path) for event in self.raw_events}
+        layers.discard("")
+        sizes: dict[str, dict[str, int]] = {layer: {} for layer in layers}
+        if self.offload_ac_saved_tensors:
+            lifetimes = {item.tensor_id: item for item in self.tensor_lifetimes}
+            for record in self._activation_prefetch_records():
+                scope = record.checkpoint_id.partition(":")[2] or record.checkpoint_id
+                layer = activation_layer_scope(scope) or scope
+                lifetime = lifetimes.get(record.tensor_id)
+                storage = (lifetime.storage_key if lifetime is not None else "") or record.tensor_id
+                size = lifetime.num_bytes if lifetime is not None else record.num_bytes
+                # Multiple views/save slots refer to one payload within a layer.
+                payloads = sizes.setdefault(layer, {})
+                payloads[storage] = max(payloads.get(storage, 0), size)
+
+        def order(layer: str) -> tuple[int, int, str]:
+            scope = activation_layer_scope(layer)
+            if scope:
+                return (1 if scope.startswith("mtp_layers.") else 0, int(scope.rsplit(".", 1)[1]), layer)
+            return (2, 0, layer)
+
+        return [{"layer": layer, "transfer_bytes": sum(sizes[layer].values())} for layer in sorted(sizes, key=order)]
 
     def _checkpoint_saved_activations_by_marker(self) -> dict[str, dict[str, Any]]:
         instances_by_marker: dict[

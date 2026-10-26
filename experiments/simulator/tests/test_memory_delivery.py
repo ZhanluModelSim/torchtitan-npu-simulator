@@ -49,6 +49,7 @@ def test_native_cli_exports_only_memory_and_preserves_raw_graph(exported_capture
         "steady_state_optimizer_active_bytes_peak",
         "persistent_param_bytes",
         "optimizer_state_bytes",
+        "activation_offload_by_layer",
     }
     with (directory / "memory/memory_timeline.csv").open() as stream:
         rows = list(csv.DictReader(stream))
@@ -170,14 +171,16 @@ def test_empty_formats_have_no_filesystem_effects(exported_capture, tmp_path):
 
 
 @pytest.mark.parametrize("mode", ["none", "full", "selective"])
-def test_mxfp8_offload_and_shard_dtype_projection_preserve_native_execution(mode):
+@pytest.mark.parametrize("family", ["deepseek_v4_smoketest", "kimi_k3_smoketest"], ids=["dsv4", "kimi"])
+def test_mxfp8_offload_and_shard_dtype_projection_preserve_native_execution(mode, family):
     from torchtitan_simulator.config import SimulationConfig
     from torchtitan_simulator.runner import simulate
 
     common = dict(
+        config=family,
         world_size=4,
         expert_parallel_degree=2,
-        num_mtp_modules=1,
+        num_mtp_modules=1 if family == "deepseek_v4_smoketest" else 0,
         local_batch_size=1,
         global_batch_size=32,
         enable_quantized_training=True,
@@ -195,6 +198,15 @@ def test_mxfp8_offload_and_shard_dtype_projection_preserve_native_execution(mode
     assert after["batch_configuration"]["gradient_accumulation"] == 8
     assert after["batch_configuration"]["captured_microbatches"] == 1
     left, right = before["memory_plan"], after["memory_plan"]
+    resident_layers = before["memory_summary"]["activation_offload_by_layer"]
+    projected_layers = after["memory_summary"]["activation_offload_by_layer"]
+    expected_layers = ["layers.0", "layers.1", "layers.2", "layers.3"]
+    if family == "deepseek_v4_smoketest":
+        expected_layers.append("mtp_layers.0")
+    assert [item["layer"] for item in resident_layers] == expected_layers
+    assert all(item["transfer_bytes"] == 0 for item in resident_layers)
+    assert all(set(item) == {"layer", "transfer_bytes"} for item in projected_layers)
+    assert all(item["transfer_bytes"] > 0 for item in projected_layers if item["layer"] != "<unattributed>")
     assert [(event.raw_op_type, event.execution_kind) for event in left.raw_events] == [
         (event.raw_op_type, event.execution_kind) for event in right.raw_events
     ]

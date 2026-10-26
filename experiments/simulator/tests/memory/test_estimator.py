@@ -220,6 +220,14 @@ def test_activation_offload_covers_none_mode_and_reports_each_layer():
     assert records["tensor:2"].checkpoint_id == "part0:layers.0"
     assert records["tensor:3"].checkpoint_id == "part0:layers.1"
     assert all(item.role == "activation_saved" for item in records.values())
+    assert offloaded_plan.to_summary_dict()["activation_offload_by_layer"] == [
+        {"layer": "layers.0", "transfer_bytes": 64},
+        {"layer": "layers.1", "transfer_bytes": 128},
+    ]
+    assert resident_plan.to_summary_dict()["activation_offload_by_layer"] == [
+        {"layer": "layers.0", "transfer_bytes": 0},
+        {"layer": "layers.1", "transfer_bytes": 0},
+    ]
 
 
 def test_autograd_saved_slots_preserve_use_def_only_activations():

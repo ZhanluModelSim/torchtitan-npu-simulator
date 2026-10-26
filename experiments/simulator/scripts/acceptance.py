@@ -80,7 +80,11 @@ def run_case(args):
         require(kinds["recompute"] > 0, "AC did not execute recomputation")
     export_result(workload, options)
     summary = json.loads((destination / "memory/memory_summary.json").read_text())
-    require(summary == memory.to_summary_dict() and len(summary) == 6, "memory consumer summary differs")
+    require(summary == memory.to_summary_dict() and len(summary) == 7, "memory consumer summary differs")
+    require(
+        all(set(item) == {"layer", "transfer_bytes"} for item in summary["activation_offload_by_layer"]),
+        "per-layer transfer payload differs",
+    )
     require({path.name for path in destination.iterdir()} == {"memory"}, "unexpected non-memory export")
     with (destination / "memory/memory_timeline.csv").open() as stream:
         active = peak = 0

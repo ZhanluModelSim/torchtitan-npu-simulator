@@ -63,6 +63,7 @@ def test_cold_state_projection_deduplicates_storage_and_can_change_peak_phase():
         "steady_state_optimizer_active_bytes_peak": 100,
         "persistent_param_bytes": 0,
         "optimizer_state_bytes": 80,
+        "activation_offload_by_layer": [],
     }
 
 

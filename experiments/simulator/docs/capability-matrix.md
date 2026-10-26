@@ -27,7 +27,7 @@ Kimi K3 新增范围及当前源码验收另见 [Kimi 接入与验证](kimi-k3-m
 | L0→L1→L2→L3 | 稳定模板 ID、全局 DAG、双向边、DataSlot/实例引用、通信归属 | 全规模 Meta 已验证 | [validation.py](../torchtitan_simulator/validation.py)、[test_memory_delivery.py](../tests/test_memory_delivery.py) |
 | mem 导出与完整原始图 | CLI mem-only；[] 无文件副作用；view/alias 不折叠 | Meta 已验证范围见本轮审计；其余图导出移除 | [test_memory_delivery.py](../tests/test_memory_delivery.py)、[本轮审计](mem-only-precision.md) |
 | 原生精度配置 | base FP32，param BF16/FP32，reduce FP32 | DSV4 base BF16 完整捕获拒绝；不支持 FP16/低精度 reduce | [test_precision.py](../tests/test_precision.py)、[精度边界](mem-only-precision.md) |
-| 稳态优化器状态驻留 | 实际本地 state storage 去重；前向／反向／优化器及总峰值 | Meta 投影；汇总仅六项；未知 owner 不猜测 | [稳态内存](steady-state-memory.md)、[状态测试](../tests/memory/test_optimizer_state.py) |
+| 稳态优化器状态驻留 | 实际本地 state storage 去重；前向／反向／优化器及总峰值 | Meta 投影；六项预算加逐层 offload payload 列表；未知 owner 不猜测 | [稳态内存](steady-state-memory.md)、[状态测试](../tests/memory/test_optimizer_state.py) |
 | 逻辑内存估算 | 实际 storage/保存槽/FSDP 区间、独立峰值求和与去重 | Meta/CPU 已验证；不含 allocator/workspace | [内存测试](../tests/memory/)、validation.py |
 | storage 释放检测 | 弱引用候选队列＋原生过期确认；每个 dispatch 边界；不支持弱引用时退回原生逐边界检查 | CPU／Meta、四并行／AC 组合及完整 Flash 已验证；不改变内存语义 | [生命周期优化](storage-lifetime-optimization.md)、[逐边界测试](../tests/test_storage_lifetime_capture.py) |
 | PP | 原有结构单测保留 | 低优先级；训练入口拒绝 | [test_config.py](../tests/test_config.py) |
