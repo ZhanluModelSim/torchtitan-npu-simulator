@@ -43,7 +43,7 @@ def run_case(args):
     from dataclasses import asdict
 
     from torchtitan_simulator.config import SimulationConfig
-    from torchtitan_simulator.runner import export_result, simulate
+    from torchtitan_simulator.runner import simulate
     from torchtitan_simulator.validation import validate_workload
 
     destination = args.output_dir
@@ -78,7 +78,6 @@ def run_case(args):
     kinds = Counter(event.execution_kind for event in memory.raw_events)
     if args.mode != "none":
         require(kinds["recompute"] > 0, "AC did not execute recomputation")
-    export_result(workload, options)
     summary = json.loads((destination / "memory/memory_summary.json").read_text())
     require(summary == memory.to_summary_dict() and len(summary) == 7, "memory consumer summary differs")
     require(

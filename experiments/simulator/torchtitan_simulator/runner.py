@@ -300,19 +300,20 @@ def simulate(simulation):
         name: getattr(prepared.trainer.training, name)
         for name in ("dtype", "mixed_precision_param", "mixed_precision_reduce")
     }
+    export_result(workload, simulation)
     return workload
 
 
 def export_result(workload, simulation):
-    """Write memory artifacts only; an empty format list has no filesystem effects."""
-    from torchtitan_simulator.memory.export import export_memory_plan
+    """Always write the memory summary; mem additionally writes diagnostic details."""
+    from torchtitan_simulator.memory.export import export_memory_details, export_memory_summary
 
     unknown = set(simulation.output_formats) - {"mem"}
     if unknown:
         raise ValueError(f"Unsupported output formats: {sorted(unknown)}; only mem is supported")
-    if "mem" not in simulation.output_formats:
-        return
     memory = workload.iteration.schedule.annotations.get("memory_plan")
     if memory is None:
         raise ValueError("Cannot export mem without a captured memory plan")
-    export_memory_plan(memory, simulation.output_dir)
+    export_memory_summary(memory, simulation.output_dir)
+    if "mem" in simulation.output_formats:
+        export_memory_details(memory, simulation.output_dir)

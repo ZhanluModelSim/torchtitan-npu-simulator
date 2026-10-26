@@ -25,7 +25,7 @@ Kimi K3 新增范围及当前源码验收另见 [Kimi 接入与验证](kimi-k3-m
 | GBS/GA | 批配置和 token 分母保留 | 单 microbatch 模板；无完整多 MB 峰值回放 | [test_s3_native_lifetimes.py](../tests/test_s3_native_lifetimes.py)、[test_memory_delivery.py](../tests/test_memory_delivery.py) |
 | typed model overrides | 原生配置树重建，构建和量化 F/B/O | 已验证；非支持字段拒绝 | [test_model_overrides.py](../tests/test_model_overrides.py) |
 | L0→L1→L2→L3 | 稳定模板 ID、全局 DAG、双向边、DataSlot/实例引用、通信归属 | 全规模 Meta 已验证 | [validation.py](../torchtitan_simulator/validation.py)、[test_memory_delivery.py](../tests/test_memory_delivery.py) |
-| mem 导出与完整原始图 | CLI mem-only；[] 无文件副作用；view/alias 不折叠 | Meta 已验证范围见本轮审计；其余图导出移除 | [test_memory_delivery.py](../tests/test_memory_delivery.py)、[本轮审计](mem-only-precision.md) |
+| mem 导出与完整原始图 | CLI／simulate() 自动写 summary JSON；mem 增加明细；view/alias 不折叠 | Meta 已验证范围见本轮审计；其余图导出移除 | [test_memory_delivery.py](../tests/test_memory_delivery.py)、[本轮审计](mem-only-precision.md) |
 | 原生精度配置 | base FP32，param BF16/FP32，reduce FP32 | DSV4 base BF16 完整捕获拒绝；不支持 FP16/低精度 reduce | [test_precision.py](../tests/test_precision.py)、[精度边界](mem-only-precision.md) |
 | 稳态优化器状态驻留 | 实际本地 state storage 去重；前向／反向／优化器及总峰值 | Meta 投影；六项预算加逐层 offload payload 列表；未知 owner 不猜测 | [稳态内存](steady-state-memory.md)、[状态测试](../tests/memory/test_optimizer_state.py) |
 | 逻辑内存估算 | 实际 storage/保存槽/FSDP 区间、独立峰值求和与去重 | Meta/CPU 已验证；不含 allocator/workspace | [内存测试](../tests/memory/)、validation.py |

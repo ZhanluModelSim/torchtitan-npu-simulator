@@ -1,7 +1,7 @@
 # Kimi K3 接入与验证
 
 Kimi K3 文本 decoder 已迁移到 TorchTitan v0.3.0 的配置、Module、MoE 和并行接口。
-入口仍为 `simulate(SimulationConfig(...))`，返回完整 `WorkloadGraph`，文件导出仍仅保留 mem。
+入口仍为 `simulate(SimulationConfig(...))`，返回完整 `WorkloadGraph`，成功后默认导出内存汇总，`mem` 选项增加明细。
 本页的验证范围是 Meta 图、CPU 数学契约和逻辑活跃内存；不包含真实 NPU 训练数值与 kernel workspace。
 
 ## 配置与调用
@@ -14,9 +14,10 @@ TORCH_DEVICE_BACKEND_AUTOLOAD=0 python -m torchtitan_simulator \
   --config kimi_k3_smoketest \
   --training.seq-len 16 \
   --training.mixed-precision-param bfloat16 \
-  --simulation.output-formats mem \
   --simulation.output-dir /tmp/kimi-k3-smoke
 ```
+
+成功仿真默认导出 `memory/memory_summary.json`；添加 `--simulation.output-formats mem` 可额外导出内存明细。
 
 | Preset | 几何与用途 |
 | --- | --- |

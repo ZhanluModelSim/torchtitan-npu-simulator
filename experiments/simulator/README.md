@@ -9,7 +9,7 @@ S5 的历史验收见 [交付说明](docs/s5-delivery.md)，
 各能力的范围与状态见 [能力矩阵](docs/capability-matrix.md)。
 当前实现已按原生 dispatch 优先收敛，具体改动和本轮复验见 [收敛记录](docs/dispatch-first-remediation.md)。
 
-当前仅保留 mem 文件导出，WorkloadGraph 保留原始 view/alias 节点；精度边界与本轮验证见 [mem 与精度审计](docs/mem-only-precision.md)。
+CLI 和 `simulate()` 成功仿真后默认导出 `memory/memory_summary.json`，`mem` 选项额外导出内存明细；WorkloadGraph 保留原始 view/alias 节点；精度边界与本轮验证见 [mem 与精度审计](docs/mem-only-precision.md)。
 模板折叠、推断补边与对应恢复代码已清理，当前图直接使用捕获的节点和依赖，见 [精简记录](docs/simulator-cleanup.md)。
 
 WorkloadGraph 中的零耗时 `stream_wait` 节点也必须参与依赖调度，见 [流控制依赖](docs/stream-control-dependencies.md)。
@@ -29,11 +29,11 @@ TORCH_DEVICE_BACKEND_AUTOLOAD=0 python -m torchtitan_simulator \
   --simulation.world-size 4 \
   --parallelism.expert-parallel-degree 2 \
   --training.num-mtp-modules 1 \
-  --simulation.output-formats mem \
   --simulation.output-dir ./simulator_output
 ```
 
-`--build-only` 只检查模型构建，不执行图/梯度验收。
+`--simulation.output-formats mem` 可额外导出事件、timeline 和 tensor/storage 生命周期等内存明细。
+`--build-only` 只检查模型构建，不执行图/梯度验收，也不导出内存汇总。
 `--simulation.logical-rank` 选择单个捕获进程承载的逻辑 rank；它与 PP stage 分开。
 默认 preset `deepseek_v4_smoketest` 映射到目标原生 debugmodel，而非复刻旧版参数规模。
 显式 `module.factory` 也可使用；全规模验收覆盖范围见能力矩阵。

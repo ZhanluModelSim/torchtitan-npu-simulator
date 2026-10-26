@@ -105,7 +105,7 @@ L0 源事件到最终图必须唯一，L1 模板引用、L2 action/DataSlot、L3
 offload 的保存集合、层外驻留、`unattributed` 和逐层单向 payload 必须遵守 [模型内存规则](model-integration.md#保存值不等于卸载候选)。
 
 `OpNode.peak_mem` 等成本注记不能替代生命周期峰值；unknown cost 不等于零时间。设备、算子成本或未来调度策略的假设应与捕获事实分开。
-当前只导出 mem，`simulate()` 本身不写结果文件；需要落盘时调用 `export_result()`。不恢复 JSON/HTML/DOT 等图导出或折叠。
+CLI 和 `simulate()` 成功完成仿真后自动导出 `<output_dir>/memory/memory_summary.json`；`output_formats=["mem"]` 额外写入内存明细。正常调用无需再次执行 `export_result()`；它只用于显式重新导出。build-only 不导出内存结果，捕获或校验失败也不生成新结果。复用目录不会清理旧明细，建议每次使用独立目录。不恢复 JSON/HTML/DOT 等图导出或折叠。
 对外 summary 只有六项预算加一个逐层 payload 列表，细节见 [输出契约](steady-state-memory.md)。更改字段或含义时同步 Python、文件、CLI、acceptance 与接入文档。
 
 ## 验收与排查入口

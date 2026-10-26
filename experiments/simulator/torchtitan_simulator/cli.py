@@ -55,7 +55,14 @@ def main(argv=None):
     parser.add_argument("--simulation.enable-fsdp-allgather-fp8", dest="enable_fsdp_allgather_fp8", action="store_true")
     parser.add_argument("--simulation.enable-ep-dispatch-fp8", dest="enable_ep_dispatch_fp8", action="store_true")
     parser.add_argument("--simulation.output-dir", dest="output_dir", default="./simulator_output")
-    parser.add_argument("--simulation.output-formats", dest="output_formats", nargs="*", choices=["mem"], default=[])
+    parser.add_argument(
+        "--simulation.output-formats",
+        dest="output_formats",
+        nargs="*",
+        choices=["mem"],
+        default=[],
+        help="Memory summary JSON is always written; mem adds detailed memory artifacts",
+    )
     for name, default in (
         ("data-parallel-replicate-degree", 1),
         ("data-parallel-shard-degree", -1),
@@ -73,11 +80,9 @@ def main(argv=None):
     options = SimulationConfig(**args)
     options.validate()
     if not build_only:
-        from torchtitan_simulator.runner import export_result, simulate
+        from torchtitan_simulator.runner import simulate
 
-        workload = simulate(options)
-        export_result(workload, options)
-        return workload
+        return simulate(options)
     from torchtitan_simulator.runtime import meta_runtime
 
     prepared = prepare_config(options)

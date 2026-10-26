@@ -41,7 +41,7 @@ python -m pip install --no-deps --no-build-isolation -e .
 ```python
 from torchtitan_simulator.config import SimulationConfig
 from torchtitan_simulator.ir.workload_graph import WorkloadGraph
-from torchtitan_simulator.runner import export_result, simulate
+from torchtitan_simulator.runner import simulate
 
 options = SimulationConfig(
     config="deepseek_v4_smoketest",
@@ -66,12 +66,9 @@ assert workload_graph.step_templates
 assert "capture_validation" in workload_graph.iteration.schedule.annotations
 
 # Pass workload_graph directly to the existing upstream consumer here.
-
-# Optional: remove this call when the upstream only needs the in-memory graph.
-export_result(workload_graph, options)
 ```
 
-`simulate()` 不导出文件，但可产生日志；`output_dir`、`output_formats` 只有调用 `export_result()` 时才控制落盘。配置在准备阶段深拷贝，不会把派生后的运行配置写回传入对象；例如 `_mxfp8` preset 会启用量化，调用者应从返回图的 `quantization_configuration` 读取实际选择。
+`simulate()` 成功完成仿真后自动向 `output_dir` 写入 `memory/memory_summary.json`，并返回 WorkloadGraph；`output_formats=["mem"]` 额外导出内存明细。配置在准备阶段深拷贝，不会把派生后的运行配置写回传入对象；例如 `_mxfp8` preset 会启用量化，调用者应从返回图的 `quantization_configuration` 读取实际选择。
 
 `SimulationConfig` 是 keyword-only dataclass，不是原生 Trainer.Config。不能传入旧 Trainer config、任意 dict 或额外训练字段。需要模型几何复写时：
 
@@ -112,7 +109,7 @@ assert isinstance(workload_graph, WorkloadGraph)
 # Pass workload_graph directly to the existing upstream consumer here.
 ```
 
-传入的是参数 token 列表，不包含 `python`、`-m` 或模块名，不应把整条 shell 命令当作一个字符串。始终显式传 `argv`；`main()` 无参数时会读取宿主的 `sys.argv`。该路径会自动调用 `export_result()`，适合确实需要标准输出文件的接入。
+传入的是参数 token 列表，不包含 `python`、`-m` 或模块名，不应把整条 shell 命令当作一个字符串。始终显式传 `argv`；`main()` 无参数时会读取宿主的 `sys.argv`。CLI 与 `simulate()` 使用同一条自动导出路径，每次成功仿真只导出一次。
 
 参数语法：
 
@@ -156,8 +153,8 @@ assert isinstance(workload_graph, WorkloadGraph)
 | `--simulation.memory-offload-ac-saved-tensors` | `memory_offload_ac_saved_tensors` | bool；false | `store_true`；保存激活驻留投影，适用于 none/full/selective；不执行实际 offload |
 | `--simulation.enable-fsdp-allgather-fp8` | `enable_fsdp_allgather_fp8` | bool；false | parser 保留，设置 true 会明确拒绝；不是已支持的优化 |
 | `--simulation.enable-ep-dispatch-fp8` | `enable_ep_dispatch_fp8` | bool；false | parser 保留，设置 true 会明确拒绝 |
-| `--simulation.output-dir` | `output_dir` | str；`./simulator_output` | 相对路径按宿主 cwd 解析；接入建议显式绝对路径且每次调用独立目录 |
-| `--simulation.output-formats` | `output_formats` | list[str]；[] | 仅 `mem`；默认 [] 不写文件；CLI 可传零个值；详见第 10 节 |
+| `--simulation.output-dir` | `output_dir` | str；`./simulator_output` | CLI 和 `simulate()` 均使用此目录；相对路径按宿主 cwd 解析，建议每次调用使用独立绝对路径 |
+| `--simulation.output-formats` | `output_formats` | list[str]；[] | 默认 [] 只写 summary JSON；`mem` 增加内存明细；CLI 可传零个值；详见第 10 节 |
 | `--build-only` | 无；CLI 专用 | bool；false | 仅诊断模型构建，返回 dict；不执行完整 F/B/O |
 | `-h`／`--help` | 无；CLI 专用 | 无值 | 帮助后退出，不执行仿真 |
 
@@ -350,15 +347,16 @@ WorkloadGraph 现在包含零耗时 `stream_wait` 节点。上游应以耗时 0 
 
 ## 10. 导出行为与可选格式
 
-只取图时调用 `simulate()`；`cli.main(argv)` 返回同一个 WorkloadGraph，并按选项调用 `export_result()`。
-默认 `output_formats=[]` 不创建输出目录、不写文件。显式 `--simulation.output-formats mem` 才写 `memory/`。
+`simulate()` 和 `cli.main(argv)` 成功完成仿真后，都自动导出 `<output_dir>/memory/memory_summary.json`，同时返回 WorkloadGraph。默认 `output_formats=[]` 只写此汇总；显式 `--simulation.output-formats mem` 才增加下列内存明细。
+
+正常接入不再需要额外调用 `export_result()`；该函数仍可用于将已有图重新导出到另一个目录。`--build-only` 不执行完整仿真，不导出 summary；捕获或校验失败也不会生成新的内存结果。导出 I/O 错误向调用者传播。
 
 mem 保留内存汇总、事件、timeline、tensor/storage 生命周期、autograd 保存值、FSDP 驻留与内存 trace。
 这些文件本身使用 JSON/CSV；删除的是完整图的 JSON/text/HTML/DOT、kernel/schedule CSV、export_manifest 及 IR 上的导出方法。
 原有 `text/html/dot/json/csv` token 和 `--simulation.csv-max-ranks` 均报错，上游必须从调用参数中移除。
 图仍通过同进程 WorkloadGraph 消费；上游自行管理跨进程序列化。
 
-导出不是原子事务，失败可能留下部分文件；每次请求应使用独立目录。旧目录的历史文件不会被自动删除。
+导出不是原子事务，失败可能留下部分文件；每次请求应使用独立目录。旧目录的历史文件不会被自动删除；未选择 `mem` 时也不会刷新之前的明细，因此应为每次仿真使用独立目录。
 
 实际精度与内存假设分开设置，详见 [精度审计](mem-only-precision.md)：
 

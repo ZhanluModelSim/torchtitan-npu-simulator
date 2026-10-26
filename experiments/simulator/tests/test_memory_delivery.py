@@ -157,17 +157,76 @@ def test_removed_export_options_fail_before_native_model_build(arguments):
     assert error.value.code == 2
 
 
-def test_empty_formats_have_no_filesystem_effects(exported_capture, tmp_path):
+def test_explicit_reexport_without_mem_writes_only_summary_and_rejects_unknown_formats(exported_capture, tmp_path):
     from torchtitan_simulator.config import SimulationConfig
     from torchtitan_simulator.runner import export_result
 
     destination = tmp_path / "absent"
     workload, _ = exported_capture
     export_result(workload, SimulationConfig(output_dir=str(destination)))
-    assert not destination.exists()
+    assert {path.name for path in (destination / "memory").iterdir()} == {"memory_summary.json"}
+    assert (
+        json.loads((destination / "memory/memory_summary.json").read_text())
+        == (workload.iteration.schedule.annotations["memory_summary"])
+    )
+    invalid_destination = tmp_path / "invalid"
     with pytest.raises(ValueError, match="Unsupported output formats"):
-        export_result(workload, SimulationConfig(output_dir=str(destination), output_formats=["csv"]))
-    assert not destination.exists()
+        export_result(workload, SimulationConfig(output_dir=str(invalid_destination), output_formats=["csv"]))
+    assert not invalid_destination.exists()
+
+
+@pytest.mark.parametrize("entry", ["python", "cli"])
+@pytest.mark.parametrize("details", [False, True], ids=["summary-only", "mem-details"])
+def test_successful_entry_automatically_exports_summary_once_and_optional_details(
+    entry, details, tmp_path, monkeypatch
+):
+    from torchtitan_simulator.config import SimulationConfig
+    from torchtitan_simulator.memory import export as memory_export
+    from torchtitan_simulator.runner import simulate
+
+    destination = tmp_path / "result"
+    original = memory_export.export_memory_summary
+    written = []
+
+    def observe_summary(plan, output_dir):
+        written.append(output_dir)
+        return original(plan, output_dir)
+
+    monkeypatch.setattr(memory_export, "export_memory_summary", observe_summary)
+    if entry == "python":
+        workload = simulate(
+            SimulationConfig(output_dir=str(destination), seq_len=128, output_formats=["mem"] if details else [])
+        )
+    else:
+        arguments = ["--simulation.output-dir", str(destination), "--training.seq-len", "128"]
+        if details:
+            arguments.extend(["--simulation.output-formats", "mem"])
+        workload = main(arguments)
+    assert written == [str(destination)]
+    directory = destination / "memory"
+    assert (
+        json.loads((directory / "memory_summary.json").read_text())
+        == (workload.iteration.schedule.annotations["memory_summary"])
+    )
+    if details:
+        assert (directory / "memory_timeline.csv").exists()
+        assert (directory / "memory_trace.json").exists()
+        assert (directory / "tensor_lifetimes.csv").exists()
+    else:
+        assert {path.name for path in directory.iterdir()} == {"memory_summary.json"}
+
+
+def test_build_only_and_invalid_simulation_do_not_export_a_memory_result(tmp_path):
+    from torchtitan_simulator.config import SimulationConfig
+    from torchtitan_simulator.runner import simulate
+
+    build_dir = tmp_path / "build"
+    main(["--build-only", "--simulation.output-dir", str(build_dir)])
+    assert not build_dir.exists()
+    failed_dir = tmp_path / "failed"
+    with pytest.raises(ValueError, match="uniform original parameter dtype"):
+        simulate(SimulationConfig(output_dir=str(failed_dir), training_dtype="bfloat16"))
+    assert not failed_dir.exists()
 
 
 @pytest.mark.parametrize("mode", ["none", "full", "selective"])

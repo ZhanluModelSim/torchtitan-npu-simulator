@@ -6,9 +6,10 @@ mem 汇总保留六项核心预算：四个包含常驻优化器状态的稳态�
 ```bash
 python -m torchtitan_simulator \
   --config deepseek_v4_smoketest \
-  --simulation.output-formats mem \
   --simulation.output-dir /tmp/simulator-steady-memory
 ```
+
+CLI 和 `simulate()` 成功仿真后均自动写入 `<output_dir>/memory/memory_summary.json`。默认只导出汇总；需要内存事件、timeline、生命周期等明细时添加 `--simulation.output-formats mem`（Python 为 `output_formats=["mem"]`）。
 
 ## 六个字段
 

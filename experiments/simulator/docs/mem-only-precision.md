@@ -1,5 +1,7 @@
 # mem 导出收敛与原生精度边界
 
+本文为阶段审计快照。下文「默认不写文件／simulate 不落盘」描述的是当时行为，现已被自动导出汇总取代：CLI 和 `simulate()` 成功后默认写 summary JSON，`mem` 仅控制额外明细。当前接入以 [上游指南](upstream-integration.md#10-导出行为与可选格式) 和 [内存汇总](steady-state-memory.md) 为准；历史验证结果保持原样。
+
 后续新增的稳态优化器状态驻留汇总见 [稳态内存说明](steady-state-memory.md)；本文结果与 SHA256 保留本阶段冻结快照，不代表后续源码复验。
 
 当前 Simulator 只保留 `mem` 文件导出，同进程仍返回完整 WorkloadGraph。参数存储投影继续支持；实际训练精度沿用原生配置与算子，不通过后处理重写 dtype。

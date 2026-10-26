@@ -1,6 +1,6 @@
 # Simulator 图折叠与死代码清理
 
-当前 WorkloadGraph 直接保留捕获的原始算子、通信、view／alias 和零耗时流控制节点。通信归属处理只调整 L1／L2 计费与 action 清单，不克隆、移动或重新编号算子，也不推断新的算子依赖。文件输出仍只有 mem，CLI 参数不变。
+当前 WorkloadGraph 直接保留捕获的原始算子、通信、view／alias 和零耗时流控制节点。通信归属处理只调整 L1／L2 计费与 action 清单，不克隆、移动或重新编号算子，也不推断新的算子依赖。当前文件输出为默认 summary JSON，以及由 `mem` 选项控制的内存明细，见 [导出约定](upstream-integration.md#10-导出行为与可选格式)。
 
 ## 删除范围
 

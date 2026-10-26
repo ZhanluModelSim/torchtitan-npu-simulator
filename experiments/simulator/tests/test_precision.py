@@ -48,7 +48,7 @@ def test_native_precision_cli_reaches_fsdp_backward_and_optimizer(param_dtype, m
         "--training.mixed-precision-reduce",
         "float32",
         "--simulation.output-dir",
-        str(tmp_path / "unused"),
+        str(tmp_path / "result"),
     ]
     if quantized:
         arguments.append("--extension.quantization.enable-quantized-training")
@@ -79,7 +79,7 @@ def test_native_precision_cli_reaches_fsdp_backward_and_optimizer(param_dtype, m
     reductions = [event for event in events if "reduce_scatter" in event.raw_op_type]
     assert reductions
     assert {ref.dtype for event in reductions for ref in event.inputs} == {"float32"}
-    assert not (tmp_path / "unused").exists()
+    assert {path.name for path in (tmp_path / "result/memory").iterdir()} == {"memory_summary.json"}
 
 
 def test_base_bfloat16_fails_with_native_fsdp_reason_before_capture():
