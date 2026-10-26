@@ -66,13 +66,16 @@ optimizer_bytes = summary["optimizer_state_bytes"]
 不再分别输出 AC 边界、普通 activation、总计、tensor 数等重复口径。
 
 - 只有 `--simulation.memory-offload-ac-saved-tensors` 开启时才报告传输字节，关闭时捕获到的每层均为 0。
-- 沿用现有 offload 选择集合，none/full/selective 按各自实际保存值统计；不包含纯重算临时张量、权重或优化器状态。
+- none/full/selective 按各自实际保存值统计；只对有明确层归属或显式 checkpoint 边界归属的保存值投影 offload，不包含纯重算临时张量、权重或优化器状态。head/norm 等层外保存值及无法确定归属的值保留设备驻留，不建模传输。
+- 标准捕获中，若一个 storage 的全部保存消费和实际使用都在同一语义前向 F action 内完成（例如 chunked loss 的立即反向），它不参与 offload，按观察到的原始生命周期保留设备字节。此规则同时影响逐层传输列表和四项显存峰值，不是仅过滤报表。仍有后续 B/recompute 使用的共享 storage 不属于此排除项。
 - 同层多个 view、保存槽、checkpoint 角色共享同一 storage 时只计一次，按观察到的完整 storage 字节计量，不取卸载后为 0 的设备驻留字节。
-- 按主模型层数字顺序排列，随后是 MTP 层；没有卸载值的层保留为 0。非层保存值或无法归属的保存值保留其标识，如 `<unattributed>`，不伪装成某一层。
+- 按主模型层数字顺序排列，随后是 MTP 层；没有卸载值的层保留为 0。当前标准捕获不再为层外／未归属保存值创建 `<unattributed>` 传输项；其来源、保存槽和真实设备生命周期仍保留在诊断明细中，不伪装成某一层，也不从显存预算删除。
 - 列表对应当前 logical rank、捕获的单 microbatch。同一 storage 被不同层使用时，各层有各自的 payload 预算，不能将列表之和解释为全局去重内存或实际总线流量。
 
 这是传输数据量预算，不执行真实 copy，不模拟跨层主机副本复用、重复加载次数和传输时序；后续 DES 可另行处理这些行为。
 终端仍只打印六项核心预算，不打印逐层明细。
+
+历史结果中的 `<unattributed>` 不等于 loss。它还包含 head/norm 等层外保存值。当前这些值不卸载、不计传输，但仍在原始生命周期、alloc/free 时间线和设备峰值中；不同 chunk 的累计字节数不直接相加为峰值。不能仅在下游隐藏旧传输行而沿用旧的零驻留预算，应使用修复后的捕获结果。
 
 传输字节沿用捕获时保存激活的实际 dtype/storage 大小，不统一强制为 FP32 或 BF16。
 `training.mixed_precision_param` 影响实际计算和保存 dtype，因此可能改变列表中的值；FP32 激活通常按每元素 4 bytes、BF16 按 2 bytes，但层内还可能包含 FP32、整数或 MXFP8 code/scale，不能将整层统一乘除 2。
@@ -99,3 +102,19 @@ optimizer_bytes = summary["optimizer_state_bytes"]
 2026-10-26 复验：sidecar 全套 489 passed，Pyrefly 0 errors（10 suppressed）。DSV4/MTP 与 Kimi 的 MXFP8 × none/full/selective 覆盖 offload 开关、图／梯度与权重投影隔离；独立 64+32=96 bytes 用例核对共享 storage、view 和多保存角色去重，且不乘双向系数。真实模块 CLI 的 full AC + MTP + offload 导出通过；更新后的 acceptance 在 world16/rank15、TP2/CP2/EP2、selective AC、MTP1 下通过，共 11,047 节点、143 个参数梯度。终端仍为六行，文件／图内汇总为七键。
 
 常规 pre-commit、Ruff 和架构检查通过；全仓检查仍因主机缺少训练依赖而有类型错误，不能标为全绿。日志和导出位于本机 `torchtitan-migration-audit-20261020/layer-offload-summary-20261026/`。本轮不验证真实传输或硬件数值，未重建镜像。
+
+### Chunked loss 的设备驻留修正
+
+已推送的 `2071a46` 在开启 offload 时将 chunk 内立即消费的 loss 保存值也投影为零设备驻留，可能低估显存。修正按保存槽和全部 consumer 的语义 action 判断，不按 `log_softmax` 名称或固定时间间隔猜测；同一 F action 内完成使用的 storage 保持真实驻留，后续 B/recompute 仍会读取的共享 storage 继续参与原 offload 选择。
+
+DSV4 smoketest、world1、seq128、MTP0 的 none/full/selective 对照中，8 个 `log_softmax` 保存 storage 每个均为 8,273,920 bytes。修复后保留各自的 alloc/free 区间，不再进入卸载列表；各 chunk 的累计 66,191,360 bytes 不是同时驻留峰值。权重、优化器状态及参数梯度清单不变，整体峰值由全部 storage 的真实重叠决定，不能直接加上这笔累计字节数。
+
+这组 DSV4 配置在排除 chunk-local loss 后，历史 `<unattributed>` 仍有 664,576 bytes：`hc_head` 内部保存值 532,992 bytes，最终 norm 的输入及归一化中间值 66,048 bytes，累计 head 梯度交给 decoder 的桥接张量 65,536 bytes。当前这些值继续驻留，不计入传输。
+
+Kimi smoketest 同样检查三种 AC；层外保存值包括输出 Attention Residual 的混合／归一化中间值、最终 norm、head 输入及梯度桥接张量。它们均保留设备生命周期；层内保存值仍可 offload，KDA/MLA/SiTU 虚拟融合、图依赖和梯度不变。
+
+归属优先采用保存槽的模块路径。明确的 head/norm/root 保存路径不借用滞后的反向模块路径归入 decoder；没有模块归属时才用实际消费／生产事件补齐。未确认层或显式 checkpoint 绑定的保存值不卸载，包含缺少该 storage 保存槽的非层重算引用；这项策略同时修正原生保存槽与旧 use-def fallback 的驻留。
+
+测试入口：[交错反向驻留与共享边界](../tests/memory/test_interleaved_loss_offload.py)。最终 sidecar 全套 507 passed，Pyrefly 0 errors（10 suppressed）；覆盖 128-byte loss／非层保存值驻留与 64-byte 真 offload 的独立峰值、checkpoint 记录恢复、后续普通反向／重算共享、无保存槽／无绑定的非层重算引用，以及 DSV4 和 Kimi 三种 AC 的 loss/head storage 分配释放。六组原生审计均通过独立时间线字节求和及图验证；DSV4 的 112 个、Kimi 的 110 个训练参数梯度齐全，传输列表仅含四个 decoder 层。
+
+旧版开启 offload 的预算和传输量应重新计算，不能只从列表删除 `<unattributed>` 或对旧峰值加上 loss 总量。原七键汇总结构不变。详细对照日志位于本机 `torchtitan-migration-audit-20261020/offload-attribution-audit-20261026/`。

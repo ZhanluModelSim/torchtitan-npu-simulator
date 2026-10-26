@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 from torchtitan_simulator.memory.layer_scope import activation_layer_scope
 from torchtitan_simulator.memory.plugins import MemoryModelContext, MemoryModelPlugin
 from torchtitan_simulator.memory.records import (
@@ -76,6 +78,16 @@ def _normal_backward_consumers(
     ]
 
 
+def _same_forward_action(saved: AutogradSavedTensorEvent, event: RawMemoryEvent | None) -> bool:
+    """Require a known, matching semantic F action for a storage use."""
+    return (
+        event is not None
+        and saved.comp_type == event.comp_type == "F"
+        and saved.pp_stage == event.pp_stage
+        and saved.pp_mb_idx == event.pp_mb_idx
+    )
+
+
 class ActivationOffloadPlugin(MemoryModelPlugin):
     """Model activations retained for normal backward.
 
@@ -107,6 +119,7 @@ class ActivationOffloadPlugin(MemoryModelPlugin):
             "checkpoint_recompute_temp",
         }
         chosen_by_storage: dict[str, tuple[AutogradSavedTensorEvent, TensorLifetime]] = {}
+        consumed_in_forward: dict[str, bool] = {}
         capture_end = max((event.seq_idx for event in context.events), default=0) + 1
 
         def saved_last_use(saved: AutogradSavedTensorEvent) -> int:
@@ -122,6 +135,12 @@ class ActivationOffloadPlugin(MemoryModelPlugin):
             lifetime = context.lifetimes_by_tensor_id.get(tensor_id)
             if lifetime is None or lifetime.kind in excluded_kinds:
                 continue
+            consumed_in_forward[saved.storage_key] = consumed_in_forward.get(saved.storage_key, True) and (
+                (unpack := event_by_seq.get(saved.unpack_seq)) is not None
+                and unpack.execution_kind == "backward"
+                and _same_forward_action(saved, unpack)
+                and all(_same_forward_action(saved, event_by_seq.get(seq)) for seq in lifetime.consumer_seqs)
+            )
             existing = chosen_by_storage.get(saved.storage_key)
             if existing is None or saved_last_use(saved) > saved_last_use(existing[0]):
                 chosen_by_storage[saved.storage_key] = (saved, lifetime)
@@ -147,6 +166,7 @@ class ActivationOffloadPlugin(MemoryModelPlugin):
 
         checkpoint_recorded_ids = {item.tensor_id for item in context.checkpoint_tensors if item.is_saved_activation}
         recorded: set[int] = set()
+        resident_sizes: dict[str, int] = {}
         for saved, lifetime in chosen_by_storage.values():
             lifetime.death_seq = max(
                 lifetime.death_seq,
@@ -157,6 +177,35 @@ class ActivationOffloadPlugin(MemoryModelPlugin):
             if lifetime.kind not in {"checkpoint_saved_activation", "checkpoint_saved_for_recompute"}:
                 lifetime.kind = "activation"
                 lifetime.reason = "autograd_saved_tensor"
+            producer_event = event_by_seq.get(lifetime.birth_seq)
+            consumer_event = event_by_seq.get(saved.unpack_seq)
+            saved_scope = activation_layer_scope(saved.module_path)
+            if saved_scope:
+                occurrence = (saved_scope, saved.pack_seq)
+            elif saved.module_path:
+                # An explicit head/norm/root save is outside decoder layers;
+                # a stale backward path must not turn it into a layer save.
+                occurrence = None
+            else:
+                occurrence = backward_occurrences.get(saved.unpack_seq)
+                if occurrence is None:
+                    for seq in lifetime.consumer_seqs:
+                        occurrence = backward_occurrences.get(seq)
+                        if occurrence is not None:
+                            consumer_event = event_by_seq[seq]
+                            break
+                if occurrence is None and producer_event is not None:
+                    occurrence = forward_occurrences.get(producer_event.seq_idx)
+            known_owner = occurrence is not None or lifetime.tensor_id in checkpoint_recorded_ids
+            if consumed_in_forward[saved.storage_key] or not known_owner:
+                # Chunked loss saves real tensors, but consumes them before
+                # decoder backward. Keep their observed device lifetimes;
+                # being saved does not make them offload candidates. Head,
+                # norm and unowned saves also stay resident by policy.
+                lifetime.modeled_num_bytes = None
+                lifetime.residency_policy = "resident"
+                resident_sizes[lifetime.tensor_id] = lifetime.num_bytes
+                continue
             if context.offload_ac_saved_tensors:
                 lifetime.modeled_num_bytes = 0
                 lifetime.residency_policy = "offloaded"
@@ -170,7 +219,6 @@ class ActivationOffloadPlugin(MemoryModelPlugin):
             ):
                 continue
             recorded.add(id(lifetime))
-            producer_event = event_by_seq.get(lifetime.birth_seq)
             if producer_event is None:
                 continue
             ref = _producer_ref(
@@ -178,14 +226,8 @@ class ActivationOffloadPlugin(MemoryModelPlugin):
                 producer_event,
                 context.alias_base_by_tensor_id,
             )
-            consumer_event = event_by_seq.get(saved.unpack_seq)
-            occurrence = backward_occurrences.get(saved.unpack_seq) if consumer_event is not None else None
-            if occurrence is None:
-                occurrence = forward_occurrences.get(producer_event.seq_idx)
-            if occurrence is None:
-                scope, anchor_seq = "<unattributed>", producer_event.seq_idx
-            else:
-                scope, anchor_seq = occurrence
+            assert occurrence is not None
+            scope, anchor_seq = occurrence
             target_event = consumer_event or producer_event
             context.activation_offload_tensors.append(
                 CheckpointTensorRecord(
@@ -207,11 +249,23 @@ class ActivationOffloadPlugin(MemoryModelPlugin):
                 )
             )
 
+        if resident_sizes:
+            context.checkpoint_tensors[:] = [
+                replace(record, residency_policy="resident", modeled_num_bytes=resident_sizes[record.tensor_id])
+                if record.tensor_id in resident_sizes and record.residency_policy == "offloaded"
+                else record
+                for record in context.checkpoint_tensors
+            ]
+            context.notes.append(
+                f"Kept {len(resident_sizes)} chunk-local or non-layer/unattributed saved storages "
+                "resident; they are excluded from activation offload payloads."
+            )
+
         selected_bytes = sum(lifetime.num_bytes for _saved, lifetime in chosen_by_storage.values())
         context.notes.append(
             "Autograd saved-tensor capture selected "
             f"{len(chosen_by_storage)} unique saved storages "
-            f"({selected_bytes} logical bytes) for normal backward."
+            f"({selected_bytes} logical bytes) observed for backward."
         )
         if retained_count:
             context.notes.append(
@@ -254,20 +308,6 @@ class ActivationOffloadPlugin(MemoryModelPlugin):
             if producer_event is None:
                 continue
 
-            lifetime.modeled_num_bytes = 0
-            lifetime.residency_policy = "offloaded"
-            if lifetime.kind not in {
-                "checkpoint_saved_activation",
-                "checkpoint_saved_for_recompute",
-            }:
-                lifetime.kind = "offloaded_activation"
-                lifetime.reason = "forward_tensor_saved_for_backward_offloaded"
-            offloaded_count += 1
-            offloaded_bytes += lifetime.num_bytes
-
-            if lifetime.tensor_id in checkpoint_recorded_ids:
-                continue
-
             ref = _producer_ref(
                 tensor_id,
                 producer_event,
@@ -297,17 +337,20 @@ class ActivationOffloadPlugin(MemoryModelPlugin):
                             producer_event.pp_mb_idx,
                         )
                     ] = producer_event
-                else:
-                    targets[
-                        (
-                            "<unattributed>",
-                            producer_event.seq_idx,
-                            producer_event.pp_stage,
-                            producer_event.pp_mb_idx,
-                        )
-                    ] = producer_event
+                elif lifetime.tensor_id not in checkpoint_recorded_ids:
                     unattributed_count += 1
                     unattributed_bytes += lifetime.num_bytes
+                    continue
+
+            lifetime.modeled_num_bytes = 0
+            lifetime.residency_policy = "offloaded"
+            if lifetime.kind not in {"checkpoint_saved_activation", "checkpoint_saved_for_recompute"}:
+                lifetime.kind = "offloaded_activation"
+                lifetime.reason = "forward_tensor_saved_for_backward_offloaded"
+            offloaded_count += 1
+            offloaded_bytes += lifetime.num_bytes
+            if lifetime.tensor_id in checkpoint_recorded_ids:
+                continue
 
             for (scope, anchor_seq, pp_stage, pp_mb_idx), target_event in targets.items():
                 context.activation_offload_tensors.append(
@@ -340,7 +383,6 @@ class ActivationOffloadPlugin(MemoryModelPlugin):
             context.notes.append(
                 "Activation-offload plugin could not map "
                 f"{unattributed_count} tensors ({unattributed_bytes} logical bytes) "
-                "to a transformer layer; they are reported under "
-                "part0:<unattributed>."
+                "to a transformer layer; they remain resident and are not offloaded."
             )
         return []

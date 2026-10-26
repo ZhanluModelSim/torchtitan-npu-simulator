@@ -1,5 +1,8 @@
 # 分阶段出口核验
 
+当前开发按 [统一指南](developer-guide.md) 分为 [捕获运行时与负载契约](capture-runtime.md) 和 [模型适配与验收](model-integration.md)。运行时升级与新模型接入均按对应规则建立新证据。
+历史阶段的通过项和测试数量不替代新模型的保存值来源、驻留／传输及独立峰值核验。
+
 当前原生 dispatch 收敛及复验见 [本轮验收](dispatch-first-remediation.md) 与 [机器可读结果](dispatch-first-results.json)。下文 S0–S5 按当时的验证口径保留。
 
 ## S0–S2 出口核验

@@ -14,6 +14,7 @@ outputs; the rest can be released after their final forward consumer.
 
 from __future__ import annotations
 
+from torchtitan_simulator.memory.layer_scope import activation_layer_scope
 from torchtitan_simulator.memory.plugins import MemoryModelContext, MemoryModelPlugin
 from torchtitan_simulator.memory.records import (
     CheckpointBoundaryEvent,
@@ -148,9 +149,6 @@ class ActivationCheckpointPlugin(MemoryModelPlugin):
             if recompute_consumers:
                 lifetime.kind = "checkpoint_saved_for_recompute"
                 lifetime.reason = "forward_tensor_reused_during_recompute"
-                if context.offload_ac_saved_tensors:
-                    lifetime.modeled_num_bytes = 0
-                    lifetime.residency_policy = "offloaded"
                 recompute_saved_count += 1
                 recompute_saved_bytes += lifetime.num_bytes
 
@@ -159,6 +157,9 @@ class ActivationCheckpointPlugin(MemoryModelPlugin):
                     producer_event,
                     boundaries_by_scope,
                 )
+                if context.offload_ac_saved_tensors and (boundary is not None or activation_layer_scope(scope)):
+                    lifetime.modeled_num_bytes = 0
+                    lifetime.residency_policy = "offloaded"
                 if boundary is None:
                     unattributed_recompute_saved_count += 1
                     unattributed_recompute_saved_bytes += lifetime.num_bytes
@@ -215,7 +216,7 @@ class ActivationCheckpointPlugin(MemoryModelPlugin):
 
         if recompute_saved_count:
             policy = (
-                "offloaded from modeled device memory"
+                "offloaded only with confirmed layer/checkpoint ownership"
                 if context.offload_ac_saved_tensors
                 else "kept resident until their final recompute consumer"
             )

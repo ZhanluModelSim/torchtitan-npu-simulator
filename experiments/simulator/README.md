@@ -71,7 +71,18 @@ Flash/Pro/Pro 20T 的 `deepseek_v4_<flavor>_baseline_bf16|mxfp8` 已执行完整
 Pro 20T 保留旧几何并使用新原生 builder，不是目标主线新增的官方 preset。逐配置结果见能力矩阵。
 类型化模型几何选项使用 `--model-overrides.*`，先重建配置树再量化；可用字段与边界见 S4 审计。
 
+## 开发导航
+
+[统一开发指南](docs/developer-guide.md) 将 v0.3.0 迁移经验整理为两个领域：
+
+| 开发领域 | 内容 |
+| --- | --- |
+| [捕获运行时与负载契约](docs/capture-runtime.md) | 环境、显式会话、Meta/autograd 兼容、身份与所有权、通信控制、IR、输出和升级验收 |
+| [模型适配与验收](docs/model-integration.md) | 官方结构、原生配置树、组件／融合、并行、量化、checkpoint、内存归属与独立先验 |
+
 ## 验证
+
+接入模型或修改内存语义前，先按对应开发领域核对验收项；模型指南同时记录 chunked loss、层外保存值和 `unattributed` 的处理规则与回归入口。
 
 在上述完整环境中安装本包的 `dev` extra，从本目录运行：
 
