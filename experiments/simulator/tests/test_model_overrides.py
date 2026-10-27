@@ -31,9 +31,9 @@ def _geometry_snapshot(value):
     "preset",
     [
         "deepseek_v4_smoketest",
-        "deepseek_v4_flash_baseline_bf16",
-        "deepseek_v4_pro_baseline_bf16",
-        "deepseek_v4_pro_20t_baseline_bf16",
+        "deepseek_v4_flash",
+        "deepseek_v4_pro",
+        "deepseek_v4_pro_20t",
     ],
 )
 def test_empty_override_preserves_the_native_config_tree(preset):
@@ -123,9 +123,7 @@ def test_invalid_typed_geometry_is_rejected_before_model_construction(changes, m
 
 def test_pro_geometry_can_introduce_plain_rope_without_reusing_compressed_theta():
     prepared = prepare_config(
-        SimulationConfig(
-            config="deepseek_v4_pro_baseline_bf16", model_overrides=ModelOverrides(n_layers=1, compress_ratios=(1,))
-        )
+        SimulationConfig(config="deepseek_v4_pro", model_overrides=ModelOverrides(n_layers=1, compress_ratios=(1,)))
     )
     assert prepared.trainer.model_spec.model.layers[0].attention.rope.theta == 10000.0
 
@@ -142,9 +140,7 @@ def test_legacy_boolean_cli_alias_preserves_explicit_false(monkeypatch):
         return model
 
     monkeypatch.setattr(cli, "build_meta_model", inspect_model)
-    report = main(
-        ["--build-only", "--config", "deepseek_v4_flash_baseline_bf16", "--model-overrides.moe-args.no-route-norm"]
-    )
+    report = main(["--build-only", "--config", "deepseek_v4_flash", "--model-overrides.moe-args.no-route-norm"])
     assert report["scope"] == "model_build_only"
     assert observed and not any(observed)
 
@@ -180,7 +176,7 @@ def test_legacy_zero_compression_runs_as_native_window_attention(quantized):
 
 
 def test_20t_preset_retains_plain_last_layer_with_native_ratio():
-    prepared = prepare_config(SimulationConfig(config="deepseek_v4_pro_20t_baseline_bf16", num_mtp_modules=1))
+    prepared = prepare_config(SimulationConfig(config="deepseek_v4_pro_20t", num_mtp_modules=1))
     model = prepared.trainer.model_spec.model
     assert model.n_layers == 96
     assert model.compress_ratios == (128, 4) * 47 + (128, 1)

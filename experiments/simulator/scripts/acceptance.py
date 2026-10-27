@@ -17,11 +17,7 @@ import sys
 import time
 from pathlib import Path
 
-PRESETS = ["deepseek_v4_smoketest"] + [
-    f"deepseek_v4_{flavor}_baseline_{precision}"
-    for flavor in ("flash", "pro", "pro_20t")
-    for precision in ("bf16", "mxfp8")
-]
+PRESETS = ["deepseek_v4_smoketest", "deepseek_v4_flash", "deepseek_v4_pro", "deepseek_v4_pro_20t"]
 GEOMETRY = {"smoketest": (4, 256), "flash": (43, 4096), "pro": (61, 7168), "pro_20t": (96, 12288)}
 
 
@@ -51,6 +47,7 @@ def run_case(args):
     small = args.case == "deepseek_v4_smoketest"
     options = SimulationConfig(
         config=args.case,
+        enable_quantized_training=args.enable_quantized_training,
         world_size=16,
         logical_rank=15,
         data_parallel_replicate_degree=2,
@@ -69,11 +66,11 @@ def run_case(args):
     report = validate_workload(workload)
     annotations = workload.iteration.schedule.annotations
     geometry = annotations["model_configuration"]
-    flavor = "smoketest" if small else args.case.removeprefix("deepseek_v4_").split("_baseline_")[0]
+    flavor = "smoketest" if small else args.case.removeprefix("deepseek_v4_")
     require((geometry["num_layers"], geometry["dim"]) == GEOMETRY[flavor], "native geometry changed")
     require(geometry["num_mtp_layers"] == 1, "MTP not exercised")
     quantization = annotations["quantization_configuration"]
-    require(quantization["enabled"] == args.case.endswith("_mxfp8"), "wrong native recipe selection")
+    require(quantization["enabled"] == args.enable_quantized_training, "wrong native recipe selection")
     memory = annotations["memory_plan"]
     kinds = Counter(event.execution_kind for event in memory.raw_events)
     if args.mode != "none":
@@ -149,6 +146,7 @@ def main():
     parser.add_argument(
         "--modes", choices=["none", "full", "selective"], nargs="+", default=["none", "full", "selective"]
     )
+    parser.add_argument("--enable-quantized-training", action="store_true")
     parser.add_argument("--case", choices=PRESETS)
     parser.add_argument("--mode", choices=["none", "full", "selective"])
     args = parser.parse_args()
@@ -172,6 +170,8 @@ def main():
                 "--output-dir",
                 str(args.output_dir / label),
             ]
+            if args.enable_quantized_training:
+                command.append("--enable-quantized-training")
             with (args.output_dir / f"{label}.log").open("w") as log:
                 process = subprocess.run(
                     command,

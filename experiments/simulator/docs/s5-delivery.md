@@ -1,6 +1,6 @@
 # DeepSeek-V4 仿真交付与复现
 
-> 历史验收记录：本文命令和输出对应当时源码。当前已移除 mem 以外的图导出、CSV rank 参数和 view 折叠；当前入口见 [接入指南](upstream-integration.md)，当前验证见 [mem 与精度审计](mem-only-precision.md)。
+> 历史验收记录：本文命令和输出对应当时源码。精度后缀 preset 已移除；当前按模型结构选择 preset，并以独立参数开启量化；验收脚本也使用显式 `--enable-quantized-training`。当前已移除 mem 以外的图导出、CSV rank 参数和 view 折叠；当前入口见 [接入指南](upstream-integration.md)，当前验证见 [mem 与精度审计](mem-only-precision.md)。
 
 本交付使用固定的 TorchTitan v0.3.0 和 torchtitan-npu master 快照，在完整官方 CANN 环境中
 执行 DeepSeek-V4（DSV4）的 Meta 前向、反向、梯度裁剪和优化器更新。真实 NPU 数值、

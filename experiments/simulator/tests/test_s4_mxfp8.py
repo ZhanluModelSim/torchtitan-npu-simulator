@@ -298,9 +298,11 @@ def test_presets_build_native_geometry_and_recipe_without_fqn_override(preset, l
     from torchtitan_simulator.config import SimulationConfig, build_meta_model, prepare_config
     from torchtitan_simulator.runtime import meta_runtime
 
-    source = SimulationConfig(config=f"deepseek_v4_{preset}_baseline_{precision}", num_mtp_modules=1)
+    source = SimulationConfig(
+        config=f"deepseek_v4_{preset}", num_mtp_modules=1, enable_quantized_training=precision == "mxfp8"
+    )
     prepared = prepare_config(source)
-    assert source.enable_quantized_training is False
+    assert source.enable_quantized_training == (precision == "mxfp8")
     assert prepared.simulation.enable_quantized_training == (precision == "mxfp8")
     with meta_runtime() as runtime:
         runtime.configure_model(prepared)

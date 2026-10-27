@@ -68,7 +68,7 @@ assert "capture_validation" in workload_graph.iteration.schedule.annotations
 # Pass workload_graph directly to the existing upstream consumer here.
 ```
 
-`simulate()` 成功完成仿真后自动向 `output_dir` 写入 `memory/memory_summary.json`，并返回 WorkloadGraph；`output_formats=["mem"]` 额外导出内存明细。配置在准备阶段深拷贝，不会把派生后的运行配置写回传入对象；例如 `_mxfp8` preset 会启用量化，调用者应从返回图的 `quantization_configuration` 读取实际选择。
+`simulate()` 成功完成仿真后自动向 `output_dir` 写入 `memory/memory_summary.json`，并返回 WorkloadGraph；`output_formats=["mem"]` 额外导出内存明细。配置在准备阶段深拷贝，不会把派生后的运行配置写回传入对象；模型名称只选择结构，量化仅由 `enable_quantized_training` 控制；调用者可从返回图的 `quantization_configuration` 读取实际选择。
 
 `SimulationConfig` 是 keyword-only dataclass，不是原生 Trainer.Config。不能传入旧 Trainer config、任意 dict 或额外训练字段。需要模型几何复写时：
 
@@ -128,7 +128,7 @@ assert isinstance(workload_graph, WorkloadGraph)
 
 | CLI 参数 | Python 字段 | 类型／默认值 | 可选值、行为与限制 |
 | --- | --- | --- | --- |
-| `--config` | `config` | str；`deepseek_v4_smoketest` | 七个 DSV4、三个 Kimi preset 或 `module.factory`；详见第 5 节 |
+| `--config` | `config` | str；`deepseek_v4_smoketest` | 四个 DSV4、三个 Kimi preset 或 `module.factory`；详见第 5 节 |
 | `--simulation.world-size` | `world_size` | int；1 | ≥1；逻辑 world，不是捕获进程数 |
 | `--simulation.logical-rank` | `logical_rank` | int；0 | `0 <= rank < world_size`；选择被捕获的逻辑 rank |
 | `--simulation.target-npu-device-type` | `target_npu_device_type` | str；`non_a5` | parser 接受 `non_a5`／`a5`，当前运行时只支持 `non_a5`，`a5` 报错 |
@@ -147,8 +147,8 @@ assert isinstance(workload_graph, WorkloadGraph)
 | `--parallelism.pipeline-parallel-degree` | `pipeline_parallel_degree` | int；1 | 当前只允许 1，其他值在构图前拒绝 |
 | `--activation-checkpoint.mode` | `activation_checkpoint_mode` | str；`none` | `none`／`full`／`selective` |
 | `--simulation.selective-ac-save-ops` | `selective_ac_save_ops` | list[str] 或 None；None | CLI 至少一个 token；仅 selective 模式可设置；全部选项见第 7 节 |
-| `--extension.quantization.enable-quantized-training` | `enable_quantized_training` | bool；false | `store_true`；使用原生 TorchAO-NPU recipe；`_mxfp8` preset 自动启用 |
-| `--extension.quantization.recipe` | `quantization_recipe` | str；`all_mxfp8` | 唯一支持值 `all_mxfp8`；只设 recipe 不会使 BF16 preset 自动开启量化 |
+| `--extension.quantization.enable-quantized-training` | `enable_quantized_training` | bool；false | `store_true`；唯一量化启用开关，默认关闭；使用原生 TorchAO-NPU recipe |
+| `--extension.quantization.recipe` | `quantization_recipe` | str；`all_mxfp8` | 唯一支持值 `all_mxfp8`；只设 recipe 不会开启量化 |
 | `--simulation.memory-parameter-storage-dtype` | `memory_parameter_storage_dtype` | str；空字符串 | 空值保留捕获 dtype；全部可选值见第 8 节；仅内存投影 |
 | `--simulation.memory-offload-ac-saved-tensors` | `memory_offload_ac_saved_tensors` | bool；false | `store_true`；保存激活驻留投影，适用于 none/full/selective；不执行实际 offload |
 | `--simulation.enable-fsdp-allgather-fp8` | `enable_fsdp_allgather_fp8` | bool；false | parser 保留，设置 true 会明确拒绝；不是已支持的优化 |
@@ -198,17 +198,30 @@ GA = GBS / (local_batch_size × DP_degree)
 | `--config`／`config` | 原生工厂／几何 | 量化行为 |
 | --- | --- | --- |
 | `deepseek_v4_smoketest` | `torchtitan_npu.models.deepseek_v4.config_registry.deepseek_v4_debugmodel`；原生 4 层／dim256 | 默认不开启；可显式开 MXFP8；不是旧版 dim128 smoketest |
-| `deepseek_v4_flash_baseline_bf16` | 同包 `deepseek_v4_flash`；43 层／dim4096 | 默认不开启；可显式开 MXFP8 |
-| `deepseek_v4_flash_baseline_mxfp8` | 同上 | 自动启用 MXFP8 |
-| `deepseek_v4_pro_baseline_bf16` | 同包 `deepseek_v4_pro`；61 层／dim7168 | 默认不开启；可显式开 MXFP8 |
-| `deepseek_v4_pro_baseline_mxfp8` | 同上 | 自动启用 MXFP8 |
-| `deepseek_v4_pro_20t_baseline_bf16` | `torchtitan_simulator.presets.deepseek_v4_pro_20t`；96 层／dim12288／2048 专家 | 默认不开启；保留旧几何的适配 preset，不是上游新官方 preset |
-| `deepseek_v4_pro_20t_baseline_mxfp8` | 同上 | 自动启用 MXFP8 |
+| `deepseek_v4_flash` | 同包 `deepseek_v4_flash`；43 层／dim4096 | 默认不开启；显式参数控制 MXFP8 |
+| `deepseek_v4_pro` | 同包 `deepseek_v4_pro`；61 层／dim7168 | 同上 |
+| `deepseek_v4_pro_20t` | `torchtitan_simulator.presets.deepseek_v4_pro_20t`；96 层／dim12288／2048 专家 | 同上；保留旧几何的适配 preset，不是上游新官方 preset |
 | `kimi_k3_smoketest` | `torchtitan_npu.models.kimi_k3.config_registry.kimi_k3_debugmodel`；4 层／dim256／8 专家 | 默认不开启；显式开关量化 routed/shared experts |
 | `kimi_k3_16layer_reduced` | 同包 `kimi_k3_16layer_reduced`；16 层缩小配置 | 同上 |
 | `kimi_k3_full` | 同包 `kimi_k3_full`；93 层／dim7168／896 专家 | 同上 |
 
-不应仅根据 preset 名称判断实际精度；读取 `annotations["quantization_configuration"]` 的 `enabled`、`recipe` 和实际 `quantized_parameters`。
+preset 和工厂只定义模型结构，不再提供精度变体。所有入口默认关闭量化；Python 显式传 `enable_quantized_training=True`，CLI 显式传 `--extension.quantization.enable-quantized-training`，才启用 `all_mxfp8`。仅设置 `quantization_recipe` 不开启量化。基础 dtype、FSDP 计算 dtype、reduce dtype 与量化开关分别设置。
+
+旧 `deepseek_v4_{flash,pro,pro_20t}_baseline_{bf16,mxfp8}` 名称已移除，Python／CLI 均在构建模型前报错并提示新名称。迁移示例：
+
+```bash
+# No quantization; the same model factory is used in both commands.
+python -m torchtitan_simulator --config deepseek_v4_flash \
+  --simulation.output-dir /tmp/flash-unquantized
+python -m torchtitan_simulator --config deepseek_v4_flash \
+  --extension.quantization.enable-quantized-training \
+  --extension.quantization.recipe all_mxfp8 \
+  --simulation.output-dir /tmp/flash-mxfp8
+```
+
+Python 对应 `SimulationConfig(config="deepseek_v4_flash", enable_quantized_training=True)`。旧 `_bf16` 名称改为无精度后缀并省略量化开关；旧 `_mxfp8` 名称改为无精度后缀且显式开启量化。
+
+读取 `annotations["quantization_configuration"]` 的 `enabled`、`recipe` 和实际 `quantized_parameters`。
 
 自定义 `module.factory` 入口会调用 `factory(num_mtp_layers=...)`，返回对象必须符合当前 native Trainer config 结构，且 `model_spec.name` 为 `deepseek_v4` 或 `kimi_k3`。这不是任意模型插件接口；自定义工厂还不能使用本 sidecar 的平铺 `model_overrides`。工厂返回的配置仍会被 sidecar 的并行、AC、seq_len、override、量化设置覆盖；compile/CUDA graphs 被关闭，EP 使用均衡路由假设。需要不同能力时先扩展并验证实现，不通过私有对象随意修改字段。
 

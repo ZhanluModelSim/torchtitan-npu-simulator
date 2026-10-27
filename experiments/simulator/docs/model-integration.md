@@ -45,6 +45,8 @@ Linear、Conv、Embedding、norm、dense／routed/shared experts 和子模块应
 保留虚拟融合时，注册 schema、Meta 输出和真实输入的 autograd 保存；backward 消费实际 dy，输出梯度的 shape/dtype/身份关系可追溯。
 Meta factory 可以创建算子输出元数据，但不能用同 shape tensor 伪造本应保存的真实前向输入。作用域退出恢复调用点，真实设备无 provider 时明确失败，不暗中使用数值不等价的替代实现。
 
+模型 preset／工厂只定义结构，不增加 `_bf16`／`_mxfp8` 工厂变体或根据模型名改写量化配置。调用者通过 `enable_quantized_training` 显式开启量化，默认关闭；recipe、基础 dtype、FSDP 计算／归约 dtype 各自独立。新增模型验收同一工厂的量化开／关两条路径，核对实际参数包装与配置不被静默覆盖。
+
 量化走公共原生 recipe／转换器，核对实际包装参数集合与 code/scale。配置被遍历不等于 custom expert/activation 子类被保留；需要检查转换后的实际 SiTU 等路径，并排除错误替换成公共 SwiGLU。
 不复制旧 FQN 名单、不默认启用其他模型专属的 sparse/LI/KV 量化选项；新模型缺少扩展字段时按公共配置机制组合，不能静默忽略量化开关。
 

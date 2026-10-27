@@ -50,6 +50,18 @@ class SimulationConfig:
     model_overrides: ModelOverrides | None = None
 
     def validate(self):
+        preset, separator, precision = self.config.rpartition("_baseline_")
+        if (
+            separator
+            and preset in {"deepseek_v4_flash", "deepseek_v4_pro", "deepseek_v4_pro_20t"}
+            and precision in {"bf16", "mxfp8"}
+        ):
+            raise ValueError(
+                f"Precision-specific simulator preset {self.config!r} was removed; use config={preset!r}. "
+                "Control quantization explicitly with enable_quantized_training "
+                "(CLI: --extension.quantization.enable-quantized-training); "
+                "it is disabled by default."
+            )
         for name, choices in (
             ("training_dtype", {"float32", "bfloat16"}),
             ("mixed_precision_param", {"float32", "bfloat16"}),
@@ -143,17 +155,10 @@ def prepare_config(simulation: SimulationConfig) -> PreparedConfig:
         "kimi_k3_full": "torchtitan_npu.models.kimi_k3.config_registry.kimi_k3_full",
         "kimi_k3_16layer_reduced": "torchtitan_npu.models.kimi_k3.config_registry.kimi_k3_16layer_reduced",
         "deepseek_v4_smoketest": "torchtitan_npu.models.deepseek_v4.config_registry.deepseek_v4_debugmodel",
+        "deepseek_v4_flash": "torchtitan_npu.models.deepseek_v4.config_registry.deepseek_v4_flash",
+        "deepseek_v4_pro": "torchtitan_npu.models.deepseek_v4.config_registry.deepseek_v4_pro",
+        "deepseek_v4_pro_20t": "torchtitan_simulator.presets.deepseek_v4_pro_20t",
     }
-    for preset, factory in (
-        ("flash", "torchtitan_npu.models.deepseek_v4.config_registry.deepseek_v4_flash"),
-        ("pro", "torchtitan_npu.models.deepseek_v4.config_registry.deepseek_v4_pro"),
-        ("pro_20t", "torchtitan_simulator.presets.deepseek_v4_pro_20t"),
-    ):
-        for precision in ("bf16", "mxfp8"):
-            name = f"deepseek_v4_{preset}_baseline_{precision}"
-            factories[name] = factory
-            if simulation.config == name and precision == "mxfp8":
-                simulation.enable_quantized_training = True
     target = factories.get(simulation.config, simulation.config)
     if "." not in target:
         raise ValueError(f"Unknown simulator preset {simulation.config!r}; use a supported preset or module.factory")

@@ -67,7 +67,8 @@ python -m torchtitan_simulator \
 ```
 
 不提供旧 `mxfp8_fqns` CLI 复写；选择范围完全沿用原生 recipe，导出实际包装后的参数 FQN。
-Flash/Pro/Pro 20T 的 `deepseek_v4_<flavor>_baseline_bf16|mxfp8` 已执行完整原生几何 F/B/O；
+Flash/Pro/Pro 20T 使用 `deepseek_v4_{flash,pro,pro_20t}`，每种结构只保留一个 preset；量化默认关闭，由上述开关独立控制。旧 `_baseline_bf16`／`_baseline_mxfp8` 名称报错并提示迁移，见 [接入指南](docs/upstream-integration.md#5-模型-preset-与实际量化选择)。
+历史 BF16／MXFP8 验收已执行完整原生几何 F/B/O；
 Pro 20T 保留旧几何并使用新原生 builder，不是目标主线新增的官方 preset。逐配置结果见能力矩阵。
 类型化模型几何选项使用 `--model-overrides.*`，先重建配置树再量化；可用字段与边界见 S4 审计。
 
@@ -109,3 +110,17 @@ docker --context colima-titan-migration-audit run --rm torchtitan-simulator:tita
 
 默认 `CANN_ENV_FILE=/usr/local/Ascend/cann/set_env.sh`；其他完整镜像可显式设置对应路径。
 本次验收使用独立 Docker context `colima-titan-migration-audit`。
+
+### 按结构验收量化开关
+
+验收脚本复用同一组结构 preset，默认不启用量化；需要 MXFP8 时显式传参。两次使用独立输出目录：
+
+```bash
+TORCH_DEVICE_BACKEND_AUTOLOAD=0 python scripts/acceptance.py \
+  --presets deepseek_v4_flash --output-dir /tmp/flash-acceptance-unquantized
+TORCH_DEVICE_BACKEND_AUTOLOAD=0 python scripts/acceptance.py \
+  --presets deepseek_v4_flash --enable-quantized-training \
+  --output-dir /tmp/flash-acceptance-mxfp8
+```
+
+省略 `--presets` 时验证四种 DSV4 结构；每种结构默认运行三种 AC。脚本的 `--enable-quantized-training` 同时传给全部子进程，验收实际包装参数、反向梯度、图依赖和内存结果；它不从模型名推断量化。

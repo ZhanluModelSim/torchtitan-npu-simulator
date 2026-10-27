@@ -88,3 +88,25 @@ def test_logical_device_selection_does_not_inherit_host_a5_flags(monkeypatch):
         assert fused_pre and all(not module._use_split_backend for module in fused_pre)
         assert runtime.capabilities["target_npu_device_type"] == "non_a5"
     assert all(owner._IS_A5 is True for owner in owners)
+
+
+@pytest.mark.parametrize("preset", ["flash", "pro", "pro_20t"])
+@pytest.mark.parametrize("precision", ["bf16", "mxfp8"])
+@pytest.mark.parametrize("quantized", [False, True])
+def test_precision_specific_presets_are_rejected_before_factory_import(preset, precision, quantized, monkeypatch):
+    from torchtitan_simulator import config
+
+    def unexpected_import(name):
+        pytest.fail(f"Removed preset must fail before importing a model factory: {name}")
+
+    monkeypatch.setattr(config, "import_module", unexpected_import)
+    with pytest.raises(ValueError, match=f"was removed; use config='deepseek_v4_{preset}'"):
+        config.prepare_config(
+            SimulationConfig(config=f"deepseek_v4_{preset}_baseline_{precision}", enable_quantized_training=quantized)
+        )
+
+
+@pytest.mark.parametrize("precision", ["bf16", "mxfp8"])
+def test_cli_rejects_removed_precision_specific_presets_with_migration_guidance(precision):
+    with pytest.raises(ValueError, match="Control quantization explicitly"):
+        main(["--build-only", "--config", f"deepseek_v4_flash_baseline_{precision}"])

@@ -1,5 +1,7 @@
 # Simulator 迁移能力矩阵
 
+当前模型入口已收紧为四个 DSV4 结构 preset，加三个 Kimi preset；量化由独立参数控制，旧精度后缀名称已移除。下文七个 preset／21 项结果中的名称均为历史验收标识，迁移方式见 [接入指南](upstream-integration.md#5-模型-preset-与实际量化选择)。
+
 Kimi K3 新增范围及当前源码验收另见 [Kimi 接入与验证](kimi-k3-migration.md)。以下历史全规模矩阵仍专指 DSV4。
 
 2026-10-23 已补齐 FSDP stream/event 控制依赖，四组配置复验通过。当前图包含零耗时 `stream_wait` 节点，上游必须保留其前驱约束。详见 [修复与复验](fsdp-dependency-audit.md#修复与复验) 和 [接入合同](stream-control-dependencies.md)。

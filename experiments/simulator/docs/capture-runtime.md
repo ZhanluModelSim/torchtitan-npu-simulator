@@ -36,6 +36,7 @@
 
 入口为 `simulate(SimulationConfig(...))` 或 `cli.main(argv)`，同进程返回 `WorkloadGraph`；不恢复旧 `SimulationTrainer.train` patch。
 独立 CLI 是白名单，不接受任意原生参数树；新增参数要检查 Python 字段、CLI、工厂、实际 consumer 和 [接入文档](upstream-integration.md)。
+模型结构和量化分开选择：preset 名称不隐式开启量化，唯一开关为 `enable_quantized_training`；旧精度后缀 preset 在构建模型前明确拒绝，并给出迁移提示。
 
 - 在导入 torch／simulator 前设置 `TORCH_DEVICE_BACKEND_AUTOLOAD=0`，按环境加载 CANN；Python API 不替调用者 source shell 脚本。
 - 捕获会话拥有 fake process group；宿主已有 process group、嵌套或并发仿真不作为支持路径。当前保留同进程串行调用，PP 捕获入口仍拒绝。
