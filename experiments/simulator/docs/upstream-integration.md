@@ -287,7 +287,7 @@ Kimi 要求 `num_mtp_modules=0`，平铺模型几何复写仍只适用 DSV4。Ki
 | `none` | 不选择这些 SAC save 算子；必须独用 |
 | `all-to-all` | 类型字面量中保留，但当前显式拒绝：旧 synthetic SAC 扩展未支持 |
 
-CLI 示例：`--activation-checkpoint.mode selective --simulation.selective-ac-save-ops default gmm comm`。某组在当前环境无注册算子会报错；通信组选择后未实际命中时可产生 warning。读取真实保存／重算事件，不能仅据配置字符串推断缓存行为。
+CLI 示例：`--activation-checkpoint.mode selective --simulation.selective-ac-save-ops default gmm comm`。某组在当前环境无注册算子会报错；当前默认 EP single 可被 `comm` 保存并在重算中复用；通信组选择后未实际命中时可产生 warning。读取真实保存／重算事件，不能仅据配置字符串推断缓存行为。
 
 ## 8. 参数存储 dtype 的全部选项
 
@@ -343,6 +343,8 @@ optimizer_bytes = summary["optimizer_state_bytes"]
 | `annotations["gradient_validation"]` | 实际 trainable 参数梯度清单和 shape/dtype/placement |
 | `annotations["capture_validation"]` | 本次图／梯度／通信／内存完整性检查结果；构建失败不会返回一张「占位成功图」 |
 | `annotations["cost_unknown_counts"]` | 未知成本算子统计；图存在不代表已知硬件时延 |
+
+EP TokenDispatcher 现在由 simulator 公共运行时默认使用 native functional `all_to_all_single`，DSV4 和 Kimi 共用，无新增参数。相应节点 raw name 为 `_c10d_functional.all_to_all_single.default`；通信量、group/ranks 和梯度仍按实际原生调用记录。`annotations["runtime_capabilities"]["ep_token_exchange"]` 标记默认策略，`ep_token_dispatcher_classes` 记录本次适配的类型数量。CP／FSDP 路径不由此改写，正常真机训练入口不受影响。范围、均衡假设和验证边界见 [EP single 交换](ep-single-transport.md)。
 
 算子名变化是接入重点：通信现在保留 `c10d.*`、`_c10d_functional.*`、`_dtensor.*` 的原生节点；optimizer 为 `aten._fused_adamw_.default`，不再生成旧 `npu.npu_apply_adam_w` 手工节点。不要按旧 raw name 写死识别；可参考 [communication_primitive](../torchtitan_simulator/capture/op_mapping.py) 的映射。
 

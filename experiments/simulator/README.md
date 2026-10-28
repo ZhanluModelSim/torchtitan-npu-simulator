@@ -44,6 +44,7 @@ TORCH_DEVICE_BACKEND_AUTOLOAD=0 python -m torchtitan_simulator \
 - 单次捕获一个 microbatch 和一次优化器更新。输入为合成单文档 next-token 序列；EP 显式采用均衡路由假设。
 - 默认启用目标原生 sparse attention、LI、mHC、RoPE、RMSNorm 和 NPU token dispatcher overrides。
 - 保留目标默认 spmd_types 后端。compile/CUDA graphs 为 dispatch capture 显式关闭。
+- EP TokenDispatcher 在 simulator 公共运行时默认使用原生 functional `all_to_all_single`，全部接入模型共用；CP／FSDP 不由此改写，无新增参数，见 [EP single 交换](docs/ep-single-transport.md)。
 - PP、FP8 通信开关与未验收 A5 目标明确拒绝。MXFP8 使用原生 `all_mxfp8` recipe，详见 [S4 审计](docs/s4-mxfp8-audit.md)。
 - mem 汇总保留四个含优化器状态的稳态峰值、单卡权重和优化器状态大小，另加逐层 offload payload 列表；每层一个单向字节数，未开 offload 时为 0；见 [稳态内存说明](docs/steady-state-memory.md)。
 - 内存输出是逻辑活跃 Tensor/storage 字节，不含 allocator reserved/cache、碎片及未建模 kernel workspace。

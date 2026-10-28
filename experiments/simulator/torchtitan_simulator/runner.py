@@ -133,7 +133,7 @@ def simulate(simulation):
             # torch_npu may install its FSDP layer on first fully_shard. Observe
             # the final layer; restoring this scope also removes the observer.
             install_fsdp_residency_hooks(runtime.patches)
-            install_balanced_dispatch(runtime.patches, model)
+            runtime.capabilities.update(install_balanced_dispatch(runtime.patches, model))
             loss_fn = config.loss.build(compile_config=config.compile)
             loss_fn.set_lm_head(model.lm_head)
             model._skip_lm_head = True
@@ -236,7 +236,7 @@ def simulate(simulation):
                 if not matched:
                     message = (
                         "Native comm SAC save-set matched no dispatcher-visible collective outputs; "
-                        "eager SPMD exchanges follow native recomputation behavior."
+                        "unmatched operations retain the native checkpoint policy."
                     )
                     logging.getLogger(__name__).warning(message)
                     prepared.adaptations.append(message)

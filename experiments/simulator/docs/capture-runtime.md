@@ -84,6 +84,8 @@ autograd warning 可能来自 bridge 安装前的能力探针，但不能据此�
 
 通信必须保留真实 process group、rank 成员、primitive、dtype 和 volume。EP／TP／FSDP mesh 可以重叠，不从 world 或模块名猜轴，也不恢复旧 HSDP 轴修正来绕过新版布局。
 
+EP TokenDispatcher 默认由 `compat/routing.py` 统一适配为原生 functional `all_to_all_single`；按实际 dispatcher helper 安装，不按模型名分支。保留 token-count→token／score 的完成依赖，复用原生输出及 autograd，正常／异常退出恢复绑定；非 Meta 调用保留原实现。该策略不改 CP／FSDP，也不启用 compile，见 [EP single 交换](ep-single-transport.md)。
+
 FSDP 包装可能延迟安装或刷新函数引用。observer 必须覆盖最终生效的 native wrapper，按 transition 关联 AG staging、full allocation、wait、reshard、finalize 和未消费 prefetch 的清理。
 不删除看似没有 tensor consumer 的预取，也不以 full parameter Python view 仍存在为由否认显式释放。
 

@@ -31,7 +31,7 @@ def test_native_meta_collective_has_real_forward_backward_nodes_and_memory(tmp_p
                 y = funcol.reduce_scatter_single_autograd(x, "sum", 1, dist.group.WORLD)
                 expected_shape = (4, 4)
             else:
-                y = funcol.all_to_all_single_autograd(x, [1, 3], [2, 2], dist.group.WORLD)
+                y = funcol.all_to_all_single(x, [1, 3], [2, 2], dist.group.WORLD)
                 expected_shape = (4, 8)
             y.sum().backward()
         nodes = capture.build_nodes()
@@ -67,7 +67,7 @@ def _gloo_exchange(rank, store_path, queue):
         receives = [1, 2] if rank == 0 else [2, 1]
         capture = OpDispatchCapture()
         with observe_collectives() as recorder, capture:
-            y = funcol.all_to_all_single_autograd(x, receives, sends, dist.group.WORLD)
+            y = funcol.all_to_all_single(x, receives, sends, dist.group.WORLD)
             values = y.tolist()
             (y.sum() * (rank + 1)).backward()
         nodes = capture.build_nodes()

@@ -52,6 +52,8 @@ Meta factory 可以创建算子输出元数据，但不能用同 shape tensor �
 
 ## 并行、精度和 checkpoint
 
+所有接入模型共用 simulator 的 [默认 EP single 交换](ep-single-transport.md)，模型内不添加通信变体或专属开关。新增 TokenDispatcher 应遵循公共 count／sync／dispatch／combine helper 契约，并验证 count 到数据交换及 GMM 的依赖；不得只因同名方法存在就宣称兼容。
+
 沿模型的原生 config-sharding 与 parallelize 顺序构建参数分布，再使用目标版本的 AC／FSDP 接口；参考 [Kimi parallelize](../../../torchtitan_npu/models/kimi_k3/parallelize.py) 与 [sharding](../../../torchtitan_npu/models/kimi_k3/sharding.py)。
 
 - 使用实际 dense/expert mesh 和 process group，分别验证 TP/EP/FSDP 的 local shape、placement 和非零 rank。原生轴选择可能随 degree 和专家数改变，不硬编码「所有参数沿第 0 维切」。

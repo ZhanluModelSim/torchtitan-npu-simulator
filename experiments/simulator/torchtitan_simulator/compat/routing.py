@@ -3,13 +3,14 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Resolve host split geometry under the declared balanced-routing assumption."""
+"""Use native functional EP exchanges with balanced host split geometry."""
 
 from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import wraps
 
 import torch
+from torch.distributed._functional_collectives import all_to_all_single
 
 
 @dataclass
@@ -45,12 +46,18 @@ def install_balanced_dispatch(scope, model):
     }
     for cls in classes:
         _install_dispatch_class(scope, cls)
+    return {
+        "ep_token_exchange": "functional_all_to_all_single",
+        "ep_token_dispatcher_classes": len(classes),
+    }
 
 
 def _install_dispatch_class(scope, cls):
     original_dispatch = cls.dispatch
     original_sync = cls._sync_token_count_exchange
+    original_count_exchange = cls._token_count_exchange
     original_exchange = cls._dispatch_token_exchange
+    original_combine = cls._combine_token_exchange
 
     @wraps(original_dispatch)
     def dispatch(self, x, scores, indices, counts, *args, **kwargs):
@@ -80,16 +87,32 @@ def _install_dispatch_class(scope, cls):
         geometry.received_counts = received_counts
         return received_counts, sends, receives
 
+    @wraps(original_count_exchange)
+    def count_exchange(self, num_local_tokens_per_expert_E, pg, ep_size):
+        if num_local_tokens_per_expert_E.device.type != "meta":
+            return original_count_exchange(self, num_local_tokens_per_expert_E, pg, ep_size)
+        return all_to_all_single(num_local_tokens_per_expert_E.view(ep_size, -1), None, None, self.ep_mesh)
+
     @wraps(original_exchange)
-    def exchange(self, *args, **kwargs):
+    def exchange(self, routed_input_ND, pg, output_splits, input_splits):
+        if routed_input_ND.device.type != "meta":
+            return original_exchange(self, routed_input_ND, pg, output_splits, input_splits)
         from torchtitan_simulator.capture.comm_events import collective_dependencies
 
         geometry = _geometry.get()
-        if geometry is None or geometry.received_counts is None:
-            return original_exchange(self, *args, **kwargs)
+        if geometry is None or geometry.dispatcher_id != id(self) or geometry.received_counts is None:
+            raise RuntimeError("EP token exchange has no synchronized count dependency")
         with collective_dependencies(geometry.received_counts):
-            return original_exchange(self, *args, **kwargs)
+            return all_to_all_single(routed_input_ND, output_splits, input_splits, self.ep_mesh)
+
+    @wraps(original_combine)
+    def combine(self, routed_output_RD, pg, input_splits, output_splits):
+        if routed_output_RD.device.type != "meta":
+            return original_combine(self, routed_output_RD, pg, input_splits, output_splits)
+        return all_to_all_single(routed_output_RD, input_splits, output_splits, self.ep_mesh)
 
     scope.replace(cls, "dispatch", dispatch)
+    scope.replace(cls, "_token_count_exchange", count_exchange)
     scope.replace(cls, "_sync_token_count_exchange", sync)
     scope.replace(cls, "_dispatch_token_exchange", exchange)
+    scope.replace(cls, "_combine_token_exchange", combine)

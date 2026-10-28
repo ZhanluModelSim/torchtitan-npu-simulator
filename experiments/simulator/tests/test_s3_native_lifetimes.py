@@ -197,14 +197,18 @@ def test_native_selective_groups_capture_actual_selected_values(selection, caplo
     if selection == "gmm":
         assert cached_ops == {"aten._grouped_mm.default"}
     elif selection == "comm":
-        # Default spmd_types uses eager ProcessGroup exchanges, which are
-        # outside native SAC's canonical functional-collective save set.
-        assert not cached_ops
-        assert "eager SPMD exchanges follow native recomputation" in caplog.text
-        assert any(
-            event.raw_op_type == "c10d.alltoall_.default" and event.execution_kind == "recompute"
+        assert cached_ops == {"_c10d_functional.all_to_all_single.default"}
+        assert "matched no dispatcher-visible collective outputs" not in caplog.text
+        assert not any(
+            event.raw_op_type == "_c10d_functional.all_to_all_single.default" and event.execution_kind == "recompute"
             for event in memory.raw_events
         )
+        assert any(
+            event.raw_op_type == "_c10d_functional.all_to_all_single.default" and event.execution_kind == "backward"
+            for event in memory.raw_events
+        )
+        cached = [slot for slot in memory.autograd_saved_tensors if slot.source == "selective_cache"]
+        assert cached and all(slot.unpack_seq >= slot.pack_seq for slot in cached)
     elif selection in {"none", "quant-mm"}:
         # BF16 has no quantized matmul. MXFP8 operator execution belongs to S4.
         assert not cached_ops
