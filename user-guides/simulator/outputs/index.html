@@ -1,0 +1,633 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" >
+<head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+      <link rel="shortcut icon" href="../../../img/favicon.ico" />
+    <title>Simulator 输出与内存口径 - torchtitan-npu</title>
+    <link rel="stylesheet" href="../../../css/theme.css" />
+    <link rel="stylesheet" href="../../../css/theme_extra.css" />
+        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/styles/github.min.css" />
+    
+      <script>
+        // Current page data
+        var mkdocs_page_name = "Simulator \u8f93\u51fa\u4e0e\u5185\u5b58\u53e3\u5f84";
+        var mkdocs_page_input_path = "user-guides/simulator/outputs.md";
+        var mkdocs_page_url = null;
+      </script>
+    
+    <!--[if lt IE 9]>
+      <script src="../../../js/html5shiv.min.js"></script>
+    <![endif]-->
+      <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/highlight.min.js"></script>
+      <script>hljs.highlightAll();</script> 
+</head>
+
+<body class="wy-body-for-nav" role="document">
+
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side stickynav">
+    <div class="wy-side-scroll">
+      <div class="wy-side-nav-search">
+          <a href="../../.." class="icon icon-home"> torchtitan-npu
+        </a>
+      </div>
+
+      <div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <ul>
+                <li class="toctree-l1"><a class="reference internal" href="../../..">Home</a>
+                </li>
+              </ul>
+              <ul>
+                <li class="toctree-l1"><a class="reference internal" href="../../../lint_guide/">Lint 指南</a>
+                </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Community</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../community/contributors/">提交者与贡献者（Committers and Contributors）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../community/governance/">社区治理</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../community/versioning_policy/">版本策略</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Design</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/1f1b-schedule-plan-assembly-guide/">1F1B 完整依赖组装与 DES 回放实现指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/alltoall-capture-analysis/">all_to_all 通信捕获缺失分析</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/communication-ownership-contract/">Communication Ownership Contract</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/dualpipev-schedule-plan-consumer-guide/">DualPipeV SchedulePlan 下游接入指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/kimi_k3_fused_ops_readme/">Kimi K3 simulator fused-op README</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/l2-l3-schedule-plan-design/">L2/L3 调度 IR 重构设计：从扁平 trace 到结构化 SchedulePlan</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/low-precision-sim-analysis/">低精度训练（MXFP8）Simulator 使能分析</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/megatron-activation-memory-deepseek-v4/">Megatron Activation Estimate vs DeepSeek V4</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/optimizer-ops-analysis/">优化器算子捕获问题分析</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/pipeline-multi-graph-capture-design/">复杂 Pipeline 策略下完整计算图捕获方案设计</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/pp-l2-capture-architecture/">PP L2 Capture Architecture</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/schedule-capture-design/">L0-L3 IR 层级归属设计</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/schedule-plan-dependency-reconstruction-contract/">SchedulePlan 下游依赖重建契约</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/schedule-plan-des-consumer-guide/">SchedulePlan 依赖重建与 DES 消费指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/simulator-architecture/">Simulator 当前架构与执行路径</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/simulator-fixes-and-limits/">Simulator 历史修复与当前边界</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/simulator-memory-model-design/">Simulator Memory Model 改造设计</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/simulator-performance-template-compatibility-2026-10-12/">Simulator 性能与多 microbatch 模板兼容性修复</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/simulator-single-microbatch-capture-2026-10-12/">非 PP 单 microbatch 捕获</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Feature guides</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../feature_guides/checkpoint/">Checkpoint 使用指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../feature_guides/deepseek_v32_mtp/">多Token预测特性(Multi Token Prediction, MTP)</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../feature_guides/low_precision_training/">低精度训练特性（MXFP8）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../feature_guides/metrics_and_debugging/">调试支持特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../feature_guides/model_custom/">Model Custom框架介绍</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../feature_guides/muon_optimizer/">Muon 优化器特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../feature_guides/new_model_onboarding/">新模型接入开发流程</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../feature_guides/npu_fused_ops/">NPU 融合算子适配</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../feature_guides/swap_optimizer/">SwapOptimizer 特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../feature_guides/torch_compile/">torch.compile 支持</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../feature_guides/virtual_optimizer/">Virtual Optimizer - 优化器显存虚拟化特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../feature_guides/vlm/">VLM NPU 支持</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" >Parallelism</a>
+    <ul>
+                <li class="toctree-l2"><a class="reference internal" href="../../../feature_guides/parallelism/custom_cp/">自定义 Context Parallel 特性</a>
+                </li>
+    </ul>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Recipe</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../recipe/sft/">SFT 指令微调</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Superpowers</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" >Plans</a>
+    <ul>
+                <li class="toctree-l2"><a class="reference internal" href="../../../superpowers/plans/2026-07-01-mhc-real-op-name-capture-implementation/">MHC Real-Op-Name Capture Implementation Plan</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../../superpowers/plans/2026-07-01-npu-simulator-implementation/">torchtitan_npu Simulator Implementation Plan</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../../superpowers/plans/2026-07-01-smla-real-op-name-capture-implementation/">SMLA Real-Op-Name Capture Implementation Plan</a>
+                </li>
+    </ul>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" >Specs</a>
+    <ul>
+                <li class="toctree-l2"><a class="reference internal" href="../../../superpowers/specs/2026-07-01-mhc-real-op-name-capture-design/">MHC 真实算子名捕获 — 架构与方案设计（阶段一：MHC）</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../../superpowers/specs/2026-07-01-npu-simulator-design/">torchtitan_npu Simulator — 架构与方案设计</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../../superpowers/specs/2026-07-01-smla-real-op-name-capture-design/">SMLA 真实算子名捕获 — 架构与方案设计（阶段二：SMLA）</a>
+                </li>
+    </ul>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Test guides</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../test_guides/model_acceptance/">新模型最终验收规范（Meta 模拟器）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../test_guides/test_design/">测试设计</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../test_guides/test_guide/">测试使用指南</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">User guides</span></p>
+              <ul class="current">
+                  <li class="toctree-l1"><a class="reference internal" href="../../deepseek_v4_model_parameters/">DeepSeek-V4 模型参数 Web 字段目录</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../installation/">软件安装</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../kimi_k3_model_parameters/">Kimi K3 模型参数 Web 字段目录</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../quickstart/">快速上手</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../">Simulator 使用指南</a>
+                  </li>
+                  <li class="toctree-l1 current"><a class="reference internal current" >Simulator</a>
+    <ul class="current">
+                <li class="toctree-l2"><a class="reference internal" href="../configuration/">Simulator 配置与建模开关</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../documentation-map/">Simulator 文档导航与历史方案索引</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../model-matrix/">Simulator 模型与特性矩阵</a>
+                </li>
+                <li class="toctree-l2 current"><a class="reference internal current" href="#">Simulator 输出与内存口径</a>
+    <ul class="current">
+    <li class="toctree-l3"><a class="reference internal" href="#_1">格式与目录</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#l2">L2 与跨进程消费</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#_2">内存建模口径</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#_3">内存明细文件</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#_4">保存激活与回捞字段</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#kernel-csv">Kernel CSV 字段</a>
+    </li>
+    </ul>
+                </li>
+    </ul>
+                  </li>
+              </ul>
+      </div>
+    </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap">
+      <nav class="wy-nav-top" role="navigation" aria-label="Mobile navigation menu">
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../..">torchtitan-npu</a>
+        
+      </nav>
+      <div class="wy-nav-content">
+        <div class="rst-content"><div role="navigation" aria-label="breadcrumbs navigation">
+  <ul class="wy-breadcrumbs">
+    <li><a href="../../.." class="icon icon-home" aria-label="Docs"></a></li>
+          <li class="breadcrumb-item">User guides</li>
+          <li class="breadcrumb-item">Simulator</li>
+      <li class="breadcrumb-item active">Simulator 输出与内存口径</li>
+    <li class="wy-breadcrumbs-aside">
+    </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+            <div class="section" itemprop="articleBody">
+              
+                <h1 id="simulator">Simulator 输出与内存口径</h1>
+<blockquote>
+<p>现状核对：2026-10-07，<code>feat/npu-simulator</code>，实现基线 <code>ecde2f0</code>。依据源码与 Git 历史静态核对，未执行测试或仿真；后续行为以当前源码为准。</p>
+</blockquote>
+<p>返回<a href="../">使用入口</a>。格式开关见<a href="../configuration/">配置参考</a>，调度依赖见<a href="../../../design/schedule-plan-dependency-reconstruction-contract/">通信与 schema v2 契约</a>。</p>
+<h2 id="_1">格式与目录</h2>
+<p><code>simulation.output_formats=[]</code> 是当前默认值。内存跟踪默认开启，所以即使不指定输出格式，也会写出 <code>memory/memory_summary.json</code>。<code>mem</code> 控制详细内存产物；关闭内存跟踪后，单独选择 <code>mem</code> 不会建立内存计划。</p>
+<table>
+<thead>
+<tr>
+<th>文件或目录</th>
+<th>启用格式</th>
+<th>内容</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>summary.txt</code></td>
+<td><code>text</code></td>
+<td>算子、执行类型、通信与逻辑内存摘要</td>
+</tr>
+<tr>
+<td><code>trace.html</code></td>
+<td><code>html</code></td>
+<td>层级图和调度展示</td>
+</tr>
+<tr>
+<td><code>compute_graph.dot</code></td>
+<td><code>dot</code></td>
+<td>算子依赖图</td>
+</tr>
+<tr>
+<td><code>simulation_result.json</code></td>
+<td><code>json</code></td>
+<td>WorkloadGraph、SchedulePlan 和模板等结构化内容</td>
+</tr>
+<tr>
+<td><code>kernel_summary/rank_N.csv</code></td>
+<td><code>csv</code></td>
+<td>各逻辑 rank 的 L0 算子展开</td>
+</tr>
+<tr>
+<td><code>ir_export/rank_schedule.csv</code></td>
+<td><code>csv</code></td>
+<td>L3/兼容调度导出</td>
+</tr>
+<tr>
+<td><code>ir_export/schedule_plan.csv</code></td>
+<td><code>csv</code></td>
+<td>L2 action 与 DataSlot，包含两个 section</td>
+</tr>
+<tr>
+<td><code>ir_export/l1_schedule/</code></td>
+<td><code>csv</code></td>
+<td>各 stage 的 L1 模板实例调度</td>
+</tr>
+<tr>
+<td><code>ir_export/step_*_l0_ops.csv</code></td>
+<td><code>csv</code></td>
+<td>L1 模板的 L0 算子；多个同类模板时文件名含模板标识</td>
+</tr>
+<tr>
+<td><code>memory/memory_summary.json</code></td>
+<td>不依赖格式</td>
+<td>内存跟踪开启且完成建模时生成</td>
+</tr>
+<tr>
+<td><code>memory/</code> 详细 trace/CSV</td>
+<td><code>mem</code></td>
+<td>生命周期、保存激活、回放 action 和诊断记录</td>
+</tr>
+</tbody>
+</table>
+<p>PP=1 直接写入 <code>simulation.output_dir</code>；PP&gt;1 各 capture process 写入 <code>rank_N/</code>，这里的 N 是真实 PP 进程编号，不能与 <code>kernel_summary/rank_N.csv</code> 的逻辑 rank 混淆。一个进程可拥有多个虚拟 stage，不能把目录固定解释为某一个 stage。输出不自动合并为全局 graph。</p>
+<p>完整导出示例：</p>
+<pre><code class="language-bash">--simulation.output-formats text html dot json csv mem
+</code></pre>
+<p>大 world 下可按需省略 CSV/JSON，或用 <code>--simulation.csv-max-ranks 4</code> 限制部分 CSV 的逻辑 rank 展开；该选项不缩小 world、mesh 或捕获范围，也不限制所有输出文件。</p>
+<h2 id="l2">L2 与跨进程消费</h2>
+<p>生产消费优先读取 SchedulePlan 对象。CSV 用于诊断，不能把第二个 DataSlot section 当作 action 行继续解析。DualPipeV overlap child 的 parent ID、template_ref 和 slot 必须保留。</p>
+<ul>
+<li><code>schedule_order</code> 是 rank-local 发布顺序；<code>seq_idx</code> 是来源/诊断位置，不能当全局时间。</li>
+<li>PP SEND/RECV 按 <code>transfer_id</code> 配对，再核对逻辑 rank、stage 和 tensor 信息；只用 <code>comm_peer_rank</code> 不足以区分多条传输。</li>
+<li>计算块内通信已经在 L1，不能再从兼容 DataPass 补一份费用。</li>
+<li>PP replay 按 action 实例化各 microbatch，展示模板仍按首次出现折叠。</li>
+</ul>
+<p>Memory Perfetto/Chrome trace 横轴由事件序号构造，不是设备运行时延。launcher 的完成记录检查 worker 状态和导出完整性，不等于模型数值或硬件性能验收。</p>
+<h2 id="_2">内存建模口径</h2>
+<p>核心 use-def 扫描使用未折叠 raw event stream，而不是把 L0 <code>peak_mem</code> 相加。每个 tensor 记录 producer、consumer、last use、alias/mutation、logical bytes、modeled resident bytes 和分类。</p>
+<ol>
+<li>从真实 model_parts 获取本地参数 shard 并去重。</li>
+<li>保留参数 materialization alias 与 FSDP full-parameter/staging 的区别。</li>
+<li>FSDP plugin 根据 wait/reshard 状态事件建驻留，不用 schedule intent 冒充驻留开始/释放。
+   驻留事件携带带 generation 的 storage 身份；同一参数的转置、reshape 和 wrapper 内部视图统一归属 FSDP 生命周期，避免被再次计为跨前向/反向的激活。PP 回放保留这些参数 storage 身份，普通激活仍按 microbatch 实例化。</li>
+<li>Checkpoint plugin 区分边界保存、内部临时值、selective 保存且在 recompute 中复用的值。</li>
+<li>non-PP 下结合 autograd <code>saved_tensors_hooks</code> pack/unpack 识别实际保留值，排除参数、输入、通信和 FSDP buffer，再按 storage/alias 去重。</li>
+<li>缺失 meta parameter gradient 由专门 plugin 建模，避免少计训练梯度。</li>
+<li>PP 下按 SchedulePlan action 实例化模板，区分 microbatch tensor 身份、持久参数和 residency。</li>
+<li>导出整体 active peak、pre-optimizer model peak、forward/backward/optimizer 分峰及 checkpoint/activation prefetch 逻辑量。</li>
+</ol>
+<p><strong>精度边界：</strong> PP replay 当前明确不重放精确 autograd save slots，<code>autograd_saved_tensor_events=None</code>，避免把 MB0 save ID 错用到其他 MB；该路径采用 use-def/checkpoint 推断。none 下的 save slots/unique storages 数量和卸载 inventory 累计字节都不能直接当作时间轴峰值。</p>
+<p>卸载仅是驻留假设：当前不是实际 host/device offload executor，也没有据此测量回捞时延。FP8 AG 当前是 transport/staging precision model，不是完整的 quantize/通信/dequantize 性能实现；EP 则显式建模 payload+scale 与依赖。</p>
+<p>证据：<a href="../../../torchtitan_npu/simulator/memory/estimator.py">estimator</a>、<a href="../../../torchtitan_npu/simulator/memory/schedule_replay.py">PP replay 边界</a>、<a href="../../../torchtitan_npu/simulator/memory/plugins.py">memory plugin 接口</a>。</p>
+<h2 id="_3">内存明细文件</h2>
+<p><code>memory/</code> 中的主要文件：</p>
+<table>
+<thead>
+<tr>
+<th>文件</th>
+<th>内容</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>memory_summary.json</code></td>
+<td>默认导出；参数常驻、前向/反向/optimizer 峰值及 checkpoint 聚合</td>
+</tr>
+<tr>
+<td><code>memory_events.csv</code></td>
+<td><code>mem</code>；未折叠的算子输入输出事件，含 PP stage/microbatch/comp_type</td>
+</tr>
+<tr>
+<td><code>memory_timeline.csv</code></td>
+<td><code>mem</code>；alloc/free 后的 active tensor bytes 曲线</td>
+</tr>
+<tr>
+<td><code>tensor_lifetimes.csv</code></td>
+<td><code>mem</code>；每个 tensor 的 birth、last consumer、death、逻辑大小、建模驻留大小和分类</td>
+</tr>
+<tr>
+<td><code>checkpoint_tensors.csv</code></td>
+<td><code>mem</code>；AC wrapper 边界输入/输出及 selective 内部保存 tensor 元数据；存在 AC 边界时生成</td>
+</tr>
+<tr>
+<td><code>activation_offload_tensors.csv</code></td>
+<td><code>mem</code>；不属于 AC wrapper 记录、但被统一激活卸载策略覆盖的 tensor 及逐层归属</td>
+</tr>
+<tr>
+<td><code>autograd_saved_tensors.csv</code></td>
+<td><code>mem</code>；存在 save/unpack 记录时生成，供核对 autograd 保留值</td>
+</tr>
+<tr>
+<td><code>memory_actions.csv</code></td>
+<td><code>mem</code>；PP 调度 action 与展开后内存事件区间的映射；非 PP 不生成</td>
+</tr>
+<tr>
+<td><code>memory_trace.json</code></td>
+<td><code>mem</code>；可由 Chrome Trace 或 Perfetto 打开的阶段趋势图</td>
+</tr>
+</tbody>
+</table>
+<p>别名去重按 ATen view 算子的精确名称识别，不以 <code>permute</code>、<code>slice</code> 等子串判断。
+MoE token permutation 的路由输出、排序索引以及 <code>slice_backward</code> 等分配型算子
+分别计入独立 tensor；真正的 view/transpose/split 则保留与原 tensor 的别名关系。
+AC <code>none</code> 下可用 <code>autograd_saved_tensors.csv</code> 核对实际 save/unpack，再与
+<code>activation_offload_tensors.csv</code> 对照；<code>requires_grad</code> 本身不代表需要保存或卸载。</p>
+<h2 id="_4">保存激活与回捞字段</h2>
+<p>示例数值仅说明字段结构，不代表当前模型的测量结果。逻辑回捞量不直接给出有效带宽或传输耗时。</p>
+<p>selective checkpoint 保存的内部 tensor 在 <code>tensor_lifetimes.csv</code> 中标记为
+<code>checkpoint_saved_for_recompute</code>。summary 中的
+<code>checkpoint_recompute_saved_{tensor_count,logical_bytes,modeled_bytes}</code>
+分别给出数量、逻辑大小和建模驻留大小；全量明细中对应的
+<code>checkpoint_tensors.csv</code> 记录使用 <code>role=recompute_saved</code>。</p>
+<p><code>memory_summary.json</code> 的 <code>checkpoint_saved_activations</code> 按稳定的
+<code>checkpoint_id</code> marker 聚合保存激活。例如：</p>
+<pre><code class="language-json">{
+  &quot;checkpoint_saved_activations&quot;: {
+    &quot;part0:layers.0&quot;: {
+      &quot;marker_kind&quot;: &quot;module&quot;,
+      &quot;logical_bytes_per_instance&quot;: 262144,
+      &quot;modeled_bytes_per_instance&quot;: 0,
+      &quot;instance_count&quot;: 2,
+      &quot;logical_bytes_total&quot;: 524288,
+      &quot;modeled_bytes_total&quot;: 0,
+      &quot;pp_stages&quot;: [0],
+      &quot;microbatches&quot;: [0, 1],
+      &quot;size_variants&quot;: [
+        {
+          &quot;logical_bytes&quot;: 262144,
+          &quot;modeled_bytes&quot;: 0,
+          &quot;tensor_count&quot;: 1,
+          &quot;instance_count&quot;: 2
+        }
+      ]
+    }
+  }
+}
+</code></pre>
+<p><code>logical_bytes_per_instance</code> 可直接作为后续一次恢复/load 的大小。若同一个 marker
+存在动态 shape，该字段为 <code>null</code>，具体大小和出现次数记录在 <code>size_variants</code>。
+marker 当前使用 AC wrapper 模块路径且 <code>marker_kind="module"</code>；该结构不依赖“层”的
+概念，后续 selective AC 可以使用 op 级 marker 和 <code>marker_kind="op"</code> 并复用相同格式。</p>
+<p><code>checkpoint_prefetch</code> 保留 AC 专用的边界输入与 selective 保存值统计。汇总三种
+AC 模式下的统一激活逻辑回捞量时，应使用 <code>activation_prefetch</code>：</p>
+<pre><code class="language-json">{
+  &quot;activation_offload_tensor_count&quot;: 567,
+  &quot;activation_offload_logical_bytes&quot;: 32992845480,
+  &quot;activation_offload_modeled_bytes&quot;: 0,
+  &quot;activation_prefetch_logical_bytes&quot;: 32992845480,
+  &quot;activation_prefetch&quot;: {
+    &quot;part0:layers.0&quot;: {
+      &quot;marker_kind&quot;: &quot;layer&quot;,
+      &quot;logical_bytes_per_instance&quot;: 1771982464,
+      &quot;modeled_bytes_per_instance&quot;: 0,
+      &quot;tensor_count_per_instance&quot;: 29,
+      &quot;instance_count&quot;: 1,
+      &quot;logical_bytes_total&quot;: 1771982464,
+      &quot;modeled_bytes_total&quot;: 0,
+      &quot;pp_stages&quot;: [0],
+      &quot;microbatches&quot;: [0],
+      &quot;size_variants&quot;: [
+        {
+          &quot;logical_bytes&quot;: 1771982464,
+          &quot;modeled_bytes&quot;: 0,
+          &quot;tensor_count&quot;: 29,
+          &quot;instance_count&quot;: 1
+        }
+      ]
+    }
+  }
+}
+</code></pre>
+<p>none 模式按正常 backward consumer 的 <code>layers.N</code> 归档保存激活；full/selective
+复用 checkpoint marker，并合并该层其他保存激活。没有唯一层归属的 loss、logits
+等记录在 <code>part0:&lt;unattributed&gt;</code>，其总量同时写入
+<code>activation_prefetch_unattributed_{tensor_count,logical_bytes}</code>。</p>
+<p>AC 专用的 <code>checkpoint_prefetch</code> 结构如下：</p>
+<pre><code class="language-json">{
+  &quot;checkpoint_prefetch&quot;: {
+    &quot;part0:layers.0&quot;: {
+      &quot;marker_kind&quot;: &quot;module&quot;,
+      &quot;boundary_logical_bytes_per_instance&quot;: 262144,
+      &quot;recompute_saved_logical_bytes_per_instance&quot;: 1048576,
+      &quot;prefetch_logical_bytes_per_instance&quot;: 1310720,
+      &quot;boundary_modeled_bytes_per_instance&quot;: 0,
+      &quot;recompute_saved_modeled_bytes_per_instance&quot;: 0,
+      &quot;modeled_bytes_per_instance&quot;: 0,
+      &quot;boundary_tensor_count_per_instance&quot;: 1,
+      &quot;recompute_saved_tensor_count_per_instance&quot;: 3,
+      &quot;tensor_count_per_instance&quot;: 4,
+      &quot;instance_count&quot;: 2,
+      &quot;prefetch_logical_bytes_total&quot;: 2621440,
+      &quot;modeled_bytes_total&quot;: 0,
+      &quot;pp_stages&quot;: [0],
+      &quot;microbatches&quot;: [0, 1],
+      &quot;size_variants&quot;: [
+        {
+          &quot;boundary_logical_bytes&quot;: 262144,
+          &quot;boundary_modeled_bytes&quot;: 0,
+          &quot;boundary_tensor_count&quot;: 1,
+          &quot;recompute_saved_logical_bytes&quot;: 1048576,
+          &quot;recompute_saved_modeled_bytes&quot;: 0,
+          &quot;recompute_saved_tensor_count&quot;: 3,
+          &quot;prefetch_logical_bytes&quot;: 1310720,
+          &quot;modeled_bytes&quot;: 0,
+          &quot;tensor_count&quot;: 4,
+          &quot;instance_count&quot;: 2
+        }
+      ]
+    }
+  }
+}
+</code></pre>
+<p><code>prefetch_logical_bytes_per_instance</code> 是该实例回捞大小的逻辑估算：
+wrapper 边界保存输入与 selective AC 内部保存结果之和。full AC 通常只有前者；
+selective AC 两部分都可能存在。<code>prefetch_logical_bytes_total</code> 是该 marker 在整个
+训练 step 中所有实例的逻辑回捞总量；当前未建模实际传输、复用、并发和时延。开启保存激活 offload 建模后，logical bytes 保持不变，
+而 modeled bytes 为 0，表示这些 tensor 不计入设备驻留。</p>
+<p>同一 marker 存在动态 shape 时，所有 <code>*_per_instance</code> 字段为 <code>null</code>，应从
+<code>size_variants</code> 读取各尺寸及出现次数。若 selective 保存值无法可靠匹配 checkpoint
+边界，<code>checkpoint_prefetch_unattributed_{tensor_count,logical_bytes}</code> 会非零；
+此时分层结果不完整，不应直接作为总带宽结论。</p>
+<h2 id="kernel-csv">Kernel CSV 字段</h2>
+<table>
+<thead>
+<tr>
+<th>列</th>
+<th>说明</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>rank</code></td>
+<td>逻辑 rank 编号（0 ~ world_size-1）</td>
+</tr>
+<tr>
+<td><code>step_type</code></td>
+<td>步骤类型：<code>forward</code> / <code>backward</code> / <code>optimizer</code></td>
+</tr>
+<tr>
+<td><code>step_id</code></td>
+<td>步骤模板 ID</td>
+</tr>
+<tr>
+<td><code>topo_order</code></td>
+<td>在该步骤模板内的拓扑序（从 0 开始，Kahn 算法）</td>
+</tr>
+<tr>
+<td><code>op_id</code></td>
+<td>算子唯一 ID</td>
+</tr>
+<tr>
+<td><code>op_type</code></td>
+<td>规范化算子类型（如 <code>matmul</code>、<code>rms_norm</code>），未映射的显示原始算子名</td>
+</tr>
+<tr>
+<td><code>raw_op_type</code></td>
+<td>原始 dispatcher 算子名（如 <code>aten.addmm.default</code>、<code>npu.npu_rms_norm.default</code>）</td>
+</tr>
+<tr>
+<td><code>inputs_shape</code> / <code>outputs_shape</code></td>
+<td>输入/输出张量 shape，格式 <code>[d0,d1];[d0,d1]</code></td>
+</tr>
+<tr>
+<td><code>inputs_dtype</code> / <code>outputs_dtype</code></td>
+<td>输入/输出 dtype</td>
+</tr>
+<tr>
+<td><code>flops</code> / <code>peak_mem</code> / <code>param_mem</code> / <code>comm_bytes</code></td>
+<td>单算子辅助成本；<code>peak_mem</code> 不能累加为训练峰值</td>
+</tr>
+<tr>
+<td><code>repeat_count</code></td>
+<td>去重折叠的重复次数</td>
+</tr>
+<tr>
+<td><code>module_path</code></td>
+<td>算子所属模块路径（如 <code>layers.2._checkpoint_wrapped_module.moe</code>）</td>
+</tr>
+<tr>
+<td><code>phase</code></td>
+<td>捕获阶段：<code>forward</code> / <code>backward</code> / <code>optimizer</code></td>
+</tr>
+<tr>
+<td><code>execution_kind</code></td>
+<td>实际执行类型：<code>original_forward</code> / <code>recompute</code> / <code>backward</code> / <code>optimizer</code></td>
+</tr>
+<tr>
+<td><code>is_recompute</code></td>
+<td>当前算子是否由 activation checkpoint 在 backward 中实际重放</td>
+</tr>
+<tr>
+<td><code>group_name</code></td>
+<td>解析后的通信维度名（如 <code>tp</code>、<code>ep</code>、<code>fsdp</code>）；无法唯一解析时回退为框架原始组 ID</td>
+</tr>
+<tr>
+<td><code>raw_group_name</code></td>
+<td>框架生成的原始 ProcessGroup 名称（如 <code>3713</code>）</td>
+</tr>
+<tr>
+<td><code>comm_dim</code></td>
+<td><code>group_name</code> 的兼容别名</td>
+</tr>
+<tr>
+<td><code>comm_ranks</code></td>
+<td>通信域包含的 Rank 列表（仅通信算子有值，如 <code>0,1,2,3,...,15</code> 表示这 16 个 rank 属于同一通信组）</td>
+</tr>
+</tbody>
+</table>
+<p>未映射算子保留 raw 名字；<code>cost_unknown</code> 表示成本尚未覆盖，不能按零工作量消费。recompute 属于 backward phase，但有独立 <code>execution_kind</code>；缓存命中且未重放的算子不应算作 recompute。通信维度无法唯一解析时保留原组名，不能猜测。</p>
+              
+            </div>
+          </div><footer>
+    <div class="rst-footer-buttons" role="navigation" aria-label="Footer Navigation">
+        <a href="../model-matrix/" class="btn btn-neutral float-left" title="Simulator 模型与特性矩阵"><span class="icon icon-circle-arrow-left"></span> Previous</a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <!-- Copyright etc -->
+  </div>
+
+  Built with <a href="https://www.mkdocs.org/">MkDocs</a> using a <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a> provided by <a href="https://readthedocs.org">Read the Docs</a>.
+</footer>
+          
+        </div>
+      </div>
+
+    </section>
+
+  </div>
+
+  <div class="rst-versions" role="note" aria-label="Versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    
+    
+      <span><a href="../model-matrix/" style="color: #fcfcfc">&laquo; Previous</a></span>
+    
+    
+  </span>
+</div>
+    <script src="../../../js/jquery-3.6.0.min.js"></script>
+    <script>var base_url = "../../..";</script>
+    <script src="../../../js/theme_extra.js"></script>
+    <script src="../../../js/theme.js"></script>
+    <script>
+        jQuery(function () {
+            SphinxRtdTheme.Navigation.enable(true);
+        });
+    </script>
+
+</body>
+</html>

@@ -1,0 +1,469 @@
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" >
+<head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+      <link rel="shortcut icon" href="../../../img/favicon.ico" />
+    <title>Simulator 模型与特性矩阵 - torchtitan-npu</title>
+    <link rel="stylesheet" href="../../../css/theme.css" />
+    <link rel="stylesheet" href="../../../css/theme_extra.css" />
+        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/styles/github.min.css" />
+    
+      <script>
+        // Current page data
+        var mkdocs_page_name = "Simulator \u6a21\u578b\u4e0e\u7279\u6027\u77e9\u9635";
+        var mkdocs_page_input_path = "user-guides/simulator/model-matrix.md";
+        var mkdocs_page_url = null;
+      </script>
+    
+    <!--[if lt IE 9]>
+      <script src="../../../js/html5shiv.min.js"></script>
+    <![endif]-->
+      <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.8.0/highlight.min.js"></script>
+      <script>hljs.highlightAll();</script> 
+</head>
+
+<body class="wy-body-for-nav" role="document">
+
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side stickynav">
+    <div class="wy-side-scroll">
+      <div class="wy-side-nav-search">
+          <a href="../../.." class="icon icon-home"> torchtitan-npu
+        </a>
+      </div>
+
+      <div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <ul>
+                <li class="toctree-l1"><a class="reference internal" href="../../..">Home</a>
+                </li>
+              </ul>
+              <ul>
+                <li class="toctree-l1"><a class="reference internal" href="../../../lint_guide/">Lint 指南</a>
+                </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Community</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../community/contributors/">提交者与贡献者（Committers and Contributors）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../community/governance/">社区治理</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../community/versioning_policy/">版本策略</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Design</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/1f1b-schedule-plan-assembly-guide/">1F1B 完整依赖组装与 DES 回放实现指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/alltoall-capture-analysis/">all_to_all 通信捕获缺失分析</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/communication-ownership-contract/">Communication Ownership Contract</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/dualpipev-schedule-plan-consumer-guide/">DualPipeV SchedulePlan 下游接入指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/kimi_k3_fused_ops_readme/">Kimi K3 simulator fused-op README</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/l2-l3-schedule-plan-design/">L2/L3 调度 IR 重构设计：从扁平 trace 到结构化 SchedulePlan</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/low-precision-sim-analysis/">低精度训练（MXFP8）Simulator 使能分析</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/megatron-activation-memory-deepseek-v4/">Megatron Activation Estimate vs DeepSeek V4</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/optimizer-ops-analysis/">优化器算子捕获问题分析</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/pipeline-multi-graph-capture-design/">复杂 Pipeline 策略下完整计算图捕获方案设计</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/pp-l2-capture-architecture/">PP L2 Capture Architecture</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/schedule-capture-design/">L0-L3 IR 层级归属设计</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/schedule-plan-dependency-reconstruction-contract/">SchedulePlan 下游依赖重建契约</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/schedule-plan-des-consumer-guide/">SchedulePlan 依赖重建与 DES 消费指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/simulator-architecture/">Simulator 当前架构与执行路径</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/simulator-fixes-and-limits/">Simulator 历史修复与当前边界</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/simulator-memory-model-design/">Simulator Memory Model 改造设计</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/simulator-performance-template-compatibility-2026-10-12/">Simulator 性能与多 microbatch 模板兼容性修复</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../design/simulator-single-microbatch-capture-2026-10-12/">非 PP 单 microbatch 捕获</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Feature guides</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../feature_guides/checkpoint/">Checkpoint 使用指南</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../feature_guides/deepseek_v32_mtp/">多Token预测特性(Multi Token Prediction, MTP)</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../feature_guides/low_precision_training/">低精度训练特性（MXFP8）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../feature_guides/metrics_and_debugging/">调试支持特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../feature_guides/model_custom/">Model Custom框架介绍</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../feature_guides/muon_optimizer/">Muon 优化器特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../feature_guides/new_model_onboarding/">新模型接入开发流程</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../feature_guides/npu_fused_ops/">NPU 融合算子适配</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../feature_guides/swap_optimizer/">SwapOptimizer 特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../feature_guides/torch_compile/">torch.compile 支持</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../feature_guides/virtual_optimizer/">Virtual Optimizer - 优化器显存虚拟化特性</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../feature_guides/vlm/">VLM NPU 支持</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" >Parallelism</a>
+    <ul>
+                <li class="toctree-l2"><a class="reference internal" href="../../../feature_guides/parallelism/custom_cp/">自定义 Context Parallel 特性</a>
+                </li>
+    </ul>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Recipe</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../recipe/sft/">SFT 指令微调</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Superpowers</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" >Plans</a>
+    <ul>
+                <li class="toctree-l2"><a class="reference internal" href="../../../superpowers/plans/2026-07-01-mhc-real-op-name-capture-implementation/">MHC Real-Op-Name Capture Implementation Plan</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../../superpowers/plans/2026-07-01-npu-simulator-implementation/">torchtitan_npu Simulator Implementation Plan</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../../superpowers/plans/2026-07-01-smla-real-op-name-capture-implementation/">SMLA Real-Op-Name Capture Implementation Plan</a>
+                </li>
+    </ul>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" >Specs</a>
+    <ul>
+                <li class="toctree-l2"><a class="reference internal" href="../../../superpowers/specs/2026-07-01-mhc-real-op-name-capture-design/">MHC 真实算子名捕获 — 架构与方案设计（阶段一：MHC）</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../../superpowers/specs/2026-07-01-npu-simulator-design/">torchtitan_npu Simulator — 架构与方案设计</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../../superpowers/specs/2026-07-01-smla-real-op-name-capture-design/">SMLA 真实算子名捕获 — 架构与方案设计（阶段二：SMLA）</a>
+                </li>
+    </ul>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">Test guides</span></p>
+              <ul>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../test_guides/model_acceptance/">新模型最终验收规范（Meta 模拟器）</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../test_guides/test_design/">测试设计</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../../test_guides/test_guide/">测试使用指南</a>
+                  </li>
+              </ul>
+              <p class="caption"><span class="caption-text">User guides</span></p>
+              <ul class="current">
+                  <li class="toctree-l1"><a class="reference internal" href="../../deepseek_v4_model_parameters/">DeepSeek-V4 模型参数 Web 字段目录</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../installation/">软件安装</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../kimi_k3_model_parameters/">Kimi K3 模型参数 Web 字段目录</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../../quickstart/">快速上手</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../">Simulator 使用指南</a>
+                  </li>
+                  <li class="toctree-l1 current"><a class="reference internal current" >Simulator</a>
+    <ul class="current">
+                <li class="toctree-l2"><a class="reference internal" href="../configuration/">Simulator 配置与建模开关</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../documentation-map/">Simulator 文档导航与历史方案索引</a>
+                </li>
+                <li class="toctree-l2 current"><a class="reference internal current" href="#">Simulator 模型与特性矩阵</a>
+    <ul class="current">
+    <li class="toctree-l3"><a class="reference internal" href="#_1">模型特性矩阵</a>
+    </li>
+    <li class="toctree-l3"><a class="reference internal" href="#simulator_1">代码已存在但不属于正式 simulator 支持矩阵</a>
+    </li>
+    </ul>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../outputs/">Simulator 输出与内存口径</a>
+                </li>
+    </ul>
+                  </li>
+              </ul>
+      </div>
+    </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap">
+      <nav class="wy-nav-top" role="navigation" aria-label="Mobile navigation menu">
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="../../..">torchtitan-npu</a>
+        
+      </nav>
+      <div class="wy-nav-content">
+        <div class="rst-content"><div role="navigation" aria-label="breadcrumbs navigation">
+  <ul class="wy-breadcrumbs">
+    <li><a href="../../.." class="icon icon-home" aria-label="Docs"></a></li>
+          <li class="breadcrumb-item">User guides</li>
+          <li class="breadcrumb-item">Simulator</li>
+      <li class="breadcrumb-item active">Simulator 模型与特性矩阵</li>
+    <li class="wy-breadcrumbs-aside">
+    </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+            <div class="section" itemprop="articleBody">
+              
+                <h1 id="simulator">Simulator 模型与特性矩阵</h1>
+<blockquote>
+<p>现状核对：2026-10-07，<code>feat/npu-simulator</code>，实现基线 <code>ecde2f0</code>。依据源码与 Git 历史静态核对，未执行测试或仿真；后续行为以当前源码为准。</p>
+</blockquote>
+<p>返回<a href="../">使用入口</a>。以下“有实现”表示注册与代码路径存在，不能替代模型最终验收或所有配置组合的运行验证。</p>
+<p>正式 simulator registry 一共 10 个公共工厂：DeepSeek V4 7 个，Kimi K3 3 个。</p>
+<table>
+<thead>
+<tr>
+<th>模型 preset</th>
+<th>主干层 / hidden / heads</th>
+<th>routed experts / top-k</th>
+<th>精度配置</th>
+<th>默认 EP</th>
+<th>默认 MTP / AC</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>DeepSeek V4 Flash</td>
+<td>43 / 4096 / 64</td>
+<td>256 / 6</td>
+<td>BF16、MXFP8</td>
+<td>32</td>
+<td>1 / full</td>
+</tr>
+<tr>
+<td>DeepSeek V4 Pro</td>
+<td>61 / 7168 / 128</td>
+<td>384 / 6</td>
+<td>BF16、MXFP8</td>
+<td>64</td>
+<td>1 / full</td>
+</tr>
+<tr>
+<td>DeepSeek V4 Pro 20T</td>
+<td>96 / 12288 / 192</td>
+<td>2048 / 23</td>
+<td>BF16、MXFP8</td>
+<td>256</td>
+<td>1 / full</td>
+</tr>
+<tr>
+<td>DeepSeek V4 smoketest</td>
+<td>4 / 128 / 4</td>
+<td>8 / 2</td>
+<td>BF16</td>
+<td>1</td>
+<td>0 / full</td>
+</tr>
+<tr>
+<td>Kimi K3 full</td>
+<td>93 / 7168 / 96</td>
+<td>896 / 16</td>
+<td>BF16、MXFP8</td>
+<td>128</td>
+<td>无专门 MTP 路径 / full</td>
+</tr>
+<tr>
+<td>Kimi K3 smoketest</td>
+<td>4 / 256 / 8</td>
+<td>8 / 3</td>
+<td>BF16</td>
+<td>1</td>
+<td>无专门 MTP 路径 / selective</td>
+</tr>
+</tbody>
+</table>
+<p>上表层数是主干层数；DeepSeek baseline 的默认 MTP 另加一层。所有精度与 parallel degree 是 preset 默认，可经 typed overrides/CLI 调整，但需符合模型限制。</p>
+<pre><code class="language-text">deepseek_v4_flash_baseline_bf16
+deepseek_v4_flash_baseline_mxfp8
+deepseek_v4_pro_baseline_bf16
+deepseek_v4_pro_baseline_mxfp8
+deepseek_v4_pro_20t_baseline_bf16
+deepseek_v4_pro_20t_baseline_mxfp8
+deepseek_v4_smoketest
+kimi_k3_baseline_bf16
+kimi_k3_baseline_mxfp8
+kimi_k3_smoketest
+</code></pre>
+<p>证据：<a href="../../../torchtitan_npu/simulator/config_registry.py">simulator registry</a>、<a href="../../../torchtitan_npu/models/deepseek_v4/__init__.py">DeepSeek 模型默认值</a>、<a href="../../../torchtitan_npu/models/kimi_k3/__init__.py">Kimi 模型默认值</a>。</p>
+<h2 id="_1">模型特性矩阵</h2>
+<table>
+<thead>
+<tr>
+<th>特性</th>
+<th>DeepSeek V4 家族</th>
+<th>Kimi K3</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>核心架构</td>
+<td>shared-KV sparse attention、compressor、Lightning Indexer/indexer loss、mHC、hash/普通 MoE、SwiGLU</td>
+<td>KDA + Gated MLA、ShortConv、AttnRes、dense 前缀、LatentMoE、SiTU-GLU</td>
+</tr>
+<tr>
+<td>Attention 层分布</td>
+<td>由 <code>compress_ratios</code> 等参数控制</td>
+<td>full：69 KDA + 24 MLA；debug：3 KDA + 1 MLA</td>
+</tr>
+<tr>
+<td>DP/FSDP/EFSDP/HSDP</td>
+<td>有代码路径，含 replica 模块 capture 修复</td>
+<td>有代码路径，复用通用 FSDP/HSDP</td>
+</tr>
+<tr>
+<td>TP/Sequence Parallel</td>
+<td>有代码路径；sequence/head 等整除约束</td>
+<td>有代码路径；含 KDA conv/head、MLA 和 AttnRes 的专门方案</td>
+</tr>
+<tr>
+<td>EP</td>
+<td>NpuExpertParallel fake bridge</td>
+<td>通用 ExpertParallel fake bridge</td>
+</tr>
+<tr>
+<td>ETP</td>
+<td>未支持，模型代码显式抛错</td>
+<td>有 EP+ETP 实现及 mesh/维度校验；本次未运行组合验证</td>
+</tr>
+<tr>
+<td>CP</td>
+<td>需要 <code>npu_smla</code>，使用 compressor/window exchange 等路径</td>
+<td>全序列 all-gather 的保守正确方案；要求 contiguous shards，load balancer 为 None</td>
+</tr>
+<tr>
+<td>PP</td>
+<td>有实现，含复杂 schedule/virtual stages</td>
+<td>未支持，parallelize 明确拒绝</td>
+</tr>
+<tr>
+<td>indexer loss</td>
+<td>需 <code>npu_smla</code> 转换后的 <code>SimNpuLiLoss</code>；未转换的基础 <code>LiLoss</code> 显式拒绝捕获</td>
+<td>不适用</td>
+</tr>
+<tr>
+<td>MTP</td>
+<td>有实现；MTP+PP 明确拒绝，PP 必须设置 <code>training.num_mtp_modules=0</code></td>
+<td>没有与 DeepSeek 等价的专门 MTP 接入</td>
+</tr>
+<tr>
+<td>AC none/full/selective</td>
+<td>有实现和重计算归属</td>
+<td>有实现和 attention synthetic SAC</td>
+</tr>
+<tr>
+<td>AC memory_budget</td>
+<td>未支持，需要 compile，与 eager 捕获冲突</td>
+<td>同左</td>
+</tr>
+<tr>
+<td>Reentrant AC</td>
+<td>当前 execution tracker 拒绝</td>
+<td>同左</td>
+</tr>
+<tr>
+<td>MXFP8 默认范围</td>
+<td>指定 attention/indexer/output projection、MoE/shared experts、MTP e/h projection 等 FQN</td>
+<td>默认仅 <code>moe.experts</code>、<code>moe.shared_experts</code></td>
+</tr>
+<tr>
+<td><code>model_overrides</code> / <code>mxfp8_fqns</code></td>
+<td>有 typed schema、校验和 CLI</td>
+<td>有稳定 schema，重建逐层 KDA/MLA/dense/MoE 配置</td>
+</tr>
+<tr>
+<td>参数存储 dtype 假设 / saved activation offload / FSDP AG FP8</td>
+<td>公共内存/通信建模路径</td>
+<td>公共内存/通信建模路径</td>
+</tr>
+<tr>
+<td>EP dispatch FP8 假设</td>
+<td>默认 NpuExpertParallel 路径已接入</td>
+<td>当前默认 converter/ExpertParallel 路径未接入该开关</td>
+</tr>
+<tr>
+<td>fake AllToAll 输出 SAC 保存扩展</td>
+<td>NpuExpertParallel synthetic bridge 已接入，须显式 <code>all-to-all</code></td>
+<td>通用 funcol A2A shim 未接入同一 synthetic cache；不能直接标为支持</td>
+</tr>
+<tr>
+<td>embedding + 第 0 层 replica 实验</td>
+<td>专属选项；保留 EP/TP，改用组内 replica + grad AR；不支持 tied embedding</td>
+<td>没有该专属选项</td>
+</tr>
+</tbody>
+</table>
+<p>限制证据：<a href="../../../torchtitan_npu/models/deepseek_v4/parallelize.py">DeepSeek parallelize</a>、<a href="../../../torchtitan_npu/models/deepseek_v4/model.py">MTP+PP 检查</a>、<a href="../../../torchtitan_npu/models/kimi_k3/parallelize.py">Kimi PP 检查</a>。</p>
+<h2 id="simulator_1">代码已存在但不属于正式 simulator 支持矩阵</h2>
+<ul>
+<li>Kimi <code>16layer_reduced</code>：模型 registry 和真实训练 recipe 存在，16 层、32 专家；当前 simulator registry 没有对应 wrapper。可通过已接入 preset 的 overrides 配置近似规模，但不等于已有同名仿真 preset。</li>
+<li>Llama3/Llama4、Qwen3、DeepSeek V3/V3.2、VLM 等：基础 NPU 插件仓的模型/训练能力不等于 simulator 已正式接入；当前 simulator registry 未提供这些模型工厂。</li>
+<li><code>raw_model/ar_llm</code>：CSA/HCA/KDA、LatentMoE、Mixture of Recursions、Engram 等超大 AR 模型原始设计。</li>
+<li><code>raw_model/world_model</code>：视频 DiT、VAE、文本编码器、相机/深度组件及交互 world model 原始结构。</li>
+<li><code>raw_model/unified_mm</code>：GLM5-Next 风格统一多模态原始结构。</li>
+<li><code>raw_model/mm_gc</code>：SLA2 + MoE / Multi-Head MoE 原始结构。</li>
+<li><code>raw_model/block_diff</code>：Block Diffusion 原始结构。</li>
+</ul>
+<p>以上 raw_model 未发现正式 ModelSpec + SimulationTrainer registry + 并行/shim 接入闭环；部分原始文件还引用未随目录提供的 companion module，不能将“文件已加入”写成“可以完整仿真”。</p>
+<p>模型规模字段详见<a href="../../deepseek_v4_model_parameters/">DeepSeek V4 参数目录</a>和<a href="../../kimi_k3_model_parameters/">Kimi K3 参数目录</a>。</p>
+              
+            </div>
+          </div><footer>
+    <div class="rst-footer-buttons" role="navigation" aria-label="Footer Navigation">
+        <a href="../documentation-map/" class="btn btn-neutral float-left" title="Simulator 文档导航与历史方案索引"><span class="icon icon-circle-arrow-left"></span> Previous</a>
+        <a href="../outputs/" class="btn btn-neutral float-right" title="Simulator 输出与内存口径">Next <span class="icon icon-circle-arrow-right"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <!-- Copyright etc -->
+  </div>
+
+  Built with <a href="https://www.mkdocs.org/">MkDocs</a> using a <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a> provided by <a href="https://readthedocs.org">Read the Docs</a>.
+</footer>
+          
+        </div>
+      </div>
+
+    </section>
+
+  </div>
+
+  <div class="rst-versions" role="note" aria-label="Versions">
+  <span class="rst-current-version" data-toggle="rst-current-version">
+    
+    
+      <span><a href="../documentation-map/" style="color: #fcfcfc">&laquo; Previous</a></span>
+    
+    
+      <span><a href="../outputs/" style="color: #fcfcfc">Next &raquo;</a></span>
+    
+  </span>
+</div>
+    <script src="../../../js/jquery-3.6.0.min.js"></script>
+    <script>var base_url = "../../..";</script>
+    <script src="../../../js/theme_extra.js"></script>
+    <script src="../../../js/theme.js"></script>
+    <script>
+        jQuery(function () {
+            SphinxRtdTheme.Navigation.enable(true);
+        });
+    </script>
+
+</body>
+</html>

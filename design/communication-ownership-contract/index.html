@@ -102,7 +102,15 @@
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../schedule-plan-des-consumer-guide/">SchedulePlan 依赖重建与 DES 消费指南</a>
                   </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../simulator-architecture/">Simulator 当前架构与执行路径</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../simulator-fixes-and-limits/">Simulator 历史修复与当前边界</a>
+                  </li>
                   <li class="toctree-l1"><a class="reference internal" href="../simulator-memory-model-design/">Simulator Memory Model 改造设计</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../simulator-performance-template-compatibility-2026-10-12/">Simulator 性能与多 microbatch 模板兼容性修复</a>
+                  </li>
+                  <li class="toctree-l1"><a class="reference internal" href="../simulator-single-microbatch-capture-2026-10-12/">非 PP 单 microbatch 捕获</a>
                   </li>
               </ul>
               <p class="caption"><span class="caption-text">Feature guides</span></p>
@@ -187,6 +195,18 @@
                   </li>
                   <li class="toctree-l1"><a class="reference internal" href="../../user-guides/simulator/">Simulator 使用指南</a>
                   </li>
+                  <li class="toctree-l1"><a class="reference internal" >Simulator</a>
+    <ul>
+                <li class="toctree-l2"><a class="reference internal" href="../../user-guides/simulator/configuration/">Simulator 配置与建模开关</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../user-guides/simulator/documentation-map/">Simulator 文档导航与历史方案索引</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../user-guides/simulator/model-matrix/">Simulator 模型与特性矩阵</a>
+                </li>
+                <li class="toctree-l2"><a class="reference internal" href="../../user-guides/simulator/outputs/">Simulator 输出与内存口径</a>
+                </li>
+    </ul>
+                  </li>
               </ul>
       </div>
     </div>
@@ -269,6 +289,14 @@ cost and dependency graph. This includes:</p>
 <p>Each such node has:</p>
 <pre><code class="language-text">annotations.communication_owner = L1_STAGE
 </code></pre>
+<p>Simulated functional autograd collectives communicate local tensors and
+restore the input DTensor's mesh and placements around their outputs. This
+preserves distributed gradient types across branched TP/CP computation while
+communication volume remains based on local shard shapes. Global output
+shapes account for every mesh dimension sharding a resized tensor dimension.
+Resizing an unevenly sharded dimension is rejected because a single local
+capture cannot infer its new global shape; unchanged dimensions retain their
+original global metadata.</p>
 <p>When repeated microbatches have different communication shapes, capture emits
 immutable variants such as:</p>
 <pre><code class="language-text">s0_F
@@ -348,7 +376,12 @@ reduce-scatter nodes keep their own communication dependencies.</p>
 <p>Reduction dependencies come only from the captured gradient data flow:</p>
 <pre><code class="language-text">parameter gradient producers -&gt; RS(group N)
 RS(group N) -&gt; AR(group N)         # corresponding HSDP data path
+parameter gradient producers -&gt; AR(group N)  # replicate-only, no actual RS
 </code></pre>
+<p>Replicate-only parameter groups with a size-one reduce-scatter mesh skip the
+actual RS collective. Their native AR also carries the original parameter
+gradients as dependency-only inputs, since its packed buffer is produced by
+hidden framework scaffolding. When RS is present, its RS-to-AR edge is retained.</p>
 <p>There is no synthetic RS stream, AR stream, or post-backward control node in
 the exported graph. In particular, an RS/AR from one parameter group must not
 be added as a predecessor of an unrelated group's RS/AR merely because the
