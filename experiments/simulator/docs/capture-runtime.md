@@ -78,6 +78,14 @@ autograd warning 可能来自 bridge 安装前的能力探针，但不能据此�
 - 只计真实本地设备 storage。CPU planner／控制元数据不因参与 NPU 调用就变成设备显存；并行原始几何和 local shard 元数据分开。
 - 优化释放检测不能降低观测边界频率。候选队列只减少待检查对象，仍在每个原 dispatch 边界确认原生过期；用逐边界参考扫描证明等价，不以峰值碰巧一致代替。
 
+### 保存钩子引入的 detach
+
+`AutogradSavedTensorCapture` 的 pack 钩子以 detached alias 保存真实 storage，并暂停记录该次 detach。对原本需要梯度的保存值，PyTorch 在 unpack 后恢复 autograd 信息时，还会对钩子返回的对象执行一次内部 detach。该操作由观测机制引入，不作为训练算子或内存使用事件记录。
+
+捕获器只对「需要恢复梯度信息的保存值」标记 unpack 返回对象，以弱引用核对其精确身份，并在匹配的 detach 上消费标记。返回别名继续关联原值的 producer 和 storage mutation frontier；保存槽的 unpack/release 与每个 dispatch 边界的 storage 释放探测照常执行。不能按 `aten.detach` 名称全局过滤，也不能仅凭 storage 相同过滤：恢复后的值、模型显式 detach、FSDP detach，以及无需恢复梯度信息的保存值上的显式 detach 都应保留。
+
+被排除的次数记录在 `workload.iteration.schedule.annotations["capture_artifacts"]["saved_tensor_unpack_detach_count"]`，不改变内存 summary 字段。该次数不要求等于「开启／关闭保存钩子的 detach 数量差」：关闭钩子本身也会改变原生保存路径。模型与框架原本产生的 view/alias/detach 仍保留在 IR 中；这些元数据节点不能当作已启动的 Vector kernel 计数。
+
 参考：[保存身份测试](../tests/capture/test_saved_tensor_identity.py)、[所有权测试](../tests/capture/test_storage_lifetimes.py)、[逐边界对照](../tests/test_storage_lifetime_capture.py)。
 
 ## 通信、流控制与负载结构
@@ -95,10 +103,22 @@ FSDP 包装可能延迟安装或刷新函数引用。observer 必须覆盖最终
 至少验证 AG 输出实际链接到后续权重使用；延后 AG 会延后投影。HSDP 的 RS/AR 必须按实际 wait/event 约束传播，clip／更新等待其必要归约；无等待的其他流仍可重叠。
 不能按捕获序号把全部节点补成串行边，也不能因 FLOPs 为 0 删除控制或 view 节点。
 
-L0 源事件到最终图必须唯一，L1 模板引用、L2 action/DataSlot、L3 iteration 保持闭合和 DAG。当前没有图折叠、节点克隆／重编号及补偿恢复；不要通过重新补图掩盖捕获缺口。
+完整捕获中 L0 源事件必须唯一，L1 模板引用、L2 action/DataSlot、L3 iteration 保持闭合和 DAG。原始捕获没有模板折叠、节点重编号及补偿恢复；对外 FSDP 视图按下述契约投影，不通过推断补边掩盖捕获缺口。
 模板复用不等于已经支持完整多 microbatch／PP 训练。当前单 microbatch 的 GBS/GA 元数据不能被下游解释为完整累积峰值。
 
 参考：[流契约](stream-control-dependencies.md)、[FSDP 审计](fsdp-dependency-audit.md)、[精简记录](simulator-cleanup.md)、`validation.py`。
+
+### FSDP 通信视图
+
+`simulate()` 和 CLI 返回的 WorkloadGraph 默认是 FSDP 通信视图。根据 FSDP unshard/wait/reshard/post-backward、state hook 和 finalize 的实际 `framework_scopes`，隐藏其中的非通信算子，包括 buffer 分配、打包、copy-in/out、cast、view 和 detach。AG/RS/AR、其他真实通信、模型计算及零耗时流控制节点继续保留。不能按 `FSDPDeepSeekV4Model` 等根模块名称过滤，因为该 FQN 下也可能存在正常模型操作。
+
+完整源图存于 `workload.captured_workload`，其自身该字段为 None。对外图和源图共用同一个 MemoryPlan：所有原始内存事件、FSDP staging/full allocation 与释放、保存槽、dtype 和本地 storage 去重均不改变。内存 raw_events 中的原始 op_id 应在 captured_workload 中解析；不能要求每个内存事件都对应可见计算节点。保留两套图结构会增加主机元数据占用，不改变逻辑设备内存预算。
+
+投影不分配新 ID，不合并模型算子。被隐藏路径的可见前驱直接传递给原可见后继，并重建 successors、模板入口／出口及 stream/event 前沿。SchedulePlan、ScheduleGraph 和 workload 引用同一组可见模板。通信描述、slot、DataPass 和跨 iteration DataPass 的单值算子锚点同步重定向；隐藏边界有多个可见前沿时，通信描述使用对应通信节点，缺少通信锚点的 DataPass 使用 0。完整的多分支依赖由 L0 边保留，原单值锚点仍可从 captured_workload 审计，不能用单值展示锚点代替图的全部依赖。
+
+`annotations["fsdp_communication_view"]` 记录隐藏 ID、数量、原始算子计数及耗时假设；`native_dispatch_op_ids` 和 `cost_unknown_counts` 对应可见图。源图保留原统计，校验同时覆盖完整捕获与投影后的引用闭合、通信和梯度依赖。该视图明确忽略 FSDP 打包、拷贝、精度转换的运行时间；不能将通信视图的耗时估计描述为包含这部分真实开销。流等待约束继续生效，不因隐藏搬移而提前消费尚未完成 AG/RS/AR 的值。
+
+实现见 `capture/fsdp_communication_view.py`；独立路径与双模型验收见 `tests/capture/test_fsdp_communication_view.py`，AG/AR 延后传播继续由 `tests/test_fsdp_stream_capture.py` 检查。
 
 ## 内存、成本与对外结果
 

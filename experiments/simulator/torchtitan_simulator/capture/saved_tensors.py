@@ -19,6 +19,7 @@ from torchtitan_simulator.capture.dispatch_capture import get_active_capture
 class _SavedTensorHandle:
     tensor: torch.Tensor
     slot_id: int | None
+    requires_grad: bool
 
 
 def _release_saved_slot(capture_ref, slot_id):
@@ -56,7 +57,7 @@ class AutogradSavedTensorCapture:
         else:
             with capture.suspend_recording():
                 packed = tensor.detach()
-        handle = _SavedTensorHandle(packed, slot_id)
+        handle = _SavedTensorHandle(packed, slot_id, tensor.requires_grad)
         if capture is not None and slot_id is not None:
             weakref.finalize(handle, _release_saved_slot, weakref.ref(capture), slot_id)
         return handle
@@ -66,4 +67,6 @@ class AutogradSavedTensorCapture:
         capture = get_active_capture()
         if capture is not None:
             capture.record_autograd_saved_tensor_unpack(handle.slot_id)
+            if handle.requires_grad:
+                capture.expect_saved_tensor_unpack_detach(handle.tensor)
         return handle.tensor

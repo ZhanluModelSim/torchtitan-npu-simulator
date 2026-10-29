@@ -25,6 +25,23 @@ def _require(condition, message):
 
 def validate_workload(workload: WorkloadGraph) -> dict:
     """Check the recorded single-microbatch execution, without expanding ranks."""
+    if workload.captured_workload is not None:
+        validate_workload(workload.captured_workload)
+        from torchtitan_simulator.capture.fsdp_communication_view import is_fsdp_bookkeeping
+
+        original = workload.captured_workload.iteration.schedule.annotations
+        visible = {key for step in workload.step_templates.values() for key in step.nodes}
+        expected = {
+            key
+            for step in workload.captured_workload.step_templates.values()
+            for key, node in step.nodes.items()
+            if not is_fsdp_bookkeeping(node)
+        }
+        _require(visible == expected, "FSDP view hid a model or communication node")
+        _require(
+            workload.iteration.schedule.annotations["memory_plan"] is original["memory_plan"],
+            "FSDP view replaced captured memory observations",
+        )
     schedule = workload.iteration.schedule
     annotations = schedule.annotations
     plan = workload.schedule_plan
@@ -85,6 +102,17 @@ def validate_workload(workload: WorkloadGraph) -> dict:
         _require(instance.step_ref in templates, "instance references missing template")
     for data_pass in schedule.data_passes:
         _require(data_pass.src_instance in instances and data_pass.dst_instance in instances, "invalid DataPass")
+    for slot in plan.data_slots.values():
+        _require(not slot.src_exit_op or slot.src_exit_op in nodes, "slot source references a missing op")
+        _require(not slot.dst_entry_op or slot.dst_entry_op in nodes, "slot destination references a missing op")
+    for action in plan.action_map.values():
+        if action.comm is not None:
+            _require(not action.comm.src_exit_op or action.comm.src_exit_op in nodes, "comm source missing")
+            _require(not action.comm.dst_entry_op or action.comm.dst_entry_op in nodes, "comm destination missing")
+    for data_pass in (*schedule.data_passes, *workload.cross_iter_passes):
+        for slot in data_pass.slots:
+            _require(not slot.src_exit_op or slot.src_exit_op in nodes, "data pass source missing")
+            _require(not slot.dst_entry_op or slot.dst_entry_op in nodes, "data pass destination missing")
     native_ids = annotations["native_dispatch_op_ids"]
     _require(all(op_id in nodes for op_id in native_ids), "native dispatch node lost or duplicated")
     communication = annotations["communication_events"]

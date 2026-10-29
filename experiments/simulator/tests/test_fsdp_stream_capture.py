@@ -40,10 +40,28 @@ def test_native_hsdp_partial_backward_wait_delays_later_matmul(monkeypatch, conf
         SimulationConfig(config=config, world_size=4, data_parallel_replicate_degree=2, num_mtp_modules=num_mtp)
     )
     nodes = {node.op_id: node for template in workload.step_templates.values() for node in template.nodes.values()}
-    sources = {node.op_id: node.op_id for node in nodes.values()}
+    captured = workload.captured_workload or workload
+    source_nodes = {
+        node.op_id: node for template in captured.step_templates.values() for node in template.nodes.values()
+    }
+
+    def visible_frontier(frontier):
+        result, pending = set(), list(frontier)
+        seen = set()
+        while pending:
+            source = pending.pop()
+            if source in seen:
+                continue
+            seen.add(source)
+            if source in nodes:
+                result.add(source)
+            else:
+                pending.extend(source_nodes[source].predecessors)
+        return result
+
     for node in nodes.values():
         for source in node.annotations.get("stream_predecessors", []) + node.annotations.get("event_predecessors", []):
-            assert sources[source] in node.predecessors
+            assert source in node.predecessors
 
     def starts(delayed_id=None):
         result, finishes = {}, {}
@@ -56,7 +74,7 @@ def test_native_hsdp_partial_backward_wait_delays_later_matmul(monkeypatch, conf
     baseline = starts()
     checked = 0
     for frontier, stream_id in observed:
-        reductions = [sources[source] for source in frontier if nodes[sources[source]].op_type == "allreduce"]
+        reductions = [source for source in visible_frontier(frontier) if nodes[source].op_type == "allreduce"]
         if not reductions:
             continue
         reduction = reductions[-1]

@@ -447,9 +447,17 @@ def install_fsdp_residency_hooks(scope) -> None:
         return result
 
     def patched_finalize_backward(self):
+        from torchtitan_simulator.capture.dispatch_capture import get_active_capture
+
         pending = getattr(self, "_all_gather_result", None)
         transition = getattr(self, "_sim_active_transition_id", "")
-        result = original_finalize_backward(self)
+        capture = get_active_capture()
+        with (
+            capture.annotate_dispatch_events("fsdp_finalize_backward_scaffold")
+            if capture is not None
+            else nullcontext()
+        ):
+            result = original_finalize_backward(self)
         if pending is not None and getattr(self, "_all_gather_result", None) is None:
             staging_owners.pop(id(pending), None)
             record_staging_release(self, pending, transition)
@@ -556,21 +564,45 @@ def install_fsdp_residency_hooks(scope) -> None:
         return ""
 
     def patched_state_pre_forward(self, *args, **kwargs):
+        from torchtitan_simulator.capture.dispatch_capture import get_active_capture
+
+        capture = get_active_capture()
         token = _active_fsdp_state_source.set(_state_module_fqn(self))
         try:
-            return orig_state_pre_forward(self, *args, **kwargs)
+            with (
+                capture.annotate_dispatch_events("fsdp_state_pre_forward_scaffold")
+                if capture is not None
+                else nullcontext()
+            ):
+                return orig_state_pre_forward(self, *args, **kwargs)
         finally:
             _active_fsdp_state_source.reset(token)
 
     def patched_state_pre_backward(self, *args, **kwargs):
+        from torchtitan_simulator.capture.dispatch_capture import get_active_capture
+
+        capture = get_active_capture()
         token = _active_fsdp_state_source.set(_state_module_fqn(self))
         try:
-            return orig_state_pre_backward(self, *args, **kwargs)
+            with (
+                capture.annotate_dispatch_events("fsdp_state_pre_backward_scaffold")
+                if capture is not None
+                else nullcontext()
+            ):
+                return orig_state_pre_backward(self, *args, **kwargs)
         finally:
             _active_fsdp_state_source.reset(token)
 
     def patched_state_post_forward(self, *args, **kwargs):
-        result = original_state_post_forward(self, *args, **kwargs)
+        from torchtitan_simulator.capture.dispatch_capture import get_active_capture
+
+        capture = get_active_capture()
+        with (
+            capture.annotate_dispatch_events("fsdp_state_post_forward_scaffold")
+            if capture is not None
+            else nullcontext()
+        ):
+            result = original_state_post_forward(self, *args, **kwargs)
         flush_deferred_releases()
         return result
 

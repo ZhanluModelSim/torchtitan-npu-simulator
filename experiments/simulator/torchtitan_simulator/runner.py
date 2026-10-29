@@ -300,6 +300,10 @@ def simulate(simulation):
         name: getattr(prepared.trainer.training, name)
         for name in ("dtype", "mixed_precision_param", "mixed_precision_reduce")
     }
+    from torchtitan_simulator.capture.fsdp_communication_view import project_fsdp_communication_view
+
+    workload = project_fsdp_communication_view(workload)
+    workload.iteration.schedule.annotations["capture_validation"] = validate_workload(workload)
     export_result(workload, simulation)
     return workload
 

@@ -327,14 +327,15 @@ optimizer_bytes = summary["optimizer_state_bytes"]
 | 路径／字段 | 对象与消费规则 |
 | --- | --- |
 | `workload_graph` | `torchtitan_simulator.ir.workload_graph.WorkloadGraph`；完整执行和 validation 后返回；不是 Trainer、dict 或 JSON 字符串 |
-| `step_templates` | `dict[str, StepGraph]`；当前 PP=1 标准路径为 `s0_F`、`s0_B`、`s0_OPTIMIZER`；key 等于 StepGraph.step_id |
+| `step_templates` | `dict[str, StepGraph]`；默认是 FSDP 通信视图，隐藏其非通信准备／搬移节点；当前 PP=1 标准路径为 `s0_F`、`s0_B`、`s0_OPTIMIZER`；key 等于 StepGraph.step_id |
+| `captured_workload` | 完整捕获的 WorkloadGraph，供来源和原始引用审计；其自身该字段为 None；与视图共用同一个 MemoryPlan |
 | `template.nodes` | `dict[int, OpNode]`；predecessors/successors 可跨模板，先建立全局索引再解析依赖；不要逐模板丢弃外部边 |
 | `node.op_type`／`node.annotations["raw_op_type"]` | 规范化类别／原始 dispatcher 名称；未知类别的原始节点仍保留；不得只消费已知 op_type 而丢弃 unknown |
 | `node.inputs`／`outputs`／`attrs` | TensorMeta 列表和算子属性；包括原地写入 operands；不是可供真实运算的 tensor 数据 |
 | `schedule_plan` | 权威 SchedulePlan；消费 actions、data_slots、template_ref 与实际 op 引用；非 PP 当前可能没有 DataSlot，不要硬性要求非空 |
 | `iteration.schedule` | 保留 ScheduleGraph、实例、数据流与 annotations；不能只按 L0 CSV 行顺序另造调度 |
 | `annotations["memory_summary"]` | 六项单卡预算加 `activation_offload_by_layer` 列表；每层仅 `layer` 和单向 `transfer_bytes`，offload 未开启时为 0；与 memory_summary.json 完全一致 |
-| `annotations["memory_plan"]` | Python 内存中为 MemoryPlan 对象，不是 dict；含实际 storage 生命周期、保存槽及捕获／稳态峰值；mem 导出汇总与明细，不序列化整个 MemoryPlan |
+| `annotations["memory_plan"]` | Python 内存中为 MemoryPlan 对象，不是 dict；保留全部 FSDP 内存事件、storage 生命周期与保存槽；raw_events 的 op_id 使用原始捕获索引，应到 captured_workload 中解析；mem 导出不序列化整个 MemoryPlan |
 | `annotations["communication_events"]` | 通信记录列表；保留实际 group、ranks、形状／payload 和图引用；原生名称不再固定为旧 `comm.*` |
 | `annotations["capture_coordinates"]` | logical_rank/world、capture worker 和 pipeline_stage；当前单 worker 的 capture_process_rank=0，不等于被模拟 rank=0 |
 | `annotations["batch_configuration"]` | GBS、local batch、DP、GA 与 captured_microbatches；当前 captured_microbatches=1 |
@@ -343,12 +344,13 @@ optimizer_bytes = summary["optimizer_state_bytes"]
 | `annotations["gradient_validation"]` | 实际 trainable 参数梯度清单和 shape/dtype/placement |
 | `annotations["capture_validation"]` | 本次图／梯度／通信／内存完整性检查结果；构建失败不会返回一张「占位成功图」 |
 | `annotations["cost_unknown_counts"]` | 未知成本算子统计；图存在不代表已知硬件时延 |
+| `annotations["fsdp_communication_view"]` | 隐藏的 FSDP 原始 ID、数量、算子名计数及忽略打包／搬移耗时的假设 |
 
 EP TokenDispatcher 现在由 simulator 公共运行时默认使用 native functional `all_to_all_single`，DSV4 和 Kimi 共用，无新增参数。相应节点 raw name 为 `_c10d_functional.all_to_all_single.default`；通信量、group/ranks 和梯度仍按实际原生调用记录。`annotations["runtime_capabilities"]["ep_token_exchange"]` 标记默认策略，`ep_token_dispatcher_classes` 记录本次适配的类型数量。CP／FSDP 路径不由此改写，正常真机训练入口不受影响。范围、均衡假设和验证边界见 [EP single 交换](ep-single-transport.md)。
 
 算子名变化是接入重点：通信现在保留 `c10d.*`、`_c10d_functional.*`、`_dtensor.*` 的原生节点；optimizer 为 `aten._fused_adamw_.default`，不再生成旧 `npu.npu_apply_adam_w` 手工节点。不要按旧 raw name 写死识别；可参考 [communication_primitive](../torchtitan_simulator/capture/op_mapping.py) 的映射。
 
-原始 alias／mutation 事实及 metadata view 节点保留在返回图中，不再折叠；view 的 FLOPs 为零，但仍有身份、别名和依赖语义。节点 ID 仅用于当前返回图内引用，不应跨运行比较 Python object identity、storage 地址或假定 op_id 稳定。L0 edges 与 L2 action/DataSlot 依赖分别消费，不靠节点列表顺序替代数据依赖。
+模型 alias／mutation 与 metadata view 节点保留在返回图中；FSDP 内部非通信节点按实际 framework_scopes 隐藏，依赖沿已捕获的路径传递，完整事实保留在 captured_workload。view 的 FLOPs 为零，仍有身份、别名和依赖语义，不计为 Vector kernel。节点 ID 不重编号，可能存在缺号；不应跨运行比较 Python object identity、storage 地址或假定 op_id 稳定。L0 edges 与 L2 action/DataSlot 依赖分别消费，不靠节点列表顺序替代数据依赖。详见 [FSDP 通信视图](capture-runtime.md#fsdp-通信视图)。
 
 FSDP 模板变体和预取推断补边已移除，当前直接使用捕获的 `op_id`，不再产生 `source_op_id` 映射。空的 `fused_regions`／`internal_data_passes` 字段和 `communication_ownership.generated_l1_templates` 诊断字段已删除，接入方无需读取，见 [精简记录](simulator-cleanup.md)。
 

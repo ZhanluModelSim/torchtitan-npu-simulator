@@ -9,8 +9,9 @@ S5 的历史验收见 [交付说明](docs/s5-delivery.md)，
 各能力的范围与状态见 [能力矩阵](docs/capability-matrix.md)。
 当前实现已按原生 dispatch 优先收敛，具体改动和本轮复验见 [收敛记录](docs/dispatch-first-remediation.md)。
 
-CLI 和 `simulate()` 成功仿真后默认导出 `memory/memory_summary.json`，`mem` 选项额外导出内存明细；WorkloadGraph 保留原始 view/alias 节点；精度边界与本轮验证见 [mem 与精度审计](docs/mem-only-precision.md)。
-模板折叠、推断补边与对应恢复代码已清理，当前图直接使用捕获的节点和依赖，见 [精简记录](docs/simulator-cleanup.md)。
+CLI 和 `simulate()` 成功仿真后默认导出 `memory/memory_summary.json`，`mem` 选项额外导出内存明细；精度边界见 [mem 与精度审计](docs/mem-only-precision.md)。
+返回的 WorkloadGraph 默认隐藏 FSDP 非通信准备／搬移节点，保留通信、模型计算及流控制依赖；完整原图在 `captured_workload`，显存仍使用完整原始事件，见 [FSDP 通信视图](docs/capture-runtime.md#fsdp-通信视图)。
+原始捕获保留模型 view/alias，不做模板折叠、重编号或推断补边，见 [精简记录](docs/simulator-cleanup.md)。
 
 WorkloadGraph 中的零耗时 `stream_wait` 节点也必须参与依赖调度，见 [流控制依赖](docs/stream-control-dependencies.md)。
 

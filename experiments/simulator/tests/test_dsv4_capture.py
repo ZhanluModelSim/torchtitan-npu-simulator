@@ -145,9 +145,11 @@ def test_native_dsv4_mtp_capture_has_gradients_closed_graph_and_memory(kwargs):
     assert memory.peak_active_bytes >= memory.model_active_bytes_peak >= memory.persistent_param_bytes
     assert memory.forward_peak_active_bytes <= memory.peak_active_bytes
     if kwargs == {"world_size": 4, "data_parallel_replicate_degree": 2}:
+        captured = workload.captured_workload or workload
         post = [
             node
-            for node in nodes.values()
+            for template in captured.step_templates.values()
+            for node in template.nodes.values()
             if "fsdp_post_backward_scaffold" in node.annotations.get("framework_scopes", ())
         ]
         assert {"aten._to_copy.default", "aten.add_.Tensor", "fsdp.chunk_cat.default"} <= {

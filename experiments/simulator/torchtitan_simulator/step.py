@@ -338,6 +338,9 @@ def run_simulation_step(
         wg.iteration.schedule.annotations["capture"] = capture_metadata
     wg.iteration.schedule.annotations["communication_events"] = [asdict(event) for event in comm_recorder.events]
     wg.iteration.schedule.annotations["native_dispatch_op_ids"] = native_dispatch_ids
+    wg.iteration.schedule.annotations["capture_artifacts"] = {
+        "saved_tensor_unpack_detach_count": capture.saved_tensor_unpack_detach_count,
+    }
     timings["build_workload_graph"] = time.perf_counter() - t8
 
     memory_plan = None

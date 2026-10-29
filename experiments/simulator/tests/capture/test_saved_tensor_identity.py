@@ -152,3 +152,71 @@ def test_producer_lookup_observes_writes_through_detached_storage_alias():
         detached.add_(1)
         writer = capture._events[-1].op_id
         assert capture.producer_op(base) == writer
+
+
+class _ExplicitSavedDetach(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, save_intermediate):
+        saved = x * 2 if save_intermediate else x
+        ctx.save_for_backward(saved)
+        return x.square() * (2 if save_intermediate else 1)
+
+    @staticmethod
+    def backward(ctx, grad):
+        (saved,) = ctx.saved_tensors
+        # This detach belongs to the model, including when saved has no grad.
+        detached = saved.detach()
+        return grad * detached * 2, None
+
+
+@pytest.mark.parametrize("device", ["cpu", "meta"])
+@pytest.mark.parametrize("save_intermediate", [False, True], ids=["differentiable-save", "no-grad-save"])
+def test_unpack_alias_preserves_explicit_model_detach_and_gradient(device, save_intermediate):
+    capture = OpDispatchCapture()
+    x = torch.tensor([0.25, 0.5, 0.75], device=device, requires_grad=True)
+    with capture, AutogradSavedTensorCapture():
+        _ExplicitSavedDetach.apply(x, save_intermediate).sum().backward()
+
+    # SavedVariable only detaches a hook result when restoring grad metadata.
+    assert capture.saved_tensor_unpack_detach_count == (0 if save_intermediate else 1)
+    events = capture._events
+    detaches = [event for event in events if event.raw_op_type == "aten.detach.default"]
+    # At least the explicit model detach remains, with its consumer connected.
+    assert detaches
+    assert any(
+        detach.op_id in event.predecessors
+        for detach in detaches
+        for event in events
+        if event.raw_op_type == "aten.mul.Tensor"
+    )
+    if device == "cpu":
+        assert torch.equal(x.grad, x.detach() * (4 if save_intermediate else 2))
+
+
+@pytest.mark.parametrize("device", ["cpu", "meta"])
+def test_unpack_alias_keeps_saved_value_producer_without_a_detach_node(device):
+    class SavedInput(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, value):
+            ctx.save_for_backward(value)
+            return value.square()
+
+        @staticmethod
+        def backward(ctx, grad):
+            (first,) = ctx.saved_tensors
+            (second,) = ctx.saved_tensors
+            return grad * (first + second)
+
+    capture = OpDispatchCapture()
+    x = torch.tensor([0.25, 0.5], device=device, requires_grad=True)
+    with capture, AutogradSavedTensorCapture():
+        value = x.sin()
+        SavedInput.apply(value).sum().backward()
+
+    assert capture.saved_tensor_unpack_detach_count >= 2
+    producer = next(event for event in capture._events if event.raw_op_type == "aten.sin.default")
+    consumer = next(event for event in capture._events if event.raw_op_type == "aten.add.Tensor")
+    assert consumer.predecessors == [producer.op_id]
+    assert not capture._saved_tensor_unpack_aliases
+    if device == "cpu":
+        assert torch.equal(x.grad, 2 * x.detach().sin() * x.detach().cos())

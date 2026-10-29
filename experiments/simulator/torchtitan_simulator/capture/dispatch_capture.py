@@ -243,6 +243,8 @@ class OpDispatchCapture(TorchDispatchMode):
         self._storage_generations = itertools.count()
         self._saved_value_ids: dict[tuple, int] = {}
         self._value_aliases: dict[int, int] = {}
+        self._saved_tensor_unpack_aliases: dict[int, weakref.ReferenceType[torch.Tensor]] = {}
+        self.saved_tensor_unpack_detach_count = 0
         self._storage_mutation_frontier: dict[str, int] = {}
         self._stream_ids: dict[object, int] = {}
         self._stream_frontiers: dict[object, int] = {}
@@ -305,6 +307,7 @@ class OpDispatchCapture(TorchDispatchMode):
         self._storage_mutation_frontier.clear()
         self._tensor_identities.clear()
         self._value_aliases.clear()
+        self._saved_tensor_unpack_aliases.clear()
         self._pending_comm_links.clear()
 
     @contextmanager
@@ -333,10 +336,25 @@ class OpDispatchCapture(TorchDispatchMode):
         instantiate StepInstances for every microbatch."""
         return self._class_instance_counts
 
-    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+    def __torch_dispatch__(self, func, types, args: tuple[Any, ...] = (), kwargs=None):
         kwargs = kwargs or {}
         if self.record_memory and self._capture_l0:
             self._storage_lifetimes.poll()
+        if self._capture_l0 and func is torch.ops.aten.detach.default:
+            source = args[0]
+            pending = self._saved_tensor_unpack_aliases.pop(id(source), None)
+            if pending is not None and pending() is source:
+                # SavedVariable restores autograd metadata by detaching the
+                # exact object returned by our unpack hook. The restored value
+                # has a new identity, so a subsequent model detach is retained.
+                result = func(*args, **kwargs)
+                source_id, result_id = self.tensor_id(source), self.tensor_id(result)
+                while source_id in self._value_aliases:
+                    source_id = self._value_aliases[source_id]
+                if result_id != source_id:
+                    self._value_aliases[result_id] = source_id
+                self.saved_tensor_unpack_detach_count += 1
+                return result
         mutated_inputs = _schema_mutated_tensors(func, args, kwargs) if self._capture_l0 else []
         result = func(*args, **kwargs)
         from torchtitan_simulator.capture.native_transport import (
@@ -380,6 +398,12 @@ class OpDispatchCapture(TorchDispatchMode):
         record_native_transport(func, operands, result, captured_op_id=op_id, source_op_id=source_op_id)
 
         return result
+
+    def expect_saved_tensor_unpack_detach(self, tensor: torch.Tensor) -> None:
+        """Identify the hook-owned alias used to restore a differentiable save."""
+        if self._capture_l0:
+            for local in _flatten_tensors(tensor):
+                self._saved_tensor_unpack_aliases[id(local)] = weakref.ref(local)
 
     def record_synthetic_op(
         self,
@@ -933,6 +957,7 @@ class OpDispatchCapture(TorchDispatchMode):
         super().__exit__(exc_type, exc_val, exc_tb)
         self._storage_identities.clear()
         self._saved_value_ids.clear()
+        self._saved_tensor_unpack_aliases.clear()
 
     def build_nodes(self) -> dict[int, OpNode]:
         """Assemble captured events into OpNode objects with cost annotations."""
