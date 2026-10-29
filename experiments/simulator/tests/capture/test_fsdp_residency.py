@@ -98,3 +98,45 @@ def test_fsdp_group_role_matches_primitive_and_restores_after_unshard_failure(mo
             FSDPParamGroup.unshard(param_group)
 
     assert get_active_fsdp_group_dimension(group, "allgather") == ""
+
+
+@pytest.mark.parametrize("method", ["unshard", "post_backward"])
+def test_fsdp_group_lookup_failure_preserves_observer_context(method):
+    from torch.distributed.fsdp._fully_shard._fsdp_param_group import FSDPParamGroup
+    from torchtitan_simulator.capture import fsdp_residency
+    from torchtitan_simulator.compat.patches import PatchScope
+    from torchtitan_simulator import meta_env
+
+    class UnavailableGroup:
+        @property
+        def group_name(self):
+            raise RuntimeError("group unavailable")
+
+    group = SimpleNamespace(
+        mesh_info=object.__new__(FSDPMeshInfo),
+        is_unsharded=False,
+        fsdp_params=[],
+        _all_gather_process_group=UnavailableGroup(),
+        _reduce_scatter_process_group=UnavailableGroup(),
+    )
+    variables = [
+        fsdp_residency._active_fsdp_transition,
+        fsdp_residency._active_fsdp_communication_context,
+        fsdp_residency._active_fsdp_reduction_dependencies,
+        fsdp_residency._active_fsdp_reduction_groups,
+        fsdp_residency._active_fsdp_group_dimensions,
+    ]
+    previous = [variable.get() for variable in variables]
+    tokens = [variable.set(value) for variable, value in zip(variables, previous)]
+    layer = meta_env._comm_layer
+    try:
+        with PatchScope() as scope:
+            fsdp_residency.install_fsdp_residency_hooks(scope)
+            with pytest.raises(RuntimeError, match="group unavailable"):
+                getattr(FSDPParamGroup, method)(group)
+        assert [variable.get() for variable in variables] == previous
+        assert meta_env._comm_layer == layer
+    finally:
+        for variable, token in zip(variables, tokens):
+            variable.reset(token)
+        meta_env._comm_layer = layer

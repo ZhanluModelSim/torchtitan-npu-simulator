@@ -349,6 +349,7 @@ def install_fsdp_residency_hooks(scope) -> None:
         previous_transition_id = getattr(self, "_sim_active_transition_id", "")
         previous_pending_transition_id = getattr(self, "_sim_pending_transition_id", "")
         explicit_schedule_action = meta_env._pp_context.get("comp_type") == "UNSHARD"
+        group_dimensions = {("allgather", str(self._all_gather_process_group.group_name)): "fsdp"}
         previous_comm_layer = meta_env._comm_layer
         meta_env._comm_layer = "L2"
         token = _active_fsdp_transition.set((transition_id, group_id))
@@ -356,9 +357,7 @@ def install_fsdp_residency_hooks(scope) -> None:
         communication_token = _active_fsdp_communication_context.set(
             (_module_fqn(self), prefetch_source_fqn, prefetch_type)
         )
-        group_token = _active_fsdp_group_dimensions.set(
-            {("allgather", str(self._all_gather_process_group.group_name)): "fsdp"}
-        )
+        group_token = _active_fsdp_group_dimensions.set(group_dimensions)
         capture = get_active_capture()
         scaffold_scope = (
             capture.annotate_dispatch_events("fsdp_unshard_scaffold") if capture is not None else nullcontext()
@@ -550,9 +549,7 @@ def install_fsdp_residency_hooks(scope) -> None:
         capture = get_active_capture()
         group_id = str(id(self))
         module_fqn = _module_fqn(self)
-        transition_token = _active_fsdp_transition.set(("", group_id))
-        communication_token = _active_fsdp_communication_context.set((module_fqn, "", ""))
-        dependency_token = _active_fsdp_reduction_dependencies.set(_post_backward_dependency_tensors(self))
+        dependencies = _post_backward_dependency_tensors(self)
         groups = []
         group_dimensions = {}
         if _uses_fsdp_sharding(self):
@@ -561,7 +558,11 @@ def install_fsdp_residency_hooks(scope) -> None:
         if hasattr(self.mesh_info, "replicate_process_group"):
             groups.append(self._all_reduce_process_group)
             group_dimensions[("allreduce", str(groups[-1].group_name))] = "dp_replicate"
-        group_token = _active_fsdp_reduction_groups.set(frozenset(str(group.group_name) for group in groups))
+        group_names = frozenset(str(group.group_name) for group in groups)
+        transition_token = _active_fsdp_transition.set(("", group_id))
+        communication_token = _active_fsdp_communication_context.set((module_fqn, "", ""))
+        dependency_token = _active_fsdp_reduction_dependencies.set(dependencies)
+        group_token = _active_fsdp_reduction_groups.set(group_names)
         dimension_token = _active_fsdp_group_dimensions.set(group_dimensions)
         scaffold_scope = (
             capture.annotate_dispatch_events("fsdp_post_backward_scaffold") if capture is not None else nullcontext()

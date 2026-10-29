@@ -86,3 +86,13 @@ def test_step_graph_multiple_external_predecessors_on_same_node():
     graph = StepGraph(step_id="s7", step_type="optimizer", nodes=nodes)
     assert graph.is_acyclic is True
     assert graph.entry_nodes == ["opt1"]
+
+
+def test_step_graph_exit_preserves_cross_template_successors():
+    nodes = {
+        "f1": _node("f1", [], ["f2", "b1"]),
+        "f2": _node("f2", ["f1"], ["b1"]),
+    }
+    graph = StepGraph(step_id="forward", step_type="forward", nodes=nodes)
+    assert graph.exit_nodes == ["f2"]
+    assert nodes["f2"].successors == ["b1"]

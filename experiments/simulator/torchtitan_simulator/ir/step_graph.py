@@ -23,10 +23,10 @@ def _compute_entry_exit(nodes: dict[int, OpNode]) -> tuple[list[int], list[int]]
     optimizer-phase op referencing a backward-phase gradient. Per
     spec/L1-StepGraph.md: "entry_node 的 input 无内部 producer：依赖链追溯
     到外部" -- external predecessors do not disqualify a node from being an
-    entry point. Exit nodes have no successors (successors are only ever
-    populated for in-graph nodes, so no such adjustment is needed there)."""
+    entry point. Exit nodes have no successors within this graph; cross-template
+    edges remain on the nodes for workload-level dependency tracking."""
     entry = [op_id for op_id, node in nodes.items() if not any(p in nodes for p in node.predecessors)]
-    exit_ = [op_id for op_id, node in nodes.items() if not node.successors]
+    exit_ = [op_id for op_id, node in nodes.items() if not any(s in nodes for s in node.successors)]
     return entry, exit_
 
 
