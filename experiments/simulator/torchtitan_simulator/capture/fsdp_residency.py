@@ -39,6 +39,10 @@ _active_fsdp_reduction_groups: contextvars.ContextVar[frozenset[str]] = contextv
     "simulator_fsdp_reduction_groups",
     default=frozenset(),
 )
+_active_fsdp_group_dimensions: contextvars.ContextVar[dict[tuple[str, str], str] | None] = contextvars.ContextVar(
+    "simulator_fsdp_group_dimensions",
+    default=None,
+)
 
 
 def get_active_fsdp_transition() -> tuple[str, str]:
@@ -47,6 +51,16 @@ def get_active_fsdp_transition() -> tuple[str, str]:
 
 def get_active_fsdp_communication_context() -> tuple[str, str, str]:
     return _active_fsdp_communication_context.get()
+
+
+def get_active_fsdp_group_dimension(group, comm_primitive: str) -> str:
+    """Resolve only the actual collective group used by the active FSDP call."""
+    from torchtitan_simulator.capture.comm_events import _canonical_collective_group
+
+    group = _canonical_collective_group(group)
+    group_name = str(getattr(group, "group_name", group))
+    dimensions = _active_fsdp_group_dimensions.get()
+    return dimensions.get((comm_primitive, group_name), "") if dimensions is not None else ""
 
 
 def is_active_fsdp_reduction_group(group) -> bool:
@@ -342,6 +356,9 @@ def install_fsdp_residency_hooks(scope) -> None:
         communication_token = _active_fsdp_communication_context.set(
             (_module_fqn(self), prefetch_source_fqn, prefetch_type)
         )
+        group_token = _active_fsdp_group_dimensions.set(
+            {("allgather", str(self._all_gather_process_group.group_name)): "fsdp"}
+        )
         capture = get_active_capture()
         scaffold_scope = (
             capture.annotate_dispatch_events("fsdp_unshard_scaffold") if capture is not None else nullcontext()
@@ -351,6 +368,7 @@ def install_fsdp_residency_hooks(scope) -> None:
             with scaffold_scope:
                 result = original_unshard(self, async_op)
         finally:
+            _active_fsdp_group_dimensions.reset(group_token)
             _active_fsdp_communication_context.reset(communication_token)
             _active_fsdp_transition.reset(token)
             meta_env._comm_layer = previous_comm_layer
@@ -536,11 +554,15 @@ def install_fsdp_residency_hooks(scope) -> None:
         communication_token = _active_fsdp_communication_context.set((module_fqn, "", ""))
         dependency_token = _active_fsdp_reduction_dependencies.set(_post_backward_dependency_tensors(self))
         groups = []
+        group_dimensions = {}
         if _uses_fsdp_sharding(self):
             groups.append(self._reduce_scatter_process_group)
+            group_dimensions[("reduce_scatter", str(groups[-1].group_name))] = "fsdp"
         if hasattr(self.mesh_info, "replicate_process_group"):
             groups.append(self._all_reduce_process_group)
+            group_dimensions[("allreduce", str(groups[-1].group_name))] = "dp_replicate"
         group_token = _active_fsdp_reduction_groups.set(frozenset(str(group.group_name) for group in groups))
+        dimension_token = _active_fsdp_group_dimensions.set(group_dimensions)
         scaffold_scope = (
             capture.annotate_dispatch_events("fsdp_post_backward_scaffold") if capture is not None else nullcontext()
         )
@@ -552,6 +574,7 @@ def install_fsdp_residency_hooks(scope) -> None:
                     **kwargs,
                 )
         finally:
+            _active_fsdp_group_dimensions.reset(dimension_token)
             _active_fsdp_reduction_groups.reset(group_token)
             _active_fsdp_reduction_dependencies.reset(dependency_token)
             _active_fsdp_communication_context.reset(communication_token)

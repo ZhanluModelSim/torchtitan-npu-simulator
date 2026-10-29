@@ -118,3 +118,22 @@ def test_enrichment_preserves_raw_name_and_updates_l0_mapping():
     assert event.raw_group_name == "pg_fsdp_0"
     assert event.comm_dim == "fsdp"
     assert names_by_op_id == {17: ("fsdp", "pg_fsdp_0")}
+
+
+def test_call_site_fsdp_role_wins_over_shared_loss_group_alias():
+    rank_table = RankTable(
+        world_size=8,
+        dim_degrees={"loss_mesh": 8},
+        process_groups={"loss_mesh": [list(range(8))]},
+        dim_by_group_name={"10001": "loss_mesh"},
+    )
+    fsdp_event = _event("10001", [list(range(8))], op_id=17)
+    fsdp_event.group_name = fsdp_event.comm_dim = "fsdp"
+    loss_event = _event("10001", [list(range(8))], op_id=18)
+    loss_event.comm_primitive = "allreduce"
+
+    names = resolve_comm_event_groups([fsdp_event, loss_event], rank_table)
+
+    assert names == {17: ("fsdp", "10001"), 18: ("loss_mesh", "10001")}
+    assert (fsdp_event.comm_dim, loss_event.comm_dim) == ("fsdp", "loss_mesh")
+    assert resolve_comm_event_groups([fsdp_event, loss_event], rank_table) == names

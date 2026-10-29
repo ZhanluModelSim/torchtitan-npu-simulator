@@ -451,6 +451,7 @@ def _record_comm_with_l0(
     try:
         from torchtitan_simulator.capture.fsdp_residency import (
             get_active_fsdp_communication_context,
+            get_active_fsdp_group_dimension,
             get_active_fsdp_reduction_dependencies,
             get_active_fsdp_transition,
             is_active_fsdp_reduction_group,
@@ -464,6 +465,10 @@ def _record_comm_with_l0(
             event.fsdp_prefetch_source_fqn,
             event.fsdp_prefetch_type,
         ) = get_active_fsdp_communication_context()
+        # FSDP can flatten dp_shard/cp into a group absent from ParallelDims,
+        # or reuse a loss/CP group. Bind the role to this call and primitive.
+        if dimension := get_active_fsdp_group_dimension(group, comm_primitive):
+            event.group_name = event.comm_dim = comm_dim = dimension
         # Replicate-only groups skip RS and all-reduce a packed gradient
         # buffer whose framework copy operations are hidden from L0.
         if comm_primitive in {"reduce_scatter", "allreduce"} and event.fsdp_group_id:

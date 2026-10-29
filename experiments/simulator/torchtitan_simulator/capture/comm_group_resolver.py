@@ -112,11 +112,16 @@ def resolve_comm_event_groups(
 
     for event in comm_events:
         raw_group_name = event.raw_group_name or event.group_name
-        group_name = resolver.resolve(
-            raw_group_name,
-            event.comm_ranks,
-            event.comm_primitive,
-        )
+        # A call-site role from the actual FSDP process group takes priority
+        # over mesh aliases: the same group may also serve loss or CP calls.
+        if event.group_name != raw_group_name and event.group_name in _MODEL_COMMUNICATION_DIMENSIONS:
+            group_name = _semantic_dimension(event.group_name)
+        else:
+            group_name = resolver.resolve(
+                raw_group_name,
+                event.comm_ranks,
+                event.comm_primitive,
+            )
         event.raw_group_name = raw_group_name
         event.group_name = group_name
         event.comm_dim = group_name

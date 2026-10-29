@@ -5,6 +5,7 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 from torch.distributed.fsdp._fully_shard._fsdp_common import FSDPMeshInfo
 from torchtitan_simulator.capture.fsdp_residency import (
@@ -65,3 +66,35 @@ def test_root_cleanup_observes_staging_created_and_cleared_inside_post_forward(m
     assert markers[0].seq_idx < markers[1].seq_idx
     assert markers[1].transition_id == "oracle"
     assert getattr_static(FSDPCommContext, "__setattr__") is previous_setattr
+
+
+def test_fsdp_group_role_matches_primitive_and_restores_after_unshard_failure(monkeypatch):
+    from torch.distributed.fsdp._fully_shard._fsdp_param_group import FSDPParamGroup
+    from torchtitan_simulator.capture.fsdp_residency import (
+        get_active_fsdp_group_dimension,
+        install_fsdp_residency_hooks,
+    )
+    from torchtitan_simulator.compat.patches import PatchScope
+
+    # Only group naming and the observer scope are exercised; no collective runs.
+    group = SimpleNamespace(group_name="10001")
+    unrelated_group = SimpleNamespace(group_name="10002")
+    param_group = SimpleNamespace(
+        mesh_info=object.__new__(FSDPMeshInfo),
+        _all_gather_process_group=group,
+        is_unsharded=False,
+    )
+
+    def fail_unshard(self, async_op=False):
+        assert get_active_fsdp_group_dimension(group, "allgather") == "fsdp"
+        assert get_active_fsdp_group_dimension(group, "allreduce") == ""
+        assert get_active_fsdp_group_dimension(unrelated_group, "allgather") == ""
+        raise RuntimeError("unshard failed")
+
+    monkeypatch.setattr(FSDPParamGroup, "unshard", fail_unshard)
+    with PatchScope() as scope:
+        install_fsdp_residency_hooks(scope)
+        with pytest.raises(RuntimeError, match="unshard failed"):
+            FSDPParamGroup.unshard(param_group)
+
+    assert get_active_fsdp_group_dimension(group, "allgather") == ""
