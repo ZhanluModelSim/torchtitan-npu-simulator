@@ -23,3 +23,7 @@
 `requirements.txt` 声明 torchtitan 版本，`.ci/setup_torchtitan.sh` 从该版本推导对应 tag。更新版本时同步核对 patch 目标、接口和测试。
 
 完整 lint、测试分层和数值验证要求见[完整开发指南](.agents/AGENTS.md)及[测试规则](tests/AGENTS.md)。`gitcode-pr` 与 `gitcode-pipeline` 是已安装相应 skill 时的可选工作流；仓库本身不提供这些 skill。
+
+## 工作区公共开发建议
+
+参与 SimWorkspace 跨仓开发时参考[Python 开发与验收规范](https://github.com/ZhanluModelSim/sim-workspace/blob/main/.agents/standards/python-development.md)，统一明确类型、窄接口、必要注释、边界校验、分层测试与独立审查习惯。本仓仍以本地开发指南和目录规则为准，保留现有 120 列 Ruff 与 pre-commit 工具链，不套用新仓的 100 列配置或强制迁移工程布局。公共规范不构成安装或运行依赖。
