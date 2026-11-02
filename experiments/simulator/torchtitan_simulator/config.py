@@ -43,6 +43,7 @@ class SimulationConfig:
     selective_ac_save_ops: list[SelectiveACSaveOp] | None = None
     memory_parameter_storage_dtype: str = ""
     memory_offload_ac_saved_tensors: bool = False
+    memory_offload_optimizer_states: bool = False
     local_batch_size: int | None = None
     global_batch_size: int | None = None
     enable_quantized_training: bool = False
@@ -50,6 +51,8 @@ class SimulationConfig:
     model_overrides: ModelOverrides | None = None
 
     def validate(self):
+        if type(self.memory_offload_optimizer_states) is not bool:
+            raise ValueError("memory_offload_optimizer_states must be boolean")
         preset, separator, precision = self.config.rpartition("_baseline_")
         if (
             separator

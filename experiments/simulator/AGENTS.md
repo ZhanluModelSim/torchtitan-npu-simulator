@@ -67,16 +67,17 @@ CLI 是参数白名单，不是任意原生训练参数的透传。新增参数�
 - 保存钩子引入的 unpack 恢复用 detach 按精确对象身份排除，并保留别名依赖；不按算子名全局过滤 detach。模型／框架原有元数据节点仍保留，不能当作真实 Vector kernel 计数，详见[运行时契约](docs/capture-runtime.md#保存钩子引入的-detach)。
 - 保存槽不等于激活或卸载候选。区分 F action 内交错反向和后续 B/recompute，核查同一 storage 的全部保存及使用。AC 先确认层／checkpoint 绑定再清零，覆盖无保存槽、无绑定的非层重算引用。
 - `unattributed` 的目标是没有未解释项。已知 head/norm/loss/梯度桥接不伪装成 decoder 层；默认逐层 offload 仅选归属明确的层或显式 checkpoint 保存值。层外和未确认归属的值继续参与设备生命周期及峰值，禁止删除记录或只过滤报表得到零未知项。
-- 使用实际本地 storage 去重和独立字节先验。optimizer state 来自实际状态清单；稳态峰值已含状态，不能重复相加。逐层 payload 表示单向传输量，不取卸载后为零的驻留字节。
+- 使用实际本地 storage 去重和独立字节先验。optimizer state 来自实际状态清单；未卸载时稳态峰值已含状态，不能重复相加；优化器卸载时四项峰值排除状态，状态总量仍保留。逐层 payload 表示单向传输量，不取卸载后为零的驻留字节。
 - Meta 图、梯度元数据与逻辑 storage 预算不能证明真实 NPU 数值、HCCL 耗时或 allocator 峰值。未知 cost 不等于零耗时；allocator reserved/cache、碎片和未建模 workspace 不在预算内。
 
 ## 输出契约
 
 成功的 CLI 和 `simulate()` 默认写入 `<output_dir>/memory/memory_summary.json`，`output_formats=["mem"]`／`--simulation.output-formats mem` 额外导出内存明细。普通调用无需再次调用 `export_result()`；该函数供重新导出使用。每次验证使用独立输出目录，旧目录中的结果和明细不会自动清理。
 
-summary 保持六项预算（四个含状态的稳态峰值、权重大小、优化器状态大小）及逐层 offload payload 列表。字段与口径见[稳态内存说明](docs/steady-state-memory.md)。修改时同步 `memory/records.py`、`memory/export.py`、实际消费者、验收脚本及接入文档；不恢复 JSON/HTML/DOT 图导出。
+summary 保持六项预算（四个遵循优化器驻留开关的稳态峰值、权重大小、优化器状态大小）及逐层 offload payload 列表。字段与口径见[稳态内存说明](docs/steady-state-memory.md)。修改时同步 `memory/records.py`、`memory/export.py`、实际消费者、验收脚本及接入文档；不恢复 JSON/HTML/DOT 图导出。
 
-激活 offload 执行图见[真实捕获核对与实现说明](docs/activation-offload-design.md)。启用现有开关后，训练侧在通信视图插入传输及等待、修正静态显存，平台负责传输耗时和 DES，MBU 分子不变。按 comp_type 区分 F/B，B 无预取窗口时入口显式加载，阶段间不延续异步传输。原生 FSDP wait 不当作逐层屏障；完整 DAG 前沿保留通信路径。晚 producer 整层复制保守降级为 F 末 drain，并在 notes／日志声明可能超过两层驻留。原始事件／lifetime 不改，新增预算放 activation_buffer_lifetimes；schema 写入事实禁止使用过期主机副本。不包含优化器卸载。
+激活 offload 执行图见[真实捕获核对与实现说明](docs/activation-offload-design.md)。启用现有开关后，训练侧在通信视图插入传输及等待、修正静态显存，平台负责传输耗时和 DES，MBU 分子不变。按 comp_type 区分 F/B，B 无预取窗口时入口显式加载，阶段间不延续异步传输。原生 FSDP wait 不当作逐层屏障；完整 DAG 前沿保留通信路径。晚 producer 整层复制保守降级为 F 末 drain，并在 notes／日志声明可能超过两层驻留。原始事件／lifetime 不改，新增预算放 activation_buffer_lifetimes；schema 写入事实禁止使用过期主机副本。激活计划不处理优化器卸载。
+- 优化器卸载由独立 `memory_offload_optimizer_states` 开关控制：真实本地状态总量作为每方向 payload，生成共同入口／出口及 H2D、D2H，与原生更新节点并行；不修改 AdamW 耗时，不包含 clip/pre/post 窗口，不乘 GA。F/B/O 排除状态及瞬态搬运 buffer，原始 inventory/lifetime 保留；激活 buffer 继续计入。更新之间夹有非更新准备节点的图明确拒绝；详见 [优化器卸载](docs/optimizer-offload.md)。最终 `memory_configuration` 明确返回两种实际开关，包括 false。
 
 ## 开发与验证入口
 

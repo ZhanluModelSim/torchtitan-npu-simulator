@@ -47,7 +47,7 @@ TORCH_DEVICE_BACKEND_AUTOLOAD=0 python -m torchtitan_simulator \
 - 保留目标默认 spmd_types 后端。compile/CUDA graphs 为 dispatch capture 显式关闭。
 - EP TokenDispatcher 在 simulator 公共运行时默认使用原生 functional `all_to_all_single`，全部接入模型共用；CP／FSDP 不由此改写，无新增参数，见 [EP single 交换](docs/ep-single-transport.md)。
 - PP、FP8 通信开关与未验收 A5 目标明确拒绝。MXFP8 使用原生 `all_mxfp8` recipe，详见 [S4 审计](docs/s4-mxfp8-audit.md)。
-- mem 汇总保留四个含优化器状态的稳态峰值、单卡权重和优化器状态大小，另加逐层 offload payload 列表；每层一个单向字节数，未开 offload 时为 0；见 [稳态内存说明](docs/steady-state-memory.md)。
+- mem 汇总保留四个遵循优化器驻留开关的稳态峰值、单卡权重和优化器状态大小，另加逐层 offload payload 列表；每层一个单向字节数，未开 offload 时为 0；见 [稳态内存说明](docs/steady-state-memory.md)。
 - 内存输出是逻辑活跃 Tensor/storage 字节，不含 allocator reserved/cache、碎片及未建模 kernel workspace。
 - storage 释放使用弱引用候选队列，在每个 dispatch 边界由原生引用确认；完整 Flash 抓图约 20.7 秒，验证范围见 [生命周期优化](docs/storage-lifetime-optimization.md)。
 - 未知 cost 单独标记，不能将图存在解释为硬件耗时已知。
@@ -126,3 +126,5 @@ TORCH_DEVICE_BACKEND_AUTOLOAD=0 python scripts/acceptance.py \
 ```
 
 省略 `--presets` 时验证四种 DSV4 结构；每种结构默认运行三种 AC。脚本的 `--enable-quantized-training` 同时传给全部子进程，验收实际包装参数、反向梯度、图依赖和内存结果；它不从模型名推断量化。
+
+优化器状态卸载使用独立的 `--simulation.memory-offload-optimizer-states` 开关，见[优化器卸载模型与限制](docs/optimizer-offload.md)。

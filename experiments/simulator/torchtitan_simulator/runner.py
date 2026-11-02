@@ -214,6 +214,7 @@ def simulate(simulation):
                 memory_parameter_storage_dtype=simulation.memory_parameter_storage_dtype,
                 memory_device_type="meta",
                 memory_offload_ac_saved_tensors=simulation.memory_offload_ac_saved_tensors,
+                print_memory_summary=False,
                 scoped_backward_phases=True,
                 rank=simulation.logical_rank,
                 capture_process_rank=0,
@@ -306,6 +307,15 @@ def simulate(simulation):
     from torchtitan_simulator.capture.activation_transfers import insert_activation_transfers
 
     workload = insert_activation_transfers(workload)
+    if simulation.memory_offload_optimizer_states:
+        from torchtitan_simulator.capture.optimizer_transfers import insert_optimizer_transfers
+
+        workload = insert_optimizer_transfers(workload)
+    memory = workload.iteration.schedule.annotations["memory_plan"]
+    workload.iteration.schedule.annotations["memory_configuration"] = {
+        "offload_activations": memory.offload_ac_saved_tensors,
+        "offload_optimizer_states": memory.offload_optimizer_states,
+    }
     workload.iteration.schedule.annotations["capture_validation"] = validate_workload(workload)
     export_result(workload, simulation)
     return workload
@@ -313,7 +323,7 @@ def simulate(simulation):
 
 def export_result(workload, simulation):
     """Always write the memory summary; mem additionally writes diagnostic details."""
-    from torchtitan_simulator.memory.export import export_memory_details, export_memory_summary
+    from torchtitan_simulator.memory.export import export_memory_details, export_memory_summary, print_memory_budget
 
     unknown = set(simulation.output_formats) - {"mem"}
     if unknown:
@@ -321,6 +331,7 @@ def export_result(workload, simulation):
     memory = workload.iteration.schedule.annotations.get("memory_plan")
     if memory is None:
         raise ValueError("Cannot export mem without a captured memory plan")
+    print_memory_budget(memory)
     export_memory_summary(memory, simulation.output_dir)
     if "mem" in simulation.output_formats:
         export_memory_details(memory, simulation.output_dir)

@@ -37,40 +37,44 @@ def validate_workload(workload: WorkloadGraph) -> dict:
             for key, node in step.nodes.items()
             if not is_fsdp_bookkeeping(node)
         }
-        modeled = workload.iteration.schedule.annotations.get("activation_transfer_plan", {}).get("modeled_op_ids", [])
+        plans = {
+            family: workload.iteration.schedule.annotations.get(f"{family}_transfer_plan", {})
+            for family in ("activation", "optimizer")
+        }
+        modeled = [key for plan in plans.values() for key in plan.get("modeled_op_ids", [])]
         _require(
             len(modeled) == len(set(modeled)) and not expected.intersection(modeled),
-            "modeled activation IDs overlap captured nodes",
+            "modeled transfer IDs overlap captured nodes",
         )
         _require(visible == expected | set(modeled), "FSDP view hid a model or communication node")
-        modeled_nodes = {
-            key: node for step in workload.step_templates.values() for key, node in step.nodes.items() if key in modeled
-        }
-        for node in modeled_nodes.values():
-            _require(
-                node.annotations.get("modeling_source") == "activation_offload_neighbor_v1",
-                "unrecognized modeled activation node",
-            )
-            raw_name = node.annotations.get("raw_op_type")
-            _require(
-                raw_name in {"simulator.activation_h2d", "simulator.activation_d2h", "simulator.stream_wait"},
-                "invalid modeled activation operation",
-            )
-            if raw_name != "simulator.stream_wait":
-                transfer = node.attrs.get("activation_transfer", {})
-                direction = transfer.get("direction")
-                _require(
-                    direction in {"h2d", "d2h"} and raw_name == f"simulator.activation_{direction}",
-                    "activation transfer direction mismatch",
+        by_id = {key: node for step in workload.step_templates.values() for key, node in step.nodes.items()}
+        for family, transfer_plan in plans.items():
+            for key in transfer_plan.get("modeled_op_ids", []):
+                node = by_id[key]
+                expected_source = (
+                    "activation_offload_neighbor_v1" if family == "activation" else "optimizer_offload_full_duplex_v1"
                 )
                 _require(
-                    type(transfer.get("bytes")) is int and transfer["bytes"] > 0,
-                    "activation transfer byte count must be positive",
+                    node.annotations.get("modeling_source") == expected_source, "unrecognized modeled transfer node"
                 )
+                raw_name = node.annotations.get("raw_op_type")
                 _require(
-                    node.annotations.get("comp_type") == ("F" if direction == "d2h" else "B"),
-                    "activation transfer belongs to the wrong phase",
+                    raw_name in {f"simulator.{family}_h2d", f"simulator.{family}_d2h", "simulator.stream_wait"},
+                    "invalid modeled transfer operation",
                 )
+                if raw_name != "simulator.stream_wait":
+                    transfer = node.attrs.get(f"{family}_transfer", {})
+                    direction = transfer.get("direction")
+                    _require(
+                        direction in {"h2d", "d2h"} and raw_name == f"simulator.{family}_{direction}",
+                        "transfer direction mismatch",
+                    )
+                    _require(
+                        type(transfer.get("bytes")) is int and transfer["bytes"] > 0,
+                        "transfer byte count must be positive",
+                    )
+                    expected_comp = "OPTIMIZER" if family == "optimizer" else ("F" if direction == "d2h" else "B")
+                    _require(node.annotations.get("comp_type") == expected_comp, "transfer belongs to the wrong phase")
         _require(
             workload.iteration.schedule.annotations["memory_plan"].raw_events is original["memory_plan"].raw_events
             and workload.iteration.schedule.annotations["memory_plan"].tensor_lifetimes
@@ -239,7 +243,7 @@ def validate_workload(workload: WorkloadGraph) -> dict:
         ),
         "local persistent parameter byte mismatch",
     )
-    budget_lifetimes = [*memory.tensor_lifetimes, *memory.activation_buffer_lifetimes]
+    budget_lifetimes = memory.device_budget_lifetimes()
     allocations = {
         f"fsdp_full_param:{event.group_id}:{event.seq_idx}": event.allocation_storage_bytes
         for event in memory.fsdp_residency_events
@@ -269,7 +273,7 @@ def validate_workload(workload: WorkloadGraph) -> dict:
     ]
     _require(len(keys) == len(set(keys)), "duplicate peak storage")
     if memory.optimizer_state_bytes is not None:
-        states = [item for item in budget_lifetimes if item.kind == "optimizer_state"]
+        states = [item for item in memory.tensor_lifetimes if item.kind == "optimizer_state"]
         _require(len({item.storage_key for item in states}) == len(states), "duplicate optimizer state storage")
         _require(memory.optimizer_state_storage_count == len(states), "optimizer state count differs")
         _require(

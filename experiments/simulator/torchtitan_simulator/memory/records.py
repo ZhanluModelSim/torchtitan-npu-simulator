@@ -7,7 +7,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any, TypedDict
 
 from torchtitan_simulator.memory.layer_scope import activation_layer_scope
@@ -215,6 +215,7 @@ class MemoryPlan:
     counted_device_type: str = ""
     parameter_storage_dtype: str = ""
     offload_ac_saved_tensors: bool = False
+    offload_optimizer_states: bool = False
     persistent_param_bytes: int = 0
     persistent_buffer_bytes: int = 0
     peak_active_bytes: int = 0
@@ -245,6 +246,18 @@ class MemoryPlan:
     steady_state_forward_peak_active_bytes: int | None = None
     steady_state_backward_peak_active_bytes: int | None = None
     steady_state_optimizer_peak_active_bytes: int | None = None
+
+    def device_budget_lifetimes(self) -> list[TensorLifetime]:
+        """Project device residency without modifying captured storage observations."""
+        lifetimes = [*self.tensor_lifetimes, *self.activation_buffer_lifetimes]
+        if not self.offload_optimizer_states:
+            return lifetimes
+        return [
+            replace(item, modeled_num_bytes=0, residency_policy="optimizer_offloaded")
+            if item.kind == "optimizer_state"
+            else item
+            for item in lifetimes
+        ]
 
     def to_summary_dict(self) -> MemorySummary:
         """Return six per-rank budgets and one per-layer offload payload list."""
@@ -602,6 +615,7 @@ class MemoryPlan:
             **({"capture": self.capture_metadata} if self.capture_metadata else {}),
             "parameter_storage_dtype": self.parameter_storage_dtype or "captured",
             "offload_ac_saved_tensors": self.offload_ac_saved_tensors,
+            "offload_optimizer_states": self.offload_optimizer_states,
             "persistent_param_bytes": self.persistent_param_bytes,
             "persistent_buffer_bytes": self.persistent_buffer_bytes,
             "active_bytes_peak": self.peak_active_bytes,

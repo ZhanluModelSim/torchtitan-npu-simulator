@@ -68,6 +68,7 @@ def run_simulation_step(
     memory_parameter_storage_dtype: str = "",
     memory_device_type: str = "",
     memory_offload_ac_saved_tensors: bool = False,
+    print_memory_summary: bool = True,
     pp_schedule: Any | None = None,
     microbatches: list[tuple[dict[str, torch.Tensor], torch.Tensor]] | None = None,
     global_valid_tokens: float | torch.Tensor | None = None,
@@ -377,16 +378,8 @@ def run_simulation_step(
     timings["total"] = time.perf_counter() - t0
 
     wg.iteration.schedule.annotations["capture_timings"] = timings
-    if memory_plan is not None:
-        print("单卡内存（GiB；峰值包含常驻优化器状态）")
-        summary = memory_plan.to_summary_dict()
-        for label, value in (
-            ("稳态总峰值", summary["steady_state_active_bytes_peak"]),
-            ("前向峰值", summary["steady_state_forward_active_bytes_peak"]),
-            ("反向峰值", summary["steady_state_backward_active_bytes_peak"]),
-            ("优化器阶段峰值", summary["steady_state_optimizer_active_bytes_peak"]),
-            ("权重大小", summary["persistent_param_bytes"]),
-            ("优化器状态大小", summary["optimizer_state_bytes"]),
-        ):
-            print(f"  {label}: {value / 2**30:.3f}" if value is not None else f"  {label}: 不可用")
+    if memory_plan is not None and print_memory_summary:
+        from torchtitan_simulator.memory.export import print_memory_budget
+
+        print_memory_budget(memory_plan)
     return wg

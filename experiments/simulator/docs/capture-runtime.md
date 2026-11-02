@@ -112,7 +112,7 @@ FSDP 包装可能延迟安装或刷新函数引用。observer 必须覆盖最终
 
 `simulate()` 和 CLI 返回的 WorkloadGraph 默认是 FSDP 通信视图。根据 FSDP unshard/wait/reshard/post-backward、state hook 和 finalize 的实际 `framework_scopes`，隐藏其中的非通信算子，包括 buffer 分配、打包、copy-in/out、cast、view 和 detach。AG/RS/AR、其他真实通信、模型计算及零耗时流控制节点继续保留。不能按 `FSDPDeepSeekV4Model` 等根模块名称过滤，因为该 FQN 下也可能存在正常模型操作。
 
-完整源图存于 `workload.captured_workload`，其自身该字段为 None。对外图和源图共用同一个 MemoryPlan：所有原始内存事件、FSDP staging/full allocation 与释放、保存槽、dtype 和本地 storage 去重均不改变。内存 raw_events 中的原始 op_id 应在 captured_workload 中解析；不能要求每个内存事件都对应可见计算节点。保留两套图结构会增加主机元数据占用，不改变逻辑设备内存预算。
+完整源图存于 `workload.captured_workload`，其自身该字段为 None。FSDP 通信投影与源图共用原始 MemoryPlan；激活／优化器卸载随后创建派生预算，继续保留原始事件和 lifetime 对象：所有原始内存事件、FSDP staging/full allocation 与释放、保存槽、dtype 和本地 storage 去重均不改变。内存 raw_events 中的原始 op_id 应在 captured_workload 中解析；不能要求每个内存事件都对应可见计算节点。保留两套图结构会增加主机元数据占用，不改变逻辑设备内存预算。
 
 投影不分配新 ID，不合并模型算子。被隐藏路径的可见前驱直接传递给原可见后继，并重建 successors、模板入口／出口及 stream/event 前沿。SchedulePlan、ScheduleGraph 和 workload 引用同一组可见模板。通信描述、slot、DataPass 和跨 iteration DataPass 的单值算子锚点同步重定向；隐藏边界有多个可见前沿时，通信描述使用对应通信节点，缺少通信锚点的 DataPass 使用 0。完整的多分支依赖由 L0 边保留，原单值锚点仍可从 captured_workload 审计，不能用单值展示锚点代替图的全部依赖。
 

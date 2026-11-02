@@ -83,7 +83,7 @@ def apply_activation_transfer_budget(memory: MemoryPlan, plans: list[ActivationT
     events = memory.raw_events
     phase_at = {event.seq_idx: event.phase for event in events}
     phase_at.update({plan.backward_start_seq: "backward" for plan in plans})
-    all_lifetimes = [*memory.tensor_lifetimes, *additions]
+    all_lifetimes = replace(memory, activation_buffer_lifetimes=additions).device_budget_lifetimes()
     timeline = _build_timeline(all_lifetimes, phase_at)
     peaks = _phase_peak_active_bytes(timeline, events)
     peak = max(timeline, key=lambda item: item.active_bytes_after, default=None)

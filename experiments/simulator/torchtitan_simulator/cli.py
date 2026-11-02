@@ -46,6 +46,9 @@ def main(argv=None):
         "--simulation.memory-offload-ac-saved-tensors", dest="memory_offload_ac_saved_tensors", action="store_true"
     )
     parser.add_argument(
+        "--simulation.memory-offload-optimizer-states", dest="memory_offload_optimizer_states", action="store_true"
+    )
+    parser.add_argument(
         "--activation-checkpoint.mode",
         dest="activation_checkpoint_mode",
         choices=["none", "full", "selective"],

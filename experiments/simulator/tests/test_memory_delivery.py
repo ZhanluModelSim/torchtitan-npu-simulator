@@ -339,3 +339,56 @@ def test_activation_transfer_mtp_capture_preserves_raw_facts_and_restores_at_b_e
     assert len(buffers) == len(memory.activation_buffer_lifetimes)
     assert all(int(row["birth_seq"]) <= int(row["death_seq"]) for row in buffers)
     assert validate_workload(workload) == annotations["capture_validation"]
+
+
+@pytest.mark.parametrize(
+    "activation_offload,optimizer_offload",
+    [(False, False), (True, False), (False, True), (True, True)],
+    ids=["resident", "activation-only", "optimizer-only", "both"],
+)
+def test_cli_offload_switches_are_independent_and_preserve_optimizer_inventory(
+    tmp_path, activation_offload, optimizer_offload, capsys
+):
+    from torchtitan_simulator.capture.activation_transfers import insert_activation_transfers
+    from torchtitan_simulator.capture.fsdp_communication_view import project_fsdp_communication_view
+
+    args = ["--activation-checkpoint.mode", "selective", "--simulation.output-dir", str(tmp_path)]
+    if activation_offload:
+        args.append("--simulation.memory-offload-ac-saved-tensors")
+    if optimizer_offload:
+        args.append("--simulation.memory-offload-optimizer-states")
+    workload = main(args)
+    raw = workload.captured_workload
+    assert raw is not None
+    memory = workload.iteration.schedule.annotations["memory_plan"]
+    baseline = insert_activation_transfers(project_fsdp_communication_view(raw))
+    baseline_memory = baseline.iteration.schedule.annotations["memory_plan"]
+    nodes = [node for step in workload.step_templates.values() for node in step.nodes.values()]
+    transfers = [node for node in nodes if "optimizer_transfer" in node.attrs]
+    activations = [node for node in nodes if "activation_transfer" in node.attrs]
+    state_bytes = memory.optimizer_state_bytes
+
+    assert state_bytes == baseline_memory.optimizer_state_bytes and state_bytes > 0
+    assert len(transfers) == (2 if optimizer_offload else 0)
+    assert bool(activations) is activation_offload
+    assert memory.tensor_lifetimes is baseline_memory.tensor_lifetimes
+    assert memory.raw_events is baseline_memory.raw_events
+    assert memory.offload_optimizer_states is optimizer_offload
+    assert workload.iteration.schedule.annotations["memory_configuration"] == {
+        "offload_activations": activation_offload,
+        "offload_optimizer_states": optimizer_offload,
+    }
+    for field in (
+        "steady_state_forward_peak_active_bytes",
+        "steady_state_backward_peak_active_bytes",
+        "steady_state_optimizer_peak_active_bytes",
+        "steady_state_peak_active_bytes",
+    ):
+        assert getattr(memory, field) == getattr(baseline_memory, field) - (state_bytes if optimizer_offload else 0)
+    assert all(node.attrs["optimizer_transfer"]["bytes"] == state_bytes for node in transfers)
+    output = capsys.readouterr().out
+    assert output.count("单卡内存") == 1
+    assert ("峰值不包含已卸载优化器状态" in output) is optimizer_offload
+    summary = json.loads((tmp_path / "memory/memory_summary.json").read_text())
+    assert summary == memory.to_summary_dict()
+    assert validate_workload(workload) == workload.iteration.schedule.annotations["capture_validation"]

@@ -150,6 +150,7 @@ assert isinstance(workload_graph, WorkloadGraph)
 | `--extension.quantization.enable-quantized-training` | `enable_quantized_training` | bool；false | `store_true`；唯一量化启用开关，默认关闭；使用原生 TorchAO-NPU recipe |
 | `--extension.quantization.recipe` | `quantization_recipe` | str；`all_mxfp8` | 唯一支持值 `all_mxfp8`；只设 recipe 不会开启量化 |
 | `--simulation.memory-parameter-storage-dtype` | `memory_parameter_storage_dtype` | str；空字符串 | 空值保留捕获 dtype；全部可选值见第 8 节；仅内存投影 |
+| `--simulation.memory-offload-optimizer-states` | `memory_offload_optimizer_states` | bool；false | 独立生成 O 阶段双向状态传输与等待节点，保留更新成本、修正静态峰值，见[优化器卸载](optimizer-offload.md) |
 | `--simulation.memory-offload-ac-saved-tensors` | `memory_offload_ac_saved_tensors` | bool；false | `store_true`；生成激活传输/等待执行图并修正静态驻留，适用于 none/full/selective；不执行真实设备 copy，见 [offload 说明](activation-offload-design.md) |
 | `--simulation.enable-fsdp-allgather-fp8` | `enable_fsdp_allgather_fp8` | bool；false | parser 保留，设置 true 会明确拒绝；不是已支持的优化 |
 | `--simulation.enable-ep-dispatch-fp8` | `enable_ep_dispatch_fp8` | bool；false | parser 保留，设置 true 会明确拒绝 |
@@ -335,6 +336,7 @@ optimizer_bytes = summary["optimizer_state_bytes"]
 | `schedule_plan` | 权威 SchedulePlan；消费 actions、data_slots、template_ref 与实际 op 引用；非 PP 当前可能没有 DataSlot，不要硬性要求非空 |
 | `iteration.schedule` | 保留 ScheduleGraph、实例、数据流与 annotations；不能只按 L0 CSV 行顺序另造调度 |
 | `annotations["memory_summary"]` | 六项单卡预算加 `activation_offload_by_layer` 列表；每层仅 `layer` 和单向 `transfer_bytes`，offload 未开启时为 0；与 memory_summary.json 完全一致 |
+| `annotations["memory_configuration"]` | 最终 MemoryPlan 的实际 `offload_activations` / `offload_optimizer_states` 布尔值，false 也返回，不从调用方请求反推 |
 | `annotations["memory_plan"]` | Python 内存中为 MemoryPlan 对象，不是 dict；保留全部 FSDP 内存事件、storage 生命周期与保存槽；raw_events 的 op_id 使用原始捕获索引，应到 captured_workload 中解析；mem 导出不序列化整个 MemoryPlan |
 | `annotations["communication_events"]` | 通信记录列表；保留实际 group、ranks、形状／payload 和图引用；原生名称不再固定为旧 `comm.*` |
 | `annotations["capture_coordinates"]` | logical_rank/world、capture worker 和 pipeline_stage；当前单 worker 的 capture_process_rank=0，不等于被模拟 rank=0 |

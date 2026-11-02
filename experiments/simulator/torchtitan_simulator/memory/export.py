@@ -389,7 +389,7 @@ def export_memory_details(plan: MemoryPlan, out_dir: str) -> None:
         ]
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
-        for lifetime in (*plan.tensor_lifetimes, *plan.activation_buffer_lifetimes):
+        for lifetime in plan.device_budget_lifetimes():
             row: dict[str, Any] = asdict(lifetime)
             row["consumer_ops"] = ";".join(str(item) for item in lifetime.consumer_ops)
             row["consumer_seqs"] = ";".join(str(item) for item in lifetime.consumer_seqs)
@@ -464,3 +464,19 @@ def export_memory_plan(plan: MemoryPlan, out_dir: str) -> None:
     """Export both the compact summary and all detailed memory artifacts."""
     export_memory_summary(plan, out_dir)
     export_memory_details(plan, out_dir)
+
+
+def print_memory_budget(plan: MemoryPlan) -> None:
+    """Display the final policy-adjusted budget, not the pre-projection capture."""
+    state_policy = "峰值不包含已卸载优化器状态" if plan.offload_optimizer_states else "峰值包含常驻优化器状态"
+    print(f"单卡内存（GiB；{state_policy}）")
+    summary = plan.to_summary_dict()
+    for label, value in (
+        ("稳态总峰值", summary["steady_state_active_bytes_peak"]),
+        ("前向峰值", summary["steady_state_forward_active_bytes_peak"]),
+        ("反向峰值", summary["steady_state_backward_active_bytes_peak"]),
+        ("优化器阶段峰值", summary["steady_state_optimizer_active_bytes_peak"]),
+        ("权重大小", summary["persistent_param_bytes"]),
+        ("优化器状态大小", summary["optimizer_state_bytes"]),
+    ):
+        print(f"  {label}: {value / 2**30:.3f}" if value is not None else f"  {label}: 不可用")

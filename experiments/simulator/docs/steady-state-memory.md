@@ -1,7 +1,7 @@
 # 单卡内存结果
 
-mem 汇总保留六项核心预算：四个包含常驻优化器状态的稳态峰值，以及单卡权重、优化器状态各自的大小。
-另有一个逐层卸载／加载数据量列表，每层只给一个字节数。没有新增 CLI 参数。
+mem 汇总保留六项核心预算：四个遵循优化器驻留策略的稳态峰值，以及单卡权重、优化器状态各自的大小。
+另有一个逐层卸载／加载数据量列表，每层只给一个字节数。优化器卸载使用独立开关，见[优化器卸载](optimizer-offload.md)。
 
 ```bash
 python -m torchtitan_simulator \
@@ -18,13 +18,13 @@ CLI 和 `simulate()` 成功仿真后均自动写入 `<output_dir>/memory/memory_
 | 字段 | 含义 |
 | --- | --- |
 | `steady_state_active_bytes_peak` | 稳态总峰值，完整 F/B/O 中为下面三个阶段峰值的最大值 |
-| `steady_state_forward_active_bytes_peak` | 前向峰值，包含优化器状态 |
-| `steady_state_backward_active_bytes_peak` | 反向峰值，包含优化器状态 |
-| `steady_state_optimizer_active_bytes_peak` | 优化器阶段峰值，包含优化器状态 |
+| `steady_state_forward_active_bytes_peak` | 前向峰值，未卸载时包含优化器状态 |
+| `steady_state_backward_active_bytes_peak` | 反向峰值，未卸载时包含优化器状态 |
+| `steady_state_optimizer_active_bytes_peak` | 优化器阶段峰值，未卸载时包含优化器状态 |
 | `persistent_param_bytes` | 单卡常驻权重 shard 的大小，不含梯度、优化器状态或激活 |
 | `optimizer_state_bytes` | 单卡优化器实际状态的大小，不含权重、梯度或临时张量 |
 
-全部数值对应所选 `simulation.logical_rank`，不是全局求和或各 rank 的最大值。权重和优化器状态已计入四个峰值，不能再次相加。
+全部数值对应所选 `simulation.logical_rank`，不是全局求和或各 rank 的最大值。权重已计入四个峰值；优化器状态仅在未卸载时计入，不能再次相加。卸载后 `optimizer_state_bytes` 仍报告真实本地状态总量，不能据此推断设备驻留。
 `memory_parameter_storage_dtype` 仅投影权重字节，不改变优化器状态的 dtype 或大小。
 
 终端只显示六行结果，单位为 GiB：
@@ -86,7 +86,7 @@ optimizer_bytes = summary["optimizer_state_bytes"]
 
 ## 计算口径
 
-状态取自原生 optimizer/container 的公开 `state`，按实际设备和本地 storage 去重；多个 view 共用 storage 时只计一次。将这些实际状态投影为从步首常驻后，重新扫描生命周期计算四个峰值，不按权重倍数猜测状态，也不在 optimizer 阶段重复加算。
+状态取自原生 optimizer/container 的公开 `state`，按实际设备和本地 storage 去重；多个 view 共用 storage 时只计一次。未开启优化器卸载时，将这些实际状态投影为从步首常驻后，重新扫描生命周期计算四个峰值，不按权重倍数猜测状态，也不在 optimizer 阶段重复加算。
 
 这是状态驻留的稳态估算，其他捕获生命周期不变，不额外执行第二步；仍只捕获一个 microbatch，不是完整 GA／PP 回放。数值是逻辑活跃 storage 字节，不含 allocator cache/reserved、碎片或未建模 workspace。
 
