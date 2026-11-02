@@ -78,10 +78,12 @@ def test_native_mem_summary_includes_optimizer_state_and_steady_phase_peaks(expo
     plan = workload.iteration.schedule.annotations["memory_plan"]
     assert summary["persistent_param_bytes"] == sum(item["storage_bytes"] for item in layouts.values())
     assert plan.optimizer_state_storage_count == 3 * len(layouts)
+    assert workload.iteration.schedule.annotations["capture"]["mode"] == "post_warmup"
+    states = [item for item in plan.tensor_lifetimes if item.kind == "optimizer_state"]
+    assert all(item.birth_seq == -1 for item in states)
+    assert sum(item.num_bytes for item in states) == expected_state_bytes
     for phase in ("forward", "backward"):
-        assert summary[f"steady_state_{phase}_active_bytes_peak"] == (
-            getattr(plan, f"{phase}_peak_active_bytes") + expected_state_bytes
-        )
+        assert summary[f"steady_state_{phase}_active_bytes_peak"] == getattr(plan, f"{phase}_peak_active_bytes")
     assert summary["steady_state_active_bytes_peak"] == max(
         summary[f"steady_state_{phase}_active_bytes_peak"] for phase in ("forward", "backward", "optimizer")
     )

@@ -668,7 +668,7 @@ def estimate_static_memory(
         plan.steady_state_optimizer_peak_active_bytes = steady_peaks["optimizer"]
         notes.append(
             "Steady-state peaks project actual optimizer-owned device storages as resident from capture start; "
-            "other captured lifetimes are unchanged. This is not a second executed iteration or GA replay."
+            "other captured lifetimes are unchanged. This projection does not replay an iteration or GA."
         )
     else:
         notes.append("Steady-state peaks unavailable: optimizer callable exposes no public state owner.")

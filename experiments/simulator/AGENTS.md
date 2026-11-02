@@ -24,7 +24,7 @@
 
 1. `config.prepare_config()` 校验 `SimulationConfig`、解析 preset 或 `module.factory`，构造原生配置树，选择 override、AC 和量化。
 2. `runner.simulate()` 进入 `runtime.meta_runtime()` 与 `compat.distributed.logical_world()`，构建 Meta 模型并执行原生 parallelize，创建 loss、optimizer、scheduler 和合成输入。
-3. `step.run_simulation_step()` 捕获 forward/backward、clip、optimizer、scheduler 和 zero-grad 路径，将 dispatch 事件组装成 step、schedule 和 workload，并计算内存计划。
+3. `runner` 先执行无观测的实际 GA 次 F/B、clip 和 optimizer 结构预热，不推进 scheduler，清梯度后安装观测器；`step.run_simulation_step()` 捕获 forward/backward、clip、optimizer、scheduler 和 zero-grad 路径，将 dispatch 事件组装成 step、schedule 和 workload，并计算内存计划。
 4. `runner` 检查参数梯度与 buffer 契约，附加配置、rank、量化与假设注记，经 `validation.validate_workload()` 后导出并返回结果。
 
 CLI 是参数白名单，不是任意原生训练参数的透传。新增参数须同步检查 `SimulationConfig`、`cli.py`、`prepare_config()`、实际 consumer、测试及接入文档；几何参数还需检查 `model_overrides.py`。不接受配置后静默忽略。
@@ -50,7 +50,7 @@ CLI 是参数白名单，不是任意原生训练参数的透传。新增参数�
 ## 当前运行边界
 
 - `prepare_config()` 当前接受 DeepSeek-V4 和 Kimi K3。preset 映射以该函数为准；默认 `deepseek_v4_smoketest` 使用原生 debugmodel。`deepseek_v4_pro_20t` 在 `presets.py` 保留旧几何，不是新增的上游官方 preset。
-- 单进程承载选定的 `logical_rank`，一次捕获一个 microbatch 和一次优化器更新。GBS/GA 配置不表示已执行完整梯度累积。输入是合成单文档 next-token 序列，EP 使用均衡路由假设。
+- 单进程承载选定的 `logical_rank`，默认先按实际 GA 结构预热，再捕获一个 microbatch 和一次优化器更新。正式图和内存预算不表示完整梯度累积回放，详见 [稳态捕获](docs/steady-state-capture.md)。输入是合成单文档 next-token 序列，EP 使用均衡路由假设。
 - 当前 PP 必须为 1，FP8 通信和 A5 目标明确拒绝；compile/CUDA graphs 为 dispatch 捕获关闭。逻辑 world、capture worker 和 PP stage 必须区分。
 - 当前 DSV4/Kimi 完整捕获要求 FP32 原始参数，可用 BF16 `mixed_precision_param` 计算；build-only 接受的 dtype 不代表完整捕获可用。`memory_parameter_storage_dtype` 是存储预算投影，不改变真实计算精度。
 - 量化默认关闭，以 `enable_quantized_training` 显式启用原生 `all_mxfp8` recipe，需要配套 `torchao_npu`。preset 只选择结构，不从名称推断精度，不恢复旧精度后缀 preset 或 FQN 名单覆盖。
@@ -120,3 +120,7 @@ docker exec -w /workspace/torchtitan-npu-simulator/experiments/simulator \
 - `scripts/acceptance.py` 是独立完整几何验收入口，默认覆盖四个 DSV4 结构和三种 AC；量化由 `--enable-quantized-training` 单独开启。按改动选择 `--presets`／`--modes`，Kimi 覆盖看其专门测试和[接入记录](docs/kimi-k3-migration.md)，不能将此脚本当作全部模型验收。
 - 仓库完整 Lint 仍按根开发指南执行：先核对 `/tmp/torchtitan`，再从仓库根运行 `python -m pre_commit run --all-files --show-diff-on-failure`。本包测试／类型检查通过不等于完整 Lint 通过。
 - 记录实际源码、依赖、命令、配置、逻辑 rank、输出和未验证范围。纯文档修改至少静态检查相对链接、参数和入口；运行条件具备时执行相关轻量验证，不仅为文档校对触发完整几何验收或真实 NPU 训练。
+
+Kimi chunked loss 的 FSDP reshard 策略恢复由 Meta 会话内兼容层负责，原策略在正常和异常退出均恢复；见[策略说明](docs/chunked-loss-policy.md)。
+
+预热性能口径见docs/steady-state-capture.md：测量负载生成CPU墙钟，区分warmup、完整simulate和含导入的进程时间；不能把小模型占比推广到完整模型，也不能将warmup直接耗时当作相对冷捕获的净增量。

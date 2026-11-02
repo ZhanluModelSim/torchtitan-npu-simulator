@@ -123,7 +123,7 @@ FSDP 包装可能延迟安装或刷新函数引用。observer 必须覆盖最终
 ## 内存、成本与对外结果
 
 从真实 optimizer state 按设备与 local storage 去重，再投影稳态驻留；不按权重倍数猜测，不在 optimizer 阶段重复加状态。
-首次训练步可能在 optimizer 阶段才懒初始化状态；稳态预算将实际观察到的状态视为从步首常驻，并非额外执行第二步。CPU step scalar 不计设备字节；无可读取 owner 时报告不可用，不将未知状态当作 0。
+`simulate()` 在正式捕获前执行[结构预热](steady-state-capture.md)，初始登记实际 optimizer state；低层单次捕获仍允许首次 O 惰性初始化。稳态预算统一将实际观察到的状态视为从捕获步首常驻，不重复相加。CPU step scalar 不计设备字节；无可读取 owner 时报告不可用，不将未知状态当作 0。
 四个阶段／总峰值包括状态，权重与状态独立大小是说明项，不能再加到峰值上。当前是逻辑活跃 storage，不是 allocator reserved/cache 或真实 workspace。
 offload 的保存集合、层外驻留、`unattributed` 和逐层单向 payload 必须遵守 [模型内存规则](model-integration.md#保存值不等于卸载候选)。
 

@@ -42,7 +42,7 @@ TORCH_DEVICE_BACKEND_AUTOLOAD=0 python -m torchtitan_simulator \
 ## 当前合同
 
 - BF16/MXFP8，AC none/full/selective，PP=1；使用原生 DSV4、配置 override、parallelize、loss、MTP、clip、fused AdamW 和 LR scheduler。
-- 单次捕获一个 microbatch 和一次优化器更新。输入为合成单文档 next-token 序列；EP 显式采用均衡路由假设。
+- 默认先执行实际 GA 的无观测结构预热，再捕获一个 microbatch 和一次优化器更新；scheduler 只在正式捕获推进。详见[稳态捕获](docs/steady-state-capture.md)。输入为合成单文档 next-token 序列；EP 显式采用均衡路由假设。
 - 默认启用目标原生 sparse attention、LI、mHC、RoPE、RMSNorm 和 NPU token dispatcher overrides。
 - 保留目标默认 spmd_types 后端。compile/CUDA graphs 为 dispatch capture 显式关闭。
 - EP TokenDispatcher 在 simulator 公共运行时默认使用原生 functional `all_to_all_single`，全部接入模型共用；CP／FSDP 不由此改写，无新增参数，见 [EP single 交换](docs/ep-single-transport.md)。
@@ -128,3 +128,5 @@ TORCH_DEVICE_BACKEND_AUTOLOAD=0 python scripts/acceptance.py \
 省略 `--presets` 时验证四种 DSV4 结构；每种结构默认运行三种 AC。脚本的 `--enable-quantized-training` 同时传给全部子进程，验收实际包装参数、反向梯度、图依赖和内存结果；它不从模型名推断量化。
 
 优化器状态卸载使用独立的 `--simulation.memory-offload-optimizer-states` 开关，见[优化器卸载模型与限制](docs/optimizer-offload.md)。
+
+Kimi chunked loss 的 FSDP reshard 策略恢复由 Meta 会话内兼容层负责，原策略在正常和异常退出均恢复；见[策略说明](docs/chunked-loss-policy.md)。

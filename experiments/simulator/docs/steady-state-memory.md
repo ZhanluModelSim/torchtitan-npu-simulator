@@ -88,7 +88,7 @@ optimizer_bytes = summary["optimizer_state_bytes"]
 
 状态取自原生 optimizer/container 的公开 `state`，按实际设备和本地 storage 去重；多个 view 共用 storage 时只计一次。未开启优化器卸载时，将这些实际状态投影为从步首常驻后，重新扫描生命周期计算四个峰值，不按权重倍数猜测状态，也不在 optimizer 阶段重复加算。
 
-这是状态驻留的稳态估算，其他捕获生命周期不变，不额外执行第二步；仍只捕获一个 microbatch，不是完整 GA／PP 回放。数值是逻辑活跃 storage 字节，不含 allocator cache/reserved、碎片或未建模 workspace。
+这是状态驻留的稳态估算，其他捕获生命周期不变；`simulate()` 默认在[结构预热](steady-state-capture.md)后捕获，低层捕获也可投影首 O 的状态。正式记录仍只有一个 microbatch，不是完整 GA／PP 回放。数值是逻辑活跃 storage 字节，不含 allocator cache/reserved、碎片或未建模 workspace。
 
 自定义 callback 没有可读取的公开 optimizer owner 时，相关值为 `null`，终端显示「不可用」；不会把未知状态假设成零。已知无状态的优化器报告状态字节为 0。
 

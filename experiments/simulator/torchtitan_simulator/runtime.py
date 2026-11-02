@@ -15,6 +15,7 @@ import torch
 from torchtitan_simulator import meta_env
 from torchtitan_simulator.compat.amp import install_meta_autocast
 from torchtitan_simulator.compat.cann_metadata import install_metadata_dispatch
+from torchtitan_simulator.compat.loss import install_chunked_loss_policy_restore
 from torchtitan_simulator.compat.optimizer import install_meta_optimizer
 from torchtitan_simulator.compat.patches import PatchScope
 from torchtitan_simulator.compat.rotary import install_rotary_bridge
@@ -79,6 +80,7 @@ def meta_runtime():
         capabilities = install_rotary_bridge(scope)
         install_meta_autocast(scope)
         install_meta_optimizer(scope)
+        install_chunked_loss_policy_restore(scope)
         previous_multithreading = torch.autograd.is_multithreading_enabled()
         # SPMD contexts carry TLS and must remain on the executing thread.
         torch.autograd.set_multithreading_enabled(False)

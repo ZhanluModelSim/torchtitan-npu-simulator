@@ -7,9 +7,11 @@
 
 import logging
 from collections import Counter
+from contextlib import nullcontext
 
 import torch
 
+from torchtitan_simulator.capture.comm_events import default_collective_context
 from torchtitan_simulator.capture.fsdp_residency import install_fsdp_residency_hooks
 from torchtitan_simulator.capture.op_mapping import communication_primitive
 from torchtitan_simulator.compat.checkpoint import logical_named_parameters
@@ -20,6 +22,7 @@ from torchtitan_simulator.meta_env import compute_block
 from torchtitan_simulator.metadata import to_meta_metadata
 from torchtitan_simulator.runtime import meta_runtime
 from torchtitan_simulator.step import run_simulation_step
+from torchtitan_simulator.warmup import warmup_training_iteration
 
 
 def _gradient_manifest(model):
@@ -130,9 +133,6 @@ def simulate(simulation):
                     "mesh_shape": tuple(mesh.shape) if mesh is not None else (),
                     "placements": str(getattr(parameter, "placements", ())),
                 }
-            # torch_npu may install its FSDP layer on first fully_shard. Observe
-            # the final layer; restoring this scope also removes the observer.
-            install_fsdp_residency_hooks(runtime.patches)
             runtime.capabilities.update(install_balanced_dispatch(runtime.patches, model))
             loss_fn = config.loss.build(compile_config=config.compile)
             loss_fn.set_lm_head(model.lm_head)
@@ -190,6 +190,34 @@ def simulate(simulation):
                 gradient_manifest.update(_gradient_manifest(model))
                 return loss
 
+            def clip_gradients():
+                return clip_grad_norm_(
+                    model.parameters(),
+                    config.training.max_norm,
+                    foreach=False,
+                    pp_mesh=None,
+                    ep_enabled=dims.ep_enabled,
+                )
+
+            global_valid_tokens = float(valid_tokens * batch_degree * gradient_accumulation)
+            tp_mesh = dims.get_optional_mesh("tp")
+
+            def warmup_microbatch():
+                with default_collective_context("tp", tp_mesh.get_group()) if tp_mesh is not None else nullcontext():
+                    forward_backward(input_dict=inputs, labels=labels, global_valid_tokens=global_valid_tokens)
+
+            logging.getLogger(__name__).info("Warming training state with %d microbatches", gradient_accumulation)
+            warmup_training_iteration(
+                gradient_accumulation=gradient_accumulation,
+                forward_backward=warmup_microbatch,
+                clip_gradients=clip_gradients,
+                optimizer_step=optimizers.step,
+                zero_grad=optimizers.zero_grad,
+            )
+            gradient_manifest.clear()
+            # Install observers only after native lazy state has been initialized.
+            # torch_npu may install its final FSDP layer on first fully_shard.
+            install_fsdp_residency_hooks(runtime.patches)
             buffers_before = _buffer_signature(model)
             workload = run_simulation_step(
                 model_parts=[model],
@@ -200,16 +228,10 @@ def simulate(simulation):
                 optimizer_step=optimizers.step,
                 optimizer_zero_grad=optimizers.zero_grad,
                 lr_scheduler_step=scheduler.step,
-                clip_grad_norm=lambda: clip_grad_norm_(
-                    model.parameters(),
-                    config.training.max_norm,
-                    foreach=False,
-                    pp_mesh=None,
-                    ep_enabled=dims.ep_enabled,
-                ),
+                clip_grad_norm=clip_gradients,
                 local_batch_size=batch_size,
                 seq_len=seq_len,
-                global_valid_tokens=float(valid_tokens * batch_degree * gradient_accumulation),
+                global_valid_tokens=global_valid_tokens,
                 gradient_accumulation=gradient_accumulation,
                 memory_parameter_storage_dtype=simulation.memory_parameter_storage_dtype,
                 memory_device_type="meta",
@@ -224,6 +246,12 @@ def simulate(simulation):
                     "Registered buffers changed storage/layout during capture; explicit residency modeling required"
                 )
             annotations = workload.iteration.schedule.annotations
+            annotations["capture"].update(
+                mode="post_warmup",
+                warmup_iterations=1,
+                warmup_microbatches=gradient_accumulation,
+                warmup_scheduler_advanced=False,
+            )
             if simulation.selective_ac_save_ops and {"comm", "full"} & set(simulation.selective_ac_save_ops):
                 memory = annotations["memory_plan"]
                 cached_storages = {
@@ -248,7 +276,9 @@ def simulate(simulation):
                 "gradient_accumulation": gradient_accumulation,
                 "captured_microbatches": 1,
                 "global_valid_tokens": valid_tokens * batch_degree * gradient_accumulation,
-                "memory_scope": "one microbatch and one optimizer update; no accumulated multi-MB replay",
+                "memory_scope": (
+                    "post-warmup single microbatch and optimizer update; static storage budget, not GA replay"
+                ),
             }
             annotations["capture_coordinates"] = {
                 "logical_rank": simulation.logical_rank,
