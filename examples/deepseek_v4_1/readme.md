@@ -16,7 +16,7 @@ bash examples/deepseek_v4_1/debug/deepseek_v4_1_flash_8p_cpt_4k_a3.sh \
     --compile.enable --compile.components model --compile.backend inductor
 ```
 
-编译态按 MoE 路由形态二分：负载均衡路由（A3/A5 脚本默认）下 inductor 保持整图（含 MoE 通信）；数据依赖路由（显式 `--debug.no-moe-force-load-balance`）时 MoE 通信在编译图外执行。
+编译态按 MoE 路由形态二分：数据依赖路由（脚本默认）时 MoE 通信在编译图外执行；负载均衡路由（显式 `--debug.moe-force-load-balance`）下 inductor 保持整图（含 MoE 通信）。
 
 单机 8 卡入口（默认读取仓内上游 CC12M 测试 tar；数据源可通过标准 CLI 覆盖）：
 
@@ -65,7 +65,7 @@ DATASET_PATH=/path/to/cc12m_tar_dir \
 bash examples/deepseek_v4_1/deepseek_v4_1_flash_cpt_4k_a5.sh
 ```
 
-A5 默认每机 8 卡、EP128/FSDP128、TP1/CP1/PP1、MBS1/GBS1024、100 步、Muon、eager/FullAC、强制负载均衡，默认开启 SMLA/LI 及 block-FP8 训练。A3 对应 `deepseek_v4_1_flash_cpt_4k_a3.sh`，默认每机 16 卡、其余并行度相同，使用 A3 融合列表且不默认量化。
+A5 默认每机 8 卡、EP128/FSDP128、TP1/CP1/PP1、MBS1/GBS1024、100 步、Muon、eager/FullAC、数据依赖 MoE 路由，默认开启 SMLA/LI 及 block-FP8 训练。A3 对应 `deepseek_v4_1_flash_cpt_4k_a3.sh`，默认每机 16 卡、其余并行度相同，使用 A3 融合列表且不默认量化。
 
 `NGPU`、`EP`、`DP_SHARD`、`GBS`、`STEPS` 可通过环境变量设置；`NODE_IPS` 必填。总卡数须能被 EP 和 DP_SHARD 整除，EP 须兼容 384 专家；MBS 必须为 1。CLI 参数放在最后，可覆盖训练配置；修改拓扑请优先使用上述环境变量，保证派生的 DP_REPLICATE 一致。Host Engram 需要正确的 tokenizer 压缩映射与足够主机内存。
 

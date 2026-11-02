@@ -17,6 +17,7 @@ if [[ "${CONFIG}" == "deepseek_v4_1_flash_text_lora" ]]; then
     export DATASET="${DATASET:-c4_test}"
 fi
 
+# To check performance under load-balanced MoE routing, append --debug.moe-force-load-balance.
 exec bash "${SCRIPT_DIR}/deepseek_v4_1_flash_cpt_4k_a3.sh" \
     --compile.no-enable \
     --checkpoint.no-load-only \

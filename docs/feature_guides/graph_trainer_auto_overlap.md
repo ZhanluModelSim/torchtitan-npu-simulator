@@ -67,6 +67,8 @@ NPU Auto Overlap
 
 Auto Overlap 采用负载均衡假设：保留可确定的总 token 数，并将 routed tokens 尽量均匀分配给 experts 和 EP ranks，使同一 chunk 内的通信和计算看到一致、合法的 workload。
 
+这里的负载均衡只是 benchmark 输入的构造假设，不等于 `--debug.moe-force-load-balance` 调试开关；仓内 GraphTrainer 脚本默认不配置该开关，需要均衡路由时在命令行显式追加。
+
 ### 2.2 计算算子
 
 普通计算节点从 FakeTensor metadata 恢复 shape、stride、dtype、device 和非 tensor 参数，并生成相同布局的随机 tensor。只有纯函数、输入 metadata 完整且 tensor 值不决定算子合法性的节点才使用通用物化；包含 index、mask、offset 或 split 信息的整数/布尔 tensor 不会被任意随机化。

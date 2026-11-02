@@ -16,6 +16,7 @@ deepseek_v4_flash_cpt_4k_a3.sh
 - `deepseek_v4_flash_cpt_4k_a5.sh`：增加 A5 运行环境和默认 block-FP8 量化，其他配置复用 A3 基线。
 - `deepseek_v4_flash_cpt_1024k_a5.sh`：继续复用 A5 4K 入口，只通过 CLI 覆盖 1M 所需的 CP、DP、序列长度和 global batch size，量化默认随 A5 4K 入口继承。
 - 用户普通 CLI 参数位于默认选项之后，因此可以覆盖默认值（A5 的 activation-checkpoint 子命令仍在末尾），包括使用 `--extension.quantization.no-enable-quantized-training` 切换到 BF16。
+- MoE 强制负载均衡（`--debug.moe-force-load-balance`）仅用于调试；脚本默认不配置，需要时在命令末尾显式追加。
 
 ## 编译配置
 
@@ -72,7 +73,6 @@ bash examples/deepseek_v4/debug/deepseek_v4_pro_32p_cpt_4k_a5.sh \
   --compile.enable \
   --compile.components model \
   --compile.backend inductor \
-  --debug.moe-force-load-balance \
   --training.steps 20
 ```
 
@@ -88,7 +88,6 @@ bash examples/deepseek_v4/debug/deepseek_v4_pro_32p_cpt_4k_a5.sh \
   --parallelism.data-parallel-replicate-degree 1 \
   --training.seq-len 131072 \
   --training.global-batch-size 8 \
-  --debug.moe-force-load-balance \
   --training.steps 20
 ```
 
@@ -140,7 +139,6 @@ bash examples/deepseek_v4/deepseek_v4_flash_cpt_4k_a5.sh \
   --compile.enable \
   --compile.components model \
   --compile.backend inductor \
-  --debug.moe-force-load-balance \
   --training.steps 20
 ```
 
@@ -158,7 +156,6 @@ bash examples/deepseek_v4/deepseek_v4_flash_cpt_4k_a5.sh \
   --parallelism.data-parallel-replicate-degree 1 \
   --training.seq-len 65536 \
   --training.global-batch-size 128 \
-  --debug.moe-force-load-balance \
   --training.steps 20
 ```
 
@@ -172,7 +169,6 @@ bash examples/deepseek_v4/deepseek_v4_flash_cpt_1024k_a5.sh \
   --compile.enable \
   --compile.components model \
   --compile.backend inductor \
-  --debug.moe-force-load-balance \
   --training.steps 20
 ```
 

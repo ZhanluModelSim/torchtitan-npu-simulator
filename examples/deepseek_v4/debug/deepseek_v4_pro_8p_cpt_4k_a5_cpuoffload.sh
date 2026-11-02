@@ -48,7 +48,6 @@ STEPS="${STEPS:-100}"
 # Debug
 USE_GOLDEN="${USE_GOLDEN:-0}"
 DEBUG_ARGS="
-    --debug.no-moe-force-load-balance
     --debug.print-config
 "
 
@@ -157,6 +156,7 @@ else
     )
 fi
 
+# To check performance under load-balanced MoE routing, append --debug.moe-force-load-balance.
 MODULE="${MODULE}" \
 CONFIG="${CONFIG}" \
 NGPU="${NGPU}" \

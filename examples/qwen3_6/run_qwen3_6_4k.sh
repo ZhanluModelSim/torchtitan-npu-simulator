@@ -41,6 +41,7 @@ ARGS=(
     "$@"
 )
 
+# To check performance under load-balanced MoE routing, append --debug.moe-force-load-balance.
 PYTORCH_NPU_ALLOC_CONF=${PYTORCH_NPU_ALLOC_CONF:-expandable_segments:True} \
     CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-1} \
     CPU_AFFINITY_CONF=${CPU_AFFINITY_CONF:-1} \

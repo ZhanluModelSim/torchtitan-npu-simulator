@@ -10,6 +10,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 DATASET_PATH="${DATASET_PATH:-/path/to/train.jsonl}"
 
+# To check performance under load-balanced MoE routing, append --debug.moe-force-load-balance.
 exec bash "${SCRIPT_DIR}/deepseek_v4_1_flash_cpt_4k_a3.sh" \
     torchtitan_npu.override.deepseek_v4_1.vision_language_dataloader.sft \
     --dataloader.dataset-path "${DATASET_PATH}" \

@@ -52,7 +52,6 @@ STEPS="${STEPS:-10}"
 
 # Debug
 DEBUG_ARGS="
-    --debug.moe-force-load-balance
     --debug.print-config
     --no_engram_enabled
 "
@@ -172,6 +171,7 @@ NPU_OPS_OVERRIDES=(
 # Wrapper defaults extend override.imports after the base targets.
 CLI_OVERRIDES="${CLI_OVERRIDES:-}"
 
+# To check performance under load-balanced MoE routing, append --debug.moe-force-load-balance.
 MODULE="${MODULE}" \
 CONFIG="${CONFIG}" \
 NODE_IPS="${NODE_IPS}" \

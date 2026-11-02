@@ -13,6 +13,7 @@ export MODULE=torchtitan_npu.models.deepseek_v4
 export CONFIG="${CONFIG:-graph_trainer_deepseek_v4_flash_43layers_16experts}"
 export NGPU="${NGPU:-8}"
 
+# To check performance under load-balanced MoE routing, append --debug.moe-force-load-balance.
 bash examples/deepseek_v4/debug/deepseek_v4_flash_8p_cpt_4k_a5.sh \
     --parallelism.spmd-backend partial_dtensor \
     --parallelism.data-parallel-shard-degree "${NGPU}" \

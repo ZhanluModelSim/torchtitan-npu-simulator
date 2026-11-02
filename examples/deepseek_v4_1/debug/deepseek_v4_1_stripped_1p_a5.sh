@@ -54,6 +54,7 @@ CLI_OVERRIDES="${CLI_OVERRIDES:-torchtitan_npu.override.common.rms_norm.asc \
                                ${LIGHTNING_INDEXER_OVERRIDE} \
                                torchtitan_npu.override.deepseek_v4_1.sparse_attn.asc}"
 
+# To check performance under load-balanced MoE routing, append --debug.moe-force-load-balance.
 exec bash scripts/run_train.sh \
     --hf-assets-path "${HF_ASSETS_PATH:-tests/assets/deepseek_v3}" \
     --dataloader.dataset "${DATASET:-c4_test}" \

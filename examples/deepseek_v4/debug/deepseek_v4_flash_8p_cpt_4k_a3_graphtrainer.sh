@@ -22,8 +22,8 @@ EP_OVERLAP_ARGS=(
     --compile.pass_pipeline mutation-functionalization+npu_auto_overlap
 )
 
+# To check performance under load-balanced MoE routing, append --debug.moe-force-load-balance.
 exec bash "${SCRIPT_DIR}/deepseek_v4_flash_8p_cpt_4k_a3.sh" \
-    --debug.moe-force-load-balance \
     --parallelism.spmd-backend partial_dtensor \
     "${EP_OVERLAP_ARGS[@]}" \
     "$@"

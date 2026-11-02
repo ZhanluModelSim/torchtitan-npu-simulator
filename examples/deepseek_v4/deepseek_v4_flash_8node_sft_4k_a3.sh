@@ -16,4 +16,5 @@ NODE_IPS="${NODE_IPS:-xx.xx.xx.xx, xx.xx.xx.xx, xx.xx.xx.xx, xx.xx.xx.xx, \
 NGPU="${NGPU:-16}"
 export NODE_IPS NGPU
 
+# To check performance under load-balanced MoE routing, append --debug.moe-force-load-balance.
 exec bash "${SCRIPT_DIR}/deepseek_v4_flash_sft_4k_a3.sh" "$@"

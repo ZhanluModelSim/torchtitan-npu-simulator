@@ -81,6 +81,7 @@ TRAINING_ARGS="
     --training.disable-cuda-graphs
 "
 
+# To check performance under load-balanced MoE routing, append --debug.moe-force-load-balance.
 MODULE="${MODULE}" \
 CONFIG="${CONFIG}" \
 NGPU="${NGPU}" \

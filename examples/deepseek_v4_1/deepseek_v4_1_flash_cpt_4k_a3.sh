@@ -54,7 +54,6 @@ STEPS="${STEPS:-100}"
 # Debug
 USE_GOLDEN="${USE_GOLDEN:-0}"
 DEBUG_ARGS="
-    --debug.moe-force-load-balance
     --debug.print-config
 "
 
@@ -180,6 +179,7 @@ fi
 # Wrapper defaults extend override.imports after the base targets.
 CLI_OVERRIDES="${CLI_OVERRIDES:-${DEFAULT_CLI_OVERRIDES}}"
 
+# To check performance under load-balanced MoE routing, append --debug.moe-force-load-balance.
 MODULE="${MODULE}" \
 CONFIG="${CONFIG}" \
 NODE_IPS="${NODE_IPS}" \

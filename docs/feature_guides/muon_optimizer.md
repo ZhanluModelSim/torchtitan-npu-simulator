@@ -61,7 +61,6 @@ bash scripts/run_train.sh \
   --optimizer.muon_enable_nesterov \
   --optimizer.muon_ns_steps 10 \
   --optimizer.muon_adjust_lr_fn match_rms_adamw \
-  --debug.no-moe-force-load-balance \
   --checkpoint.no-enable \
   --override.imports \
     torchtitan_npu.override.common.rms_norm.asc \

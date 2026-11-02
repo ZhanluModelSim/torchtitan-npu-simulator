@@ -36,6 +36,7 @@ QUANTIZATION_ARGS=(
     --extension.quantization.enable-sparse-attention-quantization
 )
 
+# To check performance under load-balanced MoE routing, append --debug.moe-force-load-balance.
 exec bash "${SCRIPT_DIR}/deepseek_v4_1_flash_8p_cpt_4k_a5.sh" \
     "${QUANTIZATION_ARGS[@]}" \
     "$@" \

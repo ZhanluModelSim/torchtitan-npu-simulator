@@ -46,7 +46,6 @@ STEPS=40
 USE_GOLDEN="${USE_GOLDEN:-0}"
 DEBUG_ARGS="
     --debug.print-config
-    --debug.moe-force-load-balance
 "
 
 # HF assets
@@ -169,6 +168,7 @@ fi
 # Wrapper defaults extend override.imports after the base targets.
 CLI_OVERRIDES="${CLI_OVERRIDES:-${DEFAULT_TEXT_ROPE_OVERRIDE} ${DEFAULT_FUSED_OVERRIDES}}"
 
+# To check performance under load-balanced MoE routing, append --debug.moe-force-load-balance.
 MODULE="${MODULE}" \
 CONFIG="${CONFIG}" \
 NGPU="${NGPU}" \

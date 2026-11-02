@@ -28,6 +28,7 @@ QUANTIZATION_ARGS=(
 # Disable swap optimizer for better performance
 export OPTIMIZER_OVERRIDES=""
 
+# To check performance under load-balanced MoE routing, append --debug.moe-force-load-balance.
 exec bash "${SCRIPT_DIR}/deepseek_v4_flash_cpt_4k_a5.sh" \
     "${QUANTIZATION_ARGS[@]}" \
     "$@"

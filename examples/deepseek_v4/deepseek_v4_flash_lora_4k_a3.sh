@@ -15,6 +15,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 export CONFIG="${CONFIG:-deepseek_v4_flash_lora}"
 
 # LoRA uses periodic native adapter checkpoints and final PEFT export.
+# To check performance under load-balanced MoE routing, append --debug.moe-force-load-balance.
 exec bash "${SCRIPT_DIR}/deepseek_v4_flash_cpt_4k_a3.sh" \
     --checkpoint.no-load-only \
     --checkpoint.save-training-state \
