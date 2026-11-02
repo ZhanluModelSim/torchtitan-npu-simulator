@@ -748,6 +748,9 @@ class OpDispatchCapture(TorchDispatchMode):
                     pp_stage=pp_stage,
                     pp_mb_idx=pp_mb_idx,
                     comp_type=comp_type,
+                    mutated_storage_keys=tuple(
+                        sorted({self._storage_identity(tensor)[0] for tensor in mutated_inputs or ()})
+                    ),
                 )
             )
 

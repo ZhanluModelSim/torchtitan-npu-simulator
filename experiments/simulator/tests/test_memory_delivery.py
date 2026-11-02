@@ -274,3 +274,68 @@ def test_mxfp8_offload_and_shard_dtype_projection_preserve_native_execution(mode
     assert left.persistent_param_bytes == 2 * right.persistent_param_bytes
     assert right.model_active_bytes_peak < left.model_active_bytes_peak
     assert right.activation_offload_tensors or right.checkpoint_tensors
+
+
+def test_activation_transfer_mtp_capture_preserves_raw_facts_and_restores_at_b_entry(tmp_path):
+    workload = main(
+        [
+            "--simulation.world-size",
+            "4",
+            "--parallelism.expert-parallel-degree",
+            "2",
+            "--training.num-mtp-modules",
+            "1",
+            "--training.seq-len",
+            "128",
+            "--simulation.memory-offload-ac-saved-tensors",
+            "--simulation.output-dir",
+            str(tmp_path),
+            "--simulation.output-formats",
+            "mem",
+        ]
+    )
+    annotations = workload.iteration.schedule.annotations
+    raw = workload.captured_workload
+    assert raw is not None
+    source = raw.iteration.schedule.annotations["memory_plan"]
+    memory = annotations["memory_plan"]
+    copies = [
+        node
+        for step in workload.step_templates.values()
+        for node in step.nodes.values()
+        if "activation_transfer" in node.attrs
+    ]
+    mtp_restore = next(
+        node
+        for node in copies
+        if node.attrs["activation_transfer"]
+        == {
+            "direction": "h2d",
+            "layer": "mtp_layers.0",
+            "bytes": next(
+                item["transfer_bytes"]
+                for item in memory.to_summary_dict()["activation_offload_by_layer"]
+                if item["layer"] == "mtp_layers.0"
+            ),
+        }
+    )
+
+    assert len(copies) == 10
+    assert mtp_restore.predecessors == []
+    assert mtp_restore.op_id in workload.step_templates["s0_B"].nodes
+    assert all(
+        node.annotations["comp_type"] == ("F" if node.attrs["activation_transfer"]["direction"] == "d2h" else "B")
+        for node in copies
+    )
+    assert all(
+        "activation_transfer" not in node.attrs for step in raw.step_templates.values() for node in step.nodes.values()
+    )
+    assert memory.tensor_lifetimes is source.tensor_lifetimes
+    assert memory.raw_events is source.raw_events
+    assert source.activation_buffer_lifetimes == []
+    assert memory.steady_state_optimizer_peak_active_bytes == source.steady_state_optimizer_peak_active_bytes
+    with (tmp_path / "memory/tensor_lifetimes.csv").open() as stream:
+        buffers = [row for row in csv.DictReader(stream) if row["kind"] == "activation_transfer_buffer"]
+    assert len(buffers) == len(memory.activation_buffer_lifetimes)
+    assert all(int(row["birth_seq"]) <= int(row["death_seq"]) for row in buffers)
+    assert validate_workload(workload) == annotations["capture_validation"]

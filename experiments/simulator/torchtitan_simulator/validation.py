@@ -37,9 +37,44 @@ def validate_workload(workload: WorkloadGraph) -> dict:
             for key, node in step.nodes.items()
             if not is_fsdp_bookkeeping(node)
         }
-        _require(visible == expected, "FSDP view hid a model or communication node")
+        modeled = workload.iteration.schedule.annotations.get("activation_transfer_plan", {}).get("modeled_op_ids", [])
         _require(
-            workload.iteration.schedule.annotations["memory_plan"] is original["memory_plan"],
+            len(modeled) == len(set(modeled)) and not expected.intersection(modeled),
+            "modeled activation IDs overlap captured nodes",
+        )
+        _require(visible == expected | set(modeled), "FSDP view hid a model or communication node")
+        modeled_nodes = {
+            key: node for step in workload.step_templates.values() for key, node in step.nodes.items() if key in modeled
+        }
+        for node in modeled_nodes.values():
+            _require(
+                node.annotations.get("modeling_source") == "activation_offload_neighbor_v1",
+                "unrecognized modeled activation node",
+            )
+            raw_name = node.annotations.get("raw_op_type")
+            _require(
+                raw_name in {"simulator.activation_h2d", "simulator.activation_d2h", "simulator.stream_wait"},
+                "invalid modeled activation operation",
+            )
+            if raw_name != "simulator.stream_wait":
+                transfer = node.attrs.get("activation_transfer", {})
+                direction = transfer.get("direction")
+                _require(
+                    direction in {"h2d", "d2h"} and raw_name == f"simulator.activation_{direction}",
+                    "activation transfer direction mismatch",
+                )
+                _require(
+                    type(transfer.get("bytes")) is int and transfer["bytes"] > 0,
+                    "activation transfer byte count must be positive",
+                )
+                _require(
+                    node.annotations.get("comp_type") == ("F" if direction == "d2h" else "B"),
+                    "activation transfer belongs to the wrong phase",
+                )
+        _require(
+            workload.iteration.schedule.annotations["memory_plan"].raw_events is original["memory_plan"].raw_events
+            and workload.iteration.schedule.annotations["memory_plan"].tensor_lifetimes
+            is original["memory_plan"].tensor_lifetimes,
             "FSDP view replaced captured memory observations",
         )
     schedule = workload.iteration.schedule
@@ -204,6 +239,7 @@ def validate_workload(workload: WorkloadGraph) -> dict:
         ),
         "local persistent parameter byte mismatch",
     )
+    budget_lifetimes = [*memory.tensor_lifetimes, *memory.activation_buffer_lifetimes]
     allocations = {
         f"fsdp_full_param:{event.group_id}:{event.seq_idx}": event.allocation_storage_bytes
         for event in memory.fsdp_residency_events
@@ -211,11 +247,11 @@ def validate_workload(workload: WorkloadGraph) -> dict:
     }
     inventory = [
         item
-        for item in memory.tensor_lifetimes
+        for item in budget_lifetimes
         if item.resident_num_bytes and item.birth_seq <= memory.peak_seq_idx <= item.death_seq
     ]
     deltas = Counter()
-    for item in memory.tensor_lifetimes:
+    for item in budget_lifetimes:
         _require(item.resident_num_bytes >= 0 and item.birth_seq <= item.death_seq, "invalid lifetime interval")
         deltas[item.birth_seq] += item.resident_num_bytes
         deltas[item.death_seq + 1] -= item.resident_num_bytes
@@ -233,7 +269,7 @@ def validate_workload(workload: WorkloadGraph) -> dict:
     ]
     _require(len(keys) == len(set(keys)), "duplicate peak storage")
     if memory.optimizer_state_bytes is not None:
-        states = [item for item in memory.tensor_lifetimes if item.kind == "optimizer_state"]
+        states = [item for item in budget_lifetimes if item.kind == "optimizer_state"]
         _require(len({item.storage_key for item in states}) == len(states), "duplicate optimizer state storage")
         _require(memory.optimizer_state_storage_count == len(states), "optimizer state count differs")
         _require(
@@ -241,8 +277,8 @@ def validate_workload(workload: WorkloadGraph) -> dict:
             "optimizer state bytes differ",
         )
         steady_deltas = Counter()
-        end = max((item.death_seq for item in memory.tensor_lifetimes), default=0)
-        for item in memory.tensor_lifetimes:
+        end = max((item.death_seq for item in budget_lifetimes), default=0)
+        for item in budget_lifetimes:
             state = item.kind == "optimizer_state"
             steady_deltas[-1 if state else item.birth_seq] += item.resident_num_bytes
             steady_deltas[(end if state else item.death_seq) + 1] -= item.resident_num_bytes

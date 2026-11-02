@@ -389,7 +389,7 @@ def export_memory_details(plan: MemoryPlan, out_dir: str) -> None:
         ]
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
-        for lifetime in plan.tensor_lifetimes:
+        for lifetime in (*plan.tensor_lifetimes, *plan.activation_buffer_lifetimes):
             row: dict[str, Any] = asdict(lifetime)
             row["consumer_ops"] = ";".join(str(item) for item in lifetime.consumer_ops)
             row["consumer_seqs"] = ";".join(str(item) for item in lifetime.consumer_seqs)

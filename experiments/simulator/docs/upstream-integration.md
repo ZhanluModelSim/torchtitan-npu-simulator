@@ -150,7 +150,7 @@ assert isinstance(workload_graph, WorkloadGraph)
 | `--extension.quantization.enable-quantized-training` | `enable_quantized_training` | bool；false | `store_true`；唯一量化启用开关，默认关闭；使用原生 TorchAO-NPU recipe |
 | `--extension.quantization.recipe` | `quantization_recipe` | str；`all_mxfp8` | 唯一支持值 `all_mxfp8`；只设 recipe 不会开启量化 |
 | `--simulation.memory-parameter-storage-dtype` | `memory_parameter_storage_dtype` | str；空字符串 | 空值保留捕获 dtype；全部可选值见第 8 节；仅内存投影 |
-| `--simulation.memory-offload-ac-saved-tensors` | `memory_offload_ac_saved_tensors` | bool；false | `store_true`；保存激活驻留投影，适用于 none/full/selective；不执行实际 offload |
+| `--simulation.memory-offload-ac-saved-tensors` | `memory_offload_ac_saved_tensors` | bool；false | `store_true`；生成激活传输/等待执行图并修正静态驻留，适用于 none/full/selective；不执行真实设备 copy，见 [offload 说明](activation-offload-design.md) |
 | `--simulation.enable-fsdp-allgather-fp8` | `enable_fsdp_allgather_fp8` | bool；false | parser 保留，设置 true 会明确拒绝；不是已支持的优化 |
 | `--simulation.enable-ep-dispatch-fp8` | `enable_ep_dispatch_fp8` | bool；false | parser 保留，设置 true 会明确拒绝 |
 | `--simulation.output-dir` | `output_dir` | str；`./simulator_output` | CLI 和 `simulate()` 均使用此目录；相对路径按宿主 cwd 解析，建议每次调用使用独立绝对路径 |

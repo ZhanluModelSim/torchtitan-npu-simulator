@@ -303,6 +303,9 @@ def simulate(simulation):
     from torchtitan_simulator.capture.fsdp_communication_view import project_fsdp_communication_view
 
     workload = project_fsdp_communication_view(workload)
+    from torchtitan_simulator.capture.activation_transfers import insert_activation_transfers
+
+    workload = insert_activation_transfers(workload)
     workload.iteration.schedule.annotations["capture_validation"] = validate_workload(workload)
     export_result(workload, simulation)
     return workload

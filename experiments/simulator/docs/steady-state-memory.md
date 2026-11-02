@@ -73,7 +73,7 @@ optimizer_bytes = summary["optimizer_state_bytes"]
 - 按主模型层数字顺序排列，随后是 MTP 层；没有卸载值的层保留为 0。当前标准捕获不再为层外／未归属保存值创建 `<unattributed>` 传输项；其来源、保存槽和真实设备生命周期仍保留在诊断明细中，不伪装成某一层，也不从显存预算删除。
 - 列表对应当前 logical rank、捕获的单 microbatch。同一 storage 被不同层使用时，各层有各自的 payload 预算，不能将列表之和解释为全局去重内存或实际总线流量。
 
-这是传输数据量预算，不执行真实 copy，不模拟跨层主机副本复用、重复加载次数和传输时序；后续 DES 可另行处理这些行为。
+启用 offload 后，标准入口同时生成激活 H2D/D2H 与等待节点，交由平台计算传输耗时和 DES；本仓不执行真实 copy。静态预算按同一计划补回 storage 去重的生成／卸载与消费／预取驻留，不是动态内存回放。晚产生 payload 保守保留至 F 末，可能超过两层；head 原驻留不重复补入，O 不变。原始 lifetime 保留，新增区间在 `activation_buffer_lifetimes`，详见[执行图与静态预算](activation-offload-design.md)。
 终端仍只打印六项核心预算，不打印逐层明细。
 
 历史结果中的 `<unattributed>` 不等于 loss。它还包含 head/norm 等层外保存值。当前这些值不卸载、不计传输，但仍在原始生命周期、alloc/free 时间线和设备峰值中；不同 chunk 的累计字节数不直接相加为峰值。不能仅在下游隐藏旧传输行而沿用旧的零驻留预算，应使用修复后的捕获结果。

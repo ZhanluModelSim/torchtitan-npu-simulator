@@ -57,6 +57,7 @@ class RawMemoryEvent:
     pp_stage: int = -1
     pp_mb_idx: int = -1
     comp_type: str = ""
+    mutated_storage_keys: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -225,6 +226,7 @@ class MemoryPlan:
     peak_phase: str = ""
     raw_events: list[RawMemoryEvent] = field(default_factory=list)
     tensor_lifetimes: list[TensorLifetime] = field(default_factory=list)
+    activation_buffer_lifetimes: list[TensorLifetime] = field(default_factory=list)
     checkpoint_tensors: list[CheckpointTensorRecord] = field(default_factory=list)
     activation_offload_tensors: list[CheckpointTensorRecord] = field(default_factory=list)
     autograd_saved_tensors: list[AutogradSavedTensorEvent] = field(default_factory=list)

@@ -354,3 +354,15 @@ def test_get_active_capture_returns_the_entered_instance():
     with capture:
         assert get_active_capture() is capture
     assert get_active_capture() is None
+
+
+def test_capture_records_out_overload_storage_writes():
+    capture = OpDispatchCapture(record_memory=True)
+    with capture:
+        source = torch.ones(4, device="meta")
+        target = torch.empty_like(source)
+        torch.add(source, source, out=target)
+    event = next(event for event in capture.memory_events() if event.raw_op_type == "aten.add.out")
+
+    assert event.mutated_storage_keys == (event.outputs[0].storage_key,)
+    assert event.mutated_storage_keys != (event.inputs[0].storage_key,)

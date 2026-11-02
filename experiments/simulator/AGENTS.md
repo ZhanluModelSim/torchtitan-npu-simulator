@@ -76,6 +76,8 @@ CLI 是参数白名单，不是任意原生训练参数的透传。新增参数�
 
 summary 保持六项预算（四个含状态的稳态峰值、权重大小、优化器状态大小）及逐层 offload payload 列表。字段与口径见[稳态内存说明](docs/steady-state-memory.md)。修改时同步 `memory/records.py`、`memory/export.py`、实际消费者、验收脚本及接入文档；不恢复 JSON/HTML/DOT 图导出。
 
+激活 offload 执行图见[真实捕获核对与实现说明](docs/activation-offload-design.md)。启用现有开关后，训练侧在通信视图插入传输及等待、修正静态显存，平台负责传输耗时和 DES，MBU 分子不变。按 comp_type 区分 F/B，B 无预取窗口时入口显式加载，阶段间不延续异步传输。原生 FSDP wait 不当作逐层屏障；完整 DAG 前沿保留通信路径。晚 producer 整层复制保守降级为 F 末 drain，并在 notes／日志声明可能超过两层驻留。原始事件／lifetime 不改，新增预算放 activation_buffer_lifetimes；schema 写入事实禁止使用过期主机副本。不包含优化器卸载。
+
 ## 开发与验证入口
 
 以下命令均从 `experiments/simulator` 执行，使用已配置完整训练栈的 Python。安装命令见 [README](README.md)，测试工具来自 `pyproject.toml` 的 `dev` extra。
