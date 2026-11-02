@@ -222,6 +222,14 @@ class TrainerEx(Trainer):
 
         self.anticipatory_schedule = AnticipatorySchedule(self) if config.anticipatory.enable else None
 
+        # CPU affinity runs last: every runtime thread it manages (acl /
+        # release / watchdog / CANN internals) is born by now, so binding
+        # here cannot propagate a narrow mask to threads that do not exist
+        # yet. Later arrivals are healed by the daemon.
+        from torchtitan_npu.extensions.affinity import AffinityExtension
+
+        self.affinity: AffinityExtension | None = AffinityExtension.start()
+
     def forward_backward_step(self, *args: Any, **kwargs: Any) -> Any:
         if self.anticipatory_schedule is not None:
             self.anticipatory_schedule.prepare_microbatch()
@@ -252,6 +260,9 @@ class TrainerEx(Trainer):
 
     def close(self) -> None:
         super().close()
+        affinity = getattr(self, "affinity", None)
+        if affinity is not None:
+            affinity.stop()
         # ``train.py`` calls ``trainer.close()`` on both the normal and the
         # exception path; give optimizer containers (e.g. the CPU-offload
         # runtime owner) a chance to release their resources there.
