@@ -27,7 +27,6 @@ from torchtitan.models.common.rope import CosSinRoPE
 
 from torchtitan_npu.models.deepseek_v3_2 import model_registry
 from torchtitan_npu.models.deepseek_v3_2.model import DeepSeekV32Model, Indexer, SparseInnerAttention
-from torchtitan_npu.patches.torchtitan.distributed.varlen_cp import CPVarlenMetadata
 from torchtitan_npu.patches.torchtitan.models.common.aux_loss import AuxLoss
 
 # Two documents in one packed row, the second one longer than ``topk``.
@@ -303,27 +302,6 @@ def test_the_indexer_loss_reads_the_selected_rows_of_every_document():
         kl += float((teacher * (teacher.clamp_min(1e-30).log() - student.log())).sum())
 
     assert float(core.indexer_loss.instance_acc) == pytest.approx(kl / denominator, rel=1e-5)
-
-
-def test_the_reference_core_rejects_context_parallel_metadata():
-    """A CP rank holds a document's middle, which attn-gym's prefix-aligned causal cannot express."""
-    inputs = _inputs(seed=0)
-    cu = torch.tensor([0, 3, 8], dtype=torch.int32)
-    cp_metadata = CPVarlenMetadata(
-        cu_seq_q=cu,
-        cu_seq_k=torch.tensor([0, 3, 5], dtype=torch.int32),
-        max_q=3,
-        max_k=3,
-        k_global_gather_indices=torch.arange(8),
-    )
-
-    try:
-        _core()(attention_masks=cp_metadata, scale=_SCALE, **inputs)
-    except ValueError as error:
-        assert "context-parallel" in str(error)
-        assert "override.deepseek_v3_2.sparse_attn.asc" in str(error)
-    else:
-        raise AssertionError("the reference core must refuse context-parallel metadata")
 
 
 def test_the_shipped_layers_dispatch_to_a_varlen_mask():

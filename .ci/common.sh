@@ -74,9 +74,9 @@ _setup_torchtitan "${TORCHTITAN_DIR}"
 # Grain needs its data-pipeline dependencies (for example etils and array-record).
 # Its dependency graph does not include torch or torch_npu.
 "${PYTHON_BIN}" -m pip install --break-system-packages --no-cache-dir grain==0.2.18
-# The CI image supplies torch 2.15.0.dev; the matching torchvision nightly
+# The CI image supplies torch 2.14.0.dev; the matching torchvision CPU wheel
 # is installed with --no-deps (resolving its torch pin would fight the image).
-"${PYTHON_BIN}" -m pip install --break-system-packages --no-deps --no-cache-dir --index-url https://download.pytorch.org/whl/nightly/cpu "torchvision==0.30.0.dev20260918"
+"${PYTHON_BIN}" -m pip install --break-system-packages --no-deps --no-cache-dir --index-url https://download.pytorch.org/whl/cpu "torchvision==0.29.0+cpu"
 "${PYTHON_BIN}" -c 'import torchtitan, torchtitan_npu, torchvision'
 
 export MODULE="${MODULE:-torchtitan_npu.models.deepseek_v4}"

@@ -3,7 +3,9 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-# Pending upstream PR: https://github.com/pytorch/torchtitan/pull/3430
+# Upstream-PR: none - the doc-chunk load balancer below is repository-specific.
+# The varlen-CP backport this module used to carry (upstream PR #3430) was
+# retired with DeepSeek-V3.2's context-parallel capability.
 
 """The CP shard, plus the doc-chunk layout as one of its load balancers.
 
@@ -26,37 +28,20 @@ from typing import cast
 
 import torch
 from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.tensor.experimental._attention import (
-    _context_parallel_shard,
-    _HeadTailLoadBalancer,
-)
+from torch.distributed.tensor.experimental._attention import _context_parallel_shard
 from torch.distributed.tensor.experimental._context_parallel._load_balancer import (
     _LoadBalancer,
 )
 from torchtitan.distributed.context_parallel.api import cp_shard as original_cp_shard
-from torchtitan.models.common.attention import AttentionMasksType, VarlenMetadata
+from torchtitan.models.common.attention import AttentionMasksType
 
 from torchtitan_npu.models.common.restore import (
     DOC_CHUNK_LAYOUT,
     doc_chunk_permutation,
     document_starts,
 )
-from torchtitan_npu.patches.torchtitan.distributed.varlen_cp import (
-    CPVarlenMetadata,
-)
 
 logger = logging.getLogger(__name__)
-
-
-def _varlen_from_masks(masks):
-    """Return the shared VarlenMetadata behind a bare mask or an all-varlen dict."""
-    if isinstance(masks, VarlenMetadata):
-        return masks
-    if isinstance(masks, dict):
-        values = [value for value in masks.values() if value is not None]
-        if values and all(isinstance(value, VarlenMetadata) for value in values):
-            return values[0]
-    return None
 
 
 class DocChunkLoadBalancer(_LoadBalancer):
@@ -113,7 +98,7 @@ def patched_cp_shard(
     ptrr_mask_key: str | None = None,
     *,
     positions: torch.Tensor | None = None,
-) -> tuple[tuple[torch.Tensor, ...], AttentionMasksType | CPVarlenMetadata | None]:
+) -> tuple[tuple[torch.Tensor, ...], AttentionMasksType | None]:
     """Shard inputs for CP, with this repository's layouts beside the framework's.
 
     ``positions`` is the row's own positions, and it is what a boundary-driven layout is built
@@ -124,8 +109,8 @@ def patched_cp_shard(
     The rank-local metadata of these layouts is the model's own transform -- it reads the row's
     boundaries, not the sharded rows -- so nothing is returned in place of the masks.
 
-    Without a repository layout the pinned behaviour is unchanged: shard the inputs and, for a
-    varlen stack, build the rank-local varlen metadata after sharding.
+    Without a repository layout the pinned behaviour is unchanged: the framework shards the
+    inputs and the masks.
     """
     seq_dims = (input_seq_dims,) * len(inputs) if isinstance(input_seq_dims, int) else input_seq_dims
     if len(seq_dims) != len(inputs):
@@ -161,49 +146,14 @@ def patched_cp_shard(
         # layout is handed tensors only, so the tuple is one of tensors.
         return cast("tuple[torch.Tensor, ...]", tuple(sharded)), attention_masks
 
-    varlen_metadata = _varlen_from_masks(attention_masks)
-    is_varlen = varlen_metadata is not None
-    batch_size = inputs[0].size(0)
-    seq_len = inputs[0].size(seq_dims[0])
-
-    inputs, output_masks = original_cp_shard(
+    return original_cp_shard(
         cp_mesh,
         inputs,
-        None if is_varlen else attention_masks,
+        attention_masks,
         load_balancer_type,
         input_seq_dims=seq_dims,
         ptrr_mask_key=ptrr_mask_key,
     )
-
-    if varlen_metadata is not None:
-        assert load_balancer_type in (
-            None,
-            "headtail",
-        ), f"varlen only support headtail as load balancer, got ({load_balancer_type})"
-
-        cp_metadata = CPVarlenMetadata.from_global(
-            varlen_metadata,
-            cp_mesh,
-            batch_size,
-            seq_len,
-            load_balancer=(
-                _HeadTailLoadBalancer(seq_len, cp_mesh.size(0), cp_mesh.device_type)
-                if load_balancer_type == "headtail"
-                else None
-            ),
-        )
-        if isinstance(attention_masks, dict):
-            # Hybrid attention stacks carry one shared varlen metadata under
-            # multiple mask keys; keep the dict shape so each block can still
-            # select its mask by key after CP sharding.
-            output_masks = {
-                key: cp_metadata if isinstance(value, VarlenMetadata) else value
-                for key, value in attention_masks.items()
-            }
-        else:
-            output_masks = cp_metadata
-
-    return inputs, output_masks  # pyrefly: ignore [bad-return]
 
 
 def apply() -> None:

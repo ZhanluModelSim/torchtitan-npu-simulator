@@ -82,9 +82,9 @@ def test_dsv32_mtp_keeps_community_cp_restriction():
         context_parallel_degree=2,
     )
 
-    # The community decoder's own refusal fires at config time for the
-    # VarlenAttention-derived cores; the reference core's metadata-seam
-    # refusal (``ReferenceVarlenMetadata``) is the later, rank-local guard.
+    # The pinned decoder refuses CP for the VarlenAttention-derived cores at
+    # configuration time.  DeepSeek-V3.2 has no successor rank-local CP path:
+    # its retired varlen-CP metadata system is not replaced by a second guard.
     with pytest.raises(NotImplementedError, match="Context Parallel is not supported"):
         config.model_spec.model.update_from_config(config=config)
 

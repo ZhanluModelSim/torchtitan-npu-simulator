@@ -1,6 +1,5 @@
 <!--
 待合入的上游 PR：
-- https://github.com/pytorch/torchtitan/pull/3430
 - https://github.com/pytorch/torchtitan/pull/3634
 - https://github.com/pytorch/torchtitan/pull/3864
 - https://github.com/pytorch/torchtitan/pull/4411
@@ -28,18 +27,17 @@
   ```
 
 - 模块 docstring 需说明补丁内容，并以 "Remove this module after the TorchTitan dependency includes the PR." 结尾。
-- 对原模块/类做属性替换的 monkey patch 必须封装在 `def apply() -> None:` 中并在文件末尾调用（`apply()`），补丁逻辑内使用完整模块路径（`import torchtitan.models.common.moe` 后以 `torchtitan.models.common.moe.X = ...` 赋值），不使用短导入别名。纯定义被模型目录引用的 backport 类（如 `BatchedLinear`、`BaseMaskHandler`、`SingleComplexRoPE`、`AuxLoss`、`VarlenCPMetadata`）不需要 `apply()`。
+- 对原模块/类做属性替换的 monkey patch 必须封装在 `def apply() -> None:` 中并在文件末尾调用（`apply()`），补丁逻辑内使用完整模块路径（`import torchtitan.models.common.moe` 后以 `torchtitan.models.common.moe.X = ...` 赋值），不使用短导入别名。纯定义被模型目录引用的 backport 类（如 `BatchedLinear`、`BaseMaskHandler`、`SingleComplexRoPE`、`AuxLoss`）不需要 `apply()`。
 
 校验（除 `__init__.py` 等包胶水文件外，每个补丁文件都应命中）：
 
 ```bash
-grep -L "Pending upstream PR: https://github.com/pytorch/torchtitan/pull/" \
+grep -L -E "Pending upstream PR: https://github.com/pytorch/(torchtitan|pytorch)/pull/" \
   torchtitan_npu/patches/torchtitan -r --include="*.py"
 ```
 
 | PR | 说明 |
 | --- | --- |
-| [#3430](https://github.com/pytorch/torchtitan/pull/3430) | 为变长注意力补充 CP 和 Full DTensor 支持 |
 | [#3634](https://github.com/pytorch/torchtitan/pull/3634) | 补充 DeepSeek-V4 所需的公共组件及训练接入 |
 | [#3864](https://github.com/pytorch/torchtitan/pull/3864) | 为 torchtitan 补充 AuxLoss 辅助损失框架 |
 | [#4474](https://github.com/pytorch/torchtitan/pull/4474) | 补齐部分初始化的 optimizer state，支持完整 checkpoint 恢复 |
@@ -59,6 +57,9 @@ grep -L "Pending upstream PR: https://github.com/pytorch/torchtitan/pull/" \
 | [#4708](https://github.com/pytorch/torchtitan/pull/4708) | 修复 functionalize_recompute_mutations_pass 和 EpOverlap 的冲突 |
 | [#4763](https://github.com/pytorch/torchtitan/pull/4763) | 向 GraphTrainer graph pass 提供运行时上下文，用于 auto-overlap 调度时整图 profiling |
 | [#201621](https://github.com/pytorch/pytorch/pull/201621) | 为本地 FileSystemReader 增加可选 mmap 加载，对应 `distributed/checkpoint/filesystem` |
+
+`distributed/context_parallel.py` 的 doc-chunk load balancer 是仓库自有布局（`Upstream-PR: none`）：
+待上游 `cp_shard` 提供布局注册点，或 doc-chunk 布局并入上游后删除。
 
 上述 6 个 TorchTitan PR（#4534、#4575、#4578、#4598、#4663、#4664）已在上游合入，但 `v0.3.0` 尚未包含这些修复。
 

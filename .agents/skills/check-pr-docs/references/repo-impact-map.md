@@ -113,9 +113,9 @@
 时标为待决，不能靠改标签宣称兼容性已验证。
 
 CI 与 `requirements.txt` 的部分版本和 CANN 路径有意不同：`.ci/unit_test.sh` 与
-`.ci/common.sh` 都改装 nightly 的 `torchvision` 覆盖 requirements 中的正式版，两者的 CANN
-入口也不同（前者 source Jenkins 目录下的 CANN，后者用
-`/usr/local/Ascend/cann/set_env.sh`）。
+`.ci/common.sh` 都改装 PyTorch CPU index 的 `torchvision==0.29.0+cpu`，覆盖镜像内按
+requirements 安装的同版本 wheel，两者的 CANN 入口也不同（前者 source Jenkins 目录下的
+CANN，后者用 `/usr/local/Ascend/cann/set_env.sh`）。
 
 CI 通过只能证明其实际软件栈下的检查结果，不能替代另一套 requirements 配置的验证。
 

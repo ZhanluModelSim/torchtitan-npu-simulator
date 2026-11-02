@@ -83,7 +83,6 @@ python -m tests.integration_tests.run_tests ./test_reports/v41-reference-mm \
 | **`dsv4_mtp_smla_cp2`** | DeepSeek-V4 MTP | CP2（连续切片） | 2 | 否 | 覆盖 MTP forward、chunked loss 及 backward 算子路径 |
 | **`dsv3_2_dsa_1rank`** | DeepSeek-V3.2 | 1 Rank，DSA 算子 | 1 | **是** | 校验 DSA attention override 并在 1-rank 下做数值 Loss 比对 |
 | **`dsv3_2_dsa_ep2_fsdp2`** | DeepSeek-V3.2 | DSA + EP2/FSDP2 | 2 | **是** | 校验分布式 DSA 算子 30-step 精度对齐 |
-| **`dsv3_2_dsa_cp2`** | DeepSeek-V3.2 | DSA + CP2 | 2 | 否 | 校验 DSA 在 CP2 模式下的训练触发与通信 |
 | **`dsv4_ema_ep2_fsdp2`** | DeepSeek-V4 | Golden + EP2/FSDP2 + EMA CPU Offload | 2 | 否 | 校验 DCP Checkpoint Metadata 完整包含 `ema_optimizer.*` |
 
 ---

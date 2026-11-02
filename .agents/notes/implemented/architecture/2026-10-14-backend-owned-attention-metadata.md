@@ -34,7 +34,7 @@ rank-local）。0.3.0 三者皆无（无 `InnerAttention` / `ParallelismContext`
    provider 节点；
 2. per-batch metadata 由 backend config 构建（每 microbatch 每 backend 一次、同几何共享），CP 下由 **metadata 自己**的
    `prepare_cp_metadata` 产出 rank-local 副本（几何由 `cp_shard_context` 发布）（V4/V4.1 的记录在 CP 后**重建**）。
-   宿主是 metadata 而不是 backend 类：被重建的就是它，key 因此退化成纯寻址（V3.2 三栈均如此）；
+   宿主是 metadata 而不是 backend 类：被重建的就是它，key 因此退化成纯寻址（V4/V4.1 如此；V3.2 的 CP 已退场）；
 3. `.ci/architecture_import_baseline.json` 不再有 metadata 相关的 `extensions → models` 债务边：metadata dataclass
    直接用 `torch.utils._pytree.register_dataclass` 注册（没有自定义 pytree shim，也没有 patch 目录里的新文件），
    activation order 不动；
@@ -59,10 +59,11 @@ rank-local）。0.3.0 三者皆无（无 `InnerAttention` / `ParallelismContext`
 
 ### B. 三个栈迁到接缝（每栈一个 commit，可按同序拆成三个 PR）
 
-- **V3.2**：`SparseInnerAttention.Config.build_attention_metadata` 建 packed layout（`ReferenceVarlenMetadata`；参考核
-  不可 CP → `prepare_cp_metadata` 拒绝）；`AscSparseInnerAttention.Config` 包成带 TND host 序列长度的
-  `AscVarlenMetadata`，CP 用 `prepare_cp_varlen_metadata` 得 rank-local 再重读 host 列表。删 `metadata_extension` /
-  `_metadata_extension` / `build_attention_masks` 与 `sparse_attn.asc_metadata`。
+- **V3.2**：`SparseInnerAttention.Config.build_attention_metadata` 建 packed layout（`VarlenMetadata`）；
+  `AscSparseInnerAttention.Config` 包成带 TND host 序列长度的 `AscVarlenMetadata`。删 `metadata_extension` /
+  `_metadata_extension` / `build_attention_masks` 与 `sparse_attn.asc_metadata`。该栈的 varlen-CP 已整体退场：
+  所有 attention config 都派生自 `VarlenAttention.Config`，pinned decoder 在 CP>1 时于配置阶段报错，不再需要
+  rank-local 的 metadata 变换。
 - **V4.1**：参考核只保留自己读的几何（`window_size` / `softmax_scale` / `compress_ratio`），metadata 是**整行的
   document 边界**（`create_varlen_metadata_for_document` 的 `cu_seq_q`）加上后端在同一处按自己的 ratio 折一次的
   池化轴 `cu_seq_k`（消费者不再除）；kernel 几何与 records
@@ -109,8 +110,9 @@ rank-local）。0.3.0 三者皆无（无 `InnerAttention` / `ParallelismContext`
 - **map 键默认是 backend 类**（同上游；#4897 自述的限制）：一个类多套几何时由 config 用 `attention_metadata_key` 声明
   几何键。0.3.0 无 `InnerAttention.__init__`，键在 `Module.Config.build` 时**无条件**盖到实例上——SimpleFSDP /
   GraphTrainer 会改写模块的 `__class__`，条件盖章会让层按运行时类型查找而拿到 `None`。
-- **不能切分的栈必须显式拒绝**：无 `prepare_cp_metadata` 的条目原样透传，V3.2 参考核因此在变换里 raise，而不是让层静默读
-  到本 rank 不持有的全局 layout。
+- **不能切分的栈必须显式拒绝**：无 `prepare_cp_metadata` 的条目原样透传；V3.2 已没有 rank-local CP 变换，其所有
+  attention config 都派生自 `VarlenAttention.Config`，pinned decoder 在 CP>1 时于配置阶段报错，层不会静默读到
+  本 rank 不持有的全局 layout。
 - **V4 的 LI provider 随 metadata 走**（provider config 是该 metadata 上的字段）：只带扁平几何时，量化 LI +
   CP/batch-chunk 的重新切分会静默产出 BF16 记录。
 - **本仓无 NPU**：A/B 的等价性依据是逐字段比对（同 frames 输入、同算子参数与顺序、同报错文本）与 CPU UT，数值结论待设备
@@ -136,12 +138,13 @@ CP 变换落在模型的 `Decoder._cp_shard`（与上游同名同职责；0.3.0 
 
 | 文件内容 | 性质 | 退出条件 |
 | --- | --- | --- |
-| `_varlen_from_masks` + `patched_cp_shard` | pinned `cp_shard` 不处理 varlen mask | **qwen3.5 迁到接缝之后**。三个 DeepSeek 栈不再往 `extra_kwargs` 放 `attention_masks`（V3.2+asc+CP 下该函数等价于 `original_cp_shard`，只做输入切分；!1099 起它另外承载本仓自己的布局 balancer `doc_chunk`，rank-local metadata 仍由 `_cp_shard` → `prepare_cp_metadata_map` → 各栈 **backend 类**的 `prepare_cp_metadata` 产生），只剩 qwen3.5 的兜底 `get_attention_masks()` 产出 `VarlenMetadata`，由 varlen 分支改写成 `CPVarlenMetadata` 供它的掩码适配器读 `k_global_gather_indices` |
+| `patched_cp_shard` 的 doc-chunk 布局 balancer | 仓库自有布局：rank `r` 的窗口是每篇文档的第 `r` 段；rank-local metadata 由各栈自己的 `prepare_cp_metadata` 或整行边界重建，shard 只切张量 | 上游 `cp_shard` 提供布局注册点，或 doc-chunk 布局并入上游后删除 |
 | `apply()` 里的 `_compiled_create_block_mask` eager 改写 | **NPU 运行时约束**：torch CP helper 内部惰性 `torch.compile(create_block_mask)`（`torch/distributed/tensor/experimental/_context_parallel/_attention.py`）会起 worker 进程、无法再初始化 NPU，「CP + BlockMask」路径必须换成 eager | 搬到 **`patches/torch_npu/`**（它改的是 torch 内部符号，不属于 torchtitan 的 CP 语义补丁；`extensions/torchtitan/eager_flex.py` 里那份改写的是另一个同名符号 `torchtitan.models.common.attention._compiled_create_block_mask`，两者不重复），或等 torch/torch_npu 不再用 worker 进程建 mask |
 
-两个条件都满足后该文件整体删除。`varlen_cp.py` 的 `CPVarlenMetadata`/`from_global` **不随之删**：它现在只剩 V3.2 的
-map 路径在用（V4 在 !1099 之后与 V4.1 共用 doc-chunk 布局、由整行边界重建 metadata，不再走 `from_global`，见
-`./2026-10-28-doc-chunk-layout.md`）。V3.2 的 CP 仍拒绝，`from_global` 随上游 #5071 或 V3.2 同样迁到 doc-chunk 一起退场。
+DeepSeek-V3.2 的 varlen-CP backport（`patched_cp_shard` 的 varlen 分支、参考核与 AscendC entry 的
+`prepare_cp_metadata`）已整体删除：该栈不再支持 CP，pinned decoder 在配置阶段就拒绝 CP>1，不需要第二道 rank-local
+守卫。qwen3.5 的 rank-local 转换仍在其自己的 `override/qwen3_5/parallelize.py` 钩子里（`QwenCPMetadata`），不经过
+这条分支。
 
 qwen3.5 那一步的核对点：它的 inner attention 要声明 `build_attention_metadata`（+ 需要的 geometry key），并把 rank-local
 转换从 forward 的掩码适配器挪进自己的 `prepare_cp_metadata`。这条路径**参与数值**，删前须做 NPU CP=1/CP=2 对齐。

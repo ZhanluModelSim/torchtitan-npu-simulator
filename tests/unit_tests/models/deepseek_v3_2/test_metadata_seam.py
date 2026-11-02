@@ -9,18 +9,20 @@ The stack used to build one mask object in ``DeepSeekV32Model`` and post-process
 it through a ``metadata_extension``.  Now every attention backend declares what
 it consumes (upstream #4897's ``build_attention_metadata``): the reference core
 names the packed layout it reads, the AscendC override wraps that layout with the
-host length lists its TND kernels take, and the decoder builds one entry per
-backend for the whole microbatch.  These tests pin that sharing, the CP half the
-AscendC entry derives for itself, and the reference core's refusal to be sharded.
+host length list its TND kernels take, and the decoder builds one entry per
+backend for the whole microbatch.  These tests pin that sharing and the AscendC
+entry's host length list.
 """
 
 from types import SimpleNamespace
 
 import pytest
 import torch
+from torchtitan.config import ParallelismConfig
+from torchtitan.models.common.attention import VarlenMetadata
+from torchtitan.models.common.decoder import Decoder
 
 import torchtitan_npu  # noqa: F401  imported for its patch chain: the seam under test
-from torchtitan.models.common.attention import VarlenMetadata
 from torchtitan_npu.models.deepseek_v3_2 import (
     ComplexRoPE,
     DeepSeekV32Model,
@@ -30,36 +32,16 @@ from torchtitan_npu.models.deepseek_v3_2 import (
     _build_dsv3_2_layers,
 )
 from torchtitan_npu.models.deepseek_v3_2 import model as v32_model
-from torchtitan_npu.models.deepseek_v3_2.model import ReferenceVarlenMetadata, SparseInnerAttention
-from torchtitan_npu.override.deepseek_v3_2.sparse_attn import asc
+from torchtitan_npu.models.deepseek_v3_2.model import SparseInnerAttention
+from torchtitan_npu.override.deepseek_v3_2.sparse_attn import asc, ascendc
 from torchtitan_npu.override.deepseek_v3_2.sparse_attn.ascendc import AscSparseInnerAttention, AscVarlenMetadata
-from torchtitan_npu.patches.torchtitan.distributed.varlen_cp import CPVarlenMetadata
-from torchtitan_npu.patches.torchtitan.models.common.attention_metadata import cp_shard_context_set
 
-# Two documents of four tokens in one packed row: the headtail load balancer
-# needs a sequence length divisible by ``2 * cp`` for the two-rank case below.
+# Two documents of four tokens in one packed row.
 _POSITIONS = torch.tensor([0, 1, 2, 3, 0, 1, 2, 3])
 _SEQ_LEN = 8
 _CU_SEQ = [0, 4, 8]
 _NO_CP_DIMS = SimpleNamespace(cp_enabled=False, get_mesh=lambda name: None)
 _NO_SPMD = SimpleNamespace(spmd_backend="partial_dtensor")
-
-
-class _FakeCPMesh:
-    """The 1-D mesh contract ``CPVarlenMetadata.from_global`` reads."""
-
-    ndim = 1
-    device_type = "cpu"
-
-    def __init__(self, rank: int, world_size: int):
-        self._rank = rank
-        self._world_size = world_size
-
-    def size(self, dim: int | None = None) -> int:
-        return self._world_size
-
-    def get_local_rank(self) -> int:
-        return self._rank
 
 
 def _model_config(n_layers: int = 3, *, ascendc: bool = False) -> DeepSeekV32Model.Config:
@@ -104,7 +86,11 @@ def _model_config(n_layers: int = 3, *, ascendc: bool = False) -> DeepSeekV32Mod
 
 @pytest.fixture
 def builds(monkeypatch) -> list:
-    """Record every packed-layout build, whichever backend asked for one."""
+    """Record every packed-layout build, whichever backend asked for one.
+
+    Both backends capture ``create_varlen_metadata_for_document`` in their own
+    module namespace, so the counter is installed in each of the two.
+    """
     recorded: list = []
     build = v32_model.create_varlen_metadata_for_document
 
@@ -113,6 +99,7 @@ def builds(monkeypatch) -> list:
         return build(positions)
 
     monkeypatch.setattr(v32_model, "create_varlen_metadata_for_document", counting_build)
+    monkeypatch.setattr(ascendc, "create_varlen_metadata_for_document", counting_build)
     return recorded
 
 
@@ -125,7 +112,7 @@ def test_the_decoder_builds_one_entry_for_the_whole_stack(builds):
     assert len(builds) == 1
     assert set(attention_metadata) == {SparseInnerAttention}
     entry = attention_metadata[SparseInnerAttention]
-    assert isinstance(entry, ReferenceVarlenMetadata)
+    assert isinstance(entry, VarlenMetadata)
     assert entry.cu_seq_q.tolist() == _CU_SEQ
     # Every layer dispatches by the key the one entry is stored under.
     keys = {layer.attention.attention_metadata_key for layer in model.layers.values()}
@@ -151,8 +138,30 @@ def test_preprocess_inputs_hands_the_map_to_the_forward():
     assert "attention_masks" not in extra_kwargs
 
 
+def test_decoder_update_from_config_refuses_context_parallel():
+    """The decoder guard the V3.2 config delegates to refuses CP for these cores.
+
+    This is the guard the retired rank-local hook used to supplement: it runs at
+    configuration time, before any layer could read a global varlen layout.  The
+    test calls the decoder contract directly so it does not depend on the
+    deferred pre-fold ``DeepSeekV32Model.Config.update_from_config`` rope step.
+    """
+    config = _model_config(n_layers=1)
+
+    with pytest.raises(NotImplementedError, match="Context Parallel is not supported"):
+        Decoder.Config.update_from_config(
+            config,
+            config=SimpleNamespace(
+                parallelism=ParallelismConfig(
+                    context_parallel_degree=2,
+                    spmd_backend="spmd_types",
+                ),
+            ),
+        )
+
+
 def test_the_ascendc_backend_owns_the_tnd_metadata(builds):
-    """The fused backend wraps the shared layout with its host length lists."""
+    """The fused backend wraps the shared layout with its host length list."""
     model = _model_config(n_layers=3, ascendc=True).build()
 
     attention_metadata = model._get_attention_metadata(_POSITIONS)
@@ -162,54 +171,10 @@ def test_the_ascendc_backend_owns_the_tnd_metadata(builds):
     entry = attention_metadata[AscSparseInnerAttention]
     assert isinstance(entry, AscVarlenMetadata)
     # The TND kernels take the cumulative end offsets on host, not the device
-    # tensor they were read from.
-    assert entry.actual_seq_qlen == _CU_SEQ[1:]
-    assert entry.actual_seq_klen == _CU_SEQ[1:]
+    # tensor they were read from.  One list serves the q and k kernel arguments
+    # because the builder hands both offset tensors the same packed layout.
+    assert entry.actual_seq_lengths == _CU_SEQ[1:]
     assert isinstance(entry.varlen_meta, VarlenMetadata)
     assert entry.varlen_meta.cu_seq_q.tolist() == _CU_SEQ
+    assert entry.varlen_meta.cu_seq_k.tolist() == _CU_SEQ
     assert {layer.attention.attention_metadata_key for layer in model.layers.values()} == {AscSparseInnerAttention}
-
-
-def test_the_ascendc_entry_prepares_this_ranks_copy_for_context_parallel():
-    """Under CP the entry re-reads its host lists from the rank-local offsets."""
-    global_entry = AscVarlenMetadata.from_varlen(v32_model.build_reference_varlen_metadata(_POSITIONS))
-    assert global_entry.actual_seq_qlen == _CU_SEQ[1:]
-
-    locals_per_rank = [_prepare_for_rank(AscVarlenMetadata, global_entry, rank) for rank in range(2)]
-
-    for entry in locals_per_rank:
-        assert isinstance(entry.varlen_meta, CPVarlenMetadata)
-        # Each rank holds half the row, and its host lists describe that half:
-        # the offsets are this rank's own, not the global row's.
-        assert entry.actual_seq_qlen == entry.varlen_meta.cu_seq_q[1:].cpu().tolist()
-        assert entry.actual_seq_qlen[-1] == _SEQ_LEN // 2
-        assert entry.actual_seq_qlen != global_entry.actual_seq_qlen
-        assert entry.varlen_meta.k_global_gather_indices.numel() > 0
-
-    # The two ranks' segments differ: the copy really is rank-local.
-    assert locals_per_rank[0].varlen_meta.k_global_gather_indices.tolist() != (
-        locals_per_rank[1].varlen_meta.k_global_gather_indices.tolist()
-    )
-
-
-def test_the_reference_core_refuses_context_parallel_while_preparing():
-    """A stack that cannot be sharded says so during preparation, not later."""
-    entry = v32_model.build_reference_varlen_metadata(_POSITIONS)
-
-    with pytest.raises(ValueError, match="not context-parallel"):
-        _prepare_for_rank(ReferenceVarlenMetadata, entry, 0)
-
-
-def _prepare_for_rank(metadata_type, attention_metadata, rank: int):
-    """Run one metadata type's CP transform the way ``Decoder._cp_shard`` does.
-
-    The transform takes the permutation alone (upstream #4617); what it cannot
-    recover -- the mesh, the load-balancer type and the *pre-shard* positions --
-    comes from the context the patched shard publishes around the call.
-    """
-    with cp_shard_context_set(
-        cp_mesh=_FakeCPMesh(rank, 2),
-        load_balancer_type="headtail",
-        positions=_POSITIONS,
-    ):
-        return metadata_type.prepare_cp_metadata(attention_metadata, permutation=None)

@@ -17,20 +17,13 @@ from dataclasses import dataclass
 import spmd_types as spmd
 import torch
 import torch_npu
-from torch.distributed.tensor.experimental._attention import _HeadTailLoadBalancer
 from torchtitan.models.common.attention import (
     VarlenAttention,
     VarlenMetadata,
+    create_varlen_metadata_for_document,
 )
 
-from torchtitan_npu.models.deepseek_v3_2.model import (
-    SparseIndexerLoss,
-    build_reference_varlen_metadata,
-)
-from torchtitan_npu.patches.torchtitan.distributed.varlen_cp import CPVarlenMetadata
-from torchtitan_npu.patches.torchtitan.models.common.attention_metadata import (
-    cp_shard_context,
-)
+from torchtitan_npu.models.deepseek_v3_2.model import SparseIndexerLoss
 from torchtitan_npu.patches.torchtitan.models.common.aux_loss import AuxLoss
 
 
@@ -237,13 +230,14 @@ class AscSparseInnerAttention(VarlenAttention):
         ) -> AscVarlenMetadata:
             """The TND metadata this backend consumes (upstream #4897).
 
-            The packed layout comes from the reference core's builder -- the
-            fused path reads the same documents -- and the host length lists the
-            TND kernels take are read here: once per microbatch for every layer
-            of this geometry, instead of once per layer.
+            The packed layout comes from the same upstream factory the
+            reference core uses -- the fused path reads the same documents --
+            and the host length list the TND kernels take is read here: once
+            per microbatch for every layer of this geometry, instead of once
+            per layer.
             """
             del padding_mask, max_num_documents, max_context_length
-            return AscVarlenMetadata.from_varlen(build_reference_varlen_metadata(positions))
+            return AscVarlenMetadata.from_varlen(create_varlen_metadata_for_document(positions))
 
     def __init__(self, config: Config) -> None:
         super().__init__(config)
@@ -278,12 +272,6 @@ class AscSparseInnerAttention(VarlenAttention):
         idx_w_TN = idx_w_BLN.reshape(T_q, N2)
 
         varlen_meta = attention_masks.varlen_meta
-        if isinstance(varlen_meta, CPVarlenMetadata):
-            gather = varlen_meta.k_global_gather_indices
-            k_nope_T1H = k_nope_T1H.index_select(0, gather)
-            k_rope_T1H = k_rope_T1H.index_select(0, gather)
-            idx_k_T1H = idx_k_T1H.index_select(0, gather)
-
         cu_seq_q_1 = varlen_meta.cu_seq_q[1:]
         cu_seq_k_1 = varlen_meta.cu_seq_k[1:]
 
@@ -330,8 +318,8 @@ class AscSparseInnerAttention(VarlenAttention):
                 scale,
                 q_rope_TNH,
                 k_rope_T1H,
-                attention_masks.actual_seq_qlen,
-                attention_masks.actual_seq_klen,
+                attention_masks.actual_seq_lengths,
+                attention_masks.actual_seq_lengths,
                 carrier=output_TNH,
             )
 
@@ -347,57 +335,24 @@ class AscSparseInnerAttention(VarlenAttention):
 class AscVarlenMetadata:
     """Varlen metadata with the host offsets the TND kernels require.
 
-    ``actual_seq_qlen``/``actual_seq_klen`` are the CANN ``actual_seq_lengths``
-    form of the packed layout -- the cumulative end offsets, not per-segment
-    lengths -- read off the device once per batch and kept next to the tensor
-    they came from, so a rank's copy is re-read in one transfer.
+    ``actual_seq_lengths`` is the CANN ``actual_seq_lengths`` form of the packed
+    layout -- the cumulative end offsets, not per-segment lengths -- read off the
+    device once per batch and kept next to the tensor it came from, so the host
+    list is read in one transfer.  One list serves both the query and the key
+    kernel argument: ``create_varlen_metadata_for_document`` hands the same
+    packed offsets to ``cu_seq_q`` and ``cu_seq_k``.
     """
 
-    varlen_meta: VarlenMetadata | CPVarlenMetadata
-    actual_seq_qlen: list[int]
-    actual_seq_klen: list[int]
-
-    @staticmethod
-    def prepare_cp_metadata(attention_metadata, *, permutation):
-        """This rank's copy of the packed layout (upstream #4617's CP half).
-
-        The global documents are re-cut for the load-balancer permutation, so the host
-        length lists are re-read from the rank-local offsets: the TND kernels receive
-        exactly the segments this rank runs.  The hook lives here, on the layout it
-        rebuilds, rather than on the backend that produced it.
-
-        The balancer is rebuilt here rather than received, because 0.3.0's CP entry takes
-        its *type* and builds the object internally; anything but ``headtail`` means that
-        entry sharded with no permutation, so this derivation passes no balancer either and
-        stays in step with the shard.  An unusable type never reaches here: the pinned entry
-        rejects it first (``ptrr`` included, since the map path hands it no masks).
-        """
-        del permutation
-        context = cp_shard_context()
-        if context.cp_mesh is None or context.positions is None:
-            raise ValueError("prepare_cp_metadata needs the CP mesh and the pre-shard positions")
-        batch_size, seq_len = context.positions.shape
-        return AscVarlenMetadata.from_varlen(
-            CPVarlenMetadata.from_global(
-                attention_metadata.varlen_meta,
-                context.cp_mesh,
-                batch_size,
-                seq_len,
-                load_balancer=(
-                    _HeadTailLoadBalancer(seq_len, context.cp_mesh.size(0), context.cp_mesh.device_type)
-                    if context.load_balancer_type == "headtail"
-                    else None
-                ),
-            )
-        )
+    varlen_meta: VarlenMetadata
+    actual_seq_lengths: list[int]
 
     @classmethod
-    def from_varlen(cls, varlen_meta: VarlenMetadata | CPVarlenMetadata) -> AscVarlenMetadata:
-        """Read both host offset lists of a packed layout in one transfer."""
-        cu_q, cu_k = varlen_meta.cu_seq_q, varlen_meta.cu_seq_k
-        actual_seq_qlen, actual_seq_klen = torch.stack([cu_q[1:], cu_k[1:]]).cpu().tolist()
+    def from_varlen(cls, varlen_meta: VarlenMetadata) -> AscVarlenMetadata:
+        """Read the host offset list of a packed layout in one transfer."""
+        # ``cu_seq_q`` is read alone because the pinned upstream factory assigns
+        # the identical ``packed_cu_seqlens`` tensor to ``cu_seq_q`` and ``cu_seq_k``.
+        actual_seq_lengths = varlen_meta.cu_seq_q[1:].cpu().tolist()
         return cls(
             varlen_meta=varlen_meta,
-            actual_seq_qlen=actual_seq_qlen,
-            actual_seq_klen=actual_seq_klen,
+            actual_seq_lengths=actual_seq_lengths,
         )

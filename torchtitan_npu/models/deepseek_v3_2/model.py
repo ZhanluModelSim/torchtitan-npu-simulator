@@ -33,53 +33,8 @@ from torchtitan.models.deepseek_v3.mtp import MTPDecoder
 from torchtitan.protocols.module import Module
 
 from torchtitan_npu.models.common.document_intervals import document_intervals
-from torchtitan_npu.patches.torchtitan.distributed.varlen_cp import CPVarlenMetadata
 from torchtitan_npu.patches.torchtitan.models.common.aux_loss import AuxLoss
 from torchtitan_npu.patches.torchtitan.models.common.linear import BatchedLinear
-
-# The two forms of the packed offsets the reference core reads: the row's own documents, and
-# the rank-local segments the context-parallel transform derives from them.  They are not
-# related by inheritance, but they carry the same two offset tensors.
-AttentionMetadata = VarlenMetadata | CPVarlenMetadata
-
-_REFERENCE_CP_UNSUPPORTED = (
-    "the DeepSeek-V3.2 reference core is not context-parallel: attn-gym's indexer "
-    "selects a query's prefix of its own document, while a CP rank holds a "
-    "document's middle and needs the kernels' end-aligned causal range. Use the "
-    "AscendC override (override.deepseek_v3_2.sparse_attn.asc) under context "
-    "parallel."
-)
-
-
-class ReferenceVarlenMetadata(VarlenMetadata):
-    """The reference core's global packed layout, which context parallel cannot shard.
-
-    The refusal lives here, beside the layout it refuses (upstream #4617's hook, hosted
-    by the metadata rather than by the backend): a stack that cannot be sharded must say
-    so while the rank-local metadata is being prepared, or the layer would silently
-    attend to a global layout it does not hold.
-    """
-
-    @staticmethod
-    def prepare_cp_metadata(attention_metadata, *, permutation):
-        """Refuse context parallel while the rank-local metadata is prepared.
-
-        attn-gym's indexer selects a query's prefix of its own document, while a CP rank
-        holds a document's middle; the kernels need their end-aligned causal range, which
-        this core cannot express.
-        """
-        del attention_metadata, permutation
-        raise ValueError(_REFERENCE_CP_UNSUPPORTED)
-
-
-def build_reference_varlen_metadata(positions: torch.Tensor) -> ReferenceVarlenMetadata:
-    """The packed document layout both DeepSeek-V3.2 attention cores read.
-
-    Together with :class:`ReferenceVarlenMetadata` this is the whole metadata
-    contract of the reference core; the AscendC core reads the same documents
-    and wraps the result, so the two backends' builders share this one call.
-    """
-    return ReferenceVarlenMetadata(*create_varlen_metadata_for_document(positions))
 
 
 @functools.cache
@@ -152,7 +107,7 @@ class Indexer(Module):
         idx_q_BLNH: torch.Tensor,
         idx_k_BL1H: torch.Tensor,
         idx_w_BLN: torch.Tensor,
-        attention_masks: AttentionMetadata,
+        attention_masks: VarlenMetadata,
         index_topk: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """The top-k selection and the student's logits at the slots it picked.
@@ -263,7 +218,7 @@ class SparseIndexerLoss(AuxLoss):
         scale: float,
         topk_indices_BLqK: torch.Tensor,
         topk_scores_BLqK: torch.Tensor,
-        attention_masks: AttentionMetadata,
+        attention_masks: VarlenMetadata,
         *,
         carrier: torch.Tensor,
     ) -> torch.Tensor:
@@ -355,7 +310,7 @@ class SparseInnerAttention(VarlenAttention):
             padding_mask: torch.Tensor | None = None,
             max_num_documents: int | None = None,
             max_context_length: int | None = None,
-        ) -> ReferenceVarlenMetadata:
+        ) -> VarlenMetadata:
             """The packed document layout the reference core reads.
 
             Upstream #4897 makes the attention backend own this construction, so
@@ -363,7 +318,7 @@ class SparseInnerAttention(VarlenAttention):
             geometry shares it.
             """
             del padding_mask, max_num_documents, max_context_length
-            return build_reference_varlen_metadata(positions)
+            return create_varlen_metadata_for_document(positions)
 
     def __init__(self, config: Config):
         super().__init__(config)
@@ -380,11 +335,9 @@ class SparseInnerAttention(VarlenAttention):
         idx_k_BL1H: torch.Tensor,
         idx_w_BLN: torch.Tensor,
         *,
-        attention_masks: AttentionMetadata,
+        attention_masks: VarlenMetadata,
         scale: float,
     ) -> torch.Tensor:
-        if isinstance(attention_masks, CPVarlenMetadata):
-            raise ValueError(_REFERENCE_CP_UNSUPPORTED)
         q_BLNH = torch.cat([q_nope_BLNH, q_rope_BLNH], dim=-1)
         k_BL1H = torch.cat([k_nope_BL1H, k_rope_BL1H], dim=-1)
 
@@ -421,7 +374,7 @@ class SparseInnerAttention(VarlenAttention):
         q_BLNH: torch.Tensor,
         k_BL1H: torch.Tensor,
         topk_indices_BLqK: torch.Tensor,
-        attention_masks: AttentionMetadata,
+        attention_masks: VarlenMetadata,
         value_head_dim: int,
         scale: float,
     ) -> torch.Tensor:

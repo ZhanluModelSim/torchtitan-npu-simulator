@@ -63,8 +63,9 @@ pip install --no-deps attn-gym==0.0.16 spmd_types==0.2.5 \
 # Resolve Grain's own data-pipeline dependencies without changing the torch stack.
 pip install grain==0.2.18
 
-pip install --no-deps torchvision==0.30.0.dev20260918 \
-    --extra-index-url https://download.pytorch.org/whl/nightly/cpu
+pip install --no-deps torchvision==0.29.0+cpu \
+    --index-url https://download.pytorch.org/whl/cpu
+python -c 'import torch, torchvision; print(torch.__version__, torchvision.__version__)'
 
 python -c 'from torchtitan.distributed.context_parallel.api import cp_shard; print(cp_shard.__module__)'
 python -m pytest -v --tb=short tests/unit_tests

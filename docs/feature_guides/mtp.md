@@ -74,7 +74,7 @@ MTP 的 future-token shift 不能在 CP rank-local 序列上执行：局部移�
 
 这些张量在 `preprocess_inputs` 中先于基座切分、在全局行上构建；随后 `super().preprocess_inputs()` 完成 `inputs`/`labels`/`positions` 的切分，MTP 三个张量再用**同一把连续切片**单独 `cp_shard`（本地切片，无通信），保证 token、label 和 mask 与 `inputs` 在每个 rank 上严格同位。
 
-该流程只接入 DeepSeek-V4：继续复用已有压缩 metadata 和 CP plan 构造；MTP 张量的切分是独立的一次 `cp_shard` 调用，与 `inputs`/`labels`/`positions` 的切分使用同一把连续切片。DeepSeek-V3 和 DeepSeek-V3.2 保留社区 MTP 的原有限制，`context_parallel_degree > 1` 时在配置更新阶段报错；两者已有的非 MTP CP 路径不变。
+该流程只接入 DeepSeek-V4：继续复用已有压缩 metadata 和 CP plan 构造；MTP 张量的切分是独立的一次 `cp_shard` 调用，与 `inputs`/`labels`/`positions` 的切分使用同一把连续切片。DeepSeek-V3 和 DeepSeek-V3.2 保留社区 MTP 的原有限制，`context_parallel_degree > 1` 时在配置更新阶段报错；DeepSeek-V3.2 的 varlen attention 本身也不支持 CP，DeepSeek-V3 已有的非 MTP CP 路径不变。
 
 该处理与 Megatron-LM MTP 在 CP 边界交换 future token/label 的数学目标一致；区别是 TorchTitan 的模型 metadata hook 位于 CP 切分之前，因此可直接在全局序列上生成，再按和输入相同的连续切法单独切分，无需额外点对点通信。
 

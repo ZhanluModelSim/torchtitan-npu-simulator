@@ -92,13 +92,10 @@ _DEFERRED_VISION_TESTS = {
 
 
 # DeepSeek-V3.2 still forwards the pre-fold ``[B, L, ...]`` layout against the
-# folded pinned upstream. These two cross the unmigrated seams: the AscendC CP
-# entry's positions unpack and the decoder config's context-length knob. Match
-# the integration runner's dsv3_2 deferral until the folded-token migration lands.
+# folded pinned upstream. This test crosses the unmigrated seam: the decoder
+# config's context-length knob. Match the integration runner's dsv3_2 deferral
+# until the folded-token migration lands.
 _DEFERRED_DSV32_FOLD_TESTS = {
-    "models/deepseek_v3_2/test_metadata_seam.py": {
-        "test_the_ascendc_entry_prepares_this_ranks_copy_for_context_parallel",
-    },
     "models/test_mtp_cp_chunk_loss.py": {
         "test_dsv32_mtp_keeps_community_cp_restriction",
     },
@@ -317,12 +314,5 @@ def dsv4():
     ns.metadata = importlib.import_module("torchtitan_npu.models.deepseek_v4.metadata")
     ns.attention = importlib.import_module("torchtitan_npu.models.deepseek_v4.attention")
     ns.compressor = importlib.import_module("torchtitan_npu.models.deepseek_v4.compressor")
-    spec = importlib.util.spec_from_file_location(
-        "varlen_cp_backport",
-        _REPO / "torchtitan_npu" / "patches" / "torchtitan" / "distributed" / "varlen_cp.py",
-    )
-    varlen_cp = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(varlen_cp)
-    ns.CPVarlenMetadata = varlen_cp.CPVarlenMetadata
     ns.cann_ops = importlib.import_module("cann_ops_transformer")
     return ns

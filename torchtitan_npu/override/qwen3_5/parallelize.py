@@ -8,7 +8,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 
 import torch
-from torch.distributed.tensor import DTensor, Replicate, Shard
+from torch.distributed.tensor import DTensor, Shard
 from torchtitan.config import TORCH_DTYPE_MAP
 from torchtitan.distributed.compile import apply_compile
 from torchtitan.distributed.fsdp import (
@@ -190,42 +190,29 @@ def exchange_sequence_heads(tensors, mesh, head_dim):
     return packed.split([part[0].size(head_dim) for part in shards], head_dim)
 
 
-def build_sequence_metadata(varlen, mesh, batch, length):
+def build_sequence_metadata(varlen):
     cu = varlen.cu_seq_q
-    if hasattr(varlen, "k_global_gather_indices"):
-        reset = torch.zeros(batch * length, dtype=torch.bool, device=cu.device)
-        starts = cu[:-1].to(torch.long)
-        reset[starts[cu.diff() == varlen.cu_seq_k.diff()]] = True
-        reset = DTensor.from_local(reset.view(batch, length), mesh, (Shard(1),), run_check=False)
-        reset = reset.redistribute(placements=(Replicate(),)).to_local()
-        starts = reset.flatten().nonzero(as_tuple=False).flatten()
-        starts = starts[starts != 0]
-        cu = torch.cat((starts.new_zeros(1), starts, starts.new_tensor([reset.numel()])))
     cu = cu.to(torch.int64)
     cu_cpu = cu.cpu()
     return QwenCPMetadata(cu, cu_cpu, cu_cpu[1:])
 
 
-def _to_qwen_cp_metadata(mask, mesh, batch, length):
+def _to_qwen_cp_metadata(mask):
     if mask is None or isinstance(mask, QwenCPMetadata) or not hasattr(mask, "cu_seq_q"):
         return mask
-    return build_sequence_metadata(mask, mesh, batch, length)
+    return build_sequence_metadata(mask)
 
 
 def prepare_sequence_metadata(module, args, kwargs):
     masks = kwargs.get("attention_masks")
     if masks is None:
         return args, kwargs
-    mesh = module.context_parallel_mesh
-    batch, length = args[0].shape[:2]
     if isinstance(masks, dict):
         # Qwen3.5 hybrid attention passes one mask dict per consumer key;
-        # convert each varlen entry to rank-local QwenCPMetadata in place.
-        kwargs["attention_masks"] = {
-            key: _to_qwen_cp_metadata(value, mesh, batch, length) for key, value in masks.items()
-        }
+        # convert each varlen entry to QwenCPMetadata in place.
+        kwargs["attention_masks"] = {key: _to_qwen_cp_metadata(value) for key, value in masks.items()}
     elif not isinstance(masks, QwenCPMetadata):
-        kwargs["attention_masks"] = build_sequence_metadata(masks, mesh, batch, length)
+        kwargs["attention_masks"] = build_sequence_metadata(masks)
     return args, kwargs
 
 
