@@ -46,7 +46,7 @@ from tests.integration_tests.loss_compare import (
     log_print,
     read_losses_from_file,
 )
-from tests.integration_tests.qwen3_5 import build_qwen3_5_test_list
+from tests.integration_tests.qwen3_5 import build_qwen3_5_quantized_test_list, build_qwen3_5_test_list
 
 
 def build_models_test_list() -> list[OverrideDefinitions]:
@@ -99,6 +99,7 @@ _TEST_SUITES_FUNCTION = {
     "deepseek_v4_1_engram_hf": build_engram_hf_test_list,
     "deepseek_v4_1_engram_cp": build_engram_cp_test_list,
     "qwen3_5": build_qwen3_5_test_list,
+    "qwen3_5_quantized": build_qwen3_5_quantized_test_list,
 }
 
 # Held while a test writes its captured output so concurrent tests do not

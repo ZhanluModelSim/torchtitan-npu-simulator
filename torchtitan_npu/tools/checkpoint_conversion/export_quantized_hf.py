@@ -76,10 +76,35 @@ _DENSE_WEIGHT_SUFFIXES = (
     ".ffn.shared_experts.w2.weight",
     ".ffn.shared_experts.w3.weight",
 )
+_QWEN35_DENSE_WEIGHT_SUFFIXES = (
+    ".self_attn.q_proj.weight",
+    ".self_attn.k_proj.weight",
+    ".self_attn.v_proj.weight",
+    ".self_attn.o_proj.weight",
+    ".linear_attn.in_proj_qkv.weight",
+    ".linear_attn.in_proj_z.weight",
+    ".linear_attn.in_proj_a.weight",
+    ".linear_attn.in_proj_b.weight",
+    ".linear_attn.out_proj.weight",
+    ".mlp.gate_proj.weight",
+    ".mlp.up_proj.weight",
+    ".mlp.down_proj.weight",
+)
+_QWEN35_HF_PREFIXES = ("model.language_model.",)
 _ROUTED_WEIGHT_PATTERN = r".*\.ffn\.experts\.\d+\.w[123]\.weight"
 
 # The converter's own recipe list also carries all_hif8, which this tool cannot export.
-_SUPPORTED_RECIPES = ("all_mxfp8", "mix", "all_block_fp8")
+_QWEN35_RECIPES = ("W4A8_MXFP", "W8A8_MXFP8")
+_SUPPORTED_RECIPES = ("all_mxfp8", "mix", "all_block_fp8", *_QWEN35_RECIPES)
+
+
+def _validate_recipe_model(recipe: str, model_name: str) -> None:
+    """Reject recipe/model combinations that the training converter cannot build."""
+    model_family = model_name.rsplit(".", 1)[-1]
+    if recipe in _QWEN35_RECIPES and model_family != "qwen3_5":
+        raise ValueError(f"recipe {recipe!r} is only supported for Qwen3.5, got model {model_name!r}")
+    if model_family == "qwen3_5" and recipe not in _QWEN35_RECIPES:
+        raise ValueError(f"Qwen3.5 export recipe must be one of {_QWEN35_RECIPES}, got {recipe!r}")
 
 
 def build_recipe_plan(recipe: str, *, enable_mxfp4_qat: bool, dst_type_max: float = 0.0):
@@ -101,6 +126,18 @@ def build_recipe_plan(recipe: str, *, enable_mxfp4_qat: bool, dst_type_max: floa
 
     if recipe == "all_mxfp8":
         return [(mxfp8_param_swap(), any_filter(dense_filter, routed_filter))]
+    if recipe in _QWEN35_RECIPES:
+        swap_config = (
+            block_fp8_param_swap(enable_mxfp4_qat=True, dst_type_max=dst_type_max)
+            if recipe == "W4A8_MXFP"
+            else block_fp8_param_swap()
+        )
+        return [
+            (
+                swap_config,
+                match_fqn_suffix(*_QWEN35_DENSE_WEIGHT_SUFFIXES),
+            )
+        ]
 
     routed_config = block_fp8_param_swap(enable_mxfp4_qat=enable_mxfp4_qat, dst_type_max=dst_type_max)
     dense_config = mxfp8_param_swap() if recipe == "mix" else block_fp8_param_swap()
@@ -287,10 +324,12 @@ def _merge_routed_experts(hf_state_dict, quantized):
 def _to_in_memory_layout(hf_state_dict, quantized_fqns):
     """Move the recipe-quantized tensors to the transformers in-memory layout.
 
-    Routed experts are merged into the 3D ``experts.gate_up_proj`` (``w1`` | ``w3``)
-    and ``experts.down_proj``; dense weights are renamed to their in-memory FQNs
-    (the quantized loader rebuilds each param from the metadata under the
-    checkpoint's original key, so these must be the final names).
+    DeepSeek routed experts are merged into the 3D ``experts.gate_up_proj``
+    (``w1`` | ``w3``) and ``experts.down_proj``; Qwen3.5's adapter has already
+    emitted that HF layout, so its non-quantized experts pass through unchanged.
+    Dense weights are renamed to their in-memory FQNs (the quantized loader
+    rebuilds each param from the metadata under the checkpoint's original key,
+    so these must be the final names).
     Returns ``(state_dict, final fqn -> plan index)``.
     """
     out = {k: v for k, v in hf_state_dict.items() if k not in quantized_fqns}
@@ -306,7 +345,11 @@ def _to_in_memory_layout(hf_state_dict, quantized_fqns):
                 new_quantized[new_key] = idx
                 break
         else:
-            raise ValueError(f"quantized tensor {fqn!r} has no in-memory name mapping")
+            if fqn.startswith(_QWEN35_HF_PREFIXES) and fqn.endswith(_QWEN35_DENSE_WEIGHT_SUFFIXES):
+                out[fqn] = hf_state_dict[fqn]
+                new_quantized[fqn] = idx
+            else:
+                raise ValueError(f"quantized tensor {fqn!r} has no in-memory name mapping")
 
     merged, merged_plan = _merge_routed_experts(hf_state_dict, quantized_fqns)
     out.update(merged)
@@ -839,6 +882,7 @@ def export_quantized_hf(args: argparse.Namespace) -> None:
     max_shard_size = args.max_shard_size
     read_threads = args.read_threads
 
+    _validate_recipe_model(recipe, model_name)
     model, sd_adapter, model_config = _build_model_and_adapter(model_name, model_flavor, hf_assets_path)
     state_dict = _load_dcp_state_dict(model, input_dir, master_dtype, read_threads)
     logger.info("Loaded DCP checkpoint %s (%d tensors)", input_dir, len(state_dict))
@@ -919,7 +963,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--enable_mxfp4_qat",
         action="store_true",
-        help="Serve the block_fp8 recipe's routed-expert weights as MXFP4.",
+        help=(
+            "Serve routed-expert weights as MXFP4 for mix/all_block_fp8; "
+            "Qwen3.5 W4A8_MXFP enables MXFP4 for dense weights intrinsically."
+        ),
     )
     parser.add_argument("--dst_type_max", type=float, default=0.0)
     parser.add_argument(

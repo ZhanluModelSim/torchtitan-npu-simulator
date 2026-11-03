@@ -45,6 +45,7 @@ from .components.deepseek_v4 import (
 from .configs import (
     _DSV4_CONFIG_FILTERS,  # noqa: F401  (re-exported for tests)
     _DSV41_CONFIG_FILTERS,  # noqa: F401  (re-exported for tests)
+    _QWEN35_CONFIG_FILTERS,  # noqa: F401  (re-exported for tests)
     ModelType,  # noqa: F401  (re-exported for tests)
     _model_type_for_spec,
 )
@@ -223,7 +224,8 @@ def _validate_fsdp_prequantize_policy(
     if enable_fsdp_prequantize and not effective_fqns:
         raise ValueError(
             f"enable_fsdp_prequantize=True but recipe {recipe!r} pre-quantizes no "
-            "weight scope; use all_block_fp8 (or mix, which pre-quantizes routed experts only) "
+            "weight scope; use all_block_fp8, W4A8_MXFP/W8A8_MXFP8 (Qwen3.5 dense weights only), "
+            "or mix (routed experts only), "
             "or disable enable_fsdp_prequantize."
         )
     _check_prequantize_policy(built_converters, effective_fqns, strict=strict)

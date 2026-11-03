@@ -166,6 +166,22 @@ def _expert_fqns(layer, w, experts=range(_N_EXPERTS)):
 # =========================================================================
 
 
+@pytest.mark.parametrize("recipe", ["W4A8_MXFP", "W8A8_MXFP8"])
+def test_validate_recipe_model_accepts_qwen35_dense_recipes(export, recipe):
+    export._validate_recipe_model(recipe, "torchtitan.models.qwen3_5")
+
+
+@pytest.mark.parametrize("recipe", ["W4A8_MXFP", "W8A8_MXFP8"])
+def test_validate_recipe_model_rejects_qwen35_recipe_for_deepseek(export, recipe):
+    with pytest.raises(ValueError, match=r"only supported for Qwen3\.5"):
+        export._validate_recipe_model(recipe, "torchtitan_npu.models.deepseek_v4")
+
+
+def test_validate_recipe_model_rejects_deepseek_recipe_for_qwen35(export):
+    with pytest.raises(ValueError, match=r"Qwen3\.5 export recipe"):
+        export._validate_recipe_model("all_block_fp8", "qwen3_5")
+
+
 def test_build_recipe_plan_routes_recipes(export, monkeypatch):
     """Each recipe maps to the right ``(swap, filter)`` order; the mxfp4 flag reaches the routed entry."""
     filters = types.ModuleType("torchao_npu.quantization.filters")
@@ -177,7 +193,7 @@ def test_build_recipe_plan_routes_recipes(export, monkeypatch):
     # autouse torchao stub intentionally omits).
     tc = types.ModuleType("torchtitan_npu.extensions.adaptor.torchao.converter")
     tc.mxfp8_param_swap = lambda: "MX"
-    tc.block_fp8_param_swap = lambda **kw: ("BLOCK", tuple(sorted(kw)))
+    tc.block_fp8_param_swap = lambda **kw: ("BLOCK", tuple(sorted(kw.items())))
     sys.modules["torchao_npu.quantization"].filters = filters
     for name, mod in (
         ("torchao_npu.quantization.filters", filters),
@@ -190,10 +206,34 @@ def test_build_recipe_plan_routes_recipes(export, monkeypatch):
     assert p[0][1][0] == "any"
 
     p = export.build_recipe_plan("mix", enable_mxfp4_qat=True, dst_type_max=5.0)
-    assert [cfg for cfg, _ in p] == ["MX", ("BLOCK", ("dst_type_max", "enable_mxfp4_qat"))]
+    assert [cfg for cfg, _ in p] == [
+        "MX",
+        ("BLOCK", (("dst_type_max", 5.0), ("enable_mxfp4_qat", True))),
+    ]
 
     p = export.build_recipe_plan("all_block_fp8", enable_mxfp4_qat=False)
-    assert [cfg for cfg, _ in p] == [("BLOCK", ()), ("BLOCK", ("dst_type_max", "enable_mxfp4_qat"))]
+    assert [cfg for cfg, _ in p] == [
+        ("BLOCK", ()),
+        ("BLOCK", (("dst_type_max", 0.0), ("enable_mxfp4_qat", False))),
+    ]
+
+    p = export.build_recipe_plan("W4A8_MXFP", enable_mxfp4_qat=False, dst_type_max=7.0)
+    assert [cfg for cfg, _ in p] == [
+        ("BLOCK", (("dst_type_max", 7.0), ("enable_mxfp4_qat", True))),
+    ]
+    assert p[0][1][0] == "suffix"
+    assert ".self_attn.q_proj.weight" in p[0][1]
+    assert ".attn.wq_a.weight" not in p[0][1]
+    assert ".attn.qkv.weight" not in p[0][1]
+    assert ".merger.linear_fc1.weight" not in p[0][1]
+
+    p = export.build_recipe_plan("W8A8_MXFP8", enable_mxfp4_qat=True, dst_type_max=7.0)
+    assert [cfg for cfg, _ in p] == [("BLOCK", ())]
+    assert p[0][1][0] == "suffix"
+    assert ".self_attn.q_proj.weight" in p[0][1]
+    assert ".attn.wq_a.weight" not in p[0][1]
+    assert ".attn.qkv.weight" not in p[0][1]
+    assert ".merger.linear_fc1.weight" not in p[0][1]
 
     with pytest.raises(ValueError, match="recipe must be one of"):
         export.build_recipe_plan("nope", enable_mxfp4_qat=False)
@@ -239,6 +279,23 @@ def test_quantize_state_dict_first_matching_plan_entry_wins(export, monkeypatch)
 
     assert quantized == {"x.w": 0}
     assert out["x.w"] == "Q<broad>"
+
+
+def test_qwen35_quantized_fqn_is_already_in_memory_layout(export):
+    fqn = "model.language_model.layers.0.self_attn.q_proj.weight"
+    tensor = torch.randn(2, 2)
+
+    out, quantized = export._to_in_memory_layout({fqn: tensor}, {fqn: 0})
+
+    assert out[fqn] is tensor
+    assert quantized == {fqn: 0}
+
+
+def test_qwen35_unknown_quantized_fqn_is_rejected(export):
+    fqn = "model.language_model.layers.0.mlp.experts.gate_up_proj"
+
+    with pytest.raises(ValueError, match="has no in-memory name mapping"):
+        export._to_in_memory_layout({fqn: torch.randn(2, 2)}, {fqn: 0})
 
 
 # =========================================================================
@@ -387,6 +444,23 @@ def test_to_in_memory_layout_merges_experts_and_preserves_plain(export):
         "model.layers.5.mlp.experts.gate_up_proj",
         "model.layers.5.mlp.experts.down_proj",
     }
+
+
+def test_to_in_memory_layout_preserves_qwen35_plain_experts(export):
+    """Qwen3.5's adapter already emits merged HF experts; dense-only recipes must preserve them."""
+    gate_up = torch.randn(_N_EXPERTS, _K, 2 * _N)
+    down = torch.randn(_N_EXPERTS, _M, _K)
+    sd = {
+        "model.language_model.layers.5.mlp.experts.gate_up_proj": gate_up,
+        "model.language_model.layers.5.mlp.experts.down_proj": down,
+    }
+
+    out, new_quantized = export._to_in_memory_layout(sd, {})
+
+    assert set(out) == set(sd)
+    assert out["model.language_model.layers.5.mlp.experts.gate_up_proj"] is gate_up
+    assert out["model.language_model.layers.5.mlp.experts.down_proj"] is down
+    assert new_quantized == {}
 
 
 def test_to_in_memory_layout_rejects_unmapped_quantized(export):

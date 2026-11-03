@@ -198,7 +198,7 @@ def _v4_attention_numbers(model_config) -> dict[str, int]:
     }
 
 
-@component("lightning_indexer", models=(ModelType.V4,))
+@component("lightning_indexer", models=(ModelType.DSV4,))
 class DeepSeekV4QuantLightningIndexerComponent(QuantComponent):
     """DeepSeek-V4 Lightning-Indexer Q/K quantization."""
 
@@ -227,7 +227,7 @@ class DeepSeekV4QuantLightningIndexerComponent(QuantComponent):
         ]
 
 
-@component("v4_sparse_attention", models=(ModelType.V4,))
+@component("v4_sparse_attention", models=(ModelType.DSV4,))
 class DeepSeekV4QuantSparseAttentionComponent(QuantComponent):
     """Install the quantized V4 sparse-attention backend that carries the LI records.
 
@@ -288,7 +288,7 @@ class DeepSeekV4QuantSparseAttentionComponent(QuantComponent):
         ]
 
 
-@component("kv_norm", models=(ModelType.V4,))
+@component("kv_norm", models=(ModelType.DSV4,))
 class KVNormComponent(QuantComponent):
     """Fake-quantizes a model's KV norms (declared via target FQNs). Opt-in per model."""
 

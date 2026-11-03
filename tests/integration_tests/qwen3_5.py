@@ -62,3 +62,35 @@ def build_qwen3_5_test_list() -> list[OverrideDefinitions]:
             extra_args=common,
         ),
     ]
+
+
+def build_qwen3_5_quantized_test_list() -> list[OverrideDefinitions]:
+    """Return the opt-in Qwen3.5 dense quantization smoke cases."""
+    return [
+        _build_case(
+            test_name="qwen3_5_w4a8_mxfp_1rank",
+            test_descr="Qwen3.5 debug model W4A8_MXFP 1rank",
+            ngpu=1,
+            extra_args=(
+                "--training.steps=1",
+                "--training.local-batch-size=1",
+                "--training.global-batch-size=1",
+                "--training.seq-len=512",
+                "--extension.quantization.enable-quantized-training",
+                "--extension.quantization.recipe=W4A8_MXFP",
+            ),
+        ),
+        _build_case(
+            test_name="qwen3_5_w8a8_mxfp8_1rank",
+            test_descr="Qwen3.5 debug model W8A8_MXFP8 1rank",
+            ngpu=1,
+            extra_args=(
+                "--training.steps=1",
+                "--training.local-batch-size=1",
+                "--training.global-batch-size=1",
+                "--training.seq-len=512",
+                "--extension.quantization.enable-quantized-training",
+                "--extension.quantization.recipe=W8A8_MXFP8",
+            ),
+        ),
+    ]

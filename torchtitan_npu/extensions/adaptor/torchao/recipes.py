@@ -72,7 +72,14 @@ class FilterSpec(TypedDict):
     suffixes: tuple[str, ...]
 
 
-_SUPPORTED_RECIPES = ("all_mxfp8", "all_hif8", "mix", "all_block_fp8")
+_SUPPORTED_RECIPES = (
+    "all_mxfp8",
+    "all_hif8",
+    "mix",
+    "all_block_fp8",
+    "W4A8_MXFP",
+    "W8A8_MXFP8",
+)
 
 
 _npu_quantized_module_cache: dict[type[Module], type[Module]] = {}
@@ -350,7 +357,13 @@ def _recipe_converters(
 
     recipe_spec_func = model_quant_config.recipe_matrix.get(recipe)
     if recipe_spec_func is None:
-        raise ValueError(f"recipe must be one of {_SUPPORTED_RECIPES}, got {recipe!r}")
+        supported = tuple(model_quant_config.recipe_matrix)
+        raise ValueError(f"recipe for model {model_type.value!r} must be one of {supported}, got {recipe!r}")
+    if recipe in ("W4A8_MXFP", "W8A8_MXFP8") and enable_fsdp_prequantize and fsdp_prequantize_dtype == "mxfp4":
+        raise ValueError(
+            f"Qwen3.5 recipe {recipe} supports only FP8 FSDP-prequantized dense weights; "
+            "remove --extension.quantization.fsdp-prequantize-dtype mxfp4 or set it to fp8"
+        )
     param_swap_specs = recipe_spec_func(filters, ctx)
 
     def _scope_fqns(param_swap_spec: ParamSwapSpec) -> tuple[str, ...] | None:

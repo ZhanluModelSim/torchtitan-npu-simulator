@@ -52,6 +52,7 @@ python -m tests.integration_tests.run_tests \
 * **`deepseek_v4_1_golden`**：DeepSeek-V4.1 golden 用例，30 步参考 Loss 逐值比对；同时纳入默认 `models` suite；
 * **`deepseek_v4_1_fused`**：DeepSeek-V4.1 多模态打包/融合与 Muon 冒烟，需 vision fixture，单独运行；
 * **`deepseek_v4_1_engram_hf`**：DeepSeek-V4.1 Engram MXFP8 专项校验与 DCP/HF 权重回环测试。
+* **`qwen3_5_quantized`**：Qwen3.5 dense `W4A8_MXFP`/`W8A8_MXFP8` 量化训练冒烟，需支持的 A5 设备、运行时和 TorchAO-NPU。
 
 #### 核心用例清单矩阵
 
@@ -118,6 +119,21 @@ python -m tests.integration_tests.run_tests \
     --test_suite deepseek_v4_quantized \
     --test_name dsv4_lora_block_fp8_ep2_fsdp2 \
     --ngpu 2
+  ```
+
+* **Qwen3.5 `W4A8_MXFP`/`W8A8_MXFP8` 量化场景 (`qwen3_5_quantized`)**：
+  ```bash
+  pip install ./experiments/torchao-npu
+
+  python -m tests.integration_tests.run_tests ./test_reports/qwen35-w4a8-mxfp \
+    --test_suite qwen3_5_quantized \
+    --test_name qwen3_5_w4a8_mxfp_1rank \
+    --ngpu 1
+
+  python -m tests.integration_tests.run_tests ./test_reports/qwen35-w8a8-mxfp8 \
+    --test_suite qwen3_5_quantized \
+    --test_name qwen3_5_w8a8_mxfp8_1rank \
+    --ngpu 1
   ```
 
 * **Engram HF 专项验证（超节点）**：

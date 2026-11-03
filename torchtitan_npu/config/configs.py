@@ -14,7 +14,14 @@ from torchtitan.components.optimizer import OptimizersContainer, ParamGroupConfi
 from torchtitan.config import TrainingConfig as _BaseTrainingConfig
 from torchtitan.tools.profiler import Profiler as _BaseProfiler
 
-QuantizationRecipe = Literal["all_mxfp8", "all_hif8", "mix", "all_block_fp8"]
+QuantizationRecipe = Literal[
+    "all_mxfp8",
+    "all_hif8",
+    "mix",
+    "all_block_fp8",
+    "W4A8_MXFP",
+    "W8A8_MXFP8",
+]
 LIQuantization = Literal["mxfp4", "mxfp8", "fp8", "hif8"]
 KVNormQuantization = Literal["mxfp8"]
 
@@ -151,6 +158,10 @@ class QuantizationExtensionConfig:
     enable_sparse_attention_quantization: bool = False
     recipe: QuantizationRecipe = "all_block_fp8"
     enable_mxfp4_qat: bool = False
+    """Enable MXFP4 fake quant for DeepSeek routed experts in ``mix`` and
+    ``all_block_fp8``. Qwen3.5 ``W4A8_MXFP`` enables it intrinsically for dense
+    weights and does not require this switch.
+    """
     li_quantization: LIQuantization | None = None
     """LI Q/K format.
 
@@ -160,10 +171,12 @@ class QuantizationExtensionConfig:
     dst_type_max: float = 0.0
     enable_fsdp_prequantize: bool = False
     fsdp_prequantize_dtype: Literal["fp8", "mxfp4"] = "fp8"
-    """Routed-expert communication format when FSDP prequantization is enabled.
+    """Communication format for FSDP-prequantized routed experts.
 
-    MXFP4 requires MXFP4 QAT. Selected dense weights retain FP8 communication
-    under the ``all_block_fp8`` recipe.
+    ``mxfp4`` requires MXFP4 QAT and only applies to DeepSeek routed experts.
+    Selected dense weights retain FP8 communication under DeepSeek
+    ``all_block_fp8`` and Qwen3.5 ``W4A8_MXFP``/``W8A8_MXFP8``; selecting ``mxfp4`` for a
+    Qwen3.5 dense-model recipe is rejected when ``mxfp4`` is selected.
     """
     fsdp_prequantize_fqns: list[str] | None = None
     """FQN suffix patterns that ENABLE FSDP pre-quantize, only meaningful with

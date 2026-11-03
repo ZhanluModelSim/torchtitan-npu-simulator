@@ -35,7 +35,7 @@ if TYPE_CHECKING:
     from ..recipes import RecipeContext
 
 
-@component("lightning_indexer", models=(ModelType.V4_1,))
+@component("lightning_indexer", models=(ModelType.DSV4_1,))
 class DeepSeekV41QuantLightningIndexerComponent(QuantComponent):
     """DeepSeek-V4.1 Lightning-Indexer quantization (QLI/QSLI)."""
 
@@ -93,7 +93,7 @@ def _sparse_attention_feature_enabled(ctx: RecipeContext, filters: dict, key: st
     return True
 
 
-@component("compressor", models=(ModelType.V4_1,))
+@component("compressor", models=(ModelType.DSV4_1,))
 class DeepSeekV41QuantCompressorComponent(QuantComponent):
     """DeepSeek-V4.1 KV-source compressor quantization (fires only when present)."""
 
@@ -117,7 +117,7 @@ class DeepSeekV41QuantCompressorComponent(QuantComponent):
         ]
 
 
-@component("sparse_attention", models=(ModelType.V4_1,))
+@component("sparse_attention", models=(ModelType.DSV4_1,))
 class DeepSeekV41QuantSparseAttentionComponent(QuantComponent):
     """DeepSeek-V4.1 sparse-attention quantization (fires only when present)."""
 

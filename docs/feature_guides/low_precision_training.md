@@ -1,6 +1,6 @@
 # 低精度训练
 
-torchtitan-npu 通过 TorchAO-NPU 为 DeepSeek-V4 和 DeepSeek-V4.1 提供 MXFP8、Block FP8 低精度训练，以及 MXFP4 量化感知训练（QAT）。量化配置复用现有预训练和续训练循环，可按需选择线性层、专家权重和 attention Q/KV 的量化方式。
+torchtitan-npu 通过 TorchAO-NPU 为 DeepSeek-V4、DeepSeek-V4.1 和 Qwen3.5 提供低精度训练。DeepSeek-V4/V4.1 支持 MXFP8、Block FP8 及 routed expert MXFP4 量化感知训练（QAT）；Qwen3.5 额外提供仅作用于 dense 线性层的 `W4A8_MXFP` 和 `W8A8_MXFP8` recipe。
 
 ## 环境要求
 
@@ -34,9 +34,26 @@ Block FP8 的二维 block 路径中，两组 scale 分别覆盖最后一维和�
 
 recipe 按模型配置中的模块路径匹配 Attention linear、shared expert 和 routed expert，将匹配上的模块转化为对应的量化实现。MXFP8 路径对权重和激活使用 MX 量化；Block FP8 路径对权重使用 Block FP8 量化，激活使用 MX 量化。
 
+`W4A8_MXFP` 和 `W8A8_MXFP8` 仅用于 Qwen3.5 dense 模型。两者匹配 full-attention、DeltaNet 和 dense FFN 投影；不支持 Qwen3.5 MoE 模型，也不量化 routed/shared experts、router、视觉编码器、embedding、LM head、norm 或 conv。两者的激活均使用 MXFP8，`W8A8_MXFP8` 权重直接使用 Block FP8，等价于 `all_block_fp8` 的 dense 权重量化方式；`W4A8_MXFP` 权重先经过 MXFP4 fake quant，再反量化到 Block FP8 参与计算。`W4A8_MXFP` 不需要同时设置 `--extension.quantization.enable-mxfp4-qat`；`--extension.quantization.dst-type-max` 仅影响 `W4A8_MXFP` 的 MXFP4 量化目标域最大值。
+
+```bash
+--extension.quantization.enable-quantized-training \
+--extension.quantization.recipe W8A8_MXFP8
+```
+
+可在 Qwen3.5 启动脚本后追加上述参数，例如：
+
+```bash
+bash examples/qwen3_5/qwen3_5_debugmodel_1p_cpt_512.sh \
+  --extension.quantization.enable-quantized-training \
+  --extension.quantization.recipe W8A8_MXFP8
+```
+
+DeepSeek-V4/V4.1 不注册 `W4A8_MXFP` 或 `W8A8_MXFP8`，选择这些组合会在转换阶段报错。
+
 ## MXFP4 QAT
 
-`--extension.quantization.enable-mxfp4-qat` 为 routed expert 的 Block FP8 权重增加 MXFP4 fake quant 数值约束，先将权重量化至 MXFP4 格式然后再反量化至 Block FP8，用于在训练中模拟 MXFP4 量化误差。它仅对 `mix` 和 `all_block_fp8` 中的 routed expert 生效，默认关闭。
+`--extension.quantization.enable-mxfp4-qat` 为 DeepSeek routed expert 的 Block FP8 权重增加 MXFP4 fake quant 数值约束，先将权重量化至 MXFP4 格式然后再反量化至 Block FP8，用于在训练中模拟 MXFP4 量化误差。该独立开关仅对 `mix` 和 `all_block_fp8` 中的 routed expert 生效，默认关闭。Qwen3.5 `W4A8_MXFP` 对 dense 权重固有地使用同一 fake quant 机制，不依赖该开关。
 
 在训练命令中使用以下参数组合：
 
@@ -46,7 +63,7 @@ recipe 按模型配置中的模块路径匹配 Attention linear、shared expert 
 --extension.quantization.enable-mxfp4-qat
 ```
 
-该选项不会将参数持久化为 4-bit，也不会将计算替换为原生 A8W4 GEMM。`all_mxfp8` 不包含 Block FP8 权重，启用该项 QAT 约束无效。
+该选项不会将参数持久化为 4-bit，也不会将计算替换为原生 `W4A8_MXFP` GEMM。`all_mxfp8` 不包含 Block FP8 权重，启用该项 QAT 约束无效。
 
 QAT 下做 MXFP4 量化时可以使用 `--extension.quantization.dst_type_max` 传参来指定量化时目标域的最大值。参数默认值为 0.0 对应 `Amax(Dtype)`；可以传参 7.0，以防止量化数据中的最大值被截断而产生较大精度损失。
 
@@ -174,7 +191,7 @@ FSDP 的参数通信和梯度通信是两个阶段：参数在模块计算前通
 
 这里的逻辑 dtype 与物理 payload 是两个概念：逻辑参数仍用于梯度路由和 FSDP 状态管理，实际通信和量化计算使用 FP8 权重及 scale。量化 wrapper 的自定义反向将梯度转换回逻辑权重，再交给 FSDP 按 `reduce_dtype` 做 reduce-scatter；优化器参数和 checkpoint 不会因此永久变成 FP8。
 
-该选项默认关闭，需要同时启用低精度训练。它只作用于 `mix` 中的 routed expert 和 `all_block_fp8` 中匹配的 Block FP8 模块；`all_mxfp8`/`all_hif8` 没有任何预量化 scope，与该开关同开属于矛盾配置，转换阶段直接抛出 `ValueError`（提示改用 `all_block_fp8`/`mix` 或关闭开关），不会被静默忽略：
+该选项默认关闭，需要同时启用低精度训练。它作用于 DeepSeek `mix` 中的 routed expert、DeepSeek `all_block_fp8` 中匹配的 Block FP8 模块，以及 Qwen3.5 `W4A8_MXFP`/`W8A8_MXFP8` 中的 dense 模块；`all_mxfp8`/`all_hif8` 没有任何预量化 scope，与该开关同开属于矛盾配置，转换阶段直接抛出 `ValueError`（提示改用具有 Block FP8 权重 scope 的 recipe 或关闭开关），不会被静默忽略：
 
 ```bash
 --extension.quantization.enable-quantized-training \
@@ -205,7 +222,7 @@ FSDP 的参数通信和梯度通信是两个阶段：参数在模块计算前通
 ```
 
 `enable-fsdp-prequantize` 启用参数通信预量化；`fsdp-prequantize-dtype mxfp4` 只将 routed experts 的通信格式切换为 MXFP4，
-attention 等 dense 权重仍使用 FP8。专家在 `[E, N, K]` 布局下沿 K 轴量化；all-gather 返回的 MXFP4 权重直接保留为反分片权重，
+`all_block_fp8` 与 Qwen3.5 `W4A8_MXFP`/`W8A8_MXFP8` 中的 dense 权重仍使用 FP8。Qwen3.5 dense 模型的这两个 recipe 不包含 routed expert 量化，因此设置 `fsdp-prequantize-dtype mxfp4` 会直接报错，避免静默回退为 FP8 通信。专家在 `[E, N, K]` 布局下沿 K 轴量化；all-gather 返回的 MXFP4 权重直接保留为反分片权重，
 在前向矩阵乘时再转换为 Block FP8，因此计算仍按 FP8 × FP8 执行。梯度通信仍使用 FSDP 原有配置。
 
 该模式要求 routed experts 启用 MXFP4 QAT，并使用 `Shard(0)` 分片（不均分时自动 pad 对齐、通信后 trim 还原）、2D/3D 权重和 block size 32；不支持 `Shard(1)`。
@@ -221,13 +238,13 @@ attention 等 dense 权重仍使用 FP8。专家在 `[E, N, K]` 布局下沿 K �
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
 | `enable-quantized-training` | `False` | 低精度训练总开关 |
-| `recipe` | `all_block_fp8` | 选择 `all_mxfp8`、`all_hif8`、`mix` 或 `all_block_fp8` |
-| `enable-mxfp4-qat` | `False` | Routed expert 的 MXFP4 fake quant 约束 |
+| `recipe` | `all_block_fp8` | DeepSeek-V4/V4.1 选择 `all_mxfp8`、`all_hif8`、`mix` 或 `all_block_fp8`；Qwen3.5 dense 模型选择 `W4A8_MXFP` 或 `W8A8_MXFP8`，不支持 Qwen3.5 MoE 模型 |
+| `enable-mxfp4-qat` | `False` | DeepSeek routed expert 的 MXFP4 fake quant 约束；Qwen3.5 `W4A8_MXFP` 的 dense 权重不依赖该开关 |
 | `li-quantization` | `None` | LI Q/K 量化；V4 可选 `fp8`、`mxfp8`、`mxfp4`、`hif8`，V4.1 仅支持 `mxfp4` |
 | `enable-sparse-attention-quantization` | `False` | V4.1 KV source Compressor 与稀疏 attention 混合量化 |
 | `dst-type-max` | `0.0` | 用于 MXFP4 量化的目标类型最大值，可取值 0.0, 6.0-12.0 |
 | `enable-fsdp-prequantize` | `False` | 启用 FSDP 参数 all-gather 前预量化 |
-| `fsdp-prequantize-dtype` | `fp8` | Routed experts 的预量化通信格式；`mxfp4` 要求专家启用 MXFP4 QAT。`all_block_fp8` 下 attention 等 dense 权重仍使用 FP8 通信，启用范围由白名单决定 |
+| `fsdp-prequantize-dtype` | `fp8` | Routed experts 的预量化通信格式；`mxfp4` 要求专家启用 MXFP4 QAT。DeepSeek `all_block_fp8` 与 Qwen3.5 `W4A8_MXFP`/`W8A8_MXFP8` 中的 dense 权重仍使用 FP8 通信；Qwen3.5 dense recipe 选择 `mxfp4` 时直接报错，启用范围由白名单决定 |
 | `fsdp-prequantize-fqns` | `None` | 预量化权重 FQN 后缀白名单，多个模式写在同一参数内并以英文逗号分隔（如 `.attention.wq_b,.attention.wo_a`）；`None` 用 recipe 默认白名单（全部 Block FP8 投影），显式空表与开关同开报 `ValueError`，命中但对齐失败的权重启动即报错 |
 | `kv-norm-quantization.format` | 未设置 | V4 nope KV Cache 量化格式，目前为 `mxfp8`（8 bit E4M3） |
 | `kv-norm-quantization.fqns` | 空列表 | V4 的量化插入位置，脚本使用 `.attention.kv_norm,.attention.compressor.norm` |

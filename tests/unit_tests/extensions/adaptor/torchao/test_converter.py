@@ -184,6 +184,115 @@ def test_recipe_converters_select_filters_for_model_type(
     assert bool(sparse_attention_converters) is expect_sparse_attention_converter
 
 
+def test_qwen35_w4a8_mxfp_recipe_quantizes_only_dense_modules(converter_module):
+    converters = converter_module._recipe_converters(
+        "W4A8_MXFP",
+        model_type=converter_module.ModelType.QWEN3_5,
+        enable_mxfp4_qat=False,
+        dst_type_max=7.0,
+        enable_fsdp_prequantize=False,
+        model_compile_enabled=False,
+    )
+
+    assert len(converters) == 1
+    converter = converters[0]
+    param_swap = converter.base_config
+    assert isinstance(param_swap.activation_config, converter_module.MXQuantizeConfig)
+    assert isinstance(param_swap.weight_config, converter_module.BlockMXQuantizeConfig)
+    mxfp4_config = param_swap.weight_config.mxfp4_fake_quantize_config
+    assert isinstance(mxfp4_config, converter_module.MXQuantizeConfig)
+    assert mxfp4_config.elem_dtype is torch.float4_e2m1fn_x2
+    assert mxfp4_config.dst_type_max == 7.0
+    assert converter.filter_fn(SimpleNamespace(), "layers.0.attention.wq")
+    assert converter.filter_fn(SimpleNamespace(), "layers.0.delta_net.in_proj_q")
+    assert converter.filter_fn(SimpleNamespace(), "layers.0.feed_forward.w1")
+    assert not converter.filter_fn(SimpleNamespace(), "layers.0.moe.routed_experts.inner_experts")
+    assert not converter.filter_fn(SimpleNamespace(), "layers.0.moe.shared_experts.w1")
+    assert not converter.filter_fn(SimpleNamespace(), "layers.0.moe.router")
+    assert not converter.filter_fn(SimpleNamespace(), "lm_head")
+
+
+def test_qwen35_w8a8_mxfp8_recipe_quantizes_only_dense_modules(converter_module):
+    converters = converter_module._recipe_converters(
+        "W8A8_MXFP8",
+        model_type=converter_module.ModelType.QWEN3_5,
+        enable_mxfp4_qat=True,
+        dst_type_max=7.0,
+        enable_fsdp_prequantize=False,
+        model_compile_enabled=False,
+    )
+
+    assert len(converters) == 1
+    converter = converters[0]
+    param_swap = converter.base_config
+    assert isinstance(param_swap.activation_config, converter_module.MXQuantizeConfig)
+    assert isinstance(param_swap.weight_config, converter_module.BlockMXQuantizeConfig)
+    assert param_swap.weight_config.mxfp4_fake_quantize_config is None
+    assert converter.filter_fn(SimpleNamespace(), "layers.0.attention.wq")
+    assert converter.filter_fn(SimpleNamespace(), "layers.0.delta_net.in_proj_q")
+    assert converter.filter_fn(SimpleNamespace(), "layers.0.feed_forward.w1")
+    assert not converter.filter_fn(SimpleNamespace(), "layers.0.moe.routed_experts.inner_experts")
+    assert not converter.filter_fn(SimpleNamespace(), "layers.0.moe.shared_experts.w1")
+    assert not converter.filter_fn(SimpleNamespace(), "layers.0.moe.router")
+    assert not converter.filter_fn(SimpleNamespace(), "lm_head")
+
+
+@pytest.mark.parametrize("recipe", ["W4A8_MXFP", "W8A8_MXFP8"])
+@pytest.mark.parametrize(
+    "fqn",
+    [
+        "vision_encoder.block.attn.wq",
+        "vision_encoder.block.attn.wk",
+        "vision_encoder.block.attn.wv",
+        "vision_encoder.block.attn.proj",
+        "vision_encoder.block.mlp.fc1",
+        "vision_encoder.block.mlp.fc2",
+        "vision_encoder.merger.fc1",
+        "vision_encoder.merger.fc2",
+    ],
+)
+def test_qwen35_dense_recipes_exclude_vision_encoder(converter_module, recipe, fqn):
+    converters = converter_module._recipe_converters(
+        recipe,
+        model_type=converter_module.ModelType.QWEN3_5,
+        enable_mxfp4_qat=False,
+        dst_type_max=7.0,
+        enable_fsdp_prequantize=False,
+        model_compile_enabled=False,
+    )
+
+    assert len(converters) == 1
+    assert not converters[0].filter_fn(SimpleNamespace(), fqn)
+
+
+@pytest.mark.parametrize("recipe", ["W4A8_MXFP", "W8A8_MXFP8"])
+def test_qwen35_dense_prequantize_rejects_mxfp4_payload(converter_module, recipe):
+    with pytest.raises(ValueError, match="supports only FP8 FSDP-prequantized dense weights"):
+        converter_module._recipe_converters(
+            recipe,
+            model_type=converter_module.ModelType.QWEN3_5,
+            enable_mxfp4_qat=False,
+            dst_type_max=7.0,
+            enable_fsdp_prequantize=True,
+            fsdp_prequantize_dtype="mxfp4",
+            model_compile_enabled=False,
+        )
+
+
+@pytest.mark.parametrize("model_type", ["v4", "v41"])
+@pytest.mark.parametrize("recipe", ["W4A8_MXFP", "W8A8_MXFP8"])
+def test_qwen35_dense_recipes_are_rejected_for_deepseek(converter_module, model_type, recipe):
+    with pytest.raises(ValueError, match=rf"recipe for model '{model_type}'.*{recipe}"):
+        converter_module._recipe_converters(
+            recipe,
+            model_type=converter_module.ModelType(model_type),
+            enable_mxfp4_qat=False,
+            dst_type_max=7.0,
+            enable_fsdp_prequantize=False,
+            model_compile_enabled=False,
+        )
+
+
 def test_v41_li_quantization_alone_is_refused(converter_module):
     """The quantized selector launches the quantized sparse attention's schedules."""
     with pytest.raises(ValueError, match=r"requires .*enable-sparse-attention-quantization"):
@@ -209,9 +318,9 @@ def test_sparse_attention_component_triggers_on_real_v41_filters(converter_modul
     from torchtitan_npu.extensions.adaptor.torchao.components import instantiate_component_for_model_and_name
     from torchtitan_npu.extensions.adaptor.torchao.recipes import RecipeContext
 
-    component = instantiate_component_for_model_and_name(converter_module.ModelType.V4_1, "sparse_attention")
+    component = instantiate_component_for_model_and_name(converter_module.ModelType.DSV4_1, "sparse_attention")
     ctx = RecipeContext(
-        model_type=converter_module.ModelType.V4_1,
+        model_type=converter_module.ModelType.DSV4_1,
         model_compile_enabled=False,
         enable_sparse_attention_quantization=True,
         fsdp_prequantize_dtype="fp8",
@@ -225,14 +334,15 @@ def test_sparse_attention_component_triggers_on_real_v41_filters(converter_modul
 
 
 def test_model_type_rejects_unknown_model_spec_name(converter_module):
-    with pytest.raises(ValueError, match=r"supports DeepSeek V4 and V4\.1 model specs"):
+    with pytest.raises(ValueError, match=r"supports DeepSeek V4, DeepSeek V4\.1 and Qwen3\.5 model specs"):
         converter_module._model_type_for_spec(SimpleNamespace(name="deepseek_v3", model=object()))
 
 
 def test_model_type_comes_from_model_spec_name(converter_module):
     kinds = {
-        "deepseek_v4": converter_module.ModelType.V4,
-        "deepseek_v4_1": converter_module.ModelType.V4_1,
+        "deepseek_v4": converter_module.ModelType.DSV4,
+        "deepseek_v4_1": converter_module.ModelType.DSV4_1,
+        "qwen3_5": converter_module.ModelType.QWEN3_5,
     }
     for spec_name, expected in kinds.items():
         assert converter_module._model_type_for_spec(SimpleNamespace(name=spec_name, model=object())) is expected
@@ -245,30 +355,34 @@ def test_family_configs_are_split_and_registered(converter_module):
     )
     from torchtitan_npu.extensions.adaptor.torchao.configs import get_model_config
 
-    v4 = get_model_config(converter_module.ModelType.V4)
-    v41 = get_model_config(converter_module.ModelType.V4_1)
+    v4 = get_model_config(converter_module.ModelType.DSV4)
+    v41 = get_model_config(converter_module.ModelType.DSV4_1)
+    qwen35 = get_model_config(converter_module.ModelType.QWEN3_5)
 
     # Component ownership now comes from the components registry, not configs.
-    assert set(component_names_for_model(converter_module.ModelType.V4)) == {
+    assert set(component_names_for_model(converter_module.ModelType.DSV4)) == {
         "lightning_indexer",
         "v4_sparse_attention",
         "kv_norm",
     }
-    assert set(component_names_for_model(converter_module.ModelType.V4_1)) == {
+    assert set(component_names_for_model(converter_module.ModelType.DSV4_1)) == {
         "lightning_indexer",
         "compressor",
         "sparse_attention",
     }
+    assert component_names_for_model(converter_module.ModelType.QWEN3_5) == ()
+    assert tuple(qwen35.recipe_matrix) == ("W4A8_MXFP", "W8A8_MXFP8")
+    assert tuple(qwen35.filters) == ("dense_model",)
 
     # Order is deterministic: component_names_for_model must preserve registration
     # order (a set would randomize across processes and break reproducible
     # converter ordering).
-    assert component_names_for_model(converter_module.ModelType.V4) == (
+    assert component_names_for_model(converter_module.ModelType.DSV4) == (
         "lightning_indexer",
         "v4_sparse_attention",
         "kv_norm",
     )
-    assert component_names_for_model(converter_module.ModelType.V4_1) == (
+    assert component_names_for_model(converter_module.ModelType.DSV4_1) == (
         "lightning_indexer",
         "compressor",
         "sparse_attention",
@@ -287,37 +401,37 @@ def test_family_configs_are_split_and_registered(converter_module):
     # Per-model components resolve under their feature name for each family.
     assert (
         type(
-            instantiate_component_for_model_and_name(converter_module.ModelType.V4_1, "sparse_attention")
+            instantiate_component_for_model_and_name(converter_module.ModelType.DSV4_1, "sparse_attention")
         ).__name__
         == "DeepSeekV41QuantSparseAttentionComponent"
     )
     assert (
         type(
-            instantiate_component_for_model_and_name(converter_module.ModelType.V4_1, "compressor")
+            instantiate_component_for_model_and_name(converter_module.ModelType.DSV4_1, "compressor")
         ).__name__
         == "DeepSeekV41QuantCompressorComponent"
     )
     assert (
-        type(instantiate_component_for_model_and_name(converter_module.ModelType.V4, "kv_norm")).__name__
+        type(instantiate_component_for_model_and_name(converter_module.ModelType.DSV4, "kv_norm")).__name__
         == "KVNormComponent"
     )
     # lightning_indexer is split per model: V4 vs V4.1 have their own class.
     assert (
-        type(instantiate_component_for_model_and_name(converter_module.ModelType.V4, "lightning_indexer")).__name__
+        type(instantiate_component_for_model_and_name(converter_module.ModelType.DSV4, "lightning_indexer")).__name__
         == "DeepSeekV4QuantLightningIndexerComponent"
     )
     assert (
-        type(instantiate_component_for_model_and_name(converter_module.ModelType.V4_1, "lightning_indexer")).__name__
+        type(instantiate_component_for_model_and_name(converter_module.ModelType.DSV4_1, "lightning_indexer")).__name__
         == "DeepSeekV41QuantLightningIndexerComponent"
     )
     assert (
-        type(instantiate_component_for_model_and_name(converter_module.ModelType.V4, "v4_sparse_attention")).__name__
+        type(instantiate_component_for_model_and_name(converter_module.ModelType.DSV4, "v4_sparse_attention")).__name__
         == "DeepSeekV4QuantSparseAttentionComponent"
     )
 
 
 def test_recipe_converters_reject_unknown_model_type(converter_module):
-    with pytest.raises(ValueError, match="unsupported DeepSeek model type"):
+    with pytest.raises(ValueError, match="unsupported quantized model type"):
         converter_module._recipe_converters(
             "mix",
             model_type="v3",  # type: ignore[arg-type]
@@ -330,7 +444,7 @@ def test_recipe_converters_reject_unknown_model_type(converter_module):
 
 @pytest.mark.parametrize(
     ("model_name", "expected_model_type"),
-    [("deepseek_v4", "v4"), ("deepseek_v4_1", "v41")],
+    [("deepseek_v4", "v4"), ("deepseek_v4_1", "v41"), ("qwen3_5", "qwen3_5")],
 )
 def test_apply_quantization_converter_passes_model_type(converter_module, monkeypatch, model_name, expected_model_type):
     from torchtitan_npu.config.configs import QuantizationExtensionConfig
@@ -543,7 +657,7 @@ def test_v41_recipe_rejects_non_mxfp4_lightning_indexer(converter_module, li_qua
     with pytest.raises(ValueError, match="supports only li_quantization='mxfp4'"):
         converter_module._recipe_converters(
             "mix",
-            model_type=converter_module.ModelType.V4_1,
+            model_type=converter_module.ModelType.DSV4_1,
             enable_sparse_attention_quantization=True,
             enable_mxfp4_qat=False,
             dst_type_max=0.0,

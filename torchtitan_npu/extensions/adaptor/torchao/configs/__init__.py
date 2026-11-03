@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING
 from ..filters import ConfigFilterFn, match_config_fqn_suffix
 from . import deepseek_v4 as _deepseek_v4
 from . import deepseek_v4_1 as _deepseek_v4_1
+from . import qwen3_5 as _qwen3_5
 
 if TYPE_CHECKING:
     from ..recipes import FilterSpec
@@ -35,8 +36,9 @@ class ModelType(StrEnum):
     import cycle when they import it back from this package.
     """
 
-    V4 = "v4"
-    V4_1 = "v41"
+    DSV4 = "v4"
+    DSV4_1 = "v41"
+    QWEN3_5 = "qwen3_5"
 
 
 class ModelQuantConfig:
@@ -71,28 +73,37 @@ def _build_filters(
 # Built & exposed (same dict objects the engine + facade/tests share).
 _DSV4_CONFIG_FILTERS = _build_filters(_deepseek_v4.V4_FILTER_SPECS)
 _DSV41_CONFIG_FILTERS = _build_filters(_deepseek_v4_1.V41_FILTER_SPECS, extra_filters=_deepseek_v4_1.V41_EXTRA_FILTERS)
+_QWEN35_CONFIG_FILTERS = _build_filters(_qwen3_5.QWEN35_FILTER_SPECS)
 
 
 _MODEL_REGISTRY: dict[ModelType, ModelQuantConfig] = {
-    ModelType.V4: ModelQuantConfig(
+    ModelType.DSV4: ModelQuantConfig(
         recipe_matrix=_deepseek_v4.DEEPSEEK_V4_RECIPE_MATRIX,
         filters=_DSV4_CONFIG_FILTERS,
         prequantize_default_fqns=_deepseek_v4.V4_PREQUANTIZE_DEFAULT_FQNS,
         unified_npu_quant_modules=_deepseek_v4.UNIFIED_NPU_QUANTIZED_MODULES,
         specific_npu_quant_modules=_deepseek_v4.SPECIFIC_NPU_QUANTIZED_MODULES,
     ),
-    ModelType.V4_1: ModelQuantConfig(
+    ModelType.DSV4_1: ModelQuantConfig(
         recipe_matrix=_deepseek_v4_1.DEEPSEEK_V41_RECIPE_MATRIX,
         filters=_DSV41_CONFIG_FILTERS,
         prequantize_default_fqns=_deepseek_v4_1.V41_PREQUANTIZE_DEFAULT_FQNS,
         unified_npu_quant_modules=_deepseek_v4_1.UNIFIED_NPU_QUANTIZED_MODULES,
         specific_npu_quant_modules=_deepseek_v4_1.SPECIFIC_NPU_QUANTIZED_MODULES,
     ),
+    ModelType.QWEN3_5: ModelQuantConfig(
+        recipe_matrix=_qwen3_5.QWEN35_RECIPE_MATRIX,
+        filters=_QWEN35_CONFIG_FILTERS,
+        prequantize_default_fqns=_qwen3_5.QWEN35_PREQUANTIZE_DEFAULT_FQNS,
+        unified_npu_quant_modules=_qwen3_5.UNIFIED_NPU_QUANTIZED_MODULES,
+        specific_npu_quant_modules=_qwen3_5.SPECIFIC_NPU_QUANTIZED_MODULES,
+    ),
 }
 
 _NAME_TO_TYPE: dict[str, ModelType] = {
-    "deepseek_v4": ModelType.V4,
-    "deepseek_v4_1": ModelType.V4_1,
+    "deepseek_v4": ModelType.DSV4,
+    "deepseek_v4_1": ModelType.DSV4_1,
+    "qwen3_5": ModelType.QWEN3_5,
 }
 
 
@@ -101,7 +112,8 @@ def get_model_config(model_type: ModelType | str) -> ModelQuantConfig:
         kind = model_type if isinstance(model_type, ModelType) else ModelType(model_type)
         return _MODEL_REGISTRY[kind]
     except (KeyError, ValueError) as exc:
-        raise ValueError(f"unsupported DeepSeek model type {model_type!r}; expected 'v4' or 'v41'") from exc
+        expected = ", ".join(repr(kind.value) for kind in ModelType)
+        raise ValueError(f"unsupported quantized model type {model_type!r}; expected one of {expected}") from exc
 
 
 def _model_type_for_spec(model_spec) -> ModelType:
@@ -109,6 +121,6 @@ def _model_type_for_spec(model_spec) -> ModelType:
         return _NAME_TO_TYPE[model_spec.name]
     except KeyError as exc:
         raise ValueError(
-            "TorchAO-NPU quantization supports DeepSeek V4 and V4.1 model specs, "
+            "TorchAO-NPU quantization supports DeepSeek V4, DeepSeek V4.1 and Qwen3.5 model specs, "
             f"got {getattr(model_spec, 'name', type(model_spec).__qualname__)!r}"
         ) from exc
