@@ -132,3 +132,7 @@ Kimi chunked loss 的 FSDP reshard 策略恢复由 Meta 会话内兼容层负责
 ## 仅生成负载与可选导出（2026-11-03）
 
 本仓移除cost包、OpDispatchCapture.cost_model、节点FLOPs/peak_mem/param_mem/comm_bytes、阶段重复成本/峰值字段及cost_unknown统计。不要恢复性能预测或硬件资源分类。保留依赖、stream/event、FSDP通信视图、metadata_view对流的作用、op_type名称、重算/FQN、AdamW角色与静态MemoryPlan。通信事件/slot的volume_bytes用于源张量容量与内存/调度，不是下游通信模型流量；重复communication_input_bytes属性已删除。默认同进程交付无文件，显式mem仍可诊断导出。详见[负载生成边界](docs/load-generation-boundary.md)。
+
+## 自定义算子语义轴
+
+自定义融合／包装边界必须在定义或对应兼容模块声明真实输入输出角色与轴；本轮覆盖六个 Kimi 虚拟融合和五个主包 MoE 包装 overload。`attrs["tensor_semantics"]` v1 的 index 指向实际 flattened inputs/outputs，axes 逐项对应 shape 维度；None 为未定义轴，嵌套 tuple 为单维的展平逻辑轴。保留物理 TensorMeta.layout/stride，不从 shape 猜角色，不给原生 ATen/CANN 自动添加。注册按完整 raw overload，绑定复用 input_tensor_bindings；缺席可选输入与真实空张量必须区分。声明随主包接口变更同步维护，平台／算子消费仍未接入。详见[自定义张量语义](docs/custom-tensor-semantics.md)。

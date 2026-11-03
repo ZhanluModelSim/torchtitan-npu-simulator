@@ -12,6 +12,12 @@ kernels or their internal workspaces. Real-device calls fail explicitly.
 import torch
 from torch.distributed.tensor import DTensor
 
+from torchtitan_simulator.capture.tensor_semantics import (
+    OperatorTensorSemantics,
+    TensorMeaning,
+    register_tensor_semantics,
+)
+
 
 @torch.library.custom_op("kimi_sim::chunk_kda", mutates_args=())
 def chunk_kda(
@@ -130,6 +136,54 @@ def _situ_backward(ctx, dy):
 
 
 situ_glu.register_autograd(_situ_backward, setup_context=_situ_setup)
+
+
+# These layouts are part of the fusion boundary in KimiDeltaAttention and
+# KimiGatedMLA, not deductions from tensor sizes. MLA values are already padded.
+_KDA_INPUTS = (
+    ("q", TensorMeaning("query", ("batch", "sequence", "head", "key_head_dim"))),
+    ("k", TensorMeaning("key", ("batch", "sequence", "head", "key_head_dim"))),
+    ("v", TensorMeaning("value", ("batch", "sequence", "head", "value_head_dim"))),
+    ("g", TensorMeaning("decay_gate", ("batch", "sequence", "head", "key_head_dim"))),
+    ("beta", TensorMeaning("update_gate", ("batch", "sequence", "head"))),
+    ("A_log", TensorMeaning("log_decay_parameter", ("head",))),
+    ("dt_bias", TensorMeaning("time_step_bias", (("head", "key_head_dim"),))),
+)
+_KDA_OUTPUT = TensorMeaning("attention_output", ("batch", "sequence", "head", "value_head_dim"))
+_ATTENTION_INPUTS = (
+    ("q", TensorMeaning("query", ("batch", "head", "q_len", "qk_head_dim"))),
+    ("k", TensorMeaning("key", ("batch", "head", "kv_len", "qk_head_dim"))),
+    ("v", TensorMeaning("value", ("batch", "head", "kv_len", "padded_value_head_dim"))),
+)
+_ATTENTION_OUTPUT = TensorMeaning("attention_output", ("batch", "head", "q_len", "padded_value_head_dim"))
+# SiTU accepts both dense and routed expert rows. Only the final feature axis
+# is defined at this boundary; rank does not identify batch or token axes.
+_SITU_INPUTS = (
+    ("gate", TensorMeaning("gate", ("feature",), unknown_leading_axes=True)),
+    ("up", TensorMeaning("up", ("feature",), unknown_leading_axes=True)),
+)
+_SITU_OUTPUT = TensorMeaning("activated_output", ("feature",), unknown_leading_axes=True)
+
+
+def _register_fusion_semantics(
+    forward: torch.library.CustomOpDef,
+    backward: torch.library.CustomOpDef,
+    inputs: tuple[tuple[str, TensorMeaning], ...],
+    output: TensorMeaning,
+) -> None:
+    register_tensor_semantics(str(forward._opoverload), OperatorTensorSemantics(inputs, (output,)))
+    output_gradient = TensorMeaning("output_gradient", output.axes, output.unknown_leading_axes)
+    gradients = tuple(
+        TensorMeaning(f"{meaning.role}_gradient", meaning.axes, meaning.unknown_leading_axes) for _, meaning in inputs
+    )
+    register_tensor_semantics(
+        str(backward._opoverload), OperatorTensorSemantics((*inputs, ("dy", output_gradient)), gradients)
+    )
+
+
+_register_fusion_semantics(chunk_kda, chunk_kda_grad, _KDA_INPUTS, _KDA_OUTPUT)
+_register_fusion_semantics(fusion_attention, fusion_attention_grad, _ATTENTION_INPUTS, _ATTENTION_OUTPUT)
+_register_fusion_semantics(situ_glu, situ_glu_backward, _SITU_INPUTS, _SITU_OUTPUT)
 
 
 def install_kimi_virtual_fusions(scope):

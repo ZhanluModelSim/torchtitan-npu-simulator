@@ -72,6 +72,8 @@ class RuntimeSession:
 def meta_runtime():
     if meta_env._is_meta_simulation:
         raise RuntimeError("Nested simulator runtime activation is not supported")
+    # Static declarations for simulator-supported main-package custom wrappers.
+    import_module("torchtitan_simulator.compat.moe_tensor_semantics")
     previous_context = dict(meta_env._pp_context)
     previous_fsdp_state = dict(meta_env._fsdp_state)
     previous_comm_layer = meta_env._comm_layer

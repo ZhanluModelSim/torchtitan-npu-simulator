@@ -25,6 +25,7 @@ from torch.utils._python_dispatch import TorchDispatchMode
 from torchtitan_simulator.capture.checkpoint_execution import current_execution_kind
 from torchtitan_simulator.capture.op_mapping import is_metadata_view_op, to_canonical_op_type
 from torchtitan_simulator.capture.operator_arguments import operator_attributes
+from torchtitan_simulator.capture.tensor_semantics import attach_tensor_semantics
 from torchtitan_simulator.capture.tensor_utils import dtype_to_str, tensor_volume_bytes, to_tensor_meta
 from torchtitan_simulator.ir.op_node import OpNode
 from torchtitan_simulator.memory.records import (
@@ -622,6 +623,9 @@ class OpDispatchCapture(TorchDispatchMode):
             )
         if visible_in_ir and (len(input_metas) != len(flat_inputs) or len(output_metas) != len(flat_outputs)):
             raise ValueError("Logical and local synthetic-op tensor counts must match")
+
+        if visible_in_ir:
+            attrs = attach_tensor_semantics(raw_op_type, attrs or {}, input_metas, output_metas)
 
         op_type = to_canonical_op_type(raw_op_type)
         phase = self.phase_provider() if self.phase_provider else "forward"

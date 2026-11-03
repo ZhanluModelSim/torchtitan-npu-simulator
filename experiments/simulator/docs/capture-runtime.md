@@ -166,3 +166,7 @@ sidecar 采用自身 `pyproject.toml`；避免同一模块又以 `experiments.si
 
 新失败必须比较相同依赖、命令与搜索根的基线。既有 root 类型错误、主机缺依赖、实际新增错误分别记录；有局部通过不能声称全仓全绿。
 性能优化先拆解 import/JIT、准备、dispatch、保存／所有权、graph assembly 和 export，再比较相同几何及冷／热条件。等价性检查包括原始事件、生命周期和控制依赖，性能计时不混入参考审计。
+
+## 自定义融合与包装的语义轴
+
+本仓自行定义的捕获边界额外交付 `attrs["tensor_semantics"]` v1，记录输入／输出的 occurrence 索引、角色和逐轴含义。通过完整原始 overload 与原生参数绑定精确关联；不从 shape 推测，不改变物理 layout、stride 或输入顺序。当前覆盖 Kimi 虚拟融合前后向和主包 MoE reroute／permute／unpermute 包装，未知轴显式为 None。原生 ATen/CANN 维持已有参数事实。数据结构、覆盖与维护入口见[自定义张量语义](custom-tensor-semantics.md)。
