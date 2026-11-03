@@ -6,6 +6,7 @@
 
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
 
+import copy
 import os
 from dataclasses import replace
 
@@ -13,9 +14,12 @@ from torchtitan.components.data import (
     FirstFitPackingConfig,
     GrainDataLoader,
     HuggingFaceRandomAccessSource,
+    HuggingFaceStreamingSource,
     SingleDatasetConfig,
 )
 from torchtitan.components.optimizer import LRSchedulersContainer, default_adamw
+from torchtitan.hf_datasets.multimodal.mm_collator import MultiModalCollator
+from torchtitan.hf_datasets.multimodal.mm_datasets import MM_DATASETS, MultiModalProcessor
 from torchtitan.hf_datasets.text_datasets import ChatProcessor
 from torchtitan.models.qwen3_5 import config_registry as _upstream_config_registry
 from torchtitan.models.qwen3_5 import model_registry
@@ -28,12 +32,53 @@ from torchtitan_npu.override.qwen3_5.parallelize import parallelize_qwen3_5_cp
 _TEXT_SPECIAL_TOKEN_IDS = {"image_id": -1, "video_id": -1}
 
 
-# Keep upstream debug and benchmark recipes available through the NPU module.
-# The recipe objects remain upstream-owned; NPU-specific behavior is selected
-# explicitly through ``override.imports`` or the launcher defaults.
+# Keep upstream benchmark recipes available through the NPU module.
+# The debug factories below configure the native dataset from launcher inputs;
+# NPU kernels remain explicitly selected through override.imports.
 for _name, _factory in vars(_upstream_config_registry).items():
     if _name.startswith("qwen35_") and callable(_factory) and _name not in globals():
         globals()[_name] = _factory
+
+
+def _multimodal_dataloader() -> GrainDataLoader.Config:
+    """Build the multimodal loader for DATASET, honouring DATASET_PATH.
+
+    The dataset, collator and shuffle policy are the upstream multimodal ones;
+    this constructs the loader directly instead of patching a text loader.
+    """
+    dataset_name = os.environ.get("DATASET", "cc12m-test")
+    if dataset_name not in MM_DATASETS:
+        raise ValueError(f"Unknown DATASET {dataset_name!r}; expected one of {sorted(MM_DATASETS)}")
+    dataset = copy.deepcopy(MM_DATASETS[dataset_name])
+    dataset_path = os.environ.get("DATASET_PATH")
+    if dataset_path:
+        source = dataset.source
+        assert isinstance(source, HuggingFaceStreamingSource.Config)
+        source.path = dataset_path
+    processor = dataset.processor
+    assert isinstance(processor, MultiModalProcessor.Config)
+    return GrainDataLoader.Config(
+        dataset=dataset,
+        collator=MultiModalCollator.Config(
+            build_mrope_positions=True,
+            patch_size=processor.patch_size,
+            temporal_patch_size=processor.temporal_patch_size,
+            spatial_merge_size=processor.spatial_merge_size,
+        ),
+        streaming_shuffle_buffer_size=128,
+    )
+
+
+def qwen35_debugmodel(seq_len: int | None = None) -> Trainer.Config:
+    config = _upstream_config_registry.qwen35_debugmodel(seq_len=seq_len)
+    config.dataloader = _multimodal_dataloader()
+    return config
+
+
+def qwen35_debugmodel_moe(seq_len: int | None = None) -> Trainer.Config:
+    config = _upstream_config_registry.qwen35_debugmodel_moe(seq_len=seq_len)
+    config.dataloader = _multimodal_dataloader()
+    return config
 
 
 def _messages(sample):

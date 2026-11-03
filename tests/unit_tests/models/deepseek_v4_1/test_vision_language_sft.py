@@ -13,15 +13,20 @@ from pathlib import Path
 import pytest
 import torch
 from PIL import Image
+from torchtitan.components.data import GrainDataLoader
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
-from torchtitan.config.override import OverrideConfig, apply_overrides
 
-from torchtitan_npu.models.deepseek_v4_1.config_registry import deepseek_v4_1_debugmodel_multimodal
+from torchtitan_npu.models.deepseek_v4_1.config_registry import (
+    deepseek_v4_1_debugmodel_multimodal_sft,
+    deepseek_v4_1_vision_sft,
+)
 from torchtitan_npu.models.deepseek_v4_1.vision import language_dataset as dataset_module
 from torchtitan_npu.models.deepseek_v4_1.vision.data import ImagePatchProcessor
 from torchtitan_npu.models.deepseek_v4_1.vision.language_dataset import (
-    DeepSeekV41VisionLanguageDataLoader,
     DeepSeekV41VisionLanguageProcessor,
+    _GrainSFTProcessor,
+    _SFTCollator,
+    sft_dataloader_config,
 )
 
 pytestmark = pytest.mark.cpu
@@ -89,12 +94,11 @@ def _loader(
     infinite=False,
     batch_size=1,
 ):
-    config = DeepSeekV41VisionLanguageDataLoader.Config(
+    config = sft_dataloader_config(
         dataset_path=str(dataset_path),
-        infinite=infinite,
+        repeat=infinite,
     )
-    return DeepSeekV41VisionLanguageDataLoader(
-        config,
+    return config.build(
         tokenizer=tokenizer,
         dp_rank=rank,
         dp_world_size=world,
@@ -218,15 +222,12 @@ def test_single_context_budget_and_shifted_batch_contract(tmp_path, tokenizer):
     with pytest.raises(ValueError, match="num_tokens_per_batch == max_context_length"):
         _loader(dataset_path, tokenizer, batch_size=2)
 
-    recipe = deepseek_v4_1_debugmodel_multimodal()
-    recipe.dataloader.dataset_path = str(dataset_path)
-    recipe.dataloader.seed = 137
-    recipe.dataloader.infinite = False
-    recipe.override = OverrideConfig(imports=["torchtitan_npu.override.deepseek_v4_1.vision_language_dataloader.sft"])
-    apply_overrides(recipe.override, recipe)
-    assert isinstance(recipe.dataloader, DeepSeekV41VisionLanguageDataLoader.Config)
-    assert recipe.dataloader.seed == 137
-    assert not recipe.dataloader.infinite
+    recipe = deepseek_v4_1_vision_sft(dataset_path=str(dataset_path), flavor="deepseek_v4_1_debugmodel")
+    assert isinstance(recipe.dataloader, GrainDataLoader.Config)
+    assert isinstance(recipe.dataloader.collator, _SFTCollator.Config)
+    assert isinstance(recipe.dataloader.dataset.processor, _GrainSFTProcessor.Config)
+    # One chat context per batch: the SFT graph has no packing stage.
+    assert not hasattr(recipe.dataloader.dataset, "num_packing_bins")
     loader = recipe.dataloader.build(
         tokenizer=tokenizer, dp_rank=0, dp_world_size=1, max_context_length=512, num_tokens_per_batch=512
     )
@@ -242,6 +243,82 @@ def test_single_context_budget_and_shifted_batch_contract(tmp_path, tokenizer):
     torch.testing.assert_close(labels, expected_labels, rtol=0, atol=0)
     for key, value in expected_inputs.items():
         torch.testing.assert_close(inputs[key], value, rtol=0, atol=0)
+
+
+def test_registry_entry_reads_the_sft_environment(tmp_path, monkeypatch):
+    dataset_path = tmp_path / "registry.jsonl"
+    dataset_path.write_text(
+        json.dumps(
+            {
+                "messages": [
+                    {"role": "user", "content": "Question"},
+                    {"role": "assistant", "content": "Answer"},
+                ]
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DSV41_SFT_DATASET", str(dataset_path))
+    monkeypatch.setenv("DSV41_SFT_THINKING_MODE", "thinking")
+    recipe = deepseek_v4_1_debugmodel_multimodal_sft()
+    assert isinstance(recipe.dataloader, GrainDataLoader.Config)
+    assert isinstance(recipe.dataloader.collator, _SFTCollator.Config)
+    processor = recipe.dataloader.dataset.processor
+    assert processor.dataset_path == str(dataset_path.resolve())
+    assert processor.thinking_mode == "thinking"
+    assert not hasattr(recipe.dataloader.dataset, "num_packing_bins")
+
+
+def test_sft_recipe_rejects_text_only_flavors(tmp_path):
+    with pytest.raises(ValueError, match="multimodal flavor"):
+        deepseek_v4_1_vision_sft(
+            dataset_path=str(tmp_path / "unused.jsonl"), flavor="deepseek_v4_1_debugmodel_text"
+        )
+
+
+def test_sft_recipe_requires_a_dataset(monkeypatch):
+    monkeypatch.delenv("DSV41_SFT_DATASET", raising=False)
+    monkeypatch.delenv("DATASET_PATH", raising=False)
+    with pytest.raises(ValueError, match="DSV41_SFT_DATASET"):
+        deepseek_v4_1_vision_sft()
+
+
+def test_config_name_installs_the_sft_loader_with_cli_policy(tmp_path, monkeypatch):
+    """The recipe, not an override, installs the loader; tyro still owns the policy."""
+    from torchtitan.config import ConfigManager
+
+    dataset_path = tmp_path / "cli.jsonl"
+    dataset_path.write_text(
+        json.dumps(
+            {
+                "messages": [
+                    {"role": "user", "content": "Question"},
+                    {"role": "assistant", "content": "Answer"},
+                ]
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("DSV41_SFT_DATASET", str(dataset_path))
+    config = ConfigManager().parse_args(
+        [
+            "--module",
+            "torchtitan_npu.models.deepseek_v4_1",
+            "--config",
+            "deepseek_v4_1_debugmodel_multimodal_sft",
+            "--dataloader.seed",
+            "137",
+        ]
+    )
+    assert isinstance(config.dataloader, GrainDataLoader.Config)
+    assert isinstance(config.dataloader.collator, _SFTCollator.Config)
+    assert isinstance(config.dataloader.dataset.processor, _GrainSFTProcessor.Config)
+    # The old override had to carry the policy fields over; the recipe is parsed by
+    # tyro like any other config, so a CLI value lands on the freshly built loader.
+    assert config.dataloader.seed == 137
+    assert config.dataloader.dataset.processor.dataset_path == str(dataset_path.resolve())
 
 
 @pytest.mark.parametrize("num_images", (0, 2), ids=("text-dummy", "interleaved-images"))

@@ -117,7 +117,7 @@ def require_dataloader_alignment(dataloader, compress_ratios: Sequence[int], cp_
     alignment = getattr(dataloader, "per_doc_alignment", None)
     if alignment is None:
         packing = getattr(dataloader, "dataset", None)
-        dataset = getattr(packing, "dataset", None)
+        dataset = getattr(packing, "dataset", packing)
         processor = getattr(dataset, "processor", None)
         alignment = getattr(processor, "per_doc_alignment", 1)
     require_per_doc_alignment(alignment, compress_ratios, cp_degree)

@@ -239,11 +239,9 @@ def build_deepseek_v4_1_fused_test_list() -> list[OverrideDefinitions]:
     """
     ngpu = 2
     args = (
-        "--dataloader.dataset-path=tests/assets/cc12m_test",
         "--hf-assets-path=tests/assets/deepseek_v3",
         "--training.steps=2",
         "--training.max-context-length=512",
-        "--dataloader.packing-buffer-size=4",
         "--debug.seed=42",
         "--debug.deterministic",
         "--training.num-tokens-per-microbatch-per-dp-rank=512",
@@ -267,6 +265,9 @@ def build_deepseek_v4_1_fused_test_list() -> list[OverrideDefinitions]:
             env_vars={
                 "MODULE": "torchtitan_npu.models.deepseek_v4_1",
                 "CONFIG": "deepseek_v4_1_debugmodel_multimodal",
+                "DATASET": "cc12m-test",
+                "DATASET_PATH": "tests/assets/cc12m_test",
+                "PACKING_BUFFER_SIZE": "4",
             },
             use_golden=False,
             check_loss=False,
@@ -280,8 +281,7 @@ def build_deepseek_v4_1_reference_multimodal_test_list() -> list[OverrideDefinit
     args = (
         "--override.imports", "torchtitan_npu.override.common.rope.workaround",
         "torchtitan_npu.override.common.optimizer.virtual",
-        "--dataloader.dataset=cc12m-test", "--dataloader.dataset-path=tests/assets/cc12m_test",
-        "--dataloader.packing-buffer-size=4", "--hf-assets-path=tests/assets/deepseek_v3",
+        "--hf-assets-path=tests/assets/deepseek_v3",
         "--training.steps=3", "--training.max-context-length=512",
         "--training.num-tokens-per-microbatch-per-dp-rank=512",
         "--training.num-tokens-per-train-step=1024",
@@ -295,7 +295,8 @@ def build_deepseek_v4_1_reference_multimodal_test_list() -> list[OverrideDefinit
     cpt = OverrideDefinitions(
         test_name="dsv41_multimodal_cpt_reference_ep2_fsdp2",
         test_descr="V4.1 CPT reference attention with Host Engram, FullAC and virtual AdamW",
-        env_vars={"MODULE": "torchtitan_npu.models.deepseek_v4_1", "CONFIG": "deepseek_v4_1_debugmodel_multimodal"},
+        env_vars={"MODULE": "torchtitan_npu.models.deepseek_v4_1", "CONFIG": "deepseek_v4_1_debugmodel_multimodal",
+                  "DATASET": "cc12m-test", "DATASET_PATH": "tests/assets/cc12m_test", "PACKING_BUFFER_SIZE": "4"},
         override_args=[args], expected_steps=((1, 2, 3),), ngpu=2,
         use_golden=True, check_loss=False, timeout=1800,
     )
@@ -305,13 +306,22 @@ def build_deepseek_v4_1_reference_multimodal_test_list() -> list[OverrideDefinit
     if not tokenizer or not fixture:
         return [cpt]
     sft_args = tuple({
-        "--dataloader.packing-buffer-size=4": "--dataloader.packing-buffer-size=0",
-        "--dataloader.dataset-path=tests/assets/cc12m_test": f"--dataloader.dataset-path={fixture}",
         "--hf-assets-path=tests/assets/deepseek_v3": f"--hf-assets-path={tokenizer}",
     }.get(arg, arg) for arg in args)
-    sft_args = (*sft_args[:3], "torchtitan_npu.override.deepseek_v4_1.vision_language_dataloader.sft", *sft_args[3:])
+    # The SFT recipe builds its own loader with no packing stage, so the CPT
+    # dataset and packing environment does not apply to it.
+    sft_env = {
+        key: value
+        for key, value in cpt.env_vars.items()
+        if key not in ("DATASET", "DATASET_PATH", "PACKING_BUFFER_SIZE")
+    }
     return [cpt, replace(
         cpt, test_name="dsv41_multimodal_sft_reference_ep2_fsdp2",
         test_descr="V4.1 official-encoding SFT with Host Engram, FullAC and virtual AdamW",
         override_args=[sft_args],
+        env_vars={
+            **sft_env,
+            "CONFIG": "deepseek_v4_1_debugmodel_multimodal_sft",
+            "DSV41_SFT_DATASET": fixture,
+        },
     )]

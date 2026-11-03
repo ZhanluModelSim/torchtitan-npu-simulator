@@ -15,11 +15,35 @@ import pytest
 
 
 def _run_isolated(source: str, root: Path) -> None:
-    """Run import-sensitive checks in a child process to avoid global leaks."""
+    """Isolate CPU checks and reject execution of the upstream CUDA short conv."""
     env = os.environ.copy()
     pythonpath = [str(root), *sys.path]
     env["PYTHONPATH"] = os.pathsep.join(dict.fromkeys(pythonpath))
-    subprocess.run([sys.executable, "-c", textwrap.dedent(source)], check=True, env=env)
+    # Qwen's package imports this CUDA-only export while loading model configs.
+    # These checks use real recipes/loaders and the NPU conv implementation;
+    # the upstream CUDA kernel is outside their scope and must never execute.
+    cuda_boundary = """
+        import attn_gym.linear as attention_gym_linear
+
+        def unexpected_cuda_short_conv(*args, **kwargs):
+            raise AssertionError("CPU adapter/data checks must not execute the upstream CUDA short convolution")
+
+        attention_gym_linear.causal_conv1d = unexpected_cuda_short_conv
+    """
+    subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(cuda_boundary) + textwrap.dedent(source)],
+        check=True,
+        env=env,
+    )
+
+
+def _multimodal_loader_assets() -> tuple[Path, Path] | None:
+    """The upstream tokenizer and this repo's cc12m fixture, when both are present."""
+    torchtitan = Path(os.environ.get("TORCHTITAN_DIR", Path.home() / "workspace/torchtitan"))
+    tokenizer_dir = torchtitan / "tests/assets/tokenizer"
+    if not (tokenizer_dir / "tokenizer.json").exists():
+        return None
+    return tokenizer_dir, Path(__file__).resolve().parents[4] / "tests/assets/cc12m_test"
 
 
 def test_qwen3_5_launcher_delegates_to_run_train_and_uses_current_gdn_override():
@@ -27,10 +51,9 @@ def test_qwen3_5_launcher_delegates_to_run_train_and_uses_current_gdn_override()
     script = (root / "examples/qwen3_5/qwen3_5_debugmodel_1p_cpt_512.sh").read_text(encoding="utf-8")
     eager_flex = (root / "torchtitan_npu/extensions/torchtitan/eager_flex.py").read_text(encoding="utf-8")
 
-
     assert "bash scripts/run_train.sh" in script
     assert "TORCHTITAN_REPO:-${TORCHTITAN_DIR:-" in script
-    assert 'if [[ ${OVERRIDE_IMPORTS+x} ]]' in script
+    assert "if [[ ${OVERRIDE_IMPORTS+x} ]]" in script
     assert "HF_ASSETS_PATH:-${TORCHTITAN_REPO}/tests/assets/tokenizer" in script
     assert "DATASET_PATH:-${TORCHTITAN_REPO}/tests/assets/cc12m_test" in script
 
@@ -39,7 +62,7 @@ def test_qwen3_5_launcher_delegates_to_run_train_and_uses_current_gdn_override()
     assert "override.common.attention" not in script
     assert "torchtitan_npu.override.common.token_dispatcher.asc" in script
     assert "ENABLE_NPU_MOE_DISPATCHER" in script
-    assert 'ENABLE_NPU_MOE_DISPATCHER:-0' in script
+    assert "ENABLE_NPU_MOE_DISPATCHER:-0" in script
     assert '--override.imports "${OVERRIDE_IMPORTS}"' in script
     assert 'if [[ -n "${OVERRIDE_IMPORTS}" ]]' not in script
     assert "return_lse=_requests_auxiliary_outputs(return_aux)" in eager_flex
@@ -55,12 +78,11 @@ def test_qwen3_5_adapter_applies_only_early_compatibility_patches():
         from torchtitan.models.common import vision_encoder as common_vision
         from torchtitan.hf_datasets.multimodal.mm_collator import MultiModalCollator
         from torchtitan.models.qwen3_5 import vision_encoder as upstream_vision
-        from torchtitan_npu.patches.torchtitan.hf_datasets.multimodal.mm_collator import patched_build_mrope_positions
         from torchtitan_npu.patches.torchtitan.models.qwen3_5.vision_encoder import (
             eager_create_block_mask,
             owning_vision_encoder_forward,
         )
-        assert MultiModalCollator._build_mrope_positions is patched_build_mrope_positions
+        assert MultiModalCollator._build_mrope_positions.__module__ == "torchtitan.hf_datasets.multimodal.mm_collator"
         assert common_vision.compiled_create_block_mask is eager_create_block_mask
         assert upstream_vision.Qwen35VisionEncoder.forward is owning_vision_encoder_forward
         from torchtitan_npu.extensions.torchtitan import eager_flex
@@ -71,15 +93,172 @@ def test_qwen3_5_adapter_applies_only_early_compatibility_patches():
     )
 
 
-def test_qwen3_5_config_registry_forwards_upstream_factories():
+def test_qwen3_5_debug_recipe_preserves_upstream_defaults():
     root = Path(__file__).resolve().parents[4]
     _run_isolated(
         """
+        import os
+
         import torchtitan_npu.models.qwen3_5
+        from torchtitan.components.data import GrainDataLoader
+        from torchtitan.hf_datasets.multimodal.mm_datasets import MM_DATASETS
         from torchtitan.models.qwen3_5 import config_registry as upstream
         from torchtitan_npu.models.qwen3_5 import config_registry as adapter
-        assert adapter.qwen35_debugmodel is upstream.qwen35_debugmodel
-        assert adapter.qwen35_debugmodel().override.imports == []
+
+        os.environ.pop("DATASET", None)
+        os.environ.pop("DATASET_PATH", None)
+        recipes = (
+            (adapter.qwen35_debugmodel, upstream.qwen35_debugmodel),
+            (adapter.qwen35_debugmodel_moe, upstream.qwen35_debugmodel_moe),
+        )
+        for adapter_factory, upstream_factory in recipes:
+            config = adapter_factory()
+            expected = upstream_factory()
+            assert config.training == expected.training
+            assert isinstance(config.dataloader, GrainDataLoader.Config)
+            assert config.dataloader.dataset == expected.dataloader.dataset
+            assert config.dataloader.collator == expected.dataloader.collator
+            assert config.dataloader.streaming_shuffle_buffer_size == expected.dataloader.streaming_shuffle_buffer_size
+            # The loader collator describes the dataset processor's patch geometry.
+            processor = config.dataloader.dataset.processor
+            collator = config.dataloader.collator
+            assert (collator.patch_size, collator.temporal_patch_size, collator.spatial_merge_size) == (
+                processor.patch_size,
+                processor.temporal_patch_size,
+                processor.spatial_merge_size,
+            )
+            assert config.override.imports == []
+
+        os.environ["DATASET_PATH"] = "/tmp/cc12m_override"
+        overridden = adapter.qwen35_debugmodel()
+        assert overridden.dataloader.dataset.source.path == "/tmp/cc12m_override"
+        # The adapter edits its own copy, so the shared upstream dataset stays intact.
+        assert MM_DATASETS["cc12m-test"].source.path == "tests/assets/cc12m_test"
+
+        os.environ.pop("DATASET_PATH", None)
+        os.environ["DATASET"] = "cc12m"
+        for adapter_factory, _upstream_factory in recipes:
+            selected = adapter_factory()
+            assert selected.dataloader.dataset == MM_DATASETS["cc12m"]
+        """,
+        root,
+    )
+
+
+@pytest.mark.parametrize(
+    "dp_rank,dp_world_size",
+    [(0, 1), (0, 2), (1, 2)],
+    ids=("single-rank", "dp2-rank0", "dp2-rank1"),
+)
+def test_qwen3_5_multimodal_loader_matches_upstream_batches(dp_rank, dp_world_size):
+    root = Path(__file__).resolve().parents[4]
+    assets = _multimodal_loader_assets()
+    if assets is None:
+        pytest.skip("the upstream tokenizer assets are needed to build the multimodal loader")
+    tokenizer_dir, cc12m_dir = assets
+    _run_isolated(
+        f"""
+        import os
+
+        import torch
+
+        os.environ["DATASET"] = "cc12m-test"
+        os.environ["DATASET_PATH"] = r"{cc12m_dir.as_posix()}"
+
+        from torchtitan.components.tokenizer import MultiModalTokenizer
+        from torchtitan.models.qwen3_5 import QWEN3_5_SPECIAL_TOKENS
+        from torchtitan.models.qwen3_5 import config_registry as upstream
+        from torchtitan_npu.models.qwen3_5 import config_registry as adapter
+
+        tokenizer = MultiModalTokenizer(
+            MultiModalTokenizer.Config(**QWEN3_5_SPECIAL_TOKENS),
+            tokenizer_path=r"{tokenizer_dir.as_posix()}",
+        )
+        build = dict(
+            tokenizer=tokenizer,
+            dp_rank={dp_rank},
+            dp_world_size={dp_world_size},
+            max_context_length=512,
+            num_tokens_per_batch=512,
+        )
+        adapter_config = adapter.qwen35_debugmodel(seq_len=512)
+        upstream_config = upstream.qwen35_debugmodel(seq_len=512)
+        adapter_loader = adapter_config.dataloader.build(**build)
+        upstream_loader = upstream_config.dataloader.build(**build)
+        try:
+            adapter_batches = iter(adapter_loader)
+            upstream_batches = iter(upstream_loader)
+            for _ in range(2):
+                adapter_inputs, adapter_labels = next(adapter_batches)
+                upstream_inputs, upstream_labels = next(upstream_batches)
+                assert adapter_inputs.keys() == upstream_inputs.keys()
+                torch.testing.assert_close(adapter_labels, upstream_labels, rtol=0, atol=0)
+                for key, value in adapter_inputs.items():
+                    reference = upstream_inputs[key]
+                    if isinstance(value, torch.Tensor):
+                        torch.testing.assert_close(value, reference, rtol=0, atol=0)
+                    else:
+                        assert value == reference, key
+        finally:
+            adapter_loader.close()
+            upstream_loader.close()
+        """,
+        root,
+    )
+
+
+def test_qwen3_5_multimodal_loader_resumes_from_state():
+    root = Path(__file__).resolve().parents[4]
+    assets = _multimodal_loader_assets()
+    if assets is None:
+        pytest.skip("the upstream tokenizer assets are needed to build the multimodal loader")
+    tokenizer_dir, cc12m_dir = assets
+    _run_isolated(
+        f"""
+        import os
+        from copy import deepcopy
+
+        import torch
+
+        os.environ["DATASET"] = "cc12m-test"
+        os.environ["DATASET_PATH"] = r"{cc12m_dir.as_posix()}"
+
+        from torchtitan.components.tokenizer import MultiModalTokenizer
+        from torchtitan.models.qwen3_5 import QWEN3_5_SPECIAL_TOKENS
+        from torchtitan_npu.models.qwen3_5 import config_registry as adapter
+
+        tokenizer = MultiModalTokenizer(
+            MultiModalTokenizer.Config(**QWEN3_5_SPECIAL_TOKENS),
+            tokenizer_path=r"{tokenizer_dir.as_posix()}",
+        )
+        build = dict(
+            tokenizer=tokenizer,
+            dp_rank=0,
+            dp_world_size=1,
+            max_context_length=512,
+            num_tokens_per_batch=512,
+        )
+        config = adapter.qwen35_debugmodel(seq_len=512)
+        original = config.dataloader.build(**build)
+        restored = config.dataloader.build(**build)
+        try:
+            iterator = iter(original)
+            for _ in range(3):
+                next(iterator)
+            restored.load_state_dict(deepcopy(original.state_dict()))
+            resumed = iter(restored)
+            for _ in range(3):
+                expected_inputs, expected_labels = next(iterator)
+                actual_inputs, actual_labels = next(resumed)
+                torch.testing.assert_close(actual_labels, expected_labels, rtol=0, atol=0)
+                for key, value in expected_inputs.items():
+                    if isinstance(value, torch.Tensor):
+                        torch.testing.assert_close(actual_inputs[key], value, rtol=0, atol=0)
+                    else:
+                        assert actual_inputs[key] == value, key
+        finally:
+            original.close()
+            restored.close()
         """,
         root,
     )
@@ -112,36 +291,37 @@ def test_qwen3_5_video_mrope_uses_contiguous_temporal_coordinates():
     root = Path(__file__).resolve().parents[4]
     _run_isolated(
         """
-        import grain
         import torch
         import torchtitan_npu.models.qwen3_5
-        from torchtitan.components.data.types import DatasetBuildContext
-        from torchtitan.hf_datasets.multimodal.mm_collator import MultiModalCollator
-        context = DatasetBuildContext(
-            tokenizer=object(),
-            max_context_length=4,
-            num_tokens_per_batch=4,
-            read_options=grain.ReadOptions(),
+        from types import SimpleNamespace
+        import grain.python as grain
+        from torchtitan.components.data import DatasetBuildContext, GrainDataLoader
+        from torchtitan_npu.models.qwen3_5.config_registry import qwen35_debugmodel
+        config = qwen35_debugmodel(seq_len=4)
+        assert isinstance(config.dataloader, GrainDataLoader.Config)
+        # Only the collator's numeric token IDs are stubbed; patches and positions
+        # are produced by the native collator selected by the actual recipe.
+        tokenizer = SimpleNamespace(TOKEN_FIELDS=("image", "video"), image_id=10, video_id=11, pad_id=0)
+        collator = config.dataloader.collator.build(
+            context=DatasetBuildContext(
+                tokenizer=tokenizer,
+                max_context_length=4,
+                num_tokens_per_batch=4,
+                read_options=grain.ReadOptions(),
+            )
         )
-        collator = MultiModalCollator(
-            MultiModalCollator.Config(
-                max_images_per_batch=8,
-                patch_size=16,
-                temporal_patch_size=2,
-                spatial_merge_size=2,
-                build_mrope_positions=True,
-            ),
-            context=context,
+        inputs, labels = collator([{
+            "input_ids": torch.tensor([100, 11, 11, 101]),
+            "labels": torch.tensor([-100, -100, 101, -100]),
+            "positions": torch.arange(4),
+            "pixel_values_videos": [torch.zeros(4, 32, 32, 3)],
+        }])
+        assert inputs["input"].shape == labels.shape == (4,)
+        assert inputs["pixel_values_videos"].shape == (8, 1536)
+        torch.testing.assert_close(inputs["grid_thw_videos"], torch.tensor([[2, 2, 2]]))
+        torch.testing.assert_close(
+            inputs["mrope_positions"], torch.tensor([[0, 0, 0], [1, 1, 1], [2, 1, 1], [3, 3, 3]])
         )
-        positions = collator._build_mrope_positions(
-            torch.tensor([[100, 11, 11, 101]]),
-            grid_thw=None,
-            grid_thw_videos=torch.tensor([[2, 2, 2]]),
-            positions=torch.arange(4).unsqueeze(0),
-            image_token_id=10,
-            video_token_id=11,
-        )
-        torch.testing.assert_close(positions, torch.tensor([[[0, 0, 0], [1, 1, 1], [2, 1, 1], [3, 3, 3]]]))
         """,
         root,
     )

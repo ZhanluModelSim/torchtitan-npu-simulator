@@ -55,7 +55,7 @@ python -m tests.integration_tests.run_tests \
 
 本轮 Router / MoE 重构的 NPU golden 验收范围为 `TP=1 / CP=1 / PP=1`、两卡 `FSDP2 / EP2`。保留的 Gloo TP2 CPU 测试只验证通用布局与计数合同，不表示 NPU TP2 支持。当前 NPU runtime 对非 gather 维度分片的 DTensor 存在 gather backward 全局形状未局部化及输入形状缓存键遗漏问题；其修复与 NPU TP2 复现测试已拆出，本轮不包含该修复。
 
-`deepseek_v4_1_reference_multimodal` 运行两卡 CPT / SFT 参考实现，使用 FullAC、Host Engram 和 virtual AdamW，并检查三步训练及 TensorBoard 步数；它也纳入默认 `models` suite。CPT 使用仓内 `cc12m_test`。只有同时设置 `DSV41_SFT_TOKENIZER_PATH` 和 `DSV41_SFT_FIXTURE_PATH` 才注册 SFT：前者指向配套的官方 `encoding.py` 与 tokenizer 目录，后者指向 JSON、JSONL 或 Parquet 数据。SFT 固定每 rank token 预算与 context 均为 512，`packing_buffer_size=0`；缺少任一变量时 SFT 不注册。运行包含 SFT 的 suite 示例：
+`deepseek_v4_1_reference_multimodal` 运行两卡 CPT / SFT 参考实现，使用 FullAC、Host Engram 和 virtual AdamW，并检查三步训练及 TensorBoard 步数；它也纳入默认 `models` suite。CPT 使用仓内 `cc12m_test`。只有同时设置 `DSV41_SFT_TOKENIZER_PATH` 和 `DSV41_SFT_FIXTURE_PATH` 才注册 SFT：前者指向配套的官方 `encoding.py` 与 tokenizer 目录，后者指向 JSON、JSONL 或 Parquet 数据。SFT 由 `deepseek_v4_1_debugmodel_multimodal_sft` 配方直接构造 loader，固定每 rank token 预算与 context 均为 512；缺少任一变量时 SFT 不注册。运行包含 SFT 的 suite 示例：
 
 ```bash
 DSV41_SFT_TOKENIZER_PATH=/path/to/tokenizer-view \

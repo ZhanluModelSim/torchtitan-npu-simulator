@@ -63,15 +63,9 @@ HF_ASSETS_ARGS="
     --hf-assets-path ${HF_ASSETS_PATH}
 "
 
-# Dataloader
-DATALOADER_ARGS="
-    --dataloader.dataset ${DATASET}
-"
-if [[ -n "${DATASET_PATH}" ]]; then
-    DATALOADER_ARGS+="
-    --dataloader.dataset-path ${DATASET_PATH}
-"
-fi
+# Native Grain dataset configuration is selected when the recipe is constructed.
+export DATASET DATASET_PATH
+export PACKING_BUFFER_SIZE="${PACKING_BUFFER_SIZE:-0}"
 
 # Parallelism
 PARALLELISM_ARGS="
@@ -188,7 +182,6 @@ LOG_PREFIX="${LOG_PREFIX:-${CONFIG}}" \
 bash scripts/run_train_multinodes.sh \
     $COMPILE_ARGS \
     $HF_ASSETS_ARGS \
-    $DATALOADER_ARGS \
     $PARALLELISM_ARGS \
     $TRAINING_ARGS \
     $DEBUG_ARGS \

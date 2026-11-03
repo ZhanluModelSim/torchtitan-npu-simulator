@@ -6,14 +6,10 @@
 
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
 
-from torchtitan_npu.patches.torchtitan.hf_datasets.multimodal import (
-    mm_collator as _mm_collator_patch,
-)
 from torchtitan_npu.patches.torchtitan.models.qwen3_5 import (
     vision_encoder as _vision_patch,
 )
 
-_mm_collator_patch.apply()
 _vision_patch.apply()
 
 import torchtitan.models.qwen3_5.config_registry as _upstream_config_registry

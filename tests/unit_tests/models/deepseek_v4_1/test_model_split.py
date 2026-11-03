@@ -71,17 +71,19 @@ def _with_cp(trainer, degree: int):
         num_tokens_per_train_step=4096,
         max_context_length=512,
     )
-    if isinstance(trainer.dataloader, GrainDataLoader.Config):
-        packing = trainer.dataloader.dataset
+    dataset = trainer.dataloader.dataset
+    if hasattr(dataset, "dataset"):
         trainer.dataloader.dataset = dataclasses.replace(
-            packing,
+            dataset,
             dataset=dataclasses.replace(
-                packing.dataset,
-                processor=dataclasses.replace(packing.dataset.processor, per_doc_alignment=2 * degree),
+                dataset.dataset,
+                processor=dataclasses.replace(dataset.dataset.processor, per_doc_alignment=2 * degree),
             ),
         )
     else:
-        trainer.dataloader = dataclasses.replace(trainer.dataloader, per_doc_alignment=2 * degree)
+        trainer.dataloader.dataset = dataclasses.replace(
+            dataset, processor=dataclasses.replace(dataset.processor, per_doc_alignment=2 * degree)
+        )
     trainer.parallelism = dataclasses.replace(trainer.parallelism, context_parallel_degree=degree)
     return trainer
 
@@ -129,7 +131,7 @@ def test_text_recipe_builds_the_text_stack_and_loader(recipes):
 
     multimodal = recipes.deepseek_v4_1_debugmodel_multimodal()
     assert isinstance(multimodal.model_spec.model, DeepSeekV41MultimodalModel.Config)
-    assert multimodal.dataloader.per_doc_alignment == 2
+    assert multimodal.dataloader.dataset.processor.per_doc_alignment == 2
 
 
 @pytest.mark.parametrize(

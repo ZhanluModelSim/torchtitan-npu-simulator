@@ -18,12 +18,12 @@ from torch.nn.utils.rnn import pad_sequence
 from torchtitan.components.data import GrainDataLoader
 from torchtitan.components.data.collators import Collator
 from torchtitan.components.data.dataset import SampleProcessor, SingleDatasetConfig
-from torchtitan.components.data.loader import BaseDataLoader
 from torchtitan.components.data.sources import HuggingFaceStreamingSource
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
 
+from torchtitan_npu.models.common.alignment import validate_alignment
+
 from .data import TEXT, ImagePatchProcessor, build_image_token_layout
-from .dataloader import DeepSeekV41DataLoader
 from .language_encoder import (
     DeepSeekV41VisionLanguageEncoder,
     ReasoningEffort,
@@ -355,8 +355,12 @@ class _GrainSFTProcessor(SampleProcessor):
         drop_thinking: bool
         add_default_bos_token: bool
         reasoning_effort: ReasoningEffort | None
+        per_doc_alignment: int = 1
 
     def __init__(self, config: Config, *, context):
+        validate_alignment(config.per_doc_alignment, context=context)
+        if context.num_tokens_per_batch != context.max_context_length:
+            raise ValueError("vision SFT requires num_tokens_per_batch == max_context_length (one chat context)")
         encoder = DeepSeekV41VisionLanguageEncoder(
             str(Path(context.tokenizer.tokenizer_path) / "encoding" / "encoding.py"),
             thinking_mode=config.thinking_mode,
@@ -399,41 +403,28 @@ class _SFTCollator(Collator):
         return inputs, labels
 
 
-class DeepSeekV41VisionLanguageDataLoader(BaseDataLoader):
-    """One assistant-masked chat context per rank, with Grain cursor state."""
-
-    @dataclass(kw_only=True, slots=True)
-    class Config(DeepSeekV41DataLoader.Config):
-        image_root: str = ""
-        thinking_mode: ThinkingMode = "chat"
-        drop_thinking: bool = True
-        add_default_bos_token: bool = True
-        reasoning_effort: ReasoningEffort | None = None
-
-    def __init__(
-        self,
-        config: Config,
-        *,
-        tokenizer: HuggingFaceTokenizer,
-        dp_world_size: int,
-        dp_rank: int,
-        max_context_length: int,
-        num_tokens_per_batch: int,
-        **kwargs,
-    ):
-        if num_tokens_per_batch != max_context_length:
-            raise ValueError("vision SFT requires num_tokens_per_batch == max_context_length (one chat context)")
-        if config.packing_buffer_size:
-            raise ValueError("vision SFT does not support packing_buffer_size; use one chat context per batch")
-        if config.per_doc_alignment < 1 or max_context_length % config.per_doc_alignment:
-            raise ValueError("max_context_length must be divisible by positive per_doc_alignment")
-        if not config.dataset_path:
-            raise ValueError("set --dataloader.dataset-path to a JSON, JSONL, or Parquet SFT dataset")
-        dataset_path = str(Path(config.dataset_path).resolve())
-        suffix = Path(dataset_path).suffix.lower()
-        if suffix not in (".json", ".jsonl", ".parquet"):
-            raise ValueError("vision SFT dataset must be JSON, JSONL, or Parquet")
-        dataset = SingleDatasetConfig(
+def sft_dataloader_config(
+    *,
+    dataset_path: str,
+    image_root: str = "",
+    thinking_mode: ThinkingMode = "chat",
+    drop_thinking: bool = True,
+    add_default_bos_token: bool = True,
+    reasoning_effort: ReasoningEffort | None = None,
+    per_doc_alignment: int = 1,
+    seed: int = 42,
+    shuffle: bool = False,
+    repeat: bool = True,
+) -> GrainDataLoader.Config:
+    """Compose one assistant-masked chat context per native Grain batch."""
+    if not dataset_path:
+        raise ValueError("vision SFT requires a JSON, JSONL, or Parquet dataset")
+    dataset_path = str(Path(dataset_path).resolve())
+    suffix = Path(dataset_path).suffix.lower()
+    if suffix not in (".json", ".jsonl", ".parquet"):
+        raise ValueError("vision SFT dataset must be JSON, JSONL, or Parquet")
+    return GrainDataLoader.Config(
+        dataset=SingleDatasetConfig(
             source=HuggingFaceStreamingSource.Config(
                 path="parquet" if suffix == ".parquet" else "json",
                 split="train",
@@ -441,38 +432,17 @@ class DeepSeekV41VisionLanguageDataLoader(BaseDataLoader):
             ),
             processor=_GrainSFTProcessor.Config(
                 dataset_path=dataset_path,
-                image_root=config.image_root,
-                thinking_mode=config.thinking_mode,
-                drop_thinking=config.drop_thinking,
-                add_default_bos_token=config.add_default_bos_token,
-                reasoning_effort=config.reasoning_effort,
+                image_root=image_root,
+                thinking_mode=thinking_mode,
+                drop_thinking=drop_thinking,
+                add_default_bos_token=add_default_bos_token,
+                reasoning_effort=reasoning_effort,
+                per_doc_alignment=per_doc_alignment,
             ),
             post_filters=(lambda sample: sample is not None,),
-        )
-        self._loader = GrainDataLoader(
-            GrainDataLoader.Config(
-                dataset=dataset,
-                collator=_SFTCollator.Config(),
-                seed=config.seed,
-                shuffle=config.shuffle,
-                repeat=config.infinite,
-            ),
-            tokenizer=tokenizer,
-            dp_rank=dp_rank,
-            dp_world_size=dp_world_size,
-            max_context_length=max_context_length,
-            num_tokens_per_batch=num_tokens_per_batch,
-            **kwargs,
-        )
-
-    def __iter__(self):
-        return iter(self._loader)
-
-    def state_dict(self):
-        return self._loader.state_dict()
-
-    def load_state_dict(self, state_dict):
-        self._loader.load_state_dict(state_dict)
-
-    def close(self):
-        self._loader.close()
+        ),
+        collator=_SFTCollator.Config(),
+        seed=seed,
+        shuffle=shuffle,
+        repeat=repeat,
+    )

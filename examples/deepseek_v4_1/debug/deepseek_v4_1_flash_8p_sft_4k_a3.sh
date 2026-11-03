@@ -8,9 +8,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-DATASET_PATH="${DATASET_PATH:-/path/to/train.jsonl}"
+export DSV41_SFT_DATASET="${DSV41_SFT_DATASET:-${DATASET_PATH:-/path/to/train.jsonl}}"
+export CONFIG="${CONFIG:-deepseek_v4_1_flash_40layers_16experts_multimodal_sft}"
 
-exec bash "${SCRIPT_DIR}/deepseek_v4_1_flash_8p_cpt_4k_a3.sh" \
-    torchtitan_npu.override.deepseek_v4_1.vision_language_dataloader.sft \
-    --dataloader.dataset-path "${DATASET_PATH}" \
-    "$@"
+exec bash "${SCRIPT_DIR}/deepseek_v4_1_flash_8p_cpt_4k_a3.sh" "$@"

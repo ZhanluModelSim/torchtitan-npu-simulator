@@ -8,11 +8,9 @@
 The image token protocol and packed batching over TorchTitan's multimodal stack;
 the sample parser reads the CC12M WebDataset ``jpg``/``txt`` fields (``cc12m`` /
 ``cc12m-test``).  Each document is padded to the model's per-document pooling
-alignment, so a compressor group never straddles a document edge (see the
-``text_datasets`` patch)."""
+alignment, so a compressor group never straddles a document edge."""
 
 import copy
-import functools
 from dataclasses import dataclass, replace
 from io import BytesIO
 from typing import Any
@@ -22,10 +20,12 @@ import numpy as np
 import torch
 from PIL import Image
 from torch.nn.utils.rnn import pad_sequence
-from torchtitan.components.data import GrainDataLoader
+from torchtitan.components.data import GrainDataLoader, HuggingFaceStreamingSource
 from torchtitan.components.data.collators import Collator
-from torchtitan.components.data.loader import BaseDataLoader
+from torchtitan.components.data.dataset import SampleProcessor
 from torchtitan.hf_datasets.multimodal.mm_datasets import MM_DATASETS, MMSamplePackingConfig
+
+from torchtitan_npu.models.common.alignment import validate_alignment
 
 from .data import TEXT, ImagePatchProcessor, build_image_token_layout
 
@@ -155,70 +155,54 @@ def _packed_sample(sample):
     }
 
 
-class DeepSeekV41DataLoader(BaseDataLoader):
-    """V4.1 image-caption processing with native Grain ordering and state."""
+class CaptionProcessor(SampleProcessor):
+    """Decode aligned image-caption documents before Grain packing."""
 
     @dataclass(kw_only=True, slots=True)
-    class Config(BaseDataLoader.Config):
-        dataset: str = "cc12m-test"
-        dataset_path: str | None = None
-        packing_buffer_size: int = 0
-        infinite: bool = True
+    class Config(SampleProcessor.Config):
         per_doc_alignment: int = 1
-        seed: int = 42
-        shuffle: bool = False
 
-    def __init__(
-        self,
-        config: Config,
-        *,
-        tokenizer,
-        dp_world_size: int,
-        dp_rank: int,
-        max_context_length: int,
-        num_tokens_per_batch: int,
-        **kwargs,
-    ):
-        if config.per_doc_alignment < 1:
-            raise ValueError("per_doc_alignment must be positive")
-        if any(size % config.per_doc_alignment for size in (max_context_length, num_tokens_per_batch)):
-            raise ValueError("context and token batch sizes must be divisible by per_doc_alignment")
-        dataset = copy.deepcopy(MM_DATASETS[config.dataset])
-        if config.dataset_path is not None:
-            dataset = replace(dataset, source=replace(dataset.source, path=config.dataset_path))
-        dataset = replace(
-            dataset,
-            processor=replace(
-                dataset.processor,
-                sample_processor=functools.partial(_process_mm_sample, per_doc_alignment=config.per_doc_alignment),
-            ),
-        )
-        if config.packing_buffer_size > 0:
-            dataset = _V41PackingConfig(dataset=dataset, num_packing_bins=config.packing_buffer_size)
-        self._loader = GrainDataLoader(
-            GrainDataLoader.Config(
-                dataset=dataset,
-                collator=_GrainV41Collator.Config(),
-                seed=config.seed,
-                shuffle=config.shuffle,
-                repeat=config.infinite,
-            ),
-            tokenizer=tokenizer,
-            dp_world_size=dp_world_size,
-            dp_rank=dp_rank,
-            max_context_length=max_context_length,
-            num_tokens_per_batch=num_tokens_per_batch,
-            **kwargs,
-        )
+    def __init__(self, config: Config, *, context):
+        validate_alignment(config.per_doc_alignment, context=context)
+        self.tokenizer = context.tokenizer
+        self.max_context_length = context.max_context_length
+        self.per_doc_alignment = config.per_doc_alignment
 
-    def __iter__(self):
-        return iter(self._loader)
+    def __call__(self, sample, rng):
+        del rng
+        processed = _process_mm_sample(sample, self.tokenizer, per_doc_alignment=self.per_doc_alignment)
+        if processed is not None and len(processed["input_ids"]) > self.max_context_length:
+            return None
+        return processed
 
-    def state_dict(self):
-        return self._loader.state_dict()
 
-    def load_state_dict(self, state_dict):
-        self._loader.load_state_dict(state_dict)
-
-    def close(self):
-        self._loader.close()
+def caption_dataloader_config(
+    *,
+    dataset: str = "cc12m-test",
+    dataset_path: str | None = None,
+    num_packing_bins: int = 0,
+    per_doc_alignment: int = 1,
+    seed: int = 42,
+    shuffle: bool = False,
+    repeat: bool = True,
+) -> GrainDataLoader.Config:
+    """Compose the caption source, processor and collator for the native loader."""
+    if dataset not in ("cc12m", "cc12m-test"):
+        raise ValueError("V4.1 caption data requires cc12m or cc12m-test jpg/txt samples")
+    if num_packing_bins < 0:
+        raise ValueError("num_packing_bins must be nonnegative (zero disables packing)")
+    samples = copy.deepcopy(MM_DATASETS[dataset])
+    if dataset_path is not None:
+        source = samples.source
+        assert isinstance(source, HuggingFaceStreamingSource.Config)
+        samples = replace(samples, source=replace(source, path=dataset_path))
+    samples = replace(samples, processor=CaptionProcessor.Config(per_doc_alignment=per_doc_alignment))
+    return GrainDataLoader.Config(
+        dataset=(
+            _V41PackingConfig(dataset=samples, num_packing_bins=num_packing_bins) if num_packing_bins else samples
+        ),
+        collator=_GrainV41Collator.Config(),
+        seed=seed,
+        shuffle=shuffle,
+        repeat=repeat,
+    )

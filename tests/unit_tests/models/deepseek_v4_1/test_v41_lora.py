@@ -35,13 +35,12 @@ from torchtitan_npu.models.deepseek_v4_1.engram.host import HostEngramTable
 from torchtitan_npu.models.deepseek_v4_1.lora import DeepSeekV41LoRAConverter
 from torchtitan_npu.models.deepseek_v4_1.model import DeepSeekV41MultimodalModel
 from torchtitan_npu.models.deepseek_v4_1.vision.data import build_image_token_layout
-from torchtitan_npu.models.deepseek_v4_1.vision.dataloader import DeepSeekV41DataLoader
 
 
 @pytest.mark.parametrize(
     "recipe,flavor,vision,loader_type",
     [
-        (deepseek_v4_1_flash_lora, "deepseek_v4_1_flash", True, DeepSeekV41DataLoader.Config),
+        (deepseek_v4_1_flash_lora, "deepseek_v4_1_flash", True, GrainDataLoader.Config),
         (deepseek_v4_1_flash_text_lora, "deepseek_v4_1_flash_text", False, GrainDataLoader.Config),
     ],
     ids=["multimodal", "text"],

@@ -5,8 +5,10 @@
 
 import copy
 import os
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import cast
+from functools import partial
+from typing import TYPE_CHECKING, cast
 
 import torch
 from torch.distributed.tensor import Shard
@@ -41,6 +43,11 @@ from torchtitan_npu.models.common.muon import make_owned_layout
 from . import model_registry
 from .indexer import Selector
 from .model import DeepSeekV41Model, DeepSeekV41MultimodalModel
+
+if TYPE_CHECKING:
+    from torchtitan.protocols.model import ModelConfigConverter
+
+    from .vision.language_encoder import ReasoningEffort, ThinkingMode
 
 
 def _per_doc_alignment(model_spec: ModelSpec) -> int:
@@ -286,16 +293,44 @@ def _vision_dataloader_config(model_spec: ModelSpec):
     Imported here rather than at module scope: the multimodal dataset stack pulls in the
     image-preprocessing dependencies, and a text-only run must not need them.
     """
-    from .vision.dataloader import DeepSeekV41DataLoader
+    from .vision.dataloader import caption_dataloader_config
 
-    return DeepSeekV41DataLoader.Config(per_doc_alignment=_per_doc_alignment(model_spec))
+    return caption_dataloader_config(
+        dataset=os.environ.get("DATASET", "cc12m-test"),
+        dataset_path=os.environ.get("DATASET_PATH") or None,
+        num_packing_bins=int(os.environ.get("PACKING_BUFFER_SIZE", "0")),
+        per_doc_alignment=_per_doc_alignment(model_spec),
+    )
 
 
-def _make_trainer_config(flavor: str, *, converters=None) -> TrainerEx.Config:
+def _make_trainer_config(
+    flavor: str,
+    *,
+    converters=None,
+    dataloader_factory: Callable[[ModelSpec], GrainDataLoader.Config] | None = None,
+) -> TrainerEx.Config:
     model_spec = model_registry(flavor, converters=converters)
     if model_spec.model.n_layers != len(model_spec.model.layers):  # pyrefly: ignore [missing-attribute]
         raise ValueError("registered V4.1 model does not describe every configured layer")
-    vision = isinstance(model_spec.model, DeepSeekV41MultimodalModel.Config)
+
+    if dataloader_factory is not None:
+        dataloader = dataloader_factory(model_spec)
+    elif isinstance(model_spec.model, DeepSeekV41MultimodalModel.Config):
+        dataloader = _vision_dataloader_config(model_spec)
+    else:
+        dataloader = GrainDataLoader.Config(
+            dataset=ConcatThenSplitPackingConfig(
+                dataset=SingleDatasetConfig(
+                    source=HuggingFaceRandomAccessSource.Config(
+                        path="json",
+                        split="train",
+                        load_dataset_kwargs={"data_files": "tests/assets/c4_test/data.json"},
+                    ),
+                    processor=AlignedTextProcessor.Config(per_doc_alignment=_per_doc_alignment(model_spec)),
+                    post_filters=(lambda sample: sample is not None,),
+                ),
+            ),
+        )
 
     return DeepSeekV41Trainer.Config(
         training=TrainingConfig(
@@ -309,30 +344,122 @@ def _make_trainer_config(flavor: str, *, converters=None) -> TrainerEx.Config:
         ),
         model_spec=model_spec,
         tokenizer=HuggingFaceTokenizer.Config(),
-        dataloader=(
-            _vision_dataloader_config(model_spec)
-            if vision
-            else GrainDataLoader.Config(
-                dataset=ConcatThenSplitPackingConfig(
-                    dataset=SingleDatasetConfig(
-                        source=HuggingFaceRandomAccessSource.Config(
-                            path="json",
-                            split="train",
-                            load_dataset_kwargs={"data_files": "tests/assets/c4_test/data.json"},
-                        ),
-                        processor=AlignedTextProcessor.Config(per_doc_alignment=_per_doc_alignment(model_spec)),
-                        post_filters=(lambda sample: sample is not None,),
-                    ),
-                ),
-            )
-        ),
+        dataloader=dataloader,
         optimizer=_v41_optimizer_config(model_spec),
         activation_checkpoint=FullAC.Config(),
     )
 
 
+def _vision_sft_dataloader_config(
+    model_spec: ModelSpec,
+    *,
+    dataset_path: str,
+    image_root: str,
+    thinking_mode: "ThinkingMode",
+    drop_thinking: bool,
+    add_default_bos_token: bool,
+    reasoning_effort: "ReasoningEffort | None",
+) -> GrainDataLoader.Config:
+    """The one-chat-context loader graph for a multimodal model.
+
+    This is the whole loader, not a caption-loader variant: the SFT rows carry
+    conversations and images, so the caption dataset, packer and collator do not
+    participate at all.
+    """
+    if not isinstance(model_spec.model, DeepSeekV41MultimodalModel.Config):
+        raise ValueError(f"V4.1 vision SFT requires a multimodal flavor, got {model_spec.flavor!r}")
+
+    # Imported here rather than at module scope: the vision dataset stack pulls in
+    # the image-preprocessing dependencies a text-only run must not need.
+    from .vision.language_dataset import sft_dataloader_config
+
+    return sft_dataloader_config(
+        dataset_path=dataset_path,
+        image_root=image_root,
+        thinking_mode=thinking_mode,
+        drop_thinking=drop_thinking,
+        add_default_bos_token=add_default_bos_token,
+        reasoning_effort=reasoning_effort,
+        per_doc_alignment=_per_doc_alignment(model_spec),
+    )
+
+
+def deepseek_v4_1_vision_sft(
+    *,
+    dataset_path: str | None = None,
+    image_root: str = "",
+    thinking_mode: "ThinkingMode" = "chat",
+    drop_thinking: bool = True,
+    add_default_bos_token: bool = True,
+    reasoning_effort: "ReasoningEffort | None" = None,
+    flavor: str = "deepseek_v4_1_debugmodel",
+    converters: list["ModelConfigConverter.Config"] | None = None,
+) -> TrainerEx.Config:
+    """A multimodal flavor trained on one chat context per Grain batch.
+
+    The loader is installed while the training config is built, instead of being
+    derived from ``_vision_dataloader_config`` afterwards: SFT and caption
+    pre-training share the model and trainer policy, but no data graph.
+    """
+    dataset_path = dataset_path or os.environ.get("DSV41_SFT_DATASET") or os.environ.get("DATASET_PATH", "")
+    if not dataset_path:
+        raise ValueError("V4.1 vision SFT requires a JSON, JSONL, or Parquet dataset (DSV41_SFT_DATASET)")
+    return _make_trainer_config(
+        flavor,
+        converters=converters,
+        dataloader_factory=partial(
+            _vision_sft_dataloader_config,
+            dataset_path=dataset_path,
+            image_root=image_root,
+            thinking_mode=thinking_mode,
+            drop_thinking=drop_thinking,
+            add_default_bos_token=add_default_bos_token,
+            reasoning_effort=reasoning_effort,
+        ),
+    )
+
+
+def _vision_sft_env(name: str, default: str) -> str:
+    """Read one SFT knob for the zero-argument registry entries."""
+    return os.environ.get(f"DSV41_SFT_{name}", default)
+
+
+def _vision_sft_env_flag(name: str, default: bool) -> bool:
+    value = os.environ.get(f"DSV41_SFT_{name}")
+    if value is None:
+        return default
+    return value.strip().lower() not in ("", "0", "false", "no", "off")
+
+
+def _vision_sft_thinking_mode() -> "ThinkingMode":
+    mode = _vision_sft_env("THINKING_MODE", "chat")
+    if mode not in ("chat", "thinking"):
+        raise ValueError(f"DSV41_SFT_THINKING_MODE must be 'chat' or 'thinking', got {mode!r}")
+    return cast("ThinkingMode", mode)
+
+
+def _vision_sft_recipe(flavor: str) -> TrainerEx.Config:
+    """The ``--config`` entry for SFT: ``--config`` names take no arguments.
+
+    The dataset path falls back to ``DSV41_SFT_DATASET`` / ``DATASET_PATH`` inside
+    the recipe; the encoder policy is read here.
+    """
+    return deepseek_v4_1_vision_sft(
+        flavor=flavor,
+        image_root=_vision_sft_env("IMAGE_ROOT", ""),
+        thinking_mode=_vision_sft_thinking_mode(),
+        drop_thinking=_vision_sft_env_flag("DROP_THINKING", True),
+        add_default_bos_token=_vision_sft_env_flag("ADD_DEFAULT_BOS_TOKEN", True),
+        reasoning_effort=_vision_sft_env("REASONING_EFFORT", "") or None,
+    )
+
+
 def deepseek_v4_1_flash() -> TrainerEx.Config:
     return _make_trainer_config("deepseek_v4_1_flash")
+
+
+def deepseek_v4_1_flash_sft() -> TrainerEx.Config:
+    return _vision_sft_recipe("deepseek_v4_1_flash")
 
 
 def deepseek_v4_1_flash_text() -> TrainerEx.Config:
@@ -343,6 +470,10 @@ def deepseek_v4_1_flash_40layers_16experts_multimodal() -> TrainerEx.Config:
     return _make_trainer_config("deepseek_v4_1_flash_40layers_16experts_vision")
 
 
+def deepseek_v4_1_flash_40layers_16experts_multimodal_sft() -> TrainerEx.Config:
+    return _vision_sft_recipe("deepseek_v4_1_flash_40layers_16experts_vision")
+
+
 def deepseek_v4_1_flash_40layers_16experts_text() -> TrainerEx.Config:
     return _make_trainer_config("deepseek_v4_1_flash_40layers_16experts_text")
 
@@ -351,12 +482,20 @@ def deepseek_v4_1_flash_40layers_24experts_multimodal() -> TrainerEx.Config:
     return _make_trainer_config("deepseek_v4_1_flash_40layers_24experts_multimodal")
 
 
+def deepseek_v4_1_flash_40layers_24experts_multimodal_sft() -> TrainerEx.Config:
+    return _vision_sft_recipe("deepseek_v4_1_flash_40layers_24experts_multimodal")
+
+
 def deepseek_v4_1_flash_40layers_24experts_text() -> TrainerEx.Config:
     return _make_trainer_config("deepseek_v4_1_flash_40layers_24experts_text")
 
 
 def deepseek_v4_1_debugmodel_multimodal() -> TrainerEx.Config:
     return _make_trainer_config("deepseek_v4_1_debugmodel")
+
+
+def deepseek_v4_1_debugmodel_multimodal_sft() -> TrainerEx.Config:
+    return _vision_sft_recipe("deepseek_v4_1_debugmodel")
 
 
 def deepseek_v4_1_debugmodel_text() -> TrainerEx.Config:

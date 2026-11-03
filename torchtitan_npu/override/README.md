@@ -103,7 +103,6 @@ torchtitan_npu/override/
 ```text
 torchtitan_npu/override/deepseek_v4_1/
 ├── mhc.py
-├── vision_language_dataloader.py
 ├── engram/
 │   ├── __init__.py
 │   ├── ascendc.py
@@ -451,7 +450,6 @@ kernel；使用它需要额外安装与当前 CANN 匹配的 `pypto` runtime，�
 | `mhc.asc_hc_post` | `HcPost.Config`（精确匹配） | `AscV41HcPost.Config` | `cann_ops_transformer.ops.mhc_post` |
 | `engram.host_offload` | `HostEngramTable.Config`（精确匹配） | `HostOffloadEngramTable.Config` | CANN EngramFetch/EngramFetchGrad |
 | `engram.host_offload_mxfp8` | `HostEngramTable.Config`（精确匹配） | `MXFP8HostOffloadEngramTable.Config` | MXFP8 数据与 E8M0 scale |
-| `vision_language_dataloader.sft` | `DeepSeekV41DataLoader.Config`（`fqns=["dataloader"]`） | V4.1 结构化多模态 SFT dataloader | 数据行不覆盖 `thinking_mode` 等策略字段 |
 
 ```text
 torchtitan_npu.override.deepseek_v4_1.sparse_attn.asc

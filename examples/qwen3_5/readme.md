@@ -12,7 +12,11 @@
 `GrainDataLoader`、Hugging Face JSON/JSONL source、上游 `ChatProcessor` 和 first-fit packing。
 `DATA_FILES` 指定文件，长文本 recipe 支持逗号分隔的多个文件；样本由各自的消息转换函数映射为
 单轮 `[user, assistant]`，原始 `messages` 也须满足上游单轮约束。训练长度与 microbatch 均使用 token 预算字段。
-多模态 debug 入口的数据管线与此独立。
+多模态 debug recipe 直接使用上游 `GrainDataLoader`、multimodal processor 和 collator，
+通过 `DATASET` / `DATASET_PATH` 选择数据源。输入 tokens 和 positions 为 `[T]`，MRoPE 为 `[T,3]`；
+视频的连续时间坐标由当前固定上游构建，不再安装旧的 batched MRoPE patch。
+当前 pin 的完整 NPU 冒烟仍会在 GDN 的 CUDA-only short-convolution 路径失败；
+数据管线和 MRoPE 的 CPU 验证通过不代表该训练后端已完成适配。
 
 ## Qwen3.5 multimodal dependencies
 
@@ -32,8 +36,8 @@ python -m pip install --no-deps -e .
 
 ## Qwen3.5 NPU override 开关
 
-默认启用 Triton GDN override。配置工厂保持与上游完全一致，不会静默注入 NPU
-实现；视觉 mask、视频 MRoPE 和 FLA 兼容补丁由 `torchtitan_npu.models.qwen3_5`
+默认启用 Triton GDN override。debug 配置复用上游工厂，仅按环境变量选择原生 Grain 数据源，不会静默注入 NPU
+实现；视觉 mask 和 FLA 兼容补丁由 `torchtitan_npu.models.qwen3_5`
 导入时按上游接口自动安装。
 
 MoE token dispatcher 是性能选项（`ENABLE_NPU_MOE_DISPATCHER` 缺省值为 `0`），
@@ -81,7 +85,7 @@ TorchTitan 提供：
 qwen3_5_debugmodel_1p_cpt_512.sh
   ├─ 组装 tokenizer、cc12m-test、override.imports 和用户参数
   └─ scripts/run_train.sh -> torchrun -m torchtitan_npu.train
-       ├─ torchtitan_npu.models.qwen3_5 导入时安装视觉/MRoPE/FLA patch
+       ├─ torchtitan_npu.models.qwen3_5 导入时安装视觉/FLA patch
        ├─ 上游 config_registry 构造 qwen35_debugmodel(_moe)
        ├─ GDN override 替换 delta kernel；可选 dispatcher 替换 MoE dispatch
        ├─ parallelize_qwen3_5_npu 建立 TP/EP/FSDP；CP 使用序列元数据与 mesh resolver

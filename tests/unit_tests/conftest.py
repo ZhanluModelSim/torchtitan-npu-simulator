@@ -38,13 +38,10 @@ collect_ignore = [
     "patches/torchtitan/experiments/graph_trainer",
     # Qwen runtime migration is deferred. Upstream eagerly imports CUDA-only
     # CuTeDSL code, which is not installed in the NPU test image.
-    "models/qwen3_5/test_qwen3_5_npu_adapter.py",
     "override/qwen3_5/test_gated_delta.py",
-    # Vision is outside the current text migration. Avoid importing its suites.
+    # Keep model-compute suites deferred; migrated vision loaders run in CPU UT.
     "models/deepseek_v4_1/test_training_contract.py",
     "models/deepseek_v4_1/test_vision_attention.py",
-    "models/deepseek_v4_1/test_vision_dataloader.py",
-    "models/deepseek_v4_1/test_vision_language_sft.py",
     "models/deepseek_v4_1/test_vision_layout.py",
 ]
 

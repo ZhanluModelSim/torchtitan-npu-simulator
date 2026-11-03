@@ -5,7 +5,9 @@
 
 import os
 import subprocess
+import sys
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 from torchtitan.config.manager import ConfigManager
@@ -106,9 +108,11 @@ def test_rope_entries_are_mutually_exclusive(launcher_config):
         apply_overrides(both, cfg)
 
 
-def test_a5_launcher_selects_the_full_fused_stack(launcher_config):
+def test_a5_launcher_selects_the_full_fused_stack(launcher_config, monkeypatch):
     """The A5 launcher's override list actually replaces every fused target:
     partial text RoPE, SwiGLUGroup experts, sparse attention and Sinkhorn."""
+    # Check real override selection without loading the native CANN registration.
+    monkeypatch.setitem(sys.modules, "cann_ops_nn.ops", ModuleType("cann_ops_nn.ops"))
     trainer = launcher_config("a5")
     cfg = trainer.model_spec.model
     apply_overrides(trainer.override, cfg)

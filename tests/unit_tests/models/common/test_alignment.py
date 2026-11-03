@@ -64,9 +64,11 @@ def test_require_per_doc_alignment_checks_the_cli_value():
 def test_dataloader_alignment_checks_grain_processor_and_direct_loader():
     processor = SimpleNamespace(per_doc_alignment=256)
     grain_loader = SimpleNamespace(dataset=SimpleNamespace(dataset=SimpleNamespace(processor=processor)))
+    single_dataset_loader = SimpleNamespace(dataset=SimpleNamespace(processor=processor))
     direct_loader = SimpleNamespace(per_doc_alignment=256)
-    for loader in (grain_loader, direct_loader):
+    for loader in (grain_loader, single_dataset_loader, direct_loader):
         require_dataloader_alignment(loader, (1, 4, 128), 2)
     processor.per_doc_alignment = 128
-    with pytest.raises(ValueError, match="multiple of 256"):
-        require_dataloader_alignment(grain_loader, (1, 4, 128), 2)
+    for loader in (grain_loader, single_dataset_loader):
+        with pytest.raises(ValueError, match="multiple of 256"):
+            require_dataloader_alignment(loader, (1, 4, 128), 2)

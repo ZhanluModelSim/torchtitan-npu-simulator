@@ -50,9 +50,9 @@ def build_qwen3_5_test_list() -> list[OverrideDefinitions]:
     """
     common = (
         "--training.steps=1",
-        "--training.local-batch-size=1",
-        "--training.global-batch-size=1",
-        "--training.seq-len=512",
+        "--training.num-tokens-per-microbatch-per-dp-rank=512",
+        "--training.num-tokens-per-train-step=512",
+        "--training.max-context-length=512",
     )
     return [
         _build_case(

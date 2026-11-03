@@ -16,12 +16,13 @@ from pathlib import Path
 import pytest
 import torch
 from PIL import Image
+from torchtitan.components.data import GrainDataLoader
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
 from torchtitan.distributed.parallel_dims import ParallelDims
 
 from torchtitan_npu.models.deepseek_v4_1.config_registry import deepseek_v4_1_debugmodel_multimodal
 from torchtitan_npu.models.deepseek_v4_1.vision.data import IMAGE_END, IMAGE_START, ImagePatchProcessor
-from torchtitan_npu.models.deepseek_v4_1.vision.dataloader import DeepSeekV41DataLoader, _process_mm_sample
+from torchtitan_npu.models.deepseek_v4_1.vision.dataloader import _process_mm_sample, caption_dataloader_config
 
 ASSETS = Path(__file__).resolve().parents[3] / "assets"
 
@@ -32,11 +33,11 @@ def tokenizer():
 
 
 def _loader(tokenizer, *, rank=0, world=1, packing=0, infinite=False, alignment=2):
-    return DeepSeekV41DataLoader.Config(
+    return caption_dataloader_config(
         dataset="cc12m-test",
         dataset_path=str(ASSETS / "cc12m_test"),
-        packing_buffer_size=packing,
-        infinite=infinite,
+        num_packing_bins=packing,
+        repeat=infinite,
         per_doc_alignment=alignment,
     ).build(tokenizer=tokenizer, dp_rank=rank, dp_world_size=world, max_context_length=512, num_tokens_per_batch=512)
 
@@ -170,7 +171,8 @@ def test_recipe_passes_the_model_alignment_to_the_loader():
     from torchtitan_npu.models.deepseek_v4_1 import config_registry as cr
 
     trainer = cr.deepseek_v4_1_debugmodel_multimodal()
-    assert trainer.dataloader.per_doc_alignment == cr._per_doc_alignment(trainer.model_spec) == 2
+    assert isinstance(trainer.dataloader, GrainDataLoader.Config)
+    assert trainer.dataloader.dataset.processor.per_doc_alignment == cr._per_doc_alignment(trainer.model_spec) == 2
 
 
 def test_empty_caption_is_filtered_before_packing(tokenizer):

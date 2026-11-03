@@ -94,39 +94,48 @@ Engram HF 表以全局逻辑行保存，不包含本地 padding，支持 EP 分�
 默认对齐值为 `2`；CP recipe 可通过 `DSV41_PER_DOC_ALIGNMENT` 指定更大的对齐值。
 默认数据源为 `tests/assets/c4_test/data.json`，自定义源在 Python recipe 中配置。
 
-纯文本 recipe 使用通用 `scripts/run_train.sh` 启动，不传入图文入口的
-`--dataloader.dataset` / `--dataloader.dataset-path`。排序、DP 分片、长文档位置边界和状态恢复均遵循
+纯文本 recipe 使用通用 `scripts/run_train.sh` 启动，数据源在 Python recipe 中配置。排序、DP 分片、长文档位置边界和状态恢复均遵循
 当前固定 TorchTitan 的 Grain 管线；旧 loader 的排序和续行规则不再保留，旧数据加载状态不能直接续用，
 模型权重可单独初始化。图像数据入口保持独立。
 
 ### 真实 CC12M 数据入口（图像条件 caption 预测）
 
-数据入口与 GitHub TorchTitan 的 Qwen/Kimi 多模态训练一致，使用 CC12M WebDataset tar（同名 `.jpg` / `.txt` 样本对）。默认 `dataset=cc12m-test`，读取仓内 `tests/assets/cc12m_test/`，无需传入 dataloader 参数；其他本地 tar 目录通过 `--dataloader.dataset-path <cc12m_tar_dir>` 指定。不提供 manifest、离线准备或 digest 专用脚本。
+数据入口与 GitHub TorchTitan 的 Qwen/Kimi 多模态训练一致，使用 CC12M WebDataset tar（同名 `.jpg` / `.txt` 样本对）。默认 `DATASET=cc12m-test`，读取仓内 `tests/assets/cc12m_test/`，无需传入 dataloader 参数；其他本地 tar 目录通过 `DATASET_PATH=<cc12m_tar_dir>` 指定。不提供 manifest、离线准备或 digest 专用脚本。
 
 数据准备沿用上游的两种方式：
 
-- 在线：选择 `--dataloader.dataset cc12m`，不指定 `dataset-path`，从 Hugging Face 流式读取，无需预先下载完整数据集。
-- 本地：下载包含图片和 caption 的 WebDataset tar 分片，使用 `--dataloader.dataset-path <cc12m_tar_dir>`。不解压、不生成 manifest，不预先 tokenize 或计算 ViT 特征；图片预处理在数据加载时执行，ViT 在模型前向中执行。
+- 在线：选择 `DATASET=cc12m`，不指定 `DATASET_PATH`，从 Hugging Face 流式读取，无需预先下载完整数据集。
+- 本地：下载包含图片和 caption 的 WebDataset tar 分片，使用 `DATASET_PATH=<cc12m_tar_dir>`。不解压、不生成 manifest，不预先 tokenize 或计算 ViT 特征；图片预处理在数据加载时执行，ViT 在模型前向中执行。
 
-`cc12m-train-0000.tar` 原样复用 [GitHub TorchTitan v0.3.0 测试资产](https://github.com/pytorch/torchtitan/blob/v0.3.0/tests/assets/cc12m_test/cc12m-train-0000.tar)，包含 32 条图文样本，仅用于测试。完整在线数据源通过 `--dataloader.dataset cc12m` 选择；指定本地目录后，读取的是该目录的数据，而非仓内测试资产。
+`cc12m-train-0000.tar` 原样复用 [GitHub TorchTitan v0.3.0 测试资产](https://github.com/pytorch/torchtitan/blob/v0.3.0/tests/assets/cc12m_test/cc12m-train-0000.tar)，包含 32 条图文样本，仅用于测试。完整在线数据源通过 `DATASET=cc12m` 选择；指定本地目录后，读取的是该目录的数据，而非仓内测试资产。
 
-图文 CPT loader 使用上游 Grain 的数据源、packing 和恢复机制，保留 `BOS + 完整图片协议 + caption + EOS`、caption/EOS 监督和逐文档压缩对齐。当前 collator 仍返回 `[1,T]`，图文到 folded decoder 的协议迁移尚未完成。文本 loader 使用 `AlignedTextDataLoader`：逐文档 shift labels、补齐压缩组，再交给 Grain concat-then-split；positions 在切行后归零，再按上下文上限切分。HF map 数据先按 DP 分片，首轮保持原顺序，后续 epoch 按 `seed + epoch` 重排；Grain 负责打包缓冲与恢复。有限数据集结束时，丢弃不足一个 token batch 的尾部；文档内部的对齐 padding 保留在输入中，但 labels 为 `IGNORE_INDEX`，不计入有效 token 数。纯文本已验证从 loader 到公共 Decoder 的 metadata map；streaming 的旧新顺序一致性、CP>1 和 `spmd_types` 输入链路尚未验收。旧 loader 状态格式不与 Grain 状态互通，跨版本对照应从同一 model-only checkpoint 和数据起点开始。
+图文 CPT 和 SFT recipe 直接使用上游 `GrainDataLoader.Config`，不再包装自定义 loader。
+CPT 的 `CaptionProcessor` 负责图像预处理和逐文档压缩对齐，collator 保留
+`BOS + 完整图片协议 + caption + EOS`，仅监督 caption 和 EOS。tokens、labels 和 positions
+均为 `[T]`，图像 patch 和 grid 另行传给模型中的 ViT；padding labels 为 `-100`，不计入有效 token 数。
+排序、DP 分片、预取和状态恢复由 Grain 管理。`DSV41_PER_DOC_ALIGNMENT` 可覆盖模型推导的压缩对齐值，
+构建管线时校验其与 context 和 token 预算的整除关系。
 
-与上游一致，`--dataloader.packing-buffer-size 0` 默认关闭 packing；设置正值（例如 `128`）启用。一个 rank 的 local batch 仍为 1，但一个 packed 序列可以包含多篇图文样本。装箱和合并仍调用上游实现；缓冲量还包括待输出的 packed 队列及 loader 预取，不是进程内存的硬上限。
+`PACKING_BUFFER_SIZE=0` 默认关闭 CPT packing；正值（例如 `128`）指定同时打开的候选 pack 数。
+一个 token batch 可包含多篇完整图文样本，图片顺序和 feature 索引随文档一起打包；
+缓冲量还包括待输出 pack 和 loader 预取，不是进程内存的硬上限。
+原来的 `--dataloader.dataset`、`--dataloader.dataset-path` 和 `--dataloader.packing-buffer-size`
+改用 `DATASET`、`DATASET_PATH` 和 `PACKING_BUFFER_SIZE`；seed 继续使用 `--dataloader.seed`。
+Python recipe 可直接组合 source、processor、packing config 和 collator。
 
 A/B 必须固定 tar 内容及顺序、tokenizer、序列长度、packing buffer、DP/全局 batch、seed 和初始权重。旧模型结构的 manifest/合成轨迹与新入口、新 LI 训练目标的轨迹互不可比；迁移后的对照统一使用新 reference 起点或同一份完整 checkpoint。精确续训使用完整 checkpoint 恢复 loader 状态；model-only 加载只复用权重（新旧结构需按参数名对账后映射，不做静默兼容）。
 
-上游多模态模块需要与 PyTorch 匹配的 `torchvision`（CPU 图像预处理）；按运行环境安装对应版本。数据路径支持 `DATASET_PATH` 环境变量或标准 CLI；不指定路径时使用所选数据集的上游注册源。
+上游多模态模块需要与 PyTorch 匹配的 `torchvision`（CPU 图像预处理）；按运行环境安装对应版本。数据路径通过 `DATASET_PATH` 环境变量配置；不指定路径时使用所选数据集的上游注册源。
 
 ### Vision-language SFT（LLaVA / VQA）
 
-SFT 复用同目录的 CPT launcher，只替换 dataloader；不另设 checkpoint 或并行策略。输入可以是 JSON、JSONL 或 Parquet，支持：
+SFT 复用同目录的 CPT launcher，只选择 SFT 的 dataloader 配方；不另设 checkpoint 或并行策略。输入可以是 JSON、JSONL 或 Parquet，支持：
 
 - LLaVA/ShareGPT 的 `conversations`（`human` / `gpt` 与 `<image>` 标记）；
 - OpenAI message schema 的 `messages` 与有序 text/image content blocks；
 - 纯文本 Alpaca `instruction` / `input` / `output`。
 
-`developer` 映射为 V4.1 的 `system`，`last_reminder` 映射为官方 `latest_reminder`。其他 role 会明确报错。训练策略由 override 统一配置，数据行中的同名字段不会覆盖 `thinking_mode`、`drop_thinking`、BOS 或 reasoning effort。
+`developer` 映射为 V4.1 的 `system`，`last_reminder` 映射为官方 `latest_reminder`。其他 role 会明确报错。训练策略由 SFT 配方统一配置，数据行中的同名字段不会覆盖 `thinking_mode`、`drop_thinking`、BOS 或 reasoning effort。
 
 最小 LLaVA VQA 样例：
 
@@ -134,12 +143,19 @@ SFT 复用同目录的 CPT launcher，只替换 dataloader；不另设 checkpoin
 {"image":"train2014/example.jpg","conversations":[{"from":"human","value":"<image>\nWhat is shown?"},{"from":"gpt","value":"A red bus."}]}
 ```
 
-图片相对路径默认以数据文件所在目录为根；也可以通过 override 的 `image_root` 指定统一根目录。普通 HTTP(S) URL 不在训练 worker 中下载，需先落盘；data URI 可以直接使用。无图片的纯文本样本沿用同一官方 chat encoding。
+图片相对路径默认以数据文件所在目录为根；也可以通过 `DSV41_SFT_IMAGE_ROOT` 指定统一根目录。普通 HTTP(S) URL 不在训练 worker 中下载，需先落盘；data URI 可以直接使用。无图片的纯文本样本沿用同一官方 chat encoding。
 
-默认 `chat` 模式对每个 assistant 回复计算监督，system/user/image/padding label 均为 `-100`，assistant 回复及 EOS 参与 loss。SFT loader 仍使用旧上游接口，尚未完成本分支的 Grain 和 folded-token 迁移；本节描述原有监督规则，不作为当前可运行入口。迁移后的长度上限使用 `training.max_context_length`，token 预算由 `training.num_tokens_per_microbatch_per_dp_rank` 和 `training.num_tokens_per_train_step` 指定。
+默认 `chat` 模式对每个 assistant 回复计算监督，system/user/image/padding label 均为 `-100`，assistant 回复及 EOS 参与 loss。
+SFT launcher 选择 `--config ..._sft` 配方；配方在构造训练配置时直接安装 SFT 的
+`GrainDataLoader.Config`（`SingleDatasetConfig` + `HuggingFaceStreamingSource` + SFT processor/collator），
+不经过 CPT 的 caption dataset、packer 或 collator，也不依赖 `PACKING_BUFFER_SIZE`。
+数据文件由 `DSV41_SFT_DATASET`（兼容 `DATASET_PATH`）指定；每个 rank 每次处理一个 chat context，
+`training.num_tokens_per_microbatch_per_dp_rank` 必须等于 `training.max_context_length`；
+全局 token 预算使用 `training.num_tokens_per_train_step`。
+CPU 测试覆盖监督、图像映射、打包和恢复；使用官方 encoding 的 NPU SFT 仍需配套 tokenizer 与数据验证。
 
 ```sh
-DATASET_PATH=/path/to/vqa.jsonl \
+DSV41_SFT_DATASET=/path/to/vqa.jsonl \
 bash examples/deepseek_v4_1/debug/deepseek_v4_1_flash_8p_sft_4k_a3.sh \
     --hf-assets-path /path/to/DeepSeek-V4.1-Flash
 ```
@@ -147,11 +163,15 @@ bash examples/deepseek_v4_1/debug/deepseek_v4_1_flash_8p_sft_4k_a3.sh \
 A5 使用同样的调用方式，将 launcher 换为同目录
 `deepseek_v4_1_flash_8p_sft_4k_a5.sh`；它复用 A5 CPT wrapper，由后者继续负责量化与融合算子配置。
 
-需要覆盖官方 encoding 选项时，将参数放在同一个 override JSON 中，例如：
+需要覆盖官方 encoding 策略时，设置对应环境变量（`--config` 名称不接受参数）：
 
-```sh
-'torchtitan_npu.override.deepseek_v4_1.vision_language_dataloader.sft={"thinking_mode":"thinking","drop_thinking":false,"reasoning_effort":"high"}'
-```
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `DSV41_SFT_THINKING_MODE` | `chat` | `chat` 或 `thinking` |
+| `DSV41_SFT_DROP_THINKING` | `1` | 透传官方 encoding 的 `drop_thinking` |
+| `DSV41_SFT_ADD_DEFAULT_BOS_TOKEN` | `1` | 透传官方 encoding 的 `add_default_bos_token` |
+| `DSV41_SFT_REASONING_EFFORT` | 空 | 透传官方 encoding 的 `reasoning_effort` |
+| `DSV41_SFT_IMAGE_ROOT` | 数据文件目录 | 图片相对路径的统一根目录 |
 
 encoder 只调用模型目录 `encoding/encoding.py` 的 `encode_messages` 公共入口，并通过官方前缀编码求 assistant span；`drop_thinking` 使历史前缀变化时，改用完整对话的公开字段探针求边界。它不复刻工具合并、thinking 清理或逐消息渲染规则；若未来官方版本不再保持上述公共行为，loader 会在生成 loss mask 前明确失败，避免静默监督错位。
 

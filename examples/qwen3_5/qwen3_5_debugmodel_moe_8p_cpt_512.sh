@@ -63,11 +63,8 @@ HF_ASSETS_ARGS="
     --hf-assets-path ${HF_ASSETS_PATH}
 "
 
-# Dataloader
-DATALOADER_ARGS="
-    --dataloader.dataset ${DATASET}
-    --dataloader.dataset-path ${DATASET_PATH}
-"
+# Native Grain dataset selection happens in the recipe.
+export DATASET DATASET_PATH
 
 # Parallelism
 PARALLELISM_ARGS="
@@ -89,9 +86,9 @@ COMPILE_ARGS="
 
 # Training
 TRAINING_ARGS="
-    --training.local-batch-size ${MBS}
-    --training.global-batch-size ${GBS}
-    --training.seq-len ${SEQ_LEN}
+    --training.num-tokens-per-microbatch-per-dp-rank $((MBS * SEQ_LEN))
+    --training.num-tokens-per-train-step $((GBS > 0 ? GBS * SEQ_LEN : -1))
+    --training.max-context-length ${SEQ_LEN}
     --training.steps ${STEPS}
     --training.disable-cuda-graphs
 "
@@ -103,7 +100,6 @@ LOG_PREFIX="${LOG_PREFIX:-${CONFIG}}" \
 bash scripts/run_train.sh \
     $COMPILE_ARGS \
     $HF_ASSETS_ARGS \
-    $DATALOADER_ARGS \
     $PARALLELISM_ARGS \
     $TRAINING_ARGS \
     $DEBUG_ARGS \
