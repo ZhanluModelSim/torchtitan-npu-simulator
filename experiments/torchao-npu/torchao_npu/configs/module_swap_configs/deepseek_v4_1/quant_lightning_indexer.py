@@ -23,9 +23,9 @@ class DeepSeekV41QuantLightningIndexerConfig(ModuleSwapConfig):
 
 def _quantized_forward(
     self,
-    idx_q_BLHiDi,
-    idx_k_BNDi,
-    weights_BLHi,
+    idx_q_THDi,
+    idx_k_NDi,
+    weights_TH,
     attention_masks,
     *,
     candidates_BL1C,
@@ -34,9 +34,9 @@ def _quantized_forward(
 
     return QuantV41LightningIndexer.forward(
         self,
-        idx_q_BLHiDi,
-        idx_k_BNDi,
-        weights_BLHi,
+        idx_q_THDi,
+        idx_k_NDi,
+        weights_TH,
         attention_masks,
         candidates_BL1C=candidates_BL1C,
     )

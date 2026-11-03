@@ -3,7 +3,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""The MXFP4 selector's forward and backward against the metadata the attention entry carries.
+"""The MXFP4 selector's TND forward and backward against attention metadata.
 
 The launches are all this module does: the one QLI schedule (a layer that scores every visible
 entry and the pool source, which are different schedules because the capacity sizes the candidate
@@ -69,15 +69,26 @@ def _selector(*, mode="full", candidate_topk_blocks=_POOL):
 
 @pytest.fixture
 def bypass_mxfp4_pack(monkeypatch):
-    monkeypatch.setattr(lightning_indexer, "_pack_mxfp4", lambda value: (value, value.new_zeros(1)))
+    def pack_tnd(value):
+        assert value.ndim == 3
+        return value, value.new_zeros(1)
+
+    monkeypatch.setattr(lightning_indexer, "_pack_mxfp4", pack_tnd)
 
 
 def _inputs():
     return (
-        torch.zeros(1, _TOKENS, 2, 64, dtype=torch.bfloat16, requires_grad=True),
-        torch.zeros(1, 2, 64, dtype=torch.bfloat16, requires_grad=True),
-        torch.zeros(1, _TOKENS, 2, dtype=torch.float32, requires_grad=True),
+        torch.zeros(_TOKENS, 2, 64, dtype=torch.bfloat16, requires_grad=True),
+        torch.zeros(2, 64, dtype=torch.bfloat16, requires_grad=True),
+        torch.zeros(_TOKENS, 2, dtype=torch.float32, requires_grad=True),
     )
+
+
+def _assert_tnd_kernel_inputs(args):
+    assert args[0].shape == (_TOKENS, 2, 64)
+    assert args[1].shape == (2, 1, 64)
+    assert args[2].shape == (_TOKENS, 2)
+    assert args[0].ndim == args[1].ndim == 3
 
 
 @pytest.mark.parametrize(
@@ -103,6 +114,7 @@ def test_qli_source_sorts_selection_publishes_pool_and_runs_slikg(
 
     def qli(*args, **kwargs):
         seen["qli"] = (args, kwargs)
+        _assert_tnd_kernel_inputs(args)
         return unsorted, torch.empty(0), candidate_blocks, torch.empty(0)
 
     def slikg(**kwargs):
@@ -138,7 +150,7 @@ def test_qli_source_sorts_selection_publishes_pool_and_runs_slikg(
     scores.backward(torch.full_like(scores, 8.0))
 
     indexer = metadata.aicpu_metadata.lightning_indexer
-    assert torch.equal(indices[0, 0], torch.tensor([3, 2, 1, -1], dtype=torch.int32))
+    assert torch.equal(indices[0], torch.tensor([3, 2, 1, -1], dtype=torch.int32))
     assert scores.shape == indices.shape and scores.requires_grad
     assert torch.equal(candidate, candidate_blocks.unsqueeze(0))
     # The pool source launches the schedule that was sized by the capacity, with the same capacity:
@@ -172,6 +184,7 @@ def test_qsli_searcher_searches_the_precomputed_pool_and_passes_it_through(monke
 
     def qsli(*args, **kwargs):
         seen["qsli"] = (args, kwargs)
+        _assert_tnd_kernel_inputs(args)
         return topk_indices, torch.empty(0)
 
     monkeypatch.setattr(
@@ -184,7 +197,7 @@ def test_qsli_searcher_searches_the_precomputed_pool_and_passes_it_through(monke
     indices, scores, candidate_out = selector(q, k, w, metadata, candidates_BL1C=candidate)
 
     indexer = metadata.aicpu_metadata.lightning_indexer
-    assert indices.shape == scores.shape == (1, 4, 4)
+    assert indices.shape == scores.shape == (4, 4)
     torch.testing.assert_close(candidate_out, candidate, rtol=0, atol=0)
     # The search is bound by the count the port derived for these frames, and by the schedule that
     # count sized: neither is rebuilt here, and neither depends on QLI having run.
@@ -207,6 +220,7 @@ def test_qli_without_candidate_pool_runs_the_pool_free_schedule(monkeypatch, byp
 
     def qli(*args, **kwargs):
         seen["qli"] = (args, kwargs)
+        _assert_tnd_kernel_inputs(args)
         return topk_indices, torch.empty(0), candidate_blocks, torch.ones_like(candidate_blocks)
 
     monkeypatch.setattr(
@@ -219,7 +233,7 @@ def test_qli_without_candidate_pool_runs_the_pool_free_schedule(monkeypatch, byp
     indices, scores, candidate = selector(q, k, w, metadata, candidates_BL1C=None)
 
     indexer = metadata.aicpu_metadata.lightning_indexer
-    assert indices.shape == scores.shape == (1, 4, 4)
+    assert indices.shape == scores.shape == (4, 4)
     assert candidate is None
     # A selector that scores every visible entry launches the pool-free schedule, and the kernels'
     # own "no pool" sentinel with it.
@@ -256,7 +270,7 @@ def test_a_pool_free_layer_inside_a_pool_geometry_scores_every_entry(monkeypatch
     indices, scores, candidate = selector(q, k, w, metadata, candidates_BL1C=None)
 
     indexer = metadata.aicpu_metadata.lightning_indexer
-    assert indices.shape == scores.shape == (1, 4, 4)
+    assert indices.shape == scores.shape == (4, 4)
     assert candidate is None
     assert seen["qli"][1]["metadata"] is indexer.fwd
     assert seen["qli"][1]["candidate_topk_blocks"] == -1

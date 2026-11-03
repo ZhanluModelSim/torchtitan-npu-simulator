@@ -251,24 +251,21 @@ class QuantV41LightningIndexer(torch.nn.Module):
 
     def forward(
         self,
-        idx_q_BLHiDi: torch.Tensor,
-        idx_k_BNDi: torch.Tensor,
-        weights_BLHi: torch.Tensor,
+        idx_q_THDi: torch.Tensor,
+        idx_k_NDi: torch.Tensor,
+        weights_TH: torch.Tensor,
         attention_metadata,
         *,
         candidates_BL1C: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        if idx_q_BLHiDi.shape[0] != 1 or idx_k_BNDi.shape[0] != 1 or weights_BLHi.shape[0] != 1:
-            raise ValueError("V4.1 QLI/QSLI requires one packed TND row (model batch size 1)")
-
         # Which schedule this layer launches, and whether it builds the pool, follow from its own
         # role -- which the model states and the entry's schedules were sized for.
         is_source = self.has_candidate_pool and self.mode == "full"
         topk = self.index_topk
         topk_indices, topk_scores, candidate = _QuantV41LightningIndexerTND.apply(
-            idx_q_BLHiDi.squeeze(0),
-            idx_k_BNDi.squeeze(0).unsqueeze(1),
-            weights_BLHi.squeeze(0).float(),
+            idx_q_THDi,
+            idx_k_NDi.unsqueeze(1),
+            weights_TH.float(),
             topk,
             self.compress_ratio,
             attention_metadata,
@@ -281,7 +278,7 @@ class QuantV41LightningIndexer(torch.nn.Module):
             self.candidate_block_size,
         )
         return (
-            topk_indices.reshape(1, -1, topk),
-            topk_scores.reshape(1, -1, topk),
+            topk_indices.reshape(-1, topk),
+            topk_scores.reshape(-1, topk),
             candidate,
         )
