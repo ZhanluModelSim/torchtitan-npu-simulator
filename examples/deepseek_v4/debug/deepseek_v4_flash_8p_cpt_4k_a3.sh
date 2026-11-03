@@ -27,19 +27,19 @@ HF_ASSETS_PATH="${HF_ASSETS_PATH:-/path/to/DeepSeekV4_tokenizer}" # your tokeniz
 CKPT_SAVE_LOAD_PATH="${CKPT_SAVE_LOAD_PATH:-/path/to/save_ckpt}" # your model save/load ckpt path
 
 # Parallelism
-TP=1
-PP=1
-EP=8
+TP="${TP:-1}"
+PP="${PP:-1}"
+EP="${EP:-8}"
 CP="${CP:-1}"
-DP_SHARD=8
+DP_SHARD="${DP_SHARD:-8}"
 DP_REPLICATE=$((WORLD_SIZE / (DP_SHARD * CP * TP * PP)))
 SPMD_BACKEND="spmd_types"
 
 # Training
-SEQ_LEN=4096
-MBS=1
-GBS=64
-STEPS=100
+SEQ_LEN="${SEQ_LEN:-4096}"
+MBS="${MBS:-1}"
+GBS="${GBS:-64}"
+STEPS="${STEPS:-100}"
 
 # Debug
 USE_GOLDEN="${USE_GOLDEN:-0}"

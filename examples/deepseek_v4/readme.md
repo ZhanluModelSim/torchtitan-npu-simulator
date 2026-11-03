@@ -57,6 +57,20 @@ bash examples/deepseek_v4/debug/deepseek_v4_flash_8p_cpt_4k_a3.sh \
   --training.steps 10
 ```
 
+A5 debug 入口在 A3 基线上启用 block-FP8 量化与 selective activation checkpointing：
+
+```sh
+bash examples/deepseek_v4/debug/deepseek_v4_flash_8p_cpt_4k_a5.sh \
+  --training.steps 10
+```
+
+A3 入口的并行与训练参数可用环境变量覆盖（默认值不变）：`TP`、`PP`、`EP`、`CP`、`DP_SHARD`、`SEQ_LEN`、`MBS`、`GBS`、`STEPS`；A5 入口继承这些覆盖，默认 `MBS=2`，另提供 `AC_MODE`（默认 `selective`，可选 `full`、`memory-budget`、`none`）。QAT 变体复用 A5 入口并追加 MXFP4 QAT：
+
+```sh
+bash examples/deepseek_v4/debug/deepseek_v4_flash_8p_qat_4k_a5.sh \
+  --training.steps 10
+```
+
 需要采集 profile 时显式追加：
 
 ```sh
@@ -191,7 +205,7 @@ CP=128 \
 --extension.quantization.recipe all_block_fp8
 ```
 
-例如 A5 64K、1M 和 Pro 32P 命令均默认使用该量化配置。其中 Flash CPT 的 A5 入口（多机 4K 及其派生 64K/1M、8P debug）在此基础上还默认启用 FSDP 权重预量化（`--extension.quantization.enable-fsdp-prequantize`）。多机 4K 入口默认 DP_SHARD=128，64K/1M 通过 CP/DP 覆盖得到的有效 FSDP 切分度同为 128；该切分度下均分切分的投影（wq_a、wkv、wo_b、shared experts）无法满足预量化的 64 对齐约束、启动即报错，因此 4K 入口将 `fsdp-prequantize-fqns` 收窄为任何切分度下都保持对齐的投影（wq_b、wo_a、indexer.wq_b、routed experts）。8P debug 入口在 DP_SHARD=8 下使用 recipe 默认白名单。对齐约束及“结构性 no-op 回退 / 对齐失败报错”的区别详见 `docs/feature_guides/low_precision_training.md`。
+例如 A5 64K、1M 和 Pro 32P 命令均默认使用该量化配置。其中 Flash CPT 的 A5 入口（多机 4K 及其派生 64K/1M、8P debug）在此基础上还默认启用 FSDP 权重预量化（`--extension.quantization.enable-fsdp-prequantize`）。多机 4K 入口默认 DP_SHARD=128，64K/1M 通过 CP/DP 覆盖得到的有效 FSDP 切分度同为 128；该切分度下均分切分的投影（wq_a、wkv、wo_b、shared experts）无法满足预量化的 64 对齐约束、启动即报错，因此 4K 入口将 `fsdp-prequantize-fqns` 收窄为任何切分度下都保持对齐的投影（wq_b、wo_a、indexer.wq_b、routed experts）。8P debug 入口在 DP_SHARD=8 下使用显式白名单：列入全部 dense 投影（含 wkv，8 卡切分后仍为 64 行），并排除 routed experts —— EP=8 时其 FSDP mesh（`efsdp = dp_shard * cp * tp / ep`）为 1，不发生 all-gather，预量化只会提前生成一份量化权重，增高峰值显存占用。对齐约束及“结构性 no-op 回退 / 对齐失败报错”的区别详见 `docs/feature_guides/low_precision_training.md`。
 
 需要保留 BF16 训练方案时，在命令末尾追加以下选项，覆盖脚本默认值：
 
