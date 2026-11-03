@@ -50,6 +50,28 @@ def qwen3_5_debugmodel_moe(*, num_mtp_layers: int = 0):
     return _qwen3_5_trainer_config("qwen35_debugmodel_moe", num_mtp_layers=num_mtp_layers)
 
 
+def _deepseek_v4_1_trainer_config(factory_name: str, *, num_mtp_layers: int = 0):
+    """Build a native DeepSeek-V4.1 TrainerEx.Config through the main package.
+
+    DeepSeek-V4.1 has no MTP modules, so the shared factory argument is
+    rejected explicitly. The text flavor keeps the vision tower out of the
+    capture, matching the text-only dataset the flavor itself selects.
+    """
+    if num_mtp_layers:
+        raise ValueError("DeepSeek-V4.1 has no MTP modules; num_mtp_layers must be 0")
+    from torchtitan_npu.models.deepseek_v4_1 import config_registry as v41_registry
+
+    return getattr(v41_registry, factory_name)()
+
+
+def deepseek_v4_1_debugmodel_text(*, num_mtp_layers: int = 0):
+    return _deepseek_v4_1_trainer_config("deepseek_v4_1_debugmodel_text", num_mtp_layers=num_mtp_layers)
+
+
+def deepseek_v4_1_debugmodel_multimodal(*, num_mtp_layers: int = 0):
+    return _deepseek_v4_1_trainer_config("deepseek_v4_1_debugmodel_multimodal", num_mtp_layers=num_mtp_layers)
+
+
 def deepseek_v4_pro_20t(*, num_mtp_layers=0):
     from torchtitan_npu.models.deepseek_v4 import _make_v4_config
     from torchtitan_npu.models.deepseek_v4.config_registry import _dsv4_optimizer_config, deepseek_v4_pro

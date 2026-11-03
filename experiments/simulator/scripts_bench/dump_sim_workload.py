@@ -4,7 +4,7 @@ memory plan, in the same JSON shape as parse_real.py output."""
 
 import json
 import sys
-from collections import Counter, defaultdict
+from collections import Counter
 
 from torchtitan_simulator.config import SimulationConfig
 from torchtitan_simulator.runner import simulate

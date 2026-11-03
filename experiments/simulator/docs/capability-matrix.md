@@ -9,6 +9,7 @@
 | DeepSeek-V4 | smoke、flash、pro、pro_20t 结构 preset；原生 attention/compressor/indexer loss/mHC/MoE/shared expert；MTP 0/1 有回归 | `config.py`、`presets.py`；[test_dsv4_capture.py](../tests/test_dsv4_capture.py) |
 | Kimi K3 | 原生模型与 loss、MoE、共享组件；KDA/attention/SiTU 采用显式 Meta 虚拟融合；不提供真实 KDA 硬件 kernel | `compat/kimi.py`；[test_kimi_capture.py](../tests/test_kimi_capture.py)、[test_kimi_parallel.py](../tests/test_kimi_parallel.py) |
 | Qwen3.5 | 上游 TorchTitan 0.3.0 原生模型、MoE；GDN 与 FlexAttention 采用显式 Meta 虚拟融合；文本捕获（vision detach）、无 MTP；CP／量化未接入 | `compat/qwen3_5.py`；[test_qwen3_5_capture.py](../tests/test_qwen3_5_capture.py)、[接入记录](qwen3-5-integration.md) |
+| DeepSeek-V4.1 | 主包原生模型、MoE、mHC 与 host-offload Engram 表（Meta 初始化桥，CPU 稀疏表豁免 dense 梯度契约）；attention 元数据经 `build_attention_masks` 适配到逐后端 map；文本 debugmodel 捕获，MTP／CP／量化未接入 | `compat/deepseek_v4_1.py`；[test_deepseek_v4_1_capture.py](../tests/test_deepseek_v4_1_capture.py) |
 | 原生配置与 override | `prepare_config()` 创建新配置，默认或显式 `override_imports`；`module.factory` 不绕过模型白名单或运行接口要求 | [test_config.py](../tests/test_config.py)、[test_model_overrides.py](../tests/test_model_overrides.py) |
 | 模型几何覆盖 | typed `model_overrides` 只适用于受支持的 DSV4 preset；自定义工厂负责自己的原生配置树 | `model_overrides.py`、[接入接口](upstream-integration.md) |
 | 训练精度 | 当前完整 DSV4/Kimi/Qwen3.5 捕获要求原始参数 FP32；计算参数 BF16/FP32，梯度归约 FP32；build-only 接受不等于完整捕获可用 | [test_precision.py](../tests/test_precision.py)、[test_kimi_capture.py](../tests/test_kimi_capture.py) |

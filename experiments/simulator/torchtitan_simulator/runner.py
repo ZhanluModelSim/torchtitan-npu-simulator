@@ -30,6 +30,10 @@ def _gradient_manifest(model):
     for name, parameter in logical_named_parameters(model):
         if not parameter.requires_grad:
             continue
+        if getattr(parameter, "_engram_host_offload", False):
+            # Host-offload sparse table: gradients reach SparseAdam through
+            # the pending sparse-grad path, never as a dense parameter grad.
+            continue
         gradient = parameter.grad
         if gradient is None:
             missing.append(name)
