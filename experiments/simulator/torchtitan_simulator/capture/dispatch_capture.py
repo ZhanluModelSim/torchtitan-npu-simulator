@@ -375,13 +375,17 @@ class OpDispatchCapture(TorchDispatchMode):
         annotations: dict[str, Any] = {}
         if self._dispatch_annotation_scopes:
             annotations["framework_scopes"] = list(self._dispatch_annotation_scopes)
+        attrs = _operator_attributes(func, args, kwargs)
         if str(func) == "aten._fused_adamw_.default":
-            from torchtitan_simulator.capture.optimizer import optimizer_annotations
+            from torchtitan_simulator.capture.optimizer import bind_fused_adamw_inputs, optimizer_annotations
 
-            annotations.update(optimizer_annotations(args[0] if args else kwargs["params"]))
+            binding = bind_fused_adamw_inputs(func, args, kwargs)
+            # Canonical schema order also covers calls using reordered keyword arguments.
+            flat_inputs = _flatten_tensors(binding.tensors)
+            attrs.update(binding.attributes())
+            annotations.update(optimizer_annotations(list(binding.tensor_lists[0])))
         operands = transport_operands(func, args)
         source_op_id = self.producer_op(operands.inputs[0]) if operands is not None else None
-        attrs = _operator_attributes(func, args, kwargs)
         if operands is not None:
             attrs.update(operands.attributes())
         module_path = self.module_path_tracker.current_path() if self.module_path_tracker else ""

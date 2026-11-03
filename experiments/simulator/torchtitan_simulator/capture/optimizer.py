@@ -10,12 +10,60 @@ from __future__ import annotations
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
+
+
+@dataclass(frozen=True)
+class FusedAdamwInputs:
+    """Native argument bindings before tensor-list flattening loses their roles."""
+
+    tensor_lists: tuple[tuple[torch.Tensor, ...], ...]
+    optional_tensors: tuple[tuple[str, torch.Tensor], ...]
+
+    @property
+    def tensors(self) -> tuple[torch.Tensor, ...]:
+        return tuple(tensor for group in self.tensor_lists for tensor in group) + tuple(
+            tensor for _, tensor in self.optional_tensors
+        )
+
+    def attributes(self) -> dict[str, list[int] | list[str]]:
+        return {
+            "input_tensor_list_sizes": [len(group) for group in self.tensor_lists],
+            "optional_tensor_roles": [name for name, _ in self.optional_tensors],
+        }
+
+
+def bind_fused_adamw_inputs(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> FusedAdamwInputs:
+    """Bind the supported scalar-LR schema, never infer roles from shape or dtype."""
+    list_names = ("self", "grads", "exp_avgs", "exp_avg_sqs", "max_exp_avg_sqs", "state_steps")
+    optional_names = ("grad_scale", "found_inf")
+    schema = func._schema
+    tensor_names = tuple(argument.name for argument in schema.arguments if "Tensor" in str(argument.type))
+    if str(func) != "aten._fused_adamw_.default" or tensor_names != list_names + optional_names:
+        raise RuntimeError("Unsupported fused AdamW operand schema")
+    bound = {
+        argument.name: args[index] if index < len(args) else kwargs.get(argument.name, argument.default_value)
+        for index, argument in enumerate(schema.arguments)
+    }
+    groups: list[tuple[torch.Tensor, ...]] = []
+    for name in list_names:
+        value = bound[name]
+        if not isinstance(value, (tuple, list)) or any(not isinstance(item, torch.Tensor) for item in value):
+            raise ValueError(f"Fused AdamW {name} must be a tensor list")
+        groups.append(tuple(value))
+    optional: list[tuple[str, torch.Tensor]] = []
+    for name in optional_names:
+        value = bound[name]
+        if value is not None:
+            if not isinstance(value, torch.Tensor):
+                raise ValueError(f"Fused AdamW {name} must be a tensor or None")
+            optional.append((name, value))
+    return FusedAdamwInputs(tuple(groups), tuple(optional))
 
 
 @dataclass

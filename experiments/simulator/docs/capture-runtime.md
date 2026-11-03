@@ -120,6 +120,10 @@ FSDP 包装可能延迟安装或刷新函数引用。observer 必须覆盖最终
 
 实现见 `capture/fsdp_communication_view.py`；独立路径与双模型验收见 `tests/capture/test_fsdp_communication_view.py`，AG/AR 延后传播继续由 `tests/test_fsdp_stream_capture.py` 检查。
 
+## AdamW 参数身份
+
+原生 fused AdamW 默认捕获六个张量列表长度与可选 scale/overflow 输入角色，按 schema 顺序交付本地 inputs；保留重复位置及真实 mutation/storage 身份。逻辑参数 shape 注记不能代替物理列表边界。字段与验证见 [AdamW 输入身份](adamw-input-identity.md)。其他算子的源字段不因该能力自动扩充。
+
 ## 内存、成本与对外结果
 
 从真实 optimizer state 按设备与 local storage 去重，再投影稳态驻留；不按权重倍数猜测，不在 optimizer 阶段重复加状态。

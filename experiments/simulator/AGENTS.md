@@ -124,3 +124,7 @@ docker exec -w /workspace/torchtitan-npu-simulator/experiments/simulator \
 Kimi chunked loss 的 FSDP reshard 策略恢复由 Meta 会话内兼容层负责，原策略在正常和异常退出均恢复；见[策略说明](docs/chunked-loss-policy.md)。
 
 预热性能口径见docs/steady-state-capture.md：测量负载生成CPU墙钟，区分warmup、完整simulate和含导入的进程时间；不能把小模型占比推广到完整模型，也不能将warmup直接耗时当作相对冷捕获的净增量。
+
+## AdamW 输入身份（2026-11-03）
+
+仅对原生 `aten._fused_adamw_.default` 按 schema 绑定并交付 `input_tensor_list_sizes`（六列表）及 `optional_tensor_roles`（grad_scale/found_inf）；inputs 规范到 schema 顺序，空列表与可选参数缺席明确表达。保留重复输入、local tensor/storage、mutation 及依赖，禁止按 shape 或逻辑参数注记推断角色。其他上游字段等待具体 costmodel 请求后补充；本次不扩展 tensor_lr 或算子模型。详见 [AdamW 输入身份](docs/adamw-input-identity.md)。
