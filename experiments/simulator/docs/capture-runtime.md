@@ -88,6 +88,22 @@ autograd warning 可能来自 bridge 安装前的能力探针，但不能据此�
 
 参考：[保存身份测试](../tests/capture/test_saved_tensor_identity.py)、[所有权测试](../tests/capture/test_storage_lifetimes.py)、[逐边界对照](../tests/test_storage_lifetime_capture.py)。
 
+## 原生算子参数绑定
+
+原生 dispatch 的 `OpNode.inputs` 继续按实际位置参数、再按关键字插入顺序展开张量，保留每次出现的位置；同一张量重复传入时不会去重。张量元数据使用本地形状。`attrs["input_tensor_bindings"]` 额外保存不可变的 `(参数名, 结构)` 元组，参数名来自实际 overload 的原生 schema，结构中的整数引用 `inputs` 的零基位置，元组保存列表／元组边界，`None` 保存空缺。例如：
+
+```python
+(("self", 0), ("indices", (None, 1)), ("values", 2))
+```
+
+上述绑定用于区分 `indices=[None, index]`、融合优化器的多个张量列表和稀疏算子的可选张量角色。省略的可选 Tensor 默认值和空 Tensor 列表也会保留；不按张量身份、shape 或模型路径推断角色。没有原生 schema 的调用不生成绑定；v1 结构只覆盖 Tensor、列表／元组及 `None`，包含字典张量参数时整组绑定不输出，避免暴露不完整的角色映射。绑定只增加捕获事实，不改变数据依赖、内存观测及原始 overload 名。
+
+非张量参数按实际值保存，包括 Tensor 声明槽中运行时出现的标量，例如 `aten.add.Tensor` 的 `other=3`。不读取 Tensor 数据或调用 `.item()`。合法数据填充值 `-inf`、`+inf`、`nan` 分别编码为 `("__sim_scalar_float_v1__", "-inf" | "+inf" | "nan")`，避免向严格 JSON 写入非有限浮点数；消费端须识别此标量编码，而不是把它用于硬件参数或耗时配置。
+
+原生 c10d ReduceOp ScriptObject 通过 `.op()` 提取真实枚举，明确保存 `sum/product/min/max/avg/band/bor/bxor`。`PREMUL_SUM` 的 ScriptObject 未暴露乘数，当前保存 `unsupported:premul_sum`，不能当作普通求和估算。旧捕获中已经被字符串化或丢弃的值不会由新契约自动恢复。
+
+实现见 [operator_arguments.py](../torchtitan_simulator/capture/operator_arguments.py)，实际 dispatch 与 fake process group 验证见 [参数捕获测试](../tests/capture/test_operator_arguments.py)。这些测试验证捕获契约，不证明真实 NPU kernel 数值或 HCCL 性能。
+
 ## 通信、流控制与负载结构
 
 通信必须保留真实 process group、rank 成员、primitive、dtype 和 volume。EP／TP／FSDP mesh 可以重叠，不从 world 或模块名猜轴，也不恢复旧 HSDP 轴修正来绕过新版布局。
