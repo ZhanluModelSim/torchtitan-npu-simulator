@@ -1,138 +1,49 @@
 # Simulator 开发规则
 
-`experiments/simulator` 是独立 distribution `torchtitan-simulator`，在 Meta 上复用 torchtitan-npu 的原生模型、配置、并行化、loss 和 optimizer，捕获训练负载并估算逻辑活跃 storage 内存。主包导入不得依赖或自动激活本包；不编辑上游 checkout 或安装源码。
+`experiments/simulator` 是独立 distribution `torchtitan-simulator`，在 Meta 上复用原生训练生成负载与静态显存。继承[仓库规则](../../.agents/AGENTS.md)和 [experiments 规则](../AGENTS.md)。主包不得依赖本包；不编辑上游 checkout 或安装源码。
 
-继承[仓库开发指南](../../.agents/AGENTS.md)和 [experiments 规则](../AGENTS.md)。本文件用于定位入口和约束修改；详细语义以当前源码及下面的领域指南为准，历史报告不作为当前版本的自动验收证明。
+## 无上下文任务的阅读顺序
 
-## 开始工作
+1. [README](README.md)：定位、环境和最小运行。
+2. [整体方案](docs/architecture.md)：执行链、职责、图与内存交付边界。
+3. **新模型必须按[模型接入流程](docs/model-integration.md)及[常见问题](docs/model-integration-pitfalls.md)推进**，不能只注册 preset 或放宽 family 校验。
+4. [开发导航](docs/developer-guide.md)：按任务选择专题、测试和交付检查。
+5. 改捕获／运行时时读[捕获契约](docs/capture-runtime.md)；查支持范围读[能力矩阵](docs/capability-matrix.md)，不要把历史迁移报告当成当前能力。
 
-- 先读[统一开发指南](docs/developer-guide.md)。运行时、兼容、capture/IR/通用内存和公开接口修改按[捕获运行时与负载契约](docs/capture-runtime.md)；模型结构、配置、组件、并行、量化及 checkpoint 修改按[模型适配与验收](docs/model-integration.md)。同时涉及两个领域时，两套规则都适用。
-- 安装与最小运行见 [README](README.md)；平台同进程接入与参数见[接入指南](docs/upstream-integration.md)；支持范围查[能力矩阵](docs/capability-matrix.md)，并对照源码。主包支持某模型或某设备不表示 simulator 已支持。
-- 修改前确认实际 Python、torch/torch_npu、CANN、torchtitan、torchtitan-npu、simulator 及可选 torchao-npu 的版本和导入路径。容器镜像、宿主源码与容器安装包可能不同，必须核实加载的是当前工作树。
+## 修改归属
 
-## 入口与执行链路
+- 主包 `torchtitan_npu/models/` 定义模型结构、配置工厂、parallelize 与 checkpoint；优先复用同构 block、公共组件和现有配置级 override，模型差异留在所属模型。
+- `config.py`／`presets.py`／`model_overrides.py`／`selective_ac.py` 负责模拟参数与原生配置组合。CLI 是白名单，不是任意训练配置透传。
+- `runtime.py`／`compat/` 仅提供显式、可恢复的 Meta/autograd/分布式适配及必要虚拟融合；正常设备训练不受影响。
+- `capture/`／`ir/` 保留数据、通信、流控制、保存值和身份事实；`memory/` 计算逻辑 storage 预算及卸载驻留；`runner.py`／`step.py` 编排单次交付。
+- 性能预测、硬件、cube/vec 分类、DES、GA 阶段展开与最终指标归下游，不在训练仓恢复 cost 或编造耗时。
 
-| 入口 | 实现与用途 |
-| --- | --- |
-| `python -m torchtitan_simulator` | `torchtitan_simulator/__main__.py` → `cli.main()` |
-| `torchtitan-simulate` | `pyproject.toml` 注册的同一个 `cli.main()`；需要安装 distribution |
-| Python 同进程调用 | 从 `torchtitan_simulator.config` 导入 `SimulationConfig`，从 `torchtitan_simulator.runner` 导入 `simulate`；`simulate(options)` 返回 `WorkloadGraph` |
-| `--build-only` | `prepare_config()` → `meta_runtime()` → `build_meta_model()`，打印模型构建报告；不捕获训练步、不验证梯度、不导出内存结果 |
-| 容器入口 | `scripts/container-entry.sh` 加载 `CANN_ENV_FILE` 后执行模块 CLI；`Dockerfile` 只安装 sidecar，基础镜像必须已有完整训练依赖 |
+## 必须保持的边界
 
-正式捕获沿以下顺序定位，不恢复旧 `SimulationTrainer.train` patch：
+- 原生 dispatch 优先。按实际 schema 与最小 Meta／梯度探针判断兼容缺口，不按版本号装整套 patch，不用同 shape 占位 tensor 冒充真实保存值。
+- 自定义融合必须具有明确 fake/Meta、autograd、真实保存输入和 `tensor_semantics` 声明；未知轴为 None，不从 shape 猜角色。主包定义的算子不得反向依赖 simulator，声明放在对应兼容层。详见[语义契约](docs/custom-tensor-semantics.md)。
+- 默认同模型／optimizer 执行实际 GA 的一次无捕获结构预热，再捕获单 microbatch F/B 和 O。低层 `run_simulation_step` 不自动预热；预热不是数值意义上的真实第二训练步。F 内可交错 head/loss backward，不能只按 phase 判断 F/B。见[稳态捕获](docs/steady-state-capture.md)。
+- 默认交付 FSDP 通信视图，完整源图在 `captured_workload`；静态显存读取完整原始事件。隐藏 FSDP 准备／搬移是约定，不为所谓完整性擅自打开。
+- 保留 stream/event、producer、alias/mutation、跨模板依赖；零耗时控制节点也参与等待。逻辑 stream 不等于硬件资源，不按序号全串行补边，不折叠或重编号掩盖缺口。
+- tensor、wrapper、storage、allocation generation 和保存槽分开。一次 unpack、最后读取或 Python wrapper 销毁不等于释放设备 storage；只精确排除保存钩子引入的 detach，不全局过滤原生 detach/view。
+- head/norm/loss 与无法确认层归属的值保留设备驻留，不伪装成 decoder 层，也不为消除 unattributed 删除记录。AC/offload 按真实保存、生产、消费和写入关系处理。
+- 既存 optimizer state 按本地 storage 去重进入初始内存。未卸载 F/B/O 含状态；卸载排除状态和约定忽略的逐 tensor buffer，但状态总量仍保留，不能按权重倍数推断。激活与优化器卸载独立。
+- 卸载在训练执行图生成传输及等待，静态预算与同一计划一致；平台只定时与 DES，不重复补拖尾。激活阶段内预取、晚 producer 的 F 末保守收尾、共享 storage 和复制后写入限制见[激活卸载](docs/activation-offload-design.md)。优化器双向并行近似见[优化器卸载](docs/optimizer-offload.md)。
+- 原生参数绑定与 AdamW 六组列表／可选角色不能丢失。源张量容量 `volume_bytes` 服务内存／调度，不是网络模型流量；不恢复 `communication_input_bytes` 或旧成本字段。
 
-1. `config.prepare_config()` 校验 `SimulationConfig`、解析 preset 或 `module.factory`，构造原生配置树，选择 override、AC 和量化。
-2. `runner.simulate()` 进入 `runtime.meta_runtime()` 与 `compat.distributed.logical_world()`，构建 Meta 模型并执行原生 parallelize，创建 loss、optimizer、scheduler 和合成输入。
-3. `runner` 先执行无观测的实际 GA 次 F/B、clip 和 optimizer 结构预热，不推进 scheduler，清梯度后安装观测器；`step.run_simulation_step()` 捕获 forward/backward、clip、optimizer、scheduler 和 zero-grad 路径，将 dispatch 事件组装成 step、schedule 和 workload，并计算内存计划。
-4. `runner` 检查参数梯度与 buffer 契约，附加配置、rank、量化与假设注记，经 `validation.validate_workload()` 后按显式选项导出并返回结果。
+## 环境、入口与交付
 
-CLI 是参数白名单，不是任意原生训练参数的透传。新增参数须同步检查 `SimulationConfig`、`cli.py`、`prepare_config()`、实际 consumer、测试及接入文档；几何参数还需检查 `model_overrides.py`。不接受配置后静默忽略。
+使用 `python -m torchtitan_simulator` 或 `runner.simulate(SimulationConfig(...))`；具体参数与返回对象见[同进程接入](docs/upstream-integration.md)。`--build-only` 不证明图、梯度或内存正确。
 
-## 源码归属
+运行前加载实际 CANN 环境，并在导入 torch 前设置 `TORCH_DEVICE_BACKEND_AUTOLOAD=0`。核对 Python、依赖版本及主包／sidecar 实际导入路径。容器与宿主 checkout 不一定相同，不把旧挂载路径写成安装契约。
 
-以下路径相对于 `torchtitan_simulator/`。
+当前单进程只承载选定 logical rank；已有 process group、嵌套或并发模拟不支持，正常及异常退出都须恢复会话状态。PP>1、FP8 通信和 A5 当前拒绝。模型限定、精度与量化范围以能力矩阵和实际校验为准。
 
-| 位置 | 职责 |
-| --- | --- |
-| `config.py`、`presets.py`、`model_overrides.py`、`selective_ac.py` | 原生配置组合、保留几何、类型化结构覆盖和原生 selective AC 策略 |
-| `runtime.py`、`compat/` | 显式会话、能力探针、可恢复的 Meta/autograd/分布式兼容及模型虚拟融合 |
-| `meta_env.py`、`rank_context.py`、`rank_table.py`、`metadata.py` | 捕获上下文、逻辑 rank/mesh、CPU 控制元数据与 Meta 元数据转换 |
-| `runner.py`、`step.py` | 原生训练步接线、捕获编排及结果交付 |
-| `capture/` | dispatch、通信与流依赖、保存槽、storage 生命周期、FSDP 驻留和图组装 |
-| `ir/` | 算子、tensor 元数据、step、schedule plan/graph 和 workload 结构 |
-| `memory/` | storage 去重、生命周期回放、AC/offload 投影、状态预算和文件输出 |
-| `validation.py` | workload 引用、依赖、DAG 与捕获一致性校验 |
+默认 `output_formats=[]`，仅返回 WorkloadGraph 和静态内存，不创建目录或打印导出预算；显式 `["mem"]` 才导出 summary／明细。`export_result` 空格式无操作，不恢复强制文件交付。旧输出目录不自动清理。
 
-`tests/`、`scripts/` 和 `docs/` 位于 distribution 根目录。模型定义、配置工厂、parallelize/sharding 和 checkpoint adapter 归属主包 `torchtitan_npu/models/`；仅模拟所需的兼容留在本包。不得把实验分支泄漏到主包训练路径。`capture/`、`ir/`、`memory/` 的迁移须延续语义与测试，移动文件不等于完成新版验收。
+## 验证与文档
 
-## 当前运行边界
-
-- `prepare_config()` 当前接受 DeepSeek-V4 和 Kimi K3。preset 映射以该函数为准；默认 `deepseek_v4_smoketest` 使用原生 debugmodel。`deepseek_v4_pro_20t` 在 `presets.py` 保留旧几何，不是新增的上游官方 preset。
-- 单进程承载选定的 `logical_rank`，默认先按实际 GA 结构预热，再捕获一个 microbatch 和一次优化器更新。正式图和内存预算不表示完整梯度累积回放，详见 [稳态捕获](docs/steady-state-capture.md)。输入是合成单文档 next-token 序列，EP 使用均衡路由假设。
-- 当前 PP 必须为 1，FP8 通信和 A5 目标明确拒绝；compile/CUDA graphs 为 dispatch 捕获关闭。逻辑 world、capture worker 和 PP stage 必须区分。
-- 当前 DSV4/Kimi 完整捕获要求 FP32 原始参数，可用 BF16 `mixed_precision_param` 计算；build-only 接受的 dtype 不代表完整捕获可用。`memory_parameter_storage_dtype` 是存储预算投影，不改变真实计算精度。
-- 量化默认关闭，以 `enable_quantized_training` 显式启用原生 `all_mxfp8` recipe，需要配套 `torchao_npu`。preset 只选择结构，不从名称推断精度，不恢复旧精度后缀 preset 或 FQN 名单覆盖。
-- 在导入 torch/simulator 前设置 `TORCH_DEVICE_BACKEND_AUTOLOAD=0` 并加载对应 CANN 环境。Meta 捕获仍依赖配套训练软件栈，不能理解为仅安装 CPU torch 即可运行全部模型。
-- 会话拥有 fake process group；不支持宿主已有 process group、嵌套或并发仿真。同进程串行调用须恢复 patch、TLS、mesh/cache 和全局状态，覆盖正常与异常退出。
-
-## 捕获与内存必须保持的语义
-
-- 原生 dispatch 优先。`compat/` 按真实接口/schema 与最小行为、梯度探针选择兼容，不按版本号分支；健康原生实现不得被无条件替换。patch 集中于可撤销作用域，禁止全局伪造设备工厂或用占位 tensor 冒充真实保存值。
-- EP dispatcher 共用 `compat/routing.py` 的 functional `all_to_all_single` 适配，保留 count 到数据交换的依赖；不为模型增加另一套通信变体，不据此改写 CP/FSDP。
-- 保留原始 view/alias/mutation、真实 process group 和流控制依赖。零耗时 `stream_wait` 仍参与调度；不得恢复图折叠、按序号全串行补边或推断恢复来掩盖捕获缺口。
-- 默认返回 FSDP 通信视图，以实际 framework scope 隐藏 FSDP 非通信节点；完整源图保存在 `captured_workload`，所有内存事件照常参与估计。投影只传递已捕获的路径，不重编号或推断依赖；原始内存事件的 ID 到源图解析，详见[通信视图契约](docs/capture-runtime.md#fsdp-通信视图)。
-- tensor、wrapper、storage 与 allocation generation 分开；一次 unpack、最后读取或 Python 对象销毁不等于设备 storage 释放。结合实际所有权、保存槽销毁、SAC 缓存消费及 FSDP alloc/free 判断生命周期。
-- 保存钩子引入的 unpack 恢复用 detach 按精确对象身份排除，并保留别名依赖；不按算子名全局过滤 detach。模型／框架原有元数据节点仍保留，不能当作真实 Vector kernel 计数，详见[运行时契约](docs/capture-runtime.md#保存钩子引入的-detach)。
-- 保存槽不等于激活或卸载候选。区分 F action 内交错反向和后续 B/recompute，核查同一 storage 的全部保存及使用。AC 先确认层／checkpoint 绑定再清零，覆盖无保存槽、无绑定的非层重算引用。
-- `unattributed` 的目标是没有未解释项。已知 head/norm/loss/梯度桥接不伪装成 decoder 层；默认逐层 offload 仅选归属明确的层或显式 checkpoint 保存值。层外和未确认归属的值继续参与设备生命周期及峰值，禁止删除记录或只过滤报表得到零未知项。
-- 使用实际本地 storage 去重和独立字节先验。optimizer state 来自实际状态清单；未卸载时稳态峰值已含状态，不能重复相加；优化器卸载时四项峰值排除状态，状态总量仍保留。逐层 payload 表示单向传输量，不取卸载后为零的驻留字节。
-- Meta 图、梯度元数据与逻辑 storage 预算不能证明真实 NPU 数值、HCCL 耗时或 allocator 峰值。训练仓不再估计算子 cost；allocator reserved/cache、碎片和未建模 workspace 不在预算内。
-
-## 输出契约
-
-CLI 和 `simulate()` 默认仅返回内存对象，不创建目录或写文件。`output_formats=["mem"]`／`--simulation.output-formats mem` 显式导出 `<output_dir>/memory/memory_summary.json` 和内存明细。`export_result()` 同样按该选项控制，空列表为无操作。每次验证使用独立输出目录，旧目录中的结果和明细不会自动清理。
-
-summary 保持六项预算（四个遵循优化器驻留开关的稳态峰值、权重大小、优化器状态大小）及逐层 offload payload 列表。字段与口径见[稳态内存说明](docs/steady-state-memory.md)。修改时同步 `memory/records.py`、`memory/export.py`、实际消费者、验收脚本及接入文档；不恢复 JSON/HTML/DOT 图导出。
-
-激活 offload 执行图见[真实捕获核对与实现说明](docs/activation-offload-design.md)。启用现有开关后，训练侧在通信视图插入传输及等待、修正静态显存，平台负责传输耗时和 DES，MBU 分子不变。按 comp_type 区分 F/B，B 无预取窗口时入口显式加载，阶段间不延续异步传输。原生 FSDP wait 不当作逐层屏障；完整 DAG 前沿保留通信路径。晚 producer 整层复制保守降级为 F 末 drain，并在 notes／日志声明可能超过两层驻留。原始事件／lifetime 不改，新增预算放 activation_buffer_lifetimes；schema 写入事实禁止使用过期主机副本。激活计划不处理优化器卸载。
-- 优化器卸载由独立 `memory_offload_optimizer_states` 开关控制：真实本地状态总量作为每方向 payload，生成共同入口／出口及 H2D、D2H，与原生更新节点并行；不修改 AdamW 耗时，不包含 clip/pre/post 窗口，不乘 GA。F/B/O 排除状态及瞬态搬运 buffer，原始 inventory/lifetime 保留；激活 buffer 继续计入。更新之间夹有非更新准备节点的图明确拒绝；详见 [优化器卸载](docs/optimizer-offload.md)。最终 `memory_configuration` 明确返回两种实际开关，包括 false。
-
-## 开发与验证入口
-
-以下命令均从 `experiments/simulator` 执行，使用已配置完整训练栈的 Python。安装命令见 [README](README.md)，测试工具来自 `pyproject.toml` 的 `dev` extra。
-
-```bash
-# 小模型完整捕获；默认校验图和梯度元数据，内存预算随返回对象交付。
-TORCH_DEVICE_BACKEND_AUTOLOAD=0 python -m torchtitan_simulator \
-  --config deepseek_v4_smoketest \
-  --simulation.output-dir /tmp/simulator-smoke
-
-# 本包测试与独立 pyrefly；源码路径按实际安装位置填写。
-TORCHTITAN_SOURCE=/path/to/torchtitan \
-TORCHTITAN_NPU_SOURCE=/path/to/torchtitan-npu \
-bash scripts/validate.sh
-```
-
-`validate.sh` 先运行本包 pytest，再运行本包 pyrefly；参数透传给 pytest。可用 `TORCHAO_NPU_SOURCE` 补充类型搜索路径。根项目类型检查刻意排除本包，不能用根目录检查代替 sidecar 检查，也不能以 `experiments.simulator.*` 重复扫描同一模块。
-
-### 当前工作区的 Docker 环境
-
-本工作区已有 `ttsim` 容器，宿主 `/home/andy/Projects` 挂载到 `/workspace`，当前仓库对应 `/workspace/torchtitan-npu-simulator`。优先复用并核对其状态及挂载，不因宿主缺少 Python/CANN 就判定无法运行，也不直接重建环境。这是本机环境记录，不是其他机器必须采用的容器名或路径。
-
-从宿主执行下面的命令可直接使用挂载的 simulator 源码；容器停止时先执行 `docker start ttsim`。`docker exec` 不会重新执行容器 entrypoint，需显式加载所需 CANN 环境：
-
-```bash
-docker exec -w /workspace/torchtitan-npu-simulator/experiments/simulator \
-  -e TORCH_DEVICE_BACKEND_AUTOLOAD=0 ttsim bash -lc \
-  'source /usr/local/Ascend/ascend-toolkit/set_env.sh && python -m torchtitan_simulator --config deepseek_v4_smoketest --simulation.output-dir /tmp/simulator-smoke'
-```
-
-这里的 `/tmp/simulator-smoke` 在容器内。运行模块无需本包的 console script 已安装，但主包及其训练依赖必须可导入；验证前仍需核对主包 editable 路径。容器具备运行依赖也不表示安装了 `dev` extra 或 `pre-commit`。
-
-### 按变更选择检查
-
-- 运行时恢复和配置：优先定位 `tests/test_runtime.py`、`test_patch_scope.py`、`test_config.py`；捕获／IR／内存分别查对应测试子目录。
-- 模型端到端：查 `test_dsv4_capture.py`、`test_kimi_capture.py`、`test_kimi_parallel.py`、`test_kimi_quantization.py`、`test_s4_mxfp8.py`。
-- 内存归属：重点检查 `tests/memory/test_interleaved_loss_offload.py`、`test_layer_offload_summary.py`、`tests/test_memory_delivery.py`；控制依赖查 `tests/test_fsdp_stream_capture.py`。
-- 修改或 review 测试时遵循仓库 `developer-tests-review` 技能。新配置／并行组合必须从真实入口验证到图、梯度及内存消费者；模型、loss、AC、量化、并行和 offload 变更须检查真实配置／数学／保存／使用／释放链路，不能仅凭 build-only 或测试数量声明完成。
-- `scripts/acceptance.py` 是独立完整几何验收入口，默认覆盖四个 DSV4 结构和三种 AC；量化由 `--enable-quantized-training` 单独开启。按改动选择 `--presets`／`--modes`，Kimi 覆盖看其专门测试和[接入记录](docs/kimi-k3-migration.md)，不能将此脚本当作全部模型验收。
-- 仓库完整 Lint 仍按根开发指南执行：先核对 `/tmp/torchtitan`，再从仓库根运行 `python -m pre_commit run --all-files --show-diff-on-failure`。本包测试／类型检查通过不等于完整 Lint 通过。
-- 记录实际源码、依赖、命令、配置、逻辑 rank、输出和未验证范围。纯文档修改至少静态检查相对链接、参数和入口；运行条件具备时执行相关轻量验证，不仅为文档校对触发完整几何验收或真实 NPU 训练。
-
-Kimi chunked loss 的 FSDP reshard 策略恢复由 Meta 会话内兼容层负责，原策略在正常和异常退出均恢复；见[策略说明](docs/chunked-loss-policy.md)。
-
-预热性能口径见docs/steady-state-capture.md：测量负载生成CPU墙钟，区分warmup、完整simulate和含导入的进程时间；不能把小模型占比推广到完整模型，也不能将warmup直接耗时当作相对冷捕获的净增量。
-
-## AdamW 输入身份（2026-11-03）
-
-仅对原生 `aten._fused_adamw_.default` 按 schema 绑定并交付 `input_tensor_list_sizes`（六列表）及 `optional_tensor_roles`（grad_scale/found_inf）；inputs 规范到 schema 顺序，空列表与可选参数缺席明确表达。保留重复输入、local tensor/storage、mutation 及依赖，禁止按 shape 或逻辑参数注记推断角色。其他上游字段等待具体 costmodel 请求后补充；本次不扩展 tensor_lr 或算子模型。详见 [AdamW 输入身份](docs/adamw-input-identity.md)。
-
-
-## 仅生成负载与可选导出（2026-11-03）
-
-本仓移除cost包、OpDispatchCapture.cost_model、节点FLOPs/peak_mem/param_mem/comm_bytes、阶段重复成本/峰值字段及cost_unknown统计。不要恢复性能预测或硬件资源分类。保留依赖、stream/event、FSDP通信视图、metadata_view对流的作用、op_type名称、重算/FQN、AdamW角色与静态MemoryPlan。通信事件/slot的volume_bytes用于源张量容量与内存/调度，不是下游通信模型流量；重复communication_input_bytes属性已删除。默认同进程交付无文件，显式mem仍可诊断导出。详见[负载生成边界](docs/load-generation-boundary.md)。
-
-## 自定义算子语义轴
-
-自定义融合／包装边界必须在定义或对应兼容模块声明真实输入输出角色与轴；本轮覆盖六个 Kimi 虚拟融合和五个主包 MoE 包装 overload。`attrs["tensor_semantics"]` v1 的 index 指向实际 flattened inputs/outputs，axes 逐项对应 shape 维度；None 为未定义轴，嵌套 tuple 为单维的展平逻辑轴。保留物理 TensorMeta.layout/stride，不从 shape 猜角色，不给原生 ATen/CANN 自动添加。注册按完整 raw overload，绑定复用 input_tensor_bindings；缺席可选输入与真实空张量必须区分。声明随主包接口变更同步维护，平台／算子消费仍未接入。详见[自定义张量语义](docs/custom-tensor-semantics.md)。
+- 修改／review 测试使用仓库 `developer-tests-review` skill；文档使用 `write-torchtitan-npu-docs`。新模型按流程的分阶段出口验收，不用 build-only、测试数量或 Meta 成功替代数值／性能证明。
+- 组件、真实小模型、相关并行／AC／量化、内存独立字节预期、连续会话和 wheel 普通安装分层验证。只扩大实际受影响的路径，不机械执行全部组合。
+- `scripts/validate.sh` 是 sidecar pytest + pyrefly 入口；完整 lint 按根仓要求执行。`scripts/acceptance.py` 当前只覆盖 DSV4 的四种结构，Kimi 或新模型需要各自测试，不能自动外推。
+- 文档只维护当前方案、workflow 和必要专题。接口、能力或命令变化同步 README 导航、对应专题及能力矩阵；不再增加阶段迁移／自审文档，历史证据由 Git 保留。

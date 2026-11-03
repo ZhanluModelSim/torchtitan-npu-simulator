@@ -40,7 +40,3 @@ EP single 进入原生 SAC `comm` 保存集合。显式选择 `--simulation.sele
 [test_routing.py](../tests/test_routing.py) 覆盖两种模型的 none/full/selective AC × 量化开关、split 方向、count→dispatch→GMM→combine→unpermute 因果路径、非 Meta 调用以及失败后的绑定／process-group 恢复。
 
 [capture/test_native_collectives.py](../tests/capture/test_native_collectives.py) 通过两个真实 Gloo rank，独立检查不等长交换的输出及远端反向梯度，直接使用同一 functional 入口。完整模型的 Meta 验证覆盖梯度元数据、图及逻辑内存，不能证明 NPU 数值、HCCL 性能或 allocator/workspace 峰值。
-
-预先隔离试验的完整 43 层 Flash 配置为 world=1024、rank=1023、DPR=2、DP shard=256、TP=1、CP=2、EP=128、S=512、AC=none、MTP=0。非量化图从 109,470 节点变为 70,641，MXFP8 从 126,670 变为 87,841；301 次 EP collective 的有序通信签名、1,285 个参数梯度元数据及六项内存预算一致。正式默认实现已在同一配置上独立重新验收，未使用强制分支脚本：两种精度的节点数均与上述 single 结果一致，与原 list 路径的有序通信签名、梯度清单、保存槽数量和内存汇总分别一致；完整 MXFP8 图的 43 层、301 对关键因果关系及 129 次反向 EP 交换复核通过。
-
-正式源码的完整 sidecar 回归为 544 项通过，容器内 sidecar Pyrefly 为 0 错误；宿主全仓 pre-commit 的非类型检查及 OAT 通过，宿主 Pyrefly 仍有 608 项既有缺依赖／导入错误，未把它记为通过。原始日志及逐次源码 SHA256 保存在验收目录 `default-single-20261028`。当前源码的后续变更须重新验证；真实 NPU／HCCL 未执行。

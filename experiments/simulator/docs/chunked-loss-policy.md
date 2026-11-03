@@ -26,14 +26,4 @@ microbatch 多一次 head allgather。
 `tests/test_chunked_loss_policy.py` 覆盖多组、递归范围、不同初始同步开关、正常／异常
 恢复、scope 退出还原，以及非 FSDP 原生 loss 的输出和梯度一致性。
 
-2026-11-02 在 ttsim 中运行平台 `scripts/audit_training_ga.py`，配置为 DP replicate=2、
-shard=2、EP=2、selective AC、seq_len=128，连续捕获 4 次真实 Meta F/B：
-
-| 预设 | 前向 allgather 次数 | 完整通信事件顺序 |
-| --- | --- | --- |
-| `kimi_k3_smoketest` | 7 / 7 / 7 / 7（修复前 7 / 8 / 8 / 8） | 四次相同 |
-| `deepseek_v4_smoketest` | 8 / 8 / 8 / 8 | 四次相同，与原核对一致 |
-
-本地报告位于工作区 `runs/kimi-policy-fixed-20261102/kimi-policy-fixed/report.json`
-和 `runs/dsv4-policy-fixed-20261102/dsv4-policy-fixed/report.json`；这些是未纳入版本管理的运行产物。
-上述验证证明 Meta 通信结构和策略恢复，不代表 NPU 数值或硬件性能验收。
+新增模型或升级依赖后，应连续捕获多次 F/B，比较 head allgather 次数与有序通信签名，确认策略不会随首次 loss 调用漂移。Kimi 曾出现第一次与后续 microbatch 的 head allgather 次数不同，排查时须先检查策略恢复，而不是直接增加 GA 模板。该检查验证 Meta 通信结构，不代表 NPU 数值或硬件性能验收。

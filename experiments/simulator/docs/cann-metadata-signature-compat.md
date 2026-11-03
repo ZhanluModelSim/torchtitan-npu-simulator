@@ -21,25 +21,11 @@ RuntimeError: Metadata Python/dispatcher contract differs: lightning_indexer_met
 
 ## 验证与边界
 
-[tests/test_metadata.py](../tests/test_metadata.py) 的新增 opaque-wrapper 用例在修正前有 12 项失败；修正后四算子的位置／关键字调用、严格参数校验、原生节点与消费者依赖、Python binding 恢复均通过。
+[tests/test_metadata.py](../tests/test_metadata.py) 覆盖四算子的位置／关键字调用、opaque wrapper、严格参数校验、原生节点与消费者依赖，以及退出后 binding 恢复。环境更新后应重新运行组件探针和真实小模型；包装签名形式相同不证明整套 CANN 软件栈兼容。
 
-真实 `simulate()` 同进程运行正常接口和四个 opaque wrapper 两条路径；两者的 112 个参数梯度清单、保存槽数量、逻辑内存峰值和常驻参数字节一致，图无环且峰值 storage 唯一。此处比较真实模型执行结果，不以 placeholder 图替代。
+## 环境排查经验
 
-| 检查 | 实际结果 |
-| --- | --- |
-| Metadata 专项 | 21 passed，包含 13 项新增用例 |
-| 全量 sidecar 回归 | `python -m pytest tests/ -q -x`：444 passed，193.87 秒 |
-| Sidecar 类型检查 | 0 errors，11 suppressed；未新增类型忽略 |
-| 独立静态复审 | 无必改问题；审查者未执行测试，运行结果由上述实际命令提供 |
-| Lint | 常规、Ruff、格式、架构、OAT 通过；主机 Pyrefly 可执行文件缺失，全仓 pre-commit 不能标为全绿；类型检查使用完整依赖容器 |
-
-验证日志位于本机审计目录 `torchtitan-migration-audit-20261020/dispatch-first-remediation/` 的 `metadata-opaque-before.log`、`metadata-opaque-complete.log`、`metadata-opaque-full-tests.log` 和 `metadata-opaque-types.log`。
-
-当前验证环境仍是冻结的 CANN 9.2.0-beta.2，通过 opaque wrapper 重现用户的接口形式；没有完整复验用户的 CANN 9.2.0 软件栈。原 21 项全规模矩阵及哈希保留为原提交的验收证据，不伪装为本补丁重新执行过 21 项矩阵。内部环境更新分支后需重跑同一 smoke 命令；若有新 traceback，应继续核对实际 schema／Meta 能力，不删除校验来掩盖版本差异。
-
-## 安装与启动的已知事项
-
-- 已验收组合为 NumPy 1.26.4 + PyArrow 25.0.0。初始 PyArrow 26.0.0 在该 NumPy 上导入失败；requirements 未锁定该组合，装完依赖后需核对。可保持 NumPy，执行 `python -m pip install --force-reinstall --no-deps "pyarrow==25.0.0"`，再确认两者可导入。
-- CANN Python 包导入可触发 `torch.utils.cpp_extension.load()`，出现 `c++`／`.so` 编译和链接日志；与本补丁及 `torch.compile` 关闭无冲突。首次慢，后续可复用编译缓存；持久化 `TORCH_EXTENSIONS_DIR` 可保留缓存。
-- autograd warning 可能来自能力探针在安装 bridge 前执行原生 Meta 梯度检查；不能仅凭 warning 判断训练梯度丢失，也不能仅凭 warning 后仍运行就认定数值正确。以完整运行结果、梯度清单与捕获校验为准。
-- Meta 仿真不依赖真实 NPU 可用性；`npu-smi info` 不可用不能作为 Meta smoke 失败的唯一依据，也不能据 Meta 成功证明真实 NPU/HCCL 可用。
+- CANN Python 包导入可能触发 `torch.utils.cpp_extension.load()`，出现 C++ 编译与链接日志；这不等于训练启用了 torch.compile。区分冷启动编译、后续缓存与实际捕获耗时。
+- NumPy/PyArrow 等二进制依赖需按实际训练栈配套，先检查 import traceback，不依据旧环境版本号盲目降级，也不通过移除依赖校验解决运行问题。
+- autograd warning 可能来自 bridge 安装前的能力探针，但必须检查完整运行的梯度清单、保存值与实际 backward 节点；不能仅凭 warning 判断失败或成功。
+- Meta 仿真不要求真实设备可用；npu-smi 失败不单独证明 Meta 失败，Meta 成功也不证明真实 NPU/HCCL 可用。

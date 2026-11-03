@@ -1,46 +1,64 @@
-# Simulator 开发指南
+# Simulator 开发导航
 
-本指南将 TorchTitan v0.3.0 迁移中已经验证的做法组织为两个开发领域，供后续开发者和 AI 接入模型、升级依赖或修改捕获基础设施时使用。
-源码、配置和测试是行为真源；历史迁移报告用于解释取舍，不作为新版本的自动验收证明。
+本指南是无上下文开发者的阅读与验证入口。先阅读[整体方案](architecture.md)，接入模型按[新模型流程](model-integration.md)逐步执行；修改捕获基础设施则按[捕获契约](capture-runtime.md)核对已有模型。源码、配置和测试是当前行为的依据。
 
-## 两个开发领域
+## 文档分工
 
-| 领域 | 职责与入口 | 先读哪些内容 |
-| --- | --- | --- |
-| 捕获运行时与负载契约 | 环境基线、显式激活、Meta/autograd 兼容、tensor/storage 身份、通信控制依赖、L0–L3、内存与对外接口 | [捕获运行时开发](capture-runtime.md) |
-| 模型适配与验收 | 官方结构对照、原生配置树、组件复用、融合边界、模型并行、量化、checkpoint、保存值归属与独立先验 | [模型接入开发](model-integration.md) |
-
-修改 `compat/`、通用 capture/IR/memory 或公开接口时，首先按运行时领域检查所有模型调用点；模型接入不得用模型专属 patch 绕过这些通用契约。
-修改模型、loss、AC、量化或并行时，首先按模型领域检查实际选中路径；遇到通用能力缺口再回到运行时领域修复。
-
-## 按任务选择专题
-
-| 任务 | 进一步阅读 |
+| 文档 | 回答的问题 |
 | --- | --- |
-| 平台同进程调用、CLI 参数和结果消费 | [上游接入](upstream-integration.md) |
-| 六项预算、逐层 payload、offload 与 dtype | [单卡内存结果](steady-state-memory.md) |
-| FSDP 等待、AG/RS/AR 和零耗时节点 | [流控制契约](stream-control-dependencies.md)、[依赖审计](fsdp-dependency-audit.md) |
-| 保存槽、storage 所有权、AC 与状态 | [S3 生命周期审计](s3-lifetime-audit.md)、[生命周期优化](storage-lifetime-optimization.md) |
-| CANN Meta 与 Python 包装接口差异 | [签名兼容](cann-metadata-signature-compat.md) |
-| 原生 MXFP8 recipe、code/scale 和保存值 | [量化审计](s4-mxfp8-audit.md) |
-| Kimi 的组件、数学和融合边界案例 | [Kimi 接入](kimi-k3-migration.md) |
-| 当前支持范围与历史验收区别 | [能力矩阵](capability-matrix.md)、[分阶段验收](acceptance.md) |
+| [整体方案](architecture.md) | 为什么复用原生训练、如何捕获、图与内存分别怎样交付 |
+| [新模型流程](model-integration.md)／[常见问题](model-integration-pitfalls.md) | 从模型先验到可验收负载，如何复用、修改、注册和排错 |
+| [捕获契约](capture-runtime.md) | 身份、依赖、保存槽、作用域恢复与公共捕获不变量 |
+| [同进程接入](upstream-integration.md) | 已支持模型如何调用，参数与返回对象在哪里读取 |
+| [能力矩阵](capability-matrix.md)／[未覆盖范围](open-questions.md) | 哪些能力有实际路径与测试，哪些不能宣称支持 |
+| [稳态捕获](steady-state-capture.md)／[静态显存](steady-state-memory.md) | 结构预热、GA、优化器状态及逐层 payload 的口径 |
+| [语义声明](custom-tensor-semantics.md)／[AdamW 身份](adamw-input-identity.md) | 给下游提供真实角色和轴，不把 shape 猜测当事实 |
+| [流控制](stream-control-dependencies.md)／[EP 交换](ep-single-transport.md) | 通信与等待如何成为真实依赖 |
+| [激活卸载](activation-offload-design.md)／[优化器卸载](optimizer-offload.md) | 传输执行图、静态预算和已知建模近似 |
+| [CANN 接口兼容](cann-metadata-signature-compat.md)／[生命周期机制](storage-lifetime-optimization.md)／[chunked loss](chunked-loss-policy.md) | 对应实现为何存在，哪些语义必须保留 |
 
-## 通用开发顺序
+## 先核对环境
 
-1. 固定源码、软件栈、配置和输入，确认基线与候选实际加载的文件路径。保持工作树和安装源码隔离。
-2. 沿真实入口找到问题，先做最小行为探针，再判断属于环境、配置、Meta、autograd、归属、图依赖还是估算问题。
-3. 遵循原生 dispatch 优先；复用已有实现；必要兼容集中在显式、可恢复的作用域内。不复制旧 patch 后再逐个屏蔽错误。
-4. 修改实现及所有调用点，补能区分错误路径的独立预期；兼顾正常、异常退出和连续捕获。
-5. 从小模型扩到相关并行／AC／量化路径，最后执行代表性完整几何验收。只在存在不同生产路径时扩大组合，不用无意义的笛卡尔积替代分析。
-6. 同步公开接口和能力边界，保留实际命令、源码哈希、模型几何、rank 坐标和原始证据。新增失败不能混入既有基线告警。
+在实际运行的 Python 环境执行；本机是否有源码不能证明容器正在使用它：
 
-没有真实 NPU 时，CPU 数学对照、Meta 图、逻辑内存和 Gloo 契约分别报告；不能改写为 NPU 数值、HCCL 性能或 allocator 峰值通过。
-完整测试次数只说明执行范围，不能替代独立字节先验、缺梯度检查和因果依赖测试。
+```bash
+export TORCH_DEVICE_BACKEND_AUTOLOAD=0
+python - <<'PYCODE'
+import sys
+import torch, torchtitan, torchtitan_npu, torchtitan_simulator
+print(sys.executable, torch.__version__)
+for module in (torchtitan, torchtitan_npu, torchtitan_simulator):
+    print(module.__name__, module.__file__)
+PYCODE
+```
 
-## 本次迁移的证据入口
+此前须加载实际 CANN 环境。容器工作目录、挂载和 editable 安装路径逐次核对，不复制历史容器名或另一 checkout 的路径。可用 `docker inspect <container>` 检查挂载。主包与 sidecar 都必须指向本次修改；不修改安装源码或用 `sys.path` 拼接替代安装。
 
-[迁移状态](migration-status.md) 保存固定版本、镜像和旧 patch 处置；
-[dispatch 收敛](dispatch-first-remediation.md) 保存从手工补图转向原生机制的验证；
-[精简记录](simulator-cleanup.md) 保存折叠、补边和多格式图导出删除的范围。
-这些报告包含历史快照。新的源码、镜像、参数规模或依赖版本必须重新验证，不能沿用其中的计时和峰值作为通过结论。
+## 检查顺序
+
+1. 用最小行为探针区分配置、原生接口、Meta/autograd、图依赖或内存归属问题；保留原始异常。
+2. 修改所属层及全部相关调用点，补能够区分错误实现的独立预期；不让新模型专用判断渗入公共捕获。
+3. 先验证组件 F/B，再跑真实小模型及相关并行／AC 路径；具体门槛和命令见新模型流程。
+4. 核对连续两次会话及异常退出后的清理，保证全局 patch、process group、TLS 和 cache 不污染下一任务。
+5. 代码变更完成后检查类型、lint、普通 wheel 安装以及实际消费者；只修改文档时执行链接、命令和必要轻量示例检查，不重复昂贵全规模验收。
+
+### 工具入口
+
+从 `experiments/simulator` 执行，使用已安装 `dev` extra 的完整训练环境：
+
+```bash
+# 选择测试子集，或省略 -k 运行整个 sidecar。
+TORCHTITAN_SOURCE=/actual/torchtitan-source \
+TORCHTITAN_NPU_SOURCE=/actual/torchtitan-npu-source \
+bash scripts/validate.sh -k 'custom_tensor_semantics or tensor_semantics'
+```
+
+`validate.sh` 先执行 pytest，再对整个 sidecar 执行 pyrefly。源码根必须替换为实际路径；如果上游是普通 wheel，类型检查可能需要其 site-packages 搜索根。`TORCHAO_NPU_SOURCE` 可补充量化包路径。根项目类型检查排除本包，不能拿根目录结果代替 sidecar 检查。
+
+完整 lint 仍遵循仓库根开发指南：核对 `/tmp/torchtitan` 后，从仓库根执行 `python -m pre_commit run --all-files --show-diff-on-failure`。局部 Ruff 通过不能写成全仓 lint 通过。
+
+普通 wheel 安装须离开源码目录确认导入来自 site-packages，并验证关键 API；已有 editable 测试不代替交付测试。模型接入结果必须区分源码核对、CPU 数学、真实 Meta 捕获与真实 NPU 数值／性能验证，不能相互替代。
+
+## 文档维护
+
+当前方案、模型 workflow 和专题各有单一职责；README 与 AGENTS.md 只导航和规定边界。历史审计数字、迁移阶段及中间自审不再单独维护，必要时从 Git 历史追溯。新增能力同步所属专题、能力矩阵、公开入口和相关测试，不再追加另一份重复的「本轮完成」文档。

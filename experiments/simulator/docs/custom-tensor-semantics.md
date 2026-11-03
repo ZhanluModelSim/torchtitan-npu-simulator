@@ -1,6 +1,6 @@
 # 自定义算子的张量语义
 
-训练负载为本仓自定义融合与包装算子提供输入／输出角色和轴含义，使下游无需根据 shape 猜测 query、token、head 等语义。信息存放在 `OpNode.attrs["tensor_semantics"]`；原有 shape、dtype、stride、物理 layout、参数绑定及依赖保持不变。本轮只扩展训练仓输出，平台和算子仓尚未增加读取逻辑。
+训练负载为本仓自定义融合与包装算子提供输入／输出角色和轴含义，使下游无需根据 shape 猜测 query、token、head 等语义。信息存放在 `OpNode.attrs["tensor_semantics"]`；原有 shape、dtype、stride、物理 layout、参数绑定及依赖保持不变。平台已接收、校验并透传至预测特征；具体 adaptor 的解析支持由算子仓维护。
 
 ## 数据结构
 

@@ -1,26 +1,12 @@
 # 激活 offload 执行图设计与真实捕获核对
 
-本文记录 2026-11-02 的真实 Meta 捕获核对与激活 offload 实现。训练 simulator 在通信视图上插入激活传输与等待依赖，并修正静态显存；平台提供传输耗时、资源与 DES。沿用 `memory_offload_ac_saved_tensors=True` 启用。优化器卸载不在范围内；本仓不执行真实设备 copy。
+本功能将激活卸载计划显式写入训练执行图。训练 simulator 在通信视图上插入激活传输与等待依赖，并修正静态显存；平台提供传输耗时、资源与 DES。沿用 `memory_offload_ac_saved_tensors=True` 启用。优化器卸载使用[独立计划](optimizer-offload.md)；本仓不执行真实设备 copy。
 
-## 实现前的真实捕获证据
-
-训练基线 `3189b01e2553df642003e87ecce9c4e09ef94aa8`，平台基线 `e33f84f08e518192dea9fad99d2788e9094176a5`。在 `ttsim` 容器使用工作区 editable 安装、PyTorch `2.14.0+cpu` 运行，实际 simulator 导入来自本 checkout。以下为 Meta 捕获及公共图适配验证，不是 NPU 实测，也未验证传输时间精度。
-
-共同参数：world size 4、DP replicate 2、DP shard 2、EP 2、local batch 1、global batch 8、seq_len 128，启用 `memory_offload_ac_saved_tensors`。DeepSeek 使用 `deepseek_v4_smoketest`；Kimi 使用 `kimi_k3_smoketest`。所有案例均完成捕获及平台适配。
-
-| 案例 | 公共图节点数 | stream_wait 数 | 逐层 payload 合计（bytes） |
-| --- | ---: | ---: | ---: |
-| DeepSeek-V4 selective AC | 5164 | 117 | 5,301,376 |
-| DeepSeek-V4 full AC | 5162 | 117 | 1,089,536 |
-| DeepSeek-V4 无 AC | 3492 | 117 | 63,053,732 |
-| DeepSeek-V4 selective AC、MTP 1 | 6276 | 152 | 20,702,600 |
-| Kimi selective AC | 4395 | 106 | 4,066,496 |
-
-完整本地证据位于工作区 `runs/activation-offload-audit-20261102/`：`audit.py`、各案例 `summary.json`、`nodes.json`、`offload-records.json`、`action-spans.json` 及运行日志。这些文件为未入库的实验产物；本表和下述结论保留审阅所需摘要。未覆盖量化、PP、多 MTP 或关闭 FSDP 的组合。
+## 层边界与使用事实
 
 ### 层、head 与 MTP
 
-以下为捕获观察到的执行块顺序，不代表已经验证了新增传输后的 DES 调度。
+以下顺序来自当前模型调用链；新模型应重新核对，不按层名排序假设执行窗口。
 
 - 普通 DeepSeek 的 F 顺序是 decoder layers → hc_head → norm → 分块 lm_head/loss。8 次 lm_head 前向和对应反向交错发生在 **F 图内**。B 图从 norm/hc_head 反向进入最后 decoder 层；有 AC 时先重计算，无 AC 时直接反向。
 - Kimi 的尾部包含 output_attn_res 和 norm，同样存在 F 图内的分块 lm_head 反向。因此不能仅按名字 `lm_head` 寻找 B 图预取窗口。
@@ -29,13 +15,11 @@
 
 ### 原生 wait 与原始内存记录
 
-`compat/device.py` 的 `wait_event` / `wait_stream` 经 `capture/dispatch_capture.py::record_stream_wait` 生成 `simulator.stream_wait`。它们等待源流的已记录前沿，不是按层生成的屏障。本轮所有这类节点均无 module path。FSDP 通信投影明确保留这些节点。
+`compat/device.py` 的 `wait_event` / `wait_stream` 经 `capture/dispatch_capture.py::record_stream_wait` 生成 `simulator.stream_wait`。它们等待源流的已记录前沿，不是按层生成的屏障。这类节点可能没有 module path，不能将其直接视为层边界。FSDP 通信投影明确保留这些节点。
 
 可以复用控制节点和流前沿依赖机制；不能直接给现有 FSDP wait 增加传输前驱，否则可能扩大等待范围、阻塞无关预取。新增等待应记录建模来源，使用独立传输流，只阻塞实际消费者或缓冲复用边界。
 
-`memory/records.py::_activation_prefetch_records()` 只有候选记录，不代表 H2D 执行事件。本轮 timeline 只有 alloc/free，action spans 为空。`memory/activation_offload.py` 将候选 lifetime 的 `modeled_num_bytes` 设为零，因此当前并未保留一层设备缓冲。head/norm 及 F 内即时消费的数据保持驻留，依据该模块及 `tests/memory/test_interleaved_loss_offload.py`；本轮导出的候选记录未独立测量 head 驻留字节。
-
-逐层 payload 按层内 storage 去重，但层间可能重复：DeepSeek 的两块 1024 B 输入被四层共享；Kimi 有一块 1024 B 被四层共享、一块 65536 B 被三层共享。payload 的归属层也可能不同于生产层，例如 checkpoint 输入由前层产生。逐层预算不是全局唯一字节数，也不足以单独决定释放时机。
+保存／预取候选记录不是已执行的 H2D 事件；传输节点由下述计划显式构建。逐层 payload 可包含跨层共享 storage，也可能归属消费层而非生产层，不能把逐层字节之和当作全局去重内存或单独据此决定释放时机。
 
 ## 实现组织与交付契约
 
@@ -79,4 +63,4 @@ annotations["modeling_source"] = "activation_offload_neighbor_v1"
 - `tests/test_memory_delivery.py::test_activation_transfer_mtp_capture_preserves_raw_facts_and_restores_at_b_entry`：真实 MTP CLI 捕获、阶段归属、原始审计保留及 mem 导出。
 - 现有 `tests/memory/test_interleaved_loss_offload.py`：DeepSeek/Kimi 的 none/full/selective AC 原生 head/loss 驻留；跨仓系统验证另外检查 DES、导出、MBU 分子和快照回放。
 
-本轮独立审阅推动修正了完整 DAG 前沿、F 内反向阶段归属、schema 写入事实、晚 producer 与晚 alias 的区别，以及 B 入口前奏的驻留起点。Meta 捕获和 synthetic 计算耗时仅验证结构与流水线，不证明 NPU 数值或真实传输性能。优化器卸载、跨阶段异步执行、按 storage ready 拆批和动态显存回放仍未实现。
+Meta 捕获与 synthetic 计算耗时仅验证结构和流水线，不证明真实 NPU 数值或传输性能。跨阶段异步执行、按 storage ready 拆批和动态显存回放尚未实现；优化器状态卸载见独立专题。

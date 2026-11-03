@@ -1,172 +1,102 @@
 # 捕获运行时与负载契约
 
-本文规定 simulator 基础设施的职责、升级步骤及验收方法。适用于环境和入口、`compat/`、通用 capture、IR、内存与对外契约变更；模型专属实现另见 [模型接入](model-integration.md)。
+本文约束 `runtime/compat/capture/ir/memory` 的修改，避免新模型兼容破坏已有负载。整体执行顺序见[整体方案](architecture.md)，接入步骤见[模型接入](model-integration.md)。下列规则以当前源码和对应测试为依据；字段不得因下游暂未消费就随意删除。
 
-## 职责与修改位置
+## 1. 会话、环境与兼容层
 
-| 位置 | 职责 | 修改时需要保护的契约 |
-| --- | --- | --- |
-| `config.py`、`cli.py`、`runner.py` | 原生工厂、参数白名单、真实 F/B/clip/optimizer 与返回结果 | 配置不静默失效；Python/CLI 结果一致；unsupported 提前拒绝 |
-| `runtime.py`、`compat/` | 显式 Meta 会话、能力探针、最小可撤销兼容 | 正常／异常恢复、健康原生实现不被覆盖、跨捕获状态隔离 |
-| `capture/` | 原生 dispatch、通信、控制事件、保存值与所有权观察 | 真实输入、tensor/storage 身份、alias/mutation、源事件唯一性 |
-| `ir/`、schedule/workload builder | 负载结构、模板实例、数据与控制依赖 | 引用闭合、双向边、DAG、通信与 action 对应关系 |
-| `memory/` | 逻辑 storage 驻留、FSDP、AC、offload 和状态预算 | 独立字节、实际释放、去重、分阶段和稳态口径 |
+`simulate(SimulationConfig(...))` 是完整入口；低层 `run_simulation_step()` 只捕获一次传入的训练动作，不负责结构预热。修改前记录 torch、torch_npu、CANN、torchtitan、主包及 sidecar 的实际版本、导入路径与 Git SHA，不能仅依据镜像名或 editable 安装记录。
 
-`build_nodes()` 只组装捕获事实，不再执行成本模型；端到端 DES、预测及指标归下游平台。IR 仍为 Python dataclass／annotations 对象，契约边界见 [负载生成边界](load-generation-boundary.md)。
-禁止为后续架构提前把释放时间固定到算子结束，也不在本仓重新引入图折叠与推断补边。
+- 导入 torch／simulator 前设置 `TORCH_DEVICE_BACKEND_AUTOLOAD=0` 并加载配套 CANN 环境；Python API 不替调用者加载 shell 环境。
+- `meta_runtime()` 与 `PatchScope` 管理临时兼容绑定、作用域内 kernel 替换和上下文，正常及异常退出都恢复；不修改上游 checkout 或安装目录。`compat/kimi.py` 的 custom op/autograd 定义及 `tensor_semantics` 声明则是模块级静态注册，不随会话卸载，不在每次进入时重复定义。
+- `logical_world()` 拥有 fake process group。宿主已有 group、嵌套或并发仿真不属于支持路径；连续串行捕获必须允许换 rank/world。
+- 恢复内容包括 autograd 多线程状态、SPMD TLS、mesh／RoPE cache 和 target flags。局部 patch 恢复不等于厂商模块从未导入，不能把原始地址当跨进程稳定 ID。
+- 先探测实际 schema、Meta 分配和梯度；健康原生实现不覆盖。Python wrapper 只显示 `*args/**kwargs` 时，从 dispatcher schema 取得参数，不按版本字符串猜签名。
+- CANN Meta 显式申请 NPU buffer 时，仅在确认的 metadata shape-inference 范围修正，继续复用原厂推导；禁止全局重定向 tensor factory。
 
-## 固定环境并保护源码
+实现：[runtime.py](../torchtitan_simulator/runtime.py)、[compat/patches.py](../torchtitan_simulator/compat/patches.py)、[compat/distributed.py](../torchtitan_simulator/compat/distributed.py)。回归：`tests/test_runtime.py`、`test_patch_scope.py`、`test_metadata.py`、`test_chunked_loss_policy.py`。
 
-迁移／升级前建立可复现基线：
+## 2. 节点、参数与原始身份
 
-- TorchTitan、NPU 插件、sidecar、TorchAO-NPU 的版本和实际提交，torch/torch_npu、Python、NumPy/PyArrow、CANN 完整版本与镜像 digest。
-- 实际导入路径、editable 安装／`PYTHONPATH` 来源、工作树状态、容器内源码 SHA256。镜像 tag、宿主路径和「master」都不足以唯一定位代码。
-- 模型几何、输入、并行布局、AC／精度及逻辑 rank；旧 smoketest 与新 native debugmodel 规模不一定相同，旧峰值不能直接作新版本阈值。
+`OpDispatchCapture` 在原生 dispatch 周围记录事件，`build_nodes()` 组装事实，不运行 costmodel。节点保留原始 overload、shape/dtype/stride、FQN、执行身份、依赖和必要参数；不输出训练侧 FLOPs、预测耗时、性能分类或重复峰值。
 
-使用包含完整 CANN 的官方镜像作为环境基础，再安装配套训练依赖及 sidecar；不要在干净镜像中通过散装执行包拼出另一套依赖。
-[Dockerfile](../Dockerfile) 只安装 sidecar，`BASE_TRAINING_IMAGE` 必须已经配套。开发容器同步源码、构建新镜像与独立安装包验收分别记录，不把三者当作同一步。
+### 参数 occurrence 与 scalar
 
-不修改上游 checkout 或安装目录来让 smoke 通过；使用独立工作树／副本，保留用户已有变更。核对主包和 sidecar 都加载当前源码，不能仅更新 sidecar 却仍导入旧模型包。
-
-安装阶段曾遇到 NumPy/PyArrow 不配套、CANN 首次导入编译 C++ 扩展、`npu-smi` 不可用和 opaque metadata 包装签名差异。
-具体冻结组合与排查方式见 [环境与签名事项](cann-metadata-signature-compat.md#安装与启动的已知事项)。这些是具体环境现象，不是可永久复制的版本判断规则。
-
-## 显式会话与入口
-
-入口为 `simulate(SimulationConfig(...))` 或 `cli.main(argv)`，同进程返回 `WorkloadGraph`；不恢复旧 `SimulationTrainer.train` patch。
-独立 CLI 是白名单，不接受任意原生参数树；新增参数要检查 Python 字段、CLI、工厂、实际 consumer 和 [接入文档](upstream-integration.md)。
-模型结构和量化分开选择：preset 名称不隐式开启量化，唯一开关为 `enable_quantized_training`；旧精度后缀 preset 在构建模型前明确拒绝，并给出迁移提示。
-
-- 在导入 torch／simulator 前设置 `TORCH_DEVICE_BACKEND_AUTOLOAD=0`，按环境加载 CANN；Python API 不替调用者 source shell 脚本。
-- 捕获会话拥有 fake process group；宿主已有 process group、嵌套或并发仿真不作为支持路径。当前保留同进程串行调用，PP 捕获入口仍拒绝。
-- capture worker、logical rank、logical world、PP stage 不混用。用 fake process group 不等于逻辑 world 为 1，也不证明真实 HCCL 可用。
-- `PatchScope` 恢复 Python binding、注册和回调；同时审计 autograd 多线程状态、SPMD TLS、DTensor/RoPE cache、target flags。成功与异常退出都测试，后续换 world/rank 不能继承旧 mesh。
-- 恢复局部 patch 不等于撤销厂商模块导入或所有框架缓存。冷／热状态可改变初始化 trace，不能把原始地址或首次运行的节点数当作跨进程恒等 ID。
-
-参考：`test_runtime.py`、`test_patch_scope.py`、`test_config.py`；实现见 `runtime.py`、`compat/patches.py` 和 `compat/distributed.py`。
-
-## 兼容层的决策顺序
-
-坚持「原生 dispatch → 必要的 Meta/autograd 补齐 → 无法表达的部分显式建模」。
-
-1. 用真实 schema、Meta 调用和输入梯度探针确认缺口。Meta 输出 shape 正确，不代表 autograd 已注册或参数梯度正确。
-2. 健康原生路径继续走 dispatch；不要为已有 CANN 算子手写第二套节点或 shape 推导。
-3. 确认缺少 Meta 或 autograd 后，局部修正分配设备或桥接原生 backward，保存真实输入对象。不能只压 warning，也不能用同 shape 占位 tensor 冒充保存值。
-4. 原生运行不可执行且无合适接口表达时，才注册明确的 virtual schema、Meta 和 autograd。记录真实设备不可执行的边界，并保留融合语义。
-5. 无法可靠匹配接口时显式失败，不按版本字符串安装一整套旧 patch，不吞掉未知参数。
-
-升级时为旧 patch 建立处置表，逐项记录目标符号、当前调用点和退出条件：原生已具备的删除，仍有行为缺口的保留最小兼容，纯手工补图／推断恢复的优先退役，未支持的能力明确拒绝。
-不能只因旧文件移动或 import 成功就认定 patch 继续有效；尤其检查延迟绑定、cached callable 和函数签名。迁移前后的具体台账见 [旧 patch 清单](legacy-patch-inventory.md)。
-
-### CANN metadata 的具体经验
-
-Python wrapper 可能只暴露 `*args/**kwargs`。不能把这两个名称当作实际算子参数；需要从 dispatcher schema 恢复参数顺序、keyword-only、默认值和必填校验。
-不能为了兼容而删除校验、静默丢参数或执行真实设备 fallback。
-
-厂商 Meta 本身可能显式分配 NPU buffer；只在已确认缺陷的 metadata shape-inference 作用域内约束为 Meta，继续复用原厂推导。不要全局重定向 `torch.empty` 等 factory。
-准备阶段 metadata 能走 dispatch，不等于已经纳入训练 F/B/O 图；必须说明准备阶段的统计范围。详见 [未决成本范围](open-questions.md)。
-
-autograd warning 可能来自 bridge 安装前的能力探针，但不能据此断言无害。最终按参数梯度、实际 backward 节点、保存值和真实运行结果判断。
-在主仓 CPU 全套测试中也曾因 mock／真实 CANN 注册交互进入设备 metadata fallback 而停滞；应保留调用栈、隔离测试和环境证据，不将中止运行记为全套通过。
-
-## tensor/storage 与设备事实
-
-- tensor value、Python wrapper、底层 allocation 和 allocation generation 分开记录。view/detach 可能共享 storage，新 wrapper 不一定是新值或新分配。
-- mutation 和 alias 仍形成真实数据依赖。不得用最后一个形状相同的 tensor、按值相等或 Python 地址复用来推断身份。
-- saved-tensor pack、unpack、slot release、Python 引用和 C++ storage 所有权分别观察。第一次 unpack 或最后读取不自动表示释放。
-- 只计真实本地设备 storage。CPU planner／控制元数据不因参与 NPU 调用就变成设备显存；并行原始几何和 local shard 元数据分开。
-- 优化释放检测不能降低观测边界频率。候选队列只减少待检查对象，仍在每个原 dispatch 边界确认原生过期；用逐边界参考扫描证明等价，不以峰值碰巧一致代替。
-
-### 保存钩子引入的 detach
-
-`AutogradSavedTensorCapture` 的 pack 钩子以 detached alias 保存真实 storage，并暂停记录该次 detach。对原本需要梯度的保存值，PyTorch 在 unpack 后恢复 autograd 信息时，还会对钩子返回的对象执行一次内部 detach。该操作由观测机制引入，不作为训练算子或内存使用事件记录。
-
-捕获器只对「需要恢复梯度信息的保存值」标记 unpack 返回对象，以弱引用核对其精确身份，并在匹配的 detach 上消费标记。返回别名继续关联原值的 producer 和 storage mutation frontier；保存槽的 unpack/release 与每个 dispatch 边界的 storage 释放探测照常执行。不能按 `aten.detach` 名称全局过滤，也不能仅凭 storage 相同过滤：恢复后的值、模型显式 detach、FSDP detach，以及无需恢复梯度信息的保存值上的显式 detach 都应保留。
-
-被排除的次数记录在 `workload.iteration.schedule.annotations["capture_artifacts"]["saved_tensor_unpack_detach_count"]`，不改变内存 summary 字段。该次数不要求等于「开启／关闭保存钩子的 detach 数量差」：关闭钩子本身也会改变原生保存路径。模型与框架原本产生的 view/alias/detach 仍保留在 IR 中；这些元数据节点不能当作已启动的 Vector kernel 计数。
-
-参考：[保存身份测试](../tests/capture/test_saved_tensor_identity.py)、[所有权测试](../tests/capture/test_storage_lifetimes.py)、[逐边界对照](../tests/test_storage_lifetime_capture.py)。
-
-## 原生算子参数绑定
-
-原生 dispatch 的 `OpNode.inputs` 继续按实际位置参数、再按关键字插入顺序展开张量，保留每次出现的位置；同一张量重复传入时不会去重。张量元数据使用本地形状。`attrs["input_tensor_bindings"]` 额外保存不可变的 `(参数名, 结构)` 元组，参数名来自实际 overload 的原生 schema，结构中的整数引用 `inputs` 的零基位置，元组保存列表／元组边界，`None` 保存空缺。例如：
+一般算子的输入按位置参数、再按关键字插入顺序展开张量，同一张量重复传入保留多个位置。`attrs["input_tensor_bindings"]` 保存 `(参数名, 结构)` 元组：整数引用本节点输入索引，元组保留 list/tuple 边界，`None` 表示缺席。例如：
 
 ```python
 (("self", 0), ("indices", (None, 1)), ("values", 2))
 ```
 
-上述绑定用于区分 `indices=[None, index]`、融合优化器的多个张量列表和稀疏算子的可选张量角色。省略的可选 Tensor 默认值和空 Tensor 列表也会保留；不按张量身份、shape 或模型路径推断角色。没有原生 schema 的调用不生成绑定；v1 结构只覆盖 Tensor、列表／元组及 `None`，包含字典张量参数时整组绑定不输出，避免暴露不完整的角色映射。绑定只增加捕获事实，不改变数据依赖、内存观测及原始 overload 名。
+原生 fused AdamW 是明确的例外：六个 TensorList 与尾部可选张量按 schema 顺序规范化；其通用绑定同步采用该顺序，另保存列表长度和可选角色。详见[AdamW 输入身份](adamw-input-identity.md)。
 
-非张量参数按实际值保存，包括 Tensor 声明槽中运行时出现的标量，例如 `aten.add.Tensor` 的 `other=3`。不读取 Tensor 数据或调用 `.item()`。合法数据填充值 `-inf`、`+inf`、`nan` 分别编码为 `("__sim_scalar_float_v1__", "-inf" | "+inf" | "nan")`，避免向严格 JSON 写入非有限浮点数；消费端须识别此标量编码，而不是把它用于硬件参数或耗时配置。
+没有 schema 时不生成绑定；张量字典超出当前 v1 的 tuple/list 协议时整组绑定省略，不交付不完整映射。不按 shape、对象相等或 FQN 推断参数角色。
 
-原生 c10d ReduceOp ScriptObject 通过 `.op()` 提取真实枚举，明确保存 `sum/product/min/max/avg/band/bor/bxor`。`PREMUL_SUM` 的 ScriptObject 未暴露乘数，当前保存 `unsupported:premul_sum`，不能当作普通求和估算。旧捕获中已经被字符串化或丢弃的值不会由新契约自动恢复。
+非张量参数按实际值保存，不读取 Meta 数据。合法填充值 `-inf/+inf/nan` 编码为 `("__sim_scalar_float_v1__", "-inf" | "+inf" | "nan")`；该编码是数据字面量，不是硬件参数或耗时。c10d ReduceOp 从实际枚举提取，`PREMUL_SUM` 因缺少乘数保存为 `unsupported:premul_sum`，不能当普通 sum。
 
-实现见 [operator_arguments.py](../torchtitan_simulator/capture/operator_arguments.py)，实际 dispatch 与 fake process group 验证见 [参数捕获测试](../tests/capture/test_operator_arguments.py)。这些测试验证捕获契约，不证明真实 NPU kernel 数值或 HCCL 性能。
+实现与测试：[operator_arguments.py](../torchtitan_simulator/capture/operator_arguments.py)、[test_operator_arguments.py](../tests/capture/test_operator_arguments.py)。
 
-## 通信、流控制与负载结构
+### 自定义算子语义
 
-通信必须保留真实 process group、rank 成员、primitive、dtype 和 volume。EP／TP／FSDP mesh 可以重叠，不从 world 或模块名猜轴，也不恢复旧 HSDP 轴修正来绕过新版布局。
+本仓自定义融合／包装按完整原始 overload 声明 `attrs["tensor_semantics"]` v1，给出每个输入输出 occurrence 的角色和语义轴。未知轴用 `None`；复合轴表示单一 shape 维度的逻辑展平。保留物理 layout/stride，不根据维度大小猜 query、token 或 head。原生 ATen/CANN 不要求额外声明，详见[自定义张量语义](custom-tensor-semantics.md)。
 
-EP TokenDispatcher 默认由 `compat/routing.py` 统一适配为原生 functional `all_to_all_single`；按实际 dispatcher helper 安装，不按模型名分支。保留 token-count→token／score 的完成依赖，复用原生输出及 autograd，正常／异常退出恢复绑定；非 Meta 调用保留原实现。该策略不改 CP／FSDP，也不启用 compile，见 [EP single 交换](ep-single-transport.md)。
+## 3. 数据、通信与流依赖
 
-FSDP 包装可能延迟安装或刷新函数引用。observer 必须覆盖最终生效的 native wrapper，按 transition 关联 AG staging、full allocation、wait、reshard、finalize 和未消费 prefetch 的清理。
-不删除看似没有 tensor consumer 的预取，也不以 full parameter Python view 仍存在为由否认显式释放。
+| 约束 | 必须保留的事实 | 禁止的替代 |
+| --- | --- | --- |
+| Tensor 数据流 | producer、实际输入输出、alias 和 storage mutation frontier | 找最后一个同 shape tensor 当 producer |
+| 同流顺序 | 该逻辑流的已提交设备工作前沿 | 按全局 seq_idx 把所有流串行化 |
+| event 等待 | record 当时源流前沿及目标流先前工作 | 自动等待 record 之后的新工作 |
+| 通信 | primitive、实际 process group、group/ranks、本地 tensor 元数据、通信完成依赖 | 从 world 或模块名猜并行域，把 launch 返回当完成 |
+| 生命周期 | `record_stream` 等真实所有权信息 | 把 allocator 记录变成执行屏障 |
 
-同流顺序与 `Event.record`／`wait_event`／`wait_stream` 按实际前沿记录。事件等待的是记录时的源流工作，不自动等待之后的新工作。
-零耗时 `stream_wait` 没有 tensor 输入输出，仍必须保留前驱；`record_stream` 是生命周期语义，不是执行屏障。host polling/synchronize 的当前支持边界不能扩大解释。
+零耗时 `stream_wait` 无 tensor 输入输出，但前驱必须完成。只改元数据的 view/alias 保留数据边，不推进设备流前沿；不能由预取 buffer 的 view 引入额外同步。`metadata_view` 判定因此是捕获语义，不是应删除的性能分类。
 
-至少验证 AG 输出实际链接到后续权重使用；延后 AG 会延后投影。HSDP 的 RS/AR 必须按实际 wait/event 约束传播，clip／更新等待其必要归约；无等待的其他流仍可重叠。
-不能按捕获序号把全部节点补成串行边，也不能因 FLOPs 为 0 删除控制或 view 节点。
+EP 默认通过 `compat/routing.py` 统一适配原生 functional `all_to_all_single`，保留 count→data/score→compute→combine 的完成依赖与原生 autograd。该适配不改 CP/FSDP；非 Meta 调用保留原实现。内部通信 event/slot 的 `volume_bytes` 用于源张量容量、内存和数据传递，不等于下游模型预测的网络流量。
 
-完整捕获中 L0 源事件必须唯一，L1 模板引用、L2 action/DataSlot、L3 iteration 保持闭合和 DAG。原始捕获没有模板折叠、节点重编号及补偿恢复；对外 FSDP 视图按下述契约投影，不通过推断补边掩盖捕获缺口。
-模板复用不等于已经支持完整多 microbatch／PP 训练。当前单 microbatch 的 GBS/GA 元数据不能被下游解释为完整累积峰值。
+FSDP wrapper 可能延迟安装或刷新。正式观察器在结构预热后安装，并以 transition 关联 AG staging、full allocation、wait、reshard、finalize 和未消费 prefetch 清理。预热阶段没有 active capture 的原生调用是合法行为，不得要求观察器在那里已有节点。
 
-参考：[流契约](stream-control-dependencies.md)、[FSDP 审计](fsdp-dependency-audit.md)、[精简记录](simulator-cleanup.md)、`validation.py`。
+至少验证：延后 AG/RS/AR 会沿真实等待边延后必要计算与 clip/update；无等待的其他流仍能重叠。参考[流控制依赖](stream-control-dependencies.md)、[EP 交换](ep-single-transport.md)、`tests/test_fsdp_stream_capture.py`、`tests/capture/test_native_collectives.py`。host polling/synchronize 和真实硬件时序不能由这些 Meta 测试推导。
+
+## 4. 阶段与图引用
+
+`comp_type` 组织 F/B/O action，`phase`／`execution_kind` 描述实际 autograd 与重算。chunked loss 的 head backward 可以发生在 F action 内；按 `phase` 全局重新分阶段会破坏已捕获路径。`is_recompute` 与 module path 保留供下游统计。
+
+完整源事件 ID 唯一；模板、action、DataSlot、跨模板依赖及外层 iteration 的引用必须闭合且无环。不得为清除 unresolved 引用而丢边、重编号、折叠节点或推断补出一条全串行链。训练 IR 的层级是组织结构，不等于平台已经实现 PP 或完整 GA 回放。
 
 ### FSDP 通信视图
 
-`simulate()` 和 CLI 返回的 WorkloadGraph 默认是 FSDP 通信视图。根据 FSDP unshard/wait/reshard/post-backward、state hook 和 finalize 的实际 `framework_scopes`，隐藏其中的非通信算子，包括 buffer 分配、打包、copy-in/out、cast、view 和 detach。AG/RS/AR、其他真实通信、模型计算及零耗时流控制节点继续保留。不能按 `FSDPDeepSeekV4Model` 等根模块名称过滤，因为该 FQN 下也可能存在正常模型操作。
+默认返回图根据实际 `framework_scopes` 隐藏 FSDP unshard/wait/reshard/post-backward/state hook/finalize 中的非通信工作，保留模型计算、通信与流控制。禁止按根 FQN 筛除节点，根模块内也可能存在正常计算。
 
-完整源图存于 `workload.captured_workload`，其自身该字段为 None。FSDP 通信投影与源图共用原始 MemoryPlan；激活／优化器卸载随后创建派生预算，继续保留原始事件和 lifetime 对象：所有原始内存事件、FSDP staging/full allocation 与释放、保存槽、dtype 和本地 storage 去重均不改变。内存 raw_events 中的原始 op_id 应在 captured_workload 中解析；不能要求每个内存事件都对应可见计算节点。保留两套图结构会增加主机元数据占用，不改变逻辑设备内存预算。
+投影沿原有路径将可见前驱传递给可见后继，更新 successors、模板边界和 stream/event 前沿，不给保留节点分配新 ID。通信、slot 与 DataPass 的单值展示锚点同步调整；多分支执行依赖仍以全部正式图边为准，不能用单值锚点替代。
 
-投影不分配新 ID，不合并模型算子。被隐藏路径的可见前驱直接传递给原可见后继，并重建 successors、模板入口／出口及 stream/event 前沿。SchedulePlan、ScheduleGraph 和 workload 引用同一组可见模板。通信描述、slot、DataPass 和跨 iteration DataPass 的单值算子锚点同步重定向；隐藏边界有多个可见前沿时，通信描述使用对应通信节点，缺少通信锚点的 DataPass 使用 0。完整的多分支依赖由 L0 边保留，原单值锚点仍可从 captured_workload 审计，不能用单值展示锚点代替图的全部依赖。
+`captured_workload` 保留完整源图。投影初始共用 MemoryPlan；卸载变换随后创建派生预算，保留原始事件/lifetime。内存事件原始 ID 在源图解析，不要求都在交付图可见。`fsdp_communication_view` 注记记录隐藏范围和耗时假设；下游通信视图有意不计 FSDP 打包、copy、cast 等准备开销。
 
-`annotations["fsdp_communication_view"]` 记录隐藏 ID、数量、原始算子计数及耗时假设；`native_dispatch_op_ids` 对应可见图。源图保留原统计，校验同时覆盖完整捕获与投影后的引用闭合、通信和梯度依赖。该视图明确忽略 FSDP 打包、拷贝、精度转换的运行时间；不能将通信视图的耗时估计描述为包含这部分真实开销。流等待约束继续生效，不因隐藏搬移而提前消费尚未完成 AG/RS/AR 的值。
+实现：[fsdp_communication_view.py](../torchtitan_simulator/capture/fsdp_communication_view.py)；回归：`tests/capture/test_fsdp_communication_view.py`、`tests/test_fsdp_stream_capture.py`。
 
-实现见 `capture/fsdp_communication_view.py`；独立路径与双模型验收见 `tests/capture/test_fsdp_communication_view.py`，AG/AR 延后传播继续由 `tests/test_fsdp_stream_capture.py` 检查。
+## 5. 保存值、storage 与静态内存
 
-## AdamW 参数身份
+- Tensor wrapper、tensor value、storage 和 allocation generation 分开标识；view/detach 可共享 storage，地址复用不表示同一代分配。
+- 保存槽 pack/unpack/release、Python 引用和原生所有权分别观察。第一次 unpack、最后读取或 wrapper 销毁均不能单独作为 storage 释放。
+- 释放检测在每个原 dispatch 边界检查；弱引用候选只减少待查集合，最终仍由原生过期判定确认。不得降低检查频率或用峰值偶然相等代替逐边界等价。
+- 只计本地目标设备 storage；CPU planner 元数据不计设备显存。参数全局几何、本地 shard、通信 tensor、量化 code/scale 分开记录。
 
-原生 fused AdamW 默认捕获六个张量列表长度与可选 scale/overflow 输入角色，按 schema 顺序交付本地 inputs；保留重复位置及真实 mutation/storage 身份。逻辑参数 shape 注记不能代替物理列表边界。字段与验证见 [AdamW 输入身份](adamw-input-identity.md)。其他算子的源字段不因该能力自动扩充。
+保存钩子为了恢复梯度信息引入的 detach 只按精确返回对象身份排除：弱引用匹配后消费标记，保留 alias/mutation 关系；不能按 `aten.detach` 名称或同 storage 一概过滤。排除次数记录在 `capture_artifacts.saved_tensor_unpack_detach_count`，不作为内存预算修正值。回归见 `tests/capture/test_saved_tensor_identity.py`、`test_storage_lifetimes.py` 与 `tests/test_storage_lifetime_capture.py`。
 
-## 内存、成本与对外结果
+优化器状态从原生 owner 的公开 `state` 获取并按本地 storage 去重。正式捕获初始登记预热后已有状态；初始化算子消失不意味着状态驻留或卸载量消失。未知 owner 报不可用，已知无状态才为 0。无卸载时状态已在 F/B/O 峰值内，不重复相加；开启卸载时保留原始总量，但按已确认策略排除其设备驻留及逐 tensor buffer。
 
-从真实 optimizer state 按设备与 local storage 去重，再投影稳态驻留；不按权重倍数猜测，不在 optimizer 阶段重复加状态。
-`simulate()` 在正式捕获前执行[结构预热](steady-state-capture.md)，初始登记实际 optimizer state；低层单次捕获仍允许首次 O 惰性初始化。稳态预算统一将实际观察到的状态视为从捕获步首常驻，不重复相加。CPU step scalar 不计设备字节；无可读取 owner 时报告不可用，不将未知状态当作 0。
-四个阶段／总峰值包括状态，权重与状态独立大小是说明项，不能再加到峰值上。当前是逻辑活跃 storage，不是 allocator reserved/cache 或真实 workspace。
-offload 的保存集合、层外驻留、`unattributed` 和逐层单向 payload 必须遵守 [模型内存规则](model-integration.md#保存值不等于卸载候选)。
+保存值集合、层归属、head 交错反向及后续 B/recompute 使用共同决定激活卸载。不能靠过滤报表将未归属存储从峰值删除，也不能把传输 payload 当卸载后的驻留值。具体预算和图变换分别见[单卡内存](steady-state-memory.md)、[激活卸载](activation-offload-design.md)、[优化器卸载](optimizer-offload.md)。
 
-图上已移除 FLOPs、成本及重复峰值注记；正式内存预算从 MemoryPlan 读取。设备性能建模与捕获事实分开。
-CLI 和 `simulate()` 默认不写文件；`output_formats=["mem"]` 显式写入显存汇总与内存明细。`export_result()` 同样按 output_formats 控制，空列表为无操作。build-only 不导出内存结果，捕获或校验失败也不生成新结果。复用目录不会清理旧明细，建议每次使用独立目录。不恢复 JSON/HTML/DOT 等图导出或折叠。
-对外 summary 只有六项预算加一个逐层 payload 列表，细节见 [输出契约](steady-state-memory.md)。更改字段或含义时同步 Python、文件、CLI、acceptance 与接入文档。
+## 6. 交付与验收
 
-## 验收与排查入口
+正式交付为 Python `WorkloadGraph` 和其中的 `memory_plan`／`memory_summary`，默认不落盘。显式 `output_formats=["mem"]` 才导出摘要和诊断明细；`build-only` 没有正式训练图、梯度或内存验收结果。复用目录不会自动清理旧文件，必须避免把旧产物当本次成功。
 
-在已配置的 sidecar 环境中，从 `experiments/simulator` 运行运行时快速回归：
+修改捕获协议时，先验证参数与依赖最小行为，再跑真实模型路径，最后按变化扩大并行／AC／量化组合。快速回归入口如下，需先按 [README](../README.md) 配置完整运行环境；从 `experiments/simulator` 执行：
 
 ```bash
 TORCH_DEVICE_BACKEND_AUTOLOAD=0 python -m pytest -q \
   tests/test_runtime.py tests/test_patch_scope.py tests/test_metadata.py \
-  tests/capture/test_saved_tensor_identity.py \
+  tests/capture/test_operator_arguments.py tests/capture/test_saved_tensor_identity.py \
   tests/capture/test_stream_dependencies.py
 ```
 
-随后按变更扩大至相关 FSDP／通信、AC、量化、模型及完整几何，并使用 [README](../README.md#验证) 的完整测试／独立类型入口。
-sidecar 采用自身 `pyproject.toml`；避免同一模块又以 `experiments.simulator.*` 被根项目扫描。editable 安装的静态分析需要真实 source search path，不能通过把整个依赖替换为 Any 来消除告警。
-
-新失败必须比较相同依赖、命令与搜索根的基线。既有 root 类型错误、主机缺依赖、实际新增错误分别记录；有局部通过不能声称全仓全绿。
-性能优化先拆解 import/JIT、准备、dispatch、保存／所有权、graph assembly 和 export，再比较相同几何及冷／热条件。等价性检查包括原始事件、生命周期和控制依赖，性能计时不混入参考审计。
-
-## 自定义融合与包装的语义轴
-
-本仓自行定义的捕获边界额外交付 `attrs["tensor_semantics"]` v1，记录输入／输出的 occurrence 索引、角色和逐轴含义。通过完整原始 overload 与原生参数绑定精确关联；不从 shape 推测，不改变物理 layout、stride 或输入顺序。当前覆盖 Kimi 虚拟融合前后向和主包 MoE reroute／permute／unpermute 包装，未知轴显式为 None。原生 ATen/CANN 维持已有参数事实。数据结构、覆盖与维护入口见[自定义张量语义](custom-tensor-semantics.md)。
+更多模型验收步骤见[接入工作流](model-integration.md)。区分本轮执行结果、静态检查和旧证据；Meta 结构验证不替代 NPU 数值验证，也不证明真实性能精度。准备阶段是否纳入独立负载见[待定范围](open-questions.md)。

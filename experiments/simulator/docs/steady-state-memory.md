@@ -27,7 +27,7 @@ CLI 和 `simulate()` 默认仅通过内存对象交付预算，不写文件；�
 全部数值对应所选 `simulation.logical_rank`，不是全局求和或各 rank 的最大值。权重已计入四个峰值；优化器状态仅在未卸载时计入，不能再次相加。卸载后 `optimizer_state_bytes` 仍报告真实本地状态总量，不能据此推断设备驻留。
 `memory_parameter_storage_dtype` 仅投影权重字节，不改变优化器状态的 dtype 或大小。
 
-终端只显示六行结果，单位为 GiB：
+显式 mem 导出时终端显示六项结果，单位为 GiB；默认不打印。下例为未卸载优化器状态的标题：
 
 ```text
 单卡内存（GiB；峰值包含常驻优化器状态）
@@ -92,30 +92,13 @@ optimizer_bytes = summary["optimizer_state_bytes"]
 
 自定义 callback 没有可读取的公开 optimizer owner 时，相关值为 `null`，终端显示「不可用」；不会把未知状态假设成零。已知无状态的优化器报告状态字节为 0。
 
-## 验证记录
+## 验证与排查入口
 
-底层稳态计算及实际冷／热两步 Meta 对照的冻结证据见 [上一阶段结果](steady-state-memory-results.json)。本次只收敛汇总格式与打印，不改变预算计算；结果不代表真实 NPU allocator 峰值。
+- [逐层 payload 与 storage 去重](../tests/memory/test_layer_offload_summary.py)：共享 view／多保存角色不能重复计量。
+- [真实模型交付](../tests/test_memory_delivery.py)：DSV4／Kimi、MTP、AC、量化、两种卸载以及默认无文件／显式 mem 行为。
+- [优化器独立字节预期](../tests/memory/test_optimizer_state.py)：实际本地状态、去重及稳态驻留。
+- [F 内交错反向](../tests/memory/test_interleaved_loss_offload.py)：chunk-local loss 不卸载，后续 B／recompute 共享的 storage 仍按真实使用处理。
 
-此前六项格式收敛阶段：全套回归 455 passed，容器 Pyrefly 0 errors（10 suppressed）；原样 CLI 及 world16/rank15、MTP1、selective AC 验收通过。该阶段日志位于本机 `torchtitan-migration-audit-20261020/compact-memory-summary/`，历史六键约束现已扩展为六项预算加一个列表。
+归属优先使用保存槽的模块路径。明确的 head/norm/root 不借用滞后反向模块路径归到 decoder；没有模块归属才用真实生产／消费事实辅助判断。没有确认层或 checkpoint 绑定的保存值继续驻留，不能通过隐藏 unattributed 报表行修正显存。
 
-逐层列表的测试入口：[storage 去重与文件导出](../tests/memory/test_layer_offload_summary.py)、[真实模型与 MTP 的 offload 开关](../tests/test_memory_delivery.py)、[闭式内存 oracle](../tests/memory/test_optimizer_state.py) 和 [终端六行格式](../tests/test_step.py)。
-
-2026-10-26 复验：sidecar 全套 489 passed，Pyrefly 0 errors（10 suppressed）。DSV4/MTP 与 Kimi 的 MXFP8 × none/full/selective 覆盖 offload 开关、图／梯度与权重投影隔离；独立 64+32=96 bytes 用例核对共享 storage、view 和多保存角色去重，且不乘双向系数。真实模块 CLI 的 full AC + MTP + offload 导出通过；更新后的 acceptance 在 world16/rank15、TP2/CP2/EP2、selective AC、MTP1 下通过，共 11,047 节点、143 个参数梯度。终端仍为六行，文件／图内汇总为七键。
-
-常规 pre-commit、Ruff 和架构检查通过；全仓检查仍因主机缺少训练依赖而有类型错误，不能标为全绿。日志和导出位于本机 `torchtitan-migration-audit-20261020/layer-offload-summary-20261026/`。本轮不验证真实传输或硬件数值，未重建镜像。
-
-### Chunked loss 的设备驻留修正
-
-已推送的 `2071a46` 在开启 offload 时将 chunk 内立即消费的 loss 保存值也投影为零设备驻留，可能低估显存。修正按保存槽和全部 consumer 的语义 action 判断，不按 `log_softmax` 名称或固定时间间隔猜测；同一 F action 内完成使用的 storage 保持真实驻留，后续 B/recompute 仍会读取的共享 storage 继续参与原 offload 选择。
-
-DSV4 smoketest、world1、seq128、MTP0 的 none/full/selective 对照中，8 个 `log_softmax` 保存 storage 每个均为 8,273,920 bytes。修复后保留各自的 alloc/free 区间，不再进入卸载列表；各 chunk 的累计 66,191,360 bytes 不是同时驻留峰值。权重、优化器状态及参数梯度清单不变，整体峰值由全部 storage 的真实重叠决定，不能直接加上这笔累计字节数。
-
-这组 DSV4 配置在排除 chunk-local loss 后，历史 `<unattributed>` 仍有 664,576 bytes：`hc_head` 内部保存值 532,992 bytes，最终 norm 的输入及归一化中间值 66,048 bytes，累计 head 梯度交给 decoder 的桥接张量 65,536 bytes。当前这些值继续驻留，不计入传输。
-
-Kimi smoketest 同样检查三种 AC；层外保存值包括输出 Attention Residual 的混合／归一化中间值、最终 norm、head 输入及梯度桥接张量。它们均保留设备生命周期；层内保存值仍可 offload，KDA/MLA/SiTU 虚拟融合、图依赖和梯度不变。
-
-归属优先采用保存槽的模块路径。明确的 head/norm/root 保存路径不借用滞后的反向模块路径归入 decoder；没有模块归属时才用实际消费／生产事件补齐。未确认层或显式 checkpoint 绑定的保存值不卸载，包含缺少该 storage 保存槽的非层重算引用；这项策略同时修正原生保存槽与旧 use-def fallback 的驻留。
-
-测试入口：[交错反向驻留与共享边界](../tests/memory/test_interleaved_loss_offload.py)。最终 sidecar 全套 507 passed，Pyrefly 0 errors（10 suppressed）；覆盖 128-byte loss／非层保存值驻留与 64-byte 真 offload 的独立峰值、checkpoint 记录恢复、后续普通反向／重算共享、无保存槽／无绑定的非层重算引用，以及 DSV4 和 Kimi 三种 AC 的 loss/head storage 分配释放。六组原生审计均通过独立时间线字节求和及图验证；DSV4 的 112 个、Kimi 的 110 个训练参数梯度齐全，传输列表仅含四个 decoder 层。
-
-旧版开启 offload 的预算和传输量应重新计算，不能只从列表删除 `<unattributed>` 或对旧峰值加上 loss 总量。原七键汇总结构不变。详细对照日志位于本机 `torchtitan-migration-audit-20261020/offload-attribution-audit-20261026/`。
+排查时比较每个 storage 的原始与建模字节、birth/death、全部保存／消费和相邻窗口，再核对峰值。多个 loss chunk 累计字节不能直接相加为峰值。历史数值不作为新模型固定阈值，独立手算应基于当前实际形状、dtype 与 sharding。

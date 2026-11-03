@@ -19,6 +19,4 @@
 
 `tests/test_optimizer_contract.py` 覆盖真实 fused AdamW 混合 dtype 分桶、未更新参数、六列表边界、AMSGrad 空／非空列表、可选 overflow/scale、反序 keyword 调用、重复输入及后继 mutation 依赖。Meta 捕获只验证结构与逻辑 storage，不证明真实 NPU 数值或性能。
 
-真实 DSV4 HSDP 2×2、EP2、GA2、selective AC 的基础与优化器卸载两例，最新算子 adaptor 均解析得到六列表长度 `(112,112,112,112,0,112)`、显式空可选角色和空 `unresolved_fields`；本地参数、梯度及两种动量 shape 对齐，step 为标量。两例全部显存摘要与修改前一致，优化器状态保持 323,048,536 bytes。证据位于工作区 `runs/adamw-identity-20261103/`；该结果不代表 AdamW costmodel 已实现。
-
-本轮相关 dispatch／optimizer／state 测试 39 项、warmup 与完整 memory_delivery 回归 33 项通过；sidecar wheel 在源码外普通安装后执行 7 项 AdamW 身份测试通过。修改文件 Ruff 检查及 pyrefly 检查通过（0 errors）；完整仓库 pre-commit 与真实 NPU 数值测试未执行。本次只增加 Meta 捕获元数据，不改训练计算路径。
+配合 `tests/test_warmup.py`、`tests/memory/test_optimizer_state.py` 与 `tests/test_memory_delivery.py` 检查预热后的状态身份、驻留量和卸载交付。新增输入身份不得改变静态显存摘要或优化器计算路径。

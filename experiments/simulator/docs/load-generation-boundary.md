@@ -1,6 +1,6 @@
 # 负载生成边界
 
-本说明记录 2026-11-03 的职责收敛，替代旧文档中默认强制写 memory summary 和训练内部估算成本的描述。
+本仓负责捕获负载及静态显存，通过内存对象交付；性能预测与调度归下游。旧成本接口的迁移边界如下。
 
 ## 内存交付与可选导出
 
@@ -28,6 +28,3 @@
 ## 验证范围
 
 默认无文件和显式 mem 导出由 `tests/test_memory_delivery.py` 覆盖；IR、捕获、通信、卸载和静态显存回归验证移除成本不改变负载事实。真实 Meta 集成对比归平台验收记录，不表示真实 NPU 性能或数值精度验证。
-
-
-最终验证：capture/IR/memory/step相关回归340 passed。训练全量首次为577 passed、14 failed；14项均为旧测试假设（12项precision默认文件断言、2项FSDP观察器未区分无捕获预热）。修正后完整test_precision.py为18 passed、test_fsdp_stream_capture.py为3 passed，未改生产语义来迁就测试。修改Python文件Ruff/format通过，pyrefly 0 errors。独立静态review无阻塞。干净目录构建的wheel从源码外site-packages运行真实Kimi两例：默认无目录，显式mem摘要/明细可读取并等于内存对象；zip检查确认无cost模块。全仓既有lint问题未纳入修改，未运行真实NPU数值/性能验收。

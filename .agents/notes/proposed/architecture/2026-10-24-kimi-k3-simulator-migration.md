@@ -66,8 +66,9 @@ checkpoint 名称因原生专家与 dense 参数布局而变化，adapter 已迁
 
 完整回归 521 项通过，随后 14 项专项包含 4 个新增测试，最终共 525 个不同 testcase。
 原生 FSDP AG 到投影权重、HSDP AR 的延后传播有专项测试；CP/EP 另有真实两 rank Gloo 对照。
-详细支持范围、精度限制、checkpoint key 变化和复验数据见
-[Kimi 接入说明](../../../../experiments/simulator/docs/kimi-k3-migration.md)。
+此处为历史验收记录；当前支持范围与限制见
+[能力矩阵](../../../../experiments/simulator/docs/capability-matrix.md)，后续模型接入见
+[模型接入指南](../../../../experiments/simulator/docs/model-integration.md)。
 主机全仓类型检查缺少训练依赖；配套容器中主包的基线和当前版本同为 357 个既有类型错误，新增 0。
 模型专项与 sidecar 类型检查均为 0 errors；不将全仓 Lint 声称为通过。
 主仓正常 pytest 入口的 Kimi CPU + 公共量化转换器 41 项通过。完整主仓回归收集 1,557 项，

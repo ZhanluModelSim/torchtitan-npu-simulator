@@ -29,26 +29,10 @@
 
 ## 验证入口
 
-`tests/test_warmup.py` 覆盖实际 GA 次数、异常清理、同进程捕获、原生 AdamW 状态初始化后的字节去重，以及一轮和两轮预热后图与峰值一致。`tests/test_step.py` 保留低层首次捕获及状态投影回归。完整模型、并行、AC 和卸载组合仍须通过真实 Meta 系统验证；不以小模型单测替代这些验证。
+`tests/test_warmup.py` 验证预热顺序、scheduler 与异常清理。`tests/test_optimizer_contract.py` 和 `tests/memory/test_optimizer_state.py` 检查状态清单；真实模型与显存交付见 `tests/test_memory_delivery.py`、`tests/test_kimi_capture.py` 和 `tests/test_dsv4_capture.py`。预热观察器必须区分无捕获阶段，不能假定 get_active_capture() 始终存在。
 
-本轮在 `ttsim` 的工作区 editable 环境验证：warmup、step、runtime 与 memory_delivery 完整组最终 38 项通过；旧冷启动峰值断言已更新为「raw 已含状态」，同时保留状态字节的独立手算和 CSV 时间线回放校验。Kimi 捕获文件 13 项通过，包含单卡、FSDP 首末 rank、HSDP、full/selective AC 和精度配置。Ruff 修改文件检查及 sidecar pyrefly 通过。
+## 预热开销的测量方法
 
-交付验证将主包和 sidecar wheel 普通安装至独立 `/tmp/steady-wheel-env-20261102`，两包实际导入均来自该环境 `site-packages`；在源码目录外运行 warmup 与 loss 核心测试 8 项通过，并完成 Kimi `world_size=2`、`seq_len=16` 的真实 Meta CLI 捕获及显存导出。未执行真实 NPU 数值或性能验证；全仓 pre-commit 未运行，不能将局部 Ruff 写为全仓 Lint 通过。
+在固定软件栈和模型配置下，以 `time.perf_counter` 分别测量 `warmup_training_iteration`、完整 `simulate` 以及含导入的进程墙钟。独立进程串行重复运行，记录中位数及逐次占比，区分冷启动与编译缓存。默认 simulate 不导出文件；显式 mem 的 I/O 开销应单独说明。
 
-
-## 预热耗时测量（2026-11-02）
-
-在ttsim容器、Intel Core i7-14700/WSL2、torch 2.14.0+cpu环境中，四组配置各以独立进程串行运行3次，使用time.perf_counter测量实际墙钟时间。共同配置为逻辑world_size=4、DP replicate2/shard2、EP2、MBS1、seq_len128、selective AC，无MTP或卸载；GBS=4×GA。下表各列为三次测量的中位数，占比先逐次计算再取中位数。
-
-| 模型预设 | GA | 预热秒数 | simulate总秒数 | 预热占比 | 整个进程秒数 |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| deepseek_v4_smoketest | 1 | 0.810 | 5.599 | 14.5% | 7.944 |
-| deepseek_v4_smoketest | 2 | 0.984 | 5.772 | 17.0% | 8.136 |
-| deepseek_v4_smoketest | 4 | 1.309 | 6.087 | 21.5% | 8.422 |
-| kimi_k3_smoketest | 2 | 0.855 | 4.872 | 17.7% | 7.221 |
-
-simulate总耗时包括构建、预热、正式捕获、内存/通信视图处理和默认原生显存摘要导出，不含模块导入及平台预测/DES/结果导出。整个进程额外包含Python启动、导入和退出，此分母下预热占比约10%～15%。DSV4 GA2预热内部F/B约0.348秒、clip约0.169秒、optimizer及首次状态初始化约0.467秒。
-
-这是负载生成器自身的CPU墙钟成本，不是被仿真训练的硬件耗时。预热直接耗时也不等于相对旧实现的净增量，因为首次初始化由正式捕获移到了预热；本次没有对旧实现做净开销A/B比较。结果仅覆盖所列小模型与环境，不作为完整模型、其他GA或机器的性能承诺。
-
-测量通过外部包装runner.warmup_training_iteration、run_simulation_step、export_result计时，未增加生产计时开关。原始12份结果及measure.py/run.py/summarize.py保存在工作区runs/warmup-timing-20261102/，大体量运行产物不入库。复测时固定相同配置，每次新建进程，串行运行，分别记录预热/完整simulate/进程墙钟，保留实际导入路径与组件版本。
+这些时间是负载生成器自身的 CPU 开销，不是仿真训练硬件时延。预热直接耗时也不等于相对无预热实现的净增量：首次状态初始化从正式捕获移到了预热。比较净开销必须使用相同模型、输入、依赖和导出设置做 A/B，不能把历史小模型结果推广到完整模型或其他机器。
