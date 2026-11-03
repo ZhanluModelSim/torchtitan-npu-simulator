@@ -1,6 +1,6 @@
 # TorchTitan simulator
 
-独立训练负载发生器：在 Meta 上复用原生模型、并行化、loss 和 optimizer，返回算子图、通信与控制依赖，以及静态显存预算。当前接入 DeepSeek-V4 和 Kimi K3；性能预测、硬件配置及 DES 归下游平台。本包仅在显式调用时激活，不修改上游安装源码，生产主包不依赖 simulator。
+独立训练负载发生器：在 Meta 上复用原生模型、并行化、loss 和 optimizer，返回算子图、通信与控制依赖，以及静态显存预算。当前接入 DeepSeek-V4、Kimi K3 和 Qwen3.5；性能预测、硬件配置及 DES 归下游平台。本包仅在显式调用时激活，不修改上游安装源码，生产主包不依赖 simulator。
 
 ## 从哪里开始
 
@@ -35,6 +35,8 @@ python -m torchtitan_simulator --config kimi_k3_smoketest \
 ```
 
 推荐 shell 入口为 `python -m torchtitan_simulator`。`--build-only` 仅构建模型，不能替代 F/B/O、梯度、通信或内存验收。Python 调用示例见[同进程接入](docs/upstream-integration.md)。
+
+模型 preset 与虚拟融合边界：Qwen3.5 文本捕获（`qwen3_5_debugmodel`／`qwen3_5_debugmodel_moe`）见 [Qwen3.5 接入](docs/qwen3-5-integration.md)。
 
 ## 主要边界
 

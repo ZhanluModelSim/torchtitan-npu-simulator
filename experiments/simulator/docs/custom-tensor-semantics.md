@@ -35,17 +35,19 @@
 | `kimi_sim.chunk_kda.default`、`chunk_kda_grad.default` | `KimiDeltaAttention.forward` 明确 reshape 为 B/S/H/D；beta 为 B/S/H，A_log 为 H，dt_bias 为 H×D 的展平维 |
 | `kimi_sim.fusion_attention.default`、`fusion_attention_grad.default` | `KimiGatedMLA.forward` 已转置为 B/H/S/D；value 已 padding，不能把轴大小当作未填充的 V head dimension |
 | `kimi_sim.situ_glu.default`、`situ_glu_backward.default` | 仅末轴 `feature` 在边界明确；前轴保持 `None`，兼容 dense、共享专家和 routed expert 输入 |
+| `qwen3_5_sim.gated_delta_rule.default`、`gated_delta_rule_grad.default` | 生产 Triton-Ascend GDN 边界为 B/S/H/D（`torchtitan_npu.ops.triton.gdn`）；g、beta 为 B/S/H；`reset` 为可选 B/S bool 掩码，固定长度文本捕获由 cu_seqlens 物化，直接调用可为 None |
 | `torchtitan_npu.npu_moe_re_routing.default` | rank-major rows 转为 expert-major rows；计数矩阵为 EP rank × local expert；恢复索引为逆置换，缺 scales 时第二个输出仍为真实空张量 |
 | `torchtitan_npu.npu_moe_token_permute.default`、`npu_moe_token_permute_backward.default` | tokens 为 token × feature；indices 的公开包装契约支持 token 向量或 token × topk；输出为 routed rows |
 | `torchtitan_npu.npu_moe_token_unpermute.default`、`npu_moe_token_unpermute_grad_unweighted.default` | probs 存在时按 token/topk 合并；probs 为 None 时只恢复 routed rows，空 probs 仍属于前者；feature 也可为标量尺度展开后的大小 1 |
+| `qwen3_5_sim.flex_attention.default`、`flex_attention_grad.default` | 上游 torchtitan attention 布局 B/H/S/D；GQA 下 k/v 的 head 轴大小小于 q，轴语义不变；scale 与 enable_gqa 为标量参数，不属于张量语义 |
 
 Kimi 反向节点同时声明保存输入角色、`output_gradient` 和输出梯度角色。原生 ATen、CANN、HCCL 算子不因注册本功能而新增语义轴；原生参数名绑定照常保留。控制节点及 offload payload 使用已有专属事实，不给它们猜测模型轴。
 
-本表覆盖当前 simulator 路径的六个 Kimi 虚拟融合与五个主包 MoE 包装 overload，不宣称其他未接入的 Triton、TileLang 或 DeepEP 自定义路径均已覆盖。
+本表覆盖当前 simulator 路径的六个 Kimi 虚拟融合、五个主包 MoE 包装 overload 与四个 Qwen3.5 虚拟融合 overload，不宣称其他未接入的 Triton、TileLang 或 DeepEP 自定义路径均已覆盖。
 
 ## 维护位置与验证
 
-Kimi 声明与定义同在 [`compat/kimi.py`](../torchtitan_simulator/compat/kimi.py)。主包包装算子的声明在 [`compat/moe_tensor_semantics.py`](../torchtitan_simulator/compat/moe_tensor_semantics.py)，依据主包 `torchtitan_npu/ops/ascendc/moe_*.py`；通过 Meta runtime 加载，主包无需依赖 simulator。注册是模块级静态声明，重复串行 runtime 不重复执行注册。
+Kimi 声明与定义同在 [`compat/kimi.py`](../torchtitan_simulator/compat/kimi.py)。主包包装算子的声明在 [`compat/moe_tensor_semantics.py`](../torchtitan_simulator/compat/moe_tensor_semantics.py)，依据主包 `torchtitan_npu/ops/ascendc/moe_*.py`；Qwen3.5 声明与定义同在 [`compat/qwen3_5.py`](../torchtitan_simulator/compat/qwen3_5.py)。通过 Meta runtime 加载，主包无需依赖 simulator。注册是模块级静态声明，重复串行 runtime 不重复执行注册。
 
 [`capture/tensor_semantics.py`](../torchtitan_simulator/capture/tensor_semantics.py) 负责精确匹配和绑定。新增自定义边界时，应在定义处或对应兼容模块声明真实角色与轴，不能从 shape 经验分类。只有参数存在性或接口明确支持的 rank 变体可选择声明；其他未知轴保留 `None`。手工 `record_synthetic_op` 若注册此声明，调用者必须在 attrs 中显式提供准确的 `input_tensor_bindings`；当前没有需要补充的手工计算调用。
 

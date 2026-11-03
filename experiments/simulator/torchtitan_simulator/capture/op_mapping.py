@@ -54,6 +54,8 @@ OP_MAPPING: dict[str, str] = {
     "kimi_sim.fusion_attention_grad.default": "fusion_attention",
     "kimi_sim.chunk_kda.default": "chunk_kda",
     "kimi_sim.chunk_kda_grad.default": "chunk_kda",
+    "qwen3_5_sim.gated_delta_rule.default": "gated_delta_rule",
+    "qwen3_5_sim.gated_delta_rule_grad.default": "gated_delta_rule",
     "situ_glu_backward": "situ_glu",
     "npu.npu_rotary_mul.default": "rope",
     # MoE dispatch
