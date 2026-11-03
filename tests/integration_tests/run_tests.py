@@ -632,9 +632,7 @@ def _filter_tests(
             continue
         if test_flavor.disabled or test_flavor.test_name in exclude_set:
             continue
-        # This branch validates the folded-token AdamW training paths first.
-        # Keep the unmigrated cases defined, with an explicit reason when a
-        # default suite or a manual selector encounters one.
+        # Keep unrelated, unmigrated features out of the selected suite.
         migration_pending = _migration_pending_reason(test_flavor)
         if migration_pending is not None:
             log_print(f"Skipping {test_flavor.test_name}: {migration_pending}")
@@ -652,10 +650,20 @@ def _migration_pending_reason(case: OverrideDefinitions) -> str | None:
     if case.test_name.startswith("dsv3_2_"):
         return "DeepSeek-V3.2 model boundary still requires the folded-token migration"
     arguments = {arg for phase in case.override_args for arg in phase}
-    if "--optimizer.name=Muon" in arguments:
-        return "Muon migration is pending"
-    if case.check_resume or case.verify_ema_checkpoint or "--checkpoint.enable" in arguments:
-        return "checkpoint/EMA migration is pending"
+    if "--optimizer.name=Muon" in arguments and "--training.enable-cpu-offload" in arguments:
+        return "native CPU-offload Muon migration is pending"
+    if "--optimizer.name=Muon" in arguments and (
+        "lora" in case.test_name
+        or any(
+            arg.startswith("--parallelism.context-parallel-degree=") and arg.rsplit("=", 1)[1] != "1"
+            for arg in arguments
+        )
+    ):
+        return "Muon LoRA/context-parallel integration migration is pending"
+    if case.verify_ema_checkpoint:
+        return "EMA migration is pending"
+    if case.check_resume and "lora" in case.test_name:
+        return "LoRA checkpoint migration is pending"
     return None
 
 

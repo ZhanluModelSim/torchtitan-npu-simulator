@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 from torch.utils.checkpoint import DefaultDeviceType, checkpoint
+from torchtitan.components.optimizer import ParamGroupConfig
 
 from torchtitan_npu.extensions.torchtitan.components.optimizer import optimizer as host_mod
 from torchtitan_npu.models.deepseek_v4_1.engram.host import HostEngramTable
@@ -164,7 +165,10 @@ def _host_table_config():
     )
 
 
-def test_host_offload_model_state_uses_rank_specific_shard_key():
+@pytest.mark.skipif(
+    not hasattr(torch.distributed.checkpoint, "CheckpointableTensor"), reason="CheckpointableTensor is required"
+)
+def test_host_offload_weight_and_moments_describe_global_row_shard():
     table = HostEngramTable(_host_table_config())
     table.weight = torch.nn.Parameter(_ramp(5))
     table._ep_rank = 1
@@ -172,8 +176,27 @@ def test_host_offload_model_state_uses_rank_specific_shard_key():
     table._mark_host_weight()
 
     state = table.state_dict()
-    assert "weight" not in state
-    assert list(state) == ["weight.ep_shard_00001_of_00002"]
+    assert list(state) == ["weight"]
+    assert state["weight"].global_shape == (10, _DIM)
+    assert state["weight"].global_offsets == ((5, 0),)
+    assert state["weight"].local_offsets == ((0, 0),)
+    assert state["weight"].local_sizes == ((5, _DIM),)
+
+    model = torch.nn.Module()
+    model.add_module("table", table)
+    optimizer = host_mod.HostSparseOptimizersContainer.Config(
+        implementation="for-loop",
+        param_groups=[ParamGroupConfig(pattern=r"table\.weight$", optimizer_name="SparseAdam")],
+    ).build(model_parts=[model])
+
+    optim_state = optimizer.state_dict()
+    for name in ("exp_avg", "exp_avg_sq"):
+        moment = optim_state[f"state.table.weight.{name}"]
+        assert moment.global_shape == (10, _DIM)
+        assert moment.global_offsets == ((5, 0),)
+        assert moment.local_offsets == ((0, 0),)
+        assert moment.local_sizes == ((5, _DIM),)
+        assert moment.data_ptr() == optimizer.optimizers[0].state[table.weight][name].data_ptr()
 
     restored = HostEngramTable(_host_table_config())
     restored.weight = torch.nn.Parameter(torch.zeros(5, _DIM))

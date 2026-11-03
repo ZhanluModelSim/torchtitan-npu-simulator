@@ -177,9 +177,9 @@ class DeepSeekV41StateDictAdapter(DeepSeekV3StateDictAdapter):
                     raise ValueError(f"HF checkpoint contains Engram for unconfigured layer {layer_id}")
                 abstract = re.sub(r"(\d+)", "{}", key, count=1)
                 local_key = self.from_hf_map[abstract].format(layer_id)
-                if hasattr(value, "_engram_native_key"):
+                if hasattr(value, "_engram_valid_rows"):
                     value[value._engram_valid_rows :].zero_()
-                    state_dict[value._engram_native_key] = value
+                    state_dict[local_key] = value
                     continue
                 scale = hf_state_dict.get(key.removesuffix("weight") + "scale") if key.endswith(".weight") else None
                 if scale is not None:
@@ -250,24 +250,26 @@ class DeepSeekV41StateDictAdapter(DeepSeekV3StateDictAdapter):
 
         for key, value in state_dict.items():
             if ".engram.table.weight" in key:
-                match = re.fullmatch(
-                    r"layers\.(\d+)\.engram\.table\.weight(?:\.(?:efsdp_)?ep_shard_(\d+)_of_(\d+))?", key
-                )
+                match = re.fullmatch(r"layers\.(\d+)\.engram\.table\.weight", key)
                 if match is None:
                     raise ValueError(f"Unexpected Engram table key: {key}")
                 layer_id = int(match[1])
                 config = self._engram_tables[layer_id]
-                rank, size = (int(match[2]), int(match[3])) if match[2] else (0, 1)
-                if not 0 <= rank < size or config.num_embeddings % size:
-                    raise ValueError(f"Invalid Engram table shard: {key}")
-                shard_rows = config.num_embeddings // size
+                shard_rows = config.num_embeddings
+                offset = 0
+                if hasattr(value, "global_shape"):
+                    if tuple(value.global_shape) != (config.num_embeddings, config.embedding_dim):
+                        raise ValueError(f"Unexpected global Engram table shape for {key}: {value.global_shape}")
+                    offset = value.global_offsets[0][0]
+                    shard_rows = value.local_sizes[0][0]
                 if tuple(value.shape) != (shard_rows, config.embedding_dim):
                     raise ValueError(f"Unexpected native Engram shard shape for {key}: {value.shape}")
                 logical_rows = sum(config.head_vocab_sizes)
+                # Full-table HF exports also support writers that do not read shard metadata.
                 hf_state_dict[f"layers.{layer_id}.engram.embed.weight"] = (
-                    value[:logical_rows]
-                    if size == 1
-                    else checkpoint_shard(value, key=key, offset=rank * shard_rows, logical_rows=logical_rows)
+                    checkpoint_shard(value, offset=offset, logical_rows=logical_rows)
+                    if offset != 0 or shard_rows != config.num_embeddings
+                    else value[:logical_rows]
                 )
 
             elif any(t in key for t in ("compressor", "indexer")):

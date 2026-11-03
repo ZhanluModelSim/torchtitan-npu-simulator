@@ -18,6 +18,7 @@ from torch.distributed.checkpoint import HuggingFaceStorageReader, HuggingFaceSt
 from torch.distributed.checkpoint._consolidate_hf_safetensors import consolidate_safetensors_files_on_every_rank
 
 from torchtitan_npu.models.deepseek_v4_1 import model_registry
+from torchtitan_npu.models.deepseek_v4_1.engram.checkpoint import checkpoint_shard
 from torchtitan_npu.models.deepseek_v4_1.state_dict_adapter import DeepSeekV41StateDictAdapter
 
 
@@ -48,17 +49,23 @@ def main():
         weight = torch.arange(48 * 32, dtype=torch.float32).reshape(48, 32)
         gate = torch.arange(8, dtype=torch.float32).reshape(2, 4)
         # Four-rank local runs cover EP2 replicas and four distinct joint shards.
-        # The default two-rank UT remains small while checking both key formats.
+        # All layouts use the same key and describe their rows through metadata.
         for layout, mapped in product(("ep", "efsdp_ep"), (False, True)):
             shards = 2 if layout == "ep" else dist.get_world_size()
             shard_rank = rank % shards
             rows = 48 // shards
             offset = shard_rank * rows
-            key = f"layers.1.engram.table.weight.{layout}_shard_{shard_rank:05d}_of_{shards:05d}"
+            key = "layers.1.engram.table.weight"
             adapter = DeepSeekV41StateDictAdapter(config, str(assets) if mapped else None)
             native = {key: weight[offset : offset + rows].clone(), "layers.1.engram.gate.q_weight": gate}
-            # Trainer casts native state before calling to_hf for last-save export.
+            # Attach checkpoint metadata to the final typed view.
             native = {name: value.to(torch.bfloat16) for name, value in native.items()}
+            native[key] = checkpoint_shard(native[key], offset=offset, logical_rows=48)
+            native_path = root / f"native_{layout}_{mapped}"
+            dcp.save(native, checkpoint_id=str(native_path))
+            full_native = {key: torch.empty_like(weight, dtype=torch.bfloat16)}
+            dcp.load(full_native, checkpoint_id=str(native_path))
+            torch.testing.assert_close(full_native[key], weight.bfloat16(), rtol=0, atol=0)
             hf = adapter.to_hf(native)
             assert type(hf["layers.1.engram.embed.weight"]) is torch.Tensor
             path = root / f"{layout}_{'mapped' if mapped else 'unmapped'}"
@@ -85,7 +92,9 @@ def main():
             dcp.load(restored, storage_reader=HuggingFaceStorageReader(str(path)))
             torch.testing.assert_close(restored["layers.1.engram.embed.weight"], weight[:41].bfloat16(), rtol=0, atol=0)
             torch.testing.assert_close(restored["layers.1.engram.q_weight"], gate.bfloat16(), rtol=0, atol=0)
-            target = adapter.to_hf({key: torch.full((rows, 32), -1.0)})
+            target = adapter.to_hf(
+                {key: checkpoint_shard(torch.full((rows, 32), -1.0), offset=offset, logical_rows=48)}
+            )
             dcp.load(target, storage_reader=HuggingFaceStorageReader(str(path)))
             loaded = adapter.from_hf(target)
             assert set(loaded) == {key}

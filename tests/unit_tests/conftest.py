@@ -36,8 +36,6 @@ collect_ignore = [
     "extensions/torchtitan/experiments/torchft",
     "patches/torchft",
     "patches/torchtitan/experiments/graph_trainer",
-    "test_dsv4_muon.py",
-    "models/deepseek_v4_1/test_muon_profile.py",
     # Qwen runtime migration is deferred. Upstream eagerly imports CUDA-only
     # CuTeDSL code, which is not installed in the NPU test image.
     "models/qwen3_5/test_qwen3_5_npu_adapter.py",
@@ -132,14 +130,15 @@ def pytest_collection_modifyitems(items):
             item.add_marker(
                 pytest.mark.skip(reason="DeepSeek-V3.2 model boundary still requires the folded-token migration")
             )
-        # Checkpoint resume and Muon are deliberately deferred on this branch.
-        if "muon" in item.name.lower() or item.name.startswith(
+        if relative_path.startswith("extensions/cpu_offload/") and "muon" in item.name.lower():
+            item.add_marker(pytest.mark.skip(reason="native CPU-offload Muon migration is pending"))
+        if item.name.startswith(
             (
                 "test_lora_training_freezes_engram_and_native_dcp_resumes",
                 "test_v41_adapter_only_resume_restores_engram_and_next_step",
             )
         ):
-            item.add_marker(pytest.mark.skip(reason="checkpoint/Muon migration is pending"))
+            item.add_marker(pytest.mark.skip(reason="LoRA checkpoint migration is pending"))
 
 
 # ---------------------------------------------------------------------------

@@ -151,43 +151,6 @@ def _save_as_hf(state_dict, sd_adapter, target_dtype, output_dir):
     dcp.save(hf_state_dict, storage_writer=storage_writer)
 
 
-def load_dcp_model(state_dict, reader):
-    """Load native CPU Engram shards into full-table views for offline export.
-
-    This is a converter implementation detail, not a StateDictAdapter hook.
-    Unsupported or incomplete table layouts must fail before loading weights.
-    """
-    metadata = reader.read_metadata().state_dict_metadata
-    targets = dict(state_dict)
-    for key, target in state_dict.items():
-        if not key.endswith(".engram.table.weight") or key in metadata:
-            continue
-        layouts = [
-            (prefix, sorted(k for k in metadata if k.startswith(key + prefix)))
-            for prefix in (".ep_shard_", ".efsdp_ep_shard_")
-        ]
-        layouts = [(prefix, shards) for prefix, shards in layouts if shards]
-        if len(layouts) > 1:
-            raise ValueError(f"Mixed Engram checkpoint shard layouts for {key}")
-        prefix, shards = layouts[0] if layouts else ("", [])
-        if not shards:
-            raise ValueError(f"Missing or unsupported Engram checkpoint layout for {key}")
-        targets.pop(key)
-        offset = 0
-        for rank, shard_key in enumerate(shards):
-            suffix = f"{prefix}{rank:05d}_of_{len(shards):05d}"
-            if shard_key != key + suffix:
-                raise ValueError(f"Incomplete or unsupported Engram checkpoint shards for {key}")
-            shape = metadata[shard_key].size
-            if len(shape) != 2 or shape[1] != target.shape[1] or offset + shape[0] > target.shape[0]:
-                raise ValueError(f"Engram checkpoint geometry differs from model config: {shard_key}")
-            targets[shard_key] = target[offset : offset + shape[0]]
-            offset += shape[0]
-        if offset != target.shape[0]:
-            raise ValueError(f"Engram checkpoint does not cover the full table: {key}")
-    dcp.load(targets, storage_reader=reader)
-
-
 @torch.inference_mode()
 def convert_to_hf(args: argparse.Namespace):
     input_dir = args.input_dir
@@ -220,7 +183,7 @@ def convert_to_hf(args: argparse.Namespace):
     # allocate state dict memory with empty weights to load checkpoint
     state_dict = model.state_dict()
     reader = ParallelFileSystemReader(input_dir, thread_count=read_threads)
-    load_dcp_model(state_dict, reader)
+    dcp.load(state_dict, storage_reader=reader)
 
     target_dtype = TORCH_DTYPE_MAP[export_dtype]
     _save_as_hf(state_dict, sd_adapter, target_dtype, output_dir)

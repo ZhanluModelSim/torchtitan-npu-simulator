@@ -27,11 +27,6 @@ TensorBoard 读取每个 step 的 loss 和 grad_norm → 按 bitwise 或 close �
 旧版本可使用 `--baseline-training-api legacy`，将 baseline 的长度参数改为 `--training.seq-len`。
 `--baseline-upstream` / `--test-upstream` 分别指定独立的 TorchTitan 源码目录。
 
-Engram 等按并行布局保存原生 checkpoint 的模型，应使用 `--seed-mode distributed`。
-该模式按 baseline 的 NPU 数、入口配置及额外选项构建模型，在训练前保存 step-0，
-不执行 forward、backward 或 optimizer 更新。两侧仍加载同一份权重；checkpoint
-是否支持两侧不同的并行布局由模型决定，不兼容时加载会失败。
-
 用法示例：
 
 1. 比较自行准备的两个训练脚本
@@ -111,10 +106,7 @@ Engram 等按并行布局保存原生 checkpoint 的模型，应使用 `--seed-m
 - --seq-len：seed 和两侧训练的序列长度，默认 4096；例如 `--seq-len 2048`。
 - --ngpus：可选的两侧 NPU 进程数覆盖值；默认沿用环境变量和各自 runner 的卡数设置。
   两侧拓扑不同时用 --baseline-ngpus / --test-ngpus 分别覆盖；显式卡数参数优先于
-  NGPU 环境变量。默认 unsharded seed 使用单进程初始化。
-- --seed-mode：默认 unsharded 使用单卡 CPU 初始化；distributed 保留 baseline
-  的并行布局，需要与 baseline 相同的卡数和显存资源，runner 必须支持 TRAIN_FILE。
-  distributed 不能与 --baseline-env TRAIN_FILE=... 同用。
+  NGPU 环境变量。seed 使用单进程 CPU 初始化。
 - --output-dir：结果输出目录，必须为空或尚未存在；默认在当前目录的
   outputs/compare_results/ 下创建独立的结果子目录。
 - --cleanup-after-test / --no-cleanup-after-test：默认清理 seed 目录和临时
@@ -337,34 +329,25 @@ def build_seed_command(
     deterministic: bool = True,
     seq_len: int = DEFAULT_SEQ_LEN,
     training_api: str = "tokens",
-    distributed: bool = False,
-    options: str = "",
 ) -> list[str]:
-    # CPU seed creation skips parallelize_fn but still builds an optimizer;
-    # DistMuon requires DTensor parameters. Distributed creation preserves
-    # the baseline optimizer and layout. Both modes save only model weights.
-    initialization = (
-        [*shlex.split(options), "--checkpoint.no-create-seed-checkpoint", "--training.steps=1"]
-        if distributed
-        else [
-            "--checkpoint.create_seed_checkpoint",
-            "--optimizer.name=AdamW",
-            "--parallelism.data-parallel-replicate-degree=1",
-            "--parallelism.data-parallel-shard-degree=1",
-            "--parallelism.tensor-parallel-degree=1",
-            "--parallelism.pipeline-parallel-degree=1",
-            "--parallelism.context-parallel-degree=1",
-            "--parallelism.expert-parallel-degree=1",
-        ]
-    )
+    # Seed creation skips parallelize_fn but still builds an optimizer. Use
+    # AdamW here because DistMuon requires DTensor parameters. Only model
+    # weights are saved; training keeps the runner's optimizer selection.
     return [
         str(runner),
         f"--dump_folder={dump_folder}",
-        *initialization,
+        "--checkpoint.create_seed_checkpoint",
         "--checkpoint.enable",
         "--checkpoint.no-load-only",
         f"--checkpoint.folder={dump_folder / 'checkpoint'}",
         "--checkpoint.last-save-model-only",
+        "--optimizer.name=AdamW",
+        "--parallelism.data-parallel-replicate-degree=1",
+        "--parallelism.data-parallel-shard-degree=1",
+        "--parallelism.tensor-parallel-degree=1",
+        "--parallelism.pipeline-parallel-degree=1",
+        "--parallelism.context-parallel-degree=1",
+        "--parallelism.expert-parallel-degree=1",
         *_fixed_training_options(deterministic=deterministic, seq_len=seq_len, training_api=training_api),
     ]
 
@@ -703,7 +686,6 @@ def write_report(
     mode: str,
     thresholds: MetricThresholds,
     comparisons: Sequence[MetricComparison],
-    seed_mode: str = "unsharded",
     runtime_options: Mapping[str, Any] | None = None,
 ) -> None:
     report: dict[str, Any] = {
@@ -722,7 +704,6 @@ def write_report(
         "runner_scope": runner_scope,
         "expected_step_range": {"first": 1, "last": expected_steps},
         "mode": mode,
-        "seed_mode": seed_mode,
         "thresholds": asdict(thresholds),
         "passed": all(result.passed for result in comparisons),
         "metrics": [asdict(result) for result in comparisons],
@@ -851,14 +832,7 @@ def parse_args() -> argparse.Namespace:
         default=[],
         help="extra KEY=VALUE[,...] environment for the test run (repeatable)",
     )
-    seed_group = parser.add_mutually_exclusive_group()
-    seed_group.add_argument(
-        "--seed-mode",
-        choices=("unsharded", "distributed"),
-        default="unsharded",
-        help="shared checkpoint initialization: single-rank CPU or baseline's distributed layout",
-    )
-    seed_group.add_argument(
+    parser.add_argument(
         "--no-seed-checkpoint",
         action="store_true",
         help="initialize both runs from deterministic seeds instead of one checkpoint",
@@ -871,8 +845,6 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if (args.baseline_ref is None) != (args.test_ref is None):
         parser.error("provide both baseline_ref and test_ref, or omit both to use the current working tree")
-    if args.seed_mode == "distributed" and "TRAIN_FILE" in _merged_env(args.baseline_env):
-        parser.error("--seed-mode distributed cannot be combined with --baseline-env TRAIN_FILE=...")
     if args.steps <= 0:
         parser.error("--steps must be positive")
     if args.seq_len <= 0:
@@ -994,20 +966,6 @@ def main() -> None:
         if not args.no_seed_checkpoint:
             log_step("Creating shared seed checkpoint")
             seed_dump = output_dir / "seed"
-            distributed_seed = args.seed_mode == "distributed"
-            seed_env = training_env(
-                base_n if distributed_seed else 1, _merged_env(args.baseline_env), upstream=args.baseline_upstream
-            )
-            if distributed_seed:
-                # Use this CLI's helper even when the baseline ref predates it.
-                # Expose only the helper, not sibling modules such as utils.
-                seed_entrypoint = seed_dump / "entrypoint"
-                seed_entrypoint.mkdir(parents=True)
-                shutil.copy2(Path(__file__).with_name("create_seed_checkpoint.py"), seed_entrypoint)
-                seed_env["TRAIN_FILE"] = "create_seed_checkpoint"
-                seed_env["PYTHONPATH"] = os.pathsep.join(
-                    filter(None, (str(seed_entrypoint), seed_env.get("PYTHONPATH", "")))
-                )
             run_with_realtime_output(
                 build_seed_command(
                     baseline_runner,
@@ -1015,17 +973,14 @@ def main() -> None:
                     deterministic=not args.no_deterministic,
                     seq_len=args.seq_len,
                     training_api=args.baseline_training_api,
-                    distributed=distributed_seed,
-                    options=args.baseline_options,
                 ),
                 cwd=baseline_worktree,
-                env=seed_env,
+                env=training_env(1, _merged_env(args.baseline_env), upstream=args.baseline_upstream),
                 log_file=seed_dump / "training.log",
             )
             seed_checkpoint = seed_dump / "checkpoint" / "step-0"
             if not seed_checkpoint.is_dir():
-                hint = "; check that the runner supports TRAIN_FILE=create_seed_checkpoint" if distributed_seed else ""
-                raise RuntimeError(f"seed checkpoint was not created: {seed_checkpoint}{hint}")
+                raise RuntimeError(f"seed checkpoint was not created: {seed_checkpoint}")
             log_success(f"Seed checkpoint is ready: {seed_checkpoint}")
         else:
             log_info("Shared seed checkpoint disabled; using deterministic seeds")
@@ -1107,7 +1062,6 @@ def main() -> None:
             mode=args.mode,
             thresholds=(thresholds if args.mode == "close" else BITWISE_THRESHOLDS),
             comparisons=comparisons,
-            seed_mode="none" if args.no_seed_checkpoint else args.seed_mode,
             runtime_options={
                 side: {
                     "training_api": getattr(args, f"{side}_training_api"),

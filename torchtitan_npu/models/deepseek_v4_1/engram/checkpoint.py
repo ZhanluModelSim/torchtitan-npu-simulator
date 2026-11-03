@@ -8,7 +8,7 @@
 import torch.distributed.checkpoint as dcp
 
 
-def checkpoint_shard(weight, *, key, offset, logical_rows):
+def checkpoint_shard(weight, *, offset, logical_rows):
     if not hasattr(dcp, "CheckpointableTensor"):
         raise RuntimeError(
             "Engram HF row shards require PyTorch CheckpointableTensor support; "
@@ -21,6 +21,5 @@ def checkpoint_shard(weight, *, key, offset, logical_rows):
     result.global_offsets = ((offset, 0),) if rows else ()
     result.local_offsets = ((0, 0),) if rows else ()
     result.local_sizes = ((rows, weight.shape[1]),) if rows else ()
-    result._engram_native_key = key
     result._engram_valid_rows = rows
     return result

@@ -19,14 +19,14 @@ from torchtitan.distributed.parallel_dims import MeshAxisName
 from torchtitan_npu.models.deepseek_v4_1 import model_registry
 from torchtitan_npu.models.deepseek_v4_1.config_registry import (
     _v41_muon_profile,
-    deepseek_v4_1_debugmodel_multimodal,
-    deepseek_v4_1_flash_40layers_24experts_multimodal,
+    deepseek_v4_1_debugmodel_text,
+    deepseek_v4_1_flash_40layers_24experts_text,
 )
 
 
 @pytest.fixture(scope="module")
 def spec():
-    return model_registry("deepseek_v4_1_flash_40layers_24experts_multimodal")
+    return model_registry("deepseek_v4_1_flash_40layers_24experts_text")
 
 
 @pytest.fixture(scope="module")
@@ -41,7 +41,7 @@ def layouts(profile):
 
 class TestDefaultRecipe:
     def test_default_is_adamw(self):
-        cfg = deepseek_v4_1_flash_40layers_24experts_multimodal()
+        cfg = deepseek_v4_1_flash_40layers_24experts_text()
         assert cfg.optimizer.name == "AdamW"
         assert [group.optimizer_name for group in cfg.optimizer.param_groups] == ["SparseAdam", "AdamW"]
 
@@ -118,7 +118,7 @@ class TestRealModelReconciliation:
     def test_pattern_layouts_and_buckets_partition_the_debugmodel(self):
         from tests.unit_tests.models.mtp_test_utils import build_cpu_model
 
-        trainer = deepseek_v4_1_debugmodel_multimodal()
+        trainer = deepseek_v4_1_debugmodel_text()
         model = build_cpu_model(trainer.model_spec.model)
         fqns = [name for name, _ in model.named_parameters()]
 
@@ -157,7 +157,7 @@ class TestRealModelReconciliation:
         assert not unexpected, sorted(unexpected)[:5]
 
     def test_materialize_swaps_param_groups_to_distmuon_plus_adamw(self):
-        trainer = deepseek_v4_1_debugmodel_multimodal()
+        trainer = deepseek_v4_1_debugmodel_text()
         trainer.optimizer.name = "Muon"
         trainer.optimizer.lr = 1.23e-4
         trainer.optimizer.materialize()

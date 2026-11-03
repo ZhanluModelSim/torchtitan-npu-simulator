@@ -179,7 +179,7 @@ def test_mxfp8_override_refreshes_derived_storage(monkeypatch):
     torch.testing.assert_close(storage[1].float(), untouched_storage.float(), rtol=0, atol=0)
     torch.testing.assert_close(scale[1].float(), untouched_scale.float(), rtol=0, atol=0)
 
-    loaded = {name: torch.full_like(value, 0.125) for name, value in table.state_dict().items()}
+    loaded = {"weight": torch.full_like(table.weight, 0.125)}
     table.load_state_dict(loaded)
     expected_storage, expected_scale = mxfp8._quantize_mxfp8_rows(table.weight)
     torch.testing.assert_close(storage.float(), expected_storage.float(), rtol=0, atol=0)
@@ -211,7 +211,11 @@ def test_joint_sharding_override_sets_storage_and_lookup_group(monkeypatch, back
     table.parallelize(SimpleNamespace(get_optional_mesh=lambda name: ep))
     assert table.weight.shape == (3, 128)
     assert table.ep_mesh is ep and table.lookup_mesh is joint
-    assert list(table.state_dict()) == ["weight.efsdp_ep_shard_00003_of_00004"]
+    if hasattr(torch.distributed.checkpoint, "CheckpointableTensor"):
+        state = table.state_dict()
+        assert list(state) == ["weight"]
+        assert state["weight"].global_shape == (12, 128)
+        assert state["weight"].global_offsets == ((9, 0),)
     if backend != "torch":
         monkeypatch.setattr(ascendc, "_dedicated_engram_group", lambda group: group)
         monkeypatch.setattr(table, "_elastic_buffer_type", lambda: _FakeBuffer)

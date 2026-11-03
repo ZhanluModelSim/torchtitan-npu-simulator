@@ -71,13 +71,8 @@ p.add_argument('--recorded-steps')
 p.add_argument('--checkpoint.folder', type=Path, dest='checkpoint_folder')
 p.add_argument('--checkpoint.create_seed_checkpoint', action='store_true', dest='create_seed_checkpoint')
 args, _ = p.parse_known_args()
-if args.create_seed_checkpoint or os.environ.get('TRAIN_FILE') == 'create_seed_checkpoint':
-    if os.environ.get('TRAIN_FILE') == 'create_seed_checkpoint':
-        entrypoint = Path(os.environ['PYTHONPATH'].split(os.pathsep)[0])
-        print('seed-imports=' + ','.join(sorted(path.name for path in entrypoint.iterdir())))
-        print('seed-processes=' + os.environ.get('NGPU', 'unset'))
+if args.create_seed_checkpoint:
     (args.checkpoint_folder / 'step-0').mkdir(parents=True)
-    print('seed-value=' + str(args.value))
     print('seed-ngpu=' + os.environ.get('NGPU', 'unset'))
     raise SystemExit(0)
 print('runner-ngpu=' + os.environ.get('NGPU', 'unset'))
@@ -127,109 +122,6 @@ def _compare(repo, refs, output, runner, *options):
     )
 
 
-def test_loss_compare_distributed_seed_uses_baseline_layout_and_options(tmp_path, runner_repo):
-    repo, refs = runner_repo
-    output = tmp_path / "comparison"
-
-    result = subprocess.run(
-        [
-            sys.executable,
-            str(CLI),
-            refs[0],
-            refs[0],
-            "--runner=runner.sh",
-            "--seed-mode=distributed",
-            "--baseline-ngpus=2",
-            "--test-ngpus=2",
-            "--steps=2",
-            "--baseline-options=--value=3",
-            "--test-options=--value=3",
-            "--output-dir",
-            str(output),
-        ],
-        cwd=repo,
-        text=True,
-        capture_output=True,
-        timeout=40,
-    )
-
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert "seed-processes=2" in result.stdout
-    assert "seed-value=3.0" in result.stdout
-    assert "seed-imports=create_seed_checkpoint.py" in result.stdout
-    report = json.loads((output / "comparison.json").read_text())
-    assert report["seed_mode"] == "distributed"
-    assert report["passed"]
-    assert "runner-value=3.0" in (output / "baseline" / "training.log").read_text()
-    assert "runner-value=3.0" in (output / "test" / "training.log").read_text()
-
-
-def test_loss_compare_rejects_distributed_seed_with_custom_baseline_entrypoint(tmp_path):
-    output = tmp_path / "comparison"
-
-    result = subprocess.run(
-        [
-            sys.executable,
-            str(CLI),
-            "HEAD",
-            "HEAD",
-            "--seed-mode=distributed",
-            "--baseline-env=EXAMPLE=1,TRAIN_FILE=custom.train",
-            "--baseline-env=EXAMPLE=2",
-            "--output-dir",
-            str(output),
-        ],
-        cwd=tmp_path,
-        text=True,
-        capture_output=True,
-        timeout=10,
-    )
-
-    assert result.returncode == 2, result.stdout + result.stderr
-    assert "--seed-mode distributed cannot be combined with --baseline-env TRAIN_FILE" in result.stderr
-    assert not output.exists()
-
-
-def test_loss_compare_bounds_training_when_runner_ignores_seed_entrypoint(tmp_path, runner_repo):
-    repo, refs = runner_repo
-    observed_steps = tmp_path / "observed_steps"
-    training = (
-        "import argparse; from pathlib import Path; "
-        "parser = argparse.ArgumentParser(); "
-        "parser.add_argument('--training.steps', dest='steps', type=int); "
-        "args, _ = parser.parse_known_args(); "
-        f"Path({str(observed_steps)!r}).write_text(','.join(map(str, range(1, args.steps + 1))))"
-    )
-    runner = repo / "ignore_entrypoint.sh"
-    runner.write_text(f'#!/bin/bash\nexec {shlex.quote(sys.executable)} -c {shlex.quote(training)} "$@"\n')
-    runner.chmod(0o755)
-    output = tmp_path / "comparison"
-
-    result = subprocess.run(
-        [
-            sys.executable,
-            str(CLI),
-            refs[0],
-            refs[0],
-            f"--runner={runner}",
-            "--seed-mode=distributed",
-            "--steps=5",
-            "--output-dir",
-            str(output),
-        ],
-        cwd=repo,
-        text=True,
-        capture_output=True,
-        timeout=40,
-    )
-
-    assert result.returncode != 0
-    assert "check that the runner supports TRAIN_FILE=create_seed_checkpoint" in result.stderr
-    assert observed_steps.read_text() == "1"
-    assert not (output / "baseline").exists()
-    assert not (output / "comparison.json").exists()
-
-
 def _write_metric_runner(repo, name, value, *, ngpus=None):
     runner = repo / name
     environment = f'export NGPU="${{NGPU:-{ngpus}}}"\n' if ngpus is not None else ""
@@ -241,7 +133,6 @@ def _write_metric_runner(repo, name, value, *, ngpus=None):
     return runner
 
 
-@pytest.mark.parametrize("seed_mode", ["unsharded", "distributed"])
 @pytest.mark.parametrize(
     ("inherited_ngpu", "options", "baseline_ngpu", "test_ngpu", "baseline_config", "test_config"),
     [
@@ -288,7 +179,6 @@ def test_loss_compare_preserves_runner_card_counts_unless_overridden(
     tmp_path,
     runner_repo,
     monkeypatch,
-    seed_mode,
     inherited_ngpu,
     options,
     baseline_ngpu,
@@ -311,7 +201,6 @@ def test_loss_compare_preserves_runner_card_counts_unless_overridden(
             "--baseline-runner=base.sh",
             "--test-runner=test.sh",
             "--steps=2",
-            f"--seed-mode={seed_mode}",
             "--output-dir",
             str(output),
             *options,
@@ -323,8 +212,7 @@ def test_loss_compare_preserves_runner_card_counts_unless_overridden(
     )
 
     assert result.returncode == 0, result.stdout + result.stderr
-    seed_ngpu = 1 if seed_mode == "unsharded" else baseline_ngpu
-    assert f"seed-ngpu={seed_ngpu}\n" in result.stdout
+    assert "seed-ngpu=1\n" in result.stdout
     report = json.loads((output / "comparison.json").read_text())
     for side, ngpu, config in (("baseline", baseline_ngpu, baseline_config), ("test", test_ngpu, test_config)):
         assert f"runner-ngpu={ngpu}\n" in (output / side / "training.log").read_text()
@@ -360,7 +248,7 @@ def test_loss_compare_runs_uncommitted_scripts_with_shared_seed(tmp_path, runner
     )
 
     assert result.returncode == (0 if test_value == 1 else 1), result.stdout + result.stderr
-    assert "seed-value=1.0" in result.stdout
+    assert "seed-ngpu=1\n" in result.stdout
     report = json.loads((output / "comparison.json").read_text())
     assert report["runner_scope"] == "working-tree"
     assert report["passed"] is (test_value == 1)

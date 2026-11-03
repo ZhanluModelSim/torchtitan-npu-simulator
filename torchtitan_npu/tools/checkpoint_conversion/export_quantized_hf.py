@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+import torch.distributed.checkpoint as dcp
 from torch import nn
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
@@ -802,7 +803,7 @@ def _load_dcp_state_dict(model, input_dir: Path, master_dtype: str, read_threads
     """Load the DCP checkpoint into the model's state-dict container."""
     from torchtitan.config import TORCH_DTYPE_MAP
 
-    from torchtitan_npu.tools.checkpoint_conversion.convert_to_hf import ParallelFileSystemReader, load_dcp_model
+    from torchtitan_npu.tools.checkpoint_conversion.convert_to_hf import ParallelFileSystemReader
 
     state_dict = model.state_dict()
     # The model is built in float32, but dcp.load copies the stored dtype into
@@ -814,7 +815,7 @@ def _load_dcp_state_dict(model, input_dir: Path, master_dtype: str, read_threads
         if value.is_floating_point() and value.dtype != container_dtype and ".engram.table.weight" not in fqn:
             state_dict[fqn] = value.detach().to(container_dtype)
     reader = ParallelFileSystemReader(str(input_dir), thread_count=read_threads)
-    load_dcp_model(state_dict, reader)
+    dcp.load(state_dict, storage_reader=reader)
     return state_dict
 
 

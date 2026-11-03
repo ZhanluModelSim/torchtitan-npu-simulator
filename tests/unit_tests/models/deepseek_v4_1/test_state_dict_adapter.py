@@ -20,9 +20,9 @@ from torch.distributed.checkpoint import HuggingFaceStorageReader, HuggingFaceSt
 from torchtitan_npu.models.deepseek_v4_1 import (
     model_registry,
 )
+from torchtitan_npu.models.deepseek_v4_1.engram.checkpoint import checkpoint_shard
 from torchtitan_npu.models.deepseek_v4_1.state_dict_adapter import DeepSeekV41StateDictAdapter
 from torchtitan_npu.models.deepseek_v4_1.vision.state_dict_adapter import DeepSeekV41VisionStateDictAdapter
-from torchtitan_npu.tools.checkpoint_conversion.convert_to_hf import load_dcp_model
 
 
 def _build_model_config():
@@ -162,11 +162,9 @@ class TestComposedAdapterPartition:
             assert torch.equal(local1[k], local2[k]), f"key {k} differs"
 
 
-@pytest.mark.skipif(
-    not hasattr(dcp, "CheckpointableTensor"), reason="PyTorch CheckpointableTensor support is required"
-)
-@pytest.mark.parametrize("layout,shards", [("ep", 2), ("efsdp_ep", 4)])
-def test_engram_hf_shard_load_and_export(tmp_path, layout, shards):
+@pytest.mark.skipif(not hasattr(dcp, "CheckpointableTensor"), reason="PyTorch CheckpointableTensor support is required")
+@pytest.mark.parametrize("shards", [2, 4], ids=["two-shards", "four-shards"])
+def test_engram_hf_shard_load_and_export(tmp_path, shards):
     """DCP reads global HF rows into an EP shard and omits native padding on save."""
     config = model_registry("deepseek_v4_1_debugmodel_text").model
     table = config.layers[1].engram.table
@@ -184,8 +182,8 @@ def test_engram_hf_shard_load_and_export(tmp_path, layout, shards):
     rows = 48 // shards
     offset = (shards - 1) * rows
     valid = 41 - offset
-    key = f"layers.1.engram.table.weight.{layout}_shard_{shards - 1:05d}_of_{shards:05d}"
-    native = {key: torch.full((rows, 32), -1.0)}
+    key = "layers.1.engram.table.weight"
+    native = {key: checkpoint_shard(torch.full((rows, 32), -1.0), offset=offset, logical_rows=48)}
     hf = adapter.to_hf(native)
     dcp.load(hf, storage_reader=adapter.get_hf_storage_reader(str(source)))
     loaded = adapter.from_hf(hf)
@@ -196,37 +194,16 @@ def test_engram_hf_shard_load_and_export(tmp_path, layout, shards):
     full_native = adapter.from_hf({"layers.1.engram.embed.weight": weight})
     native_path = tmp_path / "native"
     full_key = "layers.1.engram.table.weight"
-    dcp.save(
-        {
-            f"{full_key}.{layout}_shard_{rank:05d}_of_{shards:05d}": full_native[full_key][
-                rank * rows : (rank + 1) * rows
-            ].clone()
-            for rank in range(shards)
-        },
-        checkpoint_id=str(native_path),
-    )
+    dcp.save(full_native, checkpoint_id=str(native_path))
     full_native[full_key].fill_(-1)
     reader = dcp.FileSystemReader(str(native_path))
-    load_dcp_model(full_native, reader)
+    dcp.load(full_native, storage_reader=reader)
     exported = adapter.to_hf(full_native)
     output = tmp_path / "export"
     dcp.save(exported, storage_writer=HuggingFaceStorageWriter(str(output)))
     restored = {"layers.1.engram.embed.weight": torch.empty_like(weight)}
     dcp.load(restored, storage_reader=HuggingFaceStorageReader(str(output)))
     torch.testing.assert_close(restored["layers.1.engram.embed.weight"], weight, rtol=0, atol=0)
-
-    incomplete = tmp_path / "incomplete"
-    dcp.save({key: torch.zeros(rows, 32)}, checkpoint_id=str(incomplete))
-    with pytest.raises(ValueError, match="Incomplete or unsupported Engram checkpoint shards"):
-        load_dcp_model(full_native, dcp.FileSystemReader(str(incomplete)))
-
-    mixed = tmp_path / "mixed"
-    dcp.save(
-        {f"{full_key}.{kind}_shard_00000_of_00002": torch.zeros(24, 32) for kind in ("ep", "efsdp_ep")},
-        checkpoint_id=str(mixed),
-    )
-    with pytest.raises(ValueError, match="Mixed Engram checkpoint shard layouts"):
-        load_dcp_model(full_native, dcp.FileSystemReader(str(mixed)))
 
 
 def test_engram_quantized_hf_mapping():
@@ -353,9 +330,7 @@ class TestTextFlavorAdapter:
 
 
 @pytest.mark.skipif(not torch.distributed.is_gloo_available(), reason="Gloo is required")
-@pytest.mark.skipif(
-    not hasattr(dcp, "CheckpointableTensor"), reason="PyTorch CheckpointableTensor support is required"
-)
+@pytest.mark.skipif(not hasattr(dcp, "CheckpointableTensor"), reason="PyTorch CheckpointableTensor support is required")
 def test_engram_hf_distributed_roundtrip(tmp_path):
     worker = Path(__file__).with_name("engram_hf_worker.py")
     result = subprocess.run(

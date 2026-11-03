@@ -154,12 +154,7 @@ python scripts/numerical_alignment/loss_compare.py HEAD HEAD \
 
 #### Seed checkpoint
 
-默认通过同一份 seed checkpoint 初始化两侧模型，由 `--seed-mode` 指定创建方式：
-
-- `unsharded`（默认）：单进程 CPU 初始化完整权重，单独使用 `NGPU=1`。
-- `distributed`：按 baseline 的卡数、runner 和配置构建并行模型，需预留与 baseline 相同的卡数和显存；Engram 等依赖并行布局的 checkpoint 适用。该模式下 runner 必须读取并传递 `TRAIN_FILE`，不能写死训练入口，且不能与 `--baseline-env TRAIN_FILE=...` 同用。
-
-两种模式都不改变两次训练本身的卡数。跨并行布局加载是否支持取决于模型的 checkpoint 实现；当前不支持恢复完整训练状态的续训比较。
+默认使用 baseline 入口，以单进程 CPU 初始化完整权重并保存 seed checkpoint，两侧训练加载同一份权重。seed 阶段单独使用 `NGPU=1`，不改变两次训练本身的卡数。跨并行布局加载是否支持取决于模型的 checkpoint 实现；当前不支持恢复完整训练状态的续训比较。
 若两侧无法共用 seed checkpoint，可用 `--no-seed-checkpoint` 改为固定种子初始化。
 
 两侧默认使用 token 预算接口。迁移比较可分别选择序列长度参数：`--baseline-training-api legacy` 使用 `--training.seq-len`，`--test-training-api tokens` 使用 `--training.max-context-length`；长度仍由 `--seq-len` 统一指定。旧侧 local/global batch 与新侧 microbatch/train-step token 预算通过各自 options 显式传入，工具不推断数据并行度或梯度累积。`--baseline-upstream` / `--test-upstream` 可分别指定 TorchTitan 源码目录，并加入对应进程的 `PYTHONPATH`；解释器及依赖仍由各侧环境提供。

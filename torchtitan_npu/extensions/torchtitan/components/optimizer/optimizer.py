@@ -13,7 +13,6 @@ from typing import TYPE_CHECKING, Any, overload
 import torch
 import torch.distributed as dist
 from torch.profiler import record_function
-from torchtitan.components.checkpointer.utils import canonical_fqn
 from torchtitan.components.optimizer import OptimizersContainer, ParamGroupConfig
 
 from torchtitan_npu.config import OptimizerConfig
@@ -182,10 +181,6 @@ class HostSparseOptimizersContainer(OptimizersContainer):
             # selected explicitly by the recipe, not inferred from a model type.
             group.pop("fused", None)
             group.pop("foreach", None)
-            group["param_names"] = [
-                canonical_fqn(name) + getattr(param, "_engram_checkpoint_suffix", "")
-                for name, param in zip(group["param_names"], group["params"], strict=True)
-            ]
         return groups, patterns
 
     def _iter_host_tables(self) -> Iterator[Any]:
@@ -239,7 +234,21 @@ class HostSparseOptimizersContainer(OptimizersContainer):
         for optimizer in self.optimizers:
             if isinstance(optimizer, (torch.optim.Adam, torch.optim.AdamW, torch.optim.SparseAdam)):
                 _materialize_missing_adam_state(optimizer)
-        return super().state_dict()
+        result = super().state_dict()
+        for optimizer in self.optimizers:
+            for group in optimizer.param_groups:
+                for name, param in zip(group["param_names"], group["params"], strict=True):
+                    metadata = getattr(param, "_engram_checkpoint_metadata", None)
+                    if metadata is None:
+                        continue
+                    # Moments own the same global rows as their Host table.
+                    for state_name, value in optimizer.state[param].items():
+                        if isinstance(value, torch.Tensor) and value.shape == param.shape:
+                            key = f"state.{name}.{state_name}"
+                            view = result[key].detach()
+                            view.__dict__.update(metadata)
+                            result[key] = view
+        return result
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         for optimizer in self.optimizers:

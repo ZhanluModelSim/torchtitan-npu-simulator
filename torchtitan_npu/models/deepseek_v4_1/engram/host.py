@@ -12,6 +12,7 @@ from typing import cast
 
 import torch
 import torch.distributed as dist
+import torch.distributed.checkpoint as dcp
 from torch.distributed.device_mesh import DeviceMesh
 
 try:  # torch builds differ in the opaque-object custom-class API surface
@@ -25,6 +26,7 @@ except ImportError:  # torch build without the opaque-object custom-class API
     _HAS_OPAQUE_OBJECT_API = False
 from torchtitan.tools.logging import logger
 
+from .checkpoint import checkpoint_shard
 from .core import EngramTable
 from .lookup import HostEngramLookup, _lookup_grad_rows, _lookup_rows
 
@@ -86,20 +88,29 @@ class HostEngramTable(EngramTable):
 
     def _mark_host_weight(self) -> None:
         # Optimizer construction follows parallelize/to_empty, so preserve the
-        # Host marker and checkpoint shard suffix on replacement parameters.
+        # Host marker and global row geometry survive parameter replacement.
         self.weight._engram_host_offload = True  # type: ignore[attr-defined]
-        self.weight._engram_checkpoint_suffix = self._checkpoint_suffix()  # type: ignore[attr-defined]
+        shard_rank = self._table_mesh.get_local_rank() if self._table_mesh is not None else self._ep_rank
+        shape = tuple(self.weight.shape)
+        self.weight._engram_checkpoint_metadata = {  # type: ignore[attr-defined]
+            "global_shape": (self.num_embeddings, self.embedding_dim),
+            "global_offsets": ((shard_rank * shape[0], 0),),
+            "local_offsets": ((0, 0),),
+            "local_sizes": (shape,),
+        }
+
+    def _checkpoint_view(self, tensor):
+        if not hasattr(dcp, "CheckpointableTensor") and tuple(tensor.shape) == (
+            self.num_embeddings,
+            self.embedding_dim,
+        ):
+            return tensor
+        shard_rank = self._table_mesh.get_local_rank() if self._table_mesh is not None else self._ep_rank
+        return checkpoint_shard(tensor, offset=shard_rank * self.weight.shape[0], logical_rows=self.num_embeddings)
 
     @property
     def lookup_mesh(self):
         return self._table_mesh if self._table_mesh is not None else self.ep_mesh
-
-    def _checkpoint_suffix(self) -> str:
-        if self._table_mesh is not None:
-            return f".efsdp_ep_shard_{self._table_mesh.get_local_rank():05d}_of_{self._table_mesh.size():05d}"
-        if self._ep_size <= 1:
-            return ""
-        return f".ep_shard_{self._ep_rank:05d}_of_{self._ep_size:05d}"
 
     def parallelize(self, parallel_dims) -> None:
         ep_mesh = parallel_dims.get_optional_mesh("ep")
@@ -311,34 +322,8 @@ class HostEngramTable(EngramTable):
 
     def _save_to_state_dict(self, destination, prefix, keep_vars):
         super()._save_to_state_dict(destination, prefix, keep_vars)
-        suffix = self._checkpoint_suffix()
-        if suffix:
-            destination[prefix + "weight" + suffix] = destination.pop(prefix + "weight")
-
-    def _load_from_state_dict(
-        self,
-        state_dict,
-        prefix,
-        local_metadata,
-        strict,
-        missing_keys,
-        unexpected_keys,
-        error_msgs,
-    ):
-        suffix = self._checkpoint_suffix()
-        shard_key = prefix + "weight" + suffix
-        weight_key = prefix + "weight"
-        if suffix and shard_key in state_dict:
-            state_dict[weight_key] = state_dict.pop(shard_key)
-        super()._load_from_state_dict(
-            state_dict,
-            prefix,
-            local_metadata,
-            strict,
-            missing_keys,
-            unexpected_keys,
-            error_msgs,
-        )
+        key = prefix + "weight"
+        destination[key] = self._checkpoint_view(destination[key])
 
     def accumulate_sparse_gradient(
         self,
