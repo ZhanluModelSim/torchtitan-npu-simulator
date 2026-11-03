@@ -50,7 +50,6 @@ def test_event_wait_delays_later_compute_but_preserves_independent_stream(monkey
     assert ar in wait.predecessors
     assert wait.annotations["zero_duration"]
     assert not wait.annotations.get("cost_unknown")
-    assert (wait.flops, wait.peak_mem, wait.param_mem, wait.comm_bytes) == (0, 0, 0, 0)
     assert wait.inputs == wait.outputs == []
     assert wait.op_id not in {event.op_id for event in capture.memory_events()}
 

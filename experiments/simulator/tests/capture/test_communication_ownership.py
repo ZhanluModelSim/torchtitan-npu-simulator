@@ -68,7 +68,6 @@ def test_ownership_keeps_every_native_node_and_dependency_including_unused_prefe
     }
     # An unconsumed launch is real communication, not a missing transition to
     # reconstruct. Repeated ownership assignment must preserve its identity.
-    nodes[5].comm_bytes = 64
     for op_id, node in nodes.items():
         for predecessor in node.predecessors:
             nodes[predecessor].successors.append(op_id)
@@ -93,7 +92,6 @@ def test_ownership_keeps_every_native_node_and_dependency_including_unused_prefe
             assert graph.nodes[op_id] is original
             assert original.predecessors == predecessors
             assert original.successors == successors
-        assert graph.nodes[5].comm_bytes == 64
 
 
 def test_ownership_deduplicates_gradient_actions_without_treating_cp_as_gradient():

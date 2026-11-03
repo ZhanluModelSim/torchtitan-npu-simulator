@@ -25,7 +25,7 @@
 1. `config.prepare_config()` 校验 `SimulationConfig`、解析 preset 或 `module.factory`，构造原生配置树，选择 override、AC 和量化。
 2. `runner.simulate()` 进入 `runtime.meta_runtime()` 与 `compat.distributed.logical_world()`，构建 Meta 模型并执行原生 parallelize，创建 loss、optimizer、scheduler 和合成输入。
 3. `runner` 先执行无观测的实际 GA 次 F/B、clip 和 optimizer 结构预热，不推进 scheduler，清梯度后安装观测器；`step.run_simulation_step()` 捕获 forward/backward、clip、optimizer、scheduler 和 zero-grad 路径，将 dispatch 事件组装成 step、schedule 和 workload，并计算内存计划。
-4. `runner` 检查参数梯度与 buffer 契约，附加配置、rank、量化与假设注记，经 `validation.validate_workload()` 后导出并返回结果。
+4. `runner` 检查参数梯度与 buffer 契约，附加配置、rank、量化与假设注记，经 `validation.validate_workload()` 后按显式选项导出并返回结果。
 
 CLI 是参数白名单，不是任意原生训练参数的透传。新增参数须同步检查 `SimulationConfig`、`cli.py`、`prepare_config()`、实际 consumer、测试及接入文档；几何参数还需检查 `model_overrides.py`。不接受配置后静默忽略。
 
@@ -42,10 +42,9 @@ CLI 是参数白名单，不是任意原生训练参数的透传。新增参数�
 | `capture/` | dispatch、通信与流依赖、保存槽、storage 生命周期、FSDP 驻留和图组装 |
 | `ir/` | 算子、tensor 元数据、step、schedule plan/graph 和 workload 结构 |
 | `memory/` | storage 去重、生命周期回放、AC/offload 投影、状态预算和文件输出 |
-| `cost/` | 基础算子成本注记；未知项显式标记，不反向修改捕获事实 |
 | `validation.py` | workload 引用、依赖、DAG 与捕获一致性校验 |
 
-`tests/`、`scripts/` 和 `docs/` 位于 distribution 根目录。模型定义、配置工厂、parallelize/sharding 和 checkpoint adapter 归属主包 `torchtitan_npu/models/`；仅模拟所需的兼容留在本包。不得把实验分支泄漏到主包训练路径。`capture/`、`ir/`、`memory/`、`cost/` 的迁移须延续语义与测试，移动文件不等于完成新版验收。
+`tests/`、`scripts/` 和 `docs/` 位于 distribution 根目录。模型定义、配置工厂、parallelize/sharding 和 checkpoint adapter 归属主包 `torchtitan_npu/models/`；仅模拟所需的兼容留在本包。不得把实验分支泄漏到主包训练路径。`capture/`、`ir/`、`memory/` 的迁移须延续语义与测试，移动文件不等于完成新版验收。
 
 ## 当前运行边界
 
@@ -68,11 +67,11 @@ CLI 是参数白名单，不是任意原生训练参数的透传。新增参数�
 - 保存槽不等于激活或卸载候选。区分 F action 内交错反向和后续 B/recompute，核查同一 storage 的全部保存及使用。AC 先确认层／checkpoint 绑定再清零，覆盖无保存槽、无绑定的非层重算引用。
 - `unattributed` 的目标是没有未解释项。已知 head/norm/loss/梯度桥接不伪装成 decoder 层；默认逐层 offload 仅选归属明确的层或显式 checkpoint 保存值。层外和未确认归属的值继续参与设备生命周期及峰值，禁止删除记录或只过滤报表得到零未知项。
 - 使用实际本地 storage 去重和独立字节先验。optimizer state 来自实际状态清单；未卸载时稳态峰值已含状态，不能重复相加；优化器卸载时四项峰值排除状态，状态总量仍保留。逐层 payload 表示单向传输量，不取卸载后为零的驻留字节。
-- Meta 图、梯度元数据与逻辑 storage 预算不能证明真实 NPU 数值、HCCL 耗时或 allocator 峰值。未知 cost 不等于零耗时；allocator reserved/cache、碎片和未建模 workspace 不在预算内。
+- Meta 图、梯度元数据与逻辑 storage 预算不能证明真实 NPU 数值、HCCL 耗时或 allocator 峰值。训练仓不再估计算子 cost；allocator reserved/cache、碎片和未建模 workspace 不在预算内。
 
 ## 输出契约
 
-成功的 CLI 和 `simulate()` 默认写入 `<output_dir>/memory/memory_summary.json`，`output_formats=["mem"]`／`--simulation.output-formats mem` 额外导出内存明细。普通调用无需再次调用 `export_result()`；该函数供重新导出使用。每次验证使用独立输出目录，旧目录中的结果和明细不会自动清理。
+CLI 和 `simulate()` 默认仅返回内存对象，不创建目录或写文件。`output_formats=["mem"]`／`--simulation.output-formats mem` 显式导出 `<output_dir>/memory/memory_summary.json` 和内存明细。`export_result()` 同样按该选项控制，空列表为无操作。每次验证使用独立输出目录，旧目录中的结果和明细不会自动清理。
 
 summary 保持六项预算（四个遵循优化器驻留开关的稳态峰值、权重大小、优化器状态大小）及逐层 offload payload 列表。字段与口径见[稳态内存说明](docs/steady-state-memory.md)。修改时同步 `memory/records.py`、`memory/export.py`、实际消费者、验收脚本及接入文档；不恢复 JSON/HTML/DOT 图导出。
 
@@ -84,7 +83,7 @@ summary 保持六项预算（四个遵循优化器驻留开关的稳态峰值、
 以下命令均从 `experiments/simulator` 执行，使用已配置完整训练栈的 Python。安装命令见 [README](README.md)，测试工具来自 `pyproject.toml` 的 `dev` extra。
 
 ```bash
-# 小模型完整捕获；默认同时校验图、梯度元数据并写入内存汇总。
+# 小模型完整捕获；默认校验图和梯度元数据，内存预算随返回对象交付。
 TORCH_DEVICE_BACKEND_AUTOLOAD=0 python -m torchtitan_simulator \
   --config deepseek_v4_smoketest \
   --simulation.output-dir /tmp/simulator-smoke
@@ -113,7 +112,7 @@ docker exec -w /workspace/torchtitan-npu-simulator/experiments/simulator \
 
 ### 按变更选择检查
 
-- 运行时恢复和配置：优先定位 `tests/test_runtime.py`、`test_patch_scope.py`、`test_config.py`；捕获／IR／内存／cost 分别查对应测试子目录。
+- 运行时恢复和配置：优先定位 `tests/test_runtime.py`、`test_patch_scope.py`、`test_config.py`；捕获／IR／内存分别查对应测试子目录。
 - 模型端到端：查 `test_dsv4_capture.py`、`test_kimi_capture.py`、`test_kimi_parallel.py`、`test_kimi_quantization.py`、`test_s4_mxfp8.py`。
 - 内存归属：重点检查 `tests/memory/test_interleaved_loss_offload.py`、`test_layer_offload_summary.py`、`tests/test_memory_delivery.py`；控制依赖查 `tests/test_fsdp_stream_capture.py`。
 - 修改或 review 测试时遵循仓库 `developer-tests-review` 技能。新配置／并行组合必须从真实入口验证到图、梯度及内存消费者；模型、loss、AC、量化、并行和 offload 变更须检查真实配置／数学／保存／使用／释放链路，不能仅凭 build-only 或测试数量声明完成。
@@ -128,3 +127,8 @@ Kimi chunked loss 的 FSDP reshard 策略恢复由 Meta 会话内兼容层负责
 ## AdamW 输入身份（2026-11-03）
 
 仅对原生 `aten._fused_adamw_.default` 按 schema 绑定并交付 `input_tensor_list_sizes`（六列表）及 `optional_tensor_roles`（grad_scale/found_inf）；inputs 规范到 schema 顺序，空列表与可选参数缺席明确表达。保留重复输入、local tensor/storage、mutation 及依赖，禁止按 shape 或逻辑参数注记推断角色。其他上游字段等待具体 costmodel 请求后补充；本次不扩展 tensor_lr 或算子模型。详见 [AdamW 输入身份](docs/adamw-input-identity.md)。
+
+
+## 仅生成负载与可选导出（2026-11-03）
+
+本仓移除cost包、OpDispatchCapture.cost_model、节点FLOPs/peak_mem/param_mem/comm_bytes、阶段重复成本/峰值字段及cost_unknown统计。不要恢复性能预测或硬件资源分类。保留依赖、stream/event、FSDP通信视图、metadata_view对流的作用、op_type名称、重算/FQN、AdamW角色与静态MemoryPlan。通信事件/slot的volume_bytes用于源张量容量与内存/调度，不是下游通信模型流量；重复communication_input_bytes属性已删除。默认同进程交付无文件，显式mem仍可诊断导出。详见[负载生成边界](docs/load-generation-boundary.md)。

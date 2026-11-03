@@ -33,10 +33,6 @@ def test_op_node_construction_and_defaults():
         predecessors=[],
         successors=[],
     )
-    assert node.flops == 0
-    assert node.peak_mem == 0
-    assert node.param_mem == 0
-    assert node.comm_bytes == 0
     assert node.annotations == {}
 
 

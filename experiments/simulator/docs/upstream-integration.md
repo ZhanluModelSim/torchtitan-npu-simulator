@@ -109,7 +109,7 @@ assert isinstance(workload_graph, WorkloadGraph)
 # Pass workload_graph directly to the existing upstream consumer here.
 ```
 
-传入的是参数 token 列表，不包含 `python`、`-m` 或模块名，不应把整条 shell 命令当作一个字符串。始终显式传 `argv`；`main()` 无参数时会读取宿主的 `sys.argv`。CLI 与 `simulate()` 使用同一条自动导出路径，每次成功仿真只导出一次。
+传入的是参数 token 列表，不包含 `python`、`-m` 或模块名，不应把整条 shell 命令当作一个字符串。始终显式传 `argv`；`main()` 无参数时会读取宿主的 `sys.argv`。CLI 与 `simulate()` 使用同一条显式导出路径，默认不写文件，选择 mem 时每次成功仿真只导出一次。
 
 参数语法：
 
@@ -155,7 +155,7 @@ assert isinstance(workload_graph, WorkloadGraph)
 | `--simulation.enable-fsdp-allgather-fp8` | `enable_fsdp_allgather_fp8` | bool；false | parser 保留，设置 true 会明确拒绝；不是已支持的优化 |
 | `--simulation.enable-ep-dispatch-fp8` | `enable_ep_dispatch_fp8` | bool；false | parser 保留，设置 true 会明确拒绝 |
 | `--simulation.output-dir` | `output_dir` | str；`./simulator_output` | CLI 和 `simulate()` 均使用此目录；相对路径按宿主 cwd 解析，建议每次调用使用独立绝对路径 |
-| `--simulation.output-formats` | `output_formats` | list[str]；[] | 默认 [] 只写 summary JSON；`mem` 增加内存明细；CLI 可传零个值；详见第 10 节 |
+| `--simulation.output-formats` | `output_formats` | list[str]；[] | 默认 [] 仅内存交付；`mem` 导出 summary JSON 和内存明细；CLI 可传零个值；详见第 10 节 |
 | `--build-only` | 无；CLI 专用 | bool；false | 仅诊断模型构建，返回 dict；不执行完整 F/B/O |
 | `-h`／`--help` | 无；CLI 专用 | 无值 | 帮助后退出，不执行仿真 |
 
@@ -345,7 +345,6 @@ optimizer_bytes = summary["optimizer_state_bytes"]
 | `annotations["model_configuration"]` | preset、原生工厂、几何复写与实际模型规模 |
 | `annotations["gradient_validation"]` | 实际 trainable 参数梯度清单和 shape/dtype/placement |
 | `annotations["capture_validation"]` | 本次图／梯度／通信／内存完整性检查结果；构建失败不会返回一张「占位成功图」 |
-| `annotations["cost_unknown_counts"]` | 未知成本算子统计；图存在不代表已知硬件时延 |
 | `annotations["fsdp_communication_view"]` | 隐藏的 FSDP 原始 ID、数量、算子名计数及忽略打包／搬移耗时的假设 |
 
 EP TokenDispatcher 现在由 simulator 公共运行时默认使用 native functional `all_to_all_single`，DSV4 和 Kimi 共用，无新增参数。相应节点 raw name 为 `_c10d_functional.all_to_all_single.default`；通信量、group/ranks 和梯度仍按实际原生调用记录。`annotations["runtime_capabilities"]["ep_token_exchange"]` 标记默认策略，`ep_token_dispatcher_classes` 记录本次适配的类型数量。CP／FSDP 路径不由此改写，正常真机训练入口不受影响。范围、均衡假设和验证边界见 [EP single 交换](ep-single-transport.md)。
@@ -366,9 +365,9 @@ WorkloadGraph 现在包含零耗时 `stream_wait` 节点。上游应以耗时 0 
 
 ## 10. 导出行为与可选格式
 
-`simulate()` 和 `cli.main(argv)` 成功完成仿真后，都自动导出 `<output_dir>/memory/memory_summary.json`，同时返回 WorkloadGraph。默认 `output_formats=[]` 只写此汇总；显式 `--simulation.output-formats mem` 才增加下列内存明细。
+`simulate()` 和 `cli.main(argv)` 默认 `output_formats=[]`，只返回 WorkloadGraph 和其中的内存预算，不创建目录、不写文件。显式 `--simulation.output-formats mem`（Python 为 `output_formats=["mem"]`）才导出 `<output_dir>/memory/memory_summary.json` 及下列内存明细。
 
-正常接入不再需要额外调用 `export_result()`；该函数仍可用于将已有图重新导出到另一个目录。`--build-only` 不执行完整仿真，不导出 summary；捕获或校验失败也不会生成新的内存结果。导出 I/O 错误向调用者传播。
+正常同进程接入直接消费内存对象；`export_result()` 可按显式 mem 选项将已有图重新导出到另一个目录，空 output_formats 不写文件。`--build-only` 不执行完整仿真，不导出 summary；捕获或校验失败也不会生成新的内存结果。导出 I/O 错误向调用者传播。
 
 mem 保留内存汇总、事件、timeline、tensor/storage 生命周期、autograd 保存值、FSDP 驻留与内存 trace。
 这些文件本身使用 JSON/CSV；删除的是完整图的 JSON/text/HTML/DOT、kernel/schedule CSV、export_manifest 及 IR 上的导出方法。

@@ -21,7 +21,6 @@ class NativeTransport:
 
     def attributes(self):
         return {
-            "communication_input_bytes": sum(t.numel() * t.element_size() for t in self.inputs),
             "communication_input_shapes": [tuple(t.shape) for t in self.inputs],
         }
 

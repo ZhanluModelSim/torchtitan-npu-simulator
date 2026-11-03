@@ -117,7 +117,7 @@ def insert_optimizer_transfers(workload: WorkloadGraph) -> WorkloadGraph:
             nodes={node_id: nodes[node_id] for node_id in (*step.nodes, *(modeled_ids if key == template_id else []))},
             entry_nodes=[],
             exit_nodes=[],
-            annotations={**step.annotations, "memory_summary": summary},
+            annotations=dict(step.annotations),
         )
         for key, step in workload.step_templates.items()
     }

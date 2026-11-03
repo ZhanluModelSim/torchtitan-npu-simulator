@@ -146,9 +146,6 @@ def project_fsdp_communication_view(workload: WorkloadGraph) -> WorkloadGraph:
         "hidden_raw_op_counts": dict(Counter(source[key].annotations["raw_op_type"] for key in hidden)),
         "timing_assumption": "FSDP packing, copying and casting have no modeled runtime in this view",
     }
-    annotations["cost_unknown_counts"] = dict(
-        Counter(node.annotations["raw_op_type"] for node in nodes.values() if node.annotations.get("cost_unknown"))
-    )
     plan = workload.schedule_plan
     if plan is None:
         raise ValueError("An FSDP communication view requires a captured SchedulePlan")

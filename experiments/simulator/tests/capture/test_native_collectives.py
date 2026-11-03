@@ -149,7 +149,7 @@ def test_native_list_all_to_all_counts_every_chunk_and_keeps_output_storages(tmp
         (event,) = recorder.events
         node = capture.build_nodes()[event.op_id]
         assert node.annotations["raw_op_type"] == "c10d.alltoall_.default"
-        assert event.volume_bytes == node.comm_bytes == 128
+        assert event.volume_bytes == 128
         assert event.input_shapes == ((1, 8), (3, 8))
         assert event.output_shapes == ((3, 8), (1, 8))
         assert node.attrs["communication_input_shapes"] == [(1, 8), (3, 8)]

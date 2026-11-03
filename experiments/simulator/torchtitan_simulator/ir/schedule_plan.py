@@ -191,8 +191,8 @@ class SchedulePlan:
         ``comm_op_id``) across all L1 step_templates. Returns the OpNode or
         None. This is the entry point for simulation replay: given an
         UNSHARD/SEND/RECV action, ``action.comm_op_id`` +
-        ``find_op_node(comm_op_id)`` yields the actual op (shape, comm_bytes,
-        flops, module_path, …) to replay."""
+        ``find_op_node(comm_op_id)`` yields the actual op (shape, dtype,
+        module_path, …) to replay."""
         if not op_id:
             return None
         for sg in self.step_templates.values():

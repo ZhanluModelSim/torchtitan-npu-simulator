@@ -59,6 +59,5 @@ class WorkloadGraph:
     # legacy caller); the flat ScheduleGraph remains on `iteration.schedule`.
     schedule_plan: SchedulePlan | None = None
     total_runtime_est: float = 0.0
-    total_cost_est: float = 0.0
     # Full source graph for projected consumer views; memory plans are shared.
     captured_workload: WorkloadGraph | None = field(default=None, repr=False)

@@ -158,7 +158,8 @@ def test_default_single_ep_capture_preserves_gradients_and_causal_dependencies(f
     for event in ep:
         assert nodes[event["op_id"]].annotations["raw_op_type"] == "_c10d_functional.all_to_all_single.default"
         assert event["comm_ranks"] == [[2, 3]]
-        assert event["volume_bytes"] == nodes[event["op_id"]].attrs["communication_input_bytes"]
+        assert event["volume_bytes"] > 0
+        assert "communication_input_bytes" not in nodes[event["op_id"]].attrs
     counts = [
         e for e in ep if e["dtype"] == "int64" and nodes[e["op_id"]].annotations["execution_kind"] == "original_forward"
     ]

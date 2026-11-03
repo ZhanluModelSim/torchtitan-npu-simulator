@@ -9,7 +9,7 @@ S5 的历史验收见 [交付说明](docs/s5-delivery.md)，
 各能力的范围与状态见 [能力矩阵](docs/capability-matrix.md)。
 当前实现已按原生 dispatch 优先收敛，具体改动和本轮复验见 [收敛记录](docs/dispatch-first-remediation.md)。
 
-CLI 和 `simulate()` 成功仿真后默认导出 `memory/memory_summary.json`，`mem` 选项额外导出内存明细；精度边界见 [mem 与精度审计](docs/mem-only-precision.md)。
+CLI 和 `simulate()` 默认仅返回内存中的负载及静态显存对象，不创建输出目录；显式 `mem` 选项才导出显存汇总和明细。负载生成与性能预测职责见 [负载生成边界](docs/load-generation-boundary.md)。
 返回的 WorkloadGraph 默认隐藏 FSDP 非通信准备／搬移节点，保留通信、模型计算及流控制依赖；完整原图在 `captured_workload`，显存仍使用完整原始事件，见 [FSDP 通信视图](docs/capture-runtime.md#fsdp-通信视图)。
 原始捕获保留模型 view/alias，不做模板折叠、重编号或推断补边，见 [精简记录](docs/simulator-cleanup.md)。
 
@@ -50,7 +50,7 @@ TORCH_DEVICE_BACKEND_AUTOLOAD=0 python -m torchtitan_simulator \
 - mem 汇总保留四个遵循优化器驻留开关的稳态峰值、单卡权重和优化器状态大小，另加逐层 offload payload 列表；每层一个单向字节数，未开 offload 时为 0；见 [稳态内存说明](docs/steady-state-memory.md)。
 - 内存输出是逻辑活跃 Tensor/storage 字节，不含 allocator reserved/cache、碎片及未建模 kernel workspace。
 - storage 释放使用弱引用候选队列，在每个 dispatch 边界由原生引用确认；完整 Flash 抓图约 20.7 秒，验证范围见 [生命周期优化](docs/storage-lifetime-optimization.md)。
-- 未知 cost 单独标记，不能将图存在解释为硬件耗时已知。
+- 本仓不计算性能成本；图存在不代表硬件耗时已知，预测及覆盖状态由下游负责。
 - tensor 驻留同时依据实际 storage ownership、autograd 保存槽销毁、native SAC 缓存消费和 FSDP alloc/free；
   CPU 控制元数据不计入逻辑设备字节，注册 buffer 从捕获开始计为常驻。详见 [S3 审计](docs/s3-lifetime-audit.md)。
 - `--training.global-batch-size` 保留实际 GA 配置，但仍只捕获一个 microbatch；参数存储 dtype/offload 选项是明确的内存投影假设。

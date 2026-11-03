@@ -180,7 +180,6 @@ def validate_workload(workload: WorkloadGraph) -> dict:
         _require(
             not node.annotations["raw_op_type"].startswith("comm."), "synthetic transport replaced native dispatch"
         )
-        _require(node.attrs["communication_input_bytes"] == event["volume_bytes"], "communication payload bytes differ")
         if event["comm_dim"] == "tp":
             _require(not event["gradient_reduction"], "TP reduction classified as DP reduction")
     if any(

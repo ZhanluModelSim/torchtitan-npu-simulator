@@ -273,8 +273,6 @@ def insert_activation_transfers(workload: WorkloadGraph) -> WorkloadGraph:
     updated = dict(annotations)
     updated["memory_plan"] = apply_activation_transfer_budget(annotations["memory_plan"], plans)
     updated["memory_summary"] = updated["memory_plan"].to_summary_dict()
-    for step in steps.values():
-        step.annotations["memory_summary"] = updated["memory_summary"]
     updated["activation_transfer_plan"] = {
         "policy": "neighbor_v1_phase_barrier",
         "modeled_op_ids": modeled_ids,

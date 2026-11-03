@@ -36,7 +36,6 @@ def test_workload_graph_construction_and_defaults():
     assert graph.data_outputs == []
     assert graph.cross_iter_passes == []
     assert graph.total_runtime_est == 0.0
-    assert graph.total_cost_est == 0.0
 
 
 def test_workload_graph_data_inputs_independent_between_instances():

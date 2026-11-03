@@ -7,7 +7,7 @@
 (the canonical op set from spec/L0-OpNode.md, plus NPU-specific extensions
 used by DeepSeek-V4: rms_norm, rope, swiglu, MoE dispatch, sparse-attention
 family). Any raw op name absent from OP_MAPPING resolves to "unknown" --
-OpCostModel (Task 6) already handles "unknown" op_type gracefully."""
+This label is descriptive metadata, not a hardware resource or performance classification."""
 
 from __future__ import annotations
 

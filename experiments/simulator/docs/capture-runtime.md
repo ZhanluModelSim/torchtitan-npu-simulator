@@ -11,9 +11,8 @@
 | `capture/` | 原生 dispatch、通信、控制事件、保存值与所有权观察 | 真实输入、tensor/storage 身份、alias/mutation、源事件唯一性 |
 | `ir/`、schedule/workload builder | 负载结构、模板实例、数据与控制依赖 | 引用闭合、双向边、DAG、通信与 action 对应关系 |
 | `memory/` | 逻辑 storage 驻留、FSDP、AC、offload 和状态预算 | 独立字节、实际释放、去重、分阶段和稳态口径 |
-| `cost/` | 当前已有的基础成本注记 | unknown 明确保留；不能反向修改捕获事实 |
 
-端到端 DES、批处理、完整指标平台和独立 cost model 属于后续解耦方向。当前 `build_nodes()` 仍调用内置 `OpCostModel`，IR 仍含 Python dataclass／annotations 对象；不能据此声称跨仓协议已经独立完成。
+`build_nodes()` 只组装捕获事实，不再执行成本模型；端到端 DES、预测及指标归下游平台。IR 仍为 Python dataclass／annotations 对象，契约边界见 [负载生成边界](load-generation-boundary.md)。
 禁止为后续架构提前把释放时间固定到算子结束，也不在本仓重新引入图折叠与推断补边。
 
 ## 固定环境并保护源码
@@ -116,7 +115,7 @@ FSDP 包装可能延迟安装或刷新函数引用。observer 必须覆盖最终
 
 投影不分配新 ID，不合并模型算子。被隐藏路径的可见前驱直接传递给原可见后继，并重建 successors、模板入口／出口及 stream/event 前沿。SchedulePlan、ScheduleGraph 和 workload 引用同一组可见模板。通信描述、slot、DataPass 和跨 iteration DataPass 的单值算子锚点同步重定向；隐藏边界有多个可见前沿时，通信描述使用对应通信节点，缺少通信锚点的 DataPass 使用 0。完整的多分支依赖由 L0 边保留，原单值锚点仍可从 captured_workload 审计，不能用单值展示锚点代替图的全部依赖。
 
-`annotations["fsdp_communication_view"]` 记录隐藏 ID、数量、原始算子计数及耗时假设；`native_dispatch_op_ids` 和 `cost_unknown_counts` 对应可见图。源图保留原统计，校验同时覆盖完整捕获与投影后的引用闭合、通信和梯度依赖。该视图明确忽略 FSDP 打包、拷贝、精度转换的运行时间；不能将通信视图的耗时估计描述为包含这部分真实开销。流等待约束继续生效，不因隐藏搬移而提前消费尚未完成 AG/RS/AR 的值。
+`annotations["fsdp_communication_view"]` 记录隐藏 ID、数量、原始算子计数及耗时假设；`native_dispatch_op_ids` 对应可见图。源图保留原统计，校验同时覆盖完整捕获与投影后的引用闭合、通信和梯度依赖。该视图明确忽略 FSDP 打包、拷贝、精度转换的运行时间；不能将通信视图的耗时估计描述为包含这部分真实开销。流等待约束继续生效，不因隐藏搬移而提前消费尚未完成 AG/RS/AR 的值。
 
 实现见 `capture/fsdp_communication_view.py`；独立路径与双模型验收见 `tests/capture/test_fsdp_communication_view.py`，AG/AR 延后传播继续由 `tests/test_fsdp_stream_capture.py` 检查。
 
@@ -131,8 +130,8 @@ FSDP 包装可能延迟安装或刷新函数引用。observer 必须覆盖最终
 四个阶段／总峰值包括状态，权重与状态独立大小是说明项，不能再加到峰值上。当前是逻辑活跃 storage，不是 allocator reserved/cache 或真实 workspace。
 offload 的保存集合、层外驻留、`unattributed` 和逐层单向 payload 必须遵守 [模型内存规则](model-integration.md#保存值不等于卸载候选)。
 
-`OpNode.peak_mem` 等成本注记不能替代生命周期峰值；unknown cost 不等于零时间。设备、算子成本或未来调度策略的假设应与捕获事实分开。
-CLI 和 `simulate()` 成功完成仿真后自动导出 `<output_dir>/memory/memory_summary.json`；`output_formats=["mem"]` 额外写入内存明细。正常调用无需再次执行 `export_result()`；它只用于显式重新导出。build-only 不导出内存结果，捕获或校验失败也不生成新结果。复用目录不会清理旧明细，建议每次使用独立目录。不恢复 JSON/HTML/DOT 等图导出或折叠。
+图上已移除 FLOPs、成本及重复峰值注记；正式内存预算从 MemoryPlan 读取。设备性能建模与捕获事实分开。
+CLI 和 `simulate()` 默认不写文件；`output_formats=["mem"]` 显式写入显存汇总与内存明细。`export_result()` 同样按 output_formats 控制，空列表为无操作。build-only 不导出内存结果，捕获或校验失败也不生成新结果。复用目录不会清理旧明细，建议每次使用独立目录。不恢复 JSON/HTML/DOT 等图导出或折叠。
 对外 summary 只有六项预算加一个逐层 payload 列表，细节见 [输出契约](steady-state-memory.md)。更改字段或含义时同步 Python、文件、CLI、acceptance 与接入文档。
 
 ## 验收与排查入口

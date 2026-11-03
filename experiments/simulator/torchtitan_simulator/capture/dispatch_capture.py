@@ -26,7 +26,6 @@ from torch.utils._python_dispatch import TorchDispatchMode
 from torchtitan_simulator.capture.checkpoint_execution import current_execution_kind
 from torchtitan_simulator.capture.op_mapping import is_metadata_view_op, to_canonical_op_type
 from torchtitan_simulator.capture.tensor_utils import dtype_to_str, tensor_volume_bytes, to_tensor_meta
-from torchtitan_simulator.cost.op_cost_model import OpCostModel
 from torchtitan_simulator.ir.op_node import OpNode
 from torchtitan_simulator.memory.records import (
     AutogradSavedTensorEvent,
@@ -219,13 +218,11 @@ class OpDispatchCapture(TorchDispatchMode):
 
     def __init__(
         self,
-        cost_model: OpCostModel | None = None,
         module_path_tracker: ModulePathTracker | None = None,
         phase_provider: Callable[[], str] | None = None,
         record_memory: bool = True,
     ) -> None:
         super().__init__()
-        self.cost_model = cost_model or OpCostModel()
         self.module_path_tracker = module_path_tracker
         self.phase_provider = phase_provider
         self.record_memory = record_memory
@@ -967,10 +964,9 @@ class OpDispatchCapture(TorchDispatchMode):
         self._saved_tensor_unpack_aliases.clear()
 
     def build_nodes(self) -> dict[int, OpNode]:
-        """Assemble captured events into OpNode objects with cost annotations."""
+        """Assemble captured events into load-only OpNode objects."""
         nodes: dict[int, OpNode] = {}
         for event in self._events:
-            cost = self.cost_model.compute(event.op_type, event.inputs, event.outputs, event.attrs or {})
             annotations: dict[str, Any] = {
                 "raw_op_type": event.raw_op_type,
                 "phase": event.phase,
@@ -987,8 +983,6 @@ class OpDispatchCapture(TorchDispatchMode):
                 annotations["tensor_shape_scope"] = event.tensor_shape_scope
             if is_metadata_view_op(event.raw_op_type):
                 annotations["metadata_view"] = True
-            if cost.unknown:
-                annotations["cost_unknown"] = True
             if event.comm_dim:
                 annotations["comm_dim"] = event.comm_dim
             if event.group_name:
@@ -1011,10 +1005,6 @@ class OpDispatchCapture(TorchDispatchMode):
                 attrs=dict(event.attrs or {}),
                 predecessors=list(event.predecessors),
                 successors=[],
-                flops=cost.flops,
-                peak_mem=cost.peak_mem,
-                param_mem=cost.param_mem,
-                comm_bytes=cost.comm_bytes,
                 annotations=annotations,
                 seq_idx=event.seq_idx,
             )

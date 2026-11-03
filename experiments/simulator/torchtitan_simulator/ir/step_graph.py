@@ -62,10 +62,6 @@ class StepGraph:
     entry_nodes: list[int] = field(default_factory=list)
     exit_nodes: list[int] = field(default_factory=list)
     tensor_lifetimes: dict[str, int] = field(default_factory=dict)
-    total_flops: int = 0
-    peak_active_mem: int = 0
-    param_mem: int = 0
-    comm_volume: int = 0
     device_placement: dict[str, int] = field(default_factory=dict)
     is_acyclic: bool = True
     annotations: dict[str, Any] = field(default_factory=dict)

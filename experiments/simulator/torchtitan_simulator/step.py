@@ -369,10 +369,6 @@ def run_simulation_step(
             )
         wg.iteration.schedule.annotations["memory_plan"] = memory_plan
         wg.iteration.schedule.annotations["memory_summary"] = memory_plan.to_summary_dict()
-        for step_graph in wg.step_templates.values():
-            step_graph.param_mem = memory_plan.persistent_param_bytes
-            step_graph.peak_active_mem = memory_plan.model_active_bytes_peak
-            step_graph.annotations["memory_summary"] = memory_plan.to_summary_dict()
         timings["estimate_memory"] = time.perf_counter() - t9
 
     timings["total"] = time.perf_counter() - t0

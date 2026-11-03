@@ -104,7 +104,7 @@ def run_case(args):
     nodes = [node for template in workload.step_templates.values() for node in template.nodes.values()]
     views = [node for node in nodes if node.annotations.get("metadata_view")]
     require(bool(views), "raw metadata views were lost")
-    require(all(node.flops == 0 for node in views), "metadata view has compute cost")
+    require(all(not hasattr(node, "flops") for node in views), "load graph must not contain modeled FLOPs")
     report.update(
         status="passed",
         steady_state_memory=memory.to_summary_dict(),
@@ -115,7 +115,6 @@ def run_case(args):
         quantized_parameters=len(quantization["quantized_parameters"]),
         execution_kinds=dict(kinds),
         raw_kernel_counts=dict(Counter(event.raw_op_type for event in memory.raw_events)),
-        unknown_cost_counts=annotations["cost_unknown_counts"],
         parameter_layouts=annotations["parameter_layouts"],
         elapsed_seconds=time.monotonic() - started,
         host_peak_rss_kib=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,

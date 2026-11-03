@@ -64,7 +64,7 @@ def main(argv=None):
         nargs="*",
         choices=["mem"],
         default=[],
-        help="Memory summary JSON is always written; mem adds detailed memory artifacts",
+        help="No files are written by default; mem exports the memory summary and diagnostic artifacts",
     )
     for name, default in (
         ("data-parallel-replicate-degree", 1),

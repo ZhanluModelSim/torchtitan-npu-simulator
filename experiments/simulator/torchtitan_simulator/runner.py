@@ -6,7 +6,6 @@
 """Native DeepSeek V4 model/loss/optimizer capture with explicit correctness gates."""
 
 import logging
-from collections import Counter
 from contextlib import nullcontext
 
 import torch
@@ -316,14 +315,6 @@ def simulate(simulation):
                 "F owns native model/loss forward including interleaved chunked-head backward; "
                 "B owns decoder backward. Per-op phase and execution_kind retain actual autograd execution."
             )
-            annotations["cost_unknown_counts"] = dict(
-                Counter(
-                    node.annotations["raw_op_type"]
-                    for step in workload.step_templates.values()
-                    for node in step.nodes.values()
-                    if node.annotations.get("cost_unknown")
-                )
-            )
     from torchtitan_simulator.validation import validate_workload
 
     workload.iteration.schedule.annotations["capture_validation"] = validate_workload(workload)
@@ -347,17 +338,20 @@ def simulate(simulation):
         "offload_optimizer_states": memory.offload_optimizer_states,
     }
     workload.iteration.schedule.annotations["capture_validation"] = validate_workload(workload)
-    export_result(workload, simulation)
+    if simulation.output_formats:
+        export_result(workload, simulation)
     return workload
 
 
 def export_result(workload, simulation):
-    """Always write the memory summary; mem additionally writes diagnostic details."""
+    """Write memory artifacts only when explicitly requested by output_formats."""
     from torchtitan_simulator.memory.export import export_memory_details, export_memory_summary, print_memory_budget
 
     unknown = set(simulation.output_formats) - {"mem"}
     if unknown:
         raise ValueError(f"Unsupported output formats: {sorted(unknown)}; only mem is supported")
+    if not simulation.output_formats:
+        return
     memory = workload.iteration.schedule.annotations.get("memory_plan")
     if memory is None:
         raise ValueError("Cannot export mem without a captured memory plan")

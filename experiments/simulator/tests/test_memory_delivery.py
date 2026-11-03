@@ -65,7 +65,7 @@ def test_native_cli_exports_only_memory_and_preserves_raw_graph(exported_capture
     source_ids = {node.op_id for node in views}
     assert source_ids <= set(annotations["native_dispatch_op_ids"])
     assert any(node.predecessors and node.successors for node in views)
-    assert all(node.flops == 0 for node in views)
+    assert all(not hasattr(node, "flops") for node in views)
 
 
 def test_native_mem_summary_includes_optimizer_state_and_steady_phase_peaks(exported_capture):
@@ -159,18 +159,14 @@ def test_removed_export_options_fail_before_native_model_build(arguments):
     assert error.value.code == 2
 
 
-def test_explicit_reexport_without_mem_writes_only_summary_and_rejects_unknown_formats(exported_capture, tmp_path):
+def test_explicit_reexport_without_mem_is_noop_and_rejects_unknown_formats(exported_capture, tmp_path):
     from torchtitan_simulator.config import SimulationConfig
     from torchtitan_simulator.runner import export_result
 
     destination = tmp_path / "absent"
     workload, _ = exported_capture
     export_result(workload, SimulationConfig(output_dir=str(destination)))
-    assert {path.name for path in (destination / "memory").iterdir()} == {"memory_summary.json"}
-    assert (
-        json.loads((destination / "memory/memory_summary.json").read_text())
-        == (workload.iteration.schedule.annotations["memory_summary"])
-    )
+    assert not destination.exists()
     invalid_destination = tmp_path / "invalid"
     with pytest.raises(ValueError, match="Unsupported output formats"):
         export_result(workload, SimulationConfig(output_dir=str(invalid_destination), output_formats=["csv"]))
@@ -178,10 +174,8 @@ def test_explicit_reexport_without_mem_writes_only_summary_and_rejects_unknown_f
 
 
 @pytest.mark.parametrize("entry", ["python", "cli"])
-@pytest.mark.parametrize("details", [False, True], ids=["summary-only", "mem-details"])
-def test_successful_entry_automatically_exports_summary_once_and_optional_details(
-    entry, details, tmp_path, monkeypatch
-):
+@pytest.mark.parametrize("details", [False, True], ids=["memory-only", "mem-details"])
+def test_successful_entry_returns_memory_and_exports_only_when_requested(entry, details, tmp_path, monkeypatch):
     from torchtitan_simulator.config import SimulationConfig
     from torchtitan_simulator.memory import export as memory_export
     from torchtitan_simulator.runner import simulate
@@ -204,18 +198,18 @@ def test_successful_entry_automatically_exports_summary_once_and_optional_detail
         if details:
             arguments.extend(["--simulation.output-formats", "mem"])
         workload = main(arguments)
-    assert written == [str(destination)]
-    directory = destination / "memory"
-    assert (
-        json.loads((directory / "memory_summary.json").read_text())
-        == (workload.iteration.schedule.annotations["memory_summary"])
-    )
+    memory = workload.iteration.schedule.annotations["memory_plan"]
+    assert memory.to_summary_dict() == workload.iteration.schedule.annotations["memory_summary"]
     if details:
+        assert written == [str(destination)]
+        directory = destination / "memory"
+        assert json.loads((directory / "memory_summary.json").read_text()) == memory.to_summary_dict()
         assert (directory / "memory_timeline.csv").exists()
         assert (directory / "memory_trace.json").exists()
         assert (directory / "tensor_lifetimes.csv").exists()
     else:
-        assert {path.name for path in directory.iterdir()} == {"memory_summary.json"}
+        assert written == []
+        assert not destination.exists()
 
 
 def test_build_only_and_invalid_simulation_do_not_export_a_memory_result(tmp_path):
@@ -354,7 +348,14 @@ def test_cli_offload_switches_are_independent_and_preserve_optimizer_inventory(
     from torchtitan_simulator.capture.activation_transfers import insert_activation_transfers
     from torchtitan_simulator.capture.fsdp_communication_view import project_fsdp_communication_view
 
-    args = ["--activation-checkpoint.mode", "selective", "--simulation.output-dir", str(tmp_path)]
+    args = [
+        "--activation-checkpoint.mode",
+        "selective",
+        "--simulation.output-dir",
+        str(tmp_path),
+        "--simulation.output-formats",
+        "mem",
+    ]
     if activation_offload:
         args.append("--simulation.memory-offload-ac-saved-tensors")
     if optimizer_offload:

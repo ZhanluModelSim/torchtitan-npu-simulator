@@ -9,7 +9,7 @@ python -m torchtitan_simulator \
   --simulation.output-dir /tmp/simulator-steady-memory
 ```
 
-CLI 和 `simulate()` 成功仿真后均自动写入 `<output_dir>/memory/memory_summary.json`。默认只导出汇总；需要内存事件、timeline、生命周期等明细时添加 `--simulation.output-formats mem`（Python 为 `output_formats=["mem"]`）。
+CLI 和 `simulate()` 默认仅通过内存对象交付预算，不写文件；显式添加 `--simulation.output-formats mem`（Python 为 `output_formats=["mem"]`）才写入 `<output_dir>/memory/memory_summary.json` 及事件、timeline、生命周期等明细。
 
 ## 六个字段
 

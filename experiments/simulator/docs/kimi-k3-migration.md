@@ -1,7 +1,7 @@
 # Kimi K3 接入与验证
 
 Kimi K3 文本 decoder 已迁移到 TorchTitan v0.3.0 的配置、Module、MoE 和并行接口。
-入口仍为 `simulate(SimulationConfig(...))`，返回完整 `WorkloadGraph`，成功后默认导出内存汇总，`mem` 选项增加明细。
+入口仍为 `simulate(SimulationConfig(...))`，返回完整 `WorkloadGraph`，默认不写文件，显式 `mem` 选项导出内存汇总及明细。
 本页的验证范围是 Meta 图、CPU 数学契约和逻辑活跃内存；不包含真实 NPU 训练数值与 kernel workspace。
 
 ## 配置与调用
@@ -17,7 +17,7 @@ TORCH_DEVICE_BACKEND_AUTOLOAD=0 python -m torchtitan_simulator \
   --simulation.output-dir /tmp/kimi-k3-smoke
 ```
 
-成功仿真默认导出 `memory/memory_summary.json`；添加 `--simulation.output-formats mem` 可额外导出内存明细。
+成功仿真默认仅返回内存对象；添加 `--simulation.output-formats mem` 才导出 `memory/memory_summary.json` 和内存明细。
 
 | Preset | 几何与用途 |
 | --- | --- |
@@ -69,7 +69,7 @@ KDA、MLA attention core、SiTU 使用显式作用域内的 dispatcher custom op
 | SiTU | `kimi_sim.situ_glu.default` / `kimi_sim.situ_glu_backward.default` | `situ_glu` |
 
 依赖 raw 名称的上游匹配需更新；前反向通过原始名称和 phase 区分。
-KDA 成本保持 unknown，其他已有成本公式也不能解释为实测设备耗时。
+本仓不再提供 KDA 或其他算子的成本估计；性能建模由下游负责，见 [负载生成边界](load-generation-boundary.md)。
 模型层不导入 Triton 或 NPU 扩展；非模拟调用需显式向 `KimiDeltaAttention.Config.kernel` 注入兼容 provider，默认缺少 provider 时明确报错。
 本次没有交付或验证真实 KDA 硬件 provider。
 

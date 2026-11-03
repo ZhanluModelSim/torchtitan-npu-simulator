@@ -30,7 +30,9 @@ def test_native_hsdp_partial_backward_wait_delays_later_matmul(monkeypatch, conf
                 group = frame.f_locals["self"]
                 if getattr(group, "_post_reduce_event", None) is event:
                     capture = get_active_capture()
-                    observed.append((event._frontier, capture.stream_id(stream)))
+                    # Structural warmup executes the same native wait without an observer.
+                    if capture is not None:
+                        observed.append((event._frontier, capture.stream_id(stream)))
         finally:
             del frame
         return original(stream, event)

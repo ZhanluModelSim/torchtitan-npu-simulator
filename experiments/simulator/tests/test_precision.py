@@ -79,7 +79,8 @@ def test_native_precision_cli_reaches_fsdp_backward_and_optimizer(param_dtype, m
     reductions = [event for event in events if "reduce_scatter" in event.raw_op_type]
     assert reductions
     assert {ref.dtype for event in reductions for ref in event.inputs} == {"float32"}
-    assert {path.name for path in (tmp_path / "result/memory").iterdir()} == {"memory_summary.json"}
+    assert annotations["memory_plan"].to_summary_dict() == annotations["memory_summary"]
+    assert not (tmp_path / "result").exists()
 
 
 def test_base_bfloat16_fails_with_native_fsdp_reason_before_capture():

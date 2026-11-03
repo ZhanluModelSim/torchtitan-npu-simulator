@@ -28,9 +28,5 @@ class OpNode:
     attrs: dict[str, Any]
     predecessors: list[int]
     successors: list[int]
-    flops: int = 0
-    peak_mem: int = 0
-    param_mem: int = 0
-    comm_bytes: int = 0
     annotations: dict[str, Any] = field(default_factory=dict)
     seq_idx: int = 0
