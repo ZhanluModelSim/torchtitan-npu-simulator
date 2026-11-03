@@ -16,7 +16,6 @@ import itertools
 import weakref
 from contextlib import contextmanager
 from dataclasses import dataclass
-from functools import lru_cache
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -25,6 +24,7 @@ from torch.utils._python_dispatch import TorchDispatchMode
 
 from torchtitan_simulator.capture.checkpoint_execution import current_execution_kind
 from torchtitan_simulator.capture.op_mapping import is_metadata_view_op, to_canonical_op_type
+from torchtitan_simulator.capture.operator_arguments import operator_attributes
 from torchtitan_simulator.capture.tensor_utils import dtype_to_str, tensor_volume_bytes, to_tensor_meta
 from torchtitan_simulator.ir.op_node import OpNode
 from torchtitan_simulator.memory.records import (
@@ -141,44 +141,6 @@ class _RawEvent:
     # fused attention kernel). They become OpNode.attrs.
     attrs: dict[str, Any] | None = None
     extra_annotations: dict[str, Any] | None = None
-
-
-@lru_cache(maxsize=1024)
-def _scalar_schema_arguments(func: Any) -> tuple[tuple[int, str, Any], ...] | None:
-    schema = getattr(func, "_schema", None)
-    if schema is None:
-        return None
-    return tuple(
-        (index, argument.name, argument.default_value)
-        for index, argument in enumerate(schema.arguments)
-        if "Tensor" not in str(argument.type)
-    )
-
-
-def _operator_attributes(func: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> dict[str, Any]:
-    """Bind scalar schema arguments, including omitted defaults, without reading tensor values."""
-
-    def normalize(value: Any) -> Any:
-        if isinstance(value, torch.Tensor):
-            return {"tensor_argument": True}
-        if isinstance(value, (list, tuple)):
-            return [normalize(item) for item in value]
-        if isinstance(value, dict):
-            return {str(key): normalize(item) for key, item in value.items()}
-        if value is None or isinstance(value, (str, int, float, bool)):
-            return value
-        if isinstance(value, complex):
-            return {"real": value.real, "imag": value.imag}
-        return str(value)
-
-    attrs: dict[str, Any] = {}
-    arguments = _scalar_schema_arguments(func)
-    if arguments is None:
-        return {key: normalize(value) for key, value in kwargs.items() if not isinstance(value, torch.Tensor)}
-    for index, name, default in arguments:
-        value = args[index] if index < len(args) else kwargs.get(name, default)
-        attrs[name] = normalize(value)
-    return attrs
 
 
 def _to_tensor_ref(
@@ -372,7 +334,14 @@ class OpDispatchCapture(TorchDispatchMode):
         annotations: dict[str, Any] = {}
         if self._dispatch_annotation_scopes:
             annotations["framework_scopes"] = list(self._dispatch_annotation_scopes)
-        attrs = _operator_attributes(func, args, kwargs)
+        # AdamW inputs use schema order for its six list roles; keep generic
+        # tensor occurrence bindings in that same order after normalization.
+        attribute_kwargs = kwargs
+        if str(func) == "aten._fused_adamw_.default":
+            attribute_kwargs = {
+                argument.name: kwargs[argument.name] for argument in func._schema.arguments if argument.name in kwargs
+            }
+        attrs = operator_attributes(func, args, attribute_kwargs)
         if str(func) == "aten._fused_adamw_.default":
             from torchtitan_simulator.capture.optimizer import bind_fused_adamw_inputs, optimizer_annotations
 
@@ -383,6 +352,7 @@ class OpDispatchCapture(TorchDispatchMode):
             annotations.update(optimizer_annotations(list(binding.tensor_lists[0])))
         operands = transport_operands(func, args)
         source_op_id = self.producer_op(operands.inputs[0]) if operands is not None else None
+
         if operands is not None:
             attrs.update(operands.attributes())
         module_path = self.module_path_tracker.current_path() if self.module_path_tracker else ""
