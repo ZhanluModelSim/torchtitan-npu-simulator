@@ -53,6 +53,7 @@
       ".experiments.graph_trainer.ep_overlap_shape_queries",
       ".experiments.graph_trainer.ep_ready_nodes_dedup",
       ".experiments.graph_trainer.ep_shape_live_out",
+      ".experiments.graph_trainer.fsdp_passes",
       ".models.common.attention_metadata",
       ".models.common.decoder",
       ".models.common.moe",

@@ -15,6 +15,7 @@ from .experiments.graph_trainer import (  # noqa: F401
     ep_overlap_shape_queries,
     ep_ready_nodes_dedup,
     ep_shape_live_out,
+    fsdp_passes,
 )
 
 # ``attention_metadata`` carries the backend-owned metadata contract and must
