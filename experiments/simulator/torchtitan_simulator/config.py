@@ -153,12 +153,14 @@ _QWEN3_5_OVERRIDES = [
     "torchtitan_npu.override.qwen3_5.gated_delta.npu",
 ]
 
-# The production A3 text recipe (examples/deepseek_v4_1) enables rms_norm,
-# half-rotation rope, the ASC MoE dispatcher and the V4.1 MHC post-processing
-# override; the optimizer swap wrapper is trainer-level and stays out.
+# The production A3 text recipe (examples/deepseek_v4_1) enables rms_norm, the
+# ASC MoE dispatcher and the V4.1 MHC post-processing override; the CLI rope
+# default (asc_complex) applies after the ops list and wins over
+# rope.asc_half_rotation, so the capture uses what production actually runs.
+# The optimizer swap wrapper is trainer-level and stays out.
 _DSV4_1_OVERRIDES = [
     *_COMMON_OVERRIDES,
-    "torchtitan_npu.override.common.rope.asc_half_rotation",
+    "torchtitan_npu.override.common.rope.asc_complex",
     "torchtitan_npu.override.deepseek_v4_1.mhc.asc_hc_post",
 ]
 
