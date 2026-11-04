@@ -112,21 +112,21 @@ def test_mm_duration_stays_absent_without_a_hardware_profile():
 
 
 def test_mm_duration_replays_calibration_points_within_measured_band():
-    # The utilization curve is calibrated on the qwen3.5 dense trace (the
-    # workload distribution), so idle-device benchmark shapes are held-out
-    # and only bounded by the loose envelope documented in cost/hardware.py
-    # (max_ratio pinned to the workload p98 -> large GEMMs overestimated),
-    # while workload-representative shapes are checked tighter.
+    # The utilization curve is calibrated on idle-device microbenchmarks
+    # only (square ladder + K=4096 grid, no workload shapes).  Regular
+    # shapes replay tightly; deep-K / tiny-M shapes sit below the 1-D FLOPs
+    # curve by design and only satisfy the loose limitation envelope
+    # documented in cost/hardware.py.
     from torchtitan_simulator.cost.hardware import npu_910b3
 
-    benchmark = [
-        ((4096, 4096), (4096, 4096), 522.0),
-        ((8192, 8192), (8192, 8192), 4227.0),
-        ((64, 248320), (248320, 256), 493.0),
-    ]
-    workload = [
+    regular = [
+        ((4096, 4096), (4096, 4096), 503.6),
+        ((1024, 4096), (4096, 4096), 142.6),
         ((260, 1024), (1024, 1024), 22.2),
-        ((64, 256), (256, 248320), 213.8),
+    ]
+    deep_k = [
+        ((64, 248320), (248320, 256), 145.4),
+        ((64, 256), (256, 248320), 300.8),
     ]
     hardware = npu_910b3()
 
@@ -134,14 +134,14 @@ def test_mm_duration_replays_calibration_points_within_measured_band():
         node = _node("matmul", [_meta(a_shape), _meta(b_shape)], [_meta((a_shape[0], b_shape[1]))])
         cost = compute_cost(node.op_type, node.inputs, node.outputs, hardware=hardware)
         assert cost.duration_us is not None and cost.duration_us > 0
-        return measured_us / cost.duration_us
+        return cost.duration_us / measured_us
 
-    for a_shape, b_shape, measured_us in benchmark:
+    for a_shape, b_shape, measured_us in regular:
         ratio = measured_ratio(a_shape, b_shape, measured_us)
-        assert 0.25 < ratio < 5.5, f"{a_shape}x{b_shape}: {measured_us}us vs {cost.duration_us}us"
-    for a_shape, b_shape, measured_us in workload:
+        assert 0.4 < ratio < 2.5, f"{a_shape}x{b_shape}: model {cost.duration_us}us vs {measured_us}us"
+    for a_shape, b_shape, measured_us in deep_k:
         ratio = measured_ratio(a_shape, b_shape, measured_us)
-        assert 0.4 < ratio < 2.5, f"{a_shape}x{b_shape}: {measured_us}us vs {cost.duration_us}us"
+        assert 0.15 < ratio < 0.6, f"{a_shape}x{b_shape}: model {cost.duration_us}us vs {measured_us}us"
 
 
 def test_mm_duration_skips_unsupported_dtypes_but_keeps_work():

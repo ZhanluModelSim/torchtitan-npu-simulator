@@ -16,29 +16,38 @@ taken on the real device (qwen35-real container, BF16):
   (torchtitan-npu ``metrics.py``); the largest measured GEMM (8192^3) sustains
   260 TFLOPS, so the peak is not overreached.
 - cube utilization ``LogUtilization(k, b, min_ratio, max_ratio)`` -- calibrated
-  on the actual workload distribution (372 measured ``MatMulV2`` kernels from
-  the qwen3.5 dense trace, cube-dominated subset), NOT on idle-device
-  microbenchmarks: a 1-D FLOPs curve fit to benchmark shapes missed the real
-  trace population by an order of magnitude (chunked tiny-M GEMMs run ~10x
-  more efficiently than same-FLOPs benchmark points).  On the fit set the
-  model reproduces the measured aggregate to 0.98x, and on the held-out
-  v4.1 ep4 trace to 0.97x aggregate (per-kernel median 0.9x, p90 1.6x).
-  ``max_ratio`` is pinned to the workload's 98th percentile, so idle-device
-  large GEMMs (which reach 89% utilization) are intentionally overestimated
-  up to ~3.6x -- this profile predicts training traces, not synthetic
-  microbenchmarks.
+  exclusively on idle-device BF16 GEMM microbenchmarks (qwen35-real container,
+  back-to-back launch timing): a square ladder 256..8192 plus a 3x3
+  MxN grid at K=4096, cube-bound points only (n=16).  The fit set is chosen
+  before evaluation and contains no target-workload shapes; residuals on it
+  are median 0.92x, p90 3.54x (clamp region).  The 1-D FLOPs law is a known
+  simplification: same-FLOPs shape families deviate from it (deep-K / tiny-M
+  GEMMs run 3-6x below the curve, quantified below).
 - HBM 3.07 TB/s with a constant 0.9 efficiency -- datasheet assumption, NOT
   calibrated (no bandwidth-bound calibration point exists yet).
 - vec peak is an uncalibrated placeholder: no vec duration model is wired in
   this module, the value only satisfies the ChipCapabilities structure.
 - ``overhead_us`` 3.0 -- the kernel-duration floor observed in NPU traces.
+
+Honest measured-vs-predicted gaps (model/real, >1 means the model is longer):
+
+- qwen3.5 dense trace (372 mm): aggregate 0.81x; per-kernel median 1.22x,
+  p10-p90 0.71-2.08x.
+- deepseek_v4.1 ep4 trace (1696 mm, held-out model): aggregate 0.92x;
+  median 1.00x, p10-p90 0.65-1.50x.
+- Idle deep-K / tiny-M families (64,248320,256), (2,256,248320) etc.:
+  0.18x-0.42x -- the model underestimates because the 1-D FLOPs curve
+  cannot express shape structure.
+- The >1 tail on small GEMMs is expected for a cache-free roofline: real
+  back-to-back kernels reuse L2-resident operands, while the model charges
+  cold logical traffic.
 """
 
 from __future__ import annotations
 
 __all__ = ["npu_910b3"]
 
-_CUBE_LOG_UTILIZATION = (0.0620, -1.0760, 0.0434, 0.2461)
+_CUBE_LOG_UTILIZATION = (0.1056, -1.8626, 0.0404, 0.9254)
 
 
 def _profile():
