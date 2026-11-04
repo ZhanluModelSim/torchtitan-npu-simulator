@@ -96,9 +96,10 @@ def test_qwen3_5_capture_annotates_every_mm_with_the_lm_head_closed_form():
         )
 
     # Nothing else was guessed: view/control/alloc nodes stay explicitly unknown.
-    # (The dense qwen3.5 debugmodel has no bmm/grouped_mm nodes.)
+    # (The dense qwen3.5 debugmodel has no bmm/grouped_mm nodes; the GDN
+    # latency-model family also carries declared FLOPs.)
     stamped = {n.op_type for n in nodes if "flops" in n.annotations}
-    assert stamped == {"matmul"}
+    assert stamped == {"matmul", "gated_delta_rule"}
     unknown = [n for n in nodes if n.annotations.get("cost_unknown")]
     assert unknown and all("flops" not in n.annotations for n in unknown)
 
@@ -264,3 +265,77 @@ def test_capture_without_hardware_writes_no_duration():
     annotate_workload_costs(workload)
     nodes = [n for graph in workload.step_templates.values() for n in graph.nodes.values()]
     assert all("duration_us" not in n.annotations for n in nodes)
+
+
+def test_gated_delta_rule_uses_the_latency_model():
+    from torchtitan_simulator.cost.hardware import npu_910b3
+
+    hardware = npu_910b3()
+    q = _meta((1, 512, 2, 64))
+    k = _meta((1, 512, 2, 64))
+    v = _meta((1, 512, 4, 64))
+    g = _meta((1, 512, 4), dtype="float32")
+    beta = _meta((1, 512, 4))
+    reset = _meta((1, 512), dtype="bool")
+
+    fwd = _node("gated_delta_rule", [q, k, v, g, beta, reset], [_meta((1, 512, 4, 64))])
+    cost = compute_cost(fwd.op_type, fwd.inputs, fwd.outputs, hardware=hardware)
+    # 16 programs (1 x 4 x 4 blocks) fit one AIV wave; forward is linear in T.
+    assert abs(cost.duration_us - 0.725 * 512) < 1e-6
+    assert cost.flops == 9 * 1 * 4 * 512 * 64 * 64
+
+    dy = _meta((1, 512, 4, 64))
+    bwd = _node(
+        "gated_delta_rule",
+        [q, k, v, g, beta, reset, dy],
+        [
+            _meta((1, 512, 2, 64)),
+            _meta((1, 512, 2, 64)),
+            _meta((1, 512, 4, 64)),
+            _meta((1, 512, 4), dtype="float32"),
+            _meta((1, 512, 4)),
+        ],
+    )
+    cost = compute_cost(bwd.op_type, bwd.inputs, bwd.outputs, hardware=hardware)
+    assert abs(cost.duration_us - 3.224 * 512) < 1e-6
+    assert cost.flops == 5 * 9 * 1 * 4 * 512 * 64 * 64
+
+
+def test_mhc_post_matches_the_kernel_formula():
+    from torchtitan_simulator.cost.hardware import npu_910b3
+
+    hardware = npu_910b3()
+    # x (bs, n, d), h_res (bs, n, n), h_out (bs, d), h_post (bs, n) -> y (bs, n, d)
+    node = _node(
+        "unknown",
+        [_meta((4, 8, 256)), _meta((4, 8, 8)), _meta((4, 256)), _meta((4, 8))],
+        [_meta((4, 8, 256))],
+    )
+    cost = compute_cost(
+        node.op_type,
+        node.inputs,
+        node.outputs,
+        hardware=hardware,
+        raw_op_type="cann_ops_transformer.mhc_post.default",
+    )
+    assert cost.traffic_bytes > 0 and cost.duration_us > 0
+    # Memory-bound at these shapes: duration must cover the traffic leg.
+    assert cost.duration_us >= cost.traffic_bytes / (3.07e12 * 0.40) * 1e6
+
+
+def test_gdn_and_mhc_missing_hardware_keeps_work_only():
+    q = _meta((1, 512, 2, 64))
+    fwd = _node(
+        "gated_delta_rule",
+        [
+            q,
+            q,
+            _meta((1, 512, 4, 64)),
+            _meta((1, 512, 4), dtype="float32"),
+            _meta((1, 512, 4)),
+            _meta((1, 512), dtype="bool"),
+        ],
+        [_meta((1, 512, 4, 64))],
+    )
+    cost = compute_cost(fwd.op_type, fwd.inputs, fwd.outputs, hardware=None)
+    assert cost.flops > 0 and cost.duration_us is None

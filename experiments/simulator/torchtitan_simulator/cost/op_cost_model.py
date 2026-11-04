@@ -264,6 +264,84 @@ def _copy_cost(write_only: bool = False):
     return handler
 
 
+def _ceil_div(a: int, b: int) -> int:
+    return -(-a // b)
+
+
+# GDN (gated delta rule) is a latency-bound sequential-scan kernel: state
+# updates form a loop-carried dependency chain over tokens, so throughput
+# rooflines do not apply.  The per-token latency constants come from the
+# production trace (qwen3.5 dense, two independent kernel populations:
+# 18 forward launches and 6 backward launches at T=512); idle-device
+# microbenchmarks are unusable because DVFS drops the AIV clock ~3x on an
+# idle part.  The kernel fixes d=dv=64/128 and value-block 16, so per-token
+# latency is independent of B/H; only T and the AIV wave count matter.
+_GDN_FWD_US_PER_TOKEN = 0.725
+_GDN_BWD_US_PER_TOKEN = 3.224
+_GDN_VALUE_BLOCK = 16
+_GDN_AIV_CORES = 20
+
+
+def _gdn_cost(inputs: list[TensorMeta], outputs: list[TensorMeta], hardware=None) -> CostEstimate:
+    """``qwen3_5_sim.gated_delta_rule``: forward (1 output) and backward (5).
+
+    FLOPs follow the kernel source (sequential state recursion: ~9 MAC-passes
+    over d*dv per token per head for the forward; the backward re-runs the
+    forward with checkpointing plus a reverse pass, ~5x).  Duration is the
+    declared latency model, not a roofline leg.
+    """
+    if not inputs or not outputs:
+        return CostEstimate.unknown_cost()
+    q, v = inputs[0], inputs[2] if len(inputs) > 2 else None
+    if q is None or v is None or len(q.shape) != 4 or len(v.shape) != 4:
+        return CostEstimate.unknown_cost()
+    if q.shape[-1] not in (64, 128) or q.shape[-1] != v.shape[-1]:
+        return CostEstimate.unknown_cost()
+    batch, tokens = q.shape[0], q.shape[1]
+    heads, dim, value_dim = v.shape[2], q.shape[-1], v.shape[-1]
+    programs = batch * heads * _ceil_div(value_dim, _GDN_VALUE_BLOCK)
+    waves = max(1, _ceil_div(programs, _GDN_AIV_CORES))
+    backward = len(outputs) == 5
+    if not backward and len(outputs) != 1:
+        return CostEstimate.unknown_cost()
+    flops = 9 * batch * heads * tokens * dim * value_dim
+    if backward:
+        flops *= 5
+    traffic = _traffic(list(inputs) + list(outputs))
+    if hardware is None or hardware.chip is None:
+        return CostEstimate(flops=flops, traffic_bytes=traffic)
+    per_token = _GDN_BWD_US_PER_TOKEN if backward else _GDN_FWD_US_PER_TOKEN
+    duration = per_token * tokens * waves
+    return CostEstimate(flops=flops, traffic_bytes=traffic, duration_us=duration)
+
+
+def _make_mhc_handler(backward: bool):
+    def handler(inputs: list[TensorMeta], outputs: list[TensorMeta], hardware=None) -> CostEstimate:
+        if len(inputs) < 4 or not outputs:
+            return CostEstimate.unknown_cost()
+        x, h_res = inputs[0], inputs[1]
+        if len(x.shape) < 2 or len(h_res.shape) < 2:
+            return CostEstimate.unknown_cost()
+        n, d = h_res.shape[-1], x.shape[-1]
+        if n <= 0 or d <= 0 or h_res.shape[-2] != n:
+            return CostEstimate.unknown_cost()
+        batch = 1
+        for size in x.shape[:-1]:
+            batch *= size
+        equiv_ops = 2.0 * (n + 1) * (2.0 if backward else 1.0)
+        traffic = _traffic(list(inputs) + list(outputs))
+        elements = _elements(outputs)
+        if not traffic or not elements:
+            return CostEstimate.unknown_cost()
+        return CostEstimate(
+            flops=0,
+            traffic_bytes=traffic,
+            duration_us=_vec_duration(hardware, elements, equiv_ops, traffic),
+        )
+
+    return handler
+
+
 _HANDLERS: dict[str, Callable[[list[TensorMeta], list[TensorMeta], object], CostEstimate]] = {
     # Dispatch nodes carry the normalized ``op_type`` ("matmul") alongside the
     # raw ``aten.mm.default`` annotation; the registry keys on the former.
@@ -283,6 +361,9 @@ _HANDLERS: dict[str, Callable[[list[TensorMeta], list[TensorMeta], object], Cost
     # Fused AdamW list op: per parameter it reads param/grad/m/v and writes
     # param/m/v(+aux), so traffic dominates; ~10 vector ops per element.
     "adamw_step": _pointwise_cost(10),
+    # Latency-bound sequential-scan kernel: duration from the declared
+    # per-token latency model (see _gdn_cost), not a roofline leg.
+    "gated_delta_rule": _gdn_cost,
 }
 
 # Unknown dispatch nodes fall back to their raw op name (``aten.*`` / ``npu.*``
@@ -349,6 +430,11 @@ _RAW_COPY = {
 
 _RAW_WRITE_ONLY = {"zeros", "zeros_like", "new_zeros", "ones_like", "arange"}
 
+_MHC_RAW = {
+    "mhc_post": _make_mhc_handler(backward=False),
+    "mhc_post_backward": _make_mhc_handler(backward=True),
+}
+
 
 def _normalize_raw(raw: str) -> str:
     name = raw
@@ -361,6 +447,8 @@ def _normalize_raw(raw: str) -> str:
 
 def _raw_cost(raw: str, inputs: list[TensorMeta], outputs: list[TensorMeta], hardware) -> CostEstimate | None:
     name = _normalize_raw(raw)
+    if name in _MHC_RAW:
+        return _MHC_RAW[name](inputs, outputs, hardware)
     equiv = _RAW_EQUIV.get(name)
     if equiv is not None:
         return _pointwise_cost(equiv)(inputs, outputs, hardware)

@@ -54,6 +54,20 @@ validated per trace kernel on the qwen3.5 dense trace (66k mapped kernels):
   shape-less in the trace), PadV3 (63 ms), Conv2D family (36 ms) and other
   unmodeled kernel types (107 ms total) have no corresponding workload nodes
   or no clean semantics yet.
+
+Two fused families step outside the roofline path:
+
+- gated_delta_rule (GDN): a latency-bound sequential-scan kernel (loop-carried
+  state dependency), modeled as ``per_token_us * T * AIV_waves`` with
+  constants from the production trace (forward 0.725 us/token, backward
+  3.224 us/token, two independent launch populations at T=512).  Idle-device
+  microbenchmarks are unusable here: DVFS drops the AIV clock ~3x on an idle
+  part, so the same kernel measures 1.1 ms instead of 0.37 ms.  The linear-in-T
+  shape follows from the kernel source; only the T=512 point is trace-validated.
+- mhc_post (CANN fused head composition, deepseek_v4_1 only): closed-form
+  equivalent-op model derived from the CANN kernel source
+  (``x_{l+1}[i,:] = sum_j H_res[j,i] * x_l[j,:] + h_out * H_post[i]``);
+  no qwen3.5 presence, so it carries unit tests but no trace validation.
 """
 
 from __future__ import annotations
