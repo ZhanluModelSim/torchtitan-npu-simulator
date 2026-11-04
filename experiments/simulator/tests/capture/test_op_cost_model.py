@@ -100,3 +100,95 @@ def test_qwen3_5_capture_annotates_every_mm_with_the_lm_head_closed_form():
     assert stamped == {"matmul"}
     unknown = [n for n in nodes if n.annotations.get("cost_unknown")]
     assert unknown and all("flops" not in n.annotations for n in unknown)
+
+
+def test_mm_duration_stays_absent_without_a_hardware_profile():
+    node = _node("matmul", [_meta((128, 512)), _meta((512, 256))], [_meta((128, 256))])
+    cost = compute_cost(node.op_type, node.inputs, node.outputs)
+    assert cost.duration_us is None
+    node2 = _node("matmul", [_meta((128, 512)), _meta((512, 256))], [_meta((128, 256))])
+    cost2 = compute_cost(node2.op_type, node2.inputs, node2.outputs, hardware=None)
+    assert cost2.duration_us is None
+
+
+def test_mm_duration_replays_calibration_points_within_measured_band():
+    # The utilization curve is calibrated on the qwen3.5 dense trace (the
+    # workload distribution), so idle-device benchmark shapes are held-out
+    # and only bounded by the loose envelope documented in cost/hardware.py
+    # (max_ratio pinned to the workload p98 -> large GEMMs overestimated),
+    # while workload-representative shapes are checked tighter.
+    from torchtitan_simulator.cost.hardware import npu_910b3
+
+    benchmark = [
+        ((4096, 4096), (4096, 4096), 522.0),
+        ((8192, 8192), (8192, 8192), 4227.0),
+        ((64, 248320), (248320, 256), 493.0),
+    ]
+    workload = [
+        ((260, 1024), (1024, 1024), 22.2),
+        ((64, 256), (256, 248320), 213.8),
+    ]
+    hardware = npu_910b3()
+
+    def measured_ratio(a_shape, b_shape, measured_us):
+        node = _node("matmul", [_meta(a_shape), _meta(b_shape)], [_meta((a_shape[0], b_shape[1]))])
+        cost = compute_cost(node.op_type, node.inputs, node.outputs, hardware=hardware)
+        assert cost.duration_us is not None and cost.duration_us > 0
+        return measured_us / cost.duration_us
+
+    for a_shape, b_shape, measured_us in benchmark:
+        ratio = measured_ratio(a_shape, b_shape, measured_us)
+        assert 0.25 < ratio < 5.5, f"{a_shape}x{b_shape}: {measured_us}us vs {cost.duration_us}us"
+    for a_shape, b_shape, measured_us in workload:
+        ratio = measured_ratio(a_shape, b_shape, measured_us)
+        assert 0.4 < ratio < 2.5, f"{a_shape}x{b_shape}: {measured_us}us vs {cost.duration_us}us"
+
+
+def test_mm_duration_skips_unsupported_dtypes_but_keeps_work():
+    from torchtitan_simulator.cost.hardware import npu_910b3
+
+    node = _node(
+        "matmul",
+        [_meta((16, 8), dtype="int64"), _meta((8, 4), dtype="int64")],
+        [_meta((16, 4), dtype="int64")],
+    )
+    cost = compute_cost(node.op_type, node.inputs, node.outputs, hardware=npu_910b3())
+    assert cost.flops == 2 * 16 * 4 * 8 and not cost.unknown
+    assert cost.duration_us is None
+
+
+def test_capture_with_hardware_annotates_duration_on_every_mm():
+    workload = simulate(
+        SimulationConfig(
+            config="qwen3_5_debugmodel",
+            seq_len=16,
+            world_size=1,
+            mixed_precision_param="bfloat16",
+        )
+    )
+    from torchtitan_simulator.cost.hardware import npu_910b3
+
+    annotate_workload_costs(workload, hardware=npu_910b3())
+    nodes = [n for graph in workload.step_templates.values() for n in graph.nodes.values()]
+    mms = [n for n in nodes if n.op_type == "matmul"]
+    assert mms and all(
+        "duration_us" in n.annotations and n.annotations["duration_us"] > 0 and n.annotations["duration_us"] < 1e9
+        for n in mms
+    )
+    # Non-mm nodes carry no duration: only matmul is modeled.
+    non_mm_durations = [n for n in nodes if n.op_type != "matmul" and "duration_us" in n.annotations]
+    assert not non_mm_durations
+
+
+def test_capture_without_hardware_writes_no_duration():
+    workload = simulate(
+        SimulationConfig(
+            config="qwen3_5_debugmodel",
+            seq_len=16,
+            world_size=1,
+            mixed_precision_param="bfloat16",
+        )
+    )
+    annotate_workload_costs(workload)
+    nodes = [n for graph in workload.step_templates.values() for n in graph.nodes.values()]
+    assert all("duration_us" not in n.annotations for n in nodes)
