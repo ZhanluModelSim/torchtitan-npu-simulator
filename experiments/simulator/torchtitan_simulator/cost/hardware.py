@@ -23,24 +23,37 @@ taken on the real device (qwen35-real container, BF16):
   are median 0.92x, p90 3.54x (clamp region).  The 1-D FLOPs law is a known
   simplification: same-FLOPs shape families deviate from it (deep-K / tiny-M
   GEMMs run 3-6x below the curve, quantified below).
-- HBM 3.07 TB/s with a constant 0.9 efficiency -- datasheet assumption, NOT
-  calibrated (no bandwidth-bound calibration point exists yet).
-- vec peak is an uncalibrated placeholder: no vec duration model is wired in
-  this module, the value only satisfies the ChipCapabilities structure.
+- HBM 3.07 TB/s peak with a constant 0.40 efficiency -- calibrated on
+  idle-device contiguous bf16 copy (read+write) at 256MB/1GB: the stream
+  sustains 1.22-1.24 TB/s.  Sizes up to ~64MB run faster (up to 4.3 TB/s,
+  L2-resident operands); that cache boost is intentionally not modeled, so
+  small-kernel copy time is overestimated.
+- vec peak is an uncalibrated placeholder: every vec-family model in this
+  module is memory-bound at the declared equivalent-op counts (verified per
+  family), so the placeholder never dominates; it only satisfies the
+  ChipCapabilities structure.
 - ``overhead_us`` 3.0 -- the kernel-duration floor observed in NPU traces.
 
-Honest measured-vs-predicted gaps (model/real, >1 means the model is longer):
+Honest measured-vs-predicted gaps (model/real, >1 means the model is longer),
+validated per trace kernel on the qwen3.5 dense trace (66k mapped kernels):
 
-- qwen3.5 dense trace (372 mm): aggregate 0.81x; per-kernel median 1.22x,
-  p10-p90 0.71-2.08x.
-- deepseek_v4.1 ep4 trace (1696 mm, held-out model): aggregate 0.92x;
-  median 1.00x, p10-p90 0.65-1.50x.
-- Idle deep-K / tiny-M families (64,248320,256), (2,256,248320) etc.:
-  0.18x-0.42x -- the model underestimates because the 1-D FLOPs curve
-  cannot express shape structure.
-- The >1 tail on small GEMMs is expected for a cache-free roofline: real
-  back-to-back kernels reuse L2-resident operands, while the model charges
-  cold logical traffic.
+- matmul: aggregate 0.75x (5.25 vs 7.02 ms); per-kernel median 1.22x,
+  p10-p90 0.70-2.19x.
+- adamw: per-kernel median 0.85x -- but the well-streaming fused kernel
+  sustains 2.3 TB/s, above the clone-calibrated copy bandwidth, so the
+  sim-side fused step (whole model, one node) lands ~2.1x over the measured
+  optimizer time.
+- fused vec activations (silu family, rsqrt, exp): 1.8-2.4x over -- the
+  real fused kernels run 0.9-1.7 us, below the flat 3 us launch overhead.
+- reductions (sum/mean) and log-softmax: 0.24-0.50x (2-4x under) -- multi-pass
+  kernels that do not reach copy bandwidth with single-pass traffic.
+- copy/transform kernels (TransData/Cast/Slice/Transpose...): ~0.45x
+  (2.2x under) -- layout conversion runs well below copy bandwidth and the
+  real per-kernel floor is 5-8 us, not 3 us.
+- Known capture-side gaps the cost model cannot see: MemSet (167 ms/step,
+  shape-less in the trace), PadV3 (63 ms), Conv2D family (36 ms) and other
+  unmodeled kernel types (107 ms total) have no corresponding workload nodes
+  or no clean semantics yet.
 """
 
 from __future__ import annotations
@@ -80,7 +93,7 @@ def _profile():
         hbm=HbmCapability(
             capacity_gb=64.0,
             bandwidth_tb_per_second=3.07,
-            utilization=ConstantUtilization(ratio=0.9),
+            utilization=ConstantUtilization(ratio=0.40),
         ),
     )
     return Hardware(name="npu_910b3", chip=chip)

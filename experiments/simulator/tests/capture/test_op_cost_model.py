@@ -95,7 +95,8 @@ def test_qwen3_5_capture_annotates_every_mm_with_the_lm_head_closed_form():
             sum(tensor_volume_bytes(t.shape, t.dtype) for t in node.inputs + node.outputs)
         )
 
-    # Nothing else was guessed: every non-mm node is explicitly unknown.
+    # Nothing else was guessed: view/control/alloc nodes stay explicitly unknown.
+    # (The dense qwen3.5 debugmodel has no bmm/grouped_mm nodes.)
     stamped = {n.op_type for n in nodes if "flops" in n.annotations}
     assert stamped == {"matmul"}
     unknown = [n for n in nodes if n.annotations.get("cost_unknown")]
@@ -109,6 +110,74 @@ def test_mm_duration_stays_absent_without_a_hardware_profile():
     node2 = _node("matmul", [_meta((128, 512)), _meta((512, 256))], [_meta((128, 256))])
     cost2 = compute_cost(node2.op_type, node2.inputs, node2.outputs, hardware=None)
     assert cost2.duration_us is None
+
+
+def test_bmm_counts_batch_flops_and_uses_the_library_model():
+    from torchtitan_simulator.cost.hardware import npu_910b3
+
+    node = _node(
+        "bmm",
+        [_meta((16, 64, 256)), _meta((16, 256, 128))],
+        [_meta((16, 64, 128))],
+    )
+    cost = compute_cost(node.op_type, node.inputs, node.outputs, hardware=npu_910b3())
+    assert cost.flops == 2 * 16 * 64 * 128 * 256
+    assert cost.traffic_bytes == (16 * 64 * 256 + 16 * 256 * 128 + 16 * 64 * 128) * 2
+    assert cost.duration_us and cost.duration_us > 0
+
+
+def test_grouped_mm_shares_k_n_across_groups():
+    from torchtitan_simulator.cost.hardware import npu_910b3
+
+    # x (96, 512), w (16, 512, 256), offsets (16,) -> out (96, 256): the group
+    # split partitions rows, so total flops are 2 * T * N * K regardless.
+    node = _node(
+        "grouped_mm",
+        [_meta((96, 512)), _meta((16, 512, 256)), _meta((16,), dtype="int32")],
+        [_meta((96, 256))],
+    )
+    cost = compute_cost(node.op_type, node.inputs, node.outputs, hardware=npu_910b3())
+    assert cost.flops == 2 * 96 * 256 * 512
+    assert cost.duration_us and cost.duration_us > 0
+
+
+def test_pointwise_and_copy_families_carry_traffic_and_duration():
+    from torchtitan_simulator.cost.hardware import npu_910b3
+
+    hardware = npu_910b3()
+    silu = _node("silu", [_meta((1040, 1536))], [_meta((1040, 1536))])
+    cost = compute_cost(silu.op_type, silu.inputs, silu.outputs, hardware=hardware)
+    assert cost.traffic_bytes == 2 * 1040 * 1536 * 2 and cost.flops == 0
+    assert cost.duration_us and cost.duration_us > 0
+
+    cat = _node(
+        "cat",
+        [_meta((1040, 256)), _meta((1040, 256))],
+        [_meta((1040, 512))],
+    )
+    cost = compute_cost(cat.op_type, cat.inputs, cat.outputs, hardware=hardware)
+    assert cost.traffic_bytes == 1040 * (256 + 256 + 512) * 2
+    assert cost.duration_us and cost.duration_us > 0
+
+    zeros = _node("unknown", [], [_meta((512, 512), dtype="float32")])
+    cost = compute_cost(zeros.op_type, zeros.inputs, zeros.outputs, hardware=hardware, raw_op_type="aten.zeros.default")
+    assert cost.traffic_bytes == 512 * 512 * 4  # fp32 MemSet write, read-only
+    assert cost.duration_us and cost.duration_us > 0
+
+
+def test_unknown_nodes_dispatch_by_raw_op_type():
+    from torchtitan_simulator.cost.hardware import npu_910b3
+
+    hardware = npu_910b3()
+    mul = _node("unknown", [_meta((1040, 1536)), _meta((1040, 1536))], [_meta((1040, 1536))])
+    cost = compute_cost(mul.op_type, mul.inputs, mul.outputs, hardware=hardware, raw_op_type="aten.mul.Tensor")
+    assert cost.traffic_bytes == 3 * 1040 * 1536 * 2
+    assert cost.duration_us and cost.duration_us > 0
+
+    # No raw entry -> still unknown, not guessed.
+    odd = _node("unknown", [_meta((4,))], [_meta((4,))])
+    cost = compute_cost(odd.op_type, odd.inputs, odd.outputs, hardware=hardware, raw_op_type="aten.foo.bar")
+    assert cost.unknown
 
 
 def test_mm_duration_replays_calibration_points_within_measured_band():
@@ -141,7 +210,7 @@ def test_mm_duration_replays_calibration_points_within_measured_band():
         assert 0.4 < ratio < 2.5, f"{a_shape}x{b_shape}: model {cost.duration_us}us vs {measured_us}us"
     for a_shape, b_shape, measured_us in deep_k:
         ratio = measured_ratio(a_shape, b_shape, measured_us)
-        assert 0.15 < ratio < 0.6, f"{a_shape}x{b_shape}: model {cost.duration_us}us vs {measured_us}us"
+        assert 0.4 < ratio < 1.2, f"{a_shape}x{b_shape}: model {cost.duration_us}us vs {measured_us}us"
 
 
 def test_mm_duration_skips_unsupported_dtypes_but_keeps_work():
@@ -175,9 +244,12 @@ def test_capture_with_hardware_annotates_duration_on_every_mm():
         "duration_us" in n.annotations and n.annotations["duration_us"] > 0 and n.annotations["duration_us"] < 1e9
         for n in mms
     )
-    # Non-mm nodes carry no duration: only matmul is modeled.
-    non_mm_durations = [n for n in nodes if n.op_type != "matmul" and "duration_us" in n.annotations]
-    assert not non_mm_durations
+    # The vec/copy families are duration-annotated too, and every annotated
+    # node carries its traffic fact alongside the prediction.
+    families = {n.op_type for n in nodes if "duration_us" in n.annotations}
+    assert {"matmul", "silu", "cat", "split"} <= families
+    annotated = [n for n in nodes if "duration_us" in n.annotations]
+    assert all(n.annotations.get("memory_traffic_bytes", 0) > 0 for n in annotated)
 
 
 def test_capture_without_hardware_writes_no_duration():
