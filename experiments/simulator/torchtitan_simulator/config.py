@@ -27,6 +27,8 @@ class SimulationConfig:
     training_dtype: str | None = None
     mixed_precision_param: str | None = None
     mixed_precision_reduce: str | None = None
+    optimizer_name: Literal["AdamW", "Muon"] | None = None
+    muon_ns_steps: int | None = None
     num_mtp_modules: int = 0
     output_dir: str = "./simulator_output"
     output_formats: list[str] = field(default_factory=list)
@@ -51,6 +53,10 @@ class SimulationConfig:
     model_overrides: ModelOverrides | None = None
 
     def validate(self):
+        if self.optimizer_name not in {None, "AdamW", "Muon"}:
+            raise ValueError("optimizer_name must be AdamW or Muon")
+        if self.muon_ns_steps is not None and (type(self.muon_ns_steps) is not int or self.muon_ns_steps < 1):
+            raise ValueError("muon_ns_steps must be a positive integer")
         if type(self.memory_offload_optimizer_states) is not bool:
             raise ValueError("memory_offload_optimizer_states must be boolean")
         preset, separator, precision = self.config.rpartition("_baseline_")
@@ -149,6 +155,46 @@ _DSV4_OVERRIDES = [
 ]
 
 
+def _optimizer_selection(simulation: SimulationConfig, trainer: Any) -> str:
+    optimizer = trainer.optimizer
+    has_muon = any(group.optimizer_name == "DistMuon" for group in optimizer.param_groups)
+    if simulation.optimizer_name == "AdamW" and has_muon:
+        raise ValueError("Explicit AdamW requires a recipe with AdamW groups; the factory already materialized Muon")
+    return simulation.optimizer_name or ("Muon" if has_muon else getattr(optimizer, "name", "AdamW"))
+
+
+def _prepare_optimizer(simulation: SimulationConfig, trainer: Any, *, materialize: bool = True) -> None:
+    """Materialize the model-owned Muon policy after geometry and overrides."""
+    selected = _optimizer_selection(simulation, trainer)
+    optimizer = trainer.optimizer
+    if selected != "Muon":
+        if simulation.muon_ns_steps is not None:
+            raise ValueError("muon_ns_steps requires optimizer_name=Muon or a native Muon recipe")
+        if materialize and simulation.optimizer_name is not None and hasattr(optimizer, "name"):
+            optimizer.name = simulation.optimizer_name
+        return
+    if trainer.model_spec.name != "deepseek_v4" or getattr(optimizer, "_muon_profile", None) is None:
+        raise ValueError("Muon simulation requires a DeepSeek-V4 recipe with a native Muon profile")
+    if simulation.tensor_parallel_degree != 1 or simulation.context_parallel_degree != 1:
+        raise ValueError("Muon simulation currently requires TP=1 and CP=1")
+    if simulation.enable_quantized_training:
+        raise ValueError("Muon simulation with quantized training is not supported")
+    if simulation.memory_offload_optimizer_states:
+        raise ValueError(
+            "Muon optimizer-state offload requires a dedicated prepare/compute pipeline and state-prefetch plan"
+        )
+    if getattr(optimizer, "muon_enable_hsdp_replica_dedup", False):
+        raise ValueError("Muon simulation does not yet support HSDP replica dedup")
+    if any(entry.startswith("torchtitan_npu.override.common.optimizer.") for entry in trainer.override.imports):
+        raise ValueError("Muon simulation does not support native swap or virtual optimizer overrides")
+    if not materialize:
+        return
+    optimizer.name = "Muon"
+    if simulation.muon_ns_steps is not None:
+        optimizer.muon_ns_steps = simulation.muon_ns_steps
+    optimizer.materialize()
+
+
 def prepare_config(simulation: SimulationConfig) -> PreparedConfig:
     """Resolve a fresh native config before any model or parallel initialization."""
     simulation.validate()
@@ -230,6 +276,7 @@ def prepare_config(simulation: SimulationConfig) -> PreparedConfig:
         else simulation.override_imports
     )
     model.update_from_config(config=trainer)
+    _prepare_optimizer(simulation, trainer, materialize=False)
     quantization = None
     if hasattr(trainer, "extension"):
         quantization = trainer.extension.quantization
@@ -249,6 +296,7 @@ def prepare_config(simulation: SimulationConfig) -> PreparedConfig:
     from torchtitan.config.override import apply_overrides
 
     adaptations.extend(apply_overrides(trainer.override, trainer))
+    _prepare_optimizer(simulation, trainer)
     for name, choices in (
         ("dtype", {"float32", "bfloat16"}),
         ("mixed_precision_param", {"float32", "bfloat16"}),

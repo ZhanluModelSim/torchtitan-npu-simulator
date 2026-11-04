@@ -53,6 +53,8 @@
 
 EP 默认通过 `compat/routing.py` 统一适配原生 functional `all_to_all_single`，保留 count→data/score→compute→combine 的完成依赖与原生 autograd。该适配不改 CP/FSDP；非 Meta 调用保留原实现。内部通信 event/slot 的 `volume_bytes` 用于源张量容量、内存和数据传递，不等于下游模型预测的网络流量。
 
+DSV4 Muon 继续执行原生 FlexShard 双向 all-to-all；transfer/caller 两流及 event 快照保留预取重叠和 buffer 复用等待。跨 rank 计划哈希比较在单 logical-rank Meta 会话中明确标记未执行，不伪造 peer 值。混合参数更新和通信依赖验收见 [Muon 捕获](muon.md)。
+
 FSDP wrapper 可能延迟安装或刷新。正式观察器在结构预热后安装，并以 transition 关联 AG staging、full allocation、wait、reshard、finalize 和未消费 prefetch 清理。预热阶段没有 active capture 的原生调用是合法行为，不得要求观察器在那里已有节点。
 
 至少验证：延后 AG/RS/AR 会沿真实等待边延后必要计算与 clip/update；无等待的其他流仍能重叠。参考[流控制依赖](stream-control-dependencies.md)、[EP 交换](ep-single-transport.md)、`tests/test_fsdp_stream_capture.py`、`tests/capture/test_native_collectives.py`。host polling/synchronize 和真实硬件时序不能由这些 Meta 测试推导。

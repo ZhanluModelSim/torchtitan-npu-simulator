@@ -252,7 +252,8 @@ def run_simulation_step(
         # Always capture L0 for optimizer phase (not controlled by microbatch)
         capture._capture_l0 = True
         if clip_grad_norm is not None:
-            clip_grad_norm()
+            with capture.annotate_dispatch_events("gradient_clip"):
+                clip_grad_norm()
         from torchtitan_simulator.capture.optimizer import (
             capture_optimizer_param_groups,
         )

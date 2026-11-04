@@ -1,6 +1,6 @@
 # 优化器状态卸载
 
-`SimulationConfig.memory_offload_optimizer_states=True` 或 CLI `--simulation.memory-offload-optimizer-states` 开启本地优化器状态卸载建模，默认关闭。它与激活卸载独立，四种开关组合均可用。模型仍执行原生 Meta optimizer 捕获；本功能不执行真实 CPU optimizer 或设备 copy。
+`SimulationConfig.memory_offload_optimizer_states=True` 或 CLI `--simulation.memory-offload-optimizer-states` 开启 AdamW 本地优化器状态卸载建模，默认关闭。它与激活卸载独立，AdamW 的四种开关组合均可用。Muon 当前明确拒绝该开关，其 momentum 准备和重分布流水不能套用本窗口，见 [Muon 捕获](muon.md)。模型仍执行原生 Meta optimizer 捕获；本功能不执行真实 CPU optimizer 或设备 copy。
 
 ## 执行图
 

@@ -30,6 +30,10 @@ class RuntimeSession:
         from torchtitan_simulator.compat.target import install_target_selection
 
         self.capabilities.update(install_target_selection(self.patches, prepared.simulation.target_npu_device_type))
+        if any(group.optimizer_name == "DistMuon" for group in prepared.trainer.optimizer.param_groups):
+            from torchtitan_simulator.compat.muon import install_meta_muon
+
+            self.capabilities.update(install_meta_muon(self.patches))
         if prepared.simulation.enable_quantized_training:
             from torchtitan_simulator.compat.swiglu import install_meta_swiglu_autograd
 

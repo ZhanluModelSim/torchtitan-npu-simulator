@@ -333,6 +333,9 @@ class OpDispatchCapture(TorchDispatchMode):
         output_ids = {id(tensor) for tensor in flat_outputs}
         flat_outputs.extend(tensor for tensor in mutated_inputs if id(tensor) not in output_ids)
         annotations: dict[str, Any] = {}
+        from torchtitan_simulator.capture.optimizer import parameter_update_annotations
+
+        annotations.update(parameter_update_annotations(str(func), mutated_inputs))
         if self._dispatch_annotation_scopes:
             annotations["framework_scopes"] = list(self._dispatch_annotation_scopes)
         # AdamW inputs use schema order for its six list roles; keep generic

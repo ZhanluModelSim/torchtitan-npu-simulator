@@ -13,6 +13,7 @@
 | [能力矩阵](capability-matrix.md)／[未覆盖范围](open-questions.md) | 哪些能力有实际路径与测试，哪些不能宣称支持 |
 | [稳态捕获](steady-state-capture.md)／[静态显存](steady-state-memory.md) | 结构预热、GA、优化器状态及逐层 payload 的口径 |
 | [语义声明](custom-tensor-semantics.md)／[AdamW 身份](adamw-input-identity.md) | 给下游提供真实角色和轴，不把 shape 猜测当事实 |
+| [Muon 捕获](muon.md) | DSV4 混合优化器、Meta 适配、all-to-all 预取与更新校验 |
 | [流控制](stream-control-dependencies.md)／[EP 交换](ep-single-transport.md) | 通信与等待如何成为真实依赖 |
 | [激活卸载](activation-offload-design.md)／[优化器卸载](optimizer-offload.md) | 传输执行图、静态预算和已知建模近似 |
 | [CANN 接口兼容](cann-metadata-signature-compat.md)／[生命周期机制](storage-lifetime-optimization.md)／[chunked loss](chunked-loss-policy.md) | 对应实现为何存在，哪些语义必须保留 |

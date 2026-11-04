@@ -40,6 +40,7 @@ python -m torchtitan_simulator --config kimi_k3_smoketest \
 
 - 单进程承载一个 logical rank，使用逻辑 world；PP 必须为 1，不用 torchrun worker 数替代逻辑设备数。
 - 默认同模型／optimizer 执行一次实际 GA 的无捕获结构预热，再捕获一个 microbatch 的 F/B 与一次 O。平台负责按 GA 组织阶段，见[稳态捕获](docs/steady-state-capture.md)。
+- DSV4 可用 `--optimizer.name Muon` 选择原生 DistMuon＋AdamW；保留内部计算、all-to-all 和预取依赖，范围与限制见 [Muon 捕获](docs/muon.md)。
 - 返回图保持 FSDP 通信视图，完整源图在 `captured_workload`；显存依据完整原始事件，不依据裁剪图。数据、alias/mutation、stream/event 依赖均保留，零耗时等待也不能删除。
 - 默认通过 Python 对象交付；仅显式 `mem` 导出显存汇总和诊断文件。无图折叠或强制图文件中转。
 - 激活和优化器卸载是独立开关，训练仓生成传输节点／依赖并修正静态显存，平台计算传输时间；不执行真实主机 copy。

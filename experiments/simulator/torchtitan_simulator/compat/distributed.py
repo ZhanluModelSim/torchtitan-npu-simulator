@@ -22,6 +22,17 @@ def install_meta_fsdp(scope):
 
     device_module = MetaDeviceModule()
     scope.replace(torch, "meta", device_module)
+    original_device_module = torch.get_device_module
+
+    def get_device_module(device=None):
+        # PyTorch caches device modules globally. A cached Meta handle belongs
+        # to a previous session and would switch a different stream ContextVar
+        # than the one observed by dispatch capture through the current torch.meta.
+        if isinstance(device, (str, torch.device)) and torch.device(device).type == "meta":
+            return device_module
+        return original_device_module(device)
+
+    scope.replace(torch, "get_device_module", get_device_module)
     if hasattr(torch.accelerator, "current_stream"):
         original_stream = torch.accelerator.current_stream
 

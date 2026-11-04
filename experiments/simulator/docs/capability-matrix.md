@@ -14,6 +14,7 @@
 | MXFP8 | 显式 `enable_quantized_training` 和原生 `all_mxfp8` recipe；需要配套 TorchAO-NPU，不能从 preset 名称推断；保留实际 code/scale 与原生参数选择 | [test_s4_mxfp8.py](../tests/test_s4_mxfp8.py)、[test_kimi_quantization.py](../tests/test_kimi_quantization.py) |
 | AC 与 selective save-set | none/full/selective；选择项以 `selective_ac.py` 为准；未命中实际 comm cache 时 warning，不伪造命中 | [test_s3_native_lifetimes.py](../tests/test_s3_native_lifetimes.py)、[test_s4_mxfp8.py](../tests/test_s4_mxfp8.py) |
 | GBS／GA 与稳态捕获 | 默认先按 GA 预热一轮，再捕获单 microbatch F/B 与一次 O；scheduler 不参与预热；GA 时间展开由下游处理 | [test_warmup.py](../tests/test_warmup.py)、[结构预热](steady-state-capture.md) |
+| Muon 混合优化器 | DSV4，TP=CP=PP=1；原生 DistMuon＋AdamW、DP/HSDP/EP、矩阵计算和双向 all-to-all；EP=1 的 Shard(1)→Shard(0) 转换提前拒绝，合法 Shard(0) 路径保留；不执行真实 peer 计划哈希比较；拒绝量化、replica dedup、native swap/virtual 和优化器状态卸载 | [Muon 捕获](muon.md)、[捕获测试](../tests/test_muon_capture.py)、[预取依赖测试](../tests/test_muon_dependencies.py) |
 
 ## 并行、捕获与交付
 
@@ -36,7 +37,7 @@
 | FSDP full/shard 驻留 | 实际 AG staging、full allocation、wait/reshard/finalize 区间；不按 Python view 是否存活推断设备驻留 | [test_fsdp_residency.py](../tests/capture/test_fsdp_residency.py)、[内存测试](../tests/memory/) |
 | 稳态状态预算 | 实际本地 optimizer state 去重；四个峰值、权重与状态独立大小；预热后初始状态仍计入 | [稳态内存](steady-state-memory.md)、[test_optimizer_state.py](../tests/memory/test_optimizer_state.py) |
 | 激活卸载 | 独立开关；逐层 payload、H2D/D2H/等待和派生静态驻留；head/层外值保留，晚 producer 保守处理；不执行真实 copy | [激活卸载](activation-offload-design.md)、[test_activation_transfers.py](../tests/capture/test_activation_transfers.py) |
-| 优化器卸载 | 独立开关；按本卡真实状态量生成双向窗口，不改 AdamW 耗时；峰值按约定忽略逐 tensor 搬运 buffer | [优化器卸载](optimizer-offload.md)、[test_optimizer_transfers.py](../tests/capture/test_optimizer_transfers.py) |
+| 优化器卸载 | AdamW 独立开关；Muon 当前拒绝；按本卡真实状态量生成双向窗口，不改 AdamW 耗时；峰值按约定忽略逐 tensor 搬运 buffer | [优化器卸载](optimizer-offload.md)、[test_optimizer_transfers.py](../tests/capture/test_optimizer_transfers.py) |
 | shard dtype 投影 | `memory_parameter_storage_dtype` 只改常驻权重字节投影，不修改计算、梯度、状态和通信 dtype | [test_memory_delivery.py](../tests/test_memory_delivery.py)、[test_precision.py](../tests/test_precision.py) |
 
 ## 未支持或不由本仓证明的范围

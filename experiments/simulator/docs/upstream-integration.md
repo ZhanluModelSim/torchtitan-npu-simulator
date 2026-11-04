@@ -56,11 +56,12 @@ workload = main([
 | `selective_ac_save_ops` | `--simulation.selective-ac-save-ops` | selective 保存集合，未传使用默认，空列表与未传不等价 |
 | `training_dtype` | `--training.dtype` | 原始参数 dtype；当前完整捕获使用 float32 |
 | `mixed_precision_param`／`mixed_precision_reduce` | `--training.mixed-precision-param`／`--training.mixed-precision-reduce` | 实际计算参数与归约 dtype，不是纯内存假设 |
+| `optimizer_name`／`muon_ns_steps` | `--optimizer.name`／`--optimizer.muon-ns-steps` | 保留 recipe 默认或显式选择 AdamW／DSV4 Muon；可选覆盖 Muon 迭代次数；见 [Muon 范围与依赖](muon.md) |
 | `enable_quantized_training` | `--extension.quantization.enable-quantized-training` | 显式启用原生 MXFP8，默认关闭 |
 | `quantization_recipe` | `--extension.quantization.recipe` | 当前仅 `all_mxfp8` |
 | `memory_parameter_storage_dtype` | `--simulation.memory-parameter-storage-dtype` | 仅投影常驻本地参数 shard 字节 |
 | `memory_offload_ac_saved_tensors` | `--simulation.memory-offload-ac-saved-tensors` | 激活卸载执行图及静态预算 |
-| `memory_offload_optimizer_states` | `--simulation.memory-offload-optimizer-states` | 独立优化器状态卸载 |
+| `memory_offload_optimizer_states` | `--simulation.memory-offload-optimizer-states` | AdamW 独立优化器状态卸载；Muon 当前拒绝 |
 | `output_dir`／`output_formats` | `--simulation.output-dir`／`--simulation.output-formats mem` | 可选显存导出位置／格式 |
 | `model_overrides` | `--model-overrides.*` | 类型化 DSV4 几何覆盖，重建完整配置树 |
 | `override_imports` | 无对应通用 CLI | Python 显式替换默认 override 列表；并非追加，慎用空列表 |

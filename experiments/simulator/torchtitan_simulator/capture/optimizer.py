@@ -69,6 +69,7 @@ def bind_fused_adamw_inputs(func: Any, args: tuple[Any, ...], kwargs: dict[str, 
 @dataclass
 class _OptimizerParamScope:
     groups: tuple[tuple[torch.Tensor, ...], ...]
+    names_by_id: dict[int, str]
 
     def resolve(self, fused_params: list[torch.Tensor]) -> list[torch.Tensor]:
         """Map actual fused operands to logical params without expanding groups."""
@@ -85,6 +86,34 @@ _active_param_scope: ContextVar[_OptimizerParamScope | None] = ContextVar(
     "simulator_optimizer_param_scope",
     default=None,
 )
+
+_active_parameter_update: ContextVar[tuple[torch.Tensor, str] | None] = ContextVar(
+    "simulator_optimizer_parameter_update", default=None
+)
+
+
+@contextmanager
+def capture_parameter_update(parameter: torch.Tensor, fqn: str) -> Iterator[None]:
+    """Bind a native per-parameter update to its actual mutable operand."""
+    token = _active_parameter_update.set((parameter, fqn))
+    try:
+        yield
+    finally:
+        _active_parameter_update.reset(token)
+
+
+def parameter_update_annotations(raw_op_type: str, mutated_inputs: list[torch.Tensor]) -> dict:
+    update = _active_parameter_update.get()
+    # DistMuon's native _apply_update ends with add_(direction). Its earlier
+    # mul_(weight_decay) alone is not evidence of a complete optimizer update.
+    if update is None or raw_op_type != "aten.add_.Tensor":
+        return {}
+    parameter, fqn = update
+    local = getattr(parameter, "_local_tensor", parameter)
+    storage = local.untyped_storage()._cdata
+    if not any(tensor.untyped_storage()._cdata == storage for tensor in mutated_inputs):
+        return {}
+    return {"optimizer_updated_parameter_names": [fqn], "optimizer_algorithm": "DistMuon"}
 
 
 def _optimizer_owners(optimizer_step: Callable) -> tuple:
@@ -103,6 +132,15 @@ def optimizer_state_values(optimizer_step: Callable):
     if not owners or any(not isinstance(getattr(owner, "state", None), Mapping) for owner in owners):
         return None
     return [owner.state for owner in owners]
+
+
+def optimizer_parameter_manifest(optimizer_step: Callable) -> list[dict]:
+    """Read the native mixed container's parameter ownership, without regex inference."""
+    return [
+        {"algorithm": type(owner).__name__, "parameter_names": list(group.get("param_names", ()))}
+        for owner in _optimizer_owners(optimizer_step)
+        for group in owner.param_groups
+    ]
 
 
 def _optimizer_param_groups(optimizer_step: Callable) -> tuple[tuple[torch.Tensor, ...], ...]:
@@ -131,7 +169,14 @@ def capture_optimizer_param_groups(optimizer_step: Callable) -> Iterator[None]:
     if not groups:
         yield
         return
-    token = _active_param_scope.set(_OptimizerParamScope(groups))
+    names_by_id = {
+        id(parameter): name
+        for owner in _optimizer_owners(optimizer_step)
+        for group in owner.param_groups
+        if "param_names" in group
+        for parameter, name in zip(group["params"], group["param_names"], strict=True)
+    }
+    token = _active_param_scope.set(_OptimizerParamScope(groups, names_by_id))
     try:
         yield
     finally:
@@ -141,9 +186,13 @@ def capture_optimizer_param_groups(optimizer_step: Callable) -> Iterator[None]:
 def optimizer_annotations(params):
     scope = _active_param_scope.get()
     logical_params = scope.resolve(params) if scope is not None else params
-    return {
+    annotations: dict[str, Any] = {
         "optimizer_updated_parameter_count": len(logical_params),
         "optimizer_declared_group_sizes": [len(group) for group in scope.groups] if scope is not None else [],
         "optimizer_logical_parameter_shapes": [tuple(parameter.shape) for parameter in logical_params],
         "optimizer_work_scope": "actual_updated_parameters",
     }
+    if scope is not None and all(id(parameter) in scope.names_by_id for parameter in logical_params):
+        annotations["optimizer_updated_parameter_names"] = [scope.names_by_id[id(p)] for p in logical_params]
+        annotations["optimizer_algorithm"] = "AdamW"
+    return annotations

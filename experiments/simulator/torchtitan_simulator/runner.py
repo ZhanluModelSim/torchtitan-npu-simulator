@@ -132,6 +132,13 @@ def simulate(simulation):
                     "mesh_shape": tuple(mesh.shape) if mesh is not None else (),
                     "placements": str(getattr(parameter, "placements", ())),
                 }
+            from torchtitan_simulator.compat.muon import validate_muon_layouts
+
+            validate_muon_layouts(
+                config.optimizer,
+                logical_named_parameters(model),
+                expert_parallel_degree=simulation.expert_parallel_degree,
+            )
             runtime.capabilities.update(install_balanced_dispatch(runtime.patches, model))
             loss_fn = config.loss.build(compile_config=config.compile)
             loss_fn.set_lm_head(model.lm_head)
@@ -290,6 +297,9 @@ def simulate(simulation):
                 "metadata_planning_device": "cpu",
             }
             annotations["parameter_layouts"] = parameter_layouts
+            from torchtitan_simulator.capture.optimizer import optimizer_parameter_manifest
+
+            annotations["optimizer_parameter_groups"] = optimizer_parameter_manifest(optimizers.step)
             from dataclasses import asdict
 
             annotations["model_configuration"] = {
