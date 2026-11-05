@@ -131,7 +131,9 @@ def _simulate(simulation, timings: HostTimings):
                 if not quantized_parameters:
                     raise RuntimeError("Native all_mxfp8 recipe selected no MX training weights")
             original_shapes = {name: tuple(parameter.shape) for name, parameter in logical_named_parameters(model)}
-            with timings.measure("parallelize"):
+            from torchtitan_simulator.compat.meta_initialization import meta_initialization
+
+            with timings.measure("parallelize"), meta_initialization():
                 model = config.model_spec.parallelize_fn(
                     model,
                     parallel_dims=dims,

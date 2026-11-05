@@ -329,6 +329,12 @@ def _mesh_coordinate_worker(rank, rendezvous):
                                     3 if row_coordinate == 0 else 2,
                                     4 if column_coordinate == 0 else 3,
                                 )
+                for index, tensor in enumerate(tensors):
+                    peers = tuple(mesh.mesh[coordinates[rank][0]].tolist())
+                    expected_domain = planning.NATIVE_STORAGE_REGIONS(tensor, peers, required_storage_mesh_axis=1)
+                    actual_domain = planning.dtensor_storage_regions(tensor, peers, required_storage_mesh_axis=1)
+                    assert actual_domain == expected_domain
+                    assert actual_domain[0] == ((5, 7) if index == 0 else (3 if row == 0 else 2, 7))
                 assert flattened_meshes == 1
         finally:
             planning._mesh_coordinates.reset(token)
@@ -466,3 +472,144 @@ def _batched_gloo_worker(rank, rendezvous, world):
 @pytest.mark.parametrize("world", [2, 4])
 def test_batched_routes_round_trip_with_gloo(tmp_path, world):
     mp.spawn(_batched_gloo_worker, args=(f"file://{tmp_path / 'batch-rendezvous'}", world), nprocs=world, join=True)
+
+
+def test_validation_facts_preserve_failures_and_fall_back_for_mutable_inputs(monkeypatch):
+    calls = []
+    native = planning.NATIVE_VALIDATE_TENSOR_PARTITION
+
+    def counted(*args, **kwargs):
+        calls.append(kwargs["direction"])
+        return native(*args, **kwargs)
+
+    monkeypatch.setattr(planning, "NATIVE_VALIDATE_TENSOR_PARTITION", counted)
+    facts = planning._ValidationFacts()
+    token = planning._validation_facts.set(facts)
+    try:
+        regions = (schedule._TensorRegion((0,), (4,)),)
+        for direction in ("first", "second"):
+            planning.validate_tensor_region_partition(regions, (4,), direction=direction)
+        assert calls == ["first"]
+        for direction in ("bad-one", "bad-two"):
+            with pytest.raises(RuntimeError, match=f"{direction} regions must be in bounds"):
+                planning.validate_tensor_region_partition(regions, (3,), direction=direction)
+        assert calls[-2:] == ["bad-one", "bad-two"]
+        mutable = [schedule._TensorRegion([0], [4])]
+        for _ in range(2):
+            planning.validate_tensor_region_partition(mutable, [4], direction="mutable")
+        assert calls[-2:] == ["mutable", "mutable"]
+        mutable[0].shape[0] = 5
+        with pytest.raises(RuntimeError, match="mutable regions must be in bounds"):
+            planning.validate_tensor_region_partition(mutable, [4], direction="mutable")
+    finally:
+        planning._validation_facts.reset(token)
+
+
+def test_validation_facts_distinguish_tensor_shape_and_expected_partition():
+    regions = (schedule._TensorRegion((0,), (4,)),)
+    partition = schedule._ParticipantPartition(participant=0, tensor_shape=(4,), logical_regions=regions)
+    token = planning._validation_facts.set(planning._ValidationFacts())
+    try:
+        planning.validate_participant_logical_partition(partition, (8,), direction="participant")
+        invalid = replace(partition, tensor_shape=(3,))
+        actual = _outcome(planning.validate_participant_logical_partition, invalid, (8,), direction="participant")
+        assert actual is not None
+        assert actual == _outcome(planning.NATIVE_VALIDATE_PARTICIPANT, invalid, (8,), direction="participant")
+        planning.validate_regions_cover_partition(regions, regions, (8,), direction="cover")
+        # Equal volume but a different location must still fail containment.
+        shifted = (schedule._TensorRegion((4,), (4,)),)
+        actual = _outcome(planning.validate_regions_cover_partition, regions, shifted, (8,), direction="cover")
+        assert actual is not None
+        assert actual == _outcome(planning.NATIVE_VALIDATE_COVER, regions, shifted, (8,), direction="cover")
+    finally:
+        planning._validation_facts.reset(token)
+
+
+def test_validation_facts_have_bounded_retention_and_eviction_keeps_checks(monkeypatch):
+    monkeypatch.setattr(planning, "_MAX_VALIDATION_FACTS", 8)
+    monkeypatch.setattr(planning, "_MAX_VALIDATION_WEIGHT", 64)
+    monkeypatch.setattr(planning, "_MAX_IMMUTABLE_INPUTS", 8)
+    monkeypatch.setattr(planning, "_MAX_IMMUTABLE_WEIGHT", 32)
+    facts = planning._ValidationFacts()
+    token = planning._validation_facts.set(facts)
+    try:
+        for offset in range(512):
+            planning.validate_disjoint_regions_in_bounds(
+                (schedule._TensorRegion((offset,), (1,)),), (512,), direction="bounded"
+            )
+            assert len(facts.successes) <= 8
+            assert len(facts.order) == len(facts.successes)
+            assert facts.weight <= 64
+            assert len(facts.immutable_inputs) <= 8
+            assert facts.immutable_weight <= 32
+        with pytest.raises(RuntimeError, match="bad regions must be in bounds"):
+            planning.validate_disjoint_regions_in_bounds(
+                (schedule._TensorRegion((512,), (1,)),), (512,), direction="bad"
+            )
+        facts.clear()
+        assert not facts.successes and not facts.order and facts.weight == 0
+        assert not facts.immutable_inputs and facts.immutable_weight == 0
+    finally:
+        planning._validation_facts.reset(token)
+
+
+@pytest.mark.parametrize("fail", [False, True], ids=["success", "exception"])
+def test_validation_fact_scope_clears_references_and_restores_nested_scope(monkeypatch, fail):
+    observed = []
+    outer = planning._ValidationFacts()
+
+    def validate(_plan):
+        current = planning._validation_facts.get()
+        assert current is not outer
+        observed.append(current)
+        planning.validate_disjoint_regions_in_bounds((schedule._TensorRegion((0,), (1,)),), (1,), direction="inner")
+        if fail:
+            raise ValueError("scope failure")
+
+    monkeypatch.setattr(planning, "_validate_plan", validate)
+    token = planning._validation_facts.set(outer)
+    try:
+        for _ in range(3):
+            if fail:
+                with pytest.raises(ValueError, match="scope failure"):
+                    planning.validate_redistribution_plan(None)
+            else:
+                planning.validate_redistribution_plan(None)
+            assert planning._validation_facts.get() is outer
+        assert len({id(item) for item in observed}) == 3
+        assert all(not item.successes and not item.order and item.weight == 0 for item in observed)
+        assert all(not item.immutable_inputs and item.immutable_weight == 0 for item in observed)
+    finally:
+        planning._validation_facts.reset(token)
+    assert planning._validation_facts.get() is None
+
+
+def test_immutable_qualification_requires_identity_and_exact_types():
+    facts = planning._ValidationFacts()
+    shape = (4,)
+    facts.immutable_inputs[id(shape)] = ((5,), 999)
+    assert planning._shape_weight(shape, facts) == 2
+    assert facts.immutable_inputs[id(shape)][0] is shape
+    assert planning._shape_weight([4], facts) is None
+    assert planning._shape_weight((True,), facts) is None
+    region = schedule._TensorRegion([0], [4])
+    assert planning._fact_weight((region,), (), (4,), (), facts) is None
+    assert id(region) not in facts.immutable_inputs
+
+
+def test_native_plan_qualification_falls_back_for_mutable_geometry():
+    plan = schedule._build_whole_tensor_redistribution_plan(
+        _regions((4, 2), (0, 1)), participants=(0, 1), compute_participants=(0,), logical_shape=(4, 2)
+    )
+    assert planning._native_plan_geometry(plan, planning._ValidationFacts())
+    first = plan.storage_partitions[0]
+    region = first.logical_regions[0]
+    mutable = schedule._TensorRegion(list(region.offsets), list(region.shape))
+    changed = replace(first, logical_regions=(mutable,))
+    plan = replace(plan, storage_partitions=(changed, *plan.storage_partitions[1:]))
+    assert not planning._native_plan_geometry(plan, planning._ValidationFacts())
+    planning.validate_redistribution_plan(plan)
+    mutable.shape[0] = 99
+    actual = _outcome(planning.validate_redistribution_plan, plan)
+    assert actual is not None
+    assert actual == _outcome(planning._validate_plan, plan)
