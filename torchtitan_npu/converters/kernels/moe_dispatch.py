@@ -61,13 +61,16 @@ def _local_gate_scores(router, x: torch.Tensor) -> torch.Tensor:
     if gate_bias is not None and isinstance(gate_bias, DTensor):
         gate_bias = gate_bias.to_local()
 
-    autocast = (
-        nullcontext()
-        if x.device.type in {"cpu", "meta"}
-        else torch.autocast(device_type=x.device.type, dtype=torch.float32)
-    )
+    if x.device.type == "meta":
+        autocast = nullcontext()
+    elif x.device.type == "cpu":
+        autocast = torch.autocast(device_type="cpu", enabled=False)
+    else:
+        autocast = torch.autocast(device_type=x.device.type, dtype=torch.float32)
     with autocast:
-        return torch.nn.functional.linear(x, gate_weight, gate_bias)
+        # Router weights may deliberately remain fp32 while activations are
+        # bf16. Preserve that precision contract on CPU/meta as well as NPU.
+        return torch.nn.functional.linear(x.to(gate_weight.dtype), gate_weight, gate_bias)
 
 
 def _apply_score_func(scores: torch.Tensor, score_func: str) -> torch.Tensor:

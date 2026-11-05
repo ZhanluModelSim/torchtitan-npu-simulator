@@ -1,146 +1,86 @@
-# Block diffusion：训练与推理负载参考
+# Block Diffusion 规范参考
 
-这个目录提供独立的 PyTorch 模型，供数值核对、meta 形状捕获和 NPU 成本模型
-适配使用。核心只依赖 PyTorch 和标准库，不需要导入 `torchtitan_npu` 来运行。
-它不是已完成原生模拟器接入的 `ModelSpec`；现有
-[`models/block_diffusion`](../../../models/block_diffusion) 训练计算代理保持独立。
+**模型契约版本：1**（`model.py` 中的 `MODEL_CONTRACT_VERSION`）。本目录只包含
+本规范与独立 PyTorch 参考实现 [`model.py`](model.py)，是本仓库 Block Diffusion
+训练和推理语义的标准。网络配置决定规模，默认小配置不代表固定 checkpoint。
 
-## 文件与接口
+## 结构与张量
 
-| 文件 | 职责 |
+记 batch 为 `B`，当前序列为 `S`，前缀为 `P`，块长为 `C`，hidden 为 `H`，
+query/KV heads 为 `Nq/Nkv`，head dimension 为 `D`，词表为 `V`。
+
+- 输入 token 是 int32/int64 `[B,S]`；embedding 输出 `[B,S,H]`。
+- 每层执行 pre-norm GQA、残差、pre-norm FFN、残差；最后是 RMSNorm 和输出头。
+- Q/K/V 形状为 `[B,Nq,S,D]`／`[B,Nkv,S,D]`／`[B,Nkv,S,D]`。
+  `Nq` 必须可被 `Nkv` 整除，`D` 为正偶数；`H` 与 `Nq*D` 独立配置。
+  attention 与 FFN 的线性层无 bias。
+- dense FFN 为 `down(silu(gate(x))*up(x))`。MoE 为逐 token top-k routed
+  SwiGLU experts，加 `num_shared_experts` 个可选 shared expert 的输出之和。
+  shared expert 数可以为零；`num_experts=0` 时为 dense，不启用 shared experts。
+- router 在 FP32 计算 logits，选择 top-k 后对所选 logits 作 softmax。
+  `RoutingPlan` 可显式回放每个 token 的不同专家 ID；每个 pair 计算一次，
+  按专家分组执行，不为每个 token 复制整份专家权重。
+- `tie_word_embeddings=True` 必须实际共享 embedding 与输出头的 Parameter。
+- RoPE 按 split-half 配对 `(i, i+D/2)`，`0<=i<D/2`；逆频率为
+  `rope_theta**(-2*i/D)`，不作额外频率缩放，默认 `rope_theta=1000000`。
+  旋转在 FP32 中计算后转回激活 dtype；训练位置为 `0..S-1`，推理为
+  `P..P+S-1`。不同配对方式、频率缩放或位置起点不视为数值等价。
+
+## 训练契约
+
+`forward_training(input_ids, labels, spec=TrainingSpec(...), routing_plan=...)`
+保持梯度，使用完整窗口，不复用或 detach 推理 KV。labels 为同设备的 int64
+`[B,S]`，与输入位置对齐，**不做 next-token shift**。调用方负责 corruption、
+mask 比例和未监督位置的 `ignore_index`，模型不隐藏时间步或 loss weighting。
+
+要求 `S>=C` 且 `S%C=0`。布尔 attention mask 中 True 表示可见：
+
+| `attention_policy` | query `i` 可见 key `j` 的条件 |
 | --- | --- |
-| `model.py` | 共享 dense/MoE 网络，显式训练和推理入口 |
-| `workload.py` | 推理阶段、TP/EP 分片、通信与采样的语义描述 |
-| `training_workload.py` | 实际 CPU/meta forward、backward 和 AdamW 算子捕获 |
-| `legacy_state_dict.py` | 原始 stacked-expert 权重格式的显式双向转换 |
-| `example.py` / `export_example.py` | 推理回放与语义 JSON 导出 |
-| `tests/` | 独立数值参考、梯度、状态、分片和转换验收 |
+| `block_causal` | `floor(j/C) <= floor(i/C)`：先前块与当前整个块可见 |
+| `prefix_causal_canvas_bidirectional` | `j<=i or i>=S-C`：clean prefix 逐 token causal，最后 canvas 可见整个窗口 |
 
-从本目录导入时使用：
+输出 `TrainingOutput(logits, loss, loss_sum, valid_tokens)`；logits 为 `[B,S,V]`，
+输出头覆盖全部位置，包括 ignored positions。`loss_sum` 是 FP32 masked
+cross-entropy 之和，`valid_tokens` 是非 ignore 标签数，
+`loss=loss_sum/max(valid_tokens,1)`；零有效标签时返回可微零值。分布式全局
+有效 token 归一化由训练驱动完成，不能直接平均不同 rank 的局部 mean loss。
 
-```python
-from model import BlockDiffusionModel, ModelConfig, TrainingSpec
-```
+## 推理契约
 
-从仓库根目录运行下面的脚本不会触发 NPU 插件初始化：
+`forward(input_ids, cache=None, phase=..., attention_policy=..., logits_positions=...)`
+为无梯度的单次前向；`model.train()` 不会将它变成训练入口。
 
-```bash
-python torchtitan_npu/simulator/raw_model/block_diff/example.py --device cpu --moe
-python torchtitan_npu/simulator/raw_model/block_diff/example.py --device meta --moe
-python torchtitan_npu/simulator/raw_model/block_diff/export_example.py --tp 2 --ep 4 --output /tmp/block-diff-inference.json
-python torchtitan_npu/simulator/raw_model/block_diff/training_workload.py --device meta --optimizer adamw --output /tmp/block-diff-training.json
-```
+- `KVCache` 每层保存独立 K/V，各为 `[B,Nkv,P,D]`。当前块 RoPE 位置从 `P`
+  开始，所有层的 cache 长度一致。
+- `prefill`／`commit` 返回追加当前 `S` 个位置后的新 cache，不修改输入 cache；
+  `denoise` 读取前缀并重算当前块，保持 cache 不变。
+- 推理 `causal` 表示前缀全部可见、当前块逐 token causal；`bidirectional`
+  表示前缀与当前整个块可见。commit 采用哪种策略必须由调用方明确选择。
+- 输出 `PhaseOutput(logits, cache)`。`logits_positions=None` 输出全部位置；
+  空选择返回 `logits=None` 并跳过 final norm／head；位置序列共享于 batch，
+  int64 `[B,K]` tensor 则按请求选择，输出 `[B,K,V]`。选择发生在 final norm 前。
+- token 更新、停止、去噪步数和额外 commit 由外部调度，模型不假定统一的 `D+1`。
 
-## 推理
+## 精度与边界
 
-`model(input_ids, cache=..., phase=..., attention_policy=..., logits_positions=...)`
-执行一次前向，返回 `PhaseOutput(logits, cache)`。
+权重／激活 `dtype` 和 KV 存储 `kv_dtype` 支持 float32、float16、bfloat16；
+KV 读写转换必须显式生效。router 参数／评分、RMSNorm reduction、RoPE 计算
+使用 FP32；RMSNorm 参数使用模型 dtype。整数／量化配置不在版本 1 范围内。
 
-- `prefill` 和 `commit` 返回追加后的逐层 KV；输入 cache 不被修改。
-- `denoise` 读取前缀，重算当前块，不提交 KV。
-- `attention_policy` 明确选择前缀可见、块内 causal 或 bidirectional。
-- `logits_positions=None` 计算全部位置，空 tuple 跳过输出头；tuple 选择所有
-  请求共享的位置，输入设备上的 int64 `[B,H]` tensor 选择各请求自己的位置。
-  位置选择发生在 final norm 和输出头之前。
-- 步数、token 更新、停止和 commit 策略属于调用方，不再默认所有算法都为
-  `D+1` 次前向。模型没有内置置信度采样循环。
+参考实现为单 rank 逻辑计算；TP/EP、服务调度、采样和后端 kernel 映射属于外部
+适配。参数容量、KV 状态、临时 workspace、实际 HBM 流量与时延不能互相替代。
 
-CPU MoE 可以使用真实 top-k 路由。`RoutingPlan` 提供可复现的逐 token 专家
-选择，用于 meta 捕获或特定分布回放；专家按 token 分组计算，不展开逐 pair
-权重。可选 shared expert、权重共享与 KV 浮点存储精度均实际生效。
+## 维护与来源
 
-推理语义适配层的 `build_schedule` 支持多个块、每轮接受数、零接受轮次和
-末块无后续消费者时省略 commit。未确定位置由 bool 状态动态压缩成每条请求
-自己的索引映射，不把前 U 个位置伪装成真实未确定位置。一个批次的形状与
-接受计数相同，异步请求调度不在本目录中实现。
+`models/block_diffusion` 必须**人工维护**以符合本规范，不能运行时导入 raw
+模型或工具 loader。修改 raw 语义时先审查并递增契约版本，再人工修改 native
+实现，执行同配置、同权重的 logits／loss／梯度／KV 对照及后端检查；只有
+对应证据通过后才能声明 native 对齐。纯格式或文件迁移不改变契约版本。
 
-`ParallelSpec` 只支持明确的 batch-sharded EP × TP：请求按完整 batch 行分给
-EP；attention heads、词表和所有 FFN intermediate 沿 TP 切分；专家沿 EP
-分配。dispatch/combine、TP 归约、词表采样归约及路由元数据分别记录。允许
-没有本地请求但仍接收专家任务的 rank。它不是原生 TorchTitan 并行支持矩阵；
-独立 ETP、CP、PP、FSDP 和 KV-head 复制未实现，会明确拒绝不支持的布局。
-
-## 训练
-
-`model.forward_training(input_ids, labels, spec=TrainingSpec(...), routing_plan=...)`
-执行可反向传播的完整窗口前向，不复用或 detach 推理 KV。`forward()` 本身仍是
-无梯度推理入口；仅调用 `model.train()` 不会切换到训练接口。
-
-```python
-import torch
-from model import BlockDiffusionModel, ModelConfig, TrainingSpec
-
-model = BlockDiffusionModel(ModelConfig())
-tokens = torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8]])
-labels = torch.full_like(tokens, -100)
-labels[:, -2:] = tokens[:, -2:]
-corrupted = tokens.clone()
-corrupted[:, -2:] = 0
-output = model.forward_training(corrupted, labels, spec=TrainingSpec(block_size=4))
-output.loss.backward()
-```
-
-`TrainingSpec` 提供两种精确 mask，要求序列长度为正的 block-size 整数倍：
-
-- `block_causal`：可以看到所有先前块与当前整个块。
-- `prefix_causal_canvas_bidirectional`：前缀内部逐 token causal，最后一个
-  canvas 对前缀和自身双向可见。
-
-标签与输入位置相同，不做 AR 的 next-token shift；由调用方将未监督位置设为
-`ignore_index`。loss 是 FP32 cross-entropy 求和除以有效标签数；没有有效标签时
-返回可微分的零值。`TrainingOutput` 同时保留 `loss_sum` 和 `valid_tokens`，
-跨 rank 的全局归一化由训练驱动负责。训练输出头计算整个窗口，不隐式减少
-ignored positions 的投影工作。
-
-`capture_training_step` 通过实际执行记录 forward、backward 和可选 AdamW，
-不会用“全部参数 FLOPs × 固定倍数”代替 MoE 的真实反向图。合成输入的 mask
-位置和路由是明确的固定回放；这不代表训练数据分布或模型收敛。AdamW 为实际
-执行的非 fused、非 foreach 单次更新，其超参数写入 JSON。零目标批次是否跳过
-optimizer 由训练驱动决定；选择 AdamW 时捕获器仍会执行该更新。
-
-捕获器显式使用 PyTorch SDPA math backend，包含它实际产生的 GQA 展开等操作。
-这些是参考分解，不等同于融合 NPU attention 的流量。输出包括张量身份、存储
-别名、stride、原地写入、已知矩阵 FLOPs、实际梯度与优化器状态容量。
-未建模算子的成本为 `null`，不是零。为保持身份稳定，捕获期间保留张量引用，
-因此不能从该执行的张量寿命推导正常运行的峰值显存。
-
-## 原始接口与 checkpoint 迁移
-
-本次更新将原始的 `BlockDiffusionArgs` / `RuntimeConfig` / `BlockDiffusionLM`
-及隐式 Zhanlu 注册改为显式 `ModelConfig` / `TrainingSpec` / `BlockDiffusionModel`。
-旧 Python 调用方需要迁移；本文件不会再自动注册 `MindIBlockDiffusion`。
-下游注册、kernel 转换及硬件参数应在各自后端适配层完成。
-
-state-dict key 也已更新。不要直接把旧 checkpoint 当成新格式加载：
-
-```python
-from legacy_state_dict import from_legacy_state_dict, to_legacy_state_dict
-
-reference_state = from_legacy_state_dict(old_raw_state)
-model.load_state_dict(reference_state, strict=True)
-native_adapter_input = to_legacy_state_dict(model.state_dict())
-```
-
-`native_adapter_input` 保持现有 `BlockDiffusionStateDictAdapter.from_hf()` 使用的
-`backbone.*`、stacked `w13/w2` 格式。原生训练模型和 adapter 的实现未变。
-转换保留张量值与 dtype，拒绝未知字段、残缺专家或无法表达的多个 shared
-experts；它不承诺任意公开 HF checkpoint、旧优化器状态或 DCP 元数据的兼容。
-
-## 验收与适用范围
-
-安装 PyTorch 和 pytest 后，从仓库根目录运行独立测试：
-
-```bash
-python -m pytest -q --import-mode=prepend \
-  --confcutdir=torchtitan_npu/simulator/raw_model/block_diff/tests \
-  torchtitan_npu/simulator/raw_model/block_diff/tests
-```
-
-这只隔离 raw 模型测试，不加载根测试配置中的 NPU 插件；它不是原生训练
-集成测试的替代品。执行证据见
-[`docs/test_guides/block_diffusion_raw_acceptance.md`](../../../../docs/test_guides/block_diffusion_raw_acceptance.md)。
-
-容量、逻辑 KV 读写、collective payload、实际 HBM 与链路流量分别计量。推理
-JSON 是有序语义事件；训练 JSON 是实际参考执行轨迹。两者都还需要目标后端
-算子映射和调度才能得到 NPU 时延。原生训练路径中的 `attention_compute_alpha`
-计算代理未移植到本模型，也不能用来缩放推理 KV 容量。
+历史来源是 `ZhanluModelSim/torchtitan-npu-simulator` 的
+[`feat/npu-simulator` raw 文件](https://github.com/ZhanluModelSim/torchtitan-npu-simulator/blob/2e988ab42d56c43c19c781eb8e9afc1f446693f4/torchtitan_npu/simulator/raw_model/block_diff/model.py)；
+本地参考已修正其状态、数值与统计语义，不承诺公开 checkpoint 的训练等价。
+遵循仓库 BSD 许可证。工具、迁移方式和执行命令见
+[功能指南](../../../../docs/feature_guides/block_diffusion.md)，证据见
+[参考验收记录](../../../../docs/test_guides/block_diffusion_raw_acceptance.md)。

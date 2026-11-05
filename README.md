@@ -61,6 +61,10 @@ pip install -e .
 快速启动大语言模型的训练任务，参见
 [快速上手文档](https://gitcode.com/cann/torchtitan-npu/blob/master/docs/user-guides/quickstart.md) 。
 
+Block Diffusion 的规范模型见 [raw 契约](torchtitan_npu/simulator/raw_model/block_diff/README.md)；
+独立训练／推理工具、native 人工维护约定及验收范围见
+[功能指南](docs/feature_guides/block_diffusion.md)。
+
 
 # 特性支持概览
 

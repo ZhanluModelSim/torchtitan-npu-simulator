@@ -9,7 +9,7 @@ import json
 
 import pytest
 import torch
-from model import BlockDiffusionModel, ModelConfig, RoutingPlan
+from raw_reference import BlockDiffusionModel, ModelConfig, RoutingPlan
 from workload import (
     ParallelSpec,
     PhaseSpec,

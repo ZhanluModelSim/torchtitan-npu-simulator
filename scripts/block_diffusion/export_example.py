@@ -6,7 +6,7 @@
 """Export a small multi-block inference workload as semantic JSON.
 
 Example (from the repository root):
-    python torchtitan_npu/simulator/raw_model/block_diff/export_example.py --tp 2 --ep 4 --output /tmp/block-diff.json
+    python scripts/block_diffusion/export_example.py --tp 2 --ep 4 --output /tmp/block-diff.json
 
 This schema requires a consumer mapping; it is not TorchTitan's native training IR.
 """
@@ -20,11 +20,11 @@ from typing import TYPE_CHECKING
 
 import torch
 
-if TYPE_CHECKING or __package__:
-    from .model import ModelConfig
-    from .workload import ParallelSpec, analyze_schedule, build_schedule
+if TYPE_CHECKING:
+    from scripts.block_diffusion.workload import ParallelSpec, analyze_schedule, build_schedule
+    from torchtitan_npu.simulator.raw_model.block_diff.model import ModelConfig
 else:
-    from model import ModelConfig
+    from raw_reference import ModelConfig
     from workload import ParallelSpec, analyze_schedule, build_schedule
 
 

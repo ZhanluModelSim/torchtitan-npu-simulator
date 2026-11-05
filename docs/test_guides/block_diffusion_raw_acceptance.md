@@ -8,14 +8,18 @@
 
 ## 范围与设计
 
-本次只更新 `torchtitan_npu/simulator/raw_model/block_diff` 和相关说明。
-原生 `models/block_diffusion`、converter、并行计划及已有 state-dict adapter
-没有改动。raw 核心保留单 rank 计算语义；推理并行描述和训练算子捕获位于
-独立文件。训练和推理共享同一组网络参数，不复制网络实现。
+本文先记录独立参考阶段的证据，再记录目录迁移。规范 raw 目录仅保留
+README.md 与 model.py；辅助脚本位于 `scripts/block_diffusion`，测试位于
+`tests/unit_tests/models/block_diffusion_reference`。raw 核心仍为单 rank，
+训练和推理共享网络参数。
+
+独立参考阶段没有修改 native；后续 native 对契约版本 1 的人工对齐已完成
+本轮训练范围的比较，详见 [native 对齐验收](block_diffusion_alignment.md)。
+下列原始 120 项结果不替代该比较及真实 NPU／分布式验收。
 
 原始 raw Python 接口及默认规模已更新，旧调用方需迁移。旧参数布局通过
-`legacy_state_dict.py` 显式转换，不自动猜测格式。详见
-[接口与迁移说明](../../torchtitan_npu/simulator/raw_model/block_diff/README.md)。
+`scripts/block_diffusion/legacy_state_dict.py` 显式转换，不自动猜测格式。详见
+[接口与迁移说明](../feature_guides/block_diffusion.md)。
 
 ## 独立测试
 
@@ -24,11 +28,14 @@
 
 ```bash
 python -B -m pytest -q --import-mode=prepend \
-  --confcutdir=torchtitan_npu/simulator/raw_model/block_diff/tests \
-  torchtitan_npu/simulator/raw_model/block_diff/tests
+  --confcutdir=tests/unit_tests/models/block_diffusion_reference \
+  tests/unit_tests/models/block_diffusion_reference
 ```
 
-结果：**120 passed in 3.71s**。
+独立参考阶段结果：**120 passed in 3.71s**。
+
+目录与 loader 迁移后，在相同隔离环境重跑上面命令：**120 passed in 3.64s**。
+迁移保持原测试内容，仅调整加载位置和导入；native 对照新增结果应单独记录。
 
 | 范围 | 测试数 | 关键证据 |
 | --- | ---: | --- |
@@ -45,10 +52,10 @@ python -B -m pytest -q --import-mode=prepend \
 ## 可执行导出示例
 
 ```bash
-python torchtitan_npu/simulator/raw_model/block_diff/example.py --device cpu --moe
-python torchtitan_npu/simulator/raw_model/block_diff/example.py --device meta --moe
-python torchtitan_npu/simulator/raw_model/block_diff/export_example.py --tp 2 --ep 4 --output /tmp/block-diff-inference.json
-python torchtitan_npu/simulator/raw_model/block_diff/training_workload.py --device meta --optimizer adamw --output /tmp/block-diff-training.json
+python scripts/block_diffusion/example.py --device cpu --moe
+python scripts/block_diffusion/example.py --device meta --moe
+python scripts/block_diffusion/export_example.py --tp 2 --ep 4 --output /tmp/block-diff-inference.json
+python scripts/block_diffusion/training_workload.py --device meta --optimizer adamw --output /tmp/block-diff-training.json
 ```
 
 - 推理示例：6 个阶段、每阶段 8 个 rank，总接受 token 数 16。
@@ -57,7 +64,7 @@ python torchtitan_npu/simulator/raw_model/block_diff/training_workload.py --devi
 - 训练数值参考显式使用 PyTorch SDPA math backend，矩阵 FLOPs 仅对观察到的
   mm/bmm/addmm 计算，其他算子的成本保留为未知。以上数值不是 NPU 性能估计。
 
-## Codecheck 与代码审查
+## 独立参考阶段的 Codecheck 与代码审查（历史证据）
 
 - Ruff 0.14.14：修改目录检查和格式检查通过。
 - Pyrefly 0.45.1：本次 6 个生产 Python 文件单独检查 **0 errors**。
@@ -81,6 +88,6 @@ native adapter 的 stacked 专家排列与显式 legacy 导出一致。
 - 真实 NPU 数值与性能、C4 收敛及相同 checkpoint 的 loss/grad-norm 对齐。
 - 独立 raw JSON 到原生模拟器 IR／调度图的端到端接入。
 
-因此提交保留为 Draft PR，供上游环境补齐检查。训练捕获会保留引用来稳定
+上述历史证据不替代单独的 native 对齐报告。训练捕获会保留引用来稳定
 张量身份，不可据其寿命计算峰值显存；推理 JSON 仍是语义事件描述。两个
 输出都不能直接视为已经校准的 HBM／互联流量或硬件时延结果。

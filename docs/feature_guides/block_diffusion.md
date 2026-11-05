@@ -1,156 +1,169 @@
-# Block Diffusion 模型契约与支持范围
+# Block Diffusion 契约、实现与工具
 
-本文记录 `block_diffusion` 原生 TorchTitan 模型的来源、结构和验收边界。
-接入流程与最终判定分别遵循[新模型接入开发流程](new_model_onboarding.md)和
-[新模型最终验收规范](../test_guides/model_acceptance.md)。
+Block Diffusion 的规范由
+[`raw_model/block_diff/README.md`](../../torchtitan_npu/simulator/raw_model/block_diff/README.md)
+和同目录的 [`model.py`](../../torchtitan_npu/simulator/raw_model/block_diff/model.py)
+定义，当前 `MODEL_CONTRACT_VERSION=1`。raw 目录只保留这两个文件。
 
-## 来源与基线
+`models/block_diffusion` 是独立维护的 TorchTitan 实现，必须人工遵循 raw 契约；
+运行时不得导入 raw 或工具 loader。工具与测试可以加载规范实现，用于回放、
+算子捕获和比较，不构成 native 的继承层或运行时适配层。
 
-- 结构来源：`torchtitan_npu/simulator/raw_model/block_diff/model.py`。
-- 接入基线：`feat/npu-simulator`，基线 commit `3eeed771d70b733f4f7eadd60ccd38bb77ac3aea`。
-- 原始文件没有声明公开 checkpoint、tokenizer 或可核对的参考仓库，因此当前
-  state-dict adapter 只承诺与该 raw workload 的参数 schema 双向闭环，不声明
-  与某个 Hugging Face checkpoint 数值兼容。
+历史 native 接入基线是 `feat/npu-simulator` 的
+`3eeed771d70b733f4f7eadd60ccd38bb77ac3aea`；本次参考重构从
+`feat/npu-simulator-local` 的 `4f200e8abd318a0a813061d9f3946e85dcbc2e03` 开始。
+原始 raw 文件的固定来源见规范 README。这些来源不构成公开 checkpoint 兼容声明。
 
-## 模型契约
+## 目录职责
 
-正式规格使用以下结构：
-
-| 项目 | 值 |
+| 位置 | 职责 |
 | --- | --- |
-| layers | 97 |
-| hidden size | 8192 |
-| query heads / KV heads | 64 / 8 |
-| head dim | 128 |
-| vocabulary | 262144 |
-| routed experts / top-k | 1024 / 8 |
-| routed expert intermediate | 4096 |
-| shared experts | 1 |
-| shared expert intermediate | 14336 |
-| training sequence | 4096 |
-| block size | 256 |
-| RoPE theta | 1000000 |
-| tied embedding | false |
+| `torchtitan_npu/simulator/raw_model/block_diff/` | 规范 README 和独立参考 model.py |
+| `torchtitan_npu/models/block_diffusion/` | 人工维护的 native 模型、配置、并行计划及权重适配 |
+| `scripts/block_diffusion/raw_reference.py` | 不触发 NPU 插件初始化的独立参考 loader |
+| `scripts/block_diffusion/workload.py` | 推理调度、分片、通信和采样的语义事件 |
+| `scripts/block_diffusion/training_workload.py` | 实际 CPU/meta 前向、反向和 AdamW 算子捕获 |
+| `scripts/block_diffusion/legacy_state_dict.py` | 旧 stacked-expert 权重格式的显式双向转换 |
+| `tests/unit_tests/models/block_diffusion_reference/` | 数值、状态、工作量及 raw/native 对照验收 |
 
-每层为 pre-norm GQA，加 top-k routed experts 和一个始终激活的 shared
-SwiGLU expert。`num_experts=0` 时切换为 dense SwiGLU，用于单独验证 dense
-路径。
+原始规模是 97 层、hidden 8192、64/8 query/KV heads、head dim 128、词表
+262144、1024 routed experts、top-8、routed intermediate 4096、一个宽度
+14336 的 shared expert。它是一个历史配置，不是范式的固定结构。规范支持
+不同规模、dense、可选 shared experts 和 tied embeddings；native 能覆盖哪些
+组合必须由配置校验和比较测试明确说明。
 
-训练数据使用固定长度滑动窗口，stride 等于 `block_size`。每个窗口的最后一个
-block 是当前 canvas，之前的 token 是已完成的 clean prefix。正式配置因此把
-4096 tokens 解释为 3840-token prefix 加 256-token canvas；每向前滑动 256
-tokens，初始 prefix 之后的下一个 block 成为训练目标。
+## 训练与推理的使用范围
 
-每条样本均匀采样 `[0.01, 1.0]` 的 mask ratio，在 canvas 中精确选择相应数量的
-位置并替换为 `mask_token_id`。label 与原 token 同位置对齐；prefix 和未被 mask
-的位置写为 `IGNORE_INDEX`，所以公共 sum-reduction cross-entropy 只在 masked
-positions 上计算，并按全局有效 label 数归一化。
+训练使用完整窗口的精确 `block_causal` 或
+`prefix_causal_canvas_bidirectional` mask、同位置 masked-token labels 和
+有效标签数归一化。推理通过 prefill／denoise／commit、逐层 KV 和显式输出位置
+表达工作量。精确条件、形状和精度规则以 raw README 为准。
 
-本接入的目标是计算量建模，不复现 block attention mask。CPU/reference 路径把整个
-`seq_len` 作为一条普通自回归序列，执行一次 causal SDPA；NPU converter 对应执行一次
-`npu_fusion_attention`，进入算子前将 BSND 仅作 metadata reshape 为三维 BSH，使用
-压缩 causal mask 和 `sparse_mode=2`，返回后恢复 BSND。这样 reduced 的 seq 256 不再
-拆成 192/64 两段。Simulator 不直接导出该融合节点，因为 Zhanlu 的
-`FlashAttentionPrediction` 当前无法从该节点建立有效输入 shape；它改为按每头批化的
-`matmul(Q,K^T) -> softmax -> matmul(P,V)` 导出，反向对应 4 个 matmul 和 1 个
-softmax backward，使下游使用已有 Matmul/Softmax cost model。
-真实 NPU 调用显式传入 `head_num`、`input_layout=BSH`、`scale`、`keep_prob`、
-`pre_tockens=INT_MAX`、`next_tockens=0`、`inner_precise=0`、`sparse_mode=2`、
-`gen_mask_parallel=true` 和 `sync=false`。模拟算子另外记录 `head_dim`、KV head 数、
-Q/KV sequence length，并同时保留 torch-npu 与成本模型常见的参数名别名，避免
-下游把 `[B,S,H]` 错解为 `[B,H,S]`。这些建模参数通过 L0 OpNode 顶层的
-`parameter_inputs` 专用通道导出；`attrs` 中保留同值仅用于仓库内兼容。
+Native 现在显式区分 `attention_mode="exact"` 与 `"compute_proxy"`。
+Exact 按 raw v1 的两种 mask 分段计算，使用无缩放 split-half RoPE、FP32 router
+和有效标签归一化；alpha 必须为 1。原来的 flavors 保留 compute-proxy 模式，
+其全长 causal 前向和缩放 ledger 不能当成 raw v1 的精确数值结果。
 
-配置项 `attention_compute_alpha` 只折算 Attention 的 QK/Softmax/PV FLOPs，不改变
-数值前向，也不折算 QKV/输出投影、MoE、Norm 或优化器计算。默认值按照原两段融合
-kernel 的 score-matrix 面积与全长 kernel 面积之比设定：
-`alpha=((S-B)^2+B*S)/S^2`。因此 debug/dense_debug 为 `0.75`，reduced 为
-`0.8125`，full 为 `0.94140625`。该值是可覆盖的计算建模参数，不是模型权重或训练
-超参数。Simulator 先按 causal AR 取平均有效 key 长度，再将 alpha 直接折入分解节点的
-key 维度；因此即使外部 Zhanlu 不读取自定义属性，Matmul/Softmax 的输入 shape 也已经
-体现折算。完整融合信息仍同时保存在每个子节点的 `attrs` 和 `parameter_inputs` 中。
+Exact 的 `block_causal` 为每块的 query 调用一次对完整已知前缀及当前块的
+双向 attention；`prefix_causal_canvas_bidirectional` 则是 causal prefix 加
+双向 canvas 两段。CPU attention、NPU converter 和 simulator shim 共享此
+native 分段定义。精确 ledger 保留各段真实 Q/KV 长度，GQA 反向显式记录
+query-head contributions 到 KV heads 的归约，布局转换与 matmul 分开。
 
-上述 corruption 和 loss 是根据 raw workload 的逐 block 生成语义补齐的训练
-契约。由于原始文件没有给出权威训练代码或 checkpoint，本接入不声明 mask-ratio
-分布、loss weighting 或梯度与某个外部实现数值等价。raw workload 中的多轮
-置信度提交、causal boundary pass 和跨 block KV cache 仍属于推理调度范围。
+| 路径或能力 | 验收范围 |
+| --- | --- |
+| 独立 raw CPU/meta 训练和推理 | 已有数值、梯度、状态与工作量测试；见参考验收记录 |
+| native exact 训练 logits／loss／全部参数梯度 | 已通过真实 TorchTitan 单 rank FP32 对照，覆盖 dense、一个 shared expert 的 MoE 与两种策略 |
+| native converter 保持两种精确 mask | CPU 硬件入口仿真及 native meta ledger 检查通过；未执行真实 NPU |
+| native 推理 KV／多轮去噪 | 尚未适配；raw 推理和独立工具的通过不代表 native 推理已实现 |
+| native exact + CP | 明确拒绝，尚未实现全局位置与分片所有权语义 |
+| TP／EP／ETP／CP／PP／FSDP 等 native 组合 | 各组合单独验证，不从参考单 rank 或代码注册推导通过 |
+| 原生 NPU 数值训练、性能和收敛 | 不由本页声明；需对应设备和训练证据 |
+| 独立 JSON 到 native simulator IR | 尚需后端映射和调度集成 |
+| 公开 Hugging Face checkpoint 数值兼容 | 未声明；历史来源未给出权威 checkpoint 契约 |
 
-## 参数量公式
+## Native 配置与计量
 
-记 vocabulary 为 `V`、hidden size 为 `D`、层数为 `L`、query/KV head 数为
-`H/K`、head dim 为 `A`、shared intermediate 为 `I`、expert 数为 `E`、
-routed intermediate 为 `M`。
+保留 `dense_debug`、`debug`、`reduced`、`full` 的 compute-proxy 行为；使用
+`dense_debug_exact`、`debug_exact`、`reduced_exact`、`full_exact` 选择 exact。
+新增的训练配置是 `block_diffusion_dense_exact_smoketest` 和
+`block_diffusion_exact_smoketest`。Exact dataloader 使用窗口内 `0..S-1`
+位置，旧 proxy 的 document-position 规则保持不变。
 
-```text
-embedding = V × D
-output = V × D                         # 未 tied
-final_norm = D
-attention_per_layer = 2 × D × A × (H + K)
-norm_per_layer = 2 × D
-router_per_layer = E × D
-routed_experts_per_layer = 3 × E × D × M
-shared_expert_per_layer = 3 × D × I
+手工调用 `make_block_diffusion_config` 时指定 `attention_mode="exact"`、
+`attention_compute_alpha=1.0` 及所需 `attention_policy`。不得用顶层开关把
+不一致的复杂 RoPE 配置静默变成 exact。Exact 禁止 raw v1 未定义的额外专家
+bias、路由重缩放、分组选择和辅助负载均衡策略；不支持项会报错。
 
-total_moe = embedding + output + final_norm
-          + L × (attention_per_layer + norm_per_layer
-                 + router_per_layer + routed_experts_per_layer
-                 + shared_expert_per_layer)
+框架 `get_nparams_and_flops` 返回的第二项已修正为 **每 token** 指标，使用
+活跃专家口径，并保留 tied output head 的计算。该指标沿用 TorchTitan 的
+dense-attention MFU 估算约定，不是 exact 分段 ledger，也不用于估计峰值
+显存或 NPU 时延。
 
-total_dense = embedding + output + final_norm
-            + L × (attention_per_layer + norm_per_layer + 3 × D × I)
+通用 MoE dispatch 的 gate helper 按 gate 权重 dtype 计算，支持 BF16 hidden
+与 FP32 router；CPU 外层 autocast 不再降低明确要求的 gate 精度。NPU 融合
+attention 的 noncausal 段使用完整可见范围，参数契约依据
+[TorchNPU 官方 API](https://www.hiascend.com/document/detail/en/Pytorch/2610/apiref/customapi/docs/en/custom_APIs/torch_npu/torch_npu-npu_fusion_attention.md)。
+
+## 独立工具
+
+从仓库根目录运行，不导入 `torchtitan_npu` 包，不需要原生 NPU 依赖：
+
+```bash
+python scripts/block_diffusion/example.py --device cpu --moe
+python scripts/block_diffusion/example.py --device meta --moe
+python scripts/block_diffusion/export_example.py --tp 2 --ep 4 --output /tmp/block-diff-inference.json
+python scripts/block_diffusion/training_workload.py --device meta --optimizer adamw --output /tmp/block-diff-training.json
 ```
 
-参数字节数使用参数实际 storage dtype 计算。RoPE cache 是非持久 buffer，不计入
-参数量。
+脚本和独立测试通过 `raw_reference` 加载真正的规范文件；同一 checkout 使用
+同一个 module cache，避免 dataclass 身份不一致。工具目录加入 `PYTHONPATH`
+后也可在 Python 中使用：
 
-## 配置规格
+```python
+from raw_reference import BlockDiffusionModel, ModelConfig, TrainingSpec
+from training_workload import capture_training_step
+```
 
-- `dense_debug`：两层 dense，seq 16 / block 8，小维度 CPU/meta 单测。
-- `debug`：两层、8 experts、top-2，seq 32 / block 16。
-- `reduced`：八层、32 experts、top-4，seq 256 / block 64。
-- `full`：97 层、1024 experts、top-8，seq 4096 / block 256。
+`workload.build_schedule` 支持多块、每轮接受数、零接受轮次和末块无后续消费者
+时省略 commit。未确定位置由 bool mask 动态压缩成逐请求位置映射。当前一个
+batch 的块长与每轮接受数一致；异步 serving 调度未实现。
 
-训练/模拟器配置名称为：
+推理 `ParallelSpec` 的单一布局是 batch-sharded EP × TP：EP 按完整 batch 行
+分配请求；attention heads、词表及 FFN intermediate 沿 TP 切分，专家沿 EP
+分配。dispatch／combine、TP 归约、词表采样归约和路由元数据分别记录。
+空请求 rank 仍可接收专家任务。这不是 native 支持矩阵；独立 ETP、CP、PP、
+FSDP 和 KV-head 复制不在该语义工具中实现。
 
-- `block_diffusion_dense_smoketest`
-- `block_diffusion_smoketest`
-- `block_diffusion_reduced`
-- `block_diffusion_baseline`
+训练捕获实际执行前向、反向和可选 AdamW，不使用固定反向倍数。捕获器显式
+选择 PyTorch SDPA math backend，记录其真实参考分解；这不等同于融合 NPU
+attention。已知 mm／bmm／addmm FLOPs、实际梯度和 lazy optimizer state 分别
+记录，未知算子成本为 null。捕获期间为稳定身份保留 tensor 引用，因此不能
+从其寿命推导峰值显存。合成 corruption／路由不代表真实数据分布或收敛。
 
-## 声明支持矩阵
+## 接口及权重迁移
 
-| 能力 | 状态 | 实现依据 |
-| --- | --- | --- |
-| sliding-window corruption | 支持 | 一个 canvas stride，最后 block 精确随机 mask |
-| masked-only same-position loss | 支持 | `IGNORE_INDEX` labels 和有效 token 归一化 |
-| full causal attention compute proxy | 支持 | 单次全长 SDPA/NPU 融合 attention，Attention FLOPs 按 alpha 折算 |
-| 精确 block attention mask 数值语义 | 不支持 | 计算量建模主动省略该 mask |
-| 单卡 meta 前向/反向 | 支持 | 原生 Module/ModelSpec 和 full causal SDPA |
-| TP / sequence parallel | 支持 | TorchTitan sparse decoder 公共计划 |
-| EP / ETP（分别启用） | 支持 | common MoE 的 ExpertParallel/ExpertTensorParallel |
-| EP > 1 与 ETP > 1 同时启用 | 不支持、fail fast | 当前公共 ExpertParallel 不能处理二维 expert mesh |
-| CP | 支持 | NPU Ulysses head/sequence all-to-all dispatcher |
-| FSDP/eFSDP | 支持 | sparse decoder 公共 fully_shard 计划 |
-| activation checkpoint | 支持 | 公共 sparse AC 计划 |
-| PP | 支持 | `pipeline_llm`，需在最终组合单独验收 |
-| NPU Attention/RMSNorm/RoPE/GMM/EP dispatch | 支持 | 全长 causal attention 专用 converter 和仓库通用 converter |
-| raw schema state-dict round trip | 支持 | `BlockDiffusionStateDictAdapter` |
-| 真实 NPU 数值训练 | 未声明 | 不属于 meta 模拟器验收范围 |
-| DLM 多轮生成和 KV cache | 不支持 | 本次实现训练范式，不含推理解码循环 |
-| 公开 HF checkpoint 数值兼容 | 不支持 | 原始实现未提供 checkpoint 契约 |
+原始 `BlockDiffusionArgs`／`RuntimeConfig`／`BlockDiffusionLM` 和隐式 Zhanlu
+注册已替换为规范中的显式接口。旧 Python 调用方需要迁移，不能依赖自动注册。
+旧工具路径也已迁移到 `scripts/block_diffusion`，raw 下不提供兼容转发脚本。
 
-上述“支持”表示已接入对应公共实现，最终能否标记为 Ready 仍以验收证据矩阵
-实际执行结果为准；任何未执行的组合不得仅根据代码路径宣称通过。
+旧 stacked `w13/w2` 与新参考 state-dict 的转换必须显式执行：
 
-本次执行记录、环境、命令和最终结论见
-[Block Diffusion 接入验收记录](../test_guides/block_diffusion_acceptance.md)。
+```python
+from legacy_state_dict import from_legacy_state_dict, to_legacy_state_dict
 
-## 独立 raw 训练与推理参考
+reference_state = from_legacy_state_dict(old_raw_state)
+model.load_state_dict(reference_state, strict=True)
+legacy_state = to_legacy_state_dict(model.state_dict())
+```
 
-`simulator/raw_model/block_diff` 现在提供共享网络的精确 mask 训练入口、带逐层
-KV 的推理入口，以及独立 CPU/meta 算子捕获。其 Python 接口已现代化，旧权重
-通过显式转换保持与本文件所述原始 schema 的互通。详见
-[raw workload 说明](../../torchtitan_npu/simulator/raw_model/block_diff/README.md)。
+转换保留值与 dtype，拒绝未知字段、残缺专家，以及旧格式无法表达的多个
+shared experts。它不是任意 HF checkpoint、优化器状态或 DCP 元数据的迁移器。
+是否可进一步加载到 native，必须经过对应 state-dict adapter 和严格比较验证。
 
-本节不改变上面的原生训练 `ModelSpec` 支持矩阵；独立 raw 路径的数值测试
-不代表其已通过 TorchTitan 分布式、真实 NPU 或下游模拟器集成验收。
+## 人工维护流程
+
+本范式在 `feat/npu-simulator-local` 维护；从 fork 的同名分支提交上游 PR，
+不另外创建 `fix/block-diff-*` 开发分支。
+
+1. 在 raw README 与 model.py 中明确拟修改的结构、mask、状态或精度语义。
+2. 语义变化递增 `MODEL_CONTRACT_VERSION`，先验证规范参考本身。
+3. 人工更新 native 模型、相关配置、state-dict adapter 与 converter；不得通过
+   导入 raw 或复用工具 loader 来规避独立实现。
+4. 同配置、同权重比较 logits、loss、参数梯度和适用的 KV 状态，再验证每个
+   声明支持的并行／后端组合。记录明确的不支持项，禁止静默降级为计算代理。
+5. 更新支持矩阵和执行证据；没有执行的检查保留为待验证。
+
+独立测试命令：
+
+```bash
+python -B -m pytest -q --import-mode=prepend \
+  --confcutdir=tests/unit_tests/models/block_diffusion_reference \
+  tests/unit_tests/models/block_diffusion_reference
+```
+
+参考证据见 [raw 验收记录](../test_guides/block_diffusion_raw_acceptance.md)和
+[native 对齐验收](../test_guides/block_diffusion_alignment.md)。
+[旧 native 接入记录](../test_guides/block_diffusion_acceptance.md) 保留为历史，
+不替代契约版本 1 的对照验收。新模型接入与最终判定仍遵循
+[开发流程](new_model_onboarding.md)及[验收规范](../test_guides/model_acceptance.md)。

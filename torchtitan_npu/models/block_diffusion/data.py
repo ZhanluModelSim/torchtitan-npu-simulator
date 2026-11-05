@@ -34,9 +34,7 @@ def corrupt_last_canvas(
     if tokens.ndim != 1:
         raise ValueError(f"tokens must be one-dimensional, got shape={tokens.shape}")
     if tokens.numel() < block_size or tokens.numel() % block_size != 0:
-        raise ValueError(
-            "token count must be a multiple of block_size and contain one canvas"
-        )
+        raise ValueError("token count must be a multiple of block_size and contain one canvas")
     if not 0.0 < min_mask_ratio <= max_mask_ratio <= 1.0:
         raise ValueError("mask ratios must satisfy 0 < min <= max <= 1")
 
@@ -68,18 +66,20 @@ class BlockDiffusionDataset(HuggingFaceTextDataset):
         corruption_seed: int,
         min_mask_ratio: float,
         max_mask_ratio: float,
+        position_policy: str = "document",
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
         if self.seq_len < block_size or self.seq_len % block_size != 0:
-            raise ValueError(
-                "seq_len must be a multiple of block_size and contain one canvas"
-            )
+            raise ValueError("seq_len must be a multiple of block_size and contain one canvas")
         if mask_token_id < 0:
             raise ValueError("mask_token_id must be non-negative")
         if not 0.0 < min_mask_ratio <= max_mask_ratio <= 1.0:
             raise ValueError("mask ratios must satisfy 0 < min <= max <= 1")
 
+        if position_policy not in ("document", "window"):
+            raise ValueError("position_policy must be document or window")
+        self.position_policy = position_policy
         self.block_size = block_size
         self.mask_token_id = mask_token_id
         self.min_mask_ratio = min_mask_ratio
@@ -96,9 +96,7 @@ class BlockDiffusionDataset(HuggingFaceTextDataset):
                     add_eos=True,
                 )
                 self._inputs_buffer.extend(sample_tokens)
-                self._positions_buffer.extend(
-                    index % self.seq_len for index in range(len(sample_tokens))
-                )
+                self._positions_buffer.extend(index % self.seq_len for index in range(len(sample_tokens)))
                 self._sample_idx += 1
 
                 while len(self._inputs_buffer) >= self.seq_len:
@@ -106,9 +104,10 @@ class BlockDiffusionDataset(HuggingFaceTextDataset):
                         self._inputs_buffer[: self.seq_len],
                         dtype=torch.long,
                     )
-                    positions = torch.tensor(
-                        self._positions_buffer[: self.seq_len],
-                        dtype=torch.long,
+                    positions = (
+                        torch.arange(self.seq_len, dtype=torch.long)
+                        if self.position_policy == "window"
+                        else torch.tensor(self._positions_buffer[: self.seq_len], dtype=torch.long)
                     )
                     corrupted, labels, _ = corrupt_last_canvas(
                         clean_tokens,
@@ -133,9 +132,12 @@ class BlockDiffusionDataset(HuggingFaceTextDataset):
             self._sample_idx = 0
             self._epoch += 1
             logger.warning(f"Dataset {self.dataset_name} is being re-looped")
-            if not isinstance(self._data, Dataset):
-                if hasattr(self._data, "set_epoch") and hasattr(self._data, "epoch"):
-                    self._data.set_epoch(self._data.epoch + 1)
+            if (
+                not isinstance(self._data, Dataset)
+                and hasattr(self._data, "set_epoch")
+                and hasattr(self._data, "epoch")
+            ):
+                self._data.set_epoch(self._data.epoch + 1)
 
     def state_dict(self):
         state = super().state_dict()
@@ -159,6 +161,7 @@ class BlockDiffusionDataLoader(ParallelAwareDataloader):
         corruption_seed: int = 42
         min_mask_ratio: float = 0.01
         max_mask_ratio: float = 1.0
+        position_policy: str = "document"
 
     def __init__(
         self,
@@ -185,6 +188,7 @@ class BlockDiffusionDataLoader(ParallelAwareDataloader):
             corruption_seed=config.corruption_seed + dp_rank,
             min_mask_ratio=config.min_mask_ratio,
             max_mask_ratio=config.max_mask_ratio,
+            position_policy=config.position_policy,
         )
         super().__init__(
             dataset,

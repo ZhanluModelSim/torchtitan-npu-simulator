@@ -7,7 +7,7 @@
 
 import pytest
 import torch
-from model import (
+from raw_reference import (
     BlockDiffusionModel,
     KVCache,
     LayerKV,
@@ -254,7 +254,7 @@ def test_replay_router_normalization_is_stable_for_low_probability_experts():
 @pytest.mark.parametrize("policy", ["causal", "bidirectional"])
 @torch.no_grad()
 def test_attention_matches_independent_gqa_rope_reference_with_prefix(policy):
-    from model import Attention
+    from raw_reference import Attention
 
     cfg = config()
     attention = Attention(cfg)

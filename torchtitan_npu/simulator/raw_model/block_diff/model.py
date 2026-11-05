@@ -42,6 +42,8 @@ from torch import nn
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
+MODEL_CONTRACT_VERSION = 1
+
 _FLOAT_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
 
 

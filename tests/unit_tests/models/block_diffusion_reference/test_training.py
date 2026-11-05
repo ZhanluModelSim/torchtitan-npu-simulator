@@ -8,7 +8,7 @@
 import pytest
 import torch
 import torch.nn.functional as F
-from model import (
+from raw_reference import (
     BlockDiffusionModel,
     ModelConfig,
     RoutingPlan,

@@ -13,13 +13,15 @@ metadata on every child node.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
+
 import torch
 import torch.nn as nn
 
 from torchtitan_npu.converters.convert_utils import replace_module_with_name
 from torchtitan_npu.converters.kernels.block_diffusion_attention import BlockDiffusionAttentionModelConfig
 from torchtitan_npu.converters.model_custom_interface import ModelCustomConverter
-from torchtitan_npu.models.block_diffusion.attention import ScaledCausalSDPA
+from torchtitan_npu.models.block_diffusion.attention import ScaledCausalSDPA, attention_segments
 from torchtitan_npu.simulator.capture.dispatch_capture import get_active_capture
 
 _original_converter: type | None = None
@@ -72,6 +74,60 @@ def _record(
         )
 
 
+def _heads_to_bsh(
+    heads: torch.Tensor,
+    module_path: str,
+    metadata: dict[str, int | float | str | bool],
+) -> torch.Tensor:
+    """Record real BHSD -> BSH layout transitions, retaining actual aliases."""
+    batch, num_heads, sequence, dim = heads.shape
+    capture = get_active_capture()
+    with capture.suspend_recording() if capture is not None else nullcontext():
+        transposed = heads.transpose(1, 2)
+        physical = transposed.reshape(batch, sequence, num_heads * dim)
+    transpose_metadata = {**metadata, "dim0": 1, "dim1": 2}
+    _record("aten.transpose.int", [heads], [transposed], module_path, transpose_metadata, transpose_metadata)
+    _record("aten.reshape.default", [transposed], [physical], module_path, metadata, metadata)
+    return physical
+
+
+def _per_head_to_bsh(
+    per_head: torch.Tensor,
+    batch: int,
+    num_heads: int,
+    module_path: str,
+    metadata: dict[str, int | float | str | bool],
+) -> torch.Tensor:
+    sequence, dim = per_head.shape[-2:]
+    capture = get_active_capture()
+    with capture.suspend_recording() if capture is not None else nullcontext():
+        heads = per_head.reshape(batch, num_heads, sequence, dim)
+    _record("aten.view.default", [per_head], [heads], module_path, metadata, metadata)
+    return _heads_to_bsh(heads, module_path, metadata)
+
+
+def _kv_gradient_to_bsh(
+    per_head: torch.Tensor,
+    batch: int,
+    query_heads: int,
+    kv_heads: int,
+    module_path: str,
+    metadata: dict[str, int | float | str | bool],
+) -> torch.Tensor:
+    """Reduce GQA contributions before converting physical KV gradients."""
+    if query_heads == kv_heads:
+        return _per_head_to_bsh(per_head, batch, kv_heads, module_path, metadata)
+    sequence, dim = per_head.shape[-2:]
+    capture = get_active_capture()
+    with capture.suspend_recording() if capture is not None else nullcontext():
+        grouped = per_head.reshape(batch, kv_heads, query_heads // kv_heads, sequence, dim)
+        reduced = grouped.sum(dim=2)
+    _record("aten.view.default", [per_head], [grouped], module_path, metadata, metadata)
+    reduction_metadata = {**metadata, "reduction_dim": 2, "reduction": "gqa_query_head_groups"}
+    _record("aten.sum.dim_IntList", [grouped], [reduced], module_path, reduction_metadata, reduction_metadata)
+    return _heads_to_bsh(reduced, module_path, metadata)
+
+
 def _fused_metadata(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -95,8 +151,8 @@ def _fused_metadata(
         "keep_prob": 1.0,
         "pre_tokens": _TORCH_MAX_INT,
         "pre_tockens": _TORCH_MAX_INT,
-        "next_tokens": 0,
-        "next_tockens": 0,
+        "next_tokens": 0 if sparse_mode == 2 else _TORCH_MAX_INT,
+        "next_tockens": 0 if sparse_mode == 2 else _TORCH_MAX_INT,
         "inner_precise": 0,
         "sparse_mode": int(sparse_mode),
         "is_causal": sparse_mode == 2,
@@ -123,6 +179,7 @@ class _SimFusionAttention(torch.autograd.Function):
         kv_head_num,
         head_dim,
         compute_alpha,
+        attention_mode,
         module_path,
     ):
         batch = q.shape[0]
@@ -133,19 +190,25 @@ class _SimFusionAttention(torch.autograd.Function):
         # Approximate causal AR work with half of the full key sequence.
         # Fold Block Diffusion's alpha into that effective key dimension so
         # downstream matmul/softmax models apply it even if they ignore attrs.
-        causal_key_seq = (k_seq + 1) // 2 if sparse_mode == 2 else k_seq
-        effective_key_seq = max(1, round(causal_key_seq * compute_alpha))
+        if attention_mode == "exact":
+            effective_key_seq = k_seq
+        else:
+            causal_key_seq = (k_seq + 1) // 2 if sparse_mode == 2 else k_seq
+            effective_key_seq = max(1, round(causal_key_seq * compute_alpha))
 
         q_per_head = _empty((bh, q_seq, head_dim), q)
         k_transposed = _empty((bh, head_dim, effective_key_seq), k)
         scores = _empty((bh, q_seq, effective_key_seq), q)
         probabilities = _empty_like(scores)
         v_per_head = _empty((bh, effective_key_seq, value_head_dim), v)
-        output = _empty_like(q)
-        metadata = _fused_metadata(
-            q, k, head_num, kv_head_num, head_dim, scale, sparse_mode, compute_alpha
-        )
+        output = _empty((bh, q_seq, value_head_dim), q) if attention_mode == "exact" else _empty_like(q)
+        metadata = _fused_metadata(q, k, head_num, kv_head_num, head_dim, scale, sparse_mode, compute_alpha)
         metadata["effective_kv_seq_len"] = effective_key_seq
+        metadata["attention_mode"] = attention_mode
+        metadata["visible_pairs_per_head"] = q_seq * (q_seq + 1) // 2 if sparse_mode == 2 else q_seq * k_seq
+        metadata["flop_shape_convention"] = (
+            "physical_dense_segment" if attention_mode == "exact" else "scaled_compute_proxy"
+        )
 
         _record(
             "aten.matmul.default",
@@ -167,6 +230,9 @@ class _SimFusionAttention(torch.autograd.Function):
             [v],
         )
 
+        if attention_mode == "exact":
+            output = _per_head_to_bsh(output, batch, head_num, module_path, metadata)
+
         ctx.save_for_backward(q, k, v)
         ctx.module_path = module_path
         ctx.fused_metadata = metadata
@@ -174,6 +240,7 @@ class _SimFusionAttention(torch.autograd.Function):
         ctx.kv_head_num = kv_head_num
         ctx.head_dim = head_dim
         ctx.effective_key_seq = effective_key_seq
+        ctx.attention_mode = attention_mode
         return output
 
     @staticmethod
@@ -196,18 +263,30 @@ class _SimFusionAttention(torch.autograd.Function):
         grad_scores_t = _empty((bh, effective_key_seq, q_seq), q)
         k_per_head = _empty((bh, effective_key_seq, ctx.head_dim), k)
         q_per_head = _empty((bh, q_seq, ctx.head_dim), q)
-        metadata = ctx.fused_metadata
+        metadata: dict[str, int | float | str | bool] = ctx.fused_metadata
+
+        # Exact GQA computes one dK/dV contribution per QUERY head, then
+        # reduces the groups sharing a KV head. Returning the smaller physical
+        # KV gradient directly as a matmul output would undercount its FLOPs.
+        exact = ctx.attention_mode == "exact"
+        grad_v_matmul = _empty((bh, effective_key_seq, value_head_dim), v) if exact else grads[2]
+        grad_k_matmul = _empty((bh, effective_key_seq, ctx.head_dim), k) if exact else grads[1]
+        grad_q_matmul = _empty((bh, q_seq, ctx.head_dim), q) if exact else grads[0]
 
         # dV = P^T @ dO
         _record(
             "aten.matmul.default",
             [probabilities_t, grad_output_per_head],
-            [grads[2]],
+            [grad_v_matmul],
             ctx.module_path,
             metadata,
             metadata,
             [q, k, v, grad_output],
         )
+        if exact:
+            grads[2] = _kv_gradient_to_bsh(
+                grad_v_matmul, batch, ctx.head_num, ctx.kv_head_num, ctx.module_path, metadata
+            )
         # dP = dO @ V^T
         _record(
             "aten.matmul.default",
@@ -230,23 +309,29 @@ class _SimFusionAttention(torch.autograd.Function):
         _record(
             "aten.matmul.default",
             [grad_scores, k_per_head],
-            [grads[0]],
+            [grad_q_matmul],
             ctx.module_path,
             metadata,
             metadata,
             [k],
         )
+        if exact:
+            grads[0] = _per_head_to_bsh(grad_q_matmul, batch, ctx.head_num, ctx.module_path, metadata)
         # dK = dS^T @ Q
         _record(
             "aten.matmul.default",
             [grad_scores_t, q_per_head],
-            [grads[1]],
+            [grad_k_matmul],
             ctx.module_path,
             metadata,
             metadata,
             [grad_scores, q],
         )
-        return *grads, None, None, None, None, None, None, None
+        if exact:
+            grads[1] = _kv_gradient_to_bsh(
+                grad_k_matmul, batch, ctx.head_num, ctx.kv_head_num, ctx.module_path, metadata
+            )
+        return *grads, None, None, None, None, None, None, None, None
 
 
 class SimBlockDiffusionAttention(ScaledCausalSDPA):
@@ -272,6 +357,7 @@ class SimBlockDiffusionAttention(ScaledCausalSDPA):
             k.shape[2],
             q.shape[-1],
             self.compute_alpha,
+            self.attention_mode,
             _module_path(),
         )
         return output.reshape(batch_size, query_len, query_heads, value_dim)
@@ -295,16 +381,32 @@ class SimBlockDiffusionAttention(ScaledCausalSDPA):
         if enable_gqa and q.shape[2] % k.shape[2] != 0:
             raise ValueError("query heads must be divisible by key/value heads for GQA")
 
-        return self._fused_attention(q, k, v, scale=scale, causal=True)
+        if self.attention_mode == "compute_proxy":
+            return self._fused_attention(q, k, v, scale=scale, causal=True)
+        segments = attention_segments(
+            q.shape[1],
+            attention_mode=self.attention_mode,
+            attention_policy=self.attention_policy,
+            block_size=self.block_size,
+        )
+        outputs = [
+            self._fused_attention(
+                q[:, start:end],
+                k[:, :key_end],
+                v[:, :key_end],
+                scale=scale,
+                causal=causal,
+            )
+            for start, end, key_end, causal in segments
+        ]
+        return outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=1)
 
 
 class SimBlockDiffusionAttentionConverter(ModelCustomConverter):
     def convert(self, model: nn.Module) -> None:
         for name, module in list(model.named_modules()):
             if name and type(module) is ScaledCausalSDPA:
-                replacement = SimBlockDiffusionAttention(
-                    ScaledCausalSDPA.Config(compute_alpha=module.compute_alpha)
-                )
+                replacement = SimBlockDiffusionAttention(module.converter_config())
                 replace_module_with_name(model, name, replacement)
 
 

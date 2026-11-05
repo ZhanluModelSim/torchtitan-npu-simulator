@@ -1,5 +1,9 @@
 # Block Diffusion 接入验收记录
 
+> 历史记录：下文包含旧 full-causal／alpha 计算代理的接入验收，不是 raw
+> 契约版本 1 的精确 mask 数值对齐证据。当前规范与人工维护要求见
+> [功能指南](../feature_guides/block_diffusion.md)；新版比较结果需独立验证。
+
 本文按[新模型最终验收规范](model_acceptance.md)记录 `block_diffusion` 的可复现
 证据。验收对象包含 full-causal Attention 计算代理、sliding-window corruption、
 masked-only loss 和 simulator 的结构级/meta 训练接入；没有外推到原始 workload

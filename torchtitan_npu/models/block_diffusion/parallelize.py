@@ -5,9 +5,14 @@
 
 """Distributed plans for the Block Diffusion model."""
 
+from typing import TYPE_CHECKING, cast
+
 import torchtitan.models.llama4.parallelize as llama4_parallelize
 
 from .model import BlockDiffusionModel
+
+if TYPE_CHECKING:
+    from torchtitan.models.llama4.model import Llama4Model
 
 
 def parallelize_block_diffusion(
@@ -29,6 +34,11 @@ def parallelize_block_diffusion(
     branch instead of copying a stale parallel implementation.
     """
 
+    config = model.config
+    assert isinstance(config, BlockDiffusionModel.Config)
+    if config.attention_mode == "exact" and parallel_dims.cp_enabled:
+        raise ValueError("exact block attention does not yet support context parallelism")
+
     original_cp_applier = llama4_parallelize.apply_cp_to_attention_module
     if parallel_dims.cp_enabled:
         # The upstream SDPA context-parallel dispatcher duplicates the last
@@ -39,13 +49,12 @@ def parallelize_block_diffusion(
             apply_cp_to_attention_module,
         )
 
-        llama4_parallelize.apply_cp_to_attention_module = (
-            apply_cp_to_attention_module
-        )
+        llama4_parallelize.apply_cp_to_attention_module = apply_cp_to_attention_module
 
     try:
         return llama4_parallelize.parallelize_llama(
-            model,
+            # The existing plan uses the shared sparse-decoder module contract.
+            cast("Llama4Model", model),
             parallel_dims=parallel_dims,
             training=training,
             model_converters=model_converters,

@@ -11,7 +11,7 @@ import math
 import pytest
 import torch
 import training_workload
-from model import BlockDiffusionModel, ModelConfig, TrainingSpec
+from raw_reference import BlockDiffusionModel, ModelConfig, TrainingSpec
 from training_workload import capture_training_step
 
 

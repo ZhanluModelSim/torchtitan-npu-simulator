@@ -9,7 +9,6 @@ from collections.abc import Callable
 from functools import partial
 
 from torch import nn
-
 from torchtitan.components.loss import build_cross_entropy_loss
 from torchtitan.components.optimizer import register_moe_load_balancing_hook
 from torchtitan.distributed.pipeline_parallel import pipeline_llm
@@ -55,6 +54,9 @@ def _build_layers(
     moe_intermediate_size: int,
     num_experts_per_tok: int,
     attention_compute_alpha: float,
+    attention_mode: str,
+    attention_policy: str,
+    block_size: int,
     use_grouped_mm: bool,
 ) -> list[BlockDiffusionTransformerBlock.Config]:
     layers = []
@@ -66,9 +68,14 @@ def _build_layers(
             head_dim=head_dim,
             wqkv_param_init=_LINEAR_INIT,
             wo_param_init=_LINEAR_INIT,
-            inner_attention=ScaledCausalSDPA.Config(compute_alpha=attention_compute_alpha),
+            inner_attention=ScaledCausalSDPA.Config(
+                compute_alpha=attention_compute_alpha,
+                attention_mode=attention_mode,
+                attention_policy=attention_policy,
+                block_size=block_size,
+            ),
             mask_type="causal",
-            rope_backend="complex",
+            rope_backend="cos_sin" if attention_mode == "exact" else "complex",
         )
         dense_ffn = None
         moe = None
@@ -109,7 +116,8 @@ def _build_layers(
                 ),
                 shared_experts=shared_expert,
                 score_before_experts=False,
-                load_balance_coeff=1e-3,
+                load_balance_coeff=None if attention_mode == "exact" else 1e-3,
+                exact_routing=attention_mode == "exact",
             )
 
         layers.append(
@@ -151,6 +159,8 @@ def make_block_diffusion_config(
     max_denoise_steps: int = 48,
     enable_weight_tying: bool = False,
     use_grouped_mm: bool = True,
+    attention_mode: str = "compute_proxy",
+    attention_policy: str = "block_causal",
 ) -> BlockDiffusionModel.Config:
     return BlockDiffusionModel.Config(
         vocab_size=vocab_size,
@@ -165,6 +175,9 @@ def make_block_diffusion_config(
         num_experts_per_tok=num_experts_per_tok,
         block_size=block_size,
         attention_compute_alpha=attention_compute_alpha,
+        attention_mode=attention_mode,
+        attention_policy=attention_policy,
+        raw_contract_version=1,
         mask_token_id=mask_token_id,
         max_denoise_steps=max_denoise_steps,
         enable_weight_tying=enable_weight_tying,
@@ -188,8 +201,8 @@ def make_block_diffusion_config(
             dim=head_dim,
             max_seq_len=max_seq_len,
             theta=1_000_000.0,
-            backend="complex",
-            scaling="llama",
+            backend="cos_sin" if attention_mode == "exact" else "complex",
+            scaling="none" if attention_mode == "exact" else "llama",
         ),
         layers=_build_layers(
             n_layers=n_layers,
@@ -202,12 +215,15 @@ def make_block_diffusion_config(
             moe_intermediate_size=moe_intermediate_size,
             num_experts_per_tok=num_experts_per_tok,
             attention_compute_alpha=attention_compute_alpha,
+            attention_mode=attention_mode,
+            attention_policy=attention_policy,
+            block_size=block_size,
             use_grouped_mm=use_grouped_mm,
         ),
     )
 
 
-def _debug_model() -> BlockDiffusionModel.Config:
+def _debug_model(*, attention_mode: str = "compute_proxy") -> BlockDiffusionModel.Config:
     return make_block_diffusion_config(
         vocab_size=2048,
         dim=128,
@@ -220,14 +236,15 @@ def _debug_model() -> BlockDiffusionModel.Config:
         moe_intermediate_size=128,
         num_experts_per_tok=2,
         block_size=16,
-        attention_compute_alpha=0.75,
+        attention_compute_alpha=1.0 if attention_mode == "exact" else 0.75,
+        attention_mode=attention_mode,
         mask_token_id=100,
         max_seq_len=512,
         use_grouped_mm=False,
     )
 
 
-def _dense_debug_model() -> BlockDiffusionModel.Config:
+def _dense_debug_model(*, attention_mode: str = "compute_proxy") -> BlockDiffusionModel.Config:
     return make_block_diffusion_config(
         vocab_size=256,
         dim=64,
@@ -240,14 +257,15 @@ def _dense_debug_model() -> BlockDiffusionModel.Config:
         moe_intermediate_size=0,
         num_experts_per_tok=1,
         block_size=8,
-        attention_compute_alpha=0.75,
+        attention_compute_alpha=1.0 if attention_mode == "exact" else 0.75,
+        attention_mode=attention_mode,
         mask_token_id=100,
         max_seq_len=256,
         use_grouped_mm=False,
     )
 
 
-def _reduced_model() -> BlockDiffusionModel.Config:
+def _reduced_model(*, attention_mode: str = "compute_proxy") -> BlockDiffusionModel.Config:
     return make_block_diffusion_config(
         vocab_size=8192,
         dim=1024,
@@ -260,13 +278,14 @@ def _reduced_model() -> BlockDiffusionModel.Config:
         moe_intermediate_size=512,
         num_experts_per_tok=4,
         block_size=64,
-        attention_compute_alpha=0.8125,
+        attention_compute_alpha=1.0 if attention_mode == "exact" else 0.8125,
+        attention_mode=attention_mode,
         mask_token_id=100,
         max_seq_len=4096,
     )
 
 
-def _full_model() -> BlockDiffusionModel.Config:
+def _full_model(*, attention_mode: str = "compute_proxy") -> BlockDiffusionModel.Config:
     return make_block_diffusion_config(
         vocab_size=262144,
         dim=8192,
@@ -279,7 +298,8 @@ def _full_model() -> BlockDiffusionModel.Config:
         moe_intermediate_size=4096,
         num_experts_per_tok=8,
         block_size=256,
-        attention_compute_alpha=0.94140625,
+        attention_compute_alpha=1.0 if attention_mode == "exact" else 0.94140625,
+        attention_mode=attention_mode,
         mask_token_id=100,
         max_seq_len=262144,
     )
@@ -290,15 +310,16 @@ block_diffusion_configs = {
     "dense_debug": _dense_debug_model,
     "reduced": _reduced_model,
     "full": _full_model,
+    "dense_debug_exact": partial(_dense_debug_model, attention_mode="exact"),
+    "debug_exact": partial(_debug_model, attention_mode="exact"),
+    "reduced_exact": partial(_reduced_model, attention_mode="exact"),
+    "full_exact": partial(_full_model, attention_mode="exact"),
 }
 
 
 def model_registry(flavor: str) -> ModelSpec:
     if flavor not in block_diffusion_configs:
-        raise ValueError(
-            f"Unknown Block Diffusion flavor {flavor!r}; "
-            f"available: {sorted(block_diffusion_configs)}"
-        )
+        raise ValueError(f"Unknown Block Diffusion flavor {flavor!r}; available: {sorted(block_diffusion_configs)}")
     return ModelSpec(
         name="block_diffusion",
         flavor=flavor,

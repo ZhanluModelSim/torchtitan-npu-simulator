@@ -6,8 +6,8 @@
 """Replay a small two-block workload without external simulator dependencies.
 
 Run from the repository root:
-    python torchtitan_npu/simulator/raw_model/block_diff/example.py --device cpu
-    python torchtitan_npu/simulator/raw_model/block_diff/example.py --device meta --moe
+    python scripts/block_diffusion/example.py --device cpu
+    python scripts/block_diffusion/example.py --device meta --moe
 
 The reveal order is supplied by this example, not inferred from model quality.
 """
@@ -20,10 +20,15 @@ from typing import TYPE_CHECKING
 
 import torch
 
-if TYPE_CHECKING or __package__:
-    from .model import BlockDiffusionModel, KVCache, ModelConfig, RoutingPlan
+if TYPE_CHECKING:
+    from torchtitan_npu.simulator.raw_model.block_diff.model import (
+        BlockDiffusionModel,
+        KVCache,
+        ModelConfig,
+        RoutingPlan,
+    )
 else:
-    from model import BlockDiffusionModel, KVCache, ModelConfig, RoutingPlan
+    from raw_reference import BlockDiffusionModel, KVCache, ModelConfig, RoutingPlan
 
 
 def replay(device: str = "cpu", moe: bool = False) -> dict:

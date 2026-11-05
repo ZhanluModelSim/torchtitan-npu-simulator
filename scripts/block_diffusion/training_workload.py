@@ -30,10 +30,15 @@ import torch
 from torch.nn.attention import SDPBackend, sdpa_kernel
 from torch.utils._python_dispatch import TorchDispatchMode
 
-if TYPE_CHECKING or __package__:
-    from .model import BlockDiffusionModel, ModelConfig, RoutingPlan, TrainingSpec
+if TYPE_CHECKING:
+    from torchtitan_npu.simulator.raw_model.block_diff.model import (
+        BlockDiffusionModel,
+        ModelConfig,
+        RoutingPlan,
+        TrainingSpec,
+    )
 else:
-    from model import BlockDiffusionModel, ModelConfig, RoutingPlan, TrainingSpec
+    from raw_reference import BlockDiffusionModel, ModelConfig, RoutingPlan, TrainingSpec
 
 
 def _serialize(value: Any) -> Any:

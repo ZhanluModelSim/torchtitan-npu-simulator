@@ -31,10 +31,10 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-if TYPE_CHECKING or __package__:
-    from .model import ModelConfig, RoutingPlan
+if TYPE_CHECKING:
+    from torchtitan_npu.simulator.raw_model.block_diff.model import ModelConfig, RoutingPlan
 else:  # Direct execution/import with this directory on sys.path.
-    from model import ModelConfig, RoutingPlan
+    from raw_reference import ModelConfig, RoutingPlan
 
 
 def _integer(name: str, value: int, minimum: int = 0) -> None:

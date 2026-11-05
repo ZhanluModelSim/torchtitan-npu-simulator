@@ -5,9 +5,17 @@
 
 """Training recipes for the native Block Diffusion model."""
 
+from typing import Literal
+
 from torchtitan.components.lr_scheduler import LRSchedulersContainer
 from torchtitan.components.metrics import MetricsProcessor
 from torchtitan.components.validate import Validator
+from torchtitan.config import (
+    ActivationCheckpointConfig,
+    CommConfig,
+    CompileConfig,
+    DebugConfig,
+)
 from torchtitan.protocols.model_converter import ModelConvertersContainer
 
 from torchtitan_npu.config.configs import (
@@ -20,15 +28,9 @@ from torchtitan_npu.config.configs import (
 )
 from torchtitan_npu.converters import get_model_converter_config
 
-from torchtitan.config import (
-    ActivationCheckpointConfig,
-    CommConfig,
-    CompileConfig,
-    DebugConfig,
-)
-
 from . import model_registry
 from .data import BlockDiffusionDataLoader
+from .model import BlockDiffusionModel
 
 
 def _converters() -> list:
@@ -67,14 +69,16 @@ def _trainer_config(
     seq_len: int,
     steps: int,
     parallelism: ParallelismConfig,
-    ac_mode: str,
+    ac_mode: Literal["full", "memory_budget", "none", "selective"],
 ) -> TrainerConfig:
     model_spec = model_registry(flavor)
     model_config = model_spec.model
+    assert isinstance(model_config, BlockDiffusionModel.Config)
     train_dataloader = BlockDiffusionDataLoader.Config(
         dataset="c4_test",
         block_size=model_config.block_size,
         mask_token_id=model_config.mask_token_id,
+        position_policy="window" if model_config.attention_mode == "exact" else "document",
     )
     validation_dataloader = BlockDiffusionDataLoader.Config(
         dataset="c4_validation",
@@ -82,6 +86,7 @@ def _trainer_config(
         block_size=model_config.block_size,
         mask_token_id=model_config.mask_token_id,
         corruption_seed=43,
+        position_policy="window" if model_config.attention_mode == "exact" else "document",
     )
     return TrainerConfig(
         hf_assets_path="./tests/assets/tokenizer/deepseekv3_tokenizer",
@@ -158,4 +163,26 @@ def block_diffusion_baseline() -> TrainerConfig:
         steps=2000,
         parallelism=_parallelism(dp_shard=64, tp=8, ep=512),
         ac_mode="full",
+    )
+
+
+def block_diffusion_exact_smoketest() -> TrainerConfig:
+    """Exact block-causal MoE with window positions and no auxiliary router bias."""
+    return _trainer_config(
+        flavor="debug_exact",
+        seq_len=32,
+        steps=2,
+        parallelism=_parallelism(),
+        ac_mode="none",
+    )
+
+
+def block_diffusion_dense_exact_smoketest() -> TrainerConfig:
+    """Exact block-causal dense counterpart for raw-contract alignment."""
+    return _trainer_config(
+        flavor="dense_debug_exact",
+        seq_len=16,
+        steps=2,
+        parallelism=_parallelism(),
+        ac_mode="none",
     )

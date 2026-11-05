@@ -11,7 +11,6 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 from torch.distributed.tensor import DTensor
-
 from torchtitan.models.common import moe as common_moe
 from torchtitan.protocols.module import Module
 
@@ -30,11 +29,32 @@ def _expert_histogram(indices: torch.Tensor, num_experts: int) -> torch.Tensor:
 class BlockDiffusionRouter(common_moe.TokenChoiceTopKRouter):
     """Token-choice router with a PyTorch-2.12-compatible histogram."""
 
+    exact_routing: bool = False
+
+    def _apply(self, fn, recurse=True):
+        result = super()._apply(fn, recurse=recurse)
+        if getattr(self, "exact_routing", False):
+            self.gate.float()
+        return result
+
     def forward(
         self,
         x: torch.Tensor,
         expert_bias: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if getattr(self, "exact_routing", False):
+            if expert_bias is not None or self.num_expert_groups is not None:
+                raise ValueError("raw exact routing does not support expert bias or grouped selection")
+            context = (
+                nullcontext() if x.device.type == "meta" else torch.autocast(device_type=x.device.type, enabled=False)
+            )
+            with context:
+                logits = self.gate(x.float())
+            _, selected = logits.topk(self.top_k, dim=-1)
+            if self._debug_force_load_balance:
+                selected, _ = self._debug_force_load_balance_routing(logits)
+            top_scores = F.softmax(logits.gather(1, selected), dim=-1)
+            return top_scores, selected, _expert_histogram(selected, self.num_experts)
         autocast = (
             nullcontext()
             if x.device.type in {"cpu", "meta"}
@@ -52,9 +72,7 @@ class BlockDiffusionRouter(common_moe.TokenChoiceTopKRouter):
 
         scores_for_choice = scores if expert_bias is None else scores + expert_bias
         if self.num_expert_groups is not None:
-            scores_for_choice = self._get_node_limited_routing_scores(
-                scores_for_choice
-            )
+            scores_for_choice = self._get_node_limited_routing_scores(scores_for_choice)
         _, selected_experts_indices = torch.topk(
             scores_for_choice,
             k=self.top_k,
@@ -63,9 +81,7 @@ class BlockDiffusionRouter(common_moe.TokenChoiceTopKRouter):
         )
         top_scores = scores.gather(dim=1, index=selected_experts_indices)
         if self._debug_force_load_balance:
-            selected_experts_indices, top_scores = (
-                self._debug_force_load_balance_routing(scores)
-            )
+            selected_experts_indices, top_scores = self._debug_force_load_balance_routing(scores)
         if self.route_norm:
             top_scores = top_scores / (top_scores.sum(dim=-1, keepdim=True) + 1e-20)
         top_scores = top_scores * self.route_scale
@@ -110,6 +126,8 @@ class BlockDiffusionGroupedExperts(common_moe.GroupedExperts):
             return super().forward(x, num_tokens_per_expert)
 
         if isinstance(self.w1, DTensor):
+            if not isinstance(self.w2, DTensor) or not isinstance(self.w3, DTensor):
+                raise ValueError("expert projections must use the same distributed tensor representation")
             w1 = self.w1.to_local()
             w2 = self.w2.to_local()
             w3 = self.w3.to_local()
@@ -131,11 +149,15 @@ class BlockDiffusionMoE(common_moe.MoE):
 
     @dataclass(kw_only=True, slots=True)
     class Config(common_moe.MoE.Config):
-        pass
+        exact_routing: bool = False
 
     def __init__(self, config: Config):
         super().__init__(config)
-        self.router = BlockDiffusionRouter(config.router)
+        router = BlockDiffusionRouter(config.router)
+        router.exact_routing = config.exact_routing
+        self.router = router
+        if config.exact_routing:
+            self.router.gate.float()
         self.reorderer = BlockDiffusionTokenReorderer(
             num_experts=config.num_experts,
             top_k=config.router.top_k,

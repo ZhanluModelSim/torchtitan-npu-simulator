@@ -3,7 +3,12 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Full-sequence causal fused attention for Block Diffusion simulation."""
+"""Ascend fused-attention converter for exact visibility and legacy proxy.
+
+Replaces native ScaledCausalSDPA with torch_npu fusion attention on Ascend.
+Exact mode uses the same rectangular segment decomposition as the CPU model;
+real NPU numerical parity requires hardware validation.
+"""
 
 from __future__ import annotations
 
@@ -16,7 +21,7 @@ import torch_npu
 from torchtitan_npu.converters.convert_utils import replace_module_with_name
 from torchtitan_npu.converters.model_custom_interface import ModelCustomConfig, ModelCustomConverter
 from torchtitan_npu.converters.registry import register_model_converter
-from torchtitan_npu.models.block_diffusion.attention import ScaledCausalSDPA
+from torchtitan_npu.models.block_diffusion.attention import ScaledCausalSDPA, attention_segments
 
 _COMPRESSED_CAUSAL_MASK_SIZE = 2048
 _TORCH_MAX_INT = 2_147_483_647
@@ -41,10 +46,10 @@ def _compressed_causal_mask(device: torch.device) -> torch.Tensor:
 
 
 class NPUBlockDiffusionAttention(ScaledCausalSDPA):
-    """Execute one full-sequence causal NPU fused-attention kernel."""
+    """Execute the selected native visibility with Ascend fused attention."""
 
     def __init__(self, parent: ScaledCausalSDPA, causal_mask: torch.Tensor) -> None:
-        super().__init__(ScaledCausalSDPA.Config(compute_alpha=parent.compute_alpha))
+        super().__init__(parent.converter_config())
         self.register_buffer("causal_mask", causal_mask, persistent=False)
 
     @staticmethod
@@ -103,7 +108,25 @@ class NPUBlockDiffusionAttention(ScaledCausalSDPA):
         if enable_gqa and q.shape[2] % k.shape[2] != 0:
             raise ValueError("query heads must be divisible by key/value heads for GQA")
 
-        return self._fused_attention(q, k, v, scale=scale, causal=True)
+        if self.attention_mode == "compute_proxy":
+            return self._fused_attention(q, k, v, scale=scale, causal=True)
+        segments = attention_segments(
+            q.shape[1],
+            attention_mode=self.attention_mode,
+            attention_policy=self.attention_policy,
+            block_size=self.block_size,
+        )
+        outputs = [
+            self._fused_attention(
+                q[:, start:end],
+                k[:, :key_end],
+                v[:, :key_end],
+                scale=scale,
+                causal=causal,
+            )
+            for start, end, key_end, causal in segments
+        ]
+        return outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=1)
 
 
 class _NPUFusionAttention(torch.autograd.Function):
@@ -112,23 +135,21 @@ class _NPUFusionAttention(torch.autograd.Function):
     @staticmethod
     # pyrefly: ignore [bad-override]
     def forward(ctx, q, k, v, atten_mask, scale, sparse_mode, head_num):
-        attention, softmax_max, softmax_sum, _softmax_out, seed, offset, numels = (
-            torch_npu.npu_fusion_attention(
-                q,
-                k,
-                v,
-                head_num=head_num,
-                input_layout="BSH",
-                atten_mask=atten_mask,
-                scale=scale,
-                keep_prob=1.0,
-                pre_tockens=_TORCH_MAX_INT,
-                next_tockens=0,
-                inner_precise=0,
-                sparse_mode=sparse_mode,
-                gen_mask_parallel=True,
-                sync=False,
-            )
+        attention, softmax_max, softmax_sum, _softmax_out, seed, offset, numels = torch_npu.npu_fusion_attention(
+            q,
+            k,
+            v,
+            head_num=head_num,
+            input_layout="BSH",
+            atten_mask=atten_mask,
+            scale=scale,
+            keep_prob=1.0,
+            pre_tockens=_TORCH_MAX_INT,
+            next_tockens=0 if sparse_mode == 2 else _TORCH_MAX_INT,
+            inner_precise=0,
+            sparse_mode=sparse_mode,
+            gen_mask_parallel=True,
+            sync=False,
         )
         ctx.save_for_backward(q, k, v, attention, softmax_max, softmax_sum)
         ctx.atten_mask = atten_mask
@@ -158,7 +179,7 @@ class _NPUFusionAttention(torch.autograd.Function):
             scale_value=ctx.scale,
             keep_prob=1.0,
             pre_tockens=_TORCH_MAX_INT,
-            next_tockens=0,
+            next_tockens=0 if ctx.sparse_mode == 2 else _TORCH_MAX_INT,
             inner_precise=0,
             seed=ctx.seed,
             offset=ctx.offset,
@@ -173,9 +194,7 @@ class _NPUFusionAttention(torch.autograd.Function):
 class NPUBlockDiffusionAttentionConverter(ModelCustomConverter):
     def convert(self, model: nn.Module) -> None:
         modules = [
-            (name, module)
-            for name, module in model.named_modules()
-            if name and type(module) is ScaledCausalSDPA
+            (name, module) for name, module in model.named_modules() if name and type(module) is ScaledCausalSDPA
         ]
         if not modules:
             return

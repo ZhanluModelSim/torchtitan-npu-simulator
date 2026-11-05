@@ -8,7 +8,7 @@
 import pytest
 import torch
 from legacy_state_dict import from_legacy_state_dict, to_legacy_state_dict
-from model import BlockDiffusionModel, ModelConfig
+from raw_reference import BlockDiffusionModel, ModelConfig
 
 
 def config(**changes):
