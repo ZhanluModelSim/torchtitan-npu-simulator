@@ -28,7 +28,7 @@ EP_OVERLAP_ARGS=(
 
 exec bash "${SCRIPT_DIR}/deepseek_v4_flash_8p_cpt_4k_a5.sh" \
     --debug.moe-force-load-balance \
-    --parallelism.spmd-backend partial_dtensor \
+    --parallelism.spmd-backend spmd_types \
     --compile.memory-policy dsv4-mhc-moe-save \
     --training.steps "${STEPS}" \
     "${EP_OVERLAP_ARGS[@]}" \

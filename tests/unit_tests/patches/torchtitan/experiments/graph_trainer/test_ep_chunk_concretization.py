@@ -3,6 +3,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import pytest
 import sympy
 import torch
 from torch.fx.experimental.symbolic_shapes import free_symbols, ShapeEnv
@@ -33,7 +34,8 @@ def test_patch_updates_cached_graph_trainer_bindings() -> None:
     )
 
 
-def test_owned_chunk_symbols_exclude_independent_packed_metadata() -> None:
+@pytest.mark.parametrize("mode", ["batch", "seq"])
+def test_owned_chunk_symbols_exclude_independent_packed_metadata(mode: str) -> None:
     shape_env = ShapeEnv()
     fake_mode = torch._subclasses.FakeTensorMode(
         allow_non_fake_inputs=True,
@@ -44,9 +46,9 @@ def test_owned_chunk_symbols_exclude_independent_packed_metadata() -> None:
         packed = shape_env.create_unbacked_symint()
         torch._dynamo.override_optimization_hint(batch, 2)
         torch._dynamo.override_optimization_hint(packed, 2048)
-        inputs_meta = torch.empty(batch, 4096, device="cuda")
+        inputs_meta = torch.empty(batch, device="cuda")
         packed_meta = torch.empty(packed, device="cuda")
-    setattr(inputs_meta, "_dynamo_shape_ids", {0: "torchtitan_chunk_batch"})
+    setattr(inputs_meta, "_dynamo_shape_ids", {0: f"torchtitan_chunk_{mode}"})
 
     graph = torch.fx.Graph()
     inputs = graph.placeholder("inputs")
@@ -56,10 +58,19 @@ def test_owned_chunk_symbols_exclude_independent_packed_metadata() -> None:
     inputs.meta["val"] = inputs_meta
     metadata.meta["val"] = packed_meta
 
-    hints = ep_chunk_concretization._owned_chunk_symbol_hints(gm, "batch")
+    hints = ep_chunk_concretization._owned_chunk_symbol_hints(gm, mode)
 
     assert set(hints) == free_symbols(batch)
     assert not (set(hints) & free_symbols(packed))
+
+
+@pytest.mark.parametrize("mode", ["batch", "seq"])
+def test_flat_token_inputs_are_marked_for_graph_chunking(mode: str) -> None:
+    tokens = torch.zeros(4096, dtype=torch.int64)
+
+    ep_chunk_pass.mark_chunk_dynamic_dims(tokens, mode=mode)
+
+    assert tokens._dynamo_shape_ids == {0: f"torchtitan_chunk_{mode}"}
 
 
 def test_unrelated_packed_symbol_is_not_concretized() -> None:

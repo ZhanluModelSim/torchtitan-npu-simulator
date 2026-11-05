@@ -144,11 +144,6 @@ def parallelize_graph_trainer_deepseek_v4(
     ac_config: ActivationCheckpointingConfig,
     dump_folder: str,
 ):
-    # The graph_trainer simple_fsdp wrapper is built on raw DTensor ops
-    # (``distribute_tensor`` / ``tensor._spec``) and errors under the
-    # spmd_types backend; only the eager path supports that backend for now.
-    assert get_spmd_backend() != "spmd_types", "The GraphTrainer path does not yet support the spmd_types backend."
-
     # TP currently cannot handle uneven seq_len because we set
     # ``use_local_output=True`` to use plain Tensors for legacy reasons.
     assert training.num_tokens_per_microbatch_per_dp_rank % parallel_dims.seq_len_divisor == 0, f"""
@@ -164,7 +159,7 @@ def parallelize_graph_trainer_deepseek_v4(
 
     annotate_deepseek_v4(model)
 
-    if parallel_dims.tp_enabled or parallel_dims.ep_enabled:
+    if get_spmd_backend() == "spmd_types" or parallel_dims.tp_enabled or parallel_dims.ep_enabled:
         model.parallelize(parallel_dims)
 
     # Apply simple_fsdp unconditionally. The ``fsdp`` mesh always exists with a

@@ -39,11 +39,11 @@ GraphTrainer 是 torchtitan 上游 `experiments/graph_trainer/` 中的编译式�
 `parallelize_graph_trainer_deepseek_v4`（`parallelize.py`）是 DSV4 专属路径——eager 路径复用 DeepSeek-V3 并行化（DSV4 稀疏注意力分片基于它），而编译路径不能把稀疏注意力计算在 FSDP 下重排，故单独实现：
 
 1. 对 MoE 的 dispatch / combine / compute 区域与各子模块 FQN 附加图节点标注（`annotate_moe_ep_regions` + `annotate_module_fqns`），供 bucketing、区域编译等下游 pass 消费。
-2. TP / EP 启用时调用 `model.parallelize(parallel_dims)`。
+2. 使用 `spmd_types` 后端或启用 TP / EP 时调用 `model.parallelize(parallel_dims)`；`spmd_types` 即使在 singleton 模型并行轴下也需要类型标注。
 3. 无条件应用 `apply_simple_fsdp`：fsdp mesh 在 degree 1 时也存在（`ParallelDims._mesh_exist`），因此单卡下 MixedPrecisionPolicy 的 param_dtype cast 仍然生效。
 4. 按模式应用 `apply_graph_trainer_compile`。
 
-入口处有两条硬约束：`spmd_types` backend 不支持（simple_fsdp 构建于 raw DTensor 操作之上，该 backend 会报错）；TP 启用时 `seq_len` 必须整除 `parallel_dims.seq_len_divisor`（TP degree × 2 x CP degree，`use_local_output=True` 使用 plain tensor）。
+支持 `partial_dtensor` 和 `spmd_types` 后端。`spmd_types` 复用上游 DTensor-backed SimpleFSDP 存储，在模型前向和反向计算侧使用本地 tensor 与 SPMD 类型。入口要求每个 DP rank 的 microbatch token 数能被 `parallel_dims.seq_len_divisor` 整除。
 
 ### Graph-safe 改造
 
@@ -63,7 +63,7 @@ torchrun --nproc_per_node=8 -m torchtitan.train \
   --config graph_trainer_deepseek_v4_flash_43layers_16experts \
   --parallelism.expert-parallel-degree 8 \
   --parallelism.data-parallel-shard-degree 8 \
-  --parallelism.spmd-backend default \
+  --parallelism.spmd-backend spmd_types \
   --override.imports \
     torchtitan_npu.override.common.rms_norm.asc \
     torchtitan_npu.override.common.rope.asc_complex \
@@ -83,7 +83,6 @@ torchrun --nproc_per_node=8 -m torchtitan.train \
 | --- | --- |
 | 编译模式 | `aot_fx_trace`；NPU 上禁用 `cudagraph_pass` |
 | 并行组合 | FSDP（含 degree 1）、EP 已验证；TP 要求 `seq_len` 整除 `seq_len_divisor` |
-| `spmd_types` backend | 不支持（simple_fsdp 依赖 raw DTensor 操作） |
 | Context Parallel | 不支持（DSV4 稀疏注意力编译路径未适配 CP） |
 | EP overlap（上游实验性 pass） | 已通过patch适配；见 [`graph_trainer_ep_overlap.md`](graph_trainer_ep_overlap.md) |
 

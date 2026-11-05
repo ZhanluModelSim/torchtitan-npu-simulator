@@ -14,15 +14,15 @@ Remove this module after the TorchTitan dependency includes the PR.
 """
 
 from functools import wraps
-from inspect import getclosurevars, isfunction
+from inspect import isfunction, signature
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torchtitan.experiments.graph_trainer.chunked_loss
+from torch._subclasses.fake_tensor import FakeTensor
 from torch.distributed.tensor import DTensor, Partial, Shard
 from torchtitan.experiments.graph_trainer.chunked_loss import ChunkedLossWrapperWithParamGrads
-from torchtitan.experiments.graph_trainer.simple_fsdp import ReplicateComputation
+from torchtitan.experiments.graph_trainer.simple_fsdp import ReplicateComputation, disable_active_parametrization
 from torchtitan.tools.logging import logger
 
 _original_call = ChunkedLossWrapperWithParamGrads.__call__
@@ -30,18 +30,22 @@ _original_gradient_backprop = ChunkedLossWrapperWithParamGrads._gradient_backpro
 
 
 class _LocalGradientLMHead(nn.Module):
+    _head: nn.Linear
     sharded_weight: DTensor
 
-    def __init__(self, weight: torch.Tensor, sharded_weight: DTensor):
+    def __init__(self, head: nn.Linear, weight: torch.Tensor, sharded_weight: DTensor):
         super().__init__()
         self.weight = nn.Parameter(weight.detach(), requires_grad=sharded_weight.requires_grad)
         # Keep the original parameter out of this temporary module's parameters.
         object.__setattr__(self, "sharded_weight", sharded_weight)
+        object.__setattr__(self, "_head", head)
         self.accumulated_grad: torch.Tensor | None = None
         self.grad_hook = self.weight.register_post_accumulate_grad_hook(self._accumulate_grad)
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
-        return F.linear(hidden, self.weight)
+        # Keep the head's model-parallel forward wrappers with the gathered weight.
+        with disable_active_parametrization():
+            return torch.func.functional_call(self._head, {"weight": self.weight}, (hidden,))
 
     def _accumulate_grad(self, weight: torch.Tensor) -> None:
         assert weight.grad is not None
@@ -101,12 +105,15 @@ def _can_coalesce(head, pred) -> bool:
     ):
         return False
 
-    # SimpleFSDP v0.3.0 keeps its precision policy in the weight getter closure.
+    # The pinned SimpleFSDP binds each parameter's wrapper as a getter default.
     weight_property = getattr(type(head), "weight", None)
     if not isinstance(weight_property, property) or not isfunction(weight_property.fget):
         return False
-    parametrization = getclosurevars(weight_property.fget).nonlocals.get("parametrization")
-    if not isinstance(parametrization, ReplicateComputation) or parametrization.full_dtensor:
+    parametrization = signature(weight_property.fget).parameters.get("p")
+    if parametrization is None or not isinstance(parametrization.default, ReplicateComputation):
+        return False
+    parametrization = parametrization.default
+    if parametrization.device_mesh != weight.device_mesh or parametrization.non_dp_mesh_types:
         return False
     reduce_dtype = parametrization.reduce_dtype or parametrization.param_dtype or weight.dtype
     return reduce_dtype == torch.float32
@@ -118,17 +125,26 @@ def _coalesced_call(self, pred, labels, global_valid_tokens=None, **loss_inputs)
     if type(self) is not ChunkedLossWrapperWithParamGrads or not pred.requires_grad or head is None:
         return _original_call(self, pred, labels, global_valid_tokens, **loss_inputs)
     supported = _can_coalesce(head, pred)
+    weight = head.weight if supported else None
+    supported = type(weight) in (torch.Tensor, FakeTensor)
     if not getattr(self, "_coalesced_rs_logged", False):
         if supported:
             logger.info("[PATCH] GraphTrainer chunked loss: coalescing SimpleFSDP gradients before reduce-scatter")
         else:
-            logger.warning("[PATCH] Chunk-loss RS coalescing is unsupported for this head/layout; using upstream loss")
+            sharded_weight = head._parameters.get("weight")
+            logger.warning(
+                "[PATCH] Chunk-loss RS coalescing is unsupported for this head/layout; using upstream loss. "
+                "TP > 1 is unsupported. Head weight mesh=%s, placements=%s, dtype=%s",
+                getattr(sharded_weight, "device_mesh", None),
+                getattr(sharded_weight, "placements", None),
+                getattr(sharded_weight, "dtype", None),
+            )
         self._coalesced_rs_logged = True  # pyrefly: ignore[missing-attribute]
-    if not supported:
+    if not supported or weight is None:
         return _original_call(self, pred, labels, global_valid_tokens, **loss_inputs)
 
     # Preserve the original all-gather and compute dtype, but defer gradient sync.
-    local_head = _LocalGradientLMHead(head.weight, head._parameters["weight"])
+    local_head = _LocalGradientLMHead(head, weight, head._parameters["weight"])
     self.lm_head = local_head
     try:
         return _original_call(self, pred, labels, global_valid_tokens, **loss_inputs)

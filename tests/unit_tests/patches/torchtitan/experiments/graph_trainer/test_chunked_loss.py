@@ -32,15 +32,13 @@ def _dense_reference(hidden, labels, weight, num_chunks, valid_tokens):
         # this reference uses no chunk-loss wrapper or distributed collectives.
         chunk_losses = [
             F.cross_entropy(
-                F.linear(h, weight.to(hidden.dtype)).float().flatten(0, 1),
-                target.flatten(),
+                F.linear(h, weight.to(hidden.dtype)).float(),
+                target,
                 reduction="sum",
                 ignore_index=-100,
             )
             / valid_tokens
-            for h, target in zip(
-                rank_hidden.chunk(num_chunks, dim=1), rank_labels.chunk(num_chunks, dim=1), strict=True
-            )
+            for h, target in zip(rank_hidden.chunk(num_chunks), rank_labels.chunk(num_chunks), strict=True)
         ]
         losses.append(torch.stack(chunk_losses).sum())
     hidden_grad, weight_grad = torch.autograd.grad(torch.stack(losses).sum(), (hidden, weight))
@@ -60,10 +58,10 @@ def _assert_coalesced_microbatch_gradients(rank, rendezvous, dtype):
         mesh = init_device_mesh("cpu", (2,), mesh_dim_names=("dp_shard",))
         generator = torch.Generator().manual_seed(42)
         weight = torch.randn(13, 4, generator=generator) * 0.3
-        hidden = torch.randn(2, 1, 16, 4, generator=generator).to(dtype)
-        labels = torch.randint(13, (2, 1, 16), generator=generator)
-        labels[0, 0, 1] = -100
-        labels[1, 0, 12] = -100
+        hidden = torch.randn(2, 16, 4, generator=generator).to(dtype)
+        labels = torch.randint(13, (2, 16), generator=generator)
+        labels[0, 1] = -100
+        labels[1, 12] = -100
         valid_tokens = (labels != -100).sum()
         cfg = graph_trainer_deepseek_v4_flash_43layers_16experts()
         cfg.loss.num_chunks = 8

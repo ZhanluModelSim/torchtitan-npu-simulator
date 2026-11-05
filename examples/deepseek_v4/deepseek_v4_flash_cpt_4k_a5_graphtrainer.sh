@@ -28,7 +28,7 @@ EP_OVERLAP_ARGS=(
 
 exec bash "${SCRIPT_DIR}/deepseek_v4_flash_cpt_4k_a5.sh" \
     --training.num-tokens-per-train-step 2097152 \
-    --parallelism.spmd-backend partial_dtensor \
+    --parallelism.spmd-backend spmd_types \
     --training.steps "${STEPS}" \
     --debug.moe-force-load-balance \
     "${EP_OVERLAP_ARGS[@]}" \

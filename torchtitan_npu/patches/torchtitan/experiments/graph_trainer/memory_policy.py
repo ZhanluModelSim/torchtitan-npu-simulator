@@ -59,7 +59,7 @@ def _force_boundary_saves(
             continue
 
         if any(
-            not _is_backward_node(user) and is_recomputable(user) and _get_layer_id(user) > produce_layer_id
+            not _is_backward_node(user) and is_recomputable(user) and _get_layer_id(user) != produce_layer_id
             for user in node.users
         ):
             node.meta["recompute"] = CheckpointPolicy.MUST_SAVE

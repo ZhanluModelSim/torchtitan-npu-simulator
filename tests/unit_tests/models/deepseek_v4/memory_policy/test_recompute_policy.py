@@ -103,11 +103,18 @@ def _build_graph() -> tuple[fx.GraphModule, dict[str, fx.Node]]:
         nodes[f"out{layer_id}"] = output
         previous = output
 
+    epilogue = _node(
+        graph,
+        "epilogue",
+        torch.ops.aten.tanh.default,
+        (previous,),
+        "norm",
+    )
     nodes["bwd_output"] = _node(
         graph,
         "bwd_output",
         torch.ops.aten.mul.Tensor,
-        (previous, grad),
+        (epilogue, grad),
         "layers.7.backward",
         backward=True,
     )
@@ -161,15 +168,38 @@ def test_dsv4_mhc_layer_boundaries_and_moe_save() -> None:
         assert nodes[f"moe{layer_id}"].meta["recompute"] == CheckpointPolicy.MUST_SAVE
         assert nodes[f"pre{layer_id}"].meta["recompute"] == CheckpointPolicy.MUST_RECOMPUTE
         assert nodes[f"post{layer_id}"].meta["recompute"] == CheckpointPolicy.MUST_SAVE
-    for layer_id in range(7):
+    for layer_id in range(8):
         assert nodes[f"out{layer_id}"].meta["recompute"] == CheckpointPolicy.MUST_SAVE
 
     gm = selective_activation_remat_pass(gm)
     names = {node.name for node in gm.graph.nodes}
+    assert "out7_recomputed" not in names
     for layer_id in (0, 4):
         assert f"pre{layer_id}_recomputed" in names
         assert f"post{layer_id}_recomputed" not in names
         assert nodes[f"post{layer_id}"] in nodes[f"bwd_post{layer_id}"].all_input_nodes
         assert f"pre{layer_id}_recomputed" in {node.name for node in nodes[f"bwd_pre{layer_id}"].all_input_nodes}
+    gm.graph.lint()
+    torch.testing.assert_close(gm(*inputs), expected, rtol=0, atol=0)
+
+
+def test_full_recompute_save_selectors_preserve_selected_projections() -> None:
+    gm, nodes = _build_graph()
+    inputs = tuple(torch.full((2, 2), 0.1) for _ in range(3))
+    expected = gm(*inputs)
+    config = SimpleNamespace(
+        compile=SimpleNamespace(
+            memory_policy="full",
+            full_recompute_save_ops="layers.*.attention.wo_b::aten.matmul.default",
+        ),
+    )
+
+    gm = tag_with_memory_policy_pass(gm, config=config)
+
+    for layer_id in (0, 4):
+        assert nodes[f"wo_b{layer_id}"].meta["recompute"] == CheckpointPolicy.MUST_SAVE
+        assert nodes[f"pre{layer_id}"].meta["recompute"] == CheckpointPolicy.MUST_RECOMPUTE
+
+    gm = selective_activation_remat_pass(gm)
     gm.graph.lint()
     torch.testing.assert_close(gm(*inputs), expected, rtol=0, atol=0)

@@ -1,5 +1,6 @@
 # Pending upstream PR: https://github.com/pytorch/torchtitan/pull/4529
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
@@ -39,9 +40,9 @@ _DROPPED_METADATA_KEYS = frozenset({"attention_masks", "attention_metadata"})
 
 def _owned_chunk_symbol_hints(gm: fx.GraphModule, mode: str) -> dict[object, int]:
     """Collect symbols only from dimensions carrying the EP chunk shape ID."""
-    dim = {"batch": 0, "seq": 1}.get(mode)
-    if dim is None:
+    if mode not in ("batch", "seq"):
         raise ValueError(f"Unknown chunk mode: {mode!r}")
+    dim = 0
     expected_shape_id = f"torchtitan_chunk_{mode}"
     hints: dict[object, int] = {}
     for node in gm.graph.nodes:
@@ -134,7 +135,6 @@ def apply() -> None:
 
     original_symbol_hints = ep_pass_utils.chunk_symbol_hints_for_mode
     original_populate = ep_chunk_pass.populate_chunk_dim_metadata_pass
-    original_mark_dynamic = ep_chunk_pass.mark_chunk_dynamic_dims
     original_prepare_inputs = ep_chunk_pass.prepare_ep_overlap_trace_inputs
     original_fresh_symbol = ep_chunk_pass._fresh_unbacked_symbol_for_copy
     original_placeholder_hints = ep_pass_utils._placeholder_symbol_hints
@@ -164,35 +164,6 @@ def apply() -> None:
                 "dynamic placeholder dimension, but none was found."
             )
         return original_populate(gm, example_inputs, mode=mode)
-
-    @wraps(original_mark_dynamic)
-    def mark_chunk_dynamic_dims(tensor: torch.Tensor, *, mode: EpOverlapChunkDim) -> None:
-        from torch._dynamo.decorators import mark_unbacked
-
-        dim = {"batch": 0, "seq": 1}.get(mode)
-        if dim is None:
-            raise ValueError(f"Unknown chunk mode: {mode!r}")
-        if tensor.dim() <= dim:
-            raise ValueError(f"Cannot mark {mode} dim {dim} for shape {tuple(tensor.shape)}.")
-        extent = int(tensor.shape[dim])
-        if extent < 2 or extent % 2:
-            raise ValueError(
-                "EP overlap graph chunking requires an even selected dimension, "
-                f"got {mode} size {extent} for shape {tuple(tensor.shape)}."
-            )
-        lower, upper = extent // 2, extent
-        if mode == "batch":
-            lower = max(2, lower)
-            upper = max(upper, lower + 1)
-        mark_unbacked(
-            tensor,
-            dim,
-            hint_override=extent,
-            min=lower,
-            max=upper,
-            specialize_on=[lambda value, extent=extent: value == extent],
-            shape_id=f"torchtitan_chunk_{mode}",
-        )
 
     @wraps(original_prepare_inputs)
     def prepare_ep_overlap_trace_inputs(
@@ -254,7 +225,6 @@ def apply() -> None:
     ep_pass_utils._concretize_value = concretize_chunk_value
     ep_chunk_pass.chunk_symbol_hints_for_mode = chunk_symbol_hints_for_mode
     ep_chunk_pass.populate_chunk_dim_metadata_pass = populate_chunk_dim_metadata_pass
-    ep_chunk_pass.mark_chunk_dynamic_dims = mark_chunk_dynamic_dims
     ep_chunk_pass.prepare_ep_overlap_trace_inputs = prepare_ep_overlap_trace_inputs
     ep_chunk_pass._fresh_unbacked_symbol_for_copy = fresh_unbacked_symbol_for_copy
     graph_passes.populate_chunk_dim_metadata_pass = populate_chunk_dim_metadata_pass
