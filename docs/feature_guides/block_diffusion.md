@@ -144,3 +144,13 @@ total_dense = embedding + output + final_norm
 
 本次执行记录、环境、命令和最终结论见
 [Block Diffusion 接入验收记录](../test_guides/block_diffusion_acceptance.md)。
+
+## 独立 raw 训练与推理参考
+
+`simulator/raw_model/block_diff` 现在提供共享网络的精确 mask 训练入口、带逐层
+KV 的推理入口，以及独立 CPU/meta 算子捕获。其 Python 接口已现代化，旧权重
+通过显式转换保持与本文件所述原始 schema 的互通。详见
+[raw workload 说明](../../torchtitan_npu/simulator/raw_model/block_diff/README.md)。
+
+本节不改变上面的原生训练 `ModelSpec` 支持矩阵；独立 raw 路径的数值测试
+不代表其已通过 TorchTitan 分布式、真实 NPU 或下游模拟器集成验收。
