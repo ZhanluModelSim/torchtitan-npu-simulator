@@ -148,9 +148,9 @@ class Glm5NextModel(Decoder):
             config,
             **kwargs,
         ) -> None:
-            """GLM-specific runtime sync: reject unsupported parallelism and
-            enforce the uniform-routing divisibility contract of the eager MoE
-            dispatcher. The upstream RoPE-cache sync does not apply (NoPE)."""
+            """GLM-specific runtime sync: declare the spmd_types placements
+            (EP included) and propagate the debug routing override. The
+            upstream RoPE-cache sync does not apply (NoPE)."""
             if hasattr(config, "parallelism"):
                 parallelism = config.parallelism
                 from .sharding import set_glm5_next_sharding_config
@@ -158,27 +158,16 @@ class Glm5NextModel(Decoder):
                 set_glm5_next_sharding_config(
                     self,
                     enable_sp=parallelism.enable_sequence_parallel,
+                    enable_ep=parallelism.expert_parallel_degree > 1,
                 )
                 if parallelism.context_parallel_degree > 1:
                     raise NotImplementedError("GLM-5.3-Flash context parallelism is not implemented yet.")
-                if parallelism.expert_parallel_degree > 1:
-                    raise NotImplementedError(
-                        "GLM-5.3-Flash expert-parallel dispatch is not wired yet; set expert_parallel_degree=1."
-                    )
-                if hasattr(config, "training") and hasattr(config, "debug"):
-                    seq_len = config.training.seq_len
+                if hasattr(config, "debug"):
                     for layer_cfg in self.layers:
                         moe = getattr(layer_cfg, "moe", None)
                         if moe is None:
                             continue
-                        experts = moe.routed_experts.inner_experts
-                        if (seq_len * moe.router.top_k) % experts.num_experts != 0:
-                            raise ValueError(
-                                f"Uniform routing: seq_len ({seq_len}) * top_k "
-                                f"({moe.router.top_k}) must be divisible by the "
-                                f"expert count ({experts.num_experts})."
-                            )
-                        moe.debug_force_load_balance = config.debug.moe_force_load_balance
+                        moe.router.debug_force_load_balance = config.debug.moe_force_load_balance
 
     def __init__(self, config: Config):
         super().__init__(config)

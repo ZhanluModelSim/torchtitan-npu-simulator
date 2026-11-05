@@ -16,6 +16,7 @@ from functools import partial
 
 import torch
 import torch.nn as nn
+import torch_npu
 from torchtitan.models.common.linear import Linear
 from torchtitan.protocols.module import Module
 
@@ -61,7 +62,5 @@ class RMSNormGated(Module):
     def forward(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
         input_dtype = x.dtype
         x = x.float()
-        variance = x.pow(2).mean(-1, keepdim=True)
-        x = x * torch.rsqrt(variance + self.eps)
-        x = self.weight.to(torch.float32) * x
+        x = torch_npu.npu_rms_norm(x, self.weight.to(torch.float32), self.eps)[0]
         return (x * torch.sigmoid(gate.float())).to(input_dtype)

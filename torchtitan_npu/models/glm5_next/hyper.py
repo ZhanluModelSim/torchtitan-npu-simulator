@@ -17,6 +17,7 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
+import torch_npu
 from torch import nn
 from torchtitan.protocols.module import Module
 
@@ -54,9 +55,12 @@ class HyperConnection(Module):
         self.fn = nn.Parameter(torch.empty(mix, self.hc_mult * config.dim))
         self.base = nn.Parameter(torch.empty(mix))
         self.scale = nn.Parameter(torch.empty(3))
+        # Unit scale for the fused ``npu_rms_norm`` (Glm5NextTextUnweightedRMSNorm
+        # runs the norm through the fused kernel with an all-ones weight).
+        self.register_buffer("_ones", torch.ones(self.hc_mult * config.dim, dtype=torch.float32), persistent=False)
 
     def _unweighted_rms_norm(self, x: torch.Tensor) -> torch.Tensor:
-        return x * torch.rsqrt(x.float().square().mean(-1, keepdim=True) + self.norm_eps).to(x.dtype)
+        return torch_npu.npu_rms_norm(x, self._ones.to(x.dtype), epsilon=self.norm_eps)[0]
 
     def _sinkhorn(self, mixes: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         hc = self.hc_mult

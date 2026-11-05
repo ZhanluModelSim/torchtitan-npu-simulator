@@ -12,7 +12,6 @@ from torchtitan.models.common.moe import GroupedExperts
 from .ascendc import (
     AscFeedForward,
     AscGroupedExperts,
-    _ensure_cann_ops_loaded,
     swiglu_group_activation,
 )
 
@@ -28,11 +27,13 @@ __all__ = [
 @override(
     target=GroupedExperts.Config,
     fqns=["*.moe.routed_experts.inner_experts"],
-    exact=True,
+    # Not exact: subclasses (GlmExperts.Config) must derive too; the fqn
+    # selector already scopes this to routed experts.
     description="Use cann_ops_nn.swiglu_group for routed experts.",
 )
 def asc(cfg: GroupedExperts.Config) -> AscGroupedExperts.Config:
-    _ensure_cann_ops_loaded()
+    # The vendor ops load lazily at forward time: derivation also runs on the
+    # meta capture path, where the ops come from the simulator's fake bridge.
     if isinstance(cfg, AscGroupedExperts.Config):
         return cfg
     return derive(cfg, AscGroupedExperts.Config)
@@ -40,10 +41,10 @@ def asc(cfg: GroupedExperts.Config) -> AscGroupedExperts.Config:
 
 @override(
     target=FeedForward.Config,
-    fqns=["*.moe.shared_experts"],
-    exact=True,
-    description="Use cann_ops_nn.swiglu_group for shared experts.",
+    fqns=["*.moe.shared_experts", "*.feed_forward"],
+    # Not exact: the shared expert / dense FFN may be a FeedForward subclass
+    # (GlmMLP.Config); dense swiglu runs the same fused kernel on device.
+    description="Use cann_ops_nn.swiglu_group for shared and dense feed-forwards.",
 )
 def asc_shared_experts(cfg: FeedForward.Config) -> AscFeedForward.Config:
-    _ensure_cann_ops_loaded()
     return derive(cfg, AscFeedForward.Config)

@@ -5,11 +5,11 @@
 
 """Distributed parallelization for GLM-5.3-Flash (torchtitan 0.3.0).
 
-v1 support matrix (capture + real-run): single device and FSDP2 over the
-dense data-parallel mesh (the routed experts ride the same FSDP unit; the
-expert EP/FSDP assembly over the sparse mesh, TP + sequence parallelism and
-the spmd_types sharding declarations land together with the parallelism
-matrix phase). CP / PP / ETP / EP raise NotImplementedError.
+v1 support matrix (capture + real-run): single device, FSDP2 over the
+dense data-parallel mesh, and expert parallelism (the routed experts ride
+the sparse expert-FSDP mesh via the shared ``MoE``/``RoutedExperts``
+assembly and the ``AllToAllTokenDispatcher``). TP, sequence parallelism,
+CP, PP and ETP land with the parallelism matrix phase.
 """
 
 import logging
@@ -63,11 +63,7 @@ def parallelize_glm5_next(
     if parallel_dims.tp_enabled:
         raise NotImplementedError(
             "GLM-5.3-Flash tensor parallelism lands with the spmd_types "
-            "sharding declarations; the v1 matrix is single + FSDP2."
-        )
-    if parallel_dims.ep_enabled:
-        raise NotImplementedError(
-            "GLM-5.3-Flash expert-parallel dispatch is not wired yet; set expert_parallel_degree=1."
+            "sharding declarations; the v1 matrix is single + FSDP2 + EP."
         )
 
     validate_config(parallel_dims, model)

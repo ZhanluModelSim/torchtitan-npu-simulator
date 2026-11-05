@@ -164,10 +164,16 @@ _DSV4_1_OVERRIDES = [
     "torchtitan_npu.override.deepseek_v4_1.mhc.asc_hc_post",
 ]
 
-# GLM-5.3-Flash is NoPE (no rope override) and its KDA/DSA mixers plus
-# sigmoid-routing MoE are custom modules outside the upstream override
-# surface, so only the common RMSNorm replacement applies.
-_GLM5_NEXT_OVERRIDES = [*_COMMON_OVERRIDES]
+# GLM-5.3-Flash is NoPE (no rope override) and its KDA/DSA mixers are custom
+# modules outside the upstream override surface. The common RMSNorm
+# replacement applies, the MoE rides the shared ``MoE`` wrapper so the ASC
+# token dispatcher and the ``swiglu_group`` routed-expert/shared-expert
+# swaps hit their ``*.moe.*`` FQNs.
+_GLM5_NEXT_OVERRIDES = [
+    *_COMMON_OVERRIDES,
+    "torchtitan_npu.override.common.swiglu_group.asc",
+    "torchtitan_npu.override.common.swiglu_group.asc_shared_experts",
+]
 
 
 def prepare_config(simulation: SimulationConfig) -> PreparedConfig:
@@ -216,9 +222,7 @@ def prepare_config(simulation: SimulationConfig) -> PreparedConfig:
             setattr(trainer.training, target_name, value)
     model = trainer.model_spec.model
     if trainer.model_spec.name not in {"deepseek_v4", "deepseek_v4_1", "kimi_k3", "qwen3_5", "glm5_next"}:
-        raise ValueError(
-            "Supported model families are deepseek_v4, deepseek_v4_1, kimi_k3, qwen3_5 and glm5_next"
-        )
+        raise ValueError("Supported model families are deepseek_v4, deepseek_v4_1, kimi_k3, qwen3_5 and glm5_next")
     adaptations = []
     if simulation.model_overrides is not None:
         adaptations.append("typed geometry overrides rebuilt the complete native model configuration tree")

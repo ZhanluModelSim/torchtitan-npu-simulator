@@ -17,6 +17,7 @@ sequence length, so capture flavors keep ``seq_len`` modest.
 from dataclasses import dataclass
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.nn_modules import Conv1d
@@ -141,32 +142,80 @@ class KDALinearAttention(Module):
         self.o_proj = config.o_proj.build()
 
     def _eager_chunk_kda(
-        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, decay: torch.Tensor, beta: torch.Tensor
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor
     ) -> torch.Tensor:
-        """Recurrent linear-attention scan with l2-normalised q/k (the
-        mathematical core the chunked kernel computes; meta-safe: no value
-        reads). Shapes: q/k/v [B, S, H, D], decay [B, S, H, 1], beta [B, S, H, 1]."""
+        """FLA chunked KDA (chunk_size=64): faithful port of the MindSpeed
+        eager fallback ``chunk_kimi_delta_attention``. ``g`` is the log-space
+        safe-gated decay (values in [lower_bound, 0)); the scan applies it
+        through exp/cumsum, never as a linear multiplier. Meta-safe: every
+        loop bound is static and all control flow is shape-only.
+
+        Shapes: q/k/v [B, S, H, D], g [B, S, H, D], beta [B, S, H]."""
+        chunk_size = 64
+        initial_dtype = q.dtype
+        q, k, v, beta, g = [x.transpose(1, 2).contiguous().float() for x in (q, k, v, beta, g)]
 
         def l2norm(x):
-            return x / (x.float().norm(dim=-1, keepdim=True) + 1e-6).to(x.dtype)
+            return x / (x.norm(dim=-1, keepdim=True) + 1e-6)
 
-        # The chunked kernel accumulates in fp32; mirror that so the scan
-        # never mixes the fp32 gate/decay stream with bf16 activations.
-        out_dtype = q.dtype
-        q = q.float()
-        k = k.float()
-        v = v.float()
-        decay = decay.float()
-        beta = beta.float()
         q, k = l2norm(q), l2norm(k)
-        b, s, h, d = q.shape
-        state = torch.zeros(b, h, d, d, dtype=q.dtype, device=q.device)
-        outs = []
-        for t in range(s):
-            state = decay[:, t].unsqueeze(-1) * state
-            state = state + beta[:, t].unsqueeze(-1).unsqueeze(-1) * torch.einsum("bhd,bhe->bhde", k[:, t], v[:, t])
-            outs.append(torch.einsum("bhde,bhd->bhe", state, q[:, t]))
-        return torch.stack(outs, dim=1).to(out_dtype)
+
+        batch_size, num_heads, sequence_length, k_head_dim = k.shape
+        v_head_dim = v.shape[-1]
+        scale = 1 / (q.shape[-1] ** 0.5)
+        pad_size = (chunk_size - sequence_length % chunk_size) % chunk_size
+        total_sequence_length = sequence_length + pad_size
+
+        q = F.pad(q, (0, 0, 0, pad_size)) * scale
+        k = F.pad(k, (0, 0, 0, pad_size))
+        v = F.pad(v, (0, 0, 0, pad_size))
+        g = F.pad(g, (0, 0, 0, pad_size))
+        beta = F.pad(beta, (0, pad_size))
+        v_beta = v * beta.unsqueeze(-1)
+        k_beta = k * beta.unsqueeze(-1)
+
+        chunk_shape = (batch_size, num_heads, -1, chunk_size)
+        q, k, v, g, k_beta, v_beta = [x.reshape(*chunk_shape, x.shape[-1]) for x in (q, k, v, g, k_beta, v_beta)]
+        beta = beta.reshape(batch_size, num_heads, -1, chunk_size)
+
+        # Intra chunk: per-head cumulative gate and the decayed triangular
+        # system solved by forward substitution (static 64 iterations).
+        g = g.cumsum(dim=-2)
+        mask = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=q.device), diagonal=0)
+        strict_upper = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=q.device), diagonal=1)
+        decay_mask = (g.unsqueeze(-2) - g.unsqueeze(-3)).masked_fill(strict_upper.unsqueeze(-1), float("-inf")).exp()
+        attn = -(k_beta.unsqueeze(-2) * k.unsqueeze(-3) * decay_mask).sum(dim=-1).masked_fill(mask, 0)
+        for i in range(1, chunk_size):
+            row = attn[..., i, :i].clone()
+            sub = attn[..., :i, :i].clone()
+            attn[..., i, :i] = row + (row.unsqueeze(-1) * sub).sum(-2)
+
+        attn = attn + torch.eye(chunk_size, dtype=attn.dtype, device=q.device)
+        v = attn @ v_beta
+        k_cumdecay = attn @ (k_beta * g.exp())
+
+        state = torch.zeros(batch_size, num_heads, k_head_dim, v_head_dim, dtype=v.dtype, device=v.device)
+        core_attn_out = torch.zeros_like(v)
+
+        mask = torch.triu(torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=q.device), diagonal=1)
+        for i in range(total_sequence_length // chunk_size):
+            q_i, k_i, v_i, g_i = q[:, :, i], k[:, :, i], v[:, :, i], g[:, :, i]
+            # Inter chunk: state contribution decayed to this chunk.
+            attn_inter = (q_i * g_i.exp()) @ state
+            # Intra chunk: decayed causal attention inside the chunk.
+            attn_intra = (q_i.unsqueeze(-2) * k_i.unsqueeze(-3) * decay_mask[:, :, i]).sum(dim=-1).masked_fill(mask, 0)
+            # Corrected value target: remove the state part k_cumdecay already carries.
+            v_prime = k_cumdecay[:, :, i] @ state
+            v_new = v_i - v_prime
+            core_attn_out[:, :, i] = attn_inter + attn_intra @ v_new
+            state = (
+                state * g_i[:, :, -1].exp().unsqueeze(-1)
+                + (k_i * (g_i[:, :, -1:] - g_i).exp()).transpose(-1, -2) @ v_new
+            )
+
+        core_attn_out = core_attn_out.reshape(batch_size, num_heads, -1, v_head_dim)
+        core_attn_out = core_attn_out[:, :, :sequence_length]
+        return core_attn_out.transpose(1, 2).contiguous().to(initial_dtype)
 
     def forward(
         self,

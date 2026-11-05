@@ -16,7 +16,9 @@ from torchtitan_simulator.validation import validate_workload
 # DSA layer never enter the dense gradient contract. The stack declares no
 # virtual fusion: every dispatch is plain ATen/ACLNN semantics.
 _TOTAL_NUMEL = 4_882_192
-_GRADIENT_TENSORS = 91
+# GlmMLP keeps w1/w3 as separate gradients (4 dense/shared MLPs, +1 each over
+# the fused gate_up projection).
+_GRADIENT_TENSORS = 95
 
 
 @pytest.mark.parametrize(
@@ -51,15 +53,15 @@ def test_glm5_next_capture_reaches_iteration(world, replicate, rank, ac):
     # The indexer is excluded from FSDP units and carries no gradient.
     assert not any("indexer" in name for name in gradients)
 
-    # v1 is pure ATen capture: no model-private virtual fusion registers
-    # tensor_semantics anywhere in the graph.
+    # The only declared virtual fusion is the MoE token unpermute dispatcher
+    # bridge; everything else is plain ATen/ACLNN semantics.
     custom = {
         node.annotations["raw_op_type"]
         for template in workload.step_templates.values()
         for node in template.nodes.values()
         if "tensor_semantics" in node.attrs
     }
-    assert custom == set()
+    assert custom == {"torchtitan_npu.npu_moe_token_unpermute.default"}
 
     degree = world // replicate
     memory = workload.iteration.schedule.annotations["memory_plan"]
@@ -75,7 +77,7 @@ def test_glm5_next_capture_reaches_iteration(world, replicate, rank, ac):
     assert (
         memory.optimizer_state_bytes
         == {
-            1: 38_850_540,
-            2: {0: 19_425_484, 1: 19_425_420}[rank],
+            1: 38_850_556,
+            2: {0: 19_425_500, 1: 19_425_436}[rank],
         }[degree]
     )

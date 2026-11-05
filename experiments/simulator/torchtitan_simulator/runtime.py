@@ -79,6 +79,13 @@ class RuntimeSession:
             install_meta_norm_buffers(self.patches, owner.AscRMSNorm)
             self.capabilities["rms_norm_buffer_device"] = "meta"
             self.capabilities["rms_norm_meta_autograd"] = install_meta_norm_autograd(self.patches)
+        if any(
+            isinstance(entry, str) and entry.startswith("torchtitan_npu.override.common.swiglu_group.")
+            for entry in imports
+        ):
+            from torchtitan_simulator.compat.swiglu import install_meta_swiglu_autograd
+
+            self.capabilities["swiglu_meta_autograd"] = install_meta_swiglu_autograd(self.patches)
         if "torchtitan_npu.override.common.token_dispatcher.asc" in imports:
             from torchtitan_simulator.compat.permute import install_meta_permute_autograd
 

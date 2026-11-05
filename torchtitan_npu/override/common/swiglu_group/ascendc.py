@@ -33,6 +33,9 @@ def swiglu_group_activation(
     routed_scores: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run the documented ``cann_ops_nn.swiglu_group`` op."""
+    # Lazy load: the override factory also derives on the meta capture path,
+    # where the simulator's fake bridge registers these ops instead.
+    _ensure_cann_ops_loaded()
     weight = None if routed_scores is None else routed_scores.to(dtype=torch.float32).contiguous()
     clamp_limit = -1.0 if swiglu_limit is None else float(swiglu_limit)
     return torch.ops.cann_ops_nn.swiglu_group.default(
@@ -46,7 +49,13 @@ def swiglu_group_activation(
 class AscGroupedExperts(GroupedExperts):
     @dataclass(kw_only=True, slots=True)
     class Config(GroupedExperts.Config):
-        pass
+        # Clamped-swiglu models (GLM-5.3-Flash) carry the limit on the
+        # source config; derive copies it so the activation clamps match.
+        swiglu_limit: float | None = None
+
+    def __init__(self, config: Config):
+        super().__init__(config)
+        self.swiglu_limit = config.swiglu_limit
 
     # Match upstream keyword arguments to preserve the GroupedExperts interface.
     def forward(
@@ -97,7 +106,11 @@ class AscGroupedExperts(GroupedExperts):
 class AscFeedForward(FeedForward):
     @dataclass(kw_only=True, slots=True)
     class Config(FeedForward.Config):
-        pass
+        swiglu_limit: float | None = None
+
+    def __init__(self, config: Config):
+        super().__init__(config)
+        self.swiglu_limit = config.swiglu_limit
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         packed = torch.cat((self.w1(x), self.w3(x)), dim=-1)

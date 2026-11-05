@@ -5,10 +5,11 @@
 
 """Native component sharding for GLM-5.3-Flash (spmd_types backend).
 
-v1 declares everything replicated: the capture matrix is single + FSDP2,
-where FSDP2 owns the data-parallel sharding and the spmd_types residency
-only requires every parameter/buffer to be a DTensor on the full SPMD mesh.
-TP/EP placements for the custom KDA/DSA/MoE modules land with the
+Dense weights stay replicated: FSDP2 owns the data-parallel sharding and the
+spmd_types residency only requires every parameter/buffer to be a DTensor on
+the full SPMD mesh. The MoE subtree routes through the shared
+``set_moe_sharding_config`` (router gate, shared experts, routed-experts
+local_map, expert ``{EP}`` placements). TP/CP/PP land with the
 parallelism matrix phase.
 """
 
@@ -19,14 +20,22 @@ from torchtitan.models.common.decoder_sharding import (
 )
 from torchtitan.models.common.embedding import Embedding
 from torchtitan.models.common.linear import Linear
+from torchtitan.models.common.moe_sharding import set_moe_sharding_config
 from torchtitan.models.common.nn_modules import Conv1d, LayerNorm, RMSNorm
 from torchtitan.protocols.module import Module
 from torchtitan.protocols.sharding import ShardingConfig
 
 from .attention import DSAAttention, DSAIndexer
-from .feed_forward import GlmMoE, TopkRouter
 from .hyper import HyperConnection
 from .kda import KDALinearAttention
+
+# Routed-expert weight placement for the EP-disabled path (upstream shared
+# GroupedExperts layout: column/row-wise over the TP mesh).
+_GROUPED_EXPERTS_PARAM_LAYOUT: dict[str, spmd.PerMeshAxisSpmdType] = {
+    "w1_EFD": spmd.S(1),
+    "w2_EDF": spmd.S(2),
+    "w3_EFD": spmd.S(1),
+}
 
 
 def _replicated_for(config) -> ShardingConfig:
@@ -44,8 +53,6 @@ def set_glm5_next_sharding_config(config, *, enable_sp: bool = False, enable_ep:
     Called from ``Glm5NextModel.Config.update_from_config``; the parallelize
     step then walks the tree and distributes each parameter/buffer.
     """
-    del enable_ep  # EP sharding lands with the parallelism matrix phase
-
     # Decoder root: tok_embeddings (Shard(0) vocab), norm, lm_head.
     set_decoder_sharding_config(config, enable_sp=enable_sp)
 
@@ -62,7 +69,12 @@ def set_glm5_next_sharding_config(config, *, enable_sp: bool = False, enable_ep:
     for _, child, _, _ in config.traverse(Module.Config, recurse=True):
         if isinstance(child, HyperConnection.Config) and child.sharding_config is None:
             child.sharding_config = ShardingConfig(
-                state_shardings={"fn": replicated, "base": replicated, "scale": replicated}
+                state_shardings={
+                    "fn": replicated,
+                    "base": replicated,
+                    "scale": replicated,
+                    "_ones": replicated,
+                }
             )
 
     for layer in config.layers:
@@ -84,13 +96,14 @@ def set_glm5_next_sharding_config(config, *, enable_sp: bool = False, enable_ep:
             )
         if layer.moe is not None:
             moe = layer.moe
-            assert isinstance(moe, GlmMoE.Config)
-            assert isinstance(moe.router, TopkRouter.Config)
-            moe.router.sharding_config = ShardingConfig(state_shardings={"e_score_correction_bias": replicated})
-            moe.routed_experts.inner_experts.sharding_config = ShardingConfig(
-                state_shardings={
-                    "w1_EFD": replicated,
-                    "w2_EDF": replicated,
-                    "w3_EFD": replicated,
-                }
+            # Shared contract: router gate, shared experts, routed-experts
+            # local_map, expert {EP}/{TP} placements.
+            set_moe_sharding_config(
+                moe,
+                enable_ep=enable_ep,
+                enable_sp=enable_sp,
+                expert_param_layout=_GROUPED_EXPERTS_PARAM_LAYOUT,
             )
+            # The static GLM correction bias is a router buffer, not a gate
+            # weight: keep it replicated over the SPMD mesh.
+            moe.router.sharding_config = ShardingConfig(state_shardings={"e_score_correction_bias": replicated})
