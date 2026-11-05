@@ -5,8 +5,10 @@
 
 """Native DeepSeek V4 model/loss/optimizer capture with explicit correctness gates."""
 
+import json
 import logging
 from contextlib import nullcontext
+from typing import Literal
 
 import torch
 
@@ -17,6 +19,7 @@ from torchtitan_simulator.compat.checkpoint import logical_named_parameters
 from torchtitan_simulator.compat.distributed import logical_world
 from torchtitan_simulator.compat.routing import install_balanced_dispatch
 from torchtitan_simulator.config import build_meta_model, prepare_config
+from torchtitan_simulator.host_timing import HostTimings
 from torchtitan_simulator.meta_env import compute_block
 from torchtitan_simulator.metadata import to_meta_metadata
 from torchtitan_simulator.runtime import meta_runtime
@@ -78,7 +81,24 @@ def _buffer_signature(model):
 
 
 def simulate(simulation):
-    prepared = prepare_config(simulation)
+    """Capture a workload and report host diagnostics independently of simulated time."""
+    timings = HostTimings()
+    status: Literal["completed", "failed"] = "failed"
+    try:
+        with timings.measure("total"):
+            workload = _simulate(simulation, timings)
+        status = "completed"
+        workload.iteration.schedule.annotations["host_timings"] = timings.summary(status)
+        return workload
+    finally:
+        logging.getLogger(__name__).info(
+            "Simulation host timings: %s", json.dumps(timings.summary(status), sort_keys=True)
+        )
+
+
+def _simulate(simulation, timings: HostTimings):
+    with timings.measure("configuration"):
+        prepared = prepare_config(simulation)
     if prepared.trainer.model_spec.name == "deepseek_v4" and prepared.trainer.training.dtype != "float32":
         raise ValueError(
             "DeepSeek V4 capture requires training.dtype=float32: native FSDP expects uniform original "
@@ -97,7 +117,8 @@ def simulate(simulation):
     with meta_runtime() as runtime:
         runtime.configure_model(prepared)
         with logical_world(prepared, runtime, rank=simulation.logical_rank) as dims:
-            model = build_meta_model(prepared)
+            with timings.measure("model_build"):
+                model = build_meta_model(prepared)
             quantized_parameters = []
             if simulation.enable_quantized_training:
                 from torchao_npu.wrapper_tensors.mx_wrapper_tensor import MXTrainingWeightWrapperTensor
@@ -110,15 +131,16 @@ def simulate(simulation):
                 if not quantized_parameters:
                     raise RuntimeError("Native all_mxfp8 recipe selected no MX training weights")
             original_shapes = {name: tuple(parameter.shape) for name, parameter in logical_named_parameters(model)}
-            model = config.model_spec.parallelize_fn(
-                model,
-                parallel_dims=dims,
-                training=config.training,
-                parallelism=config.parallelism,
-                compile_config=config.compile,
-                ac_config=config.activation_checkpoint,
-                dump_folder=config.dump_folder,
-            )
+            with timings.measure("parallelize"):
+                model = config.model_spec.parallelize_fn(
+                    model,
+                    parallel_dims=dims,
+                    training=config.training,
+                    parallelism=config.parallelism,
+                    compile_config=config.compile,
+                    ac_config=config.activation_checkpoint,
+                    dump_folder=config.dump_folder,
+                )
             parameter_layouts = {}
             for name, parameter in logical_named_parameters(model):
                 local = getattr(parameter, "_local_tensor", parameter)
@@ -143,9 +165,21 @@ def simulate(simulation):
             loss_fn = config.loss.build(compile_config=config.compile)
             loss_fn.set_lm_head(model.lm_head)
             model._skip_lm_head = True
-            optimizers = config.optimizer.build(model_parts=[model])
-            if config.model_spec.post_optimizer_build_fn is not None:
-                config.model_spec.post_optimizer_build_fn(optimizers, [model], dims)
+            from torchtitan_npu.extensions.torchtitan.distributed.flex_shard.planning import collect_planning_timings
+
+            with collect_planning_timings() as planning_timings:
+                try:
+                    with timings.measure("optimizer_build"):
+                        optimizers = config.optimizer.build(model_parts=[model])
+                        if config.model_spec.post_optimizer_build_fn is not None:
+                            config.model_spec.post_optimizer_build_fn(optimizers, [model], dims)
+                finally:
+                    for name, measurement in planning_timings.items():
+                        timings.add(
+                            f"optimizer_planning.{name}",
+                            measurement.wall_seconds,
+                            calls=measurement.calls,
+                        )
             scheduler = config.lr_scheduler.build(optimizers=optimizers, training_steps=config.training.steps)
 
             seq_len = simulation.seq_len
@@ -186,12 +220,14 @@ def simulate(simulation):
 
             train_context = get_spmd_context(parallel_dims=dims, spmd_typechecking=config.debug.spmd_typechecking)
 
+            execution = "warmup"
+
             def forward_backward(*, input_dict, labels, global_valid_tokens):
                 with train_context():
-                    with compute_block("F"):
+                    with timings.measure(f"{execution}.forward"), compute_block("F"):
                         predictions = model(**input_dict)
                         loss, _ = loss_fn(predictions, labels, global_valid_tokens, positions=input_dict["positions"])
-                    with compute_block("B"):
+                    with timings.measure(f"{execution}.backward"), compute_block("B"):
                         loss.backward()
                 gradient_manifest.update(_gradient_manifest(model))
                 return loss
@@ -213,40 +249,45 @@ def simulate(simulation):
                     forward_backward(input_dict=inputs, labels=labels, global_valid_tokens=global_valid_tokens)
 
             logging.getLogger(__name__).info("Warming training state with %d microbatches", gradient_accumulation)
-            warmup_training_iteration(
-                gradient_accumulation=gradient_accumulation,
-                forward_backward=warmup_microbatch,
-                clip_gradients=clip_gradients,
-                optimizer_step=optimizers.step,
-                zero_grad=optimizers.zero_grad,
-            )
+            with timings.measure("warmup"):
+                warmup_training_iteration(
+                    gradient_accumulation=gradient_accumulation,
+                    forward_backward=warmup_microbatch,
+                    clip_gradients=clip_gradients,
+                    optimizer_step=optimizers.step,
+                    zero_grad=optimizers.zero_grad,
+                )
             gradient_manifest.clear()
             # Install observers only after native lazy state has been initialized.
             # torch_npu may install its final FSDP layer on first fully_shard.
             install_fsdp_residency_hooks(runtime.patches)
             buffers_before = _buffer_signature(model)
-            workload = run_simulation_step(
-                model_parts=[model],
-                parallel_dims=dims,
-                forward_backward_step=forward_backward,
-                input_dict=inputs,
-                labels=labels,
-                optimizer_step=optimizers.step,
-                optimizer_zero_grad=optimizers.zero_grad,
-                lr_scheduler_step=scheduler.step,
-                clip_grad_norm=clip_gradients,
-                local_batch_size=batch_size,
-                seq_len=seq_len,
-                global_valid_tokens=global_valid_tokens,
-                gradient_accumulation=gradient_accumulation,
-                memory_parameter_storage_dtype=simulation.memory_parameter_storage_dtype,
-                memory_device_type="meta",
-                memory_offload_ac_saved_tensors=simulation.memory_offload_ac_saved_tensors,
-                print_memory_summary=False,
-                scoped_backward_phases=True,
-                rank=simulation.logical_rank,
-                capture_process_rank=0,
-            )
+            execution = "capture"
+            with timings.measure("capture_step"):
+                workload = run_simulation_step(
+                    model_parts=[model],
+                    parallel_dims=dims,
+                    forward_backward_step=forward_backward,
+                    input_dict=inputs,
+                    labels=labels,
+                    optimizer_step=optimizers.step,
+                    optimizer_zero_grad=optimizers.zero_grad,
+                    lr_scheduler_step=scheduler.step,
+                    clip_grad_norm=clip_gradients,
+                    local_batch_size=batch_size,
+                    seq_len=seq_len,
+                    global_valid_tokens=global_valid_tokens,
+                    gradient_accumulation=gradient_accumulation,
+                    memory_parameter_storage_dtype=simulation.memory_parameter_storage_dtype,
+                    memory_device_type="meta",
+                    memory_offload_ac_saved_tensors=simulation.memory_offload_ac_saved_tensors,
+                    print_memory_summary=False,
+                    scoped_backward_phases=True,
+                    rank=simulation.logical_rank,
+                    capture_process_rank=0,
+                )
+            for name, wall_seconds in workload.iteration.schedule.annotations["capture_timings"].items():
+                timings.add(f"capture_step.{name}", wall_seconds)
             if _buffer_signature(model) != buffers_before:
                 raise RuntimeError(
                     "Registered buffers changed storage/layout during capture; explicit residency modeling required"
@@ -327,29 +368,35 @@ def simulate(simulation):
             )
     from torchtitan_simulator.validation import validate_workload
 
-    workload.iteration.schedule.annotations["capture_validation"] = validate_workload(workload)
+    with timings.measure("workload_validation"):
+        workload.iteration.schedule.annotations["capture_validation"] = validate_workload(workload)
     workload.iteration.schedule.annotations["precision_configuration"] = {
         name: getattr(prepared.trainer.training, name)
         for name in ("dtype", "mixed_precision_param", "mixed_precision_reduce")
     }
     from torchtitan_simulator.capture.fsdp_communication_view import project_fsdp_communication_view
 
-    workload = project_fsdp_communication_view(workload)
+    with timings.measure("fsdp_projection"):
+        workload = project_fsdp_communication_view(workload)
     from torchtitan_simulator.capture.activation_transfers import insert_activation_transfers
 
-    workload = insert_activation_transfers(workload)
+    with timings.measure("activation_transfers"):
+        workload = insert_activation_transfers(workload)
     if simulation.memory_offload_optimizer_states:
         from torchtitan_simulator.capture.optimizer_transfers import insert_optimizer_transfers
 
-        workload = insert_optimizer_transfers(workload)
+        with timings.measure("optimizer_transfers"):
+            workload = insert_optimizer_transfers(workload)
     memory = workload.iteration.schedule.annotations["memory_plan"]
     workload.iteration.schedule.annotations["memory_configuration"] = {
         "offload_activations": memory.offload_ac_saved_tensors,
         "offload_optimizer_states": memory.offload_optimizer_states,
     }
-    workload.iteration.schedule.annotations["capture_validation"] = validate_workload(workload)
+    with timings.measure("workload_validation"):
+        workload.iteration.schedule.annotations["capture_validation"] = validate_workload(workload)
     if simulation.output_formats:
-        export_result(workload, simulation)
+        with timings.measure("export"):
+            export_result(workload, simulation)
     return workload
 
 

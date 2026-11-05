@@ -83,6 +83,7 @@ MXFP8 由开关选择，不使用旧 `_baseline_bf16`／`_baseline_mxfp8` preset
 | `workload.step_templates` | F/B/O 等原生捕获模板，节点保留数据／控制依赖；遍历全体模板建立全局 ID 索引 |
 | `workload.schedule_plan` | 原生 action／slot 计划；不能与平台 L1/L2 命名直接等同 |
 | `workload.iteration.schedule.annotations` | 捕获事实、配置、梯度验证、通信和静态内存等注记 |
+| 同级 `host_timings` | 单次宿主阶段墙钟诊断，每阶段 seconds／calls；包含嵌套子项，不可直接求和，不是模拟设备耗时，见 [Muon 规划与计时](muon.md#原生规划效率与宿主计时) |
 | 同级 `capture` | 实际预热／捕获边界，见稳态捕获专题；旧结果缺失不补造 |
 | 同级 `memory_plan`／`memory_summary` | 正式静态内存对象和摘要，单位 bytes，不依赖文件 |
 | `workload.captured_workload` | 完整源图，用于审计；默认下游消费返回的 FSDP 通信视图 |

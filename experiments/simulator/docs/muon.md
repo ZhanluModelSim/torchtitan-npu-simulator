@@ -70,3 +70,18 @@ TORCH_DEVICE_BACKEND_AUTOLOAD=0 python -m pytest -q \
 配置测试覆盖显式选择、原生默认值和拒绝组合；捕获测试覆盖混合参数所有权、完整更新、状态字节、异常恢复和并行组合；原有 DSV4/Kimi 与 AdamW 测试保护已有路径。[聚合卸载测试](../tests/test_muon_offload.py) 以单卡和 world=8、EP=2 检查独立 workspace 容量预期、F/B/O 常驻、状态传输量与原生前驱保持。[内存字节测试](../tests/memory/test_optimizer_state.py) 检查 alias 去重和 workspace 卸载后保留。
 
 依赖测试在卸载开关两种状态下证明图允许预取重叠，并不提供真实重叠时长。平台三路汇合与 Trace 诊断的 synthetic 验证边界见[优化器卸载](optimizer-offload.md#验证)。真实设备计算耗时、HCCL 传输及资源竞争由平台和算子后端处理；Meta 捕获不证明 NPU 数值、性能精度或真实跨 rank 计划一致性。
+
+## 原生规划效率与宿主计时
+
+主包扩展在兼容 backport 之后启用等价的 FlexShard 规划优化，正常训练和 simulator 共用同一实现，不额外改变 recipe 或 optimizer 开关。实现位于 `torchtitan_npu/extensions/torchtitan/distributed/flex_shard/`，与上游兼容补丁分开维护。
+
+- 区域先执行完整边界校验；能沿任一轴证明互不相交时使用排序后的区间证明，否则回退通用两两校验。空区域、覆盖关系、重复参与者和非法布局仍须校验。
+- 按源／目标 rank 建立 routes 索引，避免每个 rank 重扫所有 routes。
+- All2All 打包按 peer 建立索引，并按原参与者、参数、route 顺序输出 splits 和 spans；保留零 split、自复制、replicated source 选择和全组 `has_remote_transfers`。
+- mesh 的 rank→坐标映射仅在一次 `build_bucket_plans` 调用内复用；结束或异常时清理，不跨模拟会话缓存 tensor、slot、图事件或 Owned 分配结果。
+
+优化不改变分桶、compute owner、矩阵计算、通信组与有序 ranks、All2All／事件依赖、打包 offset 或 workspace 容量。不通过删除校验、跳过空参与者的 collective 或改变 Newton–Schulz 次数缩短捕获时间。
+
+`simulate()` 成功返回的 `iteration.schedule.annotations["host_timings"]` 记录 `clock`、`scope`、`status` 和 `stages`；每阶段包含 `wall_seconds` 与 `calls`。配置、model build、parallelize、optimizer build、warmup、正式 F/B 捕获、内存规划、FSDP 投影及卸载插入分别记录。`optimizer_planning.*` 包含 build、geometry、routes、validation、packing；这些是**含子调用的墙钟时间，不可直接求和**。`capture_step.*` 兼容保留原 `capture_timings` 的细项。
+
+日志以 INFO 输出单次宿主计时摘要；失败时记录 `status="failed"` 及已执行阶段，不返回伪成功负载。计时用 `time.perf_counter()`，不做设备同步，不作为算子或通信的设备执行耗时，不改变静态显存预算；旧结果缺少此注记时不补造。
