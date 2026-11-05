@@ -190,6 +190,7 @@ def prepare_config(simulation: SimulationConfig) -> PreparedConfig:
         "glm5_next_debugmodel_multimodal": "torchtitan_simulator.presets.glm5_next_debugmodel_multimodal",
         "glm5_next_reduced_2l": "torchtitan_simulator.presets.glm5_next_reduced_2l",
         "glm5_next": "torchtitan_simulator.presets.glm5_next",
+        "glm5_next_910b_test": "torchtitan_simulator.presets.glm5_next_910b_test",
     }
     target = factories.get(simulation.config, simulation.config)
     if "." not in target:

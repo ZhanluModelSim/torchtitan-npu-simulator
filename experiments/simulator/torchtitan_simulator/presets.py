@@ -167,3 +167,7 @@ def glm5_next_reduced_2l(*, num_mtp_layers: int = 0):
 
 def glm5_next(*, num_mtp_layers: int = 0):
     return _glm5_next_trainer_config("glm5_next", num_mtp_layers=num_mtp_layers)
+
+
+def glm5_next_910b_test(*, num_mtp_layers: int = 0):
+    return _glm5_next_trainer_config("glm5_next_910b_test", num_mtp_layers=num_mtp_layers)

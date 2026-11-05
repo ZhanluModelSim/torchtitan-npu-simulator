@@ -87,3 +87,9 @@ def glm5_next(*, num_mtp_layers: int = 0) -> TrainerEx.Config:
     if num_mtp_layers:
         raise ValueError("GLM-5.3-Flash has no MTP modules; num_mtp_layers must be 0")
     return _make_trainer_config("GLM-5.3-Flash")
+
+
+def glm5_next_910b_test(*, num_mtp_layers: int = 0) -> TrainerEx.Config:
+    if num_mtp_layers:
+        raise ValueError("GLM-5.3-Flash has no MTP modules; num_mtp_layers must be 0")
+    return _make_trainer_config("910b-test")
