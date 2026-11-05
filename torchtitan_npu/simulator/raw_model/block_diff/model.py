@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import math
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -408,7 +409,10 @@ class MoE(nn.Module):
             raise ValueError("meta MoE execution requires a RoutingPlan")
         if routing_plan is not None:
             routing_plan.validate(num_tokens, cfg.num_experts, cfg.num_experts_per_tok)
-        scores = self.router(tokens.float())
+        # The routing precision is part of the contract, including under AMP.
+        context = nullcontext() if tokens.device.type == "meta" else torch.autocast(tokens.device.type, enabled=False)
+        with context:
+            scores = self.router(tokens.float())
         _, selected = scores.topk(cfg.num_experts_per_tok, dim=-1)
         if routing_plan is not None:
             selected = torch.tensor(routing_plan.expert_indices, dtype=torch.long, device=x.device)

@@ -26,7 +26,7 @@ python -B -m pytest -q --import-mode=prepend \
   tests/unit_tests/models/block_diffusion_reference
 ```
 
-主 agent 最终复跑：**162 passed, 14 warnings in 6.04s，无跳过**。
+主 agent 最终复跑：**163 passed, 14 warnings in 5.96s，无跳过**。
 14 条 warning 来自上游 TorchScript 弃用提示。仅安装独立参考依赖时 native
 测试可能跳过，不能把那种运行结果当成本页的 native 对齐证据。
 
@@ -34,7 +34,7 @@ python -B -m pytest -q --import-mode=prepend \
 
 | 范围 | 结果 |
 | --- | --- |
-| 原有独立参考／工具／权重转换 | 120 项通过，文件迁移不改变行为 |
+| 独立参考／工具／权重转换 | 121 项通过，包含本轮新增 raw router autocast 精度回归 |
 | 新增 native、converter 与配置对齐 | 42 项通过 |
 | Dense / MoE × 两种 exact mask | 同配置、同权重 logits、loss_sum、有效 token 归一化 loss 及全部参数梯度一致 |
 | 独立全 mask GQA attention 参考 | 前向与 Q/K/V 梯度一致 |
@@ -59,6 +59,9 @@ python -B -m pytest -q --import-mode=prepend \
 4. **Proxy 静默覆盖 RoPE**：保留用户显式 backend/scaling，不强制改回 flavor 默认值。
 5. **Exact matmul 输出几何错误**：元素数相同但 BSH 不符合逐头矩阵乘法输出。
    改为逐头结果，再显式 view/transpose/reshape；GQA backward 记录归约。
+6. **Raw 的 AMP 精度契约未落实**：参考 router 的 FP32 输入仍可能被外层
+   autocast 降为 BF16。现显式关闭路由评分中的 autocast，修复既定 v1 精度
+   规则的执行；不是新增训练范式或改变 contract version。
 
 两个独立审查发现的 S2（第 4、5 项）均已复测关闭。已按仓库 reviewer skill
 审查规范、模型/converter/并行规则、设计、调用点及训练基础设施。

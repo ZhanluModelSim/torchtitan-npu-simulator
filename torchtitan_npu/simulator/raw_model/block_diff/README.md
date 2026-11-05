@@ -17,7 +17,7 @@ query/KV heads 为 `Nq/Nkv`，head dimension 为 `D`，词表为 `V`。
 - dense FFN 为 `down(silu(gate(x))*up(x))`。MoE 为逐 token top-k routed
   SwiGLU experts，加 `num_shared_experts` 个可选 shared expert 的输出之和。
   shared expert 数可以为零；`num_experts=0` 时为 dense，不启用 shared experts。
-- router 在 FP32 计算 logits，选择 top-k 后对所选 logits 作 softmax。
+- router 即使在外层 autocast 下也在 FP32 计算 logits，选择 top-k 后对所选 logits 作 softmax。
   `RoutingPlan` 可显式回放每个 token 的不同专家 ID；每个 pair 计算一次，
   按专家分组执行，不为每个 token 复制整份专家权重。
 - `tie_word_embeddings=True` 必须实际共享 embedding 与输出头的 Parameter。

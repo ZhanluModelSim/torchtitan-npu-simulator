@@ -358,3 +358,14 @@ def test_per_request_positions_validate_device_and_cpu_bounds():
     for bad_index in (-1, 4):
         with pytest.raises((RuntimeError, IndexError)):
             model(tokens, logits_positions=torch.full((2, 1), bad_index, dtype=torch.long))
+
+
+def test_raw_router_fp32_contract_survives_outer_autocast():
+    moe = MoE(config(num_experts=4, num_experts_per_tok=2, moe_intermediate_size=12))
+    score_dtypes = []
+    handle = moe.router.register_forward_hook(lambda _module, _inputs, output: score_dtypes.append(output.dtype))
+    with torch.autocast("cpu", dtype=torch.bfloat16):
+        output = moe(torch.randn(1, 3, 16))
+    handle.remove()
+    assert score_dtypes == [torch.float32]
+    assert output.isfinite().all()
