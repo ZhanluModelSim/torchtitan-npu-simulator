@@ -29,6 +29,7 @@ OP_MAPPING: dict[str, str] = {
     "aten.scaled_dot_product_attention.default": "sdpa",
     "aten._scaled_dot_product_flash_attention.default": "flash_attention_fwd",
     "npu.npu_fusion_attention.default": "flash_attention_fwd",
+    "npu.npu_fusion_attention_grad.default": "flash_attention_bwd",
     "npu.npu_sparse_flash_attention.default": "flash_attention_fwd",
     "npu.npu_sparse_attn_sharedkv.default": "flash_attention_fwd",
     "npu.npu_lightning_indexer.default": "flash_attention_fwd",

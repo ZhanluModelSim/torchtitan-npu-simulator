@@ -6,8 +6,12 @@
 """Model-independent SwigluGroup overrides (registry-facing module)."""
 
 from torchtitan.config import derive, override
+import spmd_types as spmd
+
+from torchtitan.models.common.decoder_sharding import dense_param_placement
 from torchtitan.models.common.feed_forward import FeedForward
 from torchtitan.models.common.moe import GroupedExperts
+from torchtitan.protocols.sharding import ShardingConfig
 
 from .ascendc import (
     AscFeedForward,
@@ -47,4 +51,17 @@ def asc(cfg: GroupedExperts.Config) -> AscGroupedExperts.Config:
     description="Use cann_ops_nn.swiglu_group for shared and dense feed-forwards.",
 )
 def asc_shared_experts(cfg: FeedForward.Config) -> AscFeedForward.Config:
-    return derive(cfg, AscFeedForward.Config)
+    derived = derive(cfg, AscFeedForward.Config)
+    return _stamp_clamp_buffers(derived)
+
+
+def _stamp_clamp_buffers(config: AscFeedForward.Config) -> AscFeedForward.Config:
+    """Declare the clamped-swiglu bound buffers (replicated constants) on the
+    derived config, merging into any sharding the tree already carries."""
+    placement = dense_param_placement(tp=spmd.R)
+    if config.sharding_config is None:
+        config.sharding_config = ShardingConfig(state_shardings={})
+    state_shardings = config.sharding_config.state_shardings
+    state_shardings["_min_bound"] = placement
+    state_shardings["_max_bound"] = placement
+    return config

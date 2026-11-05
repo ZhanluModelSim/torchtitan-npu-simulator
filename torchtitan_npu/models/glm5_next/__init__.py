@@ -242,7 +242,13 @@ def _reduced_2l() -> Glm5NextModel.Config:
     return _full(trim_layers=4)
 
 
-def _full(trim_layers: int | None = None, *, num_experts: int = 288, index_kpool: int = 16) -> Glm5NextModel.Config:
+def _full(
+    trim_layers: int | None = None,
+    *,
+    num_experts: int = 288,
+    index_kpool: int = 16,
+    vision=None,
+) -> Glm5NextModel.Config:
     """GLM-5.3-Flash production dims (GLM-5.3-Flash-BF16 HF config).
 
     text: 45 layers (34 KDA + 11 DSA), hidden 4096, vocab 154880, NoPE,
@@ -250,7 +256,7 @@ def _full(trim_layers: int | None = None, *, num_experts: int = 288, index_kpool
     first 3 dense MLP (inter 12288), 42 MoE layers (288 experts top-8 +
     1 shared, moe_inter 2048, sigmoid routing, scaling 2.5, clamp 10).
     """
-    from .model import Glm5NextModel  # noqa: F401
+    from .model import Glm5NextModel, Glm5NextMultimodalModel  # noqa: F401
 
     n_layers = 45 if trim_layers is None else trim_layers
     dim = 4096
@@ -282,15 +288,16 @@ def _full(trim_layers: int | None = None, *, num_experts: int = 288, index_kpool
             ),
             hc_mult=4,
         ),
+        vision=vision,
     )
 
 
-def _910b_test() -> Glm5NextModel.Config:
+def _910b_test() -> Glm5NextMultimodalModel.Config:
     """The 910B3 functional-test geometry (glm53_flash_910b_test.yaml):
     production dims trimmed to 4 layers (3 KDA + 1 DSA), 48 routed experts
-    + 1 shared, indexer kpool 4. Text-only (the real run's vision tower is
-    outside the capture graph)."""
-    return _full(trim_layers=4, num_experts=48, index_kpool=4)
+    + 1 shared, indexer kpool 4, and the active vision tower (the real run
+    trains one 448x448 image per sample; the profile's [1024, *] kernels)."""
+    return _full(trim_layers=4, num_experts=48, index_kpool=4, vision=_vision_config())
 
 
 glm5_next_configs = {

@@ -7,12 +7,12 @@
 
 Mirrors ``Glm5NextTextAttention`` + ``Glm5NextTextIndexer`` in MindSpeed-MM
 ``modeling_glm5_next.py``: MLA (q/kv LoRA) + a k-pool compressed lightning
-indexer selecting top-k token pools, with the absorbed-MLA sparse attention
-(``npu_sparse_flash_attention`` in production). The whole indexer runs
-under ``torch.no_grad()`` (frozen by design — its parameters get no
-gradients in production). The 0.3.0 capture is ATen level: the eager
-absorbed-attention fallback computes the same math through explicit
-gathers and stays meta-safe.
+indexer selecting top-k token pools. The whole indexer runs under
+``torch.no_grad()`` (frozen by design — its parameters get no gradients in
+production). The attention follows the production
+``dsa_implementation='dense'`` recipe: materialize per-head K/V from the
+compressed latent, scatter the top-k indices into a [B, 1, S, S] visibility
+mask, and run ``torch_npu.npu_fusion_attention`` (FlashAttentionScore).
 """
 
 from dataclasses import dataclass, field
@@ -185,7 +185,7 @@ class DSAIndexer(Module):
 
 
 class DSAAttention(Module):
-    """MLA + DSA indexer with the absorbed sparse-attention path."""
+    """MLA + DSA indexer with the dense-mask fused-attention path."""
 
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
@@ -263,31 +263,50 @@ class DSAAttention(Module):
         # torch.no_grad() and production never trains these parameters.
         self.indexer.requires_grad_(False)
 
-    def _absorbed_weights(self):
-        """Split kv_b_proj.weight into W_UK / W_UV ([N, kv_lora, *] views)."""
-        weight = self.kv_b_proj.weight
-        if isinstance(weight, torch.distributed.tensor.DTensor):
-            weight = weight.to_local()
-        weight = weight.view(self.num_heads, self.qk_nope_head_dim + self.v_head_dim, self.kv_lora_rank)
-        return weight[:, : self.qk_nope_head_dim, :], weight[:, self.qk_nope_head_dim :, :]
+    def _dense_mask_from_topk(self, topk_indices, batch_size, seq_length):
+        """MindSpeed ``build_attention_mask_from_topk``: scatter the selected
+        indices into a dense [B, 1, S, S] visibility mask (the DSA indexer
+        already excludes padding and causality from its candidates)."""
+        valid = topk_indices.ge(0) & topk_indices.lt(seq_length)
+        counts = torch.zeros(
+            batch_size,
+            seq_length,
+            seq_length,
+            dtype=torch.int32,
+            device=topk_indices.device,
+        )
+        counts.scatter_add_(-1, topk_indices.clamp(0, seq_length - 1), valid.to(torch.int32))
+        return counts.ne(0).unsqueeze(1)
 
-    def _eager_absorbed_attention(self, query_states, k_pass, topk_indices):
-        """Meta-safe absorbed MLA fallback: gather selected latents per query
-        and run explicit absorbed attention. query_states [B, S, N, qk_nope];
-        k_pass [B, S, kv_lora]."""
-        _, s, _, _ = query_states.shape
-        w_uk, w_uv = self._absorbed_weights()
-        q_exp = torch.einsum("bsnd,ndc->bsnc", query_states, w_uk.to(query_states.dtype))
+    def _dense_attention(self, query_states, k_pass, topk_indices):
+        """MindSpeed ``dsa_implementation='dense'``: materialize per-head
+        K/V from the compressed latent and run the fused attention kernel
+        over the full sequence with the top-k visibility mask.
 
-        idx = topk_indices.clamp(0, s - 1)
-        latent_sel = (
-            k_pass[:, None].expand(-1, s, -1, -1).gather(2, idx[..., None].expand(-1, -1, -1, k_pass.shape[-1]))
-        )  # [B, S, K, C]: latent_sel[b, i, k, :] = k_pass[b, idx[b, i, k], :]
+        query_states [B, S, N, qk_head]; k_pass [B, S, kv_lora]; returns
+        [B, S, N, v_head]."""
+        batch_size, seq_length = query_states.shape[:2]
+        kv = self.kv_b_proj(k_pass).view(
+            batch_size, seq_length, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
+        )
+        key_states = kv[..., : self.qk_nope_head_dim].transpose(1, 2)
+        value_states = kv[..., self.qk_nope_head_dim :].transpose(1, 2)
+        # NoPE DSA: qk_rope_head_dim == 0, so the key needs no rope tail and
+        # qk_head_dim == qk_nope_head_dim.
 
-        scores = torch.einsum("bsnc,bskc->bsnk", q_exp, latent_sel)
-        attn = torch.softmax(scores * self.scaling, dim=-1)
-        out = torch.einsum("bsnk,bskc->bsnc", attn, latent_sel)
-        return torch.einsum("bsnc,nvc->bsnv", out, w_uv.to(out.dtype))
+        import torch_npu
+
+        atten_mask = self._dense_mask_from_topk(topk_indices, batch_size, seq_length)
+        attn_output = torch_npu.npu_fusion_attention(
+            query_states.transpose(1, 2),
+            key_states,
+            value_states,
+            self.num_heads,
+            "BNSD",
+            atten_mask=atten_mask,
+            scale=self.scaling,
+        )[0]
+        return attn_output.transpose(1, 2)
 
     def forward(
         self,
@@ -319,7 +338,7 @@ class DSAAttention(Module):
             mask = torch.ones(batch_size, seq_length, dtype=torch.bool, device=hidden_states.device)
 
         topk_indices = self.indexer(hidden_states, q_resid, mask)
-        attn_output = self._eager_absorbed_attention(query_states, k_pass, topk_indices)
+        attn_output = self._dense_attention(query_states, k_pass, topk_indices)
 
         attn_output = attn_output.reshape(batch_size, seq_length, -1).contiguous()
         return self.o_proj(attn_output), topk_indices

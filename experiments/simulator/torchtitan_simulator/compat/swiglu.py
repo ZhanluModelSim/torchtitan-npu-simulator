@@ -95,6 +95,48 @@ class _SwigluMetaAutograd(torch.autograd.Function):
         return dx, dw, None
 
 
+class _NpuSwigluMetaAutograd(torch.autograd.Function):
+    """Meta autograd pair for ``npu_swiglu`` (the vendor forward has a Meta
+    kernel but no gradient registration, which silently cuts the backward
+    chain). The backward emits the ``npu_swiglu_backward`` node."""
+
+    @staticmethod
+    def forward(ctx, x):
+        ctx.save_for_backward(x)
+        return torch.ops.npu.npu_swiglu.default(x, dim=-1)
+
+    @staticmethod
+    # pyrefly: ignore [bad-override]
+    def backward(ctx, grad):
+        (x,) = ctx.saved_tensors
+        return (torch.ops.npu.npu_swiglu_backward.default(grad, x, dim=-1),)
+
+
+def install_npu_swiglu_autograd(scope):
+    import spmd_types
+    import torch_npu
+
+    original = torch_npu.npu_swiglu
+    with torch.enable_grad():
+        x = torch.empty(2, 8, device="meta", requires_grad=True)
+        try:
+            torch.autograd.grad(original(x).sum(), x)
+        except RuntimeError as error:
+            if "not have been used in the graph" not in str(error):
+                raise
+        else:
+            return "native"
+    spmd_types.register_local_autograd_function(_NpuSwigluMetaAutograd)
+
+    def swiglu(input, dim=-1):
+        if input.device.type != "meta" or dim != -1:
+            return original(input, dim)
+        return _NpuSwigluMetaAutograd.apply(input.contiguous())
+
+    scope.replace(torch_npu, "npu_swiglu", swiglu)
+    return "bridge_fake_vendor_meta"
+
+
 def install_meta_swiglu_autograd(scope):
     import spmd_types
 

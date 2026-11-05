@@ -26,8 +26,6 @@ from torch import nn
 from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.protocols.module import Module
 
-from .feed_forward import clamp_swiglu_eager
-
 
 def _vision_position_ids(num_images: int, grid_size: int) -> torch.Tensor:
     """Qwen-VL-style 2D vision RoPE coordinates for a uniform square grid.
@@ -46,6 +44,25 @@ def _vision_position_ids(num_images: int, grid_size: int) -> torch.Tensor:
     return per_image.unsqueeze(0).expand(num_images, -1, -1).reshape(-1, 2)
 
 
+def _swiglu(gate_up: torch.Tensor) -> torch.Tensor:
+    """Production ``swiglu()``: the ACLNN kernel on NPU/meta, eager off it."""
+    if gate_up.device.type == "cpu":
+        gate, up = gate_up.chunk(2, dim=-1)
+        return F.silu(gate) * up
+    import torch_npu
+
+    return torch_npu.npu_swiglu(gate_up, dim=-1)
+
+
+def _npu_rms_norm(norm, x: torch.Tensor) -> torch.Tensor:
+    """Production RMSNorm: ``npu_rms_norm`` on NPU/meta, eager off it."""
+    if x.device.type == "cpu":
+        return norm(x)
+    import torch_npu
+
+    return torch_npu.npu_rms_norm(x, norm.weight.to(x.dtype), epsilon=norm.eps)[0]
+
+
 class VisionMLP(nn.Module):
     def __init__(self, hidden_size: int, intermediate_size: int, swiglu_limit: float):
         super().__init__()
@@ -53,6 +70,19 @@ class VisionMLP(nn.Module):
         self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=True)
         self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=True)
         self.swiglu_limit = swiglu_limit
+        # Production clamped-swiglu bounds (gate half upper-only, up half
+        # both sides), kept as non-persistent buffers like the reference.
+        self.register_buffer(
+            "_min_bound",
+            torch.cat(
+                [
+                    torch.full((intermediate_size,), float("-inf")),
+                    torch.full((intermediate_size,), -swiglu_limit),
+                ]
+            ),
+            persistent=False,
+        )
+        self.register_buffer("_max_bound", torch.full((2 * intermediate_size,), swiglu_limit), persistent=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Reference folds gate/up weights into one linear (fused gate_up).
@@ -61,8 +91,8 @@ class VisionMLP(nn.Module):
             torch.cat([self.gate_proj.weight, self.up_proj.weight], dim=0),
             torch.cat([self.gate_proj.bias, self.up_proj.bias]),
         )
-        gate_up = torch.clamp(gate_up, min=-self.swiglu_limit, max=self.swiglu_limit)
-        return self.down_proj(clamp_swiglu_eager(gate_up, self.swiglu_limit))
+        gate_up = torch.clamp(gate_up, min=self._min_bound.to(gate_up.dtype), max=self._max_bound.to(gate_up.dtype))
+        return self.down_proj(_swiglu(gate_up))
 
 
 class VisionAttention(nn.Module):
@@ -91,8 +121,8 @@ class VisionAttention(nn.Module):
         query, key, value = (
             self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
         )
-        query = self.q_norm(query)
-        key = self.k_norm(key)
+        query = _npu_rms_norm(self.q_norm, query)
+        key = _npu_rms_norm(self.k_norm, key)
 
         cos = cos.unsqueeze(-2).float()
         sin = sin.unsqueeze(-2).float()
@@ -100,18 +130,23 @@ class VisionAttention(nn.Module):
         key = ((key.float() * cos) + (self._rotate_half(key.float()) * sin)).to(key.dtype)
 
         # Uniform-square fallback: every image has the same length, so a
-        # plain batched non-causal SDPA over [N, H, L, D] is equivalent to
-        # the production packed varlen fusion attention.
+        # plain batched non-causal fused attention over [N, H, L, D] is
+        # equivalent to the production packed varlen fusion attention
+        # (FlashAttentionScore [B, H, L, D] in the device profile).
         total, heads, dim = query.shape[0], query.shape[1], query.shape[2]
         per_image = cu_seqlens.shape[0] - 1
         length = total // per_image
+        import torch_npu
+
         attn_output = (
-            F.scaled_dot_product_attention(
+            torch_npu.npu_fusion_attention(
                 query.view(per_image, length, heads, dim).transpose(1, 2),
                 key.view(per_image, length, heads, dim).transpose(1, 2),
                 value.view(per_image, length, heads, dim).transpose(1, 2),
+                heads,
+                "BNSD",
                 scale=self.scaling,
-            )
+            )[0]
             .transpose(1, 2)
             .reshape(total, heads * dim)
         )
@@ -127,8 +162,8 @@ class VisionBlock(nn.Module):
         self.mlp = VisionMLP(hidden_size, intermediate_size, swiglu_limit)
 
     def forward(self, hidden_states, cu_seqlens, cos, sin):
-        hidden_states = hidden_states + self.attn(self.norm1(hidden_states), cu_seqlens, cos, sin)
-        hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
+        hidden_states = hidden_states + self.attn(_npu_rms_norm(self.norm1, hidden_states), cu_seqlens, cos, sin)
+        hidden_states = hidden_states + self.mlp(_npu_rms_norm(self.norm2, hidden_states))
         return hidden_states
 
 
@@ -255,7 +290,7 @@ class GlmVisionTower(Module):
         for blk in self.blocks:
             hidden_states = blk(hidden_states, cu_seqlens, cos, sin)
 
-        hidden_states = self.post_layernorm(hidden_states)
+        hidden_states = _npu_rms_norm(self.post_layernorm, hidden_states)
         hidden_states = hidden_states.view(-1, cfg.spatial_merge_size, cfg.spatial_merge_size, cfg.hidden_size)
         hidden_states = hidden_states.permute(0, 3, 1, 2)
         hidden_states = self.downsample(hidden_states).view(-1, cfg.out_hidden_size)

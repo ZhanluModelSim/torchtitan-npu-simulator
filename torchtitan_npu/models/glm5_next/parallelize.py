@@ -14,7 +14,7 @@ CP, PP and ETP land with the parallelism matrix phase.
 
 import logging
 
-import torch  # noqa: TC002  # runtime-evaluated parameter annotation below
+import torch
 from torchtitan.config import (
     TORCH_DTYPE_MAP,
     CompileConfig,
@@ -31,6 +31,42 @@ from .attention import DSAIndexer
 from .model import Glm5NextModel
 
 logger = logging.getLogger(__name__)
+
+
+def _distribute_vision_states(vision_encoder: torch.nn.Module, parallel_dims: ParallelDims) -> None:
+    """Distribute the vision tower's plain ``nn`` states as replicated DTensors.
+
+    The tower internals are plain ``nn.Module`` children (Conv3d etc. have no
+    protocol counterpart), so the protocol ``Module.parallelize`` walk never
+    covers their parameters/buffers. FSDP2 requires every parameter to be a
+    DTensor on the full SPMD mesh when ``dp_mesh_dims`` is provided (EP > 1),
+    so distribute them here with the dense replicated placement, mirroring
+    ``Module._spmd_distribute_state``.
+    """
+    import spmd_types as spmd
+    from torch.distributed.tensor import DTensor
+    from torchtitan.distributed.spmd_types import set_current_spmd_mesh, spmd_distribute_tensor
+    from torchtitan.models.common.decoder_sharding import dense_param_placement
+
+    layout = dense_param_placement(tp=spmd.R)
+    mesh = parallel_dims.get_optional_mesh([axis.value for axis in layout.axes()], include_singleton_axes=True)
+    assert mesh is not None
+    for child in vision_encoder.modules():
+        for name, param in list(child.named_parameters(recurse=False)):
+            if isinstance(param, DTensor):
+                continue
+            tensor = spmd_distribute_tensor(param, mesh, layout)
+            child.register_parameter(name, torch.nn.Parameter(tensor, requires_grad=param.requires_grad))
+            with set_current_spmd_mesh(mesh):
+                spmd.assert_type(child._parameters[name], layout.axis_types, layout.partition_spec)
+        for name, buffer in list(child.named_buffers(recurse=False)):
+            if isinstance(buffer, DTensor):
+                continue
+            tensor = spmd_distribute_tensor(buffer, mesh, layout)
+            persistent = name not in child._non_persistent_buffers_set
+            child.register_buffer(name, tensor, persistent=persistent)
+            with set_current_spmd_mesh(mesh):
+                spmd.assert_type(child._buffers[name], layout.axis_types, layout.partition_spec)
 
 
 def parallelize_glm5_next(
@@ -96,6 +132,7 @@ def parallelize_glm5_next(
     edp_mesh, edp_mesh_dims = resolve_sparse_fsdp_mesh(parallel_dims)
 
     if model.vision_encoder is not None:
+        _distribute_vision_states(model.vision_encoder, parallel_dims)
         from torchtitan.distributed.fsdp import apply_fsdp_to_vision_encoder
 
         apply_fsdp_to_vision_encoder(
