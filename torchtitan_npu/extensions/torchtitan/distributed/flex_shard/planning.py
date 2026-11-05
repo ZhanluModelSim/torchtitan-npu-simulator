@@ -9,6 +9,7 @@ planning call. Timing observations are host wall time, never simulated costs.
 
 from __future__ import annotations
 
+from bisect import bisect_right
 from collections import defaultdict
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -37,6 +38,7 @@ NATIVE_PACK = schedule._build_packed_all_to_all_schedule
 NATIVE_STORAGE_REGION = schedule._dtensor_storage_region_for_participant
 NATIVE_STORAGE_REGIONS = schedule._dtensor_storage_regions
 NATIVE_RESOLVE_PLANS = muon._resolve_muon_redistribution_plans
+NATIVE_BATCHED_PLAN = muon._build_batched_matrix_redistribution_plan
 
 
 @dataclass
@@ -324,3 +326,181 @@ def build_bucket_plans[ItemT](
         )
     finally:
         _mesh_coordinates.reset(token)
+
+
+def build_batched_matrix_redistribution_plan(
+    storage_regions: Sequence[tuple[tuple[int, ...], schedule._TensorRegion]],
+    *,
+    participants: tuple[int, ...],
+    storage_shape: tuple[int, ...],
+    compute_shape: tuple[int, ...],
+) -> schedule._RedistributionPlan:
+    """Prune disjoint matrix candidates, retaining native order and validation."""
+    # The interval proof requires positive matrix dimensions and bounded row
+    # regions. Delegate all other inputs to preserve native degenerate behavior
+    # and diagnostics instead of introducing division-by-zero or early errors.
+    eligible = (
+        len(storage_shape) == 2
+        and len(compute_shape) == 3
+        and all(size > 0 for size in compute_shape)
+        and storage_shape == (compute_shape[0] * compute_shape[1], compute_shape[2])
+        and bool(participants)
+        and all(
+            len(region.offsets) == 2
+            and len(region.shape) == 2
+            and region.offsets[0] >= 0
+            and region.shape[0] >= 0
+            and region.offsets[0] + region.shape[0] <= storage_shape[0]
+            and region.offsets[1] == 0
+            and region.shape[1] == storage_shape[1]
+            for _, region in storage_regions
+        )
+    )
+    builder = _build_batched_matrix_plan if eligible else NATIVE_BATCHED_PLAN
+    return builder(storage_regions, participants=participants, storage_shape=storage_shape, compute_shape=compute_shape)
+
+
+def _build_batched_matrix_plan(
+    storage_regions: Sequence[tuple[tuple[int, ...], schedule._TensorRegion]],
+    *,
+    participants: tuple[int, ...],
+    storage_shape: tuple[int, ...],
+    compute_shape: tuple[int, ...],
+) -> schedule._RedistributionPlan:
+    """Build flat 2D routes whose destination shards contain complete matrices."""
+    schedule._require_valid_plan(
+        len(storage_shape) == 2
+        and len(compute_shape) == 3
+        and storage_shape[0] == compute_shape[0] * compute_shape[1]
+        and storage_shape[1] == compute_shape[2],
+        "matrix-batch redistribution requires flat 2D storage plus a 3D matrix-batch compute shape",
+    )
+
+    num_matrices, matrix_rows, matrix_columns = compute_shape
+    storage_by_participant = {}
+    storage_endpoints = []
+    for holders, logical_region in storage_regions:
+        schedule._require_valid_plan(
+            bool(holders)
+            and len(logical_region.shape) == 2
+            and logical_region.offsets[1] == 0
+            and logical_region.shape[1] == matrix_columns,
+            "matrix-batch redistribution requires row-sharded 2D storage",
+        )
+        tensor_region = schedule._TensorRegion(
+            offsets=(0, 0),
+            shape=logical_region.shape,
+        )
+        storage_endpoints.append((holders, logical_region, tensor_region))
+        for participant in holders:
+            schedule._require_valid_plan(
+                participant in participants and participant not in storage_by_participant,
+                "matrix-batch storage holders must partition participants",
+            )
+            storage_by_participant[participant] = (logical_region, tensor_region)
+
+    schedule._require_valid_plan(
+        set(storage_by_participant) == set(participants),
+        "matrix-batch storage must cover every participant",
+    )
+
+    storage_partitions = tuple(
+        schedule._ParticipantPartition(
+            participant=participant,
+            tensor_shape=storage_by_participant[participant][1].shape,
+            logical_regions=(storage_by_participant[participant][0],),
+        )
+        for participant in participants
+    )
+
+    compute_endpoints = []
+    compute_partitions_list = []
+    for mesh_rank, participant in enumerate(participants):
+        local_num_matrices, matrix_offset = Shard.local_shard_size_and_offset(
+            num_matrices,
+            len(participants),
+            mesh_rank,
+        )
+        logical_region = schedule._TensorRegion(
+            offsets=(matrix_offset * matrix_rows, 0),
+            shape=(local_num_matrices * matrix_rows, matrix_columns),
+        )
+        compute_endpoints.append(((participant,), matrix_offset, local_num_matrices))
+        compute_partitions_list.append(
+            schedule._ParticipantPartition(
+                participant=participant,
+                tensor_shape=logical_region.shape,
+                logical_regions=(logical_region,),
+            )
+        )
+    compute_partitions = tuple(compute_partitions_list)
+
+    # Shard assigns increasing matrix intervals in participant order. Keep empty
+    # partitions above; omit them only from this search index, never from the plan.
+    nonempty_endpoints = tuple(endpoint for endpoint in compute_endpoints if endpoint[2] > 0)
+    compute_row_ends = tuple((offset + count) * matrix_rows for _, offset, count in nonempty_endpoints)
+    storage_to_compute_routes = []
+    for source_holders, storage_region, storage_tensor_base in storage_endpoints:
+        storage_row_offset = storage_region.offsets[0]
+        storage_row_end = storage_row_offset + storage_region.shape[0]
+        if storage_row_end <= storage_row_offset:
+            continue
+        endpoint_index = bisect_right(compute_row_ends, storage_row_offset)
+        while endpoint_index < len(nonempty_endpoints):
+            destination_holders, matrix_offset, local_num_matrices = nonempty_endpoints[endpoint_index]
+            endpoint_index += 1
+            if matrix_offset * matrix_rows >= storage_row_end:
+                break
+            first_matrix = max(0, storage_row_offset // matrix_rows - matrix_offset)
+            last_matrix = min(local_num_matrices, (storage_row_end + matrix_rows - 1) // matrix_rows - matrix_offset)
+            for local_matrix_index in range(first_matrix, last_matrix):
+                matrix_index = matrix_offset + local_matrix_index
+                matrix_row_offset = matrix_index * matrix_rows
+                route_row_offset = max(storage_row_offset, matrix_row_offset)
+                route_row_end = min(
+                    storage_row_end,
+                    matrix_row_offset + matrix_rows,
+                )
+                route_rows = route_row_end - route_row_offset
+                if route_rows <= 0:
+                    continue
+
+                logical_region = schedule._TensorRegion(
+                    offsets=(route_row_offset, 0),
+                    shape=(route_rows, matrix_columns),
+                )
+                storage_tensor_region = schedule._TensorRegion(
+                    offsets=(
+                        storage_tensor_base.offsets[0] + route_row_offset - storage_row_offset,
+                        0,
+                    ),
+                    shape=(route_rows, matrix_columns),
+                )
+                compute_tensor_region = schedule._TensorRegion(
+                    offsets=(
+                        local_matrix_index * matrix_rows + route_row_offset - matrix_row_offset,
+                        0,
+                    ),
+                    shape=(route_rows, matrix_columns),
+                )
+                storage_to_compute_routes.append(
+                    schedule._TensorRegionRoute(
+                        logical_region=logical_region,
+                        source=schedule._RouteEndpoint(
+                            storage_tensor_region,
+                            source_holders,
+                        ),
+                        destination=schedule._RouteEndpoint(
+                            compute_tensor_region,
+                            destination_holders,
+                        ),
+                    )
+                )
+
+    return schedule._RedistributionPlan(
+        participants=participants,
+        logical_shape=storage_shape,
+        storage_partitions=storage_partitions,
+        compute_partitions=compute_partitions,
+        storage_to_compute_routes=tuple(storage_to_compute_routes),
+    )

@@ -78,6 +78,7 @@ TORCH_DEVICE_BACKEND_AUTOLOAD=0 python -m pytest -q \
 - 区域先执行完整边界校验；能沿任一轴证明互不相交时使用排序后的区间证明，否则回退通用两两校验。空区域、覆盖关系、重复参与者和非法布局仍须校验。
 - 按源／目标 rank 建立 routes 索引，避免每个 rank 重扫所有 routes。
 - All2All 打包按 peer 建立索引，并按原参与者、参数、route 顺序输出 splits 和 spans；保留零 split、自复制、replicated source 选择和全组 `has_remote_transfers`。
+- 矩阵分块 route 按有序行区间二分定位可能相交的 compute 分片，再裁剪局部矩阵索引范围，避免逐个扫描空分片和不相交矩阵。保留原 source／participant／matrix 顺序、offset 公式、正反向 route、全部空分区、零 split 和完整校验。退化或越界几何回退原生构造；索引仅在单次参数规划内存在，不跨参数缓存计划。
 - mesh 的 rank→坐标映射仅在一次 `build_bucket_plans` 调用内复用；结束或异常时清理，不跨模拟会话缓存 tensor、slot、图事件或 Owned 分配结果。
 
 优化不改变分桶、compute owner、矩阵计算、通信组与有序 ranks、All2All／事件依赖、打包 offset 或 workspace 容量。不通过删除校验、跳过空参与者的 collective 或改变 Newton–Schulz 次数缩短捕获时间。
@@ -85,3 +86,5 @@ TORCH_DEVICE_BACKEND_AUTOLOAD=0 python -m pytest -q \
 `simulate()` 成功返回的 `iteration.schedule.annotations["host_timings"]` 记录 `clock`、`scope`、`status` 和 `stages`；每阶段包含 `wall_seconds` 与 `calls`。配置、model build、parallelize、optimizer build、warmup、正式 F/B 捕获、内存规划、FSDP 投影及卸载插入分别记录。`optimizer_planning.*` 包含 build、geometry、routes、validation、packing；这些是**含子调用的墙钟时间，不可直接求和**。`capture_step.*` 兼容保留原 `capture_timings` 的细项。
 
 日志以 INFO 输出单次宿主计时摘要；失败时记录 `status="failed"` 及已执行阶段，不返回伪成功负载。计时用 `time.perf_counter()`，不做设备同步，不作为算子或通信的设备执行耗时，不改变静态显存预算；旧结果缺少此注记时不补造。
+
+规划等价性与 CPU Gloo 双向传输测试位于仓库根目录的 `tests/unit_tests/extensions/torchtitan/distributed/flex_shard/test_planning.py`。矩阵分块测试覆盖原生差分、pro 实际几何、异常／空分片、复制持有者与乱序 ranks；双卡和四卡 Gloo 用独立张量切片预期验证搬入、计算及搬回，包括跨矩阵边界和空 compute 分片。上述检查不替代真实 NPU 数值及性能验证。

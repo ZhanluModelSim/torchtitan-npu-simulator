@@ -23,6 +23,7 @@ def apply() -> None:
     muon._dtensor_storage_regions = planning.dtensor_storage_regions
     muon._build_bucket_plans = planning.build_bucket_plans
     muon._resolve_muon_redistribution_plans = planning.resolve_muon_redistribution_plans
+    muon._build_batched_matrix_redistribution_plan = planning.build_batched_matrix_redistribution_plan
 
 
 apply()

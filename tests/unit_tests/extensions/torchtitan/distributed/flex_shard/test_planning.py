@@ -32,6 +32,7 @@ def _native_validation(monkeypatch):
     patcher = context.__enter__()
     patcher.setattr(schedule, "_validate_disjoint_regions_in_bounds", planning.NATIVE_VALIDATE_REGIONS)
     patcher.setattr(schedule, "_validate_redistribution_plan", planning.NATIVE_VALIDATE_PLAN)
+    patcher.setattr(muon, "_build_batched_matrix_redistribution_plan", planning.NATIVE_BATCHED_PLAN)
     return context
 
 
@@ -338,3 +339,130 @@ def _mesh_coordinate_worker(rank, rendezvous):
 
 def test_mesh_coordinates_preserve_replica_and_orthogonal_shards_on_four_rank_gloo(tmp_path):
     mp.spawn(_mesh_coordinate_worker, args=(f"file://{tmp_path / 'mesh-rendezvous'}",), nprocs=4, join=True)
+
+
+@pytest.mark.parametrize("seed", [7, 29, 113])
+def test_batched_routes_match_native_for_uneven_replicated_and_empty_partitions(seed):
+    rng = random.Random(seed)
+    for _ in range(40):
+        count, matrices, rows, columns = (rng.randint(1, 24), rng.randint(1, 45), rng.randint(1, 19), rng.randint(1, 9))
+        ranks = list(range(count))
+        rng.shuffle(ranks)
+        groups = rng.randint(1, count)
+        holders = [tuple(ranks[index::groups]) for index in range(groups)]
+        cuts = sorted([0, matrices * rows] + [rng.randint(0, matrices * rows) for _ in range(groups - 1)])
+        regions = [
+            (group, schedule._TensorRegion((start, 0), (end - start, columns)))
+            for group, start, end in zip(holders, cuts[:-1], cuts[1:], strict=True)
+        ]
+        rng.shuffle(regions)
+        kwargs = dict(
+            participants=tuple(ranks), storage_shape=(matrices * rows, columns), compute_shape=(matrices, rows, columns)
+        )
+        expected = planning.NATIVE_BATCHED_PLAN(regions, **kwargs)
+        actual = muon._build_batched_matrix_redistribution_plan(regions, **kwargs)
+        assert actual == expected
+        for rank in ranks:
+            for direction in schedule._RedistributionDirection:
+                packing = dict(direction=direction, process_group=None, local_participant=rank)
+                assert planning.build_packed_all_to_all_schedule((actual,), **packing) == planning.NATIVE_PACK(
+                    (expected,), **packing
+                )
+    assert muon._build_batched_matrix_redistribution_plan is planning.build_batched_matrix_redistribution_plan
+
+
+@pytest.mark.parametrize(
+    "compute_shape",
+    [(16, 1024, 4096), (128, 512, 1536), (64, 128, 1536)],
+    ids=["matrices16", "matrices128", "matrices64"],
+)
+def test_batched_routes_preserve_pro_geometry_and_full_plan(compute_shape):
+    matrices, rows, columns = compute_shape
+    shape = (matrices * rows, columns)
+    ranks = tuple(range(2048))
+    regions = _regions(shape, ranks)
+    kwargs = dict(participants=ranks, storage_shape=shape, compute_shape=compute_shape)
+    actual = planning.build_batched_matrix_redistribution_plan(regions, **kwargs)
+    assert actual == planning.NATIVE_BATCHED_PLAN(regions, **kwargs)
+    assert len(actual.storage_to_compute_routes) == 2048
+    assert sum(bool(part.logical_regions[0].numel) for part in actual.compute_partitions) == matrices
+
+
+@pytest.mark.parametrize(
+    "regions,storage_shape,compute_shape",
+    [
+        ([((0,), ((0, 0), (0, 3)))], (0, 3), (0, 4, 3)),
+        ([((0,), ((0, 0), (4, 3)))], (4, 3), (2, 3, 3)),
+        ([((0,), ((-1, 0), (5, 3)))], (4, 3), (1, 4, 3)),
+        ([((0,), ((0,), (4, 3)))], (4, 3), (1, 4, 3)),
+        ([], (4, 3), (1, 4, 3)),
+        ([((0,), ((0, 0), (4, 3))), ((0,), ((0, 0), (4, 3)))], (4, 3), (1, 4, 3)),
+    ],
+    ids=["zero-matrices", "bad-shape", "negative-offset", "bad-offset-rank", "missing-holder", "duplicate-holder"],
+)
+def test_batched_route_degenerate_and_invalid_inputs_preserve_native_diagnostics(regions, storage_shape, compute_shape):
+    regions = tuple((holders, schedule._TensorRegion(*region)) for holders, region in regions)
+    kwargs = dict(participants=(0,), storage_shape=storage_shape, compute_shape=compute_shape)
+
+    def outcome(builder):
+        try:
+            return builder(regions, **kwargs)
+        except (RuntimeError, ValueError, IndexError) as error:
+            return type(error), str(error)
+
+    assert outcome(planning.build_batched_matrix_redistribution_plan) == outcome(planning.NATIVE_BATCHED_PLAN)
+
+
+def _batched_gloo_worker(rank, rendezvous, world):
+    dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=world)
+    try:
+        ranks = tuple(range(world))
+        # Uneven row shards split matrices; single-matrix case has empty compute
+        # participants. Replicas exercise native source selection on the return.
+        for matrices, rows, replicated in [(5, 2, False), (1, 3, False), (5, 2, True)]:
+            shape = (matrices * rows, 3)
+            global_values = torch.arange(shape[0] * 3, dtype=torch.float32).reshape(shape)
+            groups = world // 2 if replicated else world
+            chunk = (shape[0] + groups - 1) // groups
+            regions = tuple(
+                (
+                    tuple(range(index, world, groups)),
+                    schedule._TensorRegion(
+                        (min(index * chunk, shape[0]), 0), (max(0, min(chunk, shape[0] - index * chunk)), 3)
+                    ),
+                )
+                for index in range(groups)
+            )
+            storage_index = rank % groups
+            source = global_values[storage_index * chunk : (storage_index + 1) * chunk].clone()
+            matrix_chunk = (matrices + world - 1) // world
+            expected_compute = global_values[rank * matrix_chunk * rows : (rank + 1) * matrix_chunk * rows]
+            kwargs = dict(participants=ranks, storage_shape=shape, compute_shape=(matrices, rows, 3))
+            expected = planning.NATIVE_BATCHED_PLAN(regions, **kwargs)
+            actual = muon._build_batched_matrix_redistribution_plan(regions, **kwargs)
+            assert actual == expected
+            for plan in (expected, actual):
+                inbound = planning.build_packed_all_to_all_schedule(
+                    (plan,),
+                    direction=schedule._RedistributionDirection.STORAGE_TO_COMPUTE,
+                    process_group=dist.group.WORLD,
+                    local_participant=rank,
+                )
+                compute = _transport(inbound, source, plan.compute_partition(rank).tensor_shape)
+                torch.testing.assert_close(compute, expected_compute, rtol=0, atol=0)
+                compute.add_(100)
+                outbound = planning.build_packed_all_to_all_schedule(
+                    (plan,),
+                    direction=schedule._RedistributionDirection.COMPUTE_TO_STORAGE,
+                    process_group=dist.group.WORLD,
+                    local_participant=rank,
+                )
+                restored = _transport(outbound, compute, source.shape)
+                torch.testing.assert_close(restored, source + 100, rtol=0, atol=0)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("world", [2, 4])
+def test_batched_routes_round_trip_with_gloo(tmp_path, world):
+    mp.spawn(_batched_gloo_worker, args=(f"file://{tmp_path / 'batch-rendezvous'}", world), nprocs=world, join=True)
