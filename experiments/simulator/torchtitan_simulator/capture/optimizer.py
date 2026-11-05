@@ -134,6 +134,27 @@ def optimizer_state_values(optimizer_step: Callable):
     return [owner.state for owner in owners]
 
 
+def optimizer_workspace_values(optimizer_step: Callable) -> list[torch.Tensor]:
+    """Read native Muon runtime allocations, which are not checkpoint state."""
+    from torchtitan.distributed.flex_shard.dist_muon import DistMuon
+
+    tensors: list[torch.Tensor] = []
+    for owner in _optimizer_owners(optimizer_step):
+        if not isinstance(owner, DistMuon):
+            continue
+        runtime = owner._redistribution_runtime
+        slots = [runtime._local_slot]
+        if runtime._context is not None:
+            slots.extend(slot.buffers for slot in runtime._context.slots)
+        for slot in slots:
+            for reserved in slot.buffers.values():
+                for name in ("storage_exchange", "compute_exchange", "compute_scratch", "storage_scratch"):
+                    tensor = getattr(reserved, name)
+                    if tensor is not None:
+                        tensors.append(tensor)
+    return tensors
+
+
 def optimizer_parameter_manifest(optimizer_step: Callable) -> list[dict]:
     """Read the native mixed container's parameter ownership, without regex inference."""
     return [

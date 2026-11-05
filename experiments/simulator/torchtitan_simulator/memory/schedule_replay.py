@@ -445,6 +445,7 @@ def estimate_schedule_memory(
     storage_lifetimes: Iterable[StorageLifetimeRecord] | None = None,
     initial_tensors: Iterable[TensorRef] | None = None,
     optimizer_state_tensors: Iterable[TensorRef] | None = None,
+    optimizer_workspace_tensors: Iterable[TensorRef] | None = None,
     counted_device_type: str = "",
     parameter_storage_dtype: str | None = None,
     offload_ac_saved_tensors: bool = False,
@@ -463,6 +464,7 @@ def estimate_schedule_memory(
             storage_lifetimes=storage_lifetimes,
             initial_tensors=initial_tensors,
             optimizer_state_tensors=optimizer_state_tensors,
+            optimizer_workspace_tensors=optimizer_workspace_tensors,
             counted_device_type=counted_device_type,
             parameter_storage_dtype=parameter_storage_dtype,
             offload_ac_saved_tensors=offload_ac_saved_tensors,
@@ -471,6 +473,7 @@ def estimate_schedule_memory(
     autograd_saved_tensor_events = list(autograd_saved_tensor_events or [])
     if (
         optimizer_state_tensors is not None
+        or optimizer_workspace_tensors is not None
         or storage_lifetimes is not None
         or initial_tensors is not None
         or any(saved.release_tracking for saved in autograd_saved_tensor_events)

@@ -27,7 +27,7 @@
 - 保留 stream/event、producer、alias/mutation、跨模板依赖；零耗时控制节点也参与等待。逻辑 stream 不等于硬件资源，不按序号全串行补边，不折叠或重编号掩盖缺口。
 - tensor、wrapper、storage、allocation generation 和保存槽分开。一次 unpack、最后读取或 Python wrapper 销毁不等于释放设备 storage；只精确排除保存钩子引入的 detach，不全局过滤原生 detach/view。
 - head/norm/loss 与无法确认层归属的值保留设备驻留，不伪装成 decoder 层，也不为消除 unattributed 删除记录。AC/offload 按真实保存、生产、消费和写入关系处理。
-- 既存 optimizer state 按本地 storage 去重进入初始内存。未卸载 F/B/O 含状态；卸载排除状态和约定忽略的逐 tensor buffer，但状态总量仍保留，不能按权重倍数推断。激活与优化器卸载独立。
+- 既存 optimizer state 与 Muon runtime 常驻工作缓冲按实际本地 storage 去重进入初始内存。未卸载 F/B/O 含状态；聚合卸载排除状态并暂忽略状态 staging buffer，但状态总量保留。原生工作缓冲和计算临时量不能随状态卸载减掉，不能按权重倍数推断状态量。激活与优化器卸载独立。
 - 卸载在训练执行图生成传输及等待，静态预算与同一计划一致；平台只定时与 DES，不重复补拖尾。激活阶段内预取、晚 producer 的 F 末保守收尾、共享 storage 和复制后写入限制见[激活卸载](docs/activation-offload-design.md)。优化器双向并行近似见[优化器卸载](docs/optimizer-offload.md)。
 - 原生参数绑定与 AdamW 六组列表／可选角色不能丢失。源张量容量 `volume_bytes` 服务内存／调度，不是网络模型流量；不恢复 `communication_input_bytes` 或旧成本字段。
 

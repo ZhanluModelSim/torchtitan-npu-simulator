@@ -42,14 +42,24 @@ def insert_optimizer_transfers(workload: WorkloadGraph) -> WorkloadGraph:
     if len(template_ids) != 1:
         raise ValueError("Optimizer offload requires a single optimizer update template")
     template_id = next(iter(template_ids))
-    external_parents = {parent for key in updates for parent in source[key].predecessors if parent not in updates}
+    has_muon = any(group["algorithm"] == "DistMuon" for group in annotations.get("optimizer_parameter_groups", ()))
+    window = updates
+    if has_muon:
+        window = {
+            key
+            for key, node in source.items()
+            if "native_optimizer_step" in node.annotations.get("framework_scopes", ())
+        }
+        if not updates <= window or any(owner[key] != template_id for key in window):
+            raise ValueError("Muon offload requires the complete native optimizer step scope in one O template")
+    external_parents = {parent for key in window for parent in source[key].predecessors if parent not in window}
     # A shared gate cannot wait on a node downstream of an update. Such an
     # interleaved optimizer needs separate windows, rather than a silent cycle.
     pending = list(external_parents)
     visited: set[int] = set()
     while pending:
         key = pending.pop()
-        if key in updates:
+        if key in window:
             raise ValueError("Optimizer offload does not support interleaved non-update preparation nodes")
         if key not in visited:
             visited.add(key)
@@ -69,8 +79,8 @@ def insert_optimizer_transfers(workload: WorkloadGraph) -> WorkloadGraph:
     first_id = max([*raw_ids, *nodes]) + 1
     stream_base = max((node.annotations.get("stream_id", 0) for node in nodes.values()), default=0) + 1
     modeled_ids: list[int] = []
-    start_seq = min(source[key].seq_idx for key in updates)
-    end_seq = max(source[key].seq_idx for key in updates)
+    start_seq = min(source[key].seq_idx for key in window)
+    end_seq = max(source[key].seq_idx for key in window)
 
     def add_node(name: str, parents: set[int], *, direction: str | None = None, exit_node: bool = False) -> int:
         key = first_id + len(modeled_ids)
@@ -98,14 +108,14 @@ def insert_optimizer_transfers(workload: WorkloadGraph) -> WorkloadGraph:
 
     if state_bytes:
         entry = add_node("stream_wait", external_parents)
-        for key in updates:
+        for key in window:
             nodes[key].predecessors = sorted(set(nodes[key].predecessors) | {entry})
         load = add_node("optimizer_h2d", {entry}, direction="h2d")
         store = add_node("optimizer_d2h", {entry}, direction="d2h")
-        exit_id = add_node("stream_wait", updates | {load, store}, exit_node=True)
-        for key in updates:
+        exit_id = add_node("stream_wait", window | {load, store}, exit_node=True)
+        for key in window:
             for successor in source[key].successors:
-                if successor not in updates:
+                if successor not in window:
                     nodes[successor].predecessors = sorted(set(nodes[successor].predecessors) | {exit_id})
     for node in nodes.values():
         for parent in node.predecessors:
@@ -129,6 +139,10 @@ def insert_optimizer_transfers(workload: WorkloadGraph) -> WorkloadGraph:
             "policy": "full_duplex_aggregate_v1",
             "modeled_op_ids": modeled_ids,
             "update_op_ids": sorted(updates),
+            "window_op_ids": sorted(window),
+            "window_scope": "native_optimizer_step" if has_muon else "actual_updated_parameters",
+            "approximation": "ideal full-duplex state pipeline; no per-bucket load-before-read dependencies",
+            "memory_policy": "host-resident state; staging omitted; native workspace and temporaries retained",
             "transfer_bytes_per_direction": state_bytes,
         },
     }
@@ -136,7 +150,7 @@ def insert_optimizer_transfers(workload: WorkloadGraph) -> WorkloadGraph:
         raise ValueError("Optimizer transfers require a SchedulePlan")
     logging.getLogger(__name__).info(
         "Optimizer offload: %d bytes per direction, %d update operators; aggregate full-duplex window, "
-        "device state and transient buffer residency excluded",
+        "device state and modeled state staging excluded; native workspace retained",
         state_bytes,
         len(updates),
     )

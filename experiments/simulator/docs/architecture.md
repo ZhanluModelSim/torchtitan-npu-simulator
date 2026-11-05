@@ -35,7 +35,7 @@ Meta 没有张量数据，能够执行 shape、dtype、layout 和 autograd 结�
 3. **构建与并行化。** `build_meta_model()` 构建并初始化 Meta 模型，再调用原生 `model_spec.parallelize_fn`，保留实际 local shape、DTensor placement 与 mesh。量化由原生 recipe 选择参数，不用模拟器 FQN 名单重写。
 4. **准备训练组件和输入。** 构造原生 loss、optimizer、post-optimizer hook 与 scheduler；loss 绑定 lm_head。CPU 生成合成单文档 next-token 输入及有效 token 数，调用模型的 attention mask／CP planner，再转为 Meta。
 5. **结构预热。** 同一模型与 optimizer 先运行实际 GA 次 F/B、一次 clip/update，清梯度；不安装正式观测器，不推进 scheduler，不修改 `training.steps`。目的是完成优化器状态等惰性初始化，不代表数值意义上的第二训练步。
-6. **正式捕获。** 预热后安装 FSDP 驻留观察器，登记初始输入和已有 optimizer state。`run_simulation_step()` 执行一份代表性 microbatch 的 F/B，再执行 clip、optimizer 和 scheduler；观察 dispatch、流事件、保存槽与生命周期，组装模板和静态内存。
+6. **正式捕获。** 预热后安装 FSDP 驻留观察器，登记初始输入、已有 optimizer state 及 Muon runtime 常驻工作缓冲。`run_simulation_step()` 执行一份代表性 microbatch 的 F/B，再执行 clip、optimizer 和 scheduler；观察 dispatch、流事件、保存槽与生命周期，组装模板和静态内存。
 7. **校验与负载变换。** 核对所有应有参数梯度的 shape/dtype/placement/local shape，拒绝捕获期间未建模的 buffer storage/layout 变化。先校验完整捕获，再生成 FSDP 通信视图；按独立开关插入激活／优化器传输与等待，修正派生静态显存，重新校验引用与 DAG。
 8. **交付。** 返回 `WorkloadGraph`，默认不创建输出目录。只有显式 `output_formats=["mem"]` 才打印预算并导出 memory summary 与诊断明细；会话结束恢复临时 patch、逻辑分布式和捕获上下文。
 

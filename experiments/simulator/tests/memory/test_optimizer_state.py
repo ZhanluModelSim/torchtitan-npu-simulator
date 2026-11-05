@@ -9,6 +9,7 @@ from dataclasses import replace
 
 import pytest
 from torchtitan_simulator.memory.estimator import estimate_static_memory
+from torchtitan_simulator.memory.optimizer_offload import apply_optimizer_offload_budget
 from torchtitan_simulator.memory.records import RawMemoryEvent, TensorRef
 
 
@@ -104,3 +105,57 @@ def test_initial_state_without_phase_events_still_has_a_total_residency_peak():
     assert plan.steady_state_forward_peak_active_bytes == 0
     assert plan.steady_state_backward_peak_active_bytes == 0
     assert plan.steady_state_optimizer_peak_active_bytes == 0
+
+
+def test_workspace_aliases_remain_resident_in_all_phases_after_state_offload():
+    events, states = _capture(preinitialized=True)
+    workspace = _ref(6, 32, key="workspace:0")
+    view = replace(workspace, tensor_id=7, shape=(2,), num_bytes=8, alias_of=6)
+    plan = estimate_static_memory(
+        events,
+        initial_tensors=(*states, workspace, view),
+        optimizer_state_tensors=states,
+        optimizer_workspace_tensors=(workspace, view),
+        counted_device_type="meta",
+    )
+    allocated = [item for item in plan.tensor_lifetimes if item.kind == "optimizer_workspace"]
+    assert len(allocated) == 1
+    assert allocated[0].resident_num_bytes == 32
+    assert allocated[0].birth_seq == -1 and allocated[0].death_seq >= 4
+    assert plan.optimizer_state_bytes == 80
+    assert (
+        plan.steady_state_forward_peak_active_bytes,
+        plan.steady_state_backward_peak_active_bytes,
+        plan.steady_state_optimizer_peak_active_bytes,
+    ) == (212, 232, 132)
+
+    offloaded = apply_optimizer_offload_budget(plan)
+
+    assert offloaded.optimizer_state_bytes == 80
+    assert (
+        offloaded.steady_state_forward_peak_active_bytes,
+        offloaded.steady_state_backward_peak_active_bytes,
+        offloaded.steady_state_optimizer_peak_active_bytes,
+    ) == (132, 152, 52)
+    assert (
+        sum(
+            item.resident_num_bytes
+            for item in offloaded.device_budget_lifetimes()
+            if item.kind == "optimizer_workspace"
+        )
+        == 32
+    )
+
+
+def test_workspace_requires_initial_registration_and_disjoint_state_storage():
+    events, states = _capture(preinitialized=True)
+    workspace = _ref(6, 32, key="workspace:0")
+    with pytest.raises(ValueError, match="initial memory inventory"):
+        estimate_static_memory(events, initial_tensors=states, optimizer_workspace_tensors=[workspace])
+    with pytest.raises(ValueError, match="alias offloadable state"):
+        estimate_static_memory(
+            events,
+            initial_tensors=states,
+            optimizer_state_tensors=states,
+            optimizer_workspace_tensors=[states[0]],
+        )

@@ -22,7 +22,7 @@ CLI 和 `simulate()` 默认仅通过内存对象交付预算，不写文件；�
 | `steady_state_backward_active_bytes_peak` | 反向峰值，未卸载时包含优化器状态 |
 | `steady_state_optimizer_active_bytes_peak` | 优化器阶段峰值，未卸载时包含优化器状态 |
 | `persistent_param_bytes` | 单卡常驻权重 shard 的大小，不含梯度、优化器状态或激活 |
-| `optimizer_state_bytes` | 单卡优化器实际状态的大小，不含权重、梯度或临时张量 |
+| `optimizer_state_bytes` | 单卡优化器实际状态的大小，不含权重、梯度、Muon runtime 工作缓冲或临时张量 |
 
 全部数值对应所选 `simulation.logical_rank`，不是全局求和或各 rank 的最大值。权重已计入四个峰值；优化器状态仅在未卸载时计入，不能再次相加。卸载后 `optimizer_state_bytes` 仍报告真实本地状态总量，不能据此推断设备驻留。
 `memory_parameter_storage_dtype` 仅投影权重字节，不改变优化器状态的 dtype 或大小。
@@ -86,17 +86,20 @@ optimizer_bytes = summary["optimizer_state_bytes"]
 
 ## 计算口径
 
-状态取自原生 optimizer/container 的公开 `state`，按实际设备和本地 storage 去重；多个 view 共用 storage 时只计一次。未开启优化器卸载时，将这些实际状态投影为从步首常驻后，重新扫描生命周期计算四个峰值，不按权重倍数猜测状态，也不在 optimizer 阶段重复加算。
+状态取自原生 optimizer/container 的公开 `state`，按实际设备和本地 storage 去重；多个 view 共用 storage 时只计一次。 Muon momentum 按原生梯度 dtype 创建，不能固定按 FP32 或参数倍数推断。未开启优化器卸载时，将这些实际状态投影为从步首常驻后，重新扫描生命周期计算四个峰值，不按权重倍数猜测状态，也不在 optimizer 阶段重复加算。
 
 这是状态驻留的稳态估算，其他捕获生命周期不变；`simulate()` 默认在[结构预热](steady-state-capture.md)后捕获，低层捕获也可投影首 O 的状态。正式记录仍只有一个 microbatch，不是完整 GA／PP 回放。数值是逻辑活跃 storage 字节，不含 allocator cache/reserved、碎片或未建模 workspace。
 
 自定义 callback 没有可读取的公开 optimizer owner 时，相关值为 `null`，终端显示「不可用」；不会把未知状态假设成零。已知无状态的优化器报告状态字节为 0。
 
+Muon runtime 的 local slot 和双通信 slot 工作缓冲在预热后已经分配并持续持有，正式捕获从步首登记其本地 storage 驻留，而不是从 O 首次使用开始计量。缓冲按实际分配容量去重，复用不同 bucket 不累计容量。它们属于设备工作空间，不进入可卸载状态量；聚合状态卸载仍保留工作空间和 Newton–Schulz 临时量，只有状态 staging buffer 按约定暂不计入。该预算不是精确逐桶流水或 DES 动态峰值。
+
 ## 验证与排查入口
 
 - [逐层 payload 与 storage 去重](../tests/memory/test_layer_offload_summary.py)：共享 view／多保存角色不能重复计量。
 - [真实模型交付](../tests/test_memory_delivery.py)：DSV4／Kimi、MTP、AC、量化、两种卸载以及默认无文件／显式 mem 行为。
-- [优化器独立字节预期](../tests/memory/test_optimizer_state.py)：实际本地状态、去重及稳态驻留。
+- [优化器独立字节预期](../tests/memory/test_optimizer_state.py)：实际本地状态、storage／alias 去重、workspace 初始驻留及卸载后保留。
+- [Muon workspace 与卸载](../tests/test_muon_offload.py)：单卡 scratch 和 world=8、EP=2 双通信 slot 的独立容量预期，以及 F/B/O 驻留和状态传输量。
 - [F 内交错反向](../tests/memory/test_interleaved_loss_offload.py)：chunk-local loss 不卸载，后续 B／recompute 共享的 storage 仍按真实使用处理。
 
 归属优先使用保存槽的模块路径。明确的 head/norm/root 不借用滞后反向模块路径归到 decoder；没有模块归属才用真实生产／消费事实辅助判断。没有确认层或 checkpoint 绑定的保存值继续驻留，不能通过隐藏 unattributed 报表行修正显存。

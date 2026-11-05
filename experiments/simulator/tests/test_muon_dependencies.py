@@ -8,6 +8,7 @@
 from collections import defaultdict
 from contextlib import nullcontext
 
+import pytest
 import torch
 from torchtitan.distributed.flex_shard import _optimizer_reshard_runtime as reshard_runtime
 from torchtitan_simulator.capture.dispatch_capture import get_active_capture
@@ -16,7 +17,8 @@ from torchtitan_simulator.config import SimulationConfig
 from torchtitan_simulator.runner import simulate
 
 
-def test_native_muon_alltoall_prefetch_keeps_overlap_and_buffer_reuse_dependencies(monkeypatch):
+@pytest.mark.parametrize("offload", [False, True], ids=["resident", "aggregate-offload"])
+def test_native_muon_alltoall_prefetch_keeps_overlap_and_buffer_reuse_dependencies(monkeypatch, offload):
     original_device_module = torch.get_device_module
     # An earlier Muon session must not leave a cached device handle whose stream
     # context differs from the current capture's torch.meta stream context.
@@ -81,7 +83,15 @@ def test_native_muon_alltoall_prefetch_keeps_overlap_and_buffer_reuse_dependenci
     monkeypatch.setattr(reshard_runtime, "_compute_redistributed", redistributed)
     monkeypatch.setattr(MetaDeviceModule.Stream, "wait_event", wait_event)
 
-    workload = simulate(SimulationConfig(optimizer_name="Muon", world_size=8, expert_parallel_degree=2, seq_len=128))
+    workload = simulate(
+        SimulationConfig(
+            optimizer_name="Muon",
+            world_size=8,
+            expert_parallel_degree=2,
+            seq_len=128,
+            memory_offload_optimizer_states=offload,
+        )
+    )
     assert torch.get_device_module is original_device_module
     nodes = {node.op_id: node for template in workload.step_templates.values() for node in template.nodes.values()}
     scoped = defaultdict(list)

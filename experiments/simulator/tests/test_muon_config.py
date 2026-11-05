@@ -117,10 +117,6 @@ def test_native_muon_factory_rejects_replica_dedup(monkeypatch):
         ({"config": "kimi_k3_smoketest", "optimizer_name": "Muon"}, "native Muon profile"),
         ({"optimizer_name": "Muon", "world_size": 2, "tensor_parallel_degree": 2}, "TP=1 and CP=1"),
         ({"optimizer_name": "Muon", "enable_quantized_training": True}, "quantized training"),
-        (
-            {"optimizer_name": "Muon", "memory_offload_optimizer_states": True},
-            "Muon optimizer-state offload requires a dedicated",
-        ),
         ({"muon_ns_steps": 3}, "requires optimizer_name=Muon"),
         ({"optimizer_name": "Muon", "muon_ns_steps": 0}, "positive integer"),
         (
@@ -135,7 +131,6 @@ def test_native_muon_factory_rejects_replica_dedup(monkeypatch):
         "kimi",
         "tp",
         "quantized",
-        "optimizer-state-offload",
         "unused-muon-option",
         "invalid-iterations",
         "native-swap",

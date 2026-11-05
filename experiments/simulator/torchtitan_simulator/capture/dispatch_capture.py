@@ -676,6 +676,8 @@ class OpDispatchCapture(TorchDispatchMode):
         instance["end_seq_idx"] = seq_idx
         if visible_in_ir:
             extra_annotations = dict(extra_annotations or {})
+            if self._dispatch_annotation_scopes:
+                extra_annotations["framework_scopes"] = list(self._dispatch_annotation_scopes)
             if execution_stream is not None:
                 extra_annotations["stream_id"] = self.stream_id(execution_stream)
                 extra_annotations["stream_predecessors"] = list(stream_predecessors)

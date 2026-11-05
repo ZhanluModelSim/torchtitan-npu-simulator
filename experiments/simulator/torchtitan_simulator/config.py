@@ -179,10 +179,6 @@ def _prepare_optimizer(simulation: SimulationConfig, trainer: Any, *, materializ
         raise ValueError("Muon simulation currently requires TP=1 and CP=1")
     if simulation.enable_quantized_training:
         raise ValueError("Muon simulation with quantized training is not supported")
-    if simulation.memory_offload_optimizer_states:
-        raise ValueError(
-            "Muon optimizer-state offload requires a dedicated prepare/compute pipeline and state-prefetch plan"
-        )
     if getattr(optimizer, "muon_enable_hsdp_replica_dedup", False):
         raise ValueError("Muon simulation does not yet support HSDP replica dedup")
     if any(entry.startswith("torchtitan_npu.override.common.optimizer.") for entry in trainer.override.imports):

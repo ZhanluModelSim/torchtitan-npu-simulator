@@ -270,6 +270,7 @@ def _finalize_kind(lifetime: TensorLifetime) -> None:
     if lifetime.kind in {
         "parameter_shard",
         "optimizer_state",
+        "optimizer_workspace",
         "persistent_buffer",
         "external_input",
         "alias",
@@ -398,6 +399,7 @@ def estimate_static_memory(
     storage_lifetimes: Iterable[StorageLifetimeRecord] | None = None,
     initial_tensors: Iterable[TensorRef] | None = None,
     optimizer_state_tensors: Iterable[TensorRef] | None = None,
+    optimizer_workspace_tensors: Iterable[TensorRef] | None = None,
     counted_device_type: str = "",
     parameter_storage_dtype: str | None = None,
     offload_ac_saved_tensors: bool = False,
@@ -619,6 +621,24 @@ def estimate_static_memory(
                 witnessed.add(lifetime.storage_key)
         if witnessed != state_keys:
             raise ValueError("Optimizer state storage is absent from the captured memory inventory")
+    workspace_keys = {
+        ref.storage_key
+        for ref in optimizer_workspace_tensors or ()
+        if not counted_device_type or ref.device.split(":")[0] == counted_device_type
+    }
+    if "" in workspace_keys:
+        raise ValueError("Optimizer workspace lacks captured storage provenance")
+    if workspace_keys & (state_keys or set()):
+        raise ValueError("Optimizer workspace must not alias offloadable state")
+    initial_keys = {ref.storage_key for ref in initial_tensors}
+    if not workspace_keys <= initial_keys:
+        raise ValueError("Optimizer workspace must be registered in the initial memory inventory")
+    for lifetime in lifetimes:
+        if lifetime.storage_key in workspace_keys and not lifetime.alias_of:
+            lifetime.kind = "optimizer_workspace"
+            lifetime.reason = "optimizer_runtime_keepalive"
+            lifetime.birth_seq = -1
+            lifetime.death_seq = capture_end
     for lifetime in lifetimes:
         _finalize_kind(lifetime)
 

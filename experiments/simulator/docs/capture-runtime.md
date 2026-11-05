@@ -84,7 +84,7 @@ FSDP wrapper 可能延迟安装或刷新。正式观察器在结构预热后安�
 
 保存钩子为了恢复梯度信息引入的 detach 只按精确返回对象身份排除：弱引用匹配后消费标记，保留 alias/mutation 关系；不能按 `aten.detach` 名称或同 storage 一概过滤。排除次数记录在 `capture_artifacts.saved_tensor_unpack_detach_count`，不作为内存预算修正值。回归见 `tests/capture/test_saved_tensor_identity.py`、`test_storage_lifetimes.py` 与 `tests/test_storage_lifetime_capture.py`。
 
-优化器状态从原生 owner 的公开 `state` 获取并按本地 storage 去重。正式捕获初始登记预热后已有状态；初始化算子消失不意味着状态驻留或卸载量消失。未知 owner 报不可用，已知无状态才为 0。无卸载时状态已在 F/B/O 峰值内，不重复相加；开启卸载时保留原始总量，但按已确认策略排除其设备驻留及逐 tensor buffer。
+优化器状态从原生 owner 的公开 `state` 获取并按本地 storage 去重。正式捕获初始登记预热后已有状态；初始化算子消失不意味着状态驻留或卸载量消失。未知 owner 报不可用，已知无状态才为 0。无卸载时状态已在 F/B/O 峰值内，不重复相加；开启卸载时保留原始总量，但按聚合近似排除状态设备驻留，暂不计状态 staging buffer。Muon runtime 常驻工作缓冲另行登记为初始内存，覆盖 F/B/O，不计入可卸载状态量，也不随卸载排除。
 
 保存值集合、层归属、head 交错反向及后续 B/recompute 使用共同决定激活卸载。不能靠过滤报表将未归属存储从峰值删除，也不能把传输 payload 当卸载后的驻留值。具体预算和图变换分别见[单卡内存](steady-state-memory.md)、[激活卸载](activation-offload-design.md)、[优化器卸载](optimizer-offload.md)。
 
