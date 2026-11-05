@@ -33,6 +33,17 @@ from .model import Glm5NextModel
 logger = logging.getLogger(__name__)
 
 
+class _LayersShim(torch.nn.Module):
+    """Adapter for the upstream AC policy, which hardcodes
+    ``model.get_submodule("layers")``: expose the vision tower's blocks under
+    that name. The policy wraps each block and registers it back into the
+    same ModuleList, so the tower ends up holding the checkpoint wrappers."""
+
+    def __init__(self, layers: torch.nn.Module):
+        super().__init__()
+        self.layers = layers
+
+
 def _distribute_vision_states(vision_encoder: torch.nn.Module, parallel_dims: ParallelDims) -> None:
     """Distribute the vision tower's plain ``nn`` states as replicated DTensors.
 
@@ -126,7 +137,7 @@ def parallelize_glm5_next(
         ac_policy = ac_config.build(dump_folder=dump_folder)
         ac_policy.apply(model)
         if model.vision_encoder is not None:
-            ac_policy.apply(model.vision_encoder)
+            ac_policy.apply(_LayersShim(model.vision_encoder.blocks))
 
     dp_mesh, dp_mesh_dims = resolve_fsdp_mesh(parallel_dims)
     edp_mesh, edp_mesh_dims = resolve_sparse_fsdp_mesh(parallel_dims)
