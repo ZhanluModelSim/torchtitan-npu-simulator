@@ -2,6 +2,10 @@
 
 日期：2026-11-05。工作分支：`feat/npu-simulator-local`。
 
+后续 raw bundle v2 新增 ALoDLM 子契约 v1；本文仍只验证标准 block diffusion
+子契约 v1。ALoDLM 的 raw 首版证据另见 [独立验收](alodlm_raw_acceptance.md)，
+不能由本文推导 native 已支持 ALoDLM。
+
 ## 职责与范围
 
 Raw 目录仅维护规范 `README.md` 与独立 `model.py`；工具迁入

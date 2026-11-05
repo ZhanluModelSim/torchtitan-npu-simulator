@@ -21,7 +21,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 from legacy_state_dict import from_legacy_state_dict, to_legacy_state_dict
-from raw_reference import MODEL_CONTRACT_VERSION, BlockDiffusionModel, ModelConfig, TrainingSpec
+from raw_reference import STANDARD_BLOCK_DIFFUSION_CONTRACT_VERSION, BlockDiffusionModel, ModelConfig, TrainingSpec
 
 
 @pytest.fixture(scope="module")
@@ -118,7 +118,7 @@ def test_native_exact_matches_raw_weights_logits_loss_and_gradients(native_api, 
     converted = adapter.from_hf(to_legacy_state_dict(raw.state_dict()))
     loaded = native.load_state_dict(converted, strict=True)
     assert not loaded.missing_keys and not loaded.unexpected_keys
-    assert native_cfg.raw_contract_version == MODEL_CONTRACT_VERSION == 1
+    assert native_cfg.raw_contract_version == STANDARD_BLOCK_DIFFUSION_CONTRACT_VERSION == 1
     assert native_cfg.rope.backend == "cos_sin"
     assert native_cfg.rope.scaling == "none"
     if moe:

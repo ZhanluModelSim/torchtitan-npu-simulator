@@ -3,7 +3,9 @@
 Block Diffusion 的规范由
 [`raw_model/block_diff/README.md`](../../torchtitan_npu/simulator/raw_model/block_diff/README.md)
 和同目录的 [`model.py`](../../torchtitan_npu/simulator/raw_model/block_diff/model.py)
-定义，当前 `MODEL_CONTRACT_VERSION=1`。raw 目录只保留这两个文件。
+定义，当前 bundle 为 `MODEL_CONTRACT_VERSION=2`。raw 目录只保留这两个文件。
+标准 block diffusion 子契约仍为 v1，新增 ALoDLM 子契约为 v1；native 只对齐
+标准子契约 v1，本次 ALoDLM 增量不修改 native 实现。
 
 `models/block_diffusion` 是独立维护的 TorchTitan 实现，必须人工遵循 raw 契约；
 运行时不得导入 raw 或工具 loader。工具与测试可以加载规范实现，用于回放、
@@ -87,6 +89,43 @@ attention 的 noncausal 段使用完整可见范围，参数契约依据
 
 ## 独立工具
 
+### ALoDLM 首版 raw 参考
+
+ALoDLM 在共享 core 上保留 inner-loop 隐状态，并区分 prelude、core、coda。
+本仓先提供 uncached dense 回放、双流训练和 practical 目标，不接入 native
+或深度相关 serving cache。标准 block diffusion 的旧接口和数值行为保持。
+来源、反馈策略差异及计量边界以 raw README 的 ALoDLM 子契约为准。
+
+将工具目录加入 `PYTHONPATH` 后，可执行以下独立训练回放：
+
+```python
+import torch
+from raw_reference import (
+    ALoDLMModel, ALoDLMSpec, ModelConfig,
+    alodlm_training_objective, build_alodlm_batch,
+)
+
+model = ALoDLMModel(
+    ModelConfig(vocab_size=16, hidden_size=8, num_hidden_layers=3,
+                num_attention_heads=2, num_key_value_heads=1,
+                head_dim=4, intermediate_size=16),
+    ALoDLMSpec(loop_start=1, loop_end=2, max_depth=3, mask_token_id=0),
+)
+clean = torch.tensor([[1, 2, 3, 4]])
+masked = torch.tensor([[False, True, False, True]])
+batch = build_alodlm_batch(clean, clean, masked, 0.5,
+                          block_size=2, mask_token_id=0)
+output = model.rollout_training(batch, exit_depths=((0, 0, 0, 0, 0, 1, 0, 3),))
+objective = alodlm_training_objective(output, batch)
+objective.loss.backward()
+```
+
+现有 `workload.py` 和 `training_workload.py` CLI 仍面向标准子契约，不会因
+bundle 升级而隐式改为 ALoDLM。ALoDLM 首版可通过上述接口做 CPU/meta 或图
+捕获验证；精确测试记录见 [ALoDLM 验收](../test_guides/alodlm_raw_acceptance.md)。
+
+### 标准 block diffusion 工具
+
 从仓库根目录运行，不导入 `torchtitan_npu` 包，不需要原生 NPU 依赖：
 
 ```bash
@@ -147,11 +186,13 @@ shared experts。它不是任意 HF checkpoint、优化器状态或 DCP 元数�
 不另外创建 `fix/block-diff-*` 开发分支。
 
 1. 在 raw README 与 model.py 中明确拟修改的结构、mask、状态或精度语义。
-2. 语义变化递增 `MODEL_CONTRACT_VERSION`，先验证规范参考本身。
+2. 范式新增递增 `MODEL_CONTRACT_VERSION`，并分别标明各子契约版本。
+   标准子契约发生语义变化时递增其版本，先验证规范参考本身。
 3. 人工更新 native 模型、相关配置、state-dict adapter 与 converter；不得通过
    导入 raw 或复用工具 loader 来规避独立实现。
 4. 同配置、同权重比较 logits、loss、参数梯度和适用的 KV 状态，再验证每个
-   声明支持的并行／后端组合。记录明确的不支持项，禁止静默降级为计算代理。
+   声明支持的并行／后端组合。新范式允许先进入 raw，但必须标注 native 尚未
+   适配；记录明确的不支持项，禁止静默降级为计算代理。
 5. 更新支持矩阵和执行证据；没有执行的检查保留为待验证。
 
 独立测试命令：
