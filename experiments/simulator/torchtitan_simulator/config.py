@@ -164,6 +164,11 @@ _DSV4_1_OVERRIDES = [
     "torchtitan_npu.override.deepseek_v4_1.mhc.asc_hc_post",
 ]
 
+# GLM-5.3-Flash is NoPE (no rope override) and its KDA/DSA mixers plus
+# sigmoid-routing MoE are custom modules outside the upstream override
+# surface, so only the common RMSNorm replacement applies.
+_GLM5_NEXT_OVERRIDES = [*_COMMON_OVERRIDES]
+
 
 def prepare_config(simulation: SimulationConfig) -> PreparedConfig:
     """Resolve a fresh native config before any model or parallel initialization."""
@@ -181,6 +186,10 @@ def prepare_config(simulation: SimulationConfig) -> PreparedConfig:
         "qwen3_5_debugmodel_moe": "torchtitan_simulator.presets.qwen3_5_debugmodel_moe",
         "deepseek_v4_1_debugmodel_text": "torchtitan_simulator.presets.deepseek_v4_1_debugmodel_text",
         "deepseek_v4_1_debugmodel_multimodal": "torchtitan_simulator.presets.deepseek_v4_1_debugmodel_multimodal",
+        "glm5_next_debugmodel_text": "torchtitan_simulator.presets.glm5_next_debugmodel_text",
+        "glm5_next_debugmodel_multimodal": "torchtitan_simulator.presets.glm5_next_debugmodel_multimodal",
+        "glm5_next_reduced_2l": "torchtitan_simulator.presets.glm5_next_reduced_2l",
+        "glm5_next": "torchtitan_simulator.presets.glm5_next",
     }
     target = factories.get(simulation.config, simulation.config)
     if "." not in target:
@@ -205,8 +214,10 @@ def prepare_config(simulation: SimulationConfig) -> PreparedConfig:
         if value is not None:
             setattr(trainer.training, target_name, value)
     model = trainer.model_spec.model
-    if trainer.model_spec.name not in {"deepseek_v4", "deepseek_v4_1", "kimi_k3", "qwen3_5"}:
-        raise ValueError("Supported model families are deepseek_v4, deepseek_v4_1, kimi_k3 and qwen3_5")
+    if trainer.model_spec.name not in {"deepseek_v4", "deepseek_v4_1", "kimi_k3", "qwen3_5", "glm5_next"}:
+        raise ValueError(
+            "Supported model families are deepseek_v4, deepseek_v4_1, kimi_k3, qwen3_5 and glm5_next"
+        )
     adaptations = []
     if simulation.model_overrides is not None:
         adaptations.append("typed geometry overrides rebuilt the complete native model configuration tree")
@@ -251,6 +262,7 @@ def prepare_config(simulation: SimulationConfig) -> PreparedConfig:
                 "deepseek_v4_1": _DSV4_1_OVERRIDES,
                 "kimi_k3": _COMMON_OVERRIDES,
                 "qwen3_5": _QWEN3_5_OVERRIDES,
+                "glm5_next": _GLM5_NEXT_OVERRIDES,
             }[trainer.model_spec.name]
         )
         if simulation.override_imports is None

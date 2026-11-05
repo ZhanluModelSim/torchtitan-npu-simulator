@@ -46,6 +46,17 @@ class RuntimeSession:
             self.capabilities["qwen3_5_gdn_meta_bridge"] = (
                 "dispatcher Meta/autograd; Triton GDN fusion boundary and text input adapter"
             )
+        if prepared.trainer.model_spec.name == "glm5_next":
+            from torchtitan_simulator.compat.glm5_next import (
+                install_glm5_next_input_adapter,
+                install_glm5_next_meta_support,
+            )
+
+            install_glm5_next_meta_support(self.patches)
+            install_glm5_next_input_adapter(self.patches)
+            self.capabilities["glm5_next_meta_bridge"] = (
+                "meta nonzero assumption for the DSA indexer pooling; maskless text input adapter"
+            )
         if prepared.trainer.model_spec.name == "deepseek_v4_1":
             from torchtitan_simulator.compat.deepseek_v4_1 import (
                 install_deepseek_v4_1_input_adapter,
