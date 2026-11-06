@@ -5,6 +5,6 @@
 
 """Compiled SDC implementation."""
 
-__all__ = ["SDC"]
+__all__ = ["SDC", "validate_sdc_replay_config"]
 
-from .sdc import SDC
+from .sdc import SDC, validate_sdc_replay_config

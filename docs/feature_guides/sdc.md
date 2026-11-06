@@ -4,6 +4,11 @@ SDC（Silent Data Corruption，静默数据损坏）用于检测 Ascend NPU 训�
 仅支持 Eager 模式或使用 `torch.compile(backend="inductor")` 的 Compile 模式。该能力默认关闭，按需启用。
 Eager 模式通过 torch-npu 原生环境变量启用，Compile 模式通过 `--sdc.*` CLI 参数启用。
 
+本文说明通过 `config.sdc` 或 torch-npu 原生开关启用的 NPU SDC。
+上游重放一致性检查使用 `config.sdc_replayer`，通用用法与约束见[上游说明](https://github.com/pytorch/torchtitan/blob/dc3985ad4912f67f71d5a125f2fdf40144ec8354/torchtitan/observability/silent_data_corruption.md)。
+该入口与本文的 `config.sdc` 检测开关及 torch-npu 原生 SDC 开关互斥。
+本仓通过临时 patch 将重放摘要按位视为 `int64`，兼容 NPU 比较；不改哈希算法或重放流程。
+
 ## 启动入口
 
 首先两种模式都需要通过 `torchrun -m torchtitan_npu.train` 启动训练。

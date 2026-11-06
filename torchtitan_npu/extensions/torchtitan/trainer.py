@@ -77,6 +77,10 @@ class TrainerEx(Trainer):
                 self.optimizer._cpu_offload = self.training.enable_cpu_offload
             self._post_init_optimizer()
             validate_anticipatory_config(self)
+            if self.sdc_replayer is not None:
+                from torchtitan_npu.extensions.components.sdc import validate_sdc_replay_config
+
+                validate_sdc_replay_config(self.sdc)
 
         def _post_init_optimizer(self) -> None:
             # Overrides may already have materialized and replaced the CLI schema.

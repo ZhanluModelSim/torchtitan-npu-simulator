@@ -17,6 +17,8 @@ from .experiments.graph_trainer import (  # noqa: F401
     ep_shape_live_out,
 )
 
+from . import observability  # noqa: F401
+
 # ``attention_metadata`` carries the backend-owned metadata contract and must
 # be applied before ``decoder`` binds the map builder that reads it, and before
 # ``mtp`` dispatches that map per layer.

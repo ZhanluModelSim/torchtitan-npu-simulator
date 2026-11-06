@@ -174,3 +174,23 @@ class SDC(Configurable):
                     continue
                 canonical = name if len(model_parts) == 1 else f"model_parts.{part_index}.{name}"
                 yield canonical, parameter
+
+
+def validate_sdc_replay_config(sdc_config: SDC.Config) -> None:
+    """Reject detector settings incompatible with SDC replay."""
+
+    if sdc_config.gradient_enabled or sdc_config.hccl_mode != 0:
+        raise ValueError("SDC replay cannot be combined with config.sdc detection")
+
+    # Match torch-npu: default false and the last enable entry wins.
+    native_gradient = "false"
+    for item in os.environ.get("NPU_ASD_CONFIG", "").split(","):
+        pair = item.split(":")
+        if len(pair) == 2 and pair[0] == "enable":
+            native_gradient = pair[1]
+    if native_gradient != "false" or os.environ.get("NPU_ASD_ENABLE", "0") != "0":
+        raise ValueError(
+            "SDC replay requires native SDC disabled: "
+            "NPU_ASD_CONFIG enable:false and NPU_ASD_ENABLE=0; "
+            "set these before importing torch-npu in a fresh worker"
+        )
