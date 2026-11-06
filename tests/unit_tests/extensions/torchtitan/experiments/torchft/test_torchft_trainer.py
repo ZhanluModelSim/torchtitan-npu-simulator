@@ -35,6 +35,10 @@ assert config.checkpoint.enable and config.checkpoint.enable_ft_dataloader_check
 assert config.model_spec.model.n_layers == 4
 assert config.parallelism.expert_parallel_degree == 4
 assert config.parallelism.data_parallel_shard_degree == 4
+assert config.training.max_context_length == config.model_spec.max_context_length == 256
+assert config.training.num_tokens_per_microbatch_per_dp_rank == 256
+assert config.training.num_tokens_per_train_step == 4096
+assert config.training.num_tokens_per_train_step // (256 * 4 * 2) == 2
 assert isinstance(config.profiler, npu_trainer.CANNProfiler.Config)
 
 full_config = ConfigManager().parse_args([
@@ -68,6 +72,7 @@ def set_path(root, path, value):
     setattr(target, parts[-1], value)
 
 unsupported = (
+    ('sdc_replayer', object(), 'does not support the upstream SDC replay engine'),
     ('checkpoint.enable', False, 'requires checkpoint'),
     ('checkpoint.enable_ft_dataloader_checkpoints', False, 'requires checkpoint'),
     ('model_spec.flavor', 'deepseek_v4_dense', 'DeepSeek-V4 Flash'),
@@ -90,6 +95,7 @@ for path, value, message in unsupported:
 
 initialize_ft = Mock()
 def initialize_once(trainer, cfg):
+    assert trainer.sdc_replayer is None
     initialize_ft(cfg)
     trainer.model_parts = []
     trainer.loss_fn = None
@@ -113,6 +119,10 @@ with patch.object(module.FaultTolerantTrainer, '__init__', initialize_once), \\
     )
     assert trainer._sdc is build_sdc.return_value
     recovery.assert_called_once()
+    trainer.load_state_dict({'step': 7, 'ntokens_seen': 1024})
+    assert trainer.step == 7
+    assert trainer.ntokens_seen == 1024
+    assert trainer.sdc_replayer is None
 
     for ft_manager, message in (
         (Mock(), 'requires FTManagerEx'),
@@ -148,3 +158,54 @@ assert AuxiliaryLoss.group_acc == {}
 """
     result = subprocess.run([sys.executable, "-c", program], capture_output=True, text=True, timeout=120)
     assert result.returncode == 0, result.stderr
+
+
+def test_ft_train_step_consumes_collated_valid_tokens(monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+
+    import torch
+
+    from torchtitan_npu.extensions.torchtitan.experiments.torchft import trainer as module
+
+    optimizer, schedulers = Mock(), Mock()
+    schedulers.schedulers = [Mock()]
+    schedulers.schedulers[0].get_last_lr.return_value = [0.01]
+    parallel = SimpleNamespace(dp_enabled=False, pp_enabled=False, ep_enabled=False)
+    parallel.get_optional_mesh = lambda _: None
+    inputs = [
+        ({"tokens": torch.tensor([1, 2]), "num_valid_tokens": torch.tensor(2)}, torch.tensor([2, 3])),
+        ({"tokens": torch.tensor([3, 4]), "num_valid_tokens": torch.tensor(1)}, torch.tensor([4, -100])),
+    ]
+    observed = []
+
+    def forward_backward_step(*, input_dict, labels, global_valid_tokens):
+        assert "num_valid_tokens" not in input_dict
+        observed.append((input_dict["tokens"].clone(), labels.clone(), global_valid_tokens.item()))
+        return torch.tensor(0.5)
+
+    trainer = SimpleNamespace(
+        config=SimpleNamespace(training=SimpleNamespace(disable_cuda_graphs=True, max_norm=1.0)),
+        optimizers=optimizer,
+        lr_schedulers=schedulers,
+        step=1,
+        metrics_processor=Mock(should_log=Mock(return_value=False)),
+        parallel_dims=parallel,
+        gradient_accumulation_steps=2,
+        num_pp_microbatches=1,
+        device=torch.device("cpu"),
+        model_parts=[torch.nn.Linear(1, 1)],
+        checkpointer=Mock(),
+        forward_backward_step=forward_backward_step,
+    )
+    monkeypatch.setattr(module.dist_utils, "clip_grad_norm_", lambda *args, **kwargs: torch.tensor(1.0))
+
+    module.FaultTolerantTrainerEx._train_step(trainer, iter(inputs))
+
+    assert len(observed) == 2
+    assert [entry[2] for entry in observed] == [3, 3]
+    torch.testing.assert_close(observed[0][0], torch.tensor([1, 2]))
+    torch.testing.assert_close(observed[1][1], torch.tensor([4, -100]))
+    optimizer.zero_grad.assert_called_once_with(set_to_none=True)
+    optimizer.step.assert_called_once_with()
+    schedulers.step.assert_called_once_with()

@@ -10,7 +10,6 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field
 
 import torch
-from torchtitan.components.loss import IGNORE_INDEX
 from torchtitan.distributed import utils as dist_utils
 from torchtitan.experiments.torchft.checkpoint import TorchFTCheckpointManager
 from torchtitan.experiments.torchft.trainer import FaultTolerantTrainer
@@ -42,6 +41,7 @@ class FaultTolerantTrainerEx(TrainerEx, FaultTolerantTrainer):
 
     def __init__(self, config: Config) -> None:
         self._validate_supported_config(config)
+        self.sdc_replayer = None
         super().__init__(config)
         ft_manager = self.ft_manager
         if not isinstance(ft_manager, FTManagerEx):
@@ -62,6 +62,8 @@ class FaultTolerantTrainerEx(TrainerEx, FaultTolerantTrainer):
     @staticmethod
     def _validate_supported_config(config: Config) -> None:
         FTManagerEx.validate_config(config.fault_tolerance)
+        if config.sdc_replayer is not None:
+            raise ValueError("The pinned TorchFT trainer does not support the upstream SDC replay engine")
         if not config.checkpoint.enable or not config.checkpoint.enable_ft_dataloader_checkpoints:
             raise ValueError("NPU TorchFT requires checkpoint and per-replica dataloader checkpointing")
 
@@ -105,7 +107,7 @@ class FaultTolerantTrainerEx(TrainerEx, FaultTolerantTrainer):
         return self.recovery.run_step(self._train_step, data_iterator)
 
     def _train_step(self, data_iterator: Iterator[tuple[dict[str, torch.Tensor], torch.Tensor]]):
-        """Keep the v0.3 FT loop, but finish metrics before authorizing updates."""
+        """Finish metrics before authorizing the FT optimizer update."""
         self.optimizers.zero_grad(set_to_none=self.config.training.disable_cuda_graphs)
         lr = self.lr_schedulers.schedulers[0].get_last_lr()[0]
         should_log = self.metrics_processor.should_log(self.step)
@@ -115,9 +117,9 @@ class FaultTolerantTrainerEx(TrainerEx, FaultTolerantTrainer):
         local_valid_tokens = torch.tensor(0, dtype=torch.int64)
         for _ in range(self.gradient_accumulation_steps):
             microbatches = []
-            for _ in range(self.num_pipeline_parallel_microbatches):
+            for _ in range(self.num_pp_microbatches):
                 input_dict, labels = next(data_iterator)
-                local_valid_tokens += (labels != IGNORE_INDEX).sum()
+                local_valid_tokens += input_dict.pop("num_valid_tokens")
                 microbatches.append((input_dict, labels))
             microbatch_groups.append(microbatches)
 
@@ -174,6 +176,8 @@ class FaultTolerantTrainerEx(TrainerEx, FaultTolerantTrainer):
             assert ft_pg is not None, "Synchronous TorchFT requires a loss process group"
             loss_mesh = parallel_dims.get_optional_mesh("loss")
             local_avg_loss = accumulated_loss * global_valid_tokens / local_valid_tokens
+            # Loss is normalized by replica-local valid tokens; average the
+            # cross-replica SUM over the current participants.
             global_avg_loss = dist_utils.dist_sum(accumulated_loss, loss_mesh, ft_pg) / ft_pg.size()
             global_max_loss = dist_utils.dist_max(local_avg_loss, loss_mesh, ft_pg)
             global_ntokens_seen = dist_utils.dist_sum(

@@ -33,8 +33,6 @@ collect_ignore = [
     "ema",
     "extensions/experiment/cv_parallel",
     "extensions/torchtitan/experiments/graph_trainer",
-    "extensions/torchtitan/experiments/torchft",
-    "patches/torchft",
     "patches/torchtitan/experiments/graph_trainer",
     # Qwen runtime migration is deferred. Upstream eagerly imports CUDA-only
     # CuTeDSL code, which is not installed in the NPU test image.

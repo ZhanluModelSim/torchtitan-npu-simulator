@@ -16,6 +16,8 @@ from torch.utils._pytree import tree_flatten, tree_unflatten
 from torchft.manager import Manager
 
 if TYPE_CHECKING:
+    from torchft.process_group import ProcessGroup
+
     from torchtitan_npu.extensions.torchtitan.experiments.torchft.process_group import ProcessGroupHCCLEx
 
 
@@ -66,7 +68,7 @@ class TorchFTCommitTimeoutError(RuntimeError):
 
 
 class ManagerEx(Manager):
-    _pg: "ProcessGroupHCCLEx"
+    _pg: "ProcessGroup"
     _user_state_dicts: dict[str, Any]
     _quorum_future: Any
     _pending_state_dict: Any

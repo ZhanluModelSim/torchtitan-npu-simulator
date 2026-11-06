@@ -512,15 +512,15 @@ def deepseek_v4_flash_8p_torchft() -> Trainer.Config:
     model.n_layers = 4
     model.compress_ratios = model.compress_ratios[:4]
     base.model_spec.flavor = "deepseek_v4_flash_4layers_16experts"
+    base.model_spec.max_context_length = 256
+    base.training.max_context_length = 256
+    base.training.num_tokens_per_microbatch_per_dp_rank = 256
     config = _torchft_flash_config(
         base,
         expert_parallel_degree=4,
         data_parallel_shard_degree=4,
         global_batch_size=16,
     )
-    config.training.num_tokens_per_microbatch_per_dp_rank = 256
-    assert config.model_spec is not None
-    config.model_spec.max_context_length = 256
     config.debug.seed = 42
     return config
 

@@ -48,9 +48,6 @@ project-excludes = [
     "torchtitan_npu/ops/triton", "torchtitan_npu/ops/tilelang",
     # Re-enable with the DeepSeek-V3.2 folded-token model migration.
     "torchtitan_npu/models/deepseek_v3_2/sharding.py",
-    # TorchFT still targets the trainer before the folded-token migration.
-    "torchtitan_npu/patches/torchtitan/experiments/torchft",
-    "torchtitan_npu/extensions/torchtitan/experiments/torchft",
 ]
 ignore-missing-imports = [
     "attn_gym",
