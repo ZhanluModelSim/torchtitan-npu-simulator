@@ -8,4 +8,5 @@ from . import (
     determinism,  # noqa: F401
     device_copy,  # noqa: F401
     inductor_runtime_estimation,  # noqa: F401
+    multiprocessing_reductions,  # noqa: F401
 )

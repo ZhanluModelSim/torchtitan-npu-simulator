@@ -59,7 +59,7 @@ pip install --no-deps -e .
 # re-running the whole file would upgrade the CANN stack mid-job (it broke the
 # fused-op smoke tests once).  New pure-Python runtime wheels go here by name.
 pip install --no-deps attn-gym==0.0.16 spmd_types==0.2.5 \
-    'torch_checkpointing>=0.1.0' 'torch_remat>=0.2.0'
+    'torch_checkpointing==0.1.1' 'torch_remat>=0.2.0'
 # Resolve Grain's own data-pipeline dependencies without changing the torch stack.
 pip install grain==0.2.18
 

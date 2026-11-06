@@ -23,6 +23,19 @@
 `enable=False` 时既不会保存 checkpoint，也不会执行 checkpoint 加载。训练命令需要显式
 传入 `--checkpoint.enable`，或在 Python 配置中设置 `checkpoint.enable = True`。
 
+## 可选 torch_checkpointing 后端
+
+默认使用 DCP。native 后端当前推荐使用 `torch_checkpointing==0.1.1`，可在 Python 训练配置中选择：
+
+```python
+import torchtitan_npu
+from torchtitan.components.checkpointer.torch_checkpointing import TorchCheckpointingManager
+
+config.checkpoint = TorchCheckpointingManager.Config(enable=True, folder="native-checkpoint")
+```
+
+native 与 DCP 使用不同的 checkpoint 目录。
+
 ## checkpoint 格式与目录
 
 ### DCP

@@ -13,7 +13,6 @@ from torchtitan.experiments.graph_trainer.trainer import GraphTrainer
 from torchtitan_npu.config import manager as config_manager
 from torchtitan_npu.config.configs import OptimizerConfig, TrainingConfig
 from torchtitan_npu.config.converters import TrainerConfigConverter
-from torchtitan_npu.extensions.torchtitan.components.checkpoint import CheckpointManager
 
 from ...tools.profiler import CANNProfiler
 from ...trainer import TrainerEx
@@ -51,7 +50,6 @@ config_manager.register_config_converter(
         target_type=GraphTrainerEx.Config,
         component_types={
             "optimizer": OptimizerConfig,
-            "checkpoint": CheckpointManager.Config,
             "profiler": CANNProfiler.Config,
             "training": TrainingConfig,
         },

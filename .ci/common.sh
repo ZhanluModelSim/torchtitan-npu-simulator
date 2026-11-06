@@ -70,7 +70,7 @@ _setup_torchtitan "${TORCHTITAN_DIR}"
 # wheels, never the whole file, whose torch/torch_npu pins differ from the image
 # build.
 "${PYTHON_BIN}" -m pip install --break-system-packages --no-deps --no-cache-dir attn-gym==0.0.16 spmd_types==0.2.5 \
-    'torch_checkpointing>=0.1.0' 'torch_remat>=0.2.0'
+    'torch_checkpointing==0.1.1' 'torch_remat>=0.2.0'
 # Grain needs its data-pipeline dependencies (for example etils and array-record).
 # Its dependency graph does not include torch or torch_npu.
 "${PYTHON_BIN}" -m pip install --break-system-packages --no-cache-dir grain==0.2.18

@@ -10,6 +10,8 @@ from copy import copy
 from dataclasses import dataclass, field
 from typing import Any
 
+from torchtitan.components.checkpointer.base import BaseCheckpointManager
+from torchtitan.components.checkpointer.dcp import CheckpointManager as DCPCheckpointManager
 from torchtitan.config import derive
 from torchtitan.tools.logging import logger
 from torchtitan.trainer import Trainer
@@ -32,6 +34,25 @@ from torchtitan_npu.extensions.experiment.anticipatory_routing.schedule import A
 from .tools.profiler import CANNProfiler
 
 
+def convert_checkpoint_config(checkpoint: BaseCheckpointManager.Config) -> BaseCheckpointManager.Config:
+    """Adapt upstream defaults without replacing custom backend implementations."""
+    source_type = type(checkpoint)
+    # The EMA patch replaces the public DCP binding, while earlier recipes
+    # may still hold its original Config (the actual EMA Config parent).
+    if source_type in (DCPCheckpointManager.Config, DCPCheckpointManager.Config.__bases__[0]):
+        return derive(checkpoint, CheckpointManager.Config)
+    # Keep the optional native package lazy for DCP and user-defined backends.
+    if source_type.__module__ == "torchtitan.components.checkpointer.torch_checkpointing":
+        from torchtitan.components.checkpointer.torch_checkpointing import (
+            TorchCheckpointingManager as UpstreamNativeManager,
+        )
+        from torchtitan_npu.extensions.torchtitan.components.torch_checkpointing import TorchCheckpointingManager
+
+        if source_type is UpstreamNativeManager.Config:
+            return derive(checkpoint, TorchCheckpointingManager.Config)
+    return checkpoint
+
+
 def set_allow_hf32(allow: bool) -> None:
     """Set HF32 consistently on the NPU math backends."""
 
@@ -51,7 +72,7 @@ class TrainerEx(Trainer):
         optimizer: OptimizerConfig = field(  # pyrefly: ignore [bad-override]
             default_factory=OptimizerConfig,
         )
-        checkpoint: CheckpointManager.Config = field(  # pyrefly: ignore [bad-override]
+        checkpoint: BaseCheckpointManager.Config = field(
             default_factory=CheckpointManager.Config,
         )
         profiler: CANNProfiler.Config = field(  # pyrefly: ignore [bad-override]
@@ -67,6 +88,7 @@ class TrainerEx(Trainer):
             # ``slots=True`` dataclasses are recreated by the decorator, so a
             # zero-argument ``super()`` can retain the pre-decoration class cell.
             Trainer.Config.__post_init__(self)
+            self.checkpoint = convert_checkpoint_config(self.checkpoint)
             # Single switch: ``--training.enable-cpu-offload`` drives both the
             # FSDP offload policy (read by parallelize) and, through this
             # carrier field, the optimizer-container selection in the
@@ -266,11 +288,11 @@ class TrainerEx(Trainer):
 
 config_manager.register_config_converter(
     Trainer.Config,
+    # Backend selection belongs to Config.__post_init__, not a DCP coercion here.
     TrainerConfigConverter(
         target_type=TrainerEx.Config,
         component_types={
             "optimizer": OptimizerConfig,
-            "checkpoint": CheckpointManager.Config,
             "profiler": CANNProfiler.Config,
             "training": TrainingConfig,
         },

@@ -19,6 +19,7 @@ import torch
 import torchtitan.trainer
 from torchtitan.trainer import Trainer
 
+from torchtitan_npu.patches.torchtitan.components import checkpointer  # noqa: F401
 from torchtitan_npu.patches.torchtitan.components.checkpoint import EMACheckpointManager
 from torchtitan_npu.patches.torchtitan.components.ema import EMAOptimizersContainer
 from torchtitan_npu.patches.torchtitan.models.common.aux_loss import AuxLoss
@@ -121,12 +122,14 @@ class EMATrainer(Trainer):
         )
 
     def __init__(self, config: Config) -> None:
-        config.checkpoint.ema_weights = config.ema_weights
+        if config.ema_weights.enable:
+            config.checkpoint.ema_weights = config.ema_weights
         super().__init__(config)
 
-        self.ema_optimizer = cast("Any", self.checkpointer).ema_optimizer
-        self.optimizers.register_step_pre_hook(lambda *_args, **_kwargs: self.ema_optimizer.wait_for_param_reads())
-        self.optimizers.register_step_post_hook(lambda *_args, **_kwargs: self.ema_optimizer.step(self.step))
+        if config.ema_weights.enable:
+            self.ema_optimizer = cast("Any", self.checkpointer).ema_optimizer
+            self.optimizers.register_step_pre_hook(lambda *_args, **_kwargs: self.ema_optimizer.wait_for_param_reads())
+            self.optimizers.register_step_post_hook(lambda *_args, **_kwargs: self.ema_optimizer.step(self.step))
 
 
 def apply() -> None:
