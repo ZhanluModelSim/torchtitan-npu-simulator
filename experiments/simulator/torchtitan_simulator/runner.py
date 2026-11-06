@@ -30,6 +30,10 @@ def _gradient_manifest(model):
     for name, parameter in logical_named_parameters(model):
         if not parameter.requires_grad:
             continue
+        if getattr(parameter, "_engram_host_offload", False):
+            # Host-offload sparse table: gradients reach SparseAdam through
+            # the pending sparse-grad path, never as a dense parameter grad.
+            continue
         gradient = parameter.grad
         if gradient is None:
             missing.append(name)
@@ -298,7 +302,13 @@ def simulate(simulation):
                 "overrides": asdict(simulation.model_overrides) if simulation.model_overrides is not None else None,
                 "dim": config.model_spec.model.dim,
                 "vocab_size": config.model_spec.model.vocab_size,
-                "num_layers": config.model_spec.model.n_layers,
+                # DSV4 stores n_layers directly; Kimi exposes it as a property
+                # over its layer list; Qwen3.5 carries a layers mapping only.
+                "num_layers": (
+                    len(config.model_spec.model.layers)
+                    if getattr(config.model_spec.model, "layers", None) is not None
+                    else config.model_spec.model.n_layers
+                ),
                 "num_mtp_layers": len(getattr(config.model_spec.model, "mtp_layers", ())),
             }
             annotations["quantization_configuration"] = {

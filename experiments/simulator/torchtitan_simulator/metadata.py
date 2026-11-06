@@ -10,6 +10,24 @@ from dataclasses import fields, is_dataclass
 
 import torch
 
+# torch 2.14's BlockMask is not a dataclass instance, so the generic lift
+# below cannot discover its tensor fields; visit them explicitly.
+_BLOCKMASK_TENSOR_FIELDS = (
+    "seq_lengths",
+    "kv_num_blocks",
+    "kv_indices",
+    "full_kv_num_blocks",
+    "full_kv_indices",
+    "q_num_blocks",
+    "q_indices",
+    "full_q_num_blocks",
+    "full_q_indices",
+    "dq_write_order",
+    "dq_write_order_full",
+    "dq_kv_order",
+    "dq_kv_order_spt",
+)
+
 
 def iter_metadata_tensors(value):
     """Visit tensor leaves of native metadata without retaining duplicate owners."""
@@ -59,6 +77,14 @@ def to_meta_metadata(value):
             memo[id(item)] = result
             for field in fields(item):
                 object.__setattr__(result, field.name, lift(getattr(item, field.name), field_name=field.name))
+            return result
+        if isinstance(item, torch.nn.attention.flex_attention.BlockMask):
+            result = copy.copy(item)
+            memo[id(item)] = result
+            for name in _BLOCKMASK_TENSOR_FIELDS:
+                value = getattr(item, name, None)
+                if isinstance(value, torch.Tensor):
+                    object.__setattr__(result, name, lift(value, field_name=field_name))
             return result
         if isinstance(item, dict):
             result = {key: lift(child) for key, child in item.items()}

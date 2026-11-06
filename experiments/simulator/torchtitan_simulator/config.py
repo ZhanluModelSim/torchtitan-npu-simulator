@@ -148,6 +148,22 @@ _DSV4_OVERRIDES = [
     "torchtitan_npu.override.deepseek_v4.mhc.asc_hc_post",
 ]
 
+_QWEN3_5_OVERRIDES = [
+    *_COMMON_OVERRIDES,
+    "torchtitan_npu.override.qwen3_5.gated_delta.npu",
+]
+
+# The production A3 text recipe (examples/deepseek_v4_1) enables rms_norm, the
+# ASC MoE dispatcher and the V4.1 MHC post-processing override; the CLI rope
+# default (asc_complex) applies after the ops list and wins over
+# rope.asc_half_rotation, so the capture uses what production actually runs.
+# The optimizer swap wrapper is trainer-level and stays out.
+_DSV4_1_OVERRIDES = [
+    *_COMMON_OVERRIDES,
+    "torchtitan_npu.override.common.rope.asc_complex",
+    "torchtitan_npu.override.deepseek_v4_1.mhc.asc_hc_post",
+]
+
 
 def prepare_config(simulation: SimulationConfig) -> PreparedConfig:
     """Resolve a fresh native config before any model or parallel initialization."""
@@ -161,6 +177,10 @@ def prepare_config(simulation: SimulationConfig) -> PreparedConfig:
         "deepseek_v4_flash": "torchtitan_npu.models.deepseek_v4.config_registry.deepseek_v4_flash",
         "deepseek_v4_pro": "torchtitan_npu.models.deepseek_v4.config_registry.deepseek_v4_pro",
         "deepseek_v4_pro_20t": "torchtitan_simulator.presets.deepseek_v4_pro_20t",
+        "qwen3_5_debugmodel": "torchtitan_simulator.presets.qwen3_5_debugmodel",
+        "qwen3_5_debugmodel_moe": "torchtitan_simulator.presets.qwen3_5_debugmodel_moe",
+        "deepseek_v4_1_debugmodel_text": "torchtitan_simulator.presets.deepseek_v4_1_debugmodel_text",
+        "deepseek_v4_1_debugmodel_multimodal": "torchtitan_simulator.presets.deepseek_v4_1_debugmodel_multimodal",
     }
     target = factories.get(simulation.config, simulation.config)
     if "." not in target:
@@ -185,8 +205,8 @@ def prepare_config(simulation: SimulationConfig) -> PreparedConfig:
         if value is not None:
             setattr(trainer.training, target_name, value)
     model = trainer.model_spec.model
-    if trainer.model_spec.name not in {"deepseek_v4", "kimi_k3"}:
-        raise ValueError("Supported model families are deepseek_v4 and kimi_k3")
+    if trainer.model_spec.name not in {"deepseek_v4", "deepseek_v4_1", "kimi_k3", "qwen3_5"}:
+        raise ValueError("Supported model families are deepseek_v4, deepseek_v4_1, kimi_k3 and qwen3_5")
     adaptations = []
     if simulation.model_overrides is not None:
         adaptations.append("typed geometry overrides rebuilt the complete native model configuration tree")
@@ -225,7 +245,14 @@ def prepare_config(simulation: SimulationConfig) -> PreparedConfig:
     if trainer.debug.seed is None:
         trainer.debug.seed = 42
     trainer.override.imports = list(
-        ({"deepseek_v4": _DSV4_OVERRIDES, "kimi_k3": _COMMON_OVERRIDES}[trainer.model_spec.name])
+        (
+            {
+                "deepseek_v4": _DSV4_OVERRIDES,
+                "deepseek_v4_1": _DSV4_1_OVERRIDES,
+                "kimi_k3": _COMMON_OVERRIDES,
+                "qwen3_5": _QWEN3_5_OVERRIDES,
+            }[trainer.model_spec.name]
+        )
         if simulation.override_imports is None
         else simulation.override_imports
     )

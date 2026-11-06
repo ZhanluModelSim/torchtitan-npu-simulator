@@ -36,7 +36,14 @@ def balanced_splits(num_tokens, top_k, num_experts, ep_size, ep_rank):
 
 def install_balanced_dispatch(scope, model):
     routers = [module for module in model.modules() if hasattr(module, "_debug_force_load_balance")]
-    if not routers or any(not router._debug_force_load_balance for router in routers):
+    if not routers:
+        # Dense models (e.g. Qwen3.5 debugmodel) have no routers and no EP
+        # token exchange to balance; balanced dispatch stays uninstalled.
+        return {
+            "ep_token_exchange": "none_no_routers",
+            "ep_token_dispatcher_classes": 0,
+        }
+    if any(not router._debug_force_load_balance for router in routers):
         raise ValueError("Meta EP split derivation requires verified balanced routing on every router")
     classes = {
         type(dispatcher)

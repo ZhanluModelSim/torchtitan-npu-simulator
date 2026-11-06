@@ -39,6 +39,27 @@ class RuntimeSession:
 
             install_kimi_virtual_fusions(self.patches)
             self.capabilities["kimi_virtual_fusions"] = "dispatcher Meta/autograd; legacy fusion boundaries"
+        if prepared.trainer.model_spec.name == "qwen3_5":
+            from torchtitan_simulator.compat.qwen3_5 import install_qwen3_5_meta_support
+
+            install_qwen3_5_meta_support(self.patches)
+            self.capabilities["qwen3_5_gdn_meta_bridge"] = (
+                "dispatcher Meta/autograd; Triton GDN fusion boundary and text input adapter"
+            )
+        if prepared.trainer.model_spec.name == "deepseek_v4_1":
+            from torchtitan_simulator.compat.deepseek_v4_1 import (
+                install_deepseek_v4_1_input_adapter,
+                install_deepseek_v4_1_meta_support,
+            )
+
+            install_deepseek_v4_1_meta_support(self.patches)
+            install_deepseek_v4_1_input_adapter(self.patches)
+            self.capabilities["deepseek_v4_1_engram_meta_bridge"] = (
+                "Meta init for the host-offload Engram table; real residency stays CPU"
+            )
+            self.capabilities["deepseek_v4_1_metadata_map"] = (
+                "build_attention_masks adapter producing the per-backend AttentionMetadataMap"
+            )
         imports = prepared.trainer.override.imports
         if "torchtitan_npu.override.common.rms_norm.asc" in imports:
             from torchtitan_simulator.compat.norm import install_meta_norm_autograd, install_meta_norm_buffers
