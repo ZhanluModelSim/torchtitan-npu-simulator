@@ -23,9 +23,7 @@ def install_deepseek_v4_1_meta_support(scope):
         # Mirror the production seed derivation exactly; only the device
         # assertion is relaxed for meta, where init allocates nothing.
         if self.weight.device.type not in {"cpu", "meta"}:
-            raise RuntimeError(
-                f"Host-offload Engram weight must initialize on CPU or meta, got {self.weight.device}."
-            )
+            raise RuntimeError(f"Host-offload Engram weight must initialize on CPU or meta, got {self.weight.device}.")
         shard_rank = self._table_mesh.get_local_rank() if self._table_mesh is not None else self._ep_rank
         seed = (torch.initial_seed() + 1000003 * self.layer_id + 9176 * shard_rank) % (2**63 - 1)
         with torch.random.fork_rng(devices=[]):
