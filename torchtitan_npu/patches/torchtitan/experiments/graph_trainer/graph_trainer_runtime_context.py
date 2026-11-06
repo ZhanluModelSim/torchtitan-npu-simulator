@@ -164,6 +164,8 @@ def apply() -> None:
     logger.info("[PATCH] GraphTrainer graph-pass runtime context -> NPU adapter")
     torchtitan.experiments.graph_trainer.passes.apply_graph_passes = patched_apply_graph_passes
     # GraphTrainer imports this symbol directly, so patch its module alias too.
+    # Only the legacy trainer entrypoint above owns this alias.
+    # pyrefly: ignore[missing-attribute]
     torchtitan.experiments.graph_trainer.trainer.apply_graph_passes = patched_apply_graph_passes
     trainer._make_fx_forward_backward_step = (  # pyrefly: ignore [missing-attribute]
         patched_make_fx_forward_backward_step

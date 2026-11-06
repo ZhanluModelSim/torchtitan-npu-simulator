@@ -57,11 +57,10 @@ class CheckpointManager(_CheckpointManager):
         # overlaps their copy with training, which can reuse those buffers.
         if (
             not getattr(optimizers, "supports_async_with_pinned_mem", True)
-            and config.enable
             and config.async_mode == AsyncMode.ASYNC_WITH_PINNED_MEM.value
         ):
             raise ValueError(
-                "checkpoint.async_mode='async_with_pinned_mem' is unsupported "
+                "checkpointer.async_mode='async_with_pinned_mem' is unsupported "
                 "with swap_optimizer; use 'disabled' or 'async'"
             )
 
@@ -110,15 +109,15 @@ class CheckpointManager(_CheckpointManager):
 
         return result
 
-    def dcp_load(self, state_dict, checkpoint_id, from_hf=False, from_quantized=False):
+    def _load_checkpoint(self, states, checkpoint_id, *, from_hf: bool, from_quantized: bool) -> None:
         if self.verify_hash_manifest:
             verify_checkpoint_manifest(checkpoint_id)
 
-        return super().dcp_load(
-            state_dict,
+        return super()._load_checkpoint(
+            states,
             checkpoint_id,
-            from_hf,
-            from_quantized,
+            from_hf=from_hf,
+            from_quantized=from_quantized,
         )
 
 

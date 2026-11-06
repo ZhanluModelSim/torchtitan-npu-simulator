@@ -11,8 +11,9 @@ import types
 
 import pytest
 import torch
-from torchtitan.components.optimizer import OptimizersContainer, ParamGroupConfig
+from torchtitan.components.optim import AdamW, OptimizersContainer
 
+from torchtitan_npu.config import OptimizerConfig
 from torchtitan_npu.override.common import optimizer as product_optimizer
 
 make_swap = vars(product_optimizer)["_make_swap"]
@@ -83,32 +84,23 @@ def test_swap_state_hook_initializes_only_missing_states_with_gradients(
 
 def test_virtual_derives_optimizer_config():
     cfg = OptimizersContainer.Config(
-        implementation="for-loop",
-        param_groups=[ParamGroupConfig(pattern=".*", optimizer_name="AdamW", optimizer_kwargs={"lr": 0.03})],
+        optimizers=[AdamW.Config(pattern=".*", lr=0.03, fused=False)],
     )
     result = product_optimizer.virtual(cfg)
 
     assert isinstance(result, product_optimizer.VirtualOptimizersContainer.Config)
-    assert result.implementation == "for-loop"
-    assert result.param_groups[0].optimizer_kwargs["lr"] == 0.03
+    assert result.optimizers[0].fused is False
+    assert result.optimizers[0].lr == 0.03
+    model = torch.nn.Module()
+    model.weight = torch.nn.Parameter(torch.ones(1, 2))
+    optimizer = result.build(model_parts=[model], enable_cuda_graph=False)
+    assert isinstance(optimizer, product_optimizer.VirtualOptimizersContainer)
+    assert optimizer.optimizers[0].param_groups[0]["lr"] == 0.03
 
 
-@pytest.mark.parametrize("override_name", ["cpu_offload", "swap_optimizer"])
-def test_cpu_offload_preserves_sparse_training_and_checkpoint(monkeypatch, override_name):
-    from copy import deepcopy
-    from dataclasses import dataclass
-
-    from torchtitan.config import Configurable, OverrideConfig, apply_overrides
-
-    from torchtitan_npu.extensions.torchtitan.components.optimizer.optimizer import (
-        HostSparseOptimizersContainer,
-    )
+@pytest.fixture
+def cpu_offload_resources(monkeypatch):
     from torchtitan_npu.extensions.distributed import grad_accum, grad_clip
-    from torchtitan_npu.models.deepseek_v4_1.engram.host import HostEngramTable
-
-    @dataclass(kw_only=True)
-    class RootConfig(Configurable.Config):
-        optimizer: OptimizersContainer.Config
 
     # Replace only the NPU resource setup; keep container construction, factory,
     # SparseAdam, lifecycle and checkpoint serialization on the production path.
@@ -129,6 +121,59 @@ def test_cpu_offload_preserves_sparse_training_and_checkpoint(monkeypatch, overr
         for name in names:
             monkeypatch.setattr(module, name, lambda: None)
 
+    previous_channel = product_optimizer.clip_state.get_active_channel()
+    yield
+    product_optimizer.clip_state.set_active_channel(previous_channel)
+
+
+def test_cpu_offload_typed_configs_preserve_first_match_selection_and_hyperparameters(cpu_offload_resources):
+    model = torch.nn.Module()
+    model.bias = torch.nn.Parameter(torch.ones(2))
+    model.weight = torch.nn.Parameter(torch.ones(2, 3))
+    first = AdamW.Config(pattern=r"^bias$", lr=0.03, betas=(0.8, 0.9), eps=1e-5, weight_decay=0.0)
+    fallback = AdamW.Config(pattern=r".*", lr=0.02, betas=(0.7, 0.95), eps=1e-6, weight_decay=0.2)
+    source = OptimizerConfig(optimizers=[first, fallback], _cpu_offload=True)
+    config = product_optimizer.cpu_offload(source)
+
+    optimizer = config.build(model_parts=[model], enable_cuda_graph=False)
+    try:
+        assert all(isinstance(part, product_optimizer.CpuOffloadAdamW) for part in optimizer.optimizers)
+        groups = [part.param_groups[0] for part in optimizer.optimizers]
+        assert groups[0]["params"] == [model.bias]
+        assert groups[1]["params"] == [model.weight]
+        assert [group["param_names"] for group in groups] == [["bias"], ["weight"]]
+        assert [(group["lr"], group["betas"], group["eps"], group["weight_decay"]) for group in groups] == [
+            (0.03, (0.8, 0.9), 1e-5, 0.0),
+            (0.02, (0.7, 0.95), 1e-6, 0.2),
+        ]
+        assert source.optimizers == [first, fallback]
+        assert config.optimizers == [first, fallback]
+        assert all(type(part) is AdamW.Config for part in source.optimizers)
+        for part in optimizer.optimizers:
+            parameter = part.param_groups[0]["params"][0]
+            assert set(part.state[parameter]) == {"step", "exp_avg", "exp_avg_sq"}
+            assert part.state[parameter]["step"].item() == 0
+    finally:
+        optimizer.close()
+
+
+@pytest.mark.parametrize("override_name", ["cpu_offload", "swap_optimizer"])
+def test_cpu_offload_preserves_sparse_training_and_checkpoint(monkeypatch, override_name, cpu_offload_resources):
+    from copy import deepcopy
+    from dataclasses import dataclass
+
+    from torchtitan.config import Configurable, OverrideConfig, apply_overrides
+
+    from torchtitan_npu.extensions.torchtitan.components.optimizer.optimizer import (
+        HostSparseOptimizersContainer,
+        SparseAdam,
+    )
+    from torchtitan_npu.models.deepseek_v4_1.engram.host import HostEngramTable
+
+    @dataclass(kw_only=True)
+    class RootConfig(Configurable.Config):
+        optimizer: OptimizersContainer.Config
+
     def build():
         table = HostEngramTable.Config(
             vocab_size=16,
@@ -146,17 +191,14 @@ def test_cpu_offload_preserves_sparse_training_and_checkpoint(monkeypatch, overr
         root = RootConfig(
             optimizer=HostSparseOptimizersContainer.Config(
                 _cpu_offload=True,
-                implementation="fused",
-                param_groups=[
-                    ParamGroupConfig(pattern=".*", optimizer_name="SparseAdam", optimizer_kwargs={"lr": 0.05})
-                ],
+                optimizers=[SparseAdam.Config(pattern=".*", lr=0.05, betas=(0.9, 0.999), eps=1e-8)],
             )
         )
         apply_overrides(OverrideConfig(imports=[f"torchtitan_npu.override.common.optimizer.{override_name}"]), root)
-        optimizer = root.optimizer.build(model_parts=[table])
+        optimizer = root.optimizer.build(model_parts=[table], enable_cuda_graph=False)
         assert isinstance(optimizer, product_optimizer.CpuOffloadOptimizersContainer)
         assert isinstance(optimizer, HostSparseOptimizersContainer)
-        assert type(optimizer.optimizers[0]) is torch.optim.SparseAdam
+        assert type(optimizer.optimizers[0]) is SparseAdam
         assert optimizer._clip_channel._preserve_coefficient_dtype
         return table, optimizer
 
@@ -213,7 +255,6 @@ def test_cpu_offload_preserves_sparse_training_and_checkpoint(monkeypatch, overr
 def test_cpu_offload_sparse_clip_uses_one_global_coefficient(monkeypatch, cached):
     from torchtitan.distributed import utils as dist_utils
 
-    from torchtitan_npu.models.deepseek_v4_1.config_registry import DeepSeekV41Trainer
     from torchtitan_npu.models.deepseek_v4_1.engram.host import HostEngramTable
 
     table = HostEngramTable.Config(
@@ -235,8 +276,6 @@ def test_cpu_offload_sparse_clip_uses_one_global_coefficient(monkeypatch, cached
     optimizer._closed = True
     optimizer._clip_channel = channel
     optimizer.model_parts = [table]
-    trainer = object.__new__(DeepSeekV41Trainer)
-    trainer.optimizers = optimizer
 
     def clip(parameters, max_norm, norm_type, **kwargs):
         if cached:
@@ -245,7 +284,7 @@ def test_cpu_offload_sparse_clip_uses_one_global_coefficient(monkeypatch, cached
         return torch.nn.utils.clip_grad_norm_(parameters, max_norm, norm_type, foreach=False)
 
     monkeypatch.setattr(dist_utils, "clip_grad_norm_", clip)
-    assert trainer.clip_grad_norm([dense, table.weight], 1.0).item() == pytest.approx(5.0)
+    assert optimizer.clip_grad_norm([dense, table.weight], 1.0, norm_type=2.0).item() == pytest.approx(5.0)
     if cached:
         assert dense.grad.item() == 3.0
         actual = channel.apply_pending(channel.take_gradient(dense, dense.grad))

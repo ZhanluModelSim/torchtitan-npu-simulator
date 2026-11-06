@@ -25,8 +25,11 @@ and reintroduces exactly the host-side stall this module is meant to remove.
 Leaving it at the torch default keeps such floats dynamic instead.
 """
 
+import logging
+
 import torch._dynamo.config
-from torchtitan.tools.logging import logger
+
+logger = logging.getLogger(__name__)
 
 _GUARD_KNOB = "use_recursive_dict_tags_for_guards"
 

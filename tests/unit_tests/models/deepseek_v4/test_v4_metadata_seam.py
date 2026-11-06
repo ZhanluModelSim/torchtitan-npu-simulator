@@ -105,12 +105,11 @@ def test_model_config_accepts_cp_with_aligned_documents():
 
     config = deepseek_v4_debugmodel()
     config.parallelism.context_parallel_degree = 2
-    config.parallelism.spmd_backend = "spmd_types"
     config.dataloader.dataset.dataset.processor.per_doc_alignment = 256
 
-    config.model_spec.model.update_from_config(config=config)
+    config.model.update_from_config(config=config)
 
-    assert all(layer.attention.inner_attention.sharding_config is not None for layer in config.model_spec.model.layers)
+    assert all(layer.attention.inner_attention.sharding_config is not None for layer in config.model.layers)
 
 
 def test_entries_are_built_per_geometry():

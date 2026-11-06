@@ -133,18 +133,19 @@ class AnticipatorySchedule:
     def __init__(self, trainer) -> None:
         config = trainer.config.anticipatory
         engine = AnticipatoryTrainingEngine(trainer)
-        checkpoint_interval = trainer.config.checkpoint.interval
-        keep_latest_k = trainer.config.checkpoint.keep_latest_k
+        checkpointer_config = trainer.config.checkpointer
+        checkpoint_interval = getattr(checkpointer_config, "interval", 0)
+        keep_latest_k = getattr(checkpointer_config, "keep_latest_k", 0)
         self.config = config
         self.engine = engine
         self.cache = build_routing_cache(
-            engine.trainer.model_parts,
+            engine.runtime.model_parts,
             index_store_dtype=config.index_store_dtype,
-            device=trainer.device,
+            device=engine.device,
         )
         self.metrics = trainer.metrics_processor
         self.detector = config.detector.build()
-        self._microbatches_per_step = trainer.gradient_accumulation_steps
+        self._microbatches_per_step = trainer.gradient_accumulation_steps * trainer.num_pp_microbatches
 
         self._queue: deque[StepData] = deque()
         self._active_steps_left = 0
@@ -202,7 +203,7 @@ class AnticipatorySchedule:
         cannot leave the cache armed for the next forward.
         """
         engine = self.engine
-        entry_step = engine.trainer.step
+        entry_step = engine.num_completed_steps
         completed = False
         engine.begin_step()
         engine.in_step = True
@@ -225,8 +226,6 @@ class AnticipatorySchedule:
         except DataloaderExhaustedError:
             # 0.3.0 treats exhaustion as normal termination after incrementing
             # the step counter; the incomplete step must not be counted.
-            if engine.trainer.step == entry_step:
-                engine.trainer.step -= 1
             raise
         finally:
             engine.in_step = False
@@ -296,7 +295,7 @@ class AnticipatorySchedule:
 
     def _credit_metrics(self, step_data: StepData) -> None:
         """Credit this step's tokens and data-loading cost at training time."""
-        self.metrics.ntokens_since_last_log += sum(labels.numel() for _, labels in step_data.microbatches)
+        self.metrics.ntokens_since_last_log += sum(microbatch.num_valid_tokens for microbatch in step_data.microbatches)
         self.metrics.data_loading_times.extend(step_data.load_times)
 
     # -- data --------------------------------------------------------------

@@ -17,6 +17,7 @@ import logging
 import os
 import threading
 
+import pytest
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -24,17 +25,13 @@ import torch_npu
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp._fully_shard import fully_shard
 from torch.distributed.fsdp._fully_shard._fsdp_api import CPUOffloadPolicy
-from torchtitan.components.optimizer import ParamGroupConfig
+from torchtitan.components.optim import AdamW
 
 import torchtitan_npu.extensions.cpu_offload.runtime as clip_state
 from torchtitan_npu.extensions.distributed import grad_accum, grad_clip
 from torchtitan_npu.override.common.optimizer import CpuOffloadOptimizersContainer
 
-import pytest
-
-pytestmark = pytest.mark.skipif(
-    not torch_npu.npu.is_available(), reason='NPU not available'
-)
+pytestmark = pytest.mark.skipif(not torch_npu.npu.is_available(), reason="NPU not available")
 
 
 logging.basicConfig(level=logging.INFO, force=True)
@@ -74,7 +71,11 @@ def main() -> None:
 
         container = CpuOffloadOptimizersContainer(
             CpuOffloadOptimizersContainer.Config(
-                param_groups=[ParamGroupConfig(pattern=".*", optimizer_name="AdamW", optimizer_kwargs={"lr": 1e-2})]
+                optimizers=[
+                    AdamW.Config(
+                        pattern=".*", fused=False, foreach=False, betas=(0.9, 0.999), weight_decay=0.01, lr=0.01
+                    )
+                ]
             ),
             model_parts=[model],
         )

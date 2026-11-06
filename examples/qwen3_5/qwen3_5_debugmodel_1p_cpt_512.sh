@@ -22,16 +22,15 @@ CONFIG="${CONFIG:-qwen35_debugmodel}"
 # TORCHTITAN_DIR (exported by .ci/smoke_test.sh) or a sibling checkout
 # provides the tokenizer and cc12m-test data.
 TORCHTITAN_REPO="${TORCHTITAN_REPO:-${TORCHTITAN_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/../torchtitan}}"
-DATASET="${DATASET:-cc12m-test}"
 DATASET_PATH="${DATASET_PATH:-${TORCHTITAN_REPO}/tests/assets/cc12m_test}" # your data path
 HF_ASSETS_PATH="${HF_ASSETS_PATH:-${TORCHTITAN_REPO}/tests/assets/tokenizer}" # your tokenizer path
+export QWEN_DATASET_PATH="${DATASET_PATH}"
 
 # Training (smoke-sized defaults)
 SEQ_LEN=512
 MBS=1
 GBS=1
 STEPS=10
-SPMD_BACKEND="spmd_types"
 
 # NPU overrides: the Triton GDN kernel is always imported; the MoE token
 # dispatcher is a performance option enabled via ENABLE_NPU_MOE_DISPATCHER=1.
@@ -59,15 +58,10 @@ export DATASET DATASET_PATH
 
 # Parallelism
 PARALLELISM_ARGS="
-    --parallelism.spmd-backend ${SPMD_BACKEND}
 "
 
 # Compile
-COMPILE_ARGS="
-    --compile.no_enable
-    --compile.components model
-    --compile.backend aot_eager
-"
+COMPILE_ARGS=""
 
 # Training
 TRAINING_ARGS="

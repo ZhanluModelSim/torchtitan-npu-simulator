@@ -13,10 +13,12 @@ disabled.
 """
 
 import functools
+import logging
 import os
 
 import torch
-from torchtitan.tools.logging import logger
+
+logger = logging.getLogger(__name__)
 
 _NPU_DETERMINISTIC_ENV = {
     "HCCL_DETERMINISTIC": "true",

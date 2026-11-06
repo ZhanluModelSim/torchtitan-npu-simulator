@@ -23,9 +23,9 @@ class TorchFTOptimizersContainerEx(TorchFTOptimizersContainer):
     class Config(TorchFTOptimizersContainer.Config):
         pass
 
-    def __init__(self, config, *, model_parts, ft_manager):
+    def configure_fault_tolerance(self, ft_manager) -> None:
+        super().configure_fault_tolerance(ft_manager)
         self.hccl_recovery = ft_manager.process_group.recovery
-        super().__init__(config, model_parts=model_parts, ft_manager=ft_manager)
         self._transaction_manager = ft_manager.manager
 
     def zero_grad(self, set_to_none: bool = True) -> None:  # pyrefly: ignore [bad-override]

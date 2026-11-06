@@ -7,7 +7,7 @@
 
 # The import order is the extension activation order. Do not sort this block.
 # ruff: noqa: I001,F401
-from .torchtitan import ep_process_group
+from .torchtitan import distributed, ep_process_group
 from .torchtitan.models import common
 from .torchtitan import trainer
 from .torchtitan.components import metrics

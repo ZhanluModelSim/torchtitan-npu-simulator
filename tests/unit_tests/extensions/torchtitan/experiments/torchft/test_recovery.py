@@ -77,7 +77,8 @@ def test_rejected_step_clears_moe_token_counts(monkeypatch):
     class FakeMoE(torch.nn.Module):
         def __init__(self):
             super().__init__()
-            self.register_buffer("tokens_per_expert_E", torch.tensor([3.0, 5.0]))
+            self.router = torch.nn.Module()
+            self.router.register_buffer("tokens_per_expert_E", torch.tensor([3.0, 5.0]))
 
     monkeypatch.setattr(step_recovery, "MoE", FakeMoE)
     model = torch.nn.Module()
@@ -85,7 +86,7 @@ def test_rejected_step_clears_moe_token_counts(monkeypatch):
 
     step_recovery.reset_rejected_moe_state([model])
 
-    assert torch.count_nonzero(model.moe.tokens_per_expert_E).item() == 0
+    assert torch.count_nonzero(model.moe.router.tokens_per_expert_E).item() == 0
 
 
 @pytest.fixture

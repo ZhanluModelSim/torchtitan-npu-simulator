@@ -126,7 +126,7 @@ def require_dataloader_alignment(dataloader, compress_ratios: Sequence[int], cp_
 def validate_alignment(multiple: int, *, context: "DatasetBuildContext") -> None:
     if multiple < 1:
         raise ValueError("per_doc_alignment must be positive")
-    if context.max_context_length % multiple or context.num_tokens_per_batch % multiple:
+    if context.max_context_length % multiple or context.num_tokens_per_microbatch % multiple:
         raise ValueError("context length and token batch must be multiples of per_doc_alignment")
 
 
@@ -137,11 +137,22 @@ def align_text_sequence(sequence: TextSequence, *, multiple: int) -> TextSequenc
     positions = sequence.positions
     if positions is not None:
         positions = np.concatenate((positions, positions[-1] + np.arange(1, pad_len + 1, dtype=positions.dtype)))
+    # ``IGNORE_INDEX`` marks loss masking, while the target data contract uses
+    # a separate structural mask for routing, attention and auxiliary-loss
+    # accounting.  Alignment padding is real document-tail padding and must be
+    # visible to the model even though its label is also ignored.
+    padding_mask = sequence.padding_mask
+    if padding_mask is None:
+        padding_mask = np.zeros(len(sequence.input_ids), dtype=np.bool_)
+    else:
+        padding_mask = np.asarray(padding_mask, dtype=np.bool_)
+    padding_mask = np.concatenate((padding_mask, np.ones(pad_len, dtype=np.bool_)))
     return replace(
         sequence,
         input_ids=np.pad(sequence.input_ids, (0, pad_len), constant_values=0),
         labels=np.pad(sequence.labels, (0, pad_len), constant_values=IGNORE_INDEX),
         positions=positions,
+        padding_mask=padding_mask,
     )
 
 

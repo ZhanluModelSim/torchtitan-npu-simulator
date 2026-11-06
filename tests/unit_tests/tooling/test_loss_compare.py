@@ -23,6 +23,8 @@ CLI = Path(loss_compare.__file__).resolve()
 
 
 def test_loss_compare_supports_independent_sequence_apis_and_upstreams(tmp_path):
+    (tmp_path / "torchtitan").mkdir()
+    (tmp_path / "torchtitan" / "__init__.py").touch()
     common = dict(steps=100, options="", seed_checkpoint=None, seq_len=512)
     old = loss_compare.build_training_command(tmp_path / "run.sh", tmp_path / "old", training_api="legacy", **common)
     new = loss_compare.build_training_command(tmp_path / "run.sh", tmp_path / "new", **common)
@@ -41,6 +43,13 @@ def test_loss_compare_bitwise_rejects_signed_zero():
         mode="bitwise", thresholds=loss_compare.DEFAULT_THRESHOLDS, expected_steps=1,
     )
     assert not comparisons[0].passed
+
+
+def test_loss_compare_native_entrypoint_rejects_custom_train_file(monkeypatch):
+    monkeypatch.setenv("TRAIN_FILE", "custom.training")
+
+    with pytest.raises(ValueError, match="unset the custom TRAIN_FILE"):
+        loss_compare.training_env(8, config_api="native")
 
 
 @pytest.fixture
@@ -68,8 +77,9 @@ p.add_argument('--dump_folder', type=Path)
 p.add_argument('--training.steps', type=int, dest='steps')
 p.add_argument('--value', type=float)
 p.add_argument('--recorded-steps')
-p.add_argument('--checkpoint.folder', type=Path, dest='checkpoint_folder')
-p.add_argument('--checkpoint.create_seed_checkpoint', action='store_true', dest='create_seed_checkpoint')
+p.add_argument('--checkpoint.folder', '--comparison-checkpoint-folder', type=Path, dest='checkpoint_folder')
+p.add_argument('--checkpoint.create_seed_checkpoint', '--comparison-create-seed-checkpoint',
+               action='store_true', dest='create_seed_checkpoint')
 args, _ = p.parse_known_args()
 if args.create_seed_checkpoint:
     (args.checkpoint_folder / 'step-0').mkdir(parents=True)
@@ -131,6 +141,57 @@ def _write_metric_runner(repo, name, value, *, ngpus=None):
     )
     runner.chmod(0o755)
     return runner
+
+
+def test_loss_compare_selects_independent_config_apis_and_source_roots(tmp_path, runner_repo):
+    # This checks the tooling protocol using recorded metrics, not NPU training
+    # or checkpoint compatibility (which require the real example runners).
+    repo, _ = runner_repo
+    emitter = repo / "emit_metrics.py"
+    source = emitter.read_text()
+    refs = []
+    upstreams = []
+    for api in ("legacy", "native"):
+        upstream = tmp_path / api
+        upstream.mkdir()
+        (upstream / "torchtitan").mkdir()
+        (upstream / "torchtitan" / "__init__.py").touch()
+        (upstream / "selected_upstream.py").write_text(f"API = {api!r}\n")
+        upstreams.append(upstream)
+        protocol = f'''import os, sys
+from pathlib import Path
+from selected_upstream import API
+assert API == {api!r}
+assert Path(sys.path[0]).resolve() == Path.cwd()
+keys = [arg.split('=')[0] for arg in sys.argv[1:]]
+if API == 'native':
+    assert os.environ['TRAIN_FILE'] == 'scripts.numerical_alignment.train'
+    assert not any(key.startswith(('--checkpoint.', '--optimizer.')) for key in keys)
+    assert '--comparison-initial-load-path' in keys
+else:
+    assert not any(key.startswith(('--comparison-', '--optim.')) for key in keys)
+    assert '--checkpoint.create_seed_checkpoint' in keys or '--checkpoint.initial_load_path' in keys
+print('selected-api=' + API)
+'''
+        emitter.write_text(protocol + source)
+        subprocess.run(["git", "add", "emit_metrics.py"], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-qm", f"Recorded {api} control protocol"], cwd=repo, check=True)
+        refs.append(subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip())
+    output = tmp_path / "comparison"
+
+    result = subprocess.run(
+        [sys.executable, str(CLI), *refs, "--runner=runner.sh", "--steps=2",
+         "--baseline-config-api=legacy", "--test-config-api=native",
+         f"--baseline-upstream={upstreams[0]}", f"--test-upstream={upstreams[1]}", f"--output-dir={output}"],
+        cwd=repo, text=True, capture_output=True, timeout=40,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    report = json.loads((output / "comparison.json").read_text())
+    assert report["passed"]
+    for side, api in (("baseline", "legacy"), ("test", "native")):
+        assert f"selected-api={api}" in (output / side / "training.log").read_text()
+        assert report["runtime_options"][side]["config_api"] == api
 
 
 @pytest.mark.parametrize(

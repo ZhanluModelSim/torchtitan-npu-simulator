@@ -19,9 +19,7 @@ from torchtitan_npu.extensions.cpu_offload.cpu_offload_adamw import CpuOffloadAd
 from torchtitan_npu.extensions.cpu_offload.staging import CpuStaging
 from torchtitan_npu.extensions.torchtitan.trainer import TrainerEx
 
-requires_npu = pytest.mark.skipif(
-    not torch_npu.npu.is_available(), reason="NPU not available"
-)
+requires_npu = pytest.mark.skipif(not torch_npu.npu.is_available(), reason="NPU not available")
 
 
 def _muon_factory_kwargs(*, enable_hsdp_replica_dedup: bool) -> dict[str, object]:
@@ -93,9 +91,7 @@ def test_cpu_offload_muon_factory_rejects_enabled_replica_dedup() -> None:
         )
 
 
-def _step_sequence(
-    offload_states: bool, grads: list[torch.Tensor]
-) -> tuple[torch.Tensor, torch.Tensor, set[int], str]:
+def _step_sequence(offload_states: bool, grads: list[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor, set[int], str]:
     torch.manual_seed(0)
     parameter = torch.nn.Parameter(torch.randn(4, 6))
     device = torch.device("npu", torch_npu.npu.current_device())
@@ -151,6 +147,7 @@ def test_enable_cpu_offload_defaults_to_npu_resident_state(monkeypatch) -> None:
     from dataclasses import replace
 
     from torchtitan_npu.extensions import trainer as trainer_module
+    from torchtitan_npu.models.deepseek_v4.config_registry import deepseek_v4_debugmodel
     from torchtitan_npu.override.common.optimizer import (
         CpuOffloadNpuStateOptimizersContainer,
         CpuOffloadOptimizersContainer,
@@ -164,20 +161,23 @@ def test_enable_cpu_offload_defaults_to_npu_resident_state(monkeypatch) -> None:
     captured: dict[str, object] = {}
 
     def capture_runtime(self, runtime) -> None:
-        captured["optimizer"] = runtime.optimizer
+        captured["optimizer"] = runtime.optim.optimizer
         raise ReachedUpstreamError
 
     monkeypatch.setattr(trainer_module, "set_allow_hf32", lambda _: None)
     monkeypatch.setattr(cpu_dtensor_init, "install", lambda: None)
     monkeypatch.setattr(trainer_module.Trainer, "__init__", capture_runtime)
 
-    config = TrainerEx.Config(training=TrainingConfig(enable_cpu_offload=True))
+    config = TrainerEx.Config(
+        model=deepseek_v4_debugmodel().model,
+        training=TrainingConfig(enable_cpu_offload=True),
+    )
     # Config rebuilds keep the plain schema: the derive happens exactly once,
     # at trainer construction (regression: config.build() does replace(self),
     # which re-runs __post_init__ on the already-derived node).
     for cfg in (config, replace(config)):
-        assert type(cfg.optimizer) is OptimizerConfig
-        assert isinstance(cfg.optimizer.materialize(), type(None))
+        assert type(cfg.optim.optimizer) is OptimizerConfig
+        assert isinstance(cfg.optim.optimizer.materialize(), type(None))
 
     with pytest.raises(ReachedUpstreamError):
         TrainerEx(config)
@@ -191,8 +191,8 @@ def test_enable_cpu_offload_defaults_to_npu_resident_state(monkeypatch) -> None:
     assert not isinstance(derived, CpuOffloadNpuStateOptimizersContainer.Config)
 
     # Without the offload switch the optimizer schema stays untouched.
-    plain = TrainerEx.Config()
-    assert type(plain.optimizer) is OptimizerConfig
+    plain = TrainerEx.Config(model=config.model)
+    assert type(plain.optim.optimizer) is OptimizerConfig
 
 
 @requires_npu
@@ -204,8 +204,13 @@ def test_adamw_restore_continues_on_compute_device() -> None:
         parameter = torch.nn.Parameter(torch.randn(4, 6))
         staging = CpuStaging(device, owner="test-restore")
         optimizer = CpuOffloadAdamW(
-            [parameter], lr=1e-2, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1,
-            staging=staging, offload_states=False,
+            [parameter],
+            lr=1e-2,
+            betas=(0.9, 0.95),
+            eps=1e-8,
+            weight_decay=0.1,
+            staging=staging,
+            offload_states=False,
         )
         return optimizer, parameter
 
@@ -288,9 +293,7 @@ def test_muon_checkpoint_roundtrip_steps_on_compute_device() -> None:
         return build_cpu_offload_distributed_muon(
             [{"params": [parameter], "param_names": ["weight"]}],
             staging=staging,
-            compute_sharding_by_fqn={
-                "weight": ComputeLayout(shardings_by_mesh_axis={"dp_shard": Owned()})
-            },
+            compute_sharding_by_fqn={"weight": ComputeLayout(shardings_by_mesh_axis={"dp_shard": Owned()})},
             bucket_configs=[BucketConfig(patterns=("weight",), name="test")],
             offload_states=False,
             lr=1e-2,

@@ -8,12 +8,12 @@ from typing import TYPE_CHECKING, Any, cast
 
 import torch
 from torch import nn
-from torchtitan.distributed.context_parallel import cp_shard
-from torchtitan.models.common.decoder import TransformerBlock
+from torchtitan.config import TORCH_DTYPE_MAP, TrainingConfig
+from torchtitan.config.parallelism import ParallelismConfig
+from torchtitan.distributed.parallelism_context import ParallelismContext
+from torchtitan.models.common.decoder import Decoder, TransformerBlock
 from torchtitan.models.common.moe import MoE
 from torchtitan.models.utils import get_nparams_and_active_nparams
-
-from torchtitan_npu.patches.torchtitan.models.common.attention_metadata import resolve_cp_layout
 
 from .metadata import DeepSeekV4Metadata
 from .mhc import HcPost, HcPre
@@ -55,6 +55,8 @@ class DeepSeekV4TransformerBlock(TransformerBlock):
         input_ids: torch.Tensor,
         attention_metadata: DeepSeekV4Metadata | None,
         positions: torch.Tensor | None = None,
+        *,
+        padding_mask: torch.Tensor | None = None,
     ):
         residual = x
         x, post, comb = self.hc_attn_pre(x)
@@ -62,12 +64,62 @@ class DeepSeekV4TransformerBlock(TransformerBlock):
         x = self.hc_post(x, residual, post, comb)
         residual = x
         x, post, comb = self.hc_ffn_pre(x)
-        x = self.moe(self.ffn_norm(x), input_ids_T=input_ids)
+        # The upstream MoE contract treats padding as a routing input.  Keep
+        # the hash IDs for DSV4's first layers, while ensuring structural
+        # padding does not update expert counters or AuxLoss.
+        x = self.moe(
+            self.ffn_norm(x),
+            input_ids_T=input_ids,
+            padding_mask_T=padding_mask,
+        )
         x = self.hc_post(x, residual, post, comb)
         return x
 
 
 class DeepSeekV4Model(DeepSeekV4MTPDecoder):
+    @classmethod
+    def _register_optimizer_hooks(cls, optimizers, model_parts, parallelism_context):
+        from torchtitan.models.common.moe import register_moe_load_balancing_hook
+
+        from .lora import is_lora_parameter
+
+        if not any(is_lora_parameter(name) for model in model_parts for name, _ in model.named_parameters()):
+            register_moe_load_balancing_hook(optimizers, model_parts, parallelism_context)
+
+    def parallelize(self, **kwargs):
+        from .parallelize import parallelize_deepseek_v4
+
+        return parallelize_deepseek_v4(self, **kwargs)
+
+    def _apply_fsdp(
+        self,
+        *,
+        parallelism_context: ParallelismContext,
+        training: TrainingConfig,
+        parallelism: ParallelismConfig,
+    ) -> None:
+        from torchtitan.distributed.fsdp import resolve_fsdp_mesh, resolve_sparse_fsdp_mesh
+        from torchtitan.models.deepseek_v3.mtp import apply_fsdp_to_mtp_decoder
+
+        dp_mesh, dp_mesh_dims = resolve_fsdp_mesh(parallelism_context)
+        edp_mesh, edp_mesh_dims = resolve_sparse_fsdp_mesh(parallelism_context)
+        apply_fsdp_to_mtp_decoder(
+            # The helper requires the decoder/layers/MTP structure, shared by
+            # this implementation and the upstream DeepSeek V4 model.
+            self,
+            dp_mesh,
+            param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
+            reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
+            pp_enabled=parallelism_context.pp_enabled,
+            cpu_offload=training.enable_cpu_offload,
+            reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
+            ep_degree=parallelism_context.ep,
+            edp_mesh=edp_mesh,
+            dp_mesh_dims=dp_mesh_dims,
+            edp_mesh_dims=edp_mesh_dims,
+            symm_mem_scope=parallelism.fsdp_symm_mem_scope,
+        )
+
     @dataclass(kw_only=True, slots=True)
     class Config(DeepSeekV4MTPDecoder.Config):
         vocab_size: int
@@ -151,17 +203,16 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
     def __init__(self, config: Config):
         super().__init__(config)
 
-        self.lora_config = getattr(config, "lora", None)
-
     def preprocess_inputs(
         self,
-        input_dict: dict[str, torch.Tensor],
+        input_dict: dict[str, Any],
         *,
-        parallel_dims: Any,
+        parallelism_context: Any,
         parallelism: Any,
         max_num_documents: int | None = None,
         max_context_length: int | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+        **kwargs: Any,
+    ) -> tuple[torch.Tensor | tuple[torch.Tensor, ...], torch.Tensor | tuple[torch.Tensor, ...], dict[str, Any]]:
         """Prepare the MTP batch on the global row, then shard both for context parallel.
 
         The base seam (upstream #4116) builds each attention backend's metadata
@@ -180,46 +231,64 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
         construction.  Without context parallel or without MTP depths nothing changes.
         """
         labels = input_dict["labels"]
-        cp_mesh = parallel_dims.get_mesh("cp") if parallel_dims.cp_enabled else None
+        cp_mesh = parallelism_context.get_mesh("cp") if parallelism_context.cp_enabled else None
         positions = input_dict.get("positions")
+        padding_mask = input_dict.get("padding_mask")
         mtp_batch = None
-        if cp_mesh is not None and self.mtp_layers is not None:
-            mtp_batch = prepare_mtp_batch(
-                input_dict["input"],
-                labels,
-                positions,
-                len(self.mtp_layers),
-            )
+        # MTP rolls must always be derived from the global row.  Context
+        # parallelism adds a second step that shards the prepared tensors, but
+        # the non-CP path must retain the same padding/document-boundary
+        # validity masks as well.
+        if self.mtp_layers is not None:
+            mtp_kwargs = {} if padding_mask is None else {"padding_mask": padding_mask}
+            mtp_batch = prepare_mtp_batch(input_dict["input"], labels, positions, len(self.mtp_layers), **mtp_kwargs)
 
-        inputs, labels, extra_kwargs = super().preprocess_inputs(  # pyrefly: ignore [not-callable]
+        # ``MTPDecoder.preprocess_inputs`` returns the community tuple protocol
+        # (main tokens, shifted tokens, ...).  DSV4 owns a separate MTP block
+        # and its global-row/CP preparation, so call the Decoder seam directly
+        # and keep the model-facing input as one token tensor.
+        inputs, labels, extra_kwargs = Decoder.preprocess_inputs(
+            self,
             input_dict,
-            parallel_dims=parallel_dims,
+            parallelism_context=parallelism_context,
             parallelism=parallelism,
-            max_num_documents=max_num_documents,  # pyrefly: ignore [unexpected-keyword]
-            max_context_length=max_context_length,  # pyrefly: ignore [unexpected-keyword]
+            max_num_documents=max_num_documents,
+            max_context_length=max_context_length,
+            **kwargs,
         )
         if mtp_batch is not None:
-            # Narrowing for the type checker: the branch above only builds the batch with a mesh.
-            assert cp_mesh is not None, "the MTP batch is only prepared under context parallel"
+            # With CP disabled the global row is already the model row.  Under
+            # CP, cut every MTP tensor with the exact decoder input layout so
+            # shifted tokens stay aligned with the main stream.
+            if cp_mesh is None:
+                extra_kwargs["mtp_batch"] = mtp_batch
+                return inputs, labels, extra_kwargs
             # The layout the batch was sharded by, resolved exactly as the decoder resolves it:
             # an unset flag means "the layout this stack declares", and reading the raw config
             # value here would cut the depths contiguously while the inputs are permuted.
-            tensors, _ = cp_shard(
-                cp_mesh,
-                tuple(mtp_batch),
-                None,
-                resolve_cp_layout(
-                    parallelism.context_parallel_load_balancer,
-                    extra_kwargs.get("attention_metadata"),
-                ),
-                0,
-                positions=positions,  # pyrefly: ignore [unexpected-keyword]
+            from torchtitan.models.common.decoder_sharding import decoder_input_sharding
+
+            mtp_inputs = {f"mtp_{index}": tensor for index, tensor in enumerate(mtp_batch)}
+            if positions is not None:
+                mtp_inputs["positions"] = positions
+            sharding = decoder_input_sharding()["input"]
+            sharded = self._cp_shard(
+                mtp_inputs,
+                input_shardings=dict.fromkeys(mtp_inputs, sharding),
+                parallelism_context=parallelism_context,
+                parallelism=parallelism,
             )
-            extra_kwargs["mtp_batch"] = MTPBatch(*tensors)
+            extra_kwargs["mtp_batch"] = MTPBatch(*(sharded[f"mtp_{index}"] for index in range(len(mtp_batch))))
         return inputs, labels, extra_kwargs
 
 
 class GraphTrainerDeepSeekV4Model(DeepSeekV4Model):
+    def parallelize(self, **kwargs):
+        from .parallelize import parallelize_graph_trainer_deepseek_v4
+
+        kwargs.pop("skip_dp", None)
+        return parallelize_graph_trainer_deepseek_v4(self, **kwargs)
+
     """DeepSeek V4 model variant for the GraphTrainer compilation path.
 
     Wraps ``init_states`` with ``disable_active_parametrization`` so that

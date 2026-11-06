@@ -22,7 +22,7 @@ def test_trainer_config_revalidates_after_swap_optimizer_override():
 
     config.__post_init__()
 
-    assert isinstance(config.optimizer, OptimizerStateSwapContainer.Config)
+    assert isinstance(config.optim.optimizer, OptimizerStateSwapContainer.Config)
 
 
 @pytest.mark.parametrize(

@@ -7,7 +7,7 @@ from unittest.mock import Mock
 
 import pytest
 import torch
-from torchtitan.components.optimizer import ParamGroupConfig
+from torchtitan.components.optim import AdamW
 
 from torchtitan_npu.extensions.torchtitan.experiments.torchft.optimizer import TorchFTOptimizersContainerEx
 from torchtitan_npu.extensions.torchtitan.experiments.torchft.process_group import ProcessGroupHCCLEx
@@ -22,21 +22,19 @@ def make_optimizer(accepted):
     manager.should_commit.return_value = accepted
     ft = SimpleNamespace(manager=manager, process_group=manager._pg, use_async_quorum=False)
     config = TorchFTOptimizersContainerEx.Config(
-        param_groups=[
-            ParamGroupConfig(
+        optimizers=[
+            AdamW.Config(
                 pattern=".*",
-                optimizer_name="AdamW",
-                optimizer_kwargs={
-                    "lr": 0.1,
-                    "betas": (0.0, 0.0),
-                    "eps": 1e-8,
-                    "weight_decay": 0.0,
-                },
+                lr=0.1,
+                betas=(0.0, 0.0),
+                eps=1e-8,
+                weight_decay=0.0,
+                fused=False,
             )
         ],
-        implementation="for-loop",
     )
-    optimizer = config.build(model_parts=[model], ft_manager=ft)
+    optimizer = config.build(model_parts=[model])
+    optimizer.configure_fault_tolerance(ft)
     return model, optimizer, manager
 
 

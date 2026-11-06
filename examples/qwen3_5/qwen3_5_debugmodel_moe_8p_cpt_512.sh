@@ -23,9 +23,9 @@ CONFIG="${CONFIG:-qwen35_debugmodel_moe}"
 # TORCHTITAN_DIR (exported by .ci/smoke_test.sh) or a sibling checkout
 # provides the tokenizer and cc12m-test data.
 TORCHTITAN_REPO="${TORCHTITAN_REPO:-${TORCHTITAN_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/../torchtitan}}"
-DATASET="${DATASET:-cc12m-test}"
 DATASET_PATH="${DATASET_PATH:-${TORCHTITAN_REPO}/tests/assets/cc12m_test}" # your data path
 HF_ASSETS_PATH="${HF_ASSETS_PATH:-${TORCHTITAN_REPO}/tests/assets/tokenizer}" # your tokenizer path
+export QWEN_DATASET_PATH="${DATASET_PATH}"
 
 # Parallelism
 TP=1
@@ -34,7 +34,6 @@ EP=8
 CP=1
 DP_SHARD=8
 DP_REPLICATE=$((WORLD_SIZE / (DP_SHARD * CP * TP * PP)))
-SPMD_BACKEND="spmd_types"
 
 # Training (smoke-sized defaults)
 SEQ_LEN=512
@@ -68,7 +67,6 @@ export DATASET DATASET_PATH
 
 # Parallelism
 PARALLELISM_ARGS="
-    --parallelism.spmd-backend ${SPMD_BACKEND}
     --parallelism.data-parallel-shard-degree ${DP_SHARD}
     --parallelism.data-parallel-replicate-degree ${DP_REPLICATE}
     --parallelism.expert-parallel-degree ${EP}
@@ -78,11 +76,7 @@ PARALLELISM_ARGS="
 "
 
 # Compile
-COMPILE_ARGS="
-    --compile.no_enable
-    --compile.components model
-    --compile.backend aot_eager
-"
+COMPILE_ARGS=""
 
 # Training
 TRAINING_ARGS="

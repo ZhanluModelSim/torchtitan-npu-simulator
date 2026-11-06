@@ -18,7 +18,6 @@ import torch
 from PIL import Image
 from torchtitan.components.data import GrainDataLoader
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
-from torchtitan.distributed.parallel_dims import ParallelDims
 
 from torchtitan_npu.models.deepseek_v4_1.config_registry import deepseek_v4_1_debugmodel_multimodal
 from torchtitan_npu.models.deepseek_v4_1.vision.data import IMAGE_END, IMAGE_START, ImagePatchProcessor
@@ -27,9 +26,16 @@ from torchtitan_npu.models.deepseek_v4_1.vision.dataloader import _process_mm_sa
 ASSETS = Path(__file__).resolve().parents[3] / "assets"
 
 
+def _unpack(microbatch):
+    inputs = microbatch.as_input_dict()
+    labels = inputs.pop("labels")
+    inputs["num_valid_tokens"] = microbatch.num_valid_tokens
+    return inputs, labels
+
+
 @pytest.fixture(scope="module")
 def tokenizer():
-    return HuggingFaceTokenizer(tokenizer_path=str(ASSETS / "deepseek_v3"))
+    return HuggingFaceTokenizer.Config().build(tokenizer_path=str(ASSETS / "deepseek_v3"))
 
 
 def _loader(tokenizer, *, rank=0, world=1, packing=0, infinite=False, alignment=2):
@@ -39,12 +45,18 @@ def _loader(tokenizer, *, rank=0, world=1, packing=0, infinite=False, alignment=
         num_packing_bins=packing,
         repeat=infinite,
         per_doc_alignment=alignment,
-    ).build(tokenizer=tokenizer, dp_rank=rank, dp_world_size=world, max_context_length=512, num_tokens_per_batch=512)
+    ).build(
+        tokenizer=tokenizer,
+        dp_rank=rank,
+        dp_world_size=world,
+        max_context_length=512,
+        num_tokens_per_microbatch=512,
+    )
 
 
 def _captions(loader):
     try:
-        return [tuple(labels[labels != -100].tolist()) for _, labels in loader]
+        return [tuple(labels[labels != -100].tolist()) for _, labels in map(_unpack, loader)]
     finally:
         loader.close()
 
@@ -60,7 +72,7 @@ def test_packed_images_supervision_and_positions(tokenizer):
         loader.close()
     assert len(packed) < len(unpacked)
     actual_captions = []
-    for inputs, labels in packed:
+    for inputs, labels in map(_unpack, packed):
         tokens, positions, types, indices = [
             inputs[k] for k in ("input", "positions", "token_types", "image_feature_indices")
         ]
@@ -101,8 +113,8 @@ def test_packed_loader_resume_pending_samples(tokenizer, consumed):
         resumed = iter(restored)
         # Restore buffered packs both in the first epoch and after all 32 source samples.
         for _ in range(5):
-            expected, expected_labels = next(iterator)
-            actual, actual_labels = next(resumed)
+            expected, expected_labels = _unpack(next(iterator))
+            actual, actual_labels = _unpack(next(resumed))
             assert torch.equal(actual_labels, expected_labels)
             assert actual.keys() == expected.keys()
             for key in expected:
@@ -172,34 +184,34 @@ def test_recipe_passes_the_model_alignment_to_the_loader():
 
     trainer = cr.deepseek_v4_1_debugmodel_multimodal()
     assert isinstance(trainer.dataloader, GrainDataLoader.Config)
-    assert trainer.dataloader.dataset.processor.per_doc_alignment == cr._per_doc_alignment(trainer.model_spec) == 2
+    assert trainer.dataloader.dataset.processor.per_doc_alignment == cr._per_doc_alignment(trainer.model) == 2
 
 
 def test_empty_caption_is_filtered_before_packing(tokenizer):
     assert _process_mm_sample({"jpg": Image.new("RGB", (20, 40)), "txt": ""}, tokenizer) is None
 
 
-def test_packed_vision_batch_reaches_folded_attention_metadata(tokenizer):
+def test_packed_vision_batch_reaches_folded_attention_metadata(tokenizer, single_rank_spmd):
     recipe = deepseek_v4_1_debugmodel_multimodal()
-    recipe.parallelism.spmd_backend = "partial_dtensor"
+    recipe.model.update_from_config(config=recipe)
     with torch.device("meta"):
-        model = recipe.model_spec.model.build()
+        model = recipe.model.build()
     loader = _loader(tokenizer, packing=4)
     try:
-        batch, labels = next(iter(loader))
+        batch, labels = _unpack(next(iter(loader)))
     finally:
         loader.close()
     valid = batch.pop("num_valid_tokens")
-    dimensions = ParallelDims(dp_replicate=1, dp_shard=1, cp=1, tp=1, pp=1, ep=1, world_size=1)
+    dimensions = single_rank_spmd
     tokens, targets, kwargs = model.preprocess_inputs(
-        {**batch, "labels": labels}, parallel_dims=dimensions, parallelism=recipe.parallelism
+        {**batch, "labels": labels}, parallelism_context=dimensions, parallelism=recipe.parallelism
     )
     assert tokens.ndim == targets.ndim == 1
     assert valid == (targets != -100).sum()
     for key in ("positions", "token_types", "image_feature_indices", "pixel_values", "image_grid"):
         torch.testing.assert_close(kwargs[key], batch[key], rtol=0, atol=0)
     boundaries = torch.cat(((batch["positions"] == 0).nonzero().flatten(), torch.tensor([512]))).int()
-    for layer in recipe.model_spec.model.layers:
+    for layer in recipe.model.layers:
         attention = layer.attention.inner_attention
         metadata = kwargs["attention_metadata"][attention.attention_metadata_key]
         torch.testing.assert_close(metadata.cu_seq_q, boundaries, rtol=0, atol=0)

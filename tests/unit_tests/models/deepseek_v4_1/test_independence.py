@@ -79,28 +79,31 @@ def tiny_config(**kwargs):
     return make_config(**kwargs)
 registry._make_v41_config = tiny_config
 
-cfg = registry.model_registry("deepseek_v4_1_debugmodel").model
+cfg = registry.model_registry("deepseek_v4_1_debugmodel")
 cfg.vocab_size = cfg.tok_embeddings.num_embeddings = cfg.lm_head.out_features = 64
 from torchtitan_npu.models.deepseek_v4_1.state_dict_adapter import DeepSeekV41StateDictAdapter
 from torchtitan_npu.models.deepseek_v4_1.config_registry import deepseek_v4_1_debugmodel_text
 
 adapter = DeepSeekV41StateDictAdapter(cfg, None)
 recipe = deepseek_v4_1_debugmodel_text()
-assert recipe.model_spec.model.layers
+assert recipe.model.layers
 assert not any(name == blocked or name.startswith(blocked + ".")
                for name in sys.modules for blocked in Blocker.blocked)
 from tests.unit_tests.models.deepseek_v4_1.preprocess_utils import preprocess
 from tests.unit_tests.models.mtp_test_utils import build_cpu_model
-model = build_cpu_model(cfg)
-tokens = torch.arange(128).remainder(32)
-_, _, kwargs = preprocess(model, tokens, tokens, torch.arange(128))
-out = model(tokens, **kwargs)
-assert torch.isfinite(out).all()
-out.square().mean().backward()
-assert len(model.layers) == 40
-for layer in model.layers.values():
-    assert layer.moe.tokens_per_expert_E.sum() == 128 * 6
-    assert layer.moe.routed_experts.inner_experts.w1_EFD.grad is not None
+from tests.unit_tests.models.spmd_test_utils import single_rank_spmd_context
+with single_rank_spmd_context():
+    model = build_cpu_model(cfg)
+    tokens = torch.arange(128).remainder(32)
+    _, _, kwargs = preprocess(model, tokens, tokens, torch.arange(128))
+    out = model(tokens, **kwargs)
+    assert torch.isfinite(out).all()
+    out.square().mean().backward()
+    assert len(model.layers) == 40
+    for layer in model.layers.values():
+        assert layer.moe.router.tokens_per_expert_E.sum() == 128 * 6
+        assert layer.moe.routed_experts.w13.weight.grad is not None
+
 """)
 
 
@@ -120,7 +123,7 @@ def identities():
             moe.TokenChoiceTopKRouter.forward, functional.cross_entropy)
 
 def config_contract():
-    cfg = v4.model_registry("debugmodel").model
+    cfg = v4.model_registry("debugmodel")
     return [(type(layer.attention), type(layer.moe), type(layer.moe.router),
              layer.attention.compress_ratio, layer.moe.router.score_func)
             for layer in cfg.layers]

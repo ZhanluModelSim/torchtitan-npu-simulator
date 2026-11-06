@@ -17,13 +17,11 @@ export TORCH_NPU_USE_COMPATIBLE_IMPL=1
 EP_OVERLAP_ARGS=(
     --compile.ep_overlap.enabled
     --compile.ep_overlap.chunk_dim seq
-    --compile.ep_overlap.strategy graph
     --compile.ep_overlap.module_fqn "layers.*.moe"
     --compile.pass_pipeline mutation-functionalization+npu_auto_overlap
 )
 
 exec bash "${SCRIPT_DIR}/deepseek_v4_flash_8p_cpt_4k_a3.sh" \
     --debug.moe-force-load-balance \
-    --parallelism.spmd-backend spmd_types \
     "${EP_OVERLAP_ARGS[@]}" \
     "$@"

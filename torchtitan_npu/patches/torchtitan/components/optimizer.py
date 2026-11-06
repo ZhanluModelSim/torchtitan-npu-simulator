@@ -12,12 +12,12 @@ from contextlib import ExitStack
 from typing import Any
 
 import torch
-import torchtitan.components.optimizer
+import torchtitan.components.optim.optimizer
 
 logger = logging.getLogger(__name__)
 
-original_optimizers_state_dict = torchtitan.components.optimizer.OptimizersContainer.state_dict
-original_optimizers_load_state_dict = torchtitan.components.optimizer.OptimizersContainer.load_state_dict
+original_optimizers_state_dict = torchtitan.components.optim.optimizer.OptimizersContainer.state_dict
+original_optimizers_load_state_dict = torchtitan.components.optim.optimizer.OptimizersContainer.load_state_dict
 
 
 def _replica_dedup_contexts(optimizers: list[torch.optim.Optimizer], name: str) -> ExitStack:
@@ -49,8 +49,8 @@ def patched_optimizers_load_state_dict(self: Any, state_dict: dict[str, Any]) ->
 
 def apply() -> None:
     logger.info("[PATCH] OptimizersContainer save/load -> replica-dedup layout contexts (upstream #4411)")
-    torchtitan.components.optimizer.OptimizersContainer.state_dict = patched_optimizers_state_dict
-    torchtitan.components.optimizer.OptimizersContainer.load_state_dict = patched_optimizers_load_state_dict
+    torchtitan.components.optim.optimizer.OptimizersContainer.state_dict = patched_optimizers_state_dict
+    torchtitan.components.optim.optimizer.OptimizersContainer.load_state_dict = patched_optimizers_load_state_dict
 
 
 apply()

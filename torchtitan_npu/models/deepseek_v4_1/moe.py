@@ -49,8 +49,6 @@ class DeepSeekV41Router(TokenChoiceTopKRouter):
             scores_for_choice_TE = scores_TE + choice_bias_TE
         else:
             scores_for_choice_TE = scores_TE if expert_bias_E is None else scores_TE + expert_bias_E
-        if self.num_expert_groups is not None:
-            scores_for_choice_TE = self._get_node_limited_routing_scores(scores_for_choice_TE)
         return self._topk(scores_for_choice_TE)
 
     def _topk(self, scores_for_choice_TE: torch.Tensor) -> torch.Tensor:

@@ -8,17 +8,20 @@ import json
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.distributed.checkpoint as dcp
 from safetensors.torch import load_file
-from torch import distributed as dist, multiprocessing as mp
+from torch import distributed as dist
+from torch import multiprocessing as mp
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import Shard, distribute_tensor
 from torchtitan.components.checkpointer import ModelWrapper
+
+from tests.unit_tests.models.deepseek_v4.lora_test_utils import _build_model_config
 from torchtitan_npu.models.deepseek_v4 import lora, peft, state_dict_adapter
-from tests.unit_tests.models.deepseek_v4.lora_test_utils import _adapter_with_converter
 
 
 @pytest.fixture(autouse=True)
@@ -51,8 +54,9 @@ def _make_checkpoint_fixture(tmp_path, save_training_state, checkpoint_format, w
         model = Model()
         if wrapper_scope == "block-fp8":
             pytest.importorskip("torchao_npu")
-            from torchtitan_npu.extensions.adaptor.torchao.converter import block_fp8_param_swap
             from torchao_npu.wrapper_tensors.block_mx_wrapper_tensor import BlockMXTrainingWeightWrapperTensor
+
+            from torchtitan_npu.extensions.adaptor.torchao.converter import block_fp8_param_swap
 
             policy = block_fp8_param_swap()
             model.base = torch.nn.Parameter(
@@ -157,12 +161,14 @@ def _check_periodic_dcp_round_trip(
 
 def _load_base_then_adapter(target, restored, checkpoint):
     initial_adapters = {key: restored.state_dict()[key].clone() for key in ("lora_a", "lora_b")}
-    target.dcp_load(restored.state_dict(), target.initial_load_path)
+    target._load_checkpoint(
+        {"model": target.states["model"]}, target.initial_load_path, from_hf=False, from_quantized=False
+    )
     for key, value in initial_adapters.items():
         torch.testing.assert_close(restored.state_dict()[key], value, rtol=0, atol=0)
     with torch.no_grad():
         restored.get_parameter("base").zero_()
-    target.dcp_load(target._flattened_model_states_sd(target.states), checkpoint)
+    target._load_checkpoint(target.states, checkpoint, from_hf=False, from_quantized=False)
 
 
 def _check_restored_training_state(models, managers, save_training_state, checkpoint_format):
@@ -287,6 +293,7 @@ def _save_peft(rank, root, fail_finalization):
     manager.initial_load_in_hf = False
     manager.export_dtype = torch.float32
     manager.checkpoint_dir = str(Path(root) / "checkpoint")
+
     def unexpected_dcp_save(*args, **kwargs):
         raise AssertionError("PEFT export must not use DCP save")
 
@@ -316,58 +323,78 @@ def test_final_peft_save_finishes_consistently_across_ranks(tmp_path, fail_final
 def test_hf_export_rejected_before_checkpoint_initialization(monkeypatch, peft_export):
     def unexpected_init(self, config, **kwargs):
         pytest.fail("Invalid export configuration reached checkpoint initialization")
+
     monkeypatch.setattr(peft.NPUCheckpointManager, "__init__", unexpected_init)
-    config = peft.DeepSeekV4PEFTCheckpointManager.Config(
-        enable=True, last_save_in_peft=peft_export, last_save_in_hf=True,
-    )
-    with pytest.raises(ValueError, match="HF|last_save_in_hf"):
+    with pytest.raises(ValueError, match=r"HF|last_save_in_hf"):
+        config = peft.DeepSeekV4PEFTCheckpointManager.Config(
+            last_save_in_peft=peft_export,
+            last_save_in_hf=True,
+        )
         config.build()
+
+
+def _peft_adapter(*, include_mtp=False, mixed_ranks=False):
+    model = _build_model_config(num_layers=1, num_mtp_layers=int(include_mtp))
+    transform = lora.deepseek_v4_lora_transform(rank=2, alpha=4)
+    transform.target_modules = ["wq_a", "wq_b"]
+    model = transform.transform(model)
+    if mixed_ranks:
+        model.layers[0].attention.wq_b.rank = 3
+    return state_dict_adapter.DeepSeekV4StateDictAdapter(model, None)
 
 
 @pytest.mark.parametrize("invalid", ["mtp", "rank"])
 def test_peft_configuration_rejected_before_checkpoint_initialization(monkeypatch, invalid):
-    converter = lora.DeepSeekV4LoRAConverter.Config(
-        target_modules=["attention.wq_a"], include_mtp=invalid == "mtp",
-        rank=2, rank_experts=3 if invalid == "rank" else 2,
-    )
-    adapter = _adapter_with_converter(converter)
+    adapter = _peft_adapter(include_mtp=invalid == "mtp", mixed_ranks=invalid == "rank")
+
     def unexpected_init(self, config, **kwargs):
         pytest.fail("Invalid export configuration reached checkpoint initialization")
+
     monkeypatch.setattr(peft.NPUCheckpointManager, "__init__", unexpected_init)
-    config = peft.DeepSeekV4PEFTCheckpointManager.Config(enable=True)
-    with pytest.raises((ValueError, NotImplementedError), match="MTP|rank_experts|Unsupported"):
+    config = peft.DeepSeekV4PEFTCheckpointManager.Config()
+    with pytest.raises((ValueError, NotImplementedError), match=r"MTP|shared adapter rank"):
         config.build(sd_adapter=adapter)
 
 
 def test_native_checkpoint_allows_mtp_and_mixed_ranks(monkeypatch):
-    adapter = _adapter_with_converter(lora.DeepSeekV4LoRAConverter.Config(
-        rank=2, rank_experts=3, target_modules=["attention.wq_a"],
-    ))
+    adapter = _peft_adapter(include_mtp=True, mixed_ranks=True)
+
     def initialize(self, config, **kwargs):
         self.initial_load_path = "/base"
+
     monkeypatch.setattr(peft.NPUCheckpointManager, "__init__", initialize)
-    config = peft.DeepSeekV4PEFTCheckpointManager.Config(enable=True, last_save_in_peft=False)
+    config = peft.DeepSeekV4PEFTCheckpointManager.Config(last_save_in_peft=False)
     config.build(sd_adapter=adapter)
 
 
 def test_hf_base_load_limits_expert_reassembly_to_one_layer(monkeypatch):
     calls = []
 
-    def load(self, state, checkpoint_id, from_hf=False, from_quantized=False):
-        assert checkpoint_id == "/base"
-        assert from_hf and from_quantized
+    def load(state, *, storage_reader):
+        assert storage_reader == ("/base", True)
         calls.append(dict(state))
 
-    monkeypatch.setattr(peft.NPUCheckpointManager, "dcp_load", load)
+    monkeypatch.setattr(peft.dcp, "load", load)
     manager = object.__new__(peft.DeepSeekV4PEFTCheckpointManager)
-    state = {name: torch.ones(1) for name in (
-        "tok_embeddings.weight", "layers.0.attention.wq_a.weight",
-        "pre_lora_cache.weight",
-        "layers.0.moe.routed_experts.inner_experts.w1_EFD",
-        "layers.1.moe.routed_experts.inner_experts.w1_EFD",
-        "mtp_layers.0.attention.wq_a.weight", "layers.0.attention.wq_a.lora_a.weight",
-    )}
-    manager.dcp_load(state, "/base", from_hf=True, from_quantized=True)
+    state = {
+        name: torch.ones(1)
+        for name in (
+            "tok_embeddings.weight",
+            "layers.0.attention.wq_a.weight",
+            "pre_lora_cache.weight",
+            "layers.0.moe.routed_experts.inner_experts.w1_EFD",
+            "layers.1.moe.routed_experts.inner_experts.w1_EFD",
+            "mtp_layers.0.attention.wq_a.weight",
+            "layers.0.attention.wq_a.lora_a.weight",
+        )
+    }
+    model_state = SimpleNamespace(state_dict=lambda: state, load_state_dict=lambda loaded: None)
+    manager.sd_adapter = SimpleNamespace(
+        to_hf=lambda tensors: tensors,
+        from_hf=lambda tensors: tensors,
+        get_hf_storage_reader=lambda path, quantized: (path, quantized),
+    )
+    manager._load_hf_base(model_state, "/base", from_quantized=True)
     expected = set(state) - {"layers.0.attention.wq_a.lora_a.weight"}
     assert len(calls) == 4
     assert {name for call in calls for name in call} == expected
@@ -384,13 +411,18 @@ def test_remote_peft_destination_rejected_before_checkpoint_initialization(monke
 
     monkeypatch.setattr(peft.NPUCheckpointManager, "__init__", unexpected_init)
     with pytest.raises(ValueError, match="local checkpoint folder"):
-        config = peft.DeepSeekV4PEFTCheckpointManager.Config(enable=True, folder=folder)
+        config = peft.DeepSeekV4PEFTCheckpointManager.Config(folder=folder)
         config.build(base_folder=base_folder)
 
 
-@pytest.mark.parametrize("from_hf,explicit,expected", [
-    (False, None, None), (True, None, "/base"), (False, "org/base", "org/base"),
-])
+@pytest.mark.parametrize(
+    "from_hf,explicit,expected",
+    [
+        (False, None, None),
+        (True, None, "/base"),
+        (False, "org/base", "org/base"),
+    ],
+)
 def test_peft_metadata_uses_hf_base_and_never_native_checkpoint(monkeypatch, from_hf, explicit, expected):
     manager = object.__new__(_FinalSaveCheckpoint)
     model = torch.nn.Module()
@@ -412,17 +444,35 @@ def test_peft_metadata_uses_hf_base_and_never_native_checkpoint(monkeypatch, fro
 
 
 def test_adapter_state_selection_keeps_trainable_state_and_routing_buffers():
-    state = {name: torch.ones(1) for name in (
-        "base.weight", "pre_lora_cache.weight", "lora_a", "layers.0.w13_lora_a",
-        "layers.0.w1_lora_b", "layers.0.w3_lora_b", "layers.0.w2_lora_b",
-        "expert_bias_E", "optimizer", "unfrozen",
-    )}
+    state = {
+        name: torch.ones(1)
+        for name in (
+            "base.weight",
+            "pre_lora_cache.weight",
+            "lora_a",
+            "layers.0.w13_lora_a",
+            "layers.0.moe.routed_experts.w13.lora_a.weight",
+            "layers.0.moe.routed_experts.w13.lora_b.weight",
+            "layers.0.moe.shared_experts.w2.lora_b.weight",
+            "expert_bias_E",
+            "optimizer",
+            "unfrozen",
+        )
+    }
     selected = peft.select_adapter_only_state(
-        state, {"optimizer"}, model_buffer_keys={"expert_bias_E"}, model_trainable_keys={"unfrozen"},
+        state,
+        {"optimizer"},
+        model_buffer_keys={"expert_bias_E"},
+        model_trainable_keys={"unfrozen"},
     )
     assert set(selected) == {
-        "lora_a", "layers.0.w13_lora_a", "layers.0.w1_lora_b", "layers.0.w3_lora_b",
-        "layers.0.w2_lora_b", "expert_bias_E", "optimizer", "unfrozen",
+        "lora_a",
+        "layers.0.moe.routed_experts.w13.lora_a.weight",
+        "layers.0.moe.routed_experts.w13.lora_b.weight",
+        "layers.0.moe.shared_experts.w2.lora_b.weight",
+        "expert_bias_E",
+        "optimizer",
+        "unfrozen",
     }
 
 
@@ -432,5 +482,5 @@ def test_resume_rejects_legacy_interleaved_expert_optimizer(tmp_path):
     manager = object.__new__(peft.DeepSeekV4PEFTCheckpointManager)
     manager.initial_load_path = None
 
-    with pytest.raises(ValueError, match="former AdamW state"):
-        manager.dcp_load({}, str(checkpoint))
+    with pytest.raises(ValueError, match="historical w13_lora_b adapter format"):
+        manager._validate_native_resume(set(dcp.FileSystemReader(checkpoint).read_metadata().state_dict_metadata))

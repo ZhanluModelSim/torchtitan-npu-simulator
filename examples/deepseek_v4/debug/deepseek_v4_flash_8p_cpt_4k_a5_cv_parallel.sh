@@ -14,11 +14,9 @@ export CONFIG="${CONFIG:-graph_trainer_deepseek_v4_flash_43layers_16experts}"
 export NGPU="${NGPU:-8}"
 
 bash examples/deepseek_v4/debug/deepseek_v4_flash_8p_cpt_4k_a5.sh \
-    --parallelism.spmd-backend partial_dtensor \
     --parallelism.data-parallel-shard-degree "${NGPU}" \
     --parallelism.data-parallel-replicate-degree 1 \
     --parallelism.expert-parallel-degree "${NGPU}" \
-    --compile.mode aot_fx_trace \
     --compile.enable-passes \
     --compile.backend aot_eager \
     --compile.inductor-compilation regional \
@@ -26,7 +24,6 @@ bash examples/deepseek_v4/debug/deepseek_v4_flash_8p_cpt_4k_a5.sh \
     --compile.memory-policy full \
     --compile.ep-overlap.enabled \
     --compile.ep-overlap.chunk-dim batch \
-    --compile.ep-overlap.strategy graph \
     --compile.ep-overlap.module-fqn "layers.*" \
     --compile.no-enable-autoparallel \
     --compile.no-enable-fsdp-ag-rs-overlap \

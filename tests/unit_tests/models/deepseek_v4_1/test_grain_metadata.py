@@ -8,7 +8,6 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from torchtitan.distributed.parallel_dims import ParallelDims
 
 from tests.unit_tests.models.common.text_data_utils import IntegerTextTokenizer, aligned_text_config
 from torchtitan_npu.models.deepseek_v4_1 import model_registry
@@ -35,7 +34,7 @@ def test_multimodal_preprocess_annotates_vision_inputs(monkeypatch):
     monkeypatch.setattr(spmd_module, "annotate_input_spmd_types", annotate)
     recipe = deepseek_v4_1_debugmodel_multimodal()
     with torch.device("meta"):
-        model = recipe.model_spec.model.build()
+        model = recipe.model.build()
     monkeypatch.setattr(model, "_get_attention_metadata", lambda *_args, **_kwargs: {})
     batch = {
         "input": torch.arange(4),
@@ -47,7 +46,7 @@ def test_multimodal_preprocess_annotates_vision_inputs(monkeypatch):
     }
     inputs, labels, extras = model.preprocess_inputs(
         batch,
-        parallel_dims=SimpleNamespace(cp_enabled=False),
+        parallelism_context=SimpleNamespace(cp_enabled=False),
         parallelism=SimpleNamespace(spmd_backend="spmd_types"),
     )
 
@@ -67,16 +66,16 @@ def test_long_document_continuation_uses_context_boundaries(tmp_path):
         dp_rank=0,
         tokenizer=IntegerTextTokenizer(),
         max_context_length=4,
-        num_tokens_per_batch=4,
+        num_tokens_per_microbatch=4,
     )
     try:
         iterator = iter(loader)
         next(iterator)
-        inputs, _ = next(iterator)
+        inputs = next(iterator).as_input_dict()
     finally:
         loader.close()
 
-    config = model_registry("deepseek_v4_1_debugmodel_text").model
+    config = model_registry("deepseek_v4_1_debugmodel_text")
     attention = config.layers[2].attention.inner_attention
     metadata = attention.build_attention_metadata(inputs["positions"])
 
@@ -86,23 +85,27 @@ def test_long_document_continuation_uses_context_boundaries(tmp_path):
 
 
 @pytest.mark.parametrize("token_budget", (4, 8), ids=("one-context", "two-contexts"))
-def test_text_recipe_preprocess_builds_folded_metadata_map(tmp_path, token_budget):
+def test_text_recipe_preprocess_builds_folded_metadata_map(tmp_path, token_budget, monkeypatch):
+    from torchtitan_npu.patches.torchtitan.models.common import decoder as decoder_patch
+
+    # SPMD annotation requires a process group; this case checks data/metadata,
+    # while the decoder seam tests cover the named annotation contract.
+    monkeypatch.setattr(decoder_patch, "annotate_input_spmd_types", lambda _context, batch, _shardings: batch)
     dataset = tmp_path / "data.json"
     dataset.write_text('{"text":"3 4"}\n{"text":"5 6"}\n{"text":"7"}\n')
     recipe = deepseek_v4_1_debugmodel_text()
     recipe.dataloader = replace(
         recipe.dataloader, dataset=aligned_text_config(dataset).dataset, repeat=False, shuffle=False
     )
-    recipe.parallelism.spmd_backend = "partial_dtensor"
     with torch.device("meta"):
-        model = recipe.model_spec.model.build()
-    dims = ParallelDims(dp_replicate=1, dp_shard=1, cp=1, tp=1, pp=1, ep=1, world_size=1)
+        model = recipe.model.build()
+    context = SimpleNamespace(cp_enabled=False)
     loader = recipe.dataloader.build(
         dp_world_size=1,
         dp_rank=0,
         tokenizer=IntegerTextTokenizer(),
         max_context_length=4,
-        num_tokens_per_batch=token_budget,
+        num_tokens_per_microbatch=token_budget,
     )
     try:
         batches = list(loader)
@@ -115,18 +118,20 @@ def test_text_recipe_preprocess_builds_folded_metadata_map(tmp_path, token_budge
     tokens = torch.tensor([1, 3, 4, 0, 1, 5, 6, 0])
     labels = torch.tensor([3, 4, 2, -100, 5, 6, 2, -100])
     positions = torch.tensor([0, 1, 2, 3, 0, 1, 2, 3])
-    for index, (batch, targets) in enumerate(batches):
-        valid_tokens = batch.pop("num_valid_tokens")  # Trainer consumes this before preprocessing.
+    for index, microbatch in enumerate(batches):
+        batch = microbatch.as_input_dict()
         inputs, actual_labels, kwargs = model.preprocess_inputs(
-            {**batch, "labels": targets}, parallel_dims=dims, parallelism=recipe.parallelism
+            batch, parallelism_context=context, parallelism=recipe.parallelism
         )
         row = slice(index * token_budget, (index + 1) * token_budget)
         torch.testing.assert_close(inputs, tokens[row], rtol=0, atol=0)
         torch.testing.assert_close(actual_labels, labels[row], rtol=0, atol=0)
         torch.testing.assert_close(kwargs["positions"], positions[row], rtol=0, atol=0)
-        assert valid_tokens == 3 * token_budget // 4
-        assert set(kwargs) == {"positions", "attention_metadata"}
-        backends = [layer.attention.inner_attention for layer in recipe.model_spec.model.layers]
+        assert microbatch.num_valid_tokens == 3 * token_budget // 4
+        assert set(kwargs) == {"positions", "padding_mask", "attention_metadata"}
+        # The native mask marks padding, while num_valid_tokens counts its complement.
+        torch.testing.assert_close(kwargs["padding_mask"], labels[row] == -100)
+        backends = [layer.attention.inner_attention for layer in recipe.model.layers]
         assert set(kwargs["attention_metadata"]) == {backend.attention_metadata_key for backend in backends}
         for backend in backends:
             metadata = kwargs["attention_metadata"][backend.attention_metadata_key]

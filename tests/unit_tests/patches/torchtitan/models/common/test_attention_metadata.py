@@ -6,10 +6,13 @@
 """CPU contract of the backported backend-owned attention-metadata seam."""
 
 import torch
+from torchtitan.models.common import attention
+from torchtitan.protocols.module import Module
 
 import torchtitan_npu  # noqa: F401  imported for its patch chain: the seam under test
-from torchtitan.models.common.attention import BaseAttention, VarlenAttention
-from torchtitan.protocols.module import Module
+
+BaseAttention = attention.BaseAttention
+VarlenInnerAttention = attention.VarlenInnerAttention
 
 
 def test_default_contract_is_the_backend_class_and_no_metadata():
@@ -21,8 +24,8 @@ def test_default_contract_is_the_backend_class_and_no_metadata():
 
 def test_build_stamps_the_key_so_a_rewritten_class_cannot_lose_it():
     """SimpleFSDP rewrites ``__class__``; the instance keeps the key its config built the map with."""
-    instance = VarlenAttention.Config().build()
+    instance = VarlenInnerAttention.Config().build()
 
-    assert instance.__dict__["_attention_metadata_key"] is VarlenAttention  # the default key is stamped too
-    instance.__class__ = type("SimpleFSDPVarlenAttention", (VarlenAttention,), {})
-    assert instance.attention_metadata_key is VarlenAttention
+    assert instance.__dict__["_attention_metadata_key"] is VarlenInnerAttention  # the default key is stamped too
+    instance.__class__ = type("SimpleFSDPVarlenInnerAttention", (VarlenInnerAttention,), {})
+    assert instance.attention_metadata_key is VarlenInnerAttention

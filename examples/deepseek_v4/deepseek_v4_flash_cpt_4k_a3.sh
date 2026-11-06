@@ -8,7 +8,7 @@
 # Append CLI arguments to override the defaults below:
 #   NODE_IPS=192.168.1.10,192.168.1.11,192.168.1.12,192.168.1.13,192.168.1.14,192.168.1.15,192.168.1.16,192.168.1.17 \
 #     ./examples/deepseek_v4/deepseek_v4_flash_cpt_4k_a3.sh \
-#     --checkpoint.initial-load-path /path/to/model_ckpt --training.steps 5
+#     --checkpointer.initial-load-path /path/to/model_ckpt --training.steps 5
 # USE_GOLDEN=1 selects the reference combination (the model's default attention).
 # For deterministic execution, append
 # --debug.seed 42 --debug.deterministic to the command line.
@@ -23,7 +23,7 @@ WORLD_SIZE=$((NGPU * NNODES))
 
 # Model
 MODULE="${MODULE:-torchtitan_npu.models.deepseek_v4}"
-CONFIG="${CONFIG:-deepseek_v4_flash}"
+CONFIG="${CONFIG:-deepseek_v4_flash_cpt}"
 
 # Dataloader & Checkpoint
 HF_ASSETS_PATH="${HF_ASSETS_PATH:-/path/to/DeepSeekV4_tokenizer}" # your tokenizer path
@@ -37,7 +37,6 @@ EP=128
 CP="${CP:-1}"
 DP_SHARD=128
 DP_REPLICATE=$((WORLD_SIZE / (DP_SHARD * CP * TP * PP)))
-SPMD_BACKEND="spmd_types"
 
 # Training
 SEQ_LEN=4096
@@ -61,22 +60,15 @@ HF_ASSETS_ARGS="
 
 # Parallelism
 PARALLELISM_ARGS="
-    --parallelism.spmd-backend ${SPMD_BACKEND}
     --parallelism.data-parallel-shard-degree ${DP_SHARD}
     --parallelism.data-parallel-replicate-degree ${DP_REPLICATE}
     --parallelism.expert-parallel-degree ${EP}
     --parallelism.tensor-parallel-degree ${TP}
     --parallelism.context-parallel-degree ${CP}
-    --parallelism.context-parallel-load-balancer doc_chunk
     --parallelism.pipeline-parallel-degree ${PP}
 "
 
-# Compile
-COMPILE_ARGS="
-    --compile.enable
-    --compile.components model
-    --compile.backend inductor
-"
+# Compilation policy is declared by the selected Python recipe.
 
 # Training
 TRAINING_ARGS="
@@ -88,16 +80,15 @@ TRAINING_ARGS="
 "
 
 # Checkpoint
-# `checkpoint.folder` is the output/resume root (`CKPT_SAVE_LOAD_PATH`). If it
+# `checkpointer.folder` is the output/resume root (`CKPT_SAVE_LOAD_PATH`). If it
 # already contains a valid step-* checkpoint, upstream TorchTitan resumes from
 # it and ignores `initial-load-path`; use a new/empty folder when cold-starting
 # from `CKPT_INIT_LOAD_PATH`.
 CHECKPOINT_ARGS="
-    --checkpoint.enable
-    --checkpoint.load-only
-    --checkpoint.folder ${CKPT_SAVE_LOAD_PATH}
-    --checkpoint.initial-load-path ${CKPT_INIT_LOAD_PATH}
-    --checkpoint.initial-load-in-hf
+    --checkpointer.load-only
+    --checkpointer.folder ${CKPT_SAVE_LOAD_PATH}
+    --checkpointer.initial-load-path ${CKPT_INIT_LOAD_PATH}
+    --checkpointer.initial-load-in-hf
 "
 
 # Profiler
@@ -118,16 +109,16 @@ COMM_ARGS="
 
 # Optimizer
 OPTIMIZER_ARGS="
-    --optimizer.name Muon
-    --optimizer.lr 1.0e-5
-    --optimizer.beta1 0.9
-    --optimizer.beta2 0.95
-    --optimizer.eps 1.0e-8
-    --optimizer.weight_decay 1.0e-1
-    --optimizer.muon_momentum 0.95
-    --optimizer.muon_enable_nesterov
-    --optimizer.muon_ns_steps 10
-    --optimizer.muon_adjust_lr_fn match_rms_adamw
+    --optim.optimizer.name Muon
+    --optim.optimizer.lr 1.0e-5
+    --optim.optimizer.beta1 0.9
+    --optim.optimizer.beta2 0.95
+    --optim.optimizer.eps 1.0e-8
+    --optim.optimizer.weight_decay 1.0e-1
+    --optim.optimizer.muon_momentum 0.95
+    --optim.optimizer.muon_enable_nesterov
+    --optim.optimizer.muon_ns_steps 10
+    --optim.optimizer.muon_adjust_lr_fn match_rms_adamw
 "
 OPTIMIZER_OVERRIDES="${OPTIMIZER_OVERRIDES-torchtitan_npu.override.common.optimizer.swap_optimizer}"
 
@@ -163,7 +154,6 @@ NODE_IPS="${NODE_IPS}" \
 NGPU="${NGPU}" \
 LOG_PREFIX="${LOG_PREFIX:-${CONFIG}}" \
 bash scripts/run_train_multinodes.sh \
-    $COMPILE_ARGS \
     $HF_ASSETS_ARGS \
     $PARALLELISM_ARGS \
     $TRAINING_ARGS \

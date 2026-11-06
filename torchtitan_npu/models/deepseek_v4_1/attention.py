@@ -257,10 +257,10 @@ class Attention(BaseAttention):
         # one degree, where the metadata carries no plan and nothing moves.
         self.cp_group = None
 
-    def parallelize(self, parallel_dims) -> None:
+    def _parallelize(self, parallelism_context) -> None:
         """Take the CP mesh the layer restores its key side on, then recurse."""
-        self.cp_group = parallel_dims.get_optional_mesh("cp")
-        super().parallelize(parallel_dims)
+        self.cp_group = parallelism_context.get_optional_mesh("cp")
+        super()._parallelize(parallelism_context)
 
     def forward(
         self,

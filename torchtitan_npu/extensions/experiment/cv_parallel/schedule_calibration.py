@@ -9,17 +9,19 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import statistics
 import time
 from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.distributed as dist
-from torchtitan.tools.logging import logger
 
 from .cv_parallel import DualStreamRuntime, dependency_only_schedule, materialize
 from .schedule_search import build_profile_schedule as build_local_profile_schedule
 from .whole_graph_runtime_profile import collective_order_keys, node_id, profile_whole_graph_costs
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from pathlib import Path

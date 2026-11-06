@@ -6,24 +6,29 @@
 # ``CheckpointManager`` installs its upstream replacement at import time; keep
 # this import before the remaining extension dependencies.
 # ruff: noqa: I001
+import logging
 from copy import copy
 from dataclasses import dataclass, field
-from typing import Any
 
-from torchtitan.components.checkpointer.base import BaseCheckpointManager
-from torchtitan.components.checkpointer.dcp import CheckpointManager as DCPCheckpointManager
+from typing import Annotated, cast
+
+import tyro
 from torchtitan.config import derive
-from torchtitan.tools.logging import logger
 from torchtitan.trainer import Trainer
+from torchtitan.training_engine import TrainingEngine
 
 from torchtitan_npu.config import manager as config_manager
 from torchtitan_npu.config.configs import (
+    CompileConfig,
     ExtensionConfig,
+    OptimConfig,
     OptimizerConfig,
     TrainingConfig,
 )
 from torchtitan_npu.config.converters import TrainerConfigConverter
 from torchtitan_npu.extensions.torchtitan.components.checkpoint import CheckpointManager
+from torchtitan_npu.extensions.torchtitan.components.optimizer.ema import EMA
+from torchtitan_npu.extensions.components.gradient_clipping import GradientClippingOptim  # noqa: F401
 from torchtitan_npu.extensions.components.sdc import SDC
 from torchtitan_npu.extensions.experiment.anticipatory_routing.config import (
     AnticipatoryRoutingConfig,
@@ -34,23 +39,7 @@ from torchtitan_npu.extensions.experiment.anticipatory_routing.schedule import A
 from .tools.profiler import CANNProfiler
 
 
-def convert_checkpoint_config(checkpoint: BaseCheckpointManager.Config) -> BaseCheckpointManager.Config:
-    """Adapt upstream defaults without replacing custom backend implementations."""
-    source_type = type(checkpoint)
-    # The EMA patch replaces the public DCP binding, while earlier recipes
-    # may still hold its original Config (the actual EMA Config parent).
-    if source_type in (DCPCheckpointManager.Config, DCPCheckpointManager.Config.__bases__[0]):
-        return derive(checkpoint, CheckpointManager.Config)
-    # Keep the optional native package lazy for DCP and user-defined backends.
-    if source_type.__module__ == "torchtitan.components.checkpointer.torch_checkpointing":
-        from torchtitan.components.checkpointer.torch_checkpointing import (
-            TorchCheckpointingManager as UpstreamNativeManager,
-        )
-        from torchtitan_npu.extensions.torchtitan.components.torch_checkpointing import TorchCheckpointingManager
-
-        if source_type is UpstreamNativeManager.Config:
-            return derive(checkpoint, TorchCheckpointingManager.Config)
-    return checkpoint
+logger = logging.getLogger(__name__)
 
 
 def set_allow_hf32(allow: bool) -> None:
@@ -63,18 +52,44 @@ def set_allow_hf32(allow: bool) -> None:
     torch_npu.npu.aclnn.allow_hf32 = allow
 
 
+class NPUTrainingEngineMixin:
+    """Run NPU microbatch hooks at the engine's forward/backward boundary."""
+
+    anticipatory_schedule: AnticipatorySchedule | None = None
+    _sdc: SDC | None = None
+
+    def _non_pp_forward_backward_microbatch(self, **kwargs):
+        if self.anticipatory_schedule is not None:
+            self.anticipatory_schedule.prepare_microbatch()
+        # This cooperative mixin precedes TrainingEngine in NPUTrainingEngine's MRO.
+        result = super()._non_pp_forward_backward_microbatch(**kwargs)  # pyrefly: ignore [missing-attribute]
+        if self.anticipatory_schedule is not None:
+            self.anticipatory_schedule.accumulate_microbatch_loss(result)
+        if self._sdc is not None:
+            self._sdc.finalize_sdc_step()
+        return result
+
+
+class NPUTrainingEngine(NPUTrainingEngineMixin, TrainingEngine):
+    """TrainingEngine with NPU extension lifecycle hooks."""
+
+
 class TrainerEx(Trainer):
     """Base trainer for NPU-specific training features."""
+
+    engine_cls = NPUTrainingEngine
 
     @dataclass(kw_only=True, slots=True)
     class Config(Trainer.Config):
         extension: ExtensionConfig = field(default_factory=ExtensionConfig)
-        optimizer: OptimizerConfig = field(  # pyrefly: ignore [bad-override]
-            default_factory=OptimizerConfig,
-        )
-        checkpoint: BaseCheckpointManager.Config = field(
-            default_factory=CheckpointManager.Config,
-        )
+        # These mutable schemas intentionally specialize upstream fields. The
+        # registered converter preserves concrete recipe owners, while defaults
+        # expose NPU fields to Tyro; recipes explicitly instantiate optional components.
+        optim: OptimConfig = field(default_factory=OptimConfig)  # pyrefly: ignore [bad-override]
+        checkpointer: Annotated[  # pyrefly: ignore [bad-override]
+            CheckpointManager.Config | None, tyro.conf.AvoidSubcommands
+        ] = None
+        compile: Annotated[CompileConfig | None, tyro.conf.AvoidSubcommands] = None  # pyrefly: ignore [bad-override]
         profiler: CANNProfiler.Config = field(  # pyrefly: ignore [bad-override]
             default_factory=CANNProfiler.Config,
         )
@@ -88,28 +103,25 @@ class TrainerEx(Trainer):
             # ``slots=True`` dataclasses are recreated by the decorator, so a
             # zero-argument ``super()`` can retain the pre-decoration class cell.
             Trainer.Config.__post_init__(self)
-            self.checkpoint = convert_checkpoint_config(self.checkpoint)
             # Single switch: ``--training.enable-cpu-offload`` drives both the
             # FSDP offload policy (read by parallelize) and, through this
             # carrier field, the optimizer-container selection in the
             # swap_optimizer override branch (applied inside Trainer.__init__).
-            # Only our OptimizerConfig carries the _cpu_offload carrier
-            # field; upstream containers (e.g. TorchFT) do not.
-            if hasattr(self.optimizer, "_cpu_offload"):
-                self.optimizer._cpu_offload = self.training.enable_cpu_offload
+            # NPU optimizer schemas carry this field, including configs already
+            # derived to an offload owner; upstream TorchFT containers do not.
+            if hasattr(self.optim.optimizer, "_cpu_offload"):
+                setattr(  # noqa: B010 - recipe-selected subtypes own the carrier
+                    self.optim.optimizer, "_cpu_offload", self.training.enable_cpu_offload
+                )
             self._post_init_optimizer()
             validate_anticipatory_config(self)
-            if self.sdc_replayer is not None:
-                from torchtitan_npu.extensions.components.sdc import validate_sdc_replay_config
-
-                validate_sdc_replay_config(self.sdc)
 
         def _post_init_optimizer(self) -> None:
             # Overrides may already have materialized and replaced the CLI schema.
-            if not isinstance(self.optimizer, OptimizerConfig):
+            if not isinstance(self.optim.optimizer, OptimizerConfig):
                 return
-            self.optimizer.materialize()
-            if self.optimizer.name == "Muon" and (
+            self.optim.optimizer.materialize()
+            if self.optim.optimizer.name == "Muon" and (
                 self.parallelism.tensor_parallel_degree > 1 or self.parallelism.pipeline_parallel_degree > 1
             ):
                 raise ValueError(
@@ -136,7 +148,7 @@ class TrainerEx(Trainer):
         )
 
         seen: set[int] = set()
-        for model in self.model_parts:
+        for model in self.engine.model_parts:
             for module in model.modules():
                 state = _get_module_fsdp_state(module)
                 if state is None or id(state) in seen:
@@ -165,9 +177,11 @@ class TrainerEx(Trainer):
                 "Applying TorchAO-NPU quantization recipe=%s before Trainer initialization",
                 quantization_config.recipe,
             )
-            model_compile_enabled = config.compile.enable and "model" in config.compile.components
-            config.model_spec = apply_quantization_converter(
-                config.model_spec,
+            model_compile_enabled = config.compile is not None and (
+                getattr(config.compile, "model", None) is not None or hasattr(config.compile, "pass_pipeline")
+            )
+            config.model = apply_quantization_converter(
+                config.model,
                 quantization_config,
                 model_compile_enabled=model_compile_enabled,
                 override_config=config.override,
@@ -183,7 +197,7 @@ class TrainerEx(Trainer):
             from torchtitan_npu.patches.torch_npu import cpu_dtensor_init
 
             cpu_dtensor_init.install()
-            if hasattr(config.optimizer, "_cpu_offload"):
+            if hasattr(config.optim.optimizer, "_cpu_offload"):
                 # Default the optimizer container to NPU-resident state so
                 # ``--training.enable-cpu-offload`` works without listing an
                 # optimizer override; a listed ``swap_optimizer`` (applied
@@ -203,14 +217,15 @@ class TrainerEx(Trainer):
                 )
 
                 target = CpuOffloadNpuStateOptimizersContainer.Config
-                if isinstance(config.optimizer, HostSparseOptimizersContainer.Config):
+                if isinstance(config.optim.optimizer, HostSparseOptimizersContainer.Config):
                     # HostSparse schemas carry the carrier through
                     # OptimizerConfig; deriving them to the plain container
                     # would silently drop the sparse-table lifecycle.
                     target = CpuOffloadHostSparseNpuStateOptimizersContainer.Config
                 config = copy(config)
+                config.optim = copy(config.optim)
                 # pyrefly: ignore [bad-argument-type, bad-assignment]
-                config.optimizer = derive(config.optimizer, target)
+                config.optim.optimizer = derive(config.optim.optimizer, target)
 
             # Carve the per-parameter pins (to_empty()'s _apply ->
             # reset_sharded_param pins the offloaded shards there, before
@@ -230,15 +245,16 @@ class TrainerEx(Trainer):
             self._carve_grad_slots(pool)
         else:
             super().__init__(config)
-        self._sdc = config.sdc.build(
+        engine = cast("NPUTrainingEngine", self.engine)
+        engine._sdc = config.sdc.build(
             trainer_config=config,
-            model_parts=self.model_parts,
+            model_parts=self.engine.model_parts,
             gradient_accumulation_steps=self.gradient_accumulation_steps,
         )
         if getattr(config.training, "enable_cpu_offload", False):
             from torchtitan_npu.override.common.optimizer import CpuOffloadOptimizersContainer
 
-            if not isinstance(self.optimizers, CpuOffloadOptimizersContainer):
+            if not isinstance(self.engine.optim.optimizers, CpuOffloadOptimizersContainer):
                 raise ValueError(
                     "--training.enable-cpu-offload requires a CPU-offload optimizer "
                     "container, and this optimizer schema does not carry the NPU "
@@ -247,17 +263,7 @@ class TrainerEx(Trainer):
                 )
 
         self.anticipatory_schedule = AnticipatorySchedule(self) if config.anticipatory.enable else None
-
-    def forward_backward_step(self, *args: Any, **kwargs: Any) -> Any:
-        if self.anticipatory_schedule is not None:
-            self.anticipatory_schedule.prepare_microbatch()
-        result = super().forward_backward_step(*args, **kwargs)
-        if self.anticipatory_schedule is not None:
-            self.anticipatory_schedule.accumulate_microbatch_loss(result)
-        # Advancing SDC state after a failed or partial step would corrupt its
-        # accumulation window, so post-processing is intentionally success-only.
-        self._sdc.finalize_sdc_step()
-        return result
+        engine.anticipatory_schedule = self.anticipatory_schedule
 
     def train_step(self, data_iterator):
         if self.anticipatory_schedule is not None:
@@ -269,30 +275,33 @@ class TrainerEx(Trainer):
         """Adapt this step's batches after any anticipatory scheduling."""
         return batches
 
-    def batch_generator(self, data_iterable):
+    def microbatch_generator(self, data_iterable):
         if self.anticipatory_schedule is not None:
             if data_iterable is not self.dataloader:
                 raise ValueError("Anticipatory mode requires the trainer's own resumable dataloader")
             return self.anticipatory_schedule.data
-        return super().batch_generator(data_iterable)
+        return super().microbatch_generator(data_iterable)
 
     def close(self) -> None:
         super().close()
         # ``train.py`` calls ``trainer.close()`` on both the normal and the
         # exception path; give optimizer containers (e.g. the CPU-offload
         # runtime owner) a chance to release their resources there.
-        optimizers = getattr(self, "optimizers", None)
+        optimizers = getattr(getattr(getattr(self, "engine", None), "optim", None), "optimizers", None)
         if optimizers is not None and hasattr(optimizers, "close"):
             optimizers.close()
 
 
 config_manager.register_config_converter(
     Trainer.Config,
-    # Backend selection belongs to Config.__post_init__, not a DCP coercion here.
     TrainerConfigConverter(
         target_type=TrainerEx.Config,
         component_types={
-            "optimizer": OptimizerConfig,
+            "optim": OptimConfig,
+            "optim.optimizer": OptimizerConfig,
+            "optim.ema": EMA.Config,
+            "checkpointer": CheckpointManager.Config,
+            "compile": CompileConfig,
             "profiler": CANNProfiler.Config,
             "training": TrainingConfig,
         },

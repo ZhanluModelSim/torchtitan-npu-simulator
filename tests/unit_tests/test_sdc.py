@@ -13,11 +13,12 @@ import torch
 import torch._inductor.config as inductor_config
 from torch._inductor.custom_graph_pass import get_custom_graph_passes
 from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
-from torchtitan.trainer import Trainer
+from torchtitan.training_engine import TrainingEngine
 
+from torchtitan_npu.config.configs import CompileConfig, ModelCompileConfig
 from torchtitan_npu.extensions.compile import sdc_checksum
 from torchtitan_npu.extensions.components.sdc.sdc import SDC
-from torchtitan_npu.extensions.torchtitan.trainer import TrainerEx
+from torchtitan_npu.extensions.torchtitan.trainer import NPUTrainingEngine, TrainerEx
 
 
 class TorchNpuCheckerFake:
@@ -147,7 +148,7 @@ def _compiled_trainer_config(
     pipeline_parallel_degree: int = 1,
 ) -> SimpleNamespace:
     return SimpleNamespace(
-        compile=SimpleNamespace(enable=compile_enabled, components=("model",), backend=backend),
+        compile=CompileConfig(model=ModelCompileConfig(backend=backend)) if compile_enabled else None,
         parallelism=SimpleNamespace(pipeline_parallel_degree=pipeline_parallel_degree),
     )
 
@@ -318,7 +319,7 @@ def test_sdc_build_finishes_runtime_initialization_in_one_call(monkeypatch) -> N
 @pytest.mark.parametrize(
     ("trainer_options", "message"),
     [
-        pytest.param({"compile_enabled": False}, r"requires compile.enable=true", id="compile-disabled"),
+        pytest.param({"compile_enabled": False}, r"requires compile.model to be configured", id="compile-disabled"),
         pytest.param({"backend": "aot_eager"}, r"requires compile.backend='inductor'", id="non-inductor-backend"),
         pytest.param({"pipeline_parallel_degree": 2}, r"does not support pipeline parallelism", id="pipeline-parallel"),
     ],
@@ -403,22 +404,18 @@ def _patch_trainer_sdc_flow(monkeypatch) -> tuple[list[object], TrainerEx.Config
 
     def base_init(trainer: TrainerEx, received_config: object) -> None:
         events.append(("base-init", received_config))
-        trainer.init_distributed()
-        trainer.model_parts = ["model"]
+        trainer.engine = object.__new__(NPUTrainingEngine)
+        trainer.engine.model_parts = ["model"]
         trainer.gradient_accumulation_steps = 2
+        events.append("base-model-setup")
 
-    def init_distributed(_trainer: Trainer) -> SimpleNamespace:
-        events.append("base-distributed")
-        return SimpleNamespace()
-
-    def forward_backward_step(_trainer: Trainer, **kwargs: object) -> str:
+    def forward_backward_step(_engine: TrainingEngine, **kwargs: object) -> str:
         events.append(("base-step", kwargs))
         return "base-result"
 
     monkeypatch.setattr(TrainerEx.__base__, "__init__", base_init)
     monkeypatch.setattr("torchtitan_npu.extensions.torchtitan.trainer.set_allow_hf32", lambda _allow_hf32: None)
-    monkeypatch.setattr(TrainerEx.__base__, "init_distributed", init_distributed)
-    monkeypatch.setattr(TrainerEx.__base__, "forward_backward_step", forward_backward_step)
+    monkeypatch.setattr(TrainingEngine, "_non_pp_forward_backward_microbatch", forward_backward_step)
     return events, config
 
 
@@ -427,23 +424,25 @@ def test_trainer_initializes_sdc_once_after_model_setup(monkeypatch) -> None:
 
     trainer = cast("TrainerEx", object.__new__(TrainerEx))
     TrainerEx.__init__(trainer, config)
-    result = trainer.forward_backward_step(
-        input_dict={"tokens": "batch"},  # type: ignore[dict-item]
+    result = trainer.engine._non_pp_forward_backward_microbatch(
+        inputs={"tokens": "batch"},  # type: ignore[dict-item]
         labels=cast("torch.Tensor", "labels"),
-        global_valid_tokens=cast("torch.Tensor", "valid-tokens"),
+        model_kwargs={},
+        loss_kwargs={"global_valid_tokens": "valid-tokens"},
     )
 
     assert result == "base-result"
     assert events == [
         ("base-init", config),
-        "base-distributed",
+        "base-model-setup",
         ("sdc-create", config, ("model",), 2),
         (
             "base-step",
             {
-                "input_dict": {"tokens": "batch"},
+                "inputs": {"tokens": "batch"},
                 "labels": "labels",
-                "global_valid_tokens": "valid-tokens",
+                "model_kwargs": {},
+                "loss_kwargs": {"global_valid_tokens": "valid-tokens"},
             },
         ),
         "sdc-after-step",
@@ -456,25 +455,25 @@ def test_trainer_failed_backward_does_not_advance_gradient_accumulation(monkeypa
     model.register_parameter("weight", torch.nn.Parameter(torch.ones(2, 2)))
     model.weight.grad = torch.ones_like(model.weight)
     sdc = _build_gradient_sdc([model], accumulation_steps=2)
-    trainer = cast("TrainerEx", object.__new__(TrainerEx))
-    vars(trainer)["_sdc"] = sdc
-    vars(trainer)["anticipatory_schedule"] = None
+    engine = object.__new__(NPUTrainingEngine)
+    engine._sdc = sdc
+    engine.anticipatory_schedule = None
     outcomes = iter(["ok", "failure", "ok"])
 
-    def forward_backward_step(_trainer: Trainer, *_args: Any, **_kwargs: Any) -> str:
+    def forward_backward_step(_engine: TrainingEngine, *_args: Any, **_kwargs: Any) -> str:
         outcome = next(outcomes)
         if outcome == "failure":
             raise RuntimeError("backward failed")
         return outcome
 
-    monkeypatch.setattr(TrainerEx.__base__, "forward_backward_step", forward_backward_step)
+    monkeypatch.setattr(TrainingEngine, "_non_pp_forward_backward_microbatch", forward_backward_step)
 
-    assert trainer.forward_backward_step() == "ok"
+    assert engine._non_pp_forward_backward_microbatch() == "ok"
     assert checker.detected == []
     with pytest.raises(RuntimeError, match="backward failed"):
-        trainer.forward_backward_step()
+        engine._non_pp_forward_backward_microbatch()
     assert checker.detected == []
-    assert trainer.forward_backward_step() == "ok"
+    assert engine._non_pp_forward_backward_microbatch() == "ok"
 
     assert len(checker.detected) == 1
     assert checker.detected[0][1] == "weight_backward"

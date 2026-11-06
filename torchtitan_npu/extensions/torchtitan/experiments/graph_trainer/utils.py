@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import logging
 import operator
 import os
 import tempfile
@@ -24,7 +25,8 @@ from torchtitan.experiments.graph_trainer.common_utils import (
     _EP_TOKEN_EXCHANGE,
 )
 from torchtitan.experiments.graph_trainer.ep_pass_utils import is_c10d_functional_node
-from torchtitan.tools.logging import logger
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator

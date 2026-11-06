@@ -12,7 +12,7 @@ bias).
 """
 
 import spmd_types as spmd
-from torchtitan.distributed.parallel_dims import MeshAxisName
+from torchtitan.distributed.parallelism_context import MeshAxisName
 from torchtitan.models.common.decoder_sharding import (
     colwise_config,
     dense_activation_placement,
@@ -22,8 +22,10 @@ from torchtitan.models.common.decoder_sharding import (
     rowwise_config,
     set_decoder_sharding_config,
 )
-from torchtitan.models.common.moe_sharding import expert_param_placement_sparse, set_moe_sharding_config
-from torchtitan.protocols.sharding import LocalMapConfig, ShardingConfig
+from torchtitan.models.common.moe_sharding import expert_param_placement_sparse
+from torchtitan.protocols.sharding import ShardingConfig
+
+from torchtitan_npu.models.common.sharding import set_moe_sharding_config
 
 DP, CP, TP = MeshAxisName.DP, MeshAxisName.CP, MeshAxisName.TP
 
@@ -31,17 +33,6 @@ from .indexer import REUSE
 
 _dense_param_rep = dense_param_placement(tp=spmd.R)
 _attn_sink_placement = dense_param_placement(tp=spmd.S(0))
-
-_GROUPED_EXPERTS_PARAM_LAYOUT: dict[str, spmd.PerMeshAxisSpmdType] = {
-    "w1_EFD": spmd.S(1),
-    "w2_EDF": spmd.S(2),
-    "w3_EFD": spmd.S(1),
-    "w13_lora_a": spmd.R,
-    "w1_lora_b": spmd.S(1),
-    "w3_lora_b": spmd.S(1),
-    "w2_lora_a": spmd.S(2),
-    "w2_lora_b": spmd.R,
-}
 
 _replicate_weight = ShardingConfig(
     state_shardings={"weight": _dense_param_rep},
@@ -101,9 +92,7 @@ def set_engram_sharding_config(engram_cfg, *, enable_ep: bool, enable_sp: bool) 
         },
         out_src_shardings=hidden,
         out_dst_shardings=hidden,
-        local_map=LocalMapConfig(
-            in_grad_placements=(hidden, None, None, None, None),
-        ),
+        local_spmd=True,
     )
 
 
@@ -220,11 +209,15 @@ def set_v41_attention_sharding(attention_cfg, *, enable_sp: bool):
 
     at.wq_a.sharding_config = _replicate_weight
     at.q_norm.sharding_config = _replicate_weight
-    at.wq_b.sharding_config = colwise_config()
+    at.wq_b.sharding_config = colwise_config(input_layout=dense_activation_placement(tp=spmd.R, cp=spmd.S(0)))
     at.wkv.sharding_config = _replicate_weight
     at.kv_norm.sharding_config = _replicate_weight
     at.wo_a.sharding_config = ShardingConfig(state_shardings={"weight": dense_param_placement(tp=spmd.S(0))})
-    at.wo_b.sharding_config = rowwise_config(output_sp=enable_sp)
+    at.wo_b.sharding_config = rowwise_config(
+        output_layout=(
+            dense_sequence_parallel_placement() if enable_sp else dense_activation_placement(tp=spmd.I, cp=spmd.S(0))
+        )
+    )
     at.rope.sharding_config = ShardingConfig(
         state_shardings={"cache": _dense_param_rep},
     )
@@ -256,8 +249,12 @@ def set_v41_layer_sharding(layer_cfg, *, enable_sp: bool, enable_ep: bool) -> No
         layer_cfg.moe,
         enable_ep=enable_ep,
         enable_sp=enable_sp,
-        expert_param_layout=_GROUPED_EXPERTS_PARAM_LAYOUT,
     )
+    moe_sharding = layer_cfg.moe.sharding_config
+    assert moe_sharding is not None
+    if moe_sharding.in_dst_shardings is None:
+        moe_sharding.in_dst_shardings = dict(moe_sharding.in_src_shardings or {})
+
     if getattr(layer_cfg.moe.router, "vision_enabled", False):
         router_sharding = layer_cfg.moe.router.sharding_config or ShardingConfig()
         router_sharding.state_shardings["bias_vl"] = _dense_param_rep

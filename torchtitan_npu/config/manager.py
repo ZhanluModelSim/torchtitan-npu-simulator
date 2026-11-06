@@ -24,11 +24,9 @@ def register_config_converter(
 ) -> None:
     """Register a converter for a Trainer config type and its config bases."""
     _CONFIG_CONVERTERS[config_type] = converter
-    # ``patches.torchtitan.trainer`` can replace ``torchtitan.trainer.Trainer``
-    # during package activation.  A config registry imported before that
-    # replacement may still return the original base ``Trainer.Config``.
-    # Register its config bases as well, while retaining an explicitly
-    # registered converter for a more specialized type.
+    # Re-exported upstream recipes can still return the base Trainer.Config.
+    # Register config bases too, while retaining an explicitly registered
+    # converter for any more specialized recipe-owned type.
     for base in config_type.__mro__[1:]:
         if base is object:
             break
@@ -38,7 +36,9 @@ def register_config_converter(
 @wraps(_original_load_config)
 def _patched_load_config(self, args: list[str]) -> tuple[object, list[str]]:
     config, filtered_args = _original_load_config(self, args)
-    converter = _CONFIG_CONVERTERS.get(type(config))
+    # A recipe-owned Trainer subclass still needs the registered component
+    # adapters. Prefer its nearest registered base and preserve its owner.
+    converter = next((_CONFIG_CONVERTERS[base] for base in type(config).__mro__ if base in _CONFIG_CONVERTERS), None)
     if converter is not None:
         config = converter.convert(cast("Trainer.Config", config))
     return config, filtered_args

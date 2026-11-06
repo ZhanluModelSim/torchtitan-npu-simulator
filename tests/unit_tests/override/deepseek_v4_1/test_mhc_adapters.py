@@ -33,8 +33,8 @@ def isolated_rng():
 
 class TestMHcAdapters:
     def test_override_selects_and_preserves_config(self):
-        cfg = model_registry("deepseek_v4_1_debugmodel").model
-        reference = model_registry("deepseek_v4_1_debugmodel").model
+        cfg = model_registry("deepseek_v4_1_debugmodel")
+        reference = model_registry("deepseek_v4_1_debugmodel")
         apply_overrides(
             OverrideConfig(imports=[MHC_POST_OVERRIDE, MHC_SINKHORN_OVERRIDE]),
             cfg,
@@ -63,9 +63,7 @@ class TestMHcAdapters:
         comb = torch.rand(T, n, n, dtype=torch.float32)
 
         def mhc_post(residual, comb, y, post):
-            out = post.unsqueeze(-1) * y.unsqueeze(-2) + torch.sum(
-                comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=-3
-            )
+            out = post.unsqueeze(-1) * y.unsqueeze(-2) + torch.sum(comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=-3)
             return out.type_as(y)
 
         monkeypatch.setattr(torch_mod.ops.cann_ops_transformer, "mhc_post", mhc_post)
@@ -101,9 +99,7 @@ class TestMHcAdapters:
 
         def mhc_post(x, h_res, h_out, h_post):
             received.append(tuple(t.dim() for t in (x, h_res, h_out, h_post)))
-            out = h_post.unsqueeze(-1) * h_out.unsqueeze(-2) + torch.sum(
-                h_res.unsqueeze(-1) * x.unsqueeze(-2), dim=-3
-            )
+            out = h_post.unsqueeze(-1) * h_out.unsqueeze(-2) + torch.sum(h_res.unsqueeze(-1) * x.unsqueeze(-2), dim=-3)
             return out.type_as(h_out)
 
         monkeypatch.setattr(torch_mod.ops.cann_ops_transformer, "mhc_post", mhc_post)

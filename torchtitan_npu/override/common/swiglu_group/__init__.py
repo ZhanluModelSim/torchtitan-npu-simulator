@@ -5,45 +5,33 @@
 
 """Model-independent SwigluGroup overrides (registry-facing module)."""
 
-from torchtitan.config import derive, override
-from torchtitan.models.common.feed_forward import FeedForward
-from torchtitan.models.common.moe import GroupedExperts
+__all__ = ["AscSwiGLU", "asc", "asc_shared_experts", "swiglu_group_activation"]
 
-from .ascendc import (
-    AscFeedForward,
-    AscGroupedExperts,
-    _ensure_cann_ops_loaded,
-    swiglu_group_activation,
-)
+from torchtitan.config import override
+from torchtitan.models.common.activation import SwiGLU
 
-__all__ = [
-    "AscFeedForward",
-    "AscGroupedExperts",
-    "asc",
-    "asc_shared_experts",
-    "swiglu_group_activation",
-]
+from .ascendc import AscSwiGLU, _ensure_cann_ops_loaded, swiglu_group_activation
+
+
+def _activation_config(cfg: SwiGLU.Config) -> AscSwiGLU.Config:
+    return AscSwiGLU.Config(swiglu_limit=getattr(cfg, "swiglu_limit", 0.0))
 
 
 @override(
-    target=GroupedExperts.Config,
-    fqns=["*.moe.routed_experts.inner_experts"],
-    exact=True,
+    target=SwiGLU.Config,
+    fqns=["*.moe.routed_experts.activation_fn"],
     description="Use cann_ops_nn.swiglu_group for routed experts.",
 )
-def asc(cfg: GroupedExperts.Config) -> AscGroupedExperts.Config:
+def asc(cfg: SwiGLU.Config) -> AscSwiGLU.Config:
     _ensure_cann_ops_loaded()
-    if isinstance(cfg, AscGroupedExperts.Config):
-        return cfg
-    return derive(cfg, AscGroupedExperts.Config)
+    return _activation_config(cfg)
 
 
 @override(
-    target=FeedForward.Config,
-    fqns=["*.moe.shared_experts"],
-    exact=True,
+    target=SwiGLU.Config,
+    fqns=["*.moe.shared_experts.activation_fn"],
     description="Use cann_ops_nn.swiglu_group for shared experts.",
 )
-def asc_shared_experts(cfg: FeedForward.Config) -> AscFeedForward.Config:
+def asc_shared_experts(cfg: SwiGLU.Config) -> AscSwiGLU.Config:
     _ensure_cann_ops_loaded()
-    return derive(cfg, AscFeedForward.Config)
+    return _activation_config(cfg)

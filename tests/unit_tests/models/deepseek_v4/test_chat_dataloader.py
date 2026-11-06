@@ -57,17 +57,18 @@ def test_sft_recipe_builds_aligned_supervised_batches(sft_recipe):
         dp_rank=0,
         tokenizer=HuggingFaceTokenizer(tokenizer_path="tests/assets/deepseek_v3"),
         max_context_length=128,
-        num_tokens_per_batch=256,
+        num_tokens_per_microbatch=256,
     )
     try:
-        inputs, labels = next(iter(loader))
+        microbatch = next(iter(loader))
     finally:
         loader.close()
 
-    assert inputs["input"].tolist() == list(range(10, 15)) + [0] * 123 + list(range(20, 25)) + [0] * 123
-    assert labels.tolist() == [-100, 12, 13, 14, 15] + [-100] * 123 + [-100, 22, 23, 24, 25] + [-100] * 123
-    assert inputs["positions"].tolist() == list(range(128)) * 2
-    assert inputs["num_valid_tokens"] == 8
+    assert microbatch.input.tolist() == list(range(10, 15)) + [0] * 123 + list(range(20, 25)) + [0] * 123
+    assert microbatch.labels.tolist() == [-100, 12, 13, 14, 15] + [-100] * 123 + [-100, 22, 23, 24, 25] + [-100] * 123
+    assert microbatch.positions.tolist() == list(range(128)) * 2
+    assert microbatch.padding_mask.tolist() == ([False] * 5 + [True] * 123) * 2
+    assert microbatch.num_valid_tokens == 8
 
 
 @pytest.mark.parametrize("rank", (0, 1), ids=("dp-rank-0", "dp-rank-1"))
@@ -77,21 +78,22 @@ def test_sft_grain_restores_packing_and_prefetch_across_epoch(sft_recipe, rank):
         dp_rank=rank,
         tokenizer=HuggingFaceTokenizer(tokenizer_path="tests/assets/deepseek_v3"),
         max_context_length=128,
-        num_tokens_per_batch=384,
+        num_tokens_per_microbatch=384,
     )
     with ExitStack() as cleanup:
         original = sft_recipe.build(**kwargs)
         cleanup.callback(original.close)
         restored = sft_recipe.build(**kwargs)
         cleanup.callback(restored.close)
-        first, _ = next(iter(original))
-        assert first["input"][::128].tolist() == ([10, 20, 30] if rank == 0 else [50, 60, 70])
+        first = next(iter(original))
+        assert first.input[::128].tolist() == ([10, 20, 30] if rank == 0 else [50, 60, 70])
         state = json.loads(json.dumps(deepcopy(original.state_dict())))
         restored.load_state_dict(state)
         for _ in range(4):
-            expected_inputs, expected_labels = next(iter(original))
-            inputs, labels = next(iter(restored))
-            torch.testing.assert_close(labels, expected_labels, rtol=0, atol=0)
+            expected = next(iter(original))
+            actual = next(iter(restored))
+            expected_inputs, inputs = expected.as_input_dict(), actual.as_input_dict()
+            assert actual.num_valid_tokens == expected.num_valid_tokens
             assert inputs.keys() == expected_inputs.keys()
             for key in inputs:
                 torch.testing.assert_close(

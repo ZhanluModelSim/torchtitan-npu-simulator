@@ -12,16 +12,37 @@ deepseek_v4_flash_cpt_4k_a3.sh
     └── deepseek_v4_flash_cpt_1024k_a5.sh
 ```
 
-- `deepseek_v4_flash_cpt_4k_a3.sh`：公共训练参数、override、checkpoint、optimizer 等基线配置，默认通过 CLI 启用 model 编译，backend 为 `inductor`。
+- `deepseek_v4_flash_cpt_4k_a3.sh`：公共训练参数、override、checkpoint、optimizer 等基线配置，默认选择 `deepseek_v4_flash_cpt` recipe，显式启用 model 编译和 checkpoint，backend 为 `inductor`。
 - `deepseek_v4_flash_cpt_4k_a5.sh`：增加 A5 运行环境和默认 block-FP8 量化，其他配置复用 A3 基线。
 - `deepseek_v4_flash_cpt_1024k_a5.sh`：继续复用 A5 4K 入口，只通过 CLI 覆盖 1M 所需的 CP、DP、序列长度和 global batch size，量化默认随 A5 4K 入口继承。
 - 用户普通 CLI 参数位于默认选项之后，因此可以覆盖默认值（A5 的 activation-checkpoint 子命令仍在末尾），包括使用 `--extension.quantization.no-enable-quantized-training` 切换到 BF16。
 
 ## 编译配置
 
-编译通过 CLI 配置。Flash A3/A5 默认使用 `inductor`，只编译 `model`。在示例命令末尾追加
-`--compile.backend inductor` 可显式指定 backend，追加 `--compile.no-enable` 可关闭编译。
-独立入口若未默认启用编译，需同时传入 `--compile.enable --compile.components model`。
+编译和 checkpoint 的启用状态在 Python recipe 中定义。Flash A3/A5 默认选择
+`deepseek_v4_flash_cpt`，8P debug 默认选择 `deepseek_v4_flash_43layers_16experts_compiled`；
+二者均使用 `CompileConfig(components=[], model=ModelCompileConfig())`，只编译 model。
+当前固定上游仍允许对已存在的配置传入 `--compile.model.backend aot_eager` 等普通字段。
+从 `None` 启用组件、关闭组件或设置空列表时，直接修改 recipe；CLI 不再自动创建这些对象。
+
+例如将以下函数保存为仓库根目录的 `my_recipes.py`，再通过 `MODULE=my_recipes CONFIG=my_run` 选择：
+
+```python
+from torchtitan_npu.models.deepseek_v4.config_registry import deepseek_v4_flash_cpt
+
+
+def my_run():
+    config = deepseek_v4_flash_cpt()
+    config.compile = None
+    config.checkpointer = None
+    return config
+```
+
+自定义 recipe 关闭 checkpoint 时，应选用未附加 checkpoint 字段的 debug launcher，
+或直接使用 `scripts/run_train.sh` 并在 recipe 中配置训练参数。Pro、CP 等其他入口需要
+编译时，也在对应 recipe 中显式设置 `CompileConfig`，再通过 `MODULE` / `CONFIG` 选择。
+
+CV Parallel 调试入口在当前固定 TorchTitan 版本中仅完成配置与注册适配。上游已删除其依赖的 Graph EP 分块机制，CV 运行迁移尚未完成，入口会明确报错；详见 [CV 迁移状态](../../torchtitan_npu/extensions/experiment/cv_parallel/README.md)。
 
 ## 常用环境变量
 
@@ -94,9 +115,6 @@ Pro 32-expert 是独立的裁剪模型 debug/performance 入口，不与 8P Flas
 ```sh
 NODE_IPS="${NODE_IPS}" \
 bash examples/deepseek_v4/debug/deepseek_v4_pro_32p_cpt_4k_a5.sh \
-  --compile.enable \
-  --compile.components model \
-  --compile.backend inductor \
   --debug.moe-force-load-balance \
   --training.steps 20
 ```
@@ -106,9 +124,6 @@ bash examples/deepseek_v4/debug/deepseek_v4_pro_32p_cpt_4k_a5.sh \
 ```sh
 CP=32 NODE_IPS="${NODE_IPS}" \
 bash examples/deepseek_v4/debug/deepseek_v4_pro_32p_cpt_4k_a5.sh \
-  --compile.enable \
-  --compile.components model \
-  --compile.backend inductor \
   --parallelism.data-parallel-shard-degree 1 \
   --parallelism.data-parallel-replicate-degree 1 \
   --training.max-context-length 131072 \
@@ -122,27 +137,40 @@ A5 脚本默认启用 block-FP8；如需 BF16，请在命令末尾追加后文�
 
 ### 导出和加载 Debug Hugging Face checkpoint
 
+debug 默认关闭 checkpoint。先在 `my_recipes.py` 中定义需要 checkpoint 的配置：
+
+```python
+from torchtitan.components.checkpointer import CheckpointManager
+from torchtitan_npu.models.deepseek_v4.config_registry import deepseek_v4_flash_43layers_16experts_compiled
+
+
+def debug_checkpoint():
+    config = deepseek_v4_flash_43layers_16experts_compiled()
+    config.checkpointer = CheckpointManager.Config(load_only=True)
+    return config
+```
+
 导出 checkpoint：
 
 ```sh
+MODULE=my_recipes CONFIG=debug_checkpoint \
 bash examples/deepseek_v4/debug/deepseek_v4_flash_8p_cpt_4k_a3.sh \
-  --checkpoint.folder ./export_ckpt \
-  --checkpoint.enable \
-  --checkpoint.no-load-only \
-  --checkpoint.last-save-in-hf \
+  --checkpointer.folder ./export_ckpt \
+  --checkpointer.no-load-only \
+  --checkpointer.last-save-in-hf \
   --training.steps 1 \
   --debug.seed 42 \
   --debug.deterministic
 ```
 
-从导出的 HF checkpoint 冷启动时，使用新的或空的 `checkpoint.folder`，避免已有 step checkpoint 优先触发 resume：
+从导出的 HF checkpoint 冷启动时，使用新的或空的 `checkpointer.folder`，避免已有 step checkpoint 优先触发 resume：
 
 ```sh
+MODULE=my_recipes CONFIG=debug_checkpoint \
 bash examples/deepseek_v4/debug/deepseek_v4_flash_8p_cpt_4k_a3.sh \
-  --checkpoint.folder ./load_ckpt \
-  --checkpoint.enable \
-  --checkpoint.initial-load-path ./export_ckpt/checkpoint/step-1 \
-  --checkpoint.initial-load-in-hf \
+  --checkpointer.folder ./load_ckpt \
+  --checkpointer.initial-load-path ./export_ckpt/checkpoint/step-1 \
+  --checkpointer.initial-load-in-hf \
   --training.steps 1 \
   --debug.seed 42 \
   --debug.deterministic
@@ -163,9 +191,6 @@ bash examples/deepseek_v4/deepseek_v4_flash_cpt_4k_a3.sh \
 ```sh
 NODE_IPS="${NODE_IPS}" \
 bash examples/deepseek_v4/deepseek_v4_flash_cpt_4k_a5.sh \
-  --compile.enable \
-  --compile.components model \
-  --compile.backend inductor \
   --debug.moe-force-load-balance \
   --training.steps 20
 ```
@@ -177,9 +202,6 @@ bash examples/deepseek_v4/deepseek_v4_flash_cpt_4k_a5.sh \
 ```sh
 CP=8 NODE_IPS="${NODE_IPS}" \
 bash examples/deepseek_v4/deepseek_v4_flash_cpt_4k_a5.sh \
-  --compile.enable \
-  --compile.components model \
-  --compile.backend inductor \
   --parallelism.data-parallel-shard-degree 16 \
   --parallelism.data-parallel-replicate-degree 1 \
   --training.max-context-length 65536 \
@@ -196,9 +218,6 @@ bash examples/deepseek_v4/deepseek_v4_flash_cpt_4k_a5.sh \
 ```sh
 NODE_IPS="${NODE_IPS}" \
 bash examples/deepseek_v4/deepseek_v4_flash_cpt_1024k_a5.sh \
-  --compile.enable \
-  --compile.components model \
-  --compile.backend inductor \
   --debug.moe-force-load-balance \
   --training.steps 20
 ```
@@ -264,13 +283,13 @@ A3 脚本不默认启用量化；如需 A3 量化训练，请显式传入上面�
 
 ## Checkpoint 说明
 
-Flash 多机 CPT 基线默认启用 `--checkpoint.load-only`，即只负责加载，不会保存新的训练 checkpoint。需要保存时必须显式覆盖：
+Flash 多机 CPT 基线默认启用 `--checkpointer.load-only`，即只负责加载，不会保存新的训练 checkpoint。需要保存时必须显式覆盖：
 
 ```sh
---checkpoint.no-load-only
+--checkpointer.no-load-only
 ```
 
-当 `checkpoint.folder` 已存在有效的 `step-*` checkpoint 时，TorchTitan 会优先 resume，该情况下 `checkpoint.initial-load-path` 不作为冷启动来源；要从 `initial-load-path` 冷启动，请使用新的或空的 `checkpoint.folder`。
+当 `checkpointer.folder` 已存在有效的 `step-*` checkpoint 时，TorchTitan 会优先 resume，该情况下 `checkpointer.initial-load-path` 不作为冷启动来源；要从 `initial-load-path` 冷启动，请使用新的或空的 `checkpointer.folder`。
 
 ## LoRA 微调
 
@@ -279,11 +298,11 @@ Flash 多机 CPT 基线默认启用 `--checkpoint.load-only`，即只负责加�
 ```sh
 NODE_IPS="${NODE_IPS}" \
 bash examples/deepseek_v4/deepseek_v4_flash_lora_4k_a3.sh \
-  --optimizer.name AdamW \
+  --optim.optimizer.name AdamW \
   --training.steps 500 \
-  --checkpoint.interval 100
+  --checkpointer.interval 100
 ```
 
-该入口使用 `deepseek_v4_flash_lora` recipe（dense/expert rank 16、alpha 32），并开启 checkpoint 保存。优化器沿用 CPT 默认值，传入 `--optimizer.name` 可覆盖。周期 checkpoint 用于续跑，最后一步导出 PEFT adapter。模型规模、并行配置和其余默认参数继承 A3 公共入口，命令末尾的 CLI 参数仍可覆盖默认值。A5 使用 `CONFIG=deepseek_v4_flash_lora bash examples/deepseek_v4/deepseek_v4_flash_cpt_4k_a5.sh --checkpoint.no-load-only --checkpoint.save-training-state`，继承 A5 CPT 的 block-FP8 默认配置。
+该入口使用 `deepseek_v4_flash_lora_compiled` recipe（dense/expert rank 16、alpha 32），并开启 checkpoint 保存。优化器沿用 CPT 默认值，传入 `--optim.optimizer.name` 可覆盖。周期 checkpoint 用于续跑，最后一步导出 PEFT adapter。模型规模、并行配置和其余默认参数继承 A3 公共入口，命令末尾的 CLI 参数仍可覆盖默认值。A5 使用 `CONFIG=deepseek_v4_flash_lora_compiled bash examples/deepseek_v4/deepseek_v4_flash_cpt_4k_a5.sh --checkpointer.no-load-only --checkpointer.save-training-state`，继承 A5 CPT 的 block-FP8 默认配置。
 
 配置、部分参数训练、native checkpoint 恢复、PEFT 导出和离线合并见 [LoRA 功能指南](../../docs/feature_guides/deepseek_v4_lora.md)。

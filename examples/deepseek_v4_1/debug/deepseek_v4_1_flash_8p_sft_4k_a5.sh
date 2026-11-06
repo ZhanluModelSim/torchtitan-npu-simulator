@@ -9,6 +9,6 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 export DSV41_SFT_DATASET="${DSV41_SFT_DATASET:-${DATASET_PATH:-/path/to/train.jsonl}}"
-export CONFIG="${CONFIG:-deepseek_v4_1_flash_40layers_24experts_multimodal_sft}"
+export CONFIG="${CONFIG:-deepseek_v4_1_flash_40layers_24experts_multimodal_sft_compiled}"
 
 exec bash "${SCRIPT_DIR}/deepseek_v4_1_flash_8p_cpt_4k_a5.sh" "$@"

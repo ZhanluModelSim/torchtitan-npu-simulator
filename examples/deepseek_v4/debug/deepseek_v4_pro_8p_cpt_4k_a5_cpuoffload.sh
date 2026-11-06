@@ -21,7 +21,7 @@ WORLD_SIZE="${NGPU}"
 
 # Model
 MODULE="${MODULE:-torchtitan_npu.models.deepseek_v4}"
-CONFIG="${CONFIG:-deepseek_v4_pro_61layers_12experts}"
+CONFIG="${CONFIG:-deepseek_v4_pro_61layers_12experts_cpt}"
 
 # Dataloader & Checkpoint
 HF_ASSETS_PATH="${HF_ASSETS_PATH:-/path/to/DeepSeekV4_tokenizer}" # your tokenizer path
@@ -35,7 +35,6 @@ EP="${EP:-4}"
 CP="${CP:-1}"
 DP_SHARD="${DP_SHARD:-8}"
 DP_REPLICATE=$((WORLD_SIZE / (DP_SHARD * CP * TP * PP)))
-SPMD_BACKEND="spmd_types"
 
 # Training
 SEQ_LEN=4096
@@ -57,13 +56,11 @@ HF_ASSETS_ARGS="
 
 # Parallelism
 PARALLELISM_ARGS="
-    --parallelism.spmd-backend ${SPMD_BACKEND}
     --parallelism.data-parallel-shard-degree ${DP_SHARD}
     --parallelism.data-parallel-replicate-degree ${DP_REPLICATE}
     --parallelism.expert-parallel-degree ${EP}
     --parallelism.tensor-parallel-degree ${TP}
     --parallelism.context-parallel-degree ${CP}
-    --parallelism.context-parallel-load-balancer doc_chunk
     --parallelism.pipeline-parallel-degree ${PP}
 "
 
@@ -78,16 +75,15 @@ TRAINING_ARGS="
 "
 
 # Checkpoint
-# `checkpoint.folder` is the output/resume root (`CKPT_SAVE_LOAD_PATH`). If it
+# `checkpointer.folder` is the output/resume root (`CKPT_SAVE_LOAD_PATH`). If it
 # already contains a valid step-* checkpoint, upstream TorchTitan resumes from
 # it and ignores `initial-load-path`; use a new/empty folder when cold-starting
 # from `CKPT_INIT_LOAD_PATH`.
 CHECKPOINT_ARGS="
-    --checkpoint.enable
-    --checkpoint.load-only
-    --checkpoint.folder ${CKPT_SAVE_LOAD_PATH}
-    --checkpoint.initial-load-path ${CKPT_INIT_LOAD_PATH}
-    --checkpoint.initial-load-in-hf
+    --checkpointer.load-only
+    --checkpointer.folder ${CKPT_SAVE_LOAD_PATH}
+    --checkpointer.initial-load-path ${CKPT_INIT_LOAD_PATH}
+    --checkpointer.initial-load-in-hf
 "
 
 # Profiler
@@ -108,16 +104,16 @@ COMM_ARGS="
 
 # Optimizer
 OPTIMIZER_ARGS="
-    --optimizer.name Muon
-    --optimizer.lr 1.0e-5
-    --optimizer.beta1 0.9
-    --optimizer.beta2 0.95
-    --optimizer.eps 1.0e-8
-    --optimizer.weight_decay 1.0e-1
-    --optimizer.muon_momentum 0.95
-    --optimizer.muon_enable_nesterov
-    --optimizer.muon_ns_steps 10
-    --optimizer.muon_adjust_lr_fn match_rms_adamw
+    --optim.optimizer.name Muon
+    --optim.optimizer.lr 1.0e-5
+    --optim.optimizer.beta1 0.9
+    --optim.optimizer.beta2 0.95
+    --optim.optimizer.eps 1.0e-8
+    --optim.optimizer.weight_decay 1.0e-1
+    --optim.optimizer.muon_momentum 0.95
+    --optim.optimizer.muon_enable_nesterov
+    --optim.optimizer.muon_ns_steps 10
+    --optim.optimizer.muon_adjust_lr_fn match_rms_adamw
 "
 OPTIMIZER_OVERRIDES="
     torchtitan_npu.override.common.optimizer.swap_optimizer

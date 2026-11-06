@@ -12,7 +12,7 @@ from torchtitan_npu.models.deepseek_v4_1 import model_registry
 
 @pytest.mark.parametrize("layer_id", [2, 20], ids=["ratio-two", "ratio-one"])
 def test_compressor_pooling_outputs_and_gradients_match_explicit_groups(layer_id):
-    config = model_registry("deepseek_v4_1_debugmodel_text").model.layers[layer_id].attention.compressor
+    config = model_registry("deepseek_v4_1_debugmodel_text").layers[layer_id].attention.compressor
     with torch.random.fork_rng(devices=[]):
         compressor = config.build()
         compressor.init_states(buffer_device=torch.device("cpu"))

@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import replace
 from typing import Literal
 
@@ -17,7 +18,8 @@ from torchao_npu.quantization.quant_configs import (
     HiF8QuantizeConfig,
     MXQuantizeConfig,
 )
-from torchtitan.tools.logging import logger
+
+logger = logging.getLogger(__name__)
 
 # extension.quantization.enable-hif8-save-quant-codes ops added to the
 # selective-AC save list.

@@ -1,20 +1,22 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
 """CPU contract tests for the partial optimizer-state patch.
 
+Adapted from TorchTitan tests/unit_tests/cpu/test_state_dict_keys.py.
 Explicitly disable foreach so torch_npu's optimizer auto-selection does not
 query NPU hardware on CPU-only runners.
 """
 
 import torch
-import torchtitan.components.optimizer
-import torchtitan.components.optimizer.optimizer
-import torchtitan.components.optimizer.utils
+import torchtitan.components.optim
+import torchtitan.components.optim.optimizer
+import torchtitan.components.optim.utils
 from torch.distributed import checkpoint as dcp
-from torchtitan.components.optimizer import OptimizersContainer, ParamGroupConfig
+from torchtitan.components.optim import AdamW, OptimizersContainer
 
 from torchtitan_npu.patches.torchtitan.components import optimizer as optimizer_patch
 
@@ -35,7 +37,7 @@ def test_init_optim_state_materializes_missing_state():
     saved_lr = optim.param_groups[0]["lr"]
     saved_state = {key: value.clone() for key, value in optim.state[initialized].items()}
 
-    torchtitan.components.optimizer.utils.init_optim_state(optim)
+    torchtitan.components.optim.utils.init_optim_state(optim)
 
     assert initialized.grad is saved_grad
     assert missing.grad is None
@@ -64,8 +66,8 @@ def test_init_optim_state_exposes_all_checkpoint_state_keys():
     initialized.grad = torch.ones_like(initialized)
     optim.step()
 
-    torchtitan.components.optimizer.utils.init_optim_state(optim)
-    flat_state = torchtitan.components.optimizer.utils.get_flat_optim_state_dict(optim)
+    torchtitan.components.optim.utils.init_optim_state(optim)
+    flat_state = torchtitan.components.optim.utils.get_flat_optim_state_dict(optim)
 
     expected_state_keys = {
         f"state.{param_name}.{state_name}"
@@ -93,7 +95,7 @@ def test_materialized_state_matches_lazy_adamw_first_update():
         optim.step()
         optim.zero_grad(set_to_none=True)
 
-    torchtitan.components.optimizer.utils.init_optim_state(patched_optim)
+    torchtitan.components.optim.utils.init_optim_state(patched_optim)
 
     for params in (control_params, patched_params):
         params[0].grad = torch.tensor([-0.5])
@@ -118,7 +120,7 @@ def test_init_optim_state_is_idempotent_after_state_is_complete():
     saved_grad = param.grad
     saved_state = {key: value.clone() for key, value in optim.state[param].items()}
 
-    torchtitan.components.optimizer.optimizer.init_optim_state(optim)
+    torchtitan.components.optim.optimizer.init_optim_state(optim)
 
     assert param.grad is saved_grad
     for key, value in saved_state.items():
@@ -128,8 +130,9 @@ def test_init_optim_state_is_idempotent_after_state_is_complete():
 def _build_partial_state_optimizer():
     model = torch.nn.Linear(1, 1)
     config = OptimizersContainer.Config(
-        param_groups=[ParamGroupConfig(pattern=".*", optimizer_name="AdamW", optimizer_kwargs={"lr": 0.01})],
-        implementation="for-loop",
+        optimizers=[
+            AdamW.Config(pattern=".*", fused=False, foreach=False, betas=(0.9, 0.999), weight_decay=0.01, lr=0.01)
+        ],
     )
     return model, config.build(model_parts=[model])
 

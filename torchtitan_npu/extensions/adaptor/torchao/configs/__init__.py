@@ -104,11 +104,12 @@ def get_model_config(model_type: ModelType | str) -> ModelQuantConfig:
         raise ValueError(f"unsupported DeepSeek model type {model_type!r}; expected 'v4' or 'v41'") from exc
 
 
-def _model_type_for_spec(model_spec) -> ModelType:
-    try:
-        return _NAME_TO_TYPE[model_spec.name]
-    except KeyError as exc:
-        raise ValueError(
-            "TorchAO-NPU quantization supports DeepSeek V4 and V4.1 model specs, "
-            f"got {getattr(model_spec, 'name', type(model_spec).__qualname__)!r}"
-        ) from exc
+def _model_type_for_config(model_config) -> ModelType:
+    for base in type(model_config).__mro__:
+        if base.__module__.startswith("torchtitan_npu.models.deepseek_v4_1."):
+            return ModelType.V4_1
+        if base.__module__.startswith("torchtitan_npu.models.deepseek_v4."):
+            return ModelType.V4
+    raise ValueError(
+        f"TorchAO-NPU quantization supports DeepSeek V4 and V4.1 model configs, got {type(model_config).__qualname__!r}"
+    )

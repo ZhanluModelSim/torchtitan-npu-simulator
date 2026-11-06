@@ -21,7 +21,6 @@ from torchtitan.config import derive, override
 from torchtitan.models.common.rope import (
     ComplexRoPE,
     CosSinRoPE,
-    _maybe_wrap_positions,
     _reshape_for_broadcast,
 )
 
@@ -98,7 +97,6 @@ class _InterleavedCacheMixin:
         query: torch.Tensor,
         positions: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        positions = _maybe_wrap_positions(positions, query)
         cos_cache, sin_cache = self.cache.unbind(0)
         return (
             _reshape_for_broadcast(cos_cache, query.shape, positions),

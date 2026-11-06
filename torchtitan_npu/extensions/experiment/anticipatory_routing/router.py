@@ -5,12 +5,15 @@
 
 """Dynamic expert selection capture and replay."""
 
+import logging
+
 import torch
 from torch.distributed.tensor import DTensor
 from torchtitan.models.common.moe import TokenChoiceTopKRouter
-from torchtitan.tools.logging import logger
 
 from .cache import RoutingIndexCache, resolve_store_dtype
+
+logger = logging.getLogger(__name__)
 
 
 class _ReplaySelection:

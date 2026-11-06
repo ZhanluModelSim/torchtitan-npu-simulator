@@ -15,49 +15,58 @@ class _FusedStandIn(Selector):
     """A stand-in for a fused port: the trainer discovers those by class, not by a flag.
 
     The real ports subclass :class:`Selector` (and the reference selector is the only module
-    whose exact class is ``Selector``), which is what ``TrainerEx`` keys the step denominator on.
+    whose exact class is ``Selector``), which is what the engine keys the step denominator on.
     """
 
 
 def test_step_denominator_counts_queries_across_accumulation_and_data_ranks(monkeypatch):
-    config = Selector.Config(
-        mode=FULL, compress_ratio=2, num_index_heads=2, index_head_dim=4, index_topk=4
-    )
+    config = Selector.Config(mode=FULL, compress_ratio=2, num_index_heads=2, index_head_dim=4, index_topk=4)
     selector, reference = _FusedStandIn(config), Selector(config)
 
-    def initialize(self, config):
-        self.model_parts = [torch.nn.ModuleList([selector, reference])]
-        self.anticipatory_schedule = None
-
-    monkeypatch.setattr(config_registry.TrainerEx, "__init__", initialize)
-    job = SimpleNamespace(
-        override=SimpleNamespace(imports=["torchtitan_npu.override.deepseek_v4_1.lightning_indexer.asc"])
-    )
-    trainer = config_registry.DeepSeekV41Trainer(job)
-    trainer.device = torch.device("cpu")
+    engine = object.__new__(config_registry.DeepSeekV41TrainingEngine)
+    engine.model_parts = [torch.nn.ModuleList([selector, reference])]
+    engine.device = torch.device("cpu")
     mesh = object()
-    trainer.parallel_dims = SimpleNamespace(dp_enabled=True, get_mesh=lambda name: mesh)
-    batches = [({"input": torch.zeros(1, n)}, torch.full((1, n), -100)) for n in (4, 8)]
+    requested_meshes = []
+    engine.parallelism_context = SimpleNamespace(
+        dp_enabled=True, get_mesh=lambda name: requested_meshes.append(name) or mesh
+    )
+    from torchtitan.components.data import TokenizedTrainingMicrobatch
+
+    groups = [
+        [
+            TokenizedTrainingMicrobatch(
+                input=torch.zeros(n, dtype=torch.int64),
+                labels=torch.full((n,), -100),
+                positions=torch.arange(n),
+                padding_mask=torch.ones(n, dtype=torch.bool),
+                num_valid_tokens=0,
+            )
+        ]
+        for n in (4, 8)
+    ]
     reductions = []
 
     def reduce_count(value, group):
         assert group is mesh
         reductions.append(value.clone())
-        return value + 20  # Another data rank contributes 20 queries.
+        return value + 20
 
-    def run_step(self, data_iterator):
-        prefetched = list(data_iterator)
-        for inputs, labels in prefetched:
-            self.forward_backward_step(inputs, labels=labels, global_valid_tokens=torch.tensor(0))
-
-    def run_microbatch(self, input_dict, **kwargs):
-        assert "input" in input_dict
-        torch.testing.assert_close(selector.num_global_queries, torch.tensor(32.0))
+    def run_forward_backward(self, *, microbatch_groups, global_valid_tokens):
+        assert microbatch_groups is groups
+        torch.testing.assert_close(selector.num_global_queries, torch.tensor(expected_queries))
+        return "forward-backward-result"
 
     monkeypatch.setattr(config_registry.dist_utils, "dist_sum_tensor", reduce_count)
-    monkeypatch.setattr(config_registry.GradientClippingTrainer, "train_step", run_step)
-    monkeypatch.setattr(config_registry.TrainerEx, "forward_backward_step", run_microbatch)
-    trainer.train_step(iter(batches))
+    monkeypatch.setattr(config_registry.NPUTrainingEngine, "forward_backward", run_forward_backward)
+    expected_queries = 32.0
+    assert engine.forward_backward(microbatch_groups=groups, global_valid_tokens=0) == "forward-backward-result"
+    # Cached selectors must still receive the new denominator on each step.
+    groups = groups[:1]
+    expected_queries = 24.0
+    assert engine.forward_backward(microbatch_groups=groups, global_valid_tokens=0) == "forward-backward-result"
     assert reference.num_global_queries is None
-    assert len(reductions) == 1
+    assert requested_meshes == ["dp", "dp"]
+    assert len(reductions) == 2
     torch.testing.assert_close(reductions[0], torch.tensor(12.0))
+    torch.testing.assert_close(reductions[1], torch.tensor(4.0))

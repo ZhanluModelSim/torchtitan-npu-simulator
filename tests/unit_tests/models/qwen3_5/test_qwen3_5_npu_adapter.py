@@ -179,7 +179,7 @@ def test_qwen3_5_multimodal_loader_matches_upstream_batches(dp_rank, dp_world_si
             dp_rank={dp_rank},
             dp_world_size={dp_world_size},
             max_context_length=512,
-            num_tokens_per_batch=512,
+            num_tokens_per_microbatch=512,
         )
         adapter_config = adapter.qwen35_debugmodel(seq_len=512)
         upstream_config = upstream.qwen35_debugmodel(seq_len=512)
@@ -189,8 +189,11 @@ def test_qwen3_5_multimodal_loader_matches_upstream_batches(dp_rank, dp_world_si
             adapter_batches = iter(adapter_loader)
             upstream_batches = iter(upstream_loader)
             for _ in range(2):
-                adapter_inputs, adapter_labels = next(adapter_batches)
-                upstream_inputs, upstream_labels = next(upstream_batches)
+                adapter_batch = next(adapter_batches)
+                upstream_batch = next(upstream_batches)
+                adapter_inputs, adapter_labels = adapter_batch.as_input_dict(), adapter_batch.labels
+                upstream_inputs, upstream_labels = upstream_batch.as_input_dict(), upstream_batch.labels
+                assert adapter_batch.num_valid_tokens == upstream_batch.num_valid_tokens
                 assert adapter_inputs.keys() == upstream_inputs.keys()
                 torch.testing.assert_close(adapter_labels, upstream_labels, rtol=0, atol=0)
                 for key, value in adapter_inputs.items():
@@ -236,7 +239,7 @@ def test_qwen3_5_multimodal_loader_resumes_from_state():
             dp_rank=0,
             dp_world_size=1,
             max_context_length=512,
-            num_tokens_per_batch=512,
+            num_tokens_per_microbatch=512,
         )
         config = adapter.qwen35_debugmodel(seq_len=512)
         original = config.dataloader.build(**build)
@@ -248,8 +251,12 @@ def test_qwen3_5_multimodal_loader_resumes_from_state():
             restored.load_state_dict(deepcopy(original.state_dict()))
             resumed = iter(restored)
             for _ in range(3):
-                expected_inputs, expected_labels = next(iterator)
-                actual_inputs, actual_labels = next(resumed)
+                expected_batch = next(iterator)
+                actual_batch = next(resumed)
+                expected_inputs, expected_labels = expected_batch.as_input_dict(), expected_batch.labels
+                actual_inputs, actual_labels = actual_batch.as_input_dict(), actual_batch.labels
+                assert actual_inputs.keys() == expected_inputs.keys()
+                assert actual_batch.num_valid_tokens == expected_batch.num_valid_tokens
                 torch.testing.assert_close(actual_labels, expected_labels, rtol=0, atol=0)
                 for key, value in expected_inputs.items():
                     if isinstance(value, torch.Tensor):
@@ -268,10 +275,11 @@ def test_qwen3_5_moe_factory_preserves_unpatched_dispatcher_schemas():
     root = Path(__file__).resolve().parents[4]
     _run_isolated(
         """
+        import pytest
         import torchtitan_npu.models.qwen3_5
         from torchtitan.models.common.config_utils import make_routed_experts_config
 
-        for backend in ("standard", "deepep", "hybridep", "minimal_async_ep"):
+        for backend in ("standard", "deepep", "hybridep"):
             config = make_routed_experts_config(
                 dim=8,
                 hidden_dim=16,
@@ -279,9 +287,20 @@ def test_qwen3_5_moe_factory_preserves_unpatched_dispatcher_schemas():
                 top_k=2,
                 param_init={},
                 comm_backend=backend,
+                absorb_router_scores=backend in ("standard", "deepep"),
             )
             has_absorb = hasattr(config.token_dispatcher, "absorb_router_scores")
             assert has_absorb is (backend in ("standard", "deepep")), (backend, config.token_dispatcher)
+
+        with pytest.raises(ValueError, match="Unknown comm_backend: 'minimal_async_ep'"):
+            make_routed_experts_config(
+                dim=8,
+                hidden_dim=16,
+                num_experts=4,
+                top_k=2,
+                param_init={},
+                comm_backend="minimal_async_ep",
+            )
         """,
         root,
     )
@@ -306,16 +325,18 @@ def test_qwen3_5_video_mrope_uses_contiguous_temporal_coordinates():
             context=DatasetBuildContext(
                 tokenizer=tokenizer,
                 max_context_length=4,
-                num_tokens_per_batch=4,
+                num_tokens_per_microbatch=4,
                 read_options=grain.ReadOptions(),
             )
         )
-        inputs, labels = collator([{
+        microbatch = collator([{
             "input_ids": torch.tensor([100, 11, 11, 101]),
             "labels": torch.tensor([-100, -100, 101, -100]),
             "positions": torch.arange(4),
             "pixel_values_videos": [torch.zeros(4, 32, 32, 3)],
         }])
+        inputs, labels = microbatch.as_input_dict(), microbatch.labels
+        assert microbatch.num_valid_tokens == 1
         assert inputs["input"].shape == labels.shape == (4,)
         assert inputs["pixel_values_videos"].shape == (8, 1536)
         torch.testing.assert_close(inputs["grid_thw_videos"], torch.tensor([[2, 2, 2]]))
@@ -338,7 +359,7 @@ def test_qwen3_5_gdn_override_targets_upstream_kernel_config():
         config = qwen35_debugmodel()
         config.override.imports = ["torchtitan_npu.override.qwen3_5.gated_delta.npu"]
         apply_overrides(config.override, config)
-        delta_layers = [layer.delta_net for layer in config.model_spec.model.layers if layer.delta_net is not None]
+        delta_layers = [layer.delta_net for layer in config.model.layers if layer.delta_net is not None]
         assert delta_layers
         # The 0.4.0 GatedDeltaNet delegates to InnerGatedDeltaNet, which owns the kernel.
         assert all(
@@ -436,53 +457,39 @@ def test_qwen3_5_flex_attention_preserves_aux_output_protocol():
     )
 
 
-def test_qwen3_5_parallelizer_uses_v030_spmd_storage_mesh():
+def test_qwen3_5_fsdp_uses_resolved_storage_mesh():
     root = Path(__file__).resolve().parents[4]
     _run_isolated(
         """
         from types import SimpleNamespace
         from unittest.mock import patch
         from torchtitan_npu.override.qwen3_5 import parallelize as adapter
-        class ParallelDims:
+        class ParallelismContext:
             cp_enabled = False
-            tp_enabled = False
-            ep_enabled = False
-            dp_replicate_enabled = False
             pp_enabled = False
             ep = 1
             def get_mesh(self, _dims):
-                raise AssertionError("spmd_types must use the v0.3.0 storage mesh resolver")
-        class Model:
-            vision_encoder = None
-            def __init__(self): self.parallelized = False
-            def parallelize(self, _parallel_dims): self.parallelized = True
-        parallel_dims = ParallelDims()
-        model = Model()
+                raise AssertionError("FSDP must use the storage mesh resolver")
+        model = SimpleNamespace(vision_encoder=None)
+        context = ParallelismContext()
         dense_mesh, dense_dims = object(), object()
         training = SimpleNamespace(
             mixed_precision_param="bfloat16",
             mixed_precision_reduce="float32",
             enable_cpu_offload=False,
         )
-        parallelism = SimpleNamespace(spmd_backend="spmd_types", fsdp_reshard_after_forward="default")
-        compile_config = SimpleNamespace(enable=False, components=())
+        parallelism = SimpleNamespace(fsdp_reshard_after_forward="default", fsdp_symm_mem_scope=None)
         with (
             patch.object(adapter, "resolve_fsdp_mesh", return_value=(dense_mesh, dense_dims)) as resolve_dense,
             patch.object(adapter, "resolve_sparse_fsdp_mesh", return_value=(None, None)) as resolve_sparse,
             patch.object(adapter, "apply_fsdp_to_decoder") as apply_decoder,
         ):
-            result = adapter.parallelize_qwen3_5_npu(
-                model,
-                parallel_dims=parallel_dims,
-                training=training,
-                parallelism=parallelism,
-                compile_config=compile_config,
-                ac_config=None,
-                dump_folder="unused",
+            adapter.apply_qwen3_5_npu_fsdp(
+                model, parallelism_context=context, training=training, parallelism=parallelism
             )
-        assert result is model and model.parallelized
-        resolve_dense.assert_called_once_with(parallel_dims)
-        resolve_sparse.assert_called_once_with(parallel_dims)
+        resolve_dense.assert_called_once_with(context)
+        resolve_sparse.assert_called_once_with(context)
+        assert apply_decoder.call_args.args[0] is model
         assert apply_decoder.call_args.args[1] is dense_mesh
         assert apply_decoder.call_args.kwargs["dp_mesh_dims"] is dense_dims
         assert apply_decoder.call_args.kwargs["edp_mesh_dims"] is None
@@ -608,30 +615,37 @@ def test_qwen3_5_does_not_vendor_a_second_gdn_implementation():
     assert not any(old_ops.rglob("*.py"))
 
 
-def test_presplit_pipeline_bridge_handles_older_npu_schedule():
+def test_native_engine_passes_presplit_pipeline_inputs_to_schedule():
     root = Path(__file__).resolve().parents[4]
     _run_isolated(
         """
+        from contextlib import nullcontext
+        from types import SimpleNamespace
         import torch
-        from torchtitan_npu.patches.torchtitan.trainer import _run_presplit_pipeline_schedule
-        class Stage:
-            def __init__(self): self.has_backward = False; self.cleared = 0
-            def clear_runtime_states(self): self.cleared += 1
+        from torchtitan.training_engine import TrainingEngine
         class Schedule:
-            _has_backward = True
-            def __init__(self): self._stage = Stage(); self.received = None
-            def _step_microbatches(self, **kwargs): self.received = kwargs
+            def __init__(self): self.received = None
+            def step(self, **kwargs):
+                self.received = kwargs
+                kwargs["losses"].append(torch.tensor(2.0, requires_grad=True))
         schedule = Schedule()
-        _run_presplit_pipeline_schedule(
-            schedule,
-            arg_mbs=[(torch.ones(1),)],
-            kwarg_mbs=[{}],
-            target_mbs=[torch.ones(1)],
-            losses=[],
-            loss_kwargs={},
-            return_outputs=False,
+        engine = object.__new__(TrainingEngine)
+        engine.parallelism_context = SimpleNamespace(activate_spmd=lambda **kwargs: nullcontext())
+        engine.config = SimpleNamespace(debug=SimpleNamespace(spmd_typechecking=False))
+        engine.pp_has_last_stage = True
+        engine.pp_schedule = schedule
+        engine.device = torch.device("cpu")
+        inputs, labels, model_kwargs = [(torch.ones(1),)], [torch.ones(1)], [{}]
+        loss = engine._pp_forward_backward_microbatch_group(
+            inputs=inputs, labels=labels, model_kwargs=model_kwargs,
+            loss_kwargs={}, finalize_gradients=False,
         )
-        assert schedule._stage.has_backward and schedule._stage.cleared == 1 and schedule.received["arg_mbs"]
+        assert schedule.received["arg_mbs"] is inputs
+        assert schedule.received["target_mbs"] is labels
+        assert schedule.received["kwarg_mbs"] is model_kwargs
+        assert schedule.received["return_outputs"] is False
+        assert schedule.received["finalize_gradients"] is False
+        assert loss.item() == 2.0 and not loss.requires_grad
         """,
         root,
     )

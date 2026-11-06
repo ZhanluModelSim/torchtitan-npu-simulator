@@ -5,30 +5,27 @@
 # LICENSE file in the root directory of this source tree.
 
 # Run this script on each participating node; NODE_IPS lists all node addresses.
-# Append CLI arguments to override the defaults below:
-#   NODE_IPS=192.168.1.10,192.168.1.11,192.168.1.12,192.168.1.13,192.168.1.14,192.168.1.15,192.168.1.16,192.168.1.17 \
-#     ./examples/deepseek_v4_1/deepseek_v4_1_flash_cpt_4k_a3.sh \
-#     --checkpoint.initial-load-path /path/to/model_ckpt --training.steps 5
-# For deterministic execution, append --debug.seed 42 --debug.deterministic to the command line.
+# CP=EP=128 requires at least 128 ranks with eight devices per node.
+# Append CLI arguments to override the defaults below.
+# For deterministic execution, append --debug.seed 42 --debug.deterministic.
 
 set -euo pipefail
 
-NODE_IPS="${NODE_IPS:-xx.xx.xx.xx, xx.xx.xx.xx, xx.xx.xx.xx, xx.xx.xx.xx, \
-                      xx.xx.xx.xx, xx.xx.xx.xx, xx.xx.xx.xx, xx.xx.xx.xx}"
+NODE_IPS="${NODE_IPS:-xx.xx.xx.xx, xx.xx.xx.xx, xx.xx.xx.xx, xx.xx.xx.xx, xx.xx.xx.xx, xx.xx.xx.xx, xx.xx.xx.xx, xx.xx.xx.xx, \
+                      xx.xx.xx.xx, xx.xx.xx.xx, xx.xx.xx.xx, xx.xx.xx.xx, xx.xx.xx.xx, xx.xx.xx.xx, xx.xx.xx.xx, xx.xx.xx.xx}"
 NGPU="${NGPU:-8}"
 NNODES=$(awk -F, '{print NF}' <<< "${NODE_IPS}")
 WORLD_SIZE=$((NGPU * NNODES))
 
 # Model
 MODULE="${MODULE:-torchtitan_npu.models.deepseek_v4_1}"
-CONFIG="${CONFIG:-deepseek_v4_1_flash_text}"
+CONFIG="${CONFIG:-deepseek_v4_1_flash_text_cp}"
 
-# Dataloader & Checkpoint
-DATASET="${DATASET:-c4_test}"
-DATASET_PATH="${DATASET_PATH:-}" # optional; unset keeps the upstream dataset source
+# Dataloader
+DATASET_PATH="${DATASET_PATH:-}" # optional JSON/JSONL file for the text source
+export DATA_FILES="${DATA_FILES:-${DATASET_PATH:-tests/assets/c4_test/data.json}}"
+export DSV41_PER_DOC_ALIGNMENT="${DSV41_PER_DOC_ALIGNMENT:-256}"
 HF_ASSETS_PATH="${HF_ASSETS_PATH:-/path/to/DeepSeekV41_tokenizer}" # your tokenizer path
-CKPT_SAVE_LOAD_PATH="${CKPT_SAVE_LOAD_PATH:-/path/to/save_ckpt}" # your model save/load ckpt path
-CKPT_INIT_LOAD_PATH="${CKPT_INIT_LOAD_PATH:-/path/to/init_load_ckpt}" # your model initial load ckpt path
 
 # Parallelism
 TP=1
@@ -41,7 +38,6 @@ if (( WORLD_SIZE <= 0 || DP_SHARD <= 0 || EP <= 0 || WORLD_SIZE % DP_SHARD != 0 
     exit 1
 fi
 DP_REPLICATE=$((WORLD_SIZE / (DP_SHARD * CP * TP * PP)))
-SPMD_BACKEND="spmd_types"
 
 # Training
 # Full Flash uses eager execution and the recipe-owned FullAC policy.
@@ -62,20 +58,10 @@ HF_ASSETS_ARGS="
     --hf-assets-path ${HF_ASSETS_PATH}
 "
 
-# Dataloader
-DATALOADER_ARGS="
-    --dataloader.dataset ${DATASET}
-    --dataloader.per_doc_alignment 256
-"
-if [[ -n "${DATASET_PATH}" ]]; then
-    DATALOADER_ARGS+="
-    --dataloader.dataset-path ${DATASET_PATH}
-"
-fi
+# The recipe owns the typed Grain dataset graph; DATA_FILES selects its JSON source.
 
 # Parallelism
 PARALLELISM_ARGS="
-    --parallelism.spmd-backend ${SPMD_BACKEND}
     --parallelism.data-parallel-shard-degree ${DP_SHARD}
     --parallelism.data-parallel-replicate-degree ${DP_REPLICATE}
     --parallelism.expert-parallel-degree ${EP}
@@ -83,16 +69,11 @@ PARALLELISM_ARGS="
     --parallelism.context-parallel-degree ${CP}
     --parallelism.pipeline-parallel-degree ${PP}
     --parallelism.fsdp-reshard-after-forward always
-    --parallelism.context-parallel-load-balancer doc_chunk
     --parallelism.enable-sequence-parallel
 "
 
 # Compile
-COMPILE_ARGS="
-    --compile.no-enable
-    --compile.components model
-    --compile.backend inductor
-"
+COMPILE_ARGS=""
 
 # Training
 TRAINING_ARGS="
@@ -106,25 +87,15 @@ TRAINING_ARGS="
 
 # LR scheduler
 LR_SCHEDULER_ARGS="
-    --lr-scheduler.warmup-steps 2
-    --lr-scheduler.total-steps ${STEPS}
-    --lr-scheduler.decay-ratio 1.0
-    --lr-scheduler.decay-type cosine
-    --lr-scheduler.min-lr-factor 0.01
+    --optim.lr-scheduler.warmup-steps 2
+    --optim.lr-scheduler.total-steps ${STEPS}
+    --optim.lr-scheduler.decay-ratio 1.0
+    --optim.lr-scheduler.decay-type cosine
+    --optim.lr-scheduler.min-lr-factor 0.01
 "
 
-# Checkpoint
-# `checkpoint.folder` is the output/resume root (`CKPT_SAVE_LOAD_PATH`). If it
-# already contains a valid step-* checkpoint, upstream TorchTitan resumes from
-# it and ignores `initial-load-path`; use a new/empty folder when cold-starting
-# from `CKPT_INIT_LOAD_PATH`.
-CHECKPOINT_ARGS="
-    --checkpoint.no-enable
-    --checkpoint.load-only
-    --checkpoint.folder ${CKPT_SAVE_LOAD_PATH}
-    --checkpoint.initial-load-path ${CKPT_INIT_LOAD_PATH}
-    --checkpoint.initial-load-in-hf
-"
+# Checkpoint policy is declared by the selected Python recipe.
+CHECKPOINT_ARGS=""
 
 # Profiler
 PROFILER_ARGS="
@@ -144,16 +115,16 @@ COMM_ARGS="
 
 # Optimizer
 OPTIMIZER_ARGS="
-    --optimizer.name Muon
-    --optimizer.lr 1.0e-5
-    --optimizer.beta1 0.9
-    --optimizer.beta2 0.95
-    --optimizer.eps 1.0e-8
-    --optimizer.weight-decay 1.0e-1
-    --optimizer.muon_momentum 0.95
-    --optimizer.muon_enable_nesterov
-    --optimizer.muon_ns_steps 10
-    --optimizer.muon_adjust_lr_fn match_rms_adamw
+    --optim.optimizer.name Muon
+    --optim.optimizer.lr 1.0e-5
+    --optim.optimizer.beta1 0.9
+    --optim.optimizer.beta2 0.95
+    --optim.optimizer.eps 1.0e-8
+    --optim.optimizer.weight-decay 1.0e-1
+    --optim.optimizer.muon_momentum 0.95
+    --optim.optimizer.muon_enable_nesterov
+    --optim.optimizer.muon_ns_steps 10
+    --optim.optimizer.muon_adjust_lr_fn match_rms_adamw
 "
 OPTIMIZER_OVERRIDES="${OPTIMIZER_OVERRIDES-torchtitan_npu.override.common.optimizer.swap_optimizer}"
 
@@ -180,7 +151,6 @@ LOG_PREFIX="${LOG_PREFIX:-${CONFIG}}" \
 bash scripts/run_train_multinodes.sh \
     $COMPILE_ARGS \
     $HF_ASSETS_ARGS \
-    $DATALOADER_ARGS \
     $PARALLELISM_ARGS \
     $TRAINING_ARGS \
     $DEBUG_ARGS \

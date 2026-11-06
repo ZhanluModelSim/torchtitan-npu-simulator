@@ -7,13 +7,14 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import tempfile
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from torchtitan.tools.logging import logger
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from collections.abc import Iterator

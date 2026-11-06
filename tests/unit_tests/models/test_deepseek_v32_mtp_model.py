@@ -6,6 +6,7 @@
 
 import pytest
 import torch
+from torchtitan.models.common.aux_loss import AuxLoss
 
 from tests.unit_tests.models.mtp_test_utils import (
     BATCH_SIZE,
@@ -23,7 +24,6 @@ from torchtitan_npu.models.deepseek_v3_2 import (
     _build_dsv3_2_layers,
     _build_mtp_layers,
 )
-from torchtitan_npu.patches.torchtitan.models.common.aux_loss import AuxLoss
 
 
 def _build_rope_config() -> ComplexRoPE.Config:

@@ -12,18 +12,47 @@ from types import SimpleNamespace
 import pytest
 import torch
 from torch import nn
+from torchtitan.components.data.types import TrainingMicrobatch
+from torchtitan.components.optim import Optim
+from torchtitan.models.common.activation import Sigmoid
+from torchtitan.models.common.linear import RouterGateLinear
 from torchtitan.models.common.moe import TokenChoiceTopKRouter
+from torchtitan.training_engine import TrainingEngine
 
+from torchtitan_npu.config.configs import CompileConfig, ModelCompileConfig
 from torchtitan_npu.extensions.experiment.anticipatory_routing.cache import RoutingMode
 from torchtitan_npu.extensions.experiment.anticipatory_routing.config import AnticipatoryRoutingConfig
 from torchtitan_npu.extensions.experiment.anticipatory_routing.router import build_routing_cache
 from torchtitan_npu.extensions.experiment.anticipatory_routing.schedule import AnticipatorySchedule, Phase
-from torchtitan_npu.extensions.torchtitan.trainer import Trainer, TrainerEx
+from torchtitan_npu.extensions.torchtitan.trainer import NPUTrainingEngine, TrainerEx
 
 
 class Scheduler(torch.optim.lr_scheduler.StepLR):
     def get_metrics(self):
         return {"lr": self.get_last_lr()[0]}
+
+
+class Microbatch(TrainingMicrobatch):
+    def __init__(self, inputs, labels, num_valid_tokens=1):
+        self.inputs = inputs
+        self.labels = labels
+        self.num_valid_tokens = num_valid_tokens
+
+    def as_input_dict(self):
+        return {**self.inputs, "labels": self.labels}
+
+
+def make_runtime(model, *, device="cpu", ntokens_seen=0):
+    """Supply the runtime resources used by isolated forward-only passes."""
+    return SimpleNamespace(
+        model_parts=[model],
+        device=torch.device(device),
+        ntokens_seen=ntokens_seen,
+        parallelism_context=SimpleNamespace(activate_spmd=lambda **kwargs: nullcontext()),
+        config=SimpleNamespace(parallelism=SimpleNamespace(), training=SimpleNamespace(max_context_length=1)),
+        max_num_documents=None,
+        preprocess_inputs_kwargs={},
+    )
 
 
 class Loader:
@@ -36,7 +65,7 @@ class Loader:
         for i in range(self.position, self.size):
             self.position = i + 1
             self.reads.append(i)
-            yield [{"input": torch.tensor([[[i + 1.0, 0.0]]]), "num_valid_tokens": 1}, torch.tensor([[i]])]
+            yield Microbatch({"input": torch.tensor([[[i + 1.0, 0.0]]])}, torch.tensor([[i]]))
 
     def state_dict(self):
         return {"position": self.position}
@@ -48,25 +77,23 @@ class Loader:
 class Model(nn.Module):
     def __init__(self):
         super().__init__()
-        router = TokenChoiceTopKRouter.__new__(TokenChoiceTopKRouter)
-        nn.Module.__init__(router)
+        router = TokenChoiceTopKRouter.Config(
+            num_experts=2,
+            gate=RouterGateLinear.Config(in_features=2, out_features=2),
+            score_func=Sigmoid.Config(),
+            top_k=1,
+        ).build()
         router.gate = nn.Identity()
-        router.score_func = "sigmoid"
-        router.num_experts, router.top_k = 2, 1
-        router.num_expert_groups = None
-        router.route_norm, router.route_scale = False, 1.0
-        router._debug_force_load_balance = False
         self.router = router
         self.weight = nn.Parameter(torch.tensor(1.0))
         self.register_buffer("counter", torch.tensor(0.0))
-
 
     def preprocess_inputs(self, batch, **kwargs):
         return batch["input"], batch["labels"], {}
 
     def forward(self, x):
         self.counter.add_(1)
-        self.router(x)
+        self.router(x.reshape(-1, x.shape[-1]))
         return x * self.weight
 
 
@@ -82,112 +109,130 @@ def test_forward_only_preserves_batch_and_forwards_model_metadata():
 
     model = ForwardModel()
     engine = object.__new__(AnticipatoryTrainingEngine)
-    engine.trainer = SimpleNamespace(
-        model_parts=[model], device=torch.device("cpu"), ntokens_seen=0,
-        train_context=nullcontext, parallel_dims=SimpleNamespace(), config=SimpleNamespace(parallelism=None),
-    )
+    engine.runtime = make_runtime(model)
     inputs, positions, labels = torch.tensor([1]), torch.tensor([2]), torch.tensor([3])
-    batch = ({"input": inputs, "positions": positions, "num_valid_tokens": 1}, labels)
+    batch = Microbatch({"input": inputs, "positions": positions, "num_valid_tokens": 1}, labels)
     engine.forward_only_microbatch(batch)
     torch.testing.assert_close(model.seen, (inputs, positions))
-    assert batch[0]["num_valid_tokens"] == 1
-    assert set(batch[0]) == {"input", "positions", "num_valid_tokens"}
+    assert batch.inputs["num_valid_tokens"] == 1
+    assert set(batch.inputs) == {"input", "positions", "num_valid_tokens"}
 
 
 def make_trainer(monkeypatch, *, delay=2, active=3, size=40, steps=10, device="cpu", compile_backend=None):
     trainer = object.__new__(TrainerEx)
-    trainer.device = torch.device(device)
-    trainer.step, trainer.ntokens_seen = 0, 0
-    trainer.model_parts = [Model().to(trainer.device)]
+    runtime = object.__new__(NPUTrainingEngine)
+    trainer.engine = runtime
+    runtime.device = torch.device(device)
+    runtime.num_completed_steps, runtime.ntokens_seen = 0, 0
+    runtime.model_parts = [Model().to(runtime.device)]
     trainer.dataloader = Loader(size)
-    config = AnticipatoryRoutingConfig(
-        enable=True, delay_steps=delay, active_steps=active
-    )
-    trainer.config = SimpleNamespace(
-        anticipatory=config, training=SimpleNamespace(steps=steps, disable_cuda_graphs=True, max_norm=100.0), checkpoint=SimpleNamespace(interval=2, keep_latest_k=0), parallelism=SimpleNamespace()
+    config = AnticipatoryRoutingConfig(enable=True, delay_steps=delay, active_steps=active)
+    trainer.config = runtime.config = SimpleNamespace(
+        anticipatory=config,
+        training=SimpleNamespace(
+            steps=steps,
+            disable_cuda_graphs=True,
+            max_context_length=1,
+            num_tokens_per_microbatch_per_dp_rank=1,
+        ),
+        checkpointer=SimpleNamespace(interval=2, keep_latest_k=0),
+        parallelism=SimpleNamespace(),
+        debug=SimpleNamespace(spmd_typechecking=False),
+        optim=Optim.Config(max_norm=100.0),
     )
     trainer.gradient_accumulation_steps, trainer.num_pp_microbatches = 2, 1
-    trainer.parallel_dims = SimpleNamespace(
-        pp_enabled=False, dp_enabled=False, ep_enabled=False, dp_cp_enabled=False, get_optional_mesh=lambda name: None
+    runtime.num_accumulation_steps = 2
+    runtime.parallelism_context = SimpleNamespace(
+        pp_enabled=False,
+        dp_enabled=False,
+        ep_enabled=False,
+        dp_cp_enabled=False,
+        dp_replicate_enabled=False,
+        cp=1,
+        get_optional_mesh=lambda name: None,
+        activate_spmd=lambda **kwargs: nullcontext(),
     )
     trainer.metrics_processor = SimpleNamespace(
         ntokens_since_last_log=0, data_loading_times=[], should_log=lambda step: False
     )
-    trainer.train_context = nullcontext
-    trainer.sdc_replayer = None
-    trainer._sdc = SimpleNamespace(finalize_sdc_step=lambda: None)
-    # Avoid torch_npu's automatic optimizer backend probe in CPU-only CI.
-    trainer.optimizers = torch.optim.SGD(
-        trainer.model_parts[0].parameters(), lr=0.001, momentum=0.9, foreach=False, fused=False
+    runtime.sdc_replayer = None
+    runtime._sdc = None
+    runtime.gc_handler = SimpleNamespace(run=lambda step: None)
+    runtime.max_num_documents = None
+    runtime.preprocess_inputs_kwargs = {}
+    runtime._run_forward_backward = lambda groups, tokens: runtime._forward_backward_body(
+        groups, tokens, defer_fsdp_gradient_reduction=False
     )
-    trainer.lr_schedulers = Scheduler(trainer.optimizers, step_size=1, gamma=0.9)
+    # Retain the real Optim clipping, update, and scheduler lifecycle with a CPU SGD boundary.
+    optim = runtime.optim = object.__new__(Optim)
+    optim.config = trainer.config.optim
+    optim.parallelism_context = runtime.parallelism_context
+    optim.parameters = list(runtime.model_parts[0].parameters())
+    optim.pp_has_last_stage = True
+    optim.optimizers = torch.optim.SGD(optim.parameters, lr=0.001, momentum=0.9, foreach=False, fused=False)
+    optim.lr_schedulers = Scheduler(optim.optimizers, step_size=1, gamma=0.9)
+    optim.ema = None
+    optim._run_update = optim._update
     saves = []
 
     def save(curr_step, last_step=False):
         saves.append((curr_step, last_step))
         return True
 
-    trainer.checkpointer = SimpleNamespace(maybe_wait_for_staging=lambda: None, save=save, saves=saves)
-
-    def process(inputs, labels):
-        trainer.ntokens_seen += labels.numel()
-        return inputs["input"], labels, {}
-
-    trainer.post_dataloading_process = process
+    runtime.checkpointer = SimpleNamespace(maybe_wait_for_staging=lambda: None, save=save, saves=saves)
     if compile_backend is not None:
-        trainer.config.compile = SimpleNamespace(enable=True, components=["model"], backend=compile_backend)
-        trainer.model_parts[0].compile(backend=compile_backend, fullgraph=True)
+        trainer.config.compile = CompileConfig(model=ModelCompileConfig(backend=compile_backend))
+        runtime.model_parts[0].compile(backend=compile_backend, fullgraph=True)
     trainer.anticipatory_schedule = AnticipatorySchedule(trainer)
+    runtime.anticipatory_schedule = trainer.anticipatory_schedule
     cache = trainer.anticipatory_schedule.cache
     trained = []
 
-    def forward_backward(self, *, input_dict, labels, global_valid_tokens):
-        index = int(labels.item())
-        trained.append((self.step, index, cache.mode))
-        inputs, _, _ = self.post_dataloading_process(input_dict, labels)
-        loss = self.model_parts[0](inputs).square().sum() / global_valid_tokens
-        loss.backward()
-        return loss
+    def loss_fn(prediction, labels, *, global_valid_tokens):
+        trained.append((runtime.num_completed_steps + 1, int(labels.item()), cache.mode))
+        return prediction.square().sum() / global_valid_tokens, {}
 
-    monkeypatch.setattr(Trainer, "forward_backward_step", forward_backward)
+    runtime.loss_fn = loss_fn
     return trainer, trained
 
 
 def run_step(trainer):
-    trainer.step += 1
-    trainer.train_step(trainer.batch_generator(trainer.dataloader))
+    trainer.train_step(trainer.microbatch_generator(trainer.dataloader))
 
 
 def snapshot(trainer):
-    return deepcopy({
-        "model": trainer.model_parts[0].state_dict(),
-        "optimizer": trainer.optimizers.state_dict(),
-        "scheduler": trainer.lr_schedulers.state_dict(),
-        "data": trainer.dataloader.state_dict(),
-        "step": trainer.step,
-        "tokens": trainer.ntokens_seen,
-    })
+    return deepcopy(
+        {
+            "model": trainer.engine.model_parts[0].state_dict(),
+            "optimizer": trainer.engine.optim.optimizers.state_dict(),
+            "scheduler": trainer.engine.optim.lr_schedulers.state_dict(),
+            "data": trainer.dataloader.state_dict(),
+            "step": trainer.engine.num_completed_steps,
+            "tokens": trainer.engine.ntokens_seen,
+        }
+    )
 
 
 def install_checkpoint(trainer, saved):
     """In-memory checkpoint boundary; exercise the real engine rollback path."""
+
     def load(*, step):
         assert step == saved["step"]
-        trainer.model_parts[0].load_state_dict(saved["model"])
-        trainer.optimizers.load_state_dict(saved["optimizer"])
-        trainer.lr_schedulers.load_state_dict(saved["scheduler"])
+        trainer.engine.model_parts[0].load_state_dict(saved["model"])
+        trainer.engine.optim.optimizers.load_state_dict(saved["optimizer"])
+        trainer.engine.optim.lr_schedulers.load_state_dict(saved["scheduler"])
         trainer.dataloader.load_state_dict(saved["data"])
-        trainer.step = saved["step"]
-        trainer.ntokens_seen = saved["tokens"]
+        trainer.engine.num_completed_steps = saved["step"]
+        trainer.engine.ntokens_seen = saved["tokens"]
         return True
 
-    trainer.checkpointer.load = load
-    trainer.checkpointer.maybe_wait_for_saving = lambda: None
+    trainer.engine.checkpointer.load = load
+    trainer.engine.checkpointer.maybe_wait_for_saving = lambda: None
 
 
 def test_rollback_restores_training_state_and_restarts_iterator(monkeypatch):
     trainer, trained = make_trainer(monkeypatch)
-    stream = trainer.batch_generator(trainer.dataloader)
+    stream = trainer.microbatch_generator(trainer.dataloader)
     for _ in range(2):
         run_step(trainer)
     saved = snapshot(trainer)
@@ -201,14 +246,14 @@ def test_rollback_restores_training_state_and_restarts_iterator(monkeypatch):
     run_step(trainer)
     old_iterator = stream.iterator
     assert trainer.dataloader.position == 8
-    assert trainer.lr_schedulers.last_epoch == 4
-    assert not torch.equal(trainer.model_parts[0].weight, saved["model"]["weight"])
+    assert trainer.engine.optim.lr_schedulers.last_epoch == 4
+    assert not torch.equal(trainer.engine.model_parts[0].weight, saved["model"]["weight"])
 
     trainer.anticipatory_schedule.engine.rollback_to(2)
     torch.testing.assert_close(snapshot(trainer), saved, rtol=0, atol=0)
-    assert all(p.grad is None for p in trainer.model_parts[0].parameters())
+    assert all(p.grad is None for p in trainer.engine.model_parts[0].parameters())
     assert stream.iterator is None
-    assert trainer.batch_generator(trainer.dataloader) is stream
+    assert trainer.microbatch_generator(trainer.dataloader) is stream
 
     # The abandoned iterator has its own cursor: without reset it would yield 8.
     run_step(trainer)
@@ -219,7 +264,7 @@ def test_rollback_restores_training_state_and_restarts_iterator(monkeypatch):
 
 def test_multiple_microbatches_replay_their_own_layer_routes(monkeypatch):
     trainer, _ = make_trainer(monkeypatch)
-    model = trainer.model_parts[0]
+    model = trainer.engine.model_parts[0]
     model.second_router = deepcopy(model.router)
     cache = build_routing_cache([model], index_store_dtype="auto")
     trainer.anticipatory_schedule.cache = cache
@@ -251,7 +296,8 @@ def test_multiple_microbatches_replay_their_own_layer_routes(monkeypatch):
         recorded.append(expected)
 
     consumed = []
-    def forward_backward(self, *, input_dict, labels, global_valid_tokens):
+
+    def forward_backward(self, *, inputs, labels, model_kwargs, loss_kwargs):
         microbatch = int(labels.item())
         for layer, router in enumerate(routers):
             expected = recorded[microbatch][layer]
@@ -271,16 +317,19 @@ def test_multiple_microbatches_replay_their_own_layer_routes(monkeypatch):
             consumed.append((microbatch, layer))
         return torch.tensor(1.0)
 
-    monkeypatch.setattr(Trainer, "forward_backward_step", forward_backward)
+    monkeypatch.setattr(TrainingEngine, "_non_pp_forward_backward_microbatch", forward_backward)
     engine = trainer.anticipatory_schedule.engine
     engine.begin_step()
     engine.in_step = True
     try:
         cache.begin_training(slots)
         for microbatch in range(2):
-            # The real TrainerEx wrapper must select the right slot.
-            trainer.forward_backward_step(
-                input_dict={}, labels=torch.tensor(microbatch), global_valid_tokens=torch.tensor(1)
+            # The real NPU engine wrapper must select the right slot.
+            trainer.engine._non_pp_forward_backward_microbatch(
+                inputs={},
+                labels=torch.tensor(microbatch),
+                model_kwargs={},
+                loss_kwargs={"global_valid_tokens": torch.tensor(1)},
             )
     finally:
         cache.reset()
@@ -294,8 +343,8 @@ def test_multiple_microbatches_replay_their_own_layer_routes(monkeypatch):
 def test_spike_recovery_warmup_active_drain_and_normal(monkeypatch):
     trainer, trained = make_trainer(monkeypatch, active=2, steps=8)
     engine, schedule = trainer.anticipatory_schedule.engine, trainer.anticipatory_schedule
-    saves = trainer.checkpointer.saves
-    assert trainer.checkpointer.save(curr_step=0)
+    saves = trainer.engine.checkpointer.saves
+    assert trainer.engine.checkpointer.save(curr_step=0)
     observations = []
 
     def observe_spike(step, loss):
@@ -304,7 +353,7 @@ def test_spike_recovery_warmup_active_drain_and_normal(monkeypatch):
 
     # Inject a detector verdict to exercise recovery without a manual-trigger config.
     monkeypatch.setattr(schedule.detector, "observe", observe_spike)
-    router = trainer.model_parts[0].router
+    router = trainer.engine.model_parts[0].router
     recorded_ids, replayed_ids = [], []
 
     def change_live_choice(module, args):
@@ -326,15 +375,15 @@ def test_spike_recovery_warmup_active_drain_and_normal(monkeypatch):
     router_hook = router.register_forward_hook(observe_routes)
     monkeypatch.setattr(engine, "find_rollback_target", lambda onset: 2 if onset == 4 else None)
     updates = []
-    original_step = trainer.optimizers.step
+    original_step = trainer.engine.optim.optimizers.step
 
     def count_update(*args, **kwargs):
-        updates.append(trainer.step)
+        updates.append(trainer.engine.num_completed_steps + 1)
         return original_step(*args, **kwargs)
 
     # Install after scheduler construction; preserve its optimizer-step marker.
     count_update._wrapped_by_lr_sched = True
-    monkeypatch.setattr(trainer.optimizers, "step", count_update)
+    monkeypatch.setattr(trainer.engine.optim.optimizers, "step", count_update)
     for _ in range(2):
         run_step(trainer)
     saved = snapshot(trainer)
@@ -349,28 +398,29 @@ def test_spike_recovery_warmup_active_drain_and_normal(monkeypatch):
     restored = deepcopy(saved)
     restored.pop("data")
     torch.testing.assert_close(after_warmup, restored, rtol=0, atol=0)
-    assert all(module.training for part in trainer.model_parts for module in part.modules())
+    assert all(module.training for part in trainer.engine.model_parts for module in part.modules())
     assert schedule.phase is Phase.ACTIVE
     assert len(schedule._queue) == 2
-    assert [[int(labels.item()) for _, labels in entry.microbatches]
-            for entry in schedule._queue] == [[4, 5], [6, 7]]
+    assert [[int(batch.labels.item()) for batch in entry.microbatches] for entry in schedule._queue] == [[4, 5], [6, 7]]
     assert all(entry.slots and len(entry.slots) == 2 for entry in schedule._queue)
     for entry in schedule._queue:
-        for inputs, labels in entry.microbatches:
-            assert inputs["input"].device.type == labels.device.type == "cpu"
+        for batch in entry.microbatches:
+            assert batch.inputs["input"].device.type == batch.labels.device.type == "cpu"
         for slot in entry.slots:
-            assert all(ids.device == trainer.device for ids in slot.values())
+            assert all(ids.device == trainer.engine.device for ids in slot.values())
     assert engine.suppress_checkpoint_saves
-    assert not trainer.checkpointer.save(curr_step=trainer.step)
+    assert not trainer.engine.checkpointer.save(curr_step=trainer.engine.num_completed_steps)
 
     phases, lengths, positions, suppressed = [], [], [], []
-    while trainer.step < 8:
+    while trainer.engine.num_completed_steps < 8:
         run_step(trainer)
         phases.append(schedule.phase)
         lengths.append(len(schedule._queue))
         positions.append(trainer.dataloader.position)
         suppressed.append(engine.suppress_checkpoint_saves)
-        assert trainer.checkpointer.save(trainer.step) is (not engine.suppress_checkpoint_saves)
+        assert trainer.engine.checkpointer.save(trainer.engine.num_completed_steps) is (
+            not engine.suppress_checkpoint_saves
+        )
 
     assert phases == [Phase.ACTIVE, Phase.DRAIN, Phase.DRAIN, Phase.NORMAL, Phase.NORMAL, Phase.NORMAL]
     assert lengths == [2, 2, 1, 0, 0, 0]
@@ -381,9 +431,9 @@ def test_spike_recovery_warmup_active_drain_and_normal(monkeypatch):
     assert trainer.dataloader.reads == list(range(8)) + list(range(4, 16))
     assert updates == [1, 2, 3, 4, 3, 4, 5, 6, 7, 8]
     assert schedule.detector._completed_updates == len(updates)
-    assert trainer.lr_schedulers.last_epoch == 8
-    assert trainer.ntokens_seen == 16
-    assert trainer.model_parts[0].counter.item() == 16
+    assert trainer.engine.optim.lr_schedulers.last_epoch == 8
+    assert trainer.engine.ntokens_seen == 16
+    assert trainer.engine.model_parts[0].counter.item() == 16
     assert schedule._num_rollbacks == 1
     assert observations == [1, 2, 3, 4, 6, 7, 8]
     assert not schedule._queue
@@ -408,7 +458,7 @@ def test_replay_failure_cleans_state_and_blocks_checkpoint(monkeypatch):
             assert schedule.cache.slot is not None
             raise failure
 
-    handle = trainer.model_parts[0].register_forward_pre_hook(fail_forward)
+    handle = trainer.engine.model_parts[0].register_forward_pre_hook(fail_forward)
     try:
         with pytest.raises(RuntimeError) as caught:
             run_step(trainer)
@@ -419,8 +469,8 @@ def test_replay_failure_cleans_state_and_blocks_checkpoint(monkeypatch):
     assert not schedule._queue
     assert schedule.cache.mode is RoutingMode.OFF
     assert schedule.cache.slot is None and schedule.cache.step_slots is None
-    assert trainer.checkpointer.save(trainer.step, last_step=True) is False
-    assert trainer.checkpointer.saves == []
+    assert trainer.engine.checkpointer.save(trainer.engine.num_completed_steps, last_step=True) is False
+    assert trainer.engine.checkpointer.saves == []
 
 
 @pytest.mark.parametrize("stage", ["initialization", "capture", "snapshot"])
@@ -428,8 +478,8 @@ def test_recording_failure_resets_routing_before_next_forward(monkeypatch, stage
     trainer, _ = make_trainer(monkeypatch)
     schedule = trainer.anticipatory_schedule
     engine, cache = schedule.engine, schedule.cache
-    model = trainer.model_parts[0]
-    batch = ({"input": torch.ones(1, 1, 2)}, torch.zeros(1))
+    model = trainer.engine.model_parts[0]
+    batch = Microbatch({"input": torch.ones(1, 1, 2)}, torch.zeros(1))
     if stage != "initialization":
         engine.initialize_routing(cache, batch)
     before = deepcopy(model.state_dict())
@@ -470,12 +520,12 @@ def test_rollback_target_skips_checkpoint_without_optimizer(monkeypatch, tmp_pat
 
     trainer, _ = make_trainer(monkeypatch)
     engine = trainer.anticipatory_schedule.engine
-    trainer.checkpointer.folder = str(tmp_path)
-    trainer.checkpointer.states = {MODEL: trainer.model_parts[0]}
-    trainer.checkpointer.maybe_wait_for_saving = lambda: None
+    trainer.engine.checkpointer.folder = str(tmp_path)
+    trainer.engine.checkpointer.states = {MODEL: trainer.engine.model_parts[0]}
+    trainer.engine.checkpointer.maybe_wait_for_saving = lambda: None
     for step in (2, 4):
         (tmp_path / f"step-{step}").mkdir()
-    complete = dict.fromkeys(trainer.model_parts[0].state_dict())
+    complete = dict.fromkeys(trainer.engine.model_parts[0].state_dict())
     complete.update({f"{key}.leaf": None for key in engine._required_states()})
     incomplete = {key: value for key, value in complete.items() if not key.startswith(OPTIMIZER + ".")}
 
@@ -487,16 +537,16 @@ def test_rollback_target_skips_checkpoint_without_optimizer(monkeypatch, tmp_pat
     assert engine.find_rollback_target(6) == 2
 
 
-def test_batch_generator_rejects_foreign_loader(monkeypatch):
+def test_microbatch_generator_rejects_foreign_loader(monkeypatch):
     trainer, _ = make_trainer(monkeypatch)
     with pytest.raises(ValueError, match="resumable dataloader"):
-        trainer.batch_generator(Loader())
+        trainer.microbatch_generator(Loader())
 
 
 def test_replay_rejects_broadcastable_wrong_shape(monkeypatch):
     trainer, _ = make_trainer(monkeypatch)
     schedule = trainer.anticipatory_schedule
-    router = trainer.model_parts[0].router
+    router = trainer.engine.model_parts[0].router
     try:
         schedule.cache.begin_initialization()
         router(torch.ones(3, 2))
@@ -600,7 +650,7 @@ def test_compiled_routes_share_graphs_across_layers_modes_and_microbatches(
 
         def forward(self, x):
             self.counter.add_(1)
-            scores, ids, _ = self.router(x)
+            scores, ids, _ = self.router(x.reshape(-1, x.shape[-1]))
             # Both expert choice and live gate gradients affect the result.
             # Concatenation keeps the two-feature residual layout without a
             # broadcast reduction in backward (older NPU lowering lacks strict_sum).
@@ -610,9 +660,7 @@ def test_compiled_routes_share_graphs_across_layers_modes_and_microbatches(
     class ManyBlocks(nn.Module):
         def __init__(self):
             super().__init__()
-            self.layers = nn.ModuleList([
-                checkpoint_wrapper(Block()) if full_ac else Block() for _ in range(40)
-            ])
+            self.layers = nn.ModuleList([checkpoint_wrapper(Block()) if full_ac else Block() for _ in range(40)])
 
         def preprocess_inputs(self, batch, **kwargs):
             return batch["input"], batch["labels"], {}
@@ -641,17 +689,13 @@ def test_compiled_routes_share_graphs_across_layers_modes_and_microbatches(
 
     def make_engine(module):
         engine = object.__new__(AnticipatoryTrainingEngine)
-        engine.trainer = SimpleNamespace(
-            model_parts=[module], device=torch.device(device), ntokens_seen=0,
-            train_context=nullcontext, parallel_dims=SimpleNamespace(), config=SimpleNamespace(parallelism=SimpleNamespace()),
-            post_dataloading_process=lambda inputs, labels: (inputs["input"], labels, {}),
-        )
+        engine.runtime = make_runtime(module, device=device)
         return engine
 
     def update(module, routing, inputs, slots=None, index=0):
         module.zero_grad(set_to_none=True)
         inputs = inputs.detach().clone().requires_grad_()
-        make_engine(module).initialize_routing(routing, ({"input": inputs}, torch.zeros(1)))
+        make_engine(module).initialize_routing(routing, Microbatch({"input": inputs}, torch.zeros(1)))
         try:
             routing.begin_training(slots)
             routing.select(index)
@@ -665,7 +709,8 @@ def test_compiled_routes_share_graphs_across_layers_modes_and_microbatches(
         tolerance = {"rtol": 1e-5, "atol": 1e-6} if backend_name == "inductor" else {"rtol": 0, "atol": 0}
         torch.testing.assert_close(
             update(model, cache, inputs, slots, index),
-            update(reference, reference_cache, inputs, slots, index), **tolerance,
+            update(reference, reference_cache, inputs, slots, index),
+            **tolerance,
         )
         for actual, expected in zip(model.parameters(), reference.parameters(), strict=True):
             torch.testing.assert_close(actual.grad, expected.grad, **tolerance)
@@ -678,7 +723,7 @@ def test_compiled_routes_share_graphs_across_layers_modes_and_microbatches(
         slot = {}
         try:
             cache.begin_capture(slot)
-            engine.forward_only_microbatch(({"input": inputs}, torch.zeros(1)))
+            engine.forward_only_microbatch(Microbatch({"input": inputs}, torch.zeros(1)))
             cache.save_captured_routes()
         finally:
             cache.reset()
@@ -687,22 +732,23 @@ def test_compiled_routes_share_graphs_across_layers_modes_and_microbatches(
         expected = {}
         try:
             reference_cache.begin_capture(expected)
-            make_engine(reference).forward_only_microbatch(({"input": inputs}, torch.zeros(1)))
+            make_engine(reference).forward_only_microbatch(Microbatch({"input": inputs}, torch.zeros(1)))
             reference_cache.save_captured_routes()
         finally:
             reference_cache.reset()
         torch.testing.assert_close(list(slot.values()), list(expected.values()), rtol=0, atol=0)
         assert len(slot) == 40
         assert all(ids.dtype == torch.int16 for ids in slot.values())
-        assert all(slot[key].data_ptr() != buffer.capture_indices.data_ptr()
-                   for key, buffer in cache.replay_buffers.items())
+        assert all(
+            slot[key].data_ptr() != buffer.capture_indices.data_ptr() for key, buffer in cache.replay_buffers.items()
+        )
         return slot
 
     try:
         first = torch.tensor([[[2.0, -2.0]]], device=device)
         second = first.flip(-1)
         before = deepcopy(model.state_dict())
-        make_engine(model).initialize_routing(cache, ({"input": first}, torch.zeros(1)))
+        make_engine(model).initialize_routing(cache, Microbatch({"input": first}, torch.zeros(1)))
         torch.testing.assert_close(model.state_dict(), before, rtol=0, atol=0)
         assert not graphs  # Shape initialization is isolated, eager and runs only once.
         compare_update(first)
@@ -792,12 +838,8 @@ def test_capture_compile_failure_preserves_upstream_entry_and_state():
     had_forward = "forward" in model.__dict__
 
     engine = object.__new__(AnticipatoryTrainingEngine)
-    engine.trainer = SimpleNamespace(
-        model_parts=[model], device=torch.device("cpu"), ntokens_seen=7,
-        train_context=nullcontext, parallel_dims=SimpleNamespace(), config=SimpleNamespace(parallelism=SimpleNamespace()),
-        post_dataloading_process=lambda inputs, labels: (inputs["input"], labels, {}),
-    )
-    batch = ({"input": torch.ones(1, 3, 2)}, torch.zeros(1))
+    engine.runtime = make_runtime(model, ntokens_seen=7)
+    batch = Microbatch({"input": torch.ones(1, 3, 2)}, torch.zeros(1))
     before = deepcopy(model.state_dict())
     rng = torch.get_rng_state().clone()
     slot = {}
@@ -815,7 +857,7 @@ def test_capture_compile_failure_preserves_upstream_entry_and_state():
         assert ("forward" in model.__dict__) == had_forward
         assert cache.mode is RoutingMode.OFF and cache.slot is None
         assert slot == {}
-        assert engine.trainer.ntokens_seen == 7
+        assert engine.runtime.ntokens_seen == 7
         torch.testing.assert_close(model.state_dict(), before, rtol=0, atol=0)
         torch.testing.assert_close(torch.get_rng_state(), rng, rtol=0, atol=0)
     finally:
@@ -838,12 +880,8 @@ def test_compiled_capture_preserves_hooks_and_rng():
     cache = build_routing_cache([model], index_store_dtype="auto", device=torch.device("cpu"))
     model.compile(backend="aot_eager", fullgraph=True)
     engine = object.__new__(AnticipatoryTrainingEngine)
-    engine.trainer = SimpleNamespace(
-        model_parts=[model], device=torch.device("cpu"), ntokens_seen=7,
-        train_context=nullcontext, parallel_dims=SimpleNamespace(), config=SimpleNamespace(parallelism=SimpleNamespace()),
-        post_dataloading_process=lambda inputs, labels: (inputs["input"], labels, {}),
-    )
-    batch = ({"input": torch.tensor([[[2.0, -2.0]]])}, torch.zeros(1))
+    engine.runtime = make_runtime(model, ntokens_seen=7)
+    batch = Microbatch({"input": torch.tensor([[[2.0, -2.0]]])}, torch.zeros(1))
     rng = torch.get_rng_state().clone()
     before = deepcopy(model.state_dict())
     try:
@@ -859,7 +897,7 @@ def test_compiled_capture_preserves_hooks_and_rng():
         assert torch.all(slot[model.router._anticipatory_key] == 1)
         torch.testing.assert_close(torch.get_rng_state(), rng, rtol=0, atol=0)
         torch.testing.assert_close(model.state_dict(), before, rtol=0, atol=0)
-        assert engine.trainer.ntokens_seen == 7 and model.training
+        assert engine.runtime.ntokens_seen == 7 and model.training
     finally:
         hook.remove()
         torch._dynamo.reset()
@@ -901,13 +939,13 @@ def test_compiled_spike_recovery_runs_capture_and_replay_without_recompiling(mon
         # Once recovery has started, do not inject another synthetic verdict.
         monkeypatch.setattr(schedule.detector, "observe", lambda step, loss: None)
         phases = []
-        while trainer.step < 8:
+        while trainer.engine.num_completed_steps < 8:
             run_step(trainer)
             phases.append(schedule.phase)
         assert phases == [Phase.ACTIVE, Phase.DRAIN, Phase.DRAIN, Phase.NORMAL, Phase.NORMAL, Phase.NORMAL]
         assert len(graphs) == graph_count
         assert schedule._num_rollbacks == 1 and not schedule._queue
-        assert trainer.ntokens_seen == 16 and trainer.model_parts[0].counter.item() == 16
+        assert trainer.engine.ntokens_seen == 16 and trainer.engine.model_parts[0].counter.item() == 16
         assert [index for _, index, _ in trained] == list(range(8)) + list(range(4, 16))
         assert torch._dynamo.config.recompile_limit == 8
     finally:
@@ -951,12 +989,8 @@ def test_compiled_capture_keeps_disabled_hooks_outside_graph(monkeypatch, full_a
     model.compile(backend="aot_eager", fullgraph=True)
     original_compiled = model._compiled_call_impl
     engine = object.__new__(AnticipatoryTrainingEngine)
-    engine.trainer = SimpleNamespace(
-        model_parts=[model], device=torch.device("cpu"), ntokens_seen=7,
-        train_context=nullcontext, parallel_dims=SimpleNamespace(), config=SimpleNamespace(parallelism=SimpleNamespace()),
-        post_dataloading_process=lambda inputs, labels: (inputs["input"], labels, {}),
-    )
-    batch = ({"input": torch.tensor([[[2.0, -2.0]]])}, torch.zeros(1))
+    engine.runtime = make_runtime(model, ntokens_seen=7)
+    batch = Microbatch({"input": torch.tensor([[[2.0, -2.0]]])}, torch.zeros(1))
     before = deepcopy(model.state_dict())
     try:
         engine.initialize_routing(cache, batch)
@@ -975,9 +1009,9 @@ def test_compiled_capture_keeps_disabled_hooks_outside_graph(monkeypatch, full_a
             assert ("forward" in model.__dict__) == instance_forward
             torch.testing.assert_close(model.state_dict(), before, rtol=0, atol=0)
         assert events == ["pre", "post", "pre", "post"]
-        assert engine.trainer.ntokens_seen == 7 and model.training
+        assert engine.runtime.ntokens_seen == 7 and model.training
         # The same upstream entry must still execute hooks and backward.
-        model(batch[0]["input"]).sum().backward()
+        model(batch.inputs["input"]).sum().backward()
         assert events[-2:] == ["pre", "post"]
         assert all(parameter.grad is not None for parameter in model.parameters())
     finally:

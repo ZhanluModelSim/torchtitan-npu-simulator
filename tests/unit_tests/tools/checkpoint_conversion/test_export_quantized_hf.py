@@ -581,8 +581,10 @@ def _dsv4_like_config():
     def moe(layer_id):
         return _NS(
             num_experts=4,
-            router=_NS(top_k=2, layer_id=layer_id, n_hash_layers=2, score_func="sigmoid", route_scale=2.5, route_norm=True),
-            routed_experts=_NS(inner_experts=_NS(hidden_dim=128, swiglu_limit=10.0)),
+            router=_NS(
+                top_k=2, layer_id=layer_id, n_hash_layers=2, score_func="sigmoid", route_scale=2.5, route_norm=True
+            ),
+            routed_experts=_NS(w13=_NS(out_features=128), activation_fn=_NS(swiglu_limit=10.0)),
             shared_experts=_NS(),
         )
 

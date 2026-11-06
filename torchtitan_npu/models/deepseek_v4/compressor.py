@@ -107,10 +107,10 @@ class Compressor(Module):
         self.ape = nn.Parameter(torch.empty(cfg.compress_ratio, self.wkv.out_features, dtype=torch.float32))
         self.carry_exchange = cfg.carry_exchange.build()
 
-    def parallelize(self, parallel_dims) -> None:
+    def _parallelize(self, parallelism_context) -> None:
         """Take the CP mesh the framework hands down to every module."""
-        self.group = parallel_dims.get_optional_mesh("cp")
-        super().parallelize(parallel_dims)
+        self.group = parallelism_context.get_optional_mesh("cp")
+        super()._parallelize(parallelism_context)
 
     @staticmethod
     def _overlap_transform(

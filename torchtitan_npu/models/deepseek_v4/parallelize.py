@@ -12,7 +12,6 @@ from typing import TYPE_CHECKING
 import torch
 from torch.distributed.fsdp import MixedPrecisionPolicy
 from torchtitan.config import TORCH_DTYPE_MAP, TrainingConfig
-from torchtitan.distributed.utils import get_spmd_backend
 from torchtitan.experiments.graph_trainer.common_utils import (
     annotate_module_fqns,
     annotate_moe_ep_regions,
@@ -22,19 +21,17 @@ from torchtitan.experiments.graph_trainer.common_utils import (
 from torchtitan.experiments.graph_trainer.compile import (
     apply_compile as apply_graph_trainer_compile,
 )
-from torchtitan.models.deepseek_v3.parallelize import parallelize_deepseekv3
 
-from torchtitan_npu.models.common.compile_policy import skip_compile_under_cp
+from torchtitan_npu.models.common.compile_policy import parallelize_with_model_compile, skip_compile_under_cp
 from torchtitan_npu.patches.torch.distributed.fsdp import policy_overrides
 
-from .lora import is_lora_parameter
-
 if TYPE_CHECKING:
-    from torchtitan.config import CompileConfig, ParallelismConfig
-    from torchtitan.distributed import ParallelDims
+    from torchtitan.config.parallelism import ParallelismConfig
     from torchtitan.distributed.activation_checkpoint import ActivationCheckpointingConfig
+    from torchtitan.distributed.parallelism_context import ParallelismContext
     from torchtitan.experiments.graph_trainer.configs import GraphTrainerCompileConfig
 
+    from torchtitan_npu.config import CompileConfig
     from torchtitan_npu.models.deepseek_v4.model import (
         DeepSeekV4Model,
         GraphTrainerDeepSeekV4Model,
@@ -95,29 +92,27 @@ def _dsv4_fp32_overrides(
 def parallelize_deepseek_v4(
     model: DeepSeekV4Model,
     *,
-    parallel_dims: ParallelDims,
+    parallelism_context: ParallelismContext,
     training: TrainingConfig,
     parallelism: ParallelismConfig,
-    compile_config: CompileConfig,
+    compile_config: CompileConfig | None,
     ac_config: ActivationCheckpointingConfig,
     dump_folder: str,
+    skip_dp: bool = False,
 ):
     """Apply DSV4 parallelism with per-parameter FP32 SmoE policies."""
-    compile_config = skip_compile_under_cp(model, compile_config, parallel_dims)
+    compile_config = skip_compile_under_cp(model, compile_config, parallelism_context)
     with policy_overrides(_dsv4_fp32_overrides(model, training)):
-        parallelized_model = parallelize_deepseekv3(
+        parallelized_model = parallelize_with_model_compile(
             model,
-            parallel_dims=parallel_dims,
+            parallelism_context=parallelism_context,
             training=training,
             parallelism=parallelism,
             compile_config=compile_config,
             ac_config=ac_config,
             dump_folder=dump_folder,
+            skip_dp=skip_dp,
         )
-    if getattr(parallelized_model, "lora_config", None) is not None:
-        for name, parameter in parallelized_model.named_parameters():
-            if not is_lora_parameter(name):
-                parameter.requires_grad_(False)
     return parallelized_model
 
 
@@ -137,45 +132,46 @@ def annotate_deepseek_v4(model: GraphTrainerDeepSeekV4Model) -> None:
 def parallelize_graph_trainer_deepseek_v4(
     model: GraphTrainerDeepSeekV4Model,
     *,
-    parallel_dims: ParallelDims,
+    parallelism_context: ParallelismContext,
     training: TrainingConfig,
     parallelism: ParallelismConfig,
     compile_config: GraphTrainerCompileConfig,
     ac_config: ActivationCheckpointingConfig,
     dump_folder: str,
 ):
-    # TP currently cannot handle uneven seq_len because we set
-    # ``use_local_output=True`` to use plain Tensors for legacy reasons.
-    assert training.num_tokens_per_microbatch_per_dp_rank % parallel_dims.seq_len_divisor == 0, f"""
-        Sequence length {training.num_tokens_per_microbatch_per_dp_rank} must be divisible by the product of TP degree
-        ({parallel_dims.tp}) and 2 * CP degree ({parallel_dims.cp}), i.e. {parallel_dims.seq_len_divisor}.
-        """
+    token_divisor = parallelism_context.cp * (
+        parallelism_context.tp if parallelism_context.enable_sequence_parallel else 1
+    )
+    token_budget = training.num_tokens_per_microbatch_per_dp_rank
+    assert token_budget % token_divisor == 0, (
+        f"Token budget {token_budget} must be divisible by the activation sharding degree {token_divisor}."
+    )
 
     # DeepSeek V4 sparse attention does not yet support context parallelism.
-    if parallel_dims.cp_enabled:
+    if parallelism_context.cp_enabled:
         raise NotImplementedError(
             "Context Parallel is not yet supported for DeepSeek V4 sparse attention in the GraphTrainer path."
         )
 
     annotate_deepseek_v4(model)
 
-    if get_spmd_backend() == "spmd_types" or parallel_dims.tp_enabled or parallel_dims.ep_enabled:
-        model.parallelize(parallel_dims)
+    # SPMD declarations must be resolved even when every model-parallel axis is
+    # singleton; the non-graph path applies the same unconditional lifecycle.
+    with parallelism_context.activate_spmd():
+        model._parallelize(parallelism_context)
 
     # Apply simple_fsdp unconditionally. The ``fsdp`` mesh always exists with a
-    # real backend (see ParallelDims._mesh_exist), even at degree 1, so that
+    # real backend (see ParallelismContext._mesh_exist), even at degree 1, so that
     # MixedPrecisionPolicy's param_dtype cast still applies in single-GPU runs.
     # pyrefly: ignore [bad-assignment]
-    model = apply_simple_fsdp(model, parallel_dims=parallel_dims, training=training)
+    model = apply_simple_fsdp(model, parallelism_context=parallelism_context, training=training)
 
     # Apply compilation based on mode
     # pyrefly: ignore [bad-assignment]
     model = apply_graph_trainer_compile(
         model,
         compile_config=compile_config,
-        parallelism=parallelism,
-        parallel_dims=parallel_dims,
-        dump_folder=dump_folder,
+        parallelism_context=parallelism_context,
     )
 
     return model

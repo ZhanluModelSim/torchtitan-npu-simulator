@@ -26,7 +26,7 @@ def main():
     dist.init_process_group("gloo", timeout=timedelta(seconds=60))
     try:
         rank = dist.get_rank()
-        config = model_registry("deepseek_v4_1_debugmodel_text").model
+        config = model_registry("deepseek_v4_1_debugmodel_text")
         table = config.layers[1].engram.table
         table.head_vocab_sizes = (2, 3, 5, 7, 11, 13)
         table.num_embeddings = 48

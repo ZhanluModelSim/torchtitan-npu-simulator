@@ -15,13 +15,15 @@ Remove this module after the TorchTitan dependency includes the PR.
 
 from __future__ import annotations
 
+import logging
 from functools import wraps
 
 import torch
 import torch.fx as fx
 import torchtitan.experiments.graph_trainer.ep_overlap_pass as ep_overlap_pass
 from torchtitan.experiments.graph_trainer.common_utils import _EP_TOKEN_EXCHANGE
-from torchtitan.tools.logging import logger
+
+logger = logging.getLogger(__name__)
 
 
 def _is_token_exchange_shape_query(node: fx.Node, node_set: set[fx.Node]) -> bool:

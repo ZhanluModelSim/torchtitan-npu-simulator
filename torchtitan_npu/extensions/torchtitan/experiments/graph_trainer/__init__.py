@@ -8,14 +8,15 @@
 from dataclasses import dataclass, field
 
 from torchtitan.experiments.graph_trainer.configs import GraphTrainerCompileConfig
-from torchtitan.experiments.graph_trainer.trainer import GraphTrainer
+from torchtitan.experiments.graph_trainer.trainer import GraphTrainer, GraphTrainingEngine
 
 from torchtitan_npu.config import manager as config_manager
-from torchtitan_npu.config.configs import OptimizerConfig, TrainingConfig
+from torchtitan_npu.config.configs import OptimConfig, OptimizerConfig, TrainingConfig
 from torchtitan_npu.config.converters import TrainerConfigConverter
+from torchtitan_npu.extensions.torchtitan.components.checkpoint import CheckpointManager
 
 from ...tools.profiler import CANNProfiler
-from ...trainer import TrainerEx
+from ...trainer import NPUTrainingEngineMixin, TrainerEx
 from . import auto_overlap
 
 
@@ -29,8 +30,14 @@ def _apply_auto_overlap_runtime_context_patch(config) -> None:
     graph_trainer_runtime_context.apply()
 
 
+class NPUGraphTrainingEngine(NPUTrainingEngineMixin, GraphTrainingEngine):
+    """Keep GraphTrainingEngine ownership when adding NPU trainer features."""
+
+
 class GraphTrainerEx(TrainerEx, GraphTrainer):
     """GraphTrainer with the NPU behavior provided by :class:`TrainerEx`."""
+
+    engine_cls = NPUGraphTrainingEngine
 
     @dataclass(kw_only=True, slots=True)
     class Config(TrainerEx.Config, GraphTrainer.Config):
@@ -49,7 +56,9 @@ config_manager.register_config_converter(
     TrainerConfigConverter(
         target_type=GraphTrainerEx.Config,
         component_types={
-            "optimizer": OptimizerConfig,
+            "optim": OptimConfig,
+            "optim.optimizer": OptimizerConfig,
+            "checkpointer": CheckpointManager.Config,
             "profiler": CANNProfiler.Config,
             "training": TrainingConfig,
         },

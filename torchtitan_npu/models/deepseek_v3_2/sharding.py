@@ -18,7 +18,7 @@ from torchtitan.models.deepseek_v3.sharding import (
     _set_deepseek_v3_layer_sharding,
     _set_deepseek_v3_mtp_sharding,
 )
-from torchtitan.protocols.sharding import LocalMapConfig, ShardingConfig
+from torchtitan.protocols.sharding import ShardingConfig
 
 if TYPE_CHECKING:
     from torchtitan_npu.models.deepseek_v3_2.model import (
@@ -87,28 +87,28 @@ def _apply_v3_2_attention_sharding(
     inner_cfg = attention.inner_attention
     inner_cfg.sharding_config = ShardingConfig(
         in_src_shardings={
-            "q_nope_BLNH": dense_activation_placement(tp=spmd.S(2)),
-            "k_nope_BL1H": dense_activation_placement(tp=spmd.R),
-            "q_rope_BLNH": dense_activation_placement(tp=spmd.S(2)),
-            "k_rope_BL1H": dense_activation_placement(tp=spmd.R),
-            "idx_q_BLNH": dense_activation_placement(tp=spmd.S(2)),
+            "q_nope_BLNH": dense_activation_placement(tp=spmd.S(2), cp=spmd.S(0)),
+            "k_nope_BL1H": dense_activation_placement(tp=spmd.R, cp=spmd.S(0)),
+            "q_rope_BLNH": dense_activation_placement(tp=spmd.S(2), cp=spmd.S(0)),
+            "k_rope_BL1H": dense_activation_placement(tp=spmd.R, cp=spmd.S(0)),
+            "idx_q_BLNH": dense_activation_placement(tp=spmd.S(2), cp=spmd.S(0)),
             # ``spmd_types`` cannot redistribute TP and CP axes together.
             # ``Attention.forward`` supplies the TP ``R -> I`` transition.
-            "idx_k_BL1H": dense_activation_placement(tp=spmd.I),
-            "idx_w_BLN": dense_activation_placement(tp=spmd.R),
+            "idx_k_BL1H": dense_activation_placement(tp=spmd.I, cp=spmd.S(0)),
+            "idx_w_BLN": dense_activation_placement(tp=spmd.R, cp=spmd.S(0)),
         },
         in_dst_shardings={
-            "q_nope_BLNH": dense_activation_placement(tp=spmd.S(2)),
+            "q_nope_BLNH": dense_activation_placement(tp=spmd.S(2), cp=spmd.S(0)),
             "k_nope_BL1H": dense_activation_placement(tp=spmd.R, cp=spmd.R),
-            "q_rope_BLNH": dense_activation_placement(tp=spmd.S(2)),
+            "q_rope_BLNH": dense_activation_placement(tp=spmd.S(2), cp=spmd.S(0)),
             "k_rope_BL1H": dense_activation_placement(tp=spmd.R, cp=spmd.R),
-            "idx_q_BLNH": dense_activation_placement(tp=spmd.I),
+            "idx_q_BLNH": dense_activation_placement(tp=spmd.I, cp=spmd.S(0)),
             "idx_k_BL1H": dense_activation_placement(tp=spmd.I, cp=spmd.R),
-            "idx_w_BLN": dense_activation_placement(tp=spmd.I),
+            "idx_w_BLN": dense_activation_placement(tp=spmd.I, cp=spmd.S(0)),
         },
-        out_src_shardings=dense_activation_placement(tp=spmd.S(2)),
+        out_src_shardings=dense_activation_placement(tp=spmd.S(2), cp=spmd.S(0)),
         # ``spmd_types`` derives input-gradient types from forward destinations.
-        local_map=LocalMapConfig(in_grad_placements=None),
+        local_spmd=True,
     )
 
     indexer_loss_cfg = (
@@ -117,11 +117,11 @@ def _apply_v3_2_attention_sharding(
     indexer_loss_cfg.sharding_config = ShardingConfig(
         state_shardings={"instance_acc": dense_param_placement(tp=spmd.I)},
         in_src_shardings={
-            "q_BLNH": dense_activation_placement(tp=spmd.S(2)),
+            "q_BLNH": dense_activation_placement(tp=spmd.S(2), cp=spmd.S(0)),
             "k_BL1H": dense_activation_placement(tp=spmd.R, cp=spmd.R),
         },
         in_dst_shardings={
-            "q_BLNH": dense_activation_placement(tp=spmd.I),
+            "q_BLNH": dense_activation_placement(tp=spmd.I, cp=spmd.S(0)),
             "k_BL1H": dense_activation_placement(tp=spmd.I, cp=spmd.R),
         },
     )

@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from bisect import bisect_left, bisect_right
 from collections import defaultdict
 from contextlib import contextmanager
@@ -20,7 +21,6 @@ import torch.fx as fx
 import torch_npu
 from torch.utils import _pytree
 from torchtitan.experiments.graph_trainer.make_fx_tracer import run_traced
-from torchtitan.tools.logging import logger
 
 from .utils import (
     _collective_group_ordinals,
@@ -32,6 +32,8 @@ from .utils import (
     isolated_cann_profiler_work_path,
     node_id,
 )
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from collections.abc import Iterator

@@ -16,7 +16,7 @@ from torch.distributed.checkpoint.state_dict_saver import _stateful_to_state_dic
 pytest.importorskip("torch_checkpointing")
 
 from torch_checkpointing.storage.filesystem import LocalFileSystemStorageConfig
-from torchtitan.components.optimizer import LRSchedulersContainer, OptimizersContainer, ParamGroupConfig
+from torchtitan.components.optim import AdamW, LRSchedulersContainer, OptimizersContainer
 
 from torchtitan_npu.extensions.torchtitan.components.torch_checkpointing import TorchCheckpointingManager
 
@@ -46,13 +46,11 @@ def test_native_config_restores_full_state_after_async_and_final_save(tmp_path, 
         with torch.random.fork_rng(devices=[]):
             model = torch.nn.Linear(2, 1, bias=False)
         optimizers = OptimizersContainer.Config(
-            implementation="for-loop",
-            param_groups=[ParamGroupConfig(pattern=".*", optimizer_name="AdamW", optimizer_kwargs={"lr": 0.1})],
+            optimizers=[AdamW.Config(pattern=".*", lr=0.1, fused=False)],
         ).build(model_parts=[model])
-        scheduler = LRSchedulersContainer(optimizers, lr_lambda=lambda step: 1.0)
+        scheduler = LRSchedulersContainer.Config().build(optimizers=optimizers, training_steps=3)
         progress, dataloader = _Progress(), _Progress()
         manager = TorchCheckpointingManager.Config(
-            enable=True,
             folder=str(tmp_path / "checkpoint"),
             interval=1,
             load_only=load_only,
@@ -66,6 +64,7 @@ def test_native_config_restores_full_state_after_async_and_final_save(tmp_path, 
             model_parts=[model],
             optimizers=optimizers,
             lr_schedulers=scheduler,
+            ema=None,
             states={"progress": progress},
             sd_adapter=None,
         )

@@ -7,6 +7,7 @@
 import functools
 import math
 from dataclasses import dataclass, field
+from typing import Any
 
 import spmd_types as spmd
 import torch
@@ -14,14 +15,15 @@ import torch.nn.functional as F
 from attn_gym.sparse import gather_attn
 from attn_gym.sparse.indexer import lightning_indexer
 from torch.distributed.tensor import DTensor, Replicate
-from torchtitan.distributed.utils import get_spmd_backend
 from torchtitan.models.common import LayerNorm, Linear
 from torchtitan.models.common.attention import (
     AttentionMasksType,
-    VarlenAttention,
+    VarlenInnerAttention,
     VarlenMetadata,
     create_varlen_metadata_for_document,
 )
+from torchtitan.models.common.aux_loss import AuxLoss
+from torchtitan.models.common.decoder import Decoder
 from torchtitan.models.common.rope import RoPE
 from torchtitan.models.deepseek_v3.model import (
     Attention as V3Attention,
@@ -33,7 +35,6 @@ from torchtitan.models.deepseek_v3.mtp import MTPDecoder
 from torchtitan.protocols.module import Module
 
 from torchtitan_npu.models.common.document_intervals import document_intervals
-from torchtitan_npu.patches.torchtitan.models.common.aux_loss import AuxLoss
 from torchtitan_npu.patches.torchtitan.models.common.linear import BatchedLinear
 
 
@@ -85,7 +86,7 @@ class Indexer(Module):
         q_BLNH = self.wq_b(qr_BLD)
         with spmd.local():
             q_BLNH = q_BLNH.view(bsz, seqlen, -1, self.head_dim)
-            if get_spmd_backend() == "spmd_types" and spmd.is_type_checking():
+            if spmd.is_type_checking():
                 spmd.assert_type(
                     q_BLNH,
                     {"dp": spmd.S(0), "cp": spmd.S(1), "tp": spmd.S(2)},
@@ -274,7 +275,7 @@ class SparseIndexerLoss(AuxLoss):
         return self.inject(kl.sum(), carrier=carrier)
 
 
-class SparseInnerAttention(VarlenAttention):
+class SparseInnerAttention(VarlenInnerAttention):
     """Sparse attention core for DSA, with separated nope/rope support.
 
     The core is two attn-gym calls: :func:`lightning_indexer` picks the slots and
@@ -299,7 +300,7 @@ class SparseInnerAttention(VarlenAttention):
     """
 
     @dataclass(kw_only=True, slots=True)
-    class Config(VarlenAttention.Config):
+    class Config(VarlenInnerAttention.Config):
         index_topk: int
         indexer_loss: SparseIndexerLoss.Config = field(default_factory=SparseIndexerLoss.Config)
 
@@ -450,7 +451,7 @@ class Attention(V3Attention):
         q_BLNH = self.wq_b(qr_BLD)
         with spmd.local():
             q_BLNH = q_BLNH.view(bsz, seqlen, -1, self.qk_head_dim)
-            if get_spmd_backend() == "spmd_types" and spmd.is_type_checking():
+            if spmd.is_type_checking():
                 spmd.assert_type(
                     q_BLNH,
                     {"dp": spmd.S(0), "cp": spmd.S(1), "tp": spmd.S(2)},
@@ -468,7 +469,7 @@ class Attention(V3Attention):
         idx_q_BLNH, idx_k_BL1H, idx_w_BLN = self.indexer(x_BLD.detach(), qr_BLD.detach(), positions=positions)
         # ``spmd_types`` cannot yet express the required TP-CP redistribution
         # for ``idx_k``, so mark the TP transition explicitly.
-        if get_spmd_backend() == "spmd_types" and spmd.is_type_checking():
+        if spmd.is_type_checking():
             spmd.mutate_type(idx_k_BL1H, "tp", src=spmd.R, dst=spmd.I)
 
         output_BLNH = self.inner_attention(
@@ -523,19 +524,70 @@ class DeepSeekV32Model(DeepSeekV3Model):
 
     The model replaces MLA with DSA and applies V3.2-specific sharding.
 
-    The model carries no metadata seam of its own: its attention backends build
-    the per-microbatch metadata (``SparseInnerAttention.Config``, or the
-    AscendC override's ``AscSparseInnerAttention.Config``), and the decoder
-    builds and dispatches it as upstream #4897 does.
+    Without MTP, preprocessing and forward use the Decoder's backend-owned
+    metadata seam. MTP retains the pinned upstream tuple, validity-mask and
+    single attention-mask protocol until the V3.2 folded-token migration.
     """
+
+    def parallelize(self, **kwargs):
+        from torchtitan_npu.models.common.compile_policy import parallelize_with_model_compile
+
+        return parallelize_with_model_compile(self, **kwargs)
+
+    def preprocess_inputs(self, input_dict, *, parallelism_context, parallelism, **kwargs):
+        if self.mtp_layers is not None:
+            return super().preprocess_inputs(
+                input_dict,
+                parallelism_context=parallelism_context,
+                parallelism=parallelism,
+                **kwargs,
+            )
+        return Decoder.preprocess_inputs(
+            self,
+            input_dict,
+            parallelism_context=parallelism_context,
+            parallelism=parallelism,
+            **kwargs,
+        )
+
+    def forward(
+        self,
+        tokens: torch.Tensor | tuple[torch.Tensor, ...],
+        positions: torch.Tensor | None = None,
+        attention_masks: AttentionMasksType | None = None,
+        mtp_input_valid_masks: tuple[torch.Tensor, ...] | None = None,
+        *,
+        attention_metadata: Any = None,
+        padding_mask: torch.Tensor | None = None,
+    ):
+        if self.mtp_layers is None:
+            if not isinstance(tokens, torch.Tensor):
+                raise ValueError("A decoder without MTP expects one token tensor.")
+            return Decoder.forward(
+                self,
+                tokens,
+                positions,
+                attention_masks,
+                attention_metadata=attention_metadata,  # pyrefly: ignore [unexpected-keyword]
+                padding_mask=padding_mask,
+            )
+        if attention_metadata is not None:
+            raise ValueError("DeepSeek-V3.2 MTP uses the native attention_masks protocol.")
+        return super().forward(
+            tokens,
+            positions,
+            attention_masks,
+            mtp_input_valid_masks,
+            padding_mask=padding_mask,
+        )
 
     @dataclass(kw_only=True, slots=True)
     class Config(DeepSeekV3Model.Config):
         def update_from_config(self, *, config, **kwargs):
             if hasattr(config, "training"):
-                seq_len = config.training.seq_len
+                seq_len = config.training.max_context_length
                 for _, rope_cfg, _, _ in self.traverse(RoPE.Config):
-                    setattr(rope_cfg, "max_seq_len", seq_len)  # noqa: B010
+                    setattr(rope_cfg, "max_context_length", seq_len)  # noqa: B010
 
             MTPDecoder.Config.update_from_config(self, config=config, **kwargs)
             parallelism = config.parallelism

@@ -8,13 +8,11 @@
 import functools
 import logging
 
-from torchtitan.components.metrics import MetricsProcessor
-from torchtitan.observability import structured_logger as sl
-from torchtitan.tools.logging import logger as titan_logger
-
-from torchtitan_npu.patches.torchtitan.models.common.aux_loss import (
+from torchtitan.models.common.aux_loss import (
     collect_aux_loss_metrics,
 )
+from torchtitan.observability import structured_logger as sl
+from torchtitan.observability.metrics import MetricsProcessor
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +22,7 @@ original_log = MetricsProcessor.log
 @functools.wraps(original_log)
 def patched_log(self, step, global_avg_loss, global_max_loss, grad_norm, extra_metrics=None):
     """Add auxiliary losses to step metrics and structured logs."""
-    aux_metrics = collect_aux_loss_metrics(self.parallel_dims)
+    aux_metrics = collect_aux_loss_metrics(self.parallelism_context)
     original_log(
         self,
         step,
@@ -37,7 +35,7 @@ def patched_log(self, step, global_avg_loss, global_max_loss, grad_norm, extra_m
     if aux_metrics:
         sl.log_trace_scalar(aux_metrics)
         values = "  ".join(f"{name}: {value:.6f}" for name, value in sorted(aux_metrics.items()))
-        titan_logger.info(f"aux_loss step: {step:2}  {values}")
+        logger.info(f"aux_loss step: {step:2}  {values}")
 
 
 def apply() -> None:

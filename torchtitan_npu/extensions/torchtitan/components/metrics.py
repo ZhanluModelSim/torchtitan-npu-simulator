@@ -14,12 +14,14 @@ Importing this module applies the extension.
 """
 
 import functools
+import logging
 import time
 
-import torchtitan.components.metrics
-from torchtitan.tools.logging import logger as titan_logger
+import torchtitan.observability.metrics
 
-_original_log = torchtitan.components.metrics.MetricsProcessor.log
+titan_logger = logging.getLogger(__name__)
+
+_original_log = torchtitan.observability.metrics.MetricsProcessor.log
 
 
 @functools.wraps(_original_log)
@@ -32,4 +34,4 @@ def _patched_log(self, step, global_avg_loss, global_max_loss, grad_norm, extra_
     titan_logger.info(f"{color.yellow}elapsed_time_per_step: {time_end_to_end:.3f}s{color.reset}")
 
 
-torchtitan.components.metrics.MetricsProcessor.log = _patched_log
+torchtitan.observability.metrics.MetricsProcessor.log = _patched_log

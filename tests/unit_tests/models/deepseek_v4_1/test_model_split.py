@@ -42,8 +42,8 @@ def recipes():
 
 def _flavors(registry):
     return {
-        "text": registry.model_registry("deepseek_v4_1_debugmodel_text").model,
-        "multimodal": registry.model_registry("deepseek_v4_1_debugmodel").model,
+        "text": registry.model_registry("deepseek_v4_1_debugmodel_text"),
+        "multimodal": registry.model_registry("deepseek_v4_1_debugmodel"),
     }
 
 
@@ -92,7 +92,7 @@ def test_multimodal_rejects_context_parallel(registry, recipes):
     """CP is the text half's; the vision half keeps rejecting it until it has a story."""
     multimodal = _with_cp(recipes.deepseek_v4_1_debugmodel_multimodal(), 2)
     with pytest.raises(NotImplementedError, match="multimodal stack"):
-        multimodal.model_spec.model.update_from_config(config=multimodal)
+        multimodal.model.update_from_config(config=multimodal)
 
 
 def test_context_parallel_runs_on_the_fused_stack_only(recipes):
@@ -105,7 +105,7 @@ def test_context_parallel_runs_on_the_fused_stack_only(recipes):
     which is where the ports are checked against each other.
     """
     text = _with_cp(recipes.deepseek_v4_1_debugmodel_text(), 2)
-    model_config = text.model_spec.model
+    model_config = text.model
     with pytest.raises(ValueError, match="fused stack only"):
         model_config.update_from_config(config=text)
 
@@ -123,14 +123,14 @@ def test_context_parallel_runs_on_the_fused_stack_only(recipes):
 def test_text_recipe_builds_the_text_stack_and_loader(recipes):
     """The recipe pairs the text model with the text loader and its alignment."""
     trainer = recipes.deepseek_v4_1_debugmodel_text()
-    assert isinstance(trainer.model_spec.model, DeepSeekV41Model.Config)
-    assert not isinstance(trainer.model_spec.model, DeepSeekV41MultimodalModel.Config)
+    assert isinstance(trainer.model, DeepSeekV41Model.Config)
+    assert not isinstance(trainer.model, DeepSeekV41MultimodalModel.Config)
     assert type(trainer.dataloader).__name__ == "Config"
     assert isinstance(trainer.dataloader, GrainDataLoader.Config)
     assert trainer.dataloader.dataset.dataset.processor.per_doc_alignment == 2
 
     multimodal = recipes.deepseek_v4_1_debugmodel_multimodal()
-    assert isinstance(multimodal.model_spec.model, DeepSeekV41MultimodalModel.Config)
+    assert isinstance(multimodal.model, DeepSeekV41MultimodalModel.Config)
     assert multimodal.dataloader.dataset.processor.per_doc_alignment == 2
 
 
@@ -158,7 +158,7 @@ def test_every_registered_flavor_declares_its_modality(registry, flavor, multimo
 def test_flash_recipe_sets_expert_count_in_every_layer(recipes, num_experts, modality):
     recipe = getattr(recipes, f"deepseek_v4_1_flash_40layers_{num_experts}experts_{modality}")
 
-    config = recipe().model_spec.model
+    config = recipe().model
 
     assert len(config.layers) == 40
     assert isinstance(config, DeepSeekV41MultimodalModel.Config) is (modality == "multimodal")
@@ -166,7 +166,8 @@ def test_flash_recipe_sets_expert_count_in_every_layer(recipes, num_experts, mod
         assert layer.moe.num_experts == num_experts
         assert layer.moe.router.num_experts == num_experts
         assert layer.moe.router.gate.out_features == num_experts
-        assert layer.moe.routed_experts.inner_experts.num_experts == num_experts
+        assert layer.moe.routed_experts.w13.group_size == num_experts
+        assert layer.moe.routed_experts.w2.group_size == num_experts
 
 
 class _RecordedHooks(nn.Module):
@@ -206,7 +207,10 @@ def parallelize_deps(monkeypatch):
     # model, and it is the function whose dispatch is under test.
     for name in ("_shard_engram_tables", "apply_fsdp_to_decoder"):
         monkeypatch.setattr(par, name, Mock(name=name, return_value=set()))
+    monkeypatch.setattr(par, "resolve_fsdp_mesh", lambda context: (None, ()))
+    monkeypatch.setattr(par, "resolve_sparse_fsdp_mesh", lambda context: (None, ()))
     parallel_dims = Mock()
+    parallel_dims.ep = 1
     parallel_dims.ep_enabled = False
     parallel_dims.pp_enabled = False
     parallel_dims.get_mesh.return_value = Mock()
@@ -239,14 +243,20 @@ def test_parallelize_never_asks_the_text_stack_for_the_hooks(registry, recipes, 
     """
     par, parallel_dims = parallelize_deps
     model = _RecordedHooks()
-    _parallelize(par, parallel_dims, recipes, model, vision=False)
+    trainer = recipes.deepseek_v4_1_debugmodel_text()
+    par.apply_deepseek_v4_1_fsdp(
+        model,
+        parallelism_context=parallel_dims,
+        training=trainer.training,
+        parallelism=trainer.parallelism,
+    )
     assert model.calls == []
 
 
 def test_parallelize_asks_the_multimodal_stack_for_both_hooks(registry, recipes, parallelize_deps):
     """The multimodal branch reaches both hooks, which is the only reason they exist."""
     par, parallel_dims = parallelize_deps
-    model = build_cpu_model(registry.model_registry("deepseek_v4_1_debugmodel").model)
+    model = build_cpu_model(registry.model_registry("deepseek_v4_1_debugmodel"))
     calls: list[str] = []
     # The hooks are this class's own methods; recording them here keeps the assertion
     # about dispatch, while ``test_multimodal_ac_hook_wraps_every_vision_block`` covers
@@ -263,7 +273,7 @@ def test_multimodal_ac_hook_wraps_every_vision_block(registry):
     The policy's own walk covers decoder layers; a vision block lives outside that list,
     so it is wrapped here or not at all.
     """
-    config = registry.model_registry("deepseek_v4_1_debugmodel").model
+    config = registry.model_registry("deepseek_v4_1_debugmodel")
     model = build_cpu_model(config)
     wrapped: list[str] = []
 

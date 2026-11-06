@@ -20,12 +20,14 @@ The dispatcher contract follows the upstream design in
 https://github.com/pytorch/torchtitan/pull/5543.
 """
 
+# pylint: disable=huawei-invalid-name
+
 from dataclasses import dataclass
 
 import spmd_types as spmd
 import torch
-from torchtitan.distributed.spmd_types import current_spmd_mesh, maybe_set_sparse_mesh
-from torchtitan.distributed.utils import get_spmd_backend
+import torch_remat as remat
+from torchtitan.distributed.spmd_types import maybe_set_sparse_mesh, spmd_mesh_group
 from torchtitan.models.common.token_dispatcher import (
     AllToAllDispatchMetadata as TorchTitanAllToAllDispatchMetadata,
 )
@@ -78,7 +80,7 @@ class LocalTokenDispatcher(TorchTitanLocalTokenDispatcher):
         num_local_tokens_per_expert_E: torch.Tensor,
     ):
         (
-            routed_input_RD,
+            routed_input_rd,
             token_indices_experts_sorted_N,
             topk_scores_experts_sorted_N,
         ) = self._local_reorder(x_TD, topk_scores_TK, topk_expert_ids_TK)
@@ -91,20 +93,15 @@ class LocalTokenDispatcher(TorchTitanLocalTokenDispatcher):
             topk_scores_experts_sorted_N=topk_scores_experts_sorted_N,
             routed_scores_R=routed_scores_R,
         )
-        return routed_input_RD, num_local_tokens_per_expert_E, metadata
+        return routed_input_rd, num_local_tokens_per_expert_E, metadata
 
-    def combine(  # pyrefly: ignore [bad-override]
+    # Preserve upstream dimension-annotated keyword parameters.
+    def combine(  # pylint: disable=invalid-name
         self,
         routed_output_RD: torch.Tensor,
-        metadata: LocalDispatchMetadata,
+        metadata: TorchTitanLocalDispatchMetadata,
         x_TD: torch.Tensor,
-        *,
-        num_local_tokens_after_padding: int | None = None,
-        local_seq_len_after_padding: int | None = None,
     ) -> torch.Tensor:
-        # Local dispatch has no SP all-gather. Accept the legacy arguments so
-        # the shared MoE compatibility path can call both dispatcher variants.
-        del num_local_tokens_after_padding, local_seq_len_after_padding
         out_TD = torch.zeros_like(x_TD)
         # Patch override: the config is the single source of truth; skip the
         # multiply when grouped experts applied scores before down projection.
@@ -198,19 +195,14 @@ class AllToAllTokenDispatcher(TorchTitanAllToAllTokenDispatcher):
         # so they can follow the same EP all-to-all as routed activations.
         routed_scores_N = topk_scores_experts_sorted_N if self.absorb_router_scores else None
 
-        if get_spmd_backend() == "spmd_types" and spmd.is_type_checking():
+        if spmd.is_type_checking():
             for axis in ("dp", "cp", "tp"):
                 spmd.mutate_type(num_local_tokens_per_expert_E, axis, src=spmd.P, dst=spmd.V)
 
         with maybe_set_sparse_mesh():
-            pg = (
-                current_spmd_mesh().get_group(  # pyrefly: ignore [missing-attribute]
-                    "ep"
-                )
-                if get_spmd_backend() == "spmd_types"
-                else self.ep_mesh.get_group()
-            )
-            if get_spmd_backend() == "spmd_types" and spmd.is_type_checking():
+            pg = spmd_mesh_group("ep")
+            assert pg is not None
+            if spmd.is_type_checking():
                 num_local_tokens_per_expert_E = spmd.reinterpret_mesh(
                     num_local_tokens_per_expert_E, spmd.current_mesh()
                 )
@@ -232,7 +224,12 @@ class AllToAllTokenDispatcher(TorchTitanAllToAllTokenDispatcher):
                     ep_size,
                 )
 
-            routed_input_RD = self._dispatch_token_exchange(routed_input_ND, pg, output_splits_list, input_splits_list)
+            routed_input_rd = remat.region(
+                self._dispatch_token_exchange,
+                self.remat_region_name("ep_communication.dispatch"),
+                recompute=self.remat_should_recompute("ep_communication"),
+            )(routed_input_ND, pg, output_splits_list, input_splits_list)
+            remat.recompute_needs_tensor(routed_input_rd)
             # Patch override: transport router scores through EP in their
             # original dtype, alongside the routed activations.
             routed_scores_rank_major_R = (
@@ -244,12 +241,12 @@ class AllToAllTokenDispatcher(TorchTitanAllToAllTokenDispatcher):
             )
             (
                 input_shape,
-                routed_input_RD,
+                routed_input_rd,
                 permuted_indices,
                 num_global_tokens_per_local_expert_e,
                 routed_scores_R,
             ) = self._permute(
-                routed_input_RD,
+                routed_input_rd,
                 num_global_tokens_per_local_expert_E,
                 routed_scores_rank_major_R,
             )
@@ -264,7 +261,7 @@ class AllToAllTokenDispatcher(TorchTitanAllToAllTokenDispatcher):
             # Patch override: expose the EP-aligned scores to grouped experts.
             routed_scores_R=routed_scores_R,
         )
-        return routed_input_RD, num_global_tokens_per_local_expert_e, metadata
+        return routed_input_rd, num_global_tokens_per_local_expert_e, metadata
 
     def _permute(  # pyrefly: ignore[bad-override]
         self,
@@ -295,17 +292,15 @@ class AllToAllTokenDispatcher(TorchTitanAllToAllTokenDispatcher):
             routed_scores_R,
         )
 
-    def combine(  # pyrefly: ignore [bad-override]
+    # Preserve upstream dimension-annotated keyword parameters.
+    def combine(  # pylint: disable=invalid-name
         self,
         routed_output_RD: torch.Tensor,
-        metadata: AllToAllDispatchMetadata | LocalDispatchMetadata,
+        metadata: TorchTitanAllToAllDispatchMetadata | TorchTitanLocalDispatchMetadata,
         x_TD: torch.Tensor,
-        *,
-        num_local_tokens_after_padding: int | None = None,
-        local_seq_len_after_padding: int | None = None,
     ) -> torch.Tensor:
         if self.ep_mesh is None:
-            assert isinstance(metadata, LocalDispatchMetadata)
+            assert isinstance(metadata, TorchTitanLocalDispatchMetadata)
             return LocalTokenDispatcher.combine(
                 self,  # pyrefly: ignore [bad-argument-type]
                 routed_output_RD,
@@ -313,40 +308,20 @@ class AllToAllTokenDispatcher(TorchTitanAllToAllTokenDispatcher):
                 x_TD,
             )
 
-        assert isinstance(metadata, AllToAllDispatchMetadata)
+        assert isinstance(metadata, TorchTitanAllToAllDispatchMetadata)
         with maybe_set_sparse_mesh():
-            pg = (
-                current_spmd_mesh().get_group(  # pyrefly: ignore [missing-attribute]
-                    "ep"
-                )
-                if get_spmd_backend() == "spmd_types"
-                else self.ep_mesh.get_group()
-            )
+            pg = spmd_mesh_group("ep")
+            assert pg is not None
             routed_output_RD = self._unpermute(routed_output_RD, metadata.input_shape, metadata.permuted_indices)
             routed_output_RD = self._combine_token_exchange(
                 routed_output_RD, pg, metadata.input_splits, metadata.output_splits
             )
 
-        if get_spmd_backend() == "spmd_types" and spmd.is_type_checking():
+        if spmd.is_type_checking():
             routed_output_RD = spmd.reinterpret_mesh(routed_output_RD, spmd.current_mesh())
 
-        legacy_seq_padding = num_local_tokens_after_padding is not None
-        if legacy_seq_padding:
-            if local_seq_len_after_padding is None:
-                raise ValueError("local_seq_len_after_padding is required with legacy SP padding")
-            out_TD = torch.zeros(
-                num_local_tokens_after_padding * getattr(self, "sp_size", 1),
-                x_TD.shape[-1],
-                device=x_TD.device,
-                dtype=x_TD.dtype,
-            )
-            token_indices_experts_sorted_N = self._sp_global_token_indices(  # pyrefly: ignore [missing-attribute]
-                metadata.token_indices_experts_sorted_N,
-                local_seq_len_after_padding,
-            )
-        else:
-            out_TD = torch.zeros_like(x_TD)
-            token_indices_experts_sorted_N = metadata.token_indices_experts_sorted_N
+        out_TD = torch.zeros_like(x_TD)
+        token_indices_experts_sorted_n = metadata.token_indices_experts_sorted_N
         # Patch override: use the dispatcher config instead of a per-call flag;
         # grouped experts may have absorbed scores before the down projection.
         if not self.absorb_router_scores:
@@ -354,10 +329,10 @@ class AllToAllTokenDispatcher(TorchTitanAllToAllTokenDispatcher):
                 routed_output_RD.to(torch.float32) * metadata.topk_scores_experts_sorted_N.reshape(-1, 1)
             ).to(routed_output_RD.dtype)
 
-        assert isinstance(token_indices_experts_sorted_N, torch.Tensor)
+        assert isinstance(token_indices_experts_sorted_n, torch.Tensor)
         return deterministic_scatter_add(
             out_TD,
-            token_indices_experts_sorted_N.reshape(-1, 1).expand(-1, out_TD.shape[-1]),
+            token_indices_experts_sorted_n.reshape(-1, 1).expand(-1, out_TD.shape[-1]),
             routed_output_RD,
         )
 

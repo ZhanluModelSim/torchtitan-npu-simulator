@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING
 
 import torch
@@ -27,9 +28,10 @@ from torchtitan.experiments.graph_trainer.memory_policy import (
 from torchtitan.experiments.graph_trainer.registry import (
     register_memory_policy,
 )
-from torchtitan.tools.logging import logger
 
 from torchtitan_npu.patches.torchtitan.experiments.graph_trainer import memory_policy
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -47,7 +49,7 @@ _GEMMS = frozenset(
 )
 _SWIGLU_OP_NAMES = {"swiglu_group", "swiglu_group_forward"}
 _SHARED_EXPERTS = ("layers.*.moe.shared_experts",)
-_ROUTED_EXPERTS = ("layers.*.moe.routed_experts.inner_experts",)
+_ROUTED_EXPERTS = ("layers.*.moe.routed_experts",)
 
 
 def _op_name(node: torch.fx.Node) -> str:

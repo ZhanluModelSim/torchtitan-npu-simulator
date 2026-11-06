@@ -166,15 +166,15 @@ def convert_to_hf(args: argparse.Namespace):
     # while preserving the short ``llama3`` form used upstream.
     module_name = model_name if "." in model_name else f"torchtitan.models.{model_name}"
     model_module = importlib.import_module(module_name)
-    model_spec = model_module.model_registry(model_flavor)
-    model_config = model_spec.model
+    model_config = model_module.model_registry(model_flavor)
 
     with torch.device("cpu"):
         raw_model = model_config.build()
     trainable_fqns = [canonical_fqn(name) for name, p in raw_model.named_parameters() if p.requires_grad]
     model = ModelWrapper(raw_model)
 
-    sd_adapter = model_spec.state_dict_adapter(model_config, hf_assets_path)
+    adapter_cls = type(raw_model).state_dict_adapter_cls
+    sd_adapter = adapter_cls(model_config, hf_assets_path) if adapter_cls is not None else None
     if sd_adapter is None:
         raise ValueError(
             "trying to convert checkpoint from DCP to HF safetensors format, but sd_adapter is not provided."

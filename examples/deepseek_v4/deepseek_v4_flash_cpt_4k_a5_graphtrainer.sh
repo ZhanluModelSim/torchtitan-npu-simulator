@@ -11,7 +11,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
-export CONFIG="${CONFIG:-graph_trainer_deepseek_v4_flash}"
+export CONFIG="${CONFIG:-graph_trainer_deepseek_v4_flash_cpt}"
 export TORCHINDUCTOR_USE_TORCH_PROFILER_BENCHMARKER=1
 export TORCHINDUCTOR_USE_EXPERIMENTAL_BENCHMARKER=0
 export TORCH_NPU_USE_COMPATIBLE_IMPL=1
@@ -21,14 +21,12 @@ STEPS="${STEPS:-20}"
 EP_OVERLAP_ARGS=(
     --compile.ep_overlap.enabled
     --compile.ep_overlap.chunk_dim seq
-    --compile.ep_overlap.strategy graph
     --compile.ep_overlap.module_fqn "layers.*.moe"
     --compile.pass_pipeline mutation-functionalization+npu_auto_overlap
 )
 
 exec bash "${SCRIPT_DIR}/deepseek_v4_flash_cpt_4k_a5.sh" \
     --training.num-tokens-per-train-step 2097152 \
-    --parallelism.spmd-backend spmd_types \
     --training.steps "${STEPS}" \
     --debug.moe-force-load-balance \
     "${EP_OVERLAP_ARGS[@]}" \

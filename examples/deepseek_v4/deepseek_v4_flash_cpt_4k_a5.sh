@@ -53,7 +53,7 @@ QUANTIZATION_ARGS=(
     --extension.quantization.enable-quantized-training
     --extension.quantization.recipe all_block_fp8
     --extension.quantization.enable-fsdp-prequantize
-    --extension.quantization.fsdp-prequantize-fqns .attention.wq_b,.attention.wo_a,.attention.indexer.wq_b,.moe.routed_experts.inner_experts
+    --extension.quantization.fsdp-prequantize-fqns .attention.wq_b,.attention.wo_a,.attention.indexer.wq_b,.moe.routed_experts.w13,.moe.routed_experts.w2
     --extension.quantization.li-quantization fp8
     --extension.quantization.kv-norm-quantization.format mxfp8
     --extension.quantization.kv-norm-quantization.fqns .attention.kv_norm,.attention.compressor.norm

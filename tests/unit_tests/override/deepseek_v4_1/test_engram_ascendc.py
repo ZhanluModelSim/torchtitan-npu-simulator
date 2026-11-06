@@ -12,12 +12,15 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from torch.utils.checkpoint import checkpoint, DefaultDeviceType
+from torch.utils.checkpoint import DefaultDeviceType, checkpoint
+from torchtitan.components.optim import AdamW
 from torchtitan.config import Configurable, OverrideConfig, TrainingConfig, apply_overrides
-from torchtitan.components.optimizer import ParamGroupConfig
 
-from torchtitan_npu.extensions.torchtitan.components.optimizer.optimizer import HostSparseOptimizersContainer
-from torchtitan_npu.models.deepseek_v4_1.engram.host import HostEngramTable, _HAS_OPAQUE_OBJECT_API
+from torchtitan_npu.extensions.torchtitan.components.optimizer.optimizer import (
+    HostSparseOptimizersContainer,
+    SparseAdam,
+)
+from torchtitan_npu.models.deepseek_v4_1.engram.host import _HAS_OPAQUE_OBJECT_API, HostEngramTable
 from torchtitan_npu.models.deepseek_v4_1.parallelize import _shard_engram_tables
 from torchtitan_npu.override.deepseek_v4_1.engram import ascendc, mxfp8
 
@@ -53,7 +56,7 @@ class _FakeBuffer:
         # This local fake models the tests' two-rank EngramFetchCtx layout.
         rank_size = 2
         entries = torch.zeros(self.kwargs["num_max_tokens_per_rank"] * rank_size, dtype=torch.int32)
-        entries[:indices.numel()] = indices
+        entries[: indices.numel()] = indices
         context = SimpleNamespace(
             perm=torch.arange(indices.numel(), dtype=torch.int32),
             send_counts=torch.zeros(rank_size * 8, dtype=torch.int32),  # 32-byte slots per rank.
@@ -68,7 +71,7 @@ class _FakeBuffer:
 
     def engram_fetch_grad(self, grad, context):
         assert grad.dtype == torch.float32 and grad.is_contiguous()
-        indices = context.recv_local_entry[:int(context.num_recv.item())]
+        indices = context.recv_local_entry[: int(context.num_recv.item())]
         unique, inverse = indices.unique(return_inverse=True)
         reduced = torch.zeros(unique.numel(), grad.shape[1])
         reduced.index_add_(0, inverse, grad)
@@ -78,15 +81,30 @@ class _FakeBuffer:
 @pytest.mark.parametrize("recompute", [False, True], ids=["eager", "full_ac"])
 def test_override_sparse_update_reuses_registered_storage(monkeypatch, recompute):
     monkeypatch.setattr(DefaultDeviceType, "_default_device_type", "cpu")
-    root = _Root.Config(table=HostEngramTable.Config(
-        vocab_size=16, layer_id=0, ngram_orders=(2,), num_heads=1,
-        head_vocab_sizes=(11,), embedding_dim=128, num_embeddings=12,
-        require_token_id_map=False, param_init={"weight": torch.nn.init.ones_},
-    ))
-    apply_overrides(OverrideConfig(imports=[(
-        "torchtitan_npu.override.deepseek_v4_1.engram.host_offload",
-        {"num_max_tokens_per_rank": 4},
-    )]), root)
+    root = _Root.Config(
+        table=HostEngramTable.Config(
+            vocab_size=16,
+            layer_id=0,
+            ngram_orders=(2,),
+            num_heads=1,
+            head_vocab_sizes=(11,),
+            embedding_dim=128,
+            num_embeddings=12,
+            require_token_id_map=False,
+            param_init={"weight": torch.nn.init.ones_},
+        )
+    )
+    apply_overrides(
+        OverrideConfig(
+            imports=[
+                (
+                    "torchtitan_npu.override.deepseek_v4_1.engram.host_offload",
+                    {"num_max_tokens_per_rank": 4},
+                )
+            ]
+        ),
+        root,
+    )
     table = root.table.build()
     assert isinstance(table, ascendc.HostOffloadEngramTable) and table.pin_memory
     # Simulate an already-sharded CPU weight; actual EP/HCCL needs NPU validation.
@@ -98,7 +116,9 @@ def test_override_sparse_update_reuses_registered_storage(monkeypatch, recompute
     model = torch.nn.Module()
     model.add_module("table", table)
     ignored = _shard_engram_tables(
-        model, edp_mesh=SimpleNamespace(size=lambda: 1), edp_mesh_dims=None,
+        model,
+        edp_mesh=SimpleNamespace(size=lambda: 1),
+        edp_mesh_dims=None,
         training=TrainingConfig(mixed_precision_param="bfloat16"),
     )
     assert ignored == {table.weight}
@@ -112,7 +132,11 @@ def test_override_sparse_update_reuses_registered_storage(monkeypatch, recompute
     expected_optimizer = torch.optim.SparseAdam(reference.parameters(), lr=0.05)
     for rows in ([0, 3, 3, 5], [1, 3, 1]):
         ids = torch.tensor(rows)
-        actual = checkpoint(table._distributed_lookup, ids, use_reentrant=False) if recompute else table._distributed_lookup(ids)
+        actual = (
+            checkpoint(table._distributed_lookup, ids, use_reentrant=False)
+            if recompute
+            else table._distributed_lookup(ids)
+        )
         expected = reference(ids)
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         grad = torch.arange(actual.numel()).reshape_as(actual).float() / 128
@@ -136,15 +160,30 @@ def test_override_sparse_update_reuses_registered_storage(monkeypatch, recompute
 
 
 def test_mxfp8_override_refreshes_derived_storage(monkeypatch):
-    root = _Root.Config(table=HostEngramTable.Config(
-        vocab_size=16, layer_id=0, ngram_orders=(2,), num_heads=1,
-        head_vocab_sizes=(11,), embedding_dim=128, num_embeddings=12,
-        require_token_id_map=False, param_init={"weight": torch.nn.init.ones_},
-    ))
-    apply_overrides(OverrideConfig(imports=[(
-        "torchtitan_npu.override.deepseek_v4_1.engram.host_offload_mxfp8",
-        {"num_max_tokens_per_rank": 4, "quantization_chunk_rows": 2},
-    )]), root)
+    root = _Root.Config(
+        table=HostEngramTable.Config(
+            vocab_size=16,
+            layer_id=0,
+            ngram_orders=(2,),
+            num_heads=1,
+            head_vocab_sizes=(11,),
+            embedding_dim=128,
+            num_embeddings=12,
+            require_token_id_map=False,
+            param_init={"weight": torch.nn.init.ones_},
+        )
+    )
+    apply_overrides(
+        OverrideConfig(
+            imports=[
+                (
+                    "torchtitan_npu.override.deepseek_v4_1.engram.host_offload_mxfp8",
+                    {"num_max_tokens_per_rank": 4, "quantization_chunk_rows": 2},
+                )
+            ]
+        ),
+        root,
+    )
     table = root.table.build()
     assert isinstance(table, mxfp8.MXFP8HostOffloadEngramTable)
     table.weight = torch.nn.Parameter(torch.zeros(6, 128))
@@ -168,8 +207,7 @@ def test_mxfp8_override_refreshes_derived_storage(monkeypatch):
     untouched_storage = storage[1].clone()
     untouched_scale = scale[1].clone()
     container = HostSparseOptimizersContainer.Config(
-        implementation="for-loop",
-        param_groups=[ParamGroupConfig(pattern=".*", optimizer_name="SparseAdam", optimizer_kwargs={"lr": 0.05})],
+        optimizers=[SparseAdam.Config(pattern=".*", betas=(0.9, 0.999), eps=1e-08, lr=0.05)],
     ).build(model_parts=[table])
     container.step()
     assert table.pending_sparse_grad() is None
@@ -194,21 +232,36 @@ def test_joint_sharding_override_sets_storage_and_lookup_group(monkeypatch, back
     ep = SimpleNamespace(size=lambda: 2, get_local_rank=lambda: 1, get_group=lambda: ep_group)
     joint = SimpleNamespace(size=lambda: 4, get_local_rank=lambda: 3, get_group=lambda: joint_group)
     monkeypatch.setattr(host, "_joint_table_mesh", lambda dims: joint)
-    root = _Root.Config(table=HostEngramTable.Config(
-        vocab_size=16, layer_id=0, ngram_orders=(2,), num_heads=1,
-        head_vocab_sizes=(11,), embedding_dim=128, num_embeddings=12,
-        require_token_id_map=False,
-    ))
+    root = _Root.Config(
+        table=HostEngramTable.Config(
+            vocab_size=16,
+            layer_id=0,
+            ngram_orders=(2,),
+            num_heads=1,
+            head_vocab_sizes=(11,),
+            embedding_dim=128,
+            num_embeddings=12,
+            require_token_id_map=False,
+        )
+    )
     if backend == "torch":
         name, kwargs = "shard_over_efsdp", {}
     else:
         name = "host_offload" if backend == "fp32" else "host_offload_mxfp8"
         kwargs = {"num_max_tokens_per_rank": 4, "shard_over_efsdp": True}
-    apply_overrides(OverrideConfig(imports=[(
-        f"torchtitan_npu.override.deepseek_v4_1.engram.{name}", kwargs,
-    )]), root)
+    apply_overrides(
+        OverrideConfig(
+            imports=[
+                (
+                    f"torchtitan_npu.override.deepseek_v4_1.engram.{name}",
+                    kwargs,
+                )
+            ]
+        ),
+        root,
+    )
     table = root.table.build()
-    table.parallelize(SimpleNamespace(get_optional_mesh=lambda name: ep))
+    table._parallelize(SimpleNamespace(get_optional_mesh=lambda name: ep))
     assert table.weight.shape == (3, 128)
     assert table.ep_mesh is ep and table.lookup_mesh is joint
     if hasattr(torch.distributed.checkpoint, "CheckpointableTensor"):
@@ -245,15 +298,31 @@ def test_compiled_lookup_preserves_sparse_updates(monkeypatch, compiler_cache, b
     monkeypatch.setitem(sys.modules, elastic_module.__name__, elastic_module)
     monkeypatch.setattr(ascendc, "_dedicated_engram_group", lambda group: group)
     monkeypatch.setattr(ascendc.HostOffloadEngramTable, "_elastic_buffer_type", staticmethod(lambda: _FakeBuffer))
-    root = _Root.Config(table=HostEngramTable.Config(
-        vocab_size=16, layer_id=0, ngram_orders=(2,), num_heads=1,
-        head_vocab_sizes=(11,), embedding_dim=128, num_embeddings=12,
-        require_token_id_map=False, param_init={"weight": torch.nn.init.ones_},
-    ))
+    root = _Root.Config(
+        table=HostEngramTable.Config(
+            vocab_size=16,
+            layer_id=0,
+            ngram_orders=(2,),
+            num_heads=1,
+            head_vocab_sizes=(11,),
+            embedding_dim=128,
+            num_embeddings=12,
+            require_token_id_map=False,
+            param_init={"weight": torch.nn.init.ones_},
+        )
+    )
     factory = "host_offload" if backend == "fp32" else "host_offload_mxfp8"
-    apply_overrides(OverrideConfig(imports=[(
-        f"torchtitan_npu.override.deepseek_v4_1.engram.{factory}", {"num_max_tokens_per_rank": 4},
-    )]), root)
+    apply_overrides(
+        OverrideConfig(
+            imports=[
+                (
+                    f"torchtitan_npu.override.deepseek_v4_1.engram.{factory}",
+                    {"num_max_tokens_per_rank": 4},
+                )
+            ]
+        ),
+        root,
+    )
     table = root.table.build()
     table.weight = torch.nn.Parameter(torch.ones(6, 128))
     table._ep_size = 2
@@ -265,8 +334,7 @@ def test_compiled_lookup_preserves_sparse_updates(monkeypatch, compiler_cache, b
         table.refresh_lookup_storage(torch.arange(6))
     reference = torch.nn.Embedding.from_pretrained(table.weight.detach().clone(), freeze=False, sparse=True)
     optimizer = HostSparseOptimizersContainer.Config(
-        implementation="for-loop",
-        param_groups=[ParamGroupConfig(pattern=".*", optimizer_name="SparseAdam", optimizer_kwargs={"lr": 0.05})],
+        optimizers=[SparseAdam.Config(pattern=".*", betas=(0.9, 0.999), eps=1e-08, lr=0.05)],
     ).build(model_parts=[table])
     reference_optimizer = torch.optim.SparseAdam(reference.parameters(), lr=0.05)
     gain = torch.nn.Parameter(torch.tensor(0.5))
@@ -312,7 +380,9 @@ def test_compiled_lookup_preserves_sparse_updates(monkeypatch, compiler_cache, b
             expected_a.sum().backward()
             torch.testing.assert_close(gain.grad, reference_gain.grad, rtol=1e-6, atol=1e-6)
             assert table.weight.grad is None
-            torch.testing.assert_close(table.pending_sparse_grad().to_dense(), reference.weight.grad.to_dense(), rtol=0, atol=0)
+            torch.testing.assert_close(
+                table.pending_sparse_grad().to_dense(), reference.weight.grad.to_dense(), rtol=0, atol=0
+            )
             optimizer.step()
             reference_optimizer.step()
             torch.testing.assert_close(table.weight, reference.weight, rtol=0, atol=0)
@@ -321,7 +391,11 @@ def test_compiled_lookup_preserves_sparse_updates(monkeypatch, compiler_cache, b
             reference_optimizer.zero_grad()
             gain.grad = reference_gain.grad = None
     assert graphs and all(
-        any("ascendc_engram_lookup" in str(module.graph) for module in graph.modules() if isinstance(module, torch.fx.GraphModule))
+        any(
+            "ascendc_engram_lookup" in str(module.graph)
+            for module in graph.modules()
+            if isinstance(module, torch.fx.GraphModule)
+        )
         for graph in graphs
     )
     assert table._elastic_buffer.writes == 1

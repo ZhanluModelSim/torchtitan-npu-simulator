@@ -60,20 +60,12 @@ EOF
 chmod +x "${PYTHON_SHIMS}/torchrun"
 export PATH="${PYTHON_SHIMS}:${PATH}"
 
-# Clone and install torchtitan.
+# Install the source packages using the dependencies supplied by the CI image.
 _setup_torchtitan "${TORCHTITAN_DIR}"
 
 "${PYTHON_BIN}" -m pip install --break-system-packages --no-deps --no-cache-dir -e "${TORCHTITAN_DIR}"
 "${PYTHON_BIN}" -m pip install --break-system-packages --no-deps --no-cache-dir -e "${PROJECT_ROOT}"
 
-# The image predates wheels added to requirements.txt; install only the missing
-# wheels, never the whole file, whose torch/torch_npu pins differ from the image
-# build.
-"${PYTHON_BIN}" -m pip install --break-system-packages --no-deps --no-cache-dir attn-gym==0.0.16 spmd_types==0.2.5 \
-    'torch_checkpointing==0.1.1' 'torch_remat>=0.2.0'
-# Grain needs its data-pipeline dependencies (for example etils and array-record).
-# Its dependency graph does not include torch or torch_npu.
-"${PYTHON_BIN}" -m pip install --break-system-packages --no-cache-dir grain==0.2.18
 # The CI image supplies torch 2.14.0.dev; the matching torchvision CPU wheel
 # is installed with --no-deps (resolving its torch pin would fight the image).
 "${PYTHON_BIN}" -m pip install --break-system-packages --no-deps --no-cache-dir --index-url https://download.pytorch.org/whl/cpu "torchvision==0.29.0+cpu"

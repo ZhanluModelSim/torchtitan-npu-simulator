@@ -28,7 +28,6 @@ from torchtitan.components.loss import (
     ChunkedLossWrapper,
 )
 from torchtitan.config import derive
-from torchtitan.distributed.utils import get_spmd_backend
 from torchtitan.models.common.decoder import Decoder, TransformerBlock
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.moe import MoE  # noqa: TC002
@@ -74,8 +73,16 @@ def prepare_mtp_batch(
     labels: torch.Tensor,
     positions: torch.Tensor | None,
     num_mtp_layers: int,
+    padding_mask: torch.Tensor | None = None,
 ) -> MTPBatch:
-    """Build DeepSeek-V4 MTP inputs before context-parallel sharding."""
+    """Build DeepSeek-V4 MTP inputs before context-parallel sharding.
+
+    ``padding_mask`` is structural padding, rather than the loss mask encoded
+    by ``IGNORE_INDEX``.  It must be applied while rolling both the input and
+    target streams so a shifted token can never read from a padded tail.  The
+    batch is built on the global row before CP sharding; doing this after the
+    shard would make a CP boundary look like a document boundary.
+    """
     if num_mtp_layers <= 0:
         raise ValueError(f"num_mtp_layers must be positive, got {num_mtp_layers}.")
 
@@ -87,6 +94,7 @@ def prepare_mtp_batch(
             tokens,
             shift=depth,
             positions=positions,
+            padding_mask=padding_mask,
             fill_value=0,
             return_valid_mask=True,
         )
@@ -99,6 +107,7 @@ def prepare_mtp_batch(
                     labels,
                     shift=depth,
                     positions=positions,
+                    padding_mask=padding_mask,
                     fill_value=IGNORE_INDEX,
                 ),
             )
@@ -112,8 +121,6 @@ def prepare_mtp_batch(
 
 
 def _annotate_mtp_batch(batch: MTPBatch) -> None:
-    if get_spmd_backend() != "spmd_types":
-        return
     token_layout = spmd.SpmdType(
         {"dp": spmd.V, "cp": spmd.V, "tp": spmd.R}, partition_spec=spmd.PartitionSpec(("dp", "cp"), None)
     )
@@ -129,6 +136,7 @@ def _mtp_labels(
     pred: list[torch.Tensor],
     labels: torch.Tensor,
     positions: torch.Tensor | None,
+    padding_mask: torch.Tensor | None = None,
 ) -> list[torch.Tensor]:
     num_mtp_layers = len(pred) - 1
     if num_mtp_layers <= 0:
@@ -152,6 +160,7 @@ def _mtp_labels(
                 labels,
                 shift=depth,
                 positions=positions,
+                padding_mask=padding_mask,
                 fill_value=IGNORE_INDEX,
             ),
         )
@@ -210,7 +219,8 @@ class MTPChunkedLossWrapper(ChunkedLossWrapper):
             raise ValueError("MTPChunkedLossWrapper expects main hidden states followed by one tensor per MTP layer.")
 
         positions = loss_inputs.pop("positions", None)
-        mtp_labels = _mtp_labels(pred, labels, positions)
+        padding_mask = loss_inputs.pop("padding_mask", None)
+        mtp_labels = _mtp_labels(pred, labels, positions, padding_mask)
         branch_scale = self.mtp_scale / len(mtp_labels)
         head_context = _mtp_head_context(self.lm_head, isolate_gradients=self.mtp_isolate_gradients)
 
@@ -305,6 +315,8 @@ class DeepSeekV4MTPTransformerBlock(TransformerBlock):
         mtp_input_ids: torch.Tensor,
         mtp_input_valid_mask: torch.Tensor,
         attention_context: _MTPAttentionContext,
+        *,
+        padding_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if prev_hc_hidden.ndim != 3:
             raise ValueError(
@@ -329,7 +341,14 @@ class DeepSeekV4MTPTransformerBlock(TransformerBlock):
 
         residual = hidden
         hidden, post, comb = self.hc_ffn_pre(hidden)
-        hidden = self.moe(self.ffn_norm(hidden), input_ids_T=mtp_input_ids)
+        mtp_padding_mask = ~mtp_input_valid_mask
+        if padding_mask is not None:
+            mtp_padding_mask = mtp_padding_mask | padding_mask
+        hidden = self.moe(
+            self.ffn_norm(hidden),
+            input_ids_T=mtp_input_ids,
+            padding_mask_T=mtp_padding_mask,
+        )
         next_hc_hidden = self.hc_post(hidden, residual, post, comb)
 
         prediction_hidden = self.hc_head(next_hc_hidden)
@@ -397,6 +416,7 @@ class DeepSeekV4MTPDecoder(MTPDecoder):
         *,
         attention_metadata: AttentionMetadataMap,
         mtp_batch: MTPBatch | None = None,
+        padding_mask: torch.Tensor | None = None,
     ) -> torch.Tensor | list[torch.Tensor]:
         """The metadata map is the pinned argument's replacement, not a renaming of it.
 
@@ -405,7 +425,7 @@ class DeepSeekV4MTPDecoder(MTPDecoder):
         parameter is keyword-only and the pinned name would be a lie.
         """
         attention_context = _MTPAttentionContext(attention_metadata, positions)
-        state = self._forward_main(tokens, attention_context)
+        state = self._forward_main(tokens, attention_context, padding_mask=padding_mask)
 
         if self.mtp_layers is None:
             if self._skip_lm_head or self.lm_head is None:
@@ -417,7 +437,13 @@ class DeepSeekV4MTPDecoder(MTPDecoder):
 
         outputs = [
             state.main_hidden,
-            *self._forward_mtp_layers(tokens, state, attention_context, mtp_batch),
+            *self._forward_mtp_layers(
+                tokens,
+                state,
+                attention_context,
+                mtp_batch,
+                padding_mask=padding_mask,
+            ),
         ]
         if not self._skip_lm_head and self.lm_head is not None:
             outputs[0] = self.lm_head(outputs[0])
@@ -432,6 +458,8 @@ class DeepSeekV4MTPDecoder(MTPDecoder):
         self,
         tokens: torch.Tensor,
         attention_context: _MTPAttentionContext,
+        *,
+        padding_mask: torch.Tensor | None = None,
     ) -> _MTPForwardState:
         tok_embeddings = self.tok_embeddings
         input_ids = tokens.detach().long()
@@ -444,6 +472,7 @@ class DeepSeekV4MTPDecoder(MTPDecoder):
                 input_ids,
                 attention_context.for_layer(layer),
                 attention_context.positions,
+                padding_mask=padding_mask,
             )
 
         main_hidden = self.hc_head(hidden)
@@ -456,6 +485,8 @@ class DeepSeekV4MTPDecoder(MTPDecoder):
         state: _MTPForwardState,
         attention_context: _MTPAttentionContext,
         mtp_batch: MTPBatch | None,
+        *,
+        padding_mask: torch.Tensor | None = None,
     ) -> list[torch.Tensor]:
         if self.mtp_layers is None:
             return []
@@ -477,6 +508,7 @@ class DeepSeekV4MTPDecoder(MTPDecoder):
                     shift=depth,
                     fill_value=0,
                     positions=attention_context.positions,
+                    padding_mask=padding_mask,
                     return_valid_mask=True,
                 )
             else:
@@ -490,6 +522,7 @@ class DeepSeekV4MTPDecoder(MTPDecoder):
                 mtp_tokens.detach().long(),
                 valid_mask,
                 attention_context,
+                padding_mask=padding_mask,
             )
             mtp_outputs.append(prediction_hidden)
         return mtp_outputs

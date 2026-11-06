@@ -18,10 +18,11 @@ import torch.distributed.checkpoint as dcp
 import torch.multiprocessing as mp
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.tensor import DTensor, Shard
-from torchtitan.components.optimizer import OptimizersContainer
+from torchtitan.components.optim import OptimizersContainer
 from torchtitan.config import Configurable, OverrideConfig, apply_overrides
 
 from torchtitan_npu.extensions.novaswap import swap_api as product_swap_api
+from torchtitan_npu.extensions.torchtitan.components.optimizer.optimizer import SparseAdam
 from torchtitan_npu.override.common import optimizer as product_swap
 from torchtitan_npu.override.common.optimizer import OptimizerStateSwapContainer
 
@@ -214,9 +215,7 @@ def _assert_named_tensors(actual: dict[str, torch.Tensor], expected: dict[str, t
 class _Root(Configurable):
     @dataclass(kw_only=True, slots=True)
     class Config(Configurable.Config):
-        optimizer: OptimizersContainer.Config = field(
-            default_factory=OptimizersContainer.Config
-        )
+        optimizer: OptimizersContainer.Config = field(default_factory=OptimizersContainer.Config)
 
 
 def test_optimizer_state_swap_override_replaces_optimizer_config() -> None:
@@ -257,7 +256,7 @@ def test_virtual_optimizers_container_registers_state_init_hook(monkeypatch) -> 
     optimizer = torch.optim.AdamW([torch.nn.Parameter(torch.ones(1))])
     monkeypatch.setattr(optimizer, "register_step_pre_hook", hooks.append)
 
-    def initialize_container(self, *, config, model_parts):
+    def initialize_container(self, config, *, model_parts, enable_cuda_graph=False):
         self.optimizers = [optimizer]
 
     monkeypatch.setattr(
@@ -410,18 +409,13 @@ def test_optimizer_state_swap_materializes_only_missing_adamw_state(
     initialized.grad = torch.tensor([0.25, -0.5])
     optimizer.step()
     optimizer.zero_grad(set_to_none=True)
-    initialized_state = {
-        name: value.detach().clone()
-        for name, value in optimizer.state[initialized].items()
-    }
+    initialized_state = {name: value.detach().clone() for name, value in optimizer.state[initialized].items()}
     assert not optimizer.state[missing]
 
     flat_state = container.state_dict()
 
     for name, expected in initialized_state.items():
-        torch.testing.assert_close(
-            optimizer.state[initialized][name], expected, rtol=0, atol=0
-        )
+        torch.testing.assert_close(optimizer.state[initialized][name], expected, rtol=0, atol=0)
     assert set(optimizer.state[missing]) == {"step", "exp_avg", "exp_avg_sq"}
     assert optimizer.state[missing]["step"].item() == 0
     for state_name in ("exp_avg", "exp_avg_sq"):
@@ -458,9 +452,7 @@ def test_optimizer_state_swap_muon_produces_and_consumes_checkpoint_location(
                 ],
                 defaults={},
             )
-            self._redistribution_runtime = SimpleNamespace(
-                _enqueue_storage_to_compute=lambda *args, **kwargs: None
-            )
+            self._redistribution_runtime = SimpleNamespace(_enqueue_storage_to_compute=lambda *args, **kwargs: None)
 
         def _momentum(self, compute_layout, grad):
             momentum = grad.detach().clone()
@@ -520,9 +512,7 @@ def _checkpointable_local_copy(
 
 def _empty_optimizer_checkpoint_view(tensor: DTensor) -> torch.Tensor:
     parameter = torch.nn.Parameter(torch.empty(0))
-    optimizer = torch.optim.AdamW(
-        [{"params": [parameter], "param_names": ["weight"]}]
-    )
+    optimizer = torch.optim.AdamW([{"params": [parameter], "param_names": ["weight"]}])
     optimizer.state[parameter]["exp_avg"] = tensor
     vars(optimizer)["_torchtitan_npu_checkpoint_locations"] = {}
     flat_state = {"state.weight.exp_avg": tensor}
@@ -570,11 +560,7 @@ def _empty_dtensor_checkpoint_worker(
 
         dcp.save({"state": source_view}, checkpoint_id=checkpoint_dir)
 
-        target_view = (
-            _checkpointable_local_copy(local, metadata, zero=True)
-            if rank == 0
-            else source_view
-        )
+        target_view = _checkpointable_local_copy(local, metadata, zero=True) if rank == 0 else source_view
 
         dcp.load({"state": target_view}, checkpoint_id=checkpoint_dir)
         torch.testing.assert_close(target_view, local, rtol=0, atol=0)
@@ -972,10 +958,7 @@ def test_optimizer_state_swap_adamw_keeps_stock_state_and_updates(monkeypatch) -
         torch.nn.Parameter(torch.tensor([1.0, 2.0])),
         torch.nn.Parameter(torch.tensor([3.0, 4.0])),
     ]
-    reference_parameters = [
-        torch.nn.Parameter(parameter.detach().clone())
-        for parameter in swapped_parameters
-    ]
+    reference_parameters = [torch.nn.Parameter(parameter.detach().clone()) for parameter in swapped_parameters]
     swapped = torch.optim.AdamW(swapped_parameters, lr=1e-3, foreach=False)
     reference = torch.optim.AdamW(reference_parameters, lr=1e-3, foreach=False)
     _patch_container_swap_api(
@@ -989,9 +972,7 @@ def test_optimizer_state_swap_adamw_keeps_stock_state_and_updates(monkeypatch) -
 
     for _ in range(2):
         original_param_groups = swapped.param_groups
-        for swapped_parameter, reference_parameter in zip(
-            swapped_parameters, reference_parameters, strict=True
-        ):
+        for swapped_parameter, reference_parameter in zip(swapped_parameters, reference_parameters, strict=True):
             grad = torch.full_like(swapped_parameter, 0.25)
             swapped_parameter.grad = grad
             reference_parameter.grad = grad.clone()
@@ -999,9 +980,7 @@ def test_optimizer_state_swap_adamw_keeps_stock_state_and_updates(monkeypatch) -
         reference.step()
         assert swapped.param_groups is original_param_groups
 
-    for swapped_parameter, reference_parameter in zip(
-        swapped_parameters, reference_parameters, strict=True
-    ):
+    for swapped_parameter, reference_parameter in zip(swapped_parameters, reference_parameters, strict=True):
         assert torch.equal(swapped_parameter, reference_parameter)
         swapped_state = swapped.state[swapped_parameter]
         reference_state = reference.state[reference_parameter]
@@ -1147,12 +1126,15 @@ def test_optimizer_state_swap_prefetches_plan_before_a2a_and_defers_offload(monk
     )
 
     transfer_stream = object()
-    assert optimizer._redistribution_runtime._enqueue_storage_to_compute(
-        plan,
-        slot=None,
-        context=SimpleNamespace(transfer_stream=transfer_stream),
-        prepare=optimizer._prepare_local,
-    ) == "work"
+    assert (
+        optimizer._redistribution_runtime._enqueue_storage_to_compute(
+            plan,
+            slot=None,
+            context=SimpleNamespace(transfer_stream=transfer_stream),
+            prepare=optimizer._prepare_local,
+        )
+        == "work"
+    )
     assert streams == [transfer_stream]
     assert [event[0] for event in events] == [
         "H2D",
@@ -1175,10 +1157,10 @@ def test_optimizer_state_swap_prefetches_plan_before_a2a_and_defers_offload(monk
 
 @pytest.mark.parametrize("override_name", ["virtual", "swap_optimizer"])
 def test_swap_preserves_host_sparse_update(monkeypatch, override_name):
-    from torchtitan.components.optimizer import ParamGroupConfig
+    from torchtitan.components.optim import AdamW
 
-    from torchtitan_npu.models.deepseek_v4_1.engram.host import HostEngramTable
     from torchtitan_npu.extensions.torchtitan.components.optimizer.optimizer import HostSparseOptimizersContainer
+    from torchtitan_npu.models.deepseek_v4_1.engram.host import HostEngramTable
 
     allocations = []
 
@@ -1189,28 +1171,43 @@ def test_swap_preserves_host_sparse_update(monkeypatch, override_name):
 
     monkeypatch.setattr(product_swap, "_make_swap", allocate)
     # CPU allocations replace only the external NovaSwap storage/transfer API.
-    _patch_container_swap_api(monkeypatch, SimpleNamespace(
-        register_tensor=lambda *_args, **_kwargs: None,
-        execute=lambda *_args, **_kwargs: None,
-    ))
+    _patch_container_swap_api(
+        monkeypatch,
+        SimpleNamespace(
+            register_tensor=lambda *_args, **_kwargs: None,
+            execute=lambda *_args, **_kwargs: None,
+        ),
+    )
 
     def build():
         model = torch.nn.Module()
         model.register_parameter("dense", torch.nn.Parameter(torch.ones(4)))
-        model.add_module("table", HostEngramTable.Config(
-            vocab_size=16, layer_id=0, ngram_orders=(2,), num_heads=1,
-            head_vocab_sizes=(11,), embedding_dim=4, num_embeddings=12,
-            require_token_id_map=False, pin_memory=False,
-        ).build())
+        model.add_module(
+            "table",
+            HostEngramTable.Config(
+                vocab_size=16,
+                layer_id=0,
+                ngram_orders=(2,),
+                num_heads=1,
+                head_vocab_sizes=(11,),
+                embedding_dim=4,
+                num_embeddings=12,
+                require_token_id_map=False,
+                pin_memory=False,
+            ).build(),
+        )
         with torch.no_grad():
             model.table.weight.copy_(torch.arange(48).reshape(12, 4) / 16)
-        root = _Root.Config(optimizer=HostSparseOptimizersContainer.Config(
-            implementation="for-loop",
-            param_groups=[
-                ParamGroupConfig(pattern=r"table\.weight$", optimizer_name="SparseAdam", optimizer_kwargs={"lr": 0.05}),
-                ParamGroupConfig(pattern=r".*", optimizer_name="AdamW", optimizer_kwargs={"lr": 0.01}),
-            ],
-        ))
+        root = _Root.Config(
+            optimizer=HostSparseOptimizersContainer.Config(
+                optimizers=[
+                    SparseAdam.Config(pattern="table\\.weight$", betas=(0.9, 0.999), eps=1e-08, lr=0.05),
+                    AdamW.Config(
+                        pattern=".*", fused=False, foreach=False, betas=(0.9, 0.999), weight_decay=0.01, lr=0.01
+                    ),
+                ],
+            )
+        )
         apply_overrides(OverrideConfig(imports=[f"torchtitan_npu.override.common.optimizer.{override_name}"]), root)
         optimizer = root.optimizer.build(model_parts=[model])
         assert isinstance(optimizer, HostSparseOptimizersContainer)
@@ -1243,7 +1240,7 @@ def test_swap_preserves_host_sparse_update(monkeypatch, override_name):
 
 @pytest.mark.parametrize("saved_steps", [0, 3], ids=["before-first-step", "after-training"])
 def test_host_sparse_swap_checkpoint_resumes_exactly(monkeypatch, tmp_path, saved_steps):
-    from torchtitan.components.optimizer import ParamGroupConfig
+    from torchtitan.components.optim import AdamW
 
     from torchtitan_npu.extensions.torchtitan.components.optimizer.optimizer import (
         HostSparseOptimizersContainer,
@@ -1270,12 +1267,11 @@ def test_host_sparse_swap_checkpoint_resumes_exactly(monkeypatch, tmp_path, save
             model.table.weight.copy_(torch.arange(48).reshape(12, 4) / 16)
         root = _Root.Config(
             optimizer=HostSparseOptimizersContainer.Config(
-                implementation="for-loop",
-                param_groups=[
-                    ParamGroupConfig(
-                        pattern=r"table\.weight$", optimizer_name="SparseAdam", optimizer_kwargs={"lr": 0.05}
+                optimizers=[
+                    SparseAdam.Config(pattern="table\\.weight$", betas=(0.9, 0.999), eps=1e-08, lr=0.05),
+                    AdamW.Config(
+                        pattern=".*", fused=False, foreach=False, betas=(0.9, 0.999), weight_decay=0.01, lr=0.01
                     ),
-                    ParamGroupConfig(pattern=r".*", optimizer_name="AdamW", optimizer_kwargs={"lr": 0.01}),
                 ],
             )
         )
@@ -1327,7 +1323,7 @@ def test_hostsparse_schema_keeps_sparse_lifecycle_under_npu_state(monkeypatch) -
     correction (``_scale_dense_gradients``).
     """
     from torchtitan_npu.config.configs import TrainingConfig
-    from torchtitan_npu.extensions import trainer as trainer_module
+    from torchtitan_npu.extensions.torchtitan import trainer as trainer_module
     from torchtitan_npu.extensions.torchtitan.components.optimizer.optimizer import HostSparseOptimizersContainer
     from torchtitan_npu.extensions.torchtitan.trainer import TrainerEx
     from torchtitan_npu.override.common.optimizer import (
@@ -1343,7 +1339,7 @@ def test_hostsparse_schema_keeps_sparse_lifecycle_under_npu_state(monkeypatch) -
     captured: dict[str, object] = {}
 
     def capture_runtime(self, runtime) -> None:
-        captured["optimizer"] = runtime.optimizer
+        captured["optimizer"] = runtime.optim.optimizer
         raise ReachedUpstreamError
 
     monkeypatch.setattr(trainer_module, "set_allow_hf32", lambda _: None)
@@ -1351,10 +1347,11 @@ def test_hostsparse_schema_keeps_sparse_lifecycle_under_npu_state(monkeypatch) -
     monkeypatch.setattr(trainer_module.Trainer, "__init__", capture_runtime)
 
     optimizer_config = HostSparseOptimizersContainer.Config(_cpu_offload=True)
-    config = TrainerEx.Config(
-        training=TrainingConfig(enable_cpu_offload=True),
-        optimizer=optimizer_config,
-    )
+    from torchtitan_npu.models.deepseek_v4_1.config_registry import deepseek_v4_1_debugmodel_text
+
+    config = deepseek_v4_1_debugmodel_text()
+    config.training.enable_cpu_offload = True
+    config.optim.optimizer = optimizer_config
     with pytest.raises(ReachedUpstreamError):
         TrainerEx(config)
 

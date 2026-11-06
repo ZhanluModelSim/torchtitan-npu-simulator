@@ -13,12 +13,7 @@ export CONFIG="${CONFIG:-deepseek_v4_1_flash_lora}"
 # Match the documented reference-operator LoRA path by default.
 export USE_GOLDEN="${USE_GOLDEN:-1}"
 export OPTIMIZER_OVERRIDES="${OPTIMIZER_OVERRIDES-}"
-if [[ "${CONFIG}" == "deepseek_v4_1_flash_text_lora" ]]; then
-    export DATASET="${DATASET:-c4_test}"
-fi
-
 exec bash "${SCRIPT_DIR}/deepseek_v4_1_flash_cpt_4k_a3.sh" \
-    --compile.no-enable \
-    --checkpoint.no-load-only \
-    --checkpoint.save-training-state \
+    --checkpointer.no-load-only \
+    --checkpointer.save-training-state \
     "$@"

@@ -10,7 +10,7 @@ def test_debugmodel_indexer_weight_projection_uses_linear_initialization():
     from torchtitan_npu.models.deepseek_v3_2 import model_registry
 
     model_spec = model_registry("debugmodel")
-    init = model_spec.model.layers[0].attention.indexer.weights_proj.param_init
+    init = model_spec.layers[0].attention.indexer.weights_proj.param_init
 
     assert isinstance(init["weight"], partial)
     assert init["weight"].func.__name__ == "trunc_normal_"

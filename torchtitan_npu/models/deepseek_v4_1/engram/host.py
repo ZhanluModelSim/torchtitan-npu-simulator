@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import cast
 
@@ -14,6 +15,10 @@ import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 from torch.distributed.device_mesh import DeviceMesh
+
+from .checkpoint import checkpoint_shard
+from .core import EngramTable
+from .lookup import HostEngramLookup, _lookup_grad_rows, _lookup_rows
 
 try:  # torch builds differ in the opaque-object custom-class API surface
     from torch._library.opaque_object import (  # pyrefly: ignore [missing-module-attribute]
@@ -24,18 +29,16 @@ try:  # torch builds differ in the opaque-object custom-class API surface
     _HAS_OPAQUE_OBJECT_API = True
 except ImportError:  # torch build without the opaque-object custom-class API
     _HAS_OPAQUE_OBJECT_API = False
-from torchtitan.tools.logging import logger
 
-from .checkpoint import checkpoint_shard
-from .core import EngramTable
-from .lookup import HostEngramLookup, _lookup_grad_rows, _lookup_rows
+logger = logging.getLogger(__name__)
+
 
 _JOINT_TABLE_MESHES: dict[tuple[dist.ProcessGroup, dist.ProcessGroup], DeviceMesh] = {}
 
 
-def _joint_table_mesh(parallel_dims) -> DeviceMesh:
-    mesh = parallel_dims.get_mesh(["efsdp", "ep"])
-    key = (mesh.get_group("efsdp"), mesh.get_group("ep"))
+def _joint_table_mesh(parallelism_context) -> DeviceMesh:
+    mesh = parallelism_context.get_mesh(["edp_shard", "ep"])
+    key = (mesh.get_group("edp_shard"), mesh.get_group("ep"))
     if key not in _JOINT_TABLE_MESHES:
         ranks = mesh.mesh.flatten().tolist()
         group = dist.new_group(ranks=ranks, use_local_synchronization=True)
@@ -84,7 +87,8 @@ class HostEngramTable(EngramTable):
         # warns that returning a view can lose its pre-backward hook if a
         # caller later performs an in-place op, so end the view chain at this
         # module boundary.
-        return super().forward(input_ids_T, positions_T, **kwargs).clone()
+        with torch.set_grad_enabled(torch.is_grad_enabled() and self.weight.requires_grad):
+            return super().forward(input_ids_T, positions_T, **kwargs).clone()
 
     def _mark_host_weight(self) -> None:
         # Optimizer construction follows parallelize/to_empty, so preserve the
@@ -112,18 +116,25 @@ class HostEngramTable(EngramTable):
     def lookup_mesh(self):
         return self._table_mesh if self._table_mesh is not None else self.ep_mesh
 
-    def parallelize(self, parallel_dims) -> None:
-        ep_mesh = parallel_dims.get_optional_mesh("ep")
+    def _checkpoint_suffix(self) -> str:
+        if self._table_mesh is not None:
+            return f".efsdp_ep_shard_{self._table_mesh.get_local_rank():05d}_of_{self._table_mesh.size():05d}"
+        if self._ep_size <= 1:
+            return ""
+        return f".ep_shard_{self._ep_rank:05d}_of_{self._ep_size:05d}"
+
+    def _parallelize(self, parallelism_context) -> None:
+        ep_mesh = parallelism_context.get_optional_mesh("ep")
         ep_size = ep_mesh.size() if ep_mesh is not None else 1
         self._table_mesh = None
         self._efsdp_size = 1
         if self.shard_over_efsdp:
             if ep_size <= 1:
                 raise ValueError("Engram EFSDP sharding requires EP > 1.")
-            efsdp_mesh = parallel_dims.get_optional_mesh("efsdp")
+            efsdp_mesh = parallelism_context.get_optional_mesh("edp_shard")
             self._efsdp_size = efsdp_mesh.size() if efsdp_mesh is not None else 1
             if self._efsdp_size > 1:
-                self._table_mesh = _joint_table_mesh(parallel_dims)
+                self._table_mesh = _joint_table_mesh(parallelism_context)
         shard_size = ep_size * self._efsdp_size
         if self.num_embeddings % shard_size != 0:
             raise ValueError(
@@ -135,7 +146,7 @@ class HostEngramTable(EngramTable):
         global_weight = self._parameters.pop("weight")
         assert isinstance(global_weight, torch.nn.Parameter)
         try:
-            super().parallelize(parallel_dims)
+            super()._parallelize(parallelism_context)
         finally:
             local_rows = self.num_embeddings // shard_size
             local_weight = torch.nn.Parameter(

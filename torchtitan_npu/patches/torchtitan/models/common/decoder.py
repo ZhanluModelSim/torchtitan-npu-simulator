@@ -10,46 +10,19 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Backport of upstream's decoder-owned input and attention-metadata seam.
+"""Backend-owned attention metadata over the pinned Decoder input contract.
 
-Two upstream changes are carried here, both onto the pinned 0.3.0 decoder:
-
-- **#4897** — attention metadata is owned by the attention backends:
-  ``Decoder._get_attention_metadata`` builds one entry per distinct backend
-  key, and ``Decoder.forward`` hands every layer the entry its own attention
-  names.  The map is built once per microbatch, so a stack whose backends
-  precompute kernel metadata (the DeepSeek stacks' CANN ``*_metadata``
-  operators) pays for it once, not once per layer.
-- **#4116** — the model owns the preprocessing seam:
-  ``Decoder.preprocess_inputs`` turns the dataloader's ``input_dict`` into the
-  forward's ``(inputs, labels, extra_kwargs)``, including the CP shard and the
-  SPMD annotation.  It is the upstream home for what this repository carried
-  as the model-level ``build_attention_masks`` hook, and it is what makes the
-  trainer's and the validator's duplicated post-dataloading logic unnecessary
-  (upstream 0.3.0 asks for exactly that dedup in a TODO).
-- **#4617**, the CP half of that seam — the model owns the rank-local
-  attention-metadata transform as well: ``Decoder._cp_shard`` is the upstream
-  landing site, and the transform lives there instead of in the CP patch.  The
-  map's entries carry this rank's frames and the kernel records built from
-  them, so they are prepared after the shard, on this rank's rows.  0.3.0 has
-  neither ``ParallelismContext`` nor ``shard_tensors``, so the shard inside
-  ``_cp_shard`` is the pinned ``prepare_context_parallel_input`` entry point.
-
-The caller follows the pinned model contract: ``input_dict`` includes
-``labels``, and ``parallel_dims``/``parallelism`` are keyword arguments.
-The internal CP adapter derives its device from the input tensor. The
-``build_attention_masks`` branch is transitional: it is the pre-#4116 shape of
-the same seam, and disappears with the DeepSeek models' migration onto
-``build_attention_metadata``.
+Metadata is keyed by backend geometry, transformed with the typed CP load
+balancer, then passed through the native ``shard_tensors`` and SPMD annotator.
 """
 
 from typing import Any
 
 import torch
-from torch.distributed.tensor.experimental._attention import _HeadTailLoadBalancer
-from torchtitan.distributed.context_parallel import prepare_context_parallel_input
+from torchtitan.distributed import context_parallel
+from torchtitan.distributed.parallelism_context import MeshAxisName
 from torchtitan.distributed.spmd_types import annotate_input_spmd_types
-from torchtitan.models.common.attention import BaseAttention, FlexAttention, VarlenAttention
+from torchtitan.models.common.attention import BaseAttention, FlexInnerAttention, VarlenInnerAttention
 from torchtitan.models.common.decoder import Decoder
 from torchtitan.models.common.decoder_sharding import decoder_input_sharding
 
@@ -57,7 +30,6 @@ from torchtitan_npu.patches.torchtitan.models.common.attention_metadata import (
     AttentionMetadataMap,
     cp_shard_context_set,
     prepare_cp_metadata_map,
-    resolve_cp_layout,
 )
 
 __all__ = ["apply"]
@@ -115,6 +87,7 @@ def forward(
     attention_masks: Any = None,
     *,
     attention_metadata: AttentionMetadataMap | None = None,
+    padding_mask: torch.Tensor | None = None,
 ):
     """Upstream #4897's forward: select each layer's metadata by its key.
 
@@ -136,7 +109,12 @@ def forward(
             if attention_metadata is None
             else attention_metadata.get(layer.attention.attention_metadata_key)
         )
-        h = layer(h, layer_attention_metadata, positions)
+        h = layer(
+            h,
+            layer_attention_metadata,
+            positions,
+            padding_mask=padding_mask,
+        )
 
     h = self.norm(h) if self.norm is not None else h
 
@@ -151,139 +129,102 @@ def forward(
 
 def _cp_shard(
     self,
-    inputs: torch.Tensor,
-    labels: torch.Tensor,
-    extra_kwargs: dict[str, Any],
-    *,
-    cp_mesh: Any,
-    device: torch.device,
-    load_balancer_type: str | None = None,
-    ptrr_mask_key: str | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
-    """Shard for CP, then prepare this rank's attention metadata (upstream #4617).
+    input_dict: dict[str, Any],
+    input_shardings: dict[str, Any],
+    parallelism_context: Any,
+    parallelism: Any,
+) -> dict[str, Any]:
+    """Prepare rank-local backend metadata with the native typed CP shard."""
+    from torchtitan_npu.models.common.restore import DOC_CHUNK_LAYOUT
+    from torchtitan_npu.patches.torchtitan.distributed.context_parallel import DocChunkCPLoadBalancer
+    from torchtitan_npu.patches.torchtitan.models.common.attention_metadata import cp_layout_of
 
-    Upstream #4116/#4617 put the CP half of the metadata seam on the model, and
-    ``_cp_shard`` is its name.  The map carries this rank's frames and the
-    kernel records built from them, so it is rank-dependent exactly as
-    ``attention_masks`` is: its transform runs *after* the shard, on this rank's
-    rows, with the permutation the load balancer sharded by and the global
-    positions the map was built from.  Upstream calls the backend's
-    ``prepare_cp_metadata`` per entry with the permutation alone because the
-    mesh is ambient there; 0.3.0 hands the mesh, the load-balancer type and
-    those positions along as well.
-
-    The pinned native ``prepare_context_parallel_input`` shards a named
-    batch using declared input layouts; all decoder token axes are flat.
-    """
-    attention_metadata = extra_kwargs.get("attention_metadata")
-    positions = extra_kwargs.get("positions")
-    layout = resolve_cp_layout(load_balancer_type, attention_metadata)
-    permutation = None
-    if attention_metadata and layout == "headtail" and positions is not None:
-        permutation = _HeadTailLoadBalancer(
-            positions.shape[-1], cp_mesh.size(), cp_mesh.device_type
-        )._generate_indices()
-
-    del device
+    metadata = input_dict.get("attention_metadata")
+    positions = input_dict.get("positions")
+    balancer_config = parallelism.context_parallel_load_balancer
+    if cp_layout_of(metadata) == DOC_CHUNK_LAYOUT:
+        if balancer_config is not None and not isinstance(balancer_config, DocChunkCPLoadBalancer.Config):
+            raise ValueError("Document-chunk attention metadata requires DocChunkCPLoadBalancer.Config.")
+        balancer_config = DocChunkCPLoadBalancer.Config()
+    layout = (
+        DOC_CHUNK_LAYOUT
+        if isinstance(balancer_config, DocChunkCPLoadBalancer.Config)
+        else "headtail"
+        if isinstance(balancer_config, context_parallel.HeadTailCPLoadBalancer.Config)
+        else "ptrr"
+        if isinstance(balancer_config, context_parallel.PTRRFlexAttentionCPLoadBalancer.Config)
+        else None
+    )
+    cp_mesh = parallelism_context.get_mesh(MeshAxisName.CP)
     with cp_shard_context_set(cp_mesh=cp_mesh, load_balancer_type=layout, positions=positions):
-        batch = prepare_context_parallel_input(
-            {"input": inputs, "labels": labels, **extra_kwargs},
-            decoder_input_sharding(),
-            cp_mesh,
-            layout,
-            ptrr_mask_key,
+        balancer = (
+            balancer_config.build(
+                seq_len=context_parallel.get_cp_input_seq_len(input_dict, input_shardings=input_shardings),
+                attention_metadata=metadata or input_dict.get("attention_masks"),
+            )
+            if balancer_config is not None
+            else None
         )
-        inputs, labels = batch.pop("input"), batch.pop("labels")
-        extra_kwargs = batch
-        if attention_metadata:
-            extra_kwargs["attention_metadata"] = prepare_cp_metadata_map(attention_metadata, permutation=permutation)
-    return inputs, labels, extra_kwargs
+        permutation = balancer.generate_permutation() if balancer is not None else None
+        if metadata:
+            input_dict["attention_metadata"] = prepare_cp_metadata_map(metadata, permutation=permutation)
+        elif "attention_masks" in input_dict:
+            # Native CP attention backends own their metadata transformation.
+            from torchtitan.models.common.cp_attention import CPInnerAttention
+
+            prepared = set()
+            for _, config, _, _ in self.config.traverse(CPInnerAttention.Config, recurse=True):
+                owner = config._owner
+                if owner not in prepared:
+                    input_dict["attention_masks"] = owner.prepare_cp_metadata(
+                        input_dict["attention_masks"], permutation=permutation
+                    )
+                    prepared.add(owner)
+        return context_parallel.shard_tensors(input_dict, input_shardings=input_shardings, permutation=permutation)
 
 
 def preprocess_inputs(
     self,
-    input_dict: dict[str, torch.Tensor],
+    input_dict: dict[str, Any],
     *,
-    parallel_dims: Any,
+    parallelism_context: Any,
     parallelism: Any,
     max_num_documents: int | None = None,
     max_context_length: int | None = None,
+    **kwargs: Any,
 ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
-    """Build masks, shard for CP, and annotate SPMD types (upstream #4116).
-
-    The metadata map is preferred when the stack's attention backends provide
-    builders; the 0.3.0 single-mask path stays for the stacks whose inner
-    attention is a plain Flex/Varlen config, and a model-level
-    ``build_attention_masks`` override (transitional) still owns the whole
-    metadata + CP step.  The CP step itself is delegated to ``_cp_shard``,
-    upstream's method for it, which is also where the map becomes rank-local.
-    """
-    if parallelism.spmd_backend == "full_dtensor":
-        # Fail before any mask build, shard or wrapping: the config is stale.
-        raise ValueError(
-            "upstream torchtitan removed full_dtensor's input path (the pinned 0.3.0 still accepts the "
-            "field), and this seam does not support it; use spmd_types"
+    """Build backend metadata, apply native CP sharding, and annotate inputs."""
+    del kwargs
+    positions = input_dict.get("positions")
+    if positions is not None:
+        metadata = self._get_attention_metadata(
+            positions,
+            padding_mask=input_dict.get("padding_mask"),
+            max_num_documents=max_num_documents,
+            max_context_length=max_context_length,
         )
-    inputs = input_dict["input"]
-    labels = input_dict["labels"]
-    extra_kwargs: dict[str, Any] = {k: v for k, v in input_dict.items() if k not in ("input", "labels")}
-
-    build_attention_masks = getattr(self, "build_attention_masks", None)
-    if build_attention_masks is not None:
-        # Transitional model-level seam (pre-#4116 shape): the model owns the
-        # metadata construction *and* its CP sharding.
-        cp_mesh = parallel_dims.get_mesh("cp") if parallel_dims.cp_enabled else None
-        inputs, labels, extra_kwargs = build_attention_masks(
-            inputs,
-            labels,
-            extra_kwargs,
-            cp_mesh=cp_mesh,
-            load_balancer_type=parallelism.context_parallel_load_balancer,
-        )
-    else:
-        positions = extra_kwargs.get("positions", None)
-        if positions is not None:
-            attention_metadata = self._get_attention_metadata(
-                positions,
-                padding_mask=extra_kwargs.get("padding_mask", None),
+        if metadata:
+            input_dict["attention_metadata"] = metadata
+        elif isinstance(
+            self.config.first_full_attention_backend, (FlexInnerAttention.Config, VarlenInnerAttention.Config)
+        ):
+            input_dict["attention_masks"] = self.get_attention_masks(
+                positions=positions,
+                padding_mask=input_dict.get("padding_mask"),
                 max_num_documents=max_num_documents,
                 max_context_length=max_context_length,
             )
-            if attention_metadata:
-                extra_kwargs["attention_metadata"] = attention_metadata
-            else:
-                # positions and attention_masks are optional (Decoder.forward
-                # defaults both to None). Build masks only for the masked
-                # backends (Flex/Varlen), which is where get_attention_masks is
-                # defined. A maskless backend (e.g. the SDPA config used by the
-                # graph_trainer tests) still receives positions for RoPE but no
-                # masks — it relies on is_causal instead.
-                inner_attention = getattr(self.config.first_attention, "inner_attention", None)
-                if isinstance(inner_attention, (FlexAttention.Config, VarlenAttention.Config)):
-                    extra_kwargs["attention_masks"] = self.get_attention_masks(positions=positions)
-
-        if parallel_dims.cp_enabled:
-            cp_mesh = parallel_dims.get_mesh("cp")
-            inputs, labels, extra_kwargs = self._cp_shard(
-                inputs,
-                labels,
-                extra_kwargs,
-                cp_mesh=cp_mesh,
-                device=inputs.device,
-                load_balancer_type=parallelism.context_parallel_load_balancer,
-                ptrr_mask_key=parallelism.context_parallel_ptrr_mask_key,
-            )
-
-    if parallelism.spmd_backend == "spmd_types":
-        batch = annotate_input_spmd_types(
-            parallel_dims,
-            {"input": inputs, "labels": labels, **extra_kwargs},
-            decoder_input_sharding(),
+    input_shardings = decoder_input_sharding()
+    if parallelism_context.cp_enabled:
+        input_dict = self._cp_shard(
+            input_dict,
+            input_shardings=input_shardings,
+            parallelism_context=parallelism_context,
+            parallelism=parallelism,
         )
-        inputs, labels = batch.pop("input"), batch.pop("labels")
-        extra_kwargs = batch
-
-    return inputs, labels, extra_kwargs
+    input_dict = annotate_input_spmd_types(parallelism_context, input_dict, input_shardings)
+    inputs, labels = input_dict.pop("input"), input_dict.pop("labels")
+    return inputs, labels, input_dict
 
 
 def apply() -> None:

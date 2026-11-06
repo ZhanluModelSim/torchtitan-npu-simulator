@@ -19,15 +19,15 @@ import pytest
 import torch
 from torchtitan.models.common import LayerNorm, Linear
 from torchtitan.models.common.attention import (
-    VarlenAttention,
+    VarlenInnerAttention,
     VarlenMetadata,
     create_varlen_metadata_for_document,
 )
+from torchtitan.models.common.aux_loss import AuxLoss
 from torchtitan.models.common.rope import CosSinRoPE
 
 from torchtitan_npu.models.deepseek_v3_2 import model_registry
 from torchtitan_npu.models.deepseek_v3_2.model import DeepSeekV32Model, Indexer, SparseInnerAttention
-from torchtitan_npu.patches.torchtitan.models.common.aux_loss import AuxLoss
 
 # Two documents in one packed row, the second one longer than ``topk``.
 _POSITIONS = torch.tensor([[0, 1, 2, 0, 1, 2, 3, 4]])
@@ -312,12 +312,12 @@ def test_the_shipped_layers_dispatch_to_a_varlen_mask():
     stand-in the dispatch reads from (``Decoder.get_attention_masks`` touches only
     ``config.first_attention``), so this runs without materializing a model.
     """
-    layer_cfg = model_registry("debugmodel").model.layers[0]
+    layer_cfg = model_registry("debugmodel").layers[0]
     owner = SimpleNamespace(config=SimpleNamespace(first_attention=layer_cfg.attention))
 
     masks = DeepSeekV32Model.get_attention_masks(owner, _POSITIONS.reshape(-1))
 
     assert isinstance(layer_cfg.attention.inner_attention, SparseInnerAttention.Config)
-    assert issubclass(SparseInnerAttention.Config, VarlenAttention.Config)
+    assert issubclass(SparseInnerAttention.Config, VarlenInnerAttention.Config)
     assert isinstance(masks, VarlenMetadata)
     assert masks.cu_seq_q.tolist() == [0, 3, 8]

@@ -203,11 +203,11 @@ class HostOffloadEngramTable(HostEngramTable):
             raise RuntimeError("Engram registered scale was replaced; rebuild the model with a new communicator.")
         return self._elastic_buffer
 
-    def parallelize(self, parallel_dims) -> None:
-        ep_mesh = parallel_dims.get_optional_mesh("ep")
+    def _parallelize(self, parallelism_context) -> None:
+        ep_mesh = parallelism_context.get_optional_mesh("ep")
         if ep_mesh is None or ep_mesh.size() <= 1:
             raise ValueError("AscendC Host Engram requires expert_parallel_degree > 1.")
-        super().parallelize(parallel_dims)
+        super()._parallelize(parallelism_context)
 
     def _init_self_parameters(self) -> None:
         super()._init_self_parameters()

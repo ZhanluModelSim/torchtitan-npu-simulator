@@ -67,13 +67,13 @@ def validate_anticipatory_config(config):
         raise ValueError("moe_force_load_balance bypasses cached expert selection")
     if config.anticipatory.max_rollbacks == 0:
         return
-    if not config.checkpoint.enable or config.checkpoint.load_only:
+    if config.checkpointer is None or config.checkpointer.load_only:
         raise ValueError("Anticipatory routing requires checkpoint saving to be enabled")
     required = {MODEL, DATALOADER, LR_SCHEDULER, OPTIMIZER, TRAIN_STATE}
-    if getattr(getattr(config, "ema_weights", None), "enable", False):
-        from torchtitan_npu.patches.torchtitan.components.ema import EMA_OPTIMIZER
+    if config.optim.ema is not None:
+        from torchtitan.components.checkpointer import EMA
 
-        required.add(EMA_OPTIMIZER)
-    excluded = required.intersection(config.checkpoint.exclude_from_loading)
+        required.add(EMA)
+    excluded = required.intersection(config.checkpointer.exclude_from_loading)
     if excluded:
         raise ValueError(f"Cannot exclude recovery states: {sorted(excluded)}")

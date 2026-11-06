@@ -38,6 +38,13 @@ _setup_torchtitan() {
     revision="$(_torchtitan_revision)" || return
     repository="${TORCHTITAN_REPO:-${TORCHTITAN_REPOSITORY}}"
 
+    # Workflows may run from the target branch while sourcing this PR's script.
+    # Let subsequent pip subprocesses fetch the pinned remat SHA from GitCode.
+    local git_config_index="${GIT_CONFIG_COUNT:-0}"
+    export "GIT_CONFIG_KEY_${git_config_index}=url.https://gitcode.com/hitwdy/remat.git.insteadOf"
+    export "GIT_CONFIG_VALUE_${git_config_index}=https://github.com/meta-pytorch/remat.git"
+    export GIT_CONFIG_COUNT="$((git_config_index + 1))"
+
     echo "Preparing torchtitan at ${revision}..."
     if [[ ! -e "$target_dir" ]]; then
         mkdir -p "$(dirname "$target_dir")"

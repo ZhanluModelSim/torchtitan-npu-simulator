@@ -18,13 +18,13 @@ import spmd_types as spmd
 import torch
 import torch_npu
 from torchtitan.models.common.attention import (
-    VarlenAttention,
+    VarlenInnerAttention,
     VarlenMetadata,
     create_varlen_metadata_for_document,
 )
+from torchtitan.models.common.aux_loss import AuxLoss
 
 from torchtitan_npu.models.deepseek_v3_2.model import SparseIndexerLoss
-from torchtitan_npu.patches.torchtitan.models.common.aux_loss import AuxLoss
 
 
 @spmd.register_autograd_function
@@ -212,11 +212,11 @@ class AscSparseIndexerLoss(SparseIndexerLoss):
         return self.inject(dummy, carrier=carrier)
 
 
-class AscSparseInnerAttention(VarlenAttention):
+class AscSparseInnerAttention(VarlenInnerAttention):
     """Sparse attention using AscendC fused ops (MLA-absorb mode)."""
 
     @dataclass(kw_only=True, slots=True)
-    class Config(VarlenAttention.Config):
+    class Config(VarlenInnerAttention.Config):
         index_topk: int
         indexer_loss: AscSparseIndexerLoss.Config
 

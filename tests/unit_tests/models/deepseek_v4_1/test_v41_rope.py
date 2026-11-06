@@ -22,7 +22,7 @@ from torchtitan_npu.override.common.rope import (
     AscPartialComplexRoPE,
     WorkaroundComplexRoPE,
 )
-from torchtitan_npu.override.common.swiglu_group import AscFeedForward, AscGroupedExperts
+from torchtitan_npu.override.common.swiglu_group import AscSwiGLU
 from torchtitan_npu.override.deepseek_v4_1.mhc import AscV41HcPre
 from torchtitan_npu.override.deepseek_v4_1.sparse_attn.ascendc import AscV41SparseAttention
 
@@ -65,7 +65,7 @@ def test_launcher_selects_shared_rope_for_text_compressor_indexer_and_vision(
 ):
     trainer = launcher_config(golden=golden)
     overrides = trainer.override
-    cfg = trainer.model_spec.model
+    cfg = trainer.model
     apply_overrides(overrides, cfg)
     assert type(cfg.layers[0].attention.rope) is rope_type.Config
     assert type(cfg.layers[2].attention.compressor.rope) is rope_type.Config
@@ -77,7 +77,7 @@ def test_a3_text_rope_override_preserves_the_split_site_contract(launcher_config
     """The fused derive keeps every field the model's builder set on the
     public ComplexRoPE.Config (split prefix width, theta, YaRN, length)."""
     trainer = launcher_config()
-    cfg = trainer.model_spec.model
+    cfg = trainer.model
     attention_before = cfg.layers[0].attention.rope
     compress_before = cfg.layers[2].attention.compressor.rope
     apply_overrides(trainer.override, cfg)
@@ -97,7 +97,7 @@ def test_rope_entries_are_mutually_exclusive(launcher_config):
     """The reference and fused text-rope entries claim the same public
     ComplexRoPE.Config nodes, so listing two of them must fail loudly."""
     trainer = launcher_config()
-    cfg = trainer.model_spec.model
+    cfg = trainer.model
     both = OverrideConfig(
         imports=[
             "torchtitan_npu.override.common.rope.workaround",
@@ -114,7 +114,7 @@ def test_a5_launcher_selects_the_full_fused_stack(launcher_config, monkeypatch):
     # Check real override selection without loading the native CANN registration.
     monkeypatch.setitem(sys.modules, "cann_ops_nn.ops", ModuleType("cann_ops_nn.ops"))
     trainer = launcher_config("a5")
-    cfg = trainer.model_spec.model
+    cfg = trainer.model
     apply_overrides(trainer.override, cfg)
 
     # Text rope: asc_partial replaces the A3 asc_complex choice; vision keeps
@@ -129,8 +129,8 @@ def test_a5_launcher_selects_the_full_fused_stack(launcher_config, monkeypatch):
 
     # SwiGLUGroup: routed grouped experts plus the FQN-limited shared experts.
     moe = cfg.layers[0].moe
-    assert type(moe.routed_experts.inner_experts) is AscGroupedExperts.Config
-    assert type(moe.shared_experts) is AscFeedForward.Config
+    assert type(moe.routed_experts.activation_fn) is AscSwiGLU.Config
+    assert type(moe.shared_experts.activation_fn) is AscSwiGLU.Config
 
     inner = cfg.layers[2].attention.inner_attention
     assert type(inner) is AscV41SparseAttention.Config
@@ -150,7 +150,7 @@ def test_a5_golden_launches_no_fused_defaults(launcher_config):
     imports = [entry if isinstance(entry, str) else entry[0] for entry in trainer.override.imports]
     assert [i for i in imports if ".asc" in i or "swiglu" in i] == []
 
-    cfg = trainer.model_spec.model
+    cfg = trainer.model
     apply_overrides(trainer.override, cfg)
     assert type(cfg.layers[0].attention.rope) is WorkaroundComplexRoPE.Config
     assert type(cfg.layers[2].attention.compressor.rope) is WorkaroundComplexRoPE.Config
@@ -158,6 +158,6 @@ def test_a5_golden_launches_no_fused_defaults(launcher_config):
     assert type(cfg.vision_encoder.rotary) is HalfRotation.Config
     # The experts keep whatever reference config the builders produced; the
     # point here is that no SwiGLUGroup replacement was applied.
-    assert type(cfg.layers[0].moe.shared_experts) is not AscFeedForward.Config
-    assert type(cfg.layers[0].moe.routed_experts.inner_experts) is not AscGroupedExperts.Config
+    assert type(cfg.layers[0].moe.shared_experts.activation_fn) is not AscSwiGLU.Config
+    assert type(cfg.layers[0].moe.routed_experts.activation_fn) is not AscSwiGLU.Config
     assert type(cfg.layers[2].attention.inner_attention) is CompressedSparseInnerAttention2.Config

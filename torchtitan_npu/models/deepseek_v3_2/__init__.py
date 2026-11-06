@@ -6,9 +6,8 @@
 
 from typing import cast
 
-from torchtitan.components.optimizer import register_moe_load_balancing_hook
 from torchtitan.config import derive
-from torchtitan.distributed.pipeline_parallel import pipeline_llm
+from torchtitan.config.transform import ModelConfigConverter, validate_converter_compatibility
 from torchtitan.models.common import (
     ComplexRoPE,
     CosSinRoPE,
@@ -16,7 +15,12 @@ from torchtitan.models.common import (
     LayerNorm,
     Linear,
     RMSNorm,
+    Softmax,
 )
+from torchtitan.models.common.aux_loss import (
+    register_aux_loss_zero_hook,
+)
+from torchtitan.models.common.moe import register_moe_load_balancing_hook
 from torchtitan.models.deepseek_v3 import (
     _EMBEDDING_INIT,
     _LINEAR_INIT,
@@ -26,22 +30,14 @@ from torchtitan.models.deepseek_v3 import (
     _build_mtp_layers,
     _output_linear_init,
 )
-from torchtitan.models.utils import validate_converter_order
-from torchtitan.protocols.model import ModelConfigConverter
-from torchtitan.protocols.model_spec import ModelSpec
 
-from torchtitan_npu.patches.torchtitan.models.common.aux_loss import (
-    register_aux_loss_zero_hook,
-)
 from torchtitan_npu.patches.torchtitan.models.common.linear import BatchedLinear
 
 from .model import Attention, DeepSeekV32Model, Indexer, SparseInnerAttention
-from .parallelize import parallelize_deepseek_v3_2
 from .state_dict_adapter import DeepSeekV32StateDictAdapter
 
 __all__ = [
     "deepseekv3_2_configs",
-    "parallelize_deepseek_v3_2",
 ]
 
 
@@ -61,6 +57,7 @@ def _build_dsv3_2_layers(
     **kwargs,
 ):
     layers = _build_dsv3_layers(
+        enable_sp=False,
         dim=dim,
         n_heads=n_heads,
         q_lora_rank=q_lora_rank,
@@ -172,7 +169,7 @@ def _debugmodel_v3_2(
         num_experts=num_experts,
         num_shared_experts=num_shared_experts,
         router_top_k=3,
-        router_score_func="softmax",
+        router_score_func=Softmax.Config(),
         moe_comm_backend=moe_comm_backend,
         non_blocking_capacity_factor=non_blocking_capacity_factor,
         rope=ComplexRoPE.Config(
@@ -190,6 +187,7 @@ def _debugmodel_v3_2(
         index_topk=index_topk,
     )
     return DeepSeekV32Model.Config(
+        max_context_length=max_context_length,
         vocab_size=vocab_size,
         dim=dim,
         tok_embeddings=Embedding.Config(num_embeddings=vocab_size, embedding_dim=dim, param_init=_EMBEDDING_INIT),
@@ -213,9 +211,9 @@ deepseekv3_2_configs = {
 }
 
 
-def _post_optimizer_build_fn(optimizers, model_parts, parallel_dims):
-    register_moe_load_balancing_hook(optimizers, model_parts, parallel_dims)
-    register_aux_loss_zero_hook(optimizers, model_parts, parallel_dims)
+def _post_optimizer_build_fn(optimizers, model_parts, parallelism_context):
+    register_moe_load_balancing_hook(optimizers, model_parts, parallelism_context)
+    register_aux_loss_zero_hook(optimizers, model_parts, parallelism_context)
 
 
 def model_registry(
@@ -225,7 +223,7 @@ def model_registry(
     num_mtp_layers: int = 0,
     converters: list[ModelConfigConverter.Config] | None = None,
     seq_len: int | None = None,
-) -> ModelSpec:
+) -> DeepSeekV32Model.Config:
     config = deepseekv3_2_configs[flavor](
         moe_comm_backend=moe_comm_backend,
         non_blocking_capacity_factor=non_blocking_capacity_factor,
@@ -233,16 +231,10 @@ def model_registry(
         max_context_length=16384 if seq_len is None else seq_len,
     )
     if converters is not None:
-        validate_converter_order(converters)
+        validate_converter_compatibility(converters)
         for c in converters:
             config = c.build().convert(config)
-    return ModelSpec(
-        name="deepseek_v3_2",
-        flavor=flavor,
-        model=config,
-        max_context_length=16384 if seq_len is None else seq_len,
-        parallelize_fn=parallelize_deepseek_v3_2,
-        pipelining_fn=pipeline_llm,
-        post_optimizer_build_fn=_post_optimizer_build_fn,
-        state_dict_adapter=DeepSeekV32StateDictAdapter,
-    )
+    return config
+
+
+DeepSeekV32Model.state_dict_adapter_cls = DeepSeekV32StateDictAdapter

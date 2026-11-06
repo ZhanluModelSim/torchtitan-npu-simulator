@@ -713,7 +713,7 @@ class CpuOffloadDistributedMuon(DistMuon):
             lr=group["lr"],
             weight_decay=group["weight_decay"],
             adjust_lr_fn=group["adjust_lr_fn"],
-            compute_matrix_shape=compute_layout.global_compute_shape,
+            compute_matrix_shape=compute_layout.lr_reference_shape,
         )
         release = self._staging.submit_d2h(
             parameter_work,

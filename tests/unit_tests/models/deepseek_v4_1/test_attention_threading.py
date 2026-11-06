@@ -29,6 +29,8 @@ from torchtitan_npu.models.deepseek_v4_1 import (
 from torchtitan_npu.models.deepseek_v4_1.attention import CompressedSparseInnerAttention2
 from torchtitan_npu.models.deepseek_v4_1.indexer import REUSE
 
+pytestmark = pytest.mark.usefixtures("single_rank_spmd")
+
 _TOKENS = torch.arange(128).remainder(32)
 _POSITIONS = torch.arange(128)
 # Block return slots: (x, pre_mix, cmp_k, idx_k, topk_indices, topk_scores, candidates).
@@ -60,7 +62,7 @@ def _tiny_debug_model(monkeypatch):
         return make_config(**kwargs)
 
     monkeypatch.setattr(registry, "_make_v41_config", tiny_config)
-    config = registry.model_registry("deepseek_v4_1_debugmodel_text").model
+    config = registry.model_registry("deepseek_v4_1_debugmodel_text")
     config.vocab_size = config.tok_embeddings.num_embeddings = config.lm_head.out_features = 64
     for layer in config.layers:
         layer.engram = None

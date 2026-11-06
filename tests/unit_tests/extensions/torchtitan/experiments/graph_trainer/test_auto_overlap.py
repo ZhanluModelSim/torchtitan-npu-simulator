@@ -208,7 +208,7 @@ def test_npu_auto_overlap_writes_back_scheduler_result(monkeypatch, tmp_path, ca
 def test_pipeline_factory_preserves_default_preparation_and_partial_passes(monkeypatch):
     from torchtitan.experiments.graph_trainer import passes as upstream_passes
 
-    traced_result, parallel_dims = object(), object()
+    traced_result, parallelism_context = object(), object()
     config = _config()
     config.compile.ep_overlap = SimpleNamespace(module_fqn="layers.*.moe")
     before = _named_pass("before")
@@ -232,10 +232,10 @@ def test_pipeline_factory_preserves_default_preparation_and_partial_passes(monke
     configured = graph_trainer_auto_overlap.construct_npu_auto_overlap_passes(
         traced_result,
         config,
-        parallel_dims=parallel_dims,
+        parallelism_context=parallelism_context,
     )
 
-    factory.assert_called_once_with(traced_result, config, parallel_dims=parallel_dims)
+    factory.assert_called_once_with(traced_result, config, parallelism_context=parallelism_context)
     assert configured[0] is before
     assert graph_trainer_auto_overlap._pass_name(configured[1]) == "ep_overlap_validate_pass"
     assert configured[1].keywords == schedule.keywords | {"require_all_to_all": False}
@@ -251,7 +251,7 @@ def test_pipeline_factory_preserves_default_preparation_and_partial_passes(monke
 def test_mutation_functionalization_pipeline_is_composed_before_auto_overlap(
     monkeypatch,
 ):
-    traced_result, parallel_dims = object(), object()
+    traced_result, parallelism_context = object(), object()
     config = _config()
     functionalize = _named_pass("functionalize_recompute_mutations_pass")
     manual = _named_pass("ep_overlap_schedule_pass")
@@ -267,13 +267,13 @@ def test_mutation_functionalization_pipeline_is_composed_before_auto_overlap(
     configured = graph_trainer_auto_overlap.construct_mutation_functionalization_npu_auto_overlap_passes(
         traced_result,
         config,
-        parallel_dims=parallel_dims,
+        parallelism_context=parallelism_context,
     )
 
     factory.assert_called_once_with(
         traced_result,
         config,
-        parallel_dims=parallel_dims,
+        parallelism_context=parallelism_context,
     )
     assert [graph_trainer_auto_overlap._pass_name(pass_fn) for pass_fn in configured] == [
         "functionalize_recompute_mutations_pass",

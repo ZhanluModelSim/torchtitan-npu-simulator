@@ -23,6 +23,7 @@ from torch.distributed.tensor import DTensor
 from torchtitan.models.deepseek_v3.state_dict_adapter import DeepSeekV3StateDictAdapter
 
 from torchtitan_npu.extensions.mx_storage_reader.engram import EngramHuggingFaceStorageReader, dequantize_engram_weight
+from torchtitan_npu.models.common.deepseek_lora import DeepSeekPEFTAdapter, is_lora_parameter
 
 from .engram.checkpoint import checkpoint_shard
 from .indexer import REUSE
@@ -31,7 +32,7 @@ if TYPE_CHECKING:
     from .vision.state_dict_adapter import DeepSeekV41VisionStateDictAdapter
 
 
-class DeepSeekV41StateDictAdapter(DeepSeekV3StateDictAdapter):
+class DeepSeekV41StateDictAdapter(DeepSeekPEFTAdapter, DeepSeekV3StateDictAdapter):
     """V4.1 adapter: the local text mapping plus, when the model has one, the vision half.
 
     Which half is present is read off the model config's class rather than off a None
@@ -40,12 +41,15 @@ class DeepSeekV41StateDictAdapter(DeepSeekV3StateDictAdapter):
     a text-only router never builds.
     """
 
+    hf_experts_key_fragment = "ffn.experts"
+
     def __init__(self, model_config, hf_assets_path):
         self._vision_adapter: DeepSeekV41VisionStateDictAdapter | None = None
         self._engram_tables = {
             i: layer.engram.table for i, layer in enumerate(model_config.layers) if layer.engram is not None
         }
         super().__init__(model_config, hf_assets_path)
+        self._initialize_peft(model_config)
 
         self.from_hf_map = {
             "embed.weight": "tok_embeddings.weight",
@@ -63,9 +67,9 @@ class DeepSeekV41StateDictAdapter(DeepSeekV3StateDictAdapter):
             "layers.{}.attn_norm.weight": "layers.{}.attention_norm.weight",
             "layers.{}.ffn_norm.weight": "layers.{}.ffn_norm.weight",
             # MoE
-            "layers.{}.ffn.experts.{}.w1.weight": "layers.{}.moe.routed_experts.inner_experts.w1_EFD",
-            "layers.{}.ffn.experts.{}.w3.weight": "layers.{}.moe.routed_experts.inner_experts.w3_EFD",
-            "layers.{}.ffn.experts.{}.w2.weight": "layers.{}.moe.routed_experts.inner_experts.w2_EDF",
+            "layers.{}.ffn.experts.{}.w1.weight": "layers.{}.moe.routed_experts.w1_EFD",
+            "layers.{}.ffn.experts.{}.w3.weight": "layers.{}.moe.routed_experts.w3_EFD",
+            "layers.{}.ffn.experts.{}.w2.weight": "layers.{}.moe.routed_experts.w2.weight",
             "layers.{}.ffn.gate.weight": "layers.{}.moe.router.gate.weight",
             "layers.{}.ffn.gate.bias": "layers.{}.moe.expert_bias_E",
             "layers.{}.ffn.shared_experts.w1.weight": "layers.{}.moe.shared_experts.w1.weight",
@@ -242,13 +246,16 @@ class DeepSeekV41StateDictAdapter(DeepSeekV3StateDictAdapter):
                 else:
                     state_dict[key] = value
 
-        return state_dict
+        return self._native_fused_linears_from_hf(state_dict, fuse_routed_experts=True)
 
     def _to_hf_text(self, state_dict: dict[str, Any]) -> dict[str, Any]:
+        state_dict = self._native_fused_linears_to_hf(state_dict, split_routed_experts=True)
         to_hf_map = {v: k for k, v in self.from_hf_map.items()}
         hf_state_dict = {}
 
         for key, value in state_dict.items():
+            if is_lora_parameter(key):
+                continue
             if ".engram.table.weight" in key:
                 match = re.fullmatch(r"layers\.(\d+)\.engram\.table\.weight", key)
                 if match is None:
@@ -275,7 +282,7 @@ class DeepSeekV41StateDictAdapter(DeepSeekV3StateDictAdapter):
             elif any(t in key for t in ("compressor", "indexer")):
                 hf_state_dict[to_hf_map[key]] = value
 
-            elif "moe.routed_experts.inner_experts" in key:
+            elif "moe.routed_experts" in key:
                 abstract_key = re.sub(r"(\d+)", "{}", key, count=1)
                 new_abstract, layer_num = self._map_to_hf_layer_key(key, to_hf_map)
 

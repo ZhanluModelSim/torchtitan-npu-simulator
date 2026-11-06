@@ -37,12 +37,11 @@ def test_plain_weights_use_routed_experts_and_track_empty_experts():
         x = torch.linspace(-1, 1, 24).reshape(3, 8).requires_grad_()
         out = moe(x)
         assert len(calls) == 1
-        torch.testing.assert_close(moe.tokens_per_expert_E, torch.tensor([3.0, 3.0, 0.0, 0.0]))
+        torch.testing.assert_close(moe.router.tokens_per_expert_E, torch.tensor([3.0, 3.0, 0.0, 0.0]))
         out.square().mean().backward()
         for parameter in (
-            moe.routed_experts.inner_experts.w1_EFD,
-            moe.routed_experts.inner_experts.w2_EDF,
-            moe.routed_experts.inner_experts.w3_EFD,
+            moe.routed_experts.w13.weight,
+            moe.routed_experts.w2.weight,
         ):
             assert parameter.grad is not None
             assert torch.count_nonzero(parameter.grad[2:]) == 0
@@ -117,7 +116,7 @@ def test_baseline_rejects_tensor_parallel():
     config = deepseek_v4_1_debugmodel_multimodal()
     config.parallelism.tensor_parallel_degree = 2
     with pytest.raises(NotImplementedError, match="TP=1"):
-        config.model_spec.model.update_from_config(config=config)
+        config.model.update_from_config(config=config)
 
 
 def test_trainer_config_rejects_a_ratio_table_shorter_than_the_stack():
@@ -125,11 +124,11 @@ def test_trainer_config_rejects_a_ratio_table_shorter_than_the_stack():
     # check that always raised would not pass this test.
     registered = deepseek_v4_1_debugmodel_multimodal()
     registered.training.max_context_length = 512
-    registered.model_spec.model.update_from_config(config=registered)
+    registered.model.update_from_config(config=registered)
 
     config = deepseek_v4_1_debugmodel_multimodal()
     config.training.max_context_length = 512
-    model_config = config.model_spec.model
+    model_config = config.model
     model_config.compress_ratios = model_config.compress_ratios[:-1]
     with pytest.raises(ValueError, match="compress_ratios must match n_layers"):
         model_config.update_from_config(config=config)

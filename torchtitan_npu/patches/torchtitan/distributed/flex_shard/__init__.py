@@ -3,7 +3,4 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from . import (
-    dist_muon,  # noqa: F401
-    replica_dedup,  # noqa: F401
-)
+from . import replica_dedup  # noqa: F401

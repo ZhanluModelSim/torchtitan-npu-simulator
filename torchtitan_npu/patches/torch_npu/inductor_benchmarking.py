@@ -11,13 +11,15 @@ and installs it as the NPU path of ``TorchProfilerBenchmarker.benchmark_gpu``.
 Other device types keep the original implementation.
 """
 
+import logging
 from collections.abc import Callable
 from typing import Any
 
 import torch
 from torch._dynamo.device_interface import get_interface_for_device
 from torch._inductor.runtime import benchmarking
-from torchtitan.tools.logging import logger
+
+logger = logging.getLogger(__name__)
 
 _ORIGINAL_BENCHMARK_GPU_ATTR = "_torch_npu_original_benchmark_gpu"
 _CALLABLE_PROFILE_EVENT_NAME = "_CALLABLE"

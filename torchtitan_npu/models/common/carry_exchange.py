@@ -81,10 +81,10 @@ class CarryExchange(Module):
         self.ratio = config.ratio
         self.group = None
 
-    def parallelize(self, parallel_dims) -> None:
+    def _parallelize(self, parallelism_context) -> None:
         """Take the CP mesh the framework hands down to every module."""
-        self.group = parallel_dims.get_optional_mesh("cp")
-        super().parallelize(parallel_dims)
+        self.group = parallelism_context.get_optional_mesh("cp")
+        super()._parallelize(parallelism_context)
 
     @property
     def active(self) -> bool:

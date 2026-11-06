@@ -53,7 +53,7 @@ def test_dsv4_mtp_batch_precedes_cp_sharding():
 def test_dsv32_default_config_disables_mtp():
     config = deepseek_v3_2_debugmodel()
 
-    assert not config.model_spec.model.mtp_layers
+    assert not config.model.mtp_layers
     assert isinstance(config.loss, _community_loss.ChunkedLossWrapper.Config)
 
 
@@ -99,7 +99,7 @@ def test_dsv4_mtp_accepts_cp_configuration():
         context_parallel_degree=2,
     )
 
-    config.model_spec.model.update_from_config(config=config)
+    config.model.update_from_config(config=config)
 
 
 def test_prepare_mtp_batch_respects_packed_sequence_boundaries():
@@ -199,10 +199,15 @@ def _run_full_mtp_loss(case: _MTPChunkedLossCase) -> torch.Tensor:
         )
     )
     loss, _ = loss_fn(
-        [case.full_lm_head(item) for item in case.full_hidden],
-        case.labels,
+        tuple(case.full_lm_head(item) for item in case.full_hidden),
+        (
+            case.labels,
+            *(
+                _community_mtp.roll_mtp_sequence(case.labels, shift=depth, positions=case.positions, fill_value=-100)
+                for depth in range(1, len(case.full_hidden))
+            ),
+        ),
         case.global_valid_tokens,
-        positions=case.positions,
     )
     loss.backward()
     return loss

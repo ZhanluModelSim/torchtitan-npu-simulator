@@ -6,12 +6,12 @@
 
 """Overrides for NPU swap-backed optimizer states and their checkpoints."""
 
+import logging
 import math
 from collections import deque
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
-from functools import partial
+from dataclasses import dataclass, replace
 from types import MethodType
 from typing import Any, TypedDict, cast
 
@@ -20,21 +20,24 @@ import torch.distributed as dist
 import torch_npu
 from torch.distributed._tensor import DTensor
 from torch.optim.optimizer import Optimizer, _get_scalar_dtype, _use_grad_for_differentiable
-from torchtitan.components.optimizer import OptimizersContainer
-from torchtitan.components.optimizer.utils import (
+from torchtitan.components.optim import AdamW, OptimizersContainer
+from torchtitan.components.optim.optimizer import BaseOptimizer
+from torchtitan.components.optim.optimizer import DistMuon as ConfigurableDistMuon
+from torchtitan.components.optim.utils import (
     get_flat_optim_state_dict,
     init_optim_state,
     load_flat_optim_state_dict,
 )
 from torchtitan.config import derive, override
 from torchtitan.distributed.flex_shard.dist_muon import DistMuon
-from torchtitan.tools.logging import logger
 
 from torchtitan_npu.extensions.cpu_offload import runtime as clip_state
 from torchtitan_npu.extensions.cpu_offload.cpu_offload_adamw import CpuOffloadAdamW
 from torchtitan_npu.extensions.cpu_offload.staging import CpuStaging
 from torchtitan_npu.extensions.novaswap import swap_api
 from torchtitan_npu.extensions.torchtitan.components.optimizer.optimizer import HostSparseOptimizersContainer
+
+logger = logging.getLogger(__name__)
 
 _ADAMW_SWAP_BUCKET_TIMES = 16
 _ADAMW_SWAP_RESIDENT_TARGET_BUCKETS = 3
@@ -440,8 +443,8 @@ class VirtualOptimizersContainer(OptimizersContainer):
     class Config(OptimizersContainer.Config):
         pass
 
-    def __init__(self, config: Config, *, model_parts):
-        super().__init__(config=config, model_parts=model_parts)
+    def __init__(self, config: Config, *, model_parts, enable_cuda_graph: bool = False):
+        super().__init__(config=config, model_parts=model_parts, enable_cuda_graph=enable_cuda_graph)
         for opt in self._swap_optimizers():
             opt.register_step_pre_hook(_swap_state_init_hook)
 
@@ -509,6 +512,53 @@ def _build_cpu_offload_adamw(params, **kwargs: Any) -> CpuOffloadAdamW:
     return CpuOffloadAdamW(normalized_params, **kwargs)
 
 
+@dataclass(kw_only=True, slots=True)
+class _CpuOffloadOptimizerConfig(BaseOptimizer.Config):
+    """Bind staging resources while retaining upstream parameter selection."""
+
+    optimizer: BaseOptimizer.Config
+    staging: CpuStaging
+    clip_channel: clip_state.GradientClipChannel
+    offload_states: bool
+
+    def build(self, **kwargs) -> Optimizer:
+        params = kwargs.pop("params")
+        if kwargs:
+            raise TypeError(f"Unexpected CPU-offload optimizer build arguments: {sorted(kwargs)}")
+        config = self.optimizer
+        runtime = dict(staging=self.staging, clip_channel=self.clip_channel, offload_states=self.offload_states)
+        if isinstance(config, AdamW.Config):
+            if config.moment_dtype != "parameter":
+                raise ValueError("CPU-offload AdamW requires moment_dtype='parameter'")
+            return _build_cpu_offload_adamw(
+                params,
+                lr=config.lr,
+                betas=config.betas,
+                eps=config.eps,
+                weight_decay=config.weight_decay,
+                **runtime,
+            )
+        if isinstance(config, ConfigurableDistMuon.Config):
+            from torchtitan_npu.extensions.cpu_offload.cpu_offload_muon import build_cpu_offload_distributed_muon
+
+            return build_cpu_offload_distributed_muon(
+                params,
+                compute_sharding_by_fqn=config.compute_sharding_by_fqn,
+                bucket_configs=config.bucket_configs,
+                lr=config.lr,
+                weight_decay=config.weight_decay,
+                momentum=config.momentum,
+                nesterov=config.nesterov,
+                ns_coefficients=config.ns_coefficients,
+                eps=config.eps,
+                ns_steps=config.ns_steps,
+                adjust_lr_fn=config.adjust_lr_fn,
+                enable_hsdp_replica_dedup=getattr(config, "enable_hsdp_replica_dedup", False),
+                **runtime,
+            )
+        raise ValueError(f"CPU-offload optimizer does not support {type(config).__qualname__}")
+
+
 class CpuOffloadOptimizersContainer(OptimizersContainer):
     """Keep canonical optimizer tensors on CPU and compute updates on NPU."""
 
@@ -520,7 +570,9 @@ class CpuOffloadOptimizersContainer(OptimizersContainer):
     class Config(OptimizersContainer.Config):
         pass
 
-    def __init__(self, config: Config, *, model_parts) -> None:
+    def __init__(self, config: Config, *, model_parts, enable_cuda_graph: bool = False) -> None:
+        if enable_cuda_graph:
+            raise ValueError("CPU-offload optimizers do not support CUDA graph capture")
         # The CPU-offload override is the single owner of the FSDP and
         # gradient-clip patches: they are imported and installed only when
         # the user selects ``cpu_offload``. Unselected runs never import
@@ -547,7 +599,28 @@ class CpuOffloadOptimizersContainer(OptimizersContainer):
         )
         clip_state.set_active_channel(self._clip_channel)
         self._closed = False
-        super().__init__(config=config, model_parts=model_parts)
+        from torchtitan_npu.extensions.torchtitan.components.optimizer.optimizer import SparseAdam
+
+        # The upstream container owns first-match selection and validates that
+        # every trainable parameter belongs to exactly one optimizer. Host
+        # SparseAdam stays on CPU and retains its specialized FQN handling.
+        optimizer_configs = [
+            optimizer
+            if isinstance(optimizer, SparseAdam.Config)
+            else _CpuOffloadOptimizerConfig(
+                pattern=optimizer.pattern,
+                optimizer=optimizer,
+                staging=self._staging,
+                clip_channel=self._clip_channel,
+                offload_states=self._offload_states,
+            )
+            for optimizer in config.optimizers
+        ]
+        try:
+            super().__init__(config=replace(config, optimizers=optimizer_configs), model_parts=model_parts)
+        except Exception:
+            self.close()
+            raise
         for optimizer in self.optimizers:
             materialize = getattr(optimizer, "materialize_state", None)
             if materialize is not None:
@@ -605,29 +678,6 @@ class CpuOffloadOptimizersContainer(OptimizersContainer):
         self._clip_channel.clear_pending()
         self._staging.wait()
         super().zero_grad(set_to_none=set_to_none)
-
-    def _resolve_optimizer_factory(self, name: str) -> Callable[..., Optimizer]:
-        if name == "SparseAdam":
-            return torch.optim.SparseAdam
-        if name in {"DistributedMuon", "DistMuon"}:
-            from torchtitan_npu.extensions.cpu_offload.cpu_offload_muon import (
-                build_cpu_offload_distributed_muon,
-            )
-
-            return partial(
-                build_cpu_offload_distributed_muon,
-                staging=self._staging,
-                clip_channel=self._clip_channel,
-                offload_states=self._offload_states,
-            )
-        if name == "AdamW":
-            return partial(
-                _build_cpu_offload_adamw,
-                staging=self._staging,
-                clip_channel=self._clip_channel,
-                offload_states=self._offload_states,
-            )
-        raise ValueError(f"CPU-offload optimizer does not support {name}")
 
 
 class CpuOffloadHostSparseOptimizersContainer(  # pyrefly: ignore [inconsistent-inheritance]
@@ -730,8 +780,8 @@ class OptimizerStateSwapContainer(OptimizersContainer):
     class Config(OptimizersContainer.Config):
         pass
 
-    def __init__(self, config: Config, *, model_parts: list[Any]) -> None:
-        super().__init__(config=config, model_parts=model_parts)
+    def __init__(self, config: Config, *, model_parts: list[Any], enable_cuda_graph: bool = False) -> None:
+        super().__init__(config=config, model_parts=model_parts, enable_cuda_graph=enable_cuda_graph)
         parameter_to_part = {
             id(parameter): part_index
             for part_index, model_part in enumerate(model_parts)

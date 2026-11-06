@@ -12,6 +12,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from torchtitan.models.common import token_dispatcher as native_token_dispatcher
 
 
 @pytest.fixture(scope="module")
@@ -25,29 +26,13 @@ def ep_process_group():
 
     spmd_types.set_spmd_meshes = set_spmd_meshes
 
-    token_dispatcher = types.ModuleType("torchtitan.models.common.token_dispatcher")
-
-    class BaseEPTokenDispatcher:
-        def wire_meshes(self, *, ep_mesh, **kwargs):
-            self.ep_mesh = ep_mesh
-            self.kwargs = kwargs
-
-    class DeepEPTokenDispatcher(BaseEPTokenDispatcher):
-        pass
-
-    token_dispatcher.BaseEPTokenDispatcher = BaseEPTokenDispatcher
-    token_dispatcher.DeepEPTokenDispatcher = DeepEPTokenDispatcher
-
     parents = {
         "torchtitan": types.ModuleType("torchtitan"),
         "torchtitan.distributed": types.ModuleType("torchtitan.distributed"),
-        "torchtitan.models": types.ModuleType("torchtitan.models"),
-        "torchtitan.models.common": types.ModuleType("torchtitan.models.common"),
     }
     modules = {
         **parents,
         "torchtitan.distributed.spmd_types": spmd_types,
-        "torchtitan.models.common.token_dispatcher": token_dispatcher,
     }
     previous = {name: sys.modules.get(name) for name in modules}
     sys.modules.update(modules)
@@ -283,59 +268,47 @@ def test_dedicated_mesh_is_not_recursively_recreated(ep_process_group, monkeypat
     assert ep_process_group._separate_ep_mesh(dedicated_mesh) is dedicated_mesh
 
 
-def test_dispatcher_wiring_receives_the_separated_mesh(ep_process_group, monkeypatch):
-    source_group = SimpleNamespace(group_name="source")
-    source_mesh = _FakeMesh(source_group)
-    dedicated_mesh = _FakeMesh(SimpleNamespace(group_name="dedicated"))
-    monkeypatch.setattr(ep_process_group, "_is_fake_group", lambda group: False)
-    monkeypatch.setattr(
-        ep_process_group,
-        "_create_separate_ep_mesh",
-        lambda mesh: dedicated_mesh,
-    )
+def test_dispatcher_reads_the_separated_group_from_registered_sparse_mesh(ep_process_group, monkeypatch):
+    source_group = SimpleNamespace(group_name="ep-source")
+    dedicated_group = SimpleNamespace(group_name="ep-dedicated")
+    groups = {
+        "dp-source": SimpleNamespace(group_name="dp-source"),
+        "edp-source": SimpleNamespace(group_name="edp-source"),
+        "ep-source": source_group,
+        "ep-dedicated": dedicated_group,
+    }
 
-    token_dispatcher = sys.modules["torchtitan.models.common.token_dispatcher"]
-    dispatcher = token_dispatcher.BaseEPTokenDispatcher()
-    dispatcher.wire_meshes(ep_mesh=source_mesh, tp_mesh="tp")
-    assert dispatcher.ep_mesh is dedicated_mesh
-    assert dispatcher.kwargs == {"tp_mesh": "tp"}
+    class RegistryMesh(_FakeSparseMesh):
+        """Resolve group names like DeviceMesh's shared process-group registry."""
 
+        def __getitem__(self, name):
+            return _FakeMesh(self.get_group(name))
 
-def test_dispatcher_with_owned_group_skips_generic_mesh_creation(ep_process_group, monkeypatch):
-    source_group = SimpleNamespace(group_name="source")
-    source_mesh = _FakeMesh(source_group)
-    dispatcher = sys.modules["torchtitan.models.common.token_dispatcher"].BaseEPTokenDispatcher()
-    dispatcher._uses_custom_ep_process_group = True
-    calls = []
+        def get_group(self, mesh_dim=None):
+            index = 0 if mesh_dim is None else self.mesh_dim_names.index(mesh_dim)
+            return groups[self._dim_group_names[index]]
 
-    def separate(mesh):
-        calls.append(mesh)
-        return mesh
-
-    monkeypatch.setattr(ep_process_group, "_separate_ep_mesh", separate)
-
-    dispatcher.wire_meshes(ep_mesh=source_mesh)
-
-    assert dispatcher.ep_mesh is source_mesh
-    assert calls == []
-
-
-def test_deepep_inherited_wiring_uses_the_separated_mesh(ep_process_group, monkeypatch):
-    source_mesh = _FakeMesh(SimpleNamespace(group_name="source"))
-    dedicated_mesh = _FakeMesh(SimpleNamespace(group_name="dedicated"))
+    source_mesh = RegistryMesh(("dp_replicate", "edp_shard", "ep"), ("dp-source", "edp-source", "ep-source"))
+    dedicated_mesh = RegistryMesh(("ep",), ("ep-dedicated",))
     monkeypatch.setattr(ep_process_group, "_is_fake_group", lambda group: False)
     monkeypatch.setattr(ep_process_group, "_create_separate_ep_mesh", lambda mesh: dedicated_mesh)
+    spmd_types = sys.modules["torchtitan.distributed.spmd_types"]
+    spmd_types.set_spmd_meshes(dense_mesh="dense", sparse_mesh=source_mesh, dense_sp_enabled=False)
+    # Only isolate the runtime registry boundary. The real dispatcher property
+    # must read the mesh installed by the extension rather than a stored field.
+    monkeypatch.setattr(
+        native_token_dispatcher, "spmd_sparse_mesh", lambda: ep_process_group._registered["sparse_mesh"]
+    )
+    dispatcher = native_token_dispatcher.AllToAllTokenDispatcher.Config(num_experts=4, top_k=1).build()
 
-    token_dispatcher = sys.modules["torchtitan.models.common.token_dispatcher"]
-    dispatcher = token_dispatcher.DeepEPTokenDispatcher()
-    dispatcher.wire_meshes(ep_mesh=source_mesh)
-
-    assert dispatcher.ep_mesh is dedicated_mesh
+    assert dispatcher.ep_mesh.get_group() is dedicated_group
+    assert dispatcher.ep_mesh.get_group() is not source_group
 
 
-def test_sparse_registration_replaces_only_ep_group(ep_process_group, monkeypatch):
+@pytest.mark.parametrize("dense_sp_enabled", [False, True], ids=["dense-no-sp", "dense-sp"])
+def test_sparse_registration_replaces_only_ep_group(ep_process_group, monkeypatch, dense_sp_enabled):
     source_mesh = _FakeSparseMesh(
-        ("dp_replicate", "efsdp", "ep"),
+        ("dp_replicate", "edp_shard", "ep"),
         ("dp-source", "efsdp-source", "ep-source"),
     )
     dedicated_mesh = _FakeSparseMesh(("ep",), ("ep-dedicated",))
@@ -347,19 +320,20 @@ def test_sparse_registration_replaces_only_ep_group(ep_process_group, monkeypatc
     )
 
     spmd_types = sys.modules["torchtitan.distributed.spmd_types"]
-    spmd_types.set_spmd_meshes(dense_mesh="dense", sparse_mesh=source_mesh)
+    spmd_types.set_spmd_meshes(dense_mesh="dense", sparse_mesh=source_mesh, dense_sp_enabled=dense_sp_enabled)
     replaced = ep_process_group._registered["sparse_mesh"]
 
     assert replaced is not source_mesh
     assert replaced.get_group("dp_replicate").group_name == "dp-source"
-    assert replaced.get_group("efsdp").group_name == "efsdp-source"
+    assert replaced.get_group("edp_shard").group_name == "efsdp-source"
     assert replaced.get_group("ep").group_name == "ep-dedicated"
     assert ep_process_group._registered["dense_mesh"] == "dense"
+    assert ep_process_group._registered["dense_sp_enabled"] is dense_sp_enabled
 
 
 def test_sparse_registration_reuses_cached_mesh(ep_process_group, monkeypatch):
     source_mesh = _FakeSparseMesh(
-        ("dp_replicate", "efsdp", "ep"),
+        ("dp_replicate", "edp_shard", "ep"),
         ("dp-source", "efsdp-source", "ep-source"),
     )
     dedicated_mesh = _FakeSparseMesh(("ep",), ("ep-dedicated",))

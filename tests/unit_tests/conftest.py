@@ -23,8 +23,9 @@ import pytest
 import torch
 
 _REPO = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(_REPO))
 sys.path.insert(0, os.environ.get("TORCHTITAN_DIR", os.path.expanduser("~/workspace/torchtitan")))
+# Spawned workers must resolve this repository's tests package before upstream's.
+sys.path.insert(0, str(_REPO))
 
 # These features still use the pre-fold-batch trainer/optimizer interfaces.
 # Keep their tests out of collection until the feature itself is migrated;
@@ -119,21 +120,53 @@ def pytest_collection_modifyitems(items):
                 settings = params.get("settings", {})
                 # Hash routing discards the vision flag and uses token IDs.
                 is_vision |= settings.get("vision_enabled", False) and not settings.get("hash", False)
+            if (relative_path, getattr(item, "originalname", item.name)) in {
+                (
+                    "models/deepseek_v4_1/test_migration_config.py",
+                    "test_debug_recipe_builds_with_token_budget_and_preserves_embedding_weights",
+                ),
+                (
+                    "models/deepseek_v4_1/test_v41_lora.py",
+                    "test_lora_recipe_preserves_vision_and_uses_standard_adamw_and_peft",
+                ),
+            }:
+                # These config-only nodes use the migrated target contracts.
+                is_vision = False
         if is_vision:
             item.add_marker(pytest.mark.skip(reason="vision migration is outside the current text migration"))
         if getattr(item, "originalname", item.name) in _DEFERRED_DSV32_FOLD_TESTS.get(relative_path, ()):
             item.add_marker(
                 pytest.mark.skip(reason="DeepSeek-V3.2 model boundary still requires the folded-token migration")
             )
-        if relative_path.startswith("extensions/cpu_offload/") and "muon" in item.name.lower():
-            item.add_marker(pytest.mark.skip(reason="native CPU-offload Muon migration is pending"))
-        if item.name.startswith(
-            (
-                "test_lora_training_freezes_engram_and_native_dcp_resumes",
-                "test_v41_adapter_only_resume_restores_engram_and_next_step",
+        # These legacy suites still consume removed optimizer interfaces.
+        # Do not hide new Muon behavior tests by matching their names globally.
+        migrated_muon_config_test = (
+            relative_path == "models/common/test_lora_muon_profile.py"
+            and getattr(item, "originalname", item.name)
+            == "test_actual_lora_recipe_muon_groups_cover_adapters_with_layouts_and_unique_buckets"
+        )
+        if (
+            not relative_path.startswith("config/")
+            and not migrated_muon_config_test
+            and (
+                (
+                    relative_path
+                    in {
+                        "extensions/cpu_offload/test_no_optimizer_state.py",
+                        "override/common/test_swap_optimizer.py",
+                        "models/common/test_lora_muon_profile.py",
+                    }
+                    and "muon" in item.name.lower()
+                )
+                or item.name.startswith(
+                    (
+                        "test_lora_training_freezes_engram_and_native_dcp_resumes",
+                        "test_v41_adapter_only_resume_restores_engram_and_next_step",
+                    )
+                )
             )
         ):
-            item.add_marker(pytest.mark.skip(reason="LoRA checkpoint migration is pending"))
+            item.add_marker(pytest.mark.skip(reason="checkpoint/Muon migration is pending"))
 
 
 # ---------------------------------------------------------------------------
@@ -291,6 +324,15 @@ def _requested_only_tooling(config):
 def pytest_configure(config):
     if not _requested_only_tooling(config):
         install()
+
+
+@pytest.fixture(scope="module")
+def single_rank_spmd():
+    """Provide real CPU mesh axes only to model tests that explicitly request them."""
+    from tests.unit_tests.models.spmd_test_utils import single_rank_spmd_context
+
+    with single_rank_spmd_context() as context:
+        yield context
 
 
 @pytest.fixture(scope="module")

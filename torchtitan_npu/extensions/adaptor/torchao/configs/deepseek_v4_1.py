@@ -14,21 +14,19 @@ builder declared in :mod:`.deepseek_v4`.
 
 from __future__ import annotations
 
-from torchtitan.models.common.linear import Linear
-from torchtitan.models.common.moe import GroupedExperts
+from torchtitan.models.common.linear import GroupedLinear, Linear
 
 from torchtitan_npu.models.deepseek_v4_1.attention import (
     CompressedSparseInnerAttention2 as DeepSeekV41CompressedSparseInnerAttention2,
 )
 from torchtitan_npu.models.deepseek_v4_1.compressor import Compressor as DeepSeekV41Compressor
 from torchtitan_npu.models.deepseek_v4_1.indexer import Selector as DeepSeekV41Selector
-from torchtitan_npu.override.common.swiglu_group.ascendc import AscGroupedExperts
 from torchtitan_npu.patches.torchtitan.models.common.linear import BatchedLinear
 
 from ..filters import _match_fqn_suffix, any_config_filter
 from ..param_swaps import _hif8_param_swap, block_fp8_param_swap, mxfp8_param_swap
 from ..recipes import FilterSpec, ParamSwapSpec
-from .deepseek_v4 import _DENSE, _ROUTED, NpuQuantizedAscGroupedExpertsModule, _routed_expert_block_fp8
+from .deepseek_v4 import _DENSE, _ROUTED, _routed_expert_block_fp8
 
 
 def _is_v41_kv_source(config, fqn: str) -> bool:
@@ -63,15 +61,12 @@ V41_PREQUANTIZE_DEFAULT_FQNS: dict[str, tuple[str, ...]] = {
     V41FilterKeys.ROUTED_EXPERT: _ROUTED,
 }
 
-SPECIFIC_NPU_QUANTIZED_MODULES: dict[type, type] = {
-    GroupedExperts.Config: NpuQuantizedAscGroupedExpertsModule,
-    AscGroupedExperts.Config: NpuQuantizedAscGroupedExpertsModule,
-}
+SPECIFIC_NPU_QUANTIZED_MODULES: dict[type, type] = {}
 
 UNIFIED_NPU_QUANTIZED_MODULES = (
     Linear.Config,
     BatchedLinear.Config,
-    GroupedExperts.Config,
+    GroupedLinear.Config,
     DeepSeekV41CompressedSparseInnerAttention2.Config,
     DeepSeekV41Compressor.Config,
     DeepSeekV41Selector.Config,

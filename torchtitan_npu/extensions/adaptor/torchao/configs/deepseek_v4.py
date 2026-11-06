@@ -13,57 +13,24 @@ and routed-expert row builder.  V4.1 re-declares its own copies in
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Annotated
-
-import tyro
-from torchao.quantization.quant_api import quantize_
-from torchtitan.models.common.linear import Linear
-from torchtitan.models.common.moe import GroupedExperts
+from torchtitan.models.common.linear import GroupedLinear, Linear
 
 from torchtitan_npu.models.deepseek_v4.compressor import LightningIndexer as DeepSeekV4LightningIndexer
-from torchtitan_npu.override.common.swiglu_group.ascendc import AscGroupedExperts, _ensure_cann_ops_loaded
 from torchtitan_npu.patches.torchtitan.models.common.linear import BatchedLinear
 
 from ..filters import any_config_filter
 from ..param_swaps import _hif8_param_swap, block_fp8_param_swap, mxfp8_param_swap
 from ..recipes import FilterSpec, ParamSwapSpec, RecipeContext
 
-if TYPE_CHECKING:
-    from torchao.core.config import AOBaseConfig
-
-
-class NpuQuantizedAscGroupedExpertsModule(AscGroupedExperts):
-    """Parameter-quantized routed experts with the AscGroupedExperts forward."""
-
-    @dataclass(kw_only=True, slots=True)
-    class Config(AscGroupedExperts.Config):
-        _torchao_npu_config: Annotated[AOBaseConfig | None, tyro.conf.Suppress] = None
-
-    def __init__(self, config: Config) -> None:
-        super().__init__(config)
-        if config._torchao_npu_config is None:
-            raise ValueError(f"{type(self).__name__}.Config requires _torchao_npu_config")
-        _ensure_cann_ops_loaded()
-        quantize_(
-            self,
-            config._torchao_npu_config,
-            filter_fn=lambda candidate, _fqn: candidate is self,
-        )
-
-
-# Per-model "config-node type -> dedicated quantized module class" overrides the
-# generic class factory.  Empty for models without a specialized expert path.
-SPECIFIC_NPU_QUANTIZED_MODULES: dict[type, type] = {
-    GroupedExperts.Config: NpuQuantizedAscGroupedExpertsModule,
-    AscGroupedExperts.Config: NpuQuantizedAscGroupedExpertsModule,
-}
+# Projection owners retain their forward and sharding behavior through the
+# generic parameter-swap subclass; the activation override is independent.
+SPECIFIC_NPU_QUANTIZED_MODULES: dict[type, type] = {}
 
 # Per-model config-node types that may be param-swapped, and those to skip.
 UNIFIED_NPU_QUANTIZED_MODULES = (
     Linear.Config,
     BatchedLinear.Config,
-    GroupedExperts.Config,
+    GroupedLinear.Config,
     DeepSeekV4LightningIndexer.Config,
 )
 
@@ -78,7 +45,7 @@ _DENSE = (
     ".moe.shared_experts.w2",
     ".moe.shared_experts.w3",
 )
-_ROUTED = (".moe.routed_experts.inner_experts",)
+_ROUTED = (".moe.routed_experts.w13", ".moe.routed_experts.w2")
 
 
 class V4FilterKeys:

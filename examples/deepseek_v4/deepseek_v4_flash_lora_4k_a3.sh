@@ -12,10 +12,10 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
-export CONFIG="${CONFIG:-deepseek_v4_flash_lora}"
+export CONFIG="${CONFIG:-deepseek_v4_flash_lora_compiled}"
 
 # LoRA uses periodic native adapter checkpoints and final PEFT export.
 exec bash "${SCRIPT_DIR}/deepseek_v4_flash_cpt_4k_a3.sh" \
-    --checkpoint.no-load-only \
-    --checkpoint.save-training-state \
+    --checkpointer.no-load-only \
+    --checkpointer.save-training-state \
     "$@"

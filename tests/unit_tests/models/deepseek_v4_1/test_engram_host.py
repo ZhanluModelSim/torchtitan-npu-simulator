@@ -12,9 +12,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 from torch.utils.checkpoint import DefaultDeviceType, checkpoint
-from torchtitan.components.optimizer import ParamGroupConfig
+from torchtitan.components.optim import AdamW
 
 from torchtitan_npu.extensions.torchtitan.components.optimizer import optimizer as host_mod
+from torchtitan_npu.extensions.torchtitan.components.optimizer.optimizer import SparseAdam
 from torchtitan_npu.models.deepseek_v4_1.engram.host import HostEngramTable
 
 pytestmark = pytest.mark.cpu
@@ -75,7 +76,7 @@ def test_local_sparse_training_and_checkpoint_match_embedding(monkeypatch, recom
 
 
 def test_token_forward_microbatch_clipping_and_sparse_adam_match_embedding():
-    from torchtitan.components.optimizer import ParamGroupConfig
+    from torchtitan.components.optim import AdamW
 
     table = table_config().build()
     table._init_self_buffers(buffer_device=torch.device("cpu"))
@@ -88,9 +89,8 @@ def test_token_forward_microbatch_clipping_and_sparse_adam_match_embedding():
     optimizer = host_mod.HostSparseOptimizersContainer.Config(
         lr=0.05,
         weight_decay=0.0,
-        implementation="for-loop",
-        param_groups=[
-            ParamGroupConfig(pattern="table.weight", optimizer_name="SparseAdam", optimizer_kwargs={"lr": 0.05}),
+        optimizers=[
+            SparseAdam.Config(pattern="table.weight", betas=(0.9, 0.999), eps=1e-08, lr=0.05),
         ],
     ).build(model_parts=[model])
     ref_optimizer = torch.optim.SparseAdam(reference.parameters(), lr=0.05)
@@ -185,8 +185,7 @@ def test_host_offload_weight_and_moments_describe_global_row_shard():
     model = torch.nn.Module()
     model.add_module("table", table)
     optimizer = host_mod.HostSparseOptimizersContainer.Config(
-        implementation="for-loop",
-        param_groups=[ParamGroupConfig(pattern=r"table\.weight$", optimizer_name="SparseAdam")],
+        optimizers=[SparseAdam.Config(pattern="table\\.weight$", betas=(0.9, 0.999), eps=1e-08)],
     ).build(model_parts=[model])
 
     optim_state = optimizer.state_dict()
@@ -207,10 +206,8 @@ def test_host_offload_weight_and_moments_describe_global_row_shard():
     torch.testing.assert_close(restored.weight, table.weight)
 
 
-def test_trainer_clip_owns_only_its_tables(monkeypatch):
+def test_container_clip_owns_only_its_tables(monkeypatch):
     from torchtitan.distributed import utils as dist_utils
-
-    from torchtitan_npu.models.deepseek_v4_1.config_registry import DeepSeekV41Trainer
 
     table = HostEngramTable(_host_table_config())
     values = torch.zeros(1, _DIM)
@@ -220,10 +217,6 @@ def test_trainer_clip_owns_only_its_tables(monkeypatch):
     model.add_module("table", table)
     optimizer = object.__new__(host_mod.HostSparseOptimizersContainer)
     optimizer.model_parts = [model]
-    trainer = object.__new__(DeepSeekV41Trainer)
-    trainer.optimizers = optimizer
-    other = object.__new__(DeepSeekV41Trainer)
-    other.optimizers = object()
 
     def dense_clip(parameters, max_norm, norm_type=2.0, **kwargs):
         return torch.nn.utils.clip_grad_norm_(parameters, max_norm, norm_type, foreach=False)
@@ -231,20 +224,18 @@ def test_trainer_clip_owns_only_its_tables(monkeypatch):
     monkeypatch.setattr(dist_utils, "clip_grad_norm_", dense_clip)
     dense = torch.nn.Parameter(torch.zeros(1))
     dense.grad = torch.tensor([3.0])
-    assert trainer.clip_grad_norm([dense], 1.0).item() == pytest.approx(5.0)
+    assert optimizer.clip_grad_norm([dense], 1.0).item() == pytest.approx(5.0)
     assert dense.grad.item() == pytest.approx(0.6, rel=1e-5)
     assert table.pending_sparse_grad().values()[0, 0].item() == pytest.approx(0.8, rel=1e-5)
     dense.grad = torch.tensor([3.0])
-    assert other.clip_grad_norm([dense], 1.0).item() == pytest.approx(3.0)
+    assert dense_clip([dense], 1.0).item() == pytest.approx(3.0)
     assert dense.grad.item() == pytest.approx(1.0, rel=1e-5)
     assert dist_utils.clip_grad_norm_ is dense_clip
 
 
 @pytest.mark.parametrize("overflow_source", ["dense", "sparse"])
-def test_trainer_clip_aborts_before_nonfinite_correction(monkeypatch, overflow_source):
+def test_container_clip_aborts_before_nonfinite_correction(monkeypatch, overflow_source):
     from torchtitan.distributed import utils as dist_utils
-
-    from torchtitan_npu.models.deepseek_v4_1.config_registry import DeepSeekV41Trainer
 
     table = HostEngramTable(_host_table_config())
     values = torch.zeros(1, _DIM)
@@ -257,16 +248,14 @@ def test_trainer_clip_aborts_before_nonfinite_correction(monkeypatch, overflow_s
     dense.grad = torch.tensor([3e32 if overflow_source == "dense" else 3.0, 1.0])
     optimizer = object.__new__(host_mod.HostSparseOptimizersContainer)
     optimizer.model_parts = [model]
-    trainer = object.__new__(DeepSeekV41Trainer)
-    trainer.optimizers = optimizer
 
     def dense_clip(parameters, max_norm, norm_type=2.0, **kwargs):
         return torch.nn.utils.clip_grad_norm_(parameters, max_norm, norm_type, foreach=False)
 
     monkeypatch.setattr(dist_utils, "clip_grad_norm_", dense_clip)
 
-    with pytest.raises(RuntimeError, match="nonfinite .* gradient norm; optimizer update aborted"):
-        trainer.clip_grad_norm(model.parameters(), 1.0)
+    with pytest.raises(RuntimeError, match=r"nonfinite .* gradient norm; optimizer update aborted"):
+        optimizer.clip_grad_norm(model.parameters(), 1.0)
 
     # Clipping may have scaled dense gradients, but must not introduce NaNs
     # or modify parameters/the pending sparse gradient before raising.
@@ -275,45 +264,41 @@ def test_trainer_clip_aborts_before_nonfinite_correction(monkeypatch, overflow_s
     torch.testing.assert_close(table.pending_sparse_grad().values(), values, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("anticipatory", [False, True], ids=["standard", "anticipatory"])
-def test_training_step_preserves_parent_context_and_sparse_clipping(monkeypatch, anticipatory):
-    from torchtitan.components.optimizer import ParamGroupConfig
-    from torchtitan.distributed import utils as dist_utils
-    from torchtitan.models.common.linear import Linear
-    from torchtitan.models.common.moe import TokenChoiceTopKRouter
-    from torchtitan.trainer import Trainer
+@pytest.mark.parametrize("anticipatory", [False, True], ids=["standard", "anticipatory-hooks"])
+def test_engine_accumulation_preserves_sparse_clipping_and_microbatch_hooks(monkeypatch, anticipatory):
+    from functools import partial
 
-    from torchtitan_npu.extensions.experiment.anticipatory_routing.config import AnticipatoryRoutingConfig
-    from torchtitan_npu.extensions.experiment.anticipatory_routing.schedule import AnticipatorySchedule
-    from torchtitan_npu.models.deepseek_v4_1.config_registry import DeepSeekV41Trainer
+    from torchtitan.components.data import TokenizedTrainingMicrobatch
+    from torchtitan.distributed import utils as dist_utils
+    from torchtitan.training_engine import TrainingEngine
+
+    from torchtitan_npu.models.deepseek_v4_1.config_registry import (
+        DeepSeekV41TrainingEngine,
+        deepseek_v4_1_debugmodel_text,
+    )
     from torchtitan_npu.models.deepseek_v4_1.indexer import FULL
     from torchtitan_npu.override.deepseek_v4_1.lightning_indexer.ascendc import AscSelector
 
-    class RoutingModel(torch.nn.Module):
-        """CPU fixture whose initialization forward visits the real router."""
+    class SparseModel(torch.nn.Module):
+        """A CPU loss fixture with real Host Engram autograd and sparse state."""
 
         def preprocess_inputs(self, batch, **kwargs):
             return batch["input"], batch["labels"], {}
 
         def forward(self, input_ids):
-            return self.router((input_ids.float() + 1).unsqueeze(-1))[0]
+            return (3 * self.dense.sum() + 4 * self.table._distributed_lookup(input_ids)[0, 0]) / 2
 
-    model = RoutingModel()
+    model = SparseModel()
     model.add_module("table", table_config().build())
     model.register_parameter("dense", torch.nn.Parameter(torch.ones(1)))
     with torch.no_grad():
         model.table.weight.fill_(1)
-    optimizer = host_mod.HostSparseOptimizersContainer.Config(
-        lr=0.1,
-        weight_decay=0.0,
-        implementation="for-loop",
-        param_groups=[
-            ParamGroupConfig(pattern="table.weight", optimizer_name="SparseAdam"),
-            ParamGroupConfig(pattern="dense", optimizer_name="AdamW"),
+    optimizer_config = host_mod.HostSparseOptimizersContainer.Config(
+        optimizers=[
+            SparseAdam.Config(pattern="table.weight", lr=0.1, betas=(0.9, 0.999), eps=1e-8),
+            AdamW.Config(pattern="dense", lr=0.1, weight_decay=0, fused=False, foreach=False),
         ],
-    ).build(model_parts=[model])
-    trainer = object.__new__(DeepSeekV41Trainer)
-    trainer.model_parts, trainer.optimizers = [model], optimizer
+    )
     model.selector = AscSelector.Config(
         mode=FULL,
         compress_ratio=1,
@@ -321,94 +306,84 @@ def test_training_step_preserves_parent_context_and_sparse_clipping(monkeypatch,
         index_head_dim=4,
         index_topk=1,
     ).build()
-    model.router = TokenChoiceTopKRouter.Config(
-        num_experts=2,
-        top_k=1,
-        gate=Linear.Config(in_features=1, out_features=2),
-    ).build()
-    with torch.no_grad():
-        model.router.gate.weight.copy_(torch.tensor([[1.0], [-1.0]]))
-    trainer._indexer_selectors = [model.selector]
-    trainer.config = SimpleNamespace(
-        training=SimpleNamespace(disable_cuda_graphs=True, max_norm=1.0, steps=2),
-        parallelism=SimpleNamespace(),
-        anticipatory=AnticipatoryRoutingConfig(enable=anticipatory),
-        checkpoint=SimpleNamespace(interval=1, keep_latest_k=0),
-    )
-    trainer.parallel_dims = SimpleNamespace(
+    engine = object.__new__(DeepSeekV41TrainingEngine)
+    engine.model_parts = [model]
+    engine.device = torch.device("cpu")
+    engine.parallelism_context = SimpleNamespace(
+        cp=1,
         dp_enabled=False,
         pp_enabled=False,
         ep_enabled=False,
-        dp_cp_enabled=False,
+        dp_replicate_enabled=False,
         get_optional_mesh=lambda name: None,
+        activate_spmd=lambda **kwargs: nullcontext(),
     )
-    trainer.device = torch.device("cpu")
-    trainer.step = trainer.num_pp_microbatches = 1
-    trainer.sdc_replayer = None
-    trainer.gradient_accumulation_steps = 2
-    trainer.ntokens_seen = 1
-    trainer.train_context = nullcontext
-
-    events, metrics = [], []
-    trainer.lr_schedulers = SimpleNamespace(get_metrics=lambda: {}, step=lambda: events.append("lr"))
-    trainer.checkpointer = SimpleNamespace(
-        maybe_wait_for_staging=lambda: events.append("staging"), save=lambda *a: True
+    engine.config = SimpleNamespace(
+        training=SimpleNamespace(num_tokens_per_microbatch_per_dp_rank=2, max_context_length=2),
+        parallelism=SimpleNamespace(),
+        debug=SimpleNamespace(spmd_typechecking=False),
     )
-    trainer.metrics_processor = SimpleNamespace(
-        should_log=lambda step: True,
-        log=lambda *args, **kwargs: metrics.append(args),
-        ntokens_since_last_log=0,
-        data_loading_times=[],
+    engine.num_completed_steps = engine.ntokens_seen = 0
+    engine.max_num_documents = None
+    engine.preprocess_inputs_kwargs = {}
+    engine.sdc_replayer = None
+    optim_config = deepseek_v4_1_debugmodel_text().optim
+    optim_config.optimizer = optimizer_config
+    optim_config.max_norm = 1.0
+    engine.optim = optim_config.build(
+        model_parts=[model],
+        parallelism_context=engine.parallelism_context,
+        training_steps=2,
+        pp_has_last_stage=True,
     )
-    trainer._sdc = SimpleNamespace(finalize_sdc_step=lambda: events.append("sdc"))
+    optimizer = engine.optim.optimizers
+    engine.gc_handler = SimpleNamespace(run=lambda step: None)
+    engine._run_forward_backward = partial(engine._forward_backward_body, defer_fsdp_gradient_reduction=False)
+    events = []
+    engine._sdc = SimpleNamespace(finalize_sdc_step=lambda: events.append("sdc"))
+    engine.anticipatory_schedule = (
+        SimpleNamespace(
+            prepare_microbatch=lambda: events.append("prepare"),
+            accumulate_microbatch_loss=lambda loss: events.append(("loss", loss.item())),
+        )
+        if anticipatory
+        else None
+    )
 
-    class Loader:
-        """Two fixed CPU batches for the schedule's initial training step."""
-
-        def __iter__(self):
-            yield {"input": torch.tensor([0]), "num_valid_tokens": 0}, torch.tensor([-100])
-            yield {"input": torch.tensor([0, 1]), "num_valid_tokens": 2}, torch.tensor([1, 2])
-
-        def state_dict(self):
-            return {}
-
-    trainer.dataloader = Loader()
-    trainer.anticipatory_schedule = AnticipatorySchedule(trainer) if anticipatory else None
-
-    def forward_backward(self, input_dict, **kwargs):
-        events.append("forward_backward")
-        # Both microbatches, including unsupervised positions, must be counted
-        # before the first fused selector consumes the step denominator.
+    def loss_fn(output, labels, **kwargs):
         assert model.selector.num_global_queries.item() == 3
         assert kwargs["global_valid_tokens"].item() == 2
-        if anticipatory:
-            assert trainer.anticipatory_schedule.engine.in_step
-        loss = (3 * model.dense.sum() + 4 * model.table._distributed_lookup(input_dict["input"])[0, 0]) / 2
-        loss.backward()
-        return loss
+        return output, {}
+
+    engine.loss_fn = loss_fn
+    groups = [
+        [
+            TokenizedTrainingMicrobatch(
+                input=torch.tensor(tokens),
+                labels=torch.tensor(labels),
+                positions=torch.arange(len(tokens)),
+                padding_mask=torch.ones(len(tokens), dtype=torch.bool),
+                num_valid_tokens=valid,
+            )
+        ]
+        for tokens, labels, valid in (([0], [-100], 0), ([0, 1], [1, 2], 2))
+    ]
+    result = engine.forward_backward(microbatch_groups=groups, global_valid_tokens=2)
+    assert result.loss.item() == 7.0
+    assert engine.loss is result.loss
+    assert engine.num_accumulation_steps == 2 and engine.ntokens_seen == 4
+    assert events == (["prepare", ("loss", 3.5), "sdc"] * 2 if anticipatory else ["sdc"] * 2)
+    assert (
+        DeepSeekV41TrainingEngine._non_pp_forward_backward_microbatch
+        is not TrainingEngine._non_pp_forward_backward_microbatch
+    )
 
     def dense_clip(parameters, max_norm, norm_type=2.0, **kwargs):
-        events.append("clip")
         return torch.nn.utils.clip_grad_norm_(parameters, max_norm, norm_type, foreach=False)
 
-    # Keep the real parent training loop and TrainerEx hooks; only replace the
-    # NPU forward/backward boundary and the distributed dense norm on CPU.
-    monkeypatch.setattr(Trainer, "forward_backward_step", forward_backward)
     monkeypatch.setattr(dist_utils, "clip_grad_norm_", dense_clip)
-    original_step = Trainer.train_step
-    batches = trainer.anticipatory_schedule.data if anticipatory else iter(trainer.dataloader)
-    trainer.train_step(batches)
-
-    expected_events = ["forward_backward", "sdc"] * 2 + ["clip", "staging", "lr"]
-    if anticipatory:
-        engine = trainer.anticipatory_schedule.engine
-        assert engine.last_global_loss == 7.0 and not engine.in_step and not engine.failed
-        assert trainer.metrics_processor.ntokens_since_last_log == 3
-        assert trainer.ntokens_seen == 1  # Initialization must not credit training tokens.
-        buffer = trainer.anticipatory_schedule.cache.replay_buffers[model.router._anticipatory_key]
-        torch.testing.assert_close(buffer.indices, torch.zeros(1, 1, dtype=torch.int64))
-    assert events == expected_events
-    assert metrics == [(1, 7.0, 7.0, 5.0)]
+    assert engine.optim_step().item() == pytest.approx(5.0)
+    assert engine.num_completed_steps == 1
     torch.testing.assert_close(model.dense.grad, torch.tensor([3 / (5 + 1e-6)]))
     sparse = next(opt for opt in optimizer.optimizers if isinstance(opt, torch.optim.SparseAdam))
     expected_moment = torch.zeros_like(model.table.weight)
@@ -417,16 +392,10 @@ def test_training_step_preserves_parent_context_and_sparse_clipping(monkeypatch,
     assert model.table.weight[0, 0] < 1 and model.dense.item() < 1
     torch.testing.assert_close(model.table.weight[1:], torch.ones_like(model.table.weight[1:]))
     assert model.table.pending_sparse_grad() is None
-    assert Trainer.train_step is original_step
-    assert Trainer.train_step.__globals__["dist_utils"] is dist_utils
-    assert dist_utils.clip_grad_norm_ is dense_clip
 
 
 def test_lora_host_table_accepts_folded_parent_keywords_without_frozen_autograd():
-    # LoRA is optional, so import its adapter only for this parent-signature contract.
-    from torchtitan_npu.models.deepseek_v4_1.lora import _LoRAHostEngramTable
-
-    table = _LoRAHostEngramTable.Config(
+    table = HostEngramTable.Config(
         vocab_size=16,
         layer_id=0,
         ngram_orders=(2,),
@@ -448,3 +417,34 @@ def test_lora_host_table_accepts_folded_parent_keywords_without_frozen_autograd(
     expected = table.weight[table.hash(tokens, positions)].flatten(1)
     torch.testing.assert_close(output, expected, rtol=0, atol=0)
     assert not output.requires_grad
+
+
+@pytest.mark.parametrize("nonfinite_loss", [float("nan"), float("inf")], ids=["nan", "infinity"])
+def test_host_sparse_optim_rejects_nonfinite_loss_before_parameter_update(nonfinite_loss):
+    model = torch.nn.Module()
+    model.table = table_config().build()
+    model.dense = torch.nn.Parameter(torch.ones(1))
+    with torch.no_grad():
+        model.table.weight.fill_(1)
+    optimizer_config = host_mod.HostSparseOptimizersContainer.Config(
+        optimizers=[
+            SparseAdam.Config(pattern="table.weight", lr=0.1),
+            AdamW.Config(pattern="dense", lr=0.1, fused=False, foreach=False),
+        ],
+    )
+    context = SimpleNamespace(pp_enabled=False, ep_enabled=False, get_optional_mesh=lambda name: None)
+    optim = host_mod.HostSparseOptim.Config(optimizer=optimizer_config).build(
+        model_parts=[model],
+        parallelism_context=context,
+        training_steps=2,
+        pp_has_last_stage=True,
+    )
+    (model.dense.sum() + model.table._distributed_lookup(torch.tensor([0])).sum()).backward()
+    before = {name: parameter.detach().clone() for name, parameter in model.named_parameters()}
+
+    with pytest.raises(RuntimeError, match="Loss or gradient norm is not finite"):
+        optim.step(torch.tensor(nonfinite_loss), current_step=1)
+
+    for name, parameter in model.named_parameters():
+        torch.testing.assert_close(parameter, before[name], rtol=0, atol=0)
+    assert all(not optimizer.state for optimizer in optim.optimizers.optimizers)

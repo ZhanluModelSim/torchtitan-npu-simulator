@@ -26,6 +26,10 @@ TensorBoard 读取每个 step 的 loss 和 grad_norm → 按 bitwise 或 close �
 `--no-seed-checkpoint` 可跳过共享 checkpoint。
 旧版本可使用 `--baseline-training-api legacy`，将 baseline 的长度参数改为 `--training.seq-len`。
 `--baseline-upstream` / `--test-upstream` 分别指定独立的 TorchTitan 源码目录。
+checkpoint 配置接口通过 `--baseline-config-api` / `--test-config-api` 独立选择：
+默认 `native` 对应可选 checkpointer 与嵌套 optim；`legacy` 对应旧 checkpoint 与 optimizer。
+对比 `93f956c HEAD` 时使用 `--baseline-config-api legacy`，两侧训练长度 API 均保持默认 tokens。
+native 侧由本工具的训练入口构造 DCP checkpointer，不修改模型 recipe；不支持自定义 TRAIN_FILE。
 
 用法示例：
 
@@ -329,6 +333,7 @@ def build_seed_command(
     deterministic: bool = True,
     seq_len: int = DEFAULT_SEQ_LEN,
     training_api: str = "tokens",
+    config_api: str = "native",
 ) -> list[str]:
     # Seed creation skips parallelize_fn but still builds an optimizer. Use
     # AdamW here because DistMuon requires DTensor parameters. Only model
@@ -336,12 +341,23 @@ def build_seed_command(
     return [
         str(runner),
         f"--dump_folder={dump_folder}",
-        "--checkpoint.create_seed_checkpoint",
-        "--checkpoint.enable",
-        "--checkpoint.no-load-only",
-        f"--checkpoint.folder={dump_folder / 'checkpoint'}",
-        "--checkpoint.last-save-model-only",
-        "--optimizer.name=AdamW",
+        *(
+            [
+                "--comparison-create-seed-checkpoint",
+                f"--comparison-checkpoint-folder={dump_folder / 'checkpoint'}",
+                "--optim.optimizer.name=AdamW",
+            ]
+            if config_api == "native"
+            else [
+                "--checkpoint.create_seed_checkpoint",
+                "--checkpoint.enable",
+                "--checkpoint.no-load-only",
+                f"--checkpoint.folder={dump_folder / 'checkpoint'}",
+                "--checkpoint.last-save-model-only",
+                "--checkpoint.export-dtype=float32",
+                "--optimizer.name=AdamW",
+            ]
+        ),
         "--parallelism.data-parallel-replicate-degree=1",
         "--parallelism.data-parallel-shard-degree=1",
         "--parallelism.tensor-parallel-degree=1",
@@ -362,6 +378,7 @@ def build_training_command(
     deterministic: bool = True,
     seq_len: int = DEFAULT_SEQ_LEN,
     training_api: str = "tokens",
+    config_api: str = "native",
 ) -> list[str]:
     command = [
         str(runner),
@@ -373,10 +390,13 @@ def build_training_command(
     ]
     if seed_checkpoint is not None:
         command.extend(
-            [
+            [f"--comparison-initial-load-path={seed_checkpoint}"]
+            if config_api == "native"
+            else [
                 "--checkpoint.enable",
                 "--checkpoint.load_only",
-                "--checkpoint.export_dtype=bfloat16",
+                "--checkpoint.initial-load-model-only",
+                f"--checkpoint.folder={dump_folder / 'checkpoint'}",
                 f"--checkpoint.initial_load_path={seed_checkpoint}",
             ]
         )
@@ -459,16 +479,31 @@ def run_with_realtime_output(
 
 
 def training_env(
-    ngpus: int | None, extra_env: Mapping[str, str] | None = None, *, upstream: Path | None = None
+    ngpus: int | None,
+    extra_env: Mapping[str, str] | None = None,
+    *,
+    upstream: Path | None = None,
+    repo_root: Path | None = None,
+    config_api: str | None = None,
 ) -> dict[str, str]:
+    if upstream is not None and not (upstream / "torchtitan" / "__init__.py").is_file():
+        raise ValueError(f"TorchTitan source root does not contain torchtitan/__init__.py: {upstream}")
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
     if extra_env:
         env.update(extra_env)
     if ngpus is not None:
         env["NGPU"] = str(ngpus)
-    if upstream is not None:
-        env["PYTHONPATH"] = os.pathsep.join(filter(None, (str(upstream.resolve()), env.get("PYTHONPATH", ""))))
+    roots = [str(root.resolve()) for root in (repo_root, upstream) if root is not None]
+    if roots:
+        env["PYTHONPATH"] = os.pathsep.join(filter(None, (*roots, env.get("PYTHONPATH", ""))))
+    if config_api == "native":
+        if env.get("TRAIN_FILE") not in (None, "torchtitan_npu.train", "scripts.numerical_alignment.train"):
+            raise ValueError(
+                "native comparison requires TRAIN_FILE=scripts.numerical_alignment.train; "
+                "unset the custom TRAIN_FILE or select the legacy config API"
+            )
+        env["TRAIN_FILE"] = "scripts.numerical_alignment.train"
     return env
 
 
@@ -809,6 +844,13 @@ def parse_args() -> argparse.Namespace:
     )
     for side in ("baseline", "test"):
         parser.add_argument(
+            f"--{side}-config-api",
+            choices=("legacy", "native"),
+            default="native",
+            help="trainer control API: legacy checkpoint/optimizer (dc3985ad), or native "
+            "optional checkpointer/optim (ebdfc8c, default); independent of the sequence-length API",
+        )
+        parser.add_argument(
             f"--{side}-training-api",
             choices=("legacy", "tokens"),
             default="tokens",
@@ -930,6 +972,20 @@ def main() -> None:
             add_worktree(repo_root, test_worktree, test_commit)
             added_worktrees.append(test_worktree)
             log_success("Git worktrees are ready")
+        baseline_env = training_env(
+            base_n,
+            _merged_env(args.baseline_env),
+            upstream=args.baseline_upstream,
+            repo_root=baseline_worktree,
+            config_api=args.baseline_config_api,
+        )
+        test_env = training_env(
+            test_n,
+            _merged_env(args.test_env),
+            upstream=args.test_upstream,
+            repo_root=test_worktree,
+            config_api=args.test_config_api,
+        )
         baseline_runner = resolve_runner(
             repo_root if args.baseline_runner is not None else baseline_worktree,
             args.baseline_runner or args.runner,
@@ -973,10 +1029,17 @@ def main() -> None:
                     deterministic=not args.no_deterministic,
                     seq_len=args.seq_len,
                     training_api=args.baseline_training_api,
+                    config_api=args.baseline_config_api,
                 ),
                 cwd=baseline_worktree,
-                env=training_env(1, _merged_env(args.baseline_env), upstream=args.baseline_upstream),
-                log_file=seed_dump / "training.log",
+                env=training_env(
+                    1,
+                    _merged_env(args.baseline_env),
+                    upstream=args.baseline_upstream,
+                    repo_root=baseline_worktree,
+                    config_api=args.baseline_config_api,
+                ),
+                log_file=output_dir / "seed.log",
             )
             seed_checkpoint = seed_dump / "checkpoint" / "step-0"
             if not seed_checkpoint.is_dir():
@@ -994,6 +1057,7 @@ def main() -> None:
                 steps=args.steps,
                 options=args.baseline_options,
                 training_api=args.baseline_training_api,
+                config_api=args.baseline_config_api,
                 seed_checkpoint=seed_checkpoint,
                 deterministic=not args.no_deterministic,
                 seq_len=args.seq_len,
@@ -1020,6 +1084,7 @@ def main() -> None:
                 steps=args.steps,
                 options=args.test_options,
                 training_api=args.test_training_api,
+                config_api=args.test_config_api,
                 seed_checkpoint=seed_checkpoint,
                 deterministic=not args.no_deterministic,
                 seq_len=args.seq_len,
@@ -1065,6 +1130,7 @@ def main() -> None:
             runtime_options={
                 side: {
                     "training_api": getattr(args, f"{side}_training_api"),
+                    "config_api": getattr(args, f"{side}_config_api"),
                     "upstream": str(getattr(args, f"{side}_upstream")) if getattr(args, f"{side}_upstream") else None,
                     "options": getattr(args, f"{side}_options"),
                 }

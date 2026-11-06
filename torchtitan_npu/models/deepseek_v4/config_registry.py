@@ -4,13 +4,10 @@
 # LICENSE file in the root directory of this source tree.
 
 import os
-import re
-from collections.abc import Callable
 from dataclasses import fields
 from importlib import import_module
 from typing import Any, cast
 
-from torch.distributed.tensor import Shard
 from torchtitan.components.checkpointer import CheckpointManager
 from torchtitan.components.data import (
     ConcatThenSplitPackingConfig,
@@ -20,9 +17,9 @@ from torchtitan.components.data import (
     SingleDatasetConfig,
 )
 from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
-from torchtitan.components.metrics import MetricsProcessor
-from torchtitan.components.optimizer import LRSchedulersContainer, default_adamw
-from torchtitan.config import CompileConfig, ParallelismConfig
+from torchtitan.components.optim import AdamW, LRSchedulersContainer
+from torchtitan.config.parallelism import ParallelismConfig
+from torchtitan.config.transform import ModelConfigConverter
 from torchtitan.distributed.activation_checkpoint import FullAC
 from torchtitan.distributed.flex_shard import (
     BlockShard,
@@ -30,25 +27,28 @@ from torchtitan.distributed.flex_shard import (
     ComputeLayout,
     Owned,
 )
-from torchtitan.distributed.parallel_dims import MeshAxisName
+from torchtitan.distributed.parallelism_context import MeshAxisName
 from torchtitan.experiments.graph_trainer.configs import GraphTrainerCompileConfig
 from torchtitan.experiments.graph_trainer.configs import (
     to_graph_trainer_config as _to_graph_trainer_config,
 )
 from torchtitan.experiments.graph_trainer.trainer import GraphTrainer
 from torchtitan.models.common.config_utils import decoder_vocab_size
-from torchtitan.protocols.model import ModelConfigConverter
-from torchtitan.protocols.model_spec import ModelSpec
+from torchtitan.observability.metrics import MetricsProcessor
 from torchtitan.trainer import Trainer
 
 from torchtitan_npu.config import (
+    CompileConfig,
+    ModelCompileConfig,
     MuonOptimizerProfile,
+    OptimConfig,
     OptimizerConfig,
     TrainingConfig,
 )
 from torchtitan_npu.extensions.torchtitan.tools.profiler import CANNProfiler
 from torchtitan_npu.extensions.torchtitan.trainer import TrainerEx
 from torchtitan_npu.models.common.alignment import AlignedTextProcessor, compression_alignment
+from torchtitan_npu.models.common.muon import make_expert_layout, with_lora_compute_layouts
 from torchtitan_npu.patches.torchtitan.experiments.graph_trainer import (
     functionalize_recompute_mutations as _functionalize_mutations,
 )
@@ -59,40 +59,23 @@ from . import (
 )
 from .chat_encoder import DSV4EncoderConfig
 from .chat_processor import DeepSeekV4ChatProcessor
-from .lora import DEEPSEEK_V4_LORA_TARGETS, DeepSeekV4LoRAConverter
+from .lora import deepseek_v4_lora_transform
 from .model import DeepSeekV4Model, GraphTrainerDeepSeekV4Model
 from .mtp import MTPChunkedLossWrapper
-from .parallelize import parallelize_graph_trainer_deepseek_v4
 
 
-def _lora_muon_pattern(compute_sharding_by_fqn):
-    # AC/compile wrappers can insert prefixes before layer-local parameter names.
-    suffixes = {fqn.split(".", 2)[-1] for fqn in compute_sharding_by_fqn if "lora_" in fqn}
-    return "|".join(re.escape(suffix) for suffix in sorted(suffixes))
-
-
-def _dsv4_muon_profile(model_spec: ModelSpec) -> MuonOptimizerProfile:
+def _dsv4_muon_profile(model: DeepSeekV4Model.Config) -> MuonOptimizerProfile:
     """Build the DSV4-owned parameter and FlexShard policy for Muon."""
-    model_config = cast("DeepSeekV4Model.Config", model_spec.model)
-    # FSDP folds the (dp_shard, cp) storage mesh into the single
-    # ``dp_shard_cp`` axis when context parallelism is enabled, and the
-    # GraphTrainer path (simple_fsdp + partial_dtensor) stores dense
-    # parameters on the ``fsdp`` axis.  ComputeLayout resolution filters
-    # declarations by the parameter's actual storage mesh, so keep every
-    # axis name to cover CP/non-CP, eager and GraphTrainer runs.
-    dense_dp_axes = (
-        MeshAxisName.DP_SHARD.value,
-        f"{MeshAxisName.DP_SHARD.value}_{MeshAxisName.CP.value}",
-        MeshAxisName.FSDP.value,
-    )
+    model_config = model
+    dense_dp_axes = (MeshAxisName.DP_SHARD.value,)
     owned = ComputeLayout(
         shardings_by_mesh_axis={axis: Owned() for axis in dense_dp_axes},
     )
     attention_shardings = {"wq_a": owned, "wkv": owned, "wo_b": owned}
     attention_per_head_projections = ("wq_b", "wo_a")
     attention_projections = tuple(attention_shardings) + attention_per_head_projections
-    expert_projections = ("w1", "w2", "w3")
-    routed_expert_projections = ("w1_EFD", "w2_EDF", "w3_EFD")
+    expert_projections = ("w13", "w2")
+    routed_expert_projections = ("w13.weight", "w2.weight")
     compressor_projections = ("wkv", "wgate")
     indexer_projections = ("wq_b", "weights_proj")
     hc_pre_modules = ("hc_attn_pre", "hc_ffn_pre")
@@ -117,29 +100,22 @@ def _dsv4_muon_profile(model_spec: ModelSpec) -> MuonOptimizerProfile:
         # [o_lora_rank, per_group_in] matrix per group flattened likewise.
         # BlockShard computes Muon on each per-head/per-group matrix.
         shardings[f"{prefix}.attention.wq_b.weight"] = ComputeLayout(
-            shardings_by_mesh_axis={axis: BlockShard(dim=0, block_size=attention.head_dim) for axis in dense_dp_axes},
+            shardings_by_mesh_axis={
+                axis: BlockShard(dim=0, block_sizes=(attention.head_dim,)) for axis in dense_dp_axes
+            },
         )
         shardings[f"{prefix}.attention.wo_a.weight"] = ComputeLayout(
             shardings_by_mesh_axis={
-                axis: BlockShard(dim=0, block_size=attention.wo_a.out_features) for axis in dense_dp_axes
+                axis: BlockShard(dim=0, block_sizes=(attention.wo_a.out_features,)) for axis in dense_dp_axes
             },
         )
         if getattr(layer_config.attention, "compressor", None) is not None:
             for projection in ("wkv", "wgate"):
                 shardings[f"{prefix}.attention.compressor.{projection}.weight"] = owned
             shardings[f"{prefix}.attention.compressor.ape"] = owned
-        expert_sharding = ComputeLayout(
-            shardings_by_mesh_axis={
-                **{axis: Shard(0) for axis in dense_dp_axes},
-                MeshAxisName.EFSDP.value: Shard(0),
-                MeshAxisName.EP.value: Shard(0),
-            },
-            shard_order_by_tensor_dim={  # pyrefly: ignore [unexpected-keyword]
-                0: (MeshAxisName.EP.value, MeshAxisName.EFSDP.value),
-            },
-        )
+        expert_sharding = make_expert_layout(dense_dp_axes)
         for projection in routed_expert_projections:
-            shardings[f"{prefix}.moe.routed_experts.inner_experts.{projection}"] = expert_sharding
+            shardings[f"{prefix}.moe.routed_experts.{projection}"] = expert_sharding
         shardings[f"{prefix}.moe.router.gate.weight"] = owned
         for module in hc_pre_modules:
             shardings[f"{prefix}.{module}.hc_fn"] = owned
@@ -149,7 +125,7 @@ def _dsv4_muon_profile(model_spec: ModelSpec) -> MuonOptimizerProfile:
                 shardings_by_mesh_axis={
                     axis: BlockShard(
                         dim=0,
-                        block_size=indexer.index_head_dim,
+                        block_sizes=(indexer.index_head_dim,),
                     )
                     for axis in dense_dp_axes
                 },
@@ -162,14 +138,6 @@ def _dsv4_muon_profile(model_spec: ModelSpec) -> MuonOptimizerProfile:
             for projection in mtp_projections:
                 shardings[f"{prefix}.{projection}.weight"] = owned
             shardings[f"{prefix}.hc_head.hc_fn"] = owned
-        for base_key, layout in tuple(shardings.items()):
-            if base_key.endswith(".weight"):
-                owner = base_key.removesuffix(".weight")
-                if owner.removeprefix(f"{prefix}.") in DEEPSEEK_V4_LORA_TARGETS:
-                    shardings[f"{owner}.lora_a.weight"] = owned
-                    shardings[f"{owner}.lora_b.weight"] = layout
-        for projection in ("w13_lora_a", "w1_lora_b", "w3_lora_b", "w2_lora_a", "w2_lora_b"):
-            shardings[f"{prefix}.moe.routed_experts.inner_experts.{projection}"] = expert_sharding
         return shardings
 
     main_layer_shardings = tuple(
@@ -193,7 +161,7 @@ def _dsv4_muon_profile(model_spec: ModelSpec) -> MuonOptimizerProfile:
         fqn: compute_sharding for layer_shardings in per_layer for fqn, compute_sharding in layer_shardings.items()
     }
     compute_sharding_by_fqn["hc_head.hc_fn"] = owned
-    routed_expert_marker = ".moe.routed_experts.inner_experts."
+    routed_expert_marker = ".moe.routed_experts."
 
     def bucket_configs_for_layers(
         prefix: str,
@@ -217,7 +185,6 @@ def _dsv4_muon_profile(model_spec: ModelSpec) -> MuonOptimizerProfile:
     bucket_configs += bucket_configs_for_layers("mtp_layers", mtp_layer_shardings)
     # hc_head is global rather than layer-scoped, so it needs its own bucket.
     bucket_configs += (BucketConfig(name="hc_head", patterns=("hc_head.hc_fn",)),)
-    lora_pattern = _lora_muon_pattern(compute_sharding_by_fqn)
     muon_pattern = (
         r"(?:"
         rf"attention\.(?:{'|'.join(attention_projections)})\.weight|"
@@ -225,13 +192,16 @@ def _dsv4_muon_profile(model_spec: ModelSpec) -> MuonOptimizerProfile:
         rf"attention\.(?:compressor|indexer\.compressor)\.(?:{'|'.join(compressor_projections)})\.weight|"
         r"attention\.(?:compressor|indexer\.compressor)\.ape|"
         rf"moe\.shared_experts\.(?:{'|'.join(expert_projections)})\.weight|"
-        rf"moe\.routed_experts\.inner_experts\.(?:{'|'.join(routed_expert_projections)})|"
+        rf"moe\.routed_experts\.(?:{'|'.join(routed_expert_projections)})|"
         r"moe\.router\.gate\.weight|"
         rf"(?:{'|'.join(hc_pre_modules)})\.hc_fn|"
         rf"(?:{'|'.join(mtp_projections)})\.weight|"
-        r"hc_head\.hc_fn" + (f"|{lora_pattern}" if lora_pattern else "") + r")$"
+        r"hc_head\.hc_fn" + r")$"
     )
-    return MuonOptimizerProfile(
+    from torchtitan_npu.extensions.torchtitan.components.optimizer.muon import DistMuon
+
+    profile = MuonOptimizerProfile(
+        optimizer_config_type=DistMuon.Config,
         muon_pattern=muon_pattern,
         optimizer_factory_kwargs={
             "DistMuon": {
@@ -240,10 +210,11 @@ def _dsv4_muon_profile(model_spec: ModelSpec) -> MuonOptimizerProfile:
             }
         },
     )
+    return with_lora_compute_layouts(model, profile)
 
 
 def _dsv4_optimizer_config(
-    model_spec: ModelSpec,
+    model: DeepSeekV4Model.Config,
     *,
     lr: float,
 ) -> OptimizerConfig:
@@ -253,27 +224,17 @@ def _dsv4_optimizer_config(
     ``--optimizer.name Muon``.  Keeping the profile on the ordinary recipe
     makes the CLI selection the sole Muon entry point.
     """
-    adamw = default_adamw(lr=lr, eps=1e-6)
     return OptimizerConfig(
+        optimizers=[AdamW.Config(pattern=r".*", lr=lr, eps=1e-6)],
         lr=lr,
-        beta1=0.9,
-        beta2=0.95,
-        eps=1e-8,
-        weight_decay=0.1,
-        muon_momentum=0.95,
-        muon_enable_nesterov=True,
         muon_ns_steps=10,
-        muon_adjust_lr_fn="match_rms_adamw",
-        _muon_profile=_dsv4_muon_profile(model_spec),
-        param_groups=adamw.param_groups,
-        implementation=adamw.implementation,
-        optimizer_factory_kwargs_by_name=adamw.optimizer_factory_kwargs_by_name,
+        _muon_profile=_dsv4_muon_profile(model),
     )
 
 
-def _per_doc_alignment(model_spec: ModelSpec) -> int:
+def _per_doc_alignment(model: DeepSeekV4Model.Config) -> int:
     """The pooling granularity the loader pads every packed document to (V4: 128)."""
-    alignment = compression_alignment(cast("DeepSeekV4Model.Config", model_spec.model).compress_ratios)
+    alignment = compression_alignment(model.compress_ratios)
     return int(os.environ.get("DSV4_PER_DOC_ALIGNMENT", alignment))
 
 
@@ -285,18 +246,18 @@ def _make_trainer_config(
     num_mtp_layers: int = 0,
     converters: list[ModelConfigConverter.Config] | None = None,
 ) -> Trainer.Config:
-    model_spec = model_registry(flavor, seq_len=seq_len, num_mtp_layers=num_mtp_layers, converters=converters)
+    model = model_registry(flavor, seq_len=seq_len, num_mtp_layers=num_mtp_layers, converters=converters)
     if num_mtp_layers > 0:
         loss = MTPChunkedLossWrapper.Config(
             mtp_scale=0.3,
             loss_fn=CrossEntropyLoss.Config(
-                global_vocab_size=decoder_vocab_size(model_spec),
+                global_vocab_size=decoder_vocab_size(model),
             ),
         )
     else:
         loss = ChunkedLossWrapper.Config(
             loss_fn=CrossEntropyLoss.Config(
-                global_vocab_size=decoder_vocab_size(model_spec),
+                global_vocab_size=decoder_vocab_size(model),
             ),
         )
     config = TrainerEx.Config(
@@ -308,29 +269,31 @@ def _make_trainer_config(
             profiler_warmup=0,
         ),
         metrics=MetricsProcessor.Config(log_freq=1),
-        model_spec=model_spec,
+        model=model,
         dataloader=GrainDataLoader.Config(
             dataset=ConcatThenSplitPackingConfig(
                 dataset=SingleDatasetConfig(
                     source=HuggingFaceRandomAccessSource.Config(
                         path="json", split="train", load_dataset_kwargs={"data_files": "tests/assets/c4_test/data.json"}
                     ),
-                    processor=AlignedTextProcessor.Config(per_doc_alignment=_per_doc_alignment(model_spec)),
+                    processor=AlignedTextProcessor.Config(per_doc_alignment=_per_doc_alignment(model)),
                     post_filters=(lambda sample: sample is not None,),
                 ),
             ),
         ),
-        optimizer=_dsv4_optimizer_config(model_spec, lr=1e-5),
-        lr_scheduler=LRSchedulersContainer.Config(
-            warmup_steps=20,
-            decay_ratio=0.8,
-            decay_type="cosine",
-            min_lr_factor=0.01,
+        optim=OptimConfig(
+            optimizer=_dsv4_optimizer_config(model, lr=1e-5),
+            lr_scheduler=LRSchedulersContainer.Config(
+                warmup_steps=20,
+                decay_ratio=0.8,
+                decay_type="cosine",
+                min_lr_factor=0.01,
+            ),
         ),
         training=TrainingConfig(
-            num_tokens_per_microbatch_per_dp_rank=local_batch_size * model_spec.max_context_length,
+            num_tokens_per_microbatch_per_dp_rank=local_batch_size * model.max_context_length,
             num_tokens_per_train_step=-1,
-            max_context_length=model_spec.max_context_length,
+            max_context_length=model.max_context_length,
             steps=100,
         ),
         parallelism=ParallelismConfig(
@@ -338,22 +301,15 @@ def _make_trainer_config(
             fsdp_reshard_after_forward="always",
         ),
         activation_checkpoint=FullAC.Config(),
-        compile=CompileConfig(enable=False),
-        checkpoint=CheckpointManager.Config(  # pyrefly: ignore[bad-argument-type]
-            enable=False,
-            interval=100,
-        ),
+        compile=None,
+        checkpointer=None,
     )
     # V4 shards contiguous slabs; the upstream default (headtail) is refused at the CP
     # entry, so every V4 config starts from a runnable value and an explicit headtail
     # still surfaces as the guard's error.
-    config.parallelism.context_parallel_load_balancer = None
-    if getattr(model_spec.model, "lora", None) is not None:
-        from .peft import DeepSeekV4PEFTCheckpointManager
+    from torchtitan_npu.patches.torchtitan.distributed.context_parallel import DocChunkCPLoadBalancer
 
-        config.checkpoint = DeepSeekV4PEFTCheckpointManager.Config(
-            **{item.name: getattr(config.checkpoint, item.name) for item in fields(config.checkpoint) if item.init},
-        )
+    config.parallelism.context_parallel_load_balancer = DocChunkCPLoadBalancer.Config()
     return config
 
 
@@ -386,9 +342,42 @@ def deepseek_v4_flash(
 
 
 def deepseek_v4_flash_lora() -> Trainer.Config:
-    return deepseek_v4_flash(
-        converters=[DeepSeekV4LoRAConverter.Config(rank=16, alpha=32, rank_experts=16)],
+    from torchtitan.config.transform import apply_transforms
+
+    from .peft import DeepSeekV4PEFTCheckpointManager
+
+    config = apply_transforms(deepseek_v4_flash(), [deepseek_v4_lora_transform()])
+    assert isinstance(config.model, DeepSeekV4Model.Config)
+    assert isinstance(config.optim.optimizer, OptimizerConfig)
+    config.optim.optimizer._muon_profile = _dsv4_muon_profile(config.model)
+    config.checkpointer = DeepSeekV4PEFTCheckpointManager.Config()
+    return config
+
+
+def deepseek_v4_flash_cp() -> Trainer.Config:
+    """Flash with the fused document-chunk CP backend selected in the recipe."""
+    from torchtitan.config.transform import ContextParallelTransform
+
+    from torchtitan_npu.override.deepseek_v4.sparse_attn.ascendc import AscV4ContextParallelSparseAttention
+
+    config = deepseek_v4_flash()
+    assert isinstance(config.model, DeepSeekV4Model.Config)
+    config.model = cast(
+        "DeepSeekV4Model.Config",
+        ContextParallelTransform(inner_attention=AscV4ContextParallelSparseAttention).transform(config.model),
     )
+    config.parallelism.context_parallel_degree = 2
+    assert isinstance(config.dataloader, GrainDataLoader.Config)
+    assert isinstance(config.dataloader.dataset, ConcatThenSplitPackingConfig)
+    assert isinstance(config.dataloader.dataset.dataset, SingleDatasetConfig)
+    processor = config.dataloader.dataset.dataset.processor
+    assert isinstance(processor, AlignedTextProcessor.Config)
+    processor.per_doc_alignment = max(
+        processor.per_doc_alignment, compression_alignment(config.model.compress_ratios) * 2
+    )
+    config.override.imports.append("torchtitan_npu.override.deepseek_v4.lightning_indexer.asc")
+    config.__post_init__()
+    return config
 
 
 def deepseek_v4_flash_sft(
@@ -412,7 +401,7 @@ def deepseek_v4_flash_sft(
         num_mtp_layers=num_mtp_layers,
         converters=converters,
     )
-    assert config.model_spec is not None
+    assert isinstance(config.model, DeepSeekV4Model.Config)
     config.dataloader = GrainDataLoader.Config(
         dataset=FirstFitPackingConfig(
             dataset=SingleDatasetConfig(
@@ -420,7 +409,7 @@ def deepseek_v4_flash_sft(
                     path="json", split="train", load_dataset_kwargs={"data_files": dataset_path}
                 ),
                 processor=DeepSeekV4ChatProcessor.Config(
-                    per_doc_alignment=_per_doc_alignment(config.model_spec),
+                    per_doc_alignment=_per_doc_alignment(config.model),
                     chat_encoder=DSV4EncoderConfig() if chat_encoder is None else chat_encoder,
                 ),
                 post_filters=(lambda sample: sample is not None,),
@@ -474,21 +463,24 @@ def _torchft_flash_config(
         }
 
     values = config_values(base, FaultTolerantTrainerEx.Config)
-    checkpoint_values = config_values(base.checkpoint, TorchFTCheckpointManager.Config)
-    checkpoint_values.update(enable=True, enable_ft_dataloader_checkpoints=True)
-    values["checkpoint"] = TorchFTCheckpointManager.Config(**checkpoint_values)
-    values["optimizer"] = TorchFTOptimizersContainerEx.Config(
-        **config_values(base.optimizer, TorchFTOptimizersContainerEx.Config)
+    checkpoint_values = config_values(base.checkpointer, TorchFTCheckpointManager.Config)
+    checkpoint_values.update(enable_ft_dataloader_checkpoints=True)
+    values["checkpointer"] = TorchFTCheckpointManager.Config(**checkpoint_values)
+    values["optim"] = OptimConfig(
+        optimizer=TorchFTOptimizersContainerEx.Config(
+            **config_values(base.optim.optimizer, TorchFTOptimizersContainerEx.Config)
+        ),
+        lr_scheduler=base.optim.lr_scheduler,
+        max_norm=base.optim.max_norm,
     )
     config = FaultTolerantTrainerEx.Config(**values)
-    assert config.model_spec is not None
+    assert isinstance(config.model, DeepSeekV4Model.Config)
     config.fault_tolerance.group_size = 2
     config.fault_tolerance.min_replica_size = 2
-    config.training.num_tokens_per_train_step = global_batch_size * config.model_spec.max_context_length
+    config.training.num_tokens_per_train_step = global_batch_size * config.model.max_context_length
     config.training.disable_cuda_graphs = True
     config.parallelism.expert_parallel_degree = expert_parallel_degree
     config.parallelism.data_parallel_shard_degree = data_parallel_shard_degree
-    config.parallelism.spmd_backend = "spmd_types"
     return config
 
 
@@ -505,22 +497,23 @@ def deepseek_v4_flash_43layers_16experts_torchft() -> Trainer.Config:
 def deepseek_v4_flash_8p_torchft() -> Trainer.Config:
     """Four Flash layers plus MTP on two EP4/FSDP4 replicas for 8-card validation."""
     base = deepseek_v4_flash_43layers_16experts(num_mtp_layers=1)
-    assert base.model_spec is not None
-    model = base.model_spec.model
+    assert base.model is not None
+    model = base.model
     assert isinstance(model, DeepSeekV4Model.Config)
     model.layers = model.layers[:4]
     model.n_layers = 4
     model.compress_ratios = model.compress_ratios[:4]
-    base.model_spec.flavor = "deepseek_v4_flash_4layers_16experts"
-    base.model_spec.max_context_length = 256
+    # The token budget is derived from the model context, so shrink the context
+    # before the TorchFT config computes it.
+    model.max_context_length = 256
     base.training.max_context_length = 256
-    base.training.num_tokens_per_microbatch_per_dp_rank = 256
     config = _torchft_flash_config(
         base,
         expert_parallel_degree=4,
         data_parallel_shard_degree=4,
         global_batch_size=16,
     )
+    config.training.num_tokens_per_microbatch_per_dp_rank = 256
     config.debug.seed = 42
     return config
 
@@ -572,45 +565,19 @@ def deepseek_v4_pro_61layers_12experts(
 
 def to_graph_trainer_config(
     base_config: Trainer.Config,
-    graph_model_registry: Callable[[str], ModelSpec],
+    model_config_cls: type[DeepSeekV4Model.Config],
 ) -> GraphTrainer.Config:
     """Project DSV4's NPU recipe config onto GraphTrainer's upstream schema."""
     if isinstance(base_config, TrainerEx.Config):
         base_config = Trainer.Config(
             **{config_field.name: getattr(base_config, config_field.name) for config_field in fields(Trainer.Config)}
         )
-    return _to_graph_trainer_config(base_config, graph_model_registry)
-
-
-def _graph_trainer_model_registry(flavor: str) -> ModelSpec:
-    """Build a ModelSpec for the graph_trainer DeepSeek V4 path.
-
-    Wraps the base model config in ``GraphTrainerDeepSeekV4Model.Config`` and
-    points to ``parallelize_graph_trainer_deepseek_v4``. ``to_graph_trainer_config``
-    re-wraps the base config's model fields into this Config class, so the
-    values copied here only carry the class identity and parallelize_fn.
-    """
-    spec = model_registry(flavor)
-    graph_model = GraphTrainerDeepSeekV4Model.Config(
-        **{f.name: getattr(spec.model, f.name) for f in fields(spec.model)}
-    )
-    return ModelSpec(
-        name=spec.name,
-        flavor=flavor,
-        model=graph_model,
-        max_context_length=spec.max_context_length,
-        parallelize_fn=parallelize_graph_trainer_deepseek_v4,
-        pipelining_fn=spec.pipelining_fn,
-        post_optimizer_build_fn=spec.post_optimizer_build_fn,
-        state_dict_adapter=spec.state_dict_adapter,
-    )
+    return _to_graph_trainer_config(base_config, model_config_cls)
 
 
 def _graph_trainer_compile_config() -> GraphTrainerCompileConfig:
     """Compile settings shared by the GraphTrainer flash/pro config factories."""
     return GraphTrainerCompileConfig(
-        enable=True,
-        mode="aot_fx_trace",
         memory_policy="full",
         # Keeps recomputed forward mutations (fused partial RoPE) faithful;
         # see the functionalize_recompute_mutations patch module.
@@ -625,11 +592,9 @@ def graph_trainer_deepseek_v4_debugmodel() -> GraphTrainer.Config:
     """GraphTrainer config for the DeepSeek V4 debug model"""
     config = to_graph_trainer_config(
         deepseek_v4_debugmodel(num_mtp_layers=0),
-        _graph_trainer_model_registry,
+        GraphTrainerDeepSeekV4Model.Config,
     )
     config.compile = GraphTrainerCompileConfig(
-        enable=True,
-        mode="aot_fx_trace",
         memory_policy="full",
         enable_passes=True,
         pass_pipeline=_functionalize_mutations.PASS_PIPELINE_NAME,
@@ -644,7 +609,7 @@ def graph_trainer_deepseek_v4_flash() -> GraphTrainer.Config:
     """GraphTrainer config for the DeepSeek V4 Flash model"""
     config = to_graph_trainer_config(
         deepseek_v4_flash(num_mtp_layers=0),
-        _graph_trainer_model_registry,
+        GraphTrainerDeepSeekV4Model.Config,
     )
     config.compile = _graph_trainer_compile_config()
     return config
@@ -654,7 +619,7 @@ def graph_trainer_deepseek_v4_flash_43layers_16experts() -> GraphTrainer.Config:
     """GraphTrainer config for the DeepSeek V4 Flash 43 Layers 16 experts model"""
     config = to_graph_trainer_config(
         deepseek_v4_flash_43layers_16experts(num_mtp_layers=0),
-        _graph_trainer_model_registry,
+        GraphTrainerDeepSeekV4Model.Config,
     )
     config.compile = _graph_trainer_compile_config()
     return config
@@ -664,7 +629,7 @@ def graph_trainer_deepseek_v4_pro() -> GraphTrainer.Config:
     """GraphTrainer config for the DeepSeek V4 Pro model"""
     config = to_graph_trainer_config(
         deepseek_v4_pro(num_mtp_layers=0),
-        _graph_trainer_model_registry,
+        GraphTrainerDeepSeekV4Model.Config,
     )
     config.compile = _graph_trainer_compile_config()
     return config
@@ -674,7 +639,73 @@ def graph_trainer_deepseek_v4_pro_61layers_32experts() -> GraphTrainer.Config:
     """GraphTrainer config for the DeepSeek V4 Pro 61 Layers 32 experts model"""
     config = to_graph_trainer_config(
         deepseek_v4_pro_61layers_32experts(num_mtp_layers=0),
-        _graph_trainer_model_registry,
+        GraphTrainerDeepSeekV4Model.Config,
     )
     config.compile = _graph_trainer_compile_config()
+    return config
+
+
+def deepseek_v4_flash_cpt() -> Trainer.Config:
+    """Launch recipe with explicit compilation and checkpoint policy."""
+    config = deepseek_v4_flash()
+    config.compile = CompileConfig(components=[], model=ModelCompileConfig())
+    config.checkpointer = CheckpointManager.Config(load_only=True)
+    return config
+
+
+def deepseek_v4_flash_43layers_16experts_compiled() -> Trainer.Config:
+    """Launch recipe with explicit compilation and checkpoint policy."""
+    config = deepseek_v4_flash_43layers_16experts()
+    config.compile = CompileConfig(components=[], model=ModelCompileConfig())
+    return config
+
+
+def deepseek_v4_flash_sft_compiled() -> Trainer.Config:
+    """Launch recipe with explicit compilation and checkpoint policy."""
+    config = deepseek_v4_flash_sft()
+    config.compile = CompileConfig(components=[], model=ModelCompileConfig())
+    config.checkpointer = CheckpointManager.Config(load_only=True)
+    return config
+
+
+def deepseek_v4_flash_43layers_16experts_sft_compiled() -> Trainer.Config:
+    """Launch recipe with explicit compilation and checkpoint policy."""
+    config = deepseek_v4_flash_43layers_16experts_sft()
+    config.compile = CompileConfig(components=[], model=ModelCompileConfig())
+    config.checkpointer = CheckpointManager.Config(load_only=True)
+    return config
+
+
+def deepseek_v4_flash_lora_compiled() -> Trainer.Config:
+    """Launch recipe with explicit compilation and checkpoint policy."""
+    config = deepseek_v4_flash_lora()
+    config.compile = CompileConfig(components=[], model=ModelCompileConfig())
+    return config
+
+
+def deepseek_v4_flash_cp_cpt() -> Trainer.Config:
+    """Launch recipe with explicit compilation and checkpoint policy."""
+    config = deepseek_v4_flash_cp()
+    config.checkpointer = CheckpointManager.Config(load_only=True)
+    return config
+
+
+def deepseek_v4_pro_61layers_32experts_cpt() -> Trainer.Config:
+    """Launch recipe with explicit compilation and checkpoint policy."""
+    config = deepseek_v4_pro_61layers_32experts()
+    config.checkpointer = CheckpointManager.Config(load_only=True)
+    return config
+
+
+def deepseek_v4_pro_61layers_12experts_cpt() -> Trainer.Config:
+    """Launch recipe with explicit compilation and checkpoint policy."""
+    config = deepseek_v4_pro_61layers_12experts()
+    config.checkpointer = CheckpointManager.Config(load_only=True)
+    return config
+
+
+def graph_trainer_deepseek_v4_flash_cpt() -> GraphTrainer.Config:
+    """Launch recipe with explicit compilation and checkpoint policy."""
+    config = graph_trainer_deepseek_v4_flash()
+    config.checkpointer = CheckpointManager.Config(load_only=True)
     return config

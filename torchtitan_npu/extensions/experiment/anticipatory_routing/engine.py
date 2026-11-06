@@ -6,6 +6,7 @@
 """Bridge jojo's schedule to the monolithic 0.3.0 Trainer."""
 
 import copy
+import logging
 import math
 import random
 import re
@@ -16,13 +17,15 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
-from torch.distributed._composable.fsdp.fully_shard import FSDPModule
+from torch.distributed.fsdp import FSDPModule
 from torchtitan.components.checkpointer import DATALOADER, LR_SCHEDULER, MODEL, OPTIMIZER, TRAIN_STATE
+from torchtitan.components.data.types import TrainingMicrobatch
 from torchtitan.distributed import utils as dist_utils
 from torchtitan.tools import filesystem
-from torchtitan.tools.logging import logger
 
-from .data import TrainingDataIterator, copy_batch
+from .data import TrainingDataIterator
+
+logger = logging.getLogger(__name__)
 
 REQUIRED_STATES = (MODEL, DATALOADER, LR_SCHEDULER, OPTIMIZER, TRAIN_STATE)
 
@@ -32,6 +35,11 @@ class AnticipatoryTrainingEngine:
 
     def __init__(self, trainer):
         self.trainer = trainer
+        # TorchTitan ebdfc8 moved model execution, optimizer, checkpoint and
+        # train-state ownership to ``Trainer.engine``.  Keep this recovery
+        # helper as a thin policy object; never reach through the trainer for
+        # those resources.
+        self.runtime = trainer.engine
         self.data = TrainingDataIterator(trainer.dataloader)
         self.in_step = False
         self.failed = False
@@ -45,16 +53,15 @@ class AnticipatoryTrainingEngine:
 
     @property
     def device(self):
-        return self.trainer.device
+        return self.runtime.device
 
     @property
     def num_completed_steps(self):
-        # 0.3.0 increments before entering train_step; jojo increments afterwards.
-        return self.trainer.step - int(self.in_step)
+        return self.runtime.num_completed_steps
 
     @property
     def remaining_steps(self):
-        return max(0, self.trainer.config.training.steps - self.num_completed_steps)
+        return max(0, self.runtime.config.training.steps - self.num_completed_steps)
 
     def begin_step(self):
         self._microbatch_index = 0
@@ -70,38 +77,37 @@ class AnticipatoryTrainingEngine:
         self._microbatch_index += 1
 
     def reduce_step_loss(self):
-        if self._microbatch_index != self.trainer.gradient_accumulation_steps:
+        if self._microbatch_index != self.runtime.num_accumulation_steps:
             raise RuntimeError("Unexpected number of accumulated microbatch losses")
         self.last_global_loss = float(
             dist_utils.dist_sum(
                 self._step_loss_sum,  # pyrefly: ignore [bad-argument-type]
-                self.trainer.parallel_dims.get_optional_mesh("loss"),
+                self.runtime.parallelism_context.get_optional_mesh("loss"),
             )
         )
         if not math.isfinite(self.last_global_loss):
-            raise RuntimeError(f"Non-finite training loss at step {self.trainer.step}")
+            raise RuntimeError(f"Non-finite training loss at step {self.runtime.num_completed_steps}")
 
     def _reset_fsdp(self):
-        for part in self.trainer.model_parts:
+        for part in self.runtime.model_parts:
             if isinstance(part, FSDPModule) and part._get_fsdp_state()._is_root is not None:
                 part.reset_iter_state()
 
     @contextmanager
     def _isolated_forward(self):
-        from torchtitan_npu.patches.torchtitan.models.common.aux_loss import AuxLoss
+        from torchtitan.models.common.aux_loss import AuxLoss
 
-        trainer = self.trainer
         # Save registered buffers, including model-specific forward statistics.
         # Parameters are not copied or changed by this no-grad forward.
         buffers = [
             (m, name, value, value.detach().clone())
-            for part in trainer.model_parts
+            for part in self.runtime.model_parts
             for m in part.modules()
             for name, value in m._buffers.items()
             if value is not None
         ]
         aux = copy.deepcopy(AuxLoss.group_acc)
-        tokens = trainer.ntokens_seen
+        tokens = self.runtime.ntokens_seen
         python_rng, numpy_rng = random.getstate(), np.random.get_state()
         devices = [] if self.device.type == "cpu" else [self.device.index or 0]
         try:
@@ -114,7 +120,7 @@ class AnticipatoryTrainingEngine:
                     module._buffers[name] = original
             AuxLoss.group_acc.clear()
             AuxLoss.group_acc.update(aux)
-            trainer.ntokens_seen = tokens
+            self.runtime.ntokens_seen = tokens
             random.setstate(python_rng)
             np.random.set_state(numpy_rng)
             self._reset_fsdp()
@@ -138,23 +144,35 @@ class AnticipatoryTrainingEngine:
                 raise RuntimeError("The initialization forward did not visit every dynamic router")
 
     @torch.no_grad()
-    def forward_only_microbatch(self, batch):
-        # Preprocessing is allowed to mutate its input; keep queued data intact.
+    def forward_only_microbatch(self, batch: TrainingMicrobatch):
+        # ``TrainingMicrobatch`` owns the new input/loss protocol.  Build a
+        # device-local input dict and run the same preprocessing seam as
+        # ``TrainingEngine._preprocess_microbatch_groups``; the forward is
+        # isolated so router buffers and auxiliary-loss counters are restored.
         with self._isolated_forward():
-            inputs, labels = copy_batch(batch, device=self.device)
-            # The trainer consumes this metadata for loss normalization.
-            inputs.pop("num_valid_tokens", None)
-            inputs, _, kwargs = self.trainer.model_parts[0].preprocess_inputs(
-                {**inputs, "labels": labels},
-                parallel_dims=self.trainer.parallel_dims,
-                parallelism=self.trainer.config.parallelism,
-            )
-            with self.trainer.train_context():
-                self.trainer.model_parts[0](inputs, **kwargs)
+            model = self.runtime.model_parts[0]
+            input_dict = batch.to_input_dict(self.device, non_blocking=True)
+            input_dict.pop("num_valid_tokens", None)
+            with self.runtime.parallelism_context.activate_spmd():
+                inputs, _, kwargs = model.preprocess_inputs(
+                    input_dict,
+                    parallelism_context=self.runtime.parallelism_context,
+                    parallelism=self.runtime.config.parallelism,
+                    max_num_documents=self.runtime.max_num_documents,
+                    max_context_length=self.runtime.config.training.max_context_length,
+                    **self.runtime.preprocess_inputs_kwargs,
+                )
+                model(inputs, **kwargs)
 
     def install_checkpoint_save_guard(self):
         """Gate this trainer's saves without coupling the checkpoint component to routing."""
-        save = self.trainer.checkpointer.save
+        if not hasattr(self.runtime, "checkpointer"):
+            # ``max_rollbacks=0`` is a valid configuration for route-capture
+            # experiments without recovery checkpoints.  The validator admits
+            # it explicitly, so the schedule must not recreate the old
+            # Trainer.checkpointer requirement here.
+            return
+        save = self.runtime.checkpointer.save
 
         @wraps(save)
         def guarded_save(*args, **kwargs):
@@ -162,18 +180,18 @@ class AnticipatoryTrainingEngine:
                 return False
             return save(*args, **kwargs)
 
-        self.trainer.checkpointer.save = guarded_save
+        self.runtime.checkpointer.save = guarded_save
 
     def _required_states(self):
         required = [key for key in REQUIRED_STATES if key != MODEL]
-        if getattr(getattr(self.trainer.config, "ema_weights", None), "enable", False):
-            from torchtitan_npu.patches.torchtitan.components.ema import EMA_OPTIMIZER
+        if self.runtime.config.optim.ema is not None:
+            from torchtitan.components.checkpointer import EMA as EMA_OPTIMIZER
 
             required.append(EMA_OPTIMIZER)
         return required
 
     def find_rollback_target(self, onset_step):
-        checkpointer = self.trainer.checkpointer
+        checkpointer = self.runtime.checkpointer
         checkpointer.maybe_wait_for_staging()
         checkpointer.maybe_wait_for_saving()
         # 0.3.0 flattens model FQNs into the DCP root; there is no model prefix.
@@ -220,30 +238,29 @@ class AnticipatoryTrainingEngine:
         return target if target > 0 else None
 
     def rollback_to(self, step):
-        trainer = self.trainer
-        trainer.checkpointer.maybe_wait_for_staging()
-        trainer.checkpointer.maybe_wait_for_saving()
-        ema = getattr(trainer, "ema_optimizer", None)
+        runtime = self.runtime
+        runtime.checkpointer.maybe_wait_for_staging()
+        runtime.checkpointer.maybe_wait_for_saving()
+        ema = getattr(runtime.optim, "ema", None)
         if ema is not None:
             ema.wait_for_param_reads()
-        if not trainer.checkpointer.load(step=step) or trainer.step != step:
+        if not runtime.checkpointer.load(step=step) or runtime.num_completed_steps != step:
             raise RuntimeError(f"Failed to restore checkpoint step {step}")
         self.data.reset()
         self._reset_transient_training_state()
-        logger.info("Anticipatory routing rolled back to step %d", trainer.step)
+        logger.info("Anticipatory routing rolled back to step %d", runtime.num_completed_steps)
 
     def _reset_transient_training_state(self):
+        from torchtitan.models.common.aux_loss import AuxLoss
         from torchtitan.models.common.moe import MoE
 
-        from torchtitan_npu.patches.torchtitan.models.common.aux_loss import AuxLoss
-
         # Ascend uses the eager gradient lifecycle here; no CUDA graph storage must be preserved.
-        self.trainer.optimizers.zero_grad(set_to_none=True)
+        self.runtime.optim.zero_grad(set_to_none=True)
         with torch.no_grad():
-            for part in self.trainer.model_parts:
+            for part in self.runtime.model_parts:
                 for module in part.modules():
                     if isinstance(module, MoE):
-                        module.tokens_per_expert_E.zero_()
+                        module.router.tokens_per_expert_E.zero_()
                     if isinstance(module, AuxLoss):
                         module.instance_acc.zero_()
         AuxLoss.group_acc.clear()

@@ -14,8 +14,10 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from torchtitan.config import ParallelismConfig
-from torchtitan.models.common.attention import BaseAttention, VarlenAttention
+from torchtitan.config.parallelism import ParallelismConfig
+from torchtitan.distributed import context_parallel
+from torchtitan.models.common.decoder_sharding import decoder_input_sharding
+from torchtitan.models.common.attention import BaseAttention, VarlenInnerAttention
 from torchtitan.models.common.decoder import Decoder
 from torchtitan.models.common.embedding import Embedding
 from torchtitan.models.common.linear import Linear
@@ -23,6 +25,7 @@ from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.protocols.module import Module
 
 import torchtitan_npu  # noqa: F401  imported for its patch chain: the seam under test
+from torchtitan_npu.patches.torchtitan.distributed import context_parallel as cp_patch
 from torchtitan_npu.patches.torchtitan.models.common import decoder as decoder_patch
 from torchtitan_npu.patches.torchtitan.models.common.attention_metadata import (
     cp_shard_context,
@@ -32,16 +35,10 @@ _TOKENS = torch.tensor([1, 2, 3, 4, 5], dtype=torch.int64)
 # Positions [0, 1, 2, 0, 1] pack two documents: [0, 3) and [3, 5).
 _POSITIONS = torch.tensor([0, 1, 2, 0, 1], dtype=torch.int64)
 _LEGACY_MASKS = object()
-# ``partial_dtensor`` takes neither SPMD tail branch in ``preprocess_inputs``.
-_NO_SPMD = ParallelismConfig(spmd_backend="partial_dtensor")
-_SPMD_TYPES = ParallelismConfig(spmd_backend="spmd_types")
-# A stale config can bypass the current dataclass validator.
-_FULL_DTENSOR = SimpleNamespace(spmd_backend="full_dtensor")
-_NO_CP = SimpleNamespace(cp_enabled=False, get_mesh=lambda name: None)
-# ``preprocess_inputs`` only forwards the CP mesh, so a sentinel stands in for it.
+_PARALLELISM = ParallelismConfig()
+_NO_CP = SimpleNamespace(cp_enabled=False)
 _CP_MESH = object()
 _CP = SimpleNamespace(cp_enabled=True, get_mesh=lambda name: _CP_MESH)
-_LB, _PTRR = _NO_SPMD.context_parallel_load_balancer, _NO_SPMD.context_parallel_ptrr_mask_key
 # One kernel geometry of one backend class (what a DSV4 stack varies on).
 _Geometry = namedtuple("_Geometry", "ratio")
 _SEQ_LEN, _SHARD_LEN = 8, 4
@@ -153,6 +150,7 @@ def _layer(record=None, builds=None, geometry=None) -> _Layer.Config:
 def _model(layers) -> Decoder:
     return Decoder(
         Decoder.Config(
+            max_context_length=8,
             dim=8,
             vocab_size=16,
             layers=layers,
@@ -163,36 +161,51 @@ def _model(layers) -> Decoder:
     )
 
 
-def _preprocess(model, parallel_dims=_NO_CP, parallelism=_NO_SPMD):
+def _preprocess(model, parallelism_context=_NO_CP, parallelism=_PARALLELISM):
     return model.preprocess_inputs(
         {"input": _TOKENS, "labels": _TOKENS, "positions": _POSITIONS},
-        parallel_dims=parallel_dims,
+        parallelism_context=parallelism_context,
         parallelism=parallelism,
     )
 
 
+@pytest.fixture(autouse=True)
+def _isolate_spmd_annotation(monkeypatch):
+    # The metadata routing tests isolate annotation, which has its own consumer check below.
+    monkeypatch.setattr(decoder_patch, "annotate_input_spmd_types", lambda context, batch, layouts: batch)
+
+
 def _shard(monkeypatch, events: list, entries=None, positions=None, load_balancer_type="headtail", shard=None):
-    """Run the decoder's named-batch CP adapter with device communication stubbed."""
-    extra_kwargs = {"positions": torch.zeros(_SEQ_LEN, dtype=torch.int64) if positions is None else positions}
+    """Run metadata routing with native load balancing and an isolated shard boundary."""
+    batch = {
+        "input": torch.zeros(_SEQ_LEN, dtype=torch.int64),
+        "labels": torch.zeros(_SEQ_LEN, dtype=torch.int64),
+        "positions": torch.arange(_SEQ_LEN) if positions is None else positions,
+    }
     if entries is not None:
-        extra_kwargs["attention_metadata"] = entries
+        batch["attention_metadata"] = entries
 
-    def fake_shard(batch, layouts, cp_mesh, load_balancer_type, ptrr_mask_key):
-        del layouts, cp_mesh, load_balancer_type, ptrr_mask_key
+    def fake_shard(input_dict, *, input_shardings, permutation):
+        del input_shardings, permutation
         events.append("shard")
-        return {**batch, "input": batch["input"][:_SHARD_LEN], "positions": batch["positions"][:_SHARD_LEN]}
+        return {
+            name: value[:_SHARD_LEN] if name in {"input", "labels", "positions"} else value
+            for name, value in input_dict.items()
+        }
 
-    monkeypatch.setattr(decoder_patch, "prepare_context_parallel_input", fake_shard if shard is None else shard)
-    tokens = torch.zeros(_SEQ_LEN, dtype=torch.int64)
-    return Decoder._cp_shard(
+    monkeypatch.setattr(context_parallel, "shard_tensors", fake_shard if shard is None else shard)
+    monkeypatch.setattr(context_parallel, "spmd_mesh_group", lambda axis: SimpleNamespace(size=lambda: 2))
+    monkeypatch.setattr(context_parallel, "current_spmd_mesh", lambda: _MESH)
+    monkeypatch.setattr(cp_patch, "spmd_mesh_group", lambda axis: SimpleNamespace(size=lambda: 2))
+    balancer = context_parallel.HeadTailCPLoadBalancer.Config() if load_balancer_type == "headtail" else None
+    output = Decoder._cp_shard(
         SimpleNamespace(),
-        tokens,
-        tokens,
-        extra_kwargs,
-        cp_mesh=_MESH,
-        device=torch.device("cpu"),
-        load_balancer_type=load_balancer_type,
+        batch,
+        input_shardings=decoder_input_sharding(),
+        parallelism_context=SimpleNamespace(get_mesh=lambda name: _MESH),
+        parallelism=ParallelismConfig(context_parallel_load_balancer=balancer),
     )
+    return output.pop("input"), output.pop("labels"), output
 
 
 def test_forward_dispatches_per_layer_and_broadcasts_without_a_map():
@@ -226,66 +239,61 @@ def test_preprocess_inputs_hands_metadata_masks_or_neither():
     _, _, extra = _preprocess(_model([_layer(record, geometry=_Geometry(4))]))
     assert extra["attention_metadata"] == {_Geometry(4): record} and "attention_masks" not in extra
 
-    _, _, extra = _preprocess(_model([_Layer.Config(n_heads=1, inner_attention=VarlenAttention.Config())]))
+    _, _, extra = _preprocess(_model([_Layer.Config(n_heads=1, inner_attention=VarlenInnerAttention.Config())]))
     assert extra["attention_masks"].cu_seq_q.tolist() == [0, 3, 5] and "attention_metadata" not in extra
 
     _, _, extra = _preprocess(_model([_layer(geometry=_Geometry(1))]))
     assert "attention_masks" not in extra and "attention_metadata" not in extra
 
 
-def test_input_annotation_is_spmd_types_only_and_full_dtensor_is_rejected(monkeypatch):
-    """Upstream's input half: ``spmd_types`` annotates, and the removed ``full_dtensor`` fails fast."""
-    monkeypatch.setattr(
-        decoder_patch, "annotate_input_spmd_types",
-        lambda parallel_dims, batch, layouts: {**batch, "input": "annotated"},
-    )
-    assert _preprocess(_model([_layer()]), parallelism=_SPMD_TYPES)[0] == "annotated"  # the annotated path
-    assert _preprocess(_model([_layer()]))[0] is _TOKENS  # partial_dtensor: neither branch
+def test_preprocess_inputs_passes_named_layouts_to_spmd_annotator(monkeypatch):
+    seen = []
 
-    inputs = _TOKENS.clone()
-    input_dict = {"input": inputs, "positions": _POSITIONS}
-    # A bare receiver survives no step at all, so the ValueError is the proof that the guard runs first.
-    with pytest.raises(ValueError, match="full_dtensor"):
-        decoder_patch.preprocess_inputs(
-            SimpleNamespace(), input_dict, parallel_dims=_NO_CP, parallelism=_FULL_DTENSOR
-        )
-    assert list(input_dict) == ["input", "positions"] and input_dict["input"] is inputs  # nothing was wrapped
+    def annotate(context, batch, layouts):
+        seen.append((context, batch["input"], layouts))
+        return {**batch, "input": "annotated"}
+
+    monkeypatch.setattr(decoder_patch, "annotate_input_spmd_types", annotate)
+    output = _preprocess(_model([_layer()]))
+
+    assert output[0] == "annotated"
+    assert seen[0][0] is _NO_CP and seen[0][1] is _TOKENS
+    assert seen[0][2] == decoder_input_sharding()
 
 
-def test_preprocess_inputs_delegates_the_step_instead_of_building_it():
-    """A model-level hook owns the whole step; otherwise the CP step is the model's ``_cp_shard``."""
-    seen: list = []
+def test_preprocess_inputs_delegates_metadata_and_layouts_to_cp_shard():
+    seen = []
     record = object()
     model = _model([_layer(record, geometry=_Geometry(4))])
 
-    def delegate(inputs, labels, extra_kwargs, **kwargs):
-        seen.append((kwargs, extra_kwargs.get("attention_metadata")))
-        return inputs, labels, extra_kwargs
+    def delegate(batch, **kwargs):
+        seen.append((kwargs, batch["attention_metadata"]))
+        return batch
 
-    model.build_attention_masks = delegate
-    _preprocess(model, parallel_dims=_CP)
-    assert seen == [({"cp_mesh": _CP_MESH, "load_balancer_type": _LB}, None)]  # the hook owns the metadata step
-
-    del model.build_attention_masks
     model._cp_shard = delegate
-    _, _, extra = _preprocess(model, parallel_dims=_CP)
-    cp_context = {"cp_mesh": _CP_MESH, "device": _TOKENS.device, "load_balancer_type": _LB, "ptrr_mask_key": _PTRR}
-    assert seen[1] == (cp_context, {_Geometry(4): record})  # the seam's own map is what the CP step receives
-    assert extra["attention_metadata"] == {_Geometry(4): record}  # ... and what comes back out
+    _, _, extra = _preprocess(model, parallelism_context=_CP)
+
+    assert seen == [
+        (
+            {"input_shardings": decoder_input_sharding(), "parallelism_context": _CP, "parallelism": _PARALLELISM},
+            {_Geometry(4): record},
+        )
+    ]
+    assert extra["attention_metadata"] == {_Geometry(4): record}
 
 
 def test_cp_shard_owns_the_rank_local_map(monkeypatch):
-    """The map is prepared after the shard, from the row the shard started from; no map is left alone."""
+    """Metadata is prepared from the global row before the native typed tensor shard."""
     events: list = []
     _CPBackend.calls, _CPBackend.events = [], events
     record, untouched = _CPMetadata(), object()
     positions = torch.zeros(_SEQ_LEN, dtype=torch.int64)
     inputs, labels, out = _shard(monkeypatch, events, {_CPBackend: record, "untouched": untouched}, positions)
 
-    assert events == ["shard", "prepare"]  # this rank's rows exist first
+    assert events == ["prepare", "shard"]  # metadata is prepared before native typed sharding
     assert out["attention_metadata"][_CPBackend] == "rank-local"
     assert out["attention_metadata"]["untouched"] is untouched  # a key without the hook passes through
-    assert out["positions"].shape[-1] == inputs.shape[-1] == _SHARD_LEN and labels.shape[-1] == _SEQ_LEN
+    assert out["positions"].shape[-1] == inputs.shape[-1] == _SHARD_LEN and labels.shape[-1] == _SHARD_LEN
     # The transform is the metadata's own static method, handed the permutation alone
     # (upstream #4617's hook, hosted by the object being rebuilt).
     handed, permutation, context = _CPBackend.calls[0]
@@ -309,21 +317,24 @@ def test_an_unnamed_layout_is_the_one_the_metadata_declares(monkeypatch):
     """A stack declares the layout its frames describe; an unnamed run is sharded by it, and by the row."""
     seen: dict = {}
 
-    def shard(batch, layouts, cp_mesh, load_balancer_type, ptrr_mask_key):
-        del layouts, cp_mesh, ptrr_mask_key
-        seen["layout"], seen["positions"] = load_balancer_type, batch["positions"]
+    def shard(batch, *, input_shardings, permutation):
+        seen["layouts"], seen["positions"], seen["permutation"] = input_shardings, batch["positions"], permutation
         return batch
 
     class _DeclaredMetadata:
         cp_layout = "doc_chunk"
 
-    positions = torch.zeros(_SEQ_LEN, dtype=torch.int64)
+    positions = torch.arange(_SEQ_LEN)
     _shard(monkeypatch, [], {_CPBackend: _DeclaredMetadata()}, positions, load_balancer_type=None, shard=shard)
-    assert seen == {"layout": "doc_chunk", "positions": positions}
+    assert seen["layouts"] == decoder_input_sharding()
+    assert seen["positions"] is positions
+    assert seen["permutation"].tolist() == [list(range(_SEQ_LEN))]
 
-    # An explicit balancer wins over the declaration; a stack that declares nothing keeps the pin's default.
-    _shard(monkeypatch, [], {_CPBackend: _DeclaredMetadata()}, positions, load_balancer_type="headtail", shard=shard)
-    assert seen["layout"] == "headtail"
+    # An incompatible explicit balancer cannot silently misinterpret document-local metadata.
+    with pytest.raises(ValueError, match="Document-chunk"):
+        _shard(
+            monkeypatch, [], {_CPBackend: _DeclaredMetadata()}, positions, load_balancer_type="headtail", shard=shard
+        )
 
 
 def test_cp_shard_propagates_a_backend_that_refuses(monkeypatch):
@@ -333,7 +344,7 @@ def test_cp_shard_propagates_a_backend_that_refuses(monkeypatch):
     with pytest.raises(RuntimeError, match="cannot be sharded for CP"):
         _shard(monkeypatch, events, {_RefusingBackend: _RefusingMetadata()})
 
-    assert events == ["shard", "prepare"]
+    assert events == ["prepare"]
 
 
 def test_a_hook_on_the_backend_class_is_not_consulted(monkeypatch):

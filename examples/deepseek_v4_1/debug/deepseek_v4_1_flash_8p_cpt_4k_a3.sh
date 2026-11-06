@@ -18,13 +18,12 @@ WORLD_SIZE="${NGPU}"
 
 # Model
 MODULE="${MODULE:-torchtitan_npu.models.deepseek_v4_1}"
-CONFIG="${CONFIG:-deepseek_v4_1_flash_40layers_16experts_multimodal}"
+CONFIG="${CONFIG:-deepseek_v4_1_flash_40layers_16experts_multimodal_compiled}"
 
-# Dataloader & Checkpoint
+# Dataloader
 DATASET="${DATASET:-cc12m-test}"
 DATASET_PATH="${DATASET_PATH:-}" # optional; unset keeps the upstream dataset source
 HF_ASSETS_PATH="${HF_ASSETS_PATH:-/path/to/DeepSeekV41_tokenizer}" # your tokenizer path
-CKPT_SAVE_LOAD_PATH="${CKPT_SAVE_LOAD_PATH:-/path/to/save_ckpt}" # your model save/load ckpt path
 
 # Parallelism
 TP=1
@@ -33,7 +32,6 @@ EP=8
 CP=1
 DP_SHARD=8
 DP_REPLICATE=$((WORLD_SIZE / (DP_SHARD * CP * TP * PP)))
-SPMD_BACKEND="spmd_types"
 
 # Training
 # Retain the validated eager / Muon / FullAC resource crop.
@@ -60,7 +58,6 @@ export PACKING_BUFFER_SIZE="${PACKING_BUFFER_SIZE:-0}"
 
 # Parallelism
 PARALLELISM_ARGS="
-    --parallelism.spmd-backend ${SPMD_BACKEND}
     --parallelism.data-parallel-shard-degree ${DP_SHARD}
     --parallelism.data-parallel-replicate-degree ${DP_REPLICATE}
     --parallelism.expert-parallel-degree ${EP}
@@ -68,16 +65,10 @@ PARALLELISM_ARGS="
     --parallelism.context-parallel-degree ${CP}
     --parallelism.pipeline-parallel-degree ${PP}
     --parallelism.fsdp-reshard-after-forward always
-    --parallelism.context-parallel-load-balancer doc_chunk
     --parallelism.enable-sequence-parallel
 "
 
-# Compile
-COMPILE_ARGS="
-    --compile.enable
-    --compile.components model
-    --compile.backend inductor
-"
+# Compilation policy is declared by the selected Python recipe.
 
 # Training
 TRAINING_ARGS="
@@ -91,23 +82,15 @@ TRAINING_ARGS="
 
 # LR scheduler
 LR_SCHEDULER_ARGS="
-    --lr-scheduler.warmup-steps 2
-    --lr-scheduler.total-steps ${STEPS}
-    --lr-scheduler.decay-ratio 1.0
-    --lr-scheduler.decay-type cosine
-    --lr-scheduler.min-lr-factor 0.01
+    --optim.lr-scheduler.warmup-steps 2
+    --optim.lr-scheduler.total-steps ${STEPS}
+    --optim.lr-scheduler.decay-ratio 1.0
+    --optim.lr-scheduler.decay-type cosine
+    --optim.lr-scheduler.min-lr-factor 0.01
 "
 
-# Checkpoint
-# `checkpoint.folder` is the save/load root (`CKPT_SAVE_LOAD_PATH`). If it
-# already contains a valid step-* checkpoint, upstream TorchTitan resumes from
-# it; use a new/empty folder when starting a fresh run.
-CHECKPOINT_ARGS="
-    --checkpoint.no-enable
-    --checkpoint.load-only
-    --checkpoint.interval 10
-    --checkpoint.folder ${CKPT_SAVE_LOAD_PATH}
-"
+# Checkpoint policy is declared by the selected Python recipe.
+CHECKPOINT_ARGS=""
 
 # Profiler
 PROFILER_ARGS="
@@ -126,16 +109,16 @@ COMM_ARGS="
 # Optimizer
 # AdamW hyperparameters come from the recipe, not from CLI flags.
 OPTIMIZER_ARGS="
-    --optimizer.name Muon
-    --optimizer.lr 1.0e-5
-    --optimizer.beta1 0.9
-    --optimizer.beta2 0.95
-    --optimizer.eps 1.0e-8
-    --optimizer.weight-decay 1.0e-1
-    --optimizer.muon_momentum 0.95
-    --optimizer.muon_enable_nesterov
-    --optimizer.muon_ns_steps 10
-    --optimizer.muon_adjust_lr_fn match_rms_adamw
+    --optim.optimizer.name Muon
+    --optim.optimizer.lr 1.0e-5
+    --optim.optimizer.beta1 0.9
+    --optim.optimizer.beta2 0.95
+    --optim.optimizer.eps 1.0e-8
+    --optim.optimizer.weight-decay 1.0e-1
+    --optim.optimizer.muon_momentum 0.95
+    --optim.optimizer.muon_enable_nesterov
+    --optim.optimizer.muon_ns_steps 10
+    --optim.optimizer.muon_adjust_lr_fn match_rms_adamw
 "
 OPTIMIZER_OVERRIDES="${OPTIMIZER_OVERRIDES-torchtitan_npu.override.common.optimizer.swap_optimizer}"
 
@@ -168,7 +151,6 @@ CONFIG="${CONFIG}" \
 NGPU="${NGPU}" \
 LOG_PREFIX="${LOG_PREFIX:-${CONFIG}}" \
 bash scripts/run_train.sh \
-    $COMPILE_ARGS \
     $HF_ASSETS_ARGS \
     $PARALLELISM_ARGS \
     $TRAINING_ARGS \
@@ -179,5 +161,5 @@ bash scripts/run_train.sh \
     $COMM_ARGS \
     $CHECKPOINT_ARGS \
     --override.imports "${NPU_OPS_OVERRIDES[@]}" $OPTIMIZER_OVERRIDES \
-    $CLI_OVERRIDES \
+    $CLI_OVERRIDES ${DATALOADER_OVERRIDES:-} \
     "$@"

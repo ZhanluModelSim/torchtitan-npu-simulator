@@ -3,6 +3,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+__all__ = ["QwenCPMetadata", "apply_qwen3_5_npu_fsdp", "parallelize_qwen3_5_cp"]
+
 import inspect
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -10,10 +12,9 @@ from dataclasses import dataclass
 import torch
 from torch.distributed.tensor import DTensor, Shard
 from torchtitan.config import TORCH_DTYPE_MAP
-from torchtitan.distributed.compile import apply_compile
 from torchtitan.distributed.fsdp import (
     apply_fsdp_to_decoder,
-    apply_fsdp_to_vision_encoder,
+    apply_fsdp_to_multimodal_encoder,
     resolve_fsdp_mesh,
     resolve_sparse_fsdp_mesh,
 )
@@ -57,16 +58,6 @@ def _qwen_aot_eager_compile_options(backend: str):
         torch.nn.Module.compile = original_compile
 
 
-def _apply_qwen_compile(module, *, parallel_dims, compile_config):
-    """Apply upstream compilation with a Qwen3.5-specific shape policy."""
-    with _qwen_aot_eager_compile_options(compile_config.backend):
-        return apply_compile(
-            module,
-            parallel_dims=parallel_dims,
-            compile_config=compile_config,
-        )
-
-
 @dataclass(frozen=True, slots=True)
 class QwenCPMetadata:
     cu_seqlens: torch.Tensor
@@ -83,73 +74,21 @@ QWEN_CONTEXT_PARALLEL_UNSUPPORTED = (
 )
 
 
-def parallelize_qwen3_5_npu(model, *, parallel_dims, **kwargs):
-    """Apply the standard Qwen3.5 sharding path with NPU vision handling.
-
-    The pinned upstream parallelizer enables pipeline partitioning for the
-    vision encoder.  Its multimodal inputs are assembled before pipeline
-    stages, so the encoder must remain replicated while the decoder keeps the
-    configured pipeline setting.  Context-parallel recipes use the dedicated
-    function below.
-    """
-    training, parallelism = kwargs["training"], kwargs["parallelism"]
-    compile_config, ac_config = kwargs["compile_config"], kwargs["ac_config"]
-    if parallelism.spmd_backend == "full_dtensor":
-        raise NotImplementedError("full_dtensor is not supported yet.")
-
-    model_compile_enabled = compile_config.enable and "model" in compile_config.components
-    if parallel_dims.cp_enabled:
-        if parallel_dims.ep_enabled:
-            raise NotImplementedError("Qwen3.5 NPU Context Parallel does not support Expert Parallel yet.")
-        if parallel_dims.tp_enabled:
-            raise NotImplementedError("Qwen3.5 NPU Context Parallel does not support Tensor Parallel yet.")
-        if getattr(model, "vision_encoder", None) is not None:
-            raise NotImplementedError(
-                "Qwen3.5-VL NPU Context Parallel is not supported for multimodal attention masks yet."
-            )
-        return parallelize_qwen3_5_cp(model, parallel_dims=parallel_dims, **kwargs)
-
-    if parallelism.spmd_backend == "spmd_types" or parallel_dims.tp_enabled or parallel_dims.ep_enabled:
-        model.parallelize(parallel_dims)
-
-    if ac_config is not None:
-        ac_policy = ac_config.build(dump_folder=kwargs["dump_folder"])
-        ac_policy.apply(model)
-        if model.vision_encoder is not None:
-            ac_policy.apply(model.vision_encoder)
-
-    if model_compile_enabled:
-        _apply_qwen_compile(model, parallel_dims=parallel_dims, compile_config=compile_config)
-        if model.vision_encoder is not None:
-            _apply_qwen_compile(
-                model.vision_encoder,
-                parallel_dims=parallel_dims,
-                compile_config=compile_config,
-            )
-
-    if parallelism.spmd_backend == "spmd_types":
-        dp_mesh, dp_mesh_dims = resolve_fsdp_mesh(parallel_dims)
-        edp_mesh, edp_mesh_dims = resolve_sparse_fsdp_mesh(parallel_dims)
-    else:
-        dp_mesh_names = ["dp_replicate", "fsdp"] if parallel_dims.dp_replicate_enabled else ["fsdp"]
-        dp_mesh = parallel_dims.get_mesh(dp_mesh_names)
-        dp_mesh_dims = None
-        edp_mesh = None
-        edp_mesh_dims = None
-        if parallel_dims.ep_enabled:
-            edp_mesh_names = ["dp_replicate", "efsdp"] if parallel_dims.dp_replicate_enabled else ["efsdp"]
-            edp_mesh = parallel_dims.get_optional_mesh(edp_mesh_names)
-
+def apply_qwen3_5_npu_fsdp(model, *, parallelism_context, training, parallelism):
+    """Wrap vision independently of the decoder's pipeline stages."""
+    dp_mesh, dp_mesh_dims = resolve_fsdp_mesh(parallelism_context)
+    edp_mesh, edp_mesh_dims = resolve_sparse_fsdp_mesh(parallelism_context)
     param_dtype = TORCH_DTYPE_MAP[training.mixed_precision_param]
     reduce_dtype = TORCH_DTYPE_MAP[training.mixed_precision_reduce]
     if model.vision_encoder is not None:
-        apply_fsdp_to_vision_encoder(
+        apply_fsdp_to_multimodal_encoder(
             model.vision_encoder,
             dp_mesh,
             param_dtype=param_dtype,
             reduce_dtype=reduce_dtype,
             reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
             pp_enabled=False,
+            cpu_offload=training.enable_cpu_offload,
             dp_mesh_dims=dp_mesh_dims,
         )
     apply_fsdp_to_decoder(
@@ -157,15 +96,15 @@ def parallelize_qwen3_5_npu(model, *, parallel_dims, **kwargs):
         dp_mesh,
         param_dtype=param_dtype,
         reduce_dtype=reduce_dtype,
-        pp_enabled=parallel_dims.pp_enabled,
+        pp_enabled=parallelism_context.pp_enabled,
         cpu_offload=training.enable_cpu_offload,
         reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
-        ep_degree=parallel_dims.ep,
+        ep_degree=parallelism_context.ep,
         edp_mesh=edp_mesh,
         dp_mesh_dims=dp_mesh_dims,
         edp_mesh_dims=edp_mesh_dims,
+        symm_mem_scope=parallelism.fsdp_symm_mem_scope,
     )
-    return model
 
 
 def shard_local_heads(tensor, mesh):
@@ -216,7 +155,7 @@ def prepare_sequence_metadata(module, args, kwargs):
     return args, kwargs
 
 
-def parallelize_qwen3_5_cp(model, *, parallel_dims, **kwargs):
+def parallelize_qwen3_5_cp(model, *, parallelism_context, **kwargs):
     """Refuse the not-yet-migrated Qwen3.5 NPU context-parallel path.
 
     The CP graph (rank-local ``QwenCPMetadata`` pre-hook, head exchange in the
@@ -231,15 +170,12 @@ def parallelize_qwen3_5_cp(model, *, parallel_dims, **kwargs):
     # Keep the mode-specific refusals first: recipes may call the CP helper
     # directly, and those combinations are rejected for their own reasons even
     # after the folded migration.
-    if parallel_dims.ep_enabled:
+    if parallelism_context.ep_enabled:
         raise NotImplementedError("Qwen3.5 NPU Context Parallel does not support Expert Parallel yet.")
-    if parallel_dims.tp_enabled:
+    if parallelism_context.tp_enabled:
         raise NotImplementedError("Qwen3.5 NPU Context Parallel does not support Tensor Parallel yet.")
     if getattr(model, "vision_encoder", None) is not None:
         raise NotImplementedError(
             "Qwen3.5-VL NPU Context Parallel is not supported for multimodal attention masks yet."
         )
     raise NotImplementedError(QWEN_CONTEXT_PARALLEL_UNSUPPORTED)
-
-
-__all__ = ["QwenCPMetadata", "parallelize_qwen3_5_cp", "parallelize_qwen3_5_npu"]

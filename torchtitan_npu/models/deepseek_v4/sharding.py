@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 
 import spmd_types as spmd
 from spmd_types import SpmdType
-from torchtitan.distributed.parallel_dims import MeshAxisName
+from torchtitan.distributed.parallelism_context import MeshAxisName
 from torchtitan.models.common.decoder_sharding import (
     attention_activation_placement,
     colwise_config,
@@ -20,8 +20,9 @@ from torchtitan.models.common.decoder_sharding import (
     set_decoder_sharding_config,
     token_id_placement,
 )
-from torchtitan.models.common.moe_sharding import set_moe_sharding_config
-from torchtitan.protocols.sharding import LocalMapConfig, ShardingConfig
+from torchtitan.protocols.sharding import ShardingConfig
+
+from torchtitan_npu.models.common.sharding import set_moe_sharding_config
 
 _dense_param_rep = dense_param_placement(tp=spmd.R)
 _act_shard0_tp_rep = dense_activation_placement(tp=spmd.R, cp=spmd.S(0))
@@ -34,17 +35,6 @@ if TYPE_CHECKING:
         DeepSeekV4Model,
         DeepSeekV4TransformerBlock,
     )
-
-_GROUPED_EXPERTS_PARAM_LAYOUT: dict[str, spmd.PerMeshAxisSpmdType] = {
-    "w1_EFD": spmd.S(1),
-    "w2_EDF": spmd.S(2),
-    "w3_EFD": spmd.S(1),
-    "w13_lora_a": spmd.R,
-    "w1_lora_b": spmd.S(1),
-    "w3_lora_b": spmd.S(1),
-    "w2_lora_a": spmd.S(2),
-    "w2_lora_b": spmd.R,
-}
 
 _replicate_weight = ShardingConfig(
     state_shardings={"weight": _dense_param_rep},
@@ -135,7 +125,7 @@ def set_deepseek_v4_attention_sharding(attention_cfg, *, enable_sp):
     # layouts can be assigned before construction.
     at.wq_a.sharding_config = _replicate_weight
     at.q_norm.sharding_config = _replicate_weight
-    at.wq_b.sharding_config = colwise_config()
+    at.wq_b.sharding_config = colwise_config(input_layout=dense_activation_placement(tp=spmd.R, cp=spmd.S(0)))
     q_head_layout = attention_activation_placement()
     at.q_head_norm.sharding_config = ShardingConfig(
         state_shardings={"weight": _dense_param_rep},
@@ -143,14 +133,18 @@ def set_deepseek_v4_attention_sharding(attention_cfg, *, enable_sp):
         in_dst_shardings={"x": q_head_layout},
         out_src_shardings=q_head_layout,
         out_dst_shardings=q_head_layout,
-        local_map=LocalMapConfig(in_grad_placements=(q_head_layout,)),
+        local_spmd=True,
     )
     at.wkv.sharding_config = _replicate_weight
     at.kv_norm.sharding_config = _replicate_weight
     # ``wo_a`` stores per-group matrices flattened across group and output
     # dimensions, so TP shards its flattened row dimension (dim 0).
     at.wo_a.sharding_config = ShardingConfig(state_shardings={"weight": dense_param_placement(tp=spmd.S(0))})
-    at.wo_b.sharding_config = rowwise_config(output_sp=enable_sp)
+    at.wo_b.sharding_config = rowwise_config(
+        output_layout=(
+            dense_sequence_parallel_placement() if enable_sp else dense_activation_placement(tp=spmd.I, cp=spmd.S(0))
+        )
+    )
     at.rope.sharding_config = ShardingConfig(
         state_shardings={"cache": _dense_param_rep},
     )
@@ -237,16 +231,17 @@ def set_deepseek_v4_layer_sharding(
         layer_cfg.moe,
         enable_ep=enable_ep,
         enable_sp=enable_sp,
-        expert_param_layout=_GROUPED_EXPERTS_PARAM_LAYOUT,
     )
+    moe_sharding = layer_cfg.moe.sharding_config
+    assert moe_sharding is not None
+    if moe_sharding.in_dst_shardings is None:
+        moe_sharding.in_dst_shardings = dict(moe_sharding.in_src_shardings or {})
+
     input_ids_src_placement = token_id_placement()
-    input_ids_dst_placement = dense_token_ids_sequence_parallel_placement() if enable_ep else token_id_placement()
-    layer_cfg.moe.sharding_config.in_src_shardings[  # pyrefly: ignore [missing-attribute]
-        "input_ids_T"
-    ] = input_ids_src_placement
-    layer_cfg.moe.sharding_config.in_dst_shardings[  # pyrefly: ignore [missing-attribute]
-        "input_ids_T"
-    ] = input_ids_dst_placement
+    # Hash routing owns the token-ID redistribution to the score shard.
+    if moe_sharding.in_src_shardings is None:
+        moe_sharding.in_src_shardings = {}
+    moe_sharding.in_src_shardings["input_ids_T"] = input_ids_src_placement
     if layer_cfg.moe.router.layer_id < layer_cfg.moe.router.n_hash_layers:  # pyrefly: ignore [missing-attribute]
         router_sharding = layer_cfg.moe.router.sharding_config or ShardingConfig()
         router_sharding.state_shardings["tid2eid"] = _dense_param_rep

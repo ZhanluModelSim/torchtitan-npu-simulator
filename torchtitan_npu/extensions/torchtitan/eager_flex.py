@@ -232,7 +232,7 @@ def _run_eager_flex_attention(
 
 
 def _install_eager_flex_attention() -> None:
-    common_attention.FlexAttention._compiled_flex_attn = staticmethod(_run_eager_flex_attention)
+    common_attention.FlexInnerAttention._compiled_flex_attn = staticmethod(_run_eager_flex_attention)
 
 
 _original_set_determinism = dist_utils.set_determinism

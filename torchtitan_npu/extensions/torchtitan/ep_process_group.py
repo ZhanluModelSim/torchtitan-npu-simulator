@@ -8,8 +8,8 @@
 The registered sparse SPMD mesh is copied with its EP axis pointing at a
 dedicated HCCL process group before TorchTitan enters
 ``maybe_set_sparse_mesh()``. This keeps the runtime mesh a real ``DeviceMesh``
-and avoids patching dispatcher collectives. Dispatcher wiring is also patched
-for EP implementations that access ``self.ep_mesh`` directly.
+and avoids patching dispatcher collectives. Dispatchers derive their EP mesh
+from this registered sparse mesh.
 """
 
 from __future__ import annotations
@@ -117,27 +117,14 @@ def _patch_sparse_mesh_registration() -> None:
 
     original = spmd_types.set_spmd_meshes
 
-    def patched(*, dense_mesh, sparse_mesh):
+    def patched(*, dense_mesh, sparse_mesh, dense_sp_enabled):
         original(
             dense_mesh=dense_mesh,
             sparse_mesh=_replace_sparse_ep_mesh(sparse_mesh),
+            dense_sp_enabled=dense_sp_enabled,
         )
 
     cast("Any", spmd_types).set_spmd_meshes = patched
-
-
-def _patch_base_dispatcher_wiring() -> None:
-    """Wire every standard EP dispatcher to the separated EP mesh."""
-    from torchtitan.models.common.token_dispatcher import BaseEPTokenDispatcher
-
-    original = BaseEPTokenDispatcher.wire_meshes
-
-    def patched(self, *, ep_mesh=None, **kwargs):
-        if not getattr(self, "_uses_custom_ep_process_group", False):
-            ep_mesh = _separate_ep_mesh(ep_mesh)
-        return original(self, ep_mesh=ep_mesh, **kwargs)
-
-    BaseEPTokenDispatcher.wire_meshes = patched
 
 
 def get_deepep_group(ep_mesh: DeviceMesh) -> ProcessGroup:
@@ -171,4 +158,3 @@ def get_deepep_group(ep_mesh: DeviceMesh) -> ProcessGroup:
 
 
 _patch_sparse_mesh_registration()
-_patch_base_dispatcher_wiring()

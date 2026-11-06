@@ -11,6 +11,7 @@ hardware executors, and the V4 lightning-indexer adapter machinery.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Annotated, Protocol, cast
 
@@ -26,15 +27,16 @@ from torchao_npu.quantization.quant_configs import (
     MXQuantizeConfig,
 )
 from torchao_npu.quantization.quant_primitives.mx import mx_fake_quantize
-from torchtitan.components.quantization import QuantizationConverter
 from torchtitan.config import derive
+from torchtitan.config.transform.quantization import QuantizationConverter
 from torchtitan.protocols.module import Module
-from torchtitan.tools.logging import logger
 
 from ..configs import ModelType
 from ..configs.deepseek_v4 import V4FilterKeys
 from ..filters import _replace_config, match_config_fqn_suffix
 from . import QuantComponent, component
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from torchtitan_npu.config.configs import LIQuantization
@@ -373,7 +375,7 @@ class KVNormFakeQuantConverter(QuantizationConverter):
             model_config = _replace_config(model_config, parent, attr, replacement)
             converted += 1
             logger.info(
-                "[Converter] %s.%s: model_spec.model.%s %s -> %s",
+                "[Converter] %s.%s: model.%s %s -> %s",
                 type(self).__module__,
                 type(self).__qualname__,
                 fqn,

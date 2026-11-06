@@ -18,12 +18,11 @@ WORLD_SIZE="${NGPU}"
 
 # Model
 MODULE="${MODULE:-torchtitan_npu.models.deepseek_v4}"
-CONFIG="${CONFIG:-deepseek_v4_flash_43layers_16experts}"
+CONFIG="${CONFIG:-deepseek_v4_flash_43layers_16experts_compiled}"
 
-# Dataloader & Checkpoint
+# Dataloader
 # Dataset selection and source paths belong to the selected MODULE/CONFIG recipe.
 HF_ASSETS_PATH="${HF_ASSETS_PATH:-/path/to/DeepSeekV4_tokenizer}" # your tokenizer path
-CKPT_SAVE_LOAD_PATH="${CKPT_SAVE_LOAD_PATH:-/path/to/save_ckpt}" # your model save/load ckpt path
 
 # Parallelism
 TP=1
@@ -32,7 +31,6 @@ EP=8
 CP="${CP:-1}"
 DP_SHARD=8
 DP_REPLICATE=$((WORLD_SIZE / (DP_SHARD * CP * TP * PP)))
-SPMD_BACKEND="spmd_types"
 
 # Training
 SEQ_LEN=4096
@@ -54,22 +52,15 @@ HF_ASSETS_ARGS="
 
 # Parallelism
 PARALLELISM_ARGS="
-    --parallelism.spmd-backend ${SPMD_BACKEND}
     --parallelism.data-parallel-shard-degree ${DP_SHARD}
     --parallelism.data-parallel-replicate-degree ${DP_REPLICATE}
     --parallelism.expert-parallel-degree ${EP}
     --parallelism.tensor-parallel-degree ${TP}
     --parallelism.context-parallel-degree ${CP}
-    --parallelism.context-parallel-load-balancer doc_chunk
     --parallelism.pipeline-parallel-degree ${PP}
 "
 
-# Compile
-COMPILE_ARGS="
-    --compile.enable
-    --compile.components model
-    --compile.backend inductor
-"
+# Compilation policy is declared by the selected Python recipe.
 
 # Training
 TRAINING_ARGS="
@@ -80,15 +71,8 @@ TRAINING_ARGS="
     --training.disable-cuda-graphs
 "
 
-# Checkpoint
-# `checkpoint.folder` is the save/load root (`CKPT_SAVE_LOAD_PATH`). If it
-# already contains a valid step-* checkpoint, upstream TorchTitan resumes from
-# it; use a new/empty folder when starting a fresh run.
-CHECKPOINT_ARGS="
-    --checkpoint.no-enable
-    --checkpoint.load-only
-    --checkpoint.folder ${CKPT_SAVE_LOAD_PATH}
-"
+# Checkpoint policy is declared by the selected Python recipe.
+CHECKPOINT_ARGS=""
 
 # Profiler
 PROFILER_ARGS="
@@ -108,16 +92,16 @@ COMM_ARGS="
 
 # Optimizer
 OPTIMIZER_ARGS="
-    --optimizer.name Muon
-    --optimizer.lr 1.0e-5
-    --optimizer.beta1 0.9
-    --optimizer.beta2 0.95
-    --optimizer.eps 1.0e-8
-    --optimizer.weight_decay 1.0e-1
-    --optimizer.muon_momentum 0.95
-    --optimizer.muon_enable_nesterov
-    --optimizer.muon_ns_steps 10
-    --optimizer.muon_adjust_lr_fn match_rms_adamw
+    --optim.optimizer.name Muon
+    --optim.optimizer.lr 1.0e-5
+    --optim.optimizer.beta1 0.9
+    --optim.optimizer.beta2 0.95
+    --optim.optimizer.eps 1.0e-8
+    --optim.optimizer.weight_decay 1.0e-1
+    --optim.optimizer.muon_momentum 0.95
+    --optim.optimizer.muon_enable_nesterov
+    --optim.optimizer.muon_ns_steps 10
+    --optim.optimizer.muon_adjust_lr_fn match_rms_adamw
 "
 OPTIMIZER_OVERRIDES="${OPTIMIZER_OVERRIDES-torchtitan_npu.override.common.optimizer.swap_optimizer}"
 
@@ -152,7 +136,6 @@ CONFIG="${CONFIG}" \
 NGPU="${NGPU}" \
 LOG_PREFIX="${LOG_PREFIX:-${CONFIG}}" \
 bash scripts/run_train.sh \
-    $COMPILE_ARGS \
     $HF_ASSETS_ARGS \
     $PARALLELISM_ARGS \
     $TRAINING_ARGS \

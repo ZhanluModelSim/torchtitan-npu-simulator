@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import logging
 import operator
 from collections import defaultdict
 from collections.abc import Callable  # noqa: TC003
@@ -28,7 +29,8 @@ from torchtitan.experiments.graph_trainer.configs import (
 from torchtitan.experiments.graph_trainer.memory_policy import (
     _make_default_memory_policy,
 )
-from torchtitan.tools.logging import logger
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)

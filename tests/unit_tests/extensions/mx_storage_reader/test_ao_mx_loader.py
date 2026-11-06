@@ -605,20 +605,21 @@ def test_only_v4_selects_ao_reader(readers, monkeypatch, tmp_path):
             DeepSeekV4Model=SimpleNamespace(Config=object),
         ),
     )
+
+    class V4Adapter(V3Adapter):
+        pass
+
+    upstream_v4 = ModuleType("torchtitan.models.deepseek_v4.state_dict_adapter")
+    upstream_v4.DeepSeekV4StateDictAdapter = V4Adapter
+    monkeypatch.setitem(sys.modules, upstream_v4.__name__, upstream_v4)
+
+    class PEFTMixin:
+        pass
+
     monkeypatch.setitem(
         sys.modules,
-        "_ao_test_components.lora",
-        SimpleNamespace(
-            _PEFT_MODULE_SUFFIXES=(),
-            MODULE_PATHS=(),
-            PEFT_PREFIX="base_model.model.",
-            pack_expert_factor=lambda tensor, factor: tensor,
-            DEEPSEEK_V4_LORA_TARGETS=(),
-            DeepSeekV4LoRAConverter=SimpleNamespace(Config=object),
-            LoRAOptions=object,
-            is_lora_parameter=lambda _name: False,
-            peft_target_modules=lambda targets: targets,
-        ),
+        "torchtitan_npu.models.deepseek_v4.lora",
+        SimpleNamespace(DeepSeekPEFTAdapter=PEFTMixin, is_lora_parameter=lambda _name: False),
     )
     monkeypatch.setitem(sys.modules, "torchtitan_npu.extensions.mx_storage_reader.hf_storage", readers.hf_storage)
     monkeypatch.setitem(sys.modules, "torchtitan_npu.extensions.mx_storage_reader.ao_hf_storage", readers.ao_hf_storage)

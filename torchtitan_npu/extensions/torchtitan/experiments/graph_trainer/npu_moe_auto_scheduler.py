@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import statistics
 from collections import defaultdict
 from dataclasses import dataclass
@@ -29,10 +30,8 @@ from torchtitan.experiments.graph_trainer.ep_pass_utils import (
     ChunkedRegion,
     collect_chunked_regions,
     is_c10d_functional_node,
-    is_module_fqn_inside_root,
     ordered_nodes,
 )
-from torchtitan.tools.logging import logger
 
 from .compute_benchmark import (
     _GROUPED_MM_TARGET,
@@ -48,6 +47,14 @@ from .utils import (
     node_id,
     resolve_collective_process_group,
 )
+
+logger = logging.getLogger(__name__)
+
+
+def is_module_fqn_inside_root(fqn: str, root: str) -> bool:
+    """Return whether an FQN denotes the root module or one of its children."""
+    return fqn == root or fqn.startswith(f"{root}.")
+
 
 if TYPE_CHECKING:
     from collections.abc import Callable

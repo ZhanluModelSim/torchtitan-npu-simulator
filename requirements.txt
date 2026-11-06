@@ -7,17 +7,19 @@ torch==2.14.0
 torchvision==0.29.0
 --find-links https://cann-ai.obs.cn-north-4.myhuaweicloud.com/torchtitan-npu/simple/torch-npu/index.html
 torch_npu==2.14.0.dev20260918
-torchtitan @ git+https://gitcode.com/GitHub_Trending/to/torchtitan.git@dc3985ad4912f67f71d5a125f2fdf40144ec8354
+torchtitan @ git+https://gitcode.com/GitHub_Trending/to/torchtitan.git@ebdfc8c2a24d89d89c99c0ef96ed8ac149864175
+--extra-index-url https://triton-ascend.osinfra.cn/pypi/simple
+triton-ascend==3.2.1
 attn-gym==0.0.16
 grain==0.2.18
 pybind11==3.0.4
 numpy
 PyYAML
 ninja
---extra-index-url https://triton-ascend.osinfra.cn/pypi/simple
-triton-ascend==3.2.1
 scipy==1.13.1
 safetensors==0.8.0
-# Engram builds its token map at runtime; pin the normalizer semantics.
 tokenizers==0.23.2
 torchao==0.17.0
+torch_checkpointing==0.1.1
+
+tyro>=1.0.5

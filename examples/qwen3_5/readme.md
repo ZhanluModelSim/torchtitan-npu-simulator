@@ -65,8 +65,10 @@ override，用于消融或定位问题。
 
 数据和路径也可以覆盖：`HF_ASSETS_PATH` 默认为
 `${TORCHTITAN_REPO}/tests/assets/tokenizer`，`DATASET_PATH` 默认为
-`${TORCHTITAN_REPO}/tests/assets/cc12m_test`。如需使用 torch.compile，可在
-脚本中修改 `COMPILE_ARGS` 或通过 `COMPILE_BACKEND` 环境变量控制。
+`${TORCHTITAN_REPO}/tests/assets/cc12m_test`。如需使用 torch.compile，在 Python recipe 中显式设置
+`config.compile = CompileConfig(components=[], model=ModelCompileConfig())`，其中类型从
+`torchtitan_npu.config` 导入；关闭编译设置 `config.compile = None`。通过 `MODULE` / `CONFIG`
+选择该 recipe，CLI 不再从 `None` 自动创建组件。
 
 示例（单机 8 卡 MoE）：
 
@@ -95,11 +97,10 @@ qwen3_5_debugmodel_1p_cpt_512.sh
        └─ 进程组销毁
 ```
 
-`spmd_types` 使用 TorchTitan v0.3 的 `resolve_fsdp_mesh`/
-`resolve_sparse_fsdp_mesh`，而旧 backend 保留 `fsdp/efsdp` 名称；因此同一套
-parallelizer 可兼容当前主线和旧 NPU 运行环境。当前 Qwen3.5-VL 多模态视觉 mask
-尚未完成 CP 序列元数据适配；VL 配置启用 CP 时会在并行化入口明确失败，避免
-运行到错误的 dict-mask 路径。纯文本长上下文配置仍可使用专用 CP recipe。
+固定的 TorchTitan 版本仅使用 `spmd_types`，launcher 不再接受 backend 选择。
+Qwen3.5 的长文本 CP 配方保留 CP=4 及 typed Ulysses 变换配置；当前固定上游的 Ulysses
+实现要求 CUDA，NPU runtime 仍不受支持，启动时会明确拒绝。多模态 CP 的视觉元数据适配
+也尚未完成。配方构造和 CLI 解析通过不代表这些 CP 训练路径可运行。
 
 集成测试通过以下命令运行 Qwen3.5 的 1-rank 冒烟用例：
 

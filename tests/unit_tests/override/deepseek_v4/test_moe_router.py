@@ -25,7 +25,7 @@ from torchtitan_npu.override.deepseek_v4.moe_router import TilelangRouter, Tilel
     ids=["generic", "v4", "v41"],
 )
 def test_tilelang_override_selects_only_its_router_config(router_type, factory, target_type):
-    model = model_registry("deepseek_v4_1_debugmodel_text").model
+    model = model_registry("deepseek_v4_1_debugmodel_text")
     layer = model.layers[0]
     original = layer.moe.router
     if router_type is DeepSeekV4Router.Config:

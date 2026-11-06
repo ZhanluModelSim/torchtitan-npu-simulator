@@ -10,19 +10,18 @@ from functools import partial
 from typing import cast
 
 import torch.nn as nn
-from torchtitan.components.optimizer import register_moe_load_balancing_hook
-from torchtitan.distributed.pipeline_parallel import pipeline_llm
-from torchtitan.models.common import ComplexRoPE, Embedding, Linear, RMSNorm, RoPE
+from torchtitan.config.transform import ModelConfigConverter, validate_converter_compatibility
+from torchtitan.models.common import ComplexRoPE, Embedding, Linear, RMSNorm, RoPE, SqrtSoftplus
 from torchtitan.models.common.config_utils import (
+    fused_gate_up_param_init,
+    fused_grouped_gate_up_param_init,
     make_ffn_config,
     make_routed_experts_config,
 )
+from torchtitan.models.common.linear import RouterGateLinear
 from torchtitan.models.common.moe import MoE
 from torchtitan.models.common.param_init import depth_scaled_std
 from torchtitan.models.deepseek_v4.moe import DeepSeekV4Router
-from torchtitan.models.utils import validate_converter_order
-from torchtitan.protocols.model import ModelConfigConverter
-from torchtitan.protocols.model_spec import ModelSpec
 
 from torchtitan_npu.models.common.carry_exchange import CarryExchange
 from torchtitan_npu.patches.torchtitan.models.common.linear import BatchedLinear
@@ -39,7 +38,6 @@ from .mtp import (
     DeepSeekV4MTPTransformerBlock,
     MTPLoss,
 )
-from .parallelize import parallelize_deepseek_v4
 from .state_dict_adapter import DeepSeekV4StateDictAdapter
 
 __all__ = [
@@ -49,7 +47,6 @@ __all__ = [
     "MTPLoss",
     "deepseek_v4_configs",
     "model_registry",
-    "parallelize_deepseek_v4",
 ]
 
 _LINEAR_INIT = {
@@ -65,13 +62,6 @@ _HC_PARAM_INIT = {
     "hc_base": partial(nn.init.trunc_normal_, std=0.02),
     "hc_scale": partial(nn.init.trunc_normal_, std=0.02),
 }
-
-
-def _register_step_pre_hooks(optimizers, model_parts, parallel_dims) -> None:
-    """Register MoE balancing and auxiliary-loss step hooks."""
-    if any(getattr(model, "lora_config", None) is not None for model in model_parts):
-        return
-    register_moe_load_balancing_hook(optimizers, model_parts, parallel_dims)
 
 
 def _output_linear_init(dim: int) -> dict[str, Callable]:
@@ -331,14 +321,14 @@ def _make_v4_moe_config(
         num_experts=num_experts,
         router=DeepSeekV4Router.Config(
             num_experts=num_experts,
-            gate=Linear.Config(
+            gate=RouterGateLinear.Config(
                 in_features=dim,
                 out_features=num_experts,
                 bias=False,
                 param_init=_depth_init(layer_id),
             ),
             top_k=top_k,
-            score_func="sqrtsoftplus",  # pyrefly: ignore [bad-argument-type]
+            score_func=SqrtSoftplus.Config(),  # pyrefly: ignore [bad-argument-type]
             route_scale=route_scale,
             route_norm=route_norm,
             layer_id=layer_id,
@@ -510,11 +500,12 @@ def _build_mtp_layers(
         moe.router.gate.param_init = _depth_init(layer_id)
         moe.router.layer_id = layer_id  # pyrefly: ignore [missing-attribute]
         moe.router.n_hash_layers = 0  # pyrefly: ignore [missing-attribute]
-        moe.routed_experts.inner_experts.param_init = _depth_experts_init(layer_id)
+        moe.routed_experts.w13.param_init = fused_grouped_gate_up_param_init(_depth_experts_init(layer_id))
+        moe.routed_experts.w2.param_init = {"weight": _depth_experts_init(layer_id)["w2_EDF"]}
         if moe.shared_experts is not None:
             depth_init = _depth_init(layer_id)
             moe.shared_experts.w2.param_init = depth_init
-            moe.shared_experts.w3.param_init = depth_init
+            moe.shared_experts.w13.param_init = fused_gate_up_param_init(_LINEAR_INIT, depth_init)
 
         hc_attn_pre = copy.deepcopy(inner_cfg.hc_attn_pre)
         projection = _build_mtp_projection(dim)
@@ -655,6 +646,7 @@ def _make_v4_config(
             rope=rope,
         )
     return DeepSeekV4Model.Config(
+        max_context_length=max_seq_len,
         dim=dim,
         vocab_size=vocab_size,
         tok_embeddings=Embedding.Config(
@@ -847,7 +839,7 @@ def model_registry(
     non_blocking_capacity_factor: float | None = None,
     num_mtp_layers: int = 0,
     converters: list[ModelConfigConverter.Config] | None = None,
-) -> ModelSpec:
+) -> DeepSeekV4Model.Config:
     if flavor not in deepseek_v4_configs:
         raise ValueError(f"Unknown deepseek_v4 flavor: {flavor}. Available: {list(deepseek_v4_configs.keys())}")
     get_config, max_context_len = deepseek_v4_configs[flavor]
@@ -861,16 +853,10 @@ def model_registry(
         num_mtp_layers=num_mtp_layers,
     )
     if converters is not None:
-        validate_converter_order(converters)
+        validate_converter_compatibility(converters)
         for converter_cfg in converters:
             config = converter_cfg.build().convert(config)
-    return ModelSpec(
-        name="deepseek_v4",
-        flavor=flavor,
-        model=config,
-        max_context_length=context_len,
-        parallelize_fn=parallelize_deepseek_v4,
-        pipelining_fn=pipeline_llm,
-        post_optimizer_build_fn=_register_step_pre_hooks,
-        state_dict_adapter=DeepSeekV4StateDictAdapter,
-    )
+    return config
+
+
+DeepSeekV4Model.state_dict_adapter_cls = DeepSeekV4StateDictAdapter

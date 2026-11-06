@@ -18,10 +18,10 @@ import pytest
 import torch
 import torch.nn.functional as F
 from torchtitan.models.common.attention import create_varlen_metadata_for_document
+from torchtitan.models.common.aux_loss import AuxLoss
 
 from torchtitan_npu.models.deepseek_v3_2 import model_registry
 from torchtitan_npu.models.deepseek_v3_2.model import SparseIndexerLoss
-from torchtitan_npu.patches.torchtitan.models.common.aux_loss import AuxLoss
 
 
 def _masks(num_tokens: int):
@@ -79,7 +79,7 @@ def _kl_sum(q_BLNH, k_BL1H, topk_indices, student_logits) -> torch.Tensor:
 
 def test_the_layer_builds_an_aux_loss_from_the_model_config():
     """The real registry path: a DeepSeek-V3.2 layer's indexer loss is the backported AuxLoss."""
-    layer = model_registry("debugmodel").model.layers[0]
+    layer = model_registry("debugmodel").layers[0]
 
     loss_config = layer.attention.inner_attention.indexer_loss
     loss = loss_config.build()

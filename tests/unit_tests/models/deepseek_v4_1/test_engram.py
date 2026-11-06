@@ -13,6 +13,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 from torchtitan.config.manager import ConfigManager
+from torchtitan.components.optim import AdamW, DistMuon
+from torchtitan_npu.extensions.torchtitan.components.optimizer.optimizer import SparseAdam
 
 from tests.unit_tests.models.deepseek_v4_1.preprocess_utils import cp_parallel_dims, tiny_v41_model
 from torchtitan_npu.config import OptimizerConfig
@@ -186,7 +188,6 @@ def test_per_row_history_and_one_window_state_the_same_rows():
     torch.testing.assert_close(window, other_tail, rtol=0, atol=0)
 
 
-
 def test_doc_chunk_engram_history_matches_full_document_hashes(monkeypatch):
     model, _ = tiny_v41_model(monkeypatch)
     model.engram_history_size = 2
@@ -199,6 +200,7 @@ def test_doc_chunk_engram_history_matches_full_document_hashes(monkeypatch):
     expected = table.hash(tokens, positions)[local_rows]
     actual = table.hash(tokens[local_rows], positions[local_rows], token_history=history)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
 
 def test_forward_backward_matches_official_demo_dataflow():
     with torch.random.fork_rng(devices=[]):
@@ -290,21 +292,21 @@ def test_zero_dot_gate_uses_positive_clamped_sqrt():
 
 def test_debug_flavor_enables_engram_and_selects_sparse_adam():
     spec = model_registry("deepseek_v4_1_debugmodel")
-    enabled_layers = [idx for idx, layer in enumerate(spec.model.layers) if layer.engram is not None]
+    enabled_layers = [idx for idx, layer in enumerate(spec.layers) if layer.engram is not None]
     assert enabled_layers == [1, 14]
 
     trainer_config = deepseek_v4_1_debugmodel_multimodal()
-    param_groups = trainer_config.optimizer.param_groups
+    param_groups = trainer_config.optim.optimizer.optimizers
     assert param_groups[0].pattern == r".*\.engram\.table\.weight$"
-    assert param_groups[0].optimizer_name == "SparseAdam"
-    assert param_groups[0].optimizer_kwargs["lr"] == 5e-5
-    assert param_groups[1].optimizer_name == "AdamW"
+    assert isinstance(param_groups[0], SparseAdam.Config)
+    assert param_groups[0].lr == 5e-5
+    assert isinstance(param_groups[1], AdamW.Config)
 
 
 def test_released_v41_geometry_builds_published_logical_tables():
     """Official row totals exercise prime allocation across both complete layers."""
     full = model_registry("deepseek_v4_1_flash_40layers_24experts_multimodal")
-    layers = [(i, layer.engram) for i, layer in enumerate(full.model.layers) if layer.engram is not None]
+    layers = [(i, layer.engram) for i, layer in enumerate(full.layers) if layer.engram is not None]
     # Source: deepseek-ai/DeepSeek-V4.1-Flash, revision 2bc89ac, text_config.
     assert [i for i, _ in layers] == [1, 14]
     for (_, config), logical_rows in zip(layers, (384006168, 384016682), strict=True):
@@ -346,21 +348,22 @@ def test_explicit_disable_preserves_selected_optimizer(optimizer):
             "--config",
             "deepseek_v4_1_debugmodel_multimodal",
             "--no-engram-enabled",
-            "--optimizer.name",
+            "--optim.optimizer.name",
             optimizer,
             "--training.num-tokens-per-microbatch-per-dp-rank",
             "512",
         ]
     )
-    trainer.model_spec.model.update_from_config(config=trainer)
-    assert all(layer.engram is None for layer in trainer.model_spec.model.layers)
-    assert type(trainer.optimizer) is OptimizerConfig
-    assert trainer.optimizer.name == optimizer
-    trainer.optimizer.materialize()
-    assert [group.optimizer_name for group in trainer.optimizer.param_groups] == (
-        ["DistMuon", "AdamW"] if optimizer == "Muon" else ["AdamW"]
-    )
-    adapter = DeepSeekV41StateDictAdapter(trainer.model_spec.model, None)
+    trainer.model.update_from_config(config=trainer)
+    assert all(layer.engram is None for layer in trainer.model.layers)
+    assert type(trainer.optim.optimizer) is OptimizerConfig
+    assert trainer.optim.optimizer.name == optimizer
+    trainer.optim.optimizer.materialize()
+    groups = trainer.optim.optimizer.optimizers
+    expected_types = [DistMuon.Config, AdamW.Config] if optimizer == "Muon" else [AdamW.Config]
+    assert len(groups) == len(expected_types)
+    assert all(isinstance(group, expected) for group, expected in zip(groups, expected_types, strict=True))
+    adapter = DeepSeekV41StateDictAdapter(trainer.model, None)
     assert adapter.to_hf({}) == {}
 
 
@@ -386,10 +389,10 @@ def test_model_config_accepts_parameterized_engram_override(fused_attention):
             ("torchtitan_npu.override.deepseek_v4_1.lightning_indexer.asc", {}),
         ]
     # Follow Trainer's order: model validation runs before applying overrides.
-    config.model_spec.model.update_from_config(config=config)
+    config.model.update_from_config(config=config)
     apply_overrides(config.override, config)
 
-    tables = [layer.engram.table for layer in config.model_spec.model.layers if layer.engram is not None]
+    tables = [layer.engram.table for layer in config.model.layers if layer.engram is not None]
     assert tables
     assert all(isinstance(table, MXFP8HostOffloadEngramTable.Config) for table in tables)
     assert all(table.num_max_tokens_per_rank == 3072 and table.shard_over_efsdp for table in tables)

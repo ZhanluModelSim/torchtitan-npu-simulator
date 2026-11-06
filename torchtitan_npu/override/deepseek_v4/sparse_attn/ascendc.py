@@ -37,6 +37,7 @@ the sink is fp32 — an eager-fp32 caller fails loudly at the kernel's dtype
 check.
 """
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 import torch
@@ -46,6 +47,7 @@ from cann_ops_transformer import (
     sparse_flash_mla_metadata,
     sparse_lightning_indexer_kl_loss_grad_metadata,
 )
+from torchtitan.models.common.cp_attention import CPInnerAttention
 
 from torchtitan_npu.models.common.metadata import KernelFrame
 from torchtitan_npu.models.deepseek_v4.attention import CompressedSparseInnerAttention
@@ -632,3 +634,32 @@ class AscCompressedSparseInnerAttention(CompressedSparseInnerAttention):
             topk_scores_tnd,
         )
         return output.reshape(seqlen, *output.shape[1:])
+
+
+class AscV4ContextParallelSparseAttention(CPInnerAttention, AscCompressedSparseInnerAttention):
+    """The fused TND backend with its document-chunk CP metadata protocol.
+
+    Forward keeps the existing rank-local query/global key contract: the
+    attention wrapper restores the KV stream, and the fused metadata owns
+    each rank's query frame and key reach. This class selects that existing
+    implementation through TorchTitan's typed CP configuration interface.
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(CPInnerAttention.Config, AscCompressedSparseInnerAttention.Config):
+        # Released Flash geometry, also used by the ordinary asc entry.
+        num_heads: int = 64
+        head_dim: int = 512
+        index_num_heads: int = 64
+        index_head_dim: int = 128
+
+    @staticmethod
+    def prepare_cp_metadata(attention_metadata, *, permutation):
+        if isinstance(attention_metadata, Mapping):
+            return {
+                key: AscV4ContextParallelSparseAttention.prepare_cp_metadata(value, permutation=permutation)
+                for key, value in attention_metadata.items()
+            }
+        if not isinstance(attention_metadata, AscV4Metadata):
+            raise TypeError("V4 context parallel attention requires AscV4Metadata")
+        return AscV4Metadata.prepare_cp_metadata(attention_metadata, permutation=permutation)

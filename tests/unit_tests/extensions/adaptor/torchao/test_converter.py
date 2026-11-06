@@ -43,20 +43,18 @@ def quantization_calls(monkeypatch, converter_module):
     # Patch where the call sites live (generated modules in recipes + the DeepSeek
     # quantized-expert class in configs.deepseek_v4), not the facade, so the patched
     # quantize_ is what NpuQuantized*Module.__init__ resolves.
-    for mod in ("torchtitan_npu.extensions.adaptor.torchao.recipes",
-                "torchtitan_npu.extensions.adaptor.torchao.configs.deepseek_v4"):
-        monkeypatch.setattr(importlib.import_module(mod), "quantize_", quantize)
+    monkeypatch.setattr(
+        importlib.import_module("torchtitan_npu.extensions.adaptor.torchao.recipes"), "quantize_", quantize
+    )
     monkeypatch.setitem(sys.modules, "cann_ops_nn.ops", ModuleType("cann_ops_nn.ops"))
     with torch.random.fork_rng(devices=[]):
         yield calls
 
 
-@pytest.mark.parametrize("source_kind", ["grouped", "asc"])
-def test_quantized_grouped_experts_keep_config_and_skip_reconversion(converter_module, quantization_calls, source_kind):
+def test_quantized_grouped_projection_keeps_fused_axis_and_skips_reconversion(converter_module, quantization_calls):
     from torchtitan_npu.extensions.adaptor.torchao.converter import mxfp8_param_swap
 
-    source_cls = converter_module.GroupedExperts if source_kind == "grouped" else converter_module.AscGroupedExperts
-    source = source_cls.Config(dim=2, hidden_dim=4, num_experts=2, swiglu_limit=1.5)
+    source = converter_module.GroupedLinear.Config(group_size=2, in_features=2, out_features=4, num_linears=2)
     quant_config = mxfp8_param_swap()
     converter = converter_module.NpuQuantizeConverter.Config(
         base_config=quant_config,
@@ -67,26 +65,25 @@ def test_quantized_grouped_experts_keep_config_and_skip_reconversion(converter_m
 
     converted = converter.convert(source)
 
-    assert isinstance(converted, converter_module.NpuQuantizedAscGroupedExpertsModule.Config)
-    assert (converted.dim, converted.hidden_dim, converted.num_experts, converted.swiglu_limit) == (2, 4, 2, 1.5)
+    assert isinstance(converted, converter_module.GroupedLinear.Config)
+    assert (converted.group_size, converted.in_features, converted.out_features, converted.num_linears) == (2, 2, 4, 2)
     assert converter.convert(converted) is converted
-    swiglu_module = importlib.import_module("torchtitan_npu.override.common.swiglu_group")
-    assert swiglu_module.asc(converted) is converted
-    experts = converted.build()
+    projection = converted.build()
+    assert projection.weight.shape == (2, 2, 4, 2)
     assert len(quantization_calls) == 1
     module, received_config, filter_fn = quantization_calls[0]
-    assert module is experts
+    assert module is projection
     assert received_config is quant_config
-    assert filter_fn(experts, "")
+    assert filter_fn(projection, "")
     assert not filter_fn(torch.nn.Identity(), "child")
 
 
 def test_quantization_converter_preserves_custom_experts(converter_module, quantization_calls):
     from torchtitan_npu.extensions.adaptor.torchao.converter import mxfp8_param_swap
 
-    class CustomExperts(converter_module.GroupedExperts):
+    class CustomExperts(converter_module.GroupedLinear):
         @dataclass(kw_only=True, slots=True)
-        class Config(converter_module.GroupedExperts.Config):
+        class Config(converter_module.GroupedLinear.Config):
             output_scale: float = 3.0
 
         def __init__(self, config):
@@ -96,7 +93,7 @@ def test_quantization_converter_preserves_custom_experts(converter_module, quant
         def forward(self, x, num_tokens_per_expert, *, routed_scores_R=None):
             return x * self.output_scale
 
-    source = CustomExperts.Config(dim=2, hidden_dim=4, num_experts=2, output_scale=5.0)
+    source = CustomExperts.Config(group_size=2, in_features=2, out_features=4, output_scale=5.0)
     converter = converter_module.NpuQuantizeConverter.Config(
         base_config=mxfp8_param_swap(),
         require_match=False,
@@ -131,7 +128,6 @@ def test_quantization_converter_keeps_linear_forward(converter_module, quantizat
     linear = converted.build()
 
     assert isinstance(linear, converter_module.Linear)
-    assert not isinstance(linear, converter_module.NpuQuantizedAscGroupedExpertsModule)
     assert quantization_calls[0][0] is linear
     assert quantization_calls[0][1] is quant_config
     with torch.no_grad():
@@ -224,18 +220,19 @@ def test_sparse_attention_component_triggers_on_real_v41_filters(converter_modul
     assert "has no sparse_attention filter" not in caplog.text
 
 
-def test_model_type_rejects_unknown_model_spec_name(converter_module):
-    with pytest.raises(ValueError, match=r"supports DeepSeek V4 and V4\.1 model specs"):
-        converter_module._model_type_for_spec(SimpleNamespace(name="deepseek_v3", model=object()))
+def test_model_type_rejects_unknown_model_config(converter_module):
+    with pytest.raises(ValueError, match=r"supports DeepSeek V4 and V4\.1 model configs"):
+        converter_module._model_type_for_config(SimpleNamespace())
 
 
-def test_model_type_comes_from_model_spec_name(converter_module):
-    kinds = {
-        "deepseek_v4": converter_module.ModelType.V4,
-        "deepseek_v4_1": converter_module.ModelType.V4_1,
-    }
-    for spec_name, expected in kinds.items():
-        assert converter_module._model_type_for_spec(SimpleNamespace(name=spec_name, model=object())) is expected
+@pytest.mark.parametrize("family", ["deepseek_v4", "deepseek_v4_1"])
+def test_model_type_uses_real_config_owner(converter_module, family):
+    registry = importlib.import_module(f"torchtitan_npu.models.{family}").model_registry
+    name = "debugmodel" if family == "deepseek_v4" else "deepseek_v4_1_debugmodel"
+    config = registry(name)
+    expected = converter_module.ModelType.V4 if family == "deepseek_v4" else converter_module.ModelType.V4_1
+
+    assert converter_module._model_type_for_config(config) is expected
 
 
 def test_family_configs_are_split_and_registered(converter_module):
@@ -275,9 +272,10 @@ def test_family_configs_are_split_and_registered(converter_module):
     )
 
     # The lightning_indexer suffix differs per family; sparse_attention is V4.1-only.
-    assert converter_module._DSV4_CONFIG_FILTERS["lightning_indexer"] is not converter_module._DSV41_CONFIG_FILTERS[
-        "lightning_indexer"
-    ]
+    assert (
+        converter_module._DSV4_CONFIG_FILTERS["lightning_indexer"]
+        is not converter_module._DSV41_CONFIG_FILTERS["lightning_indexer"]
+    )
     assert "sparse_attention" not in converter_module._DSV4_CONFIG_FILTERS
     assert "sparse_attention" in converter_module._DSV41_CONFIG_FILTERS
 
@@ -286,15 +284,11 @@ def test_family_configs_are_split_and_registered(converter_module):
 
     # Per-model components resolve under their feature name for each family.
     assert (
-        type(
-            instantiate_component_for_model_and_name(converter_module.ModelType.V4_1, "sparse_attention")
-        ).__name__
+        type(instantiate_component_for_model_and_name(converter_module.ModelType.V4_1, "sparse_attention")).__name__
         == "DeepSeekV41QuantSparseAttentionComponent"
     )
     assert (
-        type(
-            instantiate_component_for_model_and_name(converter_module.ModelType.V4_1, "compressor")
-        ).__name__
+        type(instantiate_component_for_model_and_name(converter_module.ModelType.V4_1, "compressor")).__name__
         == "DeepSeekV41QuantCompressorComponent"
     )
     assert (
@@ -335,24 +329,20 @@ def test_recipe_converters_reject_unknown_model_type(converter_module):
 def test_apply_quantization_converter_passes_model_type(converter_module, monkeypatch, model_name, expected_model_type):
     from torchtitan_npu.config.configs import QuantizationExtensionConfig
 
-    @dataclass(frozen=True)
-    class FakeModelSpec:
-        name: str
-        model: object
-
+    registry = importlib.import_module(f"torchtitan_npu.models.{model_name}").model_registry
+    config_name = "debugmodel" if model_name == "deepseek_v4" else "deepseek_v4_1_debugmodel"
+    model_config = registry(config_name)
     quantization_config = QuantizationExtensionConfig(enable_quantized_training=True, recipe="mix")
     calls = []
     monkeypatch.setattr(converter_module, "_recipe_converters", lambda *args, **kwargs: calls.append(kwargs) or [])
-    monkeypatch.setattr(converter_module, "validate_converter_order", lambda converters: None)
 
-    model_spec = FakeModelSpec(name=model_name, model=object())
     converted = converter_module.apply_quantization_converter(
-        model_spec,
+        model_config,
         quantization_config,
         model_compile_enabled=False,
     )
 
-    assert converted is not model_spec
+    assert converted is model_config
     assert calls[0]["model_type"] == converter_module.ModelType(expected_model_type)
 
 
@@ -360,6 +350,8 @@ def test_apply_quantization_converter_passes_model_type(converter_module, monkey
 def test_quantized_experts_preserve_wrappers_through_forward(monkeypatch, converter_module, quant_format):
     from torchtitan_npu.extensions.adaptor.torchao.converter import block_fp8_param_swap, mxfp8_param_swap
 
+    # Only the grouped-matmul boundary below runs; registration has no CPU op.
+    monkeypatch.setitem(sys.modules, "cann_ops_nn", ModuleType("cann_ops_nn"))
     wrapper_module = importlib.import_module(f"torchao_npu.wrapper_tensors.{quant_format}_wrapper_tensor")
     if quant_format == "mx":
         quant_config = mxfp8_param_swap()
@@ -367,22 +359,17 @@ def test_quantized_experts_preserve_wrappers_through_forward(monkeypatch, conver
     else:
         quant_config = block_fp8_param_swap()
         wrapper_cls = wrapper_module.BlockMXTrainingWeightWrapperTensor
-    monkeypatch.setitem(sys.modules, "cann_ops_nn.ops", ModuleType("cann_ops_nn.ops"))
-    source = converter_module.GroupedExperts.Config(dim=32, hidden_dim=32, num_experts=2)
+    source = converter_module.GroupedLinear.Config(group_size=2, in_features=32, out_features=32, num_linears=2)
     converter = converter_module.NpuQuantizeConverter.Config(
         base_config=quant_config,
         unified_npu_quant_modules=converter_module.UNIFIED_NPU_QUANTIZED_MODULES,
         specific_npu_quant_modules=converter_module.SPECIFIC_NPU_QUANTIZED_MODULES,
     ).build()
 
-    # Keep real quantize_, parameter wrappers, casts and torch._grouped_mm
-    # dispatch. Replace only the NPU grouped-matmul and SwiGLU boundaries.
     with torch.random.fork_rng(devices=[]):
-        experts = converter.convert(source).build()
-    for weight in (experts.w1_EFD, experts.w3_EFD, experts.w2_EDF):
-        assert isinstance(weight, wrapper_cls)
-        assert isinstance(weight.bfloat16().transpose(-2, -1), wrapper_cls)
-
+        projection = converter.convert(source).build()
+    assert isinstance(projection.weight, wrapper_cls)
+    assert isinstance(projection.weight.flatten(1, -2).bfloat16().transpose(-2, -1), wrapper_cls)
     matmul_calls = []
 
     def quantized_grouped_mm(x, weight, offsets, activation_config, weight_config):
@@ -390,40 +377,21 @@ def test_quantized_experts_preserve_wrappers_through_forward(monkeypatch, conver
         return torch.cat((x[:1] @ weight[0], x[1:] @ weight[1]))
 
     monkeypatch.setattr(wrapper_module, f"to_{quant_format}_then_grouped_mm", quantized_grouped_mm)
-    swiglu_calls = []
-
-    def swiglu(x, *, weight, group_index, clamp_limit):
-        swiglu_calls.append((x, weight, group_index, clamp_limit))
-        # This fixed boundary contract isolates dispatch from CANN numerics.
-        return (x[..., :32].float() * weight.reshape(-1, 1)).to(x.dtype)
-
-    monkeypatch.setattr(torch.ops, "cann_ops_nn", SimpleNamespace(swiglu_group=SimpleNamespace(default=swiglu)))
-    ascendc = importlib.import_module("torchtitan_npu.override.common.swiglu_group.ascendc")
-    monkeypatch.setattr(ascendc, "get_spmd_backend", lambda: "torch")
     with torch.no_grad():
         identity = torch.eye(32)
-        experts.w1_EFD.copy_(torch.stack((identity, identity * 2)))
-        experts.w3_EFD.copy_(torch.stack((identity * 0.5, identity * 1.5)))
-        experts.w2_EDF.copy_(torch.stack((identity * 3, identity * 4)))
-    scores = torch.tensor([0.25, 0.5, 0.75])
+        projection.weight.copy_(
+            torch.stack((torch.stack((identity, identity * 2)), torch.stack((identity * 3, identity * 4))))
+        )
 
-    output = experts(torch.full((3, 32), 0.25), torch.tensor([1, 2]), routed_scores_R=scores)
+    output = projection(torch.full((3, 32), 0.25, dtype=torch.bfloat16), torch.tensor([1, 3], dtype=torch.int32))
 
-    torch.testing.assert_close(output, torch.tensor([[0.1875], [1.0], [1.5]]).expand(3, 32))
-    assert len(matmul_calls) == 3
-    for offsets, activation_config, weight_config in matmul_calls:
-        torch.testing.assert_close(offsets, torch.tensor([1, 3], dtype=torch.int32))
-        assert activation_config is quant_config.activation_config
-        assert weight_config is quant_config.weight_config
-    assert len(swiglu_calls) == 1
-    packed, weight, group_index, clamp_limit = swiglu_calls[0]
-    torch.testing.assert_close(packed[:, :32], torch.tensor([[0.25], [0.5], [0.5]], dtype=torch.bfloat16).expand(3, 32))
-    torch.testing.assert_close(
-        packed[:, 32:], torch.tensor([[0.125], [0.375], [0.375]], dtype=torch.bfloat16).expand(3, 32)
-    )
-    torch.testing.assert_close(weight, scores)
-    assert group_index is None
-    assert clamp_limit == -1.0
+    expected = torch.tensor([[[0.25], [0.5]], [[0.75], [1.0]], [[0.75], [1.0]]], dtype=torch.bfloat16).expand(3, 2, 32)
+    torch.testing.assert_close(output, expected)
+    assert len(matmul_calls) == 1
+    offsets, activation_config, weight_config = matmul_calls[0]
+    torch.testing.assert_close(offsets, torch.tensor([1, 3], dtype=torch.int32))
+    assert activation_config is quant_config.activation_config
+    assert weight_config is quant_config.weight_config
 
 
 @pytest.mark.parametrize("enabled", [False, True], ids=["disabled", "enabled"])
@@ -444,7 +412,7 @@ def test_v41_recipe_couples_source_compressor_and_sparse_attention(converter_mod
         model_compile_enabled=False,
     )
 
-    for layer in converted.model.layers:
+    for layer in converted.layers:
         compressor = layer.attention.compressor
         compressor_quant = getattr(compressor, "_torchao_npu_config", None)
         attention_quant = getattr(layer.attention.inner_attention, "_torchao_npu_config", None)
@@ -460,15 +428,16 @@ def test_v41_recipe_couples_source_compressor_and_sparse_attention(converter_mod
 def _source_compressor_layer(spec, ratio):
     return next(
         i
-        for i, layer in enumerate(spec.model.layers)
+        for i, layer in enumerate(spec.layers)
         if layer.attention.compressor.is_source and layer.attention.compressor.compress_ratio == ratio
     )
 
 
 def _build_cpu_compressor(config):
     module = config.build()
+    module._apply(lambda value: value.to(dtype=torch.bfloat16) if value.is_floating_point() else value)
     module.init_states(buffer_device=torch.device("cpu"))
-    return module.to(dtype=torch.bfloat16)
+    return module
 
 
 def _capture_compressor_encoding(monkeypatch, width):
@@ -520,10 +489,10 @@ def test_v41_teacher_pair_survives_each_supported_switch_combination(
                 "torchtitan_npu.override.deepseek_v4_1.sparse_attn.asc",
             ]
         ),
-        converted.model,
+        converted,
     )
 
-    for layer in converted.model.layers:
+    for layer in converted.layers:
         selector = layer.attention.indexer.selector
         inner_attention = layer.attention.inner_attention
         selector_quant = getattr(selector, "_torchao_npu_config", None)
@@ -573,15 +542,15 @@ def test_converted_v41_compressor_quantizes_post_rope_and_preserves_gradients(co
     layer_id = _source_compressor_layer(reference_spec, ratio)
     with torch.random.fork_rng(devices=[]):
         torch.manual_seed(17)
-        reference = _build_cpu_compressor(reference_spec.model.layers[layer_id].attention.compressor)
-        quantized = _build_cpu_compressor(converted.model.layers[layer_id].attention.compressor)
+        reference = _build_cpu_compressor(reference_spec.layers[layer_id].attention.compressor)
+        quantized = _build_cpu_compressor(converted.layers[layer_id].attention.compressor)
     quantized.load_state_dict(reference.state_dict())
-    d = reference_spec.model.layers[layer_id].attention.compressor.wkv.out_features
+    d = reference_spec.layers[layer_id].attention.compressor.wkv.out_features
     captured = _capture_compressor_encoding(monkeypatch, d)
-    dim = reference_spec.model.dim
-    x_ref = torch.linspace(-1, 1, 4 * dim, dtype=torch.bfloat16).reshape(1, 4, dim).requires_grad_()
+    dim = reference_spec.dim
+    x_ref = torch.linspace(-1, 1, 4 * dim, dtype=torch.bfloat16).reshape(4, dim).requires_grad_()
     x_quant = x_ref.detach().clone().requires_grad_()
-    positions = torch.arange(4).unsqueeze(0)
+    positions = torch.arange(4)
 
     expected_kv, expected_latent = reference(x_ref, positions)
     actual_kv, actual_latent = quantized(x_quant, positions)
@@ -592,7 +561,7 @@ def test_converted_v41_compressor_quantizes_post_rope_and_preserves_gradients(co
     expected_qdq = torch.tensor([0.25, 0.5], dtype=actual_kv.dtype).repeat(actual_kv.numel() // 2).reshape_as(actual_kv)
     assert torch.equal(actual_kv, expected_qdq)
     assert actual_kv.dtype == expected_kv.dtype
-    reuser = converted.model.layers[layer_id + 1].attention.compressor.build()
+    reuser = converted.layers[layer_id + 1].attention.compressor.build()
     shared, latent = reuser(x_quant, positions, actual_kv)
     assert shared is actual_kv
     assert latent is None

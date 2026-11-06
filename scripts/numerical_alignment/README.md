@@ -97,12 +97,34 @@ HF 与 DCP 必须来自同一份权重。两种 attention 模式都要求 batch 
 
 ```bash
 export HF_ASSETS_PATH=/path/to/tokenizer
-export CKPT_SAVE_LOAD_PATH=checkpoint
-export USE_GOLDEN=1
 
 # 比特一致对比：前后两个提交
 python scripts/numerical_alignment/loss_compare.py HEAD~1 HEAD
 ```
+
+#### 比较上游适配前后的版本
+
+`93f956c` 依赖 TorchTitan `dc3985ad`，使用旧的 `checkpoint`、`optimizer` 配置；当前版本依赖 `ebdfc8c`，使用可选的 `checkpointer` 和嵌套 `optim`。通过 `--baseline-config-api legacy` 选择旧接口，test 侧默认使用 `native`。两侧均已使用 token 训练 API，无需设置 `--baseline-training-api legacy`。
+
+准备两个分别固定到上述 commit 的 TorchTitan 源码目录，使用同一套 CANN、PyTorch、torch-npu 与输入数据，从仓库根目录执行：
+
+```bash
+export HF_ASSETS_PATH=/path/to/tokenizer
+export OLD_TORCHTITAN=/path/to/torchtitan-dc3985ad
+export NEW_TORCHTITAN=/path/to/torchtitan-ebdfc8c
+export RUNNER=examples/deepseek_v4/debug/deepseek_v4_flash_8p_cpt_4k_a3.sh
+
+python scripts/numerical_alignment/loss_compare.py 93f956c HEAD \
+    --runner "$RUNNER" --steps 100 --seq-len 4096 \
+    --baseline-config-api legacy --test-config-api native \
+    --baseline-upstream "$OLD_TORCHTITAN" --test-upstream "$NEW_TORCHTITAN"
+```
+
+DeepSeek-V4.1 使用 `examples/deepseek_v4_1/debug/deepseek_v4_1_flash_8p_cpt_4k_a3.sh`。在 A5 上使用对应的 `_a5.sh` runner；两侧分别读取各自 commit 中的脚本。运行前按实际设备配置 `ASCEND_RT_VISIBLE_DEVICES` 和编译缓存路径。
+
+脚本从旧侧生成一份 FP32、仅模型的 seed DCP，两侧从该文件加载权重，并使用各自的空 checkpoint 输出目录，避免恢复其他训练状态。默认清理 seed DCP 和临时 worktree，保留 `seed.log`、两侧训练日志、TensorBoard 事件及 `comparison.json`。native 侧使用本工具的训练入口设置可选 checkpointer，不能同时指定自定义 `TRAIN_FILE`。
+
+短训练只能验证启动、前反向、更新和比较流程；精度验收仍需完整运行 100 步。指标不一致时返回 `1`，以报告中的逐项结果判定，不把「两侧训练完成」作为精度通过。
 
 #### 数值近似对比
 

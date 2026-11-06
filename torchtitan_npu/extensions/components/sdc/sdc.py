@@ -113,13 +113,13 @@ class SDC(Configurable):
     @staticmethod
     def _validate_compiled_sdc_config(config: Trainer.Config) -> None:
         compile_config = config.compile
-        if not (compile_config.enable and "model" in compile_config.components):
+        model_compile = getattr(compile_config, "model", None)
+        if model_compile is None:
             raise ValueError(
-                "compiled SDC requires compile.enable=true with 'model' in compile.components; "
-                "use NPU_ASD_CONFIG/NPU_ASD_ENABLE for eager SDC"
+                "compiled SDC requires compile.model to be configured; use NPU_ASD_CONFIG/NPU_ASD_ENABLE for eager SDC"
             )
-        if compile_config.backend != "inductor":
-            raise ValueError(f"compiled SDC requires compile.backend='inductor'; got {compile_config.backend!r}")
+        if model_compile.backend != "inductor":
+            raise ValueError(f"compiled SDC requires compile.backend='inductor'; got {model_compile.backend!r}")
         if int(config.parallelism.pipeline_parallel_degree) > 1:
             raise ValueError("compiled SDC does not support pipeline parallelism")
 

@@ -22,26 +22,25 @@ used below.
 from __future__ import annotations
 
 import hashlib
+import logging
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
 import torch
 import torch.distributed as dist
-import torchtitan.components.optimizer.optimizer as optimizer_module
-import torchtitan.distributed.flex_shard as flex_shard_module
 import torchtitan.distributed.flex_shard.dist_muon as dist_muon_module
 from torch.distributed.tensor import DTensor, Replicate
-from torchtitan.tools.logging import logger
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Mapping, Sequence
+    from collections.abc import Mapping, Sequence
 
     from torch.distributed.device_mesh import DeviceMesh
 
 
 _DP_REPLICATE_AXIS = "dp_replicate"
-_ORIGINAL_BUILD_DIST_MUON = dist_muon_module.build_dist_muon
 _ORIGINAL_STEP = dist_muon_module.DistMuon.step
 
 
@@ -487,34 +486,8 @@ def _replica_dedup_step(muon: Any, closure: Any = None) -> float | None:
     return loss
 
 
-def build_dist_muon(
-    params: Iterable[dict[str, Any]],
-    *,
-    compute_sharding_by_fqn: Mapping[str, Any],
-    bucket_configs: Sequence[Any],
-    enable_hsdp_replica_dedup: bool = False,
-    **kwargs: Any,
-) -> Any:
-    """Build native DistMuon, optionally replacing its plans with owner plans."""
-    muon = _ORIGINAL_BUILD_DIST_MUON(
-        params,
-        compute_sharding_by_fqn=compute_sharding_by_fqn,
-        bucket_configs=bucket_configs,
-        **kwargs,
-    )
-    if not enable_hsdp_replica_dedup:
-        return muon
+def configure_dist_muon(muon: Any) -> None:
+    """Enable owner-only plans on the optimizer built by its typed Config."""
     _configure_replica_dedup(muon)
     muon.register_load_state_dict_post_hook(_after_replica_dedup_load_state_dict)
     muon.step = _replica_dedup_step.__get__(muon, type(muon))
-    return muon
-
-
-def apply() -> None:
-    """Route every upstream factory binding through the opt-in wrapper."""
-    dist_muon_module.build_dist_muon = build_dist_muon
-    flex_shard_module.build_dist_muon = build_dist_muon
-    optimizer_module.build_dist_muon = build_dist_muon
-
-
-apply()

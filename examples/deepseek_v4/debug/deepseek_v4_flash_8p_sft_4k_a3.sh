@@ -12,9 +12,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 DATASET_PATH="${DATASET_PATH:-/path/to/train.jsonl}"
 
-CONFIG="${CONFIG:-deepseek_v4_flash_43layers_16experts_sft}" \
+CONFIG="${CONFIG:-deepseek_v4_flash_43layers_16experts_sft_compiled}" \
 DSV4_SFT_DATASET="${DATASET_PATH}" \
 exec bash "${SCRIPT_DIR}/deepseek_v4_flash_8p_cpt_4k_a3.sh" \
-    --checkpoint.enable \
-    --checkpoint.no-load-only \
+    --checkpointer.no-load-only \
     "$@"

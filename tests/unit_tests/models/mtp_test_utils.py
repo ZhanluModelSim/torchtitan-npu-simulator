@@ -6,7 +6,10 @@
 
 from types import SimpleNamespace
 
+from torchtitan.config.parallelism import ParallelismConfig
+
 import torch
+from torchtitan.distributed.spmd_types import spmd_dense_mesh
 
 BATCH_SIZE = 1
 # The DSV4 stack aligns every packed document to lcm(compress_ratios) -- 128 for
@@ -22,12 +25,8 @@ PACKED_POSITIONS = torch.cat([torch.arange(_DOCUMENT_LEN), torch.arange(_DOCUMEN
 
 # ``preprocess_inputs`` (the seam under test) takes the parallelism context;
 # these models run a single process with no CP and the default SPMD backend.
-_NO_CP_DIMS = SimpleNamespace(cp_enabled=False, get_mesh=lambda name: None)
-_NO_SPMD = SimpleNamespace(
-    spmd_backend="partial_dtensor",
-    context_parallel_load_balancer=None,
-    context_parallel_ptrr_mask_key=None,
-)
+_NO_CP_CONTEXT = SimpleNamespace(cp_enabled=False, get_mesh=lambda name: None, spmd_dense_mesh=spmd_dense_mesh)
+_PARALLELISM = ParallelismConfig()
 
 
 def build_cpu_model(config):
@@ -46,8 +45,8 @@ def preprocess(model, tokens, labels, positions):
     """
     inputs, labels, extra_kwargs = model.preprocess_inputs(
         {"input": tokens, "labels": labels, "positions": positions},
-        parallel_dims=_NO_CP_DIMS,
-        parallelism=_NO_SPMD,
+        parallelism_context=_NO_CP_CONTEXT,
+        parallelism=_PARALLELISM,
     )
     assert "attention_masks" in extra_kwargs or "attention_metadata" in extra_kwargs, (
         "expected the model to build attention metadata"
@@ -76,7 +75,9 @@ def assert_packed_mtp_training(model) -> None:
             f"Expected matching main and MTP output shapes, got {tuple(output[0].shape)} and {tuple(output[1].shape)}."
         )
 
-    loss, _ = MTPLoss(MTPLoss.Config(mtp_scale=0.3, global_vocab_size=VOCAB_SIZE))(output, labels, positions=positions)
+    prepared = extra_kwargs["mtp_batch"].labels
+    aligned_labels = (labels, *prepared.unbind(dim=-1))
+    loss, _ = MTPLoss(MTPLoss.Config(mtp_scale=0.3, global_vocab_size=VOCAB_SIZE))(tuple(output), aligned_labels)
     if not torch.isfinite(loss).item():
         raise AssertionError(f"Expected a finite MTP loss, got {loss.item()}.")
     loss.backward()

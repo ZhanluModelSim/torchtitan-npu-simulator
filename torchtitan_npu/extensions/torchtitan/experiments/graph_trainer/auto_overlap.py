@@ -8,13 +8,13 @@
 from __future__ import annotations
 
 import functools
+import logging
 from typing import TYPE_CHECKING
 
 from torchtitan.experiments.graph_trainer.registry import (
     PASS_PIPELINE_REGISTRY,
     register_pass_pipeline,
 )
-from torchtitan.tools.logging import logger
 
 from torchtitan_npu.extensions.torchtitan.experiments.graph_trainer.utils import (
     assign_stable_node_tags,
@@ -22,6 +22,8 @@ from torchtitan_npu.extensions.torchtitan.experiments.graph_trainer.utils import
     dump_fx_graph,
     node_id,
 )
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -291,7 +293,7 @@ def _construct_npu_auto_overlap_pipeline(
     traced_result,
     config,
     *,
-    parallel_dims=None,
+    parallelism_context=None,
     runtime_context=None,
 ) -> list[Callable]:
     """Build ``base_pipeline`` with EP validation and NPU scheduling."""
@@ -309,7 +311,7 @@ def _construct_npu_auto_overlap_pipeline(
     passes = pipeline_fn(
         traced_result,
         config,
-        parallel_dims=parallel_dims,
+        parallelism_context=parallelism_context,
     )
     return _configure_npu_auto_overlap_passes(
         passes,
@@ -324,7 +326,7 @@ def construct_npu_auto_overlap_passes(
     traced_result,
     config,
     *,
-    parallel_dims=None,
+    parallelism_context=None,
     runtime_context=None,
 ) -> list[Callable]:
     """Build the default pipeline with the NPU MoE scheduler as its EP pass."""
@@ -332,7 +334,7 @@ def construct_npu_auto_overlap_passes(
         "default",
         traced_result,
         config,
-        parallel_dims=parallel_dims,
+        parallelism_context=parallelism_context,
         runtime_context=runtime_context,
     )
 
@@ -347,7 +349,7 @@ def construct_mutation_functionalization_npu_auto_overlap_passes(
     traced_result,
     config,
     *,
-    parallel_dims=None,
+    parallelism_context=None,
     runtime_context=None,
 ) -> list[Callable]:
     """Compose the local mutation-functionalization pipeline with the NPU scheduler."""
@@ -355,6 +357,6 @@ def construct_mutation_functionalization_npu_auto_overlap_passes(
         MUTATION_FUNCTIONALIZATION_PIPELINE,
         traced_result,
         config,
-        parallel_dims=parallel_dims,
+        parallelism_context=parallelism_context,
         runtime_context=runtime_context,
     )

@@ -8,6 +8,7 @@
 """DeepSeek-V4 conversation processing for TorchTitan's Grain dataset graph."""
 
 import json
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Annotated, Any
@@ -17,11 +18,12 @@ import tyro
 from torchtitan.components.data import DatasetBuildContext, SampleProcessor, TextSequence
 from torchtitan.components.loss import IGNORE_INDEX
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
-from torchtitan.tools.logging import logger
 
 from torchtitan_npu.models.common.alignment import align_text_sequence, validate_alignment
 
 from .chat_encoder import DSV4EncoderConfig
+
+logger = logging.getLogger(__name__)
 
 
 def _sft_messages(sample: dict[str, Any]) -> list[dict[str, Any]]:

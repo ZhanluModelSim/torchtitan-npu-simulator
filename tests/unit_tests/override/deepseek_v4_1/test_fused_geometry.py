@@ -73,7 +73,7 @@ def _model_numbers(config) -> tuple[int, ...]:
             layer.attention.indexer.num_index_heads,
             layer.attention.indexer.index_head_dim,
         )
-        for layer in config.model_spec.model.layers
+        for layer in config.model.layers
     }
     assert len(numbers) == 1, f"the stack mixes geometries, which one port config cannot describe: {numbers}"
     return numbers.pop()
@@ -187,7 +187,7 @@ def test_a_flavor_of_other_widths_states_them() -> None:
 
     # Stated, the port matches the model it runs: the metadata is sized from the same numbers the
     # layer reads, which is what makes a mismatch a build-time error rather than a lookup miss.
-    inner = config.model_spec.model.layers[0].attention.inner_attention
+    inner = config.model.layers[0].attention.inner_attention
     port = asc(
         inner,
         num_heads=DEBUG[0],

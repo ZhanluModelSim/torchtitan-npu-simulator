@@ -12,6 +12,8 @@
 
 """Native-load backport for TorchTitan's dc3985 _load hook."""
 
+import logging
+
 import torch
 from torch.distributed.checkpoint.state_dict_saver import _stateful_to_state_dict
 from torch.distributed.checkpoint.stateful import Stateful
@@ -20,7 +22,8 @@ from torchtitan.components.checkpointer.torch_checkpointing import (
     TorchCheckpointingManager as UpstreamTorchCheckpointingManager,
 )
 from torchtitan.observability import structured_logger as sl
-from torchtitan.tools.logging import logger
+
+logger = logging.getLogger(__name__)
 
 
 class TorchCheckpointingManager(UpstreamTorchCheckpointingManager):

@@ -38,12 +38,12 @@ class MoEBoundaryStub(Module):
     def __init__(self, config):
         super().__init__()
 
-    def forward(self, x, *, image_mask=None):
+    def forward(self, x, *, image_mask=None, padding_mask_T=None):
         return torch.nn.functional.silu(x) * 0.5 - 0.125
 
 
 def build_mhc_boundary_model(*, dim=4, vocab_size=11):
-    config = model_registry("deepseek_v4_1_debugmodel_text").model
+    config = model_registry("deepseek_v4_1_debugmodel_text")
     config.dim = config.tok_embeddings.embedding_dim = config.lm_head.in_features = dim
     config.vocab_size = config.tok_embeddings.num_embeddings = config.lm_head.out_features = vocab_size
     config.norm.normalized_shape = dim

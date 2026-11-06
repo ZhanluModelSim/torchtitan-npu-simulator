@@ -37,6 +37,8 @@ from torchtitan_npu.override.deepseek_v4_1.lightning_indexer.ascendc import (
 from torchtitan_npu.override.deepseek_v4_1.metadata import AicpuGeometry
 from torchtitan_npu.override.deepseek_v4_1.sparse_attn.ascendc import build_fused_metadata
 
+pytestmark = pytest.mark.usefixtures("single_rank_spmd")
+
 _TOKENS = torch.cat([torch.arange(64), torch.arange(63, -1, -1)])
 _POSITIONS = torch.cat([torch.arange(64), torch.arange(64)])
 
@@ -236,7 +238,7 @@ def _tiny_model(monkeypatch, *, fused: bool):
         return make_config(**kwargs)
 
     monkeypatch.setattr(registry, "_make_v41_config", tiny_config)
-    config = registry.model_registry("deepseek_v4_1_debugmodel").model
+    config = registry.model_registry("deepseek_v4_1_debugmodel")
     config.vocab_size = config.tok_embeddings.num_embeddings = config.lm_head.out_features = 64
     if fused:
         # ``fused`` means the fused stack, not one of its halves: the teacher edge only
@@ -615,7 +617,7 @@ def test_lightning_indexer_asc_stack_applies_without_claim_conflicts(monkeypatch
 
     monkeypatch.setattr(DefaultDeviceType, "_default_device_type", "cpu")
     registry = importlib.import_module("torchtitan_npu.models.deepseek_v4_1")
-    model = registry.model_registry("deepseek_v4_1_debugmodel").model
+    model = registry.model_registry("deepseek_v4_1_debugmodel")
 
     apply_overrides(
         OverrideConfig(
@@ -688,7 +690,7 @@ def test_both_fused_ports_build_the_kernel_stack(monkeypatch):
     registry = importlib.import_module("torchtitan_npu.models.deepseek_v4_1")
 
     def config(*, fused_selector: bool, fused_core: bool):
-        cfg = registry.model_registry("deepseek_v4_1_debugmodel").model
+        cfg = registry.model_registry("deepseek_v4_1_debugmodel")
         for layer in cfg.layers:
             # The pair only exists where there is a compressed stream.
             if layer.attention.inner_attention.compress_ratio == 0:
@@ -723,7 +725,7 @@ def test_a_half_fused_teacher_pair_is_rejected_through_override_imports(imports)
     job = recipes.deepseek_v4_1_debugmodel_text()
     job.override = OverrideConfig(imports=imports)
     with pytest.raises(ValueError, match="must be enabled together"):
-        job.model_spec.model.update_from_config(config=job)
+        job.model.update_from_config(config=job)
 
 
 def test_both_ports_requested_pass_the_pair_gate():
@@ -741,7 +743,7 @@ def test_both_ports_requested_pass_the_pair_gate():
             "torchtitan_npu.override.deepseek_v4_1.lightning_indexer.asc",
         ]
     )
-    job.model_spec.model.update_from_config(config=job)
+    job.model.update_from_config(config=job)
 
 
 def test_the_teacher_sources_are_the_index_source_layers():

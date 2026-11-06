@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import copy
+import logging
 import time
 from bisect import bisect_left, bisect_right
 from collections import Counter, defaultdict
@@ -15,13 +16,13 @@ from dataclasses import replace
 from itertools import pairwise
 from typing import Any
 
-from torchtitan.tools.logging import logger
-
 from . import schedule_simulation
 from .cv_parallel import event_frontiers
 from .schedule_scoring import _local_coverage_score, _overlap_metrics, predicted_coverage_improved
 from .schedule_simulation import ScheduleSimulation, _compute_union_ms, _ReorderProposal, _ReorderWindowOrder
 from .whole_graph_runtime_profile import node_id
+
+logger = logging.getLogger(__name__)
 
 _REORDER_TEMPLATE_CACHE_NODE_LIMIT = 262144
 _EXHAUSTIVE_REGION_NODE_LIMIT = 512

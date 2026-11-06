@@ -42,7 +42,7 @@ def qwen_cp(monkeypatch):
     fsdp_module.resolve_fsdp_mesh = lambda *args, **kwargs: None
     fsdp_module.resolve_sparse_fsdp_mesh = lambda *args, **kwargs: None
     fsdp_module.apply_fsdp_to_decoder = lambda *args, **kwargs: None
-    fsdp_module.apply_fsdp_to_vision_encoder = lambda *args, **kwargs: None
+    fsdp_module.apply_fsdp_to_multimodal_encoder = lambda *args, **kwargs: None
     monkeypatch.setitem(sys.modules, "torchtitan.distributed.compile", compile_module)
     monkeypatch.setitem(sys.modules, "torchtitan.distributed.fsdp", fsdp_module)
 

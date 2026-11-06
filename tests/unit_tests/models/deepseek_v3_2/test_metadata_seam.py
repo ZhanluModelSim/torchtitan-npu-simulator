@@ -18,9 +18,10 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from torchtitan.config import ParallelismConfig
+from torchtitan.config.parallelism import ParallelismConfig
+from torchtitan.config.validation import validate_context_parallel
+from torchtitan.distributed.spmd_types import spmd_dense_mesh
 from torchtitan.models.common.attention import VarlenMetadata
-from torchtitan.models.common.decoder import Decoder
 
 import torchtitan_npu  # noqa: F401  imported for its patch chain: the seam under test
 from torchtitan_npu.models.deepseek_v3_2 import (
@@ -36,12 +37,14 @@ from torchtitan_npu.models.deepseek_v3_2.model import SparseInnerAttention
 from torchtitan_npu.override.deepseek_v3_2.sparse_attn import asc, ascendc
 from torchtitan_npu.override.deepseek_v3_2.sparse_attn.ascendc import AscSparseInnerAttention, AscVarlenMetadata
 
+pytestmark = pytest.mark.usefixtures("single_rank_spmd")
+
 # Two documents of four tokens in one packed row.
 _POSITIONS = torch.tensor([0, 1, 2, 3, 0, 1, 2, 3])
 _SEQ_LEN = 8
 _CU_SEQ = [0, 4, 8]
-_NO_CP_DIMS = SimpleNamespace(cp_enabled=False, get_mesh=lambda name: None)
-_NO_SPMD = SimpleNamespace(spmd_backend="partial_dtensor")
+_NO_CP_CONTEXT = SimpleNamespace(cp_enabled=False, get_mesh=lambda name: None, spmd_dense_mesh=spmd_dense_mesh)
+_PARALLELISM = ParallelismConfig()
 
 
 def _model_config(n_layers: int = 3, *, ascendc: bool = False) -> DeepSeekV32Model.Config:
@@ -70,6 +73,7 @@ def _model_config(n_layers: int = 3, *, ascendc: bool = False) -> DeepSeekV32Mod
         index_topk=4,
     )
     config = DeepSeekV32Model.Config(
+        max_context_length=_SEQ_LEN,
         vocab_size=64,
         dim=32,
         tok_embeddings=Embedding.Config(num_embeddings=64, embedding_dim=32),
@@ -94,9 +98,9 @@ def builds(monkeypatch) -> list:
     recorded: list = []
     build = v32_model.create_varlen_metadata_for_document
 
-    def counting_build(positions):
+    def counting_build(positions, **kwargs):
         recorded.append(positions)
-        return build(positions)
+        return build(positions, **kwargs)
 
     monkeypatch.setattr(v32_model, "create_varlen_metadata_for_document", counting_build)
     monkeypatch.setattr(ascendc, "create_varlen_metadata_for_document", counting_build)
@@ -120,43 +124,64 @@ def test_the_decoder_builds_one_entry_for_the_whole_stack(builds):
     assert all(attention_metadata[key] is entry for key in keys)
 
 
-def test_preprocess_inputs_hands_the_map_to_the_forward():
-    """The model's own preprocessing yields the map, not a single mask object."""
-    model = _model_config(n_layers=1).build()
+@pytest.mark.parametrize("ascendc_backend", [False, True], ids=["reference", "ascendc"])
+def test_preprocess_inputs_hands_the_map_to_the_forward(ascendc_backend, builds, monkeypatch):
+    """The no-MTP model dispatches one shared entry to each backend layer."""
+    model = _model_config(n_layers=2, ascendc=ascendc_backend).build()
+    tokens = torch.arange(_SEQ_LEN, dtype=torch.int64)
+    padding_mask = torch.tensor([False, False, False, True, False, False, False, True])
 
-    _, _, extra_kwargs = model.preprocess_inputs(
+    inputs, labels, extra_kwargs = model.preprocess_inputs(
         {
-            "input": torch.zeros(_SEQ_LEN, dtype=torch.int64),
-            "labels": torch.zeros(_SEQ_LEN, dtype=torch.int64),
+            "input": tokens,
+            "labels": tokens.clone(),
             "positions": _POSITIONS,
+            "padding_mask": padding_mask,
         },
-        parallel_dims=_NO_CP_DIMS,
-        parallelism=_NO_SPMD,
+        parallelism_context=_NO_CP_CONTEXT,
+        parallelism=_PARALLELISM,
     )
 
-    assert set(extra_kwargs["attention_metadata"]) == {SparseInnerAttention}
+    backend = AscSparseInnerAttention if ascendc_backend else SparseInnerAttention
+    assert set(extra_kwargs["attention_metadata"]) == {backend}
     assert "attention_masks" not in extra_kwargs
+    assert len(builds) == 1
+    entry = extra_kwargs["attention_metadata"][backend]
+    varlen = entry.varlen_meta if ascendc_backend else entry
+    assert varlen.cu_seq_q.tolist() == varlen.cu_seq_k.tolist() == _CU_SEQ
+    torch.testing.assert_close(inputs, tokens)
+    torch.testing.assert_close(labels, tokens)
+
+    received = []
+
+    def layer_boundary(hidden, metadata, positions, *, padding_mask):
+        received.append((metadata, positions, padding_mask))
+        return hidden
+
+    # Isolate attention computation, whose folded-token migration is separate;
+    # keep the real model forward and per-layer metadata dispatch under test.
+    model.tok_embeddings = torch.nn.Identity()
+    model.norm = torch.nn.Identity()
+    model.lm_head = torch.nn.Identity()
+    for layer in model.layers.values():
+        monkeypatch.setattr(layer, "forward", layer_boundary)
+    output = model(inputs, **extra_kwargs)
+
+    torch.testing.assert_close(output, tokens)
+    assert len(received) == 2
+    assert all(metadata is entry for metadata, _, _ in received)
+    for _, positions, actual_padding_mask in received:
+        torch.testing.assert_close(positions, _POSITIONS)
+        torch.testing.assert_close(actual_padding_mask, padding_mask)
 
 
-def test_decoder_update_from_config_refuses_context_parallel():
-    """The decoder guard the V3.2 config delegates to refuses CP for these cores.
-
-    This is the guard the retired rank-local hook used to supplement: it runs at
-    configuration time, before any layer could read a global varlen layout.  The
-    test calls the decoder contract directly so it does not depend on the
-    deferred pre-fold ``DeepSeekV32Model.Config.update_from_config`` rope step.
-    """
+def test_sparse_attention_config_rejects_context_parallel():
     config = _model_config(n_layers=1)
 
-    with pytest.raises(NotImplementedError, match="Context Parallel is not supported"):
-        Decoder.Config.update_from_config(
+    with pytest.raises(ValueError, match="must use CPInnerAttention"):
+        validate_context_parallel(
             config,
-            config=SimpleNamespace(
-                parallelism=ParallelismConfig(
-                    context_parallel_degree=2,
-                    spmd_backend="spmd_types",
-                ),
-            ),
+            ParallelismConfig(context_parallel_degree=2),
         )
 
 

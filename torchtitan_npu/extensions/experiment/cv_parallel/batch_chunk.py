@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import functools
+import logging
 import operator
 from contextvars import ContextVar
 from dataclasses import replace
@@ -18,18 +19,20 @@ import torch
 import torch.fx as fx
 from torch._dynamo.decorators import mark_unbacked
 from torch.utils import _pytree as pytree
-from torchtitan.experiments.graph_trainer.ep_pass_utils import (
+from torchtitan.experiments.graph_trainer.passes import _get_pass_name
+from torchtitan.experiments.graph_trainer.registry import register_post_init_hook
+
+from . import _BATCH_CHUNK_PAIR_ATTR, CV_PARALLEL_PIPELINE
+from .chunk_symbols import (
     CHUNK_SYMBOL_HINTS_META,
     chunk_symbol_hints_for_mode,
     free_symbols,
+    require_graph_chunk_runtime,
     tensor_meta,
 )
-from torchtitan.experiments.graph_trainer.passes import _get_pass_name
-from torchtitan.experiments.graph_trainer.registry import register_post_init_hook
-from torchtitan.tools.logging import logger
-
-from . import _BATCH_CHUNK_PAIR_ATTR, CV_PARALLEL_PIPELINE
 from .symbolic_meta import batch_chunk_symbolic_meta_context
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -45,6 +48,7 @@ def configure_runtime_context(trainer):
     core itself builds (upstream #4897), so no provider has to be read back off
     the model here.
     """
+    require_graph_chunk_runtime()
     make_step = trainer._make_fx_forward_backward_step
     prepare_inputs = trainer._prepare_trace_inputs
 
@@ -446,7 +450,8 @@ def _explicit_chunk_symbol_wrapper(
     """Run the upstream transform with only explicit chunk symbols visible."""
 
     def run(gm, example_inputs):
-        import torchtitan.experiments.graph_trainer.ep_chunk_pass as ep_chunk_module
+        # Legacy graph-chunk path; require_graph_chunk_runtime rejects this on ebdfc8.
+        import torchtitan.experiments.graph_trainer.ep_chunk_pass as ep_chunk_module  # pyrefly: ignore[missing-import]
 
         originals = _mask_unrelated_dynamic_placeholders(gm, mode=mode)
         original_rewrite = ep_chunk_module._rewrite_symbolic_value
@@ -711,6 +716,7 @@ def configure_batch_chunk_passes(
     runtime_context=None,
 ) -> list[Callable]:
     """Keep the chunk transform but remove all cross-chunk scheduling."""
+    require_graph_chunk_runtime()
     if config.compile.inductor_compilation != "regional":
         raise ValueError("NPU batch chunk requires compile.inductor_compilation='regional'")
     ep_config = config.compile.ep_overlap

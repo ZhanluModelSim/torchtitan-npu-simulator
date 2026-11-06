@@ -1,7 +1,6 @@
 {
   "patch_metadata": {
     "missing": [
-      "torchtitan_npu/patches/torchtitan/distributed/flex_shard/dist_muon.py",
       "torchtitan_npu/patches/torchtitan/distributed/flex_shard/replica_dedup.py",
       "torchtitan_npu/patches/torchtitan/experiments/graph_trainer/functionalize_recompute_mutations.py",
       "torchtitan_npu/patches/torchtitan/hf_datasets/text_datasets.py",
@@ -29,6 +28,7 @@
   ],
   "activation_order": {
     "torchtitan_npu/extensions/__init__.py": [
+      ".torchtitan.distributed",
       ".torchtitan.ep_process_group",
       ".torchtitan.models.common",
       ".torchtitan.trainer",
@@ -39,17 +39,12 @@
       ".compile.dynamo_config"
     ],
     "torchtitan_npu/patches/torchtitan/__init__.py": [
-      ".components.checkpoint",
-      ".trainer",
+      ".components.checkpointer",
       ".components.metrics",
       ".components.optimizer",
       ".distributed.context_parallel",
-      ".distributed.flex_shard.dist_muon",
       ".experiments.graph_trainer.chunked_loss",
-      ".experiments.graph_trainer.ep_chunk_concretization",
       ".experiments.graph_trainer.ep_overlap_shape_queries",
-      ".experiments.graph_trainer.ep_ready_nodes_dedup",
-      ".experiments.graph_trainer.ep_shape_live_out",
       ".observability",
       ".models.common.attention_metadata",
       ".models.common.decoder",

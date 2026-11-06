@@ -18,7 +18,7 @@ consumers in the same change.
 
 from __future__ import annotations
 
-from dataclasses import replace
+import logging
 from typing import TYPE_CHECKING
 
 import torch
@@ -29,15 +29,12 @@ from torchao_npu.quantization.quant_configs import (  # noqa: F401  (re-exported
     MXQuantizeConfig,
 )
 from torchtitan.config import derive  # noqa: F401  (re-exported)
-from torchtitan.models.common.linear import Linear  # noqa: F401  (re-exported for tests)
-from torchtitan.models.common.moe import GroupedExperts  # noqa: F401  (re-exported for tests)
-from torchtitan.models.utils import validate_converter_order
+from torchtitan.config.transform import validate_converter_compatibility
+from torchtitan.models.common.linear import GroupedLinear, Linear  # noqa: F401  (re-exported for tests)
 from torchtitan.protocols.module import Module  # noqa: F401  (re-exported for tests)
-from torchtitan.tools.logging import logger
 
-import torchtitan_npu  # noqa: F401  (apply moe/GroupedExperts patch before we bind it below)
+import torchtitan_npu  # noqa: F401  (apply package patches before binding model classes)
 from torchtitan_npu.models.deepseek_v4_1.indexer import Selector as DeepSeekV41Selector  # noqa: F401  (re-exported)
-from torchtitan_npu.override.common.swiglu_group.ascendc import AscGroupedExperts  # noqa: F401  (re-exported)
 
 from .components.deepseek_v4 import (
     _prepare_quant_lightning_indexer_inputs,  # noqa: F401  (re-exported)
@@ -46,12 +43,11 @@ from .configs import (
     _DSV4_CONFIG_FILTERS,  # noqa: F401  (re-exported for tests)
     _DSV41_CONFIG_FILTERS,  # noqa: F401  (re-exported for tests)
     ModelType,  # noqa: F401  (re-exported for tests)
-    _model_type_for_spec,
+    _model_type_for_config,
 )
 from .configs.deepseek_v4 import (  # noqa: F401  (re-exported for tests)
     SPECIFIC_NPU_QUANTIZED_MODULES,
     UNIFIED_NPU_QUANTIZED_MODULES,
-    NpuQuantizedAscGroupedExpertsModule,
     V4FilterKeys,
 )
 from .filters import (  # noqa: F401
@@ -68,9 +64,11 @@ from .recipes import (
     _recipe_converters,
 )
 
+logger = logging.getLogger(__name__)
+
 if TYPE_CHECKING:
-    from torchtitan.components.quantization import QuantizationConverter
-    from torchtitan.protocols.model_spec import ModelSpec
+    from torchtitan.config.transform.quantization import QuantizationConverter
+    from torchtitan.protocols.model import BaseModel
 
     from torchtitan_npu.config.configs import QuantizationExtensionConfig
 
@@ -230,16 +228,16 @@ def _validate_fsdp_prequantize_policy(
 
 
 def apply_quantization_converter(
-    model_spec: ModelSpec | None,
+    model_config: BaseModel.Config | None,
     quantization_config: QuantizationExtensionConfig,
     *,
     model_compile_enabled: bool,
     override_config=None,
-) -> ModelSpec:
-    """Apply the selected TorchAO-NPU recipe to an existing BF16 model spec."""
+) -> BaseModel.Config:
+    """Apply the selected TorchAO-NPU recipe to an existing BF16 model config."""
 
-    if model_spec is None:
-        raise ValueError("TorchAO-NPU quantization requires model_spec to be configured")
+    if model_config is None:
+        raise ValueError("TorchAO-NPU quantization requires model to be configured")
     # Recipe-independent, so it is installed here rather than in
     # _hif8_param_swap: these are block ops, not quantized ops, and MXFP8 wants
     # them saved just as much as HiF8 does. Off by default -- at level 0
@@ -247,11 +245,10 @@ def apply_quantization_converter(
     _save_block_ops_under_selective_ac(quantization_config.save_block_ops_level)
     if not quantization_config.enable_quantized_training:
         logger.info("enable_quantized_training=False; skipping TorchAO-NPU quantization")
-        return model_spec
+        return model_config
     quantization_config.validate()
 
-    model_config = model_spec.model
-    model_type = _model_type_for_spec(model_spec)
+    model_type = _model_type_for_config(model_config)
     converter_configs = _recipe_converters(
         quantization_config.recipe,
         model_type=model_type,
@@ -268,7 +265,7 @@ def apply_quantization_converter(
         model_config=model_config,
         override_config=override_config,
     )
-    validate_converter_order(converter_configs)
+    validate_converter_compatibility(list(converter_configs))
 
     built_converters: list[object] = []
     for converter_config in converter_configs:
@@ -305,13 +302,12 @@ def apply_quantization_converter(
         quantization_config.enable_fsdp_prequantize,
         quantization_config.fsdp_prequantize_dtype,
     )
-    return replace(model_spec, model=model_config)
+    return model_config
 
 
 __all__ = [
     "ConfigFilterFn",
     "NpuQuantizeConverter",
-    "NpuQuantizedAscGroupedExpertsModule",
     "any_config_filter",
     "apply_quantization_converter",
     "block_fp8_param_swap",

@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import operator
 import re
 from bisect import bisect_left, bisect_right
@@ -22,12 +23,13 @@ from torch.utils import _pytree as pytree
 from torchtitan.experiments.graph_trainer.ep_pass_utils import (
     is_c10d_functional_node,
 )
-from torchtitan.tools.logging import logger
 
 from .cann_kernel_metrics import CannKernelMetrics, classify_mixed_core_times
 from .cann_launches import associate_cann_launches
 from .cann_profiler import cann_profile, isolated_cann_profiler_work_path, parse_cann_profile
 from .profile_overlap import SCOPE, summarize_profile
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from pathlib import Path

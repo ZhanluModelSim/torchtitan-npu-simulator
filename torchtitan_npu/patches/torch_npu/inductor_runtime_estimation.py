@@ -7,7 +7,9 @@
 
 from __future__ import annotations
 
-from torchtitan.tools.logging import logger
+import logging
+
+logger = logging.getLogger(__name__)
 
 # Conservative HBM bandwidth used only by graph scheduling roofline estimates.
 # It avoids Triton CUDA-driver probing on NPU; it does not change generated ops.

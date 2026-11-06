@@ -12,8 +12,8 @@ from functools import partial
 from typing import TYPE_CHECKING
 
 import torch.nn as nn
-from torchtitan.distributed.pipeline_parallel import pipeline_llm
-from torchtitan.models.common import ComplexRoPE, Embedding, Linear, RMSNorm
+from torchtitan.config.transform import validate_converter_compatibility
+from torchtitan.models.common import ComplexRoPE, Embedding, Linear, RMSNorm, SqrtSoftplus
 from torchtitan.models.common.config_utils import (
     make_ffn_config,
     make_moe_config,
@@ -21,8 +21,6 @@ from torchtitan.models.common.config_utils import (
     make_router_config,
 )
 from torchtitan.models.common.param_init import depth_scaled_std
-from torchtitan.models.utils import validate_converter_order
-from torchtitan.protocols.model_spec import ModelSpec
 
 from torchtitan_npu.patches.torchtitan.models.common.linear import BatchedLinear
 
@@ -46,8 +44,8 @@ from .state_dict_adapter import DeepSeekV41StateDictAdapter
 _MARKER_INIT = {name: partial(nn.init.normal_, std=1.0) for name in ("image_start", "image_newline", "image_end")}
 
 if TYPE_CHECKING:
+    from torchtitan.config.transform import ModelConfigConverter
     from torchtitan.models.common.moe import MoE
-    from torchtitan.protocols.model import ModelConfigConverter
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -471,7 +469,7 @@ def _make_v41_moe_config(
         num_experts=num_experts,
         gate_param_init=_depth_init(layer_id),
         top_k=top_k,
-        score_func="sqrtsoftplus",  # pyrefly: ignore [bad-argument-type]
+        score_func=SqrtSoftplus.Config(),  # pyrefly: ignore [bad-argument-type]
         route_norm=route_norm,
         route_scale=route_scale,
     )
@@ -700,6 +698,7 @@ def _make_v41_config(
         )
 
     common = dict(
+        max_context_length=max_seq_len,
         dim=dim,
         vocab_size=vocab_size,
         tok_embeddings=Embedding.Config(
@@ -1008,9 +1007,7 @@ def model_registry(
     moe_comm_backend: str = "standard",
     non_blocking_capacity_factor: float | None = None,
     converters: list[ModelConfigConverter.Config] | None = None,
-) -> ModelSpec:
-    from .parallelize import parallelize_deepseek_v4_1
-
+) -> DeepSeekV41Model.Config:
     if flavor not in deepseek_v4_1_configs:
         raise ValueError(f"Unknown deepseek_v4_1 flavor: {flavor}. Available: {list(deepseek_v4_1_configs.keys())}")
     config = deepseek_v4_1_configs[flavor](
@@ -1018,33 +1015,10 @@ def model_registry(
         non_blocking_capacity_factor=non_blocking_capacity_factor,
     )
     if converters is not None:
-        validate_converter_order(converters)
+        validate_converter_compatibility(converters)
         for converter_cfg in converters:
             config = converter_cfg.build().convert(config)
-    state_dict_adapter = DeepSeekV41StateDictAdapter
-    if getattr(config, "lora", None) is not None:
-        from .lora import DeepSeekV41LoRAStateDictAdapter
-
-        state_dict_adapter = DeepSeekV41LoRAStateDictAdapter
-    return ModelSpec(
-        name="deepseek_v4_1",
-        flavor=flavor,
-        model=config,
-        max_context_length=config.layers[0].attention.rope.max_context_length,
-        parallelize_fn=parallelize_deepseek_v4_1,
-        pipelining_fn=pipeline_llm,
-        post_optimizer_build_fn=_register_step_pre_hooks,
-        state_dict_adapter=state_dict_adapter,
-    )
-
-
-def _register_step_pre_hooks(optimizers, model_parts, parallel_dims) -> None:
-    """Register the MoE balancing step hook."""
-    from torchtitan.components.optimizer import register_moe_load_balancing_hook
-
-    if any(getattr(model, "lora_config", None) is not None for model in model_parts):
-        return
-    register_moe_load_balancing_hook(optimizers, model_parts, parallel_dims)
+    return config
 
 
 __all__ = [
@@ -1060,3 +1034,5 @@ __all__ = [
     "deepseek_v4_1_configs",
     "model_registry",
 ]
+
+DeepSeekV41Model.state_dict_adapter_cls = DeepSeekV41StateDictAdapter

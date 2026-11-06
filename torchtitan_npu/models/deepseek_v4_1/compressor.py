@@ -58,7 +58,7 @@ class Compressor(Module):
         super().__init__()
         self.compress_ratio = config.compress_ratio
         self.is_source = config.is_source
-        # The CP mesh: wired by the framework's ``Module.parallelize`` recursion, ``None`` at one
+        # The CP mesh: wired by the framework's ``Module._parallelize`` recursion, ``None`` at one
         # degree.  A reusing layer never restores anything, so this is set before the early return.
         self.group = None
         if not self.is_source:
@@ -74,10 +74,10 @@ class Compressor(Module):
         self.norm = config.norm.build()
         self.rope = config.rope.build()
 
-    def parallelize(self, parallel_dims) -> None:
+    def _parallelize(self, parallelism_context) -> None:
         """Take the CP mesh the framework hands down to every module."""
-        self.group = parallel_dims.get_optional_mesh("cp")
-        super().parallelize(parallel_dims)
+        self.group = parallelism_context.get_optional_mesh("cp")
+        super()._parallelize(parallelism_context)
 
     def forward(
         self,

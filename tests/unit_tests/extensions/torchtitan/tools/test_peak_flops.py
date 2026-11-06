@@ -86,7 +86,7 @@ def test_unknown_device_delegates_to_upstream(peak_flops_ext, monkeypatch):
 
 def test_metrics_processor_uses_installed_peak_flops_hook(peak_flops_ext):
     module, titan_utils, _ = peak_flops_ext
-    import torchtitan.components.metrics as titan_metrics
+    import torchtitan.observability.metrics as titan_metrics
 
     assert titan_utils.get_peak_flops is module.get_peak_flops
     assert titan_metrics.utils.get_peak_flops is module.get_peak_flops

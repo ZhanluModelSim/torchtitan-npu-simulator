@@ -6,8 +6,13 @@ pytest==8.3.2
 pytest-cov
 pre-commit
 pyrefly==0.45.1
-transformers==4.57.6
+# Match the DeepSeek-V4 reference used by the PEFT round-trip tests.
+transformers==5.13.0
+peft==0.21.2
 # Test dependencies
 einops
 expecttest
 tomli_w
+# TorchFT 0.2.0 imports its OpenTelemetry logger at package import time.
+opentelemetry-sdk
+opentelemetry-exporter-otlp-proto-http

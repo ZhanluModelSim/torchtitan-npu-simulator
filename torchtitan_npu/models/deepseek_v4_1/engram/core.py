@@ -189,9 +189,9 @@ class EngramTable(Module):
         self.hash_multipliers = torch.from_numpy(hash_multipliers).to(device=device)
         self.compressed_pad_id = self.token_id_map[self.pad_id].clone()
 
-    def parallelize(self, parallel_dims) -> None:
-        self.ep_mesh = parallel_dims.get_optional_mesh("ep")
-        super().parallelize(parallel_dims)
+    def _parallelize(self, parallelism_context) -> None:
+        self.ep_mesh = parallelism_context.get_optional_mesh("ep")
+        super()._parallelize(parallelism_context)
 
     def _shift_tokens(
         self,

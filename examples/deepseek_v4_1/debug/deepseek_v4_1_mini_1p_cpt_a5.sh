@@ -66,8 +66,6 @@ exec bash scripts/run_train.sh \
     --parallelism.tensor-parallel-degree 1 \
     --parallelism.pipeline-parallel-degree 1 \
     --parallelism.context-parallel-degree 1 \
-    --compile.no-enable \
-    --checkpoint.no-enable \
     --metrics.log-freq 1 \
     --override.imports ${CLI_OVERRIDES} \
     "${QUANTIZATION_ARGS[@]}" \

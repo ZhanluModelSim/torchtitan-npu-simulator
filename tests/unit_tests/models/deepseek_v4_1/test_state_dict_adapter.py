@@ -27,7 +27,7 @@ from torchtitan_npu.models.deepseek_v4_1.vision.state_dict_adapter import DeepSe
 
 def _build_model_config():
     """A minimal local V4.1 fixture (the debugmodel topology, tiny widths)."""
-    config = model_registry("deepseek_v4_1_debugmodel").model
+    config = model_registry("deepseek_v4_1_debugmodel")
     for layer in config.layers:
         layer.engram = None
     config.vocab_size = 32
@@ -166,7 +166,7 @@ class TestComposedAdapterPartition:
 @pytest.mark.parametrize("shards", [2, 4], ids=["two-shards", "four-shards"])
 def test_engram_hf_shard_load_and_export(tmp_path, shards):
     """DCP reads global HF rows into an EP shard and omits native padding on save."""
-    config = model_registry("deepseek_v4_1_debugmodel_text").model
+    config = model_registry("deepseek_v4_1_debugmodel_text")
     table = config.layers[1].engram.table
     table.head_vocab_sizes = (2, 3, 5, 7, 11, 13)
     table.num_embeddings = 48
@@ -208,7 +208,7 @@ def test_engram_hf_shard_load_and_export(tmp_path, shards):
 
 def test_engram_quantized_hf_mapping():
     """The adapter selects the CPU reader and maps official Engram keys."""
-    config = model_registry("deepseek_v4_1_debugmodel_text").model
+    config = model_registry("deepseek_v4_1_debugmodel_text")
     table = config.layers[1].engram.table
     table.head_vocab_sizes = (2, 3, 5, 7, 11, 13)
     table.num_embeddings = 48
@@ -298,7 +298,7 @@ class TestTextFlavorAdapter:
 
     @staticmethod
     def _text_adapter():
-        config = model_registry("deepseek_v4_1_debugmodel_text").model
+        config = model_registry("deepseek_v4_1_debugmodel_text")
         for layer in config.layers:
             layer.engram = None
         config.vocab_size = 32

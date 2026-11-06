@@ -6,7 +6,9 @@
 
 set -euo pipefail
 
-if [[ -f /usr/local/Ascend/cann/set_env.sh ]]; then
+if [[ -n "${ASCEND_SET_ENV_PATH:-}" ]]; then
+    source "${ASCEND_SET_ENV_PATH}"
+elif [[ -f /usr/local/Ascend/cann/set_env.sh ]]; then
     source /usr/local/Ascend/cann/set_env.sh
 elif [[ -f /usr/local/Ascend/ascend-toolkit/set_env.sh ]]; then
     source /usr/local/Ascend/ascend-toolkit/set_env.sh
@@ -32,10 +34,9 @@ ARGS=(
     --config qwen35_27b_4k_sft
     --hf-assets-path "${HF_ASSETS_PATH}"
     --override.imports torchtitan_npu.override.qwen3_5.gated_delta.triton
-    --checkpoint.enable
-    --checkpoint.initial-load-path "${CHECKPOINT_INITIAL_LOAD_PATH:-${HF_ASSETS_PATH}}"
-    --checkpoint.initial-load-in-hf
-    --checkpoint.initial-load-model-only
+    --checkpointer.initial-load-path "${CHECKPOINT_INITIAL_LOAD_PATH:-${HF_ASSETS_PATH}}"
+    --checkpointer.initial-load-in-hf
+    --checkpointer.initial-load-model-only
     --dump-folder "${DUMP_FOLDER:-./outputs/qwen3_6_4k_sft}"
     --training.max-context-length "${SEQ_LEN}"
     --training.num-tokens-per-microbatch-per-dp-rank "${SEQ_LEN}"

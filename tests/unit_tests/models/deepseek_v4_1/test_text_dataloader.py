@@ -21,6 +21,8 @@ from tests.unit_tests.models.deepseek_v4_1.preprocess_utils import preprocess, t
 from torchtitan_npu.models.common.alignment import AlignedTextProcessor, align_text_sequence, compression_alignment
 from torchtitan_npu.models.deepseek_v4_1.attention import CompressedSparseInnerAttention2
 
+pytestmark = pytest.mark.usefixtures("single_rank_spmd")
+
 ASSETS = Path(__file__).resolve().parents[3] / "assets"
 
 
@@ -39,7 +41,7 @@ def _loader(tokenizer, *, rank=0, world=1, alignment=2, seq_len=512, infinite=Fa
         dp_rank=rank,
         dp_world_size=world,
         max_context_length=seq_len,
-        num_tokens_per_batch=seq_len,
+        num_tokens_per_microbatch=seq_len,
     )
 
 
@@ -47,9 +49,9 @@ def _stream(loader):
     """Every supervisable (token, label) pair and token count the loader emitted."""
     pairs: list[tuple[int, int]] = []
     tokens_total = 0
-    for inputs, labels in islice(loader, 8):
-        tokens = inputs["input"]
-        row_labels = labels
+    for microbatch in islice(loader, 8):
+        tokens = microbatch.input
+        row_labels = microbatch.labels
         tokens_total += int(tokens.numel())
         supervised = row_labels != IGNORE_INDEX
         pairs.extend(zip(tokens[:-1][supervised[:-1]].tolist(), row_labels[:-1][supervised[:-1]].tolist(), strict=True))
@@ -89,16 +91,23 @@ def test_alignment_adds_a_bounded_number_of_untrained_tokens(tokenizer):
 
 
 def test_row_length_is_a_multiple_of_the_alignment(tokenizer):
-    for inputs, _ in _loader(tokenizer, alignment=2):
-        assert int(inputs["input"].numel()) % 2 == 0
+    loader = _loader(tokenizer, alignment=2)
+    try:
+        for microbatch in loader:
+            assert int(microbatch.input.numel()) % 2 == 0
+    finally:
+        loader.close()
 
 
 def test_row_cut_rebases_positions(tokenizer):
     """A row is cut to exactly ``seq_len``; the row's own positions start at 0 and
     count up, so every row is an independent pooling problem."""
     loader = _loader(tokenizer, alignment=2, seq_len=128)
-    inputs, _ = next(iter(loader))
-    positions = inputs["positions"]
+    try:
+        microbatch = next(iter(loader))
+    finally:
+        loader.close()
+    positions = microbatch.positions
     assert int(positions.numel()) == 128
     assert int(positions[0]) == 0
     assert torch.equal(positions, torch.arange(128))
@@ -114,7 +123,7 @@ def test_alignment_must_divide_seq_len(tokenizer):
             context=DatasetBuildContext(
                 tokenizer=None,
                 max_context_length=10,
-                num_tokens_per_batch=10,
+                num_tokens_per_microbatch=10,
                 read_options=grain.ReadOptions(num_threads=0),
             ),
         )
@@ -127,8 +136,12 @@ def test_dp_shards_partition_the_aligned_stream(tokenizer):
     assert all(tokens > 0 and pairs for tokens, pairs in ranks)
     # Neither rank is a prefix of the other: the shard really partitioned the source.
     assert ranks[0][1] != ranks[1][1]
-    for inputs, _ in islice(_loader(tokenizer, rank=0, world=2, alignment=2), 3):
-        assert int(inputs["input"].numel()) % 2 == 0
+    loader = _loader(tokenizer, rank=0, world=2, alignment=2)
+    try:
+        for microbatch in islice(loader, 3):
+            assert int(microbatch.input.numel()) % 2 == 0
+    finally:
+        loader.close()
 
 
 def test_the_seam_builds_the_metadata_and_forwards_nothing_extra(monkeypatch):

@@ -73,7 +73,7 @@ def test_detection_only_skips_checkpoint_requirements_but_rejects_pp():
         anticipatory=AnticipatoryRoutingConfig(enable=True, max_rollbacks=0),
         parallelism=SimpleNamespace(pipeline_parallel_degree=1),
         debug=SimpleNamespace(moe_force_load_balance=False),
-        checkpoint=SimpleNamespace(enable=False, load_only=True, exclude_from_loading=["optimizer"]),
+        checkpointer=SimpleNamespace(load_only=True, exclude_from_loading=["optimizer"]),
     )
     validate_anticipatory_config(config)
     config.anticipatory.max_rollbacks = 1

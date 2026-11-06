@@ -40,14 +40,16 @@ def test_interleaved_rope_caches_expanded_cos_and_sin(rope_cls):
     assert rope.cache.shape == (2, 16, 8)
 
 
-def test_workaround_rope_matches_complex_reference():
+@pytest.mark.parametrize("position_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("explicit_positions", [False, True], ids=["sequential", "packed"])
+def test_workaround_rope_matches_complex_reference(position_dtype, explicit_positions):
     config = ComplexRoPE.Config(dim=8, max_context_length=16)
     reference = ComplexRoPE(config)
     workaround = WorkaroundComplexRoPE(WorkaroundComplexRoPE.Config(dim=8, max_context_length=16))
     # The folded-token call form the migrated attention uses: ``[T, H, D]``
     # queries with flat per-token positions (two three-token rows folded).
     query = torch.randn(6, 1, 8)
-    positions = torch.arange(3).repeat(2)
+    positions = torch.arange(3, dtype=position_dtype).repeat(2) if explicit_positions else None
 
     expected = reference(query, positions=positions)
     actual = workaround(query, positions=positions)

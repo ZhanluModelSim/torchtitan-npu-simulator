@@ -10,7 +10,7 @@ import json
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import torch
 from PIL import Image
@@ -19,6 +19,7 @@ from torchtitan.components.data import GrainDataLoader
 from torchtitan.components.data.collators import Collator
 from torchtitan.components.data.dataset import SampleProcessor, SingleDatasetConfig
 from torchtitan.components.data.sources import HuggingFaceStreamingSource
+from torchtitan.components.data.types import TokenizedTrainingMicrobatch
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
 
 from torchtitan_npu.models.common.alignment import validate_alignment
@@ -319,6 +320,9 @@ class DeepSeekV41VisionLanguageProcessor:
         tokens = torch.tensor(ids + [self.tokenizer.eos_id] * pad, dtype=torch.long)
         token_types = torch.tensor(types + [TEXT] * pad, dtype=torch.long)
         feature_indices = torch.tensor(indices + [-1] * pad, dtype=torch.long)
+        padding_mask = torch.zeros(self.seq_len, dtype=torch.bool)
+        if pad:
+            padding_mask[-pad:] = True
         labels = torch.full((self.seq_len,), -100, dtype=torch.long)
         for position, target in enumerate(target_mask):
             if target and position:
@@ -330,8 +334,9 @@ class DeepSeekV41VisionLanguageProcessor:
             "image_grid": torch.tensor(grids),
             "token_types": token_types,
             "image_feature_indices": feature_indices,
+            "padding_mask": padding_mask,
         }
-        return inputs, labels
+        return cast("tuple[dict[str, torch.Tensor], torch.Tensor]", (inputs, labels))
 
     def __call__(
         self, row: dict | None = None, *, sample: dict | None = None, **_kwargs
@@ -359,8 +364,8 @@ class _GrainSFTProcessor(SampleProcessor):
 
     def __init__(self, config: Config, *, context):
         validate_alignment(config.per_doc_alignment, context=context)
-        if context.num_tokens_per_batch != context.max_context_length:
-            raise ValueError("vision SFT requires num_tokens_per_batch == max_context_length (one chat context)")
+        if context.num_tokens_per_microbatch != context.max_context_length:
+            raise ValueError("vision SFT requires num_tokens_per_microbatch == max_context_length (one chat context)")
         encoder = DeepSeekV41VisionLanguageEncoder(
             str(Path(context.tokenizer.tokenizer_path) / "encoding" / "encoding.py"),
             thinking_mode=config.thinking_mode,
@@ -391,16 +396,27 @@ class _SFTCollator(Collator):
 
     def __call__(self, batch: list[dict[str, Any]]):
         (sample,) = batch
-        # The input dict holds the model's forward kwargs plus ``num_valid_tokens``,
-        # the valid-token count the trainer pops (the upstream collator contract),
-        # so its values are not all tensors.
+        # Preserve structural padding separately from the prompt loss mask:
+        # image and user tokens can legitimately have IGNORE_INDEX labels.
         inputs: dict[str, Any] = {
             key: torch.as_tensor(sample[key])
-            for key in (*_STACKED_INPUT_KEYS, "pixel_values", "image_grid", "image_feature_indices")
+            for key in (
+                *_STACKED_INPUT_KEYS,
+                "padding_mask",
+                "pixel_values",
+                "image_grid",
+                "image_feature_indices",
+            )
         }
         labels = torch.as_tensor(sample["labels"])
-        inputs["num_valid_tokens"] = int((labels != -100).sum())
-        return inputs, labels
+        return TokenizedTrainingMicrobatch(
+            input=inputs.pop("input"),
+            labels=labels,
+            positions=inputs.pop("positions"),
+            padding_mask=inputs.pop("padding_mask"),
+            num_valid_tokens=int((labels != -100).sum()),
+            model_kwargs=inputs,
+        )
 
 
 def sft_dataloader_config(

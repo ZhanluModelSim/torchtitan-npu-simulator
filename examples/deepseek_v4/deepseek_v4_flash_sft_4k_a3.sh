@@ -13,9 +13,8 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 CPT_SCRIPT="${CPT_SCRIPT:-${SCRIPT_DIR}/deepseek_v4_flash_cpt_4k_a3.sh}"
 DATASET_PATH="${DATASET_PATH:-/path/to/train.jsonl}"
 
-CONFIG="${CONFIG:-deepseek_v4_flash_sft}" \
+CONFIG="${CONFIG:-deepseek_v4_flash_sft_compiled}" \
 DSV4_SFT_DATASET="${DATASET_PATH}" \
 exec bash "${CPT_SCRIPT}" \
-    --checkpoint.enable \
-    --checkpoint.no-load-only \
+    --checkpointer.no-load-only \
     "$@"

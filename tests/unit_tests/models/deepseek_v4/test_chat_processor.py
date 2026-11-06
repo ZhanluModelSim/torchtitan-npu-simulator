@@ -38,7 +38,7 @@ def processor_and_encoder(monkeypatch):
     context = DatasetBuildContext(
         tokenizer=HuggingFaceTokenizer(tokenizer_path="tests/assets/deepseek_v3"),
         max_context_length=8,
-        num_tokens_per_batch=16,
+        num_tokens_per_microbatch=16,
         read_options=grain.ReadOptions(num_threads=0),
     )
     processor = DeepSeekV4ChatProcessor.Config(per_doc_alignment=8).build(context=context)

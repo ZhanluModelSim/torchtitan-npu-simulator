@@ -7,9 +7,7 @@
 
 from dataclasses import dataclass
 
-import torch.distributed.checkpoint as dcp
-
-from torchtitan_npu.models.deepseek_v4.lora import is_lora_parameter
+from torchtitan_npu.models.common.deepseek_lora import is_lora_parameter
 from torchtitan_npu.models.deepseek_v4.peft import DeepSeekV4PEFTCheckpointManager
 
 
@@ -19,9 +17,7 @@ class DeepSeekV41LoRACheckpointManager(DeepSeekV4PEFTCheckpointManager):
         last_save_model_only: bool = False
         save_training_state: bool = True
 
-    def dcp_load(self, state_dict, checkpoint_id, from_hf=False, from_quantized=False):
-        if checkpoint_id != self.initial_load_path and not from_hf:
-            saved = dcp.FileSystemReader(checkpoint_id).read_metadata().state_dict_metadata
-            if not any(is_lora_parameter(name) for name in saved):
-                raise ValueError("V4.1 LoRA resume requires adapter tensors; load the base through initial_load_path")
-        return super().dcp_load(state_dict, checkpoint_id, from_hf, from_quantized)
+    def _validate_native_resume(self, saved_keys: set[str]) -> None:
+        super()._validate_native_resume(saved_keys)
+        if not any(is_lora_parameter(name) for name in saved_keys):
+            raise ValueError("V4.1 LoRA resume requires adapter tensors; load the base through initial_load_path")

@@ -15,18 +15,20 @@ avoid an import cycle (configs -> deepseek/components -> recipes).
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Annotated, Literal, TypedDict, cast
 
 import tyro
 from torchao.core.config import AOBaseConfig  # noqa: TC002
 from torchao.quantization.quant_api import quantize_
-from torchtitan.components.quantization import QuantizationConverter
 from torchtitan.config import derive
-from torchtitan.tools.logging import logger
+from torchtitan.config.transform.quantization import QuantizationConverter
 
 from .filters import ConfigFilterFn, _match_fqn_suffix, _replace_config
 from .param_swaps import _is_prequantizing_block_mx, _param_swap_without_prequantize
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from torchao_npu.configs import ParamSwapConfig
@@ -82,8 +84,8 @@ def _get_npu_quantized_module_cls(parent_cls: type[Module]) -> type[Module]:
     """Create a quantized subclass while preserving host behavior.
 
     The generated class inherits the concrete config owner so custom forward
-    methods and config fields remain intact. Standard GroupedExperts and
-    AscGroupedExperts use the dedicated subclass selected by NpuQuantizeConverter.
+    methods and config fields remain intact, including first-class grouped
+    projections and their fused projection axis.
     """
 
     if parent_cls in _npu_quantized_module_cache:
@@ -273,7 +275,7 @@ class NpuQuantizeConverter(QuantizationConverter):
             model_config = _replace_config(model_config, parent, attr, replacement)
             converted += 1
             logger.info(
-                "[Converter] %s.%s: model_spec.model.%s %s -> %s",
+                "[Converter] %s.%s: model.%s %s -> %s",
                 type(self).__module__,
                 type(self).__qualname__,
                 fqn,

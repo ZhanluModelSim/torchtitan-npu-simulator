@@ -8,9 +8,9 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
-from torchtitan.distributed.flex_shard import BlockShard
 from torch.distributed.tensor import Shard
-from torchtitan.distributed.parallel_dims import MeshAxisName
+from torchtitan.distributed.flex_shard import BlockShard
+from torchtitan.distributed.parallelism_context import MeshAxisName
 
 from torchtitan_npu.models.deepseek_v4 import model_registry
 from torchtitan_npu.models.deepseek_v4.config_registry import _dsv4_muon_profile
@@ -38,40 +38,22 @@ def test_d2h_swap_cleanup_warns_before_releasing_the_pinned_buffer():
 
 
 def test_dsv4_muon_profile_uses_validated_phase_one_policy():
-    path = _ROOT / "torchtitan_npu/models/deepseek_v4/config_registry.py"
-    file_source = path.read_text()
-    source = _function_source(path, "_dsv4_muon_profile")
+    from torchtitan.components.optim import AdamW
 
-    assert '"wq_a": owned' in source
-    assert '"wkv": owned' in source
-    assert '"wo_b": owned' in source
-    assert "shared_experts.{projection}.weight" in source
-    optimizer_source = _function_source(path, "_dsv4_optimizer_config")
-    assert "muon_momentum=0.95" in optimizer_source
-    assert "muon_ns_steps=10" in optimizer_source
-    assert "beta1=0.9" in optimizer_source
-    assert "eps=1e-8" in optimizer_source
-    trainer_source = (_ROOT / "torchtitan_npu/extensions/torchtitan/trainer.py").read_text()
-    assert "tensor_parallel_degree=1" in trainer_source
-    assert "pipeline_parallel_degree=1" in trainer_source
-    assert "def deepseek_v4_debugmodel_muon" not in file_source
-    assert "def deepseek_v4_flash_muon" not in file_source
-    assert "def deepseek_v4_flash_43layers_16experts_muon" not in file_source
-    assert "def deepseek_v4_pro_muon" not in file_source
-    # The DSV4 profile is the single unified active Muon policy.
-    assert "include_mtp_projections" in source
-    assert 'f"mtp_layers.{layer_id}"' in source
-    assert 'mtp_projections = ("e_proj", "h_proj")' in source
-    assert "compressor.ape" in source
-    assert "deepseek_v4_flash_43layers_16experts_muon_indexer" not in file_source
-    for experimental_recipe in (
-        "deepseek_v4_flash_43layers_16experts_muon_attention",
-        "deepseek_v4_flash_43layers_16experts_muon_compressor",
-        "deepseek_v4_flash_43layers_16experts_muon_routed_experts",
-        "deepseek_v4_flash_43layers_16experts_muon_router",
-        "deepseek_v4_flash_43layers_16experts_muon_mhc",
-    ):
-        assert experimental_recipe not in file_source
+    from torchtitan_npu.extensions.torchtitan.components.optimizer.muon import DistMuon
+    from torchtitan_npu.models.deepseek_v4.config_registry import deepseek_v4_debugmodel
+
+    config = deepseek_v4_debugmodel()
+    optimizer = config.optim.optimizer
+    assert optimizer.name == "AdamW"
+    assert len(optimizer.optimizers) == 1 and isinstance(optimizer.optimizers[0], AdamW.Config)
+    optimizer.name = "Muon"
+    optimizer.materialize()
+    muon, adamw = optimizer.optimizers
+    assert isinstance(muon, DistMuon.Config) and isinstance(adamw, AdamW.Config)
+    assert muon.momentum == 0.95 and muon.ns_steps == 10
+    assert adamw.betas == (0.9, 0.95) and adamw.eps == 1e-8
+    assert muon.pattern == optimizer._muon_profile.muon_pattern
 
 
 def test_dsv4_unified_muon_policy_follows_paper_parameter_split():
@@ -86,28 +68,20 @@ def test_dsv4_unified_muon_policy_follows_paper_parameter_split():
     assert "BlockShard(dim=0" in source
 
     profile = _dsv4_muon_profile(model_registry("debugmodel"))
-    compute_shardings = profile.optimizer_factory_kwargs["DistMuon"][
-        "compute_sharding_by_fqn"
-    ]
-    expert_layout = compute_shardings[
-        "layers.2.moe.routed_experts.inner_experts.w1_EFD"
-    ]
+    compute_shardings = profile.optimizer_factory_kwargs["DistMuon"]["compute_sharding_by_fqn"]
+    expert_layout = compute_shardings["layers.2.moe.routed_experts.w13.weight"]
     assert all(isinstance(p, Shard) and p.dim == 0 for p in expert_layout.shardings_by_mesh_axis.values())
     assert set(expert_layout.shardings_by_mesh_axis) == {
-        MeshAxisName.FSDP.value,
         MeshAxisName.DP_SHARD.value,
-        f"{MeshAxisName.DP_SHARD.value}_{MeshAxisName.CP.value}",
-        MeshAxisName.EFSDP.value,
+        MeshAxisName.EDP_SHARD.value,
         MeshAxisName.EP.value,
     }
     assert dict(expert_layout.shard_order_by_tensor_dim) == {
-        0: (MeshAxisName.EP.value, MeshAxisName.EFSDP.value),
+        0: (MeshAxisName.EP.value, MeshAxisName.EDP_SHARD.value),
     }
     bucket_configs = profile.optimizer_factory_kwargs["DistMuon"]["bucket_configs"]
-    routed_expert_bucket = next(
-        bucket for bucket in bucket_configs if bucket.name == "layers.2.routed-experts"
-    )
-    assert all(".moe.routed_experts.inner_experts." in fqn for fqn in routed_expert_bucket.patterns)
+    routed_expert_bucket = next(bucket for bucket in bucket_configs if bucket.name == "layers.2.routed-experts")
+    assert all(".moe.routed_experts." in fqn for fqn in routed_expert_bucket.patterns)
     for unified_muon_parameter in (
         "compressor",
         "routed_experts",
@@ -121,26 +95,22 @@ def test_dsv4_unified_muon_policy_follows_paper_parameter_split():
 def test_dsv4_muon_indexer_query_uses_per_head_block_sharding():
     model_spec = model_registry("debugmodel")
     profile = _dsv4_muon_profile(model_spec)
-    compute_shardings = profile.optimizer_factory_kwargs["DistMuon"][
-        "compute_sharding_by_fqn"
-    ]
+    compute_shardings = profile.optimizer_factory_kwargs["DistMuon"]["compute_sharding_by_fqn"]
 
     main_query_layout = compute_shardings["layers.2.attention.wq_b.weight"]
-    indexer_query_layout = compute_shardings[
-        "layers.2.attention.indexer.wq_b.weight"
-    ]
+    indexer_query_layout = compute_shardings["layers.2.attention.indexer.wq_b.weight"]
 
     main_dp_sharding = main_query_layout.shardings_by_mesh_axis["dp_shard"]
     assert isinstance(main_dp_sharding, BlockShard)
     assert main_dp_sharding.dim == 0
-    assert main_dp_sharding.block_size == model_spec.model.layers[2].attention.head_dim
+    assert main_dp_sharding.block_sizes == (model_spec.layers[2].attention.head_dim,)
 
     indexer_dp_sharding = indexer_query_layout.shardings_by_mesh_axis["dp_shard"]
     assert isinstance(indexer_dp_sharding, BlockShard)
     assert indexer_dp_sharding.dim == 0
-    indexer = model_spec.model.layers[2].attention.indexer
+    indexer = model_spec.layers[2].attention.indexer
     assert indexer is not None
-    assert indexer_dp_sharding.block_size == indexer.index_head_dim
+    assert indexer_dp_sharding.block_sizes == (indexer.index_head_dim,)
 
 
 def test_graph_trainer_conversion_strips_only_npu_top_level_extension():

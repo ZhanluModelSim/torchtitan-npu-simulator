@@ -48,6 +48,8 @@ from torchtitan_npu.override.deepseek_v4_1.sparse_attn.ascendc import (
 )
 from torchtitan_npu.patches.torchtitan.models.common.attention_metadata import cp_shard_context_set
 
+pytestmark = pytest.mark.usefixtures("single_rank_spmd")
+
 _TOKENS = torch.arange(128).remainder(32)
 _POSITIONS = torch.arange(128)
 

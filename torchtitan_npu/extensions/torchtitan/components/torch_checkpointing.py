@@ -31,8 +31,7 @@ class TorchCheckpointingManager(NativeLoadManager):
 
     def __init__(self, config: Config, **kwargs) -> None:
         super().__init__(config, **kwargs)
-        if self.enable:
-            adapt_checkpoint_manager(self._manager)
+        adapt_checkpoint_manager(self._manager)
 
     @torch.no_grad()
     def _save_last_step(self, curr_step: int) -> None:

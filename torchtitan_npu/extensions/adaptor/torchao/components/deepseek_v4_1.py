@@ -11,12 +11,12 @@ Registers the V4.1-unique ``lightning_indexer``, ``compressor`` and
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Annotated, Any
 
 import tyro
 from torch.utils._pytree import SUPPORTED_NODES, register_dataclass
-from torchtitan.tools.logging import logger
 
 from torchtitan_npu.models.deepseek_v4_1.attention import (
     CompressedSparseInnerAttention2 as DeepSeekV41CompressedSparseInnerAttention2,
@@ -28,6 +28,8 @@ from torchtitan_npu.models.deepseek_v4_1.attention import (
 from ..configs import ModelType
 from ..configs.deepseek_v4_1 import V41FilterKeys
 from . import QuantComponent, component
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     import torch

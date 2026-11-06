@@ -10,13 +10,29 @@ from dataclasses import dataclass, field
 from typing import Annotated, Any, Literal
 
 import tyro
-from torchtitan.components.optimizer import OptimizersContainer, ParamGroupConfig
+from torchtitan.components.optim import AdamW, DistMuon, Optim, OptimizersContainer
+from torchtitan.config import CompileConfig as _BaseCompileConfig
 from torchtitan.config import TrainingConfig as _BaseTrainingConfig
-from torchtitan.tools.profiler import Profiler as _BaseProfiler
+from torchtitan.observability.profiler import Profiler as _BaseProfiler
 
 QuantizationRecipe = Literal["all_mxfp8", "all_hif8", "mix", "all_block_fp8"]
 LIQuantization = Literal["mxfp4", "mxfp8", "fp8", "hif8"]
 KVNormQuantization = Literal["mxfp8"]
+
+
+@dataclass(kw_only=True, slots=True)
+class ModelCompileConfig:
+    """NPU block compilation, applied by the model before FSDP wrapping."""
+
+    backend: str = "inductor"
+    fullgraph: bool = True
+
+
+@dataclass(kw_only=True, slots=True)
+class CompileConfig(_BaseCompileConfig):
+    """Upstream non-model compilation plus an explicit NPU model policy."""
+
+    model: Annotated[ModelCompileConfig | None, tyro.conf.AvoidSubcommands] = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,6 +46,7 @@ class MuonOptimizerProfile:
 
     muon_pattern: str
     optimizer_factory_kwargs: Mapping[str, Mapping[str, Any]]
+    optimizer_config_type: type[DistMuon.Config] = DistMuon.Config
 
 
 @dataclass(kw_only=True, slots=True)
@@ -71,42 +88,46 @@ class OptimizerConfig(OptimizersContainer.Config):
         if self._muon_profile is None:
             raise ValueError("optimizer.name=Muon requires a recipe with a DSV4 Muon profile")
 
-        self.param_groups = [
-            ParamGroupConfig(
+        muon_kwargs = dict(self._muon_profile.optimizer_factory_kwargs["DistMuon"])
+        # The NPU runtime registers a typed optimizer config for optional
+        # replica deduplication; keep recipe metadata separate from CLI values.
+        muon_config_type = self._muon_profile.optimizer_config_type
+        self.optimizers = [
+            muon_config_type(
                 pattern=self._muon_profile.muon_pattern,
-                optimizer_name="DistMuon",
-                optimizer_kwargs={
-                    "lr": self.lr,
-                    "weight_decay": self.weight_decay,
-                    "momentum": self.muon_momentum,
-                    "nesterov": self.muon_enable_nesterov,
-                    "ns_steps": self.muon_ns_steps,
-                    "adjust_lr_fn": self.muon_adjust_lr_fn,
-                    "ns_coefficients": self.muon_ns_coefficients,
-                    "eps": self.muon_eps,
-                    "fused": False,
-                    "foreach": False,
-                },
+                lr=self.lr,
+                weight_decay=self.weight_decay,
+                momentum=self.muon_momentum,
+                nesterov=self.muon_enable_nesterov,
+                ns_steps=self.muon_ns_steps,
+                adjust_lr_fn=self.muon_adjust_lr_fn,
+                ns_coefficients=self.muon_ns_coefficients,
+                eps=self.muon_eps,
+                **muon_kwargs,
             ),
-            ParamGroupConfig(
+            AdamW.Config(
                 pattern=r".*",
-                optimizer_name="AdamW",
-                optimizer_kwargs={
-                    "lr": self.lr,
-                    "betas": (self.beta1, self.beta2),
-                    "eps": self.eps,
-                    "weight_decay": self.weight_decay,
-                    "fused": True,
-                    "foreach": False,
-                },
+                lr=self.lr,
+                betas=(self.beta1, self.beta2),
+                eps=self.eps,
+                weight_decay=self.weight_decay,
+                fused=True,
+                foreach=False,
             ),
         ]
-        self.optimizer_factory_kwargs_by_name = {
-            name: dict(kwargs) for name, kwargs in self._muon_profile.optimizer_factory_kwargs.items()
-        }
-        self.optimizer_factory_kwargs_by_name["DistMuon"]["enable_hsdp_replica_dedup"] = (
-            self.muon_enable_hsdp_replica_dedup
-        )
+        if self.muon_enable_hsdp_replica_dedup:
+            if not hasattr(self.optimizers[0], "enable_hsdp_replica_dedup"):
+                raise ValueError("Muon replica deduplication requires the NPU DistMuon config")
+            # The recipe-selected subtype, rather than the upstream base,
+            # declares this optional field; its presence was checked above.
+            setattr(self.optimizers[0], "enable_hsdp_replica_dedup", True)  # noqa: B010
+
+
+@dataclass(kw_only=True, slots=True)
+class OptimConfig(Optim.Config):
+    """Optimization policy with the NPU optimizer CLI schema."""
+
+    optimizer: OptimizersContainer.Config = field(default_factory=OptimizerConfig)
 
 
 @dataclass(kw_only=True, slots=True)

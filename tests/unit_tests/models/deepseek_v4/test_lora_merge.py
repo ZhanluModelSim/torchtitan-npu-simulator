@@ -11,29 +11,26 @@ import torch
 from safetensors.torch import load_file, save_file
 
 from scripts.lora.merge_adapter import merge
-from tests.unit_tests.models.deepseek_v4.lora_test_utils import _build_model_config
+from tests.unit_tests.models.deepseek_v4.lora_test_utils import _lora_model_config
 from torchtitan_npu.models.deepseek_v4.lora import (
     OFFICIAL_MODULES,
-    DeepSeekV4LoRAConverter,
     build_lora_merge_plan,
     merge_lora_weight,
 )
 from torchtitan_npu.models.deepseek_v4.state_dict_adapter import DeepSeekV4StateDictAdapter
 
 
+def _pack_expert_factor(value, factor):
+    if factor.endswith("lora_a"):
+        return value.reshape(-1, value.shape[-1])
+    if factor == "w13_lora_b":
+        value = torch.cat((value[:, :, 0, :], value[:, :, 1, :]), dim=1)
+    return value.permute(1, 2, 0).reshape(value.shape[1], -1)
+
+
 @pytest.fixture
 def exported_adapter(tmp_path):
-    model_config = (
-        DeepSeekV4LoRAConverter.Config(
-            rank=2,
-            rank_experts=2,
-            alpha=4.0,
-            include_mtp=False,
-            target_modules=["attention.wq_a", "attention.wq_b"],
-        )
-        .build()
-        .convert(_build_model_config(num_experts=2, num_layers=1))
-    )
+    model_config = _lora_model_config(targets=["wq_a", "wq_b"])
     adapter = DeepSeekV4StateDictAdapter(model_config, hf_assets_path=None)
     with torch.device("meta"):
         model = model_config.build()
@@ -80,11 +77,6 @@ def test_current_export_merges_checkpoint_weights_and_reloads_state(exported_ada
     for local in ("wq_a", "wq_b"):
         a, b = (factors[f"attention.{local}.lora_{factor}.weight"] for factor in ("a", "b"))
         expected[f"layers.0.attention.{local}.weight"].add_(b @ a, alpha=2.0)
-    prefix = "moe.routed_experts.inner_experts."
-    for weight, a_name, b_name in (("w1_EFD", "w13", "w1"), ("w3_EFD", "w13", "w3"), ("w2_EDF", "w2", "w2")):
-        a = factors[prefix + a_name + "_lora_a"]
-        b = factors[prefix + b_name + "_lora_b"]
-        expected["layers.0." + prefix + weight].add_(b @ a, alpha=2.0)
     base_dir = tmp_path / "base"
     base_dir.mkdir()
     official = _checkpoint_weights(adapter, base, layout)
@@ -95,7 +87,7 @@ def test_current_export_merges_checkpoint_weights_and_reloads_state(exported_ada
     written = load_file(output / "model.safetensors")
     expected_official = _checkpoint_weights(adapter, expected, layout)
 
-    assert report["merged_count"] == 8
+    assert report["merged_count"] == 2
     assert written.keys() == expected_official.keys()
     for name, value in expected_official.items():
         torch.testing.assert_close(written[name], value, rtol=1e-6, atol=1e-7)
@@ -109,8 +101,6 @@ def test_current_export_merges_checkpoint_weights_and_reloads_state(exported_ada
 
 @pytest.mark.parametrize("projection", ["gate_up_proj", "down_proj"])
 def test_fused_expert_merge_matches_independent_forward(tmp_path, projection):
-    from torchtitan_npu.models.deepseek_v4.lora import pack_expert_factor
-
     base_dir, adapter_dir, output = (tmp_path / name for name in ("base", "adapter", "output"))
     base_dir.mkdir()
     gate_up = projection == "gate_up_proj"
@@ -123,8 +113,8 @@ def test_fused_expert_merge_matches_independent_forward(tmp_path, projection):
     _write_adapter(
         adapter_dir,
         {
-            module + ".lora_A.weight": pack_expert_factor(a, "w13_lora_a" if gate_up else "w2_lora_a"),
-            module + ".lora_B.weight": pack_expert_factor(b, "w13_lora_b" if gate_up else "w2_lora_b"),
+            module + ".lora_A.weight": _pack_expert_factor(a, "w13_lora_a" if gate_up else "w2_lora_a"),
+            module + ".lora_B.weight": _pack_expert_factor(b, "w13_lora_b" if gate_up else "w2_lora_b"),
         },
     )
     merge(str(base_dir), str(adapter_dir), str(output))
@@ -263,7 +253,7 @@ def test_merge_rejects_semantic_mismatch_before_writing(tmp_path, kind):
     _write_adapter(
         adapter, {f"base_model.model.{module}.lora_A.weight": a, f"base_model.model.{module}.lora_B.weight": b}
     )
-    with pytest.raises(ValueError, match="rank|expert"):
+    with pytest.raises(ValueError, match=r"rank|expert"):
         merge(str(base), str(adapter), str(output))
     assert not output.exists()
     assert not list(tmp_path.glob(".lora-merge-*"))
@@ -303,16 +293,18 @@ def test_merge_cleans_failed_output_and_can_retry(tmp_path, monkeypatch, failure
 
 
 def test_merge_rejects_serialized_torchao_weight(tmp_path):
-    pytest.importorskip("torchao_npu")
-    from torchao_npu.serialization.export import save_hf_safetensors
-    from torchao.quantization.quantize_.workflows.float8.float8_tensor import Float8Tensor
-
     base, adapter, output = (tmp_path / name for name in ("base", "adapter", "output"))
     base.mkdir()
-    quantized = Float8Tensor(
-        torch.ones(4, 4).to(torch.float8_e4m3fn), torch.ones(1), block_size=[4, 4], dtype=torch.float32
+    # The serialized TorchAO contract has quantized payload/scale keys and a
+    # tensor metadata entry, rather than a decoded logical float weight.
+    save_file(
+        {
+            "proj.weight._weight_qdata": torch.ones(4, 4).to(torch.float8_e4m3fn),
+            "proj.weight._weight_scale": torch.ones(1),
+        },
+        base / "model.safetensors",
+        metadata={"proj.weight": '{"_type":"Float8Tensor","_tensor_data_names":["_weight_qdata","_weight_scale"]}'},
     )
-    save_hf_safetensors({"proj.weight": quantized}, base)
     _write_adapter(
         adapter,
         {
@@ -320,13 +312,14 @@ def test_merge_rejects_serialized_torchao_weight(tmp_path):
             "base_model.model.proj.lora_B.weight": torch.ones(4, 2),
         },
     )
-    with pytest.raises(ValueError, match="Decode.*FP16/BF16/FP32"):
+    with pytest.raises(ValueError, match=r"Decode.*FP16/BF16/FP32"):
         merge(str(base), str(adapter), str(output))
     assert not output.exists()
 
 
 def test_merge_loads_only_one_adapter_pair_at_a_time(tmp_path, monkeypatch):
     import weakref
+
     from scripts.lora import merge_adapter
 
     base, adapter, output = (tmp_path / name for name in ("base", "adapter", "output"))

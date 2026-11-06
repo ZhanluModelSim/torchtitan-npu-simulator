@@ -263,8 +263,8 @@ Optimizer writer 的同步、本地 native DCP 限制。异步保存只有在 DC
 | `rope.asc_partial` | `SplitComplexRoPEConfig`（精确匹配） | `AscPartialComplexRoPE.Config` | 整宽（prefix + rotary）partial-RoPE 站点的 query/key 各收敛为一次 `cann_ops_transformer` 融合原地旋转；CANN 依赖在首次调用时惰性加载 |
 | `token_dispatcher.asc` | `AllToAllTokenDispatcher.Config` | `AscAllToAllTokenDispatcher.Config` | 使用 `torch_npu.npu_moe_token_permute` `npu_moe_token_unpermute` 融合 MoE dispatch/combine |
 | `token_dispatcher.asc_deepep` | `DeepEPTokenDispatcher.Config` | `AscDeepEPTokenDispatcher.Config` | 使用 `cann_ops_transformer.ElasticBuffer` 实现训练路径的 MoE DeepEP dispatch/combine；当前要求 `expert_parallel_degree > 1` |
-| `swiglu_group.asc` | `GroupedExperts.Config` | `AscGroupedExperts.Config` | 使用 `cann_ops_nn.swiglu_group` 完成路由专家的 SwiGLU 激活及可选路由分数乘法 |
-| `swiglu_group.asc_shared_experts` | `FeedForward.Config` | `AscFeedForward.Config` | 使用 `cann_ops_nn.swiglu_group` 完成共享专家的 SwiGLU 激活 |
+| `swiglu_group.asc` | `RoutedExperts.Config` | `activation_fn=AscSwiGLU.Config` | 使用 `cann_ops_nn.swiglu_group` 完成路由专家的 SwiGLU 激活 |
+| `swiglu_group.asc_shared_experts` | `FeedForward.Config` | `activation_fn=AscSwiGLU.Config` | 使用 `cann_ops_nn.swiglu_group` 完成共享专家的 SwiGLU 激活 |
 
 `rope.workaround` 与 `rope.asc_complex` 会声明同一 target，不能同时启用。
 `rope.asc_partial` 精确匹配 split-aware 的 `SplitComplexRoPEConfig`，与其他 rope
@@ -277,17 +277,15 @@ Optimizer writer 的同步、本地 native DCP 限制。异步保存只有在 DC
 
 入口前缀为 `torchtitan_npu.override.common.swiglu_group.`，适用于采用公共专家配置和下述 FQN 布局的模型。
 
-`swiglu_group.asc` 和 `swiglu_group.asc_shared_experts` 分别直接匹配
-`routed_experts.inner_experts` 与 `shared_experts`，不会声明整个 `MoE.Config` 已被替换，
-因此可以和 MoE 中其他子模块的 override 并存。两者只替换 FFN 中间的 gate/up + SwiGLU
-激活桥接，路由选择、token dispatch 以及前后分组矩阵乘仍复用现有路径；路由分数作为
-`weight` 传给 `SwigluGroup`，由融合算子完成激活阶段的 score absorption。CANN 实现位于
-`common/swiglu_group/ascendc.py`。
+`swiglu_group.asc` 和 `swiglu_group.asc_shared_experts` 分别匹配
+`routed_experts` 与 `shared_experts`，将其 `activation_fn` 替换为
+`AscSwiGLU.Config`。两者保留 `w13`、`w2` 和 dispatcher 配置，可与这些组件的 override
+并存。CANN 激活消费 gate/up，并保留配方的 `swiglu_limit`；路由专家在激活后、`w2`
+之前单独执行 FP32 路由分数乘法，再转回激活 dtype。该分数乘法当前没有与 CANN 激活融合。
+CANN 实现位于 `common/swiglu_group/ascendc.py`。
 
-在 `TrainerEx` 中，低精配置转换先于 override 执行：选中的标准 `GroupedExperts.Config` 或
-`AscGroupedExperts.Config` 会转换为 `NpuQuantizedAscGroupedExpertsModule.Config`，复用融合前向，
-无需额外启用 `swiglu_group.asc`；显式启用时保留已有量化配置。
-其他专家子类保留原有实现；共享专家使用融合激活仍需启用 `swiglu_group.asc_shared_experts`。
+低精转换作用于独立的 `Linear.Config`、`GroupedLinear.Config` 及其参数包装；融合激活
+仍通过上述两个 override 显式选择。参数包装与 `activation_fn` 分别保留各自配置。
 
 启用两个 expert override：
 
@@ -349,8 +347,8 @@ torchtitan_npu.override.deepseek_v3_2.sparse_attn.asc
 | `mhc.tilelang_hc_post` | `HcPost.Config` | `TilelangHcPost.Config` | 通过 compile-safe wrapper 延迟调用外部 TileKernels `mhc_post` |
 | `mhc.triton_hc_head` | `HcHead.Config` | `TritonHcHead.Config` | 使用 `mhc_pre_only_sinkhorn_op` + `mhc_pre_bmm_op` |
 | `mhc.tilelang_hc_head` | `HcHead.Config` | `TilelangHcHead.Config` | 使用 `mhc_head_compute_mix_tilelang` (TileLang 融合 kernel) |
-| `moe.tilelang_swiglu_grouped` | `GroupedExperts.Config` | `TilelangGroupedExperts.Config` | 使用外部 `tile_kernels` SwiGLU forward/backward |
-| `moe.tilelang_swiglu_shared` | `FeedForward.Config` | `TilelangFeedForward.Config` | 使用外部 `tile_kernels` SwiGLU forward/backward |
+| `moe.tilelang_swiglu_grouped` | `RoutedExperts.Config` | `activation_fn=TilelangSwiGLU.Config` | 使用 TileLang SwiGLU forward/backward |
+| `moe.tilelang_swiglu_shared` | `FeedForward.Config` | `activation_fn=TilelangSwiGLU.Config` | 使用 TileLang SwiGLU forward/backward |
 | `moe_router.tilelang` | `TokenChoiceTopKRouter.Config`（精确匹配） | `TilelangRouter.Config` | 动态路由使用 TileKernels `topk_gate` |
 | `moe_router.tilelang_v4` | `DeepSeekV4Router.Config`（精确匹配） | `TilelangV4Router.Config` | V4 非 hash 层使用 TileKernels `topk_gate`；hash 层保持原逻辑 |
 | `moe_router.tilelang_v41` | `DeepSeekV41Router.Config`（精确匹配） | `TilelangV41Router.Config` | V4.1 动态路由使用 TileKernels `topk_gate` |

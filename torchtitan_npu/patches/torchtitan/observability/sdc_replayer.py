@@ -75,10 +75,7 @@ def _npu_signature(self: SDCReplayer, loss: torch.Tensor) -> _ReplaySignature:
             seen_parameters.add(id(parameter))
             add_tensor(f"gradient:{module_index}:{name}", parameter.grad)
 
-    state = (
-        ("state:python_rng", random.getstate()),
-        *((f"state:{name}", accessor.get()) for name, accessor in self._scalar_state.items()),
-    )
+    state = (("state:python_rng", random.getstate()),)
     return _ReplaySignature(tuple(schema), tuple(digests), state)
 
 

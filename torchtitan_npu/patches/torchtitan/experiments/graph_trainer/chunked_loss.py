@@ -13,39 +13,37 @@ path; removal requires equivalent upstream SimpleFSDP support.
 Remove this module after the TorchTitan dependency includes the PR.
 """
 
+import logging
 from functools import wraps
-from inspect import isfunction, signature
+from inspect import getclosurevars, isfunction
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torchtitan.experiments.graph_trainer.chunked_loss
-from torch._subclasses.fake_tensor import FakeTensor
 from torch.distributed.tensor import DTensor, Partial, Shard
 from torchtitan.experiments.graph_trainer.chunked_loss import ChunkedLossWrapperWithParamGrads
-from torchtitan.experiments.graph_trainer.simple_fsdp import ReplicateComputation, disable_active_parametrization
-from torchtitan.tools.logging import logger
+from torchtitan.experiments.graph_trainer.simple_fsdp import ReplicateComputation
+
+logger = logging.getLogger(__name__)
 
 _original_call = ChunkedLossWrapperWithParamGrads.__call__
 _original_gradient_backprop = ChunkedLossWrapperWithParamGrads._gradient_backprop
 
 
 class _LocalGradientLMHead(nn.Module):
-    _head: nn.Linear
     sharded_weight: DTensor
 
-    def __init__(self, head: nn.Linear, weight: torch.Tensor, sharded_weight: DTensor):
+    def __init__(self, weight: torch.Tensor, sharded_weight: DTensor):
         super().__init__()
         self.weight = nn.Parameter(weight.detach(), requires_grad=sharded_weight.requires_grad)
         # Keep the original parameter out of this temporary module's parameters.
         object.__setattr__(self, "sharded_weight", sharded_weight)
-        object.__setattr__(self, "_head", head)
         self.accumulated_grad: torch.Tensor | None = None
         self.grad_hook = self.weight.register_post_accumulate_grad_hook(self._accumulate_grad)
 
     def forward(self, hidden: torch.Tensor) -> torch.Tensor:
-        # Keep the head's model-parallel forward wrappers with the gathered weight.
-        with disable_active_parametrization():
-            return torch.func.functional_call(self._head, {"weight": self.weight}, (hidden,))
+        return F.linear(hidden, self.weight)
 
     def _accumulate_grad(self, weight: torch.Tensor) -> None:
         assert weight.grad is not None
@@ -105,15 +103,12 @@ def _can_coalesce(head, pred) -> bool:
     ):
         return False
 
-    # The pinned SimpleFSDP binds each parameter's wrapper as a getter default.
+    # SimpleFSDP keeps its precision policy in the weight getter closure.
     weight_property = getattr(type(head), "weight", None)
     if not isinstance(weight_property, property) or not isfunction(weight_property.fget):
         return False
-    parametrization = signature(weight_property.fget).parameters.get("p")
-    if parametrization is None or not isinstance(parametrization.default, ReplicateComputation):
-        return False
-    parametrization = parametrization.default
-    if parametrization.device_mesh != weight.device_mesh or parametrization.non_dp_mesh_types:
+    parametrization = getclosurevars(weight_property.fget).nonlocals.get("parametrization")
+    if not isinstance(parametrization, ReplicateComputation):
         return False
     reduce_dtype = parametrization.reduce_dtype or parametrization.param_dtype or weight.dtype
     return reduce_dtype == torch.float32
@@ -122,29 +117,25 @@ def _can_coalesce(head, pred) -> bool:
 @wraps(_original_call)
 def _coalesced_call(self, pred, labels, global_valid_tokens=None, **loss_inputs):
     head = self.lm_head
-    if type(self) is not ChunkedLossWrapperWithParamGrads or not pred.requires_grad or head is None:
+    if (
+        type(self) is not ChunkedLossWrapperWithParamGrads
+        or not isinstance(pred, torch.Tensor)
+        or not pred.requires_grad
+        or head is None
+    ):
         return _original_call(self, pred, labels, global_valid_tokens, **loss_inputs)
     supported = _can_coalesce(head, pred)
-    weight = head.weight if supported else None
-    supported = type(weight) in (torch.Tensor, FakeTensor)
     if not getattr(self, "_coalesced_rs_logged", False):
         if supported:
             logger.info("[PATCH] GraphTrainer chunked loss: coalescing SimpleFSDP gradients before reduce-scatter")
         else:
-            sharded_weight = head._parameters.get("weight")
-            logger.warning(
-                "[PATCH] Chunk-loss RS coalescing is unsupported for this head/layout; using upstream loss. "
-                "TP > 1 is unsupported. Head weight mesh=%s, placements=%s, dtype=%s",
-                getattr(sharded_weight, "device_mesh", None),
-                getattr(sharded_weight, "placements", None),
-                getattr(sharded_weight, "dtype", None),
-            )
+            logger.warning("[PATCH] Chunk-loss RS coalescing is unsupported for this head/layout; using upstream loss")
         self._coalesced_rs_logged = True  # pyrefly: ignore[missing-attribute]
-    if not supported or weight is None:
+    if not supported:
         return _original_call(self, pred, labels, global_valid_tokens, **loss_inputs)
 
     # Preserve the original all-gather and compute dtype, but defer gradient sync.
-    local_head = _LocalGradientLMHead(head, weight, head._parameters["weight"])
+    local_head = _LocalGradientLMHead(head.weight, head._parameters["weight"])
     self.lm_head = local_head
     try:
         return _original_call(self, pred, labels, global_valid_tokens, **loss_inputs)
@@ -153,16 +144,18 @@ def _coalesced_call(self, pred, labels, global_valid_tokens=None, **loss_inputs)
         self.lm_head = head
 
 
-def _gradient_backprop(hidden_states, accumulated_grad, total_loss, lm_head, fsdp_enabled):
+def _gradient_backprop(self, hidden_states, accumulated_grads, total_loss):
+    lm_head = self.lm_head
     if not isinstance(lm_head, _LocalGradientLMHead):
-        return _original_gradient_backprop(hidden_states, accumulated_grad, total_loss, lm_head, fsdp_enabled)
-    assert not fsdp_enabled
+        return _original_gradient_backprop(self, hidden_states, accumulated_grads, total_loss)
+    # Coalescing is selected only for a single tensor prediction in __call__.
+    assert len(hidden_states) == len(accumulated_grads) == 1
     assert lm_head.accumulated_grad is not None
     # Partial SUM is a local contribution; do not divide by num_chunks again.
     return _ChunkGradsBackprop.apply(
-        hidden_states,
+        hidden_states[0],
         lm_head.sharded_weight,
-        accumulated_grad,
+        accumulated_grads[0],
         lm_head.accumulated_grad,
         total_loss,
     )
@@ -172,7 +165,7 @@ def apply() -> None:
     # Patch methods in place so previously imported classes/configs also see it.
     torchtitan.experiments.graph_trainer.chunked_loss.ChunkedLossWrapperWithParamGrads.__call__ = _coalesced_call
     torchtitan.experiments.graph_trainer.chunked_loss.ChunkedLossWrapperWithParamGrads._gradient_backprop = (
-        staticmethod(_gradient_backprop)
+        _gradient_backprop
     )
 
 

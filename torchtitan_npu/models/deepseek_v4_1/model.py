@@ -223,6 +223,7 @@ class DeepSeekV41TransformerBlock(TransformerBlock):
         candidates: torch.Tensor | None = None,
         image_mask: torch.Tensor | None = None,
         engram_token_history: torch.Tensor | None = None,
+        padding_mask: torch.Tensor | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -259,7 +260,11 @@ class DeepSeekV41TransformerBlock(TransformerBlock):
 
         residual = x
         x, ffn_pre, post, comb = self.hc_ffn_pre(x, attn_pre)
-        x = self.moe(self.ffn_norm(x), image_mask=image_mask)
+        x = self.moe(
+            self.ffn_norm(x),
+            image_mask=image_mask,
+            padding_mask_T=padding_mask,
+        )
         x = self.hc_post(x, residual, post, comb)
         return x, ffn_pre, cmp_k, idx_k, topk_indices, topk_scores, candidates
 
@@ -344,6 +349,38 @@ class DeepSeekV41Model(Decoder):
     built and whether an ``image_mask`` reaches the blocks.
     """
 
+    @classmethod
+    def _register_optimizer_hooks(cls, optimizers, model_parts, parallelism_context):
+        from torchtitan.models.common.moe import register_moe_load_balancing_hook
+
+        from torchtitan_npu.models.common.deepseek_lora import is_lora_parameter
+
+        if not any(is_lora_parameter(name) for model in model_parts for name, _ in model.named_parameters()):
+            register_moe_load_balancing_hook(optimizers, model_parts, parallelism_context)
+
+    def parallelize(self, **kwargs):
+        from torchtitan_npu.models.common.compile_policy import (
+            parallelize_with_model_compile,
+            skip_compile_under_cp,
+        )
+
+        kwargs["compile_config"] = skip_compile_under_cp(self, kwargs["compile_config"], kwargs["parallelism_context"])
+        if getattr(kwargs["compile_config"], "model", None) is None and (
+            kwargs["ac_config"] is None or not isinstance(self, DeepSeekV41MultimodalModel)
+        ):
+            return super().parallelize(**kwargs)
+        return parallelize_with_model_compile(self, **kwargs)
+
+    def apply_model_compile(self, model_compile):
+        from .parallelize import _apply_compile_v4_1
+
+        _apply_compile_v4_1(self, compile_config=model_compile)
+
+    def _apply_fsdp(self, **kwargs):
+        from .parallelize import apply_deepseek_v4_1_fsdp
+
+        apply_deepseek_v4_1_fsdp(self, **kwargs)
+
     @dataclass(kw_only=True, slots=True)
     class Config(Decoder.Config):
         # Whether this stack can run under context parallelism: the text stack is the one
@@ -374,6 +411,15 @@ class DeepSeekV41Model(Decoder):
             # state is threaded explicitly and the sparse core is the
             # traceable gather_attn reference implementation.
             fused_core, fused_selector = _requested_fused_attention(config.override)
+            if parallelism.context_parallel_degree > 1:
+                from torchtitan_npu.override.deepseek_v4_1.sparse_attn.ascendc import (
+                    AscV41ContextParallelSparseAttention,
+                )
+
+                fused_core |= all(
+                    isinstance(layer.attention.inner_attention, AscV41ContextParallelSparseAttention.Config)
+                    for layer in self.layers
+                )
             _check_indexer_teacher_pair(fused_core, fused_selector)
             self._check_context_parallel(parallelism.context_parallel_degree, fused_core, fused_selector)
             if parallelism.context_parallel_degree > 1:
@@ -531,7 +577,6 @@ class DeepSeekV41Model(Decoder):
     def __init__(self, config: Config):
         super().__init__(config)
         cfg = config
-        self.lora_config = getattr(config, "lora", None)
         self.hc_mult = cfg.hc_mult
         self.compress_ratios = tuple(cfg.compress_ratios)
         self.engram_history_size = max(
@@ -543,7 +588,7 @@ class DeepSeekV41Model(Decoder):
         self,
         input_dict: dict[str, torch.Tensor],
         *,
-        parallel_dims,
+        parallelism_context,
         parallelism,
         **kwargs,
     ):
@@ -560,27 +605,26 @@ class DeepSeekV41Model(Decoder):
         """
         positions = input_dict.get("positions")
         history = None
-        if self.engram_history_size and parallel_dims.cp_enabled:
+        if self.engram_history_size and parallelism_context.cp_enabled:
             if positions is None:
                 raise ValueError("Engram's token history needs the row's document-relative positions.")
-            history = self._engram_row_history(input_dict["input"], positions, parallel_dims)
+            history = self._engram_row_history(input_dict["input"], positions, parallelism_context)
         inputs, labels, extra_kwargs = super().preprocess_inputs(  # pyrefly: ignore [not-callable]
             input_dict,
-            parallel_dims=parallel_dims,
+            parallelism_context=parallelism_context,
             parallelism=parallelism,
             **kwargs,
         )
         if history is not None:
-            if parallelism.spmd_backend == "spmd_types":
-                import spmd_types as spmd
-                from torchtitan.distributed.spmd_types import annotate_input_spmd_types
-                from torchtitan.models.common.decoder_sharding import dense_activation_placement
+            import spmd_types as spmd
+            from torchtitan.distributed.spmd_types import annotate_input_spmd_types
+            from torchtitan.models.common.decoder_sharding import dense_activation_placement
 
-                annotate_input_spmd_types(
-                    parallel_dims,
-                    {"engram_token_history": history},
-                    {"engram_token_history": dense_activation_placement(tp=spmd.R, cp=spmd.S(0))},
-                )
+            annotate_input_spmd_types(
+                parallelism_context,
+                {"engram_token_history": history},
+                {"engram_token_history": dense_activation_placement(tp=spmd.R, cp=spmd.S(0))},
+            )
             extra_kwargs["engram_token_history"] = history
         return inputs, labels, extra_kwargs
 
@@ -588,7 +632,7 @@ class DeepSeekV41Model(Decoder):
         self,
         tokens: torch.Tensor,
         positions: torch.Tensor,
-        parallel_dims,
+        parallelism_context,
     ) -> torch.Tensor:
         """Each of this rank's rows' predecessors, one entry per distance (``[C, H]``).
 
@@ -597,7 +641,7 @@ class DeepSeekV41Model(Decoder):
         before it *in its document*, which the permutation has already placed the right number of
         slots earlier.  Nothing moves, and no rank sees another rank's rows.
         """
-        cp_mesh = parallel_dims.get_mesh("cp")
+        cp_mesh = parallelism_context.get_mesh("cp")
         cp_size, cp_rank = cp_mesh.size(), cp_mesh.get_local_rank()
         slab_len = tokens.shape[0] // cp_size
         rows = doc_chunk_permutation(document_starts(positions), cp_size, slab_len)[0]
@@ -642,6 +686,7 @@ class DeepSeekV41Model(Decoder):
         input_embeds: torch.Tensor | None = None,
         image_mask: torch.Tensor | None = None,
         engram_token_history: torch.Tensor | None = None,
+        padding_mask: torch.Tensor | None = None,
     ):
         """V4.1 forward with Single-Pass mHC on a folded token stream.
 
@@ -690,6 +735,7 @@ class DeepSeekV41Model(Decoder):
                 candidates=candidates,
                 image_mask=image_mask,
                 engram_token_history=engram_token_history,
+                padding_mask=padding_mask,
             )
 
         # The stack has no learned output head: it collapses with the last block's
@@ -728,40 +774,35 @@ class DeepSeekV41MultimodalModel(DeepSeekV41Model):
         self.vision_encoder = config.vision_encoder.build()
         self.image_marker_embeddings = config.image_marker_embeddings.build()
 
-    def preprocess_inputs(self, input_dict, *, parallel_dims, parallelism, **kwargs):
+    def preprocess_inputs(self, input_dict, *, parallelism_context, parallelism, **kwargs):
         # The decoder seam annotates its own inputs; the vision inputs have their
         # own DP-local layout and must be handled by the multimodal model.
         vision_names = ("pixel_values", "image_grid", "image_feature_indices", "token_types")
         vision_inputs = {name: input_dict[name] for name in vision_names if name in input_dict}
         decoder_inputs = {name: value for name, value in input_dict.items() if name not in vision_inputs}
         inputs, labels, extra_kwargs = super().preprocess_inputs(
-            decoder_inputs, parallel_dims=parallel_dims, parallelism=parallelism, **kwargs
+            decoder_inputs, parallelism_context=parallelism_context, parallelism=parallelism, **kwargs
         )
-        if parallelism.spmd_backend == "spmd_types":
-            from torchtitan.distributed.spmd_types import annotate_input_spmd_types
-            from torchtitan.models.common.decoder_sharding import token_id_placement
-            from torchtitan.models.common.vision_encoder_sharding import multimodal_input_sharding
+        from torchtitan.distributed.spmd_types import annotate_input_spmd_types
+        from torchtitan.models.common.decoder_sharding import token_id_placement
+        from torchtitan.models.common.vision_encoder_sharding import multimodal_input_sharding
 
-            vision_layout = multimodal_input_sharding()["pixel_values"]
-            annotate_input_spmd_types(
-                parallel_dims,
-                vision_inputs,
-                {
-                    "pixel_values": vision_layout,
-                    "image_grid": vision_layout,
-                    "image_feature_indices": token_id_placement(),
-                    "token_types": token_id_placement(),
-                },
-            )
+        vision_layout = multimodal_input_sharding()["pixel_values"]
+        annotate_input_spmd_types(
+            parallelism_context,
+            vision_inputs,
+            {
+                "pixel_values": vision_layout,
+                "image_grid": vision_layout,
+                "image_feature_indices": token_id_placement(),
+                "token_types": token_id_placement(),
+            },
+        )
         extra_kwargs.update(vision_inputs)
         return inputs, labels, extra_kwargs
 
     def apply_activation_checkpointing_extensions(self, policy) -> None:
         """Apply the shared AC policy to the V4.1 vision blocks.
-
-        Called by ``parallelize_deepseek_v4_1`` only for this class: the text stack has no
-        extension blocks -- every block is a decoder layer the policy already walks -- so
-        a no-op there would exist only to be dispatched to.
 
         ``_wrap_block`` is private because the pinned torchtitan exposes no public hook
         for wrapping a block that is not part of a ``Decoder`` layer list.
@@ -772,23 +813,19 @@ class DeepSeekV41MultimodalModel(DeepSeekV41Model):
                 policy._wrap_block(block, base_fqn=f"vision_encoder.blocks.{name}"),
             )
 
-    def apply_fsdp_extensions(self, *, dp_mesh, training, parallelism, parallel_dims) -> None:
-        """FSDP-wrap the V4.1 vision tower before the shared decoder wrapper.
-
-        Called by ``parallelize_deepseek_v4_1`` only for this class: a text stack has no
-        submodule the shared decoder wrapper would miss.
-        """
+    def apply_fsdp_extensions(self, *, dp_mesh, dp_mesh_dims, training, parallelism, parallelism_context) -> None:
+        """FSDP-wrap the V4.1 vision tower before the shared decoder wrapper."""
         from torchtitan.config import TORCH_DTYPE_MAP
+        from torchtitan.distributed.fsdp import apply_fsdp_to_multimodal_encoder
 
-        from torchtitan_npu.extensions.torchtitan.distributed.fsdp import apply_fsdp_to_vision_encoder
-
-        apply_fsdp_to_vision_encoder(
+        apply_fsdp_to_multimodal_encoder(
             self.vision_encoder,
             dp_mesh,
+            dp_mesh_dims=dp_mesh_dims,
             param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
             reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
             reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
-            pp_enabled=parallel_dims.pp_enabled,
+            pp_enabled=parallelism_context.pp_enabled,
             cpu_offload=training.enable_cpu_offload,
         )
 
@@ -870,6 +907,7 @@ class DeepSeekV41MultimodalModel(DeepSeekV41Model):
         image_feature_indices: torch.Tensor | None = None,
         token_types: torch.Tensor | None = None,
         input_embeds: torch.Tensor | None = None,
+        padding_mask: torch.Tensor | None = None,
     ):
         """The text forward plus the modality inputs the vision tower consumes.
 
@@ -877,18 +915,23 @@ class DeepSeekV41MultimodalModel(DeepSeekV41Model):
         the stack understands, so the rest of the forward -- the cross-layer state
         thread, the mHC collapse and the head -- is the inherited implementation.
         """
-        embeds, image_mask = self._modality_inputs(
-            tokens,
-            input_embeds=input_embeds,
-            pixel_values=pixel_values,
-            image_grid=image_grid,
-            image_feature_indices=image_feature_indices,
-            token_types=token_types,
-        )
+        from torchtitan.distributed.spmd_types import spmd_local_context
+
+        # Images and their grids are independent on each data-parallel rank.
+        with spmd_local_context("dp"):
+            embeds, image_mask = self._modality_inputs(
+                tokens,
+                input_embeds=input_embeds,
+                pixel_values=pixel_values,
+                image_grid=image_grid,
+                image_feature_indices=image_feature_indices,
+                token_types=token_types,
+            )
         return super().forward(
             tokens,
             positions,
             attention_metadata=attention_metadata,
             input_embeds=embeds,
             image_mask=image_mask,
+            padding_mask=padding_mask,
         )

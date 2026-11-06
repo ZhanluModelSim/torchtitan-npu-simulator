@@ -6,6 +6,7 @@
 
 """Collect training traces with ``torch_npu.profiler``."""
 
+import logging
 import os
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -13,10 +14,11 @@ from typing import cast
 
 import torch
 import torch_npu
-from torchtitan.tools.logging import logger
-from torchtitan.tools.profiler import Profiler
+from torchtitan.observability.profiler import Profiler
 
 from torchtitan_npu.config.configs import ProfilerConfig
+
+logger = logging.getLogger(__name__)
 
 
 def _resume_aware_schedule(

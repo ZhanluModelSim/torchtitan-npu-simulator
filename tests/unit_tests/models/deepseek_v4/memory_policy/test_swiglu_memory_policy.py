@@ -46,7 +46,7 @@ def _build_graph(swiglu_op, *, separate_projections=False, intervening_op=False)
 
     for layer in (0, 1, 4):
         outputs = []
-        for kind, suffix in (("shared", "shared_experts"), ("routed", "routed_experts.inner_experts")):
+        for kind, suffix in (("shared", "shared_experts"), ("routed", "routed_experts")):
             fqn = f"layers.{layer}.moe.{suffix}"
             key = f"{kind}{layer}"
             if separate_projections:
@@ -114,12 +114,12 @@ def _build_default_swiglu_graph():
         backward_inputs.extend((shared_w1, shared_w3, shared_h, shared_w2))
         outputs.append(shared_w2)
 
-        routed_root = f"layers.{layer}.moe.routed_experts.inner_experts"
-        routed_w1 = add(torch.ops.aten.mm.default, (x, w2), routed_root, f"routed{layer}_w1")
+        routed_root = f"layers.{layer}.moe.routed_experts"
+        routed_w1 = add(torch.ops.aten.mm.default, (x, w2), routed_root + ".w1", f"routed{layer}_w1")
         routed_silu = add(torch.ops.aten.silu.default, (routed_w1,), routed_root, f"routed{layer}_silu")
-        routed_w3 = add(torch.ops.aten.mm.default, (x, w2), routed_root, f"routed{layer}_w3")
+        routed_w3 = add(torch.ops.aten.mm.default, (x, w2), routed_root + ".w3", f"routed{layer}_w3")
         routed_h = add(torch.ops.aten.mul.Tensor, (routed_silu, routed_w3), routed_root, f"routed{layer}_h")
-        routed_w2 = add(torch.ops.aten.mm.default, (routed_h, w2), routed_root, f"routed{layer}_w2")
+        routed_w2 = add(torch.ops.aten.mm.default, (routed_h, w2), routed_root + ".w2", f"routed{layer}_w2")
         nodes[f"routed{layer}"] = (routed_w1, routed_w3, routed_h, routed_w2)
         backward_inputs.extend((routed_w1, routed_w3, routed_h, routed_w2))
         outputs.append(routed_w2)

@@ -7,27 +7,19 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""V4.1 parallelization: EP/FSDP/FullAC assembly (CP1-only).
+"""V4.1 FSDP assembly, Host Engram exclusion and model compile policy."""
 
-Derived from the DSV4 policy with the CP/MTP branches removed: V4.1
-rejects CP>1 and PP>1 in its config, so this assembly wires only what the
-supported matrix needs.  The decoder FSDP wrapper is the generic (non-MTP)
-helper.  torch.compile is supported (see _apply_compile_v4_1).
-"""
+from functools import partial
 
 import torch
 from torchtitan.config import (
     TORCH_DTYPE_MAP,
     CompileConfig,
-    ParallelismConfig,
     TrainingConfig,
 )
-from torchtitan.distributed import ParallelDims
-from torchtitan.distributed.activation_checkpoint import ActivationCheckpointingConfig
-from torchtitan.distributed.fsdp import resolve_fsdp_mesh, resolve_sparse_fsdp_mesh
+from torchtitan.distributed.fsdp import apply_fsdp_to_decoder, resolve_fsdp_mesh, resolve_sparse_fsdp_mesh
 
-from torchtitan_npu.extensions.torchtitan.distributed.fsdp import apply_fsdp_to_decoder
-from torchtitan_npu.models.common.compile_policy import skip_compile_under_cp
+from torchtitan_npu.models.common.compile_policy import configure_model_compile
 
 from .engram.host import HostEngramTable
 from .model import DeepSeekV41MultimodalModel
@@ -67,7 +59,7 @@ def _apply_compile_v4_1(model, *, compile_config: CompileConfig) -> None:
     communication.  Once apply_compile grows fullgraph/dynamic parameters
     this collapses back to a plain call.  The regional-inductor helper is
     intentionally not used: V4.1's sparse core is the gather_attn
-    reference implementation (no FlexAttention), for which it is the
+    reference implementation (no FlexInnerAttention), for which it is the
     identity.  The shared per-block code object plus role-level graphs keep
     the recompile count within the stock recompile_limit.
 
@@ -86,17 +78,13 @@ def _apply_compile_v4_1(model, *, compile_config: CompileConfig) -> None:
       stable formulation is swapped in for the compiled run only (eager
       keeps the upstream helper; the permutation is identical).
     """
-    import torch
-    import torch._dynamo.config
-    from torchtitan.tools.logging import logger
+    import logging
 
-    # Mirrors torchtitan.distributed.compile.apply_compile; keep in sync.
-    # capture_scalar_outputs: data-dependent dynamic shapes in token-choice
-    # MoE dispatch (unbacked SymInts for the expert segments).
-    torch._dynamo.config.capture_scalar_outputs = True
-    # Skip replaying forward side effects (e.g. RoPE cache updates) during
-    # the AC recompute in backward; eager AC replays them, compiled does not.
-    setattr(torch._dynamo.config, "skip_fwd_side_effects_in_bwd_under_checkpoint", True)  # noqa: B010
+    import torch
+
+    logger = logging.getLogger(__name__)
+
+    configure_model_compile()
 
     # Traceable reorder opt-in for the compiled run (see the override module).
     from torchtitan_npu.override.common.token_dispatcher import (
@@ -145,88 +133,44 @@ def _apply_compile_v4_1(model, *, compile_config: CompileConfig) -> None:
     )
 
 
-def apply_activation_checkpointing(model, ac_config, dump_folder):
-    """Apply the selected policy plus any model-specific extension blocks.
-
-    Only the multimodal stack has blocks outside the decoder layer list; the text stack
-    is fully covered by the policy's own walk, so it takes no second call.
-    """
-    policy = ac_config.build(dump_folder=dump_folder)
-    policy.apply(model)
-    if isinstance(model, DeepSeekV41MultimodalModel):
-        model.apply_activation_checkpointing_extensions(policy)
-
-
-def parallelize_deepseek_v4_1(
-    model,
-    *,
-    parallel_dims: ParallelDims,
-    training: TrainingConfig,
-    parallelism: ParallelismConfig,
-    compile_config: CompileConfig,
-    ac_config: ActivationCheckpointingConfig,
-    dump_folder: str,
-):
-    """Parallelize V4.1: sharding config, AC, then the decoder FSDP wrap."""
-    compile_config = skip_compile_under_cp(model, compile_config, parallel_dims)
-    if parallelism.spmd_backend == "spmd_types" or parallel_dims.ep_enabled:
-        model.parallelize(parallel_dims)
-
-    if ac_config is not None:
-        apply_activation_checkpointing(model, ac_config, dump_folder)
-
-    model_compile_enabled = compile_config.enable and "model" in compile_config.components
-    if model_compile_enabled:
-        _apply_compile_v4_1(model, compile_config=compile_config)
-
-    if parallelism.spmd_backend == "spmd_types":
-        dp_mesh, dp_mesh_dims = resolve_fsdp_mesh(parallel_dims)
-        edp_mesh, edp_mesh_dims = resolve_sparse_fsdp_mesh(parallel_dims)
-    else:
-        dp_mesh_names = ["dp_replicate", "fsdp"] if parallel_dims.dp_replicate_enabled else ["fsdp"]
-        dp_mesh = parallel_dims.get_mesh(dp_mesh_names)
-        dp_mesh_dims = None
-        edp_mesh = None
-        edp_mesh_dims = None
-        if parallel_dims.ep_enabled:
-            edp_mesh_names = ["dp_replicate", "efsdp"] if parallel_dims.dp_replicate_enabled else ["efsdp"]
-            edp_mesh = parallel_dims.get_optional_mesh(edp_mesh_names)
-
+def apply_deepseek_v4_1_fsdp(model, *, parallelism_context, training, parallelism):
+    dp_mesh, dp_mesh_dims = resolve_fsdp_mesh(parallelism_context)
+    edp_mesh, edp_mesh_dims = resolve_sparse_fsdp_mesh(parallelism_context)
     # The vision tower is wrapped as one unit before the decoder wrapper sees it; a text
     # stack has no such submodule and goes straight to the decoder wrapper.
     if isinstance(model, DeepSeekV41MultimodalModel):
         model.apply_fsdp_extensions(
             dp_mesh=dp_mesh,
+            dp_mesh_dims=dp_mesh_dims,
             training=training,
             parallelism=parallelism,
-            parallel_dims=parallel_dims,
+            parallelism_context=parallelism_context,
         )
 
     ignored_params = _shard_engram_tables(
         model,
-        edp_mesh=edp_mesh if parallel_dims.ep_enabled else dp_mesh,
-        edp_mesh_dims=edp_mesh_dims if parallel_dims.ep_enabled else dp_mesh_dims,
+        edp_mesh=edp_mesh if parallelism_context.ep_enabled else dp_mesh,
+        edp_mesh_dims=edp_mesh_dims if parallelism_context.ep_enabled else dp_mesh_dims,
         training=training,
     )
-    apply_fsdp_to_decoder(
+    apply_fsdp = apply_fsdp_to_decoder
+    if ignored_params:
+        from torchtitan_npu.extensions.torchtitan.distributed.fsdp import (
+            apply_fsdp_to_decoder as apply_fsdp_with_ignored_params,
+        )
+
+        apply_fsdp = partial(apply_fsdp_with_ignored_params, ignored_params=ignored_params)
+    apply_fsdp(
         model,
         dp_mesh,
-        ignored_params=ignored_params,
         param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
         reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
-        pp_enabled=parallel_dims.pp_enabled,
+        pp_enabled=parallelism_context.pp_enabled,
         cpu_offload=training.enable_cpu_offload,
         reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
-        ep_degree=parallel_dims.ep,
+        ep_degree=parallelism_context.ep,
         edp_mesh=edp_mesh,
         dp_mesh_dims=dp_mesh_dims,
         edp_mesh_dims=edp_mesh_dims,
-        enable_symm_mem=parallelism.enable_fsdp_symm_mem,
+        symm_mem_scope=parallelism.fsdp_symm_mem_scope,
     )
-    if getattr(model, "lora_config", None) is not None:
-        # Keep ordinary V4.1 imports independent of the optional V4 LoRA implementation.
-        from torchtitan_npu.models.deepseek_v4.lora import is_lora_parameter
-
-        for name, parameter in model.named_parameters():
-            parameter.requires_grad_(is_lora_parameter(name))
-    return model

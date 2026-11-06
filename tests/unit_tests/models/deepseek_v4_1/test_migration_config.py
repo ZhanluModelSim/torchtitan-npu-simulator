@@ -17,13 +17,13 @@ from torchtitan_npu.models.deepseek_v4_1.config_registry import (
 )
 def test_debug_recipe_builds_with_token_budget_and_preserves_embedding_weights(factory):
     config = factory()
-    config.model_spec.model.update_from_config(config=config)
+    config.model.update_from_config(config=config)
 
     with torch.device("meta"):
-        model = config.model_spec.model.build()
+        model = config.model.build()
 
     assert config.training.num_tokens_per_microbatch_per_dp_rank == 512
-    assert config.training.max_context_length == config.model_spec.max_context_length == 512
+    assert config.training.max_context_length == config.model.max_context_length == 512
     assert tuple(model.tok_embeddings.weight.shape) == (129280, 512)
     assert tuple(model.lm_head.weight.shape) == (129280, 512)
     assert len(model.layers) == 40

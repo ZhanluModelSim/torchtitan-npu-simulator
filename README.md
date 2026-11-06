@@ -64,7 +64,6 @@ pip install -e .
 
 详情参见 [安装教程](https://gitcode.com/cann/torchtitan-npu/tree/master/docs/user-guides/installation.md) 。
 
-
 # 快速上手
 快速启动大语言模型的训练任务，参见
 [快速上手文档](https://gitcode.com/cann/torchtitan-npu/tree/master/docs/user-guides/quickstart.md) 。

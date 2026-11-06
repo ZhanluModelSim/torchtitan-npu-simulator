@@ -7,85 +7,18 @@
 
 from __future__ import annotations
 
-import importlib.util
 import sys
 import types
-from dataclasses import dataclass
-from enum import Enum
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+from torchtitan.components.checkpointer.dcp import CheckpointManager as _CheckpointManager
 
+from torchtitan_npu.extensions.torchtitan.components import checkpoint as product_checkpoint
 
-class _AsyncMode(str, Enum):
-    DISABLED = "disabled"
-    ASYNC = "async"
-    ASYNC_WITH_PINNED_MEM = "async_with_pinned_mem"
-
-
-class _CheckpointManager:
-    @dataclass(kw_only=True, slots=True)
-    class Config:
-        interval: int = 1
-        enable: bool = True
-        async_mode: str = "disabled"
-
-    def __init__(self, config, **kwargs):
-        self.config = config
-
-    def save(self, curr_step, last_step=False):
-        return True
-
-    def dcp_save(self, **kwargs):
-        return "upstream-save"
-
-    def dcp_load(self, *args, **kwargs):
-        return "upstream-load"
-
-
-torchtitan_stub = types.ModuleType("torchtitan")
-torchtitan_stub.__path__ = []
-components_stub = types.ModuleType("torchtitan.components")
-components_stub.__path__ = []
-torchtitan_stub.components = components_stub
-checkpoint_stub = types.ModuleType("torchtitan.components.checkpointer")
-checkpoint_stub.AsyncMode = _AsyncMode
-checkpoint_stub.CheckpointManager = _CheckpointManager
-components_stub.checkpointer = checkpoint_stub
-observability_stub = types.ModuleType("torchtitan.observability")
-observability_stub.structured_logger = types.SimpleNamespace(log_trace_span=lambda name: lambda function: function)
-torchtitan_stub.observability = observability_stub
-tools_stub = types.ModuleType("torchtitan.tools")
-tools_stub.__path__ = []
-torchtitan_stub.tools = tools_stub
-utils_stub = types.ModuleType("torchtitan.tools.utils")
-utils_stub.GarbageCollection = MagicMock()
-tools_stub.utils = utils_stub
-validation_stub = types.ModuleType("torchtitan_npu.extensions.components.validation")
-validation_stub.mark_checkpoint_manifest_pending = MagicMock()
-validation_stub.verify_checkpoint_manifest = MagicMock()
-validation_stub.write_checkpoint_manifest = MagicMock()
-
-module_path = Path(__file__).resolve().parents[5] / "torchtitan_npu/extensions/torchtitan/components/checkpoint.py"
-module_name = "torchtitan_npu.extensions.torchtitan.components.checkpoint"
-module_spec = importlib.util.spec_from_file_location(module_name, module_path)
-product_checkpoint = importlib.util.module_from_spec(module_spec)
-
-with patch.dict(
-    sys.modules,
-    {
-        "torchtitan": torchtitan_stub,
-        "torchtitan.components": components_stub,
-        "torchtitan.components.checkpointer": checkpoint_stub,
-        "torchtitan.observability": observability_stub,
-        "torchtitan.tools": tools_stub,
-        "torchtitan.tools.utils": utils_stub,
-        "torchtitan_npu.extensions.components.validation": validation_stub,
-    },
-):
-    module_spec.loader.exec_module(product_checkpoint)
+_AsyncMode = product_checkpoint.AsyncMode
 
 
 pytestmark = pytest.mark.cpu
@@ -102,8 +35,10 @@ def test_manager_reads_hash_manifest_extension_config():
         extensions=product_checkpoint.CheckpointExtensions(verify_hash_manifest=True)
     )
 
-    manager = product_checkpoint.CheckpointManager(config)
+    with patch.object(_CheckpointManager, "__init__", return_value=None) as initialize:
+        manager = product_checkpoint.CheckpointManager(config)
 
+    initialize.assert_called_once_with(config=config)
     assert manager.verify_hash_manifest is True
 
 
@@ -121,9 +56,11 @@ def test_manager_rejects_pinned_async_for_swap_optimizer():
 def test_manager_keeps_pinned_async_for_native_optimizer():
     config = product_checkpoint.CheckpointManager.Config(async_mode="async_with_pinned_mem")
 
-    manager = product_checkpoint.CheckpointManager(config, optimizers=object())
+    optimizers = object()
+    with patch.object(_CheckpointManager, "__init__", return_value=None) as initialize:
+        product_checkpoint.CheckpointManager(config, optimizers=optimizers)
 
-    assert manager.config is config
+    initialize.assert_called_once_with(config=config, optimizers=optimizers)
 
 
 def test_save_marks_pending_before_save_and_writes_manifest_afterward():
@@ -189,7 +126,7 @@ def test_save_skips_manifest_operations_when_disabled():
     write.assert_not_called()
 
 
-def test_dcp_load_verifies_manifest_before_upstream_load():
+def test_load_checkpoint_verifies_manifest_before_upstream_load():
     manager = object.__new__(product_checkpoint.CheckpointManager)
     manager.verify_hash_manifest = True
     events = []
@@ -202,22 +139,46 @@ def test_dcp_load_verifies_manifest_before_upstream_load():
         ),
         patch.object(
             _CheckpointManager,
-            "dcp_load",
-            side_effect=lambda *args, **kwargs: events.append("load checkpoint") or "loaded",
+            "_load_checkpoint",
+            side_effect=lambda *args, **kwargs: events.append("load checkpoint"),
         ),
     ):
-        result = manager.dcp_load({}, "checkpoint")
+        result = manager._load_checkpoint({}, "checkpoint", from_hf=True, from_quantized=False)
 
-    assert result == "loaded"
+    assert result is None
     assert events == ["verify manifest", "load checkpoint"]
+
+
+def test_load_checkpoint_hash_failure_prevents_restore():
+    manager = object.__new__(product_checkpoint.CheckpointManager)
+    manager.verify_hash_manifest = True
+    with (
+        patch.object(product_checkpoint, "verify_checkpoint_manifest", side_effect=ValueError("hash mismatch")),
+        patch.object(_CheckpointManager, "_load_checkpoint") as restore,
+        pytest.raises(ValueError, match="hash mismatch"),
+    ):
+        manager._load_checkpoint({}, "checkpoint", from_hf=False, from_quantized=False)
+    restore.assert_not_called()
+
+
+def test_load_checkpoint_disabled_verification_preserves_states_and_flags():
+    manager = object.__new__(product_checkpoint.CheckpointManager)
+    manager.verify_hash_manifest = False
+    states = {"model": object()}
+    with (
+        patch.object(product_checkpoint, "verify_checkpoint_manifest") as verify,
+        patch.object(_CheckpointManager, "_load_checkpoint") as restore,
+    ):
+        manager._load_checkpoint(states, "checkpoint", from_hf=True, from_quantized=True)
+    verify.assert_not_called()
+    restore.assert_called_once_with(states, "checkpoint", from_hf=True, from_quantized=True)
 
 
 def _run_isolated_patch(script, *args):
     import subprocess
 
     module_path = (
-        Path(__file__).resolve().parents[5]
-        / "torchtitan_npu/patches/torchtitan/distributed/checkpoint/filesystem.py"
+        Path(__file__).resolve().parents[5] / "torchtitan_npu/patches/torchtitan/distributed/checkpoint/filesystem.py"
     )
     subprocess.run([sys.executable, "-c", script, str(module_path), *map(str, args)], check=True)
 

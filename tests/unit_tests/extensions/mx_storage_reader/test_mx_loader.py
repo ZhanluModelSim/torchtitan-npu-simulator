@@ -287,34 +287,46 @@ def test_only_v4_selects_mx_reader(reader_module, monkeypatch, tmp_path, weight_
     upstream = ModuleType("torchtitan.models.deepseek_v3.state_dict_adapter")
     upstream.DeepSeekV3StateDictAdapter = V3Adapter
     monkeypatch.setitem(sys.modules, upstream.__name__, upstream)
-    monkeypatch.setitem(sys.modules, "_mx_test_components.model", SimpleNamespace(
-        DeepSeekV4Model=SimpleNamespace(Config=object),
-    ))
-    # Load the adapter under an isolated package name without importing the
-    # full DeepSeek-V4 model package.  The reader-selection method does not
-    # exercise LoRA conversion, but the adapter module still imports these
-    # symbols at module load time.
-    monkeypatch.setitem(sys.modules, "_mx_test_components.lora", SimpleNamespace(
-        _PEFT_MODULE_SUFFIXES=(),
-        MODULE_PATHS=(),
-        PEFT_PREFIX="base_model.model.",
-        pack_expert_factor=lambda tensor, factor: tensor,
-        DEEPSEEK_V4_LORA_TARGETS=(),
-        DeepSeekV4LoRAConverter=SimpleNamespace(Config=object),
-        LoRAOptions=object,
-        is_lora_parameter=lambda _name: False,
-        peft_target_modules=lambda targets: targets,
-    ))
-    monkeypatch.setitem(sys.modules,
-                        "torchtitan_npu.extensions.mx_storage_reader.hf_storage", reader_module)
+
+    class V4Adapter(V3Adapter):
+        pass
+
+    upstream_v4 = ModuleType("torchtitan.models.deepseek_v4.state_dict_adapter")
+    upstream_v4.DeepSeekV4StateDictAdapter = V4Adapter
+    monkeypatch.setitem(sys.modules, upstream_v4.__name__, upstream_v4)
+    monkeypatch.setitem(
+        sys.modules,
+        "_mx_test_components.model",
+        SimpleNamespace(
+            DeepSeekV4Model=SimpleNamespace(Config=object),
+        ),
+    )
+
+    # Reader selection only needs the PEFT mixin in the MRO; conversion is outside this test.
+    class PEFTMixin:
+        pass
+
+    monkeypatch.setitem(
+        sys.modules,
+        "torchtitan_npu.models.deepseek_v4.lora",
+        SimpleNamespace(
+            DeepSeekPEFTAdapter=PEFTMixin,
+            is_lora_parameter=lambda _name: False,
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "torchtitan_npu.extensions.mx_storage_reader.hf_storage", reader_module)
     # The V4 adapter probes the AO reader before the fixed-format MX reader.
-    monkeypatch.setitem(sys.modules,
-                        "torchtitan_npu.extensions.mx_storage_reader.ao_hf_storage",
-                        sys.modules["_mx_test_components.ao_hf_storage"])
+    monkeypatch.setitem(
+        sys.modules,
+        "torchtitan_npu.extensions.mx_storage_reader.ao_hf_storage",
+        sys.modules["_mx_test_components.ao_hf_storage"],
+    )
     root = Path(__file__).resolve().parents[4] / "torchtitan_npu/models"
     classes = []
-    for model, class_name in (("deepseek_v4", "DeepSeekV4StateDictAdapter"),
-                              ("deepseek_v3_2", "DeepSeekV32StateDictAdapter")):
+    for model, class_name in (
+        ("deepseek_v4", "DeepSeekV4StateDictAdapter"),
+        ("deepseek_v3_2", "DeepSeekV32StateDictAdapter"),
+    ):
         spec = importlib.util.spec_from_file_location(
             f"_mx_test_components.{model}", root / model / "state_dict_adapter.py"
         )
@@ -323,8 +335,12 @@ def test_only_v4_selects_mx_reader(reader_module, monkeypatch, tmp_path, weight_
         spec.loader.exec_module(module)
         classes.append(getattr(module, class_name))
     v4, v32 = classes
-    dtype = {"mxfp4": torch.uint8, "mxfp8": torch.float8_e4m3fn,
-             "bf16": torch.bfloat16, "block-fp8": torch.float8_e4m3fn}[weight_format]
+    dtype = {
+        "mxfp4": torch.uint8,
+        "mxfp8": torch.float8_e4m3fn,
+        "bf16": torch.bfloat16,
+        "block-fp8": torch.float8_e4m3fn,
+    }[weight_format]
     tensors = {"linear.weight": torch.ones(1, 32).to(dtype)}
     if weight_format.startswith("mx"):
         tensors["linear.scale"] = torch.full((1, 2 if weight_format == "mxfp4" else 1), 127, dtype=torch.uint8)

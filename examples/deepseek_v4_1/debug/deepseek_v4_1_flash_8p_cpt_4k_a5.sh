@@ -14,7 +14,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
-export CONFIG="${CONFIG:-deepseek_v4_1_flash_40layers_24experts_multimodal}"
+export CONFIG="${CONFIG:-deepseek_v4_1_flash_40layers_24experts_multimodal_compiled}"
 
 # Use the command line `npu-smi info -t topo` to query the CPU affinity of the
 # NPU cards for configuration.

@@ -207,9 +207,8 @@ def npu(cfg: GatedDeltaKernel.Config) -> TritonGatedDeltaKernel.Config:
 class ContextParallelGatedDeltaNet(qwen3_5.GatedDeltaNet):
     """Refuse the not-yet-migrated context-parallel GDN forward.
 
-    The class stays registered so the CP recipe fails at the factory with the
-    shared explanation instead of importing a missing symbol, but the forward
-    itself also refuses: the pre-fold implementation exchanged rank-local
+    The class preserves the configured CP implementation while its forward
+    refuses execution: the pre-fold implementation exchanged rank-local
     heads, convolved ``[B, L, D]`` rows, and called the kernel through
     ``self.kernel``, none of which exists on the folded ``[T, ...]`` module.
     """
@@ -226,4 +225,4 @@ class ContextParallelGatedDeltaNet(qwen3_5.GatedDeltaNet):
 
 @override(target=qwen3_5.GatedDeltaNet.Config, exact=True, description="Use Triton GDN with Context Parallel")
 def context_parallel(cfg: qwen3_5.GatedDeltaNet.Config) -> ContextParallelGatedDeltaNet.Config:
-    raise NotImplementedError(QWEN_CONTEXT_PARALLEL_UNSUPPORTED)
+    return derive(cfg, ContextParallelGatedDeltaNet.Config)

@@ -23,8 +23,8 @@ def test_debugmodel_uses_the_documented_per_layer_compression_ratios():
 
     model_spec = model_registry("debugmodel")
 
-    assert model_spec.model.compress_ratios == (1, 1, 4, 128)
-    assert len(model_spec.model.layers) == len(model_spec.model.compress_ratios)
+    assert model_spec.compress_ratios == (1, 1, 4, 128)
+    assert len(model_spec.layers) == len(model_spec.compress_ratios)
 
 
 def test_flash_mtp_4k_model_flops():
@@ -33,7 +33,7 @@ def test_flash_mtp_4k_model_flops():
     model_config = model_registry(
         "deepseek_v4_flash",
         num_mtp_layers=1,
-    ).model
+    )
 
     with torch.device("meta"):
         model = model_config.build()
@@ -64,7 +64,7 @@ def test_every_layer_pins_the_core_config_the_overrides_target():
     from torchtitan_npu.models.deepseek_v4 import model_registry
     from torchtitan_npu.models.deepseek_v4.attention import CompressedSparseInnerAttention
 
-    model_config = model_registry("debugmodel").model
+    model_config = model_registry("debugmodel")
     cores = [layer.attention.inner_attention for layer in model_config.layers]
 
     assert len(cores) == len(model_config.compress_ratios) == 4
@@ -77,7 +77,7 @@ def test_flash_rope_configs_pin_split_per_site():
     """Every rope site's config carries the split matching its tensor width."""
     from torchtitan_npu.models.deepseek_v4 import model_registry
 
-    model_config = model_registry("deepseek_v4_flash", num_mtp_layers=0).model
+    model_config = model_registry("deepseek_v4_flash", num_mtp_layers=0)
     rd = 64
 
     for layer in model_config.layers:
@@ -140,7 +140,7 @@ def test_aligned_dataloader_only_inserts_pads(tmp_path):
         dp_world_size=1,
         dp_rank=0,
         max_context_length=128,
-        num_tokens_per_batch=256,
+        num_tokens_per_microbatch=256,
     )
     try:
         batches = list(loader)
@@ -148,8 +148,9 @@ def test_aligned_dataloader_only_inserts_pads(tmp_path):
         loader.close()
 
     assert len(batches) == 1
-    inputs, labels = batches[0]
+    inputs = batches[0].as_input_dict()
+    labels = inputs["labels"]
     assert inputs["input"].tolist() == [1, 3, 4] + [0] * 125 + [1, 5] + [0] * 126
     assert labels.tolist() == [3, 4, 2] + [-100] * 125 + [5, 2] + [-100] * 126
     assert inputs["positions"].tolist() == list(range(128)) * 2
-    assert inputs["num_valid_tokens"] == 5
+    assert batches[0].num_valid_tokens == 5

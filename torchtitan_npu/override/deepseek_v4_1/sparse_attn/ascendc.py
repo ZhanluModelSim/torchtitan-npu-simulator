@@ -4,11 +4,13 @@
 # LICENSE file in the root directory of this source tree.
 """V4.1 SMLA attention and SMLAG-backed indexer distillation."""
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 import cann_ops_transformer  # noqa: F401  (registers the fused operators)
 import torch
 from torch.utils._pytree import SUPPORTED_NODES, register_dataclass
+from torchtitan.models.common.cp_attention import CPInnerAttention
 
 from torchtitan_npu.models.common.alignment import require_document_alignment
 from torchtitan_npu.models.common.metadata import KernelFrame
@@ -634,3 +636,31 @@ class AscV41SparseAttention(CompressedSparseInnerAttention2):
             wants_teacher,
         )
         return output.reshape_as(q)
+
+
+class AscV41ContextParallelSparseAttention(CPInnerAttention, AscV41SparseAttention):
+    """The fused V4.1 TND backend and its rank-local metadata preparation.
+
+    The inherited forward consumes local queries and the restored KV stream.
+    AscV41Metadata prepares per-document query chunks, global key reach,
+    restore plans and the corresponding kernel records.
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(CPInnerAttention.Config, AscV41SparseAttention.Config):
+        num_heads: int = 64
+        head_dim: int = 512
+        index_topk: int = 512
+        index_num_heads: int = 32
+        index_head_dim: int = 128
+
+    @staticmethod
+    def prepare_cp_metadata(attention_metadata, *, permutation):
+        if isinstance(attention_metadata, Mapping):
+            return {
+                key: AscV41ContextParallelSparseAttention.prepare_cp_metadata(value, permutation=permutation)
+                for key, value in attention_metadata.items()
+            }
+        if not isinstance(attention_metadata, AscV41Metadata):
+            raise TypeError("V4.1 context parallel attention requires AscV41Metadata")
+        return AscV41Metadata.prepare_cp_metadata(attention_metadata, permutation=permutation)

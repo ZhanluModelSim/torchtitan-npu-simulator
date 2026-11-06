@@ -10,44 +10,33 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn.functional as F
 from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.tensor import DTensor, Replicate, Shard, distribute_tensor
+from torch.distributed.tensor import DTensor, Partial, Replicate, Shard, distribute_tensor
 
 from torchtitan_npu.extensions.experiment.anticipatory_routing.router import build_routing_cache
 from torchtitan_npu.models.deepseek_v4_1.moe import DeepSeekV41Router
 
 
 def _router():
-    from torchtitan.models.common.linear import Linear
-    from torchtitan.models.common.moe import GroupedExperts, MoE, RoutedExperts
+    from torchtitan.models.common.activation import Sigmoid
+    from torchtitan.models.common.linear import RouterGateLinear
 
-    from torchtitan_npu.patches.torchtitan.models.common.token_dispatcher import LocalTokenDispatcher
-
-    config = MoE.Config(
+    config = DeepSeekV41Router.Config(
         num_experts=4,
-        router=DeepSeekV41Router.Config(
-            num_experts=4,
-            gate=Linear.Config(in_features=4, out_features=4),
-            top_k=2,
-            sorted_topk=True,
-            route_norm=True,
-            route_scale=1.4,
-        ),
-        routed_experts=RoutedExperts.Config(
-            inner_experts=GroupedExperts.Config(dim=4, hidden_dim=4, num_experts=4),
-            token_dispatcher=LocalTokenDispatcher.Config(num_experts=4, top_k=2),
-        ),
+        gate=RouterGateLinear.Config(in_features=4, out_features=4),
+        score_func=Sigmoid.Config(),
+        top_k=2,
+        sorted_topk=True,
+        route_norm=True,
+        route_scale=1.4,
     )
     with torch.random.fork_rng(devices=[]):
-        result = config.router.build()
+        result = config.build()
     assert isinstance(result, DeepSeekV41Router)
     return result
 
 
 def _replay_worker(rank, rendezvous):
-    from torchtitan.distributed.utils import set_spmd_backend
-
     torch.set_num_threads(1)
-    set_spmd_backend("partial_dtensor")
     dist.init_process_group("gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=2)
     cache = None
     try:
@@ -67,6 +56,8 @@ def _replay_worker(rank, rendezvous):
         )
         router = _router()
         router.gate.weight = torch.nn.Parameter(distribute_tensor(capture_weight.clone(), mesh, [Replicate()]))
+        # Token statistics are rank-local partial sums, as in the upstream router sharding plan.
+        router.tokens_per_expert_E = DTensor.from_local(torch.zeros(4), mesh, [Partial()], run_check=False)
         sharded_inputs = distribute_tensor(inputs.clone(), mesh, [Shard(0)]).requires_grad_()
         cache = build_routing_cache([router], index_store_dtype="int16", device=torch.device("cpu"))
         key = router._anticipatory_key
@@ -102,7 +93,7 @@ def _replay_worker(rank, rendezvous):
 
         cache.begin_training([slot])
         cache.select(0)
-        selected, replay_ids, scores = router(sharded_inputs)
+        selected, replay_ids, routing_map = router(sharded_inputs)
         assert isinstance(replay_ids, DTensor)
         assert replay_ids.device_mesh == mesh and replay_ids.placements == (Shard(0),)
         assert replay_ids.shape == (6, 2) and replay_ids.to_local().shape == (3, 2)
@@ -111,7 +102,8 @@ def _replay_worker(rank, rendezvous):
         assert not torch.equal(live_scores.topk(2, -1).indices, expected_ids)
         reference_selected = live_scores.gather(-1, expected_ids)
         reference_selected = reference_selected / (reference_selected.sum(-1, keepdim=True) + 1e-20) * 1.4
-        torch.testing.assert_close(scores.full_tensor(), live_scores, rtol=1e-6, atol=1e-7)
+        expected_map = torch.zeros_like(live_scores, dtype=torch.bool).scatter_(-1, expected_ids, True)
+        torch.testing.assert_close(routing_map.full_tensor(), expected_map, rtol=0, atol=0)
         torch.testing.assert_close(selected.full_tensor(), reference_selected, rtol=1e-6, atol=1e-7)
         upstream = torch.tensor([[0.3, -0.6], [1.2, 0.7], [-0.4, 1.1], [0.8, -0.2], [-0.9, 0.5], [1.4, -1.0]])
         (selected.to_local() * upstream[row]).sum().backward()
@@ -139,13 +131,14 @@ def test_anticipatory_replay_preserves_dtensor_ids_and_current_score_gradients(t
 
 
 def test_cache_wraps_dynamic_router_but_not_v4_hash_router():
-    from torchtitan.models.common.linear import Linear
+    from torchtitan.models.common.activation import Sigmoid
+    from torchtitan.models.common.linear import RouterGateLinear
     from torchtitan.models.deepseek_v4.moe import DeepSeekV4Router
 
-    gate = Linear.Config(in_features=4, out_features=4)
+    gate = RouterGateLinear.Config(in_features=4, out_features=4)
     with torch.random.fork_rng(devices=[]):
         hash_router = DeepSeekV4Router.Config(
-            num_experts=4, gate=gate, top_k=2, vocab_size=8, layer_id=0, n_hash_layers=1
+            num_experts=4, gate=gate, score_func=Sigmoid.Config(), top_k=2, vocab_size=8, layer_id=0, n_hash_layers=1
         ).build()
         dynamic_router = _router()
     model = torch.nn.ModuleList([hash_router, dynamic_router])

@@ -8,16 +8,19 @@ V4.1 的模型、图像路由、压缩 attention、metadata 和并行化均由 `
 
 既有配方覆盖 **FSDP + EP、TP1 / CP1 / PP1、eager 执行与 torch.compile**，包含 FullAC 与图文输入；迁移验收范围见开头说明。A3 脚本组织公共实验参数与融合列表，A5 调用 A3 并追加 CPU 亲和性、partial 文本 RoPE、两项 SwiGLUGroup、sparse attention 与 mHC Sinkhorn；两种入口均通过 `USE_GOLDEN=1` 选择 reference。A3 默认融合包含 RMSNorm、文本（`asc_complex`）与视觉 RoPE、MoE token dispatcher 和 mHC post；A5 将文本 RoPE 换为 `asc_partial` 并追加 routed/shared SwiGLUGroup、sparse 与 Sinkhorn。routed experts 的 grouped GEMM 是 reference 与融合共用的公共路径，不再作为独立融合开关。已接入量化入口及 Host Engram；不支持 MTP、DSpark、GraphTrainer；不支持的 TP、CP、PP 和 compile 配置在入口拒绝。
 
-**torch.compile 已支持**（每个 TransformerBlock 整图编译，跨层状态为显式前向参数），通过脚本 `"$@"` 透传超参开启：
+编译和 checkpoint 的启用状态由 Python recipe 明确配置。8P debug 默认选择对应的
+`*_multimodal_compiled` recipe，多机入口默认选择 `deepseek_v4_1_flash_cpt`；它们显式设置
+`CompileConfig(components=[], model=ModelCompileConfig())`。当前上游仍支持覆盖已存在的
+配置字段，例如以下 backend 参数；编译运行是否可用仍受本轮迁移范围限制：
 
 ```sh
 # aot_eager 整图（fullgraph=True）
 bash examples/deepseek_v4_1/debug/deepseek_v4_1_flash_8p_cpt_4k_a3.sh \
-    --compile.enable --compile.components model --compile.backend aot_eager
+    --compile.model.backend aot_eager
 
 # inductor
 bash examples/deepseek_v4_1/debug/deepseek_v4_1_flash_8p_cpt_4k_a3.sh \
-    --compile.enable --compile.components model --compile.backend inductor
+    --compile.model.backend inductor
 ```
 
 编译态按 MoE 路由形态二分：负载均衡路由（A3/A5 脚本默认）下 inductor 保持整图（含 MoE 通信）；数据依赖路由（显式 `--debug.no-moe-force-load-balance`）时 MoE 通信在编译图外执行。
@@ -41,22 +44,22 @@ USE_GOLDEN=1 \
 # 短跑（如 3 步）：显式同步步数与 LR 调度
 bash examples/deepseek_v4_1/debug/deepseek_v4_1_flash_8p_cpt_4k_a3.sh \
     --hf-assets-path <v41_tokenizer_dir> \
-    --training.steps 3 --lr-scheduler.total-steps 3 --lr-scheduler.warmup-steps 2
+    --training.steps 3 --optim.lr-scheduler.total-steps 3 --optim.lr-scheduler.warmup-steps 2
 ```
 
 单机 8 卡默认使用 40 层模型，A3 为 16 个路由专家，A5 为 24 个路由专家；上下文上限均为 4096，每 rank microbatch 为 4096 tokens，每步全局为 32768 tokens，使用 FSDP8/EP8、Muon（NS steps=10）、eager 和 FullAC，训练与调度均为 40 步。Python 配方保留模型结构、数据协议和优化器参数布局；实验参数由脚本组织，末尾 CLI 参数覆盖脚本默认值。`CONFIG` 可选择 `deepseek_v4_1_debugmodel_multimodal` 调试宽度，硬件选择仍由脚本负责。
 
-关闭 Engram 使用 `--no-engram-enabled`；优化器由脚本显式选择，末尾 `--optimizer.name AdamW` 仍可覆盖。A3 单机可通过末尾 CLI 参数调整上下文、microbatch 和每步 token 预算；默认每步预算为 32768 tokens。A5 多机保留与单机一致的 swap override；可通过 `OPTIMIZER_OVERRIDES` 显式覆盖。
+关闭 Engram 使用 `--no-engram-enabled`；优化器由脚本显式选择，末尾 `--optim.optimizer.name AdamW` 仍可覆盖。A3 单机可通过末尾 CLI 参数调整上下文、microbatch 和每步 token 预算；默认每步预算为 32768 tokens。A5 多机保留与单机一致的 swap override；可通过 `OPTIMIZER_OVERRIDES` 显式覆盖。
 
 A5 的 `CPU_AFFINITY_CONF` 应按主机拓扑覆盖。通过 `CLI_OVERRIDES` 扩展融合列表：A3 基础列表之外，文本 RoPE 经该通道按硬件选择（A3 默认 `asc_complex`，A5 换为 `asc_partial`），A5 默认追加 SwiGLUGroup、sparse attention、融合 LI 选分与 Sinkhorn，不重复传入 `--override.imports`。显式传 `--override.imports` 会替换整个集合，需自行包含所需的 RoPE 与 swap optimizer。最终选择随 Trainer Config 打印。
 
-普通运行不强制随机种子和确定性；精度对照须在双方命令中追加 `--debug.seed 42 --debug.deterministic`。默认关闭 checkpoint 且设置 `load_only=True`；保存时同时传 `--checkpoint.enable --checkpoint.no-load-only`。`load_only` 表示禁止保存，与 model-only 加载不同。tokenizer 统一经 `--hf-assets-path` 提供（测试可用仓内 `tests/assets/deepseek_v3` mini tokenizer），该参数本身不加载模型权重。
+普通运行不强制随机种子和确定性；精度对照须在双方命令中追加 `--debug.seed 42 --debug.deterministic`。debug recipe 默认使用 `checkpointer=None`，不加载或保存 checkpoint；需要加载或保存时，在 Python recipe 中显式设置 checkpointer 后，再通过 CLI 覆盖其普通字段。`load_only` 表示禁止保存，与 model-only 加载不同。tokenizer 统一经 `--hf-assets-path` 提供（测试可用仓内 `tests/assets/deepseek_v3` mini tokenizer），该参数本身不加载模型权重。
 
 indexer 的训练目标没有独立的损失项，它只走 A5 两个融合算子的反向夹具：`sparse_attn.asc` 的 SMLAG 反向按每个选中条目产出该层 attention 自身完整 softmax（窗口 + 压缩条目 + sink）的边际质量 `p`，写在 `topk_scores` 的梯度上；`lightning_indexer.asc` 的 SLIKG 反向把它当作教师，由 kernel 施加 `dI = Z·Y - p` 并产出 indexer 的 `q`/`k`/`w` 梯度。`topk_scores` 不参与任务损失，除这条边之外没有消费者，因此**A5 的两个 override 必须同开**：模型构造时按配置类标记检查这一对，只开一个直接报 `ValueError`，不会进入训练。单开 LI 时该梯度为 `None`、SLIKG 反向返回零梯度，indexer 全程不更新；单开 sparse attention 时 reference selector 会把 attention 级别的边际质量加到按 head 求和的 logits 上，训练信号是错的（该组合不做修复，仅由构造期检查拦住）。未使用的 top-k 槽位（`-1`）在教师上被置零。完整契约与 CPU 验证范围见 [override 说明](../../torchtitan_npu/override/README.md#deepseek-v41)。
 
 ### Flash 完整主干多机训练
 
-`CONFIG=deepseek_v4_1_flash`，参数对齐 [HF 官方配置](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/main/config.json)：40 层、隐藏维度 5120、384 个路由专家、1 个共享专家、top-6、MoE 中间维度 2304；attention 64 heads × 512、Q/O LoRA 1280/1024；ViT 32 层、维度 1024、16 heads、MLP 2816。Engram 位于第 1/14 层，逻辑表行数 384006168/384016682，沿用仓内 Host 存储和 2048 行对齐。训练长度默认为 4096；模型配置保留官方的最大位置范围 1048576，运行时按训练长度准备 RoPE。
+`CONFIG=deepseek_v4_1_flash_cpt`，参数对齐 [HF 官方配置](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/blob/main/config.json)：40 层、隐藏维度 5120、384 个路由专家、1 个共享专家、top-6、MoE 中间维度 2304；attention 64 heads × 512、Q/O LoRA 1280/1024；ViT 32 层、维度 1024、16 heads、MLP 2816。Engram 位于第 1/14 层，逻辑表行数 384006168/384016682，沿用仓内 Host 存储和 2048 行对齐。训练长度默认为 4096；模型配置保留官方的最大位置范围 1048576，运行时按训练长度准备 RoPE。
 
 这里的“完整”指非裁剪的文本主干、ViT 和 Engram。HF 额外的 3 层 MTP 和 DSpark 尚未实现，本入口不代表完整 HF 训练目标均已支持；HF 的 FP8/FP4 权重发布格式也不等于本入口的训练量化配方。
 
@@ -73,15 +76,15 @@ A5 默认每机 8 卡、EP128/FSDP128、TP1/CP1/PP1、每 rank microbatch 4096 t
 
 `NGPU`、`EP`、`DP_SHARD`、`STEPS` 可通过环境变量设置；`NODE_IPS` 必填。总卡数须能被 EP 和 DP_SHARD 整除，EP 须兼容 384 专家。CLI 参数放在最后，可覆盖训练配置；修改拓扑请优先使用上述环境变量，保证派生的 DP_REPLICATE 一致。Host Engram 需要正确的 tokenizer 压缩映射与足够主机内存。
 
-初始权重不会因设置 `HF_ASSETS_PATH` 自动加载：需要时设置 `CKPT_INIT_LOAD_PATH` 指向 HF checkpoint；保存 checkpoint 另加 `--checkpoint.no-load-only`。默认不启用参数/梯度 CPU offload，保留 `swap_optimizer` 对 Engram 的适配。`USE_GOLDEN=1` 切换 reference override；A5 若还要关闭量化，追加 `--extension.quantization.no-enable-quantized-training`。
+初始权重不会因设置 `HF_ASSETS_PATH` 自动加载：需要时设置 `CKPT_INIT_LOAD_PATH` 指向 HF checkpoint；保存 checkpoint 另加 `--checkpointer.no-load-only`。默认不启用参数/梯度 CPU offload，保留 `swap_optimizer` 对 Engram 的适配。`USE_GOLDEN=1` 切换 reference override；A5 若还要关闭量化，追加 `--extension.quantization.no-enable-quantized-training`。
 
 ### Checkpoint 加载范围
 
 以下为追加到训练命令末尾的标准 CLI 参数：
 
-- 原生 DCP 完整续训：`--checkpoint.enable --checkpoint.initial-load-path /path/to/dcp/step-N --checkpoint.no-initial-load-in-hf --checkpoint.no-initial-load-in-hf-quantized --checkpoint.no-initial-load-model-only`。恢复模型、优化器和训练状态；并行布局与原 checkpoint 保持兼容。
-- 普通 HF 权重初始化：`--checkpoint.enable --checkpoint.initial-load-path /path/to/hf --checkpoint.initial-load-in-hf --checkpoint.no-initial-load-in-hf-quantized --checkpoint.initial-load-model-only`。只加载模型权重，优化器重新初始化。
-- 输入包含官方格式的 Engram MXFP8 权重时，在 HF 初始化参数上追加 `--checkpoint.initial-load-in-hf-quantized`，按 row/block scale 反量化到训练参数。该选项描述输入 checkpoint 格式，与训练时是否启用 Engram MXFP8 算子相互独立。
+- 原生 DCP 完整续训：`--checkpointer.initial-load-path /path/to/dcp/step-N --checkpointer.no-initial-load-in-hf --checkpointer.no-initial-load-in-hf-quantized --checkpointer.no-initial-load-model-only`。恢复模型、优化器和训练状态；并行布局与原 checkpoint 保持兼容。
+- 普通 HF 权重初始化：`--checkpointer.initial-load-path /path/to/hf --checkpointer.initial-load-in-hf --checkpointer.no-initial-load-in-hf-quantized --checkpointer.initial-load-model-only`。只加载模型权重，优化器重新初始化。
+- 输入包含官方格式的 Engram MXFP8 权重时，在 HF 初始化参数上追加 `--checkpointer.initial-load-in-hf-quantized`，按 row/block scale 反量化到训练参数。该选项描述输入 checkpoint 格式，与训练时是否启用 Engram MXFP8 算子相互独立。
 
 Engram HF 表以全局逻辑行保存，不包含本地 padding，支持 EP 分片和 EP × EFSDP 联合分片的权重导入导出；离线 DCP 转 HF 同样支持这两种表布局。这不包含原生优化器状态在不同分片布局之间的自动迁移。
 
@@ -177,25 +180,41 @@ encoder 只调用模型目录 `encoding/encoding.py` 的 `encode_messages` 公�
 
 ### 相同初始权重（生成与加载）
 
-baseline 与融合组要从同一份显式权重出发时，先生成再加载（dcp 格式，model-only）：
+baseline 与融合组要从同一份显式权重出发时，先在仓库根目录的 `my_recipes.py` 中启用 checkpoint：
+
+```python
+from torchtitan.components.checkpointer import CheckpointManager
+from torchtitan_npu.models.deepseek_v4_1.config_registry import (
+    deepseek_v4_1_flash_40layers_16experts_multimodal_compiled,
+)
+
+
+def debug_checkpoint():
+    config = deepseek_v4_1_flash_40layers_16experts_multimodal_compiled()
+    config.checkpointer = CheckpointManager.Config(load_only=True)
+    return config
+```
+
+然后先生成再加载（DCP 格式，model-only）：
 
 ```sh
 # 生成：跑 3 步保存训练 checkpoint（后续仅加载其中的模型权重）
+MODULE=my_recipes CONFIG=debug_checkpoint \
 bash examples/deepseek_v4_1/debug/deepseek_v4_1_flash_8p_cpt_4k_a3.sh \
     --hf-assets-path <v41_tokenizer_dir> \
-    --training.steps 3 --lr-scheduler.total-steps 3 --lr-scheduler.warmup-steps 2 \
-    --checkpoint.enable --checkpoint.no-load-only \
-    --checkpoint.folder <ckpt_dir>
+    --training.steps 3 --optim.lr-scheduler.total-steps 3 --optim.lr-scheduler.warmup-steps 2 \
+    --checkpointer.no-load-only \
+    --checkpointer.folder <ckpt_dir>
 
-# 加载同一份权重起跑（--checkpoint.load-only 禁用后续保存）
+# 加载同一份权重起跑（--checkpointer.load-only 禁用后续保存）
+MODULE=my_recipes CONFIG=debug_checkpoint \
 bash examples/deepseek_v4_1/debug/deepseek_v4_1_flash_8p_cpt_4k_a3.sh \
     --hf-assets-path <v41_tokenizer_dir> \
-    --checkpoint.enable \
-    --checkpoint.initial-load-path <ckpt_dir>/step-3 \
-    --checkpoint.initial-load-model-only
+    --checkpointer.initial-load-path <ckpt_dir>/step-3 \
+    --checkpointer.initial-load-model-only
 ```
 
-两个要点：`--checkpoint.enable` 是加载生效的前提（不传时 CheckpointManager 未激活，会静默 fresh start，日志中只有一条 warning）；`initial-load-path` 指向 `step-N` 子目录。输出 `checkpoint.folder` 中已有有效 checkpoint 时会优先恢复它；从 `initial-load-path` 起跑应使用新的输出目录。加载后应核对 checkpoint 日志与实际数据配置，再比较训练轨迹；单凭首步 loss 接近不能证明权重和数据一致。
+`checkpointer=None` 表示关闭；启用或关闭均在 recipe 中设置。嵌套 CLI 参数只覆盖已存在的配置，不再从 `None` 自动创建组件。编译的 `components=[]` 也在 recipe 中设置。`initial-load-path` 指向 `step-N` 子目录。输出 `checkpointer.folder` 中已有有效 checkpoint 时会优先恢复它；从 `initial-load-path` 起跑应使用新的输出目录。加载后应核对 checkpoint 日志与实际数据配置，再比较训练轨迹；单凭首步 loss 接近不能证明权重和数据一致。
 
 ### 融合算子逐项说明
 
@@ -209,7 +228,7 @@ bash examples/deepseek_v4_1/debug/deepseek_v4_1_flash_8p_cpt_4k_a3.sh \
 | `common.rope.asc_half_rotation` | 视觉塔 2D 位置表的 half 旋转（半宽 cos/sin，融合前复制为全宽表，逐 batch 折叠保位置） | 同上 |
 | `sparse_attn.asc`（仅 A5，须与下一行同开） | 替换完整 attention forward；反向除自身梯度外还在 `topk_scores` 梯度上产出 indexer 教师。该 config 按**自己的几何**（每个 `(端口, compress_ratio)` 一个 map entry）每微批预计算 SMLA 与 indexer 元数据（`sparse_flash_mla_metadata` / `sparse_flash_mla_grad_metadata` / `lightning_indexer_metadata` / `sparse_lightning_indexer_kl_loss_grad_metadata`），随 entry 的 `aicpu_metadata` 字段下发，前向/重算/反向直接读字段（没有查表）。几何即该 config 自己的必填字段（无默认值），由该入口的五个参数一次写入，默认值即 V4.1-Flash 的发布形状；记录是内核 metadata 的唯一来源：拿着没经过端口构建的 metadata 前向会直接失败，不会在层里补一次算子调用（没有 inline 回退） | Ascend sparse flash MLA + CANN `*_metadata` |
 | `lightning_indexer.asc`（仅 A5，须与上一行同开） | 替换 selector 节点 | CANN `lightning_indexer` + `sparse_lightning_indexer_kl_loss_grad` |
-| `common.swiglu_group.asc`（仅 A5） | `*.moe.routed_experts.inner_experts` 的 grouped SwiGLU（FQN 限定） | cann_ops_nn.swiglu_group |
+| `common.swiglu_group.asc`（仅 A5） | `*.moe.routed_experts.activation_fn` 的 SwiGLU | cann_ops_nn.swiglu_group |
 | `common.swiglu_group.asc_shared_experts`（仅 A5） | `*.moe.shared_experts` 的 SwiGLU（FQN 限定，不替换视觉 MLP） | 同上 |
 | `common.token_dispatcher.asc` | 公共 MoE 的 permute / re-routing / unpermute；reference 不启用 | Ascend token dispatcher |
 | `mhc.asc_hc_post` | mHC post 变换 | Ascend mHC post |
@@ -217,7 +236,7 @@ bash examples/deepseek_v4_1/debug/deepseek_v4_1_flash_8p_cpt_4k_a3.sh \
 
 量化路径不是这两个 override 的包装，而是另一个 backend：开启 `--extension.quantization.enable-sparse-attention-quantization` 后，量化后的 sparse attention（`torchao_npu` 里 fused attention 的拷贝）由 converter 安装，它自己构建 entry 的四份 metadata（含量化 selector 的两条 schedule），因此 `sparse_attn.asc` 在该路径上不生效；`--extension.quantization.li-quantization mxfp4` 必须与该开关同时开启，否则非量化 attention 的 BF16 schedule 会被量化 kernel 读到（垃圾索引，kernel 可能崩），converter 会直接报错。非量化路径的 `lightning_indexer.fwd_sparse` / `.sparse_length` 当前留空，等带 candidate 的非量化算子落地后由 port 填。
 
-routed experts 已走公共 grouped GEMM（`_ClampGroupedExperts` → 仓内 NPU `_grouped_mm`），reference 与融合共用，不改变模型参数名称、FSDP/EP 或 checkpoint 格式。融合输出、输入/权重梯度与训练轨迹的误差需与迁移后同配置 reference 对照验收；仅运行成功不代表数值或性能验收完成。
+routed experts 使用独立的 `GroupedLinear.Config`：`w13` 保存 gate/up 投影，`w2` 保存 down 投影。融合 override 仅替换 `activation_fn`，保留分组矩阵乘和 dispatcher；路由分数在激活后、`w2` 前单独乘入。参数名现为 `routed_experts.w13.weight` 和 `routed_experts.w2.weight`。融合输出、输入/权重梯度与训练轨迹的误差需与迁移后同配置 reference 对照验收；仅运行成功不代表数值或性能验收完成。
 
 ### RoPE seam 说明
 
@@ -227,7 +246,7 @@ CPU 测试覆盖两类 seam 的输出/梯度、partial 非连续输入、逐 bat
 
 ### Muon 优化器注意事项
 
-`--optimizer.name Muon` 启用 DistMuon 时，`materialize()` 会整体替换 `param_groups` 为 `[DistMuon(pattern), AdamW(.*)]`，launcher 传入的 `--optimizer.param-groups.0.*` 参数静默失效。学习率等超参请使用顶层字段：`--optimizer.lr`、`--optimizer.weight-decay`、`--optimizer.muon-momentum` 等。indexer 参数在 LI 下有梯度，但仍留在 AdamW fallback 组，不因迁移改变参数策略。
+`--optim.optimizer.name Muon` 启用 DistMuon 时，`materialize()` 会整体替换 `optimizers` 为 `[DistMuon(pattern), AdamW(.*)]`，launcher 传入的 `--optim.optimizer.optimizers.0.*` 参数静默失效。学习率等超参请使用顶层字段：`--optim.optimizer.lr`、`--optim.optimizer.weight-decay`、`--optim.optimizer.muon-momentum` 等。indexer 参数在 LI 下有梯度，但仍留在 AdamW fallback 组，不因迁移改变参数策略。
 
 ### 验证范围
 

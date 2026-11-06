@@ -11,6 +11,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 from torchtitan.config import derive
+from torchtitan.models.common.activation import Sigmoid, Softmax, SqrtSoftplus
 from torchtitan.models.deepseek_v4.moe import DeepSeekV4Router
 
 from torchtitan_npu.models.deepseek_v4_1.moe import DeepSeekV41Router
@@ -38,8 +39,10 @@ _HASH_TABLE = torch.tensor([[0, 1], [6, 2], [7, 4], [1, 3], [5, 0], [2, 7], [3, 
 def _router(settings):
     from torchtitan.models.common.config_utils import make_router_config
 
-    config = make_router_config(dim=3, num_experts=8, gate_param_init={}, top_k=2)
     settings = dict(settings)
+    score_func = settings.pop("score_func", "sigmoid")
+    activation = {"sigmoid": Sigmoid, "softmax": Softmax, "sqrtsoftplus": SqrtSoftplus}[score_func]
+    config = make_router_config(dim=3, num_experts=8, gate_param_init={}, top_k=2, score_func=activation.Config())
     is_hash = settings.pop("hash", False)
     vocab_size = settings.pop("vocab_size", None)
     if is_hash:
@@ -106,7 +109,8 @@ def _reference_forward(inputs, weight, settings, balancing_bias):
     selected = scores.gather(-1, expert_ids)
     if settings.get("route_norm", False):
         selected = selected / (selected.sum(-1, keepdim=True) + 1e-20)
-    return selected * settings.get("route_scale", 1.0), expert_ids, scores
+    routing_map = torch.tensor([[expert in row for expert in range(8)] for row in expert_ids.tolist()])
+    return selected * settings.get("route_scale", 1.0), expert_ids, routing_map
 
 
 @pytest.mark.parametrize(
@@ -144,15 +148,13 @@ def _reference_forward(inputs, weight, settings, balancing_bias):
                 "hash": True,
                 "vocab_size": 8,
                 "vision_enabled": True,
-                "num_expert_groups": 2,
-                "num_limited_groups": 1,
                 "sorted_topk": True,
                 "score_func": "sqrtsoftplus",
                 "route_norm": True,
                 "route_scale": 1.3,
             },
             True,
-            id="fixed-hash-ignores-choice-bias-and-grouping",
+            id="fixed-hash-ignores-choice-bias",
         ),
         pytest.param(
             {
@@ -168,7 +170,7 @@ def _reference_forward(inputs, weight, settings, balancing_bias):
         ),
     ],
 )
-def test_plain_router_full_forward_and_gate_gradients_match_legacy_behavior(settings, with_balancing_bias, monkeypatch):
+def test_plain_router_scores_routes_and_gate_gradients_match_reference(settings, with_balancing_bias):
     router = _router(settings)
     assert DeepSeekV41Router.forward is DeepSeekV41Router.__bases__[0].forward
     inputs = _INPUT.clone().requires_grad_()
@@ -186,7 +188,12 @@ def test_plain_router_full_forward_and_gate_gradients_match_legacy_behavior(sett
         torch.testing.assert_close(observed, reference, rtol=0, atol=0)
     top_k = settings.get("top_k", 2)
     assert actual[0].shape == actual[1].shape == (4, top_k)
-    assert actual[0].dtype == actual[2].dtype == torch.float32
+    assert actual[0].dtype == torch.float32
+    assert actual[1].dtype == torch.int64
+    assert actual[2].dtype == torch.bool
+    assert actual[2].shape == (4, 8)
+    torch.testing.assert_close(actual[2].sum(-1), torch.full((4,), top_k))
+    torch.testing.assert_close(router.tokens_per_expert_E, expected[2].sum(0).float())
     if settings.get("num_expert_groups") and not settings.get("hash"):
         # For row 0 the strongest single expert is in group 0, but the sum
         # of the best two experts correctly chooses group 1.
@@ -197,9 +204,8 @@ def test_plain_router_full_forward_and_gate_gradients_match_legacy_behavior(sett
     selected_upstream = torch.tensor(
         [[0.6, -0.4, 1.2, -0.7], [-1.2, 0.3, 0.8, 0.5], [0.8, 1.5, -0.9, 0.2], [-0.7, 0.9, 0.4, -1.1]]
     )[:, :top_k]
-    score_upstream = torch.arange(32, dtype=torch.float32).reshape(4, 8) * 0.03 - 0.1
-    actual_loss = (actual[0] * selected_upstream).sum() + (actual[2] * score_upstream).sum()
-    expected_loss = (expected[0] * selected_upstream).sum() + (expected[2] * score_upstream).sum()
+    actual_loss = (actual[0] * selected_upstream).sum()
+    expected_loss = (expected[0] * selected_upstream).sum()
     choice_parameters = tuple(
         value for value in (balancing_bias, getattr(router, "bias_vl", None)) if value is not None
     )

@@ -30,8 +30,6 @@ class TilelangRouter(TokenChoiceTopKRouter):
 
 def _tilelang_select_experts(router: TokenChoiceTopKRouter, scores_TE: torch.Tensor, expert_bias_E) -> torch.Tensor:
     scores_for_choice_TE = scores_TE if expert_bias_E is None else scores_TE + expert_bias_E
-    if router.num_expert_groups is not None:
-        scores_for_choice_TE = router._get_node_limited_routing_scores(scores_for_choice_TE)
     return _tilelang_topk(scores_for_choice_TE, router.top_k)
 
 

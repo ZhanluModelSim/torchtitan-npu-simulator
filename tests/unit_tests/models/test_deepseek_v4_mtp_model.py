@@ -26,6 +26,8 @@ from torchtitan_npu.models.deepseek_v4.state_dict_adapter import (
     DeepSeekV4StateDictAdapter,
 )
 
+pytestmark = pytest.mark.usefixtures("single_rank_spmd")
+
 
 def _build_model_config(
     *,
@@ -101,7 +103,7 @@ def test_deepseek_v4_mtp_model_supports_chunked_loss():
     positions = PACKED_POSITIONS.clone()
     labels = (tokens + 1) % VOCAB_SIZE
     tokens, labels, extra_kwargs = preprocess(model, tokens, labels, positions)
-    assert "mtp_batch" not in extra_kwargs
+    assert extra_kwargs["mtp_batch"].labels.shape == (SEQ_LEN, 1)
     object.__setattr__(model, "_skip_lm_head", True)
     output = model(tokens, **extra_kwargs)
 
@@ -142,7 +144,7 @@ def test_deepseek_v4_mtp_loss_flag_reaches_model():
     trainer_config = deepseek_v4_debugmodel(num_mtp_layers=1)
     assert not trainer_config.loss.mtp_isolate_gradients
     trainer_config.loss.mtp_isolate_gradients = True
-    model_config = trainer_config.model_spec.model
+    model_config = trainer_config.model
     model_config.update_from_config(config=trainer_config)
     with torch.device("meta"):
         model = model_config.build()
@@ -271,7 +273,7 @@ def test_deepseek_v4_mtp_state_dict_round_trip():
         "mtp_layers.0.hc_head.",
         "mtp_layers.0.moe.router.",
         "mtp_layers.0.moe.shared_experts.",
-        "mtp_layers.0.moe.routed_experts.inner_experts.",
+        "mtp_layers.0.moe.routed_experts.",
     )
     assert all(any(key.startswith(prefix) for key in local_state_dict) for prefix in required_local_prefixes)
 
@@ -347,18 +349,17 @@ def test_preprocess_inputs_builds_the_mtp_batch_on_the_global_row(monkeypatch):
     rank, cp_size = 1, 2
     shard_len = SEQ_LEN // cp_size
 
-    def fake_cp_shard(mesh, tensors, masks=None, load_balancer_type=None, input_seq_dim=1, *, positions=None):
-        shard_calls.append((tuple(tensors), positions, load_balancer_type))
-        cut = tuple(tensor.narrow(input_seq_dim, rank * shard_len, shard_len) for tensor in tensors)
-        return cut, masks
+    def fake_cp_shard(input_dict, *, input_shardings, parallelism_context, parallelism):
+        shard_calls.append((dict(input_dict), input_dict["positions"], input_shardings))
+        assert parallelism_context.get_mesh("cp") is mesh
+        return {key: tensor.narrow(0, rank * shard_len, shard_len) for key, tensor in input_dict.items()}
 
     monkeypatch.setattr(model_mod, "prepare_mtp_batch", record_prepare)
-    monkeypatch.setattr(model_mod, "cp_shard", fake_cp_shard)
+    monkeypatch.setattr(model, "_cp_shard", fake_cp_shard)
 
-    # The base seam is exercised in its own tests; here the model's own
-    # responsibility is the MTP batch: built on the global row, then cut by the
-    # same shard, handed the same row so the balancer derives the same layout.
+    # Isolate the decoder's metadata build; both calls still exercise the model's named shard boundary.
     from torchtitan.models.common.decoder import Decoder
+    from torchtitan.models.common.decoder_sharding import decoder_input_sharding
 
     from torchtitan_npu.models.deepseek_v4.metadata import build_v4_metadata, doc_chunk_entry
 
@@ -366,30 +367,28 @@ def test_preprocess_inputs_builds_the_mtp_batch_on_the_global_row(monkeypatch):
     row_entry = build_v4_metadata(positions, 1)
     local_entry = doc_chunk_entry(row_entry, cp_size=cp_size, cp_rank=rank, slab_len=shard_len)
 
-    def fake_base(self, input_dict, *, parallel_dims, parallelism, **kwargs):
-        del parallel_dims, parallelism, kwargs
+    def fake_base(self, input_dict, *, parallelism_context, parallelism, **kwargs):
+        del kwargs
         base_calls.append((input_dict["input"].shape, input_dict["labels"].shape))
-        cut, _ = model_mod.cp_shard(
-            mesh,
-            (input_dict["input"], input_dict["labels"], input_dict["positions"]),
-            None,
-            None,
-            0,
-            positions=input_dict["positions"],
+        cut = self._cp_shard(
+            input_dict,
+            input_shardings=decoder_input_sharding(),
+            parallelism_context=parallelism_context,
+            parallelism=parallelism,
         )
-        return cut[0], cut[1], {"positions": cut[2], "attention_metadata": {("debug", 1): local_entry}}
+        return (
+            cut["input"],
+            cut["labels"],
+            {"positions": cut["positions"], "attention_metadata": {("debug", 1): local_entry}},
+        )
 
     monkeypatch.setattr(Decoder, "preprocess_inputs", fake_base)
     mesh = SimpleNamespace(size=lambda *_: cp_size, get_local_rank=lambda: rank, device_type="cpu")
-    parallel_dims = SimpleNamespace(cp_enabled=True, get_mesh=lambda name: mesh)
-    parallelism = SimpleNamespace(
-        spmd_backend="partial_dtensor",
-        context_parallel_load_balancer=None,
-        context_parallel_ptrr_mask_key=None,
-    )
+    parallelism_context = SimpleNamespace(cp_enabled=True, get_mesh=lambda name: mesh)
+    parallelism = SimpleNamespace(context_parallel_load_balancer=None)
     inputs, out_labels, extra_kwargs = model.preprocess_inputs(
         {"input": tokens, "labels": labels, "positions": positions},
-        parallel_dims=parallel_dims,
+        parallelism_context=parallelism_context,
         parallelism=parallelism,
     )
 
@@ -403,17 +402,16 @@ def test_preprocess_inputs_builds_the_mtp_batch_on_the_global_row(monkeypatch):
     # Two cuts, both fed the full row: the base inputs, then the MTP batch.
     assert base_calls == [(tokens.shape, labels.shape)]
     assert len(shard_calls) == 2
-    for got, expected in zip(shard_calls[0][0], (tokens, labels, positions), strict=True):
-        assert torch.equal(got, expected)
-    for got, expected in zip(shard_calls[1][0], batch, strict=True):
-        assert torch.equal(got, expected)
+    for name, expected in (("input", tokens), ("labels", labels), ("positions", positions)):
+        assert torch.equal(shard_calls[0][0][name], expected)
+    for index, expected in enumerate(batch):
+        assert torch.equal(shard_calls[1][0][f"mtp_{index}"], expected)
     # The row reaches both calls, so the layout cannot be derived from anything else.
     for _, handed_positions, _ in shard_calls:
         assert torch.equal(handed_positions, positions)
-    # The MTP cut is handed the layout the run resolves to, not the raw (unset) flag: an
-    # unset flag means "this stack's layout", and passing it through would cut the depths
-    # contiguously while the inputs are permuted.
-    assert shard_calls[1][2] == "doc_chunk", shard_calls[1][2]
+    # Every MTP tensor uses the same token layout that the decoder's native shard consumes.
+    assert set(shard_calls[1][2]) == {"mtp_0", "mtp_1", "mtp_2", "positions"}
+    assert all(layout == decoder_input_sharding()["input"] for layout in shard_calls[1][2].values())
 
     # What the forward reads is the shard's answer, not the global row.
     slab = slice(rank * shard_len, (rank + 1) * shard_len)

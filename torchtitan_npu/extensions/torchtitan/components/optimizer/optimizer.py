@@ -1,4 +1,5 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
@@ -7,15 +8,20 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+__all__ = ["HostSparseOptim", "HostSparseOptimizersContainer", "clip_grad_norm_with_host_sparse_tables"]
+
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, overload
 
 import torch
 import torch.distributed as dist
 from torch.profiler import record_function
-from torchtitan.components.optimizer import OptimizersContainer, ParamGroupConfig
+from torchtitan.components.checkpointer.utils import canonical_fqn
+from torchtitan.components.optim import Optim
+from torchtitan.components.optim.optimizer import BaseOptimizer, OptimizersContainer
+from torchtitan.distributed import utils as dist_utils
 
-from torchtitan_npu.config import OptimizerConfig
+from torchtitan_npu.config import OptimConfig, OptimizerConfig
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -152,36 +158,39 @@ def _materialize_missing_adam_state(optimizer: torch.optim.Optimizer) -> None:
                 state["max_exp_avg_sq"] = torch.zeros_like(param, memory_format=torch.preserve_format)
 
 
+class SparseAdam(torch.optim.SparseAdam, BaseOptimizer):
+    """Typed SparseAdam used by Host Engram table recipes."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(BaseOptimizer.Config):
+        lr: float = 5e-5
+        betas: tuple[float, float] = (0.9, 0.95)
+        eps: float = 1e-6
+
+    def __init__(self, config: Config, *, params) -> None:
+        super().__init__(params, lr=config.lr, betas=config.betas, eps=config.eps)
+
+
 class HostSparseOptimizersContainer(OptimizersContainer):
     """Select SparseAdam for Host tables and complete lazy state for DCP."""
 
     @dataclass(kw_only=True, slots=True)
     class Config(OptimizerConfig):
         def materialize(self) -> None:
-            sparse_groups = [group for group in self.param_groups if group.optimizer_name == "SparseAdam"]
+            sparse_configs = [config for config in self.optimizers if isinstance(config, SparseAdam.Config)]
             OptimizerConfig.materialize(self)
             if self.name == "Muon":
-                self.param_groups = sparse_groups + self.param_groups
+                self.optimizers = sparse_configs + self.optimizers
 
     @staticmethod
-    def _resolve_optimizer_factory(name: str) -> Callable[..., torch.optim.Optimizer]:
-        if name == "SparseAdam":
-            return torch.optim.SparseAdam
-        return OptimizersContainer._resolve_optimizer_factory(name)
-
-    @staticmethod
-    def _build_param_groups(
-        model: torch.nn.Module,
-        param_group_configs: list[ParamGroupConfig],
-        impl_kwargs: dict[str, Any],
-    ) -> tuple[dict[str, list[dict[str, Any]]], dict[str, list[str]]]:
-        groups, patterns = OptimizersContainer._build_param_groups(model, param_group_configs, impl_kwargs)
-        for group in groups.get("SparseAdam", []):
-            # SparseAdam has no fused/foreach implementation. Its group is
-            # selected explicitly by the recipe, not inferred from a model type.
-            group.pop("fused", None)
-            group.pop("foreach", None)
-        return groups, patterns
+    def _build_param_group(model, optimizer_config, claimed):
+        group = OptimizersContainer._build_param_group(model, optimizer_config, claimed)
+        if isinstance(optimizer_config, SparseAdam.Config):
+            group["param_names"] = [
+                canonical_fqn(name) + getattr(param, "_engram_checkpoint_suffix", "")
+                for name, param in zip(group["param_names"], group["params"], strict=True)
+            ]
+        return group
 
     def _iter_host_tables(self) -> Iterator[Any]:
         for model in self.model_parts:
@@ -257,4 +266,41 @@ class HostSparseOptimizersContainer(OptimizersContainer):
         super().load_state_dict(state_dict)
 
 
-__all__ = ["HostSparseOptimizersContainer", "clip_grad_norm_with_host_sparse_tables"]
+class HostSparseOptim(Optim):
+    """Keep host sparse gradients in the engine's joint clipping boundary."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(OptimConfig):
+        optimizer: OptimizersContainer.Config = field(default_factory=HostSparseOptimizersContainer.Config)
+
+    def _update(self, loss: torch.Tensor) -> torch.Tensor:
+        # Optim owns clipping on the pinned upstream; the container owns the
+        # host tables and any CPU-offload correction of dense gradients.
+        optimizers = self.optimizers
+        clipper = (
+            optimizers.clip_grad_norm
+            if isinstance(optimizers, HostSparseOptimizersContainer)
+            else dist_utils.clip_grad_norm_
+        )
+        grad_norm = clipper(
+            self.parameters,
+            self.config.max_norm,
+            foreach=True,
+            pp_mesh=self.parallelism_context.get_optional_mesh("pp"),
+            ep_enabled=self.parallelism_context.ep_enabled,
+        )
+        # Match upstream Optim's finite-loss checks before the optimizer update.
+        loss_is_finite = torch.isfinite(loss).all().to(torch.int32)
+        if not self.parallelism_context.pp_enabled or self.pp_has_last_stage:
+            loss_mesh = self.parallelism_context.get_optional_mesh("loss")
+            if loss_mesh is not None:
+                dist.all_reduce(loss_is_finite, op=dist.ReduceOp.MIN, group=loss_mesh.get_group())
+        pp_mesh = self.parallelism_context.get_optional_mesh("pp")
+        if pp_mesh is not None:
+            dist.all_reduce(loss_is_finite, op=dist.ReduceOp.MIN, group=pp_mesh.get_group())
+        torch._assert_async(
+            loss_is_finite.logical_and(torch.isfinite(grad_norm).all()),
+            "Loss or gradient norm is not finite. Stopping before the update.",
+        )
+        optimizers.step()
+        return grad_norm

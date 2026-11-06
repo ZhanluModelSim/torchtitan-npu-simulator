@@ -7,6 +7,7 @@
 __all__ = ["DeepSeekV4PEFTCheckpointManager", "select_adapter_only_state"]
 
 import json
+import logging
 import os
 from dataclasses import dataclass
 from typing import Any
@@ -15,14 +16,16 @@ import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 from safetensors.torch import save_file
 from torch.distributed.tensor import DTensor
-from torchtitan.components.checkpointer import MODEL
+from torchtitan.components.checkpointer import EMA, MODEL
 from torchtitan.components.checkpointer.utils import canonical_fqn
 from torchtitan.tools import filesystem
-from torchtitan.tools.logging import logger
 
+from torchtitan_npu.extensions.torchtitan.components import checkpoint as checkpoint_extensions
 from torchtitan_npu.extensions.torchtitan.components.checkpoint import CheckpointManager as NPUCheckpointManager
 
-from .lora import is_lora_parameter
+from .lora import DeepSeekPEFTAdapter, is_lora_parameter
+
+logger = logging.getLogger(__name__)
 
 
 def select_adapter_only_state(
@@ -45,27 +48,25 @@ class DeepSeekV4PEFTCheckpointManager(NPUCheckpointManager):
         peft_base_model_name_or_path: str | None = None
 
         def __post_init__(self) -> None:
+            if self.last_save_in_hf:
+                raise ValueError("last_save_in_hf cannot preserve LoRA adapters; use PEFT export or native DCP")
             NPUCheckpointManager.Config.__post_init__(self)
-            if self.enable and self.last_save_in_peft and filesystem.is_remote(self.folder):
+            if self.last_save_in_peft and filesystem.is_remote(self.folder):
                 raise ValueError("PEFT export requires a local checkpoint folder")
 
     def __init__(self, config: Config, **kwargs) -> None:
-        if config.enable:
-            if config.last_save_in_hf:
-                raise ValueError("last_save_in_hf cannot preserve LoRA adapters; use PEFT export or native DCP")
-            if config.last_save_in_peft:
-                destination = filesystem.join(kwargs.get("base_folder", ""), config.folder)
-                if filesystem.is_remote(destination):
-                    raise ValueError("PEFT export requires a local checkpoint folder")
-                from .state_dict_adapter import DeepSeekV4StateDictAdapter
+        if config.last_save_in_hf:
+            raise ValueError("last_save_in_hf cannot preserve LoRA adapters; use PEFT export or native DCP")
+        if config.last_save_in_peft:
+            destination = filesystem.join(kwargs.get("base_folder", ""), config.folder)
+            if filesystem.is_remote(destination):
+                raise ValueError("PEFT export requires a local checkpoint folder")
 
-                adapter = kwargs.get("sd_adapter")
-                if not isinstance(adapter, DeepSeekV4StateDictAdapter):
-                    raise TypeError("DeepSeekV4 PEFT export requires DeepSeekV4StateDictAdapter")
-                adapter.peft_adapter_config()
+            adapter = kwargs.get("sd_adapter")
+            if not isinstance(adapter, DeepSeekPEFTAdapter):
+                raise TypeError("DeepSeekV4 PEFT export requires DeepSeekV4StateDictAdapter")
+            adapter.peft_adapter_config()
         super().__init__(config, **kwargs)
-        if not config.enable:
-            return
         self.peft_base_model_name_or_path = config.peft_base_model_name_or_path
         self.last_save_in_peft = config.last_save_in_peft
         self.periodic_save_adapter_only = config.periodic_save_adapter_only
@@ -87,10 +88,8 @@ class DeepSeekV4PEFTCheckpointManager(NPUCheckpointManager):
         status: list[str | None] = [None]
         if rank == 0:
             try:
-                from .state_dict_adapter import DeepSeekV4StateDictAdapter
-
                 adapter = self.sd_adapter
-                if not isinstance(adapter, DeepSeekV4StateDictAdapter):
+                if not isinstance(adapter, DeepSeekPEFTAdapter):
                     raise TypeError("DeepSeekV4 PEFT export requires DeepSeekV4StateDictAdapter")
                 peft_state = adapter.to_peft(state_dict)
                 peft_state = {name: value.contiguous() for name, value in peft_state.items()}
@@ -102,60 +101,104 @@ class DeepSeekV4PEFTCheckpointManager(NPUCheckpointManager):
         if status[0] is not None:
             raise RuntimeError(f"PEFT checkpoint finalization failed: {status[0]}")
 
-    def dcp_load(self, state_dict, checkpoint_id, from_hf=False, from_quantized=False):
+    def _verify_load_source(self, checkpoint_id: str) -> None:
+        if self.verify_hash_manifest:
+            checkpoint_extensions.verify_checkpoint_manifest(checkpoint_id)
+
+    def _load_hf_base(self, model_state, checkpoint_id: str, *, from_quantized: bool) -> None:
+        """Load one layer at a time without restoring LoRA or reseeding EMA."""
+        assert self.sd_adapter is not None, "HF loading requires a state-dict adapter"
+        groups: dict[str, dict[str, Any]] = {}
+        for name, value in model_state.state_dict().items():
+            if is_lora_parameter(name):
+                continue
+            parts = name.split(".", 2)
+            prefix = ".".join(parts[:2]) if parts[0] in {"layers", "mtp_layers"} else ""
+            groups.setdefault(prefix, {})[name] = value
+        for prefix in sorted(groups):
+            hf_state = self.sd_adapter.to_hf(groups[prefix])
+            reader = self.sd_adapter.get_hf_storage_reader(checkpoint_id, from_quantized)
+            dcp.load(hf_state, storage_reader=reader)
+            model_state.load_state_dict(self.sd_adapter.from_hf(hf_state))
+            del hf_state, reader
+
+    @staticmethod
+    def _load_native_states(states, state_dict, checkpoint_id: str) -> None:
+        # DCP restores non-model Stateful objects itself. The flattened model
+        # needs an explicit load to commit transformed or hook-produced tensors.
+        dcp.load(state_dict, checkpoint_id=checkpoint_id)
+        if MODEL in states:
+            states[MODEL].load_state_dict(state_dict)
+
+    def _validate_native_resume(self, saved_keys: set[str]) -> None:
+        if any(key.endswith(".w13_lora_b") for key in saved_keys):
+            raise ValueError("This checkpoint uses the unsupported historical w13_lora_b adapter format")
+
+    def _load_checkpoint(self, states, checkpoint_id, *, from_hf: bool, from_quantized: bool) -> None:
+        if MODEL not in states:
+            # Preserve upstream's non-model-only consumers, including TorchFT.
+            return super()._load_checkpoint(states, checkpoint_id, from_hf=from_hf, from_quantized=from_quantized)
+
+        self._verify_load_source(checkpoint_id)
+        restored_states = states
         if from_hf:
-            # Bound temporary expert reassembly tensors to one transformer layer.
-            groups = {}
-            for name, value in state_dict.items():
-                if is_lora_parameter(name):
-                    continue
-                parts = name.split(".", 2)
-                prefix = ".".join(parts[:2]) if parts[0] in {"layers", "mtp_layers"} else ""
-                groups.setdefault(prefix, {})[name] = value
-            for prefix in sorted(groups):
-                super().dcp_load(groups[prefix], checkpoint_id, from_hf, from_quantized)
-            return None
-        if checkpoint_id == self.initial_load_path:
-            state_dict = {key: value for key, value in state_dict.items() if not is_lora_parameter(key)}
-        elif not from_hf:
-            saved_keys = dcp.FileSystemReader(checkpoint_id).read_metadata().state_dict_metadata.keys()
-            if any(key.endswith(".w13_lora_b") for key in saved_keys):
-                raise ValueError(
-                    "Cannot resume an interleaved w13_lora_b DCP with split Muon parameters. "
-                    "Export/merge the adapter with the checkpoint's original version and start a new run; "
-                    "the former AdamW state cannot be restored as Muon momentum."
-                )
-            model_state = self.states[MODEL].state_dict()
+            self._load_hf_base(states[MODEL], checkpoint_id, from_quantized=from_quantized)
+            restored_states = {MODEL: states[MODEL]}
+        else:
+            saved_keys = set(dcp.FileSystemReader(checkpoint_id).read_metadata().state_dict_metadata)
+            initial_base = checkpoint_id == self.initial_load_path
+            if not initial_base:
+                self._validate_native_resume(saved_keys)
+            model_state = states[MODEL].state_dict()
             model_buffer_keys = self._model_buffer_keys()
+            has_adapters = any(is_lora_parameter(key) for key in saved_keys)
             has_base = all(
                 key in saved_keys for key in model_state if not is_lora_parameter(key) and key not in model_buffer_keys
             )
-            has_adapters = any(is_lora_parameter(key) for key in saved_keys)
-            if not has_adapters:
-                state_dict = {key: value for key, value in state_dict.items() if not is_lora_parameter(key)}
-            if has_base or not has_adapters:
-                return super().dcp_load(state_dict, checkpoint_id, from_hf, from_quantized)
-            if not self.initial_load_path:
-                raise ValueError("Loading an adapter-only DCP requires initial_load_path for the frozen base")
-            self.dcp_load(
-                model_state, self.initial_load_path, self.initial_load_in_hf, self.initial_load_in_hf_quantized
-            )
-            non_model_keys = {
-                key
-                for key in self.states
-                if key != MODEL and any(saved == key or saved.startswith(f"{key}.") for saved in saved_keys)
-            }
-            if not non_model_keys:
-                logger.warning(
-                    "Loading LoRA weights only: optimizer, scheduler, dataloader and training step are not restored."
-                )
-            state_dict = select_adapter_only_state(
-                {**state_dict, **self.states[MODEL].state_dict()},
-                non_model_keys,
-                model_buffer_keys=model_buffer_keys.intersection(saved_keys),
-                model_trainable_keys=set(model_state).intersection(saved_keys),
-            )
-        return super().dcp_load(state_dict, checkpoint_id, from_hf, from_quantized)
+            if initial_base or not has_adapters:
+                flat = {
+                    key: value
+                    for key, value in self._flattened_model_states_sd(states).items()
+                    if not is_lora_parameter(key)
+                }
+            elif has_base:
+                flat = self._flattened_model_states_sd(states)
+            else:
+                if not self.initial_load_path:
+                    raise ValueError("Loading an adapter-only DCP requires initial_load_path for the frozen base")
+                missing_adapters = {key for key in model_state if is_lora_parameter(key)} - saved_keys
+                if missing_adapters:
+                    raise ValueError(f"Adapter checkpoint is missing LoRA tensors: {sorted(missing_adapters)}")
+                # Check both sources before either can change live weights.
+                self._verify_load_source(self.initial_load_path)
+                if self.initial_load_in_hf:
+                    self._load_hf_base(
+                        states[MODEL], self.initial_load_path, from_quantized=self.initial_load_in_hf_quantized
+                    )
+                else:
+                    base_state = {key: value for key, value in model_state.items() if not is_lora_parameter(key)}
+                    self._load_native_states({MODEL: states[MODEL]}, base_state, self.initial_load_path)
+                restored_states = {
+                    key: value
+                    for key, value in states.items()
+                    if key == MODEL or any(saved == key or saved.startswith(f"{key}.") for saved in saved_keys)
+                }
+                if restored_states.keys() == {MODEL}:
+                    logger.warning(
+                        "Loading LoRA weights only: optimizer, scheduler, dataloader "
+                        "and training step are not restored."
+                    )
+                flat = {
+                    key: value
+                    for key, value in self._flattened_model_states_sd(restored_states).items()
+                    if key in restored_states or key in saved_keys
+                }
+            self._load_native_states(restored_states, flat, checkpoint_id)
+
+        # Match target upstream: reseed only when a model was restored and EMA
+        # was not. Base/layer loads above never reseed partially restored weights.
+        if EMA in self.states and EMA not in restored_states:
+            self.states[EMA].load_state_dict({})
 
     def _model_buffer_keys(self) -> set[str]:
         return {
@@ -206,9 +249,9 @@ class DeepSeekV4PEFTCheckpointManager(NPUCheckpointManager):
         if not self.last_save_in_peft:
             super()._save_last_step(curr_step)
             return
-        from .state_dict_adapter import DeepSeekV4StateDictAdapter
 
-        if not isinstance(self.sd_adapter, DeepSeekV4StateDictAdapter):
+        adapter = self.sd_adapter
+        if not isinstance(adapter, DeepSeekPEFTAdapter):
             raise TypeError("DeepSeekV4 PEFT export requires DeepSeekV4StateDictAdapter")
 
         self._ensure_peft_exportable()
@@ -216,7 +259,7 @@ class DeepSeekV4PEFTCheckpointManager(NPUCheckpointManager):
         base_model = self.peft_base_model_name_or_path
         if base_model is None and self.initial_load_in_hf:
             base_model = self.initial_load_path
-        adapter_config = self.sd_adapter.peft_adapter_config(base_model_name_or_path=base_model)
+        adapter_config = adapter.peft_adapter_config(base_model_name_or_path=base_model)
         rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
         adapter_state = {}
         for name, value in state_dict.items():

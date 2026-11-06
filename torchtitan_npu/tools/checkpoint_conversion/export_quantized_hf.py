@@ -445,8 +445,8 @@ def _model_derived_config_fields(model_config) -> dict:
         put("n_routed_experts", lambda: moe.num_experts)
         put("num_experts_per_tok", lambda: moe.router.top_k)
         put("num_hash_layers", lambda: sum(1 for layer in layers if _is_hash_moe(layer)))
-        put("moe_intermediate_size", lambda: moe.routed_experts.inner_experts.hidden_dim)
-        put("swiglu_limit", lambda: moe.routed_experts.inner_experts.swiglu_limit)
+        put("moe_intermediate_size", lambda: moe.routed_experts.w13.out_features)
+        put("swiglu_limit", lambda: getattr(moe.routed_experts.activation_fn, "swiglu_limit", 0.0))
         put("n_shared_experts", lambda: 1 if moe.shared_experts is not None else 0)
         put("scoring_func", lambda: moe.router.score_func)
         put("routed_scaling_factor", lambda: moe.router.route_scale)
@@ -789,11 +789,11 @@ def _build_model_and_adapter(model_name: str, model_flavor: str, hf_assets_path:
     # upstream.
     module_name = model_name if "." in model_name else f"torchtitan.models.{model_name}"
     model_module = importlib.import_module(module_name)
-    model_spec = model_module.model_registry(model_flavor)
-    model_config = model_spec.model
+    model_config = model_module.model_registry(model_flavor)
     with torch.device("cpu"):
         raw_model = model_config.build()
-    sd_adapter = model_spec.state_dict_adapter(model_config, str(hf_assets_path))
+    adapter_cls = type(raw_model).state_dict_adapter_cls
+    sd_adapter = adapter_cls(model_config, str(hf_assets_path)) if adapter_cls is not None else None
     if sd_adapter is None:
         raise ValueError("trying to export to HF safetensors, but the model spec provides no state_dict_adapter.")
     return ModelWrapper(raw_model), sd_adapter, model_config

@@ -70,7 +70,7 @@ class CompressedSparseInnerAttention(Module):
     class Config(Module.Config):
         # TODO: Revisit the upstream attention config contract on the next refactor;
         # reuse or inherit the upstream interface when it can express this CP-capable
-        # sparse backend without classifying it as VarlenAttention.
+        # sparse backend without classifying it as VarlenInnerAttention.
         # The model's window is a count of preceding tokens.
         window_size: int
         compress_ratio: int
@@ -260,15 +260,15 @@ class Attention(BaseAttention):
         self.lightning_indexer = cfg.lightning_indexer.build() if cfg.lightning_indexer is not None else None
         self.inner_attention = cfg.inner_attention.build()
 
-    def parallelize(self, parallel_dims) -> None:
+    def _parallelize(self, parallelism_context) -> None:
         """Take the CP mesh the layer's key stream is restored on, then recurse.
 
         The compressor and its carry exchange take the same mesh through their own
         ``parallelize`` (the framework recurses into every child module), so nothing here wraps
         them: their module paths, sharding and checkpoint entries stay as they are.
         """
-        self.cp_group = parallel_dims.get_optional_mesh("cp")
-        super().parallelize(parallel_dims)
+        self.cp_group = parallelism_context.get_optional_mesh("cp")
+        super()._parallelize(parallelism_context)
 
     def forward(self, x, attention_metadata, positions):
         """The unified attention forward (CP and non-CP).

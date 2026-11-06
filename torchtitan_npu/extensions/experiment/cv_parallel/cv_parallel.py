@@ -28,6 +28,7 @@ from .batch_chunk import (
     _requires_full_stream_barrier,
     configure_batch_chunk_passes,
 )
+from .chunk_symbols import require_graph_chunk_runtime
 from .whole_graph_runtime_profile import (
     _is_metadata_only_compute_node,
     assign_stable_node_tags,
@@ -418,12 +419,13 @@ def schedule_pass(gm, example_inputs, *, profile_root: Path, runtime_context=Non
 
 
 @register_pass_pipeline(CV_PARALLEL_PIPELINE)
-def cv_parallel_pipeline(traced_result, config, *, parallel_dims=None):
+def cv_parallel_pipeline(traced_result, config, *, parallelism_context=None):
+    require_graph_chunk_runtime()
     if config.compile.backend != "aot_eager":
         raise ValueError("The fixed chunk stream probe currently requires aot_eager")
     if not config.compile.ep_overlap.enabled:
         raise ValueError("cv_parallel requires EP chunking to be enabled")
-    passes = construct_default_graph_passes(traced_result, config, parallel_dims=parallel_dims)
+    passes = construct_default_graph_passes(traced_result, config, parallelism_context=parallelism_context)
     context_factory = _RUNTIME_CONTEXT.get()
     if context_factory is None:
         raise RuntimeError("cv_parallel requires its trainer-instance runtime context")

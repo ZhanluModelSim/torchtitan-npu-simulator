@@ -48,7 +48,6 @@ import torch
 import torch_npu
 from torchtitan.config import derive, override
 from torchtitan.distributed.spmd_types import current_spmd_mesh, maybe_set_sparse_mesh
-from torchtitan.distributed.utils import get_spmd_backend
 from torchtitan.models.common.token_dispatcher import BaseEPTokenDispatcher
 
 from torchtitan_npu.extensions.torchtitan.ep_process_group import get_deepep_group
@@ -204,20 +203,16 @@ class AscAllToAllTokenDispatcher(AllToAllTokenDispatcher):
 
         ep_size = self.ep_mesh.size()
 
-        if get_spmd_backend() == "spmd_types" and spmd.is_type_checking():  # sparse mesh reinterpret
+        if spmd.is_type_checking():  # sparse mesh reinterpret
             for axis in ["dp", "cp", "tp"]:
                 spmd.mutate_type(num_local_tokens_per_expert_E, axis, src=spmd.P, dst=spmd.V)
 
         # generate the input splits and output splits for all-to-all
         with maybe_set_sparse_mesh():
-            pg = (
-                current_spmd_mesh().get_group(  # pyrefly: ignore [missing-attribute]
-                    "ep"
-                )
-                if get_spmd_backend() == "spmd_types"
-                else self.ep_mesh.get_group()
-            )
-            if get_spmd_backend() == "spmd_types" and spmd.is_type_checking():
+            mesh = current_spmd_mesh()
+            assert mesh is not None, "EP dispatch requires an active SPMD mesh"
+            pg = mesh.get_group("ep")
+            if spmd.is_type_checking():
                 num_local_tokens_per_expert_E = spmd.reinterpret_mesh(
                     num_local_tokens_per_expert_E, spmd.current_mesh()
                 )
@@ -325,13 +320,9 @@ class AscAllToAllTokenDispatcher(AllToAllTokenDispatcher):
             )
 
         with maybe_set_sparse_mesh():
-            pg = (
-                current_spmd_mesh().get_group(  # pyrefly: ignore [missing-attribute]
-                    "ep"
-                )
-                if get_spmd_backend() == "spmd_types"
-                else self.ep_mesh.get_group()
-            )
+            mesh = current_spmd_mesh()
+            assert mesh is not None, "EP combine requires an active SPMD mesh"
+            pg = mesh.get_group("ep")
             routed_output_RD = npu_moe_token_unpermute(
                 routed_output_RD,
                 metadata.permuted_indices,
@@ -344,7 +335,7 @@ class AscAllToAllTokenDispatcher(AllToAllTokenDispatcher):
                 metadata.output_splits,
             )
 
-        if get_spmd_backend() == "spmd_types" and spmd.is_type_checking():
+        if spmd.is_type_checking():
             # dense mesh reinterpret
             routed_output_RD = spmd.reinterpret_mesh(routed_output_RD, spmd.current_mesh())
 

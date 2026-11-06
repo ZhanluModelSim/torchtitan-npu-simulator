@@ -23,6 +23,7 @@ from torch.nn.utils.rnn import pad_sequence
 from torchtitan.components.data import GrainDataLoader, HuggingFaceStreamingSource
 from torchtitan.components.data.collators import Collator
 from torchtitan.components.data.dataset import SampleProcessor
+from torchtitan.components.data.types import TokenizedTrainingMicrobatch
 from torchtitan.hf_datasets.multimodal.mm_datasets import MM_DATASETS, MMSamplePackingConfig
 
 from torchtitan_npu.models.common.alignment import validate_alignment
@@ -49,12 +50,16 @@ def _process_mm_sample(sample, tokenizer, *, per_doc_alignment: int = 1, **kwarg
     # resets) and is unsupervised, so it only rounds the document up to a whole
     # number of pooling groups.
     padding = -ids.numel() % per_doc_alignment
+    padding_mask = torch.zeros(ids.numel() + padding, dtype=torch.bool)
+    if padding:
+        padding_mask[-padding:] = True
     ids = torch.nn.functional.pad(ids, (0, padding))
     labels = torch.nn.functional.pad(labels, (0, padding), value=-100)
     return {
         "input_ids": ids,
         "labels": labels,
         "positions": torch.arange(ids.numel()),
+        "padding_mask": padding_mask,
         # The upstream packer preserves this ordered list for every document.
         "pixel_values": [(patches, grid)],
     }
@@ -69,8 +74,12 @@ class _V41Collator:
         # The current model uses one document-packed stream per DP rank.
         (sample,) = batch
         ids, labels, positions = (sample[k] for k in ("input_ids", "labels", "positions"))
+        sample_padding_mask = sample.get("padding_mask", torch.zeros_like(ids, dtype=torch.bool))
         images = sample["pixel_values"]
         real_length = sample.get("packed_length", ids.numel())
+        sample_padding_mask = sample_padding_mask.clone()
+        if real_length < ids.numel():
+            sample_padding_mask[real_length:] = True
         # Grain zero-fills the packed row tail. Reconstruct one padding segment
         # from its segment IDs rather than treating every zero as a document.
         positions = positions.clone()
@@ -91,6 +100,7 @@ class _V41Collator:
         tokens = torch.nn.functional.pad(ids, (0, pad))
         token_types = torch.nn.functional.pad(types, (0, pad), value=TEXT)
         feature_indices = torch.nn.functional.pad(indices, (0, pad), value=-1)
+        padding_mask = torch.nn.functional.pad(sample_padding_mask, (0, pad), value=True)
         # BOS labels are already masked, so shifting a pack never supervises
         # EOS -> the next document's BOS. Padding is a separate document.
         targets = torch.nn.functional.pad(labels[1:], (0, pad + 1), value=-100)
@@ -98,6 +108,7 @@ class _V41Collator:
         return {
             "input": tokens,
             "positions": positions,
+            "padding_mask": padding_mask,
             "token_types": token_types,
             "image_feature_indices": feature_indices,
             "pixel_values": pad_sequence([p for p, _ in images], batch_first=True),
@@ -112,12 +123,18 @@ class _GrainV41Collator(Collator):
 
     def __init__(self, config: Config, *, context):
         del config
-        self.collate = _V41Collator(context.num_tokens_per_batch, context.tokenizer.get_vocab_size())
+        self.collate = _V41Collator(context.num_tokens_per_microbatch, context.tokenizer.get_vocab_size())
 
     def __call__(self, rows):
         inputs, labels = self.collate(rows)
-        inputs["num_valid_tokens"] = int((labels != -100).sum())
-        return inputs, labels
+        return TokenizedTrainingMicrobatch(
+            input=inputs.pop("input"),
+            labels=labels,
+            positions=inputs.pop("positions"),
+            padding_mask=inputs.pop("padding_mask"),
+            num_valid_tokens=int((labels != -100).sum()),
+            model_kwargs=inputs,
+        )
 
 
 @dataclass(frozen=True, kw_only=True, slots=True)
@@ -130,10 +147,18 @@ class _V41PackingConfig(MMSamplePackingConfig):
             dataset = dataset.to_iter_dataset(read_options=context.read_options)
         dataset = grain.experimental.FirstFitPackIterDataset(
             dataset,
-            length_struct=dict.fromkeys(("input_ids", "labels", "positions"), context.num_tokens_per_batch),
-            padding_struct={"input_ids": 0, "labels": -100, "positions": 0},
+            length_struct=dict.fromkeys(
+                ("input_ids", "labels", "positions", "padding_mask"),
+                context.num_tokens_per_microbatch,
+            ),
+            padding_struct={
+                "input_ids": 0,
+                "labels": -100,
+                "positions": 0,
+                "padding_mask": True,
+            },
             num_packing_bins=self.num_packing_bins,
-            meta_features=("labels", "positions", "pixel_values"),
+            meta_features=("labels", "positions", "padding_mask", "pixel_values"),
             seed=dataset_iteration_policy.seed,
             shuffle_bins=dataset_iteration_policy.shuffle,
         )
@@ -142,14 +167,14 @@ class _V41PackingConfig(MMSamplePackingConfig):
 
 def _packing_input(sample):
     return {
-        **{key: np.asarray(sample[key]) for key in ("input_ids", "labels", "positions")},
+        **{key: np.asarray(sample[key]) for key in ("input_ids", "labels", "positions", "padding_mask")},
         "pixel_values": sample["pixel_values"],
     }
 
 
 def _packed_sample(sample):
     return {
-        **{key: torch.from_numpy(sample[key]) for key in ("input_ids", "labels", "positions")},
+        **{key: torch.from_numpy(sample[key]) for key in ("input_ids", "labels", "positions", "padding_mask")},
         "pixel_values": [image for images in sample["pixel_values"] for image in images],
         "packed_length": int(np.count_nonzero(sample["input_ids_segment_ids"])),
     }

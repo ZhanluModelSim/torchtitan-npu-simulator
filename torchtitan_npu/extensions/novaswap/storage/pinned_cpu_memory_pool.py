@@ -12,7 +12,8 @@ import threading
 from dataclasses import dataclass
 
 import torch
-from torchtitan.tools.logging import logger
+
+logger = logging.getLogger(__name__)
 
 _SLAB_GROW_ALIGNMENT_BYTES = 1024**3
 

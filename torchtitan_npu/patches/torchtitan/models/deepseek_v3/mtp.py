@@ -19,6 +19,7 @@ it -- so it selects per layer as well, MTP depths included: they run the same
 attention geometry as the layer they were copied from.
 """
 
+import inspect
 from typing import Any
 
 from torchtitan.models.common.decoder import Decoder
@@ -100,6 +101,13 @@ def forward(
 
 
 def apply() -> None:
+    # ebdfc8 already contains the native metadata-aware MTP protocol from
+    # upstream.  The backport below is only for the older pinned API; applying
+    # it on the new class would erase ``mtp_input_valid_masks`` and the native
+    # padding-mask contract used by the DSV4/DSV4.1 migration.
+    native_parameters = inspect.signature(MTPDecoder.forward).parameters
+    if "mtp_input_valid_masks" in native_parameters:
+        return
     # Identity, not a marker attribute: this module replaces exactly one method,
     # and ``MTPDecoder`` inherits ``Decoder``, so a marker would have to avoid
     # colliding with the one the decoder patch leaves on the base class.  A

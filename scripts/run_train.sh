@@ -8,7 +8,7 @@
 # override arguments belong in an example under examples/; extra command-line
 # arguments are passed through unchanged.
 #
-#   ./scripts/run_train.sh --compile.enable --compile.components model --compile.backend inductor
+#   MODULE=my_recipes CONFIG=my_run ./scripts/run_train.sh
 
 set -euo pipefail
 

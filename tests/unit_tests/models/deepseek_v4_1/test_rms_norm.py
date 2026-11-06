@@ -30,7 +30,7 @@ def test_override_reaches_vision_and_preserves_parameter_names():
 
 
 def test_model_config_uses_common_rms_norm():
-    cfg = model_registry("deepseek_v4_1_debugmodel").model
+    cfg = model_registry("deepseek_v4_1_debugmodel")
     assert type(cfg.layers[0].attention.q_norm) is RMSNorm.Config
     assert type(cfg.layers[2].attention.compressor.norm) is RMSNorm.Config
     assert type(cfg.layers[2].attention.indexer.k_norm) is RMSNorm.Config

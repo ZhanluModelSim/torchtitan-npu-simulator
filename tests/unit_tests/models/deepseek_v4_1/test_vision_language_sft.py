@@ -33,9 +33,16 @@ pytestmark = pytest.mark.cpu
 ASSETS = Path(__file__).resolve().parents[3] / "assets"
 
 
+def _unpack(microbatch):
+    inputs = microbatch.as_input_dict()
+    labels = inputs.pop("labels")
+    inputs["num_valid_tokens"] = microbatch.num_valid_tokens
+    return inputs, labels
+
+
 @pytest.fixture(scope="module")
 def tokenizer():
-    return HuggingFaceTokenizer(tokenizer_path=str(ASSETS / "deepseek_v3"))
+    return HuggingFaceTokenizer.Config().build(tokenizer_path=str(ASSETS / "deepseek_v3"))
 
 
 class _StubVisionLanguageEncoder:
@@ -103,7 +110,7 @@ def _loader(
         dp_rank=rank,
         dp_world_size=world,
         max_context_length=512,
-        num_tokens_per_batch=512 * batch_size,
+        num_tokens_per_microbatch=512 * batch_size,
     )
 
 
@@ -181,7 +188,7 @@ def test_streaming_dp_shards_and_resume_round_trip(tmp_path, tokenizer):
             samples = list(islice(loader, 3))
         finally:
             loader.close()
-        shards.append({tuple(labels[labels != -100].tolist()) for _, labels in samples})
+        shards.append({tuple(labels[labels != -100].tolist()) for _, labels in map(_unpack, samples)})
     assert shards[0] and shards[1] and shards[0].isdisjoint(shards[1])
 
     original = _loader(dataset_path, tokenizer, infinite=True)
@@ -190,9 +197,9 @@ def test_streaming_dp_shards_and_resume_round_trip(tmp_path, tokenizer):
         iterator = iter(original)
         next(iterator)
         state = deepcopy(original.state_dict())
-        expected = next(iterator)
+        expected = _unpack(next(iterator))
         restored.load_state_dict(state)
-        actual = next(iter(restored))
+        actual = _unpack(next(iter(restored)))
         assert torch.equal(actual[1], expected[1])
         for key in expected[0]:
             # ``num_valid_tokens`` rides the batch as the int the trainer pops.
@@ -219,7 +226,7 @@ def test_single_context_budget_and_shifted_batch_contract(tmp_path, tokenizer):
         + "\n",
         encoding="utf-8",
     )
-    with pytest.raises(ValueError, match="num_tokens_per_batch == max_context_length"):
+    with pytest.raises(ValueError, match="num_tokens_per_microbatch == max_context_length"):
         _loader(dataset_path, tokenizer, batch_size=2)
 
     recipe = deepseek_v4_1_vision_sft(dataset_path=str(dataset_path), flavor="deepseek_v4_1_debugmodel")
@@ -229,10 +236,10 @@ def test_single_context_budget_and_shifted_batch_contract(tmp_path, tokenizer):
     # One chat context per batch: the SFT graph has no packing stage.
     assert not hasattr(recipe.dataloader.dataset, "num_packing_bins")
     loader = recipe.dataloader.build(
-        tokenizer=tokenizer, dp_rank=0, dp_world_size=1, max_context_length=512, num_tokens_per_batch=512
+        tokenizer=tokenizer, dp_rank=0, dp_world_size=1, max_context_length=512, num_tokens_per_microbatch=512
     )
     try:
-        inputs, labels = next(iter(loader))
+        inputs, labels = _unpack(next(iter(loader)))
     finally:
         loader.close()
     raw = json.loads(dataset_path.read_text())
@@ -342,7 +349,7 @@ def test_grain_sft_preserves_processed_multimodal_fixture(tmp_path, tokenizer, n
     expected_inputs, expected_labels = _processor(dataset_path, tokenizer)._sample(row)
     loader = _loader(dataset_path, tokenizer)
     try:
-        inputs, labels = next(iter(loader))
+        inputs, labels = _unpack(next(iter(loader)))
     finally:
         loader.close()
     torch.testing.assert_close(labels, expected_labels, rtol=0, atol=0)

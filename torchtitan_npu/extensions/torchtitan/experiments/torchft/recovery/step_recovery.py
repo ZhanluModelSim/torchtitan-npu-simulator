@@ -5,20 +5,22 @@
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING
 
 import torch
 import torch_npu
 from torch.distributed._composable.fsdp.fully_shard import FSDPModule
 from torchtitan.models.common.moe import MoE
-from torchtitan.tools.logging import logger
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
     from torch import nn
     from torch.distributed.checkpoint.stateful import Stateful
-    from torchtitan.components.optimizer import LRSchedulersContainer
+    from torchtitan.components.optim import LRSchedulersContainer
 
     from torchtitan_npu.extensions.torchtitan.experiments.torchft.manager import ManagerEx
 
@@ -49,7 +51,7 @@ def reset_rejected_moe_state(model_parts):
     for model in model_parts:
         for module in model.modules():
             if isinstance(module, MoE):
-                module.tokens_per_expert_E.zero_()
+                module.router.tokens_per_expert_E.zero_()
 
 
 class StepRecovery:

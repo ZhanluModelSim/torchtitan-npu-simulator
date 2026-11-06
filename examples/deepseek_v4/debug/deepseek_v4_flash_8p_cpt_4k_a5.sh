@@ -38,7 +38,7 @@ fi
 # narrow the whitelist by appending the default patterns minus the offending
 # one, e.g. excluding wkv (comma-separated in a single argument, matching the
 # 4K entry):
-#   --extension.quantization.fsdp-prequantize-fqns .attention.wq_a,.attention.wq_b,.attention.wo_a,.attention.wo_b,.attention.indexer.wq_b,.moe.shared_experts.w1,.moe.shared_experts.w2,.moe.shared_experts.w3,.moe.routed_experts.inner_experts
+#   --extension.quantization.fsdp-prequantize-fqns .attention.wq_a,.attention.wq_b,.attention.wo_a,.attention.wo_b,.attention.indexer.wq_b,.moe.shared_experts.w13,.moe.shared_experts.w2,.moe.routed_experts.w13,.moe.routed_experts.w2
 # A user whitelist fails fast on any pattern absent from the model, so drop
 # the .moe.shared_experts.* entries on a model without shared experts.
 QUANTIZATION_ARGS=(

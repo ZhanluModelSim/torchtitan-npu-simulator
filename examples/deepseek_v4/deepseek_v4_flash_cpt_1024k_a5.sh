@@ -14,13 +14,13 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
+CONFIG="${CONFIG:-deepseek_v4_flash_cp_cpt}" \
 DSV4_PER_DOC_ALIGNMENT="${DSV4_PER_DOC_ALIGNMENT:-16384}" \
 exec bash "${SCRIPT_DIR}/deepseek_v4_flash_cpt_4k_a5.sh" \
     --training.max-context-length 1048576 \
     --training.num-tokens-per-microbatch-per-dp-rank 1048576 \
     --training.num-tokens-per-train-step 8388608 \
     --parallelism.context-parallel-degree 128 \
-    --parallelism.context-parallel-load-balancer doc_chunk \
     --parallelism.data-parallel-shard-degree 1 \
     --parallelism.data-parallel-replicate-degree 1 \
     "$@"
