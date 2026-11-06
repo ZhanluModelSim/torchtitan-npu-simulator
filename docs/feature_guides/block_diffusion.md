@@ -3,11 +3,11 @@
 Block Diffusion 的规范由
 [`raw_model/block_diff/README.md`](../../torchtitan_npu/simulator/raw_model/block_diff/README.md)
 和同目录的 [`model.py`](../../torchtitan_npu/simulator/raw_model/block_diff/model.py)
-定义，当前 bundle 为 `MODEL_CONTRACT_VERSION=2`。raw 目录只保留这两个文件。
-标准 block diffusion 子契约仍为 v1，新增 ALoDLM 子契约为 v1；native 只对齐
-标准子契约 v1，本次 ALoDLM 增量不修改 native 实现。
+定义，当前 bundle 为 `MODEL_CONTRACT_VERSION=3`。raw 目录只保留这两个文件。
+标准 block diffusion 子契约仍为 v1，通用 LOOP 子契约为 v1；具体论文配方不再
+作为 raw 的独立模型。公开仓的 native 路径只负责已验证的标准训练适配。
 
-`models/block_diffusion` 是独立维护的 TorchTitan 实现，必须人工遵循 raw 契约；
+`models/block_diffusion` 是独立维护的 TorchTitan 训练实现，必须人工遵循 raw 契约；
 运行时不得导入 raw 或工具 loader。工具与测试可以加载规范实现，用于回放、
 算子捕获和比较，不构成 native 的继承层或运行时适配层。
 
@@ -25,7 +25,8 @@ Block Diffusion 的规范由
 | `scripts/block_diffusion/raw_reference.py` | 不触发 NPU 插件初始化的独立参考 loader |
 | `scripts/block_diffusion/workload.py` | 推理调度、分片、通信和采样的语义事件 |
 | `scripts/block_diffusion/training_workload.py` | 实际 CPU/meta 前向、反向和 AdamW 算子捕获 |
-| `scripts/block_diffusion/legacy_state_dict.py` | 旧 stacked-expert 权重格式的显式双向转换 |
+| `scripts/block_diffusion/legacy_state_dict.py` | 旧标准模型 stacked-expert 权重格式的显式双向转换 |
+| `scripts/block_diffusion/recipes/` | 具体论文的数据、额外 head、反馈、停止和训练目标；复用通用 Loop |
 | `tests/unit_tests/models/block_diffusion_reference/` | 数值、状态、工作量及 raw/native 对照验收 |
 
 原始规模是 97 层、hidden 8192、64/8 query/KV heads、head dim 128、词表
@@ -55,9 +56,10 @@ query-head contributions 到 KV heads 的归约，布局转换与 matmul 分开�
 | 路径或能力 | 验收范围 |
 | --- | --- |
 | 独立 raw CPU/meta 训练和推理 | 已有数值、梯度、状态与工作量测试；见参考验收记录 |
-| native exact 训练 logits／loss／全部参数梯度 | 已通过真实 TorchTitan 单 rank FP32 对照，覆盖 dense、一个 shared expert 的 MoE 与两种策略 |
+| native exact 训练 logits／loss／全部参数梯度 | 已通过真实 TorchTitan 单 rank FP32 对照，覆盖 qk_norm=False 的 dense、一个 shared expert 的 MoE 与两种策略 |
 | native converter 保持两种精确 mask | CPU 硬件入口仿真及 native meta ledger 检查通过；未执行真实 NPU |
-| native 推理 KV／多轮去噪 | 尚未适配；raw 推理和独立工具的通过不代表 native 推理已实现 |
+| 通用 Loop 训练适配 | 当前仅在 raw 定义；不从标准 native 的验证推导支持 |
+| 推理引擎／部署 | 不属于本公开训练适配路径；raw 单文件可作为独立对接的模型定义 |
 | native exact + CP | 明确拒绝，尚未实现全局位置与分片所有权语义 |
 | TP／EP／ETP／CP／PP／FSDP 等 native 组合 | 各组合单独验证，不从参考单 rank 或代码注册推导通过 |
 | 原生 NPU 数值训练、性能和收敛 | 不由本页声明；需对应设备和训练证据 |
@@ -89,20 +91,41 @@ attention 的 noncausal 段使用完整可见范围，参数契约依据
 
 ## 独立工具
 
-### ALoDLM 首版 raw 参考
+### 通用 Loop 与外层配方
 
-ALoDLM 在共享 core 上保留 inner-loop 隐状态，并区分 prelude、core、coda。
-本仓先提供 uncached dense 回放、双流训练和 practical 目标，不接入 native
-或深度相关 serving cache。标准 block diffusion 的旧接口和数值行为保持。
-来源、反馈策略差异及计量边界以 raw README 的 ALoDLM 子契约为准。
+`LoopedModel` 只封装共享层区间、carry、外部可微反馈及按需读出。固定深度
+循环不需要 Gate、双流输入或论文 loss；按步控制时，外层自行决定是否继续、
+哪些位置回填和如何训练。`ModelConfig.qk_norm` 是 backbone 选项；True 的
+配置不自动属于 native 标准 v1 的已验证范围。
 
-将工具目录加入 `PYTHONPATH` 后，可执行以下独立训练回放：
+将 `scripts/block_diffusion` 加入 `PYTHONPATH` 后，普通固定深度用法如下：
 
 ```python
 import torch
-from raw_reference import (
-    ALoDLMModel, ALoDLMSpec, ModelConfig,
-    alodlm_training_objective, build_alodlm_batch,
+from raw_reference import LoopedModel, LoopSpec, ModelConfig
+
+config = ModelConfig(num_hidden_layers=4)
+model = LoopedModel(config, LoopSpec(loop_start=1, loop_end=3, max_depth=3))
+ids = torch.tensor([[1, 2, 3, 4]])
+positions = torch.arange(4).unsqueeze(0)
+visible = torch.ones((4, 4), dtype=torch.bool).tril()
+result = model(ids, positions, visible, readout="last")
+logits = result.readouts[-1].logits
+```
+
+`readout="each_step"` 每轮执行 Coda／readout；`"none"` 只推进 latent。
+`project_logits=False` 可只返回 normalized features。外层模型可为这些 features
+接入任意 head，并自行决定是否 detach，而不是由 Loop 固定某篇论文的梯度规则。
+
+ALoDLM 是一个具体组合示例，位于 `scripts/block_diffusion/recipes/alodlm.py`。
+其模型适配器把 Transformer、RoPE、carry norm 和 coda 计算委托给 Loop，
+自身只维护 Gate、teacher/token 反馈、双流数据、采样和 practical objective：
+
+```python
+import torch
+from raw_reference import ModelConfig
+from recipes.alodlm import (
+    ALoDLMModel, ALoDLMSpec, alodlm_training_objective, build_alodlm_batch,
 )
 
 model = ALoDLMModel(
@@ -116,13 +139,20 @@ masked = torch.tensor([[False, True, False, True]])
 batch = build_alodlm_batch(clean, clean, masked, 0.5,
                           block_size=2, mask_token_id=0)
 output = model.rollout_training(batch, exit_depths=((0, 0, 0, 0, 0, 1, 0, 3),))
-objective = alodlm_training_objective(output, batch)
-objective.loss.backward()
+alodlm_training_objective(output, batch).loss.backward()
 ```
 
-现有 `workload.py` 和 `training_workload.py` CLI 仍面向标准子契约，不会因
-bundle 升级而隐式改为 ALoDLM。ALoDLM 首版可通过上述接口做 CPU/meta 或图
-捕获验证；精确测试记录见 [ALoDLM 验收](../test_guides/alodlm_raw_acceptance.md)。
+旧 ALoDLM 调用应从 recipe 导入，`raw_reference` 不保留论文专属别名。
+旧 recipe checkpoint 的 `backbone.*` 需通过
+`recipes.alodlm.load_legacy_recipe_state_dict` 转为 `loop.backbone.*` 后严格加载，
+Gate 参数名称不变。该迁移不改变参数值或训练配方。
+加载时仍需相同的模型／配方配置，尤其是循环区间和深度；strict load 只核对
+参数键与形状，不验证执行策略，也不迁移 optimizer state。
+
+本次 8 种配置的旧版／新版对比中，随机轨迹、loss、全部参数梯度、两次 SGD
+更新和推理输出均逐位一致。详见 [Loop 重构验收](../test_guides/block_diffusion_loop_refactor.md)。
+ALoDLM 的无缓存、全行稠密计算等范围保持，论文背景与原始验收见
+[ALoDLM 记录](../test_guides/alodlm_raw_acceptance.md)。
 
 ### 标准 block diffusion 工具
 
@@ -186,13 +216,13 @@ shared experts。它不是任意 HF checkpoint、优化器状态或 DCP 元数�
 不另外创建 `fix/block-diff-*` 开发分支。
 
 1. 在 raw README 与 model.py 中明确拟修改的结构、mask、状态或精度语义。
-2. 范式新增递增 `MODEL_CONTRACT_VERSION`，并分别标明各子契约版本。
-   标准子契约发生语义变化时递增其版本，先验证规范参考本身。
+2. 新论文优先组合现有 backbone／Loop／外层策略；只有发现可复用机制时才
+   扩展 raw，并递增对应契约。不得简单在 raw 添加论文名模型和专用目标。
 3. 人工更新 native 模型、相关配置、state-dict adapter 与 converter；不得通过
    导入 raw 或复用工具 loader 来规避独立实现。
 4. 同配置、同权重比较 logits、loss、参数梯度和适用的 KV 状态，再验证每个
-   声明支持的并行／后端组合。新范式允许先进入 raw，但必须标注 native 尚未
-   适配；记录明确的不支持项，禁止静默降级为计算代理。
+   声明支持的并行／后端组合。训练适配与外部推理对接分别验收；通用机制
+   不等于任一具体平台已接入，禁止静默降级为计算代理。
 5. 更新支持矩阵和执行证据；没有执行的检查保留为待验证。
 
 独立测试命令：

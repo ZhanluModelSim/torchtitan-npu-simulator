@@ -1,13 +1,16 @@
 # Block Diffusion 规范参考
 
-**模型契约版本：2**（`model.py` 中的 `MODEL_CONTRACT_VERSION`）。本目录只包含
+**模型契约版本：3**（`model.py` 中的 `MODEL_CONTRACT_VERSION`）。本目录只包含
 本规范与独立 PyTorch 参考实现 [`model.py`](model.py)，是本仓库 Block Diffusion
 训练和推理语义的标准。网络配置决定规模，默认小配置不代表固定 checkpoint。
 
-本版本包含两个明确分开的子契约：`STANDARD_BLOCK_DIFFUSION_CONTRACT_VERSION=1`
-保持原有 `BlockDiffusionModel` 行为；`ALODLM_CONTRACT_VERSION=1` 新增下述
-`ALoDLMModel`。Native 目前只对齐标准子契约 v1，不自动获得 ALoDLM 支持。
-下方“结构、训练、推理”先定义标准子契约，ALoDLM 的差异在独立章节说明。
+本版本包含标准 block diffusion 子契约 v1 和通用 LOOP 子契约 v1。
+`ModelConfig` 定义共享 backbone；`BlockDiffusionModel` 提供标准训练／推理，
+`LoopedModel` 提供与论文无关的循环计算机制。具体数据布局、Gate、停止／提交
+策略和训练目标由外层配方组合，不再按论文向本文件追加模型实现。
+Native 当前只对齐已验证的标准子契约，不自动获得 LOOP 支持。
+本公开仓的 native 路径是训练适配。推理平台可以独立接收本文件作为模型定义，
+其框架注册、调度、kernel 映射与验收属于接收方的适配范围。
 
 ## 结构与张量
 
@@ -19,6 +22,10 @@ query/KV heads 为 `Nq/Nkv`，head dimension 为 `D`，词表为 `V`。
 - Q/K/V 形状为 `[B,Nq,S,D]`／`[B,Nkv,S,D]`／`[B,Nkv,S,D]`。
   `Nq` 必须可被 `Nkv` 整除，`D` 为正偶数；`H` 与 `Nq*D` 独立配置。
   attention 与 FFN 的线性层无 bias。
+- `ModelConfig.qk_norm=True` 可在 RoPE 前对每个 Q/K head 的最后一维做 RMSNorm。
+  每层 Q/K 各有 D 个共享于 heads 的权重；默认 False 保持旧参数格式与行为。
+  这是 backbone 选项，不属于循环或某篇论文的专属配置。
+  已验证的标准 v1／native 对照采用默认 `qk_norm=False`；True 不自动属于该支持范围。
 - dense FFN 为 `down(silu(gate(x))*up(x))`。MoE 为逐 token top-k routed
   SwiGLU experts，加 `num_shared_experts` 个可选 shared expert 的输出之和。
   shared expert 数可以为零；`num_experts=0` 时为 dense，不启用 shared experts。
@@ -67,90 +74,65 @@ cross-entropy 之和，`valid_tokens` 是非 ignore 标签数，
   int64 `[B,K]` tensor 则按请求选择，输出 `[B,K,V]`。选择发生在 final norm 前。
 - token 更新、停止、去噪步数和额外 commit 由外部调度，模型不假定统一的 `D+1`。
 
-## ALoDLM 子契约 v1
+## 通用 LOOP 子契约 v1
 
-依据 [ALoDLM 论文 v1](https://arxiv.org/html/2610.04198v1) 的循环架构及训练公式，
-并核对作者发布代码
-[`fe225a99`](https://github.com/amazon-science/ALoDLM/tree/fe225a99e0b5aeff351804e871d7581155d7f27d)。
-本节为独立的稠密参考实现，不是作者代码移植或其 checkpoint 的数值兼容声明。
+`LoopSpec(loop_start, loop_end, max_depth, normalize_carry=False)` 只定义层区间、
+循环上限和可选 carry normalization，不包含 mask token、Gate、loss 或提交规则。
+区间 `[loop_start,loop_end)` 为非空共享 Core；之前是 Prelude，之后是 Coda。
+同一个物理 backbone 被重复调用，循环次数增加不会复制或新增网络参数。
+支持 dense 和 MoE；后者的路由可在每步通过 `RoutingPlan` 明确回放。
 
-### 循环结构与状态
+### 状态与执行接口
 
-`ALoDLMModel(ModelConfig, ALoDLMSpec)` 当前只接受 dense backbone。Spec 用
-`[loop_start, loop_end)` 指定共享 core；prelude 每次 outer 调用执行一次，
-core 和 coda 在每个 inner pass 都执行。下一轮携带 **pre-coda** 隐状态，
-coda 分支只用于本轮 readout；不将 coda 输出反馈成下一轮 carry。
+| 接口 | 语义 |
+| --- | --- |
+| `begin(input_ids, position_ids, attention_mask)` | embedding 加一次 Prelude，返回 depth=0 的 LoopState |
+| `step(state, ...)` | 执行一次共享 Core，返回新状态及可选读出 |
+| `forward(..., steps, readout)` | 无反馈的固定深度便利调用；readout 为 last（默认）、each_step 或 none |
 
-- 主干物理参数不随循环次数复制。新增 ExitGate 为 `Linear(H,1,bias=True)`
-  和 K 个可学习 depth bias；其输入 detach，不通过 gate 给主干传梯度。
-- `qk_norm=True` 默认在每个 head 的 Q/K 上、RoPE 前增加 RMSNorm。
-  `normalize_carry=True` 默认在轮间使用同一个 backbone final norm。
-  这些是显式选项；标准 `BlockDiffusionModel` 不因此增加 QK norm 参数。
-- 每次新 outer 调用重新从 embedding/prelude 初始化；carry 只在 inner
-  passes 中保留。所有 physical rows 继续参与稠密主干和读出，不按退出深度
-  自动剪掉 token 的后续计算。
-- 输入必须给出原始逻辑 `position_ids[B,T]` 与显式布尔 mask `[T,T]`；不能
-  把重排后的 physical row index 直接当成 RoPE 位置。
+`LoopState` 保存 pre-coda carry `[B,S,H]`、原始逻辑位置 `[B,S]`、布尔
+attention mask `[S,S]`、已执行深度和可复用的 RoPE 表。RoPE 表不是 KV cache。
+状态的几何信息在同一次循环内固定，调用方不得修改其 tensor 内容；更换
+序列或位置应重新 begin。新状态保留梯度，step 不原地修改输入状态。
 
-推理 `run_outer(...)` 是固定 schedule 回放：commit depth 与执行 `steps`
-分别提供，Gate 停止概率不是 commit depth。`feedback_policy="cumulative"`
-每轮回填累计提交位置；`"newly_committed"` 只在下一轮回填新提交位置，之后
-保留其 latent 演化。这两个选项分别对应论文反馈公式和发布推理的不同细节，
-不代表两个端到端引擎 profile。提供 `feedback_tokens` 可回放指定 token，
-否则使用各轮 argmax。全部位置均执行 LMHead/ExitGate，包括最后一轮。
+每次 step 的顺序是：
 
-`alodlm_decision` 单独表达提交和停止：entropy 决定新提交集合，累积 hazard
-更新为 `a+(1-a)*lambda`，剩余位置的平均值决定是否停止；到达末轮时有效
-hazard 强制为 1。停止但本 outer 尚无提交时，至少提交剩余位置中 entropy
-最低的一项。默认采用论文的 `<=` 条件；发布代码的严格 `<` 和位置惩罚必须
-通过 `strict_entropy`、`position_penalty` 明确提供。
+1. 若已有 Core pass 且配置启用，先 normalize 前一轮的 raw carry。
+2. 若调用方提供 `feedback[B,S,H]` 和 `feedback_mask[B,S]`，用 where 注入。
+3. 执行共享 Core；其输出成为下一轮的 raw carry。
+4. 按 readout 请求执行 Coda、final norm 和可选 LMHead；读出不改变 carry。
 
-### 双流训练与目标
+`feedback` 是通用 hidden state，既可以是 token embedding，也可以是其他
+可微变换；其选择、累计方式和 detach 决策属于调用方。Core 不认识 gold label、
+已提交 token、confidence 或 halting probability。
+`feedback_mask` 只替换值，不裁剪 Core 的计算行数；所有位置仍参与每次稠密前向。
 
-`build_alodlm_batch(clean_ids, labels, masked, mask_probability, ...)` 构造
-`[B,2S]` 的 clean/noisy 双流，逐 noisy block 稳定排列为 observed-first、
-masked-last，保留原始位置。每行可见同 stream、同 block 的 causal 前缀，
-以及所有此前 clean blocks；noisy 行看不到同块 clean target。
-每个 batch row 是独立序列；随机 corruption 和 packed 文档不在此 helper 中。
-Batch 同时保存 `ignore_index`，目标函数继承这一口径，不能使用冲突的覆盖值。
+`readout=False` 跳过 Coda、final norm 和输出头。
+`readout=True, project_logits=False` 只返回 normalized features，允许外层接入
+任意 head。Loop 本身不创建 Gate；普通固定深度循环无需任何策略模型或专用 loss。
+训练／推理的 grad mode 由调用方控制，通用接口保持 autograd 可用。
 
-`rollout_training(batch, exit_depths=...)` 始终执行完整 K 轮，输出所有深度的
-logits/gates。训练采用累计 **gold embedding** 回填，必须在对应退出轮读出
-之后才能注入标签。可给定退出轨迹回放，或采样条件 Bernoulli gate；有效
-退出深度为 1..K，末轮强制退出。回放不等于从当前策略随机采样。
+### 负载语义
 
-`alodlm_training_objective` 明确采用发布实现的 practical 数学口径：
+设执行 s 次 Core、请求 r 次 readout，则 Transformer 层调用数为：
 
-- Denoiser 使用到采样退出轮为止的 detached 权重，并将剩余概率质量并入
-  该退出轮；逆 mask probability 权重在本批监督 mask 内归一化。
-- Actor 使用每条独立序列的 cost sum 与 decision-log-probability sum 的乘积，
-  再除以监督 mask 总数；第一轮 CE 为 detached baseline。
-- 深度 prior 为 `softmax(-c*depth)`；默认 individual/aggregate 系数为 0.1/1。
-- AR loss 在 clean stream 上做 next-token shift，跨深度平均；最终为
-  `(denoising + actor + AR)/2`。本参考将 CE/reduction 显式置于 FP32；发布代码
-  的 denoiser CE 使用 backbone dtype，二者不声称低精度逐位一致。
+```text
+prelude_layers + s * core_layers + r * coda_layers
+```
 
-这个 practical 目标不声称具有论文基础 joint-KL estimator 的完整无偏性。
-零监督 mask 时 denoising/actor 为零，但只要 clean AR 标签有效，AR loss
-仍然存在。所有 Tensor 变换支持固定形状 meta 回放和真实反向传播。
+`layer_evaluations(steps, readout_count)` 返回这一计数，不包括 embedding、norm
+或输出头，也不是 FLOPs/token 或时延。只在最后读出时 r=1，每轮读出时 r=s，
+纯 latent 循环时 r=0。实际 mask、每步路由、head 和反馈决定其余工作量。
 
-### 负载口径与首版边界
+当前 Loop 是完整窗口、无持久 KV 的参考。Depth-aware cache、虚拟层缓存共享
+和 token pruning 需要单独的后端策略；不在通用 Loop 中假定某种缓存数量公式。
 
-本版是 **uncached dense** 参考，拒绝普通和 depth-aware KV cache 参数。
-不实现 streaming window、cache repair、packed 文档、activation checkpointing、
-ragged batch 调度或优化 serving。完整 readout 历史被保留用于验收，不能据此
-推断优化流式推理的峰值内存。
-推理读出覆盖整个输入窗口，比发布引擎只对初始 masked rows 读出的工作更多；
-不能将本参考的耗时或流量当成作者优化引擎结果。
-本参考还先计算全部 2S 行的 denoising CE 再屏蔽，发布代码只计算监督 masked
-rows；需要精确估计该发行实现的 loss 工作量时，应由后端显式做行选择。
+### 具体配方
 
-`layer_evaluations(s)` 返回 `loop_start+s*(L-loop_start)` 层调用数；它不是
-FLOPs/token。`logical_buffer_count()` 只给出潜在 depth-aware 布局的
-`L+(K-1)*(loop_end-loop_start)` 个 KV 对，不分配或模拟这些 cache。
-例如 L=36、core=[10,26)、K=4 时，两项分别为 114 次层调用和 84 个 KV 对。
-论文明确将 deepest-available fallback 与 shared-coda cache 视为 serving
-近似，未来适配不能把普通 KV cache 或 token 提交深度直接替代它们。
+具体论文应描述如何组合 backbone、Loop 和外层策略。例如 ALoDLM 使用每轮
+readout，再组合自己的 Gate、反馈规则、双流数据和训练目标；这些保存在
+`scripts/block_diffusion/recipes/alodlm.py`，不是 raw 的独立模型范式。
+其他循环方案可以复用同一 begin/step，无需在 raw 中增加论文名分支。
 
 ## 精度与边界
 
@@ -163,10 +145,12 @@ KV 读写转换必须显式生效。router 参数／评分、RMSNorm reduction�
 
 ## 维护与来源
 
-`models/block_diffusion` 必须**人工维护**以符合本规范，不能运行时导入 raw
-模型或工具 loader。修改 raw 语义时先审查并递增契约版本，再人工修改 native
-实现，执行同配置、同权重的 logits／loss／梯度／KV 对照及后端检查；只有
+公开训练侧 `models/block_diffusion` 必须**人工维护**以符合所声明的本规范子集，不能运行时导入 raw
+模型或工具 loader。修改通用 raw 语义时先审查并递增对应契约版本，再人工修改 native
+实现，执行同配置、同权重的 logits／loss／梯度和适用状态的对照及后端检查；只有
 对应证据通过后才能声明 native 对齐。纯格式或文件迁移不改变契约版本。
+向推理平台交付的是同一份独立 `model.py`；公开训练侧的通过结果不代表
+接收方推理框架已完成接入。
 
 历史来源是 `ZhanluModelSim/torchtitan-npu-simulator` 的
 [`feat/npu-simulator` raw 文件](https://github.com/ZhanluModelSim/torchtitan-npu-simulator/blob/2e988ab42d56c43c19c781eb8e9afc1f446693f4/torchtitan_npu/simulator/raw_model/block_diff/model.py)；

@@ -49,20 +49,18 @@ def load_raw_reference() -> ModuleType:
 
 if TYPE_CHECKING:
     from torchtitan_npu.simulator.raw_model.block_diff.model import (
-        ALODLM_CONTRACT_VERSION,
+        LOOP_CONTRACT_VERSION,
         MODEL_CONTRACT_VERSION,
         STANDARD_BLOCK_DIFFUSION_CONTRACT_VERSION,
-        ALoDLMBatch,
-        ALoDLMDecision,
-        ALoDLMModel,
-        ALoDLMObjective,
-        ALoDLMOuterOutput,
-        ALoDLMOutput,
-        ALoDLMSpec,
         Attention,
         BlockDiffusionModel,
         KVCache,
         LayerKV,
+        LoopedModel,
+        LoopOutput,
+        LoopSpec,
+        LoopState,
+        LoopStepOutput,
         ModelConfig,
         MoE,
         PhaseOutput,
@@ -72,32 +70,22 @@ if TYPE_CHECKING:
         TrainingOutput,
         TrainingSpec,
         TransformerBlock,
-        alodlm_attention_mask,
-        alodlm_decision,
-        alodlm_training_objective,
-        build_alodlm_batch,
         training_attention_mask,
     )
 else:
     _reference = load_raw_reference()
     MODEL_CONTRACT_VERSION = _reference.MODEL_CONTRACT_VERSION
     STANDARD_BLOCK_DIFFUSION_CONTRACT_VERSION = _reference.STANDARD_BLOCK_DIFFUSION_CONTRACT_VERSION
-    ALODLM_CONTRACT_VERSION = _reference.ALODLM_CONTRACT_VERSION
-    ALoDLMSpec = _reference.ALoDLMSpec
-    ALoDLMBatch = _reference.ALoDLMBatch
-    build_alodlm_batch = _reference.build_alodlm_batch
-    alodlm_attention_mask = _reference.alodlm_attention_mask
-    ALoDLMOutput = _reference.ALoDLMOutput
-    ALoDLMOuterOutput = _reference.ALoDLMOuterOutput
-    ALoDLMModel = _reference.ALoDLMModel
-    ALoDLMObjective = _reference.ALoDLMObjective
-    alodlm_training_objective = _reference.alodlm_training_objective
-    ALoDLMDecision = _reference.ALoDLMDecision
-    alodlm_decision = _reference.alodlm_decision
+    LOOP_CONTRACT_VERSION = _reference.LOOP_CONTRACT_VERSION
     Attention = _reference.Attention
     BlockDiffusionModel = _reference.BlockDiffusionModel
     KVCache = _reference.KVCache
     LayerKV = _reference.LayerKV
+    LoopedModel = _reference.LoopedModel
+    LoopSpec = _reference.LoopSpec
+    LoopState = _reference.LoopState
+    LoopStepOutput = _reference.LoopStepOutput
+    LoopOutput = _reference.LoopOutput
     ModelConfig = _reference.ModelConfig
     MoE = _reference.MoE
     PhaseOutput = _reference.PhaseOutput
@@ -110,20 +98,18 @@ else:
     training_attention_mask = _reference.training_attention_mask
 
 __all__ = [
-    "ALODLM_CONTRACT_VERSION",
+    "LOOP_CONTRACT_VERSION",
     "MODEL_CONTRACT_VERSION",
     "STANDARD_BLOCK_DIFFUSION_CONTRACT_VERSION",
-    "ALoDLMBatch",
-    "ALoDLMDecision",
-    "ALoDLMModel",
-    "ALoDLMObjective",
-    "ALoDLMOuterOutput",
-    "ALoDLMOutput",
-    "ALoDLMSpec",
     "Attention",
     "BlockDiffusionModel",
     "KVCache",
     "LayerKV",
+    "LoopOutput",
+    "LoopSpec",
+    "LoopState",
+    "LoopStepOutput",
+    "LoopedModel",
     "MoE",
     "ModelConfig",
     "PhaseOutput",
@@ -133,10 +119,6 @@ __all__ = [
     "TrainingOutput",
     "TrainingSpec",
     "TransformerBlock",
-    "alodlm_attention_mask",
-    "alodlm_decision",
-    "alodlm_training_objective",
-    "build_alodlm_batch",
     "load_raw_reference",
     "training_attention_mask",
 ]

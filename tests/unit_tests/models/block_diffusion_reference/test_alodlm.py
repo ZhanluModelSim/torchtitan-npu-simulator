@@ -11,8 +11,9 @@ import pytest
 import torch
 import torch.nn.functional as F
 from raw_reference import BlockDiffusionModel, ModelConfig, load_raw_reference
+from recipes import alodlm as raw
 
-raw = load_raw_reference()
+canonical = load_raw_reference()
 
 
 def config(**changes):
@@ -59,9 +60,11 @@ def fixed_seed():
 
 
 def test_alodlm_contract_is_separate_from_native_standard_contract():
-    assert raw.MODEL_CONTRACT_VERSION == 2
-    assert raw.STANDARD_BLOCK_DIFFUSION_CONTRACT_VERSION == 1
+    assert canonical.MODEL_CONTRACT_VERSION == 3
+    assert canonical.STANDARD_BLOCK_DIFFUSION_CONTRACT_VERSION == 1
+    assert canonical.LOOP_CONTRACT_VERSION == 1
     assert raw.ALODLM_CONTRACT_VERSION == 1
+    assert not any("alodlm" in name.lower() for name in vars(canonical))
 
 
 def test_dual_stream_batch_reorders_observed_first_without_changing_logical_positions():

@@ -458,3 +458,27 @@ def test_unresolved_head_compaction_exists_without_sampling_consumer():
     assert events["head.select"].output.shape == (2, 2, 16)
     assert events["lm_head"].output.shape[0] == 4
     assert not any(name.startswith("sampling.update") for name in events)
+
+
+@pytest.mark.parametrize("tp_size", [1, 2])
+def test_qk_norm_parameters_are_replicated_and_events_precede_rope(tp_size):
+    cfg = config(qk_norm=True)
+    parallel = ParallelSpec(tp_size=tp_size)
+    description = analyze_phase(cfg, phase(), parallel)
+    baseline = analyze_phase(config(qk_norm=False), phase(), parallel)
+    extra_bytes = 2 * cfg.num_hidden_layers * cfg.head_dim * torch.empty((), dtype=cfg.dtype).element_size()
+    for rank, plain in zip(description.ranks, baseline.ranks, strict=True):
+        assert rank.parameter_bytes - plain.parameter_bytes == extra_bytes
+        for layer in range(cfg.num_hidden_layers):
+            events = [event for event in rank.events if event.layer == layer]
+            names = [event.name for event in events]
+            query_norm = events[names.index("q_norm")]
+            key_norm = events[names.index("k_norm")]
+            assert query_norm.inputs[0].shape == (2, cfg.num_attention_heads // tp_size, 4, cfg.head_dim)
+            assert key_norm.inputs[0].shape == (2, cfg.num_key_value_heads // tp_size, 4, cfg.head_dim)
+            assert query_norm.metadata["weight_shape"] == (cfg.head_dim,)
+            assert key_norm.metadata["weight_shape"] == (cfg.head_dim,)
+            assert names.index("q_norm") < names.index("rope.qk")
+            assert names.index("k_norm") < names.index("rope.qk")
+    if tp_size == 1:
+        assert description.ranks[0].parameter_bytes == BlockDiffusionModel(cfg).parameter_memory_bytes()

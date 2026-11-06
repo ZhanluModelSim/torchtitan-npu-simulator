@@ -296,6 +296,9 @@ def _parameter_bytes(c: ModelConfig, p: ParallelSpec) -> int:
     weight = _bytes(c.dtype)
     embedding = c.vocab_size // tp * h * (1 if c.tie_word_embeddings else 2)
     norms = (2 * layers + 1) * h
+    if c.qk_norm:
+        # Head-dimension norm parameters are shared by heads, replicated over TP.
+        norms += 2 * layers * c.head_dim
     attention = layers * 2 * h * c.head_dim * ((c.num_attention_heads + c.num_key_value_heads) // tp)
     if c.num_experts:
         ffn = (
@@ -410,6 +413,9 @@ def analyze_phase(config: ModelConfig, phase: PhaseSpec, parallel: ParallelSpec 
                     mm("q_proj", layer, n, h, heads * d)
                     mm("k_proj", layer, n, h, kv_heads * d)
                     mm("v_proj", layer, n, h, kv_heads * d)
+                    if c.qk_norm:
+                        vector("q_norm", layer, (batch, heads, q, d), compute_dtype="float32", weight_shape=(d,))
+                        vector("k_norm", layer, (batch, kv_heads, q, d), compute_dtype="float32", weight_shape=(d,))
                     events.append(
                         Event(
                             "rope.qk",

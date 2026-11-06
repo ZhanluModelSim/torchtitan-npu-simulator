@@ -1,5 +1,10 @@
 # ALoDLM raw 首版验收
 
+本记录保留对应历史实现阶段的证据。当前 raw 已抽象为通用 Loop，ALoDLM 配方
+位于 `scripts/block_diffusion/recipes/alodlm.py`；新接口、迁移和单文件交付验证见
+[Loop 重构验收](block_diffusion_loop_refactor.md)。公开 native 路径仅为训练适配，
+不把这些结果视为外部推理引擎已接入。
+
 日期：2026-11-05。开发分支：`feat/npu-simulator-local`。
 
 ## 范围与依据
