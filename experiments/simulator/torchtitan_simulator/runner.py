@@ -169,7 +169,13 @@ def _simulate(simulation, timings: HostTimings):
                 logical_named_parameters(model),
                 expert_parallel_degree=simulation.expert_parallel_degree,
             )
-            runtime.capabilities.update(install_balanced_dispatch(runtime.patches, model))
+            runtime.capabilities.update(
+                install_balanced_dispatch(
+                    runtime.patches,
+                    model,
+                    uniform_geometry_source="simulator_uniform_synthetic_spmd_v1",
+                )
+            )
             loss_fn = config.loss.build(compile_config=config.compile)
             loss_fn.set_lm_head(model.lm_head)
             model._skip_lm_head = True
