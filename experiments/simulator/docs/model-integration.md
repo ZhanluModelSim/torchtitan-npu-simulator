@@ -45,6 +45,10 @@ PY
 
 复制已有 block 前逐项核对残差、norm、激活、路由权重位置和并行归约顺序。复用工程组织不意味着复制所有默认值。主包模型层已有的跨层依赖债务不作为新增代码的先例。
 
+Dense（无 MoE）模型的补充事实：`override.common.token_dispatcher.asc` 等 MoE 专属公共 override 不适用（按需省略，不照抄其他 family 的 override 清单）；`install_balanced_dispatch` 对无 router 模型返回 `not-applicable-dense`，不安装任何补丁。smoketest 推荐用**真实几何的层切片**——只减少层数，保留 GQA、QK-norm、SwiGLU、untied head 等全部差异路径与真实维度，参考 `qwen3_32b_smoketest`（`model.layers = model.layers[:n]`）与 `kimi_k3_16layer_reduced`；不要另造只剩普通 block 的小几何。
+
+若上游 torchtitan 已自带目标模型族（如 qwen3），不要复制几何 builder：用字段重绑把上游 Config 转到带 repo-local 协议的子类（参考 `torchtitan_npu/models/qwen3/model.py` 的 `as_npu_config`，过滤 `field.init=False`），几何变化自动跟随上游演进。
+
 | 内容 | 修改位置／参考 |
 | --- | --- |
 | 模型／block／组件配置和构建 | `torchtitan_npu/models/<family>/`；参考 [Kimi model](../../../torchtitan_npu/models/kimi_k3/model.py)、[配置 builder](../../../torchtitan_npu/models/kimi_k3/__init__.py) |
@@ -88,7 +92,10 @@ PY
 | `model(**input_dict)` 与 `loss_fn(..., positions=...)` | loss 返回 `(loss, aux)`；当前合成输入为单文档 next-token 文本，多模态／额外状态需明确扩展协议 |
 | 原生 `parallelize_fn`、SPMD context、clip、optimizer、scheduler | 使用实际训练调用与依赖，不能旁路为手工图模板 |
 | 参数／buffer／梯度清单 | 并行前后名称可对应，本地 shard、dtype、placement 和冻结参数可解释 |
+| `config.model_spec.model.n_layers` | 汇总读取层数；可用 property 从 `layers` 派生，避免与层切片 preset 漂移 |
 | CLI build-only 报告 | 读取 `model.layers` 与 `model.tok_embeddings.weight`；不同结构需明确调整报告，不只改 `simulate()` |
+
+三个易漏的 factory 约定（漏掉时在运行期才暴露）：`TrainingConfig(dtype="float32")`——原始参数 FP32 是全仓捕获约束，runner 按 family 有显式守卫，新 family 需要加对称守卫或明确声明；`ParallelismConfig(context_parallel_load_balancer=None)`——torchtitan 默认非 None，runner 原样透传给 `build_attention_masks`；无 MTP 的模型接收 `num_mtp_layers` 关键字并对非零值显式拒绝。`build_attention_masks` 的最小实现见 [qwen3 model](../../../torchtitan_npu/models/qwen3/model.py)：非 CP 模型显式拒绝 `cp_mesh`/`load_balancer_type`，用原生 `get_attention_masks(positions)` 生成 mask 并注入 `extra_kwargs["attention_masks"]`。
 
 ### 3.3 接入 simulator 的检查清单
 
@@ -105,11 +112,21 @@ PY
 
 ## 4. 接入算子：先原生，后必要兼容
 
-按以下顺序决定实现，避免把模型仿真变成另一套训练实现：
+按以下顺序决定实现，避免把模型仿真变成另一套训练实现。**写代码前先用 dispatch 探针确认算子的后端能力**（几分钟即可决定整条路线）：
 
-1. **原生 torch／CANN 接口健康**：直接执行并由 dispatch 捕获，不再手工补一份同名节点。
-2. **原生接口只有 Meta／autograd 缺口**：用最小探针确认缺失，复用真实 schema 与保存对象，局部补齐。只在有缺口时安装，正常与异常退出都恢复原绑定。
-3. **确实需要保留自定义融合边界**：在 `compat/` 定义 dispatcher custom op、fake/Meta 实现和 autograd。参考 [`compat/kimi.py`](../torchtitan_simulator/compat/kimi.py)，不在模型 forward 中新增 simulator 开关。
+```python
+import torch
+import torch_npu  # AUTOLOAD=0 时需显式导入
+
+for key in ("NPU", "Meta"):
+    print(key, torch._C._dispatch_has_kernel_for_dispatch_key("npu::<算子名>", key))
+```
+
+按探针结果三分：
+
+1. **原生 torch／CANN 接口健康**：直接执行并由 dispatch 捕获，不再手工补一份同名节点。含真实 NPU 训练算子自带厂商 Meta kernel 的情况（qwen3 的 `npu_fusion_attention_v3` 前向）。
+2. **真实 NPU 算子有厂商 Meta 前向、但 Meta 上 autograd 不通**：能力探针 + autograd.Function 桥——前向调用真实算子（真实节点进图），反向调用该算子的真实梯度算子（保存前向返回的统计量如 softmax_max/sum），装桥前断言梯度算子的 schema 参数名；探针发现厂商补齐原生能力时自动回退。参考 [compat/norm.py](../torchtitan_simulator/compat/norm.py)（`npu_rms_norm`）与 [compat/attention.py](../torchtitan_simulator/compat/attention.py)（`npu_fusion_attention_v3`）。**优先于合成算子**：真实算子名进图，下游可直接对齐真实 kernel 边界。
+3. **不存在原生算子**（模型专有融合，如 Kimi KDA/SiTU）：按下述 custom_op 流程注册合成边界并声明 tensor_semantics。
 
 具体注册顺序为 `@torch.library.custom_op` 定义 schema → `register_fake` 定义 Meta 输出 → `register_autograd(..., setup_context=...)` 绑定前反向 → `register_tensor_semantics` 声明原始 overload 的角色与轴。以上在模块加载时静态注册一次；每次 runtime 的 `PatchScope` 只安装／恢复实际调用点，不重复注册 dispatcher 或语义表。
 
@@ -156,10 +173,10 @@ AC 通过原生 `none/full/selective` 策略启用；selective save set 必须�
 | 关卡 | 操作和通过条件 | 参考 |
 | --- | --- | --- |
 | A 配置与构建 | 独立配置、关键层型齐全、实际 override/量化选择正确、非法组合拒绝；校对参数清单与独立几何计数 | [test_config.py](../tests/test_config.py)、[Kimi 配置选择](../tests/test_kimi_capture.py) |
-| B 核心组件 | CPU 数学／状态映射与独立参考对照；Meta F/B 的实际保存输入、dy、梯度与 raw 名称正确 | 主包 `tests/unit_tests/models/`、[融合捕获](../tests/test_kimi_capture.py) |
+| B 核心组件 | CPU 数学／状态映射与独立参考对照；Meta F/B 的实际保存输入、dy、梯度与 raw 名称正确 | 主包 `tests/unit_tests/models/`、[融合捕获](../tests/test_kimi_capture.py)、[qwen3 数值参考](../tests/test_qwen3_numerics.py) |
 | C 单任务 F/B/O | 调用 `simulate()`；所有预期 trainable 参数有正确梯度、图 DAG／引用闭合、buffer 不漂移、状态清单完整 | [DSV4 捕获](../tests/test_dsv4_capture.py)、[Kimi 捕获](../tests/test_kimi_capture.py)、[优化器契约](../tests/test_optimizer_contract.py) |
-| D 并行与 AC | 每条支持路径覆盖 local shape/placement、非零 rank、独立字节及通信完成依赖；对不同层型测 none/full/selective | [Kimi 并行](../tests/test_kimi_parallel.py)、[FSDP 流依赖](../tests/test_fsdp_stream_capture.py) |
-| E 内存与卸载 | 层内／层外、共享 storage、chunk-local、recompute 归属可解释；两种卸载分别及共同启用均保护状态与 payload | [内存交付](../tests/test_memory_delivery.py)、[交错 loss](../tests/memory/test_interleaved_loss_offload.py)、[逐层汇总](../tests/memory/test_layer_offload_summary.py) |
+| D 并行与 AC | 每条支持路径覆盖 local shape/placement、非零 rank、独立字节及通信完成依赖；对不同层型测 none/full/selective | [Kimi 并行](../tests/test_kimi_parallel.py)、[qwen3 并行](../tests/test_qwen3_parallel.py)（锚定 `parameter_layouts` 的独立 shard 数学范式）、[FSDP 流依赖](../tests/test_fsdp_stream_capture.py) |
+| E 内存与卸载 | 层内／层外、共享 storage、chunk-local、recompute 归属可解释；两种卸载分别及共同启用均保护状态与 payload | [内存交付](../tests/test_memory_delivery.py)、[qwen3 卸载](../tests/test_qwen3_offload.py)、[交错 loss](../tests/memory/test_interleaved_loss_offload.py)、[逐层汇总](../tests/memory/test_layer_offload_summary.py) |
 | F 量化与交付 | 只验证承诺支持的 recipe 组合；实际 code/scale、梯度和自定义语义完整；串行两次和异常退出不泄漏状态 | [Kimi 量化](../tests/test_kimi_quantization.py)、[runtime 恢复](../tests/test_runtime.py)、[语义交付](../tests/test_custom_tensor_semantics_delivery.py) |
 
 最小组合应含 world=1、FSDP/HSDP、适用的 TP／EP／CP、首末 rank、AC 三种模式；再补实际会改变执行的交叉组合和量化路径，不机械做完整笛卡尔积。明确不支持的组合应有拒绝测试与说明。

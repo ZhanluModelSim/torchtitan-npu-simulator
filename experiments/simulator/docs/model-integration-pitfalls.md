@@ -2,6 +2,16 @@
 
 本页保存从现有模型获得的可复用经验。先按[接入工作流](model-integration.md)确定变更和验收范围；此处用于解释常见错误的原因，不把某次历史测试结果当作新模型通过证据。
 
+## 新 family 接入时运行期才暴露的约定
+
+| 症状 | 根因 | 正确处理 |
+| --- | --- | --- |
+| 捕获完成后 `AttributeError: 'Config' object has no attribute 'n_layers'` | runner 汇总读取 `model_spec.model.n_layers`，上游/自建 Config 未必有该字段 | 在 Config 上提供 property 从 `layers` 派生（层切片 preset 不会漂移） |
+| 自建 `build_attention_masks` 对 load_balancer_type 立即 raise | torchtitan `ParallelismConfig.context_parallel_load_balancer` 默认非 None，runner 原样透传 | factory 显式 `ParallelismConfig(context_parallel_load_balancer=None)`（Kimi/qwen3 均如此） |
+| MoE 模型直接换 dense 模型后 `install_balanced_dispatch` 报"requires verified balanced routing" | 旧版对无 router 模型直接 raise | 现已对 dense 返回 `not-applicable-dense`；新 family 应在捕获测试中断言该能力标记 |
+| 数值参考对照 attention 偏差巨大 | 上游 `FusedQKVLinear` 的融合权重**按 KV 组交织**（`r_dim = heads_per_kv + 2`，每组 [Q×hpk, K, V]），不是 [Wq;Wk;Wv] 拼接；state dict 经 hook 转回 wq/wk/wv | 参考实现按 `view(B, S, n_kv, r_dim, hd)` 切片，见 [test_qwen3_numerics.py](../tests/test_qwen3_numerics.py) |
+| varlen 元数据传给 NPU 算子后行为异常 | Ascend `actual_seq_qlen/kvlen` 是**不含前导 0** 的累加和；`VarlenMetadata.cu_seq_q` 以 0 开头 | 传 `cu_seq_q[1:]`；约定来源是 torch_npu binding docstring，不确定时先读 docstring 再探测 |
+
 ## 构建与配置正常，实际路径却不对
 
 | 症状 | 常见原因／应检查的位置 | 正确处理 |
