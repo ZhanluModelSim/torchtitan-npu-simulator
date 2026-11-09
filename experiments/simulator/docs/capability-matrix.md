@@ -22,6 +22,7 @@
 | --- | --- | --- |
 | DP/FSDP/HSDP、EP、TP/SP、CP | 按原生 parallelize 与合法 mesh 执行；单进程捕获一个 logical rank；各模型组合以对应测试为准，不代表全部并行度笛卡尔积 | `compat/distributed.py`；[test_dsv4_capture.py](../tests/test_dsv4_capture.py)、[test_kimi_parallel.py](../tests/test_kimi_parallel.py) |
 | 原生通信与 autograd | functional/c10d/DTensor transport、实际 group/ranks、归约到 clip/update 的依赖；fake process group 不证明真实 HCCL 性能 | [test_native_collectives.py](../tests/capture/test_native_collectives.py)、[test_fsdp_group_capture.py](../tests/test_fsdp_group_capture.py) |
+| 通信语义事实 v1 | 四个精确 AG／RS／AR／A2A 原语的实际组、稳定归约和缓冲事实；已证明的 EP 全组分流及反向转置；其他来源缺完整事实时明示 unresolved，不代表已有性能预测 | [通信事实契约](capture-runtime.md#通信语义事实-v1)、[test_collective_facts.py](../tests/capture/test_collective_facts.py) |
 | EP single exchange | DSV4/Kimi 共用原生 functional single 适配；count/data/score 顺序和异常恢复；均衡路由是声明假设 | [EP 交换说明](ep-single-transport.md)、[test_routing.py](../tests/test_routing.py) |
 | 流与事件等待 | 同流前沿、event record 快照、wait_event/wait_stream、零耗时控制节点；无等待的流保持独立 | [流控制依赖](stream-control-dependencies.md)、[test_fsdp_stream_capture.py](../tests/test_fsdp_stream_capture.py) |
 | FSDP 通信视图 | 默认隐藏 FSDP scope 非通信准备工作，保留通信/模型计算/控制依赖；源图保留作审计，内存不跟随过滤 | [捕获契约](capture-runtime.md#fsdp-通信视图)、[test_fsdp_communication_view.py](../tests/capture/test_fsdp_communication_view.py) |

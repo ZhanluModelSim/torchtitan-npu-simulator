@@ -356,9 +356,15 @@ class OpDispatchCapture(TorchDispatchMode):
             annotations.update(optimizer_annotations(list(binding.tensor_lists[0])))
         operands = transport_operands(func, args)
         source_op_id = self.producer_op(operands.inputs[0]) if operands is not None else None
+        from torchtitan_simulator.capture.collective_facts import native_collective_facts
 
+        collective_facts = (
+            native_collective_facts(func, args, kwargs, operands, result) if operands is not None else None
+        )
         if operands is not None:
             attrs.update(operands.attributes())
+        if collective_facts is not None:
+            attrs["collective_facts"] = collective_facts
         module_path = self.module_path_tracker.current_path() if self.module_path_tracker else ""
         op_id = self._record_event(
             str(func),
