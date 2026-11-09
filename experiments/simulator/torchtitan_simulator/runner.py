@@ -112,6 +112,12 @@ def _simulate(simulation, timings: HostTimings):
             "but the model defines A_log/dt_bias in float32. Use mixed_precision_param=bfloat16 for BF16 compute, "
             "or memory_parameter_storage_dtype for a storage-only estimate. Build-only can inspect bfloat16."
         )
+    if prepared.trainer.model_spec.name == "qwen3" and prepared.trainer.training.dtype != "float32":
+        raise ValueError(
+            "Qwen3 capture requires training.dtype=float32: the fused AdamW gradient manifest and the static "
+            "memory accounting are validated for FP32 original parameters only. Use mixed_precision_param=bfloat16 "
+            "for BF16 compute, or memory_parameter_storage_dtype for a storage-only estimate."
+        )
     simulation = prepared.simulation
     config = prepared.trainer
     with meta_runtime() as runtime:

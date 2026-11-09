@@ -7,6 +7,7 @@ from collections import Counter
 
 from torchtitan_simulator.config import SimulationConfig
 from torchtitan_simulator.runner import simulate
+from torchtitan_simulator.validation import validate_workload
 
 
 def _all_nodes(workload):
@@ -15,8 +16,6 @@ def _all_nodes(workload):
 
 def test_native_qwen3_capture_keeps_real_fused_attention_and_full_gradients():
     workload = simulate(SimulationConfig(config="qwen3_32b_smoketest", seq_len=128))
-    from torchtitan_simulator.validation import validate_workload
-
     validation = validate_workload(workload)
     assert validation["graph_acyclic"] and validation["peak_storage_unique"]
 
@@ -74,3 +73,7 @@ def test_native_qwen3_capture_keeps_real_fused_attention_and_full_gradients():
     assert annotations["memory_plan"] is not None
     assert annotations["memory_summary"] is not None
     assert annotations["fsdp_communication_view"] is not None
+    # Dense decoders take the no-router early return in the balanced dispatch
+    # installer; lock the capability marker against accidental regressions.
+    assert annotations["runtime_capabilities"]["ep_token_exchange"] == "not-applicable-dense"
+    assert annotations["runtime_capabilities"]["ep_token_dispatcher_classes"] == 0

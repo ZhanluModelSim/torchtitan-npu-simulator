@@ -105,6 +105,12 @@ def install_meta_fusion_attention_autograd(scope):
         )
     if all(gradient is not None for gradient in gradients):
         return "native"
+    # Mirror the RMSNorm bridge contract check: the gradient op must keep the
+    # documented input order. The return layout (dq, dk, dv, pse placeholder,
+    # scalar tail) is positional-only knowledge for torch_npu 2.14.0.dev20260918.
+    grad_schema = torch.ops.npu.npu_fusion_attention_grad_v3.default._schema
+    if [argument.name for argument in grad_schema.arguments][:5] != ["query", "key", "value", "dy", "head_num"]:
+        raise RuntimeError(f"Fusion attention backward contract requires review: {grad_schema}")
     spmd_types.register_local_autograd_function(_FusionAttentionV3MetaAutograd)
 
     seam = varlen_attention._fusion_attention_v3

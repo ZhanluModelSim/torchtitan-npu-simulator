@@ -71,5 +71,8 @@ def as_npu_config(upstream: _UpstreamQwen3Model.Config) -> "Qwen3Model.Config":
     The upstream config tree is built inside the calling factory, so the
     shallow field copy still yields an independent tree per call while
     tracking any future upstream fields without duplicating geometry code.
+    ``field.init=False`` fields are derived, not constructor inputs.
     """
-    return Qwen3Model.Config(**{field.name: getattr(upstream, field.name) for field in fields(upstream)})
+    return Qwen3Model.Config(
+        **{field.name: getattr(upstream, field.name) for field in fields(upstream) if field.init}
+    )

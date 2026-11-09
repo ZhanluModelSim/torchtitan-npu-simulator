@@ -30,7 +30,7 @@ python -m pytest -q tests/test_qwen3_capture.py
 | dense GQA 融合 attention | `torchtitan_npu/override/common/varlen_attention.py` | `AscVarlenAttention`：真实 NPU kernel（见下节） |
 | Meta autograd 桥 | `torchtitan_simulator/compat/attention.py` | 复刻 [norm.py](../torchtitan_simulator/compat/norm.py) 模式：能力探针 → autograd.Function 桥 |
 
-独立预期（验收参考，不以实现自证）：完整几何 32,762,118,144 参数（≈32.76B）；可训练参数 64×9+3=579（4 层切片为 39），全部 FP32 梯度。
+独立预期（验收参考，不以实现自证）：完整几何 32,762,123,264 参数（≈32.76B，含 final norm 5,120）；可训练参数 64×9+3=579（4 层切片为 39），全部 FP32 梯度。
 
 ## 3. Attention 路线：真实融合算子直捕
 
@@ -55,8 +55,11 @@ python -m pytest -q tests/test_qwen3_capture.py
 | 关卡 | 内容 | 结果与证据 |
 | --- | --- | --- |
 | A 配置与构建 | build-only：13 处 RMSNorm override（含每层 qk_norm）+ 4 处 AscVarlenAttention override 全命中；非法 `num_mtp_layers`、CP、load balancer 显式拒绝 | 通过（容器实跑） |
+| B 核心组件数值 | 上游 GQAttention 数学（**按 KV 组交织的融合 QKV**，r_dim=heads_per_kv+2、QK-Norm 在 RoPE 前、逐头、带可学习权重、half-split RoPE float32 上抛、GQA 广播、输出折叠）与 SwiGLU FFN 对手写独立参考（HF Qwen3 约定）：attention 最大误差 <1e-5、FFN <1e-5（CPU；融合内核以 causal SDPA shim 替代——v3 无 CPU 后端）。**覆盖范围是上游组件数学**；`AscVarlenAttention` 的 TND 打包参数（`cu_seq_q[1:]`、mask、pre_tockens）仅有结构层验证（见 §4-C/D 的节点计数与形状断言），数值验证依赖真机（§5-1） | [test_qwen3_numerics.py](../tests/test_qwen3_numerics.py) |
 | C 单任务 F/B/O（smoke） | `test_qwen3_capture.py`：39/39 梯度精确 FQN 集合且全 FP32；4+4 v3/grad_v3；17+17 `npu_rms_norm`/`_backward`；fused AdamW 更新数与 shape 契约；`memory_plan`/`memory_summary`/`fsdp_communication_view` 齐备；全模板无环、前驱闭合 | 1 passed |
 | C 单任务 F/B/O（完整几何） | 手工运行 `qwen3_32b`（64 层）：F 5242 / B 6676 / OPT 1171 节点全无环；579/579 梯度 FP32；64+64 v3/grad_v3；257+257 rms_norm；内存计划齐备 | 通过 |
+| D 并行与 AC | `test_qwen3_parallel.py` 10 组合：FSDP2 首末 rank、DDP2、TP2+FSDP2 首末、HSDP4 末、HSDP+TP8 中间 rank、TP2×full/selective AC、FSDP8 末。独立 shard 数学（TP 轴按投影类型、FSDP 切 dim0）逐参数比对 local_shape；内存字节公式 `param=sum(shard)×4`、`opt=2×param+39×4` 独立复算；v3 局部头数 `(16, 64/tp, 128)`/`(16, 8/tp, 128)`；TP 偏和在下一层 norm 前完成（含 SP 形状 `(1, 16/tp, 5120)`） | 10 passed |
+| E 内存与卸载 | `test_qwen3_offload.py` 3 测试：AC=full + 双卸载产生 `simulator.activation_d2h/h2d` 各 4（逐层）、`optimizer_h2d/d2h` 各 1、等待依赖增加；fwd/bwd/opt 三阶段峰值全面下降（49.9→21.8 / 63.9→35.8 / 56.1→28.0 GB）；单独 optimizer 卸载只降 opt 峰值；开关关闭时零传输节点 | 3 passed |
 | 共享层回归 | `test_routing.py`+`test_config.py`（42 passed）；`test_kimi_capture.py`（13 passed）；`test_dsv4_capture.py`（15 passed）——dense 无 router 的 `install_balanced_dispatch` 早退不改变 MoE 模型行为 | 全部通过 |
 
 ## 5. 明确不支持与未覆盖
@@ -65,12 +68,12 @@ python -m pytest -q tests/test_qwen3_capture.py
 
 **未验证/后续工作**（不因本文声称已支持）：
 
-1. **并行组合（关卡 D）**：当前回归仅 world=1（FSDP mesh size=1 路径）；world=2/4 的 FSDP/HSDP、TP/SP 组合、首末 rank 与非均匀 shard 尚未补测试。
-2. **内存与卸载（关卡 E）**：激活/优化器卸载对 dense 的专项验证未做（开关本身为公共机制）。
-3. **数值验证（关卡 B 的 attention 部分）**：`npu_fusion_attention_v3` 无 CPU kernel；CPU 参考需经 flex 前向或手写 GQA+QK-Norm 对照。Meta 捕获不证明真实 NPU 数值、HCCL 行为或 kernel 性能。
-4. **量化（关卡 F）**：MXFP8 未接入验证（全 Linear 理论可复用，按流程后置）。
-5. **真实 NPU 数值/性能**：本仓不证明；`AscVarlenAttention` 的真机行为需真机验证后回填。
-6. **acceptance.py**：仍只覆盖 DSV4 四结构，Qwen3 需要各自验收脚本。
+1. **数值验证（融合内核与打包层）**：`npu_fusion_attention_v3` 无 CPU kernel，上游组件数学已由 SDPA shim 参考验证（见 §4-B），但融合内核自身与 `AscVarlenAttention` 的 TND 打包参数（`cu_seq_q[1:]` 推导、mask 尺寸、pre_tockens/next_tockens 取值）需真机数值验证；Meta 捕获不证明 HCCL 行为或 kernel 性能。
+2. **量化（关卡 F）**：MXFP8 未接入验证（全 Linear 理论可复用，按流程后置）。
+3. **selective AC 的 "attention" 类目**：`selective_ac.py` 的 attention 算子枚举不含 `npu.npu_fusion_attention_v3.default`，显式选择该类目时对融合 attention 边界不生效（默认 selective 策略不受影响）；属既有枚举与新算子的适配缺口，接入前需单独验证保存集语义。
+4. **真实 NPU 数值/性能**：本仓不证明；`AscVarlenAttention` 的真机行为需真机验证后回填。
+5. **acceptance.py**：仍只覆盖 DSV4 四结构，Qwen3 需要各自验收脚本。
+6. **更大规模并行**：world>8 组合、TP=4/8、非均匀 shard 尾部（如 vocab 不整除场景）未覆盖；当前 10 组合覆盖 FSDP/HSDP/DDP/TP×AC 的代表性路径。
 
 ## 6. 跨仓提示
 
