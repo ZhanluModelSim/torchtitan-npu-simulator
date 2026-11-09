@@ -12,6 +12,9 @@ torchtitan @ git+https://gitcode.com/GitHub_Trending/to/torchtitan.git@ebdfc8c2a
 triton-ascend==3.2.1
 attn-gym==0.0.16
 grain==0.2.18
+renderers==0.1.11
+spmd_types==0.2.5
+torch_remat==0.2.2
 pybind11==3.0.4
 numpy
 PyYAML
