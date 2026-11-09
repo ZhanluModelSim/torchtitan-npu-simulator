@@ -43,11 +43,7 @@ def test_native_qwen3_capture_keeps_real_fused_attention_and_full_gradients():
 
     assert all(template.is_acyclic for template in workload.step_templates.values())
     nodes = _all_nodes(workload)
-    assert all(
-        predecessor in {node.op_id for node in nodes}
-        for node in nodes
-        for predecessor in node.predecessors
-    )
+    assert all(predecessor in {node.op_id for node in nodes} for node in nodes for predecessor in node.predecessors)
 
     op_types = Counter(node.annotations["raw_op_type"] for node in nodes)
     # The delivered graph keeps the real NPU kernel boundaries: one fused
@@ -77,3 +73,20 @@ def test_native_qwen3_capture_keeps_real_fused_attention_and_full_gradients():
     # installer; lock the capability marker against accidental regressions.
     assert annotations["runtime_capabilities"]["ep_token_exchange"] == "not-applicable-dense"
     assert annotations["runtime_capabilities"]["ep_token_dispatcher_classes"] == 0
+
+    memory = annotations["memory_plan"]
+    forward = [event for event in memory.raw_events if event.raw_op_type == "npu.npu_fusion_attention_v3.default"]
+    backward = [event for event in memory.raw_events if event.raw_op_type == "npu.npu_fusion_attention_grad_v3.default"]
+    for event in forward:
+        output = event.outputs[0]
+        # Match actual storage, so a same-shape placeholder cannot satisfy the
+        # backward activation dependency or its saved-value lifetime.
+        consumers = [grad for grad in backward if any(ref.storage_key == output.storage_key for ref in grad.inputs)]
+        assert len(consumers) == 1, "Attention backward must consume its real forward output"
+        assert any(
+            slot.storage_key == output.storage_key and slot.unpack_seq >= consumers[0].seq_idx
+            for slot in memory.autograd_saved_tensors
+        )
+        mask = next(ref for ref in event.inputs if ref.dtype == "bool")
+        assert mask.shape == (2048, 2048)
+        assert mask.num_bytes == 2048 * 2048

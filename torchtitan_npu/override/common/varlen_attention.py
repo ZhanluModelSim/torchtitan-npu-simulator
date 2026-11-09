@@ -77,9 +77,7 @@ class AscVarlenAttention(VarlenAttention):
                 f"AscVarlenAttention supports full causal attention only, got window_size={self.window_size}"
             )
         if not isinstance(attention_masks, VarlenMetadata):
-            raise TypeError(
-                f"AscVarlenAttention requires VarlenMetadata, got {type(attention_masks).__name__}"
-            )
+            raise TypeError(f"AscVarlenAttention requires VarlenMetadata, got {type(attention_masks).__name__}")
         batch, length, hq, head_dim = q_BLNH.shape
         hkv = k_BLNH.shape[2]
         if v_BLNH.shape[-1] != head_dim:
@@ -92,12 +90,12 @@ class AscVarlenAttention(VarlenAttention):
         # Ascend varlen convention: cumulative document lengths WITHOUT the
         # leading zero (cu_seq_q carries [0, s1, s1+s2, ...]).
         actual_seq = attention_masks.cu_seq_q[1:].to(torch.int64)
-        mask_len = max(length, attention_masks.max_k)
+        # sparse_mode=7 consumes a fixed compressed causal mask, independent
+        # of the document lengths carried by actual_seq.
+        mask_len = 2048
         causal_mask = getattr(self, "_causal_mask", None)
-        if causal_mask is None or causal_mask.shape[0] < mask_len or causal_mask.device != query.device:
-            causal_mask = torch.triu(
-                torch.ones(mask_len, mask_len, dtype=torch.bool, device=query.device), diagonal=1
-            )
+        if causal_mask is None or causal_mask.device != query.device:
+            causal_mask = torch.triu(torch.ones(mask_len, mask_len, dtype=torch.bool, device=query.device), diagonal=1)
             self._causal_mask = causal_mask
         out = _fusion_attention_v3(
             query=query,

@@ -40,7 +40,7 @@ class _FusionAttentionV3MetaAutograd(torch.autograd.Function):
         )
         # (output, softmax_max, softmax_sum, softmax_in placeholder, seed, offset)
         output, softmax_max, softmax_sum = result[0], result[1], result[2]
-        ctx.save_for_backward(query, key, value, atten_mask, actual_seq, softmax_max, softmax_sum)
+        ctx.save_for_backward(query, key, value, atten_mask, actual_seq, softmax_max, softmax_sum, output)
         ctx.head_num = head_num
         ctx.scale = scale
         ctx.pre_tockens = pre_tockens
@@ -51,7 +51,7 @@ class _FusionAttentionV3MetaAutograd(torch.autograd.Function):
     # Fixed gradient arity follows Function outputs; the base stub uses variadic args.
     # pyrefly: ignore [bad-override]
     def backward(ctx, dy):
-        query, key, value, atten_mask, actual_seq, softmax_max, softmax_sum = ctx.saved_tensors
+        query, key, value, atten_mask, actual_seq, softmax_max, softmax_sum, output = ctx.saved_tensors
         gradients = torch.ops.npu.npu_fusion_attention_grad_v3(
             query=query,
             key=key,
@@ -62,6 +62,7 @@ class _FusionAttentionV3MetaAutograd(torch.autograd.Function):
             atten_mask=atten_mask,
             softmax_max=softmax_max,
             softmax_sum=softmax_sum,
+            attention_in=output,
             scale_value=ctx.scale,
             keep_prob=1.0,
             pre_tockens=ctx.pre_tockens,
