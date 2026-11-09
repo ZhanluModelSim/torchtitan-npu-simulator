@@ -314,11 +314,3 @@ class DeepSeekV41StateDictAdapter(DeepSeekPEFTAdapter, DeepSeekV3StateDictAdapte
                     hf_state_dict[key] = value
 
         return hf_state_dict
-
-    def _map_from_hf_layer_key(self, abstract_key: str, layer_num: str) -> tuple[str, str]:
-        return self.from_hf_map[abstract_key], layer_num
-
-    def _map_to_hf_layer_key(self, key: str, to_hf_map: dict[str, str]) -> tuple[str, str]:
-        abstract_key = re.sub(r"(\d+)", "{}", key, count=1)
-        layer_num = re.search(r"\d+", key).group(0)  # pyrefly: ignore [missing-attribute]
-        return to_hf_map[abstract_key], layer_num

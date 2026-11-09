@@ -67,6 +67,28 @@ def _merged_hf_dict() -> dict[str, torch.Tensor]:
     return _base_hf_dict() | _vision_hf_dict()
 
 
+@pytest.mark.parametrize("flavor", ["deepseek_v4_1_debugmodel_text", "deepseek_v4_1_debugmodel"])
+def test_layer_weights_round_trip_for_text_and_multimodal(flavor):
+    config = model_registry(flavor)
+    adapter = DeepSeekV41StateDictAdapter(model_config=config, hf_assets_path=None)
+    hf_weights = {
+        "layers.3.attn.wq_a.weight": torch.arange(12, dtype=torch.float32).reshape(3, 4),
+        "layers.3.ffn.gate.weight": torch.arange(8, dtype=torch.float32).reshape(2, 4),
+    }
+
+    local = adapter.from_hf(hf_weights)
+    torch.testing.assert_close(
+        local["layers.3.attention.wq_a.weight"], hf_weights["layers.3.attn.wq_a.weight"], rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        local["layers.3.moe.router.gate.weight"], hf_weights["layers.3.ffn.gate.weight"], rtol=0, atol=0
+    )
+    restored = adapter.to_hf(local)
+    assert restored.keys() == hf_weights.keys()
+    for key, value in hf_weights.items():
+        torch.testing.assert_close(restored[key], value, rtol=0, atol=0)
+
+
 class TestVisionAdapterOwnership:
     """Unit tests for DeepSeekV41VisionStateDictAdapter ownership helpers."""
 

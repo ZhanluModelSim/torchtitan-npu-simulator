@@ -40,9 +40,7 @@ def _shard_engram_tables(
             ignored_params.add(module.weight)
             # A table FSDP does not manage still has replicas along the sparse
             # data-parallel axes, and their gradients have to be summed.
-            wire_replicas = getattr(module, "wire_sparse_grad_replicas", None)
-            if wire_replicas is not None:
-                wire_replicas(edp_mesh=edp_mesh, edp_mesh_dims=edp_mesh_dims)
+            module.wire_sparse_grad_replicas(edp_mesh=edp_mesh, edp_mesh_dims=edp_mesh_dims)
             init_buffer = getattr(module, "init_elastic_buffer", None)
             if init_buffer is not None:
                 init_buffer(param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param])
