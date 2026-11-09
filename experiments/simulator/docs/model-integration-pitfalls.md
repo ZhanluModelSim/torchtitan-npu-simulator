@@ -55,6 +55,8 @@ Meta 输出可以新建；autograd 应保存的前向输入不能用同 shape �
 
 原生 CANN 可用时不要手工再插一个融合节点；兼容层只补已确认的 Meta/autograd 缺口，并保持原始 raw overload。真实设备 provider 与纯 Meta 虚拟实现分开说明，不能因捕获通过宣称 kernel 数值可用。
 
+桥接真实算子（如 `npu_fusion_attention_v3`）时，保存集按其梯度 kernel 的**完整 schema** 推导：所有可选输入都是潜在必要保存值——`npu_fusion_attention_grad_v3` 的 `attention_in` 就是前向输出 out（Flash 反向契约 q/k/v/out/LSE），漏存它时 Meta 形状推断照常通过，捕获、并行与卸载测试可以全部绿，缺陷只表现为 B 模板缺失对前向输出的保存激活依赖；直到用 storage_key 匹配（同形状占位无法通过）加 `autograd_saved_tensors` 生命周期断言才暴露并锁住（[test_qwen3_capture.py](../tests/test_qwen3_capture.py)、e00dc90a）。Meta 前向通过不构成保存集完整的证据。
+
 ## 首轮与稳态、chunked loss 和阶段边界
 
 `simulate()` 已默认结构预热。首个 optimizer 更新常有惰性 state 初始化；稳定 O 图不再出现这些创建算子，但状态仍驻留，不能少算优化器显存或卸载量。每轮计数 reset、fill 等仍有意义，禁止按名称删除。底层 `run_simulation_step()` 不自动执行预热，测试不能混淆两种入口。

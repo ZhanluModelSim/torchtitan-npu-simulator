@@ -125,7 +125,7 @@ for key in ("NPU", "Meta"):
 按探针结果三分：
 
 1. **原生 torch／CANN 接口健康**：直接执行并由 dispatch 捕获，不再手工补一份同名节点。含真实 NPU 训练算子自带厂商 Meta kernel 的情况（qwen3 的 `npu_fusion_attention_v3` 前向）。
-2. **真实 NPU 算子有厂商 Meta 前向、但 Meta 上 autograd 不通**：能力探针 + autograd.Function 桥——前向调用真实算子（真实节点进图），反向调用该算子的真实梯度算子（保存前向返回的统计量如 softmax_max/sum），装桥前断言梯度算子的 schema 参数名；探针发现厂商补齐原生能力时自动回退。参考 [compat/norm.py](../torchtitan_simulator/compat/norm.py)（`npu_rms_norm`）与 [compat/attention.py](../torchtitan_simulator/compat/attention.py)（`npu_fusion_attention_v3`）。**优先于合成算子**：真实算子名进图，下游可直接对齐真实 kernel 边界。
+2. **真实 NPU 算子有厂商 Meta 前向、但 Meta 上 autograd 不通**：能力探针 + autograd.Function 桥——前向调用真实算子（真实节点进图），反向调用该算子的真实梯度算子，装桥前断言梯度算子的 schema 参数名；探针发现厂商补齐原生能力时自动回退。参考 [compat/norm.py](../torchtitan_simulator/compat/norm.py)（`npu_rms_norm`）与 [compat/attention.py](../torchtitan_simulator/compat/attention.py)（`npu_fusion_attention_v3`）。**优先于合成算子**：真实算子名进图，下游可直接对齐真实 kernel 边界。**保存集按梯度算子的完整 schema 推导**——所有可选输入（如 `attention_in` 即前向输出、softmax 统计量）都是潜在必要保存值；Meta 前向通过不证明保存集完整，用 storage_key 匹配与保存生命周期断言锁定（见[常见问题](model-integration-pitfalls.md)）。
 3. **不存在原生算子**（模型专有融合，如 Kimi KDA/SiTU）：按下述 custom_op 流程注册合成边界并声明 tensor_semantics。
 
 具体注册顺序为 `@torch.library.custom_op` 定义 schema → `register_fake` 定义 Meta 输出 → `register_autograd(..., setup_context=...)` 绑定前反向 → `register_tensor_semantics` 声明原始 overload 的角色与轴。以上在模块加载时静态注册一次；每次 runtime 的 `PatchScope` 只安装／恢复实际调用点，不重复注册 dispatcher 或语义表。
