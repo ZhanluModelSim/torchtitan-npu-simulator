@@ -8,6 +8,7 @@
 | --- | --- | --- |
 | DeepSeek-V4 | smoke、flash、pro、pro_20t 结构 preset；原生 attention/compressor/indexer loss/mHC/MoE/shared expert；MTP 0/1 有回归 | `config.py`、`presets.py`；[test_dsv4_capture.py](../tests/test_dsv4_capture.py) |
 | Kimi K3 | 原生模型与 loss、MoE、共享组件；KDA/attention/SiTU 采用显式 Meta 虚拟融合；不提供真实 KDA 硬件 kernel | `compat/kimi.py`；[test_kimi_capture.py](../tests/test_kimi_capture.py)、[test_kimi_parallel.py](../tests/test_kimi_parallel.py) |
+| Qwen3-32B | dense：上游 torchtitan qwen3 几何（64 层、GQA 64:8、QK-norm、SwiGLU、不 tie 头）；attention 走真实融合算子 `npu_fusion_attention_v3`/`_grad_v3`（TND varlen，Meta 上由 [compat/attention.py](../torchtitan_simulator/compat/attention.py) 桥接 autograd）；`qwen3_32b_smoketest`（4 层切片）与 `qwen3_32b`（完整几何）有捕获回归；无 EP/CP 路径，当前验证范围为 world=1 | `override/common/varlen_attention.py`、[test_qwen3_capture.py](../tests/test_qwen3_capture.py) |
 | 原生配置与 override | `prepare_config()` 创建新配置，默认或显式 `override_imports`；`module.factory` 不绕过模型白名单或运行接口要求 | [test_config.py](../tests/test_config.py)、[test_model_overrides.py](../tests/test_model_overrides.py) |
 | 模型几何覆盖 | typed `model_overrides` 只适用于受支持的 DSV4 preset；自定义工厂负责自己的原生配置树 | `model_overrides.py`、[接入接口](upstream-integration.md) |
 | 训练精度 | 当前完整 DSV4/Kimi 捕获要求原始参数 FP32；计算参数 BF16/FP32，梯度归约 FP32；build-only 接受不等于完整捕获可用 | [test_precision.py](../tests/test_precision.py)、[test_kimi_capture.py](../tests/test_kimi_capture.py) |

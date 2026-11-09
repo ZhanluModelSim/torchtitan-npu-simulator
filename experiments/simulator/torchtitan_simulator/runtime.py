@@ -55,6 +55,10 @@ class RuntimeSession:
             from torchtitan_simulator.compat.permute import install_meta_permute_autograd
 
             self.capabilities["token_permute_meta_autograd"] = install_meta_permute_autograd(self.patches)
+        if "torchtitan_npu.override.common.varlen_attention.asc" in imports:
+            from torchtitan_simulator.compat.attention import install_meta_fusion_attention_autograd
+
+            self.capabilities["fusion_attention_meta_autograd"] = install_meta_fusion_attention_autograd(self.patches)
         if any(
             isinstance(entry, str) and entry.startswith("torchtitan_npu.override.common.rope.") for entry in imports
         ):

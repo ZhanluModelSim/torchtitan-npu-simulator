@@ -143,6 +143,13 @@ _COMMON_OVERRIDES = [
     "torchtitan_npu.override.common.token_dispatcher.asc",
 ]
 
+_QWEN3_OVERRIDES = [
+    "torchtitan_npu.override.common.rms_norm.asc",
+    # Dense GQA attention on the real fused CANN kernel; the simulator bridges
+    # its autograd on Meta (see compat/attention.py).
+    "torchtitan_npu.override.common.varlen_attention.asc",
+]
+
 _DSV4_OVERRIDES = [
     *_COMMON_OVERRIDES,
     "torchtitan_npu.override.common.rope.asc_complex",
@@ -203,6 +210,8 @@ def prepare_config(simulation: SimulationConfig) -> PreparedConfig:
         "deepseek_v4_flash": "torchtitan_npu.models.deepseek_v4.config_registry.deepseek_v4_flash",
         "deepseek_v4_pro": "torchtitan_npu.models.deepseek_v4.config_registry.deepseek_v4_pro",
         "deepseek_v4_pro_20t": "torchtitan_simulator.presets.deepseek_v4_pro_20t",
+        "qwen3_32b_smoketest": "torchtitan_npu.models.qwen3.config_registry.qwen3_32b_smoketest",
+        "qwen3_32b": "torchtitan_npu.models.qwen3.config_registry.qwen3_32b",
     }
     target = factories.get(simulation.config, simulation.config)
     if "." not in target:
@@ -227,8 +236,8 @@ def prepare_config(simulation: SimulationConfig) -> PreparedConfig:
         if value is not None:
             setattr(trainer.training, target_name, value)
     model = trainer.model_spec.model
-    if trainer.model_spec.name not in {"deepseek_v4", "kimi_k3"}:
-        raise ValueError("Supported model families are deepseek_v4 and kimi_k3")
+    if trainer.model_spec.name not in {"deepseek_v4", "kimi_k3", "qwen3"}:
+        raise ValueError("Supported model families are deepseek_v4, kimi_k3, and qwen3")
     adaptations = []
     if simulation.model_overrides is not None:
         adaptations.append("typed geometry overrides rebuilt the complete native model configuration tree")
@@ -267,7 +276,13 @@ def prepare_config(simulation: SimulationConfig) -> PreparedConfig:
     if trainer.debug.seed is None:
         trainer.debug.seed = 42
     trainer.override.imports = list(
-        ({"deepseek_v4": _DSV4_OVERRIDES, "kimi_k3": _COMMON_OVERRIDES}[trainer.model_spec.name])
+        (
+            {
+                "deepseek_v4": _DSV4_OVERRIDES,
+                "kimi_k3": _COMMON_OVERRIDES,
+                "qwen3": _QWEN3_OVERRIDES,
+            }[trainer.model_spec.name]
+        )
         if simulation.override_imports is None
         else simulation.override_imports
     )

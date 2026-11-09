@@ -8,7 +8,7 @@ Simulator 在 Meta 张量上执行原生模型、并行化、loss 和优化器�
 
 Meta 没有张量数据，能够执行 shape、dtype、layout 和 autograd 结构逻辑，但不能提供数据相关路由或数值结果。输入准备在 CPU 计算必要的静态元数据，设备张量转到 Meta；MoE token 路由使用明确的均衡假设。没有数据时不能用 `.item()`、随机占位值或经验猜测伪装成真实事实。
 
-当前标准入口只支持 DeepSeek-V4 与 Kimi K3。`module.factory` 是配置来源扩展点，不代表任意模型已满足运行接口。新增模型必须接通并验证原生构建、forward/loss、parallelize、optimizer 和保存值链路，不能只增加名称白名单。
+当前标准入口支持 DeepSeek-V4、Kimi K3 与 Qwen3-32B（dense）。`module.factory` 是配置来源扩展点，不代表任意模型已满足运行接口。新增模型必须接通并验证原生构建、forward/loss、parallelize、optimizer 和保存值链路，不能只增加名称白名单。
 
 ## 2. 组件边界
 

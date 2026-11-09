@@ -2,7 +2,7 @@
 
 本指南面向首次接触本仓的开发者和 agent：将外部模型资料转成原生模型配置，再接入 simulator，最后验证图、梯度元数据、并行依赖和静态内存。先读[整体方案](architecture.md)，运行时细节查[捕获契约](capture-runtime.md)，排错查[常见问题](model-integration-pitfalls.md)。
 
-当前正式入口只接受 DeepSeek-V4 和 Kimi K3；增加一个 preset 或放开 family 校验不等于完成新模型接入。模型定义与真实训练能力归主包，simulator 只负责必要的 Meta 兼容和负载交付。Meta 成功不代表真实设备数值或性能已经验证。
+当前正式入口接受 DeepSeek-V4、Kimi K3 与 Qwen3-32B（dense）；增加一个 preset 或放开 family 校验不等于完成新模型接入。模型定义与真实训练能力归主包，simulator 只负责必要的 Meta 兼容和负载交付。Meta 成功不代表真实设备数值或性能已经验证。
 
 ## 1. 固定环境和模型依据
 

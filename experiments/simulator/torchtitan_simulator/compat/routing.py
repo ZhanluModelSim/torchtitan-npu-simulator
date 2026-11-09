@@ -36,7 +36,14 @@ def balanced_splits(num_tokens, top_k, num_experts, ep_size, ep_rank):
 
 def install_balanced_dispatch(scope, model):
     routers = [module for module in model.modules() if hasattr(module, "_debug_force_load_balance")]
-    if not routers or any(not router._debug_force_load_balance for router in routers):
+    if not routers:
+        # Dense decoders have no routed experts; EP split derivation does not
+        # apply and there is no dispatch class to instrument.
+        return {
+            "ep_token_exchange": "not-applicable-dense",
+            "ep_token_dispatcher_classes": 0,
+        }
+    if any(not router._debug_force_load_balance for router in routers):
         raise ValueError("Meta EP split derivation requires verified balanced routing on every router")
     classes = {
         type(dispatcher)
