@@ -15,6 +15,7 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.testing._internal.distributed.fake_pg import FakeStore
 from torchtitan_simulator.capture.collective_facts import (
     collective_fact_scope,
+    install_reduce_scatter_observer,
     reduction_name,
     retain_backward_facts,
 )
@@ -61,6 +62,68 @@ def test_native_ag_rs_ar_keep_actual_sparse_rank_group_and_named_reduction(spars
     assert ar.attrs["collective_facts"]["reduction"]["operation"] == "MAX"
     assert ar.attrs["reduce_op"] == "max"
     assert ar.attrs["collective_facts"]["buffer_relation"] == "inplace"
+
+
+@pytest.mark.parametrize("factor", [0.25, 1.0, 0.0, -0.5])
+def test_native_rs_preserves_host_factor_and_restores_scope(sparse_group, factor):
+    original = dist.reduce_scatter_single
+    full = torch.empty(6, device="meta")
+    shard = torch.empty(3, device="meta")
+    op = dist.ReduceOp.PREMUL_SUM(factor)
+    capture = OpDispatchCapture(record_memory=False)
+    with pytest.raises(RuntimeError, match="leave scope"), PatchScope() as scope, capture:
+        install_reduce_scatter_observer(scope)
+        dist.reduce_scatter_single(shard, full, op=op, group=sparse_group)
+        raise RuntimeError("leave scope")
+
+    assert dist.reduce_scatter_single is original
+    (node,) = _communication_nodes(capture)
+    facts = node.attrs["collective_facts"]
+    assert facts["schema_version"] == 2
+    assert facts["reduction"] == {
+        "operation": "PREMUL_SUM",
+        "pre_scale": factor,
+        "post_scale": 1.0,
+        "scale_implemented_by_nodes": False,
+        "source": "native_reduceop_factor_v1",
+    }
+    assert "unresolved_fields" not in facts
+    assert node.attrs["reduce_op"] == "premul_sum"
+    assert len(capture.build_nodes()) == 1
+
+
+@pytest.mark.parametrize("name", ["SUM", "AVG"])
+def test_reduce_scatter_observer_preserves_unscaled_native_enums(sparse_group, name):
+    full = torch.empty(6, device="meta")
+    shard = torch.empty(3, device="meta")
+    capture = OpDispatchCapture(record_memory=False)
+    with PatchScope() as scope, capture:
+        install_reduce_scatter_observer(scope)
+        dist.reduce_scatter_single(shard, full, op=getattr(dist.ReduceOp, name), group=sparse_group)
+
+    (node,) = _communication_nodes(capture)
+    assert node.attrs["reduce_op"] == name.lower()
+    assert node.attrs["collective_facts"]["reduction"]["operation"] == name
+
+
+def test_native_rs_does_not_read_tensor_factor_or_reuse_prior_factor(sparse_group):
+    full = torch.empty(6, device="meta")
+    shard = torch.empty(3, device="meta")
+    scalar_op = dist.ReduceOp.PREMUL_SUM(0.125)
+    tensor_op = dist.ReduceOp.PREMUL_SUM(torch.empty((), device="meta"))
+    capture = OpDispatchCapture(record_memory=False)
+    with capture:
+        with PatchScope() as scope:
+            install_reduce_scatter_observer(scope)
+            dist.reduce_scatter_single(shard, full, op=scalar_op, group=sparse_group)
+            dist.reduce_scatter_single(shard, full, op=tensor_op, group=sparse_group)
+        dist.reduce_scatter_single(shard, full, op=scalar_op, group=sparse_group)
+    known, *missing = (node.attrs["collective_facts"] for node in _communication_nodes(capture))
+    assert known["reduction"]["pre_scale"] == 0.125
+    for facts in missing:
+        assert facts["reduction"]["operation"] == "PREMUL_SUM"
+        assert facts["reduction"]["pre_scale"] is None
+        assert facts["unresolved_fields"] == ["reduction.pre_scale"]
 
 
 def test_ag_local_alias_does_not_prove_all_rank_output_alias(sparse_group):

@@ -14,6 +14,7 @@ from typing import Any, cast
 import torch
 import torch.distributed as dist
 
+from torchtitan_simulator.capture.collective_facts import install_reduce_scatter_observer
 from torchtitan_simulator.compat.device import MetaDeviceModule
 
 
@@ -96,6 +97,7 @@ def logical_world(prepared, runtime, *, rank=0):
     try:
         utils.set_spmd_backend(prepared.trainer.parallelism.spmd_backend)
         install_meta_fsdp(runtime.patches)
+        install_reduce_scatter_observer(runtime.patches)
         # Cached DTensor output specs retain DeviceMesh objects. Equal logical
         # worlds rebuilt in one process must not reuse the previous world's
         # mesh identity (FSDP validates identity, not just rank equality).

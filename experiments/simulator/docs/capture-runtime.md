@@ -31,7 +31,7 @@
 
 没有 schema 时不生成绑定；张量字典超出当前 v1 的 tuple/list 协议时整组绑定省略，不交付不完整映射。不按 shape、对象相等或 FQN 推断参数角色。
 
-非张量参数按实际值保存，不读取 Meta 数据。合法填充值 `-inf/+inf/nan` 编码为 `("__sim_scalar_float_v1__", "-inf" | "+inf" | "nan")`；该编码是数据字面量，不是硬件参数或耗时。c10d ReduceOp 从实际枚举提取，`PREMUL_SUM` 因缺少乘数保存为 `unsupported:premul_sum`，不能当普通 sum。
+非张量参数按实际值保存，不读取 Meta 数据。合法填充值 `-inf/+inf/nan` 编码为 `("__sim_scalar_float_v1__", "-inf" | "+inf" | "nan")`；该编码是数据字面量，不是硬件参数或耗时。c10d ReduceOp 从实际枚举提取。通用参数中的 `premul_sum` 表示归约身份，乘数由通信事实单独交付。
 
 实现与测试：[operator_arguments.py](../torchtitan_simulator/capture/operator_arguments.py)、[test_operator_arguments.py](../tests/capture/test_operator_arguments.py)。
 
@@ -59,11 +59,13 @@ FSDP wrapper 可能延迟安装或刷新。正式观察器在结构预热后安�
 
 至少验证：延后 AG/RS/AR 会沿真实等待边延后必要计算与 clip/update；无等待的其他流仍能重叠。参考[流控制依赖](stream-control-dependencies.md)、[EP 交换](ep-single-transport.md)、`tests/test_fsdp_stream_capture.py`、`tests/capture/test_native_collectives.py`。host polling/synchronize 和真实硬件时序不能由这些 Meta 测试推导。
 
-### 通信语义事实 v1
+### 通信语义事实 v2
 
 `attrs["collective_facts"]` 为下游通信模型交付独立的语义事实，不计算流量或耗时。首期只覆盖 `c10d._allgather_base_.default`、`c10d._reduce_scatter_base_.default`、`c10d.allreduce_.default` 与 `_c10d_functional.all_to_all_single.default`，不按公共算子名套用其他 overload 的参数角色。
 
-事实包含 `schema_version=1`、精确 primitive、实际 global capture rank、有序组、实际 dense／contiguous 检查、原语的跨 rank 等形保证和逻辑缓冲关系。归约从仍可解释的原生枚举或 TorchBind `op()` 读取，按安装版本的具名枚举映射到 `reduction.operation`，与通用参数绑定并存；不能从 opaque 文本或 FSDP 场景推断 SUM。多 rank 的 AG 本地 alias 不能证明全组 alias，缺全组保证时保守交付 `distinct`；只有单 rank 可凭完整本地 storage／offset 证据交付 `same_region`。原地 AR 由原语契约确定。
+事实包含 `schema_version=2`、精确 primitive、实际 global capture rank、有序组、实际 dense／contiguous 检查、原语的跨 rank 等形保证和逻辑缓冲关系。归约从仍可解释的原生枚举或 TorchBind `op()` 读取，按安装版本的具名枚举映射到 `reduction.operation`，与通用参数绑定并存；不能从 opaque 文本或 FSDP 场景推断 SUM。多 rank 的 AG 本地 alias 不能证明全组 alias，缺全组保证时保守交付 `distinct`；只有单 rank 可凭完整本地 storage／offset 证据交付 `same_region`。原地 AR 由原语契约确定。
+
+Meta 运行时在 `torch.distributed.reduce_scatter_single` 调用边界读取原生 `ReduceOp.factor`，并以输入、输出张量身份关联到对应的 RS dispatch。退出调用时清除关联。标量乘数记录为捕获 rank 的 `reduction.pre_scale`，`post_scale` 为 1，`scale_implemented_by_nodes` 为 false。原生后端负责该次乘法。TorchBind 只暴露归约身份，tensor 乘数、非有限值和绕过观察边界的调用均记录 `reduction.pre_scale` 缺失。v1 的默认值 1.0 对 PREMUL_SUM 无效。
 
 EP 适配在所有 router 的 force-load-balance 已核验、且入口明确交付同 geometry 的 synthetic SPMD 来源时，生成版本化 `torchtitan_balanced_ep_v1` 证明，区分 dispatch／combine；count exchange 交付完整 equal 行矩阵。不从本 rank 的一行 split 或均匀 shape 推断全组矩阵。原生 A2A autograd 节点 metadata 保存对应证明，反向捕获读取实际节点，转置矩阵并交换全组 input／output shape，不替换原生求梯度函数。
 

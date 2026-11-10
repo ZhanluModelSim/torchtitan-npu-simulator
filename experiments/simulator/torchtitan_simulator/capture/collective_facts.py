@@ -10,6 +10,8 @@ from __future__ import annotations
 from contextlib import contextmanager
 from contextvars import ContextVar
 from copy import deepcopy
+from functools import wraps
+from math import isfinite
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -17,6 +19,8 @@ import torch.distributed as dist
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+
+    from torchtitan_simulator.compat.patches import PatchScope
 
 _SUPPORTED = {
     "c10d._allgather_base_.default",
@@ -29,6 +33,40 @@ _PROOF_METADATA_KEY = "torchtitan_simulator.collective_facts.v1"
 _exchange_facts: ContextVar[dict[str, Any] | None] = ContextVar("simulator_collective_facts", default=None)
 
 
+_rs_pre_scale: ContextVar[tuple[torch.Tensor, torch.Tensor, float] | None] = ContextVar(
+    "simulator_rs_pre_scale", default=None
+)
+
+
+def install_reduce_scatter_observer(scope: PatchScope) -> None:
+    """Carry the native scalar across the Python-to-TorchBind call boundary."""
+    name = "reduce_scatter_single" if hasattr(dist, "reduce_scatter_single") else "reduce_scatter_tensor"
+    original = getattr(dist, name)
+
+    @wraps(original)
+    def observe(output, input, op=dist.ReduceOp.SUM, group=None, async_op=False):
+        if output.device.type != "meta" or input.device.type != "meta":
+            return original(output, input, op, group, async_op)
+        scale = None
+        if isinstance(op, dist.ReduceOp) and getattr(op, "op", None) == dist.ReduceOp.PREMUL_SUM:
+            try:
+                factor = getattr(op, "factor", None)
+            except (AttributeError, RuntimeError):
+                factor = None
+            if type(factor) is float and isfinite(factor):
+                scale = (output, input, factor)
+        token = _rs_pre_scale.set(scale)
+        try:
+            return original(output, input, op, group, async_op)
+        finally:
+            _rs_pre_scale.reset(token)
+
+    scope.replace(dist, name, observe)
+    # Back-compat entry points on newer torch call the implementation module.
+    if getattr(dist.distributed_c10d, name, None) is original:
+        scope.replace(dist.distributed_c10d, name, observe)
+
+
 def reduction_name(value: object) -> str | None:
     """Decode installed named enums before TorchBind objects are stringified."""
     if isinstance(value, torch.ScriptObject):
@@ -37,7 +75,7 @@ def reduction_name(value: object) -> str | None:
         except (AttributeError, RuntimeError):
             return None
     elif isinstance(value, dist.ReduceOp):
-        value = value.op
+        value = getattr(value, "op", value)
     # TorchBind op() returns an integer in some builds. Compare against this
     # installation's enum, never a hardcoded integer or an opaque print value.
     for name in ("SUM", "AVG", "MAX", "MIN", "PRODUCT", "PREMUL_SUM", "BAND", "BOR", "BXOR"):
@@ -141,7 +179,7 @@ def native_collective_facts(func, args, kwargs, operands, result) -> dict[str, A
     outputs = (result,) if operands.outputs is None else operands.outputs
     dense = all(tensor.layout == torch.strided and tensor.is_contiguous() for tensor in (*operands.inputs, *outputs))
     facts: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": 2,
         "primitive": primitive,
         "capture_rank": capture_rank,
         "ordered_group": group,
@@ -160,12 +198,23 @@ def native_collective_facts(func, args, kwargs, operands, result) -> dict[str, A
         missing.append("ordered_group")
     if primitive in {"c10d.allreduce_.default", "c10d._reduce_scatter_base_.default"}:
         operation = reduction_name(_schema_argument(func, args, kwargs, "reduce_op"))
+        pre_scale: float | None = 1.0
+        source = "installed_torch_named_reduceop_v1"
+        if operation == "PREMUL_SUM":
+            observed = _rs_pre_scale.get() if primitive == "c10d._reduce_scatter_base_.default" else None
+            if observed is not None and outputs[0] is observed[0] and operands.inputs[0] is observed[1]:
+                pre_scale = observed[2]
+                source = "native_reduceop_factor_v1"
+                facts["source"] = source
+            else:
+                pre_scale = None
+                missing.append("reduction.pre_scale")
         facts["reduction"] = {
             "operation": operation,
-            "pre_scale": 1.0,
+            "pre_scale": pre_scale,
             "post_scale": 1.0,
             "scale_implemented_by_nodes": False,
-            "source": "installed_torch_named_reduceop_v1",
+            "source": source,
         }
         if operation is None:
             missing.append("reduction.operation")
