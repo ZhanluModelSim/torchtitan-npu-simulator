@@ -11,9 +11,12 @@
 - `logical_world()` 拥有 fake process group。宿主已有 group、嵌套或并发仿真不属于支持路径；连续串行捕获必须允许换 rank/world。
 - 恢复内容包括 autograd 多线程状态、SPMD TLS、mesh／RoPE cache 和 target flags。局部 patch 恢复不等于厂商模块从未导入，不能把原始地址当跨进程稳定 ID。
 - 先探测实际 schema、Meta 分配和梯度；健康原生实现不覆盖。Python wrapper 只显示 `*args/**kwargs` 时，从 dispatcher schema 取得参数，不按版本字符串猜签名。
+- `meta_runtime()` 在安装临时 patch 前检查 FSDP 观察器及 Meta 适配实际使用的方法、调用形状和静态方法描述符。缺符号或调用不兼容时，错误包含具体接口与软件栈；通过后将检查记录保存在 `runtime_capabilities.fsdp_capture_compatibility`。检查不执行 collective、不创建模型或 process group，也不按版本号选择 patch；新增可选参数不会因签名文本不同而被拒绝。
 - CANN Meta 显式申请 NPU buffer 时，仅在确认的 metadata shape-inference 范围修正，继续复用原厂推导；禁止全局重定向 tensor factory。
 
 实现：[runtime.py](../torchtitan_simulator/runtime.py)、[compat/patches.py](../torchtitan_simulator/compat/patches.py)、[compat/distributed.py](../torchtitan_simulator/compat/distributed.py)。回归：`tests/test_runtime.py`、`test_patch_scope.py`、`test_metadata.py`、`test_chunked_loss_policy.py`。
+
+FSDP 前置检查实现见 [compat/fsdp.py](../torchtitan_simulator/compat/fsdp.py)，回归见 `tests/test_fsdp_compatibility.py`。它仅验证 Python 调用边界；私有实例字段、方法内部行为、保存值及驻留事件变化仍须通过真实小模型捕获与现有内存／通信回归确认，不能把检查通过视为整个软件栈兼容认证。独立诊断与精确环境记录方法见[开发导航](developer-guide.md#先核对环境)。
 
 ## 2. 节点、参数与原始身份
 

@@ -35,6 +35,17 @@ PYCODE
 
 此前须加载实际 CANN 环境。容器工作目录、挂载和 editable 安装路径逐次核对，不复制历史容器名或另一 checkout 的路径。可用 `docker inspect <container>` 检查挂载。主包与 sidecar 都必须指向本次修改；不修改安装源码或用 `sys.path` 拼接替代安装。
 
+捕获前可独立检查所用 FSDP 私有调用边界，输出安装版本、Python 路径、模块来源和实际签名：
+
+```bash
+TORCH_DEVICE_BACKEND_AUTOLOAD=0 python -m torchtitan_simulator.compat.fsdp
+python -m pip freeze --all
+```
+
+此诊断不加载 NPU 模型或安装 simulator patch。`loaded=false` 的模块路径表示可解析的安装来源，尚非已导入证据；完整运行中保存的检查记录应与实际导入路径一起核对。包版本不能区分同版本的修改代码，交付时还需记录主包、sidecar 和上游 checkout 的 `git rev-parse HEAD`、`git status --short`，以及普通安装 wheel 的 `sha256sum`。CANN 环境文件、实际 CANN 版本文件和容器 image ID 另行保存；这些信息不由 Python 分发版本代替。
+
+检查仅绑定当前适配器使用的调用形状，不执行方法或认证其内部语义。新增软件组合仍需下述真实小模型与作用域恢复回归；不因诊断成功扩大已验证版本范围。
+
 ## 检查顺序
 
 1. 用最小行为探针区分配置、原生接口、Meta/autograd、图依赖或内存归属问题；保留原始异常。

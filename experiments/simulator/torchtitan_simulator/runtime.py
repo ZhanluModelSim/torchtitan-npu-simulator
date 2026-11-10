@@ -15,6 +15,7 @@ import torch
 from torchtitan_simulator import meta_env
 from torchtitan_simulator.compat.amp import install_meta_autocast
 from torchtitan_simulator.compat.cann_metadata import install_metadata_dispatch
+from torchtitan_simulator.compat.fsdp import validate_fsdp_capture
 from torchtitan_simulator.compat.loss import install_chunked_loss_policy_restore
 from torchtitan_simulator.compat.optimizer import install_meta_optimizer
 from torchtitan_simulator.compat.patches import PatchScope
@@ -80,6 +81,7 @@ class RuntimeSession:
 def meta_runtime():
     if meta_env._is_meta_simulation:
         raise RuntimeError("Nested simulator runtime activation is not supported")
+    fsdp_compatibility = validate_fsdp_capture()
     # Static declarations for simulator-supported main-package custom wrappers.
     import_module("torchtitan_simulator.compat.moe_tensor_semantics")
     previous_context = dict(meta_env._pp_context)
@@ -88,6 +90,7 @@ def meta_runtime():
     previous_metadata_inference = meta_env._in_metadata_inference
     with PatchScope() as scope:
         capabilities = install_rotary_bridge(scope)
+        capabilities["fsdp_capture_compatibility"] = fsdp_compatibility
         install_meta_autocast(scope)
         install_meta_optimizer(scope)
         install_chunked_loss_policy_restore(scope)

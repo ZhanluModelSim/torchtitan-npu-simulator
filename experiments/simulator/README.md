@@ -37,6 +37,8 @@ python -m torchtitan_simulator --config kimi_k3_smoketest \
 
 推荐 shell 入口为 `python -m torchtitan_simulator`。`--build-only` 仅构建模型，不能替代 F/B/O、梯度、通信或内存验收。Python 调用示例见[同进程接入](docs/upstream-integration.md)。
 
+运行时会在安装临时 patch 前检查所用 FSDP 私有调用边界；独立诊断及软件栈记录方法见[开发导航](docs/developer-guide.md#先核对环境)。该检查不替代真实负载捕获验证。
+
 ## 主要边界
 
 - 单进程承载一个 logical rank，使用逻辑 world；PP 必须为 1，不用 torchrun worker 数替代逻辑设备数。
