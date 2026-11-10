@@ -381,9 +381,7 @@ config、用 `quant_lightning_indexer_metadata` 构建自己的 entry，并拒�
 按 rank-local 行重建 plan，再在其上重填记录（upstream PR #4617）；参考契约的 hook 直接拒绝 CP。
 compressor 的状态表由**融合 attention 的 metadata 构建器**在 eager 边界写进 plan（表宽随 batch 的
 文档走，不能在建图时构），因此选 `sparse_attn.asc` 就带上了它，不再有独立的 compressor 状态表入口。非融合的 attention backend（参考核）不建表，压缩器在 forward 里按当前 batch 自行构表（eager 下逐
-batch 正确；只有「参考 attention + 融合 compressor + 图训练」这一组合目前没有 recipe 使用）。CV 的 metadata 重切不再是一个配置节点：启用
-`batch_chunk_token_dispatcher.asc_dispatcher` 即激活实验，`cv_parallel` 的 post-init hook 在每一步的
-`_make_fx_forward_backward_step` 入口把 map 的每条 entry 重切成 full + 两个 chunk。
+batch 正确；只有「参考 attention + 融合 compressor + 图训练」这一组合目前没有 recipe 使用）。
 MHC 的 `asc_hc_pre` / `asc_hc_post` 与 `triton_hc_pre` / `triton_hc_post` / `triton_hc_head` / `tilelang_hc_head` 是可选入口（`deepseek_v4/__init__.py`
 默认只导入 `sparse_attn`），需要时显式加入 `override.imports`。`triton_hc_head` 与 `tilelang_hc_head` 声明同一 `HcHead.Config` 节点，两者互斥，只能启用其一；二者均可与 `asc_hc_pre` / `asc_hc_post` 共存。
 

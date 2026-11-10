@@ -16,7 +16,6 @@ import torch.nn.functional as F
 from torchtitan.config import ConfigManager, apply_overrides
 from torchtitan.models.common.activation import SiTUGLU, SwiGLU
 
-from torchtitan_npu.extensions.experiment.cv_parallel.batch_chunk_token_dispatcher import BatchChunkTokenDispatcher
 from torchtitan_npu.override.common.swiglu_group import AscSwiGLU
 from torchtitan_npu.override.common.token_dispatcher import AscAllToAllTokenDispatcher
 from torchtitan_npu.patches.torchtitan.models.common.moe import ClampedSwiGLU
@@ -24,10 +23,6 @@ from torchtitan_npu.patches.torchtitan.models.common.moe import ClampedSwiGLU
 _SWIGLU = "torchtitan_npu.override.common.swiglu_group."
 _DISPATCHERS = {
     "standard": ("torchtitan_npu.override.common.token_dispatcher.asc", AscAllToAllTokenDispatcher.Config),
-    "cv": (
-        "torchtitan_npu.extensions.experiment.cv_parallel.batch_chunk_token_dispatcher.asc_dispatcher",
-        BatchChunkTokenDispatcher.Config,
-    ),
 }
 _RECIPES = [
     ("torchtitan_npu.models.deepseek_v4.config_registry", "deepseek_v4_debugmodel"),
@@ -50,7 +45,7 @@ def _replacement_fqns(replacements):
 
 
 @pytest.mark.parametrize(("module", "recipe"), _RECIPES, ids=["v4", "v41"])
-@pytest.mark.parametrize("dispatcher", ["standard", "cv"])
+@pytest.mark.parametrize("dispatcher", ["standard"])
 @pytest.mark.parametrize("dispatcher_first", [False, True])
 def test_activation_and_dispatcher_overrides_compose_without_replacing_expert_owners(
     tmp_path, module, recipe, dispatcher, dispatcher_first

@@ -43,7 +43,7 @@
 | 数据、SFT、验证 | batch 改为 `TrainingMicrobatch`；padding、长文档拆分和恢复状态变化；新增多轮 SFT；验证增加空数据保护 | 迁移本地 loader、视觉数据、调度缓存；单独检查数据语义变化 |
 | Checkpoint | `#4190/#4191/#4528` 统一 load 后端、完善 HF consolidation；新 EMA 状态结构 | 迁移 DCP load hook、hash、PEFT、量化读取和导出；默认继续使用 DCP |
 | AC 与编译 | `#4497` 引入 torch_remat/RegionAC；FullAC 默认 early-stop；`#4895` 删除常规逐 block compile | 保全既有 NPU FullAC/SelectiveAC 和模型编译功能；RegionAC 不纳入默认支持 |
-| GraphTrainer | `#4666/#4884/#4952` 统一 GraphRuntime，收敛到 AOT tracing，删除 graph-based EP chunking | **必须迁移** NPU auto-overlap、runtime context、全图校准和 CV parallel；使用 eager chunking |
+| GraphTrainer | `#4666/#4884/#4952` 统一 GraphRuntime，收敛到 AOT tracing，删除 graph-based EP chunking | **必须迁移** NPU auto-overlap、runtime context 和全图校准；使用 eager chunking |
 | CUDA graphs | 新增梯度累积 capture、graph-owned gradients、独立 optimizer capture、looped PP | 属于 CUDA 能力；NPU 不自动启用，验证不会进入 CUDA 专属执行分支 |
 | 模型扩展与工程设施 | Qwen3.5 tying/多模态修复；新增 Qwen3.6 registry；Kimi K3 TP/PP/packing；RL 搬迁与扩展；日志和 CI 重组 | Qwen 现有路径回归；公共修复继承；新模型/RL 专属功能另列后续项，不复制 GPU CI/golden |
 
@@ -180,11 +180,10 @@
 - 迁到 `GraphTrainingEngine` 与 GraphRuntime，重新接入 trace/runtime context、全图校准、NPU pass registry。
 - 删除 graph-based EP chunking，统一 eager chunking；更新 launcher 中旧 strategy 和执行模式配置。
 - auto-overlap 放在 eager chunk metadata 已产生、FSDP bucketing 完成后的调度位置，不再依赖已删除的 concretization pass。
-- CV parallel 单独迁到新的 graph builder/runtime 接口；不能只修默认 GraphTrainer 就宣称该能力已保全。
 - 校准不得改变模型参数、grad、buffer、随机状态或训练进度。
 - NPU 默认关闭 CUDA graph capture；新增 WGrad fusion、RegionAC 等优化不混入基础兼容性验收。
 
-**阶段出口：** eager 与 graph 的现有训练组合、梯度累积、EP overlap、校准和 CV parallel 均有独立结果。
+**阶段出口：** eager 与 graph 的现有训练组合、梯度累积、EP overlap 和校准均有独立结果。
 
 ### 阶段七：迁移 TorchFT、多模态并清理补丁
 

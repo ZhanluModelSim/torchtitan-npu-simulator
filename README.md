@@ -249,7 +249,7 @@ torchtitan-npu/
 │   │   ├── components/            # 本仓训练组件及接线逻辑
 │   │   ├── cpu_offload/           # CPU offload 运行时与 staging
 │   │   ├── distributed/           # 梯度累积与梯度裁剪扩展
-│   │   ├── experiment/            # Anticipatory Routing、CV Parallel 等实验能力
+│   │   ├── experiment/            # Anticipatory Routing 等实验能力
 │   │   ├── mx_storage_reader/     # MX 量化权重读取能力
 │   │   └── novaswap/              # NovaSwap 显存交换扩展
 │   ├── override/                  # 配置级组件替换，含 common 与模型专属目录

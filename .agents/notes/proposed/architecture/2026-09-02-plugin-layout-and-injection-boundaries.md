@@ -57,7 +57,7 @@ ownership debt manifest、目录布局检查和 extension ownership 检查脚本
 | DeepSeek-V4/V4.1 模型配置、并行化与 checkpoint 适配 | `extensions/` 与 `override/` | 提炼公开模型/配置接口后逐项替换，不改变训练、checkpoint 或数值语义 |
 | Qwen3.5 模型模块 | 模型专属 `override/` | 通过明确注册或调用边界消除反向依赖 |
 | `extensions/torchtitan/trainer.py`、checkpoint extension | `extensions/components/` | 在 loader 和组件注册表稳定后改为按需接线 |
-| TorchAO adaptor、CV Parallel 与 TorchFT extension | `models/`、`override/`、`ops/` 或 patch 私有符号 | 用公开 adaptor/extension 接口分阶段替换 |
+| TorchAO adaptor 与 TorchFT extension | `models/`、`override/`、`ops/` 或 patch 私有符号 | 用公开 adaptor/extension 接口分阶段替换 |
 | `patches/torchtitan/models/qwen3_5/vision_encoder.py` | `extensions/torchtitan/eager_flex.py` | 将 eager 兼容逻辑移到单向可激活层，消除 patch 反向依赖 |
 
 `patches/torchtitan/` 的新增文件使用 `Upstream-PR:` 头部。现有文件含历史 `Pending upstream PR`/`Upstream PR` 标记和基线中已登记的缺失项；当前门禁只禁止新增元数据债务，统一整理另行完成。

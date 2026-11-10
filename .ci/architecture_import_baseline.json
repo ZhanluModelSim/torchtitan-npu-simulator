@@ -18,10 +18,6 @@
     {"source": "torchtitan_npu/extensions/adaptor/torchao/configs/deepseek_v4.py", "target_module": "torchtitan_npu.models.deepseek_v4.compressor"},
     {"source": "torchtitan_npu/extensions/adaptor/torchao/configs/deepseek_v4.py", "target_module": "torchtitan_npu.override.common.swiglu_group.ascendc"},
     {"source": "torchtitan_npu/extensions/compile/sdc_checksum.py", "target_module": "torchtitan_npu.ops.misc.sdc_checksum"},
-    {"source": "torchtitan_npu/extensions/experiment/cv_parallel/batch_chunk_metadata.py", "target_module": "torchtitan_npu.models.deepseek_v4.metadata"},
-    {"source": "torchtitan_npu/extensions/experiment/cv_parallel/batch_chunk_metadata.py", "target_module": "torchtitan_npu.override.deepseek_v4.sparse_attn.ascendc"},
-    {"source": "torchtitan_npu/extensions/experiment/cv_parallel/batch_chunk_token_dispatcher.py", "target_module": "torchtitan_npu.ops.ascendc.moe_token_permute"},
-    {"source": "torchtitan_npu/extensions/experiment/cv_parallel/batch_chunk_token_dispatcher.py", "target_module": "torchtitan_npu.override.common.token_dispatcher"},
     {"source": "torchtitan_npu/extensions/torchtitan/experiments/torchft/trainer.py", "target_module": "torchtitan_npu.models.deepseek_v4.model"},
     {"source": "torchtitan_npu/extensions/torchtitan/trainer.py", "target_module": "torchtitan_npu.override.common.optimizer"},
     {"source": "torchtitan_npu/patches/torchtitan/models/qwen3_5/vision_encoder.py", "target_module": "torchtitan_npu.extensions.torchtitan.eager_flex"}

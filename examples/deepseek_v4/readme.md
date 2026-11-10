@@ -42,8 +42,6 @@ def my_run():
 或直接使用 `scripts/run_train.sh` 并在 recipe 中配置训练参数。Pro、CP 等其他入口需要
 编译时，也在对应 recipe 中显式设置 `CompileConfig`，再通过 `MODULE` / `CONFIG` 选择。
 
-CV Parallel 调试入口在当前固定 TorchTitan 版本中仅完成配置与注册适配。上游已删除其依赖的 Graph EP 分块机制，CV 运行迁移尚未完成，入口会明确报错；详见 [CV 迁移状态](../../torchtitan_npu/extensions/experiment/cv_parallel/README.md)。
-
 ## 常用环境变量
 
 运行前至少根据环境设置以下路径和节点信息：

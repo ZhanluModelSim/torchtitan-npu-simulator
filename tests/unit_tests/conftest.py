@@ -32,7 +32,6 @@ sys.path.insert(0, str(_REPO))
 # skip marks cannot prevent imports of removed upstream symbols.
 collect_ignore = [
     "ema",
-    "extensions/experiment/cv_parallel",
     "extensions/torchtitan/experiments/graph_trainer",
     "patches/torchtitan/experiments/graph_trainer",
     # Qwen runtime migration is deferred. Upstream eagerly imports CUDA-only
