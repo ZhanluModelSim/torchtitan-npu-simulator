@@ -181,6 +181,8 @@ def prepare_config(simulation: SimulationConfig) -> PreparedConfig:
         "qwen3_5_debugmodel_moe": "torchtitan_simulator.presets.qwen3_5_debugmodel_moe",
         "deepseek_v4_1_debugmodel_text": "torchtitan_simulator.presets.deepseek_v4_1_debugmodel_text",
         "deepseek_v4_1_debugmodel_multimodal": "torchtitan_simulator.presets.deepseek_v4_1_debugmodel_multimodal",
+        "system3_debugmodel_text": "torchtitan_npu.models.system3.config_registry.system3_debugmodel_text",
+        "system3_debugmodel_multimodal": "torchtitan_npu.models.system3.config_registry.system3_debugmodel_multimodal",
     }
     target = factories.get(simulation.config, simulation.config)
     if "." not in target:
@@ -205,8 +207,8 @@ def prepare_config(simulation: SimulationConfig) -> PreparedConfig:
         if value is not None:
             setattr(trainer.training, target_name, value)
     model = trainer.model_spec.model
-    if trainer.model_spec.name not in {"deepseek_v4", "deepseek_v4_1", "kimi_k3", "qwen3_5"}:
-        raise ValueError("Supported model families are deepseek_v4, deepseek_v4_1, kimi_k3 and qwen3_5")
+    if trainer.model_spec.name not in {"deepseek_v4", "deepseek_v4_1", "kimi_k3", "qwen3_5", "system3"}:
+        raise ValueError("Supported model families are deepseek_v4, deepseek_v4_1, kimi_k3, qwen3_5 and system3")
     adaptations = []
     if simulation.model_overrides is not None:
         adaptations.append("typed geometry overrides rebuilt the complete native model configuration tree")
@@ -251,6 +253,7 @@ def prepare_config(simulation: SimulationConfig) -> PreparedConfig:
                 "deepseek_v4_1": _DSV4_1_OVERRIDES,
                 "kimi_k3": _COMMON_OVERRIDES,
                 "qwen3_5": _QWEN3_5_OVERRIDES,
+                "system3": _COMMON_OVERRIDES,
             }[trainer.model_spec.name]
         )
         if simulation.override_imports is None
