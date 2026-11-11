@@ -22,6 +22,7 @@ from torchtitan.models.common.lora import (
     get_lora_grouped_linear,
     get_lora_linear,
 )
+from torchtitan.models.common.rope import ComplexRoPE
 from torchtitan.protocols.module import Module
 from torchtitan.protocols.sharding import ShardingConfig
 
@@ -152,8 +153,11 @@ class DeepSeekLoRATransform(LoRATransform):
 
     def transform(self, model):
         frozen_indexers = {}
+        original_ropes = {}
         freeze = LoRATransform(handlers=(), target_modules=[])
         for fqn, cfg, _, attr in model.traverse(Module.Config, recurse=True):
+            if type(cfg) is ComplexRoPE.Config:
+                original_ropes[fqn] = cfg
             if attr == "indexer":
                 frozen_indexers[fqn] = freeze.transform(copy.deepcopy(cfg))
         transformed = LoRATransform.transform(self, model)
@@ -161,6 +165,10 @@ class DeepSeekLoRATransform(LoRATransform):
             if fqn in frozen_indexers:
                 assert parent is not None and isinstance(attr, str)
                 setattr(parent, attr, frozen_indexers[fqn])
+        # Base RoPE has only buffers; retain its concrete config for exact overrides.
+        for fqn, _, parent, attr in transformed.traverse(ComplexRoPE.Config):
+            if fqn in original_ropes and isinstance(attr, str):
+                setattr(parent, attr, original_ropes[fqn])
         return transformed
 
 

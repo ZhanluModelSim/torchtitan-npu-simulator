@@ -118,6 +118,9 @@ class DeepSeekV4PEFTCheckpointManager(NPUCheckpointManager):
                 # A preceding retention pass may still be deleting this directory.
                 continue
             saved_keys = set(metadata.state_dict_metadata)
+            if step == 0 and not self.initial_load_in_hf and directory == self.initial_load_path:
+                # A configured base seed initializes adapters rather than resuming them.
+                return latest_native if latest_native != -1 else 0
             try:
                 self._validate_native_resume(saved_keys)
             except ValueError as error:
@@ -154,7 +157,11 @@ class DeepSeekV4PEFTCheckpointManager(NPUCheckpointManager):
 
     def _is_purge_exempt(self, step: int) -> bool:
         # Exports can occupy retention slots without replacing a training resume point.
-        return super()._is_purge_exempt(step) or step == self._purge_resume_step
+        return (
+            super()._is_purge_exempt(step)
+            or step == self._purge_resume_step
+            or filesystem.join(self.folder, f"step-{step}") == self.initial_load_path
+        )
 
     def save(self, curr_step: int, last_step: bool = False) -> bool:
         if last_step and self.last_save_in_peft and self._should_save(curr_step, last_step):

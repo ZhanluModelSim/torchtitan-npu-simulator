@@ -234,6 +234,78 @@ def test_peft_retention_preserves_native_resume_when_newer_dcp_lacks_adapters(tm
     assert {path.name for path in root.iterdir()} == {"step-1", "step-2", "step-3"}
 
 
+@pytest.mark.parametrize("family", ["v4", "v41"])
+@pytest.mark.parametrize("load_step", [-1, 0])
+def test_native_step_zero_seed_initializes_base_without_overwriting_adapters(tmp_path, monkeypatch, family, load_step):
+    config = _model_config(monkeypatch, family)
+    root = tmp_path / "checkpoints"
+    seed = root / "step-0"
+    original = _model(config)
+    _write_native_base(seed, original)
+    expected = {name: value for name, value in _clone_state(original).items() if not is_lora_parameter(name)}
+    model = _model(config)
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.fill_(0.75)
+        model.resume_probe.zero_()
+    adapters = {name: value for name, value in _clone_state(model).items() if is_lora_parameter(name)}
+
+    with closing(_manager(root, seed, config, family, model, initial_hf=False, verify=True)) as manager:
+        assert manager.load(step=load_step)
+
+    actual = model.state_dict()
+    _assert_state({name: actual[name] for name in expected}, expected)
+    _assert_state({name: actual[name] for name in adapters}, adapters)
+
+
+@pytest.mark.parametrize("family", ["v4", "v41"])
+@pytest.mark.parametrize("keep,full_save", [(2, False), (3, False), (2, True)])
+def test_adapter_only_retention_keeps_initial_seed_and_resumes_latest_state(
+    tmp_path, monkeypatch, family, keep, full_save
+):
+    config = _model_config(monkeypatch, family)
+    root = tmp_path / "checkpoints"
+    seed = root / "step-0"
+    _write_native_base(seed, _model(config))
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+
+    with closing(_manager(root, seed, config, family, _model(config), initial_hf=False, keep=keep)) as manager:
+        assert manager.load(step=0)
+        for step in (1, 2, 3):
+            if step == 3 and full_save:
+                manager.periodic_save_adapter_only = False
+            with torch.no_grad():
+                for parameter in manager.states["model"].model[0].parameters():
+                    if parameter.requires_grad:
+                        parameter.add_(0.25)
+            manager.states["train_state"].step = manager.states["dataloader"].step = step
+            assert manager.save(step)
+        expected = _clone_state(manager.states["model"].model[0])
+
+    assert (seed / ".metadata").is_file()
+    with closing(_manager(root, seed, config, family, _model(config), initial_hf=False, keep=keep)) as manager:
+        assert manager._find_load_step() == 3
+        assert manager.load()
+        assert manager.states["train_state"].step == manager.states["dataloader"].step == 3
+        _assert_state(manager.states["model"].state_dict(), expected)
+
+
+@pytest.mark.parametrize("family", ["v4", "v41"])
+def test_automatic_selection_rejects_step_zero_without_adapters_unless_it_is_initial_base(
+    tmp_path, monkeypatch, family
+):
+    config = _model_config(monkeypatch, family)
+    model = _model(config)
+    root = tmp_path / "checkpoints"
+    base = tmp_path / "base"
+    _write_native_base(base, model)
+    _write_native_base(root / "step-0", model)
+
+    with closing(_manager(root, base, config, family, model, initial_hf=False)) as manager:
+        with pytest.raises(ValueError, match="requires adapter tensors"):
+            manager.load()
+
+
 def _clone_state(model):
     return {key: value.detach().clone() for key, value in model.state_dict().items()}
 
