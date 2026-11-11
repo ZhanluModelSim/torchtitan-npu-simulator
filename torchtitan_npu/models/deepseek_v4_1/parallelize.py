@@ -73,12 +73,10 @@ def _apply_compile_v4_1(model, *, compile_config: CompileConfig) -> None:
       the graph (fullgraph=False) instead.
     - The dispatcher reorder opt-in: aten argsort does not survive dynamo
       fake-eval under the spmd_types patch stack, so the traceable exact
-      stable formulation is swapped in for the compiled run only (eager
-      keeps the upstream helper; the permutation is identical).
+      stable formulation is bound to this model's dispatcher instances (eager
+      models keep the upstream helper; the permutation is identical).
     """
     import logging
-
-    import torch
 
     logger = logging.getLogger(__name__)
 
@@ -86,10 +84,8 @@ def _apply_compile_v4_1(model, *, compile_config: CompileConfig) -> None:
 
     # Traceable reorder opt-in for the compiled run (see the override module).
     from torchtitan_npu.override.common.token_dispatcher import (
-        apply_compile_friendly_local_reorder,
+        configure_dispatchers_for_compile,
     )
-
-    apply_compile_friendly_local_reorder()
 
     # Force-load-balanced MoE routing (round-robin, --debug.moe-force-load-balance)
     # keeps the all_to_all split sizes constant (T*K/E per rank on every step),
@@ -102,25 +98,9 @@ def _apply_compile_v4_1(model, *, compile_config: CompileConfig) -> None:
     routers = [m for m in model.modules() if hasattr(m, "_debug_force_load_balance")]
     force_balanced_moe = bool(routers) and all(m._debug_force_load_balance for m in routers)
     fullgraph = compile_config.backend != "inductor" or force_balanced_moe
-    if compile_config.backend == "inductor":
-        import torch._inductor.config
-
-        # Skip the unbacked-SymInt runtime assertions (Eq(u32+..., T*K))
-        # that inductor derives from the tracing run's expert distribution.
-        setattr(torch._inductor.config, "do_not_emit_runtime_assertions", True)  # noqa: B010
-        if not force_balanced_moe:
-            # The MoE communication (all_to_all_single with data-dependent
-            # splits) runs eagerly: wrap the NPU dispatcher's dispatch/combine
-            # so dynamo treats them as opaque and graph-breaks around them.
-            # aot_eager keeps fullgraph=True and needs no wrapping.
-            from torchtitan_npu.override.common.token_dispatcher import AscAllToAllTokenDispatcher
-
-            AscAllToAllTokenDispatcher.dispatch = torch._dynamo.disable(recursive=True)(
-                AscAllToAllTokenDispatcher.dispatch
-            )
-            AscAllToAllTokenDispatcher.combine = torch._dynamo.disable(recursive=True)(
-                AscAllToAllTokenDispatcher.combine
-            )
+    configure_dispatchers_for_compile(
+        model, eager_all_to_all=compile_config.backend == "inductor" and not force_balanced_moe
+    )
 
     for layer_id, transformer_block in model.layers.named_children():
         transformer_block.compile(backend=compile_config.backend, fullgraph=fullgraph, dynamic=False)

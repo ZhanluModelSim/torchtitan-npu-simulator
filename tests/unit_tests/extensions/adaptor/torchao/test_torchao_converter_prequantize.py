@@ -33,6 +33,7 @@ from torchtitan_npu.extensions.adaptor.torchao.converter import (
     apply_quantization_converter,
 )
 from torchtitan_npu.models.deepseek_v4 import model_registry
+from torchtitan_npu.models.deepseek_v4_1 import model_registry as v41_model_registry
 
 
 def _quantization_config(**overrides) -> QuantizationExtensionConfig:
@@ -50,15 +51,22 @@ def _collect_flags(model_config) -> dict[str, bool]:
     return flags
 
 
-def test_default_whitelist_keeps_prequantize_on_all_dense_projections():
+@pytest.mark.parametrize("family", ["v4", "v41"])
+def test_default_whitelist_keeps_prequantize_on_all_dense_projections(family):
     """fsdp_prequantize_fqns=None resolves to the recipe default whitelist."""
-    spec = model_registry("debugmodel", num_mtp_layers=0)
+    spec = (
+        model_registry("debugmodel", num_mtp_layers=0)
+        if family == "v4"
+        else v41_model_registry("deepseek_v4_1_stripped")
+    )
     quantization = _quantization_config(enable_fsdp_prequantize=True)
 
     converted = apply_quantization_converter(spec, quantization, model_compile_enabled=False)
 
     flags = _collect_flags(converted)
     assert flags, "debugmodel must expose quantized Linear nodes"
+    shared_gate_up = {fqn for fqn, _, _, _ in spec.traverse(Linear.Config) if fqn.endswith(".moe.shared_experts.w13")}
+    assert shared_gate_up and shared_gate_up <= flags.keys()
     assert all(flags.values()), f"default whitelist must enable every dense weight: {flags}"
 
 

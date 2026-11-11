@@ -29,6 +29,8 @@ GOLDEN_OVERRIDES = (
     "torchtitan_npu.override.common.rope.workaround",
 )
 
+_LORA_ROPE_OVERRIDES = ("--override.imports", "tests.integration_tests.lora_config.lora_rope_workaround")
+
 # The V4 Grain recipe already points at tests/assets/c4_test/data.json.
 V4_TRAIN_ARGS = (
     "--metrics.enable_tensorboard",
@@ -103,13 +105,18 @@ def build_deepseek_v4_checkpoint_resume_test_list() -> list[OverrideDefinitions]
         check_loss=False,
         check_resume=True,
     )
-    lora_args = GOLDEN_OVERRIDES + checkpoint_args + ("--checkpoint.save-training-state", "--optimizer.name=Muon")
+    lora_args = (
+        *_LORA_ROPE_OVERRIDES,
+        *(arg.replace("--checkpoint.", "--checkpointer.") for arg in checkpoint_args if arg != "--checkpoint.enable"),
+        "--checkpointer.save-training-state",
+        "--optim.optimizer.name=Muon",
+    )
     lora_checkpoint_case = replace(
         checkpoint_case,
         test_name="dsv4_lora_resume_ep2_fsdp2",
         test_descr="DeepSeek-V4 LoRA checkpoint resume EP2/FSDP2",
         env_vars={"MODULE": "tests.integration_tests.lora_config", "CONFIG": "deepseek_v4_lora_training"},
-        override_args=[lora_args, (*lora_args, "--checkpoint.load-step=2")],
+        override_args=[lora_args, (*lora_args, "--checkpointer.load-step=2")],
     )
     return [checkpoint_case, lora_checkpoint_case]
 
@@ -151,10 +158,10 @@ def build_deepseek_v4_quantized_test_list() -> list[OverrideDefinitions]:
             env_vars={"MODULE": "tests.integration_tests.lora_config", "CONFIG": "deepseek_v4_lora_quantized_training"},
             override_args=[
                 (
-                    *GOLDEN_OVERRIDES,
+                    *_LORA_ROPE_OVERRIDES,
                     "--training.steps=2",
                     "--training.num-tokens-per-train-step=4096",
-                    "--optimizer.name=AdamW",
+                    "--optim.optimizer.name=AdamW",
                     "--parallelism.data-parallel-shard-degree=2",
                     "--parallelism.expert-parallel-degree=2",
                     "--hf-assets-path=tests/assets/deepseek_v3",
@@ -248,15 +255,14 @@ def build_deepseek_v4_test_list() -> list[OverrideDefinitions]:
             env_vars={"MODULE": "tests.integration_tests.lora_config", "CONFIG": "deepseek_v4_lora_training"},
             override_args=[
                 (
-                    *GOLDEN_OVERRIDES,
+                    *_LORA_ROPE_OVERRIDES,
                     "--training.steps=2",
                     "--training.num-tokens-per-train-step=4096",
-                    "--optimizer.name=Muon",
+                    "--optim.optimizer.name=Muon",
                     "--parallelism.data-parallel-shard-degree=2",
                     "--parallelism.expert-parallel-degree=2",
                     "--hf-assets-path=tests/assets/deepseek_v3",
-                    "--checkpoint.enable",
-                    "--checkpoint.interval=10000",
+                    "--checkpointer.interval=10000",
                 )
             ],
             ngpu=2,

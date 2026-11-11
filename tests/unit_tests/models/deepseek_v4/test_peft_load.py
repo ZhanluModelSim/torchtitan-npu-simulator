@@ -5,6 +5,7 @@
 
 import copy
 import json
+from contextlib import closing
 from dataclasses import dataclass
 
 import pytest
@@ -119,7 +120,7 @@ def _write_native_base(path, model):
     validation._write_manifest(path)
 
 
-def _manager(path, base, config, family, model, *, save_training_state=True, verify=False, initial_hf=True):
+def _manager(path, base, config, family, model, *, save_training_state=True, verify=False, initial_hf=True, keep=0):
     optimizer = OptimizersContainer.Config(
         optimizers=[AdamW.Config(pattern=".*", lr=0.02, weight_decay=0.0, fused=False)]
     ).build(model_parts=[model])
@@ -129,7 +130,7 @@ def _manager(path, base, config, family, model, *, save_training_state=True, ver
     manager = owner.Config(
         folder=str(path),
         interval=1,
-        keep_latest_k=0,
+        keep_latest_k=keep,
         initial_load_path=str(base),
         initial_load_in_hf=initial_hf,
         last_save_in_peft=False,
@@ -145,6 +146,92 @@ def _manager(path, base, config, family, model, *, save_training_state=True, ver
         sd_adapter=_adapter(config, family),
     )
     return manager
+
+
+def test_peft_retention_preserves_resume_point_and_uses_normal_cleanup(tmp_path, monkeypatch):
+    config = _model_config(monkeypatch, "v4")
+    root = tmp_path / "checkpoints"
+    base = tmp_path / "base"
+    _write_native_base(base, _model(config))
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+
+    def new_manager():
+        return _manager(root, base, config, "v4", _model(config), verify=True, initial_hf=False, keep=2)
+
+    def retained():
+        return {path.name for path in root.iterdir()}
+
+    with closing(new_manager()) as manager:
+        manager.states["train_state"].step = manager.states["dataloader"].step = 1
+        assert manager.save(1)
+        weights_only = root / "step-3"
+        adapters = {
+            name: value for name, value in manager.states["model"].state_dict().items() if is_lora_parameter(name)
+        }
+        dcp.save(adapters, checkpoint_id=weights_only)
+        validation._write_manifest(weights_only)
+        manager._finalize_peft_directory(str(root / "step-4"), {"peft_type": "LORA"}, {"a": torch.ones(1)})
+        assert manager._find_load_step() == 1
+    assert retained() == {"step-1", "step-3", "step-4"}
+
+    with closing(new_manager()) as manager:
+        assert manager.load()
+        assert manager.states["train_state"].step == manager.states["dataloader"].step == 1
+        native_save = manager.dcp_save
+
+        def interrupted_save(*args, **kwargs):
+            native_save(*args, **kwargs)
+            raise OSError("injected failure before manifest completion")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(manager, "dcp_save", interrupted_save)
+            with pytest.raises(OSError, match="before manifest completion"):
+                manager.save(5)
+        assert (root / "step-5" / ".metadata").is_file()
+        assert not validation.is_checkpoint_manifest_complete(root / "step-5", required=False)
+        assert manager._find_load_step() == 1
+    assert retained() == {"step-1", "step-4", "step-5"}
+
+    with closing(new_manager()) as manager:
+        manager.states["train_state"].step = manager.states["dataloader"].step = 5
+        assert manager.save(5)
+        assert validation.is_checkpoint_manifest_complete(root / "step-5", required=True)
+        assert manager._find_load_step() == 5
+        assert manager._find_load_step(max_step=4) == 1
+    assert retained() == {"step-1", "step-4", "step-5"}
+
+    with closing(new_manager()) as manager:
+        assert manager.load()
+        assert manager.states["train_state"].step == manager.states["dataloader"].step == 5
+        assert manager.save(6)
+        assert manager._find_load_step() == 6
+    assert retained() == {"step-5", "step-6"}
+
+
+def test_peft_retention_preserves_native_resume_when_newer_dcp_lacks_adapters(tmp_path, monkeypatch):
+    config = _model_config(monkeypatch, "v4")
+    root = tmp_path / "checkpoints"
+    base = tmp_path / "base"
+    _write_native_base(base, _model(config))
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+
+    with closing(_manager(root, base, config, "v4", _model(config), initial_hf=False, keep=2)) as manager:
+        manager.states["train_state"].step = manager.states["dataloader"].step = 1
+        assert manager.save(1)
+        saved = manager._flattened_model_states_sd()
+        dcp.save(
+            {name: value for name, value in saved.items() if not is_lora_parameter(name)}, checkpoint_id=root / "step-2"
+        )
+
+        assert manager.load()
+        assert manager.states["train_state"].step == 1
+        with pytest.raises(ValueError, match="requires adapter tensors"):
+            manager.load(step=2)
+
+        manager._purge_stale_checkpoints(saving_step=3)
+        manager._finalize_peft_directory(str(root / "step-3"), {"peft_type": "LORA"}, {"a": torch.ones(1)})
+
+    assert {path.name for path in root.iterdir()} == {"step-1", "step-2", "step-3"}
 
 
 def _clone_state(model):
@@ -371,15 +458,38 @@ def test_real_hf_entry_forwards_quantized_flag_to_reader_boundary(tmp_path, monk
         manager.close()
 
 
-def test_v41_real_resume_entry_rejects_native_checkpoint_without_adapters(tmp_path, monkeypatch):
-    config = _model_config(monkeypatch, "v41")
+@pytest.mark.parametrize("family", ["v4", "v41"])
+@pytest.mark.parametrize("missing", ["all", "one"])
+def test_real_resume_rejects_missing_adapters_before_loading_any_live_state(tmp_path, monkeypatch, family, missing):
+    config = _model_config(monkeypatch, family)
     model = _model(config)
     run = tmp_path / "run"
-    _write_native_base(run / "step-3", model)
-    manager = _manager(run, tmp_path / "base", config, "v41", model)
+    saved = _clone_state(model)
+    adapter_names = sorted(name for name in saved if is_lora_parameter(name))
+    assert len(adapter_names) > 1
+    for name in adapter_names if missing == "all" else adapter_names[:1]:
+        del saved[name]
+    # A complete base must not make an incomplete adapter resume acceptable.
+    saved = {name: value + 3 for name, value in saved.items()}
+    dcp.save(saved, checkpoint_id=run / "step-3")
+    manager = _manager(run, tmp_path / "base", config, family, model)
+    before = _clone_state(model)
+    ema_before = copy.deepcopy(manager.states[EMA_KEY].state_dict())
+    loads = []
+    original_load = dcp.load
+
+    def record_load(*args, **kwargs):
+        loads.append(kwargs.get("checkpoint_id"))
+        return original_load(*args, **kwargs)
+
+    monkeypatch.setattr(dcp, "load", record_load)
     try:
         with pytest.raises(ValueError, match="requires adapter tensors"):
             manager.load()
+        assert loads == []
+        _assert_state(model.state_dict(), before)
+        _assert_state(manager.states[EMA_KEY].state_dict(), ema_before)
+        assert manager.states["train_state"].step == manager.states["dataloader"].step == 0
     finally:
         manager.close()
 

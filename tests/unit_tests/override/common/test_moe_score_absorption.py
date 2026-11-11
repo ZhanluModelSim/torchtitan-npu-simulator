@@ -132,29 +132,74 @@ def test_compile_friendly_local_reorder_matches_upstream():
     """The compile-time opt-in reorder is the exact upstream permutation."""
     pytest.importorskip("torch_npu")
     from torchtitan_npu.override.common.token_dispatcher import (
-        apply_compile_friendly_local_reorder,
+        configure_dispatchers_for_compile,
     )
 
-    fake_self = SimpleNamespace(num_experts=4, top_k=2)
     x_TD = torch.randn(8, 3)
     scores_TK = torch.rand(8, 2)
     expert_ids_TK = torch.tensor([[3, 1], [0, 0], [2, 1], [1, 3], [0, 2], [3, 3], [1, 0], [2, 2]])
 
-    saved = (
-        LocalTokenDispatcher._local_reorder,
-        AllToAllTokenDispatcher._local_reorder,
+    for cls in (LocalTokenDispatcher, AllToAllTokenDispatcher):
+        config = cls.Config(num_experts=4, top_k=2)
+        compiled, eager = cls(config), cls(config)
+        original = cls._local_reorder
+        configure_dispatchers_for_compile(compiled, eager_all_to_all=False)
+        assert cls._local_reorder is original
+        assert compiled._local_reorder.__func__ is not original
+        assert eager._local_reorder.__func__ is original
+        patched = compiled._local_reorder(x_TD, scores_TK, expert_ids_TK)
+        upstream = eager._local_reorder(x_TD, scores_TK, expert_ids_TK)
+        for got, want in zip(patched, upstream, strict=True):
+            torch.testing.assert_close(got, want)
+
+
+def test_v41_compile_keeps_variable_splits_eager_and_model_local(monkeypatch):
+    import torch._inductor.config as inductor_config
+
+    from torchtitan_npu.models.deepseek_v4_1.parallelize import _apply_compile_v4_1
+
+    class SplitDispatcher(AllToAllTokenDispatcher):
+        @property
+        def ep_mesh(self):
+            return object()
+
+        def dispatch(self, x, count):
+            assert not torch.compiler.is_compiling()
+            return x.split((count, x.numel() - count))
+
+        def combine(self, left, right):
+            assert not torch.compiler.is_compiling()
+            return torch.cat((left, right))
+
+    class Block(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.dispatcher = SplitDispatcher(SplitDispatcher.Config(num_experts=2, top_k=1))
+
+        def forward(self, x, count):
+            left, right = self.dispatcher.dispatch(x, count)
+            return self.dispatcher.combine(left.square(), right * 3)
+
+    # Run the production compile assembly with AOTAutograd on CPU.
+    compile_module = torch.nn.Module.compile
+    monkeypatch.setattr(
+        torch.nn.Module, "compile", lambda module, **kw: compile_module(module, **(kw | {"backend": "aot_eager"}))
     )
-    try:
-        apply_compile_friendly_local_reorder()
-        for cls in (LocalTokenDispatcher, AllToAllTokenDispatcher):
-            upstream = dispatcher_patch.TorchTitanLocalTokenDispatcher._local_reorder(
-                fake_self, x_TD, scores_TK, expert_ids_TK
-            )
-            patched = cls._local_reorder(fake_self, x_TD, scores_TK, expert_ids_TK)
-            for got, want in zip(patched, upstream, strict=True):
-                torch.testing.assert_close(got, want)
-    finally:
-        LocalTokenDispatcher._local_reorder, AllToAllTokenDispatcher._local_reorder = saved
+    monkeypatch.setattr(inductor_config, "do_not_emit_runtime_assertions", False)
+    for setting in ("capture_scalar_outputs", "skip_fwd_side_effects_in_bwd_under_checkpoint"):
+        monkeypatch.setattr(torch._dynamo.config, setting, False)
+    model = torch.nn.Module()
+    compiled, eager = Block(), Block()
+    model.layers = torch.nn.ModuleList([compiled])
+    _apply_compile_v4_1(model, compile_config=SimpleNamespace(backend="inductor"))
+    assert inductor_config.do_not_emit_runtime_assertions is False
+    assert eager.dispatcher.dispatch.__func__ is SplitDispatcher.dispatch
+    for count in (1, 3):
+        x = torch.arange(4.0, requires_grad=True)
+        actual = compiled(x, count)
+        torch.testing.assert_close(actual, eager(x, count))
+        actual.sum().backward()
+        torch.testing.assert_close(x.grad, torch.cat((2 * x[:count], torch.full_like(x[count:], 3))))
 
 
 def test_ep_dispatch_transports_scores_in_router_dtype(monkeypatch):

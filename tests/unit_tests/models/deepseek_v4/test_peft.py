@@ -18,7 +18,7 @@ from torch import multiprocessing as mp
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import Shard, distribute_tensor
-from torchtitan.components.checkpointer import ModelWrapper
+from torchtitan.components.checkpointer import AsyncMode, ModelWrapper
 
 from tests.unit_tests.models.deepseek_v4.lora_test_utils import _build_model_config
 from torchtitan_npu.models.deepseek_v4 import lora, peft, state_dict_adapter
@@ -279,7 +279,7 @@ class _FinalSaveCheckpoint(peft.DeepSeekV4PEFTCheckpointManager):
         return self.checkpoint_dir
 
 
-def _save_peft(rank, root, fail_finalization):
+def _save_peft(rank, root, failure):
     model = torch.nn.Module()
     mesh = init_device_mesh("cpu", (2,))
     adapter = distribute_tensor(torch.arange(6).reshape(2, 3).float(), mesh, [Shard(0)])
@@ -288,11 +288,16 @@ def _save_peft(rank, root, fail_finalization):
     manager.states = {"model": ModelWrapper(model)}
     manager.last_save_in_peft = True
     manager.peft_base_model_name_or_path = None
-    manager.sd_adapter = _MappingStubAdapter(fail_finalization)
+    manager.sd_adapter = _MappingStubAdapter(failure == "finalization")
     manager.initial_load_path = ""
     manager.initial_load_in_hf = False
     manager.export_dtype = torch.float32
     manager.checkpoint_dir = str(Path(root) / "checkpoint")
+    manager.load_only = manager.enable_first_step_checkpoint = manager.verify_hash_manifest = False
+    manager.keep_latest_k = 0
+    manager.async_mode = AsyncMode.DISABLED
+    manager.stager = None
+    manager.staging_future = manager.save_future = None
 
     def unexpected_dcp_save(*args, **kwargs):
         raise AssertionError("PEFT export must not use DCP save")
@@ -300,15 +305,24 @@ def _save_peft(rank, root, fail_finalization):
     original_save = dcp.save
     try:
         dcp.save = unexpected_dcp_save
-        manager._save_last_step(1)
+        assert manager.save(1, last_step=True)
     finally:
         dcp.save = original_save
 
 
-@pytest.mark.parametrize("fail_finalization", [False, True], ids=["adapter-file", "rank-zero-io-failure"])
-def test_final_peft_save_finishes_consistently_across_ranks(tmp_path, fail_finalization):
-    messages = _run_distributed(tmp_path, _save_peft, fail_finalization)
-    if fail_finalization:
+@pytest.mark.parametrize("failure", [None, "preflight", "finalization"])
+def test_final_peft_save_finishes_consistently_across_ranks(tmp_path, failure):
+    checkpoint = tmp_path / "checkpoint"
+    if failure == "preflight":
+        peft.DeepSeekV4PEFTCheckpointManager._finalize_peft_directory(
+            str(checkpoint), {"peft_type": "LORA"}, {"lora_a": torch.ones(1)}
+        )
+    messages = _run_distributed(tmp_path, _save_peft, failure)
+    if failure == "preflight":
+        assert messages[0] and "PEFT checkpoint preflight failed: FileExistsError" in messages[0]
+        assert messages[1] == messages[0]
+        torch.testing.assert_close(load_file(checkpoint / "adapter_model.safetensors")["lora_a"], torch.ones(1))
+    elif failure == "finalization":
         assert all(
             message and "PEFT checkpoint finalization failed: OSError: injected" in message for message in messages
         )

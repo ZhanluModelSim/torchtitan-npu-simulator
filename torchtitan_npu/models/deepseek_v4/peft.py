@@ -9,6 +9,8 @@ __all__ = ["DeepSeekV4PEFTCheckpointManager", "select_adapter_only_state"]
 import json
 import logging
 import os
+import pickle
+import tempfile
 from dataclasses import dataclass
 from typing import Any
 
@@ -16,10 +18,11 @@ import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 from safetensors.torch import save_file
 from torch.distributed.tensor import DTensor
-from torchtitan.components.checkpointer import EMA, MODEL
+from torchtitan.components.checkpointer import DATALOADER, EMA, LR_SCHEDULER, MODEL, OPTIMIZER, TRAIN_STATE
 from torchtitan.components.checkpointer.utils import canonical_fqn
 from torchtitan.tools import filesystem
 
+from torchtitan_npu.extensions.components.validation import is_checkpoint_manifest_complete
 from torchtitan_npu.extensions.torchtitan.components import checkpoint as checkpoint_extensions
 from torchtitan_npu.extensions.torchtitan.components.checkpoint import CheckpointManager as NPUCheckpointManager
 
@@ -71,16 +74,120 @@ class DeepSeekV4PEFTCheckpointManager(NPUCheckpointManager):
         self.last_save_in_peft = config.last_save_in_peft
         self.periodic_save_adapter_only = config.periodic_save_adapter_only
         self.save_training_state = config.save_training_state
+        self._purge_resume_step = -1
         if self.periodic_save_adapter_only and not self.initial_load_path:
             raise ValueError("periodic_save_adapter_only requires a fixed initial_load_path for the frozen base")
+
+    def _is_valid_checkpoint(self, checkpoint_dir: str) -> bool:
+        # Keep the native retention decision independent of the manifest load policy.
+        if super()._is_resumable_checkpoint(checkpoint_dir) or super()._is_valid_checkpoint(checkpoint_dir):
+            return True
+        return is_checkpoint_manifest_complete(checkpoint_dir, required=False) and all(
+            self._storage.isfile(filesystem.join(checkpoint_dir, name))
+            for name in ("adapter_model.safetensors", "adapter_config.json")
+        )
+
+    def _is_resumable_checkpoint(self, checkpoint_dir: str) -> bool:
+        return super()._is_resumable_checkpoint(checkpoint_dir) and is_checkpoint_manifest_complete(
+            checkpoint_dir, required=self.verify_hash_manifest
+        )
+
+    def _find_load_step(self, folder: str = "", max_step: int | None = None) -> int:
+        folder = folder or self.folder
+        if not self._storage.isdir(folder):
+            return -1
+
+        steps = []
+        for dirname in self._storage.listdir(folder):
+            step = self._parse_step(dirname)
+            if step is not None and (max_step is None or step <= max_step):
+                steps.append(step)
+
+        required = {
+            name for name in (OPTIMIZER, LR_SCHEDULER, DATALOADER, TRAIN_STATE) if self.states.get(name) is not None
+        }
+        latest_native = -1
+        first_resume_error: ValueError | None = None
+        for step in sorted(steps, reverse=True):
+            directory = filesystem.join(folder, f"step-{step}")
+            if not self._is_resumable_checkpoint(directory):
+                continue
+            try:
+                metadata = dcp.FileSystemReader(directory).read_metadata()
+            except FileNotFoundError:
+                # A preceding retention pass may still be deleting this directory.
+                continue
+            saved_keys = set(metadata.state_dict_metadata)
+            try:
+                self._validate_native_resume(saved_keys)
+            except ValueError as error:
+                if first_resume_error is None:
+                    first_resume_error = error
+                continue
+            if step == 0:
+                # The upstream step-0 seed is also a model-only fallback.
+                return latest_native if latest_native != -1 else 0
+            if latest_native == -1:
+                latest_native = step
+            saved_states = {key.partition(".")[0] for key in saved_keys}
+            if required <= saved_states:
+                return step
+
+        if latest_native == -1 and first_resume_error is not None:
+            raise first_resume_error
+        # Keep weights-only restart available for runs that never saved training state.
+        return latest_native
+
+    def _purge_stale_checkpoints(self, *, saving_step: int, staging_dir_prefix: str | None = None) -> None:
+        if not self._should_purge():
+            return
+        # Select once before the background worker can delete entries from this pass.
+        try:
+            self._purge_resume_step = self._find_load_step()
+        except (OSError, EOFError, pickle.UnpicklingError, ValueError) as error:
+            logger.warning("Skipping checkpoint cleanup because a resume checkpoint could not be selected: %s", error)
+            return
+        try:
+            super()._purge_stale_checkpoints(saving_step=saving_step, staging_dir_prefix=staging_dir_prefix)
+        finally:
+            self._purge_resume_step = -1
+
+    def _is_purge_exempt(self, step: int) -> bool:
+        # Exports can occupy retention slots without replacing a training resume point.
+        return super()._is_purge_exempt(step) or step == self._purge_resume_step
+
+    def save(self, curr_step: int, last_step: bool = False) -> bool:
+        if last_step and self.last_save_in_peft and self._should_save(curr_step, last_step):
+            distributed = dist.is_available() and dist.is_initialized()
+            status: list[str | None] = [None]
+            if not distributed or dist.get_rank() == 0:
+                try:
+                    checkpoint_id = self._create_checkpoint_id(curr_step)
+                    for name in (".metadata", "adapter_config.json"):
+                        if os.path.exists(os.path.join(checkpoint_id, name)):
+                            raise FileExistsError(f"A checkpoint already exists at {checkpoint_id}")
+                except Exception as exception:
+                    status[0] = f"{type(exception).__name__}: {exception}"
+            if distributed:
+                dist.broadcast_object_list(status, src=0)
+            if status[0] is not None:
+                raise RuntimeError(f"PEFT checkpoint preflight failed: {status[0]}")
+        return super().save(curr_step, last_step)
 
     @staticmethod
     def _finalize_peft_directory(checkpoint_id: str, adapter_config: dict, state_dict: dict) -> None:
         os.makedirs(checkpoint_id, exist_ok=True)
-        save_file(state_dict, os.path.join(checkpoint_id, "adapter_model.safetensors"))
-        with open(os.path.join(checkpoint_id, "adapter_config.json"), "w", encoding="utf-8") as output:
-            json.dump(adapter_config, output, indent=2, sort_keys=True)
-            output.write("\n")
+        if any(os.path.exists(os.path.join(checkpoint_id, name)) for name in (".metadata", "adapter_config.json")):
+            raise FileExistsError(f"A checkpoint already exists at {checkpoint_id}")
+        with tempfile.TemporaryDirectory(prefix=".peft-", dir=checkpoint_id) as staging:
+            weights = os.path.join(staging, "adapter_model.safetensors")
+            config = os.path.join(staging, "adapter_config.json")
+            save_file(state_dict, weights)
+            with open(config, "w", encoding="utf-8") as output:
+                json.dump(adapter_config, output, indent=2, sort_keys=True)
+                output.write("\n")
+            os.replace(weights, os.path.join(checkpoint_id, "adapter_model.safetensors"))
+            os.replace(config, os.path.join(checkpoint_id, "adapter_config.json"))
 
     def finalize_peft_checkpoint(self, checkpoint_id: str, adapter_config: dict, state_dict: dict) -> None:
         distributed = dist.is_available() and dist.is_initialized()
@@ -92,7 +199,16 @@ class DeepSeekV4PEFTCheckpointManager(NPUCheckpointManager):
                 if not isinstance(adapter, DeepSeekPEFTAdapter):
                     raise TypeError("DeepSeekV4 PEFT export requires DeepSeekV4StateDictAdapter")
                 peft_state = adapter.to_peft(state_dict)
-                peft_state = {name: value.contiguous() for name, value in peft_state.items()}
+                # Gate/up adapters can share the same A tensor after splitting.
+                # Copy only repeated views, leaving independent tensors in place.
+                seen = set()
+                for name, value in peft_state.items():
+                    value = value.contiguous()
+                    address = (value.device, value.data_ptr())
+                    if value.numel() and address in seen:
+                        value = value.clone()
+                    seen.add(address)
+                    peft_state[name] = value
                 self._finalize_peft_directory(checkpoint_id, adapter_config, peft_state)
             except Exception as error:
                 status[0] = f"{type(error).__name__}: {error}"
@@ -133,6 +249,13 @@ class DeepSeekV4PEFTCheckpointManager(NPUCheckpointManager):
     def _validate_native_resume(self, saved_keys: set[str]) -> None:
         if any(key.endswith(".w13_lora_b") for key in saved_keys):
             raise ValueError("This checkpoint uses the unsupported historical w13_lora_b adapter format")
+        expected_adapters = {key for key in self.states[MODEL].state_dict() if is_lora_parameter(key)}
+        missing_adapters = expected_adapters - saved_keys
+        if missing_adapters:
+            raise ValueError(
+                "LoRA resume requires adapter tensors; load the base through initial_load_path. "
+                f"Missing tensors: {sorted(missing_adapters)}"
+            )
 
     def _load_checkpoint(self, states, checkpoint_id, *, from_hf: bool, from_quantized: bool) -> None:
         if MODEL not in states:
@@ -151,11 +274,10 @@ class DeepSeekV4PEFTCheckpointManager(NPUCheckpointManager):
                 self._validate_native_resume(saved_keys)
             model_state = states[MODEL].state_dict()
             model_buffer_keys = self._model_buffer_keys()
-            has_adapters = any(is_lora_parameter(key) for key in saved_keys)
             has_base = all(
                 key in saved_keys for key in model_state if not is_lora_parameter(key) and key not in model_buffer_keys
             )
-            if initial_base or not has_adapters:
+            if initial_base:
                 flat = {
                     key: value
                     for key, value in self._flattened_model_states_sd(states).items()
@@ -166,9 +288,6 @@ class DeepSeekV4PEFTCheckpointManager(NPUCheckpointManager):
             else:
                 if not self.initial_load_path:
                     raise ValueError("Loading an adapter-only DCP requires initial_load_path for the frozen base")
-                missing_adapters = {key for key in model_state if is_lora_parameter(key)} - saved_keys
-                if missing_adapters:
-                    raise ValueError(f"Adapter checkpoint is missing LoRA tensors: {sorted(missing_adapters)}")
                 # Check both sources before either can change live weights.
                 self._verify_load_source(self.initial_load_path)
                 if self.initial_load_in_hf:

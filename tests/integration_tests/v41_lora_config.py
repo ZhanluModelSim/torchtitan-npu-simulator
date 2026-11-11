@@ -3,6 +3,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -11,7 +12,6 @@ import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 from torchtitan.components.checkpointer.utils import canonical_fqn
 from torchtitan.config import derive
-from torchtitan.tools.logging import logger
 
 from tests.integration_tests.lora_config import LoRATrainer, _cpu_tensor
 from torchtitan_npu.models.deepseek_v4.lora import is_lora_parameter
@@ -23,6 +23,8 @@ from torchtitan_npu.models.deepseek_v4_1.config_registry import (
 from torchtitan_npu.models.deepseek_v4_1.engram.host import HostEngramTable
 from torchtitan_npu.models.deepseek_v4_1.vision.data import build_image_token_layout
 
+logger = logging.getLogger(__name__)
+
 
 class V41LoRATrainer(LoRATrainer, DeepSeekV41Trainer):
     @dataclass(kw_only=True, slots=True)
@@ -30,24 +32,25 @@ class V41LoRATrainer(LoRATrainer, DeepSeekV41Trainer):
         check_resume_state: bool = False
 
     def __init__(self, config):
-        if config.checkpoint.periodic_save_adapter_only:
-            config.checkpoint.initial_load_path = str(Path(config.dump_folder) / "fixed_base")
+        if config.checkpointer.periodic_save_adapter_only:
+            config.checkpointer.initial_load_path = str(Path(config.dump_folder) / "fixed_base")
         super().__init__(config)
-        if config.checkpoint.periodic_save_adapter_only:
-            base = Path(self.checkpointer.initial_load_path)
+        if config.checkpointer.periodic_save_adapter_only:
+            base = Path(self.engine.checkpointer.initial_load_path)
             if not (base / ".metadata").exists():
                 # All ranks save the initialized, sharded base once; resumed runs reuse it.
                 dcp.save(
-                    {name: value for name, value in self.model_parts[0].state_dict().items() if not is_lora_parameter(name)},
+                    {name: value for name, value in self.engine.model_parts[0].state_dict().items()
+                     if not is_lora_parameter(name)},
                     checkpoint_id=base,
                 )
 
     def train(self):
         super().train()
-        if self.checkpointer.periodic_save_adapter_only:
-            path = Path(self.checkpointer.folder) / f"step-{self.config.checkpoint.interval}"
+        if self.engine.checkpointer.periodic_save_adapter_only:
+            path = Path(self.engine.checkpointer.folder) / f"step-{self.config.checkpointer.interval}"
             keys = dcp.FileSystemReader(path).read_metadata().state_dict_metadata
-            model = self.model_parts[0]
+            model = self.engine.model_parts[0]
             assert any(is_lora_parameter(name) for name in keys)
             assert any(name.startswith("optimizer.") for name in keys)
             buffers = {canonical_fqn(name) for name, _ in model.named_buffers()}
@@ -56,10 +59,11 @@ class V41LoRATrainer(LoRATrainer, DeepSeekV41Trainer):
             assert not frozen.intersection(keys)
 
     def _check_resume_state(self, step):
-        optimizer = self.optimizers.state_dict()
+        optimizer = self.engine.optim.optimizers.state_dict()
         tensors = {
             "adapters": {
-                name: _cpu_tensor(value) for name, value in self.model_parts[0].named_parameters()
+                name: _cpu_tensor(value)
+                for name, value in self.engine.model_parts[0].named_parameters()
                 if is_lora_parameter(name)
             },
             "optimizer": {name: _cpu_tensor(value) for name, value in optimizer.items()
@@ -68,7 +72,7 @@ class V41LoRATrainer(LoRATrainer, DeepSeekV41Trainer):
         assert tensors["adapters"] and tensors["optimizer"]
         metadata = {name: value for name, value in optimizer.items() if not isinstance(value, torch.Tensor)}
         path = Path(self.config.dump_folder) / f"resume_state_step{step}_rank{dist.get_rank()}.pt"
-        if (self.config.checkpoint.load_step or 0) > 0:
+        if self.config.checkpointer.load_step > 0:
             expected = torch.load(path, map_location="cpu", weights_only=True)
             torch.testing.assert_close(tensors, expected["tensors"], rtol=0, atol=0)
             assert metadata == expected["metadata"]
@@ -79,22 +83,23 @@ class V41LoRATrainer(LoRATrainer, DeepSeekV41Trainer):
                 torch.save({"tensors": tensors, "metadata": metadata}, stream)
 
     def train_step(self, data_iterator):
-        checkpoint = self.config.checkpoint
-        load_step = checkpoint.load_step or 0
-        if self.config.check_resume_state and load_step > 0 and self.step == load_step + 1:
+        checkpoint = self.config.checkpointer
+        load_step = checkpoint.load_step
+        if self.config.check_resume_state and load_step > 0 and self.engine.num_completed_steps == load_step:
             self._check_resume_state(load_step)
-        tables = [m for m in self.model_parts[0].modules() if isinstance(m, HostEngramTable)]
+        tables = [m for m in self.engine.model_parts[0].modules() if isinstance(m, HostEngramTable)]
         assert len(tables) == 2
         super().train_step(data_iterator)
         assert all(table.pending_sparse_grad() is None for table in tables)
         assert all(not table.weight.requires_grad for table in tables)
-        if self.config.check_resume_state and self.step >= checkpoint.interval:
-            self._check_resume_state(self.step)
+        step = self.engine.num_completed_steps
+        if self.config.check_resume_state and step >= checkpoint.interval:
+            self._check_resume_state(step)
 
 
 def deepseek_v4_1_lora_training():
     config = deepseek_v4_1_debugmodel_lora()
-    config.checkpoint.periodic_save_adapter_only = False
+    config.checkpointer.periodic_save_adapter_only = False
     return derive(config, V41LoRATrainer.Config)
 
 
@@ -109,7 +114,7 @@ def deepseek_v4_1_lora_quantized_training():
 def deepseek_v4_1_lora_adapter_only_training():
     config = deepseek_v4_1_lora_training()
     config.check_resume_state = True
-    config.checkpoint.periodic_save_adapter_only = True
+    config.checkpointer.periodic_save_adapter_only = True
     return config
 
 

@@ -41,9 +41,8 @@ _DENSE = (
     ".attention.wo_a",
     ".attention.wo_b",
     ".attention.indexer.wq_b",
-    ".moe.shared_experts.w1",
+    ".moe.shared_experts.w13",
     ".moe.shared_experts.w2",
-    ".moe.shared_experts.w3",
 )
 _ROUTED = (".moe.routed_experts.w13", ".moe.routed_experts.w2")
 

@@ -55,6 +55,13 @@ def _is_writer_and_reader_rank() -> bool:
     return not (dist.is_available() and dist.is_initialized()) or dist.get_rank() == 0
 
 
+def is_checkpoint_manifest_complete(directory: str | os.PathLike, *, required: bool) -> bool:
+    """Inspect completion markers without hashing or entering collectives."""
+    return not filesystem.exists(filesystem.join(directory, _PENDING_MANIFEST_FILENAME)) and (
+        not required or filesystem.isfile(filesystem.join(directory, _MANIFEST_FILENAME))
+    )
+
+
 def _clear_manifest_pending(directory: str | os.PathLike) -> None:
     pending_path = filesystem.join(directory, _PENDING_MANIFEST_FILENAME)
     if filesystem.exists(pending_path):

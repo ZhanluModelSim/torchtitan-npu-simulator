@@ -41,6 +41,7 @@ fp32-score-multiply + bf16 ``scatter_add``.
 """
 
 from dataclasses import dataclass
+from types import MethodType
 from typing import TYPE_CHECKING, ClassVar, cast
 
 import spmd_types as spmd
@@ -114,15 +115,20 @@ def _compile_friendly_local_reorder(
     )
 
 
-def apply_compile_friendly_local_reorder() -> None:
-    """Opt the dispatchers into the traceable stable reorder (compile only).
+def configure_dispatchers_for_compile(model: torch.nn.Module, *, eager_all_to_all: bool) -> None:
+    """Opt this model's dispatchers into the compile policy.
 
     Called by the V4.1 compile assembly (models/deepseek_v4_1/parallelize)
-    when torch.compile is enabled; eager runs keep the upstream
-    ``torch.argsort(stable=True)`` helper.
+    when torch.compile is enabled; eager models keep the upstream
+    ``torch.argsort(stable=True)`` helper. Data-dependent EP communication
+    stays eager when requested.
     """
-    LocalTokenDispatcher._local_reorder = _compile_friendly_local_reorder
-    AllToAllTokenDispatcher._local_reorder = _compile_friendly_local_reorder
+    for dispatcher in model.modules():
+        if isinstance(dispatcher, (LocalTokenDispatcher, AllToAllTokenDispatcher)):
+            dispatcher._local_reorder = MethodType(_compile_friendly_local_reorder, dispatcher)
+        if eager_all_to_all and isinstance(dispatcher, AllToAllTokenDispatcher) and dispatcher.ep_mesh is not None:
+            for name in ("dispatch", "combine"):
+                setattr(dispatcher, name, torch.compiler.disable(getattr(dispatcher, name)))
 
 
 class AscAllToAllTokenDispatcher(AllToAllTokenDispatcher):

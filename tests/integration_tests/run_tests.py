@@ -662,7 +662,9 @@ def _migration_pending_reason(case: OverrideDefinitions) -> str | None:
         return "Muon LoRA/context-parallel integration migration is pending"
     if case.verify_ema_checkpoint:
         return "EMA migration is pending"
-    if case.check_resume and "lora" in case.test_name:
+    if case.check_resume and "lora" in case.test_name and not any(
+        arg.startswith("--checkpointer.load-step=") for arg in arguments
+    ):
         return "LoRA checkpoint migration is pending"
     return None
 

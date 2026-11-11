@@ -6,19 +6,33 @@
 """LoRA training, selective freezing and PEFT export on real NPUs."""
 
 import json
-from dataclasses import dataclass, fields
+import logging
+from dataclasses import dataclass, fields, replace
 from pathlib import Path
 
 import torch
 import torch.distributed as dist
 from safetensors.torch import load_file
 from torch.distributed.tensor import DTensor
-from torchtitan.tools.logging import logger
+from torchtitan.components.optim import DistMuon
+from torchtitan.config import override
+from torchtitan.config.transform import apply_transforms
 
 from torchtitan_npu.extensions.torchtitan.trainer import TrainerEx
-from torchtitan_npu.models.deepseek_v4.config_registry import deepseek_v4_debugmodel
-from torchtitan_npu.models.deepseek_v4.lora import DeepSeekV4LoRAConverter, is_lora_parameter
-from torchtitan.distributed.flex_shard.dist_muon import DistMuon
+from torchtitan_npu.models.deepseek_v4.config_registry import _dsv4_muon_profile, deepseek_v4_debugmodel
+from torchtitan_npu.models.deepseek_v4.lora import deepseek_v4_lora_transform, is_lora_parameter
+from torchtitan_npu.models.deepseek_v4.peft import DeepSeekV4PEFTCheckpointManager
+from torchtitan_npu.override.common.rope import WorkaroundComplexRoPE, workaround
+from torchtitan_npu.patches.torchtitan.models.common.rope import SplitComplexRoPEConfig
+
+logger = logging.getLogger(__name__)
+
+
+@override(target=SplitComplexRoPEConfig)
+def lora_rope_workaround(cfg: SplitComplexRoPEConfig) -> WorkaroundComplexRoPE.Config:
+    # LoRA wraps the config in a frozen subclass, so the exact-type override skips it.
+    # This RoPE module has buffers only.
+    return workaround(cfg)
 
 
 def _cpu_tensor(tensor):
@@ -34,16 +48,24 @@ class LoRATrainer(TrainerEx):
     class Config(TrainerEx.Config):
         pass
 
+    def __init__(self, config):
+        if config.checkpointer.load_step > 0:
+            # Compare with the uninterrupted artifacts without overwriting them.
+            config.checkpointer.load_only = True
+        super().__init__(config)
+
     def train_step(self, data_iterator):
-        checkpoint = self.config.checkpoint
-        if checkpoint.save_training_state and (checkpoint.load_step or 0) > 0 and self.step == checkpoint.load_step + 1:
+        engine = self.engine
+        checkpoint = self.config.checkpointer
+        step = engine.num_completed_steps + 1
+        if checkpoint.save_training_state and checkpoint.load_step > 0 and step == checkpoint.load_step + 1:
             expected = torch.load(
                 self._optimizer_snapshot_path(checkpoint.load_step),
                 map_location="cpu",
                 weights_only=True,
             )
             torch.testing.assert_close(self._optimizer_snapshot(), expected, rtol=0, atol=0)
-        model = self.model_parts[0]
+        model = engine.model_parts[0]
         self._check_quantized_parameters(model)
         frozen = {name: _cpu_tensor(p) for name, p in model.named_parameters() if not p.requires_grad}
         biases = {name: _cpu_tensor(b) for name, b in model.named_buffers() if name.endswith("expert_bias_E")}
@@ -51,15 +73,17 @@ class LoRATrainer(TrainerEx):
         before = _cpu_tensor(adapter)
         adapter_a = model.layers["0"].attention.wq_a.lora_a.weight
         before_a = _cpu_tensor(adapter_a)
-        experts = model.layers["0"].moe.routed_experts.inner_experts
-        expert_b = (experts.w1_lora_b, experts.w3_lora_b)
-        before_expert_b = [_cpu_tensor(p.full_tensor() if isinstance(p, DTensor) else p) for p in expert_b]
-        if self.config.optimizer.name == "Muon":
+        expert_b = model.layers["0"].moe.routed_experts.w13.lora_b.weight
+        before_expert_b = _cpu_tensor(expert_b.full_tensor() if isinstance(expert_b, DTensor) else expert_b)
+        if self.config.optim.optimizer.name == "Muon":
             muon_parameters = {
-                id(p) for optimizer in self.optimizers.optimizers if isinstance(optimizer, DistMuon)
-                for group in optimizer.param_groups for p in group["params"]
+                id(p)
+                for optimizer in engine.optim.optimizers.optimizers
+                if isinstance(optimizer, DistMuon)
+                for group in optimizer.param_groups
+                for p in group["params"]
             }
-            assert all(id(p) in muon_parameters for p in expert_b)
+            assert id(expert_b) in muon_parameters
         assert biases
         super().train_step(data_iterator)
         for name, expected in frozen.items():
@@ -69,36 +93,39 @@ class LoRATrainer(TrainerEx):
         for name, expected in biases.items():
             torch.testing.assert_close(_cpu_tensor(model.get_buffer(name)), expected, rtol=0, atol=0)
         assert not torch.equal(_cpu_tensor(adapter), before)
-        for parameter, previous in zip(expert_b, before_expert_b, strict=True):
-            current = parameter.full_tensor() if isinstance(parameter, DTensor) else parameter
-            assert not torch.equal(_cpu_tensor(current), previous)
+        current = _cpu_tensor(expert_b.full_tensor() if isinstance(expert_b, DTensor) else expert_b)
+        assert current.shape[1] == 2
+        for gate_up in range(2):
+            assert not torch.equal(current[:, gate_up], before_expert_b[:, gate_up])
         if adapter_a.requires_grad and torch.count_nonzero(before):
             assert not torch.equal(_cpu_tensor(adapter_a), before_a)
 
-        if checkpoint.save_training_state and checkpoint.interval > 0 and self.step % checkpoint.interval == 0:
+        if checkpoint.save_training_state and not checkpoint.load_only and step % checkpoint.interval == 0:
             state = self._optimizer_snapshot()
-            state_fields = ("momentum_buffer", "exp_avg") if self.config.optimizer.name == "Muon" else ("exp_avg",)
+            state_fields = ("momentum_buffer", "exp_avg") if self.config.optim.optimizer.name == "Muon" else ("exp_avg",)
             for field in state_fields:
                 values = [value for name, value in state.items() if field in name]
                 assert values and any(torch.count_nonzero(value) for value in values), field
-            torch.save(state, self._optimizer_snapshot_path(self.step))
+            torch.save(state, self._optimizer_snapshot_path(step))
 
     def train(self):
         super().train()
+        engine = self.engine
+        checkpointer = engine.checkpointer
         state = {
             name: (value.full_tensor() if isinstance(value, DTensor) else value).detach().cpu()
-            for name, value in self.model_parts[0].state_dict().items()
+            for name, value in engine.model_parts[0].state_dict().items()
             if is_lora_parameter(name)
         }
-        expected = self.checkpointer.sd_adapter.to_peft(state)
-        checkpoint = Path(self.checkpointer._create_checkpoint_id(self.step))
+        expected = checkpointer.sd_adapter.to_peft(state)
+        checkpoint = Path(checkpointer._create_checkpoint_id(engine.num_completed_steps))
         exported = load_file(checkpoint / "adapter_model.safetensors")
         assert exported.keys() == expected.keys()
         for name, value in expected.items():
-            torch.testing.assert_close(exported[name], value.to(self.checkpointer.export_dtype), rtol=0, atol=0)
+            torch.testing.assert_close(exported[name], value.to(checkpointer.export_dtype), rtol=0, atol=0)
         with (checkpoint / "adapter_config.json").open(encoding="utf-8") as source:
             metadata = json.load(source)
-        options = self.config.model_spec.model.lora
+        options = self.config.model.layers[0].attention.wq_a
         assert metadata["r"] == options.rank
         assert metadata["lora_alpha"] == options.alpha
         target_parameters = set(metadata["target_parameters"])
@@ -124,7 +151,7 @@ class LoRATrainer(TrainerEx):
     def _optimizer_snapshot(self):
         return {
             name: _cpu_tensor(value)
-            for name, value in self.optimizers.state_dict().items()
+            for name, value in self.engine.optim.optimizers.state_dict().items()
             if isinstance(value, torch.Tensor)
         }
 
@@ -153,10 +180,9 @@ class LoRATrainer(TrainerEx):
 
 
 def deepseek_v4_lora_training():
-    config = deepseek_v4_debugmodel(converters=[DeepSeekV4LoRAConverter.Config()])
-    config.checkpoint.enable = True
-    config.checkpoint.interval = 10000
-    config.checkpoint.periodic_save_adapter_only = False
+    config = apply_transforms(deepseek_v4_debugmodel(), [deepseek_v4_lora_transform()])
+    config.optim.optimizer = replace(config.optim.optimizer, _muon_profile=_dsv4_muon_profile(config.model))
+    config.checkpointer = DeepSeekV4PEFTCheckpointManager.Config(interval=10000, periodic_save_adapter_only=False)
     return LoRATrainer.Config(
         **{field.name: getattr(config, field.name) for field in fields(config) if field.init},
     )

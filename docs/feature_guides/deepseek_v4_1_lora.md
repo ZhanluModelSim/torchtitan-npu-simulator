@@ -12,21 +12,21 @@ HF_ASSETS_PATH=/path/to/tokenizer \
 CKPT_INIT_LOAD_PATH=/path/to/v41-hf-base \
 CKPT_SAVE_LOAD_PATH=/path/to/run/checkpoint \
 bash examples/deepseek_v4_1/deepseek_v4_1_flash_lora_4k_a3.sh \
-  --optimizer.name Muon \
-  --training.steps 150 --checkpoint.interval 50
+  --optim.optimizer.name Muon \
+  --training.steps 150 --checkpointer.interval 50
 ```
 
-使用 `--optimizer.name AdamW` 选择 AdamW。默认 rank 为 16、alpha 为 32，专家 rank 为 16。通过 `CONFIG=deepseek_v4_1_flash_text_lora` 使用同一脚本训练正式纯文本模型：脚本将默认数据集切换为 `c4_test`，也可用 `DATASET`、`DATASET_PATH` 选择文本数据。多模态默认数据集为 `cc12m-test`。用户环境变量与末尾 CLI 参数可覆盖脚本默认值。
+使用 `--optim.optimizer.name AdamW` 选择 AdamW。默认 rank 为 16、alpha 为 32，专家 rank 为 16。通过 `CONFIG=deepseek_v4_1_flash_text_lora` 使用同一脚本训练正式纯文本模型：脚本将默认数据集切换为 `c4_test`，也可用 `DATASET`、`DATASET_PATH` 选择文本数据。多模态默认数据集为 `cc12m-test`。用户环境变量与末尾 CLI 参数可覆盖脚本默认值。
 
 `deepseek_v4_1_debugmodel_lora` 为纯文本调试配置。设备数量应满足模型内存需求，仅缩小并行度不会缩小模型。
 
-从 native DCP 基座初始化时增加 `--checkpoint.no-initial-load-in-hf`。恢复 native checkpoint 时，保持 EP 度数、Engram 表结构、tokenizer 映射和 LoRA 配置一致。
+从 native DCP 基座初始化时增加 `--checkpointer.no-initial-load-in-hf`。恢复 native checkpoint 时，保持 EP 度数、Engram 表结构、tokenizer 映射和 LoRA 配置一致。保持相同的 `CKPT_INIT_LOAD_PATH` 和 `CKPT_SAVE_LOAD_PATH`，使用 `--checkpointer.load-step 50` 指定恢复点。
 
 ## Checkpoint 与导出
 
-初始化加载基座时保留新建的 adapter。周期 checkpoint 默认保存 adapter、持久化模型 buffer 和训练状态；恢复时先加载固定基座，再恢复这些状态，因此需要保留 `initial_load_path`。使用 `--checkpoint.no-periodic-save-adapter-only` 可将基座和 Engram 分片一并写入周期 DCP。恢复路径中的 checkpoint 必须包含 adapter。
+初始化加载基座时保留新建的 adapter。周期 checkpoint 默认保存 adapter、持久化模型 buffer 和训练状态；恢复时先加载固定基座，再恢复这些状态，因此需要保留 `initial_load_path`。使用 `--checkpointer.no-periodic-save-adapter-only` 可将基座和 Engram 分片一并写入周期 DCP。恢复路径中的 checkpoint 必须包含 adapter。
 
-最后一步保存 `adapter_model.safetensors` 和 `adapter_config.json`。Engram 权重保留在所引用的基座中，PEFT 仅导出训练的 adapter。使用 `--checkpoint.no-last-save-in-peft` 可改为保存 native checkpoint。`last_save_in_hf` 会被拒绝，因为普通全模型 HF 导出不保留 LoRA adapter。
+最后一步保存 `adapter_model.safetensors` 和 `adapter_config.json`。Engram 权重保留在所引用的基座中，PEFT 仅导出训练的 adapter。使用 `--checkpointer.no-last-save-in-peft --checkpointer.no-last-save-model-only` 可在最后一步保存可续训的 native checkpoint。`last_save_in_hf` 会被拒绝，因为普通全模型 HF 导出不保留 LoRA adapter。
 
 将 adapter 合并到浮点 V4.1 HF 基座：
 
