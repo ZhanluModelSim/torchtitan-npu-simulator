@@ -11,9 +11,10 @@ from dataclasses import dataclass, fields
 import pytest
 from torchtitan.components.checkpointer import CheckpointManager
 from torchtitan.components.optim import AdamW, Optim, OptimizersContainer
-from torchtitan.config import ConfigManager
+from torchtitan.config import ConfigManager, DebugConfig
 from torchtitan.config import TrainingConfig as UpstreamTrainingConfig
 from torchtitan.models.llama3 import model_registry
+from torchtitan.observability.sdc_replayer import SDCReplayer
 from torchtitan.trainer import Trainer
 
 import torchtitan_npu.config as npu_config
@@ -691,6 +692,49 @@ def test_config_manager_preserves_recipe_optimizer_type_and_fields(monkeypatch, 
     assert config.optim.optimizer.recipe_policy == "retain-me"
     assert config.optim.optimizer.optimizers[0].lr == 0.007
     assert config.optim.optimizer._owner is RecipeOptimizer
+
+
+@pytest.mark.parametrize("detector", ["typed", "native"])
+def test_config_manager_rejects_sdc_detection_with_replay(monkeypatch, tmp_path, detector):
+    monkeypatch.setenv("NPU_ASD_CONFIG", "enable:false")
+    monkeypatch.setenv("NPU_ASD_ENABLE", "1" if detector == "native" else "0")
+    source = Trainer.Config(
+        model=_debug_model(),
+        hf_assets_path=str(tmp_path),
+        debug=DebugConfig(deterministic=True),
+        sdc_replayer=SDCReplayer.Config(),
+    )
+    module_name = "_torchtitan_npu_sdc_replay_registry"
+    _install_config_registry(monkeypatch, module_name, lambda: source)
+    args = ["--module", module_name, "--config", "test_config"]
+    if detector == "typed":
+        args.append("--sdc.gradient-enabled")
+
+    diagnostic = "config.sdc detection" if detector == "typed" else "SDC replay requires native SDC disabled"
+    with pytest.raises(ValueError, match=diagnostic):
+        ConfigManager().parse_args(args)
+
+
+@pytest.mark.parametrize("replay_enabled", [False, True], ids=("detector-only", "replay-only"))
+def test_config_manager_accepts_sdc_detection_or_replay_alone(monkeypatch, tmp_path, replay_enabled):
+    monkeypatch.setenv("NPU_ASD_CONFIG", "enable:false")
+    monkeypatch.setenv("NPU_ASD_ENABLE", "0")
+    source = Trainer.Config(
+        model=_debug_model(),
+        hf_assets_path=str(tmp_path),
+        debug=DebugConfig(deterministic=True),
+        sdc_replayer=SDCReplayer.Config() if replay_enabled else None,
+    )
+    module_name = "_torchtitan_npu_sdc_independent_registry"
+    _install_config_registry(monkeypatch, module_name, lambda: source)
+    args = ["--module", module_name, "--config", "test_config"]
+    if not replay_enabled:
+        args.append("--sdc.gradient-enabled")
+
+    config = ConfigManager().parse_args(args)
+
+    assert (config.sdc_replayer is not None) is replay_enabled
+    assert config.sdc.gradient_enabled is not replay_enabled
 
 
 def test_config_manager_overrides_recipe_owned_optional_components(monkeypatch, tmp_path):

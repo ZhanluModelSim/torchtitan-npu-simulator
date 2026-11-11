@@ -30,7 +30,7 @@ from torchtitan_npu.config.converters import TrainerConfigConverter
 from torchtitan_npu.extensions.torchtitan.components.checkpoint import CheckpointManager
 from torchtitan_npu.extensions.torchtitan.components.optimizer.ema import EMA
 from torchtitan_npu.extensions.components.gradient_clipping import GradientClippingOptim  # noqa: F401
-from torchtitan_npu.extensions.components.sdc import SDC
+from torchtitan_npu.extensions.components.sdc import SDC, validate_sdc_replay_config
 from torchtitan_npu.extensions.experiment.anticipatory_routing.config import (
     AnticipatoryRoutingConfig,
     validate_anticipatory_config,
@@ -123,6 +123,8 @@ class TrainerEx(Trainer):
                 )
             self._post_init_optimizer()
             validate_anticipatory_config(self)
+            if self.sdc_replayer is not None:
+                validate_sdc_replay_config(self.sdc)
 
         def _post_init_optimizer(self) -> None:
             # Overrides may already have materialized and replaced the CLI schema.
