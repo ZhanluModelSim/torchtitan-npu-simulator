@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from typing import Annotated, cast
 
 import tyro
+from torchtitan.components.checkpointer.base import BaseCheckpointManager
 from torchtitan.config import derive
 from torchtitan.trainer import Trainer
 from torchtitan.training_engine import TrainingEngine
@@ -87,7 +88,7 @@ class TrainerEx(Trainer):
         # expose NPU fields to Tyro; recipes explicitly instantiate optional components.
         optim: OptimConfig = field(default_factory=OptimConfig)  # pyrefly: ignore [bad-override]
         checkpointer: Annotated[  # pyrefly: ignore [bad-override]
-            CheckpointManager.Config | None, tyro.conf.AvoidSubcommands
+            BaseCheckpointManager.Config | None, tyro.conf.AvoidSubcommands
         ] = None
         compile: Annotated[CompileConfig | None, tyro.conf.AvoidSubcommands] = None  # pyrefly: ignore [bad-override]
         profiler: CANNProfiler.Config = field(  # pyrefly: ignore [bad-override]
@@ -103,6 +104,13 @@ class TrainerEx(Trainer):
             # ``slots=True`` dataclasses are recreated by the decorator, so a
             # zero-argument ``super()`` can retain the pre-decoration class cell.
             Trainer.Config.__post_init__(self)
+            if type(self.checkpointer).__module__ == "torchtitan.components.checkpointer.torch_checkpointing":
+                from torchtitan.components.checkpointer import torch_checkpointing as native
+
+                from torchtitan_npu.extensions.torchtitan.components import torch_checkpointing as npu_native
+
+                if type(self.checkpointer) is native.TorchCheckpointingManager.Config:
+                    self.checkpointer = derive(self.checkpointer, npu_native.TorchCheckpointingManager.Config)
             # Single switch: ``--training.enable-cpu-offload`` drives both the
             # FSDP offload policy (read by parallelize) and, through this
             # carrier field, the optimizer-container selection in the

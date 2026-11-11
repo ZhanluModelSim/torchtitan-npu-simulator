@@ -744,3 +744,35 @@ def test_config_manager_overrides_recipe_owned_optional_components(monkeypatch, 
     assert source.compile.model.fullgraph is True
     assert source.checkpointer.interval == 11
     assert source.checkpointer.extensions.verify_hash_manifest is False
+
+
+@pytest.mark.parametrize("recipe_owned", [False, True], ids=("upstream-native", "recipe-native"))
+def test_config_manager_selects_native_checkpointer_owner(monkeypatch, tmp_path, recipe_owned):
+    pytest.importorskip("torch_checkpointing")
+    from torchtitan.components.checkpointer.torch_checkpointing import TorchCheckpointingManager as NativeManager
+
+    from torchtitan_npu.extensions.torchtitan.components.torch_checkpointing import (
+        TorchCheckpointingManager as NPUNativeManager,
+    )
+
+    class RecipeNativeManager(NativeManager):
+        @dataclass(kw_only=True, slots=True)
+        class Config(NativeManager.Config):
+            pass
+
+    source_manager = RecipeNativeManager if recipe_owned else NativeManager
+    expected_manager = RecipeNativeManager if recipe_owned else NPUNativeManager
+    source = Trainer.Config(
+        model=_debug_model(),
+        hf_assets_path=str(tmp_path),
+        checkpointer=source_manager.Config(interval=11),
+    )
+    module_name = "_torchtitan_npu_native_checkpointer_registry"
+    _install_config_registry(monkeypatch, module_name, lambda: source)
+
+    config = ConfigManager().parse_args(
+        ["--module", module_name, "--config", "test_config", "--checkpointer.interval", "7"]
+    )
+
+    assert config.checkpointer._owner is expected_manager  # pylint: disable=protected-access
+    assert config.checkpointer.interval == 7

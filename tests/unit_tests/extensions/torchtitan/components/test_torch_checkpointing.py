@@ -3,9 +3,10 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""CPU round trip through the local native-checkpoint integration."""
+"""CPU save, restore, and HF export through the native-checkpoint integration."""
 
 import copy
+import json
 from contextlib import closing
 
 import pytest
@@ -15,6 +16,7 @@ from torch.distributed.checkpoint.state_dict_saver import _stateful_to_state_dic
 
 pytest.importorskip("torch_checkpointing")
 
+from safetensors.torch import load_file
 from torch_checkpointing.storage.filesystem import LocalFileSystemStorageConfig
 from torchtitan.components.optim import AdamW, LRSchedulersContainer, OptimizersContainer
 
@@ -89,3 +91,53 @@ def test_native_config_restores_full_state_after_async_and_final_save(tmp_path, 
         for requested, saved in ((1, 1), (-1, 2)):
             assert restored.load(requested)
             torch.testing.assert_close(_stateful_to_state_dict(restored.states), expected[saved], rtol=0, atol=0)
+
+
+def test_native_final_save_exports_hf_weights_and_preserves_integer_buffers(tmp_path, process_group):
+    class HFExportAdapter:
+        fqn_to_index_mapping = {"hf.weight": 1, "hf.counter": 1}
+
+        @staticmethod
+        def to_hf(state_dict):
+            return {"hf.weight": state_dict["weight"], "hf.counter": state_dict["counter"]}
+
+    weights = torch.tensor([[0.123456, -0.654321]], dtype=torch.float32)
+    with torch.random.fork_rng(devices=[]):
+        model = torch.nn.Linear(2, 1, bias=False)
+    with torch.no_grad():
+        model.weight.copy_(weights)
+    model.register_buffer("counter", torch.tensor(3, dtype=torch.int64))
+    optimizers = OptimizersContainer.Config(
+        optimizers=[AdamW.Config(pattern=".*", lr=0.1, fused=False)],
+    ).build(model_parts=[model])
+    scheduler = LRSchedulersContainer.Config().build(optimizers=optimizers, training_steps=3)
+    manager = TorchCheckpointingManager.Config(
+        folder=str(tmp_path / "checkpoint"),
+        last_save_in_hf=True,
+        last_save_model_only=True,
+        export_dtype="float16",
+    ).build(
+        storage_config=LocalFileSystemStorageConfig(use_direct_io=False),
+        dataloader=None,
+        model_parts=[model],
+        optimizers=optimizers,
+        lr_schedulers=scheduler,
+        ema=None,
+        states={},
+        sd_adapter=HFExportAdapter(),
+    )
+
+    with closing(manager):
+        assert manager.save(2, last_step=True)
+
+    checkpoint_dir = tmp_path / "checkpoint" / "step-2"
+    index = json.loads((checkpoint_dir / "model.safetensors.index.json").read_text())
+    assert set(index["weight_map"]) == {"hf.weight", "hf.counter"}
+    exported = {}
+    for shard in set(index["weight_map"].values()):
+        exported.update(load_file(checkpoint_dir / shard))
+    assert set(exported) == {"hf.weight", "hf.counter"}
+    assert exported["hf.weight"].dtype == torch.float16
+    torch.testing.assert_close(exported["hf.weight"], weights.to(torch.float16), rtol=0, atol=0)
+    assert exported["hf.counter"].dtype == torch.int64
+    torch.testing.assert_close(exported["hf.counter"], torch.tensor(3, dtype=torch.int64), rtol=0, atol=0)
