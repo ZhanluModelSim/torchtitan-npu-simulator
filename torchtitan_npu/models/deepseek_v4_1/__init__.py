@@ -769,7 +769,7 @@ def _debugmodel(
         vision_dim=128,
         vision_heads=8,
         vision_inter_dim=256,
-        max_seq_len=512,
+        max_seq_len=4096,
         n_layers=40,
         vocab_size=129280,
         window_size=128,
