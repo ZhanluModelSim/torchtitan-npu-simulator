@@ -244,6 +244,8 @@ PRESET_FACTORIES = {
     "qwen3_5_debugmodel_moe": "torchtitan_simulator.presets.qwen3_5_debugmodel_moe",
     "deepseek_v4_1_debugmodel_text": "torchtitan_simulator.presets.deepseek_v4_1_debugmodel_text",
     "multi_head_moe_debugmodel": "torchtitan_simulator.presets.multi_head_moe_debugmodel",
+    "deepseek_v4_1_debugmodel_multimodal": "torchtitan_simulator.presets.deepseek_v4_1_debugmodel_multimodal",
+    "sys2mot_debugmodel_multimodal": "torchtitan_npu.models.sys2mot.config_registry.sys2mot_debugmodel_multimodal",
 }
 
 
@@ -284,10 +286,12 @@ def prepare_config(simulation: SimulationConfig) -> PreparedConfig:
         "qwen3",
         "qwen3_5",
         "multi_head_moe",
+        "sys2mot",
     }:
         raise ValueError(
             "Supported model families are deepseek_v4, deepseek_v4_1, kimi_k3, "
-            "kimi_k3_1, qwen3, qwen3_5 and multi_head_moe"
+            "kimi_k3_1, qwen3, qwen3_5, multi_head_moe and sys2mot"
+
         )
     adaptations = []
     if simulation.model_overrides is not None:
@@ -336,6 +340,7 @@ def prepare_config(simulation: SimulationConfig) -> PreparedConfig:
                 "qwen3": _QWEN3_OVERRIDES,
                 "qwen3_5": _QWEN3_5_OVERRIDES,
                 "multi_head_moe": _MULTI_HEAD_MOE_OVERRIDES,
+                "sys2mot": _COMMON_OVERRIDES,
             }[trainer.model_spec.name]
         )
         if simulation.override_imports is None
