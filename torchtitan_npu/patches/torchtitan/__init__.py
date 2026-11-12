@@ -3,6 +3,9 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+# The import order below is the patch activation order, not isort's.
+# ruff: noqa: I001
+
 # torch 2.14 CI compatibility: upstream torchtitan 0.4.0 imports this newer
 # pipelining symbol when ``torchtitan.models.common.dist_moe.runtime`` loads.
 # The NPU eager path never runs pipeline parallel, so install a fail-fast stub
@@ -27,7 +30,13 @@ if not hasattr(_pipelining, "PipelineStageInfo"):
     _pipelining.PipelineStageInfo = _PipelineStageInfo  # pyrefly: ignore [missing-attribute]
 
 
-from .components import checkpointer, metrics, optimizer  # noqa: F401, I001
+# Upstream #5744: 0.4.0's ``torchtitan.config`` re-exports ``ParallelismConfig``,
+# so a module that imports ``torchtitan.distributed.context_parallel`` first
+# re-enters the half-initialized CP module.  Loading the package here makes the
+# entry order stop mattering.  Drop it when the pin carries #5744.
+import torchtitan.config  # noqa: F401
+
+from .components import checkpointer, metrics, optimizer  # noqa: F401
 import torchtitan_npu.patches.torchtitan.distributed.checkpoint.filesystem  # noqa: F401
 
 from . import observability  # noqa: F401
