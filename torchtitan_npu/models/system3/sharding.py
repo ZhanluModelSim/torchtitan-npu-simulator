@@ -110,7 +110,7 @@ def _latent_routed_experts_sharding_configs(*, enable_ep: bool) -> tuple[Shardin
             )
         ),
     )
-    return wrapper_config, ShardingConfig(state_shardings=state_shardings)
+    return wrapper_config, ShardingConfig(state_shardings=state_shardings)  # pyrefly: ignore [bad-argument-type]
 
 
 def _set_moe_layer_sharding(moe_cfg, *, enable_ep: bool) -> None:

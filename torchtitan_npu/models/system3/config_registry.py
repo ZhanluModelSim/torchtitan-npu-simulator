@@ -353,7 +353,10 @@ def _encoder_block_config(*, hidden: int, heads: int, g: _Geometry):
 
 
 def _modality_encoder_config(*, g: _Geometry) -> ModalityEncoder.Config:
-    modalities = ["image", "audio", "point3d", "haptic", "text"]
+    # Order matters: the reference builds type_ids by enumerating this list
+    # (text=0, image=1, audio=2, point3d=3, haptic=4), which indexes the
+    # shared modality_type_embedding rows.
+    modalities = ["text", "image", "audio", "point3d", "haptic"]
     return ModalityEncoder.Config(
         modalities=modalities,
         image_encoder=ImageEncoder.Config(
