@@ -1,0 +1,33 @@
+a2 hardware simulation: Qwen3.5 debugmodel, fsdp8/ep4/efsdp2/seq4096
+=====================================================================
+
+Date: 2026-11-12
+Container: titan030-qwen35 (cwd /workspace)
+Command:
+  python3 -m sim_platform train /workspace/qwen35-platform-run/a2-qwen35-fsdp8-ep4-seq4096/a2_qwen35.toml
+
+TOML (a2_qwen35.toml):
+  training.config = qwen3_5_debugmodel
+  world_size 8, data_parallel_shard_degree 8, expert_parallel_degree 4
+  (efsdp auto = dp_shard/ep = 2), seq_len 4096, gbs 8, mbs 1, GA 1
+  bf16, activation_checkpoint_mode none, offload off
+  platform.hardware = a2 (hardware_dir /workspace/qwen35-platform-run/hardware,
+  a2.json cube 752/376/188 TFLOPS, vec 18.43/9.22, HBM 1.6 TB/s 64 GB;
+  a2-topo.txt memory_swap present but unused: no offload in this run)
+  prediction.backends = roofline, overhead_us 1.0, corrections.vec_scale 1.0
+
+Model raw config: qwen35_config.json (copied from
+/workspace/glm-adapt/titan-qwen35/torchtitan_npu/simulator/raw_model/unified_mm/config.json,
+architecture Glm5NextForConditionalGeneration)
+
+Results (runs/l1/statistics/training.json):
+  end_to_end 53901.9 us  (F 44799.7 / B 8180.7 / O 921.4, single L1, not xGA)
+  prediction_coverage: success 1820 / miss 133 / fail 0 (template_nodes)
+  MFU 8.35%  HFU 8.35%  MBU 62.18%  (coverage incomplete: mfu known 246 missing 18,
+   mbu known 1820 missing 133; token throughput not emitted - no dataloader
+   seq description for this preset)
+  parallelism: dp=8 dp_shard=8 ep=4 efsdp=2 tp=1 pp=1
+
+Operator CSVs (operators_by_name.csv / operators_by_shape.csv) carry the
+local working-tree columns cube_flops/vec_flops/read_bytes/write_bytes
+(NOT committed to the platform repo; user requested local-only).

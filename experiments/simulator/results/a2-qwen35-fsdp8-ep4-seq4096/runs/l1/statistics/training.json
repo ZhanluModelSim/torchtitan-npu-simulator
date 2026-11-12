@@ -1,0 +1,182 @@
+{
+  "results": {
+    "end_to_end_us": 53901.85182402281,
+    "phase_durations_us": {
+      "F": 44799.74959249265,
+      "B": 8180.668248082926,
+      "O": 921.4339834472361
+    },
+    "tokens_per_second_per_device": 75989.96808815587,
+    "mfu": 0.08345770596996575,
+    "hfu": 0.08345770596996575,
+    "mbu": 0.6217981277001816,
+    "utilization_unavailable": {},
+    "memory": {
+      "kind": "upstream_static",
+      "scope": "post-warmup single microbatch and optimizer update; static storage budget, not GA replay",
+      "budgets_bytes": {
+        "steady_state_active_bytes_peak": 3055792824,
+        "steady_state_forward_active_bytes_peak": 2547233468,
+        "steady_state_backward_active_bytes_peak": 3055792824,
+        "steady_state_optimizer_active_bytes_peak": 265997832,
+        "persistent_param_bytes": 66212336,
+        "optimizer_state_bytes": 132425204
+      },
+      "activation_offload_by_layer": [
+        {
+          "layer": "layers.0",
+          "transfer_bytes": 0
+        },
+        {
+          "layer": "layers.1",
+          "transfer_bytes": 0
+        },
+        {
+          "layer": "layers.2",
+          "transfer_bytes": 0
+        },
+        {
+          "layer": "layers.3",
+          "transfer_bytes": 0
+        },
+        {
+          "layer": "layers.4",
+          "transfer_bytes": 0
+        },
+        {
+          "layer": "layers.5",
+          "transfer_bytes": 0
+        },
+        {
+          "layer": "layers.6",
+          "transfer_bytes": 0
+        },
+        {
+          "layer": "layers.7",
+          "transfer_bytes": 0
+        }
+      ]
+    },
+    "synthetic": false,
+    "prediction_coverage": {
+      "success": 1820,
+      "miss": 133,
+      "fail": 0,
+      "scope": "template_nodes",
+      "complete": false
+    },
+    "utilization_coverage": {
+      "mfu": {
+        "known_nodes": 246,
+        "missing_nodes": 18,
+        "denominator_complete": false,
+        "scope": "template_nodes",
+        "workload_complete": false,
+        "complete": false
+      },
+      "hfu": {
+        "known_nodes": 246,
+        "missing_nodes": 18,
+        "denominator_complete": false,
+        "scope": "template_nodes",
+        "workload_complete": false,
+        "complete": false
+      },
+      "mbu": {
+        "known_nodes": 1820,
+        "missing_nodes": 133,
+        "denominator_complete": false,
+        "scope": "template_nodes",
+        "workload_complete": false,
+        "complete": false
+      }
+    }
+  },
+  "config": {
+    "workload": {
+      "gradient_accumulation": 1,
+      "captured_microbatches": 1,
+      "local_batch_size": 1,
+      "global_batch_size": 8,
+      "data_parallel_degree": 8,
+      "logical_rank": 0,
+      "logical_world_size": 8,
+      "seq_len": 4096,
+      "capture": {
+        "mode": "post_warmup",
+        "warmup_iterations": 1,
+        "warmup_microbatches": 1,
+        "warmup_scheduler_advanced": false
+      },
+      "memory": {
+        "offload_activations": false,
+        "offload_optimizer_states": false
+      },
+      "model": {
+        "config_factory": "torchtitan_simulator.presets.qwen3_5_debugmodel",
+        "preset": "qwen3_5_debugmodel"
+      },
+      "parallelism": {
+        "batch": 8,
+        "cp": 1,
+        "dp": 8,
+        "dp_replicate": 1,
+        "dp_shard": 8,
+        "efsdp": 2,
+        "ep": 4,
+        "loss_mesh": 8,
+        "pp": 1,
+        "tp": 1
+      },
+      "precision": {
+        "dtype": "float32",
+        "mixed_precision_param": "bfloat16",
+        "mixed_precision_reduce": "float32"
+      },
+      "quantization": {
+        "enabled": false
+      }
+    },
+    "requested": {
+      "config": "qwen3_5_debugmodel",
+      "world_size": 8,
+      "logical_rank": 0,
+      "pipeline_parallel_degree": 1,
+      "seq_len": 4096,
+      "training_dtype": null,
+      "mixed_precision_param": "bfloat16",
+      "mixed_precision_reduce": null,
+      "num_mtp_modules": 0,
+      "output_dir": "/workspace/qwen35-platform-run/a2-qwen35-fsdp8-ep4-seq4096/runs",
+      "output_formats": [],
+      "enable_fsdp_allgather_fp8": false,
+      "enable_ep_dispatch_fp8": false,
+      "target_npu_device_type": "non_a5",
+      "override_imports": null,
+      "data_parallel_replicate_degree": 1,
+      "data_parallel_shard_degree": 8,
+      "tensor_parallel_degree": 1,
+      "context_parallel_degree": 1,
+      "expert_parallel_degree": 4,
+      "activation_checkpoint_mode": "none",
+      "selective_ac_save_ops": null,
+      "memory_parameter_storage_dtype": "",
+      "memory_offload_ac_saved_tensors": false,
+      "memory_offload_optimizer_states": false,
+      "local_batch_size": 1,
+      "global_batch_size": 8,
+      "enable_quantized_training": false,
+      "quantization_recipe": "all_mxfp8"
+    },
+    "platform": {
+      "chip": "/workspace/qwen35-platform-run/hardware/a2.json",
+      "transfers": {
+        "h2d_bandwidth_gb_per_second": 4.0,
+        "d2h_bandwidth_gb_per_second": 4.0,
+        "h2d_utilization": 0.75,
+        "d2h_utilization": 0.75
+      },
+      "vec_scale": 1.0
+    }
+  }
+}
