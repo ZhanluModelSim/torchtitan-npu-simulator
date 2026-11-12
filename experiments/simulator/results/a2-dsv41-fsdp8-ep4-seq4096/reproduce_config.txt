@@ -1,0 +1,89 @@
+================================================================
+A2 硬件 DeepSeek-V4.1 仿真配置（复现文档）
+================================================================
+生成时间: 2026-11-11
+运行入口: python3 -m sim_platform train <toml>  (sim-platform, 容器 titan030-qwen35)
+
+[运行命令]
+  python3 -m sim_platform train /workspace/qwen35-platform-run/a2-dsv41-fsdp8-ep4-seq4096/a2_dsv41.toml
+
+[TOML 完整内容] (a2_dsv41.toml)
+  见同目录 a2_dsv41.toml；要点:
+    config                        = deepseek_v4_1_debugmodel_text
+    world_size                    = 8
+    data_parallel_replicate_degree= 1
+    data_parallel_shard_degree    = 8      # fsdp=8
+    expert_parallel_degree        = 4      # ep=4
+    local_batch_size              = 1      # mbs=1
+    global_batch_size             = 8      # gbs=8 → GA = 8/(1*8) = 1
+    seq_len                       = 4096
+    mixed_precision_param         = bfloat16
+    activation_checkpoint_mode    = none   # 关闭重计算
+    # offload: 未配置 memory_offload_* (默认 false, 即关闭)
+    # efsdp=2: 无显式 TOML 键, 由 ParallelDims 推导 = dp_shard/ep = 8/4 = 2
+    hardware                      = a2 (hardware/a2.json)
+    prediction.backends           = [roofline]; overhead_us = 1.0; vec_scale = 1.0
+
+[硬件文件] hardware/a2.json —— 由 /home/l30079348/hardware/a2-chip.txt 转换
+  字段映射 (chip.txt → 平台 JSON chip_config):
+    compute.cube.float8/float16/float32 (TFLOPS)  → cube.tflops_by_bits 8/16/32 = 752/376/188
+    compute.vector.float8/float16/float32 (TFLOPS)→ vec.tflops_by_bits 8/16/32 = 18.43/18.43/9.22
+    memory.hbm.bandwidth (TB/s), size (GB)        → hbm.bandwidth_tb_per_second=1.6, capacity_gb=64
+    utilization.cube {log_a,log_b,max,min}        → cube {mode:log, k:0.15, b:-2.82, max_ratio:0.95, min_ratio:0.1532}
+    utilization.hbm {log_a,log_b,max,min}         → hbm  {mode:log, k:0.07, b:-0.68, max_ratio:0.6999, min_ratio:0.2767}
+    utilization.vector.constant 0.6               → vec {mode:constant, ratio:0.6}
+  未被平台 schema 消费的字段 (平台 chip_config 仅允许 cube/vec/hbm/utilization):
+    head_tail_time=4, head_tail_time_for_fused_op=1  → 平台 head_tail 按 0 计
+    L2cache (7.86 TB/s, 192MB), comm.dispatch      → 未消费
+  a2-topo.txt (卡间拓扑 level1 8卡 fullmesh 25Gbps/port, memory_swap bandwidth_gbps=32.0)
+    → 平台不读 topo 文件; 本实验关闭 offload, memory_swap 不涉及
+
+[模型与并行说明]
+  模型: DeepSeek-V4.1 debugmodel_text (MoE, EP 才有意义; 捕获走 simulator preset)
+  并行: dp_replicate=1 × dp_shard(fsdp)=8 × ep=4 → expert 维 efsdp=2 自动成立
+  batch: mbs=1 × GA=1 × dp=8 → gbs=8
+
+[结果文件说明] (同目录 runs/l1/statistics/)
+  training.json           端到端耗时/相位/吞吐/MFU/MBU/覆盖/内存
+  operators_by_name.csv   按算子名聚合; 含 cube_flops/vec_flops/read_bytes/write_bytes 列
+                          (本次为满足算子级 FLOPs/访存量记录需求新增, 源自库预测 details)
+  operators_by_shape.csv  按算子形状聚合, 同上列
+  communication_domains.csv 通信域聚合
+  000_F/001_B/002_OPTIMIZER.{csv,trace.json}  图级时间线
+
+================================================================
+补充记录 (2026-11-11 终版运行)
+================================================================
+[必要的 simulator 源码修改]
+  torchtitan_npu/models/deepseek_v4_1/__init__.py: _debugmodel() 的
+  max_seq_len 512 → 4096。原因: RoPE.Config.max_seq_len 是模型支持的最大
+
+
+================================================================
+补充记录 (2026-11-11 终版运行)
+================================================================
+
+[必要的 simulator 源码修改]
+  torchtitan_npu/models/deepseek_v4_1/__init__.py: _debugmodel() 的
+  max_seq_len 512 -> 4096。原因: RoPE.Config.max_seq_len 是"模型支持的最大
+  序列长度"语义, debugmodel 初始 512 会在 decoder update_from_config 校验
+  seq_len(4096) > max_seq_len(512) 处直接报错; 4096 与 YaRN original_seq_len
+  一致, post-init 本就会把缓存 replace 为训练 seq_len。
+
+[结果目录最终结构]
+  runs/statistics/training.json          端到端 489035.4us; F 179221.9 / B 305104.7 / O 4708.8
+                                         tps 8375.7; MFU 2.93%; MBU 49.69%
+                                         覆盖 success=51958 / miss=2142 / fail=0 (96.0%)
+  runs/statistics/operators_by_name.csv  含新增 4 列: cube_flops / vec_flops /
+                                         read_bytes / write_bytes (来自库预测
+                                         PredictionDetails, 按 GA 权重聚合)
+                                         总量: cube 5.18e12, vec 7.40e10, read 2.30e11B, write 1.59e11B
+  runs/statistics/operators_by_shape.csv 同 4 列, 按形状聚合
+  runs/statistics/communication_domains.csv
+  runs/000_F / 001_B / 002_OPTIMIZER.{csv,trace.json} 图级时间线
+  run.log                                运行日志 (含 miss 原因)
+
+[sim-platform 导出改动]
+  metrics/operators.py + exports/statistics.py: OperatorAggregate/_Accumulator
+  增加 4 个工作量字段并从 PredictionDetails 聚合, operator CSV 增加对应列。
+  (平台单测 507 passed; 1 个既有失败为库 SLA2 提交与旧测试期望失配, 与本次无关)
