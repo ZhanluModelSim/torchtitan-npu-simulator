@@ -198,22 +198,24 @@ def _prepare_optimizer(simulation: SimulationConfig, trainer: Any, *, materializ
     optimizer.materialize()
 
 
+PRESET_FACTORIES = {
+    "kimi_k3_smoketest": "torchtitan_npu.models.kimi_k3.config_registry.kimi_k3_debugmodel",
+    "kimi_k3_full": "torchtitan_npu.models.kimi_k3.config_registry.kimi_k3_full",
+    "kimi_k3_16layer_reduced": "torchtitan_npu.models.kimi_k3.config_registry.kimi_k3_16layer_reduced",
+    "deepseek_v4_smoketest": "torchtitan_npu.models.deepseek_v4.config_registry.deepseek_v4_debugmodel",
+    "deepseek_v4_flash": "torchtitan_npu.models.deepseek_v4.config_registry.deepseek_v4_flash",
+    "deepseek_v4_pro": "torchtitan_npu.models.deepseek_v4.config_registry.deepseek_v4_pro",
+    "deepseek_v4_pro_20t": "torchtitan_simulator.presets.deepseek_v4_pro_20t",
+    "qwen3_32b_smoketest": "torchtitan_npu.models.qwen3.config_registry.qwen3_32b_smoketest",
+    "qwen3_32b": "torchtitan_npu.models.qwen3.config_registry.qwen3_32b",
+}
+
+
 def prepare_config(simulation: SimulationConfig) -> PreparedConfig:
     """Resolve a fresh native config before any model or parallel initialization."""
     simulation.validate()
     simulation = copy.deepcopy(simulation)
-    factories = {
-        "kimi_k3_smoketest": "torchtitan_npu.models.kimi_k3.config_registry.kimi_k3_debugmodel",
-        "kimi_k3_full": "torchtitan_npu.models.kimi_k3.config_registry.kimi_k3_full",
-        "kimi_k3_16layer_reduced": "torchtitan_npu.models.kimi_k3.config_registry.kimi_k3_16layer_reduced",
-        "deepseek_v4_smoketest": "torchtitan_npu.models.deepseek_v4.config_registry.deepseek_v4_debugmodel",
-        "deepseek_v4_flash": "torchtitan_npu.models.deepseek_v4.config_registry.deepseek_v4_flash",
-        "deepseek_v4_pro": "torchtitan_npu.models.deepseek_v4.config_registry.deepseek_v4_pro",
-        "deepseek_v4_pro_20t": "torchtitan_simulator.presets.deepseek_v4_pro_20t",
-        "qwen3_32b_smoketest": "torchtitan_npu.models.qwen3.config_registry.qwen3_32b_smoketest",
-        "qwen3_32b": "torchtitan_npu.models.qwen3.config_registry.qwen3_32b",
-    }
-    target = factories.get(simulation.config, simulation.config)
+    target = PRESET_FACTORIES.get(simulation.config, simulation.config)
     if "." not in target:
         raise ValueError(f"Unknown simulator preset {simulation.config!r}; use a supported preset or module.factory")
     module_name, factory_name = target.rsplit(".", 1)
@@ -222,7 +224,7 @@ def prepare_config(simulation: SimulationConfig) -> PreparedConfig:
     if simulation.model_overrides is not None:
         from torchtitan_simulator.model_overrides import apply_model_overrides
 
-        if target not in set(factories.values()) or trainer.model_spec.name != "deepseek_v4":
+        if target not in set(PRESET_FACTORIES.values()) or trainer.model_spec.name != "deepseek_v4":
             raise ValueError(
                 "Flat model_overrides require a supported simulator preset; custom factories own their config trees"
             )

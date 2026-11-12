@@ -117,14 +117,13 @@ class _Geometry:
     num_mtp_layers: int
 
 
-def apply_model_overrides(trainer, overrides: ModelOverrides, *, num_mtp_modules: int):
+def describe_geometry(trainer, *, num_mtp_modules: int) -> _Geometry:
+    """Read native DSV4 geometry without rebuilding or changing the config tree."""
     from inspect import signature
 
     from torchtitan_npu.models.deepseek_v4 import _make_v4_config
-    from torchtitan_npu.models.deepseek_v4.config_registry import _dsv4_muon_profile
     from torchtitan_npu.models.deepseek_v4.model import DeepSeekV4Model
 
-    overrides.validate()
     model = trainer.model_spec.model
     if type(model) is not DeepSeekV4Model.Config:
         raise ValueError("Geometry overrides require an unconverted native DeepSeekV4Model.Config")
@@ -143,7 +142,7 @@ def apply_model_overrides(trainer, overrides: ModelOverrides, *, num_mtp_modules
     plain_theta = plain.rope.theta if plain is not None else signature(_make_v4_config).parameters["rope_theta"].default
     if not isinstance(plain_theta, (int, float)):
         raise RuntimeError("Native plain RoPE default requires review")
-    geometry = _Geometry(
+    return _Geometry(
         dim=model.dim,
         n_layers=model.n_layers,
         vocab_size=model.vocab_size,
@@ -179,6 +178,14 @@ def apply_model_overrides(trainer, overrides: ModelOverrides, *, num_mtp_modules
         rope_factor=compressed.rope.rope_factor,
         num_mtp_layers=num_mtp_modules,
     )
+
+
+def apply_model_overrides(trainer, overrides: ModelOverrides, *, num_mtp_modules: int):
+    from torchtitan_npu.models.deepseek_v4 import _make_v4_config
+    from torchtitan_npu.models.deepseek_v4.config_registry import _dsv4_muon_profile
+
+    overrides.validate()
+    geometry = describe_geometry(trainer, num_mtp_modules=num_mtp_modules)
     values = asdict(geometry)
     changes = asdict(overrides)
     moe_changes = changes.pop("moe_args")
