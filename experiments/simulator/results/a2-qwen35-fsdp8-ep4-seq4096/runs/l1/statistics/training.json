@@ -1,15 +1,15 @@
 {
   "results": {
-    "end_to_end_us": 53901.85182402281,
+    "end_to_end_us": 54755.83710792745,
     "phase_durations_us": {
-      "F": 44799.74959249265,
-      "B": 8180.668248082926,
+      "F": 45139.63923354904,
+      "B": 8694.763890931183,
       "O": 921.4339834472361
     },
-    "tokens_per_second_per_device": 75989.96808815587,
-    "mfu": 0.08345770596996575,
-    "hfu": 0.08345770596996575,
-    "mbu": 0.6217981277001816,
+    "tokens_per_second_per_device": 74804.81015981013,
+    "mfu": 0.08216096876448896,
+    "hfu": 0.08216096876448896,
+    "mbu": 0.6150705620182009,
     "utilization_unavailable": {},
     "memory": {
       "kind": "upstream_static",
@@ -59,32 +59,32 @@
     },
     "synthetic": false,
     "prediction_coverage": {
-      "success": 1820,
-      "miss": 133,
+      "success": 1896,
+      "miss": 57,
       "fail": 0,
       "scope": "template_nodes",
       "complete": false
     },
     "utilization_coverage": {
       "mfu": {
-        "known_nodes": 246,
-        "missing_nodes": 18,
+        "known_nodes": 264,
+        "missing_nodes": 0,
         "denominator_complete": false,
         "scope": "template_nodes",
-        "workload_complete": false,
+        "workload_complete": true,
         "complete": false
       },
       "hfu": {
-        "known_nodes": 246,
-        "missing_nodes": 18,
+        "known_nodes": 264,
+        "missing_nodes": 0,
         "denominator_complete": false,
         "scope": "template_nodes",
-        "workload_complete": false,
+        "workload_complete": true,
         "complete": false
       },
       "mbu": {
-        "known_nodes": 1820,
-        "missing_nodes": 133,
+        "known_nodes": 1896,
+        "missing_nodes": 57,
         "denominator_complete": false,
         "scope": "template_nodes",
         "workload_complete": false,

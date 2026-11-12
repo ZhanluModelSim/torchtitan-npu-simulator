@@ -1,7 +1,8 @@
 a2 hardware simulation: Qwen3.5 debugmodel, fsdp8/ep4/efsdp2/seq4096
 =====================================================================
 
-Date: 2026-11-12
+Date: 2026-11-12 (final rerun: flex_attention + convolution + constant_pad_nd
+operator modeling all active)
 Container: titan030-qwen35 (cwd /workspace)
 Command:
   python3 -m sim_platform train /workspace/qwen35-platform-run/a2-qwen35-fsdp8-ep4-seq4096/a2_qwen35.toml
@@ -16,16 +17,23 @@ TOML (a2_qwen35.toml):
   a2-topo.txt memory_swap present but unused: no offload in this run)
   prediction.backends = roofline, overhead_us 1.0, corrections.vec_scale 1.0
 
+Operator library: opm-dev gdn-sla2 (02e5bbf convolution, 23a3860
+flex_attention, 8ec632b constant_pad_nd):
+  Qwen35SimFlexAttention   2 nodes serial 129.8us (cube 4x B*Hq*Sq*Skv*D)
+  Qwen35SimFlexAttentionGrad 2 nodes serial 270.0us (cube 10x ...)
+  Convolution / ConvolutionBackward  18+18 nodes serial 105.1/139.1us
+  ConstantPadNd            36 nodes serial 210.1us (memory-only copy)
+  Remaining miss (57): c10d allgather/reduce_scatter 31 (communication
+  formulas out of scope by design), lift_fresh 7, exp 6, _to_copy 6,
+  le.Scalar 2, misc small ops.
+
 Model raw config: qwen35_config.json (copied from
 /workspace/glm-adapt/titan-qwen35/torchtitan_npu/simulator/raw_model/unified_mm/config.json,
 architecture Glm5NextForConditionalGeneration)
 
 Results (runs/l1/statistics/training.json):
-  end_to_end 53901.9 us  (F 44799.7 / B 8180.7 / O 921.4, single L1, not xGA)
-  prediction_coverage: success 1820 / miss 133 / fail 0 (template_nodes)
-  MFU 8.35%  HFU 8.35%  MBU 62.18%  (coverage incomplete: mfu known 246 missing 18,
-   mbu known 1820 missing 133; token throughput not emitted - no dataloader
-   seq description for this preset)
+  end_to_end 54755.8 us (single L1 template, phases in phase_durations_us)
+  prediction_coverage: success 1896 / miss 57 / fail 0 (template_nodes)
   parallelism: dp=8 dp_shard=8 ep=4 efsdp=2 tp=1 pp=1
 
 Operator CSVs (operators_by_name.csv / operators_by_shape.csv) carry the

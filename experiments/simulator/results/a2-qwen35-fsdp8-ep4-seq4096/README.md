@@ -15,3 +15,12 @@ stack (branch `030-qwen3.5-261106`).
   `task.log`
 
 All files are small enough to be stored raw; no archive is needed.
+
+## Operator modeling status (2026-11-12 rerun)
+
+Coverage 1896/57/0 (template nodes): flex_attention forward/backward,
+aten convolution + backward and constant_pad_nd are all modeled
+(opm gdn-sla2: 02e5bbf convolution, 23a3860 flex_attention, 8ec632b
+constant_pad_nd).  Remaining misses are c10d collectives (communication
+formulas out of scope) and a handful of small aten ops.  End-to-end
+54755.8 us.
