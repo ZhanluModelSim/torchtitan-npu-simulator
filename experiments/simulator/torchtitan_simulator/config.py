@@ -48,9 +48,17 @@ class SimulationConfig:
     global_batch_size: int | None = None
     enable_quantized_training: bool = False
     quantization_recipe: Literal["all_mxfp8"] = "all_mxfp8"
+    optimizer_name: Literal["AdamW", "Muon"] | None = None
+    muon_ns_steps: int | None = None
     model_overrides: ModelOverrides | None = None
 
     def validate(self):
+        if self.optimizer_name not in {None, "AdamW", "Muon"}:
+            raise ValueError("optimizer_name must be AdamW or Muon")
+        if self.muon_ns_steps is not None and (type(self.muon_ns_steps) is not int or self.muon_ns_steps < 1):
+            raise ValueError("muon_ns_steps must be a positive integer")
+        if self.muon_ns_steps is not None:
+            raise ValueError("muon_ns_steps requires optimizer_name=Muon or a native Muon recipe")
         if type(self.memory_offload_optimizer_states) is not bool:
             raise ValueError("memory_offload_optimizer_states must be boolean")
         preset, separator, precision = self.config.rpartition("_baseline_")
