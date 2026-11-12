@@ -16,9 +16,9 @@ DeepSeek-V4 的训练示例 wrapper（`examples/deepseek_v4/*.sh`）会按 `USE_
 
 ```bash
 python -m torchtitan_npu.train \
-  --module torchtitan_npu.models.deepseek_v4 \
+  --module torchtitan_npu_recipes.models.deepseek_v4 \
   --config deepseek_v4_debugmodel \
-  --override.imports \
+  --override \
     torchtitan_npu.override.common.rope.workaround
 ```
 

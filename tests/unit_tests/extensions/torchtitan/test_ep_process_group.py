@@ -12,7 +12,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from torchtitan.models.common import token_dispatcher as native_token_dispatcher
+from torchtitan.models.common.moe import token_dispatcher as native_token_dispatcher
 
 
 @pytest.fixture(scope="module")

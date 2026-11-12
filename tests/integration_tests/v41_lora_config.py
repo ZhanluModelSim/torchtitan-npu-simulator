@@ -15,13 +15,10 @@ from torchtitan.config import derive
 
 from tests.integration_tests.lora_config import LoRATrainer, _cpu_tensor
 from torchtitan_npu.models.deepseek_v4.lora import is_lora_parameter
-from torchtitan_npu.models.deepseek_v4_1.config_registry import (
-    DeepSeekV41Trainer,
-    _make_lora_trainer_config,
-    deepseek_v4_1_debugmodel_lora,
-)
 from torchtitan_npu.models.deepseek_v4_1.engram.host import HostEngramTable
+from torchtitan_npu.models.deepseek_v4_1.trainer import DeepSeekV41Trainer
 from torchtitan_npu.models.deepseek_v4_1.vision.data import build_image_token_layout
+from torchtitan_npu_recipes.models.deepseek_v4_1 import _make_lora_trainer_config, deepseek_v4_1_debugmodel_lora
 
 logger = logging.getLogger(__name__)
 

@@ -36,7 +36,7 @@ def test_grain_loader_keeps_document_alignment_labels_and_positions(tmp_path):
     torch.testing.assert_close(
         microbatch.padding_mask, torch.tensor([False, False, False, True, False, False, True, True])
     )
-    assert microbatch.num_valid_tokens == 5
+    assert int(microbatch.loss_token_counts) == 5
 
 
 @pytest.mark.parametrize("token_budget", (4, 8), ids=("one-context", "two-contexts"))
@@ -92,7 +92,7 @@ def test_map_loader_partitions_shards_and_restores_pending_pack(tmp_path, rank):
         for expected in tail:
             actual = next(resumed)
             expected_inputs, actual_inputs = expected.as_input_dict(), actual.as_input_dict()
-            assert actual.num_valid_tokens == expected.num_valid_tokens
+            assert int(actual.loss_token_counts) == int(expected.loss_token_counts)
             assert actual_inputs.keys() == expected_inputs.keys()
             for key in expected_inputs:
                 torch.testing.assert_close(

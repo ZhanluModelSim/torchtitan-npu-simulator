@@ -409,12 +409,14 @@ class _SFTCollator(Collator):
             )
         }
         labels = torch.as_tensor(sample["labels"])
+        padding_mask = inputs.pop("padding_mask")
         return TokenizedTrainingMicrobatch(
             input=inputs.pop("input"),
             labels=labels,
             positions=inputs.pop("positions"),
-            padding_mask=inputs.pop("padding_mask"),
-            num_valid_tokens=int((labels != -100).sum()),
+            padding_mask=padding_mask,
+            loss_token_counts=(labels != -100).sum(),
+            routing_token_counts=(~padding_mask).sum(),
             model_kwargs=inputs,
         )
 

@@ -63,8 +63,6 @@ def validate_anticipatory_config(config):
         return
     if config.parallelism.pipeline_parallel_degree > 1:
         raise ValueError("Anticipatory routing requires pipeline_parallel_degree=1")
-    if config.debug.moe_force_load_balance:
-        raise ValueError("moe_force_load_balance bypasses cached expert selection")
     if config.anticipatory.max_rollbacks == 0:
         return
     if config.checkpointer is None or config.checkpointer.load_only:

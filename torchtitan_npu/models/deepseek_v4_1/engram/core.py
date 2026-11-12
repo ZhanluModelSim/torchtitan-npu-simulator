@@ -22,7 +22,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.distributed.tensor import DTensor
-from torchtitan.protocols.module import Module
+from torchtitan.models.base.module import Module
 
 
 def _local_tensor(tensor: torch.Tensor) -> torch.Tensor:

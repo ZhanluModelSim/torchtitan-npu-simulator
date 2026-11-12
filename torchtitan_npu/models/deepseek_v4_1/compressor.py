@@ -29,10 +29,10 @@ modules the config builds, with the rope's prefix width set by the site.
 from dataclasses import dataclass
 
 import torch
+from torchtitan.models.base.module import Module
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.models.common.rope import RoPE
-from torchtitan.protocols.module import Module
 
 
 class Compressor(Module):

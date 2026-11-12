@@ -21,7 +21,6 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-import torch
 from torchao_npu.quantization.quant_configs import (  # noqa: F401  (re-exported)
     BlockMXQuantizeConfig,
     FP8QuantizeConfig,
@@ -30,8 +29,8 @@ from torchao_npu.quantization.quant_configs import (  # noqa: F401  (re-exported
 )
 from torchtitan.config import derive  # noqa: F401  (re-exported)
 from torchtitan.config.transform import validate_converter_compatibility
+from torchtitan.models.base.module import Module  # noqa: F401  (re-exported for tests)
 from torchtitan.models.common.linear import GroupedLinear, Linear  # noqa: F401  (re-exported for tests)
-from torchtitan.protocols.module import Module  # noqa: F401  (re-exported for tests)
 
 import torchtitan_npu  # noqa: F401  (apply package patches before binding model classes)
 from torchtitan_npu.models.deepseek_v4_1.indexer import Selector as DeepSeekV41Selector  # noqa: F401  (re-exported)
@@ -68,95 +67,14 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from torchtitan.config.transform.quantization import QuantizationConverter
-    from torchtitan.protocols.model import BaseModel
+    from torchtitan.models.base.model import BaseModel
 
     from torchtitan_npu.config.configs import QuantizationExtensionConfig
 
 
-_AC_BLOCK_OPS_PATCHED = [False]
-
-
-# extension.quantization.save-block-ops-level levels -> the transformer-block ops
-# added to the selective-AC save list, grouped by the module they belong to
-# and ordered by critical-path ms per saved GiB (best first).
-_BLOCK_SAVE_OPS = (
-    # 1: attention
-    (1, "cann_ops_transformer.sparse_flash_mla.default"),
-    (1, "cann_ops_transformer.lightning_indexer.default"),
-    # 2: mHC
-    (2, "npu.npu_mhc_pre.default"),
-    (2, "cann_ops_transformer.mhc_post.default"),
-    (2, "npu.npu_mhc_sinkhorn.default"),
-    # 3: MoE routing
-    (3, "npu.npu_moe_token_permute.default"),
-    (3, "torchtitan_npu.npu_moe_re_routing.default"),
-    (3, "torchtitan_npu.npu_moe_token_unpermute.default"),
-)
-
-
-def _resolve_torch_op(path: str):
-    """``torch.ops`` lookup by dotted path, or None if not registered yet."""
-    obj = torch.ops
-    try:
-        for part in path.split("."):
-            obj = getattr(obj, part)
-    except (AttributeError, RuntimeError):
-        return None
-    return obj
-
-
 def _save_block_ops_under_selective_ac(level: int) -> None:
-    """extension.quantization.save-block-ops-level: keep the attention / mHC /
-    MoE-routing results across the selective-AC boundary instead of
-    re-deriving them in the backward.
-
-    torchtitan's ``_get_default_save_ops()`` doesn't know about custom NPU
-    ops, so the min-cut partitioner always recomputes them. ``_BLOCK_SAVE_OPS``
-    orders them best-first by profiled win, an upper bound rather than a
-    guarantee -- a recomputed kernel off the critical path may already be
-    overlapped.
-
-    NOT bit-exact (forward and recompute don't compile to the same fused
-    kernel), so this needs a loss A/B before being trusted.
-
-    Resolution is deferred to call time (inside the returned closure, not
-    at patch time) because some ops register only once model modules have
-    imported ``cann_ops_transformer``.
-    """
-    if level <= 0 or _AC_BLOCK_OPS_PATCHED[0]:
-        return
-    try:
-        from torchtitan.distributed import activation_checkpoint as ac
-    except ImportError:
-        return
-    wanted = tuple(path for lvl, path in _BLOCK_SAVE_OPS if lvl <= level)
-    if not wanted:
-        return
-    _AC_BLOCK_OPS_PATCHED[0] = True
-    orig = ac._get_default_save_ops
-
-    def _get_default_save_ops():
-        ops = orig()
-        added, missing = [], []
-        for path in wanted:
-            op = _resolve_torch_op(path)
-            if op is None:
-                # Not registered in this build/config (e.g. the lightning
-                # indexer is off for this model). A miss is a lost
-                # optimization, never a correctness problem.
-                missing.append(path)
-            else:
-                ops.add(op)
-                added.append(path)
-        logger.info(
-            "save_block_ops_level=%d: added %s to the selective-AC save list%s",
-            level,
-            ", ".join(added) or "nothing",
-            f" (not registered: {', '.join(missing)})" if missing else "",
-        )
-        return ops
-
-    ac._get_default_save_ops = _get_default_save_ops
+    if level > 0:
+        raise NotImplementedError("NPU selective rematerialization save policies are not supported in this upgrade")
 
 
 def _check_prequantize_policy(

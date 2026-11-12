@@ -4,11 +4,13 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-# Vision-language SFT wrapper around the 8p A5 CPT launcher in this directory.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-export DSV41_SFT_DATASET="${DSV41_SFT_DATASET:-${DATASET_PATH:-/path/to/train.jsonl}}"
-export CONFIG="${CONFIG:-deepseek_v4_1_flash_40layers_24experts_multimodal_sft_compiled}"
+export CPU_AFFINITY_CONF="${CPU_AFFINITY_CONF:-1,npu0:288-311,npu1:312-335,npu2:336-359,npu3:360-383,npu4:96-119,npu5:120-143,npu6:144-167,npu7:168-191}"
 
-exec bash "${SCRIPT_DIR}/deepseek_v4_1_flash_8p_cpt_4k_a5.sh" "$@"
+MODULE="${MODULE:-torchtitan_npu_recipes.examples.deepseek_v4_1}" \
+CONFIG="${CONFIG:-deepseek_v4_1_flash_8p_sft_4k_a5}" \
+NGPU="${NGPU:-8}" \
+NNODES="${NNODES:-1}" \
+exec bash "${SCRIPT_DIR}/../../../scripts/run_train.sh" "$@"

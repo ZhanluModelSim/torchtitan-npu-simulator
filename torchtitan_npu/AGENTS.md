@@ -8,7 +8,7 @@
 
 | 目录 | 目标职责 | 允许的直接依赖 |
 | --- | --- | --- |
-| `config/` | NPU config schema、纯转换器与显式注册 API | 标准库与上游配置 API；当前包导入会安装 ConfigManager loader wrapper，拆除该副作用是后续目标 |
+| `config/` | NPU config schema、纯转换器与显式注册 API | 标准库与上游配置 API；当前包导入会安装 ConfigLoader loader wrapper，拆除该副作用是后续目标 |
 | `patches/` | 上游 `torchtitan` 或 `torch_npu` 的待合入补丁 | 不得新增对 `extensions/` 的依赖 |
 | `models/` | 应由上游 TorchTitan 拥有、但尚未合入的模型定义、配置、并行化与 checkpoint 适配 | 现有跨层依赖是迁移债务，不宣称已清零 |
 | `extensions/` | 本仓永久额外扩展、组件集成与图编译注册 | 可依赖 `patches/` 定义；不得新增对 `models/`、`override/` 或 `ops/` 的依赖 |
@@ -30,8 +30,10 @@ patches → config → extensions → ops
 ```
 
 - `patches/` 先导入并完成上游替换；`extensions/` 随后可复用 patch 定义或经上游路径使用其效果。
-- `config/` 当前通过导入 `manager` 安装 `ConfigManager._load_config` wrapper；该副作用服务于现有配置转换，尚未迁入 extension 激活入口。
+- `config/` 当前通过导入 `manager` 安装 `ConfigLoader._load_config` wrapper；该副作用服务于现有配置转换，尚未迁入 extension 激活入口。
 - `override/` 不是自动导入层；它由 `override.imports` 显式选择。
+- GraphTrainer extension 不再由包入口自动导入；后置功能不能阻断 eager 入口。
+- `TrainerEx` 复用上游 `Trainer` 的 `model_config.update_from_config(config=...)` 生命周期；模型准备逻辑由模型配置拥有，extension 不直接导入模型。
 - 收敛为 `patches → extensions` 是后续目标。当前 `config` 和 `ops` 仍由包入口导入，不能把目标顺序写成已实现行为。
 - `TORCHTITAN_NPU_DISABLE_EXTENSIONS` 和 `TORCHTITAN_NPU_DISABLE_COMPONENTS` 是未实现的目标加载接口，当前不能作为运行时配置使用；实现状态见 [extensions 规则](extensions/AGENTS.md)。
 

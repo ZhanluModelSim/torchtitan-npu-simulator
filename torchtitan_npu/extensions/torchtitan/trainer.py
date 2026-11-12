@@ -7,7 +7,7 @@
 # this import before the remaining extension dependencies.
 # ruff: noqa: I001
 import logging
-from copy import copy
+from copy import copy, deepcopy
 from dataclasses import dataclass, field
 
 from typing import Annotated, cast
@@ -28,7 +28,6 @@ from torchtitan_npu.config.configs import (
 )
 from torchtitan_npu.config.converters import TrainerConfigConverter
 from torchtitan_npu.extensions.torchtitan.components.checkpoint import CheckpointManager
-from torchtitan_npu.extensions.torchtitan.components.optimizer.ema import EMA
 from torchtitan_npu.extensions.components.gradient_clipping import GradientClippingOptim  # noqa: F401
 from torchtitan_npu.extensions.components.sdc import SDC, validate_sdc_replay_config
 from torchtitan_npu.extensions.experiment.anticipatory_routing.config import (
@@ -53,8 +52,8 @@ def set_allow_hf32(allow: bool) -> None:
     torch_npu.npu.aclnn.allow_hf32 = allow
 
 
-class NPUTrainingEngineMixin:
-    """Run NPU microbatch hooks at the engine's forward/backward boundary."""
+class TrainingEngineEx(TrainingEngine):
+    """Upstream ``TrainingEngine`` with NPU microbatch hooks."""
 
     anticipatory_schedule: AnticipatorySchedule | None = None
     _sdc: SDC | None = None
@@ -62,8 +61,7 @@ class NPUTrainingEngineMixin:
     def _non_pp_forward_backward_microbatch(self, **kwargs):
         if self.anticipatory_schedule is not None:
             self.anticipatory_schedule.prepare_microbatch()
-        # This cooperative mixin precedes TrainingEngine in NPUTrainingEngine's MRO.
-        result = super()._non_pp_forward_backward_microbatch(**kwargs)  # pyrefly: ignore [missing-attribute]
+        result = super()._non_pp_forward_backward_microbatch(**kwargs)
         if self.anticipatory_schedule is not None:
             self.anticipatory_schedule.accumulate_microbatch_loss(result)
         if self._sdc is not None:
@@ -71,14 +69,10 @@ class NPUTrainingEngineMixin:
         return result
 
 
-class NPUTrainingEngine(NPUTrainingEngineMixin, TrainingEngine):
-    """TrainingEngine with NPU extension lifecycle hooks."""
-
-
 class TrainerEx(Trainer):
     """Base trainer for NPU-specific training features."""
 
-    engine_cls = NPUTrainingEngine
+    engine_cls = TrainingEngineEx
 
     @dataclass(kw_only=True, slots=True)
     class Config(Trainer.Config):
@@ -111,6 +105,8 @@ class TrainerEx(Trainer):
 
                 if type(self.checkpointer) is native.TorchCheckpointingManager.Config:
                     self.checkpointer = derive(self.checkpointer, npu_native.TorchCheckpointingManager.Config)
+            if self.compile is not None:
+                raise NotImplementedError("NPU model compilation is not supported in the eager upgrade")
             # Single switch: ``--training.enable-cpu-offload`` drives both the
             # FSDP offload policy (read by parallelize) and, through this
             # carrier field, the optimizer-container selection in the
@@ -179,6 +175,10 @@ class TrainerEx(Trainer):
                         )
 
     def __init__(self, config: Config):
+        if getattr(config, "compile", None) is not None:
+            raise NotImplementedError("NPU model compilation is not supported in the eager upgrade")
+        if getattr(getattr(config, "optim", None), "ema", None) is not None:
+            raise NotImplementedError("NPU EMA is not supported in the eager upgrade")
         quantization_config = config.extension.quantization
         if quantization_config.enable_quantized_training:
             from torchtitan_npu.extensions.adaptor.torchao.converter import apply_quantization_converter
@@ -196,6 +196,17 @@ class TrainerEx(Trainer):
                 model_compile_enabled=model_compile_enabled,
                 override_config=config.override,
             )
+
+        # v0.4.0 removed the upstream ``update_from_config`` call and applies
+        # overrides before the engine exists. Run the model-owned preparation on a
+        # private copy here so the sharding pass still precedes the overrides, which
+        # derive their configs from it.
+        model_config = getattr(config, "model", None)
+        if model_config is not None:
+            config.model = deepcopy(model_config)
+            update = getattr(config.model, "update_from_config", None)
+            if update is not None:
+                update(config=config)
 
         set_allow_hf32(config.training.extension.allow_hf32)
         if getattr(config.training, "enable_cpu_offload", False):
@@ -255,7 +266,7 @@ class TrainerEx(Trainer):
             self._carve_grad_slots(pool)
         else:
             super().__init__(config)
-        engine = cast("NPUTrainingEngine", self.engine)
+        engine = cast("TrainingEngineEx", self.engine)
         engine._sdc = config.sdc.build(
             trainer_config=config,
             model_parts=self.engine.model_parts,
@@ -309,9 +320,7 @@ config_manager.register_config_converter(
         component_types={
             "optim": OptimConfig,
             "optim.optimizer": OptimizerConfig,
-            "optim.ema": EMA.Config,
             "checkpointer": CheckpointManager.Config,
-            "compile": CompileConfig,
             "profiler": CANNProfiler.Config,
             "training": TrainingConfig,
         },

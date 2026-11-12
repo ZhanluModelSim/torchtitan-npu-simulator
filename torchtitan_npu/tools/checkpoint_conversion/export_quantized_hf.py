@@ -400,7 +400,7 @@ def _model_derived_config_fields(model_config) -> dict:
     put("vocab_size", lambda: model_config.vocab_size)
     put("hidden_size", lambda: model_config.dim)
     put("num_hidden_layers", lambda: len(layers) or None)
-    put("num_nextn_predict_layers", lambda: len(model_config.mtp_layers))
+    put("num_nextn_predict_layers", lambda: len(model_config.mtp_layers or ()))
     put("tie_word_embeddings", lambda: model_config.enable_weight_tying)
     put(
         "compress_ratios",

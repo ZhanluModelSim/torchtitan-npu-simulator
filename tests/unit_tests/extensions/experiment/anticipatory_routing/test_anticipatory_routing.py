@@ -15,7 +15,7 @@ from torch import nn
 from torchtitan.components.data.types import TrainingMicrobatch
 from torchtitan.components.optim import Optim
 from torchtitan.models.common.activation import Sigmoid
-from torchtitan.models.common.linear import RouterGateLinear
+from torchtitan.models.common.linear.hi_mid_lo_linear import HiMidLoLinear
 from torchtitan.models.common.moe import TokenChoiceTopKRouter
 from torchtitan.training_engine import TrainingEngine
 
@@ -24,7 +24,7 @@ from torchtitan_npu.extensions.experiment.anticipatory_routing.cache import Rout
 from torchtitan_npu.extensions.experiment.anticipatory_routing.config import AnticipatoryRoutingConfig
 from torchtitan_npu.extensions.experiment.anticipatory_routing.router import build_routing_cache
 from torchtitan_npu.extensions.experiment.anticipatory_routing.schedule import AnticipatorySchedule, Phase
-from torchtitan_npu.extensions.torchtitan.trainer import NPUTrainingEngine, TrainerEx
+from torchtitan_npu.extensions.torchtitan.trainer import TrainingEngineEx, TrainerEx
 
 
 class Scheduler(torch.optim.lr_scheduler.StepLR):
@@ -79,7 +79,7 @@ class Model(nn.Module):
         super().__init__()
         router = TokenChoiceTopKRouter.Config(
             num_experts=2,
-            gate=RouterGateLinear.Config(in_features=2, out_features=2),
+            gate=HiMidLoLinear.Config(in_features=2, out_features=2),
             score_func=Sigmoid.Config(),
             top_k=1,
         ).build()
@@ -120,7 +120,7 @@ def test_forward_only_preserves_batch_and_forwards_model_metadata():
 
 def make_trainer(monkeypatch, *, delay=2, active=3, size=40, steps=10, device="cpu", compile_backend=None):
     trainer = object.__new__(TrainerEx)
-    runtime = object.__new__(NPUTrainingEngine)
+    runtime = object.__new__(TrainingEngineEx)
     trainer.engine = runtime
     runtime.device = torch.device(device)
     runtime.num_completed_steps, runtime.ntokens_seen = 0, 0

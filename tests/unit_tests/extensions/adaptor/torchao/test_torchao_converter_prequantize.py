@@ -175,7 +175,7 @@ def test_mxfp4_communication_config_reaches_only_selected_experts():
         enable_mxfp4_qat=True,
         enable_fsdp_prequantize=True,
         fsdp_prequantize_dtype="mxfp4",
-        fsdp_prequantize_fqns=[".moe.routed_experts.w13", ".moe.routed_experts.w2"],
+        fsdp_prequantize_fqns=[".feed_forward.routed_experts.w13", ".feed_forward.routed_experts.w2"],
     )
     converted = apply_quantization_converter(spec, config, model_compile_enabled=False)
     experts = list(converted.traverse(GroupedLinear.Config))

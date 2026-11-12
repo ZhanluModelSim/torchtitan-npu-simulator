@@ -3,17 +3,44 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from __future__ import annotations
+
+__all__ = [
+    "DeepSeekV4MTPDecoder",
+    "DeepSeekV4MTPTransformerBlock",
+    "MTPBatch",
+    "MTPChunkedLossWrapper",
+    "MTPLoss",
+    "MTPModelOutput",
+    "prepare_mtp_batch",
+    "roll_mtp_sequence",
+]
+
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, NamedTuple, cast
 
 import spmd_types as spmd
 import torch
-from torchtitan.components.loss import IGNORE_INDEX, BaseLoss, ChunkedLossWrapper
-from torchtitan.models.deepseek_v3.mtp import MTPLoss as MTPLoss
-from torchtitan.models.deepseek_v3.mtp import roll_mtp_sequence
+from torchtitan.components.loss import (
+    IGNORE_INDEX,
+    BaseLoss,
+    ChunkedLossWrapper,
+)
+from torchtitan.config import derive
+from torchtitan.models.common.linear import Linear
+from torchtitan.models.deepseek_v3.mtp import (
+    MTPDecoder,
+    MTPLoss,
+    roll_mtp_sequence,
+)
+from torchtitan.models.deepseek_v4.model import DeepSeekV4Model as TorchTitanV4Model
+from torchtitan.models.deepseek_v4.mtp import MTPBlock
 
+from torchtitan_npu.models.common.attention_metadata import AttentionMetadataMap, GeometryAttentionMetadataMixin
 from torchtitan_npu.models.common.linear import SharedLinear
+
+from .mhc import HcHead  # noqa: TC001
 
 
 class MTPBatch(NamedTuple):
@@ -171,7 +198,7 @@ class MTPChunkedLossWrapper(ChunkedLossWrapper):
         mtp_isolate_gradients: bool = False
 
     def __init__(self, config: Config, *, compile_config=None):
-        super().__init__(config, compile_config=compile_config)
+        super().__init__(config)
         self.mtp_scale = config.mtp_scale
         self.mtp_isolate_gradients = config.mtp_isolate_gradients
         self._scaled_loss = _ScaledLoss(self.loss_fn)
@@ -179,37 +206,254 @@ class MTPChunkedLossWrapper(ChunkedLossWrapper):
 
     def __call__(
         self,
-        pred: list[torch.Tensor],
-        labels: torch.Tensor,
-        global_valid_tokens: torch.Tensor | None = None,
+        pred: tuple[torch.Tensor, ...],
+        labels: tuple[torch.Tensor, ...],
+        global_loss_token_counts: torch.Tensor | None = None,
         **loss_inputs: Any,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        if not isinstance(pred, list):
-            raise ValueError("MTPChunkedLossWrapper expects main hidden states followed by one tensor per MTP layer.")
-
-        positions = loss_inputs.pop("positions", None)
-        padding_mask = loss_inputs.pop("padding_mask", None)
-        mtp_labels = _mtp_labels(pred, labels, positions, padding_mask)
-        branch_scale = self.mtp_scale / len(mtp_labels)
-        head_context = _mtp_head_context(self.lm_head, isolate_gradients=self.mtp_isolate_gradients)
-
-        self._scaled_loss.scale = 1.0
-        total_loss, metrics = super().__call__(
-            pred[0],
-            labels,
-            global_valid_tokens,
-            **loss_inputs,
+        if not isinstance(pred, tuple) or not isinstance(labels, tuple) or len(pred) != len(labels) or len(pred) < 2:
+            raise ValueError("MTP chunked loss requires aligned main and MTP tuples.")
+        if global_loss_token_counts is not None and (
+            global_loss_token_counts.ndim != 1 or global_loss_token_counts.numel() != len(pred)
+        ):
+            raise ValueError("MTP chunked loss requires one denominator per objective.")
+        counts = (
+            (None,) * len(pred)
+            if global_loss_token_counts is None
+            else tuple(count.clamp_min(1) for count in global_loss_token_counts.unbind())
         )
-        # Keep the real head visible to the upstream FSDP chunk lifecycle.
-        with head_context:
-            for hidden, depth_labels in zip(pred[1:], mtp_labels, strict=True):
-                self._scaled_loss.scale = branch_scale
-                depth_loss, depth_metrics = super().__call__(
-                    hidden,
-                    depth_labels,
-                    global_valid_tokens,
-                    **loss_inputs,
-                )
+        mtp_head_context = _mtp_head_context(self.lm_head, isolate_gradients=self.mtp_isolate_gradients)
+        self._scaled_loss.scale = 1.0
+        total_loss, metrics = super().__call__(pred[0], labels[0], counts[0], **loss_inputs)
+        with mtp_head_context:
+            for hidden, depth_labels, count in zip(pred[1:], labels[1:], counts[1:], strict=True):
+                self._scaled_loss.scale = self.mtp_scale / (len(pred) - 1)
+                depth_loss, depth_metrics = super().__call__(hidden, depth_labels, count, **loss_inputs)
                 total_loss = total_loss + depth_loss
                 metrics = self._combine_chunk_metrics(metrics, depth_metrics)
         return total_loss, metrics
+
+
+class _MTPAttentionContext(NamedTuple):
+    """What every DSV4 layer reads for its attention, main and MTP depths.
+
+    The per-microbatch metadata map (upstream #4897) is built once for the whole
+    stack -- main layers and MTP depths together -- and each layer reads the entry
+    its own attention backend named.  There is no single-object fallback: the V4
+    cores all build their own metadata, so a layer whose key is missing is a
+    config that built none for a backend it runs, not a reason to hand it another
+    geometry's grid.
+    """
+
+    attention_metadata: AttentionMetadataMap
+    positions: torch.Tensor | None
+
+    def for_layer(self, layer: Any) -> Any:
+        """The metadata one layer reads: its own map entry, keyed by its backend."""
+        key = getattr(layer.attention, "attention_metadata_key", type(layer.attention.inner_attention))
+        metadata = self.attention_metadata.get(key)
+        if metadata is None:
+            raise ValueError(f"no attention metadata was built for {key!r}")
+        return metadata
+
+
+class _MTPForwardState(NamedTuple):
+    tok_embeddings: Any
+    hc_hidden: torch.Tensor
+    main_hidden: torch.Tensor
+
+
+class DeepSeekV4MTPTransformerBlock(MTPBlock):
+    """Adapt geometry-keyed metadata to the upstream MTP block interface."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(MTPBlock.Config):
+        pass
+
+    def forward(  # pyrefly: ignore [bad-param-name-override]
+        self,
+        mtp_input_embed,
+        prev_hc_hidden,
+        mtp_input_ids,
+        mtp_input_valid_mask,
+        attention_context,
+        *,
+        padding_mask=None,
+        aux_loss_denominator=None,
+    ):
+        return super().forward(
+            mtp_input_embed,
+            prev_hc_hidden,
+            mtp_input_ids,
+            mtp_input_valid_mask,
+            attention_context.for_layer(self),
+            attention_context.positions,
+            padding_mask=padding_mask,
+            aux_loss_denominator=aux_loss_denominator,
+        )
+
+
+class DeepSeekV4MTPDecoder(GeometryAttentionMetadataMixin, TorchTitanV4Model):
+    """DeepSeek-V4 decoder with optional multi-token prediction layers."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(TorchTitanV4Model.Config):
+        hc_mult: int = 4
+        hc_head: HcHead.Config
+        mtp_isolate_gradients: bool = False
+
+    def __init__(self, config: Config):
+        if config.mtp_isolate_gradients:
+            if not config.mtp_layers or type(config.lm_head) is not Linear.Config:
+                raise ValueError("MTP gradient isolation requires MTP layers and an unmodified Linear LM head.")
+            config = derive(config, type(config), lm_head=derive(config.lm_head, SharedLinear.Config))
+        super().__init__(config)
+        self.mtp_isolate_gradients = config.mtp_isolate_gradients
+        if not config.mtp_layers:
+            self.mtp_layers = None  # pyrefly: ignore [bad-assignment]
+
+    # Reuse aligned input/label preparation without copying the V3 MTP implementation.
+    preprocess_inputs = MTPDecoder.preprocess_inputs
+
+    def forward(  # pyrefly: ignore [bad-override]
+        self,
+        tokens: torch.Tensor | tuple[torch.Tensor, ...],
+        positions: torch.Tensor | None = None,
+        *,
+        attention_metadata: AttentionMetadataMap,
+        mtp_input_valid_masks: tuple[torch.Tensor, ...] | None = None,
+        padding_mask: torch.Tensor | None = None,
+        aux_loss_denominators: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
+        """The metadata map is the pinned argument's replacement, not a renaming of it.
+
+        The pinned ``MTPDecoder.forward`` takes one mask object for every layer; this decoder
+        takes the decoder's map and hands each layer the entry of its own geometry, so the
+        parameter is keyword-only and the pinned name would be a lie.
+        """
+        attention_context = _MTPAttentionContext(attention_metadata, positions)
+        if self.mtp_layers is not None:
+            if not isinstance(tokens, tuple) or len(tokens) != len(self.mtp_layers) + 1:
+                raise ValueError("MTP requires one token tensor per objective.")
+            if mtp_input_valid_masks is None or len(mtp_input_valid_masks) != len(self.mtp_layers):
+                raise ValueError("MTP requires one validity mask per depth.")
+            main_tokens, *depth_tokens = tokens
+            mtp_batch = MTPBatch(
+                torch.stack(depth_tokens, dim=-1),
+                torch.stack(mtp_input_valid_masks, dim=-1),
+                torch.empty(0, device=main_tokens.device),
+            )
+        else:
+            if not isinstance(tokens, torch.Tensor):
+                raise ValueError("Decoder without MTP requires one token tensor.")
+            main_tokens, mtp_batch = tokens, None
+        if aux_loss_denominators is not None and aux_loss_denominators.numel() != (
+            1 + (0 if self.mtp_layers is None else len(self.mtp_layers))
+        ):
+            raise ValueError("Expected one routing denominator per objective.")
+        state = self._forward_main(
+            main_tokens,
+            attention_context,
+            padding_mask=padding_mask,
+            aux_loss_denominator=None if aux_loss_denominators is None else aux_loss_denominators[0],
+        )
+
+        if self.mtp_layers is None:
+            if self._skip_lm_head or self.lm_head is None:
+                return state.main_hidden
+            return self.lm_head(state.main_hidden)
+
+        if state.tok_embeddings is None:
+            raise ValueError("DeepSeek-V4 MTP forward requires token embeddings.")
+
+        outputs = [
+            state.main_hidden,
+            *self._forward_mtp_layers(
+                main_tokens,
+                state,
+                attention_context,
+                mtp_batch,
+                padding_mask=padding_mask,
+                aux_loss_denominators=aux_loss_denominators,
+            ),
+        ]
+        if not self._skip_lm_head and self.lm_head is not None:
+            outputs[0] = self.lm_head(outputs[0])
+            with _mtp_head_context(self.lm_head, isolate_gradients=self.mtp_isolate_gradients):
+                outputs[1:] = [self.lm_head(item) for item in outputs[1:]]
+        return tuple(outputs)
+
+    def _forward_main(
+        self,
+        tokens: torch.Tensor,
+        attention_context: _MTPAttentionContext,
+        *,
+        padding_mask: torch.Tensor | None = None,
+        aux_loss_denominator: torch.Tensor | None = None,
+    ) -> _MTPForwardState:
+        tok_embeddings = self.tok_embeddings
+        input_ids = tokens.detach().long()
+        hidden = tok_embeddings(tokens) if tok_embeddings is not None else tokens
+        hidden = hidden.unsqueeze(1).repeat(1, self.hc_mult, 1)
+
+        for layer in self.layers.values():
+            hidden = layer(
+                hidden,
+                input_ids,
+                attention_context.for_layer(layer),
+                attention_context.positions,
+                padding_mask=padding_mask,
+                aux_loss_denominator=aux_loss_denominator,
+            )
+
+        main_hidden = self.hc_head(hidden)
+        main_hidden = self.norm(main_hidden) if self.norm is not None else main_hidden
+        return _MTPForwardState(tok_embeddings, hidden, main_hidden)
+
+    def _forward_mtp_layers(
+        self,
+        tokens: torch.Tensor,
+        state: _MTPForwardState,
+        attention_context: _MTPAttentionContext,
+        mtp_batch: MTPBatch | None,
+        *,
+        padding_mask: torch.Tensor | None = None,
+        aux_loss_denominators: torch.Tensor | None = None,
+    ) -> list[torch.Tensor]:
+        if self.mtp_layers is None:
+            return []
+        if mtp_batch is not None and mtp_batch.input_tokens.shape[-1] != len(self.mtp_layers):
+            raise ValueError(
+                "Prepared MTP input depth does not match model layers: "
+                f"{mtp_batch.input_tokens.shape[-1]} inputs for "
+                f"{len(self.mtp_layers)} layers."
+            )
+
+        mtp_outputs = []
+        prev_hc_hidden = state.hc_hidden.detach() if self.mtp_isolate_gradients else state.hc_hidden
+        for depth, layer in enumerate(self.mtp_layers, 1):
+            if mtp_batch is None:
+                mtp_tokens, valid_mask = roll_mtp_sequence(
+                    tokens,
+                    shift=depth,
+                    fill_value=0,
+                    positions=attention_context.positions,
+                    padding_mask=padding_mask,
+                    return_valid_mask=True,
+                )
+            else:
+                mtp_tokens = mtp_batch.input_tokens[..., depth - 1]
+                valid_mask = mtp_batch.input_valid_mask[..., depth - 1]
+            with torch.no_grad() if self.mtp_isolate_gradients else nullcontext():
+                mtp_embed = state.tok_embeddings(mtp_tokens)
+            prev_hc_hidden, prediction_hidden = layer(
+                mtp_embed,
+                prev_hc_hidden,
+                mtp_tokens.detach().long(),
+                valid_mask,
+                attention_context,
+                padding_mask=padding_mask,
+                aux_loss_denominator=None if aux_loss_denominators is None else aux_loss_denominators[depth],
+            )
+            mtp_outputs.append(prediction_hidden)
+        return mtp_outputs

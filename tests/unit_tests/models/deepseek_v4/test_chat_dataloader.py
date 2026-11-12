@@ -17,7 +17,7 @@ from torchtitan.components.tokenizer import HuggingFaceTokenizer
 
 from torchtitan_npu.models.deepseek_v4.chat_encoder import DSV4EncoderConfig
 from torchtitan_npu.models.deepseek_v4.chat_processor import DeepSeekV4ChatProcessor
-from torchtitan_npu.models.deepseek_v4.config_registry import deepseek_v4_flash_sft
+from torchtitan_npu_recipes.models.deepseek_v4 import deepseek_v4_flash_sft
 
 
 class _StubEncoder:
@@ -68,7 +68,7 @@ def test_sft_recipe_builds_aligned_supervised_batches(sft_recipe):
     assert microbatch.labels.tolist() == [-100, 12, 13, 14, 15] + [-100] * 123 + [-100, 22, 23, 24, 25] + [-100] * 123
     assert microbatch.positions.tolist() == list(range(128)) * 2
     assert microbatch.padding_mask.tolist() == ([False] * 5 + [True] * 123) * 2
-    assert microbatch.num_valid_tokens == 8
+    assert int(microbatch.loss_token_counts) == 8
 
 
 @pytest.mark.parametrize("rank", (0, 1), ids=("dp-rank-0", "dp-rank-1"))
@@ -93,7 +93,7 @@ def test_sft_grain_restores_packing_and_prefetch_across_epoch(sft_recipe, rank):
             expected = next(iter(original))
             actual = next(iter(restored))
             expected_inputs, inputs = expected.as_input_dict(), actual.as_input_dict()
-            assert actual.num_valid_tokens == expected.num_valid_tokens
+            assert int(actual.loss_token_counts) == int(expected.loss_token_counts)
             assert inputs.keys() == expected_inputs.keys()
             for key in inputs:
                 torch.testing.assert_close(

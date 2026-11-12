@@ -51,9 +51,11 @@ def _build_model_config(num_experts=NUM_EXPERTS, num_layers=N_LAYERS, num_mtp_la
 
 
 def _lora_model_config(*, num_experts=2, num_layers=1, targets=None):
+    from torchtitan_npu.models.deepseek_v4.backend import with_npu_attention_backend
     from torchtitan_npu.models.deepseek_v4.lora import deepseek_v4_lora_transform
 
     transform = deepseek_v4_lora_transform(rank=8, alpha=16)
     if targets is not None:
         transform.target_modules = targets
-    return transform.transform(_build_model_config(num_experts=num_experts, num_layers=num_layers))
+    config = with_npu_attention_backend(_build_model_config(num_experts=num_experts, num_layers=num_layers))
+    return transform.transform(config)

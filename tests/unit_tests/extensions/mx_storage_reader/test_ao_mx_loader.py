@@ -592,7 +592,7 @@ def test_only_v4_selects_ao_reader(readers, monkeypatch, tmp_path):
     fallback = object()
 
     class V3Adapter:
-        def get_hf_storage_reader(self, path, from_quantized=False):
+        def get_hf_storage_reader(self, path, from_quantized=False, *, thread_count=None):
             return fallback
 
     upstream = ModuleType("torchtitan.models.deepseek_v3.state_dict_adapter")

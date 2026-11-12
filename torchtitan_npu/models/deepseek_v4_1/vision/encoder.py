@@ -8,10 +8,13 @@ from dataclasses import dataclass, field, replace
 
 import torch
 import torch.nn.functional as F
+from torchtitan.models.base.module import Module, ModuleList
 from torchtitan.models.common import Linear
 from torchtitan.models.common.nn_modules import RMSNorm
-from torchtitan.models.common.vision_encoder_sharding import invariant_norm_config, vision_invariant_linear_config
-from torchtitan.protocols.module import Module, ModuleList
+from torchtitan.models.common.vision_encoder_sharding import (
+    invariant_norm_sharding_config,
+    vision_invariant_linear_sharding_config,
+)
 
 from torchtitan_npu.models.common.rope import HalfRotation
 
@@ -70,7 +73,7 @@ class PatchEmbed(Module):
             in_features=3 * config.patch_size * config.patch_size,
             out_features=config.dim,
             bias=True,
-            sharding_config=vision_invariant_linear_config(),
+            sharding_config=vision_invariant_linear_sharding_config(),
         ).build()
 
     def forward(self, patches: torch.Tensor) -> torch.Tensor:
@@ -96,13 +99,13 @@ class VisionAttention(Module):
             in_features=config.dim,
             out_features=3 * config.dim,
             bias=True,
-            sharding_config=vision_invariant_linear_config(),
+            sharding_config=vision_invariant_linear_sharding_config(),
         ).build()
         self.wo = Linear.Config(
             in_features=config.dim,
             out_features=config.dim,
             bias=True,
-            sharding_config=vision_invariant_linear_config(),
+            sharding_config=vision_invariant_linear_sharding_config(),
         ).build()
 
     def forward(self, x, cos, sin, valid):
@@ -153,13 +156,13 @@ class VisionMLP(Module):
             in_features=config.dim,
             out_features=2 * config.inter_dim,
             bias=False,
-            sharding_config=vision_invariant_linear_config(),
+            sharding_config=vision_invariant_linear_sharding_config(),
         ).build()
         self.w2 = Linear.Config(
             in_features=config.inter_dim,
             out_features=config.dim,
             bias=False,
-            sharding_config=vision_invariant_linear_config(),
+            sharding_config=vision_invariant_linear_sharding_config(),
         ).build()
 
     def forward(self, x):
@@ -185,11 +188,17 @@ class VisionBlock(Module):
     def __init__(self, config: Config):
         super().__init__()
         self.norm1 = replace(
-            config.norm, normalized_shape=config.dim, eps=config.norm_eps, sharding_config=invariant_norm_config()
+            config.norm,
+            normalized_shape=config.dim,
+            eps=config.norm_eps,
+            sharding_config=invariant_norm_sharding_config(),
         ).build()
         self.attn = self.attention_type.Config(dim=config.dim, num_heads=config.num_heads, rotary=config.rotary).build()
         self.norm2 = replace(
-            config.norm, normalized_shape=config.dim, eps=config.norm_eps, sharding_config=invariant_norm_config()
+            config.norm,
+            normalized_shape=config.dim,
+            eps=config.norm_eps,
+            sharding_config=invariant_norm_sharding_config(),
         ).build()
         self.mlp = VisionMLP.Config(dim=config.dim, inter_dim=config.inter_dim).build()
 
@@ -213,13 +222,13 @@ class ImageAligner(Module):
             in_features=in_dim,
             out_features=config.text_dim,
             bias=True,
-            sharding_config=vision_invariant_linear_config(),
+            sharding_config=vision_invariant_linear_sharding_config(),
         ).build()
         self.w2 = Linear.Config(
             in_features=config.text_dim,
             out_features=config.text_dim,
             bias=True,
-            sharding_config=vision_invariant_linear_config(),
+            sharding_config=vision_invariant_linear_sharding_config(),
         ).build()
 
     def forward(self, x, grids):
@@ -292,7 +301,10 @@ class DeepSeekV41VisionEncoder(Module):
             ]
         )
         self.norm = replace(
-            config.norm, normalized_shape=config.dim, eps=config.norm_eps, sharding_config=invariant_norm_config()
+            config.norm,
+            normalized_shape=config.dim,
+            eps=config.norm_eps,
+            sharding_config=invariant_norm_sharding_config(),
         ).build()
         self.aligner = ImageAligner.Config(
             dim=config.dim,

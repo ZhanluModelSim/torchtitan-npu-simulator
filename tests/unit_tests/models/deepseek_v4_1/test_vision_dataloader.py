@@ -19,7 +19,7 @@ from PIL import Image
 from torchtitan.components.data import GrainDataLoader
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
 
-from torchtitan_npu.models.deepseek_v4_1.config_registry import deepseek_v4_1_debugmodel_multimodal
+from torchtitan_npu_recipes.models.deepseek_v4_1 import deepseek_v4_1_debugmodel_multimodal
 from torchtitan_npu.models.deepseek_v4_1.vision.data import IMAGE_END, IMAGE_START, ImagePatchProcessor
 from torchtitan_npu.models.deepseek_v4_1.vision.dataloader import _process_mm_sample, caption_dataloader_config
 
@@ -180,7 +180,7 @@ def test_recipe_passes_the_model_alignment_to_the_loader():
     """The recipes derive the loader's per-document alignment from the model spec
     (the LCM of its compression ratios), so a packed document never straddles a
     pooled group."""
-    from torchtitan_npu.models.deepseek_v4_1 import config_registry as cr
+    from torchtitan_npu_recipes.models import deepseek_v4_1 as cr
 
     trainer = cr.deepseek_v4_1_debugmodel_multimodal()
     assert isinstance(trainer.dataloader, GrainDataLoader.Config)

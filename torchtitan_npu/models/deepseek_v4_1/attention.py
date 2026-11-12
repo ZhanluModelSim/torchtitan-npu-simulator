@@ -36,15 +36,16 @@ inner-attention forward.
 """
 
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 from attn_gym.sparse import gather_attn
 from torch import nn
-from torchtitan.models.common.attention import BaseAttention, create_varlen_metadata_for_document
+from torchtitan.models.common.attention import Attention as BaseAttention
+from torchtitan.models.common.attention import InnerAttention, create_varlen_metadata_for_document
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.models.common.rope import RoPE
-from torchtitan.protocols.module import Module
 
 from torchtitan_npu.patches.torchtitan.models.common.linear import BatchedLinear
 
@@ -53,7 +54,7 @@ from .indexer import HierarchicalIndexer
 from .model import DeepSeekV41Metadata, build_v41_frames
 
 
-class CompressedSparseInnerAttention2(Module):
+class CompressedSparseInnerAttention2(InnerAttention):
     """CSA2's sparse core: sliding window plus the selected compressed entries.
 
     The whole core is Attention Gym's ``gather_attn`` in one call: ``q`` carries
@@ -71,7 +72,7 @@ class CompressedSparseInnerAttention2(Module):
     """
 
     @dataclass(kw_only=True, slots=True)
-    class Config(Module.Config):
+    class Config(InnerAttention.Config):
         window_size: int
         softmax_scale: float
         # The layer's compression ratio: the grid this core addresses its compressed pool on.
@@ -97,7 +98,7 @@ class CompressedSparseInnerAttention2(Module):
             padding_mask: torch.Tensor | None = None,
             max_num_documents: int | None = None,
             max_context_length: int | None = None,
-        ) -> DeepSeekV41Metadata:
+        ) -> Any:
             """The packed row and this geometry's pool grid, built once per microbatch (#4897).
 
             Upstream's ``create_varlen_metadata_for_document`` supplies the row's boundaries --
@@ -252,6 +253,7 @@ class Attention(BaseAttention):
         self.attn_sink = nn.Parameter(torch.empty(cfg.n_heads, dtype=torch.float32))
         self.compressor = cfg.compressor.build()
         self.indexer = cfg.indexer.build()
+        self.attention_metadata_key = cfg.inner_attention.attention_metadata_key
         self.inner_attention = cfg.inner_attention.build()
         # The CP mesh this layer restores its key side on, wired by ``parallelize``; ``None`` at
         # one degree, where the metadata carries no plan and nothing moves.

@@ -5,9 +5,9 @@ import pytest
 import spmd_types as spmd
 import torch
 import torch.nn.functional as F
+from torchtitan.models.base.sharding import ShardingConfig
 from torchtitan.models.common.decoder_sharding import dense_param_placement
 from torchtitan.models.common.linear import GroupedLinear
-from torchtitan.protocols.sharding import ShardingConfig
 
 from tests.unit_tests.models.deepseek_v4.lora_test_utils import _lora_model_config
 
@@ -38,7 +38,7 @@ def test_standard_lora_projection_output_and_gradients_match_independent_formula
     elif kind == "batched":
         projection = config.layers[0].attention.wo_a
     else:
-        projection = config.layers[0].moe.routed_experts.w13
+        projection = config.layers[0].feed_forward.routed_experts.w13
         monkeypatch.setattr(GroupedLinear, "_grouped_mm", _cpu_grouped_mm)
     if replicated:
         projection.sharding_config = ShardingConfig(state_shardings={"weight": dense_param_placement(tp=spmd.R)})

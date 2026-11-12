@@ -18,11 +18,11 @@ from torchtitan_npu.models.deepseek_v4_1.moe import DeepSeekV41Router
 
 def _router():
     from torchtitan.models.common.activation import Sigmoid
-    from torchtitan.models.common.linear import RouterGateLinear
+    from torchtitan.models.common.linear.hi_mid_lo_linear import HiMidLoLinear
 
     config = DeepSeekV41Router.Config(
         num_experts=4,
-        gate=RouterGateLinear.Config(in_features=4, out_features=4),
+        gate=HiMidLoLinear.Config(in_features=4, out_features=4),
         score_func=Sigmoid.Config(),
         top_k=2,
         sorted_topk=True,
@@ -132,10 +132,10 @@ def test_anticipatory_replay_preserves_dtensor_ids_and_current_score_gradients(t
 
 def test_cache_wraps_dynamic_router_but_not_v4_hash_router():
     from torchtitan.models.common.activation import Sigmoid
-    from torchtitan.models.common.linear import RouterGateLinear
+    from torchtitan.models.common.linear.hi_mid_lo_linear import HiMidLoLinear
     from torchtitan.models.deepseek_v4.moe import DeepSeekV4Router
 
-    gate = RouterGateLinear.Config(in_features=4, out_features=4)
+    gate = HiMidLoLinear.Config(in_features=4, out_features=4)
     with torch.random.fork_rng(devices=[]):
         hash_router = DeepSeekV4Router.Config(
             num_experts=4, gate=gate, score_func=Sigmoid.Config(), top_k=2, vocab_size=8, layer_id=0, n_hash_layers=1

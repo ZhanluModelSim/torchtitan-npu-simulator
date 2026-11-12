@@ -8,14 +8,16 @@ version = "0.1.0"
 description = "Huawei Ascend NPU overrides for torchtitan"
 requires-python = ">=3.12"
 dependencies = [
-    "torchtitan @ git+https://gitcode.com/GitHub_Trending/to/torchtitan.git@ebdfc8c2a24d89d89c99c0ef96ed8ac149864175",
-    "torch-npu",
-    "attn-gym==0.0.16",
-    "torchvision",
+    "torchtitan==0.4.0",
+    "torch==2.15.0+cpu",
+    "torch-npu==2.15.0.dev20261105",
+    "attn-gym==0.0.17",
+    "torchvision==0.29.2+cpu",
     "grain==0.2.18",
-    "renderers==0.1.11",
-    "spmd_types==0.2.5",
+    "renderers==0.1.12",
+    "spmd_types==0.3.1",
     "torch_remat==0.2.2",
+    "torch_checkpointing==0.1.1",
 ]
 
 [project.optional-dependencies]
@@ -23,14 +25,14 @@ multimodal = [
     "av",
     "einops",
     "pillow",
-    "torchvision==0.29.0+cpu",
+    "torchvision==0.29.2+cpu",
 ]
 torchft = [
     "torchft==0.2.0",
 ]
 
 [tool.setuptools.packages.find]
-include = ["torchtitan_npu*"]
+include = ["torchtitan_npu*", "torchtitan_npu_recipes*"]
 exclude = ["tests*", "CI*", "third_party*"]
 
 [tool.pytest.ini_options]
@@ -51,8 +53,10 @@ project-excludes = [
     # Kernel DSL tensor annotations are not Python type annotations.
     "torchtitan_npu/ops/pypto", "torchtitan_npu/ops/pypto_pro",
     "torchtitan_npu/ops/triton", "torchtitan_npu/ops/tilelang",
-    # Re-enable with the DeepSeek-V3.2 folded-token model migration.
-    "torchtitan_npu/models/deepseek_v3_2/sharding.py",
+    # Re-enable with the DeepSeek-V3.2 folded-token model migration: the model and
+    # its override still use the pre-0.4 attention-mask and aux-loss APIs.
+    "torchtitan_npu/models/deepseek_v3_2/**",
+    "torchtitan_npu/override/deepseek_v3_2/**",
 ]
 ignore-missing-imports = [
     "attn_gym",

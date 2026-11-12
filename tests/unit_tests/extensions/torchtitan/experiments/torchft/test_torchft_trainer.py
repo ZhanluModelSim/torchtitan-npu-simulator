@@ -14,11 +14,11 @@ from torchtitan.config import ConfigManager
 
 from torchtitan_npu.extensions.torchtitan.experiments.torchft import trainer as module
 from torchtitan_npu.extensions.torchtitan import trainer as npu_trainer
-from torchtitan_npu.models.deepseek_v4.config_registry import deepseek_v4_flash, deepseek_v4_flash_8p_torchft
+from torchtitan_npu_recipes.models.deepseek_v4 import deepseek_v4_flash, deepseek_v4_flash_8p_torchft
 
 def make_config():
     return ConfigManager().parse_args([
-        '--module', 'torchtitan_npu.models.deepseek_v4',
+        '--module', 'torchtitan_npu_recipes.models.deepseek_v4',
         '--config', 'deepseek_v4_flash_8p_torchft',
         '--fault-tolerance.group-size', '2',
         '--fault-tolerance.min-replica-size', '2',
@@ -43,7 +43,7 @@ assert config.training.num_tokens_per_train_step // (256 * 4 * 2) == 2
 assert isinstance(config.profiler, npu_trainer.CANNProfiler.Config)
 
 full_config = ConfigManager().parse_args([
-    '--module', 'torchtitan_npu.models.deepseek_v4',
+    '--module', 'torchtitan_npu_recipes.models.deepseek_v4',
     '--config', 'deepseek_v4_flash_torchft',
 ])
 assert isinstance(full_config, module.FaultTolerantTrainerEx.Config)
@@ -57,7 +57,7 @@ assert full_config.optim.optimizer.optimizers == base_config.optim.optimizer.opt
 module.FaultTolerantTrainerEx._validate_supported_config(full_config)
 
 small_expert_config = ConfigManager().parse_args([
-    '--module', 'torchtitan_npu.models.deepseek_v4',
+    '--module', 'torchtitan_npu_recipes.models.deepseek_v4',
     '--config', 'deepseek_v4_flash_43layers_16experts_torchft',
 ])
 assert isinstance(small_expert_config, module.FaultTolerantTrainerEx.Config)
@@ -174,8 +174,8 @@ def test_ft_train_step_consumes_collated_valid_tokens(monkeypatch):
     parallel.get_mesh = lambda _: None
     parallel.get_optional_mesh = lambda _: None
     microbatches = [
-        SimpleNamespace(num_valid_tokens=2),
-        SimpleNamespace(num_valid_tokens=1),
+        SimpleNamespace(loss_token_counts=torch.tensor(2), routing_token_counts=torch.tensor(2)),
+        SimpleNamespace(loss_token_counts=torch.tensor(1), routing_token_counts=torch.tensor(1)),
     ]
     observed = []
     result = SimpleNamespace(loss=torch.tensor(0.5))

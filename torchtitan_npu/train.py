@@ -5,9 +5,16 @@
 
 """NPU-aware torchtitan training entry point."""
 
-from torchtitan.train import main
-
+# Activate NPU patches before importing the upstream training entry point.
 import torchtitan_npu  # noqa: F401
+
+
+def main() -> None:
+    # Imported after the package activation so every patch is installed first.
+    from torchtitan.train import main as upstream_main
+
+    upstream_main()
+
 
 if __name__ == "__main__":
     main()

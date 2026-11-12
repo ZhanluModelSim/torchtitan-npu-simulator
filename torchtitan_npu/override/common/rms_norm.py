@@ -38,7 +38,7 @@ class AscRMSNorm(RMSNorm):
                 self._buffers["weight"] = self.weight.to(device)
             self.weight.fill_(1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:  # pyrefly: ignore [bad-param-name-override]
         return torch_npu.npu_rms_norm(x, self.weight, self.eps)[0]
 
 

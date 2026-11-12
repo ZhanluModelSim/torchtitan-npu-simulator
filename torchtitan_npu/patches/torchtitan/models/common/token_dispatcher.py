@@ -27,20 +27,20 @@ from dataclasses import dataclass
 import spmd_types as spmd
 import torch
 import torch_remat as remat
-from torchtitan.distributed.spmd_types import maybe_set_sparse_mesh, spmd_mesh_group
-from torchtitan.models.common.token_dispatcher import (
+from torchtitan.distributed.spmd_types import maybe_set_sparse_mesh
+from torchtitan.models.common.moe.token_dispatcher import (
     AllToAllDispatchMetadata as TorchTitanAllToAllDispatchMetadata,
 )
-from torchtitan.models.common.token_dispatcher import (
+from torchtitan.models.common.moe.token_dispatcher import (
     AllToAllTokenDispatcher as TorchTitanAllToAllTokenDispatcher,
 )
-from torchtitan.models.common.token_dispatcher import (
+from torchtitan.models.common.moe.token_dispatcher import (
     DeepEPTokenDispatcher as TorchTitanDeepEPTokenDispatcher,
 )
-from torchtitan.models.common.token_dispatcher import (
+from torchtitan.models.common.moe.token_dispatcher import (
     LocalDispatchMetadata as TorchTitanLocalDispatchMetadata,
 )
-from torchtitan.models.common.token_dispatcher import (
+from torchtitan.models.common.moe.token_dispatcher import (
     LocalTokenDispatcher as TorchTitanLocalTokenDispatcher,
 )
 from torchtitan.ops.scatter_add import deterministic_scatter_add
@@ -125,7 +125,7 @@ class AllToAllTokenDispatcher(TorchTitanAllToAllTokenDispatcher):
         num_local_tokens_per_expert_E: torch.Tensor,
         num_global_tokens_per_local_expert_EP_e: torch.Tensor,
         ep_size: int,
-    ) -> tuple[torch.Tensor, list[int], list[int]]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # Patch override: keep exactly two blocking _to_copy CPU copies
         # in this method. Upstream's graph_trainer ep_overlap pass tags the
         # ops launched here (annotate_moe_ep_regions wraps this override)
@@ -151,13 +151,10 @@ class AllToAllTokenDispatcher(TorchTitanAllToAllTokenDispatcher):
             .sum(dim=1)
             .to(torch.device("cpu"), non_blocking=False)
         )
-        input_splits_list = input_splits.tolist()
-        output_splits_list = output_splits.tolist()
-
         return (
             num_global_tokens_per_local_expert_E,
-            input_splits_list,
-            output_splits_list,
+            input_splits,
+            output_splits,
         )
 
     @dataclass(kw_only=True, slots=True)
@@ -196,12 +193,10 @@ class AllToAllTokenDispatcher(TorchTitanAllToAllTokenDispatcher):
         routed_scores_N = topk_scores_experts_sorted_N if self.absorb_router_scores else None
 
         if spmd.is_type_checking():
-            for axis in ("dp", "cp", "tp"):
-                spmd.mutate_type(num_local_tokens_per_expert_E, axis, src=spmd.P, dst=spmd.V)
+            spmd.mutate_type(num_local_tokens_per_expert_E, src=spmd.P, dst={"dp": spmd.V, "cp": spmd.V, "tp": spmd.V})
 
         with maybe_set_sparse_mesh():
-            pg = spmd_mesh_group("ep")
-            assert pg is not None
+            pg = "ep"
             if spmd.is_type_checking():
                 num_local_tokens_per_expert_E = spmd.reinterpret_mesh(
                     num_local_tokens_per_expert_E, spmd.current_mesh()
@@ -216,14 +211,16 @@ class AllToAllTokenDispatcher(TorchTitanAllToAllTokenDispatcher):
                 )
                 (
                     num_global_tokens_per_local_expert_E,
-                    input_splits_list,
-                    output_splits_list,
+                    input_splits,
+                    output_splits,
                 ) = self._sync_token_count_exchange(
                     num_local_tokens_per_expert_E,
                     num_global_tokens_per_local_expert_EP_e,
                     ep_size,
                 )
 
+            input_splits_list = input_splits.tolist()
+            output_splits_list = output_splits.tolist()
             routed_input_rd = remat.region(
                 self._dispatch_token_exchange,
                 self.remat_region_name("ep_communication.dispatch"),
@@ -239,16 +236,14 @@ class AllToAllTokenDispatcher(TorchTitanAllToAllTokenDispatcher):
                 if routed_scores_N is not None
                 else None
             )
+            input_shape = routed_input_rd.shape
             (
-                input_shape,
                 routed_input_rd,
                 permuted_indices,
                 num_global_tokens_per_local_expert_e,
-                routed_scores_R,
-            ) = self._permute(
-                routed_input_rd,
-                num_global_tokens_per_local_expert_E,
-                routed_scores_rank_major_R,
+            ) = self._permute(routed_input_rd, num_global_tokens_per_local_expert_E)
+            routed_scores_R = (
+                routed_scores_rank_major_R[permuted_indices] if routed_scores_rank_major_R is not None else None
             )
 
         metadata = AllToAllDispatchMetadata(
@@ -262,35 +257,6 @@ class AllToAllTokenDispatcher(TorchTitanAllToAllTokenDispatcher):
             routed_scores_R=routed_scores_R,
         )
         return routed_input_rd, num_global_tokens_per_local_expert_e, metadata
-
-    def _permute(  # pyrefly: ignore[bad-override]
-        self,
-        routed_input_RD: torch.Tensor,
-        num_global_tokens_per_local_expert_E: torch.Tensor,
-        routed_scores_rank_major_R: torch.Tensor | None = None,
-    ):
-        """Reorder rank-major tokens (and optional scores) to expert-major."""
-        (
-            input_shape,
-            routed_input_RD,
-            permuted_indices,
-            num_global_tokens_per_local_expert_e,
-        ) = super()._permute(
-            routed_input_RD,
-            num_global_tokens_per_local_expert_E,
-        )
-        # Patch override: scores must follow the same rank-major -> expert-major
-        # index mapping as routed_input_RD.
-        routed_scores_R = (
-            routed_scores_rank_major_R[permuted_indices] if routed_scores_rank_major_R is not None else None
-        )
-        return (
-            input_shape,
-            routed_input_RD,
-            permuted_indices,
-            num_global_tokens_per_local_expert_e,
-            routed_scores_R,
-        )
 
     # Preserve upstream dimension-annotated keyword parameters.
     def combine(  # pylint: disable=invalid-name
@@ -310,8 +276,7 @@ class AllToAllTokenDispatcher(TorchTitanAllToAllTokenDispatcher):
 
         assert isinstance(metadata, TorchTitanAllToAllDispatchMetadata)
         with maybe_set_sparse_mesh():
-            pg = spmd_mesh_group("ep")
-            assert pg is not None
+            pg = "ep"
             routed_output_RD = self._unpermute(routed_output_RD, metadata.input_shape, metadata.permuted_indices)
             routed_output_RD = self._combine_token_exchange(
                 routed_output_RD, pg, metadata.input_splits, metadata.output_splits
@@ -351,25 +316,28 @@ class DeepEPTokenDispatcher(TorchTitanDeepEPTokenDispatcher):
 
 def apply() -> None:
     import torchtitan.models.common.config_utils
-    import torchtitan.models.common.token_dispatcher as token_dispatcher_module
+    import torchtitan.models.common.moe.moe
+    import torchtitan.models.common.moe.token_dispatcher
 
-    token_dispatcher_module.LocalTokenDispatcher = LocalTokenDispatcher  # pyrefly: ignore [bad-assignment]
-    token_dispatcher_module.AllToAllTokenDispatcher = AllToAllTokenDispatcher  # pyrefly: ignore [bad-assignment]
-    token_dispatcher_module.DeepEPTokenDispatcher = DeepEPTokenDispatcher  # pyrefly: ignore [bad-assignment]
+    torchtitan.models.common.moe.token_dispatcher.LocalTokenDispatcher = (  # pyrefly: ignore [bad-assignment]
+        LocalTokenDispatcher
+    )
+    torchtitan.models.common.moe.token_dispatcher.AllToAllTokenDispatcher = (  # pyrefly: ignore [bad-assignment]
+        AllToAllTokenDispatcher
+    )
+    torchtitan.models.common.moe.token_dispatcher.DeepEPTokenDispatcher = (  # pyrefly: ignore [bad-assignment]
+        DeepEPTokenDispatcher
+    )
+
+    torchtitan.models.common.moe.moe.LocalTokenDispatcher = LocalTokenDispatcher
 
     # Patch override: DeepSeek-V4's ``_make_moe_config()`` calls
     # ``config_utils.make_routed_experts_config()``, whose module-level
     # ``from`` imports cached the upstream dispatcher classes. Refresh those
     # bindings so its factory builds configs with the patched dispatcher
     # contracts.
-    torchtitan.models.common.config_utils.LocalTokenDispatcher = (  # pyrefly: ignore [bad-assignment]
-        LocalTokenDispatcher
-    )
     torchtitan.models.common.config_utils.AllToAllTokenDispatcher = (  # pyrefly: ignore [bad-assignment]
         AllToAllTokenDispatcher
-    )
-    torchtitan.models.common.config_utils.DeepEPTokenDispatcher = (  # pyrefly: ignore [bad-assignment]
-        DeepEPTokenDispatcher
     )
 
 

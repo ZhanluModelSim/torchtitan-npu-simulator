@@ -7,7 +7,6 @@
 
 from __future__ import annotations
 
-import logging
 from dataclasses import replace
 from typing import Literal
 
@@ -19,59 +18,10 @@ from torchao_npu.quantization.quant_configs import (
     MXQuantizeConfig,
 )
 
-logger = logging.getLogger(__name__)
-
-# extension.quantization.enable-hif8-save-quant-codes ops added to the
-# selective-AC save list.
-_QUANT_CODE_SAVE_OPS = (
-    "npu.npu_quantize.default",
-    "npu.npu_dynamic_quant.default",
-    "npu.npu_grouped_matmul.default",
-    "npu.npu_quant_matmul.default",
-)
-
-_AC_QUANT_CODES_PATCHED = [False]
-
 
 def _save_quant_codes_under_selective_ac(enable: bool) -> None:
-    """extension.quantization.enable-hif8-save-quant-codes: keep the quantized
-    matmul's operands and result across the selective-AC boundary instead of
-    re-deriving them in the backward.
-
-    Must be called at model-setup time, before parallelization wraps the
-    blocks: torchtitan reads ``_get_default_save_ops`` when it installs
-    activation checkpointing.
-    """
-    if not enable or _AC_QUANT_CODES_PATCHED[0]:
-        return
-    try:
-        from torchtitan.distributed import activation_checkpoint as ac
-    except ImportError:
-        return
-    _AC_QUANT_CODES_PATCHED[0] = True
-    orig = ac._get_default_save_ops
-
-    def _get_default_save_ops():
-        ops = orig()
-        added, missing = [], []
-        for path in _QUANT_CODE_SAVE_OPS:
-            obj = torch.ops
-            try:
-                for part in path.split("."):
-                    obj = getattr(obj, part)
-            except (AttributeError, RuntimeError):
-                missing.append(path)
-                continue
-            ops.add(obj)
-            added.append(path)
-        logger.info(
-            "enable_hif8_save_quant_codes: added %s to the selective-AC save list%s",
-            ", ".join(added) or "nothing",
-            f" (not registered: {', '.join(missing)})" if missing else "",
-        )
-        return ops
-
-    ac._get_default_save_ops = _get_default_save_ops
+    if enable:
+        raise NotImplementedError("NPU selective rematerialization save policies are not supported in this upgrade")
 
 
 def mxfp8_param_swap() -> ParamSwapConfig:

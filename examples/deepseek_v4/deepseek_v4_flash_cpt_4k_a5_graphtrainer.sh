@@ -4,30 +4,19 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-# Full-model A5 GraphTrainer recipe with sequence-based EP overlap.
-# Run this script on each participating node, as with the A5 eager recipe.
-# Append CLI arguments to override defaults, for example --training.steps 5.
 set -euo pipefail
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-
-export CONFIG="${CONFIG:-graph_trainer_deepseek_v4_flash_cpt}"
-export TORCHINDUCTOR_USE_TORCH_PROFILER_BENCHMARKER=1
-export TORCHINDUCTOR_USE_EXPERIMENTAL_BENCHMARKER=0
-export TORCH_NPU_USE_COMPATIBLE_IMPL=1
-
-STEPS="${STEPS:-20}"
-
-EP_OVERLAP_ARGS=(
-    --compile.ep_overlap.enabled
-    --compile.ep_overlap.chunk_dim seq
-    --compile.ep_overlap.module_fqn "layers.*.moe"
-    --compile.pass_pipeline mutation-functionalization+npu_auto_overlap
-)
-
-exec bash "${SCRIPT_DIR}/deepseek_v4_flash_cpt_4k_a5.sh" \
-    --training.num-tokens-per-train-step 2097152 \
-    --training.steps "${STEPS}" \
-    --debug.moe-force-load-balance \
-    "${EP_OVERLAP_ARGS[@]}" \
-    "$@"
+MODULE="${MODULE:-torchtitan_npu_recipes.examples.deepseek_v4}" \
+CONFIG="${CONFIG:-deepseek_v4_flash_cpt_4k_a5_graphtrainer}" \
+NGPU="${NGPU:-8}" \
+NNODES="${NNODES:-$(awk -F, '{print NF ? NF : 16}' <<< "${NODE_IPS:-}")}" \
+CPU_AFFINITY_CONF="${CPU_AFFINITY_CONF:-1,npu0:288-311,npu1:312-335,npu2:336-359,npu3:360-383,npu4:96-119,npu5:120-143,npu6:144-167,npu7:168-191}" \
+HCCL_CONNECT_TIMEOUT="${HCCL_CONNECT_TIMEOUT:-7200}" \
+HCCL_EXEC_TIMEOUT="${HCCL_EXEC_TIMEOUT:-17330}" \
+ACL_DEVICE_SYNC_TIMEOUT="${ACL_DEVICE_SYNC_TIMEOUT:-2147480}" \
+HCCL_EVENT_TIMEOUT="${HCCL_EVENT_TIMEOUT:-2147480}" \
+HCCL_ASYNC_ERROR_HANDLING="${HCCL_ASYNC_ERROR_HANDLING:-0}" \
+TORCHINDUCTOR_USE_TORCH_PROFILER_BENCHMARKER="${TORCHINDUCTOR_USE_TORCH_PROFILER_BENCHMARKER:-1}" \
+TORCHINDUCTOR_USE_EXPERIMENTAL_BENCHMARKER="${TORCHINDUCTOR_USE_EXPERIMENTAL_BENCHMARKER:-0}" \
+TORCH_NPU_USE_COMPATIBLE_IMPL="${TORCH_NPU_USE_COMPATIBLE_IMPL:-1}" \
+exec bash "$(dirname -- "${BASH_SOURCE[0]}")/../../scripts/run_train_multinodes.sh" "$@"

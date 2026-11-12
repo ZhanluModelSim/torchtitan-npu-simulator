@@ -1,6 +1,8 @@
 # DeepSeek-V4 training examples
 
-本目录只保留少量稳定入口，模型规模、序列长度、并行策略和量化方式优先通过 CLI 覆盖，不为每一种组合新增独立脚本。
+本目录提供选择完整 Python recipe 的启动入口。模型规模、序列长度、并行策略和量化方式由 `torchtitan_npu_recipes.examples.deepseek_v4` 中的配置函数定义，自定义组合使用 `MODULE` / `CONFIG` 选择，见[Python 配置指南](../../docs/developer_guides/python_recipes.md)。
+
+示例默认使用非 golden 的 NPU 融合算子组合，参考组合需显式设置 `USE_GOLDEN=1`。A3 使用 CANN 1104 和 torch-npu 1105.3，下载与安装见[安装指南](../../docs/user-guides/installation.md)。
 
 ## 入口关系
 
@@ -19,17 +21,15 @@ deepseek_v4_flash_cpt_4k_a3.sh
 
 ## 编译配置
 
-编译和 checkpoint 的启用状态在 Python recipe 中定义。Flash A3/A5 默认选择
-`deepseek_v4_flash_cpt`，8P debug 默认选择 `deepseek_v4_flash_43layers_16experts_compiled`；
-二者均使用 `CompileConfig(components=[], model=ModelCompileConfig())`，只编译 model。
-当前固定上游仍允许对已存在的配置传入 `--compile.model.backend aot_eager` 等普通字段。
-从 `None` 启用组件、关闭组件或设置空列表时，直接修改 recipe；CLI 不再自动创建这些对象。
+编译和 checkpoint 的启用状态在 Python recipe 中定义。A3 8P Flash CPT debug
+默认选择 `deepseek_v4_flash_8p_cpt_4k_a3_eager`，使用 `compile=None` 关闭模型编译。
+其他 Flash 配置函数保留各自的编译配置；配置存在不表示当前 NPU trainer 支持该编译路径。
+更改编译 backend、启用或关闭组件时直接修改 recipe，不使用通用字段 CLI。
 
 例如将以下函数保存为仓库根目录的 `my_recipes.py`，再通过 `MODULE=my_recipes CONFIG=my_run` 选择：
 
 ```python
-from torchtitan_npu.models.deepseek_v4.config_registry import deepseek_v4_flash_cpt
-
+from torchtitan_npu_recipes.models.deepseek_v4 import deepseek_v4_flash_cpt
 
 def my_run():
     config = deepseek_v4_flash_cpt()
@@ -95,16 +95,44 @@ token 预算使用 `--training.num-tokens-per-microbatch-per-dp-rank` 和
 
 ### 8P Flash 16-expert Debug
 
+默认使用 43 层、16 个专家、4K 上下文、Muon 优化器和非 golden 融合算子，以 eager 模式运行。
+训练预算与 `upstream/dev_0.4.0` 的 A3 8P 脚本一致：每卡每个 microbatch 4096 个 token，
+每步 262144 个 token，共 100 步，并启用全量激活重计算。
+`USE_GOLDEN` 只切换算子组合，不改变优化器或文档打包上限。
+参考组合不提供 indexer 训练梯度，使用 Muon 会报 `missing gradients`；需要该组合时，
+应在自定义配置中显式选择 AdamW，不能作为本用例的 Muon 训练对照。
+
 ```sh
-bash examples/deepseek_v4/debug/deepseek_v4_flash_8p_cpt_4k_a3.sh \
-  --training.steps 10
+bash examples/deepseek_v4/debug/deepseek_v4_flash_8p_cpt_4k_a3.sh
 ```
 
-需要采集 profile 时显式追加：
+在 A3、CANN 1104 与 torch-npu 1105.3 上，修复前的完整 4K 配置已完成 50 步训练，
+峰值显存约 `40.19 GiB`，未出现 OOM。与 `upstream/dev_0.4.0` 固定版本
+`775fdcd5036de8c3311fb2eeaa45e1258f387227` 的 eager 运行比较时，使用同一份
+FP32 初始权重、相同输入、seed 42、严格确定性检查，并关闭 HF32。
+10 步比较中，loss 和 grad_norm 的最大相对误差分别为 `0.117694%` 和 `0.239883%`，
+两项均满足仓库的数值近似阈值，比特一致未通过。进一步的完整 50 步比较中，
+两项的最大相对误差分别为 `0.575068%` 和 `4.943348%`，平均绝对误差分别为
+`0.02604002` 和 `0.12830677`，均未通过数值近似阈值。8 个 rank 每侧各消费
+400 个 microbatch，输入全部一致；grad_norm、loss 分别从第 17、36 步开始逐步超限。
+首个前向差异已定位到 Q head 归一化：旧版使用融合 RMSNorm，当前上游使用
+BF16 算式，中间舍入不同。这些 50 步数据属于修复前版本，不能作为修复后的精度结论。
 
-```sh
---profiler.enable-profiling
-```
+当前已恢复可配置的 Q head 归一化节点，由非 golden 组合启用融合 RMSNorm；
+同时修正 Muon 的两处迁移遗漏：`wo_a` 按每组 `o_lora_rank` 分块，
+`compressor_128` 的投影与 APE 参数使用与旧版相同的 Muon 配置。
+修复后以相同的完整配置比较第 1 步，loss 均为 `12.281325340270996`，
+grad_norm 均为 `9.061148643493652`；8 个 rank 各 1199 个优化器参数的梯度
+与更新后值逐字节一致。参数比较仅统一新旧名称，并移除 attention sink 新增的尾部单维。
+捕获的第 0 层 attention 输出梯度仍有正负零的位表示差异，数值差为 0；
+因此该结论限定为首步训练指标、参数梯度和参数更新，不表示所有中间张量的原始位模式相同。
+修复后的 10/50 步尚未验证，不能由首步结果推断多步精度或完整收敛。
+此前关闭激活重计算的 4K 配置曾出现 OOM，该记录不适用于当前全量重计算配置。
+训练步数、上下文长度和 token 预算统一在自定义 Python 配置中设置，
+本入口不再读取 `STEPS`、`MAX_CONTEXT_LENGTH`、`TOKENS_PER_MICROBATCH`、
+`TOKENS_PER_STEP` 或 `MAX_NUM_DOCUMENTS`。
+
+运行前按安装指南设置 `ASCEND_SET_ENV_PATH` 指向 1104 CANN。需要 profiling 时在自定义 Python 配置函数中设置 `config.profiler.enable_profiling=True`。
 
 ### 32P Pro 32-expert Debug
 
@@ -113,7 +141,6 @@ Pro 32-expert 是独立的裁剪模型 debug/performance 入口，不与 8P Flas
 ```sh
 NODE_IPS="${NODE_IPS}" \
 bash examples/deepseek_v4/debug/deepseek_v4_pro_32p_cpt_4k_a5.sh \
-  --debug.moe-force-load-balance \
   --training.steps 20
 ```
 
@@ -127,7 +154,6 @@ bash examples/deepseek_v4/debug/deepseek_v4_pro_32p_cpt_4k_a5.sh \
   --training.max-context-length 131072 \
   --training.num-tokens-per-microbatch-per-dp-rank 131072 \
   --training.num-tokens-per-train-step 1048576 \
-  --debug.moe-force-load-balance \
   --training.steps 20
 ```
 
@@ -139,8 +165,7 @@ debug 默认关闭 checkpoint。先在 `my_recipes.py` 中定义需要 checkpoin
 
 ```python
 from torchtitan.components.checkpointer import CheckpointManager
-from torchtitan_npu.models.deepseek_v4.config_registry import deepseek_v4_flash_43layers_16experts_compiled
-
+from torchtitan_npu_recipes.models.deepseek_v4 import deepseek_v4_flash_43layers_16experts_compiled
 
 def debug_checkpoint():
     config = deepseek_v4_flash_43layers_16experts_compiled()
@@ -189,7 +214,6 @@ bash examples/deepseek_v4/deepseek_v4_flash_cpt_4k_a3.sh \
 ```sh
 NODE_IPS="${NODE_IPS}" \
 bash examples/deepseek_v4/deepseek_v4_flash_cpt_4k_a5.sh \
-  --debug.moe-force-load-balance \
   --training.steps 20
 ```
 
@@ -205,7 +229,6 @@ bash examples/deepseek_v4/deepseek_v4_flash_cpt_4k_a5.sh \
   --training.max-context-length 65536 \
   --training.num-tokens-per-microbatch-per-dp-rank 131072 \
   --training.num-tokens-per-train-step 8388608 \
-  --debug.moe-force-load-balance \
   --training.steps 20
 ```
 
@@ -216,7 +239,6 @@ bash examples/deepseek_v4/deepseek_v4_flash_cpt_4k_a5.sh \
 ```sh
 NODE_IPS="${NODE_IPS}" \
 bash examples/deepseek_v4/deepseek_v4_flash_cpt_1024k_a5.sh \
-  --debug.moe-force-load-balance \
   --training.steps 20
 ```
 

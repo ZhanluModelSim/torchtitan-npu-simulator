@@ -38,7 +38,7 @@ from dataclasses import dataclass
 
 import torch
 from torch.distributed._functional_collectives import all_to_all_single
-from torchtitan.protocols.module import Module
+from torchtitan.models.base.module import Module
 
 from torchtitan_npu.models.common.restore import doc_relative_positions
 

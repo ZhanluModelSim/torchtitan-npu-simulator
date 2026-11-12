@@ -4,13 +4,25 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 #
-# Generic single-node TorchTitan launcher. Model, config, dataset, and
-# override arguments belong in an example under examples/; extra command-line
-# arguments are passed through unchanged.
+# Single-node TorchTitan launcher. Training settings belong in the selected Python
+# recipe; extra native launch arguments are passed through unchanged.
 #
 #   MODULE=my_recipes CONFIG=my_run ./scripts/run_train.sh
 
 set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+cd "${SCRIPT_DIR}/.."
+
+export NGPU="${NGPU:-1}"
+export MODULE="${MODULE:-torchtitan_npu_recipes.models.deepseek_v4}"
+export CONFIG="${CONFIG:-deepseek_v4_debugmodel}"
+TRAIN_FILE="${TRAIN_FILE:-torchtitan_npu.train}"
+COMM_BACKEND=${COMM_BACKEND:-}
+if [[ -n "${COMM_BACKEND}" && "${COMM_BACKEND}" != fake ]]; then
+    echo "COMM_BACKEND must be empty or fake; received ${COMM_BACKEND}." >&2
+    exit 1
+fi
 
 if [ -n "${ASCEND_SET_ENV_PATH:-}" ]; then
     source "${ASCEND_SET_ENV_PATH}"
@@ -25,35 +37,29 @@ fi
 # Set the Inductor backend to AscendC.
 export TORCHINDUCTOR_NPU_BACKEND="${TORCHINDUCTOR_NPU_BACKEND:-ascendc}"
 
-NGPU=${NGPU:-1}
 export LOG_RANK=${LOG_RANK:-0}
 export PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"
-MODULE=${MODULE:-"torchtitan.models.deepseek_v3"}
-CONFIG=${CONFIG:-"deepseek_v3_debugmodel"}
-TRAIN_FILE=${TRAIN_FILE:-torchtitan_npu.train}
-COMM_MODE=${COMM_MODE:-}
 TORCHFT_LIGHTHOUSE=${TORCHFT_LIGHTHOUSE:-}
 
 time=$(date +%Y%m%d%H%M)
 logfile=${LOG_PREFIX:-${CONFIG}}_${time}.log
 mkdir -p logs
 
-if [[ -n "${COMM_MODE}" ]]; then
-    echo "Running with comm_mode=${COMM_MODE}"
-    NGPU="${NGPU}" LOCAL_RANK=0 python3 -m "${TRAIN_FILE}" \
+if [[ "${COMM_BACKEND}" == fake ]]; then
+    LOCAL_RANK=0 python3 -m "${TRAIN_FILE}" \
         --module "${MODULE}" --config "${CONFIG}" \
-        --comm.mode="${COMM_MODE}" "$@"
+        --comm-backend fake "$@"
 else
-    PYTORCH_NPU_ALLOC_CONF="expandable_segments:True" \
-    CUDA_DEVICE_MAX_CONNECTIONS=1 \
+    PYTORCH_NPU_ALLOC_CONF="${PYTORCH_NPU_ALLOC_CONF:-expandable_segments:True}" \
+    CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-1}" \
     CPU_AFFINITY_CONF="${CPU_AFFINITY_CONF:-1}" \
-    TASK_QUEUE_ENABLE=2 \
-    HCCL_CONNECT_TIMEOUT=3600 \
-    STREAMS_PER_DEVICE=32 \
-    MULTI_STREAM_MEMORY_RESERVE=1 \
+    TASK_QUEUE_ENABLE="${TASK_QUEUE_ENABLE:-2}" \
+    HCCL_CONNECT_TIMEOUT="${HCCL_CONNECT_TIMEOUT:-3600}" \
+    STREAMS_PER_DEVICE="${STREAMS_PER_DEVICE:-32}" \
+    MULTI_STREAM_MEMORY_RESERVE="${MULTI_STREAM_MEMORY_RESERVE:-1}" \
     TORCHFT_LIGHTHOUSE="${TORCHFT_LIGHTHOUSE}" \
     torchrun --nproc_per_node="${NGPU}" --rdzv_backend c10d \
     --rdzv_endpoint="localhost:0" \
     --local-ranks-filter "${LOG_RANK}" --role rank --tee 3 \
-    -m "${TRAIN_FILE}" --module "${MODULE}" --config "${CONFIG}" "$@" 2>&1 | tee -a logs/${logfile}
+    -m "${TRAIN_FILE}" --module "${MODULE}" --config "${CONFIG}" "$@" 2>&1 | tee -a "logs/${logfile}"
 fi

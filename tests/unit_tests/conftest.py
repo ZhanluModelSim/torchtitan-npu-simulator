@@ -27,6 +27,10 @@ sys.path.insert(0, os.environ.get("TORCHTITAN_DIR", os.path.expanduser("~/worksp
 # Spawned workers must resolve this repository's tests package before upstream's.
 sys.path.insert(0, str(_REPO))
 
+# Activate the plugin patches (and the torch-version shim) before any test imports
+# an upstream module directly.
+import torchtitan_npu  # noqa: F401
+
 # These features still use the pre-fold-batch trainer/optimizer interfaces.
 # Keep their tests out of collection until the feature itself is migrated;
 # skip marks cannot prevent imports of removed upstream symbols.
@@ -41,6 +45,33 @@ collect_ignore = [
     "models/deepseek_v4_1/test_training_contract.py",
     "models/deepseek_v4_1/test_vision_attention.py",
     "models/deepseek_v4_1/test_vision_layout.py",
+    # Pre-0.4 CLI tests; the Python-recipe loader is covered by test_config_loader.py.
+    "config/test_configs.py",
+    "config/test_muon_profile_contract.py",
+    "models/common/test_deepseek_cp_config.py",
+    # DeepSeek-V3.2 folded-token migration is deferred.
+    "models/deepseek_v3_2",
+    "models/deepseek_v3_2/test_deepseek_v32_mtp_model.py",
+    "models/test_mtp_cp_chunk_loss.py",
+    # CP metadata rebuild tests wait for the v0.4 context-parallel transform.
+    "override/deepseek_v4_1/test_asc_metadata_reuse.py",
+    "override/qwen3_5/test_cp_config.py",
+    # The stage-denominator AuxLoss patch was replaced by v0.4.0's inject(denominator=...).
+    "patches/torchtitan/models/common/test_aux_loss.py",
+    # Multimodal / Qwen runtime migration is deferred by the upgrade plan.
+    "models/deepseek_v4_1/test_vision_dataloader.py",
+    "models/deepseek_v4_1/test_vision_language_sft.py",
+    "models/deepseek_v4_1/test_grain_metadata.py",
+    "models/qwen3_5/test_qwen3_5_npu_adapter.py",
+    # The memory-policy expectations track the pre-0.4 checkpoint policy mapping.
+    "models/deepseek_v4/memory_policy",
+    # TorchFT remains on the pre-fold-batch trainer interface.
+    "extensions/torchtitan/experiments/torchft",
+    "patches/torchft",
+    # EMA is rejected by the eager NPU trainer.
+    "extensions/torchtitan/components/optimizer/test_ema.py",
+    # Anticipatory routing still targets the pre-0.4 dynamo/config interfaces.
+    "extensions/experiment/anticipatory_routing",
 ]
 
 

@@ -11,6 +11,7 @@
 | `torchtitan_npu/extensions/` | 永久扩展、可选 adaptor 和组件集成 |
 | `torchtitan_npu/override/` | 由 `override.imports` 显式启用的组件替换 |
 | `torchtitan_npu/models/` | 模型配置、实现、并行化和 checkpoint 适配 |
+| `torchtitan_npu_recipes/` | 返回完整 Trainer.Config 的训练组合；可复用实现保留在插件包 |
 | `torchtitan_npu/ops/` | NPU 专属算子与后端注册 |
 | `torchtitan_npu/tools/` | 随 package 分发的转换和导出工具 |
 | `scripts/` | 仓库维护、训练和合规脚本 |

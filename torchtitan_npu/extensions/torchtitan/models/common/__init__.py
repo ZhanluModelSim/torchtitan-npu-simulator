@@ -4,5 +4,3 @@
 # LICENSE file in the root directory of this source tree.
 
 """Common model runtime extensions."""
-
-from . import moe  # noqa: F401

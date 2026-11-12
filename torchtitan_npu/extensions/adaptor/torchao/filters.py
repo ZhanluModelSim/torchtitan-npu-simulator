@@ -10,7 +10,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
-    from torchtitan.protocols.module import Module
+    from torchtitan.models.base.module import Module
 
 
 class ConfigFilterFn(Protocol):

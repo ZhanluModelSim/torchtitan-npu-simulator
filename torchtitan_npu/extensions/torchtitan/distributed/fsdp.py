@@ -9,8 +9,10 @@ Backport of the proposed generic interface; replace with upstream once available
 """
 
 # ruff: noqa: B905, RUF005
+import inspect
 import logging
-from typing import TYPE_CHECKING, Any, cast
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any
 
 import torch
 from torch import nn
@@ -24,12 +26,12 @@ from torchtitan.distributed.fsdp import (
     get_fsdp_reshard_after_forward_policy,
     linear_param_shard_placements,
 )
+from torchtitan.models.common.moe import MoE
 
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from torchtitan.models.common.decoder import Decoder
-    from torchtitan.models.common.moe import MoE
 
 
 def apply_fsdp_to_decoder(
@@ -47,6 +49,7 @@ def apply_fsdp_to_decoder(
     symm_mem_scope: FSDPSymmMemScope = None,
     *,
     ignored_params: set[nn.Parameter] | None = None,
+    param_dtype_override_fn: Callable[[nn.Parameter], torch.dtype | None] | None = None,
 ):
     """
     Apply data parallelism (via FSDP2) to a decoder-style transformer model.
@@ -87,14 +90,20 @@ def apply_fsdp_to_decoder(
         edp_mesh_dims: Sibling of ``dp_mesh_dims`` for the sparse SPMD mesh
             used by routed experts. ``None`` outside full_dtensor.
         ignored_params: Parameters managed outside FSDP, forwarded to every shard.
+        param_dtype_override_fn: Native FSDP callback preserving selected parameter dtypes.
         symm_mem_scope: FSDP units selected for symmetric-memory communication.
             communication.
     """
-    mp_policy = MixedPrecisionPolicy(
+    mp_policy_kwargs: dict[str, Any] = dict(
         param_dtype=param_dtype,
         reduce_dtype=reduce_dtype,
         cast_forward_inputs=False,
     )
+    # ``param_dtype_override_fn`` is a torch 2.15 addition; CI images that still run
+    # torch 2.14 cannot accept it, so forward it only when the runtime supports it.
+    if "param_dtype_override_fn" in inspect.signature(MixedPrecisionPolicy).parameters:
+        mp_policy_kwargs["param_dtype_override_fn"] = param_dtype_override_fn
+    mp_policy = MixedPrecisionPolicy(**mp_policy_kwargs)
     fsdp_config: dict[str, Any] = {"mesh": dp_mesh, "mp_policy": mp_policy}
     if ignored_params is not None:
         fsdp_config["ignored_params"] = ignored_params
@@ -141,13 +150,7 @@ def apply_fsdp_to_decoder(
         #   shard their output features when FSDP degree > num_experts
         # Dense blocks use the default mesh with only stacked-parameter
         # placement overrides.
-        if getattr(transformer_block, "moe_enabled", False):
-            assert hasattr(transformer_block, "moe")
-            # ebdfc8 stores the expert projections directly under the
-            # first-class ``routed_experts.w13``/``w2`` modules.  The former
-            # ``inner_experts`` child and its ``num_experts`` field were
-            # removed together with GroupedExperts.
-            moe = cast("MoE", transformer_block.moe)
+        if isinstance(moe := transformer_block.feed_forward, MoE):
             experts = moe.routed_experts
             num_experts = moe.num_experts
 
@@ -160,10 +163,9 @@ def apply_fsdp_to_decoder(
                 if "cp" in dp_storage_mesh.mesh_dim_names:
                     efsdp_ep_size *= dp_storage_mesh["cp"].size()
 
+            expert_placements = {param: Shard(0) for param in experts.parameters()}
             if efsdp_ep_size > num_experts:
-                expert_placements = linear_param_shard_placements(experts, include_unstacked_grouped=True)
-            else:
-                expert_placements = {param: Shard(0) for param in experts.parameters()}
+                expert_placements.update(linear_param_shard_placements(experts, include_unstacked_grouped=True))
 
             if ep_degree == 1:
                 param_placements = stacked_param_placements.copy()

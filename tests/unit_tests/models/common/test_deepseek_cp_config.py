@@ -30,7 +30,7 @@ def _selectors(config, family):
 
 @pytest.mark.parametrize("family,original,recipe,owner_name,alignment", _RECIPES)
 def test_original_cp1_recipe_keeps_ordinary_attention(family, original, recipe, owner_name, alignment):
-    registry = importlib.import_module(f"torchtitan_npu.models.{family}.config_registry")
+    registry = importlib.import_module(f"torchtitan_npu_recipes.models.{family}")
     config = getattr(registry, original)()
     assert config.parallelism.context_parallel_degree == 1
     assert all(
@@ -49,7 +49,7 @@ def test_typed_cp_recipe_passes_native_cli_validation_and_retains_fused_owner(
     config = ConfigManager().parse_args(
         [
             "--module",
-            f"torchtitan_npu.models.{family}.config_registry",
+            f"torchtitan_npu_recipes.models.{family}",
             "--config",
             recipe,
             "--hf-assets-path",
@@ -106,7 +106,7 @@ def test_typed_cp_metadata_hook_rejects_reference_metadata_and_reaches_real_buil
     with pytest.raises(TypeError, match="requires AscV"):
         owner.prepare_cp_metadata({"layer": object()}, permutation=None)
 
-    registry = importlib.import_module(f"torchtitan_npu.models.{family}.config_registry")
+    registry = importlib.import_module(f"torchtitan_npu_recipes.models.{family}")
     config = getattr(registry, recipe)()
     config.model.layers = config.model.layers[:1]
     config.model.n_layers = 1

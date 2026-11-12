@@ -23,7 +23,7 @@ def build_test_list() -> list[OverrideDefinitions]:
             "--training.global-batch-size", "128",
             "--training.steps", str(STEPS),
             "--optimizer.name", "AdamW", "--compile.no-enable",
-            "--checkpoint.no-enable", "--debug.moe-force-load-balance",
+            "--checkpoint.no-enable",
             "--comm.init-timeout-seconds", "600",
         )],
         # Source Flash recipe owns the full NPU import list.  The shell uses

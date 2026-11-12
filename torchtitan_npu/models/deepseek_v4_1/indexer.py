@@ -63,7 +63,7 @@ from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
-from torchtitan.protocols.module import Module
+from torchtitan.models.base.module import Module
 
 if TYPE_CHECKING:
     from torchtitan.models.common.linear import Linear

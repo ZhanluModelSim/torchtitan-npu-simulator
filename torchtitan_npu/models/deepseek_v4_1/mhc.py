@@ -24,7 +24,8 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 from torch import nn
-from torchtitan.protocols.module import Module
+from torchtitan.models.base.module import Module
+from torchtitan.models.deepseek_v4.mhc import HcPost as TorchTitanHcPost
 
 
 class HcPre(Module):
@@ -132,17 +133,14 @@ class HcPre(Module):
         return self.collapse(x, pre_mix), pre_THc, post, comb
 
 
-class HcPost(Module):
-    """Expand a sublayer output back to the residual branches and mix the residual in."""
+class HcPost(TorchTitanHcPost):
+    """Use upstream post mixing with V4.1's arbitrary leading dimensions."""
 
     @dataclass(kw_only=True, slots=True)
-    class Config(Module.Config):
+    class Config(TorchTitanHcPost.Config):
         pass
 
-    def __init__(self, config: Config):
-        super().__init__()
-
-    def forward(
+    def forward(  # pyrefly: ignore [bad-param-name-override]
         self,
         y: torch.Tensor,
         residual: torch.Tensor,
@@ -159,9 +157,20 @@ class HcPost(Module):
         Returns:
             Updated residual branches of shape ``[T, hc, D]``.
 
-        ``comb * residual`` has shape ``[T, hc, hc, D]`` with axes
-        ``(t, m, q, d)``. Sum over the input branch ``m`` (``dim=-3``),
-        preserving the output branch ``q`` and feature dimension ``d``.
+        Higher-rank inputs flatten their leading token dimensions around the upstream
+        implementation, which contracts the branch axis at ``dim=1``.
         """
-        out_THcD = post.unsqueeze(-1) * y.unsqueeze(-2) + torch.sum(comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=-3)
-        return out_THcD.type_as(y)
+        if y.ndim == 2 and residual.ndim == 3 and post.ndim <= 2 and comb.ndim <= 3:
+            return super().forward(y, residual, post, comb)
+
+        # Upstream contracts the branch axis at dim=1 of [T, hc, hc, D].
+        # Fold only token dimensions so its reduction sees the same branch order.
+        branches, dim = residual.shape[-2:]
+        leading_shape = torch.broadcast_shapes(y.shape[:-1], residual.shape[:-2], post.shape[:-1], comb.shape[:-2])
+        mixed = super().forward(
+            y.expand(*leading_shape, dim).reshape(-1, dim),
+            residual.expand(*leading_shape, branches, dim).reshape(-1, branches, dim),
+            post.expand(*leading_shape, branches).reshape(-1, branches),
+            comb.expand(*leading_shape, branches, branches).reshape(-1, branches, branches),
+        )
+        return mixed.reshape(*leading_shape, branches, dim)

@@ -23,7 +23,7 @@ from dataclasses import fields
 
 import pytest
 
-from torchtitan_npu.models.deepseek_v4_1 import config_registry
+from torchtitan_npu_recipes.models import deepseek_v4_1 as config_registry
 from torchtitan_npu.models.deepseek_v4_1.attention import CompressedSparseInnerAttention2
 from torchtitan_npu.override.deepseek_v4_1.metadata import AicpuGeometry
 from torchtitan_npu.override.deepseek_v4_1.sparse_attn import asc

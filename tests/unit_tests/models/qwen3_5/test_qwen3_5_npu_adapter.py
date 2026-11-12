@@ -46,25 +46,25 @@ def _multimodal_loader_assets() -> tuple[Path, Path] | None:
     return tokenizer_dir, Path(__file__).resolve().parents[4] / "tests/assets/cc12m_test"
 
 
-def test_qwen3_5_launcher_delegates_to_run_train_and_uses_current_gdn_override():
+def test_qwen_launchers_select_recipes_and_delegate_to_run_train():
     root = Path(__file__).resolve().parents[4]
-    script = (root / "examples/qwen3_5/qwen3_5_debugmodel_1p_cpt_512.sh").read_text(encoding="utf-8")
     eager_flex = (root / "torchtitan_npu/extensions/torchtitan/eager_flex.py").read_text(encoding="utf-8")
 
-    assert "bash scripts/run_train.sh" in script
-    assert "TORCHTITAN_REPO:-${TORCHTITAN_DIR:-" in script
-    assert "if [[ ${OVERRIDE_IMPORTS+x} ]]" in script
-    assert "HF_ASSETS_PATH:-${TORCHTITAN_REPO}/tests/assets/tokenizer" in script
-    assert "DATASET_PATH:-${TORCHTITAN_REPO}/tests/assets/cc12m_test" in script
-
-    assert "torchtitan_npu.models.qwen3_5" in script
-    assert "torchtitan_npu.override.qwen3_5.gated_delta.npu" in script
-    assert "override.common.attention" not in script
-    assert "torchtitan_npu.override.common.token_dispatcher.asc" in script
-    assert "ENABLE_NPU_MOE_DISPATCHER" in script
-    assert "ENABLE_NPU_MOE_DISPATCHER:-0" in script
-    assert '--override.imports "${OVERRIDE_IMPORTS}"' in script
-    assert 'if [[ -n "${OVERRIDE_IMPORTS}" ]]' not in script
+    for model, recipe, devices in (
+        ("qwen3_5", "qwen3_5_debugmodel_1p_cpt_512", 1),
+        ("qwen3_5", "qwen3_5_debugmodel_moe_8p_cpt_512", 8),
+        ("qwen3_6", "run_qwen3_6_4k", 16),
+    ):
+        script = (root / "examples" / model / f"{recipe}.sh").read_text(encoding="utf-8")
+        assert f"MODULE:-torchtitan_npu_recipes.examples.{model}" in script
+        assert f"CONFIG:-{recipe}" in script
+        assert f"NGPU:-{devices}" in script
+        assert 'exec bash "${SCRIPT_DIR}/../../scripts/run_train.sh" "$@"' in script
+        assert script.count("scripts/run_train.sh") == 1
+        assert "--training." not in script
+        assert "--override.imports" not in script
+        assert "HF_ASSETS_PATH" not in script
+        assert "DATASET_PATH" not in script
     assert "return_lse=_requests_auxiliary_outputs(return_aux)" in eager_flex
     assert "return_aux=_normalize_aux_request(return_aux)" in eager_flex
     assert "use_legacy_npu_compile" in eager_flex
@@ -103,7 +103,7 @@ def test_qwen3_5_debug_recipe_preserves_upstream_defaults():
         from torchtitan.components.data import GrainDataLoader
         from torchtitan.hf_datasets.multimodal.mm_datasets import MM_DATASETS
         from torchtitan.models.qwen3_5 import config_registry as upstream
-        from torchtitan_npu.models.qwen3_5 import config_registry as adapter
+        from torchtitan_npu_recipes.models import qwen3_5 as adapter
 
         os.environ.pop("DATASET", None)
         os.environ.pop("DATASET_PATH", None)
@@ -168,7 +168,7 @@ def test_qwen3_5_multimodal_loader_matches_upstream_batches(dp_rank, dp_world_si
         from torchtitan.components.tokenizer import MultiModalTokenizer
         from torchtitan.models.qwen3_5 import QWEN3_5_SPECIAL_TOKENS
         from torchtitan.models.qwen3_5 import config_registry as upstream
-        from torchtitan_npu.models.qwen3_5 import config_registry as adapter
+        from torchtitan_npu_recipes.models import qwen3_5 as adapter
 
         tokenizer = MultiModalTokenizer(
             MultiModalTokenizer.Config(**QWEN3_5_SPECIAL_TOKENS),
@@ -228,7 +228,7 @@ def test_qwen3_5_multimodal_loader_resumes_from_state():
 
         from torchtitan.components.tokenizer import MultiModalTokenizer
         from torchtitan.models.qwen3_5 import QWEN3_5_SPECIAL_TOKENS
-        from torchtitan_npu.models.qwen3_5 import config_registry as adapter
+        from torchtitan_npu_recipes.models import qwen3_5 as adapter
 
         tokenizer = MultiModalTokenizer(
             MultiModalTokenizer.Config(**QWEN3_5_SPECIAL_TOKENS),
@@ -315,7 +315,7 @@ def test_qwen3_5_video_mrope_uses_contiguous_temporal_coordinates():
         from types import SimpleNamespace
         import grain.python as grain
         from torchtitan.components.data import DatasetBuildContext, GrainDataLoader
-        from torchtitan_npu.models.qwen3_5.config_registry import qwen35_debugmodel
+        from torchtitan_npu_recipes.models.qwen3_5 import qwen35_debugmodel
         config = qwen35_debugmodel(seq_len=4)
         assert isinstance(config.dataloader, GrainDataLoader.Config)
         # Only the collator's numeric token IDs are stubbed; patches and positions
@@ -354,7 +354,7 @@ def test_qwen3_5_gdn_override_targets_upstream_kernel_config():
         """
         import inspect
         from torchtitan.config import apply_overrides
-        from torchtitan_npu.models.qwen3_5.config_registry import qwen35_debugmodel
+        from torchtitan_npu_recipes.models.qwen3_5 import qwen35_debugmodel
         from torchtitan_npu.override.qwen3_5.gated_delta import TritonGatedDeltaKernel, npu
         config = qwen35_debugmodel()
         config.override.imports = ["torchtitan_npu.override.qwen3_5.gated_delta.npu"]

@@ -15,7 +15,7 @@ from torchtitan.components.data import (
 
 from tests.unit_tests.models.common.text_data_utils import IntegerTextTokenizer
 from torchtitan_npu.models.common.alignment import AlignedTextProcessor
-from torchtitan_npu.models.deepseek_v4.config_registry import deepseek_v4_debugmodel
+from torchtitan_npu_recipes.models.deepseek_v4 import deepseek_v4_debugmodel
 
 
 def test_debugmodel_uses_the_documented_per_layer_compression_ratios():
@@ -46,7 +46,7 @@ def test_flash_mtp_4k_model_flops():
 
 def test_debugmodel_uses_cann_profiler_extension():
     from torchtitan_npu.extensions.torchtitan.tools.profiler import CANNProfiler
-    from torchtitan_npu.models.deepseek_v4.config_registry import deepseek_v4_debugmodel
+    from torchtitan_npu_recipes.models.deepseek_v4 import deepseek_v4_debugmodel
 
     config = deepseek_v4_debugmodel()
 
@@ -54,27 +54,28 @@ def test_debugmodel_uses_cann_profiler_extension():
     assert isinstance(config.profiler.build(), CANNProfiler)
 
 
-def test_every_layer_pins_the_core_config_the_overrides_target():
-    """The sparse core's config type is the anchor the fused overrides replace.
+def test_every_layer_uses_the_native_core_contract_the_overrides_target():
+    from torchtitan.models.deepseek_v4.attention import (
+        CompressedSparseAttention,
+        HeavilyCompressedAttention,
+        SlidingWindowAttention,
+    )
 
-    ``asc``/``pypto`` are registered against exactly this type, so a model that
-    moved to another Config class would quietly run the reference core instead of the fused
-    one.  The core's implementation may change; this anchor may not.
-    """
     from torchtitan_npu.models.deepseek_v4 import model_registry
-    from torchtitan_npu.models.deepseek_v4.attention import CompressedSparseInnerAttention
 
     model_config = model_registry("debugmodel")
     cores = [layer.attention.inner_attention for layer in model_config.layers]
 
     assert len(cores) == len(model_config.compress_ratios) == 4
-    for core in cores:
-        assert type(core) is CompressedSparseInnerAttention.Config
-        assert isinstance(core, CompressedSparseInnerAttention.Config)
+    assert [type(core) for core in cores] == [
+        SlidingWindowAttention.Config,
+        SlidingWindowAttention.Config,
+        CompressedSparseAttention.Config,
+        HeavilyCompressedAttention.Config,
+    ]
 
 
-def test_flash_rope_configs_pin_split_per_site():
-    """Every rope site's config carries the split matching its tensor width."""
+def test_flash_rope_configs_rotate_the_native_sliced_tail():
     from torchtitan_npu.models.deepseek_v4 import model_registry
 
     model_config = model_registry("deepseek_v4_flash", num_mtp_layers=0)
@@ -82,17 +83,17 @@ def test_flash_rope_configs_pin_split_per_site():
 
     for layer in model_config.layers:
         attn = layer.attention
-        # Attention q/kv/o rotate the tail of a head_dim-wide (512) tensor.
+        # Native modules slice the rotary tail before invoking RoPE.
         assert attn.rope.dim == rd
-        assert attn.rope.split == attn.head_dim - rd
+        assert getattr(attn.rope, "split", 0) == 0
         if attn.compress_ratio > 1:
-            assert attn.compressor.rope.split == attn.compressor.head_dim - rd
+            compressor = attn.compressor if attn.compress_ratio == 4 else attn.compressor_128
+            assert compressor.rope.dim == rd
+            assert getattr(compressor.rope, "split", 0) == 0
         if attn.compress_ratio == 4:
-            # Indexer q is index_head_dim-wide (128): a different split even
-            # though it reuses the same base rope flavor.
             indexer = attn.indexer
             assert indexer.rope.dim == rd
-            assert indexer.rope.split == indexer.index_head_dim - rd
+            assert getattr(indexer.rope, "split", 0) == 0
             return
     raise AssertionError("flash spec must contain compress_ratio == 4 layers")
 
@@ -104,7 +105,7 @@ def test_dataloader_pads_documents_to_the_compression_alignment():
     block never straddles a document edge -- the property the compressor's
     "complete blocks only" contract and the kernels' ``cmp_residual_k`` rely on.
     """
-    from torchtitan_npu.models.deepseek_v4.config_registry import deepseek_v4_debugmodel
+    from torchtitan_npu_recipes.models.deepseek_v4 import deepseek_v4_debugmodel
 
     config = deepseek_v4_debugmodel()
     assert isinstance(config.dataloader, GrainDataLoader.Config)
@@ -123,6 +124,7 @@ def test_aligned_dataloader_only_inserts_pads(tmp_path):
     assert isinstance(recipe.dataloader, GrainDataLoader.Config)
     recipe.dataloader.shuffle = False
     recipe.dataloader.repeat = False
+    recipe.dataloader.num_mtp_layers = 1
     packing = recipe.dataloader.dataset
     assert isinstance(packing, ConcatThenSplitPackingConfig)
     assert isinstance(packing.dataset, SingleDatasetConfig)
@@ -153,4 +155,6 @@ def test_aligned_dataloader_only_inserts_pads(tmp_path):
     assert inputs["input"].tolist() == [1, 3, 4] + [0] * 125 + [1, 5] + [0] * 126
     assert labels.tolist() == [3, 4, 2] + [-100] * 125 + [5, 2] + [-100] * 126
     assert inputs["positions"].tolist() == list(range(128)) * 2
-    assert batches[0].num_valid_tokens == 5
+    assert inputs["padding_mask"].tolist() == [False] * 3 + [True] * 125 + [False] * 2 + [True] * 126
+    torch.testing.assert_close(batches[0].loss_token_counts, torch.tensor([5, 3]), rtol=0, atol=0)
+    torch.testing.assert_close(batches[0].routing_token_counts, torch.tensor([5, 3]), rtol=0, atol=0)

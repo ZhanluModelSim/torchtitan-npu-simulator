@@ -48,8 +48,8 @@ _GEMMS = frozenset(
     }
 )
 _SWIGLU_OP_NAMES = {"swiglu_group", "swiglu_group_forward"}
-_SHARED_EXPERTS = ("layers.*.moe.shared_experts",)
-_ROUTED_EXPERTS = ("layers.*.moe.routed_experts",)
+_SHARED_EXPERTS = ("layers.*.feed_forward.shared_experts",)
+_ROUTED_EXPERTS = ("layers.*.feed_forward.routed_experts",)
 
 
 def _op_name(node: torch.fx.Node) -> str:
@@ -170,7 +170,7 @@ _DSV4_MHC_SAVE_OVERRIDES = {
     # first-step grad norm become NaN, even without EP overlap.
     _must_save_key(
         target="aten.add.Tensor",
-        module_fqn="layers.*.moe",
+        module_fqn="layers.*.feed_forward",
     ): CheckpointPolicy.MUST_SAVE,
 }
 

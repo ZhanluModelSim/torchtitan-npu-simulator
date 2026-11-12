@@ -321,9 +321,9 @@ class DeepSeekV4PEFTCheckpointManager(NPUCheckpointManager):
                 }
             self._load_native_states(restored_states, flat, checkpoint_id)
 
-        # Match target upstream: reseed only when a model was restored and EMA
-        # was not. Base/layer loads above never reseed partially restored weights.
-        if EMA in self.states and EMA not in restored_states:
+        # Upstream reseeds after `_load_checkpoint` only when EMA is absent
+        # from `states`; cover the adapter-only case it leaves untouched.
+        if EMA in self.states and EMA in states and EMA not in restored_states:
             self.states[EMA].load_state_dict({})
 
     def _model_buffer_keys(self) -> set[str]:

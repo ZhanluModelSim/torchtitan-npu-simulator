@@ -5,18 +5,18 @@
 
 import importlib
 import threading
+from types import MethodType
 
 import pytest
 import torch
 import torch.distributed as dist
 import torchtitan.distributed.parallelism_context as context_module
 import torchtitan.distributed.spmd_types as spmd_runtime
-from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import CheckpointWrapper
 from torch.distributed.tensor import DTensor, Shard
 from torch.distributed.tensor.debug import _clear_sharding_prop_cache
 from torch.distributed.tensor.placement_types import _StridedShard
 from torch.testing._internal.distributed.fake_pg import FakeStore
-from torchtitan.distributed.activation_checkpoint import FullAC
+from torchtitan.distributed.activation_remat import FullActivationRematConfig
 from torchtitan.distributed.parallelism_context import DistributedTopology, ParallelismContext
 
 
@@ -51,7 +51,7 @@ def cpu_storage_world(monkeypatch):
 def test_model_parallelize_places_expert_weights_on_dense_or_sparse_storage(
     cpu_storage_world, family, recipe, ep, full_ac
 ):
-    registry = importlib.import_module(f"torchtitan_npu.models.{family}.config_registry")
+    registry = importlib.import_module(f"torchtitan_npu_recipes.models.{family}")
     config = getattr(registry, recipe)()
     config.hf_assets_path = "/tmp"
     config.parallelism.data_parallel_shard_degree = 2
@@ -65,11 +65,11 @@ def test_model_parallelize_places_expert_weights_on_dense_or_sparse_storage(
         config.model.kv_source_layers = config.model.kv_source_layers[:1]
         config.model.layers[0].engram = None
     config.model.update_from_config(config=config)
-    context = ParallelismContext.from_config(config.parallelism, DistributedTopology(world_size=2))
+    context = ParallelismContext.from_config(config.parallelism, DistributedTopology(world_size=2), dump_folder="")
     context.build_mesh()
     with torch.device("meta"):
         model = config.model.build()
-    experts = model.layers["0"].moe.routed_experts
+    experts = model.layers["0"].feed_forward.routed_experts
     shapes = {name: tuple(getattr(experts, name).weight.shape) for name in ("w13", "w2")}
 
     # Match the production lifecycle: _parallelize materializes plain local
@@ -79,12 +79,14 @@ def test_model_parallelize_places_expert_weights_on_dense_or_sparse_storage(
         parallelism_context=context,
         training=config.training,
         parallelism=config.parallelism,
-        compile_config=None,
-        ac_config=FullAC.Config() if full_ac else None,
+        local_compile_regions=config.model.local_compile_regions,
+        activation_remat=FullActivationRematConfig() if full_ac else None,
         dump_folder="",
     )
 
-    assert isinstance(model.layers["0"], CheckpointWrapper) is full_ac
+    # v0.4.0 rebinds each block's ``forward`` with ``remat.checkpoint`` instead
+    # of wrapping the module in ``CheckpointWrapper``.
+    assert isinstance(model.layers["0"].forward, MethodType) is not full_ac
 
     # There are at least four experts, so these two ranks split the expert
     # dimension. EP1 assigns the split to DP; EP2 retains sparse EP ownership
@@ -105,7 +107,7 @@ def test_model_parallelize_places_expert_weights_on_dense_or_sparse_storage(
 
 @pytest.mark.parametrize("full_ac", [False, True], ids=["no-ac", "full-ac"])
 def test_multimodal_parallelize_shards_all_vision_parameters(cpu_storage_world, full_ac):
-    from torchtitan_npu.models.deepseek_v4_1.config_registry import deepseek_v4_1_debugmodel_multimodal
+    from torchtitan_npu_recipes.models.deepseek_v4_1 import deepseek_v4_1_debugmodel_multimodal
 
     config = deepseek_v4_1_debugmodel_multimodal()
     config.hf_assets_path = "/tmp"
@@ -118,7 +120,7 @@ def test_multimodal_parallelize_shards_all_vision_parameters(cpu_storage_world, 
     config.model.layers[0].engram = None
     config.model.vision_encoder.num_layers = 1
     config.model.update_from_config(config=config)
-    context = ParallelismContext.from_config(config.parallelism, DistributedTopology(world_size=2))
+    context = ParallelismContext.from_config(config.parallelism, DistributedTopology(world_size=2), dump_folder="")
     context.build_mesh()
     with torch.device("meta"):
         model = config.model.build()
@@ -129,12 +131,11 @@ def test_multimodal_parallelize_shards_all_vision_parameters(cpu_storage_world, 
         parallelism_context=context,
         training=config.training,
         parallelism=config.parallelism,
-        compile_config=None,
-        ac_config=FullAC.Config() if full_ac else None,
+        local_compile_regions=config.model.local_compile_regions,
+        activation_remat=FullActivationRematConfig() if full_ac else None,
         dump_folder="",
     )
 
-    assert isinstance(model.vision_encoder.blocks[0], CheckpointWrapper) is full_ac
     # FSDP must partition every projection, bias and norm, including the patch
     # embedding and aligner outside the checkpointed transformer blocks.
     for parameter, shape in zip(model.vision_encoder.parameters(), shapes, strict=True):

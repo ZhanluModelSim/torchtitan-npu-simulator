@@ -8,10 +8,15 @@ torchtitan-npu 支持 Atlas 800T A3 等昇腾训练硬件。软件版本配套�
 |---------------------|-----------------|--------------|----------------|-----------|-------------|---------------|
 | master | main | 2.14.0(daily) | 2.14.0(daily) | 9.2.0 | Python 3.12.x | 3.2.1 |
 | v0.2.2-dev | v0.2.2 | 2.10.0 | 2.10.0 | 9.0.0 | Python 3.11.x | 3.2.1 |
-| dev_0.4.0 | `ebdfc8c2a24d89d89c99c0ef96ed8ac149864175` | 2.14.0(daily) | 2.14.0(daily) | 9.3.0 | Python 3.12.x | 3.2.1 |
+| dev_0.4.0 | v0.4.0 | 2.15.0+cpu | 2.15.0.dev20261105 | 9.3.0 | Python 3.12.x | 3.2.1 |
 
 > [!NOTE]
 > 安装所需的 Python 包依赖及版本见 [requirements.txt](../../requirements.txt)
+
+A3 使用 [2026-11-04 CANN 包](https://ascend.devcloud.huaweicloud.com/artifactory/cann-run-mirror/software/legacy/20261104000324968/)中的 Toolkit 和 A3 算子包：
+
+- `Ascend-cann-toolkit_9.3.0~weekly.20261104.01_linux-aarch64.run`
+- `Ascend-cann-A3-ops_9.3.0~weekly.20261104.01_linux-aarch64.run`
 
 ## 源码安装
 
@@ -61,17 +66,39 @@ torchtitan-npu 支持 Atlas 800T A3 等昇腾训练硬件。软件版本配套�
 
  ```shell
 git clone https://gitcode.com/cann/torchtitan-npu.git
+cd torchtitan-npu
  ```
 
-### 3. 安装 torchtitan-npu
+### 3. 下载 PyTorch 和 torch-npu daily 包
+
+在 Python 3.12 环境中使用 [2026-11-05.3 daily 包](https://pytorch-package.obs.cn-north-4.myhuaweicloud.com/pta/Daily/master/20261105.3/pytorch_master_py312.tar.gz)。归档包含 aarch64 和 x86_64 wheel，pip 会选择与当前平台匹配的文件。
 
 ```shell
-cd torchtitan-npu
-python3 -m pip install -r requirements.txt
-python3 -m pip install -e .
+TORCH_PACKAGE_DIR=/path/to/pytorch-20261105.3
+mkdir -p "$TORCH_PACKAGE_DIR"
+curl -fL --retry 3 \
+  https://pytorch-package.obs.cn-north-4.myhuaweicloud.com/pta/Daily/master/20261105.3/pytorch_master_py312.tar.gz \
+  -o "$TORCH_PACKAGE_DIR/pytorch_master_py312.tar.gz"
+tar -xzf "$TORCH_PACKAGE_DIR/pytorch_master_py312.tar.gz" \
+  -C "$TORCH_PACKAGE_DIR" --wildcards '*.whl' '*.whl.sha256'
 ```
 
-### 4. 安装 torchao-npu（可选）
+加载已安装的 CANN 环境，并将路径传给训练 launcher：
+
+```shell
+export ASCEND_SET_ENV_PATH=/path/to/cann/1104/cann/set_env.sh
+source "$ASCEND_SET_ENV_PATH"
+```
+
+### 4. 安装 torchtitan-npu
+
+```shell
+python -m pip install --find-links "$TORCH_PACKAGE_DIR" -r requirements.txt
+python -m pip install --find-links "$TORCH_PACKAGE_DIR" -e .
+python -m pip check
+```
+
+### 5. 安装 torchao-npu（可选）
 
 仓库已在 `experiments/torchao-npu/torchao_npu` 中内置 TorchAO-NPU 适配代码，
 默认无需单独克隆 `torchao-npu` 仓库。从 torchtitan-npu 仓库根目录执行：

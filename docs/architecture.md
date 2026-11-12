@@ -6,9 +6,10 @@
 
 ```text
 torchtitan_npu/  Ascend NPU 插件主体
+torchtitan_npu_recipes/  完整训练配置与 recipe 组合
 experiments/     独立实验包；当前包含 torchao-npu distribution
 docs/            架构、开发者、功能和用户文档
-examples/        可运行 recipe、模型配置与示例 launcher
+examples/        选择完整 Python 配置的示例 launcher
 scripts/         训练、转换、合规检查与辅助脚本
 tests/           CPU UT、NPU ST 与 tooling 自测
 .agents/         Agent Notes 与可复用 skills
@@ -22,7 +23,7 @@ tests/           CPU UT、NPU ST 与 tooling 自测
 
 | 子包 | 职责 | 直接依赖边界 |
 | --- | --- | --- |
-| `config/` | NPU config schema、纯转换器和显式注册 API | 当前包导入会安装 ConfigManager loader wrapper；目标是移至 extension 激活入口且不反向导入具体 extension |
+| `config/` | NPU config schema、纯转换器和显式注册 API | 当前包导入会安装 ConfigLoader loader wrapper；目标是移至 extension 激活入口且不反向导入具体 extension |
 | `patches/` | 上游 `torchtitan` 或 `torch_npu` 的待合入补丁 | 不得新增对 `extensions/` 的依赖；现有反向边记录为迁移债务 |
 | `models/` | 尚未上游化的模型定义、配置、并行化与 checkpoint 适配 | 现有跨层依赖为迁移债务，不以本文宣称已清零 |
 | `extensions/` | 本仓永久额外扩展、组件集成与图编译注册 | 可以依赖 `patches/` 提供的定义；不得新增对 `models/`、`override/` 或 `ops/` 的依赖 |
@@ -30,6 +31,10 @@ tests/           CPU UT、NPU ST 与 tooling 自测
 | `override/` | `override.imports` 显式启用的 NPU/CANN 组件替换 | 可使用 `ops/`；现有对 `extensions/` 的依赖为迁移债务 |
 | `ops/` | 设备后端 kernel、最小启动封装与 `torch.library` 注册 | 仅保留实现算子所需的后端代码 |
 | `tools/` | 随 package 分发的 checkpoint 转换与导出工具 | 依赖公开模型与 integration API，不承载训练期自动注入 |
+
+完整训练工厂位于 [`torchtitan_npu_recipes/`](../torchtitan_npu_recipes/README.md)，通过完整模块路径和工厂名选择。模型 flavor registry、Muon profile、Engram 优化器 schema、数据转换函数和模型专属 trainer/engine 保留在插件中；插件实现不得反向导入 recipe。图训练组合单独放在 `torchtitan_npu_recipes/graph_trainer/`，不会因 eager recipe 的导入而自动启用。
+
+`torchtitan_npu_recipes/examples/` 保存与每个示例脚本同名的完整配置工厂，组合基础模型工厂以及数据、优化器、并行、checkpoint 和 override 选择。`examples/` shell 只设置启动资源并调用共用 launcher，原生 CLI 参数原样传递。
 
 模型无关能力放在最通用的适用位置。完整的开发约束见 [主包规则](../torchtitan_npu/AGENTS.md) 及其目录级规则。
 
@@ -43,7 +48,7 @@ patches → config → extensions → ops
 
 这是当前运行时行为，不是目标顺序。`patches` 先替换上游实现；`extensions` 可从 `torchtitan_npu.patches.*` 复用 patch 提供的定义，也可经 `torchtitan.*`、`torch.*` 或 `torch_npu.*` 使用已替换结果。反向的 `patches → extensions` 依赖不得新增。
 
-`config` 当前导入 `manager` 时会安装 `ConfigManager._load_config` 的转换 wrapper；该副作用是现有配置转换链的一部分。将其改为仅由 extension 激活入口安装是后续目标，不是当前行为。
+`config` 当前导入 `manager` 时会安装 `ConfigLoader._load_config` 的转换 wrapper；该副作用是现有配置转换链的一部分。将其改为仅由 extension 激活入口安装是后续目标，不是当前行为。
 
 `override` 不自动加载；一次训练由 `override.imports` 显式选择。将自动导入收敛为下列顺序是后续目标，不能据此描述当前行为：
 
@@ -71,7 +76,7 @@ patch 替换后必须刷新或说明上游 `from ... import ...` 已捕获的绑
 
 ### extensions
 
-`extensions/torchtitan/` 放镜像上游结构的 monkey-patch 激活模块；新增替换必须声明 owner 和顺序。现有 `MetricsProcessor.log`、`CheckpointManager` 与 `ConfigManager._load_config` 的多层包装保留为历史例外，包装顺序由对应测试保护，本轮不合并其业务行为。`extensions/components/` 放带声明名称的自包含集成；当前 TrainerEx、checkpoint extension 和 DeepSeek-V4.1 配置仍存在组件顶层接线或反向使用，这是迁移债务，不是新组件约束。`extensions/compile/` 放 graph-pass 注册基础设施和具体 pattern。
+`extensions/torchtitan/` 放镜像上游结构的 monkey-patch 激活模块；新增替换必须声明 owner 和顺序。现有 `MetricsProcessor.log`、`CheckpointManager` 与 `ConfigLoader._load_config` 的多层包装保留为历史例外，包装顺序由对应测试保护，本轮不合并其业务行为。`extensions/components/` 放带声明名称的自包含集成；当前 TrainerEx、checkpoint extension 和 DeepSeek-V4.1 配置仍存在组件顶层接线或反向使用，这是迁移债务，不是新组件约束。`extensions/compile/` 放 graph-pass 注册基础设施和具体 pattern。
 
 `extensions/` 当前还包含 `adaptor/`、`cpu_offload/`、`distributed/`、`mx_storage_reader/`、`novaswap/` 与 `experiment/`。其中仅包入口显式列出的模块自动加载；其余目录由调用路径按需导入。各目录的职责和加载方式见 [extensions 规则](../torchtitan_npu/extensions/AGENTS.md)。
 

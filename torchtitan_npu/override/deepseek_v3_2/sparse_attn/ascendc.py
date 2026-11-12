@@ -18,8 +18,8 @@ import spmd_types as spmd
 import torch
 import torch_npu
 from torchtitan.models.common.attention import (
+    VarlenAttentionMetadata,
     VarlenInnerAttention,
-    VarlenMetadata,
     create_varlen_metadata_for_document,
 )
 from torchtitan.models.common.aux_loss import AuxLoss
@@ -343,11 +343,11 @@ class AscVarlenMetadata:
     packed offsets to ``cu_seq_q`` and ``cu_seq_k``.
     """
 
-    varlen_meta: VarlenMetadata
+    varlen_meta: VarlenAttentionMetadata
     actual_seq_lengths: list[int]
 
     @classmethod
-    def from_varlen(cls, varlen_meta: VarlenMetadata) -> AscVarlenMetadata:
+    def from_varlen(cls, varlen_meta: VarlenAttentionMetadata) -> AscVarlenMetadata:
         """Read the host offset list of a packed layout in one transfer."""
         # ``cu_seq_q`` is read alone because the pinned upstream factory assigns
         # the identical ``packed_cu_seqlens`` tensor to ``cu_seq_q`` and ``cu_seq_k``.

@@ -413,7 +413,6 @@ def clip_grad_norm_(
     error_if_nonfinite: bool = False,
     foreach: bool | None = None,
     pp_mesh=None,
-    ep_enabled: bool = False,
 ) -> torch.Tensor:
     parameter_list = [parameters] if isinstance(parameters, torch.Tensor) else list(parameters)
     parameter_gradients = [(parameter, parameter.grad) for parameter in parameter_list if parameter.grad is not None]
@@ -427,7 +426,6 @@ def clip_grad_norm_(
             error_if_nonfinite,
             foreach,
             pp_mesh,
-            ep_enabled,
         )
     if len(cpu_gradients) != len(gradients) or any(not isinstance(gradient, DTensor) for gradient in gradients):
         raise TypeError("CPU gradient clipping requires only CPU DTensor gradients")
@@ -451,7 +449,6 @@ def clip_grad_norm_(
             error_if_nonfinite,
             foreach,
             pp_mesh,
-            ep_enabled,
         )
     if device.type != "npu":
         return _ORIGINAL_CLIP_GRAD_NORM(
@@ -461,7 +458,6 @@ def clip_grad_norm_(
             error_if_nonfinite,
             foreach,
             pp_mesh,
-            ep_enabled,
         )
 
     channel = clip_state.get_active_channel()

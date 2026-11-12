@@ -29,7 +29,6 @@
       ".torchtitan.models.common",
       ".torchtitan.trainer",
       ".torchtitan.components.metrics",
-      ".torchtitan.experiments.graph_trainer",
       ".torchtitan.tools.utils",
       ".torchtitan.eager_flex",
       ".compile.dynamo_config"
@@ -38,16 +37,11 @@
       ".components.checkpointer",
       ".components.metrics",
       ".components.optimizer",
-      ".distributed.context_parallel",
-      ".experiments.graph_trainer.chunked_loss",
-      ".experiments.graph_trainer.ep_overlap_shape_queries",
       ".observability",
-      ".models.common.attention_metadata",
-      ".models.common.decoder",
       ".models.common.moe",
       ".models.common.rope",
       ".models.common.token_dispatcher",
-      ".models.deepseek_v3.mtp"
+      ".models.deepseek_v4"
     ]
   }
 }

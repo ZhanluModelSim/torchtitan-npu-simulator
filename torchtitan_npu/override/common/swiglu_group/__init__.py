@@ -19,7 +19,7 @@ def _activation_config(cfg: SwiGLU.Config) -> AscSwiGLU.Config:
 
 @override(
     target=SwiGLU.Config,
-    fqns=["*.moe.routed_experts.activation_fn"],
+    fqns=["*.feed_forward.routed_experts.activation_fn"],
     description="Use cann_ops_nn.swiglu_group for routed experts.",
 )
 def asc(cfg: SwiGLU.Config) -> AscSwiGLU.Config:
@@ -29,7 +29,7 @@ def asc(cfg: SwiGLU.Config) -> AscSwiGLU.Config:
 
 @override(
     target=SwiGLU.Config,
-    fqns=["*.moe.shared_experts.activation_fn"],
+    fqns=["*.feed_forward.shared_experts.activation_fn"],
     description="Use cann_ops_nn.swiglu_group for shared experts.",
 )
 def asc_shared_experts(cfg: SwiGLU.Config) -> AscSwiGLU.Config:

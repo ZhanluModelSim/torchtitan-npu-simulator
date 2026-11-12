@@ -21,8 +21,8 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from torchtitan.components.data import TextSequence
+from torchtitan.components.data.text_datasets import TextProcessor
 from torchtitan.components.loss import IGNORE_INDEX
-from torchtitan.hf_datasets.text_datasets import TextProcessor
 
 if TYPE_CHECKING:
     from torchtitan.components.data import DatasetBuildContext

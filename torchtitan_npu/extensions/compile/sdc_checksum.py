@@ -75,7 +75,7 @@ def install_checksum_pass() -> None:
 
     installed = get_custom_graph_passes(inductor_config.post_grad_custom_post_pass)
     if _CHECKSUM_POST_GRAD_PASS not in installed:
-        inductor_config.post_grad_custom_post_pass = (
+        inductor_config.post_grad_custom_post_pass = (  # pyrefly: ignore [bad-assignment]
             *installed,
             _CHECKSUM_POST_GRAD_PASS,
         )

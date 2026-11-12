@@ -43,9 +43,11 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar, cast
 
 import torch
+import torch_remat as remat
 from torch import nn
 from torchtitan.models.common.decoder import Decoder, TransformerBlock
 
+from torchtitan_npu.models.common.attention_metadata import GeometryAttentionMetadataMixin
 from torchtitan_npu.models.common.metadata import KernelFrame
 from torchtitan_npu.models.common.restore import DOC_CHUNK_LAYOUT, doc_chunk_permutation, document_starts
 
@@ -56,8 +58,8 @@ from .mhc import HcPost, HcPre
 if TYPE_CHECKING:
     from torchtitan.models.common.moe import MoE
 
+    from torchtitan_npu.models.common.attention_metadata import AttentionMetadataMap
     from torchtitan_npu.models.common.restore import RestorePlan
-    from torchtitan_npu.patches.torchtitan.models.common.attention_metadata import AttentionMetadataMap
 
     from .attention import Attention
     from .vision import DeepSeekV41VisionEncoder, ImageMarkerEmbeddings
@@ -189,7 +191,7 @@ class DeepSeekV41TransformerBlock(TransformerBlock):
         # Redeclared with the V4.1 types so config builders can reach the fields the
         # sharding and MTP helpers need.
         attention: Attention.Config  # pyrefly: ignore [bad-override]
-        moe: MoE.Config  # pyrefly: ignore [bad-override]
+        feed_forward: MoE.Config  # pyrefly: ignore [bad-override]
         hc_attn_pre: HcPre.Config
         hc_ffn_pre: HcPre.Config
         hc_post: HcPost.Config
@@ -202,11 +204,16 @@ class DeepSeekV41TransformerBlock(TransformerBlock):
         self.attention = cfg.attention.build()
         self.attention_norm = cfg.attention_norm.build()
         self.ffn_norm = cfg.ffn_norm.build()
-        self.moe = cfg.moe.build()
+        self.feed_forward = cfg.feed_forward.build()
         self.hc_attn_pre = cfg.hc_attn_pre.build()
         self.hc_ffn_pre = cfg.hc_ffn_pre.build()
         self.hc_post = cfg.hc_post.build()
         self.engram = cfg.engram.build() if cfg.engram is not None else None
+        self._remat_encode_optional_outputs = False
+
+    def configure_remat_regions(self, save_patterns, recompute_patterns=()):
+        super().configure_remat_regions(save_patterns, recompute_patterns)
+        self._remat_encode_optional_outputs = True
 
     def forward(
         self,
@@ -224,6 +231,7 @@ class DeepSeekV41TransformerBlock(TransformerBlock):
         image_mask: torch.Tensor | None = None,
         engram_token_history: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
+        aux_loss_denominator: torch.Tensor | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -256,17 +264,25 @@ class DeepSeekV41TransformerBlock(TransformerBlock):
             topk_scores=topk_scores,
             candidates=candidates,
         )
+        remat.recompute_needs_tensor(x)
         x = self.hc_post(x, residual, post, comb)
 
         residual = x
         x, ffn_pre, post, comb = self.hc_ffn_pre(x, attn_pre)
-        x = self.moe(
+        x = self.feed_forward(
             self.ffn_norm(x),
             image_mask=image_mask,
             padding_mask_T=padding_mask,
+            aux_loss_denominator=aux_loss_denominator,
         )
+        remat.recompute_needs_tensor(x)
         x = self.hc_post(x, residual, post, comb)
-        return x, ffn_pre, cmp_k, idx_k, topk_indices, topk_scores, candidates
+        outputs = (x, ffn_pre, cmp_k, idx_k, topk_indices, topk_scores, candidates)
+        if self._remat_encode_optional_outputs:
+            # torch_remat's checkpoint boundary only accepts tensors. Attention
+            # carry tensors have rank >= 2, so a scalar bool marks an absent slot.
+            return tuple(value if value is not None else x.new_zeros((), dtype=torch.bool) for value in outputs)
+        return outputs
 
 
 def _layer_attention_metadata(attention_metadata: AttentionMetadataMap, layer: nn.Module) -> DeepSeekV41Metadata:
@@ -340,7 +356,7 @@ def _check_indexer_teacher_pair(fused_core: bool, fused_selector: bool) -> None:
     )
 
 
-class DeepSeekV41Model(Decoder):
+class DeepSeekV41Model(GeometryAttentionMetadataMixin, Decoder):
     """DeepSeek-V4.1 text backbone: CSA2 policy over the packed varlen contract.
 
     No MTP depths, no vision tower, no modality input: the stack consumes tokens,
@@ -351,25 +367,14 @@ class DeepSeekV41Model(Decoder):
 
     @classmethod
     def _register_optimizer_hooks(cls, optimizers, model_parts, parallelism_context):
+        from torchtitan.models.common.aux_loss import register_aux_loss_zero_hook
         from torchtitan.models.common.moe import register_moe_load_balancing_hook
 
         from torchtitan_npu.models.common.deepseek_lora import is_lora_parameter
 
         if not any(is_lora_parameter(name) for model in model_parts for name, _ in model.named_parameters()):
             register_moe_load_balancing_hook(optimizers, model_parts, parallelism_context)
-
-    def parallelize(self, **kwargs):
-        from torchtitan_npu.models.common.compile_policy import (
-            parallelize_with_model_compile,
-            skip_compile_under_cp,
-        )
-
-        kwargs["compile_config"] = skip_compile_under_cp(self, kwargs["compile_config"], kwargs["parallelism_context"])
-        if getattr(kwargs["compile_config"], "model", None) is None and (
-            kwargs["ac_config"] is None or not isinstance(self, DeepSeekV41MultimodalModel)
-        ):
-            return super().parallelize(**kwargs)
-        return parallelize_with_model_compile(self, **kwargs)
+        register_aux_loss_zero_hook(optimizers, model_parts, parallelism_context)
 
     def apply_model_compile(self, model_compile):
         from .parallelize import _apply_compile_v4_1
@@ -399,36 +404,23 @@ class DeepSeekV41Model(Decoder):
         candidate_source_layer: int = 20
         candidate_topk_blocks: int = 2048
         candidate_block_size: int = 8
+        fp32_param_patterns: tuple[str, ...] = ()
+        """Parameter name patterns retained in FP32 under FSDP mixed precision."""
 
-        def update_from_config(self, *, config, **kwargs):
+        def update_from_config(self, *, config, **kwargs) -> None:
+            from torchtitan.models.common.linear import Linear
+
+            for _, linear, _, _ in self.traverse(Linear.Config):
+                linear.inplace_wgrad_accum = False
             parallelism = config.parallelism
             if parallelism.tensor_parallel_degree != 1:
                 raise NotImplementedError("DeepSeek V4.1 currently supports TP=1 only")
             pp = parallelism.pipeline_parallel_degree
             if pp != 1:
                 raise NotImplementedError(f"DeepSeek V4.1 does not support pipeline parallelism; got PP={pp}")
-            # compile (aot_eager / inductor) is supported: the cross-layer
-            # state is threaded explicitly and the sparse core is the
-            # traceable gather_attn reference implementation.
             fused_core, fused_selector = _requested_fused_attention(config.override)
-            if parallelism.context_parallel_degree > 1:
-                from torchtitan_npu.override.deepseek_v4_1.sparse_attn.ascendc import (
-                    AscV41ContextParallelSparseAttention,
-                )
-
-                fused_core |= all(
-                    isinstance(layer.attention.inner_attention, AscV41ContextParallelSparseAttention.Config)
-                    for layer in self.layers
-                )
             _check_indexer_teacher_pair(fused_core, fused_selector)
             self._check_context_parallel(parallelism.context_parallel_degree, fused_core, fused_selector)
-            if parallelism.context_parallel_degree > 1:
-                from torchtitan_npu.models.common.alignment import require_dataloader_alignment
-
-                require_dataloader_alignment(
-                    config.dataloader, self.compress_ratios, parallelism.context_parallel_degree
-                )
-            Decoder.Config.update_from_config(self, config=config, **kwargs)
 
             if len(self.compress_ratios) != self.n_layers:
                 raise ValueError(
@@ -468,6 +460,47 @@ class DeepSeekV41Model(Decoder):
                         "EngramArgs.table_padding_multiple without changing it "
                         "between checkpoints."
                     )
+
+            # DeepEP/HybridEP size their buffers from the training shape; v0.4.0 no longer
+            # runs the upstream helper that used to fill these fields.
+            from torchtitan.models.common.moe.token_dispatcher import (
+                DeepEPTokenDispatcher,
+                HybridEPTokenDispatcher,
+            )
+
+            buffer_dispatchers = [
+                layer.feed_forward.routed_experts.token_dispatcher
+                for layer in self.layers
+                if isinstance(
+                    layer.feed_forward.routed_experts.token_dispatcher,
+                    (DeepEPTokenDispatcher.Config, HybridEPTokenDispatcher.Config),
+                )
+            ]
+            if buffer_dispatchers:
+                if parallelism.expert_parallel_degree == 1:
+                    raise ValueError("DeepEP/HybridEP token dispatch requires expert_parallel_degree > 1.")
+                num_token_shards = parallelism.context_parallel_degree * parallelism.tensor_parallel_degree
+                num_tokens = config.training.num_tokens_per_microbatch_per_dp_rank
+                if num_tokens % num_token_shards != 0:
+                    raise ValueError(
+                        "training.num_tokens_per_microbatch_per_dp_rank "
+                        f"({num_tokens}) must be divisible by "
+                        "context_parallel_degree * tensor_parallel_degree "
+                        f"({num_token_shards}) so CP and TP/SP produce equal local "
+                        "token counts."
+                    )
+                required_capacity = num_tokens // num_token_shards
+                for dispatcher in buffer_dispatchers:
+                    if dispatcher.num_max_tokens_per_rank is None:
+                        dispatcher.num_max_tokens_per_rank = required_capacity
+                    elif dispatcher.num_max_tokens_per_rank < required_capacity:
+                        raise ValueError(
+                            f"{type(dispatcher).__qualname__} num_max_tokens_per_rank "
+                            f"({dispatcher.num_max_tokens_per_rank}) is smaller than the "
+                            f"required per-rank capacity ({required_capacity})."
+                        )
+                    if dispatcher.hidden_dim is None:
+                        dispatcher.hidden_dim = self.dim
 
             from .sharding import set_deepseek_v4_1_sharding_config
 
@@ -521,7 +554,7 @@ class DeepSeekV41Model(Decoder):
             """
             from typing import cast
 
-            from torchtitan.models.utils import get_nparams_and_active_nparams
+            from torchtitan.models.common.flops import get_nparams_and_active_nparams
 
             deepseek_v4_1_model = cast("DeepSeekV41Model", model)
             first_attention = self.layers[0].attention
@@ -609,7 +642,7 @@ class DeepSeekV41Model(Decoder):
             if positions is None:
                 raise ValueError("Engram's token history needs the row's document-relative positions.")
             history = self._engram_row_history(input_dict["input"], positions, parallelism_context)
-        inputs, labels, extra_kwargs = super().preprocess_inputs(  # pyrefly: ignore [not-callable]
+        inputs, labels, extra_kwargs, loss_kwargs = super().preprocess_inputs(  # pyrefly: ignore [not-callable]
             input_dict,
             parallelism_context=parallelism_context,
             parallelism=parallelism,
@@ -626,7 +659,7 @@ class DeepSeekV41Model(Decoder):
                 {"engram_token_history": dense_activation_placement(tp=spmd.R, cp=spmd.S(0))},
             )
             extra_kwargs["engram_token_history"] = history
-        return inputs, labels, extra_kwargs
+        return inputs, labels, extra_kwargs, loss_kwargs
 
     def _engram_row_history(
         self,
@@ -687,6 +720,7 @@ class DeepSeekV41Model(Decoder):
         image_mask: torch.Tensor | None = None,
         engram_token_history: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
+        aux_loss_denominators: torch.Tensor | None = None,
     ):
         """V4.1 forward with Single-Pass mHC on a folded token stream.
 
@@ -736,7 +770,13 @@ class DeepSeekV41Model(Decoder):
                 image_mask=image_mask,
                 engram_token_history=engram_token_history,
                 padding_mask=padding_mask,
+                aux_loss_denominator=None if aux_loss_denominators is None else aux_loss_denominators[0],
             )
+            if layer._remat_encode_optional_outputs:
+                cmp_k, idx_k, topk_indices, topk_scores, candidates = (
+                    None if value.ndim == 0 and value.dtype == torch.bool else value
+                    for value in (cmp_k, idx_k, topk_indices, topk_scores, candidates)
+                )
 
         # The stack has no learned output head: it collapses with the last block's
         # attention-input coefficients.
@@ -780,7 +820,7 @@ class DeepSeekV41MultimodalModel(DeepSeekV41Model):
         vision_names = ("pixel_values", "image_grid", "image_feature_indices", "token_types")
         vision_inputs = {name: input_dict[name] for name in vision_names if name in input_dict}
         decoder_inputs = {name: value for name, value in input_dict.items() if name not in vision_inputs}
-        inputs, labels, extra_kwargs = super().preprocess_inputs(
+        inputs, labels, extra_kwargs, loss_kwargs = super().preprocess_inputs(
             decoder_inputs, parallelism_context=parallelism_context, parallelism=parallelism, **kwargs
         )
         from torchtitan.distributed.spmd_types import annotate_input_spmd_types
@@ -799,7 +839,7 @@ class DeepSeekV41MultimodalModel(DeepSeekV41Model):
             },
         )
         extra_kwargs.update(vision_inputs)
-        return inputs, labels, extra_kwargs
+        return inputs, labels, extra_kwargs, loss_kwargs
 
     def apply_activation_checkpointing_extensions(self, policy) -> None:
         """Apply the shared AC policy to the V4.1 vision blocks.

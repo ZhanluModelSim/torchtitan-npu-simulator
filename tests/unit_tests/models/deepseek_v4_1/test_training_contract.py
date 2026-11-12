@@ -9,7 +9,7 @@ import importlib
 import pytest
 import torch
 from torch.utils.checkpoint import DefaultDeviceType
-from torchtitan.distributed.activation_checkpoint import FullAC
+from torchtitan.distributed.activation_remat import FullActivationRematConfig
 
 from tests.unit_tests.models.deepseek_v4_1.preprocess_utils import preprocess
 from tests.unit_tests.models.mtp_test_utils import build_cpu_model
@@ -61,7 +61,7 @@ def test_full_ac_preserves_image_routing(monkeypatch, with_engram):
             layer.moe.expert_bias_E.copy_(bias)
             layer.moe.router.bias_vl.copy_(bias.flip(0))
     checkpointed = copy.deepcopy(model)
-    FullAC.Config().build().apply(checkpointed)
+    FullActivationRematConfig.Config().build().apply(checkpointed)
 
     # Real image protocol without depending on the synthetic RNG fallback.
     ids, types, feature_ids = build_image_token_layout([(3, 3)], span_start=2, vocab_size=64)

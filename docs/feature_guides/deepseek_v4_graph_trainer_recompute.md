@@ -1,5 +1,7 @@
 # DeepSeek-V4 GraphTrainer 激活重计算
 
+> **0.4.0 配置迁移说明：** 下文保留历史实现说明与字段 CLI 示例，不能直接作为当前启动命令。训练工厂已迁至 `torchtitan_npu_recipes`；当前启动方式见[快速上手](../user-guides/quickstart.md)，专用配置与 golden 应按 [Python 配置组合指南](../developer_guides/python_recipes.md)定义工厂。功能支持以 0.4.0 升级计划为准。
+
 本文说明 `torchtitan-npu` 中 DeepSeek-V4 GraphTrainer 的激活重计算设计，包括默认 `full` 策略、可选 `dsv4-mhc` / `dsv4-mhc-moe-save` 策略、使用方式和已知限制。
 
 
@@ -33,7 +35,7 @@ disable_passes = ["cudagraph_pass"]
 配置位置：
 
 ```text
-torchtitan_npu/models/deepseek_v4/config_registry.py
+torchtitan_npu_recipes/graph_trainer/deepseek_v4.py
 ```
 
 五个 GraphTrainer recipe 均使用 `num_mtp_layers=0` 和 `memory_policy="full"`。
@@ -165,7 +167,7 @@ CPU offload 与 SAR 之前把变异写入显式化为数据流，原生 SAR 随�
 
 | 功能 | 文件 |
 | --- | --- |
-| DSV4 GraphTrainer 配置 | `torchtitan_npu/models/deepseek_v4/config_registry.py` |
+| DSV4 GraphTrainer 配置 | `torchtitan_npu_recipes/graph_trainer/deepseek_v4.py` |
 | 通用 full policy | `torchtitan/experiments/graph_trainer/memory_policy.py` |
 | NPU policy 框架 | `torchtitan_npu/patches/torchtitan/experiments/graph_trainer/memory_policy.py` |
 | `dsv4-mhc` / `dsv4-mhc-moe-save` 策略 | `torchtitan_npu/models/deepseek_v4/memory_policy.py` |

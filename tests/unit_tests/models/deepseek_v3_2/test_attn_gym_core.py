@@ -319,5 +319,5 @@ def test_the_shipped_layers_dispatch_to_a_varlen_mask():
 
     assert isinstance(layer_cfg.attention.inner_attention, SparseInnerAttention.Config)
     assert issubclass(SparseInnerAttention.Config, VarlenInnerAttention.Config)
-    assert isinstance(masks, VarlenMetadata)
+    assert isinstance(masks, VarlenAttentionMetadata)
     assert masks.cu_seq_q.tolist() == [0, 3, 8]

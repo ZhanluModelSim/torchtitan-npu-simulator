@@ -5,18 +5,35 @@
 
 """Registered mHC backbone with fixed boundaries for the not-yet-folded attention/MoE."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from types import SimpleNamespace
 
 import torch
-from torchtitan.protocols.module import Module
+from torchtitan.models.base.module import Module
 
 from torchtitan_npu.models.deepseek_v4_1 import model_registry
+
+
+class _BoundaryInnerAttentionConfig:
+    """Minimal inner-attention contract for the boundary stub.
+
+    Upstream v0.4.0 reads ``inner_attention`` from the decoder config and keys the
+    per-microbatch metadata map by the geometry this stub publishes.
+    """
+
+    is_full_attention = True
+    attention_metadata_key = "mhc_boundary"
+
+    @staticmethod
+    def build_attention_metadata(positions, **_kwargs):
+        del positions
+        return SimpleNamespace()
 
 
 class AttentionBoundaryStub(Module):
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
-        pass
+        inner_attention: _BoundaryInnerAttentionConfig = field(default_factory=_BoundaryInnerAttentionConfig)
 
     attention_metadata_key = "mhc_boundary"
 
@@ -38,7 +55,7 @@ class MoEBoundaryStub(Module):
     def __init__(self, config):
         super().__init__()
 
-    def forward(self, x, *, image_mask=None, padding_mask_T=None):
+    def forward(self, x, *, image_mask=None, padding_mask_T=None, aux_loss_denominator=None):
         return torch.nn.functional.silu(x) * 0.5 - 0.125
 
 
@@ -53,7 +70,7 @@ def build_mhc_boundary_model(*, dim=4, vocab_size=11):
     for layer in config.layers:
         layer.engram = None
         layer.attention = AttentionBoundaryStub.Config()
-        layer.moe = MoEBoundaryStub.Config()
+        layer.feed_forward = MoEBoundaryStub.Config()
         layer.attention_norm.normalized_shape = layer.ffn_norm.normalized_shape = dim
         layer.hc_attn_pre.dim = layer.hc_ffn_pre.dim = dim
         layer.hc_attn_pre.sinkhorn_iters = layer.hc_ffn_pre.sinkhorn_iters = 4

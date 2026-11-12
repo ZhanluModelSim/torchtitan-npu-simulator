@@ -26,19 +26,3 @@ RUN python3 -m pip install --no-cache-dir \
 
 COPY requirements.txt /tmp/requirements.txt
 COPY requirements-dev.txt /tmp/requirements-dev.txt
-
-# The self-built torch_npu wheel is CPython 3.12/aarch64 only. Install its
-# dependencies first, then install the wheel without dependencies because its
-# metadata pins torch==2.14.0 while this image intentionally uses a matching
-# torch nightly build.
-RUN test "$(uname -m)" = "aarch64" \
-    && python3 -c 'import sys; assert sys.version_info[:2] == (3, 12), sys.version' \
-    && sed -E '/^torch_npu[[:space:]]*(@|==)/d' /tmp/requirements.txt > /tmp/requirements_without_torch_npu.txt \
-    && python3 -m pip install --no-cache-dir --prefer-binary --retries 10 --timeout 120 \
-        -r /tmp/requirements_without_torch_npu.txt \
-        -r /tmp/requirements-dev.txt \
-    && { grep '^--find-links[[:space:]]' /tmp/requirements.txt > /tmp/torch_npu_requirement.txt || true; } \
-    && grep -E '^torch_npu[[:space:]]*(@|==)' /tmp/requirements.txt >> /tmp/torch_npu_requirement.txt \
-    && test -s /tmp/torch_npu_requirement.txt \
-    && python3 -m pip install --no-cache-dir --no-deps --retries 10 --timeout 120 \
-        -r /tmp/torch_npu_requirement.txt

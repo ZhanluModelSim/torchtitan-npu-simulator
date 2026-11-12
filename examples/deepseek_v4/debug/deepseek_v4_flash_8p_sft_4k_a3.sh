@@ -6,14 +6,9 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-# SFT wrapper around the 8p CPT launcher in this directory.
 set -euo pipefail
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-DATASET_PATH="${DATASET_PATH:-/path/to/train.jsonl}"
-
-CONFIG="${CONFIG:-deepseek_v4_flash_43layers_16experts_sft_compiled}" \
-DSV4_SFT_DATASET="${DATASET_PATH}" \
-exec bash "${SCRIPT_DIR}/deepseek_v4_flash_8p_cpt_4k_a3.sh" \
-    --checkpointer.no-load-only \
-    "$@"
+MODULE="${MODULE:-torchtitan_npu_recipes.examples.deepseek_v4}" \
+CONFIG="${CONFIG:-deepseek_v4_flash_8p_sft_4k_a3}" \
+NGPU="${NGPU:-8}" \
+exec bash "$(dirname -- "${BASH_SOURCE[0]}")/../../../scripts/run_train.sh" "$@"

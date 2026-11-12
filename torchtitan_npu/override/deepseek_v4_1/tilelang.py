@@ -9,7 +9,7 @@ V4.1 keeps a cross-layer pre-mix graph, so ``TilelangV41HcPre`` adapts the
 model-side ``forward(x, pre_mix) -> (y, pre, post, comb)`` contract to the
 TileKernels split/apply primitives (the freshly computed ``pre`` is returned
 for the next sub-layer and the branches collapse with the incoming
-``pre_mix``).  ``TilelangV41HcPost`` adapts ``forward(y, residual, post, comb)``
+``pre_mix``).  ``TilelangV41HcPost`` adapts ``forward(x, residual, post, comb)``
 to the external TileKernels ``mhc_post`` operator.
 """
 
@@ -87,7 +87,7 @@ class TilelangV41HcPost(HcPost):
     class Config(HcPost.Config):
         pass
 
-    def forward(
+    def forward(  # pyrefly: ignore [bad-param-name-override]
         self,
         y: torch.Tensor,
         residual: torch.Tensor,

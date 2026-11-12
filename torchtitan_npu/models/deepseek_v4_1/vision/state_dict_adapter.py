@@ -37,7 +37,7 @@ class DeepSeekV41VisionStateDictAdapter:
         "image_start": "image_marker_embeddings.image_start",
         "image_newline": "image_marker_embeddings.image_newline",
         "image_end": "image_marker_embeddings.image_end",
-        "layers.{}.ffn.gate.bias_vl": "layers.{}.moe.router.bias_vl",
+        "layers.{}.ffn.gate.bias_vl": "layers.{}.feed_forward.router.bias_vl",
     }
 
     _HF_PREFIXES = ("vision.", "aligner.")
@@ -45,7 +45,7 @@ class DeepSeekV41VisionStateDictAdapter:
     # ``bias_vl`` sits inside the layer namespace the text half otherwise owns, so it is
     # claimed by pattern rather than by prefix -- on both sides of the mapping.
     _HF_VL_BIAS = re.compile(r"^layers\.\d+\.ffn\.gate\.bias_vl$")
-    _LOCAL_VL_BIAS = re.compile(r"^layers\.\d+\.moe\.router\.bias_vl$")
+    _LOCAL_VL_BIAS = re.compile(r"^layers\.\d+\.feed_forward\.router\.bias_vl$")
     _LOCAL_PREFIXES = ("vision_encoder.", "image_marker_embeddings.")
 
     def __init__(self, *, expected_shapes: Mapping[str, tuple[int, ...]] | None = None):
@@ -111,7 +111,7 @@ class DeepSeekV41VisionStateDictAdapter:
 
     @staticmethod
     def _abstract_key(key: str) -> str:
-        """``layers.3.moe.router.bias_vl`` -> ``layers.{}.moe.router.bias_vl``.
+        """``layers.3.feed_forward.router.bias_vl`` -> ``layers.{}.feed_forward.router.bias_vl``.
 
         A key that is not layer-scoped is returned unchanged, so the abstraction is only
         ever a *different* string for a layer-scoped key -- which is what the callers

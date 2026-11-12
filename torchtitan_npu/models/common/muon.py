@@ -10,17 +10,18 @@ import re
 from collections.abc import Iterable
 from dataclasses import replace
 
+import torch
 from torch.distributed.tensor import Shard
 from torchtitan.distributed.flex_shard import ComputeLayout, Owned
 from torchtitan.distributed.parallelism_context import MeshAxisName
+from torchtitan.models.base.module import Module
 from torchtitan.models.common.linear import GroupedLinear
-from torchtitan.protocols.module import Module
 
 from torchtitan_npu.config import MuonOptimizerProfile
 
 
 def make_owned_layout(axes: Iterable[str]) -> ComputeLayout:
-    return ComputeLayout(shardings_by_mesh_axis={axis: Owned() for axis in axes})
+    return ComputeLayout(shardings_by_mesh_axis={axis: Owned() for axis in axes}, compute_dtype=torch.bfloat16)
 
 
 def make_expert_layout(axes: Iterable[str]) -> ComputeLayout:
@@ -29,6 +30,7 @@ def make_expert_layout(axes: Iterable[str]) -> ComputeLayout:
             axis: Shard(0) for axis in (*axes, MeshAxisName.EDP_SHARD.value, MeshAxisName.EP.value)
         },
         shard_order_by_tensor_dim={0: (MeshAxisName.EP.value, MeshAxisName.EDP_SHARD.value)},
+        compute_dtype=torch.bfloat16,
     )
 
 

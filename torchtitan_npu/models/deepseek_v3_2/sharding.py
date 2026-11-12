@@ -9,6 +9,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import spmd_types as spmd
+from torchtitan.models.base.sharding import ShardingConfig
 from torchtitan.models.common.decoder_sharding import (
     dense_activation_placement,
     dense_param_placement,
@@ -18,7 +19,6 @@ from torchtitan.models.deepseek_v3.sharding import (
     _set_deepseek_v3_layer_sharding,
     _set_deepseek_v3_mtp_sharding,
 )
-from torchtitan.protocols.sharding import ShardingConfig
 
 if TYPE_CHECKING:
     from torchtitan_npu.models.deepseek_v3_2.model import (

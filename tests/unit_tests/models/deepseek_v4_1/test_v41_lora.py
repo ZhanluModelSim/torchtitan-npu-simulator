@@ -4,11 +4,11 @@
 import pytest
 import torch
 from torchtitan.components.optim import AdamW
-from torchtitan.protocols.module import Module
+from torchtitan.models.base.module import Module
 
 from torchtitan_npu.models.deepseek_v4.lora import is_lora_parameter
 from torchtitan_npu.models.deepseek_v4_1.checkpoint import DeepSeekV41LoRACheckpointManager
-from torchtitan_npu.models.deepseek_v4_1.config_registry import (
+from torchtitan_npu_recipes.models.deepseek_v4_1 import (
     deepseek_v4_1_debugmodel_lora,
     deepseek_v4_1_flash_lora,
     deepseek_v4_1_flash_text_lora,

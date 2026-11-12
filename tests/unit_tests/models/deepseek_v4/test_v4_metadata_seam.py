@@ -19,11 +19,12 @@ import torch
 from torchtitan_npu.models.common.restore import DOC_CHUNK_LAYOUT
 from torchtitan_npu.models.deepseek_v4 import _make_v4_config
 from torchtitan_npu.models.deepseek_v4.attention import CompressedSparseInnerAttention
+from torchtitan_npu.models.deepseek_v4.backend import with_npu_attention_backend
 from torchtitan_npu.models.deepseek_v4.metadata import DeepSeekV4Metadata
 from torchtitan_npu.models.deepseek_v4.sharding import set_deepseek_v4_sharding_config
 from torchtitan_npu.override import _IS_A5
 from torchtitan_npu.override.deepseek_v4.metadata import AicpuGeometry, AscV4Metadata
-from torchtitan_npu.override.deepseek_v4.sparse_attn import asc
+from torchtitan_npu.override.deepseek_v4.sparse_attn import asc_legacy
 from torchtitan_npu.override.deepseek_v4.sparse_attn.ascendc import AscCompressedSparseInnerAttention
 from torchtitan_npu.patches.torchtitan.models.common.attention_metadata import cp_shard_context_set
 
@@ -70,6 +71,8 @@ def _model_config(ratios: tuple[int, ...], *, ascendc: bool, geometry: dict | No
         original_seq_len=_WINDOW * 2,
         num_mtp_layers=0,
     )
+    # These tests exercise the explicitly retained geometry/carry backend.
+    config = with_npu_attention_backend(config)
     # The sharding pass runs at config resolution, before the overrides.
     set_deepseek_v4_sharding_config(config, enable_sp=False, enable_ep=False)
     if ascendc:
@@ -77,7 +80,7 @@ def _model_config(ratios: tuple[int, ...], *, ascendc: bool, geometry: dict | No
             setattr(
                 parent,
                 attr,
-                asc(
+                asc_legacy(
                     inner,
                     **(
                         geometry
@@ -100,16 +103,15 @@ def _entry(model, ratio: int = 4, positions=None):
     return matches[0]
 
 
-def test_model_config_accepts_cp_with_aligned_documents():
-    from torchtitan_npu.models.deepseek_v4.config_registry import deepseek_v4_debugmodel
+def test_native_model_rejects_cp_even_with_aligned_documents():
+    from torchtitan_npu_recipes.models.deepseek_v4 import deepseek_v4_debugmodel
 
     config = deepseek_v4_debugmodel()
     config.parallelism.context_parallel_degree = 2
     config.dataloader.dataset.dataset.processor.per_doc_alignment = 256
 
-    config.model.update_from_config(config=config)
-
-    assert all(layer.attention.inner_attention.sharding_config is not None for layer in config.model.layers)
+    with pytest.raises(NotImplementedError, match="TP=CP=PP=1"):
+        config.model.update_from_config(config=config)
 
 
 def test_entries_are_built_per_geometry():

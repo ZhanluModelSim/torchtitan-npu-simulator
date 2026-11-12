@@ -1,6 +1,6 @@
 # DeepSeek-V4 GraphTrainer 编译路径适配
 
-GraphTrainer 是 torchtitan 上游 `experiments/graph_trainer/` 中的编译式分布式训练实验：用 `minimal_fx_tracer` 把 forward、loss、backward（可选 optimizer.step）整体捕获为单个 FX 图，所有优化都以 graph pass 的形式作用于同一张图。本适配让 DeepSeek-V4（DSV4）在该编译路径上可在 Ascend NPU 运行，与现有 eager 路径并行存在、互不影响。默认不启用：需要显式选择 `graph_trainer_*` 配置名。
+GraphTrainer 是 torchtitan 上游 `experiments/graph_trainer/` 中的编译式分布式训练实验：用 `minimal_fx_tracer` 把 forward、loss、backward（可选 optimizer.step）整体捕获为单个 FX 图，所有优化都以 graph pass 的形式作用于同一张图。本仓保留 DeepSeek-V4（DSV4）的 NPU 图训练实现；TorchTitan 0.4.0 的当前验收范围为文本 eager，图训练仍待迁移和回归。图训练配置位于独立 recipe 模块。
 
 ## 上游 GraphTrainer 特性
 
@@ -18,7 +18,7 @@ GraphTrainer 是 torchtitan 上游 `experiments/graph_trainer/` 中的编译式�
 
 ### 配置入口
 
-`torchtitan_npu/models/deepseek_v4/config_registry.py` 新增 5 个配置工厂，均复用对应 eager 配置，经 `to_graph_trainer_config` 包装为 `GraphTrainer.Config`：
+`torchtitan_npu_recipes/graph_trainer/deepseek_v4.py` 保存图训练组合，均复用 `torchtitan_npu_recipes.models.deepseek_v4` 中的对应 eager 配置，经 `torchtitan_npu/models/deepseek_v4/graph_trainer.py` 的 `to_graph_trainer_config` 包装为 `GraphTrainer.Config`：
 
 | 配置名 | 对应 eager 配置 |
 | --- | --- |
@@ -55,27 +55,11 @@ GraphTrainer 的 trace 约束与 eager 有本质差异：`minimal_fx_tracer` 在
 
 ## 激活方式
 
-以 flash 43layers 模型、8 卡 EP=8 为例（对应 0825 验证脚本 `acc_align_smoke_ep_overlap.sh`）：
+TorchTitan 0.4.0 适配当前只验收 DeepSeek 文本 eager，GraphTrainer 尚未完成迁移和回归。本页说明保留的实现结构，不作为当前版本可运行的图训练指南。
 
-```bash
-torchrun --nproc_per_node=8 -m torchtitan.train \
-  --module torchtitan_npu.models.deepseek_v4 \
-  --config graph_trainer_deepseek_v4_flash_43layers_16experts \
-  --parallelism.expert-parallel-degree 8 \
-  --parallelism.data-parallel-shard-degree 8 \
-  --parallelism.spmd-backend spmd_types \
-  --override.imports \
-    torchtitan_npu.override.common.rms_norm.asc \
-    torchtitan_npu.override.common.rope.asc_complex \
-    'torchtitan_npu.override.deepseek_v4.sparse_attn.asc={"num_heads":16,"index_num_heads":8}' \
-    torchtitan_npu.override.deepseek_v4.lightning_indexer.asc \
-    torchtitan_npu.override.deepseek_v4.mhc.asc_hc_pre \
-    torchtitan_npu.override.deepseek_v4.mhc.asc_hc_post \
-    torchtitan_npu.override.common.token_dispatcher.asc \
-    torchtitan_npu.override.common.optimizer.virtual
-```
+旧图训练 launcher 位于 `examples/deepseek_v4/` 及其 `debug/` 子目录，模块选择指向 `torchtitan_npu_recipes.graph_trainer.deepseek_v4`。其中的通用字段 CLI 参数仍需迁移为 Python 配置；迁移完成前不要据此启动 0.4.0 图训练。完整训练策略应定义新 recipe，由 shell launcher 选择，组合方式见 [recipe 指南](../../torchtitan_npu_recipes/README.md)。
 
-编译配置（`aot_fx_trace`、禁用 `cudagraph_pass`）由配置工厂内置，无需 CLI 传入；`--compile.disable_passes cudagraph_pass` 仅对 eager 配置的默认编译路径必需。
+下表描述保留实现的设计范围；历史验证不代表当前依赖组合已通过验收。
 
 ## 支持范围与限制
 

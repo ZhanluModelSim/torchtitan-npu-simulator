@@ -26,7 +26,7 @@ from torchtitan.components.checkpointer.torch_checkpointing import (
     _sync_save_config,
 )
 from torchtitan.tools import filesystem
-from torchtitan.tools.utils import GarbageCollection
+from torchtitan.tools.garbage_collector import GarbageCollector
 
 from .torch_checkpointing_backend import adapt_checkpoint_manager
 
@@ -117,4 +117,4 @@ class TorchCheckpointingManager(upstream.TorchCheckpointingManager):
             )
         finally:
             manager.close()
-        GarbageCollection.collect("GC collection invoked by checkpointer.")
+        GarbageCollector.collect("GC collection invoked by native NPU checkpointer.")

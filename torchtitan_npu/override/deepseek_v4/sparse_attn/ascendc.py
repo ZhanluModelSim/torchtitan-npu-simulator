@@ -47,7 +47,7 @@ from cann_ops_transformer import (
     sparse_flash_mla_metadata,
     sparse_lightning_indexer_kl_loss_grad_metadata,
 )
-from torchtitan.models.common.cp_attention import CPInnerAttention
+from torchtitan.models.common.attention.cp_attention import CPInnerAttention
 
 from torchtitan_npu.models.common.metadata import KernelFrame
 from torchtitan_npu.models.deepseek_v4.attention import CompressedSparseInnerAttention
@@ -253,6 +253,7 @@ def build_aicpu_metadata(
     *,
     geometry: AicpuGeometry,
     positions_q: torch.Tensor | None = None,
+    include_selector: bool = True,
 ) -> AscV4Metadata:
     """The AscendC record tier over one geometry's frames (upstream #4897).
 
@@ -284,7 +285,7 @@ def build_aicpu_metadata(
     workaround = None
     if not _IS_A5:
         workaround, swa_k, cmp_k = A3KeyWorkaround.build(swa_k=swa_k, cmp_k=cmp_k)
-    li_record, slig_metadata = _selector_records(q, cmp_k, geometry, ratio)
+    li_record, slig_metadata = _selector_records(q, cmp_k, geometry, ratio) if include_selector else (None, None)
     smla_metadata, smla_grad_metadata = _sparse_attention_records(q, swa_k, cmp_k, geometry, ratio)
     record = AicpuMetadata(
         geometry=geometry,
@@ -297,7 +298,8 @@ def build_aicpu_metadata(
     # this rank's when the CP transform rebuilds the entry.
     compact_proof = None
     if (
-        positions_q is not None
+        include_selector
+        and positions_q is not None
         and cmp_k is not None
         and ratio == LI_CMP_RATIO
         and geometry.index_num_heads == 64
@@ -499,6 +501,52 @@ class _SparseFlashMLATND(torch.autograd.Function):
         )
 
 
+def run_sparse_flash_mla(
+    q,
+    swa_k,
+    attn_sink,
+    *,
+    attention_metadata: AscV4Metadata,
+    softmax_scale: float,
+    compress_ratio: int,
+    window_size: int,
+    cmp_k=None,
+    topk_indices=None,
+    teacher_carrier=None,
+):
+    """Run the existing SMLA bridge and expose its detached TND LSE."""
+    if not isinstance(attention_metadata, AscV4Metadata):
+        raise TypeError("SMLA requires the AscV4Metadata its config built.")
+    if compress_ratio == 4 and (cmp_k is None or topk_indices is None):
+        raise ValueError("ratio-4 SMLA requires cmp_k and topk_indices together.")
+    metadata = attention_metadata
+    if not _IS_A5:
+        workaround = metadata.a3_workaround
+        assert workaround is not None, "an arch22 entry states the key workaround"
+        if workaround.swa_k_gather is not None:
+            swa_k = swa_k.index_select(0, workaround.swa_k_gather)
+        if cmp_k is not None and workaround.cmp_k_gather is not None:
+            cmp_k = cmp_k.index_select(0, workaround.cmp_k_gather)
+    swa_k = swa_k.unsqueeze(1).contiguous()
+    if cmp_k is not None:
+        cmp_k = cmp_k.unsqueeze(1).contiguous()
+    indices_tnd = None if topk_indices is None else topk_indices.reshape(-1, 1, topk_indices.shape[-1])
+    carrier_tnd = None if teacher_carrier is None else teacher_carrier.reshape(-1, 1, teacher_carrier.shape[-1])
+    output, lse = _SparseFlashMLATND.apply(
+        q,
+        swa_k,
+        cmp_k,
+        indices_tnd,
+        attn_sink.float(),
+        metadata,
+        softmax_scale,
+        compress_ratio,
+        window_size,
+        carrier_tnd,
+    )
+    return output.reshape(q.shape[0], *output.shape[1:]), lse
+
+
 class AscCompressedSparseInnerAttention(CompressedSparseInnerAttention):
     """Run SMLA/SMLAG in a local TND layout, consuming the selector's selection.
 
@@ -577,63 +625,19 @@ class AscCompressedSparseInnerAttention(CompressedSparseInnerAttention):
         topk_scores=None,
         attention_metadata: AscV4Metadata,
     ) -> torch.Tensor:
-        # The single-source contract (see ``docs/feature_guides/fused_ops.md``): the fused
-        # kernels read the records their own builder attached, so an entry built by any other
-        # backend is refused here rather than launched with missing metadata.  There is no
-        # inline fallback.
-        if not isinstance(attention_metadata, AscV4Metadata):
-            raise TypeError(
-                "asc requires the attention metadata its own config built, got "
-                f"{type(attention_metadata).__name__}: the decoder hands each layer the entry "
-                "its attention_metadata_key names, so this layer's backend did not build one."
-            )
-        if self.compress_ratio == 4 and (cmp_k is None or topk_indices is None):
-            raise ValueError("ratio-4 asc requires cmp_k and topk_indices together.")
-        metadata = attention_metadata
-        seqlen = q.shape[0]
-        if not _IS_A5:
-            # Both KV streams arrive as the gathered whole row, and this rank may read only its
-            # per-document reach: the options state that reach as the kernels' frame, so each row is
-            # compacted onto it here.  Both gathers are differentiable, so the kernels' gradients
-            # scatter back onto the gathered rows; on the rank whose reach is every document in
-            # full there is no gather and no row is copied.
-            workaround = metadata.a3_workaround
-            assert workaround is not None, "an arch22 entry states the key workaround"
-            if workaround.swa_k_gather is not None:
-                swa_k = swa_k.index_select(0, workaround.swa_k_gather)
-            if cmp_k is not None and workaround.cmp_k_gather is not None:
-                cmp_k = cmp_k.index_select(0, workaround.cmp_k_gather)
-        swa_k = swa_k.unsqueeze(1).contiguous()
-        if cmp_k is not None:
-            cmp_k = cmp_k.unsqueeze(1).contiguous()
-
-        topk_indices_tnd = None
-        if topk_indices is not None:
-            # The model carries the selection as ``[B, L, K]``; a TND kernel wants
-            # ``[T, 1, K]``.  Order is left exactly as the selector emitted it: it already
-            # canonicalised position order, and the teacher's slots follow that order.
-            topk_indices_tnd = topk_indices.reshape(-1, 1, topk_indices.shape[-1])
-
-        # The carrier is a training-only by-product: its gradient is the selector's only edge,
-        # and SMLAG's backward writes the teacher on it.  In eval there is no indexer gradient
-        # to feed, so the carrier is not threaded through.
-        topk_scores_tnd = None
-        if self.training and topk_scores is not None:
-            topk_scores_tnd = topk_scores.reshape(-1, 1, topk_scores.shape[-1])
-
-        output, _lse = _SparseFlashMLATND.apply(
+        output, _lse = run_sparse_flash_mla(
             q,
             swa_k,
-            cmp_k,
-            topk_indices_tnd,
-            attn_sink.float(),
-            metadata,
-            self.softmax_scale,
-            self.compress_ratio,
-            self.window_size,
-            topk_scores_tnd,
+            attn_sink,
+            attention_metadata=attention_metadata,
+            softmax_scale=self.softmax_scale,
+            compress_ratio=self.compress_ratio,
+            window_size=self.window_size,
+            cmp_k=cmp_k,
+            topk_indices=topk_indices,
+            teacher_carrier=topk_scores if self.training else None,
         )
-        return output.reshape(seqlen, *output.shape[1:])
+        return output
 
 
 class AscV4ContextParallelSparseAttention(CPInnerAttention, AscCompressedSparseInnerAttention):

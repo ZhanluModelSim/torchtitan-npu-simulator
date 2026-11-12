@@ -211,8 +211,8 @@ class TilelangHcPre(HcPre):
             self.hc_scale.float(),
             self.hc_base.float(),
             self.hc_mult,
-            self.sinkhorn_iters,
-            self.eps,
+            self.sinkhorn.sinkhorn_iters,
+            self.sinkhorn.eps,
             self.norm_eps,
         )
 

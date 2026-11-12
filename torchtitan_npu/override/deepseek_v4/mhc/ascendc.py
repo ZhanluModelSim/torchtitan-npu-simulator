@@ -43,8 +43,8 @@ class AscHcPre(HcPre):
             self.hc_scale.float(),
             self.hc_base.float(),
             self.hc_mult,
-            self.sinkhorn_iters,
-            self.eps,
+            self.sinkhorn.sinkhorn_iters,
+            self.sinkhorn.eps,
             self.norm_eps,
             True,
         )
@@ -61,14 +61,14 @@ class AscHcPre(HcPre):
             self.hc_scale.float(),
             self.hc_base.float(),
             norm_eps=self.norm_eps,
-            hc_eps=self.eps,
+            hc_eps=self.sinkhorn.eps,
             out_flag=1,
             inner_precise=1,
         )
         h_res, _, _ = torch_npu.npu_mhc_sinkhorn(
             h_res,
-            eps=self.eps,
-            num_iters=self.sinkhorn_iters,
+            eps=self.sinkhorn.eps,
+            num_iters=self.sinkhorn.sinkhorn_iters,
             out_flag=1,
         )
         return h_in.to(dtype), h_post, h_res

@@ -721,7 +721,7 @@ def test_a_half_fused_teacher_pair_is_rejected_through_override_imports(imports)
     """The rejection fires on the override request, which is the stage that can see it."""
     from torchtitan.config.override import OverrideConfig
 
-    recipes = importlib.import_module("torchtitan_npu.models.deepseek_v4_1.config_registry")
+    recipes = importlib.import_module("torchtitan_npu_recipes.models.deepseek_v4_1")
     job = recipes.deepseek_v4_1_debugmodel_text()
     job.override = OverrideConfig(imports=imports)
     with pytest.raises(ValueError, match="must be enabled together"):
@@ -732,7 +732,7 @@ def test_both_ports_requested_pass_the_pair_gate():
     """Both requested is the shipped configuration, so the same stage lets it through."""
     from torchtitan.config.override import OverrideConfig
 
-    recipes = importlib.import_module("torchtitan_npu.models.deepseek_v4_1.config_registry")
+    recipes = importlib.import_module("torchtitan_npu_recipes.models.deepseek_v4_1")
     job = recipes.deepseek_v4_1_debugmodel_text()
     # The context length is part of a CP-capable config: torchtitan's rope budget is checked
     # inside update_from_config, alongside the gate this test is about.

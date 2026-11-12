@@ -1,5 +1,7 @@
 # Checkpoint 使用指南
 
+> **0.4.0 配置迁移说明：** 下文保留历史实现说明与字段 CLI 示例，不能直接作为当前启动命令。训练工厂已迁至 `torchtitan_npu_recipes`；当前启动方式见[快速上手](../user-guides/quickstart.md)，专用配置与 golden 应按 [Python 配置组合指南](../developer_guides/python_recipes.md)定义工厂。功能支持以 0.4.0 升级计划为准。
+
 本文说明如何使用 TorchTitan 的 checkpoint 机制保存、加载
 `torchtitan-npu` 训练状态，以及如何加载或保存 Hugging Face safetensors 权重。
 
@@ -17,8 +19,8 @@
 
 | 模块 | 配置入口 | checkpoint 默认值 |
 | --- | --- | --- |
-| `torchtitan_npu.models.deepseek_v4.config_registry` | `deepseek_v4_debugmodel`、`deepseek_v4_flash`、`deepseek_v4_pro` | `enable=False`，`interval=100` |
-| `torchtitan_npu.models.deepseek_v3_2.config_registry` | `deepseek_v3_2_debugmodel` | `enable=False`，`interval=10`，`last_save_model_only=False` |
+| `torchtitan_npu_recipes.models.deepseek_v4` | `deepseek_v4_debugmodel`、`deepseek_v4_flash`、`deepseek_v4_pro` | `enable=False`，`interval=100` |
+| `torchtitan_npu_recipes.models.deepseek_v3_2` | `deepseek_v3_2_debugmodel` | `enable=False`，`interval=10`，`last_save_model_only=False` |
 
 `enable=False` 时既不会保存 checkpoint，也不会执行 checkpoint 加载。训练命令需要显式
 传入 `--checkpoint.enable`，或在 Python 配置中设置 `checkpoint.enable = True`。
@@ -275,4 +277,4 @@ bash scripts/run_train.sh \
 - [快速上手](../user-guides/quickstart.md)
 - [安装指南](../user-guides/installation.md)
 - [训练启动脚本](../../scripts/run_train.sh)
-- [DeepSeek-V4 checkpoint 配置](../../torchtitan_npu/models/deepseek_v4/config_registry.py)
+- [DeepSeek-V4 checkpoint 配置](../../torchtitan_npu_recipes/models/deepseek_v4.py)

@@ -68,7 +68,7 @@ def test_from_hf_ignores_gate_bias_for_hash_layers(adapter, layer_id):
 @pytest.mark.parametrize("layer_id", range(N_HASH_LAYERS))
 def test_to_hf_omits_expert_bias_for_hash_layers(adapter, layer_id):
     local_state_dict = {
-        f"layers.{layer_id}.moe.expert_bias_E": torch.arange(
+        f"layers.{layer_id}.feed_forward.expert_bias_E": torch.arange(
             NUM_EXPERTS, dtype=torch.float32
         )
     }
@@ -83,9 +83,9 @@ def test_from_hf_keeps_gate_bias_for_non_hash_layer(adapter):
 
     restored = adapter.from_hf(hf_state_dict)
 
-    assert "layers.3.moe.expert_bias_E" in restored
+    assert "layers.3.feed_forward.expert_bias_E" in restored
     torch.testing.assert_close(
-        restored["layers.3.moe.expert_bias_E"],
+        restored["layers.3.feed_forward.expert_bias_E"],
         hf_state_dict["layers.3.ffn.gate.bias"],
         rtol=0,
         atol=0,
@@ -94,7 +94,7 @@ def test_from_hf_keeps_gate_bias_for_non_hash_layer(adapter):
 
 def test_to_hf_keeps_expert_bias_for_non_hash_layer(adapter):
     local_state_dict = {
-        "layers.3.moe.expert_bias_E": torch.arange(
+        "layers.3.feed_forward.expert_bias_E": torch.arange(
             NUM_EXPERTS, dtype=torch.float32
         )
     }
@@ -104,7 +104,7 @@ def test_to_hf_keeps_expert_bias_for_non_hash_layer(adapter):
     assert "layers.3.ffn.gate.bias" in hf_state_dict
     torch.testing.assert_close(
         hf_state_dict["layers.3.ffn.gate.bias"],
-        local_state_dict["layers.3.moe.expert_bias_E"],
+        local_state_dict["layers.3.feed_forward.expert_bias_E"],
         rtol=0,
         atol=0,
     )
@@ -117,9 +117,9 @@ def test_from_hf_keeps_gate_bias_for_mtp_layer(adapter):
 
     restored = adapter.from_hf(hf_state_dict)
 
-    assert "mtp_layers.0.moe.expert_bias_E" in restored
+    assert "mtp_layers.0.feed_forward.expert_bias_E" in restored
     torch.testing.assert_close(
-        restored["mtp_layers.0.moe.expert_bias_E"],
+        restored["mtp_layers.0.feed_forward.expert_bias_E"],
         hf_state_dict["mtp.0.ffn.gate.bias"],
         rtol=0,
         atol=0,
@@ -128,7 +128,7 @@ def test_from_hf_keeps_gate_bias_for_mtp_layer(adapter):
 
 def test_to_hf_keeps_expert_bias_for_mtp_layer(adapter):
     local_state_dict = {
-        "mtp_layers.0.moe.expert_bias_E": torch.arange(
+        "mtp_layers.0.feed_forward.expert_bias_E": torch.arange(
             NUM_EXPERTS, dtype=torch.float32
         )
     }
@@ -138,7 +138,7 @@ def test_to_hf_keeps_expert_bias_for_mtp_layer(adapter):
     assert "mtp.0.ffn.gate.bias" in hf_state_dict
     torch.testing.assert_close(
         hf_state_dict["mtp.0.ffn.gate.bias"],
-        local_state_dict["mtp_layers.0.moe.expert_bias_E"],
+        local_state_dict["mtp_layers.0.feed_forward.expert_bias_E"],
         rtol=0,
         atol=0,
     )

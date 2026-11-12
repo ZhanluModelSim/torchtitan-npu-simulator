@@ -8,7 +8,7 @@ import torch._dynamo.config
 import torch._inductor.config
 from torch.distributed.tensor import DTensor
 
-from torchtitan_npu.models.deepseek_v4.config_registry import graph_trainer_deepseek_v4_debugmodel
+from torchtitan_npu_recipes.graph_trainer.deepseek_v4 import graph_trainer_deepseek_v4_debugmodel
 
 
 def test_graph_trainer_parallelize_initializes_singleton_model_parallel_axes(tmp_path, monkeypatch, single_rank_spmd):
@@ -35,7 +35,7 @@ def test_graph_trainer_parallelize_initializes_singleton_model_parallel_axes(tmp
         training=config.training,
         parallelism=config.parallelism,
         compile_config=config.compile,
-        ac_config=config.activation_checkpoint,
+        ac_config=config.activation_remat,
         dump_folder=str(tmp_path),
     )
     projection = model.layers["0"].attention.wq_a

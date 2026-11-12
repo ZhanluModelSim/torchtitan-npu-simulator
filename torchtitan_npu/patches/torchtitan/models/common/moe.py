@@ -12,29 +12,11 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
-import torch.nn.functional as F
 import torch_remat as remat
 from torchtitan.distributed.spmd_types import maybe_set_sparse_mesh
-from torchtitan.models.common.activation import SwiGLU
 from torchtitan.models.common.moe import RoutedExperts
 
-
-class ClampedSwiGLU(SwiGLU):
-    """SwiGLU with the DeepSeek gate/up clamp before the activation."""
-
-    @dataclass(kw_only=True, slots=True)
-    class Config(SwiGLU.Config):
-        swiglu_limit: float = 0.0
-
-    def __init__(self, config: Config) -> None:
-        self.swiglu_limit = config.swiglu_limit
-
-    def __call__(self, gate: torch.Tensor, up: torch.Tensor, **kwargs: Any) -> torch.Tensor:
-        del kwargs
-        if self.swiglu_limit > 0:
-            gate = torch.clamp(gate, max=self.swiglu_limit)
-            up = torch.clamp(up, min=-self.swiglu_limit, max=self.swiglu_limit)
-        return F.silu(gate) * up
+from torchtitan_npu.models.common.activation import LimitedSwiGLU
 
 
 class _RouterScoreAbsorbingRoutedExperts(RoutedExperts):
@@ -50,28 +32,23 @@ class _RouterScoreAbsorbingRoutedExperts(RoutedExperts):
         topk_scores_TK: torch.Tensor,
         topk_expert_ids_TK: torch.Tensor,
         num_local_tokens_per_expert_E: torch.Tensor,
+        *,
+        padding_mask_T: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        del padding_mask_T
         routed_input_rd, tokens_per_expert_e, metadata = self.token_dispatcher.dispatch(
             x_TD, topk_scores_TK, topk_expert_ids_TK, num_local_tokens_per_expert_E
         )
         offsets_e = torch.cumsum(tokens_per_expert_e, dim=0, dtype=torch.int32)
         with maybe_set_sparse_mesh():
-            gate_up_r2f = remat.region(
-                self.w13,
-                self.remat_region_name("w13"),
-                recompute=self.remat_should_recompute("w13"),
-            )(routed_input_rd.bfloat16(), offsets_e)
+            remat.recompute_needs_tensor(routed_input_rd)
+            gate_up_r2f = self.w13(routed_input_rd.bfloat16(), offsets_e)
             remat.recompute_needs_tensor(gate_up_r2f)
-            gate_rf, up_rf = gate_up_r2f.unbind(dim=-2)
-            hidden_rf = self.activation_fn(gate_rf, up_rf, offsets=offsets_e)
+            hidden_rf = self.activation_fn(gate_up_r2f, offsets=offsets_e)
             routed_scores_r = getattr(metadata, "routed_scores_R", None)
             if routed_scores_r is not None:
                 hidden_rf = (hidden_rf.float() * routed_scores_r.float().reshape(-1, 1)).to(hidden_rf.dtype)
-            routed_output_rd = remat.region(
-                self.w2,
-                self.remat_region_name("w2"),
-                recompute=self.remat_should_recompute("w2"),
-            )(hidden_rf, offsets_e)
+            routed_output_rd = self.w2(hidden_rf, offsets_e)
             remat.recompute_needs_tensor(routed_output_rd)
             routed_output_rd = routed_output_rd.type_as(routed_input_rd)
             if self.output_postprocess is not None:
@@ -81,7 +58,7 @@ class _RouterScoreAbsorbingRoutedExperts(RoutedExperts):
 
 def _clamp_make_routed_experts_config(
     *,
-    swiglu_limit: float = 0.0,
+    swiglu_limit: float | None = None,
     absorb_router_scores: bool = True,
     **kwargs,
 ):
@@ -91,16 +68,16 @@ def _clamp_make_routed_experts_config(
         dispatcher = dataclasses.replace(dispatcher, absorb_router_scores=absorb_router_scores)
     elif absorb_router_scores:
         raise ValueError(f"Pre-W2 router scores are unsupported by dispatcher {type(dispatcher).__qualname__}")
-    return dataclasses.replace(
-        config,
-        activation_fn=ClampedSwiGLU.Config(swiglu_limit=swiglu_limit),
-        token_dispatcher=dispatcher,
-    )
+    if swiglu_limit is not None:
+        config = dataclasses.replace(config, activation_fn=LimitedSwiGLU.Config(swiglu_limit=swiglu_limit))
+    return dataclasses.replace(config, token_dispatcher=dispatcher)
 
 
-def _clamp_make_ffn_config(*, swiglu_limit: float = 0.0, **kwargs):
+def _clamp_make_ffn_config(*, swiglu_limit: float | None = None, **kwargs):
     config = _original_make_ffn_config(**kwargs)
-    return dataclasses.replace(config, activation_fn=ClampedSwiGLU.Config(swiglu_limit=swiglu_limit))
+    if swiglu_limit is None:
+        return config
+    return dataclasses.replace(config, activation_fn=LimitedSwiGLU.Config(swiglu_limit=swiglu_limit))
 
 
 _original_make_routed_experts_config: Callable[..., Any]
@@ -110,7 +87,9 @@ _original_make_ffn_config: Callable[..., Any]
 def apply() -> None:
     import torchtitan.models.common.config_utils
     import torchtitan.models.common.moe
+    import torchtitan.models.common.moe.moe
 
+    torchtitan.models.common.moe.moe.RoutedExperts = _RouterScoreAbsorbingRoutedExperts
     torchtitan.models.common.moe.RoutedExperts = _RouterScoreAbsorbingRoutedExperts
     torchtitan.models.common.config_utils.RoutedExperts = _RouterScoreAbsorbingRoutedExperts
     global _original_make_routed_experts_config, _original_make_ffn_config

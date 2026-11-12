@@ -15,26 +15,14 @@ from torchtitan_npu.models.common.deepseek_lora import (
     BatchedLinearLoRA as BatchedLinearLoRA,
 )
 from torchtitan_npu.models.common.deepseek_lora import (
-    BatchedLinearLoRAHandler as BatchedLinearLoRAHandler,
-)
-from torchtitan_npu.models.common.deepseek_lora import (
-    DeepSeekGroupedLinearLoRAHandler as DeepSeekGroupedLinearLoRAHandler,
-)
-from torchtitan_npu.models.common.deepseek_lora import (
-    DeepSeekLinearLoRAHandler as DeepSeekLinearLoRAHandler,
-)
-from torchtitan_npu.models.common.deepseek_lora import (
     DeepSeekLoRATransform as DeepSeekLoRATransform,
-)
-from torchtitan_npu.models.common.deepseek_lora import (
-    DeepSeekPEFTAdapter as DeepSeekPEFTAdapter,
 )
 from torchtitan_npu.models.common.deepseek_lora import (
     deepseek_v4_lora_transform as deepseek_v4_lora_transform,
 )
-from torchtitan_npu.models.common.deepseek_lora import (
-    is_lora_parameter as is_lora_parameter,
-)
+
+from .peft_adapter import DeepSeekPEFTAdapter as DeepSeekPEFTAdapter
+from .peft_adapter import is_lora_parameter as is_lora_parameter
 
 MODULE_PATHS = (
     ("lm_head", "lm_head", "head"),

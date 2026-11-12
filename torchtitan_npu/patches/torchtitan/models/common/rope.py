@@ -106,6 +106,18 @@ def _complex_apply_rotary_emb(
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Apply complex RoPE using adjacent-dim pairs; rotate query only when
     ``key`` is ``None``, and conjugate the cache for ``inverse``."""
+    if torch.compiler.is_compiling():
+        # Inductor cannot compile a complex multiply; rotate in real arithmetic.
+        # ``_reshape_cache`` hands over the real view under compile.
+        cache = torch.view_as_real(rope_cache) if rope_cache.is_complex() else rope_cache.unflatten(-1, (-1, 2))
+        cos, sin = cache[..., 0], cache[..., 1]
+        if inverse:
+            sin = -sin
+        rotate = torchtitan.models.common.rope._RotatePairs.apply
+        query_out = rotate(query, cos, sin)
+        if key is None:
+            return query_out
+        return query_out, rotate(key, cos, sin)
     if inverse:
         rope_cache = rope_cache.conj()
     xq_ = torch.view_as_complex(query.float().reshape(*query.shape[:-1], query.shape[-1] // 2, 2))

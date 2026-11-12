@@ -27,15 +27,15 @@ from torchtitan_npu.override.deepseek_v4.moe_router import TilelangRouter, Tilel
 def test_tilelang_override_selects_only_its_router_config(router_type, factory, target_type):
     model = model_registry("deepseek_v4_1_debugmodel_text")
     layer = model.layers[0]
-    original = layer.moe.router
+    original = layer.feed_forward.router
     if router_type is DeepSeekV4Router.Config:
-        layer.moe.router = derive(original, router_type, vocab_size=8, layer_id=0, n_hash_layers=1)
+        layer.feed_forward.router = derive(original, router_type, vocab_size=8, layer_id=0, n_hash_layers=1)
     else:
-        layer.moe.router = derive(original, router_type)
-    untouched = model.layers[1].moe.router
+        layer.feed_forward.router = derive(original, router_type)
+    untouched = model.layers[1].feed_forward.router
 
     apply_overrides(OverrideConfig(imports=[f"torchtitan_npu.override.deepseek_v4.moe_router.{factory}"]), model)
 
-    assert type(layer.moe.router) is target_type
+    assert type(layer.feed_forward.router) is target_type
     if router_type is not DeepSeekV41Router.Config:
-        assert model.layers[1].moe.router is untouched
+        assert model.layers[1].feed_forward.router is untouched

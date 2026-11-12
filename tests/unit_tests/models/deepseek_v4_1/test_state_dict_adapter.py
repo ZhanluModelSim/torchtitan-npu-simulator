@@ -81,7 +81,7 @@ def test_layer_weights_round_trip_for_text_and_multimodal(flavor):
         local["layers.3.attention.wq_a.weight"], hf_weights["layers.3.attn.wq_a.weight"], rtol=0, atol=0
     )
     torch.testing.assert_close(
-        local["layers.3.moe.router.gate.weight"], hf_weights["layers.3.ffn.gate.weight"], rtol=0, atol=0
+        local["layers.3.feed_forward.router.gate.weight"], hf_weights["layers.3.ffn.gate.weight"], rtol=0, atol=0
     )
     restored = adapter.to_hf(local)
     assert restored.keys() == hf_weights.keys()
@@ -112,10 +112,10 @@ class TestVisionAdapterOwnership:
         assert DeepSeekV41VisionStateDictAdapter.owns_local_key("vision_encoder.aligner.w1.weight")
         assert DeepSeekV41VisionStateDictAdapter.owns_local_key("image_marker_embeddings.image_start")
         assert DeepSeekV41VisionStateDictAdapter.owns_local_key("image_marker_embeddings.image_end")
-        assert DeepSeekV41VisionStateDictAdapter.owns_local_key("layers.3.moe.router.bias_vl")
+        assert DeepSeekV41VisionStateDictAdapter.owns_local_key("layers.3.feed_forward.router.bias_vl")
         assert not DeepSeekV41VisionStateDictAdapter.owns_local_key("embed.weight")
         assert not DeepSeekV41VisionStateDictAdapter.owns_local_key("layers.0.attention.wq_a.weight")
-        assert not DeepSeekV41VisionStateDictAdapter.owns_local_key("layers.0.moe.router.gate.weight")
+        assert not DeepSeekV41VisionStateDictAdapter.owns_local_key("layers.0.feed_forward.router.gate.weight")
 
     @staticmethod
     def test_vision_adapter_round_trip():
@@ -346,7 +346,7 @@ class TestTextFlavorAdapter:
             "norm.weight": torch.randn(32),
         }
         local = adapter.from_hf(hf_in)
-        assert "layers.3.moe.router.bias_vl" not in local
+        assert "layers.3.feed_forward.router.bias_vl" not in local
         hf_out = adapter.to_hf(local)
         assert set(hf_out) == set(hf_in)
 

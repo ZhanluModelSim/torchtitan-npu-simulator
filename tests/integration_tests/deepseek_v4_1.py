@@ -68,7 +68,8 @@ def build_deepseek_v4_1_test_list() -> list[OverrideDefinitions]:
                 "--parallelism.tensor-parallel-degree=1",
                 "--parallelism.context-parallel-degree=1",
                 "--parallelism.pipeline-parallel-degree=1",
-                "--debug.no-moe-force-load-balance",
+                "--parallelism.context-parallel-load-balancer=None",
+                "--parallelism.spmd-backend=partial_dtensor",
                 "--debug.seed=42",
                 "--debug.deterministic",
                 "--optim.optimizer.name=AdamW",
@@ -171,7 +172,7 @@ GOLDEN_OVERRIDES = (
 # tests/assets/deepseek_v3 mini tokenizer, the same one the DeepSeek-V4 golden
 # cases use.
 GOLDEN_ENV = {
-    "MODULE": "torchtitan_npu.models.deepseek_v4_1",
+    "MODULE": "torchtitan_npu_recipes.models.deepseek_v4_1",
     "CONFIG": "deepseek_v4_1_debugmodel_text",
 }
 
@@ -193,8 +194,8 @@ def build_deepseek_v4_1_golden_test_list() -> list[OverrideDefinitions]:
                     "--parallelism.tensor-parallel-degree=1",
                     "--parallelism.context-parallel-degree=1",
                     "--parallelism.pipeline-parallel-degree=1",
-                    "--debug.no-moe-force-load-balance",
-                    "--hf-assets-path=tests/assets/deepseek_v3",
+                    "--parallelism.context-parallel-load-balancer=None",
+                        "--hf-assets-path=tests/assets/deepseek_v3",
                     # The LR recipe (warmup 25 / total 40) is part of the frozen
                     # anchor: the trajectory is produced with the 40-step
                     # baseline schedule. Keep it unchanged when shortening the
@@ -253,7 +254,7 @@ def build_deepseek_v4_1_fused_test_list() -> list[OverrideDefinitions]:
             test_name="dsv41_multimodal_muon_2p",
             ngpu=ngpu,
             env_vars={
-                "MODULE": "torchtitan_npu.models.deepseek_v4_1",
+                "MODULE": "torchtitan_npu_recipes.models.deepseek_v4_1",
                 "CONFIG": "deepseek_v4_1_debugmodel_multimodal",
                 "DATASET": "cc12m-test",
                 "DATASET_PATH": "tests/assets/cc12m_test",
@@ -278,14 +279,20 @@ def build_deepseek_v4_1_reference_multimodal_test_list() -> list[OverrideDefinit
         "--parallelism.data-parallel-shard-degree=2", "--parallelism.expert-parallel-degree=2",
         "--parallelism.data-parallel-replicate-degree=1", "--parallelism.tensor-parallel-degree=1",
         "--parallelism.context-parallel-degree=1", "--parallelism.pipeline-parallel-degree=1",
-        "--debug.no-moe-force-load-balance", "--debug.seed=42", "--debug.deterministic",
-        "--optim.optimizer.name=AdamW",
+        "--parallelism.context-parallel-load-balancer=None", "--parallelism.spmd-backend=partial_dtensor",
+        "--debug.seed=42", "--debug.deterministic",
+        "--optimizer.name=AdamW", "--compile.no-enable", "--checkpoint.no-enable",
     )
     cpt = OverrideDefinitions(
         test_name="dsv41_multimodal_cpt_reference_ep2_fsdp2",
         test_descr="V4.1 CPT reference attention with Host Engram, FullAC and virtual AdamW",
-        env_vars={"MODULE": "torchtitan_npu.models.deepseek_v4_1", "CONFIG": "deepseek_v4_1_debugmodel_multimodal",
-                  "DATASET": "cc12m-test", "DATASET_PATH": "tests/assets/cc12m_test", "PACKING_BUFFER_SIZE": "4"},
+        env_vars={
+            "MODULE": "torchtitan_npu_recipes.models.deepseek_v4_1",
+            "CONFIG": "deepseek_v4_1_debugmodel_multimodal",
+            "DATASET": "cc12m-test",
+            "DATASET_PATH": "tests/assets/cc12m_test",
+            "PACKING_BUFFER_SIZE": "4",
+        },
         override_args=[args], expected_steps=((1, 2, 3),), ngpu=2,
         use_golden=True, check_loss=False, timeout=1800,
     )

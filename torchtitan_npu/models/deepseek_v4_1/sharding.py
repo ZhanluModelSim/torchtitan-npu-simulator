@@ -13,19 +13,24 @@ bias).
 
 import spmd_types as spmd
 from torchtitan.distributed.parallelism_context import MeshAxisName
+from torchtitan.models.base.sharding import ShardingConfig
 from torchtitan.models.common.decoder_sharding import (
-    colwise_config,
+    colwise_sharding_config as colwise_config,
+)
+from torchtitan.models.common.decoder_sharding import (
     dense_activation_placement,
     dense_param_placement,
     dense_sequence_parallel_placement,
-    norm_config,
-    rowwise_config,
-    set_decoder_sharding_config,
 )
-from torchtitan.models.common.moe_sharding import expert_param_placement_sparse
-from torchtitan.protocols.sharding import ShardingConfig
+from torchtitan.models.common.decoder_sharding import (
+    norm_sharding_config as norm_config,
+)
+from torchtitan.models.common.decoder_sharding import (
+    rowwise_sharding_config as rowwise_config,
+)
+from torchtitan.models.common.moe.sharding import expert_param_placement_sparse
 
-from torchtitan_npu.models.common.sharding import set_moe_sharding_config
+from torchtitan_npu.models.common.sharding import set_decoder_sharding_config, set_moe_sharding_config
 
 DP, CP, TP = MeshAxisName.DP, MeshAxisName.CP, MeshAxisName.TP
 
@@ -246,27 +251,27 @@ def set_v41_layer_sharding(layer_cfg, *, enable_sp: bool, enable_ep: bool) -> No
     set_v41_attention_sharding(layer_cfg.attention, enable_sp=enable_sp)
 
     set_moe_sharding_config(
-        layer_cfg.moe,
+        layer_cfg.feed_forward,
         enable_ep=enable_ep,
         enable_sp=enable_sp,
     )
-    moe_sharding = layer_cfg.moe.sharding_config
+    moe_sharding = layer_cfg.feed_forward.sharding_config
     assert moe_sharding is not None
     if moe_sharding.in_dst_shardings is None:
         moe_sharding.in_dst_shardings = dict(moe_sharding.in_src_shardings or {})
 
-    if getattr(layer_cfg.moe.router, "vision_enabled", False):
-        router_sharding = layer_cfg.moe.router.sharding_config or ShardingConfig()
+    if getattr(layer_cfg.feed_forward.router, "vision_enabled", False):
+        router_sharding = layer_cfg.feed_forward.router.sharding_config or ShardingConfig()
         router_sharding.state_shardings["bias_vl"] = _dense_param_rep
-        layer_cfg.moe.router.sharding_config = router_sharding
+        layer_cfg.feed_forward.router.sharding_config = router_sharding
         image_mask_src_placement = dense_activation_placement(tp=spmd.R, cp=spmd.S(0))
         image_mask_dst_placement = (
             dense_token_ids_sequence_parallel_placement() if enable_ep else image_mask_src_placement
         )
-        layer_cfg.moe.sharding_config.in_src_shardings[  # pyrefly: ignore [missing-attribute]
+        layer_cfg.feed_forward.sharding_config.in_src_shardings[  # pyrefly: ignore [missing-attribute]
             "image_mask"
         ] = image_mask_src_placement
-        layer_cfg.moe.sharding_config.in_dst_shardings[  # pyrefly: ignore [missing-attribute]
+        layer_cfg.feed_forward.sharding_config.in_dst_shardings[  # pyrefly: ignore [missing-attribute]
             "image_mask"
         ] = image_mask_dst_placement
 

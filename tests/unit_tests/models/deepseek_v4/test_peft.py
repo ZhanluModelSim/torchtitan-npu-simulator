@@ -396,8 +396,8 @@ def test_hf_base_load_limits_expert_reassembly_to_one_layer(monkeypatch):
             "tok_embeddings.weight",
             "layers.0.attention.wq_a.weight",
             "pre_lora_cache.weight",
-            "layers.0.moe.routed_experts.inner_experts.w1_EFD",
-            "layers.1.moe.routed_experts.inner_experts.w1_EFD",
+            "layers.0.feed_forward.routed_experts.inner_experts.w1_EFD",
+            "layers.1.feed_forward.routed_experts.inner_experts.w1_EFD",
             "mtp_layers.0.attention.wq_a.weight",
             "layers.0.attention.wq_a.lora_a.weight",
         )
@@ -465,9 +465,9 @@ def test_adapter_state_selection_keeps_trainable_state_and_routing_buffers():
             "pre_lora_cache.weight",
             "lora_a",
             "layers.0.w13_lora_a",
-            "layers.0.moe.routed_experts.w13.lora_a.weight",
-            "layers.0.moe.routed_experts.w13.lora_b.weight",
-            "layers.0.moe.shared_experts.w2.lora_b.weight",
+            "layers.0.feed_forward.routed_experts.w13.lora_a.weight",
+            "layers.0.feed_forward.routed_experts.w13.lora_b.weight",
+            "layers.0.feed_forward.shared_experts.w2.lora_b.weight",
             "expert_bias_E",
             "optimizer",
             "unfrozen",
@@ -481,9 +481,9 @@ def test_adapter_state_selection_keeps_trainable_state_and_routing_buffers():
     )
     assert set(selected) == {
         "lora_a",
-        "layers.0.moe.routed_experts.w13.lora_a.weight",
-        "layers.0.moe.routed_experts.w13.lora_b.weight",
-        "layers.0.moe.shared_experts.w2.lora_b.weight",
+        "layers.0.feed_forward.routed_experts.w13.lora_a.weight",
+        "layers.0.feed_forward.routed_experts.w13.lora_b.weight",
+        "layers.0.feed_forward.shared_experts.w2.lora_b.weight",
         "expert_bias_E",
         "optimizer",
         "unfrozen",
@@ -492,7 +492,10 @@ def test_adapter_state_selection_keeps_trainable_state_and_routing_buffers():
 
 def test_resume_rejects_legacy_interleaved_expert_optimizer(tmp_path):
     checkpoint = tmp_path / "legacy"
-    dcp.save({"layers.0.moe.routed_experts.inner_experts.w13_lora_b": torch.ones(2, 3, 2, 2)}, checkpoint_id=checkpoint)
+    dcp.save(
+        {"layers.0.feed_forward.routed_experts.inner_experts.w13_lora_b": torch.ones(2, 3, 2, 2)},
+        checkpoint_id=checkpoint,
+    )
     manager = object.__new__(peft.DeepSeekV4PEFTCheckpointManager)
     manager.initial_load_path = None
 

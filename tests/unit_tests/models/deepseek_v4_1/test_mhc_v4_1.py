@@ -144,13 +144,28 @@ def test_hcpre_outputs_and_gradients_match_per_token_reference(tokens, branches)
         torch.testing.assert_close(value, reference.float(), rtol=3e-5, atol=3e-6)
 
 
-def test_hcpost_input_gradients_match_explicit_branch_sum():
+@pytest.mark.parametrize(
+    "shapes",
+    (
+        ((5, 3), (5, 4, 3), (5, 4), (5, 4, 4)),
+        ((2, 3, 3), (2, 3, 4, 3), (2, 3, 4), (2, 3, 4, 4)),
+        ((3,), (4, 3), (4,), (4, 4)),
+        ((2, 1, 3), (2, 3, 4, 3), (1, 3, 4), (4, 4)),
+    ),
+    ids=("folded", "batched", "single-token", "broadcast-coefficients"),
+)
+@pytest.mark.parametrize("strided", (False, True), ids=("contiguous", "strided"))
+def test_hcpost_input_gradients_match_explicit_branch_sum(shapes, strided):
     generator = torch.Generator().manual_seed(52)
-    inputs = [
-        torch.randn(shape, generator=generator, requires_grad=True) for shape in ((5, 3), (5, 4, 3), (5, 4), (5, 4, 4))
-    ]
+    inputs = []
+    for shape in shapes:
+        storage_shape = (*shape[:-1], shape[-1] * 2) if strided else shape
+        value = torch.randn(storage_shape, generator=generator)
+        if strided:
+            value = value[..., ::2]
+        inputs.append(value.requires_grad_())
     reference_inputs = [value.detach().double().requires_grad_() for value in inputs]
-    upstream = torch.randn(5, 4, 3, generator=generator)
+    upstream = torch.randn(shapes[1], generator=generator)
 
     actual = _hc_post()(y=inputs[0], residual=inputs[1], post=inputs[2], comb=inputs[3])
     expected = hc_post_reference(*reference_inputs)

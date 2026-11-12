@@ -1,5 +1,7 @@
 # DeepSeek-V4 Muon 优化器
 
+> **0.4.0 配置迁移说明：** 下文保留历史实现说明与字段 CLI 示例，不能直接作为当前启动命令。训练工厂已迁至 `torchtitan_npu_recipes`；当前启动方式见[快速上手](../user-guides/quickstart.md)，专用配置与 golden 应按 [Python 配置组合指南](../developer_guides/python_recipes.md)定义工厂。功能支持以 0.4.0 升级计划为准。
+
 本文说明当前实现中的 Muon 方案、使用方法和能力边界。实现以 TorchTitan 上游
 `DistMuon`/FlexShard 为核心；上游的 `ComputeLayout`、`Owned`、`BlockShard`、bucket
 和 storage-to-compute 语义参见 [TorchTitan FlexShard README](https://github.com/pytorch/torchtitan/blob/main/torchtitan/distributed/flex_shard/README.md)。
@@ -7,7 +9,7 @@
 ## 当前方案
 
 DSV4 使用混合优化器容器：匹配 Muon 规则的二维矩阵参数交给 `DistMuon`，其余参数交给
-AdamW。`torchtitan_npu/models/deepseek_v4/config_registry.py` 中的
+AdamW。`torchtitan_npu/models/deepseek_v4/muon.py` 中的
 `_dsv4_optimizer_config()` 提供常规 DSV4 optimizer schema；
 `_dsv4_muon_profile()` 提供参数匹配、FlexShard compute layout 和 bucket 元数据。
 `--optimizer.name Muon` 才 materialize 出 DistMuon 与 AdamW fallback 两组。
@@ -36,7 +38,7 @@ Muon 与 AdamW fallback 当前共用 `--optimizer.lr`，没有独立 `muon_lr` �
 8 卡的直接启动命令；swap override 也是显式列出，而非 recipe 隐式启用：
 
 ```bash
-MODULE=torchtitan_npu.models.deepseek_v4 \
+MODULE=torchtitan_npu_recipes.models.deepseek_v4 \
 CONFIG=deepseek_v4_flash_43layers_16experts \
 NGPU=8 \
 bash scripts/run_train.sh \
@@ -61,7 +63,6 @@ bash scripts/run_train.sh \
   --optimizer.muon_enable_nesterov \
   --optimizer.muon_ns_steps 10 \
   --optimizer.muon_adjust_lr_fn match_rms_adamw \
-  --debug.no-moe-force-load-balance \
   --checkpoint.no-enable \
   --override.imports \
     torchtitan_npu.override.common.rms_norm.asc \
@@ -131,14 +132,12 @@ FlexShard bucket 调度：
 `unredistributed_items` 不进入 storage-to-compute A2A。它们在 caller stream 上执行
 `_prepare_local()`、Muon 计算和参数更新，随后沿现有单 tensor 路径提交 D2H。
 
-
 AdamW 的 `exp_avg`、`exp_avg_sq`（AMSGrad 时还包括 `max_exp_avg_sq`）按 bucket 拼成连续
 flat state。每个 bucket 执行 H2D、`WAIT_DEVICE`、上游 AdamW 更新和 D2H，并在当前 bucket
 更新前提交下一个 bucket 的 H2D。
 
 开启 swap 之后，checkpoint 的存储和加载支持同步模式和基于 CPU snapshot 的异步模式 `async`，暂不支持
 `async_with_pinned_mem`。
-
 
 ## 能力边界
 

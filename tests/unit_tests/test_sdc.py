@@ -18,7 +18,7 @@ from torchtitan.training_engine import TrainingEngine
 from torchtitan_npu.config.configs import CompileConfig, ModelCompileConfig
 from torchtitan_npu.extensions.compile import sdc_checksum
 from torchtitan_npu.extensions.components.sdc.sdc import SDC
-from torchtitan_npu.extensions.torchtitan.trainer import NPUTrainingEngine, TrainerEx
+from torchtitan_npu.extensions.torchtitan.trainer import TrainingEngineEx, TrainerEx
 
 
 class TorchNpuCheckerFake:
@@ -404,7 +404,7 @@ def _patch_trainer_sdc_flow(monkeypatch) -> tuple[list[object], TrainerEx.Config
 
     def base_init(trainer: TrainerEx, received_config: object) -> None:
         events.append(("base-init", received_config))
-        trainer.engine = object.__new__(NPUTrainingEngine)
+        trainer.engine = object.__new__(TrainingEngineEx)
         trainer.engine.model_parts = ["model"]
         trainer.gradient_accumulation_steps = 2
         events.append("base-model-setup")
@@ -455,7 +455,7 @@ def test_trainer_failed_backward_does_not_advance_gradient_accumulation(monkeypa
     model.register_parameter("weight", torch.nn.Parameter(torch.ones(2, 2)))
     model.weight.grad = torch.ones_like(model.weight)
     sdc = _build_gradient_sdc([model], accumulation_steps=2)
-    engine = object.__new__(NPUTrainingEngine)
+    engine = object.__new__(TrainingEngineEx)
     engine._sdc = sdc
     engine.anticipatory_schedule = None
     outcomes = iter(["ok", "failure", "ok"])

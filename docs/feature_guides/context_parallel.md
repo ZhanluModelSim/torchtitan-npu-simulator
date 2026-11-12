@@ -1,5 +1,7 @@
 # DeepSeek-V4 系列上下文并行（CP）
 
+> **0.4.0 配置迁移说明：** 下文保留历史实现说明与字段 CLI 示例，不能直接作为当前启动命令。训练工厂已迁至 `torchtitan_npu_recipes`；当前启动方式见[快速上手](../user-guides/quickstart.md)，专用配置与 golden 应按 [Python 配置组合指南](../developer_guides/python_recipes.md)定义工厂。功能支持以 0.4.0 升级计划为准。
+
 DeepSeek-V4（DSV4）与 DeepSeek-V4.1（DSV4.1）共用同一套上下文并行语义：**查询按文档内部分成
 `cp` 份，KV 与压缩 KV 保持整行**。融合内核在边界处把本地 slab 声明式 all-gather 成整行，再用
 frame 的 `seqused = reach` 把可见范围限制在本 rank 的 chunk 之前。两栈共用
@@ -108,7 +110,7 @@ entry 的 `prepare_cp_metadata` 用 rank-local chunk 重建这三个 frame 以�
 
 ```bash
 # DeepSeek-V4.1，两个 rank；先设置 HF_ASSETS_PATH 指向 tokenizer。
-MODULE=torchtitan_npu.models.deepseek_v4_1 CONFIG=deepseek_v4_1_stripped NGPU=2 \
+MODULE=torchtitan_npu_recipes.models.deepseek_v4_1 CONFIG=deepseek_v4_1_stripped NGPU=2 \
   bash scripts/run_train.sh \
   --hf-assets-path "$HF_ASSETS_PATH" \
   --training.max-context-length 512 \

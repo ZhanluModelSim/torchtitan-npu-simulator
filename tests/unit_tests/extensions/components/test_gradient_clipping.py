@@ -80,3 +80,45 @@ def test_nonfinite_loss_does_not_commit_optimizer_update():
         optim.step(torch.tensor(float("nan")), current_step=1)
 
     torch.testing.assert_close(model.weight, before)
+
+
+def test_optimizer_clipper_combines_only_its_pending_sparse_gradients():
+    class SparseTable(torch.nn.Module):
+        uses_host_offload = True
+        layer_id = 0
+        lookup_mesh = None
+
+        def __init__(self, value):
+            super().__init__()
+            self.gradient = torch.sparse_coo_tensor([[0]], [[value]], (1, 1)).coalesce()
+            self.reductions = 0
+
+        def pending_sparse_grad(self):
+            return self.gradient
+
+        def reduce_sparse_gradient_across_replicas(self):
+            self.reductions += 1
+
+        def scale_pending_sparse_grad(self, scale):
+            self.gradient._values().mul_(scale)
+
+    model = torch.nn.Linear(1, 1, bias=False)
+    model.table = SparseTable(4.0)
+    other_table = SparseTable(12.0)
+    config = OptimConfig(
+        optimizer=HostSparseOptimizersContainer.Config(optimizers=[AdamW.Config(pattern=".*", lr=0.1, fused=False)]),
+        max_norm=1.0,
+    )
+    optim = config.build(
+        model_parts=[model], parallelism_context=_parallelism_context(), training_steps=10, pp_has_last_stage=True
+    )
+    model.weight.grad = torch.tensor([[3.0]])
+
+    norm = optim.gradient_clipper.clip_grad_norm_(optim.parameters, 1.0, parallelism_context=optim.parallelism_context)
+
+    torch.testing.assert_close(norm, torch.tensor(5.0))
+    torch.testing.assert_close(model.weight.grad, torch.tensor([[0.6]]), rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(model.table.gradient.values(), torch.tensor([[0.8]]), rtol=1e-5, atol=1e-6)
+    assert model.table.reductions == 1
+    assert other_table.reductions == 0
+    torch.testing.assert_close(other_table.gradient.values(), torch.tensor([[12.0]]))

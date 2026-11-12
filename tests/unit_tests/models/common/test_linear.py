@@ -12,7 +12,7 @@ from torchtitan_npu.models.common.linear import SharedLinear
 @pytest.mark.parametrize("compiled", [False, True], ids=["eager", "aot_eager"])
 def test_shared_linear_detaches_weights_and_restores_mode(compiled):
     with torch.random.fork_rng():
-        head = SharedLinear.Config(in_features=4, out_features=3, bias=True).build()
+        head = SharedLinear.Config(in_features=4, out_features=3, bias=True, inplace_wgrad_accum=False).build()
         projection = torch.compile(head, backend="aot_eager", fullgraph=True) if compiled else head
         inputs = torch.arange(8, dtype=torch.float32).reshape(2, 4).requires_grad_()
         expected = torch.nn.functional.linear(inputs, head.weight, head.bias).detach()
@@ -30,7 +30,7 @@ def test_shared_linear_detaches_weights_and_restores_mode(compiled):
 
 def test_shared_linear_restores_nested_mode_after_exception():
     with torch.random.fork_rng():
-        head = SharedLinear.Config(in_features=4, out_features=3).build()
+        head = SharedLinear.Config(in_features=4, out_features=3, inplace_wgrad_accum=False).build()
         with pytest.raises(RuntimeError, match="abort"), head.detached_weight():
             with head.detached_weight():
                 pass

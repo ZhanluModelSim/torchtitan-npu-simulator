@@ -1,5 +1,7 @@
 # Virtual Optimizer - 优化器显存虚拟化特性
 
+> **0.4.0 配置迁移说明：** 下文保留历史实现说明与字段 CLI 示例，不能直接作为当前启动命令。训练工厂已迁至 `torchtitan_npu_recipes`；当前启动方式见[快速上手](../user-guides/quickstart.md)，专用配置与 golden 应按 [Python 配置组合指南](../developer_guides/python_recipes.md)定义工厂。功能支持以 0.4.0 升级计划为准。
+
 ## 背景与挑战
 
 在大规模分布式训练中，模型参数、梯度和优化器状态都会占用大量 NPU 显存。对于 Adam/AdamW，`exp_avg` 和 `exp_avg_sq` 两组 moments 通常与模型参数规模相当，并且在前向和反向计算期间仍会长期驻留在显存中。
@@ -57,7 +59,7 @@ Virtual Optimizer 与 `torchtitan_npu.override.common.optimizer.swap_optimizer` 
 
 ```bash
 python -m torchtitan_npu.train \
-  --module torchtitan_npu.models.deepseek_v4 \
+  --module torchtitan_npu_recipes.models.deepseek_v4 \
   --config deepseek_v4_debugmodel \
   --override.imports torchtitan_npu.override.common.optimizer.virtual \
   --checkpoint.enable \

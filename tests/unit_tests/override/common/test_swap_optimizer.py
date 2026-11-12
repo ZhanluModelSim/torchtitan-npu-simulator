@@ -1347,7 +1347,7 @@ def test_hostsparse_schema_keeps_sparse_lifecycle_under_npu_state(monkeypatch) -
     monkeypatch.setattr(trainer_module.Trainer, "__init__", capture_runtime)
 
     optimizer_config = HostSparseOptimizersContainer.Config(_cpu_offload=True)
-    from torchtitan_npu.models.deepseek_v4_1.config_registry import deepseek_v4_1_debugmodel_text
+    from torchtitan_npu_recipes.models.deepseek_v4_1 import deepseek_v4_1_debugmodel_text
 
     config = deepseek_v4_1_debugmodel_text()
     config.training.enable_cpu_offload = True

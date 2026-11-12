@@ -21,11 +21,11 @@ from torchtitan_npu.extensions.torchtitan.experiments.torchft.ft_manager import 
 from torchtitan_npu.extensions.torchtitan.experiments.torchft.manager import ManagerEx
 from torchtitan_npu.extensions.torchtitan.experiments.torchft.optimizer import TorchFTOptimizersContainerEx
 from torchtitan_npu.extensions.torchtitan.experiments.torchft.recovery.step_recovery import StepRecovery
-from torchtitan_npu.extensions.torchtitan.trainer import NPUTrainingEngineMixin, TrainerEx
+from torchtitan_npu.extensions.torchtitan.trainer import TrainerEx, TrainingEngineEx
 from torchtitan_npu.models.deepseek_v4.model import DeepSeekV4Model
 
 
-class FaultTolerantTrainingEngineEx(NPUTrainingEngineMixin, FaultTolerantTrainingEngine):
+class FaultTolerantTrainingEngineEx(TrainingEngineEx, FaultTolerantTrainingEngine):
     """TorchFT training engine with the NPU microbatch lifecycle hooks."""
 
     def __init__(self, config, *, model_config, max_num_documents, output_dir):
@@ -127,22 +127,28 @@ class FaultTolerantTrainerEx(TrainerEx, FaultTolerantTrainer):
         should_log = self.metrics_processor.should_log(current_step)
 
         microbatch_groups = []
-        local_valid_tokens = torch.tensor(0, dtype=torch.int64)
+        local_loss_tokens = torch.tensor(0, dtype=torch.int64)
+        local_routing_tokens = torch.tensor(0, dtype=torch.int64)
         for _ in range(self.gradient_accumulation_steps):
             microbatches = []
             for _ in range(self.num_pp_microbatches):
                 microbatch = next(data_iterator)
-                local_valid_tokens += microbatch.num_valid_tokens
+                local_loss_tokens += microbatch.loss_token_counts.sum()
+                local_routing_tokens += microbatch.routing_token_counts.sum()
                 microbatches.append(microbatch)
             microbatch_groups.append(microbatches)
 
-        global_valid_tokens = local_valid_tokens.to(engine.device)
+        global_loss_token_counts = local_loss_tokens.to(engine.device)
+        global_routing_token_counts = local_routing_tokens.to(engine.device)
         if parallelism_context.dp_enabled:
-            global_valid_tokens = dist_utils.dist_sum_tensor(global_valid_tokens, parallelism_context.get_mesh("dp"))
+            dp_mesh = parallelism_context.get_mesh("dp")
+            global_loss_token_counts = dist_utils.dist_sum_tensor(global_loss_token_counts, dp_mesh)
+            global_routing_token_counts = dist_utils.dist_sum_tensor(global_routing_token_counts, dp_mesh)
 
         forward_backward_result = engine.forward_backward(
             microbatch_groups=microbatch_groups,
-            global_valid_tokens=global_valid_tokens,
+            global_loss_token_counts=global_loss_token_counts,
+            global_routing_token_counts=global_routing_token_counts,
         )
 
         if not should_log:
@@ -156,7 +162,7 @@ class FaultTolerantTrainerEx(TrainerEx, FaultTolerantTrainer):
             ft_pg = engine.ft_manager.loss_sync_pg
             assert ft_pg is not None, "Synchronous TorchFT requires a loss process group"
             loss_mesh = parallelism_context.get_optional_mesh("loss")
-            local_avg_loss = accumulated_loss * global_valid_tokens / local_valid_tokens
+            local_avg_loss = accumulated_loss * global_loss_token_counts / local_loss_tokens
             global_avg_loss = dist_utils.dist_sum(accumulated_loss, loss_mesh, ft_pg) / ft_pg.size()
             global_max_loss = dist_utils.dist_max(local_avg_loss, loss_mesh, ft_pg)
             global_ntokens_seen = dist_utils.dist_sum(

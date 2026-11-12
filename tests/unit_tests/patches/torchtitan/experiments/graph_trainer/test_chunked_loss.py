@@ -18,7 +18,7 @@ from torchtitan.experiments.graph_trainer.common_utils import accumulate_param_g
 from torchtitan.experiments.graph_trainer.make_fx_tracer import minimal_fx_tracer, run_traced
 from torchtitan.experiments.graph_trainer.simple_fsdp import data_parallel
 
-from torchtitan_npu.models.deepseek_v4.config_registry import graph_trainer_deepseek_v4_flash_43layers_16experts
+from torchtitan_npu_recipes.graph_trainer.deepseek_v4 import graph_trainer_deepseek_v4_flash_43layers_16experts
 
 pytestmark = pytest.mark.cpu
 

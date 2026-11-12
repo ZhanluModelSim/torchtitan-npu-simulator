@@ -16,7 +16,7 @@ from torchtitan_npu.config.converters import TrainerConfigConverter
 from torchtitan_npu.extensions.torchtitan.components.checkpoint import CheckpointManager
 
 from ...tools.profiler import CANNProfiler
-from ...trainer import NPUTrainingEngineMixin, TrainerEx
+from ...trainer import TrainerEx, TrainingEngineEx
 from . import auto_overlap
 
 
@@ -30,7 +30,7 @@ def _apply_auto_overlap_runtime_context_patch(config) -> None:
     graph_trainer_runtime_context.apply()
 
 
-class NPUGraphTrainingEngine(NPUTrainingEngineMixin, GraphTrainingEngine):
+class NPUGraphTrainingEngine(TrainingEngineEx, GraphTrainingEngine):
     """Keep GraphTrainingEngine ownership when adding NPU trainer features."""
 
 

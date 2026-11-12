@@ -16,7 +16,7 @@ import torch
 import torch.nn.attention.flex_attention as flex_attention
 import torch.nn.functional as F
 import torchtitan  # noqa: F401
-import torchtitan.models.common.attention as common_attention
+import torchtitan.models.common.attention.attention as common_attention
 from torch.nn.attention.flex_attention import (
     BlockMask,
     create_mask,

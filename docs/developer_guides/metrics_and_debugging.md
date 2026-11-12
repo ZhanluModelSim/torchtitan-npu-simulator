@@ -1,5 +1,7 @@
 # 调试支持特性
 
+> **0.4.0 配置迁移说明：** 下文保留历史实现说明与字段 CLI 示例，不能直接作为当前启动命令。训练工厂已迁至 `torchtitan_npu_recipes`；当前启动方式见[快速上手](../user-guides/quickstart.md)，专用配置与 golden 应按 [Python 配置组合指南](../developer_guides/python_recipes.md)定义工厂。功能支持以 0.4.0 升级计划为准。
+
 torchtitan-npu 目前提供多种调试特性支持，帮助开发者定位分布式训练中的各类问题，包括内存问题和性能瓶颈等。以下是常见使用场景和对应功能的快速参考：
 
 | 使用场景 | 对应功能 |
@@ -38,7 +40,7 @@ torchtitan 原生内存快照功能优先使用 `--profiler.memory-snapshot-freq
 
 ```bash
 torchrun --nproc_per_node=2 -m torchtitan_npu.train \
-  --module torchtitan_npu.models.deepseek_v4 \
+  --module torchtitan_npu_recipes.models.deepseek_v4 \
   --config deepseek_v4_debugmodel \
   --profiler.enable-memory-snapshot \
   --profiler.save-memory-snapshot-folder profiling/memory_snapshot \
@@ -120,7 +122,7 @@ python3 scripts/parse_profiling_data.py path/to/save_traces_folder
 
 ```bash
 torchrun --nproc_per_node=2 -m torchtitan_npu.train \
-  --module torchtitan_npu.models.deepseek_v4 \
+  --module torchtitan_npu_recipes.models.deepseek_v4 \
   --config deepseek_v4_debugmodel \
   --profiler.enable-profiling \
   --profiler.save-traces-folder profiling/traces \

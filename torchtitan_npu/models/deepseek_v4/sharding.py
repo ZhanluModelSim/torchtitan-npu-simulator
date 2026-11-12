@@ -3,26 +3,33 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import spmd_types as spmd
 from spmd_types import SpmdType
 from torchtitan.distributed.parallelism_context import MeshAxisName
+from torchtitan.models.base.sharding import ShardingConfig
 from torchtitan.models.common.decoder_sharding import (
     attention_activation_placement,
-    colwise_config,
     dense_activation_placement,
     dense_param_placement,
     dense_sequence_parallel_placement,
-    norm_config,
-    pre_lm_head_norm_config,
-    rowwise_config,
-    set_decoder_sharding_config,
     token_id_placement,
 )
-from torchtitan.protocols.sharding import ShardingConfig
+from torchtitan.models.common.decoder_sharding import (
+    colwise_sharding_config as colwise_config,
+)
+from torchtitan.models.common.decoder_sharding import (
+    norm_sharding_config as norm_config,
+)
+from torchtitan.models.common.decoder_sharding import (
+    pre_lm_head_norm_sharding_config as pre_lm_head_norm_config,
+)
+from torchtitan.models.common.decoder_sharding import (
+    rowwise_sharding_config as rowwise_config,
+)
 
-from torchtitan_npu.models.common.sharding import set_moe_sharding_config
+from torchtitan_npu.models.common.sharding import set_decoder_sharding_config, set_moe_sharding_config
 
 _dense_param_rep = dense_param_placement(tp=spmd.R)
 _act_shard0_tp_rep = dense_activation_placement(tp=spmd.R, cp=spmd.S(0))
@@ -31,6 +38,9 @@ DP = MeshAxisName.DP
 CP = MeshAxisName.CP
 TP = MeshAxisName.TP
 if TYPE_CHECKING:
+    from torchtitan.models.common.moe import MoE
+    from torchtitan.models.deepseek_v4.moe import DeepSeekV4Router
+
     from torchtitan_npu.models.deepseek_v4.model import (
         DeepSeekV4Model,
         DeepSeekV4TransformerBlock,
@@ -68,14 +78,22 @@ def set_compressed_sparse_attention_sharding(attention_cfg) -> None:
     placements = {
         "q": q,
         "swa_k": replicated_activation,
-        "cmp_k": replicated_activation,
-        "topk_indices": replicated_activation,
-        "topk_scores": replicated_activation,
         "attn_sink": sink,
     }
+    if getattr(attention_cfg, "compress_ratio", 1) > 1:
+        placements.update(
+            {
+                "cmp_k": replicated_activation,
+                "topk_indices": replicated_activation,
+                "topk_scores": replicated_activation,
+            }
+        )
     # The core consumes the gathered KV streams, the local query chunks and the sink, while
     # the selection arrives from the selector already in the model's document-local numbering.
-    consumed = {**placements, "swa_k": row, "cmp_k": row}
+    # The sliding-window core takes no compressed stream, so its forward names no cmp/topk.
+    consumed = {**placements, "swa_k": row}
+    if "cmp_k" in consumed:
+        consumed["cmp_k"] = row
     attention_cfg.inner_attention.sharding_config = ShardingConfig(
         in_src_shardings=placements,
         in_dst_shardings=consumed,
@@ -83,10 +101,11 @@ def set_compressed_sparse_attention_sharding(attention_cfg) -> None:
         out_dst_shardings=q,
     )
 
-    if attention_cfg.lightning_indexer is not None:
+    lightning_indexer = getattr(attention_cfg, "lightning_indexer", None)
+    if lightning_indexer is not None:
         # The selector scores the whole row's index keys against this rank's chunks: the query
         # side stays replicated, the keys get the same ``S(0) -> R`` gather as the KV streams.
-        attention_cfg.lightning_indexer.sharding_config = ShardingConfig(
+        lightning_indexer.sharding_config = ShardingConfig(
             in_src_shardings={
                 "idx_q": replicated_activation,
                 "idx_k": replicated_activation,
@@ -228,11 +247,11 @@ def set_deepseek_v4_layer_sharding(
 
     # MoE FFN (every DSV4 layer is a MoE layer).
     set_moe_sharding_config(
-        layer_cfg.moe,
+        layer_cfg.feed_forward,
         enable_ep=enable_ep,
         enable_sp=enable_sp,
     )
-    moe_sharding = layer_cfg.moe.sharding_config
+    moe_sharding = layer_cfg.feed_forward.sharding_config
     assert moe_sharding is not None
     if moe_sharding.in_dst_shardings is None:
         moe_sharding.in_dst_shardings = dict(moe_sharding.in_src_shardings or {})
@@ -242,10 +261,12 @@ def set_deepseek_v4_layer_sharding(
     if moe_sharding.in_src_shardings is None:
         moe_sharding.in_src_shardings = {}
     moe_sharding.in_src_shardings["input_ids_T"] = input_ids_src_placement
-    if layer_cfg.moe.router.layer_id < layer_cfg.moe.router.n_hash_layers:  # pyrefly: ignore [missing-attribute]
-        router_sharding = layer_cfg.moe.router.sharding_config or ShardingConfig()
+    moe_cfg = cast("MoE.Config", layer_cfg.feed_forward)
+    router = cast("DeepSeekV4Router.Config", moe_cfg.router)
+    if router.layer_id < router.n_hash_layers:
+        router_sharding = moe_cfg.router.sharding_config or ShardingConfig()
         router_sharding.state_shardings["tid2eid"] = _dense_param_rep
-        layer_cfg.moe.router.sharding_config = router_sharding
+        moe_cfg.router.sharding_config = router_sharding
 
 
 def set_deepseek_v4_sharding_config(
@@ -267,7 +288,7 @@ def set_deepseek_v4_sharding_config(
     for layer_cfg in config.layers:
         set_deepseek_v4_layer_sharding(layer_cfg, enable_sp=enable_sp, enable_ep=enable_ep)
 
-    if len(config.mtp_layers) > 0:
+    if config.mtp_layers:
         _set_deepseek_v4_mtp_sharding(
             config,
             enable_sp=enable_sp,
@@ -293,7 +314,7 @@ def _set_deepseek_v4_mtp_sharding(
             out_src_shardings=activation,
         )
 
-    for mtp_layer_cfg in config.mtp_layers:
+    for mtp_layer_cfg in config.mtp_layers or ():
         set_deepseek_v4_layer_sharding(
             mtp_layer_cfg,
             enable_sp=enable_sp,
@@ -301,6 +322,12 @@ def _set_deepseek_v4_mtp_sharding(
         )
 
         block_sharding = mtp_layer_cfg.sharding_config or ShardingConfig()
+        # v0.4.0's MTP block forward takes the ids as ``mtp_input_ids``; upstream's
+        # sharding table still spells the pinned ``_T`` name.
+        for field in ("in_src_shardings", "in_dst_shardings"):
+            mapping = getattr(block_sharding, field)
+            if mapping and "mtp_input_ids_T" in mapping:
+                mapping["mtp_input_ids"] = mapping.pop("mtp_input_ids_T")
         if enable_sp:
             if block_sharding.in_src_shardings is None:
                 block_sharding.in_src_shardings = {}
@@ -323,3 +350,22 @@ def _set_deepseek_v4_mtp_sharding(
         mtp_layer_cfg.mtp_norm.sharding_config = pre_lm_head_norm_config(enable_sp=enable_sp)
         mtp_layer_cfg.e_proj.sharding_config = projection_sharding()
         mtp_layer_cfg.h_proj.sharding_config = projection_sharding()
+
+
+def set_upstream_deepseek_v4_sharding_config(config, *, enable_sp: bool, enable_ep: bool) -> None:
+    """Update expert ownership on an already annotated upstream V4 config tree."""
+    from torchtitan.models.common.moe.sharding import routed_expert_linear_sharding_config
+
+    for layer in (*config.layers, *(config.mtp_layers or ())):
+        q_head_layout = attention_activation_placement()
+        layer.attention.q_head_norm.sharding_config = ShardingConfig(
+            state_shardings={"weight": _dense_param_rep},
+            in_src_shardings={"x": q_head_layout},
+            in_dst_shardings={"x": q_head_layout},
+            out_src_shardings=q_head_layout,
+            out_dst_shardings=q_head_layout,
+            local_spmd=True,
+        )
+        experts = layer.feed_forward.routed_experts
+        experts.w13.sharding_config = routed_expert_linear_sharding_config(enable_ep=enable_ep)
+        experts.w2.sharding_config = routed_expert_linear_sharding_config(enable_ep=enable_ep)

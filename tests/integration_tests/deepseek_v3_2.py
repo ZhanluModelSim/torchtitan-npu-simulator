@@ -35,7 +35,7 @@ def build_deepseek_v3_2_test_list() -> list[OverrideDefinitions]:
             test_name="dsv3_2_dsa_1rank",
             ngpu=1,
             env_vars={
-                "MODULE": "torchtitan_npu.models.deepseek_v3_2",
+                "MODULE": "torchtitan_npu_recipes.models.deepseek_v3_2",
                 "CONFIG": "deepseek_v3_2_debugmodel",
             },
         ),
@@ -58,7 +58,7 @@ def build_deepseek_v3_2_test_list() -> list[OverrideDefinitions]:
             test_name="dsv3_2_dsa_ep2_fsdp2",
             ngpu=2,
             env_vars={
-                "MODULE": "torchtitan_npu.models.deepseek_v3_2",
+                "MODULE": "torchtitan_npu_recipes.models.deepseek_v3_2",
                 "CONFIG": "deepseek_v3_2_debugmodel",
             },
         ),

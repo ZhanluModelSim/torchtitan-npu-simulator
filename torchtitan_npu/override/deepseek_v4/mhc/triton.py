@@ -42,7 +42,7 @@ class TritonHcPre(HcPre):
         # sinkhorn and BMM steps are the registered Triton custom ops.
         x_flat = x.reshape(-1, nD)
         norm_gamma = torch.ones(nD, device=x.device, dtype=torch.float32)
-        x_norm_flat, _rstd = torch_npu.npu_rms_norm(x_flat, gamma=norm_gamma, epsilon=self.eps)
+        x_norm_flat, _rstd = torch_npu.npu_rms_norm(x_flat, gamma=norm_gamma, epsilon=self.sinkhorn.eps)
         x_norm_mat = x_norm_flat.reshape(B, S, nD)
         x_proj = torch.matmul(x_norm_mat, weight)
 
@@ -51,8 +51,8 @@ class TritonHcPre(HcPre):
             branch_alpha,
             branch_beta,
             hc_mult=self.hc_mult,
-            sinkhorn_iters=self.sinkhorn_iters,
-            eps=self.eps,
+            sinkhorn_iters=self.sinkhorn.sinkhorn_iters,
+            eps=self.sinkhorn.eps,
         )
 
         x_unflatten = x.unflatten(dim=-1, sizes=(self.hc_mult, -1))

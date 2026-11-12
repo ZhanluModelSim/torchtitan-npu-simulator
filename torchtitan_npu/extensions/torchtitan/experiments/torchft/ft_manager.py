@@ -60,7 +60,7 @@ class FTManagerEx(TorchFTManager):
     @dataclass(kw_only=True, slots=True)
     class Config(TorchFTManager.Config):
         enable: bool = True
-        process_group: str = "hccl"
+        process_group: str = "hccl"  # pyrefly: ignore [bad-override]
         quorum_timeout_seconds: int = 60
         """Allow time for replica-local state export, loading and disk operations."""
         device_recovery_timeout_seconds: int = 60

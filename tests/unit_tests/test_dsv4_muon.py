@@ -13,7 +13,7 @@ from torchtitan.distributed.flex_shard import BlockShard
 from torchtitan.distributed.parallelism_context import MeshAxisName
 
 from torchtitan_npu.models.deepseek_v4 import model_registry
-from torchtitan_npu.models.deepseek_v4.config_registry import _dsv4_muon_profile
+from torchtitan_npu.models.deepseek_v4.muon import _dsv4_muon_profile
 
 _ROOT = Path(__file__).resolve().parents[2]
 
@@ -41,7 +41,7 @@ def test_dsv4_muon_profile_uses_validated_phase_one_policy():
     from torchtitan.components.optim import AdamW
 
     from torchtitan_npu.extensions.torchtitan.components.optimizer.muon import DistMuon
-    from torchtitan_npu.models.deepseek_v4.config_registry import deepseek_v4_debugmodel
+    from torchtitan_npu_recipes.models.deepseek_v4 import deepseek_v4_debugmodel
 
     config = deepseek_v4_debugmodel()
     optimizer = config.optim.optimizer
@@ -57,7 +57,7 @@ def test_dsv4_muon_profile_uses_validated_phase_one_policy():
 
 
 def test_dsv4_unified_muon_policy_follows_paper_parameter_split():
-    path = _ROOT / "torchtitan_npu/models/deepseek_v4/config_registry.py"
+    path = _ROOT / "torchtitan_npu/models/deepseek_v4/muon.py"
     source = path.read_text()
     active_source = _function_source(path, "_dsv4_muon_profile")
 
@@ -69,7 +69,7 @@ def test_dsv4_unified_muon_policy_follows_paper_parameter_split():
 
     profile = _dsv4_muon_profile(model_registry("debugmodel"))
     compute_shardings = profile.optimizer_factory_kwargs["DistMuon"]["compute_sharding_by_fqn"]
-    expert_layout = compute_shardings["layers.2.moe.routed_experts.w13.weight"]
+    expert_layout = compute_shardings["layers.2.feed_forward.routed_experts.w13.weight"]
     assert all(isinstance(p, Shard) and p.dim == 0 for p in expert_layout.shardings_by_mesh_axis.values())
     assert set(expert_layout.shardings_by_mesh_axis) == {
         MeshAxisName.DP_SHARD.value,
@@ -81,7 +81,7 @@ def test_dsv4_unified_muon_policy_follows_paper_parameter_split():
     }
     bucket_configs = profile.optimizer_factory_kwargs["DistMuon"]["bucket_configs"]
     routed_expert_bucket = next(bucket for bucket in bucket_configs if bucket.name == "layers.2.routed-experts")
-    assert all(".moe.routed_experts." in fqn for fqn in routed_expert_bucket.patterns)
+    assert all(".feed_forward.routed_experts." in fqn for fqn in routed_expert_bucket.patterns)
     for unified_muon_parameter in (
         "compressor",
         "routed_experts",
@@ -114,8 +114,9 @@ def test_dsv4_muon_indexer_query_uses_per_head_block_sharding():
 
 
 def test_graph_trainer_conversion_strips_only_npu_top_level_extension():
-    registry_path = _ROOT / "torchtitan_npu/models/deepseek_v4/config_registry.py"
-    conversion_source = _function_source(registry_path, "to_graph_trainer_config")
+    conversion_path = _ROOT / "torchtitan_npu/models/deepseek_v4/graph_trainer.py"
+    registry_path = _ROOT / "torchtitan_npu_recipes/graph_trainer/deepseek_v4.py"
+    conversion_source = _function_source(conversion_path, "to_graph_trainer_config")
 
     assert "isinstance(base_config, TrainerEx.Config)" in conversion_source
     assert "for config_field in fields(Trainer.Config)" in conversion_source

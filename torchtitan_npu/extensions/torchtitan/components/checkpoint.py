@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import torch
+import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 import torchtitan.components.checkpointer
 from torch.distributed.checkpoint.state_dict_saver import AsyncSaveResponse
@@ -19,8 +20,9 @@ from torchtitan.components.checkpointer import (
 from torchtitan.components.checkpointer import (
     CheckpointManager as _CheckpointManager,
 )
+from torchtitan.components.checkpointer.base import MODEL
 from torchtitan.observability import structured_logger as sl
-from torchtitan.tools.utils import GarbageCollection
+from torchtitan.tools.garbage_collector import GarbageCollector
 
 from torchtitan_npu.extensions.components.validation import (
     mark_checkpoint_manifest_pending,
@@ -65,7 +67,27 @@ class CheckpointManager(_CheckpointManager):
             )
 
         self.verify_hash_manifest = config.extensions.verify_hash_manifest
+        self._metadata_pg = None
         super().__init__(config=config, **kwargs)
+        if config.async_mode == AsyncMode.DISABLED.value and dist.is_initialized() and dist.get_backend() == "hccl":
+            # TODO(CANN): Remove this Gloo metadata group and the matching sync
+            # dcp.save/dcp.load overrides below once the HCCL AICPU scatter path
+            # no longer fails on DCP plan metadata. Current symptom on A3:
+            # AICPU errcode 11002 (open so failed for libhccl_aicpu_kernel.so /
+            # HcclLaunchAicpuKernelA3), followed by ACL 507018, when the default
+            # HCCL group scatters DCP plan objects. Re-check after a matched
+            # CANN / driver / torch_npu upgrade, then drop the workaround if a
+            # large DCP save/load no longer reproduces it.
+            self._metadata_pg = dist.new_group(backend="gloo")
+
+    def _close(self):
+        group = getattr(self, "_metadata_pg", None)
+        self._metadata_pg = None
+        try:
+            super()._close()
+        finally:
+            if group is not None and dist.is_initialized():
+                dist.destroy_process_group(group)
 
     @torch.no_grad()
     def dcp_save(
@@ -85,15 +107,14 @@ class CheckpointManager(_CheckpointManager):
                 to_hf=to_hf,
             )
 
-        dcp.save(
-            state_dict,
-            storage_writer=dcp.FileSystemWriter(
-                checkpoint_id,
-                per_thread_copy_ahead=0,
-            ),
-        )
+        writer = dcp.FileSystemWriter(checkpoint_id, per_thread_copy_ahead=0)
+        group = getattr(self, "_metadata_pg", None)
+        if group is None:
+            dcp.save(state_dict, storage_writer=writer)
+        else:
+            dcp.save(state_dict, storage_writer=writer, process_group=group)
         if enable_garbage_collection:
-            GarbageCollection.collect("GC collection invoked by checkpointer.")
+            GarbageCollector.collect("GC collection invoked by checkpointer.")
         return None
 
     @sl.log_trace_span("checkpoint_save")
@@ -113,12 +134,19 @@ class CheckpointManager(_CheckpointManager):
         if self.verify_hash_manifest:
             verify_checkpoint_manifest(checkpoint_id)
 
-        return super()._load_checkpoint(
-            states,
-            checkpoint_id,
-            from_hf=from_hf,
-            from_quantized=from_quantized,
-        )
+        group = getattr(self, "_metadata_pg", None)
+        if from_hf or group is None:
+            return super()._load_checkpoint(
+                states,
+                checkpoint_id,
+                from_hf=from_hf,
+                from_quantized=from_quantized,
+            )
+
+        state_dict = self._flattened_model_states_sd(states)
+        dcp.load(state_dict, checkpoint_id=checkpoint_id, process_group=group)
+        if MODEL in states:
+            states[MODEL].load_state_dict(state_dict)
 
 
 torchtitan.components.checkpointer.CheckpointManager = CheckpointManager

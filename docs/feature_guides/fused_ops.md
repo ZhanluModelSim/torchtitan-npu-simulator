@@ -1,5 +1,7 @@
 # 融合算子接入指南
 
+> **0.4.0 配置迁移说明：** 下文保留历史实现说明与字段 CLI 示例，不能直接作为当前启动命令。训练工厂已迁至 `torchtitan_npu_recipes`；当前启动方式见[快速上手](../user-guides/quickstart.md)，专用配置与 golden 应按 [Python 配置组合指南](../developer_guides/python_recipes.md)定义工厂。功能支持以 0.4.0 升级计划为准。
+
 本文面向在 `torchtitan-npu` 中接入 AscendC、Triton 或者 Tilelang 等融合算子的开发者。
 融合算子应作为 NPU 适配层通过 [override 机制](../../torchtitan_npu/override/README.md) 接入，不修改上游 `torchtitan`；默认训练路径不受影响，只有在 `override.imports` 中显式列出入口后才会替换组件。
 
@@ -173,7 +175,7 @@ replacement 只支持具体 Config 类型时设置 `exact=True`；需要按层�
 
 ```bash
 python -m torchtitan_npu.train \
-  --module torchtitan_npu.models.deepseek_v4 \
+  --module torchtitan_npu_recipes.models.deepseek_v4 \
   --config deepseek_v4_debugmodel \
   --override.imports \
     torchtitan_npu.override.common.rms_norm.asc \

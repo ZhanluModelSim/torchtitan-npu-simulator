@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 import torch
-from torchtitan.protocols.module import Module
+from torchtitan.models.base.module import Module
 
 from tests.unit_tests.models.deepseek_v4.lora_test_utils import _build_model_config, _lora_model_config
 from torchtitan_npu.models.deepseek_v4.lora import is_lora_parameter
@@ -16,10 +16,10 @@ def test_standard_transform_adapts_projections_and_freezes_indexer_and_base():
         for suffix in (
             "attention.wq_a",
             "attention.wo_a",
-            "moe.router.gate",
-            "moe.shared_experts.w13",
-            "moe.routed_experts.w13",
-            "moe.routed_experts.w2",
+            "feed_forward.router.gate",
+            "feed_forward.shared_experts.w13",
+            "feed_forward.routed_experts.w13",
+            "feed_forward.routed_experts.w2",
         )
     )
     assert not any(hasattr(cfg, "rank") for name, cfg in configs.items() if ".indexer." in name)
@@ -50,4 +50,4 @@ def test_transform_keeps_mtp_and_adapts_its_projection_modules():
     config = deepseek_v4_lora_transform(rank=8).transform(_build_model_config(num_layers=1, num_mtp_layers=1))
     assert config.mtp_layers[0].e_proj.rank == 8
     assert config.mtp_layers[0].h_proj.rank == 8
-    assert config.mtp_layers[0].moe.routed_experts.w13.rank == 8
+    assert config.mtp_layers[0].feed_forward.routed_experts.w13.rank == 8

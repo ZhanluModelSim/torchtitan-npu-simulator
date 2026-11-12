@@ -1,5 +1,7 @@
 # 静默数据损坏检测（SDC）
 
+> **0.4.0 配置迁移说明：** 下文保留历史实现说明与字段 CLI 示例，不能直接作为当前启动命令。训练工厂已迁至 `torchtitan_npu_recipes`；当前启动方式见[快速上手](../user-guides/quickstart.md)，专用配置与 golden 应按 [Python 配置组合指南](../developer_guides/python_recipes.md)定义工厂。功能支持以 0.4.0 升级计划为准。
+
 SDC（Silent Data Corruption，静默数据损坏）用于检测 Ascend NPU 训练中的 gradient、HCCL 和 matmul checksum 异常，
 仅支持 Eager 模式或使用 `torch.compile(backend="inductor")` 的 Compile 模式。该能力默认关闭，按需启用。
 Eager 模式通过 torch-npu 原生环境变量启用，Compile 模式通过 `--sdc.*` CLI 参数启用。
@@ -25,7 +27,7 @@ Eager 模式由 torch-npu 原生控制：
 ```bash
 NPU_ASD_CONFIG='enable:true,with_checksum:false' \
 torchrun --nproc_per_node=8 -m torchtitan_npu.train \
-         --module torchtitan_npu.models.deepseek_v4 \
+         --module torchtitan_npu_recipes.models.deepseek_v4 \
          --config deepseek_v4_flash_43layers_16experts
 ```
 
@@ -41,7 +43,7 @@ compiled gradient、checksum 或 typed HCCL 控制。
 
 ```bash
 torchrun --nproc_per_node=8 -m torchtitan_npu.train \
-  --module torchtitan_npu.models.deepseek_v4 \
+  --module torchtitan_npu_recipes.models.deepseek_v4 \
   --config deepseek_v4_flash_43layers_16experts \
   --sdc.gradient-enabled \
   --sdc.with-checksum \

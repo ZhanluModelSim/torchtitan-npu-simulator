@@ -41,11 +41,13 @@ def test_qwen3_5_uses_the_merged_gdn_override():
 
 
 def test_qwen3_5_launcher_selects_the_current_gdn_override():
-    script = (Path(__file__).resolve().parents[4] / "examples" / "qwen3_5" / "qwen3_5_debugmodel_1p_cpt_512.sh").read_text(encoding="utf-8")
-    assert "bash scripts/run_train.sh" in script
-    assert "torchtitan_npu.override.qwen3_5.gated_delta.npu" in script
-    assert "override.common.attention" not in script
-    assert "triton_gated_delta_override" not in script
+    root = Path(__file__).resolve().parents[4]
+    script = (root / "examples" / "qwen3_5" / "qwen3_5_debugmodel_1p_cpt_512.sh").read_text(encoding="utf-8")
+    recipe = (root / "torchtitan_npu_recipes" / "examples" / "qwen3_5.py").read_text(encoding="utf-8")
+    assert "scripts/run_train.sh" in script
+    assert "torchtitan_npu.override.qwen3_5.gated_delta.npu" in recipe
+    assert "override.common.attention" not in recipe
+    assert "triton_gated_delta_override" not in recipe
 
 
 def test_torchvision_native_image_ops_and_v2_transforms_are_available():
@@ -96,7 +98,7 @@ from pathlib import Path
 assert Path(torchvision.__file__).is_file()
 assert importlib.metadata.version('torchvision') == torchvision.__version__
 assert torchvision.__version__.startswith({expected_series!r} + '.')
-from torchtitan_npu.models.qwen3_5.config_registry import qwen35_debugmodel
+from torchtitan_npu_recipes.models.qwen3_5 import qwen35_debugmodel
 qwen35_debugmodel()
 assert sys.modules['torchvision'] is torchvision
 assert 'torchtitan_npu.models.qwen3_5._torchvision_compat' not in sys.modules

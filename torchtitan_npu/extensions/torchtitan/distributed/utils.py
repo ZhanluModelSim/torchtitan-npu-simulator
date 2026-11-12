@@ -48,7 +48,6 @@ def init_distributed(
     if pipeline_parallel_degree > 1 or comm_config.backend == "real_pp_fake_spmd":
         raise NotImplementedError("Pipeline parallelism requires a PyTorch runtime with pipeline_per_edge_p2p support")
 
-    torchtitan.distributed.utils.enable_fp32_matmul_emulation_with_bf16x9()
     torch.autograd.set_multithreading_enabled(False)
     if comm_config.backend == "fake":
         world_size = torchtitan.distributed.utils._env_int("NGPU")

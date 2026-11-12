@@ -11,7 +11,7 @@ import torch
 
 from tests.unit_tests.models.common.text_data_utils import IntegerTextTokenizer, aligned_text_config
 from torchtitan_npu.models.deepseek_v4_1 import model_registry
-from torchtitan_npu.models.deepseek_v4_1.config_registry import (
+from torchtitan_npu_recipes.models.deepseek_v4_1 import (
     deepseek_v4_1_debugmodel_multimodal,
     deepseek_v4_1_debugmodel_text,
 )

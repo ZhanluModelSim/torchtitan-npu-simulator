@@ -29,7 +29,7 @@ from torchao_npu.quantization.quant_configs import (
 from torchao_npu.quantization.quant_primitives.mx import mx_fake_quantize
 from torchtitan.config import derive
 from torchtitan.config.transform.quantization import QuantizationConverter
-from torchtitan.protocols.module import Module
+from torchtitan.models.base.module import Module
 
 from ..configs import ModelType
 from ..configs.deepseek_v4 import V4FilterKeys
@@ -302,11 +302,12 @@ class KVNormComponent(QuantComponent):
         block_size = getattr(k, "block_size", None)
         fqns = tuple(getattr(k, "fqns", ()) or ())
         logger.info("[Component] KVNorm: fake-quantizing %d norm(s), block_size=%s", len(fqns), block_size)
+        if ctx.model_compile_enabled:
+            raise NotImplementedError("NPU quantization with model compilation is not supported in this upgrade")
         return [
             KVNormFakeQuantConverter.Config(
                 base_config=MXQuantizeConfig(elem_dtype=torch.float8_e4m3fn, block_size=block_size),
                 target_fqns=fqns,
-                model_compile_enabled=ctx.model_compile_enabled,
             )
         ]
 

@@ -35,7 +35,7 @@ def init_extension(monkeypatch):
     multithreading = torch.autograd.is_multithreading_enabled()
     spec.loader.exec_module(module)
     monkeypatch.setattr(dist, "is_initialized", lambda: False)
-    monkeypatch.setattr(upstream_utils, "enable_fp32_matmul_emulation_with_bf16x9", lambda: None)
+    monkeypatch.setattr(upstream_utils, "enable_fp32_matmul_emulation_with_bf16x9", lambda: None, raising=False)
     try:
         yield module
     finally:

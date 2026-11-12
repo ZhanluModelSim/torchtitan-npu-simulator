@@ -5,71 +5,81 @@
 
 """Real typed recipe overrides compose at disjoint activation/dispatcher leaves.
 
-CANN packages and operator registration remain real. The last test substitutes
-only the registered device primitive on CPU to check the built activation's
-packing, clamp argument, output and gradient boundary; it is not NPU validation.
+These are config-level checks: ``_ensure_cann_ops_loaded`` is faked so the CPU
+UT does not depend on the CANN JIT build. The real ``cann_ops_nn.swiglu_group``
+registration boundary is covered by
+``tests/smoke_tests/ops/test_swiglu_group_cann_boundary.py``.
 """
 
 import pytest
-import torch
-import torch.nn.functional as F
-from torchtitan.config import ConfigManager, apply_overrides
+from torchtitan.config import apply_overrides
+from torchtitan.config.loader import ConfigLoader
 from torchtitan.models.common.activation import SiTUGLU, SwiGLU
+from torchtitan.models.common.moe import MoE
 
 from torchtitan_npu.override.common.swiglu_group import AscSwiGLU
 from torchtitan_npu.override.common.token_dispatcher import AscAllToAllTokenDispatcher
-from torchtitan_npu.patches.torchtitan.models.common.moe import ClampedSwiGLU
+from torchtitan_npu.patches.torchtitan.models.common.moe import LimitedSwiGLU
 
 _SWIGLU = "torchtitan_npu.override.common.swiglu_group."
 _DISPATCHERS = {
     "standard": ("torchtitan_npu.override.common.token_dispatcher.asc", AscAllToAllTokenDispatcher.Config),
 }
 _RECIPES = [
-    ("torchtitan_npu.models.deepseek_v4.config_registry", "deepseek_v4_debugmodel"),
-    ("torchtitan_npu.models.deepseek_v4_1.config_registry", "deepseek_v4_1_debugmodel_text"),
+    ("torchtitan_npu_recipes.models.deepseek_v4", "deepseek_v4_debugmodel"),
+    ("torchtitan_npu_recipes.models.deepseek_v4_1", "deepseek_v4_1_debugmodel_text"),
 ]
 
 
 def _trainer_config(module, recipe, tmp_path):
-    config = ConfigManager().parse_args(["--module", module, "--config", recipe, "--hf-assets-path", str(tmp_path)])
-    config.model.update_from_config(config=config)
-    return config
+    del tmp_path
+    return ConfigLoader._load_config(module, recipe)
 
 
 def _moe_layers(config):
-    return [(index, layer) for index, layer in enumerate(config.model.layers) if layer.moe is not None]
+    return [
+        (index, layer) for index, layer in enumerate(config.model.layers) if isinstance(layer.feed_forward, MoE.Config)
+    ]
 
 
 def _replacement_fqns(replacements):
     return {line.split(": ", 1)[1].split(" ", 1)[0] for line in replacements}
 
 
+@pytest.fixture
+def cann_free_swiglu(monkeypatch):
+    """Keep the config-only override tests independent of the CANN JIT build."""
+    from torchtitan_npu.override.common import swiglu_group
+
+    monkeypatch.setattr(swiglu_group, "_ensure_cann_ops_loaded", lambda: None)
+
+
 @pytest.mark.parametrize(("module", "recipe"), _RECIPES, ids=["v4", "v41"])
 @pytest.mark.parametrize("dispatcher", ["standard"])
 @pytest.mark.parametrize("dispatcher_first", [False, True])
 def test_activation_and_dispatcher_overrides_compose_without_replacing_expert_owners(
-    tmp_path, module, recipe, dispatcher, dispatcher_first
+    tmp_path, module, recipe, dispatcher, dispatcher_first, cann_free_swiglu
 ):
     config = _trainer_config(module, recipe, tmp_path)
     layers = _moe_layers(config)
     assert layers
     originals = [
         (
-            layer.moe,
-            layer.moe.routed_experts,
-            layer.moe.shared_experts,
-            layer.moe.routed_experts.w13,
-            layer.moe.routed_experts.w2,
-            layer.moe.shared_experts.w13,
-            layer.moe.shared_experts.w2,
-            layer.moe.routed_experts.activation_fn.swiglu_limit,
-            getattr(layer.moe.shared_experts.activation_fn, "swiglu_limit", 0.0),
-            layer.moe.routed_experts.token_dispatcher.absorb_router_scores,
+            layer.feed_forward,
+            layer.feed_forward.routed_experts,
+            layer.feed_forward.shared_experts,
+            layer.feed_forward.routed_experts.w13,
+            layer.feed_forward.routed_experts.w2,
+            layer.feed_forward.shared_experts.w13,
+            layer.feed_forward.shared_experts.w2,
+            layer.feed_forward.routed_experts.activation_fn.swiglu_limit,
+            getattr(layer.feed_forward.shared_experts.activation_fn, "swiglu_limit", 0.0),
+            layer.feed_forward.routed_experts.token_dispatcher.absorb_router_scores,
             layer.attention,
         )
         for _, layer in layers
     ]
-    assert any(isinstance(layer.moe.routed_experts.activation_fn, ClampedSwiGLU.Config) for _, layer in layers)
+    assert any(isinstance(layer.feed_forward.routed_experts.activation_fn, LimitedSwiGLU.Config) for _, layer in layers)
     dispatcher_target, dispatcher_config = _DISPATCHERS[dispatcher]
     imports = [_SWIGLU + "asc", _SWIGLU + "asc_shared_experts"]
     imports.insert(0 if dispatcher_first else len(imports), dispatcher_target)
@@ -93,9 +103,9 @@ def test_activation_and_dispatcher_overrides_compose_without_replacing_expert_ow
             absorb,
             attention,
         ) = original
-        assert layer.moe is moe
-        assert layer.moe.routed_experts is routed
-        assert layer.moe.shared_experts is shared
+        assert layer.feed_forward is moe
+        assert layer.feed_forward.routed_experts is routed
+        assert layer.feed_forward.shared_experts is shared
         assert routed.w13 is routed_w13 and routed.w2 is routed_w2
         assert shared.w13 is shared_w13 and shared.w2 is shared_w2
         assert layer.attention is attention
@@ -105,7 +115,7 @@ def test_activation_and_dispatcher_overrides_compose_without_replacing_expert_ow
         assert shared.activation_fn.swiglu_limit == shared_limit
         assert type(routed.token_dispatcher) is dispatcher_config
         assert routed.token_dispatcher.absorb_router_scores is absorb
-        prefix = f"model.layers.{index}.moe"
+        prefix = f"model.layers.{index}.feed_forward"
         expected_fqns.update(
             {
                 prefix + ".routed_experts.activation_fn",
@@ -118,18 +128,18 @@ def test_activation_and_dispatcher_overrides_compose_without_replacing_expert_ow
 
 
 @pytest.mark.parametrize("selected", ["routed_experts", "shared_experts"])
-def test_only_requested_swiglu_leaf_changes_and_plain_swiglu_has_no_clamp(tmp_path, selected):
+def test_only_requested_swiglu_leaf_changes_and_plain_swiglu_has_no_clamp(tmp_path, selected, cann_free_swiglu):
     config = _trainer_config(*_RECIPES[0], tmp_path)
-    first_moe = _moe_layers(config)[0][1].moe
+    first_moe = _moe_layers(config)[0][1].feed_forward
     first_moe.routed_experts.activation_fn = SwiGLU.Config()
-    first_moe.shared_experts.activation_fn = ClampedSwiGLU.Config(swiglu_limit=0.75)
+    first_moe.shared_experts.activation_fn = LimitedSwiGLU.Config(swiglu_limit=0.75)
     routed, shared = first_moe.routed_experts, first_moe.shared_experts
     original_routed, original_shared = routed.activation_fn, shared.activation_fn
     config.override.imports = [_SWIGLU + ("asc" if selected == "routed_experts" else "asc_shared_experts")]
 
     replacements = apply_overrides(config.override, config)
 
-    assert all(fqn.endswith(f".moe.{selected}.activation_fn") for fqn in _replacement_fqns(replacements))
+    assert all(fqn.endswith(f".feed_forward.{selected}.activation_fn") for fqn in _replacement_fqns(replacements))
     if selected == "routed_experts":
         assert type(routed.activation_fn) is AscSwiGLU.Config
         assert routed.activation_fn.swiglu_limit == 0.0
@@ -141,14 +151,14 @@ def test_only_requested_swiglu_leaf_changes_and_plain_swiglu_has_no_clamp(tmp_pa
 
 
 @pytest.mark.parametrize(("module", "recipe"), _RECIPES, ids=["v4", "v41"])
-def test_situglu_activations_are_preserved_while_dispatcher_is_selected(tmp_path, module, recipe):
+def test_situglu_activations_are_preserved_while_dispatcher_is_selected(tmp_path, module, recipe, cann_free_swiglu):
     config = _trainer_config(module, recipe, tmp_path)
     originals = []
     for _, layer in _moe_layers(config):
         routed = SiTUGLU.Config(beta=0.5, linear_beta=1.5)
         shared = SiTUGLU.Config(beta=1.25)
-        layer.moe.routed_experts.activation_fn = routed
-        layer.moe.shared_experts.activation_fn = shared
+        layer.feed_forward.routed_experts.activation_fn = routed
+        layer.feed_forward.shared_experts.activation_fn = shared
         originals.append((routed, shared))
     config.override.imports = [_SWIGLU + "asc", _SWIGLU + "asc_shared_experts", _DISPATCHERS["standard"][0]]
 
@@ -157,51 +167,6 @@ def test_situglu_activations_are_preserved_while_dispatcher_is_selected(tmp_path
     assert replacements
     assert all(fqn.endswith(".routed_experts.token_dispatcher") for fqn in _replacement_fqns(replacements))
     for (_, layer), (routed, shared) in zip(_moe_layers(config), originals, strict=True):
-        assert layer.moe.routed_experts.activation_fn is routed
-        assert layer.moe.shared_experts.activation_fn is shared
+        assert layer.feed_forward.routed_experts.activation_fn is routed
+        assert layer.feed_forward.shared_experts.activation_fn is shared
         assert (routed.beta, routed.linear_beta, shared.beta) == (0.5, 1.5, 1.25)
-
-
-@pytest.mark.parametrize("limit", [0.0, 0.75])
-def test_recipe_selected_built_activation_reaches_registered_cann_boundary(monkeypatch, tmp_path, limit):
-    config = _trainer_config(*_RECIPES[0], tmp_path)
-    first_moe = _moe_layers(config)[0][1].moe
-    first_moe.routed_experts.activation_fn = ClampedSwiGLU.Config(swiglu_limit=limit)
-    config.override.imports = [_SWIGLU + "asc"]
-    apply_overrides(config.override, config)
-    activation = first_moe.routed_experts.activation_fn.build()
-    assert type(activation) is AscSwiGLU
-    # The real override above loaded cann_ops_nn.ops and registered this operator.
-    operation = torch.ops.cann_ops_nn.swiglu_group
-    assert operation.default._schema.name == "cann_ops_nn::swiglu_group"
-    calls = []
-
-    def cpu_device_primitive(h, *, weight, group_index, clamp_limit):
-        calls.append((h, weight, group_index, clamp_limit))
-        gate, up = h.chunk(2, dim=-1)
-        if clamp_limit > 0:
-            gate = gate.clamp(max=clamp_limit)
-            up = up.clamp(min=-clamp_limit, max=clamp_limit)
-        return F.silu(gate) * up
-
-    monkeypatch.setattr(operation, "default", cpu_device_primitive)
-    gate = torch.tensor([[-2.0, 1.0, 0.5], [0.25, 3.0, -1.0]], requires_grad=True)
-    up = torch.tensor([[2.0, -3.0, 0.25], [0.5, 1.0, -2.0]], requires_grad=True)
-    ref_gate, ref_up = gate.detach().clone().requires_grad_(), up.detach().clone().requires_grad_()
-    clamped_gate = ref_gate.clamp(max=limit) if limit > 0 else ref_gate
-    clamped_up = ref_up.clamp(min=-limit, max=limit) if limit > 0 else ref_up
-    expected = F.silu(clamped_gate) * clamped_up
-
-    actual = activation(gate, up, offsets=torch.tensor([2]))
-
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-    actual.sum().backward()
-    expected.sum().backward()
-    torch.testing.assert_close(gate.grad, ref_gate.grad, rtol=0, atol=0)
-    torch.testing.assert_close(up.grad, ref_up.grad, rtol=0, atol=0)
-    assert len(calls) == 1
-    packed, weight, group_index, clamp_limit = calls[0]
-    torch.testing.assert_close(packed, torch.cat((gate, up), dim=-1))
-    assert packed.is_contiguous()
-    assert weight is None and group_index is None
-    assert clamp_limit == (limit if limit > 0 else -1.0)

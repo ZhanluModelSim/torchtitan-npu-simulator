@@ -13,6 +13,7 @@ device with no per-step round trip.
 import pytest
 import torch
 import torch_npu
+from torchtitan.config.configs import DebugConfig
 
 from torchtitan_npu.config.configs import MuonOptimizerProfile, OptimizerConfig, TrainingConfig
 from torchtitan_npu.extensions.cpu_offload.cpu_offload_adamw import CpuOffloadAdamW
@@ -147,13 +148,13 @@ def test_enable_cpu_offload_defaults_to_npu_resident_state(monkeypatch) -> None:
     from dataclasses import replace
 
     from torchtitan_npu.extensions import trainer as trainer_module
-    from torchtitan_npu.models.deepseek_v4.config_registry import deepseek_v4_debugmodel
     from torchtitan_npu.override.common.optimizer import (
         CpuOffloadNpuStateOptimizersContainer,
         CpuOffloadOptimizersContainer,
         swap_optimizer,
     )
     from torchtitan_npu.patches.torch_npu import cpu_dtensor_init
+    from torchtitan_npu_recipes.models.deepseek_v4 import deepseek_v4_debugmodel
 
     class ReachedUpstreamError(Exception):
         pass
@@ -171,6 +172,7 @@ def test_enable_cpu_offload_defaults_to_npu_resident_state(monkeypatch) -> None:
     config = TrainerEx.Config(
         model=deepseek_v4_debugmodel().model,
         training=TrainingConfig(enable_cpu_offload=True),
+        debug=DebugConfig(distinct_seed_mesh_axes=["dp_shard"]),
     )
     # Config rebuilds keep the plain schema: the derive happens exactly once,
     # at trainer construction (regression: config.build() does replace(self),

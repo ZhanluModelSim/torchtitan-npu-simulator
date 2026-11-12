@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 from torchtitan.config import derive
 from torchtitan.config.transform import ModelConfigConverter, validate_converter_compatibility
@@ -21,11 +21,10 @@ from torchtitan.models.common.aux_loss import (
     register_aux_loss_zero_hook,
 )
 from torchtitan.models.common.moe import register_moe_load_balancing_hook
-from torchtitan.models.deepseek_v3 import (
+from torchtitan.models.deepseek_v3.flavors import (
     _EMBEDDING_INIT,
     _LINEAR_INIT,
     _NORM_INIT,
-    DeepSeekV3TransformerBlock,
     _build_dsv3_layers,
     _build_mtp_layers,
     _output_linear_init,
@@ -35,6 +34,9 @@ from torchtitan_npu.patches.torchtitan.models.common.linear import BatchedLinear
 
 from .model import Attention, DeepSeekV32Model, Indexer, SparseInnerAttention
 from .state_dict_adapter import DeepSeekV32StateDictAdapter
+
+if TYPE_CHECKING:
+    from torchtitan.models.deepseek_v3.model import DeepSeekV3TransformerBlock
 
 __all__ = [
     "deepseekv3_2_configs",
@@ -58,6 +60,7 @@ def _build_dsv3_2_layers(
 ):
     layers = _build_dsv3_layers(
         enable_sp=False,
+        enable_ep=False,
         dim=dim,
         n_heads=n_heads,
         q_lora_rank=q_lora_rank,
@@ -170,8 +173,6 @@ def _debugmodel_v3_2(
         num_shared_experts=num_shared_experts,
         router_top_k=3,
         router_score_func=Softmax.Config(),
-        moe_comm_backend=moe_comm_backend,
-        non_blocking_capacity_factor=non_blocking_capacity_factor,
         rope=ComplexRoPE.Config(
             dim=qk_rope_head_dim,
             max_context_length=max_context_length,
@@ -202,6 +203,7 @@ def _debugmodel_v3_2(
             cast("DeepSeekV3TransformerBlock.Config", layers[-1]),
             dim=dim,
             num_mtp_layers=num_mtp_layers,
+            enable_sp=False,
         ),
     )
 

@@ -4,16 +4,19 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-# LoRA wrapper around the shared V4.1 CPT launcher; user arguments take precedence.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
-export CONFIG="${CONFIG:-deepseek_v4_1_flash_lora}"
-# Match the documented reference-operator LoRA path by default.
-export USE_GOLDEN="${USE_GOLDEN:-1}"
-export OPTIMIZER_OVERRIDES="${OPTIMIZER_OVERRIDES-}"
-exec bash "${SCRIPT_DIR}/deepseek_v4_1_flash_cpt_4k_a3.sh" \
-    --checkpointer.no-load-only \
-    --checkpointer.save-training-state \
-    "$@"
+if [[ -n "${NODE_IPS:-}" ]]; then
+    IFS=',' read -r -a node_ips <<< "${NODE_IPS}"
+    default_nodes="${#node_ips[@]}"
+else
+    default_nodes=8
+fi
+
+MODULE="${MODULE:-torchtitan_npu_recipes.examples.deepseek_v4_1}" \
+CONFIG="${CONFIG:-deepseek_v4_1_flash_lora_4k_a3}" \
+NGPU="${NGPU:-16}" \
+NNODES="${NNODES:-${default_nodes}}" \
+exec bash "${SCRIPT_DIR}/../../scripts/run_train_multinodes.sh" "$@"

@@ -199,14 +199,16 @@ class HostSparseOptimizersContainer(OptimizersContainer):
                 if getattr(module, "uses_host_offload", False):
                     yield module
 
-    def clip_grad_norm(self, parameters, max_norm, **kwargs):
-        from torchtitan.distributed.utils import clip_grad_norm_
+    def clip_grad_norm(self, parameters, max_norm, *, clipper=None, **kwargs):
+        if clipper is None:
+            from torchtitan.distributed.utils import clip_grad_norm_
 
+            clipper = clip_grad_norm_
         return clip_grad_norm_with_host_sparse_tables(
             parameters,
             max_norm,
             tables=list(self._iter_host_tables()),
-            clipper=clip_grad_norm_,
+            clipper=clipper,
             scale_dense_gradients=self._scale_dense_gradients,
             **kwargs,
         )
@@ -288,7 +290,6 @@ class HostSparseOptim(Optim):
             self.config.max_norm,
             foreach=True,
             pp_mesh=self.parallelism_context.get_optional_mesh("pp"),
-            ep_enabled=self.parallelism_context.ep_enabled,
         )
         # Match upstream Optim's finite-loss checks before the optimizer update.
         loss_is_finite = torch.isfinite(loss).all().to(torch.int32)

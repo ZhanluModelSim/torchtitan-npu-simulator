@@ -12,7 +12,8 @@ from pathlib import Path
 from tests.integration_tests import OverrideDefinitions
 from tests.integration_tests.loss_compare import extract_scalar_from_tensorboard
 from torchtitan_npu.models.deepseek_v4_1 import _attach_engram, _flash_engram_geometry
-from torchtitan_npu.models.deepseek_v4_1.config_registry import deepseek_v4_1_stripped, _v41_optimizer_config
+from torchtitan_npu_recipes.models.deepseek_v4_1 import deepseek_v4_1_stripped
+from torchtitan_npu.models.deepseek_v4_1.optimizer import _v41_optimizer_config
 
 
 def engram_cp():
@@ -20,7 +21,10 @@ def engram_cp():
     config.activation_checkpoint = None
     # Preserve the fused attention geometry. Two configured Engram layers fit
     # the stripped stack; only table rows are reduced by the launcher.
-    _attach_engram(config.model_spec.model, dataclasses.replace(_flash_engram_geometry(), layer_ids=(0, len(config.model_spec.model.layers) - 1)))
+    _attach_engram(
+        config.model_spec.model,
+        dataclasses.replace(_flash_engram_geometry(), layer_ids=(0, len(config.model_spec.model.layers) - 1)),
+    )
     config.optimizer = _v41_optimizer_config(config.model_spec)
     return config
 
@@ -51,7 +55,7 @@ def summarize(root):
             raise RuntimeError(f"{tag}: expected exactly three completed steps")
         for step in (1, 2, 3):
             baseline, sharded = (record[step] for record in values)
-            print(f"{tag} step={step} cp1={baseline:.9g} cp2={sharded:.9g} delta={sharded-baseline:.9g}")
+            print(f"{tag} step={step} cp1={baseline:.9g} cp2={sharded:.9g} delta={sharded - baseline:.9g}")
     print("CP1/CP2 completed; numerical differences above require review")
 
 

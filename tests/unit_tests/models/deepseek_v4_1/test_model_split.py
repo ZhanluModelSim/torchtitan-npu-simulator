@@ -37,7 +37,7 @@ def registry():
 
 @pytest.fixture(scope="module")
 def recipes():
-    return importlib.import_module("torchtitan_npu.models.deepseek_v4_1.config_registry")
+    return importlib.import_module("torchtitan_npu_recipes.models.deepseek_v4_1")
 
 
 def _flavors(registry):
@@ -55,8 +55,8 @@ def test_only_the_multimodal_half_carries_vision_parameters(registry):
     be a second way to say what the argument already says.
     """
     text, multimodal = _flavors(registry).values()
-    assert not any(layer.moe.router.vision_enabled for layer in text.layers)
-    assert all(layer.moe.router.vision_enabled for layer in multimodal.layers)
+    assert not any(layer.feed_forward.router.vision_enabled for layer in text.layers)
+    assert all(layer.feed_forward.router.vision_enabled for layer in multimodal.layers)
     assert "vision_enabled" not in {field.name for field in dataclasses.fields(DeepSeekV41TransformerBlock.Config)}
     assert not hasattr(text, "vision_encoder")
     assert multimodal.vision_encoder.dim == 128
@@ -163,11 +163,11 @@ def test_flash_recipe_sets_expert_count_in_every_layer(recipes, num_experts, mod
     assert len(config.layers) == 40
     assert isinstance(config, DeepSeekV41MultimodalModel.Config) is (modality == "multimodal")
     for layer in config.layers:
-        assert layer.moe.num_experts == num_experts
-        assert layer.moe.router.num_experts == num_experts
-        assert layer.moe.router.gate.out_features == num_experts
-        assert layer.moe.routed_experts.w13.group_size == num_experts
-        assert layer.moe.routed_experts.w2.group_size == num_experts
+        assert layer.feed_forward.num_experts == num_experts
+        assert layer.feed_forward.router.num_experts == num_experts
+        assert layer.feed_forward.router.gate.out_features == num_experts
+        assert layer.feed_forward.routed_experts.w13.group_size == num_experts
+        assert layer.feed_forward.routed_experts.w2.group_size == num_experts
 
 
 class _RecordedHooks(nn.Module):
@@ -229,7 +229,7 @@ def _parallelize(par, parallel_dims, recipes, model, *, vision: bool):
         training=trainer.training,
         parallelism=parallelism,
         compile_config=trainer.compile,
-        ac_config=trainer.activation_checkpoint,
+        ac_config=trainer.activation_remat,
         dump_folder=".",
     )
 

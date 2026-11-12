@@ -13,6 +13,7 @@ emits event synchronization before host reads.
 """
 
 import functools
+from importlib.machinery import PathFinder
 from typing import Any, cast
 
 import torch
@@ -43,15 +44,21 @@ def apply() -> None:
     if not torch_npu.npu.is_available():
         return
 
-    try:
-        from torch_npu._inductor.ascendc.lowering.common import (  # pyrefly: ignore [missing-import]
-            _LoweringGuard,
-            exclude,
-        )
-    except ModuleNotFoundError:
-        # The AscendC lowering module is absent in this torch_npu build; the
-        # workaround degrades gracefully (no D2H event synchronization).
-        return
+    # Resolving dotted names with importlib.util.find_spec would initialize
+    # _inductor, whose backend loader can fail before an absent ascendc is found.
+    path = torch_npu.__path__
+    for name in ("_inductor", "ascendc", "lowering", "common"):
+        spec = PathFinder.find_spec(name, path)
+        if spec is None:
+            return
+        path = spec.submodule_search_locations
+        if name != "common" and path is None:
+            return
+
+    from torch_npu._inductor.ascendc.lowering.common import (  # pyrefly: ignore [missing-import]
+        _LoweringGuard,
+        exclude,
+    )
 
     cast("Any", inductor_ir.DeviceCopy).create = classmethod(_patched_device_copy_create)
     _LoweringGuard.support(

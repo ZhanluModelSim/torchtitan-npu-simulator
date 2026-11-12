@@ -9,19 +9,19 @@ from dataclasses import dataclass
 
 import torch
 from torchtitan.config import derive, override
-from torchtitan.models.common.cp_attention import UlyssesCPVarlenInnerAttention
+from torchtitan.models.common.attention.cp_attention import UlyssesVarlenInnerAttention
 
 from torchtitan_npu.override.qwen3_5.parallelize import (
     QWEN_CONTEXT_PARALLEL_UNSUPPORTED,
 )
 
 
-class AscVarlenInnerAttention(UlyssesCPVarlenInnerAttention):
+class AscVarlenInnerAttention(UlyssesVarlenInnerAttention):
     """Refuse the not-yet-migrated context-parallel varlen attention.
 
     Upstream 0.4.0 folds the batch dimension into the token row: the base
     ``VarlenInnerAttention.forward`` now takes ``[T, N, H]`` and a
-    ``VarlenMetadata``.  The removed implementation exchanged rank-local heads
+    ``VarlenAttentionMetadata``.  The removed implementation exchanged rank-local heads
     on pre-fold ``[B, L, N, H]`` tensors and fed CANN TND attention with
     ``actual_seq_qlen`` from the old CP metadata, so running it against the
     folded caller would mis-shard the sequence. Configuration retains the real
@@ -30,7 +30,7 @@ class AscVarlenInnerAttention(UlyssesCPVarlenInnerAttention):
     """
 
     @dataclass(kw_only=True, slots=True)
-    class Config(UlyssesCPVarlenInnerAttention.Config):
+    class Config(UlyssesVarlenInnerAttention.Config):
         pass
 
     def forward(
@@ -44,10 +44,10 @@ class AscVarlenInnerAttention(UlyssesCPVarlenInnerAttention):
 
 
 @override(
-    target=UlyssesCPVarlenInnerAttention.Config,
+    target=UlyssesVarlenInnerAttention.Config,
     fqns=["model.layers.*.attention.inner_attention"],
     exact=True,
     description="Use CANN TND attention with Qwen3.5/3.6 Context Parallel",
 )
-def asc_cp(cfg: UlyssesCPVarlenInnerAttention.Config) -> AscVarlenInnerAttention.Config:
+def asc_cp(cfg: UlyssesVarlenInnerAttention.Config) -> AscVarlenInnerAttention.Config:
     return derive(cfg, AscVarlenInnerAttention.Config)

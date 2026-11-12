@@ -14,8 +14,8 @@ from torchtitan_npu.extensions.torchtitan.components.optimizer.muon import DistM
 @pytest.mark.parametrize(
     ("module", "recipe"),
     [
-        ("torchtitan_npu.models.deepseek_v4.config_registry", "deepseek_v4_debugmodel"),
-        ("torchtitan_npu.models.deepseek_v4_1.config_registry", "deepseek_v4_1_debugmodel_text"),
+        ("torchtitan_npu_recipes.models.deepseek_v4", "deepseek_v4_debugmodel"),
+        ("torchtitan_npu_recipes.models.deepseek_v4_1", "deepseek_v4_1_debugmodel_text"),
     ],
 )
 @pytest.mark.parametrize("dedup", [False, True])

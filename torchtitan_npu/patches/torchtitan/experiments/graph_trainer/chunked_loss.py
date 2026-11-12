@@ -115,7 +115,7 @@ def _can_coalesce(head, pred) -> bool:
 
 
 @wraps(_original_call)
-def _coalesced_call(self, pred, labels, global_valid_tokens=None, **loss_inputs):
+def _coalesced_call(self, pred, labels, global_loss_token_counts=None, **loss_inputs):
     head = self.lm_head
     if (
         type(self) is not ChunkedLossWrapperWithParamGrads
@@ -123,7 +123,7 @@ def _coalesced_call(self, pred, labels, global_valid_tokens=None, **loss_inputs)
         or not pred.requires_grad
         or head is None
     ):
-        return _original_call(self, pred, labels, global_valid_tokens, **loss_inputs)
+        return _original_call(self, pred, labels, global_loss_token_counts, **loss_inputs)
     supported = _can_coalesce(head, pred)
     if not getattr(self, "_coalesced_rs_logged", False):
         if supported:
@@ -132,13 +132,13 @@ def _coalesced_call(self, pred, labels, global_valid_tokens=None, **loss_inputs)
             logger.warning("[PATCH] Chunk-loss RS coalescing is unsupported for this head/layout; using upstream loss")
         self._coalesced_rs_logged = True  # pyrefly: ignore[missing-attribute]
     if not supported:
-        return _original_call(self, pred, labels, global_valid_tokens, **loss_inputs)
+        return _original_call(self, pred, labels, global_loss_token_counts, **loss_inputs)
 
     # Preserve the original all-gather and compute dtype, but defer gradient sync.
     local_head = _LocalGradientLMHead(head.weight, head._parameters["weight"])
     self.lm_head = local_head
     try:
-        return _original_call(self, pred, labels, global_valid_tokens, **loss_inputs)
+        return _original_call(self, pred, labels, global_loss_token_counts, **loss_inputs)
     finally:
         local_head.grad_hook.remove()
         self.lm_head = head

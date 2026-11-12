@@ -112,7 +112,7 @@ class SDC(Configurable):
 
     @staticmethod
     def _validate_compiled_sdc_config(config: Trainer.Config) -> None:
-        compile_config = config.compile
+        compile_config = getattr(config, "compile", None)
         model_compile = getattr(compile_config, "model", None)
         if model_compile is None:
             raise ValueError(

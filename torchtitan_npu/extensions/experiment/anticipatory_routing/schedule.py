@@ -295,7 +295,9 @@ class AnticipatorySchedule:
 
     def _credit_metrics(self, step_data: StepData) -> None:
         """Credit this step's tokens and data-loading cost at training time."""
-        self.metrics.ntokens_since_last_log += sum(microbatch.num_valid_tokens for microbatch in step_data.microbatches)
+        self.metrics.ntokens_since_last_log += sum(
+            int(microbatch.loss_token_counts.sum()) for microbatch in step_data.microbatches
+        )
         self.metrics.data_loading_times.extend(step_data.load_times)
 
     # -- data --------------------------------------------------------------

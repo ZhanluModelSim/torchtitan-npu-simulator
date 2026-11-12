@@ -19,11 +19,12 @@ from torchtitan.config import override
 from torchtitan.config.transform import apply_transforms
 
 from torchtitan_npu.extensions.torchtitan.trainer import TrainerEx
-from torchtitan_npu.models.deepseek_v4.config_registry import _dsv4_muon_profile, deepseek_v4_debugmodel
 from torchtitan_npu.models.deepseek_v4.lora import deepseek_v4_lora_transform, is_lora_parameter
+from torchtitan_npu.models.deepseek_v4.muon import _dsv4_muon_profile
 from torchtitan_npu.models.deepseek_v4.peft import DeepSeekV4PEFTCheckpointManager
 from torchtitan_npu.override.common.rope import WorkaroundComplexRoPE, workaround
 from torchtitan_npu.patches.torchtitan.models.common.rope import SplitComplexRoPEConfig
+from torchtitan_npu_recipes.models.deepseek_v4 import deepseek_v4_debugmodel
 
 logger = logging.getLogger(__name__)
 
@@ -102,7 +103,11 @@ class LoRATrainer(TrainerEx):
 
         if checkpoint.save_training_state and not checkpoint.load_only and step % checkpoint.interval == 0:
             state = self._optimizer_snapshot()
-            state_fields = ("momentum_buffer", "exp_avg") if self.config.optim.optimizer.name == "Muon" else ("exp_avg",)
+            state_fields = (
+                ("momentum_buffer", "exp_avg")
+                if self.config.optim.optimizer.name == "Muon"
+                else ("exp_avg",)
+            )
             for field in state_fields:
                 values = [value for name, value in state.items() if field in name]
                 assert values and any(torch.count_nonzero(value) for value in values), field

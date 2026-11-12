@@ -23,7 +23,11 @@ class TilelangSwiGLU(BinaryActivationFn):
     def __init__(self, config):
         self.swiglu_limit = config.swiglu_limit
 
-    def __call__(self, gate: torch.Tensor, up: torch.Tensor, **kwargs):
+    def _activation_fn(self, gate, up):
+        raise NotImplementedError("TileLang implements the fused activation")
+
+    def __call__(self, gate_up: torch.Tensor, **kwargs):
+        gate, up = gate_up.unbind(dim=-2)
         if isinstance(gate, DTensor) or isinstance(up, DTensor):
             raise ValueError("TileLang SwiGLU requires local SPMD inputs")
         shape = gate.shape

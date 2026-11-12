@@ -11,7 +11,6 @@ from typing import Annotated, Any, Literal
 
 import tyro
 from torchtitan.components.optim import AdamW, BaseOptimizer, DistMuon, Optim, OptimizersContainer
-from torchtitan.config import CompileConfig as _BaseCompileConfig
 from torchtitan.config import TrainingConfig as _BaseTrainingConfig
 from torchtitan.observability.profiler import Profiler as _BaseProfiler
 
@@ -29,9 +28,10 @@ class ModelCompileConfig:
 
 
 @dataclass(kw_only=True, slots=True)
-class CompileConfig(_BaseCompileConfig):
+class CompileConfig:
     """Upstream non-model compilation plus an explicit NPU model policy."""
 
+    components: list[str] = field(default_factory=list)
     model: Annotated[ModelCompileConfig | None, tyro.conf.AvoidSubcommands] = None
 
 

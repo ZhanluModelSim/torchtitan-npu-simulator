@@ -23,8 +23,8 @@ from torch.nn.utils.rnn import pad_sequence
 from torchtitan.components.data import GrainDataLoader, HuggingFaceStreamingSource
 from torchtitan.components.data.collators import Collator
 from torchtitan.components.data.dataset import SampleProcessor
+from torchtitan.components.data.multimodal.mm_datasets import MM_DATASETS, MMSamplePackingConfig
 from torchtitan.components.data.types import TokenizedTrainingMicrobatch
-from torchtitan.hf_datasets.multimodal.mm_datasets import MM_DATASETS, MMSamplePackingConfig
 
 from torchtitan_npu.models.common.alignment import validate_alignment
 
@@ -127,12 +127,14 @@ class _GrainV41Collator(Collator):
 
     def __call__(self, rows):
         inputs, labels = self.collate(rows)
+        padding_mask = inputs.pop("padding_mask")
         return TokenizedTrainingMicrobatch(
             input=inputs.pop("input"),
             labels=labels,
             positions=inputs.pop("positions"),
-            padding_mask=inputs.pop("padding_mask"),
-            num_valid_tokens=int((labels != -100).sum()),
+            padding_mask=padding_mask,
+            loss_token_counts=(labels != -100).sum(),
+            routing_token_counts=(~padding_mask).sum(),
             model_kwargs=inputs,
         )
 

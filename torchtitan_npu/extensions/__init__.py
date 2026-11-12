@@ -11,7 +11,6 @@ from .torchtitan import distributed, ep_process_group
 from .torchtitan.models import common
 from .torchtitan import trainer
 from .torchtitan.components import metrics
-from .torchtitan.experiments import graph_trainer
 from .torchtitan.tools import utils
 from .torchtitan import eager_flex
 from .compile import dynamo_config

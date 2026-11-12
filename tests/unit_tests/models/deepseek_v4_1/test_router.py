@@ -91,8 +91,6 @@ def _reference_expert_ids(scores, settings, balancing_bias):
             unsorted = torch.tensor(choice, dtype=scores.dtype).topk(top_k, dim=-1, sorted=False).indices
             assert torch.equal(unsorted.sort(-1).values, torch.tensor(chosen).sort(-1).values)
             chosen = unsorted.tolist()
-    if settings.get("_debug_force_load_balance"):
-        chosen = [[(token * top_k + slot) % 8 for slot in range(top_k)] for token in range(scores.shape[0])]
     return torch.tensor(chosen, dtype=torch.long)
 
 
@@ -156,18 +154,6 @@ def _reference_forward(inputs, weight, settings, balancing_bias):
             True,
             id="fixed-hash-ignores-choice-bias",
         ),
-        pytest.param(
-            {
-                "hash": True,
-                "vocab_size": 8,
-                "vision_enabled": True,
-                "_debug_force_load_balance": True,
-                "route_norm": True,
-                "route_scale": 0.6,
-            },
-            True,
-            id="debug-round-robin-overrides-hash",
-        ),
     ],
 )
 def test_plain_router_scores_routes_and_gate_gradients_match_reference(settings, with_balancing_bias):
@@ -198,7 +184,7 @@ def test_plain_router_scores_routes_and_gate_gradients_match_reference(settings,
         # For row 0 the strongest single expert is in group 0, but the sum
         # of the best two experts correctly chooses group 1.
         assert actual[1][0].tolist() == [4, 5]
-    if settings.get("hash") and not settings.get("_debug_force_load_balance"):
+    if settings.get("hash"):
         assert actual[1][0].tolist() == actual[1][2].tolist() == [5, 0]
 
     selected_upstream = torch.tensor(

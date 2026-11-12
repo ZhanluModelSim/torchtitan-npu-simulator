@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from torchao_npu.configs import ParamSwapConfig
-    from torchtitan.protocols.module import Module
+    from torchtitan.models.base.module import Module
 
     from torchtitan_npu.config.configs import KVNormQuantizationConfig, LIQuantization
 
@@ -128,10 +128,11 @@ def _quantization_converter(
     specific_npu_quant_modules: dict[type, type] | None = None,
     recurse: bool = False,
 ) -> NpuQuantizeConverter.Config:
+    if model_compile_enabled:
+        raise NotImplementedError("NPU quantization with model compilation is not supported in this upgrade")
     return NpuQuantizeConverter.Config(
         base_config=base_config,
         filter_fn=filter_fn,
-        model_compile_enabled=model_compile_enabled,
         replacement_config_type=replacement_config_type,
         replacement_kwargs=replacement_kwargs or {},
         prequantize_fqns=prequantize_fqns,

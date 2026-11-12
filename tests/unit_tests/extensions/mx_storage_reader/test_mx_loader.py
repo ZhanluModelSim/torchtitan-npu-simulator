@@ -280,7 +280,7 @@ def test_only_v4_selects_mx_reader(reader_module, monkeypatch, tmp_path, weight_
     fallback = object()
 
     class V3Adapter:
-        def get_hf_storage_reader(self, path, from_quantized=False):
+        def get_hf_storage_reader(self, path, from_quantized=False, *, thread_count=None):
             return fallback
 
     original = V3Adapter.get_hf_storage_reader

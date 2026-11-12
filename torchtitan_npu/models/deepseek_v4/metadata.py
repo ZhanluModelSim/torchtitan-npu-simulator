@@ -180,8 +180,8 @@ class DeepSeekV4Metadata:
         raise ValueError(
             "the DeepSeek-V4 reference stack does not support context parallel: its metadata "
             "describes one contiguous document stream, so it cannot describe a rank-local row. "
-            "Enable the fused stack (override.deepseek_v4.sparse_attn.asc) to run with "
-            "--parallelism.context-parallel-degree."
+            "The current eager V4 upgrade requires CP=1. Legacy geometry backends "
+            "require explicit configuration and separate validation."
         )
 
 

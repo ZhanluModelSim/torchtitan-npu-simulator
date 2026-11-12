@@ -47,7 +47,7 @@ __all__ = [
 def build_torchtitan_config(model_flavor: str):
     """Build the registered TorchTitan config for one DSV4 flavor."""
 
-    from torchtitan_npu.models.deepseek_v4 import config_registry
+    from torchtitan_npu_recipes.models import deepseek_v4 as config_registry
 
     factory_name = _MODEL_CONFIG_FACTORIES.get(model_flavor)
     if factory_name is None:

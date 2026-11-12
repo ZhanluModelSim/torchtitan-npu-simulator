@@ -57,7 +57,7 @@ SIG 例会：[sig-framework-adapter](https://meeting.osinfra.cn/cann?sig=sig-fra
 ```shell
 git clone https://gitcode.com/cann/torchtitan-npu.git
 cd torchtitan-npu
-git checkout master
+git checkout dev_0.4.0
 pip install -r requirements.txt
 pip install -e .
 ```
@@ -67,6 +67,8 @@ pip install -e .
 # 快速上手
 快速启动大语言模型的训练任务，参见
 [快速上手文档](https://gitcode.com/cann/torchtitan-npu/tree/master/docs/user-guides/quickstart.md) 。
+
+完整训练配置位于 [`torchtitan_npu_recipes`](torchtitan_npu_recipes/README.md)，自定义训练组合见 [Python 配置指南](docs/developer_guides/python_recipes.md)。
 
 
 <a id="特性支持概览"></a>

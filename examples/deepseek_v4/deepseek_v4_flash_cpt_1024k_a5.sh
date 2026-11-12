@@ -4,23 +4,16 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-# 1M sequence specialization. Reuse the A5 4K wrapper and override only the
-# Trainer configuration that differs from the 4K setup. User CLI arguments are
-# appended last and therefore can override these defaults.
-
 set -euo pipefail
 
-# Quantization defaults are inherited from the A5 4K wrapper.
-
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-
-CONFIG="${CONFIG:-deepseek_v4_flash_cp_cpt}" \
-DSV4_PER_DOC_ALIGNMENT="${DSV4_PER_DOC_ALIGNMENT:-16384}" \
-exec bash "${SCRIPT_DIR}/deepseek_v4_flash_cpt_4k_a5.sh" \
-    --training.max-context-length 1048576 \
-    --training.num-tokens-per-microbatch-per-dp-rank 1048576 \
-    --training.num-tokens-per-train-step 8388608 \
-    --parallelism.context-parallel-degree 128 \
-    --parallelism.data-parallel-shard-degree 1 \
-    --parallelism.data-parallel-replicate-degree 1 \
-    "$@"
+MODULE="${MODULE:-torchtitan_npu_recipes.examples.deepseek_v4}" \
+CONFIG="${CONFIG:-deepseek_v4_flash_cpt_1024k_a5}" \
+NGPU="${NGPU:-8}" \
+NNODES="${NNODES:-$(awk -F, '{print NF ? NF : 16}' <<< "${NODE_IPS:-}")}" \
+CPU_AFFINITY_CONF="${CPU_AFFINITY_CONF:-1,npu0:288-311,npu1:312-335,npu2:336-359,npu3:360-383,npu4:96-119,npu5:120-143,npu6:144-167,npu7:168-191}" \
+HCCL_CONNECT_TIMEOUT="${HCCL_CONNECT_TIMEOUT:-7200}" \
+HCCL_EXEC_TIMEOUT="${HCCL_EXEC_TIMEOUT:-17330}" \
+ACL_DEVICE_SYNC_TIMEOUT="${ACL_DEVICE_SYNC_TIMEOUT:-2147480}" \
+HCCL_EVENT_TIMEOUT="${HCCL_EVENT_TIMEOUT:-2147480}" \
+HCCL_ASYNC_ERROR_HANDLING="${HCCL_ASYNC_ERROR_HANDLING:-0}" \
+exec bash "$(dirname -- "${BASH_SOURCE[0]}")/../../scripts/run_train_multinodes.sh" "$@"

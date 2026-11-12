@@ -22,7 +22,7 @@
   esac
   export CLI_OVERRIDES="torchtitan_npu.override.deepseek_v4_1.engram.host_offload_mxfp8={\"num_max_tokens_per_rank\":3072,\"shard_over_efsdp\":$joint}"
   export NGPU=4 LOG_RANK=0,1,2,3
-  export MODULE=torchtitan_npu.models.deepseek_v4_1
+  export MODULE=torchtitan_npu_recipes.models.deepseek_v4_1
   export CONFIG=deepseek_v4_1_debugmodel_text
   export DATASET=c4_test DATASET_PATH="$PWD/tests/assets/c4_test"
   : "${HF_ASSETS_PATH:?Set HF_ASSETS_PATH to the V4.1 tokenizer assets}"

@@ -15,27 +15,25 @@ import torch.nn.functional as F
 from attn_gym.sparse import gather_attn
 from attn_gym.sparse.indexer import lightning_indexer
 from torch.distributed.tensor import DTensor, Replicate
+from torchtitan.models.base.module import Module
 from torchtitan.models.common import LayerNorm, Linear
 from torchtitan.models.common.attention import (
-    AttentionMasksType,
+    VarlenAttentionMetadata,
     VarlenInnerAttention,
-    VarlenMetadata,
     create_varlen_metadata_for_document,
 )
 from torchtitan.models.common.aux_loss import AuxLoss
 from torchtitan.models.common.decoder import Decoder
 from torchtitan.models.common.rope import RoPE
-from torchtitan.models.deepseek_v3.model import (
-    Attention as V3Attention,
-)
+from torchtitan.models.deepseek_v3.attention import DeepSeekMLAAttention as V3Attention
 from torchtitan.models.deepseek_v3.model import (
     DeepSeekV3Model,
 )
-from torchtitan.models.deepseek_v3.mtp import MTPDecoder
-from torchtitan.protocols.module import Module
 
 from torchtitan_npu.models.common.document_intervals import document_intervals
 from torchtitan_npu.patches.torchtitan.models.common.linear import BatchedLinear
+
+AttentionMasksType = Any  # TODO(CANN): replace with the v0.4 attention-metadata type during the V3.2 migration.
 
 
 @functools.cache
@@ -108,7 +106,7 @@ class Indexer(Module):
         idx_q_BLNH: torch.Tensor,
         idx_k_BL1H: torch.Tensor,
         idx_w_BLN: torch.Tensor,
-        attention_masks: VarlenMetadata,
+        attention_masks: VarlenAttentionMetadata,
         index_topk: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """The top-k selection and the student's logits at the slots it picked.
@@ -219,7 +217,7 @@ class SparseIndexerLoss(AuxLoss):
         scale: float,
         topk_indices_BLqK: torch.Tensor,
         topk_scores_BLqK: torch.Tensor,
-        attention_masks: VarlenMetadata,
+        attention_masks: VarlenAttentionMetadata,
         *,
         carrier: torch.Tensor,
     ) -> torch.Tensor:
@@ -311,7 +309,7 @@ class SparseInnerAttention(VarlenInnerAttention):
             padding_mask: torch.Tensor | None = None,
             max_num_documents: int | None = None,
             max_context_length: int | None = None,
-        ) -> VarlenMetadata:
+        ) -> VarlenAttentionMetadata:
             """The packed document layout the reference core reads.
 
             Upstream #4897 makes the attention backend own this construction, so
@@ -336,7 +334,7 @@ class SparseInnerAttention(VarlenInnerAttention):
         idx_k_BL1H: torch.Tensor,
         idx_w_BLN: torch.Tensor,
         *,
-        attention_masks: VarlenMetadata,
+        attention_masks: VarlenAttentionMetadata,
         scale: float,
     ) -> torch.Tensor:
         q_BLNH = torch.cat([q_nope_BLNH, q_rope_BLNH], dim=-1)
@@ -375,7 +373,7 @@ class SparseInnerAttention(VarlenInnerAttention):
         q_BLNH: torch.Tensor,
         k_BL1H: torch.Tensor,
         topk_indices_BLqK: torch.Tensor,
-        attention_masks: VarlenMetadata,
+        attention_masks: VarlenAttentionMetadata,
         value_head_dim: int,
         scale: float,
     ) -> torch.Tensor:
@@ -442,7 +440,7 @@ class Attention(V3Attention):
     def forward(  # pyrefly: ignore [bad-param-name-override]
         self,
         x_BLD: torch.Tensor,
-        attention_masks: AttentionMasksType,
+        attention_masks: VarlenAttentionMetadata,
         positions: torch.Tensor | None = None,
     ):
         bsz, seqlen, _ = x_BLD.size()
@@ -589,7 +587,6 @@ class DeepSeekV32Model(DeepSeekV3Model):
                 for _, rope_cfg, _, _ in self.traverse(RoPE.Config):
                     setattr(rope_cfg, "max_context_length", seq_len)  # noqa: B010
 
-            MTPDecoder.Config.update_from_config(self, config=config, **kwargs)
             parallelism = config.parallelism
 
             from torchtitan_npu.models.deepseek_v3_2.sharding import (

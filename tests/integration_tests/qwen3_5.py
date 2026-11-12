@@ -31,7 +31,7 @@ def _build_case(
         ngpu=ngpu,
         disabled=disabled,
         env_vars={
-            "MODULE": "torchtitan_npu.models.qwen3_5",
+            "MODULE": "torchtitan_npu_recipes.models.qwen3_5",
             "CONFIG": "qwen35_debugmodel",
         },
         use_golden=False,

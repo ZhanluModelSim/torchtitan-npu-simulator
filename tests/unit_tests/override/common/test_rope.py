@@ -57,6 +57,32 @@ def test_workaround_rope_matches_complex_reference(position_dtype, explicit_posi
     torch.testing.assert_close(actual, expected)
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("inverse", [False, True])
+def test_workaround_split_rope_matches_real_rotation_forward_and_gradient(dtype, inverse):
+    config = ComplexRoPE.Config(dim=8, max_context_length=16, split=4)
+    reference = ComplexRoPE(config)
+    workaround = WorkaroundComplexRoPE(derive(config, WorkaroundComplexRoPE.Config))
+    generator = torch.Generator().manual_seed(17)
+    query = torch.randn(6, 2, 12, generator=generator, dtype=dtype).requires_grad_()
+    expected_query = query.detach().clone().requires_grad_()
+    positions = torch.tensor([0, 1, 2, 0, 1, 2])
+
+    actual = workaround(query, positions=positions, inverse=inverse)
+    cache = reference.cache[positions].unsqueeze(1)
+    cos, sin = cache.real, cache.imag
+    if inverse:
+        sin = -sin
+    even, odd = expected_query[..., 4::2].float(), expected_query[..., 5::2].float()
+    rotated = torch.stack((even * cos - odd * sin, odd * cos + even * sin), dim=-1).flatten(-2)
+    expected = torch.cat((expected_query[..., :4], rotated.to(dtype)), dim=-1)
+    actual.float().sum().backward()
+    expected.float().sum().backward()
+
+    torch.testing.assert_close(query.grad, expected_query.grad, rtol=0, atol=0)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("rope_cls", [WorkaroundComplexRoPE, AscComplexRoPE])
 def test_interleaved_rope_cache_pool_reuses_compatible_cache(rope_cls):
     first = rope_cls(rope_cls.Config(dim=8, max_context_length=16))

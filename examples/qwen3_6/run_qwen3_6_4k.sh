@@ -6,50 +6,9 @@
 
 set -euo pipefail
 
-if [[ -n "${ASCEND_SET_ENV_PATH:-}" ]]; then
-    source "${ASCEND_SET_ENV_PATH}"
-elif [[ -f /usr/local/Ascend/cann/set_env.sh ]]; then
-    source /usr/local/Ascend/cann/set_env.sh
-elif [[ -f /usr/local/Ascend/ascend-toolkit/set_env.sh ]]; then
-    source /usr/local/Ascend/ascend-toolkit/set_env.sh
-else
-    source /home/developer/Ascend/ascend-toolkit/set_env.sh
-fi
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
-: "${HF_ASSETS_PATH:?Set HF_ASSETS_PATH to the Qwen3.5/Qwen3.6 Hugging Face model directory}"
-: "${DATA_FILES:?Set DATA_FILES to the CANNBOT 4K SFT JSONL file}"
-
-NGPU=${NGPU:-16}
-SEQ_LEN=${SEQ_LEN:-4096}
-TRAIN_FILE=${TRAIN_FILE:-torchtitan_npu.train}
-((SEQ_LEN >= 64 && SEQ_LEN <= 4096 && SEQ_LEN % 64 == 0)) || {
-    echo "SEQ_LEN must be a multiple of 64 in [64, 4096], got ${SEQ_LEN}" >&2
-    exit 1
-}
-export LOG_RANK=${LOG_RANK:-0}
-export DATA_FILES
-
-ARGS=(
-    --module torchtitan_npu.models.qwen3_5.config_registry
-    --config qwen35_27b_4k_sft
-    --hf-assets-path "${HF_ASSETS_PATH}"
-    --override.imports torchtitan_npu.override.qwen3_5.gated_delta.triton
-    --checkpointer.initial-load-path "${CHECKPOINT_INITIAL_LOAD_PATH:-${HF_ASSETS_PATH}}"
-    --checkpointer.initial-load-in-hf
-    --checkpointer.initial-load-model-only
-    --dump-folder "${DUMP_FOLDER:-./outputs/qwen3_6_4k_sft}"
-    --training.max-context-length "${SEQ_LEN}"
-    --training.num-tokens-per-microbatch-per-dp-rank "${SEQ_LEN}"
-    "$@"
-)
-
-PYTORCH_NPU_ALLOC_CONF=${PYTORCH_NPU_ALLOC_CONF:-expandable_segments:True} \
-    CUDA_DEVICE_MAX_CONNECTIONS=${CUDA_DEVICE_MAX_CONNECTIONS:-1} \
-    CPU_AFFINITY_CONF=${CPU_AFFINITY_CONF:-1} \
-    TASK_QUEUE_ENABLE=${TASK_QUEUE_ENABLE:-2} \
-    HCCL_CONNECT_TIMEOUT=${HCCL_CONNECT_TIMEOUT:-3600} \
-    STREAMS_PER_DEVICE=${STREAMS_PER_DEVICE:-32} \
-    MULTI_STREAM_MEMORY_RESERVE=${MULTI_STREAM_MEMORY_RESERVE:-1} \
-    torchrun --nproc-per-node "${NGPU}" --rdzv-backend c10d --rdzv-endpoint localhost:0 \
-    --local-ranks-filter "${LOG_RANK}" --role rank --tee 3 -m "${TRAIN_FILE}" \
-    "${ARGS[@]}"
+MODULE="${MODULE:-torchtitan_npu_recipes.examples.qwen3_6}" \
+CONFIG="${CONFIG:-run_qwen3_6_4k}" \
+NGPU="${NGPU:-16}" \
+exec bash "${SCRIPT_DIR}/../../scripts/run_train.sh" "$@"

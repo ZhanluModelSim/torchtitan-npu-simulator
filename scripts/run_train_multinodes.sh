@@ -6,6 +6,9 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+cd "${SCRIPT_DIR}/.."
+
 if [ -n "${ASCEND_SET_ENV_PATH:-}" ]; then
     source "${ASCEND_SET_ENV_PATH}"
 elif [ -f /usr/local/Ascend/cann/set_env.sh ]; then
@@ -53,6 +56,7 @@ MASTER_PORT=${MASTER_PORT:-6300}
 NNODES=${NNODES:-${#IPs[@]}}
 NODE_RANK=${NODE_RANK:-}
 for i in "${!IPs[@]}"; do
+    [[ -n "${NODE_RANK}" ]] && break
     if [[ "$LOCAL_HOST" == "${IPs[$i]}" ]]; then
         echo "Node Rank : ${i}"
         NODE_RANK=$i
@@ -64,8 +68,8 @@ if [[ $NODE_RANK == "" ]]; then
     exit 1
 fi
 
-MODULE=${MODULE:-"torchtitan.models.deepseek_v3"}
-CONFIG=${CONFIG:-"deepseek_v3_debugmodel"}
+MODULE=${MODULE:-"torchtitan_npu_recipes.models.deepseek_v4"}
+CONFIG=${CONFIG:-"deepseek_v4_debugmodel"}
 TRAIN_FILE=${TRAIN_FILE:-torchtitan_npu.train}
 time=$(date +%Y%m%d%H%M)
 logfile=${LOG_PREFIX:-${CONFIG}}_${time}_node${NODE_RANK}_${LOCAL_HOST//./_}.log
@@ -79,10 +83,10 @@ torchrun \
     --nproc_per_node=${NPUS_PER_NODE} \
     --master_addr=${MASTER_ADDR} \
     --master_port=${MASTER_PORT} \
-    --local-ranks-filter ${LOG_RANK} \
+    --local-ranks-filter "${LOG_RANK}" \
     --role rank \
     --tee 3 \
     -m "${TRAIN_FILE}" \
     --module "${MODULE}" \
     --config "${CONFIG}" \
-    "$@" 2>&1 | tee -a logs/${logfile}
+    "$@" 2>&1 | tee -a "logs/${logfile}"

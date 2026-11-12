@@ -8,12 +8,12 @@
 from functools import wraps
 from typing import cast
 
-from torchtitan.config.manager import ConfigManager
+from torchtitan.config.loader import ConfigLoader
 from torchtitan.trainer import Trainer
 
 from torchtitan_npu.config.converters import TrainerConfigConverter
 
-_original_load_config = ConfigManager._load_config
+_original_load_config = ConfigLoader._load_config
 
 _CONFIG_CONVERTERS: dict[type[object], TrainerConfigConverter] = {}
 
@@ -34,19 +34,17 @@ def register_config_converter(
 
 
 @wraps(_original_load_config)
-def _patched_load_config(self, args: list[str]) -> tuple[object, list[str]]:
-    config, filtered_args = _original_load_config(self, args)
-    # A recipe-owned Trainer subclass still needs the registered component
-    # adapters. Prefer its nearest registered base and preserve its owner.
+def _patched_load_config(module_name: str, config_name: str) -> object:
+    config = _original_load_config(module_name, config_name)
     converter = next((_CONFIG_CONVERTERS[base] for base in type(config).__mro__ if base in _CONFIG_CONVERTERS), None)
     if converter is not None:
         config = converter.convert(cast("Trainer.Config", config))
-    return config, filtered_args
+    return config
 
 
 def apply() -> None:
     """Install the loader wrapper that dispatches registered config converters."""
-    ConfigManager._load_config = _patched_load_config  # type: ignore[method-assign]
+    ConfigLoader._load_config = staticmethod(_patched_load_config)  # type: ignore[method-assign]
 
 
 apply()

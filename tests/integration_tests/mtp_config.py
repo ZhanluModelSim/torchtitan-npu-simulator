@@ -7,7 +7,7 @@
 
 from torchtitan.config.transform import ContextParallelTransform
 
-from torchtitan_npu.models.deepseek_v4.config_registry import deepseek_v4_debugmodel
+from torchtitan_npu_recipes.models.deepseek_v4 import deepseek_v4_debugmodel
 
 
 def _debugmodel_cp(*, num_mtp_layers: int):

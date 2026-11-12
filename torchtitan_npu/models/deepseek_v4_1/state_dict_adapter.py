@@ -16,7 +16,7 @@ the markers and the router's vision bias belong to
 from __future__ import annotations
 
 import re
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 from torch.distributed.tensor import DTensor
@@ -29,6 +29,7 @@ from .engram.checkpoint import checkpoint_shard
 from .indexer import REUSE
 
 if TYPE_CHECKING:
+    from .model import DeepSeekV41Model
     from .vision.state_dict_adapter import DeepSeekV41VisionStateDictAdapter
 
 
@@ -67,14 +68,14 @@ class DeepSeekV41StateDictAdapter(DeepSeekPEFTAdapter, DeepSeekV3StateDictAdapte
             "layers.{}.attn_norm.weight": "layers.{}.attention_norm.weight",
             "layers.{}.ffn_norm.weight": "layers.{}.ffn_norm.weight",
             # MoE
-            "layers.{}.ffn.experts.{}.w1.weight": "layers.{}.moe.routed_experts.w1_EFD",
-            "layers.{}.ffn.experts.{}.w3.weight": "layers.{}.moe.routed_experts.w3_EFD",
-            "layers.{}.ffn.experts.{}.w2.weight": "layers.{}.moe.routed_experts.w2.weight",
-            "layers.{}.ffn.gate.weight": "layers.{}.moe.router.gate.weight",
-            "layers.{}.ffn.gate.bias": "layers.{}.moe.expert_bias_E",
-            "layers.{}.ffn.shared_experts.w1.weight": "layers.{}.moe.shared_experts.w1.weight",
-            "layers.{}.ffn.shared_experts.w3.weight": "layers.{}.moe.shared_experts.w3.weight",
-            "layers.{}.ffn.shared_experts.w2.weight": "layers.{}.moe.shared_experts.w2.weight",
+            "layers.{}.ffn.experts.{}.w1.weight": "layers.{}.feed_forward.routed_experts.w1_EFD",
+            "layers.{}.ffn.experts.{}.w3.weight": "layers.{}.feed_forward.routed_experts.w3_EFD",
+            "layers.{}.ffn.experts.{}.w2.weight": "layers.{}.feed_forward.routed_experts.w2.weight",
+            "layers.{}.ffn.gate.weight": "layers.{}.feed_forward.router.gate.weight",
+            "layers.{}.ffn.gate.bias": "layers.{}.feed_forward.expert_bias_E",
+            "layers.{}.ffn.shared_experts.w1.weight": "layers.{}.feed_forward.shared_experts.w1.weight",
+            "layers.{}.ffn.shared_experts.w3.weight": "layers.{}.feed_forward.shared_experts.w3.weight",
+            "layers.{}.ffn.shared_experts.w2.weight": "layers.{}.feed_forward.shared_experts.w2.weight",
             # Engram
             "layers.{}.engram.embed.weight": "layers.{}.engram.table.weight",
             "layers.{}.engram.wkv.weight": "layers.{}.engram.gate.wkv",
@@ -141,26 +142,30 @@ class DeepSeekV41StateDictAdapter(DeepSeekPEFTAdapter, DeepSeekV3StateDictAdapte
     def _owns_vision_local_key(self, key: str) -> bool:
         return self._vision_adapter is not None and self._vision_adapter.owns_local_key(key)
 
-    def from_hf(self, hf_state_dict: dict[str, Any]) -> dict[str, Any]:
+    def from_hf(self, hf_state_dict: dict[str, Any], *, is_quantized_layout: bool = False) -> dict[str, Any]:
         vision_hf = {k: v for k, v in hf_state_dict.items() if self._owns_vision_hf_key(k)}
         base_hf = {k: v for k, v in hf_state_dict.items() if not self._owns_vision_hf_key(k)}
+        if is_quantized_layout:
+            raise NotImplementedError("V4.1 quantized HF layout is not supported.")
         result = self._from_hf_text(base_hf)
         if self._vision_adapter is not None:
             result.update(self._vision_adapter.from_hf(vision_hf))
         return result
 
-    def get_hf_storage_reader(self, path: str, from_quantized: bool = False):
+    def get_hf_storage_reader(self, path: str, from_quantized: bool = False, *, thread_count: int | None = None):
         if self._engram_tables:
             shapes = {
                 f"layers.{i}.engram.embed.weight": (sum(config.head_vocab_sizes), config.embedding_dim)
                 for i, config in self._engram_tables.items()
             }
             return EngramHuggingFaceStorageReader(path, table_shapes=shapes, from_quantized=from_quantized)
-        return super().get_hf_storage_reader(path, from_quantized)
+        return super().get_hf_storage_reader(path, from_quantized, thread_count=thread_count)
 
-    def to_hf(self, state_dict: dict[str, Any]) -> dict[str, Any]:
+    def to_hf(self, state_dict: dict[str, Any], *, to_quantized_layout: bool = False) -> dict[str, Any]:
         vision_local = {k: v for k, v in state_dict.items() if self._owns_vision_local_key(k)}
         base_local = {k: v for k, v in state_dict.items() if not self._owns_vision_local_key(k)}
+        if to_quantized_layout:
+            raise NotImplementedError("V4.1 quantized HF layout is not supported.")
         result = self._to_hf_text(base_local)
         if self._vision_adapter is not None:
             result.update(self._vision_adapter.to_hf(vision_local))
@@ -224,7 +229,7 @@ class DeepSeekV41StateDictAdapter(DeepSeekPEFTAdapter, DeepSeekV3StateDictAdapte
                         layer_num,
                     )
                 else:
-                    num_experts = self.model_config.layers[0].moe.num_experts  # pyrefly: ignore [missing-attribute]
+                    num_experts = cast("DeepSeekV41Model.Config", self.model_config).layers[0].feed_forward.num_experts
                     stacked = self._concatenate_expert_weights(
                         expert_weights,
                         titan_abstract,
@@ -282,7 +287,7 @@ class DeepSeekV41StateDictAdapter(DeepSeekPEFTAdapter, DeepSeekV3StateDictAdapte
             elif any(t in key for t in ("compressor", "indexer")):
                 hf_state_dict[to_hf_map[key]] = value
 
-            elif "moe.routed_experts" in key:
+            elif "feed_forward.routed_experts" in key:
                 abstract_key = re.sub(r"(\d+)", "{}", key, count=1)
                 new_abstract, layer_num = self._map_to_hf_layer_key(key, to_hf_map)
 
@@ -298,7 +303,7 @@ class DeepSeekV41StateDictAdapter(DeepSeekPEFTAdapter, DeepSeekV3StateDictAdapte
                     )
                     hf_state_dict.update(local_fqn)
                 else:
-                    num_experts = self.model_config.layers[0].moe.num_experts  # pyrefly: ignore [missing-attribute]
+                    num_experts = cast("DeepSeekV41Model.Config", self.model_config).layers[0].feed_forward.num_experts
                     split_values = self._split_experts_weights(value, num_experts)
                     for e in range(num_experts):
                         hf_state_dict[new_abstract.format(layer_num, e)] = split_values[e].squeeze()

@@ -8,32 +8,27 @@
 ``Decoder.preprocess_inputs`` is the seam under test: it builds the per-layer
 attention-metadata map out of the attention backends' builders and, under context
 parallelism, shards the inputs.  A CPU unit test has no process group, so the framework's
-CP entry cannot run: :func:`install_doc_chunk_cp_shard` reproduces what it does for a run with the
-doc-chunk layout -- permute the replicated row, then one even slice per rank -- which is the
-configuration both DeepSeek stacks run; the map's own CP transform is ``Decoder._cp_shard``'s
-and runs before it.
+The geometry map is produced by the model's shared metadata seam. Context parallelism is deferred
+for this upgrade.
 """
 
-import copy
 import importlib
 from types import SimpleNamespace
 
 import torch
-from torchtitan.distributed.spmd_types import spmd_dense_mesh
 from torch.utils.checkpoint import DefaultDeviceType
-from torchtitan.config.parallelism import ParallelismConfig
+from torchtitan.distributed.spmd_types import spmd_dense_mesh
 
 from tests.unit_tests.models.mtp_test_utils import build_cpu_model
-from torchtitan_npu.models.common.restore import (
-    DOC_CHUNK_LAYOUT,
-    doc_chunk_permutation,
-    document_starts,
-)
 
 # ``preprocess_inputs`` takes the parallelism context; these models run a single process
 # with no CP and the default SPMD backend.
-_NO_CP_CONTEXT = SimpleNamespace(cp_enabled=False, get_mesh=lambda name: None, spmd_dense_mesh=spmd_dense_mesh)
-_PARALLELISM = ParallelismConfig()
+_NO_CP_DIMS = SimpleNamespace(cp_enabled=False, get_mesh=lambda name: None, spmd_dense_mesh=spmd_dense_mesh)
+_NO_SPMD = SimpleNamespace(
+    spmd_backend="partial_dtensor",
+    context_parallel_load_balancer=None,
+    context_parallel_ptrr_mask_key=None,
+)
 
 
 def tiny_v41_model(monkeypatch, *, configure=None):
@@ -65,7 +60,10 @@ def tiny_v41_model(monkeypatch, *, configure=None):
         return make_config(**kwargs)
 
     monkeypatch.setattr(registry, "_make_v41_config", tiny_config)
-    config = registry.model_registry("deepseek_v4_1_debugmodel")
+    from torchtitan.models.common import decoder as decoder_module
+
+    monkeypatch.setattr(decoder_module, "annotate_input_spmd_types", lambda _ctx, batch, _layouts: batch)
+    config = registry.model_registry("deepseek_v4_1_debugmodel_text")
     config.vocab_size = config.tok_embeddings.num_embeddings = config.lm_head.out_features = 64
     if configure is not None:
         configure(config)
@@ -84,20 +82,10 @@ def preprocess(model, tokens, labels, positions, *, parallel_dims=None, parallel
     ``batch`` carries the dataloader's other keys (the modality tensors, say) straight into
     ``input_dict``, exactly as the trainer hands them over.
     """
-    # Real loaders keep target storage distinct from model tokens; their SPMD types differ.
-    if labels is tokens:
-        labels = labels.clone()
-    if parallelism is None:
-        parallelism = _PARALLELISM
-    elif parallelism.context_parallel_load_balancer == DOC_CHUNK_LAYOUT:
-        from torchtitan_npu.patches.torchtitan.distributed.context_parallel import DocChunkCPLoadBalancer
-
-        parallelism = copy.copy(parallelism)
-        parallelism.context_parallel_load_balancer = DocChunkCPLoadBalancer.Config()
-    inputs, labels, extra_kwargs = model.preprocess_inputs(
+    inputs, labels, extra_kwargs, _ = model.preprocess_inputs(
         {"input": tokens, "labels": labels, "positions": positions, **batch},
-        parallelism_context=_NO_CP_CONTEXT if parallel_dims is None else parallel_dims,
-        parallelism=parallelism,
+        parallelism_context=_NO_CP_DIMS if parallel_dims is None else parallel_dims,
+        parallelism=_NO_SPMD if parallelism is None else parallelism,
     )
     assert "attention_metadata" in extra_kwargs, "expected the attention backends to build the metadata map"
     return inputs, labels, extra_kwargs
@@ -130,44 +118,3 @@ def cp_parallel_dims(cp_size: int, cp_rank: int) -> SimpleNamespace:
     """A parallelism context with CP on, over :class:`FakeCpMesh`."""
     mesh = FakeCpMesh(cp_size, cp_rank)
     return SimpleNamespace(cp_enabled=True, get_mesh=lambda name: mesh, spmd_dense_mesh=spmd_dense_mesh)
-
-
-def install_doc_chunk_cp_shard(monkeypatch) -> None:
-    """Stand in for the framework's CP input shard, on CPU.
-
-    With the doc-chunk layout the framework permutes the replicated row and slices it evenly,
-    so rank ``r`` holds chunk ``r`` of every document; this reproduces that without a device
-    mesh or a collective.  Only the shard is stubbed: the map's own CP transform is
-    ``Decoder._cp_shard``'s, and it runs before the shard, on the pre-shard positions, which
-    is the geometry the transform derives this rank's copy from.
-    """
-    from torchtitan.distributed import context_parallel
-
-    from torchtitan_npu.patches.torchtitan.distributed import context_parallel as cp_patch
-    from torchtitan_npu.patches.torchtitan.models.common.attention_metadata import cp_shard_context
-
-    def cp_group(axis):
-        assert axis == "cp"
-        return SimpleNamespace(size=lambda: cp_shard_context().cp_mesh.size())
-
-    def shard(batch, *, input_shardings, permutation):
-        context = cp_shard_context()
-        cp_mesh = context.cp_mesh
-        positions = context.positions
-        if context.load_balancer_type != DOC_CHUNK_LAYOUT or positions is None:
-            raise AssertionError("the CPU stand-in only reproduces the doc-chunk layout")
-        slab = positions.numel() // cp_mesh.size()
-        expected = doc_chunk_permutation(document_starts(positions), cp_mesh.size(), slab)
-        torch.testing.assert_close(permutation, expected, rtol=0, atol=0)
-        lo = cp_mesh.get_local_rank() * slab
-        held = permutation[0][lo : lo + slab]
-        shard_dims = context_parallel._cp_shard_dims(input_shardings)
-        return {
-            key: torch.index_select(value, shard_dims[key], held)
-            if key in shard_dims and isinstance(value, torch.Tensor)
-            else value
-            for key, value in batch.items()
-        }
-
-    monkeypatch.setattr(cp_patch, "spmd_mesh_group", cp_group)
-    monkeypatch.setattr(context_parallel, "shard_tensors", shard)

@@ -10,7 +10,7 @@ from dataclasses import dataclass
 import cann_ops_transformer  # noqa: F401  (registers the fused operators)
 import torch
 from torch.utils._pytree import SUPPORTED_NODES, register_dataclass
-from torchtitan.models.common.cp_attention import CPInnerAttention
+from torchtitan.models.common.attention.cp_attention import CPInnerAttention
 
 from torchtitan_npu.models.common.alignment import require_document_alignment
 from torchtitan_npu.models.common.metadata import KernelFrame

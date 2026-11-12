@@ -7,28 +7,26 @@ from __future__ import annotations
 
 import copy
 import math
+from dataclasses import replace
 
 import numpy as np
 import pytest
 import torch
 import torch.nn.functional as F
-from torchtitan.config.manager import ConfigManager
 from torchtitan.components.optim import AdamW, DistMuon
-from torchtitan_npu.extensions.torchtitan.components.optimizer.optimizer import SparseAdam
 
 from tests.unit_tests.models.deepseek_v4_1.preprocess_utils import cp_parallel_dims, tiny_v41_model
 from torchtitan_npu.config import OptimizerConfig
+from torchtitan_npu.extensions.torchtitan.components.optimizer.optimizer import SparseAdam
 from torchtitan_npu.models.deepseek_v4_1 import (
     EngramArgs,
     model_registry,
-)
-from torchtitan_npu.models.deepseek_v4_1.config_registry import (
-    deepseek_v4_1_debugmodel_multimodal,
 )
 from torchtitan_npu.models.deepseek_v4_1.engram.config import _make_engram_configs
 from torchtitan_npu.models.deepseek_v4_1.state_dict_adapter import (
     DeepSeekV41StateDictAdapter,
 )
+from torchtitan_npu_recipes.models.deepseek_v4_1 import deepseek_v4_1_debugmodel_multimodal
 
 pytestmark = pytest.mark.cpu
 
@@ -340,20 +338,9 @@ def test_image_tokens_reset_hash_history_and_receive_no_residual_gradient():
 
 @pytest.mark.parametrize("optimizer", ["AdamW", "Muon"])
 def test_explicit_disable_preserves_selected_optimizer(optimizer):
-    trainer = deepseek_v4_1_debugmodel_multimodal()
-    trainer = ConfigManager().parse_args(
-        [
-            "--module",
-            "torchtitan_npu.models.deepseek_v4_1",
-            "--config",
-            "deepseek_v4_1_debugmodel_multimodal",
-            "--no-engram-enabled",
-            "--optim.optimizer.name",
-            optimizer,
-            "--training.num-tokens-per-microbatch-per-dp-rank",
-            "512",
-        ]
-    )
+    trainer = replace(deepseek_v4_1_debugmodel_multimodal(), engram_enabled=False)
+    trainer.optim.optimizer.name = optimizer
+    trainer.training.num_tokens_per_microbatch_per_dp_rank = 512
     trainer.model.update_from_config(config=trainer)
     assert all(layer.engram is None for layer in trainer.model.layers)
     assert type(trainer.optim.optimizer) is OptimizerConfig
@@ -371,8 +358,8 @@ def test_explicit_disable_preserves_selected_optimizer(optimizer):
 def test_model_config_accepts_parameterized_engram_override(fused_attention):
     from torchtitan.config.override import apply_overrides
 
-    from torchtitan_npu.models.deepseek_v4_1.config_registry import deepseek_v4_1_debugmodel_text
     from torchtitan_npu.override.deepseek_v4_1.engram.mxfp8 import MXFP8HostOffloadEngramTable
+    from torchtitan_npu_recipes.models.deepseek_v4_1 import deepseek_v4_1_debugmodel_text
 
     config = deepseek_v4_1_debugmodel_text()
     config.hf_assets_path = "tests/assets/deepseek_v3"

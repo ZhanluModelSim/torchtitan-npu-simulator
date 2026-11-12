@@ -3,15 +3,46 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from dataclasses import dataclass, field
+"""Upstream attention references and the optional NPU geometry backend."""
 
+__all__ = [
+    "Attention",
+    "CompressedSparseAttention",
+    "CompressedSparseInnerAttention",
+    "DSV4InnerAttention",
+    "DeepSeekV4Attention",
+    "HeavilyCompressedAttention",
+    "NPUAttention",
+    "NPUCompressedSparseInnerAttention",
+    "SlidingWindowAttention",
+    "UnitScaleRMSNorm",
+]
+
+from dataclasses import dataclass, field
+from typing import Any, cast
+
+import spmd_types as spmd
 import torch
+import torch_remat as remat
 from attn_gym.sparse import AuxRequest, GatherAttnAux, gather_attn
-from torchtitan.models.common.attention import BaseAttention
+from torchtitan.distributed.parallelism_context import MeshAxisName
+from torchtitan.distributed.spmd_types import spmd_dense_sp_enabled, spmd_mesh_group
+from torchtitan.models.common.attention import Attention as BaseAttention
+from torchtitan.models.common.attention import InnerAttention
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.models.common.rope import RoPE
-from torchtitan.protocols.module import Module
+from torchtitan.models.deepseek_v4.attention import (
+    CompressedSparseAttention,
+    DSV4InnerAttention,
+    HeavilyCompressedAttention,
+    SlidingWindowAttention,
+    _assert_spmd_attention_type,
+    _packed_cu_seqlens,
+)
+from torchtitan.models.deepseek_v4.attention import (
+    DeepSeekV4Attention as UpstreamDeepSeekV4Attention,
+)
 
 from torchtitan_npu.patches.torchtitan.models.common.linear import BatchedLinear
 
@@ -35,14 +66,137 @@ class UnitScaleRMSNorm(RMSNorm):
         del buffer_device
         self.weight.fill_(1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:  # pyrefly: ignore [bad-param-name-override]
         # Preserve the original query normalization's input-dtype rounding.
         assert self.eps is not None
         return x * torch.rsqrt(x.square().mean(-1, keepdim=True) + self.eps)
 
 
-class CompressedSparseInnerAttention(Module):
-    """DeepSeek sparse attention core for DeepSeek-V4.
+class DeepSeekV4Attention(UpstreamDeepSeekV4Attention):
+    """Upstream V4 attention with an overridable, parameter-free Q head norm.
+
+    The forward follows TorchTitan v0.4.0. Keep it in sync until upstream
+    exposes this normalization as a configurable child module.
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(UpstreamDeepSeekV4Attention.Config):
+        q_head_norm: RMSNorm.Config
+
+    def __init__(self, config: Config):
+        super().__init__(config)
+        self.q_head_norm = config.q_head_norm.build()
+
+    def forward(
+        self,
+        x,
+        attention_metadata=None,
+        positions=None,
+        aux_loss_denominator=None,
+        padding_mask=None,
+    ):
+        """Apply one DeepSeek V4 attention layer over folded tokens."""
+        tp_group = spmd_mesh_group(MeshAxisName.TP)
+        if tp_group is not None:
+            # Query, KV, compressor, and indexer branches consume x. Gather
+            # once at their common attention boundary.
+            x = spmd.redistribute(
+                x,
+                tp_group,
+                src=spmd.S(0) if spmd_dense_sp_enabled() else spmd.I,
+                dst=spmd.R,
+                backward_options={"op_dtype": x.dtype},
+            )
+
+        num_tokens = x.size(0)
+        rd = self.rope_head_dim
+
+        qr = self.wq_a(x)
+        # q_norm reads the wq_a projection output with bare ops.
+        remat.recompute_needs_tensor(qr)
+        qr = self.q_norm(qr)
+        q = self.wq_b(qr)
+        with spmd.local():
+            q = q.view(num_tokens, -1, self.head_dim)
+            _assert_spmd_attention_type(q, tp=spmd.S(1))
+        # The rescale reads the wq_b projection output with bare ops.
+        remat.recompute_needs_tensor(q)
+        q = self.q_head_norm(q)
+        q_nope, q_rope = torch.split(q, [self.head_dim - rd, rd], dim=-1)
+
+        kv = self.wkv(x)
+        # kv_norm reads the wkv projection output with bare ops.
+        remat.recompute_needs_tensor(kv)
+        kv = self.kv_norm(kv)
+        kv_nope, kv_rope = torch.split(kv, [self.head_dim - rd, rd], dim=-1)
+
+        q_rope, kv_rope = self.rope(q_rope, kv_rope.unsqueeze(1), positions)
+        q = torch.cat([q_nope, q_rope], dim=-1)
+        kv = torch.cat([kv_nope, kv_rope.squeeze(1)], dim=-1)
+
+        cu_seqlens = _packed_cu_seqlens(attention_metadata)
+        cmp_k = idx_q = idx_k = idx_w = None
+        if self.compress_ratio > 1 and hasattr(self, "indexer"):
+            idx_q, idx_k, idx_w = self.indexer(x.detach(), qr.detach(), positions=positions, cu_seqlens=cu_seqlens)
+        if self.compress_ratio == 4:
+            cmp_k = self.compressor(x, positions=positions, cu_seqlens=cu_seqlens)
+        elif self.compress_ratio > 1:
+            cmp_k = self.compressor_128(x, positions=positions, cu_seqlens=cu_seqlens)
+
+        attn_sink_param = self.attn_sink.weight.squeeze(-1)
+        if self.compress_ratio == 4:
+            o = self.inner_attention(
+                q,
+                kv,
+                cmp_k,
+                idx_q,
+                idx_k,
+                idx_w,
+                attn_sink_param,
+                attention_metadata=attention_metadata,
+                aux_loss_denominator=aux_loss_denominator,
+                padding_mask_T=padding_mask,
+            )
+        elif self.compress_ratio > 1:
+            o = self.inner_attention(
+                q,
+                kv,
+                cmp_k,
+                attn_sink_param,
+                attention_metadata=attention_metadata,
+            )
+        else:
+            o = self.inner_attention(
+                q,
+                kv,
+                attn_sink_param,
+                attention_metadata=attention_metadata,
+            )
+
+        o_nope, o_rope = torch.split(o, [self.head_dim - rd, rd], dim=-1)
+        o_rope = self.rope(o_rope, positions=positions, inverse=True)
+        o = torch.cat([o_nope, o_rope], dim=-1)
+
+        with spmd.local():
+            n_local_heads = o.shape[1]
+            n_local_groups = self.n_groups // (self.n_heads // n_local_heads)
+            o = o.view(num_tokens, n_local_groups, -1)
+            _assert_spmd_attention_type(o, tp=spmd.S(1))
+            wo_a = self.wo_a.weight.view(n_local_groups, self.o_lora_rank, -1)
+            if spmd.is_type_checking():
+                spmd.assert_type(
+                    wo_a,
+                    {"dp": spmd.R, "cp": spmd.R, "tp": spmd.S(0)},
+                )
+        o = torch.einsum("tgd,grd->tgr", o, wo_a)
+        with spmd.local():
+            o = o.reshape(num_tokens, -1)
+            _assert_spmd_attention_type(o, tp=spmd.S(1))
+        return self.wo_b(o)
+
+
+class NPUCompressedSparseInnerAttention(InnerAttention):
+    """Optional NPU sparse-attention backend for DeepSeek-V4.
 
     The core is Attention Gym's ``gather_attn`` over the packed offsets the metadata already
     carries, so no document-aware block mask is built per layer:
@@ -58,16 +212,15 @@ class CompressedSparseInnerAttention(Module):
 
     - it does **not** chunk the query axis: the operator materialises intermediates that grow
       with the sequence length, the window/selection width and the head dimension, so it is a
-      debugging and numerics reference rather than the path to train on -- the fused
-      ``sparse_attn.asc`` / ``sparse_attn.pypto`` recipes are the ones the model ships (both
-      replace this class and keep working under context parallel, which this core refuses);
+      debugging and numerics reference; the ``sparse_attn.asc_legacy`` /
+      ``sparse_attn.pypto`` legacy ports replace this class and own their CP metadata;
     - it carries no indexer loss of its own: the LI objective is a property of a fused port (its
       SMLAG backward hands the fused selector its teacher), so a recipe that runs this core
       trains no gradient for the indexer's compressor.
     """
 
     @dataclass(kw_only=True, slots=True)
-    class Config(Module.Config):
+    class Config(InnerAttention.Config):
         # TODO: Revisit the upstream attention config contract on the next refactor;
         # reuse or inherit the upstream interface when it can express this CP-capable
         # sparse backend without classifying it as VarlenInnerAttention.
@@ -97,7 +250,7 @@ class CompressedSparseInnerAttention(Module):
             padding_mask: torch.Tensor | None = None,
             max_num_documents: int | None = None,
             max_context_length: int | None = None,
-        ) -> DeepSeekV4Metadata:
+        ) -> Any:
             """This geometry's per-microbatch contract (upstream #4897).
 
             Built from the pre-shard ``positions`` alone: the entry carries the row's boundaries
@@ -195,7 +348,14 @@ class CompressedSparseInnerAttention(Module):
         return output.squeeze(0).transpose(0, 1), gathered.lse.squeeze(0)
 
 
-class Attention(BaseAttention):
+class NPUAttention(BaseAttention):
+    """Geometry/carry adapter used by the explicitly selected NPU backend.
+
+    The upstream reference uses :class:`DeepSeekV4Attention`. This adapter
+    retains the NPU backend's bare sink, grouped projection and metadata
+    contract; its reference core deliberately has no indexer auxiliary loss.
+    """
+
     @dataclass(kw_only=True, slots=True)
     class Config(BaseAttention.Config):
         n_heads: int
@@ -223,10 +383,10 @@ class Attention(BaseAttention):
         compressor: Compressor.Config | None
         indexer: Indexer.Config | None
         lightning_indexer: LightningIndexer.Config | None
-        # The sparse core the decoder replaces wholesale with ``sparse_attn.asc``.  It is the
+        # The legacy sparse core replaced by ``sparse_attn.asc_legacy``. It is the
         # layer's only metadata backend and the CP boundary for its KV streams; the annotation
         # stays the base type because a port's config is a replacement of this node.
-        inner_attention: Module.Config
+        inner_attention: InnerAttention.Config
 
     def __init__(self, config: Config):
         super().__init__()
@@ -258,6 +418,9 @@ class Attention(BaseAttention):
         self.compressor = cfg.compressor.build() if cfg.compressor is not None else None
         self.indexer = cfg.indexer.build() if cfg.indexer is not None else None
         self.lightning_indexer = cfg.lightning_indexer.build() if cfg.lightning_indexer is not None else None
+        self.attention_metadata_key = cast(
+            "CompressedSparseInnerAttention.Config", cfg.inner_attention
+        ).attention_metadata_key
         self.inner_attention = cfg.inner_attention.build()
 
     def _parallelize(self, parallelism_context) -> None:
@@ -270,7 +433,7 @@ class Attention(BaseAttention):
         self.cp_group = parallelism_context.get_optional_mesh("cp")
         super()._parallelize(parallelism_context)
 
-    def forward(self, x, attention_metadata, positions):
+    def forward(self, x, attention_metadata, positions, *, aux_loss_denominator=None, padding_mask=None):
         """The unified attention forward (CP and non-CP).
 
         The input layout already put these rows on **chunk ``r`` of every document**, so the
@@ -279,6 +442,10 @@ class Attention(BaseAttention):
         each consumer restores what it reads on its own: the compressor its pooling window, the
         core this rank's swa window, whose sharding then gathers the whole row at its boundary.
         """
+        # Upstream V4 blocks pass these objective inputs to every attention
+        # backend. The existing NPU reference has no carrier-injected indexer
+        # loss, and its metadata already carries the structural padding mask.
+        del aux_loss_denominator, padding_mask
         num_tokens = x.size(0)
         metadata = attention_metadata
 
@@ -356,3 +523,9 @@ class Attention(BaseAttention):
         # arrived in: the residual and every other consumer are token-wise, and the loss is
         # taken against labels the same layout moved.
         return o
+
+
+# Compatibility names for the existing NPU override registrations. New model
+# references use the upstream classes exported above.
+Attention = NPUAttention
+CompressedSparseInnerAttention = NPUCompressedSparseInnerAttention

@@ -15,6 +15,7 @@ import torch.nn as nn
 from torchtitan.config.transform import validate_converter_compatibility
 from torchtitan.models.common import ComplexRoPE, Embedding, Linear, RMSNorm, SqrtSoftplus
 from torchtitan.models.common.config_utils import (
+    fused_gate_up_param_init,
     make_ffn_config,
     make_moe_config,
     make_routed_experts_config,
@@ -446,6 +447,50 @@ def _make_v41_attn_config(
     )
 
 
+def _make_v41_token_dispatcher_config(
+    *,
+    num_experts: int,
+    top_k: int,
+    dim: int,
+    moe_comm_backend: str,
+    non_blocking_capacity_factor: float | None,
+):
+    """Build the EP dispatcher the recipe's ``moe_comm_backend`` selects.
+
+    v0.4.0's ``make_routed_experts_config`` hardcodes the all-to-all dispatcher, so the
+    backend knob has to be applied here. ``num_max_tokens_per_rank`` stays ``None`` until
+    ``update_from_config`` fills it from the training shape.
+    """
+    from torchtitan.models.common.moe.token_dispatcher import (
+        AllToAllTokenDispatcher,
+        DeepEPTokenDispatcher,
+    )
+
+    # The NPU patch adds pre-W2 router-score absorption to the standard and DeepEP
+    # dispatchers; HybridEP retains the pinned upstream schema and is rejected for the
+    # same reason the patch rejects it.
+    if moe_comm_backend == "standard":
+        return AllToAllTokenDispatcher.Config(
+            num_experts=num_experts,
+            top_k=top_k,
+            absorb_router_scores=True,  # pyrefly: ignore [unexpected-keyword]
+        )
+    if moe_comm_backend == "deepep":
+        return DeepEPTokenDispatcher.Config(
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_dim=dim,
+            absorb_router_scores=True,  # pyrefly: ignore [unexpected-keyword]
+        )
+    if moe_comm_backend == "hybridep":
+        raise ValueError(
+            "Pre-W2 router scores are unsupported by dispatcher HybridEPTokenDispatcher; "
+            "DeepSeek-V4.1 requires them, so use 'standard' or 'deepep' "
+            f"(non_blocking_capacity_factor={non_blocking_capacity_factor!r})."
+        )
+    raise ValueError(f"Unknown moe_comm_backend: {moe_comm_backend!r}. Must be one of 'standard' or 'deepep'.")
+
+
 def _make_v41_moe_config(
     *,
     layer_id: int,
@@ -480,32 +525,48 @@ def _make_v41_moe_config(
     from torchtitan.config import derive
 
     router = derive(router, DeepSeekV41Router.Config, vision_enabled=vision_enabled, sorted_topk=True)
-    return make_moe_config(
+    routed_experts = make_routed_experts_config(
+        dim=dim,
+        hidden_dim=moe_inter_dim,
         num_experts=num_experts,
-        router=router,
-        routed_experts=make_routed_experts_config(
-            dim=dim,
-            hidden_dim=moe_inter_dim,
+        top_k=top_k,
+        param_init=_depth_experts_init(layer_id),
+        enable_ep=False,
+        swiglu_limit=_SWIGLU_LIMIT,  # pyrefly: ignore [unexpected-keyword]
+    )
+    routed_experts = dataclasses.replace(
+        routed_experts,
+        token_dispatcher=_make_v41_token_dispatcher_config(
             num_experts=num_experts,
             top_k=top_k,
-            param_init=_depth_experts_init(layer_id),
-            comm_backend=moe_comm_backend,
+            dim=dim,
+            moe_comm_backend=moe_comm_backend,
             non_blocking_capacity_factor=non_blocking_capacity_factor,
-            swiglu_limit=_SWIGLU_LIMIT,  # pyrefly: ignore [unexpected-keyword]
         ),
+    )
+    moe = make_moe_config(
+        num_experts=num_experts,
+        router=router,
+        routed_experts=routed_experts,
         shared_experts=(
             make_ffn_config(
                 dim=dim,
                 hidden_dim=moe_inter_dim * num_shared_experts,
-                w1_param_init=_LINEAR_INIT,
-                w2w3_param_init=_depth_init(layer_id),
+                w13_param_init=_LINEAR_INIT,
+                w2_param_init=_depth_init(layer_id),
+                enable_sp=False,
                 swiglu_limit=_SWIGLU_LIMIT,  # pyrefly: ignore [unexpected-keyword]
             )
             if num_shared_experts > 0
             else None
         ),
         load_balance_coeff=load_balance_coeff,
+        enable_sp=False,
     )
+
+    if moe.shared_experts is not None:
+        moe.shared_experts.w13.param_init = fused_gate_up_param_init(_LINEAR_INIT, _depth_init(layer_id))
+    return moe
 
 
 def _make_v41_config(
@@ -676,7 +737,7 @@ def _make_v41_config(
                     eps=norm_eps,
                     param_init=_NORM_INIT,
                 ),
-                moe=moe_cfg,
+                feed_forward=moe_cfg,
                 hc_attn_pre=HcPre.Config(
                     hc_mult=hc_mult,
                     dim=dim,
@@ -1007,6 +1068,7 @@ def model_registry(
     moe_comm_backend: str = "standard",
     non_blocking_capacity_factor: float | None = None,
     converters: list[ModelConfigConverter.Config] | None = None,
+    parallelism=None,
 ) -> DeepSeekV41Model.Config:
     if flavor not in deepseek_v4_1_configs:
         raise ValueError(f"Unknown deepseek_v4_1 flavor: {flavor}. Available: {list(deepseek_v4_1_configs.keys())}")
@@ -1018,6 +1080,20 @@ def model_registry(
         validate_converter_compatibility(converters)
         for converter_cfg in converters:
             config = converter_cfg.build().convert(config)
+    # Configure layouts before construction and disable the upstream in-place WGRAD path.
+    from torchtitan.config.parallelism import ParallelismConfig
+    from torchtitan.models.common.linear import Linear
+
+    from .sharding import set_deepseek_v4_1_sharding_config
+
+    parallelism = parallelism or ParallelismConfig()
+    set_deepseek_v4_1_sharding_config(
+        config,
+        enable_sp=parallelism.enable_sequence_parallel,
+        enable_ep=parallelism.expert_parallel_degree > 1,
+    )
+    for _, linear, _, _ in config.traverse(Linear.Config):
+        linear.inplace_wgrad_accum = False
     return config
 
 

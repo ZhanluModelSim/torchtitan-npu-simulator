@@ -8,9 +8,10 @@
 
 from dataclasses import dataclass
 
-import torchtitan.models.qwen3_5.config_registry as _upstream_config_registry
 from torchtitan.config import derive
-from torchtitan.models.qwen3_5 import model_registry as _upstream_model_registry
+from torchtitan.config.parallelism import ParallelismConfig
+from torchtitan.config.transform import ModelConfigConverter
+from torchtitan.models.qwen3_5 import build_model_config as _upstream_build_model_config
 from torchtitan.models.qwen3_5.model import Qwen35Model
 
 from torchtitan_npu.patches.torchtitan.models.qwen3_5 import (
@@ -52,9 +53,20 @@ class NPUQwen35Model(Qwen35Model):
         apply_qwen3_5_npu_fsdp(self, **kwargs)
 
 
-def model_registry(*args, **kwargs):
-    """Build the NPU Qwen3.5 model through its real model config."""
-    return derive(_upstream_model_registry(*args, **kwargs), NPUQwen35Model.Config)
-
-
-_upstream_config_registry.model_registry = model_registry
+def model_registry(
+    flavor: str,
+    *,
+    parallelism: ParallelismConfig,
+    seq_len: int | None = None,
+    attn_backend: str = "flex",
+    converters: list[ModelConfigConverter.Config] | None = None,
+) -> NPUQwen35Model.Config:
+    """Build the NPU Qwen3.5 config with the upstream flavor parameters."""
+    config = _upstream_build_model_config(
+        flavor,
+        parallelism=parallelism,
+        seq_len=seq_len,
+        attn_backend=attn_backend,
+        converters=converters,
+    )
+    return derive(config, NPUQwen35Model.Config)

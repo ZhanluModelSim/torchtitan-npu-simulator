@@ -10,7 +10,7 @@ from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
-from torchtitan.protocols.module import Module
+from torchtitan.models.base.module import Module
 
 
 class BatchedLinear(Module):

@@ -16,7 +16,7 @@ from PIL import Image
 from torchtitan.components.data import GrainDataLoader
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
 
-from torchtitan_npu.models.deepseek_v4_1.config_registry import (
+from torchtitan_npu_recipes.models.deepseek_v4_1 import (
     deepseek_v4_1_debugmodel_multimodal_sft,
     deepseek_v4_1_vision_sft,
 )
@@ -279,9 +279,7 @@ def test_registry_entry_reads_the_sft_environment(tmp_path, monkeypatch):
 
 def test_sft_recipe_rejects_text_only_flavors(tmp_path):
     with pytest.raises(ValueError, match="multimodal flavor"):
-        deepseek_v4_1_vision_sft(
-            dataset_path=str(tmp_path / "unused.jsonl"), flavor="deepseek_v4_1_debugmodel_text"
-        )
+        deepseek_v4_1_vision_sft(dataset_path=str(tmp_path / "unused.jsonl"), flavor="deepseek_v4_1_debugmodel_text")
 
 
 def test_sft_recipe_requires_a_dataset(monkeypatch):
@@ -312,7 +310,7 @@ def test_config_name_installs_the_sft_loader_with_cli_policy(tmp_path, monkeypat
     config = ConfigManager().parse_args(
         [
             "--module",
-            "torchtitan_npu.models.deepseek_v4_1",
+            "torchtitan_npu_recipes.models.deepseek_v4_1",
             "--config",
             "deepseek_v4_1_debugmodel_multimodal_sft",
             "--dataloader.seed",

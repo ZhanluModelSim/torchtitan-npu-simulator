@@ -8,7 +8,7 @@ import torch
 
 from tests.unit_tests.models.mtp_test_utils import build_cpu_model
 from torchtitan_npu.models.deepseek_v4_1 import _LINEAR_INIT, _make_v41_moe_config
-from torchtitan_npu.models.deepseek_v4_1.config_registry import deepseek_v4_1_debugmodel_multimodal
+from torchtitan_npu_recipes.models.deepseek_v4_1 import deepseek_v4_1_debugmodel_multimodal
 
 
 def test_plain_weights_use_routed_experts_and_track_empty_experts():

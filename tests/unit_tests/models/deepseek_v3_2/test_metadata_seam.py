@@ -21,7 +21,7 @@ import torch
 from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.config.validation import validate_context_parallel
 from torchtitan.distributed.spmd_types import spmd_dense_mesh
-from torchtitan.models.common.attention import VarlenMetadata
+from torchtitan.models.common.attention import VarlenAttentionMetadata
 
 import torchtitan_npu  # noqa: F401  imported for its patch chain: the seam under test
 from torchtitan_npu.models.deepseek_v3_2 import (
@@ -116,7 +116,7 @@ def test_the_decoder_builds_one_entry_for_the_whole_stack(builds):
     assert len(builds) == 1
     assert set(attention_metadata) == {SparseInnerAttention}
     entry = attention_metadata[SparseInnerAttention]
-    assert isinstance(entry, VarlenMetadata)
+    assert isinstance(entry, VarlenAttentionMetadata)
     assert entry.cu_seq_q.tolist() == _CU_SEQ
     # Every layer dispatches by the key the one entry is stored under.
     keys = {layer.attention.attention_metadata_key for layer in model.layers.values()}
@@ -199,7 +199,7 @@ def test_the_ascendc_backend_owns_the_tnd_metadata(builds):
     # tensor they were read from.  One list serves the q and k kernel arguments
     # because the builder hands both offset tensors the same packed layout.
     assert entry.actual_seq_lengths == _CU_SEQ[1:]
-    assert isinstance(entry.varlen_meta, VarlenMetadata)
+    assert isinstance(entry.varlen_meta, VarlenAttentionMetadata)
     assert entry.varlen_meta.cu_seq_q.tolist() == _CU_SEQ
     assert entry.varlen_meta.cu_seq_k.tolist() == _CU_SEQ
     assert {layer.attention.attention_metadata_key for layer in model.layers.values()} == {AscSparseInnerAttention}

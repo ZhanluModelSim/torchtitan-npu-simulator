@@ -47,10 +47,13 @@ class AscSwiGLU(BinaryActivationFn):
     def __init__(self, config):
         self.swiglu_limit = config.swiglu_limit
 
-    def __call__(self, gate, up, **kwargs):
+    def _activation_fn(self, gate, up):
+        raise NotImplementedError("CANN implements the fused activation")
+
+    def __call__(self, gate_up, **kwargs):
         # Routed score multiplication belongs to RoutedExperts, after this op.
         return swiglu_group_activation(
-            torch.cat((gate, up), dim=-1),
+            gate_up.flatten(-2),
             _effective_swiglu_limit(self),
         )
 

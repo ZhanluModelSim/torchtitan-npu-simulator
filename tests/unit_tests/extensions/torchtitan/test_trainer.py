@@ -14,7 +14,7 @@ from torchtitan_npu.extensions.torchtitan import trainer as trainer_module
 def test_trainer_config_revalidates_after_swap_optimizer_override():
     from torchtitan.config.override import OverrideConfig, apply_overrides
 
-    from torchtitan_npu.models.deepseek_v4.config_registry import deepseek_v4_debugmodel
+    from torchtitan_npu_recipes.models.deepseek_v4 import deepseek_v4_debugmodel
     from torchtitan_npu.override.common.optimizer import OptimizerStateSwapContainer
 
     config = deepseek_v4_debugmodel()

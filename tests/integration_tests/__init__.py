@@ -37,6 +37,11 @@ class OverrideDefinitions:
     expected_steps: Sequence[Sequence[int]] | None = None
     check_resume: bool = False
     verify_ema_checkpoint: bool = False
+    # Python recipes use the constrained ConfigLoader CLI and own all training settings.
+    python_config: bool = False
+    check_resume_state: bool = False
+    required_checkpoint_keys: tuple[str, ...] = ()
+    require_indexer_audit: bool = False
 
     def __repr__(self):
         return self.test_descr

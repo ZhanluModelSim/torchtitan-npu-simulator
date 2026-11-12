@@ -11,7 +11,13 @@ import pytest
 import torch
 from torch import nn
 from torch.distributed.tensor import Shard
-from torchtitan.models.common.config_utils import make_ffn_config, make_routed_experts_config
+from torchtitan.models.common.activation import Sigmoid
+from torchtitan.models.common.config_utils import (
+    make_ffn_config,
+    make_moe_config,
+    make_routed_experts_config,
+    make_router_config,
+)
 
 
 @pytest.fixture(scope="module")
@@ -33,6 +39,18 @@ class _StorageMeshStub(dict):
         if cp > 1:
             self["cp"] = SimpleNamespace(size=lambda: cp)
         self.mesh_dim_names = tuple(self)
+
+
+def _moe(num_experts, *, enable_ep):
+    return make_moe_config(
+        num_experts=num_experts,
+        router=make_router_config(dim=8, num_experts=num_experts, gate_param_init={}, score_func=Sigmoid.Config()),
+        routed_experts=make_routed_experts_config(
+            dim=8, hidden_dim=16, num_experts=num_experts, top_k=1, param_init={}, enable_ep=enable_ep
+        ),
+        shared_experts=make_ffn_config(dim=8, hidden_dim=16, w13_param_init={}, w2_param_init={}, enable_sp=False),
+        enable_sp=False,
+    ).build()
 
 
 def _decoder_shell(block):
@@ -66,13 +84,7 @@ def test_ep1_expert_storage_overrides_stacked_projection_placement(
 ):
     with torch.device("meta"):
         block = nn.Module()
-        block.moe_enabled = True
-        block.moe = nn.Module()
-        block.moe.num_experts = 4
-        block.moe.routed_experts = make_routed_experts_config(
-            dim=8, hidden_dim=16, num_experts=4, top_k=1, param_init={}, comm_backend="standard"
-        ).build()
-        block.moe.shared_experts = make_ffn_config(dim=8, hidden_dim=16, w1_param_init={}, w2w3_param_init={}).build()
+        block.feed_forward = _moe(4, enable_ep=False)
         model = _decoder_shell(block)
         model.host_table = nn.Parameter(torch.empty(4, 8))
     mesh = _StorageMeshStub(dp_shard, cp)
@@ -84,10 +96,11 @@ def test_ep1_expert_storage_overrides_stacked_projection_placement(
     # W13 is [E, 2, F, D]; W2 is [E, D, F]. Expert-axis sharding
     # takes precedence until dp_shard * cp exceeds E.
     assert shard_calls[0][1] == {
-        "moe.routed_experts.w13.weight": Shard(expected_w13),
-        "moe.routed_experts.w2.weight": Shard(expected_w2),
-        "moe.shared_experts.w13.weight": Shard(1),
-        "moe.shared_experts.w2.weight": None,
+        "feed_forward.router.gate.weight": None,
+        "feed_forward.routed_experts.w13.weight": Shard(expected_w13),
+        "feed_forward.routed_experts.w2.weight": Shard(expected_w2),
+        "feed_forward.shared_experts.w13.weight": Shard(1),
+        "feed_forward.shared_experts.w2.weight": None,
     }
     assert shard_calls[-1][0] is model
     assert all(kwargs["ignored_params"] is ignored for _, _, kwargs in shard_calls)
@@ -97,8 +110,9 @@ def test_ep1_expert_storage_overrides_stacked_projection_placement(
 def test_dense_stacked_gate_up_shards_matrix_rows(fsdp, shard_calls):
     with torch.device("meta"):
         block = nn.Module()
-        block.moe_enabled = False
-        block.feed_forward = make_ffn_config(dim=8, hidden_dim=16, w1_param_init={}, w2w3_param_init={}).build()
+        block.feed_forward = make_ffn_config(
+            dim=8, hidden_dim=16, w13_param_init={}, w2_param_init={}, enable_sp=False
+        ).build()
         model = _decoder_shell(block)
 
     fsdp.apply_fsdp_to_decoder(model, _StorageMeshStub(4), torch.bfloat16, torch.float32, pp_enabled=False)
@@ -108,6 +122,41 @@ def test_dense_stacked_gate_up_shards_matrix_rows(fsdp, shard_calls):
         "feed_forward.w13.weight": Shard(1),
         "feed_forward.w2.weight": None,
     }
+
+
+def test_native_dtype_override_reaches_fsdp_policy_with_ignored_parameters(fsdp, shard_calls):
+    with torch.device("meta"):
+        block = nn.Module()
+        block.feed_forward = make_ffn_config(
+            dim=8, hidden_dim=16, w13_param_init={}, w2_param_init={}, enable_sp=False
+        ).build()
+        model = _decoder_shell(block)
+        model.host_table = nn.Parameter(torch.empty(4, 8))
+    fp32_weight = block.feed_forward.w13.weight
+    default_weight = block.feed_forward.w2.weight
+    ignored = {model.host_table}
+
+    def keep_selected_dtype(parameter):
+        return parameter.dtype if parameter is fp32_weight else None
+
+    fsdp.apply_fsdp_to_decoder(
+        model,
+        _StorageMeshStub(4),
+        torch.bfloat16,
+        torch.float32,
+        pp_enabled=False,
+        ignored_params=ignored,
+        param_dtype_override_fn=keep_selected_dtype,
+    )
+
+    assert shard_calls
+    for _, _, kwargs in shard_calls:
+        policy = kwargs["mp_policy"]
+        assert kwargs["ignored_params"] is ignored
+        assert policy.param_dtype_override_fn is keep_selected_dtype
+        assert policy._resolve_for_param(fp32_weight).param_dtype == torch.float32
+        assert policy._resolve_for_param(default_weight).param_dtype == torch.bfloat16
+        assert policy.reduce_dtype == torch.float32
 
 
 @pytest.fixture
@@ -136,13 +185,7 @@ def test_ep2_selects_sparse_fsdp_mesh_and_preserves_dense_stacked_placement(
 
     with torch.device("meta"):
         block = nn.Module()
-        block.moe_enabled = True
-        block.moe = nn.Module()
-        block.moe.num_experts = num_experts
-        block.moe.routed_experts = make_routed_experts_config(
-            dim=8, hidden_dim=16, num_experts=num_experts, top_k=1, param_init={}, comm_backend="standard"
-        ).build()
-        block.moe.shared_experts = make_ffn_config(dim=8, hidden_dim=16, w1_param_init={}, w2w3_param_init={}).build()
+        block.feed_forward = _moe(num_experts, enable_ep=True)
         model = _decoder_shell(block)
         model.host_table = nn.Parameter(torch.empty(4, 8))
     dense_mesh, sparse_mesh = ep2_storage_meshes
@@ -163,12 +206,12 @@ def test_ep2_selects_sparse_fsdp_mesh_and_preserves_dense_stacked_placement(
 
     placements = shard_calls[0][1]
     for projection, axis in zip(("w13", "w2"), expected_axes, strict=True):
-        placement = placements[f"moe.routed_experts.{projection}.weight"]
+        placement = placements[f"feed_forward.routed_experts.{projection}.weight"]
         assert placement.placement == Shard(axis)
         assert placement.mesh_info.spmd_mesh is sparse_mesh
         assert placement.mesh_info.mesh.mesh.tolist() == [1, 3]
     for projection, axis in (("w13", 1), ("w2", 0)):
-        placement = placements[f"moe.shared_experts.{projection}.weight"]
+        placement = placements[f"feed_forward.shared_experts.{projection}.weight"]
         assert placement.placement == Shard(axis)
         assert placement.mesh_info.spmd_mesh is dense_mesh
         assert placement.mesh_info.mesh.mesh.tolist() == [0, 1, 2, 3]

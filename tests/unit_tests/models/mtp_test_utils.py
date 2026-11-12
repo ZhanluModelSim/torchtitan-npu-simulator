@@ -4,11 +4,11 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from itertools import pairwise
 from types import SimpleNamespace
 
-from torchtitan.config.parallelism import ParallelismConfig
-
 import torch
+from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.distributed.spmd_types import spmd_dense_mesh
 
 BATCH_SIZE = 1
@@ -85,45 +85,53 @@ def assert_packed_mtp_training(model) -> None:
         raise AssertionError("Expected at least one MTP parameter to receive a gradient.")
 
 
-def build_v4_model_config(
-    *,
-    compress_ratios=(1, 1, 1),
-    rope_head_dim=4,
-    original_seq_len=SEQ_LEN,
-    num_mtp_layers=1,
-    n_hash_layers=0,
-):
-    from torchtitan_npu.models.deepseek_v4 import _make_v4_config
+def preprocess_v04(model, tokens, labels, positions):
+    """Run the v0.4 MTP producer with a single-process SPMD context."""
+    import spmd_types as spmd
 
-    return _make_v4_config(
-        dim=32,
-        n_layers=3,
-        vocab_size=VOCAB_SIZE,
-        n_heads=4,
-        head_dim=8,
-        rope_head_dim=rope_head_dim,
-        q_lora_rank=16,
-        o_lora_rank=8,
-        n_groups=2,
-        compress_ratios=compress_ratios,
-        window_size=SEQ_LEN,
-        norm_eps=1e-6,
-        index_n_heads=2,
-        index_head_dim=8,
-        index_topk=2,
-        moe_inter_dim=16,
-        num_experts=2,
-        num_shared_experts=1,
-        top_k=1,
-        n_hash_layers=n_hash_layers,
-        route_norm=False,
-        route_scale=1.0,
-        load_balance_coeff=1e-3,
-        hc_mult=2,
-        sinkhorn_iters=2,
-        hc_eps=1e-6,
-        max_seq_len=SEQ_LEN,
-        compress_rope_theta=10000.0,
-        original_seq_len=original_seq_len,
-        num_mtp_layers=num_mtp_layers,
+    mesh = {name: spmd.MeshAxis.of(1, 1) for name in ("dp", "cp", "tp")}
+    starts = [*(positions == 0).nonzero().flatten().tolist(), tokens.numel()]
+    lengths = [end - start for start, end in pairwise(starts)]
+    inputs, targets, extra_kwargs, loss_kwargs = model.preprocess_inputs(
+        {"input": tokens, "labels": labels, "positions": positions},
+        parallelism_context=SimpleNamespace(cp_enabled=False, spmd_dense_mesh=lambda: mesh),
+        parallelism=SimpleNamespace(),
+        global_routing_token_counts=torch.tensor(
+            [sum(max(length - depth, 0) for length in lengths) for depth in range(len(model.mtp_layers) + 1)]
+        ),
     )
+    assert not loss_kwargs
+    assert "attention_metadata" in extra_kwargs
+    return inputs, targets, extra_kwargs
+
+
+def assert_packed_mtp_training_v04(model) -> None:
+    from torchtitan.models.deepseek_v3.mtp import MTPLoss
+
+    tokens = torch.arange(SEQ_LEN) % VOCAB_SIZE
+    labels = (tokens + 1) % VOCAB_SIZE
+    inputs, targets, extra_kwargs = preprocess_v04(model, tokens, labels, PACKED_POSITIONS.clone())
+    expected_tokens = torch.cat(
+        (tokens[1:_DOCUMENT_LEN], tokens.new_zeros(1), tokens[_DOCUMENT_LEN + 1:], tokens.new_zeros(1))
+    )
+    expected_labels = torch.cat(
+        (labels[1:_DOCUMENT_LEN], labels.new_full((1,), -100), labels[_DOCUMENT_LEN + 1:], labels.new_full((1,), -100))
+    )
+    torch.testing.assert_close(inputs[0], tokens, rtol=0, atol=0)
+    torch.testing.assert_close(inputs[1], expected_tokens, rtol=0, atol=0)
+    torch.testing.assert_close(targets[0], labels, rtol=0, atol=0)
+    torch.testing.assert_close(targets[1], expected_labels, rtol=0, atol=0)
+    output = model(inputs, **extra_kwargs)
+    assert isinstance(output, tuple) and len(output) == len(targets) == 2
+    assert all(item.shape == (SEQ_LEN, VOCAB_SIZE) for item in output)
+    counts = torch.tensor([SEQ_LEN, SEQ_LEN - 2])
+    loss, _ = MTPLoss(MTPLoss.Config(mtp_scale=0.3, global_vocab_size=VOCAB_SIZE))(output, targets, counts)
+    expected_loss = torch.nn.functional.cross_entropy(
+        output[0].float(), labels, reduction="sum"
+    ) / SEQ_LEN + 0.3 * torch.nn.functional.cross_entropy(output[1].float(), expected_labels, reduction="sum") / (
+        SEQ_LEN - 2
+    )
+    torch.testing.assert_close(loss, expected_loss)
+    loss.backward()
+    assert model.mtp_layers[0].e_proj.weight.grad is not None
+    assert model.mtp_layers[0].e_proj.weight.grad.count_nonzero()

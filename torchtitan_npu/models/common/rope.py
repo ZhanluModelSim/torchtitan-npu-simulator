@@ -11,8 +11,8 @@
 from dataclasses import dataclass
 
 import torch
+from torchtitan.models.base.module import Module
 from torchtitan.models.common.rope import CosSinRoPE
-from torchtitan.protocols.module import Module
 
 
 class HalfRotation(Module):

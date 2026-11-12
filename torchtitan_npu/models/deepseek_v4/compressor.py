@@ -3,32 +3,28 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+"""Upstream compressor references and explicit NPU geometry/carry adapters."""
+
 import math
 from dataclasses import dataclass, field
-from functools import cache
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from attn_gym.sparse import lightning_indexer
 from torchtitan.config import Configurable
-from torchtitan.models.common.linear import Linear
-from torchtitan.models.common.nn_modules import RMSNorm
-from torchtitan.models.common.rope import RoPE
-from torchtitan.protocols.module import Module
+from torchtitan.models.base.module import Module
+from torchtitan.models.deepseek_v4.compressor import (
+    Compressor as UpstreamCompressor,
+)
+from torchtitan.models.deepseek_v4.compressor import (
+    Indexer as UpstreamIndexer,
+)
+from torchtitan.models.deepseek_v4.compressor import (
+    _hadamard,  # noqa: F401 -- preserve the existing helper import path
+)
 
 from torchtitan_npu.models.common.carry_exchange import CarryExchange
 from torchtitan_npu.models.common.document_intervals import document_intervals
-
-
-@cache
-def _hadamard(dim: int, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
-    if dim & (dim - 1) != 0:
-        raise ValueError("Hadamard dim must be a power of two")
-    h = torch.ones((1, 1), dtype=dtype, device=device)
-    while h.shape[0] < dim:
-        h = torch.cat([torch.cat([h, h], 1), torch.cat([h, -h], 1)], 0)
-    return h
 
 
 class CompressorImplementation(Configurable):
@@ -52,8 +48,8 @@ class CompressorImplementation(Configurable):
         return compressor._forward(x, positions, cu_seqlens)
 
 
-class Compressor(Module):
-    """Document-packed key compression.
+class NPUCompressor(UpstreamCompressor):
+    """NPU document-packed key compression with geometry and carry handling.
 
     The compressor sees one local token stream, that stream's own document-relative positions and
     (for the ratio-4 overlap only) the **row's** document boundaries.  Pooling is a flat fold of
@@ -70,14 +66,7 @@ class Compressor(Module):
     """
 
     @dataclass(kw_only=True, slots=True)
-    class Config(Module.Config):
-        rope: RoPE.Config
-        wkv: Linear.Config
-        wgate: Linear.Config
-        norm: RMSNorm.Config
-        head_dim: int
-        rope_head_dim: int
-        compress_ratio: int
+    class Config(UpstreamCompressor.Config):
         # The ratio-4 overlap's cross-rank block.  The compressor owns it, so the modules that
         # call this one never learn that the overlap continues on another rank.
         carry_exchange: CarryExchange.Config
@@ -86,25 +75,18 @@ class Compressor(Module):
         )
 
     def __init__(self, config: Config):
-        super().__init__()
+        super().__init__(config)
         cfg = config
         self.implementation = cfg.implementation.build()
-        self.head_dim = cfg.head_dim
-        self.rope_head_dim = cfg.rope_head_dim
         self.nope_head_dim = cfg.head_dim - cfg.rope_head_dim
-        self.compress_ratio = cfg.compress_ratio
-        self.overlap = cfg.compress_ratio == 4
         # The CP mesh: wired by the framework's ``Module.parallelize`` recursion, exactly like
         # the exchange's own.  ``None`` at one degree, where nothing moves.
         self.group = None
-        self.rope = cfg.rope.build()
-        self.wkv = cfg.wkv.build()
-        self.wgate = cfg.wgate.build()
-        self.norm = cfg.norm.build()
         # ``ape`` is a plain score bias on the compression block, not a
         # projection; own it directly like the upstream implementation.  Its
         # param_init is declared on the Config (registry-side, ``_APE_INIT``).
-        self.ape = nn.Parameter(torch.empty(cfg.compress_ratio, self.wkv.out_features, dtype=torch.float32))
+        if self.ape.dtype != torch.float32:
+            self.ape = nn.Parameter(self.ape.to(dtype=torch.float32))
         self.carry_exchange = cfg.carry_exchange.build()
 
     def _parallelize(self, parallelism_context) -> None:
@@ -113,7 +95,7 @@ class Compressor(Module):
         super()._parallelize(parallelism_context)
 
     @staticmethod
-    def _overlap_transform(
+    def _npu_overlap_transform(
         state: torch.Tensor,
         first_indices: torch.Tensor,
         *,
@@ -149,8 +131,8 @@ class Compressor(Module):
         self,
         x: torch.Tensor,
         positions: torch.Tensor,
-        *,
         cu_seqlens: torch.Tensor | None = None,
+        *,
         attention_metadata=None,
     ) -> torch.Tensor:
         """Compress one stream into the row's blocks.
@@ -227,8 +209,8 @@ class Compressor(Module):
                     "every document has no predecessor block to borrow."
                 )
             first_indices = (cu_seqlens[:-1] // ratio).to(torch.int64)
-            score = self._overlap_transform(score, first_indices, value=float("-inf"))
-            kv = self._overlap_transform(kv, first_indices, value=0.0)
+            score = self._npu_overlap_transform(score, first_indices, value=float("-inf"))
+            kv = self._npu_overlap_transform(kv, first_indices, value=0.0)
 
         # -- softmax pool + norm + RoPE (RoPE owns the [nope | rope] split) --
         # The gate is a softmax over the block's pooled rows: ``ratio`` of them, or ``2 * ratio``
@@ -238,31 +220,14 @@ class Compressor(Module):
         return self.rope(kv.squeeze(0).unsqueeze(1), positions=positions.reshape(-1)[::ratio]).squeeze(1).unsqueeze(0)
 
 
-class Indexer(Module):
+class NPUIndexer(UpstreamIndexer):
+    """Upstream indexer projections with NPU RoPE and key-stream metadata."""
+
     @dataclass(kw_only=True, slots=True)
-    class Config(Module.Config):
-        rope: RoPE.Config
-        wq_b: Linear.Config
-        weights_proj: Linear.Config
-        compressor: "Compressor.Config"
-        num_index_heads: int
-        index_head_dim: int
-        rope_head_dim: int
+    class Config(UpstreamIndexer.Config):
+        compressor: NPUCompressor.Config  # pyrefly: ignore [bad-override]
 
-    def __init__(self, config: Config):
-        super().__init__()
-        cfg = config
-        self.num_index_heads = cfg.num_index_heads
-        self.head_dim = cfg.index_head_dim
-        self.rope_head_dim = cfg.rope_head_dim
-        self.softmax_scale = cfg.index_head_dim**-0.5
-        self.rope = cfg.rope.build()
-
-        self.wq_b = cfg.wq_b.build()
-        self.weights_proj = cfg.weights_proj.build()
-        self.compressor = cfg.compressor.build()
-
-    def forward(self, x, qr, *, positions, attention_metadata):
+    def forward(self, x, qr, *, positions, cu_seqlens=None, attention_metadata=None):
         """Project raw indexer queries, keys, and per-head weights.
 
         ``x`` is the frame the layout produced (this rank's chunks under CP) and ``qr`` its
@@ -279,6 +244,7 @@ class Indexer(Module):
             idx_w: Per-head indexer weights ``[T, num_index_heads]``
                 (the local rows).
         """
+        assert attention_metadata is not None
         num_tokens = qr.size(0)
         idx_q = self.wq_b(qr)
         idx_q = idx_q.view(num_tokens, self.num_index_heads, self.head_dim)
@@ -297,11 +263,11 @@ class Indexer(Module):
         idx_w = self.weights_proj(x) * (self.softmax_scale * self.num_index_heads**-0.5)
         return idx_q, idx_k, idx_w
 
-    @staticmethod
-    def _rotate_activation(x: torch.Tensor) -> torch.Tensor:
-        d = x.size(-1)
-        H = _hadamard(d, dtype=x.dtype, device=x.device)
-        return F.linear(x, H) * (d**-0.5)
+
+# Compatibility names remain tied to the optional NPU backend. The default
+# reference model uses UpstreamCompressor/UpstreamIndexer directly.
+Compressor = NPUCompressor
+Indexer = NPUIndexer
 
 
 def select_compressed_slots(

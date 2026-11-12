@@ -4,18 +4,10 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-# LoRA wrapper around the common DeepSeek-V4 Flash CPT launcher. Keep model,
-# training, and parallelism differences as CLI overrides so user-supplied
-# arguments remain the final source of truth.
-
 set -euo pipefail
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-
-export CONFIG="${CONFIG:-deepseek_v4_flash_lora_compiled}"
-
-# LoRA uses periodic native adapter checkpoints and final PEFT export.
-exec bash "${SCRIPT_DIR}/deepseek_v4_flash_cpt_4k_a3.sh" \
-    --checkpointer.no-load-only \
-    --checkpointer.save-training-state \
-    "$@"
+MODULE="${MODULE:-torchtitan_npu_recipes.examples.deepseek_v4}" \
+CONFIG="${CONFIG:-deepseek_v4_flash_lora_4k_a3}" \
+NGPU="${NGPU:-16}" \
+NNODES="${NNODES:-$(awk -F, '{print NF ? NF : 8}' <<< "${NODE_IPS:-}")}" \
+exec bash "$(dirname -- "${BASH_SOURCE[0]}")/../../scripts/run_train_multinodes.sh" "$@"

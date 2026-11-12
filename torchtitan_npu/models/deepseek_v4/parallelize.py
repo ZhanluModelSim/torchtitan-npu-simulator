@@ -6,12 +6,9 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
-from torch.distributed.fsdp import MixedPrecisionPolicy
-from torchtitan.config import TORCH_DTYPE_MAP, TrainingConfig
 from torchtitan.experiments.graph_trainer.common_utils import (
     annotate_module_fqns,
     annotate_moe_ep_regions,
@@ -22,34 +19,23 @@ from torchtitan.experiments.graph_trainer.compile import (
     apply_compile as apply_graph_trainer_compile,
 )
 
-from torchtitan_npu.models.common.compile_policy import parallelize_with_model_compile, skip_compile_under_cp
-from torchtitan_npu.patches.torch.distributed.fsdp import policy_overrides
-
 if TYPE_CHECKING:
+    from torchtitan.config import TrainingConfig
     from torchtitan.config.parallelism import ParallelismConfig
-    from torchtitan.distributed.activation_checkpoint import ActivationCheckpointingConfig
     from torchtitan.distributed.parallelism_context import ParallelismContext
     from torchtitan.experiments.graph_trainer.configs import GraphTrainerCompileConfig
 
-    from torchtitan_npu.config import CompileConfig
     from torchtitan_npu.models.deepseek_v4.model import (
         DeepSeekV4Model,
         GraphTrainerDeepSeekV4Model,
     )
 
 
-def _dsv4_fp32_overrides(
+def _dsv4_param_dtypes(
     model: DeepSeekV4Model,
     training: TrainingConfig,
-) -> dict[str, MixedPrecisionPolicy]:
+) -> dict[str, torch.dtype]:
     """Return the fqn-fp32 policy map for DSV4 SmoE hyper-connection and MoE router parameters."""
-    default = MixedPrecisionPolicy(
-        param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
-        reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
-        output_dtype=None,
-        cast_forward_inputs=False,
-    )
-    fp32 = replace(default, param_dtype=torch.float32)
 
     def matches_any(fqn: str, patterns: tuple[str, ...]) -> bool:
         """Check if a module/parameter FQN matches any of the fnmatch patterns."""
@@ -59,61 +45,47 @@ def _dsv4_fp32_overrides(
     fp32_module_fqns = (
         "layers.*.hc_attn_pre",
         "layers.*.hc_ffn_pre",
-        "layers.*.moe.router",
+        "layers.*.feed_forward.router",
         "layers.*.hc_head",
         "mtp_layers.*.hc_attn_pre",
         "mtp_layers.*.hc_ffn_pre",
-        "mtp_layers.*.moe.router",
+        "mtp_layers.*.feed_forward.router",
         "mtp_layers.*.hc_head",
         "hc_head",
     )
     fp32_parameter_fqns = (
         "layers.*.attention.compressor.ape",
+        "layers.*.attention.compressor_128.ape",
+        "layers.*.attention.compressor_128.ape",
         "layers.*.attention.indexer.compressor.ape",
         "mtp_layers.*.attention.compressor.ape",
+        "mtp_layers.*.attention.compressor_128.ape",
+        "mtp_layers.*.attention.compressor_128.ape",
         "mtp_layers.*.attention.indexer.compressor.ape",
         # Learned per-head softmax logits: created FP32 in attention.py and
         # required FP32 by the attention kernels.
         "layers.*.attention.attn_sink",
+        "layers.*.attention.attn_sink.weight",
         "mtp_layers.*.attention.attn_sink",
+        "mtp_layers.*.attention.attn_sink.weight",
     )
 
     fp32_modules = [module for name, module in model.named_modules() if matches_any(name, fp32_module_fqns)]
     fp32_param_ids = {id(param) for module in fp32_modules for param in module.parameters()}
 
-    overrides: dict[str, MixedPrecisionPolicy] = {}
+    overrides: dict[str, torch.dtype] = {}
     for name, parameter in model.named_parameters(remove_duplicate=False):
         if id(parameter) in fp32_param_ids or matches_any(name, fp32_parameter_fqns):
-            overrides[name] = fp32
+            overrides[name] = torch.float32
 
     return overrides
 
 
-def parallelize_deepseek_v4(
-    model: DeepSeekV4Model,
-    *,
-    parallelism_context: ParallelismContext,
-    training: TrainingConfig,
-    parallelism: ParallelismConfig,
-    compile_config: CompileConfig | None,
-    ac_config: ActivationCheckpointingConfig,
-    dump_folder: str,
-    skip_dp: bool = False,
-):
-    """Apply DSV4 parallelism with per-parameter FP32 SmoE policies."""
-    compile_config = skip_compile_under_cp(model, compile_config, parallelism_context)
-    with policy_overrides(_dsv4_fp32_overrides(model, training)):
-        parallelized_model = parallelize_with_model_compile(
-            model,
-            parallelism_context=parallelism_context,
-            training=training,
-            parallelism=parallelism,
-            compile_config=compile_config,
-            ac_config=ac_config,
-            dump_folder=dump_folder,
-            skip_dp=skip_dp,
-        )
-    return parallelized_model
+def parallelize_deepseek_v4(model, **kwargs):
+    """Apply upstream eager parallelization with DSV4 FP32 parameter policies."""
+    from torchtitan.models.base.model import BaseModel
+
+    return BaseModel.parallelize(model, **kwargs)
 
 
 def annotate_deepseek_v4(model: GraphTrainerDeepSeekV4Model) -> None:
@@ -136,7 +108,7 @@ def parallelize_graph_trainer_deepseek_v4(
     training: TrainingConfig,
     parallelism: ParallelismConfig,
     compile_config: GraphTrainerCompileConfig,
-    ac_config: ActivationCheckpointingConfig,
+    ac_config: Any,
     dump_folder: str,
 ):
     token_divisor = parallelism_context.cp * (

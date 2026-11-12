@@ -98,6 +98,117 @@ def test_virtual_derives_optimizer_config():
     assert optimizer.optimizers[0].param_groups[0]["lr"] == 0.03
 
 
+@pytest.mark.skipif(
+    not hasattr(torch.distributed.checkpoint, "CheckpointableTensor"), reason="CheckpointableTensor is required"
+)
+@pytest.mark.parametrize(
+    "container_type",
+    [product_optimizer.VirtualOptimizersContainer, product_optimizer.VirtualHostSparseOptimizersContainer],
+    ids=["virtual", "virtual-host-sparse"],
+)
+def test_virtual_optimizer_dcp_restores_moments_and_continues_training(tmp_path, swap_allocations, container_type):
+    import torch.distributed.checkpoint as dcp
+
+    def build():
+        model = torch.nn.Linear(3, 2, bias=False)
+        config = container_type.Config(optimizers=[AdamW.Config(pattern=".*", lr=0.03, fused=False)])
+        return model, config.build(model_parts=[model], enable_cuda_graph=False)
+
+    model, optimizer = build()
+    with torch.no_grad():
+        model.weight.copy_(torch.tensor([[1.0, -2.0, 0.5], [0.3, 0.7, -0.4]]))
+    model.weight.grad = torch.tensor([[0.1, -0.3, 0.7], [0.2, -0.5, 0.4]])
+    optimizer.step()
+    saved_weight = model.weight.detach().clone()
+    original_state = optimizer.optimizers[0].state[model.weight]
+    expected_moments = {key: original_state[key].clone() for key in ("exp_avg", "exp_avg_sq")}
+    dcp.save({"optimizer": optimizer}, checkpoint_id=tmp_path)
+
+    restored, restored_optimizer = build()
+    with torch.no_grad():
+        restored.weight.copy_(saved_weight)
+    restored_optimizer.state_dict()
+    restored_state = restored_optimizer.optimizers[0].state[restored.weight]
+    destinations = {key: restored_state[key] for key in expected_moments}
+    dcp.load({"optimizer": restored_optimizer}, checkpoint_id=tmp_path)
+
+    for key, expected in expected_moments.items():
+        assert restored_optimizer.optimizers[0].state[restored.weight][key] is destinations[key]
+        torch.testing.assert_close(destinations[key], expected, rtol=0, atol=0)
+    assert restored_optimizer.optimizers[0].state[restored.weight]["step"].item() == 1
+
+    gradient = torch.tensor([[-0.2, 0.8, 0.1], [0.6, -0.4, 0.3]])
+    model.weight.grad = gradient.clone()
+    restored.weight.grad = gradient.clone()
+    optimizer.step()
+    restored_optimizer.step()
+    torch.testing.assert_close(restored.weight, model.weight, rtol=0, atol=0)
+
+
+def test_virtual_optimizer_failed_load_preserves_moment_storage(swap_allocations):
+    model = torch.nn.Linear(3, 2, bias=False)
+    config = product_optimizer.VirtualOptimizersContainer.Config(
+        optimizers=[AdamW.Config(pattern=".*", lr=0.03, fused=False)]
+    )
+    optimizer = config.build(model_parts=[model], enable_cuda_graph=False)
+    state = optimizer.state_dict()
+    original = optimizer.optimizers[0].state[model.weight]["exp_avg"]
+    state["state.weight.exp_avg"] = torch.zeros(5)
+
+    with pytest.raises(RuntimeError):
+        optimizer.load_state_dict(state)
+
+    assert optimizer.optimizers[0].state[model.weight]["exp_avg"] is original
+
+
+def _virtual_optimizer_dcp_shard_worker(rank, rendezvous, checkpoint_dir):
+    import torch.distributed as dist
+    import torch.distributed.checkpoint as dcp
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.tensor import DTensor, Shard
+
+    dist.init_process_group("gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=2)
+    try:
+        mesh = init_device_mesh("cpu", (2,))
+        local = torch.arange(rank * 6, rank * 6 + 6, dtype=torch.float32).reshape(2, 3)
+        weight = DTensor.from_local(local, mesh, (Shard(0),), shape=(4, 3), stride=(3, 1), run_check=False)
+        model = torch.nn.Module()
+        model.weight = torch.nn.Parameter(weight)
+        config = product_optimizer.VirtualOptimizersContainer.Config(
+            optimizers=[AdamW.Config(pattern=".*", lr=0.03, fused=False)]
+        )
+        optimizer = config.build(model_parts=[model], enable_cuda_graph=False)
+        optimizer.state_dict()
+        state = optimizer.optimizers[0].state[model.weight]
+        for key, value in (("exp_avg", local + 1), ("exp_avg_sq", local + 10)):
+            state[key].to_local().copy_(value)
+        snapshot = optimizer.state_dict()["state.weight.exp_avg"]
+        assert snapshot.global_shape == (4, 3)
+        assert snapshot.global_offsets == ((rank * 2, 0),)
+        torch.testing.assert_close(snapshot, local + 1, rtol=0, atol=0)
+        dcp.save({"optimizer": optimizer}, checkpoint_id=checkpoint_dir)
+        state["exp_avg"].to_local().zero_()
+        state["exp_avg_sq"].to_local().zero_()
+        dcp.load({"optimizer": optimizer}, checkpoint_id=checkpoint_dir)
+        torch.testing.assert_close(state["exp_avg"].to_local(), local + 1, rtol=0, atol=0)
+        torch.testing.assert_close(state["exp_avg_sq"].to_local(), local + 10, rtol=0, atol=0)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    not hasattr(torch.distributed.checkpoint, "CheckpointableTensor"), reason="CheckpointableTensor is required"
+)
+def test_virtual_optimizer_dcp_roundtrip_preserves_two_rank_dtensor_shards(tmp_path, swap_allocations):
+    torch.multiprocessing.start_processes(
+        _virtual_optimizer_dcp_shard_worker,
+        args=(str(tmp_path / "rendezvous"), str(tmp_path / "checkpoint")),
+        nprocs=2,
+        join=True,
+        start_method="fork",
+    )
+
+
 @pytest.fixture
 def cpu_offload_resources(monkeypatch):
     from torchtitan_npu.extensions.distributed import grad_accum, grad_clip

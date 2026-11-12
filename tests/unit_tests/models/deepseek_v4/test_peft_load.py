@@ -125,7 +125,7 @@ def _manager(path, base, config, family, model, *, save_training_state=True, ver
         optimizers=[AdamW.Config(pattern=".*", lr=0.02, weight_decay=0.0, fused=False)]
     ).build(model_parts=[model])
     scheduler = LRSchedulersContainer.Config(warmup_steps=0).build(optimizers=optimizer, training_steps=20)
-    ema = EMA.Config(decay=0.5, buffer_patterns=[r"^resume_probe$"]).build(model_parts=[model])
+    ema = EMA.Config(decays=[0.5], buffer_patterns=[r"^resume_probe$"]).build(model_parts=[model])
     owner = DeepSeekV4PEFTCheckpointManager if family == "v4" else DeepSeekV41LoRACheckpointManager
     manager = owner.Config(
         folder=str(path),
@@ -140,9 +140,8 @@ def _manager(path, base, config, family, model, *, save_training_state=True, ver
         model_parts=[model],
         optimizers=optimizer,
         lr_schedulers=scheduler,
-        dataloader=_Counter(),
         ema=ema,
-        states={"train_state": _Counter()},
+        extra_states={"train_state": _Counter(), "dataloader": _Counter()},
         sd_adapter=_adapter(config, family),
     )
     return manager
@@ -301,9 +300,11 @@ def test_automatic_selection_rejects_step_zero_without_adapters_unless_it_is_ini
     _write_native_base(base, model)
     _write_native_base(root / "step-0", model)
 
-    with closing(_manager(root, base, config, family, model, initial_hf=False)) as manager:
-        with pytest.raises(ValueError, match="requires adapter tensors"):
-            manager.load()
+    with (
+        closing(_manager(root, base, config, family, model, initial_hf=False)) as manager,
+        pytest.raises(ValueError, match="requires adapter tensors"),
+    ):
+        manager.load()
 
 
 def _clone_state(model):
@@ -375,7 +376,8 @@ def test_real_load_entry_reads_hf_by_layer_preserves_adapters_and_reseeds_ema_on
         assert ema_calls == [False]
         for optimizer in manager.states[EMA_KEY].optimizers:
             for tensor, state in optimizer.state.items():
-                torch.testing.assert_close(state["ema_params"], tensor, rtol=0, atol=0)
+                for ema_param in state["ema_params"].values():
+                    torch.testing.assert_close(ema_param, tensor, rtol=0, atol=0)
     finally:
         manager.close()
 
@@ -476,7 +478,8 @@ def test_current_adapter_only_save_load_restores_real_stateful_consumers(
             assert ema_calls == [False]
             for optimizer in target.states[EMA_KEY].optimizers:
                 for tensor, state in optimizer.state.items():
-                    torch.testing.assert_close(state["ema_params"], tensor, rtol=0, atol=0)
+                    for ema_param in state["ema_params"].values():
+                        torch.testing.assert_close(ema_param, tensor, rtol=0, atol=0)
     finally:
         target.close()
 

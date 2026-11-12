@@ -133,7 +133,6 @@ def _worker(folder):
                 router.num_experts, router.top_k = 2, 1
                 router.num_expert_groups = None
                 router.route_norm, router.route_scale = False, 1.0
-                router._debug_force_load_balance = False
                 self.routers.append(router)
             self.experts = torch.nn.Parameter(torch.tensor([[4.0, -4.0], [3.0, -3.0]]))
             self.register_buffer("counter", torch.zeros(()))

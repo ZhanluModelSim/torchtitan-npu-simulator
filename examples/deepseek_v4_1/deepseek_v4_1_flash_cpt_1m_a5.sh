@@ -4,161 +4,19 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-# Run this script on each participating node; NODE_IPS lists all node addresses.
-# CP=EP=128 requires at least 128 ranks with eight devices per node.
-# Append CLI arguments to override the defaults below.
-# For deterministic execution, append --debug.seed 42 --debug.deterministic.
-
 set -euo pipefail
 
-NODE_IPS="${NODE_IPS:-xx.xx.xx.xx, xx.xx.xx.xx, xx.xx.xx.xx, xx.xx.xx.xx, xx.xx.xx.xx, xx.xx.xx.xx, xx.xx.xx.xx, xx.xx.xx.xx, \
-                      xx.xx.xx.xx, xx.xx.xx.xx, xx.xx.xx.xx, xx.xx.xx.xx, xx.xx.xx.xx, xx.xx.xx.xx, xx.xx.xx.xx, xx.xx.xx.xx}"
-NGPU="${NGPU:-8}"
-NNODES=$(awk -F, '{print NF}' <<< "${NODE_IPS}")
-WORLD_SIZE=$((NGPU * NNODES))
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
-# Model
-MODULE="${MODULE:-torchtitan_npu.models.deepseek_v4_1}"
-CONFIG="${CONFIG:-deepseek_v4_1_flash_text_cp}"
-
-# Dataloader
-DATASET_PATH="${DATASET_PATH:-}" # optional JSON/JSONL file for the text source
-export DATA_FILES="${DATA_FILES:-${DATASET_PATH:-tests/assets/c4_test/data.json}}"
-export DSV41_PER_DOC_ALIGNMENT="${DSV41_PER_DOC_ALIGNMENT:-256}"
-HF_ASSETS_PATH="${HF_ASSETS_PATH:-/path/to/DeepSeekV41_tokenizer}" # your tokenizer path
-
-# Parallelism
-TP=1
-PP=1
-EP="${EP:-128}"
-CP="${CP:-128}"
-DP_SHARD="${DP_SHARD:-1}"
-if (( WORLD_SIZE <= 0 || DP_SHARD <= 0 || EP <= 0 || WORLD_SIZE % DP_SHARD != 0 || WORLD_SIZE % EP != 0 || 384 % EP != 0 )); then
-    echo "Invalid topology: WORLD_SIZE must divide into DP_SHARD/EP groups; EP must divide 384 experts." >&2
-    exit 1
+if [[ -n "${NODE_IPS:-}" ]]; then
+    IFS=',' read -r -a node_ips <<< "${NODE_IPS}"
+    default_nodes="${#node_ips[@]}"
+else
+    default_nodes=16
 fi
-DP_REPLICATE=$((WORLD_SIZE / (DP_SHARD * CP * TP * PP)))
 
-# Training
-# Full Flash uses eager execution and the recipe-owned FullAC policy.
-SEQ_LEN=1048576
-NUM_TOKENS_PER_MICROBATCH_PER_DP_RANK=1048576
-NUM_TOKENS_PER_TRAIN_STEP=1048576
-STEPS="${STEPS:-10}"
-
-# Debug
-DEBUG_ARGS="
-    --debug.moe-force-load-balance
-    --debug.print-config
-    --no_engram_enabled
-"
-
-# HF assets
-HF_ASSETS_ARGS="
-    --hf-assets-path ${HF_ASSETS_PATH}
-"
-
-# The recipe owns the typed Grain dataset graph; DATA_FILES selects its JSON source.
-
-# Parallelism
-PARALLELISM_ARGS="
-    --parallelism.data-parallel-shard-degree ${DP_SHARD}
-    --parallelism.data-parallel-replicate-degree ${DP_REPLICATE}
-    --parallelism.expert-parallel-degree ${EP}
-    --parallelism.tensor-parallel-degree ${TP}
-    --parallelism.context-parallel-degree ${CP}
-    --parallelism.pipeline-parallel-degree ${PP}
-    --parallelism.fsdp-reshard-after-forward always
-    --parallelism.enable-sequence-parallel
-"
-
-# Compile
-COMPILE_ARGS=""
-
-# Training
-TRAINING_ARGS="
-    --training.num-tokens-per-microbatch-per-dp-rank ${NUM_TOKENS_PER_MICROBATCH_PER_DP_RANK}
-    --training.num-tokens-per-train-step ${NUM_TOKENS_PER_TRAIN_STEP}
-    --training.max-context-length ${SEQ_LEN}
-    --training.steps ${STEPS}
-    --training.disable-cuda-graphs
-    --metrics.log-freq 1
-"
-
-# LR scheduler
-LR_SCHEDULER_ARGS="
-    --optim.lr-scheduler.warmup-steps 2
-    --optim.lr-scheduler.total-steps ${STEPS}
-    --optim.lr-scheduler.decay-ratio 1.0
-    --optim.lr-scheduler.decay-type cosine
-    --optim.lr-scheduler.min-lr-factor 0.01
-"
-
-# Checkpoint policy is declared by the selected Python recipe.
-CHECKPOINT_ARGS=""
-
-# Profiler
-PROFILER_ARGS="
-    --profiler.no-enable-profiling
-    --profiler.save-traces-folder profiling_path
-    --profiler.extension.no-enable-online-parse
-    --profiler.extension.profiler-start 6
-    --profiler.extension.profiler-end 7
-    --profiler.extension.profile-ranks 0
-"
-
-# Communication
-COMM_ARGS="
-    --comm.init-timeout-seconds 7200
-    --comm.train-timeout-seconds 600
-"
-
-# Optimizer
-OPTIMIZER_ARGS="
-    --optim.optimizer.name Muon
-    --optim.optimizer.lr 1.0e-5
-    --optim.optimizer.beta1 0.9
-    --optim.optimizer.beta2 0.95
-    --optim.optimizer.eps 1.0e-8
-    --optim.optimizer.weight-decay 1.0e-1
-    --optim.optimizer.muon_momentum 0.95
-    --optim.optimizer.muon_enable_nesterov
-    --optim.optimizer.muon_ns_steps 10
-    --optim.optimizer.muon_adjust_lr_fn match_rms_adamw
-"
-OPTIMIZER_OVERRIDES="${OPTIMIZER_OVERRIDES-torchtitan_npu.override.common.optimizer.swap_optimizer}"
-
-NPU_OPS_OVERRIDES=(
-    torchtitan_npu.override.common.rms_norm.asc \
-    torchtitan_npu.override.common.rope.asc_partial \
-    torchtitan_npu.override.common.token_dispatcher.asc \
-    torchtitan_npu.override.common.swiglu_group.asc \
-    torchtitan_npu.override.common.swiglu_group.asc_shared_experts \
-    torchtitan_npu.override.deepseek_v4_1.mhc.asc_sinkhorn \
-    torchtitan_npu.override.deepseek_v4_1.mhc.asc_hc_post \
-    torchtitan_npu.override.deepseek_v4_1.lightning_indexer.asc \
-    torchtitan_npu.override.deepseek_v4_1.sparse_attn.asc
-)
-
-# Wrapper defaults extend override.imports after the base targets.
-CLI_OVERRIDES="${CLI_OVERRIDES:-}"
-
-MODULE="${MODULE}" \
-CONFIG="${CONFIG}" \
-NODE_IPS="${NODE_IPS}" \
-NGPU="${NGPU}" \
-LOG_PREFIX="${LOG_PREFIX:-${CONFIG}}" \
-bash scripts/run_train_multinodes.sh \
-    $COMPILE_ARGS \
-    $HF_ASSETS_ARGS \
-    $PARALLELISM_ARGS \
-    $TRAINING_ARGS \
-    $DEBUG_ARGS \
-    $OPTIMIZER_ARGS \
-    $LR_SCHEDULER_ARGS \
-    $PROFILER_ARGS \
-    $COMM_ARGS \
-    $CHECKPOINT_ARGS \
-    --override.imports "${NPU_OPS_OVERRIDES[@]}" $OPTIMIZER_OVERRIDES \
-    $CLI_OVERRIDES \
-    "$@"
+MODULE="${MODULE:-torchtitan_npu_recipes.examples.deepseek_v4_1}" \
+CONFIG="${CONFIG:-deepseek_v4_1_flash_cpt_1m_a5}" \
+NGPU="${NGPU:-8}" \
+NNODES="${NNODES:-${default_nodes}}" \
+exec bash "${SCRIPT_DIR}/../../scripts/run_train_multinodes.sh" "$@"

@@ -11,9 +11,9 @@ from torchtitan.components.optim import AdamW, OptimizersContainer
 from torchtitan.distributed.flex_shard import BlockShard, Owned
 
 from torchtitan_npu.extensions.torchtitan.components.optimizer.muon import DistMuon
-from torchtitan_npu.models.deepseek_v4.config_registry import deepseek_v4_flash_lora
 from torchtitan_npu.models.deepseek_v4.lora import is_lora_parameter
-from torchtitan_npu.models.deepseek_v4_1.config_registry import deepseek_v4_1_flash_text_lora
+from torchtitan_npu_recipes.models.deepseek_v4 import deepseek_v4_flash_lora
+from torchtitan_npu_recipes.models.deepseek_v4_1 import deepseek_v4_1_flash_text_lora
 
 
 @pytest.mark.parametrize("factory", [deepseek_v4_flash_lora, deepseek_v4_1_flash_text_lora], ids=["v4", "v4.1"])
@@ -57,7 +57,7 @@ def test_actual_lora_recipe_muon_groups_cover_adapters_with_layouts_and_unique_b
 
     for factor in ("a", "b"):
         dense = f"layers.0.attention.wq_a.lora_{factor}.weight"
-        grouped = f"layers.0.moe.routed_experts.w13.lora_{factor}.weight"
+        grouped = f"layers.0.feed_forward.routed_experts.w13.lora_{factor}.weight"
         assert {dense, grouped} <= muon_names
         expert_layout = muon.compute_sharding_by_fqn[grouped].shardings_by_mesh_axis
         assert {"dp_shard", "edp_shard", "ep"} <= expert_layout.keys()

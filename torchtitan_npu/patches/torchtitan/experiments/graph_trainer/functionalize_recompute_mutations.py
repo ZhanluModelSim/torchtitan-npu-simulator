@@ -47,7 +47,7 @@ def functionalize_recompute_mutations_pass(
     ):
         return gm
     effect_types = {
-        _get_effect(node.target)
+        _get_effect(node.target)  # pyrefly: ignore [bad-argument-type]
         for module in gm.modules()
         if isinstance(module, fx.GraphModule)
         for node in module.graph.nodes

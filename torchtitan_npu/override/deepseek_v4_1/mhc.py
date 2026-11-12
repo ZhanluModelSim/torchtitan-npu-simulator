@@ -37,7 +37,7 @@ class AscV41HcPost(HcPost):
     class Config(HcPost.Config):
         pass
 
-    def forward(self, y, residual, post, comb):
+    def forward(self, y, residual, post, comb):  # pyrefly: ignore [bad-param-name-override]
         return torch.ops.cann_ops_transformer.mhc_post(residual, comb, y, post)
 
 

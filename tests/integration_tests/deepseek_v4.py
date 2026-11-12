@@ -14,8 +14,7 @@ NPU_OVERRIDES = (
     "--override.imports",
     "torchtitan_npu.override.common.rms_norm.asc",
     "torchtitan_npu.override.common.rope.asc_complex",
-    "torchtitan_npu.override.deepseek_v4.lightning_indexer.asc",
-    'torchtitan_npu.override.deepseek_v4.sparse_attn.asc={"num_heads":16,"index_num_heads":8}',
+    'torchtitan_npu.override.deepseek_v4.sparse_attn.asc={"num_heads":16,"index_num_heads":8,"selector_backend":"asc"}',
     "torchtitan_npu.override.deepseek_v4.mhc.asc_hc_pre",
     "torchtitan_npu.override.deepseek_v4.mhc.asc_hc_post",
     "torchtitan_npu.override.common.token_dispatcher.asc",
@@ -133,7 +132,7 @@ def build_deepseek_v4_quantized_test_list() -> list[OverrideDefinitions]:
             train_args=V4_TRAIN_ARGS,
             test_name="dsv4_mxfp4_communication_fsdp2",
             test_descr="MXFP4 QAT communication, two forward/backward/optimizer steps on A5",
-            env_vars={"MODULE": "torchtitan_npu.models.deepseek_v4", "CONFIG": "deepseek_v4_debugmodel"},
+            env_vars={"MODULE": "torchtitan_npu_recipes.models.deepseek_v4", "CONFIG": "deepseek_v4_debugmodel"},
             override_args=[
                 (
                     *GOLDEN_OVERRIDES,
@@ -190,7 +189,7 @@ def _build_grain_sft_case() -> OverrideDefinitions:
         ngpu=1,
         timeout=600,
         env_vars={
-            "MODULE": "torchtitan_npu.models.deepseek_v4",
+            "MODULE": "torchtitan_npu_recipes.models.deepseek_v4",
             "CONFIG": "deepseek_v4_debugmodel_sft",
             "DSV4_SFT_DATASET": dataset,
         },

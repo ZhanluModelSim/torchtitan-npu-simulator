@@ -464,6 +464,8 @@ def run_single_test(
 
     if test_flavor.expected_steps is not None and len(test_flavor.expected_steps) != len(test_flavor.override_args):
         raise ValueError(f"Expected one step sequence per phase for {test_name}")
+    if test_flavor.check_resume_state and not test_flavor.check_resume:
+        raise ValueError("Final-state comparison requires a resume case")
     if test_flavor.check_resume and (test_flavor.expected_steps is None or len(test_flavor.override_args) != 2):
         raise ValueError(f"Resume comparison requires two phases with expected steps for {test_name}")
 
@@ -504,15 +506,21 @@ def run_single_test(
         # torchtitan-npu override: launch the case-specific training script
         # directly with an argv list and pass settings through the environment;
         # no shell is involved, so tokens are never re-split or interpolated.
-        cmd = ["bash", test_flavor.train_script, "--dump_folder", str(case_dir / "test_run")]
-        train_args = DEFAULT_TRAIN_ARGS if test_flavor.train_args is None else test_flavor.train_args
-        cmd += list(train_args)
-        if test_flavor.check_loss or test_flavor.check_resume:
-            cmd += list(DETERMINISTIC_ARGS)
-        # Keep root options before tyro subcommands in the case overrides.
-        # A subcommand such as activation-checkpoint:none ends root parsing.
-        if test_flavor.expected_steps is not None:
-            cmd.append(f"--metrics.save_tb_folder=tb_phase_{idx}")
+        if test_flavor.python_config:
+            cmd = ["bash", test_flavor.train_script, "--output-dir", str(case_dir / "test_run")]
+            # The recipe uses this per-phase channel for TensorBoard paths; all
+            # deterministic, topology and training settings remain in Python.
+            env["TT_NPU_INTEGRATION_PHASE"] = str(idx)
+            if test_flavor.train_args:
+                cmd += list(test_flavor.train_args)
+        else:
+            cmd = ["bash", test_flavor.train_script, "--dump_folder", str(case_dir / "test_run")]
+            train_args = DEFAULT_TRAIN_ARGS if test_flavor.train_args is None else test_flavor.train_args
+            cmd += list(train_args)
+            if test_flavor.check_loss or test_flavor.check_resume:
+                cmd += list(DETERMINISTIC_ARGS)
+            if test_flavor.expected_steps is not None:
+                cmd.append(f"--metrics.save_tb_folder=tb_phase_{idx}")
         if override_arg:
             cmd += list(override_arg)
         # Human-readable rendering for the log header and error messages:
@@ -795,8 +803,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--module",
-        default="torchtitan_npu.models.deepseek_v4",
-        help="Model module to use for training (default: torchtitan_npu.models.deepseek_v4). "
+        default="torchtitan_npu_recipes.models.deepseek_v4",
+        help="Model module to use for training (default: torchtitan_npu_recipes.models.deepseek_v4). "
         "This is passed as MODULE env var to run_train.sh.",
     )
     parser.add_argument(

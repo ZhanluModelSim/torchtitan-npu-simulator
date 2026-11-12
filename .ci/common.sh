@@ -66,12 +66,9 @@ _setup_torchtitan "${TORCHTITAN_DIR}"
 "${PYTHON_BIN}" -m pip install --break-system-packages --no-deps --no-cache-dir -e "${TORCHTITAN_DIR}"
 "${PYTHON_BIN}" -m pip install --break-system-packages --no-deps --no-cache-dir -e "${PROJECT_ROOT}"
 
-# The CI image supplies torch 2.14.0.dev; the matching torchvision CPU wheel
-# is installed with --no-deps (resolving its torch pin would fight the image).
-"${PYTHON_BIN}" -m pip install --break-system-packages --no-deps --no-cache-dir --index-url https://download.pytorch.org/whl/cpu "torchvision==0.29.0+cpu"
 "${PYTHON_BIN}" -c 'import torchtitan, torchtitan_npu, torchvision'
 
-export MODULE="${MODULE:-torchtitan_npu.models.deepseek_v4}"
+export MODULE="${MODULE:-torchtitan_npu_recipes.models.deepseek_v4}"
 export CONFIG="${CONFIG:-deepseek_v4_debugmodel}"
 export NGPU
 export LOG_RANK="${LOG_RANK:-0}"

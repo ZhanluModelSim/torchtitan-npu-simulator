@@ -34,9 +34,9 @@ def test_standard_peft_factor_layout_preserves_each_expert_and_gate_up_order():
         b = exported[f"{prefix}{suffix}.lora_B.weight"].reshape(output, 8, 2)
         for expert in range(2):
             torch.testing.assert_close(
-                a[expert], factors[f"layers.0.moe.routed_experts.{projection}.lora_a.weight"][expert]
+                a[expert], factors[f"layers.0.feed_forward.routed_experts.{projection}.lora_a.weight"][expert]
             )
-            original_b = factors[f"layers.0.moe.routed_experts.{projection}.lora_b.weight"][expert]
+            original_b = factors[f"layers.0.feed_forward.routed_experts.{projection}.lora_b.weight"][expert]
             expected_b = torch.cat((original_b[0], original_b[1])) if projection == "w13" else original_b
             torch.testing.assert_close(b[:, :, expert], expected_b)
     metadata = adapter.peft_adapter_config()
@@ -60,10 +60,10 @@ def test_hf_base_export_omits_standard_adapter_tensors():
 def test_fused_base_expert_and_shared_weights_roundtrip_exactly():
     adapter, _ = _adapter_and_factors()
     state = {
-        "layers.0.moe.routed_experts.w13.weight": torch.arange(2048).reshape(2, 2, 16, 32).float(),
-        "layers.0.moe.routed_experts.w2.weight": torch.arange(1024).reshape(2, 32, 16).float(),
-        "layers.0.moe.shared_experts.w13.weight": torch.arange(1024).reshape(2, 16, 32).float(),
-        "layers.0.moe.shared_experts.w2.weight": torch.arange(512).reshape(32, 16).float(),
+        "layers.0.feed_forward.routed_experts.w13.weight": torch.arange(2048).reshape(2, 2, 16, 32).float(),
+        "layers.0.feed_forward.routed_experts.w2.weight": torch.arange(1024).reshape(2, 32, 16).float(),
+        "layers.0.feed_forward.shared_experts.w13.weight": torch.arange(1024).reshape(2, 16, 32).float(),
+        "layers.0.feed_forward.shared_experts.w2.weight": torch.arange(512).reshape(32, 16).float(),
     }
     exported = adapter.to_hf(state)
     assert "layers.0.ffn.experts.1.w3.weight" in exported
@@ -111,7 +111,7 @@ def test_peft_export_loads_in_transformers_and_matches_independent_merged_logits
             a = factors[f"layers.0.attention.{projection}.lora_a.weight"]
             b = factors[f"layers.0.attention.{projection}.lora_b.weight"]
             getattr(layer.self_attn, hf).weight.add_(b @ a, alpha=2)
-        prefix = "layers.0.moe.shared_experts"
+        prefix = "layers.0.feed_forward.shared_experts"
         for index, projection in enumerate(("gate_proj", "up_proj")):
             getattr(layer.mlp.shared_experts, projection).weight.add_(
                 factors[f"{prefix}.w13.lora_b.weight"][index] @ factors[f"{prefix}.w13.lora_a.weight"],
@@ -121,7 +121,7 @@ def test_peft_export_loads_in_transformers_and_matches_independent_merged_logits
             factors[f"{prefix}.w2.lora_b.weight"] @ factors[f"{prefix}.w2.lora_a.weight"],
             alpha=2,
         )
-        prefix = "layers.0.moe.routed_experts"
+        prefix = "layers.0.feed_forward.routed_experts"
         for expert in range(2):
             a = factors[f"{prefix}.w13.lora_a.weight"][expert]
             b = factors[f"{prefix}.w13.lora_b.weight"][expert]

@@ -129,6 +129,7 @@ def test_save_skips_manifest_operations_when_disabled():
 def test_load_checkpoint_verifies_manifest_before_upstream_load():
     manager = object.__new__(product_checkpoint.CheckpointManager)
     manager.verify_hash_manifest = True
+    manager._metadata_pg = object()
     events = []
 
     with (
@@ -248,7 +249,7 @@ def test_checkpoint_manager_uses_synchronous_writer():
     with (
         patch.object(product_checkpoint.dcp, "FileSystemWriter", return_value=writer) as make_writer,
         patch.object(product_checkpoint.dcp, "save") as save,
-        patch.object(product_checkpoint.GarbageCollection, "collect") as collect,
+        patch.object(product_checkpoint.GarbageCollector, "collect") as collect,
     ):
         result = manager.dcp_save(
             state_dict,

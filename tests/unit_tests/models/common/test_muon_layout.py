@@ -31,8 +31,8 @@ def sparse_storage_mesh():
 @pytest.mark.parametrize(
     "module,recipe",
     [
-        ("torchtitan_npu.models.deepseek_v4.config_registry", "deepseek_v4_debugmodel"),
-        ("torchtitan_npu.models.deepseek_v4_1.config_registry", "deepseek_v4_1_debugmodel_text"),
+        ("torchtitan_npu_recipes.models.deepseek_v4", "deepseek_v4_debugmodel"),
+        ("torchtitan_npu_recipes.models.deepseek_v4_1", "deepseek_v4_1_debugmodel_text"),
     ],
     ids=["v4", "v4.1"],
 )
@@ -47,7 +47,7 @@ def test_recipe_expert_layout_preserves_ep_ownership_during_row_redistribution(
     config = getattr(importlib.import_module(module), recipe)()
     config.optim.optimizer.name = "Muon"
     config.optim.optimizer.materialize()
-    fqn = f"layers.0.moe.routed_experts.{projection}.weight"
+    fqn = f"layers.0.feed_forward.routed_experts.{projection}.weight"
     optimizer_config = next(
         owner for owner in config.optim.optimizer.optimizers if hasattr(owner, "compute_sharding_by_fqn")
     )

@@ -45,11 +45,16 @@ class _FakeNode:
 
 
 @pytest.fixture
-def device_copy_patch(monkeypatch):
+def device_copy_patch(monkeypatch, tmp_path):
     """Load the patch module without importing the package-level plugin chain."""
     fake_torch_npu = types.ModuleType("torch_npu")
     fake_torch_npu.npu = types.SimpleNamespace(is_available=lambda: False)
+    fake_torch_npu.__path__ = [str(tmp_path)]
     monkeypatch.setitem(sys.modules, "torch_npu", fake_torch_npu)
+    saved_modules = {}
+    for name in list(sys.modules):
+        if name.startswith("torch_npu._inductor"):
+            saved_modules[name] = sys.modules.pop(name)
     fake_inductor_ir = types.SimpleNamespace(DeviceCopy=_FakeDeviceCopy, Layout=_FakeLayout)
     fake_inductor = types.ModuleType("torch._inductor")
     fake_inductor.ir = fake_inductor_ir
@@ -61,10 +66,72 @@ def device_copy_patch(monkeypatch):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     module.inductor_ir = fake_inductor_ir
-    module._original_device_copy_create = (
-        lambda x, device, non_blocking, *args, **kwargs: _FakeDeviceCopy()
+    module._original_device_copy_create = lambda x, device, non_blocking, *args, **kwargs: _FakeDeviceCopy()
+    yield module
+    for name in list(sys.modules):
+        if name.startswith("torch_npu._inductor"):
+            del sys.modules[name]
+    sys.modules.update(saved_modules)
+
+
+def _write_backend(root, *, common_source=None):
+    inductor = root / "_inductor"
+    inductor.mkdir()
+    (inductor / "__init__.py").write_text("raise ImportError('inductor initialization')\n")
+    if common_source is None:
+        return
+    lowering = inductor / "ascendc" / "lowering"
+    lowering.mkdir(parents=True)
+    for package in (inductor, inductor / "ascendc", lowering):
+        (package / "__init__.py").write_text("")
+    (lowering / "common.py").write_text(common_source)
+
+
+def test_apply_absent_ascendc_does_not_initialize_inductor(device_copy_patch, monkeypatch, tmp_path):
+    _write_backend(tmp_path)
+    monkeypatch.setattr(device_copy_patch.torch_npu.npu, "is_available", lambda: True)
+    original = _FakeDeviceCopy.create.__func__
+
+    device_copy_patch.apply()
+
+    assert _FakeDeviceCopy.create.__func__ is original
+    assert "torch_npu._inductor" not in sys.modules
+
+
+def test_apply_present_ascendc_installs_device_copy_patch(device_copy_patch, monkeypatch, tmp_path):
+    _write_backend(
+        tmp_path,
+        common_source=(
+            "class _LoweringGuard:\n"
+            "    calls = []\n"
+            "    @classmethod\n"
+            "    def support(cls, *args): cls.calls.append(args)\n"
+            "def exclude(): return (torch.float32,)\n"
+            "import torch\n"
+        ),
     )
-    return module
+    monkeypatch.setattr(device_copy_patch.torch_npu.npu, "is_available", lambda: True)
+    monkeypatch.setattr(_FakeDeviceCopy, "create", _FakeDeviceCopy.__dict__["create"])
+
+    device_copy_patch.apply()
+
+    from torch_npu._inductor.ascendc.lowering.common import _LoweringGuard
+
+    assert _FakeDeviceCopy.create.__func__ is device_copy_patch._patched_device_copy_create
+    assert _LoweringGuard.calls == [
+        (device_copy_patch.torch.ops.prims.device_put, (device_copy_patch.torch.float32, device_copy_patch.torch.int64))
+    ]
+    result = _FakeDeviceCopy.create(_FakeNode("npu"), types.SimpleNamespace(type="cpu"), True)
+    assert result.layout.is_pinned
+
+
+@pytest.mark.parametrize("error_type", [ImportError, ModuleNotFoundError])
+def test_apply_present_backend_propagates_import_error(device_copy_patch, monkeypatch, tmp_path, error_type):
+    _write_backend(tmp_path, common_source=f"raise {error_type.__name__}('backend dependency failed')\n")
+    monkeypatch.setattr(device_copy_patch.torch_npu.npu, "is_available", lambda: True)
+
+    with pytest.raises(error_type, match="backend dependency failed"):
+        device_copy_patch.apply()
 
 
 @pytest.mark.parametrize(
@@ -77,9 +144,7 @@ def device_copy_patch(monkeypatch):
         pytest.param(None, "cpu", True, False, id="unknown-source"),
     ],
 )
-def test_device_copy_pins_only_async_npu_to_cpu(
-    device_copy_patch, source, destination, non_blocking, expected_pinned
-):
+def test_device_copy_pins_only_async_npu_to_cpu(device_copy_patch, source, destination, non_blocking, expected_pinned):
     result = device_copy_patch._patched_device_copy_create(
         _FakeDeviceCopy,
         _FakeNode(source),

@@ -4,13 +4,15 @@
 # LICENSE file in the root directory of this source tree.
 
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 from types import ModuleType
+from unittest.mock import patch
 
 import pytest
-from torchtitan.config.manager import ConfigManager
+from torchtitan.config import ConfigLoader
 from torchtitan.config.override import OverrideConfig, apply_overrides
 
 from torchtitan_npu.models.common.rope import HalfRotation
@@ -36,18 +38,22 @@ def launcher_config(tmp_path):
     (scripts / "run_train.sh").write_text('printf "%s\\0" --module "$MODULE" --config "$CONFIG" "$@"\n')
 
     def parse(hardware="a3", *, golden=False):
-        env = os.environ | {
-            "CONFIG": "deepseek_v4_1_debugmodel_multimodal",
-            "MODULE": "torchtitan_npu.models.deepseek_v4_1",
+        legacy = ("CLI_OVERRIDES", "OPTIMIZER_OVERRIDES", "DATALOADER_OVERRIDES", "MHC_POST_OVERRIDE")
+        base_env = {key: value for key, value in os.environ.items() if key not in legacy}
+        env = base_env | {
             "USE_GOLDEN": str(int(golden)),
             "NGPU": "8",
-            "CLI_OVERRIDES": "",
             "HF_ASSETS_PATH": str(root / "tests/assets/deepseek_v3"),
         }
-        script = root / f"examples/deepseek_v4_1/debug/deepseek_v4_1_flash_8p_cpt_4k_{hardware}.sh"
+        script = tmp_path / f"examples/deepseek_v4_1/debug/deepseek_v4_1_flash_8p_cpt_4k_{hardware}.sh"
+        script.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(root / "examples" / "deepseek_v4_1" / "debug" / script.name, script)
         captured = subprocess.check_output(["bash", str(script)], cwd=tmp_path, env=env)
         args = captured.decode().rstrip("\0").split("\0")
-        return ConfigManager().parse_args(args)
+        # ``ConfigLoader`` re-runs the recipe in-process; give it the same clean
+        # environment as the launcher, including the golden switch.
+        with patch.dict(os.environ, env, clear=True):
+            return ConfigLoader().load(args)
 
     return parse
 
@@ -128,7 +134,7 @@ def test_a5_launcher_selects_the_full_fused_stack(launcher_config, monkeypatch):
     assert type(cfg.vision_encoder.rotary) is AscHalfRotation.Config
 
     # SwiGLUGroup: routed grouped experts plus the FQN-limited shared experts.
-    moe = cfg.layers[0].moe
+    moe = cfg.layers[0].feed_forward
     assert type(moe.routed_experts.activation_fn) is AscSwiGLU.Config
     assert type(moe.shared_experts.activation_fn) is AscSwiGLU.Config
 
@@ -158,6 +164,6 @@ def test_a5_golden_launches_no_fused_defaults(launcher_config):
     assert type(cfg.vision_encoder.rotary) is HalfRotation.Config
     # The experts keep whatever reference config the builders produced; the
     # point here is that no SwiGLUGroup replacement was applied.
-    assert type(cfg.layers[0].moe.shared_experts.activation_fn) is not AscSwiGLU.Config
-    assert type(cfg.layers[0].moe.routed_experts.activation_fn) is not AscSwiGLU.Config
+    assert type(cfg.layers[0].feed_forward.shared_experts.activation_fn) is not AscSwiGLU.Config
+    assert type(cfg.layers[0].feed_forward.routed_experts.activation_fn) is not AscSwiGLU.Config
     assert type(cfg.layers[2].attention.inner_attention) is CompressedSparseInnerAttention2.Config

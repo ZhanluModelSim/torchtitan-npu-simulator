@@ -82,7 +82,7 @@ registry._make_v41_config = tiny_config
 cfg = registry.model_registry("deepseek_v4_1_debugmodel")
 cfg.vocab_size = cfg.tok_embeddings.num_embeddings = cfg.lm_head.out_features = 64
 from torchtitan_npu.models.deepseek_v4_1.state_dict_adapter import DeepSeekV41StateDictAdapter
-from torchtitan_npu.models.deepseek_v4_1.config_registry import deepseek_v4_1_debugmodel_text
+from torchtitan_npu_recipes.models.deepseek_v4_1 import deepseek_v4_1_debugmodel_text
 
 adapter = DeepSeekV41StateDictAdapter(cfg, None)
 recipe = deepseek_v4_1_debugmodel_text()
@@ -101,8 +101,8 @@ with single_rank_spmd_context():
     out.square().mean().backward()
     assert len(model.layers) == 40
     for layer in model.layers.values():
-        assert layer.moe.router.tokens_per_expert_E.sum() == 128 * 6
-        assert layer.moe.routed_experts.w13.weight.grad is not None
+        assert layer.feed_forward.router.tokens_per_expert_E.sum() == 128 * 6
+        assert layer.feed_forward.routed_experts.w13.weight.grad is not None
 
 """)
 
@@ -124,8 +124,8 @@ def identities():
 
 def config_contract():
     cfg = v4.model_registry("debugmodel")
-    return [(type(layer.attention), type(layer.moe), type(layer.moe.router),
-             layer.attention.compress_ratio, layer.moe.router.score_func)
+    return [(type(layer.attention), type(layer.feed_forward), type(layer.feed_forward.router),
+             layer.attention.compress_ratio, layer.feed_forward.router.score_func)
             for layer in cfg.layers]
 
 before, config_before = identities(), config_contract()

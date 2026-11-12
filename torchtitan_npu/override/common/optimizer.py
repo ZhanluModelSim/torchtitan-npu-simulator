@@ -455,23 +455,55 @@ class VirtualOptimizersContainer(OptimizersContainer):
         # DCP also needs state for parameters that were unused in training.
         for opt in self._swap_optimizers():
             _initialize_swap_state(opt, only_with_grad=False)
-        return super().state_dict()
+        result = super().state_dict()
+        for opt in self._swap_optimizers():
+            for param, name in _named_optimizer_parameters(opt):
+                for key in ("exp_avg", "exp_avg_sq", "max_exp_avg_sq"):
+                    value = opt.state[param].get(key)
+                    if value is None:
+                        continue
+                    local = _local_tensor(value)
+                    # Direct D2H from swapped virtual memory can segfault in
+                    # torch_npu. Clone one moment to ordinary device memory
+                    # first; retain only the CPU snapshot for DCP. This costs
+                    # an additional full host copy of the optimizer moments.
+                    snapshot = local.detach().clone().cpu()
+                    for field, metadata in _checkpoint_metadata(value, local).items():
+                        setattr(snapshot, field, metadata)
+                    result[f"state.{name}.{key}"] = snapshot
+        return result
 
     def load_state_dict(self, state_dict):
         # Optimizer.load_state_dict may replace the moment tensors. Preserve
         # swap-backed destinations even when loading ordinary checkpoint tensors.
         destinations = []
+        state_for_optimizer = dict(state_dict)
         for opt in self._swap_optimizers():
             _initialize_swap_state(opt, only_with_grad=False)
             for group in opt.param_groups:
-                for param in group["params"]:
+                for param, name in zip(group["params"], group["param_names"], strict=True):
                     for key in ("exp_avg", "exp_avg_sq", "max_exp_avg_sq"):
                         if key in opt.state[param]:
-                            destinations.append((opt, param, key, opt.state[param][key]))
-        super().load_state_dict(state_dict)
-        with torch.no_grad():
-            for opt, param, key, destination in destinations:
-                destination.copy_(opt.state[param][key])
+                            destination = opt.state[param][key]
+                            flat_key = f"state.{name}.{key}"
+                            source = state_dict.get(flat_key)
+                            if source is not None:
+                                destinations.append((opt, param, key, destination, source))
+                                # Keep optimizer loading from allocating all
+                                # moments on device at once or replacing swap
+                                # storage; copy the loaded snapshots below.
+                                state_for_optimizer[flat_key] = destination
+        try:
+            super().load_state_dict(state_for_optimizer)
+            with torch.no_grad():
+                for _, _, _, destination, source in destinations:
+                    local = _local_tensor(destination)
+                    incoming = _local_tensor(source)
+                    # Direct CPU-to-swap copy is also unsupported. Materialize
+                    # one ordinary device tensor before writing the swap view.
+                    local.copy_(incoming.to(device=local.device))
+        finally:
+            for opt, param, key, destination, _ in destinations:
                 opt.state[param][key] = destination
 
 

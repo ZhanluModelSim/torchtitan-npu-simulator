@@ -23,7 +23,9 @@ import torch.nn.functional as F
 from torchtitan.config import OverrideConfig, apply_overrides
 
 from torchtitan_npu.models.common.carry_exchange import CarryExchange
-from torchtitan_npu.models.deepseek_v4 import _debugmodel, _make_v4_config
+from torchtitan_npu.models.deepseek_v4 import _debugmodel as _native_debugmodel
+from torchtitan_npu.models.deepseek_v4 import _make_v4_config
+from torchtitan_npu.models.deepseek_v4.backend import with_npu_attention_backend
 from torchtitan_npu.models.deepseek_v4.compressor import (
     Compressor,
     CompressorImplementation,
@@ -42,6 +44,10 @@ _FUSED_GEOMETRY = AicpuGeometry(
     index_num_heads=8,
     index_head_dim=128,
 )
+
+
+def _debugmodel():
+    return with_npu_attention_backend(_native_debugmodel())
 
 
 def _positions(cu: torch.Tensor) -> torch.Tensor:
@@ -93,6 +99,7 @@ def _tiny_config():
         original_seq_len=256,
     )
     # The sharding pass runs at config resolution, before the overrides.
+    config = with_npu_attention_backend(config)
     set_deepseek_v4_sharding_config(config, enable_sp=False, enable_ep=False)
     return config
 
@@ -106,7 +113,7 @@ def test_compressor_override_composes_with_norm_and_rope(monkeypatch, reverse):
     monkeypatch.setattr(registry, "_REGISTRY", registry._REGISTRY.copy())
     cfg = _debugmodel()
     imports = [
-        "torchtitan_npu.override.deepseek_v4.compressor.asc",
+        "torchtitan_npu.override.deepseek_v4.compressor.legacy_asc",
         "torchtitan_npu.override.common.rms_norm.asc",
         "torchtitan_npu.override.common.rope.asc_complex",
     ]
@@ -157,7 +164,7 @@ def compressor_factory(monkeypatch):
 
         def build(ratio, indexer=False):
             cfg = _debugmodel()
-            apply_overrides(OverrideConfig(imports=["torchtitan_npu.override.deepseek_v4.compressor.asc"]), cfg)
+            apply_overrides(OverrideConfig(imports=["torchtitan_npu.override.deepseek_v4.compressor.legacy_asc"]), cfg)
             attention = cfg.layers[2 if ratio == 4 else 3].attention
             compressor_cfg = attention.indexer.compressor if indexer else attention.compressor
             compressor_cfg.wkv.in_features = 1024

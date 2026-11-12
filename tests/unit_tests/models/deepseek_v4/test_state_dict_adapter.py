@@ -5,7 +5,7 @@ import pytest
 import torch
 
 from tests.unit_tests.models.deepseek_v4.lora_test_utils import _build_model_config
-from tests.unit_tests.models.mtp_test_utils import build_v4_model_config
+from tests.unit_tests.models.deepseek_v4.test_deepseek_v4_mtp_model import _build_model_config as _compressed_config
 from torchtitan_npu.models.deepseek_v4.state_dict_adapter import DeepSeekV4StateDictAdapter
 
 
@@ -14,18 +14,18 @@ def test_sink_preserves_bare_parameter_shape_and_values(prefix):
     config = _build_model_config(num_mtp_layers=1)
     adapter = DeepSeekV4StateDictAdapter(config, None)
     hf_key = f"{prefix}.attn.attn_sink"
-    local_key = f"{prefix.replace('mtp.', 'mtp_layers.')}.attention.attn_sink"
+    local_key = f"{prefix.replace('mtp.', 'mtp_layers.')}.attention.attn_sink.weight"
     sink = torch.arange(4, dtype=torch.float32)
     restored = adapter.from_hf({hf_key: sink})
     assert restored.keys() == {local_key}
-    torch.testing.assert_close(restored[local_key], sink, rtol=0, atol=0)
-    exported = adapter.to_hf({local_key: sink})
+    torch.testing.assert_close(restored[local_key], sink.unsqueeze(-1), rtol=0, atol=0)
+    exported = adapter.to_hf({local_key: sink.unsqueeze(-1)})
     assert exported.keys() == {hf_key}
     torch.testing.assert_close(exported[hf_key], sink, rtol=0, atol=0)
 
 
 def test_full_model_checkpoint_roundtrip_preserves_fused_experts_and_compressors():
-    config = build_v4_model_config(compress_ratios=(1, 4, 128), rope_head_dim=8, original_seq_len=65536)
+    config = _compressed_config(compress_ratios=(1, 4, 128), rope_head_dim=8, original_seq_len=65536)
     with torch.device("meta"):
         model = config.build()
     state = {
@@ -40,14 +40,14 @@ def test_full_model_checkpoint_roundtrip_preserves_fused_experts_and_compressors
             for index, projection in enumerate(("w1", "w3")):
                 torch.testing.assert_close(
                     exported[f"{prefix}.ffn.experts.{expert}.{projection}.weight"],
-                    state[f"{local_prefix}.moe.routed_experts.w13.weight"][expert, index],
+                    state[f"{local_prefix}.feed_forward.routed_experts.w13.weight"][expert, index],
                     rtol=0,
                     atol=0,
                 )
-    for layer in (1, 2):
+    for layer, local_name in ((1, "compressor"), (2, "compressor_128")):
         torch.testing.assert_close(
             exported[f"layers.{layer}.attn.compressor.wkv.weight"],
-            state[f"layers.{layer}.attention.compressor.wkv.weight"],
+            state[f"layers.{layer}.attention.{local_name}.wkv.weight"],
             rtol=0,
             atol=0,
         )

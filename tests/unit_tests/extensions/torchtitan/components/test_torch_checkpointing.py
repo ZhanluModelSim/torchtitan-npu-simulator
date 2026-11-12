@@ -62,12 +62,11 @@ def test_native_config_restores_full_state_after_async_and_final_save(tmp_path, 
             initial_load_in_hf_quantized=load_only,
         ).build(
             storage_config=LocalFileSystemStorageConfig(use_direct_io=False),
-            dataloader=dataloader,
             model_parts=[model],
             optimizers=optimizers,
             lr_schedulers=scheduler,
             ema=None,
-            states={"progress": progress},
+            extra_states={"progress": progress},
             sd_adapter=None,
         )
         return manager, model, optimizers, scheduler, progress, dataloader
@@ -118,12 +117,11 @@ def test_native_final_save_exports_hf_weights_and_preserves_integer_buffers(tmp_
         export_dtype="float16",
     ).build(
         storage_config=LocalFileSystemStorageConfig(use_direct_io=False),
-        dataloader=None,
         model_parts=[model],
         optimizers=optimizers,
         lr_schedulers=scheduler,
         ema=None,
-        states={},
+        extra_states={},
         sd_adapter=HFExportAdapter(),
     )
 

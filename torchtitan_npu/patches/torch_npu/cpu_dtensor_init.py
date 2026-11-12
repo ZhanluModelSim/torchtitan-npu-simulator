@@ -29,7 +29,7 @@ from typing import cast
 import torch
 import torch_npu
 from torch.distributed.tensor import DTensor
-from torchtitan.protocols.module import Module
+from torchtitan.models.base.module import Module
 
 _ORIGINAL_INIT_PARAM = Module._init_param
 _PATCHED = "_torchtitan_npu_cpu_dtensor_init"

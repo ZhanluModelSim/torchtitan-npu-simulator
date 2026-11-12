@@ -4,69 +4,12 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-# Single-card DeepSeek-V4.1 with the fused ds41 LightningIndexer.
-#
-# The flavor behind this wrapper (`deepseek_v4_1_stripped`) is the flash model with six
-# layers instead of forty; ``dim``, the attention heads and both released geometries are
-# untouched, because the MLA attention and the ds41 indexer are both fixed by their kernels.
-# See ``_stripped`` in ``torchtitan_npu/models/deepseek_v4_1/__init__.py``.
-#
-# Six layers is the smallest count that still reaches all three branches of the fused
-# selector: layer 2 is Full Mode at ratio 2 with the pool off, layer 3 is the Full Mode pool
-# source at ratio 1, and layer 4 is the Reindex Mode searcher that reads what layer 3 built.
-# The candidate pool is a ratio-1 mechanism in the released model too -- its source sits at
-# the first ratio-1 layer -- so this shape does not invent a combination the model lacks.
-#
-# Run from the repository root:
-#   NGPU=1 bash examples/deepseek_v4_1/debug/deepseek_v4_1_mini_1p_cpt_a5.sh --training.steps 5
-#
-# Append CLI arguments to override the defaults below. `QUANTIZATION_ARGS` enables
-# the all_block_fp8 training recipe.
-
 set -euo pipefail
 
-export NGPU="${NGPU:-1}"
-export MODULE="${MODULE:-torchtitan_npu.models.deepseek_v4_1}"
-export CONFIG="${CONFIG:-deepseek_v4_1_stripped}"
-export PYTHONUNBUFFERED=1
-export TORCHTITAN_ENGRAM_TABLE_ROWS="${TORCHTITAN_ENGRAM_TABLE_ROWS:-100000}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
-# The fused operators this flavor exists to exercise.  `sparse_attn.asc` is not optional
-# alongside `lightning_indexer.asc`: the indexer is trained purely through the teacher that
-# SMLA's backward emits, and the model refuses a half-fused stack rather than training an
-# indexer that never receives a gradient.
-#
-LIGHTNING_INDEXER_OVERRIDE="torchtitan_npu.override.deepseek_v4_1.lightning_indexer.asc"
-
-# Enable block FP8 quantized training.
-QUANTIZATION_ARGS=(
-    --extension.quantization.enable-quantized-training
-    --extension.quantization.recipe all_block_fp8
-)
-
-CLI_OVERRIDES="${CLI_OVERRIDES:-torchtitan_npu.override.common.rms_norm.asc \
-                               torchtitan_npu.override.common.rope.asc_complex \
-                               torchtitan_npu.override.deepseek_v4_1.mhc.asc_hc_post \
-                               ${LIGHTNING_INDEXER_OVERRIDE} \
-                               torchtitan_npu.override.deepseek_v4_1.sparse_attn.asc}"
-
-SEQ_LEN=2048
-NUM_TOKENS_PER_MICROBATCH_PER_DP_RANK=2048
-NUM_TOKENS_PER_TRAIN_STEP=2048
-
-exec bash scripts/run_train.sh \
-    --hf-assets-path "${HF_ASSETS_PATH:-tests/assets/deepseek_v3}" \
-    --training.num-tokens-per-microbatch-per-dp-rank "${NUM_TOKENS_PER_MICROBATCH_PER_DP_RANK}" \
-    --training.num-tokens-per-train-step "${NUM_TOKENS_PER_TRAIN_STEP}" \
-    --training.max-context-length "${SEQ_LEN}" \
-    --training.steps "${STEPS:-5}" \
-    --parallelism.data-parallel-shard-degree 1 \
-    --parallelism.data-parallel-replicate-degree 1 \
-    --parallelism.expert-parallel-degree 1 \
-    --parallelism.tensor-parallel-degree 1 \
-    --parallelism.pipeline-parallel-degree 1 \
-    --parallelism.context-parallel-degree 1 \
-    --metrics.log-freq 1 \
-    --override.imports ${CLI_OVERRIDES} \
-    "${QUANTIZATION_ARGS[@]}" \
-    "$@"
+MODULE="${MODULE:-torchtitan_npu_recipes.examples.deepseek_v4_1}" \
+CONFIG="${CONFIG:-deepseek_v4_1_mini_1p_cpt_a5}" \
+NGPU="${NGPU:-1}" \
+NNODES="${NNODES:-1}" \
+exec bash "${SCRIPT_DIR}/../../../scripts/run_train.sh" "$@"

@@ -15,9 +15,9 @@ import torch
 import torch.nn.functional as F
 from torch.distributed.device_mesh import DeviceMesh
 from torchtitan.config import derive, override
-from torchtitan.models import qwen3_5
-from torchtitan.models.common.attention import VarlenMetadata
-from torchtitan.models.qwen3_5.gdn import GatedDeltaKernel
+from torchtitan.models.common.attention import LinearAttentionMetadata
+from torchtitan.models.common.attention import gdn as upstream_gdn
+from torchtitan.models.common.attention.gdn import GDN, GDNKernel
 
 from torchtitan_npu.ops.triton.gdn import gated_delta_rule as run_gdn
 from torchtitan_npu.override.qwen3_5.parallelize import (
@@ -25,9 +25,9 @@ from torchtitan_npu.override.qwen3_5.parallelize import (
 )
 
 
-class TritonGatedDeltaKernel(GatedDeltaKernel):
+class TritonGatedDeltaKernel(GDNKernel):
     @dataclass(kw_only=True, slots=True)
-    class Config(GatedDeltaKernel.Config):
+    class Config(GDNKernel.Config):
         pass
 
     def forward(
@@ -59,8 +59,8 @@ class TritonGatedDeltaKernel(GatedDeltaKernel):
         ).squeeze(0)
 
 
-@override(target=GatedDeltaKernel.Config, exact=True, description="Use the Triton-Ascend GDN kernel")
-def triton(cfg: GatedDeltaKernel.Config) -> TritonGatedDeltaKernel.Config:
+@override(target=GDNKernel.Config, exact=True, description="Use the Triton-Ascend GDN kernel")
+def triton(cfg: GDNKernel.Config) -> TritonGatedDeltaKernel.Config:
     return derive(cfg, TritonGatedDeltaKernel.Config)
 
 
@@ -183,7 +183,7 @@ def _causal_conv1d_varlen_folded(
     weight_C1W: torch.Tensor,
     cu_seqlens: torch.Tensor,
 ) -> torch.Tensor:
-    """The folded ``[T, C]`` signature the 0.4.0 ``InnerGatedDeltaNet`` closure calls.
+    """The folded ``[T, C]`` signature the 0.4.0 ``InnerGDN`` implementation calls.
 
     Device-side offsets keep the convolution traceable inside checkpoint HOP; the
     eager strict-validation branch of :func:`_causal_conv1d_varlen` cannot run
@@ -192,19 +192,19 @@ def _causal_conv1d_varlen_folded(
     return _causal_conv1d_varlen_tensor(x_TD.unsqueeze(0), weight_C1W, cu_seqlens).squeeze(0)
 
 
-@override(target=GatedDeltaKernel.Config, exact=True, description="Use the NPU GDN kernel without FLA")
-def npu(cfg: GatedDeltaKernel.Config) -> TritonGatedDeltaKernel.Config:
-    # The upstream 0.4.0 ``InnerGatedDeltaNet`` closure resolves its packed
+@override(target=GDNKernel.Config, exact=True, description="Use the NPU GDN kernel without FLA")
+def npu(cfg: GDNKernel.Config) -> TritonGatedDeltaKernel.Config:
+    # The upstream 0.4.0 ``InnerGDN`` implementation resolves its packed
     # convolution through the ``gdn`` module global at call time, so swapping
     # that global is the seam the folded upstream actually calls.  FLA's
     # ``causal_conv1d`` is CUDA-only, which is why the reference cannot run
     # as-is on NPU.  FLA availability is not used as a backend selector
     # because its convolution is not an NPU implementation.
-    qwen3_5.gdn._causal_conv1d_varlen = _causal_conv1d_varlen_folded  # pyrefly: ignore [bad-assignment]
+    upstream_gdn._causal_conv1d_varlen = _causal_conv1d_varlen_folded  # pyrefly: ignore [bad-assignment]
     return derive(cfg, TritonGatedDeltaKernel.Config)
 
 
-class ContextParallelGatedDeltaNet(qwen3_5.GatedDeltaNet):
+class ContextParallelGatedDeltaNet(GDN):
     """Refuse the not-yet-migrated context-parallel GDN forward.
 
     The class preserves the configured CP implementation while its forward
@@ -216,13 +216,13 @@ class ContextParallelGatedDeltaNet(qwen3_5.GatedDeltaNet):
     context_parallel_mesh: DeviceMesh
 
     @dataclass(kw_only=True, slots=True)
-    class Config(qwen3_5.GatedDeltaNet.Config):
+    class Config(GDN.Config):
         pass
 
-    def forward(self, x_TD: torch.Tensor, attention_masks: VarlenMetadata | None = None) -> torch.Tensor:
+    def forward(self, x_TD: torch.Tensor, attention_metadata: LinearAttentionMetadata | None = None) -> torch.Tensor:
         raise NotImplementedError(QWEN_CONTEXT_PARALLEL_UNSUPPORTED)
 
 
-@override(target=qwen3_5.GatedDeltaNet.Config, exact=True, description="Use Triton GDN with Context Parallel")
-def context_parallel(cfg: qwen3_5.GatedDeltaNet.Config) -> ContextParallelGatedDeltaNet.Config:
+@override(target=GDN.Config, exact=True, description="Use Triton GDN with Context Parallel")
+def context_parallel(cfg: GDN.Config) -> ContextParallelGatedDeltaNet.Config:
     return derive(cfg, ContextParallelGatedDeltaNet.Config)
