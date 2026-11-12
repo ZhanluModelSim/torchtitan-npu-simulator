@@ -83,3 +83,47 @@ def assert_packed_mtp_training(model) -> None:
     loss.backward()
     if not any(parameter.grad is not None for parameter in model.mtp_layers.parameters()):
         raise AssertionError("Expected at least one MTP parameter to receive a gradient.")
+
+
+def build_v4_model_config(
+    *,
+    compress_ratios=(1, 1, 1),
+    rope_head_dim=4,
+    original_seq_len=SEQ_LEN,
+    num_mtp_layers=1,
+    n_hash_layers=0,
+):
+    from torchtitan_npu.models.deepseek_v4 import _make_v4_config
+
+    return _make_v4_config(
+        dim=32,
+        n_layers=3,
+        vocab_size=VOCAB_SIZE,
+        n_heads=4,
+        head_dim=8,
+        rope_head_dim=rope_head_dim,
+        q_lora_rank=16,
+        o_lora_rank=8,
+        n_groups=2,
+        compress_ratios=compress_ratios,
+        window_size=SEQ_LEN,
+        norm_eps=1e-6,
+        index_n_heads=2,
+        index_head_dim=8,
+        index_topk=2,
+        moe_inter_dim=16,
+        num_experts=2,
+        num_shared_experts=1,
+        top_k=1,
+        n_hash_layers=n_hash_layers,
+        route_norm=False,
+        route_scale=1.0,
+        load_balance_coeff=1e-3,
+        hc_mult=2,
+        sinkhorn_iters=2,
+        hc_eps=1e-6,
+        max_seq_len=SEQ_LEN,
+        compress_rope_theta=10000.0,
+        original_seq_len=original_seq_len,
+        num_mtp_layers=num_mtp_layers,
+    )

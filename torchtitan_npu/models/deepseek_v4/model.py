@@ -3,25 +3,44 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from dataclasses import dataclass
+from collections.abc import Hashable
+from contextlib import nullcontext
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, cast
 
 import torch
 from torch import nn
-from torchtitan.config import TORCH_DTYPE_MAP, TrainingConfig
+from torchtitan.config import TORCH_DTYPE_MAP, TrainingConfig, derive
 from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.distributed.parallelism_context import ParallelismContext
 from torchtitan.models.common.decoder import Decoder, TransformerBlock
+from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.moe import MoE
+from torchtitan.models.deepseek_v3.mtp import roll_mtp_sequence
 from torchtitan.models.utils import get_nparams_and_active_nparams
+from torchtitan.protocols.module import ModuleList
+
+from torchtitan_npu.models.common.linear import SharedLinear
+from torchtitan_npu.patches.torchtitan.models.common.attention_metadata import (
+    AttentionMetadataMap,
+)
 
 from .metadata import DeepSeekV4Metadata
-from .mhc import HcPost, HcPre
-from .mtp import DeepSeekV4MTPDecoder, MTPBatch, prepare_mtp_batch
+from .mhc import HcHead, HcPost, HcPre
+from .mtp import MTPBatch, MTPModelOutput, _annotate_mtp_batch, _mtp_head_context, prepare_mtp_batch
 
 if TYPE_CHECKING:
+    from torchtitan.models.deepseek_v4.mtp import MTPBlock
+
+    from .attention import Attention
     from .compressor import Indexer
-    from .mtp import DeepSeekV4MTPTransformerBlock
+
+
+def _require_attention_metadata(metadata: AttentionMetadataMap, key: Hashable) -> Any:
+    entry = metadata.get(key)
+    if entry is None:
+        raise ValueError(f"no attention metadata was built for {key!r}")
+    return entry
 
 
 class DeepSeekV4TransformerBlock(TransformerBlock):
@@ -76,7 +95,7 @@ class DeepSeekV4TransformerBlock(TransformerBlock):
         return x
 
 
-class DeepSeekV4Model(DeepSeekV4MTPDecoder):
+class DeepSeekV4Model(Decoder):
     @classmethod
     def _register_optimizer_hooks(cls, optimizers, model_parts, parallelism_context):
         from torchtitan.models.common.moe import register_moe_load_balancing_hook
@@ -106,7 +125,7 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
         apply_fsdp_to_mtp_decoder(
             # The helper requires the decoder/layers/MTP structure, shared by
             # this implementation and the upstream DeepSeek V4 model.
-            self,
+            self,  # pyrefly: ignore [bad-argument-type]
             dp_mesh,
             param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
             reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
@@ -121,13 +140,26 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
         )
 
     @dataclass(kw_only=True, slots=True)
-    class Config(DeepSeekV4MTPDecoder.Config):
+    class Config(Decoder.Config):
         vocab_size: int
         compress_ratios: tuple[int, ...]
         n_layers: int
+        hc_mult: int = 4
+        hc_head: HcHead.Config
+        mtp_layers: list["MTPBlock.Config"] = field(default_factory=list)
+        mtp_isolate_gradients: bool = False
 
         def update_from_config(self, *, config, **kwargs):
-            DeepSeekV4MTPDecoder.Config.update_from_config(self, config=config, **kwargs)
+            self.mtp_isolate_gradients = getattr(getattr(config, "loss", None), "mtp_isolate_gradients", False)
+            # Apply runtime MoE/debug settings to auxiliary depths as well as main layers.
+            num_main_layers = len(self.layers)
+            self.layers.extend(self.mtp_layers or ())
+            try:
+                Decoder.Config.update_from_config(self, config=config, **kwargs)
+            finally:
+                del self.layers[num_main_layers:]
+            if self.mtp_layers and config.parallelism.pipeline_parallel_degree > 1:
+                raise NotImplementedError("DeepSeek V4 MTP does not support pipeline parallelism yet.")
             parallelism = config.parallelism
             if parallelism.context_parallel_degree > 1:
                 from torchtitan_npu.models.common.alignment import require_dataloader_alignment
@@ -185,7 +217,7 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
                         num_flops_per_token += 6 * attention.n_heads * (2 * attention.head_dim) * compressed_seq_len
 
             model_mtp_layers = deepseek_v4_model.mtp_layers
-            if model_mtp_layers is not None:
+            if model_mtp_layers:
                 lm_head = cast("nn.Module", deepseek_v4_model.lm_head)
                 num_flops_per_token += 6 * len(model_mtp_layers) * sum(param.numel() for param in lm_head.parameters())
                 num_flops_per_token += (
@@ -194,14 +226,120 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
                     * sum(
                         param.numel()
                         for mtp_layer in model_mtp_layers
-                        for param in cast("DeepSeekV4MTPTransformerBlock", mtp_layer).h_proj.parameters()
+                        for param in cast("MTPBlock", mtp_layer).h_proj.parameters()
                     )
                 )
 
             return nparams, num_flops_per_token
 
     def __init__(self, config: Config):
+        if config.mtp_isolate_gradients:
+            if not config.mtp_layers or type(config.lm_head) is not Linear.Config:
+                raise ValueError("MTP gradient isolation requires MTP layers and an unmodified Linear LM head.")
+            config = derive(config, type(config), lm_head=derive(config.lm_head, SharedLinear.Config))
         super().__init__(config)
+        self.hc_mult = config.hc_mult
+        self.hc_head = config.hc_head.build()
+        self.mtp_layers = ModuleList(layer.build() for layer in config.mtp_layers)
+        self.mtp_isolate_gradients = config.mtp_isolate_gradients
+
+    def forward(  # pyrefly: ignore [bad-override]
+        self,
+        tokens: torch.Tensor,
+        positions: torch.Tensor | None = None,
+        *,
+        attention_metadata: AttentionMetadataMap,
+        mtp_batch: MTPBatch | None = None,
+        padding_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor | list[torch.Tensor]:
+        if len(self.mtp_layers) > 0 and self.tok_embeddings is None:
+            raise ValueError("DeepSeek V4 MTP forward requires token embeddings.")
+        input_ids_T = tokens.detach().long()
+        hidden = self.tok_embeddings(tokens) if self.tok_embeddings is not None else tokens
+        hidden = hidden.unsqueeze(1).repeat(1, self.hc_mult, 1)
+        for layer in self.layers.values():
+            hidden = layer(
+                hidden,
+                input_ids_T,
+                _require_attention_metadata(
+                    attention_metadata, cast("Attention", layer.attention).attention_metadata_key
+                ),
+                positions,
+                padding_mask=padding_mask,
+            )
+        prev_hc_hidden = hidden
+        main_hidden = self.hc_head(hidden)
+        main_hidden = self.norm(main_hidden) if self.norm is not None else main_hidden
+
+        if len(self.mtp_layers) == 0:
+            if self._skip_lm_head or self.lm_head is None:
+                return main_hidden
+            return self.lm_head(main_hidden)
+
+        outputs = [
+            main_hidden,
+            *self.mtp_forward(
+                prev_hc_hidden,
+                tokens,
+                positions,
+                attention_metadata=attention_metadata,
+                mtp_batch=mtp_batch,
+                padding_mask=padding_mask,
+            ),
+        ]
+        if not self._skip_lm_head and self.lm_head is not None:
+            outputs[0] = self.lm_head(outputs[0])
+            with _mtp_head_context(self.lm_head, isolate_gradients=self.mtp_isolate_gradients):
+                outputs[1:] = [self.lm_head(item) for item in outputs[1:]]
+        return MTPModelOutput(outputs, mtp_labels=mtp_batch.labels if mtp_batch is not None else None)
+
+    def mtp_forward(
+        self,
+        prev_hc_hidden: torch.Tensor,
+        tokens: torch.Tensor,
+        positions: torch.Tensor | None = None,
+        *,
+        attention_metadata: AttentionMetadataMap,
+        mtp_batch: MTPBatch | None = None,
+        padding_mask: torch.Tensor | None = None,
+    ) -> list[torch.Tensor]:
+        """Run auxiliary MTP depths, using globally prepared inputs under CP."""
+        if mtp_batch is not None:
+            if mtp_batch.input_tokens.shape[-1] != len(self.mtp_layers):
+                raise ValueError("Prepared MTP input depth does not match model layers.")
+            _annotate_mtp_batch(mtp_batch)
+        mtp_outputs = []
+        prev_hc_hidden = prev_hc_hidden.detach() if self.mtp_isolate_gradients else prev_hc_hidden
+        for depth, mtp_block in enumerate(self.mtp_layers, 1):
+            if mtp_batch is None:
+                mtp_tokens, valid_mask = roll_mtp_sequence(
+                    tokens,
+                    shift=depth,
+                    fill_value=0,
+                    positions=positions,
+                    padding_mask=padding_mask,
+                    return_valid_mask=True,
+                )
+            else:
+                mtp_tokens = mtp_batch.input_tokens[..., depth - 1]
+                valid_mask = mtp_batch.input_valid_mask[..., depth - 1]
+            with torch.no_grad() if self.mtp_isolate_gradients else nullcontext():
+                mtp_embed = self.tok_embeddings(mtp_tokens)
+            # MTPBlock calls the upstream V4 TransformerBlock.forward. Changes to
+            # the NPU main-stack block above also need review for this path.
+            prev_hc_hidden, prediction_hidden = mtp_block(
+                mtp_embed,
+                prev_hc_hidden,
+                mtp_tokens.detach().long(),
+                valid_mask,
+                _require_attention_metadata(
+                    attention_metadata, cast("Attention", mtp_block.attention).attention_metadata_key
+                ),
+                positions,
+                padding_mask=padding_mask,
+            )
+            mtp_outputs.append(prediction_hidden)
+        return mtp_outputs
 
     def preprocess_inputs(
         self,
@@ -228,10 +366,9 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
         the shard builds its balancer from the row and permutes the replicated row
         before slicing, so no rank moves anything.  The depths ride the same shard,
         handed the same row's positions, so the two agree row for row by
-        construction.  Without context parallel or without MTP depths nothing changes.
+        construction.  With CP disabled, the prepared batch already matches the input row.
         """
         labels = input_dict["labels"]
-        cp_mesh = parallelism_context.get_mesh("cp") if parallelism_context.cp_enabled else None
         positions = input_dict.get("positions")
         padding_mask = input_dict.get("padding_mask")
         mtp_batch = None
@@ -239,16 +376,12 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
         # parallelism adds a second step that shards the prepared tensors, but
         # the non-CP path must retain the same padding/document-boundary
         # validity masks as well.
-        if self.mtp_layers is not None:
-            mtp_kwargs = {} if padding_mask is None else {"padding_mask": padding_mask}
-            mtp_batch = prepare_mtp_batch(input_dict["input"], labels, positions, len(self.mtp_layers), **mtp_kwargs)
+        if self.mtp_layers:
+            mtp_batch = prepare_mtp_batch(
+                input_dict["input"], labels, positions, len(self.mtp_layers), padding_mask=padding_mask
+            )
 
-        # ``MTPDecoder.preprocess_inputs`` returns the community tuple protocol
-        # (main tokens, shifted tokens, ...).  DSV4 owns a separate MTP block
-        # and its global-row/CP preparation, so call the Decoder seam directly
-        # and keep the model-facing input as one token tensor.
-        inputs, labels, extra_kwargs = Decoder.preprocess_inputs(
-            self,
+        inputs, labels, extra_kwargs = super().preprocess_inputs(
             input_dict,
             parallelism_context=parallelism_context,
             parallelism=parallelism,
@@ -260,18 +393,26 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
             # With CP disabled the global row is already the model row.  Under
             # CP, cut every MTP tensor with the exact decoder input layout so
             # shifted tokens stay aligned with the main stream.
-            if cp_mesh is None:
+            if not parallelism_context.cp_enabled:
                 extra_kwargs["mtp_batch"] = mtp_batch
                 return inputs, labels, extra_kwargs
-            # The layout the batch was sharded by, resolved exactly as the decoder resolves it:
-            # an unset flag means "the layout this stack declares", and reading the raw config
-            # value here would cut the depths contiguously while the inputs are permuted.
             from torchtitan.models.common.decoder_sharding import decoder_input_sharding
+
+            from torchtitan_npu.patches.torchtitan.distributed.context_parallel import resolve_cp_load_balancer
+            from torchtitan_npu.patches.torchtitan.models.common.attention_metadata import cp_layout_of
 
             mtp_inputs = {f"mtp_{index}": tensor for index, tensor in enumerate(mtp_batch)}
             if positions is not None:
                 mtp_inputs["positions"] = positions
             sharding = decoder_input_sharding()["input"]
+            # The main metadata selects doc_chunk implicitly. Reuse its layout
+            # without sending rank-local attention metadata through CP again.
+            balancer_config = resolve_cp_load_balancer(
+                parallelism.context_parallel_load_balancer,
+                cp_layout_of(extra_kwargs.get("attention_metadata")),
+            )
+            if balancer_config is not parallelism.context_parallel_load_balancer:
+                parallelism = replace(parallelism, context_parallel_load_balancer=balancer_config)
             sharded = self._cp_shard(
                 mtp_inputs,
                 input_shardings=dict.fromkeys(mtp_inputs, sharding),

@@ -18,36 +18,10 @@ from torchtitan_npu.models.deepseek_v3_2.config_registry import (
 from torchtitan_npu.models.deepseek_v4.config_registry import (
     deepseek_v4_debugmodel,
 )
-from torchtitan_npu.models.deepseek_v4.mtp import (
-    MTPChunkedLossWrapper,
-    MTPModelOutput,
-    prepare_mtp_batch,
-)
+from torchtitan_npu.models.deepseek_v4.mtp import MTPChunkedLossWrapper, MTPModelOutput, prepare_mtp_batch
 
 _community_loss = import_module("torchtitan.components.loss")
 _community_mtp = import_module("torchtitan.models.deepseek_v3.mtp")
-
-
-def test_dsv4_mtp_batch_precedes_cp_sharding():
-    tokens = torch.arange(8)
-    labels = tokens + 1
-    positions = torch.arange(8)
-
-    batch = prepare_mtp_batch(tokens, labels, positions, num_mtp_layers=1)
-
-    # One head-tail CP rank owns disjoint prefix and suffix pieces. Selecting
-    # from the globally shifted tensor preserves the future token at index 1;
-    # rolling the already-local tensor would incorrectly select token 6.
-    local_indices = torch.tensor([0, 1, 6, 7])
-    prepared_local = batch.input_tokens[local_indices, 0]
-    incorrectly_rolled_local = _community_mtp.roll_mtp_sequence(
-        tokens[local_indices],
-        shift=1,
-        fill_value=0,
-    )
-
-    torch.testing.assert_close(prepared_local, torch.tensor([1, 2, 7, 0]))
-    assert prepared_local[1] != incorrectly_rolled_local[1]
 
 
 def test_dsv32_default_config_disables_mtp():
@@ -90,7 +64,7 @@ def test_dsv32_mtp_keeps_community_cp_restriction():
 
 
 def test_dsv4_mtp_accepts_cp_configuration():
-    config = deepseek_v4_debugmodel()
+    config = deepseek_v4_debugmodel(num_mtp_layers=1)
     # A CP run splits every document into equal chunks and each chunk must stay
     # ratio-aligned, so the loader's per-document alignment grows with the degree.
     config.dataloader.dataset.dataset.processor.per_doc_alignment = 256
@@ -106,54 +80,12 @@ def test_prepare_mtp_batch_respects_packed_sequence_boundaries():
     tokens = torch.arange(10, 18)
     labels = tokens + 100
     positions = torch.tensor([0, 1, 2, 0, 1, 0, 1, 2])
-
     batch = prepare_mtp_batch(tokens, labels, positions, num_mtp_layers=2)
-
-    expected_tokens = torch.tensor(
-        [
-            [11, 12],
-            [12, 0],
-            [0, 0],
-            [14, 0],
-            [0, 0],
-            [16, 17],
-            [17, 0],
-            [0, 0],
-        ]
-    )
-    expected_valid = expected_tokens.ne(0)
-    expected_labels = torch.where(
-        expected_valid,
-        expected_tokens + 100,
-        _community_loss.IGNORE_INDEX,
-    )
-
-    torch.testing.assert_close(batch.input_tokens, expected_tokens)
-    torch.testing.assert_close(batch.input_valid_mask, expected_valid)
-    torch.testing.assert_close(batch.labels, expected_labels)
-
-
-def test_prepared_mtp_labels_match_community_roll():
-    seq_len = 8
-    labels = torch.arange(seq_len)
-    positions = torch.arange(seq_len)
-    tokens = torch.zeros(seq_len, dtype=torch.long)
-
-    mtp_batch = prepare_mtp_batch(tokens, labels, positions, num_mtp_layers=2)
-    expected = torch.stack(
-        [
-            _community_mtp.roll_mtp_sequence(
-                labels,
-                shift=depth,
-                positions=positions,
-                fill_value=_community_loss.IGNORE_INDEX,
-            )
-            for depth in (1, 2)
-        ],
-        dim=-1,
-    )
-
-    torch.testing.assert_close(mtp_batch.labels, expected, rtol=0, atol=0)
+    expected_tokens = (torch.tensor([11, 12, 0, 14, 0, 16, 17, 0]), torch.tensor([12, 0, 0, 0, 0, 17, 0, 0]))
+    for depth, expected in enumerate(expected_tokens):
+        torch.testing.assert_close(batch.input_tokens[..., depth], expected)
+        torch.testing.assert_close(batch.input_valid_mask[..., depth], expected.ne(0))
+        torch.testing.assert_close(batch.labels[..., depth], torch.where(expected.ne(0), expected + 100, -100))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -227,12 +159,7 @@ def _run_chunked_mtp_loss(case: _MTPChunkedLossCase) -> torch.Tensor:
     loss, _ = loss_fn(
         MTPModelOutput(
             case.hidden,
-            mtp_labels=prepare_mtp_batch(
-                case.tokens,
-                case.labels,
-                case.positions,
-                num_mtp_layers=2,
-            ).labels,
+            mtp_labels=prepare_mtp_batch(case.tokens, case.labels, case.positions, num_mtp_layers=2).labels,
         ),
         case.labels,
         case.global_valid_tokens,

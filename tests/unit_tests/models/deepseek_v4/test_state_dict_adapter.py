@@ -5,7 +5,7 @@ import pytest
 import torch
 
 from tests.unit_tests.models.deepseek_v4.lora_test_utils import _build_model_config
-from tests.unit_tests.models.test_deepseek_v4_mtp_model import _build_model_config as _compressed_config
+from tests.unit_tests.models.mtp_test_utils import build_v4_model_config
 from torchtitan_npu.models.deepseek_v4.state_dict_adapter import DeepSeekV4StateDictAdapter
 
 
@@ -25,7 +25,7 @@ def test_sink_preserves_bare_parameter_shape_and_values(prefix):
 
 
 def test_full_model_checkpoint_roundtrip_preserves_fused_experts_and_compressors():
-    config = _compressed_config(compress_ratios=(1, 4, 128), rope_head_dim=8, original_seq_len=65536)
+    config = build_v4_model_config(compress_ratios=(1, 4, 128), rope_head_dim=8, original_seq_len=65536)
     with torch.device("meta"):
         model = config.build()
     state = {

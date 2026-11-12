@@ -14,7 +14,21 @@ from torch.distributed.tensor.experimental._context_parallel._load_balancer impo
 from torchtitan.distributed.context_parallel import ContextParallelLoadBalancer
 from torchtitan.distributed.spmd_types import spmd_mesh_group
 
-from torchtitan_npu.models.common.restore import doc_chunk_permutation, document_starts
+from torchtitan_npu.models.common.restore import DOC_CHUNK_LAYOUT, doc_chunk_permutation, document_starts
+
+
+def resolve_cp_load_balancer(
+    config: ContextParallelLoadBalancer.Config | None,
+    metadata_layout: str | None,
+) -> ContextParallelLoadBalancer.Config | None:
+    """Resolve the typed CP balancer for the layout required by attention metadata."""
+    if metadata_layout != DOC_CHUNK_LAYOUT:
+        return config
+    if config is None:
+        return DocChunkCPLoadBalancer.Config()
+    if not isinstance(config, DocChunkCPLoadBalancer.Config):
+        raise ValueError("Document-chunk attention metadata requires DocChunkCPLoadBalancer.Config.")
+    return config
 
 
 class DocChunkLoadBalancer(_LoadBalancer):

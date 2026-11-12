@@ -3,16 +3,31 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Config module for the MTP x CP integration case.
+"""Debug recipes with the native typed V4 context-parallel backend."""
 
-The runner's default config module is the model package and its default ``CONFIG`` is
-``deepseek_v4_debugmodel``, whose ``num_mtp_layers`` is 0.  This module is selected by the
-case's ``env_vars`` so the case named after MTP actually builds the MTP layers.
-"""
+from torchtitan.config.transform import ContextParallelTransform
 
 from torchtitan_npu.models.deepseek_v4.config_registry import deepseek_v4_debugmodel
 
 
+def _debugmodel_cp(*, num_mtp_layers: int):
+    from torchtitan_npu.override.deepseek_v4.sparse_attn.ascendc import AscV4ContextParallelSparseAttention
+
+    config = deepseek_v4_debugmodel(num_mtp_layers=num_mtp_layers)
+    transform = ContextParallelTransform(inner_attention=AscV4ContextParallelSparseAttention)
+    config.model = transform.transform(config.model)
+    for _, attention, _, _ in config.model.traverse(AscV4ContextParallelSparseAttention.Config):
+        # Match the geometry of the fused debug recipe, including its MTP blocks.
+        attention.num_heads = 16
+        attention.index_num_heads = 8
+    return config
+
+
+def deepseek_v4_debugmodel_cp():
+    """Debug model for the CP2 + EP2 smoke case."""
+    return _debugmodel_cp(num_mtp_layers=0)
+
+
 def deepseek_v4_debugmodel_mtp():
-    """The debug model with one MTP depth, for the MTP x CP case."""
-    return deepseek_v4_debugmodel(num_mtp_layers=1)
+    """Debug model with one MTP depth for the CP2 smoke case."""
+    return _debugmodel_cp(num_mtp_layers=1)

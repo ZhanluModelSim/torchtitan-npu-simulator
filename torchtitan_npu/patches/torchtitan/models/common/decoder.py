@@ -136,16 +136,15 @@ def _cp_shard(
 ) -> dict[str, Any]:
     """Prepare rank-local backend metadata with the native typed CP shard."""
     from torchtitan_npu.models.common.restore import DOC_CHUNK_LAYOUT
-    from torchtitan_npu.patches.torchtitan.distributed.context_parallel import DocChunkCPLoadBalancer
+    from torchtitan_npu.patches.torchtitan.distributed.context_parallel import (
+        DocChunkCPLoadBalancer,
+        resolve_cp_load_balancer,
+    )
     from torchtitan_npu.patches.torchtitan.models.common.attention_metadata import cp_layout_of
 
     metadata = input_dict.get("attention_metadata")
     positions = input_dict.get("positions")
-    balancer_config = parallelism.context_parallel_load_balancer
-    if cp_layout_of(metadata) == DOC_CHUNK_LAYOUT:
-        if balancer_config is not None and not isinstance(balancer_config, DocChunkCPLoadBalancer.Config):
-            raise ValueError("Document-chunk attention metadata requires DocChunkCPLoadBalancer.Config.")
-        balancer_config = DocChunkCPLoadBalancer.Config()
+    balancer_config = resolve_cp_load_balancer(parallelism.context_parallel_load_balancer, cp_layout_of(metadata))
     layout = (
         DOC_CHUNK_LAYOUT
         if isinstance(balancer_config, DocChunkCPLoadBalancer.Config)

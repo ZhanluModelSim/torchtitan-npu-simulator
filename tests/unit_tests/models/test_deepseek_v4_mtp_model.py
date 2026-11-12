@@ -5,10 +5,15 @@
 # LICENSE file in the root directory of this source tree.
 
 from copy import deepcopy
+from inspect import signature
+from types import MethodType
 
 import pytest
 import torch
 from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
+from torchtitan.models.deepseek_v3.mtp import MTPLoss
+from torchtitan.models.deepseek_v4.mtp import MTPBlock
+from torchtitan.protocols.module import ModuleList
 
 from tests.unit_tests.models.mtp_test_utils import (
     PACKED_POSITIONS,
@@ -16,11 +21,15 @@ from tests.unit_tests.models.mtp_test_utils import (
     VOCAB_SIZE,
     assert_packed_mtp_training,
     build_cpu_model,
+    build_v4_model_config,
     preprocess,
 )
 from torchtitan_npu.models.common.linear import SharedLinear
-from torchtitan_npu.models.deepseek_v4 import _make_v4_config
-from torchtitan_npu.models.deepseek_v4.config_registry import deepseek_v4_debugmodel
+from torchtitan_npu.models.deepseek_v4.config_registry import (
+    deepseek_v4_debugmodel,
+    deepseek_v4_flash_43layers_16experts,
+)
+from torchtitan_npu.models.deepseek_v4.model import DeepSeekV4TransformerBlock
 from torchtitan_npu.models.deepseek_v4.mtp import MTPChunkedLossWrapper
 from torchtitan_npu.models.deepseek_v4.state_dict_adapter import (
     DeepSeekV4StateDictAdapter,
@@ -29,54 +38,41 @@ from torchtitan_npu.models.deepseek_v4.state_dict_adapter import (
 pytestmark = pytest.mark.usefixtures("single_rank_spmd")
 
 
-def _build_model_config(
-    *,
-    compress_ratios=(1, 1, 1),
-    rope_head_dim=4,
-    original_seq_len=SEQ_LEN,
-    num_mtp_layers=1,
-):
-    return _make_v4_config(
-        dim=32,
-        n_layers=3,
-        vocab_size=VOCAB_SIZE,
-        n_heads=4,
-        head_dim=8,
-        rope_head_dim=rope_head_dim,
-        q_lora_rank=16,
-        o_lora_rank=8,
-        n_groups=2,
-        compress_ratios=compress_ratios,
-        window_size=SEQ_LEN,
-        norm_eps=1e-6,
-        index_n_heads=2,
-        index_head_dim=8,
-        index_topk=2,
-        moe_inter_dim=16,
-        num_experts=2,
-        num_shared_experts=1,
-        top_k=1,
-        n_hash_layers=0,
-        route_norm=False,
-        route_scale=1.0,
-        load_balance_coeff=1e-3,
-        hc_mult=2,
-        sinkhorn_iters=2,
-        hc_eps=1e-6,
-        max_seq_len=SEQ_LEN,
-        compress_rope_theta=10000.0,
-        original_seq_len=original_seq_len,
-        num_mtp_layers=num_mtp_layers,
+@pytest.mark.parametrize(
+    "recipe", [deepseek_v4_debugmodel, deepseek_v4_flash_43layers_16experts], ids=["debug", "flash43"]
+)
+@pytest.mark.parametrize("num_mtp_layers", [0, 1, 2])
+def test_v4_recipe_builds_upstream_mtp_contract(recipe, num_mtp_layers):
+    trainer_config = recipe(num_mtp_layers=num_mtp_layers)
+    model_config = trainer_config.model
+    if num_mtp_layers:
+        assert len(model_config.mtp_layers) == num_mtp_layers
+        assert all(type(layer) is MTPBlock.Config for layer in model_config.mtp_layers)
+        assert isinstance(trainer_config.loss, MTPChunkedLossWrapper.Config)
+    else:
+        assert model_config.mtp_layers == []
+        assert type(trainer_config.loss) is ChunkedLossWrapper.Config
+    with torch.device("meta"):
+        model = model_config.build()
+    assert isinstance(model.mtp_layers, ModuleList)
+    assert len(model.mtp_layers) == num_mtp_layers
+    assert all(type(layer) is MTPBlock for layer in model.mtp_layers)
+    assert bool([name for name, _ in model.named_parameters() if name.startswith("mtp_layers.")]) == bool(
+        num_mtp_layers
     )
 
 
+def test_upstream_mtp_block_accepts_sequence_parallel_valid_mask():
+    assert "mtp_input_valid_mask" in signature(MTPBlock.forward).parameters
+
+
 def test_deepseek_v4_mtp_model_supports_packed_sequences():
-    assert_packed_mtp_training(build_cpu_model(_build_model_config()))
+    assert_packed_mtp_training(build_cpu_model(build_v4_model_config()))
 
 
 def test_deepseek_v4_mtp_metadata_includes_uncompressed_plan():
     model = build_cpu_model(
-        _build_model_config(
+        build_v4_model_config(
             compress_ratios=(128, 128, 4),
             rope_head_dim=8,
             original_seq_len=65536,
@@ -98,7 +94,7 @@ def test_deepseek_v4_mtp_metadata_includes_uncompressed_plan():
 
 
 def test_deepseek_v4_mtp_model_supports_chunked_loss():
-    model = build_cpu_model(_build_model_config())
+    model = build_cpu_model(build_v4_model_config())
     tokens = torch.arange(SEQ_LEN) % VOCAB_SIZE
     positions = PACKED_POSITIONS.clone()
     labels = (tokens + 1) % VOCAB_SIZE
@@ -178,7 +174,7 @@ def test_deepseek_v4_mtp_isolation_rejects_incompatible_loss_head(missing_head):
 
 def test_deepseek_v4_mtp_isolation_rejects_replaced_model_head():
     with torch.random.fork_rng():
-        config = _build_model_config()
+        config = build_v4_model_config()
         config.mtp_isolate_gradients = True
         model = build_cpu_model(config)
         model.lm_head = torch.nn.Linear(32, VOCAB_SIZE, bias=False)
@@ -192,7 +188,7 @@ def test_deepseek_v4_mtp_isolation_rejects_replaced_model_head():
 @pytest.mark.parametrize("num_mtp_layers", [1, 2], ids=["depth1", "depth2"])
 def test_deepseek_v4_mtp_detaches_all_shared_parameters(num_mtp_layers):
     with torch.random.fork_rng():
-        config = _build_model_config(num_mtp_layers=num_mtp_layers)
+        config = build_v4_model_config(num_mtp_layers=num_mtp_layers)
         config.mtp_isolate_gradients = True
         model = build_cpu_model(config)
         tokens = torch.arange(SEQ_LEN) % VOCAB_SIZE
@@ -214,7 +210,7 @@ def test_deepseek_v4_mtp_detaches_all_shared_parameters(num_mtp_layers):
 @pytest.mark.parametrize("chunked", [False, True], ids=["logits", "chunked"])
 def test_deepseek_v4_mtp_isolation_preserves_main_gradients(chunked, single_threaded_cpu):
     with torch.random.fork_rng():
-        config = _build_model_config()
+        config = build_v4_model_config()
         reference = build_cpu_model(config)
         isolated_config = deepcopy(config)
         isolated_config.mtp_isolate_gradients = True
@@ -256,12 +252,12 @@ def test_deepseek_v4_mtp_isolation_preserves_main_gradients(chunked, single_thre
             assert (parameter.grad is None) == (expected_grad is None), name
             if expected_grad is not None:
                 torch.testing.assert_close(
-                    parameter.grad, expected_grad, rtol=0, atol=0, msg=lambda message: f"{name}: {message}"
+                    parameter.grad, expected_grad, rtol=0, atol=0, msg=lambda message, name=name: f"{name}: {message}"
                 )
 
 
 def test_deepseek_v4_mtp_state_dict_round_trip():
-    model_config = _build_model_config()
+    model_config = build_v4_model_config()
     model = build_cpu_model(model_config)
     local_state_dict = {
         key: value.detach().clone() for key, value in model.state_dict().items() if key.startswith("mtp_layers.0.")
@@ -313,113 +309,178 @@ def test_deepseek_v4_mtp_state_dict_round_trip():
     ),
 )
 def test_deepseek_v4_mtp_state_dict_rejects_invalid_depth(method_name, key):
-    model_config = _build_model_config()
+    model_config = build_v4_model_config()
     adapter = DeepSeekV4StateDictAdapter(model_config, hf_assets_path=None)
 
     with pytest.raises(ValueError, match="not present"):
         getattr(adapter, method_name)({key: torch.ones(1)})
 
 
-def test_preprocess_inputs_builds_the_mtp_batch_on_the_global_row(monkeypatch):
-    """The MTP depths' rolled tokens are built before the CP shard, then cut with it.
-
-    A shift across a shard boundary is not a shift, so the batch must be built
-    from the whole row and the same ``cp_shard`` cut applied afterwards.  The
-    shard here really slices rank 1's half of a two-rank run, so the test pins
-    the alignment, not only the call order.
-    """
+@pytest.mark.parametrize("rank", [0, 1])
+def test_preprocess_mtp_batch_uses_the_main_input_cp_layout(monkeypatch, rank, single_rank_spmd):
     from types import SimpleNamespace
 
-    from torchtitan_npu.models.deepseek_v4 import model as model_mod
+    from torchtitan.config.parallelism import ParallelismConfig
+    from torchtitan.distributed import context_parallel
 
-    model = build_cpu_model(_build_model_config())
-    tokens = torch.arange(SEQ_LEN) % VOCAB_SIZE
-    labels = (tokens + 1) % VOCAB_SIZE
+    from torchtitan_npu.models.deepseek_v4.metadata import DeepSeekV4Metadata, doc_chunk_entry
+    from torchtitan_npu.patches.torchtitan.distributed import context_parallel as cp_patch
+
+    with torch.random.fork_rng():
+        model = build_cpu_model(build_v4_model_config(num_mtp_layers=2))
+    tokens = torch.arange(SEQ_LEN)
+    labels = tokens + 1000
     positions = PACKED_POSITIONS.clone()
-
-    real_prepare = model_mod.prepare_mtp_batch
-    built = []
-
-    def record_prepare(inputs, prepared_labels, prepared_positions, num_layers):
-        batch = real_prepare(inputs, prepared_labels, prepared_positions, num_layers)
-        built.append((inputs, prepared_labels, prepared_positions, batch))
-        return batch
-
     shard_calls = []
-    rank, cp_size = 1, 2
-    shard_len = SEQ_LEN // cp_size
-
-    def fake_cp_shard(input_dict, *, input_shardings, parallelism_context, parallelism):
-        shard_calls.append((dict(input_dict), input_dict["positions"], input_shardings))
-        assert parallelism_context.get_mesh("cp") is mesh
-        return {key: tensor.narrow(0, rank * shard_len, shard_len) for key, tensor in input_dict.items()}
-
-    monkeypatch.setattr(model_mod, "prepare_mtp_batch", record_prepare)
-    monkeypatch.setattr(model, "_cp_shard", fake_cp_shard)
-
-    # Isolate the decoder's metadata build; both calls still exercise the model's named shard boundary.
-    from torchtitan.models.common.decoder import Decoder
-    from torchtitan.models.common.decoder_sharding import decoder_input_sharding
-
-    from torchtitan_npu.models.deepseek_v4.metadata import build_v4_metadata, doc_chunk_entry
-
-    base_calls = []
-    row_entry = build_v4_metadata(positions, 1)
-    local_entry = doc_chunk_entry(row_entry, cp_size=cp_size, cp_rank=rank, slab_len=shard_len)
-
-    def fake_base(self, input_dict, *, parallelism_context, parallelism, **kwargs):
-        del kwargs
-        base_calls.append((input_dict["input"].shape, input_dict["labels"].shape))
-        cut = self._cp_shard(
-            input_dict,
-            input_shardings=decoder_input_sharding(),
-            parallelism_context=parallelism_context,
-            parallelism=parallelism,
-        )
-        return (
-            cut["input"],
-            cut["labels"],
-            {"positions": cut["positions"], "attention_metadata": {("debug", 1): local_entry}},
-        )
-
-    monkeypatch.setattr(Decoder, "preprocess_inputs", fake_base)
-    mesh = SimpleNamespace(size=lambda *_: cp_size, get_local_rank=lambda: rank, device_type="cpu")
-    parallelism_context = SimpleNamespace(cp_enabled=True, get_mesh=lambda name: mesh)
-    parallelism = SimpleNamespace(context_parallel_load_balancer=None)
-    inputs, out_labels, extra_kwargs = model.preprocess_inputs(
-        {"input": tokens, "labels": labels, "positions": positions},
-        parallelism_context=parallelism_context,
-        parallelism=parallelism,
+    mesh = SimpleNamespace(size=lambda *_: 2, get_local_rank=lambda: rank, device_type="cpu")
+    indices = torch.cat(
+        [torch.arange(rank * 64, (rank + 1) * 64), torch.arange(128 + rank * 64, 128 + (rank + 1) * 64)]
     )
 
-    # The batch was built from the global row, once.
-    assert len(built) == 1
-    global_inputs, global_labels, global_positions, batch = built[0]
-    assert global_inputs.shape == tokens.shape
-    assert torch.equal(global_labels, labels)
-    assert torch.equal(global_positions, positions)
+    def device_shard(batch, *, input_shardings, permutation):
+        assert permutation is not None
+        permutation = permutation.flatten()
+        shard_calls.append((set(input_shardings) & batch.keys(), permutation))
+        return {
+            key: value.index_select(0, permutation).chunk(mesh.size(), dim=0)[rank] if key in input_shardings else value
+            for key, value in batch.items()
+        }
 
-    # Two cuts, both fed the full row: the base inputs, then the MTP batch.
-    assert base_calls == [(tokens.shape, labels.shape)]
-    assert len(shard_calls) == 2
-    for name, expected in (("input", tokens), ("labels", labels), ("positions", positions)):
-        assert torch.equal(shard_calls[0][0][name], expected)
-    for index, expected in enumerate(batch):
-        assert torch.equal(shard_calls[1][0][f"mtp_{index}"], expected)
-    # The row reaches both calls, so the layout cannot be derived from anything else.
-    for _, handed_positions, _ in shard_calls:
-        assert torch.equal(handed_positions, positions)
-    # Every MTP tensor uses the same token layout that the decoder's native shard consumes.
-    assert set(shard_calls[1][2]) == {"mtp_0", "mtp_1", "mtp_2", "positions"}
-    assert all(layout == decoder_input_sharding()["input"] for layout in shard_calls[1][2].values())
+    def cpu_metadata(entry, *, permutation):
+        del permutation
+        return doc_chunk_entry(entry, cp_size=2, cp_rank=rank, slab_len=SEQ_LEN // 2)
 
-    # What the forward reads is the shard's answer, not the global row.
-    slab = slice(rank * shard_len, (rank + 1) * shard_len)
-    assert torch.equal(inputs, tokens[slab]) and torch.equal(out_labels, labels[slab])
-    assert torch.equal(extra_kwargs["positions"], positions[slab])
-    # The mask is the global row's own (a shift across a shard boundary is not a shift): the
-    # local copy is exactly its slab, so the row's last token still has no successor.
-    local_batch = extra_kwargs["mtp_batch"]
-    assert torch.equal(local_batch.input_valid_mask, batch.input_valid_mask[slab])
-    assert not bool(local_batch.input_valid_mask[-1].all())
-    assert extra_kwargs["attention_metadata"][("debug", 1)] is local_entry
+    monkeypatch.setattr(DeepSeekV4Metadata, "prepare_cp_metadata", staticmethod(cpu_metadata))
+    monkeypatch.setattr(cp_patch, "spmd_mesh_group", lambda name: mesh)
+    monkeypatch.setattr(context_parallel, "shard_tensors", device_shard)
+    inputs, out_labels, extra = model.preprocess_inputs(
+        {"input": tokens, "labels": labels, "positions": positions},
+        parallelism_context=SimpleNamespace(
+            cp_enabled=True, get_mesh=lambda name: mesh, spmd_dense_mesh=single_rank_spmd.spmd_dense_mesh
+        ),
+        parallelism=ParallelismConfig(context_parallel_load_balancer=None),
+    )
+    assert [keys for keys, _ in shard_calls] == [
+        {"input", "labels", "positions"},
+        {"mtp_0", "mtp_1", "mtp_2", "positions"},
+    ]
+    torch.testing.assert_close(shard_calls[0][1], shard_calls[1][1])
+    batch = extra["mtp_batch"]
+    torch.testing.assert_close(inputs, tokens[indices])
+    torch.testing.assert_close(out_labels, labels[indices])
+    torch.testing.assert_close(extra["positions"], positions[indices])
+    for depth in (1, 2):
+        valid = indices.remainder(128) < 128 - depth
+        torch.testing.assert_close(batch.input_tokens[..., depth - 1], torch.where(valid, indices + depth, 0))
+        torch.testing.assert_close(batch.input_valid_mask[..., depth - 1], valid)
+        torch.testing.assert_close(batch.labels[..., depth - 1], torch.where(valid, indices + depth + 1000, -100))
+
+
+# Reference computation from dev_0.4.0 commit 029756d, before upstream-block reuse.
+# Keep the two original computation paths independent of the inherited forward methods.
+def _baseline_v4_block_forward(self, hidden, input_ids, metadata, positions=None, *, padding_mask=None):
+    residual = hidden
+    hidden, post, comb = self.hc_attn_pre(hidden)
+    hidden = self.attention(self.attention_norm(hidden), metadata, positions)
+    hidden = self.hc_post(hidden, residual, post, comb)
+    residual = hidden
+    hidden, post, comb = self.hc_ffn_pre(hidden)
+    hidden = self.moe(self.ffn_norm(hidden), input_ids_T=input_ids, padding_mask_T=padding_mask)
+    return self.hc_post(hidden, residual, post, comb)
+
+
+def _baseline_mtp_forward(
+    self, embedding, prev_hidden, input_ids, valid_mask, metadata, positions=None, *, padding_mask=None
+):
+    prev_hidden = prev_hidden * valid_mask.unsqueeze(-1).unsqueeze(-1).to(prev_hidden.dtype)
+    hidden = self.e_proj(self.enorm(embedding)).unsqueeze(1) + self.h_proj(self.hnorm(prev_hidden))
+    mtp_padding_mask = ~valid_mask if padding_mask is None else ~valid_mask | padding_mask
+    next_hidden = _baseline_v4_block_forward(
+        self, hidden, input_ids, metadata, positions, padding_mask=mtp_padding_mask
+    )
+    prediction = self.mtp_norm(self.hc_head(next_hidden))
+    return next_hidden, prediction
+
+
+@pytest.mark.parametrize(
+    ("chunked", "isolate", "prepared", "n_hash_layers", "num_mtp_layers"),
+    [
+        (False, False, True, 0, 2),
+        (True, False, False, 2, 2),
+        (True, True, False, 0, 2),
+        (True, False, True, 0, 2),
+        (False, False, False, 2, 0),
+    ],
+    ids=["logits-learned", "chunked-hash", "chunked-isolated", "chunked-prepared-labels", "mtp-disabled"],
+)
+def test_upstream_mtp_block_matches_baseline_outputs_loss_and_gradients(
+    chunked, isolate, prepared, n_hash_layers, num_mtp_layers, single_threaded_cpu
+):
+    with torch.random.fork_rng():
+        config = build_v4_model_config(num_mtp_layers=num_mtp_layers, n_hash_layers=n_hash_layers)
+        config.mtp_isolate_gradients = isolate
+        model = build_cpu_model(config)
+        reference = deepcopy(model)
+        assert all(isinstance(layer, DeepSeekV4TransformerBlock) for layer in model.layers.values())
+        assert all(type(layer) is MTPBlock for layer in model.mtp_layers or ())
+        for layer in reference.layers.values():
+            layer.forward = MethodType(_baseline_v4_block_forward, layer)
+        for layer in reference.mtp_layers or ():
+            layer.forward = MethodType(_baseline_mtp_forward, layer)
+        model._skip_lm_head = reference._skip_lm_head = chunked
+        tokens = torch.arange(SEQ_LEN) % VOCAB_SIZE
+        labels = (tokens + 1) % VOCAB_SIZE
+        inputs, labels, extra_kwargs = preprocess(model, tokens, labels, PACKED_POSITIONS.clone())
+        if not prepared:
+            extra_kwargs.pop("mtp_batch", None)
+
+        actual_outputs = model(inputs, **extra_kwargs)
+        expected_outputs = reference(inputs, **extra_kwargs)
+        actual_branches = [actual_outputs] if isinstance(actual_outputs, torch.Tensor) else actual_outputs
+        expected_branches = [expected_outputs] if isinstance(expected_outputs, torch.Tensor) else expected_outputs
+        for actual, expected in zip(actual_branches, expected_branches, strict=True):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        if chunked:
+            loss_config = MTPChunkedLossWrapper.Config(
+                num_chunks=2,
+                mtp_isolate_gradients=isolate,
+                loss_fn=CrossEntropyLoss.Config(global_vocab_size=VOCAB_SIZE),
+            )
+            actual_fn = loss_config.build()
+            expected_fn = deepcopy(loss_config).build()
+            actual_fn.set_lm_head(model.lm_head)
+            expected_fn.set_lm_head(reference.lm_head)
+        elif num_mtp_layers:
+            actual_fn = MTPLoss(MTPLoss.Config(global_vocab_size=VOCAB_SIZE))
+            expected_fn = MTPLoss(MTPLoss.Config(global_vocab_size=VOCAB_SIZE))
+        else:
+            actual_fn = CrossEntropyLoss(CrossEntropyLoss.Config(global_vocab_size=VOCAB_SIZE))
+            expected_fn = CrossEntropyLoss(CrossEntropyLoss.Config(global_vocab_size=VOCAB_SIZE))
+        denominator = torch.tensor(labels.numel())
+        if chunked:
+            actual_loss, _ = actual_fn(actual_outputs, labels, denominator, positions=PACKED_POSITIONS)
+            expected_loss, _ = expected_fn(expected_outputs, labels, denominator, positions=PACKED_POSITIONS)
+        elif num_mtp_layers:
+            aligned_labels = (labels, *extra_kwargs["mtp_batch"].labels.unbind(dim=-1))
+            actual_loss, _ = actual_fn(tuple(actual_outputs), aligned_labels, denominator)
+            expected_loss, _ = expected_fn(tuple(expected_outputs), aligned_labels, denominator)
+        else:
+            actual_loss, _ = actual_fn(actual_outputs, labels, denominator)
+            expected_loss, _ = expected_fn(expected_outputs, labels, denominator)
+        actual_loss.backward()
+        expected_loss.backward()
+
+        torch.testing.assert_close(actual_loss, expected_loss, rtol=0, atol=0)
+        expected_parameters = dict(reference.named_parameters())
+        assert dict(model.named_parameters()).keys() == expected_parameters.keys()
+        for name, parameter in model.named_parameters():
+            expected_grad = expected_parameters[name].grad
+            assert (parameter.grad is None) == (expected_grad is None), name
+            if expected_grad is not None:
+                torch.testing.assert_close(
+                    parameter.grad,
+                    expected_grad,
+                    rtol=0,
+                    atol=0,
+                    msg=lambda message, name=name: f"{name}: {message}",
+                )

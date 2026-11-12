@@ -22,6 +22,7 @@ from torchtitan.models.common.linear import RouterGateLinear
 from torchtitan.models.common.moe import MoE
 from torchtitan.models.common.param_init import depth_scaled_std
 from torchtitan.models.deepseek_v4.moe import DeepSeekV4Router
+from torchtitan.models.deepseek_v4.mtp import MTPBlock
 
 from torchtitan_npu.models.common.carry_exchange import CarryExchange
 from torchtitan_npu.patches.torchtitan.models.common.linear import BatchedLinear
@@ -33,16 +34,10 @@ from .model import (
     DeepSeekV4Model,
     DeepSeekV4TransformerBlock,
 )
-from .mtp import (
-    DeepSeekV4MTPDecoder,
-    DeepSeekV4MTPTransformerBlock,
-    MTPLoss,
-)
+from .mtp import MTPLoss
 from .state_dict_adapter import DeepSeekV4StateDictAdapter
 
 __all__ = [
-    "DeepSeekV4MTPDecoder",
-    "DeepSeekV4MTPTransformerBlock",
     "DeepSeekV4Model",
     "MTPLoss",
     "deepseek_v4_configs",
@@ -475,11 +470,8 @@ def _build_mtp_layers(
     n_main_layers: int,
     num_mtp_layers: int,
     rope: RoPE.Config,
-) -> list[DeepSeekV4MTPTransformerBlock.Config]:
+) -> list[MTPBlock.Config]:
     """Build independent, non-compressed DSV4 MTP depths."""
-    if num_mtp_layers < 0:
-        raise ValueError(f"num_mtp_layers must be non-negative, got {num_mtp_layers}.")
-
     mtp_layers = []
     for depth in range(num_mtp_layers):
         layer_id = n_main_layers + depth
@@ -509,21 +501,22 @@ def _build_mtp_layers(
 
         hc_attn_pre = copy.deepcopy(inner_cfg.hc_attn_pre)
         projection = _build_mtp_projection(dim)
+        # Upstream builds the NPU configs via Config.build().
         mtp_layers.append(
-            DeepSeekV4MTPTransformerBlock.Config(
-                attention=attention,
+            MTPBlock.Config(
+                attention=attention,  # pyrefly: ignore [bad-argument-type]
                 attention_norm=copy.deepcopy(inner_cfg.attention_norm),
                 ffn_norm=copy.deepcopy(inner_cfg.ffn_norm),
-                moe=moe,
+                moe=moe,  # pyrefly: ignore [bad-argument-type]
                 enorm=copy.deepcopy(inner_cfg.attention_norm),
                 hnorm=copy.deepcopy(inner_cfg.attention_norm),
                 e_proj=copy.deepcopy(projection),
                 h_proj=copy.deepcopy(projection),
                 mtp_norm=copy.deepcopy(inner_cfg.attention_norm),
-                hc_attn_pre=hc_attn_pre,
-                hc_ffn_pre=copy.deepcopy(inner_cfg.hc_ffn_pre),
-                hc_post=copy.deepcopy(inner_cfg.hc_post),
-                hc_head=HcHead.Config(
+                hc_attn_pre=hc_attn_pre,  # pyrefly: ignore [bad-argument-type]
+                hc_ffn_pre=copy.deepcopy(inner_cfg.hc_ffn_pre),  # pyrefly: ignore [bad-argument-type]
+                hc_post=copy.deepcopy(inner_cfg.hc_post),  # pyrefly: ignore [bad-argument-type]
+                hc_head=HcHead.Config(  # pyrefly: ignore [bad-argument-type]
                     hc_mult=hc_attn_pre.hc_mult,
                     dim=dim,
                     norm_eps=hc_attn_pre.norm_eps,
@@ -582,6 +575,9 @@ def _make_v4_config(
     num_mtp_layers: int = 0,
 ) -> DeepSeekV4Model.Config:
     """Build a DSV4 model config from the flavor constants."""
+
+    if num_mtp_layers < 0:
+        raise ValueError(f"num_mtp_layers must be non-negative, got {num_mtp_layers}.")
 
     rope = ComplexRoPE.Config(
         dim=rope_head_dim,

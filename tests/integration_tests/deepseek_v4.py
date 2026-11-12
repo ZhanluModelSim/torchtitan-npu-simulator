@@ -51,6 +51,7 @@ def _build_case(
     extra_override_imports: tuple[str, ...] = (),
     env_vars: dict[str, str] | None = None,
     disabled: bool = False,
+    use_cp_attention: bool = False,
 ) -> OverrideDefinitions:
     """Build one DeepSeek-V4 integration case.
 
@@ -60,6 +61,11 @@ def _build_case(
     checking.
     """
     recipe = GOLDEN_OVERRIDES if use_golden else NPU_OVERRIDES
+    if use_cp_attention:
+        # The CP recipe selects the fused CP backend before Trainer config validation.
+        recipe = tuple(
+            arg for arg in recipe if not arg.startswith("torchtitan_npu.override.deepseek_v4.sparse_attn.asc=")
+        )
     return OverrideDefinitions(
         override_args=[recipe + extra_override_imports + extra_args],
         train_args=V4_TRAIN_ARGS,
@@ -328,13 +334,16 @@ def build_deepseek_v4_test_list() -> list[OverrideDefinitions]:
             test_name="dsv4_smla_cp2_ep2_fsdp2",
             test_descr="DeepSeek-V4 SMLA Muon cp2 ep2 fsdp2",
             ngpu=4,
+            env_vars={
+                "MODULE": "tests.integration_tests.mtp_config",
+                "CONFIG": "deepseek_v4_debugmodel_cp",
+                "DSV4_PER_DOC_ALIGNMENT": "256",
+            },
+            use_cp_attention=True,
             extra_args=(
                 "--training.steps=1",
                 "--parallelism.expert-parallel-degree=2",
                 "--parallelism.context-parallel-degree=2",
-                "--parallelism.context-parallel-load-balancer=None",
-                "--parallelism.spmd-backend=spmd_types",
-                "--dataloader.per_doc_alignment=256",
                 "--hf-assets-path=tests/assets/deepseek_v3",
                 "--training.num-tokens-per-train-step=4096",
                 "--optim.optimizer.name=Muon",
@@ -349,18 +358,17 @@ def build_deepseek_v4_test_list() -> list[OverrideDefinitions]:
         ),
         _build_case(
             test_name="dsv4_mtp_smla_cp2",
-            test_descr="DeepSeek-V4 MTP SMLA Muon cp2",
+            test_descr="DeepSeek-V4 MTP SMLA AdamW cp2",
             ngpu=2,
             env_vars={
                 "MODULE": "tests.integration_tests.mtp_config",
                 "CONFIG": "deepseek_v4_debugmodel_mtp",
+                "DSV4_PER_DOC_ALIGNMENT": "256",
             },
+            use_cp_attention=True,
             extra_args=(
                 "--training.steps=1",
                 "--parallelism.context-parallel-degree=2",
-                "--parallelism.context-parallel-load-balancer=None",
-                "--parallelism.spmd-backend=spmd_types",
-                "--dataloader.per_doc_alignment=256",
                 "--hf-assets-path=tests/assets/deepseek_v3",
                 "--training.num-tokens-per-train-step=4096",
                 "--optim.optimizer.name=Muon",
