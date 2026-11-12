@@ -331,7 +331,20 @@ def test_config_manager_materializes_muon_from_cli(monkeypatch, tmp_path):
         return TrainerEx.Config(
             model=_debug_model(),
             hf_assets_path=str(tmp_path),
-            optim=OptimConfig(optimizer=OptimizerConfig(_muon_profile=profile)),
+            optim=OptimConfig(
+                optimizer=OptimizerConfig(
+                    _muon_profile=profile,
+                    _optimizer_defaults={
+                        "Muon": [
+                            profile.optimizer_config_type(
+                                pattern=profile.muon_pattern,
+                                **profile.optimizer_factory_kwargs["DistMuon"],
+                            ),
+                            AdamW.Config(pattern=r".*", foreach=False),
+                        ],
+                    },
+                )
+            ),
         )
 
     _install_config_registry(monkeypatch, module_name, test_config)

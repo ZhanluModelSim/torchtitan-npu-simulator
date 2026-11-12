@@ -76,26 +76,26 @@ def _build_case(
 def build_deepseek_v4_checkpoint_resume_test_list() -> list[OverrideDefinitions]:
     """Compare two resumed steps with uninterrupted FSDP2/EP2 training."""
     checkpoint_args = (
-        "--checkpoint.enable",
-        "--checkpoint.interval=2",
-        "--checkpoint.no-last-save-model-only",
-        "--checkpoint.keep-latest-k=0",
+        "--checkpointer.interval=2",
+        "--checkpointer.no-last-save-model-only",
+        "--checkpointer.keep-latest-k=0",
         "--hf-assets-path=tests/assets/deepseek_v3",
         "--training.num-tokens-per-train-step=4096",
         "--training.steps=4",
         "--parallelism.data-parallel-shard-degree=2",
         "--parallelism.expert-parallel-degree=2",
     )
-    adamw_swap_args = (*checkpoint_args, "--optimizer.name=AdamW")
+    adamw_swap_args = (*checkpoint_args, "--optim.optimizer.name=AdamW")
     adamw_swap_overrides = (
         *GOLDEN_OVERRIDES,
         "torchtitan_npu.override.common.optimizer.swap_optimizer",
     )
     checkpoint_case = OverrideDefinitions(
         train_args=V4_TRAIN_ARGS,
+        env_vars={"MODULE": "tests.integration_tests.optimizer_config", "CONFIG": "deepseek_v4_checkpoint"},
         override_args=[
             adamw_swap_overrides + adamw_swap_args,
-            adamw_swap_overrides + adamw_swap_args + ("--checkpoint.load-step=2",),
+            adamw_swap_overrides + adamw_swap_args + ("--checkpointer.load-step=2",),
         ],
         test_descr="DeepSeek-V4 AdamW NovaSwap checkpoint FSDP2 EP2 exact resume",
         test_name="dsv4_checkpoint_resume_ep2_fsdp2",
@@ -107,7 +107,7 @@ def build_deepseek_v4_checkpoint_resume_test_list() -> list[OverrideDefinitions]
     )
     lora_args = (
         *_LORA_ROPE_OVERRIDES,
-        *(arg.replace("--checkpoint.", "--checkpointer.") for arg in checkpoint_args if arg != "--checkpoint.enable"),
+        *checkpoint_args,
         "--checkpointer.save-training-state",
         "--optim.optimizer.name=Muon",
     )
@@ -216,8 +216,8 @@ def build_deepseek_v4_test_list() -> list[OverrideDefinitions]:
             test_name="dsv4_anticipatory_recovery",
             test_descr="DeepSeek-V4 CLI loss spike, native checkpoint rollback and route replay",
             env_vars={
-                "MODULE": "torchtitan_npu.models.deepseek_v4",
-                "CONFIG": "deepseek_v4_debugmodel",
+                "MODULE": "tests.integration_tests.optimizer_config",
+                "CONFIG": "deepseek_v4_checkpoint",
                 "TRAIN_FILE": "tests.integration_tests.anticipatory_routing",
             },
             override_args=[
@@ -231,11 +231,10 @@ def build_deepseek_v4_test_list() -> list[OverrideDefinitions]:
                     "--parallelism.expert-parallel-degree=1",
                     "--hf-assets-path=tests/assets/deepseek_v3",
                     "--debug.seed=42",
-                    "--checkpoint.enable",
-                    "--checkpoint.no-load-only",
-                    "--checkpoint.interval=2",
-                    "--checkpoint.keep-latest-k=0",
-                    "--checkpoint.no-last-save-model-only",
+                    "--checkpointer.no-load-only",
+                    "--checkpointer.interval=2",
+                    "--checkpointer.keep-latest-k=0",
+                    "--checkpointer.no-last-save-model-only",
                     "--anticipatory.enable",
                     "--anticipatory.delay-steps=1",
                     "--anticipatory.active-steps=2",
@@ -277,7 +276,7 @@ def build_deepseek_v4_test_list() -> list[OverrideDefinitions]:
             ngpu=1,
             extra_args=(
                 "--training.steps=30",
-                "--lr-scheduler.total-steps=100",
+                "--optim.lr-scheduler.total-steps=100",
                 "--hf-assets-path=tests/assets/deepseek_v3",
                 "--training.num-tokens-per-train-step=4096",
             ),
@@ -290,7 +289,7 @@ def build_deepseek_v4_test_list() -> list[OverrideDefinitions]:
             ngpu=2,
             extra_args=(
                 "--training.steps=30",
-                "--lr-scheduler.total-steps=100",
+                "--optim.lr-scheduler.total-steps=100",
                 "--parallelism.expert-parallel-degree=2",
                 "--hf-assets-path=tests/assets/deepseek_v3",
                 "--training.num-tokens-per-train-step=4096",
@@ -302,10 +301,9 @@ def build_deepseek_v4_test_list() -> list[OverrideDefinitions]:
             test_name="dsv4_smla_1rank_aot_eager",
             test_descr="DeepSeek-V4 SMLA 1rank aot_eager",
             ngpu=1,
+            env_vars={"MODULE": "tests.integration_tests.optimizer_config", "CONFIG": "deepseek_v4_aot_eager"},
             extra_args=(
                 "--training.steps=1",
-                "--compile.enable",
-                "--compile.backend=aot_eager",
                 "--hf-assets-path=tests/assets/deepseek_v3",
                 "--training.num-tokens-per-train-step=4096",
             ),
@@ -316,11 +314,10 @@ def build_deepseek_v4_test_list() -> list[OverrideDefinitions]:
             test_name="dsv4_smla_ep2_fsdp2",
             test_descr="DeepSeek-V4 SMLA ep2 fsdp2",
             ngpu=2,
+            env_vars={"MODULE": "tests.integration_tests.optimizer_config", "CONFIG": "deepseek_v4_aot_eager"},
             extra_args=(
                 "--training.steps=1",
                 "--parallelism.expert-parallel-degree=2",
-                "--compile.enable",
-                "--compile.backend=aot_eager",
                 "--hf-assets-path=tests/assets/deepseek_v3",
                 "--training.num-tokens-per-train-step=4096",
             ),
@@ -340,7 +337,7 @@ def build_deepseek_v4_test_list() -> list[OverrideDefinitions]:
                 "--dataloader.per_doc_alignment=256",
                 "--hf-assets-path=tests/assets/deepseek_v3",
                 "--training.num-tokens-per-train-step=4096",
-                "--optimizer.name=Muon",
+                "--optim.optimizer.name=Muon",
             ),
             use_golden=False,
             check_loss=False,
@@ -366,7 +363,7 @@ def build_deepseek_v4_test_list() -> list[OverrideDefinitions]:
                 "--dataloader.per_doc_alignment=256",
                 "--hf-assets-path=tests/assets/deepseek_v3",
                 "--training.num-tokens-per-train-step=4096",
-                "--optimizer.name=Muon",
+                "--optim.optimizer.name=Muon",
             ),
             use_golden=False,
             check_loss=False,

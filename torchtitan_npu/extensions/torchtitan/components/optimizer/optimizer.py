@@ -177,7 +177,8 @@ class HostSparseOptimizersContainer(OptimizersContainer):
     @dataclass(kw_only=True, slots=True)
     class Config(OptimizerConfig):
         def materialize(self) -> None:
-            sparse_configs = [config for config in self.optimizers if isinstance(config, SparseAdam.Config)]
+            defaults = self._optimizer_defaults.get("AdamW", self.optimizers)
+            sparse_configs = [config for config in defaults if isinstance(config, SparseAdam.Config)]
             OptimizerConfig.materialize(self)
             if self.name == "Muon":
                 self.optimizers = sparse_configs + self.optimizers

@@ -56,7 +56,7 @@ def build_deepseek_v4_1_test_list() -> list[OverrideDefinitions]:
         override_args=[
             (
                 "--override.imports",
-                "torchtitan_npu.override.common.rope.workaround",
+                "tests.integration_tests.lora_config.lora_rope_workaround",
                 "--hf-assets-path=tests/assets/deepseek_v3",
                 "--training.steps=3",
                 "--training.num-tokens-per-microbatch-per-dp-rank=128",
@@ -68,15 +68,11 @@ def build_deepseek_v4_1_test_list() -> list[OverrideDefinitions]:
                 "--parallelism.tensor-parallel-degree=1",
                 "--parallelism.context-parallel-degree=1",
                 "--parallelism.pipeline-parallel-degree=1",
-                "--parallelism.context-parallel-load-balancer=None",
-                "--parallelism.spmd-backend=partial_dtensor",
                 "--debug.no-moe-force-load-balance",
                 "--debug.seed=42",
                 "--debug.deterministic",
-                "--optimizer.name=AdamW",
-                "--compile.no-enable",
+                "--optim.optimizer.name=AdamW",
                 "--no-engram-enabled",
-                "--checkpoint.no-enable",
                 "activation-checkpoint:none",
             )
         ],
@@ -165,7 +161,7 @@ def build_deepseek_v4_1_quantized_test_list() -> list[OverrideDefinitions]:
 # regression via run_train.sh; its anchor is intentionally not committed.
 GOLDEN_OVERRIDES = (
     "--override.imports",
-    "torchtitan_npu.override.common.rope.workaround",
+    "tests.integration_tests.lora_config.lora_rope_workaround",
     "torchtitan_npu.override.common.optimizer.virtual",
 )
 
@@ -191,15 +187,12 @@ def build_deepseek_v4_1_golden_test_list() -> list[OverrideDefinitions]:
                     "--training.num-tokens-per-train-step=1024",
                     "--training.max-context-length=512",
                     "--training.disable-cuda-graphs",
-                    "--compile.no-enable",
-                    "--parallelism.spmd-backend=partial_dtensor",
                     "--parallelism.data-parallel-shard-degree=2",
                     "--parallelism.data-parallel-replicate-degree=1",
                     "--parallelism.expert-parallel-degree=2",
                     "--parallelism.tensor-parallel-degree=1",
                     "--parallelism.context-parallel-degree=1",
                     "--parallelism.pipeline-parallel-degree=1",
-                    "--parallelism.context-parallel-load-balancer=None",
                     "--debug.no-moe-force-load-balance",
                     "--hf-assets-path=tests/assets/deepseek_v3",
                     # The LR recipe (warmup 25 / total 40) is part of the frozen
@@ -207,12 +200,11 @@ def build_deepseek_v4_1_golden_test_list() -> list[OverrideDefinitions]:
                     # baseline schedule. Keep it unchanged when shortening the
                     # smoke run so its steps remain an exact prefix of that
                     # baseline.
-                    "--lr-scheduler.warmup-steps=25",
-                    "--lr-scheduler.total-steps=40",
-                    "--lr-scheduler.decay-type=cosine",
-                    "--lr-scheduler.decay-ratio=1.0",
-                    "--lr-scheduler.min-lr-factor=0.01",
-                    "--checkpoint.no-enable",
+                    "--optim.lr-scheduler.warmup-steps=25",
+                    "--optim.lr-scheduler.total-steps=40",
+                    "--optim.lr-scheduler.decay-type=cosine",
+                    "--optim.lr-scheduler.decay-ratio=1.0",
+                    "--optim.lr-scheduler.min-lr-factor=0.01",
                     "--metrics.disable-color-printing",
                 )
             ],
@@ -252,10 +244,8 @@ def build_deepseek_v4_1_fused_test_list() -> list[OverrideDefinitions]:
         "--parallelism.tensor-parallel-degree=1",
         "--parallelism.context-parallel-degree=1",
         "--parallelism.pipeline-parallel-degree=1",
-        "--parallelism.context-parallel-load-balancer=None",
-        "--checkpoint.no-enable",
     )
-    args += ("--optimizer.name=Muon",)
+    args += ("--optim.optimizer.name=Muon",)
     return [
         OverrideDefinitions(
             override_args=[args],
@@ -279,7 +269,7 @@ def build_deepseek_v4_1_fused_test_list() -> list[OverrideDefinitions]:
 
 def build_deepseek_v4_1_reference_multimodal_test_list() -> list[OverrideDefinitions]:
     args = (
-        "--override.imports", "torchtitan_npu.override.common.rope.workaround",
+        "--override.imports", "tests.integration_tests.lora_config.lora_rope_workaround",
         "torchtitan_npu.override.common.optimizer.virtual",
         "--hf-assets-path=tests/assets/deepseek_v3",
         "--training.steps=3", "--training.max-context-length=512",
@@ -288,9 +278,8 @@ def build_deepseek_v4_1_reference_multimodal_test_list() -> list[OverrideDefinit
         "--parallelism.data-parallel-shard-degree=2", "--parallelism.expert-parallel-degree=2",
         "--parallelism.data-parallel-replicate-degree=1", "--parallelism.tensor-parallel-degree=1",
         "--parallelism.context-parallel-degree=1", "--parallelism.pipeline-parallel-degree=1",
-        "--parallelism.context-parallel-load-balancer=None", "--parallelism.spmd-backend=partial_dtensor",
         "--debug.no-moe-force-load-balance", "--debug.seed=42", "--debug.deterministic",
-        "--optimizer.name=AdamW", "--compile.no-enable", "--checkpoint.no-enable",
+        "--optim.optimizer.name=AdamW",
     )
     cpt = OverrideDefinitions(
         test_name="dsv41_multimodal_cpt_reference_ep2_fsdp2",

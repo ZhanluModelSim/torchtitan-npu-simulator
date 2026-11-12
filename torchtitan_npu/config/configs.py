@@ -6,11 +6,11 @@
 """Typed NPU extensions to TorchTitan's training configuration."""
 
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Annotated, Any, Literal
 
 import tyro
-from torchtitan.components.optim import AdamW, DistMuon, Optim, OptimizersContainer
+from torchtitan.components.optim import AdamW, BaseOptimizer, DistMuon, Optim, OptimizersContainer
 from torchtitan.config import CompileConfig as _BaseCompileConfig
 from torchtitan.config import TrainingConfig as _BaseTrainingConfig
 from torchtitan.observability.profiler import Profiler as _BaseProfiler
@@ -51,71 +51,85 @@ class MuonOptimizerProfile:
 
 @dataclass(kw_only=True, slots=True)
 class OptimizerConfig(OptimizersContainer.Config):
-    """NPU optimizer CLI schema while preserving recipe-provided AdamW configs."""
+    """Model-owned optimizer modes with optional scalar CLI overrides.
+
+    Recipes with ``_optimizer_defaults`` own the source configs. For these
+    recipes, ``optimizers`` is materialized output, not a customization input.
+    Recipes without mode defaults retain the upstream ``optimizers`` input.
+    """
 
     name: Literal["AdamW", "Muon"] = "AdamW"
-    lr: float = 1e-5
-    beta1: float = 0.9
-    beta2: float = 0.95
-    eps: float = 1e-8
-    weight_decay: float = 0.1
-    muon_momentum: float = 0.95
-    muon_enable_nesterov: bool = True
-    muon_ns_steps: int = 5
-    muon_adjust_lr_fn: Literal["original", "match_rms_adamw", "spectral_unclamped"] = "match_rms_adamw"
-    muon_ns_coefficients: tuple[float, float, float] = (
-        3.4445,
-        -4.7750,
-        2.0315,
-    )
-    muon_eps: float = 1e-7
+    # None preserves the selected mode's typed optimizer defaults.
+    lr: float | None = None
+    beta1: float | None = None
+    beta2: float | None = None
+    eps: float | None = None
+    weight_decay: float | None = None
+    muon_momentum: float | None = None
+    muon_enable_nesterov: Annotated[bool | None, tyro.conf.DisallowNone] = None
+    muon_ns_steps: int | None = None
+    muon_adjust_lr_fn: Literal["original", "match_rms_adamw", "spectral_unclamped"] | None = None
+    muon_ns_coefficients: tuple[float, float, float] | None = None
+    muon_eps: float | None = None
     muon_enable_hsdp_replica_dedup: bool = False
     """Assign each DistMuon tensor state to one HSDP replica domain."""
     _muon_profile: Annotated[MuonOptimizerProfile | None, tyro.conf.Suppress] = None
+    _optimizer_defaults: Annotated[dict[str, list[BaseOptimizer.Config]], tyro.conf.Suppress] = field(
+        default_factory=dict
+    )
     _cpu_offload: Annotated[bool, tyro.conf.Suppress] = False
     """Carrier for ``--training.enable-cpu-offload``, set by the trainer
     config so the optimizer-container override can branch on it; not a
     user-facing switch."""
 
     def materialize(self) -> None:
-        """Turn an explicit Muon selection into upstream optimizer groups.
+        """Select a mode, then apply non-None overrides to its optimizer configs."""
+        selected = self._optimizer_defaults.get(self.name, self.optimizers)
+        if self.name == "Muon":
+            if self._muon_profile is None or "Muon" not in self._optimizer_defaults:
+                raise ValueError("optim.optimizer.name=Muon requires recipe-owned Muon defaults and a Muon profile")
+            # LoRA transforms can replace the profile after the defaults were built.
+            selected = [
+                replace(
+                    optimizer,
+                    pattern=self._muon_profile.muon_pattern,
+                    **self._muon_profile.optimizer_factory_kwargs["DistMuon"],
+                )
+                if isinstance(optimizer, DistMuon.Config)
+                else optimizer
+                for optimizer in selected
+            ]
 
-        ``AdamW`` is intentionally a strict no-op so converting every NPU
-        recipe to this schema cannot alter its existing optimizer behavior.
-        """
-        if self.name == "AdamW":
-            return
-        if self._muon_profile is None:
-            raise ValueError("optimizer.name=Muon requires a recipe with a DSV4 Muon profile")
-
-        muon_kwargs = dict(self._muon_profile.optimizer_factory_kwargs["DistMuon"])
-        # The NPU runtime registers a typed optimizer config for optional
-        # replica deduplication; keep recipe metadata separate from CLI values.
-        muon_config_type = self._muon_profile.optimizer_config_type
+        shared = {name: value for name in ("lr", "weight_decay") if (value := getattr(self, name)) is not None}
+        muon_updates = {
+            name: value
+            for name, value in {
+                "momentum": self.muon_momentum,
+                "nesterov": self.muon_enable_nesterov,
+                "ns_steps": self.muon_ns_steps,
+                "adjust_lr_fn": self.muon_adjust_lr_fn,
+                "ns_coefficients": self.muon_ns_coefficients,
+                "eps": self.muon_eps,
+            }.items()
+            if value is not None
+        }
         self.optimizers = [
-            muon_config_type(
-                pattern=self._muon_profile.muon_pattern,
-                lr=self.lr,
-                weight_decay=self.weight_decay,
-                momentum=self.muon_momentum,
-                nesterov=self.muon_enable_nesterov,
-                ns_steps=self.muon_ns_steps,
-                adjust_lr_fn=self.muon_adjust_lr_fn,
-                ns_coefficients=self.muon_ns_coefficients,
-                eps=self.muon_eps,
-                **muon_kwargs,
-            ),
-            AdamW.Config(
-                pattern=r".*",
-                lr=self.lr,
-                betas=(self.beta1, self.beta2),
-                eps=self.eps,
-                weight_decay=self.weight_decay,
-                fused=True,
-                foreach=False,
-            ),
+            replace(
+                optimizer,
+                **shared,
+                betas=(
+                    optimizer.betas[0] if self.beta1 is None else self.beta1,
+                    optimizer.betas[1] if self.beta2 is None else self.beta2,
+                ),
+                eps=optimizer.eps if self.eps is None else self.eps,
+            )
+            if isinstance(optimizer, AdamW.Config)
+            else replace(optimizer, **shared, **muon_updates)
+            if isinstance(optimizer, DistMuon.Config)
+            else optimizer
+            for optimizer in selected
         ]
-        if self.muon_enable_hsdp_replica_dedup:
+        if self.name == "Muon" and self.muon_enable_hsdp_replica_dedup:
             if not hasattr(self.optimizers[0], "enable_hsdp_replica_dedup"):
                 raise ValueError("Muon replica deduplication requires the NPU DistMuon config")
             # The recipe-selected subtype, rather than the upstream base,

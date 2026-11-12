@@ -781,6 +781,12 @@ class OptimizerStateSwapContainer(OptimizersContainer):
         pass
 
     def __init__(self, config: Config, *, model_parts: list[Any], enable_cuda_graph: bool = False) -> None:
+        if any(
+            isinstance(optimizer, AdamW.Config) and optimizer.moment_dtype != "parameter"
+            for optimizer in config.optimizers
+        ):
+            # BF16 moment hooks allocate state before NovaSwap installs its bucket views.
+            raise ValueError("AdamW NovaSwap requires moment_dtype='parameter'")
         super().__init__(config=config, model_parts=model_parts, enable_cuda_graph=enable_cuda_graph)
         parameter_to_part = {
             id(parameter): part_index

@@ -120,14 +120,17 @@ class DeepSeekV41Trainer(TrainerEx):
                 self.model = model
                 assert isinstance(model, DeepSeekV41Model.Config)
                 # Remove the HostSparse capability together with Engram.
-                self.optim.optimizer = derive(copy.deepcopy(self.optim.optimizer), OptimizerConfig)
+                optimizer = derive(copy.deepcopy(self.optim.optimizer), OptimizerConfig)
+                self.optim.optimizer = optimizer
                 for layer in model.layers:
                     layer.engram = None
-                self.optim.optimizer.optimizers = [
-                    group
-                    for group in self.optim.optimizer.optimizers
-                    if not isinstance(group, EngramTableOptimizerConfig)
+                optimizer.optimizers = [
+                    group for group in optimizer.optimizers if not isinstance(group, EngramTableOptimizerConfig)
                 ]
+                optimizer._optimizer_defaults = {
+                    name: [group for group in groups if not isinstance(group, EngramTableOptimizerConfig)]
+                    for name, groups in optimizer._optimizer_defaults.items()
+                }
             TrainerEx.Config.__post_init__(self)
 
 
@@ -231,6 +234,7 @@ def _v41_muon_profile(model: DeepSeekV41Model.Config) -> MuonOptimizerProfile:
 def _v41_optimizer_config(model: DeepSeekV41Model.Config) -> OptimizerConfig:
     has_engram = any(layer.engram is not None for layer in model.layers)
     optimizer_type = HostSparseOptimizersContainer.Config if has_engram else OptimizerConfig
+    profile = _v41_muon_profile(model)
     optimizers: list[BaseOptimizer.Config] = [AdamW.Config(pattern=r".*", lr=1e-5, eps=1e-6)]
     if has_engram:
         optimizers.insert(
@@ -244,8 +248,19 @@ def _v41_optimizer_config(model: DeepSeekV41Model.Config) -> OptimizerConfig:
         )
     return optimizer_type(
         name="AdamW" if has_engram else "Muon",
-        optimizers=optimizers,
-        _muon_profile=_v41_muon_profile(model),
+        _optimizer_defaults={
+            "AdamW": optimizers,
+            "Muon": [
+                profile.optimizer_config_type(
+                    pattern=profile.muon_pattern,
+                    lr=1e-5,
+                    adjust_lr_fn="match_rms_adamw",
+                    **profile.optimizer_factory_kwargs["DistMuon"],
+                ),
+                AdamW.Config(pattern=r".*", lr=1e-5, eps=1e-8, fused=True, foreach=False),
+            ],
+        },
+        _muon_profile=profile,
     )
 
 
@@ -529,7 +544,7 @@ def _make_lora_trainer_config(flavor: str) -> TrainerEx.Config:
 
     config = _make_trainer_config(flavor)
     config.optim.optimizer = OptimizerConfig(
-        optimizers=[AdamW.Config(pattern=r".*", lr=1e-5, eps=1e-6)],
+        _optimizer_defaults={"AdamW": [AdamW.Config(pattern=r".*", lr=1e-5, eps=1e-6)]},
     )
     from .checkpoint import DeepSeekV41LoRACheckpointManager
 
@@ -537,7 +552,9 @@ def _make_lora_trainer_config(flavor: str) -> TrainerEx.Config:
     assert isinstance(config, TrainerEx.Config)
     assert isinstance(config.model, DeepSeekV41Model.Config)
     assert isinstance(config.optim.optimizer, OptimizerConfig)
-    config.optim.optimizer._muon_profile = _v41_muon_profile(config.model)
+    defaults = _v41_optimizer_config(config.model)
+    config.optim.optimizer._muon_profile = defaults._muon_profile
+    config.optim.optimizer._optimizer_defaults["Muon"] = defaults._optimizer_defaults["Muon"]
     config.checkpointer = DeepSeekV41LoRACheckpointManager.Config()
     return config
 

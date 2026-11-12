@@ -218,17 +218,28 @@ def _dsv4_optimizer_config(
     *,
     lr: float,
 ) -> OptimizerConfig:
-    """Build an AdamW-default DSV4 optimizer schema with a Muon profile.
+    """Build recipe-owned AdamW and Muon + AdamW defaults for DSV4.
 
-    ``name`` remains ``AdamW`` until the user explicitly supplies
-    ``--optimizer.name Muon``.  Keeping the profile on the ordinary recipe
-    makes the CLI selection the sole Muon entry point.
+    ``--optim.optimizer.name=Muon`` selects the mixed optimizer defaults.
+    Non-None scalar CLI values override the selected mode's defaults;
+    the profile supplies Muon parameter matching and FlexShard layouts.
     """
+    profile = _dsv4_muon_profile(model)
     return OptimizerConfig(
-        optimizers=[AdamW.Config(pattern=r".*", lr=lr, eps=1e-6)],
-        lr=lr,
-        muon_ns_steps=10,
-        _muon_profile=_dsv4_muon_profile(model),
+        _optimizer_defaults={
+            "AdamW": [AdamW.Config(pattern=r".*", lr=lr, eps=1e-6)],
+            "Muon": [
+                profile.optimizer_config_type(
+                    pattern=profile.muon_pattern,
+                    lr=lr,
+                    ns_steps=10,
+                    adjust_lr_fn="match_rms_adamw",
+                    **profile.optimizer_factory_kwargs["DistMuon"],
+                ),
+                AdamW.Config(pattern=r".*", lr=lr, eps=1e-8, fused=True, foreach=False),
+            ],
+        },
+        _muon_profile=profile,
     )
 
 

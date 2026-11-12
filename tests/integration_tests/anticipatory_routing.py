@@ -25,11 +25,11 @@ def main():
     def initialize(self, config):
         original_init(self, config)
         assert isinstance(config, TrainerEx.Config)
-        assert isinstance(self.checkpointer, CheckpointManager)
+        assert isinstance(self.engine.checkpointer, CheckpointManager)
         assert self.anticipatory_schedule is not None
         routers = [
             m
-            for part in self.model_parts
+            for part in self.engine.model_parts
             for m in part.modules()
             if isinstance(m, TokenChoiceTopKRouter) and hasattr(m, "_anticipatory_cache")
         ]
@@ -38,28 +38,28 @@ def main():
         self._test_injected = False
         self._test_phases = []
         self._test_rollbacks = []
-        original_loss = self.loss_fn
+        original_loss = self.engine.loss_fn
 
         def perturbed_loss(*args, **kwargs):
             loss, metrics = original_loss(*args, **kwargs)
             # Exercise the real detector with a changed training objective;
             # do not inject its verdict or replace checkpoint/load methods.
-            if self.step == 6 and not self._test_injected:
+            if self.engine.num_completed_steps == 5 and not self._test_injected:
                 loss = loss * 100
                 self._test_injected = True
             return loss, metrics
 
-        self.loss_fn = perturbed_loss
+        self.engine.loss_fn = perturbed_loss
 
     @wraps(original_step)
     def step(self, data_iterator):
-        entry_step = self.step
+        entry_step = self.engine.num_completed_steps + 1
         before = self.anticipatory_schedule.phase
         result = original_step(self, data_iterator)
         after = self.anticipatory_schedule.phase
         self._test_phases.append((before, after))
-        if self.step < entry_step:
-            self._test_rollbacks.append((entry_step, self.step))
+        if self.engine.num_completed_steps < entry_step:
+            self._test_rollbacks.append((entry_step, self.engine.num_completed_steps))
             assert self.anticipatory_schedule._queue, "Rollback did not execute inline WARMUP"
         return result
 
@@ -73,7 +73,7 @@ def main():
         assert (Phase.NORMAL, Phase.ACTIVE) in self._test_phases
         assert (Phase.ACTIVE, Phase.DRAIN) in self._test_phases
         assert (Phase.DRAIN, Phase.NORMAL) in self._test_phases
-        assert self.step == self.config.training.steps
+        assert self.engine.num_completed_steps == self.config.training.steps
         assert schedule._num_rollbacks == 1 and not schedule._queue
         assert not schedule.engine.failed and not schedule.engine.suppress_checkpoint_saves
 

@@ -650,9 +650,10 @@ def _migration_pending_reason(case: OverrideDefinitions) -> str | None:
     if case.test_name.startswith("dsv3_2_"):
         return "DeepSeek-V3.2 model boundary still requires the folded-token migration"
     arguments = {arg for phase in case.override_args for arg in phase}
-    if "--optimizer.name=Muon" in arguments and "--training.enable-cpu-offload" in arguments:
+    uses_muon = bool(arguments & {"--optimizer.name=Muon", "--optim.optimizer.name=Muon"})
+    if uses_muon and "--training.enable-cpu-offload" in arguments:
         return "native CPU-offload Muon migration is pending"
-    if "--optimizer.name=Muon" in arguments and (
+    if uses_muon and (
         "lora" in case.test_name
         or any(
             arg.startswith("--parallelism.context-parallel-degree=") and arg.rsplit("=", 1)[1] != "1"
