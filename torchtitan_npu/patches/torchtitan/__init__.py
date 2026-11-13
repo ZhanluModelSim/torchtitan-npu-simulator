@@ -36,7 +36,7 @@ if not hasattr(_pipelining, "PipelineStageInfo"):
 # entry order stop mattering.  Drop it when the pin carries #5744.
 import torchtitan.config  # noqa: F401
 
-from .components import checkpointer, metrics, optimizer  # noqa: F401
+from .components import metrics, optimizer  # noqa: F401
 import torchtitan_npu.patches.torchtitan.distributed.checkpoint.filesystem  # noqa: F401
 
 from . import observability  # noqa: F401

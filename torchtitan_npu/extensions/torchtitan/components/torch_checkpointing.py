@@ -105,9 +105,8 @@ class TorchCheckpointingManager(upstream.TorchCheckpointingManager):
             _sync_save_config(),
             storage_config=storage_config,
             items=item_specs,
+            pre_finalize_callback=pre_finalize_callback,
         )
-        # torch_checkpointing 0.1.1 uses CallbackArgs; the upstream helper still types the old two-argument API.
-        manager_config.pre_finalize_callback = pre_finalize_callback
         manager = manager_config.build()
         try:
             adapt_checkpoint_manager(manager)

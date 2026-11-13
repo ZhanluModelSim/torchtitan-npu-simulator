@@ -34,7 +34,6 @@
       ".compile.dynamo_config"
     ],
     "torchtitan_npu/patches/torchtitan/__init__.py": [
-      ".components.checkpointer",
       ".components.metrics",
       ".components.optimizer",
       ".observability",
