@@ -79,7 +79,7 @@ from torchtitan.models.common.embedding import Embedding
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.nn_modules import GELU, Conv1d, Conv2d
 from torchtitan.models.common.token_dispatcher import AllToAllTokenDispatcher, LocalTokenDispatcher
-from torchtitan.protocols.module import Module
+from torchtitan.protocols.module import Module, ModuleList
 from torchtitan.protocols.sharding import ShardingConfig
 
 _register_autograd_function = getattr(spmd, "register_autograd_function", None)
@@ -958,7 +958,7 @@ class LatentMoELayer(Module):
         self.latent_up = config.latent_up.build()
         self.router = config.router.build()
         self.routed_experts = config.routed_experts.build()
-        self.shared_experts = nn.ModuleList(
+        self.shared_experts = ModuleList(
             [shared.build() for shared in config.shared_experts]  # pyrefly: ignore [missing-attribute]
         )
 
@@ -1114,8 +1114,8 @@ class EngramModule(Module):
     def __init__(self, config: Config):
         super().__init__()
         d = config.hidden_size
-        self.hash_fns = nn.ModuleList([hash_fn.build() for hash_fn in config.hash_fns])
-        self.hash_tables = nn.ModuleList([table.build() for table in config.hash_tables])
+        self.hash_fns = ModuleList([hash_fn.build() for hash_fn in config.hash_fns])
+        self.hash_tables = ModuleList([table.build() for table in config.hash_tables])
         self.key_proj = config.key_proj.build()
         self.value_proj = config.value_proj.build()
         self.query_proj = config.query_proj.build()
@@ -1203,8 +1203,10 @@ class HyperConnectionBlock(Module):
         self.branch_dim = config.branch_dim
 
     def reset_parameters(self) -> None:
-        # Reference init: ``torch.randn(hc_mult, hc_mult) * 0.02``.
-        self.mix_weights.data = torch.randn(*self.mix_weights.shape) * 0.02
+        # Reference init: ``torch.randn(hc_mult, hc_mult) * 0.02``. In-place so
+        # the tensor follows the parameter's device (meta build, then NPU).
+        with torch.no_grad():
+            self.mix_weights.normal_().mul_(0.02)
 
     def forward(self, x):
         b, s, _d = x.shape
@@ -1646,8 +1648,10 @@ class System3Model(Decoder):
             for layer in self.layers:
                 attn = layer.attention
                 d = attn.hidden_size
-                if attn.is_isa:
-                    # Q/O projections on every ISA layer; K/V on kv layers.
+                dk = getattr(attn, "d_k", None)
+                if dk is None:
+                    # ISA layer (AlternatingAttention.Config): Q/O projections
+                    # on every ISA layer; K/V on the kv-role layer.
                     active += 2 * attn.num_heads * attn.head_dim * d
                     if attn.role == "kv":
                         active += 2 * attn.num_heads * attn.head_dim * d
@@ -1655,13 +1659,12 @@ class System3Model(Decoder):
                         idx_dim = attn.indexer.n_heads * attn.indexer.head_dim
                         active += 2 * d * idx_dim
                 else:
-                    g = attn.gdn2
-                    assert g is not None
-                    active += 3 * d * g.num_heads * g.d_k
-                    active += g.num_heads * g.d_v * d
-                    active += d * g.num_heads * g.d_k  # alpha gate
-                    active += d * 2 * g.num_heads * g.d_state  # beta gate
-                    active += d * g.num_heads * g.d_a  # da proj
+                    # GDN2 layer (GDN2Attention.Config).
+                    active += 3 * d * attn.num_heads * dk
+                    active += attn.num_heads * attn.d_v * d
+                    active += d * attn.num_heads * dk  # alpha gate
+                    active += d * 2 * attn.num_heads * attn.d_state  # beta gate
+                    active += d * attn.num_heads * attn.d_a  # da proj
                 if layer.moe is not None:
                     moe = layer.moe
                     latent = moe.gate_down.out_features
