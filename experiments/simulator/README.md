@@ -9,7 +9,7 @@
 | 理解整体执行链、职责和设计取舍 | [整体方案](docs/architecture.md) |
 | **从零接入新模型、复用组件并完成验收** | **[新模型接入流程](docs/model-integration.md)** → [常见问题](docs/model-integration-pitfalls.md) |
 | 开发、环境核对与测试选择 | [开发导航](docs/developer-guide.md) |
-| Python／CLI 调用与返回对象 | [同进程接入](docs/upstream-integration.md) |
+| Python／CLI 调用、只读配置目录与返回对象 | [同进程接入](docs/upstream-integration.md) |
 | 判断当前配置是否在支持范围 | [能力矩阵](docs/capability-matrix.md) |
 | Qwen3-32B dense 的路线决策、验证边界与未覆盖范围 | [Qwen3 接入说明](docs/qwen3-integration.md) |
 

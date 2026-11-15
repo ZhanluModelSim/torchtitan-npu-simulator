@@ -98,3 +98,11 @@ F 内可能交错 lm_head/loss backward，不能只按 `phase` 切 F/B。原始 
 `output_formats=[]` 不写文件；`["mem"]` 写 `memory/memory_summary.json` 和事件／timeline／storage／保存值／FSDP 等诊断明细。`export_result()` 也按该选项控制。无 JSON/HTML/DOT 图导出；平台自行保存其公共图快照。导出非原子事务，I/O 失败可能留下部分文件，每次使用独立目录，旧文件不自动清理。
 
 接入至少运行一次完整 F/B/O，再在同一进程顺序执行第二次，检查返回图可消费、梯度齐全、图无环、状态不泄漏，且第一张图仍可读取。验证缺失与无状态零值的区别，不能只比较输出文件是否存在。真实模型测试入口见 `tests/test_dsv4_capture.py`、`tests/test_kimi_capture.py`、`tests/test_memory_delivery.py` 和 `tests/test_runtime.py`；新模型步骤见模型接入流程。
+
+## 只读配置目录
+
+`torchtitan_simulator.configuration_metadata.describe_configuration()` 从 `SimulationConfig`、已登记的原生 preset 工厂和 DeepSeek-V4 几何读取逻辑生成表单元数据。返回相对训练配置的 `model_reset_paths`、公共 `fields` 和 `models`；字段的 `default`、选项和赋值使用 Python 原生值，由平台统一编码 TOML literal。`None` 表示没有可用默认提示，不代表 TOML 值。
+
+每个模型条目的 `identity` 只包含 `config`；`assignments` 另设置默认 MTP 数量。选择模型时只重置 `config`、`model_overrides` 和结构字段 `num_mtp_modules`，保留精度、并行、输入、优化器和卸载配置。缺失字段继承原生默认，提示值不要求写入任务。DeepSeek-V4 的几何提示复用 override 的同一读取逻辑；Qwen3 和 Kimi K3 保留现有不支持 flat `model_overrides` 的限制。
+
+目录生成会导入框架配置，但不创建模型、不执行 override、不抓图，不加载任意用户 `module.factory`。普通 `torchtitan_simulator` 导入仍不加载 Torch。目录不是运行时预检或捕获成功证明。
