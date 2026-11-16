@@ -71,10 +71,16 @@ def _reduce_op_literal(value: Any) -> str | None:
             return None
         # Native ReduceOp accessors are absent from torch's Python stubs.
         operation = cast("Any", value).op()
-    elif isinstance(value, ReduceOp):
-        operation = cast("Any", value).op
     elif isinstance(value, ReduceOp.RedOpType):
+        # pybind enum members expose .value; some builds deliver these directly
+        # where older APIs wrapped them in a ReduceOp with an .op accessor.
         operation = cast("Any", value).value
+    elif isinstance(value, ReduceOp):
+        operation = cast("Any", getattr(value, "op", None))
+        if operation is None:
+            # Opaque native premul wrappers expose neither a numeric id nor the
+            # factor; preserve the same unsupported identity as ScriptObject.
+            return "unsupported:premul_sum"
     else:
         return None
 
