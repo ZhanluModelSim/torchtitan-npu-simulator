@@ -153,6 +153,67 @@ class _Geometry:
                 raise ValueError("Index source must use global attention")
 
 
+@dataclass(frozen=True)
+class _GeometryMid(_Geometry):
+    """Mid geometry: the reference ``student30b`` flavor with only the layer
+    count reduced (40 -> 8) and the routed experts reduced (24 -> 16) to fit
+    7-device fp32 training (6.3B parameters, ~14 GB/device including
+    optimizer states). The budget is dominated by activation working space,
+    not parameters: the indexer's candidate KV workspace alone is a single
+    4.3 GB aclnnChunkCat allocation per indexer pass (candidate_blocks 2048 x
+    block_size 8 x head_dim 512 x 64 heads x 4 B), and the mHC Sinkhorn
+    hyper-connections keep per-layer intermediate states that at 12 layers
+    still pushed reserved memory to 59.6 GB/61 GB before OOM in backward.
+
+    Every other field keeps the published production value: the student30b
+    expert/memory flavor (top-6 routing, expert_dim 1408, 32,771 engram
+    buckets), the student300b dimensions (width 5120, heads 64, head_dim 512,
+    low-rank 1280/1024 attention, index_topk 512, 2048 candidate blocks,
+    546px vision at width 1024, 129,280 vocab). The structural schedules are
+    remapped onto 8 layers with the student300b pattern: two dense layers, a
+    ratio-2 compression spine, a ratio-1 tail, 2 KV sources, 4 indexers, and
+    Engram on the first layer and the final encoder boundary.
+    """
+
+    vocab_size: int = 129280
+    width: int = 5120
+    layers: int = 8
+    encoder_layers: int = 4
+    heads: int = 64
+    head_dim: int = 512
+    rope_dim: int = 64
+    q_rank: int = 1280
+    o_rank: int = 1024
+    o_groups: int = 8
+    experts: int = 16
+    topk: int = 6
+    expert_dim: int = 1408
+    window: int = 128
+    compress_ratios: tuple[int, ...] = (0, 0) + (2,) * 2 + (1,) * 4
+    kv_sources: tuple[int, ...] = (2, 4)
+    index_sources: tuple[int, ...] = (2, 4, 6, 8)
+    index_heads: int = 32
+    index_dim: int = 128
+    index_topk: int = 512
+    candidate_source: int = 4
+    candidate_blocks: int = 2048
+    candidate_block_size: int = 8
+    engram_layers: tuple[int, ...] = (1, 4)
+    engram_buckets: int = 32771
+    engram_heads: int = 8
+    engram_dim: int = 256
+    vision_width: int = 1024
+    vision_layers: int = 32
+    vision_heads: int = 16
+    vision_mlp: int = 2816
+    image_size: int = 546
+    action_width: int = 1024
+    action_layers: int = 8
+    action_q_rank: int = 256
+    action_o_rank: int = 128
+    action_mlp: int = 4096
+
+
 def _norm(dim: int, g: _Geometry) -> RMSNorm.Config:
     return RMSNorm.Config(dim=dim, eps=g.eps)
 
@@ -413,6 +474,7 @@ def _make_model_config(*, g: _Geometry) -> Sys2MotModel.Config:
 
 sys2mot_configs = {
     "debugmodel_multimodal": lambda: _make_model_config(g=_Geometry()),
+    "mid_multimodal": lambda: _make_model_config(g=_GeometryMid()),
 }
 
 
@@ -430,7 +492,9 @@ def model_registry(flavor: str) -> ModelSpec:
     )
 
 
-def _sys2mot_trainer_config(flavor: str, *, num_mtp_layers: int = 0) -> Trainer.Config:
+def _sys2mot_trainer_config(
+    flavor: str, *, num_mtp_layers: int = 0, seq_len: int = 100
+) -> Trainer.Config:
     if num_mtp_layers:
         raise ValueError("sys2mot has no MTP modules; num_mtp_layers must be 0")
     model_spec = model_registry(flavor)
@@ -461,8 +525,9 @@ def _sys2mot_trainer_config(flavor: str, *, num_mtp_layers: int = 0) -> Trainer.
         training=TrainingConfig(
             local_batch_size=1,
             # Reference input contract: 100..200 text tokens; the debug preset
-            # pins the minimum (embed_prefix validates the range).
-            seq_len=100,
+            # pins the minimum (embed_prefix validates the range), the mid
+            # preset pins the production maximum.
+            seq_len=seq_len,
             steps=10,
             # Reference ``train_dummy`` is fp32 (like the system3 capture
             # flavor); the routed experts cast to bf16 for the grouped GEMM.
@@ -486,4 +551,10 @@ def sys2mot_debugmodel_multimodal(*, num_mtp_layers: int = 0) -> Trainer.Config:
     return _sys2mot_trainer_config("debugmodel_multimodal", num_mtp_layers=num_mtp_layers)
 
 
-__all__ = ["model_registry", "sys2mot_debugmodel_multimodal"]
+def sys2mot_mid_multimodal(*, num_mtp_layers: int = 0) -> Trainer.Config:
+    return _sys2mot_trainer_config(
+        "mid_multimodal", num_mtp_layers=num_mtp_layers, seq_len=200
+    )
+
+
+__all__ = ["model_registry", "sys2mot_debugmodel_multimodal", "sys2mot_mid_multimodal"]
