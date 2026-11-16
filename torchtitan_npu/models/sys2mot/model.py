@@ -86,6 +86,7 @@ from torchtitan.distributed.spmd_types import maybe_set_sparse_mesh
 from torchtitan.models.common.decoder import Decoder
 from torchtitan.models.common.decoder_sharding import dense_param_placement
 from torchtitan.models.common.embedding import Embedding
+from torchtitan.protocols.module import ModuleList
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.nn_modules import Conv2d
 from torchtitan.models.common.token_dispatcher import LocalTokenDispatcher
@@ -267,7 +268,7 @@ class DeepSeekViT(Module):
         self.downsample = config.downsample
         self.image_size = config.image_size
         self.patch = config.patch.build()  # pyrefly: ignore [missing-attribute]
-        self.blocks = nn.ModuleList([block.build() for block in config.blocks])
+        self.blocks = ModuleList([block.build() for block in config.blocks])
         self.norm = config.norm.build()  # pyrefly: ignore [missing-attribute]
         self.align1 = config.align1.build()  # pyrefly: ignore [missing-attribute]
         self.align2 = config.align2.build()  # pyrefly: ignore [missing-attribute]
@@ -1242,7 +1243,7 @@ class ActionMoT(Module):
         super().__init__()
         self.action_dim = config.action_dim
         self.horizon = config.horizon
-        self.blocks = nn.ModuleList([block.build() for block in config.blocks])
+        self.blocks = ModuleList([block.build() for block in config.blocks])
         self.state_in = config.state_in.build()  # pyrefly: ignore [missing-attribute]
         self.action_in = config.action_in.build()  # pyrefly: ignore [missing-attribute]
         self.time_in = config.time_in.build()  # pyrefly: ignore [missing-attribute]
