@@ -7,7 +7,7 @@
 
 Model-specific alignment scripts should only describe which modules map to
 which trace keys.  Hook installation, tensor detaching and handle cleanup stay
-in this module so DSV3, DSV3.2 and future models can share the same behavior.
+in this module so multiple models can share the same behavior.
 """
 
 from __future__ import annotations

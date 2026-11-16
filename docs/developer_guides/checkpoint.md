@@ -20,7 +20,6 @@
 | 模块 | 配置入口 | checkpoint 默认值 |
 | --- | --- | --- |
 | `torchtitan_npu_recipes.models.deepseek_v4` | `deepseek_v4_debugmodel`、`deepseek_v4_flash`、`deepseek_v4_pro` | `enable=False`，`interval=100` |
-| `torchtitan_npu_recipes.models.deepseek_v3_2` | `deepseek_v3_2_debugmodel` | `enable=False`，`interval=10`，`last_save_model_only=False` |
 
 `enable=False` 时既不会保存 checkpoint，也不会执行 checkpoint 加载。训练命令需要显式
 传入 `--checkpoint.enable`，或在 Python 配置中设置 `checkpoint.enable = True`。
@@ -239,7 +238,7 @@ bash scripts/run_train.sh \
 ```
 
 `last_save_in_hf` 需要模型提供 state-dict adapter，并且必须保持
-`last_save_model_only=True`。`deepseek_v3_2` 和 `deepseek_v4` 模型均提供
+`last_save_model_only=True`。`deepseek_v4` 模型提供
 对应的 state-dict adapter；具体可用性仍取决于模型配置和权重格式。
 
 ## 创建 seed checkpoint

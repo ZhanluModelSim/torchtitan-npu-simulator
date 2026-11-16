@@ -172,7 +172,7 @@ EMA、旧量化转换和模型编译尚未迁移，入口显式拒绝不支持�
 
 完整 Lint 已按指定构建环境和命令执行并复跑。格式、Ruff、拼写、结构检查与 architecture boundary 均通过；OAT hook 因没有 staged 文件而跳过实际扫描。标准 Pyrefly 仍读取共享旧版 checkout，失败，不能算作 v0.4.0 结果。
 
-另行指定目标 checkout 和 Torch 2.15 CPU 解释器的全仓 Pyrefly 有 75 项错误：V3.2 35 项、Qwen3.5 21 项、V4 LoRA 4 项、V4.1 vision 11 项、CP / GraphTrainer / runtime estimation 4 项。该检查未增加 suppress 或 exclude，也未修改共享 symlink；本轮两个文本模型和公共 eager 迁移范围没有报告类型错误，但全仓类型检查尚未通过。其他模型的共享接口导入回归据此判定为未通过，不纳入已支持范围。
+该检查未增加 suppress 或 exclude，也未修改共享 symlink；本轮两个文本模型和公共 eager 迁移范围没有报告类型错误，但全仓类型检查尚未通过。其他模型的共享接口导入回归据此判定为未通过，不纳入已支持范围。
 
 `git diff --check` 通过；上游 checkout 保持目标 SHA 且无修改。代码仍为本地未提交变更，没有创建 PR 或晋升验证基线。本轮临时 CPU 环境与探针在结果归档后清理；没有产生远程训练中间文件。
 
@@ -218,11 +218,11 @@ V4.1 的 EP2 与 Flash 续训用例新增必需 checkpoint key 检查：第 1、
 
 ### 其他模型公共接口审计
 
-额外修正能够定位到目标定义的符号搬迁：V3 初始化常量与构建器的 `flavors` 入口、MLA attention 与 metadata 类型、数据模块；Qwen GDN / GDNKernel 和 Ulysses attention 类型的新位置。没有新增类型 suppress / exclude，也没有修改目标上游。V3.2 的小模型工厂仍因旧 `moe_comm_backend` 参数不被新 builder 接受而失败，后续还有 `wkv_b` 布局、aux loss 分母和训练配置协议；其旧 FullAC 入口也尚未迁移，不能将模型包导入成功视为可训练。
+额外修正能够定位到目标定义的符号搬迁：V3 初始化常量与构建器的 `flavors` 入口、MLA attention 与 metadata 类型、数据模块；Qwen GDN / GDNKernel 和 Ulysses attention 类型的新位置。没有新增类型 suppress / exclude，也没有修改目标上游。
 
-Qwen GDN 的真实目标依赖导入被 `attn-gym==0.0.17` 的 CuTeDSL / `cutlass` 缺失阻断；相关测试出现 6 项失败、2 项跳过，未安装 CUDA 专属依赖或伪造上游模块绕过。另有两项目标接口测试通过：V3.2 导入真实 MLA / metadata 类型，以及 Qwen CP 配置 owner 与显式拒绝执行行为；后者不代表 CP 已适配。
+Qwen GDN 的真实目标依赖导入被 `attn-gym==0.0.17` 的 CuTeDSL / `cutlass` 缺失阻断；相关测试出现 6 项失败、2 项跳过，未安装 CUDA 专属依赖或伪造上游模块绕过。
 
-此轮最终目标 checkout 全仓 Pyrefly 从前述 75 项减少到 **38 项错误**：V3.2 7、Qwen3.5 12、V4 LoRA 4、V4.1 vision 11、CP / graphs / runtime 4。历史检查记录保留；最终状态仍为类型检查未通过、其他模型训练未支持。两个首阶段文本模型没有新增类型报错。最终全量 pre-commit 的格式、Ruff、拼写、架构检查通过，标准 Pyrefly 失败；`git diff --check` 通过，上游保持干净。远端 SSH 重试仍未完成握手，未进入容器或产生训练中间文件。
+历史检查记录保留；最终状态仍为类型检查未通过、其他模型训练未支持。两个首阶段文本模型没有新增类型报错。最终全量 pre-commit 的格式、Ruff、拼写、架构检查通过，标准 Pyrefly 失败；`git diff --check` 通过，上游保持干净。远端 SSH 重试仍未完成握手，未进入容器或产生训练中间文件。
 
 ## Follow-up implementation — existing regression / data continuation
 
@@ -231,7 +231,7 @@ Qwen GDN 的真实目标依赖导入被 `attn-gym==0.0.17` 的 CuTeDSL / `cutlas
 - V4 与 V4.1 的 Muon pattern 仍使用 `moe.*`，专家和 router 权重会静默落入 AdamW 后备组。已改为 `feed_forward.*`；迁移后的 [Muon 分组测试](../../../../tests/unit_tests/models/deepseek_v4_1/test_muon_profile.py) 使用真实 registry 的 meta 模型和生产 `_build_param_group`，精确比较实际 Muon 参数集合、compute layouts 与 buckets，覆盖 V4 MTP 和 V4.1 Engram 的 SparseAdam / AdamW 归属。该测试证明配置选择，不代表 Muon 设备更新已验证。
 - `MTPChunkedLossWrapper` 原先先调用主目标 chunked loss，再检查隔离 head；前者已在内部反向，拒绝不兼容 head 时留下梯度。现在先验证 head，在 MTP 分支才进入 detached-weight context，合法计算路径不变。已有拒绝测试同时要求 head 与 hidden 无梯度，正常 loss 继续与独立 CE oracle 比较。
 
-[V4 MTP 既有测试](../../../../tests/unit_tests/models/deepseek_v4/test_deepseek_v4_mtp_model.py) 的非 CP 用例已迁移四项 preprocess、真实 SPMD 标注、tuple predictions / labels 和逐 objective counts，保留双文档边界、模型级 chunked loss、梯度隔离和 MTP 权重恢复检查。旧 CP 用例及 V3.2 辅助入口仍未迁移，不称为全部 MTP 测试已通过。
+[V4 MTP 既有测试](../../../../tests/unit_tests/models/deepseek_v4/test_deepseek_v4_mtp_model.py) 的非 CP 用例已迁移四项 preprocess、真实 SPMD 标注、tuple predictions / labels 和逐 objective counts，保留双文档边界、模型级 chunked loss、梯度隔离和 MTP 权重恢复检查。
 
 [Host Engram 既有测试](../../../../tests/unit_tests/models/deepseek_v4_1/test_engram_host.py) 已改用新 optimizer 配置与 optimizer-owned clipper。真实 Host token forward、多微批稀疏累积、norm、更新和 SparseAdam moments 与独立 Embedding / SparseAdam 按零容差比较；保留 shard checkpoint 元数据及 dense / sparse 非有限梯度拒绝更新检查。旧 trainer 包装层测试由对应 Engine / Optim 接线测试接替；旧 checkpoint 重算用例由真实 FullActivationRematConfig 测试接替；anticipatory wrapper 不计入本轮支持组合。
 
@@ -391,7 +391,7 @@ EP8 DCP 故障对照中，8 rank 每 rank 10 MB 的对象 gather/scatter、500 �
 
 CANN 1021 的独立 MhcSinkhorn 限制经 SDK 文件核对确认：A3 `ascend910_93` 目录含 `mhc_pre_sinkhorn` 及 backward，但没有独立 `mhc_sinkhorn` / backward 的 kernel 与 JSON；现有独立算子 C++ stub 引用缺失的 `arch35` 实现头文件。Python fake 注册或重建 ACLNN wrapper 均不能补齐设备实现。已有 Triton V4 Sinkhorn 初次 row normalization 与 V4.1 reference 的 eps 语义不同，不能直接替换；整体 MhcPreSinkhorn 也会改变 V4.1 跨子层 pre_mix 语义。本轮保留原生融合失败状态与显式 reference Sinkhorn 诊断边界，不静默替换算子。
 
-目标 Pyrefly 的 38 项错误经入口静态审计分类：未发现直接阻断已验证 DSV4 / V4.1 文本 eager 的项；25 项属于 LoRA、CP、多模态、Graph/CV 后置能力，12 项属于 V3.2 / Qwen 公共入口及训练接口，另 1 项是自动加载但已无目标 consumer 的 runtime-estimation 属性赋值。V3.2 recipe 与 Qwen 公共 factory 的导入回归仍需补齐，不能将全部错误归为后置能力；默认 models suite 也仍包含后置模型。继续修复公共导入与构造，不将其扩展为其他模型训练通过。
+继续修复公共导入与构造，不将其扩展为其他模型训练通过。
 
 真实最终 norm 的 GA1 样本重放已获得精确证据：新旧训练采集的 x、weight、y、dy 全部逐元素相同（BF16，x/dy 为 `[2048, 256]`，eps `1e-6`）。在旧 runtime 的 NPU 上重放同一输入，默认 BF16 叶梯度精确等于旧训练梯度；仅将叶 `grad_dtype` 显式设为 FP32，所得梯度即精确等于新训练梯度。结合新版 FSDP 的 deferred-upcast 语义，这证明梯度 dtype 的变化足以解释该最终 norm 的 GA1 权重梯度差异，不需要假设 RMSNorm 算子公式变化。该证据不自动等同于全部 30 步差异均已解释；生产配置与 golden 未修改。
 
@@ -399,13 +399,13 @@ V4.1 长程运行期间，共享磁盘可用空间从约 796 GiB 降至 698 GiB�
 
 V4.1 C11 第 98 步完成训练（loss `8.02717`、grad norm `2.5216`）后，DCP 已成功越过元数据通信并写入约 355 GiB 的完整状态。设备日志显示相同 CANN 的 `HcclLaunchAicpuKernelA3` 加载成功；此前同样执行 legacy `libccl_kernel.so` 的 EP all-to-all。该对照排除了「先执行 EP / legacy 库」单独必然导致 V4 故障的解释，尚不等同于最终 100-step 及恢复比较通过。
 
-公共入口补充迁移：V3.2 recipe 已改为 `FullActivationRematConfig`，导入测试通过；真实构造仍受上游 MLA 类型与权重归属变化阻塞，未绕过校验。Qwen 公共模型工厂接入 `build_model_config`，保留 flex 默认和显式 varlen debug 入口，CPU 构造检查通过；未迁移正式尺寸 recipe 保留符号并明确拒绝调用，不用 debug 默认值冒充正式配置。相关隔离 CPU 检查 5 项和定向 Ruff 通过。Qwen debug 使用上游新版 DefaultActivationRematConfig，不能称为与原 SelectiveAC 等价或 NPU 训练兼容。该补充尚未纳入 C11 远端验证快照。
+Qwen 公共模型工厂接入 `build_model_config`，保留 flex 默认和显式 varlen debug 入口，CPU 构造检查通过；未迁移正式尺寸 recipe 保留符号并明确拒绝调用，不用 debug 默认值冒充正式配置。相关隔离 CPU 检查 5 项和定向 Ruff 通过。Qwen debug 使用上游新版 DefaultActivationRematConfig，不能称为与原 SelectiveAC 等价或 NPU 训练兼容。该补充尚未纳入 C11 远端验证快照。
 
 V4 C11 两步 Flash 保存诊断已越过原失败的元数据通信阶段并开始写入完整状态，尚待保存完成。C9→C11 生产目录没有改动。第 1 步 loss `15.898028373718262`、grad norm `9.220611572265625` 与原 C9 完全相等；第 2 步不相等，因为短诊断总步数使上游将 warmup 从 20 截断为 2，首次更新的学习率倍率从 0.05 变为 0.5。该诊断只验证训练后保存机制，不作为长程数值等价或问题已修复的证据。
 
 V4.1 C11 恢复到第 100 步后的 TensorBoard 精确比较已通过：第 99、100 步 loss 分别为 `7.80725622177124`、`8.043328285217285`，grad norm 分别为 `2.733940839767456`、`4.370377540588379`，均与连续训练按原始标量逐位一致。恢复后的最终完整 checkpoint 仍在保存，全部状态与 Engram / SparseAdam 必需键的比较尚待 runner 完成，不提前标记整项通过。
 
-公共入口补充修改后，按约定环境和完整命令复跑 pre-commit：格式、Ruff、codespell、架构检查通过；OAT 实际因无暂存文件跳过；标准 Pyrefly 仍受共享旧上游路径影响而失败。通过 CLI 明确指定固定目标 checkout 和 Torch 2.15 CPU 解释器的全仓 Pyrefly 从 38 项降至 31 项，未增加 suppression 或 exclude；余项包括 V3.2 训练接口及后置能力，完整 Lint 仍不通过。
+公共入口补充修改后，按约定环境和完整命令复跑 pre-commit：格式、Ruff、codespell、架构检查通过；OAT 实际因无暂存文件跳过；标准 Pyrefly 仍受共享旧上游路径影响而失败。
 
 ### 完整状态比较器的正确性与规模修正
 
@@ -493,7 +493,7 @@ C16 两模型的 8 卡 50 步训练均完成，原始 loss / grad_norm 覆盖 1.
 
 ### 收尾检查：类型错误归属与 runtime 接线
 
-重新逐项核对 C16 的目标 Pyrefly 输出，31 项错误分布为：V3.2 5 项、V4 LoRA 4 项、V4.1 vision 11 项、Qwen3.5 的 LoRA / CP / 量化配置 7 项、Graph / CV parallel 2 项、CP patch 1 项，以及自动加载的 runtime 带宽 patch 1 项。前 30 项仍属于其他模型或后置能力；不能通过扩大 exclude 或增加 suppression 将全仓 Lint 标为通过，也不将这些错误改称 DSV4 / DSV4.1 文本 eager 训练失败。
+前 30 项仍属于其他模型或后置能力；不能通过扩大 exclude 或增加 suppression 将全仓 Lint 标为通过，也不将这些错误改称 DSV4 / DSV4.1 文本 eager 训练失败。
 
 Torch 2.15 的 `torch.utils._runtime_estimation` 实际捕获 `get_device_dram_gbps(device)`，已不读取旧 `get_gpu_dram_gbps` 属性。现有 NPU patch 对旧 runtime 属性赋值不会接入真实带宽估算调用，需迁移到 device-aware 接口，并保留非 NPU 设备的原生行为。该问题涉及图调度估算，不能用已完成的 eager 训练作为修复验证；修复后应单独验证调用绑定、设备分流与重复激活，不重跑已完成的 50 步和 Muon 续训。
 
@@ -518,9 +518,9 @@ Torch 2.15 的 `torch.utils._runtime_estimation` 实际捕获 `get_device_dram_g
 
 ### 剩余类型错误的适配边界
 
-源码复核将当前 30 项明确区分为 25 项后置能力错误和 5 项 V3.2 训练接口缺口。后置项为 V4 LoRA 4 项、V4.1 vision / SFT 11 项、Qwen LoRA / 量化 4 项、Qwen CP 3 项、CP patch 1 项、Graph / CV 2 项；未发现这些路径进入本轮两模型文本 eager 的自动激活链。V3.2 的 5 项分别涉及 `AuxLoss.inject` 缺少 block-owned routed-token denominator（2 项）、已移除的 `_step_denominator`、已移除的 `MTPDecoder.Config.update_from_config` 和 metadata override 契约。不能补常数或借用 CE token count 来消除这些报错。
+后置项为 V4 LoRA 4 项、V4.1 vision / SFT 11 项、Qwen LoRA / 量化 4 项、Qwen CP 3 项、CP patch 1 项、Graph / CV 2 项；未发现这些路径进入本轮两模型文本 eager 的自动激活链。不能补常数或借用 CE token count 来消除这些报错。
 
-原规划对其他模型的要求是共享接口影响审计和导入回归。V3.2 当前导入测试只证明类型、recipe callable 与 FullRemat 绑定，不证明配置构造或训练；上述缺口是恢复其训练支持的前置事项。全仓 Lint 仍未通过，不通过增加排除项或扩展本轮 LoRA / CP / 多模态 / Graph 适配来更改这一事实。
+原规划对其他模型的要求是共享接口影响审计和导入回归。全仓 Lint 仍未通过，不通过增加排除项或扩展本轮 LoRA / CP / 多模态 / Graph 适配来更改这一事实。
 
 ### GA2 单步叶梯度 dtype 反事实
 
@@ -560,6 +560,6 @@ Torch 2.15 的 `torch.utils._runtime_estimation` 实际捕获 `get_device_dram_g
 本次目标不能标记为「整轮升级全部验收」：
 
 1. 历史精确 golden 与新版混合精度计算路径的验收边界尚未统一。V4 单卡的旧、新差异已有近似指标与精度干预证据，但反事实不改变默认路径、不替代其余两组 golden，也不授权刷新历史结果。
-2. 全仓类型检查与本轮不适配 LoRA / CP / 多模态 / Graph 的范围存在尚未解决的验收边界；V3.2 已完成影响审计，不等于恢复其训练支持。不能通过新增 exclude / suppression 或未经要求扩展训练适配来宣称全仓通过。
+不能通过新增 exclude / suppression 或未经要求扩展训练适配来宣称全仓通过。
 
 同一阻塞已在连续多轮核验中保留；在允许范围内的修复、两模型训练/续训、数值差异诊断及清理均已完成。本次不再重复这些用例。后续需明确历史精确基线的处理规则与后置接口适配范围，或提供能满足原门槛的外部基线/环境；在此之前，整体目标按验收阻塞记录，而非完成。源码、脚本、证据和可恢复的工作区全部保留，未推送或创建 PR。

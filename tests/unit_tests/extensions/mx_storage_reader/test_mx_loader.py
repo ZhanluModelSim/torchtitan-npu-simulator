@@ -275,8 +275,8 @@ def test_ao_components_resolved_by_dtype(ao_module, cpu_npu_boundary, tmp_path):
 
 
 @pytest.mark.parametrize("weight_format", ["mxfp4", "mxfp8", "bf16", "block-fp8"])
-def test_only_v4_selects_mx_reader(reader_module, monkeypatch, tmp_path, weight_format):
-    # Isolate model imports; execute the real V4/V3.2 adapter classes and MX reader.
+def test_v4_selects_mx_reader(reader_module, monkeypatch, tmp_path, weight_format):
+    # Isolate model imports; execute the real V4 adapter class and MX reader.
     fallback = object()
 
     class V3Adapter:
@@ -322,19 +322,13 @@ def test_only_v4_selects_mx_reader(reader_module, monkeypatch, tmp_path, weight_
         sys.modules["_mx_test_components.ao_hf_storage"],
     )
     root = Path(__file__).resolve().parents[4] / "torchtitan_npu/models"
-    classes = []
-    for model, class_name in (
-        ("deepseek_v4", "DeepSeekV4StateDictAdapter"),
-        ("deepseek_v3_2", "DeepSeekV32StateDictAdapter"),
-    ):
-        spec = importlib.util.spec_from_file_location(
-            f"_mx_test_components.{model}", root / model / "state_dict_adapter.py"
-        )
-        module = importlib.util.module_from_spec(spec)
-        monkeypatch.setitem(sys.modules, spec.name, module)
-        spec.loader.exec_module(module)
-        classes.append(getattr(module, class_name))
-    v4, v32 = classes
+    spec = importlib.util.spec_from_file_location(
+        "_mx_test_components.deepseek_v4", root / "deepseek_v4" / "state_dict_adapter.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, module)
+    spec.loader.exec_module(module)
+    v4 = module.DeepSeekV4StateDictAdapter
     dtype = {
         "mxfp4": torch.uint8,
         "mxfp8": torch.float8_e4m3fn,
@@ -355,4 +349,3 @@ def test_only_v4_selects_mx_reader(reader_module, monkeypatch, tmp_path, weight_
     else:
         assert reader is fallback
     assert V3Adapter.get_hf_storage_reader is original
-    assert v32.get_hf_storage_reader is original

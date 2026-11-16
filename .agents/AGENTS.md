@@ -15,14 +15,14 @@
 
 5. **保护已验证的代码路径。** 修改已收敛的代码时务必谨慎。标记可能导致现有用户代码或 checkpoint 静默失效的改动。存疑时主动询问。
 
-6. **审计所有调用点。** 修改共享代码（公共模型组件、配置字段、分布式工具）时，检查并更新所有调用点，包括当前维护的 DeepSeek-V3.2、DeepSeek-V4、对应 override 和 patch 注册入口。
+6. **审计所有调用点。** 修改共享代码（公共模型组件、配置字段、分布式工具）时，检查并更新所有调用点，包括当前维护的所有模型、对应 override 和 patch 注册入口。
 
 ## 插件仓专属原则
 
 1. **不修改上游 checkout。** torchtitan-npu 不直接编辑 torchtitan 源码。适配按职责放入以下位置：
    - **Package patch**（`torchtitan_npu/patches/`）：补齐 PyTorch PrivateUse1 backend，或替换当前运行时中缺失的 Python/CANN 符号。`patches/torchtitan/` 只允许有上游依据的临时 patch；`patches/torch_npu/` 用于当前有效的 NPU runtime compatibility patch
    - **配置级 override**（`torchtitan_npu/override/`）：使用 `@override` 声明组件替换，通过 `override.imports` 显式启用
-   - **模型模块**（`torchtitan_npu/models/`）：提供 DeepSeek-V3.2 和 DeepSeek-V4 的模型配置、并行化与 checkpoint 适配
+   - **模型模块**（`torchtitan_npu/models/`）：提供相关的模型配置、并行化与 checkpoint 适配
    - **NPU 算子**（`torchtitan_npu/ops/`）：封装 CANN 或设备专属算子能力
 
 2. **理解 patch 生效机制。** `torchtitan_npu/__init__.py` 导入 `torchtitan_npu.patches`，后者继续导入 `torch_npu` 和 `torchtitan` 子包，因此导入 `torchtitan_npu` 即会注册或应用其中的入口 patch。只有需要随包导入生效的 patch 才应加入对应的 `__init__.py`；供模型或 override 直接复用的兼容模块按调用路径显式导入。
@@ -54,7 +54,7 @@
 | `torchtitan_npu/patches/torch_npu/` | 当前有效的 NPU runtime compatibility patch；保留其自动加载和生效时机 |
 | `torchtitan_npu/extensions/` | 永久扩展、组件集成和可选外部 adaptor |
 | `torchtitan_npu/override/` | 通过 `override.imports` 显式启用的配置级组件替换 |
-| `torchtitan_npu/models/` | DeepSeek-V3.2、DeepSeek-V4 模型配置、实现、并行化和 checkpoint 适配 |
+| `torchtitan_npu/models/` | 模型配置、实现、并行化和 checkpoint 适配 |
 | `torchtitan_npu/ops/` | CANN 与 NPU 专属算子封装 |
 | `torchtitan_npu/tools/` | 随 package 分发的 checkpoint 转换与导出工具 |
 | `tests/unit_tests/` | CPU 单测和静态契约测试 |

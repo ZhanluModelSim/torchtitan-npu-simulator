@@ -25,7 +25,6 @@ from pathlib import Path
 
 # torchtitan-npu override: the runner consumes the case definition at runtime.
 from tests.integration_tests import OverrideDefinitions  # noqa: TC001
-from tests.integration_tests.deepseek_v3_2 import build_deepseek_v3_2_test_list
 from tests.integration_tests.deepseek_v4 import (
     build_deepseek_v4_checkpoint_resume_test_list,
     build_deepseek_v4_quantized_test_list,
@@ -67,7 +66,6 @@ def build_models_test_list() -> list[OverrideDefinitions]:
         + build_deepseek_v4_1_test_list()
         + build_deepseek_v4_1_golden_test_list()
         + build_deepseek_v4_1_reference_multimodal_test_list()
-        + build_deepseek_v3_2_test_list()
         + build_qwen3_5_test_list()
     )
 
@@ -85,10 +83,9 @@ def build_engram_cp_test_list():
     return build()
 
 
-# torchtitan-npu override: register the DeepSeek-V4, V4.1 and V3.2 NPU suites.
+# torchtitan-npu override: register the DeepSeek-V4 and V4.1 NPU suites.
 _TEST_SUITES_FUNCTION = {
     "models": build_models_test_list,
-    "deepseek_v3_2": build_deepseek_v3_2_test_list,
     "deepseek_v4": build_deepseek_v4_test_list,
     "deepseek_v4_1": build_deepseek_v4_1_test_list,
     "deepseek_v4_1_checkpoint": build_deepseek_v4_1_checkpoint_test_list,
@@ -655,8 +652,6 @@ def _filter_tests(
 def _migration_pending_reason(case: OverrideDefinitions) -> str | None:
     if any(modality in case.test_name for modality in ("vision", "multimodal")):
         return "vision migration is outside the current text migration"
-    if case.test_name.startswith("dsv3_2_"):
-        return "DeepSeek-V3.2 model boundary still requires the folded-token migration"
     arguments = {arg for phase in case.override_args for arg in phase}
     uses_muon = bool(arguments & {"--optimizer.name=Muon", "--optim.optimizer.name=Muon"})
     if uses_muon and "--training.enable-cpu-offload" in arguments:

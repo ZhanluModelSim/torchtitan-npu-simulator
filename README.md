@@ -70,7 +70,6 @@ pip install -e .
 
 完整训练配置位于 [`torchtitan_npu_recipes`](torchtitan_npu_recipes/README.md)，自定义训练组合见 [Python 配置指南](docs/developer_guides/python_recipes.md)。
 
-
 <a id="特性支持概览"></a>
 
 # 特性支持概览
@@ -255,7 +254,7 @@ torchtitan-npu/
 │   │   ├── mx_storage_reader/     # MX 量化权重读取能力
 │   │   └── novaswap/              # NovaSwap 显存交换扩展
 │   ├── override/                  # 配置级组件替换，含 common 与模型专属目录
-│   ├── models/                    # 模型实现与并行化（DeepSeek-V3.2/V4/V4.1、Qwen3.5）
+│   ├── models/                    # 模型实现与并行化（DeepSeek-V4/V4.1、Qwen3.5）
 │   ├── ops/                       # CANN 与 NPU 专属算子封装
 │   │   ├── ascendc/               # AscendC 算子适配（导入时自动加载）
 │   │   ├── misc/                  # 杂项算子
@@ -293,7 +292,6 @@ System: Ascend 950，图模式
 | [DeepSeek-V4-Flash](torchtitan_npu/models/deepseek_v4/config_registry.py) | 64 | QAT | 512 | 4k | 64 | 1 | 1 | 1 | 64 | 1576 | 20.79 s | / |
 | [DeepSeek-V4-Flash](torchtitan_npu/models/deepseek_v4/config_registry.py) | 64 | QAT | 64 | 64k | 8 | 1 | 1 | 8 | 64 | 1532 | 42.78 s | / |
 
-
 # 免责声明
 
 ---
@@ -305,7 +303,6 @@ System: Ascend 950，图模式
 3. 如您在使用 torchtitan‑npu 过程中，发现任何问题（包括但不限于功能问题、合规问题），请在 GitCode 提交 issue，我们将及时审视并解决。
 
 torchtitan‑npu 功能依赖的 PyTorch 等第三方开源软件，均由第三方社区提供和维护，因第三方开源软件导致的问题的修复依赖相关社区的贡献和反馈。您应理解，torchtitan‑npu 仓库不保证对第三方开源软件本身的问题进行修复，也不保证会测试、纠正所有第三方开源软件的漏洞和错误。
-
 
 # License 声明
 

@@ -79,11 +79,6 @@ torchtitan_npu/override/
 │   ├── __init__.py
 │   ├── checkpoint.py
 │   └── validation.py
-├── deepseek_v3_2/
-│   ├── __init__.py
-│   └── sparse_attn/
-│       ├── __init__.py
-│       └── ascendc.py
 └── deepseek_v4/
     ├── __init__.py
     ├── mhc/
@@ -176,7 +171,6 @@ import torch_npu
 from torchtitan.config import derive, override
 from torchtitan.models.common.nn_modules import RMSNorm
 
-
 class AscRMSNorm(RMSNorm):
     @dataclass(kw_only=True, slots=True)
     class Config(RMSNorm.Config):
@@ -184,7 +178,6 @@ class AscRMSNorm(RMSNorm):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return torch_npu.npu_rms_norm(x, self.weight, self.eps)[0]
-
 
 @override(
     target=RMSNorm.Config,
@@ -311,25 +304,6 @@ Virtual Optimizer 使用 NPU swap memory 保存 Adam/AdamW 的 `exp_avg` 和
 作用于不同的配置节点；checkpoint 逻辑是 Virtual Optimizer 的保存兼容处理，不是独立
 checkpoint 特性。完整的数据流、支持范围和限制见
 [Virtual Optimizer 特性说明](../../docs/feature_guides/virtual_optimizer.md)。
-
-### DeepSeek-V3.2
-
-以下入口省略 `torchtitan_npu.override.deepseek_v3_2.` 前缀：
-
-| 入口 | Target | Replacement |
-| --- | --- | --- |
-| `sparse_attn.asc` | `SparseInnerAttention.Config` | `AscSparseInnerAttention.Config` |
-
-TND 稀疏注意力只需要 `sparse_attn.asc`：注意力内核与它消费的 TND metadata 同属一个
-backend，metadata 由被替换的 `AscSparseInnerAttention.Config.build_attention_metadata`
-直接构建（upstream PR #4897 的 backend-owned 接缝），不再有单独的 metadata 入口。
-
-```text
-torchtitan_npu.override.deepseek_v3_2.sparse_attn.asc
-```
-
-`sparse_attn.asc` 会同时把嵌套的 `SparseIndexerLoss.Config` 派生为
-`AscSparseIndexerLoss.Config`。
 
 ### DeepSeek-V4
 

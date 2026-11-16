@@ -4,7 +4,6 @@
 
 | 入口 | 配置归属 |
 | --- | --- |
-| `torchtitan_npu_recipes.models.deepseek_v3_2` | V3.2 训练配置 |
 | `torchtitan_npu_recipes.models.deepseek_v4` | V4 eager、SFT、LoRA 和 TorchFT 配置工厂 |
 | `torchtitan_npu_recipes.models.deepseek_v4_1` | V4.1 文本、多模态和 LoRA 配置工厂 |
 | `torchtitan_npu_recipes.models.qwen3_5` | Qwen 配置工厂 |

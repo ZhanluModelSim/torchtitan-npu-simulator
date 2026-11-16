@@ -550,7 +550,7 @@ def run_sparse_flash_mla(
 class AscCompressedSparseInnerAttention(CompressedSparseInnerAttention):
     """Run SMLA/SMLAG in a local TND layout, consuming the selector's selection.
 
-    The flow mirrors ``AscSparseInnerAttention`` (dsv3.2): the core reads this geometry's
+    The core reads this geometry's
     frames (queries on this rank's chunks) and calls the AscendC ops directly.  The selector's
     forward/backward is **not** here: it is the separate ``lightning_indexer.asc`` override,
     which emits ``topk_indices`` and the teacher carrier.  This core consumes both, and its

@@ -49,9 +49,6 @@ collect_ignore = [
     "config/test_configs.py",
     "config/test_muon_profile_contract.py",
     "models/common/test_deepseek_cp_config.py",
-    # DeepSeek-V3.2 folded-token migration is deferred.
-    "models/deepseek_v3_2",
-    "models/deepseek_v3_2/test_deepseek_v32_mtp_model.py",
     "models/test_mtp_cp_chunk_loss.py",
     # CP metadata rebuild tests wait for the v0.4 context-parallel transform.
     "override/deepseek_v4_1/test_asc_metadata_reuse.py",
@@ -115,17 +112,6 @@ _DEFERRED_VISION_TESTS = {
 }
 
 
-# DeepSeek-V3.2 still forwards the pre-fold ``[B, L, ...]`` layout against the
-# folded pinned upstream. This test crosses the unmigrated seam: the decoder
-# config's context-length knob. Match the integration runner's dsv3_2 deferral
-# until the folded-token migration lands.
-_DEFERRED_DSV32_FOLD_TESTS = {
-    "models/test_mtp_cp_chunk_loss.py": {
-        "test_dsv32_mtp_keeps_community_cp_restriction",
-    },
-}
-
-
 def pytest_collection_modifyitems(items):
     for item in items:
         if not item.path.is_relative_to(_REPO / "tests/unit_tests"):
@@ -164,10 +150,6 @@ def pytest_collection_modifyitems(items):
                 is_vision = False
         if is_vision:
             item.add_marker(pytest.mark.skip(reason="vision migration is outside the current text migration"))
-        if getattr(item, "originalname", item.name) in _DEFERRED_DSV32_FOLD_TESTS.get(relative_path, ()):
-            item.add_marker(
-                pytest.mark.skip(reason="DeepSeek-V3.2 model boundary still requires the folded-token migration")
-            )
         # These legacy suites still consume removed optimizer interfaces.
         # Do not hide new Muon behavior tests by matching their names globally.
         migrated_muon_config_test = (

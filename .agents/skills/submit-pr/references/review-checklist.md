@@ -36,7 +36,7 @@
   前缀。
 - 用户可见的错误使用 `ValueError`；内部不变量使用 `assert`；分布式代码中显式验证
   mesh、placement 和配置。
-- 修改共享代码时，检查所有调用点，包括 DeepSeek-V3.2、DeepSeek-V4、override 和
+- 修改共享代码时，检查所有调用点，包括 DeepSeek-V4、override 和
   patch 注册入口。
 
 ## 3. 精简和注释

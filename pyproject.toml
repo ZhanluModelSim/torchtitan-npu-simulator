@@ -53,10 +53,6 @@ project-excludes = [
     # Kernel DSL tensor annotations are not Python type annotations.
     "torchtitan_npu/ops/pypto", "torchtitan_npu/ops/pypto_pro",
     "torchtitan_npu/ops/triton", "torchtitan_npu/ops/tilelang",
-    # Re-enable with the DeepSeek-V3.2 folded-token model migration: the model and
-    # its override still use the pre-0.4 attention-mask and aux-loss APIs.
-    "torchtitan_npu/models/deepseek_v3_2/**",
-    "torchtitan_npu/override/deepseek_v3_2/**",
 ]
 ignore-missing-imports = [
     "attn_gym",

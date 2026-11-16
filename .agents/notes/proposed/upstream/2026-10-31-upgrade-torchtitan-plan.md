@@ -101,9 +101,9 @@
 - NPU Linear、LoRA 和量化实现接入 `_linear`；NPU GMM 接入 `_grouped_mm(input_RI, weight_EOI, offsets_E)`。TP/SP 通信由上游外层负责，避免漏通信或重复通信。
 - SwiGLU/clamp 接入 activation 配置；移除 `GroupedExperts`、`inner_experts` 和旧参数名依赖。
 - 保留本地 DSV 路由分数在 **W2 前相乘并回到 BF16** 的语义；dispatcher combine 不得再次乘分数。上游 W2 后的 `output_postprocess` 不能替代此行为。
-- Router 改用类型化 activation 配置；DSV3.2 继承新的分组路由实现，V4/V4.1 删除对通用 router 已移除字段的访问。
+- Router 改用类型化 activation 配置；V4/V4.1 删除对通用 router 已移除字段的访问。
 - 全部 transformer/MTP 路径传递真实 `padding_mask`；padding 不计入负载统计和辅助损失，但不能破坏 dispatch map。
-- 统一使用上游 AuxLoss，迁移 DSV3.2 indexer loss、metrics 和 anticipatory 快照，避免两套分母与累加器并存。
+- 统一使用上游 AuxLoss，迁移 metrics 和 anticipatory 快照，避免两套分母与累加器并存。
 - 更新 HF adapter、Muon 参数筛选、初始化、量化白名单和 LoRA target，确保它们共同使用新 FQN。
 
 新分组线性层的存储与计算视图见 [GroupedLinear](/home/wdy/project/train/tt-lite/adapt_tt_ebdfc8/torchtitan/torchtitan/models/common/linear.py:232)。
@@ -213,7 +213,7 @@
 | 安装与配置 | 固定 SHA、运行依赖、默认 import、所有现有 recipe/override、可选组件 | 无过期模块引用；配置字段不丢失；可选组件不阻断默认启动 |
 | CPU 行为 | 配置转换、参数归属、FQN、HF roundtrip、LoRA trainable 集合、tying、microbatch、metadata permutation | 验证实际行为，不以符号存在或 mock 导入替代 |
 | NPU 算子 | dense/grouped W13、SwiGLU clamp、pre-W2 score、router、packed attention、GDN | 前向与关键梯度满足相应数值标准 |
-| 模型训练 | DSV3.2、V4、V4.1 文本/视觉、Qwen3.5 dense/MoE、现有 Qwen3.6 launcher 的实际配方 | 每条既有能力有明确结果；基线未验证项单独标记 |
+| 模型训练 | V4、V4.1 文本/视觉、Qwen3.5 dense/MoE、现有 Qwen3.6 launcher 的实际配方 | 每条既有能力有明确结果；基线未验证项单独标记 |
 | 并行 | 当前支持的 DP/HSDP、TP/SP、EP、CP、PP 组合，CPU offload、Engram | 无 collective 次序错误；参数与梯度 placement 正确 |
 | Graph/AC | eager、FullAC、SelectiveAC、GraphTrainer；累积 1/>1、overlap、CV、校准 | 状态更新次数正确，校准无训练副作用，无 handle/显存持续增长 |
 | 保存与恢复 | 新 DCP 同步/异步、EMA、AdamW/Muon、HostSparse、LoRA、量化、hash | 重启后的下一步与连续运行一致；坏 hash 明确拒绝 |
@@ -266,7 +266,6 @@
 - **处理方向：** 在恢复运行支持前增加明确的未迁移入口检查；随后围绕目标版本的 FT engine 接入 NPU/HCCL 恢复，迁移状态 owner 与 `TrainingMicrobatch`，删除旧训练循环。保持跨副本指标 collective 先于提交投票、失败尝试不推进训练状态的原有约束。
 - **完成条件：** 实际创建 FT engine；正常 step、失败回滚、重试和 rank 重入均进入新路径；验证失败尝试不推进 optimizer、LR、训练步数或数据位置，并验证 checkpoint 恢复。恢复被延期的 TorchFT 测试收集后，执行真实 NPU/HCCL 验证。
 - **代码依据：** [TorchFT trainer](../../../../torchtitan_npu/extensions/torchtitan/experiments/torchft/trainer.py)、[恢复逻辑](../../../../torchtitan_npu/extensions/torchtitan/experiments/torchft/recovery/step_recovery.py)、[测试延期清单](../../../../tests/unit_tests/conftest.py)。
-
 
 ## 7. 阶段四、五实施范围（2026-11-02）
 

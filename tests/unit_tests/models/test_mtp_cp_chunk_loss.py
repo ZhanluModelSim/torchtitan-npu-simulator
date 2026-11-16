@@ -10,16 +10,12 @@ from importlib import import_module
 
 import pytest
 import torch
-from torchtitan.config.parallelism import ParallelismConfig
-from torchtitan.config.validation import validate_context_parallel
 
-from torchtitan_npu.models.deepseek_v3_2 import model_registry as deepseek_v3_2_model_registry
 from torchtitan_npu.models.deepseek_v4.mtp import (
     MTPChunkedLossWrapper,
     MTPModelOutput,
     prepare_mtp_batch,
 )
-from torchtitan_npu_recipes.models.deepseek_v3_2 import deepseek_v3_2_debugmodel
 from torchtitan_npu_recipes.models.deepseek_v4 import deepseek_v4_debugmodel
 
 _community_loss = import_module("torchtitan.components.loss")
@@ -48,13 +44,6 @@ def test_dsv4_mtp_batch_precedes_cp_sharding():
     assert prepared_local[1] != incorrectly_rolled_local[1]
 
 
-def test_dsv32_default_config_disables_mtp():
-    config = deepseek_v3_2_debugmodel()
-
-    assert not config.model.mtp_layers
-    assert isinstance(config.loss, _community_loss.ChunkedLossWrapper.Config)
-
-
 def test_dsv3_mtp_uses_community_implementation():
     # ``MTPDecoder.forward`` is the one community method this repository
     # patches: the pinned 0.3.0 decoder has no per-layer attention-metadata
@@ -67,17 +56,6 @@ def test_dsv3_mtp_uses_community_implementation():
         "torchtitan_npu.patches.torchtitan.models.deepseek_v3.mtp",
     )
     assert _community_mtp.MTPLoss.__call__.__module__ == "torchtitan.models.deepseek_v3.mtp"
-
-
-def test_dsv32_mtp_keeps_community_cp_restriction():
-    parallelism = ParallelismConfig(context_parallel_degree=2)
-    model_config = deepseek_v3_2_model_registry(
-        "debugmodel",
-        num_mtp_layers=1,
-        parallelism=parallelism,
-    )
-    with pytest.raises(ValueError, match="must use CPInnerAttention"):
-        validate_context_parallel(model_config, parallelism)
 
 
 def test_dsv4_mtp_rejects_cp_configuration():

@@ -25,7 +25,7 @@
 torchtitan_npu.override.<scope>.<target>.<variant>
 ```
 
-- `scope`：`common` 或模型名（如 `deepseek_v3_2`、`deepseek_v4`）。只依赖 `torchtitan`
+- `scope`：`common` 或模型名（如 `deepseek_v4`）。只依赖 `torchtitan`
   公共组件的实现放在 `common/`；依赖模型专属配置、布局或 metadata 的实现放在模型目录。
 - `target`：被替换对象的语义名称，使用 `snake_case`，例如 `rms_norm`、`sparse_attn`、`mhc`。
 - `variant`：实现或行为。常用取值如下。
@@ -88,9 +88,6 @@ torchtitan_npu/override/<scope>/<target>/
 
 当前实现示例：
 
-- DeepSeek-V3.2 的 `AscSparseInnerAttention.Config.build_attention_metadata` 把公共的 varlen
-  layout 包成 `AscVarlenMetadata` 并读出 TND 需要的 host 序列长度；`sparse_attn.asc` 调用
-  `torch_npu.npu_lightning_indexer` 和 `torch_npu.npu_sparse_flash_attention`。
 - DeepSeek-V4.1 的 `AscV41SparseAttention.Config.build_attention_metadata` 建**这个几何自己**的
   entry：参考后端的 builder 给出整行的 document 边界与按自身 `compress_ratio` 折好的 `cu_seq_k`
   （池化轴，折一次，消费者不再除），端口在这两个 grid 上加自己的三个 kernel frame（`q` /
@@ -143,7 +140,6 @@ import torch_npu
 from torchtitan.config import derive, override
 from torchtitan.models.common.nn_modules import RMSNorm
 
-
 class AscRMSNorm(RMSNorm):
     @dataclass(kw_only=True, slots=True)
     class Config(RMSNorm.Config):
@@ -151,7 +147,6 @@ class AscRMSNorm(RMSNorm):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return torch_npu.npu_rms_norm(x, self.weight, self.eps)[0]
-
 
 @override(
     target=RMSNorm.Config,
@@ -198,8 +193,6 @@ python -m torchtitan_npu.train \
 
 多个 override 是否能同时启用取决于实际声明的配置节点，而不是模块路径是否不同：
 
-- DeepSeek-V3.2 只需启用 `sparse_attn.asc`：attention 与它自己的 TND metadata 同属一个
-  backend，metadata 由被替换的 config 直接构建，不再有单独的 metadata 入口。
 - DeepSeek-V4.1 的 `sparse_attn.asc` 同时替换 attention 并构建它自己的 metadata，
   没有单独的 metadata 入口；五个几何数是替换后 config 的必填字段，由该入口的参数写入
   （默认值为 V4.1-Flash 形状）。本入口不声明量化：量化 selector 的 metadata 由量化后的 attention
@@ -251,7 +244,6 @@ python -m torchtitan_npu.train \
 ## 参考实现
 
 - [`override/README.md`](../../torchtitan_npu/override/README.md)：override 机制、入口和当前清单。
-- [`deepseek_v3_2/sparse_attn`](../../torchtitan_npu/override/deepseek_v3_2/sparse_attn)：TND metadata 与 AscendC DSA。
 - [`deepseek_v4/sparse_attn`](../../torchtitan_npu/override/deepseek_v4/sparse_attn)：AscendC 与 PyPTO DSA。
 - [`deepseek_v4/mhc`](../../torchtitan_npu/override/deepseek_v4/mhc)：AscendC 与 Triton 多后端替换。
 - [`torchtitan_npu/override/common/token_dispatcher.py`](../../torchtitan_npu/override/common/token_dispatcher.py)：`token_dispatcher.asc` 在 `AllToAllTokenDispatcher` 中替换局部 dispatch/combine 计算。

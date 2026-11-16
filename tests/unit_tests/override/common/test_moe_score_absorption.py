@@ -44,20 +44,6 @@ def test_deepseek_v4_enables_score_absorption_for_standard_dispatch():
     assert all(config.token_dispatcher.absorb_router_scores for config in routed_configs)
 
 
-@pytest.mark.skip(reason="DeepSeek-V3.2 folded-token migration is deferred past v0.4.0")
-def test_deepseek_v3_2_enables_score_absorption():
-    from torchtitan_npu.models.deepseek_v3_2 import model_registry
-
-    model_spec = model_registry("debugmodel")
-    model = model_spec.model if hasattr(model_spec, "model") else model_spec
-    routed_configs = [
-        layer.feed_forward.routed_experts for layer in model.layers if isinstance(layer.feed_forward, MoE.Config)
-    ]
-
-    assert routed_configs
-    assert all(config.token_dispatcher.absorb_router_scores for config in routed_configs)
-
-
 def test_standard_dispatch_preserves_default_api_and_exposes_aligned_scores():
     default_dispatcher = AllToAllTokenDispatcher(AllToAllTokenDispatcher.Config(num_experts=2, top_k=2))
     absorbed_dispatcher = AllToAllTokenDispatcher(
