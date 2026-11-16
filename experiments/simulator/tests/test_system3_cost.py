@@ -66,6 +66,7 @@ def test_system3_residual_unknowns_are_control_or_view_nodes(_annotated_nodes) -
         "aten.alias.default",
         "aten.detach.default",
         "aten.expand.default",
+        "aten.new_empty_strided.default",
         "aten.permute.default",
         "aten.select.int",
         "aten.slice.Tensor",

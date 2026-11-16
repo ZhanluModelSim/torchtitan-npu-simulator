@@ -144,6 +144,43 @@ def _norm(dim: int, g: _Geometry) -> System3RMSNorm.Config:
     return System3RMSNorm.Config(dim=dim, eps=g.norm_eps)
 
 
+_FULL_GEOMETRY = _Geometry(
+    # Published-preview-shaped single-card configuration: every structural
+    # path (ISA/GDN2 units, latent MoE, Engram hash, mHC) at realistic
+    # widths; MoE sized so bf16 params + fp32 AdamW states stay well within
+    # one 910B3 (64 GB).
+    hidden_size=2048,
+    vocab_size=16384,
+    base_depth=24,
+    num_recursion=2,
+    heads=16,
+    head_dim=128,
+    qk_rope_head_dim=64,
+    rope_theta=10000.0,
+    yarn_factor=1.0,
+    yarn_original_max=4096,
+    max_seq_len=4096,
+    indexer_heads=4,
+    indexer_head_dim=64,
+    indexer_topk=64,
+    gdn2_heads=16,
+    gdn2_d_state=128,
+    gdn2_d_k=64,
+    gdn2_d_v=64,
+    gdn2_d_a=32,
+    hc_mult=2,
+    hc_branch_dim=1024,
+    num_experts=16,
+    topk=4,
+    moe_latent=512,
+    moe_inter=512,
+    engram_layers=(1, 7, 13, 19),
+    engram_heads=4,
+    engram_head_dim=64,
+    engram_rows=4096,
+)
+
+
 def _attention_config(*, layer_idx: int, g: _Geometry):
     """ISA or GDN2 attention config for one physical layer.
 
@@ -456,6 +493,7 @@ def _make_model_config(*, multimodal: bool, g: _Geometry) -> System3Model.Config
 system3_configs = {
     "debugmodel_text": lambda: _make_model_config(multimodal=False, g=_Geometry()),
     "debugmodel_multimodal": lambda: _make_model_config(multimodal=True, g=_Geometry()),
+    "full_text": lambda: _make_model_config(multimodal=False, g=_FULL_GEOMETRY),
 }
 
 
@@ -473,7 +511,13 @@ def model_registry(flavor: str) -> ModelSpec:
     )
 
 
-def _system3_trainer_config(flavor: str, *, num_mtp_layers: int = 0) -> Trainer.Config:
+def _system3_trainer_config(
+    flavor: str,
+    *,
+    num_mtp_layers: int = 0,
+    seq_len: int = 32,
+    steps: int = 10,
+) -> Trainer.Config:
     if num_mtp_layers:
         raise ValueError("system3 has no MTP modules; num_mtp_layers must be 0")
     model_spec = model_registry(flavor)
@@ -499,8 +543,8 @@ def _system3_trainer_config(flavor: str, *, num_mtp_layers: int = 0) -> Trainer.
         ),
         training=TrainingConfig(
             local_batch_size=1,
-            seq_len=32,
-            steps=10,
+            seq_len=seq_len,
+            steps=steps,
         ),
         dataloader=HuggingFaceTextDataLoader.Config(
             dataset="c4_test",
@@ -520,3 +564,8 @@ def system3_debugmodel_text(*, num_mtp_layers: int = 0) -> Trainer.Config:
 
 def system3_debugmodel_multimodal(*, num_mtp_layers: int = 0) -> Trainer.Config:
     return _system3_trainer_config("debugmodel_multimodal", num_mtp_layers=num_mtp_layers)
+
+
+def system3_full_text(*, num_mtp_layers: int = 0, seq_len: int = 2048, steps: int = 10) -> Trainer.Config:
+    """Single-card full-size text flavor for duration-grade comparisons."""
+    return _system3_trainer_config("full_text", num_mtp_layers=num_mtp_layers, seq_len=seq_len, steps=steps)
