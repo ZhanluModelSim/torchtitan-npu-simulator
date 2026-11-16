@@ -39,11 +39,16 @@ class RuntimeSession:
             from torchtitan_simulator.compat.swiglu import install_meta_swiglu_autograd
 
             self.capabilities["swiglu_meta_autograd"] = install_meta_swiglu_autograd(self.patches)
-        if prepared.trainer.model_spec.name == "kimi_k3":
+        if prepared.trainer.model_spec.name in {"kimi_k3", "kimi_k3_1"}:
             from torchtitan_simulator.compat.kimi import install_kimi_virtual_fusions
 
             install_kimi_virtual_fusions(self.patches)
             self.capabilities["kimi_virtual_fusions"] = "dispatcher Meta/autograd; legacy fusion boundaries"
+        if prepared.trainer.model_spec.name == "kimi_k3_1":
+            from torchtitan_simulator.compat.kimi_dsa import install_kimi_dsa_virtual_fusions
+
+            install_kimi_dsa_virtual_fusions(self.patches)
+            self.capabilities["kimi_dsa_virtual_fusions"] = "selected-key Meta/autograd; explicit saved output/LSE"
         imports = prepared.trainer.override.imports
         if "torchtitan_npu.override.common.rms_norm.asc" in imports:
             from torchtitan_simulator.compat.norm import install_meta_norm_autograd, install_meta_norm_buffers

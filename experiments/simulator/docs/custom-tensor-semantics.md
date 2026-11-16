@@ -34,6 +34,7 @@
 | --- | --- |
 | `kimi_sim.chunk_kda.default`、`chunk_kda_grad.default` | `KimiDeltaAttention.forward` 明确 reshape 为 B/S/H/D；beta 为 B/S/H，A_log 为 H，dt_bias 为 H×D 的展平维 |
 | `kimi_sim.fusion_attention.default`、`fusion_attention_grad.default` | `KimiGatedMLA.forward` 已转置为 B/H/S/D；value 已 padding，不能把轴大小当作未填充的 V head dimension |
+| `kimi_sim.dsa_indexer.default`、`dsa_attention.default`、`dsa_attention_grad.default` | K3.1 选取为 B/S/index-head/feature；attention 为 B/H/S/D，分别声明 QK/V 宽度、索引、真实保存的输出和 FP32 logsumexp |
 | `kimi_sim.situ_glu.default`、`situ_glu_backward.default` | 仅末轴 `feature` 在边界明确；前轴保持 `None`，兼容 dense、共享专家和 routed expert 输入 |
 | `torchtitan_npu.npu_moe_re_routing.default` | rank-major rows 转为 expert-major rows；计数矩阵为 EP rank × local expert；恢复索引为逆置换，缺 scales 时第二个输出仍为真实空张量 |
 | `torchtitan_npu.npu_moe_token_permute.default`、`npu_moe_token_permute_backward.default` | tokens 为 token × feature；indices 的公开包装契约支持 token 向量或 token × topk；输出为 routed rows |
@@ -41,11 +42,11 @@
 
 Kimi 反向节点同时声明保存输入角色、`output_gradient` 和输出梯度角色。原生 ATen、CANN、HCCL 算子不因注册本功能而新增语义轴；原生参数名绑定照常保留。控制节点及 offload payload 使用已有专属事实，不给它们猜测模型轴。
 
-本表覆盖当前 simulator 路径的六个 Kimi 虚拟融合与五个主包 MoE 包装 overload，不宣称其他未接入的 Triton、TileLang 或 DeepEP 自定义路径均已覆盖。
+本表覆盖当前 simulator 路径的九个 Kimi 虚拟融合与五个主包 MoE 包装 overload，不宣称其他未接入的 Triton、TileLang 或 DeepEP 自定义路径均已覆盖。
 
 ## 维护位置与验证
 
-Kimi 声明与定义同在 [`compat/kimi.py`](../torchtitan_simulator/compat/kimi.py)。主包包装算子的声明在 [`compat/moe_tensor_semantics.py`](../torchtitan_simulator/compat/moe_tensor_semantics.py)，依据主包 `torchtitan_npu/ops/ascendc/moe_*.py`；通过 Meta runtime 加载，主包无需依赖 simulator。注册是模块级静态声明，重复串行 runtime 不重复执行注册。
+Kimi 既有声明与定义同在 [`compat/kimi.py`](../torchtitan_simulator/compat/kimi.py)，K3.1 DSA 的三个边界位于 [`compat/kimi_dsa.py`](../torchtitan_simulator/compat/kimi_dsa.py)。主包包装算子的声明在 [`compat/moe_tensor_semantics.py`](../torchtitan_simulator/compat/moe_tensor_semantics.py)，依据主包 `torchtitan_npu/ops/ascendc/moe_*.py`；通过 Meta runtime 加载，主包无需依赖 simulator。注册是模块级静态声明，重复串行 runtime 不重复执行注册。
 
 [`capture/tensor_semantics.py`](../torchtitan_simulator/capture/tensor_semantics.py) 负责精确匹配和绑定。新增自定义边界时，应在定义处或对应兼容模块声明真实角色与轴，不能从 shape 经验分类。只有参数存在性或接口明确支持的 rank 变体可选择声明；其他未知轴保留 `None`。手工 `record_synthetic_op` 若注册此声明，调用者必须在 attrs 中显式提供准确的 `input_tensor_bindings`；当前没有需要补充的手工计算调用。
 

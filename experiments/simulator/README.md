@@ -1,6 +1,6 @@
 # TorchTitan simulator
 
-独立训练负载发生器：在 Meta 上复用原生模型、并行化、loss 和 optimizer，返回算子图、通信与控制依赖，以及静态显存预算。当前接入 DeepSeek-V4、Kimi K3 与 Qwen3-32B（dense）；性能预测、硬件配置及 DES 归下游平台。本包仅在显式调用时激活，不修改上游安装源码，生产主包不依赖 simulator。
+独立训练负载发生器：在 Meta 上复用原生模型、并行化、loss 和 optimizer，返回算子图、通信与控制依赖，以及静态显存预算。当前接入 DeepSeek-V4、Kimi K3／K3.1 与 Qwen3-32B（dense）；性能预测、硬件配置及 DES 归下游平台。本包仅在显式调用时激活，不修改上游安装源码，生产主包不依赖 simulator。
 
 ## 从哪里开始
 
@@ -12,6 +12,7 @@
 | Python／CLI 调用、只读配置目录与返回对象 | [同进程接入](docs/upstream-integration.md) |
 | 判断当前配置是否在支持范围 | [能力矩阵](docs/capability-matrix.md) |
 | Qwen3-32B dense 的路线决策、验证边界与未覆盖范围 | [Qwen3 接入说明](docs/qwen3-integration.md) |
+| Kimi K3.1 的 DSA、模型入口与参考实现边界 | [Kimi K3.1 接入说明](docs/kimi-k3-1.md) |
 
 新模型接入不能只修改 preset 或模型名白名单。应先核对配置树、runner 接口、并行和 loss 契约，再逐阶段验证；不要从历史测试数量推断新模型已支持。
 

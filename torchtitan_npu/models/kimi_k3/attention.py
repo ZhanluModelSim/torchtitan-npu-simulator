@@ -328,7 +328,8 @@ class KimiGatedMLA(_FullContextAttention):
         batch_size, seq_len, _ = hidden_states.shape
 
         # Query
-        q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
+        query_latent = self.q_a_layernorm(self.q_a_proj(hidden_states))
+        q = self.q_b_proj(query_latent)
         q = q.view(batch_size, seq_len, self.num_heads, self.q_head_dim)
         q_nope, q_rope = torch.split(q, [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
 
@@ -346,15 +347,7 @@ class KimiGatedMLA(_FullContextAttention):
         query = torch.cat([q_nope, q_rope], dim=-1)
         key = torch.cat([k_nope, k_rope_expanded], dim=-1)
 
-        # Pad v to match q_head_dim for flash attention compatibility
-        v_padded = F.pad(v, [0, self.q_head_dim - self.v_head_dim]) if self.v_head_dim != self.q_head_dim else v
-
-        # Scaled dot-product attention
-        query = query.transpose(1, 2)  # (B, H, S, D)
-        key = key.transpose(1, 2)
-        v_padded = v_padded.transpose(1, 2)
-
-        attn_output = self._attention_core(query, key, v_padded)
+        attn_output = self._compute_attention(hidden_states, query_latent, query, key, v)
         attn_output = attn_output.transpose(1, 2)  # (B, S, H, D)
 
         # Trim padding
@@ -368,6 +361,19 @@ class KimiGatedMLA(_FullContextAttention):
         attn_output = attn_output * gate
 
         return self.o_proj(self._local_context(attn_output))
+
+    def _compute_attention(
+        self,
+        hidden_states: torch.Tensor,
+        query_latent: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+    ) -> torch.Tensor:
+        """Attention extension point after shared MLA projections in B/S/H/D layout."""
+        if self.v_head_dim != self.q_head_dim:
+            value = F.pad(value, [0, self.q_head_dim - self.v_head_dim])
+        return self._attention_core(query.transpose(1, 2), key.transpose(1, 2), value.transpose(1, 2))
 
     def _attention_core(
         self,

@@ -202,6 +202,9 @@ PRESET_FACTORIES = {
     "kimi_k3_smoketest": "torchtitan_npu.models.kimi_k3.config_registry.kimi_k3_debugmodel",
     "kimi_k3_full": "torchtitan_npu.models.kimi_k3.config_registry.kimi_k3_full",
     "kimi_k3_16layer_reduced": "torchtitan_npu.models.kimi_k3.config_registry.kimi_k3_16layer_reduced",
+    "kimi_k3_1_smoketest": "torchtitan_npu.models.kimi_k3_1.config_registry.kimi_k3_1_debugmodel",
+    "kimi_k3_1_full": "torchtitan_npu.models.kimi_k3_1.config_registry.kimi_k3_1_full",
+    "kimi_k3_1_16layer_reduced": "torchtitan_npu.models.kimi_k3_1.config_registry.kimi_k3_1_16layer_reduced",
     "deepseek_v4_smoketest": "torchtitan_npu.models.deepseek_v4.config_registry.deepseek_v4_debugmodel",
     "deepseek_v4_flash": "torchtitan_npu.models.deepseek_v4.config_registry.deepseek_v4_flash",
     "deepseek_v4_pro": "torchtitan_npu.models.deepseek_v4.config_registry.deepseek_v4_pro",
@@ -238,8 +241,10 @@ def prepare_config(simulation: SimulationConfig) -> PreparedConfig:
         if value is not None:
             setattr(trainer.training, target_name, value)
     model = trainer.model_spec.model
-    if trainer.model_spec.name not in {"deepseek_v4", "kimi_k3", "qwen3"}:
-        raise ValueError("Supported model families are deepseek_v4, kimi_k3, and qwen3")
+    if trainer.model_spec.name == "kimi_k3_1" and simulation.enable_quantized_training:
+        raise ValueError("Kimi K3.1 capture currently supports unquantized training only")
+    if trainer.model_spec.name not in {"deepseek_v4", "kimi_k3", "kimi_k3_1", "qwen3"}:
+        raise ValueError("Supported model families are deepseek_v4, kimi_k3, kimi_k3_1, and qwen3")
     adaptations = []
     if simulation.model_overrides is not None:
         adaptations.append("typed geometry overrides rebuilt the complete native model configuration tree")
@@ -282,6 +287,7 @@ def prepare_config(simulation: SimulationConfig) -> PreparedConfig:
             {
                 "deepseek_v4": _DSV4_OVERRIDES,
                 "kimi_k3": _COMMON_OVERRIDES,
+                "kimi_k3_1": _COMMON_OVERRIDES,
                 "qwen3": _QWEN3_OVERRIDES,
             }[trainer.model_spec.name]
         )
