@@ -246,6 +246,7 @@ PRESET_FACTORIES = {
     "multi_head_moe_debugmodel": "torchtitan_simulator.presets.multi_head_moe_debugmodel",
     "deepseek_v4_1_debugmodel_multimodal": "torchtitan_simulator.presets.deepseek_v4_1_debugmodel_multimodal",
     "sys2mot_debugmodel_multimodal": "torchtitan_npu.models.sys2mot.config_registry.sys2mot_debugmodel_multimodal",
+    "sys2mot_mid_multimodal": "torchtitan_npu.models.sys2mot.config_registry.sys2mot_mid_multimodal",
 }
 
 
@@ -340,7 +341,10 @@ def prepare_config(simulation: SimulationConfig) -> PreparedConfig:
                 "qwen3": _QWEN3_OVERRIDES,
                 "qwen3_5": _QWEN3_5_OVERRIDES,
                 "multi_head_moe": _MULTI_HEAD_MOE_OVERRIDES,
-                "sys2mot": _COMMON_OVERRIDES,
+                # sys2mot reproduces the reference's own RMSNorm math and uses
+                # the shared LocalTokenDispatcher, so neither AscendC override
+                # applies to its config tree.
+                "sys2mot": [],
             }[trainer.model_spec.name]
         )
         if simulation.override_imports is None
