@@ -97,6 +97,27 @@ def test_sys2mot_full_ac_recomputes_forward_math():
     assert len(gradients) == _PARAM_TENSORS
 
 
+def test_sys2mot_selective_ac_gmm_save_set_skips_grouped_gemm_recompute():
+    workload = simulate(
+        SimulationConfig(
+            config="sys2mot_debugmodel_multimodal",
+            seq_len=100,
+            activation_checkpoint_mode="selective",
+            selective_ac_save_ops=["gmm", "attention"],
+        )
+    )
+    result = validate_workload(workload)
+    assert result["graph_acyclic"] and result["peak_storage_unique"]
+    nodes = [n for template in workload.step_templates.values() for n in template.nodes.values()]
+    counts = Counter(n.annotations["raw_op_type"] for n in nodes)
+    # The gmm save-set keeps the grouped GEMMs saved (forward count only);
+    # the indexer/router topk is not part of the saved set and recomputes.
+    assert counts["aten._grouped_mm.default"] == 72
+    assert counts["aten.topk.default"] == 36
+    gradients = workload.iteration.schedule.annotations["gradient_validation"]
+    assert len(gradients) == _PARAM_TENSORS
+
+
 def test_sys2mot_rejects_tensor_parallel_at_config_level():
     with pytest.raises(NotImplementedError, match="tensor parallelism"):
         simulate(
