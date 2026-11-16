@@ -106,9 +106,10 @@ def _simulate(simulation, timings: HostTimings):
             "Use mixed_precision_param=bfloat16 for native BF16 compute, or memory_parameter_storage_dtype "
             "for a storage-only estimate. Build-only can still inspect the native bfloat16 model."
         )
-    if prepared.trainer.model_spec.name == "kimi_k3" and prepared.trainer.training.dtype != "float32":
+    if prepared.trainer.model_spec.name in {"kimi_k3", "kimi_k3_1"} and prepared.trainer.training.dtype != "float32":
         raise ValueError(
-            "Kimi K3 capture requires training.dtype=float32: native FSDP expects uniform original parameter dtype, "
+            "Kimi K3/K3.1 capture requires training.dtype=float32: native FSDP expects uniform original "
+            "parameter dtype, "
             "but the model defines A_log/dt_bias in float32. Use mixed_precision_param=bfloat16 for BF16 compute, "
             "or memory_parameter_storage_dtype for a storage-only estimate. Build-only can inspect bfloat16."
         )
