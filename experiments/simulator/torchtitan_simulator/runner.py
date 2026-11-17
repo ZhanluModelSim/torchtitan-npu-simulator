@@ -251,6 +251,16 @@ def _simulate(simulation, timings: HostTimings):
             loss_fn = config.loss.build(compile_config=config.compile)
             loss_fn.set_lm_head(model.lm_head)
             model._skip_lm_head = True
+            if getattr(config.loss, "distill", False):
+                # The reference distillation runs a frozen teacher VLA per step
+                # and distills logits KL + hidden MSE. The teacher is a meta
+                # model of the same capture config (widths equal, so the
+                # Distiller projection is Identity), mounted on the loss to
+                # stay outside FSDP and the optimizer.
+                with timings.measure("teacher_build"):
+                    teacher = build_meta_model(prepared)
+                loss_fn.set_teacher(teacher)
+                model._distill_capture = True
             from torchtitan_npu.extensions.torchtitan.distributed.flex_shard.planning import collect_planning_timings
 
             with collect_planning_timings() as planning_timings:
