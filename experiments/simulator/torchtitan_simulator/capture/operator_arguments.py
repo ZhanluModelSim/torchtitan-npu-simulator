@@ -71,10 +71,12 @@ def _reduce_op_literal(value: Any) -> str | None:
             return None
         # Native ReduceOp accessors are absent from torch's Python stubs.
         operation = cast("Any", value).op()
+    elif isinstance(value, ReduceOp.RedOpType):
+        # dist.ReduceOp aliases the enum type in this installation, so the
+        # enum-member check must precede the wrapper check.
+        operation = cast("Any", value).value
     elif isinstance(value, ReduceOp):
         operation = cast("Any", value).op
-    elif isinstance(value, ReduceOp.RedOpType):
-        operation = cast("Any", value).value
     else:
         return None
 

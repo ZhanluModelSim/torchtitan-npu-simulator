@@ -165,7 +165,9 @@ def test_grouped_experts_output_and_gradients_match_dense(
     else:
         assert op_scores is None
     assert group_index is None
-    assert clamp_limit == (limit if limit > 0 else -1.0)
+    # Clamping lives on the aten path (production ClipByValueV2 halves); the
+    # fused op never sees a clamp limit.
+    assert clamp_limit == -1.0
 
 
 @pytest.mark.parametrize("limit", [0.0, 0.75], ids=["unclamped", "clamped"])
@@ -208,4 +210,6 @@ def test_shared_experts_output_and_gradients_match_dense(swiglu_module, cpu_swig
     assert packed.dtype == x_data.dtype
     assert op_scores is None
     assert group_index is None
-    assert clamp_limit == (limit if limit > 0 else -1.0)
+    # Clamping lives on the aten path (production ClipByValueV2 bounds); the
+    # fused op never sees a clamp limit.
+    assert clamp_limit == -1.0

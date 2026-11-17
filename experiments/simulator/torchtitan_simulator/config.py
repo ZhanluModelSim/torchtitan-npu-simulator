@@ -211,7 +211,23 @@ PRESET_FACTORIES = {
     "deepseek_v4_pro_20t": "torchtitan_simulator.presets.deepseek_v4_pro_20t",
     "qwen3_32b_smoketest": "torchtitan_npu.models.qwen3.config_registry.qwen3_32b_smoketest",
     "qwen3_32b": "torchtitan_npu.models.qwen3.config_registry.qwen3_32b",
+    "glm5_next_debugmodel_text": "torchtitan_simulator.presets.glm5_next_debugmodel_text",
+    "glm5_next_debugmodel_multimodal": "torchtitan_simulator.presets.glm5_next_debugmodel_multimodal",
+    "glm5_next_reduced_2l": "torchtitan_simulator.presets.glm5_next_reduced_2l",
+    "glm5_next": "torchtitan_simulator.presets.glm5_next",
+    "glm5_next_910b_test": "torchtitan_simulator.presets.glm5_next_910b_test",
 }
+
+# GLM-5.3-Flash is NoPE (no rope override) and its KDA/DSA mixers are custom
+# modules outside the upstream override surface. The common RMSNorm
+# replacement applies, the MoE rides the shared ``MoE`` wrapper so the ASC
+# token dispatcher and the ``swiglu_group`` routed-expert/shared-expert
+# swaps hit their ``*.moe.*`` FQNs.
+_GLM5_NEXT_OVERRIDES = [
+    *_COMMON_OVERRIDES,
+    "torchtitan_npu.override.common.swiglu_group.asc",
+    "torchtitan_npu.override.common.swiglu_group.asc_shared_experts",
+]
 
 
 def prepare_config(simulation: SimulationConfig) -> PreparedConfig:
@@ -243,8 +259,18 @@ def prepare_config(simulation: SimulationConfig) -> PreparedConfig:
     model = trainer.model_spec.model
     if trainer.model_spec.name == "kimi_k3_1" and simulation.enable_quantized_training:
         raise ValueError("Kimi K3.1 capture currently supports unquantized training only")
-    if trainer.model_spec.name not in {"deepseek_v4", "kimi_k3", "kimi_k3_1", "qwen3"}:
-        raise ValueError("Supported model families are deepseek_v4, kimi_k3, kimi_k3_1, and qwen3")
+    if trainer.model_spec.name not in {
+        "deepseek_v4",
+        "deepseek_v4_1",
+        "kimi_k3",
+        "kimi_k3_1",
+        "qwen3",
+        "glm5_next",
+    }:
+        raise ValueError(
+            "Supported model families are deepseek_v4, deepseek_v4_1, kimi_k3, kimi_k3_1, "
+            "qwen3 and glm5_next"
+        )
     adaptations = []
     if simulation.model_overrides is not None:
         adaptations.append("typed geometry overrides rebuilt the complete native model configuration tree")
@@ -289,6 +315,7 @@ def prepare_config(simulation: SimulationConfig) -> PreparedConfig:
                 "kimi_k3": _COMMON_OVERRIDES,
                 "kimi_k3_1": _COMMON_OVERRIDES,
                 "qwen3": _QWEN3_OVERRIDES,
+                "glm5_next": _GLM5_NEXT_OVERRIDES,
             }[trainer.model_spec.name]
         )
         if simulation.override_imports is None

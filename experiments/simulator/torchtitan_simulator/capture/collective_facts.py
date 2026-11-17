@@ -77,11 +77,20 @@ def reduction_name(value: object) -> str | None:
     elif isinstance(value, dist.ReduceOp):
         value = getattr(value, "op", value)
     # TorchBind op() returns an integer in some builds. Compare against this
-    # installation's enum, never a hardcoded integer or an opaque print value.
+    # installation's enum identity, never a hardcoded integer or an opaque
+    # print value; integers are matched against the enum ordinal.
+    if isinstance(value, (str, bool)):
+        return None
     for name in ("SUM", "AVG", "MAX", "MIN", "PRODUCT", "PREMUL_SUM", "BAND", "BOR", "BXOR"):
         named = getattr(dist.ReduceOp, name, None)
-        if named is not None and not isinstance(value, (str, bool)) and value == named:
-            return name
+        if named is None:
+            continue
+        try:
+            if int(value) == int(named):
+                return name
+        except (TypeError, ValueError):
+            if value == named:
+                return name
     return None
 
 
