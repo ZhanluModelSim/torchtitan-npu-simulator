@@ -9,6 +9,7 @@
 | DeepSeek-V4 | smoke、flash、pro、pro_20t 结构 preset；原生 attention/compressor/indexer loss/mHC/MoE/shared expert；MTP 0/1 有回归 | `config.py`、`presets.py`；[test_dsv4_capture.py](../tests/test_dsv4_capture.py) |
 | Kimi K3 | 原生模型与 loss、MoE、共享组件；KDA/attention/SiTU 采用显式 Meta 虚拟融合；不提供真实 KDA 硬件 kernel | `compat/kimi.py`；[test_kimi_capture.py](../tests/test_kimi_capture.py)、[test_kimi_parallel.py](../tests/test_kimi_parallel.py) |
 | Qwen3.5 | 上游 TorchTitan 0.3.0 原生模型、MoE；GDN 与 FlexAttention 采用显式 Meta 虚拟融合；文本捕获（vision detach）、无 MTP；CP／量化未接入 | `compat/qwen3_5.py`；[test_qwen3_5_capture.py](../tests/test_qwen3_5_capture.py)、[接入记录](qwen3-5-integration.md) |
+| Multi-Head-MoE（SLA2） | 主包 `torchtitan_npu/models/multi_head_moe`（外部 multi-head-moe 参考实现的修正移植：front-2/back-2 dense + 中间 per-head gate MoE + shared expert）；SLA2 稀疏/线性两个分支核心采用显式 Meta 虚拟融合（含 mask 梯度），块池化/gumbel 软 top-k mask/alpha 融合为原生 dispatch；debug preset 捕获（单卡、FSDP/HSDP、EP2 all-to-all、full/selective AC）；TP/CP/MTP 拒绝；不提供真实 SLA2 硬件 kernel；SLA2 成本建模在 opm-dev 仓 operator-performance-models（4 族 roofline，需硬件与显式 vec 配置），硬件用 `cost/hardware.py::dv120_hardware` 解析的 DV120 真实规格 | 主包 `models/multi_head_moe`、`compat/multi_head_moe.py`；[test_multi_head_moe_capture.py](../tests/test_multi_head_moe_capture.py) |
 | DeepSeek-V4.1 | 主包原生模型、MoE、mHC 与 host-offload Engram 表（Meta 初始化桥，CPU 稀疏表豁免 dense 梯度契约）；attention 元数据经 `build_attention_masks` 适配到逐后端 map；文本 debugmodel 捕获，MTP／CP／量化未接入 | `compat/deepseek_v4_1.py`；[test_deepseek_v4_1_capture.py](../tests/test_deepseek_v4_1_capture.py) |
 | 原生配置与 override | `prepare_config()` 创建新配置，默认或显式 `override_imports`；`module.factory` 不绕过模型白名单或运行接口要求 | [test_config.py](../tests/test_config.py)、[test_model_overrides.py](../tests/test_model_overrides.py) |
 | 模型几何覆盖 | typed `model_overrides` 只适用于受支持的 DSV4 preset；自定义工厂负责自己的原生配置树 | `model_overrides.py`、[接入接口](upstream-integration.md) |
@@ -26,7 +27,7 @@
 | EP single exchange | DSV4/Kimi 共用原生 functional single 适配；count/data/score 顺序和异常恢复；均衡路由是声明假设 | [EP 交换说明](ep-single-transport.md)、[test_routing.py](../tests/test_routing.py) |
 | 流与事件等待 | 同流前沿、event record 快照、wait_event/wait_stream、零耗时控制节点；无等待的流保持独立 | [流控制依赖](stream-control-dependencies.md)、[test_fsdp_stream_capture.py](../tests/test_fsdp_stream_capture.py) |
 | FSDP 通信视图 | 默认隐藏 FSDP scope 非通信准备工作，保留通信/模型计算/控制依赖；源图保留作审计，内存不跟随过滤 | [捕获契约](capture-runtime.md#fsdp-通信视图)、[test_fsdp_communication_view.py](../tests/capture/test_fsdp_communication_view.py) |
-| 原生参数与自定义语义 | 原生 schema 参数绑定、标量及 AdamW 列表身份；6 个 Kimi、5 个 MoE 包装和 4 个 Qwen3.5 虚拟融合 overload 的角色/轴声明 | [参数测试](../tests/capture/test_operator_arguments.py)、[自定义语义](custom-tensor-semantics.md)、[真实交付测试](../tests/test_custom_tensor_semantics_delivery.py) |
+| 原生参数与自定义语义 | 原生 schema 参数绑定、标量及 AdamW 列表身份；6 个 Kimi、5 个 MoE 包装、4 个 Qwen3.5 和 4 个 Multi-Head-MoE 虚拟融合 overload 的角色/轴声明 | [参数测试](../tests/capture/test_operator_arguments.py)、[自定义语义](custom-tensor-semantics.md)、[真实交付测试](../tests/test_custom_tensor_semantics_delivery.py) |
 | 会话隔离 | 显式激活，正常／异常退出恢复；同进程串行捕获 | [test_runtime.py](../tests/test_runtime.py)、[test_patch_scope.py](../tests/test_patch_scope.py)、[test_chunked_loss_policy.py](../tests/test_chunked_loss_policy.py) |
 | Python／文件交付 | 默认返回图与 MemoryPlan，不写文件；仅显式 mem 导出摘要／明细；无 JSON/HTML/DOT 图导出 | [test_memory_delivery.py](../tests/test_memory_delivery.py)、[接入接口](upstream-integration.md) |
 
