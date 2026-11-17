@@ -15,9 +15,16 @@ production fusion as a virtual custom op with a fake Meta kernel and an
 explicit backward op, following the ``qwen3_5_sim`` flex-attention pattern.
 The bridge is installed only for simulator capture sessions; real-device
 training never sees it.
-"""
 
-import math
+RMSNorm and rotary-apply bridging deliberately deviates from production: the
+sys2mot reference implementation expresses both as unfused eager chains and the
+measured NPU run launches one aclnn kernel per chain member (no aclnnRmsNorm /
+fused rotary in the kernel trace).  Capture sessions route them through the
+vendor fused operators (``npu.npu_rms_norm`` / ``npu.npu_rotary_mul``) to keep
+the captured graph compact; per-op correspondence with the production trace is
+intentionally surrendered for these chains.  Non-fp32 inputs and partial or
+odd rotation widths keep the reference chain.
+"""
 
 import torch
 
@@ -121,11 +128,59 @@ def _sdpa_bridge(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=Fal
     return flash_attention(query, key, value, scale, enable_gqa)
 
 
+def _install_sys2mot_norm_rotary(scope) -> dict[str, str]:
+    """Route sys2mot RMSNorm and rotary-apply through vendor fused kernels.
+
+    Only float32 full-precision calls are covered; everything else keeps the
+    reference eager chain.  Frequency/angle computation stays verbatim so the
+    captured cos/sin kernels keep matching the production trace.
+    """
+    import torch_npu
+
+    from torchtitan_npu.models.sys2mot import model as sys2mot_model
+    from torchtitan_simulator.compat.norm import install_meta_norm_autograd
+    from torchtitan_simulator.compat.rotary import install_rotary_bridge
+
+    status = {
+        "rms_norm_meta_autograd": install_meta_norm_autograd(scope),
+        "rotary_meta_autograd": str(install_rotary_bridge(scope).get("rotary_meta_autograd", "native")),
+    }
+    reference_rms_forward = sys2mot_model.RMSNorm.forward
+    reference_rotary = sys2mot_model.rotary
+
+    def rms_norm_forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dtype is not torch.float32:
+            return reference_rms_forward(self, x)
+        return torch_npu.npu_rms_norm(x, self.weight, self.eps)[0]
+
+    def rotary_forward(x, pos, dim, theta=10000.0, inverse=False):
+        if x.dtype is not torch.float32 or dim % 2 or dim > x.size(-1):
+            return reference_rotary(x, pos, dim, theta, inverse)
+        freq = theta ** (-torch.arange(0, dim, 2, device=x.device).float() / dim)
+        angles = pos.float()[..., None] * freq
+        angles = angles[None, :, None] if pos.ndim == 1 else angles[:, :, None]
+        if inverse:
+            angles = -angles
+        cosine, sine = angles.cos(), angles.sin()
+        tail_input = x if dim == x.size(-1) else x[..., -dim:]
+        rotated = torch_npu.npu_rotary_mul(tail_input, cosine, sine, rotary_mode="half")
+        if dim == x.size(-1):
+            return rotated
+        return torch.cat((x[..., :-dim], rotated), -1)
+
+    scope.replace(sys2mot_model.RMSNorm, "forward", rms_norm_forward)
+    scope.replace(sys2mot_model, "rotary", rotary_forward)
+    status["rms_norm_capture_boundary"] = "npu.npu_rms_norm"
+    status["rotary_capture_boundary"] = "npu.npu_rotary_mul[half]"
+    return status
+
+
 def install_sys2mot_meta_support(scope):
-    """Route the capture-session SDPA calls through the virtual fusion."""
+    """Install all capture-session Meta bridges for the sys2mot model."""
     import torch.nn.functional as functional
 
     scope.replace(functional, "scaled_dot_product_attention", _sdpa_bridge)
+    return _install_sys2mot_norm_rotary(scope)
 
 
 __all__ = [

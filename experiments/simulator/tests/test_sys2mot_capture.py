@@ -44,11 +44,11 @@ def test_sys2mot_capture_reaches_iteration_with_reference_operators():
     nodes = [n for template in workload.step_templates.values() for n in template.nodes.values()]
     counts = Counter(n.annotations["raw_op_type"] for n in nodes)
     # The CSA2/Engram/mHC/action paths are the reference's own eager
-    # operators; nothing is substituted by virtual fused ops. The routed
-    # experts run three grouped GEMMs per MoE layer (8 layers), the router
-    # scores with sqrt(softplus) in fp32, the CSA2 indexer and the
-    # force-balanced MoE routing keep their real topk calls, and the ViT
-    # pixel unshuffle is the reference's own unfold (im2col/col2im).
+    # operators. The routed experts run three grouped GEMMs per MoE layer
+    # (8 layers), the router scores with sqrt(softplus) in fp32, the CSA2
+    # indexer and the force-balanced MoE routing keep their real topk calls,
+    # and the ViT pixel unshuffle is the reference's own unfold
+    # (im2col/col2im).
     assert counts["aten._grouped_mm.default"] == 72
     assert counts["aten.topk.default"] == 18
     assert counts["aten._softmax.default"] == 49
@@ -62,7 +62,8 @@ def test_sys2mot_capture_reaches_iteration_with_reference_operators():
     # The captured joint loss: flow MSE + 0.1 text CE + 0.01 indexer aux.
     assert counts["aten.mse_loss.default"] == 1
     assert counts["aten.nll_loss_forward.default"] == 1
-    # No virtual fusion ops: every node is a native aten/collective op.
+    # Only the sys2mot_sim FlashAttention virtual boundary is substituted;
+    # every other node is a native aten/collective op.
     assert not any(raw.startswith(("sys2mot.", "system3.", "deepseek_v4.")) for raw in counts)
     # The aux-loss-free routing-bias update (bincount/nonzero on Meta) is
     # skipped under the capture's force-load-balance debug flag; the real
@@ -76,7 +77,19 @@ def test_sys2mot_capture_reaches_iteration_with_reference_operators():
     # and one fp32 step scalar per participating parameter.
     assert memory.persistent_param_bytes == _PARAMS * 4
     assert memory.optimizer_state_bytes == _PARAMS * 8 + _PARAM_TENSORS * 4
-    assert all("tensor_semantics" not in n.attrs for n in nodes)
+    # Capture-session vendor fused boundaries for RMSNorm and rotary-apply
+    # (deliberately coarser than the unfused production trace), with the
+    # Meta autograd bridges recording the paired backward operators.
+    assert counts["npu.npu_rms_norm.default"] == 75
+    assert counts["npu.npu_rms_norm_backward.default"] == 75
+    assert counts["npu.npu_rotary_mul.default"] == 64
+    assert counts["npu.npu_rotary_mul_backward.default"] == 64
+    # Only the FlashAttention virtual boundary declares tensor roles.
+    assert all(
+        "tensor_semantics" not in n.attrs
+        for n in nodes
+        if not str(n.annotations["raw_op_type"]).startswith("sys2mot_sim.")
+    )
 
 
 def test_sys2mot_full_ac_recomputes_forward_math():
