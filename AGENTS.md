@@ -19,6 +19,8 @@
 
 新增或迁移代码先读取[架构边界](docs/architecture.md)及目标目录的 `AGENTS.md`。当前自动导入顺序为 `patches → config → extensions → ops`；`patches → extensions` 是后续收敛目标。extensions 可以依赖 patches；patches 不得新增对 extensions 的依赖。
 
+TorchFT engine 的按需激活、唯一 owner 和顺序见[架构说明](docs/architecture.md#torchft-engine)，不得新增第二个直接绑定入口。
+
 ## 上游与验证
 
 `requirements.txt` 声明 torchtitan 版本，`.ci/setup_torchtitan.sh` 从该版本推导对应 tag。更新版本时同步核对 patch 目标、接口和测试。

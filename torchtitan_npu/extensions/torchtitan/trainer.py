@@ -251,10 +251,10 @@ class TrainerEx(Trainer):
 
             pool = PinnedFlatPool("fsdp-offload")
             with pool.pinned_pin_window():
-                super().__init__(config)
+                self._initialize_trainer(config)
             self._carve_grad_slots(pool)
         else:
-            super().__init__(config)
+            self._initialize_trainer(config)
         engine = cast("TrainingEngineEx", self.engine)
         engine._sdc = config.sdc.build(
             trainer_config=config,
@@ -274,6 +274,10 @@ class TrainerEx(Trainer):
 
         self.anticipatory_schedule = AnticipatorySchedule(self) if config.anticipatory.enable else None
         engine.anticipatory_schedule = self.anticipatory_schedule
+
+    def _initialize_trainer(self, config: Config) -> None:
+        """Build the trainer while allowing experiments to own data partitioning."""
+        super().__init__(config)
 
     def train_step(self, data_iterator):
         if self.anticipatory_schedule is not None:

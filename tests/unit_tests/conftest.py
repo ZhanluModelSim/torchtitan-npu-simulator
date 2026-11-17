@@ -62,9 +62,6 @@ collect_ignore = [
     "models/qwen3_5/test_qwen3_5_npu_adapter.py",
     # The memory-policy expectations track the pre-0.4 checkpoint policy mapping.
     "models/deepseek_v4/memory_policy",
-    # TorchFT remains on the pre-fold-batch trainer interface.
-    "extensions/torchtitan/experiments/torchft",
-    "patches/torchft",
     # EMA is rejected by the eager NPU trainer.
     "extensions/torchtitan/components/optimizer/test_ema.py",
     # Anticipatory routing still targets the pre-0.4 dynamo/config interfaces.

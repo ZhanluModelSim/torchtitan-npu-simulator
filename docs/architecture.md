@@ -64,6 +64,12 @@ patches → extensions → selected override
 
 patch 替换后必须刷新或说明上游 `from ... import ...` 已捕获的绑定；无法穷尽捕获点时，改用公开注册机制或 extension。extensions 默认上游模块和 dataclass 都已存在，因此不依赖早期导入，也不替换被上游 dataclass 捕获的 `.Config`。它只使用配置外包装、运行期方法 seam、单目标 hook 注册组件或公开注册 API（例如 `torch.library`、graph-pass registry）。不属于 patches 且无法通过这些机制实现的能力，不以 monkey-patch 落地，而应提出稳定扩展点或扩展本仓配置外包装。
 
+### TorchFT engine
+
+TorchFT 通过现有 FT recipe 按需导入 `torchtitan_npu.extensions.torchtitan.experiments.torchft`，不加入根包自动导入链。[该包入口](../torchtitan_npu/extensions/torchtitan/experiments/torchft/__init__.py) 是上游 `FaultTolerantTrainingEngine.__new__` 的唯一 owner（sole owner）：先检查可选 `torchft` 依赖，再加载 TorchFT 设备补丁与上游兼容补丁入口，最后由 `apply()` 安装配置分派的实例分配 hook，在构造 FT trainer 前完成。直接构造上游 engine 且配置为 `FaultTolerantTrainerEx.Config` 时，分配 `FaultTolerantTrainingEngineEx` 实例；原生配置和显式子类保留原来的类型。hook 不调用初始化，Python 仍只执行一次 `__init__`。上游类符号保持不变，重复激活不会叠加包装。
+
+该绑定针对上游 FT 构造函数运行时读取的 engine 符号；上游 FT 构造函数不使用普通 Trainer 的 `engine_cls`。它不替换已被 dataclass 捕获的 `.Config`，其他模块不得再次直接替换该目标。现有 recipe 名称和模块路径不变。
+
 ## 目标子层
 
 ### patches

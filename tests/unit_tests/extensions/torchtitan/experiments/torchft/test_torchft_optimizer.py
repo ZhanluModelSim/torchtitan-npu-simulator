@@ -9,7 +9,10 @@ import pytest
 import torch
 from torchtitan.components.optim import AdamW
 
-from torchtitan_npu.extensions.torchtitan.experiments.torchft.optimizer import TorchFTOptimizersContainerEx
+from torchtitan_npu.extensions.torchtitan.experiments.torchft.optimizer import (
+    TorchFTOptimEx,
+    TorchFTOptimizersContainerEx,
+)
 from torchtitan_npu.extensions.torchtitan.experiments.torchft.process_group import ProcessGroupHCCLEx
 
 
@@ -56,6 +59,24 @@ def test_accepted_step_updates_parameter_once_and_advances_scheduler_once(monkey
     assert hooks == ["step"]
     manager.should_commit.assert_called_once_with()
     manager._begin_step.assert_called_once_with()
+
+    # The outer optimizer reports non-finite loss to the synchronous manager;
+    # only the container votes, so it cannot authorize a duplicate update.
+    outer = object.__new__(TorchFTOptimEx)
+    outer.config = TorchFTOptimEx.Config()
+    outer.parameters = [model.weight]
+    outer.parallelism_context = SimpleNamespace(pp_enabled=False, get_optional_mesh=lambda _: None)
+    outer.gradient_clipper = Mock(clip_grad_norm_=Mock(return_value=torch.tensor(1.0)))
+    outer.optimizers = optimizer
+    outer._consecutive_non_finite_steps = 0
+    outer.configure_fault_tolerance(SimpleNamespace(manager=manager, use_async_quorum=False))
+    manager.should_commit.reset_mock()
+    manager.should_commit.return_value = False
+    outer._update(torch.tensor(float("nan")))
+    manager.report_error.assert_called_once()
+    manager.should_commit.assert_called_once_with()
+    manager._begin_step.assert_called_once_with()
+    torch.testing.assert_close(model.weight, torch.tensor([[0.9]]))
 
 
 def test_rejected_step_skips_optimizer_and_preserves_upstream_scheduler_advancement():

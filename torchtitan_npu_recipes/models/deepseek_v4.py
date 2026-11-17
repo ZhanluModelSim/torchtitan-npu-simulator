@@ -386,7 +386,10 @@ def _torchft_flash_config(
 
     from torchtitan.experiments.torchft.checkpoint import TorchFTCheckpointManager
 
-    from torchtitan_npu.extensions.torchtitan.experiments.torchft.optimizer import TorchFTOptimizersContainerEx
+    from torchtitan_npu.extensions.torchtitan.experiments.torchft.optimizer import (
+        TorchFTOptimEx,
+        TorchFTOptimizersContainerEx,
+    )
     from torchtitan_npu.extensions.torchtitan.experiments.torchft.trainer import FaultTolerantTrainerEx
 
     def config_values(source: object, target: type) -> dict[str, Any]:
@@ -398,13 +401,11 @@ def _torchft_flash_config(
     checkpoint_values = config_values(base.checkpointer, TorchFTCheckpointManager.Config)
     checkpoint_values.update(enable_ft_dataloader_checkpoints=True)
     values["checkpointer"] = TorchFTCheckpointManager.Config(**checkpoint_values)
-    values["optim"] = OptimConfig(
-        optimizer=TorchFTOptimizersContainerEx.Config(
-            **config_values(base.optim.optimizer, TorchFTOptimizersContainerEx.Config)
-        ),
-        lr_scheduler=base.optim.lr_scheduler,
-        max_norm=base.optim.max_norm,
+    optim_values = config_values(base.optim, TorchFTOptimEx.Config)
+    optim_values["optimizer"] = TorchFTOptimizersContainerEx.Config(
+        **config_values(base.optim.optimizer, TorchFTOptimizersContainerEx.Config)
     )
+    values["optim"] = TorchFTOptimEx.Config(**optim_values)
     config = FaultTolerantTrainerEx.Config(**values)
     assert isinstance(config.model, DeepSeekV4Model.Config)
     config.fault_tolerance.group_size = 2

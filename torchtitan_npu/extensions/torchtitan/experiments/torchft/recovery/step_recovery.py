@@ -20,7 +20,6 @@ if TYPE_CHECKING:
 
     from torch import nn
     from torch.distributed.checkpoint.stateful import Stateful
-    from torchtitan.components.optim import LRSchedulersContainer
 
     from torchtitan_npu.extensions.torchtitan.experiments.torchft.manager import ManagerEx
 
@@ -41,8 +40,9 @@ def reset_failed_iteration(model_parts):
                     for fsdp_param in group.fsdp_params:
                         unsharded = getattr(fsdp_param, "_unsharded_param", None)
                         if unsharded is not None:
+                            # FSDP's accumulated-gradient accessor reads this
+                            # leaf; it is no longer separately writable state.
                             unsharded.grad = None
-                        fsdp_param.unsharded_accumulated_grad = None
     reset_rejected_moe_state(model_parts)
 
 
@@ -62,7 +62,7 @@ class StepRecovery:
         manager: ManagerEx,
         model_parts: list[nn.Module],
         train_state: Stateful,
-        lr_schedulers: LRSchedulersContainer,
+        finish_discarded_step: Callable[[], None],
         max_consecutive_recoveries: int,
         reset_auxiliary_state: Callable[[], None],
     ):
@@ -70,12 +70,18 @@ class StepRecovery:
         self._manager = manager
         self._model_parts = model_parts
         self._train_state = train_state
-        self._lr_schedulers = lr_schedulers
+        self._finish_discarded_step = finish_discarded_step
         self._max_consecutive_recoveries = max_consecutive_recoveries
         self._reset_auxiliary_state = reset_auxiliary_state
         self._consecutive_recoveries = 0
+        self._step_finished = False
+
+    def mark_step_finished(self) -> None:
+        """Record that the engine advanced its clock, even for a rejected vote."""
+        self._step_finished = True
 
     def run_step(self, step, data_iterator):
+        self._step_finished = False
         try:
             result = step(data_iterator)
         except RuntimeError as error:
@@ -83,6 +89,8 @@ class StepRecovery:
                 raise
             if self._hccl.optimizer_update_completed:
                 raise RuntimeError("HCCL recovery after an optimizer commit is not supported") from error
+            if self._step_finished:
+                raise RuntimeError("HCCL recovery after a finalized step requires restarting the replica") from error
             self._consecutive_recoveries += 1
             if self._consecutive_recoveries > self._max_consecutive_recoveries:
                 raise RuntimeError("Exceeded the consecutive HCCL recovery limit") from error
@@ -93,10 +101,10 @@ class StepRecovery:
             # operator workspaces outside the PyTorch caching allocator.
             torch_npu.npu.empty_cache()
             self._manager.discard_interrupted_step(error)
-            self._lr_schedulers.step()
+            self._finish_discarded_step()
             logger.warning(
                 "Discarded interrupted TorchFT attempt %d after device recovery; next step reads new data",
-                attempt_state["step"],
+                attempt_state["step"] + 1,
             )
             return
         if not self._manager.commit_authorized:

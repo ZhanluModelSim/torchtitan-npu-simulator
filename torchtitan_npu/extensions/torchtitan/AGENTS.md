@@ -4,5 +4,6 @@
 
 - 每个上游目标只允许一个激活模块直接 monkey-patch，避免覆盖顺序不确定。迁移阶段的 ownership 检查脚本保存在代码仓外的本地工具目录；新增 patch 仍必须人工确认 owner、目标路径和激活顺序。
 - 激活模块通过公开注册接口接纳其他扩展；需要扩展同一目标时，不得新增第二个直接 patch 模块。
+- TorchFT engine 绑定由 `experiments/torchft/__init__.py` 按需独占激活；目标与顺序见[架构说明](../../../docs/architecture.md#torchft-engine)。
 - 组件接线模块只注册 hook，不定义 `apply()`，也不直接 monkey-patch。组件禁用时只跳过对应接线模块，核心激活模块仍可加载。
 - 核心模块不得在顶层导入组件；在真正注册或需要时再惰性加载已声明组件。

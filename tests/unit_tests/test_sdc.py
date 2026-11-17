@@ -18,7 +18,7 @@ from torchtitan.training_engine import TrainingEngine
 from torchtitan_npu.config.configs import CompileConfig, ModelCompileConfig
 from torchtitan_npu.extensions.compile import sdc_checksum
 from torchtitan_npu.extensions.components.sdc.sdc import SDC
-from torchtitan_npu.extensions.torchtitan.trainer import TrainingEngineEx, TrainerEx
+from torchtitan_npu.extensions.torchtitan.trainer import TrainerEx, TrainingEngineEx
 
 
 class TorchNpuCheckerFake:
@@ -193,6 +193,18 @@ def test_sdc_submits_only_at_configured_accumulation_boundaries(
     gradient, name = checker.detected[0]
     assert torch.equal(gradient, model.weight.grad)
     assert name == "weight_backward"
+
+    sdc.discard_step()
+    before = len(checker.detected)
+    sdc._microbatch = accumulation_steps - 1
+    sdc.discard_step()
+    assert sdc._microbatch == 0
+    assert len(checker.detected) == before
+    for _ in range(accumulation_steps - 1):
+        sdc.finalize_sdc_step()
+        assert len(checker.detected) == before
+    sdc.finalize_sdc_step()
+    assert len(checker.detected) == before + 1
 
 
 @pytest.mark.parametrize(

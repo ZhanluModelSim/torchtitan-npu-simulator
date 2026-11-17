@@ -142,6 +142,11 @@ class SDC(Configurable):
                 )
 
     @torch.no_grad()
+    def discard_step(self) -> None:
+        """Discard a partial accumulation window without reading failed gradients."""
+        self._microbatch = 0
+
+    @torch.no_grad()
     def finalize_sdc_step(self) -> None:
         """Submit a complete accumulation window after a successful backward step."""
 

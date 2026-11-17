@@ -40,6 +40,8 @@ def test_recovery_rejects_mismatched_tensor_shape_before_loading():
 
 
 def test_reset_failed_iteration_clears_cached_fsdp_gradients(monkeypatch):
+    from torch.distributed.fsdp._fully_shard._fsdp_param import FSDPParam
+
     class FakeFSDPModule(torch.nn.Module):
         def __init__(self):
             super().__init__()
@@ -47,10 +49,8 @@ def test_reset_failed_iteration_clears_cached_fsdp_gradients(monkeypatch):
             self.sharded.grad = torch.ones(1)
             unsharded = torch.nn.Parameter(torch.ones(1))
             unsharded.grad = torch.ones(1)
-            self.fsdp_param = SimpleNamespace(
-                _unsharded_param=unsharded,
-                unsharded_accumulated_grad=torch.ones(1),
-            )
+            self.fsdp_param = object.__new__(FSDPParam)
+            self.fsdp_param._unsharded_param = unsharded
             self.state = SimpleNamespace(_fsdp_param_groups=[SimpleNamespace(fsdp_params=[self.fsdp_param])])
             self.reset_count = 0
 
@@ -155,7 +155,9 @@ def test_only_unfinished_device_work_requests_recovery(monkeypatch, deferred_tim
 
 
 def test_wait_for_completion_retires_only_the_selected_hccl_work(monkeypatch, deferred_timers):
-    monkeypatch.setattr("torchtitan_npu.extensions.torchtitan.experiments.torchft.recovery.hccl.time.sleep", lambda _: None)
+    monkeypatch.setattr(
+        "torchtitan_npu.extensions.torchtitan.experiments.torchft.recovery.hccl.time.sleep", lambda _: None
+    )
     pg = ProcessGroupHCCLEx(recovery_timeout=timedelta(seconds=1))
     inner_work = Mock(is_completed=Mock(side_effect=[False, True]))
     tracked_work = pg._wrap_work(inner_work, object())

@@ -15,10 +15,11 @@ with patch.object(module, 'ManagerEx') as manager, \\
      patch.object(module, 'ProcessGroupHCCLEx') as process_group, \\
      patch.object(module.torchft.process_group, 'ManagedProcessGroup') as managed:
     config = module.FTManagerEx.Config(
-        replica_id=2, group_size=4, min_replica_size=2, process_group_timeout_ms=135000
+        replica_id=2, group_size=4, min_replica_size=2, process_group_timeout_ms=135000, timeout_ms=234000
     )
     assert not hasattr(config, 'enable_hccl_recovery')
     assert not hasattr(config, 'state_dict_on_training_thread')
+    assert config.use_async_quorum is False
     ft = module.FTManagerEx(config)
     assert not ft.use_async_quorum
     assert ft.group_size == config.group_size
@@ -26,6 +27,7 @@ with patch.object(module, 'ManagerEx') as manager, \\
     assert manager.call_args.kwargs['use_async_quorum'] is False
     assert manager.call_args.kwargs['init_sync'] is True
     assert manager.call_args.kwargs['min_replica_size'] == 2
+    assert manager.call_args.kwargs['timeout'].total_seconds() == 234
     assert manager.call_args.kwargs['replica_id'] == 'torchtitan_ft_2'
     assert manager.call_args.kwargs['pg'] is process_group.return_value
     assert process_group.call_args.args[0].total_seconds() == 135
@@ -37,6 +39,7 @@ for overrides in (
     {'enable': False},
     {'process_group': 'gloo'},
     {'semi_sync_method': 'local_sgd'},
+    {'use_async_quorum': True},
     {'group_size': 1},
     {'group_size': 2, 'min_replica_size': 3},
     {'group_size': 2, 'replica_id': 2},

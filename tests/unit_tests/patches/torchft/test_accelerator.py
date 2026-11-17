@@ -4,8 +4,11 @@
 import subprocess
 import sys
 
+import pytest
+
 
 def test_patch_rebinds_preloaded_consumers_and_is_idempotent():
+    pytest.importorskip("torchft")
     program = """
 from unittest.mock import Mock, patch
 import sys
@@ -47,7 +50,7 @@ def test_plain_import_does_not_require_torchft_and_opt_in_explains_installation(
     program = """
 import importlib.abc
 import sys
-from torchtitan.config import ConfigManager
+from torchtitan.config import ConfigLoader
 
 class BlockTorchFT(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path=None, target=None):
@@ -63,7 +66,7 @@ common_args = [
     '--module', 'torchtitan_npu_recipes.models.deepseek_v4',
     '--config', 'deepseek_v4_flash_43layers_16experts',
 ]
-config = ConfigManager().parse_args(common_args)
+config = ConfigLoader().load(common_args)
 assert isinstance(config, TrainerEx.Config)
 assert not any(name == 'torchft' or name.startswith('torchft.') for name in sys.modules)
 from torchtitan_npu_recipes.models.deepseek_v4 import deepseek_v4_flash_torchft

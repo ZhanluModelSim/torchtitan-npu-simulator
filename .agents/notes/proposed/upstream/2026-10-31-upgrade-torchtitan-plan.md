@@ -188,7 +188,7 @@
 ### 阶段七：迁移 TorchFT、多模态并清理补丁
 
 - TorchFT 接入新的 FaultTolerantTrainingEngine，重建明确的 NPU engine 构造入口；不继续依赖旧 Trainer 多继承关系。
-- 保留 HCCL 恢复、snapshot/rollback 和事务顺序：跨副本指标 collective 在投票前完成，失败尝试不推进 LR、step 或数据位置。
+- 保留 HCCL 恢复及跨副本指标 collective 先于投票的顺序；旧「失败尝试不推进 LR、step 或数据位置」约束已过期，按[第 6.2 节](#62-torchft-训练生命周期迁移)的 consumed-attempt 语义验收。
 - 保持现有 TorchFT 支持边界，不扩展 TP/CP/PP。
 - Qwen3.5 继承小模型 embedding tying，验证共享参数身份；检查不同 rank 混合 text/image/video 时的 FSDP collective 顺序。
 - GDN 覆盖末尾重复 offsets、空 padding segment 和文档边界；不把上游 Ulysses 新增当作 GDN CP 已支持。
@@ -218,7 +218,7 @@
 | Graph/AC | eager、FullAC、SelectiveAC、GraphTrainer；累积 1/>1、overlap、CV、校准 | 状态更新次数正确，校准无训练副作用，无 handle/显存持续增长 |
 | 保存与恢复 | 新 DCP 同步/异步、EMA、AdamW/Muon、HostSparse、LoRA、量化、hash | 重启后的下一步与连续运行一致；坏 hash 明确拒绝 |
 | HF/PEFT 导出 | text-only、多模态、MTP 开关、EP、多 rank、未加载的可选 key | safetensors 实际重开成功，index 与张量集合正确，逐张量比较 |
-| TorchFT | 成功提交、失败回滚、重试、rank 重入、数据与 checkpoint 步数 | 失败不推进状态，恢复后事务与 collective 顺序正确 |
+| TorchFT | 成功提交、尝试丢弃、rank 重入、数据与 checkpoint 步数 | 按第 6.2 节的 consumed-attempt 语义推进计数，恢复后事务与 collective 顺序正确；旧「失败不推进状态」条件已过期 |
 
 ### 数值验收规则
 
@@ -262,10 +262,10 @@
 
 ### 6.2 TorchFT 训练生命周期迁移
 
-- **现状与影响：** `FaultTolerantTrainerEx` 仍通过旧多继承结构使用普通 NPU engine，并访问旧 Trainer 的 `ft_manager`、`model_parts`、`lr_schedulers`。本地训练循环仍消费 tuple batch 和旧配置字段，尚未接入 `FaultTolerantTrainingEngine`。配置可构造不代表该路径可运行。
-- **处理方向：** 在恢复运行支持前增加明确的未迁移入口检查；随后围绕目标版本的 FT engine 接入 NPU/HCCL 恢复，迁移状态 owner 与 `TrainingMicrobatch`，删除旧训练循环。保持跨副本指标 collective 先于提交投票、失败尝试不推进训练状态的原有约束。
-- **完成条件：** 实际创建 FT engine；正常 step、失败回滚、重试和 rank 重入均进入新路径；验证失败尝试不推进 optimizer、LR、训练步数或数据位置，并验证 checkpoint 恢复。恢复被延期的 TorchFT 测试收集后，执行真实 NPU/HCCL 验证。
-- **代码依据：** [TorchFT trainer](../../../../torchtitan_npu/extensions/torchtitan/experiments/torchft/trainer.py)、[恢复逻辑](../../../../torchtitan_npu/extensions/torchtitan/experiments/torchft/recovery/step_recovery.py)、[测试延期清单](../../../../tests/unit_tests/conftest.py)。
+- **历史问题：** 旧实现使用普通 NPU engine、旧 Trainer 状态和 tuple batch；此描述保留为历史背景，不代表当前接口。FT engine 的现行绑定契约见[架构说明](../../../../docs/architecture.md#torchft-engine)。
+- **现行丢弃语义：** 旧「失败尝试不推进 optimizer、LR、训练步数或数据位置」的整体回滚约束已过期。`training.steps` 按 consumed-attempt（已消耗的尝试）计数，而非成功参数更新次数；被拒绝或经恢复丢弃的尝试仍推进 LR scheduler 和 step 一次，已消费的数据不重放，下一次尝试读取新数据。未获提交授权时不执行 optimizer 参数更新，但不保证 forward 等副作用全量回滚，也不保证 MoE bias 不变。
+- **完成条件：** 实际创建 FT engine，正常 step、尝试丢弃、rank 重入和 checkpoint 恢复均按上述语义验证；跨副本指标 collective 保持先于提交投票。测试恢复收集不等于运行通过，需针对最终提交提供 NPU/HCCL 验证结果。
+- **代码依据：** [TorchFT trainer](../../../../torchtitan_npu/extensions/torchtitan/experiments/torchft/trainer.py)、[恢复逻辑](../../../../torchtitan_npu/extensions/torchtitan/experiments/torchft/recovery/step_recovery.py)、[测试收集配置](../../../../tests/unit_tests/conftest.py)。
 
 ## 7. 阶段四、五实施范围（2026-11-02）
 

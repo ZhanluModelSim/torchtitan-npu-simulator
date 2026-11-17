@@ -7,10 +7,11 @@
 """One quorum decision and one optimizer update per training step."""
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from torchtitan.experiments.torchft.optimizer import TorchFTOptimizersContainer
+from torchtitan.components.optim import OptimizersContainer
+from torchtitan.experiments.torchft.optimizer import TorchFTOptim, TorchFTOptimizersContainer
 
 if TYPE_CHECKING:
     from torchtitan_npu.extensions.torchtitan.experiments.torchft.manager import ManagerEx
@@ -46,3 +47,16 @@ class TorchFTOptimizersContainerEx(TorchFTOptimizersContainer):
         # Direct dispatch preserves the upstream fix for recursive container hooks.
         for optimizer in self.optimizers:
             optimizer.step()
+
+
+class TorchFTOptimEx(TorchFTOptim):
+    """Use upstream non-finite rejection with synchronous NPU quorum."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(TorchFTOptim.Config):
+        optimizer: OptimizersContainer.Config = field(default_factory=TorchFTOptimizersContainerEx.Config)
+
+    def configure_fault_tolerance(self, ft_manager) -> None:
+        # The outer Optim reports non-finite errors; only the container starts
+        # quorum and votes. Upstream's async-quorum guard is not applicable here.
+        self._quorum_manager = ft_manager.manager

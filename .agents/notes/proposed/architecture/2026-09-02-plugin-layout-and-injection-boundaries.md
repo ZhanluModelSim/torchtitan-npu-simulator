@@ -47,6 +47,8 @@ Tracking: PR #688
 
 ownership debt manifest、目录布局检查和 extension ownership 检查脚本当前只保存在代码仓外的本地阶段工具目录，不属于本 PR，也不是仓库或 CI 的有效门禁。后续如需引入，必须重新设计、补充自测并作为独立变更评审。
 
+TorchFT engine 绑定由 opt-in 包入口独占，保持根包自动导入链不变；owner 与激活顺序见[架构说明](../../../../docs/architecture.md#torchft-engine)。
+
 ### Current dependency debt
 
 以下边不符合目标单向依赖，但当前代码仍依赖它们。`scripts/check_architecture_boundaries.py` 以 `.ci/architecture_import_baseline.json` 记录直接 import 基线并阻止新增；它不是债务已经清零的证明。

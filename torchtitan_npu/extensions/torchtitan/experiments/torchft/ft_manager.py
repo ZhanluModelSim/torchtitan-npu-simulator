@@ -61,6 +61,7 @@ class FTManagerEx(TorchFTManager):
     class Config(TorchFTManager.Config):
         enable: bool = True
         process_group: str = "hccl"  # pyrefly: ignore [bad-override]
+        use_async_quorum: bool = False
         quorum_timeout_seconds: int = 60
         """Allow time for replica-local state export, loading and disk operations."""
         device_recovery_timeout_seconds: int = 60
@@ -73,6 +74,8 @@ class FTManagerEx(TorchFTManager):
             raise ValueError("NPU TorchFT requires enabled HCCL fault tolerance")
         if config.semi_sync_method is not None:
             raise ValueError("NPU TorchFT supports synchronous training only; LocalSGD and DiLoCo are unsupported")
+        if config.use_async_quorum:
+            raise ValueError("NPU TorchFT requires synchronous quorum; use_async_quorum must be False")
         if config.group_size < 2:
             raise ValueError("NPU TorchFT requires at least two elastic DP replicas")
         if not 1 <= config.min_replica_size <= config.group_size:
@@ -106,6 +109,7 @@ class FTManagerEx(TorchFTManager):
             use_async_quorum=False,
             replica_id=f"torchtitan_ft_{config.replica_id}",
             init_sync=True,
+            timeout=timedelta(milliseconds=config.timeout_ms),
             quorum_timeout=timedelta(seconds=config.quorum_timeout_seconds),
         )
         self.replicate_pg = torchft.process_group.ManagedProcessGroup(self._manager)
