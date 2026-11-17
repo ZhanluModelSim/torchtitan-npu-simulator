@@ -1,6 +1,6 @@
 # TorchTitan simulator
 
-独立训练负载发生器：在 Meta 上复用原生模型、并行化、loss 和 optimizer，返回算子图、通信与控制依赖，以及静态显存预算。当前接入 DeepSeek-V4、DeepSeek-V4.1、Kimi K3 和 Qwen3.5；性能预测、硬件配置及 DES 归下游平台。本包仅在显式调用时激活，不修改上游安装源码，生产主包不依赖 simulator。
+独立训练负载发生器：在 Meta 上复用原生模型、并行化、loss 和 optimizer，返回算子图、通信与控制依赖，以及静态显存预算。当前接入 DeepSeek-V4、Kimi K3／K3.1、Qwen3-32B（dense）与 system3；性能预测、硬件配置及 DES 归下游平台。本包仅在显式调用时激活，不修改上游安装源码，生产主包不依赖 simulator。
 
 ## 从哪里开始
 
@@ -9,8 +9,10 @@
 | 理解整体执行链、职责和设计取舍 | [整体方案](docs/architecture.md) |
 | **从零接入新模型、复用组件并完成验收** | **[新模型接入流程](docs/model-integration.md)** → [常见问题](docs/model-integration-pitfalls.md) |
 | 开发、环境核对与测试选择 | [开发导航](docs/developer-guide.md) |
-| Python／CLI 调用与返回对象 | [同进程接入](docs/upstream-integration.md) |
+| Python／CLI 调用、只读配置目录与返回对象 | [同进程接入](docs/upstream-integration.md) |
 | 判断当前配置是否在支持范围 | [能力矩阵](docs/capability-matrix.md) |
+| Qwen3-32B dense 的路线决策、验证边界与未覆盖范围 | [Qwen3 接入说明](docs/qwen3-integration.md) |
+| Kimi K3.1 的 DSA、模型入口与参考实现边界 | [Kimi K3.1 接入说明](docs/kimi-k3-1.md) |
 
 新模型接入不能只修改 preset 或模型名白名单。应先核对配置树、runner 接口、并行和 loss 契约，再逐阶段验证；不要从历史测试数量推断新模型已支持。
 
@@ -36,12 +38,14 @@ python -m torchtitan_simulator --config kimi_k3_smoketest \
 
 推荐 shell 入口为 `python -m torchtitan_simulator`。`--build-only` 仅构建模型，不能替代 F/B/O、梯度、通信或内存验收。Python 调用示例见[同进程接入](docs/upstream-integration.md)。
 
-模型 preset 与虚拟融合边界：Qwen3.5 文本捕获（`qwen3_5_debugmodel`／`qwen3_5_debugmodel_moe`）见 [Qwen3.5 接入](docs/qwen3-5-integration.md)；DeepSeek-V4.1 文本捕获（`deepseek_v4_1_debugmodel_text`，Engram 表 Meta 桥）见 [模型接入工作流](docs/model-integration.md)与能力矩阵。
+运行时会在安装临时 patch 前检查所用 FSDP 私有调用边界；独立诊断及软件栈记录方法见[开发导航](docs/developer-guide.md#先核对环境)。该检查不替代真实负载捕获验证。
 
 ## 主要边界
 
 - 单进程承载一个 logical rank，使用逻辑 world；PP 必须为 1，不用 torchrun worker 数替代逻辑设备数。
 - 默认同模型／optimizer 执行一次实际 GA 的无捕获结构预热，再捕获一个 microbatch 的 F/B 与一次 O。平台负责按 GA 组织阶段，见[稳态捕获](docs/steady-state-capture.md)。
+- DSV4 可用 `--optimizer.name Muon` 选择原生 DistMuon＋AdamW；保留内部计算、all-to-all 和预取依赖；支持常驻缓冲统计和整段聚合状态卸载，范围与限制见 [Muon 捕获](docs/muon.md)。
+- Qwen3-32B（dense）attention 走真实 `npu_fusion_attention_v3` 融合算子并经 Meta 桥接 autograd；并行（FSDP/HSDP/DDP/TP×AC）、双卸载与 CPU 数值参考已验证，量化与真机数值边界见 [Qwen3 接入说明](docs/qwen3-integration.md)。
 - 返回图保持 FSDP 通信视图，完整源图在 `captured_workload`；显存依据完整原始事件，不依据裁剪图。数据、alias/mutation、stream/event 依赖均保留，零耗时等待也不能删除。
 - 默认通过 Python 对象交付；仅显式 `mem` 导出显存汇总和诊断文件。无图折叠或强制图文件中转。
 - 激活和优化器卸载是独立开关，训练仓生成传输节点／依赖并修正静态显存，平台计算传输时间；不执行真实主机 copy。

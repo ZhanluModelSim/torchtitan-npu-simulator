@@ -197,9 +197,7 @@ def validate_workload(workload: WorkloadGraph) -> dict:
         == sum(event["gradient_reduction"] for event in communication),
         "gradient reduction ownership count differs",
     )
-    optimizers = [
-        node for node in nodes.values() if node.annotations.get("raw_op_type") == "aten._fused_adamw_.default"
-    ]
+    optimizers = [node for node in nodes.values() if node.annotations.get("optimizer_updated_parameter_names")]
     _require(bool(optimizers), "missing native optimizer")
     gradients = annotations["gradient_validation"]
     clipped = [
@@ -207,11 +205,30 @@ def validate_workload(workload: WorkloadGraph) -> dict:
         for node in nodes.values()
         if node.annotations.get("raw_op_type") == "aten.mul_.Tensor"
         and node.annotations.get("comp_type") == "OPTIMIZER"
+        and "gradient_clip" in node.annotations.get("framework_scopes", ())
     ]
     _require(len(clipped) == len(gradients), "clip set differs from gradient set")
     _require(
-        sum(node.annotations["optimizer_updated_parameter_count"] for node in optimizers) == len(gradients),
+        {name for node in optimizers for name in node.annotations["optimizer_updated_parameter_names"]}
+        == set(gradients),
         "optimizer update set differs from gradient set",
+    )
+    declared = [name for group in annotations["optimizer_parameter_groups"] for name in group["parameter_names"]]
+    _require(len(declared) == len(set(declared)) and set(declared) == set(gradients), "optimizer ownership differs")
+    algorithms = {
+        name: group["algorithm"]
+        for group in annotations["optimizer_parameter_groups"]
+        for name in group["parameter_names"]
+    }
+    updated = [name for node in optimizers for name in node.annotations["optimizer_updated_parameter_names"]]
+    _require(len(updated) == len(set(updated)), "parameter updated more than once")
+    _require(
+        all(
+            node.annotations.get("optimizer_algorithm") == algorithms[name]
+            for node in optimizers
+            for name in node.annotations["optimizer_updated_parameter_names"]
+        ),
+        "optimizer update algorithm differs from parameter owner",
     )
     ancestors = set()
     pending = [node.op_id for node in optimizers]

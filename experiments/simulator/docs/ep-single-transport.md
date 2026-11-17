@@ -22,6 +22,8 @@ simulator 在公共运行时中默认使用 PyTorch 原生 functional `all_to_al
 
 Meta 无法从 tensor 内容读取远端 token count，因此保留原有均衡 round-robin 路由假设及 host split 推导。实际 count collective 及 wait 节点仍在图中；后续 token／score dispatch 显式依赖 received-count tensor。缺少同步 count 依赖时报错。
 
+完整入口还声明 synthetic SPMD 同 geometry 来源；适配核验所有 router 的 force-load-balance 后交付版本化全组分流证明。证明保存在对应原生 autograd 节点上，反向捕获使用转置事实；普通局部 split 不自动升级为全组事实。字段、缓冲关系和缺失处理统一见[通信语义事实](capture-runtime.md#通信语义事实-v1)。
+
 上游应按规范化 `all_to_all` 类型和通信描述消费，不依赖旧 `c10d.alltoall_` raw 名称。EP 交换现在记录为 `_c10d_functional.all_to_all_single.default`；group、ranks、dtype、payload、F/B 归属及实际 tensor 依赖继续保留。
 
 返回图的 `annotations["runtime_capabilities"]` 包含：

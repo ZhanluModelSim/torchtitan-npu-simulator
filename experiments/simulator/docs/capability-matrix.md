@@ -8,14 +8,16 @@
 | --- | --- | --- |
 | DeepSeek-V4 | smoke、flash、pro、pro_20t 结构 preset；原生 attention/compressor/indexer loss/mHC/MoE/shared expert；MTP 0/1 有回归 | `config.py`、`presets.py`；[test_dsv4_capture.py](../tests/test_dsv4_capture.py) |
 | Kimi K3 | 原生模型与 loss、MoE、共享组件；KDA/attention/SiTU 采用显式 Meta 虚拟融合；不提供真实 KDA 硬件 kernel | `compat/kimi.py`；[test_kimi_capture.py](../tests/test_kimi_capture.py)、[test_kimi_parallel.py](../tests/test_kimi_parallel.py) |
-| Qwen3.5 | 上游 TorchTitan 0.3.0 原生模型、MoE；GDN 与 FlexAttention 采用显式 Meta 虚拟融合；文本捕获（vision detach）、无 MTP；CP／量化未接入 | `compat/qwen3_5.py`；[test_qwen3_5_capture.py](../tests/test_qwen3_5_capture.py)、[接入记录](qwen3-5-integration.md) |
-| DeepSeek-V4.1 | 主包原生模型、MoE、mHC 与 host-offload Engram 表（Meta 初始化桥，CPU 稀疏表豁免 dense 梯度契约）；attention 元数据经 `build_attention_masks` 适配到逐后端 map；文本 debugmodel 捕获，MTP／CP／量化未接入 | `compat/deepseek_v4_1.py`；[test_deepseek_v4_1_capture.py](../tests/test_deepseek_v4_1_capture.py) |
+| Kimi K3.1 Pro | 复用 K3，24 个 MLA 层增加冻结 DSA indexer；长序列 Meta 捕获采用选取／稀疏注意力正反向融合契约，普通设备保持 ATen 参考路径，短序列复用 dense 边界；不含索引器蒸馏、量化或融合 NPU 性能验证 | [接入说明](kimi-k3-1.md)、[test_kimi_k3_1_capture.py](../tests/test_kimi_k3_1_capture.py) |
+| Qwen3-32B | dense：上游 torchtitan qwen3 几何（64 层、GQA 64:8、QK-norm、SwiGLU、不 tie 头）；attention 走真实融合算子 `npu_fusion_attention_v3`/`_grad_v3`（TND varlen，Meta 上由 [compat/attention.py](../torchtitan_simulator/compat/attention.py) 桥接 autograd）；`qwen3_32b_smoketest`（4 层切片）与 `qwen3_32b`（完整几何）有捕获回归；并行（FSDP/HSDP/DDP/TP×AC、首末与中间 rank）、双卸载与 CPU 数值参考已验证，CP/EP 显式拒绝；量化与真机数值未覆盖 | `override/common/varlen_attention.py`、[test_qwen3_capture.py](../tests/test_qwen3_capture.py)、[test_qwen3_parallel.py](../tests/test_qwen3_parallel.py)、[test_qwen3_offload.py](../tests/test_qwen3_offload.py) |
+| system3 | 参照 MindSpeed fsdp2 版实现移植：ISA 递归块、条件 Engram 表、MoE 与共享专家；调试/完整/单元结构 preset（unit_text 为外推基准）；attention 走分解路径，FA 融合接入待启用 | `torchtitan_npu/models/system3/`、[test_system3_capture.py](../tests/test_system3_capture.py) |
 | 原生配置与 override | `prepare_config()` 创建新配置，默认或显式 `override_imports`；`module.factory` 不绕过模型白名单或运行接口要求 | [test_config.py](../tests/test_config.py)、[test_model_overrides.py](../tests/test_model_overrides.py) |
 | 模型几何覆盖 | typed `model_overrides` 只适用于受支持的 DSV4 preset；自定义工厂负责自己的原生配置树 | `model_overrides.py`、[接入接口](upstream-integration.md) |
 | 训练精度 | 当前完整 DSV4/Kimi/Qwen3.5 捕获要求原始参数 FP32；计算参数 BF16/FP32，梯度归约 FP32；build-only 接受不等于完整捕获可用 | [test_precision.py](../tests/test_precision.py)、[test_kimi_capture.py](../tests/test_kimi_capture.py) |
 | MXFP8 | 显式 `enable_quantized_training` 和原生 `all_mxfp8` recipe；需要配套 TorchAO-NPU，不能从 preset 名称推断；保留实际 code/scale 与原生参数选择 | [test_s4_mxfp8.py](../tests/test_s4_mxfp8.py)、[test_kimi_quantization.py](../tests/test_kimi_quantization.py) |
 | AC 与 selective save-set | none/full/selective；选择项以 `selective_ac.py` 为准；未命中实际 comm cache 时 warning，不伪造命中 | [test_s3_native_lifetimes.py](../tests/test_s3_native_lifetimes.py)、[test_s4_mxfp8.py](../tests/test_s4_mxfp8.py) |
 | GBS／GA 与稳态捕获 | 默认先按 GA 预热一轮，再捕获单 microbatch F/B 与一次 O；scheduler 不参与预热；GA 时间展开由下游处理 | [test_warmup.py](../tests/test_warmup.py)、[结构预热](steady-state-capture.md) |
+| Muon 混合优化器 | DSV4，TP=CP=PP=1；原生 DistMuon＋AdamW、DP/HSDP/EP、矩阵计算和双向 all-to-all；EP=1 的 Shard(1)→Shard(0) 转换提前拒绝，合法 Shard(0) 路径保留；不执行真实 peer 计划哈希比较；拒绝量化、replica dedup、native swap/virtual；支持整段聚合状态卸载 | [Muon 捕获](muon.md)、[捕获测试](../tests/test_muon_capture.py)、[预取依赖测试](../tests/test_muon_dependencies.py) |
 
 ## 并行、捕获与交付
 
@@ -23,6 +25,7 @@
 | --- | --- | --- |
 | DP/FSDP/HSDP、EP、TP/SP、CP | 按原生 parallelize 与合法 mesh 执行；单进程捕获一个 logical rank；各模型组合以对应测试为准，不代表全部并行度笛卡尔积 | `compat/distributed.py`；[test_dsv4_capture.py](../tests/test_dsv4_capture.py)、[test_kimi_parallel.py](../tests/test_kimi_parallel.py) |
 | 原生通信与 autograd | functional/c10d/DTensor transport、实际 group/ranks、归约到 clip/update 的依赖；fake process group 不证明真实 HCCL 性能 | [test_native_collectives.py](../tests/capture/test_native_collectives.py)、[test_fsdp_group_capture.py](../tests/test_fsdp_group_capture.py) |
+| 通信语义事实 v2 | 四个精确 AG／RS／AR／A2A 原语的组、归约和缓冲事实。记录 RS 原生标量乘数以及已证明的 EP 全组分流与反向转置，缺字段时标记 unresolved | [通信事实契约](capture-runtime.md#通信语义事实-v2)、[test_collective_facts.py](../tests/capture/test_collective_facts.py) |
 | EP single exchange | DSV4/Kimi 共用原生 functional single 适配；count/data/score 顺序和异常恢复；均衡路由是声明假设 | [EP 交换说明](ep-single-transport.md)、[test_routing.py](../tests/test_routing.py) |
 | 流与事件等待 | 同流前沿、event record 快照、wait_event/wait_stream、零耗时控制节点；无等待的流保持独立 | [流控制依赖](stream-control-dependencies.md)、[test_fsdp_stream_capture.py](../tests/test_fsdp_stream_capture.py) |
 | FSDP 通信视图 | 默认隐藏 FSDP scope 非通信准备工作，保留通信/模型计算/控制依赖；源图保留作审计，内存不跟随过滤 | [捕获契约](capture-runtime.md#fsdp-通信视图)、[test_fsdp_communication_view.py](../tests/capture/test_fsdp_communication_view.py) |
@@ -36,9 +39,9 @@
 | --- | --- | --- |
 | storage 生命周期 | tensor/storage/generation 分开，alias/mutation、真实保存值、原生所有权；候选通知不替代释放确认 | [test_saved_tensor_identity.py](../tests/capture/test_saved_tensor_identity.py)、[test_storage_lifetime_capture.py](../tests/test_storage_lifetime_capture.py) |
 | FSDP full/shard 驻留 | 实际 AG staging、full allocation、wait/reshard/finalize 区间；不按 Python view 是否存活推断设备驻留 | [test_fsdp_residency.py](../tests/capture/test_fsdp_residency.py)、[内存测试](../tests/memory/) |
-| 稳态状态预算 | 实际本地 optimizer state 去重；四个峰值、权重与状态独立大小；预热后初始状态仍计入 | [稳态内存](steady-state-memory.md)、[test_optimizer_state.py](../tests/memory/test_optimizer_state.py) |
+| 稳态状态预算 | 实际本地 optimizer state 去重；四个峰值、权重与状态独立大小；预热后初始状态与 Muon runtime 常驻工作缓冲均计入 | [稳态内存](steady-state-memory.md)、[test_optimizer_state.py](../tests/memory/test_optimizer_state.py) |
 | 激活卸载 | 独立开关；逐层 payload、H2D/D2H/等待和派生静态驻留；head/层外值保留，晚 producer 保守处理；不执行真实 copy | [激活卸载](activation-offload-design.md)、[test_activation_transfers.py](../tests/capture/test_activation_transfers.py) |
-| 优化器卸载 | 独立开关；按本卡真实状态量生成双向窗口，不改 AdamW 耗时；峰值按约定忽略逐 tensor 搬运 buffer | [优化器卸载](optimizer-offload.md)、[test_optimizer_transfers.py](../tests/capture/test_optimizer_transfers.py) |
+| 优化器卸载 | AdamW 保留更新窗口；DSV4 Muon 覆盖整个混合 optimizer step，H2D/D2H 与原生 DAG 并行；按本卡真实状态量传输，忽略状态 staging buffer；Muon 常驻工作缓冲保留 | [优化器卸载](optimizer-offload.md)、[test_optimizer_transfers.py](../tests/capture/test_optimizer_transfers.py)、[Muon 卸载测试](../tests/test_muon_offload.py) |
 | shard dtype 投影 | `memory_parameter_storage_dtype` 只改常驻权重字节投影，不修改计算、梯度、状态和通信 dtype | [test_memory_delivery.py](../tests/test_memory_delivery.py)、[test_precision.py](../tests/test_precision.py) |
 
 ## 未支持或不由本仓证明的范围

@@ -42,7 +42,8 @@ def apply_optimizer_offload_budget(memory: MemoryPlan) -> MemoryPlan:
     result.steady_state_peak_active_bytes = max(peaks.values())
     result.notes.append(
         "Optimizer states are host-resident in F/B/O; aggregate full-duplex transfers overlap "
-        "device optimizer updates. Transient per-tensor state buffers are ignored by policy; "
+        "the native optimizer window under an ideal pipeline approximation. State staging buffers "
+        "are omitted; native persistent workspace and compute temporaries remain resident. "
         "optimizer_state_bytes remains the observed per-direction payload inventory."
     )
     return result

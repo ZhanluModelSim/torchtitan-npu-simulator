@@ -333,6 +333,9 @@ class OpDispatchCapture(TorchDispatchMode):
         output_ids = {id(tensor) for tensor in flat_outputs}
         flat_outputs.extend(tensor for tensor in mutated_inputs if id(tensor) not in output_ids)
         annotations: dict[str, Any] = {}
+        from torchtitan_simulator.capture.optimizer import parameter_update_annotations
+
+        annotations.update(parameter_update_annotations(str(func), mutated_inputs))
         if self._dispatch_annotation_scopes:
             annotations["framework_scopes"] = list(self._dispatch_annotation_scopes)
         # AdamW inputs use schema order for its six list roles; keep generic
@@ -353,9 +356,15 @@ class OpDispatchCapture(TorchDispatchMode):
             annotations.update(optimizer_annotations(list(binding.tensor_lists[0])))
         operands = transport_operands(func, args)
         source_op_id = self.producer_op(operands.inputs[0]) if operands is not None else None
+        from torchtitan_simulator.capture.collective_facts import native_collective_facts
 
+        collective_facts = (
+            native_collective_facts(func, args, kwargs, operands, result) if operands is not None else None
+        )
         if operands is not None:
             attrs.update(operands.attributes())
+        if collective_facts is not None:
+            attrs["collective_facts"] = collective_facts
         module_path = self.module_path_tracker.current_path() if self.module_path_tracker else ""
         op_id = self._record_event(
             str(func),
@@ -673,6 +682,8 @@ class OpDispatchCapture(TorchDispatchMode):
         instance["end_seq_idx"] = seq_idx
         if visible_in_ir:
             extra_annotations = dict(extra_annotations or {})
+            if self._dispatch_annotation_scopes:
+                extra_annotations["framework_scopes"] = list(self._dispatch_annotation_scopes)
             if execution_stream is not None:
                 extra_annotations["stream_id"] = self.stream_id(execution_stream)
                 extra_annotations["stream_predecessors"] = list(stream_predecessors)

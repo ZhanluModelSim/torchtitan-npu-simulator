@@ -204,8 +204,8 @@ def test_legacy_collective_retains_actual_reduce_op_enum(tmp_path, operation):
         dist.destroy_process_group()
 
 
-def test_premul_sum_is_explicitly_unsupported_instead_of_plain_sum():
+def test_premul_sum_preserves_its_native_reduce_op_identity():
     reduction = torch._C._distributed_c10d._make_nccl_premul_sum(0.5)
     attrs = operator_attributes(torch.ops.c10d.allreduce_.default, ([], None, reduction, None), {})
 
-    assert attrs["reduce_op"] == "unsupported:premul_sum"
+    assert attrs["reduce_op"] == "premul_sum"

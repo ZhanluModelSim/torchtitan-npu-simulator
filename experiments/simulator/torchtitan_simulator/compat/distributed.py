@@ -14,6 +14,7 @@ from typing import Any, cast
 import torch
 import torch.distributed as dist
 
+from torchtitan_simulator.capture.collective_facts import install_reduce_scatter_observer
 from torchtitan_simulator.compat.device import MetaDeviceModule
 
 
@@ -22,6 +23,17 @@ def install_meta_fsdp(scope):
 
     device_module = MetaDeviceModule()
     scope.replace(torch, "meta", device_module)
+    original_device_module = torch.get_device_module
+
+    def get_device_module(device=None):
+        # PyTorch caches device modules globally. A cached Meta handle belongs
+        # to a previous session and would switch a different stream ContextVar
+        # than the one observed by dispatch capture through the current torch.meta.
+        if isinstance(device, (str, torch.device)) and torch.device(device).type == "meta":
+            return device_module
+        return original_device_module(device)
+
+    scope.replace(torch, "get_device_module", get_device_module)
     if hasattr(torch.accelerator, "current_stream"):
         original_stream = torch.accelerator.current_stream
 
@@ -85,6 +97,7 @@ def logical_world(prepared, runtime, *, rank=0):
     try:
         utils.set_spmd_backend(prepared.trainer.parallelism.spmd_backend)
         install_meta_fsdp(runtime.patches)
+        install_reduce_scatter_observer(runtime.patches)
         # Cached DTensor output specs retain DeviceMesh objects. Equal logical
         # worlds rebuilt in one process must not reuse the previous world's
         # mesh identity (FSDP validates identity, not just rank equality).

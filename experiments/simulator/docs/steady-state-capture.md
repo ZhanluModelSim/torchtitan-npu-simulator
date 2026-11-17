@@ -23,7 +23,7 @@
 
 `batch_configuration.memory_scope` 标明预热后的单 microbatch 静态预算。预热执行完整 GA 不表示正式图或显存预算包含多 microbatch 回放。
 
-正式捕获开始时登记真实 optimizer state；结束时按实际本地 storage 清单重分类为 optimizer_state，并按 storage 身份去重。已有状态不会因初始输入和最终清单各出现一次而重复计数。卸载仍从正式静态预算排除状态，原始状态量保留；逐层激活不混入预热保存值。
+正式捕获开始时登记真实 optimizer state；结束时按实际本地 storage 清单重分类为 optimizer_state，并按 storage 身份去重。已有状态不会因初始输入和最终清单各出现一次而重复计数。 Muon runtime 在 warmup 后持有的 local／双通信 slot 工作缓冲也登记为初始驻留，覆盖 F/B/O；它们与 optimizer state 分开，不随状态卸载排除。预热消除初始化计算，初始登记保留已分配容量，二者不能互相替代。卸载仍从正式静态预算排除状态，原始状态量保留；逐层激活不混入预热保存值。
 
 不按 `zeros`、`empty` 或 `fill` 名称删除节点：正常每轮的 MoE 计数清理必须保留。Meta 捕获和逻辑存储预算不证明真实设备数值或 allocator 峰值。
 

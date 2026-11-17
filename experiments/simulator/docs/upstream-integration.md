@@ -56,11 +56,12 @@ workload = main([
 | `selective_ac_save_ops` | `--simulation.selective-ac-save-ops` | selective 保存集合，未传使用默认，空列表与未传不等价 |
 | `training_dtype` | `--training.dtype` | 原始参数 dtype；当前完整捕获使用 float32 |
 | `mixed_precision_param`／`mixed_precision_reduce` | `--training.mixed-precision-param`／`--training.mixed-precision-reduce` | 实际计算参数与归约 dtype，不是纯内存假设 |
+| `optimizer_name`／`muon_ns_steps` | `--optimizer.name`／`--optimizer.muon-ns-steps` | 保留 recipe 默认或显式选择 AdamW／DSV4 Muon；可选覆盖 Muon 迭代次数；见 [Muon 范围与依赖](muon.md) |
 | `enable_quantized_training` | `--extension.quantization.enable-quantized-training` | 显式启用原生 MXFP8，默认关闭 |
 | `quantization_recipe` | `--extension.quantization.recipe` | 当前仅 `all_mxfp8` |
 | `memory_parameter_storage_dtype` | `--simulation.memory-parameter-storage-dtype` | 仅投影常驻本地参数 shard 字节 |
 | `memory_offload_ac_saved_tensors` | `--simulation.memory-offload-ac-saved-tensors` | 激活卸载执行图及静态预算 |
-| `memory_offload_optimizer_states` | `--simulation.memory-offload-optimizer-states` | 独立优化器状态卸载 |
+| `memory_offload_optimizer_states` | `--simulation.memory-offload-optimizer-states` | AdamW／DSV4 Muon 独立状态卸载；整段并行近似及工作缓冲口径见[优化器卸载](optimizer-offload.md) |
 | `output_dir`／`output_formats` | `--simulation.output-dir`／`--simulation.output-formats mem` | 可选显存导出位置／格式 |
 | `model_overrides` | `--model-overrides.*` | 类型化 DSV4 几何覆盖，重建完整配置树 |
 | `override_imports` | 无对应通用 CLI | Python 显式替换默认 override 列表；并非追加，慎用空列表 |
@@ -82,6 +83,7 @@ MXFP8 由开关选择，不使用旧 `_baseline_bf16`／`_baseline_mxfp8` preset
 | `workload.step_templates` | F/B/O 等原生捕获模板，节点保留数据／控制依赖；遍历全体模板建立全局 ID 索引 |
 | `workload.schedule_plan` | 原生 action／slot 计划；不能与平台 L1/L2 命名直接等同 |
 | `workload.iteration.schedule.annotations` | 捕获事实、配置、梯度验证、通信和静态内存等注记 |
+| 同级 `host_timings` | 单次宿主阶段墙钟诊断，每阶段 seconds／calls；包含嵌套子项，不可直接求和，不是模拟设备耗时，见 [Muon 规划与计时](muon.md#原生规划效率与宿主计时) |
 | 同级 `capture` | 实际预热／捕获边界，见稳态捕获专题；旧结果缺失不补造 |
 | 同级 `memory_plan`／`memory_summary` | 正式静态内存对象和摘要，单位 bytes，不依赖文件 |
 | `workload.captured_workload` | 完整源图，用于审计；默认下游消费返回的 FSDP 通信视图 |
@@ -96,3 +98,11 @@ F 内可能交错 lm_head/loss backward，不能只按 `phase` 切 F/B。原始 
 `output_formats=[]` 不写文件；`["mem"]` 写 `memory/memory_summary.json` 和事件／timeline／storage／保存值／FSDP 等诊断明细。`export_result()` 也按该选项控制。无 JSON/HTML/DOT 图导出；平台自行保存其公共图快照。导出非原子事务，I/O 失败可能留下部分文件，每次使用独立目录，旧文件不自动清理。
 
 接入至少运行一次完整 F/B/O，再在同一进程顺序执行第二次，检查返回图可消费、梯度齐全、图无环、状态不泄漏，且第一张图仍可读取。验证缺失与无状态零值的区别，不能只比较输出文件是否存在。真实模型测试入口见 `tests/test_dsv4_capture.py`、`tests/test_kimi_capture.py`、`tests/test_memory_delivery.py` 和 `tests/test_runtime.py`；新模型步骤见模型接入流程。
+
+## 只读配置目录
+
+`torchtitan_simulator.configuration_metadata.describe_configuration()` 从 `SimulationConfig`、已登记的原生 preset 工厂和 DeepSeek-V4 几何读取逻辑生成表单元数据。返回相对训练配置的 `model_reset_paths`、公共 `fields` 和 `models`；字段的 `default`、选项和赋值使用 Python 原生值，由平台统一编码 TOML literal。`None` 表示没有可用默认提示，不代表 TOML 值。
+
+每个模型条目的 `identity` 只包含 `config`；`assignments` 另设置默认 MTP 数量。选择模型时只重置 `config`、`model_overrides` 和结构字段 `num_mtp_modules`，保留精度、并行、输入、优化器和卸载配置。缺失字段继承原生默认，提示值不要求写入任务。DeepSeek-V4 的几何提示复用 override 的同一读取逻辑；Qwen3 和 Kimi K3 保留现有不支持 flat `model_overrides` 的限制。
+
+目录生成会导入框架配置，但不创建模型、不执行 override、不抓图，不加载任意用户 `module.factory`。普通 `torchtitan_simulator` 导入仍不加载 Torch。目录不是运行时预检或捕获成功证明。

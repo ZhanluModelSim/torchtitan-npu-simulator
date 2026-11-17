@@ -27,6 +27,8 @@ class SimulationConfig:
     training_dtype: str | None = None
     mixed_precision_param: str | None = None
     mixed_precision_reduce: str | None = None
+    optimizer_name: Literal["AdamW", "Muon"] | None = None
+    muon_ns_steps: int | None = None
     num_mtp_modules: int = 0
     output_dir: str = "./simulator_output"
     output_formats: list[str] = field(default_factory=list)
@@ -145,6 +147,13 @@ _COMMON_OVERRIDES = [
     "torchtitan_npu.override.common.token_dispatcher.asc",
 ]
 
+_QWEN3_OVERRIDES = [
+    "torchtitan_npu.override.common.rms_norm.asc",
+    # Dense GQA attention on the real fused CANN kernel; the simulator bridges
+    # its autograd on Meta (see compat/attention.py).
+    "torchtitan_npu.override.common.varlen_attention.asc",
+]
+
 _DSV4_OVERRIDES = [
     *_COMMON_OVERRIDES,
     "torchtitan_npu.override.common.rope.asc_complex",
@@ -173,28 +182,67 @@ _DSV4_1_OVERRIDES = [
 ]
 
 
+def _optimizer_selection(simulation: SimulationConfig, trainer: Any) -> str:
+    optimizer = trainer.optimizer
+    has_muon = any(group.optimizer_name == "DistMuon" for group in optimizer.param_groups)
+    if simulation.optimizer_name == "AdamW" and has_muon:
+        raise ValueError("Explicit AdamW requires a recipe with AdamW groups; the factory already materialized Muon")
+    return simulation.optimizer_name or ("Muon" if has_muon else getattr(optimizer, "name", "AdamW"))
+
+
+def _prepare_optimizer(simulation: SimulationConfig, trainer: Any, *, materialize: bool = True) -> None:
+    """Materialize the model-owned Muon policy after geometry and overrides."""
+    selected = _optimizer_selection(simulation, trainer)
+    optimizer = trainer.optimizer
+    if selected != "Muon":
+        if simulation.muon_ns_steps is not None:
+            raise ValueError("muon_ns_steps requires optimizer_name=Muon or a native Muon recipe")
+        if materialize and simulation.optimizer_name is not None and hasattr(optimizer, "name"):
+            optimizer.name = simulation.optimizer_name
+        return
+    if trainer.model_spec.name != "deepseek_v4" or getattr(optimizer, "_muon_profile", None) is None:
+        raise ValueError("Muon simulation requires a DeepSeek-V4 recipe with a native Muon profile")
+    if simulation.tensor_parallel_degree != 1 or simulation.context_parallel_degree != 1:
+        raise ValueError("Muon simulation currently requires TP=1 and CP=1")
+    if simulation.enable_quantized_training:
+        raise ValueError("Muon simulation with quantized training is not supported")
+    if getattr(optimizer, "muon_enable_hsdp_replica_dedup", False):
+        raise ValueError("Muon simulation does not yet support HSDP replica dedup")
+    if any(entry.startswith("torchtitan_npu.override.common.optimizer.") for entry in trainer.override.imports):
+        raise ValueError("Muon simulation does not support native swap or virtual optimizer overrides")
+    if not materialize:
+        return
+    optimizer.name = "Muon"
+    if simulation.muon_ns_steps is not None:
+        optimizer.muon_ns_steps = simulation.muon_ns_steps
+    optimizer.materialize()
+
+
+PRESET_FACTORIES = {
+    "kimi_k3_smoketest": "torchtitan_npu.models.kimi_k3.config_registry.kimi_k3_debugmodel",
+    "kimi_k3_full": "torchtitan_npu.models.kimi_k3.config_registry.kimi_k3_full",
+    "kimi_k3_16layer_reduced": "torchtitan_npu.models.kimi_k3.config_registry.kimi_k3_16layer_reduced",
+    "kimi_k3_1_smoketest": "torchtitan_npu.models.kimi_k3_1.config_registry.kimi_k3_1_debugmodel",
+    "kimi_k3_1_full": "torchtitan_npu.models.kimi_k3_1.config_registry.kimi_k3_1_full",
+    "kimi_k3_1_16layer_reduced": "torchtitan_npu.models.kimi_k3_1.config_registry.kimi_k3_1_16layer_reduced",
+    "deepseek_v4_smoketest": "torchtitan_npu.models.deepseek_v4.config_registry.deepseek_v4_debugmodel",
+    "deepseek_v4_flash": "torchtitan_npu.models.deepseek_v4.config_registry.deepseek_v4_flash",
+    "deepseek_v4_pro": "torchtitan_npu.models.deepseek_v4.config_registry.deepseek_v4_pro",
+    "deepseek_v4_pro_20t": "torchtitan_simulator.presets.deepseek_v4_pro_20t",
+    "qwen3_32b_smoketest": "torchtitan_npu.models.qwen3.config_registry.qwen3_32b_smoketest",
+    "qwen3_32b": "torchtitan_npu.models.qwen3.config_registry.qwen3_32b",
+    "system3_debugmodel_text": "torchtitan_npu.models.system3.config_registry.system3_debugmodel_text",
+    "system3_debugmodel_multimodal": "torchtitan_npu.models.system3.config_registry.system3_debugmodel_multimodal",
+    "system3_full_text": "torchtitan_npu.models.system3.config_registry.system3_full_text",
+    "system3_unit_text": "torchtitan_npu.models.system3.config_registry.system3_unit_text",
+}
+
+
 def prepare_config(simulation: SimulationConfig) -> PreparedConfig:
     """Resolve a fresh native config before any model or parallel initialization."""
     simulation.validate()
     simulation = copy.deepcopy(simulation)
-    factories = {
-        "kimi_k3_smoketest": "torchtitan_npu.models.kimi_k3.config_registry.kimi_k3_debugmodel",
-        "kimi_k3_full": "torchtitan_npu.models.kimi_k3.config_registry.kimi_k3_full",
-        "kimi_k3_16layer_reduced": "torchtitan_npu.models.kimi_k3.config_registry.kimi_k3_16layer_reduced",
-        "deepseek_v4_smoketest": "torchtitan_npu.models.deepseek_v4.config_registry.deepseek_v4_debugmodel",
-        "deepseek_v4_flash": "torchtitan_npu.models.deepseek_v4.config_registry.deepseek_v4_flash",
-        "deepseek_v4_pro": "torchtitan_npu.models.deepseek_v4.config_registry.deepseek_v4_pro",
-        "deepseek_v4_pro_20t": "torchtitan_simulator.presets.deepseek_v4_pro_20t",
-        "qwen3_5_debugmodel": "torchtitan_simulator.presets.qwen3_5_debugmodel",
-        "qwen3_5_debugmodel_moe": "torchtitan_simulator.presets.qwen3_5_debugmodel_moe",
-        "deepseek_v4_1_debugmodel_text": "torchtitan_simulator.presets.deepseek_v4_1_debugmodel_text",
-        "deepseek_v4_1_debugmodel_multimodal": "torchtitan_simulator.presets.deepseek_v4_1_debugmodel_multimodal",
-        "system3_debugmodel_text": "torchtitan_npu.models.system3.config_registry.system3_debugmodel_text",
-        "system3_debugmodel_multimodal": "torchtitan_npu.models.system3.config_registry.system3_debugmodel_multimodal",
-        "system3_full_text": "torchtitan_npu.models.system3.config_registry.system3_full_text",
-        "system3_unit_text": "torchtitan_npu.models.system3.config_registry.system3_unit_text",
-    }
-    target = factories.get(simulation.config, simulation.config)
+    target = PRESET_FACTORIES.get(simulation.config, simulation.config)
     if "." not in target:
         raise ValueError(f"Unknown simulator preset {simulation.config!r}; use a supported preset or module.factory")
     module_name, factory_name = target.rsplit(".", 1)
@@ -203,7 +251,7 @@ def prepare_config(simulation: SimulationConfig) -> PreparedConfig:
     if simulation.model_overrides is not None:
         from torchtitan_simulator.model_overrides import apply_model_overrides
 
-        if target not in set(factories.values()) or trainer.model_spec.name != "deepseek_v4":
+        if target not in set(PRESET_FACTORIES.values()) or trainer.model_spec.name != "deepseek_v4":
             raise ValueError(
                 "Flat model_overrides require a supported simulator preset; custom factories own their config trees"
             )
@@ -217,8 +265,10 @@ def prepare_config(simulation: SimulationConfig) -> PreparedConfig:
         if value is not None:
             setattr(trainer.training, target_name, value)
     model = trainer.model_spec.model
-    if trainer.model_spec.name not in {"deepseek_v4", "deepseek_v4_1", "kimi_k3", "qwen3_5", "system3"}:
-        raise ValueError("Supported model families are deepseek_v4, deepseek_v4_1, kimi_k3, qwen3_5 and system3")
+    if trainer.model_spec.name == "kimi_k3_1" and simulation.enable_quantized_training:
+        raise ValueError("Kimi K3.1 capture currently supports unquantized training only")
+    if trainer.model_spec.name not in {"deepseek_v4", "kimi_k3", "kimi_k3_1", "qwen3", "system3"}:
+        raise ValueError("Supported model families are deepseek_v4, kimi_k3, kimi_k3_1, qwen3 and system3")
     adaptations = []
     if simulation.model_overrides is not None:
         adaptations.append("typed geometry overrides rebuilt the complete native model configuration tree")
@@ -260,9 +310,9 @@ def prepare_config(simulation: SimulationConfig) -> PreparedConfig:
         (
             {
                 "deepseek_v4": _DSV4_OVERRIDES,
-                "deepseek_v4_1": _DSV4_1_OVERRIDES,
                 "kimi_k3": _COMMON_OVERRIDES,
-                "qwen3_5": _QWEN3_5_OVERRIDES,
+                "kimi_k3_1": _COMMON_OVERRIDES,
+                "qwen3": _QWEN3_OVERRIDES,
                 "system3": _COMMON_OVERRIDES,
             }[trainer.model_spec.name]
         )
@@ -270,6 +320,7 @@ def prepare_config(simulation: SimulationConfig) -> PreparedConfig:
         else simulation.override_imports
     )
     model.update_from_config(config=trainer)
+    _prepare_optimizer(simulation, trainer, materialize=False)
     quantization = None
     if hasattr(trainer, "extension"):
         quantization = trainer.extension.quantization
@@ -289,6 +340,7 @@ def prepare_config(simulation: SimulationConfig) -> PreparedConfig:
     from torchtitan.config.override import apply_overrides
 
     adaptations.extend(apply_overrides(trainer.override, trainer))
+    _prepare_optimizer(simulation, trainer)
     for name, choices in (
         ("dtype", {"float32", "bfloat16"}),
         ("mixed_precision_param", {"float32", "bfloat16"}),

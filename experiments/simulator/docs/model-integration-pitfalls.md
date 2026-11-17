@@ -2,6 +2,16 @@
 
 本页保存从现有模型获得的可复用经验。先按[接入工作流](model-integration.md)确定变更和验收范围；此处用于解释常见错误的原因，不把某次历史测试结果当作新模型通过证据。
 
+## 新 family 接入时运行期才暴露的约定
+
+| 症状 | 根因 | 正确处理 |
+| --- | --- | --- |
+| 捕获完成后 `AttributeError: 'Config' object has no attribute 'n_layers'` | runner 汇总读取 `model_spec.model.n_layers`，上游/自建 Config 未必有该字段 | 在 Config 上提供 property 从 `layers` 派生（层切片 preset 不会漂移） |
+| 自建 `build_attention_masks` 对 load_balancer_type 立即 raise | torchtitan `ParallelismConfig.context_parallel_load_balancer` 默认非 None，runner 原样透传 | factory 显式 `ParallelismConfig(context_parallel_load_balancer=None)`（Kimi/qwen3 均如此） |
+| MoE 模型直接换 dense 模型后 `install_balanced_dispatch` 报"requires verified balanced routing" | 旧版对无 router 模型直接 raise | 现已对 dense 返回 `not-applicable-dense`；新 family 应在捕获测试中断言该能力标记 |
+| 数值参考对照 attention 偏差巨大 | 上游 `FusedQKVLinear` 的融合权重**按 KV 组交织**（`r_dim = heads_per_kv + 2`，每组 [Q×hpk, K, V]），不是 [Wq;Wk;Wv] 拼接；state dict 经 hook 转回 wq/wk/wv | 参考实现按 `view(B, S, n_kv, r_dim, hd)` 切片，见 [test_qwen3_numerics.py](../tests/test_qwen3_numerics.py) |
+| varlen 元数据传给 NPU 算子后行为异常 | Ascend `actual_seq_qlen/kvlen` 是**不含前导 0** 的累加和；`VarlenMetadata.cu_seq_q` 以 0 开头 | 传 `cu_seq_q[1:]`；约定来源是 torch_npu binding docstring，不确定时先读 docstring 再探测 |
+
 ## 构建与配置正常，实际路径却不对
 
 | 症状 | 常见原因／应检查的位置 | 正确处理 |
@@ -44,6 +54,8 @@ Meta 输出可以新建；autograd 应保存的前向输入不能用同 shape �
 新自定义边界必须有 [`tensor_semantics`](custom-tensor-semantics.md)。例如 Kimi attention 为 B/H/S/D，KDA 为 B/S/H/D，不能通用地把第二维当作序列。MLA 的 V 已 padding，边界 shape 是填充后的宽度。SiTU 前轴未知就用 `None`，不能凭 rank 猜 batch/token。可选输入缺席与 shape 为 0 的真实 tensor 不同，后者仍占索引；同一 tensor 多次出现也不能按身份去重输入。
 
 原生 CANN 可用时不要手工再插一个融合节点；兼容层只补已确认的 Meta/autograd 缺口，并保持原始 raw overload。真实设备 provider 与纯 Meta 虚拟实现分开说明，不能因捕获通过宣称 kernel 数值可用。
+
+桥接真实算子（如 `npu_fusion_attention_v3`）时，保存集按其梯度 kernel 的**完整 schema** 推导：所有可选输入都是潜在必要保存值——`npu_fusion_attention_grad_v3` 的 `attention_in` 就是前向输出 out（Flash 反向契约 q/k/v/out/LSE），漏存它时 Meta 形状推断照常通过，捕获、并行与卸载测试可以全部绿，缺陷只表现为 B 模板缺失对前向输出的保存激活依赖；直到用 storage_key 匹配（同形状占位无法通过）加 `autograd_saved_tensors` 生命周期断言才暴露并锁住（[test_qwen3_capture.py](../tests/test_qwen3_capture.py)、e00dc90a）。Meta 前向通过不构成保存集完整的证据。
 
 ## 首轮与稳态、chunked loss 和阶段边界
 

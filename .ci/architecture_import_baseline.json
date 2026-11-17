@@ -29,6 +29,7 @@
   ],
   "activation_order": {
     "torchtitan_npu/extensions/__init__.py": [
+      ".torchtitan.distributed.flex_shard.optimizer_reshard",
       ".torchtitan.ep_process_group",
       ".torchtitan.trainer",
       ".torchtitan.components.metrics",

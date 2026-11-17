@@ -79,13 +79,10 @@ def _reduce_op_literal(value: Any) -> str | None:
         return None
 
     operation_id = int(operation)
-    for name in ("SUM", "PRODUCT", "MIN", "MAX", "AVG", "BAND", "BOR", "BXOR"):
+    # This literal carries identity only. The scalar belongs to collective_facts.
+    for name in ("SUM", "PRODUCT", "MIN", "MAX", "AVG", "BAND", "BOR", "BXOR", "PREMUL_SUM"):
         if operation_id == int(getattr(ReduceOp, name)):
             return name.lower()
-    # PREMUL_SUM's factor is not exposed by the ScriptObject getter. Preserve
-    # the unsupported identity instead of silently treating it as ordinary SUM.
-    if operation_id == int(ReduceOp.PREMUL_SUM):
-        return "unsupported:premul_sum"
     return f"unsupported:reduce_op:{operation_id}"
 
 
