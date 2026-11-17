@@ -266,6 +266,7 @@ PRESET_FACTORIES = {
     "deepseek_v4_1_debugmodel_multimodal": "torchtitan_simulator.presets.deepseek_v4_1_debugmodel_multimodal",
     "sys2mot_debugmodel_multimodal": "torchtitan_npu.models.sys2mot.config_registry.sys2mot_debugmodel_multimodal",
     "sys2mot_mid_multimodal": "torchtitan_npu.models.sys2mot.config_registry.sys2mot_mid_multimodal",
+    "sys2mot_mid_ep_multimodal": "torchtitan_npu.models.sys2mot.config_registry.sys2mot_mid_ep_multimodal",
 }
 
 

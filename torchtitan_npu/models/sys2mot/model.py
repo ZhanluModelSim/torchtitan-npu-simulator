@@ -1330,16 +1330,18 @@ class Sys2MotModel(Decoder):
                     "grouped output low-rank factors and the mHC branch mixing would all need "
                     "sharded layouts; capture covers DP/FSDP only"
                 )
-            if parallelism.expert_parallel_degree > 1:
+            if getattr(parallelism, "expert_tensor_parallel_degree", 1) > 1:
                 raise NotImplementedError(
-                    "sys2mot does not support expert parallel yet: the routed experts are "
-                    "grouped-GEMM weights on the shared dispatcher, and EP sharding/placement "
-                    "is not validated for this family"
+                    "sys2mot does not implement expert tensor parallelism: the grouped-GEMM "
+                    "experts shard across the EP mesh only"
                 )
             Decoder.Config.update_from_config(self, config=config, **kwargs)
             from .sharding import set_sys2mot_sharding_config
 
-            set_sys2mot_sharding_config(self)
+            set_sys2mot_sharding_config(
+                self,
+                enable_ep=getattr(parallelism, "expert_parallel_degree", 1) > 1,
+            )
 
         def get_nparams_and_flops(self, model: Module, seq_len: int) -> tuple[int, int]:
             # Debug-grade estimate: touched parameter elements per prefix token

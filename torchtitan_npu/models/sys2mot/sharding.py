@@ -5,19 +5,21 @@
 
 """Sharding annotations for the sys2mot VLA.
 
-Capture covers DP/FSDP only (TP/CP/EP are rejected at the config level), so
-every state is placed replicated on the TP axis and left to FSDP. Child
-``Linear``/``Embedding``/``Conv2d`` configs carry no default annotations, so
-this walk annotates them explicitly; modules with plain parameters
-(Router, GroupedExperts, HyperMix, SparseAttention/ActionExpert ``oa``/``sink``,
-Engram gates, ViT delimiters, ActionMoT positions, RMSNorm) self-annotate in
-their ``Config.__post_init__``.
+TP/CP are rejected at the config level, so every state is placed replicated
+on the TP axis and left to FSDP; with EP the routed-expert grouped weights
+take the canonical sparse-family placement (expert dim on the EP mesh).
+Child ``Linear``/``Embedding``/``Conv2d`` configs carry no default
+annotations, so this walk annotates them explicitly; modules with plain
+parameters (Router, GroupedExperts, HyperMix, SparseAttention/ActionExpert
+``oa``/``sink``, Engram gates, ViT delimiters, ActionMoT positions, RMSNorm)
+self-annotate in their ``Config.__post_init__``.
 """
 
 from typing import TYPE_CHECKING
 
 import spmd_types as spmd
 from torchtitan.models.common.decoder_sharding import dense_param_placement, set_decoder_sharding_config
+from torchtitan.models.common.moe_sharding import expert_param_placement_sparse
 from torchtitan.protocols.sharding import ShardingConfig
 
 if TYPE_CHECKING:
@@ -36,8 +38,13 @@ def _replicate(config, *parameters: str) -> None:
         )
 
 
-def set_sys2mot_sharding_config(config: "Sys2MotModel.Config") -> None:
-    """Annotate every model state replicated; EP is rejected for this family."""
+def set_sys2mot_sharding_config(config: "Sys2MotModel.Config", *, enable_ep: bool = False) -> None:
+    """Annotate every state replicated on TP, left to FSDP.
+
+    With EP enabled the routed-expert grouped weights take the canonical
+    sparse-family placement instead (DP_REPLICATE/EFSDP replicated, EP
+    shard on the expert dim), matching the shared MoE decoder recipe.
+    """
     set_decoder_sharding_config(config, enable_sp=False)
     for layer_cfg in config.layers:
         attention = layer_cfg.attention
@@ -56,6 +63,14 @@ def set_sys2mot_sharding_config(config: "Sys2MotModel.Config") -> None:
         _replicate(moe.shared.gate, "weight")
         _replicate(moe.shared.up, "weight")
         _replicate(moe.shared.down, "weight")
+        if enable_ep:
+            experts = moe.routed_experts.inner_experts
+            experts.sharding_config = ShardingConfig(
+                state_shardings={
+                    name: expert_param_placement_sparse()
+                    for name in ("w_gate_EFD", "w_up_EFD", "w_down_EDF")
+                }
+            )
         if layer_cfg.engram is not None:
             _replicate(layer_cfg.engram.table, "weight")
             _replicate(layer_cfg.engram.project, "weight")
