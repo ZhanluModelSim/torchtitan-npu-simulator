@@ -1,0 +1,397 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+import csv
+import json
+from collections import Counter
+
+import pytest
+from torchtitan_simulator.cli import main
+from torchtitan_simulator.validation import validate_workload
+
+
+@pytest.fixture(scope="module")
+def exported_capture(tmp_path_factory):
+    directory = tmp_path_factory.mktemp("native_exports")
+    workload = main(
+        [
+            "--simulation.world-size",
+            "4",
+            "--parallelism.expert-parallel-degree",
+            "2",
+            "--training.num-mtp-modules",
+            "1",
+            "--simulation.output-dir",
+            str(directory),
+            "--simulation.output-formats",
+            "mem",
+        ]
+    )
+    return workload, directory
+
+
+def test_native_cli_exports_only_memory_and_preserves_raw_graph(exported_capture):
+    workload, directory = exported_capture
+    report = validate_workload(workload)
+    annotations = workload.iteration.schedule.annotations
+    assert annotations["capture_coordinates"]["logical_world_size"] == 4
+    assert annotations["rank_table"]["world_size"] == 4
+    assert annotations["capture_validation"] == report
+    assert {path.name for path in directory.iterdir()} == {"memory"}
+    memory = json.loads((directory / "memory/memory_summary.json").read_text())
+    assert memory == workload.iteration.schedule.annotations["memory_summary"]
+    assert set(memory) == {
+        "steady_state_active_bytes_peak",
+        "steady_state_forward_active_bytes_peak",
+        "steady_state_backward_active_bytes_peak",
+        "steady_state_optimizer_active_bytes_peak",
+        "persistent_param_bytes",
+        "optimizer_state_bytes",
+        "activation_offload_by_layer",
+    }
+    with (directory / "memory/memory_timeline.csv").open() as stream:
+        rows = list(csv.DictReader(stream))
+    active = peak = 0
+    for row in rows:
+        active += int(row["num_bytes"]) * (1 if row["action"] == "alloc" else -1)
+        assert active == int(row["active_bytes_after"])
+        peak = max(peak, active)
+    assert peak == report["peak_active_bytes"]
+    nodes = {node.op_id: node for template in workload.step_templates.values() for node in template.nodes.values()}
+    views = [node for node in nodes.values() if node.annotations.get("metadata_view")]
+    assert views
+    source_ids = {node.op_id for node in views}
+    assert source_ids <= set(annotations["native_dispatch_op_ids"])
+    assert any(node.predecessors and node.successors for node in views)
+    assert all(not hasattr(node, "flops") for node in views)
+
+
+def test_native_mem_summary_includes_optimizer_state_and_steady_phase_peaks(exported_capture):
+    workload, directory = exported_capture
+    summary = json.loads((directory / "memory/memory_summary.json").read_text())
+    layouts = workload.iteration.schedule.annotations["parameter_layouts"]
+    # Native fused AdamW: two FP32 moments plus one device FP32 step per parameter.
+    expected_state_bytes = 2 * sum(item["storage_bytes"] for item in layouts.values()) + 4 * len(layouts)
+    assert summary["optimizer_state_bytes"] == expected_state_bytes
+    plan = workload.iteration.schedule.annotations["memory_plan"]
+    assert summary["persistent_param_bytes"] == sum(item["storage_bytes"] for item in layouts.values())
+    assert plan.optimizer_state_storage_count == 3 * len(layouts)
+    assert workload.iteration.schedule.annotations["capture"]["mode"] == "post_warmup"
+    states = [item for item in plan.tensor_lifetimes if item.kind == "optimizer_state"]
+    assert all(item.birth_seq == -1 for item in states)
+    assert sum(item.num_bytes for item in states) == expected_state_bytes
+    for phase in ("forward", "backward"):
+        assert summary[f"steady_state_{phase}_active_bytes_peak"] == getattr(plan, f"{phase}_peak_active_bytes")
+    assert summary["steady_state_active_bytes_peak"] == max(
+        summary[f"steady_state_{phase}_active_bytes_peak"] for phase in ("forward", "backward", "optimizer")
+    )
+    with (directory / "memory/tensor_lifetimes.csv").open() as stream:
+        lifetimes = list(csv.DictReader(stream))
+    end = max(int(row["death_seq"]) for row in lifetimes)
+    deltas = Counter()
+    for row in lifetimes:
+        size = int(row["modeled_num_bytes"] or row["num_bytes"])
+        state = row["kind"] == "optimizer_state"
+        deltas[-1 if state else int(row["birth_seq"])] += size
+        deltas[(end if state else int(row["death_seq"])) + 1] -= size
+    with (directory / "memory/memory_events.csv").open() as stream:
+        optimizer_start = min(int(row["seq_idx"]) for row in csv.DictReader(stream) if row["phase"] == "optimizer")
+    active = peak = optimizer_peak = 0
+    for seq in sorted(set(deltas) | {optimizer_start}):
+        active += deltas[seq]
+        peak = max(peak, active)
+        if seq >= optimizer_start:
+            optimizer_peak = max(optimizer_peak, active)
+    assert peak == summary["steady_state_active_bytes_peak"]
+    assert optimizer_peak == summary["steady_state_optimizer_active_bytes_peak"]
+    trace = json.loads((directory / "memory/memory_trace.json").read_text())
+    assert trace["metadata"]["timeline_scope"] == "captured_iteration"
+    for key in (
+        "optimizer_state_bytes",
+        "steady_state_active_bytes_peak",
+        "steady_state_forward_active_bytes_peak",
+        "steady_state_backward_active_bytes_peak",
+        "steady_state_optimizer_active_bytes_peak",
+    ):
+        assert trace["metadata"][key] == summary[key]
+
+
+@pytest.mark.parametrize(
+    "corruption", ["reference", "cycle", "peak", "saved_identity", "capture_rank", "steady_peak", "optimizer_state"]
+)
+def test_validation_rejects_corrupted_native_capture(exported_capture, monkeypatch, corruption):
+    workload, _ = exported_capture
+    template = workload.step_templates["s0_F"]
+    node = next(iter(template.nodes.values()))
+    memory = workload.iteration.schedule.annotations["memory_plan"]
+    if corruption == "reference":
+        monkeypatch.setattr(node, "predecessors", [-123456789])
+        message = "missing predecessor"
+    elif corruption == "cycle":
+        monkeypatch.setattr(node, "predecessors", [node.op_id])
+        message = "dependency cycle"
+    elif corruption == "peak":
+        monkeypatch.setattr(memory, "peak_active_bytes", memory.peak_active_bytes + 1)
+        message = "peak differs"
+    elif corruption == "steady_peak":
+        monkeypatch.setattr(memory, "steady_state_peak_active_bytes", memory.steady_state_peak_active_bytes + 1)
+        message = "steady-state lifetime sweep peak differs"
+    elif corruption == "optimizer_state":
+        monkeypatch.setattr(memory, "optimizer_state_bytes", memory.optimizer_state_bytes + 1)
+        message = "optimizer state bytes differ"
+    elif corruption == "capture_rank":
+        monkeypatch.setitem(workload.schedule_plan.annotations, "capture_process_rank", 99)
+        message = "plan capture worker differs"
+    else:
+        slot = next(slot for slot in memory.autograd_saved_tensors if slot.unpack_seq >= 0)
+        monkeypatch.setattr(slot, "tensor_id", -123456789)
+        message = "saved value lacks captured provenance"
+    with pytest.raises(RuntimeError, match=message):
+        validate_workload(workload)
+
+
+@pytest.mark.parametrize("arguments", [["--simulation.output-formats", "json"], ["--simulation.csv-max-ranks", "1"]])
+def test_removed_export_options_fail_before_native_model_build(arguments):
+    with pytest.raises(SystemExit) as error:
+        main(["--build-only", *arguments])
+    assert error.value.code == 2
+
+
+def test_explicit_reexport_without_mem_is_noop_and_rejects_unknown_formats(exported_capture, tmp_path):
+    from torchtitan_simulator.config import SimulationConfig
+    from torchtitan_simulator.runner import export_result
+
+    destination = tmp_path / "absent"
+    workload, _ = exported_capture
+    export_result(workload, SimulationConfig(output_dir=str(destination)))
+    assert not destination.exists()
+    invalid_destination = tmp_path / "invalid"
+    with pytest.raises(ValueError, match="Unsupported output formats"):
+        export_result(workload, SimulationConfig(output_dir=str(invalid_destination), output_formats=["csv"]))
+    assert not invalid_destination.exists()
+
+
+@pytest.mark.parametrize("entry", ["python", "cli"])
+@pytest.mark.parametrize("details", [False, True], ids=["memory-only", "mem-details"])
+def test_successful_entry_returns_memory_and_exports_only_when_requested(entry, details, tmp_path, monkeypatch):
+    from torchtitan_simulator.config import SimulationConfig
+    from torchtitan_simulator.memory import export as memory_export
+    from torchtitan_simulator.runner import simulate
+
+    destination = tmp_path / "result"
+    original = memory_export.export_memory_summary
+    written = []
+
+    def observe_summary(plan, output_dir):
+        written.append(output_dir)
+        return original(plan, output_dir)
+
+    monkeypatch.setattr(memory_export, "export_memory_summary", observe_summary)
+    if entry == "python":
+        workload = simulate(
+            SimulationConfig(output_dir=str(destination), seq_len=128, output_formats=["mem"] if details else [])
+        )
+    else:
+        arguments = ["--simulation.output-dir", str(destination), "--training.seq-len", "128"]
+        if details:
+            arguments.extend(["--simulation.output-formats", "mem"])
+        workload = main(arguments)
+    memory = workload.iteration.schedule.annotations["memory_plan"]
+    assert memory.to_summary_dict() == workload.iteration.schedule.annotations["memory_summary"]
+    if details:
+        assert written == [str(destination)]
+        directory = destination / "memory"
+        assert json.loads((directory / "memory_summary.json").read_text()) == memory.to_summary_dict()
+        assert (directory / "memory_timeline.csv").exists()
+        assert (directory / "memory_trace.json").exists()
+        assert (directory / "tensor_lifetimes.csv").exists()
+    else:
+        assert written == []
+        assert not destination.exists()
+
+
+def test_build_only_and_invalid_simulation_do_not_export_a_memory_result(tmp_path):
+    from torchtitan_simulator.config import SimulationConfig
+    from torchtitan_simulator.runner import simulate
+
+    build_dir = tmp_path / "build"
+    main(["--build-only", "--simulation.output-dir", str(build_dir)])
+    assert not build_dir.exists()
+    failed_dir = tmp_path / "failed"
+    with pytest.raises(ValueError, match="uniform original parameter dtype"):
+        simulate(SimulationConfig(output_dir=str(failed_dir), training_dtype="bfloat16"))
+    assert not failed_dir.exists()
+
+
+@pytest.mark.parametrize("mode", ["none", "full", "selective"])
+@pytest.mark.parametrize("family", ["deepseek_v4_smoketest", "kimi_k3_smoketest"], ids=["dsv4", "kimi"])
+def test_mxfp8_offload_and_shard_dtype_projection_preserve_native_execution(mode, family):
+    from torchtitan_simulator.config import SimulationConfig
+    from torchtitan_simulator.runner import simulate
+
+    common = dict(
+        config=family,
+        world_size=4,
+        expert_parallel_degree=2,
+        num_mtp_modules=1 if family == "deepseek_v4_smoketest" else 0,
+        local_batch_size=1,
+        global_batch_size=32,
+        enable_quantized_training=True,
+        activation_checkpoint_mode=mode,
+    )
+    resident = simulate(SimulationConfig(**common))
+    projected = simulate(
+        SimulationConfig(**common, memory_parameter_storage_dtype="bfloat16", memory_offload_ac_saved_tensors=True)
+    )
+    validate_workload(resident)
+    validate_workload(projected)
+    before, after = (workload.iteration.schedule.annotations for workload in (resident, projected))
+    assert before["gradient_validation"] == after["gradient_validation"]
+    assert before["quantization_configuration"] == after["quantization_configuration"]
+    assert after["batch_configuration"]["gradient_accumulation"] == 8
+    assert after["batch_configuration"]["captured_microbatches"] == 1
+    left, right = before["memory_plan"], after["memory_plan"]
+    resident_layers = before["memory_summary"]["activation_offload_by_layer"]
+    projected_layers = after["memory_summary"]["activation_offload_by_layer"]
+    expected_layers = ["layers.0", "layers.1", "layers.2", "layers.3"]
+    if family == "deepseek_v4_smoketest":
+        expected_layers.append("mtp_layers.0")
+    assert [item["layer"] for item in resident_layers] == expected_layers
+    assert all(item["transfer_bytes"] == 0 for item in resident_layers)
+    assert all(set(item) == {"layer", "transfer_bytes"} for item in projected_layers)
+    assert all(item["transfer_bytes"] > 0 for item in projected_layers if item["layer"] != "<unattributed>")
+    assert [(event.raw_op_type, event.execution_kind) for event in left.raw_events] == [
+        (event.raw_op_type, event.execution_kind) for event in right.raw_events
+    ]
+    assert left.optimizer_state_bytes == right.optimizer_state_bytes
+    assert left.optimizer_state_storage_count == right.optimizer_state_storage_count
+    assert left.persistent_param_bytes == 2 * right.persistent_param_bytes
+    assert right.model_active_bytes_peak < left.model_active_bytes_peak
+    assert right.activation_offload_tensors or right.checkpoint_tensors
+
+
+def test_activation_transfer_mtp_capture_preserves_raw_facts_and_restores_at_b_entry(tmp_path):
+    workload = main(
+        [
+            "--simulation.world-size",
+            "4",
+            "--parallelism.expert-parallel-degree",
+            "2",
+            "--training.num-mtp-modules",
+            "1",
+            "--training.seq-len",
+            "128",
+            "--simulation.memory-offload-ac-saved-tensors",
+            "--simulation.output-dir",
+            str(tmp_path),
+            "--simulation.output-formats",
+            "mem",
+        ]
+    )
+    annotations = workload.iteration.schedule.annotations
+    raw = workload.captured_workload
+    assert raw is not None
+    source = raw.iteration.schedule.annotations["memory_plan"]
+    memory = annotations["memory_plan"]
+    copies = [
+        node
+        for step in workload.step_templates.values()
+        for node in step.nodes.values()
+        if "activation_transfer" in node.attrs
+    ]
+    mtp_restore = next(
+        node
+        for node in copies
+        if node.attrs["activation_transfer"]
+        == {
+            "direction": "h2d",
+            "layer": "mtp_layers.0",
+            "bytes": next(
+                item["transfer_bytes"]
+                for item in memory.to_summary_dict()["activation_offload_by_layer"]
+                if item["layer"] == "mtp_layers.0"
+            ),
+        }
+    )
+
+    assert len(copies) == 10
+    assert mtp_restore.predecessors == []
+    assert mtp_restore.op_id in workload.step_templates["s0_B"].nodes
+    assert all(
+        node.annotations["comp_type"] == ("F" if node.attrs["activation_transfer"]["direction"] == "d2h" else "B")
+        for node in copies
+    )
+    assert all(
+        "activation_transfer" not in node.attrs for step in raw.step_templates.values() for node in step.nodes.values()
+    )
+    assert memory.tensor_lifetimes is source.tensor_lifetimes
+    assert memory.raw_events is source.raw_events
+    assert source.activation_buffer_lifetimes == []
+    assert memory.steady_state_optimizer_peak_active_bytes == source.steady_state_optimizer_peak_active_bytes
+    with (tmp_path / "memory/tensor_lifetimes.csv").open() as stream:
+        buffers = [row for row in csv.DictReader(stream) if row["kind"] == "activation_transfer_buffer"]
+    assert len(buffers) == len(memory.activation_buffer_lifetimes)
+    assert all(int(row["birth_seq"]) <= int(row["death_seq"]) for row in buffers)
+    assert validate_workload(workload) == annotations["capture_validation"]
+
+
+@pytest.mark.parametrize(
+    "activation_offload,optimizer_offload",
+    [(False, False), (True, False), (False, True), (True, True)],
+    ids=["resident", "activation-only", "optimizer-only", "both"],
+)
+def test_cli_offload_switches_are_independent_and_preserve_optimizer_inventory(
+    tmp_path, activation_offload, optimizer_offload, capsys
+):
+    from torchtitan_simulator.capture.activation_transfers import insert_activation_transfers
+    from torchtitan_simulator.capture.fsdp_communication_view import project_fsdp_communication_view
+
+    args = [
+        "--activation-checkpoint.mode",
+        "selective",
+        "--simulation.output-dir",
+        str(tmp_path),
+        "--simulation.output-formats",
+        "mem",
+    ]
+    if activation_offload:
+        args.append("--simulation.memory-offload-ac-saved-tensors")
+    if optimizer_offload:
+        args.append("--simulation.memory-offload-optimizer-states")
+    workload = main(args)
+    raw = workload.captured_workload
+    assert raw is not None
+    memory = workload.iteration.schedule.annotations["memory_plan"]
+    baseline = insert_activation_transfers(project_fsdp_communication_view(raw))
+    baseline_memory = baseline.iteration.schedule.annotations["memory_plan"]
+    nodes = [node for step in workload.step_templates.values() for node in step.nodes.values()]
+    transfers = [node for node in nodes if "optimizer_transfer" in node.attrs]
+    activations = [node for node in nodes if "activation_transfer" in node.attrs]
+    state_bytes = memory.optimizer_state_bytes
+
+    assert state_bytes == baseline_memory.optimizer_state_bytes and state_bytes > 0
+    assert len(transfers) == (2 if optimizer_offload else 0)
+    assert bool(activations) is activation_offload
+    assert memory.tensor_lifetimes is baseline_memory.tensor_lifetimes
+    assert memory.raw_events is baseline_memory.raw_events
+    assert memory.offload_optimizer_states is optimizer_offload
+    assert workload.iteration.schedule.annotations["memory_configuration"] == {
+        "offload_activations": activation_offload,
+        "offload_optimizer_states": optimizer_offload,
+    }
+    for field in (
+        "steady_state_forward_peak_active_bytes",
+        "steady_state_backward_peak_active_bytes",
+        "steady_state_optimizer_peak_active_bytes",
+        "steady_state_peak_active_bytes",
+    ):
+        assert getattr(memory, field) == getattr(baseline_memory, field) - (state_bytes if optimizer_offload else 0)
+    assert all(node.attrs["optimizer_transfer"]["bytes"] == state_bytes for node in transfers)
+    output = capsys.readouterr().out
+    assert output.count("单卡内存") == 1
+    assert ("峰值不包含已卸载优化器状态" in output) is optimizer_offload
+    summary = json.loads((tmp_path / "memory/memory_summary.json").read_text())
+    assert summary == memory.to_summary_dict()
+    assert validate_workload(workload) == workload.iteration.schedule.annotations["capture_validation"]

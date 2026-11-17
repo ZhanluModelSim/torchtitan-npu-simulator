@@ -1,0 +1,114 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+"""Track the module owning each captured forward or backward operator."""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+import torch
+import torch.nn as nn
+from torch.utils._pytree import tree_flatten
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
+
+
+class ModulePathTracker:
+    """Return stable model FQNs for forward, recompute, and backward ops.
+
+    Forward hooks preserve the existing exact path behavior. Lightweight
+    output-gradient hooks mark the most specific module whose backward graph
+    is about to run. Unlike full module backward hooks, tensor hooks do not
+    insert view operators into the captured graph.
+    """
+
+    def __init__(self, root: nn.Module | Iterable[nn.Module]) -> None:
+        roots = (root,) if isinstance(root, nn.Module) else tuple(root)
+        if not roots or not all(isinstance(module, nn.Module) for module in roots):
+            raise ValueError("ModulePathTracker requires at least one module root")
+        self.roots = roots
+        # Preserve the historical attribute for callers that inspect it.
+        self.root = roots[0]
+        self.stack: list[str] = []
+        self._backward_path = ""
+        self._root_names = {type(module).__name__ for module in roots}
+        self._has_engine_callback = False
+        self._handles: list[object] = []
+
+    def __enter__(self) -> ModulePathTracker:
+        names = {
+            id(module): name or module.__class__.__name__
+            for root in self.roots
+            for name, module in root.named_modules()
+        }
+
+        def pre_hook(module: nn.Module, _args: object) -> None:
+            self.stack.append(names.get(id(module), module.__class__.__name__))
+
+        def post_hook(module: nn.Module, _args: object, output: object) -> None:
+            if self.stack:
+                self.stack.pop()
+            name = names.get(id(module), module.__class__.__name__)
+            tensors, _spec = tree_flatten(output)
+            seen: set[int] = set()
+            for tensor in tensors:
+                if not isinstance(tensor, torch.Tensor) or not tensor.requires_grad or id(tensor) in seen:
+                    continue
+                seen.add(id(tensor))
+                self._handles.append(
+                    tensor.register_hook(
+                        lambda grad, module_name=name: self._mark_backward(
+                            module_name,
+                            grad,
+                        )
+                    )
+                )
+
+        seen: set[int] = set()
+        for root in self.roots:
+            for _, module in root.named_modules():
+                if id(module) in seen:
+                    continue
+                seen.add(id(module))
+                self._handles.append(module.register_forward_pre_hook(pre_hook))
+                self._handles.append(module.register_forward_hook(post_hook))
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        for handle in self._handles:
+            handle.remove()  # type: ignore[attr-defined]
+        self._handles.clear()
+        self.stack.clear()
+        self._backward_path = ""
+        self._has_engine_callback = False
+
+    def current_path(self) -> str:
+        if self.stack:
+            return self.stack[-1]
+        return self._backward_path
+
+    def _mark_backward(
+        self,
+        module_path: str,
+        grad: torch.Tensor,
+    ) -> torch.Tensor:
+        current = self._backward_path
+        incoming_is_ancestor = current != module_path and (
+            module_path in self._root_names or current.startswith(f"{module_path}.")
+        )
+        if not incoming_is_ancestor:
+            self._backward_path = module_path
+
+        if not self._has_engine_callback:
+            self._has_engine_callback = True
+
+            def clear_backward_path() -> None:
+                self._backward_path = ""
+                self._has_engine_callback = False
+
+            torch.autograd.Variable._execution_engine.queue_callback(clear_backward_path)
+        return grad

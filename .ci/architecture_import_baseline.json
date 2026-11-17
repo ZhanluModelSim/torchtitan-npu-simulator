@@ -1,0 +1,63 @@
+{
+  "patch_metadata": {
+    "missing": [
+      "torchtitan_npu/patches/torchtitan/distributed/flex_shard/_optimizer_reshard_schedule.py",
+      "torchtitan_npu/patches/torchtitan/distributed/flex_shard/dist_muon.py",
+      "torchtitan_npu/patches/torchtitan/distributed/flex_shard/optimizer_reshard.py",
+      "torchtitan_npu/patches/torchtitan/distributed/flex_shard/replica_dedup.py",
+      "torchtitan_npu/patches/torchtitan/experiments/graph_trainer/functionalize_recompute_mutations.py",
+      "torchtitan_npu/patches/torchtitan/hf_datasets/text_datasets.py",
+      "torchtitan_npu/patches/torchtitan/models/common/rope.py"
+    ]
+  },
+  "import": [
+    {"source": "torchtitan_npu/extensions/adaptor/torchao/converter.py", "target_module": "torchtitan_npu.models.common.metadata_extension"},
+    {"source": "torchtitan_npu/extensions/adaptor/torchao/converter.py", "target_module": "torchtitan_npu.models.deepseek_v4.compressor"},
+    {"source": "torchtitan_npu/extensions/adaptor/torchao/converter.py", "target_module": "torchtitan_npu.models.deepseek_v4_1.attention"},
+    {"source": "torchtitan_npu/extensions/adaptor/torchao/converter.py", "target_module": "torchtitan_npu.models.deepseek_v4_1.compressor"},
+    {"source": "torchtitan_npu/extensions/adaptor/torchao/converter.py", "target_module": "torchtitan_npu.models.deepseek_v4_1.indexer"},
+    {"source": "torchtitan_npu/extensions/adaptor/torchao/converter.py", "target_module": "torchtitan_npu.override.common.swiglu_group.ascendc"},
+    {"source": "torchtitan_npu/extensions/compile/sdc_checksum.py", "target_module": "torchtitan_npu.ops.misc.sdc_checksum"},
+    {"source": "torchtitan_npu/extensions/experiment/cv_parallel/batch_chunk_metadata.py", "target_module": "torchtitan_npu.models.common.metadata_extension"},
+    {"source": "torchtitan_npu/extensions/experiment/cv_parallel/batch_chunk_metadata.py", "target_module": "torchtitan_npu.models.deepseek_v4.metadata"},
+    {"source": "torchtitan_npu/extensions/experiment/cv_parallel/batch_chunk_metadata.py", "target_module": "torchtitan_npu.override.deepseek_v4.sparse_attn.ascendc"},
+    {"source": "torchtitan_npu/extensions/experiment/cv_parallel/batch_chunk_token_dispatcher.py", "target_module": "torchtitan_npu.ops.ascendc.moe_token_permute"},
+    {"source": "torchtitan_npu/extensions/experiment/cv_parallel/batch_chunk_token_dispatcher.py", "target_module": "torchtitan_npu.override.common.token_dispatcher"},
+    {"source": "torchtitan_npu/extensions/torchtitan/experiments/torchft/trainer.py", "target_module": "torchtitan_npu.models.deepseek_v4.model"},
+    {"source": "torchtitan_npu/extensions/torchtitan/trainer.py", "target_module": "torchtitan_npu.override.common.optimizer"},
+    {"source": "torchtitan_npu/patches/torchtitan/models/qwen3_5/vision_encoder.py", "target_module": "torchtitan_npu.extensions.torchtitan.eager_flex"}
+  ],
+  "activation_order": {
+    "torchtitan_npu/extensions/__init__.py": [
+      ".torchtitan.distributed.flex_shard.optimizer_reshard",
+      ".torchtitan.ep_process_group",
+      ".torchtitan.trainer",
+      ".torchtitan.components.metrics",
+      ".torchtitan.experiments.graph_trainer",
+      ".torchtitan.tools.utils",
+      ".torchtitan.eager_flex",
+      ".compile.dynamo_config"
+    ],
+    "torchtitan_npu/patches/torchtitan/__init__.py": [
+      ".components.checkpoint",
+      ".trainer",
+      ".components.metrics",
+      ".components.optimizer",
+      ".components.validate",
+      ".distributed.context_parallel",
+      ".distributed.full_dtensor",
+      ".distributed.flex_shard.dist_muon",
+      ".experiments.graph_trainer.chunked_loss",
+      ".experiments.graph_trainer.ep_chunk_concretization",
+      ".experiments.graph_trainer.ep_overlap_shape_queries",
+      ".experiments.graph_trainer.ep_ready_nodes_dedup",
+      ".experiments.graph_trainer.ep_shape_live_out",
+      ".models.common.attention_metadata",
+      ".models.common.decoder",
+      ".models.common.moe",
+      ".models.common.rope",
+      ".models.common.token_dispatcher",
+      ".models.deepseek_v3.mtp"
+    ]
+  }
+}

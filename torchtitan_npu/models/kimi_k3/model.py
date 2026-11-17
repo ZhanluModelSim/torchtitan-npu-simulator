@@ -8,41 +8,66 @@
 Fork reason: Upstream torchtitan has no K3 support. K3 introduces KDA linear
 attention (69/93 layers), Gated MLA (24/93 layers), attention residuals,
 SiTU-GLU, and LatentMoE.
-Reference: MindSpeed-MM mindspeed_mm/fsdp/models/kimi_k3/modeling_kimi_linear.py
+Reference: moonshotai/Kimi-K3, revision f831ab66814297da540d832a5235f8e904f29d06.
 """
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import torch
-import torch.nn.functional as F
 from torch import nn
-
 from torchtitan.models.common.attention import AttentionMasksType
+from torchtitan.models.common.embedding import Embedding
 from torchtitan.models.common.linear import Linear
-from torchtitan.models.common.rmsnorm import RMSNorm
+from torchtitan.models.common.nn_modules import RMSNorm
+from torchtitan.protocols.model import BaseModel
 from torchtitan.protocols.module import Module, ModuleDict
 
 from .attention import KimiDeltaAttention, KimiGatedMLA
-from .feed_forward import KimiMLP, KimiSparseMoeBlock
+from .feed_forward import KimiLatentMoE, KimiMLP
 
 logger = logging.getLogger(__name__)
 
 
-class KimiAttentionResidual(nn.Module):
+class KimiResidualScoreNorm(Module):
+    """FP32 normalization and folded score weight in official Attention Residual.
+
+    Unlike an affine RMSNorm followed by a projection, the affine and
+    projection weights are multiplied before the token-wise reduction.
+    """
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(Module.Config):
+        dim: int
+        eps: float = 1e-5
+
+    def __init__(self, config: Config):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(config.dim))
+        self.eps = config.eps
+
+    def reset_parameters(self):
+        nn.init.ones_(self.weight)
+
+    def forward(self, values: torch.Tensor, projection_weight: torch.Tensor) -> torch.Tensor:
+        values = values.float()
+        normalized = values * torch.rsqrt(values.pow(2).mean(-1, keepdim=True) + self.eps)
+        score_weight = self.weight.float() * projection_weight.squeeze(0).float()
+        return (normalized * score_weight).sum(-1)
+
+
+class KimiAttentionResidual(Module):
     """Token-local attention-residual mixing used at K3 block boundaries."""
 
-    def __init__(self, dim: int, eps: float):
+    @dataclass(kw_only=True, slots=True)
+    class Config(Module.Config):
+        norm: KimiResidualScoreNorm.Config
+        proj: Linear.Config
+
+    def __init__(self, config: Config):
         super().__init__()
-        self.norm = RMSNorm.Config(
-            normalized_shape=dim,
-            eps=eps,
-        ).build()
-        self.proj = Linear.Config(
-            in_features=dim,
-            out_features=1,
-            bias=False,
-        ).build()
+        self.norm = config.norm.build()
+        self.proj = config.proj.build()
 
     def forward(
         self,
@@ -53,16 +78,17 @@ class KimiAttentionResidual(nn.Module):
             (block_residual, prefix_sum.unsqueeze(1)),
             dim=1,
         )
-        normalized = self.norm(values)
-        scores = F.linear(
-            normalized.float(),
-            self.proj.weight.float(),
-        ).squeeze(-1)
+        values_float = values.float()
+        scores = self.norm(values_float, self.proj.weight)
         probabilities = scores.softmax(-1).unsqueeze(1)
-        return torch.matmul(
-            probabilities,
-            values.float(),
-        ).squeeze(1).to(values.dtype)
+        return (
+            torch.matmul(
+                probabilities,
+                values_float,
+            )
+            .squeeze(1)
+            .to(values.dtype)
+        )
 
 
 class KimiK3TransformerBlock(Module):
@@ -70,11 +96,13 @@ class KimiK3TransformerBlock(Module):
 
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
-        attention: KimiDeltaAttention.Config | KimiGatedMLA.Config = field(
-            default_factory=KimiDeltaAttention.Config
-        )
+        attention: KimiDeltaAttention.Config | KimiGatedMLA.Config
+        attention_norm: RMSNorm.Config
+        ffn_norm: RMSNorm.Config
+        self_attention_res: KimiAttentionResidual.Config | None = None
+        mlp_res: KimiAttentionResidual.Config | None = None
         feed_forward: KimiMLP.Config | None = None
-        moe: KimiSparseMoeBlock.Config | None = None
+        moe: KimiLatentMoE.Config | None = None
         norm_eps: float = 1e-5
         dim: int = 7168
         layer_id: int = 0
@@ -86,37 +114,23 @@ class KimiK3TransformerBlock(Module):
         self.attn_res_block_size = config.attn_res_block_size
         if self.attn_res_block_size is not None and self.attn_res_block_size <= 0:
             raise ValueError(
-                "attn_res_block_size must be greater than zero when enabled, "
-                f"got {self.attn_res_block_size}"
+                f"attn_res_block_size must be greater than zero when enabled, got {self.attn_res_block_size}"
             )
 
-        # Build attention
-        if isinstance(config.attention, KimiDeltaAttention.Config):
-            self.attention = KimiDeltaAttention(config.attention)
-        else:
-            self.attention = KimiGatedMLA(config.attention)
-
-        self.attention_norm = RMSNorm.Config(
-            normalized_shape=config.dim,
-            eps=config.norm_eps,
-        ).build()
-        self.ffn_norm = RMSNorm.Config(
-            normalized_shape=config.dim,
-            eps=config.norm_eps,
-        ).build()
+        self.attention = config.attention.build()
+        self.attention_norm = config.attention_norm.build()
+        self.ffn_norm = config.ffn_norm.build()
         if self.attn_res_block_size is not None:
-            self.self_attention_res = KimiAttentionResidual(
-                config.dim,
-                config.norm_eps,
-            )
-            self.mlp_res = KimiAttentionResidual(
-                config.dim,
-                config.norm_eps,
-            )
+            if config.self_attention_res is None or config.mlp_res is None:
+                raise ValueError("Attention residuals require both self_attention_res and mlp_res configurations")
+            self.self_attention_res = config.self_attention_res.build()
+            if config.layer_id == 0:
+                self.self_attention_res.requires_grad_(False)
+            self.mlp_res = config.mlp_res.build()
 
         # Build FFN or MoE
         if config.moe is not None:
-            self.moe = KimiSparseMoeBlock(config.moe)
+            self.moe = config.moe.build()
             self.feed_forward = None
             self.moe_enabled = True
         elif config.feed_forward is not None:
@@ -148,13 +162,16 @@ class KimiK3TransformerBlock(Module):
 
         # Pre-norm FFN/MoE
         h = self.ffn_norm(x)
-        if self.moe is not None:
-            h = self.moe(h)
-        else:
-            h = self.feed_forward(h)
+        h = self._feed_forward(h)
         x = x + h
 
         return x
+
+    def _feed_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if self.moe is not None:
+            return self.moe(hidden_states)
+        assert self.feed_forward is not None
+        return self.feed_forward(hidden_states)
 
     def _forward_attn_residual(
         self,
@@ -169,7 +186,7 @@ class KimiK3TransformerBlock(Module):
         if block_residual is None:
             block_residual = x.new_empty(batch_size * seq_len, 0, hidden_size)
 
-        prefix_sum: torch.Tensor | None = x
+        prefix_sum = x
         if block_residual.shape[1] > 0:
             x = self.self_attention_res(
                 prefix_sum.reshape(-1, hidden_size),
@@ -196,15 +213,12 @@ class KimiK3TransformerBlock(Module):
             block_residual,
         ).view(batch_size, seq_len, hidden_size)
         h = self.ffn_norm(h)
-        if self.moe is not None:
-            h = self.moe(h)
-        else:
-            h = self.feed_forward(h)
+        h = self._feed_forward(h)
         prefix_sum = prefix_sum + h
         return prefix_sum, block_residual
 
 
-class KimiK3Model(Module):
+class KimiK3Model(BaseModel):
     """Kimi K3: 2.8T MoE model with hybrid KDA/Gated-MLA attention.
 
     Architecture:
@@ -216,37 +230,46 @@ class KimiK3Model(Module):
     """
 
     @dataclass(kw_only=True, slots=True)
-    class Config(Module.Config):
+    class Config(BaseModel.Config):
+        tok_embeddings: Embedding.Config
+        norm: RMSNorm.Config
+        lm_head: Linear.Config
+        layers: list[KimiK3TransformerBlock.Config]
+        output_attn_res: KimiAttentionResidual.Config | None = None
         vocab_size: int = 163840
         dim: int = 7168
-        layers: list[KimiK3TransformerBlock.Config] = field(default_factory=list)
         norm_eps: float = 1e-5
         attn_res_block_size: int | None = 12
 
-        def update_from_config(self, *, trainer_config, **kwargs) -> None:
+        @property
+        def n_layers(self) -> int:
+            return len(self.layers)
+
+        def update_from_config(self, *, config, **kwargs) -> None:
             """Called by Trainer.__init__ to sync runtime params (seq_len, etc.)."""
-            debug_force_load_balance = (
-                trainer_config.debug.moe_force_load_balance
+            from .sharding import set_kimi_sharding_config
+
+            set_kimi_sharding_config(
+                self,
+                enable_sp=config.parallelism.enable_sequence_parallel,
+                enable_ep=config.parallelism.expert_parallel_degree > 1,
             )
+            debug_force_load_balance = config.debug.moe_force_load_balance
             for layer in self.layers:
                 if layer.moe is not None:
-                    layer.moe.debug_force_load_balance = (
-                        debug_force_load_balance
-                    )
+                    layer.moe.router._debug_force_load_balance = debug_force_load_balance
 
-        def get_nparams_and_flops(self, model, seq_len: int) -> tuple[int, float]:
+        def get_nparams_and_flops(self, model: Module, seq_len: int) -> tuple[int, int]:
             """Return (total_params, flops_per_token) for MFU calculation."""
             nparams = sum(p.numel() for p in model.parameters())
             # Approximate: 6 * nparams * seq_len (2 for fwd + 4 for bwd)
-            flops_per_token = 6.0 * nparams
+            flops_per_token = 6 * nparams
             return nparams, flops_per_token
 
     def __init__(self, config: Config):
         super().__init__()
         mismatched_layers = [
-            layer.layer_id
-            for layer in config.layers
-            if layer.attn_res_block_size != config.attn_res_block_size
+            layer.layer_id for layer in config.layers if layer.attn_res_block_size != config.attn_res_block_size
         ]
         if mismatched_layers:
             raise ValueError(
@@ -254,72 +277,32 @@ class KimiK3Model(Module):
                 "attn_res_block_size; mismatched layer ids: "
                 f"{mismatched_layers}"
             )
-        self.tok_embeddings = nn.Embedding(config.vocab_size, config.dim)
-        self.layers = ModuleDict(
-            {str(i): KimiK3TransformerBlock(layer_cfg) for i, layer_cfg in enumerate(config.layers)}
-        )
+        self.tok_embeddings = config.tok_embeddings.build()
+        self.layers = ModuleDict({str(i): layer_cfg.build() for i, layer_cfg in enumerate(config.layers)})
         self.attn_res_block_size = config.attn_res_block_size
         if self.attn_res_block_size is not None:
-            self.output_attn_res = KimiAttentionResidual(
-                config.dim,
-                config.norm_eps,
-            )
-        self.norm = RMSNorm.Config(
-            normalized_shape=config.dim,
-            eps=config.norm_eps,
-        ).build()
-        self.output = Linear.Config(
-            in_features=config.dim,
-            out_features=config.vocab_size,
-            bias=False,
-        ).build()
+            if config.output_attn_res is None:
+                raise ValueError("Attention residuals require an output_attn_res configuration")
+            self.output_attn_res = config.output_attn_res.build()
+        self.norm = config.norm.build()
+        self.lm_head = config.lm_head.build()
 
-    def verify_module_protocol(self) -> None:
-        """Verify model conforms to torchtitan's module protocol."""
-        pass
+    _skip_lm_head: bool = False
+    enable_weight_tying: bool = False
 
-    def init_weights(self, *, buffer_device=None) -> None:
-        """Initialize model weights. Called by Trainer after parallelize."""
-        del buffer_device
-        init_std = 0.02
-        for module in self.modules():
-            if isinstance(module, (nn.Linear, nn.Conv1d, nn.Embedding)):
-                nn.init.normal_(
-                    module.weight,
-                    mean=0.0,
-                    std=init_std,
+    def build_attention_masks(self, tokens, labels, extra_inputs, *, cp_mesh=None, load_balancer_type=None):
+        if cp_mesh is not None:
+            if load_balancer_type is not None:
+                raise ValueError(
+                    "Kimi causal convolutions and KDA require contiguous CP intervals; disable load balancing"
                 )
-                if getattr(module, "bias", None) is not None:
-                    nn.init.zeros_(module.bias)
-            elif isinstance(module, nn.RMSNorm):
-                nn.init.ones_(module.weight)
-
-        for layer in self.layers.values():
-            if isinstance(layer.attention, KimiDeltaAttention):
-                nn.init.uniform_(layer.attention.A_log, 1.0, 16.0)
-                with torch.no_grad():
-                    layer.attention.A_log.log_()
-                nn.init.zeros_(layer.attention.dt_bias)
-                nn.init.ones_(layer.attention.o_norm.weight)
-            if layer.moe is not None:
-                nn.init.normal_(
-                    layer.moe.experts.w1,
-                    mean=0.0,
-                    std=init_std,
-                )
-                nn.init.normal_(
-                    layer.moe.experts.w2,
-                    mean=0.0,
-                    std=init_std,
-                )
-                nn.init.normal_(
-                    layer.moe.experts.w3,
-                    mean=0.0,
-                    std=init_std,
-                )
-                nn.init.zeros_(
-                    layer.moe.gate.e_score_correction_bias
-                )
+            degree, rank = cp_mesh.size(), cp_mesh.get_local_rank()
+            if tokens.shape[1] % degree:
+                raise ValueError("Kimi sequence length must be divisible by CP degree")
+            tokens = tokens.chunk(degree, dim=1)[rank].contiguous()
+            labels = labels.chunk(degree, dim=1)[rank].contiguous()
+            extra_inputs = {key: value.chunk(degree, dim=1)[rank].contiguous() for key, value in extra_inputs.items()}
+        return tokens, labels, extra_inputs
 
     def forward(
         self,
@@ -350,4 +333,4 @@ class KimiK3Model(Module):
                 block_residual,
             ).view_as(x)
         x = self.norm(x)
-        return self.output(x)
+        return x if self._skip_lm_head else self.lm_head(x)

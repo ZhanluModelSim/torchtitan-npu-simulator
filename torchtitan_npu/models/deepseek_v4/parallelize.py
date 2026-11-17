@@ -1,1263 +1,184 @@
-# Adapted from
-# https://github.com/pytorch/torchtitan/blob/v0.2.1/torchtitan/models/deepseek_v3/infra/parallelize.py
-# https://github.com/pytorch/torchtitan/blob/v0.2.1/torchtitan/models/llama4/infra/parallelize.py
-# Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-import logging
-from typing import Any, cast
+from __future__ import annotations
+
+from dataclasses import replace
+from typing import TYPE_CHECKING
 
 import torch
-import torch.distributed as dist
-import torch.nn as nn
-from torch.distributed._composable.replicate_with_fsdp import replicate
-from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
-    CheckpointWrapper,
+from torch.distributed.fsdp import MixedPrecisionPolicy
+from torchtitan.config import TORCH_DTYPE_MAP, TrainingConfig
+from torchtitan.distributed.utils import get_spmd_backend
+from torchtitan.experiments.graph_trainer.common_utils import (
+    annotate_module_fqns,
+    annotate_moe_ep_regions,
+    apply_simple_fsdp,
+    matches_module_fqn_pattern,
 )
-from torch.distributed.device_mesh import DeviceMesh
-from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy, fully_shard
-from torch.distributed.fsdp._fully_shard._fsdp_common import (
-    FSDPMeshInfo,
-    HSDPMeshInfo,
-    ShardPlacementResult,
+from torchtitan.experiments.graph_trainer.compile import (
+    apply_compile as apply_graph_trainer_compile,
 )
-from torch.distributed.tensor import (
-    Replicate,
-    Shard,
-    distribute_module,
-    distribute_tensor,
-)
-from torch.distributed.tensor.parallel import (
-    ColwiseParallel,
-    ParallelStyle,
-    PrepareModuleInput,
-    PrepareModuleInputOutput,
-    RowwiseParallel,
-    SequenceParallel,
-    parallelize_module,
-)
-from torchtitan.components.quantization.float8 import find_float8_linear_config
-from torchtitan.config import TORCH_DTYPE_MAP
-from torchtitan.distributed import ParallelDims
-from torchtitan.distributed.expert_parallel import (
-    DeepEPExpertParallel,
-    ExpertParallel,
-    TensorParallel,
-)
-from torchtitan.distributed.fsdp import get_fsdp_reshard_after_forward_policy
-from torchtitan.distributed.tensor_parallel import NoParallel, maybe_enable_async_tp
-from torchtitan.models.common import FlexAttention, VarlenAttention
-from torchtitan.models.common import moe as moe_module
-from torchtitan.models.llama3.parallelize import (
-    apply_replicate,
-    disable_fsdp_gradient_division,
-)
-from torchtitan.models.llama4.parallelize import apply_fsdp
+from torchtitan.models.deepseek_v3.parallelize import parallelize_deepseekv3
 
-from torchtitan_npu.converters.kernels.rms_norm import NPURMSNorm
-from torchtitan_npu.converters.registry import has_npu_converter
-from torchtitan_npu.models.common.dsa_indexer_loss import DSAIndexerLossLoggingHelper
-from torchtitan_npu.models.deepseek_v4.activation_checkpoint import (
-    apply_deepseek_v4_ac,
-)
-from torchtitan_npu.models.deepseek_v4.model import Attention
-from torchtitan_npu.models.deepseek_v4.model import MoE as DeepSeekV4MoE
+from torchtitan_npu.patches.torch.distributed.fsdp import policy_overrides
 
-logger = logging.getLogger(__name__)
+from .lora import is_lora_parameter
 
+if TYPE_CHECKING:
+    from torchtitan.config import CompileConfig, ParallelismConfig
+    from torchtitan.distributed import ParallelDims
+    from torchtitan.distributed.activation_checkpoint import ActivationCheckpointingConfig
+    from torchtitan.experiments.graph_trainer.configs import GraphTrainerCompileConfig
 
-class AwaitRowwiseParallel(RowwiseParallel):
-    @staticmethod
-    def _prepare_output_fn(output_layouts, use_local_output, mod, outputs, device_mesh):
-        # Rowwise sharding produces partial output, depending on output layouts:
-        # 1. to replicate -> allreduce
-        # 2. to shard -> reduce_scatter
-        if outputs.placements != output_layouts:
-            outputs = outputs.redistribute(placements=output_layouts, async_op=True)
-
-        # wait for async redistribution to complete
-        real_tensor = outputs._local_tensor
-        torch.ops._c10d_functional.wait_tensor(real_tensor)
-
-        # back to local tensor if use_local_output is True
-        return outputs.to_local() if use_local_output else outputs
-
-
-class PrepareModuleInputOutputWithBwdAllReduce(PrepareModuleInputOutput):
-    """
-    Extension of PrepareModuleInputOutput that registers backward hooks on specified inputs
-    to perform allreduce on their gradients during backpropagation.
-
-    This is useful when certain inputs participate in computations that require
-    gradient synchronization across devices (e.g., in tensor parallelism scenarios).
-    """
-
-    def __init__(self, *, bwd_allreduce_inputs: tuple[bool, ...], **kwargs):
-        super().__init__(**kwargs)
-        self.bwd_allreduce_inputs = bwd_allreduce_inputs
-
-        if self.prepare_module_input.input_layouts is not None:
-            assert len(self.bwd_allreduce_inputs) == len(self.prepare_module_input.input_layouts), (
-                f"bwd_allreduce_inputs must have the same length as input_layouts! "
-                f"Got {len(self.bwd_allreduce_inputs)} vs {len(self.prepare_module_input.input_layouts)}"
-            )
-
-    def _attach_bwd_hook_fn(self, module: nn.Module, inputs: tuple) -> None:
-        """
-        Register backward hooks on specified inputs to perform allreduce on gradients.
-
-        Args:
-            module: The module to register hooks on
-            inputs: Tuple of input tensors to the module
-        """
-        for _, (inp, needs_allreduce) in enumerate(zip(inputs, self.bwd_allreduce_inputs, strict=True)):
-            if not needs_allreduce:
-                continue
-
-            if not isinstance(inp, torch.Tensor) or not inp.requires_grad:
-                continue
-
-            def _allreduce_grad_hook(grad: torch.Tensor) -> torch.Tensor:
-                # Ensure gradient is contiguous for efficient communication
-                if not grad.is_contiguous():
-                    grad = grad.contiguous()
-                torch.distributed.all_reduce(grad, op=torch.distributed.ReduceOp.SUM, group=self.group)
-                return grad
-
-            inp.register_hook(_allreduce_grad_hook)
-
-    def _apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:
-        super()._apply(module, device_mesh)
-
-        self.group = device_mesh.get_group()
-        if self.prepare_module_input.use_local_output:
-            module.register_forward_pre_hook(self._attach_bwd_hook_fn)
-
-        return module
-
-
-def _register_distributed_parameter(
-    module: nn.Module,
-    name: str,
-    device_mesh: DeviceMesh,
-    placements: list,
-):
-    dt = nn.Parameter(
-        distribute_tensor(
-            getattr(module, name),
-            device_mesh=device_mesh,
-            placements=placements,
-            src_data_rank=0,
-        )
-    )
-    module.register_parameter(name, dt)
-
-
-def _model_uses_attention_masks(model_args: Any) -> bool:
-    for layer_cfg in getattr(model_args, "layers", ()):
-        inner_attention = getattr(getattr(layer_cfg, "attention", None), "inner_attention", None)
-        if isinstance(inner_attention, (FlexAttention.Config, VarlenAttention.Config)):
-            return True
-    return False
-
-
-def _replicate_embedding_and_first_layer_enabled() -> bool:
-    """Read the DeepSeek-V4-only simulator experiment from the active config."""
-    from torchtitan_npu.patches.torchtitan._trainer_config_stash import (
-        get_trainer_config,
-    )
-
-    trainer_config = get_trainer_config()
-    simulation_config = getattr(trainer_config, "simulation", None)
-    return bool(
-        getattr(
-            simulation_config,
-            "replicate_embedding_and_first_layer",
-            False,
-        )
+    from torchtitan_npu.models.deepseek_v4.model import (
+        DeepSeekV4Model,
+        GraphTrainerDeepSeekV4Model,
     )
 
 
-class HcHeadParallelStyle(ParallelStyle):
-    _param_names = ("hc_head_fn", "hc_head_base", "hc_head_scale")
+def _dsv4_fp32_overrides(
+    model: DeepSeekV4Model,
+    training: TrainingConfig,
+) -> dict[str, MixedPrecisionPolicy]:
+    """Return the fqn-fp32 policy map for DSV4 SmoE hyper-connection and MoE router parameters."""
+    default = MixedPrecisionPolicy(
+        param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
+        reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
+        output_dtype=None,
+        cast_forward_inputs=False,
+    )
+    fp32 = replace(default, param_dtype=torch.float32)
 
-    def __init__(self) -> None:
-        self.io_plan = PrepareModuleInputOutput(
-            input_layouts=(Shard(1),),
-            desired_input_layouts=(Replicate(),),
-            use_local_input=True,
-            output_layouts=(Replicate()),
-            desired_output_layouts=(Shard(1)),
-            use_local_output=False,
-        )
+    def matches_any(fqn: str, patterns: tuple[str, ...]) -> bool:
+        """Check if a module/parameter FQN matches any of the fnmatch patterns."""
+        clean = ".".join(part for part in fqn.split(".") if part != "_checkpoint_wrapped_module")
+        return any(matches_module_fqn_pattern(pattern, clean) for pattern in patterns)
 
-    def partition_fn(self, name: str, module: nn.Module, device_mesh: DeviceMesh) -> None:
-        del name
-        for param_name in self._param_names:
-            param = getattr(module, param_name, None)
-            if param is None:
-                continue
-            module.register_parameter(
-                param_name,
-                nn.Parameter(
-                    distribute_tensor(
-                        param,
-                        device_mesh=device_mesh,
-                        placements=[Replicate()],
-                        src_data_rank=0,
-                    )
-                ),
-            )
+    fp32_module_fqns = (
+        "layers.*.hc_attn_pre",
+        "layers.*.hc_ffn_pre",
+        "layers.*.moe.router",
+        "layers.*.hc_head",
+        "mtp_layers.*.hc_attn_pre",
+        "mtp_layers.*.hc_ffn_pre",
+        "mtp_layers.*.moe.router",
+        "mtp_layers.*.hc_head",
+        "hc_head",
+    )
+    fp32_parameter_fqns = (
+        "layers.*.attention.compressor.ape",
+        "layers.*.attention.indexer.compressor.ape",
+        "mtp_layers.*.attention.compressor.ape",
+        "mtp_layers.*.attention.indexer.compressor.ape",
+        # Learned per-head softmax logits: created FP32 in attention.py and
+        # required FP32 by the attention kernels.
+        "layers.*.attention.attn_sink",
+        "mtp_layers.*.attention.attn_sink",
+    )
 
-    def _apply(self, module: nn.Module, device_mesh: DeviceMesh) -> nn.Module:
-        module = distribute_module(module, device_mesh, self.partition_fn)
-        return parallelize_module(module, device_mesh, self.io_plan)
+    fp32_modules = [module for name, module in model.named_modules() if matches_any(name, fp32_module_fqns)]
+    fp32_param_ids = {id(param) for module in fp32_modules for param in module.parameters()}
+
+    overrides: dict[str, MixedPrecisionPolicy] = {}
+    for name, parameter in model.named_parameters(remove_duplicate=False):
+        if id(parameter) in fp32_param_ids or matches_any(name, fp32_parameter_fqns):
+            overrides[name] = fp32
+
+    return overrides
 
 
 def parallelize_deepseek_v4(
-    model: nn.Module,
+    model: DeepSeekV4Model,
     *,
     parallel_dims: ParallelDims,
-    training,
-    model_converters,
-    parallelism,
-    compile_config,
-    ac_config,
+    training: TrainingConfig,
+    parallelism: ParallelismConfig,
+    compile_config: CompileConfig,
+    ac_config: ActivationCheckpointingConfig,
     dump_folder: str,
 ):
-    # TODO: TP currently cannot handle uneven seq_len because we set
-    #       `use_local_output=True` to use plain Tensors for legacy reasons.
-    #       Need to revisit this.
+    """Apply DSV4 parallelism with per-parameter FP32 SmoE policies."""
+    with policy_overrides(_dsv4_fp32_overrides(model, training)):
+        parallelized_model = parallelize_deepseekv3(
+            model,
+            parallel_dims=parallel_dims,
+            training=training,
+            parallelism=parallelism,
+            compile_config=compile_config,
+            ac_config=ac_config,
+            dump_folder=dump_folder,
+        )
+    if getattr(parallelized_model, "lora_config", None) is not None:
+        for name, parameter in parallelized_model.named_parameters():
+            if not is_lora_parameter(name):
+                parameter.requires_grad_(False)
+    return parallelized_model
+
+
+def annotate_deepseek_v4(model: GraphTrainerDeepSeekV4Model) -> None:
+    """Attach annotations to FX graph nodes for DeepSeek V4.
+
+    - Expert Parallel (EP) annotations: Tags "dispatch", "combine", and "compute"
+      regions in MoE for debugging purposes.
+    - Module FQN annotation: Tags each submodule's forward with its
+      fully-qualified name for downstream passes (bucketing, SAC region
+      boundaries, etc.).
+    """
+    annotate_moe_ep_regions()
+    annotate_module_fqns(model)
+
+
+def parallelize_graph_trainer_deepseek_v4(
+    model: GraphTrainerDeepSeekV4Model,
+    *,
+    parallel_dims: ParallelDims,
+    training: TrainingConfig,
+    parallelism: ParallelismConfig,
+    compile_config: GraphTrainerCompileConfig,
+    ac_config: ActivationCheckpointingConfig,
+    dump_folder: str,
+):
+    # The graph_trainer simple_fsdp wrapper is built on raw DTensor ops
+    # (``distribute_tensor`` / ``tensor._spec``) and errors under the
+    # spmd_types backend; only the eager path supports that backend for now.
+    assert get_spmd_backend() != "spmd_types", "The GraphTrainer path does not yet support the spmd_types backend."
+
+    # TP currently cannot handle uneven seq_len because we set
+    # ``use_local_output=True`` to use plain Tensors for legacy reasons.
     assert training.seq_len % parallel_dims.seq_len_divisor == 0, f"""
         Sequence length {training.seq_len} must be divisible by the product of TP degree
-        ({parallel_dims.tp}) and 2 * CP degree ({parallel_dims.cp}).
+        ({parallel_dims.tp}) and 2 * CP degree ({parallel_dims.cp}), i.e. {parallel_dims.seq_len_divisor}.
         """
 
-    # patch the indexer loss tracking with distributed version to get the synchronized indexer loss metric
-    model_args = cast("Any", model).model_args
-    apply_distributed_indexer_loss_tracking(parallel_dims, model_args.n_layers, model_args.compress_ratios)
-
-    if parallel_dims.tp_enabled:
-        float8_config = find_float8_linear_config(model_converters.converters)
-        enable_float8_linear = float8_config is not None
-        float8_is_rowwise = float8_config is not None and float8_config.recipe_name in (
-            "rowwise",
-            "rowwise_with_gw_hp",
-        )
-
-        enable_float8_tensorwise_tp = enable_float8_linear and not float8_is_rowwise
-        if enable_float8_tensorwise_tp:
-            raise NotImplementedError("Currently, float8 tensorwise TP is not tested for deepseekv4")
-
-        tp_mesh = parallel_dims.get_mesh("tp")
-        apply_non_moe_tp(
-            model,
-            tp_mesh,
-            loss_parallel=not parallelism.disable_loss_parallel,
-            enable_float8_tensorwise_tp=False,
-            parallelism=parallelism,
-            model_converters=model_converters,
-            ac_config=ac_config,
-        )
-        maybe_enable_async_tp(parallelism, compile_config, tp_mesh)
-
+    # DeepSeek V4 sparse attention does not yet support context parallelism.
     if parallel_dims.cp_enabled:
-        from torchtitan_npu.distributed.context_parallel.registry import (
-            apply_cp_to_attention_module,
+        raise NotImplementedError(
+            "Context Parallel is not yet supported for DeepSeek V4 sparse attention in the GraphTrainer path."
         )
 
-        if not has_npu_converter(model_converters.converters, "npu_smla"):
-            raise NotImplementedError(
-                "Context parallel is supported only when DSv4 fusion kernels "
-                "are enabled, please add `npu_smla` to converters."
-            )
-
-        apply_cp_to_attention_module(
-            # pyrefly: ignore[missing-attribute, not-callable]
-            [block.attention for block in model.layers.values()],
-            parallel_dims.get_mesh("cp"),
-        )
-
-    # Check if using DeepEP for MoE communication
-    if parallelism.expert_parallel_comm_backend == "deepep":
-        if not parallel_dims.ep_enabled:
-            raise ValueError(
-                "DeepEP requires expert parallelism (ep_degree > 1). "
-                "The DeepEP MoE model code does not support EP=1. "
-                "Please set expert_parallel_degree > 1 or use standard communication backend."
-            )
-        if parallel_dims.etp_enabled:
-            raise NotImplementedError(
-                "DeepEP with Expert Tensor Parallelism (ETP) is not supported yet. "
-                "Please set expert_tensor_parallel_degree=1 or use standard communication backend."
-            )
-
-        use_deepep = True
-
-        # Import deepep module to register custom ops before accessing them
-        import torchtitan.distributed.deepep  # noqa: F401 - registers torch.ops.deepep
-
-    else:
-        use_deepep = False
+    annotate_deepseek_v4(model)
 
     if parallel_dims.tp_enabled or parallel_dims.ep_enabled:
-        apply_moe_ep_tp(
-            model,
-            tp_mesh=parallel_dims.get_optional_mesh("tp"),
-            ep_mesh=parallel_dims.get_optional_mesh("ep"),
-            etp_mesh=parallel_dims.get_optional_mesh("etp"),
-            ep_etp_mesh=parallel_dims.get_optional_mesh(["ep", "etp"]),
-            use_deepep=use_deepep,
-        )
+        model.parallelize(parallel_dims)
 
-    model_compile_enabled = compile_config.enable and "model" in compile_config.components
+    # Apply simple_fsdp unconditionally. The ``fsdp`` mesh always exists with a
+    # real backend (see ParallelDims._mesh_exist), even at degree 1, so that
+    # MixedPrecisionPolicy's param_dtype cast still applies in single-GPU runs.
+    # pyrefly: ignore [bad-assignment]
+    model = apply_simple_fsdp(model, parallel_dims=parallel_dims, training=training)
 
-    if ac_config.mode != "none":
-        apply_deepseek_v4_ac(
-            model,
-            ac_config,
-            model_compile_enabled=model_compile_enabled,
-            base_folder=dump_folder,
-        )
-
-    if model_compile_enabled:
-        apply_compile(model, compile_config, parallel_dims.ep_enabled)
-
-    dp_mesh: DeviceMesh | None = None
-    if parallel_dims.fsdp_enabled or parallel_dims.ep_enabled:
-        # apply FSDP or HSDP, potentially with Context Parallel
-        dp_mesh_names = ["dp_replicate", "fsdp"] if parallel_dims.dp_replicate_enabled else ["fsdp"]
-        dp_mesh = parallel_dims.get_mesh(dp_mesh_names)
-
-        # the mesh dim names of which the MoE params are sharded on via FSDP/HSDP
-        edp_mesh_names = ["dp_replicate", "efsdp"] if parallel_dims.dp_replicate_enabled else ["efsdp"]
-        edp_mesh = parallel_dims.get_optional_mesh(edp_mesh_names)
-
-        fsdp_fn = (
-            apply_deepseek_v4_fsdp_with_replicated_first_layer
-            if _replicate_embedding_and_first_layer_enabled()
-            else apply_fsdp
-        )
-        fsdp_fn(
-            model,
-            dp_mesh,
-            param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
-            reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
-            pp_enabled=parallel_dims.pp_enabled,
-            cpu_offload=training.enable_cpu_offload,
-            reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
-            ep_degree=parallel_dims.ep,
-            edp_mesh=edp_mesh,
-            gradient_divide_factor=parallel_dims.fsdp_gradient_divide_factor,
-        )
-
-        if parallel_dims.dp_replicate_enabled:
-            logger.info("Applied HSDP to the model")
-        else:
-            logger.info("Applied FSDP to the model")
-
-        if training.enable_cpu_offload:
-            logger.info("Applied CPU Offloading to the model")
-
-    elif parallel_dims.dp_replicate_enabled:
-        dp_mesh = parallel_dims.get_mesh("dp_replicate")
-        if dp_mesh.ndim > 1:
-            raise RuntimeError("DDP has not supported > 1D parallelism")
-        apply_replicate(
-            model,
-            dp_mesh,
-            param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
-            reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
-        )
+    # Apply compilation based on mode
+    # pyrefly: ignore [bad-assignment]
+    model = apply_graph_trainer_compile(
+        model,
+        compile_config=compile_config,
+        parallelism=parallelism,
+        parallel_dims=parallel_dims,
+        dump_folder=dump_folder,
+    )
 
     return model
-
-
-def _flatten_replicate_mesh(mesh: DeviceMesh, mesh_dim_name: str) -> DeviceMesh:
-    """Return the 1D data-parallel mesh required by ``replicate()``."""
-    if mesh.ndim == 1:
-        return mesh
-    if mesh.ndim != 2:
-        raise ValueError(
-            "DeepSeek-V4 replicated first-layer simulation expects a 1D FSDP "
-            f"mesh or a 2D HSDP mesh, but got {mesh.ndim} dimensions"
-        )
-    return mesh._flatten(mesh_dim_name)
-
-
-def _fsdp_mesh_info(mesh: DeviceMesh) -> FSDPMeshInfo:
-    """Build mesh metadata that preserves the HSDP replicate dimension."""
-    if mesh.ndim == 1:
-        return FSDPMeshInfo(mesh, shard_mesh_dim=0)
-    if mesh.ndim == 2:
-        mesh_dim_names = tuple(mesh.mesh_dim_names or ())
-        if (
-            len(mesh_dim_names) != 2
-            or mesh_dim_names[0] != "dp_replicate"
-            or mesh_dim_names[1] not in {"fsdp", "efsdp"}
-        ):
-            raise ValueError(
-                "DeepSeek-V4 HSDP expects mesh dimensions "
-                "('dp_replicate', 'fsdp' or 'efsdp'), but got "
-                f"{mesh_dim_names}"
-            )
-        return HSDPMeshInfo(
-            mesh,
-            shard_mesh_dim=1,
-            replicate_mesh_dim=0,
-        )
-    raise ValueError(
-        "DeepSeek-V4 FSDP expects a 1D FSDP mesh or a 2D HSDP mesh, "
-        f"but got {mesh.ndim} dimensions"
-    )
-
-
-def apply_deepseek_v4_fsdp_with_replicated_first_layer(
-    model: Any,
-    dp_mesh: DeviceMesh,
-    param_dtype: torch.dtype,
-    reduce_dtype: torch.dtype,
-    pp_enabled: bool,
-    cpu_offload: bool = False,
-    reshard_after_forward_policy: str = "default",
-    ep_degree: int = 1,
-    edp_mesh: DeviceMesh | None = None,
-    gradient_divide_factor: int | None = None,
-) -> None:
-    """Apply FSDP while replicating the embedding and global layer zero.
-
-    The first layer's routed experts remain partitioned by EP, but replicas of
-    the same experts are synchronized over EDP instead of being EFSDP-sharded.
-    All other first-layer parameters are synchronized over the dense DP mesh.
-    """
-    del gradient_divide_factor  # Gradient division is disabled below, matching upstream.
-
-    if getattr(model, "enable_weight_tying", False):
-        raise ValueError("simulation.replicate_embedding_and_first_layer does not support weight-tied embeddings")
-
-    mp_policy = MixedPrecisionPolicy(
-        param_dtype=param_dtype,
-        reduce_dtype=reduce_dtype,
-    )
-    fsdp_config: dict[str, Any] = {"mesh": dp_mesh, "mp_policy": mp_policy}
-    replicate_config: dict[str, Any] = {
-        "mesh": _flatten_replicate_mesh(dp_mesh, "dsv4_first_layer_dp"),
-        "mp_policy": mp_policy,
-    }
-    if cpu_offload:
-        offload_policy = CPUOffloadPolicy()
-        fsdp_config["offload_policy"] = offload_policy
-        replicate_config["offload_policy"] = offload_policy
-
-    reshard_after_forward = get_fsdp_reshard_after_forward_policy(
-        reshard_after_forward_policy,
-        pp_enabled,
-    )
-
-    if model.tok_embeddings is not None:
-        replicate(model.tok_embeddings, **replicate_config)
-
-    if model.norm is not None and model.output is not None:
-        fully_shard(
-            [model.norm, model.output],
-            **fsdp_config,
-            reshard_after_forward=reshard_after_forward_policy == "always",
-        )
-
-    for layer_id, transformer_block in model.layers.items():
-        is_first_layer = int(layer_id) == 0
-        if is_first_layer:
-            if transformer_block.moe_enabled:
-                if ep_degree > 1:
-                    if edp_mesh is None:
-                        raise ValueError(
-                            "DeepSeek-V4 replicated first-layer experts require "
-                            "an EDP mesh when Expert Parallel is enabled"
-                        )
-                    expert_mesh = edp_mesh
-                else:
-                    expert_mesh = dp_mesh
-                expert_replicate_config = dict(replicate_config)
-                expert_replicate_config["mesh"] = _flatten_replicate_mesh(
-                    expert_mesh,
-                    "dsv4_first_layer_edp",
-                )
-                # Apply bottom-up so the parent replicate group excludes routed
-                # expert params, which use the EP-aligned EDP process group.
-                replicate(
-                    transformer_block.moe.experts,
-                    **expert_replicate_config,
-                )
-            replicate(transformer_block, **replicate_config)
-            continue
-
-        if transformer_block.moe_enabled:
-            expert_params = set(transformer_block.moe.experts.parameters())
-            num_experts = transformer_block.moe.experts.num_experts
-
-            if ep_degree > 1:
-                if edp_mesh is None:
-                    raise ValueError("Expert Parallel requires an EDP mesh")
-                efsdp_ep_size = edp_mesh["efsdp"].size() * ep_degree
-            else:
-                efsdp_ep_size = dp_mesh.size()
-
-            expert_shard_placement = Shard(1) if efsdp_ep_size > num_experts else Shard(0)
-            if ep_degree == 1 and expert_shard_placement == Shard(0):
-                fully_shard(
-                    transformer_block,
-                    **fsdp_config,
-                    reshard_after_forward=reshard_after_forward,
-                )
-            elif ep_degree == 1:
-
-                def _experts_shard_placement_fn(
-                    param: nn.Parameter,
-                    _expert_params: set = expert_params,
-                ) -> Shard | None:
-                    return Shard(1) if param in _expert_params else None
-
-                fully_shard(
-                    transformer_block,
-                    **fsdp_config,
-                    reshard_after_forward=reshard_after_forward,
-                    shard_placement_fn=_experts_shard_placement_fn,
-                )
-            else:
-                assert edp_mesh is not None
-                edp_mesh_info = _fsdp_mesh_info(edp_mesh)
-                dp_mesh_info = _fsdp_mesh_info(dp_mesh)
-
-                def _shard_placement_fn(
-                    param: nn.Parameter,
-                    _expert_params: set = expert_params,
-                    _expert_placement: Shard = expert_shard_placement,
-                    _edp_mesh_info: FSDPMeshInfo = edp_mesh_info,
-                    _dp_mesh_info: FSDPMeshInfo = dp_mesh_info,
-                ) -> ShardPlacementResult:
-                    if param in _expert_params:
-                        return ShardPlacementResult(
-                            placement=_expert_placement,
-                            mesh_info=_edp_mesh_info,
-                        )
-                    return ShardPlacementResult(
-                        placement=Shard(0),
-                        mesh_info=_dp_mesh_info,
-                    )
-
-                fully_shard(
-                    transformer_block,
-                    **fsdp_config,
-                    reshard_after_forward=reshard_after_forward,
-                    shard_placement_fn=_shard_placement_fn,
-                )
-        else:
-            fully_shard(
-                transformer_block,
-                **fsdp_config,
-                reshard_after_forward=reshard_after_forward,
-            )
-
-    fully_shard(model, **fsdp_config)
-    disable_fsdp_gradient_division(model)
-    logger.info(
-        "Replicated DeepSeek-V4 embedding and first layer across their FSDP meshes while preserving Expert Parallel"
-    )
-
-    if ep_degree == 1:
-        return
-
-    transformer_blocks = list(model.layers.values())
-    next_transformer_blocks = [*transformer_blocks[1:], None]
-    if model.tok_embeddings is not None and transformer_blocks:
-        model.tok_embeddings.set_modules_to_forward_prefetch([transformer_blocks[0]])
-    for transformer_block, next_transformer_block in zip(
-        transformer_blocks,
-        next_transformer_blocks,
-        strict=True,
-    ):
-        if next_transformer_block is not None:
-            transformer_block.set_modules_to_forward_prefetch([next_transformer_block])
-        elif model.norm is not None and model.output is not None:
-            transformer_block.set_modules_to_forward_prefetch([model.norm, model.output])
-
-    reversed_transformer_blocks = list(reversed(transformer_blocks))
-    prev_transformer_blocks = [*reversed_transformer_blocks[1:], None]
-    if model.norm is not None and model.output is not None and reversed_transformer_blocks:
-        model.output.set_modules_to_backward_prefetch([reversed_transformer_blocks[0]])
-    for transformer_block, prev_transformer_block in zip(
-        reversed_transformer_blocks,
-        prev_transformer_blocks,
-        strict=True,
-    ):
-        if prev_transformer_block is not None:
-            transformer_block.set_modules_to_backward_prefetch([prev_transformer_block])
-        elif model.tok_embeddings is not None:
-            transformer_block.set_modules_to_backward_prefetch([model.tok_embeddings])
-
-
-def apply_non_moe_tp(
-    model: nn.Module,
-    tp_mesh: DeviceMesh,
-    loss_parallel: bool,
-    enable_float8_tensorwise_tp: bool,
-    parallelism,
-    model_converters,
-    ac_config,
-):
-    """Apply tensor parallelism."""
-
-    enable_activation_checkpoint = ac_config.mode in [
-        "full",
-        "selective",
-    ]
-
-    # 1. Parallelize the embedding and shard its outputs (which are the first
-    # transformer block's inputs)
-    # 2. Parallelize the root norm layer over the sequence dim
-    # 3. Parallelize the final linear output layer
-    (
-        rowwise_parallel,
-        await_rowwise_parallel,
-        colwise_parallel,
-        prepare_module_input,
-        prepare_module_input_output,
-    ) = (
-        RowwiseParallel,
-        AwaitRowwiseParallel,
-        ColwiseParallel,
-        PrepareModuleInput,
-        PrepareModuleInputOutput,
-    )
-    hc_head_plan = HcHeadParallelStyle()
-    tok_embeddings = getattr(model, "tok_embeddings", None)
-    norm = getattr(model, "norm", None)
-    output = getattr(model, "output", None)
-
-    root_parallelize_plan: dict[str, Any] = {}
-    if tok_embeddings is not None:
-        root_parallelize_plan["tok_embeddings"] = rowwise_parallel(
-            input_layouts=Replicate(),
-            output_layouts=Shard(1),
-        )
-    if norm is not None:
-        root_parallelize_plan["norm"] = SequenceParallel()
-    if output is not None:
-        root_parallelize_plan["output"] = colwise_parallel(
-            input_layouts=Shard(1),
-            output_layouts=Shard(-1) if loss_parallel else Replicate(),
-            use_local_output=not loss_parallel,
-        )
-
-    if root_parallelize_plan:
-        parallelize_module(model, tp_mesh, root_parallelize_plan)
-
-    # NOTE: hc_head now lives inside the last main transformer layer
-    # (``transformer_block.hc_head`` when ``is_last_layer``); its TP plan is
-    # applied in the per-layer loop below.
-
-    attention_kernel_plan_ratio1 = PrepareModuleInputOutputWithBwdAllReduce(
-        bwd_allreduce_inputs=(False, True, False, False, False),
-        input_layouts=(Shard(2), Replicate(), Shard(0), None, None),
-        desired_input_layouts=(Shard(2), Replicate(), Shard(0), None, None),
-        use_local_input=True,
-        output_layouts=(Shard(2)),
-        desired_output_layouts=(Shard(2)),
-        use_local_output=False,
-    )
-
-    attention_kernel_plan_ratio4 = PrepareModuleInputOutputWithBwdAllReduce(
-        bwd_allreduce_inputs=(False, True, False, True, False),
-        input_layouts=(Shard(2), Replicate(), Shard(0), Replicate(), Replicate()),
-        desired_input_layouts=(
-            Shard(2),
-            Replicate(),
-            Shard(0),
-            Replicate(),
-            Replicate(),
-        ),
-        use_local_input=True,
-        output_layouts=(Shard(2)),
-        desired_output_layouts=(Shard(2)),
-        use_local_output=False,
-    )
-
-    attention_kernel_plan_ratio128 = PrepareModuleInputOutputWithBwdAllReduce(
-        bwd_allreduce_inputs=(False, True, False, True, False),
-        input_layouts=(Shard(2), Replicate(), Shard(0), Replicate(), None),
-        desired_input_layouts=(Shard(2), Replicate(), Shard(0), Replicate(), None),
-        use_local_input=True,
-        output_layouts=(Shard(2)),
-        desired_output_layouts=(Shard(2)),
-        use_local_output=False,
-    )
-
-    indexer_plan = prepare_module_input_output(
-        input_layouts=(Replicate(), Replicate(), Replicate(), Replicate()),
-        desired_input_layouts=(
-            Replicate(),
-            Replicate(),
-            Replicate(),
-            Replicate(),
-        ),
-        use_local_input=True,
-        output_layouts=(Replicate(), Replicate(), Replicate()),
-        desired_output_layouts=(Replicate(), Replicate(), Replicate()),
-        use_local_output=False,
-    )
-
-    li_compute_plan = prepare_module_input_output(
-        input_layouts=(Replicate(), Replicate(), Replicate(), None, None),
-        desired_input_layouts=(Replicate(), Replicate(), Replicate(), None, None),
-        use_local_input=True,
-        output_layouts=(Replicate(), Replicate()),
-        desired_output_layouts=(Replicate(), Replicate()),
-        use_local_output=False,
-    )
-
-    li_compute_smla_plan = prepare_module_input_output(
-        input_layouts=(Replicate(), Replicate(), Replicate(), None, None, None),
-        desired_input_layouts=(
-            Replicate(),
-            Replicate(),
-            Replicate(),
-            None,
-            None,
-            None,
-        ),
-        use_local_input=True,
-        output_layouts=(Replicate(), Replicate()),
-        desired_output_layouts=(Replicate(), Replicate()),
-        use_local_output=False,
-    )
-
-    compressor_plan = prepare_module_input_output(
-        input_layouts=(Replicate(), Replicate()),
-        desired_input_layouts=(Replicate(), Replicate()),
-        use_local_input=False,
-        output_layouts=(Replicate()),
-        desired_output_layouts=(Replicate()),
-        use_local_output=False,
-    )
-
-    indexer_compressor_plan = prepare_module_input_output(
-        input_layouts=(Replicate(), Replicate()),
-        desired_input_layouts=(Replicate(), Replicate()),
-        use_local_input=False,
-        output_layouts=(Replicate()),
-        desired_output_layouts=(Replicate()),
-        use_local_output=True,
-    )
-
-    hc_pre_plan = prepare_module_input_output(
-        input_layouts=(Shard(1), Replicate(), Replicate(), Replicate()),
-        desired_input_layouts=(Replicate(), Replicate(), Replicate(), Replicate()),
-        use_local_input=True,
-        output_layouts=(Replicate(), Replicate(), Replicate()),
-        desired_output_layouts=(Shard(1), Shard(1), Shard(1)),
-        use_local_output=False,
-    )
-
-    hc_post_plan = prepare_module_input_output(
-        input_layouts=(Shard(1), Shard(1), Shard(1), Shard(1)),
-        desired_input_layouts=(Replicate(), Replicate(), Replicate(), Replicate()),
-        use_local_input=True,
-        output_layouts=(Replicate()),
-        desired_output_layouts=(Shard(1)),
-    )
-
-    hc_pre_sinkhon_plan = prepare_module_input(
-        input_layouts=(Replicate(), Replicate(), Replicate(), None, None, None),
-        desired_input_layouts=(Replicate(), Replicate(), Replicate(), None, None, None),
-        use_local_output=True,
-    )
-
-    get_window_topk_idxs_plan = prepare_module_input_output(
-        input_layouts=(None, None, None),
-        desired_input_layouts=(None, None, None),
-        use_local_input=False,
-        output_layouts=(Replicate()),
-        desired_output_layouts=(Replicate()),
-        use_local_output=True,
-    )
-
-    get_compress_topk_idxs_plan = prepare_module_input_output(
-        input_layouts=(Replicate(), None),
-        desired_input_layouts=(Replicate(), None),
-        use_local_input=False,
-        output_layouts=(Replicate()),
-        desired_output_layouts=(Replicate()),
-        use_local_output=True,
-    )
-
-    li_loss_plan = prepare_module_input(
-        input_layouts=(
-            Shard(1),
-            Replicate(),
-            Replicate(),
-            Shard(0),
-            Replicate(),
-            Replicate(),
-            Replicate(),
-            Replicate(),
-            Replicate(),
-            None,
-            None,
-        ),
-        desired_input_layouts=(
-            Replicate(),
-            Replicate(),
-            Replicate(),
-            Replicate(),
-            Replicate(),
-            Replicate(),
-            Replicate(),
-            Replicate(),
-            Replicate(),
-            None,
-            None,
-        ),
-        use_local_output=True,
-    )
-
-    model_args = cast("Any", model).model_args
-    use_attention_masks = _model_uses_attention_masks(model_args)
-
-    # Apply tensor + sequence parallelism to every transformer block
-    # NOTE: At the cost of model code change, we can accelerate Sequence Parallel
-    #       by folding (and unfolding) the batch dimension and the sequence dimension.
-    #       Examples can be found at https://github.com/pytorch/torchtitan/pull/437
-    # pyrefly: ignore [not-callable]
-    for transformer_block in model.layers.values():
-        _register_distributed_parameter(
-            # pyrefly: ignore [missing-attribute]
-            transformer_block.attention.inner_attention,
-            "attn_sink",
-            tp_mesh,
-            [Shard(0)],
-        )
-        _register_distributed_parameter(
-            # pyrefly: ignore [bad-argument-type]
-            transformer_block,
-            "hc_attn_fn",
-            tp_mesh,
-            [Replicate()],
-        )
-        _register_distributed_parameter(
-            # pyrefly: ignore [bad-argument-type]
-            transformer_block,
-            "hc_ffn_fn",
-            tp_mesh,
-            [Replicate()],
-        )
-        _register_distributed_parameter(
-            # pyrefly: ignore [bad-argument-type]
-            transformer_block,
-            "hc_attn_base",
-            tp_mesh,
-            [Replicate()],
-        )
-        _register_distributed_parameter(
-            # pyrefly: ignore [bad-argument-type]
-            transformer_block,
-            "hc_ffn_base",
-            tp_mesh,
-            [Replicate()],
-        )
-        _register_distributed_parameter(
-            # pyrefly: ignore [bad-argument-type]
-            transformer_block,
-            "hc_attn_scale",
-            tp_mesh,
-            [Replicate()],
-        )
-        _register_distributed_parameter(
-            # pyrefly: ignore [bad-argument-type]
-            transformer_block,
-            "hc_ffn_scale",
-            tp_mesh,
-            [Replicate()],
-        )
-        # pyrefly: ignore [missing-attribute]
-        if transformer_block.attention.compress_ratio <= 1:
-            attention_kernel_plan = attention_kernel_plan_ratio1
-        # pyrefly: ignore [missing-attribute]
-        elif transformer_block.attention.compress_ratio == 4:
-            attention_kernel_plan = attention_kernel_plan_ratio4
-        else:
-            attention_kernel_plan = attention_kernel_plan_ratio128
-
-        layer_plan: dict[str, ParallelStyle] = {
-            "attention_norm": SequenceParallel(),
-            "attention": prepare_module_input(
-                input_layouts=(Shard(1), Replicate(), None, None),
-                desired_input_layouts=(Replicate(), Replicate(), None, None),
-            ),
-            "attention.inner_attention.sparse_attn.get_window_topk_idxs": get_window_topk_idxs_plan,
-            "attention.inner_attention.sparse_attn.get_compress_topk_idxs": get_compress_topk_idxs_plan,
-            # NOTE: use_local_output=False make the output to be a DTensor instead of a plain Tensor
-            # so that the intermedidate results k is generated as a DTensor and its gradient is
-            # correctly handled by the autograd engine.
-            "attention.pre_attention.wq_a": NoParallel(),
-            "attention.pre_attention.q_norm": NoParallel(),
-            "attention.pre_attention.wq_b": colwise_parallel(use_local_output=False),
-            "attention.pre_attention.wkv": NoParallel(),
-            "attention.pre_attention.kv_norm": NoParallel(),
-            "attention.post_attention.wo_a": colwise_parallel(use_local_output=False),
-            "attention.post_attention.wo_b": rowwise_parallel(
-                input_layouts=Shard(-1),
-                output_layouts=Shard(1),
-                use_local_output=False,
-            ),
-            "attention.inner_attention.sparse_attn": attention_kernel_plan,
-            "attention.inner_attention.li_loss": li_loss_plan,
-            "hc_post": hc_post_plan,
-            "hc_pre": hc_pre_plan,
-            "hc_pre.torch_hc_split_sinkhorn": hc_pre_sinkhon_plan,
-            "ffn_norm": SequenceParallel(),
-        }
-        if getattr(transformer_block, "is_last_layer", False):
-            # hc_head runs at the end of this block's forward (input is the
-            # post-hc_post Shard(1) activation, same layout it had when hc_head
-            # was at the root), so the same plan applies.
-            layer_plan.update({"hc_head": hc_head_plan})
-        # pyrefly: ignore [missing-attribute]
-        if transformer_block.attention.compress_ratio > 1:
-            # pyrefly: ignore [missing-attribute]
-            compress_ratio = transformer_block.attention.compress_ratio
-            compressor_attr = "compressor" if compress_ratio == 4 else "compressor_128"
-            compressor_module = getattr(
-                # pyrefly: ignore [missing-attribute]
-                transformer_block.attention.pre_attention,
-                compressor_attr,
-            )
-            compressor_key = f"attention.pre_attention.{compressor_attr}"
-            _register_distributed_parameter(compressor_module, "ape", tp_mesh, [Replicate()])
-            layer_plan.update(
-                {
-                    compressor_key: compressor_plan,
-                    f"{compressor_key}.wkv": NoParallel(),
-                    f"{compressor_key}.wgate": NoParallel(),
-                    f"{compressor_key}.norm": NoParallel(),
-                }
-            )
-            if compress_ratio == 4:
-                li_compute_parallel_plan = li_compute_smla_plan if use_attention_masks else li_compute_plan
-                _register_distributed_parameter(
-                    # pyrefly: ignore [missing-attribute]
-                    transformer_block.attention.pre_attention.indexer.compressor,
-                    "ape",
-                    tp_mesh,
-                    [Replicate()],
-                )
-                layer_plan.update(
-                    {
-                        "attention.inner_attention.li_compute": li_compute_parallel_plan,
-                        "attention.pre_attention.indexer": indexer_plan,
-                        "attention.pre_attention.indexer.compressor": indexer_compressor_plan,
-                        "attention.pre_attention.indexer.wq_b": NoParallel(local_output_grad_placements=(Replicate(),)),
-                        "attention.pre_attention.indexer.weights_proj": NoParallel(
-                            local_output_grad_placements=(Replicate(),)
-                        ),
-                        # Upstream NoParallel dropped ``use_local_output``;
-                        # output stays a DTensor by default.
-                        "attention.pre_attention.indexer.compressor.wkv": NoParallel(),
-                        "attention.pre_attention.indexer.compressor.wgate": NoParallel(),
-                        "attention.pre_attention.indexer.compressor.norm": NoParallel(),
-                    }
-                )
-
-        # pyrefly: ignore [missing-attribute]
-        if not transformer_block.moe_enabled:
-            # Select the appropriate parallel strategy:
-            # Use AwaitRowwiseParallel when activation checkpoint is enabled to handle
-            # async redistribution. The custom implementation ensures wait_tensor() is called
-            # on _local_tensor to prevent memory leaks caused by incomplete async operations.
-            safe_rowwise_parallel = await_rowwise_parallel if enable_activation_checkpoint else rowwise_parallel
-            layer_plan.update(
-                {
-                    "feed_forward": prepare_module_input(
-                        input_layouts=(Shard(1),),
-                        desired_input_layouts=(Replicate(),),
-                    ),
-                    "feed_forward.w1": colwise_parallel(),
-                    "feed_forward.w2": safe_rowwise_parallel(output_layouts=Shard(1)),
-                    "feed_forward.w3": colwise_parallel(),
-                }
-            )
-
-        # pyrefly: ignore [missing-attribute]
-        if transformer_block.layer_id >= model.model_args.n_layers:
-            layer_plan.update(
-                {
-                    "enorm": SequenceParallel(),
-                    "hnorm": SequenceParallel(),
-                    "e_proj": SequenceParallel(use_local_output=True),
-                    "h_proj": SequenceParallel(use_local_output=True),
-                    "mtp_norm": SequenceParallel(),
-                    "mtp_hc_head": hc_head_plan,
-                }
-            )
-
-        parallelize_module(
-            # pyrefly: ignore [bad-argument-type]
-            module=transformer_block,
-            device_mesh=tp_mesh,
-            parallelize_plan=layer_plan,
-        )
-
-    logger.info(f"Applied {'Float8 tensorwise ' if enable_float8_tensorwise_tp else ''}Tensor Parallelism to the model")
-
-
-def apply_moe_ep_tp(
-    model: nn.Module,
-    tp_mesh: DeviceMesh | None,
-    ep_mesh: DeviceMesh | None,
-    etp_mesh: DeviceMesh | None,
-    ep_etp_mesh: DeviceMesh | None,
-    use_deepep: bool = False,
-):
-    assert tp_mesh is not None or ep_mesh is not None, f"""
-        At least one of Tensor Parallel mesh (tp_mesh) or Expert Parallel mesh (ep_mesh) must be provided.
-        Current status: tp_mesh={tp_mesh}, ep_mesh={ep_mesh}
-        """
-
-    # pyrefly: ignore [not-callable]
-    for transformer_block in model.layers.values():
-        # pyrefly: ignore [missing-attribute]
-        if not transformer_block.moe_enabled:
-            continue
-
-        if tp_mesh is not None:
-            moe_layer_plan = {
-                # input / output sharding on the seqlen dim
-                "moe": PrepareModuleInputOutput(
-                    input_layouts=(Shard(1), Replicate()),
-                    desired_input_layouts=(Shard(1), Shard(1)),
-                    use_local_input=True,
-                    output_layouts=(Shard(1),),
-                    desired_output_layouts=(Shard(1),),
-                ),
-                "moe.router.gate": SequenceParallel(sequence_dim=0, use_local_output=True),
-            }
-            # pyrefly: ignore [missing-attribute]
-            if transformer_block.moe.shared_experts is not None:
-                # input: sharded on fused batch-seq dimension (dim=0)
-                # all-gather for input, reduce-scatter for output
-                # pyrefly: ignore [no-matching-overload]
-                moe_layer_plan.update(
-                    {
-                        "moe.shared_experts": PrepareModuleInput(
-                            input_layouts=(Shard(0),),
-                            desired_input_layouts=(Replicate(),),
-                        ),
-                        "moe.shared_experts.w1": ColwiseParallel(),
-                        "moe.shared_experts.w2": RowwiseParallel(output_layouts=Shard(0)),
-                        "moe.shared_experts.w3": ColwiseParallel(),
-                    }
-                )
-            parallelize_module(
-                # pyrefly: ignore [bad-argument-type]
-                module=transformer_block,
-                device_mesh=tp_mesh,
-                # pyrefly: ignore [bad-argument-type]
-                parallelize_plan=moe_layer_plan,
-            )
-
-        # Currently only TP and TP extend EP are supported
-        experts_mesh, experts_plan = None, None
-        if ep_mesh is None:
-            experts_mesh = tp_mesh
-            experts_plan = TensorParallel()
-        elif tp_mesh is None or etp_mesh is None:
-            experts_mesh = ep_mesh
-            if use_deepep:
-                # pyrefly: ignore [missing-attribute]
-                score_before_experts = transformer_block.moe.score_before_experts
-                experts_plan = DeepEPExpertParallel(
-                    score_before_experts=score_before_experts,
-                )
-                logger.info("Applying DeepEP to MoE layer")
-            else:
-                experts_plan = ExpertParallel()
-        else:
-            raise NotImplementedError("ETP is not supported currently")
-
-        parallelize_module(
-            # pyrefly: ignore [missing-attribute]
-            module=transformer_block.moe.experts,
-            device_mesh=experts_mesh,
-            parallelize_plan=experts_plan,
-        )
-
-
-def _compile_moe_transformer_block(
-    transformer_block: nn.Module,
-    compile_config,
-) -> nn.Module:
-    # MoE layers contain FSDP(GroupedExperts) hooks. Compile around those hooks so
-    # activation checkpointing does not fall the whole graph back to eager.
-    block = (
-        transformer_block._checkpoint_wrapped_module
-        if isinstance(transformer_block, CheckpointWrapper)
-        else transformer_block
-    )
-    for attr_name, submod in block.named_children():
-        if getattr(block, attr_name) != getattr(transformer_block, attr_name):
-            raise RuntimeError(f"Checkpoint-wrapped block child {attr_name!r} is not exposed on wrapper")
-        if attr_name in {"hc_pre"}:
-            continue
-        if isinstance(submod, Attention):
-            _compile_children_except(submod, {"inner_attention"}, compile_config)
-        elif isinstance(submod, DeepSeekV4MoE):
-            _compile_children_except(submod, {"experts"}, compile_config)
-        elif isinstance(submod, NPURMSNorm):
-            continue
-        else:
-            setattr(
-                block,
-                attr_name,
-                torch.compile(submod, backend=compile_config.backend, fullgraph=True),
-            )
-    return transformer_block
-
-
-def _compile_children_except(
-    module: nn.Module,
-    skip_names: set[str],
-    compile_config,
-) -> None:
-    for child_name, child_module in module.named_children():
-        if child_name in skip_names:
-            continue
-        setattr(
-            module,
-            child_name,
-            torch.compile(
-                child_module,
-                backend=compile_config.backend,
-                fullgraph=True,
-            ),
-        )
-
-
-def _patch_grouped_mm_compile(compile_config, ep_enabled: bool) -> None:
-    already_patched = "_run_experts_grouped_mm_dynamic" in moe_module._run_experts_grouped_mm.__qualname__
-    if already_patched:
-        return
-
-    moe_module._run_experts_grouped_mm = torch.compile(
-        moe_module._run_experts_grouped_mm,
-        backend=compile_config.backend,
-        fullgraph=True,
-    )
-    if not ep_enabled:
-        return
-
-    compiled_fn = moe_module._run_experts_grouped_mm
-
-    # Keep function logic in sync with the `already_patched` check above.
-    def _run_experts_grouped_mm_dynamic(
-        w1: torch.Tensor,
-        w2: torch.Tensor,
-        w3: torch.Tensor,
-        x: torch.Tensor,
-        num_tokens_per_expert: torch.Tensor,
-    ) -> torch.Tensor:
-        torch._dynamo.mark_dynamic(x, 0)
-        return compiled_fn(w1, w2, w3, x, num_tokens_per_expert)
-
-    moe_module._run_experts_grouped_mm = _run_experts_grouped_mm_dynamic
-
-
-def apply_compile(model: nn.Module, compile_config, ep_enabled: bool):
-    """
-    Apply torch.compile to each TransformerBlock, which makes compilation efficient due to
-    repeated structure. Alternatively one can compile the whole model (after applying DP).
-    """
-    # Required for torch.compile to avoid graph breaking on dynamic shapes in
-    # token-choice MoE.
-    torch._dynamo.config.capture_scalar_outputs = True
-    # Workaround for https://github.com/pytorch/pytorch/issues/166926
-    # pyrefly: ignore [missing-attribute]
-    torch._C._dynamo.eval_frame._set_lru_cache(False)
-
-    for (
-        layer_id,
-        transformer_block,
-    ) in model.layers.named_children():  # pyrefly: ignore [missing-attribute]
-        if transformer_block.moe_enabled:
-            transformer_block = _compile_moe_transformer_block(transformer_block, compile_config)
-        else:
-            transformer_block = torch.compile(
-                transformer_block,
-                backend=compile_config.backend,
-                fullgraph=True,
-            )
-        # pyrefly: ignore [missing-attribute]
-        model.layers.register_module(layer_id, transformer_block)
-
-    _patch_grouped_mm_compile(compile_config, ep_enabled)
-    # NOTE: We don't compile for loop code path due to an issue with unbacked symints:
-    # https://github.com/pytorch/pytorch/issues/166460
-
-    logger.info("Compiling each TransformerBlock with torch.compile")
-
-
-def apply_distributed_indexer_loss_tracking(
-    parallel_dims: ParallelDims,
-    num_layers: int,
-    compress_ratios: tuple[int, ...],
-):
-    """
-    Dynamically patch track_dsa_indexer_metrics to support 3D/4D parallelism
-    synchronization efficiently using a single global communication step.
-
-    Before synchronization, the indexer loss on each GPU is merely an average
-    over its local [B, S] (Batch, Sequence) shape. In a distributed scenario,
-    this local loss must be synchronized (averaged) across all parallel domains,
-    including Pipeline Parallel (PP), Tensor Parallel (TP), Data Parallel (DP),
-    and Context Parallel (CP) groups, to obtain the globally accurate metric.
-    """
-
-    # Pre-compute which layer indices have an indexer (compress_ratio == 4).
-    # This is static model structure info — same on every rank — so it can be
-    # used as a safe early-return guard and as an index into the values tensor
-    # without introducing any cross-rank divergence.
-    valid_indices = [i for i in range(num_layers) if i < len(compress_ratios) and compress_ratios[i] == 4]
-
-    # Normalization factor: each valid layer is computed by every rank in its
-    # PP stage.  world_size / pp == dp * tp * cp (ranks per PP stage).
-    norm_factor = dist.get_world_size() // max(parallel_dims.pp, 1)
-
-    def _new_empty_tracker_tensor() -> torch.Tensor:
-        device = torch.device("npu", cast("Any", torch).npu.current_device())
-        return torch.zeros(num_layers, device=device)
-
-    def distributed_track_dsa_indexer_metrics(total_acc_steps: int):
-        # valid_indices is derived from model config — identical on all ranks,
-        # so this early return fires uniformly and cannot cause a hang.
-        if not valid_indices:
-            DSAIndexerLossLoggingHelper.clean_loss_in_tracker()
-            return
-
-        tracker = DSAIndexerLossLoggingHelper.tracker
-        values = tracker.get("values")
-        dsa_indexer_losses = _new_empty_tracker_tensor() if values is None else values.clone()
-
-        # all_reduce is unconditional so every rank participates, even those
-        # on PP stages that have no indexer layers (their values are zeros).
-        if dist.is_initialized():
-            dist.all_reduce(dsa_indexer_losses, op=dist.ReduceOp.SUM)
-
-        loss = dsa_indexer_losses[valid_indices].mean() / (norm_factor * total_acc_steps)
-
-        DSAIndexerLossLoggingHelper.clean_loss_in_tracker()
-        logger.info(f"indexer loss: {loss.item()}")
-
-    # Apply the monkey patch
-    DSAIndexerLossLoggingHelper.track_dsa_indexer_metrics = distributed_track_dsa_indexer_metrics

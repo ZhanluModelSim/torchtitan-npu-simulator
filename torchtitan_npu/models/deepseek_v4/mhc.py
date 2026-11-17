@@ -1,0 +1,105 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+from dataclasses import dataclass
+
+import torch
+import torch.nn.functional as F
+from torch import nn
+from torchtitan.protocols.module import Module
+
+
+class HcPre(Module):
+    """Head-collaboration pre step; owns its mixing parameters."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(Module.Config):
+        hc_mult: int = 4
+        dim: int
+        sinkhorn_iters: int = 20
+        eps: float = 1e-6
+        norm_eps: float = 1e-6
+
+    def __init__(self, config: Config):
+        super().__init__()
+        hc_mult = config.hc_mult
+        mix_hc = (2 + hc_mult) * hc_mult
+        hc_dim = hc_mult * config.dim
+        self.hc_mult = config.hc_mult
+        self.sinkhorn_iters = config.sinkhorn_iters
+        self.eps = config.eps
+        self.norm_eps = config.norm_eps
+        self.hc_fn = nn.Parameter(torch.empty(mix_hc, hc_dim, dtype=torch.float32))
+        self.hc_base = nn.Parameter(torch.empty(mix_hc, dtype=torch.float32))
+        self.hc_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
+
+    def _sinkhorn(self, mixes, hc_scale, hc_base):
+        hc_mult = self.hc_mult
+        pre, post, comb = mixes.split([hc_mult, hc_mult, hc_mult * hc_mult], dim=-1)
+        comb = comb.unflatten(-1, (hc_mult, hc_mult))
+
+        pre = torch.sigmoid(pre * hc_scale[0] + hc_base[:hc_mult].unsqueeze(0).unsqueeze(0)) + self.eps
+        post = 2 * torch.sigmoid(post * hc_scale[1] + hc_base[hc_mult : 2 * hc_mult].unsqueeze(0).unsqueeze(0))
+        comb = comb * hc_scale[2] + hc_base[2 * hc_mult :].view(hc_mult, hc_mult).unsqueeze(0).unsqueeze(0)
+
+        row_max = comb.max(dim=-1, keepdim=True).values
+        comb = torch.exp(comb - row_max)
+        comb = comb / comb.sum(dim=-1, keepdim=True) + self.eps
+        comb = comb / (comb.sum(dim=-2, keepdim=True) + self.eps)
+        for _ in range(self.sinkhorn_iters - 1):
+            comb = comb / (comb.sum(dim=-1, keepdim=True) + self.eps)
+            comb = comb / (comb.sum(dim=-2, keepdim=True) + self.eps)
+        return pre, post, comb
+
+    def forward(self, x):
+        shape, dtype = x.size(), x.dtype
+        x = x.flatten(2).float()
+        rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + self.norm_eps)
+        mixes = F.linear(x, self.hc_fn.float()) * rsqrt
+        pre, post, comb = self._sinkhorn(mixes, self.hc_scale.float(), self.hc_base.float())
+        y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=2)
+        return y.to(dtype), post, comb
+
+
+class HcPost(Module):
+    @dataclass(kw_only=True, slots=True)
+    class Config(Module.Config):
+        pass
+
+    def __init__(self, config: Config):
+        super().__init__()
+
+    def forward(self, x, residual, post, comb):
+        y = post.unsqueeze(-1) * x.unsqueeze(-2) + torch.sum(comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=2)
+        return y.type_as(x)
+
+
+class HcHead(Module):
+    """Head-collaboration head; owns its mixing parameters."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(Module.Config):
+        hc_mult: int = 4
+        dim: int
+        norm_eps: float = 1e-6
+        eps: float = 1e-6
+
+    def __init__(self, config: Config):
+        super().__init__()
+        hc_dim = config.hc_mult * config.dim
+        self.norm_eps = config.norm_eps
+        self.eps = config.eps
+        self.hc_fn = nn.Parameter(torch.empty(config.hc_mult, hc_dim, dtype=torch.float32))
+        self.hc_base = nn.Parameter(torch.empty(config.hc_mult, dtype=torch.float32))
+        self.hc_scale = nn.Parameter(torch.empty(1, dtype=torch.float32))
+
+    def forward(self, x):
+        shape, dtype = x.size(), x.dtype
+        x = x.flatten(2).float()
+        rsqrt = torch.rsqrt(x.square().mean(-1, keepdim=True) + self.norm_eps)
+        mixes = F.linear(x, self.hc_fn.float()) * rsqrt
+        pre = torch.sigmoid(mixes * self.hc_scale + self.hc_base) + self.eps
+        y = torch.sum(pre.unsqueeze(-1) * x.view(shape), dim=2)
+        return y.to(dtype)

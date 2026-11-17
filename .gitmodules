@@ -1,0 +1,4 @@
+[submodule "KPBot"]
+	path = third_party/agent-skills/KPBot
+	url = https://gitcode.com/openeuler/KPBot.git
+	branch = master

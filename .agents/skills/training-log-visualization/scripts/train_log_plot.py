@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,18 +14,26 @@ from pathlib import Path
 ANSI_ESCAPE_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
 VISIBLE_ESCAPE_RE = re.compile(r"␛\[[0-?]*[ -/]*[@-~]")
 
-# Numeric extractor that accepts comma separators, e.g. 7,234
-NUM_RE = r"([-+]?\d[\d,]*(?:\.\d+)?)"
+# Numeric extractor supporting comma separators, scientific notation, and
+# non-finite values. Keep all inner groups non-capturing because callers read
+# the numeric token from capture group 1 (and group 2 for memory percentage).
+FINITE_NUM_RE = (
+    r"(?:(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d*)?|\.\d+)"
+    r"(?:[eE][-+]?\d+)?"
+)
+NONFINITE_NUM_RE = r"(?i:nan|inf(?:inity)?)"
+NUM_RE = rf"([-+]?(?:{FINITE_NUM_RE}|{NONFINITE_NUM_RE}))"
+NUM_END_RE = r"(?![\w.,])"
 
-STEP_RE = re.compile(rf"\bstep:\s*{NUM_RE}")
-LOSS_RE = re.compile(rf"\bloss:\s*{NUM_RE}")
-GRAD_NORM_RE = re.compile(rf"\bgrad_norm:\s*{NUM_RE}")
-MEMORY_RE = re.compile(rf"\bmemory:\s*{NUM_RE}\s*GiB(?:\(\s*{NUM_RE}%\))?")
-TPS_RE = re.compile(rf"\btps:\s*{NUM_RE}")
-TFLOPS_RE = re.compile(rf"\btflops:\s*{NUM_RE}")
-MFU_RE = re.compile(rf"\bmfu:\s*{NUM_RE}%")
-ELAPSED_RE = re.compile(rf"\belapsed_time_per_step:\s*{NUM_RE}s")
-INDEXER_LOSS_RE = re.compile(rf"\bindexer\s+loss:\s*{NUM_RE}")
+STEP_RE = re.compile(rf"\bstep:\s*{NUM_RE}{NUM_END_RE}")
+LOSS_RE = re.compile(rf"\bloss:\s*{NUM_RE}{NUM_END_RE}")
+GRAD_NORM_RE = re.compile(rf"\bgrad_norm:\s*{NUM_RE}{NUM_END_RE}")
+MEMORY_RE = re.compile(rf"\bmemory:\s*{NUM_RE}\s*GiB(?:\(\s*{NUM_RE}%\))?(?![\w.])")
+TPS_RE = re.compile(rf"\btps:\s*{NUM_RE}{NUM_END_RE}")
+TFLOPS_RE = re.compile(rf"\btflops:\s*{NUM_RE}{NUM_END_RE}")
+MFU_RE = re.compile(rf"\bmfu:\s*{NUM_RE}%(?![\w.])")
+ELAPSED_RE = re.compile(rf"\belapsed_time_per_step:\s*{NUM_RE}s(?![\w.])")
+INDEXER_LOSS_RE = re.compile(rf"\bindexer\s+loss:\s*{NUM_RE}{NUM_END_RE}")
 
 
 @dataclass(frozen=True)
@@ -51,6 +60,10 @@ def _search_float(pattern: re.Pattern[str], line: str) -> float | None:
     if not match:
         return None
     return _to_float(match.group(1))
+
+
+def _is_valid_step(value: float | None) -> bool:
+    return value is not None and math.isfinite(value) and value.is_integer()
 
 
 def _search_memory(line: str) -> tuple[float | None, float | None]:
@@ -86,7 +99,7 @@ def read_training_metrics(log_path: str | Path) -> tuple[list[dict], list[str]]:
 
             step_val = _search_float(STEP_RE, line)
             loss_val = _search_float(LOSS_RE, line)
-            if step_val is None or loss_val is None:
+            if not _is_valid_step(step_val) or loss_val is None:
                 malformed_lines += 1
                 pending_indexer_loss = None
                 continue
@@ -176,15 +189,16 @@ def align_by_common_steps(records_a: list[dict], records_b: list[dict]) -> Align
     )
 
 
-def compute_signed_errors(
+def compute_errors(
     values_a: list[float], values_b: list[float], baseline: str = "a"
 ) -> tuple[list[float], list[float]]:
+    """Return absolute errors and signed relative errors against the baseline."""
     if len(values_a) != len(values_b):
         raise ValueError("values_a and values_b must have the same length")
     if baseline not in {"a", "b"}:
         raise ValueError("baseline must be 'a' or 'b'")
 
-    abs_errors: list[float] = []
+    absolute_errors: list[float] = []
     rel_errors: list[float] = []
 
     for a_val, b_val in zip(values_a, values_b, strict=True):
@@ -194,10 +208,10 @@ def compute_signed_errors(
         else:
             diff = a_val - b_val
             denom = abs(b_val)
-        abs_errors.append(diff)
+        absolute_errors.append(abs(diff))
         rel_errors.append(diff / denom if denom > 0 else 0.0)
 
-    return abs_errors, rel_errors
+    return absolute_errors, rel_errors
 
 
 def summarize_records(records: list[dict]) -> dict[str, float | int]:

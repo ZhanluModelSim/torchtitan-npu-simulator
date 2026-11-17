@@ -1,0 +1,989 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+import pytest
+from torchtitan_simulator.capture.comm_events import CommEvent
+from torchtitan_simulator.capture.schedule_assemblers import (
+    ActionSpec,
+    CapturedTraceAssembler,
+)
+from torchtitan_simulator.capture.schedule_builder import build_schedule_plan
+from torchtitan_simulator.capture.schedule_validation import (
+    replay_1f1b_readiness,
+    validate_1f1b_transfer_pairs,
+)
+from torchtitan_simulator.ir.op_node import OpNode
+from torchtitan_simulator.ir.step_graph import StepGraph
+from torchtitan_simulator.memory.records import FSDPResidencyEvent
+
+
+class _RankTable:
+    def __init__(self, *, pp: int = 2, dp_shard: int = 1) -> None:
+        self.dim_degrees = {
+            "pp": pp,
+            "dp_replicate": 1,
+            "dp_shard": dp_shard,
+            "tp": 1,
+        }
+
+    def to_dict(self) -> dict:
+        return {"dim_degrees": dict(self.dim_degrees)}
+
+
+def _timeline(stage: int, comp_type: str, mb_idx: int, start: int, end: int) -> dict:
+    return {
+        "pp_stage": stage,
+        "pp_mb_idx": mb_idx,
+        "comp_type": comp_type,
+        "start_seq_idx": start,
+        "end_seq_idx": end,
+        "seq_idx": end,
+        "instance_id": f"s{stage}_{comp_type}_mb{mb_idx}",
+    }
+
+
+def test_action_order_is_independent_from_l0_sequence_ids() -> None:
+    send = _p2p(
+        "f-send",
+        "forward_send",
+        stage=0,
+        mb_idx=0,
+        seq_idx=1,
+        peer_rank=1,
+    )
+    send.action_order = 1
+    timeline = _timeline(0, "F", 0, 100, 200)
+    timeline["action_order"] = 0
+
+    plan = build_schedule_plan(
+        step_templates={"s0_F": StepGraph("s0_F", "F", {})},
+        rank_table=_RankTable(),
+        comm_events=[send],
+        timeline_events=[timeline],
+        pipeline_schedule="custom",
+        rank=0,
+    )
+
+    assert [action.action_type for action in plan.actions[:2]] == [
+        "COMPUTE",
+        "SEND_F",
+    ]
+    assert [action.schedule_order for action in plan.actions[:2]] == [0, 1]
+    assert [action.seq_idx for action in plan.actions[:2]] == [100, 1]
+
+
+def test_schedule_compute_intent_without_execution_fails_fast() -> None:
+    with pytest.raises(RuntimeError, match="without matching compute execution"):
+        build_schedule_plan(
+            step_templates={},
+            rank_table=_RankTable(),
+            comm_events=[],
+            timeline_events=[
+                {
+                    "event_kind": "schedule_action",
+                    "action_type": "F",
+                    "pp_stage": 1,
+                    "pp_mb_idx": 0,
+                    "seq_idx": 10,
+                    "action_order": 0,
+                }
+            ],
+            pipeline_schedule="custom",
+            rank=1,
+            captured_trace_primary=True,
+        )
+
+
+def test_dualpipe_overlap_intent_groups_observed_compute_children() -> None:
+    overlap_intent = {
+        "event_kind": "schedule_action",
+        "action_type": "OVERLAP_F_B",
+        "pp_stage": -1,
+        "pp_mb_idx": -1,
+        "seq_idx": 10,
+        "action_order": 4,
+        "sub_actions": [
+            {"action_type": "F", "pp_stage": 0, "pp_mb_idx": 3},
+            {"action_type": "B", "pp_stage": 3, "pp_mb_idx": 1},
+        ],
+    }
+    forward = _timeline(0, "F", 3, 20, 21)
+    forward["action_order"] = 5
+    backward = _timeline(3, "B", 1, 30, 31)
+    backward["action_order"] = 6
+
+    plan = build_schedule_plan(
+        step_templates={
+            "s0_F": StepGraph("s0_F", "F", {}),
+            "s3_B": StepGraph("s3_B", "B", {}),
+        },
+        rank_table=_RankTable(),
+        comm_events=[],
+        timeline_events=[overlap_intent, forward, backward],
+        pipeline_schedule="DualPipeV",
+        rank=0,
+        captured_trace_primary=True,
+    )
+
+    overlap = next(action for action in plan.actions if action.action_type == "OVERLAP_F_B")
+    assert [(child.stage, child.mb_idx, child.comp_type) for child in overlap.sub_actions] == [
+        (0, 3, "F"),
+        (3, 1, "B"),
+    ]
+    assert all(child.schedule_order == overlap.schedule_order for child in overlap.sub_actions)
+    assert not any(action.action_type == "COMPUTE" for action in plan.actions)
+
+
+def test_runtime_fsdp_intents_without_fsdp_module_are_removed_from_l2() -> None:
+    forward = _timeline(0, "F", 0, 20, 21)
+    forward["action_order"] = 1
+    plan = build_schedule_plan(
+        step_templates={"s0_F": StepGraph("s0_F", "F", {})},
+        rank_table=_RankTable(),
+        comm_events=[],
+        timeline_events=[
+            {
+                "event_kind": "schedule_action",
+                "action_type": "UNSHARD",
+                "pp_stage": 0,
+                "pp_mb_idx": -1,
+                "seq_idx": 10,
+                "action_order": 0,
+            },
+            {
+                "event_kind": "schedule_action",
+                "action_type": "F",
+                "pp_stage": 0,
+                "pp_mb_idx": 0,
+                "seq_idx": 19,
+                "action_order": 1,
+            },
+            forward,
+            {
+                "event_kind": "schedule_action",
+                "action_type": "RESHARD",
+                "pp_stage": 0,
+                "pp_mb_idx": -1,
+                "seq_idx": 30,
+                "action_order": 2,
+            },
+        ],
+        pipeline_schedule="DualPipeV",
+        rank=0,
+        captured_trace_primary=True,
+    )
+
+    assert [action.action_type for action in plan.actions] == ["COMPUTE"]
+    assert all(slot.kind not in {"param_full", "param_shard"} for slot in plan.data_slots.values())
+
+
+def _p2p(
+    event_id: str,
+    direction: str,
+    *,
+    stage: int,
+    mb_idx: int,
+    seq_idx: int,
+    peer_rank: int,
+) -> CommEvent:
+    primitive = "p2p_send" if direction.endswith("send") else "p2p_recv"
+    return CommEvent(
+        event_id=event_id,
+        comm_primitive=primitive,
+        group_name="pp",
+        world_size=2,
+        tensor_shape=(2, 8),
+        dtype="bfloat16",
+        volume_bytes=32,
+        p2p_peer_rank=peer_rank,
+        p2p_direction=direction,
+        p2p_mb_idx=mb_idx,
+        p2p_stage=stage,
+        seq_idx=seq_idx,
+        comm_layer="L2",
+    )
+
+
+def _templates(stage: int) -> dict[str, StepGraph]:
+    return {
+        f"s{stage}_F": StepGraph(f"s{stage}_F", "F", {}),
+        f"s{stage}_B": StepGraph(f"s{stage}_B", "B", {}),
+    }
+
+
+def test_two_stage_1f1b_trace_has_complete_cross_rank_dependencies() -> None:
+    rank0 = build_schedule_plan(
+        step_templates=_templates(0),
+        rank_table=_RankTable(),
+        comm_events=[
+            _p2p("f-send-0", "forward_send", stage=0, mb_idx=0, seq_idx=20, peer_rank=1),
+            _p2p("f-send-1", "forward_send", stage=0, mb_idx=1, seq_idx=40, peer_rank=1),
+            _p2p("b-recv-0", "backward_recv", stage=0, mb_idx=0, seq_idx=50, peer_rank=1),
+            _p2p("b-recv-1", "backward_recv", stage=0, mb_idx=1, seq_idx=80, peer_rank=1),
+            # CP uses similarly named metadata but is not a PP stage transfer.
+            _p2p("cp-send", "cp_forward_send", stage=0, mb_idx=0, seq_idx=25, peer_rank=1),
+        ],
+        timeline_events=[
+            _timeline(0, "F", 0, 10, 11),
+            _timeline(0, "F", 1, 30, 31),
+            _timeline(0, "B", 0, 60, 61),
+            _timeline(0, "B", 1, 90, 91),
+        ],
+        pipeline_schedule="1F1B",
+        num_micro_batches=2,
+        rank=0,
+    )
+    rank1 = build_schedule_plan(
+        step_templates=_templates(1),
+        rank_table=_RankTable(),
+        comm_events=[
+            _p2p("f-recv-0", "forward_recv", stage=1, mb_idx=0, seq_idx=5, peer_rank=0),
+            _p2p("b-send-0", "backward_send", stage=1, mb_idx=0, seq_idx=35, peer_rank=0),
+            _p2p("f-recv-1", "forward_recv", stage=1, mb_idx=1, seq_idx=45, peer_rank=0),
+            _p2p("b-send-1", "backward_send", stage=1, mb_idx=1, seq_idx=75, peer_rank=0),
+        ],
+        timeline_events=[
+            _timeline(1, "F", 0, 15, 16),
+            _timeline(1, "B", 0, 25, 26),
+            _timeline(1, "F", 1, 55, 56),
+            _timeline(1, "B", 1, 65, 66),
+        ],
+        pipeline_schedule="1F1B",
+        num_micro_batches=2,
+        rank=1,
+    )
+
+    assert rank0.annotations["assembler"] == "captured_trace"
+    assert rank0.annotations["capture_schema_version"] == 2
+    assert rank0.annotations["capture_process_rank"] == 0
+    assert all(action.annotations["capture_schema_version"] == 2 for action in rank0.actions)
+    assert [action.action_type for action in rank0.actions] == [
+        "COMPUTE",
+        "SEND_F",
+        "COMPUTE",
+        "SEND_F",
+        "RECV_B",
+        "COMPUTE",
+        "RECV_B",
+        "COMPUTE",
+    ]
+    assert all("cp" not in action.action_id for action in rank0.actions)
+
+    send = next(action for action in rank0.actions if action.action_type == "SEND_F")
+    send_slot = rank0.data_slots[send.consumes[0]]
+    assert send_slot.kind == "activation_local"
+    assert send_slot.producer_action_id
+
+    recv = next(action for action in rank1.actions if action.action_type == "RECV_F")
+    recv_slot = rank1.data_slots[recv.produces[0]]
+    assert recv_slot.kind == "activation_recv"
+    assert recv_slot.consumer_action_ids
+
+    validate_1f1b_transfer_pairs([rank0, rank1])
+    replay_1f1b_readiness([rank0, rank1])
+
+
+def test_split_backward_trace_builds_semantic_dependencies() -> None:
+    optimizer_node = OpNode(
+        op_id=999,
+        op_type="optimizer",
+        inputs=[],
+        outputs=[],
+        attrs={},
+        predecessors=[],
+        successors=[],
+        seq_idx=60,
+    )
+    templates = {
+        "s0_F": StepGraph("s0_F", "F", {}),
+        "s0_I": StepGraph("s0_I", "I", {}),
+        "s0_W": StepGraph("s0_W", "W", {}),
+        "s0_OPTIMIZER": StepGraph("s0_OPTIMIZER", "OPTIMIZER", {999: optimizer_node}),
+    }
+    plan = build_schedule_plan(
+        step_templates=templates,
+        rank_table=_RankTable(),
+        comm_events=[
+            _p2p(
+                "f-send",
+                "forward_send",
+                stage=0,
+                mb_idx=0,
+                seq_idx=20,
+                peer_rank=1,
+            ),
+            _p2p(
+                "b-recv",
+                "backward_recv",
+                stage=0,
+                mb_idx=0,
+                seq_idx=30,
+                peer_rank=1,
+            ),
+        ],
+        timeline_events=[
+            _timeline(0, "F", 0, 10, 11),
+            _timeline(0, "I", 0, 40, 41),
+            _timeline(0, "W", 0, 50, 51),
+        ],
+        pipeline_schedule="zero-bubble",
+        rank=0,
+    )
+
+    forward = next(action for action in plan.actions if action.comp_type == "F")
+    backward_input = next(action for action in plan.actions if action.comp_type == "I")
+    backward_weight = next(action for action in plan.actions if action.comp_type == "W")
+    backward_recv = next(action for action in plan.actions if action.action_type == "RECV_B")
+    optimizer = next(action for action in plan.actions if action.action_type == "OPTIMIZER")
+
+    recv_slots = [plan.data_slots[slot_id] for slot_id in backward_recv.produces]
+    assert any(backward_input.action_id in slot.consumer_action_ids for slot in recv_slots)
+
+    forward_state = next(
+        plan.data_slots[slot_id] for slot_id in forward.produces if plan.data_slots[slot_id].kind == "forward_state"
+    )
+    assert set(forward_state.consumer_action_ids) == {
+        backward_input.action_id,
+        backward_weight.action_id,
+    }
+    assert any(plan.data_slots[slot_id].kind == "dataloader_input" for slot_id in forward.consumes)
+    assert any(
+        plan.data_slots[slot_id].producer_action_id == backward_weight.action_id for slot_id in optimizer.consumes
+    )
+
+
+def test_virtual_stages_build_local_split_backward_dependency() -> None:
+    schedule = type(
+        "_VirtualSchedule",
+        (),
+        {"stage_index_to_group_rank": {0: 0, 1: 1, 2: 1, 3: 0}},
+    )()
+    plan = build_schedule_plan(
+        step_templates={
+            "s1_F": StepGraph("s1_F", "F", {}),
+            "s1_I": StepGraph("s1_I", "I", {}),
+            "s2_F": StepGraph("s2_F", "F", {}),
+            "s2_I": StepGraph("s2_I", "I", {}),
+        },
+        rank_table=_RankTable(),
+        comm_events=[],
+        timeline_events=[
+            _timeline(1, "F", 0, 10, 11),
+            _timeline(2, "F", 0, 20, 21),
+            _timeline(2, "I", 0, 30, 31),
+            _timeline(1, "I", 0, 40, 41),
+        ],
+        pp_schedule_obj=schedule,
+        pipeline_schedule="virtual",
+        rank=1,
+        captured_trace_primary=True,
+    )
+
+    stage2_backward = next(action for action in plan.actions if action.stage == 2 and action.comp_type == "I")
+    stage1_backward = next(action for action in plan.actions if action.stage == 1 and action.comp_type == "I")
+    local_grad = next(slot for slot in plan.data_slots.values() if slot.kind == "grad_input" and slot.is_local_transfer)
+
+    assert local_grad.producer_action_id == stage2_backward.action_id
+    assert local_grad.consumer_action_ids == [stage1_backward.action_id]
+    assert not any(slot.kind == "loss_grad" for slot in plan.data_slots.values())
+
+
+def test_virtual_last_stage_receives_external_loss_gradient() -> None:
+    schedule = type(
+        "_VirtualSchedule",
+        (),
+        {"stage_index_to_group_rank": {0: 0, 1: 1, 2: 1, 3: 0}},
+    )()
+    plan = build_schedule_plan(
+        step_templates={
+            "s3_F": StepGraph("s3_F", "F", {}),
+            "s3_I": StepGraph("s3_I", "I", {}),
+        },
+        rank_table=_RankTable(),
+        comm_events=[],
+        timeline_events=[
+            _timeline(3, "F", 0, 10, 11),
+            _timeline(3, "I", 0, 20, 21),
+        ],
+        pp_schedule_obj=schedule,
+        pipeline_schedule="virtual",
+        rank=0,
+        captured_trace_primary=True,
+    )
+
+    loss_grad = next(slot for slot in plan.data_slots.values() if slot.kind == "loss_grad")
+    assert loss_grad.external
+    assert loss_grad.dst_stage == 3
+
+
+def test_reduce_grad_schedule_intent_without_collective_is_nonblocking() -> None:
+    optimizer_node = OpNode(
+        op_id=999,
+        op_type="optimizer",
+        inputs=[],
+        outputs=[],
+        attrs={},
+        predecessors=[],
+        successors=[],
+        seq_idx=60,
+    )
+    templates = {
+        "s0_F": StepGraph("s0_F", "F", {}),
+        "s0_I": StepGraph("s0_I", "I", {}),
+        "s0_W": StepGraph("s0_W", "W", {}),
+        "s0_OPTIMIZER": StepGraph("s0_OPTIMIZER", "OPTIMIZER", {999: optimizer_node}),
+    }
+    forward = _timeline(0, "F", 0, 10, 11)
+    forward["action_order"] = 0
+    backward_input = _timeline(0, "I", 0, 20, 21)
+    backward_input["action_order"] = 1
+    backward_weight = _timeline(0, "W", 0, 30, 31)
+    backward_weight["action_order"] = 2
+
+    plan = build_schedule_plan(
+        step_templates=templates,
+        rank_table=_RankTable(pp=1, dp_shard=2),
+        comm_events=[],
+        timeline_events=[
+            forward,
+            backward_input,
+            backward_weight,
+            {
+                "event_kind": "schedule_action",
+                "action_type": "REDUCE_GRAD",
+                "pp_stage": 0,
+                "pp_mb_idx": -1,
+                "seq_idx": 40,
+                "action_order": 3,
+            },
+        ],
+        pipeline_schedule="ZBVZeroBubble",
+        rank=0,
+    )
+
+    optimizer = next(action for action in plan.actions if action.action_type == "OPTIMIZER")
+    weight = next(action for action in plan.actions if action.comp_type == "W")
+
+    assert not any(action.action_type == "REDUCE_GRAD" for action in plan.actions)
+    assert any(plan.data_slots[slot_id].producer_action_id == weight.action_id for slot_id in optimizer.consumes)
+    assert plan.annotations["communication_ownership"]["removed_noop_gradient_intents"] == 1
+
+
+def test_compute_local_size_one_fsdp_transition_is_removed_from_l2() -> None:
+    timeline = _timeline(0, "F", 0, 20, 30)
+    timeline["action_order"] = 5
+    residency_alloc = FSDPResidencyEvent(
+        group_id="block0",
+        action="alloc",
+        seq_idx=10,
+        phase="forward",
+        num_bytes=256,
+        pp_stage=0,
+        pp_mb_idx=0,
+        comp_type="UNSHARD",
+        parent_compute_instance_id="s0_UNSHARD_mb0",
+        shard_world_size=1,
+        action_order=1,
+        transition_id="fsdp:r0:gblock0:u0",
+    )
+    residency_free = FSDPResidencyEvent(
+        group_id="block0",
+        action="free",
+        seq_idx=40,
+        phase="forward",
+        num_bytes=256,
+        pp_stage=0,
+        pp_mb_idx=0,
+        comp_type="RESHARD",
+        parent_compute_instance_id="s0_RESHARD_mb0",
+        shard_world_size=1,
+        action_order=9,
+        transition_id="fsdp:r0:gblock0:u0",
+    )
+
+    plan = build_schedule_plan(
+        step_templates={"s0_F": StepGraph("s0_F", "F", {})},
+        rank_table=_RankTable(pp=1),
+        comm_events=[],
+        fsdp_residency_events=[residency_alloc, residency_free],
+        timeline_events=[timeline],
+        pipeline_schedule="ZBVZeroBubble",
+        rank=0,
+    )
+
+    assert [action.action_type for action in plan.actions] == ["COMPUTE"]
+    assert plan.annotations["communication_ownership"] == {
+        "internal_fsdp_transitions": 1,
+        "external_fsdp_prefetches": 0,
+        "internal_gradient_reductions": 0,
+        "external_gradient_reductions": 0,
+        "removed_noop_gradient_intents": 0,
+        "stage_owned_collectives": 0,
+    }
+
+
+def test_fsdp_residency_and_gradient_reduction_are_distinct_dependencies() -> None:
+    allgather = OpNode(
+        op_id=900,
+        op_type="allgather",
+        inputs=[],
+        outputs=[],
+        attrs={},
+        predecessors=[],
+        successors=[],
+        annotations={"raw_op_type": "comm.allgather"},
+    )
+    reduce_scatter = OpNode(
+        op_id=901,
+        op_type="reduce_scatter",
+        inputs=[],
+        outputs=[],
+        attrs={},
+        predecessors=[],
+        successors=[],
+        annotations={"raw_op_type": "comm.reduce_scatter"},
+    )
+    templates = {
+        "s0_F": StepGraph("s0_F", "F", {900: allgather}),
+        "s0_B": StepGraph("s0_B", "B", {901: reduce_scatter}),
+    }
+    comm_events = [
+        CommEvent(
+            event_id="allgather",
+            comm_primitive="allgather",
+            group_name="fsdp",
+            world_size=2,
+            tensor_shape=(128,),
+            dtype="bfloat16",
+            volume_bytes=256,
+            op_id=900,
+            comm_layer="L2",
+            p2p_stage=0,
+            p2p_mb_idx=0,
+            seq_idx=12,
+            comp_type="F",
+        ),
+        CommEvent(
+            event_id="reduce",
+            comm_primitive="reduce_scatter",
+            group_name="fsdp",
+            world_size=2,
+            tensor_shape=(128,),
+            dtype="bfloat16",
+            volume_bytes=256,
+            op_id=901,
+            comm_layer="L2",
+            p2p_stage=0,
+            p2p_mb_idx=0,
+            seq_idx=80,
+        ),
+    ]
+    residency = [
+        FSDPResidencyEvent(
+            group_id="block0",
+            action="alloc",
+            seq_idx=12,
+            phase="forward",
+            num_bytes=256,
+            pp_stage=0,
+            pp_mb_idx=0,
+            comp_type="F",
+            parent_compute_instance_id="s0_F_mb0",
+        ),
+        FSDPResidencyEvent(
+            group_id="block0",
+            action="free",
+            seq_idx=48,
+            phase="forward",
+            num_bytes=256,
+            pp_stage=0,
+            pp_mb_idx=0,
+            comp_type="F",
+            parent_compute_instance_id="s0_F_mb0",
+        ),
+    ]
+
+    plan = build_schedule_plan(
+        step_templates=templates,
+        rank_table=_RankTable(pp=1, dp_shard=2),
+        comm_events=comm_events,
+        fsdp_residency_events=residency,
+        timeline_events=[
+            _timeline(0, "F", 0, 10, 50),
+            _timeline(0, "B", 0, 60, 100),
+        ],
+        pipeline_schedule="1F1B",
+        rank=0,
+    )
+
+    assert [action.action_type for action in plan.actions] == [
+        "UNSHARD",
+        "COMPUTE",
+        "RESHARD",
+        "COMPUTE",
+    ]
+    reshard = next(action for action in plan.actions if action.action_type == "RESHARD")
+    reshard_slot = plan.data_slots[reshard.consumes[0]]
+    assert reshard.comm is None
+    assert reshard_slot.kind == "control"
+    assert plan.action_map[reshard_slot.producer_action_id].comp_type == "F"
+
+    assert not any(action.action_type == "REDUCE_GRAD" for action in plan.actions)
+    assert reduce_scatter.annotations["communication_owner"] == "L1_STAGE"
+    ownership = plan.annotations["communication_ownership"]
+    assert ownership["internal_gradient_reductions"] == 1
+    assert ownership["external_gradient_reductions"] == 0
+
+
+def test_standalone_gradient_reduction_remains_in_l2() -> None:
+    reduce_scatter = OpNode(
+        op_id=905,
+        op_type="reduce_scatter",
+        inputs=[],
+        outputs=[],
+        attrs={},
+        predecessors=[],
+        successors=[],
+        annotations={"raw_op_type": "comm.reduce_scatter"},
+    )
+    event = CommEvent(
+        event_id="standalone-reduce",
+        comm_primitive="reduce_scatter",
+        group_name="fsdp",
+        world_size=2,
+        tensor_shape=(128,),
+        dtype="float32",
+        volume_bytes=512,
+        op_id=905,
+        comm_layer="L2",
+        p2p_stage=0,
+        p2p_mb_idx=0,
+        seq_idx=80,
+        comp_type="REDUCE_GRAD",
+    )
+    plan = build_schedule_plan(
+        step_templates={
+            "s0_B": StepGraph("s0_B", "B", {}),
+            "s0_REDUCE_GRAD": StepGraph(
+                "s0_REDUCE_GRAD",
+                "REDUCE_GRAD",
+                {905: reduce_scatter},
+            ),
+        },
+        rank_table=_RankTable(pp=1, dp_shard=2),
+        comm_events=[event],
+        timeline_events=[_timeline(0, "B", 0, 60, 70)],
+        pipeline_schedule="1F1B",
+        rank=0,
+    )
+
+    reduction = next(action for action in plan.actions if action.action_type == "REDUCE_GRAD")
+    assert reduction.annotations["communication_owner"] == "L2_STANDALONE"
+    ownership = plan.annotations["communication_ownership"]
+    assert ownership["internal_gradient_reductions"] == 0
+    assert ownership["external_gradient_reductions"] == 1
+
+
+def test_state_unshards_keep_observed_order_after_initial_prefetch_intent() -> None:
+    initial_prefetch = ActionSpec(
+        action_type="UNSHARD",
+        stage=0,
+        mb_idx=0,
+        seq_idx=10,
+        order_key=(10, 0, 0),
+        annotations={
+            "capture_action_order": 10,
+            "fsdp_schedule_source": "intent",
+        },
+    )
+    later_microbatch = ActionSpec(
+        action_type="UNSHARD",
+        stage=0,
+        mb_idx=1,
+        seq_idx=40,
+        order_key=(40, 0, 1),
+        annotations={
+            "capture_action_order": 40,
+            "fsdp_schedule_source": "state",
+        },
+    )
+
+    specs = CapturedTraceAssembler._bind_residency_intents(
+        [initial_prefetch, later_microbatch],
+        [
+            {
+                "action_type": "UNSHARD",
+                "pp_stage": 0,
+                "pp_mb_idx": -1,
+                "action_order": 5,
+                "seq_idx": 5,
+            }
+        ],
+    )
+
+    assert initial_prefetch.order_key == (5, 0, 0)
+    assert initial_prefetch.annotations["capture_schedule_intent"]
+    assert later_microbatch.order_key == (40, 0, 1)
+    assert "capture_schedule_intent" not in later_microbatch.annotations
+    assert specs == [initial_prefetch, later_microbatch]
+
+
+def test_group_local_shard_size_controls_unshard_noop() -> None:
+    allgather = OpNode(
+        op_id=920,
+        op_type="allgather",
+        inputs=[],
+        outputs=[],
+        attrs={},
+        predecessors=[],
+        successors=[],
+        annotations={"raw_op_type": "comm.allgather"},
+    )
+    templates = {
+        "s0_F": StepGraph("s0_F", "F", {920: allgather}),
+        "s0_B": StepGraph("s0_B", "B", {}),
+    }
+    comm_events = [
+        CommEvent(
+            event_id="dense-allgather",
+            comm_primitive="allgather",
+            group_name="fsdp",
+            world_size=2,
+            tensor_shape=(128,),
+            dtype="bfloat16",
+            volume_bytes=256,
+            op_id=920,
+            comm_layer="L2",
+            p2p_stage=0,
+            p2p_mb_idx=0,
+            seq_idx=12,
+            comp_type="F",
+        ),
+    ]
+    residency = [
+        FSDPResidencyEvent(
+            group_id="expert-efsdp",
+            action="alloc",
+            seq_idx=11,
+            phase="forward",
+            num_bytes=256,
+            pp_stage=0,
+            pp_mb_idx=0,
+            comp_type="F",
+            parent_compute_instance_id="s0_F_mb0",
+            shard_world_size=1,
+        ),
+        FSDPResidencyEvent(
+            group_id="dense",
+            action="alloc",
+            seq_idx=12,
+            phase="forward",
+            num_bytes=256,
+            pp_stage=0,
+            pp_mb_idx=0,
+            comp_type="F",
+            parent_compute_instance_id="s0_F_mb0",
+            shard_world_size=2,
+        ),
+        FSDPResidencyEvent(
+            group_id="dense",
+            action="free",
+            seq_idx=18,
+            phase="forward",
+            num_bytes=256,
+            pp_stage=0,
+            pp_mb_idx=0,
+            comp_type="F",
+            parent_compute_instance_id="s0_F_mb0",
+            shard_world_size=2,
+        ),
+        FSDPResidencyEvent(
+            group_id="expert-efsdp",
+            action="free",
+            seq_idx=19,
+            phase="forward",
+            num_bytes=256,
+            pp_stage=0,
+            pp_mb_idx=0,
+            comp_type="F",
+            parent_compute_instance_id="s0_F_mb0",
+            shard_world_size=1,
+        ),
+    ]
+
+    plan = build_schedule_plan(
+        step_templates=templates,
+        rank_table=_RankTable(pp=1, dp_shard=2),
+        comm_events=comm_events,
+        fsdp_residency_events=residency,
+        timeline_events=[
+            _timeline(0, "F", 0, 10, 20),
+            _timeline(0, "B", 0, 30, 40),
+        ],
+        pipeline_schedule="1F1B",
+        rank=0,
+    )
+
+    unshards = [action for action in plan.actions if action.action_type == "UNSHARD"]
+    dense = next(action for action in unshards if action.annotations["fsdp_group_id"] == "dense")
+    expert = next(action for action in unshards if action.annotations["fsdp_group_id"] == "expert-efsdp")
+    assert dense.comm is not None and dense.comm.primitive == "allgather"
+    assert not dense.is_noop
+    assert expert.is_noop
+    assert expert.comm is not None and expert.comm.is_noop
+    assert not expert.consumes and not expert.produces
+
+
+def test_fsdp_transition_id_matches_allgather_without_order_guessing() -> None:
+    nodes = {
+        op_id: OpNode(
+            op_id=op_id,
+            op_type="allgather",
+            inputs=[],
+            outputs=[],
+            attrs={},
+            predecessors=[],
+            successors=[932],
+            annotations={"raw_op_type": "comm.allgather"},
+        )
+        for op_id in (930, 931)
+    }
+    nodes[932] = OpNode(
+        op_id=932,
+        op_type="matmul",
+        inputs=[],
+        outputs=[],
+        attrs={},
+        predecessors=[930, 931],
+        successors=[],
+        annotations={"raw_op_type": "aten.mm.default"},
+    )
+    templates = {"s0_F": StepGraph("s0_F", "F", nodes)}
+    comm_events = [
+        CommEvent(
+            event_id="group-b",
+            comm_primitive="allgather",
+            group_name="fsdp",
+            world_size=2,
+            tensor_shape=(64,),
+            dtype="bfloat16",
+            volume_bytes=128,
+            op_id=931,
+            comm_layer="L2",
+            p2p_stage=0,
+            comp_type="F",
+            seq_idx=11,
+            fsdp_group_id="group-b",
+            fsdp_transition_id="transition-b",
+        ),
+        CommEvent(
+            event_id="group-a",
+            comm_primitive="allgather",
+            group_name="fsdp",
+            world_size=2,
+            tensor_shape=(128,),
+            dtype="bfloat16",
+            volume_bytes=256,
+            op_id=930,
+            comm_layer="L2",
+            p2p_stage=0,
+            comp_type="F",
+            seq_idx=99,
+            fsdp_group_id="group-a",
+            fsdp_transition_id="transition-a",
+        ),
+    ]
+    residency = []
+    for order, (group_id, transition_id) in enumerate((("group-a", "transition-a"), ("group-b", "transition-b"))):
+        residency.extend(
+            [
+                FSDPResidencyEvent(
+                    group_id=group_id,
+                    action="alloc",
+                    seq_idx=20 + order,
+                    phase="forward",
+                    num_bytes=256,
+                    pp_stage=0,
+                    pp_mb_idx=0,
+                    comp_type="F",
+                    parent_compute_instance_id="s0_F_mb0",
+                    shard_world_size=2,
+                    transition_id=transition_id,
+                    action_order=order,
+                ),
+                FSDPResidencyEvent(
+                    group_id=group_id,
+                    action="free",
+                    seq_idx=30 + order,
+                    phase="forward",
+                    num_bytes=256,
+                    pp_stage=0,
+                    pp_mb_idx=0,
+                    comp_type="F",
+                    parent_compute_instance_id="s0_F_mb0",
+                    shard_world_size=2,
+                    transition_id=transition_id,
+                    action_order=order + 10,
+                ),
+            ]
+        )
+
+    plan = build_schedule_plan(
+        step_templates=templates,
+        rank_table=_RankTable(pp=1, dp_shard=2),
+        comm_events=comm_events,
+        fsdp_residency_events=residency,
+        timeline_events=[_timeline(0, "F", 0, 10, 40)],
+        pipeline_schedule="custom",
+        rank=0,
+    )
+
+    assert all(action.action_type not in {"UNSHARD", "RESHARD"} for action in plan.actions)
+    fsdp_nodes = [
+        node
+        for node in plan.step_templates["s0_F"].nodes.values()
+        if node.annotations.get("communication_owner") == "L1_STAGE"
+    ]
+    assert {node.annotations["fsdp_group_id"] for node in fsdp_nodes} == {
+        "group-a",
+        "group-b",
+    }
+    assert all(not set(node.predecessors).intersection({930, 931}) for node in fsdp_nodes)
+    assert plan.step_templates["s0_F"].nodes[932].predecessors == [930, 931]
+    assert set(plan.step_templates["s0_F"].entry_nodes) == {930, 931}
+    assert plan.step_templates["s0_F"].exit_nodes == [932]
+    assert plan.step_templates["s0_F"].is_acyclic
+
+
+def test_free_only_fsdp_transition_does_not_create_l2_residency_action() -> None:
+    timeline = _timeline(0, "F", 0, 10, 20)
+    timeline["action_order"] = 0
+    plan = build_schedule_plan(
+        step_templates={"s0_F": StepGraph("s0_F", "F", {})},
+        rank_table=_RankTable(pp=1, dp_shard=2),
+        comm_events=[],
+        fsdp_residency_events=[
+            FSDPResidencyEvent(
+                group_id="cleanup-group",
+                action="free",
+                seq_idx=30,
+                phase="backward",
+                num_bytes=256,
+                pp_stage=0,
+                pp_mb_idx=0,
+                comp_type="W",
+                parent_compute_instance_id="",
+                shard_world_size=2,
+                transition_id="transition-outside-step",
+                action_order=1,
+                schedule_source="state",
+            )
+        ],
+        timeline_events=[timeline],
+        pipeline_schedule="custom",
+        rank=0,
+    )
+
+    assert all(action.action_type not in {"UNSHARD", "RESHARD"} for action in plan.actions)

@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "torchtitan-simulator"
+version = "0.1.0"
+description = "Explicitly activated training graph and logical memory capture"
+requires-python = ">=3.12"
+license = {file = "LICENSE"}
+dependencies = ["torch"]
+
+[project.optional-dependencies]
+dev = ["pytest", "pyrefly", "ruff"]
+
+[project.scripts]
+torchtitan-simulate = "torchtitan_simulator.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["torchtitan_simulator*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = ["--import-mode=importlib"]
+
+[tool.pyrefly]
+project-includes = ["torchtitan_simulator"]
+project-excludes = ["tests"]
+replace-imports-with-any = ["torch_npu", "torch.npu"]

@@ -18,6 +18,12 @@ on:
 permissions:
   contents: write
 
+# Serialize scheduled and manual runs: two concurrent syncs each hold a stale
+# origin lease, so the later push fails with --force-with-lease mid-way.
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
 jobs:
   sync:
     runs-on: ubuntu-latest
@@ -55,6 +61,30 @@ jobs:
             fi
           done
 
+      - name: Prune branches deleted upstream
+        run: |
+          # Branches that live only on the mirror are GitHub-side artifacts
+          # and must never be pruned (gh-pages carries the docs site).
+          protected_branches="gh-pages"
+          git fetch origin '+refs/heads/*:refs/remotes/origin/*'
+          for branch in $(git branch -r --list 'origin/*' --format='%(refname:lstrip=3)' | grep -v HEAD); do
+            if [[ " $protected_branches " == *" $branch "* ]]; then
+              echo "Skipping protected branch $branch"
+              continue
+            fi
+            if ! git show-ref --verify --quiet "refs/remotes/upstream/$branch"; then
+              echo "Pruning $branch (deleted upstream)..."
+              if [[ "${{ github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run }}" == "true" ]]; then
+                echo "  [DRY RUN] git push origin --delete $branch"
+              else
+                git push origin --delete "$branch"
+              fi
+            fi
+          done
+
       - name: Push tags
+        # Tags are intentionally additive-only: never pruned and never
+        # force-updated, so upstream mistakes cannot erase release history
+        # on the mirror.
         if: ${{ !(github.event_name == 'workflow_dispatch' && github.event.inputs.dry_run == 'true') }}
         run: git push origin --tags
