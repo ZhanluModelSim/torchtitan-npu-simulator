@@ -1,188 +1,66 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
-# Copyright (c) Meta Platforms, Inc. and affiliates.
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from torchtitan.components.checkpoint import CheckpointManager
-from torchtitan.components.lr_scheduler import LRSchedulersContainer
-from torchtitan.components.metrics import MetricsProcessor
-from torchtitan.components.optimizer import OptimizersContainer
-from torchtitan.config import ActivationCheckpointConfig, TrainingConfig
-from torchtitan.models.qwen3.config_registry import qwen3_0_6b as _upstream_qwen3_0_6b
-from torchtitan.protocols.model_converter import ModelConvertersContainer
+"""Native training configuration factories for the Qwen3 dense decoder."""
+
+from dataclasses import replace
+
+from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
+from torchtitan.components.optimizer import default_adamw
+from torchtitan.config import ParallelismConfig, TrainingConfig
+from torchtitan.models.qwen3 import model_registry
+from torchtitan.protocols.model_spec import ModelSpec
 from torchtitan.trainer import Trainer
 
-from torchtitan_npu.config.configs import ChatDataLoaderConfig, CheckpointConfig, ParallelismConfig
-from torchtitan_npu.converters import get_model_converter_config
-from torchtitan_npu.models.qwen3 import model_registry
+from .model import as_npu_config
+
+__all__ = ["qwen3_32b", "qwen3_32b_smoketest"]
 
 
-def sft_qwen3_30ba3b_gsm8k() -> Trainer.Config:
-    def process_sample(sample):
-        answer = sample["answer"]
-        reasoning, final_answer = answer.rsplit("####", 1)
-        return [
-            {"role": "user", "content": sample["question"]},
-            {
-                "role": "assistant",
-                "reasoning_content": reasoning.strip(),
-                "content": final_answer.strip(),
-            },
-        ]
-
-    model_spec = model_registry("30B-A3B")
+def _trainer_config(
+    flavor: str,
+    *,
+    num_layers: int | None = None,
+    num_mtp_layers: int = 0,
+) -> Trainer.Config:
+    if num_mtp_layers:
+        raise ValueError("Qwen3 dense models have no MTP modules")
+    # The varlen backend matches the NPU training path (packed-document
+    # metadata); flex attention has no Ascend kernel boundary.
+    spec = model_registry(flavor, attn_backend="varlen")
+    model = as_npu_config(spec.model)
+    if num_layers is not None:
+        if not 0 < num_layers < len(model.layers):
+            raise ValueError(f"reduced depth must be within (0, {len(model.layers)}), got {num_layers}")
+        model.layers = model.layers[:num_layers]
+    model_spec = replace(spec, model=model)
     return Trainer.Config(
-        hf_assets_path="./assets/hf/Qwen3-30B-A3B",
         model_spec=model_spec,
-        model_converters=ModelConvertersContainer.Config(
-            converters=[
-                get_model_converter_config("npu_rms_norm"),
-                get_model_converter_config("npu_rope"),
-                get_model_converter_config("npu_moe_dispatch"),
-                get_model_converter_config("npu_gmm"),
-            ],
+        loss=ChunkedLossWrapper.Config(
+            loss_fn=CrossEntropyLoss.Config(global_vocab_size=model.vocab_size),
         ),
-        optimizer=OptimizersContainer.Config(lr=1e-5),
-        lr_scheduler=LRSchedulersContainer.Config(
-            warmup_steps=10,
-            decay_ratio=0.9,
-            decay_type="cosine",
-            min_lr_factor=0.1,
-        ),
-        training=TrainingConfig(
-            local_batch_size=1,
-            seq_len=4096,
-            steps=100,
-        ),
-        parallelism=ParallelismConfig(
-            data_parallel_replicate_degree=1,
-            data_parallel_shard_degree=-1,
-            tensor_parallel_degree=1,
-            pipeline_parallel_degree=1,
-            expert_parallel_degree=8,
-            expert_tensor_parallel_degree=1,
-            context_parallel_degree=4,
-        ),
-        dataloader=ChatDataLoaderConfig(
-            dataset_path="openai/gsm8k",
-            load_dataset_kwargs={"name": "main", "split": "train"},
-            sample_processor=process_sample,
-        ),
-        metrics=MetricsProcessor.Config(
-            log_freq=1,
-        ),
-        checkpoint=CheckpointConfig(
-            enable=True,
-            folder="checkpoint",
-            load_only=False,
-            initial_load_in_hf=True,
-            initial_load_path="./assets/hf/Qwen3-30B-A3B",
-        ),
-        activation_checkpoint=ActivationCheckpointConfig(
-            mode="selective",
-        ),
+        optimizer=default_adamw(lr=8e-4),
+        # Dense causal attention has no CP load balancer; the runner passes
+        # this value through to build_attention_masks unchanged.
+        parallelism=ParallelismConfig(context_parallel_load_balancer=None),
+        # FP32 raw parameters satisfy the unified dtype constraint; the
+        # simulator and FSDP keep BF16 compute projections.
+        training=TrainingConfig(local_batch_size=1, seq_len=128, steps=1, dtype="float32"),
     )
 
 
-def qwen3_06b_test() -> Trainer.Config:
-    config = _upstream_qwen3_0_6b()
-    config.model_spec = model_registry("0.6B")
-    config.model_converters = ModelConvertersContainer.Config(
-        converters=[
-            get_model_converter_config("npu_rms_norm"),
-            get_model_converter_config("npu_rope"),
-        ],
-    )
-    config.dataloader.dataset = "c4_test"
-    config.lr_scheduler.warmup_steps = 20
-    config.training.steps = 100
-    config.checkpoint.initial_load_in_hf = True
-    return config
+def qwen3_32b(*, num_mtp_layers: int = 0) -> Trainer.Config:
+    """Full Qwen3-32B: 64 layers, GQA 64:8, head_dim 128, SwiGLU 25600."""
+    return _trainer_config("32B", num_mtp_layers=num_mtp_layers)
 
 
-def _qwen3_1_7b_converters() -> ModelConvertersContainer.Config:
-    return ModelConvertersContainer.Config(
-        converters=[],
-    )
+def qwen3_32b_smoketest(*, num_mtp_layers: int = 0) -> Trainer.Config:
+    """Four-layer slice of the real 32B geometry.
 
-
-def _process_wordle_sample(sample: dict) -> list[dict]:
-    """Convert a ``willcb/V3-wordle`` sample to Qwen3 chat messages.
-
-    The dataset uses ``prompt`` (list of system + first-user messages) and
-    ``completion`` (list of multi-turn assistant + user messages).
-    We concatenate them into a single conversation and ensure ``content``
-    is always a plain string.
+    Only depth is reduced: GQA 64:8, QK-norm, fused QKV, SwiGLU 25600, the
+    untied head, vocabulary 151936 and rope theta 1e6 all stay on the real
+    path so the smoke exercises every distinctive branch.
     """
-    if "messages" in sample:
-        messages = sample["messages"]
-    elif "prompt" in sample and "completion" in sample:
-        messages = list(sample["prompt"]) + list(sample["completion"])
-    else:
-        raise KeyError(f"Wordle sample must have 'messages' or 'prompt'+'completion'. Got keys: {list(sample.keys())}")
-    # Normalize: ensure content is always a string (Jinja2 chat templates
-    # expect strings; some datasets store content as lists).
-    for msg in messages:
-        if isinstance(msg.get("content"), list):
-            msg["content"] = "\n".join(str(c) for c in msg["content"])
-    return messages
-
-
-def sft_qwen3_1_7b_wordle() -> Trainer.Config:
-    """SFT warmup for Qwen3-1.7B to play Wordle.
-
-    Goal: 20 steps on ``willcb/V3-wordle`` to teach the model the
-    environment's message format (multi-turn board-state → guess loop).
-
-    Loads from HF base weights directly (no CPT prerequisite).
-    Matches the prime-rl Wordle example SFT phase.
-
-    Hardware: NGPU=1 (HF load safe), 64 GB NPU.
-    """
-    return Trainer.Config(
-        hf_assets_path="./assets/hf/Qwen3-1.7B",
-        model_spec=model_registry("1.7B"),
-        model_converters=_qwen3_1_7b_converters(),
-        optimizer=OptimizersContainer.Config(lr=1e-5),
-        lr_scheduler=LRSchedulersContainer.Config(
-            warmup_steps=0,
-            decay_ratio=1.0,
-            decay_type="cosine",
-            min_lr_factor=1.0,
-        ),
-        training=TrainingConfig(
-            local_batch_size=2,
-            global_batch_size=64,
-            seq_len=1024,
-            max_norm=1.0,
-            steps=20,
-        ),
-        parallelism=ParallelismConfig(
-            data_parallel_replicate_degree=1,
-            data_parallel_shard_degree=-1,
-            tensor_parallel_degree=1,
-            pipeline_parallel_degree=1,
-            expert_parallel_degree=1,
-            expert_tensor_parallel_degree=1,
-            context_parallel_degree=1,
-        ),
-        dataloader=ChatDataLoaderConfig(
-            dataset_path="willcb/V3-wordle",
-            load_dataset_kwargs={"split": "train"},
-            sample_processor=_process_wordle_sample,
-        ),
-        metrics=MetricsProcessor.Config(
-            log_freq=1,
-        ),
-        checkpoint=CheckpointManager.Config(
-            enable=True,
-            folder="checkpoint_wordle_sft",
-            load_only=False,
-            initial_load_in_hf=True,
-            initial_load_path="./assets/hf/Qwen3-1.7B",
-        ),
-        activation_checkpoint=ActivationCheckpointConfig(
-            mode="selective",
-        ),
-    )
+    return _trainer_config("32B", num_layers=4, num_mtp_layers=num_mtp_layers)

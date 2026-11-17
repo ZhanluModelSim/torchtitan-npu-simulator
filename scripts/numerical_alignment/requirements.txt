@@ -1,0 +1,3 @@
+# Transformers inference reference; install in an isolated alignment environment.
+transformers==5.13.0
+safetensors==0.8.0

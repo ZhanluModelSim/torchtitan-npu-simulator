@@ -9,16 +9,18 @@ on:
   push:
     branches: [master]
   workflow_dispatch:
-  workflow_run:
-    workflows: ["Sync Upstream"]
-    types: [completed]
 
 permissions:
   contents: write
 
+# Docs only need rebuilding when master changes; if runs overlap (rapid
+# successive pushes), the newest build supersedes the queued/running one.
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+
 jobs:
   deploy:
-    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository

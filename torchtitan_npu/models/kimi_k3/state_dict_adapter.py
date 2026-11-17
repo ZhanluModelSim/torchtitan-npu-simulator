@@ -11,11 +11,13 @@ Reference: moonshotai/Kimi-K3 config.json (model_type="kimi_k3")
 
 import logging
 import re
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
+
+if TYPE_CHECKING:
+    from .model import KimiK3Model
 
 import torch
-
-from torchtitan.models.utils import StateDictAdapter
+from torchtitan.protocols.state_dict_adapter import StateDictAdapter
 
 logger = logging.getLogger(__name__)
 
@@ -35,7 +37,7 @@ class KimiK3StateDictAdapter(StateDictAdapter):
             "language_model.model.output_attn_res_norm.weight": "output_attn_res.norm.weight",
             "language_model.model.output_attn_res_proj.weight": "output_attn_res.proj.weight",
             "language_model.model.norm.weight": "norm.weight",
-            "language_model.lm_head.weight": "output.weight",
+            "language_model.lm_head.weight": "lm_head.weight",
         }
 
         # Layer-level abstract mappings ({} = layer index)
@@ -72,33 +74,33 @@ class KimiK3StateDictAdapter(StateDictAdapter):
             "language_model.model.layers.{}.self_attn.f_a_proj.weight": "layers.{}.attention.f_a_proj.weight",
             "language_model.model.layers.{}.self_attn.f_b_proj.weight": "layers.{}.attention.f_b_proj.weight",
             "language_model.model.layers.{}.self_attn.b_proj.weight": "layers.{}.attention.b_proj.weight",
-            "language_model.model.layers.{}.self_attn.o_norm.weight": "layers.{}.attention.o_norm.weight",
+            "language_model.model.layers.{}.self_attn.o_norm.weight": "layers.{}.attention.o_norm.norm.weight",
+            "language_model.model.layers.{}.self_attn.g_a_proj.weight": "layers.{}.attention.g_a_proj.weight",
+            "language_model.model.layers.{}.self_attn.g_b_proj.weight": "layers.{}.attention.g_b_proj.weight",
             # Dense FFN
-            "language_model.model.layers.{}.mlp.gate_proj.weight": "layers.{}.feed_forward.gate_proj.weight",
-            "language_model.model.layers.{}.mlp.up_proj.weight": "layers.{}.feed_forward.up_proj.weight",
-            "language_model.model.layers.{}.mlp.down_proj.weight": "layers.{}.feed_forward.down_proj.weight",
+            "language_model.model.layers.{}.mlp.gate_proj.weight": "layers.{}.feed_forward.w1.weight",
+            "language_model.model.layers.{}.mlp.up_proj.weight": "layers.{}.feed_forward.w3.weight",
+            "language_model.model.layers.{}.mlp.down_proj.weight": "layers.{}.feed_forward.w2.weight",
             # MoE
-            "language_model.model.layers.{}.block_sparse_moe.gate.weight": "layers.{}.moe.gate.gate.weight",
+            "language_model.model.layers.{}.block_sparse_moe.gate.weight": "layers.{}.moe.router.gate.weight",
             "language_model.model.layers.{}.block_sparse_moe.gate.e_score_correction_bias": (
-                "layers.{}.moe.gate.e_score_correction_bias"
+                "layers.{}.moe.expert_bias_E"
             ),
             "language_model.model.layers.{}.block_sparse_moe.routed_expert_down_proj.weight": (
-                "layers.{}.moe.routed_expert_down_proj.weight"
+                "layers.{}.moe.down_proj.weight"
             ),
             "language_model.model.layers.{}.block_sparse_moe.routed_expert_up_proj.weight": (
-                "layers.{}.moe.routed_expert_up_proj.weight"
+                "layers.{}.moe.up_proj.weight"
             ),
-            "language_model.model.layers.{}.block_sparse_moe.routed_expert_norm.weight": (
-                "layers.{}.moe.routed_expert_norm.weight"
-            ),
+            "language_model.model.layers.{}.block_sparse_moe.routed_expert_norm.weight": ("layers.{}.moe.norm.weight"),
             "language_model.model.layers.{}.block_sparse_moe.shared_experts.gate_proj.weight": (
-                "layers.{}.moe.shared_experts.gate_proj.weight"
+                "layers.{}.moe.shared_experts.w1.weight"
             ),
             "language_model.model.layers.{}.block_sparse_moe.shared_experts.up_proj.weight": (
-                "layers.{}.moe.shared_experts.up_proj.weight"
+                "layers.{}.moe.shared_experts.w3.weight"
             ),
             "language_model.model.layers.{}.block_sparse_moe.shared_experts.down_proj.weight": (
-                "layers.{}.moe.shared_experts.down_proj.weight"
+                "layers.{}.moe.shared_experts.w2.weight"
             ),
         }
 
@@ -134,24 +136,25 @@ class KimiK3StateDictAdapter(StateDictAdapter):
                 if expert_match:
                     layer_idx, expert_idx, weight_name = expert_match.groups()
                     group_key = (layer_idx, weight_name)
-                    expert_weights.setdefault(group_key, {})[
-                        int(expert_idx)
-                    ] = tensor
+                    expert_weights.setdefault(group_key, {})[int(expert_idx)] = tensor
                     mapped = True
 
             if not mapped:
                 logger.debug("from_hf: skipping unmapped key: %s", hf_key)
 
+        suffixes = {"w1": "w1_EFD", "w2": "w2_EDF", "w3": "w3_EFD"}
         for (layer_idx, weight_name), weights_by_expert in expert_weights.items():
             expert_indices = sorted(weights_by_expert)
-            if expert_indices != list(range(len(expert_indices))):
+            moe = cast("KimiK3Model.Config", self.model_config).layers[int(layer_idx)].moe
+            if moe is None:
+                raise ValueError(f"Checkpoint contains routed experts for dense layer {layer_idx}")
+            expected = moe.num_experts
+            if expert_indices != list(range(expected)):
                 raise ValueError(
                     "Kimi expert checkpoint shards must contain contiguous "
-                    f"indices starting at zero; got {expert_indices}"
+                    f"all {expected} indices starting at zero; got {expert_indices}"
                 )
-            state_dict[
-                f"layers.{layer_idx}.moe.experts.{weight_name}"
-            ] = torch.stack(
+            state_dict[f"layers.{layer_idx}.moe.routed_experts.inner_experts.{suffixes[weight_name]}"] = torch.stack(
                 [weights_by_expert[index] for index in expert_indices],
                 dim=0,
             )
@@ -183,7 +186,7 @@ class KimiK3StateDictAdapter(StateDictAdapter):
             # Grouped expert weights
             if not mapped:
                 expert_match = re.match(
-                    r"layers\.(\d+)\.moe\.experts\.(w[123])$",
+                    r"layers\.(\d+)\.moe\.routed_experts\.inner_experts\.(w[123])_(?:EFD|EDF)$",
                     key,
                 )
                 if expert_match:

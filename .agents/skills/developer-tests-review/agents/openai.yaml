@@ -1,0 +1,9 @@
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+interface:
+  display_name: "TorchTitan-NPU 测试 workflow"
+  short_description: "更新或 review UT、NPU ST 与测试格式"
+  default_prompt: "使用 $developer-tests-review 选择更新测试或 review测试 workflow，处理此 PR 的 UT、NPU ST 和测试格式。"
