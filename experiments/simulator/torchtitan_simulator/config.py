@@ -192,6 +192,7 @@ def prepare_config(simulation: SimulationConfig) -> PreparedConfig:
         "system3_debugmodel_text": "torchtitan_npu.models.system3.config_registry.system3_debugmodel_text",
         "system3_debugmodel_multimodal": "torchtitan_npu.models.system3.config_registry.system3_debugmodel_multimodal",
         "system3_full_text": "torchtitan_npu.models.system3.config_registry.system3_full_text",
+        "system3_unit_text": "torchtitan_npu.models.system3.config_registry.system3_unit_text",
     }
     target = factories.get(simulation.config, simulation.config)
     if "." not in target:

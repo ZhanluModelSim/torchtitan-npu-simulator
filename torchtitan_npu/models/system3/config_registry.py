@@ -17,7 +17,7 @@ Engram conditional memory on inject layers, and (multimodal flavor only)
 the four modality encoders with interleaved AR sequence assembly.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 
 import torch.nn as nn
@@ -178,6 +178,18 @@ _FULL_GEOMETRY = _Geometry(
     engram_heads=4,
     engram_head_dim=64,
     engram_rows=4096,
+)
+
+# Minimal structural unit of the full geometry: one joint ISA/engram period.
+# ISA recurs every 4 layers, engram every 6, so the joint period is lcm(4,6)=12
+# (base_depth must stay divisible by unit_size); one replay of the loop.
+# Node counts and per-period work scale linearly in base_depth * num_recursion,
+# so unit timings extrapolate to the full geometry with fixed terms separated.
+_UNIT_GEOMETRY = replace(
+    _FULL_GEOMETRY,
+    base_depth=12,
+    num_recursion=1,
+    engram_layers=(1, 7),
 )
 
 
@@ -494,6 +506,7 @@ system3_configs = {
     "debugmodel_text": lambda: _make_model_config(multimodal=False, g=_Geometry()),
     "debugmodel_multimodal": lambda: _make_model_config(multimodal=True, g=_Geometry()),
     "full_text": lambda: _make_model_config(multimodal=False, g=_FULL_GEOMETRY),
+    "unit_text": lambda: _make_model_config(multimodal=False, g=_UNIT_GEOMETRY),
 }
 
 
@@ -569,3 +582,8 @@ def system3_debugmodel_multimodal(*, num_mtp_layers: int = 0) -> Trainer.Config:
 def system3_full_text(*, num_mtp_layers: int = 0, seq_len: int = 2048, steps: int = 10) -> Trainer.Config:
     """Single-card full-size text flavor for duration-grade comparisons."""
     return _system3_trainer_config("full_text", num_mtp_layers=num_mtp_layers, seq_len=seq_len, steps=steps)
+
+
+def system3_unit_text(*, num_mtp_layers: int = 0, seq_len: int = 2048, steps: int = 10) -> Trainer.Config:
+    """Minimal joint ISA/engram period of the full geometry (depth 12, recursion 1)."""
+    return _system3_trainer_config("unit_text", num_mtp_layers=num_mtp_layers, seq_len=seq_len, steps=steps)
