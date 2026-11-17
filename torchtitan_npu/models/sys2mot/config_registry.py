@@ -32,7 +32,7 @@ from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
 from torchtitan.models.common.embedding import Embedding
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.nn_modules import Conv2d
-from torchtitan.models.common.token_dispatcher import LocalTokenDispatcher
+from torchtitan_npu.patches.torchtitan.models.common.token_dispatcher import AllToAllTokenDispatcher
 from torchtitan.protocols.model_spec import ModelSpec
 from torchtitan.trainer import Trainer
 
@@ -214,6 +214,23 @@ class _GeometryMid(_Geometry):
     action_mlp: int = 4096
 
 
+@dataclass(frozen=True)
+class _GeometryMidEp(_GeometryMid):
+    """Mid geometry with the routed experts made divisible by the 7-device
+    expert-parallel mesh (16 -> 14, two experts per rank); every other field
+    keeps the mid flavor. EP requires ``num_experts % ep_size == 0`` and the
+    only feasible EP degree on 7 devices is 7 itself."""
+
+    experts: int = 14
+
+
+sys2mot_configs = {
+    "debugmodel_multimodal": lambda: _make_model_config(g=_Geometry()),
+    "mid_multimodal": lambda: _make_model_config(g=_GeometryMid()),
+    "mid_ep_multimodal": lambda: _make_model_config(g=_GeometryMidEp()),
+}
+
+
 def _norm(dim: int, g: _Geometry) -> RMSNorm.Config:
     return RMSNorm.Config(dim=dim, eps=g.eps)
 
@@ -360,7 +377,10 @@ def _moe_config(*, g: _Geometry) -> MoE.Config:
                 num_experts=g.experts,
                 swiglu_limit=g.swiglu_limit,
             ),
-            token_dispatcher=LocalTokenDispatcher.Config(
+            # The all-to-all dispatcher falls back to the local reorder at
+            # EP=1 (identical capture), and runs the EP token exchange when
+            # the expert mesh is wired.
+            token_dispatcher=AllToAllTokenDispatcher.Config(
                 num_experts=g.experts,
                 top_k=g.topk,
             ),
@@ -472,11 +492,6 @@ def _make_model_config(*, g: _Geometry) -> Sys2MotModel.Config:
     )
 
 
-sys2mot_configs = {
-    "debugmodel_multimodal": lambda: _make_model_config(g=_Geometry()),
-    "mid_multimodal": lambda: _make_model_config(g=_GeometryMid()),
-}
-
 
 def model_registry(flavor: str) -> ModelSpec:
     if flavor not in sys2mot_configs:
@@ -560,4 +575,15 @@ def sys2mot_mid_multimodal(*, num_mtp_layers: int = 0) -> Trainer.Config:
     )
 
 
-__all__ = ["model_registry", "sys2mot_debugmodel_multimodal", "sys2mot_mid_multimodal"]
+def sys2mot_mid_ep_multimodal(*, num_mtp_layers: int = 0) -> Trainer.Config:
+    return _sys2mot_trainer_config(
+        "mid_ep_multimodal", num_mtp_layers=num_mtp_layers, seq_len=200
+    )
+
+
+__all__ = [
+    "model_registry",
+    "sys2mot_debugmodel_multimodal",
+    "sys2mot_mid_multimodal",
+    "sys2mot_mid_ep_multimodal",
+]

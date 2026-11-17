@@ -14,8 +14,9 @@ FSDP unit.
 TP and CP fail fast (config level and here): the CSA2 head axis, the grouped
 output low-rank factors and the mHC branch mixing would need sharded layouts,
 and the compressed KV grid, Engram hash and the per-layer prefix/action joint
-attention span the full sequence. EP is rejected until its expert
-sharding/placement path is validated for this family.
+attention span the full sequence. EP follows the shared MoE decoder recipe:
+the routed experts ride the expert-parallel FSDP mesh (efsdp) and the token
+dispatcher runs the all-to-all exchange (local fallback at EP=1).
 """
 
 from torchtitan.config import (
@@ -28,7 +29,7 @@ from torchtitan.distributed import ParallelDims
 from torchtitan.distributed.activation_checkpoint import ActivationCheckpointingConfig
 from torchtitan.distributed.compile import apply_compile
 from torchtitan.distributed.fsdp import apply_fsdp_to_decoder
-from torchtitan.distributed.full_dtensor import resolve_fsdp_mesh
+from torchtitan.distributed.full_dtensor import resolve_fsdp_mesh, resolve_sparse_fsdp_mesh
 from torchtitan.models.common.decoder import Decoder
 
 
@@ -55,12 +56,13 @@ def parallelize_sys2mot(
             "span the full sequence"
         )
 
-    if parallel_dims.ep_enabled:
-        raise NotImplementedError("sys2mot does not support expert parallel yet: capture covers DP/FSDP only")
-
-    if parallelism.spmd_backend == "spmd_types" or parallel_dims.tp_enabled:
-        # Module protocol: sharding configs are replicated everywhere (TP/EP
-        # rejected above); this wires redistribution for the spmd_types path.
+    if (
+        parallelism.spmd_backend == "spmd_types"
+        or parallel_dims.tp_enabled
+        or parallel_dims.ep_enabled
+    ):
+        # Module protocol: sharding configs are replicated on TP (rejected
+        # above); with EP this wires the dispatcher's EP meshes.
         model.parallelize(parallel_dims)
 
     if ac_config is not None:
@@ -76,10 +78,16 @@ def parallelize_sys2mot(
 
     if parallelism.spmd_backend == "spmd_types":
         dp_mesh, dp_mesh_dims = resolve_fsdp_mesh(parallel_dims)
+        edp_mesh, edp_mesh_dims = resolve_sparse_fsdp_mesh(parallel_dims)
     else:
         dp_mesh_names = ["dp_replicate", "fsdp"] if parallel_dims.dp_replicate_enabled else ["fsdp"]
         dp_mesh = parallel_dims.get_mesh(dp_mesh_names)
         dp_mesh_dims = None
+        edp_mesh = None
+        edp_mesh_dims = None
+        if parallel_dims.ep_enabled:
+            edp_mesh_names = ["dp_replicate", "efsdp"] if parallel_dims.dp_replicate_enabled else ["efsdp"]
+            edp_mesh = parallel_dims.get_optional_mesh(edp_mesh_names)
 
     apply_fsdp_to_decoder(
         model,
@@ -90,7 +98,9 @@ def parallelize_sys2mot(
         cpu_offload=training.enable_cpu_offload,
         reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
         ep_degree=parallel_dims.ep,
+        edp_mesh=edp_mesh,
         dp_mesh_dims=dp_mesh_dims,
+        edp_mesh_dims=edp_mesh_dims,
     )
 
     return model

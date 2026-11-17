@@ -164,16 +164,27 @@ def test_sys2mot_rejects_context_parallel():
         )
 
 
-def test_sys2mot_rejects_expert_parallel():
-    with pytest.raises(NotImplementedError, match="expert parallel"):
-        simulate(
-            SimulationConfig(
-                config="sys2mot_debugmodel_multimodal",
-                seq_len=100,
-                world_size=2,
-                expert_parallel_degree=2,
-            )
+def test_sys2mot_expert_parallel_runs_all_to_all_dispatch():
+    # EP follows the shared MoE decoder recipe: routed experts ride the
+    # efsdp mesh (EP shard on the expert dim), the all-to-all dispatcher
+    # exchanges tokens (local fallback at EP=1 keeps the base capture
+    # byte-identical), and the FSDP all-gather/reduce-scatter chain stays.
+    workload = simulate(
+        SimulationConfig(
+            config="sys2mot_debugmodel_multimodal",
+            seq_len=100,
+            world_size=8,
+            expert_parallel_degree=4,
         )
+    )
+    result = validate_workload(workload)
+    assert result["graph_acyclic"] and result["peak_storage_unique"]
+    nodes = [n for template in workload.step_templates.values() for n in template.nodes.values()]
+    counts = Counter(n.annotations["raw_op_type"] for n in nodes)
+    assert counts["_c10d_functional.all_to_all_single.default"] == 40
+    assert counts["aten._grouped_mm.default"] == 96
+    assert counts["c10d._allgather_base_.default"] == 37
+    assert counts["c10d._reduce_scatter_base_.default"] == 20
 
 
 def test_sys2mot_preset_rejects_mtp_modules():
