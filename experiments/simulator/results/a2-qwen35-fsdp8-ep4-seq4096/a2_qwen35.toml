@@ -1,0 +1,26 @@
+schema_version = 1
+
+[training]
+config = "qwen3_5_debugmodel"
+world_size = 8
+data_parallel_replicate_degree = 1
+data_parallel_shard_degree = 8
+expert_parallel_degree = 4
+local_batch_size = 1
+global_batch_size = 8
+seq_len = 4096
+mixed_precision_param = "bfloat16"
+logical_rank = 0
+activation_checkpoint_mode = "none"
+output_dir = "/workspace/qwen35-platform-run/a2-qwen35-fsdp8-ep4-seq4096/runs"
+
+[platform]
+hardware = "a2"
+hardware_dir = "/workspace/qwen35-platform-run/hardware"
+
+[prediction]
+backends = ["roofline"]
+overhead_us = 1.0
+
+[corrections]
+vec_scale = 1.0

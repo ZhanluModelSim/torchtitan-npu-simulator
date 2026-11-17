@@ -45,5 +45,5 @@
 
 - 修改／review 测试使用仓库 `developer-tests-review` skill；文档使用 `write-torchtitan-npu-docs`。新模型按流程的分阶段出口验收，不用 build-only、测试数量或 Meta 成功替代数值／性能证明。
 - 组件、真实小模型、相关并行／AC／量化、内存独立字节预期、连续会话和 wheel 普通安装分层验证。只扩大实际受影响的路径，不机械执行全部组合。
-- `scripts/validate.sh` 是 sidecar pytest + pyrefly 入口；完整 lint 按根仓要求执行。`scripts/acceptance.py` 当前只覆盖 DSV4 的四种结构，Kimi 或新模型需要各自测试，不能自动外推。
+- `scripts/validate.sh` 是 sidecar pytest + pyrefly 入口；完整 lint 按根仓要求执行。`scripts/acceptance.py` 当前只覆盖 DSV4 的四种结构，Kimi 或新模型需要各自测试（Qwen3.5 见 `tests/test_qwen3_5_capture.py` 与[接入记录](docs/qwen3-5-integration.md)），不能自动外推。
 - 文档只维护当前方案、workflow 和必要专题。接口、能力或命令变化同步 README 导航、对应专题及能力矩阵；不再增加阶段迁移／自审文档，历史证据由 Git 保留。
