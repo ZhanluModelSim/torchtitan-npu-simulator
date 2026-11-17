@@ -48,20 +48,27 @@ def test_sys2mot_capture_reaches_iteration_with_reference_operators():
     # (8 layers), the router scores with sqrt(softplus) in fp32, the CSA2
     # indexer and the force-balanced MoE routing keep their real topk calls,
     # and the ViT pixel unshuffle is the reference's own unfold
-    # (im2col/col2im).
-    assert counts["aten._grouped_mm.default"] == 72
-    assert counts["aten.topk.default"] == 18
-    assert counts["aten._softmax.default"] == 49
-    assert counts["aten.softplus.default"] == 8
-    assert counts["aten.embedding.default"] == 3  # text + two Engram tables
-    assert counts["aten.constant_pad_nd.default"] == 40
-    assert counts["aten.im2col.default"] == 1
-    assert counts["aten.convolution.default"] == 1
-    assert counts["aten.sort.stable"] == 8  # token dispatcher per MoE layer
-    assert counts["torchtitan.deterministic_scatter_add.default"] == 8
-    # The captured joint loss: flow MSE + 0.1 text CE + 0.01 indexer aux.
+    # (im2col/col2im). The frozen distillation teacher adds one eval-mode
+    # VLM backbone pass (no backward: the paired backward counts stay at the
+    # student-only values), one extra ViT patch embed and one extra text +
+    # Engram embedding set.
+    assert counts["aten._grouped_mm.default"] == 96
+    assert counts["aten.topk.default"] == 36
+    assert counts["aten._softmax.default"] == 83
+    assert counts["aten.softplus.default"] == 16
+    assert counts["aten.embedding.default"] == 6  # student + teacher text/Engram
+    assert counts["aten.constant_pad_nd.default"] == 79
+    assert counts["aten.im2col.default"] == 2
+    assert counts["aten.convolution.default"] == 2
+    assert counts["aten.sort.stable"] == 16  # token dispatcher per MoE layer, student + teacher
+    assert counts["torchtitan.deterministic_scatter_add.default"] == 16
+    # The captured joint loss: flow MSE + 0.5 logits KD + 0.1 hidden MSE +
+    # 0.1 text CE + 0.01 indexer aux. F.kl_div captures decomposed
+    # (xlogy + mul/sub), so the kd signature is the single xlogy.
     assert counts["aten.mse_loss.default"] == 1
     assert counts["aten.nll_loss_forward.default"] == 1
+    assert counts["aten.xlogy.Tensor"] == 1
+    assert counts["aten._log_softmax.default"] == 10
     # Only the sys2mot_sim FlashAttention virtual boundary is substituted;
     # every other node is a native aten/collective op.
     assert not any(raw.startswith(("sys2mot.", "system3.", "deepseek_v4.")) for raw in counts)
@@ -80,9 +87,9 @@ def test_sys2mot_capture_reaches_iteration_with_reference_operators():
     # Capture-session vendor fused boundaries for RMSNorm and rotary-apply
     # (deliberately coarser than the unfused production trace), with the
     # Meta autograd bridges recording the paired backward operators.
-    assert counts["npu.npu_rms_norm.default"] == 75
+    assert counts["npu.npu_rms_norm.default"] == 117
     assert counts["npu.npu_rms_norm_backward.default"] == 75
-    assert counts["npu.npu_rotary_mul.default"] == 64
+    assert counts["npu.npu_rotary_mul.default"] == 104
     assert counts["npu.npu_rotary_mul_backward.default"] == 64
     # Only the FlashAttention virtual boundary declares tensor roles.
     assert all(
@@ -100,12 +107,13 @@ def test_sys2mot_full_ac_recomputes_forward_math():
     assert result["graph_acyclic"] and result["peak_storage_unique"]
     nodes = [n for template in workload.step_templates.values() for n in template.nodes.values()]
     counts = Counter(n.annotations["raw_op_type"] for n in nodes)
-    # Full AC recomputes the forward inside backward: the grouped GEMMs and
-    # router scoring double, the indexer topk doubles, while the
-    # loss/optimizer-side signatures keep their counts.
-    assert counts["aten._grouped_mm.default"] == 96
-    assert counts["aten.topk.default"] == 36
-    assert counts["aten.softplus.default"] == 16
+    # Full AC recomputes the forward inside backward: the grouped GEMMs,
+    # router scoring and indexer topk recompute once more, the frozen
+    # teacher's eval pass runs once (no gradient), while the loss/optimizer
+    # signatures keep their counts.
+    assert counts["aten._grouped_mm.default"] == 120
+    assert counts["aten.topk.default"] == 54
+    assert counts["aten.softplus.default"] == 24
     gradients = workload.iteration.schedule.annotations["gradient_validation"]
     assert len(gradients) == _PARAM_TENSORS
 
@@ -123,10 +131,11 @@ def test_sys2mot_selective_ac_gmm_save_set_skips_grouped_gemm_recompute():
     assert result["graph_acyclic"] and result["peak_storage_unique"]
     nodes = [n for template in workload.step_templates.values() for n in template.nodes.values()]
     counts = Counter(n.annotations["raw_op_type"] for n in nodes)
-    # The gmm save-set keeps the grouped GEMMs saved (forward count only);
-    # the indexer/router topk is not part of the saved set and recomputes.
-    assert counts["aten._grouped_mm.default"] == 72
-    assert counts["aten.topk.default"] == 36
+    # The gmm save-set keeps the student grouped GEMMs saved (forward count
+    # only); the indexer/router topk is not part of the saved set and
+    # recomputes. The frozen teacher's eval pass runs once on top.
+    assert counts["aten._grouped_mm.default"] == 96
+    assert counts["aten.topk.default"] == 54
     gradients = workload.iteration.schedule.annotations["gradient_validation"]
     assert len(gradients) == _PARAM_TENSORS
 

@@ -1492,6 +1492,21 @@ class Sys2MotModel(Decoder):
         velocity = self.action.decode(a)
         # The encoder boundary always exists (0 < encoder_layers < layers).
         assert encoder_hidden is not None, "encoder boundary hidden must be captured"
+        if getattr(self, "_distill_capture", False):
+            # The loss-side teacher forward consumes the raw multimodal batch;
+            # carry it through the prediction dict (capture-local contract).
+            pred = {
+                "velocity": velocity,
+                "hidden": features["hidden"],
+                "indexer_aux": features["indexer_aux"],
+                "encoder_hidden": encoder_hidden,
+                "distill_images": images,
+                "distill_tokens": tokens,
+                "distill_text_mask": text_mask,
+            }
+            if not self._skip_lm_head:
+                pred["logits"] = self.lm_head(features["hidden"][:, visual_tokens:])
+            return pred
         if self._skip_lm_head:
             return {
                 "velocity": velocity,
@@ -1509,6 +1524,29 @@ class Sys2MotModel(Decoder):
     # ------------------------------------------------------------------
     # Runner input-prep seam (multimodal capture inputs)
     # ------------------------------------------------------------------
+    def backbone_forward(
+        self,
+        images: torch.Tensor,
+        tokens: torch.Tensor,
+        text_mask: torch.Tensor | None = None,
+        view_mask: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        """Reference ``VLA.backbone``: ViT + VLM layers + LM head, no action loop.
+
+        The distillation teacher runs this per step in eval mode; the indexer
+        aux branch is skipped by ``self.training == False`` and the returned
+        dict carries the teacher logits plus the text-span hidden states the
+        ``Distiller`` formulas consume.
+        """
+        h, pre, valid, image_mask, ids, visual_tokens = self.embed_prefix(images, tokens, text_mask, view_mask)
+        runtime, auxs = AttentionRuntime(), []
+        for layer in self.layers.values():
+            h, pre, aux, runtime = layer(h, pre, valid, image_mask, ids, runtime, capture_kv=False)
+            auxs.append(aux)
+        features = self.finish(h, pre, auxs)
+        span = features["hidden"][:, visual_tokens:]
+        return {"logits": self.lm_head(span), "text_hidden": span}
+
     def build_attention_masks(self, tokens, labels, extra_inputs, *, cp_mesh=None, load_balancer_type=None):
         """Runner input-prep seam.
 

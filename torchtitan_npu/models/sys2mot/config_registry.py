@@ -500,15 +500,18 @@ def _sys2mot_trainer_config(
     model_spec = model_registry(flavor)
     model_config = model_spec.model
     assert isinstance(model_config, Sys2MotModel.Config)
-    # The captured joint loss: flow MSE + 0.1*text CE + 0.01*indexer aux (the
-    # reference's student-only terms; KD/hidden need a teacher forward). The
-    # text span starts after the synthesized 3-view vision prefix.
+    # The captured joint loss: flow MSE + 0.5*logits-KD + 0.1*hidden-MSE +
+    # 0.1*text CE + 0.01*indexer aux. KD/hidden distill from a frozen teacher
+    # (same capture config, mounted on the loss by the runner) so the full
+    # reference objective runs inside the capture. The text span starts after
+    # the synthesized 3-view vision prefix.
     loss = Sys2MotJointLoss.Config(
         text_offset=3 * model_config.image_tokens,
         action_dim=model_config.action.action_dim,
         horizon=model_config.action.horizon,
         ce_weight=0.1,
         indexer_weight=0.01,
+        distill=True,
     )
     return Trainer.Config(
         loss=loss,
