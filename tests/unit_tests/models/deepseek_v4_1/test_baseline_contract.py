@@ -3,6 +3,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from dataclasses import replace
+
 import pytest
 import torch
 
@@ -115,23 +117,21 @@ def test_v41_moe_rides_the_common_stack_with_an_opt_in_vision_bias():
 def test_baseline_rejects_tensor_parallel():
     config = deepseek_v4_1_debugmodel_multimodal()
     config.parallelism.tensor_parallel_degree = 2
-    with pytest.raises(NotImplementedError, match="TP=1"):
-        config.model.update_from_config(config=config)
+    with pytest.raises(NotImplementedError, match="TP=CP=PP=1"):
+        with torch.device("meta"):
+            model = config.model.build()
+        model.parallelize(parallelism=config.parallelism)
 
 
-def test_trainer_config_rejects_a_ratio_table_shorter_than_the_stack():
+def test_model_config_rejects_a_ratio_table_shorter_than_the_stack():
     # Positive control: the registered table is accepted by the same entry point, so a
     # check that always raised would not pass this test.
     registered = deepseek_v4_1_debugmodel_multimodal()
-    registered.training.max_context_length = 512
-    registered.model.update_from_config(config=registered)
+    assert replace(registered.model).n_layers == 40
 
     config = deepseek_v4_1_debugmodel_multimodal()
-    config.training.max_context_length = 512
-    model_config = config.model
-    model_config.compress_ratios = model_config.compress_ratios[:-1]
     with pytest.raises(ValueError, match="compress_ratios must match n_layers"):
-        model_config.update_from_config(config=config)
+        replace(config.model, compress_ratios=config.model.compress_ratios[:-1])
 
 
 def test_vision_bias_follows_the_factory_switch():

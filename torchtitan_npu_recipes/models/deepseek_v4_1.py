@@ -31,7 +31,7 @@ from torchtitan_npu.config import (
 )
 from torchtitan_npu.extensions.torchtitan.trainer import TrainerEx
 from torchtitan_npu.models.common.alignment import AlignedTextProcessor, compression_alignment
-from torchtitan_npu.models.deepseek_v4_1 import model_registry
+from torchtitan_npu.models.deepseek_v4_1 import EngramArgs, model_registry
 from torchtitan_npu.models.deepseek_v4_1.model import DeepSeekV41Model, DeepSeekV41MultimodalModel
 from torchtitan_npu.models.deepseek_v4_1.optimizer import _v41_optimizer_config
 from torchtitan_npu.models.deepseek_v4_1.trainer import DeepSeekV41Trainer
@@ -83,14 +83,37 @@ def _make_trainer_config(
     converters=None,
     dataloader_factory: Callable[[DeepSeekV41Model.Config], GrainDataLoader.Config] | None = None,
     parallelism: ParallelismConfig | None = None,
-    hf_assets_path: str | None = None,
     seq_len: int | None = None,
-    mtp_isolate_gradients: bool = False,
+    hf_assets_path: str | None = None,
+    moe_comm_backend: str = "standard",
+    num_tokens_per_microbatch: int | None = None,
+    num_max_tokens_per_rank: int | None = None,
+    engram: EngramArgs | None = None,
 ) -> TrainerEx.Config:
-    # V4.1 still runs the Trainer-side update_from_config lifecycle; the
-    # recipe-side arguments only preselect the layouts and asset path.
-    del mtp_isolate_gradients  # V4.1 has no MTP depths yet.
-    model = model_registry(flavor, converters=converters, parallelism=parallelism)
+    from torchtitan_npu.models.common.moe import dispatcher_capacity
+
+    parallelism = parallelism or ParallelismConfig()
+    if parallelism.context_parallel_degree > 1:
+        raise NotImplementedError("DeepSeek V4.1 context parallelism requires the v0.4 CP lifecycle migration")
+    seq_len = seq_len if seq_len is not None else (512 if "debugmodel" in flavor else 4096)
+    hf_assets_path = hf_assets_path or "tests/assets/tokenizer"
+    num_tokens = num_tokens_per_microbatch if num_tokens_per_microbatch is not None else seq_len
+    if moe_comm_backend == "deepep":
+        required = dispatcher_capacity(num_tokens=num_tokens, parallelism=parallelism)
+        if num_max_tokens_per_rank is None:
+            num_max_tokens_per_rank = required
+        elif num_max_tokens_per_rank < required:
+            raise ValueError(f"num_max_tokens_per_rank must be at least {required}")
+    model = model_registry(
+        flavor,
+        converters=converters,
+        parallelism=parallelism,
+        seq_len=seq_len,
+        tokenizer_path=os.path.join(hf_assets_path, "tokenizer.json"),
+        moe_comm_backend=moe_comm_backend,
+        num_max_tokens_per_rank=num_max_tokens_per_rank,
+        engram=engram,
+    )
     model = derive(
         model,
         type(model),
@@ -101,16 +124,6 @@ def _make_trainer_config(
         ),
         local_compile_regions=[],
     )
-    # The upstream validator requires model, data, and RoPE context lengths to agree.
-    context_len = model.max_context_length if seq_len is None else min(seq_len, model.max_context_length)
-    model.max_context_length = min(4096, context_len)
-    from torchtitan.models.common.rope import RoPE
-
-    for _, rope, _, _ in model.traverse(RoPE.Config):
-        rope.max_context_length = model.max_context_length
-    if model.n_layers != len(model.layers):  # pyrefly: ignore [missing-attribute]
-        raise ValueError("registered V4.1 model does not describe every configured layer")
-
     if dataloader_factory is not None:
         dataloader = dataloader_factory(model)
     elif isinstance(model, DeepSeekV41MultimodalModel.Config):
@@ -131,10 +144,11 @@ def _make_trainer_config(
         )
 
     return DeepSeekV41Trainer.Config(
+        hf_assets_path=hf_assets_path,
         training=TrainingConfig(
             disable_cuda_graphs=True,
-            num_tokens_per_microbatch_per_dp_rank=min(4096, model.max_context_length),
-            max_context_length=min(4096, model.max_context_length),
+            num_tokens_per_microbatch_per_dp_rank=num_tokens,
+            max_context_length=seq_len,
         ),
         loss=ChunkedLossWrapper.Config(
             loss_fn=CrossEntropyLoss.Config(
@@ -145,10 +159,9 @@ def _make_trainer_config(
         tokenizer=HuggingFaceTokenizer.Config(),
         dataloader=dataloader,
         optim=OptimConfig(optimizer=_v41_optimizer_config(model)),
-        parallelism=parallelism or ParallelismConfig(),
+        parallelism=parallelism,
         activation_remat=None,
         override=OverrideConfig(imports=["torchtitan_npu.override.common.rope.workaround"]),
-        hf_assets_path=hf_assets_path or "tests/assets/tokenizer",
     )
 
 
@@ -196,6 +209,10 @@ def deepseek_v4_1_vision_sft(
     reasoning_effort: "ReasoningEffort | None" = None,
     flavor: str = "deepseek_v4_1_debugmodel",
     converters: list["ModelConfigConverter.Config"] | None = None,
+    parallelism: ParallelismConfig | None = None,
+    seq_len: int | None = None,
+    hf_assets_path: str | None = None,
+    engram: EngramArgs | None = None,
 ) -> TrainerEx.Config:
     """A multimodal flavor trained on one chat context per Grain batch.
 
@@ -218,6 +235,10 @@ def deepseek_v4_1_vision_sft(
             add_default_bos_token=add_default_bos_token,
             reasoning_effort=reasoning_effort,
         ),
+        parallelism=parallelism,
+        seq_len=seq_len,
+        hf_assets_path=hf_assets_path,
+        engram=engram,
     )
 
 
@@ -240,7 +261,14 @@ def _vision_sft_thinking_mode() -> "ThinkingMode":
     return mode
 
 
-def _vision_sft_recipe(flavor: str) -> TrainerEx.Config:
+def _vision_sft_recipe(
+    flavor: str,
+    *,
+    parallelism: ParallelismConfig | None = None,
+    seq_len: int | None = None,
+    hf_assets_path: str | None = None,
+    engram: EngramArgs | None = None,
+) -> TrainerEx.Config:
     """The ``--config`` entry for SFT: ``--config`` names take no arguments.
 
     The dataset path falls back to ``DSV41_SFT_DATASET`` / ``DATASET_PATH`` inside
@@ -253,115 +281,286 @@ def _vision_sft_recipe(flavor: str) -> TrainerEx.Config:
         drop_thinking=_vision_sft_env_flag("DROP_THINKING", True),
         add_default_bos_token=_vision_sft_env_flag("ADD_DEFAULT_BOS_TOKEN", True),
         reasoning_effort=_vision_sft_env("REASONING_EFFORT", "") or None,
+        parallelism=parallelism,
+        seq_len=seq_len,
+        hf_assets_path=hf_assets_path,
+        engram=engram,
     )
 
 
-def deepseek_v4_1_flash() -> TrainerEx.Config:
-    return _make_trainer_config("deepseek_v4_1_flash")
+def deepseek_v4_1_flash(
+    *,
+    parallelism: ParallelismConfig | None = None,
+    seq_len: int | None = None,
+    hf_assets_path: str | None = None,
+    engram: EngramArgs | None = None,
+) -> TrainerEx.Config:
+    return _make_trainer_config(
+        "deepseek_v4_1_flash", parallelism=parallelism, seq_len=seq_len, hf_assets_path=hf_assets_path, engram=engram
+    )
 
 
-def deepseek_v4_1_flash_sft() -> TrainerEx.Config:
-    return _vision_sft_recipe("deepseek_v4_1_flash")
+def deepseek_v4_1_flash_sft(
+    *,
+    parallelism: ParallelismConfig | None = None,
+    seq_len: int | None = None,
+    hf_assets_path: str | None = None,
+    engram: EngramArgs | None = None,
+) -> TrainerEx.Config:
+    return _vision_sft_recipe(
+        "deepseek_v4_1_flash", parallelism=parallelism, seq_len=seq_len, hf_assets_path=hf_assets_path, engram=engram
+    )
 
 
-def deepseek_v4_1_flash_text() -> TrainerEx.Config:
-    return _make_trainer_config("deepseek_v4_1_flash_text")
+def deepseek_v4_1_flash_text(
+    *,
+    parallelism: ParallelismConfig | None = None,
+    seq_len: int | None = None,
+    hf_assets_path: str | None = None,
+    engram: EngramArgs | None = None,
+) -> TrainerEx.Config:
+    return _make_trainer_config(
+        "deepseek_v4_1_flash_text",
+        parallelism=parallelism,
+        seq_len=seq_len,
+        hf_assets_path=hf_assets_path,
+        engram=engram,
+    )
 
 
-def deepseek_v4_1_flash_40layers_16experts_multimodal() -> TrainerEx.Config:
-    return _make_trainer_config("deepseek_v4_1_flash_40layers_16experts_vision")
+def deepseek_v4_1_flash_40layers_16experts_multimodal(
+    *,
+    parallelism: ParallelismConfig | None = None,
+    seq_len: int | None = None,
+    hf_assets_path: str | None = None,
+    engram: EngramArgs | None = None,
+) -> TrainerEx.Config:
+    return _make_trainer_config(
+        "deepseek_v4_1_flash_40layers_16experts_vision",
+        parallelism=parallelism,
+        seq_len=seq_len,
+        hf_assets_path=hf_assets_path,
+        engram=engram,
+    )
 
 
-def deepseek_v4_1_flash_40layers_16experts_multimodal_sft() -> TrainerEx.Config:
-    return _vision_sft_recipe("deepseek_v4_1_flash_40layers_16experts_vision")
+def deepseek_v4_1_flash_40layers_16experts_multimodal_sft(
+    *,
+    parallelism: ParallelismConfig | None = None,
+    seq_len: int | None = None,
+    hf_assets_path: str | None = None,
+    engram: EngramArgs | None = None,
+) -> TrainerEx.Config:
+    return _vision_sft_recipe(
+        "deepseek_v4_1_flash_40layers_16experts_vision",
+        parallelism=parallelism,
+        seq_len=seq_len,
+        hf_assets_path=hf_assets_path,
+        engram=engram,
+    )
 
 
-def deepseek_v4_1_flash_40layers_16experts_text() -> TrainerEx.Config:
-    return _make_trainer_config("deepseek_v4_1_flash_40layers_16experts_text")
+def deepseek_v4_1_flash_40layers_16experts_text(
+    *,
+    parallelism: ParallelismConfig | None = None,
+    seq_len: int | None = None,
+    hf_assets_path: str | None = None,
+    engram: EngramArgs | None = None,
+) -> TrainerEx.Config:
+    return _make_trainer_config(
+        "deepseek_v4_1_flash_40layers_16experts_text",
+        parallelism=parallelism,
+        seq_len=seq_len,
+        hf_assets_path=hf_assets_path,
+        engram=engram,
+    )
 
 
-def deepseek_v4_1_flash_40layers_24experts_multimodal() -> TrainerEx.Config:
-    return _make_trainer_config("deepseek_v4_1_flash_40layers_24experts_multimodal")
+def deepseek_v4_1_flash_40layers_24experts_multimodal(
+    *,
+    parallelism: ParallelismConfig | None = None,
+    seq_len: int | None = None,
+    hf_assets_path: str | None = None,
+    engram: EngramArgs | None = None,
+) -> TrainerEx.Config:
+    return _make_trainer_config(
+        "deepseek_v4_1_flash_40layers_24experts_multimodal",
+        parallelism=parallelism,
+        seq_len=seq_len,
+        hf_assets_path=hf_assets_path,
+        engram=engram,
+    )
 
 
-def deepseek_v4_1_flash_40layers_24experts_multimodal_sft() -> TrainerEx.Config:
-    return _vision_sft_recipe("deepseek_v4_1_flash_40layers_24experts_multimodal")
+def deepseek_v4_1_flash_40layers_24experts_multimodal_sft(
+    *,
+    parallelism: ParallelismConfig | None = None,
+    seq_len: int | None = None,
+    hf_assets_path: str | None = None,
+    engram: EngramArgs | None = None,
+) -> TrainerEx.Config:
+    return _vision_sft_recipe(
+        "deepseek_v4_1_flash_40layers_24experts_multimodal",
+        parallelism=parallelism,
+        seq_len=seq_len,
+        hf_assets_path=hf_assets_path,
+        engram=engram,
+    )
 
 
-def deepseek_v4_1_flash_40layers_24experts_text() -> TrainerEx.Config:
-    return _make_trainer_config("deepseek_v4_1_flash_40layers_24experts_text")
+def deepseek_v4_1_flash_40layers_24experts_text(
+    *,
+    parallelism: ParallelismConfig | None = None,
+    seq_len: int | None = None,
+    hf_assets_path: str | None = None,
+    engram: EngramArgs | None = None,
+) -> TrainerEx.Config:
+    return _make_trainer_config(
+        "deepseek_v4_1_flash_40layers_24experts_text",
+        parallelism=parallelism,
+        seq_len=seq_len,
+        hf_assets_path=hf_assets_path,
+        engram=engram,
+    )
 
 
 def deepseek_v4_1_debugmodel_multimodal(
     *,
     parallelism: ParallelismConfig | None = None,
-    hf_assets_path: str | None = None,
     seq_len: int | None = None,
-    mtp_isolate_gradients: bool = False,
+    hf_assets_path: str | None = None,
+    engram: EngramArgs | None = None,
 ) -> TrainerEx.Config:
     return _make_trainer_config(
         "deepseek_v4_1_debugmodel",
         parallelism=parallelism,
-        hf_assets_path=hf_assets_path,
         seq_len=seq_len,
-        mtp_isolate_gradients=mtp_isolate_gradients,
+        hf_assets_path=hf_assets_path,
+        engram=engram,
     )
 
 
-def deepseek_v4_1_debugmodel_multimodal_sft() -> TrainerEx.Config:
-    return _vision_sft_recipe("deepseek_v4_1_debugmodel")
+def deepseek_v4_1_debugmodel_multimodal_sft(
+    *,
+    parallelism: ParallelismConfig | None = None,
+    seq_len: int | None = None,
+    hf_assets_path: str | None = None,
+    engram: EngramArgs | None = None,
+) -> TrainerEx.Config:
+    return _vision_sft_recipe(
+        "deepseek_v4_1_debugmodel",
+        parallelism=parallelism,
+        seq_len=seq_len,
+        hf_assets_path=hf_assets_path,
+        engram=engram,
+    )
 
 
 def deepseek_v4_1_debugmodel_text(
     *,
     parallelism: ParallelismConfig | None = None,
-    hf_assets_path: str | None = None,
     seq_len: int | None = None,
-    mtp_isolate_gradients: bool = False,
+    hf_assets_path: str | None = None,
+    engram: EngramArgs | None = None,
 ) -> TrainerEx.Config:
     config = _make_trainer_config(
         "deepseek_v4_1_debugmodel_text",
         parallelism=parallelism,
-        hf_assets_path=hf_assets_path,
         seq_len=seq_len,
-        mtp_isolate_gradients=mtp_isolate_gradients,
+        hf_assets_path=hf_assets_path,
+        engram=engram,
     )
     config.hf_assets_path = hf_assets_path or os.environ.get("HF_ASSETS_PATH") or "tests/assets/deepseek_v3"
     return config
 
 
-def deepseek_v4_1_stripped() -> TrainerEx.Config:
+def deepseek_v4_1_stripped(
+    *,
+    parallelism: ParallelismConfig | None = None,
+    seq_len: int | None = None,
+    hf_assets_path: str | None = None,
+    engram: EngramArgs | None = None,
+) -> TrainerEx.Config:
     """The single-card flavor: debug widths, released indexer geometry, ten layers.
 
     See :func:`torchtitan_npu.models.deepseek_v4_1._stripped` for what is and is not
     shrunk; the point of the flavor is to reach all three branches of the fused selector
     on one card.
     """
-    return _make_trainer_config("deepseek_v4_1_stripped")
+    return _make_trainer_config(
+        "deepseek_v4_1_stripped", parallelism=parallelism, seq_len=seq_len, hf_assets_path=hf_assets_path, engram=engram
+    )
 
 
-def deepseek_v4_1_flash_lora() -> TrainerEx.Config:
-    return _make_lora_trainer_config("deepseek_v4_1_flash")
+def deepseek_v4_1_flash_lora(
+    *,
+    parallelism: ParallelismConfig | None = None,
+    seq_len: int | None = None,
+    hf_assets_path: str | None = None,
+    engram: EngramArgs | None = None,
+) -> TrainerEx.Config:
+    return _make_lora_trainer_config(
+        "deepseek_v4_1_flash", parallelism=parallelism, seq_len=seq_len, hf_assets_path=hf_assets_path, engram=engram
+    )
 
 
-def deepseek_v4_1_flash_text_lora() -> TrainerEx.Config:
-    return _make_lora_trainer_config("deepseek_v4_1_flash_text")
+def deepseek_v4_1_flash_text_lora(
+    *,
+    parallelism: ParallelismConfig | None = None,
+    seq_len: int | None = None,
+    hf_assets_path: str | None = None,
+    engram: EngramArgs | None = None,
+) -> TrainerEx.Config:
+    return _make_lora_trainer_config(
+        "deepseek_v4_1_flash_text",
+        parallelism=parallelism,
+        seq_len=seq_len,
+        hf_assets_path=hf_assets_path,
+        engram=engram,
+    )
 
 
-def deepseek_v4_1_flash_text_cp() -> TrainerEx.Config:
+def deepseek_v4_1_flash_text_cp(
+    *,
+    parallelism: ParallelismConfig | None = None,
+    seq_len: int | None = None,
+    hf_assets_path: str | None = None,
+    engram: EngramArgs | None = None,
+) -> TrainerEx.Config:
     raise NotImplementedError("Context parallelism is deferred in the v0.4 eager upgrade.")
 
 
-def deepseek_v4_1_debugmodel_lora() -> TrainerEx.Config:
-    return _make_lora_trainer_config("deepseek_v4_1_debugmodel_text")
+def deepseek_v4_1_debugmodel_lora(
+    *,
+    parallelism: ParallelismConfig | None = None,
+    seq_len: int | None = None,
+    hf_assets_path: str | None = None,
+    engram: EngramArgs | None = None,
+) -> TrainerEx.Config:
+    return _make_lora_trainer_config(
+        "deepseek_v4_1_debugmodel_text",
+        parallelism=parallelism,
+        seq_len=seq_len,
+        hf_assets_path=hf_assets_path,
+        engram=engram,
+    )
 
 
-def _make_lora_trainer_config(flavor: str) -> TrainerEx.Config:
+def _make_lora_trainer_config(
+    flavor: str,
+    *,
+    parallelism: ParallelismConfig | None = None,
+    seq_len: int | None = None,
+    hf_assets_path: str | None = None,
+    engram: EngramArgs | None = None,
+) -> TrainerEx.Config:
     from torchtitan.config.transform import apply_transforms
 
     from torchtitan_npu.models.common.deepseek_lora import deepseek_v4_lora_transform
 
-    config = _make_trainer_config(flavor)
+    config = _make_trainer_config(
+        flavor, parallelism=parallelism, seq_len=seq_len, hf_assets_path=hf_assets_path, engram=engram
+    )
     config.optim.optimizer = OptimizerConfig(
         _optimizer_defaults={"AdamW": [AdamW.Config(pattern=r".*", lr=1e-5, eps=1e-6)]},
     )
@@ -378,46 +577,92 @@ def _make_lora_trainer_config(flavor: str) -> TrainerEx.Config:
     return config
 
 
-def deepseek_v4_1_flash_cpt() -> TrainerEx.Config:
+def deepseek_v4_1_flash_cpt(
+    *,
+    parallelism: ParallelismConfig | None = None,
+    seq_len: int | None = None,
+    hf_assets_path: str | None = None,
+    engram: EngramArgs | None = None,
+) -> TrainerEx.Config:
     """Launch recipe with explicit compilation and checkpoint policy."""
-    config = deepseek_v4_1_flash()
+    config = deepseek_v4_1_flash(parallelism=parallelism, seq_len=seq_len, hf_assets_path=hf_assets_path, engram=engram)
     config.compile = CompileConfig(components=[], model=ModelCompileConfig())
     # The registered converter promotes this upstream schema before CLI parsing.
     cast("Trainer.Config", config).checkpointer = CheckpointManager.Config(load_only=True)
     return config
 
 
-def deepseek_v4_1_flash_40layers_16experts_multimodal_compiled() -> TrainerEx.Config:
+def deepseek_v4_1_flash_40layers_16experts_multimodal_compiled(
+    *,
+    parallelism: ParallelismConfig | None = None,
+    seq_len: int | None = None,
+    hf_assets_path: str | None = None,
+    engram: EngramArgs | None = None,
+) -> TrainerEx.Config:
     """Launch recipe with explicit compilation and checkpoint policy."""
-    config = deepseek_v4_1_flash_40layers_16experts_multimodal()
+    config = deepseek_v4_1_flash_40layers_16experts_multimodal(
+        parallelism=parallelism, seq_len=seq_len, hf_assets_path=hf_assets_path, engram=engram
+    )
     config.compile = CompileConfig(components=[], model=ModelCompileConfig())
     return config
 
 
-def deepseek_v4_1_flash_40layers_24experts_multimodal_compiled() -> TrainerEx.Config:
+def deepseek_v4_1_flash_40layers_24experts_multimodal_compiled(
+    *,
+    parallelism: ParallelismConfig | None = None,
+    seq_len: int | None = None,
+    hf_assets_path: str | None = None,
+    engram: EngramArgs | None = None,
+) -> TrainerEx.Config:
     """Launch recipe with explicit compilation and checkpoint policy."""
-    config = deepseek_v4_1_flash_40layers_24experts_multimodal()
+    config = deepseek_v4_1_flash_40layers_24experts_multimodal(
+        parallelism=parallelism, seq_len=seq_len, hf_assets_path=hf_assets_path, engram=engram
+    )
     config.compile = CompileConfig(components=[], model=ModelCompileConfig())
     return config
 
 
-def deepseek_v4_1_flash_sft_compiled() -> TrainerEx.Config:
+def deepseek_v4_1_flash_sft_compiled(
+    *,
+    parallelism: ParallelismConfig | None = None,
+    seq_len: int | None = None,
+    hf_assets_path: str | None = None,
+    engram: EngramArgs | None = None,
+) -> TrainerEx.Config:
     """Launch the native SFT recipe with explicit model compilation."""
-    config = deepseek_v4_1_flash_sft()
+    config = deepseek_v4_1_flash_sft(
+        parallelism=parallelism, seq_len=seq_len, hf_assets_path=hf_assets_path, engram=engram
+    )
     config.compile = CompileConfig(components=[], model=ModelCompileConfig())
     cast("Trainer.Config", config).checkpointer = CheckpointManager.Config(load_only=True)
     return config
 
 
-def deepseek_v4_1_flash_40layers_16experts_multimodal_sft_compiled() -> TrainerEx.Config:
+def deepseek_v4_1_flash_40layers_16experts_multimodal_sft_compiled(
+    *,
+    parallelism: ParallelismConfig | None = None,
+    seq_len: int | None = None,
+    hf_assets_path: str | None = None,
+    engram: EngramArgs | None = None,
+) -> TrainerEx.Config:
     """Launch the native SFT recipe with explicit model compilation."""
-    config = deepseek_v4_1_flash_40layers_16experts_multimodal_sft()
+    config = deepseek_v4_1_flash_40layers_16experts_multimodal_sft(
+        parallelism=parallelism, seq_len=seq_len, hf_assets_path=hf_assets_path, engram=engram
+    )
     config.compile = CompileConfig(components=[], model=ModelCompileConfig())
     return config
 
 
-def deepseek_v4_1_flash_40layers_24experts_multimodal_sft_compiled() -> TrainerEx.Config:
+def deepseek_v4_1_flash_40layers_24experts_multimodal_sft_compiled(
+    *,
+    parallelism: ParallelismConfig | None = None,
+    seq_len: int | None = None,
+    hf_assets_path: str | None = None,
+    engram: EngramArgs | None = None,
+) -> TrainerEx.Config:
     """Launch the native SFT recipe with explicit model compilation."""
-    config = deepseek_v4_1_flash_40layers_24experts_multimodal_sft()
+    config = deepseek_v4_1_flash_40layers_24experts_multimodal_sft(
+        parallelism=parallelism, seq_len=seq_len, hf_assets_path=hf_assets_path, engram=engram
+    )
     config.compile = CompileConfig(components=[], model=ModelCompileConfig())
     return config

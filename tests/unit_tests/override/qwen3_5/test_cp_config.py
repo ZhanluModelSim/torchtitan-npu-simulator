@@ -4,9 +4,9 @@
 import torch
 from torchtitan.config import ConfigManager
 from torchtitan.config.override import apply_overrides
+from torchtitan.models.base.module import Module
 from torchtitan.models.common.attention import VarlenAttentionMetadata
 from torchtitan.models.common.cp_attention import CPInnerAttention
-from torchtitan.models.base.module import Module
 
 from torchtitan_npu.override.qwen3_5.gated_delta import ContextParallelGatedDeltaNet
 from torchtitan_npu.override.qwen3_5.varlen_attention import AscVarlenInnerAttention
@@ -23,7 +23,6 @@ def test_long_text_cli_keeps_cp_and_selects_typed_cp_attention_and_gdn():
             "/tmp",
         ]
     )
-    config.model.update_from_config(config=config)
     apply_overrides(config.override, config)
     assert config.parallelism.context_parallel_degree == 4
     configs = [cfg for _, cfg, _, _ in config.model.traverse(Module.Config, recurse=True)]

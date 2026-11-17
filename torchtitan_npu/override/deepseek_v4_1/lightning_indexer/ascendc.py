@@ -229,9 +229,7 @@ class AscSelector(Selector):
     contract rather than this pair's.
 
     It is the consumer half of the teacher pair: ``sparse_attn.asc`` emits the teacher on
-    ``topk_scores``' gradient and this backward is what reads it, so the two overrides are
-    requested together or not at all -- see
-    :func:`torchtitan_npu.models.deepseek_v4_1.model._check_indexer_teacher_pair`.
+    ``topk_scores``' gradient and this backward is what reads it, so training requires both overrides.
     """
 
     @dataclass(kw_only=True, slots=True)

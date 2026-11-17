@@ -471,6 +471,7 @@ def test_v41_teacher_pair_survives_each_supported_switch_combination(
 
     from torchtitan_npu.config.configs import QuantizationExtensionConfig
     from torchtitan_npu.models.deepseek_v4_1 import model_registry
+    from torchtitan_npu.models.deepseek_v4_1.indexer import Selector
 
     converted = converter_module.apply_quantization_converter(
         model_registry("deepseek_v4_1_debugmodel"),
@@ -503,8 +504,9 @@ def test_v41_teacher_pair_survives_each_supported_switch_combination(
         if inner_attention.compress_ratio > 0:
             # The trainer discovers instances, not configs, to assign the step denominator.
             selector_module = selector.build()
-            assert isinstance(selector_module, converter_module.DeepSeekV41Selector)
+            assert isinstance(selector_module, Selector)
             assert selector_module.num_global_queries is None
+
 
 
 @pytest.mark.parametrize("li_quantization", ["mxfp8", "fp8", "hif8"])

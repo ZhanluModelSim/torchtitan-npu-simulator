@@ -18,7 +18,6 @@ from torchtitan.components.optim import LRSchedulersContainer
 from torchtitan.config import derive
 from torchtitan.config.override import OverrideImport
 from torchtitan.config.parallelism import ParallelismConfig
-from torchtitan.models.common.rope import RoPE
 
 from torchtitan_npu.config import CompileConfig, ModelCompileConfig, OptimizerConfig
 from torchtitan_npu.config.configs import ProfilerExtensionConfig
@@ -26,7 +25,7 @@ from torchtitan_npu.extensions.torchtitan.components.checkpoint import Checkpoin
 from torchtitan_npu.extensions.torchtitan.tools.profiler import CANNProfiler
 from torchtitan_npu.extensions.torchtitan.trainer import TrainerEx
 from torchtitan_npu.models.common.alignment import AlignedTextProcessor
-from torchtitan_npu.models.deepseek_v4_1 import _attach_engram, _flash_engram_geometry
+from torchtitan_npu.models.deepseek_v4_1 import EngramArgs, _flash_engram_geometry
 from torchtitan_npu.models.deepseek_v4_1.model import DeepSeekV41Model
 from torchtitan_npu_recipes.models import deepseek_v4_1 as models
 
@@ -45,8 +44,7 @@ def _world_size(*, local_processes: int, nodes: int) -> int:
     return int(os.environ.get("NGPU", local_processes)) * int(os.environ.get("NNODES", node_count))
 
 
-def _set_topology(
-    config: TrainerEx.Config,
+def _topology(
     *,
     local_processes: int,
     nodes: int,
@@ -54,22 +52,19 @@ def _set_topology(
     expert_degree: int,
     context_degree: int = 1,
     configurable: bool = False,
-) -> None:
+) -> ParallelismConfig:
     if configurable:
         shard_degree = int(os.environ.get("DP_SHARD", shard_degree))
         expert_degree = int(os.environ.get("EP", expert_degree))
         context_degree = int(os.environ.get("CP", context_degree))
     world_size = _world_size(local_processes=local_processes, nodes=nodes)
-    assert isinstance(config.model, DeepSeekV41Model.Config)
-    num_experts = config.model.layers[0].feed_forward.num_experts
     if (
         min(world_size, shard_degree, expert_degree, context_degree) <= 0
         or world_size % (shard_degree * context_degree)
         or world_size % expert_degree
-        or num_experts % expert_degree
     ):
         raise ValueError("WORLD_SIZE must form complete DP/CP/EP groups, and EP must divide the model's expert count")
-    config.parallelism = ParallelismConfig(
+    return ParallelismConfig(
         data_parallel_shard_degree=shard_degree,
         data_parallel_replicate_degree=world_size // (shard_degree * context_degree),
         expert_parallel_degree=expert_degree,
@@ -83,10 +78,8 @@ def _set_topology(
 
 def _set_context(config: TrainerEx.Config, *, sequence_length: int, token_budget: int, steps: int) -> None:
     assert isinstance(config.model, DeepSeekV41Model.Config)
-    config.model.max_context_length = sequence_length
-    for _, rope, _, _ in config.model.traverse(RoPE.Config):
-        rope.max_context_length = sequence_length
-    config.training.max_context_length = sequence_length
+    if config.model.max_context_length != sequence_length:
+        raise ValueError("Construct the model with the training sequence length")
     config.training.num_tokens_per_microbatch_per_dp_rank = sequence_length
     config.training.num_tokens_per_train_step = token_budget
     config.training.steps = steps
@@ -161,9 +154,21 @@ def _overrides(*, a5: bool, debug: bool, swap: bool = True, qat: bool = False) -
     return result
 
 
-def _sft(flavor: str, *, checkpoint: bool) -> TrainerEx.Config:
+def _sft(
+    flavor: str,
+    *,
+    checkpoint: bool,
+    parallelism: ParallelismConfig,
+    seq_len: int,
+    hf_assets_path: str,
+    engram: EngramArgs | None = None,
+) -> TrainerEx.Config:
     config = models.deepseek_v4_1_vision_sft(
         flavor=flavor,
+        parallelism=parallelism,
+        seq_len=seq_len,
+        hf_assets_path=hf_assets_path,
+        engram=engram,
         dataset_path=os.environ.get("DSV41_SFT_DATASET") or os.environ.get("DATASET_PATH") or "/path/to/train.jsonl",
         image_root=models._vision_sft_env("IMAGE_ROOT", ""),
         thinking_mode=models._vision_sft_thinking_mode(),
@@ -179,25 +184,26 @@ def _sft(flavor: str, *, checkpoint: bool) -> TrainerEx.Config:
 
 def _debug(*, a5: bool, sft: bool = False, qat: bool = False) -> TrainerEx.Config:
     _reject_legacy_overrides()
+    parallelism = _topology(local_processes=8, nodes=1, shard_degree=8, expert_degree=8)
+    geometry = _flash_engram_geometry()
+    table_rows = int(os.environ.get("TORCHTITAN_ENGRAM_TABLE_ROWS", "100000"))
+    options = dict(
+        engram=replace(geometry, vocab_size_per_ngram=(table_rows,) * len(geometry.vocab_size_per_ngram)),
+        parallelism=parallelism,
+        seq_len=4096,
+        hf_assets_path=os.environ.get("HF_ASSETS_PATH", "/path/to/DeepSeekV41_tokenizer"),
+    )
     if sft:
         flavor = (
             "deepseek_v4_1_flash_40layers_24experts_multimodal"
             if a5
             else "deepseek_v4_1_flash_40layers_16experts_vision"
         )
-        config = _sft(flavor, checkpoint=False)
+        config = _sft(flavor, checkpoint=False, **options)
     elif a5:
-        config = models.deepseek_v4_1_flash_40layers_24experts_multimodal_compiled()
+        config = models.deepseek_v4_1_flash_40layers_24experts_multimodal_compiled(**options)
     else:
-        config = models.deepseek_v4_1_flash_40layers_16experts_multimodal_compiled()
-    assert isinstance(config.model, DeepSeekV41Model.Config)
-    geometry = _flash_engram_geometry()
-    table_rows = int(os.environ.get("TORCHTITAN_ENGRAM_TABLE_ROWS", "100000"))
-    _attach_engram(
-        config.model,
-        replace(geometry, vocab_size_per_ngram=(table_rows,) * len(geometry.vocab_size_per_ngram)),
-    )
-    _set_topology(config, local_processes=8, nodes=1, shard_degree=8, expert_degree=8)
+        config = models.deepseek_v4_1_flash_40layers_16experts_multimodal_compiled(**options)
     _set_context(config, sequence_length=4096, token_budget=32768, steps=40)
     _set_muon(config)
     _set_schedule(config)
@@ -219,20 +225,24 @@ def _debug(*, a5: bool, sft: bool = False, qat: bool = False) -> TrainerEx.Confi
 
 def _full(*, a5: bool, sft: bool = False, lora: bool = False) -> TrainerEx.Config:
     _reject_legacy_overrides()
-    if sft:
-        config = _sft("deepseek_v4_1_flash", checkpoint=True)
-    elif lora:
-        config = models.deepseek_v4_1_flash_lora()
-    else:
-        config = models.deepseek_v4_1_flash_cpt()
-    _set_topology(
-        config,
+    parallelism = _topology(
         local_processes=8 if a5 else 16,
         nodes=16 if a5 else 8,
         shard_degree=128,
         expert_degree=128,
         configurable=True,
     )
+    options = dict(
+        parallelism=parallelism,
+        seq_len=4096,
+        hf_assets_path=os.environ.get("HF_ASSETS_PATH", "/path/to/DeepSeekV41_tokenizer"),
+    )
+    if sft:
+        config = _sft("deepseek_v4_1_flash", checkpoint=True, **options)
+    elif lora:
+        config = models.deepseek_v4_1_flash_lora(**options)
+    else:
+        config = models.deepseek_v4_1_flash_cpt(**options)
     _set_context(config, sequence_length=4096, token_budget=4194304, steps=int(os.environ.get("STEPS", "100")))
     _set_muon(config)
     _set_schedule(config)
@@ -299,8 +309,11 @@ def deepseek_v4_1_flash_sft_4k_a5() -> TrainerEx.Config:
 
 def deepseek_v4_1_mini_1p_cpt_a5() -> TrainerEx.Config:
     _reject_legacy_overrides()
-    config = models.deepseek_v4_1_stripped()
-    _set_topology(config, local_processes=1, nodes=1, shard_degree=1, expert_degree=1)
+    config = models.deepseek_v4_1_stripped(
+        parallelism=_topology(local_processes=1, nodes=1, shard_degree=1, expert_degree=1),
+        seq_len=2048,
+        hf_assets_path=os.environ.get("HF_ASSETS_PATH", "tests/assets/deepseek_v3"),
+    )
     _set_context(config, sequence_length=2048, token_budget=2048, steps=int(os.environ.get("STEPS", "5")))
     config.hf_assets_path = os.environ.get("HF_ASSETS_PATH", "tests/assets/deepseek_v3")
     config.override.imports = [
@@ -318,10 +331,7 @@ def deepseek_v4_1_mini_1p_cpt_a5() -> TrainerEx.Config:
 def deepseek_v4_1_flash_cpt_1m_a5() -> TrainerEx.Config:
     """Declare the long-context CP configuration; the model still rejects unsupported CP."""
     _reject_legacy_overrides()
-    config = models.deepseek_v4_1_flash_text()
-    config = derive(config, type(config), engram_enabled=False)
-    _set_topology(
-        config,
+    parallelism = _topology(
         local_processes=8,
         nodes=16,
         shard_degree=1,
@@ -329,6 +339,12 @@ def deepseek_v4_1_flash_cpt_1m_a5() -> TrainerEx.Config:
         context_degree=128,
         configurable=True,
     )
+    config = models.deepseek_v4_1_flash_text(
+        parallelism=parallelism,
+        seq_len=1048576,
+        hf_assets_path=os.environ.get("HF_ASSETS_PATH", "/path/to/DeepSeekV41_tokenizer"),
+    )
+    config = derive(config, type(config), engram_enabled=False)
     _set_context(config, sequence_length=1048576, token_budget=1048576, steps=int(os.environ.get("STEPS", "10")))
     _set_muon(config)
     _set_schedule(config)

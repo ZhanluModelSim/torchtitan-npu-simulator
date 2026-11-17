@@ -79,7 +79,7 @@ DeepSeek-V4 的默认 recipe 使用 `MTPChunkedLossWrapper`。它继承并逐预
 
 已启用 MTP 的 recipe 可通过 `--loss.mtp-isolate-gradients` 开启梯度隔离，默认关闭。该开关截断主干 hidden state 到 MTP 的梯度，并阻止 MTP 更新共享 token Embedding 和 LM head；LM head 仍向 MTP hidden state 传递梯度，主预测正常更新共享参数。前向输出和 loss 计算公式不变，checkpoint 参数名称与形状不变。
 
-`mtp_isolate_gradients` 在 `MTPChunkedLossWrapper.Config` 中配置，模型在 `update_from_config` 时读取同一设置，统一控制三处梯度边界。
+recipe 使用同一个 `mtp_isolate_gradients` 值构造模型和 `MTPChunkedLossWrapper.Config`，统一控制三处梯度边界；模型不读取 Trainer 配置。
 
 此开关适用于原生 Linear LM head 和 `MTPChunkedLossWrapper`。仅隔离直接梯度，仍使用现有全局梯度裁剪，主模型与 MTP 的裁剪系数仍然关联。
 

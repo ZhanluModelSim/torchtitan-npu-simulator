@@ -33,7 +33,7 @@ patches → config → extensions → ops
 - `config/` 当前通过导入 `manager` 安装 `ConfigLoader._load_config` wrapper；该副作用服务于现有配置转换，尚未迁入 extension 激活入口。
 - `override/` 不是自动导入层；它由 `override.imports` 显式选择。
 - GraphTrainer extension 不再由包入口自动导入；后置功能不能阻断 eager 入口。
-- `TrainerEx` 复用上游 `Trainer` 的 `model_config.update_from_config(config=...)` 生命周期；模型准备逻辑由模型配置拥有，extension 不直接导入模型。
+- recipe 先确定最终并行度、序列长度和资产路径，再由模型 registry 构造完整配置与分片声明；`TrainerEx` 沿用上游复制、override 和校验顺序，extension 不直接导入模型或补齐模型配置。
 - 收敛为 `patches → extensions` 是后续目标。当前 `config` 和 `ops` 仍由包入口导入，不能把目标顺序写成已实现行为。
 - `TORCHTITAN_NPU_DISABLE_EXTENSIONS` 和 `TORCHTITAN_NPU_DISABLE_COMPONENTS` 是未实现的目标加载接口，当前不能作为运行时配置使用；实现状态见 [extensions 规则](extensions/AGENTS.md)。
 

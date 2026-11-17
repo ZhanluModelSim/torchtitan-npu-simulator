@@ -10,9 +10,8 @@ The input must use Hugging Face tensor names and BF16 Safetensors. The current
 stacks per-expert weights. The resulting DCP uses the current routed-expert
 schema::
 
-    layers.N.moe.routed_experts.inner_experts.w1_EFD
-    layers.N.moe.routed_experts.inner_experts.w2_EDF
-    layers.N.moe.routed_experts.inner_experts.w3_EFD
+    layers.N.feed_forward.routed_experts.w13.weight
+    layers.N.feed_forward.routed_experts.w2.weight
 
 Run from the repository root. Tensor conversion and DCP writing use CPU memory;
 the Python environment must still be able to import TorchTitan and torchtitan-npu.
@@ -34,9 +33,9 @@ from safetensors import safe_open
 
 from scripts.numerical_alignment.deepseek_v4 import config as dsv4_config
 
-_CURRENT_MOE_PREFIX = ".moe.routed_experts.inner_experts."
-_LEGACY_MOE_PREFIX = ".moe.experts."
-_EXPERT_WEIGHTS = ("w1_EFD", "w2_EDF", "w3_EFD")
+_CURRENT_MOE_PREFIX = ".feed_forward.routed_experts."
+_LEGACY_MOE_PREFIX = ".moe."
+_EXPERT_WEIGHTS = ("w13.weight", "w2.weight")
 
 
 def _keep_hf_key(key: str, n_layers: int) -> bool:
@@ -63,11 +62,9 @@ def _validate_converted_state_dict(
 
     for layer_id, layer in enumerate(model_config.layers):
         key = f"layers.{layer_id}.attention.wo_a.weight"
-        cfg = layer.attention.wo_a
-        # ``wo_a`` uses the flattened BatchedLinear layout ``[n_heads * out, in]``
-        # (torchtitan_npu/patches/torchtitan/models/common/linear.py); HF stores
-        # the same per-group matrices already flattened across group and output.
-        expected_shape = (cfg.n_heads * cfg.out_features, cfg.in_features)
+        # Build only this projection on meta to validate its configured layout.
+        with torch.device("meta"):
+            expected_shape = tuple(layer.attention.wo_a.build().weight.shape)
         actual_shape = tuple(state_dict[key].shape)
         if actual_shape != expected_shape:
             raise RuntimeError(f"converted {key} has shape {actual_shape}; expected {expected_shape}")
@@ -134,7 +131,7 @@ def convert_hf_to_dcp(
     )
 
     config = dsv4_config.build_torchtitan_config(model_flavor)
-    model_config = config.model_spec.model
+    model_config = config.model
     if output_dir.exists() and any(output_dir.iterdir()):
         raise FileExistsError(f"output directory is not empty: {output_dir}")
 

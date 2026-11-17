@@ -6,11 +6,11 @@
 import pytest
 import torch
 
+from torchtitan_npu.models.deepseek_v4_1.model import DeepSeekV41MultimodalModel
 from torchtitan_npu_recipes.models.deepseek_v4_1 import (
     deepseek_v4_1_debugmodel_multimodal,
     deepseek_v4_1_debugmodel_text,
 )
-from torchtitan_npu.models.deepseek_v4_1.model import DeepSeekV41MultimodalModel
 
 
 @pytest.mark.parametrize(
@@ -21,7 +21,6 @@ from torchtitan_npu.models.deepseek_v4_1.model import DeepSeekV41MultimodalModel
 def test_debug_recipe_builds_with_token_budget_and_selective_fp32_parameters(factory, expected_multimodal):
     config = factory()
     config.hf_assets_path = "tests/assets/deepseek_v3"
-    config.model.update_from_config(config=config)
 
     with torch.random.fork_rng(devices=[]), torch.device("meta"):
         model = config.model.build()

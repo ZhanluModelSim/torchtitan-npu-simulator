@@ -32,7 +32,8 @@ python -m torchtitan_npu.train \
 
 NPU DeepEP dispatcher 与上游 `moe_comm_backend="deepep"` 配置绑定。模型配置选择
 `deepep` 后，显式启用以下 override 即可；`hidden_dim` 和
-`num_max_tokens_per_rank` 会由 `update_from_config()` 根据模型及训练形状填充。
+`num_max_tokens_per_rank` 由 recipe 根据最终 token budget 和 CP×TP 确定，再通过上游
+`TokenDispatcherTransform` 在构造阶段填入；容量不足时明确报错。
 
 ```bash
 --override.imports \
@@ -49,8 +50,8 @@ cfg.override.imports = [
 
 ## 应用过程
 
-TorchTitan 在模型配置执行 `update_from_config()` 后、任何组件执行 `build()` 前应用
-override：
+recipe 在模型 registry 中完成分片声明，并应用配置变换。上游 Trainer 复制模型配置后、
+任何组件执行 `build()` 前应用 override；转换与替换必须保留分片声明和精度字段：
 
 1. 导入条目对应的模块，触发 `@override` 注册。
 2. 按 `module.function` 解析本次启用的工厂函数。
@@ -504,10 +505,7 @@ lightning_indexer
 #### indexer 只在两个 override 同开时学习
 
 `sparse_attn.asc` 与 `lightning_indexer.asc` 各自替换独立的配置节点，但**必须同时启用**：
-配置阶段（`update_from_config`）会检查这一对，只开其中一个直接报 `ValueError`，不会进入
-训练。检查按本次运行**请求的 override 列表**判定——该阶段在 `apply_overrides` 之前，能看到的
-就是请求本身；两个名字写在 `torchtitan_npu/models/deepseek_v4_1/model.py` 的
-`_FUSED_ATTENTION_OVERRIDES` 中，改名需要同步。
+配置需保证两者配套；模型构建入口不再检查 teacher 配对。当前模型并行入口仅接受 TP=CP=PP=1。
 
 原因是 indexer 的训练目标只存在于两个 kernel 反向之间：
 

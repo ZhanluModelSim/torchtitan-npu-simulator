@@ -13,8 +13,8 @@ from torchtitan.distributed import fsdp as upstream_fsdp
 
 from torchtitan_npu.extensions.torchtitan.distributed import fsdp as npu_fsdp
 from torchtitan_npu.models.deepseek_v4_1 import parallelize
-from torchtitan_npu_recipes.models.deepseek_v4_1 import deepseek_v4_1_debugmodel_text
 from torchtitan_npu.models.deepseek_v4_1.engram.host import HostEngramTable
+from torchtitan_npu_recipes.models.deepseek_v4_1 import deepseek_v4_1_debugmodel_text
 
 
 @pytest.mark.parametrize("engram_enabled", (False, True), ids=("decoder", "host-engram"))
@@ -25,7 +25,6 @@ def test_recipe_fp32_parameters_reach_every_shard_with_checkpoint_wrapping(
     if not engram_enabled:
         config = derive(config, type(config), engram_enabled=False)
     config.hf_assets_path = "tests/assets/deepseek_v3"
-    config.model.update_from_config(config=config)
     with torch.random.fork_rng(devices=[]), torch.device("meta"):
         model = config.model.build()
     # One wrapped block and the remaining plain blocks exercise the same logical policy.

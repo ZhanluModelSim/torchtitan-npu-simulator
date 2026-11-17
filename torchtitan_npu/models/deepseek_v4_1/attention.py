@@ -66,9 +66,7 @@ class CompressedSparseInnerAttention2(InnerAttention):
     document boundaries into its kernel layout -- so it is never guessed from shapes.
 
     A port that can produce the indexer's teacher replaces this forward wholesale and
-    emits it on ``topk_scores``' gradient; this core has no kernel to make one.  Which port
-    is in place is read off the requested overrides, one stage earlier, by
-    :func:`torchtitan_npu.models.deepseek_v4_1.model._check_indexer_teacher_pair`.
+    emits it on ``topk_scores``' gradient; this core has no kernel to make one.
     """
 
     @dataclass(kw_only=True, slots=True)

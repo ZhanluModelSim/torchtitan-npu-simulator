@@ -19,9 +19,9 @@ from PIL import Image
 from torchtitan.components.data import GrainDataLoader
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
 
-from torchtitan_npu_recipes.models.deepseek_v4_1 import deepseek_v4_1_debugmodel_multimodal
 from torchtitan_npu.models.deepseek_v4_1.vision.data import IMAGE_END, IMAGE_START, ImagePatchProcessor
 from torchtitan_npu.models.deepseek_v4_1.vision.dataloader import _process_mm_sample, caption_dataloader_config
+from torchtitan_npu_recipes.models.deepseek_v4_1 import deepseek_v4_1_debugmodel_multimodal
 
 ASSETS = Path(__file__).resolve().parents[3] / "assets"
 
@@ -193,7 +193,6 @@ def test_empty_caption_is_filtered_before_packing(tokenizer):
 
 def test_packed_vision_batch_reaches_folded_attention_metadata(tokenizer, single_rank_spmd):
     recipe = deepseek_v4_1_debugmodel_multimodal()
-    recipe.model.update_from_config(config=recipe)
     with torch.device("meta"):
         model = recipe.model.build()
     loader = _loader(tokenizer, packing=4)

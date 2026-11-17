@@ -44,7 +44,7 @@ __all__ = [
 ]
 
 
-def build_torchtitan_config(model_flavor: str):
+def build_torchtitan_config(model_flavor: str, *, seq_len: int = 4096):
     """Build the registered TorchTitan config for one DSV4 flavor."""
 
     from torchtitan_npu_recipes.models import deepseek_v4 as config_registry
@@ -58,7 +58,7 @@ def build_torchtitan_config(model_flavor: str):
     # view built by ``hf_model`` also sets ``num_nextn_predict_layers=0``;
     # keeping both sides on the same main decoder avoids constructing an
     # unused extra MoE layer and keeps the checkpoint/output contracts equal.
-    return getattr(config_registry, factory_name)(num_mtp_layers=0)
+    return getattr(config_registry, factory_name)(num_mtp_layers=0, seq_len=seq_len)
 
 
 def truncate_model_config(model_config, n_layers: int) -> None:
@@ -90,16 +90,15 @@ def configure_reduced_moe(
         raise ValueError(f"n_hash_layers must be in [0, {len(model_config.layers)}], got {n_hash_layers}")
 
     for layer_id, layer in enumerate(model_config.layers):
-        moe = layer.moe
-        if moe is None:
-            continue
+        moe = layer.feed_forward
         moe.num_experts = num_experts
         moe.router.num_experts = num_experts
         moe.router.gate.out_features = num_experts
         moe.router.top_k = top_k
         moe.router.layer_id = layer_id
         moe.router.n_hash_layers = n_hash_layers
-        moe.routed_experts.inner_experts.num_experts = num_experts
+        moe.routed_experts.w13.group_size = num_experts
+        moe.routed_experts.w2.group_size = num_experts
         moe.routed_experts.token_dispatcher.num_experts = num_experts
         moe.routed_experts.token_dispatcher.top_k = top_k
 

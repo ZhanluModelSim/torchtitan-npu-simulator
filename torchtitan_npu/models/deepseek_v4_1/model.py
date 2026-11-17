@@ -38,9 +38,8 @@ description.
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, ClassVar, cast
+from typing import TYPE_CHECKING, cast
 
 import torch
 import torch_remat as remat
@@ -303,59 +302,6 @@ def _layer_attention_metadata(attention_metadata: AttentionMetadataMap, layer: n
     return cast("DeepSeekV41Metadata", metadata)
 
 
-# The two ports that, together, make V4.1's fused attention: the core emits the indexer's
-# teacher on ``topk_scores``' gradient and the selector consumes it.  Both gates below read
-# the override list a run requests -- the config stage runs before ``apply_overrides``
-# installs them, so the request is what this stage has.
-_FUSED_ATTENTION_OVERRIDES = (
-    "torchtitan_npu.override.deepseek_v4_1.sparse_attn.asc",
-    "torchtitan_npu.override.deepseek_v4_1.lightning_indexer.asc",
-)
-
-
-def _requested_fused_attention(override) -> tuple[bool, bool]:
-    """``(fused core, fused selector)``, as the run's overrides request them."""
-    requested = {entry if isinstance(entry, str) else entry[0] for entry in override.imports or ()}
-    core, selector = _FUSED_ATTENTION_OVERRIDES
-    return core in requested, selector in requested
-
-
-def _check_indexer_teacher_pair(fused_core: bool, fused_selector: bool) -> None:
-    """The fused indexer teacher is a pair: one port emits it, one consumes it.
-
-    ``topk_scores`` is carried only between the two kernel backwards.  The emitting port
-    writes the raw teacher on ``topk_scores``' gradient; the consuming selector is the only
-    thing that ever reads that edge.  Fusing one side alone therefore breaks the objective --
-    silently, since neither half raises on its own -- so the mismatch is rejected here instead
-    of being discovered from a flat training curve.
-
-    Neither half is a usable fallback:
-
-    - Selector without the fused core: ``topk_scores``' gradient is ``None``, so SLIKG
-      returns zero gradient and the indexer never updates.
-    - Fused core without the fused selector: the reference selector does pick the teacher up
-      off that edge, but it applies attention-level marginals to summed per-head indexer
-      logits.  The two sides are not the same quantity, so the resulting training signal is
-      wrong rather than merely different.
-
-    The check reads the *requested* overrides rather than the attention they install, because
-    the request is what this stage has -- and renaming a port means renaming it here too.
-    """
-    if fused_core == fused_selector:
-        return
-    if fused_core:
-        active, missing = "sparse_attn.asc", "lightning_indexer.asc"
-        consequence = "the reference selector would take the teacher onto summed per-head logits"
-    else:
-        active, missing = "lightning_indexer.asc", "sparse_attn.asc"
-        consequence = "topk_scores would carry no teacher"
-    raise ValueError(
-        f"A fused V4.1 attention core and a fused selector must be enabled together: {active} is "
-        f"active without {missing}, so {consequence} and the indexer cannot be trained correctly. "
-        "Enable both or neither. See torchtitan_npu/override/README.md#deepseek-v41."
-    )
-
-
 class DeepSeekV41Model(GeometryAttentionMetadataMixin, Decoder):
     """DeepSeek-V4.1 text backbone: CSA2 policy over the packed varlen contract.
 
@@ -364,6 +310,24 @@ class DeepSeekV41Model(GeometryAttentionMetadataMixin, Decoder):
     :class:`DeepSeekV41MultimodalModel`, which only changes how the input embeddings are
     built and whether an ``image_mask`` reaches the blocks.
     """
+
+    supports_pipeline_parallel = False
+
+    def parallelize(self, **kwargs):
+        from torchtitan_npu.models.common.moe import validate_dispatcher_capacity
+
+        parallelism = kwargs["parallelism"]
+        if (
+            parallelism.tensor_parallel_degree != 1
+            or parallelism.context_parallel_degree != 1
+            or parallelism.pipeline_parallel_degree != 1
+        ):
+            raise NotImplementedError("DeepSeek V4.1 currently supports TP=CP=PP=1 only")
+        for layer in self.config.layers:
+            if layer.engram is not None and layer.engram.table.num_embeddings % parallelism.expert_parallel_degree:
+                raise ValueError("Engram physical table size must be divisible by EP degree")
+        validate_dispatcher_capacity(self.config, training=kwargs["training"], parallelism=parallelism)
+        return super().parallelize(**kwargs)
 
     @classmethod
     def _register_optimizer_hooks(cls, optimizers, model_parts, parallelism_context):
@@ -388,14 +352,6 @@ class DeepSeekV41Model(GeometryAttentionMetadataMixin, Decoder):
 
     @dataclass(kw_only=True, slots=True)
     class Config(Decoder.Config):
-        # Whether this stack can run under context parallelism: the text stack is the one
-        # the CP layout is being built for, and the multimodal config overrides this to
-        # ``False`` until the vision path has a CP story.
-        #
-        # The flag lives on the config because the gate that reads it runs on the config
-        # tree, before any module exists.
-        accepts_context_parallel: ClassVar[bool] = True
-
         n_layers: int
         hc_mult: int = 4
         compress_ratios: tuple[int, ...]
@@ -407,143 +363,9 @@ class DeepSeekV41Model(GeometryAttentionMetadataMixin, Decoder):
         fp32_param_patterns: tuple[str, ...] = ()
         """Parameter name patterns retained in FP32 under FSDP mixed precision."""
 
-        def update_from_config(self, *, config, **kwargs) -> None:
-            from torchtitan.models.common.linear import Linear
-
-            for _, linear, _, _ in self.traverse(Linear.Config):
-                linear.inplace_wgrad_accum = False
-            parallelism = config.parallelism
-            if parallelism.tensor_parallel_degree != 1:
-                raise NotImplementedError("DeepSeek V4.1 currently supports TP=1 only")
-            pp = parallelism.pipeline_parallel_degree
-            if pp != 1:
-                raise NotImplementedError(f"DeepSeek V4.1 does not support pipeline parallelism; got PP={pp}")
-            fused_core, fused_selector = _requested_fused_attention(config.override)
-            _check_indexer_teacher_pair(fused_core, fused_selector)
-            self._check_context_parallel(parallelism.context_parallel_degree, fused_core, fused_selector)
-
-            if len(self.compress_ratios) != self.n_layers:
-                raise ValueError(
-                    f"compress_ratios must match n_layers ({self.n_layers}), got {len(self.compress_ratios)}"
-                )
-
-            if hasattr(config, "training"):
-                from torchtitan.models.common.rope import RoPE
-
-                max_context_length = config.training.max_context_length
-                for _, rope_cfg, _, _ in self.traverse(RoPE.Config):
-                    assert isinstance(rope_cfg, RoPE.Config)
-                    rope_cfg.max_context_length = max_context_length
-
-            engram_configs = [layer.engram for layer in self.layers if layer.engram is not None]
-            ep_degree = max(1, parallelism.expert_parallel_degree)
-            for engram_cfg in engram_configs:
-                table_cfg = engram_cfg.table
-                if (
-                    table_cfg.require_token_id_map
-                    and table_cfg.token_id_map_path is None
-                    and table_cfg.tokenizer_path is None
-                ):
-                    if config.hf_assets_path is None:
-                        raise ValueError(
-                            "Engram tokenizer compression is required, but neither "
-                            "table.token_id_map_path nor hf_assets_path is configured."
-                        )
-                    table_cfg.tokenizer_path = os.path.join(
-                        config.hf_assets_path,
-                        "tokenizer.json",
-                    )
-                if table_cfg.num_embeddings % ep_degree != 0:
-                    raise ValueError(
-                        f"Engram physical table size ({table_cfg.num_embeddings}) must "
-                        f"be divisible by EP degree ({ep_degree}). Increase "
-                        "EngramArgs.table_padding_multiple without changing it "
-                        "between checkpoints."
-                    )
-
-            # DeepEP/HybridEP size their buffers from the training shape; v0.4.0 no longer
-            # runs the upstream helper that used to fill these fields.
-            from torchtitan.models.common.moe.token_dispatcher import (
-                DeepEPTokenDispatcher,
-                HybridEPTokenDispatcher,
-            )
-
-            buffer_dispatchers = [
-                layer.feed_forward.routed_experts.token_dispatcher
-                for layer in self.layers
-                if isinstance(
-                    layer.feed_forward.routed_experts.token_dispatcher,
-                    (DeepEPTokenDispatcher.Config, HybridEPTokenDispatcher.Config),
-                )
-            ]
-            if buffer_dispatchers:
-                if parallelism.expert_parallel_degree == 1:
-                    raise ValueError("DeepEP/HybridEP token dispatch requires expert_parallel_degree > 1.")
-                num_token_shards = parallelism.context_parallel_degree * parallelism.tensor_parallel_degree
-                num_tokens = config.training.num_tokens_per_microbatch_per_dp_rank
-                if num_tokens % num_token_shards != 0:
-                    raise ValueError(
-                        "training.num_tokens_per_microbatch_per_dp_rank "
-                        f"({num_tokens}) must be divisible by "
-                        "context_parallel_degree * tensor_parallel_degree "
-                        f"({num_token_shards}) so CP and TP/SP produce equal local "
-                        "token counts."
-                    )
-                required_capacity = num_tokens // num_token_shards
-                for dispatcher in buffer_dispatchers:
-                    if dispatcher.num_max_tokens_per_rank is None:
-                        dispatcher.num_max_tokens_per_rank = required_capacity
-                    elif dispatcher.num_max_tokens_per_rank < required_capacity:
-                        raise ValueError(
-                            f"{type(dispatcher).__qualname__} num_max_tokens_per_rank "
-                            f"({dispatcher.num_max_tokens_per_rank}) is smaller than the "
-                            f"required per-rank capacity ({required_capacity})."
-                        )
-                    if dispatcher.hidden_dim is None:
-                        dispatcher.hidden_dim = self.dim
-
-            from .sharding import set_deepseek_v4_1_sharding_config
-
-            set_deepseek_v4_1_sharding_config(
-                self,
-                enable_sp=parallelism.enable_sequence_parallel,
-                enable_ep=parallelism.expert_parallel_degree > 1,
-            )
-
-        def _check_context_parallel(self, context_parallel_degree: int, fused_core: bool, fused_selector: bool) -> None:
-            """Reject a CP degree this stack cannot run.
-
-            Context parallelism requires the fused attention: the sharded frames describe this
-            rank's query chunks while the KV frames stay the gathered row, and the fused core
-            and selector are the consumers that read that difference (``seqused``).  A
-            torch-native core or selector grids the row instead -- silently, since every shape
-            still fits -- so a run that does not ask for both ports is rejected.
-
-            The multimodal stack cannot be sharded at all, so its config overrides
-            :attr:`accepts_context_parallel`; reading the class attribute rather than branching
-            on the config class keeps that half one line and lets the text stack reach the rest.
-            """
-            if context_parallel_degree == 1:
-                return
-            if not type(self).accepts_context_parallel:
-                raise NotImplementedError(
-                    "DeepSeek V4.1 rejects context parallelism on the multimodal stack; "
-                    f"got CP={context_parallel_degree}"
-                )
-            missing = [
-                name
-                for name, requested in zip(_FUSED_ATTENTION_OVERRIDES, (fused_core, fused_selector), strict=True)
-                if not requested
-            ]
-            if missing:
-                raise ValueError(
-                    "DeepSeek V4.1 runs context parallelism on the fused stack only: this run "
-                    f"does not request {', '.join(missing)}. Request both "
-                    "torchtitan_npu.override.deepseek_v4_1.sparse_attn.asc and "
-                    "torchtitan_npu.override.deepseek_v4_1.lightning_indexer.asc, or run with "
-                    f"context_parallel_degree=1 (got CP={context_parallel_degree}). See "
-                    "torchtitan_npu/override/README.md#deepseek-v41."
-                )
+        def __post_init__(self) -> None:
+            if len(self.compress_ratios) != self.n_layers or len(self.layers) != self.n_layers:
+                raise ValueError(f"layers and compress_ratios must match n_layers ({self.n_layers})")
 
         def get_nparams_and_flops(self, model: nn.Module, seq_len: int) -> tuple[int, int]:
             """Estimate V4.1 model FLOPs per token using TorchTitan's MFU convention.
@@ -800,10 +622,6 @@ class DeepSeekV41MultimodalModel(DeepSeekV41Model):
 
     @dataclass(kw_only=True, slots=True)
     class Config(DeepSeekV41Model.Config):
-        # Context parallelism is defined for the text stack; the vision path has no CP
-        # contract yet, so the multimodal stack keeps rejecting it.
-        accepts_context_parallel: ClassVar[bool] = False
-
         # Required rather than optional: a config with neither is the text stack, and
         # that is a different class.
         vision_encoder: DeepSeekV41VisionEncoder.Config

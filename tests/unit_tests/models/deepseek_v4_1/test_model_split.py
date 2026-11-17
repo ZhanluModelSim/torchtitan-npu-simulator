@@ -3,24 +3,16 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""The text/multimodal split: which half owns what, and what each half rejects.
-
-V4.1 has two models, not one model with an optional tower: the text stack
-(:class:`DeepSeekV41Model`) carries no vision parameter and no modality input, and the
-multimodal stack (:class:`DeepSeekV41MultimodalModel`) subclasses it with the tower, the
-markers, the router's vision bias and the context-parallel rejection.  These tests pin
-that partition, because the whole point of the split is that each half's parameter set
-and routing behaviour is readable from its class -- including what each half rejects under
-context parallelism.
-"""
+"""Text and multimodal model structure, routing and recipe configuration."""
 
 import dataclasses
 import importlib
 
 import pytest
+import torch
 import torch.nn as nn
 from torchtitan.components.data import GrainDataLoader
-from torchtitan.config.override import OverrideConfig, apply_overrides
+from torchtitan.config.parallelism import ParallelismConfig
 
 from tests.unit_tests.models.mtp_test_utils import build_cpu_model
 from torchtitan_npu.models.deepseek_v4_1.model import (
@@ -62,62 +54,13 @@ def test_only_the_multimodal_half_carries_vision_parameters(registry):
     assert multimodal.vision_encoder.dim == 128
 
 
-def _with_cp(trainer, degree: int):
-    # The sequence length is part of a CP config: torchtitan's rope budget is checked
-    # against it inside ``update_from_config``, before the attention the gate is about.
-    trainer.training = dataclasses.replace(
-        trainer.training,
-        num_tokens_per_microbatch_per_dp_rank=512,
-        num_tokens_per_train_step=4096,
-        max_context_length=512,
-    )
-    dataset = trainer.dataloader.dataset
-    if hasattr(dataset, "dataset"):
-        trainer.dataloader.dataset = dataclasses.replace(
-            dataset,
-            dataset=dataclasses.replace(
-                dataset.dataset,
-                processor=dataclasses.replace(dataset.dataset.processor, per_doc_alignment=2 * degree),
-            ),
-        )
-    else:
-        trainer.dataloader.dataset = dataclasses.replace(
-            dataset, processor=dataclasses.replace(dataset.processor, per_doc_alignment=2 * degree)
-        )
-    trainer.parallelism = dataclasses.replace(trainer.parallelism, context_parallel_degree=degree)
-    return trainer
-
-
 def test_multimodal_rejects_context_parallel(registry, recipes):
-    """CP is the text half's; the vision half keeps rejecting it until it has a story."""
-    multimodal = _with_cp(recipes.deepseek_v4_1_debugmodel_multimodal(), 2)
-    with pytest.raises(NotImplementedError, match="multimodal stack"):
-        multimodal.model.update_from_config(config=multimodal)
-
-
-def test_context_parallel_runs_on_the_fused_stack_only(recipes):
-    """CP hands the torch-native attention a chunk frame where it expects the row.
-
-    The sharded metadata describes this rank's query chunks, which only the fused ports read
-    (through ``seqused``); a torch-native core or selector would grid it as if it were the row,
-    silently, since every shape still fits.  The gate reads the overrides the run *requests*
-    (the config stage runs before ``apply_overrides``), and the same stack then really builds,
-    which is where the ports are checked against each other.
-    """
-    text = _with_cp(recipes.deepseek_v4_1_debugmodel_text(), 2)
-    model_config = text.model
-    with pytest.raises(ValueError, match="fused stack only"):
-        model_config.update_from_config(config=text)
-
-    text.override = OverrideConfig(
-        imports=[
-            "torchtitan_npu.override.deepseek_v4_1.sparse_attn.asc",
-            "torchtitan_npu.override.deepseek_v4_1.lightning_indexer.asc",
-        ]
-    )
-    model_config.update_from_config(config=text)
-    apply_overrides(text.override, text)
-    model_config.build()
+    parallelism = ParallelismConfig(context_parallel_degree=2)
+    config = registry.model_registry("deepseek_v4_1_debugmodel", parallelism=parallelism, seq_len=512)
+    with torch.device("meta"):
+        model = config.build()
+    with pytest.raises(NotImplementedError, match="TP=CP=PP=1"):
+        model.parallelize(parallelism=parallelism)
 
 
 def test_text_recipe_builds_the_text_stack_and_loader(recipes):

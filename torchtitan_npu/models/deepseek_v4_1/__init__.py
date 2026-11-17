@@ -12,8 +12,9 @@ from functools import partial
 from typing import TYPE_CHECKING
 
 import torch.nn as nn
+from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.config.transform import validate_converter_compatibility
-from torchtitan.models.common import ComplexRoPE, Embedding, Linear, RMSNorm, SqrtSoftplus
+from torchtitan.models.common import ComplexRoPE, Embedding, Linear, RMSNorm, RoPE, SqrtSoftplus
 from torchtitan.models.common.config_utils import (
     fused_gate_up_param_init,
     make_ffn_config,
@@ -458,8 +459,8 @@ def _make_v41_token_dispatcher_config(
     """Build the EP dispatcher the recipe's ``moe_comm_backend`` selects.
 
     v0.4.0's ``make_routed_experts_config`` hardcodes the all-to-all dispatcher, so the
-    backend knob has to be applied here. ``num_max_tokens_per_rank`` stays ``None`` until
-    ``update_from_config`` fills it from the training shape.
+    backend knob is selected here. The registry supplies the recipe's capacity
+    through TokenDispatcherTransform before returning the final config.
     """
     from torchtitan.models.common.moe.token_dispatcher import (
         AllToAllTokenDispatcher,
@@ -1068,7 +1069,11 @@ def model_registry(
     moe_comm_backend: str = "standard",
     non_blocking_capacity_factor: float | None = None,
     converters: list[ModelConfigConverter.Config] | None = None,
-    parallelism=None,
+    parallelism: ParallelismConfig | None = None,
+    seq_len: int | None = None,
+    tokenizer_path: str | None = None,
+    engram: EngramArgs | None = None,
+    num_max_tokens_per_rank: int | None = None,
 ) -> DeepSeekV41Model.Config:
     if flavor not in deepseek_v4_1_configs:
         raise ValueError(f"Unknown deepseek_v4_1 flavor: {flavor}. Available: {list(deepseek_v4_1_configs.keys())}")
@@ -1076,12 +1081,9 @@ def model_registry(
         moe_comm_backend=moe_comm_backend,
         non_blocking_capacity_factor=non_blocking_capacity_factor,
     )
-    if converters is not None:
-        validate_converter_compatibility(converters)
-        for converter_cfg in converters:
-            config = converter_cfg.build().convert(config)
+    if engram is not None:
+        _attach_engram(config, engram)
     # Configure layouts before construction and disable the upstream in-place WGRAD path.
-    from torchtitan.config.parallelism import ParallelismConfig
     from torchtitan.models.common.linear import Linear
 
     from .sharding import set_deepseek_v4_1_sharding_config
@@ -1094,6 +1096,43 @@ def model_registry(
     )
     for _, linear, _, _ in config.traverse(Linear.Config):
         linear.inplace_wgrad_accum = False
+    if seq_len is not None:
+        if seq_len > config.max_context_length:
+            raise ValueError(
+                f"Requested seq_len {seq_len} exceeds max context length "
+                f"{config.max_context_length} for flavor {flavor}"
+            )
+        config.max_context_length = seq_len
+        for _, rope, _, _ in config.traverse(RoPE.Config):
+            rope.max_context_length = seq_len
+    for layer in config.layers:
+        if layer.engram is None:
+            continue
+        table = layer.engram.table
+        if table.num_embeddings % parallelism.expert_parallel_degree:
+            raise ValueError("Engram physical table size must be divisible by EP degree")
+        if table.require_token_id_map and table.token_id_map_path is None and table.tokenizer_path is None:
+            table.tokenizer_path = tokenizer_path
+    if moe_comm_backend == "deepep":
+        from torchtitan.config.transform import TokenDispatcherTransform, transform_model_config_
+        from torchtitan.models.common.moe.token_dispatcher import DeepEPTokenDispatcher
+
+        if parallelism.expert_parallel_degree <= 1:
+            raise ValueError("DeepEP token dispatch requires expert_parallel_degree > 1")
+        transform_model_config_(
+            config,
+            [
+                TokenDispatcherTransform(
+                    dispatcher=DeepEPTokenDispatcher,
+                    num_max_tokens_per_rank=num_max_tokens_per_rank,
+                    kwargs={"absorb_router_scores": True},
+                )
+            ],
+        )
+    if converters is not None:
+        validate_converter_compatibility(converters)
+        for converter_cfg in converters:
+            config = converter_cfg.build().convert(config)
     return config
 
 

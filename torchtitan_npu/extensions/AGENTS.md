@@ -6,7 +6,7 @@
 - 除所属 `__init__.py` 外，其他模块不得导入带 `apply()` 的模块；只提供定义的无副作用模块可按需复用。直接 monkey-patch 只使用完整点路径赋值。
 - 新增代码只依赖标准库、上游包、`extensions/` 内部模块和所需的 `patches/` 定义；不得新增对 `models`、`override` 或 `ops` 的依赖。现有跨层边是迁移债务，不以本规则宣称已经消除。
 - extensions 可以导入 `torchtitan_npu.patches.*` 复用 patch 提供的定义，也可以通过 `torchtitan.*`、`torch.*` 或 `torch_npu.*` 使用已替换结果；`patches/` 不得新增反向依赖。
-- `TrainerEx` 复用上游 `Trainer` 的 `model_config.update_from_config(config=...)` 生命周期；不得为模型准备引入 extension 到具体模型的反向依赖。
+- `TrainerEx` 沿用上游 Trainer 的配置复制、override 和校验生命周期；模型准备在 recipe 与 registry 构造阶段完成，不得在 extension 中添加模型配置补齐回调或到具体模型的反向依赖。
 - 包入口不自动导入 GraphTrainer extension；其功能适配与验收独立于 eager 训练。
 - 新增直接 monkey-patch 必须声明唯一 owner 和激活顺序。现有重复包装链是迁移债务，未经单独设计和行为验证不得合并。
 - **当前状态：加载策略尚未实现。** `extensions/torchtitan/` 已按上游目录建立边界，`adaptor/` 已迁入本层；[包入口](__init__.py) 仍会无条件导入现有 extension。统一加载器和下列环境变量尚未实现。

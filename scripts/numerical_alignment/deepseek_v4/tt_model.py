@@ -47,11 +47,11 @@ def build_model_config(
 
     from torchtitan.config import apply_overrides
 
-    cfg = dsv4_config.build_torchtitan_config(model_flavor)
+    cfg = dsv4_config.build_torchtitan_config(model_flavor, seq_len=seq_len)
     cfg.training.num_tokens_per_microbatch_per_dp_rank = global_batch_size * seq_len
     cfg.training.num_tokens_per_train_step = global_batch_size * seq_len
     cfg.training.max_context_length = seq_len
-    model_config = cfg.model_spec.model
+    model_config = cfg.model
     dsv4_config.truncate_model_config(model_config, n_layers)
     if (num_experts is None) != (top_k is None):
         raise ValueError("num_experts and top_k must be set together")
@@ -61,9 +61,7 @@ def build_model_config(
             num_experts=num_experts,
             top_k=top_k,
         )
-    # Mirror the trainer order: update_from_config installs the sharding
-    # configs that the CANN overrides derive from, so it must run first.
-    model_config.update_from_config(config=cfg)
+    # The recipe constructs sharding declarations before overrides.
     cfg.override.imports = list(overrides)
     apply_overrides(cfg.override, cfg)
     return model_config

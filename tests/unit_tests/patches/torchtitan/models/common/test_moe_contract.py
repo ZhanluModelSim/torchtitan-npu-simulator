@@ -15,9 +15,10 @@ import torch.nn.functional as F
 
 @pytest.fixture(scope="module")
 def patches():
-    # Import in an isolated process when running this file: package startup requires
-    # the CANN runtime, but these two Python implementations are CPU-capable.
+    # Re-execute the CPU-capable patches and restore every affected import site
+    # before the rest of the suite constructs models and dispatcher transforms.
     root = Path(__file__).resolve().parents[6] / "torchtitan_npu/patches/torchtitan/models/common"
+    import torchtitan.config.transform.token_dispatcher as dispatcher_transform
     import torchtitan.models.common.config_utils as config_utils
     import torchtitan.models.common.moe as moe_package
     import torchtitan.models.common.moe.moe as moe_impl
@@ -39,23 +40,24 @@ def patches():
         (moe_package, ("RoutedExperts",)),
         (moe_impl, ("RoutedExperts", "LocalTokenDispatcher")),
         (dispatch_impl, ("LocalTokenDispatcher", "AllToAllTokenDispatcher", "DeepEPTokenDispatcher")),
+        (dispatcher_transform, ("LocalTokenDispatcher",)),
     ):
         for name in names:
             if hasattr(module, name):
                 patcher.setattr(module, name, getattr(module, name))
             else:
                 patcher.setattr(module, name, None, raising=False)
-    modules = []
-    for name, file in (("_moe_dispatch", "token_dispatcher.py"), ("_moe_patch", "moe.py")):
-        spec = importlib.util.spec_from_file_location(name, root / file)
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[name] = module
-        spec.loader.exec_module(module)
-        modules.append(module)
-    yield modules
-    patcher.undo()
-    sys.modules.pop("_moe_dispatch", None)
-    sys.modules.pop("_moe_patch", None)
+    try:
+        modules = []
+        for name, file in (("_moe_dispatch", "token_dispatcher.py"), ("_moe_patch", "moe.py")):
+            spec = importlib.util.spec_from_file_location(name, root / file)
+            module = importlib.util.module_from_spec(spec)
+            patcher.setitem(sys.modules, name, module)
+            spec.loader.exec_module(module)
+            modules.append(module)
+        yield modules
+    finally:
+        patcher.undo()
 
 
 def test_clamped_activation_uses_fused_gate_up_and_backward(patches):

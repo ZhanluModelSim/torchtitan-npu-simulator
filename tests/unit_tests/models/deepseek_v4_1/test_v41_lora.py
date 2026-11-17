@@ -8,13 +8,13 @@ from torchtitan.models.base.module import Module
 
 from torchtitan_npu.models.deepseek_v4.lora import is_lora_parameter
 from torchtitan_npu.models.deepseek_v4_1.checkpoint import DeepSeekV41LoRACheckpointManager
+from torchtitan_npu.models.deepseek_v4_1.model import DeepSeekV41MultimodalModel
+from torchtitan_npu.models.deepseek_v4_1.state_dict_adapter import DeepSeekV41StateDictAdapter
 from torchtitan_npu_recipes.models.deepseek_v4_1 import (
     deepseek_v4_1_debugmodel_lora,
     deepseek_v4_1_flash_lora,
     deepseek_v4_1_flash_text_lora,
 )
-from torchtitan_npu.models.deepseek_v4_1.model import DeepSeekV41MultimodalModel
-from torchtitan_npu.models.deepseek_v4_1.state_dict_adapter import DeepSeekV41StateDictAdapter
 
 
 @pytest.mark.parametrize(
@@ -41,7 +41,6 @@ def test_lora_recipe_preserves_vision_and_uses_standard_adamw_and_peft(factory, 
 
 def test_lora_model_meta_build_freezes_engram_vision_and_base():
     config = deepseek_v4_1_debugmodel_lora()
-    config.model.update_from_config(config=config)
     with torch.device("meta"):
         model = config.model.build()
     assert any("engram.table.weight" in name for name, _ in model.named_parameters())

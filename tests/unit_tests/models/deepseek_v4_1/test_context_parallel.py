@@ -420,8 +420,3 @@ def test_the_transform_rejects_a_slab_the_row_does_not_grid():
             batch_size=2,
             slab_len=12,
         )
-
-
-def test_the_model_takes_a_context_parallel_degree():
-    """The text stack admits CP; the layout above is what it was waiting for."""
-    assert DeepSeekV41Model.Config.accepts_context_parallel is True

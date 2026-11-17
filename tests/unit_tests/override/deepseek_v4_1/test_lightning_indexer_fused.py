@@ -19,7 +19,6 @@ gradient, so its parameters stay frozen; that is why nothing here checks an "eag
 indexer gradient" -- with the distillation loss removed there is no longer a path to one.
 """
 
-import dataclasses
 import importlib
 from itertools import pairwise
 
@@ -681,8 +680,6 @@ def test_full_model_smla_trains_the_indexer_through_the_teacher_edge(monkeypatch
 def test_both_fused_ports_build_the_kernel_stack(monkeypatch):
     """With both ports derived, the built model carries the kernels rather than the reference.
 
-    The half-fused cases are rejected one stage earlier, on the override request -- see
-    ``test_a_half_fused_teacher_pair_is_rejected_through_override_imports``.
     """
     from torchtitan_npu.override.deepseek_v4_1.sparse_attn.ascendc import AscV41SparseAttention
 
@@ -709,41 +706,24 @@ def test_both_fused_ports_build_the_kernel_stack(monkeypatch):
     assert isinstance(model.layers["2"].attention.indexer.selector, AscSelector)
 
 
-@pytest.mark.parametrize(
-    "imports",
-    [
-        ["torchtitan_npu.override.deepseek_v4_1.lightning_indexer.asc"],
-        ["torchtitan_npu.override.deepseek_v4_1.sparse_attn.asc"],
-    ],
-    ids=["selector-only", "core-only"],
-)
-def test_a_half_fused_teacher_pair_is_rejected_through_override_imports(imports):
-    """The rejection fires on the override request, which is the stage that can see it."""
-    from torchtitan.config.override import OverrideConfig
+def test_both_ports_requested_build_matching_teacher_components():
+    from torchtitan.config.override import OverrideConfig, apply_overrides
+
+    from torchtitan_npu.override.deepseek_v4_1.sparse_attn.ascendc import AscV41SparseAttention
 
     recipes = importlib.import_module("torchtitan_npu_recipes.models.deepseek_v4_1")
     job = recipes.deepseek_v4_1_debugmodel_text()
-    job.override = OverrideConfig(imports=imports)
-    with pytest.raises(ValueError, match="must be enabled together"):
-        job.model.update_from_config(config=job)
-
-
-def test_both_ports_requested_pass_the_pair_gate():
-    """Both requested is the shipped configuration, so the same stage lets it through."""
-    from torchtitan.config.override import OverrideConfig
-
-    recipes = importlib.import_module("torchtitan_npu_recipes.models.deepseek_v4_1")
-    job = recipes.deepseek_v4_1_debugmodel_text()
-    # The context length is part of a CP-capable config: torchtitan's rope budget is checked
-    # inside update_from_config, alongside the gate this test is about.
-    job.training = dataclasses.replace(job.training, max_context_length=512)
     job.override = OverrideConfig(
         imports=[
             "torchtitan_npu.override.deepseek_v4_1.sparse_attn.asc",
             "torchtitan_npu.override.deepseek_v4_1.lightning_indexer.asc",
         ]
     )
-    job.model.update_from_config(config=job)
+    apply_overrides(job.override, job)
+    with torch.device("meta"):
+        model = job.model.build()
+    assert isinstance(model.layers["2"].attention.inner_attention, AscV41SparseAttention)
+    assert isinstance(model.layers["2"].attention.indexer.selector, AscSelector)
 
 
 def test_the_teacher_sources_are_the_index_source_layers():

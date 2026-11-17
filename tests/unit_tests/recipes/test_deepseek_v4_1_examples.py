@@ -67,26 +67,32 @@ def test_mini_recipe_resolves_training_budget_and_quantized_policy(example_envir
 
 @pytest.mark.cpu
 @pytest.mark.parametrize("custom_topology", [False, True], ids=["released-cp128", "two-rank-cp2"])
-def test_long_context_recipe_preserves_text_input_and_explicit_cp_policy(
-    example_environment, tmp_path, custom_topology
-):
-    data = tmp_path / "packed text.jsonl"
-    data.write_text('{"text": "An independent text document."}\n', encoding="utf-8")
-    example_environment.setenv("DATASET_PATH", str(data))
+def test_long_context_recipe_rejects_cp_until_its_lifecycle_is_migrated(example_environment, custom_topology):
     if custom_topology:
         example_environment.setenv("NGPU", "2")
         example_environment.setenv("NNODES", "1")
         example_environment.setenv("EP", "2")
         example_environment.setenv("CP", "2")
-    expected_degree = 2 if custom_topology else 128
+
+    with pytest.raises(NotImplementedError, match=r"context parallelism requires the v0\.4 CP lifecycle migration"):
+        ConfigLoader().load(["--module", _MODULE, "--config", "deepseek_v4_1_flash_cpt_1m_a5"])
+
+
+@pytest.mark.cpu
+def test_long_context_recipe_preserves_text_input_and_optimizer_at_cp1(example_environment, tmp_path):
+    data = tmp_path / "packed text.jsonl"
+    data.write_text('{"text": "An independent text document."}\n', encoding="utf-8")
+    example_environment.setenv("DATASET_PATH", str(data))
+    for name in ("NGPU", "NNODES", "EP", "CP"):
+        example_environment.setenv(name, "1")
 
     config = ConfigLoader().load(["--module", _MODULE, "--config", "deepseek_v4_1_flash_cpt_1m_a5"])
 
     assert config.model.max_context_length == config.training.max_context_length == 1048576
     assert config.training.num_tokens_per_microbatch_per_dp_rank == 1048576
     assert config.training.num_tokens_per_train_step == 1048576
-    assert config.parallelism.context_parallel_degree == expected_degree
-    assert config.parallelism.expert_parallel_degree == expected_degree
+    assert config.parallelism.context_parallel_degree == 1
+    assert config.parallelism.expert_parallel_degree == 1
     assert config.parallelism.data_parallel_shard_degree == 1
     assert config.parallelism.data_parallel_replicate_degree == 1
     assert config.dataloader.dataset.dataset.source.load_dataset_kwargs["data_files"] == str(data)
@@ -97,8 +103,8 @@ def test_long_context_recipe_preserves_text_input_and_explicit_cp_policy(
     assert config.optim.optimizer.optimizers[0].ns_steps == 10
     assert not any(isinstance(group, EngramTableOptimizerConfig) for group in config.optim.optimizer.optimizers)
     assert config.compile is None
-    # The fused stack supports context parallelism, so the recipe configures it.
-    config.model.update_from_config(config=config)
+    # Layout declarations are complete before Trainer applies the requested overrides.
+    assert config.model.layers[0].feed_forward.routed_experts.w13.sharding_config is not None
 
 
 @pytest.mark.cpu

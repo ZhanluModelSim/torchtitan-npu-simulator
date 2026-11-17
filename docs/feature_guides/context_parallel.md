@@ -153,14 +153,13 @@ V4.1 的 CP 配方是 `examples/deepseek_v4_1/deepseek_v4_1_flash_cpt_1m_a5.sh`�
   的：CP 把每篇文档切成 `cp` 个等长 chunk，除了 `doc % (cp × ratio) == 0`，**每个 chunk 自身**也
   必须是 ratio 的整数倍，否则该 rank 的压缩前缀会停在组中间，而部分压缩块不在已验证的内核契约内
   ——因此不放松。例如 cp=2、ratio=128、doc=128 会得到 64-token chunk（不是 128 的倍数）并被明确
-  拒绝。数据加载器配置的文档对齐值必须是对应 lcm × cp 的倍数：模型配置更新时由
-  `require_dataloader_alignment` 检查，每个 geometry 的 entry 再由
+  拒绝。数据加载器配置的文档对齐值必须是对应 lcm × cp 的倍数；每个 geometry 的 entry 由
   `require_document_alignment(cu_seqlens, cp_size=cp, ratio=r)` 检查（V4 在 `doc_chunk_entry`，V4.1
   在 `shard_asc_v41_metadata`），V4.1 使用 `--dataloader.per-doc-alignment`；V4 Grain 使用 dataset processor 的配置。
 - 需要完整 NPU 环境（`torch_npu`、CANN、HCCL、匹配的 `cann_ops_transformer`）。只有 AscendC 融合
-  路径支持 CP；模型目录的参考 metadata hook 显式拒绝 CP，V4.1 的 `update_from_config` 还会要求
-  同时请求 `override.deepseek_v4_1.sparse_attn.asc` 与
-  `override.deepseek_v4_1.lightning_indexer.asc`。
+  路径具有 CP metadata 实现；模型目录的参考 metadata hook 显式拒绝 CP。V4.1 的
+  attention/selector teacher 配对由 recipe 保证，模型构建入口不检查配对；并行入口仅接受
+  TP=CP=PP=1。完整 CP 生命周期迁移另行跟踪，不能将 metadata 实现视为训练恢复。
 - 量化后端（V4 的 `QuantV4Metadata`、V4.1 的 `_V41QuantAttentionMetadata`）目前不重建 rank-local
   metadata，`prepare_cp_metadata` 直接拒绝：量化路径只能跑 `context-parallel-degree 1`。
 - 模型输入使用 folded-token 布局：token 与位置为 `[T]`，隐藏状态为 `[T, D]`。
@@ -430,7 +429,7 @@ Engram 不在这一列。它的 token history 要的是每行**在本文档内**
 | `torchtitan_npu/models/deepseek_v4_1/attention.py` | V4.1 查询保持 doc-chunk 布局，key 消费方按需恢复 slab |
 | `torchtitan_npu/models/deepseek_v4_1/compressor.py` | V4.1 本地池化压缩器（CP-agnostic，无 carry） |
 | `torchtitan_npu/models/deepseek_v4_1/sharding.py` | V4.1 sparse core / selector 的 `S(0) -> R` 声明 |
-| `torchtitan_npu/models/deepseek_v4_1/model.py` | `DeepSeekV41Metadata` 与 `build_v41_frames`（整行边界与三帧）；`prepare_cp_metadata` 拒绝 CP；`preprocess_inputs` 按行构造 Engram 的 token history；teacher 成对启用检查 |
+| `torchtitan_npu/models/deepseek_v4_1/model.py` | `DeepSeekV41Metadata` 与 `build_v41_frames`（整行边界与三帧）；`prepare_cp_metadata` 拒绝 CP；`preprocess_inputs` 按行构造 Engram 的 token history；并行入口仅接受 TP=CP=PP=1 |
 | `torchtitan_npu/override/deepseek_v4_1/sparse_attn/ascendc.py` | `AscV41Metadata` / `shard_asc_v41_metadata` / `build_fused_metadata` |
 | `torchtitan_npu/override/deepseek_v4_1/lightning_indexer/ascendc.py` | V4.1 BF16 selector（整行 index keys × 本 rank chunk） |
 | `torchtitan_npu/override/deepseek_v4_1/metadata.py` | V4.1 的 `AicpuGeometry` / `AicpuMetadata`：按 kernel 分组的 AI_CPU 记录结构 |

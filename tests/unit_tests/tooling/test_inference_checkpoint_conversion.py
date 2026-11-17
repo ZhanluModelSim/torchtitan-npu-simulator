@@ -9,6 +9,7 @@ import json
 
 import pytest
 import torch
+import torch.distributed.checkpoint as dcp
 from safetensors.torch import load_file, save_file
 
 from scripts.checkpoint_conversion.convert_dsv4_hf_to_dcp import _read_hf_state_dict

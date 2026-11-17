@@ -341,7 +341,6 @@ def test_explicit_disable_preserves_selected_optimizer(optimizer):
     trainer = replace(deepseek_v4_1_debugmodel_multimodal(), engram_enabled=False)
     trainer.optim.optimizer.name = optimizer
     trainer.training.num_tokens_per_microbatch_per_dp_rank = 512
-    trainer.model.update_from_config(config=trainer)
     assert all(layer.engram is None for layer in trainer.model.layers)
     assert type(trainer.optim.optimizer) is OptimizerConfig
     assert trainer.optim.optimizer.name == optimizer
@@ -375,8 +374,7 @@ def test_model_config_accepts_parameterized_engram_override(fused_attention):
             "torchtitan_npu.override.deepseek_v4_1.sparse_attn.asc",
             ("torchtitan_npu.override.deepseek_v4_1.lightning_indexer.asc", {}),
         ]
-    # Follow Trainer's order: model validation runs before applying overrides.
-    config.model.update_from_config(config=config)
+    # Recipes supply the base configuration; Trainer applies the requested overrides.
     apply_overrides(config.override, config)
 
     tables = [layer.engram.table for layer in config.model.layers if layer.engram is not None]
