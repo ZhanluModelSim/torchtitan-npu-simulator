@@ -214,7 +214,13 @@ def validate_workload(workload: WorkloadGraph) -> dict:
         "optimizer update set differs from gradient set",
     )
     declared = [name for group in annotations["optimizer_parameter_groups"] for name in group["parameter_names"]]
-    _require(len(declared) == len(set(declared)) and set(declared) == set(gradients), "optimizer ownership differs")
+    # Host-offload sparse tables (e.g. DeepSeek-V4.1 Engram) are optimizer-owned
+    # but never produce dense parameter grads; the runner records their names.
+    exempt = set(annotations.get("dense_gradient_exemptions", ()))
+    _require(
+        len(declared) == len(set(declared)) and set(declared) == set(gradients) | exempt,
+        "optimizer ownership differs",
+    )
     algorithms = {
         name: group["algorithm"]
         for group in annotations["optimizer_parameter_groups"]

@@ -29,6 +29,7 @@ from torchtitan_simulator.warmup import warmup_training_iteration
 
 def _gradient_manifest(model):
     manifest = {}
+    exemptions = []
     missing = []
     for name, parameter in logical_named_parameters(model):
         if not parameter.requires_grad:
@@ -36,6 +37,9 @@ def _gradient_manifest(model):
         if getattr(parameter, "_engram_host_offload", False):
             # Host-offload sparse table: gradients reach SparseAdam through
             # the pending sparse-grad path, never as a dense parameter grad.
+            # Track the exemption so validation can reconcile the declared
+            # optimizer ownership against the dense gradient set.
+            exemptions.append(name)
             continue
         gradient = parameter.grad
         if gradient is None:
@@ -72,7 +76,7 @@ def _gradient_manifest(model):
         }
     if missing:
         raise RuntimeError(f"Expected parameter gradients are missing: {missing}")
-    return manifest
+    return manifest, exemptions
 
 
 def _buffer_signature(model):
@@ -235,6 +239,7 @@ def _simulate(simulation, timings: HostTimings):
             inputs = {"tokens": tokens.to("meta"), **to_meta_metadata(kwargs)}
             labels = labels.to("meta")
             gradient_manifest = {}
+            dense_gradient_exemptions = set()
             from torchtitan.distributed.utils import clip_grad_norm_, get_spmd_context
 
             train_context = get_spmd_context(parallel_dims=dims, spmd_typechecking=config.debug.spmd_typechecking)
@@ -248,7 +253,9 @@ def _simulate(simulation, timings: HostTimings):
                         loss, _ = loss_fn(predictions, labels, global_valid_tokens, positions=input_dict["positions"])
                     with timings.measure(f"{execution}.backward"), compute_block("B"):
                         loss.backward()
-                gradient_manifest.update(_gradient_manifest(model))
+                manifest, exemptions = _gradient_manifest(model)
+                gradient_manifest.update(manifest)
+                dense_gradient_exemptions.update(exemptions)
                 return loss
 
             def clip_gradients():
@@ -384,6 +391,7 @@ def _simulate(simulation, timings: HostTimings):
                 "quantized_parameters": quantized_parameters,
             }
             annotations["gradient_validation"] = gradient_manifest
+            annotations["dense_gradient_exemptions"] = sorted(dense_gradient_exemptions)
             annotations["runtime_capabilities"] = dict(runtime.capabilities)
             annotations["simulation_assumptions"] = prepared.adaptations
             annotations["input_source"] = "synthetic single-document positions and valid next-token labels"
