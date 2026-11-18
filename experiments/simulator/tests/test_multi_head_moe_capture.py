@@ -231,6 +231,13 @@ def test_multi_head_moe_opt_in_fusion_replaces_only_the_two_branch_seams():
     assert all(node.annotations.get("cost_unknown") for node in fused)
     annotate_workload_costs(workload, hardware=_sla2_hardware())
     assert all(node.annotations.get("duration_us", 0) > 0 for node in fused)
+    # Re-annotation must not leave the earlier cost_unknown flag behind
+    # alongside the valid duration (PR #19 review), and a hardware-less
+    # re-annotation must clear the durations again instead of keeping both.
+    assert all(not node.annotations.get("cost_unknown") for node in fused)
+    annotate_workload_costs(workload)
+    assert all(node.annotations.get("cost_unknown") for node in fused)
+    assert all("duration_us" not in node.annotations for node in fused)
 
 
 def test_multi_head_moe_seq_len_128_exercises_real_block_selection():

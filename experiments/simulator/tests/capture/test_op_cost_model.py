@@ -108,6 +108,47 @@ def test_mm_duration_stays_absent_without_a_hardware_profile():
     node = _node("matmul", [_meta((128, 512)), _meta((512, 256))], [_meta((128, 256))])
     cost = compute_cost(node.op_type, node.inputs, node.outputs)
     assert cost.duration_us is None
+
+
+def test_repeated_annotation_clears_previous_cost_keys_in_any_order():
+    # Regression (PR #19 review): re-annotation used to leave contradictory
+    # state -- cost_unknown=True alongside a valid duration_us (unknown->known)
+    # and stale durations/flops (known->unknown). Annotations must always
+    # reflect the latest call exactly.
+    from torchtitan_simulator.cost.hardware import npu_910b3
+
+    matmul = _node("matmul", [_meta((16, 8)), _meta((8, 4))], [_meta((16, 4))])
+    view = _node("aten.view.default", [_meta((4, 6))], [_meta((6, 4))])
+
+    class _Templates:
+        def __init__(self, nodes):
+            self.nodes = dict(enumerate(nodes))
+
+    class _Workload:
+        def __init__(self, nodes):
+            self.step_templates = {"step": _Templates(nodes)}
+            self.captured_workload = self
+
+    workload = _Workload([matmul, view])
+
+    annotate_workload_costs(workload, hardware=npu_910b3())
+    assert matmul.annotations["duration_us"] is not None
+    assert view.annotations["cost_unknown"]
+
+    # known -> unknown: the stale duration must not survive a hardware-less pass.
+    annotate_workload_costs(workload)
+    assert "duration_us" not in matmul.annotations
+    assert matmul.annotations["flops"] > 0
+    assert not matmul.annotations.get("cost_unknown")
+    assert view.annotations["cost_unknown"]
+    assert "flops" not in view.annotations
+
+    # unknown stays unknown, known returns when the hardware profile comes back.
+    annotate_workload_costs(workload, hardware=npu_910b3())
+    assert matmul.annotations["duration_us"] is not None
+    assert not matmul.annotations.get("cost_unknown")
+    assert view.annotations["cost_unknown"]
+    assert "duration_us" not in view.annotations
     node2 = _node("matmul", [_meta((128, 512)), _meta((512, 256))], [_meta((128, 256))])
     cost2 = compute_cost(node2.op_type, node2.inputs, node2.outputs, hardware=None)
     assert cost2.duration_us is None

@@ -682,7 +682,14 @@ def compute_cost(
     return CostEstimate.unknown_cost()
 
 
+_ANNOTATION_KEYS = (_UNKNOWN_KEY, _FLOPS_KEY, _TRAFFIC_KEY, _COMM_KEY, _DURATION_KEY)
+
+
 def _annotate_node(node: OpNode, hardware) -> None:
+    # Re-annotation recomputes from scratch: clear every key this module owns
+    # first so unknown->known and known->unknown transitions leave no residue.
+    for key in _ANNOTATION_KEYS:
+        node.annotations.pop(key, None)
     cost = compute_cost(
         node.op_type,
         node.inputs,
@@ -708,7 +715,9 @@ def annotate_workload_costs(workload, hardware=None) -> None:
     """Stamp ``flops`` / ``memory_traffic_bytes`` / ``comm_bytes`` onto every
     node of every step template in place (captured source graph included).
 
-    Explicit and idempotent: ops without a handler get ``cost_unknown`` only.
+    Explicit and idempotent: every call first clears the cost keys it owns on
+    each node, then recomputes them, so repeated calls in any order leave no
+    residue; ops without a handler get ``cost_unknown`` only.
     Passing ``hardware`` (see :mod:`torchtitan_simulator.cost.hardware`) also
     stamps ``duration_us`` on ops the prediction layer supports.
     """
