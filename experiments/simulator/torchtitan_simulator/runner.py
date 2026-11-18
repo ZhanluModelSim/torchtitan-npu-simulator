@@ -31,14 +31,28 @@ def _gradient_manifest(model):
     manifest = {}
     exemptions = []
     missing = []
+    host_tables = {
+        id(module.weight): module
+        for module in model.modules()
+        if getattr(module, "uses_host_offload", False) and getattr(module, "weight", None) is not None
+    }
     for name, parameter in logical_named_parameters(model):
         if not parameter.requires_grad:
             continue
         if getattr(parameter, "_engram_host_offload", False):
             # Host-offload sparse table: gradients reach SparseAdam through
             # the pending sparse-grad path, never as a dense parameter grad.
-            # Track the exemption so validation can reconcile the declared
-            # optimizer ownership against the dense gradient set.
+            # The exemption is only valid with captured sparse work behind
+            # it (PR #19 review): every table must hold a pending sparse
+            # gradient once its backward has run.
+            table = host_tables.get(id(parameter))
+            if table is None:
+                raise RuntimeError(f"Host-offload parameter {name} has no owning Engram table module")
+            if table.pending_sparse_grad() is None:
+                raise RuntimeError(
+                    f"Host-offload table {name} produced no pending sparse gradient; the dense "
+                    "gradient-contract exemption requires captured sparse work"
+                )
             exemptions.append(name)
             continue
         gradient = parameter.grad
@@ -86,6 +100,51 @@ def _buffer_signature(model):
         storage = tensor.untyped_storage()
         signature[name] = (tuple(tensor.shape), tensor.dtype, tensor.device, int(storage._cdata), storage.nbytes())
     return signature
+
+
+def _sparse_optimizer_validation(optimizers, model):
+    """Evidence that every exempted host table executed its sparse update.
+
+    The dense gradient contract exempts the host-offload tables only because
+    their work lives in the pending-sparse-grad / SparseAdam path; after the
+    captured optimizer step each table must have consumed its pending
+    gradient and hold actual SparseAdam state (PR #19 review). Names come
+    from the same logical enumeration as the gradient manifest, so the
+    evidence set reconciles with the exemptions under any wrapper tree
+    (activation checkpointing included).
+    """
+    owners = getattr(optimizers, "optimizers", None) or (optimizers,)
+    state_keys_by_param: dict[int, list[str]] = {}
+    for owner in owners:
+        state = getattr(owner, "state", None)
+        if not state:
+            continue
+        for parameter, parameter_state in state.items():
+            state_keys_by_param[id(parameter)] = sorted(parameter_state)
+    host_tables = {
+        id(module.weight): module
+        for module in model.modules()
+        if getattr(module, "uses_host_offload", False) and getattr(module, "weight", None) is not None
+    }
+    validation = {}
+    for name, parameter in logical_named_parameters(model):
+        if not getattr(parameter, "_engram_host_offload", False):
+            continue
+        table = host_tables.get(id(parameter))
+        record = {
+            "state_keys": state_keys_by_param.get(id(parameter), []),
+            "pending_consumed": table.pending_sparse_grad() is None if table is not None else False,
+        }
+        if not record["state_keys"]:
+            raise RuntimeError(
+                f"Host-offload table {name} reached no SparseAdam state; the sparse update did not execute"
+            )
+        if not record["pending_consumed"]:
+            raise RuntimeError(
+                f"Host-offload table {name} did not consume its pending sparse gradient in the optimizer step"
+            )
+        validation[name] = record
+    return validation
 
 
 def simulate(simulation):
@@ -171,6 +230,9 @@ def _simulate(simulation, timings: HostTimings):
                     "mesh_dim_names": tuple(mesh.mesh_dim_names) if mesh is not None else (),
                     "mesh_shape": tuple(mesh.shape) if mesh is not None else (),
                     "placements": str(getattr(parameter, "placements", ())),
+                    # Host-resident parameters (Engram CPU tables) report their
+                    # own budget; device-byte reconciliation excludes them.
+                    "residency": "host" if getattr(parameter, "_engram_host_offload", False) else "device",
                 }
             from torchtitan_simulator.compat.muon import validate_muon_layouts
 
@@ -260,6 +322,21 @@ def _simulate(simulation, timings: HostTimings):
                 return loss
 
             def clip_gradients():
+                # Route through the native mixed container exactly like the
+                # production trainer, so host sparse gradients join the
+                # global clip norm instead of bypassing it (PR #19 review).
+                from torchtitan_npu.extensions.torchtitan.components.optimizer.optimizer import (
+                    HostSparseOptimizersContainer,
+                )
+
+                if isinstance(optimizers, HostSparseOptimizersContainer):
+                    return optimizers.clip_grad_norm(
+                        model.parameters(),
+                        config.training.max_norm,
+                        foreach=False,
+                        pp_mesh=None,
+                        ep_enabled=dims.ep_enabled,
+                    )
                 return clip_grad_norm_(
                     model.parameters(),
                     config.training.max_norm,
@@ -315,6 +392,11 @@ def _simulate(simulation, timings: HostTimings):
                 )
             for name, wall_seconds in workload.iteration.schedule.annotations["capture_timings"].items():
                 timings.add(f"capture_step.{name}", wall_seconds)
+            # The captured sparse work is part of the F/B/O contract: record
+            # the host tables' SparseAdam evidence for downstream validation.
+            workload.iteration.schedule.annotations["sparse_optimizer_validation"] = _sparse_optimizer_validation(
+                optimizers, model
+            )
             if _buffer_signature(model) != buffers_before:
                 raise RuntimeError(
                     "Registered buffers changed storage/layout during capture; explicit residency modeling required"

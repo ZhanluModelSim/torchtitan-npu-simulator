@@ -206,8 +206,27 @@ def validate_workload(workload: WorkloadGraph) -> dict:
         if node.annotations.get("raw_op_type") == "aten.mul_.Tensor"
         and node.annotations.get("comp_type") == "OPTIMIZER"
         and "gradient_clip" in node.annotations.get("framework_scopes", ())
+        and "gradient_clip_sparse_correction" not in node.annotations.get("framework_scopes", ())
     ]
     _require(len(clipped) == len(gradients), "clip set differs from gradient set")
+    # The host-sparse clip wrapper rescales the dense gradients by the
+    # combined (dense + sparse-squares) coefficient: production branches on
+    # the read scalar, the meta twin records the rescale unconditionally
+    # under a distinct scope (PR #19 review). It exists exactly when host
+    # tables participate, mirrors the dense clip one-for-one and stays
+    # connected to the optimizer like the dense clip.
+    corrections = [
+        node
+        for node in nodes.values()
+        if node.annotations.get("raw_op_type") == "aten.mul_.Tensor"
+        and node.annotations.get("comp_type") == "OPTIMIZER"
+        and "gradient_clip_sparse_correction" in node.annotations.get("framework_scopes", ())
+    ]
+    host_sparse_tables = bool(annotations.get("sparse_optimizer_validation"))
+    _require(
+        len(corrections) == (len(gradients) if host_sparse_tables else 0),
+        "host sparse clip correction set differs from the dense gradient set",
+    )
     _require(
         {name for node in optimizers for name in node.annotations["optimizer_updated_parameter_names"]}
         == set(gradients),
@@ -221,6 +240,21 @@ def validate_workload(workload: WorkloadGraph) -> dict:
         len(declared) == len(set(declared)) and set(declared) == set(gradients) | exempt,
         "optimizer ownership differs",
     )
+    if exempt:
+        # The exemption is only valid with captured sparse work behind it
+        # (PR #19 review): every exempted table must show a consumed pending
+        # gradient and materialized SparseAdam moments.
+        sparse_evidence = annotations.get("sparse_optimizer_validation", {})
+        _require(
+            set(sparse_evidence) == exempt,
+            "sparse optimizer evidence set differs from the dense gradient exemptions",
+        )
+        for name, record in sparse_evidence.items():
+            _require(
+                {"exp_avg", "exp_avg_sq"} <= set(record["state_keys"]),
+                f"exempted host table {name} reached no SparseAdam moments",
+            )
+            _require(record["pending_consumed"], f"exempted host table {name} did not consume its pending gradient")
     algorithms = {
         name: group["algorithm"]
         for group in annotations["optimizer_parameter_groups"]
@@ -247,6 +281,10 @@ def validate_workload(workload: WorkloadGraph) -> dict:
         if event.get("gradient_reduction"):
             _require(event["op_id"] in ancestors, "gradient reduction disconnected from optimizer")
     _require(all(node.op_id in ancestors for node in clipped), "clip disconnected from optimizer")
+    _require(
+        all(node.op_id in ancestors for node in corrections),
+        "host sparse clip correction disconnected from optimizer",
+    )
     memory = annotations["memory_plan"]
     _require(not any("marker imbalance" in note for note in memory.notes), "unbalanced FSDP residency")
     markers = memory.fsdp_residency_events
@@ -255,16 +293,34 @@ def validate_workload(workload: WorkloadGraph) -> dict:
         == Counter(event.group_id for event in markers if event.action == "free"),
         "unreleased full parameters",
     )
+    device_layouts = [
+        item for item in annotations["parameter_layouts"].values() if item.get("residency", "device") == "device"
+    ]
+    host_layouts = [
+        item for item in annotations["parameter_layouts"].values() if item.get("residency", "device") == "host"
+    ]
     _require(
         memory.persistent_param_bytes
         == sum(
             tensor_volume_bytes(tuple(item["local_shape"]), memory.parameter_storage_dtype)
             if memory.parameter_storage_dtype
             else item["storage_bytes"]
-            for item in annotations["parameter_layouts"].values()
+            for item in device_layouts
         ),
         "local persistent parameter byte mismatch",
     )
+    if host_layouts:
+        # Host-resident parameters (Engram CPU tables) carry their own budget;
+        # they must stay out of every counted device byte total (PR #19
+        # review) and reconcile against the host-side report.
+        _require(
+            memory.host_param_bytes == sum(item["storage_bytes"] for item in host_layouts),
+            "host persistent parameter byte mismatch",
+        )
+        _require(
+            not any(item.kind == "host_parameter" for item in memory.tensor_lifetimes),
+            "host-resident parameter leaked into device lifetimes",
+        )
     budget_lifetimes = memory.device_budget_lifetimes()
     allocations = {
         f"fsdp_full_param:{event.group_id}:{event.seq_idx}": event.allocation_storage_bytes

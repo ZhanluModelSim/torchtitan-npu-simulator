@@ -15,6 +15,7 @@ from __future__ import annotations
 import itertools
 import weakref
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -46,6 +47,42 @@ _id_counter = itertools.count(1)
 _seq_counter = itertools.count()
 _memory_event_counter = itertools.count()
 
+_host_only_work: ContextVar[bool] = ContextVar("torchtitan_simulator_host_only_work", default=False)
+
+
+@contextmanager
+def host_only_work():
+    """Execute host-side bookkeeping without recording device-graph facts.
+
+    Production runs host-offload bookkeeping (sparse gradient accumulation,
+    host clipping rescale, SparseAdam state materialization) on CPU tensors
+    outside the device graph; the meta twins keep the same split by
+    suppressing L0 and memory recording in here. Outside an active capture
+    the flag is inert -- the ops simply dispatch normally.
+    """
+    token = _host_only_work.set(True)
+    try:
+        yield
+    finally:
+        _host_only_work.reset(token)
+
+
+@contextmanager
+def annotate_active_capture_events(provenance: str) -> Iterator[None]:
+    """Annotate dispatch events of the active capture, if any.
+
+    Compat seams that run inside the runner's framework scopes (gradient
+    clipping, the optimizer step) use this to label work whose provenance
+    the runner cannot name, e.g. the host-sparse dense correction rescale.
+    Outside an active capture the context is inert.
+    """
+    capture = _active_capture
+    if capture is None:
+        yield
+        return
+    with capture.annotate_dispatch_events(provenance):
+        yield
+
 
 def _next_op_id() -> int:
     return next(_id_counter)
@@ -60,6 +97,10 @@ def _flatten_tensors(value: Any, *, localize_dtensor: bool = True) -> list[torch
     edge construction and producing incomplete IR dependencies. DTensors are
     localized by default because dependency and memory tracking are per-rank;
     callers may retain them to read logical global metadata instead.
+    Sparse-layout tensors are skipped: their storage identity is not
+    accessible (SparseTensorImpl), and in production they carry host-side
+    facts that never belong to the per-device graph. Only their dense
+    index/value operands participate in tracking.
     """
     tensors: list[torch.Tensor] = []
 
@@ -72,7 +113,8 @@ def _flatten_tensors(value: Any, *, localize_dtensor: bool = True) -> list[torch
         else:
             tensors.append(value)
     elif isinstance(value, torch.Tensor):
-        tensors.append(value)
+        if value.layout is torch.strided:
+            tensors.append(value)
     elif isinstance(value, dict):
         for item in value.values():
             tensors.extend(_flatten_tensors(item, localize_dtensor=localize_dtensor))
@@ -298,6 +340,10 @@ class OpDispatchCapture(TorchDispatchMode):
 
     def __torch_dispatch__(self, func, types, args: tuple[Any, ...] = (), kwargs=None):
         kwargs = kwargs or {}
+        if _host_only_work.get():
+            # Host-side bookkeeping executes structurally but never enters
+            # the captured device graph (see host_only_work).
+            return func(*args, **kwargs)
         if self.record_memory and self._capture_l0:
             self._storage_lifetimes.poll()
         if self._capture_l0 and func is torch.ops.aten.detach.default:
@@ -316,6 +362,9 @@ class OpDispatchCapture(TorchDispatchMode):
                 self.saved_tensor_unpack_detach_count += 1
                 return result
         mutated_inputs = _schema_mutated_tensors(func, args, kwargs) if self._capture_l0 else []
+        # Sparse-layout operands cannot enter mutation/storage tracking for
+        # the same reason as _flatten_tensors skips them.
+        mutated_inputs = [tensor for tensor in mutated_inputs if tensor.layout is torch.strided]
         result = func(*args, **kwargs)
         from torchtitan_simulator.capture.native_transport import (
             record_native_transport,

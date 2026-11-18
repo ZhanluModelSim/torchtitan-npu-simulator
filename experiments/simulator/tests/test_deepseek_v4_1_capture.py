@@ -12,13 +12,17 @@ from torchtitan_simulator.validation import validate_workload
 
 # Native deepseek_v4_1_debugmodel geometry, text-only: dim=512, 40 layers,
 # vocab=129280, hc_mult=4, 16 experts, FP32 parameters.  The stack carries two
-# host-offload Engram tables (one per KV-source layer), which hold 2,097,232
-# FP32 elements in total and are excluded from the dense gradient contract.
-_ENGRAM_NUMEL = 2_097_232
+# host-offload Engram tables (one per KV-source layer) with 2,097,152 FP32
+# elements in total; production keeps them CPU-resident, so they report the
+# host budget, never device bytes (PR #19 review).  40 odd-numel dense
+# parameters skew the FSDP2 shards by one element each (shard 0 up,
+# shard 1 down); the degree-1 shard needs no padding.
+_ENGRAM_NUMEL = 2_097_152
 _TOTAL_NUMEL = 430_312_240
 _DENSE_NUMEL = _TOTAL_NUMEL - _ENGRAM_NUMEL
 _TOTAL_PARAM_TENSORS = 966
 _DENSE_GRADIENT_TENSORS = 964
+_FSDP_ODD_SKEW = 40
 
 
 @pytest.mark.parametrize(
@@ -56,36 +60,52 @@ def test_deepseek_v4_1_capture_reaches_iteration_with_metadata_map(world, replic
     # their gate projections stay ordinary dense parameters.
     assert not any(name.endswith("engram.table.weight") for name in gradients)
 
-    # The stack has no model-private virtual fusion: the only custom-semantics
-    # dispatch is the shared NPU MoE token unpermute, once per layer forward
-    # (twice under full AC, which replays the forward inside the checkpoint).
+    # The stack has exactly two custom-semantics dispatches: the shared NPU
+    # MoE token unpermute, once per layer forward (twice under full AC,
+    # which replays the forward inside the checkpoint), and the sparse
+    # table update boundary, once per host Engram table in the O phase
+    # (PR #19 review).
     custom = {
         node.annotations["raw_op_type"]
         for template in workload.step_templates.values()
         for node in template.nodes.values()
         if "tensor_semantics" in node.attrs
     }
-    assert custom == {"torchtitan_npu.npu_moe_token_unpermute.default"}
+    assert custom == {"torchtitan_npu.npu_moe_token_unpermute.default", "dsv41_sim.sparse_adam_update.default"}
 
     nodes = [n for template in workload.step_templates.values() for n in template.nodes.values()]
     unpermute = "torchtitan_npu.npu_moe_token_unpermute.default"
     unpermutes = sum(1 for n in nodes if n.annotations["raw_op_type"] == unpermute)
     assert unpermutes == (80 if ac == "full" else 40)
+    sparse_update = "dsv41_sim.sparse_adam_update.default"
+    assert sum(1 for n in nodes if n.annotations["raw_op_type"] == sparse_update) == 2
 
     degree = world // replicate
     memory = workload.iteration.schedule.annotations["memory_plan"]
-    # FP32 residency. Under FSDP2 each parameter shards independently: the
-    # stack has 80 odd-numel dense parameters, so shard 0 rounds up and shard
-    # 1 rounds down (an 80-element skew), while the host-offload tables stay
-    # whole on every rank (the EP degree is 1, nothing to shard them over).
-    # Shard 0 holds the exact half; shard 1 rounds the 80 odd-numel dense
-    # parameters down (an 80-element skew).
-    local_dense = _DENSE_NUMEL // degree - (80 if degree > 1 and rank > 0 else 0)
-    assert memory.persistent_param_bytes == (local_dense + _ENGRAM_NUMEL) * 4
-    # Two FP32 AdamW moments per local dense element; the residual covers the
-    # host-offload tables' SparseAdam state stubs (dense and sparse parameter
-    # groups are accounted separately, and the stubs do not shard).
-    assert memory.optimizer_state_bytes == local_dense * 8 + 4496
+    # FP32 residency split by production residency (PR #19 review): dense
+    # parameters shard under FSDP2 with the odd-numel skew (shard 0 up,
+    # shard 1 down), while the host-offload Engram tables stay whole on
+    # every rank (EP degree is 1) and report the host budget only.
+    if degree == 1:
+        local_moment_elements = _DENSE_NUMEL
+    elif rank == 0:
+        local_moment_elements = _DENSE_NUMEL // 2 + _FSDP_ODD_SKEW
+    else:
+        local_moment_elements = _DENSE_NUMEL // 2 - _FSDP_ODD_SKEW
+    assert memory.persistent_param_bytes == local_moment_elements * 4
+    assert memory.host_param_bytes == _ENGRAM_NUMEL * 4
+    # Two FP32 AdamW moments per local dense element plus one FP32 step
+    # scalar per dense parameter; the host-offload tables' SparseAdam
+    # moments (two tables x exp_avg + exp_avg_sq, EP degree 1 keeps them
+    # whole per rank) report the host budget, never device bytes.
+    assert memory.optimizer_state_bytes == local_moment_elements * 8 + _DENSE_GRADIENT_TENSORS * 4
+    assert memory.host_optimizer_state_bytes == _ENGRAM_NUMEL * 8
+    layouts = workload.iteration.schedule.annotations["parameter_layouts"]
+    assert {name for name in layouts if name.endswith("engram.table.weight")} == {
+        name for name, item in layouts.items() if item["residency"] == "host"
+    }
+    assert not any(item.kind == "host_parameter" for item in memory.tensor_lifetimes)
+
 
 def test_deepseek_v4_1_multimodal_flavor_is_not_a_capture_preset():
     # The multimodal flavor needs pixel_values the text-only runner does not
