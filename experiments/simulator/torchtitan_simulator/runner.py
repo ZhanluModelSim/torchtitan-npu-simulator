@@ -8,6 +8,7 @@
 import json
 import logging
 from contextlib import nullcontext
+from dataclasses import replace
 from typing import Literal
 
 import torch
@@ -209,21 +210,46 @@ def _simulate(simulation, timings: HostTimings):
             from torchtitan_simulator.compat.meta_initialization import meta_initialization
 
             teacher = None
+            teacher_shapes = {}
             if getattr(config.loss, "distill", False):
                 # The reference distillation runs a frozen teacher VLA per step
                 # (backbone forward only: embed_prefix + layers + finish with
-                # logits) and distills logits KL + hidden MSE. The teacher is a
-                # meta model of the same capture config (widths equal, so the
-                # Distiller projection is Identity; the reference loads the real
-                # teacher size from a checkpoint the file does not carry) and
-                # stays outside FSDP and the optimizer, so its comm is zero.
-                # FSDP-sharding the teacher needs the forward-tree root wrapped
-                # (FSDP2 single-root semantics), which would claim the vision
-                # stem into a DTensor group and break the plain-input conv
-                # chain; the spmd annotation bridge that keeps the student's
-                # stem plain does not carry to a second model instance.
+                # logits) and distills logits KL + hidden MSE. The teacher is
+                # a meta model of the same capture config (widths equal, so the
+                # Distiller projection is Identity; the reference loads the
+                # real teacher size from a checkpoint the file does not carry).
+                # Production distillation shards the teacher in-loop with the
+                # same FSDP2+EP recipe as the student: the teacher is a second
+                # independent FSDP tree (same one-process two-tree shape as
+                # qwen3_vl's vision tower + decoder), so its forward all-
+                # gathers and EP all-to-alls are captured natively. Frozen +
+                # no_grad keeps it out of backward and the optimizer.
                 with timings.measure("teacher_build"):
                     teacher = build_meta_model(prepared)
+                    teacher.eval()
+                    teacher.requires_grad_(False)
+                    teacher_shapes = {
+                        name: tuple(parameter.shape) for name, parameter in logical_named_parameters(teacher)
+                    }
+                with timings.measure("teacher_parallelize"), meta_initialization():
+                    # No AC and no compile on the frozen tree; the dense FSDP2
+                    # and EP wiring match the student exactly.
+                    teacher = config.model_spec.parallelize_fn(
+                        teacher,
+                        parallel_dims=dims,
+                        training=config.training,
+                        parallelism=config.parallelism,
+                        compile_config=replace(config.compile, enable=False),
+                        ac_config=None,
+                        dump_folder=config.dump_folder,
+                    )
+                # FSDP2 unshard rides the ROOT module's __call__ pre-hook; the
+                # root unit owns the vision stem, so the teacher entry must be
+                # a module call. Bind the instance forward to the backbone
+                # path (the loss-side contract) instead of bypassing __call__
+                # via backbone_forward, which would leave the root-sharded
+                # vision conv weight a DTensor inside aten.convolution.
+                teacher.forward = teacher.backbone_forward
 
             with timings.measure("parallelize"), meta_initialization():
                 model = config.model_spec.parallelize_fn(
@@ -382,6 +408,26 @@ def _simulate(simulation, timings: HostTimings):
                     zero_grad=optimizers.zero_grad,
                 )
             gradient_manifest.clear()
+            if teacher is not None:
+                # The frozen teacher tree carries its own sharded parameters
+                # (persistent storage, no optimizer states). Collect them
+                # AFTER warmup so the recorded sizes match the steady state
+                # the memory estimator snapshots: FSDP2 never runs a backward
+                # for the teacher, so the root and the never-resharded
+                # [norm, lm_head] unit stay unsharded on device across steps
+                # while the remaining units reshard after every forward.
+                for name, parameter in logical_named_parameters(teacher):
+                    local = getattr(parameter, "_local_tensor", parameter)
+                    mesh = getattr(parameter, "device_mesh", None)
+                    parameter_layouts[f"teacher.{name}"] = {
+                        "original_shape": teacher_shapes[name],
+                        "local_shape": tuple(local.shape),
+                        "dtype": str(parameter.dtype),
+                        "storage_bytes": local.numel() * local.element_size(),
+                        "mesh_dim_names": tuple(mesh.mesh_dim_names) if mesh is not None else (),
+                        "mesh_shape": tuple(mesh.shape) if mesh is not None else (),
+                        "placements": str(getattr(parameter, "placements", ())),
+                    }
             # Install observers only after native lazy state has been initialized.
             # torch_npu may install its final FSDP layer on first fully_shard.
             install_fsdp_residency_hooks(runtime.patches)
@@ -389,7 +435,7 @@ def _simulate(simulation, timings: HostTimings):
             execution = "capture"
             with timings.measure("capture_step"):
                 workload = run_simulation_step(
-                    model_parts=[model],
+                    model_parts=[model, teacher] if teacher is not None else [model],
                     parallel_dims=dims,
                     forward_backward_step=forward_backward,
                     input_dict=inputs,
