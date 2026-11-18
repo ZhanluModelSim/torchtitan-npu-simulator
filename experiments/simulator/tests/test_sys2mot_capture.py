@@ -81,8 +81,10 @@ def test_sys2mot_capture_reaches_iteration_with_reference_operators():
     assert len(gradients) == _PARAM_TENSORS
     memory = workload.iteration.schedule.annotations["memory_plan"]
     # Reference ``train_dummy`` dtype: fp32 parameters, fp32 AdamW moments
-    # and one fp32 step scalar per participating parameter.
-    assert memory.persistent_param_bytes == _PARAMS * 4
+    # and one fp32 step scalar per participating parameter. The sharded
+    # frozen teacher is a second FSDP tree: its fp32 parameters are persistent
+    # storage too, but it owns no gradients and no optimizer states.
+    assert memory.persistent_param_bytes == _PARAMS * 8
     assert memory.optimizer_state_bytes == _PARAMS * 8 + _PARAM_TENSORS * 4
     # Capture-session vendor fused boundaries for RMSNorm and rotary-apply
     # (deliberately coarser than the unfused production trace), with the
@@ -169,6 +171,11 @@ def test_sys2mot_expert_parallel_runs_all_to_all_dispatch():
     # efsdp mesh (EP shard on the expert dim), the all-to-all dispatcher
     # exchanges tokens (local fallback at EP=1 keeps the base capture
     # byte-identical), and the FSDP all-gather/reduce-scatter chain stays.
+    # The sharded frozen teacher adds its own EP exchanges and forward
+    # all-gathers; it owns no gradients, so the reduce-scatter chain stays
+    # student-only, and its root + never-resharded [norm, lm_head] unit stay
+    # unsharded across steps (native FSDP2 no-grad semantics), so their
+    # all-gathers appear only in the warmup, not the captured step.
     workload = simulate(
         SimulationConfig(
             config="sys2mot_debugmodel_multimodal",
@@ -181,9 +188,14 @@ def test_sys2mot_expert_parallel_runs_all_to_all_dispatch():
     assert result["graph_acyclic"] and result["peak_storage_unique"]
     nodes = [n for template in workload.step_templates.values() for n in template.nodes.values()]
     counts = Counter(n.annotations["raw_op_type"] for n in nodes)
-    assert counts["_c10d_functional.all_to_all_single.default"] == 40
+    # 8 student MoE layers + 8 teacher MoE layers, each with the balanced
+    # count exchange plus the dispatch/combine pair.
+    assert counts["_c10d_functional.all_to_all_single.default"] == 64
     assert counts["aten._grouped_mm.default"] == 96
-    assert counts["c10d._allgather_base_.default"] == 37
+    # Student: forward + backward regather all-gathers (37). Teacher: 17
+    # forward-only all-gathers (19 units minus the root and [norm, lm_head]
+    # units that stay unsharded).
+    assert counts["c10d._allgather_base_.default"] == 54
     assert counts["c10d._reduce_scatter_base_.default"] == 20
 
 

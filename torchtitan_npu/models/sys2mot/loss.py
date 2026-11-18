@@ -67,8 +67,11 @@ class Sys2MotJointLoss(BaseLoss):
     def set_teacher(self, teacher: torch.nn.Module) -> None:
         """Mount the frozen teacher (eval, no grad); must run before the first call.
 
-        The teacher lives on the loss because it must stay outside FSDP and
-        outside the optimizer, exactly like the reference distillation setup.
+        The teacher lives on the loss so it stays outside the optimizer,
+        exactly like the reference distillation setup; it MAY carry its own
+        FSDP2+EP sharding (the mounter binds the instance forward to the
+        backbone path, so the loss calls it as a module). Frozen: no
+        gradients, no optimizer states, forward comm only.
         """
         if not self.distill:
             raise ValueError("set_teacher requires the distill loss knob")
@@ -94,7 +97,10 @@ class Sys2MotJointLoss(BaseLoss):
         tokens = pred["distill_tokens"]
         text_mask = pred["distill_text_mask"]
         with torch.no_grad():
-            tf = self.teacher.backbone_forward(images, tokens, text_mask=text_mask)
+            # Module call, not ``backbone_forward``: the sharded teacher is an
+            # FSDP tree and the root ``__call__`` pre-hook unshards the vision
+            # stem the root unit owns before the backbone path runs.
+            tf = self.teacher(images, tokens, text_mask=text_mask)
         temperature = self.kd_temperature
         s = logits.float()
         t = tf["logits"].detach().float()
