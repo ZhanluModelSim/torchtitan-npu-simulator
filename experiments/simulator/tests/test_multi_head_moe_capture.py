@@ -225,6 +225,18 @@ def test_multi_head_moe_opt_in_fusion_replaces_only_the_two_branch_seams():
     custom = [n for n in nodes if "tensor_semantics" in n.attrs]
     assert {n.annotations["raw_op_type"] for n in custom} == {_SPARSE_FWD, _SPARSE_BWD, _LINEAR_FWD, _LINEAR_BWD}
 
+    # Mask gradient routing matches the eager reference per branch (PR #19
+    # review): the sparse mask enters the eager branch through the boolean
+    # gate ``masked_fill(mask < 1e-6)``, so the fused sparse backward feeds
+    # only the output mix, while the linear complement mask is a differentiable
+    # einsum operand and its backward joins the ``M_not = 1 - M_c`` chain.
+    sparse_bwd_ids = {n.op_id for n in nodes if n.annotations["raw_op_type"] == _SPARSE_BWD}
+    sparse_consumers = {c.annotations["raw_op_type"] for c in nodes if sparse_bwd_ids & set(c.predecessors)}
+    assert sparse_consumers == {"aten.add.Tensor"}
+    linear_bwd_ids = {n.op_id for n in nodes if n.annotations["raw_op_type"] == _LINEAR_BWD}
+    linear_consumers = {c.annotations["raw_op_type"] for c in nodes if linear_bwd_ids & set(c.predecessors)}
+    assert {"aten.neg.default"} <= linear_consumers
+
     # Library cost routing: durations appear only with a hardware profile.
     annotate_workload_costs(workload)
     fused = [n for n in nodes if n.annotations["raw_op_type"].startswith("multi_head_moe_sim.sla2_")]

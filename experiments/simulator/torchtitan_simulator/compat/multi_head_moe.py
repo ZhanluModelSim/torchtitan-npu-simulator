@@ -22,9 +22,11 @@ replaces the seams only when ``SimulationConfig.enable_sla2_fusion`` is set
 
 Everything around the fusion stays native dispatch: block pooling, the block
 router (its projections are real parameters), the gumbel soft top-k mask,
-``M_not = 1 - M_c`` and the alpha branch mix. The block mask is a real
-differentiable input of both fusions on the training path, so their
-backwards return its gradient alongside the query/key/value gradients.
+``M_not = 1 - M_c`` and the alpha branch mix. The mask differentiability
+matches the eager reference per branch: the sparse branch consumes its mask
+through the boolean gate ``masked_fill(mask < 1e-6)`` so its backward routes
+None to the router, while the linear branch consumes the complement mask as a
+real differentiable einsum operand and its backward returns the mask gradient.
 """
 
 import torch
@@ -141,8 +143,14 @@ def _sparse_setup(ctx, inputs, output):
 def _sparse_backward(ctx, dy):
     q, k, v, mask = ctx.saved_tensors
     grads = sla2_sparse_attention_grad(q, k, v, mask, ctx.selected_blocks, dy)
-    # None marks the non-differentiable selected_blocks scalar.
-    return (*grads, None)
+    # Eager consumes the block mask through the boolean gate
+    # (``masked_fill(mask < 1e-6)``), so no gradient flows back to the
+    # router; the virtual op keeps the fourth output slot for the cost
+    # adaptor contract but autograd routes None for the mask, matching the
+    # eager reference. None also marks the non-differentiable
+    # selected_blocks scalar.
+    _dq, _dk, _dv, _dmask = grads
+    return (_dq, _dk, _dv, None, None)
 
 
 sla2_sparse_attention.register_autograd(_sparse_backward, setup_context=_sparse_setup)
