@@ -208,6 +208,23 @@ def _simulate(simulation, timings: HostTimings):
             original_shapes = {name: tuple(parameter.shape) for name, parameter in logical_named_parameters(model)}
             from torchtitan_simulator.compat.meta_initialization import meta_initialization
 
+            teacher = None
+            if getattr(config.loss, "distill", False):
+                # The reference distillation runs a frozen teacher VLA per step
+                # (backbone forward only: embed_prefix + layers + finish with
+                # logits) and distills logits KL + hidden MSE. The teacher is a
+                # meta model of the same capture config (widths equal, so the
+                # Distiller projection is Identity; the reference loads the real
+                # teacher size from a checkpoint the file does not carry) and
+                # stays outside FSDP and the optimizer, so its comm is zero.
+                # FSDP-sharding the teacher needs the forward-tree root wrapped
+                # (FSDP2 single-root semantics), which would claim the vision
+                # stem into a DTensor group and break the plain-input conv
+                # chain; the spmd annotation bridge that keeps the student's
+                # stem plain does not carry to a second model instance.
+                with timings.measure("teacher_build"):
+                    teacher = build_meta_model(prepared)
+
             with timings.measure("parallelize"), meta_initialization():
                 model = config.model_spec.parallelize_fn(
                     model,
@@ -251,14 +268,7 @@ def _simulate(simulation, timings: HostTimings):
             loss_fn = config.loss.build(compile_config=config.compile)
             loss_fn.set_lm_head(model.lm_head)
             model._skip_lm_head = True
-            if getattr(config.loss, "distill", False):
-                # The reference distillation runs a frozen teacher VLA per step
-                # and distills logits KL + hidden MSE. The teacher is a meta
-                # model of the same capture config (widths equal, so the
-                # Distiller projection is Identity), mounted on the loss to
-                # stay outside FSDP and the optimizer.
-                with timings.measure("teacher_build"):
-                    teacher = build_meta_model(prepared)
+            if teacher is not None:
                 loss_fn.set_teacher(teacher)
                 model._distill_capture = True
             from torchtitan_npu.extensions.torchtitan.distributed.flex_shard.planning import collect_planning_timings
