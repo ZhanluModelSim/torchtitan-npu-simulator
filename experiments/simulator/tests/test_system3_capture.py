@@ -39,20 +39,48 @@ def test_system3_text_capture_reaches_iteration_with_reference_operators():
     assert result["graph_acyclic"] and result["peak_storage_unique"]
     nodes = [n for template in workload.step_templates.values() for n in template.nodes.values()]
     counts = Counter(n.annotations["raw_op_type"] for n in nodes)
-    # The ISA/GDN2/Engram/mHC paths are the reference's own eager operators;
-    # nothing is substituted by virtual fused ops. GDN2's per-token delta-rule
-    # loop pads k/v/q to the 16-wide state (constant_pad_nd), the ISA indexer
-    # masks the compressed grid (masked_fill + topk), the routed experts run
-    # three grouped GEMMs per MoE layer, and the router normalizes in fp32.
-    assert counts["aten.constant_pad_nd.default"] == 2304
-    assert counts["aten.masked_fill_.Scalar"] == 288
-    assert counts["aten.topk.default"] == 22
+    # The compatibility layer installs the system3 virtual fusions and the
+    # npu_rms_norm recipe: the per-token delta-rule loop collapses into
+    # ``system3_sim.gdn2_chunked`` (absorbing the eager pad/mask branches),
+    # the MoE FFN activation collapses into ``system3_sim.swiglu_clamp``
+    # (absorbing silu/gelu), the ISA top-K selection and the selected-key
+    # attention core collapse into ``system3_sim.isa_indexer`` /
+    # ``isa_sparse_attention`` (absorbing the indexer topk/softmax and the
+    # gather/score/combine einsums), and the reference RMSNorm math
+    # dispatches as ``npu_rms_norm``.  The remaining eager operators (MoE
+    # routing topk, grouped GEMMs, router softmax) keep their counts.
+    assert counts["system3_sim.gdn2_chunked.default"] == 18
+    assert counts["system3_sim.gdn2_chunked_backward.default"] == 18
+    assert counts["system3_sim.swiglu_clamp.default"] == 36
+    assert counts["system3_sim.swiglu_clamp_backward.default"] == 36
+    assert counts["system3_sim.isa_indexer.default"] == 4
+    assert counts["system3_sim.isa_indexer_grad.default"] == 4
+    assert counts["system3_sim.isa_sparse_attention.default"] == 6
+    assert counts["system3_sim.isa_sparse_attention_grad.default"] == 6
+    assert counts["npu.npu_rms_norm.default"] == 243
+    assert counts["npu.npu_rms_norm_backward.default"] == 243
+    assert counts["aten.constant_pad_nd.default"] == 0
+    assert counts["aten.masked_fill_.Scalar"] == 0
+    assert counts["aten.silu.default"] == 0
+    assert counts["aten.topk.default"] == 18
     assert counts["aten._grouped_mm.default"] == 162
-    assert counts["aten._softmax.default"] == 24
-    assert counts["aten.silu.default"] == 36
+    assert counts["aten._softmax.default"] == 18
     assert counts["aten.embedding.default"] == 13
-    # No virtual fusion ops: every node is a native aten/collective op.
-    assert not any(raw.startswith(("system3.", "multi_head_moe_sim.", "deepseek_v4.")) for raw in counts)
+    # No foreign virtual fusions: the only virtual ops are this workspace's
+    # system3_sim family, and they are the only nodes carrying
+    # ``tensor_semantics`` schema attributes.
+    assert not any(raw.startswith(("multi_head_moe_sim.", "deepseek_v4.")) for raw in counts)
+    semantic_nodes = [n for n in nodes if "tensor_semantics" in n.attrs]
+    assert {n.annotations["raw_op_type"] for n in semantic_nodes} == {
+        "system3_sim.gdn2_chunked.default",
+        "system3_sim.gdn2_chunked_backward.default",
+        "system3_sim.swiglu_clamp.default",
+        "system3_sim.swiglu_clamp_backward.default",
+        "system3_sim.isa_indexer.default",
+        "system3_sim.isa_indexer_grad.default",
+        "system3_sim.isa_sparse_attention.default",
+        "system3_sim.isa_sparse_attention_grad.default",
+    }
     gradients = workload.iteration.schedule.annotations["gradient_validation"]
     assert len(gradients) == _TEXT_PARAM_TENSORS
     memory = workload.iteration.schedule.annotations["memory_plan"]
@@ -60,7 +88,6 @@ def test_system3_text_capture_reaches_iteration_with_reference_operators():
     # Native fused AdamW keeps two FP32 moments and one device FP32 step
     # scalar per participating parameter.
     assert memory.optimizer_state_bytes == _TEXT_PARAMS * 8 + _TEXT_PARAM_TENSORS * 4
-    assert all("tensor_semantics" not in n.attrs for n in nodes)
 
 
 def test_system3_full_ac_recomputes_forward_math():
@@ -72,12 +99,22 @@ def test_system3_full_ac_recomputes_forward_math():
     nodes = [n for template in workload.step_templates.values() for n in template.nodes.values()]
     counts = Counter(n.annotations["raw_op_type"] for n in nodes)
     # Full AC recomputes the forward inside backward: the forward-only math
-    # doubles (topk/indexer, grouped GEMMs, softmax, router math), while the
-    # pad/mask signatures keep their backward-side counts.
-    assert counts["aten.topk.default"] == 44
+    # doubles (topk/indexer, grouped GEMMs, softmax, router math, and the
+    # virtual fusion forward stems), while the backward-side counts keep
+    # their single-pass population.
+    assert counts["system3_sim.gdn2_chunked.default"] == 36
+    assert counts["system3_sim.gdn2_chunked_backward.default"] == 18
+    assert counts["system3_sim.swiglu_clamp.default"] == 72
+    assert counts["system3_sim.swiglu_clamp_backward.default"] == 36
+    assert counts["system3_sim.isa_indexer.default"] == 8
+    assert counts["system3_sim.isa_indexer_grad.default"] == 4
+    assert counts["system3_sim.isa_sparse_attention.default"] == 12
+    assert counts["system3_sim.isa_sparse_attention_grad.default"] == 6
+    assert counts["npu.npu_rms_norm.default"] == 485
+    assert counts["npu.npu_rms_norm_backward.default"] == 243
+    assert counts["aten.topk.default"] == 36
     assert counts["aten._grouped_mm.default"] == 216
-    assert counts["aten._softmax.default"] == 48
-    assert counts["aten.silu.default"] == 72
+    assert counts["aten._softmax.default"] == 36
     assert counts["aten.embedding.default"] == 25
     gradients = workload.iteration.schedule.annotations["gradient_validation"]
     assert len(gradients) == _TEXT_PARAM_TENSORS
@@ -93,11 +130,20 @@ def test_system3_multimodal_capture_includes_encoder_gradients():
     assert len(gradients) == _MM_PARAM_TENSORS
     nodes = [n for template in workload.step_templates.values() for n in template.nodes.values()]
     counts = Counter(n.annotations["raw_op_type"] for n in nodes)
-    # The encoders are plain bidirectional blocks (qkv bmm attention +
-    # gelu MLP) behind Conv/patch stems; the modality type lookup joins the
-    # sequence (backbone lookups + one per modality segment).
+    # The encoders are plain bidirectional blocks (qkv bmm attention + gelu
+    # MLP) behind Conv/patch stems; the modality type lookup joins the
+    # sequence (backbone lookups + one per modality segment).  The encoder
+    # attention runs as ``npu_fusion_attention`` (8 forward + 8 gradient
+    # stems), and the backbone ISA units fuse into the virtual selection and
+    # selected-key boundaries, so the softmax count keeps only the eager
+    # router math.
+    assert counts["npu.npu_fusion_attention.default"] == 8
+    assert counts["npu.npu_fusion_attention_grad.default"] == 8
+    assert counts["system3_sim.isa_indexer.default"] == 4
+    assert counts["system3_sim.isa_sparse_attention.default"] == 6
     assert counts["aten.embedding.default"] == 17
-    assert counts["aten._softmax.default"] == 32  # backbone + 8 encoder blocks
+    assert counts["aten._softmax.default"] == 18  # eager router math only
+    assert counts["aten.gelu.default"] == 13  # encoder MLP activations stay eager
     memory = workload.iteration.schedule.annotations["memory_plan"]
     assert memory.persistent_param_bytes == _MM_PARAMS * 4
     assert memory.optimizer_state_bytes == _MM_PARAMS * 8 + _MM_PARAM_TENSORS * 4

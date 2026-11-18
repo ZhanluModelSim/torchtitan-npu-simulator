@@ -147,6 +147,15 @@ _COMMON_OVERRIDES = [
     "torchtitan_npu.override.common.token_dispatcher.asc",
 ]
 
+_SYSTEM3_OVERRIDES = [
+    # common.rms_norm.asc gates the simulator npu_rms_norm Meta bridge; the
+    # recipe itself has no targets because system3 ships its own norm class.
+    "torchtitan_npu.override.common.rms_norm.asc",
+    "torchtitan_npu.override.system3.rms_norm.asc",
+    "torchtitan_npu.override.common.token_dispatcher.asc",
+    "torchtitan_npu.override.common.fusion_attention.asc",
+]
+
 _QWEN3_OVERRIDES = [
     "torchtitan_npu.override.common.rms_norm.asc",
     # Dense GQA attention on the real fused CANN kernel; the simulator bridges
@@ -313,7 +322,7 @@ def prepare_config(simulation: SimulationConfig) -> PreparedConfig:
                 "kimi_k3": _COMMON_OVERRIDES,
                 "kimi_k3_1": _COMMON_OVERRIDES,
                 "qwen3": _QWEN3_OVERRIDES,
-                "system3": _COMMON_OVERRIDES,
+                "system3": _SYSTEM3_OVERRIDES,
             }[trainer.model_spec.name]
         )
         if simulation.override_imports is None

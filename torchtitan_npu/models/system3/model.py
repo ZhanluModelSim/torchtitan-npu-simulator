@@ -311,10 +311,14 @@ class ISAIndexer(Module):
 
     def select(self, hidden_states, attention_mask=None):
         """Returns topk_indices [b, s, topk], topk_scores [b, s, topk]."""
-        b, s, _ = hidden_states.shape
         idx_q = self.q_norm(self.q_proj(hidden_states))
         idx_k = self.k_norm(self.k_proj(hidden_states))
         idx_k_c = idx_k[:, :: self.compress_ratio, :]
+        return self._select_topk(idx_q, idx_k_c, attention_mask)
+
+    def _select_topk(self, idx_q, idx_k_c, attention_mask=None):
+        """Causal top-K selection over the compressed indexer grid (seam)."""
+        b, s, _ = idx_q.shape
         cl = idx_k_c.shape[1]
 
         scores = torch.bmm(
@@ -322,8 +326,8 @@ class ISAIndexer(Module):
             idx_k_c.reshape(b, cl, -1).transpose(1, 2),
         ) / math.sqrt(idx_q.shape[-1])
 
-        q_pos = torch.arange(s, device=hidden_states.device).unsqueeze(1)
-        k_pos = torch.arange(0, s, self.compress_ratio, device=hidden_states.device).unsqueeze(0)
+        q_pos = torch.arange(s, device=idx_q.device).unsqueeze(1)
+        k_pos = torch.arange(0, s, self.compress_ratio, device=idx_q.device).unsqueeze(0)
         # Mask value uses the dtype minimum (-1e9 is not representable in fp16).
         mask_val = torch.finfo(scores.dtype).min
         scores = scores.masked_fill((k_pos > q_pos).unsqueeze(0), mask_val)
@@ -357,6 +361,10 @@ class IndexedSparseAttention(Module):
         self.compress_ratio = config.compress_ratio
 
     def forward(self, q_full, k_comp, v_comp, topk_indices, topk_scores, attention_mask=None):
+        return self._sparse_attention(q_full, k_comp, v_comp, topk_indices, topk_scores, attention_mask)
+
+    def _sparse_attention(self, q_full, k_comp, v_comp, topk_indices, topk_scores, attention_mask=None):
+        """Selected-key attention over the compressed KV grid (seam)."""
         b, s, nh, hd = q_full.shape
         cl = k_comp.shape[1]
         actual_topk = topk_indices.shape[-1]
@@ -463,11 +471,21 @@ class GDN2Attention(Module):
         # Per-head read gain: [b, s, H]
         da_gain = torch.sigmoid(da.mean(dim=-1))
 
-        device = hidden_states.device
-        dtype = hidden_states.dtype
+        # The delta-rule update runs token by token in the reference
+        # (production may swap in a chunked-parallel algorithm; the reference
+        # is serial). The seam keeps that swap a one-method change.
+        out = self._delta_rule_scan(q, k, v, alpha, beta_erase, beta_write, da_gain, mask)
+        out = out.reshape(b, s, H * dv)
+        return self.o_proj(out)
 
-        # Reference runs the delta-rule update token by token (production may
-        # swap in a chunked-parallel algorithm; the reference is serial).
+    def _delta_rule_scan(self, q, k, v, alpha, beta_erase, beta_write, da_gain, mask):
+        """Serial reference delta-rule scan; the simulator swaps a chunked boundary in."""
+        b, s, H = q.shape[0], q.shape[1], q.shape[2]
+        ds, dv = beta_erase.shape[-1], v.shape[-1]
+        dk = q.shape[-1]
+        device = q.device
+        dtype = q.dtype
+
         S = torch.zeros(b, H, ds, ds, device=device, dtype=dtype)
 
         outputs = []
@@ -526,9 +544,7 @@ class GDN2Attention(Module):
 
             outputs.append(o)
 
-        out = torch.stack(outputs, dim=1)  # [b, s, H, dv]
-        out = out.reshape(b, s, H * dv)
-        return self.o_proj(out)
+        return torch.stack(outputs, dim=1)  # [b, s, H, dv]
 
 
 # ============================================================================

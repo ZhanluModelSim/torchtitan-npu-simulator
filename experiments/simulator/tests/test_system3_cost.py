@@ -87,10 +87,8 @@ def test_system3_fallback_families_cover_the_eager_math(_annotated_nodes) -> Non
     fallback_families = (
         "aten.mul.Tensor",
         "aten.add.Tensor",
-        "aten.constant_pad_nd.default",
         "aten.select_backward.default",
         "aten.sum.dim_IntList",
-        "aten.masked_fill_.Scalar",
         "aten.embedding.default",
         "aten.topk.default",
         "aten.sigmoid.default",
@@ -99,3 +97,13 @@ def test_system3_fallback_families_cover_the_eager_math(_annotated_nodes) -> Non
         members = [n for n in nodes if n.annotations.get("raw_op_type") == raw]
         assert members, f"{raw} absent from capture"
         assert all("cost_unknown" not in n.annotations for n in members), f"{raw} not annotated"
+    # The declared multi-output generalization (values + index streams, split
+    # chunks) routes the sort/split spellings the single-output contract used
+    # to reject; the GDN2 chunked fusion absorbed the eager constant_pad_nd /
+    # masked_fill_ branches, so they no longer appear in the capture.
+    for raw in ("aten.sort.stable", "aten.split.Tensor"):
+        members = [n for n in nodes if n.annotations.get("raw_op_type") == raw]
+        assert members, f"{raw} absent from capture"
+        assert all("cost_unknown" not in n.annotations for n in members), f"{raw} not annotated"
+    fused = ("aten.constant_pad_nd.default", "aten.masked_fill_.Scalar")
+    assert not [n for n in nodes if n.annotations.get("raw_op_type") in fused]

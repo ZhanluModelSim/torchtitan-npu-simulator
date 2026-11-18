@@ -43,7 +43,7 @@ __all__ = ["CostEstimate", "annotate_workload_costs", "compute_cost"]
 
 if TYPE_CHECKING:
     from operator_performance_models.core import Hardware
-    from operator_performance_models.models.roofline._defaults import SemanticBackend
+    from operator_performance_models.models.roofline.base._defaults import SemanticBackend
 
 _FLOPS_KEY = "flops"
 _TRAFFIC_KEY = "memory_traffic_bytes"
@@ -110,10 +110,20 @@ def _raw_index() -> dict[str, str]:
     """Raw spelling -> canonical family name (package-owned index)."""
     global _RAW_INDEX
     if _RAW_INDEX is None:
-        from operator_performance_models.adaptors.declared import builtin_raw_index
+        from operator_performance_models.adaptors.vec.declared import builtin_raw_index
 
         _RAW_INDEX = builtin_raw_index()
     return _RAW_INDEX
+
+
+def _freeze_attr(value):
+    """Capture attrs may carry dict/list structures (tensor semantics facts);
+    the library accepts only immutable scalars and tuples."""
+    if isinstance(value, dict):
+        return tuple((k, _freeze_attr(v)) for k, v in value.items())
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_attr(v) for v in value)
+    return value
 
 
 def _opm_features(
@@ -130,7 +140,7 @@ def _opm_features(
         name=canonical,
         inputs=tuple(TensorFeatures(shape=t.shape, dtype=t.dtype, device=t.device) for t in inputs),
         outputs=tuple(TensorFeatures(shape=t.shape, dtype=t.dtype, device=t.device) for t in outputs),
-        attributes=tuple((k, tuple(v) if isinstance(v, list) else v) for k, v in (attrs or {}).items()),
+        attributes=tuple((k, _freeze_attr(v)) for k, v in (attrs or {}).items()),
     )
 
 
@@ -240,17 +250,17 @@ def _sla2_families() -> dict:
     ``docs/sla2-roofline-models.md``); this adapter only translates captured
     tensor facts and the ``selected_blocks`` schema scalar.
     """
-    from operator_performance_models.adaptors.npu_fused import (
+    from operator_performance_models.adaptors.mix.sla2 import (
         Sla2LinearAttentionAdaptor,
-        Sla2SparseAttentionAdaptor,
-    )
-    from operator_performance_models.adaptors.npu_gradients import (
         Sla2LinearAttentionGradientAdaptor,
+        Sla2SparseAttentionAdaptor,
         Sla2SparseAttentionGradientAdaptor,
     )
-    from operator_performance_models.models.roofline.fused import (
+    from operator_performance_models.models.roofline.mix.sla2_linear_attention import (
         Sla2LinearAttentionGradientRoofline,
         Sla2LinearAttentionRoofline,
+    )
+    from operator_performance_models.models.roofline.mix.sla2_sparse_attention import (
         Sla2SparseAttentionGradientRoofline,
         Sla2SparseAttentionRoofline,
     )
@@ -405,7 +415,7 @@ def _declared_index() -> dict[str, str]:
     """Raw spelling -> declared fallback canonical (package-owned table)."""
     global _DECLARED_INDEX
     if _DECLARED_INDEX is None:
-        from operator_performance_models.adaptors.declared import declared_raw_index
+        from operator_performance_models.adaptors.vec.declared import declared_raw_index
 
         _DECLARED_INDEX = declared_raw_index()
     return _DECLARED_INDEX
@@ -468,28 +478,38 @@ def compute_cost(
 
     Passing a hardware profile additionally asks the library for a duration
     prediction; the default ``None`` keeps every call hardware-independent.
-    Nodes dispatching as ``unknown`` fall back to their ``raw_op_type``.
+    A dispatch handler that rejects the node (or returns unknown) falls back
+    to the captured raw spelling route before the op stays unknown, so a
+    stale declared dispatch cannot mask a precise family the package knows.
     Handlers that declare an ``attrs`` parameter receive the captured node
     attributes (schema scalars of virtual fusions).
     """
+    estimate: CostEstimate | None = None
     handler = _HANDLERS.get(op_type)
     if handler is not None:
         try:
             if _accepts_attrs(handler):
-                return handler(inputs, outputs, hardware, attrs or {})
-            return handler(inputs, outputs, hardware)
+                estimate = handler(inputs, outputs, hardware, attrs or {})
+            else:
+                estimate = handler(inputs, outputs, hardware)
         except (IndexError, TypeError, ValueError):
-            return CostEstimate.unknown_cost()
-    raw = raw_op_type or op_type
-    try:
-        estimate = _raw_cost(raw, inputs, outputs, hardware, attrs)
-        if estimate is None and raw_op_type is not None and raw_op_type != op_type:
-            estimate = _raw_cost(op_type, inputs, outputs, hardware, attrs)
-        if estimate is not None:
-            return estimate
-    except (IndexError, TypeError, ValueError):
+            estimate = None
+    if estimate is None or estimate.unknown or (
+        not estimate.flops and not estimate.traffic_bytes and estimate.duration_us is None
+    ):
+        raw = raw_op_type or op_type
+        try:
+            raw_estimate = _raw_cost(raw, inputs, outputs, hardware, attrs)
+            if raw_estimate is None and raw_op_type is not None and raw_op_type != op_type:
+                raw_estimate = _raw_cost(op_type, inputs, outputs, hardware, attrs)
+            if raw_estimate is not None:
+                return raw_estimate
+        except (IndexError, TypeError, ValueError):
+            if estimate is None:
+                return CostEstimate.unknown_cost()
+    if estimate is None:
         return CostEstimate.unknown_cost()
-    return CostEstimate.unknown_cost()
+    return estimate
 
 
 def _annotate_node(node: OpNode, hardware) -> None:
