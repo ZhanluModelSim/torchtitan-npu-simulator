@@ -25,6 +25,8 @@ class MemorySummary(TypedDict):
     steady_state_optimizer_active_bytes_peak: int | None
     persistent_param_bytes: int
     optimizer_state_bytes: int | None
+    host_param_bytes: int
+    host_optimizer_state_bytes: int | None
     activation_offload_by_layer: list[LayerOffloadTransfer]
 
 

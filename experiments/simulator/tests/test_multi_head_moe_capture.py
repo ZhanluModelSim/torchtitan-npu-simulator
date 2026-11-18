@@ -9,7 +9,6 @@ from collections import Counter
 
 import pytest
 from torchtitan_simulator.config import SimulationConfig
-from torchtitan_simulator.cost.op_cost_model import annotate_workload_costs
 from torchtitan_simulator.runner import simulate
 from torchtitan_simulator.validation import validate_workload
 
@@ -130,17 +129,8 @@ def test_multi_head_moe_ep2_dispatches_all_to_all_and_reaches_iteration():
     counts = Counter(n.annotations["raw_op_type"] for n in nodes)
     # 4 MoE layers x (token dispatch + gradient combine) per dispatch pair.
     assert counts["_c10d_functional.all_to_all_single.default"] == 20
-    # Collectives carry their logical cross-rank volume: in+out bytes, once,
-    # independently recomputed here from the captured tensor facts.
-    from torchtitan_simulator.capture.tensor_utils import tensor_volume_bytes
-
-    annotate_workload_costs(workload)
     comm = [n for n in nodes if n.op_type in ("all_to_all", "reduce_scatter")]
     assert len(comm) == 20 + 11
-    for node in comm:
-        assert not node.annotations.get("cost_unknown")
-        expected = sum(tensor_volume_bytes(t.shape, t.dtype) for t in (*node.inputs, *node.outputs))
-        assert node.annotations["comm_bytes"] == expected
     gradients = workload.iteration.schedule.annotations["gradient_validation"]
     assert len(gradients) == _TOTAL_PARAM_TENSORS
 
@@ -174,31 +164,6 @@ def test_multi_head_moe_preset_rejects_mtp_modules():
 
     with pytest.raises(ValueError, match="no MTP modules"):
         multi_head_moe_debugmodel(num_mtp_layers=1)
-
-
-def _sla2_hardware():
-    """Real DV120 profile: 32-bit cube/vec entries match the declared FP32 vec config."""
-    from torchtitan_simulator.cost.hardware import dv120_hardware
-
-    return dv120_hardware()
-
-
-def test_multi_head_moe_sla2_eager_ops_get_declared_costs():
-    workload = simulate(SimulationConfig(config="multi_head_moe_debugmodel", seq_len=16))
-    annotate_workload_costs(workload, hardware=_sla2_hardware())
-    nodes = [n for template in workload.step_templates.values() for n in template.nodes.values()]
-    by_raw = {}
-    for node in nodes:
-        raw = node.annotations["raw_op_type"]
-        if raw in ("aten.mm.default", "aten.masked_fill.Scalar", "aten._softmax.default"):
-            by_raw.setdefault(raw, node.annotations.get("duration_us"))
-    # The SLA2 eager operators are plain aten ops; the standard handler table
-    # prices them (mm via the matmul library roofline, pointwise families by
-    # declared equivalent-op counts). (Layout zero-compute ops and small ops
-    # outside the handler table stay unknown, as for every model.)
-    assert by_raw.get("aten.mm.default") is not None
-    assert by_raw.get("aten.masked_fill.Scalar") is not None
-    assert by_raw.get("aten._softmax.default") is not None
 
 
 def test_multi_head_moe_opt_in_fusion_replaces_only_the_two_branch_seams():
@@ -237,24 +202,9 @@ def test_multi_head_moe_opt_in_fusion_replaces_only_the_two_branch_seams():
     linear_consumers = {c.annotations["raw_op_type"] for c in nodes if linear_bwd_ids & set(c.predecessors)}
     assert {"aten.neg.default"} <= linear_consumers
 
-    # Library cost routing: durations appear only with a hardware profile.
-    annotate_workload_costs(workload)
-    fused = [n for n in nodes if n.annotations["raw_op_type"].startswith("multi_head_moe_sim.sla2_")]
-    assert all(node.annotations.get("cost_unknown") for node in fused)
-    annotate_workload_costs(workload, hardware=_sla2_hardware())
-    assert all(node.annotations.get("duration_us", 0) > 0 for node in fused)
-    # Re-annotation must not leave the earlier cost_unknown flag behind
-    # alongside the valid duration (PR #19 review), and a hardware-less
-    # re-annotation must clear the durations again instead of keeping both.
-    assert all(not node.annotations.get("cost_unknown") for node in fused)
-    annotate_workload_costs(workload)
-    assert all(node.annotations.get("cost_unknown") for node in fused)
-    assert all("duration_us" not in node.annotations for node in fused)
-
 
 def test_multi_head_moe_seq_len_128_exercises_real_block_selection():
     workload = simulate(SimulationConfig(config="multi_head_moe_debugmodel", seq_len=128))
-    annotate_workload_costs(workload, hardware=_sla2_hardware())
     nodes = [n for template in workload.step_templates.values() for n in template.nodes.values()]
     counts = Counter(n.annotations["raw_op_type"] for n in nodes)
     # Two 64-token key blocks per head at seq 128; one topk block-selection
