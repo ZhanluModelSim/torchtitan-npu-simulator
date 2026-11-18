@@ -81,10 +81,6 @@ def deepseek_v4_1_debugmodel_text(*, num_mtp_layers: int = 0):
     return _deepseek_v4_1_trainer_config("deepseek_v4_1_debugmodel_text", num_mtp_layers=num_mtp_layers)
 
 
-def deepseek_v4_1_debugmodel_multimodal(*, num_mtp_layers: int = 0):
-    return _deepseek_v4_1_trainer_config("deepseek_v4_1_debugmodel_multimodal", num_mtp_layers=num_mtp_layers)
-
-
 def deepseek_v4_pro_20t(*, num_mtp_layers=0):
     from torchtitan_npu.models.deepseek_v4 import _make_v4_config
     from torchtitan_npu.models.deepseek_v4.config_registry import _dsv4_optimizer_config, deepseek_v4_pro

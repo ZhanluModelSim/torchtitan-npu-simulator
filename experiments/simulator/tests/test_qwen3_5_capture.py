@@ -294,3 +294,18 @@ def test_qwen3_5_default_overrides_reach_gdn_kernel_and_moe_dispatcher():
 def test_qwen3_5_rejects_mtp_modules():
     with pytest.raises(ValueError, match="no MTP"):
         simulate(SimulationConfig(config="qwen3_5_debugmodel", num_mtp_modules=1))
+
+def test_qwen3_5_capture_rejects_bfloat16_original_parameters():
+    # The capability matrix promises full Qwen3.5 capture only with FP32
+    # original parameters; the runner fail-fasts before any capture work
+    # (PR #19 review). mixed_precision_param=bfloat16 stays the BF16
+    # compute path and is exercised by the capture tests above.
+    with pytest.raises(ValueError, match=r"training\.dtype=float32"):
+        simulate(
+            SimulationConfig(
+                config="qwen3_5_debugmodel",
+                seq_len=16,
+                world_size=1,
+                training_dtype="bfloat16",
+            )
+        )

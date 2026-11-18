@@ -86,3 +86,11 @@ def test_deepseek_v4_1_capture_reaches_iteration_with_metadata_map(world, replic
     # host-offload tables' SparseAdam state stubs (dense and sparse parameter
     # groups are accounted separately, and the stubs do not shard).
     assert memory.optimizer_state_bytes == local_dense * 8 + 4496
+
+def test_deepseek_v4_1_multimodal_flavor_is_not_a_capture_preset():
+    # The multimodal flavor needs pixel_values the text-only runner does not
+    # synthesize, so its vision parameters would fail the gradient manifest
+    # (PR #19 review). The capture preset table exposes the text flavor only;
+    # the native multimodal factory stays available to native training.
+    with pytest.raises(ValueError, match="Unknown simulator preset"):
+        simulate(SimulationConfig(config="deepseek_v4_1_debugmodel_multimodal", seq_len=16))
