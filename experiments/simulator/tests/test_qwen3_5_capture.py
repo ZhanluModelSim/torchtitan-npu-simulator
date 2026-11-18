@@ -129,6 +129,33 @@ def test_qwen3_5_capture_reaches_iteration_with_virtual_gdn_and_flex_boundaries(
     # cu_seqlens; the direct-dispatch test covers the absent-reset branch.
     assert roles == ["query", "key", "value", "decay_gate", "update_gate", "state_reset_mask"]
     assert tuple(gdn_forward.inputs[5].shape) == (1, 16)
+    flex_forwards = [
+        n for n in custom if n.annotations["raw_op_type"] == "qwen3_5_sim.flex_attention.default"
+    ]
+    assert flex_forwards
+    for node in flex_forwards:
+        bindings = {item["role"]: item for item in node.attrs["tensor_semantics"]["inputs"]}
+        # The causal BlockMask payload stays connected to every flex fusion
+        # node as dependency inputs with declared mask semantics (PR #19
+        # review): the block counts and indices per query block, full-block
+        # documentary counts included, survive into the captured node facts
+        # instead of being dropped at the boundary.
+        expected_flex_roles = {
+            "key_block_count_mask",
+            "key_block_index_mask",
+            "query_block_count_mask",
+            "query_block_index_mask",
+            "full_key_block_count_mask",
+            "full_key_block_index_mask",
+            "full_query_block_count_mask",
+            "full_query_block_index_mask",
+        }
+        assert expected_flex_roles <= set(bindings)
+        counts_tensor = node.inputs[bindings["key_block_count_mask"]["index"]]
+        indices_tensor = node.inputs[bindings["key_block_index_mask"]["index"]]
+        assert len(counts_tensor.shape) == 3 and len(indices_tensor.shape) == 4
+        assert counts_tensor.dtype == "int32" and indices_tensor.dtype == "int32"
+        assert counts_tensor.shape[:3] == indices_tensor.shape[:3]
 
 
 @pytest.mark.parametrize(
@@ -140,7 +167,12 @@ def test_qwen3_5_capture_reaches_iteration_with_virtual_gdn_and_flex_boundaries(
             [(1, 8, 2, 64), (1, 8, 2, 64), (1, 8, 2, 64), (1, 8, 2), (1, 8, 2)],
             (None,),
         ),
-        (flex_attention, "flex_attention_grad", [(1, 4, 8, 64), (1, 2, 8, 64), (1, 2, 8, 64)], (0.125, True)),
+        (
+            flex_attention,
+            "flex_attention_grad",
+            [(1, 4, 8, 64), (1, 2, 8, 64), (1, 2, 8, 64)],
+            (0.125, True, None, None, None, None, None, None, None, None),
+        ),
     ],
     ids=["gdn", "flex"],
 )
@@ -186,7 +218,9 @@ def test_qwen3_5_fusion_semantics_declare_roles_and_skip_absent_reset():
         q = torch.empty(1, 4, 8, 64, device="meta", requires_grad=True)
         k = torch.empty(1, 2, 8, 64, device="meta", requires_grad=True)
         v = torch.empty(1, 2, 8, 64, device="meta", requires_grad=True)
-        flex_out = flex_attention(q.sin(), k.sin(), v.sin(), 0.125, True)
+        flex_out = flex_attention(
+            q.sin(), k.sin(), v.sin(), 0.125, True, None, None, None, None, None, None, None, None
+        )
         flex_out.backward(torch.empty_like(flex_out))
 
     nodes = {node.annotations["raw_op_type"]: node for node in capture.build_nodes().values()}
@@ -236,6 +270,104 @@ def test_qwen3_5_fusion_semantics_declare_roles_and_skip_absent_reset():
     )
     json.dumps(gdn.attrs["tensor_semantics"], allow_nan=False)
     json.dumps(flex.attrs["tensor_semantics"], allow_nan=False)
+
+
+def test_qwen3_5_flex_fusion_keeps_blockmask_payload_connected():
+    q = torch.empty(1, 4, 8, 64, device="meta", requires_grad=True)
+    k = torch.empty(1, 2, 8, 64, device="meta", requires_grad=True)
+    v = torch.empty(1, 2, 8, 64, device="meta", requires_grad=True)
+    kv_num_blocks = torch.empty(1, 1, 1, device="meta", dtype=torch.int32)
+    kv_indices = torch.empty(1, 1, 1, 4, device="meta", dtype=torch.int32)
+    q_num_blocks = torch.empty(1, 1, 1, device="meta", dtype=torch.int32)
+    q_indices = torch.empty(1, 1, 1, 4, device="meta", dtype=torch.int32)
+    full_kv_num_blocks = torch.empty(1, 1, 1, device="meta", dtype=torch.int32)
+    full_kv_indices = torch.empty(1, 1, 1, 4, device="meta", dtype=torch.int32)
+    capture = OpDispatchCapture()
+    with capture:
+        out = flex_attention(
+            q.sin(),
+            k.sin(),
+            v.sin(),
+            0.125,
+            True,
+            kv_num_blocks,
+            kv_indices,
+            q_num_blocks,
+            q_indices,
+            full_kv_num_blocks,
+            full_kv_indices,
+            None,
+            None,
+        )
+        out.backward(torch.empty_like(out))
+    nodes = {node.annotations["raw_op_type"]: node for node in capture.build_nodes().values()}
+    forward = nodes["qwen3_5_sim.flex_attention.default"]
+    roles = {item["role"]: item["index"] for item in forward.attrs["tensor_semantics"]["inputs"]}
+    # The block-structure tensors are real dependency inputs of the captured
+    # forward and backward nodes, with declared mask semantics (PR #19
+    # review); the absent full_q_* slots are skipped from the declared roles.
+    expected_roles = {
+        "key_block_count_mask",
+        "key_block_index_mask",
+        "query_block_count_mask",
+        "query_block_index_mask",
+        "full_key_block_count_mask",
+        "full_key_block_index_mask",
+    }
+    assert expected_roles <= set(roles)
+    assert not {"full_query_block_count_mask", "full_query_block_index_mask"} & set(roles)
+    assert tuple(forward.inputs[roles["key_block_count_mask"]].shape) == (1, 1, 1)
+    assert tuple(forward.inputs[roles["key_block_index_mask"]].shape) == (1, 1, 1, 4)
+    memory = capture.memory_events()
+    forward_event = next(e for e in memory if e.raw_op_type == "qwen3_5_sim.flex_attention.default")
+    backward_event = next(e for e in memory if e.raw_op_type == "qwen3_5_sim.flex_attention_grad.default")
+    mask_ids = {
+        capture.tensor_id(tensor)
+        for tensor in (kv_num_blocks, kv_indices, q_num_blocks, q_indices, full_kv_num_blocks, full_kv_indices)
+    }
+    assert mask_ids <= {t.tensor_id for t in forward_event.inputs}
+    assert mask_ids <= {t.alias_of or t.tensor_id for t in backward_event.inputs}
+
+
+def test_qwen3_5_flex_bridge_rejects_unsupported_requests_and_mask_fields():
+    from types import SimpleNamespace
+
+    from torchtitan_simulator.compat.qwen3_5 import _flex_bridge
+
+    q = torch.empty(1, 4, 8, 64, device="meta")
+    k = torch.empty(1, 2, 8, 64, device="meta")
+    v = torch.empty(1, 2, 8, 64, device="meta")
+    kv_num_blocks = torch.empty(1, 1, 1, device="meta", dtype=torch.int32)
+    kv_indices = torch.empty(1, 1, 1, 4, device="meta", dtype=torch.int32)
+    causal_mask = SimpleNamespace(
+        kv_num_blocks=kv_num_blocks,
+        kv_indices=kv_indices,
+        q_num_blocks=None,
+        q_indices=None,
+        full_kv_num_blocks=None,
+        full_kv_indices=None,
+        full_q_num_blocks=None,
+        full_q_indices=None,
+    )
+    # score_mod programs and auxiliary-output requests are rejected explicitly
+    # instead of being silently ignored (PR #19 review).
+    with pytest.raises(NotImplementedError, match="score_mod"):
+        _flex_bridge(q, k, v, score_mod=object(), block_mask=None, scale=0.125,
+                      enable_gqa=True, return_aux=None, kernel_options={})
+    with pytest.raises(NotImplementedError, match="auxiliary outputs"):
+        _flex_bridge(q, k, v, score_mod=None, block_mask=None, scale=0.125,
+                     enable_gqa=True, return_aux=True, kernel_options={})
+    # BlockMask tensor fields outside the declared boundary are rejected.
+    from torchtitan_simulator.compat.qwen3_5 import _blockmask_payload
+
+    varlen_mask = SimpleNamespace(seq_lengths=torch.empty(1, device="meta"))
+    with pytest.raises(NotImplementedError, match="seq_lengths"):
+        _blockmask_payload(varlen_mask)
+    # The supported causal payload passes through and reaches the fusion op.
+    out, aux = _flex_bridge(q, k, v, score_mod=None, block_mask=causal_mask, scale=0.125,
+                            enable_gqa=True, return_aux=None, kernel_options={})
+    assert out.shape == q.shape
+    assert not aux.lse
 
 
 def test_qwen3_5_default_overrides_reach_gdn_kernel_and_moe_dispatcher():
@@ -294,6 +426,7 @@ def test_qwen3_5_default_overrides_reach_gdn_kernel_and_moe_dispatcher():
 def test_qwen3_5_rejects_mtp_modules():
     with pytest.raises(ValueError, match="no MTP"):
         simulate(SimulationConfig(config="qwen3_5_debugmodel", num_mtp_modules=1))
+
 
 def test_qwen3_5_capture_rejects_bfloat16_original_parameters():
     # The capability matrix promises full Qwen3.5 capture only with FP32

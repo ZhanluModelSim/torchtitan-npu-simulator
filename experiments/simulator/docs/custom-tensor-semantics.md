@@ -40,7 +40,7 @@
 | `torchtitan_npu.npu_moe_re_routing.default` | rank-major rows 转为 expert-major rows；计数矩阵为 EP rank × local expert；恢复索引为逆置换，缺 scales 时第二个输出仍为真实空张量 |
 | `torchtitan_npu.npu_moe_token_permute.default`、`npu_moe_token_permute_backward.default` | tokens 为 token × feature；indices 的公开包装契约支持 token 向量或 token × topk；输出为 routed rows |
 | `torchtitan_npu.npu_moe_token_unpermute.default`、`npu_moe_token_unpermute_grad_unweighted.default` | probs 存在时按 token/topk 合并；probs 为 None 时只恢复 routed rows，空 probs 仍属于前者；feature 也可为标量尺度展开后的大小 1 |
-| `qwen3_5_sim.flex_attention.default`、`flex_attention_grad.default` | 上游 torchtitan attention 布局 B/H/S/D；GQA 下 k/v 的 head 轴大小小于 q，轴语义不变；scale 与 enable_gqa 为标量参数，不属于张量语义 |
+| `qwen3_5_sim.flex_attention.default`、`flex_attention_grad.default` | 上游 torchtitan attention 布局 B/H/S/D；GQA 下 k/v 的 head 轴大小小于 q，轴语义不变；scale 与 enable_gqa 为标量参数，不属于张量语义；causal BlockMask 的 8 个块结构张量（kv/q 的 counts/indices 及 full_* documentary 计数）以 optional 依赖输入进入边界并声明 mask 语义，varlen `seq_lengths` 与 `dq_*` 字段显式拒绝 |
 
 Kimi 反向节点同时声明保存输入角色、`output_gradient` 和输出梯度角色。原生 ATen、CANN、HCCL 算子不因注册本功能而新增语义轴；原生参数名绑定照常保留。控制节点及 offload payload 使用已有专属事实，不给它们猜测模型轴。
 
