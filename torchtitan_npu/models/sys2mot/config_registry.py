@@ -214,20 +214,9 @@ class _GeometryMid(_Geometry):
     action_mlp: int = 4096
 
 
-@dataclass(frozen=True)
-class _GeometryMidEp(_GeometryMid):
-    """Mid geometry with the routed experts made divisible by the 7-device
-    expert-parallel mesh (16 -> 14, two experts per rank); every other field
-    keeps the mid flavor. EP requires ``num_experts % ep_size == 0`` and the
-    only feasible EP degree on 7 devices is 7 itself."""
-
-    experts: int = 14
-
-
 sys2mot_configs = {
     "debugmodel_multimodal": lambda: _make_model_config(g=_Geometry()),
     "mid_multimodal": lambda: _make_model_config(g=_GeometryMid()),
-    "mid_ep_multimodal": lambda: _make_model_config(g=_GeometryMidEp()),
 }
 
 
@@ -575,15 +564,8 @@ def sys2mot_mid_multimodal(*, num_mtp_layers: int = 0) -> Trainer.Config:
     )
 
 
-def sys2mot_mid_ep_multimodal(*, num_mtp_layers: int = 0) -> Trainer.Config:
-    return _sys2mot_trainer_config(
-        "mid_ep_multimodal", num_mtp_layers=num_mtp_layers, seq_len=200
-    )
-
-
 __all__ = [
     "model_registry",
     "sys2mot_debugmodel_multimodal",
     "sys2mot_mid_multimodal",
-    "sys2mot_mid_ep_multimodal",
 ]
