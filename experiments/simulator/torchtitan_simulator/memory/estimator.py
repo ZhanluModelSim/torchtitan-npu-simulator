@@ -688,7 +688,10 @@ def estimate_static_memory(
         offload_ac_saved_tensors=offload_ac_saved_tensors,
         persistent_param_bytes=sum(item.resident_num_bytes for item in param_lifetimes),
         persistent_buffer_bytes=sum(item.resident_num_bytes for item in buffer_lifetimes),
-        host_param_bytes=sum(item.resident_num_bytes for item in host_param_lifetimes),
+        # Host-resident weights keep their original precision bytes: the
+        # storage-dtype projection estimates device residency only, while
+        # production keeps the CPU tables at their real dtype (PR #19 review).
+        host_param_bytes=sum(item.num_bytes for item in host_param_lifetimes),
         peak_active_bytes=peak_event.active_bytes_after if peak_event else 0,
         model_active_bytes_peak=_model_peak_active_bytes(timeline, events),
         forward_peak_active_bytes=phase_peaks["forward"],

@@ -24,6 +24,7 @@ from torch.profiler import record_function
 from torchtitan_simulator.capture.dispatch_capture import (
     annotate_active_capture_events,
     host_only_work,
+    record_host_boundary,
 )
 from torchtitan_simulator.capture.tensor_semantics import (
     OperatorTensorSemantics,
@@ -113,6 +114,16 @@ def _meta_sparse_adam_step(self, closure=None):
                     state["step"] += 1
                     grad_indices = grad._indices()
                     grad_values = grad._values()
+                # The extracted rows carry the backward gradient and the
+                # applied clip coefficient across the host boundary; record
+                # both so the update node stays connected to the graph.
+                sources = list(getattr(parameter, "_pending_grad_sources", ()) or ())
+                applied_scale = getattr(parameter, "_last_sparse_scale", None)
+                if applied_scale is not None:
+                    sources.append(applied_scale)
+                record_host_boundary(sources, grad_indices)
+                record_host_boundary(sources, grad_values)
+                parameter._pending_grad_sources = []
                 sparse_adam_update(
                     parameter,
                     grad_indices,
@@ -161,12 +172,24 @@ def _meta_accumulate_sparse_gradient(self, local_row_ids: torch.Tensor, grad_row
                 check_invariants=False,
             )
         self._pending_sparse_grad._coalesced_(True)
+    # Remember the device-side gradient rows this pending gradient was
+    # accumulated from (stashed on the weight, which is the identity the
+    # SparseAdam step sees); the sparse update and the clip squares register
+    # their cross-boundary dependency on them (see record_host_boundary).
+    sources = getattr(self.weight, "_pending_grad_sources", None)
+    if sources is None:
+        sources = []
+        self.weight._pending_grad_sources = sources
+    sources.append(grad_rows)
 
 
 def _meta_scale_pending_sparse_grad(self, scale) -> None:
     """Meta twin of the clipping rescale, keeping the coalesced declaration."""
     if self._pending_sparse_grad is None:
         return
+    # The scale tensor feeds the cross-boundary dependency of the sparse
+    # update (the extracted rows carry the applied coefficient).
+    self.weight._last_sparse_scale = scale
     with host_only_work():
         self._pending_sparse_grad = torch.sparse_coo_tensor(
             self._pending_sparse_grad.indices(),
@@ -253,9 +276,12 @@ def _meta_clip_grad_norm_with_host_sparse_tables(
         pending = table.pending_sparse_grad()
         assert pending is not None
         # The sparse square is host-computed in production; only its scalar
-        # joins the device coefficient math below.
+        # joins the device coefficient math below. The boundary dependency
+        # keeps it connected to the backward gradient it was derived from.
         with host_only_work():
-            group_squares[group] = group_squares[group] + pending.values().detach().float().pow(2).sum()
+            squares = pending.values().detach().float().pow(2).sum()
+        record_host_boundary(getattr(table.weight, "_pending_grad_sources", ()), squares)
+        group_squares[group] = group_squares[group] + squares
     sparse_sq = torch.zeros((), dtype=torch.float32, device=dense_norm.device)
     for group, local_sq in group_squares.items():
         # The row-ownership group was verified trivial above; the production

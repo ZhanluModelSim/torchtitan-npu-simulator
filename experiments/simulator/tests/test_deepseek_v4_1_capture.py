@@ -80,6 +80,47 @@ def test_deepseek_v4_1_capture_reaches_iteration_with_metadata_map(world, replic
     sparse_update = "dsv41_sim.sparse_adam_update.default"
     assert sum(1 for n in nodes if n.annotations["raw_op_type"] == sparse_update) == 2
 
+    # The sparse boundary keeps explicit cross-boundary dependencies (PR #19
+    # review): the host-only accumulation/scale/extraction work is suppressed
+    # from the graph, so the update consumes tensors that must trace back to
+    # the Engram lookup backward gradient AND the clip coefficient chain.
+    nodes_by_id = {n.op_id: n for n in nodes}
+
+    def _ancestors(op_id):
+        seen, frontier = set(), [op_id]
+        while frontier:
+            current = frontier.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            frontier.extend(nodes_by_id[current].predecessors)
+        return seen
+
+    lookup_backward = {
+        n.op_id
+        for n in nodes
+        if n.annotations["raw_op_type"] == "torchtitan_npu.host_engram_lookup_backward.default"
+    }
+    assert lookup_backward
+    update_nodes = [n for n in nodes if n.annotations["raw_op_type"] == sparse_update]
+    for update in update_nodes:
+        reach = _ancestors(update.op_id)
+        assert reach & lookup_backward, "sparse update disconnected from the Engram backward gradient"
+    corrections = [
+        n
+        for n in nodes
+        if n.annotations.get("raw_op_type") == "aten.mul_.Tensor"
+        and "gradient_clip_sparse_correction" in n.annotations.get("framework_scopes", ())
+    ]
+    assert corrections
+    coefficient_reach = _ancestors(corrections[0].op_id)
+    # Without the squares boundary dependency the coefficient chain only
+    # reaches the backward through the dense norm; the lookup backward must
+    # be reachable too, which only the host squares link provides.
+    assert coefficient_reach & lookup_backward, "clip coefficient misses the host squares link"
+    for update in update_nodes:
+        assert _ancestors(update.op_id) & coefficient_reach, "sparse update misses the clip coefficient chain"
+
     degree = world // replicate
     memory = workload.iteration.schedule.annotations["memory_plan"]
     # FP32 residency split by production residency (PR #19 review): dense
@@ -114,3 +155,32 @@ def test_deepseek_v4_1_multimodal_flavor_is_not_a_capture_preset():
     # the native multimodal factory stays available to native training.
     with pytest.raises(ValueError, match="Unknown simulator preset"):
         simulate(SimulationConfig(config="deepseek_v4_1_debugmodel_multimodal", seq_len=16))
+
+
+def test_deepseek_v4_1_storage_projection_keeps_host_weights_original():
+    # The storage-dtype projection estimates device residency only; the
+    # host-offload Engram tables keep their real CPU dtype, so one simulate()
+    # must reconcile the projected device weights AND the original-precision
+    # host weights at once (PR #19 review).
+    workload = simulate(
+        SimulationConfig(
+            config="deepseek_v4_1_debugmodel_text",
+            seq_len=128,
+            world_size=1,
+            logical_rank=0,
+            data_parallel_shard_degree=1,
+            data_parallel_replicate_degree=1,
+            mixed_precision_param="bfloat16",
+            memory_parameter_storage_dtype="bfloat16",
+        )
+    )
+    validate_workload(workload)
+    memory = workload.iteration.schedule.annotations["memory_plan"]
+    assert memory.parameter_storage_dtype == "bfloat16"
+    # Device dense parameters are projected to BF16; the host tables are not.
+    assert memory.persistent_param_bytes == _DENSE_NUMEL * 2
+    assert memory.host_param_bytes == _ENGRAM_NUMEL * 4
+    layouts = workload.iteration.schedule.annotations["parameter_layouts"]
+    host = [item for item in layouts.values() if item["residency"] == "host"]
+    assert {item["dtype"] for item in host} == {"torch.float32"}
+    assert memory.host_optimizer_state_bytes == _ENGRAM_NUMEL * 8

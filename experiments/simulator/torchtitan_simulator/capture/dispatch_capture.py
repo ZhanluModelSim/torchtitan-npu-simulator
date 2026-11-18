@@ -84,6 +84,27 @@ def annotate_active_capture_events(provenance: str) -> Iterator[None]:
         yield
 
 
+def record_host_boundary(sources, derived: torch.Tensor) -> None:
+    """Register explicit cross-boundary data dependencies.
+
+    Host-only bookkeeping (see :func:`host_only_work`) is suppressed from the
+    graph, so the tensors it produces -- sparse index/value rows, host norm
+    squares -- would otherwise reach their device consumers producer-less.
+    This records the device-side tensors the host value was derived from
+    (the backward gradient rows, the clip coefficient) so predecessors
+    resolve across the boundary and the O-phase update stays connected to
+    the backward that fed it (PR #19 review). No-op outside an active
+    capture.
+    """
+    capture = _active_capture
+    if capture is None:
+        return
+    derived_id = capture.tensor_id(derived)
+    parents = capture._boundary_parents.setdefault(derived_id, set())
+    for source in sources:
+        if source is not None:
+            parents.add(capture.tensor_id(source))
+
 def _next_op_id() -> int:
     return next(_id_counter)
 
@@ -254,6 +275,7 @@ class OpDispatchCapture(TorchDispatchMode):
         self._capture_l0: bool = True  # pass-through when False (duplicate class)
         self._compute_instances: dict[tuple[int, int, str], dict[str, Any]] = {}
         self._dispatch_annotation_scopes: list[str] = []
+        self._boundary_parents: dict[int, set[int]] = {}
         self._pending_comm_links: dict[str, CommEvent] = {}  # output storage → first consumer
         # All compute classes on a stage share one representative microbatch.
         # Other microbatches remain pass-through schedule instances.
@@ -311,6 +333,7 @@ class OpDispatchCapture(TorchDispatchMode):
         self._value_aliases.clear()
         self._saved_tensor_unpack_aliases.clear()
         self._pending_comm_links.clear()
+        self._boundary_parents.clear()
 
     @contextmanager
     def suspend_recording(self) -> Iterator[None]:
@@ -979,6 +1002,14 @@ class OpDispatchCapture(TorchDispatchMode):
             return {self._producer[tensor_id]}
         if tensor_id in self._value_aliases:
             return self._predecessors_for_tensor_id(self._value_aliases[tensor_id])
+        if tensor_id in self._boundary_parents:
+            # Cross-boundary parents are recorded as source tensor ids; the
+            # producing op is resolved at query time.
+            return {
+                producer
+                for source_id in self._boundary_parents[tensor_id]
+                if (producer := self._producer.get(source_id)) is not None
+            }
         return set()
 
     def __enter__(self) -> OpDispatchCapture:
