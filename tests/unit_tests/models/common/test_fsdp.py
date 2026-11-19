@@ -6,19 +6,24 @@
 """Native FSDP precision retains model and MTP weights before computation."""
 
 import copy
+from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.distributed as dist
+import torchtitan.distributed.fsdp as fsdp
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
+from torchtitan.config import TrainingConfig
+from torchtitan.config.parallelism import ParallelismConfig
+from torchtitan.models.base.module import Module
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.deepseek_v4.mhc import HcPre
 
-from torchtitan_npu.models.common.fsdp import apply_fsdp_to_mtp_decoder, make_param_dtype_override_fn
+from torchtitan_npu.models.deepseek_v4.model import DeepSeekV4Model
 
 
-class _ProjectionBlock(nn.Module):
+class _ProjectionBlock(Module):
     """Use actual V4 mixing and Linear modules in the decoder sharding layout."""
 
     def __init__(self):
@@ -31,11 +36,11 @@ class _ProjectionBlock(nn.Module):
         return self.feed_forward(reduced), post, comb
 
 
-class _MTPDecoderLayout(nn.Module):
-    """The layer/MTP containers consumed by the production sharding bridge."""
+class _MTPDecoderLayout(DeepSeekV4Model):
+    """Small layer/MTP composition consumed by the upstream FSDP entry points."""
 
     def __init__(self):
-        super().__init__()
+        Module.__init__(self)
         self.enable_weight_tying = False
         self.tok_embeddings = self.norm = self.lm_head = None
         self.layers = nn.ModuleDict({"0": _ProjectionBlock()})
@@ -55,7 +60,18 @@ def cpu_mesh(tmp_path):
         dist.destroy_process_group()
 
 
-def test_native_callback_preserves_fp32_model_and_mtp_weights_and_gradients(cpu_mesh):
+def test_shared_fsdp_policy_accepts_declared_bf16_parameters():
+    with torch.random.fork_rng(devices=[]):
+        model = _ProjectionBlock().bfloat16()
+
+    policy = fsdp.mixed_precision_policy(model, param_dtype=torch.bfloat16, reduce_dtype=torch.float32)
+    resolved = policy._resolve_for_param(model.hc_attn_pre.hc_fn)
+
+    assert resolved.param_dtype is torch.bfloat16
+
+
+@pytest.mark.parametrize("entrypoint", ("v4-model", "explicit-callback"))
+def test_upstream_fsdp_preserves_declared_model_and_mtp_weights_and_gradients(cpu_mesh, entrypoint):
     with torch.random.fork_rng(devices=[]):
         model = _MTPDecoderLayout()
     with torch.no_grad():
@@ -66,19 +82,43 @@ def test_native_callback_preserves_fp32_model_and_mtp_weights_and_gradients(cpu_
     masters = {name: parameter.detach().clone() for name, parameter in model.named_parameters()}
     for block in (reference.layers["0"], reference.mtp_layers[0]):
         block.feed_forward.to(dtype=torch.bfloat16)
-    overrides = {name: torch.float32 for name in masters if ".hc_attn_pre." in name}
-    callback = make_param_dtype_override_fn(model, overrides)
+    overrides = (
+        {}
+        if entrypoint == "explicit-callback"
+        else {name: torch.float32 for name in masters if ".hc_attn_pre." in name}
+    )
+    if entrypoint == "explicit-callback":
+        reference.bfloat16()
     original_layers = tuple(model.layers)
 
-    apply_fsdp_to_mtp_decoder(
-        model,
-        cpu_mesh,
-        param_dtype=torch.bfloat16,
-        reduce_dtype=torch.float32,
-        pp_enabled=False,
-        reshard_after_forward_policy="never",
-        param_dtype_override_fn=callback,
-    )
+    if entrypoint == "explicit-callback":
+        alias = str(len(model.layers))
+        model.layers[alias] = model.mtp_layers[0]
+        try:
+            fsdp.apply_fsdp_to_decoder(
+                model,
+                cpu_mesh,
+                param_dtype=torch.bfloat16,
+                reduce_dtype=torch.float32,
+                pp_enabled=False,
+                reshard_after_forward_policy="never",
+                param_dtype_override_fn=lambda _parameter: None,
+            )
+        finally:
+            del model.layers[alias]
+    else:
+        context = SimpleNamespace(
+            get_activated_mesh=lambda _axes: cpu_mesh,
+            ep_enabled=False,
+            pp_enabled=False,
+            ep=1,
+        )
+        DeepSeekV4Model._apply_fsdp(
+            model,
+            parallelism_context=context,
+            training=TrainingConfig(mixed_precision_param="bfloat16", mixed_precision_reduce="float32"),
+            parallelism=ParallelismConfig(fsdp_reshard_after_forward="never"),
+        )
 
     assert tuple(model.layers) == original_layers
     observed = {}

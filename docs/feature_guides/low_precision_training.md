@@ -12,6 +12,14 @@ torchtitan-npu 通过 TorchAO-NPU 为 DeepSeek-V4 和 DeepSeek-V4.1 提供 MXFP8
 
 配置默认关闭量化训练，DeepSeek-V4/DeepSeek-V4.1 的 A5 示例脚本会显式启用量化。
 
+## DeepSeek-V4 FSDP 参数精度
+
+DeepSeek-V4 的混合精度 FSDP 保留 mHC、compressor APE、attention sink 和训练 router 的参数精度，覆盖主干与 MTP 层。FP32 主参数搭配 BF16 默认计算时，这些参数仍以 FP32 参与计算，其他参数按 BF16 计算；主参数存储与 `reduce_dtype` 保持训练配置指定的值。
+
+共享策略使用参数自身 dtype 与 `param_dtype` 中较宽的类型。DeepSeek-V4 继续拒绝受保护参数自身和默认计算 dtype 均为 BF16 的组合，保持 TorchTitan 0.4.0 原有 FP32 override 请求的拒绝边界；该清理不新增这一训练模式。
+
+TorchTitan 0.4.0 通过包导入时安装的共享策略读取模块运行期声明，模型继承上游 FSDP/MTP 流程。该适配回移上游 [#5774](https://github.com/pytorch/torchtitan/pull/5774) 的精度策略机制，保留既有 Config 类型，不新增配置参数，也不改变 GraphTrainer SimpleFSDP、checkpoint 导出或 RL 权重传输。具体加载边界见[架构说明](../architecture.md#两阶段时序语义)。
+
 ## 当前支持的数据格式
 
 当前实现中的量化数据和 scale 表示如下。不同量化路径分别使用低精度计算或 fake quant，并通过对应的反向实现传递梯度。

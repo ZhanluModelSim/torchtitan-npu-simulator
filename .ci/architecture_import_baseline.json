@@ -33,6 +33,9 @@
       ".torchtitan.eager_flex",
       ".compile.dynamo_config"
     ],
+    "torchtitan_npu/patches/torchtitan/distributed/__init__.py": [
+      ".fsdp"
+    ],
     "torchtitan_npu/patches/torchtitan/__init__.py": [
       ".components.metrics",
       ".components.optimizer",

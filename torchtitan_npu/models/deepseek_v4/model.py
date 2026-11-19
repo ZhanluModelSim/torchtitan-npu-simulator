@@ -8,15 +8,17 @@ from typing import TYPE_CHECKING, cast
 
 import torch
 from torch import nn
-from torchtitan.config import TORCH_DTYPE_MAP, TrainingConfig
-from torchtitan.config.parallelism import ParallelismConfig
-from torchtitan.distributed.parallelism_context import ParallelismContext
+from torchtitan.models.base.module import Module
 from torchtitan.models.common.flops import get_nparams_and_active_nparams
 from torchtitan.models.deepseek_v4.model import DeepSeekV4TransformerBlock as DeepSeekV4TransformerBlock
 
 from .mtp import DeepSeekV4MTPDecoder
 
 if TYPE_CHECKING:
+    from torchtitan.config import TrainingConfig
+    from torchtitan.config.parallelism import ParallelismConfig
+    from torchtitan.distributed.parallelism_context import ParallelismContext
+
     from .compressor import Indexer
     from .mtp import DeepSeekV4MTPTransformerBlock
 
@@ -54,35 +56,24 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
     def _apply_fsdp(
         self,
         *,
-        parallelism_context: ParallelismContext,
-        training: TrainingConfig,
-        parallelism: ParallelismConfig,
+        parallelism_context: "ParallelismContext",
+        training: "TrainingConfig",
+        parallelism: "ParallelismConfig",
     ) -> None:
-        from torchtitan.distributed.fsdp import resolve_fsdp_mesh, resolve_sparse_fsdp_mesh
-
-        from torchtitan_npu.models.common.fsdp import apply_fsdp_to_mtp_decoder, make_param_dtype_override_fn
-
-        dp_mesh, dp_mesh_dims = resolve_fsdp_mesh(parallelism_context)
-        edp_mesh, edp_mesh_dims = resolve_sparse_fsdp_mesh(parallelism_context)
-
-        from .parallelize import _dsv4_param_dtypes
-
-        apply_fsdp_to_mtp_decoder(
-            # The helper requires the decoder/layers/MTP structure, shared by
-            # this implementation and the upstream DeepSeek V4 model.
-            self,
-            dp_mesh,
-            param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
-            reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
-            pp_enabled=parallelism_context.pp_enabled,
-            cpu_offload=training.enable_cpu_offload,
-            reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
-            ep_degree=parallelism_context.ep,
-            edp_mesh=edp_mesh,
-            dp_mesh_dims=dp_mesh_dims,
-            edp_mesh_dims=edp_mesh_dims,
-            symm_mem_scope=parallelism.fsdp_symm_mem_scope,
-            param_dtype_override_fn=make_param_dtype_override_fn(self, _dsv4_param_dtypes(self, training)),
+        # The released FP32 override rejected BF16 storage with a BF16 policy.
+        # Preserving that rejection avoids silently enabling a different policy.
+        if training.mixed_precision_param == "bfloat16":
+            for name, parameter in Module.named_preserve_dtype_params(self):  # pyrefly: ignore [missing-attribute]
+                if parameter.dtype is not torch.float32:
+                    raise ValueError(
+                        f"DeepSeek-V4 requires FP32 storage for protected parameter {name!r} "
+                        f"with mixed_precision_param='bfloat16', got {parameter.dtype}. "
+                        "Use FP32 master parameters or mixed_precision_param='float32'."
+                    )
+        super()._apply_fsdp(
+            parallelism_context=parallelism_context,
+            training=training,
+            parallelism=parallelism,
         )
 
     @dataclass(kw_only=True, slots=True)
@@ -132,6 +123,20 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
 
     def __init__(self, config: Config):
         super().__init__(config)
+        mtp_layers = cast("nn.ModuleList | None", self.mtp_layers)
+        for layer in (*self.layers.values(), *(mtp_layers if mtp_layers is not None else ())):
+            # The training router policy also covers adapter/quantization children.
+            router = cast("nn.Module | None", getattr(layer.feed_forward, "router", None))
+            if router is not None:
+                for module in router.modules():
+                    names = tuple(name for name, parameter in module._parameters.items() if parameter is not None)
+                    setattr(module, "_preserve_dtype_params", names)  # noqa: B010 -- API backported on existing modules
+            attention = cast("nn.Module", layer.attention)
+            sink = cast("nn.Module | nn.Parameter", attention.attn_sink)
+            if isinstance(sink, nn.Parameter):
+                setattr(attention, "_preserve_dtype_params", ("attn_sink",))  # noqa: B010
+            else:
+                setattr(sink, "_preserve_dtype_params", ("weight",))  # noqa: B010
 
 
 class GraphTrainerDeepSeekV4Model(DeepSeekV4Model):

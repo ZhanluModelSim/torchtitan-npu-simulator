@@ -29,59 +29,8 @@ if TYPE_CHECKING:
     from torchtitan.experiments.graph_trainer.configs import GraphTrainerCompileConfig
 
     from torchtitan_npu.models.deepseek_v4.model import (
-        DeepSeekV4Model,
         GraphTrainerDeepSeekV4Model,
     )
-
-
-def _dsv4_param_dtypes(
-    model: DeepSeekV4Model,
-    training: TrainingConfig,
-) -> dict[str, torch.dtype]:
-    """Return the fqn-fp32 policy map for DSV4 SmoE hyper-connection and MoE router parameters."""
-
-    def matches_any(fqn: str, patterns: tuple[str, ...]) -> bool:
-        """Check if a module/parameter FQN matches any of the fnmatch patterns."""
-        clean = ".".join(part for part in fqn.split(".") if part != "_checkpoint_wrapped_module")
-        return any(matches_module_fqn_pattern(pattern, clean) for pattern in patterns)
-
-    fp32_module_fqns = (
-        "layers.*.hc_attn_pre",
-        "layers.*.hc_ffn_pre",
-        "layers.*.feed_forward.router",
-        "layers.*.hc_head",
-        "mtp_layers.*.hc_attn_pre",
-        "mtp_layers.*.hc_ffn_pre",
-        "mtp_layers.*.feed_forward.router",
-        "mtp_layers.*.hc_head",
-        "hc_head",
-    )
-    fp32_parameter_fqns = (
-        "layers.*.attention.compressor.ape",
-        "layers.*.attention.compressor_128.ape",
-        "layers.*.attention.compressor_128.ape",
-        "layers.*.attention.indexer.compressor.ape",
-        "mtp_layers.*.attention.compressor.ape",
-        "mtp_layers.*.attention.compressor_128.ape",
-        "mtp_layers.*.attention.compressor_128.ape",
-        "mtp_layers.*.attention.indexer.compressor.ape",
-        # Learned per-head softmax logits: created FP32 in attention.py and
-        # required FP32 by the attention kernels.
-        "layers.*.attention.attn_sink",
-        "layers.*.attention.attn_sink.weight",
-        "mtp_layers.*.attention.attn_sink",
-        "mtp_layers.*.attention.attn_sink.weight",
-    )
-
-    fp32_modules = [module for name, module in model.named_modules() if matches_any(name, fp32_module_fqns)]
-    fp32_param_ids = {id(param) for module in fp32_modules for param in module.parameters()}
-
-    overrides: dict[str, torch.dtype] = {}
-    for name, parameter in model.named_parameters(remove_duplicate=False):
-        if id(parameter) in fp32_param_ids or matches_any(name, fp32_parameter_fqns):
-            overrides[name] = torch.float32
-
-    return overrides
 
 
 def parallelize_deepseek_v4(model, **kwargs):
