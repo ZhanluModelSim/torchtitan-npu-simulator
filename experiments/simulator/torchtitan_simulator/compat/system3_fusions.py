@@ -237,7 +237,10 @@ def _isa_indexer_meta(idx_q, idx_k_c, mask, topk, compress_ratio):
 
 @torch.library.custom_op("system3_sim::isa_indexer_grad", mutates_args=())
 def isa_indexer_grad(
-    idx_q: torch.Tensor, idx_k_c: torch.Tensor, indices: torch.Tensor, d_scores: torch.Tensor
+    idx_q: torch.Tensor,
+    idx_k_c: torch.Tensor,
+    indices: torch.Tensor,
+    d_scores: torch.Tensor,
 ) -> list[torch.Tensor]:
     raise RuntimeError("system3 virtual isa_indexer backward is available only for Meta simulation")
 
@@ -245,12 +248,12 @@ def isa_indexer_grad(
 @isa_indexer_grad.register_fake
 def _isa_indexer_grad_meta(idx_q, idx_k_c, indices, d_scores):
     b, s, _width, cl = _isa_indexer_geometry(idx_q, idx_k_c)
-    if indices.dtype != torch.int64 or indices.ndim != 3 or indices.shape[:2] != (b, s):
-        raise ValueError("ISA indexer gradient requires B/S int64 selections")
+    if indices.ndim != 3 or indices.shape[:2] != (b, s):
+        raise ValueError("ISA indexer gradient requires B/S selections")
     if indices.shape[-1] < 1 or indices.shape[-1] > cl:
         raise ValueError("ISA indexer selections must stay within the compressed grid")
     if d_scores.shape != indices.shape or d_scores.dtype != idx_q.dtype:
-        raise ValueError("ISA indexer score gradient must match the selection geometry")
+        raise ValueError("ISA indexer score gradient must match the selection score precision")
     if len({t.device for t in (idx_q, idx_k_c, indices, d_scores)}) != 1:
         raise ValueError("ISA indexer gradient operands must share placement")
     return [torch.empty_like(idx_q), torch.empty_like(idx_k_c)]
@@ -286,8 +289,8 @@ def _isa_attention_geometry(q, k, v, indices, bias):
         raise ValueError("ISA attention indices must describe one selection row per query")
     if min(indices.shape[-1], k.shape[1]) < 1 or indices.shape[-1] > k.shape[1]:
         raise ValueError("ISA attention selections must stay within the compressed grid")
-    if bias.shape != indices.shape or bias.dtype != q.dtype:
-        raise ValueError("ISA indexer bias must match the selection geometry and precision")
+    if bias.shape != indices.shape or bias.dtype not in (q.dtype, torch.float32):
+        raise ValueError("ISA indexer bias must match the selection geometry in query or float32 precision")
     return b, s, heads, width, k.shape[1]
 
 
@@ -375,7 +378,11 @@ isa_sparse_attention.register_autograd(_isa_attention_backward, setup_context=_i
 
 
 def _register_isa_semantics() -> None:
-    indexer_inputs = (("idx_q", _IDX_Q), ("idx_k_c", _IDX_K), _IDX_MASK)
+    indexer_inputs = (
+        ("idx_q", _IDX_Q),
+        ("idx_k_c", _IDX_K),
+        _IDX_MASK,
+    )
     register_tensor_semantics(
         str(isa_indexer._opoverload),
         OperatorTensorSemantics(indexer_inputs, (_IDX_INDICES, _IDX_SCORES)),

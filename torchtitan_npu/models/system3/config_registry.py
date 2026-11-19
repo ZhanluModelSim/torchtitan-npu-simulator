@@ -9,8 +9,11 @@ The reference geometry (``external_models/system3``) is a 40T
 compute-equivalent preview: 100 physical layers looped twice, 16384 hidden,
 4096 routed experts top-25 with a 4096-wide latent bottleneck, 8M context.
 The debug flavor is the reference's own ``smoke_test`` configuration
-verbatim (its 14,148,524-parameter geometry is the golden calibration
-baseline): every structural path survives — the ``[ISA, GDN2 x 3]`` unit
+verbatim (its tied-embedding 14,148,524-parameter geometry is the golden
+calibration baseline; this port additionally keeps an untied LM head per
+the runner parameter-ledger contract, so the built multimodal model counts
+14,214,060 parameters): every structural path survives — the
+``[ISA, GDN2 x 3]`` unit
 pattern, loop 2x with Flash KV sharing (kv/reuse/reindex), LatentMoE with
 the latent bottleneck and shared expert, mHC Sinkhorn hyper-connections,
 Engram conditional memory on inject layers, and (multimodal flavor only)
@@ -264,7 +267,6 @@ def _attention_config(*, layer_idx: int, g: _Geometry):
                 compress_ratio=g.isa_compress_ratio,
                 q_proj=_LIN(in_features=d, out_features=idx_dim, bias=False),
                 k_proj=_LIN(in_features=d, out_features=idx_dim, bias=False),
-                weights_proj=_LIN(in_features=d, out_features=g.indexer_heads, bias=False),
                 q_norm=_norm(idx_dim, g),
                 k_norm=_norm(idx_dim, g),
             )

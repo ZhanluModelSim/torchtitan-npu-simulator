@@ -279,10 +279,10 @@ class RotaryEmbedding(Module):
 class ISAIndexer(Module):
     """Indexer for token-level sparsity over the stride-compressed KV grid.
 
-    Follows the reference DSV4 indexer scoring: fp32 multi-head logits over
-    the compressed grid, ReLU, a per-token-head weights gate
-    (``weights_proj``), and a head-sum reduction into a single causal score
-    map for top-K. The indexer scores are passed to the attention as bias.
+    Reference scoring: RMSNorm'd low-rank projections, then one flattened
+    dot product over the index width scaled by ``1/sqrt(width)`` on the
+    compressed grid — no ReLU, no per-head gate, no head-sum. The indexer
+    scores are passed to the attention as bias.
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -294,15 +294,12 @@ class ISAIndexer(Module):
         compress_ratio: int
         q_proj: Linear.Config
         k_proj: Linear.Config
-        weights_proj: Linear.Config
         q_norm: System3RMSNorm.Config
         k_norm: System3RMSNorm.Config
 
         def __post_init__(self) -> None:
             if self.q_proj.out_features != self.n_heads * self.head_dim:
                 raise ValueError("indexer q_proj must project to n_heads * head_dim")
-            if self.weights_proj.out_features != self.n_heads:
-                raise ValueError("indexer weights_proj must produce one gate per indexer head")
 
     def __init__(self, config: Config):
         super().__init__()
@@ -312,34 +309,29 @@ class ISAIndexer(Module):
         self.compress_ratio = config.compress_ratio
         self.q_proj = config.q_proj.build()
         self.k_proj = config.k_proj.build()
-        self.weights_proj = config.weights_proj.build()
         self.q_norm = config.q_norm.build()
         self.k_norm = config.k_norm.build()
 
     def select(self, hidden_states, attention_mask=None):
-        """Returns topk_indices [b, s, topk] int64, topk_scores [b, s, topk] float32."""
+        """Returns topk_indices [b, s, topk] int64, topk_scores [b, s, topk]."""
         idx_q = self.q_norm(self.q_proj(hidden_states))
         idx_k = self.k_norm(self.k_proj(hidden_states))
         idx_k_c = idx_k[:, :: self.compress_ratio, :]
-        weights = self.weights_proj(hidden_states).float()
-        return self._select_topk(idx_q, idx_k_c, weights, attention_mask)
+        return self._select_topk(idx_q, idx_k_c, attention_mask)
 
-    def _select_topk(self, idx_q, idx_k_c, weights, attention_mask=None):
+    def _select_topk(self, idx_q, idx_k_c, attention_mask=None):
         """Causal top-K selection over the compressed indexer grid (seam).
 
-        Reference scoring: fp32 multi-head logits, ReLU, per-token-head
-        gate, head-sum reduction.
+        Reference scoring: one flattened dot product over the index width,
+        scaled by ``1/sqrt(width)``; no ReLU, no gate, no head-sum.
         """
-        b, s, _hd_total = idx_q.shape
+        b, s, width = idx_q.shape
         cl = idx_k_c.shape[1]
-        n, d = self.n_heads, self.head_dim
 
-        logits = torch.matmul(
-            idx_q.float().view(b, s, n, d).permute(0, 2, 1, 3),  # [b, n, s, d]
-            idx_k_c.float().view(b, cl, n, d).permute(0, 2, 3, 1),  # [b, n, d, cl]
-        )  # [b, n, s, cl]
-        gated = torch.nn.functional.relu(logits) * weights.permute(0, 2, 1).unsqueeze(-1)
-        scores = gated.sum(dim=1)  # [b, s, cl] float32
+        scores = torch.bmm(
+            idx_q.reshape(b, s, width),
+            idx_k_c.reshape(b, cl, width).transpose(1, 2),
+        ) / math.sqrt(width)
 
         q_pos = torch.arange(s, device=idx_q.device).unsqueeze(1)
         k_pos = torch.arange(0, s, self.compress_ratio, device=idx_q.device).unsqueeze(0)
