@@ -120,20 +120,8 @@ def _preserve_model_state(model) -> Iterator[None]:
             )
 
 
-def make_calibration_runner(traced_result, runtime_context):
+def make_calibration_runner(traced_result, *, model, training_args, train_context):
     """Build a state-preserving runner for whole-graph calibration."""
-    # Accept both the typed construction-time context and the legacy dict
-    # supplied later by the compatibility patch.
-    get_context_value = (
-        runtime_context.__getitem__
-        if isinstance(runtime_context, dict)
-        else lambda name: getattr(runtime_context, name)
-    )
-    model = get_context_value("module")
-    if traced_result is None:
-        traced_result = get_context_value("traced_result")
-    training_args = get_context_value("args")
-    train_context = get_context_value("train_context")
 
     def run_candidate(candidate_gm):
         calibration_args = _pytree.tree_map(

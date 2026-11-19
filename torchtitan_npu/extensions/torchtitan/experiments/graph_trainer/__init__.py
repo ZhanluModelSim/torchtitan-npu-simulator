@@ -6,6 +6,7 @@
 """NPU extensions for TorchTitan's graph trainer."""
 
 from dataclasses import dataclass, field
+from typing import ClassVar
 
 from torchtitan.experiments.graph_trainer.configs import GraphTrainerCompileConfig
 from torchtitan.experiments.graph_trainer.trainer import GraphTrainer, GraphTrainingEngine
@@ -14,6 +15,7 @@ from torchtitan_npu.config import manager as config_manager
 from torchtitan_npu.config.configs import OptimConfig, OptimizerConfig, TrainingConfig
 from torchtitan_npu.config.converters import TrainerConfigConverter
 from torchtitan_npu.extensions.torchtitan.components.checkpoint import CheckpointManager
+from torchtitan_npu.patches.torchtitan.experiments.graph_trainer import graph_trainer_runtime_context
 
 from ...tools.profiler import CANNProfiler
 from ...trainer import TrainerEx, TrainingEngineEx
@@ -23,11 +25,12 @@ from . import auto_overlap
 def _apply_auto_overlap_runtime_context_patch(config) -> None:
     if not auto_overlap.is_npu_auto_overlap_pipeline(config.compile.pass_pipeline):
         return
-    from torchtitan_npu.patches.torchtitan.experiments.graph_trainer import (
-        graph_trainer_runtime_context,
-    )
+    from .whole_graph_benchmark import make_calibration_runner
 
-    graph_trainer_runtime_context.apply()
+    graph_trainer_runtime_context.apply(
+        uses_candidate_runner=auto_overlap.is_npu_auto_overlap_pipeline,
+        make_runner=make_calibration_runner,
+    )
 
 
 class NPUGraphTrainingEngine(TrainingEngineEx, GraphTrainingEngine):
@@ -40,10 +43,17 @@ class GraphTrainerEx(TrainerEx, GraphTrainer):
     engine_cls = NPUGraphTrainingEngine
 
     @dataclass(kw_only=True, slots=True)
-    class Config(TrainerEx.Config, GraphTrainer.Config):
+    class Config(TrainerEx.Config):  # pyrefly: ignore [bad-override]
+        _supports_graph_compile: ClassVar[bool] = True
         compile: GraphTrainerCompileConfig = field(  # pyrefly: ignore [bad-override]
             default_factory=GraphTrainerCompileConfig,
         )
+        npu_auto_overlap_debug: bool = False
+        """Dump Auto Overlap FX graphs, log per-node costs, and retain profiler files."""
+
+        def _validate_upstream_config(self) -> None:
+            # Reuse validation without inheriting a second slotted config.
+            GraphTrainer.Config.__post_init__(self)  # pyrefly: ignore [bad-argument-type]
 
     def __init__(self, config: Config) -> None:
         # This patch must wrap GraphTrainer before its first trace.

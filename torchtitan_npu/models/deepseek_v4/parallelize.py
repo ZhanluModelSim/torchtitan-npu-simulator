@@ -6,9 +6,11 @@
 
 from __future__ import annotations
 
+from functools import wraps
 from typing import TYPE_CHECKING, Any
 
 import torch
+from torch.fx.traceback import annotate_fn
 from torchtitan.experiments.graph_trainer.common_utils import (
     annotate_module_fqns,
     annotate_moe_ep_regions,
@@ -18,6 +20,7 @@ from torchtitan.experiments.graph_trainer.common_utils import (
 from torchtitan.experiments.graph_trainer.compile import (
     apply_compile as apply_graph_trainer_compile,
 )
+from torchtitan.experiments.graph_trainer.configs import MOE_BLOCK_FQN, validate_ep_overlap_config
 
 if TYPE_CHECKING:
     from torchtitan.config import TrainingConfig
@@ -101,6 +104,39 @@ def annotate_deepseek_v4(model: GraphTrainerDeepSeekV4Model) -> None:
     annotate_module_fqns(model)
 
 
+def _chunk_dsv4_moe_forward(forward, fqn: str):
+    region = {"chunked_region_fqn": fqn}
+    split = annotate_fn({**region, "chunked_region_role": "split_boundary"})(torch.split)
+    bodies = tuple(
+        annotate_fn({**region, "chunked_region_role": "body", "chunk_id": chunk_id})(forward) for chunk_id in (0, 1)
+    )
+    cat = annotate_fn({**region, "chunked_region_role": "materialization"})(torch.cat)
+
+    @wraps(forward)
+    def chunked_forward(x, *, input_ids_T=None, padding_mask_T=None, aux_loss_denominator=None):
+        # DSV4's hash router needs token IDs split at the same boundary as x.
+        num_tokens = x.shape[0]
+        torch._check(num_tokens % 2 == 0, lambda: f"EP overlap requires an even token count in {fqn}")
+        sizes = [num_tokens // 2] * 2
+        hidden_chunks = split(x, sizes, dim=0)
+        id_chunks = (None, None) if input_ids_T is None else split(input_ids_T, sizes, dim=0)
+        mask_chunks = (None, None) if padding_mask_T is None else split(padding_mask_T, sizes, dim=0)
+        return cat(
+            [
+                body(
+                    hidden.contiguous(),
+                    **({} if ids is None else {"input_ids_T": ids.contiguous()}),
+                    padding_mask_T=None if mask is None else mask.contiguous(),
+                    aux_loss_denominator=aux_loss_denominator,
+                )
+                for body, hidden, ids, mask in zip(bodies, hidden_chunks, id_chunks, mask_chunks, strict=True)
+            ],
+            dim=0,
+        )
+
+    return chunked_forward
+
+
 def parallelize_graph_trainer_deepseek_v4(
     model: GraphTrainerDeepSeekV4Model,
     *,
@@ -108,7 +144,7 @@ def parallelize_graph_trainer_deepseek_v4(
     training: TrainingConfig,
     parallelism: ParallelismConfig,
     compile_config: GraphTrainerCompileConfig,
-    ac_config: Any,
+    activation_remat: Any,
     dump_folder: str,
 ):
     token_divisor = parallelism_context.cp * (
@@ -137,6 +173,14 @@ def parallelize_graph_trainer_deepseek_v4(
     # MixedPrecisionPolicy's param_dtype cast still applies in single-GPU runs.
     # pyrefly: ignore [bad-assignment]
     model = apply_simple_fsdp(model, parallelism_context=parallelism_context, training=training)
+
+    if compile_config.ep_overlap.enabled:
+        _, module_fqn = validate_ep_overlap_config(compile_config.ep_overlap)
+        if module_fqn != MOE_BLOCK_FQN:
+            raise ValueError(f"DeepSeek-V4 EP overlap requires module_fqn={MOE_BLOCK_FQN!r}")
+        for fqn, module in model.named_modules():
+            if matches_module_fqn_pattern(module_fqn, fqn):
+                module.forward = _chunk_dsv4_moe_forward(module.forward, fqn)  # pyrefly: ignore [bad-override]
 
     # Apply compilation based on mode
     # pyrefly: ignore [bad-assignment]

@@ -5,6 +5,9 @@
 
 """Resolve example recipes through the production configuration loader."""
 
+import sys
+from types import ModuleType
+
 import pytest
 from torchtitan.components.optim import AdamW, DistMuon
 from torchtitan.config.loader import ConfigLoader
@@ -156,7 +159,7 @@ def test_full_a5_recipe_keeps_checkpoint_and_prequantization_contract(monkeypatc
     ]
     kv = config.extension.quantization.kv_norm_quantization
     assert kv.format == "mxfp8" and kv.block_size == 64
-    assert kv.fqns == [".attention.kv_norm", ".attention.compressor.norm"]
+    assert kv.fqns == [".attention.kv_norm", ".attention.compressor.norm", ".attention.compressor_128.norm"]
 
 
 def test_qat_recipe_preserves_inherited_a5_policy_and_adds_mxfp4():
@@ -199,14 +202,51 @@ def test_legacy_override_environment_fails_with_a_migration_action(monkeypatch):
     "name,message",
     [
         ("deepseek_v4_flash_cpt_1024k_a5", "Context parallelism is deferred"),
-        ("deepseek_v4_flash_8p_cpt_4k_a3_graphtrainer", "NPU GraphTrainer remains deferred"),
         ("deepseek_v4_flash_8p_cpt_4k_a5_cv_parallel", "no longer exposes"),
     ],
-    ids=["context-parallel", "graph-config-layout", "cv-backend"],
+    ids=["context-parallel", "cv-backend"],
 )
 def test_deferred_examples_report_the_actual_unavailable_capability(name, message):
     with pytest.raises(NotImplementedError, match=message):
         _load(name)
+
+
+def test_a3_graphtrainer_example_loads_the_npu_graph_config():
+    from torchtitan_npu.extensions.torchtitan.experiments.graph_trainer import GraphTrainerEx
+
+    config = _load("deepseek_v4_flash_8p_cpt_4k_a3_graphtrainer")
+
+    assert type(config) is GraphTrainerEx.Config
+    assert config._owner is GraphTrainerEx
+    assert config.training.num_tokens_per_train_step == -1
+    assert config.compile.pass_pipeline == "mutation-functionalization+npu_auto_overlap"
+    assert config.compile.ep_overlap.enabled
+    assert config.compile.ep_overlap.module_fqn == "layers.*.feed_forward"
+
+
+def test_full_a5_graphtrainer_runs_quantization_without_local_model_compile(monkeypatch):
+    from torchtitan_npu.extensions.torchtitan.experiments import graph_trainer
+
+    monkeypatch.setattr(graph_trainer, "_apply_auto_overlap_runtime_context_patch", lambda config: None)
+    config = _load("deepseek_v4_flash_cpt_4k_a5_graphtrainer")
+    assert ("torchtitan_npu.override.deepseek_v4.compressor.asc", {"fused_pooling": False}) in config.override.imports
+    assert config.extension.quantization.li_quantization is None
+    converter = ModuleType("torchtitan_npu.extensions.adaptor.torchao.converter")
+
+    class ReachedQuantizationError(Exception):
+        pass
+
+    def apply_quantization_converter(model, quantization, *, model_compile_enabled, override_config):
+        assert model is config.model
+        assert quantization.recipe == "all_block_fp8"
+        assert not model_compile_enabled
+        raise ReachedQuantizationError
+
+    converter.apply_quantization_converter = apply_quantization_converter
+    monkeypatch.setitem(sys.modules, converter.__name__, converter)
+
+    with pytest.raises(ReachedQuantizationError):
+        config.build()
 
 
 def test_compiled_example_preserves_the_current_training_guard():

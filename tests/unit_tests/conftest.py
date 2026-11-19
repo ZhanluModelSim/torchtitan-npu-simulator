@@ -36,8 +36,6 @@ import torchtitan_npu  # noqa: F401
 # skip marks cannot prevent imports of removed upstream symbols.
 collect_ignore = [
     "ema",
-    "extensions/torchtitan/experiments/graph_trainer",
-    "patches/torchtitan/experiments/graph_trainer",
     # Qwen runtime migration is deferred. Upstream eagerly imports CUDA-only
     # CuTeDSL code, which is not installed in the NPU test image.
     "override/qwen3_5/test_gated_delta.py",
@@ -60,8 +58,6 @@ collect_ignore = [
     "models/deepseek_v4_1/test_vision_language_sft.py",
     "models/deepseek_v4_1/test_grain_metadata.py",
     "models/qwen3_5/test_qwen3_5_npu_adapter.py",
-    # The memory-policy expectations track the pre-0.4 checkpoint policy mapping.
-    "models/deepseek_v4/memory_policy",
     # EMA is rejected by the eager NPU trainer.
     "extensions/torchtitan/components/optimizer/test_ema.py",
     # Anticipatory routing still targets the pre-0.4 dynamo/config interfaces.

@@ -94,13 +94,10 @@ def test_candidate_runner_clones_inputs_and_restores_mutated_buffers(monkeypatch
 
     monkeypatch.setattr(benchmark_module, "run_traced", fake_run_traced)
     runner = make_calibration_runner(
-        None,
-        {
-            "module": model,
-            "traced_result": traced_result,
-            "args": (training_input,),
-            "train_context": nullcontext,
-        },
+        traced_result,
+        model=model,
+        training_args=(training_input,),
+        train_context=nullcontext,
     )
 
     result = runner(candidate_gm)
@@ -135,13 +132,10 @@ def test_candidate_runner_restores_mutated_buffers_after_failure(monkeypatch):
 
     monkeypatch.setattr(benchmark_module, "run_traced", fake_run_traced)
     runner = make_calibration_runner(
-        None,
-        {
-            "module": model,
-            "traced_result": TracedResult(object()),
-            "args": (torch.tensor([1.0]),),
-            "train_context": nullcontext,
-        },
+        TracedResult(object()),
+        model=model,
+        training_args=(torch.tensor([1.0]),),
+        train_context=nullcontext,
     )
 
     with pytest.raises(RuntimeError, match="candidate failed"):

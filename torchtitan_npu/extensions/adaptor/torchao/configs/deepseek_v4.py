@@ -41,10 +41,10 @@ _DENSE = (
     ".attention.wo_a",
     ".attention.wo_b",
     ".attention.indexer.wq_b",
-    ".moe.shared_experts.w13",
-    ".moe.shared_experts.w2",
+    ".feed_forward.shared_experts.w13",
+    ".feed_forward.shared_experts.w2",
 )
-_ROUTED = (".moe.routed_experts.w13", ".moe.routed_experts.w2")
+_ROUTED = (".feed_forward.routed_experts.w13", ".feed_forward.routed_experts.w2")
 
 
 class V4FilterKeys:

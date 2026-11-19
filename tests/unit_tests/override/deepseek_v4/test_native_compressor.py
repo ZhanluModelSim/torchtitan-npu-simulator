@@ -10,6 +10,7 @@ import copy
 import pytest
 import torch
 import torch.nn.functional as F
+from torch.fx.experimental.proxy_tensor import make_fx
 from torchtitan.config import OverrideConfig, apply_overrides
 from torchtitan.models.deepseek_v4.compressor import Compressor
 
@@ -21,14 +22,34 @@ from torchtitan_npu.override.deepseek_v4.compressor import ascendc
 
 def _model_config():
     return _make_v4_config(
-        dim=16, n_layers=2, vocab_size=32, n_heads=2, head_dim=8,
-        rope_head_dim=4, q_lora_rank=8, o_lora_rank=4, n_groups=1,
-        compress_ratios=(4, 128), window_size=128, norm_eps=1e-6,
-        index_n_heads=2, index_head_dim=8, index_topk=4,
-        moe_inter_dim=8, num_experts=2, num_shared_experts=1, top_k=1,
-        n_hash_layers=0, route_norm=False, route_scale=1.0,
-        load_balance_coeff=1e-3, hc_mult=2, sinkhorn_iters=2,
-        hc_eps=1e-6, max_seq_len=512, compress_rope_theta=10000.0,
+        dim=16,
+        n_layers=2,
+        vocab_size=32,
+        n_heads=2,
+        head_dim=8,
+        rope_head_dim=4,
+        q_lora_rank=8,
+        o_lora_rank=4,
+        n_groups=1,
+        compress_ratios=(4, 128),
+        window_size=128,
+        norm_eps=1e-6,
+        index_n_heads=2,
+        index_head_dim=8,
+        index_topk=4,
+        moe_inter_dim=8,
+        num_experts=2,
+        num_shared_experts=1,
+        top_k=1,
+        n_hash_layers=0,
+        route_norm=False,
+        route_scale=1.0,
+        load_balance_coeff=1e-3,
+        hc_mult=2,
+        sinkhorn_iters=2,
+        hc_eps=1e-6,
+        max_seq_len=512,
+        compress_rope_theta=10000.0,
         original_seq_len=512,
     )
 
@@ -37,9 +58,7 @@ def test_native_compressor_override_preserves_state_layout_and_composes_children
     config = _model_config()
     original = copy.deepcopy(config.layers[0].attention.compressor)
 
-    apply_overrides(
-        OverrideConfig(imports=["torchtitan_npu.override.deepseek_v4.compressor.asc"]), config
-    )
+    apply_overrides(OverrideConfig(imports=["torchtitan_npu.override.deepseek_v4.compressor.asc"]), config)
 
     selected = [node for _, node, _, _ in config.traverse(Compressor.Config)]
     assert len(selected) == 3  # attention C4, its indexer, and HCA
@@ -60,6 +79,33 @@ def test_native_compressor_override_preserves_state_layout_and_composes_children
     assert set(dict(module.named_parameters())) == {"ape", "wkv.weight", "wgate.weight", "norm.weight"}
 
 
+def test_native_compressor_without_fused_pooling_traces_packed_documents(monkeypatch):
+    def unexpected_kernel():
+        pytest.fail("GraphTrainer should use the traceable pooling path")
+
+    monkeypatch.setattr(ascendc, "load_compressor", unexpected_kernel)
+    config = _model_config()
+    apply_overrides(
+        OverrideConfig(
+            imports=[
+                (
+                    "torchtitan_npu.override.deepseek_v4.compressor.asc",
+                    {"fused_pooling": False, "fused_norm": False, "fused_rope": False},
+                ),
+            ]
+        ),
+        config,
+    )
+    compressor = config.layers[0].attention.compressor.build()
+    x = torch.randn(8, 16)
+    positions = torch.arange(8)
+    aligned = torch.tensor([0, 4, 8, 8], dtype=torch.int32)
+    partial = torch.tensor([0, 3, 8, 8], dtype=torch.int32)
+
+    traced = make_fx(compressor, tracing_mode="fake", _allow_non_fake_inputs=True)(x, positions, aligned)
+    torch.testing.assert_close(traced(x, positions, partial), compressor(x, positions, partial))
+
+
 def test_native_compressor_reserved_terminal_slots_select_cann(monkeypatch):
     class KernelSelected(Exception):
         pass
@@ -70,10 +116,14 @@ def test_native_compressor_reserved_terminal_slots_select_cann(monkeypatch):
     monkeypatch.setattr(ascendc, "load_compressor", selected_kernel)
     config = _model_config()
     apply_overrides(
-        OverrideConfig(imports=[(
-            "torchtitan_npu.override.deepseek_v4.compressor.asc",
-            {"fused_norm": False, "fused_rope": False},
-        )]),
+        OverrideConfig(
+            imports=[
+                (
+                    "torchtitan_npu.override.deepseek_v4.compressor.asc",
+                    {"fused_norm": False, "fused_rope": False},
+                )
+            ]
+        ),
         config,
     )
     with torch.random.fork_rng(devices=[]):
@@ -134,10 +184,14 @@ def test_native_compressor_partial_documents_match_independent_oracle(monkeypatc
     monkeypatch.setattr(ascendc, "load_compressor", unexpected_kernel)
     config = _model_config()
     apply_overrides(
-        OverrideConfig(imports=[(
-            "torchtitan_npu.override.deepseek_v4.compressor.asc",
-            {"fused_norm": False, "fused_rope": False},
-        )]),
+        OverrideConfig(
+            imports=[
+                (
+                    "torchtitan_npu.override.deepseek_v4.compressor.asc",
+                    {"fused_norm": False, "fused_rope": False},
+                )
+            ]
+        ),
         config,
     )
     selected = config.layers[0 if ratio == 4 else 1].attention
@@ -162,8 +216,14 @@ def test_native_compressor_partial_documents_match_independent_oracle(monkeypatc
 
     actual = module(x, positions, boundaries)
     expected = _document_oracle(
-        reference_x, parameters, lengths, ratio, module.head_dim, module.rope_head_dim,
-        cfg.rope.theta, module.norm.eps,
+        reference_x,
+        parameters,
+        lengths,
+        ratio,
+        module.head_dim,
+        module.rope_head_dim,
+        cfg.rope.theta,
+        module.norm.eps,
     )
     upstream_gradient = torch.randn(actual.shape, generator=generator)
     actual.backward(upstream_gradient)

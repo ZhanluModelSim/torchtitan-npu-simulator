@@ -13,12 +13,11 @@ from torchtitan_npu.extensions.torchtitan.experiments.graph_trainer import auto_
 from torchtitan_npu.extensions.torchtitan.experiments.graph_trainer.utils import node_id
 
 
-def _config(*, debug_graph_passes: bool = False) -> SimpleNamespace:
+def _config() -> SimpleNamespace:
     return SimpleNamespace(
         compile=SimpleNamespace(
             passes=[],
             precompile_artifact_dir="",
-            debug_graph_passes=debug_graph_passes,
         )
     )
 
@@ -66,13 +65,13 @@ def test_runtime_context_patch_is_enabled_only_for_runtime_auto_overlap(
     assert apply.call_count == expected_calls
 
 
-def test_npu_auto_overlap_runs_after_chunk_shape_concretization():
+def test_npu_auto_overlap_runs_after_eager_chunk_metadata():
     config = _config()
     passes = [
         _named_pass("before"),
         _named_pass("joint_transformer_block_bucketing_reordering_pass"),
+        _named_pass("populate_eager_chunk_metadata_pass"),
         _named_pass("ep_overlap_schedule_pass"),
-        _named_pass("concretize_ep_chunk_symbolic_shapes_pass"),
         _named_pass("regional_inductor_pass"),
     ]
 
@@ -84,8 +83,8 @@ def test_npu_auto_overlap_runs_after_chunk_shape_concretization():
     assert [graph_trainer_auto_overlap._pass_name(pass_fn) for pass_fn in configured] == [
         "before",
         "joint_transformer_block_bucketing_reordering_pass",
+        "populate_eager_chunk_metadata_pass",
         "ep_overlap_validate_pass",
-        "concretize_ep_chunk_symbolic_shapes_pass",
         "npu_moe_auto_overlap_pass",
         "regional_inductor_pass",
     ]
@@ -110,7 +109,7 @@ def test_npu_auto_overlap_keeps_original_pipeline_with_duplicate_manual_pass(cap
     passes = [
         manual_pass,
         manual_pass,
-        _named_pass("concretize_ep_chunk_symbolic_shapes_pass"),
+        _named_pass("populate_eager_chunk_metadata_pass"),
         _named_pass("regional_inductor_pass"),
     ]
 
@@ -123,7 +122,7 @@ def test_npu_auto_overlap_keeps_original_pipeline_with_duplicate_manual_pass(cap
     assert "ep_overlap_schedule_pass=2" in caplog.text
 
 
-def test_npu_auto_overlap_keeps_original_pipeline_without_concretize_pass(caplog):
+def test_npu_auto_overlap_keeps_original_pipeline_without_eager_chunk_metadata(caplog):
     config = _config()
     passes = [
         _named_pass("ep_overlap_schedule_pass"),
@@ -136,7 +135,7 @@ def test_npu_auto_overlap_keeps_original_pipeline_without_concretize_pass(caplog
     )
 
     assert configured is passes
-    assert "concretize_ep_chunk_symbolic_shapes_pass=0" in caplog.text
+    assert "populate_eager_chunk_metadata_pass=0" in caplog.text
 
 
 def test_npu_auto_overlap_keeps_precompiled_runtime_pipeline(caplog):
@@ -153,8 +152,7 @@ def test_npu_auto_overlap_keeps_precompiled_runtime_pipeline(caplog):
     assert "precompiled artifact" in caplog.text
 
 
-@pytest.mark.parametrize("debug", [False, True])
-def test_npu_auto_overlap_writes_back_scheduler_result(monkeypatch, tmp_path, caplog, debug):
+def test_npu_auto_overlap_writes_back_scheduler_result(monkeypatch, caplog):
     from torchtitan_npu.extensions.torchtitan.experiments.graph_trainer import npu_moe_auto_scheduler
 
     class Scheduler:
@@ -169,12 +167,11 @@ def test_npu_auto_overlap_writes_back_scheduler_result(monkeypatch, tmp_path, ca
         "NpuMoeAutoOverlapScheduler",
         Scheduler,
     )
-    config = _config(debug_graph_passes=debug)
-    config.dump_folder = str(tmp_path)
+    config = _config()
     passes = [
         _named_pass("before"),
+        _named_pass("populate_eager_chunk_metadata_pass"),
         _named_pass("ep_overlap_schedule_pass"),
-        _named_pass("concretize_ep_chunk_symbolic_shapes_pass"),
         _named_pass("regional_inductor_pass"),
     ]
 
@@ -185,8 +182,8 @@ def test_npu_auto_overlap_writes_back_scheduler_result(monkeypatch, tmp_path, ca
 
     assert [graph_trainer_auto_overlap._pass_name(pass_fn) for pass_fn in configured] == [
         "before",
+        "populate_eager_chunk_metadata_pass",
         "ep_overlap_validate_pass",
-        "concretize_ep_chunk_symbolic_shapes_pass",
         "npu_moe_auto_overlap_pass",
         "regional_inductor_pass",
     ]
@@ -194,15 +191,8 @@ def test_npu_auto_overlap_writes_back_scheduler_result(monkeypatch, tmp_path, ca
     value = graph.placeholder("value")
     graph.output(value)
     gm = torch.fx.GraphModule({}, graph)
-    monkeypatch.chdir(tmp_path)
     assert configured[3](gm, ()) is gm
-    before_dump = tmp_path / "fx_graphs/auto_overlap_before_rank0.py"
-    after_dump = tmp_path / "fx_graphs/auto_overlap_after_rank0.py"
-    assert before_dump.is_file() is debug
-    assert after_dump.is_file() is debug
-    if debug:
-        assert "class GraphModule" in after_dump.read_text(encoding="utf-8")
-    assert "did not provide a runtime context" in caplog.text
+    assert "did not provide a candidate runner" in caplog.text
 
 
 def test_pipeline_factory_preserves_default_preparation_and_partial_passes(monkeypatch):
@@ -218,32 +208,33 @@ def test_pipeline_factory_preserves_default_preparation_and_partial_passes(monke
         require_all_to_all=True,
         pair_first_token_exchange=True,
     )
-    concretize = _named_pass("concretize_ep_chunk_symbolic_shapes_pass")
+    metadata = _named_pass("populate_eager_chunk_metadata_pass")
     terminal = partial(_named_pass("regional_inductor_pass"))
     default_passes = [
         before,
+        metadata,
         schedule,
-        concretize,
         terminal,
     ]
     factory = Mock(return_value=default_passes)
     monkeypatch.setattr(upstream_passes, "construct_default_graph_passes", factory)
+    run_graph = Mock()
 
     configured = graph_trainer_auto_overlap.construct_npu_auto_overlap_passes(
         traced_result,
         config,
         parallelism_context=parallelism_context,
+        run_graph=run_graph,
     )
 
     factory.assert_called_once_with(traced_result, config, parallelism_context=parallelism_context)
     assert configured[0] is before
-    assert graph_trainer_auto_overlap._pass_name(configured[1]) == "ep_overlap_validate_pass"
-    assert configured[1].keywords == schedule.keywords | {"require_all_to_all": False}
-    assert configured[2] is concretize
+    assert configured[1] is metadata
+    assert graph_trainer_auto_overlap._pass_name(configured[2]) == "ep_overlap_validate_pass"
+    assert configured[2].keywords == schedule.keywords | {"require_all_to_all": False}
     assert configured[3].func is graph_trainer_auto_overlap.npu_moe_auto_overlap_pass
     assert configured[3].keywords["config"] is config
-    assert configured[3].keywords["traced_result"] is traced_result
-    assert configured[3]._requires_runtime_context is True
+    assert configured[3].keywords["run_graph"] is run_graph
     assert configured[4] is terminal
     assert len(default_passes) == 4  # Do not mutate the upstream pass list.
 
@@ -255,8 +246,8 @@ def test_mutation_functionalization_pipeline_is_composed_before_auto_overlap(
     config = _config()
     functionalize = _named_pass("functionalize_recompute_mutations_pass")
     manual = _named_pass("ep_overlap_schedule_pass")
-    concretize = _named_pass("concretize_ep_chunk_symbolic_shapes_pass")
-    base_passes = [functionalize, manual, concretize]
+    metadata = _named_pass("populate_eager_chunk_metadata_pass")
+    base_passes = [functionalize, metadata, manual]
     factory = Mock(return_value=base_passes)
     monkeypatch.setitem(
         PASS_PIPELINE_REGISTRY,
@@ -277,18 +268,17 @@ def test_mutation_functionalization_pipeline_is_composed_before_auto_overlap(
     )
     assert [graph_trainer_auto_overlap._pass_name(pass_fn) for pass_fn in configured] == [
         "functionalize_recompute_mutations_pass",
+        "populate_eager_chunk_metadata_pass",
         "ep_overlap_validate_pass",
-        "concretize_ep_chunk_symbolic_shapes_pass",
         "npu_moe_auto_overlap_pass",
     ]
-    assert base_passes == [functionalize, manual, concretize]
+    assert base_passes == [functionalize, metadata, manual]
 
 
-def test_two_whole_graph_rounds_measure_previous_schedule_and_keep_latest_fallback(
-    monkeypatch,
-    tmp_path,
-):
-    from torchtitan_npu.extensions.torchtitan.experiments.graph_trainer import npu_moe_auto_scheduler as scheduler_module
+def test_two_whole_graph_rounds_measure_previous_schedule_and_keep_latest_fallback(monkeypatch):
+    from torchtitan_npu.extensions.torchtitan.experiments.graph_trainer import (
+        npu_moe_auto_scheduler as scheduler_module,
+    )
     from torchtitan_npu.extensions.torchtitan.experiments.graph_trainer import whole_graph_benchmark as benchmark_module
 
     graph = torch.fx.Graph()
@@ -322,7 +312,6 @@ def test_two_whole_graph_rounds_measure_previous_schedule_and_keep_latest_fallba
         assert candidate is gm
         assert run_candidate is runner
         assert candidate.meta["test_schedule_generation"] == calibration_round
-        assert debug is True
         cid, aid = node_id(compute), node_id(comm)
         assert profile_node_ids == frozenset((cid, aid))
         profiles.append(calibration_round)
@@ -333,19 +322,12 @@ def test_two_whole_graph_rounds_measure_previous_schedule_and_keep_latest_fallba
 
     monkeypatch.setattr(scheduler_module, "NpuMoeAutoOverlapScheduler", Scheduler)
     monkeypatch.setattr(benchmark_module, "profile_whole_graph_costs", profile)
-    monkeypatch.setattr(
-        benchmark_module,
-        "make_calibration_runner",
-        lambda _traced_result, _runtime_context: runner,
-    )
-    config = _config(debug_graph_passes=True)
-    config.dump_folder = str(tmp_path)
-    monkeypatch.chdir(tmp_path)
     passes = graph_trainer_auto_overlap._configure_npu_auto_overlap_passes(
-        [_named_pass("ep_overlap_schedule_pass"), _named_pass("concretize_ep_chunk_symbolic_shapes_pass")],
-        config,
+        [_named_pass("populate_eager_chunk_metadata_pass"), _named_pass("ep_overlap_schedule_pass")],
+        _config(),
+        run_graph=runner,
     )
-    result = passes[2](gm, (), runtime_context={"test": "context"})
+    result = passes[2](gm, ())
     assert result is gm
     assert profiles == [1, 2]
     assert len(schedulers) == 3
@@ -356,4 +338,3 @@ def test_two_whole_graph_rounds_measure_previous_schedule_and_keep_latest_fallba
         assert scheduler.kwargs["canonical_order_override"] is schedulers[0].kwargs["canonical_order_override"]
     assert schedulers[-1].costs_by_node_id[node_id(compute)] == 0.0
     assert schedulers[-1].costs_by_node_id[node_id(comm)] == 3.0
-    assert (tmp_path / "fx_graphs/auto_overlap_after_rank0.py").is_file()

@@ -30,6 +30,8 @@ from torchao_npu.quantization.quant_primitives.mx import mx_fake_quantize
 from torchtitan.config import derive
 from torchtitan.config.transform.quantization import QuantizationConverter
 from torchtitan.models.base.module import Module
+from torchtitan.models.deepseek_v4.attention import DeepSeekV4Attention
+from torchtitan.models.deepseek_v4.compressor import Compressor
 
 from ..configs import ModelType
 from ..configs.deepseek_v4 import V4FilterKeys
@@ -360,7 +362,10 @@ class KVNormFakeQuantConverter(QuantizationConverter):
                 raise ValueError(
                     f"KV norm at {fqn!r} has an invalid nope span: head_dim={head_dim}, nope_head_dim={nope_head_dim}"
                 )
-            if split != nope_head_dim:
+            # Native attention and compression slice out the rotary span before
+            # invoking RoPE, so their RoPE config has no unrotated prefix.
+            pre_sliced_rope = split == 0 and isinstance(parent, (DeepSeekV4Attention.Config, Compressor.Config))
+            if split != nope_head_dim and not pre_sliced_rope:
                 raise ValueError(
                     f"KV norm at {fqn!r} disagrees with its rope split: "
                     f"nope_head_dim={nope_head_dim}, rope split={split}"

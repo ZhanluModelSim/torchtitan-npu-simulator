@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import logging
+from collections import defaultdict
 from typing import TYPE_CHECKING
 
 import torch
@@ -109,17 +110,17 @@ def _swiglu_w13_candidate(
     return root, next(iter(candidates))
 
 
-def _fallback_w1w3_nodes(gm: torch.fx.GraphModule, root: str) -> set[torch.fx.Node]:
-    nodes = [
-        node
-        for node in gm.graph.nodes
-        if node.op == "call_function" and not _is_backward_node(node) and _op_name(node) in _GEMMS
-    ]
-    exact = {node for node in nodes if _get_module_fqn(node) in {root + ".w1", root + ".w3"}}
-    if len(exact) == 2:
-        return exact
+def _fallback_w13_nodes(nodes: list[torch.fx.Node], root: str) -> set[torch.fx.Node]:
+    gemms = [node for node in nodes if _op_name(node) in _GEMMS]
+    packed = {node for node in gemms if _get_module_fqn(node) == root + ".w13"}
+    if len(packed) == 1:
+        return packed
 
-    same_root = [node for node in nodes if _get_module_fqn(node) == root]
+    separate = {node for node in gemms if _get_module_fqn(node) in {root + ".w1", root + ".w3"}}
+    if len(separate) == 2:
+        return separate
+
+    same_root = [node for node in gemms if _get_module_fqn(node) == root]
     return set(same_root[:2]) if len(same_root) >= 3 else set()
 
 
@@ -128,23 +129,34 @@ def _find_w13_save_nodes(
     *,
     module_patterns: Sequence[str],
 ) -> dict[str, set[torch.fx.Node]]:
-    roots = {
-        root
-        for node in gm.graph.nodes
-        if not _is_backward_node(node) and (root := _root_for(node, module_patterns)) is not None
-    }
-    saves: dict[str, set[torch.fx.Node]] = {}
-
+    nodes_by_chunk: defaultdict[tuple[str, int | None], list[torch.fx.Node]] = defaultdict(list)
+    fused_saves: defaultdict[tuple[str, int | None], set[torch.fx.Node]] = defaultdict(set)
     for node in gm.graph.nodes:
+        if node.op != "call_function" or _is_backward_node(node):
+            continue
+        root = _root_for(node, module_patterns)
+        if root is None:
+            continue
+        key = (root, node.meta.get("custom", {}).get("chunk_id"))
+        nodes_by_chunk[key].append(node)
         candidate = _swiglu_w13_candidate(node, module_patterns)
         if candidate is not None:
-            root, save_node = candidate
-            saves.setdefault(root, set()).add(save_node)
+            fused_saves[key].add(candidate[1])
 
-    for root in sorted(roots - saves.keys()):
-        saves[root] = _fallback_w1w3_nodes(gm, root)
-        if len(saves[root]) != 2:
-            raise ValueError(f"Cannot identify W13 or W1/W3 outputs in {root}. Inspect the pre-remat graph.")
+    chunked_roots = {root for root, chunk_id in nodes_by_chunk if chunk_id is not None}
+    saves: defaultdict[str, set[torch.fx.Node]] = defaultdict(set)
+    for (root, chunk_id), nodes in nodes_by_chunk.items():
+        # Expert FQNs also occur on graph nodes outside the eager chunk bodies.
+        if chunk_id is None and root in chunked_roots:
+            continue
+        candidates = fused_saves.get((root, chunk_id)) or _fallback_w13_nodes(nodes, root)
+        if not candidates:
+            gemms = [(node.name, _get_module_fqn(node), _op_name(node)) for node in nodes if _op_name(node) in _GEMMS]
+            raise ValueError(
+                f"Cannot identify W13 or W1/W3 outputs in {root} (chunk_id={chunk_id}). "
+                f"GEMMs in the pre-remat graph: {gemms}"
+            )
+        saves[root].update(candidates)
 
     for root, nodes in sorted(saves.items()):
         logger.info(
@@ -227,7 +239,7 @@ def _tag_dsv4_mhc_moe_save(
             return full_policy(node)
         return base_policy(node)
 
-    logger.info("DSV4 MHC MoE save: %d W13 or W1/W3 tensors selected before EP chunking", len(extra_saves))
+    logger.info("DSV4 MHC MoE save: %d W13 or W1/W3 tensors selected before rematerialization", len(extra_saves))
     memory_policy.tag_sac_policy(
         gm,
         policy_fn=policy_fn,

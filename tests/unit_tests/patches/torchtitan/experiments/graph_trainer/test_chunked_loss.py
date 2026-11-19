@@ -17,8 +17,9 @@ from torch.distributed.device_mesh import init_device_mesh
 from torchtitan.experiments.graph_trainer.common_utils import accumulate_param_grads_, compute_annotated_loss
 from torchtitan.experiments.graph_trainer.make_fx_tracer import minimal_fx_tracer, run_traced
 from torchtitan.experiments.graph_trainer.simple_fsdp import data_parallel
+from torchtitan.models.common.linear import Linear
 
-from torchtitan_npu_recipes.graph_trainer.deepseek_v4 import graph_trainer_deepseek_v4_flash_43layers_16experts
+from torchtitan_npu_recipes.examples.deepseek_v4 import deepseek_v4_flash_8p_cpt_4k_a3_graphtrainer
 
 pytestmark = pytest.mark.cpu
 
@@ -63,10 +64,10 @@ def _assert_coalesced_microbatch_gradients(rank, rendezvous, dtype):
         labels[0, 1] = -100
         labels[1, 12] = -100
         valid_tokens = (labels != -100).sum()
-        cfg = graph_trainer_deepseek_v4_flash_43layers_16experts()
+        cfg = deepseek_v4_flash_8p_cpt_4k_a3_graphtrainer()
         cfg.loss.num_chunks = 8
-        loss_fn = cfg.loss.build(compile_config=None)
-        head = torch.nn.Linear(4, 13, bias=False)
+        loss_fn = cfg.loss.build()
+        head = Linear.Config(in_features=4, out_features=13, bias=False, inplace_wgrad_accum=False).build()
         with torch.no_grad():
             head.weight.copy_(weight)
         data_parallel(
@@ -79,7 +80,7 @@ def _assert_coalesced_microbatch_gradients(rank, rendezvous, dtype):
         loss_fn.set_lm_head(head)
 
         def step(local_hidden, targets, token_count):
-            loss = compute_annotated_loss(loss_fn, local_hidden, targets, {"global_valid_tokens": token_count})
+            loss = compute_annotated_loss(loss_fn, local_hidden, targets, {"global_loss_token_counts": token_count})
             grads = torch.autograd.grad(loss * 0.25, (local_hidden, head._parameters["weight"]))
             return loss, *grads
 

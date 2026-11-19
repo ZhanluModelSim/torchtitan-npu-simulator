@@ -105,5 +105,8 @@ def test_muon_groups_match_real_parameters_layouts_and_buckets(version):
     for name in ("layers.0.feed_forward.router.gate.weight", "layers.0.attention.wq_a.weight"):
         assert isinstance(layouts[name].shardings_by_mesh_axis[dp], Owned)
     expert = layouts["layers.0.feed_forward.routed_experts.w13.weight"]
-    assert set(expert.shardings_by_mesh_axis) == {dp, MeshAxisName.EDP_SHARD.value, MeshAxisName.EP.value}
+    expected_expert_axes = {dp, MeshAxisName.EDP_SHARD.value, MeshAxisName.EP.value}
+    if version == "v4":
+        expected_expert_axes.add("fsdp")  # GraphTrainer SimpleFSDP flattens the dense DP mesh.
+    assert set(expert.shardings_by_mesh_axis) == expected_expert_axes
     assert all(isinstance(shard, Shard) and shard.dim == 0 for shard in expert.shardings_by_mesh_axis.values())

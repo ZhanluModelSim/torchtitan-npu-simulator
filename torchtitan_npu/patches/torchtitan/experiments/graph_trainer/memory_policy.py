@@ -176,11 +176,13 @@ def make_node_override_memory_policy(
     base_policy: Callable[[torch.fx.Node], CheckpointPolicy],
     overrides: dict[NodePolicyKey, CheckpointPolicy],
 ) -> Callable[[torch.fx.Node], CheckpointPolicy]:
-    node_counts: defaultdict[tuple[object, str], int] = defaultdict(int)
+    node_counts: defaultdict[tuple[object, str, int | None], int] = defaultdict(int)
 
     def policy_fn(node: torch.fx.Node) -> CheckpointPolicy:
-        fqn = node.meta.get("custom", {}).get(_MODULE_FQN, "")
-        count_key = (node.target, fqn)
+        custom = node.meta.get("custom", {})
+        fqn = custom.get(_MODULE_FQN, "")
+        # Eager EP chunks share the module FQN but have separate occurrences.
+        count_key = (node.target, fqn, custom.get("chunk_id"))
         node_counts[count_key] += 1
         occurrence = node_counts[count_key]
 

@@ -6,22 +6,30 @@
 """Native V4 config selection and CPU-visible SMLA adapter contracts."""
 
 import copy
+import inspect
 from itertools import pairwise
 
 import pytest
 import torch
+from torch._subclasses.functional_tensor import dispatch_functionalize
+from torch.utils.checkpoint import CheckpointPolicy
 from torchtitan.config import OverrideConfig, apply_overrides, derive
+from torchtitan.experiments.graph_trainer.make_fx_tracer import minimal_fx_tracer, run_traced
 from torchtitan.models.common.aux_loss import AuxLoss
 from torchtitan.models.deepseek_v4.attention import DeepSeekV4Attention as UpstreamDeepSeekV4Attention
-from torchtitan.models.deepseek_v4.compressor import Indexer, SparseIndexerLoss
+from torchtitan.models.deepseek_v4.compressor import Indexer, SparseIndexerLoss, compressed_cu_seqlens
 
 from torchtitan_npu.models.deepseek_v4 import _make_v4_config
 from torchtitan_npu.models.deepseek_v4.attention import DeepSeekV4Attention
+from torchtitan_npu.models.deepseek_v4.model import GraphTrainerDeepSeekV4Model
 from torchtitan_npu.override.deepseek_v4.sparse_attn import ascendc
 from torchtitan_npu.override.deepseek_v4.sparse_attn.native import (
     AscCompressedSparseAttention,
     AscHeavilyCompressedAttention,
     AscSlidingWindowAttention,
+)
+from torchtitan_npu.patches.torchtitan.experiments.graph_trainer.functionalize_recompute_mutations import (
+    functionalize_recompute_mutations_pass,
 )
 
 pytestmark = pytest.mark.usefixtures("dsv4")
@@ -175,6 +183,48 @@ def test_native_reserved_empty_segments_are_removed_only_from_kernel_frames(monk
     expected = original.build()(*arguments, attention_metadata=reference_metadata)
 
     torch.testing.assert_close(actual, expected, rtol=3e-5, atol=3e-6)
+
+
+def test_graph_trainer_compressed_offsets_reject_capacity_overflow():
+    config = _model_config()
+    _select(config)
+    model = derive(config, GraphTrainerDeepSeekV4Model.Config).build()
+    metadata = model._get_attention_metadata(torch.arange(256).repeat(3))[AscCompressedSparseAttention]
+
+    with pytest.raises(RuntimeError, match="Document offsets exceed capacity"):
+        metadata.with_fixed_native_offsets(num_tokens=4)
+
+
+@pytest.mark.skipif(
+    "propagate_input_mutations" not in inspect.signature(dispatch_functionalize).parameters,
+    reason="functionalization backport requires propagate_input_mutations",
+)
+def test_graph_trainer_compressed_offsets_replay_with_a_different_document_count():
+    config = _model_config()
+    _select(config)
+    model = derive(config, GraphTrainerDeepSeekV4Model.Config).build()
+
+    def compressed_offsets(offsets):
+        compressed = compressed_cu_seqlens(offsets, ratio=4)
+        return torch.empty_like(compressed).copy_(compressed)
+
+    first = model._get_attention_metadata(torch.arange(256).repeat(3))[AscCompressedSparseAttention]
+    traced = minimal_fx_tracer(compressed_offsets)(first.cu_seq_q)
+    for node in traced.gm.graph.nodes:
+        if node.op == "call_function":
+            node.meta["recompute"] = CheckpointPolicy.MUST_RECOMPUTE
+    functional = functionalize_recompute_mutations_pass(traced.gm, traced.example_inputs)
+    assert functional is not traced.gm
+    traced.gm = functional
+    replay = run_traced(traced)
+
+    for doc_len, num_docs in [(384, 2), (128, 6)]:
+        metadata = model._get_attention_metadata(torch.arange(doc_len).repeat(num_docs))[AscCompressedSparseAttention]
+        boundaries = torch.arange(num_docs + 1, dtype=torch.int32) * doc_len
+        torch.testing.assert_close(metadata.q.cu_seqlens, boundaries)
+        expected = (boundaries // 4).new_full((193,), 192)
+        expected[: num_docs + 1] = boundaries // 4
+        torch.testing.assert_close(replay(metadata.cu_seq_q), expected)
 
 
 @pytest.mark.parametrize(

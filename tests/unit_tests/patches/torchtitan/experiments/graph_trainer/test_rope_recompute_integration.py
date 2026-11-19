@@ -50,14 +50,14 @@ from torchtitan_npu.patches.torchtitan.experiments.graph_trainer.functionalize_r
 _PROPAGATES_INPUT_MUTATIONS = "propagate_input_mutations" in inspect.signature(dispatch_functionalize).parameters
 
 SPLIT, ROTARY_DIM = 4, 4
-POSITIONS = torch.arange(1, 4).unsqueeze(0)
+POSITIONS = torch.arange(1, 4)
 # Fixed, unequal channel weights so a dropped rotation visibly shifts the
 # gradient instead of cancelling out.
-WEIGHT = torch.arange(1.0, SPLIT + ROTARY_DIM + 1.0).view(1, 1, 1, -1)
+WEIGHT = torch.arange(1.0, SPLIT + ROTARY_DIM + 1.0)
 
 
 def _build_joint(inverse):
-    fused = AscPartialComplexRoPE(AscPartialComplexRoPE.Config(dim=ROTARY_DIM, max_seq_len=16, split=SPLIT))
+    fused = AscPartialComplexRoPE(AscPartialComplexRoPE.Config(dim=ROTARY_DIM, max_context_length=16, split=SPLIT))
 
     def joint(x):
         y = fused(x, positions=POSITIONS, inverse=inverse)
@@ -71,7 +71,7 @@ def _build_joint(inverse):
 def _trace_and_tag(inverse):
     """Capture the joint graph and apply GraphTrainer-style metadata."""
     torch.manual_seed(2026)
-    x = torch.randn(1, 3, 2, SPLIT + ROTARY_DIM, requires_grad=True)
+    x = torch.randn(3, 2, SPLIT + ROTARY_DIM, requires_grad=True)
     gm = make_fx(_build_joint(inverse))(x)
 
     # The fixed fixture has a single loss reduction; everything after it is

@@ -106,13 +106,16 @@ class AscNativeCompressor(UpstreamCompressor):
 
     @dataclass(kw_only=True, slots=True)
     class Config(UpstreamCompressor.Config):
-        pass
+        fused_pooling: bool = True
 
     def __init__(self, config: Config):
         super().__init__(config)
+        self.fused_pooling = config.fused_pooling
         self._compressor_fn = None
 
     def forward(self, x, positions, cu_seqlens=None):
+        if not self.fused_pooling:
+            return super().forward(x, positions, cu_seqlens)
         ratio = self.compress_ratio
         seqlen = x.shape[0]
         if seqlen == 0:

@@ -22,47 +22,25 @@ DeepSeek-V4 同时包含 attention、压缩 attention、MoE、SimpleFSDP 通信�
 
 ### 2.1 默认配置
 
-DSV4 GraphTrainer 工厂默认配置如下：
-
-```text
-enable = true
-mode = "aot_fx_trace"
-memory_policy = "full"
-pass_pipeline = "mutation-functionalization"
-disable_passes = ["cudagraph_pass"]
-```
-
-配置位置：
-
-```text
-torchtitan_npu_recipes/graph_trainer/deepseek_v4.py
-```
-
-五个 GraphTrainer recipe 均使用 `num_mtp_layers=0` 和 `memory_policy="full"`。
+三个 DSV4 示例位于 `torchtitan_npu_recipes/examples/deepseek_v4.py`，使用 `mutation-functionalization+npu_auto_overlap`，并禁用 `cudagraph_pass`。A5 八卡示例使用 `dsv4-mhc-moe-save`，A3 八卡和 A5 多机示例使用 `full`。
 
 ### 2.2 切换 DSV4 专用策略
 
-```bash
---compile.memory-policy dsv4-mhc
+```python
+config.compile.memory_policy = "dsv4-mhc"
 ```
 
 `dsv4-mhc` 不是默认策略。建议先用 `full` 完成数值和编译验证，再在相同模型、batch、并行度和 step 数下对比显存与吞吐。
 
 如需额外保存 MoE expert 激活、减少反向 W13 或 W1/W3 GEMM replay，可使用：
 
-```bash
---compile.memory-policy dsv4-mhc-moe-save
+```python
+config.compile.memory_policy = "dsv4-mhc-moe-save"
 ```
 
 ### 2.3 配置类型要求
 
-NPU ConfigManager 会跳过 `GraphTrainer.Config` 的普通包装，相关代码位于：
-
-```text
-torchtitan_npu/config/manager.py
-```
-
-如果误转成普通 `TrainerConfig`，训练会退回 `TrainerEx`，GraphTrainer 的联合图和重计算策略不会生效。
+DSV4 图训练 recipe 返回 `GraphTrainerEx.Config`。自定义 recipe 可复用该配置，并在返回前设置 `config.compile.memory_policy`。
 
 ## 3. 执行流程
 
@@ -167,7 +145,7 @@ CPU offload 与 SAR 之前把变异写入显式化为数据流，原生 SAR 随�
 
 | 功能 | 文件 |
 | --- | --- |
-| DSV4 GraphTrainer 配置 | `torchtitan_npu_recipes/graph_trainer/deepseek_v4.py` |
+| DSV4 GraphTrainer 配置 | `torchtitan_npu_recipes/examples/deepseek_v4.py` |
 | 通用 full policy | `torchtitan/experiments/graph_trainer/memory_policy.py` |
 | NPU policy 框架 | `torchtitan_npu/patches/torchtitan/experiments/graph_trainer/memory_policy.py` |
 | `dsv4-mhc` / `dsv4-mhc-moe-save` 策略 | `torchtitan_npu/models/deepseek_v4/memory_policy.py` |

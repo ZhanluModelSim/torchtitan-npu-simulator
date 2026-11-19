@@ -47,7 +47,7 @@ def _build_graph(swiglu_op, *, separate_projections=False, intervening_op=False)
     for layer in (0, 1, 4):
         outputs = []
         for kind, suffix in (("shared", "shared_experts"), ("routed", "routed_experts")):
-            fqn = f"layers.{layer}.moe.{suffix}"
+            fqn = f"layers.{layer}.feed_forward.{suffix}"
             key = f"{kind}{layer}"
             if separate_projections:
                 gate = add(torch.ops.aten.mm.default, (x, w2), fqn, key + "_gate")
@@ -64,8 +64,8 @@ def _build_graph(swiglu_op, *, separate_projections=False, intervening_op=False)
             nodes[key] = (gu, swiglu_input, h, out)
             backward_inputs.extend((swiglu_input, h, out))
             outputs.append(out)
-        gate = add(torch.ops.aten.mm.default, (x, w2), f"layers.{layer}.moe.router.gate", f"gate{layer}")
-        merge = add(torch.ops.aten.add.Tensor, tuple(outputs), f"layers.{layer}.moe", f"merge{layer}")
+        gate = add(torch.ops.aten.mm.default, (x, w2), f"layers.{layer}.feed_forward.router.gate", f"gate{layer}")
+        merge = add(torch.ops.aten.add.Tensor, tuple(outputs), f"layers.{layer}.feed_forward", f"merge{layer}")
         nodes[f"base{layer}"] = (gate, merge)
 
     backward = []
@@ -104,7 +104,7 @@ def _build_default_swiglu_graph():
     for layer in (0, 1):
         outputs = []
 
-        shared_root = f"layers.{layer}.moe.shared_experts"
+        shared_root = f"layers.{layer}.feed_forward.shared_experts"
         shared_w1 = add(torch.ops.aten.mm.default, (x, w2), shared_root + ".w1", f"shared{layer}_w1")
         shared_silu = add(torch.ops.aten.silu.default, (shared_w1,), shared_root, f"shared{layer}_silu")
         shared_w3 = add(torch.ops.aten.mm.default, (x, w2), shared_root + ".w3", f"shared{layer}_w3")
@@ -114,7 +114,7 @@ def _build_default_swiglu_graph():
         backward_inputs.extend((shared_w1, shared_w3, shared_h, shared_w2))
         outputs.append(shared_w2)
 
-        routed_root = f"layers.{layer}.moe.routed_experts"
+        routed_root = f"layers.{layer}.feed_forward.routed_experts"
         routed_w1 = add(torch.ops.aten.mm.default, (x, w2), routed_root + ".w1", f"routed{layer}_w1")
         routed_silu = add(torch.ops.aten.silu.default, (routed_w1,), routed_root, f"routed{layer}_silu")
         routed_w3 = add(torch.ops.aten.mm.default, (x, w2), routed_root + ".w3", f"routed{layer}_w3")
@@ -124,8 +124,8 @@ def _build_default_swiglu_graph():
         backward_inputs.extend((routed_w1, routed_w3, routed_h, routed_w2))
         outputs.append(routed_w2)
 
-        gate = add(torch.ops.aten.mm.default, (x, w2), f"layers.{layer}.moe.router.gate", f"gate{layer}")
-        merge = add(torch.ops.aten.add.Tensor, tuple(outputs), f"layers.{layer}.moe", f"merge{layer}")
+        gate = add(torch.ops.aten.mm.default, (x, w2), f"layers.{layer}.feed_forward.router.gate", f"gate{layer}")
+        merge = add(torch.ops.aten.add.Tensor, tuple(outputs), f"layers.{layer}.feed_forward", f"merge{layer}")
         nodes[f"base{layer}"] = (gate, merge)
 
     backward = []
@@ -215,6 +215,65 @@ def test_mhc_moe_save_policy_without_swiglu_group_saves_w1_w3_outputs():
             assert w3.meta["recompute"] == CheckpointPolicy.MUST_SAVE
             assert h.meta["recompute"] == CheckpointPolicy.MUST_RECOMPUTE
             assert w2.meta["recompute"] == CheckpointPolicy.MUST_RECOMPUTE
+
+
+def test_mhc_moe_save_policy_saves_packed_w13_and_first_moe_add_per_eager_chunk():
+    graph = Graph()
+    x = graph.placeholder("x")
+    w13 = graph.placeholder("w13")
+    w2 = graph.placeholder("w2")
+    expected_saves = []
+    expected_recompute = []
+    backward_inputs = []
+    root = "layers.0.feed_forward"
+
+    def add(target, args, fqn, chunk_id):
+        node = graph.call_function(target, args)
+        node.meta["custom"] = {"module_fqn": fqn}
+        if chunk_id is not None:
+            node.meta["custom"]["chunk_id"] = chunk_id
+        return node
+
+    x = add(torch.ops.aten.neg.default, (x,), f"{root}.shared_experts", None)
+    for chunk_id in (0, 1):
+        expert_outputs = []
+        for expert in ("shared_experts", "routed_experts"):
+            expert_fqn = f"{root}.{expert}"
+            gate_up = add(torch.ops.aten.mm.default, (x, w13), f"{expert_fqn}.w13", chunk_id)
+            gate = add(torch.ops.aten.slice.Tensor, (gate_up, 1, 0, 3), expert_fqn, chunk_id)
+            up = add(torch.ops.aten.slice.Tensor, (gate_up, 1, 3, 6), expert_fqn, chunk_id)
+            activated = add(torch.ops.aten.silu.default, (gate,), expert_fqn, chunk_id)
+            hidden = add(torch.ops.aten.mul.Tensor, (activated, up), expert_fqn, chunk_id)
+            output = add(torch.ops.aten.mm.default, (hidden, w2), f"{expert_fqn}.w2", chunk_id)
+            expected_saves.append(gate_up)
+            expected_recompute.append(output)
+            expert_outputs.append(output)
+        merged = add(torch.ops.aten.add.Tensor, tuple(expert_outputs), root, chunk_id)
+        later_add = add(torch.ops.aten.add.Tensor, (merged, x), root, chunk_id)
+        expected_saves.append(merged)
+        expected_recompute.append(later_add)
+        backward_inputs.extend((activation, chunk_id) for activation in (*expected_saves[-3:], later_add))
+
+    outputs = []
+    for activation, chunk_id in backward_inputs:
+        bwd = add(torch.ops.aten.sum.default, (activation,), root, chunk_id)
+        bwd.meta["autograd_backward"] = True
+        outputs.append(bwd)
+    graph.output(tuple(outputs))
+    gm = GraphModule({}, graph)
+    inputs = (torch.ones(2, 3), torch.ones(3, 6), torch.eye(3))
+    expected = gm(*inputs)
+    config = SimpleNamespace(
+        parallelism=SimpleNamespace(fsdp_reshard_after_forward="always", pipeline_parallel_degree=1)
+    )
+
+    MEMORY_POLICY_REGISTRY["dsv4-mhc-moe-save"](gm, config=config)
+
+    assert all(node.meta["recompute"] == CheckpointPolicy.MUST_SAVE for node in expected_saves)
+    assert all(node.meta["recompute"] == CheckpointPolicy.MUST_RECOMPUTE for node in expected_recompute)
+    selective_activation_remat_pass(gm)
+    assert not {f"{node.name}_recomputed" for node in expected_saves} & {node.name for node in gm.graph.nodes}
+    torch.testing.assert_close(gm(*inputs), expected, rtol=0, atol=0)
 
 
 def test_fused_mhc_moe_save_policy_rejects_missing_activation_match(swiglu_op):

@@ -1,6 +1,23 @@
 # DeepSeek-V4 GraphTrainer 编译路径适配
 
-GraphTrainer 是 torchtitan 上游 `experiments/graph_trainer/` 中的编译式分布式训练实验：用 `minimal_fx_tracer` 把 forward、loss、backward（可选 optimizer.step）整体捕获为单个 FX 图，所有优化都以 graph pass 的形式作用于同一张图。本仓保留 DeepSeek-V4（DSV4）的 NPU 图训练实现；TorchTitan 0.4.0 的当前验收范围为文本 eager，图训练仍待迁移和回归。图训练配置位于独立 recipe 模块。
+GraphTrainer 使用 `minimal_fx_tracer` 将前向、loss 和反向捕获为联合 FX 图，再通过 graph pass 优化。本仓提供配套 TorchTitan v0.4.0 的 DeepSeek-V4（DSV4）A3 和 A5 GraphTrainer recipe。
+
+## 启动训练
+
+从仓库根目录启动 A3 八卡 Flash 示例。将 `HF_ASSETS_PATH` 指向实际的 tokenizer 目录。
+
+```bash
+HF_ASSETS_PATH=/path/to/DeepSeekV4_tokenizer STEPS=20 \
+  bash examples/deepseek_v4/debug/deepseek_v4_flash_8p_cpt_4k_a3_graphtrainer.sh
+```
+
+| Python recipe（`torchtitan_npu_recipes.examples.deepseek_v4`） | 对应 launcher | 默认步数 |
+| --- | --- | ---: |
+| `deepseek_v4_flash_8p_cpt_4k_a3_graphtrainer` | [A3 八卡](../../examples/deepseek_v4/debug/deepseek_v4_flash_8p_cpt_4k_a3_graphtrainer.sh) | 100 |
+| `deepseek_v4_flash_8p_cpt_4k_a5_graphtrainer` | [A5 八卡](../../examples/deepseek_v4/debug/deepseek_v4_flash_8p_cpt_4k_a5_graphtrainer.sh) | 20 |
+| `deepseek_v4_flash_cpt_4k_a5_graphtrainer` | [A5 多机](../../examples/deepseek_v4/deepseek_v4_flash_cpt_4k_a5_graphtrainer.sh) | 20 |
+
+三个 recipe 均读取 `STEPS` 覆盖训练步数。其他训练字段通过 Python recipe 设置，配置组合见 [recipe 指南](../../torchtitan_npu_recipes/README.md)。TorchTitan v0.4.0 的 SPMD 路径不支持将梯度累积与 EP overlap 或自定义 pass pipeline 组合，示例使用单 microbatch。
 
 ## 上游 GraphTrainer 特性
 
@@ -12,23 +29,13 @@ GraphTrainer 是 torchtitan 上游 `experiments/graph_trainer/` 中的编译式�
 - **Graph pass 流水线**：默认（保数值）pass 与 opt-in 性能 pass 分层，包括 bucketing 通信重叠、异步 TP、regional/full Inductor 编译、CUDA graph、CPU offload、选择性激活重算等。
 - **可组合并行**：FSDP、TP、EP 均在图内表达；EP overlap（MoE chunk 级通信重叠）为实验性 pass。
 
-编译模式固定为 `aot_fx_trace`（上游已弃用 `aot` 与 `jit` 两种旧模式）。NPU 上必须禁用 `cudagraph_pass`（CUDA graph capture 无意义且不兼容），本适配的编译配置已内置该禁用项。
+NPU recipe 通过 `disable_passes=["cudagraph_pass"]` 禁用 CUDA Graph capture。
 
 ## 本仓实现
 
 ### 配置入口
 
-`torchtitan_npu_recipes/graph_trainer/deepseek_v4.py` 保存图训练组合，均复用 `torchtitan_npu_recipes.models.deepseek_v4` 中的对应 eager 配置，经 `torchtitan_npu/models/deepseek_v4/graph_trainer.py` 的 `to_graph_trainer_config` 包装为 `GraphTrainer.Config`：
-
-| 配置名 | 对应 eager 配置 |
-| --- | --- |
-| `graph_trainer_deepseek_v4_debugmodel` | `deepseek_v4_debugmodel` |
-| `graph_trainer_deepseek_v4_flash` | `deepseek_v4_flash` |
-| `graph_trainer_deepseek_v4_flash_43layers_16experts` | `deepseek_v4_flash_43layers_16experts` |
-| `graph_trainer_deepseek_v4_pro` | `deepseek_v4_pro` |
-| `graph_trainer_deepseek_v4_pro_61layers_32experts` | `deepseek_v4_pro_61layers_32experts` |
-
-编译配置统一为 `mode="aot_fx_trace"`、`memory_policy="full"`、`disable_passes=["cudagraph_pass"]`。模型通过 `_graph_trainer_model_registry` 包装为 `GraphTrainerDeepSeekV4Model.Config`，并行化函数指向 `parallelize_graph_trainer_deepseek_v4`。
+图训练 recipe 复用对应的 Flash 配置，经 `to_graph_trainer_config` 转换后返回 `GraphTrainerEx.Config`，模型配置使用 `GraphTrainerDeepSeekV4Model.Config`。三个示例均选择 `mutation-functionalization+npu_auto_overlap`。A5 八卡示例默认使用 `dsv4-mhc-moe-save` 选重策略，其余两个使用 `full`。
 
 ### 模型变体
 
@@ -38,12 +45,11 @@ GraphTrainer 是 torchtitan 上游 `experiments/graph_trainer/` 中的编译式�
 
 `parallelize_graph_trainer_deepseek_v4`（`parallelize.py`）是 DSV4 专属路径——eager 路径复用 DeepSeek-V3 并行化（DSV4 稀疏注意力分片基于它），而编译路径不能把稀疏注意力计算在 FSDP 下重排，故单独实现：
 
-1. 对 MoE 的 dispatch / combine / compute 区域与各子模块 FQN 附加图节点标注（`annotate_moe_ep_regions` + `annotate_module_fqns`），供 bucketing、区域编译等下游 pass 消费。
-2. 使用 `spmd_types` 后端或启用 TP / EP 时调用 `model.parallelize(parallel_dims)`；`spmd_types` 即使在 singleton 模型并行轴下也需要类型标注。
-3. 无条件应用 `apply_simple_fsdp`：fsdp mesh 在 degree 1 时也存在（`ParallelDims._mesh_exist`），因此单卡下 MixedPrecisionPolicy 的 param_dtype cast 仍然生效。
-4. 按模式应用 `apply_graph_trainer_compile`。
+1. 为 MoE dispatch、combine、compute 和模块 FQN 添加图节点标注。
+2. 在 SPMD 上下文中调用 `model._parallelize`，再应用 SimpleFSDP。
+3. 配置启用 EP overlap 时，在 FX 捕获前包装 MoE forward，详见 [EP overlap 适配](graph_trainer_ep_overlap.md)。
 
-支持 `partial_dtensor` 和 `spmd_types` 后端。`spmd_types` 复用上游 DTensor-backed SimpleFSDP 存储，在模型前向和反向计算侧使用本地 tensor 与 SPMD 类型。入口要求每个 DP rank 的 microbatch token 数能被 `parallel_dims.seq_len_divisor` 整除。
+SimpleFSDP 使用 DTensor 存储参数，模型计算侧使用本地 tensor 与 SPMD 类型。启用 sequence parallel 时，每个 DP rank 的 microbatch token 数须能被 TP degree 整除。
 
 ### Graph-safe 改造
 
@@ -53,22 +59,14 @@ GraphTrainer 的 trace 约束与 eager 有本质差异：`minimal_fx_tracer` 在
 
 `patches/torch_npu/inductor_runtime_estimation.py`（新增，包导入时按需生效）：NPU 上以常量 1200 GB/s 代替 Triton CUDA-driver 探测 DRAM 带宽——该值只进入 graph 调度 roofline 估计，不改变生成算子；同时默认开启 `standalone_compile(donate_graph_module=True)`，避免图模块深拷贝开销。仅在 `torch.npu.is_available()` 时应用。
 
-## 激活方式
-
-TorchTitan 0.4.0 适配当前只验收 DeepSeek 文本 eager，GraphTrainer 尚未完成迁移和回归。本页说明保留的实现结构，不作为当前版本可运行的图训练指南。
-
-旧图训练 launcher 位于 `examples/deepseek_v4/` 及其 `debug/` 子目录，模块选择指向 `torchtitan_npu_recipes.graph_trainer.deepseek_v4`。其中的通用字段 CLI 参数仍需迁移为 Python 配置；迁移完成前不要据此启动 0.4.0 图训练。完整训练策略应定义新 recipe，由 shell launcher 选择，组合方式见 [recipe 指南](../../torchtitan_npu_recipes/README.md)。
-
-下表描述保留实现的设计范围；历史验证不代表当前依赖组合已通过验收。
-
 ## 支持范围与限制
 
 | 能力 | 状态 |
 | --- | --- |
-| 编译模式 | `aot_fx_trace`；NPU 上禁用 `cudagraph_pass` |
-| 并行组合 | FSDP（含 degree 1）、EP 已验证；TP 要求 `seq_len` 整除 `seq_len_divisor` |
+| 图捕获 | SPMD 联合 FX 图 |
+| 并行组合 | 使用 SimpleFSDP 和 EP，TP 受 microbatch token 对齐约束 |
 | Context Parallel | 不支持（DSV4 稀疏注意力编译路径未适配 CP） |
-| EP overlap（上游实验性 pass） | 已通过patch适配；见 [`graph_trainer_ep_overlap.md`](graph_trainer_ep_overlap.md) |
+| EP overlap | 在 MoE forward 中切分序列，见 [EP overlap 适配](graph_trainer_ep_overlap.md) |
 
 ## 相关文档
 

@@ -5,7 +5,7 @@
 
 """SMLA inner-attention adapters for TorchTitan's unmodified V4 attention."""
 
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 from typing import Literal
 
 import spmd_types as spmd
@@ -49,6 +49,19 @@ class NativeAscV4Metadata(AscV4Metadata):
     @property
     def max_k(self):
         return self.native.max_k
+
+    def with_fixed_native_offsets(self, num_tokens: int) -> "NativeAscV4Metadata":
+        # Every nonempty segment is aligned to ratio. Reserve empty trailing
+        # segments so retracing the compressor cannot specialize their count.
+        cu = self.native.cu_seq_q
+        with spmd.local():
+            capacity = num_tokens // self.ratio + 1
+            pad = capacity - cu.numel()
+            torch._check(pad >= 0, lambda: f"Document offsets exceed capacity {capacity} for ratio {self.ratio}")
+            padded = F.pad(cu, (0, pad), value=num_tokens)
+            if spmd.is_type_checking():
+                spmd.assert_type(padded, spmd.get_local_type(cu), spmd.get_partition_spec(cu))
+        return replace(self, native=self.native._replace(cu_seq_q=padded, cu_seq_k=padded))
 
     @staticmethod
     def prepare_cp_metadata(attention_metadata, *, permutation):

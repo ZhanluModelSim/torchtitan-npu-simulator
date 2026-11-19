@@ -43,9 +43,10 @@ if TYPE_CHECKING:
 
 _SWAP_OPTIMIZER = "torchtitan_npu.override.common.optimizer.swap_optimizer"
 _ROPE_REFERENCE = "torchtitan_npu.override.common.rope.workaround"
+_COMPRESSOR_ASC = "torchtitan_npu.override.deepseek_v4.compressor.asc"
 _A5_OVERRIDES = [
     "torchtitan_npu.override.deepseek_v4.common.rope",
-    "torchtitan_npu.override.deepseek_v4.compressor.asc",
+    _COMPRESSOR_ASC,
     "torchtitan_npu.override.common.swiglu_group.asc",
     "torchtitan_npu.override.common.swiglu_group.asc_shared_experts",
 ]
@@ -237,7 +238,7 @@ def _a5_quantization(config: TrainerEx.Config, *, full_model: bool = False) -> N
     quantization.li_quantization = "fp8"
     quantization.kv_norm_quantization = KVNormQuantizationConfig(
         format="mxfp8",
-        fqns=[".attention.kv_norm", ".attention.compressor.norm"],
+        fqns=[".attention.kv_norm", ".attention.compressor.norm", ".attention.compressor_128.norm"],
         block_size=64,
     )
     config.activation_remat = DefaultActivationRematConfig()
@@ -451,19 +452,11 @@ def deepseek_v4_flash_lora_4k_a3() -> TrainerEx.Config:
 
 
 def _graph_example(*, a5: bool, full_model: bool = False) -> TrainerEx.Config:
-    """Keep the graph recipe's policy while retaining the existing NPU guard."""
+    """Build the NPU GraphTrainer recipe from the corresponding Flash recipe."""
     from torchtitan.config import derive
     from torchtitan.experiments.graph_trainer.configs import EpOverlapConfig, GraphTrainerCompileConfig
 
-    try:
-        from torchtitan_npu.extensions.torchtitan.experiments.graph_trainer import GraphTrainerEx
-    except TypeError as error:
-        if "multiple bases have instance lay-out conflict" not in str(error):
-            raise
-        raise NotImplementedError(
-            "NPU GraphTrainer remains deferred: its existing slotted configuration "
-            "bases have incompatible instance layouts in TorchTitan 0.4.0."
-        ) from error
+    from torchtitan_npu.extensions.torchtitan.experiments.graph_trainer import GraphTrainerEx
     from torchtitan_npu.models.deepseek_v4.graph_trainer import to_graph_trainer_config
     from torchtitan_npu.models.deepseek_v4.model import GraphTrainerDeepSeekV4Model
     from torchtitan_npu.patches.torchtitan.experiments.graph_trainer import (
@@ -479,16 +472,23 @@ def _graph_example(*, a5: bool, full_model: bool = False) -> TrainerEx.Config:
         disable_passes=["cudagraph_pass"],
         ep_overlap=EpOverlapConfig(enabled=True, chunk_dim="seq", module_fqn="layers.*.feed_forward"),
     )
+    # TorchTitan v0.4.0 rejects SPMD gradient accumulation with EP overlap or
+    # custom pass pipelines. Use one microbatch per training step.
+    graph.training.num_tokens_per_train_step = -1
+    graph.training.steps = int(os.environ.get("STEPS") or ("20" if a5 else "100"))
     if a5:
-        graph.training.steps = int(os.environ.get("STEPS") or "20")
-        if full_model:
-            graph.training.num_tokens_per_train_step = 2097152
-        else:
+        # Fused pooling dispatch reads packed document lengths in Python.
+        graph.override.imports = [
+            (_COMPRESSOR_ASC, {"fused_pooling": False}) if entry == _COMPRESSOR_ASC else entry
+            for entry in graph.override.imports
+        ]
+        # Native attention uses an integrated selector. The quantized LI
+        # converter targets the standalone LightningIndexer on the legacy backend.
+        base.extension.quantization.li_quantization = None
+        if not full_model:
             # The NPU memory-policy registry owns this deferred custom policy.
             graph.compile.memory_policy = "dsv4-mhc-moe-save"  # pyrefly: ignore [bad-assignment]
-    # The existing NPU graph schema owns extension/quantization and its build
-    # implementation. Its current compilation guard must not be bypassed.
-    return derive(graph, GraphTrainerEx.Config, extension=base.extension)
+    return derive(graph, GraphTrainerEx.Config, extension=base.extension, sdc=base.sdc, anticipatory=base.anticipatory)
 
 
 def deepseek_v4_flash_8p_cpt_4k_a3_graphtrainer() -> TrainerEx.Config:

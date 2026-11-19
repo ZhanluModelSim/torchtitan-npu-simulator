@@ -163,7 +163,17 @@ def test_grouped_mm_spec_uses_assumed_tokens_for_dynamic_routing_dimension():
     assert forward.counts == wgrad.counts == (3, 3, 3, 3)
 
 
-def test_grouped_mm_is_selected_for_benchmark_and_uses_distribution_cache_key():
+@pytest.fixture
+def grouped_mm_cache(monkeypatch):
+    from torch._inductor.fx_passes import overlap_scheduling
+
+    cache = {}
+    monkeypatch.setattr(overlap_scheduling, "get_cached_node_time", cache.get)
+    monkeypatch.setattr(overlap_scheduling, "set_cached_node_time", cache.__setitem__)
+    return cache
+
+
+def test_grouped_mm_is_selected_for_benchmark_and_uses_distribution_cache_key(grouped_mm_cache):
     graph = torch.fx.Graph()
     lhs = graph.placeholder("lhs")
     rhs = graph.placeholder("rhs")
@@ -185,8 +195,10 @@ def test_grouped_mm_is_selected_for_benchmark_and_uses_distribution_cache_key():
     assert "tokens=7" in key
     assert "experts=4" in key
     assert "distribution=(2, 2, 2, 1)" in key
+    assert grouped_mm_cache[key] == elapsed_ms
 
 
+@pytest.mark.usefixtures("grouped_mm_cache")
 def test_empty_grouped_mm_returns_zero_without_backend_launch():
     graph = torch.fx.Graph()
     lhs = graph.placeholder("lhs")
@@ -208,6 +220,7 @@ def test_empty_grouped_mm_returns_zero_without_backend_launch():
     assert result is not None and result[0] == 0.0
 
 
+@pytest.mark.usefixtures("grouped_mm_cache")
 def test_grouped_mm_benchmark_accepts_offsets_keyword_argument():
     graph = torch.fx.Graph()
     lhs = graph.placeholder("lhs")

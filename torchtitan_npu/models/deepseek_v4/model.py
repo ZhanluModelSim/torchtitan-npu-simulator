@@ -152,6 +152,28 @@ class GraphTrainerDeepSeekV4Model(DeepSeekV4Model):
     class Config(DeepSeekV4Model.Config):
         pass
 
+    def _get_attention_metadata(
+        self,
+        positions: torch.Tensor,
+        *,
+        padding_mask: torch.Tensor | None = None,
+        max_num_documents: int | None = None,
+        max_context_length: int | None = None,
+    ):
+        from torchtitan_npu.override.deepseek_v4.sparse_attn.native import NativeAscV4Metadata
+
+        metadata = super()._get_attention_metadata(
+            positions,
+            padding_mask=padding_mask,
+            max_num_documents=max_num_documents,
+            max_context_length=max_context_length,
+        )
+        if max_num_documents is None:
+            for backend, value in metadata.items():
+                if isinstance(value, NativeAscV4Metadata) and value.ratio > 1:
+                    metadata[backend] = value.with_fixed_native_offsets(positions.numel())
+        return metadata
+
     def init_states(
         self,
         *,

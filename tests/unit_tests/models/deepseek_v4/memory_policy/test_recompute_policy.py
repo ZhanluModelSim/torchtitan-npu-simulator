@@ -14,7 +14,7 @@ from torchtitan.experiments.graph_trainer.selective_activation_remat import (
     selective_activation_remat_pass,
 )
 
-import torchtitan_npu_recipes.models.deepseek_v4 as _dsv4_config_registry  # noqa: F401
+import torchtitan_npu.models.deepseek_v4.memory_policy  # noqa: F401
 
 
 def _node(
@@ -73,7 +73,7 @@ def _build_graph() -> tuple[fx.GraphModule, dict[str, fx.Node]]:
                 f"moe{layer_id}",
                 torch.ops.aten.add.Tensor,
                 (wo_b, wo_b),
-                f"layers.{layer_id}.moe",
+                f"layers.{layer_id}.feed_forward",
             )
             output = _node(
                 graph,

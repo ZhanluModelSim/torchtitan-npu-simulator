@@ -34,6 +34,7 @@ from torchtitan_npu.extensions.adaptor.torchao.converter import (
 )
 from torchtitan_npu.models.deepseek_v4 import model_registry
 from torchtitan_npu.models.deepseek_v4_1 import model_registry as v41_model_registry
+from torchtitan_npu_recipes.examples.deepseek_v4 import deepseek_v4_flash_cpt_4k_a5_graphtrainer
 
 
 def _quantization_config(**overrides) -> QuantizationExtensionConfig:
@@ -65,9 +66,42 @@ def test_default_whitelist_keeps_prequantize_on_all_dense_projections(family):
 
     flags = _collect_flags(converted)
     assert flags, "debugmodel must expose quantized Linear nodes"
-    shared_gate_up = {fqn for fqn, _, _, _ in spec.traverse(Linear.Config) if fqn.endswith(".moe.shared_experts.w13")}
+    shared_gate_up_suffix = ".feed_forward.shared_experts.w13"
+    shared_gate_up = {fqn for fqn, _, _, _ in spec.traverse(Linear.Config) if fqn.endswith(shared_gate_up_suffix)}
     assert shared_gate_up and shared_gate_up <= flags.keys()
     assert all(flags.values()), f"default whitelist must enable every dense weight: {flags}"
+
+
+def test_full_a5_graphtrainer_quantizes_shared_and_routed_experts():
+    from torchtitan_npu.override.common.rms_norm import AscRMSNorm
+    from torchtitan_npu.override.deepseek_v4.compressor import asc
+
+    config = deepseek_v4_flash_cpt_4k_a5_graphtrainer()
+    converted = apply_quantization_converter(
+        config.model,
+        config.extension.quantization,
+        model_compile_enabled=False,
+        override_config=config.override,
+    )
+    for suffix, config_type, prequantize in (
+        (".feed_forward.shared_experts.w13", Linear.Config, False),
+        (".feed_forward.shared_experts.w2", Linear.Config, False),
+        (".feed_forward.routed_experts.w13", GroupedLinear.Config, True),
+        (".feed_forward.routed_experts.w2", GroupedLinear.Config, True),
+    ):
+        projections = [node for fqn, node, _, _ in converted.traverse(config_type) if fqn.endswith(suffix)]
+        assert projections, suffix
+        assert all(node._torchao_npu_config.weight_config.fsdp_prequantize is prequantize for node in projections)
+    assert converted.layers[0].attention.kv_norm.nope_head_dim == 448
+    hca_norms = [layer.attention.compressor_128.norm for layer in converted.layers if layer.attention.compressor_128]
+    assert hca_norms
+    assert all(norm.nope_head_dim == 448 for norm in hca_norms)
+    for field in ("compressor", "compressor_128"):
+        compressor = next(cfg for layer in converted.layers if (cfg := getattr(layer.attention, field)) is not None)
+        fused_norm = asc(compressor).norm
+        assert isinstance(fused_norm.norm, AscRMSNorm.Config)
+        assert fused_norm.norm.normalized_shape == compressor.head_dim
+        assert fused_norm._fake_quant_config is compressor.norm._fake_quant_config
 
 
 def test_user_whitelist_disables_non_whitelisted_weights():

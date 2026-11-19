@@ -2,33 +2,33 @@
 
 NPU Auto Overlap 用于 TorchTitan GraphTrainer 的双 chunk MoE 通信掩盖自动调度。它在 NPU 上测量计算和通信耗时，再以依赖安全、跨 rank 一致为约束重排图，使双 chunk 的计算和通信互相掩盖。
 
-该特性复用原生 EP overlap 的切图、process-group 隔离、结构校验和符号 shape 处理，将 `ep_overlap_schedule_pass` 的固定调度替换为基于实测 cost 的自动调度。使用时需要：
+该特性复用原生 EP overlap 的 eager chunking、process-group 隔离和结构校验，将 `ep_overlap_schedule_pass` 的固定调度替换为基于实测 cost 的自动调度。使用条件如下。
 
 1. 设置 `TORCHINDUCTOR_USE_TORCH_PROFILER_BENCHMARKER=1`；
 2. 设置 `TORCHINDUCTOR_USE_EXPERIMENTAL_BENCHMARKER=0`；
 3. 开启 EP overlap，并选择对应的 Auto Overlap pipeline。
 
-完整配置参考 [`deepseek_v4_flash_8p_cpt_4k_a3_graphtrainer.sh`](../../examples/deepseek_v4/debug/deepseek_v4_flash_8p_cpt_4k_a3_graphtrainer.sh)：该脚本同时设置 EP overlap、两个 Inductor benchmark 环境变量和 NPU auto overlap pipeline。
+[`deepseek_v4_flash_8p_cpt_4k_a3_graphtrainer.sh`](../../examples/deepseek_v4/debug/deepseek_v4_flash_8p_cpt_4k_a3_graphtrainer.sh) 设置两个 Inductor benchmark 环境变量，并加载启用 EP overlap 和 NPU Auto Overlap pipeline 的 Python recipe。
 
 ## 1. 整体流程
 
 ### 1.1 与原生 EP overlap 的关系
 
-原生 EP overlap 将目标 MoE 区域切成两个 chunk，并以固定规则重排节点。NPU Auto Overlap 保留切图结果，等动态 shape 具体化后再根据 NPU 实测 cost 调度：
+TorchTitan v0.4.0 在 FX 捕获之前包装 MoE forward，将输入分成两个 chunk。捕获联合图后，`populate_eager_chunk_metadata_pass` 读取切分标注并生成调度所需的 chunk metadata。
 
 ```text
 原生 EP overlap
-  chunk metadata -> EP chunk -> 固定调度 -> shape 具体化 -> 后续编译
+  eager chunking -> FX 捕获 -> chunk metadata -> 固定调度 -> 后续编译
 
 NPU Auto Overlap
-  chunk metadata -> EP chunk -> EP 结构校验 -> shape 具体化 -> 自动调度 -> 后续编译
+  eager chunking -> FX 捕获 -> chunk metadata -> EP 结构校验 -> 自动调度 -> 后续编译
 ```
 
 启用时，pipeline 组合逻辑执行以下操作：
 
 1. 从完整的原生 GraphTrainer pipeline 开始。
 2. 将原生 EP 调度 pass 替换为结构校验的 `ep_overlap_validate_pass`，不应用原生固定调度。
-3. 在 EP chunk shape 具体化之后插入 NPU Auto Overlap pass。
+3. 在结构校验后运行 `npu_moe_auto_overlap_pass`。这两个 pass 占用原固定调度的位置，均在 chunk metadata 生成之后。
 4. 保持其他 pass 的内容和相对顺序不变。
 
 如果必要的 EP pass 缺失、目标 pass 重复，或者当前正在加载预编译产物，则不改写 pipeline。
@@ -229,11 +229,13 @@ count0 -> count1 -> D2H0/D2H1/D2H2 async -> D2H3 sync -> dispatch0/1
 
 ## 5. 调试与实现索引
 
-设置 `--compile.debug-graph-passes` 后，除原生 graph pass 调试信息外，auto overlap 还会：
+在 Python recipe 返回的 NPU GraphTrainer 配置上设置 `config.npu_auto_overlap_debug = True` 可开启以下诊断。该字段默认关闭。
 
 - 保留内部 CANN profiling 目录，位于 `$TMPDIR` 或系统临时目录；
-- 保存自动调度前后的可读 FX 图，位于 `./fx_graphs/` 目录；
+- 在 `./fx_graphs/` 下为每个 rank 保存 `auto_overlap_before_rank<N>.py` 和 `auto_overlap_after_rank<N>.py`；
 - 日志打印单算子本地/对齐 cost、整图应用 cost 和逐步调度决策。
+
+需要查看整个 pass pipeline 时，可用 `TORCH_TRACE` 采集并使用 `tlparse` 查看上游记录的各 pass 前后 FX 图。
 
 相关代码：
 

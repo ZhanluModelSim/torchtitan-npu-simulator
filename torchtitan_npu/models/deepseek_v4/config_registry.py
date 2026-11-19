@@ -62,7 +62,8 @@ from .mtp import MTPChunkedLossWrapper
 def _dsv4_muon_profile(model: DeepSeekV4Model.Config) -> MuonOptimizerProfile:
     """Build the DSV4-owned parameter and FlexShard policy for Muon."""
     model_config = model
-    dense_dp_axes = (MeshAxisName.DP_SHARD.value,)
+    # GraphTrainer SimpleFSDP flattens the dense DP mesh to "fsdp".
+    dense_dp_axes = (MeshAxisName.DP_SHARD.value, "fsdp")
     owned = make_owned_layout(dense_dp_axes)
     attention_shardings = {"wq_a": owned, "wkv": owned, "wo_b": owned}
     attention_per_head_projections = ("wq_b", "wo_a")

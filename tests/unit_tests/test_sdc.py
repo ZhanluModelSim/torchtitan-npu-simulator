@@ -407,6 +407,7 @@ def _patch_trainer_sdc_flow(monkeypatch) -> tuple[list[object], TrainerEx.Config
     config = cast(
         "TrainerEx.Config",
         SimpleNamespace(
+            compile=None,
             sdc=SimpleNamespace(build=build_sdc),
             anticipatory=SimpleNamespace(enable=False),
             extension=SimpleNamespace(quantization=SimpleNamespace(enable_quantized_training=False)),

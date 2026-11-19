@@ -11,6 +11,7 @@ import functools
 import logging
 from typing import TYPE_CHECKING
 
+from torchtitan.experiments.graph_trainer.configs import MOE_BLOCK_FQN
 from torchtitan.experiments.graph_trainer.registry import (
     PASS_PIPELINE_REGISTRY,
     register_pass_pipeline,
@@ -36,7 +37,7 @@ _AUTO_OVERLAP_PIPELINES = {
     MUTATION_FUNCTIONALIZATION_PIPELINE: (MUTATION_FUNCTIONALIZATION_AUTO_OVERLAP_PIPELINE),
 }
 _EP_OVERLAP_SCHEDULE_PASS = "ep_overlap_schedule_pass"
-_CONCRETIZE_EP_SHAPES_PASS = "concretize_ep_chunk_symbolic_shapes_pass"
+_EAGER_CHUNK_METADATA_PASS = "populate_eager_chunk_metadata_pass"
 _WHOLE_GRAPH_CALIBRATION_ROUNDS = 2
 
 
@@ -54,18 +55,16 @@ def npu_moe_auto_overlap_pass(
     _example_inputs,
     *,
     config,
-    traced_result=None,
-    runtime_context=None,
+    run_graph=None,
 ):
     """Benchmark and schedule the configured NPU MoE regions."""
-    debug = bool(config.compile.debug_graph_passes)
+    debug = getattr(config, "npu_auto_overlap_debug", False)
     if debug:
         dump_fx_graph(gm, prefix="auto_overlap_before")
     from torchtitan_npu.extensions.torchtitan.experiments.graph_trainer.npu_moe_auto_scheduler import (
         NpuMoeAutoOverlapScheduler,
     )
     from torchtitan_npu.extensions.torchtitan.experiments.graph_trainer.whole_graph_benchmark import (
-        make_calibration_runner,
         profile_whole_graph_costs,
     )
 
@@ -73,7 +72,7 @@ def npu_moe_auto_overlap_pass(
     module_pattern = getattr(
         ep_overlap_config,
         "module_fqn",
-        "layers.*.moe",
+        MOE_BLOCK_FQN,
     )
     assign_stable_node_tags(gm)
     original_order = canonical_order(gm)
@@ -85,17 +84,13 @@ def npu_moe_auto_overlap_pass(
         debug=debug,
     )
     scheduled = scheduler.run()
-    if runtime_context is None:
+    if run_graph is None:
         logger.warning(
             "Skipped NPU auto-overlap whole-graph calibration because "
-            "apply_graph_passes did not provide a runtime context; keeping "
+            "the joint graph builder did not provide a candidate runner; keeping "
             "the first benchmark-driven schedule"
         )
     else:
-        run_candidate = make_calibration_runner(
-            traced_result,
-            runtime_context,
-        )
         for calibration_round in range(1, _WHOLE_GRAPH_CALIBRATION_ROUNDS + 1):
             # Profile and reschedule the graph produced by the previous round.
             # Stable IDs and canonical heuristic order stay fixed.
@@ -108,7 +103,7 @@ def npu_moe_auto_overlap_pass(
             )
             profile_costs = profile_whole_graph_costs(
                 scheduled,
-                run_candidate,
+                run_graph,
                 profile_node_ids=frozenset(fallback_costs),
                 calibration_round=calibration_round,
                 debug=debug,
@@ -188,8 +183,7 @@ def _configure_npu_auto_overlap_passes(
     passes: list[Callable],
     config,
     *,
-    traced_result=None,
-    runtime_context=None,
+    run_graph=None,
 ) -> list[Callable]:
     """Insert the only supported NPU MoE scheduler pass into ``passes``."""
     precompile_artifact_dir = getattr(
@@ -205,28 +199,27 @@ def _configure_npu_auto_overlap_passes(
         return passes
 
     schedule_passes = [pass_fn for pass_fn in passes if _pass_name(pass_fn) == _EP_OVERLAP_SCHEDULE_PASS]
-    concretize_passes = [pass_fn for pass_fn in passes if _pass_name(pass_fn) == _CONCRETIZE_EP_SHAPES_PASS]
-    if len(schedule_passes) != 1 or len(concretize_passes) != 1:
+    metadata_passes = [pass_fn for pass_fn in passes if _pass_name(pass_fn) == _EAGER_CHUNK_METADATA_PASS]
+    if len(schedule_passes) != 1 or len(metadata_passes) != 1:
         logger.warning(
             "Skipped NPU auto-overlap because its required pass pipeline "
             "is unavailable: %s=%d, %s=%d; keeping the "
             "original graph-pass pipeline",
             _EP_OVERLAP_SCHEDULE_PASS,
             len(schedule_passes),
-            _CONCRETIZE_EP_SHAPES_PASS,
-            len(concretize_passes),
+            _EAGER_CHUNK_METADATA_PASS,
+            len(metadata_passes),
         )
         return passes
 
     schedule_index = passes.index(schedule_passes[0])
-    concretize_index = passes.index(concretize_passes[0])
-    if schedule_index >= concretize_index:
+    if passes.index(metadata_passes[0]) >= schedule_index:
         logger.warning(
             "Skipped NPU auto-overlap because the original pass order is "
             "unsupported: %s must precede %s; keeping the original "
             "graph-pass pipeline",
+            _EAGER_CHUNK_METADATA_PASS,
             _EP_OVERLAP_SCHEDULE_PASS,
-            _CONCRETIZE_EP_SHAPES_PASS,
         )
         return passes
 
@@ -236,21 +229,7 @@ def _configure_npu_auto_overlap_passes(
 
     inductor_benchmarking.apply()
 
-    pass_kwargs = {
-        "config": config,
-        "traced_result": traced_result,
-    }
-    if runtime_context is not None:
-        pass_kwargs["runtime_context"] = runtime_context
-    configured_pass = functools.partial(npu_moe_auto_overlap_pass, **pass_kwargs)
-    if runtime_context is None:
-        # Compatibility with TorchTitan revisions that do not pass runtime
-        # context to pipeline construction. The local patch binds it later.
-        configured_pass._requires_runtime_context = True  # pyrefly: ignore [missing-attribute]
-
-    # Retain the native EP structural checks at the original scheduling
-    # position. Runtime benchmarking requires concrete tensor dimensions, so
-    # defer the NPU scheduler until after concretization.
+    # Eager chunking already provides the region metadata at this position.
     from torchtitan.experiments.graph_trainer.ep_overlap_pass import (
         ep_overlap_validate_pass,
     )
@@ -269,10 +248,9 @@ def _configure_npu_auto_overlap_passes(
         )
     else:
         validation_pass = ep_overlap_validate_pass
-    configured = [validation_pass if pass_fn is schedule_pass else pass_fn for pass_fn in passes]
-    concretize_index = configured.index(concretize_passes[0])
-    configured.insert(concretize_index + 1, configured_pass)
-    return configured
+    schedule = functools.partial(npu_moe_auto_overlap_pass, config=config, run_graph=run_graph)
+    next_pass_index = schedule_index + 1
+    return [*passes[:schedule_index], validation_pass, schedule, *passes[next_pass_index:]]
 
 
 def enable_npu_auto_overlap(config):
@@ -294,7 +272,7 @@ def _construct_npu_auto_overlap_pipeline(
     config,
     *,
     parallelism_context=None,
-    runtime_context=None,
+    run_graph=None,
 ) -> list[Callable]:
     """Build ``base_pipeline`` with EP validation and NPU scheduling."""
     if base_pipeline == "default":
@@ -313,12 +291,7 @@ def _construct_npu_auto_overlap_pipeline(
         config,
         parallelism_context=parallelism_context,
     )
-    return _configure_npu_auto_overlap_passes(
-        passes,
-        config,
-        traced_result=traced_result,
-        runtime_context=runtime_context,
-    )
+    return _configure_npu_auto_overlap_passes(passes, config, run_graph=run_graph)
 
 
 @register_pass_pipeline(AUTO_OVERLAP_PIPELINE)
@@ -327,7 +300,7 @@ def construct_npu_auto_overlap_passes(
     config,
     *,
     parallelism_context=None,
-    runtime_context=None,
+    run_graph=None,
 ) -> list[Callable]:
     """Build the default pipeline with the NPU MoE scheduler as its EP pass."""
     return _construct_npu_auto_overlap_pipeline(
@@ -335,7 +308,7 @@ def construct_npu_auto_overlap_passes(
         traced_result,
         config,
         parallelism_context=parallelism_context,
-        runtime_context=runtime_context,
+        run_graph=run_graph,
     )
 
 
@@ -350,7 +323,7 @@ def construct_mutation_functionalization_npu_auto_overlap_passes(
     config,
     *,
     parallelism_context=None,
-    runtime_context=None,
+    run_graph=None,
 ) -> list[Callable]:
     """Compose the local mutation-functionalization pipeline with the NPU scheduler."""
     return _construct_npu_auto_overlap_pipeline(
@@ -358,5 +331,5 @@ def construct_mutation_functionalization_npu_auto_overlap_passes(
         traced_result,
         config,
         parallelism_context=parallelism_context,
-        runtime_context=runtime_context,
+        run_graph=run_graph,
     )

@@ -10,7 +10,7 @@ import logging
 from copy import copy
 from dataclasses import dataclass, field
 
-from typing import Annotated, cast
+from typing import Annotated, ClassVar, cast
 
 import tyro
 from torchtitan.components.checkpointer.base import BaseCheckpointManager
@@ -76,6 +76,7 @@ class TrainerEx(Trainer):
 
     @dataclass(kw_only=True, slots=True)
     class Config(Trainer.Config):
+        _supports_graph_compile: ClassVar[bool] = False
         extension: ExtensionConfig = field(default_factory=ExtensionConfig)
         # These mutable schemas intentionally specialize upstream fields. The
         # registered converter preserves concrete recipe owners, while defaults
@@ -94,10 +95,13 @@ class TrainerEx(Trainer):
         sdc: SDC.Config = field(default_factory=SDC.Config)
         anticipatory: AnticipatoryRoutingConfig = field(default_factory=AnticipatoryRoutingConfig)
 
-        def __post_init__(self) -> None:
+        def _validate_upstream_config(self) -> None:
             # ``slots=True`` dataclasses are recreated by the decorator, so a
             # zero-argument ``super()`` can retain the pre-decoration class cell.
             Trainer.Config.__post_init__(self)
+
+        def __post_init__(self) -> None:
+            self._validate_upstream_config()
             if type(self.checkpointer).__module__ == "torchtitan.components.checkpointer.torch_checkpointing":
                 from torchtitan.components.checkpointer import torch_checkpointing as native
 
@@ -105,7 +109,7 @@ class TrainerEx(Trainer):
 
                 if type(self.checkpointer) is native.TorchCheckpointingManager.Config:
                     self.checkpointer = derive(self.checkpointer, npu_native.TorchCheckpointingManager.Config)
-            if self.compile is not None:
+            if self.compile is not None and not self._supports_graph_compile:
                 raise NotImplementedError("NPU model compilation is not supported in the eager upgrade")
             # Single switch: ``--training.enable-cpu-offload`` drives both the
             # FSDP offload policy (read by parallelize) and, through this
@@ -175,7 +179,7 @@ class TrainerEx(Trainer):
                         )
 
     def __init__(self, config: Config):
-        if getattr(config, "compile", None) is not None:
+        if config.compile is not None and not config._supports_graph_compile:
             raise NotImplementedError("NPU model compilation is not supported in the eager upgrade")
         if getattr(getattr(config, "optim", None), "ema", None) is not None:
             raise NotImplementedError("NPU EMA is not supported in the eager upgrade")
@@ -187,9 +191,8 @@ class TrainerEx(Trainer):
                 "Applying TorchAO-NPU quantization recipe=%s before Trainer initialization",
                 quantization_config.recipe,
             )
-            model_compile_enabled = config.compile is not None and (
-                getattr(config.compile, "model", None) is not None or hasattr(config.compile, "pass_pipeline")
-            )
+            # GraphTrainer's pass pipeline compiles the training step, not individual model regions.
+            model_compile_enabled = getattr(config.compile, "model", None) is not None
             config.model = apply_quantization_converter(
                 config.model,
                 quantization_config,

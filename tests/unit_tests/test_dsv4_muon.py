@@ -73,6 +73,7 @@ def test_dsv4_unified_muon_policy_follows_paper_parameter_split():
     assert all(isinstance(p, Shard) and p.dim == 0 for p in expert_layout.shardings_by_mesh_axis.values())
     assert set(expert_layout.shardings_by_mesh_axis) == {
         MeshAxisName.DP_SHARD.value,
+        "fsdp",
         MeshAxisName.EDP_SHARD.value,
         MeshAxisName.EP.value,
     }
