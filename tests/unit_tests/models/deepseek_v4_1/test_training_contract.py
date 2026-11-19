@@ -56,10 +56,10 @@ def test_full_ac_preserves_image_routing(monkeypatch, with_engram):
         model = build_cpu_model(config)
     with torch.no_grad():
         for layer in model.layers.values():
-            layer.moe.router.gate.weight.zero_()
-            bias = torch.arange(layer.moe.router.num_experts, dtype=torch.float32)
-            layer.moe.expert_bias_E.copy_(bias)
-            layer.moe.router.bias_vl.copy_(bias.flip(0))
+            layer.feed_forward.router.gate.weight.zero_()
+            bias = torch.arange(layer.feed_forward.router.num_experts, dtype=torch.float32)
+            layer.feed_forward.expert_bias_E.copy_(bias)
+            layer.feed_forward.router.bias_vl.copy_(bias.flip(0))
     checkpointed = copy.deepcopy(model)
     FullActivationRematConfig.Config().build().apply(checkpointed)
 
@@ -102,7 +102,7 @@ def test_full_ac_preserves_image_routing(monkeypatch, with_engram):
         for layer in checkpointed.layers.values():
             if layer.engram is not None:
                 engram_handles.append(layer.engram.register_forward_hook(capture_engram, with_kwargs=True))
-    handle = checkpointed.layers["0"].moe.router.register_forward_hook(capture_route, with_kwargs=True)
+    handle = checkpointed.layers["0"].feed_forward.router.register_forward_hook(capture_route, with_kwargs=True)
     try:
         _, _, kwargs = preprocess(model, tokens, tokens, inputs["positions"], **modality)
         expected = model(tokens, **kwargs)

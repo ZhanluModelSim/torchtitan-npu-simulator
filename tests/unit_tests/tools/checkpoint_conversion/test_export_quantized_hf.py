@@ -591,7 +591,7 @@ def _dsv4_like_config():
     layers = [
         _NS(
             attention=attn(ratio),
-            moe=moe(i),
+            feed_forward=moe(i),
             hc_attn_pre=_NS(hc_mult=4, sinkhorn_iters=20, eps=1e-6),
         )
         for i, ratio in enumerate([1, 1, 4, 128])
@@ -661,7 +661,7 @@ def test_model_derived_config_fields_skips_unbacked_structures(export):
     }
 
     moe = _NS(num_experts=4, shared_experts=None)
-    cfg = _NS(vocab_size=32, dim=8, layers=[_NS(attention=_NS(n_heads=2, head_dim=4), moe=moe)])
+    cfg = _NS(vocab_size=32, dim=8, layers=[_NS(attention=_NS(n_heads=2, head_dim=4), feed_forward=moe)])
     fields = export._model_derived_config_fields(cfg)
     assert fields["n_routed_experts"] == 4
     assert fields["n_shared_experts"] == 0
@@ -699,6 +699,30 @@ def test_apply_model_derived_config_rewrites_and_preserves(export, tmp_path):
     assert config["rope_scaling"] == {"type": "yarn"}
     # alt-spelling fields the asset omits (official release layout) stay absent
     assert not {"layer_types", "mlp_layer_types", "rope_parameters"} & set(config)
+
+
+def test_apply_model_derived_config_writes_real_scoring_func_as_hf_name(export, tmp_path):
+    """0.4.0 routers carry an activation config; config.json must get HF's string."""
+    sqrt_softplus = pytest.importorskip("torchtitan.models.common").SqrtSoftplus
+
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "config.json").write_text(json.dumps({"scoring_func": "sigmoid"}))
+    config = _dsv4_like_config()
+    config.layers[0].feed_forward.router.score_func = sqrt_softplus.Config()
+
+    export._apply_model_derived_config(out, config)
+
+    assert json.loads((out / "config.json").read_text())["scoring_func"] == "sqrtsoftplus"
+
+
+def test_model_derived_config_fields_rejects_unknown_scoring_func(export):
+    pytest.importorskip("torchtitan.models.common")
+    config = _dsv4_like_config()
+    config.layers[0].feed_forward.router.score_func = object()
+
+    with pytest.raises(ValueError, match="scoring_func"):
+        export._model_derived_config_fields(config)
 
 
 def test_apply_model_derived_config_syncs_carried_alt_spellings(export, tmp_path):

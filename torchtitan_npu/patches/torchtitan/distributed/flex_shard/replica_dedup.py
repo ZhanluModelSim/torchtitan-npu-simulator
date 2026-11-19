@@ -167,8 +167,8 @@ def _configure_replica_dedup(muon: Any) -> None:
 
     _validate_canonical_layouts_across_replicas(all_layouts, owner_by_fqn)
 
-    total_expert_tensors = sum(".moe.routed_experts." in layout.fqn for layout in all_layouts)
-    local_expert_tensors = sum(".moe.routed_experts." in layout.fqn for layout in local_owned_layouts)
+    total_expert_tensors = sum(".routed_experts." in layout.fqn for layout in all_layouts)
+    local_expert_tensors = sum(".routed_experts." in layout.fqn for layout in local_owned_layouts)
     logger.info(
         "HSDP DistMuon replica dedup: rank=%d owns %d/%d tensors (%d/%d routed-expert tensors)",
         dist.get_rank(),

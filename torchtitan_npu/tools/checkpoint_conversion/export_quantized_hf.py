@@ -367,9 +367,36 @@ def _find_rope_configs(layers):
     return main_rope, compress_rope
 
 
+def _layer_moe(layer):
+    """Return the layer's MoE sub-config, or None for a dense feed-forward layer.
+
+    TorchTitan 0.4.0 keeps the dense FFN and the MoE under ``feed_forward`` and
+    no longer declares a ``moe`` field, so ``num_experts`` (present only on the
+    MoE sub-config) is the discriminator.
+    """
+    feed_forward = getattr(layer, "feed_forward", None)
+    return feed_forward if getattr(feed_forward, "num_experts", None) is not None else None
+
+
 def _is_hash_moe(layer) -> bool:
-    router = getattr(layer.moe, "router", None)
+    router = getattr(_layer_moe(layer), "router", None)
     return getattr(router, "layer_id", 0) < getattr(router, "n_hash_layers", 0)
+
+
+def _hf_scoring_func(score_func) -> str:
+    """Map the router's activation config to HF's ``scoring_func`` string."""
+    if isinstance(score_func, str):  # 0.3.0 stored the name itself
+        return score_func
+    from torchtitan.models.common import Sigmoid, Softmax, SqrtSoftplus
+
+    for config_type, name in (
+        (Sigmoid.Config, "sigmoid"),
+        (Softmax.Config, "softmax"),
+        (SqrtSoftplus.Config, "sqrtsoftplus"),
+    ):
+        if isinstance(score_func, config_type):
+            return name
+    raise ValueError(f"config.json has no scoring_func name for {type(score_func).__qualname__}")
 
 
 def _model_derived_config_fields(model_config) -> dict:
@@ -410,7 +437,7 @@ def _model_derived_config_fields(model_config) -> dict:
     if ratios := fields.get("compress_ratios"):
         with contextlib.suppress(KeyError):
             fields["layer_types"] = [_LAYER_TYPE_FOR_RATIO[ratio] for ratio in ratios]
-    if layers and all(getattr(layer, "moe", None) is not None for layer in layers):
+    if layers and all(_layer_moe(layer) is not None for layer in layers):
         fields["mlp_layer_types"] = ["hash_moe" if _is_hash_moe(layer) else "moe" for layer in layers]
 
     attn = layers[0].attention if layers else None
@@ -440,7 +467,7 @@ def _model_derived_config_fields(model_config) -> dict:
         put("index_n_heads", lambda: indexer.num_index_heads)
         put("index_head_dim", lambda: indexer.index_head_dim)
 
-    moe = next((layer.moe for layer in layers if getattr(layer, "moe", None) is not None), None)
+    moe = next((found for layer in layers if (found := _layer_moe(layer)) is not None), None)
     if moe is not None:
         put("n_routed_experts", lambda: moe.num_experts)
         put("num_experts_per_tok", lambda: moe.router.top_k)
@@ -448,7 +475,7 @@ def _model_derived_config_fields(model_config) -> dict:
         put("moe_intermediate_size", lambda: moe.routed_experts.w13.out_features)
         put("swiglu_limit", lambda: getattr(moe.routed_experts.activation_fn, "swiglu_limit", 0.0))
         put("n_shared_experts", lambda: 1 if moe.shared_experts is not None else 0)
-        put("scoring_func", lambda: moe.router.score_func)
+        put("scoring_func", lambda: _hf_scoring_func(moe.router.score_func))
         put("routed_scaling_factor", lambda: moe.router.route_scale)
         put("norm_topk_prob", lambda: moe.router.route_norm)
 

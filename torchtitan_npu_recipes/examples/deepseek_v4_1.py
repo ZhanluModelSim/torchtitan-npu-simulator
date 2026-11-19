@@ -18,6 +18,7 @@ from torchtitan.components.optim import LRSchedulersContainer
 from torchtitan.config import derive
 from torchtitan.config.override import OverrideImport
 from torchtitan.config.parallelism import ParallelismConfig
+from torchtitan.distributed.activation_remat import FullActivationRematConfig
 
 from torchtitan_npu.config import CompileConfig, ModelCompileConfig, OptimizerConfig
 from torchtitan_npu.config.configs import ProfilerExtensionConfig
@@ -28,6 +29,16 @@ from torchtitan_npu.models.common.alignment import AlignedTextProcessor
 from torchtitan_npu.models.deepseek_v4_1 import EngramArgs, _flash_engram_geometry
 from torchtitan_npu.models.deepseek_v4_1.model import DeepSeekV41Model
 from torchtitan_npu_recipes.models import deepseek_v4_1 as models
+
+_A5_DEBUG_PREQUANTIZE_FQNS = [
+    ".attention.wq_b",
+    ".attention.wo_a",
+    ".attention.wkv",
+    ".attention.wo_b",
+    ".attention.indexer.wq_b",
+    ".feed_forward.shared_experts.w2",
+]
+_A5_MULTINODE_PREQUANTIZE_FQNS = [".attention.wq_b", ".attention.wo_a"]
 
 
 def _reject_legacy_overrides() -> None:
@@ -108,6 +119,16 @@ def _set_schedule(config: TrainerEx.Config) -> None:
         decay_ratio=1.0,
         decay_type="cosine",
         min_lr_factor=0.01,
+    )
+
+
+def _a5_quantization(config: TrainerEx.Config, *, full_model: bool) -> None:
+    quantization = config.extension.quantization
+    quantization.enable_quantized_training = True
+    quantization.recipe = "all_block_fp8"
+    quantization.enable_fsdp_prequantize = True
+    quantization.fsdp_prequantize_fqns = list(
+        _A5_MULTINODE_PREQUANTIZE_FQNS if full_model else _A5_DEBUG_PREQUANTIZE_FQNS
     )
 
 
@@ -214,12 +235,13 @@ def _debug(*, a5: bool, sft: bool = False, qat: bool = False) -> TrainerEx.Confi
     )
     config.comm.init_timeout_seconds, config.comm.train_timeout_seconds = 7200, 600
     config.override.imports = _overrides(a5=a5, debug=True, qat=qat)
-    config.extension.quantization.enable_quantized_training = a5
-    config.extension.quantization.recipe = "all_block_fp8"
+    if a5:
+        _a5_quantization(config, full_model=False)
     if qat:
         config.extension.quantization.enable_mxfp4_qat = True
         config.extension.quantization.li_quantization = "mxfp4"
         config.extension.quantization.enable_sparse_attention_quantization = True
+    config.activation_remat = FullActivationRematConfig()
     return config
 
 
@@ -262,8 +284,9 @@ def _full(*, a5: bool, sft: bool = False, lora: bool = False) -> TrainerEx.Confi
     config.checkpointer.initial_load_in_hf = True
     config.checkpointer.load_only = not lora
     config.override.imports = _overrides(a5=a5, debug=False, swap=not lora)
-    config.extension.quantization.enable_quantized_training = a5
-    config.extension.quantization.recipe = "all_block_fp8"
+    # The multi-node entry runs DP_SHARD=128, so only wq_b/wo_a stay aligned.
+    if a5:
+        _a5_quantization(config, full_model=True)
     return config
 
 

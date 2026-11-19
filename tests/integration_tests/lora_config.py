@@ -74,7 +74,7 @@ class LoRATrainer(TrainerEx):
         before = _cpu_tensor(adapter)
         adapter_a = model.layers["0"].attention.wq_a.lora_a.weight
         before_a = _cpu_tensor(adapter_a)
-        expert_b = model.layers["0"].moe.routed_experts.w13.lora_b.weight
+        expert_b = model.layers["0"].feed_forward.routed_experts.w13.lora_b.weight
         before_expert_b = _cpu_tensor(expert_b.full_tensor() if isinstance(expert_b, DTensor) else expert_b)
         if self.config.optim.optimizer.name == "Muon":
             muon_parameters = {
