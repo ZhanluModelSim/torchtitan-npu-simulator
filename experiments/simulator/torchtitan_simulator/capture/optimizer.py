@@ -134,6 +134,27 @@ def optimizer_state_values(optimizer_step: Callable):
     return [owner.state for owner in owners]
 
 
+def split_optimizer_state_residency(states: list) -> tuple[list, list]:
+    """Split per-parameter optimizer state maps into device and host parts.
+
+    Host-resident parameters carry the same ``_engram_host_offload`` flag the
+    gradient manifest and the memory estimator honor; their state (SparseAdam
+    moments of host-offload tables) belongs to the host budget, never to the
+    counted device inventory.
+    """
+    device_states: list[dict] = []
+    host_states: list[dict] = []
+    for state in states:
+        device_map: dict = {}
+        host_map: dict = {}
+        for parameter, parameter_state in state.items():
+            target = host_map if getattr(parameter, "_engram_host_offload", False) else device_map
+            target[parameter] = parameter_state
+        device_states.append(device_map)
+        host_states.append(host_map)
+    return device_states, host_states
+
+
 def optimizer_workspace_values(optimizer_step: Callable) -> list[torch.Tensor]:
     """Read native Muon runtime allocations, which are not checkpoint state."""
     from torchtitan.distributed.flex_shard.dist_muon import DistMuon

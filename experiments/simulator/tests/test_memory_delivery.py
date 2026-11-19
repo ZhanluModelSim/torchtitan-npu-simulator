@@ -48,7 +48,9 @@ def test_native_cli_exports_only_memory_and_preserves_raw_graph(exported_capture
         "steady_state_backward_active_bytes_peak",
         "steady_state_optimizer_active_bytes_peak",
         "persistent_param_bytes",
+        "host_param_bytes",
         "optimizer_state_bytes",
+        "host_optimizer_state_bytes",
         "activation_offload_by_layer",
     }
     with (directory / "memory/memory_timeline.csv").open() as stream:

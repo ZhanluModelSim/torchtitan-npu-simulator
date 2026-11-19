@@ -29,9 +29,31 @@ from torchtitan_simulator.warmup import warmup_training_iteration
 
 def _gradient_manifest(model):
     manifest = {}
+    exemptions = []
     missing = []
+    host_tables = {
+        id(module.weight): module
+        for module in model.modules()
+        if getattr(module, "uses_host_offload", False) and getattr(module, "weight", None) is not None
+    }
     for name, parameter in logical_named_parameters(model):
         if not parameter.requires_grad:
+            continue
+        if getattr(parameter, "_engram_host_offload", False):
+            # Host-offload sparse table: gradients reach SparseAdam through
+            # the pending sparse-grad path, never as a dense parameter grad.
+            # The exemption is only valid with captured sparse work behind
+            # it (PR #19 review): every table must hold a pending sparse
+            # gradient once its backward has run.
+            table = host_tables.get(id(parameter))
+            if table is None:
+                raise RuntimeError(f"Host-offload parameter {name} has no owning Engram table module")
+            if table.pending_sparse_grad() is None:
+                raise RuntimeError(
+                    f"Host-offload table {name} produced no pending sparse gradient; the dense "
+                    "gradient-contract exemption requires captured sparse work"
+                )
+            exemptions.append(name)
             continue
         gradient = parameter.grad
         if gradient is None:
@@ -68,7 +90,7 @@ def _gradient_manifest(model):
         }
     if missing:
         raise RuntimeError(f"Expected parameter gradients are missing: {missing}")
-    return manifest
+    return manifest, exemptions
 
 
 def _buffer_signature(model):
@@ -78,6 +100,51 @@ def _buffer_signature(model):
         storage = tensor.untyped_storage()
         signature[name] = (tuple(tensor.shape), tensor.dtype, tensor.device, int(storage._cdata), storage.nbytes())
     return signature
+
+
+def _sparse_optimizer_validation(optimizers, model):
+    """Evidence that every exempted host table executed its sparse update.
+
+    The dense gradient contract exempts the host-offload tables only because
+    their work lives in the pending-sparse-grad / SparseAdam path; after the
+    captured optimizer step each table must have consumed its pending
+    gradient and hold actual SparseAdam state (PR #19 review). Names come
+    from the same logical enumeration as the gradient manifest, so the
+    evidence set reconciles with the exemptions under any wrapper tree
+    (activation checkpointing included).
+    """
+    owners = getattr(optimizers, "optimizers", None) or (optimizers,)
+    state_keys_by_param: dict[int, list[str]] = {}
+    for owner in owners:
+        state = getattr(owner, "state", None)
+        if not state:
+            continue
+        for parameter, parameter_state in state.items():
+            state_keys_by_param[id(parameter)] = sorted(parameter_state)
+    host_tables = {
+        id(module.weight): module
+        for module in model.modules()
+        if getattr(module, "uses_host_offload", False) and getattr(module, "weight", None) is not None
+    }
+    validation = {}
+    for name, parameter in logical_named_parameters(model):
+        if not getattr(parameter, "_engram_host_offload", False):
+            continue
+        table = host_tables.get(id(parameter))
+        record = {
+            "state_keys": state_keys_by_param.get(id(parameter), []),
+            "pending_consumed": table.pending_sparse_grad() is None if table is not None else False,
+        }
+        if not record["state_keys"]:
+            raise RuntimeError(
+                f"Host-offload table {name} reached no SparseAdam state; the sparse update did not execute"
+            )
+        if not record["pending_consumed"]:
+            raise RuntimeError(
+                f"Host-offload table {name} did not consume its pending sparse gradient in the optimizer step"
+            )
+        validation[name] = record
+    return validation
 
 
 def simulate(simulation):
@@ -113,11 +180,12 @@ def _simulate(simulation, timings: HostTimings):
             "but the model defines A_log/dt_bias in float32. Use mixed_precision_param=bfloat16 for BF16 compute, "
             "or memory_parameter_storage_dtype for a storage-only estimate. Build-only can inspect bfloat16."
         )
-    if prepared.trainer.model_spec.name == "qwen3" and prepared.trainer.training.dtype != "float32":
+    if prepared.trainer.model_spec.name in {"qwen3", "qwen3_5"} and prepared.trainer.training.dtype != "float32":
         raise ValueError(
-            "Qwen3 capture requires training.dtype=float32: the fused AdamW gradient manifest and the static "
-            "memory accounting are validated for FP32 original parameters only. Use mixed_precision_param=bfloat16 "
-            "for BF16 compute, or memory_parameter_storage_dtype for a storage-only estimate."
+            "Qwen3/Qwen3.5 capture requires training.dtype=float32: the fused AdamW gradient manifest and the "
+            "static memory accounting are validated for FP32 original parameters only (capability matrix). "
+            "Use mixed_precision_param=bfloat16 for BF16 compute, or memory_parameter_storage_dtype "
+            "for a storage-only estimate."
         )
     simulation = prepared.simulation
     config = prepared.trainer
@@ -162,6 +230,9 @@ def _simulate(simulation, timings: HostTimings):
                     "mesh_dim_names": tuple(mesh.mesh_dim_names) if mesh is not None else (),
                     "mesh_shape": tuple(mesh.shape) if mesh is not None else (),
                     "placements": str(getattr(parameter, "placements", ())),
+                    # Host-resident parameters (Engram CPU tables) report their
+                    # own budget; device-byte reconciliation excludes them.
+                    "residency": "host" if getattr(parameter, "_engram_host_offload", False) else "device",
                 }
             from torchtitan_simulator.compat.muon import validate_muon_layouts
 
@@ -231,6 +302,7 @@ def _simulate(simulation, timings: HostTimings):
             inputs = {"tokens": tokens.to("meta"), **to_meta_metadata(kwargs)}
             labels = labels.to("meta")
             gradient_manifest = {}
+            dense_gradient_exemptions = set()
             from torchtitan.distributed.utils import clip_grad_norm_, get_spmd_context
 
             train_context = get_spmd_context(parallel_dims=dims, spmd_typechecking=config.debug.spmd_typechecking)
@@ -244,10 +316,27 @@ def _simulate(simulation, timings: HostTimings):
                         loss, _ = loss_fn(predictions, labels, global_valid_tokens, positions=input_dict["positions"])
                     with timings.measure(f"{execution}.backward"), compute_block("B"):
                         loss.backward()
-                gradient_manifest.update(_gradient_manifest(model))
+                manifest, exemptions = _gradient_manifest(model)
+                gradient_manifest.update(manifest)
+                dense_gradient_exemptions.update(exemptions)
                 return loss
 
             def clip_gradients():
+                # Route through the native mixed container exactly like the
+                # production trainer, so host sparse gradients join the
+                # global clip norm instead of bypassing it (PR #19 review).
+                from torchtitan_npu.extensions.torchtitan.components.optimizer.optimizer import (
+                    HostSparseOptimizersContainer,
+                )
+
+                if isinstance(optimizers, HostSparseOptimizersContainer):
+                    return optimizers.clip_grad_norm(
+                        model.parameters(),
+                        config.training.max_norm,
+                        foreach=False,
+                        pp_mesh=None,
+                        ep_enabled=dims.ep_enabled,
+                    )
                 return clip_grad_norm_(
                     model.parameters(),
                     config.training.max_norm,
@@ -303,6 +392,11 @@ def _simulate(simulation, timings: HostTimings):
                 )
             for name, wall_seconds in workload.iteration.schedule.annotations["capture_timings"].items():
                 timings.add(f"capture_step.{name}", wall_seconds)
+            # The captured sparse work is part of the F/B/O contract: record
+            # the host tables' SparseAdam evidence for downstream validation.
+            workload.iteration.schedule.annotations["sparse_optimizer_validation"] = _sparse_optimizer_validation(
+                optimizers, model
+            )
             if _buffer_signature(model) != buffers_before:
                 raise RuntimeError(
                     "Registered buffers changed storage/layout during capture; explicit residency modeling required"
@@ -364,7 +458,13 @@ def _simulate(simulation, timings: HostTimings):
                 "overrides": asdict(simulation.model_overrides) if simulation.model_overrides is not None else None,
                 "dim": config.model_spec.model.dim,
                 "vocab_size": config.model_spec.model.vocab_size,
-                "num_layers": config.model_spec.model.n_layers,
+                # DSV4 stores n_layers directly; Kimi exposes it as a property
+                # over its layer list; Qwen3.5 carries a layers mapping only.
+                "num_layers": (
+                    len(config.model_spec.model.layers)
+                    if getattr(config.model_spec.model, "layers", None) is not None
+                    else config.model_spec.model.n_layers
+                ),
                 "num_mtp_layers": len(getattr(config.model_spec.model, "mtp_layers", ())),
             }
             annotations["quantization_configuration"] = {
@@ -374,6 +474,7 @@ def _simulate(simulation, timings: HostTimings):
                 "quantized_parameters": quantized_parameters,
             }
             annotations["gradient_validation"] = gradient_manifest
+            annotations["dense_gradient_exemptions"] = sorted(dense_gradient_exemptions)
             annotations["runtime_capabilities"] = dict(runtime.capabilities)
             annotations["simulation_assumptions"] = prepared.adaptations
             annotations["input_source"] = "synthetic single-document positions and valid next-token labels"

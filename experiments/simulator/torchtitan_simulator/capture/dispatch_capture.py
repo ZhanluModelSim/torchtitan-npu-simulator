@@ -15,6 +15,7 @@ from __future__ import annotations
 import itertools
 import weakref
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -46,6 +47,63 @@ _id_counter = itertools.count(1)
 _seq_counter = itertools.count()
 _memory_event_counter = itertools.count()
 
+_host_only_work: ContextVar[bool] = ContextVar("torchtitan_simulator_host_only_work", default=False)
+
+
+@contextmanager
+def host_only_work():
+    """Execute host-side bookkeeping without recording device-graph facts.
+
+    Production runs host-offload bookkeeping (sparse gradient accumulation,
+    host clipping rescale, SparseAdam state materialization) on CPU tensors
+    outside the device graph; the meta twins keep the same split by
+    suppressing L0 and memory recording in here. Outside an active capture
+    the flag is inert -- the ops simply dispatch normally.
+    """
+    token = _host_only_work.set(True)
+    try:
+        yield
+    finally:
+        _host_only_work.reset(token)
+
+
+@contextmanager
+def annotate_active_capture_events(provenance: str) -> Iterator[None]:
+    """Annotate dispatch events of the active capture, if any.
+
+    Compat seams that run inside the runner's framework scopes (gradient
+    clipping, the optimizer step) use this to label work whose provenance
+    the runner cannot name, e.g. the host-sparse dense correction rescale.
+    Outside an active capture the context is inert.
+    """
+    capture = _active_capture
+    if capture is None:
+        yield
+        return
+    with capture.annotate_dispatch_events(provenance):
+        yield
+
+
+def record_host_boundary(sources, derived: torch.Tensor) -> None:
+    """Register explicit cross-boundary data dependencies.
+
+    Host-only bookkeeping (see :func:`host_only_work`) is suppressed from the
+    graph, so the tensors it produces -- sparse index/value rows, host norm
+    squares -- would otherwise reach their device consumers producer-less.
+    This records the device-side tensors the host value was derived from
+    (the backward gradient rows, the clip coefficient) so predecessors
+    resolve across the boundary and the O-phase update stays connected to
+    the backward that fed it (PR #19 review). No-op outside an active
+    capture.
+    """
+    capture = _active_capture
+    if capture is None:
+        return
+    derived_id = capture.tensor_id(derived)
+    parents = capture._boundary_parents.setdefault(derived_id, set())
+    for source in sources:
+        if source is not None:
+            parents.add(capture.tensor_id(source))
 
 def _next_op_id() -> int:
     return next(_id_counter)
@@ -60,6 +118,10 @@ def _flatten_tensors(value: Any, *, localize_dtensor: bool = True) -> list[torch
     edge construction and producing incomplete IR dependencies. DTensors are
     localized by default because dependency and memory tracking are per-rank;
     callers may retain them to read logical global metadata instead.
+    Sparse-layout tensors are skipped: their storage identity is not
+    accessible (SparseTensorImpl), and in production they carry host-side
+    facts that never belong to the per-device graph. Only their dense
+    index/value operands participate in tracking.
     """
     tensors: list[torch.Tensor] = []
 
@@ -72,7 +134,8 @@ def _flatten_tensors(value: Any, *, localize_dtensor: bool = True) -> list[torch
         else:
             tensors.append(value)
     elif isinstance(value, torch.Tensor):
-        tensors.append(value)
+        if value.layout is torch.strided:
+            tensors.append(value)
     elif isinstance(value, dict):
         for item in value.values():
             tensors.extend(_flatten_tensors(item, localize_dtensor=localize_dtensor))
@@ -212,6 +275,7 @@ class OpDispatchCapture(TorchDispatchMode):
         self._capture_l0: bool = True  # pass-through when False (duplicate class)
         self._compute_instances: dict[tuple[int, int, str], dict[str, Any]] = {}
         self._dispatch_annotation_scopes: list[str] = []
+        self._boundary_parents: dict[int, set[int]] = {}
         self._pending_comm_links: dict[str, CommEvent] = {}  # output storage → first consumer
         # All compute classes on a stage share one representative microbatch.
         # Other microbatches remain pass-through schedule instances.
@@ -269,6 +333,7 @@ class OpDispatchCapture(TorchDispatchMode):
         self._value_aliases.clear()
         self._saved_tensor_unpack_aliases.clear()
         self._pending_comm_links.clear()
+        self._boundary_parents.clear()
 
     @contextmanager
     def suspend_recording(self) -> Iterator[None]:
@@ -298,6 +363,10 @@ class OpDispatchCapture(TorchDispatchMode):
 
     def __torch_dispatch__(self, func, types, args: tuple[Any, ...] = (), kwargs=None):
         kwargs = kwargs or {}
+        if _host_only_work.get():
+            # Host-side bookkeeping executes structurally but never enters
+            # the captured device graph (see host_only_work).
+            return func(*args, **kwargs)
         if self.record_memory and self._capture_l0:
             self._storage_lifetimes.poll()
         if self._capture_l0 and func is torch.ops.aten.detach.default:
@@ -316,6 +385,9 @@ class OpDispatchCapture(TorchDispatchMode):
                 self.saved_tensor_unpack_detach_count += 1
                 return result
         mutated_inputs = _schema_mutated_tensors(func, args, kwargs) if self._capture_l0 else []
+        # Sparse-layout operands cannot enter mutation/storage tracking for
+        # the same reason as _flatten_tensors skips them.
+        mutated_inputs = [tensor for tensor in mutated_inputs if tensor.layout is torch.strided]
         result = func(*args, **kwargs)
         from torchtitan_simulator.capture.native_transport import (
             record_native_transport,
@@ -930,6 +1002,14 @@ class OpDispatchCapture(TorchDispatchMode):
             return {self._producer[tensor_id]}
         if tensor_id in self._value_aliases:
             return self._predecessors_for_tensor_id(self._value_aliases[tensor_id])
+        if tensor_id in self._boundary_parents:
+            # Cross-boundary parents are recorded as source tensor ids; the
+            # producing op is resolved at query time.
+            return {
+                producer
+                for source_id in self._boundary_parents[tensor_id]
+                if (producer := self._producer.get(source_id)) is not None
+            }
         return set()
 
     def __enter__(self) -> OpDispatchCapture:

@@ -46,6 +46,9 @@ class SimulationConfig:
     memory_parameter_storage_dtype: str = ""
     memory_offload_ac_saved_tensors: bool = False
     memory_offload_optimizer_states: bool = False
+    # Opt-in virtual SLA2 branch fusions for multi_head_moe capture. Default
+    # off: the model runs the reference's own eager operators.
+    enable_sla2_fusion: bool = False
     local_batch_size: int | None = None
     global_batch_size: int | None = None
     enable_quantized_training: bool = False
@@ -59,6 +62,8 @@ class SimulationConfig:
             raise ValueError("muon_ns_steps must be a positive integer")
         if type(self.memory_offload_optimizer_states) is not bool:
             raise ValueError("memory_offload_optimizer_states must be boolean")
+        if type(self.enable_sla2_fusion) is not bool:
+            raise ValueError("enable_sla2_fusion must be boolean")
         preset, separator, precision = self.config.rpartition("_baseline_")
         if (
             separator
@@ -161,6 +166,30 @@ _DSV4_OVERRIDES = [
     "torchtitan_npu.override.deepseek_v4.mhc.asc_hc_post",
 ]
 
+_QWEN3_5_OVERRIDES = [
+    *_COMMON_OVERRIDES,
+    "torchtitan_npu.override.qwen3_5.gated_delta.npu",
+]
+
+# SLA2 uses the fused interleave RoPE like the DSV4 families; the rms_norm and
+# ASC MoE dispatcher entries reuse the shared common overrides. The SLA2 branch
+# fusions are installed by runtime.configure_model, not through override.imports.
+_MULTI_HEAD_MOE_OVERRIDES = [
+    *_COMMON_OVERRIDES,
+    "torchtitan_npu.override.common.rope.asc_complex",
+]
+
+# The production A3 text recipe (examples/deepseek_v4_1) enables rms_norm, the
+# ASC MoE dispatcher and the V4.1 MHC post-processing override; the CLI rope
+# default (asc_complex) applies after the ops list and wins over
+# rope.asc_half_rotation, so the capture uses what production actually runs.
+# The optimizer swap wrapper is trainer-level and stays out.
+_DSV4_1_OVERRIDES = [
+    *_COMMON_OVERRIDES,
+    "torchtitan_npu.override.common.rope.asc_complex",
+    "torchtitan_npu.override.deepseek_v4_1.mhc.asc_hc_post",
+]
+
 
 def _optimizer_selection(simulation: SimulationConfig, trainer: Any) -> str:
     optimizer = trainer.optimizer
@@ -211,6 +240,10 @@ PRESET_FACTORIES = {
     "deepseek_v4_pro_20t": "torchtitan_simulator.presets.deepseek_v4_pro_20t",
     "qwen3_32b_smoketest": "torchtitan_npu.models.qwen3.config_registry.qwen3_32b_smoketest",
     "qwen3_32b": "torchtitan_npu.models.qwen3.config_registry.qwen3_32b",
+    "qwen3_5_debugmodel": "torchtitan_simulator.presets.qwen3_5_debugmodel",
+    "qwen3_5_debugmodel_moe": "torchtitan_simulator.presets.qwen3_5_debugmodel_moe",
+    "deepseek_v4_1_debugmodel_text": "torchtitan_simulator.presets.deepseek_v4_1_debugmodel_text",
+    "multi_head_moe_debugmodel": "torchtitan_simulator.presets.multi_head_moe_debugmodel",
 }
 
 
@@ -243,8 +276,19 @@ def prepare_config(simulation: SimulationConfig) -> PreparedConfig:
     model = trainer.model_spec.model
     if trainer.model_spec.name == "kimi_k3_1" and simulation.enable_quantized_training:
         raise ValueError("Kimi K3.1 capture currently supports unquantized training only")
-    if trainer.model_spec.name not in {"deepseek_v4", "kimi_k3", "kimi_k3_1", "qwen3"}:
-        raise ValueError("Supported model families are deepseek_v4, kimi_k3, kimi_k3_1, and qwen3")
+    if trainer.model_spec.name not in {
+        "deepseek_v4",
+        "deepseek_v4_1",
+        "kimi_k3",
+        "kimi_k3_1",
+        "qwen3",
+        "qwen3_5",
+        "multi_head_moe",
+    }:
+        raise ValueError(
+            "Supported model families are deepseek_v4, deepseek_v4_1, kimi_k3, "
+            "kimi_k3_1, qwen3, qwen3_5 and multi_head_moe"
+        )
     adaptations = []
     if simulation.model_overrides is not None:
         adaptations.append("typed geometry overrides rebuilt the complete native model configuration tree")
@@ -286,9 +330,12 @@ def prepare_config(simulation: SimulationConfig) -> PreparedConfig:
         (
             {
                 "deepseek_v4": _DSV4_OVERRIDES,
+                "deepseek_v4_1": _DSV4_1_OVERRIDES,
                 "kimi_k3": _COMMON_OVERRIDES,
                 "kimi_k3_1": _COMMON_OVERRIDES,
                 "qwen3": _QWEN3_OVERRIDES,
+                "qwen3_5": _QWEN3_5_OVERRIDES,
+                "multi_head_moe": _MULTI_HEAD_MOE_OVERRIDES,
             }[trainer.model_spec.name]
         )
         if simulation.override_imports is None
