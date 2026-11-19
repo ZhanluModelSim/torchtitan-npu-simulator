@@ -517,6 +517,7 @@ system3_configs = {
     "debugmodel_text": lambda: _make_model_config(multimodal=False, g=_Geometry()),
     "debugmodel_multimodal": lambda: _make_model_config(multimodal=True, g=_Geometry()),
     "full_text": lambda: _make_model_config(multimodal=False, g=_FULL_GEOMETRY),
+    "full_multimodal": lambda: _make_model_config(multimodal=True, g=_FULL_GEOMETRY),
     "unit_text": lambda: _make_model_config(multimodal=False, g=_UNIT_GEOMETRY),
 }
 
@@ -574,7 +575,7 @@ def _system3_trainer_config(
     # The multimodal AR sequence is the modality segments + the text span, so
     # its length is not a multiple of the chunked-loss chunk grid; run the
     # loss as a single chunk there (equivalent math, no divisibility bound).
-    num_chunks = 1 if flavor == "debugmodel_multimodal" else 8
+    num_chunks = 1 if flavor.endswith("multimodal") else 8
     return Trainer.Config(
         loss=ChunkedLossWrapper.Config(
             num_chunks=num_chunks,
@@ -619,6 +620,12 @@ def system3_debugmodel_multimodal(*, num_mtp_layers: int = 0) -> Trainer.Config:
 def system3_full_text(*, num_mtp_layers: int = 0, seq_len: int = 2048, steps: int = 10) -> Trainer.Config:
     """Single-card full-size text flavor for duration-grade comparisons."""
     return _system3_trainer_config("full_text", num_mtp_layers=num_mtp_layers, seq_len=seq_len, steps=steps)
+
+
+def system3_full_multimodal(*, num_mtp_layers: int = 0, seq_len: int = 2048, steps: int = 10) -> Trainer.Config:
+    """Full-size multimodal flavor: the published-preview geometry with the
+    four modality encoders and interleaved AR sequence assembly."""
+    return _system3_trainer_config("full_multimodal", num_mtp_layers=num_mtp_layers, seq_len=seq_len, steps=steps)
 
 
 def system3_unit_text(*, num_mtp_layers: int = 0, seq_len: int = 2048, steps: int = 10) -> Trainer.Config:

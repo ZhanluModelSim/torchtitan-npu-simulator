@@ -243,6 +243,7 @@ PRESET_FACTORIES = {
     "system3_debugmodel_text": "torchtitan_npu.models.system3.config_registry.system3_debugmodel_text",
     "system3_debugmodel_multimodal": "torchtitan_npu.models.system3.config_registry.system3_debugmodel_multimodal",
     "system3_full_text": "torchtitan_npu.models.system3.config_registry.system3_full_text",
+    "system3_full_multimodal": "torchtitan_npu.models.system3.config_registry.system3_full_multimodal",
     "system3_unit_text": "torchtitan_npu.models.system3.config_registry.system3_unit_text",
 }
 
