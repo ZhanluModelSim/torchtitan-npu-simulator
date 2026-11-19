@@ -214,7 +214,23 @@ def validate_workload(workload: WorkloadGraph) -> dict:
         "optimizer update set differs from gradient set",
     )
     declared = [name for group in annotations["optimizer_parameter_groups"] for name in group["parameter_names"]]
-    _require(len(declared) == len(set(declared)) and set(declared) == set(gradients), "optimizer ownership differs")
+    # Host sparse tables (SparseAdam groups) are declared optimizer owners but
+    # live outside the dense gradient contract: their gradients reach the
+    # optimizer through the pending sparse-grad path and the gradient manifest
+    # exempts them (runner ``_gradient_manifest``). They must stay disjoint
+    # from the dense gradient set, which the dense groups must still match
+    # exactly.
+    sparse_declared = {
+        name
+        for group in annotations["optimizer_parameter_groups"]
+        if group["algorithm"] == "SparseAdam"
+        for name in group["parameter_names"]
+    }
+    _require(
+        len(declared) == len(set(declared)) and not sparse_declared.intersection(gradients),
+        "optimizer ownership differs",
+    )
+    _require(set(declared) - sparse_declared == set(gradients), "optimizer ownership differs")
     algorithms = {
         name: group["algorithm"]
         for group in annotations["optimizer_parameter_groups"]
@@ -256,6 +272,7 @@ def validate_workload(workload: WorkloadGraph) -> dict:
             if memory.parameter_storage_dtype
             else item["storage_bytes"]
             for item in annotations["parameter_layouts"].values()
+            if item.get("device", memory.counted_device_type) == memory.counted_device_type
         ),
         "local persistent parameter byte mismatch",
     )

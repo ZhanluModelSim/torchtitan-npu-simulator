@@ -57,14 +57,17 @@ def test_system3_residual_unknowns_are_control_or_view_nodes(_annotated_nodes) -
     nodes = _annotated_nodes
     unknown_raw = Counter(n.annotations.get("raw_op_type", "?") for n in nodes if "cost_unknown" in n.annotations)
     # Profiler markers and stream waits are capture/control noise; the rest
-    # are view/metadata rewrites with no arithmetic. All of them stay unknown
-    # on the same convention as the qwen3.5 workspace; everything else (the
+    # are view/metadata rewrites with no arithmetic. The Engram host-table
+    # scratch (``aten.empty.memory_format``) is an allocation with no
+    # arithmetic and joins the same convention. All of them stay unknown on
+    # the same convention as the qwen3.5 workspace; everything else (the
     # eager system3 math) is annotated.
     assert set(unknown_raw) == {
         # view / metadata rewrites (no arithmetic)
         "aten._unsafe_view.default",
         "aten.alias.default",
         "aten.detach.default",
+        "aten.empty.memory_format",
         "aten.expand.default",
         "aten.new_empty_strided.default",
         "aten.permute.default",
@@ -107,3 +110,16 @@ def test_system3_fallback_families_cover_the_eager_math(_annotated_nodes) -> Non
         assert all("cost_unknown" not in n.annotations for n in members), f"{raw} not annotated"
     fused = ("aten.constant_pad_nd.default", "aten.masked_fill_.Scalar")
     assert not [n for n in nodes if n.annotations.get("raw_op_type") in fused]
+    # The Engram rows H2D transfers are visible device traffic and carry a
+    # byte-based cost through the ToCopy family (not an unknown).
+    table_transfers = [
+        n
+        for n in nodes
+        if n.annotations.get("raw_op_type") == "aten._to_copy.default"
+        and n.annotations.get("module_path", "").endswith("engram.hash_tables.0")
+    ]
+    assert len(table_transfers) == 6
+    for node in table_transfers:
+        assert "cost_unknown" not in node.annotations
+        assert node.annotations.get("memory_traffic_bytes", 0) > 0
+        assert node.annotations.get("duration_us", 0) > 0

@@ -162,6 +162,7 @@ def _simulate(simulation, timings: HostTimings):
                     "original_shape": original_shapes[name],
                     "local_shape": tuple(local.shape),
                     "dtype": str(parameter.dtype),
+                    "device": local.device.type,
                     "storage_bytes": local.numel() * local.element_size(),
                     "mesh_dim_names": tuple(mesh.mesh_dim_names) if mesh is not None else (),
                     "mesh_shape": tuple(mesh.shape) if mesh is not None else (),

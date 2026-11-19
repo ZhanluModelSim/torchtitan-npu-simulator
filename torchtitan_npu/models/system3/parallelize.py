@@ -17,6 +17,7 @@ hash all span the full sequence (``System3Model.Config.update_from_config``
 rejects both at the config level as well).
 """
 
+import torch
 from torchtitan.config import (
     TORCH_DTYPE_MAP,
     CompileConfig,
@@ -26,12 +27,35 @@ from torchtitan.config import (
 from torchtitan.distributed import ParallelDims
 from torchtitan.distributed.activation_checkpoint import ActivationCheckpointingConfig
 from torchtitan.distributed.compile import apply_compile
-from torchtitan.distributed.fsdp import apply_fsdp_to_decoder
 from torchtitan.distributed.full_dtensor import (
     resolve_fsdp_mesh,
     resolve_sparse_fsdp_mesh,
 )
 from torchtitan.models.common.decoder import Decoder
+
+from torchtitan_npu.extensions.torchtitan.distributed.fsdp import apply_fsdp_to_decoder
+
+
+def _shard_system3_engram_tables(
+    model,
+    *,
+    edp_mesh,
+    edp_mesh_dims,
+) -> set[torch.nn.Parameter]:
+    """Exclude CPU hash tables from FSDP and wire their sparse-grad replicas.
+
+    A table FSDP does not manage still has replicas along the sparse
+    data-parallel axes, and their owner-local sparse gradients have to be
+    summed before the optimizer step.
+    """
+    ignored_params: set[torch.nn.Parameter] = set()
+    for module in model.modules():
+        if getattr(module, "uses_host_offload", False):
+            ignored_params.add(module.weight)
+            wire_replicas = getattr(module, "wire_sparse_grad_replicas", None)
+            if wire_replicas is not None:
+                wire_replicas(edp_mesh=edp_mesh, edp_mesh_dims=edp_mesh_dims)
+    return ignored_params
 
 
 def parallelize_system3(
@@ -85,9 +109,15 @@ def parallelize_system3(
             edp_mesh_names = ["dp_replicate", "efsdp"] if parallel_dims.dp_replicate_enabled else ["efsdp"]
             edp_mesh = parallel_dims.get_optional_mesh(edp_mesh_names)
 
+    ignored_params = _shard_system3_engram_tables(
+        model,
+        edp_mesh=edp_mesh if parallel_dims.ep_enabled else dp_mesh,
+        edp_mesh_dims=edp_mesh_dims if parallel_dims.ep_enabled else dp_mesh_dims,
+    )
     apply_fsdp_to_decoder(
         model,
         dp_mesh,
+        ignored_params=ignored_params,
         param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
         reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
         pp_enabled=parallel_dims.pp_enabled,

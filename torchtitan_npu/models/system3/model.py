@@ -65,10 +65,11 @@ T tokens.
 
 import math
 from dataclasses import dataclass
-from typing import ClassVar, Literal
+from typing import ClassVar, Literal, cast
 
 import spmd_types as spmd
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 from torch.distributed.tensor import DTensor
@@ -108,6 +109,7 @@ __all__ = [
     "RopeGeometry",
     "SharedLatentExpertMLP",
     "SinkhornIteration",
+    "System3HostHashTable",
     "System3Model",
     "System3RMSNorm",
 ]
@@ -277,9 +279,10 @@ class RotaryEmbedding(Module):
 class ISAIndexer(Module):
     """Indexer for token-level sparsity over the stride-compressed KV grid.
 
-    s_ij = <rmsnorm(W_q h_i), rmsnorm(W_k h_j)> / sqrt(idx_dim); causal masking
-    (2j > i -> dtype min) on the compressed grid, then top-K. The indexer
-    scores are passed to the attention as bias.
+    Follows the reference DSV4 indexer scoring: fp32 multi-head logits over
+    the compressed grid, ReLU, a per-token-head weights gate
+    (``weights_proj``), and a head-sum reduction into a single causal score
+    map for top-K. The indexer scores are passed to the attention as bias.
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -291,12 +294,15 @@ class ISAIndexer(Module):
         compress_ratio: int
         q_proj: Linear.Config
         k_proj: Linear.Config
+        weights_proj: Linear.Config
         q_norm: System3RMSNorm.Config
         k_norm: System3RMSNorm.Config
 
         def __post_init__(self) -> None:
             if self.q_proj.out_features != self.n_heads * self.head_dim:
                 raise ValueError("indexer q_proj must project to n_heads * head_dim")
+            if self.weights_proj.out_features != self.n_heads:
+                raise ValueError("indexer weights_proj must produce one gate per indexer head")
 
     def __init__(self, config: Config):
         super().__init__()
@@ -306,25 +312,34 @@ class ISAIndexer(Module):
         self.compress_ratio = config.compress_ratio
         self.q_proj = config.q_proj.build()
         self.k_proj = config.k_proj.build()
+        self.weights_proj = config.weights_proj.build()
         self.q_norm = config.q_norm.build()
         self.k_norm = config.k_norm.build()
 
     def select(self, hidden_states, attention_mask=None):
-        """Returns topk_indices [b, s, topk], topk_scores [b, s, topk]."""
+        """Returns topk_indices [b, s, topk] int64, topk_scores [b, s, topk] float32."""
         idx_q = self.q_norm(self.q_proj(hidden_states))
         idx_k = self.k_norm(self.k_proj(hidden_states))
         idx_k_c = idx_k[:, :: self.compress_ratio, :]
-        return self._select_topk(idx_q, idx_k_c, attention_mask)
+        weights = self.weights_proj(hidden_states).float()
+        return self._select_topk(idx_q, idx_k_c, weights, attention_mask)
 
-    def _select_topk(self, idx_q, idx_k_c, attention_mask=None):
-        """Causal top-K selection over the compressed indexer grid (seam)."""
-        b, s, _ = idx_q.shape
+    def _select_topk(self, idx_q, idx_k_c, weights, attention_mask=None):
+        """Causal top-K selection over the compressed indexer grid (seam).
+
+        Reference scoring: fp32 multi-head logits, ReLU, per-token-head
+        gate, head-sum reduction.
+        """
+        b, s, _hd_total = idx_q.shape
         cl = idx_k_c.shape[1]
+        n, d = self.n_heads, self.head_dim
 
-        scores = torch.bmm(
-            idx_q.reshape(b, s, -1),
-            idx_k_c.reshape(b, cl, -1).transpose(1, 2),
-        ) / math.sqrt(idx_q.shape[-1])
+        logits = torch.matmul(
+            idx_q.float().view(b, s, n, d).permute(0, 2, 1, 3),  # [b, n, s, d]
+            idx_k_c.float().view(b, cl, n, d).permute(0, 2, 3, 1),  # [b, n, d, cl]
+        )  # [b, n, s, cl]
+        gated = torch.nn.functional.relu(logits) * weights.permute(0, 2, 1).unsqueeze(-1)
+        scores = gated.sum(dim=1)  # [b, s, cl] float32
 
         q_pos = torch.arange(s, device=idx_q.device).unsqueeze(1)
         k_pos = torch.arange(0, s, self.compress_ratio, device=idx_q.device).unsqueeze(0)
@@ -1096,6 +1111,394 @@ class MultiHeadHashTable(Module):
             idx = hash_indices[:, :, h] + self.head_offsets[h]
             outs.append(F.embedding(idx, self.weight))
         return torch.cat(outs, dim=-1)  # [b, s, nh * head_dim]
+
+
+class _System3HostLookup(torch.autograd.Function):
+    """Eager lookup for the host hash table with owner-local sparse gradients.
+
+    EP=1 gathers rows from the local CPU table; EP>1 routes deduplicated row
+    requests to their EP owners through the production all-to-all exchange
+    (``torchtitan_npu.models.deepseek_v4_1.engram.lookup``) and reverses it in
+    backward. Either way the backward accumulates only the owner-local rows
+    into the table's pending sparse gradient; the dense table gradient is
+    never materialized.
+    """
+
+    @staticmethod
+    def forward(ctx, weight, flat_ids, table, lookup_rows, lookup_grad_rows):
+        if table._ep_size > 1:
+            rows = lookup_rows(ctx, weight, flat_ids, table.lookup_mesh.get_group())
+            ctx.distributed = True
+        else:
+            local_ids = flat_ids.reshape(-1).to(device=weight.device, copy=True)
+            rows = weight.index_select(0, local_ids).to(device=flat_ids.device)
+            rows = rows.view(*flat_ids.shape, weight.shape[1])
+            ctx.save_for_backward(flat_ids)
+            ctx.distributed = False
+        ctx.table = table
+        ctx.lookup_grad_rows = lookup_grad_rows
+        return rows
+
+    @staticmethod
+    def backward(ctx, grad_rows):  # pyrefly: ignore [bad-override]
+        table = ctx.table
+        if ctx.distributed:
+            grad_local_rows, local_ids = ctx.lookup_grad_rows(ctx, grad_rows)
+        else:
+            (flat_ids,) = ctx.saved_tensors
+            local_ids = flat_ids.reshape(-1).to(device=table.weight.device, dtype=torch.int64, copy=True)
+            grad_local_rows = grad_rows.reshape(-1, grad_rows.shape[-1])
+        table.accumulate_sparse_gradient(local_ids, grad_local_rows)
+        return None, None, None, None, None
+
+
+class System3HostHashTable(MultiHeadHashTable):
+    """Official-paradigm execution of the reference hash table.
+
+    DeepSeek's public Engram deployment stores the n-gram tables host-side,
+    shards the rows over the EP mesh, routes lookups through an all-to-all
+    exchange, and trains the tables with owner-local sparse gradients fed to
+    SparseAdam; dense table gradients are never materialized. This subclass
+    keeps the reference hash math verbatim (the rolling-hash ids, per-head
+    offsets and the head-major ``[B, S, orders*heads*Dh]`` memory layout) and
+    swaps only that storage/lookup/training execution, following the
+    production DeepSeek-V4.1 ``HostEngramTable`` recipe (owner-approved
+    deviation from the reference preview's dense device table).
+
+    The weight is CPU-resident: ``_apply`` keeps it off device transforms,
+    FSDP excludes it via ``ignored_params`` (the table shards itself over EP
+    instead) and the sparse-gradient lifecycle follows the shared
+    ``uses_host_offload`` protocol that the HostSparse optimizer container
+    and the gradient clipper drive. Meta capture replaces ``_lookup_rows``
+    with a shape-visible decomposition (see
+    ``torchtitan_simulator.compat.system3_engram``).
+    """
+
+    uses_host_offload = True
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(MultiHeadHashTable.Config):
+        layer_idx: int = 0
+        pin_memory: bool = False
+
+    def __init__(self, config: Config):
+        self.pin_memory = config.pin_memory
+        self.layer_idx = config.layer_idx
+        self._table_mesh = None
+        self._ep_mesh = None
+        self._ep_rank = 0
+        self._ep_size = 1
+        self._pending_sparse_grad: torch.Tensor | None = None
+        self._replica_group = None
+        self._replica_size = 1
+        super().__init__(config)
+        # The reference allocates on the ambient default device; the host
+        # table owns its weight on CPU instead (``init_states`` seeds it via
+        # ``_init_self_parameters``).
+        weight = self._parameters.pop("weight")
+        assert isinstance(weight, torch.nn.Parameter)
+        weight = nn.Parameter(
+            torch.empty(
+                weight.shape,
+                dtype=weight.dtype,
+                device="cpu",
+                pin_memory=self.pin_memory,
+            ),
+            requires_grad=weight.requires_grad,
+        )
+        self.register_parameter("weight", weight)
+        self._mark_host_weight()
+
+    def _mark_host_weight(self) -> None:
+        # Optimizer construction follows parallelize/to_empty, so preserve the
+        # Host marker and checkpoint shard suffix on replacement parameters.
+        self.weight._engram_host_offload = True  # type: ignore[attr-defined]
+        self.weight._engram_checkpoint_suffix = self._checkpoint_suffix()  # type: ignore[attr-defined]
+
+    def _checkpoint_suffix(self) -> str:
+        if self._ep_size <= 1:
+            return ""
+        return f".ep_shard_{self._ep_rank:05d}_of_{self._ep_size:05d}"
+
+    def _apply(self, fn, recurse=True):
+        """Apply device transforms to metadata while keeping weight on CPU."""
+        weight = self._parameters.pop("weight")
+        assert isinstance(weight, torch.nn.Parameter)
+        try:
+            result = super()._apply(fn, recurse=recurse)
+        finally:
+            if weight.is_meta:
+                materialized = torch.empty(
+                    weight.shape,
+                    dtype=weight.dtype,
+                    device="cpu",
+                    pin_memory=self.pin_memory,
+                )
+                weight = nn.Parameter(materialized, requires_grad=weight.requires_grad)
+            self.register_parameter("weight", weight)
+            self._mark_host_weight()
+        return result
+
+    def _init_self_parameters(self) -> None:
+        # Rank-dependent streams avoid repeating the same local shard on
+        # every EP owner; mirrors the production HostEngramTable seeding.
+        shard_rank = self._table_mesh.get_local_rank() if self._table_mesh is not None else self._ep_rank
+        seed = (torch.initial_seed() + 1000003 * self.layer_idx + 9176 * shard_rank) % (2**63 - 1)
+        with torch.random.fork_rng(devices=[]):
+            torch.random.default_generator.manual_seed(seed)
+            self.reset_parameters()
+
+    # -- lookup ----------------------------------------------------------
+
+    @property
+    def lookup_mesh(self):
+        return self._ep_mesh
+
+    def _lookup_rows(self, flat_ids: torch.Tensor) -> torch.Tensor:
+        """Official host lookup: local at EP=1, all-to-all routed at EP>1."""
+        from torchtitan_npu.models.deepseek_v4_1.engram.lookup import _lookup_grad_rows, _lookup_rows
+
+        return _System3HostLookup.apply(self.weight, flat_ids, self, _lookup_rows, _lookup_grad_rows)
+
+    def forward(self, hash_indices):
+        _b, _s, nh = hash_indices.shape
+        # Head-major flat row ids: identical rows and concat order to the
+        # reference per-head ``F.embedding`` loop.
+        flat_ids = hash_indices + self.head_offsets.view(1, 1, nh)
+        rows = self._lookup_rows(flat_ids)  # [b, s, nh, head_dim]
+        return rows.reshape(*hash_indices.shape[:-1], nh * self.per_head_dim)
+
+    # -- EP sharding -------------------------------------------------------
+
+    def parallelize(self, parallel_dims) -> None:
+        ep_mesh = parallel_dims.get_optional_mesh("ep")
+        ep_size = ep_mesh.size() if ep_mesh is not None else 1
+        self._ep_mesh = ep_mesh
+        self._table_mesh = None
+        if ep_size <= 1:
+            self._ep_rank = 0
+            self._ep_size = 1
+            return
+        rows = self.weight.shape[0]
+        if rows % ep_size != 0:
+            raise ValueError(f"Engram hash table has {rows} physical rows, not divisible by its EP degree {ep_size}.")
+        # Keep weight out of generic SpmdLayout distribution. Hash metadata is
+        # still parallelized by the inherited sharding config.
+        global_weight = self._parameters.pop("weight")
+        assert isinstance(global_weight, torch.nn.Parameter)
+        try:
+            super().parallelize(parallel_dims)
+        finally:
+            local_rows = global_weight.shape[0] // ep_size
+            local_weight = nn.Parameter(
+                torch.empty(
+                    local_rows,
+                    global_weight.shape[1],
+                    dtype=global_weight.dtype,
+                    device=global_weight.device,
+                ),
+                requires_grad=global_weight.requires_grad,
+            )
+            self.register_parameter("weight", local_weight)
+
+        self._ep_rank = ep_mesh.get_local_rank() if ep_mesh is not None else 0
+        self._ep_size = ep_size
+        self._mark_host_weight()
+
+    def wire_sparse_grad_replicas(self, *, edp_mesh, edp_mesh_dims=None) -> None:
+        """Record the ranks that hold a copy of this EP shard.
+
+        FSDP would reduce the replicas of the parameters it manages; this
+        table is deliberately unmanaged, so it sums its owner-local sparse
+        gradients itself along the sparse data-parallel axes. The EP axis
+        holds disjoint row ranges and is excluded from the reduction.
+        """
+        self._replica_group = None
+        self._replica_size = 1
+        if edp_mesh is None:
+            return
+        if edp_mesh_dims is not None:
+            replica_axes = (edp_mesh_dims.replicate, edp_mesh_dims.shard)
+            # Dense FSDP may fold (dp_shard, cp) into a tuple of shard axes.
+            axes = tuple(name for axis in replica_axes if axis for name in ((axis,) if isinstance(axis, str) else axis))
+            if not axes:
+                return
+            replica_mesh = edp_mesh[axes]
+        else:
+            replica_mesh = edp_mesh
+        if replica_mesh.size() <= 1:
+            return
+        # Replica groups for different EP shards are disjoint. Only members
+        # participate in creating their group; no private mesh flattening API.
+        self._replica_group = cast(
+            "dist.ProcessGroup",
+            (
+                replica_mesh.get_group()
+                if replica_mesh.ndim == 1
+                else dist.new_group(ranks=replica_mesh.mesh.flatten().tolist(), use_local_synchronization=True)
+            ),
+        )
+        self._replica_size = replica_mesh.size()
+
+    @torch.no_grad()
+    def reduce_sparse_gradient_across_replicas(self) -> None:
+        """Sum this step's sparse gradient over the replicas of this shard.
+
+        Called from the gradient clipper, which TorchTitan runs unconditionally
+        before every optimizer step, so the norm is taken on the reduced
+        gradient. Each rank pads its owner-local rows to the group maximum,
+        all-gathers them, and coalesces: every replica ends up with the same
+        summed gradient, which keeps their weights and SparseAdam state in step
+        without ever materializing a dense shard gradient.
+        """
+        group = self._replica_group
+        if group is None:
+            return
+
+        device = self.head_offsets.device
+        pending = self._pending_sparse_grad
+        if pending is None:
+            local_ids = torch.empty(0, dtype=torch.int64)
+            local_values = torch.empty(0, self.weight.shape[1], dtype=torch.float32)
+        else:
+            local_ids = pending.indices()[0]
+            local_values = pending.values()
+
+        # Row counts differ per replica, so the gather has to be padded to the
+        # largest one; collecting the counts first also says where to cut.
+        counts = torch.zeros(self._replica_size, dtype=torch.int64, device=device)
+        counts[dist.get_rank(group)] = local_ids.numel()
+        dist.all_reduce(counts, op=dist.ReduceOp.SUM, group=group)
+        max_rows = int(counts.max())
+        if max_rows == 0:
+            return
+
+        padded_ids = torch.zeros(max_rows, dtype=torch.int64, device=device)
+        padded_ids[: local_ids.numel()] = local_ids.to(device=device)
+        padded_values = torch.zeros(max_rows, self.weight.shape[1], dtype=torch.float32, device=device)
+        padded_values[: local_values.shape[0]] = local_values.to(device=device)
+
+        gathered_ids = [torch.empty_like(padded_ids) for _ in range(self._replica_size)]
+        gathered_values = [torch.empty_like(padded_values) for _ in range(self._replica_size)]
+        dist.all_gather(gathered_ids, padded_ids, group=group)
+        dist.all_gather(gathered_values, padded_values, group=group)
+
+        ids_parts = []
+        values_parts = []
+        for replica in range(self._replica_size):
+            rows = int(counts[replica])
+            if rows:
+                ids_parts.append(gathered_ids[replica][:rows].to(device="cpu", copy=True))
+                values_parts.append(gathered_values[replica][:rows].to(device="cpu", copy=True))
+
+        self._pending_sparse_grad = torch.sparse_coo_tensor(
+            torch.cat(ids_parts).unsqueeze(0),
+            torch.cat(values_parts),
+            size=self.weight.shape,
+            dtype=torch.float32,
+            device="cpu",
+            check_invariants=False,
+        ).coalesce()
+
+    # -- checkpoint shards --------------------------------------------------
+
+    def _save_to_state_dict(self, destination, prefix, keep_vars):
+        super()._save_to_state_dict(destination, prefix, keep_vars)
+        suffix = self._checkpoint_suffix()
+        if suffix:
+            destination[prefix + "weight" + suffix] = destination.pop(prefix + "weight")
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        suffix = self._checkpoint_suffix()
+        shard_key = prefix + "weight" + suffix
+        weight_key = prefix + "weight"
+        if suffix and shard_key in state_dict:
+            state_dict[weight_key] = state_dict.pop(shard_key)
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+
+    # -- sparse-gradient lifecycle -------------------------------------------
+
+    def accumulate_sparse_gradient(
+        self,
+        local_row_ids: torch.Tensor,
+        grad_rows: torch.Tensor,
+    ) -> None:
+        """Accumulate one microbatch's owner-local rows in FP32 on CPU."""
+        local_row_ids = local_row_ids.reshape(-1)
+        grad_rows = grad_rows.reshape(local_row_ids.numel(), self.weight.shape[1])
+        ids = local_row_ids.to(device="cpu", dtype=torch.int64)
+        values = grad_rows.to(device="cpu", dtype=torch.float32)
+        if ids.numel():
+            min_id = int(ids.min())
+            max_id = int(ids.max())
+            if min_id < 0 or max_id >= self.weight.shape[0]:
+                raise IndexError(
+                    "Engram hash lookup returned local row outside "
+                    f"[0, {self.weight.shape[0]}): got range [{min_id}, {max_id}] "
+                    f"across {ids.numel()} sparse entries."
+                )
+        sparse_grad = torch.sparse_coo_tensor(
+            ids.unsqueeze(0),
+            values,
+            size=self.weight.shape,
+            dtype=torch.float32,
+            device="cpu",
+            check_invariants=False,
+        ).coalesce()
+        if self._pending_sparse_grad is None:
+            self._pending_sparse_grad = sparse_grad
+        else:
+            self._pending_sparse_grad = (self._pending_sparse_grad + sparse_grad).coalesce()
+
+    def pending_sparse_grad(self) -> torch.Tensor | None:
+        """The accumulated CPU sparse gradient, before it reaches SparseAdam."""
+        return self._pending_sparse_grad
+
+    def scale_pending_sparse_grad(self, scale: float) -> None:
+        """Apply the global gradient-clipping coefficient to the sparse gradient."""
+        if self._pending_sparse_grad is None:
+            return
+        self._pending_sparse_grad = torch.sparse_coo_tensor(
+            self._pending_sparse_grad.indices(),
+            self._pending_sparse_grad.values() * scale,
+            self._pending_sparse_grad.shape,
+        ).coalesce()
+
+    def prepare_sparse_optimizer_step(self) -> None:
+        if self._pending_sparse_grad is None:
+            self.weight.grad = None
+            return
+        self.weight.grad = self._pending_sparse_grad.to(dtype=self.weight.dtype)
+
+    def clear_sparse_gradient(self) -> None:
+        self._pending_sparse_grad = None
+        self.weight.grad = None
+
+    def mark_sparse_step_complete(self) -> None:
+        self._pending_sparse_grad = None
+
+    def refresh_lookup_storage(self, row_ids: torch.Tensor) -> None:
+        """Refresh derived lookup rows after an optimizer update, if any.
+
+        FP32 lookup uses the master weight directly and needs no refresh.
+        """
 
 
 class EngramModule(Module):

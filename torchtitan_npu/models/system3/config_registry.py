@@ -24,7 +24,7 @@ import torch.nn as nn
 from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
 from torchtitan.components.metrics import MetricsProcessor
-from torchtitan.components.optimizer import LRSchedulersContainer, default_adamw
+from torchtitan.components.optimizer import LRSchedulersContainer, ParamGroupConfig, default_adamw
 from torchtitan.config import TrainingConfig
 from torchtitan.distributed.activation_checkpoint import FullAC
 from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
@@ -35,6 +35,9 @@ from torchtitan.models.common.nn_modules import Conv1d, Conv2d
 from torchtitan.models.common.token_dispatcher import LocalTokenDispatcher
 from torchtitan.protocols.model_spec import ModelSpec
 from torchtitan.trainer import Trainer
+
+from torchtitan_npu.config import OptimizerConfig
+from torchtitan_npu.extensions.torchtitan.components.optimizer.optimizer import HostSparseOptimizersContainer
 
 from .model import (
     AlternatingAttention,
@@ -54,19 +57,23 @@ from .model import (
     LatentMoERouter,
     LatentRoutedExperts,
     ModalityEncoder,
-    MultiHeadHashTable,
     PointCloudEncoder,
     PolynomialRollingHash,
     RopeGeometry,
     RotaryEmbedding,
     SharedLatentExpertMLP,
     SinkhornIteration,
+    System3HostHashTable,
     System3Model,
     System3RMSNorm,
 )
 from .parallelize import parallelize_system3
 
 _LIN = Linear.Config
+
+
+class EngramTableParamGroupConfig(ParamGroupConfig):
+    """The recipe-owned table group, distinct from user-defined groups."""
 
 
 @dataclass(frozen=True)
@@ -257,6 +264,7 @@ def _attention_config(*, layer_idx: int, g: _Geometry):
                 compress_ratio=g.isa_compress_ratio,
                 q_proj=_LIN(in_features=d, out_features=idx_dim, bias=False),
                 k_proj=_LIN(in_features=d, out_features=idx_dim, bias=False),
+                weights_proj=_LIN(in_features=d, out_features=g.indexer_heads, bias=False),
                 q_norm=_norm(idx_dim, g),
                 k_norm=_norm(idx_dim, g),
             )
@@ -356,10 +364,11 @@ def _engram_config(*, layer_idx: int, g: _Geometry) -> EngramModule.Config:
             for order_idx, order in enumerate(g.engram_orders)
         ],
         hash_tables=[
-            MultiHeadHashTable.Config(
+            System3HostHashTable.Config(
                 capacity=g.engram_rows,
                 num_heads=g.engram_heads,
                 head_dim=g.engram_head_dim,
+                layer_idx=layer_idx,
             )
             for _ in g.engram_orders
         ],
@@ -524,6 +533,32 @@ def model_registry(flavor: str) -> ModelSpec:
     )
 
 
+def _system3_optimizer_config() -> OptimizerConfig:
+    """Official Engram training paradigm: SparseAdam for the host tables.
+
+    The hash tables are CPU-resident and updated through owner-local sparse
+    gradients (``HostSparseOptimizersContainer`` discovers them via the
+    ``uses_host_offload`` marker); every other parameter keeps the reference
+    AdamW recipe. The table learning rate mirrors the reference dense recipe,
+    which trained the tables as ordinary parameters at the model lr.
+    """
+    adamw = default_adamw(lr=8e-4)
+    groups = [
+        EngramTableParamGroupConfig(
+            pattern=r".*\.engram\.hash_tables\.\d+\.weight$",
+            optimizer_name="SparseAdam",
+            optimizer_kwargs={"lr": 8e-4},
+        ),
+        *adamw.param_groups,
+    ]
+    return HostSparseOptimizersContainer.Config(
+        name="AdamW",
+        param_groups=groups,
+        implementation=adamw.implementation,
+        optimizer_factory_kwargs_by_name=adamw.optimizer_factory_kwargs_by_name,
+    )
+
+
 def _system3_trainer_config(
     flavor: str,
     *,
@@ -547,7 +582,7 @@ def _system3_trainer_config(
         ),
         hf_assets_path="./tests/assets/tokenizer",
         model_spec=model_spec,
-        optimizer=default_adamw(lr=8e-4),
+        optimizer=_system3_optimizer_config(),
         lr_scheduler=LRSchedulersContainer.Config(
             warmup_steps=2,
             decay_ratio=0.8,

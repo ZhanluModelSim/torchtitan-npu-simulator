@@ -50,12 +50,14 @@ class RuntimeSession:
             install_kimi_dsa_virtual_fusions(self.patches)
             self.capabilities["kimi_dsa_virtual_fusions"] = "selected-key Meta/autograd; explicit saved output/LSE"
         if prepared.trainer.model_spec.name == "system3":
+            from torchtitan_simulator.compat.system3_engram import install_system3_engram_meta_support
             from torchtitan_simulator.compat.system3_fusions import install_system3_virtual_fusions
 
             install_system3_virtual_fusions(self.patches)
             self.capabilities["system3_virtual_fusions"] = (
                 "swiglu_clamp, gdn2_chunked, isa_indexer and isa_sparse_attention dispatcher Meta/autograd boundaries"
             )
+            self.capabilities["system3_engram_host_table"] = install_system3_engram_meta_support(self.patches)
         imports = prepared.trainer.override.imports
         if "torchtitan_npu.override.common.rms_norm.asc" in imports:
             from torchtitan_simulator.compat.norm import install_meta_norm_autograd, install_meta_norm_buffers

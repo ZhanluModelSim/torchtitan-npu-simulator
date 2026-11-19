@@ -16,12 +16,34 @@ from torchtitan_simulator.validation import validate_workload
 # reference smoke_test config): hidden=128, vocab=512, 12 physical blocks
 # looped twice, [ISA, GDN2 x 3] units, 4 experts top-2 + 1 shared in a
 # 48-wide latent, Engram on layers 1/5/9 (orders [2], 2 heads x 64 rows x
-# 16 dim), mHC hc_mult=2 x branch 1024, FP32 parameters. The multimodal
-# flavor adds the four encoders (image 64, audio/point3d/haptic).
+# 16 dim — each module executes twice per pass with the block loop), mHC
+# hc_mult=2 x branch 1024, FP32 parameters. The multimodal flavor adds the
+# four encoders (image 64, audio/point3d/haptic).
+# Engram runs the official host-table paradigm: the three hash tables are
+# CPU-resident (device "cpu" in the parameter layouts, excluded from the
+# device persistent bytes and the dense gradient contract), each pass
+# gathers rows on the host and moves them over as visible transfers, EP>1
+# routes the lookups through the production all-to-all exchange, and the
+# tables train through owner-local sparse gradients fed to SparseAdam.
 _TEXT_PARAMS = 13_886_412
 _TEXT_PARAM_TENSORS = 373
+_ENGRAM_TABLE_PARAMS = 3 * 2 * 64 * 16
+_TEXT_DENSE_PARAMS = _TEXT_PARAMS - _ENGRAM_TABLE_PARAMS
+_TEXT_DENSE_TENSORS = 370
 _MM_PARAMS = 14_214_060
 _MM_PARAM_TENSORS = 440
+_MM_DENSE_PARAMS = _MM_PARAMS - _ENGRAM_TABLE_PARAMS
+_MM_DENSE_TENSORS = 437
+
+
+def _table_host_transfers(nodes):
+    """The visible rows H2D transfers of the host hash tables."""
+    return [
+        n
+        for n in nodes
+        if n.annotations["raw_op_type"] == "aten._to_copy.default"
+        and n.annotations.get("module_path", "").endswith("engram.hash_tables.0")
+    ]
 
 
 def test_system3_param_formula_matches_reference_smoke_geometry():
@@ -31,6 +53,11 @@ def test_system3_param_formula_matches_reference_smoke_geometry():
     assert _MM_PARAMS == 14_148_524 + 512 * 128
     # The encoder towers over the untied text backbone.
     assert _MM_PARAMS - _TEXT_PARAMS == 327_648
+    # The dense contract excludes exactly the three host tables.
+    assert _TEXT_DENSE_PARAMS == _TEXT_PARAMS - _ENGRAM_TABLE_PARAMS
+    assert _TEXT_DENSE_TENSORS == _TEXT_PARAM_TENSORS - 3
+    assert _MM_DENSE_PARAMS == _MM_PARAMS - _ENGRAM_TABLE_PARAMS
+    assert _MM_DENSE_TENSORS == _MM_PARAM_TENSORS - 3
 
 
 def test_system3_text_capture_reaches_iteration_with_reference_operators():
@@ -65,7 +92,14 @@ def test_system3_text_capture_reaches_iteration_with_reference_operators():
     assert counts["aten.topk.default"] == 18
     assert counts["aten._grouped_mm.default"] == 162
     assert counts["aten._softmax.default"] == 18
-    assert counts["aten.embedding.default"] == 13
+    # The tok embedding is the only dense lookup left: the six per-pass
+    # Engram table executions no longer dispatch per-head F.embedding; each
+    # one gathers its rows on the host instead, leaving a host-scratch
+    # ``empty`` and a visible rows H2D ``_to_copy`` per execution.
+    assert counts["aten.embedding.default"] == 1
+    assert counts["aten.embedding_dense_backward.default"] == 1
+    assert counts["aten.empty.memory_format"] == 6
+    assert len(_table_host_transfers(nodes)) == 6
     # No foreign virtual fusions: the only virtual ops are this workspace's
     # system3_sim family, and they are the only nodes carrying
     # ``tensor_semantics`` schema attributes.
@@ -82,12 +116,22 @@ def test_system3_text_capture_reaches_iteration_with_reference_operators():
         "system3_sim.isa_sparse_attention_grad.default",
     }
     gradients = workload.iteration.schedule.annotations["gradient_validation"]
-    assert len(gradients) == _TEXT_PARAM_TENSORS
+    # Only the dense parameters carry the gradient contract; the three host
+    # tables reach SparseAdam through their pending sparse gradients.
+    assert len(gradients) == _TEXT_DENSE_TENSORS
+    assert not any("hash_tables" in name for name in gradients)
+    groups = workload.iteration.schedule.annotations["optimizer_parameter_groups"]
+    sparse_groups = [group for group in groups if group["algorithm"] == "SparseAdam"]
+    assert len(sparse_groups) == 1
+    assert len(sparse_groups[0]["parameter_names"]) == 3
     memory = workload.iteration.schedule.annotations["memory_plan"]
-    assert memory.persistent_param_bytes == _TEXT_PARAMS * 4
+    # The CPU tables are not device-persistent; only the dense parameters
+    # hold device residency.
+    assert memory.persistent_param_bytes == _TEXT_DENSE_PARAMS * 4
     # Native fused AdamW keeps two FP32 moments and one device FP32 step
-    # scalar per participating parameter.
-    assert memory.optimizer_state_bytes == _TEXT_PARAMS * 8 + _TEXT_PARAM_TENSORS * 4
+    # scalar per participating dense parameter; the host tables get no
+    # dense moments (SparseAdam skips grad-less tables at capture).
+    assert memory.optimizer_state_bytes == _TEXT_DENSE_PARAMS * 8 + _TEXT_DENSE_TENSORS * 4
 
 
 def test_system3_full_ac_recomputes_forward_math():
@@ -115,9 +159,13 @@ def test_system3_full_ac_recomputes_forward_math():
     assert counts["aten.topk.default"] == 36
     assert counts["aten._grouped_mm.default"] == 216
     assert counts["aten._softmax.default"] == 36
-    assert counts["aten.embedding.default"] == 25
+    # Full AC replays the Engram host lookups with the recompute: the
+    # tok embedding stays single (outside the checkpointed blocks).
+    assert counts["aten.embedding.default"] == 1
+    assert counts["aten.empty.memory_format"] == 12
+    assert len(_table_host_transfers(nodes)) == 12
     gradients = workload.iteration.schedule.annotations["gradient_validation"]
-    assert len(gradients) == _TEXT_PARAM_TENSORS
+    assert len(gradients) == _TEXT_DENSE_TENSORS
 
 
 def test_system3_multimodal_capture_includes_encoder_gradients():
@@ -125,9 +173,10 @@ def test_system3_multimodal_capture_includes_encoder_gradients():
     result = validate_workload(workload)
     assert result["graph_acyclic"] and result["peak_storage_unique"]
     gradients = workload.iteration.schedule.annotations["gradient_validation"]
-    # 373 backbone + 67 encoder parameter tensors — the reference smoke
-    # counts exactly 67 encoder grads as well.
-    assert len(gradients) == _MM_PARAM_TENSORS
+    # 370 dense backbone + 67 encoder parameter tensors — the reference smoke
+    # counts exactly 67 encoder grads as well; the host tables stay outside
+    # the dense gradient contract.
+    assert len(gradients) == _MM_DENSE_TENSORS
     nodes = [n for template in workload.step_templates.values() for n in template.nodes.values()]
     counts = Counter(n.annotations["raw_op_type"] for n in nodes)
     # The encoders are plain bidirectional blocks (qkv bmm attention + gelu
@@ -141,12 +190,16 @@ def test_system3_multimodal_capture_includes_encoder_gradients():
     assert counts["npu.npu_fusion_attention_grad.default"] == 8
     assert counts["system3_sim.isa_indexer.default"] == 4
     assert counts["system3_sim.isa_sparse_attention.default"] == 6
-    assert counts["aten.embedding.default"] == 17
+    # tok embedding + one modality-segment lookup per encoder; the Engram
+    # per-head lookups are host gathers now.
+    assert counts["aten.embedding.default"] == 5
     assert counts["aten._softmax.default"] == 18  # eager router math only
     assert counts["aten.gelu.default"] == 13  # encoder MLP activations stay eager
+    assert counts["aten.empty.memory_format"] == 6
+    assert len(_table_host_transfers(nodes)) == 6
     memory = workload.iteration.schedule.annotations["memory_plan"]
-    assert memory.persistent_param_bytes == _MM_PARAMS * 4
-    assert memory.optimizer_state_bytes == _MM_PARAMS * 8 + _MM_PARAM_TENSORS * 4
+    assert memory.persistent_param_bytes == _MM_DENSE_PARAMS * 4
+    assert memory.optimizer_state_bytes == _MM_DENSE_PARAMS * 8 + _MM_DENSE_TENSORS * 4
 
 
 def test_system3_ep2_dispatches_all_to_all_and_reaches_iteration():
@@ -164,11 +217,27 @@ def test_system3_ep2_dispatches_all_to_all_and_reaches_iteration():
     counts = Counter(n.annotations["raw_op_type"] for n in nodes)
     # 9 MoE layers x (dispatch + combine paths) carry the latent pair per
     # exchange; the routed grouped GEMM count is unchanged (per-rank local
-    # experts shrink with EP, the per-layer GEMM count does not).
-    assert counts["_c10d_functional.all_to_all_single.default"] == 90
+    # experts shrink with EP, the per-layer GEMM count does not). The Engram
+    # lookups join the routed path: 6 table executions x the production
+    # counts/ids/rows exchange triple adds 18 more all-to-alls.
+    assert counts["_c10d_functional.all_to_all_single.default"] == 108
+    engram_a2a = [
+        n
+        for n in nodes
+        if n.annotations["raw_op_type"] == "_c10d_functional.all_to_all_single.default"
+        and "engram" in n.annotations.get("module_path", "")
+    ]
+    assert len(engram_a2a) == 18
     assert counts["aten._grouped_mm.default"] == 162
     gradients = workload.iteration.schedule.annotations["gradient_validation"]
-    assert len(gradients) == _TEXT_PARAM_TENSORS
+    assert len(gradients) == _TEXT_DENSE_TENSORS
+    # The tables shard their rows over EP: 128 flat rows / 2 = 64 local rows
+    # on each owner, CPU-resident, outside FSDP.
+    layouts = workload.iteration.schedule.annotations["parameter_layouts"]
+    table_layouts = {name: layout for name, layout in layouts.items() if "hash_tables" in name}
+    assert len(table_layouts) == 3
+    assert all(layout["device"] == "cpu" for layout in table_layouts.values())
+    assert all(tuple(layout["local_shape"]) == (64, 16) for layout in table_layouts.values())
 
 
 def test_system3_rejects_tensor_parallel_at_config_level():
