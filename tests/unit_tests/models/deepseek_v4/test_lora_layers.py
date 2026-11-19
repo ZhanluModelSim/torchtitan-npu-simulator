@@ -10,6 +10,8 @@ from torchtitan.models.common.decoder_sharding import dense_param_placement
 from torchtitan.models.common.linear import GroupedLinear
 
 from tests.unit_tests.models.deepseek_v4.lora_test_utils import _lora_model_config
+from torchtitan_npu.models.common.deepseek_lora import BatchedLinearLoRA
+from torchtitan_npu_recipes.models.deepseek_v4_1 import deepseek_v4_1_debugmodel_lora
 
 
 @pytest.fixture(autouse=True)
@@ -29,14 +31,28 @@ def _cpu_grouped_mm(self, *, input_RI, weight_EOI, offsets_E):
     )
 
 
-@pytest.mark.parametrize("kind", ["dense", "batched", "grouped"], ids=["dense", "per-head", "routed"])
+@pytest.mark.parametrize(
+    "model,kind",
+    [
+        pytest.param("dsv4", "dense", id="dsv4-dense"),
+        pytest.param(
+            "dsv4",
+            "batched",
+            marks=pytest.mark.skip(reason="Native DSV4 wo_a uses Linear; batched LoRA is covered by V4.1."),
+            id="dsv4-per-group",
+        ),
+        pytest.param("dsv4", "grouped", id="dsv4-routed"),
+        pytest.param("dsv4_1", "batched", id="v41-per-group"),
+    ],
+)
 @pytest.mark.parametrize("replicated", [False, True], ids=["unsharded", "replicated"])
-def test_standard_lora_projection_output_and_gradients_match_independent_formula(kind, replicated, monkeypatch):
-    config = _lora_model_config()
+def test_standard_lora_projection_output_and_gradients_match_independent_formula(model, kind, replicated, monkeypatch):
+    config = deepseek_v4_1_debugmodel_lora().model if model == "dsv4_1" else _lora_model_config()
     if kind == "dense":
         projection = config.layers[0].attention.wq_a
     elif kind == "batched":
         projection = config.layers[0].attention.wo_a
+        assert isinstance(projection, BatchedLinearLoRA.Config)
     else:
         projection = config.layers[0].feed_forward.routed_experts.w13
         monkeypatch.setattr(GroupedLinear, "_grouped_mm", _cpu_grouped_mm)
@@ -47,10 +63,14 @@ def test_standard_lora_projection_output_and_gradients_match_independent_formula
         for adapter in (module.lora_a, module.lora_b):
             assert adapter._sharding_config.state_shardings["weight"] == dense_param_placement(tp=spmd.R)
     module.init_states(buffer_device=torch.device("cpu"))
+    if kind == "batched":
+        module = module.to(dtype=torch.float64)
     with torch.no_grad():
+        if kind == "batched":
+            module.lora_a.weight.normal_(std=0.1)
         module.lora_b.weight.normal_(std=0.1)
     shape = (5, projection.n_heads, projection.in_features) if kind == "batched" else (5, projection.in_features)
-    inputs = torch.randn(shape, requires_grad=True)
+    inputs = torch.randn(shape, dtype=module.weight.dtype, requires_grad=True)
     a, b = module.lora_a.weight, module.lora_b.weight
     if kind == "grouped":
         offsets = torch.tensor([2, 5], dtype=torch.int32)
@@ -61,16 +81,21 @@ def test_standard_lora_projection_output_and_gradients_match_independent_formula
         expected = base + 2 * torch.einsum("tr,tsor->tso", hidden, b[experts])
     elif kind == "batched":
         actual = module(inputs)
-        base = torch.einsum("thi,hoi->tho", inputs, module.weight.view(projection.n_heads, projection.out_features, -1))
-        hidden = torch.einsum("thi,ri->thr", inputs, a)
-        expected = base + 2 * torch.einsum(
-            "thr,hor->tho", hidden, b.view(projection.n_heads, projection.out_features, -1)
+        weights = module.weight.view(projection.n_heads, projection.out_features, projection.in_features)
+        group_b = b.view(projection.n_heads, projection.out_features, projection.rank)
+        expected = torch.stack(
+            [
+                inputs[:, group] @ weights[group].T
+                + (projection.alpha / projection.rank) * (inputs[:, group] @ a.T @ group_b[group].T)
+                for group in range(projection.n_heads)
+            ],
+            dim=1,
         )
     else:
         actual = module(inputs)
         expected = F.linear(inputs, module.weight) + 2 * (inputs @ a.T @ b.T)
     torch.testing.assert_close(actual, expected)
-    upstream = torch.linspace(-0.5, 0.7, actual.numel()).reshape_as(actual)
+    upstream = torch.linspace(-0.5, 0.7, actual.numel(), dtype=actual.dtype).reshape_as(actual)
     actual_grads = torch.autograd.grad(actual, (inputs, a, b), upstream, retain_graph=True)
     expected_grads = torch.autograd.grad(expected, (inputs, a, b), upstream)
     for actual_grad, expected_grad in zip(actual_grads, expected_grads, strict=True):
