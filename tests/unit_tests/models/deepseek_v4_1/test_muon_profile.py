@@ -13,33 +13,35 @@ from torchtitan.components.optim.optimizer import OptimizersContainer
 from torchtitan.distributed.flex_shard import BlockShard, Owned
 from torchtitan.distributed.parallelism_context import MeshAxisName
 
+from torchtitan_npu.config import OptimizerConfig
+from torchtitan_npu.extensions.torchtitan.components.optimizer.muon import DistMuon as NpuDistMuon
 from torchtitan_npu.models.deepseek_v4 import model_registry as v4_registry
-from torchtitan_npu.models.deepseek_v4.muon import _dsv4_optimizer_config
 from torchtitan_npu.models.deepseek_v4_1 import model_registry as v41_registry
-from torchtitan_npu.models.deepseek_v4_1.optimizer import _v41_optimizer_config
+from torchtitan_npu.models.deepseek_v4_1.optimizer import EngramTableOptimizerConfig
+from torchtitan_npu_recipes.models.deepseek_v4 import _dsv4_muon_profile
+from torchtitan_npu_recipes.models.deepseek_v4_1 import _v41_muon_profile
 
 
 @pytest.mark.parametrize("version", ["v4", "v41"])
 def test_muon_groups_match_real_parameters_layouts_and_buckets(version):
     if version == "v4":
         config = v4_registry("debugmodel", seq_len=128, num_mtp_layers=1)
-        optimizer_config = _dsv4_optimizer_config(config, lr=1e-5)
+        profile = _dsv4_muon_profile(config)
     else:
         config = v41_registry("deepseek_v4_1_debugmodel_text")
-        optimizer_config = _v41_optimizer_config(config)
+        profile = _v41_muon_profile(config)
+    groups = [
+        NpuDistMuon.Config(
+            pattern=profile.muon_pattern,
+            compute_sharding_by_fqn=profile.compute_sharding_by_fqn,
+            bucket_configs=profile.bucket_configs,
+            lr=1e-5,
+        ),
+        AdamW.Config(pattern=r".*", lr=1e-5, eps=1e-8),
+    ]
     if version == "v41":
-        assert optimizer_config.name == "AdamW"
-        # v0.4.0 keeps the recipe-owned groups in ``_optimizer_defaults`` until
-        # ``materialize()`` selects a mode.
-        sparse = optimizer_config._optimizer_defaults["AdamW"][0]
-    optimizer_config.name = "Muon"
-    optimizer_config.materialize()
-    if version == "v41":
-        assert len(optimizer_config.optimizers) == 3 and optimizer_config.optimizers[0] is sparse
-        optimizer_config.materialize()
-        assert len(optimizer_config.optimizers) == 3 and optimizer_config.optimizers[0] is sparse
-    profile = optimizer_config._muon_profile
-    assert profile is not None
+        groups.insert(0, EngramTableOptimizerConfig(pattern=r".*\.engram\.table\.weight$"))
+    optimizer_config = OptimizerConfig(optimizers=groups)
     with torch.device("meta"):
         model = config.build()
 
@@ -54,8 +56,8 @@ def test_muon_groups_match_real_parameters_layouts_and_buckets(version):
     muon_names = next(names for group, names in assigned if group is muon)
     adamw_names = next(names for group, names in assigned if group is adamw)
     all_names = {name for name, param in model.named_parameters() if param.requires_grad}
-    layouts = profile.optimizer_factory_kwargs["DistMuon"]["compute_sharding_by_fqn"]
-    buckets = profile.optimizer_factory_kwargs["DistMuon"]["bucket_configs"]
+    layouts = profile.compute_sharding_by_fqn
+    buckets = profile.bucket_configs
     bucket_names = []
     for bucket in buckets:
         bucket_names.extend(bucket.patterns)

@@ -1,7 +1,7 @@
 # 数值一致性检查（精度对比）
 
 本目录提供三类精度对比：局部模块前反向、Transformers 推理基线对齐、两个训练脚本或 Git 版本的训练指标对比。
-整网对比以 DeepSeek-V4（DSV4）为例；**只比较训练 `loss` 和 `grad_norm` 时，直接看「步骤四」即可，无需准备推理权重。**
+整网对比以 DeepSeek-V4（DSV4）为例。步骤四的训练命令生成器仅适用于旧字段 CLI；当前 0.4.0 应分别通过 Python recipe 运行训练，再比较 TensorBoard 完整精度指标。
 
 指标定义与验收要求见[数值对齐开发指南](../../docs/developer_guides/numerical_alignment.md)，完整参数见各入口的 `--help`。
 
@@ -87,6 +87,8 @@ HF 与 DCP 必须来自同一份权重。两种 attention 模式都要求 batch 
 
 ### 步骤四：训练 loss 和 grad_norm 对比
 
+本节 `loss_compare.py` 仍依赖旧训练 CLI，尚未适配当前 0.4.0 recipe 入口。
+
 [`loss_compare.py`](loss_compare.py) 比较两个训练脚本或两个 Git 版本，从 TensorBoard 事件读取逐 step 的 `loss` 和 `grad_norm`。
 默认比较 100 步、序列长度 4096、训练 seed 42、开启确定性算法，默认入口为 `examples/deepseek_v4/debug/deepseek_v4_mini_1p_cpt_2k_a3.sh`。
 
@@ -102,19 +104,20 @@ export HF_ASSETS_PATH=/path/to/tokenizer
 python scripts/numerical_alignment/loss_compare.py HEAD~1 HEAD
 ```
 
-#### 比较上游适配前后的版本
+#### 历史接口迁移示例（不适用于当前 HEAD）
 
-`93f956c` 依赖 TorchTitan `dc3985ad`，使用旧的 `checkpoint`、`optimizer` 配置；当前版本依赖 `ebdfc8c`，使用可选的 `checkpointer` 和嵌套 `optim`。通过 `--baseline-config-api legacy` 选择旧接口，test 侧默认使用 `native`。两侧均已使用 token 训练 API，无需设置 `--baseline-training-api legacy`。
+历史迁移曾比较 `93f956c`（TorchTitan `dc3985ad`，旧 `checkpoint` / `optimizer`）与采用 `ebdfc8c`、仍支持字段 CLI 的中间版本（`checkpointer` / `optim`）。下例需显式指定对应的中间版本提交，不能使用当前 0.4.0 的 `HEAD`。`native` 仅指中间版本的字段命名，不代表支持最终版 ConfigLoader。
 
-准备两个分别固定到上述 commit 的 TorchTitan 源码目录，使用同一套 CANN、PyTorch、torch-npu 与输入数据，从仓库根目录执行：
+准备与两侧提交分别匹配的 TorchTitan 源码目录，使用可兼容的 CANN、PyTorch、torch-npu 与相同输入数据。从仓库根目录执行，先设置实际的中间版本提交：
 
 ```bash
 export HF_ASSETS_PATH=/path/to/tokenizer
 export OLD_TORCHTITAN=/path/to/torchtitan-dc3985ad
 export NEW_TORCHTITAN=/path/to/torchtitan-ebdfc8c
+: "${INTERMEDIATE_REF:?Set the intermediate repository commit using ebdfc8c and field CLI}"
 export RUNNER=examples/deepseek_v4/debug/deepseek_v4_flash_8p_cpt_4k_a3.sh
 
-python scripts/numerical_alignment/loss_compare.py 93f956c HEAD \
+python scripts/numerical_alignment/loss_compare.py 93f956c "$INTERMEDIATE_REF" \
     --runner "$RUNNER" --steps 100 --seq-len 4096 \
     --baseline-config-api legacy --test-config-api native \
     --baseline-upstream "$OLD_TORCHTITAN" --test-upstream "$NEW_TORCHTITAN"
@@ -155,11 +158,10 @@ python scripts/numerical_alignment/loss_compare.py \
 
 #### 比较不同训练参数或 runner
 
-```bash
-# 只改 test 的学习率
-python scripts/numerical_alignment/loss_compare.py HEAD HEAD \
-    --mode close --test-options=--optimizer.lr=2e-5
-```
+比较不同学习率时，在两侧 Python recipe 的对应 optimizer Config 中分别设置 `lr`。
+`loss_compare.py` 的训练命令生成仍使用旧字段 CLI，尚未适配 TorchTitan 0.4.0 的
+ConfigLoader；本节训练命令仅适用于保留该接口的历史版本。当前版本应通过 recipe
+分别运行两侧训练，再比较 TensorBoard 中完整精度的逐步指标。
 
 常用参数：
 

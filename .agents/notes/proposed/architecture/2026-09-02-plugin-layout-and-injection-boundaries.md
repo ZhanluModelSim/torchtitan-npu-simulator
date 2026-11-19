@@ -114,3 +114,7 @@ torchtitan_npu.distributed.utils
 ## Risks
 
 上游 API 漂移、导入顺序变化和错误的依赖判断都可能导致注册时机、checkpoint、分布式路径、性能或数值回归。
+
+## Muon 配置归属
+
+V4/V4.1 的 Muon 参数匹配、compute layout 和 bucket 配置生成函数放在对应模型的 recipe 文件，沿用上游 recipe 组织方式。仅迁移配置定义和调用路径，不改变分组、布局、超参数及更新行为。通用 layout 构造能力和 Engram 优化器类型留在插件，插件不反向导入 recipe。

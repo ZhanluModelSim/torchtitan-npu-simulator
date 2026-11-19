@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from typing import Annotated, ClassVar, cast
 
 import tyro
+from torchtitan.components.optim import DistMuon
 from torchtitan.components.checkpointer.base import BaseCheckpointManager
 from torchtitan.config import derive
 from torchtitan.trainer import Trainer
@@ -127,11 +128,9 @@ class TrainerEx(Trainer):
                 validate_sdc_replay_config(self.sdc)
 
         def _post_init_optimizer(self) -> None:
-            # Overrides may already have materialized and replaced the CLI schema.
             if not isinstance(self.optim.optimizer, OptimizerConfig):
                 return
-            self.optim.optimizer.materialize()
-            if self.optim.optimizer.name == "Muon" and (
+            if any(isinstance(optimizer, DistMuon.Config) for optimizer in self.optim.optimizer.optimizers) and (
                 self.parallelism.tensor_parallel_degree > 1 or self.parallelism.pipeline_parallel_degree > 1
             ):
                 raise ValueError(
@@ -218,8 +217,8 @@ class TrainerEx(Trainer):
                 # state container, keeping optimizer-state offload opt-in.
                 # Deriving here rather than in Config.__post_init__ keeps
                 # config rebuilds (dataclasses.replace) on the plain schema,
-                # and materialize() has already baked the Muon profile into
-                # upstream param-group fields; the carrier-field guard keeps
+                # and recipes already provide the final optimizer groups;
+                # the carrier-field guard keeps
                 # foreign schemas (e.g. TorchFT) on their own containers.
                 from torchtitan_npu.extensions.torchtitan.components.optimizer.optimizer import (
                     HostSparseOptimizersContainer,

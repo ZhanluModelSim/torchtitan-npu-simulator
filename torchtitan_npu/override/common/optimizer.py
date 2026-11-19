@@ -718,7 +718,7 @@ class CpuOffloadHostSparseOptimizersContainer(  # pyrefly: ignore [inconsistent-
     """Stage dense updates on NPU while retaining CPU sparse-table updates."""
 
     # CpuOffload goes first to own staging/channel setup; Config puts
-    # HostSparse first so materialize() keeps SparseAdam groups ahead of Muon.
+    # Preserve the HostSparse container for recipe-owned SparseAdam groups.
     @dataclass(kw_only=True, slots=True)
     class Config(HostSparseOptimizersContainer.Config, CpuOffloadOptimizersContainer.Config):
         pass

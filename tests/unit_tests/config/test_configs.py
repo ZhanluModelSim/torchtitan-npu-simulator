@@ -21,7 +21,6 @@ import torchtitan_npu.config as npu_config
 import torchtitan_npu.extensions.torchtitan.trainer as trainer_module
 from torchtitan_npu.config import (
     ExtensionConfig,
-    MuonOptimizerProfile,
     OptimConfig,
     OptimizerConfig,
     QuantizationExtensionConfig,
@@ -81,7 +80,6 @@ def test_config_manager_adapts_standard_component_configs_without_changing_value
     assert isinstance(config.training.extension, TrainingExtensionConfig)
     assert config.training.extension.allow_hf32 is True
     assert isinstance(config.optim.optimizer, OptimizerConfig)
-    assert config.optim.optimizer.name == "AdamW"
     for config_field in fields(Trainer.Config):
         if config_field.name in ("optim", "profiler", "training", "checkpointer"):
             continue
@@ -313,89 +311,6 @@ def test_kv_norm_quantization_config_validates_its_format():
 
     with pytest.raises(ValueError, match="format must be None or one of: mxfp8"):
         KVNormQuantizationConfig(format="fp8")  # pyrefly: ignore [bad-argument-type]
-
-
-def test_config_manager_materializes_muon_from_cli(monkeypatch, tmp_path):
-    module_name = "_torchtitan_npu_muon_config_registry"
-    profile = MuonOptimizerProfile(
-        muon_pattern=r"matrix\\.weight",
-        optimizer_factory_kwargs={
-            "DistMuon": {
-                "compute_sharding_by_fqn": {},
-                "bucket_configs": (),
-            }
-        },
-    )
-
-    def test_config() -> TrainerEx.Config:
-        return TrainerEx.Config(
-            model=_debug_model(),
-            hf_assets_path=str(tmp_path),
-            optim=OptimConfig(
-                optimizer=OptimizerConfig(
-                    _muon_profile=profile,
-                    _optimizer_defaults={
-                        "Muon": [
-                            profile.optimizer_config_type(
-                                pattern=profile.muon_pattern,
-                                **profile.optimizer_factory_kwargs["DistMuon"],
-                            ),
-                            AdamW.Config(pattern=r".*", foreach=False),
-                        ],
-                    },
-                )
-            ),
-        )
-
-    _install_config_registry(monkeypatch, module_name, test_config)
-
-    config = ConfigManager().parse_args(
-        [
-            "--module",
-            module_name,
-            "--config",
-            "test_config",
-            "--optim.optimizer.name",
-            "Muon",
-            "--optim.optimizer.lr",
-            "2.2e-4",
-            "--optim.optimizer.weight_decay",
-            "0.1",
-            "--optim.optimizer.muon_momentum",
-            "0.95",
-            "--optim.optimizer.muon_enable_nesterov",
-            "--optim.optimizer.muon_ns_steps",
-            "10",
-            "--optim.optimizer.muon_adjust_lr_fn",
-            "match_rms_adamw",
-        ]
-    )
-
-    assert config.optim.optimizer.name == "Muon"
-    assert len(config.optim.optimizer.optimizers) == 2
-    muon_group, adamw_group = config.optim.optimizer.optimizers
-    assert type(muon_group).__qualname__ == "DistMuon.Config"
-    assert muon_group.lr == pytest.approx(2.2e-4)
-    assert muon_group.momentum == pytest.approx(0.95)
-    assert muon_group.nesterov is True
-    assert muon_group.ns_steps == 10
-    assert isinstance(adamw_group, AdamW.Config)
-    assert adamw_group.foreach is False
-
-
-def test_config_manager_accepts_adamw_from_cli(monkeypatch, tmp_path):
-    module_name = "_torchtitan_npu_adamw_config_registry"
-
-    def test_config() -> TrainerEx.Config:
-        return TrainerEx.Config(model=_debug_model(), hf_assets_path=str(tmp_path))
-
-    _install_config_registry(monkeypatch, module_name, test_config)
-
-    config = ConfigManager().parse_args(
-        ["--module", module_name, "--config", "test_config", "--optim.optimizer.name", "AdamW"]
-    )
-
-    assert config.optim.optimizer.name == "AdamW"
 
 
 def test_config_package_does_not_reexport_trainer_config():

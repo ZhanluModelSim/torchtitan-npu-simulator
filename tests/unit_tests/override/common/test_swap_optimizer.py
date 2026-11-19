@@ -1322,7 +1322,6 @@ def test_hostsparse_schema_keeps_sparse_lifecycle_under_npu_state(monkeypatch) -
     combined container must resolve the offload-aware dense-gradient clip
     correction (``_scale_dense_gradients``).
     """
-    from torchtitan_npu.config.configs import TrainingConfig
     from torchtitan_npu.extensions.torchtitan import trainer as trainer_module
     from torchtitan_npu.extensions.torchtitan.components.optimizer.optimizer import HostSparseOptimizersContainer
     from torchtitan_npu.extensions.torchtitan.trainer import TrainerEx

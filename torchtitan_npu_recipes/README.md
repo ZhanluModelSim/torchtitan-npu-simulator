@@ -1,6 +1,6 @@
 # TorchTitan-NPU Python recipes
 
-本包保存返回完整 `Trainer.Config` 的训练组合。模型、Muon profile、数据转换函数和 trainer/engine 实现保留在 `torchtitan_npu`；recipe 选择并组合这些实现。
+本包保存返回完整 `Trainer.Config` 的训练组合，并定义模型对应的 Muon 参数匹配、compute layout 和 bucket 配置。模型、通用 layout 构造能力、数据转换函数和 trainer/engine 实现保留在 `torchtitan_npu`；recipe 选择并组合这些实现。
 
 | 入口 | 配置归属 |
 | --- | --- |

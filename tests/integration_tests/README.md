@@ -42,7 +42,7 @@ python -m tests.integration_tests.run_tests \
 
 ### 1.2 冒烟测试全景矩阵（1~4 卡）
 
-4die 冒烟测试及专项验证包含以下 Suite：
+以下为已注册 Suite 的用途，不表示所有用例均已完成 0.4.0 迁移。实际执行还受 runner 的迁移门禁和硬件条件限制：
 * **`models`**：DeepSeek-V4、DeepSeek-V4.1 多卡基础训练冒烟与 Loss 对齐校验；
 * **`deepseek_v4_checkpoint`**：DeepSeek-V4 分布式断点续训两阶段比对；
 * **`deepseek_v4_quantized`**：DeepSeek-V4 Block-FP8 量化（需 Ascend 950 芯片）；
@@ -51,7 +51,7 @@ python -m tests.integration_tests.run_tests \
 * **`deepseek_v4_1_quantized`**：DeepSeek-V4.1 Block-FP8 LoRA 专项验证，需支持的设备和运行时；
 * **`deepseek_v4_1_golden`**：DeepSeek-V4.1 golden 用例，30 步参考 Loss 逐值比对；同时纳入默认 `models` suite；
 * **`deepseek_v4_1_fused`**：DeepSeek-V4.1 多模态打包/融合与 Muon 冒烟，需 vision fixture，单独运行；
-* **`deepseek_v4_1_engram_hf`**：DeepSeek-V4.1 Engram MXFP8 专项校验与 DCP/HF 权重回环测试。
+* **`deepseek_v4_1_engram_hf`**：Engram MXFP8 与 DCP/HF 回环测试的旧入口，尚未迁移，见[迁移状态](#engram-hf-专项验证迁移状态)。
 
 本轮 Router / MoE 重构的 NPU golden 验收范围为 `TP=1 / CP=1 / PP=1`、两卡 `FSDP2 / EP2`。保留的 Gloo TP2 CPU 测试只验证通用布局与计数合同，不表示 NPU TP2 支持。当前 NPU runtime 对非 gather 维度分片的 DTensor 存在 gather backward 全局形状未局部化及输入形状缓存键遗漏问题；其修复与 NPU TP2 复现测试已拆出，本轮不包含该修复。
 
@@ -66,12 +66,15 @@ python -m tests.integration_tests.run_tests ./test_reports/v41-reference-mm \
 
 #### 核心用例清单矩阵
 
+表格说明用例设计；迁移门禁会跳过部分多模态、Muon LoRA/CP、原生 CPU-offload 和 EMA 用例。是否注册、是否被跳过与是否运行通过是不同状态，按 `run_tests.py` 的实际输出判断。
+
 | Case 名称 | 对应模型 | 并行配置 | 卡数 (ngpu) | Check Loss | 核心校验点与说明 |
 | :--- | :--- | :--- | :---: | :---: | :--- |
 | **`dsv4_golden_1rank`** | DeepSeek-V4 | 1 Rank 参考配置 | 1 | **是** | 严格 Deterministic 模式，精确逐值比对参考 Loss |
 | **`dsv4_golden_ep2_fsdp2`** | DeepSeek-V4 | EP2 + FSDP2 | 2 | **是** | 分布式并行环境下的数值 Loss 精确比对 |
 | **`dsv41_golden_2p_ep2_fsdp2`** | DeepSeek-V4.1 | Golden recipe、EP2 + FSDP2、30 steps | 2 | **是** | V4.1 text debug model，30 步参考 Loss 精确逐值比对 |
 | **`dsv4_checkpoint_resume_ep2_fsdp2`** | DeepSeek-V4 | EP2 + FSDP2 + AdamW NovaSwap | 2 | **动态比对** | 两阶段连续训练 vs 断点恢复训练，逐步比对 Loss 与 Grad Norm |
+| **`dsv4_muon_checkpoint_resume_ep2_fsdp2`** | DeepSeek-V4 | EP2 + FSDP2 + Muon / AdamW NovaSwap | 2 | **动态比对** | 参考 attention，开启 indexer 辅助损失，逐值比较恢复后的 Loss 与 Grad Norm |
 | **`dsv4_lora_ep2_fsdp2`** | DeepSeek-V4 LoRA | EP2 + FSDP2，训练 LoRA A/B | 2 | 否 | 校验基座参数冻结、Adapter 权重更新及 PEFT 导出完整性 |
 | **`dsv41_lora_engram_ep2_fsdp2`** | DeepSeek-V4.1 LoRA | EP2 + FSDP2、FullAC、AdamW | 2 | 否 | 校验基座与 Engram 冻结、adapter 更新及 PEFT 导出 |
 | **`dsv41_lora_multimodal_ep2_fsdp2`** | DeepSeek-V4.1 LoRA | EP2 + FSDP2、FullAC、图像 patch + C4 文本 | 2 | 否 | 校验实际 vision forward、vision/Engram 冻结、adapter 更新及 PEFT 导出 |
@@ -90,7 +93,7 @@ python -m tests.integration_tests.run_tests ./test_reports/v41-reference-mm \
 #### 1. 精度对齐判定原则：`use_golden` 与 `check_loss`
 集成测试严格区分**算子实现选择**与**数值精确对齐**两个独立维度：
 * **`use_golden`**：决定模型使用参考实现（DeepSeek-V4 为模型默认内核，即 attn-gym `gather_attn`；V4.1 为同一入口的 reference override 组合），还是使用 SMLA / NPU 专用算子优化 override；
-* **`check_loss`**：决定是否启用确定性计算（`--debug.deterministic`）、固定随机种子，并严格读取参考基准 Loss 执行逐值比对。
+* **`check_loss`**：决定是否严格读取参考基准 Loss 执行逐值比对。Python recipe 用例还需在工厂中显式设置 `config.debug.deterministic=True` 和固定随机种子。
 
 **判定规则**：
 1. 设置 `check_loss=True` 的用例（如 Golden 用例与 DSA 对齐用例），会自动比对 TensorBoard 中的标量 `loss_metrics/global_avg_loss`，**要求执行步骤集合和每一个浮点数值均严格相等（不允许浮点容差）**；
@@ -100,13 +103,24 @@ python -m tests.integration_tests.run_tests ./test_reports/v41-reference-mm \
 * **DCP 动态断点续训比对 (`dsv4_checkpoint_resume_ep2_fsdp2`)**：
   采用**两阶段动态自校验**设计，严格验证在分布式 AdamW NovaSwap 场景下的 Checkpoint 保存与恢复一致性：
   - **阶段一（连续基准）**：固定 `seed=42` 开启确定性模式，连续训练 4 步，并在 step 2 保存完整 DCP Checkpoint；
-  - **阶段二（续训恢复）**：新进程通过 `--checkpoint.load-step=2` 加载 step 2 权重，继续训练第 3、4 步；
+  - **阶段二（续训恢复）**：新进程通过 `--resume-step=2` 加载 step 2 权重，继续训练第 3、4 步；
   - **断言比对**：比对两次运行在 TensorBoard 中的 `global_avg_loss` 与 `grad_norm`。第 3、4 步数值必须逐值精确相等，不舍入、不设容差。
   ```bash
   python -m tests.integration_tests.run_tests ./test_reports/lora-resume \
     --test_suite deepseek_v4_checkpoint \
     --test_name dsv4_checkpoint_resume_ep2_fsdp2 \
     --ngpu 2
+  ```
+
+* **Muon + AdamW NovaSwap 续训 (`dsv4_muon_checkpoint_resume_ep2_fsdp2`)**：
+  复用上述 4-step、第 2 步保存及新进程恢复流程，使用参考 attention，默认开启 indexer 辅助损失
+  （`coeff=1e-3`）。序列长度为 128，indexer Top-K 为 8，不冻结 indexer；恢复后的第 3、4 步
+  loss 和 grad_norm 必须与连续训练逐值相等。此用例位于既有 `deepseek_v4_checkpoint` suite，
+  沿用该 suite 的独立执行方式。
+  ```bash
+  python -m tests.integration_tests.run_tests ./test_reports/muon-resume \
+    --test_suite deepseek_v4_checkpoint \
+    --test_name dsv4_muon_checkpoint_resume_ep2_fsdp2 --ngpu 2 --no-parallel
   ```
 
 * **LoRA 训练与 PEFT 导出 (`dsv4_lora_ep2_fsdp2`)**：
@@ -128,16 +142,7 @@ python -m tests.integration_tests.run_tests ./test_reports/v41-reference-mm \
     --ngpu 2
   ```
 
-* **Engram HF 专项验证（超节点）**：
-  在具备 Engram MXFP8 Host 通信环境的超节点上，验证 V4.1 Engram 参数在原生 DCP 与 FP32 HF 权重格式之间的双向回环保存与恢复一致性：
-  ```bash
-  HF_ASSETS_PATH=/path/to/v41-tokenizer \
-  ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 \
-  python -m tests.integration_tests.run_tests /tmp/engram-hf-output \
-    --test_suite deepseek_v4_1_engram_hf \
-    --ngpu 4 --no-parallel
-  ```
-  成功执行后控制台输出 `HF_ROUNDTRIP PASS`。
+* **Engram HF 专项验证**：旧入口尚未完成 0.4.0 迁移，不能作为当前可执行示例，详见[迁移状态](#engram-hf-专项验证迁移状态)。
 
 #### 3. 4die 并发调度（`GPUPool`）、实际耗时汇总与通信端口防冲突
 当执行包含多个用例的套件时，`run_tests` 默认复用 TorchTitan 的 `GPUPool` 机制并发执行测试，自动按卡号切分：
@@ -181,6 +186,8 @@ python -m tests.integration_tests.run_tests /tmp/v41_muon_adapter_resume \
 ---
 
 ## 二、集群 Nightly 全量用例测试（A3 / A5 真实集群）
+
+> Nightly 的现有用例和多机 runner 仍有旧字段 CLI，尚未完成 0.4.0 配置迁移。下述调度命令保留供维护参考，不能视为当前训练已可运行。单机 Python recipe 验证使用上文 `run_tests` 入口。
 
 ### 2.1 测试矩阵与规格定义
 
@@ -239,47 +246,55 @@ Nightly 用例统一存放于：
 | **`test_name`** | `str` | 用例唯一标识（不可重复，用于 GitHub Matrix 调度命名与结果报告） |
 | **`nnodes`** | `int` | 所需节点数（单机写 `1`，双机写 `2`） |
 | **`ngpu`** | `int` | 单节点卡数（通常为 `8`） |
-| **`override_args`** | `dict` | 传给训练启动脚本的命令行参数（覆盖默认 toml 配置） |
-| **`env_vars`** | `dict` | 运行时环境变量（CANN 脚本路径、模型权重路径、优化器覆盖等） |
-| **`expected_steps`** | `int` | 预期训练步数（用于 TensorBoard 与日志断言） |
+| **`override_args`** | `Sequence[Sequence[str]]` | 各阶段启动参数。Python recipe 用例只传 ConfigLoader 支持的选项 |
+| **`env_vars`** | `Mapping[str, str]` | 运行资源及 recipe 读取的环境变量，如 `MODULE`、`CONFIG` 和资源路径 |
+| **`expected_steps`** | `Sequence[Sequence[int]]` | 各阶段预期的训练步骤序列 |
+| **`python_config`** | `bool` | 标记 Python recipe 用例，单机 runner 使用 `--output-dir` 等原生启动参数 |
 
 #### 步骤三：代码编写模板
-打开 `tests/integration_tests/nightly_all_models_test/a3_8p_tests.py`，在 `build_test_list()` 中添加新的用例定义：
+
+训练参数应放在返回完整配置的 Python 工厂中，下面展示单机用例结构。
+例如先在 `my_recipes.py` 定义工厂：
 
 ```python
-from torchtitan_npu.testing.framework import OverrideDefinitions
+from torchtitan_npu_recipes.examples.deepseek_v4 import deepseek_v4_flash_8p_cpt_4k_a3_eager
+
+
+def nightly_five_steps():
+    config = deepseek_v4_flash_8p_cpt_4k_a3_eager()
+    config.training.steps = 5
+    config.metrics.enable_tensorboard = True
+    config.metrics.log_freq = 1
+    config.metrics.save_tb_folder = "tb_phase_0"
+    return config
+```
+
+用例从实际的 `tests.integration_tests` 导入 `OverrideDefinitions`：
+
+```python
+from tests.integration_tests import OverrideDefinitions
+
 
 def build_test_list():
-    tests = [
-        # 现有用例...
-
-        # 新增用例示例：
+    return [
         OverrideDefinitions(
             test_name="dsv4_flash_a3_8p_my_feature",
+            test_descr="V4 Flash eager five-step recipe",
             nnodes=1,
             ngpu=8,
-            override_args={
-                "--job.config_file": "torchtitan_npu/models/deepseek_v4/train_configs/dsv4_flash_8p.toml",
-                "--training.steps": "5",
-                "--training.batch_size": "1",
-            },
-            env_vars={
-                # 必填：执行机上的 CANN 环境配置脚本
-                "ASCEND_SET_ENV_PATH": "/mnt/share/Ascend/ascend-toolkit/latest/set_env.sh",
-                # 必填：Tokenizer 与模型资产路径
-                "HF_ASSETS_PATH": "/mnt/share/models/DeepSeek-V4-Flash-bf16",
-                # 必填：权重 Checkpoint 路径
-                "CKPT_INIT_LOAD_PATH": "/mnt/share/dsv4_ckpt_8rank",
-                # 可选：如果使用 Virtual Optimizer 优化 AdamW 显存占用
-                "OPTIMIZER_OVERRIDES": "torchtitan_npu.override.common.optimizer.virtual",
-                # 可选：设置共享 Hugging Face 缓存，防止 Docker 满盘
-                "HF_HOME": "/mnt/share/ci_tests/.lite-actions-hf-cache",
-            },
-            expected_steps=5,
+            python_config=True,
+            check_loss=False,
+            override_args=[()],
+            train_script="examples/deepseek_v4/debug/deepseek_v4_flash_8p_cpt_4k_a3.sh",
+            env_vars={"MODULE": "my_recipes", "CONFIG": "nightly_five_steps"},
+            expected_steps=(tuple(range(1, 6)),),
         ),
     ]
-    return tests
 ```
+
+执行前准备 CANN 和 HF 资源路径。将工厂与用例放入实际可导入的模块后，
+可使用单机 `run_tests` 验证。多机 Nightly runner 仍需独立迁移其旧字段参数，
+仅修改用例定义或通过 `inspect` 不代表多机启动已经适配。
 
 #### 步骤四：本地静态语法与元数据解析自测（无需 NPU）
 在提交代码前，在普通的 CPU 开发机环境下执行 `inspect` 子命令，验证用例语法与参数是否合法：
@@ -329,21 +344,8 @@ gh workflow run a3_16p_lite_actions.yml -R torchtitan-npu/torchtitan-npu --ref m
 
 ---
 
-## Engram HF 专项验证
+## Engram HF 专项验证迁移状态
 
-在支持 Engram MXFP8 Host 通信的超节点上激活 CANN、torch extension 和训练环境，准备 V4.1 tokenizer assets 后执行：
+`deepseek_v4_1_engram_hf` 仍保留注册，但 `run_engram_hf.sh` 使用旧字段 CLI 和旧 override 环境变量，不能直接用于当前 ConfigLoader。该入口不能以「suite 存在」视为验证通过，也不能仅替换参数名称后执行。
 
-```bash
-HF_ASSETS_PATH=/path/to/v41-tokenizer \
-ASCEND_RT_VISIBLE_DEVICES=0,1,2,3 \
-python -m tests.integration_tests.run_tests /tmp/engram-hf-output \
-  --test_suite deepseek_v4_1_engram_hf --ngpu 4 --no-parallel
-```
-
-输出目录使用新目录。该 suite 包含 EP4/FSDP4 及 EP2×EFSDP2 联合分片两项用例，均为 V4.1 debug text、四卡、eager、seq512、GBS4，启用 Engram MXFP8 override，关闭普通模型 FP8 和 optimizer CPU offload。使用仓内 C4 数据及自动生成的微型 HF fixture，不需要正式模型权重。
-
-先训练两步并保存同一模型的原生 DCP 和 FP32 HF 权重，再各自通过真实 CheckpointManager 初始化模型，使用相同的新优化器和数据种子训练三步。每个 rank 校验加载后的 Engram 参数及 MXFP8 缓存/scale 有效行字节，随后对比 TensorBoard loss/grad_norm。失败会使测试返回非零，成功输出 `HF_ROUNDTRIP PASS`。不读取固定 golden，不验证优化器状态续训，也不覆盖正式整包非 Engram 量化权重的导入。
-
-仅验证 Engram 联合分片 HF 路径时，在上述命令追加
-`--test_name dsv41_engram_mxfp8_hf_ep2_efsdp2`。该用例保持相同的 native/HF
-加载后参数、MXFP8 缓存及三步 loss/grad_norm 精确比较，不加入默认 CI smoke。
+原用例设计覆盖四卡 EP4/FSDP4 与 EP2×EFSDP2：保存原生 DCP 和 FP32 HF 权重，检查 Engram 参数、MXFP8 缓存及加载后的训练指标。迁移需同步 Python recipe、checkpoint 调用接口和结果采集；完成运行验证后再恢复使用命令。当前 Muon / AdamW NovaSwap 续训使用上文已迁移的 `deepseek_v4_checkpoint` suite。

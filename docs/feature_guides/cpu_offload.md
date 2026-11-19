@@ -1,5 +1,7 @@
 # CPU Offload - 权重与梯度 CPU 常驻，优化器状态可选 CPU/NPU 驻留面
 
+> **启动接口说明：** 本文保留旧字段 CLI 的配置示例，不能直接追加到 TorchTitan 0.4.0 启动命令。当前训练参数在 Python recipe 中设置，见 [Python 配置指南](../developer_guides/python_recipes.md)。下文历史命令及支持记录不代表当前依赖下的对应组合已经完成验证。
+
 ## 背景与挑战
 
 在大规模分布式训练中，模型参数、梯度和优化器状态全部驻留 NPU HBM，显存占用为三者的总和。对于 MoE 模型（如 DeepSeek-V4），仅参数和梯度就可达数百 GB，远超单卡 HBM 容量。

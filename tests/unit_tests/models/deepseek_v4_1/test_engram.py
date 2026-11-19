@@ -338,13 +338,26 @@ def test_image_tokens_reset_hash_history_and_receive_no_residual_gradient():
 
 @pytest.mark.parametrize("optimizer", ["AdamW", "Muon"])
 def test_explicit_disable_preserves_selected_optimizer(optimizer):
-    trainer = replace(deepseek_v4_1_debugmodel_multimodal(), engram_enabled=False)
-    trainer.optim.optimizer.name = optimizer
+    from torchtitan_npu.extensions.torchtitan.components.optimizer.muon import DistMuon as NpuDistMuon
+    from torchtitan_npu_recipes.models.deepseek_v4_1 import _v41_muon_profile, deepseek_v4_1_debugmodel_text
+
+    trainer = deepseek_v4_1_debugmodel_text()
+    if optimizer == "Muon":
+        profile = _v41_muon_profile(trainer.model)
+        trainer.optim.optimizer.optimizers = [
+            trainer.optim.optimizer.optimizers[0],
+            NpuDistMuon.Config(
+                pattern=profile.muon_pattern,
+                compute_sharding_by_fqn=profile.compute_sharding_by_fqn,
+                bucket_configs=profile.bucket_configs,
+                lr=1e-5,
+            ),
+            AdamW.Config(pattern=r".*"),
+        ]
+    trainer = replace(trainer, engram_enabled=False)
     trainer.training.num_tokens_per_microbatch_per_dp_rank = 512
     assert all(layer.engram is None for layer in trainer.model.layers)
     assert type(trainer.optim.optimizer) is OptimizerConfig
-    assert trainer.optim.optimizer.name == optimizer
-    trainer.optim.optimizer.materialize()
     groups = trainer.optim.optimizer.optimizers
     expected_types = [DistMuon.Config, AdamW.Config] if optimizer == "Muon" else [AdamW.Config]
     assert len(groups) == len(expected_types)

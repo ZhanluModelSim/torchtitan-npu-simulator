@@ -13,7 +13,11 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor, Shard
 from torch.distributed.tensor.placement_types import _StridedShard
 from torch.testing._internal.distributed.fake_pg import FakeStore
+from torchtitan.components.optim import AdamW
 from torchtitan.distributed.flex_shard.dist_muon import _resolve_storage_to_compute_transition
+
+from torchtitan_npu.config import OptimizerConfig
+from torchtitan_npu.extensions.torchtitan.components.optimizer.muon import DistMuon
 
 
 @pytest.fixture
@@ -45,8 +49,19 @@ def test_recipe_expert_layout_preserves_ep_ownership_during_row_redistribution(
     sparse_storage_mesh, module, recipe, projection, global_shape, local_shape, row_axis
 ):
     config = getattr(importlib.import_module(module), recipe)()
-    config.optim.optimizer.name = "Muon"
-    config.optim.optimizer.materialize()
+    recipes = importlib.import_module(module)
+    profile = (recipes._dsv4_muon_profile if "_v4_1" not in module else recipes._v41_muon_profile)(config.model)
+    config.optim.optimizer = OptimizerConfig(
+        optimizers=[
+            DistMuon.Config(
+                pattern=profile.muon_pattern,
+                compute_sharding_by_fqn=profile.compute_sharding_by_fqn,
+                bucket_configs=profile.bucket_configs,
+                lr=1e-5,
+            ),
+            AdamW.Config(pattern=r".*"),
+        ]
+    )
     fqn = f"layers.0.feed_forward.routed_experts.{projection}.weight"
     optimizer_config = next(
         owner for owner in config.optim.optimizer.optimizers if hasattr(owner, "compute_sharding_by_fqn")

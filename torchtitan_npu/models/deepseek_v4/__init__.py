@@ -40,6 +40,9 @@ from .mtp import (
     DeepSeekV4MTPTransformerBlock,
     MTPLoss,
 )
+from .state_dict_adapter import DeepSeekV4StateDictAdapter
+
+DeepSeekV4Model.state_dict_adapter_cls = DeepSeekV4StateDictAdapter
 
 if TYPE_CHECKING:
     from torchtitan.models.common.moe import MoE

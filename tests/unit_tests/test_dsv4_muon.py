@@ -13,7 +13,7 @@ from torchtitan.distributed.flex_shard import BlockShard
 from torchtitan.distributed.parallelism_context import MeshAxisName
 
 from torchtitan_npu.models.deepseek_v4 import model_registry
-from torchtitan_npu.models.deepseek_v4.muon import _dsv4_muon_profile
+from torchtitan_npu_recipes.models.deepseek_v4 import _dsv4_muon_profile
 
 _ROOT = Path(__file__).resolve().parents[2]
 
@@ -40,24 +40,36 @@ def test_d2h_swap_cleanup_warns_before_releasing_the_pinned_buffer():
 def test_dsv4_muon_profile_uses_validated_phase_one_policy():
     from torchtitan.components.optim import AdamW
 
+    from torchtitan_npu.config import OptimizerConfig
     from torchtitan_npu.extensions.torchtitan.components.optimizer.muon import DistMuon
     from torchtitan_npu_recipes.models.deepseek_v4 import deepseek_v4_debugmodel
 
     config = deepseek_v4_debugmodel()
     optimizer = config.optim.optimizer
-    assert optimizer.name == "AdamW"
     assert len(optimizer.optimizers) == 1 and isinstance(optimizer.optimizers[0], AdamW.Config)
-    optimizer.name = "Muon"
-    optimizer.materialize()
+    profile = _dsv4_muon_profile(config.model)
+    optimizer = OptimizerConfig(
+        optimizers=[
+            DistMuon.Config(
+                pattern=profile.muon_pattern,
+                compute_sharding_by_fqn=profile.compute_sharding_by_fqn,
+                bucket_configs=profile.bucket_configs,
+                lr=1e-5,
+                ns_steps=10,
+                adjust_lr_fn="match_rms_adamw",
+            ),
+            AdamW.Config(pattern=r".*", lr=1e-5, eps=1e-8, fused=True, foreach=False),
+        ],
+    )
     muon, adamw = optimizer.optimizers
     assert isinstance(muon, DistMuon.Config) and isinstance(adamw, AdamW.Config)
     assert muon.momentum == 0.95 and muon.ns_steps == 10
     assert adamw.betas == (0.9, 0.95) and adamw.eps == 1e-8
-    assert muon.pattern == optimizer._muon_profile.muon_pattern
+    assert muon.pattern == _dsv4_muon_profile(config.model).muon_pattern
 
 
 def test_dsv4_unified_muon_policy_follows_paper_parameter_split():
-    path = _ROOT / "torchtitan_npu/models/deepseek_v4/muon.py"
+    path = _ROOT / "torchtitan_npu_recipes/models/deepseek_v4.py"
     source = path.read_text()
     active_source = _function_source(path, "_dsv4_muon_profile")
 
@@ -68,7 +80,7 @@ def test_dsv4_unified_muon_policy_follows_paper_parameter_split():
     assert "BlockShard(dim=0" in source
 
     profile = _dsv4_muon_profile(model_registry("debugmodel"))
-    compute_shardings = profile.optimizer_factory_kwargs["DistMuon"]["compute_sharding_by_fqn"]
+    compute_shardings = profile.compute_sharding_by_fqn
     expert_layout = compute_shardings["layers.2.feed_forward.routed_experts.w13.weight"]
     assert all(isinstance(p, Shard) and p.dim == 0 for p in expert_layout.shardings_by_mesh_axis.values())
     assert set(expert_layout.shardings_by_mesh_axis) == {
@@ -80,7 +92,7 @@ def test_dsv4_unified_muon_policy_follows_paper_parameter_split():
     assert dict(expert_layout.shard_order_by_tensor_dim) == {
         0: (MeshAxisName.EP.value, MeshAxisName.EDP_SHARD.value),
     }
-    bucket_configs = profile.optimizer_factory_kwargs["DistMuon"]["bucket_configs"]
+    bucket_configs = profile.bucket_configs
     routed_expert_bucket = next(bucket for bucket in bucket_configs if bucket.name == "layers.2.routed-experts")
     assert all(".feed_forward.routed_experts." in fqn for fqn in routed_expert_bucket.patterns)
     for unified_muon_parameter in (
@@ -96,7 +108,7 @@ def test_dsv4_unified_muon_policy_follows_paper_parameter_split():
 def test_dsv4_muon_indexer_query_uses_per_head_block_sharding():
     model_spec = model_registry("debugmodel")
     profile = _dsv4_muon_profile(model_spec)
-    compute_shardings = profile.optimizer_factory_kwargs["DistMuon"]["compute_sharding_by_fqn"]
+    compute_shardings = profile.compute_sharding_by_fqn
 
     main_query_layout = compute_shardings["layers.2.attention.wq_b.weight"]
     indexer_query_layout = compute_shardings["layers.2.attention.indexer.wq_b.weight"]

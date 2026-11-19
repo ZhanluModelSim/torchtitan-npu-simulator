@@ -118,10 +118,10 @@ export PYTHONPATH="/path/to/custom/parent${PYTHONPATH:+:${PYTHONPATH}}"
 ```
 
 `/path/to/custom/parent` 必须直接包含 `torchao_npu/__init__.py`。使用仓内源码时，可将其
-替换为 `<torchtitan-npu>/experiments/torchao-npu`。通用训练脚本只透传量化 CLI，
-不会自动修改可选依赖路径。具体命令见快速上手中的
-[DeepSeek-V4](./quickstart.md#deepseek-v4-torchao-npu-低精度训练) 与
-[DeepSeek-V4.1](./quickstart.md#deepseek-v41-torchao-npu-低精度训练) 入口。
+替换为 `<torchtitan-npu>/experiments/torchao-npu`。通用训练脚本不会自动修改可选依赖路径。
+当前训练参数在 Python recipe 中设置，见[快速上手](./quickstart.md)和
+[Python 配置指南](../developer_guides/python_recipes.md)。量化配置含义及历史支持记录见
+[低精度训练](../feature_guides/low_precision_training.md)。
 
 ## PyPI 安装
 

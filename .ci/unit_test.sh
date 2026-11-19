@@ -44,7 +44,7 @@ export TORCH_DEVICE_BACKEND_AUTOLOAD=0
 export CXXFLAGS="${CXXFLAGS:-} -std=c++20"
 
 cd "${PROJECT_ROOT}"
-export PYTHONPATH="${PROJECT_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+export PYTHONPATH="${PROJECT_ROOT}:${TORCHTITAN_DIR}${PYTHONPATH:+:${PYTHONPATH}}"
 "${PYTHON_BIN}" -m pip install -r requirements-dev.txt
 
 _setup_torchtitan "${TORCHTITAN_DIR}"

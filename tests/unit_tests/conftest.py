@@ -45,7 +45,6 @@ collect_ignore = [
     "models/deepseek_v4_1/test_vision_layout.py",
     # Pre-0.4 CLI tests; the Python-recipe loader is covered by test_config_loader.py.
     "config/test_configs.py",
-    "config/test_muon_profile_contract.py",
     "models/common/test_deepseek_cp_config.py",
     "models/test_mtp_cp_chunk_loss.py",
     # CP metadata rebuild tests wait for the v0.4 context-parallel transform.
@@ -143,32 +142,13 @@ def pytest_collection_modifyitems(items):
                 is_vision = False
         if is_vision:
             item.add_marker(pytest.mark.skip(reason="vision migration is outside the current text migration"))
-        # These legacy suites still consume removed optimizer interfaces.
-        # Do not hide new Muon behavior tests by matching their names globally.
-        migrated_muon_config_test = (
-            relative_path == "models/common/test_lora_muon_profile.py"
-            and getattr(item, "originalname", item.name)
-            == "test_actual_lora_recipe_muon_groups_cover_adapters_with_layouts_and_unique_buckets"
-        )
         if (
-            not relative_path.startswith("config/")
-            and not migrated_muon_config_test
-            and (
-                (
-                    relative_path
-                    in {
-                        "extensions/cpu_offload/test_no_optimizer_state.py",
-                        "override/common/test_swap_optimizer.py",
-                        "models/common/test_lora_muon_profile.py",
-                    }
-                    and "muon" in item.name.lower()
-                )
-                or item.name.startswith(
-                    (
-                        "test_lora_training_freezes_engram_and_native_dcp_resumes",
-                        "test_v41_adapter_only_resume_restores_engram_and_next_step",
-                    )
-                )
+            relative_path == "extensions/cpu_offload/test_no_optimizer_state.py"
+            and item.name == "test_muon_checkpoint_roundtrip_steps_on_compute_device"
+        ) or item.name.startswith(
+            (
+                "test_lora_training_freezes_engram_and_native_dcp_resumes",
+                "test_v41_adapter_only_resume_restores_engram_and_next_step",
             )
         ):
             item.add_marker(pytest.mark.skip(reason="checkpoint/Muon migration is pending"))

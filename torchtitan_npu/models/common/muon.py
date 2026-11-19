@@ -42,9 +42,8 @@ def with_lora_compute_layouts(model: Module.Config, profile: MuonOptimizerProfil
     retain the expert axis. Projections outside the model's Muon policy,
     including the output head, keep the AdamW fallback.
     """
-    kwargs = dict(profile.optimizer_factory_kwargs["DistMuon"])
-    layouts = dict(kwargs["compute_sharding_by_fqn"])
-    buckets = list(kwargs["bucket_configs"])
+    layouts = dict(profile.compute_sharding_by_fqn)
+    buckets = list(profile.bucket_configs)
     factors = []
     for fqn, config, _, _ in model.traverse(Module.Config, recurse=True):
         if not (hasattr(config, "rank") and hasattr(config, "alpha")):
@@ -75,9 +74,9 @@ def with_lora_compute_layouts(model: Module.Config, profile: MuonOptimizerProfil
     # Layer wrappers preserve projection suffixes in the optimizer's raw FQNs.
     suffixes = {fqn.split(".", 2)[-1] for fqn in factors}
     lora_pattern = "|".join(re.escape(suffix) for suffix in sorted(suffixes))
-    kwargs.update(compute_sharding_by_fqn=layouts, bucket_configs=tuple(buckets))
     return replace(
         profile,
         muon_pattern=rf"(?:{profile.muon_pattern}|(?:{lora_pattern})$)",
-        optimizer_factory_kwargs={**profile.optimizer_factory_kwargs, "DistMuon": kwargs},
+        compute_sharding_by_fqn=layouts,
+        bucket_configs=tuple(buckets),
     )

@@ -5,9 +5,15 @@
 
 """Real model recipes select the typed Muon replica-dedup configuration."""
 
-import pytest
-from torchtitan.config import ConfigManager
+import importlib
+import sys
+import types
 
+import pytest
+from torchtitan.components.optim import AdamW
+from torchtitan.config import ConfigLoader
+
+from torchtitan_npu.config import OptimizerConfig
 from torchtitan_npu.extensions.torchtitan.components.optimizer.muon import DistMuon
 
 
@@ -19,28 +25,35 @@ from torchtitan_npu.extensions.torchtitan.components.optimizer.muon import DistM
     ],
 )
 @pytest.mark.parametrize("dedup", [False, True])
-def test_real_muon_recipe_selects_npu_config_and_propagates_replica_dedup(module, recipe, dedup, tmp_path):
-    args = [
-        "--module",
-        module,
-        "--config",
-        recipe,
-        "--hf_assets_path",
-        str(tmp_path),
-        "--optim.optimizer.name",
-        "Muon",
-    ]
-    if dedup:
-        args.append("--optim.optimizer.muon_enable_hsdp_replica_dedup")
+def test_real_muon_recipe_selects_npu_config_and_propagates_replica_dedup(module, recipe, dedup, monkeypatch, tmp_path):
+    def configured_recipe():
+        config = getattr(importlib.import_module(module), recipe)()
+        config.hf_assets_path = str(tmp_path)
+        recipes = importlib.import_module(module)
+        profile = (recipes._dsv4_muon_profile if "_v4_1" not in module else recipes._v41_muon_profile)(config.model)
+        config.optim.optimizer = OptimizerConfig(
+            optimizers=[
+                DistMuon.Config(
+                    pattern=profile.muon_pattern,
+                    compute_sharding_by_fqn=profile.compute_sharding_by_fqn,
+                    bucket_configs=profile.bucket_configs,
+                    lr=1e-5,
+                    enable_hsdp_replica_dedup=dedup,
+                ),
+                AdamW.Config(pattern=r".*"),
+            ]
+        )
+        return config
 
-    config = ConfigManager().parse_args(args)
+    registry = types.ModuleType("_optimizer_recipe")
+    registry.recipe = configured_recipe
+    monkeypatch.setitem(sys.modules, registry.__name__, registry)
+    config = ConfigLoader().load(["--module", registry.__name__, "--config", "recipe"])
 
     muons = [optimizer for optimizer in config.optim.optimizer.optimizers if type(optimizer) is DistMuon.Config]
     assert len(muons) == 1
     muon = muons[0]
     assert type(muon) is DistMuon.Config
     assert muon.enable_hsdp_replica_dedup is dedup
-    assert config.optim.optimizer._muon_profile.optimizer_config_type is DistMuon.Config
-    assert muon.pattern == config.optim.optimizer._muon_profile.muon_pattern
     assert muon.compute_sharding_by_fqn
     assert muon.bucket_configs

@@ -1,4 +1,5 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
+# Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
@@ -10,6 +11,7 @@ from dataclasses import fields
 from importlib import import_module
 from typing import TYPE_CHECKING, Any
 
+import torch
 from torchtitan.components.data import (
     ConcatThenSplitPackingConfig,
     FirstFitPackingConfig,
@@ -18,14 +20,18 @@ from torchtitan.components.data import (
     SingleDatasetConfig,
 )
 from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
-from torchtitan.components.optim import LRSchedulersContainer
+from torchtitan.components.optim import AdamW, LRSchedulersContainer
 from torchtitan.config.parallelism import ParallelismConfig
+from torchtitan.distributed.flex_shard import BlockShard, BucketConfig, ComputeLayout
+from torchtitan.distributed.parallelism_context import MeshAxisName
 from torchtitan.models.common.config_utils import decoder_vocab_size
+from torchtitan.models.deepseek_v4.compressor import SparseIndexerLoss
 from torchtitan.observability.metrics import MetricsProcessor
 
 from torchtitan_npu.config import (
     CompileConfig,
     ModelCompileConfig,
+    MuonOptimizerProfile,
     OptimConfig,
     OptimizerConfig,
     TrainingConfig,
@@ -34,16 +40,174 @@ from torchtitan_npu.extensions.torchtitan.components.checkpoint import Checkpoin
 from torchtitan_npu.extensions.torchtitan.tools.profiler import CANNProfiler
 from torchtitan_npu.extensions.torchtitan.trainer import TrainerEx
 from torchtitan_npu.models.common.alignment import AlignedTextProcessor, compression_alignment
+from torchtitan_npu.models.common.muon import make_expert_layout, make_owned_layout, with_lora_compute_layouts
 from torchtitan_npu.models.deepseek_v4 import model_registry
 from torchtitan_npu.models.deepseek_v4.chat_encoder import DSV4EncoderConfig
 from torchtitan_npu.models.deepseek_v4.chat_processor import DeepSeekV4ChatProcessor
 from torchtitan_npu.models.deepseek_v4.model import DeepSeekV4Model
 from torchtitan_npu.models.deepseek_v4.mtp import MTPChunkedLossWrapper
-from torchtitan_npu.models.deepseek_v4.muon import _dsv4_muon_profile, _dsv4_optimizer_config
 
 if TYPE_CHECKING:
     from torchtitan.config.transform import ModelConfigConverter
     from torchtitan.trainer import Trainer
+
+
+def _enable_indexer_aux_loss(model: DeepSeekV4Model.Config) -> None:
+    """Train the reference selector through its existing distillation loss."""
+    for layer in model.layers:
+        if layer.attention.indexer is not None:
+            inner = layer.attention.inner_attention
+            inner.aux_loss = SparseIndexerLoss.Config(
+                coeff=1e-3,
+                softmax_scale=inner.softmax_scale,
+                num_heads=layer.attention.n_heads,
+                compress_ratio=inner.compress_ratio,
+            )
+
+
+def _dsv4_muon_profile(model: DeepSeekV4Model.Config) -> MuonOptimizerProfile:
+    """Build the DSV4-owned parameter and FlexShard policy for Muon."""
+    model_config = model
+    # GraphTrainer SimpleFSDP flattens the dense DP mesh to "fsdp".
+    dense_dp_axes = (MeshAxisName.DP_SHARD.value, "fsdp")
+    owned = make_owned_layout(dense_dp_axes)
+    attention_shardings = {"wq_a": owned, "wkv": owned, "wo_b": owned}
+    attention_per_head_projections = ("wq_b", "wo_a")
+    attention_projections = tuple(attention_shardings) + attention_per_head_projections
+    expert_projections = ("w13", "w2")
+    routed_expert_projections = ("w13.weight", "w2.weight")
+    compressor_projections = ("wkv", "wgate")
+    indexer_projections = ("wq_b", "weights_proj")
+    hc_pre_modules = ("hc_attn_pre", "hc_ffn_pre")
+    mtp_projections = ("e_proj", "h_proj")
+
+    def compute_shardings_for_transformer_layer(
+        prefix: str,
+        layer_config: Any,
+        *,
+        include_mtp_projections: bool,
+    ) -> dict[str, ComputeLayout]:
+        attention = layer_config.attention
+        shardings = {
+            f"{prefix}.attention.{projection}.weight": compute_sharding
+            for projection, compute_sharding in attention_shardings.items()
+        }
+        shardings.update(
+            {f"{prefix}.feed_forward.shared_experts.{projection}.weight": owned for projection in expert_projections}
+        )
+        # ``wq_b`` stores one [head_dim, q_lora_rank] matrix per head flattened
+        # into [n_heads * head_dim, q_lora_rank]; ``wo_a`` stores one
+        # [o_lora_rank, per_group_in] matrix per group flattened likewise.
+        # BlockShard computes Muon on each per-head/per-group matrix.
+        shardings[f"{prefix}.attention.wq_b.weight"] = ComputeLayout(
+            shardings_by_mesh_axis={
+                axis: BlockShard(dim=0, block_sizes=(attention.head_dim,)) for axis in dense_dp_axes
+            },
+            compute_dtype=torch.bfloat16,
+        )
+        shardings[f"{prefix}.attention.wo_a.weight"] = ComputeLayout(
+            shardings_by_mesh_axis={
+                axis: BlockShard(dim=0, block_sizes=(attention.o_lora_rank,)) for axis in dense_dp_axes
+            },
+            compute_dtype=torch.bfloat16,
+        )
+        for compressor_name in ("compressor", "compressor_128"):
+            if getattr(attention, compressor_name, None) is not None:
+                for projection in compressor_projections:
+                    shardings[f"{prefix}.attention.{compressor_name}.{projection}.weight"] = owned
+                shardings[f"{prefix}.attention.{compressor_name}.ape"] = owned
+        expert_sharding = make_expert_layout(dense_dp_axes)
+        for projection in routed_expert_projections:
+            shardings[f"{prefix}.feed_forward.routed_experts.{projection}"] = expert_sharding
+        shardings[f"{prefix}.feed_forward.router.gate.weight"] = owned
+        for module in hc_pre_modules:
+            shardings[f"{prefix}.{module}.hc_fn"] = owned
+        indexer = layer_config.attention.indexer
+        if indexer is not None:
+            shardings[f"{prefix}.attention.indexer.wq_b.weight"] = ComputeLayout(
+                shardings_by_mesh_axis={
+                    axis: BlockShard(
+                        dim=0,
+                        block_sizes=(indexer.index_head_dim,),
+                    )
+                    for axis in dense_dp_axes
+                },
+                compute_dtype=torch.bfloat16,
+            )
+            shardings[f"{prefix}.attention.indexer.weights_proj.weight"] = owned
+            for projection in compressor_projections:
+                shardings[f"{prefix}.attention.indexer.compressor.{projection}.weight"] = owned
+            shardings[f"{prefix}.attention.indexer.compressor.ape"] = owned
+        if include_mtp_projections:
+            for projection in mtp_projections:
+                shardings[f"{prefix}.{projection}.weight"] = owned
+            shardings[f"{prefix}.hc_head.hc_fn"] = owned
+        return shardings
+
+    main_layer_shardings = tuple(
+        compute_shardings_for_transformer_layer(
+            f"layers.{layer_id}",
+            model_config.layers[layer_id],
+            include_mtp_projections=False,
+        )
+        for layer_id in range(model_config.n_layers)
+    )
+    mtp_layer_shardings = tuple(
+        compute_shardings_for_transformer_layer(
+            f"mtp_layers.{layer_id}",
+            layer_config,
+            include_mtp_projections=True,
+        )
+        for layer_id, layer_config in enumerate(model_config.mtp_layers or ())
+    )
+    per_layer = main_layer_shardings + mtp_layer_shardings
+    compute_sharding_by_fqn = {}
+    for layer_shardings in per_layer:
+        compute_sharding_by_fqn.update(layer_shardings)
+    compute_sharding_by_fqn["hc_head.hc_fn"] = owned
+    routed_expert_marker = ".feed_forward.routed_experts."
+
+    def bucket_configs_for_layers(
+        prefix: str,
+        layer_shardings: tuple[dict[str, ComputeLayout], ...],
+    ) -> tuple[BucketConfig, ...]:
+        layer_bucket_configs = []
+        for layer_id, shardings in enumerate(layer_shardings):
+            layer_name = f"{prefix}.{layer_id}"
+            routed_expert_patterns = tuple(fqn for fqn in shardings if routed_expert_marker in fqn)
+            dense_patterns = tuple(fqn for fqn in shardings if routed_expert_marker not in fqn)
+            layer_bucket_configs.append(BucketConfig(name=layer_name, patterns=dense_patterns))
+            layer_bucket_configs.append(
+                BucketConfig(
+                    name=f"{layer_name}.routed-experts",
+                    patterns=routed_expert_patterns,
+                )
+            )
+        return tuple(layer_bucket_configs)
+
+    bucket_configs = bucket_configs_for_layers("layers", main_layer_shardings)
+    bucket_configs += bucket_configs_for_layers("mtp_layers", mtp_layer_shardings)
+    # hc_head is global rather than layer-scoped, so it needs its own bucket.
+    bucket_configs += (BucketConfig(name="hc_head", patterns=("hc_head.hc_fn",)),)
+    muon_pattern = (
+        r"(?:"
+        rf"attention\.(?:{'|'.join(attention_projections)})\.weight|"
+        rf"attention\.indexer\.(?:{'|'.join(indexer_projections)})\.weight|"
+        rf"attention\.(?:compressor(?:_128)?|indexer\.compressor)\.(?:{'|'.join(compressor_projections)})\.weight|"
+        r"attention\.(?:compressor(?:_128)?|indexer\.compressor)\.ape|"
+        rf"feed_forward\.shared_experts\.(?:{'|'.join(expert_projections)})\.weight|"
+        rf"feed_forward\.routed_experts\.(?:{'|'.join(routed_expert_projections)})|"
+        r"feed_forward\.router\.gate\.weight|"
+        rf"(?:{'|'.join(hc_pre_modules)})\.hc_fn|"
+        rf"(?:{'|'.join(mtp_projections)})\.weight|"
+        r"hc_head\.hc_fn" + r")$"
+    )
+    profile = MuonOptimizerProfile(
+        muon_pattern=muon_pattern,
+        compute_sharding_by_fqn=compute_sharding_by_fqn,
+        bucket_configs=bucket_configs,
+    )
+    return with_lora_compute_layouts(model, profile)
 
 
 def _per_doc_alignment(model: DeepSeekV4Model.Config) -> int:
@@ -111,7 +275,7 @@ def _make_trainer_config(
             ),
         ),
         optim=OptimConfig(
-            optimizer=_dsv4_optimizer_config(model, lr=1e-5),
+            optimizer=OptimizerConfig(optimizers=[AdamW.Config(pattern=r".*", lr=1e-5, eps=1e-6)]),
             lr_scheduler=LRSchedulersContainer.Config(
                 warmup_steps=20,
                 decay_ratio=0.8,
@@ -260,7 +424,6 @@ def deepseek_v4_flash_lora(
     )
     assert isinstance(config.model, DeepSeekV4Model.Config)
     assert isinstance(config.optim.optimizer, OptimizerConfig)
-    config.optim.optimizer._muon_profile = _dsv4_muon_profile(config.model)
     config.checkpointer = DeepSeekV4PEFTCheckpointManager.Config()
     return config
 

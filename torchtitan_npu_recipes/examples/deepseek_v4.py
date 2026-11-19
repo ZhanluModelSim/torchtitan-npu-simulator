@@ -22,12 +22,14 @@ from torchtitan.components.data import (
     HuggingFaceRandomAccessSource,
     SingleDatasetConfig,
 )
+from torchtitan.components.optim import AdamW, BaseOptimizer
 from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.distributed.activation_remat import DefaultActivationRematConfig, FullActivationRematConfig
 
 from torchtitan_npu.config import CompileConfig, ModelCompileConfig, OptimizerConfig
 from torchtitan_npu.config.configs import KVNormQuantizationConfig
 from torchtitan_npu.extensions.torchtitan.components.checkpoint import CheckpointManager
+from torchtitan_npu.extensions.torchtitan.components.optimizer.muon import DistMuon
 from torchtitan_npu_recipes.models import deepseek_v4 as model_recipes
 
 if TYPE_CHECKING:
@@ -203,18 +205,36 @@ def _configure(
     config.profiler.extension.profile_ranks = [0]
     config.comm.init_timeout_seconds = 7200
     config.comm.train_timeout_seconds = 600
-    optimizer = config.optim.optimizer
-    assert isinstance(optimizer, OptimizerConfig)
-    optimizer.name = "AdamW" if mini and _is_golden() else "Muon"
-    optimizer.lr = 1e-5
-    optimizer.beta1, optimizer.beta2 = 0.9, 0.95
-    optimizer.eps = 1e-8
-    optimizer.weight_decay = 0.1
-    optimizer.muon_momentum = 0.95
-    optimizer.muon_enable_nesterov = True
-    optimizer.muon_ns_steps = 10
-    optimizer.muon_adjust_lr_fn = "match_rms_adamw"
-    optimizer.materialize()
+    optimizers: list[BaseOptimizer.Config] = []
+    if not (mini and _is_golden()):
+        model = cast("model_recipes.DeepSeekV4Model.Config", config.model)
+        if _is_golden():
+            model_recipes._enable_indexer_aux_loss(model)
+        profile = model_recipes._dsv4_muon_profile(model)
+        optimizers.append(
+            DistMuon.Config(
+                pattern=profile.muon_pattern,
+                compute_sharding_by_fqn=profile.compute_sharding_by_fqn,
+                bucket_configs=profile.bucket_configs,
+                lr=1e-5,
+                momentum=0.95,
+                nesterov=True,
+                ns_steps=10,
+                adjust_lr_fn="match_rms_adamw",
+            )
+        )
+    optimizers.append(
+        AdamW.Config(
+            pattern=r".*",
+            lr=1e-5,
+            betas=(0.9, 0.95),
+            eps=1e-8,
+            weight_decay=0.1,
+            fused=True,
+            foreach=None if mini and _is_golden() else False,
+        )
+    )
+    config.optim.optimizer = OptimizerConfig(optimizers=optimizers)
     config.override.imports = _overrides(mini=mini, a5=a5, hif8=hif8, pro=pro, swap=swap)
     return config
 

@@ -1,5 +1,7 @@
 # torch.compile 与 AscendC AutoFuse 特性
 
+> **启动接口说明：** 本文保留旧字段 CLI 的配置示例，不能直接追加到 TorchTitan 0.4.0 启动命令。当前训练参数在 Python recipe 中设置，见 [Python 配置指南](../developer_guides/python_recipes.md)。下文历史命令及支持记录不代表当前依赖下的对应组合已经完成验证。
+
 本文说明 `torchtitan-npu` 如何复用 PyTorch `torch.compile` 与 TorchInductor，并通过
 `torch_npu` 内置的 AscendC Codegen 接入 CANN AutoFuse。文档面向训练配置维护者、模型适配开发者和
 融合算子开发者，重点说明启用方式、组件边界及容易被忽略的运行约束。

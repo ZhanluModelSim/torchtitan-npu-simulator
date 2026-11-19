@@ -14,7 +14,7 @@ from torchtitan.components.data import (
     HuggingFaceRandomAccessSource,
     SingleDatasetConfig,
 )
-from torchtitan.components.optim import LRSchedulersContainer
+from torchtitan.components.optim import AdamW, BaseOptimizer, LRSchedulersContainer
 from torchtitan.config import derive
 from torchtitan.config.override import OverrideImport
 from torchtitan.config.parallelism import ParallelismConfig
@@ -23,12 +23,16 @@ from torchtitan.distributed.activation_remat import FullActivationRematConfig
 from torchtitan_npu.config import CompileConfig, ModelCompileConfig, OptimizerConfig
 from torchtitan_npu.config.configs import ProfilerExtensionConfig
 from torchtitan_npu.extensions.torchtitan.components.checkpoint import CheckpointManager
+from torchtitan_npu.extensions.torchtitan.components.optimizer.muon import DistMuon
+from torchtitan_npu.extensions.torchtitan.components.optimizer.optimizer import HostSparseOptimizersContainer
 from torchtitan_npu.extensions.torchtitan.tools.profiler import CANNProfiler
 from torchtitan_npu.extensions.torchtitan.trainer import TrainerEx
 from torchtitan_npu.models.common.alignment import AlignedTextProcessor
 from torchtitan_npu.models.deepseek_v4_1 import EngramArgs, _flash_engram_geometry
 from torchtitan_npu.models.deepseek_v4_1.model import DeepSeekV41Model
+from torchtitan_npu.models.deepseek_v4_1.optimizer import EngramTableOptimizerConfig
 from torchtitan_npu_recipes.models import deepseek_v4_1 as models
+from torchtitan_npu_recipes.models.deepseek_v4_1 import _v41_muon_profile
 
 _A5_DEBUG_PREQUANTIZE_FQNS = [
     ".attention.wq_b",
@@ -99,17 +103,33 @@ def _set_context(config: TrainerEx.Config, *, sequence_length: int, token_budget
 
 
 def _set_muon(config: TrainerEx.Config) -> None:
-    assert isinstance(config.optim.optimizer, OptimizerConfig)
-    optimizer = config.optim.optimizer
-    optimizer.name = "Muon"
-    optimizer.lr = 1e-5
-    optimizer.beta1, optimizer.beta2 = 0.9, 0.95
-    optimizer.eps, optimizer.weight_decay = 1e-8, 0.1
-    optimizer.muon_momentum = 0.95
-    optimizer.muon_enable_nesterov = True
-    optimizer.muon_ns_steps = 10
-    optimizer.muon_adjust_lr_fn = "match_rms_adamw"
-    optimizer.materialize()
+    assert isinstance(config.model, DeepSeekV41Model.Config)
+    optimizers: list[BaseOptimizer.Config]
+    optimizers = [group for group in config.optim.optimizer.optimizers if isinstance(group, EngramTableOptimizerConfig)]
+    profile = _v41_muon_profile(config.model)
+    optimizers.extend(
+        [
+            DistMuon.Config(
+                pattern=profile.muon_pattern,
+                compute_sharding_by_fqn=profile.compute_sharding_by_fqn,
+                bucket_configs=profile.bucket_configs,
+                lr=1e-5,
+                momentum=0.95,
+                nesterov=True,
+                ns_steps=10,
+                adjust_lr_fn="match_rms_adamw",
+            ),
+            AdamW.Config(
+                pattern=r".*", lr=1e-5, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1, fused=True, foreach=False
+            ),
+        ]
+    )
+    optimizer_type = (
+        HostSparseOptimizersContainer.Config
+        if any(isinstance(group, EngramTableOptimizerConfig) for group in optimizers)
+        else OptimizerConfig
+    )
+    config.optim.optimizer = optimizer_type(optimizers=optimizers)
 
 
 def _set_schedule(config: TrainerEx.Config) -> None:

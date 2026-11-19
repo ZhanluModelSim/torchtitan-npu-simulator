@@ -15,30 +15,32 @@ import torch
 import torch_npu
 from torchtitan.config.configs import DebugConfig
 
-from torchtitan_npu.config.configs import MuonOptimizerProfile, OptimizerConfig, TrainingConfig
+from torchtitan_npu.config.configs import OptimizerConfig, TrainingConfig
 from torchtitan_npu.extensions.cpu_offload.cpu_offload_adamw import CpuOffloadAdamW
+from torchtitan_npu.extensions.cpu_offload.runtime import GradientClipChannel
 from torchtitan_npu.extensions.cpu_offload.staging import CpuStaging
+from torchtitan_npu.extensions.torchtitan.components.optimizer.muon import DistMuon
 from torchtitan_npu.extensions.torchtitan.trainer import TrainerEx
+from torchtitan_npu.override.common.optimizer import _CpuOffloadOptimizerConfig
 
 requires_npu = pytest.mark.skipif(not torch_npu.npu.is_available(), reason="NPU not available")
 
 
-def _muon_factory_kwargs(*, enable_hsdp_replica_dedup: bool) -> dict[str, object]:
-    config = OptimizerConfig(
-        name="Muon",
-        muon_enable_hsdp_replica_dedup=enable_hsdp_replica_dedup,
-        _muon_profile=MuonOptimizerProfile(
-            muon_pattern=r".*",
-            optimizer_factory_kwargs={
-                "DistMuon": {
-                    "compute_sharding_by_fqn": {},
-                    "bucket_configs": (),
-                }
-            },
+def _muon_factory_config(*, staging, enable_hsdp_replica_dedup: bool) -> _CpuOffloadOptimizerConfig:
+    return _CpuOffloadOptimizerConfig(
+        pattern=r".*",
+        optimizer=DistMuon.Config(
+            pattern=r".*",
+            compute_sharding_by_fqn={},
+            bucket_configs=(),
+            enable_hsdp_replica_dedup=enable_hsdp_replica_dedup,
+            lr=3e-3,
+            ns_steps=3,
         ),
+        staging=staging,
+        clip_channel=GradientClipChannel(),
+        offload_states=False,
     )
-    config.materialize()
-    return config.optimizer_factory_kwargs_by_name["DistMuon"]
 
 
 def test_cpu_offload_muon_factory_consumes_disabled_replica_dedup(monkeypatch) -> None:
@@ -67,29 +69,22 @@ def test_cpu_offload_muon_factory_consumes_disabled_replica_dedup(monkeypatch) -
     monkeypatch.setattr(cpu_offload_muon, "LocalPrefetchRuntime", FakeLocalPrefetchRuntime)
 
     staging = type("FakeStaging", (), {"stream": object()})()
-    optimizer = cpu_offload_muon.build_cpu_offload_distributed_muon(
-        [],
-        staging=staging,
-        offload_states=False,
-        **_muon_factory_kwargs(enable_hsdp_replica_dedup=False),
-    )
+    config = _muon_factory_config(staging=staging, enable_hsdp_replica_dedup=False)
+    optimizer = config.build(params=[])
 
     assert isinstance(optimizer, FakeMuon)
     assert "enable_hsdp_replica_dedup" not in captured
+    assert captured["lr"] == 3e-3
+    assert captured["ns_steps"] == 3
+    assert captured["compute_sharding_by_fqn"] == {}
+    assert captured["bucket_configs"] == ()
 
 
 def test_cpu_offload_muon_factory_rejects_enabled_replica_dedup() -> None:
-    from torchtitan_npu.extensions.cpu_offload.cpu_offload_muon import (
-        build_cpu_offload_distributed_muon,
-    )
+    config = _muon_factory_config(staging=None, enable_hsdp_replica_dedup=True)
 
     with pytest.raises(ValueError, match="not supported with CPU-offload Muon"):
-        build_cpu_offload_distributed_muon(
-            [],
-            staging=None,  # type: ignore[arg-type]
-            offload_states=False,
-            **_muon_factory_kwargs(enable_hsdp_replica_dedup=True),
-        )
+        config.build(params=[])
 
 
 def _step_sequence(offload_states: bool, grads: list[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor, set[int], str]:
@@ -179,7 +174,6 @@ def test_enable_cpu_offload_defaults_to_npu_resident_state(monkeypatch) -> None:
     # which re-runs __post_init__ on the already-derived node).
     for cfg in (config, replace(config)):
         assert type(cfg.optim.optimizer) is OptimizerConfig
-        assert isinstance(cfg.optim.optimizer.materialize(), type(None))
 
     with pytest.raises(ReachedUpstreamError):
         TrainerEx(config)

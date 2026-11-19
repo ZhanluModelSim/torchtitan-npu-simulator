@@ -61,7 +61,7 @@ class FaultTolerantTrainerEx(TrainerEx, FaultTolerantTrainer):
         )
 
         def _post_init_optimizer(self) -> None:
-            # The TorchFT optimizer config has neither materialize() nor NPU Muon settings.
+            # The TorchFT optimizer config uses its own container schema.
             pass
 
     def __init__(self, config: Config) -> None:

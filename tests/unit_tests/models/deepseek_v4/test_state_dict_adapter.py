@@ -32,7 +32,8 @@ def test_full_model_checkpoint_roundtrip_preserves_fused_experts_and_compressors
         key: torch.arange(value.numel(), dtype=torch.float32).reshape(value.shape).to(value.dtype)
         for key, value in model.state_dict().items()
     }
-    adapter = DeepSeekV4StateDictAdapter(config, None)
+    adapter = type(model).state_dict_adapter_cls(config, None)
+    assert isinstance(adapter, DeepSeekV4StateDictAdapter)
     exported = adapter.to_hf(state)
     for prefix in ("layers.0", "mtp.0"):
         local_prefix = prefix.replace("mtp.", "mtp_layers.")

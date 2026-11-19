@@ -8,6 +8,7 @@ from collections.abc import Callable
 from functools import partial
 from typing import TYPE_CHECKING, cast
 
+import torch
 from torchtitan.components.checkpointer import CheckpointManager
 from torchtitan.components.data import (
     ConcatThenSplitPackingConfig,
@@ -20,20 +21,26 @@ from torchtitan.components.optim import AdamW
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
 from torchtitan.config import OverrideConfig, derive
 from torchtitan.config.parallelism import ParallelismConfig
+from torchtitan.distributed.flex_shard import BlockShard, BucketConfig, ComputeLayout
+from torchtitan.distributed.parallelism_context import MeshAxisName
 from torchtitan.models.common.config_utils import decoder_vocab_size
 
 from torchtitan_npu.config import (
     CompileConfig,
     ModelCompileConfig,
+    MuonOptimizerProfile,
     OptimConfig,
     OptimizerConfig,
     TrainingConfig,
 )
+from torchtitan_npu.extensions.torchtitan.components.optimizer.muon import DistMuon
+from torchtitan_npu.extensions.torchtitan.components.optimizer.optimizer import HostSparseOptimizersContainer
 from torchtitan_npu.extensions.torchtitan.trainer import TrainerEx
 from torchtitan_npu.models.common.alignment import AlignedTextProcessor, compression_alignment
+from torchtitan_npu.models.common.muon import make_expert_layout, make_owned_layout, with_lora_compute_layouts
 from torchtitan_npu.models.deepseek_v4_1 import EngramArgs, model_registry
 from torchtitan_npu.models.deepseek_v4_1.model import DeepSeekV41Model, DeepSeekV41MultimodalModel
-from torchtitan_npu.models.deepseek_v4_1.optimizer import _v41_optimizer_config
+from torchtitan_npu.models.deepseek_v4_1.optimizer import EngramTableOptimizerConfig
 from torchtitan_npu.models.deepseek_v4_1.trainer import DeepSeekV41Trainer
 
 if TYPE_CHECKING:
@@ -41,6 +48,123 @@ if TYPE_CHECKING:
     from torchtitan.trainer import Trainer
 
     from torchtitan_npu.models.deepseek_v4_1.vision.language_encoder import ReasoningEffort, ThinkingMode
+
+
+def _v41_muon_profile(model: DeepSeekV41Model.Config) -> MuonOptimizerProfile:
+    """Build the V4.1-owned parameter and FlexShard policy for Muon.
+
+    Same sharding policy as the DSV4 profile where the parameter spaces
+    overlap (per-head ``wq_b``/``wo_a`` BlockShard, expert-sharded routed
+    GEMMs, Owned for the rest).  V4.1 differences: no MTP depths, no
+    ``hc_head``, no compressor APE.  The indexer parameters do receive LI
+    gradients on the new baseline, but they stay on the AdamW fallback group
+    together with the vision tower and every 1-D parameter — this profile
+    does not change the parameter policy the verified stacks ran with.
+    """
+    model_config = model
+    # The target upstream names the dense parameter storage axis dp_shard.
+    dense_dp_axes = (MeshAxisName.DP_SHARD.value,)
+    owned = make_owned_layout(dense_dp_axes)
+    owned_attention_projections = {"wq_a": owned, "wkv": owned, "wo_b": owned}
+    attention_projections = (*owned_attention_projections, "wq_b", "wo_a")
+    expert_projections = ("w13", "w2")
+    routed_expert_projections = ("w13.weight", "w2.weight")
+    compressor_projections = ("wkv", "wgate")
+    hc_pre_modules = ("hc_attn_pre", "hc_ffn_pre")
+    expert_sharding = make_expert_layout(dense_dp_axes)
+
+    compute_sharding_by_fqn: dict[str, ComputeLayout] = {}
+    bucket_configs: list[BucketConfig] = []
+    for layer_id, layer_config in enumerate(model_config.layers):
+        attention = layer_config.attention
+        attention_shardings = {
+            f"layers.{layer_id}.attention.{projection}.weight": compute_sharding
+            for projection, compute_sharding in owned_attention_projections.items()
+        }
+        # ``wq_b`` stores one [head_dim, q_lora_rank] matrix per head and
+        # ``wo_a`` one [o_lora_rank, per_group_in] matrix per group, both
+        # flattened on dim 0; BlockShard computes Muon per matrix.
+        attention_shardings[f"layers.{layer_id}.attention.wq_b.weight"] = ComputeLayout(
+            shardings_by_mesh_axis={
+                axis: BlockShard(dim=0, block_sizes=(attention.head_dim,)) for axis in dense_dp_axes
+            },
+            compute_dtype=torch.bfloat16,
+        )
+        attention_shardings[f"layers.{layer_id}.attention.wo_a.weight"] = ComputeLayout(
+            shardings_by_mesh_axis={
+                axis: BlockShard(dim=0, block_sizes=(attention.wo_a.out_features,)) for axis in dense_dp_axes
+            },
+            compute_dtype=torch.bfloat16,
+        )
+        # Every layer carries a compressor; only the sources own weights.
+        for projection in compressor_projections:
+            if getattr(attention.compressor, projection, None) is not None:
+                attention_shardings[f"layers.{layer_id}.attention.compressor.{projection}.weight"] = owned
+        attention_shardings[f"layers.{layer_id}.hc_attn_pre.hc_fn"] = owned
+        dense_shardings = {
+            f"layers.{layer_id}.feed_forward.shared_experts.{projection}.weight": owned
+            for projection in expert_projections
+        }
+        dense_shardings[f"layers.{layer_id}.feed_forward.router.gate.weight"] = owned
+        dense_shardings[f"layers.{layer_id}.hc_ffn_pre.hc_fn"] = owned
+        if layer_config.engram is not None:
+            # q_weight/k_weight are normalization scales, not projections.
+            dense_shardings[f"layers.{layer_id}.engram.gate.wkv"] = owned
+        routed_shardings = {
+            f"layers.{layer_id}.feed_forward.routed_experts.{projection}": expert_sharding
+            for projection in routed_expert_projections
+        }
+        # Split each layer into three buckets: the routed-expert GEMMs are
+        # by far the largest and get a bucket of their own so the
+        # Newton-Schulz all-gather peak stays bounded on the 40-layer
+        # FSDP8 shape (a single per-layer bucket OOMs at ~89% HBM).
+        compute_sharding_by_fqn.update(attention_shardings)
+        compute_sharding_by_fqn.update(dense_shardings)
+        compute_sharding_by_fqn.update(routed_shardings)
+        bucket_configs.append(BucketConfig(name=f"layers.{layer_id}.attn", patterns=tuple(attention_shardings)))
+        bucket_configs.append(BucketConfig(name=f"layers.{layer_id}.dense", patterns=tuple(dense_shardings)))
+        bucket_configs.append(BucketConfig(name=f"layers.{layer_id}.routed", patterns=tuple(routed_shardings)))
+
+    muon_pattern = (
+        r"(?:"
+        rf"attention\.(?:{'|'.join(attention_projections)})\.weight|"
+        rf"attention\.compressor\.(?:{'|'.join(compressor_projections)})\.weight|"
+        rf"feed_forward\.shared_experts\.(?:{'|'.join(expert_projections)})\.weight|"
+        rf"feed_forward\.routed_experts\.(?:{'|'.join(routed_expert_projections)})|"
+        r"feed_forward\.router\.gate\.weight|"
+        r"engram\.gate\.wkv|"
+        rf"(?:{'|'.join(hc_pre_modules)})\.hc_fn" + r")$"
+    )
+    profile = MuonOptimizerProfile(
+        muon_pattern=muon_pattern,
+        compute_sharding_by_fqn=compute_sharding_by_fqn,
+        bucket_configs=tuple(bucket_configs),
+    )
+    return with_lora_compute_layouts(model, profile)
+
+
+def _v41_optimizer_config(model: DeepSeekV41Model.Config) -> OptimizerConfig:
+    has_engram = any(layer.engram is not None for layer in model.layers)
+    if has_engram:
+        return HostSparseOptimizersContainer.Config(
+            optimizers=[
+                EngramTableOptimizerConfig(pattern=r".*\.engram\.table\.weight$", lr=5e-5, betas=(0.9, 0.95), eps=1e-6),
+                AdamW.Config(pattern=r".*", lr=1e-5, eps=1e-6),
+            ]
+        )
+    profile = _v41_muon_profile(model)
+    return OptimizerConfig(
+        optimizers=[
+            DistMuon.Config(
+                pattern=profile.muon_pattern,
+                compute_sharding_by_fqn=profile.compute_sharding_by_fqn,
+                bucket_configs=profile.bucket_configs,
+                lr=1e-5,
+                adjust_lr_fn="match_rms_adamw",
+            ),
+            AdamW.Config(pattern=r".*", lr=1e-5, eps=1e-8, fused=True, foreach=False),
+        ]
+    )
 
 
 def _per_doc_alignment(model: DeepSeekV41Model.Config) -> int:
@@ -561,18 +685,13 @@ def _make_lora_trainer_config(
     config = _make_trainer_config(
         flavor, parallelism=parallelism, seq_len=seq_len, hf_assets_path=hf_assets_path, engram=engram
     )
-    config.optim.optimizer = OptimizerConfig(
-        _optimizer_defaults={"AdamW": [AdamW.Config(pattern=r".*", lr=1e-5, eps=1e-6)]},
-    )
+    config.optim.optimizer = OptimizerConfig(optimizers=[AdamW.Config(pattern=r".*", lr=1e-5, eps=1e-6)])
     from torchtitan_npu.models.deepseek_v4_1.checkpoint import DeepSeekV41LoRACheckpointManager
 
     config = apply_transforms(config, [deepseek_v4_lora_transform()])
     assert isinstance(config, TrainerEx.Config)
     assert isinstance(config.model, DeepSeekV41Model.Config)
     assert isinstance(config.optim.optimizer, OptimizerConfig)
-    defaults = _v41_optimizer_config(config.model)
-    config.optim.optimizer._muon_profile = defaults._muon_profile
-    config.optim.optimizer._optimizer_defaults["Muon"] = defaults._optimizer_defaults["Muon"]
     config.checkpointer = DeepSeekV41LoRACheckpointManager.Config()
     return config
 

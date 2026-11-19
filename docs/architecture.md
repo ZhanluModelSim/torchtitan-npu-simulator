@@ -32,7 +32,9 @@ tests/           CPU UT、NPU ST 与 tooling 自测
 | `ops/` | 设备后端 kernel、最小启动封装与 `torch.library` 注册 | 仅保留实现算子所需的后端代码 |
 | `tools/` | 随 package 分发的 checkpoint 转换与导出工具 | 依赖公开模型与 integration API，不承载训练期自动注入 |
 
-完整训练配置位于 [`torchtitan_npu_recipes/`](../torchtitan_npu_recipes/README.md)，通过完整模块路径和配置名选择。模型 flavor registry、Muon profile、Engram 优化器 schema、数据转换函数和模型专属 trainer/engine 保留在插件中；插件实现不得反向导入 recipe。
+完整训练配置位于 [`torchtitan_npu_recipes/`](../torchtitan_npu_recipes/README.md)，通过完整模块路径和配置名选择。Muon 参数匹配、compute layout 和 bucket 配置在模型对应的 recipe 中生成。模型 flavor registry、Engram 优化器 schema、数据转换函数和模型专属 trainer/engine 保留在插件中；插件实现不得反向导入 recipe。图训练组合单独放在 `torchtitan_npu_recipes/graph_trainer/`，不会因 eager recipe 的导入而自动启用。
+
+`torchtitan_npu_recipes/examples/` 保存与每个示例脚本同名的完整配置工厂，组合基础模型工厂以及数据、优化器、并行、checkpoint 和 override 选择。`examples/` shell 只设置启动资源并调用共用 launcher，原生 CLI 参数原样传递。
 
 模型无关能力放在最通用的适用位置。完整的开发约束见 [主包规则](../torchtitan_npu/AGENTS.md) 及其目录级规则。
 

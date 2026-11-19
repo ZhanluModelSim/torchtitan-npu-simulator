@@ -1,147 +1,81 @@
-# DeepSeek-V4 Muon 优化器
+# DeepSeek Muon 优化器与 NovaSwap
 
-> **0.4.0 配置迁移说明：** 下文保留历史实现说明与字段 CLI 示例，不能直接作为当前启动命令。训练工厂已迁至 `torchtitan_npu_recipes`；当前启动方式见[快速上手](../user-guides/quickstart.md)，专用配置与 golden 应按 [Python 配置组合指南](../developer_guides/python_recipes.md)定义工厂。功能支持以 0.4.0 升级计划为准。
+DeepSeek-V4/V4.1 使用 TorchTitan 的 DistMuon/FlexShard 更新指定矩阵，其余参数使用 AdamW。Host Engram 表由独立的 CPU SparseAdam 更新，不进入 NovaSwap。
 
-本文说明当前实现中的 Muon 方案、使用方法和能力边界。实现以 TorchTitan 上游
-`DistMuon`/FlexShard 为核心；上游的 `ComputeLayout`、`Owned`、`BlockShard`、bucket
-和 storage-to-compute 语义参见 [TorchTitan FlexShard README](https://github.com/pytorch/torchtitan/blob/main/torchtitan/distributed/flex_shard/README.md)。
+## 配置与启动
 
-## 当前方案
+完整训练配置位于 `torchtitan_npu_recipes`。TorchTitan 0.4.0 使用 Python recipe，不再接受 `--optim.optimizer.name` 等通用字段 CLI。模型实现目录的 `config_registry.py` 只保留模型 registry 导出。
 
-DSV4 使用混合优化器容器：匹配 Muon 规则的二维矩阵参数交给 `DistMuon`，其余参数交给
-AdamW。`torchtitan_npu/models/deepseek_v4/muon.py` 中的
-`_dsv4_optimizer_config()` 提供常规 DSV4 optimizer schema；
-`_dsv4_muon_profile()` 提供参数匹配、FlexShard compute layout 和 bucket 元数据。
-`--optimizer.name Muon` 才 materialize 出 DistMuon 与 AdamW fallback 两组。
+在自定义 Python recipe 中选择优化器，例如 `my_recipes.py`：
 
-Muon 覆盖 attention 投影、compressor/indexer 投影、shared/routed experts、router、
-mHC 的 `hc_fn` 和全局 `hc_head.hc_fn`，以及对应的二维 `ape` 参数。embedding、输出头、
-归一化和其他 1D 参数落入 AdamW 组。
+```python
+from torchtitan.components.optim import AdamW
 
-DSV4 recipe 的默认 Muon 参数为：
+from torchtitan_npu.extensions.torchtitan.components.optimizer.muon import DistMuon
+from torchtitan_npu_recipes.models.deepseek_v4 import (
+    _dsv4_muon_profile,
+    _enable_indexer_aux_loss,
+    deepseek_v4_debugmodel,
+)
 
-```text
-momentum=0.95
-weight_decay=0.1
-ns_steps=10
-adjust_lr_fn="match_rms_adamw"
-foreach=False
+
+def muon_training():
+    config = deepseek_v4_debugmodel()
+    _enable_indexer_aux_loss(config.model)
+    profile = _dsv4_muon_profile(config.model)
+    config.optim.optimizer.optimizers = [
+        DistMuon.Config(
+            pattern=profile.muon_pattern,
+            compute_sharding_by_fqn=profile.compute_sharding_by_fqn,
+            bucket_configs=profile.bucket_configs,
+            lr=1e-5,
+            ns_steps=10,
+            adjust_lr_fn="match_rms_adamw",
+        ),
+        AdamW.Config(pattern=r".*", lr=1e-5, eps=1e-8, fused=True, foreach=False),
+    ]
+    return config
 ```
 
-Muon 与 AdamW fallback 当前共用 `--optimizer.lr`，没有独立 `muon_lr` 字段；
-`--optimizer.muon_momentum`、`--optimizer.muon_ns_steps` 和
-`--optimizer.muon_adjust_lr_fn` 可以分别覆盖。
+本例使用参考 attention，默认通过 `_enable_indexer_aux_loss()` 为 indexer 配置上游已有的
+`SparseIndexerLoss`，系数为 `1e-3`，使参与 Muon 更新的 indexer 参数获得梯度。
+V4 的参考 Muon 示例和 checkpoint IT 沿用此配置，不需要冻结 indexer。
+使用融合 attention 的 `selector_backend="asc"` 时，其已有独立的 indexer 训练目标，
+应保留 `aux_loss=None`，不要叠加上述辅助损失。
 
-## 如何使用 Muon
-
-使用常规 `deepseek_v4_flash_43layers_16experts` recipe，并显式选择 Muon。以下是单机
-8 卡的直接启动命令；swap override 也是显式列出，而非 recipe 隐式启用：
+启动时选择该工厂。NovaSwap 通过显式 override 启用：
 
 ```bash
-MODULE=torchtitan_npu_recipes.models.deepseek_v4 \
-CONFIG=deepseek_v4_flash_43layers_16experts \
-NGPU=8 \
-bash scripts/run_train.sh \
-  --hf-assets-path /path/to/DeepSeekV4_tokenizer \
-  --dataloader.dataset c4_test \
-  --dataloader.dataset-path tests/assets/c4_test \
-  --parallelism.spmd-backend spmd_types \
-  --parallelism.data-parallel-shard-degree 8 \
-  --parallelism.data-parallel-replicate-degree 1 \
-  --parallelism.expert-parallel-degree 8 \
-  --parallelism.tensor-parallel-degree 1 \
-  --parallelism.context-parallel-degree 1 \
-  --parallelism.pipeline-parallel-degree 1 \
-  --training.local-batch-size 1 \
-  --training.global-batch-size -1 \
-  --training.seq-len 4096 \
-  --training.steps 100 \
-  --optimizer.name Muon \
-  --optimizer.lr 2.2e-4 \
-  --optimizer.weight_decay 0.1 \
-  --optimizer.muon_momentum 0.95 \
-  --optimizer.muon_enable_nesterov \
-  --optimizer.muon_ns_steps 10 \
-  --optimizer.muon_adjust_lr_fn match_rms_adamw \
-  --checkpoint.no-enable \
-  --override.imports \
-    torchtitan_npu.override.common.rms_norm.asc \
-    torchtitan_npu.override.common.rope.asc_complex \
-    torchtitan_npu.override.deepseek_v4.sparse_attn.asc \
-    torchtitan_npu.override.deepseek_v4.lightning_indexer.asc \
-    torchtitan_npu.override.deepseek_v4.mhc.asc_hc_post \
-    torchtitan_npu.override.common.token_dispatcher.asc \
-    torchtitan_npu.override.common.optimizer.swap_optimizer
+MODULE=my_recipes CONFIG=muon_training NGPU=2 bash scripts/run_train.sh \
+  --override torchtitan_npu.override.common.optimizer.swap_optimizer
 ```
 
-DeepSeek-V4 示例脚本默认使用 Muon，并固定同一组 Muon 与 swap 参数。
+数据、并行和 checkpoint 策略也由 recipe 配置，见 [Python 配置指南](../developer_guides/python_recipes.md)。关闭 swap 时不传该 override，并确认 recipe 的 `override.imports` 中也没有它。
 
-当前只验证并支持 TP=1、PP=1；routed experts 的 layout 同时声明 DP shard、EFSDP 和
-EP，以兼容当前 EP=8/EP=1 的 storage mesh。
+`optimizers` 列表直接指定最终使用的优化器。超参数分别填写在 `AdamW.Config`、`DistMuon.Config` 中，不再设置外层 `name`、学习率或模式默认表。纯 AdamW 使用单个 `AdamW.Config`，V4 的默认 `eps=1e-6`。混合模式中的 AdamW 使用 `eps=1e-8`，Muon 的 `eps` 在自身 Config 中独立设置。Host Engram 的 SparseAdam 保留独立配置。
 
-## HSDP replica dedup
+## 参数分组与 FlexShard
 
-HSDP 的 `dp_replicate` 轴保存相同的本地参数分片。开启 replica dedup 后，DistMuon 为每个
-参数 FQN 在该轴上选择一个确定的 owner；只有 owner 保留并更新该参数的 Muon momentum，随后将
-更新后的本地参数分片异步 broadcast 给同一 replica group 的其他坐标。该路径减少重复的
-storage-to-compute、Newton--Schulz 和参数更新计算，同时不改变模型参数的 storage layout。
+参数匹配、compute layout 和 bucket 配置由 recipe 定义：V4 位于 `torchtitan_npu_recipes/models/deepseek_v4.py`，V4.1 位于 `torchtitan_npu_recipes/models/deepseek_v4_1.py`。配置辅助函数根据模型结构生成默认规则，不改变优化器实现。
 
-该功能仅作用于 `DistMuon`，默认关闭。使用 HSDP 且显式启用 Muon 时，在启动参数中增加：
+FlexShard 按 `Owned`、`BlockShard` 或专家维分片，把参数的 storage layout 转成 Muon 需要的计算布局。当前上游要求 Muon 的 `ComputeLayout.compute_dtype=torch.bfloat16`。这只规定 Newton–Schulz 的计算精度，不等于把持久动量统一改为 BF16。
 
-```text
---optimizer.muon-enable-hsdp-replica-dedup
-```
+V4.1 Host Engram 的表权重使用 SparseAdam，投影等 NPU 参数继续按模型 profile 分配。
 
-不使用 HSDP，或未启用该开关时，DistMuon 保持原有行为。DCP 保存和恢复沿用常规 checkpoint
-配置，无需增加 dedup 专用 checkpoint 参数。
+## NovaSwap 与 checkpoint
 
-## 如何开启 swap
+Muon 动量仍按单个 Tensor 注册和搬运。FlexShard 准备重分布 bucket 时提前提交 H2D，消费前等待数据，完成 prepare 和 inbound 通信提交后执行 D2H。无需重分布的参数保持单 Tensor 路径。
 
-swap 是显式 opt-in override，不存在 `swap_optimizer=true` 配置字段。在同一条命令的
-`--override.imports` 末尾增加：
+首次创建动量后注册 NovaSwap，checkpoint 初始化沿用现有 optimizer state 初始化流程，不改变上游 Newton–Schulz 与参数更新公式。
 
-```text
-torchtitan_npu.override.common.optimizer.swap_optimizer
-```
+AdamW 仍使用独立的 flat-state bucket。checkpoint 使用共享 CPU storage 的 view 和全局 shard metadata，保持原有 key 及 optimizer Tensor identity。未注册 NovaSwap 的优化器继续使用普通 checkpoint 路径。
 
-`swap_optimizer` 与
-`torchtitan_npu.override.common.optimizer.virtual`（Virtual Optimizer）都替换
-`OptimizersContainer.Config`，不能同时启用。使用 Muon state swap 时，
-`override.imports` 中不得包含 Virtual Optimizer；需要 Virtual Optimizer 时则移除
-`swap_optimizer`。
+开启 swap 后支持同步和 CPU snapshot 异步 `async`，不支持 `async_with_pinned_mem`。NovaSwap 要求 AdamW `moment_dtype="parameter"`，拒绝会提前创建 state 的 BF16 moment hook，不限制 BF16 前向计算。
 
-swap 将 optimizer state 置于 NovaSwap 管理的 CPU/NPU 生命周期中。PyTorch 仍在首次梯度
-更新时懒创建 optimizer state；swap 不会在模型初始化阶段预分配完整 state storage。Muon
-和 AdamW 使用不同的唯一 swap name，因此多个 optimizer 实例不会互相覆盖 state。
+`swap_optimizer` 与 `torchtitan_npu.override.common.optimizer.virtual` 替换同一 optimizer container，不能同时启用。
 
-Muon 的 `momentum_buffer` 首次创建后注册为 NovaSwap tensor 并执行 D2H。后续 step 按
-FlexShard bucket 调度：
+## HSDP replica dedup 与支持边界
 
-1. FlexShard 准备执行一个 redistributed bucket 的 storage-to-compute enqueue 时，swap
-   在 prefetch stream 上为该 bucket 的 `redistributed_items` 和 `unredistributed_items`
-   提交 H2D。
-2. 每个 tensor 到达 `_prepare_local()` 时仍执行 `WAIT_DEVICE`，随后由上游更新 momentum。
-   H2D 提前提交不改变 tensor 的消费依赖。
-3. transfer stream 完成该 bucket 的 prepare、pack 和 inbound `all_to_all_single` 提交后，
-   swap 在同一 transfer stream 上提交该 bucket 已更新 redistributed momentum 的 D2H。
-   NovaSwap 的 offload stream 因而等待 transfer-stream event；D2H 不会抢在该 bucket 的
-   inbound A2A 前提交。
-4. caller stream 等待 `compute_input_ready` 后执行 Newton--Schulz。FlexShard 可以在
-   caller stream 计算前一个 bucket 时预取后一个 bucket 的 H2D 和 inbound A2A。
+在 recipe 的 `DistMuon.Config` 中设置 `enable_hsdp_replica_dedup=True`，可为每个 Muon 参数选择一个 HSDP replica owner。只有 owner 保存和更新动量，随后向其他 replica 广播参数分片。
 
-`unredistributed_items` 不进入 storage-to-compute A2A。它们在 caller stream 上执行
-`_prepare_local()`、Muon 计算和参数更新，随后沿现有单 tensor 路径提交 D2H。
-
-AdamW 的 `exp_avg`、`exp_avg_sq`（AMSGrad 时还包括 `max_exp_avg_sq`）按 bucket 拼成连续
-flat state。每个 bucket 执行 H2D、`WAIT_DEVICE`、上游 AdamW 更新和 D2H，并在当前 bucket
-更新前提交下一个 bucket 的 H2D。
-
-开启 swap 之后，checkpoint 的存储和加载支持同步模式和基于 CPU snapshot 的异步模式 `async`，暂不支持
-`async_with_pinned_mem`。
-
-## 能力边界
-
-当前方案适合 DSV4 单机 8 卡、TP/PP=1、EP/DP-shard 并行的实验和训练。尚未证明：
-
-- TP>1 或 PP>1 的 DistMuon；
-- `async_with_pinned_mem`、跨 world size 恢复及更复杂并行拓扑下的 swap checkpoint；
+当前 DistMuon 路径要求 TP=1、PP=1。新依赖和设备要求见 [安装指南](../user-guides/installation.md)。跨版本 checkpoint 兼容性、图捕获以及更复杂的并行组合不由本说明保证，必须使用对应运行时单独验证。

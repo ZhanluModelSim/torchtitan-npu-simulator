@@ -7,7 +7,7 @@
 
 import json
 import logging
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, fields
 from pathlib import Path
 
 import torch
@@ -20,7 +20,6 @@ from torchtitan.config.transform import apply_transforms
 
 from torchtitan_npu.extensions.torchtitan.trainer import TrainerEx
 from torchtitan_npu.models.deepseek_v4.lora import deepseek_v4_lora_transform, is_lora_parameter
-from torchtitan_npu.models.deepseek_v4.muon import _dsv4_muon_profile
 from torchtitan_npu.models.deepseek_v4.peft import DeepSeekV4PEFTCheckpointManager
 from torchtitan_npu.override.common.rope import WorkaroundComplexRoPE, workaround
 from torchtitan_npu.patches.torchtitan.models.common.rope import SplitComplexRoPEConfig
@@ -76,7 +75,7 @@ class LoRATrainer(TrainerEx):
         before_a = _cpu_tensor(adapter_a)
         expert_b = model.layers["0"].feed_forward.routed_experts.w13.lora_b.weight
         before_expert_b = _cpu_tensor(expert_b.full_tensor() if isinstance(expert_b, DTensor) else expert_b)
-        if self.config.optim.optimizer.name == "Muon":
+        if any(isinstance(optimizer, DistMuon) for optimizer in engine.optim.optimizers.optimizers):
             muon_parameters = {
                 id(p)
                 for optimizer in engine.optim.optimizers.optimizers
@@ -105,7 +104,7 @@ class LoRATrainer(TrainerEx):
             state = self._optimizer_snapshot()
             state_fields = (
                 ("momentum_buffer", "exp_avg")
-                if self.config.optim.optimizer.name == "Muon"
+                if any(isinstance(optimizer, DistMuon) for optimizer in engine.optim.optimizers.optimizers)
                 else ("exp_avg",)
             )
             for field in state_fields:
@@ -186,7 +185,6 @@ class LoRATrainer(TrainerEx):
 
 def deepseek_v4_lora_training():
     config = apply_transforms(deepseek_v4_debugmodel(), [deepseek_v4_lora_transform()])
-    config.optim.optimizer = replace(config.optim.optimizer, _muon_profile=_dsv4_muon_profile(config.model))
     config.checkpointer = DeepSeekV4PEFTCheckpointManager.Config(interval=10000, periodic_save_adapter_only=False)
     return LoRATrainer.Config(
         **{field.name: getattr(config, field.name) for field in fields(config) if field.init},

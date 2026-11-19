@@ -11,13 +11,10 @@ NODE_IPS="${NODE_IPS}" \
 HF_ASSETS_PATH=/path/to/tokenizer \
 CKPT_INIT_LOAD_PATH=/path/to/base-weights \
 CKPT_SAVE_LOAD_PATH=/path/to/run/checkpoint \
-bash examples/deepseek_v4/deepseek_v4_flash_lora_4k_a3.sh \
-  --optim.optimizer.name AdamW \
-  --training.steps 500 \
-  --checkpointer.interval 100
+bash examples/deepseek_v4/deepseek_v4_flash_lora_4k_a3.sh
 ```
 
-A5 使用 `CONFIG=deepseek_v4_flash_lora bash examples/deepseek_v4/deepseek_v4_flash_cpt_4k_a5.sh --checkpointer.no-load-only --checkpointer.save-training-state`，直接调用 A5 CPT 入口，默认启用 block-FP8。运行前按实际设备和数据设置节点、卡数、并行参数及输入路径，详见[训练示例](../../examples/deepseek_v4/readme.md)。命令末尾的普通 CLI 参数可覆盖默认值。
+优化器、训练步数和 checkpoint 间隔在所选 Python recipe 中设置；可通过 `MODULE` / `CONFIG` 选择自定义 recipe。A5 量化 LoRA 需在对应 A5 recipe 中配置 LoRA transform 和检查点管理器，不能用模型配置名直接替换 CPT launcher 的完整训练配置。资源与输入路径见[训练示例](../../examples/deepseek_v4/readme.md)，配置入口见 [Python 配置指南](../developer_guides/python_recipes.md)。
 
 ### 模型与优化器配置
 
@@ -26,7 +23,7 @@ A5 使用 `CONFIG=deepseek_v4_flash_lora bash examples/deepseek_v4/deepseek_v4_f
 ```python
 from torchtitan.config.transform import apply_transforms
 
-from torchtitan_npu.models.deepseek_v4.config_registry import deepseek_v4_flash
+from torchtitan_npu_recipes.models.deepseek_v4 import deepseek_v4_flash
 from torchtitan_npu.models.deepseek_v4.lora import deepseek_v4_lora_transform
 from torchtitan_npu.models.deepseek_v4.peft import DeepSeekV4PEFTCheckpointManager
 
@@ -44,10 +41,10 @@ def custom_v4_lora():
 
 | 配置项 | 用途 |
 | --- | --- |
-| `--optim.optimizer.name AdamW` | 使用 AdamW 更新适配器 |
-| `--optim.optimizer.name Muon` | 使用 Muon 与 AdamW 混合更新；专家 gate/up 适配器 B 分开由 Muon 更新，要求 TP=PP=1 |
-| `--extension.quantization.no-enable-quantized-training` | 关闭量化训练，使用 BF16 基座 |
-| `--extension.quantization.recipe` | 选择已有量化方案；A5 入口默认 `all_block_fp8` |
+| `config.optim.optimizer.optimizers = [AdamW.Config(...)]` | 使用 AdamW 更新适配器 |
+| `config.optim.optimizer.optimizers = [DistMuon.Config(...), AdamW.Config(...)]` | 使用 Muon 与 AdamW 混合更新，参数匹配、layout 和 bucket 由 LoRA 模型 profile 提供，要求 TP=PP=1 |
+| `config.extension.quantization.enable_quantized_training = False` | 关闭量化训练，使用 BF16 基座 |
+| `config.extension.quantization.recipe` | 选择已有量化方案 |
 
 未启用量化时，LoRA 沿用原有基座配置。使用已有 TorchAO-NPU 参数量化方案时，LoRA 配置保留所选量化策略，基座参数沿用原策略选择，适配器保持 BF16。替换整个模块且无法保留适配器前向计算的方案会在配置阶段报错。优化器和并行配置详见 [Muon 优化器](muon_optimizer.md)与[上下文并行](context_parallel.md)。
 
@@ -57,21 +54,22 @@ def custom_v4_lora():
 
 周期检查点使用原生 DCP 格式。`checkpointer.periodic_save_adapter_only=True` 时，只保存适配器和路由缓冲区，不重复保存冻结的基座。启用 `checkpointer.save_training_state=True` 后，还会保存优化器、调度器、数据加载器和训练步数；上述 LoRA 启动脚本已启用此选项。
 
-断点续训时保持相同基座、训练总步数和检查点目录，并通过 `--checkpointer.load-step 100` 指定恢复点。
+断点续训时保持相同基座、训练总步数和检查点目录，在 recipe 中设置 `config.checkpointer.load_step = 100` 指定恢复点。
 
 自动恢复优先选择包含完整训练状态的 LoRA DCP，检查点清理会保留该恢复点。
 
 最后一步默认导出 PEFT 适配器。若需要将最后一步也保存为可续训的 DCP 检查点，设置：
 
-```bash
---checkpointer.no-last-save-in-peft --checkpointer.no-last-save-model-only
+```python
+config.checkpointer.last_save_in_peft = False
+config.checkpointer.last_save_model_only = False
 ```
 
 ## 导出与加载适配器
 
 PEFT 导出生成 `adapter_model.safetensors` 和 `adapter_config.json`，只包含适配器权重及配置。导出目录须为本地文件系统路径。
 
-使用 `--checkpointer.peft-base-model-name-or-path` 指定供外部加载器使用的 Hugging Face 基座 ID 或目录。未指定时，优先采用 HF 初始检查点路径，否则采用 HF 资源路径；原生 DCP 路径不会写入基座标识。
+使用 recipe 的 `config.checkpointer.peft_base_model_name_or_path` 指定供外部加载器使用的 Hugging Face 基座 ID 或目录。未指定时，优先采用 HF 初始检查点路径，否则采用 HF 资源路径；原生 DCP 路径不会写入基座标识。
 
 加载时使用与训练相同、且 Transformers 能够加载的基座：
 

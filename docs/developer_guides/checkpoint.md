@@ -15,14 +15,23 @@
 
 ## 当前配置入口
 
-训练配置由以下注册表提供：
+TorchTitan 0.4.0 由 Python recipe 配置 `config.checkpointer`。以 V4 debug 为例：
 
-| 模块 | 配置入口 | checkpoint 默认值 |
-| --- | --- | --- |
-| `torchtitan_npu_recipes.models.deepseek_v4` | `deepseek_v4_debugmodel`、`deepseek_v4_flash`、`deepseek_v4_pro` | `enable=False`，`interval=100` |
+```python
+from torchtitan.components.checkpointer import CheckpointManager
+from torchtitan_npu_recipes.models.deepseek_v4 import deepseek_v4_debugmodel
 
-`enable=False` 时既不会保存 checkpoint，也不会执行 checkpoint 加载。训练命令需要显式
-传入 `--checkpoint.enable`，或在 Python 配置中设置 `checkpoint.enable = True`。
+
+def checkpoint_training():
+    config = deepseek_v4_debugmodel()
+    config.checkpointer = CheckpointManager.Config(interval=100)
+    return config
+```
+
+将工厂保存在 `my_recipes.py`，通过 `MODULE=my_recipes CONFIG=checkpoint_training`
+选择。`config.checkpointer = None` 关闭加载和保存，不再设置 `checkpoint.enable`。
+已有 checkpointer 时，启动参数 `--output-dir` 设置输出目录，`--resume-step 100`
+选择恢复步数。后面的字段 CLI 命令仍是历史示例，不能直接用于 0.4.0。
 
 ## 可选 torch_checkpointing 后端
 

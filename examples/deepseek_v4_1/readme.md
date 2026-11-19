@@ -83,7 +83,7 @@ CPU 测试覆盖两类 seam 的输出/梯度、partial 非连续输入、逐 bat
 
 ### Muon 优化器注意事项
 
-Python 工厂通过 `config.optim.optimizer.name = "Muon"` 选择 DistMuon，并调用 `materialize()` 构造 `[DistMuon(pattern), AdamW(.*)]`。自定义 Muon 超参应先设置 `config.optim.optimizer.lr`、`weight_decay`、`muon_momentum` 等 schema 字段，再调用 `materialize()`；直接改旧的 optimizer 子组字段会在重新 materialize 时被替换。indexer 仍属于 AdamW fallback 组。
+Python recipe 直接在 `config.optim.optimizer.optimizers` 中配置 `[DistMuon.Config(...), AdamW.Config(...)]`，Host Engram 保留独立的 SparseAdam 分组。学习率、动量等超参数填写在对应的 Config 中，indexer 属于 AdamW fallback 组。参数匹配、layout 和 bucket 由 recipe 的 Muon profile 提供，配置示例见 [Muon 优化器](../../docs/feature_guides/muon_optimizer.md)。
 
 ### 验证范围
 

@@ -89,7 +89,7 @@ Routed expert 在 `w2` 投影前乘 router score，并回到 BF16；将乘法延
 
 示例：[DeepSeek-V4 小算子基线与被测实现训练指标对齐方法](../../scripts/numerical_alignment/README.md#数值近似对比)，通过 runner 的 `USE_GOLDEN` 比较参考实现（模型默认 attention）和融合实现的 `loss`、`grad_norm`。
 
-注意：参考组合（模型默认 attention）不训练 `r=4` 层的 indexer——TopK 选择不可导，KL 蒸馏目标只在融合组合（`sparse_attn.asc` + `lightning_indexer.asc`，SMLAG → SLIKG）中——对比 `indexer` 相关参数或依赖其梯度的 `grad_norm` 时不要把参考组合当作训练对照。参考组合因此只能配 AdamW；`DistMuon` 要求所有参数都有梯度，会报 `missing gradients`。
+参考 attention 的 Top-K 选择本身不给 indexer 提供梯度。V4 参考 Muon recipe 已配置现有 `SparseIndexerLoss`，使 indexer 保持可训练，详见 [Muon 指南](../feature_guides/muon_optimizer.md)。未配置辅助损失的 reference 与融合 selector 的训练目标不同，不能直接把二者的 indexer 梯度或 `grad_norm` 当作同目标对照。对比前应核对两侧的辅助损失配置、系数及参与更新的参数；不能仅由 `USE_GOLDEN` 开关推断训练目标一致。
 
 训练对比默认使用 `seq_len=4096`；其他长度通过 `--seq-len` 统一指定。
 
@@ -103,7 +103,7 @@ Routed expert 在 `w2` 投影前乘 router score，并回到 BF16；将乘法延
 - 至少运行 `100` 个训练 step；
 - 声明不改变计算结果时，`loss` 和 `grad_norm` 必须 `比特一致`；涉及计算变化时，需满足 `数值近似`。
 
-示例：[修改前后训练精度对齐方法](../../scripts/numerical_alignment/README.md#步骤四训练-loss-和-grad_norm-对比)，通过两个 Git ref 指定比较对象，使用 `--steps 100` 运行两侧训练。
+当前 0.4.0 在两侧 Python recipe 中设置 `config.training.steps = 100`，分别运行后比较 TensorBoard 完整精度指标。[训练精度对齐工具](../../scripts/numerical_alignment/README.md#步骤四训练-loss-和-grad_norm-对比)的自动启动仍使用旧字段 CLI，仅用于支持该接口的历史版本，不能直接对当前 HEAD 执行。
 
 ## 4. 验证范围
 

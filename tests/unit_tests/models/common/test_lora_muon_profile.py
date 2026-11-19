@@ -1,8 +1,8 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
 
-import copy
 import fnmatch
+import importlib
 
 import pytest
 import torch
@@ -10,6 +10,7 @@ from torch.distributed.tensor import Shard
 from torchtitan.components.optim import AdamW, OptimizersContainer
 from torchtitan.distributed.flex_shard import BlockShard, Owned
 
+from torchtitan_npu.config import OptimizerConfig
 from torchtitan_npu.extensions.torchtitan.components.optimizer.muon import DistMuon
 from torchtitan_npu.models.deepseek_v4.lora import is_lora_parameter
 from torchtitan_npu_recipes.models.deepseek_v4 import deepseek_v4_flash_lora
@@ -20,7 +21,6 @@ from torchtitan_npu_recipes.models.deepseek_v4_1 import deepseek_v4_1_flash_text
 def test_actual_lora_recipe_muon_groups_cover_adapters_with_layouts_and_unique_buckets(factory):
     config = factory()
     optimizer = config.optim.optimizer
-    assert optimizer.name == "AdamW"
     assert [type(group) for group in optimizer.optimizers] == [AdamW.Config]
     with torch.device("meta"):
         model = config.model.build()
@@ -28,11 +28,21 @@ def test_actual_lora_recipe_muon_groups_cover_adapters_with_layouts_and_unique_b
     assert trainables and all(is_lora_parameter(name) for name in trainables)
     assert not any("indexer" in name or "engram" in name or "vision" in name for name in trainables)
 
-    optimizer.name = "Muon"
-    optimizer.materialize()
-    first_materialization = copy.deepcopy(optimizer.optimizers)
-    optimizer.materialize()
-    assert optimizer.optimizers == first_materialization
+    recipes = importlib.import_module(factory.__module__)
+    profile = (recipes._dsv4_muon_profile if "_v4_1" not in factory.__module__ else recipes._v41_muon_profile)(
+        config.model
+    )
+    optimizer = OptimizerConfig(
+        optimizers=[
+            DistMuon.Config(
+                pattern=profile.muon_pattern,
+                compute_sharding_by_fqn=profile.compute_sharding_by_fqn,
+                bucket_configs=profile.bucket_configs,
+                lr=1e-5,
+            ),
+            AdamW.Config(pattern=r".*", lr=1e-5, eps=1e-8),
+        ]
+    )
     claimed = set()
     groups = [OptimizersContainer._build_param_group(model, group, claimed) for group in optimizer.optimizers]
     assert claimed == trainables

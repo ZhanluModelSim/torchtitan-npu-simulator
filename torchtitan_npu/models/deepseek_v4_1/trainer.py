@@ -75,8 +75,4 @@ class DeepSeekV41Trainer(TrainerEx):
                 optimizer.optimizers = [
                     group for group in optimizer.optimizers if not isinstance(group, EngramTableOptimizerConfig)
                 ]
-                optimizer._optimizer_defaults = {
-                    name: [group for group in groups if not isinstance(group, EngramTableOptimizerConfig)]
-                    for name, groups in optimizer._optimizer_defaults.items()
-                }
             TrainerEx.Config.__post_init__(self)

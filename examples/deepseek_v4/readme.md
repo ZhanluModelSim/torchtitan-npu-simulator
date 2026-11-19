@@ -6,18 +6,17 @@
 
 ## 入口关系
 
-Flash 多机训练以 `deepseek_v4_flash_cpt_4k_a3.sh` 为公共基线：
+每个 launcher 选择 `torchtitan_npu_recipes.examples.deepseek_v4` 中的完整配置函数，
+不再通过 shell 继承和字段 CLI 拼接训练配置：
 
-```text
-deepseek_v4_flash_cpt_4k_a3.sh
-└── deepseek_v4_flash_cpt_4k_a5.sh
-    └── deepseek_v4_flash_cpt_1024k_a5.sh
-```
+| launcher | 配置函数 |
+| --- | --- |
+| `deepseek_v4_flash_cpt_4k_a3.sh` | `deepseek_v4_flash_cpt_4k_a3` |
+| `deepseek_v4_flash_cpt_4k_a5.sh` | `deepseek_v4_flash_cpt_4k_a5` |
+| `deepseek_v4_flash_cpt_1024k_a5.sh` | `deepseek_v4_flash_cpt_1024k_a5` |
 
-- `deepseek_v4_flash_cpt_4k_a3.sh`：公共训练参数、override、checkpoint、optimizer 等基线配置，默认选择 `deepseek_v4_flash_cpt` recipe，显式启用 model 编译和 checkpoint，backend 为 `inductor`。
-- `deepseek_v4_flash_cpt_4k_a5.sh`：增加 A5 运行环境和默认 block-FP8 量化，其他配置复用 A3 基线。
-- `deepseek_v4_flash_cpt_1024k_a5.sh`：继续复用 A5 4K 入口，只通过 CLI 覆盖 1M 所需的 CP、DP、序列长度和 global batch size，量化默认随 A5 4K 入口继承。
-- 用户普通 CLI 参数位于默认选项之后，因此可以覆盖默认值（A5 的 activation-checkpoint 子命令仍在末尾），包括使用 `--extension.quantization.no-enable-quantized-training` 切换到 BF16。
+修改训练参数时，用 `MODULE` / `CONFIG` 选择自定义 Python 工厂。CLI 仅保留
+`--print-config`、`--output-dir`、`--resume-step`、`--comm-backend` 和 `--override` 等启动选项。
 
 ## 编译配置
 
@@ -38,8 +37,8 @@ def my_run():
     return config
 ```
 
-自定义 recipe 关闭 checkpoint 时，应选用未附加 checkpoint 字段的 debug launcher，
-或直接使用 `scripts/run_train.sh` 并在 recipe 中配置训练参数。Pro、CP 等其他入口需要
+自定义 recipe 通过 `config.checkpointer = None` 关闭 checkpoint，
+再由对应 launcher 或 `scripts/run_train.sh` 选择该工厂。Pro、CP 等其他入口需要
 编译时，也在对应 recipe 中显式设置 `CompileConfig`，再通过 `MODULE` / `CONFIG` 选择。
 
 ## 常用环境变量
@@ -54,10 +53,10 @@ export CKPT_INIT_LOAD_PATH=/path/to/init_hf_ckpt
 ```
 
 A5 默认每节点使用 8 张 NPU，A3 默认每节点使用 16 张 NPU；需要改变时设置 `NGPU`。
-训练参数在基础脚本中直接设置；派生入口通过 CLI 覆盖不同的默认值。命令末尾的
-`--training.max-context-length`、`--training.num-tokens-per-microbatch-per-dp-rank` 和
-`--training.num-tokens-per-train-step` 可覆盖相应参数。单独修改上下文长度不会重算 microbatch，
-单独修改 microbatch 也不会重算每步预算；需要调整时应同时指定相关参数。
+训练参数由 recipe 设置。构造基础配置时传入 `seq_len` 和 `parallelism`，
+并设置 `config.training.num_tokens_per_microbatch_per_dp_rank` 与
+`config.training.num_tokens_per_train_step`。单独修改训练字段不会重建模型的 RoPE 或分片声明，
+也不会自动重算 token 预算，修改时需保持这些设置一致。
 每步预算须能被「每 rank microbatch token 数 × 有效 DP 度 × PP microbatch 数」整除。
 例如 8 卡 Flash debug 的 A3 默认梯度累积 8 次，A5 默认梯度累积 4 次。
 
@@ -77,18 +76,37 @@ Debug/performance 验证优先使用等价裁剪模型，避免为了快速验�
 optimizer step；参考 indexer 的离散选择不提供 indexer 训练目标。
 默认融合组合使用 Muon。融合算子组合另以 AdamW 完成两步功能验证；当前
 CANN 的 `SparseFlashMlaGrad` 拒绝确定性模式，因此该功能验证未启用
-`--debug.deterministic`，不能作为数值对齐证据。Muon、多卡及编译仍需独立验证。
+`config.debug.deterministic`，不能作为数值对齐证据。该记录仅覆盖所述单卡配置。
 
 ```sh
 bash examples/deepseek_v4/debug/deepseek_v4_mini_1p_cpt_2k_a3.sh
 
 USE_GOLDEN=1 HF_ASSETS_PATH="$PWD/tests/assets/deepseek_v3" \
-bash examples/deepseek_v4/debug/deepseek_v4_mini_1p_cpt_2k_a3.sh \
-  --training.steps 2 --debug.seed 42 --debug.deterministic
+bash examples/deepseek_v4/debug/deepseek_v4_mini_1p_cpt_2k_a3.sh --print-config
 ```
 
-token 预算使用 `--training.num-tokens-per-microbatch-per-dp-rank` 和
-`--training.num-tokens-per-train-step`；两者均统计 token slot。模型上下文
+需要复现两步确定性配置时，在 `my_recipes.py` 中定义：
+
+```python
+from torchtitan_npu_recipes.examples.deepseek_v4 import deepseek_v4_mini_1p_cpt_2k_a3
+
+
+def mini_two_steps():
+    config = deepseek_v4_mini_1p_cpt_2k_a3()
+    config.training.steps = 2
+    config.debug.seed = 42
+    config.debug.deterministic = True
+    return config
+```
+
+```bash
+USE_GOLDEN=1 HF_ASSETS_PATH="$PWD/tests/assets/deepseek_v3" \
+MODULE=my_recipes CONFIG=mini_two_steps \
+bash examples/deepseek_v4/debug/deepseek_v4_mini_1p_cpt_2k_a3.sh
+```
+
+token 预算使用 `config.training.num_tokens_per_microbatch_per_dp_rank` 和
+`config.training.num_tokens_per_train_step`；两者均统计 token slot。模型上下文
 在 registry 构造时选定，recipe 同步设置 `training.max_context_length`。
 单独覆盖训练上下文不会重新配置 RoPE；修改上下文长度需使用匹配的 recipe。
 其他入口的迁移与验证状态独立于本单卡 mini 记录。
@@ -99,8 +117,8 @@ token 预算使用 `--training.num-tokens-per-microbatch-per-dp-rank` 和
 训练预算与 `upstream/dev_0.4.0` 的 A3 8P 脚本一致：每卡每个 microbatch 4096 个 token，
 每步 262144 个 token，共 100 步，并启用全量激活重计算。
 `USE_GOLDEN` 只切换算子组合，不改变优化器或文档打包上限。
-参考组合不提供 indexer 训练梯度，使用 Muon 会报 `missing gradients`；需要该组合时，
-应在自定义配置中显式选择 AdamW，不能作为本用例的 Muon 训练对照。
+参考 Muon 组合通过现有 `SparseIndexerLoss` 提供 indexer 梯度，系数为 `1e-3`，
+无需冻结 indexer 或改用 AdamW。配置与融合路径的区别见 [Muon 指南](../../docs/feature_guides/muon_optimizer.md)。
 
 ```sh
 bash examples/deepseek_v4/debug/deepseek_v4_flash_8p_cpt_4k_a3.sh
@@ -136,180 +154,143 @@ grad_norm 均为 `9.061148643493652`；8 个 rank 各 1199 个优化器参数的
 
 ### 32P Pro 32-expert Debug
 
-Pro 32-expert 是独立的裁剪模型 debug/performance 入口，不与 8P Flash launcher 强制复用：
+Pro 32-expert 是独立的裁剪模型入口：
 
 ```sh
 NODE_IPS="${NODE_IPS}" \
-bash examples/deepseek_v4/debug/deepseek_v4_pro_32p_cpt_4k_a5.sh \
-  --training.steps 20
+bash examples/deepseek_v4/debug/deepseek_v4_pro_32p_cpt_4k_a5.sh
 ```
 
-128K 场景不新增 launcher，只通过 CLI 改变并行和训练配置：
-
-```sh
-CP=32 NODE_IPS="${NODE_IPS}" \
-bash examples/deepseek_v4/debug/deepseek_v4_pro_32p_cpt_4k_a5.sh \
-  --parallelism.data-parallel-shard-degree 1 \
-  --parallelism.data-parallel-replicate-degree 1 \
-  --training.max-context-length 131072 \
-  --training.num-tokens-per-microbatch-per-dp-rank 131072 \
-  --training.num-tokens-per-train-step 1048576 \
-  --training.steps 20
-```
-
-A5 脚本默认启用 block-FP8；如需 BF16，请在命令末尾追加后文的禁用选项。
+训练步数在对应的自定义 recipe 中设置 `config.training.steps = 20`。
+128K 场景需在模型构造前指定上下文长度和并行配置，并同步 token 预算，
+通过 `MODULE` / `CONFIG` 选择工厂，不再在命令末尾追加字段参数。
+构造顺序见 [Python 配置指南](../../docs/developer_guides/python_recipes.md)。
+A5 脚本默认启用 block-FP8，BF16 切换方式见下文。
 
 ### 导出和加载 Debug Hugging Face checkpoint
 
-debug 默认关闭 checkpoint。先在 `my_recipes.py` 中定义需要 checkpoint 的配置：
+debug 默认关闭 checkpoint。以下工厂保存到仓库根目录的 `my_recipes.py`，
+复用 8P eager 示例并显式配置 checkpointer：
 
 ```python
-from torchtitan.components.checkpointer import CheckpointManager
-from torchtitan_npu_recipes.models.deepseek_v4 import deepseek_v4_flash_43layers_16experts_compiled
+from pathlib import Path
 
-def debug_checkpoint():
-    config = deepseek_v4_flash_43layers_16experts_compiled()
-    config.checkpointer = CheckpointManager.Config(load_only=True)
+from torchtitan.components.checkpointer import CheckpointManager
+from torchtitan_npu_recipes.examples.deepseek_v4 import deepseek_v4_flash_8p_cpt_4k_a3_eager
+
+
+def export_debug_checkpoint():
+    config = deepseek_v4_flash_8p_cpt_4k_a3_eager()
+    config.training.steps = 1
+    config.debug.seed = 42
+    config.debug.deterministic = True
+    config.checkpointer = CheckpointManager.Config(
+        load_only=False, last_save_model_only=True, last_save_in_hf=True
+    )
+    return config
+
+
+def load_debug_checkpoint():
+    config = export_debug_checkpoint()
+    config.checkpointer.load_only = True
+    config.checkpointer.initial_load_path = str(Path("export_ckpt/checkpoint/step-1").resolve())
+    config.checkpointer.initial_load_in_hf = True
     return config
 ```
 
-导出 checkpoint：
+使用参考算子组合导出与加载：
 
 ```sh
-MODULE=my_recipes CONFIG=debug_checkpoint \
-bash examples/deepseek_v4/debug/deepseek_v4_flash_8p_cpt_4k_a3.sh \
-  --checkpointer.folder ./export_ckpt \
-  --checkpointer.no-load-only \
-  --checkpointer.last-save-in-hf \
-  --training.steps 1 \
-  --debug.seed 42 \
-  --debug.deterministic
+USE_GOLDEN=1 MODULE=my_recipes CONFIG=export_debug_checkpoint \
+bash examples/deepseek_v4/debug/deepseek_v4_flash_8p_cpt_4k_a3.sh --output-dir ./export_ckpt
+
+USE_GOLDEN=1 MODULE=my_recipes CONFIG=load_debug_checkpoint \
+bash examples/deepseek_v4/debug/deepseek_v4_flash_8p_cpt_4k_a3.sh --output-dir ./load_ckpt
 ```
 
-从导出的 HF checkpoint 冷启动时，使用新的或空的 `checkpointer.folder`，避免已有 step checkpoint 优先触发 resume：
-
-```sh
-MODULE=my_recipes CONFIG=debug_checkpoint \
-bash examples/deepseek_v4/debug/deepseek_v4_flash_8p_cpt_4k_a3.sh \
-  --checkpointer.folder ./load_ckpt \
-  --checkpointer.initial-load-path ./export_ckpt/checkpoint/step-1 \
-  --checkpointer.initial-load-in-hf \
-  --training.steps 1 \
-  --debug.seed 42 \
-  --debug.deterministic
-```
+两侧模型配置需一致。从 HF 权重冷启动时，使用新的或空的输出目录，
+避免已有 step checkpoint 优先触发 resume。HF 权重加载不恢复优化器和训练步数。
 
 ## 多机完整模型训练
 
 ### A3 4K
 
 ```sh
-NODE_IPS="${NODE_IPS}" \
-bash examples/deepseek_v4/deepseek_v4_flash_cpt_4k_a3.sh \
-  --training.steps 500
+NODE_IPS="${NODE_IPS}" bash examples/deepseek_v4/deepseek_v4_flash_cpt_4k_a3.sh
 ```
 
 ### A5 4K
 
 ```sh
-NODE_IPS="${NODE_IPS}" \
-bash examples/deepseek_v4/deepseek_v4_flash_cpt_4k_a5.sh \
-  --training.steps 20
+NODE_IPS="${NODE_IPS}" bash examples/deepseek_v4/deepseek_v4_flash_cpt_4k_a5.sh
 ```
 
 ### A5 64K
 
-64K 不需要新增 launcher，直接在 A5 4K 入口上覆盖训练和并行参数：
-
-```sh
-CP=8 NODE_IPS="${NODE_IPS}" \
-bash examples/deepseek_v4/deepseek_v4_flash_cpt_4k_a5.sh \
-  --parallelism.data-parallel-shard-degree 16 \
-  --parallelism.data-parallel-replicate-degree 1 \
-  --training.max-context-length 65536 \
-  --training.num-tokens-per-microbatch-per-dp-rank 131072 \
-  --training.num-tokens-per-train-step 8388608 \
-  --training.steps 20
-```
+64K 使用自定义 Python recipe，在构造模型前指定 `seq_len=65536`、CP 和 DP，
+并设置相应 microbatch 和每步 token 预算。通过 `MODULE` / `CONFIG` 选择该工厂，
+不能对已构造的 4K 模型仅修改训练上下文。
 
 ### A5 1M
 
-1M wrapper 只提供该场景的默认 CLI 覆盖；仍可在命令末尾继续覆盖：
-
 ```sh
-NODE_IPS="${NODE_IPS}" \
-bash examples/deepseek_v4/deepseek_v4_flash_cpt_1024k_a5.sh \
-  --training.steps 20
+NODE_IPS="${NODE_IPS}" bash examples/deepseek_v4/deepseek_v4_flash_cpt_1024k_a5.sh
 ```
 
-等价的主要差异参数为：
-
-```sh
-CP=128 \
---parallelism.data-parallel-shard-degree 1 \
---parallelism.data-parallel-replicate-degree 1 \
---training.max-context-length 1048576 \
---training.num-tokens-per-microbatch-per-dp-rank 1048576 \
---training.num-tokens-per-train-step 8388608
-```
+1M 工厂声明 CP=128、DP shard=1、上下文和 microbatch token 数均为 1048576、
+每步 token 数为 8388608，并保留模型的 CP 迁移检查。
+其他步数和训练预算统一在自定义 recipe 中设置。
 
 ## A5 量化与 BF16
 
-所有 A5 脚本（`*_a5.sh`）默认启用 block-FP8 量化训练，等价于自动追加：
+A5 Flash 和 Pro 示例在 Python recipe 中启用 block-FP8，HiF8 与 QAT 专用入口
+使用各自配置。普通 block-FP8 设置为：
 
-```sh
---extension.quantization.enable-quantized-training \
---extension.quantization.recipe all_block_fp8
+```python
+config.extension.quantization.enable_quantized_training = True
+config.extension.quantization.recipe = "all_block_fp8"
 ```
 
-例如 A5 64K、1M 和 Pro 32P 命令均默认使用该量化配置。其中 Flash CPT 的 A5 入口（多机 4K 及其派生 64K/1M、8P debug）在此基础上还默认启用 FSDP 权重预量化（`--extension.quantization.enable-fsdp-prequantize`）。多机 4K 入口默认 DP_SHARD=128，64K/1M 通过 CP/DP 覆盖得到的有效 FSDP 切分度同为 128；该切分度下均分切分的投影（wq_a、wkv、wo_b、shared experts）无法满足预量化的 64 对齐约束、启动即报错，因此 4K 入口将 `fsdp-prequantize-fqns` 收窄为任何切分度下都保持对齐的投影（wq_b、wo_a、indexer.wq_b、routed experts）。8P debug 入口在 DP_SHARD=8 下使用 recipe 默认白名单。对齐约束及“结构性 no-op 回退 / 对齐失败报错”的区别详见 `docs/feature_guides/low_precision_training.md`。
+Flash A5 工厂还启用 FSDP 权重预量化。完整 Flash 工厂使用显式的
+`fsdp_prequantize_fqns` 白名单，以满足参数分片的对齐约束，8P debug 使用默认白名单。
+对齐检查见 [低精度训练](../../docs/feature_guides/low_precision_training.md)。
 
-需要保留 BF16 训练方案时，在命令末尾追加以下选项，覆盖脚本默认值：
+需要 BF16 时，在所选工厂返回前设置：
 
-```sh
---extension.quantization.no-enable-quantized-training
+```python
+config.extension.quantization.enable_quantized_training = False
 ```
 
-A3 脚本不默认启用量化；如需 A3 量化训练，请显式传入上面的 enable 和 recipe 参数。
+A3 示例默认不启用量化。自定义量化配置也直接在 recipe 中设置。
 
 ## Profiling
 
-需要采集 profile 时显式开启：
+在自定义 recipe 中启用 profiling，并设置采样窗口：
 
-```sh
---profiler.enable-profiling
+```python
+config.profiler.enable_profiling = True
+config.profiler.extension.profiler_start = 6
+config.profiler.extension.profiler_end = 7
+config.profiler.extension.profile_ranks = [0]
 ```
 
-公共 A3 基线提供如下 schedule，A5 Flash 直接继承，用户仍可通过 CLI 覆盖：
-
-```sh
---profiler.profile-freq 1 \
---profiler.profiler-warmup 0 \
---profiler.profiler-active 1 \
---profiler.profiler-repeat 1 \
---profiler.profiler-skip-first 4
-```
-
-如需不依赖 recipe 固定单次采样窗口，请在命令末尾完整追加：
-
-```sh
---profiler.enable-profiling \
---profiler.profile-freq 10 \
---profiler.profiler-warmup 3 \
---profiler.profiler-active 1 \
---profiler.profiler-repeat 1 \
---profiler.profiler-skip-first 0
-```
+上述设置沿用示例工厂的 NPU profiler 扩展，训练步数需覆盖所选窗口。
+使用 `MODULE` / `CONFIG` 选择该配置。
 
 ## Checkpoint 说明
 
-Flash 多机 CPT 基线默认启用 `--checkpointer.load-only`，即只负责加载，不会保存新的训练 checkpoint。需要保存时必须显式覆盖：
+Flash 多机 CPT 基线的 `config.checkpointer.load_only=True`，只加载，不保存新的 checkpoint。
+需要保存时，在 recipe 中设置：
 
-```sh
---checkpointer.no-load-only
+```python
+config.checkpointer.load_only = False
+config.checkpointer.interval = 100
 ```
 
-当 `checkpointer.folder` 已存在有效的 `step-*` checkpoint 时，TorchTitan 会优先 resume，该情况下 `checkpointer.initial-load-path` 不作为冷启动来源；要从 `initial-load-path` 冷启动，请使用新的或空的 `checkpointer.folder`。
+若基础工厂的 `checkpointer=None`，先创建 `CheckpointManager.Config`。
+当输出目录内存在有效的 step checkpoint 时，会优先 resume；从
+`config.checkpointer.initial_load_path` 冷启动需使用新的或空的输出目录。
+已有 checkpoint 配置可通过 `--resume-step` 选择恢复步数。
 
 ## LoRA 微调
 
@@ -317,12 +298,9 @@ Flash 多机 CPT 基线默认启用 `--checkpointer.load-only`，即只负责加
 
 ```sh
 NODE_IPS="${NODE_IPS}" \
-bash examples/deepseek_v4/deepseek_v4_flash_lora_4k_a3.sh \
-  --optim.optimizer.name AdamW \
-  --training.steps 500 \
-  --checkpointer.interval 100
+bash examples/deepseek_v4/deepseek_v4_flash_lora_4k_a3.sh
 ```
 
-该入口使用 `deepseek_v4_flash_lora_compiled` recipe（dense/expert rank 16、alpha 32），并开启 checkpoint 保存。优化器沿用 CPT 默认值，传入 `--optim.optimizer.name` 可覆盖。周期 checkpoint 用于续跑，最后一步导出 PEFT adapter。模型规模、并行配置和其余默认参数继承 A3 公共入口，命令末尾的 CLI 参数仍可覆盖默认值。A5 使用 `CONFIG=deepseek_v4_flash_lora_compiled bash examples/deepseek_v4/deepseek_v4_flash_cpt_4k_a5.sh --checkpointer.no-load-only --checkpointer.save-training-state`，继承 A5 CPT 的 block-FP8 默认配置。
+该入口选择 `torchtitan_npu_recipes.examples.deepseek_v4.deepseek_v4_flash_lora_4k_a3`，基座为 compiled LoRA 模型（dense/expert rank 16、alpha 32），并开启 checkpoint 保存。优化器列表及超参数直接在 Python recipe 中配置；修改步数和保存间隔也应修改 recipe，通过 `MODULE` / `CONFIG` 选择自定义配置。周期 checkpoint 用于续跑，最后一步导出 PEFT adapter。A5 量化 LoRA 需在对应 A5 recipe 中配置 LoRA transform 和检查点管理器。
 
 配置、部分参数训练、native checkpoint 恢复、PEFT 导出和离线合并见 [LoRA 功能指南](../../docs/feature_guides/deepseek_v4_lora.md)。

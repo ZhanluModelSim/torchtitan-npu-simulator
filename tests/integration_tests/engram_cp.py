@@ -12,8 +12,7 @@ from pathlib import Path
 from tests.integration_tests import OverrideDefinitions
 from tests.integration_tests.loss_compare import extract_scalar_from_tensorboard
 from torchtitan_npu.models.deepseek_v4_1 import _attach_engram, _flash_engram_geometry
-from torchtitan_npu_recipes.models.deepseek_v4_1 import deepseek_v4_1_stripped
-from torchtitan_npu.models.deepseek_v4_1.optimizer import _v41_optimizer_config
+from torchtitan_npu_recipes.models.deepseek_v4_1 import _v41_optimizer_config, deepseek_v4_1_stripped
 
 
 def engram_cp():

@@ -108,30 +108,10 @@ entry 的 `prepare_cp_metadata` 用 rank-local chunk 重建这三个 frame 以�
 
 ## 2. 启用方式
 
-```bash
-# DeepSeek-V4.1，两个 rank；先设置 HF_ASSETS_PATH 指向 tokenizer。
-MODULE=torchtitan_npu_recipes.models.deepseek_v4_1 CONFIG=deepseek_v4_1_stripped NGPU=2 \
-  bash scripts/run_train.sh \
-  --hf-assets-path "$HF_ASSETS_PATH" \
-  --training.max-context-length 512 \
-  --training.num-tokens-per-microbatch-per-dp-rank 512 \
-  --training.num-tokens-per-train-step 512 \
-  --training.steps 2 --training.disable-cuda-graphs --compile.no-enable \
-  --dataloader.per-doc-alignment 4 \
-  --parallelism.spmd-backend spmd_types \
-  --parallelism.context-parallel-degree 2 \
-  --parallelism.context-parallel-load-balancer doc_chunk \
-  --parallelism.data-parallel-shard-degree 1 \
-  --parallelism.data-parallel-replicate-degree 1 \
-  --parallelism.expert-parallel-degree 1 \
-  --parallelism.tensor-parallel-degree 1 \
-  --parallelism.pipeline-parallel-degree 1 \
-  --optimizer.name AdamW --checkpoint.no-enable \
-  --override.imports torchtitan_npu.override.common.rope.workaround \
-    torchtitan_npu.override.common.optimizer.virtual \
-    torchtitan_npu.override.deepseek_v4_1.lightning_indexer.asc \
-    torchtitan_npu.override.deepseek_v4_1.sparse_attn.asc
-```
+CP 拓扑、优化器和 checkpoint 由 Python recipe 配置。创建模型时传入目标
+`ParallelismConfig`，并按模型入口的支持检查选择拓扑；优化器在
+`config.optim.optimizer.optimizers` 中构造，关闭 checkpoint 使用 `config.checkpointer = None`。
+启动时通过 `MODULE` / `CONFIG` 选择完整配置，见 [Python 配置指南](../developer_guides/python_recipes.md)。
 
 DeepSeek-V4 的 Grain 配置将文档对齐值放在 dataset 的 `AlignedTextProcessor.Config.per_doc_alignment`；
 启用 CP 时，需在 recipe 中将该值设为 `128 × CP` 的倍数。
@@ -414,7 +394,7 @@ Engram 不在这一列。它的 token history 要的是每行**在本文档内**
 | `torchtitan_npu/patches/torchtitan/distributed/context_parallel.py` | `DocChunkLoadBalancer`：`cp_shard` 内部按整行边界构造它，`_generate_indices` 自己算置换（切之前重排，零通信） |
 | `torchtitan_npu/models/common/compile_policy.py` | `skip_compile_under_cp`：arch22 + CP 时把编译关掉并告警（见 §4.2） |
 | `torchtitan_npu/models/common/metadata.py` | `KernelFrame`（两栈共用的 frame 原语） |
-| `torchtitan_npu/models/common/packing.py` | `require_document_alignment` / `require_per_doc_alignment`：文档长度与 `per_doc_alignment` 的严格对齐检查 |
+| `torchtitan_npu/models/common/alignment.py` | `require_document_alignment` / `require_per_doc_alignment`：文档长度与 `per_doc_alignment` 的严格对齐检查 |
 | `torchtitan_npu/models/deepseek_v4/model.py` | `DeepSeekV4Model.preprocess_inputs`：MTP 深度与 batch 走同一次 `cp_shard`（布局由 seam 施加，模型不再搬 batch） |
 | `torchtitan_npu/models/deepseek_v4/metadata.py` | `DeepSeekV4Metadata(ratio, q, swa_k, cmp_k, slots, cp)` / `CPDeepSeekMetadata` / `build_v4_metadata` / `doc_chunk_entry` |
 | `torchtitan_npu/models/deepseek_v4/attention.py` | 查询与 key 都在 doc-chunk 行上投影；swa 键在核心前用 `key_stream` 恢复、压缩器内部恢复+carry、selector + 内层核心直调（无 wrapper）、输出不 unpermute；参考内核读 `q` / `cmp_k` frame 与预计算的 HCA 选择 |
@@ -468,10 +448,9 @@ CP 的验收分三层，越往下越严格：
 
 ### 7.2 取数要点（每一条都曾把一个对比做废）
 
-- **权重必须对齐**：两侧加载同一份 checkpoint（`--checkpoint.enable` + `--checkpoint.load-only`
-  + `--checkpoint.folder=<绝对目录>`，且日志里要看到 `Loading the checkpoint from ...`）。只给
-  `load_only` 不给 `enable` 时 checkpoint 管理器整个不启用，日志里没有加载行——"看起来对齐"的对比
-  是无效的。
+- **权重必须对齐**：两侧在 recipe 中创建 `CheckpointManager.Config(load_only=True, ...)`，
+  并指定同一份 checkpoint。当前配置入口为 `config.checkpointer`，设为 `None` 时不加载或保存，
+  不再使用 `checkpoint.enable`。日志中应确认实际加载的路径，不能只检查配置中存在 `load_only`。
 - **同一 seed 重新初始化不算对齐**：模型初始化依赖 world size（分片张量的抽样位置不同），world=1
   与 world=2 拿到的是不同权重。
 - **单卡模拟器还要手工镜像权重**：模拟器按 Philox 状态的*元素偏移*摆放每个 rank，而 NPU 生成器

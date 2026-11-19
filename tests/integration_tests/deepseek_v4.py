@@ -90,18 +90,11 @@ def build_deepseek_v4_checkpoint_resume_test_list() -> list[OverrideDefinitions]
         "--parallelism.data-parallel-shard-degree=2",
         "--parallelism.expert-parallel-degree=2",
     )
-    adamw_swap_args = (*checkpoint_args, "--optim.optimizer.name=AdamW")
-    adamw_swap_overrides = (
-        *GOLDEN_OVERRIDES,
-        "torchtitan_npu.override.common.optimizer.swap_optimizer",
-    )
     checkpoint_case = OverrideDefinitions(
-        train_args=V4_TRAIN_ARGS,
-        env_vars={"MODULE": "tests.integration_tests.optimizer_config", "CONFIG": "deepseek_v4_checkpoint"},
-        override_args=[
-            adamw_swap_overrides + adamw_swap_args,
-            adamw_swap_overrides + adamw_swap_args + ("--checkpointer.load-step=2",),
-        ],
+        python_config=True,
+        train_args=(),
+        env_vars={"MODULE": "tests.integration_tests.optimizer_config", "CONFIG": "deepseek_v4_swap_checkpoint"},
+        override_args=[(), ("--resume-step=2",)],
         test_descr="DeepSeek-V4 AdamW NovaSwap checkpoint FSDP2 EP2 exact resume",
         test_name="dsv4_checkpoint_resume_ep2_fsdp2",
         expected_steps=((1, 2, 3, 4), (3, 4)),
@@ -118,12 +111,20 @@ def build_deepseek_v4_checkpoint_resume_test_list() -> list[OverrideDefinitions]
     )
     lora_checkpoint_case = replace(
         checkpoint_case,
+        python_config=False,
+        train_args=V4_TRAIN_ARGS,
         test_name="dsv4_lora_resume_ep2_fsdp2",
         test_descr="DeepSeek-V4 LoRA checkpoint resume EP2/FSDP2",
         env_vars={"MODULE": "tests.integration_tests.lora_config", "CONFIG": "deepseek_v4_lora_training"},
         override_args=[lora_args, (*lora_args, "--checkpointer.load-step=2")],
     )
-    return [checkpoint_case, lora_checkpoint_case]
+    muon_checkpoint_case = replace(
+        checkpoint_case,
+        test_name="dsv4_muon_checkpoint_resume_ep2_fsdp2",
+        test_descr="DeepSeek-V4 Muon + AdamW NovaSwap checkpoint with indexer auxiliary loss",
+        env_vars={"MODULE": "tests.integration_tests.optimizer_config", "CONFIG": "deepseek_v4_muon_swap_checkpoint"},
+    )
+    return [checkpoint_case, lora_checkpoint_case, muon_checkpoint_case]
 
 
 def build_deepseek_v4_quantized_test_list() -> list[OverrideDefinitions]:

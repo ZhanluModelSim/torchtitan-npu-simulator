@@ -1,12 +1,14 @@
 # 低精度训练
 
+> **启动接口说明：** 本文保留旧字段 CLI 的配置示例，不能直接追加到 TorchTitan 0.4.0 启动命令。当前训练参数在 Python recipe 中设置，见 [Python 配置指南](../developer_guides/python_recipes.md)。下文历史命令及支持记录不代表当前依赖下的对应组合已经完成验证。
+
 torchtitan-npu 通过 TorchAO-NPU 为 DeepSeek-V4 和 DeepSeek-V4.1 提供 MXFP8、Block FP8 低精度训练，以及 MXFP4 量化感知训练（QAT）。量化配置复用现有预训练和续训练循环，可按需选择线性层、专家权重和 attention Q/KV 的量化方式。
 
 ## 环境要求
 
 - 当前低精度训练面向 A5（Ascend 950）硬件，需要配套的 torch_npu、CANN、HCCL 和融合算子环境。
 - 按[软件安装](../user-guides/installation.md)准备基础环境，并安装其中的可选依赖 TorchAO-NPU。仓内适配包依赖 `torchao==0.17.0`，也可按安装文档通过 `PYTHONPATH` 加载源码。
-- 数据集、Tokenizer、CANN 环境变量及单机启动命令见[快速上手](../user-guides/quickstart.md)。本文中的参数组合用于追加到对应训练命令。
+- 数据集、Tokenizer、CANN 环境变量及单机启动命令见[快速上手](../user-guides/quickstart.md)。下文旧参数组合仅用于说明配置含义，当前配置方式见文首迁移说明。
 
 配置默认关闭量化训练，DeepSeek-V4/DeepSeek-V4.1 的 A5 示例脚本会显式启用量化。
 
@@ -50,7 +52,7 @@ recipe 按模型配置中的模块路径匹配 Attention linear、shared expert 
 
 QAT 下做 MXFP4 量化时可以使用 `--extension.quantization.dst_type_max` 传参来指定量化时目标域的最大值。参数默认值为 0.0 对应 `Amax(Dtype)`；可以传参 7.0，以防止量化数据中的最大值被截断而产生较大精度损失。
 
-DeepSeek-V4/V4.1 的完整 QAT 启动方式见[快速上手](../user-guides/quickstart.md#deepseek-v41-torchao-npu-低精度训练)。V4.1 QAT 脚本同时启用 routed expert MXFP4 fake quant、Lightning Indexer 和稀疏 attention/KV source Compressor 量化，相关自定义算子依赖见下一节。
+当前启动和配置入口见[快速上手](../user-guides/quickstart.md)与[Python 配置指南](../developer_guides/python_recipes.md)。历史 V4.1 QAT 脚本同时启用 routed expert MXFP4 fake quant、Lightning Indexer 和稀疏 attention/KV source Compressor 量化，相关自定义算子依赖见下一节。
 
 ## Attention 量化
 
