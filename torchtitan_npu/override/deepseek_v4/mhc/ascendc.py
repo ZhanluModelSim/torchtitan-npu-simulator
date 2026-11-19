@@ -9,9 +9,9 @@ from dataclasses import dataclass
 
 import torch
 import torch_npu
+from torchtitan.models.deepseek_v4.mhc import HcPost, HcPre
 
 import torchtitan_npu.ops.ascendc.mhc  # noqa: F401
-from torchtitan_npu.models.deepseek_v4.mhc import HcPost, HcPre
 from torchtitan_npu.override import _IS_A5
 
 

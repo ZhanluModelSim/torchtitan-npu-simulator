@@ -9,8 +9,8 @@ from dataclasses import dataclass
 
 import torch
 import torch_npu
+from torchtitan.models.deepseek_v4.mhc import HcHead, HcPost, HcPre
 
-from torchtitan_npu.models.deepseek_v4.mhc import HcHead, HcPost, HcPre
 from torchtitan_npu.ops.triton.mhc import (
     mhc_post_bmm1_op,
     mhc_post_bmm2_op,

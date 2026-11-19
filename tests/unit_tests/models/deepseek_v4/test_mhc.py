@@ -18,8 +18,9 @@ import copy
 
 import pytest
 import torch
+from torchtitan.models.deepseek_v4.mhc import HcHead, HcPost, HcPre
 
-from torchtitan_npu.models.deepseek_v4.mhc import HcHead, HcPost, HcPre
+import torchtitan_npu  # noqa: F401 -- activate the upstream Sinkhorn patch
 
 
 def _set_hc_pre_parameters(module):

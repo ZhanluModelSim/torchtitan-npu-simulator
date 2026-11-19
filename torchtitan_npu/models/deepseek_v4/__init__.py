@@ -24,13 +24,13 @@ from torchtitan.models.deepseek_v4.flavors import (
 from torchtitan.models.deepseek_v4.flavors import (
     _build_v4_layers as _upstream_build_v4_layers,
 )
+from torchtitan.models.deepseek_v4.mhc import HcHead, HcPost, HcPre
 from torchtitan.models.deepseek_v4.sharding import hc_head_sharding_config
 
 from torchtitan_npu.models.common.activation import LimitedSwiGLU
 
 from .attention import DeepSeekV4Attention as Attention
 from .attention import UnitScaleRMSNorm
-from .mhc import HcHead, HcPost, HcPre
 from .model import (
     DeepSeekV4Model,
     DeepSeekV4TransformerBlock,

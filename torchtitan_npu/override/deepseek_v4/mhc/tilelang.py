@@ -16,8 +16,8 @@ import torch
 from torch import Tensor
 from torch.distributed.tensor import DTensor
 from torch.nn import functional as F
+from torchtitan.models.deepseek_v4.mhc import HcHead, HcPost, HcPre
 
-from torchtitan_npu.models.deepseek_v4.mhc import HcHead, HcPost, HcPre
 from torchtitan_npu.ops.tilelang import (
     mhc_head_compute_mix_tilelang,
     tilelang_mhc_head_compute_mix_a5,

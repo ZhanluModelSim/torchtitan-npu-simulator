@@ -7,7 +7,7 @@
 
 Override-parity tests (``test_hc_*_override_matches_eager``) compare the
 ``torchtitan_npu.override.deepseek_v4.mhc`` Triton modules against their eager
-``torchtitan_npu.models.deepseek_v4.mhc`` counterparts for forward output and
+``torchtitan.models.deepseek_v4.mhc`` counterparts for forward output and
 backward gradients.
 
 Compile-safety tests (``test_mhc_*_compiled_backward``) verify that each
@@ -29,9 +29,9 @@ with error 507035 (vector core exception).
 
 import pytest
 import torch
+from torchtitan.models.deepseek_v4.mhc import HcHead, HcPost, HcPre
 
 from tests.conftest import assert_tensor_finite, stable_randn
-from torchtitan_npu.models.deepseek_v4.mhc import HcHead, HcPost, HcPre
 from torchtitan_npu.ops.triton.mhc.post_bmm1 import mhc_post_bmm1_op
 from torchtitan_npu.ops.triton.mhc.post_bmm2 import mhc_post_bmm2_op
 from torchtitan_npu.ops.triton.mhc.pre_bmm import mhc_pre_bmm_op

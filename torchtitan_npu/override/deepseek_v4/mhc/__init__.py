@@ -18,8 +18,7 @@ and HcHead overrides target separate nodes and may coexist across families.
 """
 
 from torchtitan.config import derive, override
-
-from torchtitan_npu.models.deepseek_v4.mhc import HcHead, HcPost, HcPre
+from torchtitan.models.deepseek_v4.mhc import HcHead, HcPost, HcPre
 
 from .ascendc import AscHcPost, AscHcPre
 from .tilelang import TilelangHcHead, TilelangHcPost, TilelangHcPre

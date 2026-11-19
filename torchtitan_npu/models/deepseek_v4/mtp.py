@@ -34,13 +34,12 @@ from torchtitan.models.deepseek_v3.mtp import (
     MTPLoss,
     roll_mtp_sequence,
 )
+from torchtitan.models.deepseek_v4.mhc import HcHead  # noqa: TC002 -- runtime config annotation
 from torchtitan.models.deepseek_v4.model import DeepSeekV4Model as TorchTitanV4Model
 from torchtitan.models.deepseek_v4.mtp import MTPBlock
 
 from torchtitan_npu.models.common.attention_metadata import AttentionMetadataMap, GeometryAttentionMetadataMixin
 from torchtitan_npu.models.common.linear import SharedLinear
-
-from .mhc import HcHead  # noqa: TC001
 
 
 class MTPBatch(NamedTuple):
