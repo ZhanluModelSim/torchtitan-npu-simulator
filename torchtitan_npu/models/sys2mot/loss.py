@@ -45,8 +45,13 @@ class Sys2MotJointLoss(BaseLoss):
         horizon: int
         ce_weight: float = 0.1
         indexer_weight: float = 0.01
-        distill: bool = True
-        """Run the frozen teacher forward and the KD/hidden distillation terms."""
+        distill: bool = False
+        """Run the frozen teacher forward and the KD/hidden distillation terms.
+
+        Current capture form is offline distillation (student-only training
+        step). The archived in-loop sharded form (tag sys2mot-distill-sharded)
+        re-enables the in-loop teacher by setting True here and in the preset.
+        """
 
     def __init__(self, config: Config, *, compile_config: CompileConfig | None = None):
         del compile_config  # the composite loss is not compiled
