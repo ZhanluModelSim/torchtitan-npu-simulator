@@ -1,76 +1,21 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-__all__ = ["QwenCPMetadata", "apply_qwen3_5_npu_fsdp", "parallelize_qwen3_5_cp"]
-
-import inspect
-from contextlib import contextmanager
+from collections.abc import Sequence
 from dataclasses import dataclass
 
+import spmd_types as spmd
 import torch
-from torch.distributed.tensor import DTensor, Shard
+import torch.distributed as dist
 from torchtitan.config import TORCH_DTYPE_MAP
 from torchtitan.distributed.fsdp import (
     apply_fsdp_to_decoder,
     apply_fsdp_to_multimodal_encoder,
     resolve_fsdp_mesh,
     resolve_sparse_fsdp_mesh,
-)
-
-
-@contextmanager
-def _qwen_aot_eager_compile_options(backend: str):
-    """Isolate Qwen3.5 recompilation caches for dynamic multimodal inputs.
-
-    The upstream compiler applies fullgraph=True to every transformer block.
-    Qwen3.5 multimodal batches legitimately vary in vision-token and
-    packed-document metadata shapes, so one shared checkpoint-wrapper code
-    object can exceed Dynamo's recompilation cache. Keep this policy local to
-    the Qwen3.5 adapter and only for aot_eager; other models and backends
-    retain the upstream compile contract.
-    """
-    if backend != "aot_eager":
-        yield
-        return
-
-    original_compile = torch.nn.Module.compile
-    try:
-        compile_parameters = inspect.signature(torch.compile).parameters
-    except (TypeError, ValueError):
-        compile_parameters = {}
-
-    def _compile_qwen_block(self, *args, **kwargs):
-        # Isolate per-call cache entries when supported; heterogeneous Qwen
-        # blocks otherwise share checkpoint-wrapper recompilation counters.
-        # Keep upstream fullgraph=True so each block remains an aot_eager
-        # graph; isolation prevents unrelated block variants exhausting the
-        # shared Dynamo cache.
-        if "isolate_recompiles" in compile_parameters:
-            kwargs.setdefault("isolate_recompiles", True)
-        return original_compile(self, *args, **kwargs)
-
-    torch.nn.Module.compile = _compile_qwen_block
-    try:
-        yield
-    finally:
-        torch.nn.Module.compile = original_compile
-
-
-@dataclass(frozen=True, slots=True)
-class QwenCPMetadata:
-    cu_seqlens: torch.Tensor
-    cu_seqlens_cpu: torch.Tensor
-    actual_seq_qlen: torch.Tensor
-
-
-QWEN_CONTEXT_PARALLEL_UNSUPPORTED = (
-    "Qwen3.5/3.6 NPU Context Parallel is not migrated to the folded token layout yet: "
-    "the CP GatedDeltaNet and varlen-attention forwards still target the pre-fold "
-    "[B, L, ...] interface, and upstream 0.4.0 moved the GatedDeltaNet seam under "
-    "inner_gated_delta_net. Keep context_parallel_degree at 1 until the CP NPU "
-    "validation pass lands."
 )
 
 
@@ -107,26 +52,30 @@ def apply_qwen3_5_npu_fsdp(model, *, parallelism_context, training, parallelism)
     )
 
 
-def shard_local_heads(tensor, mesh):
-    return tensor.chunk(mesh.size(), 0)[mesh.get_local_rank()].contiguous()
+def exchange_sequence_heads(tensors: Sequence[torch.Tensor], group: dist.ProcessGroup) -> tuple[torch.Tensor, ...]:
+    """Combine CP exchanges while preserving each projection's head order."""
+    degree = group.size()
+    if any(tensor.shape[1] % degree for tensor in tensors):
+        raise ValueError("Each projection's channel count must be divisible by CP.")
+    shards = [tensor.chunk(degree, 1) for tensor in tensors]
+    packed = torch.cat([parts[rank] for rank in range(degree) for parts in shards], 1)
+    packed = spmd.redistribute(packed, group, src=spmd.S(0), dst=spmd.S(1))
+    return packed.split([parts[0].shape[1] for parts in shards], 1)
 
 
-def sequence_to_head_shard(tensor, mesh, head_dim):
-    tensor = DTensor.from_local(tensor, mesh, (Shard(1),), run_check=False)
-    return tensor.redistribute(placements=(Shard(head_dim),)).to_local()
+def head_to_sequence_shard(tensor: torch.Tensor, group: dist.ProcessGroup) -> torch.Tensor:
+    return spmd.redistribute(tensor, group, src=spmd.S(1), dst=spmd.S(0))
 
 
-def head_to_sequence_shard(tensor, mesh, head_dim):
-    tensor = DTensor.from_local(tensor, mesh, (Shard(head_dim),), run_check=False)
-    return tensor.redistribute(placements=(Shard(1),)).to_local()
+def shard_local_heads(tensor: torch.Tensor, group: dist.ProcessGroup) -> torch.Tensor:
+    return spmd.redistribute(tensor, group, src=spmd.R, dst=spmd.S(0))
 
 
-def exchange_sequence_heads(tensors, mesh, head_dim):
-    degree = mesh.size()
-    shards = [tensor.chunk(degree, head_dim) for tensor in tensors]
-    packed = torch.cat([part[rank] for rank in range(degree) for part in shards], head_dim)
-    packed = sequence_to_head_shard(packed, mesh, head_dim)
-    return packed.split([part[0].size(head_dim) for part in shards], head_dim)
+@dataclass(frozen=True, slots=True)
+class QwenCPMetadata:
+    cu_seqlens: torch.Tensor
+    cu_seqlens_cpu: torch.Tensor
+    actual_seq_qlen: torch.Tensor
 
 
 def build_sequence_metadata(varlen):
@@ -153,29 +102,3 @@ def prepare_sequence_metadata(module, args, kwargs):
     elif not isinstance(masks, QwenCPMetadata):
         kwargs["attention_masks"] = build_sequence_metadata(masks)
     return args, kwargs
-
-
-def parallelize_qwen3_5_cp(model, *, parallelism_context, **kwargs):
-    """Refuse the not-yet-migrated Qwen3.5 NPU context-parallel path.
-
-    The CP graph (rank-local ``QwenCPMetadata`` pre-hook, head exchange in the
-    GatedDeltaNet/varlen-attention forwards, and the FSDP2 wrap over the CP
-    storage mesh) still targets the pre-fold ``[B, L, ...]`` modules, while the
-    pinned trainer hands folded ``[T, ...]`` rows to folded attention seams.
-    Wiring the old modules into that contract would train on mis-sharded
-    activations, so the path is disabled until its NPU validation pass lands.
-    The CPU-safe metadata helpers above are kept for that migration and for
-    their unit tests.
-    """
-    # Keep the mode-specific refusals first: recipes may call the CP helper
-    # directly, and those combinations are rejected for their own reasons even
-    # after the folded migration.
-    if parallelism_context.ep_enabled:
-        raise NotImplementedError("Qwen3.5 NPU Context Parallel does not support Expert Parallel yet.")
-    if parallelism_context.tp_enabled:
-        raise NotImplementedError("Qwen3.5 NPU Context Parallel does not support Tensor Parallel yet.")
-    if getattr(model, "vision_encoder", None) is not None:
-        raise NotImplementedError(
-            "Qwen3.5-VL NPU Context Parallel is not supported for multimodal attention masks yet."
-        )
-    raise NotImplementedError(QWEN_CONTEXT_PARALLEL_UNSUPPORTED)

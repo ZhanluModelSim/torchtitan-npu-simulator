@@ -8,7 +8,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 
-MODULE="${MODULE:-torchtitan_npu_recipes.examples.qwen3_6}" \
-CONFIG="${CONFIG:-run_qwen3_6_4k}" \
+MODULE="${MODULE:-torchtitan_npu_recipes.examples.qwen3_5}" \
+CONFIG="${CONFIG:-run_qwen3_5_4k}" \
 NGPU="${NGPU:-16}" \
 exec bash "${SCRIPT_DIR}/../../scripts/run_train.sh" "$@"

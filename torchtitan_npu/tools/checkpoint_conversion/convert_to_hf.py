@@ -17,7 +17,9 @@ import io
 import logging
 import os
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import AbstractContextManager, nullcontext
 from pathlib import Path
+from typing import TYPE_CHECKING, cast
 
 import torch
 import torch.distributed.checkpoint as dcp
@@ -29,6 +31,9 @@ from torch.futures import Future
 from torchtitan.components.checkpointer import ModelWrapper
 from torchtitan.components.checkpointer.utils import canonical_fqn
 from torchtitan.config import TORCH_DTYPE_MAP
+
+if TYPE_CHECKING:
+    from torchtitan_npu.models.qwen3_5 import Qwen35TextStateDictAdapter
 
 _EMA_STATE_PREFIX = "ema_optimizer.state."
 _EMA_STATE_SUFFIX = ".ema_params"
@@ -134,17 +139,25 @@ def _load_ema_state_dict(model_state_dict, trainable_fqns, input_dir, read_threa
     return ema_state_dict
 
 
-def _save_as_hf(state_dict, sd_adapter, target_dtype, output_dir):
+def _save_as_hf(state_dict, sd_adapter, target_dtype, output_dir, *, filter_weight_index=False):
     hf_state_dict = sd_adapter.to_hf(state_dict)
     if target_dtype != torch.float32:
         # The adapter stores hash routing indices as float32 in HF format.
         # Rounding those indices changes the selected expert after reload.
         hf_state_dict = {k: v if k.endswith(".tid2eid") else v.to(target_dtype) for k, v in hf_state_dict.items()}
 
+    weight_index = sd_adapter.fqn_to_index_mapping
+    if filter_weight_index and weight_index is not None:
+        # A Qwen vision DCP can omit auxiliary weights listed in the source HF index.
+        if hf_state_dict.keys() <= weight_index.keys():
+            weight_index = {name: weight_index[name] for name in hf_state_dict}
+        else:
+            weight_index = None
+
     storage_writer = HuggingFaceStorageWriter(
         path=output_dir,
         save_distributed=True,
-        fqn_to_index_mapping=sd_adapter.fqn_to_index_mapping,
+        fqn_to_index_mapping=weight_index,
         enable_consolidation=True,
         thread_count_consolidation=5,
     )
@@ -165,8 +178,21 @@ def convert_to_hf(args: argparse.Namespace):
     # Allow a fully-qualified module path (e.g. torchtitan_npu.models.deepseek_v4)
     # while preserving the short ``llama3`` form used upstream.
     module_name = model_name if "." in model_name else f"torchtitan.models.{model_name}"
-    model_module = importlib.import_module(module_name)
-    model_config = model_module.model_registry(model_flavor)
+    reader = ParallelFileSystemReader(input_dir, thread_count=read_threads)
+    metadata = None
+    has_vision = False
+    if module_name in {"torchtitan.models.qwen3_5", "torchtitan_npu.models.qwen3_5"}:
+        import torchtitan_npu  # noqa: F401 -- load the NPU patches before importing Qwen
+        from torchtitan_npu.models.qwen3_5 import checkpoint_model_config
+
+        metadata = reader.read_metadata().state_dict_metadata
+        has_vision = any(key.startswith("vision_encoder.") for key in metadata)
+        model_config = checkpoint_model_config(
+            model_flavor, has_vision=has_vision, separate_gate_up="layers.0.feed_forward.w1.weight" in metadata
+        )
+    else:
+        model_module = importlib.import_module(module_name)
+        model_config = model_module.model_registry(model_flavor)
 
     with torch.device("cpu"):
         raw_model = model_config.build()
@@ -182,23 +208,30 @@ def convert_to_hf(args: argparse.Namespace):
 
     # allocate state dict memory with empty weights to load checkpoint
     state_dict = model.state_dict()
-    reader = ParallelFileSystemReader(input_dir, thread_count=read_threads)
-    dcp.load(state_dict, storage_reader=reader)
+    load_state = state_dict
+    export_context: AbstractContextManager[None] = nullcontext()
+    if metadata is not None and not has_vision:
+        text_adapter = cast("Qwen35TextStateDictAdapter", sd_adapter)
+        if "qwen_hf_source.path" in metadata:
+            load_state = state_dict | {"qwen_hf_source": text_adapter}
+        export_context = text_adapter.export_hf(fallback_path=str(hf_assets_path))
+    dcp.load(load_state, storage_reader=reader)
 
     target_dtype = TORCH_DTYPE_MAP[export_dtype]
-    _save_as_hf(state_dict, sd_adapter, target_dtype, output_dir)
+    with export_context:
+        _save_as_hf(state_dict, sd_adapter, target_dtype, output_dir, filter_weight_index=has_vision)
 
-    if ema_output is not None:
-        ema_state_dict = _load_ema_state_dict(state_dict, trainable_fqns, input_dir, read_threads)
-        if ema_state_dict is None:
-            logger.warning(
-                "--ema_output was given but the checkpoint at %s has no EMA weights "
-                "(EMA was disabled during that training run, or this checkpoint predates "
-                "EMA support). Skipping EMA export.",
-                input_dir,
-            )
-        else:
-            _save_as_hf(ema_state_dict, sd_adapter, target_dtype, ema_output)
+        if ema_output is not None:
+            ema_state_dict = _load_ema_state_dict(state_dict, trainable_fqns, input_dir, read_threads)
+            if ema_state_dict is None:
+                logger.warning(
+                    "--ema_output was given but the checkpoint at %s has no EMA weights "
+                    "(EMA was disabled during that training run, or this checkpoint predates "
+                    "EMA support). Skipping EMA export.",
+                    input_dir,
+                )
+            else:
+                _save_as_hf(ema_state_dict, sd_adapter, target_dtype, ema_output, filter_weight_index=has_vision)
 
 
 def main():

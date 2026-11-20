@@ -42,4 +42,32 @@ import torchtitan_npu.patches.torchtitan.distributed.checkpoint.filesystem  # no
 from . import observability  # noqa: F401
 
 from .models.common import moe, rope, token_dispatcher  # noqa: F401
+
+
+def _patch_optional_qwen_short_conv() -> None:
+    # Apply before a Qwen import resolves the optional CuTeDSL backend.
+    from torchtitan.models.common import attn_gym
+
+    resolve = attn_gym.__getattr__
+    backend = "attn_gym.linear.short_conv"
+
+    def resolve_optional_short_conv(name: str):
+        try:
+            return resolve(name)
+        except ImportError as error:
+            cause = error.__cause__
+            if name != "causal_conv1d" or not isinstance(cause, ModuleNotFoundError) or cause.name != "cutlass":
+                raise
+            # Attention Gym 0.0.17 wraps this missing backend on attribute
+            # access. Give TorchTitan the same deferred error it uses when
+            # a backend fails during module import.
+            vars(attn_gym)["_BACKEND_ERRORS"].setdefault(backend, cause)
+            kernel = vars(attn_gym)["_missing_backend_kernel"](backend)
+            vars(attn_gym)[name] = kernel
+            return kernel
+
+    attn_gym.__getattr__ = resolve_optional_short_conv
+
+
+_patch_optional_qwen_short_conv()
 from .models import deepseek_v4  # noqa: F401

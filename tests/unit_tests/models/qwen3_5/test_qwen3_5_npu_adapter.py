@@ -53,7 +53,6 @@ def test_qwen_launchers_select_recipes_and_delegate_to_run_train():
     for model, recipe, devices in (
         ("qwen3_5", "qwen3_5_debugmodel_1p_cpt_512", 1),
         ("qwen3_5", "qwen3_5_debugmodel_moe_8p_cpt_512", 8),
-        ("qwen3_6", "run_qwen3_6_4k", 16),
     ):
         script = (root / "examples" / model / f"{recipe}.sh").read_text(encoding="utf-8")
         assert f"MODULE:-torchtitan_npu_recipes.examples.{model}" in script

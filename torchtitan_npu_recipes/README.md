@@ -6,12 +6,11 @@
 | --- | --- |
 | `torchtitan_npu_recipes.models.deepseek_v4` | V4 eager、SFT、LoRA 和 TorchFT 配置工厂 |
 | `torchtitan_npu_recipes.models.deepseek_v4_1` | V4.1 文本、多模态和 LoRA 配置工厂 |
-| `torchtitan_npu_recipes.models.qwen3_5` | Qwen 配置工厂 |
+| `torchtitan_npu_recipes.models.qwen3_5` | Qwen3.5 系列配置工厂 |
 | `torchtitan_npu_recipes.graph_trainer.deepseek_v4` | V4 GraphTrainer 配置工厂 |
 | `torchtitan_npu_recipes.examples.deepseek_v4` | 19 个 V4 launcher 的完整配置 |
 | `torchtitan_npu_recipes.examples.deepseek_v4_1` | 12 个 V4.1 launcher 的完整配置 |
 | `torchtitan_npu_recipes.examples.qwen3_5` | 2 个 Qwen3.5 launcher 的完整配置 |
-| `torchtitan_npu_recipes.examples.qwen3_6` | Qwen3.6 launcher 的配置入口（基础工厂仍延期） |
 
 这些是配置的归属，不是功能支持声明。TorchTitan 0.4.0 的当前 NPU 适配优先覆盖 DeepSeek 文本 eager；TP、CP、PP、多模态、SFT、LoRA、图训练与其他延期路径仍受各实现的限制。移动配置不会启用这些功能。
 

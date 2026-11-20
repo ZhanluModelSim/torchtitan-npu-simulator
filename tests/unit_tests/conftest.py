@@ -49,7 +49,6 @@ collect_ignore = [
     "models/test_mtp_cp_chunk_loss.py",
     # CP metadata rebuild tests wait for the v0.4 context-parallel transform.
     "override/deepseek_v4_1/test_asc_metadata_reuse.py",
-    "override/qwen3_5/test_cp_config.py",
     # The stage-denominator AuxLoss patch was replaced by v0.4.0's inject(denominator=...).
     "patches/torchtitan/models/common/test_aux_loss.py",
     # Multimodal / Qwen runtime migration is deferred by the upgrade plan.

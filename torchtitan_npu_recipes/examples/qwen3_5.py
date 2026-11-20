@@ -11,6 +11,28 @@ import os
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from torchtitan_npu_recipes.models.qwen3_5 import (
+    qwen3_5_27b_sft_64k_cp8 as qwen3_5_27b_sft_64k_cp8,
+)
+from torchtitan_npu_recipes.models.qwen3_5 import (
+    run_qwen3_5_4k as run_qwen3_5_4k,
+)
+from torchtitan_npu_recipes.models.qwen3_5 import (
+    run_qwen3_5_32k_cp8 as run_qwen3_5_32k_cp8,
+)
+from torchtitan_npu_recipes.models.qwen3_5 import (
+    run_qwen3_5_32k_cp8_fla as run_qwen3_5_32k_cp8_fla,
+)
+from torchtitan_npu_recipes.models.qwen3_5 import (
+    run_qwen3_5_64k_cp8 as run_qwen3_5_64k_cp8,
+)
+from torchtitan_npu_recipes.models.qwen3_5 import (
+    run_qwen3_5_128k_cp8 as run_qwen3_5_128k_cp8,
+)
+from torchtitan_npu_recipes.models.qwen3_5 import (
+    run_qwen_sft as run_qwen_sft,
+)
+
 if TYPE_CHECKING:
     from torchtitan.trainer import Trainer
 
