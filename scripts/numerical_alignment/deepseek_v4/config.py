@@ -47,13 +47,28 @@ __all__ = [
 def build_torchtitan_config(model_flavor: str, *, seq_len: int = 4096):
     """Build the registered TorchTitan config for one DSV4 flavor."""
 
-    from torchtitan_npu_recipes.models import deepseek_v4 as config_registry
+    if model_flavor == "deepseek_v4_flash":
+        # Conversion/alignment needs the full 256-expert flavor.  The verified
+        # reduced debug recipe has a different expert dimension, so construct
+        # this model through the shared model builder and wrap it in the test
+        # recipe's common trainer config.
+        from torchtitan.config.parallelism import ParallelismConfig
+
+        from torchtitan_npu.models.deepseek_v4 import build_model_config
+        from torchtitan_npu_recipes.tests.models.deepseek_v4 import _trainer_config
+
+        parallelism = ParallelismConfig(expert_parallel_degree=1, fsdp_reshard_after_forward="always")
+        model = build_model_config(model_flavor, parallelism=parallelism, seq_len=seq_len, num_mtp_layers=0)
+        return _trainer_config(model, parallelism=parallelism, num_mtp_layers=0)
 
     factory_name = _MODEL_CONFIG_FACTORIES.get(model_flavor)
     if factory_name is None:
         raise ValueError(
             f"unknown DSV4 model flavor {model_flavor!r}; expected one of {sorted(_MODEL_CONFIG_FACTORIES)}"
         )
+
+    from torchtitan_npu_recipes.tests.models import deepseek_v4 as config_registry
+
     # The alignment reference config disables multi-token prediction. The HF
     # view built by ``hf_model`` also sets ``num_nextn_predict_layers=0``;
     # keeping both sides on the same main decoder avoids constructing an

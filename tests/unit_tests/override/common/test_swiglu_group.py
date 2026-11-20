@@ -26,7 +26,7 @@ _DISPATCHERS = {
     "standard": ("torchtitan_npu.override.common.token_dispatcher.asc", AscAllToAllTokenDispatcher.Config),
 }
 _RECIPES = [
-    ("torchtitan_npu_recipes.models.deepseek_v4", "deepseek_v4_debugmodel"),
+    ("torchtitan_npu_recipes.tests.models.deepseek_v4", "deepseek_v4_debugmodel"),
     ("torchtitan_npu_recipes.models.deepseek_v4_1", "deepseek_v4_1_debugmodel_text"),
 ]
 

@@ -11,16 +11,18 @@ import types
 
 import pytest
 from torchtitan.components.optim import AdamW
-from torchtitan.config import ConfigLoader
+from torchtitan.config.loader import ConfigLoader
 
 from torchtitan_npu.config import OptimizerConfig
 from torchtitan_npu.extensions.torchtitan.components.optimizer.muon import DistMuon
+from torchtitan_npu_recipes.models.deepseek_v4 import _dsv4_muon_profile
+from torchtitan_npu_recipes.models.deepseek_v4_1 import _v41_muon_profile
 
 
 @pytest.mark.parametrize(
     ("module", "recipe"),
     [
-        ("torchtitan_npu_recipes.models.deepseek_v4", "deepseek_v4_debugmodel"),
+        ("torchtitan_npu_recipes.tests.models.deepseek_v4", "deepseek_v4_debugmodel"),
         ("torchtitan_npu_recipes.models.deepseek_v4_1", "deepseek_v4_1_debugmodel_text"),
     ],
 )
@@ -29,8 +31,7 @@ def test_real_muon_recipe_selects_npu_config_and_propagates_replica_dedup(module
     def configured_recipe():
         config = getattr(importlib.import_module(module), recipe)()
         config.hf_assets_path = str(tmp_path)
-        recipes = importlib.import_module(module)
-        profile = (recipes._dsv4_muon_profile if "_v4_1" not in module else recipes._v41_muon_profile)(config.model)
+        profile = (_v41_muon_profile if "v4_1" in module else _dsv4_muon_profile)(config.model)
         config.optim.optimizer = OptimizerConfig(
             optimizers=[
                 DistMuon.Config(

@@ -5,7 +5,7 @@
 set -eo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-MODULE="${MODULE:-torchtitan_npu_recipes.examples.qwen3_5}"
+MODULE="${MODULE:-torchtitan_npu_recipes.models.qwen3_5}"
 NGPU="${NGPU:-16}"
 TRAIN_FILE=torchtitan_npu_recipes.qwen_sft
 

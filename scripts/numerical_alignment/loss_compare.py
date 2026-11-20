@@ -36,8 +36,8 @@ native 侧由本工具的训练入口构造 DCP checkpointer，不修改模型 r
 1. 比较自行准备的两个训练脚本
 
     python scripts/numerical_alignment/loss_compare.py \
-        --baseline-runner examples/deepseek_v4/debug/base.sh \
-        --test-runner examples/deepseek_v4/debug/test.sh
+        --baseline-runner scripts/run_train.sh \
+        --test-runner scripts/run_train.sh
 
 两侧均从当前仓库根目录启动，相对路径以仓库根目录为基准，脚本无需提交。
 模型配置、数据路径和 override 等可直接写入各自脚本；脚本必须将 "$@" 追加到
@@ -52,8 +52,8 @@ native 侧由本工具的训练入口构造 DCP checkpointer，不修改模型 r
 也可用当前工作区准备的脚本启动历史版本的代码，脚本无需存在于被测提交中：
 
     python scripts/numerical_alignment/loss_compare.py branch1 branch2 \
-        --baseline-runner examples/deepseek_v4/debug/base.sh \
-        --test-runner examples/deepseek_v4/debug/test.sh
+        --baseline-runner scripts/run_train.sh \
+        --test-runner scripts/run_train.sh
 
 上述相对入口路径会先基于当前仓库根目录转为绝对路径，再从对应 worktree 执行，无需写为绝对路径。
 入口脚本须沿用该工作目录，以相对路径启动训练，例如 `bash scripts/run_train.sh "$@"`。
@@ -64,12 +64,12 @@ native 侧由本工具的训练入口构造 DCP checkpointer，不修改模型 r
 
 默认入口脚本为：
 
-    examples/deepseek_v4/debug/deepseek_v4_mini_1p_cpt_2k_a3.sh
+    scripts/run_train.sh
 
 通过 --runner 可指定其他入口脚本：
 
     python scripts/numerical_alignment/loss_compare.py main HEAD \
-        --runner examples/deepseek_v4/debug/deepseek_v4_flash_8p_cpt_4k_a5.sh
+        --runner scripts/run_train.sh
 
 这里的 --runner 为相对路径，两侧分别读取各自 ref 中的 A5 脚本，因此两个 ref 都须包含该文件。
 若脚本仅存在于当前工作区，使用前述 --baseline-runner / --test-runner 指定。
@@ -87,8 +87,8 @@ native 侧由本工具的训练入口构造 DCP checkpointer，不修改模型 r
 5. 比较不同训练参数或 override
 
     python scripts/numerical_alignment/loss_compare.py HEAD HEAD \
-        --baseline-options='--override.imports baseline.factory' \
-        --test-options='--override.imports candidate.factory'
+        --baseline-options='--override baseline.factory' \
+        --test-options='--override candidate.factory'
 
     runner 通过环境变量选择 override 组时，可用 --baseline-env / --test-env
     为两侧注入不同环境（例如 debug_deepseek_v4_1p.sh 的 USE_GOLDEN）：
@@ -105,7 +105,7 @@ native 侧由本工具的训练入口构造 DCP checkpointer，不修改模型 r
 - --baseline-runner / --test-runner：分别指定两侧入口，覆盖 --runner。
   相对路径始终使用当前工作区根目录中的文件，不受 Git ref 影响；
   绝对路径直接使用指定文件，入口脚本无需提交。
-- --runner：两侧入口的默认值；未指定时使用上述 DeepSeek-V4 mini 脚本。
+- --runner：两侧入口的默认值；未指定时使用 `scripts/run_train.sh`，模型和配置由环境变量选择。
   指定 Git ref 时，相对路径分别使用对应 ref 中的脚本；绝对路径两侧共用。
 - --seq-len：seed 和两侧训练的序列长度，默认 4096；例如 `--seq-len 2048`。
 - --ngpus：可选的两侧 NPU 进程数覆盖值；默认沿用环境变量和各自 runner 的卡数设置。
@@ -155,7 +155,7 @@ FIXED_TRAINING_OPTIONS = (
     "--metrics.log_freq=1",
 )
 TENSORBOARD_FOLDER = "tensorboard"
-DEFAULT_RUNNER = Path("examples/deepseek_v4/debug/deepseek_v4_mini_1p_cpt_2k_a3.sh")
+DEFAULT_RUNNER = Path("scripts/run_train.sh")
 RELATIVE_ERROR_FLOOR = 1e-4
 
 
@@ -335,17 +335,16 @@ def build_seed_command(
     training_api: str = "tokens",
     config_api: str = "native",
 ) -> list[str]:
-    # Seed creation skips parallelize_fn but still builds an optimizer. Use
-    # AdamW here because DistMuon requires DTensor parameters. Only model
-    # weights are saved; training keeps the runner's optimizer selection.
+    # Seed creation uses the selected Python recipe. The native entry point
+    # switches the optimizer and mesh to a single-process seed setup after
+    # loading the recipe, so the launcher does not need legacy CLI overrides.
     return [
         str(runner),
-        f"--dump_folder={dump_folder}",
+        f"--output-dir={dump_folder}",
         *(
             [
                 "--comparison-create-seed-checkpoint",
                 f"--comparison-checkpoint-folder={dump_folder / 'checkpoint'}",
-                "--optim.optimizer.name=AdamW",
             ]
             if config_api == "native"
             else [
@@ -358,12 +357,6 @@ def build_seed_command(
                 "--optimizer.name=AdamW",
             ]
         ),
-        "--parallelism.data-parallel-replicate-degree=1",
-        "--parallelism.data-parallel-shard-degree=1",
-        "--parallelism.tensor-parallel-degree=1",
-        "--parallelism.pipeline-parallel-degree=1",
-        "--parallelism.context-parallel-degree=1",
-        "--parallelism.expert-parallel-degree=1",
         *_fixed_training_options(deterministic=deterministic, seq_len=seq_len, training_api=training_api),
     ]
 
@@ -382,7 +375,7 @@ def build_training_command(
 ) -> list[str]:
     command = [
         str(runner),
-        f"--dump_folder={dump_folder}",
+        f"--output-dir={dump_folder}",
         *shlex.split(options),
         *_fixed_training_options(deterministic=deterministic, seq_len=seq_len, training_api=training_api),
         f"--training.steps={steps}",

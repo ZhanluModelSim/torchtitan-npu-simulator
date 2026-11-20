@@ -3,147 +3,61 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+"""Full-model DeepSeek-V4 GraphTrainer recipe."""
+
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from torchtitan_npu.extensions.torchtitan.components.checkpoint import CheckpointManager
 from torchtitan_npu.models.deepseek_v4.graph_trainer import to_graph_trainer_config
 from torchtitan_npu.models.deepseek_v4.model import GraphTrainerDeepSeekV4Model
-from torchtitan_npu_recipes.models.deepseek_v4 import (
-    deepseek_v4_debugmodel,
-    deepseek_v4_flash,
-    deepseek_v4_flash_43layers_16experts,
-    deepseek_v4_pro,
-    deepseek_v4_pro_61layers_32experts,
-)
+from torchtitan_npu_recipes.models import deepseek_v4 as model_recipes
 
 if TYPE_CHECKING:
-    from torchtitan.config.parallelism import ParallelismConfig
-    from torchtitan.experiments.graph_trainer.configs import GraphTrainerCompileConfig
-    from torchtitan.experiments.graph_trainer.trainer import GraphTrainer
+    from torchtitan_npu.extensions.torchtitan.trainer import TrainerEx
 
 
-def _graph_trainer_compile_config() -> GraphTrainerCompileConfig:
-    """Compile settings shared by the GraphTrainer flash/pro config factories."""
-    from torchtitan.experiments.graph_trainer.configs import GraphTrainerCompileConfig
+def _to_graph_config(base: TrainerEx.Config) -> TrainerEx.Config:
+    """Convert the training recipe with the existing NPU graph policy and guard."""
+    from torchtitan.config import derive
+    from torchtitan.experiments.graph_trainer.configs import EpOverlapConfig, GraphTrainerCompileConfig
 
+    try:
+        from torchtitan_npu.extensions.torchtitan.experiments.graph_trainer import GraphTrainerEx
+    except TypeError as error:
+        if "multiple bases have instance lay-out conflict" not in str(error):
+            raise
+        raise NotImplementedError(
+            "NPU GraphTrainer remains deferred: its existing slotted configuration "
+            "bases have incompatible instance layouts in TorchTitan 0.4.0."
+        ) from error
     from torchtitan_npu.patches.torchtitan.experiments.graph_trainer import (
         functionalize_recompute_mutations as _functionalize_mutations,
     )
 
-    return GraphTrainerCompileConfig(
+    base.compile = None
+    graph = to_graph_trainer_config(base, GraphTrainerDeepSeekV4Model.Config)
+    graph.compile = GraphTrainerCompileConfig(
         memory_policy="full",
-        # Keeps recomputed forward mutations (fused partial RoPE) faithful;
-        # see the functionalize_recompute_mutations patch module.
-        pass_pipeline=_functionalize_mutations.PASS_PIPELINE_NAME,
-        disable_passes=[
-            "cudagraph_pass",
-        ],
+        pass_pipeline=f"{_functionalize_mutations.PASS_PIPELINE_NAME}+npu_auto_overlap",
+        disable_passes=["cudagraph_pass"],
+        ep_overlap=EpOverlapConfig(enabled=True, chunk_dim="seq", module_fqn="layers.*.feed_forward"),
     )
+    return derive(graph, GraphTrainerEx.Config, extension=base.extension)
 
 
-def graph_trainer_deepseek_v4_debugmodel(
-    *,
-    parallelism: ParallelismConfig | None = None,
-    seq_len: int = 2048,
-    hf_assets_path: str | None = None,
-) -> GraphTrainer.Config:
-    """GraphTrainer config for the DeepSeek V4 debug model"""
-    from torchtitan.experiments.graph_trainer.configs import GraphTrainerCompileConfig
-
-    from torchtitan_npu.patches.torchtitan.experiments.graph_trainer import (
-        functionalize_recompute_mutations as _functionalize_mutations,
-    )
-
-    config = to_graph_trainer_config(
-        deepseek_v4_debugmodel(
-            num_mtp_layers=0, parallelism=parallelism, seq_len=seq_len, hf_assets_path=hf_assets_path
-        ),
-        GraphTrainerDeepSeekV4Model.Config,
-    )
-    config.compile = GraphTrainerCompileConfig(
-        memory_policy="full",
-        enable_passes=True,
-        pass_pipeline=_functionalize_mutations.PASS_PIPELINE_NAME,
-        disable_passes=[
-            "cudagraph_pass",
-        ],
-    )
-    return config
+def graph_trainer_deepseek_v4_flash_cpt_4k_a5() -> TrainerEx.Config:
+    """Build 128-rank Flash graph CPT on A5 (16 x 8 NPUs) with DeepEP and block-FP8; currently deferred."""
+    base = model_recipes.deepseek_v4_flash_cpt_4k_a5()
+    base.training.steps = 20
+    # EP overlap currently requires one microbatch per train step.  Keep the
+    # token budget sentinel until GraphTrainer lifts that schema restriction.
+    base.training.num_tokens_per_train_step = -1
+    return _to_graph_config(base)
 
 
-def graph_trainer_deepseek_v4_flash(
-    *,
-    parallelism: ParallelismConfig | None = None,
-    seq_len: int = 4096,
-    hf_assets_path: str | None = None,
-) -> GraphTrainer.Config:
-    """GraphTrainer config for the DeepSeek V4 Flash model"""
-    config = to_graph_trainer_config(
-        deepseek_v4_flash(num_mtp_layers=0, parallelism=parallelism, seq_len=seq_len, hf_assets_path=hf_assets_path),
-        GraphTrainerDeepSeekV4Model.Config,
-    )
-    config.compile = _graph_trainer_compile_config()
-    return config
+def graph_trainer_deepseek_v4_debugmodel() -> TrainerEx.Config:
+    """Debug-width GraphTrainer recipe used by the graph parallelize contract."""
+    from torchtitan_npu_recipes.tests.models import deepseek_v4 as test_recipes
 
-
-def graph_trainer_deepseek_v4_flash_43layers_16experts(
-    *,
-    parallelism: ParallelismConfig | None = None,
-    seq_len: int = 4096,
-    hf_assets_path: str | None = None,
-) -> GraphTrainer.Config:
-    """GraphTrainer config for the DeepSeek V4 Flash 43 Layers 16 experts model"""
-    config = to_graph_trainer_config(
-        deepseek_v4_flash_43layers_16experts(
-            num_mtp_layers=0, parallelism=parallelism, seq_len=seq_len, hf_assets_path=hf_assets_path
-        ),
-        GraphTrainerDeepSeekV4Model.Config,
-    )
-    config.compile = _graph_trainer_compile_config()
-    return config
-
-
-def graph_trainer_deepseek_v4_pro(
-    *,
-    parallelism: ParallelismConfig | None = None,
-    seq_len: int = 4096,
-    hf_assets_path: str | None = None,
-) -> GraphTrainer.Config:
-    """GraphTrainer config for the DeepSeek V4 Pro model"""
-    config = to_graph_trainer_config(
-        deepseek_v4_pro(num_mtp_layers=0, parallelism=parallelism, seq_len=seq_len, hf_assets_path=hf_assets_path),
-        GraphTrainerDeepSeekV4Model.Config,
-    )
-    config.compile = _graph_trainer_compile_config()
-    return config
-
-
-def graph_trainer_deepseek_v4_pro_61layers_32experts(
-    *,
-    parallelism: ParallelismConfig | None = None,
-    seq_len: int = 4096,
-    hf_assets_path: str | None = None,
-) -> GraphTrainer.Config:
-    """GraphTrainer config for the DeepSeek V4 Pro 61 Layers 32 experts model"""
-    config = to_graph_trainer_config(
-        deepseek_v4_pro_61layers_32experts(
-            num_mtp_layers=0, parallelism=parallelism, seq_len=seq_len, hf_assets_path=hf_assets_path
-        ),
-        GraphTrainerDeepSeekV4Model.Config,
-    )
-    config.compile = _graph_trainer_compile_config()
-    return config
-
-
-def graph_trainer_deepseek_v4_flash_cpt(
-    *,
-    parallelism: ParallelismConfig | None = None,
-    seq_len: int = 4096,
-    hf_assets_path: str | None = None,
-) -> GraphTrainer.Config:
-    """Launch recipe with explicit compilation and checkpoint policy."""
-    config = graph_trainer_deepseek_v4_flash(parallelism=parallelism, seq_len=seq_len, hf_assets_path=hf_assets_path)
-    config.checkpointer = CheckpointManager.Config(load_only=True)
-    return config
+    return _to_graph_config(test_recipes.deepseek_v4_debugmodel())

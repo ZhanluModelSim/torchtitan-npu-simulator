@@ -12,28 +12,26 @@ from torchtitan.components.data import (
     HuggingFaceRandomAccessSource,
     SingleDatasetConfig,
 )
+from torchtitan.config.parallelism import ParallelismConfig
 
 from tests.unit_tests.models.common.text_data_utils import IntegerTextTokenizer
 from torchtitan_npu.models.common.alignment import AlignedTextProcessor
-from torchtitan_npu_recipes.models.deepseek_v4 import deepseek_v4_debugmodel
+from torchtitan_npu_recipes.tests.models.deepseek_v4 import deepseek_v4_debugmodel
 
 
 def test_debugmodel_uses_the_documented_per_layer_compression_ratios():
-    from torchtitan_npu.models.deepseek_v4 import model_registry
+    from torchtitan_npu.models.deepseek_v4 import build_model_config
 
-    model_spec = model_registry("debugmodel")
+    model_spec = build_model_config("debugmodel", parallelism=ParallelismConfig())
 
     assert model_spec.compress_ratios == (1, 1, 4, 128)
     assert len(model_spec.layers) == len(model_spec.compress_ratios)
 
 
 def test_flash_mtp_4k_model_flops():
-    from torchtitan_npu.models.deepseek_v4 import model_registry
+    from torchtitan_npu.models.deepseek_v4 import build_model_config
 
-    model_config = model_registry(
-        "deepseek_v4_flash",
-        num_mtp_layers=1,
-    )
+    model_config = build_model_config("deepseek_v4_flash", num_mtp_layers=1, parallelism=ParallelismConfig())
 
     with torch.device("meta"):
         model = model_config.build()
@@ -46,7 +44,7 @@ def test_flash_mtp_4k_model_flops():
 
 def test_debugmodel_uses_cann_profiler_extension():
     from torchtitan_npu.extensions.torchtitan.tools.profiler import CANNProfiler
-    from torchtitan_npu_recipes.models.deepseek_v4 import deepseek_v4_debugmodel
+    from torchtitan_npu_recipes.tests.models.deepseek_v4 import deepseek_v4_debugmodel
 
     config = deepseek_v4_debugmodel()
 
@@ -61,9 +59,9 @@ def test_every_layer_uses_the_native_core_contract_the_overrides_target():
         SlidingWindowAttention,
     )
 
-    from torchtitan_npu.models.deepseek_v4 import model_registry
+    from torchtitan_npu.models.deepseek_v4 import build_model_config
 
-    model_config = model_registry("debugmodel")
+    model_config = build_model_config("debugmodel", parallelism=ParallelismConfig())
     cores = [layer.attention.inner_attention for layer in model_config.layers]
 
     assert len(cores) == len(model_config.compress_ratios) == 4
@@ -76,9 +74,9 @@ def test_every_layer_uses_the_native_core_contract_the_overrides_target():
 
 
 def test_flash_rope_configs_rotate_the_native_sliced_tail():
-    from torchtitan_npu.models.deepseek_v4 import model_registry
+    from torchtitan_npu.models.deepseek_v4 import build_model_config
 
-    model_config = model_registry("deepseek_v4_flash", num_mtp_layers=0)
+    model_config = build_model_config("deepseek_v4_flash", num_mtp_layers=0, parallelism=ParallelismConfig())
     rd = 64
 
     for layer in model_config.layers:
@@ -105,7 +103,7 @@ def test_dataloader_pads_documents_to_the_compression_alignment():
     block never straddles a document edge -- the property the compressor's
     "complete blocks only" contract and the kernels' ``cmp_residual_k`` rely on.
     """
-    from torchtitan_npu_recipes.models.deepseek_v4 import deepseek_v4_debugmodel
+    from torchtitan_npu_recipes.tests.models.deepseek_v4 import deepseek_v4_debugmodel
 
     config = deepseek_v4_debugmodel()
     assert isinstance(config.dataloader, GrainDataLoader.Config)

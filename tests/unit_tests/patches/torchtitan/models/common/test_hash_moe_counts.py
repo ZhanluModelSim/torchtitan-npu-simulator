@@ -19,6 +19,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn.functional as F
+from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.models.common.activation import Sigmoid, SwiGLU
 from torchtitan.models.common.linear import GroupedLinear
 from torchtitan.models.common.linear.hi_mid_lo_linear import HiMidLoLinear
@@ -26,7 +27,7 @@ from torchtitan.models.common.moe import MoE, register_moe_load_balancing_hook
 from torchtitan.models.deepseek_v4.moe import DeepSeekV4Router
 
 from tests.unit_tests.models.spmd_test_utils import gloo_ep_group_context
-from torchtitan_npu.models.deepseek_v4 import model_registry
+from torchtitan_npu.models.deepseek_v4 import build_model_config
 from torchtitan_npu.models.deepseek_v4_1.moe import DeepSeekV41Router
 from torchtitan_npu.patches.torchtitan.models.common.moe import (
     LimitedSwiGLU,
@@ -48,7 +49,7 @@ class _RoutedExpertsBoundaryStub(torch.nn.Module):
 def _small_config(*, route="hash", absorb=True, limit=1.0, enable_ep=False):
     # Start at the actual recipe so this test detects factory/patch selection
     # regressions, then shrink dimensions without changing expert ownership.
-    recipe = model_registry("debugmodel").layers[0].feed_forward
+    recipe = build_model_config("debugmodel", parallelism=ParallelismConfig()).layers[0].feed_forward
     router_type = DeepSeekV4Router if route == "hash" else DeepSeekV41Router
     router = router_type.Config(
         num_experts=4,
@@ -93,7 +94,7 @@ def _initialize(moe):
 
 
 def test_v4_recipe_preserves_typed_grouped_linears_clamp_scores_and_balancing_buffer():
-    config = model_registry("debugmodel").layers[0].feed_forward
+    config = build_model_config("debugmodel", parallelism=ParallelismConfig()).layers[0].feed_forward
     experts = config.routed_experts
     assert experts.__class__ is _RouterScoreAbsorbingRoutedExperts.Config
     assert (experts.w13.group_size, experts.w13.num_linears) == (config.num_experts, 2)
@@ -199,7 +200,7 @@ def _spmd_worker(rank, rendezvous, *, check_experts, uneven_peer_splits=False):
         )
         with patch.object(context_module, "device_type", "cpu"):
             context.build_mesh()
-        layer = model_registry("debugmodel").layers[0]
+        layer = build_model_config("debugmodel", parallelism=ParallelismConfig()).layers[0]
         layer.feed_forward = _small_config(enable_ep=True)
         set_deepseek_v4_layer_sharding(layer, enable_sp=True, enable_ep=True)
         with torch.random.fork_rng(devices=[]):

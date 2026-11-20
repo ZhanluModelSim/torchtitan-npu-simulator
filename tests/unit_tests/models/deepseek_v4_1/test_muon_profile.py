@@ -10,12 +10,13 @@ import torch
 from torch.distributed.tensor import Shard
 from torchtitan.components.optim import AdamW, DistMuon
 from torchtitan.components.optim.optimizer import OptimizersContainer
+from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.distributed.flex_shard import BlockShard, Owned
 from torchtitan.distributed.parallelism_context import MeshAxisName
 
 from torchtitan_npu.config import OptimizerConfig
 from torchtitan_npu.extensions.torchtitan.components.optimizer.muon import DistMuon as NpuDistMuon
-from torchtitan_npu.models.deepseek_v4 import model_registry as v4_registry
+from torchtitan_npu.models.deepseek_v4 import build_model_config
 from torchtitan_npu.models.deepseek_v4_1 import model_registry as v41_registry
 from torchtitan_npu.models.deepseek_v4_1.optimizer import EngramTableOptimizerConfig
 from torchtitan_npu_recipes.models.deepseek_v4 import _dsv4_muon_profile
@@ -25,7 +26,7 @@ from torchtitan_npu_recipes.models.deepseek_v4_1 import _v41_muon_profile
 @pytest.mark.parametrize("version", ["v4", "v41"])
 def test_muon_groups_match_real_parameters_layouts_and_buckets(version):
     if version == "v4":
-        config = v4_registry("debugmodel", seq_len=128, num_mtp_layers=1)
+        config = build_model_config("debugmodel", seq_len=128, num_mtp_layers=1, parallelism=ParallelismConfig())
         profile = _dsv4_muon_profile(config)
     else:
         config = v41_registry("deepseek_v4_1_debugmodel_text")

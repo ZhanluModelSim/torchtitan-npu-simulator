@@ -20,6 +20,12 @@ from torchtitan_npu.models.deepseek_v4_1.vision.data import build_image_token_la
 def test_full_ac_preserves_image_routing(monkeypatch, with_engram):
     # CPU-only checkpoint inputs otherwise inherit the registered NPU backend.
     monkeypatch.setattr(DefaultDeviceType, "_default_device_type", "cpu")
+    # The recipe-level test has no trainer mesh; skip the SPMD input annotation.
+    from torchtitan.distributed import spmd_types as spmd_types_module
+    from torchtitan.models.common import decoder as decoder_module
+
+    monkeypatch.setattr(decoder_module, "annotate_input_spmd_types", lambda _ctx, batch, _layouts: batch)
+    monkeypatch.setattr(spmd_types_module, "annotate_input_spmd_types", lambda _ctx, batch, _layouts: batch)
     registry = importlib.import_module("torchtitan_npu.models.deepseek_v4_1")
     make_config = registry._make_v41_config
 
@@ -42,7 +48,7 @@ def test_full_ac_preserves_image_routing(monkeypatch, with_engram):
         return make_config(**kwargs)
 
     monkeypatch.setattr(registry, "_make_v41_config", tiny_config)
-    config = registry.model_registry("deepseek_v4_1_debugmodel").model
+    config = registry.model_registry("deepseek_v4_1_debugmodel")
     if not with_engram:
         for layer in config.layers:
             layer.engram = None
@@ -61,7 +67,7 @@ def test_full_ac_preserves_image_routing(monkeypatch, with_engram):
             layer.feed_forward.expert_bias_E.copy_(bias)
             layer.feed_forward.router.bias_vl.copy_(bias.flip(0))
     checkpointed = copy.deepcopy(model)
-    FullActivationRematConfig.Config().build().apply(checkpointed)
+    FullActivationRematConfig().apply(checkpointed)
 
     # Real image protocol without depending on the synthetic RNG fallback.
     ids, types, feature_ids = build_image_token_layout([(3, 3)], span_start=2, vocab_size=64)

@@ -68,7 +68,7 @@ _setup_torchtitan "${TORCHTITAN_DIR}"
 
 "${PYTHON_BIN}" -c 'import torchtitan, torchtitan_npu, torchvision'
 
-export MODULE="${MODULE:-torchtitan_npu_recipes.models.deepseek_v4}"
+export MODULE="${MODULE:-torchtitan_npu_recipes.tests.models.deepseek_v4}"
 export CONFIG="${CONFIG:-deepseek_v4_debugmodel}"
 export NGPU
 export LOG_RANK="${LOG_RANK:-0}"

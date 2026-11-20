@@ -504,7 +504,7 @@ def _make_v41_moe_config(
     route_norm: bool,
     load_balance_coeff: float,
     moe_comm_backend: str,
-    non_blocking_capacity_factor: float | None,
+    non_blocking_capacity_factor: float | None = None,
     vision_enabled: bool,
 ) -> MoE.Config:
     # Every block carries the same MoE stack, so one config serves them all; the common

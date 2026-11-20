@@ -123,7 +123,8 @@ def identities():
             moe.TokenChoiceTopKRouter.forward, functional.cross_entropy)
 
 def config_contract():
-    cfg = v4.model_registry("debugmodel")
+    from torchtitan.config.parallelism import ParallelismConfig
+    cfg = v4.build_model_config("debugmodel", parallelism=ParallelismConfig())
     return [(type(layer.attention), type(layer.feed_forward), type(layer.feed_forward.router),
              layer.attention.compress_ratio, layer.feed_forward.router.score_func)
             for layer in cfg.layers]

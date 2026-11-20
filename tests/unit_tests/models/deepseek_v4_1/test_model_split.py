@@ -91,7 +91,7 @@ def test_text_recipe_builds_the_text_stack_and_loader(recipes):
 def test_every_registered_flavor_declares_its_modality(registry, flavor, multimodal):
     """A flavor name and the class it builds cannot drift apart silently."""
     assert flavor in registry.deepseek_v4_1_configs, sorted(registry.deepseek_v4_1_configs)
-    config = registry.deepseek_v4_1_configs[flavor](non_blocking_capacity_factor=None)
+    config = registry.deepseek_v4_1_configs[flavor]()
     assert isinstance(config, DeepSeekV41MultimodalModel.Config) is multimodal, flavor
     assert ("_text" in flavor) is not multimodal, flavor
 

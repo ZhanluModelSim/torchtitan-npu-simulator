@@ -1,27 +1,47 @@
-# TorchTitan-NPU Python recipes
+# TorchTitan-NPU Recipes
 
-本包保存返回完整 `Trainer.Config` 的训练组合，并定义模型对应的 Muon 参数匹配、compute layout 和 bucket 配置。模型、通用 layout 构造能力、数据转换函数和 trainer/engine 实现保留在 `torchtitan_npu`；recipe 选择并组合这些实现。
+## 1. 目录结构与规则
 
-| 入口 | 配置归属 |
+本目录通过 Python 函数返回完整训练配置，统一组织模型、数据、优化器、并行策略、checkpoint 和算子选择。
+
+| 目录 | 规则 |
 | --- | --- |
-| `torchtitan_npu_recipes.models.deepseek_v4` | V4 eager、SFT、LoRA 和 TorchFT 配置工厂 |
-| `torchtitan_npu_recipes.models.deepseek_v4_1` | V4.1 文本、多模态和 LoRA 配置工厂 |
-| `torchtitan_npu_recipes.models.qwen3_5` | Qwen3.5 系列配置工厂 |
-| `torchtitan_npu_recipes.graph_trainer.deepseek_v4` | V4 GraphTrainer 配置工厂 |
-| `torchtitan_npu_recipes.examples.deepseek_v4` | 19 个 V4 launcher 的完整配置 |
-| `torchtitan_npu_recipes.examples.deepseek_v4_1` | 12 个 V4.1 launcher 的完整配置 |
-| `torchtitan_npu_recipes.examples.qwen3_5` | 2 个 Qwen3.5 launcher 的完整配置 |
+| `models/` | 存放经过验证的完整模型运行配置 |
+| `graph_trainer/` | 存放经过验证的完整模型 GraphTrainer 配置，函数名使用 `graph_trainer_` 前缀 |
+| `tests/` | 存放调试、裁减模型和 CI 配置；按 `models/`、`graph_trainer/`、`ci/`、`torchft/` 分类 |
 
-这些是配置的归属，不是功能支持声明。TorchTitan 0.4.0 的当前 NPU 适配优先覆盖 DeepSeek 文本 eager；TP、CP、PP、多模态、SFT、LoRA、图训练与其他延期路径仍受各实现的限制。移动配置不会启用这些功能。
+## 2. 当前完整模型配置
 
-DeepSeek-V4 和 V4.1 示例默认使用非 golden 算子组合，只有显式设置 `USE_GOLDEN=1` 才选择参考组合。基础模型工厂保留各自的配置，示例工厂负责选择实际运行的算子。A3 环境使用 CANN 1104 和 torch-npu 1105.3，下载与安装见[安装指南](../docs/user-guides/installation.md)。
+以下模块均以 `torchtitan_npu_recipes.` 为前缀；不列调试和 CI 配方。同系列用 `{a3,a5}` 表示两个独立函数。
 
-`examples/` 下的训练脚本选择对应工厂，shell 只保留设备、节点、CANN 等启动资源和一条共用 launcher 调用。A3 8P Flash CPT debug 脚本默认选择 `deepseek_v4_flash_8p_cpt_4k_a3_eager`，关闭模型编译。数据、训练预算、优化器、并行、checkpoint 和算子选择均在 Python 中定义。例如查看 mini 示例的完整配置：
+| 模块 | 配置函数 | 用途 |
+| --- | --- | --- |
+| `models.deepseek_v4` | `deepseek_v4_flash_cpt_4k_a3` | 128 卡 Flash CPT，4K、BF16、Muon + swap |
+| 同上 | `deepseek_v4_flash_cpt_4k_a5` | 128 卡 Flash CPT，4K、DeepEP、block-FP8 |
+| 同上 | `deepseek_v4_flash_qat_4k_a5` | A5 CPT 基础上启用 MXFP4 QAT |
+| 同上 | `deepseek_v4_flash_sft_4k_a3` | 128 卡对话 SFT，允许保存 checkpoint |
+| 同上 | `deepseek_v4_flash_lora_4k_a3` | 128 卡 LoRA，rank 16，PEFT checkpoint |
+| 同上 | `deepseek_v4_flash_cpt_1024k_a5` | 1M 上下文、CP128；待迁移 |
+| `graph_trainer.deepseek_v4` | `graph_trainer_deepseek_v4_flash_cpt_4k_a5` | 128 卡 A5 图训练、DeepEP、block-FP8；当前配置 schema 不兼容 |
+
+上述完整模型组合尚未完成当前分支的统一验证；编译路径仍受当前 trainer 限制。
+
+## 3. 运行配置
+
+安装依赖并准备 CANN、tokenizer 和数据后，先修改原 recipe，再从仓库根目录直接启动。
+
+以 `deepseek_v4_flash_43layers_16experts_eager_bf16` 为例：
+
+1. 在 [tests/models/deepseek_v4.py](tests/models/deepseek_v4.py) 的对应函数中，将 `hf_assets_path`、`data_files` 的默认值改为实际路径；如需加载或保存权重，在配方中设置 `checkpointer`。
+2. 该配方默认 8 卡 EP8 / FSDP8、4K 上下文、100 步，使用 BF16、Muon + swap 和融合算子。改变卡数时同步修改配方中的并行布局。
+3. 选择模块和配置函数，直接运行：
 
 ```bash
-bash examples/deepseek_v4/debug/deepseek_v4_mini_1p_cpt_2k_a3.sh --print-config
+ASCEND_SET_ENV_PATH=/path/to/cann/set_env.sh \
+NGPU=8 \
+MODULE=torchtitan_npu_recipes.tests.models.deepseek_v4 \
+CONFIG=deepseek_v4_flash_43layers_16experts_eager_bf16 \
+bash scripts/run_train.sh
 ```
 
-依赖、数据和 HF 资源必须按安装指南准备。训练入口见 [快速上手](../docs/user-guides/quickstart.md)，自定义组合见 [Python 配置指南](../docs/developer_guides/python_recipes.md)，验证入口见 [integration 指南](../tests/integration_tests/README.md)。通用 `--section.option` 参数不属于 TorchTitan 0.4.0 的配置接口；改变训练策略应定义新的 Python 工厂。
-
-`torchtitan_npu/models/*/config_registry.py` 不再提供训练工厂。模型实现继续通过 `torchtitan_npu.models.<model>.model_registry` 构造；训练调用方导入本包。组件替换仍使用现有 `torchtitan_npu.override` 和上游 override pass。
+追加 `--print-config` 可只打印配置。运行其他配方时替换 `MODULE` / `CONFIG`，或直接在 `scripts/run_train.sh` 中修改。资产路径和训练参数直接在对应 recipe 中修改，进程数须与并行布局一致。多机使用 `scripts/run_train_multinodes.sh`，各节点设置 `NNODES`、`NODE_RANK`、`MASTER_ADDR` 和 `NGPU`。

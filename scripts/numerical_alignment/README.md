@@ -87,10 +87,10 @@ HF 与 DCP 必须来自同一份权重。两种 attention 模式都要求 batch 
 
 ### 步骤四：训练 loss 和 grad_norm 对比
 
-本节 `loss_compare.py` 仍依赖旧训练 CLI，尚未适配当前 0.4.0 recipe 入口。
+本节 `loss_compare.py` 通过专用训练入口把比较控制项应用到 0.4.0 Python recipe。
 
 [`loss_compare.py`](loss_compare.py) 比较两个训练脚本或两个 Git 版本，从 TensorBoard 事件读取逐 step 的 `loss` 和 `grad_norm`。
-默认比较 100 步、序列长度 4096、训练 seed 42、开启确定性算法，默认入口为 `examples/deepseek_v4/debug/deepseek_v4_mini_1p_cpt_2k_a3.sh`。
+默认比较 100 步、序列长度 4096、训练 seed 42、开启确定性算法，默认入口为 `scripts/run_train.sh`；模型和配置由 `MODULE`、`CONFIG` 选择。
 
 省略 Git ref 时直接使用当前工作区（含未提交改动）；指定两个 ref 时，两侧在独立 worktree 中运行，ref 须已存在于本地且改动已提交。
 两个 ref 须同时提供或同时省略，暂不支持单个 ref 与当前未提交改动的比较。
@@ -115,7 +115,7 @@ export HF_ASSETS_PATH=/path/to/tokenizer
 export OLD_TORCHTITAN=/path/to/torchtitan-dc3985ad
 export NEW_TORCHTITAN=/path/to/torchtitan-ebdfc8c
 : "${INTERMEDIATE_REF:?Set the intermediate repository commit using ebdfc8c and field CLI}"
-export RUNNER=examples/deepseek_v4/debug/deepseek_v4_flash_8p_cpt_4k_a3.sh
+export RUNNER=scripts/run_train.sh
 
 python scripts/numerical_alignment/loss_compare.py 93f956c "$INTERMEDIATE_REF" \
     --runner "$RUNNER" --steps 100 --seq-len 4096 \
@@ -123,7 +123,7 @@ python scripts/numerical_alignment/loss_compare.py 93f956c "$INTERMEDIATE_REF" \
     --baseline-upstream "$OLD_TORCHTITAN" --test-upstream "$NEW_TORCHTITAN"
 ```
 
-DeepSeek-V4.1 使用 `examples/deepseek_v4_1/debug/deepseek_v4_1_flash_8p_cpt_4k_a3.sh`。在 A5 上使用对应的 `_a5.sh` runner；两侧分别读取各自 commit 中的脚本。运行前按实际设备配置 `ASCEND_RT_VISIBLE_DEVICES` 和编译缓存路径。
+DeepSeek-V4.1 使用 `scripts/run_train.sh`，通过 `MODULE`、`CONFIG` 选择对应 recipe。运行前按实际设备配置 `ASCEND_RT_VISIBLE_DEVICES` 和编译缓存路径。
 
 脚本从旧侧生成一份 FP32、仅模型的 seed DCP，两侧从该文件加载权重，并使用各自的空 checkpoint 输出目录，避免恢复其他训练状态。默认清理 seed DCP 和临时 worktree，保留 `seed.log`、两侧训练日志、TensorBoard 事件及 `comparison.json`。native 侧使用本工具的训练入口设置可选 checkpointer，不能同时指定自定义 `TRAIN_FILE`。
 
@@ -146,8 +146,8 @@ python scripts/numerical_alignment/loss_compare.py HEAD HEAD \
 
 ```bash
 python scripts/numerical_alignment/loss_compare.py \
-    --baseline-runner examples/deepseek_v4/debug/base.sh \
-    --test-runner examples/deepseek_v4/debug/test.sh
+    --baseline-runner scripts/run_train.sh \
+    --test-runner scripts/run_train.sh
 ```
 
 同样可在命令前加上两个 Git ref 来比较历史版本的代码；入口脚本始终从当前工作区读取，无需存在于被测提交中。
@@ -159,9 +159,8 @@ python scripts/numerical_alignment/loss_compare.py \
 #### 比较不同训练参数或 runner
 
 比较不同学习率时，在两侧 Python recipe 的对应 optimizer Config 中分别设置 `lr`。
-`loss_compare.py` 的训练命令生成仍使用旧字段 CLI，尚未适配 TorchTitan 0.4.0 的
-ConfigLoader；本节训练命令仅适用于保留该接口的历史版本。当前版本应通过 recipe
-分别运行两侧训练，再比较 TensorBoard 中完整精度的逐步指标。
+native 入口会将比较脚本生成的输出目录、步数、序列长度、seed 和 TensorBoard 选项应用到
+已加载的 Python recipe；额外的配置 override 使用上游支持的 `--override` 参数。
 
 常用参数：
 

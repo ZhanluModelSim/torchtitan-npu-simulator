@@ -5,13 +5,8 @@
 
 """Resolve example recipes through the production configuration loader."""
 
-import sys
-from types import ModuleType
-
 import pytest
-from torchtitan.components.optim import AdamW, DistMuon
 from torchtitan.config.loader import ConfigLoader
-from torchtitan.distributed.activation_remat import FullActivationRematConfig
 
 import torchtitan_npu  # noqa: F401
 
@@ -45,100 +40,33 @@ def example_environment(monkeypatch):
         monkeypatch.delenv(name, raising=False)
 
 
-def _load(name):
-    return ConfigLoader().load(["--module", "torchtitan_npu_recipes.examples.deepseek_v4", "--config", name])
+def _load(name, *, recipe_module=None):
+    if recipe_module is not None:
+        return ConfigLoader().load(["--module", recipe_module, "--config", name])
+    if name.removesuffix("_reference") in {
+        "deepseek_v4_debugmodel",
+        "deepseek_v4_flash_43layers_16experts_eager_bf16",
+        "deepseek_v4_flash_43layers_16experts_eager_fp8",
+        "deepseek_v4_flash_1p_2k",
+    }:
+        return ConfigLoader().load(["--module", "torchtitan_npu_recipes.tests.models.deepseek_v4", "--config", name])
+    return ConfigLoader().load(["--module", "torchtitan_npu_recipes.models.deepseek_v4", "--config", name])
 
 
-def test_eager_example_resolves_fixture_assets_without_a_cli_override():
-    config = _load("deepseek_v4_eager_1p")
+def test_reduced_dsv4_recipe_surface_contains_only_verified_entries():
+    from torchtitan_npu_recipes.tests.models import deepseek_v4
 
-    assert config.hf_assets_path == "tests/assets/deepseek_v3"
-    assert config.training.max_context_length == 2048
-    assert config.compile is None
-    assert config.checkpointer is None
-
-
-@pytest.mark.parametrize("golden", [False, True], ids=["npu", "reference"])
-def test_a3_flash_eager_preserves_upstream_training_policy(monkeypatch, golden):
-    monkeypatch.setenv("HF_ASSETS_PATH", "/model-assets")
-    monkeypatch.setenv("USE_GOLDEN", str(int(golden)))
-    config = _load("deepseek_v4_flash_8p_cpt_4k_a3_eager")
-
-    assert config.compile is None
-    assert config.model.local_compile_regions == []
-    assert isinstance(config.activation_remat, FullActivationRematConfig)
-    assert config.activation_remat.save_regions == []
-    assert config.training.max_context_length == config.model.max_context_length == 4096
-    assert config.training.num_tokens_per_microbatch_per_dp_rank == 4096
-    assert config.training.num_tokens_per_train_step == 262144
-    assert config.training.steps == 100
-    assert config.parallelism.expert_parallel_degree == 8
-    assert config.parallelism.data_parallel_shard_degree == 8
-    assert config.parallelism.data_parallel_replicate_degree == 1
-    assert config.dataloader.max_num_documents is None
-    muon, adamw = config.optim.optimizer.optimizers
-    assert isinstance(muon, DistMuon.Config)
-    assert muon.lr == 1e-5 and muon.ns_steps == 10
-    assert isinstance(adamw, AdamW.Config)
-    assert adamw.betas == (0.9, 0.95) and adamw.eps == 1e-8
+    assert {
+        name for name, value in vars(deepseek_v4).items() if name.startswith("deepseek_v4_") and callable(value)
+    } == {
+        "deepseek_v4_debugmodel",
+        "deepseek_v4_flash_43layers_16experts_eager_bf16",
+        "deepseek_v4_flash_43layers_16experts_eager_fp8",
+        "deepseek_v4_flash_1p_2k",
+    }
 
 
-@pytest.mark.parametrize("golden", [False, True], ids=["npu-muon", "reference-adamw"])
-def test_mini_example_selects_actual_optimizer_and_operator_policy(monkeypatch, golden):
-    monkeypatch.setenv("USE_GOLDEN", str(int(golden)))
-    monkeypatch.setenv("HF_ASSETS_PATH", "/model-assets")
-    config = _load("deepseek_v4_mini_1p_cpt_2k_a3")
-
-    assert config.hf_assets_path == "/model-assets"
-    assert config.training.num_tokens_per_microbatch_per_dp_rank == 2048
-    assert config.training.num_tokens_per_train_step == -1
-    assert config.training.steps == 100
-    assert config.parallelism.expert_parallel_degree == 1
-    assert config.dataloader.dataset.dataset.processor.per_doc_alignment == 128
-    if golden:
-        assert isinstance(config.optim.optimizer.optimizers[0], AdamW.Config)
-        assert config.optim.optimizer.optimizers[0].lr == 1e-5
-        assert config.override.imports == ["torchtitan_npu.override.common.rope.workaround"]
-    else:
-        muon, adamw = config.optim.optimizer.optimizers
-        assert isinstance(muon, DistMuon.Config)
-        assert muon.lr == 1e-5 and muon.ns_steps == 10
-        assert isinstance(adamw, AdamW.Config)
-        assert adamw.betas == (0.9, 0.95) and adamw.eps == 1e-8
-        assert config.override.imports[-1] == "torchtitan_npu.override.common.optimizer.swap_optimizer"
-        assert (
-            "torchtitan_npu.override.deepseek_v4.sparse_attn.asc",
-            {"num_heads": 16, "index_num_heads": 8, "selector_backend": "asc"},
-        ) in config.override.imports
-
-
-@pytest.mark.parametrize(
-    "name,microbatch,quantization,swap",
-    [
-        ("deepseek_v4_flash_8p_cpt_4k_a3", 4096, None, True),
-        ("deepseek_v4_flash_8p_cpt_4k_a5", 8192, "all_block_fp8", False),
-        ("deepseek_v4_flash_8p_cpt_4k_a5_hif8", 4096, "all_hif8", True),
-    ],
-    ids=["a3", "a5-block-fp8", "a5-hif8"],
-)
-def test_flash_examples_resolve_training_parallelism_and_quantization(name, microbatch, quantization, swap):
-    config = _load(name)
-
-    assert config.training.num_tokens_per_microbatch_per_dp_rank == microbatch
-    assert config.training.num_tokens_per_train_step == 262144
-    assert config.parallelism.expert_parallel_degree == 8
-    assert config.parallelism.data_parallel_shard_degree == 8
-    assert config.parallelism.data_parallel_replicate_degree == 1
-    assert config.compile.model.backend == "inductor"
-    assert ("torchtitan_npu.override.common.optimizer.swap_optimizer" in config.override.imports) is swap
-    assert config.extension.quantization.enable_quantized_training is (quantization is not None)
-    if quantization:
-        assert config.extension.quantization.recipe == quantization
-        assert config.activation_remat.save_regions == ["*"]
-        assert config.activation_remat.recompute_regions == ["*routed_experts.w13.*"]
-
-
-def test_full_a5_recipe_keeps_checkpoint_and_prequantization_contract(monkeypatch):
+def test_full_a5_recipe_keeps_explicit_resources_and_prequantization_contract(monkeypatch):
     monkeypatch.setenv("CKPT_INIT_LOAD_PATH", "/hf-base")
     monkeypatch.setenv("CKPT_SAVE_LOAD_PATH", "/native-checkpoints")
     config = _load("deepseek_v4_flash_cpt_4k_a5")
@@ -147,8 +75,8 @@ def test_full_a5_recipe_keeps_checkpoint_and_prequantization_contract(monkeypatc
     assert config.parallelism.data_parallel_shard_degree == 128
     assert config.training.num_tokens_per_train_step == 4194304
     assert config.checkpointer.load_only
-    assert config.checkpointer.folder == "/native-checkpoints"
-    assert config.checkpointer.initial_load_path == "/hf-base"
+    assert config.checkpointer.folder == "/path/to/save_ckpt"
+    assert config.checkpointer.initial_load_path == "/path/to/init_load_ckpt"
     assert config.checkpointer.initial_load_in_hf
     assert config.extension.quantization.fsdp_prequantize_fqns == [
         ".attention.wq_b",
@@ -159,7 +87,11 @@ def test_full_a5_recipe_keeps_checkpoint_and_prequantization_contract(monkeypatc
     ]
     kv = config.extension.quantization.kv_norm_quantization
     assert kv.format == "mxfp8" and kv.block_size == 64
-    assert kv.fqns == [".attention.kv_norm", ".attention.compressor.norm", ".attention.compressor_128.norm"]
+    assert kv.fqns == [
+        ".attention.kv_norm",
+        ".attention.compressor.norm",
+        ".attention.compressor_128.norm",
+    ]
 
 
 def test_qat_recipe_preserves_inherited_a5_policy_and_adds_mxfp4():
@@ -171,86 +103,108 @@ def test_qat_recipe_preserves_inherited_a5_policy_and_adds_mxfp4():
     assert config.training.num_tokens_per_microbatch_per_dp_rank == 8192
 
 
-def test_sft_example_keeps_its_conversation_loader_and_writable_checkpoints(monkeypatch):
-    monkeypatch.setenv("DATASET_PATH", "/conversations.jsonl")
-    config = _load("deepseek_v4_flash_8p_sft_4k_a3")
-
-    assert config.dataloader.dataset.dataset.source.load_dataset_kwargs["data_files"] == "/conversations.jsonl"
-    assert config.dataloader.dataset.dataset.processor.per_doc_alignment == 128
-    assert config.training.num_tokens_per_train_step == 262144
-    assert config.checkpointer is not None and not config.checkpointer.load_only
-
-
-def test_pro_offload_example_retains_distinct_ep_and_fsdp_degrees():
-    config = _load("deepseek_v4_pro_8p_cpt_4k_a5_cpuoffload")
-
-    assert config.parallelism.expert_parallel_degree == 4
-    assert config.parallelism.data_parallel_shard_degree == 8
-    assert config.training.enable_cpu_offload
-    assert config.optim.optimizer._cpu_offload
-    assert config.training.num_tokens_per_train_step == 262144
-
-
-def test_legacy_override_environment_fails_with_a_migration_action(monkeypatch):
-    monkeypatch.setenv("CLI_OVERRIDES", "my_module.my_override")
-
-    with pytest.raises(ValueError, match=r"Python recipe.*--override"):
-        _load("deepseek_v4_mini_1p_cpt_2k_a3")
+@pytest.mark.parametrize(
+    "name,message,recipe_module",
+    [
+        ("deepseek_v4_flash_cpt_1024k_a5", "Context parallelism is deferred", None),
+    ],
+    ids=["context-parallel"],
+)
+def test_deferred_examples_report_the_actual_unavailable_capability(name, message, recipe_module):
+    with pytest.raises(NotImplementedError, match=message):
+        _load(name, recipe_module=recipe_module)
 
 
 @pytest.mark.parametrize(
-    "name,message",
+    "name",
     [
-        ("deepseek_v4_flash_cpt_1024k_a5", "Context parallelism is deferred"),
-        ("deepseek_v4_flash_8p_cpt_4k_a5_cv_parallel", "no longer exposes"),
+        "deepseek_v4_flash_cpt_4k_a3",
+        "deepseek_v4_flash_cpt_4k_a5",
+        "deepseek_v4_flash_qat_4k_a5",
+        "deepseek_v4_flash_sft_4k_a3",
+        "deepseek_v4_flash_lora_4k_a3",
     ],
-    ids=["context-parallel", "cv-backend"],
 )
-def test_deferred_examples_report_the_actual_unavailable_capability(name, message):
-    with pytest.raises(NotImplementedError, match=message):
-        _load(name)
+def test_full_model_recipes_load_master_training_defaults(name):
+    from torchtitan.distributed.activation_remat import DefaultActivationRematConfig, FullActivationRematConfig
+
+    config = _load(name)
+    assert config.model.n_layers == 43
+    assert config.training.max_context_length == 4096
+    assert config.training.num_tokens_per_train_step == 1024 * 4096
+    assert config.training.steps == 100
+    assert config.parallelism.expert_parallel_degree == 128
+    assert config.parallelism.data_parallel_shard_degree == 128
+    assert config.parallelism.data_parallel_replicate_degree == 1
+    from torchtitan.components.optim import AdamW
+
+    from torchtitan_npu.extensions.torchtitan.components.optimizer.muon import DistMuon
+
+    optimizer = config.optim.optimizer
+    muon = next(group for group in optimizer.optimizers if isinstance(group, DistMuon.Config))
+    adamw = next(group for group in optimizer.optimizers if isinstance(group, AdamW.Config))
+    assert (muon.lr, muon.momentum, muon.ns_steps) == (1e-5, 0.95, 10)
+    assert (adamw.lr, adamw.betas, adamw.eps) == (1e-5, (0.9, 0.95), 1e-8)
+    assert adamw.weight_decay == 0.1
+    assert config.compile.model.backend == "inductor"
+    assert config.comm.init_timeout_seconds == 7200
+    assert config.comm.train_timeout_seconds == 600
+    assert config.override.imports[0] == (
+        "torchtitan_npu.override.deepseek_v4.common.rms_norm"
+        if name.endswith("a5")
+        else "torchtitan_npu.override.common.rms_norm.asc"
+    )
+    assert config.override.imports[1:5] == [
+        "torchtitan_npu.override.deepseek_v4.lightning_indexer.asc",
+        ("torchtitan_npu.override.deepseek_v4.sparse_attn.asc", {"selector_backend": "asc"}),
+        "torchtitan_npu.override.deepseek_v4.mhc.asc_hc_pre",
+        "torchtitan_npu.override.deepseek_v4.mhc.asc_hc_post",
+    ]
+    if name.endswith("a5"):
+        from torchtitan_npu.patches.torchtitan.models.common.token_dispatcher import DeepEPTokenDispatcher
+
+        for layer in config.model.layers:
+            dispatcher = layer.feed_forward.routed_experts.token_dispatcher
+            assert isinstance(dispatcher, DeepEPTokenDispatcher.Config)
+            assert dispatcher.num_max_tokens_per_rank == 8192
+            assert dispatcher.hidden_dim == 4096
+            assert dispatcher.absorb_router_scores
+        assert isinstance(config.activation_remat, DefaultActivationRematConfig)
+        assert config.override.imports[-2:] == [
+            "torchtitan_npu.override.common.swiglu_group.asc_shared_experts",
+            "torchtitan_npu.override.common.token_dispatcher.asc_deepep",
+        ]
+        assert not any("swap_optimizer" in item for item in config.override.imports)
+    else:
+        from torchtitan_npu.patches.torchtitan.models.common.token_dispatcher import AllToAllTokenDispatcher
+
+        assert isinstance(
+            config.model.layers[0].feed_forward.routed_experts.token_dispatcher, AllToAllTokenDispatcher.Config
+        )
+        assert isinstance(config.activation_remat, FullActivationRematConfig)
+        assert config.override.imports[5:] == [
+            "torchtitan_npu.override.common.optimizer.swap_optimizer",
+            "torchtitan_npu.override.common.rope.asc_complex",
+            "torchtitan_npu.override.common.token_dispatcher.asc",
+        ]
+    assert config.checkpointer.load_only == ("sft" not in name and "lora" not in name)
 
 
-def test_a3_graphtrainer_example_loads_the_npu_graph_config():
-    from torchtitan_npu.extensions.torchtitan.experiments.graph_trainer import GraphTrainerEx
+def test_full_recipes_allow_resource_edits_without_affecting_later_configs():
+    first = _load("deepseek_v4_flash_cpt_4k_a5")
+    first.hf_assets_path = "/tokenizer"
+    first.dataloader.dataset.dataset.source.load_dataset_kwargs["data_files"] = "/data.jsonl"
+    first.checkpointer.folder = "/checkpoints"
+    first.checkpointer.initial_load_path = "/weights"
+    first.override.imports.clear()
+    first.extension.quantization.fsdp_prequantize_fqns.clear()
 
-    config = _load("deepseek_v4_flash_8p_cpt_4k_a3_graphtrainer")
-
-    assert type(config) is GraphTrainerEx.Config
-    assert config._owner is GraphTrainerEx
-    assert config.training.num_tokens_per_train_step == -1
-    assert config.compile.pass_pipeline == "mutation-functionalization+npu_auto_overlap"
-    assert config.compile.ep_overlap.enabled
-    assert config.compile.ep_overlap.module_fqn == "layers.*.feed_forward"
-
-
-def test_full_a5_graphtrainer_runs_quantization_without_local_model_compile(monkeypatch):
-    from torchtitan_npu.extensions.torchtitan.experiments import graph_trainer
-
-    monkeypatch.setattr(graph_trainer, "_apply_auto_overlap_runtime_context_patch", lambda config: None)
-    config = _load("deepseek_v4_flash_cpt_4k_a5_graphtrainer")
-    assert ("torchtitan_npu.override.deepseek_v4.compressor.asc", {"fused_pooling": False}) in config.override.imports
-    assert config.extension.quantization.li_quantization is None
-    converter = ModuleType("torchtitan_npu.extensions.adaptor.torchao.converter")
-
-    class ReachedQuantizationError(Exception):
-        pass
-
-    def apply_quantization_converter(model, quantization, *, model_compile_enabled, override_config):
-        assert model is config.model
-        assert quantization.recipe == "all_block_fp8"
-        assert not model_compile_enabled
-        raise ReachedQuantizationError
-
-    converter.apply_quantization_converter = apply_quantization_converter
-    monkeypatch.setitem(sys.modules, converter.__name__, converter)
-
-    with pytest.raises(ReachedQuantizationError):
-        config.build()
-
-
-def test_compiled_example_preserves_the_current_training_guard():
-    config = _load("deepseek_v4_flash_8p_cpt_4k_a3")
-
-    with pytest.raises(NotImplementedError, match="NPU model compilation is not supported"):
-        config.__post_init__()
+    second = _load("deepseek_v4_flash_cpt_4k_a5")
+    assert second.hf_assets_path == "/path/to/DeepSeekV4_tokenizer"
+    assert (
+        second.dataloader.dataset.dataset.source.load_dataset_kwargs["data_files"] == "tests/assets/c4_test/data.json"
+    )
+    assert second.checkpointer.folder == "/path/to/save_ckpt"
+    assert second.checkpointer.initial_load_path == "/path/to/init_load_ckpt"
+    assert second.override.imports
+    assert second.extension.quantization.fsdp_prequantize_fqns

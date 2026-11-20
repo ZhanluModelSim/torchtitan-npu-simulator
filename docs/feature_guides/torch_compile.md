@@ -47,7 +47,7 @@ bash scripts/run_train.sh \
   <训练参数>
 ```
 
-多机任务在每个参与节点的启动 shell 中执行同一条命令，`NODE_IPS` 的顺序保持一致：
+编译选项和训练步数在 Python recipe 中设置；当前编译训练仍受 0.4.0 trainer 限制。多机启动方式如下，`NODE_IPS` 的顺序保持一致：
 
 ```bash
 source /usr/local/Ascend/cann/set_env.sh
@@ -55,13 +55,11 @@ export TORCHINDUCTOR_NPU_BACKEND=ascendc
 
 NODE_IPS=192.168.1.10,192.168.1.11 \
 NGPU=16 \
-bash examples/deepseek_v4/deepseek_v4_flash_cpt_4k_a3.sh \
-  --compile.backend inductor \
-  --compile.components model loss \
-  --training.steps 5
+MODULE=torchtitan_npu_recipes.models.deepseek_v4 \
+CONFIG=deepseek_v4_flash_cpt_4k_a3 bash scripts/run_train_multinodes.sh
 ```
 
-该 wrapper 最终调用 `scripts/run_train_multinodes.sh`；同一节点上的 `torchrun` 子进程会继承启动 shell
+多机入口为 `scripts/run_train_multinodes.sh`；同一节点上的 `torchrun` 子进程会继承启动 shell
 的环境变量。如果脚本无法自动识别本机地址，设置对应的 `LOCAL_HOST`。
 
 ### 2.2 使用 `aot_eager` 检查编译兼容性

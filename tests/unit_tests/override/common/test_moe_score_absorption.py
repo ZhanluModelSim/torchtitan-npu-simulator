@@ -15,6 +15,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 import torch.nn.functional as F
+from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.distributed.spmd_types import set_spmd_meshes
 from torchtitan.models.common.linear import GroupedLinear
 from torchtitan.models.common.moe import MoE
@@ -32,9 +33,9 @@ from torchtitan_npu.patches.torchtitan.models.common.token_dispatcher import (
 
 
 def test_deepseek_v4_enables_score_absorption_for_standard_dispatch():
-    from torchtitan_npu.models.deepseek_v4 import model_registry
+    from torchtitan_npu.models.deepseek_v4 import build_model_config
 
-    model_spec = model_registry("debugmodel")
+    model_spec = build_model_config("debugmodel", parallelism=ParallelismConfig())
     model = model_spec.model if hasattr(model_spec, "model") else model_spec
     routed_configs = [
         layer.feed_forward.routed_experts for layer in model.layers if isinstance(layer.feed_forward, MoE.Config)

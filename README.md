@@ -94,7 +94,7 @@ pip install -e .
       <td>✅</td>
     </tr>
     <tr>
-      <td>多模态训练（<a href="examples/deepseek_v4_1/readme.md">图文</a>、<a href="examples/qwen3_5/readme.md">视频</a>）</td>
+      <td>多模态训练（<a href="torchtitan_npu_recipes/README.md">图文</a>、<a href="torchtitan_npu_recipes/README.md">视频</a>）</td>
       <td>✅</td>
       <td>✅</td>
     </tr>
@@ -264,7 +264,6 @@ torchtitan-npu/
 │   ├── tools/                     # 随 package 分发的 checkpoint 转换与导出工具
 │   ├── __init__.py                # 导入 package patch 与 extension
 │   └── train.py                   # 训练入口
-├── examples/                      # 各模型训练示例脚本与说明
 ├── experiments/                   # 实验性适配包（torchao-npu 量化）
 ├── scripts/                       # 训练与仓库辅助脚本
 ├── tests/                         # 单元测试和测试数据
@@ -284,13 +283,13 @@ System: Ascend 950，图模式
 
 | 模型 | NPU 数 | 量化 | GBS | 序列长度 | FSDP | TP | PP | CP | EP | 单卡吞吐 (tokens/s) | step time | BF16 MFU |
 | :--- | ---: | :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| [DeepSeek-V4-Flash](torchtitan_npu/models/deepseek_v4/config_registry.py) | 64 | MXFP8 | 512 | 4k | 64 | 1 | 1 | 1 | 64 | 2126 | 15.42 s | / |
-| [DeepSeek-V4-Flash](torchtitan_npu/models/deepseek_v4/config_registry.py) | 64 | MXFP8 | 64 | 64k | 8 | 1 | 1 | 8 | 64 | 1501.6 | 43.64 s | / |
-| [DeepSeek-V4-Flash](torchtitan_npu/models/deepseek_v4/config_registry.py) | 128 | MXFP8 | 8 | 1M | 1 | 1 | 1 | 128 | 128 | 1325 | 49.46 s | / |
-| [DeepSeek-V4-Flash](torchtitan_npu/models/deepseek_v4/config_registry.py) | 64 | BF16 | 512 | 4k | 64 | 1 | 1 | 1 | 64 | 1603 | 20.44 s | 28.81% |
-| [DeepSeek-V4-Flash](torchtitan_npu/models/deepseek_v4/config_registry.py) | 64 | BF16 | 64 | 64k | 8 | 1 | 1 | 8 | 64 | 1421 | 46.12 s | 32.87% |
-| [DeepSeek-V4-Flash](torchtitan_npu/models/deepseek_v4/config_registry.py) | 64 | QAT | 512 | 4k | 64 | 1 | 1 | 1 | 64 | 1576 | 20.79 s | / |
-| [DeepSeek-V4-Flash](torchtitan_npu/models/deepseek_v4/config_registry.py) | 64 | QAT | 64 | 64k | 8 | 1 | 1 | 8 | 64 | 1532 | 42.78 s | / |
+| [DeepSeek-V4-Flash](torchtitan_npu_recipes/models/deepseek_v4.py) | 64 | MXFP8 | 512 | 4k | 64 | 1 | 1 | 1 | 64 | 2126 | 15.42 s | / |
+| [DeepSeek-V4-Flash](torchtitan_npu_recipes/models/deepseek_v4.py) | 64 | MXFP8 | 64 | 64k | 8 | 1 | 1 | 8 | 64 | 1501.6 | 43.64 s | / |
+| [DeepSeek-V4-Flash](torchtitan_npu_recipes/models/deepseek_v4.py) | 128 | MXFP8 | 8 | 1M | 1 | 1 | 1 | 128 | 128 | 1325 | 49.46 s | / |
+| [DeepSeek-V4-Flash](torchtitan_npu_recipes/models/deepseek_v4.py) | 64 | BF16 | 512 | 4k | 64 | 1 | 1 | 1 | 64 | 1603 | 20.44 s | 28.81% |
+| [DeepSeek-V4-Flash](torchtitan_npu_recipes/models/deepseek_v4.py) | 64 | BF16 | 64 | 64k | 8 | 1 | 1 | 8 | 64 | 1421 | 46.12 s | 32.87% |
+| [DeepSeek-V4-Flash](torchtitan_npu_recipes/models/deepseek_v4.py) | 64 | QAT | 512 | 4k | 64 | 1 | 1 | 1 | 64 | 1576 | 20.79 s | / |
+| [DeepSeek-V4-Flash](torchtitan_npu_recipes/models/deepseek_v4.py) | 64 | QAT | 64 | 64k | 8 | 1 | 1 | 8 | 64 | 1532 | 42.78 s | / |
 
 # 免责声明
 

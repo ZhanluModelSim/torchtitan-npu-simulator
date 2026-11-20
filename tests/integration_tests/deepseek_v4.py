@@ -133,7 +133,7 @@ def build_deepseek_v4_quantized_test_list() -> list[OverrideDefinitions]:
             train_args=V4_TRAIN_ARGS,
             test_name="dsv4_mxfp4_communication_fsdp2",
             test_descr="MXFP4 QAT communication, two forward/backward/optimizer steps on A5",
-            env_vars={"MODULE": "torchtitan_npu_recipes.models.deepseek_v4", "CONFIG": "deepseek_v4_debugmodel"},
+            env_vars={"MODULE": "torchtitan_npu_recipes.tests.models.deepseek_v4", "CONFIG": "deepseek_v4_debugmodel"},
             override_args=[
                 (
                     *GOLDEN_OVERRIDES,
@@ -190,7 +190,7 @@ def _build_grain_sft_case() -> OverrideDefinitions:
         ngpu=1,
         timeout=600,
         env_vars={
-            "MODULE": "torchtitan_npu_recipes.models.deepseek_v4",
+            "MODULE": "torchtitan_npu_recipes.tests.ci.deepseek_v4",
             "CONFIG": "deepseek_v4_debugmodel_sft",
             "DSV4_SFT_DATASET": dataset,
         },
@@ -276,30 +276,25 @@ def build_deepseek_v4_test_list() -> list[OverrideDefinitions]:
             check_resume=False,
             expected_steps=((1, 2),),
         ),
-        _build_case(
+        OverrideDefinitions(
             test_name="dsv4_golden_1rank",
             test_descr="DeepSeek-V4 golden 1rank",
             ngpu=1,
-            extra_args=(
-                "--training.steps=30",
-                "--optim.lr-scheduler.total-steps=100",
-                "--hf-assets-path=tests/assets/deepseek_v3",
-                "--training.num-tokens-per-train-step=4096",
-            ),
+            python_config=True,
+            env_vars={"MODULE": "tests.integration_tests.dsv4_eager_config", "CONFIG": "dsv4_golden_1rank"},
+            train_args=(),
+            override_args=[()],
             use_golden=True,
             check_loss=True,
         ),
-        _build_case(
+        OverrideDefinitions(
             test_name="dsv4_golden_ep2_fsdp2",
             test_descr="DeepSeek-V4 golden ep2 fsdp2",
             ngpu=2,
-            extra_args=(
-                "--training.steps=30",
-                "--optim.lr-scheduler.total-steps=100",
-                "--parallelism.expert-parallel-degree=2",
-                "--hf-assets-path=tests/assets/deepseek_v3",
-                "--training.num-tokens-per-train-step=4096",
-            ),
+            python_config=True,
+            env_vars={"MODULE": "tests.integration_tests.dsv4_eager_config", "CONFIG": "dsv4_golden_ep2_fsdp2"},
+            train_args=(),
+            override_args=[()],
             use_golden=True,
             check_loss=True,
         ),

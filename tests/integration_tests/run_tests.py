@@ -798,8 +798,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--module",
-        default="torchtitan_npu_recipes.models.deepseek_v4",
-        help="Model module to use for training (default: torchtitan_npu_recipes.models.deepseek_v4). "
+        default="torchtitan_npu_recipes.tests.models.deepseek_v4",
+        help="Model module to use for training (default: torchtitan_npu_recipes.tests.models.deepseek_v4). "
         "This is passed as MODULE env var to run_train.sh.",
     )
     parser.add_argument(

@@ -59,7 +59,7 @@ Virtual Optimizer 与 `torchtitan_npu.override.common.optimizer.swap_optimizer` 
 
 ```bash
 python -m torchtitan_npu.train \
-  --module torchtitan_npu_recipes.models.deepseek_v4 \
+  --module torchtitan_npu_recipes.tests.models.deepseek_v4 \
   --config deepseek_v4_debugmodel \
   --override.imports torchtitan_npu.override.common.optimizer.virtual \
   --checkpoint.enable \

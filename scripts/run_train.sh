@@ -14,9 +14,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 cd "${SCRIPT_DIR}/.."
 
-export NGPU="${NGPU:-1}"
-export MODULE="${MODULE:-torchtitan_npu_recipes.models.deepseek_v4}"
-export CONFIG="${CONFIG:-deepseek_v4_debugmodel}"
+export NGPU="${NGPU:-8}"
+export MODULE="${MODULE:-torchtitan_npu_recipes.tests.models.deepseek_v4}"
+export CONFIG="${CONFIG:-deepseek_v4_flash_43layers_16experts_eager_bf16}"
 TRAIN_FILE="${TRAIN_FILE:-torchtitan_npu.train}"
 COMM_BACKEND=${COMM_BACKEND:-}
 if [[ -n "${COMM_BACKEND}" && "${COMM_BACKEND}" != fake ]]; then

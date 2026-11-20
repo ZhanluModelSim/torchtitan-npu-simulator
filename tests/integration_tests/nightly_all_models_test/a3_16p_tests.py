@@ -14,7 +14,7 @@ def build_test_list() -> list[OverrideDefinitions]:
         test_name="dsv4_flash_a3_16p_example",
         test_descr="DeepSeek-V4 Flash two-node 16P AdamW Eager, 5 steps",
         ngpu=8, nnodes=2,
-        train_script="examples/deepseek_v4/deepseek_v4_flash_cpt_4k_a3.sh",
+        train_script="scripts/run_train_multinodes.sh",
         train_args=("--metrics.enable_tensorboard", "--metrics.log_freq=1"),
         override_args=[(
             "--parallelism.expert-parallel-degree", "16",
@@ -26,9 +26,9 @@ def build_test_list() -> list[OverrideDefinitions]:
             "--checkpoint.no-enable",
             "--comm.init-timeout-seconds", "600",
         )],
-        # Source Flash recipe owns the full NPU import list.  The shell uses
-        # `${OPTIMIZER_OVERRIDES-default}`, so explicit empty removes Muon swap.
+        # Legacy CLI overrides still require migration to the native config API.
         env_vars={
+            "MODULE": "torchtitan_npu_recipes.tests.models.deepseek_v4",
             "ASCEND_SET_ENV_PATH": "/mnt/share/Ascend/20260805101249091/ascend-toolkit/latest/set_env.sh",
             "HF_ASSETS_PATH": "/mnt/share/models/DeepSeek-V4-Flash-bf16",
             # /data hosts the Docker overlay on A3 and can be 100% full.
@@ -38,7 +38,7 @@ def build_test_list() -> list[OverrideDefinitions]:
             "CKPT_INIT_LOAD_PATH": "/mnt/share/dsv4_ckpt_8rank",
             "MASTER_PORT": "6316",
             "HCCL_IF_BASE_PORT": "30160",
-            "CONFIG": "deepseek_v4_flash_43layers_16experts",
+            "CONFIG": "deepseek_v4_flash_43layers_16experts_eager_fp8",
             "OPTIMIZER_OVERRIDES": "",
             # On some installed torch_npu builds the default Triton backend
             # registers aten.erfc twice at import-time (even in Eager runs).

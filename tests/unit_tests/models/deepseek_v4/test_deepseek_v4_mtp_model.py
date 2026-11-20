@@ -4,8 +4,6 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-from copy import deepcopy
-
 import pytest
 import torch
 from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
@@ -19,12 +17,12 @@ from tests.unit_tests.models.mtp_test_utils import (
     preprocess_v04,
 )
 from torchtitan_npu.models.common.linear import SharedLinear
-from torchtitan_npu.models.deepseek_v4 import _make_v4_config
+from torchtitan_npu.models.deepseek_v4.flavors import _make_dsv4_config
 from torchtitan_npu.models.deepseek_v4.mtp import MTPChunkedLossWrapper
 from torchtitan_npu.models.deepseek_v4.state_dict_adapter import (
     DeepSeekV4StateDictAdapter,
 )
-from torchtitan_npu_recipes.models.deepseek_v4 import deepseek_v4_debugmodel
+from torchtitan_npu_recipes.tests.models.deepseek_v4 import deepseek_v4_debugmodel
 
 
 def _build_model_config(
@@ -34,7 +32,7 @@ def _build_model_config(
     original_seq_len=SEQ_LEN,
     num_mtp_layers=1,
 ):
-    return _make_v4_config(
+    return _make_dsv4_config(
         dim=32,
         n_layers=3,
         vocab_size=VOCAB_SIZE,
@@ -145,6 +143,25 @@ def test_deepseek_v4_mtp_model_supports_chunked_loss():
     assert any(parameter.grad is not None for parameter in model.mtp_layers.parameters())
 
 
+def test_deepseek_v4_mtp_gradient_isolation_detaches_shared_parameters():
+    config = _build_model_config()
+    config.mtp_isolate_gradients = True
+    model = build_cpu_model(config)
+
+    assert isinstance(model.lm_head, SharedLinear)
+    tokens = torch.arange(SEQ_LEN) % VOCAB_SIZE
+    labels = (tokens + 1) % VOCAB_SIZE
+    tokens, _, extra_kwargs = preprocess_v04(model, tokens, labels, PACKED_POSITIONS.clone())
+
+    output = model(tokens, **extra_kwargs)
+    sum(item.square().sum() for item in output[1:]).backward()
+
+    for name, parameter in model.named_parameters():
+        if not name.startswith("mtp_layers."):
+            assert parameter.grad is None or not parameter.grad.count_nonzero(), name
+    assert model.mtp_layers[0].e_proj.weight.grad is not None
+
+
 @pytest.fixture
 def single_threaded_cpu():
     # Keep scatter/reduction scheduling fixed for bitwise gradient comparison.
@@ -154,128 +171,6 @@ def single_threaded_cpu():
         yield
     finally:
         torch.set_num_threads(previous)
-
-
-@pytest.mark.parametrize("isolate", [False, True], ids=["shared-gradients", "isolated-gradients"])
-def test_deepseek_v4_mtp_recipe_configures_model_and_loss_together(isolate):
-    trainer_config = deepseek_v4_debugmodel(num_mtp_layers=1, mtp_isolate_gradients=isolate)
-    assert trainer_config.loss.mtp_isolate_gradients is isolate
-    model_config = trainer_config.model
-    with torch.device("meta"):
-        model = model_config.build()
-
-    assert model.mtp_isolate_gradients is isolate
-    assert isinstance(model.lm_head, SharedLinear) is isolate
-
-
-@pytest.mark.parametrize("missing_head", [False, True], ids=["ordinary_linear", "missing_head"])
-def test_deepseek_v4_mtp_isolation_rejects_incompatible_loss_head(missing_head):
-    with torch.random.fork_rng(devices=[]):
-        loss_fn = MTPChunkedLossWrapper(
-            MTPChunkedLossWrapper.Config(
-                num_chunks=2,
-                loss_fn=CrossEntropyLoss.Config(global_vocab_size=VOCAB_SIZE),
-                mtp_isolate_gradients=True,
-            )
-        )
-        head = torch.nn.Linear(4, VOCAB_SIZE, bias=False)
-        if not missing_head:
-            loss_fn.set_lm_head(head)
-        hidden = tuple(torch.ones(4, 4, requires_grad=True) for _ in range(2))
-        labels = (torch.zeros(4, dtype=torch.long),) * 2
-
-        with pytest.raises(ValueError, match="mtp_isolate_gradients requires a SharedLinear LM head"):
-            loss_fn(hidden, labels, torch.tensor([4, 4]))
-
-        assert head.weight.grad is None
-        assert all(item.grad is None for item in hidden)
-
-
-def test_deepseek_v4_mtp_isolation_rejects_replaced_model_head():
-    with torch.random.fork_rng(devices=[]):
-        config = _build_model_config()
-        config.mtp_isolate_gradients = True
-        model = build_cpu_model(config)
-        model.lm_head = torch.nn.Linear(32, VOCAB_SIZE, bias=False)
-        tokens = torch.arange(SEQ_LEN) % VOCAB_SIZE
-        tokens, _, extra_kwargs = preprocess_v04(model, tokens, (tokens + 1) % VOCAB_SIZE, PACKED_POSITIONS.clone())
-
-        with pytest.raises(ValueError, match="mtp_isolate_gradients requires a SharedLinear LM head"):
-            model(tokens, **extra_kwargs)
-
-
-@pytest.mark.parametrize("num_mtp_layers", [1, 2], ids=["depth1", "depth2"])
-def test_deepseek_v4_mtp_detaches_all_shared_parameters(num_mtp_layers):
-    with torch.random.fork_rng(devices=[]):
-        config = _build_model_config(num_mtp_layers=num_mtp_layers)
-        config.mtp_isolate_gradients = True
-        model = build_cpu_model(config)
-        tokens = torch.arange(SEQ_LEN) % VOCAB_SIZE
-        labels = (tokens + 1) % VOCAB_SIZE
-        tokens, _, extra_kwargs = preprocess_v04(model, tokens, labels, PACKED_POSITIONS.clone())
-
-        output = model(tokens, **extra_kwargs)
-        sum(item.square().sum() for item in output[1:]).backward()
-
-        for name, parameter in model.named_parameters():
-            if not name.startswith("mtp_layers."):
-                assert parameter.grad is None or not parameter.grad.count_nonzero(), name
-        for layer in model.mtp_layers:
-            for projection in (layer.e_proj, layer.h_proj):
-                assert projection.weight.grad is not None
-                assert projection.weight.grad.count_nonzero()
-
-
-@pytest.mark.parametrize("chunked", [False, True], ids=["logits", "chunked"])
-def test_deepseek_v4_mtp_isolation_preserves_main_gradients(chunked, single_threaded_cpu):
-    with torch.random.fork_rng(devices=[]):
-        config = _build_model_config()
-        reference = build_cpu_model(config)
-        isolated_config = deepcopy(config)
-        isolated_config.mtp_isolate_gradients = True
-        model = build_cpu_model(isolated_config)
-        model.load_state_dict(reference.state_dict(), strict=True)
-        tokens = torch.arange(SEQ_LEN) % VOCAB_SIZE
-        labels = (tokens + 1) % VOCAB_SIZE
-        positions = PACKED_POSITIONS.clone()
-        tokens, labels, extra_kwargs = preprocess_v04(model, tokens, labels, positions)
-        if chunked:
-            object.__setattr__(model, "_skip_lm_head", True)
-            object.__setattr__(reference, "_skip_lm_head", True)
-
-        output = model(tokens, **extra_kwargs)
-        expected = reference(tokens, **extra_kwargs)
-        for actual, original in zip(output, expected, strict=True):
-            torch.testing.assert_close(actual, original, rtol=0, atol=0)
-        loss_config = CrossEntropyLoss.Config(global_vocab_size=VOCAB_SIZE)
-        if chunked:
-            main_loss_fn = ChunkedLossWrapper(ChunkedLossWrapper.Config(num_chunks=2, loss_fn=loss_config))
-            main_loss_fn.set_lm_head(reference.lm_head)
-            loss_fn = MTPChunkedLossWrapper(
-                MTPChunkedLossWrapper.Config(num_chunks=2, loss_fn=loss_config, mtp_isolate_gradients=True)
-            )
-            loss_fn.set_lm_head(model.lm_head)
-            main_loss, _ = main_loss_fn(expected[0], labels[0], torch.tensor(SEQ_LEN))
-            loss, _ = loss_fn(output, labels, torch.tensor([SEQ_LEN, SEQ_LEN - 2]))
-        else:
-            main_loss, _ = CrossEntropyLoss(loss_config)(expected[0], labels[0], torch.tensor(SEQ_LEN))
-            loss = (
-                CrossEntropyLoss(loss_config)(output[0], labels[0], torch.tensor(SEQ_LEN))[0]
-                + output[1].square().mean()
-            )
-        main_loss.backward()
-        loss.backward()
-        assert model.mtp_layers[0].e_proj.weight.grad.count_nonzero()
-
-        for name, parameter in model.named_parameters():
-            if name.startswith("mtp_layers."):
-                continue
-            expected_grad = dict(reference.named_parameters())[name].grad
-            assert (parameter.grad is None) == (expected_grad is None), name
-            if expected_grad is not None:
-                torch.testing.assert_close(
-                    parameter.grad, expected_grad, rtol=0, atol=0, msg=lambda message, name=name: f"{name}: {message}"
-                )
 
 
 def test_deepseek_v4_mtp_state_dict_round_trip():

@@ -5,9 +5,7 @@
 它不是算子级 override API；PyTorch backend 缺口及必须随包导入生效的临时适配放在
 `torchtitan_npu.patches`。
 
-DeepSeek-V4 的训练示例 wrapper 选择 `torchtitan_npu_recipes.examples.deepseek_v4` 中的工厂，
-由 Python recipe 按 `USE_GOLDEN` 设置 `config.override.imports`。`scripts/run_train.sh`
-只负责通用启动和参数透传，不提供 `TEST_OVERRIDES` 或 `GOLDEN_OVERRIDES`。
+DeepSeek-V4 配方在 `config.override.imports` 中显式选择融合算子，不读取 `USE_GOLDEN`。`scripts/run_train.sh` 负责进程启动与原生参数透传。
 
 ## 启用方式
 
@@ -16,17 +14,17 @@ DeepSeek-V4 的训练示例 wrapper 选择 `torchtitan_npu_recipes.examples.deep
 
 ```bash
 python -m torchtitan_npu.train \
-  --module torchtitan_npu_recipes.models.deepseek_v4 \
+  --module torchtitan_npu_recipes.tests.models.deepseek_v4 \
   --config deepseek_v4_debugmodel \
   --override \
     torchtitan_npu.override.common.rope.workaround
 ```
 
-CLI 每个条目使用一个 `--override`，多个条目重复该选项。工厂函数需要关键字参数时，使用
+多个无参数条目可以用空格或逗号分隔。工厂函数需要关键字参数时，使用
 `target=<JSON object>`，并将整个条目作为一个 shell 参数：
 
 ```bash
---override \
+--override.imports \
   'torchtitan_npu.override.deepseek_v4.sparse_attn.asc={"num_heads":128}'
 ```
 
@@ -36,7 +34,7 @@ NPU DeepEP dispatcher 与上游 `moe_comm_backend="deepep"` 配置绑定。模�
 `TokenDispatcherTransform` 在构造阶段填入；容量不足时明确报错。
 
 ```bash
---override \
+--override.imports \
   torchtitan_npu.override.common.token_dispatcher.asc_deepep
 ```
 
@@ -208,21 +206,32 @@ converter 处理后的实际配置类型和 FQN 核对匹配结果。
 
 ### Checkpoint 完整性校验
 
-Checkpoint 配置由 NPU 的 `CheckpointManager.Config` 提供，位于
-`torchtitan_npu/extensions/torchtitan/components/checkpoint.py`，不再通过 checkpoint
-override 工厂选择。文件级 SHA-256 manifest 默认关闭，在 recipe 中开启：
+`torchtitan_npu.override.checkpoint.npu` 为基础 `CheckpointManager` 增加文件级 SHA-256
+manifest。该入口默认不启用校验；使用以下参数后，保存会生成
+`_checkpoint_hash_manifest.json`，加载会在物化 checkpoint state 前验证清单：
 
 ```python
-from torchtitan_npu.extensions.torchtitan.components.checkpoint import CheckpointManager
-
-# 若 recipe 已有 checkpointer，保留其保存策略，仅设置 extensions 字段。
-config.checkpointer = CheckpointManager.Config()
 config.checkpointer.extensions.verify_hash_manifest = True
 ```
 
-保存会生成 `_checkpoint_hash_manifest.json`，加载会在物化 checkpoint state 前验证清单。
-异步保存只有在 DCP 和 manifest 均成功后才完成；遗留 pending 标记会使加载失败。
-没有 manifest 且没有 pending 标记时，checkpoint 按无清单格式加载并跳过校验。
+| 入口 | Target | Replacement | 适用范围 |
+| --- | --- | --- | --- |
+| `torchtitan_npu.override.checkpoint.npu` | `CheckpointManager.Config`（精确匹配） | `NPUCheckpointManager.Config` | 基础 checkpoint manager |
+| `torchtitan_npu.override.checkpoint.npu_virtual` | `CheckpointManager.Config`（精确匹配） | `NPUVirtualCheckpointManager.Config` | 同时需要 SHA-256 manifest 和 Virtual Optimizer checkpoint writer |
+
+Virtual Optimizer 组合场景使用单一 checkpoint replacement，不能再同时启用
+`optimizer.checkpoint_virtual`：
+
+```python
+config.checkpointer.extensions.verify_hash_manifest = True
+```
+
+两个 checkpoint 入口均使用精确匹配，不会替换 `TorchFTCheckpointManager.Config` 等上游
+特化配置；当前不为 TorchFT 提供 SHA-256 manifest variant。基础 `npu` 入口的 manifest I/O
+支持本地路径和 TorchTitan 支持的 fsspec 远程 native DCP 路径；`npu_virtual` 仍受 Virtual
+Optimizer writer 的同步、本地 native DCP 限制。异步保存只有在 DCP 和 manifest 均成功后
+才完成；遗留 pending 标记会使加载失败。没有 manifest 且没有 pending 标记时，checkpoint
+按旧格式加载并跳过校验。
 
 清单只接受 checkpoint 目录中的单层普通文件，不读取绝对路径、父目录、符号链接或其他
 非普通文件。CPU 单元测试覆盖本地路径、fsspec `memory://`、异步完成与失败传播，以及路径
@@ -235,6 +244,7 @@ config.checkpointer.extensions.verify_hash_manifest = True
 | 入口 | Target | Replacement | 说明 |
 | --- | --- | --- | --- |
 | `optimizer.virtual` | `OptimizersContainer.Config` | `VirtualOptimizersContainer.Config` | 将 Adam/AdamW 的 `exp_avg` 和 `exp_avg_sq` 放入 NPU swap memory |
+| `optimizer.checkpoint_virtual` | `CheckpointManager.Config` | `VirtualCheckpointManager.Config` | 为 Virtual Optimizer 的同步 native DCP 保存关闭 writer copy-ahead |
 | `rms_norm.asc` | `RMSNorm.Config` | `AscRMSNorm.Config` | 使用 `torch_npu.npu_rms_norm` |
 | `rope.workaround` | `ComplexRoPE.Config` | `WorkaroundComplexRoPE.Config` | 预展开 cos/sin cache，并使用 PyTorch 小算子计算 interleaved RoPE；仅精确匹配 `ComplexRoPE.Config` |
 | `rope.asc_complex` | `ComplexRoPE.Config` | `AscComplexRoPE.Config` | 使用 interleave 模式的 `torch_npu.npu_rotary_mul`；仅精确匹配 |
@@ -269,22 +279,26 @@ CANN 实现位于 `common/swiglu_group/ascendc.py`。
 启用两个 expert override：
 
 ```bash
---override torchtitan_npu.override.common.swiglu_group.asc \
---override torchtitan_npu.override.common.swiglu_group.asc_shared_experts
+--override.imports \
+  torchtitan_npu.override.common.swiglu_group.asc \
+  torchtitan_npu.override.common.swiglu_group.asc_shared_experts
 ```
 
 ### Virtual Optimizer 与 checkpoint
 
 Virtual Optimizer 使用 NPU swap memory 保存 Adam/AdamW 的 `exp_avg` 和
-`exp_avg_sq`，通过以下入口启用：
+`exp_avg_sq`。通过同步 native DCP 保存和恢复完整训练状态时，应同时启用：
 
 ```bash
---override torchtitan_npu.override.common.optimizer.virtual
+--override.imports \
+  torchtitan_npu.override.common.optimizer.virtual,\
+  torchtitan_npu.override.common.optimizer.checkpoint_virtual
 ```
 
-同步 native DCP 的 writer 适配已由上述 NPU `CheckpointManager` 提供，无需额外的
-checkpoint override。在 recipe 中配置 checkpointer，并使用 `async_mode="disabled"`。
-完整的数据流、支持范围和限制见
+`optimizer.virtual` 负责创建 swap-backed optimizer state，`optimizer.checkpoint_virtual`
+负责让同步 native DCP 正确保存这些 live swap tensors。两个入口位于同一模块，但
+作用于不同的配置节点；checkpoint 逻辑是 Virtual Optimizer 的保存兼容处理，不是独立
+checkpoint 特性。完整的数据流、支持范围和限制见
 [Virtual Optimizer 特性说明](../../docs/feature_guides/virtual_optimizer.md)。
 
 ### DeepSeek-V4
@@ -345,14 +359,14 @@ MHC 的 `asc_hc_pre` / `asc_hc_post` 与 `triton_hc_pre` / `triton_hc_post` / `t
 `tilelang_hc_pre` 与 `asc_hc_pre`、`triton_hc_pre` 作用于同一 `HcPre.Config` 节点，只能选择一个；它可以与作用于 `HcPost.Config` 的 `asc_hc_post` 同时启用。
 
 依赖的 tilelang/tile_kernels 暂时未开源，不随默认 requirements 安装。
-推荐直接使用 `examples/deepseek_v4/*.sh` wrapper；单机调试可使用
-[deepseek_v4_mini_1p_cpt_2k_a3.sh](../../examples/deepseek_v4/debug/deepseek_v4_mini_1p_cpt_2k_a3.sh)，
-它选择对应的 Python recipe，并调用 `scripts/run_train.sh`：
+单卡调试使用 [DeepSeek-V4 配方](../../torchtitan_npu_recipes/tests/models/deepseek_v4.py)，先在配方中设置资产路径，再运行：
 
 ```bash
-bash examples/deepseek_v4/debug/deepseek_v4_mini_1p_cpt_2k_a3.sh
-USE_GOLDEN=1 bash examples/deepseek_v4/debug/deepseek_v4_mini_1p_cpt_2k_a3.sh
+MODULE=torchtitan_npu_recipes.tests.models.deepseek_v4 \
+CONFIG=deepseek_v4_flash_1p_2k NGPU=1 bash scripts/run_train.sh
 ```
+
+参考算子组合需在 Python 配方中显式选择，不能通过 `USE_GOLDEN` 切换。
 
 默认路径启用以下组合：
 
@@ -413,7 +427,7 @@ torchtitan_npu.override.deepseek_v4_1.mhc.asc_sinkhorn
 只在 `override.imports` 按完整 `module.function` 列名导入时注册。`mhc` 下的两个入口
 只替换单个阶段，`HcPost` 的 kernel 调用因此要求显式的 `[B, T, D]` 流；`engram` 下的两个
 入口都要求 `num_max_tokens_per_rank`，取值需覆盖该次运行的最大 batch。启用方式见
-[V4.1 独立训练基线](../../examples/deepseek_v4_1/readme.md)。
+[V4.1 独立训练基线](../../torchtitan_npu_recipes/README.md)。
 
 #### `sparse_attn.asc` 的 kernel geometry 是 override 的参数
 

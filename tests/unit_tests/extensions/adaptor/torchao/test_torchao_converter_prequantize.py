@@ -13,6 +13,7 @@ concern (the wrapper tensor's fail-fast guard), not a config-stage one.
 """
 
 import pytest
+from torchtitan.config.parallelism import ParallelismConfig
 
 # TorchAO and TorchAO-NPU are optional dependencies (see the adaptor converter's
 # module docstring): the adaptor's configs/recipe modules import them at module
@@ -32,9 +33,9 @@ from torchtitan_npu.extensions.adaptor.torchao.converter import (
     _model_type_for_config,
     apply_quantization_converter,
 )
-from torchtitan_npu.models.deepseek_v4 import model_registry
+from torchtitan_npu.models.deepseek_v4 import build_model_config
 from torchtitan_npu.models.deepseek_v4_1 import model_registry as v41_model_registry
-from torchtitan_npu_recipes.examples.deepseek_v4 import deepseek_v4_flash_cpt_4k_a5_graphtrainer
+from torchtitan_npu_recipes.models.deepseek_v4 import deepseek_v4_flash_cpt_4k_a5
 
 
 def _quantization_config(**overrides) -> QuantizationExtensionConfig:
@@ -56,7 +57,7 @@ def _collect_flags(model_config) -> dict[str, bool]:
 def test_default_whitelist_keeps_prequantize_on_all_dense_projections(family):
     """fsdp_prequantize_fqns=None resolves to the recipe default whitelist."""
     spec = (
-        model_registry("debugmodel", num_mtp_layers=0)
+        build_model_config("debugmodel", num_mtp_layers=0, parallelism=ParallelismConfig())
         if family == "v4"
         else v41_model_registry("deepseek_v4_1_stripped")
     )
@@ -76,7 +77,7 @@ def test_full_a5_graphtrainer_quantizes_shared_and_routed_experts():
     from torchtitan_npu.override.common.rms_norm import AscRMSNorm
     from torchtitan_npu.override.deepseek_v4.compressor import asc
 
-    config = deepseek_v4_flash_cpt_4k_a5_graphtrainer()
+    config = deepseek_v4_flash_cpt_4k_a5()
     converted = apply_quantization_converter(
         config.model,
         config.extension.quantization,
@@ -106,7 +107,7 @@ def test_full_a5_graphtrainer_quantizes_shared_and_routed_experts():
 
 def test_user_whitelist_disables_non_whitelisted_weights():
     """Only whitelisted FQNs keep fsdp_prequantize=True; the rest are explicitly off."""
-    spec = model_registry("debugmodel", num_mtp_layers=0)
+    spec = build_model_config("debugmodel", num_mtp_layers=0, parallelism=ParallelismConfig())
     quantization = _quantization_config(
         enable_fsdp_prequantize=True,
         fsdp_prequantize_fqns=[".attention.wq_a"],
@@ -123,7 +124,7 @@ def test_user_whitelist_disables_non_whitelisted_weights():
 
 def test_whitelist_pattern_matching_nothing_raises():
     """A typo'd pattern is a silent no-op and must fail fast."""
-    spec = model_registry("debugmodel", num_mtp_layers=0)
+    spec = build_model_config("debugmodel", num_mtp_layers=0, parallelism=ParallelismConfig())
     quantization = _quantization_config(
         enable_fsdp_prequantize=True,
         fsdp_prequantize_fqns=[".attention.wq_a", ".attention.wk_b"],  # wk_b does not exist
@@ -135,7 +136,7 @@ def test_whitelist_pattern_matching_nothing_raises():
 
 def test_explicit_empty_whitelist_with_master_switch_raises():
     """An explicitly empty whitelist contradicts enable_fsdp_prequantize=True."""
-    spec = model_registry("debugmodel", num_mtp_layers=0)
+    spec = build_model_config("debugmodel", num_mtp_layers=0, parallelism=ParallelismConfig())
     quantization = _quantization_config(enable_fsdp_prequantize=True, fsdp_prequantize_fqns=[])
 
     with pytest.raises(ValueError, match="explicitly empty"):
@@ -144,7 +145,7 @@ def test_explicit_empty_whitelist_with_master_switch_raises():
 
 def test_master_switch_off_leaves_policy_inert():
     """Without enable_fsdp_prequantize no whitelist policy is applied at all."""
-    spec = model_registry("debugmodel", num_mtp_layers=0)
+    spec = build_model_config("debugmodel", num_mtp_layers=0, parallelism=ParallelismConfig())
     quantization = _quantization_config(enable_fsdp_prequantize=False)
 
     converted = apply_quantization_converter(spec, quantization, model_compile_enabled=False)
@@ -162,7 +163,7 @@ def test_default_whitelist_covers_every_quantized_projection():
     coverage. Matching the config tree — not a literal copy of the constant —
     is what keeps the whitelist and the recipe in sync.
     """
-    spec = model_registry("debugmodel", num_mtp_layers=0)
+    spec = build_model_config("debugmodel", num_mtp_layers=0, parallelism=ParallelismConfig())
     quantization = _quantization_config(enable_fsdp_prequantize=True)
     converted = apply_quantization_converter(spec, quantization, model_compile_enabled=False)
 
@@ -177,7 +178,7 @@ def test_default_whitelist_covers_every_quantized_projection():
 
 
 def test_mxfp4_communication_keeps_dense_fp8_and_experts_mxfp4():
-    spec = model_registry("debugmodel", num_mtp_layers=0)
+    spec = build_model_config("debugmodel", num_mtp_layers=0, parallelism=ParallelismConfig())
     config = _quantization_config(
         enable_mxfp4_qat=True,
         enable_fsdp_prequantize=True,
@@ -204,7 +205,7 @@ def test_mxfp4_communication_keeps_dense_fp8_and_experts_mxfp4():
 
 
 def test_mxfp4_communication_config_reaches_only_selected_experts():
-    spec = model_registry("debugmodel", num_mtp_layers=0)
+    spec = build_model_config("debugmodel", num_mtp_layers=0, parallelism=ParallelismConfig())
     config = _quantization_config(
         enable_mxfp4_qat=True,
         enable_fsdp_prequantize=True,

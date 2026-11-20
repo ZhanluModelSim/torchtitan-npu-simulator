@@ -19,8 +19,8 @@ from torchtitan.models.common.aux_loss import AuxLoss
 from torchtitan.models.deepseek_v4.attention import DeepSeekV4Attention as UpstreamDeepSeekV4Attention
 from torchtitan.models.deepseek_v4.compressor import Indexer, SparseIndexerLoss, compressed_cu_seqlens
 
-from torchtitan_npu.models.deepseek_v4 import _make_v4_config
 from torchtitan_npu.models.deepseek_v4.attention import DeepSeekV4Attention
+from torchtitan_npu.models.deepseek_v4.flavors import _make_dsv4_config as _make_v4_config
 from torchtitan_npu.models.deepseek_v4.model import GraphTrainerDeepSeekV4Model
 from torchtitan_npu.override.deepseek_v4.sparse_attn import ascendc
 from torchtitan_npu.override.deepseek_v4.sparse_attn.native import (

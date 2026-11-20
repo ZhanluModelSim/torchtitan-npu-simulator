@@ -14,8 +14,8 @@ from torchtitan_npu.extensions.torchtitan.components.optimizer.muon import DistM
 from torchtitan_npu_recipes.models.deepseek_v4 import (
     _dsv4_muon_profile,
     _enable_indexer_aux_loss,
-    deepseek_v4_debugmodel,
 )
+from torchtitan_npu_recipes.tests.models.deepseek_v4 import deepseek_v4_debugmodel
 
 
 def deepseek_v4_checkpoint(*, parallelism: ParallelismConfig | None = None, seq_len: int = 2048):

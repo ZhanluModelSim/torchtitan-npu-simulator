@@ -18,6 +18,8 @@ from torchtitan.distributed.flex_shard.dist_muon import _resolve_storage_to_comp
 
 from torchtitan_npu.config import OptimizerConfig
 from torchtitan_npu.extensions.torchtitan.components.optimizer.muon import DistMuon
+from torchtitan_npu_recipes.models.deepseek_v4 import _dsv4_muon_profile
+from torchtitan_npu_recipes.models.deepseek_v4_1 import _v41_muon_profile
 
 
 @pytest.fixture
@@ -33,10 +35,10 @@ def sparse_storage_mesh():
 
 
 @pytest.mark.parametrize(
-    "module,recipe",
+    "module,recipe,profile_factory",
     [
-        ("torchtitan_npu_recipes.models.deepseek_v4", "deepseek_v4_debugmodel"),
-        ("torchtitan_npu_recipes.models.deepseek_v4_1", "deepseek_v4_1_debugmodel_text"),
+        ("torchtitan_npu_recipes.tests.models.deepseek_v4", "deepseek_v4_debugmodel", _dsv4_muon_profile),
+        ("torchtitan_npu_recipes.models.deepseek_v4_1", "deepseek_v4_1_debugmodel_text", _v41_muon_profile),
     ],
     ids=["v4", "v4.1"],
 )
@@ -46,11 +48,10 @@ def sparse_storage_mesh():
     ids=["stacked-gate-up", "down"],
 )
 def test_recipe_expert_layout_preserves_ep_ownership_during_row_redistribution(
-    sparse_storage_mesh, module, recipe, projection, global_shape, local_shape, row_axis
+    sparse_storage_mesh, module, recipe, profile_factory, projection, global_shape, local_shape, row_axis
 ):
     config = getattr(importlib.import_module(module), recipe)()
-    recipes = importlib.import_module(module)
-    profile = (recipes._dsv4_muon_profile if "_v4_1" not in module else recipes._v41_muon_profile)(config.model)
+    profile = profile_factory(config.model)
     config.optim.optimizer = OptimizerConfig(
         optimizers=[
             DistMuon.Config(

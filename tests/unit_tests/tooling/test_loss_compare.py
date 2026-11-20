@@ -73,7 +73,7 @@ from tensorboard.compat.proto.event_pb2 import Event
 from tensorboard.compat.proto.summary_pb2 import Summary
 from tensorboard.summary.writer.event_file_writer import EventFileWriter
 p = argparse.ArgumentParser()
-p.add_argument('--dump_folder', type=Path)
+p.add_argument('--output-dir', '--dump_folder', type=Path, dest='dump_folder')
 p.add_argument('--training.steps', type=int, dest='steps')
 p.add_argument('--value', type=float)
 p.add_argument('--recorded-steps')
@@ -648,3 +648,15 @@ def test_loss_compare_output_exception_stops_descendants(tmp_path, sleeping_runn
         )
 
     _assert_processes_stopped(json.loads(pid_file.read_text()))
+
+
+@pytest.mark.parametrize("option", ["--optim.optimizer.name=AdamW", "--parallelism.expert-parallel-degree=1"],
+                         ids=["optimizer", "parallelism"])
+def test_native_comparison_rejects_seed_only_choices_during_training(option):
+    result = subprocess.run(
+        [sys.executable, str(CLI.with_name("train.py")), option],
+        cwd=CLI.parents[2], capture_output=True, text=True,
+    )
+
+    assert result.returncode == 2
+    assert "seed-only; choose a Python recipe" in result.stderr

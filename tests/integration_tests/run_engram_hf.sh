@@ -39,7 +39,7 @@
       hf) args+=(--checkpoint.initial-load-path "$RUN_DIR/source/checkpoint/step-2" --checkpoint.initial-load-in-hf) ;;
     esac
     export CKPT_SAVE_LOAD_PATH="$RUN_DIR/$mode/checkpoint"
-    bash examples/deepseek_v4_1/debug/deepseek_v4_1_flash_8p_cpt_4k_a5.sh \
+    bash scripts/run_train.sh \
       --extension.quantization.no-enable-quantized-training \
       --compile.no-enable \
       --optimizer.name AdamW --training.no-enable-cpu-offload \

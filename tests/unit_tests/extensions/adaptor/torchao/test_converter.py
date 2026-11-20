@@ -227,9 +227,14 @@ def test_model_type_rejects_unknown_model_config(converter_module):
 
 @pytest.mark.parametrize("family", ["deepseek_v4", "deepseek_v4_1"])
 def test_model_type_uses_real_config_owner(converter_module, family):
-    registry = importlib.import_module(f"torchtitan_npu.models.{family}").model_registry
-    name = "debugmodel" if family == "deepseek_v4" else "deepseek_v4_1_debugmodel"
-    config = registry(name)
+    from torchtitan.config.parallelism import ParallelismConfig
+
+    registry = importlib.import_module(f"torchtitan_npu.models.{family}")
+    config = (
+        registry.build_model_config("debugmodel", parallelism=ParallelismConfig())
+        if family == "deepseek_v4"
+        else registry.model_registry("deepseek_v4_1_debugmodel")
+    )
     expected = converter_module.ModelType.V4 if family == "deepseek_v4" else converter_module.ModelType.V4_1
 
     assert converter_module._model_type_for_config(config) is expected
@@ -329,9 +334,14 @@ def test_recipe_converters_reject_unknown_model_type(converter_module):
 def test_apply_quantization_converter_passes_model_type(converter_module, monkeypatch, model_name, expected_model_type):
     from torchtitan_npu.config.configs import QuantizationExtensionConfig
 
-    registry = importlib.import_module(f"torchtitan_npu.models.{model_name}").model_registry
-    config_name = "debugmodel" if model_name == "deepseek_v4" else "deepseek_v4_1_debugmodel"
-    model_config = registry(config_name)
+    from torchtitan.config.parallelism import ParallelismConfig
+
+    registry = importlib.import_module(f"torchtitan_npu.models.{model_name}")
+    model_config = (
+        registry.build_model_config("debugmodel", parallelism=ParallelismConfig())
+        if model_name == "deepseek_v4"
+        else registry.model_registry("deepseek_v4_1_debugmodel")
+    )
     quantization_config = QuantizationExtensionConfig(enable_quantized_training=True, recipe="mix")
     calls = []
     monkeypatch.setattr(converter_module, "_recipe_converters", lambda *args, **kwargs: calls.append(kwargs) or [])

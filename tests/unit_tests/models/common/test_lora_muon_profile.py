@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 import fnmatch
-import importlib
 
 import pytest
 import torch
@@ -13,12 +12,17 @@ from torchtitan.distributed.flex_shard import BlockShard, Owned
 from torchtitan_npu.config import OptimizerConfig
 from torchtitan_npu.extensions.torchtitan.components.optimizer.muon import DistMuon
 from torchtitan_npu.models.deepseek_v4.lora import is_lora_parameter
-from torchtitan_npu_recipes.models.deepseek_v4 import deepseek_v4_flash_lora
-from torchtitan_npu_recipes.models.deepseek_v4_1 import deepseek_v4_1_flash_text_lora
+from torchtitan_npu_recipes.models.deepseek_v4 import _dsv4_muon_profile
+from torchtitan_npu_recipes.models.deepseek_v4_1 import _v41_muon_profile, deepseek_v4_1_flash_text_lora
+from torchtitan_npu_recipes.tests.ci.deepseek_v4 import deepseek_v4_flash_lora
 
 
-@pytest.mark.parametrize("factory", [deepseek_v4_flash_lora, deepseek_v4_1_flash_text_lora], ids=["v4", "v4.1"])
-def test_actual_lora_recipe_muon_groups_cover_adapters_with_layouts_and_unique_buckets(factory):
+@pytest.mark.parametrize(
+    "factory,profile_factory",
+    [(deepseek_v4_flash_lora, _dsv4_muon_profile), (deepseek_v4_1_flash_text_lora, _v41_muon_profile)],
+    ids=["v4", "v4.1"],
+)
+def test_actual_lora_recipe_muon_groups_cover_adapters_with_layouts_and_unique_buckets(factory, profile_factory):
     config = factory()
     optimizer = config.optim.optimizer
     assert [type(group) for group in optimizer.optimizers] == [AdamW.Config]
@@ -28,10 +32,7 @@ def test_actual_lora_recipe_muon_groups_cover_adapters_with_layouts_and_unique_b
     assert trainables and all(is_lora_parameter(name) for name in trainables)
     assert not any("indexer" in name or "engram" in name or "vision" in name for name in trainables)
 
-    recipes = importlib.import_module(factory.__module__)
-    profile = (recipes._dsv4_muon_profile if "_v4_1" not in factory.__module__ else recipes._v41_muon_profile)(
-        config.model
-    )
+    profile = profile_factory(config.model)
     optimizer = OptimizerConfig(
         optimizers=[
             DistMuon.Config(

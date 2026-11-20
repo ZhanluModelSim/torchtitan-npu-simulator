@@ -18,7 +18,8 @@ from torchtitan.experiments.torchft.optimizer import TorchFTOptim
 from torchtitan_npu.extensions.torchtitan.experiments import torchft as activation
 from torchtitan_npu.extensions.torchtitan.experiments.torchft import trainer as module
 from torchtitan_npu.extensions.torchtitan import trainer as npu_trainer
-from torchtitan_npu_recipes.models.deepseek_v4 import deepseek_v4_flash, deepseek_v4_flash_8p_torchft
+from torchtitan_npu_recipes.tests.ci.deepseek_v4 import deepseek_v4_flash
+from torchtitan_npu_recipes.tests.ci.deepseek_v4 import deepseek_v4_flash_8p_torchft
 from torchtitan_npu.extensions.torchtitan.experiments.torchft.optimizer import TorchFTOptimEx
 
 engine_class = upstream.FaultTolerantTrainingEngine
@@ -31,7 +32,7 @@ assert issubclass(module.FaultTolerantTrainingEngineEx, engine_class)
 
 def make_config():
     return ConfigLoader().load([
-        '--module', 'torchtitan_npu_recipes.models.deepseek_v4',
+        '--module', 'torchtitan_npu_recipes.tests.ci.deepseek_v4',
         '--config', 'deepseek_v4_flash_8p_torchft',
     ])
 
@@ -49,9 +50,11 @@ assert config.training.num_tokens_per_microbatch_per_dp_rank == 256
 assert config.training.num_tokens_per_train_step == 4096
 assert config.training.num_tokens_per_train_step // (256 * 4 * 2) == 2
 assert isinstance(config.profiler, npu_trainer.CANNProfiler.Config)
+assert not config.extension.quantization.enable_quantized_training
+assert config.override.imports == ["torchtitan_npu.override.common.rope.workaround"]
 
 full_config = ConfigLoader().load([
-    '--module', 'torchtitan_npu_recipes.models.deepseek_v4',
+    '--module', 'torchtitan_npu_recipes.tests.ci.deepseek_v4',
     '--config', 'deepseek_v4_flash_torchft',
 ])
 assert isinstance(full_config, module.FaultTolerantTrainerEx.Config)
@@ -68,12 +71,14 @@ assert isinstance(full_config.optim, TorchFTOptimEx.Config)
 module.FaultTolerantTrainerEx._validate_supported_config(full_config)
 
 small_expert_config = ConfigLoader().load([
-    '--module', 'torchtitan_npu_recipes.models.deepseek_v4',
+    '--module', 'torchtitan_npu_recipes.tests.ci.deepseek_v4',
     '--config', 'deepseek_v4_flash_43layers_16experts_torchft',
 ])
 assert isinstance(small_expert_config, module.FaultTolerantTrainerEx.Config)
 assert small_expert_config.model.layers[2].feed_forward.num_experts == 16
 assert small_expert_config.parallelism.expert_parallel_degree == 16
+assert not small_expert_config.extension.quantization.enable_quantized_training
+assert small_expert_config.override.imports == ["torchtitan_npu.override.common.rope.workaround"]
 module.FaultTolerantTrainerEx._validate_supported_config(small_expert_config)
 
 # Preserve native callers after activating the NPU recipe in the same process.

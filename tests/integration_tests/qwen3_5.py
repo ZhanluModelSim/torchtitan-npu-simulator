@@ -36,12 +36,12 @@ def _build_case(
         ngpu=ngpu,
         disabled=disabled,
         env_vars={
-            "MODULE": "torchtitan_npu_recipes.models.qwen3_5",
+            "MODULE": "torchtitan_npu_recipes.tests.models.qwen3_5",
             "CONFIG": "qwen35_debugmodel",
         },
         use_golden=False,
         check_loss=False,
-        train_script="examples/qwen3_5/qwen3_5_debugmodel_1p_cpt_512.sh",
+        train_script="scripts/run_train.sh",
         train_args=QWEN3_5_TRAIN_ARGS,
     )
 

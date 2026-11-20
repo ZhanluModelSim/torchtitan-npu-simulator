@@ -14,7 +14,7 @@ from torch.fx.experimental.proxy_tensor import make_fx
 from torchtitan.config import OverrideConfig, apply_overrides
 from torchtitan.models.deepseek_v4.compressor import Compressor
 
-from torchtitan_npu.models.deepseek_v4 import _make_v4_config
+from torchtitan_npu.models.deepseek_v4.flavors import _make_dsv4_config as _make_v4_config
 from torchtitan_npu.override.common.rms_norm import AscRMSNorm
 from torchtitan_npu.override.common.rope import AscComplexRoPE
 from torchtitan_npu.override.deepseek_v4.compressor import ascendc
@@ -107,11 +107,11 @@ def test_native_compressor_without_fused_pooling_traces_packed_documents(monkeyp
 
 
 def test_native_compressor_reserved_terminal_slots_select_cann(monkeypatch):
-    class KernelSelected(Exception):
+    class KernelSelectedError(Exception):
         pass
 
     def selected_kernel():
-        raise KernelSelected
+        raise KernelSelectedError
 
     monkeypatch.setattr(ascendc, "load_compressor", selected_kernel)
     config = _model_config()
@@ -130,7 +130,7 @@ def test_native_compressor_reserved_terminal_slots_select_cann(monkeypatch):
         module = config.layers[0].attention.compressor.build()
     boundaries = torch.tensor([0, 4, 8, 8, 8], dtype=torch.int32)
 
-    with pytest.raises(KernelSelected):
+    with pytest.raises(KernelSelectedError):
         module(torch.ones(8, 16), torch.tensor([0, 1, 2, 3, 0, 1, 2, 3]), boundaries)
 
 

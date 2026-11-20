@@ -192,7 +192,12 @@ def convert_to_hf(args: argparse.Namespace):
         )
     else:
         model_module = importlib.import_module(module_name)
-        model_config = model_module.model_registry(model_flavor)
+        if module_name == "torchtitan_npu.models.deepseek_v4":
+            from torchtitan.config.parallelism import ParallelismConfig
+
+            model_config = model_module.build_model_config(model_flavor, parallelism=ParallelismConfig())
+        else:
+            model_config = model_module.model_registry(model_flavor)
 
     with torch.device("cpu"):
         raw_model = model_config.build()

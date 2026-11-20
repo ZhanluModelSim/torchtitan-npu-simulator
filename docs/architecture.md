@@ -9,7 +9,6 @@ torchtitan_npu/  Ascend NPU 插件主体
 torchtitan_npu_recipes/  完整训练配置与 recipe 组合
 experiments/     独立实验包；当前包含 torchao-npu distribution
 docs/            架构、开发者、功能和用户文档
-examples/        选择完整 Python 配置的示例 launcher
 scripts/         训练、转换、合规检查与辅助脚本
 tests/           CPU UT、NPU ST 与 tooling 自测
 .agents/         Agent Notes 与可复用 skills

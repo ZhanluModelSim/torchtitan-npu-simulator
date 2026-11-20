@@ -5,15 +5,20 @@
 
 """Debug recipes with the native typed V4 context-parallel backend."""
 
+import os
+
 from torchtitan.config.transform import ContextParallelTransform
 
-from torchtitan_npu_recipes.models.deepseek_v4 import deepseek_v4_debugmodel
+from torchtitan_npu_recipes.tests.models.deepseek_v4 import deepseek_v4_debugmodel
 
 
 def _debugmodel_cp(*, num_mtp_layers: int):
     from torchtitan_npu.override.deepseek_v4.sparse_attn.ascendc import AscV4ContextParallelSparseAttention
 
-    config = deepseek_v4_debugmodel(num_mtp_layers=num_mtp_layers)
+    config = deepseek_v4_debugmodel(
+        num_mtp_layers=num_mtp_layers,
+        per_doc_alignment=int(os.environ.get("DSV4_PER_DOC_ALIGNMENT", 128)),
+    )
     transform = ContextParallelTransform(inner_attention=AscV4ContextParallelSparseAttention)
     config.model = transform.transform(config.model)
     for _, attention, _, _ in config.model.traverse(AscV4ContextParallelSparseAttention.Config):

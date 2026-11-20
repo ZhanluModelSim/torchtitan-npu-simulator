@@ -17,12 +17,12 @@ from torchtitan.components.optim import AdamW, DistMuon
 
 from tests.unit_tests.models.deepseek_v4_1.preprocess_utils import cp_parallel_dims, tiny_v41_model
 from torchtitan_npu.config import OptimizerConfig
-from torchtitan_npu.extensions.torchtitan.components.optimizer.optimizer import SparseAdam
 from torchtitan_npu.models.deepseek_v4_1 import (
     EngramArgs,
     model_registry,
 )
 from torchtitan_npu.models.deepseek_v4_1.engram.config import _make_engram_configs
+from torchtitan_npu.models.deepseek_v4_1.optimizer import EngramTableOptimizerConfig
 from torchtitan_npu.models.deepseek_v4_1.state_dict_adapter import (
     DeepSeekV41StateDictAdapter,
 )
@@ -296,9 +296,10 @@ def test_debug_flavor_enables_engram_and_selects_sparse_adam():
     trainer_config = deepseek_v4_1_debugmodel_multimodal()
     param_groups = trainer_config.optim.optimizer.optimizers
     assert param_groups[0].pattern == r".*\.engram\.table\.weight$"
-    assert isinstance(param_groups[0], SparseAdam.Config)
+    assert isinstance(param_groups[0], EngramTableOptimizerConfig)
     assert param_groups[0].lr == 5e-5
-    assert isinstance(param_groups[1], AdamW.Config)
+    assert isinstance(param_groups[1], DistMuon.Config)
+    assert isinstance(param_groups[2], AdamW.Config)
 
 
 def test_released_v41_geometry_builds_published_logical_tables():
@@ -359,7 +360,7 @@ def test_explicit_disable_preserves_selected_optimizer(optimizer):
     assert all(layer.engram is None for layer in trainer.model.layers)
     assert type(trainer.optim.optimizer) is OptimizerConfig
     groups = trainer.optim.optimizer.optimizers
-    expected_types = [DistMuon.Config, AdamW.Config] if optimizer == "Muon" else [AdamW.Config]
+    expected_types = [DistMuon.Config, AdamW.Config]
     assert len(groups) == len(expected_types)
     assert all(isinstance(group, expected) for group, expected in zip(groups, expected_types, strict=True))
     adapter = DeepSeekV41StateDictAdapter(trainer.model, None)

@@ -11,7 +11,7 @@ def build_test_list() -> list[OverrideDefinitions]:
     common = dict(
         ngpu=8,
         nnodes=1,
-        train_script="examples/deepseek_v4/debug/deepseek_v4_flash_8p_cpt_4k_a3.sh",
+        train_script="scripts/run_train.sh",
         train_args=("--metrics.enable_tensorboard", "--metrics.log_freq=1"),
         expected_steps=(tuple(range(1, 6)),),
         check_loss=False,
@@ -23,6 +23,8 @@ def build_test_list() -> list[OverrideDefinitions]:
             test_descr="DeepSeek-V4 Flash A3 8P Muon Eager, 5 steps",
             override_args=[("--training.steps", "5", "--compile.no-enable")],
             env_vars={
+                "MODULE": "torchtitan_npu_recipes.tests.models.deepseek_v4",
+                "CONFIG": "deepseek_v4_flash_43layers_16experts_eager_bf16",
                 "ASCEND_SET_ENV_PATH": "/mnt/share/Ascend/20260805101249091/ascend-toolkit/latest/set_env.sh",
                 "HF_ASSETS_PATH": "/mnt/share/models/DeepSeek-V4-Flash-bf16",
             # /data hosts the Docker overlay on A3 and can be 100% full.
@@ -42,6 +44,8 @@ def build_test_list() -> list[OverrideDefinitions]:
             override_args=[("--training.steps", "5", "--compile.no-enable",
                             "--optimizer.name", "AdamW")],
             env_vars={
+                "MODULE": "torchtitan_npu_recipes.tests.models.deepseek_v4",
+                "CONFIG": "deepseek_v4_flash_43layers_16experts_eager_bf16",
                 "ASCEND_SET_ENV_PATH": "/mnt/share/Ascend/20260805101249091/ascend-toolkit/latest/set_env.sh",
                 "HF_ASSETS_PATH": "/mnt/share/models/DeepSeek-V4-Flash-bf16",
             # /data hosts the Docker overlay on A3 and can be 100% full.

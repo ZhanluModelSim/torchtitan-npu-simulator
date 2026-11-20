@@ -116,7 +116,7 @@ CP 拓扑、优化器和 checkpoint 由 Python recipe 配置。创建模型时�
 DeepSeek-V4 的 Grain 配置将文档对齐值放在 dataset 的 `AlignedTextProcessor.Config.per_doc_alignment`；
 启用 CP 时，需在 recipe 中将该值设为 `128 × CP` 的倍数。
 
-V4.1 的 CP 配方是 `examples/deepseek_v4_1/deepseek_v4_1_flash_cpt_1m_a5.sh`：脚本默认
+V4.1 的 CP 配方是 `torchtitan_npu_recipes.models.deepseek_v4_1.deepseek_v4_1_flash_cpt_1m_a5`：配方默认
 `CP=128`、`EP=128`、`--dataloader.per_doc_alignment 256`，启动时按 `EP` 校验拓扑（`WORLD_SIZE`
 与 `384` 都要能被 `EP` 整除）；`CP` / `EP` 可用同名环境变量覆盖。
 

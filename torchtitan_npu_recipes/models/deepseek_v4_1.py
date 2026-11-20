@@ -17,9 +17,10 @@ from torchtitan.components.data import (
     SingleDatasetConfig,
 )
 from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
-from torchtitan.components.optim import AdamW
+from torchtitan.components.optim import AdamW, LRSchedulersContainer
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
 from torchtitan.config import OverrideConfig, derive
+from torchtitan.config.override import OverrideImport
 from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.distributed.flex_shard import BlockShard, BucketConfig, ComputeLayout
 from torchtitan.distributed.parallelism_context import MeshAxisName
@@ -33,8 +34,11 @@ from torchtitan_npu.config import (
     OptimizerConfig,
     TrainingConfig,
 )
+from torchtitan_npu.config.configs import ProfilerExtensionConfig
+from torchtitan_npu.extensions.torchtitan.components.checkpoint import CheckpointManager as NPUCheckpointManager
 from torchtitan_npu.extensions.torchtitan.components.optimizer.muon import DistMuon
 from torchtitan_npu.extensions.torchtitan.components.optimizer.optimizer import HostSparseOptimizersContainer
+from torchtitan_npu.extensions.torchtitan.tools.profiler import CANNProfiler
 from torchtitan_npu.extensions.torchtitan.trainer import TrainerEx
 from torchtitan_npu.models.common.alignment import AlignedTextProcessor, compression_alignment
 from torchtitan_npu.models.common.muon import make_expert_layout, make_owned_layout, with_lora_compute_layouts
@@ -44,10 +48,25 @@ from torchtitan_npu.models.deepseek_v4_1.optimizer import EngramTableOptimizerCo
 from torchtitan_npu.models.deepseek_v4_1.trainer import DeepSeekV41Trainer
 
 if TYPE_CHECKING:
+    from torchtitan.components.optim.optimizer import BaseOptimizer
     from torchtitan.config.transform import ModelConfigConverter
     from torchtitan.trainer import Trainer
 
     from torchtitan_npu.models.deepseek_v4_1.vision.language_encoder import ReasoningEffort, ThinkingMode
+
+
+_A5_PREQUANTIZE_FQNS = [
+    ".attention.wq_a",
+    ".attention.wq_b",
+    ".attention.wkv",
+    ".attention.wo_a",
+    ".attention.wo_b",
+    ".attention.indexer.wq_b",
+    ".feed_forward.shared_experts.w13",
+    ".feed_forward.shared_experts.w2",
+    ".feed_forward.routed_experts.w13",
+    ".feed_forward.routed_experts.w2",
+]
 
 
 def _v41_muon_profile(model: DeepSeekV41Model.Config) -> MuonOptimizerProfile:
@@ -143,28 +162,31 @@ def _v41_muon_profile(model: DeepSeekV41Model.Config) -> MuonOptimizerProfile:
     return with_lora_compute_layouts(model, profile)
 
 
-def _v41_optimizer_config(model: DeepSeekV41Model.Config) -> OptimizerConfig:
+def _v41_optimizer_config(model: DeepSeekV41Model.Config, *, include_engram_table: bool = True) -> OptimizerConfig:
     has_engram = any(layer.engram is not None for layer in model.layers)
-    if has_engram:
-        return HostSparseOptimizersContainer.Config(
-            optimizers=[
-                EngramTableOptimizerConfig(pattern=r".*\.engram\.table\.weight$", lr=5e-5, betas=(0.9, 0.95), eps=1e-6),
-                AdamW.Config(pattern=r".*", lr=1e-5, eps=1e-6),
-            ]
-        )
     profile = _v41_muon_profile(model)
-    return OptimizerConfig(
-        optimizers=[
-            DistMuon.Config(
-                pattern=profile.muon_pattern,
-                compute_sharding_by_fqn=profile.compute_sharding_by_fqn,
-                bucket_configs=profile.bucket_configs,
-                lr=1e-5,
-                adjust_lr_fn="match_rms_adamw",
-            ),
-            AdamW.Config(pattern=r".*", lr=1e-5, eps=1e-8, fused=True, foreach=False),
-        ]
-    )
+    optimizers: list[BaseOptimizer.Config] = [
+        DistMuon.Config(
+            pattern=profile.muon_pattern,
+            compute_sharding_by_fqn=profile.compute_sharding_by_fqn,
+            bucket_configs=profile.bucket_configs,
+            lr=1e-5,
+            ns_steps=10,
+            adjust_lr_fn="match_rms_adamw",
+        ),
+        AdamW.Config(pattern=r".*", lr=1e-5, eps=1e-8, fused=True, foreach=False),
+    ]
+    # LoRA freezes the host table.  Omitting its sparse group avoids the empty
+    # parameter-group error while preserving the Muon/AdamW split for every
+    # remaining trainable parameter.  CPT/SFT retain the table group.
+    if has_engram and include_engram_table:
+        optimizers.insert(
+            0,
+            EngramTableOptimizerConfig(pattern=r".*\.engram\.table\.weight$", lr=5e-5, betas=(0.9, 0.95), eps=1e-6),
+        )
+    if has_engram:
+        return HostSparseOptimizersContainer.Config(optimizers=optimizers)
+    return OptimizerConfig(optimizers=optimizers)
 
 
 def _per_doc_alignment(model: DeepSeekV41Model.Config) -> int:
@@ -784,4 +806,271 @@ def deepseek_v4_1_flash_40layers_24experts_multimodal_sft_compiled(
         parallelism=parallelism, seq_len=seq_len, hf_assets_path=hf_assets_path, engram=engram
     )
     config.compile = CompileConfig(components=[], model=ModelCompileConfig())
+    return config
+
+
+def _reject_legacy_overrides() -> None:
+    for name in ("CLI_OVERRIDES", "OPTIMIZER_OVERRIDES", "DATALOADER_OVERRIDES", "MHC_POST_OVERRIDE"):
+        if name in os.environ:
+            raise ValueError(f"{name} no longer selects training settings; define a Python recipe or use --override")
+
+
+def _world_size(*, local_processes: int, nodes: int) -> int:
+    if "WORLD_SIZE" in os.environ:
+        return int(os.environ["WORLD_SIZE"])
+    node_ips = os.environ.get("NODE_IPS", "")
+    node_count = len([address for address in node_ips.split(",") if address.strip()]) if node_ips else nodes
+    return int(os.environ.get("NGPU", local_processes)) * int(os.environ.get("NNODES", node_count))
+
+
+def _topology(
+    *,
+    local_processes: int,
+    nodes: int,
+    shard_degree: int,
+    expert_degree: int,
+    context_degree: int = 1,
+    configurable: bool = False,
+) -> ParallelismConfig:
+    if configurable:
+        shard_degree = int(os.environ.get("DP_SHARD", shard_degree))
+        expert_degree = int(os.environ.get("EP", expert_degree))
+        context_degree = int(os.environ.get("CP", context_degree))
+    world_size = _world_size(local_processes=local_processes, nodes=nodes)
+    if (
+        min(world_size, shard_degree, expert_degree, context_degree) <= 0
+        or world_size % (shard_degree * context_degree)
+        or world_size % expert_degree
+    ):
+        raise ValueError("WORLD_SIZE must form complete DP/CP/EP groups, and EP must divide the model's expert count")
+    return ParallelismConfig(
+        data_parallel_shard_degree=shard_degree,
+        data_parallel_replicate_degree=world_size // (shard_degree * context_degree),
+        expert_parallel_degree=expert_degree,
+        context_parallel_degree=context_degree,
+        tensor_parallel_degree=1,
+        pipeline_parallel_degree=1,
+        fsdp_reshard_after_forward="always",
+        enable_sequence_parallel=True,
+    )
+
+
+def _set_context(config: TrainerEx.Config, *, sequence_length: int, token_budget: int, steps: int) -> None:
+    assert isinstance(config.model, DeepSeekV41Model.Config)
+    if config.model.max_context_length != sequence_length:
+        raise ValueError("Construct the model with the training sequence length")
+    config.training.num_tokens_per_microbatch_per_dp_rank = sequence_length
+    config.training.num_tokens_per_train_step = token_budget
+    config.training.steps = steps
+    config.training.disable_cuda_graphs = True
+    config.metrics.log_freq = 1
+
+
+def _set_muon(config: TrainerEx.Config, *, include_engram_table: bool = True) -> None:
+    assert isinstance(config.model, DeepSeekV41Model.Config)
+    assert isinstance(config.optim.optimizer, OptimizerConfig)
+    config.optim.optimizer = _v41_optimizer_config(config.model, include_engram_table=include_engram_table)
+
+
+def _set_schedule(config: TrainerEx.Config) -> None:
+    config.optim.lr_scheduler = LRSchedulersContainer.Config(
+        warmup_steps=2,
+        total_steps=config.training.steps,
+        decay_ratio=1.0,
+        decay_type="cosine",
+        min_lr_factor=0.01,
+    )
+
+
+def _overrides(*, a5: bool, debug: bool, swap: bool = True, qat: bool = False) -> list[OverrideImport]:
+    golden = os.environ.get("USE_GOLDEN", "0") == "1"
+    tilelang = a5 and not golden and os.environ.get("USE_TILELANG", "0") == "1"
+    result: list[OverrideImport]
+    if golden:
+        result = ["torchtitan_npu.override.common.rope.workaround"]
+    else:
+        result = [
+            "torchtitan_npu.override.common.rms_norm.asc",
+            "torchtitan_npu.override.common.rope.asc_half_rotation",
+            (
+                "torchtitan_npu.override.deepseek_v4_1.tilelang.tilelang_hc_post"
+                if tilelang
+                else "torchtitan_npu.override.deepseek_v4_1.mhc.asc_hc_post"
+            ),
+            "torchtitan_npu.override.common.token_dispatcher.asc",
+        ]
+    if swap:
+        result.append("torchtitan_npu.override.common.optimizer.swap_optimizer")
+    # QAT historically selects its fused attention list independently of USE_GOLDEN.
+    if qat or not golden:
+        result.append(f"torchtitan_npu.override.common.rope.{'asc_partial' if a5 else 'asc_complex'}")
+        if tilelang and not qat:
+            result.append("torchtitan_npu.override.deepseek_v4_1.tilelang.tilelang_hc_pre")
+        if a5:
+            result.extend(
+                [
+                    "torchtitan_npu.override.common.swiglu_group.asc",
+                    "torchtitan_npu.override.common.swiglu_group.asc_shared_experts",
+                ]
+            )
+        if a5 or debug:
+            result.extend(
+                [
+                    "torchtitan_npu.override.deepseek_v4_1.sparse_attn.asc",
+                    "torchtitan_npu.override.deepseek_v4_1.lightning_indexer.asc",
+                ]
+            )
+        if a5 and not tilelang and not qat:
+            result.append("torchtitan_npu.override.deepseek_v4_1.mhc.asc_sinkhorn")
+    return result
+
+
+def _sft(
+    flavor: str,
+    *,
+    checkpoint: bool,
+    parallelism: ParallelismConfig,
+    seq_len: int,
+    hf_assets_path: str,
+    engram: EngramArgs | None = None,
+) -> TrainerEx.Config:
+    config = deepseek_v4_1_vision_sft(
+        flavor=flavor,
+        parallelism=parallelism,
+        seq_len=seq_len,
+        hf_assets_path=hf_assets_path,
+        engram=engram,
+        dataset_path=os.environ.get("DSV41_SFT_DATASET") or os.environ.get("DATASET_PATH") or "/path/to/train.jsonl",
+        image_root=_vision_sft_env("IMAGE_ROOT", ""),
+        thinking_mode=_vision_sft_thinking_mode(),
+        drop_thinking=_vision_sft_env_flag("DROP_THINKING", True),
+        add_default_bos_token=_vision_sft_env_flag("ADD_DEFAULT_BOS_TOKEN", True),
+        reasoning_effort=_vision_sft_env("REASONING_EFFORT", "") or None,
+    )
+    config.compile = CompileConfig(components=[], model=ModelCompileConfig())
+    if checkpoint:
+        config.checkpointer = NPUCheckpointManager.Config(load_only=True)
+    return config
+
+
+def _full(*, a5: bool, sft: bool = False, lora: bool = False) -> TrainerEx.Config:
+    _reject_legacy_overrides()
+    parallelism = _topology(
+        local_processes=8 if a5 else 16,
+        nodes=16 if a5 else 8,
+        shard_degree=128,
+        expert_degree=128,
+        configurable=True,
+    )
+    options = dict(
+        parallelism=parallelism,
+        seq_len=4096,
+        hf_assets_path=os.environ.get("HF_ASSETS_PATH", "/path/to/DeepSeekV41_tokenizer"),
+    )
+    if sft:
+        config = _sft("deepseek_v4_1_flash", checkpoint=True, **options)
+    elif lora:
+        config = deepseek_v4_1_flash_lora(**options)
+    else:
+        config = deepseek_v4_1_flash_cpt(**options)
+    _set_context(config, sequence_length=4096, token_budget=4194304, steps=int(os.environ.get("STEPS", "100")))
+    _set_muon(config, include_engram_table=not lora)
+    _set_schedule(config)
+    config.hf_assets_path = os.environ.get("HF_ASSETS_PATH", "/path/to/DeepSeekV41_tokenizer")
+    config.debug.print_config = True
+    config.profiler = CANNProfiler.Config(
+        enable_profiling=False,
+        save_traces_folder="profiling_path",
+        extension=ProfilerExtensionConfig(
+            enable_online_parse=False, profiler_start=6, profiler_end=7, profile_ranks=[0]
+        ),
+    )
+    config.comm.init_timeout_seconds, config.comm.train_timeout_seconds = 7200, 600
+    assert config.checkpointer is not None
+    config.checkpointer.folder = os.environ.get("CKPT_SAVE_LOAD_PATH", "/path/to/save_ckpt")
+    config.checkpointer.initial_load_path = os.environ.get("CKPT_INIT_LOAD_PATH", "/path/to/init_load_ckpt")
+    config.checkpointer.initial_load_in_hf = True
+    config.checkpointer.load_only = not lora
+    config.override.imports = _overrides(a5=a5, debug=False, swap=not lora)
+    config.extension.quantization.enable_quantized_training = a5
+    config.extension.quantization.recipe = "all_block_fp8"
+    if a5:
+        config.extension.quantization.enable_fsdp_prequantize = True
+        config.extension.quantization.fsdp_prequantize_fqns = list(_A5_PREQUANTIZE_FQNS)
+    return config
+
+
+def deepseek_v4_1_flash_cpt_4k_a3() -> TrainerEx.Config:
+    return _full(a5=False)
+
+
+def deepseek_v4_1_flash_cpt_4k_a5() -> TrainerEx.Config:
+    return _full(a5=True)
+
+
+def deepseek_v4_1_flash_lora_4k_a3() -> TrainerEx.Config:
+    return _full(a5=False, lora=True)
+
+
+def deepseek_v4_1_flash_sft_4k_a3() -> TrainerEx.Config:
+    return _full(a5=False, sft=True)
+
+
+def deepseek_v4_1_flash_sft_4k_a5() -> TrainerEx.Config:
+    return _full(a5=True, sft=True)
+
+
+def deepseek_v4_1_flash_cpt_1m_a5() -> TrainerEx.Config:
+    """Declare the long-context CP configuration; the model still rejects unsupported CP."""
+    _reject_legacy_overrides()
+    parallelism = _topology(
+        local_processes=8,
+        nodes=16,
+        shard_degree=1,
+        expert_degree=128,
+        context_degree=128,
+        configurable=True,
+    )
+    config = deepseek_v4_1_flash_text(
+        parallelism=parallelism,
+        seq_len=1048576,
+        hf_assets_path=os.environ.get("HF_ASSETS_PATH", "/path/to/DeepSeekV41_tokenizer"),
+    )
+    config = derive(config, type(config), engram_enabled=False)
+    _set_context(config, sequence_length=1048576, token_budget=1048576, steps=int(os.environ.get("STEPS", "10")))
+    _set_muon(config)
+    _set_schedule(config)
+    config.hf_assets_path = os.environ.get("HF_ASSETS_PATH", "/path/to/DeepSeekV41_tokenizer")
+    config.debug.print_config = True
+    assert isinstance(config.dataloader, GrainDataLoader.Config)
+    packed = config.dataloader.dataset
+    assert isinstance(packed, ConcatThenSplitPackingConfig)
+    dataset = packed.dataset
+    assert isinstance(dataset, SingleDatasetConfig)
+    assert isinstance(dataset.source, HuggingFaceRandomAccessSource.Config)
+    assert isinstance(dataset.processor, AlignedTextProcessor.Config)
+    dataset.source.load_dataset_kwargs["data_files"] = (
+        os.environ.get("DATA_FILES") or os.environ.get("DATASET_PATH") or "tests/assets/c4_test/data.json"
+    )
+    dataset.processor.per_doc_alignment = int(os.environ.get("DSV41_PER_DOC_ALIGNMENT", "256"))
+    config.profiler = CANNProfiler.Config(
+        enable_profiling=False,
+        save_traces_folder="profiling_path",
+        extension=ProfilerExtensionConfig(
+            enable_online_parse=False, profiler_start=6, profiler_end=7, profile_ranks=[0]
+        ),
+    )
+    config.comm.init_timeout_seconds, config.comm.train_timeout_seconds = 7200, 600
+    config.override.imports = [
+        "torchtitan_npu.override.common.rms_norm.asc",
+        "torchtitan_npu.override.common.rope.asc_partial",
+        "torchtitan_npu.override.common.token_dispatcher.asc",
+        "torchtitan_npu.override.common.swiglu_group.asc",
+        "torchtitan_npu.override.common.swiglu_group.asc_shared_experts",
+        "torchtitan_npu.override.deepseek_v4_1.mhc.asc_sinkhorn",
+        "torchtitan_npu.override.deepseek_v4_1.mhc.asc_hc_post",
+        "torchtitan_npu.override.deepseek_v4_1.lightning_indexer.asc",
+        "torchtitan_npu.override.deepseek_v4_1.sparse_attn.asc",
+        "torchtitan_npu.override.common.optimizer.swap_optimizer",
+    ]
     return config

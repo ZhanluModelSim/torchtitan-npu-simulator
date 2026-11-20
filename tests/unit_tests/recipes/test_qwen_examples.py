@@ -55,7 +55,7 @@ def qwen_resources(monkeypatch, tmp_path):
     ids=["dense-1p", "moe-8p"],
 )
 def test_loader_selects_qwen_example_training_and_resources(recipe, microbatch, step_tokens, ep, dp, qwen_resources):
-    config = ConfigLoader().load(["--module", "torchtitan_npu_recipes.examples.qwen3_5", "--config", recipe])
+    config = ConfigLoader().load(["--module", "torchtitan_npu_recipes.tests.models.qwen3_5", "--config", recipe])
 
     assert isinstance(config.model, NPUQwen35Model.Config)
     assert config.model.max_context_length == config.training.max_context_length == 512
@@ -85,7 +85,7 @@ def test_moe_recipe_replicates_complete_eight_rank_groups(size_variable, monkeyp
     config = ConfigLoader().load(
         [
             "--module",
-            "torchtitan_npu_recipes.examples.qwen3_5",
+            "torchtitan_npu_recipes.tests.models.qwen3_5",
             "--config",
             "qwen3_5_debugmodel_moe_8p_cpt_512",
         ]
@@ -103,7 +103,7 @@ def test_moe_recipe_rejects_incomplete_eight_rank_groups(monkeypatch, qwen_resou
         ConfigLoader().load(
             [
                 "--module",
-                "torchtitan_npu_recipes.examples.qwen3_5",
+                "torchtitan_npu_recipes.tests.models.qwen3_5",
                 "--config",
                 "qwen3_5_debugmodel_moe_8p_cpt_512",
             ]
@@ -121,7 +121,7 @@ def test_loader_honors_qwen_asset_paths_and_dispatcher_selection(monkeypatch, tm
     config = ConfigLoader().load(
         [
             "--module",
-            "torchtitan_npu_recipes.examples.qwen3_5",
+            "torchtitan_npu_recipes.tests.models.qwen3_5",
             "--config",
             "qwen3_5_debugmodel_moe_8p_cpt_512",
         ]
@@ -142,7 +142,7 @@ def test_legacy_qwen_override_environment_requires_explicit_configuration(monkey
         ConfigLoader().load(
             [
                 "--module",
-                "torchtitan_npu_recipes.examples.qwen3_5",
+                "torchtitan_npu_recipes.tests.models.qwen3_5",
                 "--config",
                 "qwen3_5_debugmodel_1p_cpt_512",
             ]
@@ -211,7 +211,7 @@ def test_qwen_moe_checkpoint_preserves_single_router_update_and_gradients(monkey
         ("qwen3_5_27b_sft_64k_cp8", 65536, 8),
     ],
 )
-@pytest.mark.parametrize("launcher", ["examples/qwen3_5/run_qwen_sft.sh", "examples/qwen3_5/run_qwen3_5_4k.sh"])
+@pytest.mark.parametrize("launcher", ["examples/qwen3_5/run_qwen_sft.sh"])
 def test_sft_launcher_emits_only_native_cli(preset, length, cp, launcher, monkeypatch, tmp_path):
     root = Path(__file__).resolve().parents[3]
     bin_dir = tmp_path / "bin"

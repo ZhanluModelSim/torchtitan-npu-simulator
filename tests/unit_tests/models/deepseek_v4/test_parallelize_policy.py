@@ -29,7 +29,7 @@ from torchtitan.models.deepseek_v4.moe import DeepSeekV4Router
 from torchtitan.tools.utils import set_default_dtype
 
 from tests.unit_tests.models.mtp_test_utils import SEQ_LEN, VOCAB_SIZE, build_cpu_model
-from torchtitan_npu.models.deepseek_v4 import _make_v4_config
+from torchtitan_npu.models.deepseek_v4.flavors import _make_dsv4_config
 
 
 class _RouterWithAdapter(DeepSeekV4Router):
@@ -46,7 +46,7 @@ class _RouterWithAdapter(DeepSeekV4Router):
 
 def _build_policy_model(*, router_adapter=False, master_dtype=torch.float32):
     """Construct main HCA/CSA blocks and a dense MTP block through the factory."""
-    config = _make_v4_config(
+    config = _make_dsv4_config(
         dim=32,
         n_layers=3,
         vocab_size=VOCAB_SIZE,

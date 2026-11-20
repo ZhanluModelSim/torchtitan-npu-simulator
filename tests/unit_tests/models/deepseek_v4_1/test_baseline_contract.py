@@ -25,7 +25,6 @@ def test_plain_weights_use_routed_experts_and_track_empty_experts():
         route_norm=True,
         load_balance_coeff=1e-3,
         moe_comm_backend="standard",
-        non_blocking_capacity_factor=None,
         vision_enabled=False,
     )
     with torch.random.fork_rng(devices=[]):
@@ -76,7 +75,6 @@ def test_v41_moe_rides_the_common_stack_with_an_opt_in_vision_bias():
         route_norm=True,
         load_balance_coeff=1e-3,
         moe_comm_backend="standard",
-        non_blocking_capacity_factor=None,
         vision_enabled=True,
     )
     assert config.router.vision_enabled and config.router.sorted_topk
@@ -151,7 +149,6 @@ def test_vision_bias_follows_the_factory_switch():
             route_norm=True,
             load_balance_coeff=1e-3,
             moe_comm_backend="standard",
-            non_blocking_capacity_factor=None,
             vision_enabled=vision_enabled,
         )
         with torch.random.fork_rng(devices=[]):

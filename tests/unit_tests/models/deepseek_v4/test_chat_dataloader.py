@@ -17,7 +17,7 @@ from torchtitan.components.tokenizer import HuggingFaceTokenizer
 
 from torchtitan_npu.models.deepseek_v4.chat_encoder import DSV4EncoderConfig
 from torchtitan_npu.models.deepseek_v4.chat_processor import DeepSeekV4ChatProcessor
-from torchtitan_npu_recipes.models.deepseek_v4 import deepseek_v4_flash_sft
+from torchtitan_npu_recipes.tests.ci.deepseek_v4 import deepseek_v4_flash_sft
 
 
 class _StubEncoder:

@@ -1,51 +1,27 @@
 # Python 训练配置
 
-训练配置位于 [`torchtitan_npu_recipes`](../../torchtitan_npu_recipes/README.md)，由 Python 函数返回完整的 `Trainer.Config`。模型、数据、优化器和并行策略在配置函数中定义；启动脚本负责选择配置、设备和节点。
+训练配置由 Python recipe 返回完整的 `Trainer.Config`，启动脚本只负责选择配置和分配进程资源。
 
-`torchtitan_npu_recipes.models` 提供可复用的基础配置，`torchtitan_npu_recipes.examples` 组合具体训练用例，供 `examples/` 下的脚本调用。
+## 配置位置
 
-## 编写配置
+- `torchtitan_npu_recipes.models`：经过验证的完整模型配置。
+- `torchtitan_npu_recipes.graph_trainer`：经过验证的完整 GraphTrainer 配置。
+- `torchtitan_npu_recipes.tests`：调试、裁减模型和 CI 配置。
 
-在仓库根目录创建 `my_recipes.py`，复用基础配置并调整训练步数：
+模型、数据、优化器、scheduler、checkpoint、并行策略和 `override` 都写在 recipe 中。模型实现和数据处理保留在 `torchtitan_npu`，recipe 只负责组合。资源路径也直接在对应 recipe 中设置，不通过环境变量隐式选择训练策略。
 
-```python
-from torchtitan_npu_recipes.models.deepseek_v4 import deepseek_v4_debugmodel
+修改训练步数、资源路径、并行度或上下文长度时，直接修改对应 recipe 函数，并同步调整相关模型、数据和 token budget 字段。需要新的优化器、算子或 checkpoint 组合时，新增具名 recipe。
 
+## 启动配置
 
-def debug_five_steps():
-    config = deepseek_v4_debugmodel(
-        seq_len=2048, hf_assets_path="tests/assets/deepseek_v3"
-    )
-    config.training.steps = 5
-    return config
-```
-
-`hf_assets_path` 指向 tokenizer 等 Hugging Face 资源所在目录；相对路径从仓库根目录解析。
-
-构造模型前，先确定 `parallelism`、`seq_len` 和资源路径，并传入基础配置函数。模型配置及分片声明确定后，再执行配置变换和 override，由 Trainer 校验并构建模型。构造后修改并行度或序列长度不会自动重建模型配置。
-
-训练参数直接写入 Python 配置，组件替换通过 `config.override.imports` 或 `--override` 指定，详见 [override 说明](../../torchtitan_npu/override/README.md)。
-
-## 启动与查看配置
-
-通过 `MODULE` 指定模块、`CONFIG` 指定配置函数：
+从仓库根目录使用通用 launcher，`MODULE` 指向 recipe 模块，`CONFIG` 指向配置函数：
 
 ```bash
-MODULE=my_recipes CONFIG=debug_five_steps \
-  bash examples/deepseek_v4/debug/deepseek_v4_eager_1p.sh
+MODULE=torchtitan_npu_recipes.tests.models.deepseek_v4 \
+CONFIG=deepseek_v4_flash_1p_2k NGPU=1 \
+bash scripts/run_train.sh
 ```
 
-追加 `--print-config` 可打印配置并退出，不执行训练：
+只查看最终配置时追加 `--print-config`。单机进程数使用 `NGPU`；多机使用 `scripts/run_train_multinodes.sh`，并设置 `NNODES`、`NODE_RANK` 和 `MASTER_ADDR`。CANN 环境通过 `ASCEND_SET_ENV_PATH` 指定。
 
-```bash
-MODULE=my_recipes CONFIG=debug_five_steps \
-  bash examples/deepseek_v4/debug/deepseek_v4_eager_1p.sh --print-config
-```
-
-设备、节点和 CANN 环境通过启动脚本配置。单机使用 `scripts/run_train.sh`；多机使用 `scripts/run_train_multinodes.sh`，在各节点设置启动参数并执行。
-
-## 算子与编译设置
-
-DeepSeek-V4 和 V4.1 示例默认使用非 golden 算子组合，设置 `USE_GOLDEN=1` 可选择参考组合。
-
-文本 eager 基础配置使用 `compile=None` 和 `model.local_compile_regions=[]`，并配置 NPU RoPE 兼容实现。自定义 eager 配置需同时关闭整体和局部编译。各训练用例的支持范围见 [recipe 说明](../../torchtitan_npu_recipes/README.md)。
+根目录 `examples/` 已删除，旧示例中的模型、数据和优化器选择已迁移到 recipe。已有配置可直接替换上面命令中的 `MODULE`、`CONFIG`；训练参数和资源路径应先在对应 Python 文件中修改。

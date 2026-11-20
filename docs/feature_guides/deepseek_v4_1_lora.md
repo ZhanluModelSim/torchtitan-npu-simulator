@@ -4,27 +4,29 @@ V4.1 复用已有的 dense、batched 和 routed-expert LoRA 实现。训练时�
 
 ## 训练
 
-LoRA 脚本选择 `torchtitan_npu_recipes.examples.deepseek_v4_1.deepseek_v4_1_flash_lora_4k_a3` 完整训练配置。基座权重、tokenizer、Engram token map 和模型配置需要匹配，节点数和并行参数按实际资源设置：
+LoRA 脚本复用现有 CPT 入口，默认选择多模态 `deepseek_v4_1_flash_lora`、参考算子和 eager 执行，并清空 optimizer swap override，与下述 LoRA 集成用例的执行方式一致。基座权重、tokenizer、Engram token map 和模型配置需要匹配，节点数和并行参数按实际资源设置：
 
 ```sh
 NODE_IPS="${NODE_IPS}" \
 HF_ASSETS_PATH=/path/to/tokenizer \
 CKPT_INIT_LOAD_PATH=/path/to/v41-hf-base \
 CKPT_SAVE_LOAD_PATH=/path/to/run/checkpoint \
-bash examples/deepseek_v4_1/deepseek_v4_1_flash_lora_4k_a3.sh
+MODULE=torchtitan_npu_recipes.models.deepseek_v4_1 CONFIG=deepseek_v4_1_flash_lora_4k_a3 NGPU=16 bash scripts/run_train_multinodes.sh \
+  --optim.optimizer.name Muon \
+  --training.steps 150 --checkpointer.interval 50
 ```
 
-优化器及超参数直接写入 recipe 的 `config.optim.optimizer.optimizers`，纯 AdamW 配置单组 `AdamW.Config`，混合模式配置 `DistMuon.Config` 和 AdamW fallback。LoRA 的 rank、alpha、数据、步数和 checkpoint 策略也由 recipe 配置；通过 `MODULE` / `CONFIG` 选择自定义完整训练配置，见 [Python 配置指南](../developer_guides/python_recipes.md)。
+使用 `--optim.optimizer.name AdamW` 选择 AdamW。默认 rank 为 16、alpha 为 32，专家 rank 为 16。通过 `CONFIG=deepseek_v4_1_flash_text_lora` 使用同一脚本训练正式纯文本模型：脚本将默认数据集切换为 `c4_test`，也可用 `DATASET`、`DATASET_PATH` 选择文本数据。多模态默认数据集为 `cc12m-test`。用户环境变量与末尾 CLI 参数可覆盖脚本默认值。
 
-`torchtitan_npu_recipes.models.deepseek_v4_1.deepseek_v4_1_debugmodel_text_lora` 为纯文本调试配置。设备数量应满足模型内存需求，仅缩小并行度不会缩小模型。
+`deepseek_v4_1_debugmodel_lora` 为纯文本调试配置。设备数量应满足模型内存需求，仅缩小并行度不会缩小模型。
 
-从 native DCP 基座初始化时，在 recipe 中设置 `config.checkpointer.initial_load_in_hf = False`。恢复 native checkpoint 时，保持 EP 度数、Engram 表结构、tokenizer 映射和 LoRA 配置一致。保持相同的 `CKPT_INIT_LOAD_PATH` 和 `CKPT_SAVE_LOAD_PATH`，在 recipe 中设置 `config.checkpointer.load_step = 50` 指定恢复点。
+从 native DCP 基座初始化时增加 `--checkpointer.no-initial-load-in-hf`。恢复 native checkpoint 时，保持 EP 度数、Engram 表结构、tokenizer 映射和 LoRA 配置一致。保持相同的 `CKPT_INIT_LOAD_PATH` 和 `CKPT_SAVE_LOAD_PATH`，使用 `--checkpointer.load-step 50` 指定恢复点。
 
 ## Checkpoint 与导出
 
-初始化加载基座时保留新建的 adapter。周期 checkpoint 默认保存 adapter、持久化模型 buffer 和训练状态；恢复时先加载固定基座，再恢复这些状态，因此需要保留 `initial_load_path`。设置 `config.checkpointer.periodic_save_adapter_only = False` 可将基座和 Engram 分片一并写入周期 DCP。恢复路径中的 checkpoint 必须包含 adapter。
+初始化加载基座时保留新建的 adapter。周期 checkpoint 默认保存 adapter、持久化模型 buffer 和训练状态；恢复时先加载固定基座，再恢复这些状态，因此需要保留 `initial_load_path`。使用 `--checkpointer.no-periodic-save-adapter-only` 可将基座和 Engram 分片一并写入周期 DCP。恢复路径中的 checkpoint 必须包含 adapter。
 
-最后一步保存 `adapter_model.safetensors` 和 `adapter_config.json`。Engram 权重保留在所引用的基座中，PEFT 仅导出训练的 adapter。设置 `config.checkpointer.last_save_in_peft = False` 和 `config.checkpointer.last_save_model_only = False` 可在最后一步保存可续训的 native checkpoint。`last_save_in_hf` 会被拒绝，因为普通全模型 HF 导出不保留 LoRA adapter。
+最后一步保存 `adapter_model.safetensors` 和 `adapter_config.json`。Engram 权重保留在所引用的基座中，PEFT 仅导出训练的 adapter。使用 `--checkpointer.no-last-save-in-peft --checkpointer.no-last-save-model-only` 可在最后一步保存可续训的 native checkpoint。`last_save_in_hf` 会被拒绝，因为普通全模型 HF 导出不保留 LoRA adapter。
 
 将 adapter 合并到浮点 V4.1 HF 基座：
 

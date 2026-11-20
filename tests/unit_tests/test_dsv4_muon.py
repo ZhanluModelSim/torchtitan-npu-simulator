@@ -9,10 +9,11 @@ import ast
 from pathlib import Path
 
 from torch.distributed.tensor import Shard
+from torchtitan.config.parallelism import ParallelismConfig
 from torchtitan.distributed.flex_shard import BlockShard
 from torchtitan.distributed.parallelism_context import MeshAxisName
 
-from torchtitan_npu.models.deepseek_v4 import model_registry
+from torchtitan_npu.models.deepseek_v4 import build_model_config
 from torchtitan_npu_recipes.models.deepseek_v4 import _dsv4_muon_profile
 
 _ROOT = Path(__file__).resolve().parents[2]
@@ -40,27 +41,12 @@ def test_d2h_swap_cleanup_warns_before_releasing_the_pinned_buffer():
 def test_dsv4_muon_profile_uses_validated_phase_one_policy():
     from torchtitan.components.optim import AdamW
 
-    from torchtitan_npu.config import OptimizerConfig
     from torchtitan_npu.extensions.torchtitan.components.optimizer.muon import DistMuon
-    from torchtitan_npu_recipes.models.deepseek_v4 import deepseek_v4_debugmodel
+    from torchtitan_npu_recipes.tests.models.deepseek_v4 import deepseek_v4_debugmodel
 
     config = deepseek_v4_debugmodel()
     optimizer = config.optim.optimizer
-    assert len(optimizer.optimizers) == 1 and isinstance(optimizer.optimizers[0], AdamW.Config)
-    profile = _dsv4_muon_profile(config.model)
-    optimizer = OptimizerConfig(
-        optimizers=[
-            DistMuon.Config(
-                pattern=profile.muon_pattern,
-                compute_sharding_by_fqn=profile.compute_sharding_by_fqn,
-                bucket_configs=profile.bucket_configs,
-                lr=1e-5,
-                ns_steps=10,
-                adjust_lr_fn="match_rms_adamw",
-            ),
-            AdamW.Config(pattern=r".*", lr=1e-5, eps=1e-8, fused=True, foreach=False),
-        ],
-    )
+    assert len(optimizer.optimizers) == 2
     muon, adamw = optimizer.optimizers
     assert isinstance(muon, DistMuon.Config) and isinstance(adamw, AdamW.Config)
     assert muon.momentum == 0.95 and muon.ns_steps == 10
@@ -79,7 +65,7 @@ def test_dsv4_unified_muon_policy_follows_paper_parameter_split():
     assert "deepseek_v4_debugmodel_paper_muon" not in source
     assert "BlockShard(dim=0" in source
 
-    profile = _dsv4_muon_profile(model_registry("debugmodel"))
+    profile = _dsv4_muon_profile(build_model_config("debugmodel", parallelism=ParallelismConfig()))
     compute_shardings = profile.compute_sharding_by_fqn
     expert_layout = compute_shardings["layers.2.feed_forward.routed_experts.w13.weight"]
     assert all(isinstance(p, Shard) and p.dim == 0 for p in expert_layout.shardings_by_mesh_axis.values())
@@ -106,7 +92,7 @@ def test_dsv4_unified_muon_policy_follows_paper_parameter_split():
 
 
 def test_dsv4_muon_indexer_query_uses_per_head_block_sharding():
-    model_spec = model_registry("debugmodel")
+    model_spec = build_model_config("debugmodel", parallelism=ParallelismConfig())
     profile = _dsv4_muon_profile(model_spec)
     compute_shardings = profile.compute_sharding_by_fqn
 
@@ -134,11 +120,4 @@ def test_graph_trainer_conversion_strips_only_npu_top_level_extension():
     assert "isinstance(base_config, TrainerEx.Config)" in conversion_source
     assert "for config_field in fields(Trainer.Config)" in conversion_source
 
-    for graph_recipe in (
-        "graph_trainer_deepseek_v4_debugmodel",
-        "graph_trainer_deepseek_v4_flash",
-        "graph_trainer_deepseek_v4_flash_43layers_16experts",
-        "graph_trainer_deepseek_v4_pro",
-        "graph_trainer_deepseek_v4_pro_61layers_32experts",
-    ):
-        assert "use_npu_config" not in _function_source(registry_path, graph_recipe)
+    assert "use_npu_config" not in _function_source(registry_path, "_to_graph_config")

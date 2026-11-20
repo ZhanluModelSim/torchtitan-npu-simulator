@@ -64,12 +64,12 @@ from torchtitan_npu.extensions.torchtitan.trainer import TrainerEx
 assert not any(name == 'torchft' or name.startswith('torchft.') for name in sys.modules)
 common_args = [
     '--module', 'torchtitan_npu_recipes.models.deepseek_v4',
-    '--config', 'deepseek_v4_flash_43layers_16experts',
+    '--config', 'deepseek_v4_flash_cpt_4k_a3',
 ]
 config = ConfigLoader().load(common_args)
 assert isinstance(config, TrainerEx.Config)
 assert not any(name == 'torchft' or name.startswith('torchft.') for name in sys.modules)
-from torchtitan_npu_recipes.models.deepseek_v4 import deepseek_v4_flash_torchft
+from torchtitan_npu_recipes.tests.ci.deepseek_v4 import deepseek_v4_flash_torchft
 try:
     deepseek_v4_flash_torchft()
 except ModuleNotFoundError as error:

@@ -22,9 +22,9 @@ from torchtitan_npu.extensions.torchtitan.components.optimizer.optimizer import 
 
 def _model_config(monkeypatch, family):
     if family == "v4":
-        import torchtitan_npu.models.deepseek_v4 as registry
+        from torchtitan_npu.models.deepseek_v4 import flavors as registry
 
-        make = registry._make_v4_config
+        make = registry._make_dsv4_config
 
         def tiny(**kwargs):
             kwargs.update(
@@ -53,8 +53,10 @@ def _model_config(monkeypatch, family):
             )
             return make(**kwargs)
 
-        monkeypatch.setattr(registry, "_make_v4_config", tiny)
-        return registry.model_registry("debugmodel", seq_len=16, num_mtp_layers=1)
+        monkeypatch.setattr(registry, "_make_dsv4_config", tiny)
+        from torchtitan.config.parallelism import ParallelismConfig
+
+        return registry.build_model_config("debugmodel", seq_len=16, num_mtp_layers=1, parallelism=ParallelismConfig())
 
     import torchtitan_npu.models.deepseek_v4_1 as registry
 

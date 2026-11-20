@@ -4,7 +4,7 @@
 # LICENSE file in the root directory of this source tree.
 
 
-from torchtitan_npu.models import deepseek_v4 as dsv4
+from torchtitan_npu.models.deepseek_v4 import flavors as dsv4
 
 N_HASH_LAYERS = 3
 
@@ -16,7 +16,7 @@ NUM_EXPERTS = 4
 
 
 def _build_model_config(num_experts=NUM_EXPERTS, num_layers=N_LAYERS, num_mtp_layers=0):
-    return dsv4._make_v4_config(
+    return dsv4._make_dsv4_config(
         dim=32,
         n_layers=num_layers,
         vocab_size=512,

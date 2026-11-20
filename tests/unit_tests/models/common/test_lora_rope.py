@@ -13,8 +13,9 @@ from torchtitan.models.common.rope import ComplexRoPE
 
 from torchtitan_npu.models.common.deepseek_lora import deepseek_v4_lora_transform
 from torchtitan_npu.override.common.rope import AscComplexRoPE, AscPartialComplexRoPE, WorkaroundComplexRoPE
-from torchtitan_npu_recipes.models.deepseek_v4 import deepseek_v4_flash, deepseek_v4_flash_lora_compiled
+from torchtitan_npu_recipes.tests.ci.deepseek_v4 import deepseek_v4_flash
 from torchtitan_npu_recipes.models.deepseek_v4_1 import deepseek_v4_1_flash_lora, deepseek_v4_1_flash_text_lora
+from torchtitan_npu_recipes.tests.ci.deepseek_v4 import deepseek_v4_flash_lora_compiled
 
 
 class CustomComplexRoPE(ComplexRoPE):

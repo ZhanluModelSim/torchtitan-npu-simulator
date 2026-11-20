@@ -23,7 +23,7 @@ from torchtitan_npu.models.deepseek_v4.lora import deepseek_v4_lora_transform, i
 from torchtitan_npu.models.deepseek_v4.peft import DeepSeekV4PEFTCheckpointManager
 from torchtitan_npu.override.common.rope import WorkaroundComplexRoPE, workaround
 from torchtitan_npu.patches.torchtitan.models.common.rope import SplitComplexRoPEConfig
-from torchtitan_npu_recipes.models.deepseek_v4 import deepseek_v4_debugmodel
+from torchtitan_npu_recipes.tests.models.deepseek_v4 import deepseek_v4_debugmodel
 
 logger = logging.getLogger(__name__)
 

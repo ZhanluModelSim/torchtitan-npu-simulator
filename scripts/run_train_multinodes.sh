@@ -69,7 +69,7 @@ if [[ $NODE_RANK == "" ]]; then
 fi
 
 MODULE=${MODULE:-"torchtitan_npu_recipes.models.deepseek_v4"}
-CONFIG=${CONFIG:-"deepseek_v4_debugmodel"}
+CONFIG=${CONFIG:-"deepseek_v4_flash_cpt_4k_a5"}
 TRAIN_FILE=${TRAIN_FILE:-torchtitan_npu.train}
 time=$(date +%Y%m%d%H%M)
 logfile=${LOG_PREFIX:-${CONFIG}}_${time}_node${NODE_RANK}_${LOCAL_HOST//./_}.log

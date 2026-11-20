@@ -7,26 +7,10 @@ DeepSeek-V4（DSV4）在模型层使用文档打包（varlen）的 `[B, S, ...]`
 融合路径要求完整的 Ascend NPU 运行环境，以及与 CANN 版本匹配的 `cann_ops_transformer`。推荐使用仓内脚本：
 
 ```bash
-bash examples/deepseek_v4/debug/deepseek_v4_mini_1p_cpt_2k_a3.sh
+MODULE=torchtitan_npu_recipes.tests.models.deepseek_v4 CONFIG=deepseek_v4_flash_1p_2k NGPU=1 bash scripts/run_train.sh
 ```
 
-DeepSeek-V4 的示例 wrapper 有两种可切换的 recipe（`USE_GOLDEN` 选择；`--override` 是显式组件替换入口）。`scripts/run_train.sh` 只负责通用启动和参数透传，不定义这些 recipe：
-
-```text
-USE_GOLDEN=1  # recipe 中的参考组合（模型默认内核 = attn-gym gather_attn）：
-              #   override.common.rope.workaround
-              #   (the MoE is the normal clamped bf16 path on both sides)
-USE_GOLDEN=0  # recipe 中的默认测试组合：
-              #   override.common.rms_norm.asc
-              #   override.common.rope.asc_complex
-              #   override.deepseek_v4.sparse_attn.asc（并带 geometry，见 fused_ops 指南）
-              #   override.deepseek_v4.lightning_indexer.asc（与 sparse_attn.asc 成对；
-              #   PyPTO 侧 selector 对应 lightning_indexer.pypto）
-```
-
-参考路径（模型默认内核：Attention Gym 的 `gather_attn`，eager 逐文档、FP32）用于数值校验：
-参考路径与 patched transformers 做逐 step 容差对比，AscendC 融合内核与参考路径在容差内一致
-这些组合定义在 `torchtitan_npu_recipes/examples/deepseek_v4.py`；通用 launcher `scripts/run_train.sh` 透传原生 `--override`，不会自动注入 DeepSeek-V4 override 组。
+DeepSeek-V4 配方通过 `config.override.imports` 显式选择算子，不读取 `USE_GOLDEN`。`scripts/run_train.sh` 只负责通用启动和原生参数透传；参考算子组合需在 Python 配方中定义。融合配置及 selector 选择以对应 recipe 为准，见[配方说明](../../torchtitan_npu_recipes/README.md)。
 
 ## 数据流
 
@@ -107,12 +91,10 @@ SFT 使用 `DeepSeekV4ChatProcessor`，两个 processor 共用 `align_text_seque
 先做 next-token shift，再补无监督 pad。过长或无监督 token 的对话被过滤。
 CPT 使用 `ConcatThenSplitPackingConfig`，SFT 使用 `FirstFitPackingConfig`。
 
-SFT 入口选择 `deepseek_v4_flash_sft` recipe；JSON/JSONL 路径通过 `DSV4_SFT_DATASET` 传入。
-现有 launcher 将 `DATASET_PATH` 转为该变量：
+SFT 入口选择 `deepseek_v4_flash_sft_4k_a3`；JSON/JSONL 路径直接修改配方中的 `data_files`，不读取资源环境变量。各节点配置启动地址和 rank 后运行：
 
 ```bash
-DATASET_PATH=/path/to/train.jsonl \
-bash examples/deepseek_v4/deepseek_v4_flash_sft_4k_a3.sh
+MODULE=torchtitan_npu_recipes.models.deepseek_v4 CONFIG=deepseek_v4_flash_sft_4k_a3 NGPU=16 bash scripts/run_train_multinodes.sh
 ```
 
 自定义 recipe 可按 registry 中的嵌套配置组合随机访问或流式 Hugging Face source、chat encoder 和
@@ -147,9 +129,9 @@ CP 的 `cmp_k.residual = reach % ratio`；文档按 `cp × ratio` 对齐后 `rea
 
 默认内核就是唯一的参考路径，不再有独立的 golden override：`test_dsv4.py` 以形状/有限值和 pool 梯度的可复现性守护它，融合内核与它做容差对照。
 
-参考 attention 的 Top-K 选择本身不向 indexer 传递梯度。V4 参考 Muon recipe 通过 `_enable_indexer_aux_loss()` 配置现有 `SparseIndexerLoss`，系数为 `1e-3`，为 indexer 提供可导的训练目标。`USE_GOLDEN=1` 的参考 Muon 示例因此可以保留 indexer 训练，无需改用 AdamW。mini reference 仍使用其原有 AdamW 配置。
+参考组合不训练 indexer：`r=4` 层的 `LightningIndexer` 返回 `(topk_indices, topk_scores)`，`topk_scores` 是可导的 student logits，但参考核心不产生 KL loss；它的 KL 蒸馏目标由融合组合的 `sparse_attn.asc` + `lightning_indexer.asc`（SMLAG → SLIKG）承担。因此用参考组合与融合组合对比 `loss` / `grad_norm` 时，indexer 相关参数在参考组合下没有梯度属于预期；`test_dsv4.py` 与 `dsv4_golden_*` 用例只校验注意力数值，不覆盖 indexer 的训练目标。
 
-融合 selector 使用自己的 indexer 训练目标，应保持 `aux_loss=None`。参考与融合训练的对比必须先核对目标和系数，不能把未配置辅助损失的 reference 当作 indexer 梯度基线。具体配置见 [Muon 指南](muon_optimizer.md)。
+因此参考组合目前只能用 AdamW：`DistMuon` 在 step 前要求每个配置的参数都有梯度，会以 `missing gradients: layers.<n>.attention.indexer.*` 报错（`USE_GOLDEN=1` 搭配示例里的 Muon 参数即属此情况）。
 
 ## AscendC 融合路径
 
@@ -189,7 +171,7 @@ python -m tests.integration_tests.run_tests /tmp/dsv4-grain-sft-results \
 | --- | --- |
 | `positions` | 必须提供 `[B, S]`，且每条序列从 0 连续递增 |
 | Padding | varlen 流必须覆盖本 rank 的全部 `B * S` 个 token，metadata 不表达 padding token |
-| Context Parallel | AscendC 融合路径包含 CP 实现；当前 0.4.0 组合需按 recipe 的并行约束单独验证，不能通过旧字段 CLI 修改已构造模型；**静态 doc-chunk 布局**：`cp_shard` 在切之前按 `doc_chunk_permutation` 重排整行（零通信），所以输入（token / positions / labels / MTP 深度）一次就是「每篇文档的第 r 个 chunk」，本层 KV 侧再用 `cp.restore` 恢复到 slab，KV/压缩 KV 整行；布局与还原在 `models/common/restore.py`（`doc_chunk_permutation` / `chunk_plan` / `to_slab`），两栈共用；ratio-4 carry 仍在 `models/common/carry_exchange.py` 的 `CarryExchange`（压缩器本身 CP-agnostic） |
+| Context Parallel | 当前 0.4.0 迁移尚未支持，不能通过修改启动参数启用 |
 | Tensor Parallel | DSA 路径固定 TP=1（indexer score 对 head 维求和），TP 方案待 CP 之后另行设计 |
 | 空压缩流 | doc-packing 场景要求每条序列至少产生一个完整压缩块；融合路径在 metadata 边界对 `ratio > 1` 且无完整块直接报错（AscendC CSA/HCA 不接受空 `cmp_kv`） |
 | 运行环境 | 需要 `torch_npu`、CANN、HCCL、Ascend NPU，以及匹配的 `cann_ops_transformer` |

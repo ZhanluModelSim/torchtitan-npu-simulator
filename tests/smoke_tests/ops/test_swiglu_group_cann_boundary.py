@@ -28,7 +28,7 @@ try:
 except Exception as error:  # the JIT build may fail on a CPU runner
     pytest.skip(f"cann_ops_nn.swiglu_group is unavailable: {error}", allow_module_level=True)
 
-_RECIPE = ("torchtitan_npu_recipes.models.deepseek_v4", "deepseek_v4_debugmodel")
+_RECIPE = ("torchtitan_npu_recipes.tests.models.deepseek_v4", "deepseek_v4_debugmodel")
 _SWIGLU = "torchtitan_npu.override.common.swiglu_group."
 
 

@@ -30,7 +30,7 @@
   # size from two to four, so the paired runs see the same packed documents.
   for cp in 1 2; do
     export NGPU=$((2 * cp))
-    bash examples/deepseek_v4_1/debug/deepseek_v4_1_stripped_1p_a5.sh \
+    bash scripts/run_train.sh \
       --extension.quantization.no-enable-quantized-training \
       --extension.quantization.li-quantization None \
       --parallelism.spmd-backend spmd_types \

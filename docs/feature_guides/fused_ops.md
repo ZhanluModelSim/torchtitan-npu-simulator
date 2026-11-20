@@ -170,7 +170,7 @@ replacement 只支持具体 Config 类型时设置 `exact=True`；需要按层�
 
 ```bash
 python -m torchtitan_npu.train \
-  --module torchtitan_npu_recipes.models.deepseek_v4 \
+  --module torchtitan_npu_recipes.tests.models.deepseek_v4 \
   --config deepseek_v4_debugmodel \
   --override.imports \
     torchtitan_npu.override.common.rms_norm.asc \

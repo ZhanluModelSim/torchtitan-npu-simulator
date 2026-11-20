@@ -816,7 +816,12 @@ def _build_model_and_adapter(model_name: str, model_flavor: str, hf_assets_path:
     # upstream.
     module_name = model_name if "." in model_name else f"torchtitan.models.{model_name}"
     model_module = importlib.import_module(module_name)
-    model_config = model_module.model_registry(model_flavor)
+    if module_name == "torchtitan_npu.models.deepseek_v4":
+        from torchtitan.config.parallelism import ParallelismConfig
+
+        model_config = model_module.build_model_config(model_flavor, parallelism=ParallelismConfig())
+    else:
+        model_config = model_module.model_registry(model_flavor)
     with torch.device("cpu"):
         raw_model = model_config.build()
     adapter_cls = type(raw_model).state_dict_adapter_cls

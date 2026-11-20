@@ -40,7 +40,7 @@ torchtitan 原生内存快照功能优先使用 `--profiler.memory-snapshot-freq
 
 ```bash
 torchrun --nproc_per_node=2 -m torchtitan_npu.train \
-  --module torchtitan_npu_recipes.models.deepseek_v4 \
+  --module torchtitan_npu_recipes.tests.models.deepseek_v4 \
   --config deepseek_v4_debugmodel \
   --profiler.enable-memory-snapshot \
   --profiler.save-memory-snapshot-folder profiling/memory_snapshot \
@@ -122,7 +122,7 @@ python3 scripts/parse_profiling_data.py path/to/save_traces_folder
 
 ```bash
 torchrun --nproc_per_node=2 -m torchtitan_npu.train \
-  --module torchtitan_npu_recipes.models.deepseek_v4 \
+  --module torchtitan_npu_recipes.tests.models.deepseek_v4 \
   --config deepseek_v4_debugmodel \
   --profiler.enable-profiling \
   --profiler.save-traces-folder profiling/traces \

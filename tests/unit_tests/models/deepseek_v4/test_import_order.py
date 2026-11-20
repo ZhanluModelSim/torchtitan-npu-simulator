@@ -30,13 +30,14 @@ def test_v4_import_order_preserves_clamp_and_pre_down_projection_scores(order):
         from torchtitan.models.common.linear import GroupedLinear
         from torchtitan.models.common.moe import RoutedExperts
         from torchtitan_npu.models.common.activation import LimitedSwiGLU
-        from torchtitan_npu.models.deepseek_v4 import model_registry
+        from torchtitan_npu.models.deepseek_v4 import build_model_config
+        from torchtitan.config.parallelism import ParallelismConfig
         from torchtitan_npu.patches.torchtitan.models.common import moe as moe_patch
 
         if sys.argv[1] == "upstream-first":
             assert early_flavors.make_routed_experts_config is captured_factory
         assert moe_patch.LimitedSwiGLU is LimitedSwiGLU
-        config = model_registry("debugmodel", seq_len=128, num_mtp_layers=1)
+        config = build_model_config("debugmodel", parallelism=ParallelismConfig(), seq_len=128, num_mtp_layers=1)
         for layer in (*config.layers, *config.mtp_layers):
             experts = layer.feed_forward.routed_experts
             assert type(experts) is RoutedExperts.Config

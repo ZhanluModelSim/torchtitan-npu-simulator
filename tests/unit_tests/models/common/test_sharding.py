@@ -52,7 +52,8 @@ def cpu_storage_world(monkeypatch):
 def test_model_parallelize_places_expert_weights_on_dense_or_sparse_storage(
     cpu_storage_world, family, recipe, ep, full_ac
 ):
-    registry = importlib.import_module(f"torchtitan_npu_recipes.models.{family}")
+    package = "torchtitan_npu_recipes.tests.models" if family == "deepseek_v4" else "torchtitan_npu_recipes.models"
+    registry = importlib.import_module(f"{package}.{family}")
     config = getattr(registry, recipe)(
         parallelism=ParallelismConfig(data_parallel_shard_degree=2, expert_parallel_degree=ep),
         hf_assets_path="/tmp",

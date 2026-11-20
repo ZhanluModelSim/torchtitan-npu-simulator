@@ -4,8 +4,6 @@
 # LICENSE file in the root directory of this source tree.
 
 import os
-import shutil
-import subprocess
 import sys
 from pathlib import Path
 from types import ModuleType
@@ -30,12 +28,9 @@ from torchtitan_npu.override.deepseek_v4_1.sparse_attn.ascendc import AscV41Spar
 
 
 @pytest.fixture
-def launcher_config(tmp_path):
-    """Capture launcher arguments without entering torchrun or reserving NPUs."""
+def recipe_config():
+    """Load the selected recipe without entering torchrun or reserving NPUs."""
     root = Path(__file__).resolve().parents[4]
-    scripts = tmp_path / "scripts"
-    scripts.mkdir()
-    (scripts / "run_train.sh").write_text('printf "%s\\0" --module "$MODULE" --config "$CONFIG" "$@"\n')
 
     def parse(hardware="a3", *, golden=False):
         legacy = ("CLI_OVERRIDES", "OPTIMIZER_OVERRIDES", "DATALOADER_OVERRIDES", "MHC_POST_OVERRIDE")
@@ -45,13 +40,12 @@ def launcher_config(tmp_path):
             "NGPU": "8",
             "HF_ASSETS_PATH": str(root / "tests/assets/deepseek_v3"),
         }
-        script = tmp_path / f"examples/deepseek_v4_1/debug/deepseek_v4_1_flash_8p_cpt_4k_{hardware}.sh"
-        script.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(root / "examples" / "deepseek_v4_1" / "debug" / script.name, script)
-        captured = subprocess.check_output(["bash", str(script)], cwd=tmp_path, env=env)
-        args = captured.decode().rstrip("\0").split("\0")
-        # ``ConfigLoader`` re-runs the recipe in-process; give it the same clean
-        # environment as the launcher, including the golden switch.
+        args = [
+            "--module",
+            "torchtitan_npu_recipes.tests.models.deepseek_v4_1",
+            "--config",
+            f"deepseek_v4_1_flash_8p_cpt_4k_{hardware}",
+        ]
         with patch.dict(os.environ, env, clear=True):
             return ConfigLoader().load(args)
 
@@ -66,10 +60,10 @@ def launcher_config(tmp_path):
     ],
     ids=["reference", "a3"],
 )
-def test_launcher_selects_shared_rope_for_text_compressor_indexer_and_vision(
-    launcher_config, golden, rope_type, vision_type
+def test_recipe_selects_shared_rope_for_text_compressor_indexer_and_vision(
+    recipe_config, golden, rope_type, vision_type
 ):
-    trainer = launcher_config(golden=golden)
+    trainer = recipe_config(golden=golden)
     overrides = trainer.override
     cfg = trainer.model
     apply_overrides(overrides, cfg)
@@ -79,10 +73,9 @@ def test_launcher_selects_shared_rope_for_text_compressor_indexer_and_vision(
     assert type(cfg.vision_encoder.rotary) is vision_type.Config
 
 
-def test_a3_text_rope_override_preserves_the_split_site_contract(launcher_config):
-    """The fused derive keeps every field the model's builder set on the
-    public ComplexRoPE.Config (split prefix width, theta, YaRN, length)."""
-    trainer = launcher_config()
+def test_a3_text_rope_override_preserves_the_split_site_contract(recipe_config):
+    """Keep every field the model's builder set on the public ComplexRoPE.Config."""
+    trainer = recipe_config()
     cfg = trainer.model
     attention_before = cfg.layers[0].attention.rope
     compress_before = cfg.layers[2].attention.compressor.rope
@@ -99,10 +92,9 @@ def test_a3_text_rope_override_preserves_the_split_site_contract(launcher_config
         assert after.scaling == before.scaling
 
 
-def test_rope_entries_are_mutually_exclusive(launcher_config):
-    """The reference and fused text-rope entries claim the same public
-    ComplexRoPE.Config nodes, so listing two of them must fail loudly."""
-    trainer = launcher_config()
+def test_rope_entries_are_mutually_exclusive(recipe_config):
+    """Reference and fused text-rope entries must not be listed together."""
+    trainer = recipe_config()
     cfg = trainer.model
     both = OverrideConfig(
         imports=[
@@ -114,12 +106,11 @@ def test_rope_entries_are_mutually_exclusive(launcher_config):
         apply_overrides(both, cfg)
 
 
-def test_a5_launcher_selects_the_full_fused_stack(launcher_config, monkeypatch):
-    """The A5 launcher's override list actually replaces every fused target:
-    partial text RoPE, SwiGLUGroup experts, sparse attention and Sinkhorn."""
+def test_a5_recipe_selects_the_full_fused_stack(recipe_config, monkeypatch):
+    """The A5 recipe's override list replaces every fused target."""
     # Check real override selection without loading the native CANN registration.
     monkeypatch.setitem(sys.modules, "cann_ops_nn.ops", ModuleType("cann_ops_nn.ops"))
-    trainer = launcher_config("a5")
+    trainer = recipe_config("a5")
     cfg = trainer.model
     apply_overrides(trainer.override, cfg)
 
@@ -150,9 +141,9 @@ def test_a5_launcher_selects_the_full_fused_stack(launcher_config, monkeypatch):
         assert issubclass(AscV41HcPre, HcPre)
 
 
-def test_a5_golden_launches_no_fused_defaults(launcher_config):
-    """USE_GOLDEN=1 through the A5 wrapper injects none of the fused entries."""
-    trainer = launcher_config("a5", golden=True)
+def test_a5_golden_launches_no_fused_defaults(recipe_config):
+    """USE_GOLDEN=1 in the A5 recipe injects none of the fused entries."""
+    trainer = recipe_config("a5", golden=True)
     imports = [entry if isinstance(entry, str) else entry[0] for entry in trainer.override.imports]
     assert [i for i in imports if ".asc" in i or "swiglu" in i] == []
 

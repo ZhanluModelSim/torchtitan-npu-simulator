@@ -164,7 +164,7 @@ python -m tests.integration_tests.run_tests ./test_reports/v41-reference-mm \
 
 `deepseek_v4_1_checkpoint` 单独运行 AdamW adapter-only、Muon 完整 DCP 和 Muon adapter-only 恢复用例。
 AdamW 使用固定基座与 adapter-only DCP；Muon adapter-only 保持公共 LoRA 配方的默认保存模式。
-完整模型配置见 [A3/A5 示例入口](../../examples/deepseek_v4_1/readme.md)。
+完整模型配置见 [A3/A5 示例入口](../../torchtitan_npu_recipes/README.md)。
 
 #### Muon adapter-only resume
 
@@ -185,7 +185,7 @@ python -m tests.integration_tests.run_tests /tmp/v41_muon_adapter_resume \
 
 ---
 
-## 二、集群 Nightly 全量用例测试（A3 / A5 真实集群）
+## 二、集群 Nightly 全量用例测试（A3 真实集群）
 
 > Nightly 的现有用例和多机 runner 仍有旧字段 CLI，尚未完成 0.4.0 配置迁移。下述调度命令保留供维护参考，不能视为当前训练已可运行。单机 Python recipe 验证使用上文 `run_tests` 入口。
 
@@ -198,7 +198,6 @@ Nightly CI 用例专为真实物理集群设计，由内网 Lite Actions 调度�
 | **`a3_8p_tests`** | `dsv4_flash_a3_8p_example` | A3 单机 8P | Muon，Eager，5 steps | Exit Code 0、TensorBoard 步数 |
 | **`a3_8p_tests`** | `dsv4_flash_a3_8p_adamw` | A3 单机 8P | AdamW + Virtual Optimizer，4K seq，5 steps | Exit Code 0、TensorBoard 步数 |
 | **`a3_16p_tests`** | `dsv4_flash_a3_16p_example` | A3 双机 16P | AdamW，EP16，Eager，双机各 8P，5 steps | Exit Code 0、跨机通信与步数 |
-| **`a5_64p_tests`** | `dsv4_pro_a5_64p` | A5 八机 64P | DeepSeek-V4 Pro，八机各 8P | 待硬件环境验收后开放 |
 
 ---
 
@@ -236,7 +235,6 @@ Nightly 用例统一存放于：
 根据用例的卡数规格，编辑对应文件（或新建文件并在 `__init__.py` 中暴露）：
 - 单机 8P 用例：`a3_8p_tests.py`
 - 双机 16P 用例：`a3_16p_tests.py`
-- 八机 64P 用例：`a5_64p_tests.py`
 
 #### 步骤二：编写 `OverrideDefinitions`
 每个用例都是一个 `OverrideDefinitions` 对象。核心字段说明如下：

@@ -15,11 +15,11 @@ from torchtitan_npu.override.common.rms_norm import AscRMSNorm
 from torchtitan_npu.override.common.rope import AscComplexRoPE
 from torchtitan_npu.override.deepseek_v4.compressor.ascendc import AscNativeCompressor
 from torchtitan_npu.override.deepseek_v4.sparse_attn.native import AscNativeInnerAttentionConfig
-from torchtitan_npu_recipes.models.deepseek_v4 import deepseek_v4_debugmodel_npu
+from torchtitan_npu_recipes.tests.models.deepseek_v4 import deepseek_v4_flash_43layers_16experts_eager_bf16
 
 
 def test_component_overrides_keep_native_outer_modules_and_checkpoint_schema():
-    config = deepseek_v4_debugmodel_npu(num_mtp_layers=1)
+    config = deepseek_v4_flash_43layers_16experts_eager_bf16(num_mtp_layers=1)
     original = copy.deepcopy(config.model)
     attentions = [node for _, node, _, _ in config.model.traverse(DeepSeekV4Attention.Config)]
     indexers = [node for _, node, _, _ in config.model.traverse(Indexer.Config)]
@@ -52,7 +52,7 @@ def test_component_overrides_keep_native_outer_modules_and_checkpoint_schema():
 
 
 def test_query_norm_preserves_reference_bf16_rounding_and_gradients():
-    config = deepseek_v4_debugmodel_npu().model.layers[0].attention.q_head_norm
+    config = deepseek_v4_flash_43layers_16experts_eager_bf16().model.layers[0].attention.q_head_norm
     norm = config.build()
     generator = torch.Generator().manual_seed(42)
     reference = torch.randn(7, 16, 512, generator=generator, dtype=torch.bfloat16, requires_grad=True)

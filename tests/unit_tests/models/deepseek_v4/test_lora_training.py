@@ -4,6 +4,7 @@
 import copy
 
 import torch
+from torchtitan.config.parallelism import ParallelismConfig
 
 from tests.unit_tests.models.deepseek_v4.lora_test_utils import _build_model_config
 from torchtitan_npu.models import deepseek_v4 as registry
@@ -12,13 +13,13 @@ from torchtitan_npu.models.deepseek_v4.lora import deepseek_v4_lora_transform, i
 
 def test_registry_lora_forward_keeps_zero_adapter_base_output_and_updates_only_adapters(monkeypatch):
     monkeypatch.setitem(
-        registry.deepseek_v4_configs,
+        registry.MODEL_FLAVORS,
         "debugmodel",
         (lambda *args, **kwargs: _build_model_config(num_layers=1), 64),
     )
     with torch.random.fork_rng(devices=[]):
         torch.manual_seed(11)
-        config = registry.model_registry("debugmodel")
+        config = registry.build_model_config("debugmodel", parallelism=ParallelismConfig())
         base = config.build()
         base.init_states(buffer_device=torch.device("cpu"))
         model = deepseek_v4_lora_transform(rank=8).transform(copy.deepcopy(config)).build()

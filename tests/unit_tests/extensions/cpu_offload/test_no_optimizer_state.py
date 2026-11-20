@@ -149,7 +149,7 @@ def test_enable_cpu_offload_defaults_to_npu_resident_state(monkeypatch) -> None:
         swap_optimizer,
     )
     from torchtitan_npu.patches.torch_npu import cpu_dtensor_init
-    from torchtitan_npu_recipes.models.deepseek_v4 import deepseek_v4_debugmodel
+    from torchtitan_npu_recipes.tests.models.deepseek_v4 import deepseek_v4_debugmodel
 
     class ReachedUpstreamError(Exception):
         pass

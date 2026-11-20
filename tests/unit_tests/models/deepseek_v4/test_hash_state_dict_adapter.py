@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from torchtitan_npu.models.deepseek_v4 import _make_v4_config
+from torchtitan_npu.models.deepseek_v4.flavors import _make_dsv4_config
 from torchtitan_npu.models.deepseek_v4.state_dict_adapter import (
     DeepSeekV4StateDictAdapter,
 )
@@ -14,7 +14,7 @@ NUM_EXPERTS = 4
 
 
 def _build_model_config():
-    return _make_v4_config(
+    return _make_dsv4_config(
         dim=32,
         n_layers=N_LAYERS,
         vocab_size=512,

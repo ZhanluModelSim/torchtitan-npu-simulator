@@ -19,7 +19,7 @@ from torchtitan.experiments.graph_trainer.make_fx_tracer import minimal_fx_trace
 from torchtitan.experiments.graph_trainer.simple_fsdp import data_parallel
 from torchtitan.models.common.linear import Linear
 
-from torchtitan_npu_recipes.examples.deepseek_v4 import deepseek_v4_flash_8p_cpt_4k_a3_graphtrainer
+from torchtitan_npu_recipes.graph_trainer.deepseek_v4 import graph_trainer_deepseek_v4_debugmodel
 
 pytestmark = pytest.mark.cpu
 
@@ -64,7 +64,7 @@ def _assert_coalesced_microbatch_gradients(rank, rendezvous, dtype):
         labels[0, 1] = -100
         labels[1, 12] = -100
         valid_tokens = (labels != -100).sum()
-        cfg = deepseek_v4_flash_8p_cpt_4k_a3_graphtrainer()
+        cfg = graph_trainer_deepseek_v4_debugmodel()
         cfg.loss.num_chunks = 8
         loss_fn = cfg.loss.build()
         head = Linear.Config(in_features=4, out_features=13, bias=False, inplace_wgrad_accum=False).build()
@@ -153,5 +153,8 @@ def test_coalesced_chunk_loss_uses_one_rs_and_preserves_microbatch_gradients(tmp
         args=(str(tmp_path / "rendezvous"), dtype),
         nprocs=2,
         join=True,
-        start_method="fork",
+        # Profiling from a forked child can segfault after the pytest parent
+        # has initialized torch/torch_npu worker threads.  Spawn a clean
+        # interpreter for the distributed check instead.
+        start_method="spawn",
     )

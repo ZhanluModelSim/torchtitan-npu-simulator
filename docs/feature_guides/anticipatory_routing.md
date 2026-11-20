@@ -12,23 +12,7 @@ LR scheduler 更新仍由上游完成。路由重放只固定专家 ID，gate sc
 使用 `torchrun -m torchtitan_npu.train` 启动，使 NPU 配置转换构造 `TrainerEx`。
 `scripts/run_train.sh` 和 `scripts/run_train_multinodes.sh` 默认使用 NPU 入口。
 
-使用单卡 DeepSeek-V4 调试脚本的示例：
-
-```bash
-HF_ASSETS_PATH="$PWD/tests/assets/deepseek_v3" \
-CKPT_SAVE_LOAD_PATH="$PWD/outputs/anticipatory_run/checkpoint" \
-bash examples/deepseek_v4/debug/deepseek_v4_mini_1p_cpt_2k_a3.sh \
-  --training.steps 1000 \
-  --checkpoint.enable --checkpoint.no-load-only --checkpoint.interval 50 \
-  --anticipatory.enable \
-  --anticipatory.delay-steps 8 \
-  --anticipatory.active-steps 32
-```
-
-从仓库根目录运行；`tests/assets/deepseek_v3` 需包含已准备好的 tokenizer.json 和 tokenizer_config.json，
-数据使用 `tests/assets/c4_test`。checkpoint 目录需可写，独立实验应使用新的目录。
-该示例通过训练 loss 的趋势和波动自动检测异常。
-启动脚本可能恢复现有 checkpoint；进行独立实验时应使用独立的输出目录。
+原单卡 example 已删除。当前通过 `torchtitan_npu_recipes.tests.models.deepseek_v4` 选择调试配置；该 0.3.0 功能的配置接口尚待迁移，不能将下表中的旧 CLI 参数直接传给 0.4.0 launcher。
 
 ## 配置参数
 

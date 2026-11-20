@@ -14,7 +14,8 @@ from torchtitan.config.loader import ConfigLoader
 import torchtitan_npu  # noqa: F401
 from torchtitan_npu.models.deepseek_v4_1.optimizer import EngramTableOptimizerConfig
 
-_MODULE = "torchtitan_npu_recipes.examples.deepseek_v4_1"
+_MODULE = "torchtitan_npu_recipes.models.deepseek_v4_1"
+_DEBUG_MODULE = "torchtitan_npu_recipes.tests.models.deepseek_v4_1"
 
 
 @pytest.fixture
@@ -49,7 +50,7 @@ def test_mini_recipe_resolves_training_budget_and_quantized_policy(example_envir
     assets.mkdir()
     example_environment.setenv("HF_ASSETS_PATH", str(assets))
 
-    config = ConfigLoader().load(["--module", _MODULE, "--config", "deepseek_v4_1_mini_1p_cpt_a5"])
+    config = ConfigLoader().load(["--module", _DEBUG_MODULE, "--config", "deepseek_v4_1_mini_1p_cpt_a5"])
 
     assert config.hf_assets_path == str(assets)
     assert config.model.max_context_length == config.training.max_context_length == 2048
@@ -112,4 +113,4 @@ def test_legacy_override_text_requires_an_explicit_recipe(example_environment):
     example_environment.setenv("CLI_OVERRIDES", "torchtitan_npu.override.common.rope.workaround")
 
     with pytest.raises(ValueError, match=r"CLI_OVERRIDES.*Python recipe"):
-        ConfigLoader().load(["--module", _MODULE, "--config", "deepseek_v4_1_mini_1p_cpt_a5"])
+        ConfigLoader().load(["--module", _DEBUG_MODULE, "--config", "deepseek_v4_1_mini_1p_cpt_a5"])

@@ -16,7 +16,7 @@ from torchtitan_npu.models.deepseek_v4.mtp import (
     MTPModelOutput,
     prepare_mtp_batch,
 )
-from torchtitan_npu_recipes.models.deepseek_v4 import deepseek_v4_debugmodel
+from torchtitan_npu_recipes.tests.models.deepseek_v4 import deepseek_v4_debugmodel
 
 _community_loss = import_module("torchtitan.components.loss")
 _community_mtp = import_module("torchtitan.models.deepseek_v3.mtp")
