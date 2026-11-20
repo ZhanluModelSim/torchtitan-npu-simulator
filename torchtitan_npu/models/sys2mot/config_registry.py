@@ -505,17 +505,18 @@ def _sys2mot_trainer_config(
     model_config = model_spec.model
     assert isinstance(model_config, Sys2MotModel.Config)
     # The captured joint loss: flow MSE + 0.5*logits-KD + 0.1*hidden-MSE +
-    # 0.1*text CE + 0.01*indexer aux. KD/hidden distill from a frozen teacher
-    # (same capture config, mounted on the loss by the runner) so the full
-    # reference objective runs inside the capture. The text span starts after
-    # the synthesized 3-view vision prefix.
+    # 0.1*text CE + 0.01*indexer aux. Current capture form: distillation is
+    # OFFLINE — the training step is student-only; the teacher's logits and
+    # hidden states are treated as inputs the loss would consume when the
+    # distill knob is re-enabled (the archived in-loop sharded form lives at
+    # tag sys2mot-distill-sharded).
     loss = Sys2MotJointLoss.Config(
         text_offset=3 * model_config.image_tokens,
         action_dim=model_config.action.action_dim,
         horizon=model_config.action.horizon,
         ce_weight=0.1,
         indexer_weight=0.01,
-        distill=True,
+        distill=False,
     )
     return Trainer.Config(
         loss=loss,
