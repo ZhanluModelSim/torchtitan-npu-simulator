@@ -482,7 +482,6 @@ def _make_model_config(*, g: _Geometry) -> Sys2MotModel.Config:
     )
 
 
-
 def model_registry(flavor: str) -> ModelSpec:
     if flavor not in sys2mot_configs:
         raise ValueError(f"Unknown sys2mot flavor: {flavor}. Available: {list(sys2mot_configs)}")
@@ -497,9 +496,7 @@ def model_registry(flavor: str) -> ModelSpec:
     )
 
 
-def _sys2mot_trainer_config(
-    flavor: str, *, num_mtp_layers: int = 0, seq_len: int = 100
-) -> Trainer.Config:
+def _sys2mot_trainer_config(flavor: str, *, num_mtp_layers: int = 0, seq_len: int = 100) -> Trainer.Config:
     if num_mtp_layers:
         raise ValueError("sys2mot has no MTP modules; num_mtp_layers must be 0")
     model_spec = model_registry(flavor)
@@ -562,9 +559,7 @@ def sys2mot_debugmodel_multimodal(*, num_mtp_layers: int = 0) -> Trainer.Config:
 
 
 def sys2mot_mid_multimodal(*, num_mtp_layers: int = 0) -> Trainer.Config:
-    return _sys2mot_trainer_config(
-        "mid_multimodal", num_mtp_layers=num_mtp_layers, seq_len=200
-    )
+    return _sys2mot_trainer_config("mid_multimodal", num_mtp_layers=num_mtp_layers, seq_len=200)
 
 
 __all__ = [

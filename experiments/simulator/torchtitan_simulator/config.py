@@ -296,7 +296,6 @@ def prepare_config(simulation: SimulationConfig) -> PreparedConfig:
         raise ValueError(
             "Supported model families are deepseek_v4, deepseek_v4_1, kimi_k3, "
             "kimi_k3_1, qwen3, qwen3_5, multi_head_moe and sys2mot"
-
         )
     adaptations = []
     if simulation.model_overrides is not None:

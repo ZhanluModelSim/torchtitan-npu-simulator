@@ -56,11 +56,7 @@ def parallelize_sys2mot(
             "span the full sequence"
         )
 
-    if (
-        parallelism.spmd_backend == "spmd_types"
-        or parallel_dims.tp_enabled
-        or parallel_dims.ep_enabled
-    ):
+    if parallelism.spmd_backend == "spmd_types" or parallel_dims.tp_enabled or parallel_dims.ep_enabled:
         # Module protocol: sharding configs are replicated on TP (rejected
         # above); with EP this wires the dispatcher's EP meshes.
         model.parallelize(parallel_dims)

@@ -67,8 +67,7 @@ def set_sys2mot_sharding_config(config: "Sys2MotModel.Config", *, enable_ep: boo
             experts = moe.routed_experts.inner_experts
             experts.sharding_config = ShardingConfig(
                 state_shardings={
-                    name: expert_param_placement_sparse()
-                    for name in ("w_gate_EFD", "w_up_EFD", "w_down_EDF")
+                    name: expert_param_placement_sparse() for name in ("w_gate_EFD", "w_up_EFD", "w_down_EDF")
                 }
             )
         if layer_cfg.engram is not None:
