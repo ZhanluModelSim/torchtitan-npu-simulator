@@ -32,9 +32,10 @@ from torchtitan.hf_datasets.text_datasets import HuggingFaceTextDataLoader
 from torchtitan.models.common.embedding import Embedding
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.nn_modules import Conv2d
-from torchtitan_npu.patches.torchtitan.models.common.token_dispatcher import AllToAllTokenDispatcher
 from torchtitan.protocols.model_spec import ModelSpec
 from torchtitan.trainer import Trainer
+
+from torchtitan_npu.patches.torchtitan.models.common.token_dispatcher import AllToAllTokenDispatcher
 
 from .loss import Sys2MotJointLoss
 from .model import (
@@ -506,10 +507,10 @@ def _sys2mot_trainer_config(
     assert isinstance(model_config, Sys2MotModel.Config)
     # The captured joint loss: flow MSE + 0.5*logits-KD + 0.1*hidden-MSE +
     # 0.1*text CE + 0.01*indexer aux. Current capture form: distillation is
-    # OFFLINE — the training step is student-only; the teacher's logits and
-    # hidden states are treated as inputs the loss would consume when the
-    # distill knob is re-enabled (the archived in-loop sharded form lives at
-    # tag sys2mot-distill-sharded).
+    # OFFLINE — the training step never runs the teacher; its logits and
+    # hidden arrive as inputs (stand-in synthetic spans feed the KD/hidden
+    # terms so the graph carries the real offline compute). The archived
+    # in-loop sharded form lives at tag sys2mot-distill-sharded.
     loss = Sys2MotJointLoss.Config(
         text_offset=3 * model_config.image_tokens,
         action_dim=model_config.action.action_dim,
@@ -517,6 +518,7 @@ def _sys2mot_trainer_config(
         ce_weight=0.1,
         indexer_weight=0.01,
         distill=False,
+        distill_offline=True,
     )
     return Trainer.Config(
         loss=loss,
