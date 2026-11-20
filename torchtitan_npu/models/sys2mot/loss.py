@@ -6,14 +6,21 @@
 """Joint VLA training loss for sys2mot capture.
 
 The reference joint objective (``train_dummy``) is
-``flow + 0.5*KD_KL + 0.1*hidden + 0.1*CE + 0.01*indexer``. The KD/hidden terms
-distill from a frozen teacher forward: the runner mounts a frozen meta-model
-on the loss (``set_teacher``) and the loss runs the teacher VLM backbone per
-step under ``no_grad``, replicating the reference ``Distiller`` formulas
-(temperature-2 logits KL and normalized hidden MSE over the text mask). The
-teacher is not FSDP-wrapped and never joins the optimizer, matching the
-reference ``teacher.eval().requires_grad_(False)``. The model forward returns
-the velocity, the final prefix hidden states and the indexer aux as separate
+``flow + 0.5*KD_KL + 0.1*hidden + 0.1*CE + 0.01*indexer``. Distillation runs
+in one of two forms:
+
+- ``distill`` (archived in-loop form, tag sys2mot-distill-sharded): the runner
+  mounts a frozen meta-model teacher (``set_teacher``) and the loss runs the
+  teacher VLM backbone per step under ``no_grad``, replicating the reference
+  ``Distiller`` formulas (temperature-2 logits KL and normalized hidden MSE
+  over the text mask).
+- ``distill_offline`` (current form): distillation is offline — the training
+  step never runs the teacher, and its logits/hidden arrive as inputs
+  precomputed elsewhere; the loss computes the identical KD/hidden terms on
+  synthetic capture tensors standing in for those inputs.
+
+The teacher never joins the optimizer. The model forward returns the
+velocity, the final prefix hidden states and the indexer aux as separate
 tensors, so no gradient injection is needed — the composite loss backward
 flows through all of them.
 
@@ -25,6 +32,7 @@ shifted-target mask, a constant-factor difference in loss scale only).
 """
 
 from dataclasses import dataclass
+from math import prod
 
 import torch
 import torch.nn.functional as F
@@ -32,6 +40,18 @@ from torchtitan.components.loss import BaseLoss
 from torchtitan.config import CompileConfig
 
 from .model import synthetic_action_batch
+
+
+def _synthetic_span(shape: torch.Size, phase: float, device) -> torch.Tensor:
+    """Deterministic stand-in for an offline-precomputed teacher tensor.
+
+    Same input-synthesis pattern as ``synthetic_action_batch``: the Meta
+    capture has no RNG, so a fixed arithmetic recipe fills the span. Structure
+    only — the real training step loads the teacher outputs from the
+    precomputation pass.
+    """
+    lin = torch.arange(prod(shape), device=device, dtype=torch.float32)
+    return ((lin * phase) % 1.0).reshape(tuple(shape)) - 0.5
 
 
 class Sys2MotJointLoss(BaseLoss):
@@ -48,9 +68,17 @@ class Sys2MotJointLoss(BaseLoss):
         distill: bool = False
         """Run the frozen teacher forward and the KD/hidden distillation terms.
 
-        Current capture form is offline distillation (student-only training
-        step). The archived in-loop sharded form (tag sys2mot-distill-sharded)
-        re-enables the in-loop teacher by setting True here and in the preset.
+        Archived in-loop sharded form (tag sys2mot-distill-sharded); mutually
+        exclusive with ``distill_offline``.
+        """
+        distill_offline: bool = False
+        """Compute the KD/hidden terms on offline-precomputed teacher outputs.
+
+        Offline distillation: the training step never runs the teacher; its
+        logits and hidden states arrive as inputs (precomputed elsewhere).
+        The capture stands in for those inputs with deterministic synthetic
+        tensors shaped to the student's span, so the graph carries the exact
+        KD/hidden compute the real offline training step performs.
         """
 
     def __init__(self, config: Config, *, compile_config: CompileConfig | None = None):
@@ -61,6 +89,9 @@ class Sys2MotJointLoss(BaseLoss):
         self.ce_weight = config.ce_weight
         self.indexer_weight = config.indexer_weight
         self.distill = config.distill
+        self.distill_offline = config.distill_offline
+        if self.distill and self.distill_offline:
+            raise ValueError("distill (in-loop teacher) and distill_offline (offline inputs) are mutually exclusive")
         self.lm_head: torch.nn.Module | None = None
         self.teacher: torch.nn.Module | None = None
         self.kd_temperature: float = 2.0
@@ -120,6 +151,40 @@ class Sys2MotJointLoss(BaseLoss):
         hidden = ((sh - th).square().sum(-1) * text_mask).sum() / text_mask.sum().clamp_min(1)
         return 0.5 * kd + 0.1 * hidden
 
+    def _offline_distill_terms(
+        self,
+        pred: dict[str, torch.Tensor],
+        logits: torch.Tensor,
+    ) -> torch.Tensor:
+        """Reference ``Distiller`` formulas on offline-precomputed teacher outputs.
+
+        The real offline training step loads the teacher's logits and text-span
+        hidden from the precomputation pass and runs exactly this compute; the
+        capture stands in for the loaded tensors with deterministic synthetic
+        spans shaped to the student's (same input-synthesis pattern as the
+        flow targets). Only the student side carries gradients, and both terms
+        normalize over the all-valid capture text mask like the reference.
+        """
+        device = logits.device
+        # Teacher logits keep a scale that exercises the softmax non-degenerately.
+        t_logits = _synthetic_span(logits.shape, 0.3, device) * 2.0
+        span = pred["hidden"][:, self.text_offset :]
+        t_hidden = _synthetic_span(span.shape, 0.7, device)
+        text_mask = torch.ones(logits.shape[:2], device=device, dtype=torch.bool)
+        temperature = self.kd_temperature
+        s = logits.float()
+        t = t_logits.float()
+        kl = F.kl_div(
+            (s / temperature).log_softmax(-1),
+            (t / temperature).softmax(-1),
+            reduction="none",
+        ).sum(-1)
+        kd = (kl * text_mask).sum() / text_mask.sum().clamp_min(1) * temperature**2
+        sh = F.normalize(span.float(), dim=-1)
+        th = F.normalize(t_hidden.float(), dim=-1)
+        hidden = ((sh - th).square().sum(-1) * text_mask).sum() / text_mask.sum().clamp_min(1)
+        return 0.5 * kd + 0.1 * hidden
+
     def __call__(
         self,
         pred: dict[str, torch.Tensor],
@@ -148,4 +213,6 @@ class Sys2MotJointLoss(BaseLoss):
         loss = flow + self.ce_weight * ce + self.indexer_weight * indexer_aux
         if self.distill:
             loss = loss + self._distill_terms(pred, logits)
+        if self.distill_offline:
+            loss = loss + self._offline_distill_terms(pred, logits)
         return loss, {}

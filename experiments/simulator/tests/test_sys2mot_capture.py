@@ -54,7 +54,8 @@ def test_sys2mot_capture_reaches_iteration_with_reference_operators():
     # sys2mot-distill-sharded for the archived in-loop form).
     assert counts["aten._grouped_mm.default"] == 72
     assert counts["aten.topk.default"] == 18
-    assert counts["aten._softmax.default"] == 49
+    # Student routers + indexer plus the offline-distillation teacher softmax.
+    assert counts["aten._softmax.default"] == 50
     assert counts["aten.softplus.default"] == 8
     assert counts["aten.embedding.default"] == 3  # student text + Engram
     assert counts["aten.constant_pad_nd.default"] == 40
@@ -62,13 +63,17 @@ def test_sys2mot_capture_reaches_iteration_with_reference_operators():
     assert counts["aten.convolution.default"] == 1
     assert counts["aten.sort.stable"] == 8  # token dispatcher per MoE layer
     assert counts["torchtitan.deterministic_scatter_add.default"] == 8
-    # The captured joint loss: flow MSE + 0.1 text CE + 0.01 indexer aux.
-    # The KD signature (xlogy from F.kl_div) only appears with the distill
-    # knob enabled.
+    # The captured joint loss: flow MSE + 0.1 text CE + 0.01 indexer aux,
+    # plus the offline-distillation KD/hidden terms computed on synthetic
+    # stand-in teacher tensors (inputs the real offline step loads from the
+    # precomputation pass): the KD signature is the single xlogy, the teacher
+    # softmax adds one entry, and the hidden term uses square/sub (no second
+    # mse_loss).
     assert counts["aten.mse_loss.default"] == 1
     assert counts["aten.nll_loss_forward.default"] == 1
-    assert counts["aten.xlogy.Tensor"] == 0
-    assert counts["aten._log_softmax.default"] == 9
+    assert counts["aten.xlogy.Tensor"] == 1
+    assert counts["aten._log_softmax.default"] == 10
+    assert counts["aten._softmax.default"] == 50
     # Only the sys2mot_sim FlashAttention virtual boundary is substituted;
     # every other node is a native aten/collective op.
     assert not any(raw.startswith(("sys2mot.", "system3.", "deepseek_v4.")) for raw in counts)
