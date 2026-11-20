@@ -135,6 +135,30 @@ def test_multi_head_moe_ep2_dispatches_all_to_all_and_reaches_iteration():
     assert len(gradients) == _TOTAL_PARAM_TENSORS
 
 
+def test_multi_head_moe_head_parallel_dispatches_static_all_to_all():
+    workload = simulate(
+        SimulationConfig(
+            config="multi_head_moe_debugmodel_head_parallel",
+            seq_len=16,
+            world_size=2,
+            logical_rank=0,
+            expert_parallel_degree=2,
+        )
+    )
+    result = validate_workload(workload)
+    assert result["graph_acyclic"] and result["peak_storage_unique"]
+    nodes = [n for template in workload.step_templates.values() for n in template.nodes.values()]
+    counts = Counter(n.annotations["raw_op_type"] for n in nodes)
+    # 4 MoE layers x (head dispatch + head combine) forward plus their
+    # backward: static shapes, so no token-count exchange precedes the data
+    # all-to-alls (EP mode pays one extra count exchange per direction).
+    assert counts["_c10d_functional.all_to_all_single.default"] == 16
+    comm = [n for n in nodes if n.op_type in ("all_to_all", "reduce_scatter")]
+    assert len(comm) == 16 + 11
+    gradients = workload.iteration.schedule.annotations["gradient_validation"]
+    assert len(gradients) == _TOTAL_PARAM_TENSORS
+
+
 def test_multi_head_moe_rejects_tensor_parallel_at_config_level():
     with pytest.raises(NotImplementedError, match="tensor parallelism"):
         simulate(

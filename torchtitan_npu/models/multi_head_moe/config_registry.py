@@ -274,8 +274,15 @@ def _debugmodel_model_config() -> MultiHeadMoEModel.Config:
     )
 
 
+def _debugmodel_head_parallel_model_config() -> MultiHeadMoEModel.Config:
+    config = _debugmodel_model_config()
+    config.head_parallel = True
+    return config
+
+
 multi_head_moe_configs = {
     "debugmodel": _debugmodel_model_config,
+    "debugmodel-head-parallel": _debugmodel_head_parallel_model_config,
 }
 
 
@@ -297,6 +304,40 @@ def model_registry(flavor: str) -> ModelSpec:
 
 def multi_head_moe_debugmodel() -> Trainer.Config:
     model_spec = model_registry("debugmodel")
+    return Trainer.Config(
+        loss=ChunkedLossWrapper.Config(
+            loss_fn=CrossEntropyLoss.Config(
+                global_vocab_size=decoder_vocab_size(model_spec),
+            ),
+        ),
+        hf_assets_path="./tests/assets/tokenizer",
+        model_spec=model_spec,
+        optimizer=default_adamw(lr=8e-4),
+        lr_scheduler=LRSchedulersContainer.Config(
+            warmup_steps=2,
+            decay_ratio=0.8,
+            decay_type="linear",
+            min_lr_factor=0.0,
+        ),
+        training=TrainingConfig(
+            local_batch_size=1,
+            seq_len=128,
+            steps=10,
+        ),
+        dataloader=HuggingFaceTextDataLoader.Config(
+            dataset="c4_test",
+        ),
+        metrics=MetricsProcessor.Config(log_freq=1),
+        checkpoint=CheckpointManager.Config(
+            interval=10,
+            last_save_model_only=False,
+        ),
+        activation_checkpoint=FullAC.Config(),
+    )
+
+
+def multi_head_moe_debugmodel_head_parallel() -> Trainer.Config:
+    model_spec = model_registry("debugmodel-head-parallel")
     return Trainer.Config(
         loss=ChunkedLossWrapper.Config(
             loss_fn=CrossEntropyLoss.Config(
