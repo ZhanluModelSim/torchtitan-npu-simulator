@@ -8,11 +8,12 @@
 """DeepSeek-V4's model-owned structured chat encoder."""
 
 import importlib.util
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-from torchtitan.components.tokenizer import BaseTokenizer
+from torchtitan.components.tokenizer import HuggingFaceTokenizer
 
 ThinkingMode = Literal["chat", "thinking"]
 ReasoningEffort = Literal["low", "high", "max"]
@@ -50,14 +51,24 @@ class DSV4ChatEncoder:
     def encode_messages_with_assistant_mask(
         self,
         messages: list[dict[str, Any]],
-        tokenizer: BaseTokenizer,
+        tokenizer: HuggingFaceTokenizer,
         eos_id: int,
     ) -> tuple[str, list[int], list[bool]]:
-        # Official context is an already-encoded prefix: it affects rendering
-        # decisions but is not emitted or labeled by this sample.
-        context = [dict(message) for message in self.context or []]
+        del eos_id  # The official template controls EOS, including wo_eos.
+        full_text = self._encoding.encode_messages(
+            messages,
+            thinking_mode=self.thinking_mode,
+            context=deepcopy(self.context),
+            drop_thinking=self.drop_thinking,
+            add_default_bos_token=self.add_default_bos_token,
+            reasoning_effort=self.reasoning_effort,
+        )
+        # Per-message rendering only identifies the assistant boundaries.
+        context = deepcopy(self.context) or []
+        bos = self._encoding.bos_token if self.add_default_bos_token and not context else ""
         messages = self._encoding.merge_tool_messages(messages)
-        messages = self._encoding.sort_tool_results_by_call_order(context + messages)[len(context) :]
+        context_len = len(context)
+        messages = self._encoding.sort_tool_results_by_call_order(context + messages)[context_len:]
         if context:
             context = self._encoding.sort_tool_results_by_call_order(self._encoding.merge_tool_messages(context))
         messages = context + messages
@@ -89,32 +100,25 @@ class DSV4ChatEncoder:
                 messages,
                 thinking_mode=self.thinking_mode,
                 drop_thinking=drop_thinking,
-                reasoning_effort=self.reasoning_effort if index == 0 else None,
+                reasoning_effort=self.reasoning_effort,
             )
             for index in range(context_len, len(messages))
         ]
-        full_text = "".join(rendered)
-        add_bos = self.add_default_bos_token and not context
-        full_tokens = tokenizer.encode(full_text, add_bos=add_bos, add_eos=False)
-        if not full_tokens or full_tokens[-1] != eos_id:
-            full_tokens.append(eos_id)
-
-        assistant_mask = [False] * len(full_tokens)
-        prefix_text = ""
-        for index, (message, message_text) in enumerate(zip(messages[context_len:], rendered, strict=True)):
-            next_prefix_text = full_text if index == len(rendered) - 1 else prefix_text + message_text
-            if message.get("role") == "assistant":
-                prefix_tokens = tokenizer.encode(prefix_text, add_bos=add_bos, add_eos=False)
-                through_tokens = tokenizer.encode(next_prefix_text, add_bos=add_bos, add_eos=False)
-                if full_tokens[: len(prefix_tokens)] != prefix_tokens:
-                    raise ValueError(f"Assistant prefix token alignment failed at message {index}")
-                if full_tokens[: len(through_tokens)] != through_tokens:
-                    raise ValueError(f"Assistant boundary token alignment failed at message {index}")
-                start, end = len(prefix_tokens), len(through_tokens)
-                assistant_mask[start:end] = [True] * (end - start)
-            prefix_text = next_prefix_text
-
-        return full_text, full_tokens, assistant_mask
+        if bos + "".join(rendered) != full_text:
+            raise ValueError("Per-message rendering diverges from the official DeepSeek V4 prompt")
+        encoded = tokenizer.tokenizer.encode(full_text, add_special_tokens=False)
+        assistant_spans = []
+        cursor = len(bos)
+        for message, message_text in zip(messages[context_len:], rendered, strict=True):
+            end = cursor + len(message_text)
+            if message.get("role") == "assistant" and cursor < end:
+                assistant_spans.append((cursor, end))
+            cursor = end
+        assistant_mask = [
+            any(begin < span_end and finish > span_start for span_start, span_end in assistant_spans)
+            for begin, finish in encoded.offsets
+        ]
+        return full_text, encoded.ids, assistant_mask
 
 
 @dataclass(kw_only=True, slots=True)

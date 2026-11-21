@@ -9,17 +9,15 @@ import json
 from copy import deepcopy
 from itertools import islice
 from pathlib import Path
+from textwrap import dedent
 
 import pytest
 import torch
+from datasets import Dataset
 from PIL import Image
 from torchtitan.components.data import GrainDataLoader
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
 
-from torchtitan_npu_recipes.models.deepseek_v4_1 import (
-    deepseek_v4_1_debugmodel_multimodal_sft,
-    deepseek_v4_1_vision_sft,
-)
 from torchtitan_npu.models.deepseek_v4_1.vision import language_dataset as dataset_module
 from torchtitan_npu.models.deepseek_v4_1.vision.data import ImagePatchProcessor
 from torchtitan_npu.models.deepseek_v4_1.vision.language_dataset import (
@@ -27,6 +25,13 @@ from torchtitan_npu.models.deepseek_v4_1.vision.language_dataset import (
     _GrainSFTProcessor,
     _SFTCollator,
     sft_dataloader_config,
+)
+from torchtitan_npu.models.deepseek_v4_1.vision.language_encoder import DeepSeekV41VisionLanguageEncoder
+from torchtitan_npu.override.deepseek_v4_1.vision_language_dataloader import sft as sft_override
+from torchtitan_npu_recipes.models.deepseek_v4_1 import (
+    deepseek_v4_1_debugmodel_multimodal,
+    deepseek_v4_1_debugmodel_multimodal_sft,
+    deepseek_v4_1_vision_sft,
 )
 
 pytestmark = pytest.mark.cpu
@@ -36,13 +41,112 @@ ASSETS = Path(__file__).resolve().parents[3] / "assets"
 def _unpack(microbatch):
     inputs = microbatch.as_input_dict()
     labels = inputs.pop("labels")
-    inputs["num_valid_tokens"] = microbatch.num_valid_tokens
+    inputs["loss_token_count"] = int(microbatch.loss_token_counts)
     return inputs, labels
 
 
 @pytest.fixture(scope="module")
 def tokenizer():
     return HuggingFaceTokenizer.Config().build(tokenizer_path=str(ASSETS / "deepseek_v3"))
+
+
+@pytest.mark.parametrize("with_tool_result", (True, False))
+def test_tool_call_is_supervised_when_a_shorter_prefix_renders_differently(tmp_path, tokenizer, with_tool_result):
+    asset = tmp_path / "encoding.py"
+    asset.write_text(
+        "IMAGE_PLACEHOLDER = '<image>'\n"
+        "def encode_messages(messages, thinking_mode, context=None, drop_thinking=True,\n"
+        "                    add_default_bos_token=True, reasoning_effort=None, return_multi_modal_data=False):\n"
+        "    if not messages and context:\n"
+        "        raise ValueError('This encoder cannot render an empty tool-call suffix')\n"
+        "    prompt = ''.join(message['content'] for message in messages)\n"
+        f"    if not context and len(messages) == {3 if with_tool_result else 2}:\n"
+        "        prompt += ' Earlier thinking.'\n"
+        "    return (prompt, {'images': []}) if return_multi_modal_data else prompt\n"
+    )
+    messages = [
+        {"role": "user", "content": "Question!\n"},
+        {"role": "assistant", "content": "Look up the rec", "wo_eos": True},
+        {"role": "assistant", "content": "ord.", "tool_calls": [{"id": "lookup"}]},
+    ]
+    if with_tool_result:
+        messages.append({"role": "tool", "content": "\nTool result."})
+    encoder = DeepSeekV41VisionLanguageEncoder(str(asset), thinking_mode="thinking")
+    prompt, tokens, keep, _, _ = encoder.encode_messages_with_assistant_mask(messages, tokenizer)
+    assert prompt == "Question!\nLook up the record." + ("\nTool result." if with_tool_result else "")
+    assert tokens == tokenizer.tokenizer.encode(prompt, add_special_tokens=False).ids
+    assert [token for token, supervise in zip(tokens, keep, strict=True) if supervise] == (
+        tokenizer.tokenizer.encode("Look up the record.").ids
+    )
+
+
+@pytest.mark.parametrize("has_merge_helper", (True, False), ids=("ordered-images", "missing-helper"))
+def test_tool_result_images_follow_call_order(tmp_path, tokenizer, has_merge_helper):
+    asset = tmp_path / "encoding.py"
+    source = dedent(
+        """\
+        IMAGE_PLACEHOLDER = "<image>"
+
+        def merge_tool_messages(messages):
+            return messages
+
+        def sort_tool_results_by_call_order(messages):
+            ordinary = [message for message in messages if "tool_call_id" not in message]
+            order = [call["id"] for message in ordinary for call in message.get("tool_calls", [])]
+            results = {message["tool_call_id"]: message for message in messages if "tool_call_id" in message}
+            return ordinary + [results[key] for key in order if key in results]
+
+        def process_image_messages(messages):
+            return messages, [message["image"] for message in messages if "image" in message]
+
+        def encode_messages(messages, thinking_mode, context=None, drop_thinking=True,
+                            add_default_bos_token=True, reasoning_effort=None, return_multi_modal_data=False):
+            ordered = sort_tool_results_by_call_order(messages)
+            prompt = "".join(message["content"] for message in ordered)
+            _, images = process_image_messages(messages)
+            return (prompt, {"images": images}) if return_multi_modal_data else prompt
+        """
+    )
+    asset.write_text(source if has_merge_helper else source + "\ndel merge_tool_messages\n")
+    messages = [
+        {"role": "user", "content": "Compare two images.\n"},
+        {"role": "assistant", "content": "Look them up.\n", "tool_calls": [{"id": "a"}, {"id": "b"}]},
+        {"role": "tool", "content": "B <image>\n", "tool_call_id": "b", "image": "b.png"},
+        {"role": "tool", "content": "A <image>\n", "tool_call_id": "a", "image": "a.png"},
+    ]
+    encoder = DeepSeekV41VisionLanguageEncoder(str(asset))
+    if has_merge_helper:
+        prompt, _, _, positions, images = encoder.encode_messages_with_assistant_mask(messages, tokenizer)
+        assert prompt.endswith("A <image>\nB <image>\n")
+        assert images == ["a.png", "b.png"]
+        assert len(positions) == 2
+    else:
+        with pytest.raises(RuntimeError, match="missing tool image helpers: merge_tool_messages"):
+            encoder.encode_messages_with_assistant_mask(messages, tokenizer)
+
+
+def test_empty_historical_assistant_span(tmp_path, tokenizer):
+    asset = tmp_path / "encoding.py"
+    asset.write_text(
+        "IMAGE_PLACEHOLDER = '<image>'\n"
+        "def encode_messages(messages, thinking_mode, context=None, drop_thinking=True,\n"
+        "                    add_default_bos_token=True, reasoning_effort=None, return_multi_modal_data=False):\n"
+        "    prompt = ''.join(message['content'] for message in messages)\n"
+        "    if len(messages) == 2:\n"
+        "        prompt += ' Earlier thinking.'\n"
+        "    return (prompt, {'images': []}) if return_multi_modal_data else prompt\n"
+    )
+    messages = [
+        {"role": "user", "content": "Old question.\n"},
+        {"role": "assistant", "content": "", "wo_eos": True},
+        {"role": "user", "content": "New question.\n"},
+        {"role": "assistant", "content": "Answer."},
+    ]
+    encoder = DeepSeekV41VisionLanguageEncoder(str(asset), thinking_mode="thinking")
+    _, tokens, keep, _, _ = encoder.encode_messages_with_assistant_mask(messages, tokenizer)
+    assert [token for token, supervise in zip(tokens, keep, strict=True) if supervise] == (
+        tokenizer.tokenizer.encode("Answer.").ids
+    )
 
 
 class _StubVisionLanguageEncoder:
@@ -160,9 +264,10 @@ def test_vqa_labels_only_assistant_text_and_eos(tmp_path, tokenizer):
     # Labels are shifted targets, so the reply's EOS is supervised at the reply's
     # last token and the row tail (also filled with EOS) is unsupervised.
     last_supervised = int((labels != -100).nonzero().flatten().max())
+    first_unsupervised = last_supervised + 1
     assert labels[last_supervised] == tokenizer.eos_id
-    assert inputs["input"][last_supervised + 1] == tokenizer.eos_id
-    assert (labels[last_supervised + 1 :] == -100).all()
+    assert inputs["input"][first_unsupervised] == tokenizer.eos_id
+    assert (labels[first_unsupervised:] == -100).all()
     assert (labels[:-1][inputs["token_types"][1:] >= 0] == -100).all()
     supervised = labels[:-1] != -100
     assert torch.equal(labels[:-1][supervised], inputs["input"][1:][supervised])
@@ -202,7 +307,7 @@ def test_streaming_dp_shards_and_resume_round_trip(tmp_path, tokenizer):
         actual = _unpack(next(iter(restored)))
         assert torch.equal(actual[1], expected[1])
         for key in expected[0]:
-            # ``num_valid_tokens`` rides the batch as the int the trainer pops.
+            # The batch carries the count of supervised labels independently of padding.
             if isinstance(expected[0][key], torch.Tensor):
                 assert torch.equal(actual[0][key], expected[0][key]), key
             else:
@@ -210,6 +315,26 @@ def test_streaming_dp_shards_and_resume_round_trip(tmp_path, tokenizer):
     finally:
         original.close()
         restored.close()
+
+
+@pytest.mark.parametrize("has_valid", (True, False), ids=("valid-after-1000", "all-invalid"))
+def test_parquet_stream_checks_all_rows_before_declaring_a_shard_empty(tmp_path, tokenizer, has_valid):
+    data = tmp_path / "questions_[train].parquet"
+    rows = [{"instruction": "word " * 700, "output": "Too long"}] * 1_000
+    if has_valid:
+        rows.append({"instruction": "Question", "output": "Answer"})
+    Dataset.from_list(rows).to_parquet(str(data))
+
+    if not has_valid:
+        with pytest.raises(ValueError, match="SFT data shard 0/1 has no valid samples"):
+            _loader(data, tokenizer, infinite=True)
+        return
+
+    loader = _loader(data, tokenizer, infinite=True)
+    try:
+        assert next(iter(loader)).loss_token_counts.item() > 0
+    finally:
+        loader.close()
 
 
 def test_single_context_budget_and_shifted_batch_contract(tmp_path, tokenizer):
@@ -245,8 +370,8 @@ def test_single_context_budget_and_shifted_batch_contract(tmp_path, tokenizer):
     raw = json.loads(dataset_path.read_text())
     expected_inputs, expected_labels = _processor(dataset_path, tokenizer)._sample(raw)
     assert inputs["input"].shape == labels.shape == (512,)
-    assert type(inputs["num_valid_tokens"]) is int
-    assert inputs["num_valid_tokens"] == (expected_labels != -100).sum()
+    assert type(inputs["loss_token_count"]) is int
+    assert inputs["loss_token_count"] == (expected_labels != -100).sum()
     torch.testing.assert_close(labels, expected_labels, rtol=0, atol=0)
     for key, value in expected_inputs.items():
         torch.testing.assert_close(inputs[key], value, rtol=0, atol=0)
@@ -289,9 +414,8 @@ def test_sft_recipe_requires_a_dataset(monkeypatch):
         deepseek_v4_1_vision_sft()
 
 
-def test_config_name_installs_the_sft_loader_with_cli_policy(tmp_path, monkeypatch):
-    """The recipe, not an override, installs the loader; tyro still owns the policy."""
-    from torchtitan.config import ConfigManager
+def test_python_recipe_controls_sft_loader_policy(tmp_path, monkeypatch):
+    from torchtitan.config import ConfigLoader
 
     dataset_path = tmp_path / "cli.jsonl"
     dataset_path.write_text(
@@ -307,27 +431,28 @@ def test_config_name_installs_the_sft_loader_with_cli_policy(tmp_path, monkeypat
         encoding="utf-8",
     )
     monkeypatch.setenv("DSV41_SFT_DATASET", str(dataset_path))
-    config = ConfigManager().parse_args(
-        [
-            "--module",
-            "torchtitan_npu_recipes.models.deepseek_v4_1",
-            "--config",
-            "deepseek_v4_1_debugmodel_multimodal_sft",
-            "--dataloader.seed",
-            "137",
-        ]
+    (tmp_path / "local_vision_sft_recipe.py").write_text(
+        """from torchtitan_npu_recipes.models.deepseek_v4_1 import deepseek_v4_1_debugmodel_multimodal_sft
+
+def recipe():
+    config = deepseek_v4_1_debugmodel_multimodal_sft()
+    config.dataloader.seed = 137
+    return config
+""",
+        encoding="utf-8",
     )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    config = ConfigLoader().load(["--module", "local_vision_sft_recipe", "--config", "recipe"])
     assert isinstance(config.dataloader, GrainDataLoader.Config)
     assert isinstance(config.dataloader.collator, _SFTCollator.Config)
     assert isinstance(config.dataloader.dataset.processor, _GrainSFTProcessor.Config)
-    # The old override had to carry the policy fields over; the recipe is parsed by
-    # tyro like any other config, so a CLI value lands on the freshly built loader.
     assert config.dataloader.seed == 137
     assert config.dataloader.dataset.processor.dataset_path == str(dataset_path.resolve())
 
 
 @pytest.mark.parametrize("num_images", (0, 2), ids=("text-dummy", "interleaved-images"))
-def test_grain_sft_preserves_processed_multimodal_fixture(tmp_path, tokenizer, num_images):
+@pytest.mark.parametrize("suffix", (".jsonl", ".json"))
+def test_grain_sft_preserves_processed_multimodal_fixture(tmp_path, tokenizer, num_images, suffix):
     for index, size in enumerate(((101, 100), (140, 70))):
         Image.new("RGB", size, color=(index * 127, 37, 255)).save(tmp_path / f"image{index}.png")
     blocks = []
@@ -339,13 +464,25 @@ def test_grain_sft_preserves_processed_multimodal_fixture(tmp_path, tokenizer, n
             ]
         )
     blocks.append({"type": "text", "text": "Describe the colors."})
-    row = {"messages": [{"role": "user", "content": blocks}, {"role": "assistant", "content": "Blue and red."}]}
-    dataset_path = tmp_path / "multimodal.jsonl"
+    row = {
+        "messages": [
+            {"role": "user", "content": blocks},
+            {"role": "assistant", "content_blocks": [{"type": "text", "text": "Blue and red."}]},
+        ]
+    }
+    dataset_path = tmp_path / f"multimodal{suffix}"
     # Overlong rows are filtered before collation; they must not affect labels.
     overlong = {"messages": [{"role": "user", "content": "word " * 700}, {"role": "assistant", "content": "Skipped."}]}
-    dataset_path.write_text(json.dumps(overlong) + "\n" + json.dumps(row) + "\n")
+    rows = [overlong, row]
+    dataset_path.write_text(
+        json.dumps(rows) if suffix == ".json" else "".join(json.dumps(sample) + "\n" for sample in rows)
+    )
     expected_inputs, expected_labels = _processor(dataset_path, tokenizer)._sample(row)
-    loader = _loader(dataset_path, tokenizer)
+    loader_config = sft_override(deepseek_v4_1_debugmodel_multimodal().dataloader, dataset_path=str(dataset_path))
+    loader_config.repeat = False
+    loader = loader_config.build(
+        tokenizer=tokenizer, dp_rank=0, dp_world_size=1, max_context_length=512, num_tokens_per_microbatch=512
+    )
     try:
         inputs, labels = _unpack(next(iter(loader)))
     finally:
@@ -355,8 +492,27 @@ def test_grain_sft_preserves_processed_multimodal_fixture(tmp_path, tokenizer, n
         torch.testing.assert_close(inputs[key], value, rtol=0, atol=0)
     expected_reply = [*tokenizer.tokenizer.encode("Blue and red.").ids, tokenizer.eos_id]
     assert labels[labels != -100].tolist() == expected_reply
-    assert inputs["num_valid_tokens"] == len(expected_reply)
+    assert inputs["loss_token_count"] == len(expected_reply)
     assert inputs["pixel_values"].shape[0] == max(num_images, 1)
     if not num_images:
         assert (inputs["image_feature_indices"] == -1).all()
         assert torch.count_nonzero(inputs["pixel_values"]) == 0
+
+
+def test_repeating_sft_rejects_a_dp_shard_with_no_valid_samples(tmp_path, tokenizer):
+    dataset_path = tmp_path / "shards.jsonl"
+    rows = [
+        {"instruction": "Question", "output": "Answer"},
+        {"instruction": "word " * 700, "output": "Too long"},
+    ]
+    dataset_path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    config = sft_override(deepseek_v4_1_debugmodel_multimodal().dataloader, dataset_path=str(dataset_path))
+    config.shuffle = False
+    loader = config.build(
+        tokenizer=tokenizer, dp_rank=1, dp_world_size=2, max_context_length=512, num_tokens_per_microbatch=512
+    )
+    try:
+        with pytest.raises(ValueError, match="SFT data shard 1/2 has no valid samples"):
+            next(iter(loader))
+    finally:
+        loader.close()

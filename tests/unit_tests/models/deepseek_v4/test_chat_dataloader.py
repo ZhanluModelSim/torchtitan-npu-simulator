@@ -17,7 +17,9 @@ from torchtitan.components.tokenizer import HuggingFaceTokenizer
 
 from torchtitan_npu.models.deepseek_v4.chat_encoder import DSV4EncoderConfig
 from torchtitan_npu.models.deepseek_v4.chat_processor import DeepSeekV4ChatProcessor
+from torchtitan_npu.override.deepseek_v4.chat_dataloader import sft
 from torchtitan_npu_recipes.tests.ci.deepseek_v4 import deepseek_v4_flash_sft
+from torchtitan_npu_recipes.tests.models.deepseek_v4 import deepseek_v4_debugmodel
 
 
 class _StubEncoder:
@@ -25,6 +27,8 @@ class _StubEncoder:
 
     def encode_messages_with_assistant_mask(self, messages, tokenizer, eos_id):
         base = int(messages[0]["content"])
+        if base < 0:
+            return "", list(range(6)), [False] * 6
         return "", list(range(base, base + 6)), [False, False, True, True, True, True]
 
 
@@ -99,3 +103,63 @@ def test_sft_grain_restores_packing_and_prefetch_across_epoch(sft_recipe, rank):
                 torch.testing.assert_close(
                     torch.as_tensor(inputs[key]), torch.as_tensor(expected_inputs[key]), rtol=0, atol=0
                 )
+
+
+def test_cpt_chat_override_rejects_shard_without_supervision(tmp_path, monkeypatch):
+    monkeypatch.setattr(DSV4EncoderConfig, "build", lambda self, path: _StubEncoder())
+    data = tmp_path / "chat.jsonl"
+    data.write_text(
+        "".join(
+            json.dumps({"messages": [{"role": "user", "content": prompt}, {"role": "assistant", "content": "ok"}]})
+            + "\n"
+            for prompt in ("10", "-1")
+        )
+    )
+    config = sft(deepseek_v4_debugmodel().dataloader, dataset_path=str(data))
+    config.shuffle = False
+    loader = config.build(
+        dp_world_size=2,
+        dp_rank=1,
+        tokenizer=HuggingFaceTokenizer(tokenizer_path="tests/assets/deepseek_v3"),
+        max_context_length=128,
+        num_tokens_per_microbatch=128,
+    )
+    try:
+        with pytest.raises(ValueError, match="SFT data shard 1/2 has no valid samples"):
+            next(iter(loader))
+    finally:
+        loader.close()
+
+
+@pytest.mark.parametrize("has_valid", (True, False), ids=("valid-in-later-epoch", "all-invalid"))
+def test_cpt_chat_override_checks_shuffled_shards(tmp_path, monkeypatch, has_valid):
+    monkeypatch.setattr(DSV4EncoderConfig, "build", lambda self, path: _StubEncoder())
+    data = tmp_path / "chat_[v1].jsonl"
+    data.write_text(
+        "".join(
+            json.dumps({"messages": [{"role": "user", "content": prompt}, {"role": "assistant", "content": "ok"}]})
+            + "\n"
+            for prompt in ("10" if has_valid else "-1", "-1", "-1", "-1")
+        )
+    )
+    link = tmp_path / "chat.jsonl"
+    link.symlink_to(data)
+    config = sft(deepseek_v4_debugmodel().dataloader, dataset_path=str(link))
+    config.shuffle = True
+    config.seed = 42
+    loader = config.build(
+        dp_world_size=2,
+        dp_rank=1,
+        tokenizer=HuggingFaceTokenizer(tokenizer_path="tests/assets/deepseek_v3"),
+        max_context_length=128,
+        num_tokens_per_microbatch=128,
+    )
+    try:
+        if has_valid:
+            # Seed 42 assigns the first usable row to rank 1 only in epoch four.
+            assert next(iter(loader)).input[0].item() == 10
+        else:
+            with pytest.raises(ValueError, match="SFT data shard 1/2 has no valid samples"):
+                next(iter(loader))
+    finally:
+        loader.close()

@@ -8,6 +8,7 @@
 import copy
 import importlib.util
 import inspect
+from pathlib import Path
 from typing import Any, Literal
 
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
@@ -29,6 +30,11 @@ class DeepSeekV41VisionLanguageEncoder:
     ) -> None:
         if thinking_mode not in ("chat", "thinking"):
             raise ValueError(f"Unsupported thinking_mode: {thinking_mode!r}")
+        if not Path(encoding_module_path).is_file():
+            raise FileNotFoundError(
+                f"DeepSeek V4.1 SFT could not find {encoding_module_path}. "
+                "Set --hf-assets-path to the model directory containing encoding/encoding.py."
+            )
         spec = importlib.util.spec_from_file_location("encoding_dsv41", encoding_module_path)
         if spec is None or spec.loader is None:
             raise FileNotFoundError(f"Cannot load encoding module: {encoding_module_path}")
@@ -49,6 +55,7 @@ class DeepSeekV41VisionLanguageEncoder:
         missing = required - inspect.signature(encode_messages).parameters.keys()
         if missing:
             raise RuntimeError(f"The V4.1 encoding API is missing parameters: {sorted(missing)}")
+        self._encoding = encoding
         self._encode_messages: Any = encode_messages
         self._image_placeholder = image_placeholder
         self.thinking_mode = thinking_mode
@@ -76,9 +83,23 @@ class DeepSeekV41VisionLanguageEncoder:
         prompt: str,
         encoding_options: dict[str, Any],
     ) -> tuple[int, int]:
-        """Derive one span by changing only public message fields."""
+        """Derive one span with the full conversation available to the encoder."""
         if messages[index].get("tool_calls"):
-            raise RuntimeError("tool-call supervision requires a prefix-stable V4.1 encoding")
+            # Keep the later user turns visible to drop_thinking and include the
+            # serialized tool calls that follow the assistant's text.
+            context = encoding_options["context"] or []
+            options = encoding_options | {"add_default_bos_token": False}
+            with_call = self._encode_messages(messages[index:], **(options | {"context": context + messages[:index]}))
+            next_index = index + 1
+            after_call = ""
+            if next_index < len(messages):
+                after_call = self._encode_messages(
+                    messages[next_index:], **(options | {"context": context + messages[:next_index]})
+                )
+            start, end = len(prompt) - len(with_call), len(prompt) - len(after_call)
+            if start >= end or not prompt.endswith(with_call) or not with_call.endswith(after_call):
+                raise RuntimeError("the official V4.1 encoding did not preserve the tool-call SFT span")
+            return start, end
         marker = f"\ue000torchtitan_sft_{index}\ue001"
         if marker in prompt:
             raise RuntimeError("SFT span probe marker occurs in the encoded prompt")
@@ -105,9 +126,19 @@ class DeepSeekV41VisionLanguageEncoder:
         if marker_end < len(marker) or not prompt.endswith(suffix):
             raise RuntimeError("the official V4.1 encoding did not preserve the SFT end probe")
         end = len(prompt) - len(suffix)
-        if start >= end:
-            raise RuntimeError("the official V4.1 encoding produced an empty assistant span")
+        if start > end:
+            raise RuntimeError("the official V4.1 encoding produced an inverted assistant span")
         return start, end
+
+    def _merge_tool_messages(self, messages):
+        normalized = []
+        for message in messages:
+            content = message.get("content")
+            if message.get("role") == "user" and message.get("content_blocks") is None and isinstance(content, list):
+                # The first release expects user blocks to be set before merging tools.
+                message = message | {"content_blocks": content}
+            normalized.append(message)
+        return self._encoding.merge_tool_messages(normalized)
 
     def encode_messages_with_assistant_mask(
         self,
@@ -143,10 +174,19 @@ class DeepSeekV41VisionLanguageEncoder:
         images = media.get("images")
         if not isinstance(images, list):
             raise RuntimeError("The V4.1 encoding did not return an images list")
+        if images and any(message.get("tool_calls") for message in (context or []) + messages):
+            # The first V4.1 release collected images before sorting tool results.
+            helpers = ("merge_tool_messages", "sort_tool_results_by_call_order", "process_image_messages")
+            missing = [name for name in helpers if not callable(getattr(self._encoding, name, None))]
+            if missing:
+                raise RuntimeError(f"The V4.1 encoding is missing tool image helpers: {', '.join(missing)}")
+            history = self._merge_tool_messages(context or [])
+            history_length = len(history)
+            ordered = self._encoding.sort_tool_results_by_call_order(history + self._merge_tool_messages(messages))
+            _, images = self._encoding.process_image_messages(ordered[history_length:])
 
-        # Ask the official encoder for every assistant boundary instead of
-        # reproducing its image, tool and thinking preprocessing. Prefix
-        # stability is the only contract required for multi-turn supervision.
+        # Use official prefixes when stable and recover the span against the
+        # full conversation when later messages change the prefix rendering.
         assistant_spans = []
         for index, message in enumerate(messages):
             if message.get("role") != "assistant":
@@ -154,9 +194,11 @@ class DeepSeekV41VisionLanguageEncoder:
             before = self._encode_messages(messages[:index], **encoding_options)
             through = self._encode_messages(messages[: index + 1], **encoding_options)
             if through.startswith(before) and prompt.startswith(through):
-                assistant_spans.append((len(before), len(through)))
+                start, end = len(before), len(through)
             else:
-                assistant_spans.append(self._assistant_span_by_probe(messages, index, prompt, encoding_options))
+                start, end = self._assistant_span_by_probe(messages, index, prompt, encoding_options)
+            if start < end:
+                assistant_spans.append((start, end))
 
         placeholder = self._image_placeholder
         image_spans = []
@@ -167,15 +209,12 @@ class DeepSeekV41VisionLanguageEncoder:
         if len(image_spans) != len(images):
             raise ValueError("Encoded image count does not match the prompt")
 
-        cuts = sorted(image_spans + [(end, end) for _, end in assistant_spans])
         token_ids: list[int] = []
         assistant_mask: list[bool] = []
         image_positions: list[int] = []
         cursor = 0
-        for start, end in [*cuts, (len(prompt), len(prompt))]:
-            if start < cursor:
-                continue
-            encoded = tokenizer.tokenizer.encode(prompt[cursor:start])
+        for start, end in [*image_spans, (len(prompt), len(prompt))]:
+            encoded = tokenizer.tokenizer.encode(prompt[cursor:start], add_special_tokens=False)
             token_ids.extend(encoded.ids)
             assistant_mask.extend(
                 any(
@@ -184,13 +223,6 @@ class DeepSeekV41VisionLanguageEncoder:
                 )
                 for begin, finish in encoded.offsets
             )
-            if (
-                start == end
-                and any(span_end == end for _, span_end in assistant_spans)
-                and token_ids
-                and token_ids[-1] == tokenizer.eos_id
-            ):
-                assistant_mask[-1] = True
             if end > start:
                 image_positions.append(len(token_ids))
             cursor = end

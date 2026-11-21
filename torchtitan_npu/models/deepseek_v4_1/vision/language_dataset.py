@@ -1,4 +1,5 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
@@ -7,19 +8,21 @@
 
 import base64
 import json
-from dataclasses import dataclass
+from contextlib import closing
+from dataclasses import dataclass, replace
+from glob import escape
 from io import BytesIO
 from pathlib import Path
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 from PIL import Image
 from torch.nn.utils.rnn import pad_sequence
 from torchtitan.components.data import GrainDataLoader
 from torchtitan.components.data.collators import Collator
-from torchtitan.components.data.dataset import SampleProcessor, SingleDatasetConfig
+from torchtitan.components.data.dataset import GrainDataset, SampleProcessor, SingleDatasetConfig
 from torchtitan.components.data.sources import HuggingFaceStreamingSource
-from torchtitan.components.data.types import TokenizedTrainingMicrobatch
+from torchtitan.components.data.types import DatasetBuildContext, DatasetIterationPolicy, TokenizedTrainingMicrobatch
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
 
 from torchtitan_npu.models.common.alignment import validate_alignment
@@ -30,6 +33,9 @@ from .language_encoder import (
     ReasoningEffort,
     ThinkingMode,
 )
+
+if TYPE_CHECKING:
+    import grain.python as grain
 
 _STACKED_INPUT_KEYS = (
     "input",
@@ -153,7 +159,9 @@ class DeepSeekV41VisionLanguageProcessor:
                     raise ValueError("LLaVA message value must be text")
                 parts = split_text(value)
             else:
-                content = message.get("content_blocks", message.get("content"))
+                content = message.get("content_blocks")
+                if content is None:
+                    content = message.get("content")
                 parts = []
                 if isinstance(content, str):
                     parts = split_text(content)
@@ -225,7 +233,11 @@ class DeepSeekV41VisionLanguageProcessor:
             if any(not isinstance(message, dict) for message in context):
                 raise ValueError("context messages must be objects")
             context = [
-                {**message, "role": aliases.get(message.get("role"), message.get("role"))} for message in context
+                {
+                    **message,
+                    "role": aliases.get(message.get("role"), message.get("role")),
+                }
+                for message in context
             ]
         _, text_ids, text_mask, image_positions, image_sources = (
             self.vision_language_encoder.encode_messages_with_assistant_mask(
@@ -308,7 +320,7 @@ class DeepSeekV41VisionLanguageProcessor:
         types.extend([TEXT] * (len(text_ids) - cursor))
         indices.extend([-1] * (len(text_ids) - cursor))
         target_mask.extend(text_mask[cursor:])
-        if not any(target_mask):
+        if not any(target_mask[1:]):
             raise ValueError("V4.1 chat SFT requires an assistant response")
         if len(ids) > self.seq_len:
             return None
@@ -421,6 +433,21 @@ class _SFTCollator(Collator):
         )
 
 
+class _VisionLanguageStreamConfig(SingleDatasetConfig):
+    def build(self, *, context: DatasetBuildContext, dataset_iteration_policy: DatasetIterationPolicy) -> GrainDataset:
+        policy = dataset_iteration_policy
+        if not policy.repeat or not isinstance(self.source, HuggingFaceStreamingSource.Config):
+            return super().build(context=context, dataset_iteration_policy=policy)
+
+        # A stream has no row count. Check a finite pass before enabling its native repeat.
+        finite_policy = replace(policy, repeat=False, shuffle=False)
+        shard = cast("grain.IterDataset", super().build(context=context, dataset_iteration_policy=finite_policy))
+        with closing(iter(shard)) as iterator:
+            if next(iterator, None) is None:
+                raise ValueError(f"SFT data shard {policy.dp_rank}/{policy.dp_world_size} has no valid samples")
+        return super().build(context=context, dataset_iteration_policy=policy)
+
+
 def sft_dataloader_config(
     *,
     dataset_path: str,
@@ -442,11 +469,11 @@ def sft_dataloader_config(
     if suffix not in (".json", ".jsonl", ".parquet"):
         raise ValueError("vision SFT dataset must be JSON, JSONL, or Parquet")
     return GrainDataLoader.Config(
-        dataset=SingleDatasetConfig(
+        dataset=_VisionLanguageStreamConfig(
             source=HuggingFaceStreamingSource.Config(
                 path="parquet" if suffix == ".parquet" else "json",
                 split="train",
-                load_dataset_kwargs={"data_files": {"train": dataset_path}},
+                load_dataset_kwargs={"data_files": {"train": escape(dataset_path)}},
             ),
             processor=_GrainSFTProcessor.Config(
                 dataset_path=dataset_path,
