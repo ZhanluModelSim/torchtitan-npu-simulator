@@ -5,8 +5,8 @@
 <h4>基于 torchtitan 的昇腾全流程大模型训练适配插件</h4>
 
 [![Documentation](https://img.shields.io/badge/docs-latest-brightgreen.svg?style=flat)](#特性支持概览)
-[![license](https://img.shields.io/badge/license-BSD_3--Clause-lightgrey.svg)](https://gitcode.com/cann/torchtitan-npu/tree/master/LICENSE)
-[![contributing](https://img.shields.io/badge/CONTRIBUTING-teal)](https://gitcode.com/cann/torchtitan-npu/blob/master/docs/community/governance.md)
+[![license](https://img.shields.io/badge/license-BSD_3--Clause-lightgrey.svg)](LICENSE)
+[![contributing](https://img.shields.io/badge/CONTRIBUTING-teal)](docs/community/governance.md)
 [![SIG](https://img.shields.io/badge/SIG-framework--adapter-yellow)](https://gitcode.com/cann/community/tree/master/CANN/sigs/framework-adapter)
 [![pypi](https://img.shields.io/badge/pypi-0.2.2.post2-blue)](https://pypi.org/project/torchtitan-npu/)
 [![zread](https://img.shields.io/badge/Ask_Zread-_.svg?style=plastic&color=00b0aa&labelColor=000000&logo=data%3Aimage%2Fsvg%2Bxml%3Bbase64%2CPHN2ZyB3aWR0aD0iMTYiIGhlaWdodD0iMTYiIHZpZXdCb3g9IjAgMCAxNiAxNiIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj4KPHBhdGggZD0iTTQuOTYxNTYgMS42MDAxSDIuMjQxNTZDMS44ODgxIDEuNjAwMSAxLjYwMTU2IDEuODg2NjQgMS42MDE1NiAyLjI0MDFWNC45NjAxQzEuNjAxNTYgNS4zMTM1NiAxLjg4ODEgNS42MDAxIDIuMjQxNTYgNS42MDAxSDQuOTYxNTZDNS4zMTUwMiA1LjYwMDEgNS42MDE1NiA1LjMxMzU2IDUuNjAxNTYgNC45NjAxVjIuMjQwMUM1LjYwMTU2IDEuODg2NjQgNS4zMTUwMiAxLjYwMDEgNC45NjE1NiAxLjYwMDFaIiBmaWxsPSIjZmZmIi8%2BCjxwYXRoIGQ9Ik00Ljk2MTU2IDEwLjM5OTlIMi4yNDE1NkMxLjg4ODEgMTAuMzk5OSAxLjYwMTU2IDEwLjY4NjQgMS42MDE1NiAxMS4wMzk5VjEzLjc1OTlDMS42MDE1NiAxNC4xMTM0IDEuODg4MSAxNC4zOTk5IDIuMjQxNTYgMTQuMzk5OUg0Ljk2MTU2QzUuMzE1MDIgMTQuMzk5OSA1LjYwMTU2IDE0LjExMzQgNS42MDE1NiAxMy43NTk5VjExLjAzOTlDNS42MDE1NiAxMC42ODY0IDUuMzE1MDIgMTAuMzk5OSA0Ljk2MTU2IDEwLjM5OTlaIiBmaWxsPSIjZmZmIi8%2BCjxwYXRoIGQ9Ik0xMy43NTg0IDEuNjAwMUgxMS4wMzg0QzEwLjY4NSAxLjYwMDEgMTAuMzk4NCAxLjg4NjY0IDEwLjM5ODQgMi4yNDAxVjQuOTYwMUMxMC4zOTg0IDUuMzEzNTYgMTAuNjg1IDUuNjAwMSAxMS4wMzg0IDUuNjAwMUgxMy43NTg0QzE0LjExMTkgNS42MDAxIDE0LjM5ODQgNS4zMTM1NiAxNC4zOTg0IDQuOTYwMVYyLjI0MDFDMTQuMzk4NCAxLjg4NjY0IDE0LjExMTkgMS42MDAxIDEzLjc1ODQgMS42MDAxWiIgZmlsbD0iI2ZmZiIvPgo8cGF0aCBkPSJNNCAxMkwxMiA0TDQgMTJaIiBmaWxsPSIjZmZmIi8%2BCjxwYXRoIGQ9Ik00IDEyTDEyIDQiIHN0cm9rZT0iI2ZmZiIgc3Ryb2tlLXdpZHRoPSIxLjUiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIvPgo8L3N2Zz4K&logoColor=ffffff)](https://zread.ai/hicann/torchtitan-npu)
@@ -62,11 +62,11 @@ pip install -r requirements.txt
 pip install -e .
 ```
 
-详情参见 [安装教程](https://gitcode.com/cann/torchtitan-npu/tree/master/docs/user-guides/installation.md) 。
+详情参见 [安装教程](docs/user-guides/installation.md) 。
 
 # 快速上手
 快速启动大语言模型的训练任务，参见
-[快速上手文档](https://gitcode.com/cann/torchtitan-npu/tree/master/docs/user-guides/quickstart.md) 。
+[快速上手文档](docs/user-guides/quickstart.md) 。
 
 完整训练配置位于 [`torchtitan_npu_recipes`](torchtitan_npu_recipes/README.md)，自定义训练组合见 [Python 配置指南](docs/developer_guides/python_recipes.md)。
 
@@ -307,7 +307,7 @@ torchtitan‑npu 功能依赖的 PyTorch 等第三方开源软件，均由第三
 
 ---
 
-- torchtitan‑npu 产品的使用许可证，具体请参见 [LICENSE](https://gitcode.com/cann/torchtitan-npu/tree/master/LICENSE)。
+- torchtitan‑npu 产品的使用许可证，具体请参见 [LICENSE](LICENSE)。
 - torchtitan‑npu 工具 docs 目录下的文档适用相应许可证，具体请参见根目录下的 LICENSE 文件。
 
 ## 🤝联系我们
