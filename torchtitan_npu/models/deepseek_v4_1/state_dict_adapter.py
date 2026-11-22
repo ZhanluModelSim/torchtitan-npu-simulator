@@ -1,4 +1,5 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
+# Copyright (c) Meta Platforms, Inc. and affiliates.
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
@@ -23,10 +24,10 @@ from torch.distributed.tensor import DTensor
 from torchtitan.models.deepseek_v3.state_dict_adapter import DeepSeekV3StateDictAdapter
 
 from torchtitan_npu.extensions.mx_storage_reader.engram import EngramHuggingFaceStorageReader, dequantize_engram_weight
-from torchtitan_npu.models.common.deepseek_lora import DeepSeekPEFTAdapter, is_lora_parameter
 
 from .engram.checkpoint import checkpoint_shard
 from .indexer import REUSE
+from .peft_adapter import DeepSeekPEFTAdapter, is_lora_parameter
 
 if TYPE_CHECKING:
     from .model import DeepSeekV41Model

@@ -28,8 +28,6 @@ GOLDEN_OVERRIDES = (
     "torchtitan_npu.override.common.rope.workaround",
 )
 
-_LORA_ROPE_OVERRIDES = ("--override.imports", "tests.integration_tests.lora_config.lora_rope_workaround")
-
 # The V4 Grain recipe already points at tests/assets/c4_test/data.json.
 V4_TRAIN_ARGS = (
     "--metrics.enable_tensorboard",
@@ -80,16 +78,6 @@ def _build_case(
 
 def build_deepseek_v4_checkpoint_resume_test_list() -> list[OverrideDefinitions]:
     """Compare two resumed steps with uninterrupted FSDP2/EP2 training."""
-    checkpoint_args = (
-        "--checkpointer.interval=2",
-        "--checkpointer.no-last-save-model-only",
-        "--checkpointer.keep-latest-k=0",
-        "--hf-assets-path=tests/assets/deepseek_v3",
-        "--training.num-tokens-per-train-step=4096",
-        "--training.steps=4",
-        "--parallelism.data-parallel-shard-degree=2",
-        "--parallelism.expert-parallel-degree=2",
-    )
     checkpoint_case = OverrideDefinitions(
         python_config=True,
         train_args=(),
@@ -103,20 +91,13 @@ def build_deepseek_v4_checkpoint_resume_test_list() -> list[OverrideDefinitions]
         check_loss=False,
         check_resume=True,
     )
-    lora_args = (
-        *_LORA_ROPE_OVERRIDES,
-        *checkpoint_args,
-        "--checkpointer.save-training-state",
-        "--optim.optimizer.name=Muon",
-    )
     lora_checkpoint_case = replace(
         checkpoint_case,
-        python_config=False,
-        train_args=V4_TRAIN_ARGS,
+        python_config=True,
         test_name="dsv4_lora_resume_ep2_fsdp2",
         test_descr="DeepSeek-V4 LoRA checkpoint resume EP2/FSDP2",
-        env_vars={"MODULE": "tests.integration_tests.lora_config", "CONFIG": "deepseek_v4_lora_training"},
-        override_args=[lora_args, (*lora_args, "--checkpointer.load-step=2")],
+        env_vars={"MODULE": "tests.integration_tests.lora_config", "CONFIG": "deepseek_v4_lora_resume"},
+        override_args=[(), ("--resume-step=2",)],
     )
     muon_checkpoint_case = replace(
         checkpoint_case,
@@ -162,17 +143,7 @@ def build_deepseek_v4_quantized_test_list() -> list[OverrideDefinitions]:
             test_name="dsv4_lora_block_fp8_ep2_fsdp2",
             test_descr="DeepSeek-V4 block-FP8 base and floating LoRA training EP2/FSDP2",
             env_vars={"MODULE": "tests.integration_tests.lora_config", "CONFIG": "deepseek_v4_lora_quantized_training"},
-            override_args=[
-                (
-                    *_LORA_ROPE_OVERRIDES,
-                    "--training.steps=2",
-                    "--training.num-tokens-per-train-step=4096",
-                    "--optim.optimizer.name=AdamW",
-                    "--parallelism.data-parallel-shard-degree=2",
-                    "--parallelism.expert-parallel-degree=2",
-                    "--hf-assets-path=tests/assets/deepseek_v3",
-                )
-            ],
+            override_args=[()],
             expected_steps=((1, 2),),
             check_resume=False,
         ),
@@ -254,22 +225,11 @@ def build_deepseek_v4_test_list() -> list[OverrideDefinitions]:
             check_loss=False,
         ),
         OverrideDefinitions(
-            train_args=V4_TRAIN_ARGS,
+            python_config=True,
             test_name="dsv4_lora_ep2_fsdp2",
             test_descr="DeepSeek-V4 LoRA A/B training, frozen base and PEFT export EP2/FSDP2",
             env_vars={"MODULE": "tests.integration_tests.lora_config", "CONFIG": "deepseek_v4_lora_training"},
-            override_args=[
-                (
-                    *_LORA_ROPE_OVERRIDES,
-                    "--training.steps=2",
-                    "--training.num-tokens-per-train-step=4096",
-                    "--optim.optimizer.name=Muon",
-                    "--parallelism.data-parallel-shard-degree=2",
-                    "--parallelism.expert-parallel-degree=2",
-                    "--hf-assets-path=tests/assets/deepseek_v3",
-                    "--checkpointer.interval=10000",
-                )
-            ],
+            override_args=[()],
             ngpu=2,
             use_golden=True,
             check_loss=False,

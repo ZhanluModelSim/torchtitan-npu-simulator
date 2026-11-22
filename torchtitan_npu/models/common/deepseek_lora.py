@@ -149,6 +149,8 @@ _PEFT_MODULES = {
     "attention.wo_b": "self_attn.o_b_proj",
     "attention.compressor.wkv": "self_attn.compressor.kv_proj",
     "attention.compressor.wgate": "self_attn.compressor.gate_proj",
+    "attention.compressor_128.wkv": "self_attn.compressor.kv_proj",
+    "attention.compressor_128.wgate": "self_attn.compressor.gate_proj",
     "attention.indexer.wq_b": "self_attn.indexer.q_b_proj",
     "attention.indexer.weights_proj": "self_attn.indexer.weights_proj",
     "attention.indexer.compressor.wkv": "self_attn.indexer.compressor.kv_proj",

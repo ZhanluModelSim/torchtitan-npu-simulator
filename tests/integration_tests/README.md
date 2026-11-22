@@ -76,7 +76,7 @@ python -m tests.integration_tests.run_tests ./test_reports/v41-reference-mm \
 | **`dsv4_checkpoint_resume_ep2_fsdp2`** | DeepSeek-V4 | EP2 + FSDP2 + AdamW NovaSwap | 2 | **动态比对** | 两阶段连续训练 vs 断点恢复训练，逐步比对 Loss 与 Grad Norm |
 | **`dsv4_muon_checkpoint_resume_ep2_fsdp2`** | DeepSeek-V4 | EP2 + FSDP2 + Muon / AdamW NovaSwap | 2 | **动态比对** | 参考 attention，开启 indexer 辅助损失，逐值比较恢复后的 Loss 与 Grad Norm |
 | **`dsv4_lora_ep2_fsdp2`** | DeepSeek-V4 LoRA | EP2 + FSDP2，训练 LoRA A/B | 2 | 否 | 校验基座参数冻结、Adapter 权重更新及 PEFT 导出完整性 |
-| **`dsv41_lora_engram_ep2_fsdp2`** | DeepSeek-V4.1 LoRA | EP2 + FSDP2、FullAC、AdamW | 2 | 否 | 校验基座与 Engram 冻结、adapter 更新及 PEFT 导出 |
+| **`dsv41_lora_engram_ep2_fsdp2`** | DeepSeek-V4.1 LoRA | EP2 + FSDP2、AdamW | 2 | 否 | 校验基座与 Engram 冻结、adapter 更新及 PEFT 导出 |
 | **`dsv41_lora_multimodal_ep2_fsdp2`** | DeepSeek-V4.1 LoRA | EP2 + FSDP2、FullAC、图像 patch + C4 文本 | 2 | 否 | 校验实际 vision forward、vision/Engram 冻结、adapter 更新及 PEFT 导出 |
 | **`dsv4_muon_swap_ep2_fsdp2`** | DeepSeek-V4 | NPU 融合算子 + DistMuon NovaSwap | 2 | 否 | NPU 融合算子（RMSNorm/RoPE/SparseAttention）与 Swap 路径冒烟 |
 | **`dsv4_anticipatory_recovery`** | DeepSeek-V4 | 1 Rank 原生 Checkpoint 回滚 | 1 | 否 | 一次性扰动训练 Loss，断言 Override 机制与完整恢复周期 |
@@ -165,6 +165,17 @@ python -m tests.integration_tests.run_tests ./test_reports/v41-reference-mm \
 `deepseek_v4_1_checkpoint` 单独运行 AdamW adapter-only、Muon 完整 DCP 和 Muon adapter-only 恢复用例。
 AdamW 使用固定基座与 adapter-only DCP；Muon adapter-only 保持公共 LoRA 配方的默认保存模式。
 完整模型配置见 [A3/A5 示例入口](../../torchtitan_npu_recipes/README.md)。
+
+#### AdamW adapter-only resume
+
+连续训练 4 步，第 2 步保存 checkpoint。第二个进程通过 `--resume-step=2` 恢复，
+比较恢复后的 adapter 和 optimizer 状态，以及第 3–4 步的 loss 和 grad_norm。
+
+```bash
+python -m tests.integration_tests.run_tests ./v41-adamw-resume \
+  --test_suite deepseek_v4_1_checkpoint \
+  --test_name dsv41_lora_adamw_resume_ep2_fsdp2 --ngpu 2 --no-parallel
+```
 
 #### Muon adapter-only resume
 

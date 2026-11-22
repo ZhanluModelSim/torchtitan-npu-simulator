@@ -3,9 +3,12 @@
 
 import pytest
 import torch
+from torchtitan.config.parallelism import ParallelismConfig
 
 from tests.unit_tests.models.deepseek_v4.lora_test_utils import _build_model_config
 from tests.unit_tests.models.deepseek_v4.test_deepseek_v4_mtp_model import _build_model_config as _compressed_config
+from torchtitan_npu.models.deepseek_v4 import build_model_config
+from torchtitan_npu.models.deepseek_v4.lora import deepseek_v4_lora_transform
 from torchtitan_npu.models.deepseek_v4.state_dict_adapter import DeepSeekV4StateDictAdapter
 
 
@@ -56,3 +59,17 @@ def test_full_model_checkpoint_roundtrip_preserves_fused_experts_and_compressors
     assert restored.keys() == state.keys()
     for key in state:
         torch.testing.assert_close(restored[key], state[key], rtol=0, atol=0)
+
+
+def test_peft_metadata_uses_shared_compressor_names_for_both_ratios():
+    config = build_model_config("debugmodel", parallelism=ParallelismConfig())
+    config = deepseek_v4_lora_transform().transform(config)
+    with torch.device("meta"):
+        model = config.build()
+    adapter_cls = type(model).state_dict_adapter_cls
+    assert adapter_cls is DeepSeekV4StateDictAdapter
+    targets = set(adapter_cls(config, None).peft_adapter_config()["target_parameters"])
+    for layer, ratio in enumerate(config.compress_ratios):
+        if ratio in (4, 128):
+            for projection in ("kv_proj", "gate_proj"):
+                assert f"model.layers.{layer}.self_attn.compressor.{projection}.weight" in targets

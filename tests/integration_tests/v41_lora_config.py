@@ -4,6 +4,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import logging
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -12,6 +13,7 @@ import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 from torchtitan.components.checkpointer.utils import canonical_fqn
 from torchtitan.config import derive
+from torchtitan.config.parallelism import ParallelismConfig
 
 from tests.integration_tests.lora_config import LoRATrainer, _cpu_tensor
 from torchtitan_npu.models.deepseek_v4.lora import is_lora_parameter
@@ -113,6 +115,41 @@ def deepseek_v4_1_lora_adapter_only_training():
     config.check_resume_state = True
     config.checkpointer.periodic_save_adapter_only = True
     return config
+
+
+def _lora_adamw_recipe(*, resume: bool):
+    config = deepseek_v4_1_debugmodel_lora(
+        parallelism=ParallelismConfig(
+            data_parallel_shard_degree=2,
+            expert_parallel_degree=2,
+            fsdp_reshard_after_forward="always",
+        ),
+        seq_len=128,
+        hf_assets_path="tests/assets/deepseek_v3",
+    )
+    config = derive(config, V41LoRATrainer.Config)
+    config.check_resume_state = resume
+    config.checkpointer.periodic_save_adapter_only = resume
+    if resume:
+        config.checkpointer.interval = 2
+    config.checkpointer.keep_latest_k = 0
+    config.debug.seed = 42
+    config.debug.deterministic = True
+    config.training.steps = 4 if resume else 2
+    config.training.num_tokens_per_train_step = 256
+    config.metrics.enable_tensorboard = True
+    config.metrics.log_freq = 1
+    config.metrics.save_tb_folder = f"tb_phase_{os.environ.get('TT_NPU_INTEGRATION_PHASE', '0')}"
+    config.override.imports = ["tests.integration_tests.lora_config.lora_rope_workaround"]
+    return config
+
+
+def deepseek_v4_1_lora_adamw_training():
+    return _lora_adamw_recipe(resume=False)
+
+
+def deepseek_v4_1_lora_adamw_resume():
+    return _lora_adamw_recipe(resume=True)
 
 
 class V41MultimodalLoRATrainer(V41LoRATrainer):

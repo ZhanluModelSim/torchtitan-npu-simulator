@@ -30,6 +30,7 @@ from torchtitan.distributed.spmd_types import spmd_dense_sp_enabled, spmd_mesh_g
 from torchtitan.models.common.attention import Attention as BaseAttention
 from torchtitan.models.common.attention import InnerAttention
 from torchtitan.models.common.linear import Linear
+from torchtitan.models.common.lora import _LoRALinearMixin
 from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.models.common.rope import RoPE
 from torchtitan.models.deepseek_v4.attention import (
@@ -86,6 +87,24 @@ class DeepSeekV4Attention(UpstreamDeepSeekV4Attention):
     def __init__(self, config: Config):
         super().__init__(config)
         self.q_head_norm = config.q_head_norm.build()
+
+    def project_output_groups(self, grouped):
+        """Project each head group with its own base and LoRA B weights."""
+        with spmd.local():
+            num_groups = grouped.size(1)
+            weight = self.wo_a.weight.view(num_groups, self.o_lora_rank, -1)
+            if spmd.is_type_checking():
+                spmd.assert_type(weight, {"dp": spmd.R, "cp": spmd.R, "tp": spmd.S(0)})
+        output = torch.einsum("tgd,grd->tgr", grouped, weight)
+        projection = self.wo_a
+        if isinstance(projection, _LoRALinearMixin):
+            hidden = projection.lora_a(grouped)
+            with spmd.local():
+                adapter_b = projection.lora_b.weight.view(num_groups, self.o_lora_rank, -1)
+                if spmd.is_type_checking():
+                    spmd.assert_type(adapter_b, {"dp": spmd.R, "cp": spmd.R, "tp": spmd.S(0)})
+            output = output + projection._lora_scaling * torch.einsum("tgl,grl->tgr", hidden, adapter_b)
+        return output
 
     def forward(
         self,
@@ -182,17 +201,11 @@ class DeepSeekV4Attention(UpstreamDeepSeekV4Attention):
             n_local_groups = self.n_groups // (self.n_heads // n_local_heads)
             o = o.view(num_tokens, n_local_groups, -1)
             _assert_spmd_attention_type(o, tp=spmd.S(1))
-            wo_a = self.wo_a.weight.view(n_local_groups, self.o_lora_rank, -1)
-            if spmd.is_type_checking():
-                spmd.assert_type(
-                    wo_a,
-                    {"dp": spmd.R, "cp": spmd.R, "tp": spmd.S(0)},
-                )
-        o = torch.einsum("tgd,grd->tgr", o, wo_a)
+        projected = self.project_output_groups(o)
         with spmd.local():
-            o = o.reshape(num_tokens, -1)
-            _assert_spmd_attention_type(o, tp=spmd.S(1))
-        return self.wo_b(o)
+            projected = projected.reshape(num_tokens, -1)
+            _assert_spmd_attention_type(projected, tp=spmd.S(1))
+        return self.wo_b(projected)
 
 
 class NPUCompressedSparseInnerAttention(InnerAttention):

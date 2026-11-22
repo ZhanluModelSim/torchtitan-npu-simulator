@@ -7,8 +7,9 @@
 
 from dataclasses import dataclass
 
-from torchtitan_npu.models.common.deepseek_lora import is_lora_parameter
 from torchtitan_npu.models.deepseek_v4.peft import DeepSeekV4PEFTCheckpointManager
+
+from .peft_adapter import is_lora_parameter
 
 
 class DeepSeekV41LoRACheckpointManager(DeepSeekV4PEFTCheckpointManager):

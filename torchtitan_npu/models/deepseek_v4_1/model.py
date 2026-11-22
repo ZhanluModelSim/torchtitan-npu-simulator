@@ -334,7 +334,7 @@ class DeepSeekV41Model(GeometryAttentionMetadataMixin, Decoder):
         from torchtitan.models.common.aux_loss import register_aux_loss_zero_hook
         from torchtitan.models.common.moe import register_moe_load_balancing_hook
 
-        from torchtitan_npu.models.common.deepseek_lora import is_lora_parameter
+        from .peft_adapter import is_lora_parameter
 
         if not any(is_lora_parameter(name) for model in model_parts for name, _ in model.named_parameters()):
             register_moe_load_balancing_hook(optimizers, model_parts, parallelism_context)

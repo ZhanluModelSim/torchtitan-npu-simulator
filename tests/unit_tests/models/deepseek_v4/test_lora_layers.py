@@ -31,6 +31,35 @@ def _cpu_grouped_mm(self, *, input_RI, weight_EOI, offsets_E):
     )
 
 
+def test_native_wo_a_grouped_output_uses_both_lora_factors():
+    config = _lora_model_config().layers[0].attention
+    attention = config.build().double()
+    projection = attention.wo_a
+    projection.init_states(buffer_device=torch.device("cpu"))
+    with torch.no_grad():
+        projection.lora_b.weight.normal_(std=0.1)
+    inputs = torch.randn(3, attention.n_groups, projection.in_features, dtype=torch.float64)
+    scale = config.wo_a.alpha / config.wo_a.rank
+    weights = projection.weight.view(attention.n_groups, attention.o_lora_rank, -1)
+    adapter_b = projection.lora_b.weight.view(attention.n_groups, attention.o_lora_rank, -1)
+    expected = torch.stack(
+        [
+            F.linear(
+                inputs[:, group],
+                weights[group] + scale * (adapter_b[group] @ projection.lora_a.weight),
+            )
+            for group in range(attention.n_groups)
+        ],
+        dim=1,
+    )
+    output = attention.project_output_groups(inputs)
+    torch.testing.assert_close(output, expected, rtol=1e-12, atol=1e-12)
+    output.square().sum().backward()
+    assert projection.weight.grad is None
+    assert torch.count_nonzero(projection.lora_a.weight.grad) > 0
+    assert torch.count_nonzero(projection.lora_b.weight.grad) > 0
+
+
 @pytest.mark.parametrize(
     "model,kind",
     [

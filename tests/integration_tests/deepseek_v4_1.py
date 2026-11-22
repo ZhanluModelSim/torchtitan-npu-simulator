@@ -23,8 +23,8 @@ from dataclasses import replace
 from tests.integration_tests import OverrideDefinitions
 
 
-def build_deepseek_v4_1_test_list() -> list[OverrideDefinitions]:
-    args = (
+def _legacy_lora_args() -> tuple[str, ...]:
+    return (
         "--override.imports", "tests.integration_tests.lora_config.lora_rope_workaround",
         "--hf-assets-path=tests/assets/deepseek_v3", "--training.steps=2",
         "--training.num-tokens-per-microbatch-per-dp-rank=128",
@@ -34,16 +34,25 @@ def build_deepseek_v4_1_test_list() -> list[OverrideDefinitions]:
         "--checkpointer.keep-latest-k=0", "--debug.seed=42", "--debug.deterministic",
         "--optim.optimizer.name=AdamW",
     )
+
+
+def build_deepseek_v4_1_test_list() -> list[OverrideDefinitions]:
     text = OverrideDefinitions(
         test_name="dsv41_lora_engram_ep2_fsdp2",
         test_descr="V4.1 LoRA with frozen Engram, adapter updates and PEFT export",
-        env_vars={"MODULE": "tests.integration_tests.v41_lora_config", "CONFIG": "deepseek_v4_1_lora_training"},
-        override_args=[args], expected_steps=((1, 2),), ngpu=2,
+        env_vars={
+            "MODULE": "tests.integration_tests.v41_lora_config",
+            "CONFIG": "deepseek_v4_1_lora_adamw_training",
+        },
+        python_config=True,
+        override_args=[()], expected_steps=((1, 2),), ngpu=2,
         use_golden=True, check_loss=False,
     )
     multimodal = replace(
         text, test_name="dsv41_lora_multimodal_ep2_fsdp2",
         test_descr="V4.1 image-conditioned LoRA with frozen vision and Engram",
+        python_config=False,
+        override_args=[_legacy_lora_args()],
         env_vars={
             "MODULE": "tests.integration_tests.v41_lora_config",
             "CONFIG": "deepseek_v4_1_lora_multimodal_training",
@@ -112,14 +121,19 @@ def build_deepseek_v4_1_test_list() -> list[OverrideDefinitions]:
 
 
 def build_deepseek_v4_1_checkpoint_test_list(
-    *, optimizers: tuple[str, ...] = ("AdamW", "Muon"), include_adapter_only: bool = True,
+    *,
+    optimizers: tuple[str, ...] = ("AdamW", "Muon"),
+    include_adapter_only: bool = True,
+    migrate_adamw: bool = True,
 ) -> list[OverrideDefinitions]:
-    case = build_deepseek_v4_1_test_list()[0]
-    common = tuple(arg for arg in case.override_args[0] if not arg.startswith(("--training.steps=", "--optim.optimizer.name=")))
+    case = replace(build_deepseek_v4_1_test_list()[0], python_config=False)
+    common = tuple(
+        arg for arg in _legacy_lora_args() if not arg.startswith(("--training.steps=", "--optim.optimizer.name="))
+    )
     result = []
     for optimizer in optimizers:
         args = (*common, "--training.steps=4", "--checkpointer.interval=2", f"--optim.optimizer.name={optimizer}")
-        result.append(replace(
+        resume_case = replace(
             case, test_name=f"dsv41_lora_{optimizer.lower()}_resume_ep2_fsdp2",
             test_descr=f"V4.1 LoRA {optimizer} exact native checkpoint resume",
             override_args=[args, (*args, "--checkpointer.load-step=2")],
@@ -129,7 +143,18 @@ def build_deepseek_v4_1_checkpoint_test_list(
                 "CONFIG": ("deepseek_v4_1_lora_adapter_only_training" if optimizer == "AdamW"
                            else "deepseek_v4_1_lora_training"),
             },
-        ))
+        )
+        if optimizer == "AdamW" and migrate_adamw:
+            resume_case = replace(
+                resume_case,
+                python_config=True,
+                override_args=[(), ("--resume-step=2",)],
+                env_vars={
+                    "MODULE": "tests.integration_tests.v41_lora_config",
+                    "CONFIG": "deepseek_v4_1_lora_adamw_resume",
+                },
+            )
+        result.append(resume_case)
     if include_adapter_only and "Muon" in optimizers:
         args = (*common, "--training.steps=10", "--checkpointer.interval=5", "--optim.optimizer.name=Muon")
         result.append(replace(
@@ -149,7 +174,7 @@ def build_deepseek_v4_1_quantized_test_list() -> list[OverrideDefinitions]:
     return [replace(
         case, test_name=case.test_name.replace("_resume_", "_block_fp8_resume_"),
         env_vars={"MODULE": "tests.integration_tests.v41_lora_config", "CONFIG": "deepseek_v4_1_lora_quantized_training"},
-    ) for case in build_deepseek_v4_1_checkpoint_test_list(include_adapter_only=False)]
+    ) for case in build_deepseek_v4_1_checkpoint_test_list(include_adapter_only=False, migrate_adamw=False)]
 
 
 # DeepSeek-V4.1 golden reference recipe: the same operator overrides the
