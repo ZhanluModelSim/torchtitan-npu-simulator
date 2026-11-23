@@ -295,8 +295,6 @@ def prepare_config(simulation: SimulationConfig) -> PreparedConfig:
     model = trainer.model_spec.model
     if trainer.model_spec.name == "kimi_k3_1" and simulation.enable_quantized_training:
         raise ValueError("Kimi K3.1 capture currently supports unquantized training only")
-    if trainer.model_spec.name not in {"deepseek_v4", "kimi_k3", "kimi_k3_1", "qwen3", "system3"}:
-        raise ValueError("Supported model families are deepseek_v4, kimi_k3, kimi_k3_1, qwen3 and system3")
     if trainer.model_spec.name not in {
         "deepseek_v4",
         "deepseek_v4_1",
@@ -305,10 +303,11 @@ def prepare_config(simulation: SimulationConfig) -> PreparedConfig:
         "qwen3",
         "qwen3_5",
         "multi_head_moe",
+        "system3",
     }:
         raise ValueError(
             "Supported model families are deepseek_v4, deepseek_v4_1, kimi_k3, "
-            "kimi_k3_1, qwen3, qwen3_5 and multi_head_moe"
+            "kimi_k3_1, qwen3, qwen3_5, multi_head_moe and system3"
         )
     adaptations = []
     if simulation.model_overrides is not None:
@@ -351,16 +350,13 @@ def prepare_config(simulation: SimulationConfig) -> PreparedConfig:
         (
             {
                 "deepseek_v4": _DSV4_OVERRIDES,
-                "kimi_k3": _COMMON_OVERRIDES,
-                "kimi_k3_1": _COMMON_OVERRIDES,
-                "qwen3": _QWEN3_OVERRIDES,
-                "system3": _SYSTEM3_OVERRIDES,
                 "deepseek_v4_1": _DSV4_1_OVERRIDES,
                 "kimi_k3": _COMMON_OVERRIDES,
                 "kimi_k3_1": _COMMON_OVERRIDES,
+                "multi_head_moe": _MULTI_HEAD_MOE_OVERRIDES,
                 "qwen3": _QWEN3_OVERRIDES,
                 "qwen3_5": _QWEN3_5_OVERRIDES,
-                "multi_head_moe": _MULTI_HEAD_MOE_OVERRIDES,
+                "system3": _SYSTEM3_OVERRIDES,
             }[trainer.model_spec.name]
         )
         if simulation.override_imports is None

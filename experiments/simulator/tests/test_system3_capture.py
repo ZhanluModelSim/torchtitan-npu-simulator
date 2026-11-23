@@ -116,6 +116,7 @@ def test_system3_text_capture_reaches_iteration_with_reference_operators():
         "system3_sim.isa_indexer_grad.default",
         "system3_sim.isa_sparse_attention.default",
         "system3_sim.isa_sparse_attention_grad.default",
+        "system3_sim.sparse_adam_update.default",
     }
     gradients = workload.iteration.schedule.annotations["gradient_validation"]
     # Only the dense parameters carry the gradient contract; the three host
@@ -131,9 +132,18 @@ def test_system3_text_capture_reaches_iteration_with_reference_operators():
     # hold device residency.
     assert memory.persistent_param_bytes == _TEXT_DENSE_PARAMS * 4
     # Native fused AdamW keeps two FP32 moments and one device FP32 step
-    # scalar per participating dense parameter; the host tables get no
-    # dense moments (SparseAdam skips grad-less tables at capture).
+    # scalar per participating dense parameter; the host tables hold their
+    # SparseAdam moments host-side and stay out of the device budget.
     assert memory.optimizer_state_bytes == _TEXT_DENSE_PARAMS * 8 + _TEXT_DENSE_TENSORS * 4
+    # The sparse update actually executes: one declared SparseAdam update per
+    # table, with captured state materialization and pending-gradient
+    # consumption behind the dense gradient exemption (PR #24 review).
+    assert counts["system3_sim.sparse_adam_update.default"] == 3
+    layouts = workload.iteration.schedule.annotations["parameter_layouts"]
+    evidence = workload.iteration.schedule.annotations["sparse_optimizer_validation"]
+    assert set(evidence) == {name for name in layouts if "hash_tables" in name}
+    assert all({"exp_avg", "exp_avg_sq"} <= set(record["state_keys"]) for record in evidence.values())
+    assert all(record["pending_consumed"] for record in evidence.values())
 
 
 def test_system3_full_ac_recomputes_forward_math():
@@ -221,25 +231,49 @@ def test_system3_ep2_dispatches_all_to_all_and_reaches_iteration():
     # exchange; the routed grouped GEMM count is unchanged (per-rank local
     # experts shrink with EP, the per-layer GEMM count does not). The Engram
     # lookups join the routed path: 6 table executions x the production
-    # counts/ids/rows exchange triple adds 18 more all-to-alls.
-    assert counts["_c10d_functional.all_to_all_single.default"] == 108
+    # counts/ids/rows exchange triple adds 18 more all-to-alls, and the
+    # captured sparse lifecycle adds the owner-local backward row exchange
+    # per execution (6 more) plus one EP-group row-square all-reduce for the
+    # combined clip norm (PR #24 review).
+    assert counts["_c10d_functional.all_to_all_single.default"] == 114
+    assert counts["_c10d_functional.all_reduce.default"] == 1
     engram_a2a = [
         n
         for n in nodes
         if n.annotations["raw_op_type"] == "_c10d_functional.all_to_all_single.default"
         and "engram" in n.annotations.get("module_path", "")
     ]
-    assert len(engram_a2a) == 18
+    assert len(engram_a2a) == 24
     assert counts["aten._grouped_mm.default"] == 162
     gradients = workload.iteration.schedule.annotations["gradient_validation"]
     assert len(gradients) == _TEXT_DENSE_TENSORS
     # The tables shard their rows over EP: 128 flat rows / 2 = 64 local rows
-    # on each owner, CPU-resident, outside FSDP.
+    # on each owner. The capture build keeps the weight on the ambient meta
+    # device (the host-offload flag carries the production CPU residency);
+    # it stays outside FSDP and outside every counted device byte total.
     layouts = workload.iteration.schedule.annotations["parameter_layouts"]
     table_layouts = {name: layout for name, layout in layouts.items() if "hash_tables" in name}
     assert len(table_layouts) == 3
-    assert all(layout["device"] == "cpu" for layout in table_layouts.values())
+    assert all(layout["device"] == "meta" for layout in table_layouts.values())
+    assert all(layout["residency"] == "host" for layout in table_layouts.values())
     assert all(tuple(layout["local_shape"]) == (64, 16) for layout in table_layouts.values())
+    # The routed path accumulates and updates the sparse gradients too: the
+    # balanced-exchange lookup keeps the formal autograd boundary, so every
+    # table holds pending evidence and executes its SparseAdam update.
+    assert counts["system3_sim.sparse_adam_update.default"] == 3
+    evidence = workload.iteration.schedule.annotations["sparse_optimizer_validation"]
+    # Evidence keys follow the SparseAdam group naming (checkpoint shard
+    # suffix at EP degree > 1), so they reconcile against the declared
+    # sparse parameters, not the logical layout names.
+    sparse_groups = [
+        group
+        for group in workload.iteration.schedule.annotations["optimizer_parameter_groups"]
+        if group["algorithm"] == "SparseAdam"
+    ]
+    sparse_group_names = sparse_groups[0]["parameter_names"]
+    assert set(evidence) == set(sparse_group_names)
+    assert all({"exp_avg", "exp_avg_sq"} <= set(record["state_keys"]) for record in evidence.values())
+    assert all(record["pending_consumed"] for record in evidence.values())
 
 
 def test_system3_rejects_tensor_parallel_at_config_level():
@@ -361,9 +395,11 @@ def test_isa_sparse_attention_meta_output_follows_value_width():
     assert lse.shape == (b, heads, s)
 
 
-def test_fusion_attention_grad_meta_follows_operand_geometry():
-    """The shared BSND fusion-attention backward fake must mirror each
-    operand's own shape (GQA heads / differing widths), not the query shape."""
+def test_fusion_attention_meta_follows_native_contracts():
+    """The shared BSND fusion-attention fakes follow the native contracts:
+    FP32 (B, N, S, 8) softmax statistics, GQA-operand backward geometry, and
+    an explicit rejection of unequal head widths."""
+    import pytest
     import torch
     from torchtitan_simulator.compat.attention import (
         _npu_fusion_attention_grad_meta,
@@ -372,13 +408,96 @@ def test_fusion_attention_grad_meta_follows_operand_geometry():
 
     q = torch.empty(1, 8, 4, 16, dtype=torch.bfloat16, device="meta")
     k = torch.empty(1, 8, 2, 16, dtype=torch.bfloat16, device="meta")
-    v = torch.empty(1, 8, 2, 32, dtype=torch.bfloat16, device="meta")
-    dy = torch.empty(1, 8, 4, 16, dtype=torch.bfloat16, device="meta")
+    v = torch.empty(1, 8, 2, 16, dtype=torch.bfloat16, device="meta")
 
-    out = _npu_fusion_attention_meta(q, k, v, 4, "BSND")[0]
+    out, softmax_max, softmax_sum = _npu_fusion_attention_meta(q, k, v, 4, "BSND")[:3]
     assert out.shape == q.shape
+    assert softmax_max.shape == (1, 4, 8, 8) and softmax_max.dtype == torch.float32
+    assert softmax_sum.shape == (1, 4, 8, 8) and softmax_sum.dtype == torch.float32
 
+    dy = torch.empty(1, 8, 4, 16, dtype=torch.bfloat16, device="meta")
     dq, dk, dv = _npu_fusion_attention_grad_meta(q, k, v, dy, 4, "BSND")[:3]
     assert dq.shape == q.shape
     assert dk.shape == k.shape
     assert dv.shape == v.shape
+
+    v_wide = torch.empty(1, 8, 2, 32, dtype=torch.bfloat16, device="meta")
+    with pytest.raises(ValueError, match="equal query/key/value head dims"):
+        _npu_fusion_attention_meta(q, k, v_wide, 4, "BSND")
+
+
+def test_system3_rejects_full_dtensor_backend():
+    """The spmd_types backend is the only supported one; full_dtensor's input
+    path was removed stack-wide and the previously kept default-DTensor mesh
+    branch was unreachable dead code (PR #24 review)."""
+    from torchtitan.config import ParallelismConfig
+
+    from torchtitan_npu.models.system3.parallelize import parallelize_system3
+
+    parallelism = ParallelismConfig(data_parallel_shard_degree=1, spmd_backend="full_dtensor")
+    with pytest.raises(NotImplementedError, match="spmd_types backend only"):
+        parallelize_system3(
+            None,
+            parallel_dims=None,
+            training=None,
+            parallelism=parallelism,
+            compile_config=None,
+            ac_config=None,
+            dump_folder=None,
+        )
+
+
+def _gdn2_independent_dims(d_k, d_v, d_state):
+    """Build a GDN2Attention whose key/value/state widths are all free."""
+    from torchtitan.models.common.linear import Linear
+
+    from torchtitan_npu.models.system3.model import GDN2Attention, RopeGeometry, System3RMSNorm
+
+    hidden, heads = 64, 2
+
+    def linear(out):
+        return Linear.Config(in_features=hidden, out_features=out, bias=False)
+
+    config = GDN2Attention.Config(
+        hidden_size=hidden,
+        num_heads=heads,
+        d_state=d_state,
+        d_k=d_k,
+        d_v=d_v,
+        d_a=d_k,
+        rope=RopeGeometry(max_seq_len=64),
+        q_proj=linear(heads * d_k),
+        k_proj=linear(heads * d_k),
+        v_proj=linear(heads * d_v),
+        o_proj=Linear.Config(in_features=heads * d_v, out_features=hidden, bias=False),
+        alpha_gate=linear(heads * d_k),
+        beta_gate=linear(2 * heads * d_state),
+        da_proj=linear(heads * d_k),
+        da_norm=System3RMSNorm.Config(dim=heads * d_k),
+    )
+    return config.build()
+
+
+@pytest.mark.parametrize(
+    ("d_k", "d_v", "d_state"),
+    [(16, 24, 16), (24, 8, 16), (8, 8, 32)],
+    ids=["dk-eq-ds", "dk-gt-ds-dv-lt-ds", "debug-geometry"],
+)
+def test_gdn2_delta_rule_scan_handles_independent_key_value_state_widths(d_k, d_v, d_state):
+    """The key and value state conversions are independent: deriving the
+    value conversion from the dk relation crashed on dk==ds/dv!=ds and
+    dk>ds/dv<ds geometries (reference carries the same latent defect;
+    owner-approved deviation, bitwise-identical on the debug geometry)."""
+    import torch
+
+    gdn2 = _gdn2_independent_dims(d_k, d_v, d_state)
+    b, s, hidden = 1, 8, 64
+    h = torch.randn(b, s, hidden)
+    q = gdn2.q_proj(h).view(b, s, gdn2.H, gdn2.d_k)
+    k = gdn2.k_proj(h).view(b, s, gdn2.H, gdn2.d_k)
+    v = gdn2.v_proj(h).view(b, s, gdn2.H, gdn2.d_v)
+    alpha = torch.sigmoid(gdn2.alpha_gate(h).view(b, s, gdn2.H, gdn2.d_k))
+    beta = gdn2.beta_gate(h).view(b, s, 2, gdn2.H, gdn2.d_state)
+    da = torch.sigmoid(gdn2.da_norm(gdn2.da_proj(h)).view(b, s, gdn2.H, gdn2.d_a).mean(dim=-1))
+    out = gdn2._delta_rule_scan(q, k, v, alpha, beta[:, :, 0], beta[:, :, 1], da, None)
+    assert out.shape == (b, s, gdn2.H, d_v)

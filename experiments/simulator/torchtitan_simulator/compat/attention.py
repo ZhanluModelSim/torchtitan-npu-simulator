@@ -176,9 +176,27 @@ def _npu_fusion_attention_meta(
     offset=0,
 ):
     batch, seq, heads, dim = query.shape
+    # The native fused op requires equal query/key/value head dims (GQA
+    # varies the head count, not the width); an unequal width would produce
+    # inconsistent geometry, so the boundary rejects it explicitly.
+    if key.shape[-1] != dim or value.shape[-1] != dim:
+        raise ValueError(
+            "npu_fusion_attention requires equal query/key/value head dims, got "
+            f"q={dim}, k={key.shape[-1]}, v={value.shape[-1]}"
+        )
+    kv_heads = key.shape[2]
+    if heads <= 0 or kv_heads <= 0 or heads % kv_heads != 0:
+        raise ValueError(
+            f"npu_fusion_attention requires a positive GQA head geometry, got heads={heads}, kv_heads={kv_heads}"
+        )
     out = torch.empty(batch, seq, heads, dim, dtype=query.dtype, device="meta")
-    lse = torch.empty(batch, 1, heads, seq, dtype=torch.float32, device="meta")
-    return out, lse, torch.empty(0, device="meta"), torch.empty(0, device="meta"), 0, 0, 0
+    # Softmax statistics follow the native BSND contract: FP32 per query
+    # position, padded to 8 lanes (B, N, S, 8); the empty placeholders made
+    # the backward drop softmax_sum and understate the activation memory
+    # and traffic.
+    softmax_max = torch.empty(batch, heads, seq, 8, dtype=torch.float32, device="meta")
+    softmax_sum = torch.empty(batch, heads, seq, 8, dtype=torch.float32, device="meta")
+    return out, softmax_max, softmax_sum, torch.empty(0, device="meta"), 0, 0, 0
 
 
 def _npu_fusion_attention_grad_meta(

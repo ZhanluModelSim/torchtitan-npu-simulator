@@ -504,15 +504,24 @@ class GDN2Attention(Module):
             be = beta_erase[:, t]  # [b, H, ds]
             bw = beta_write[:, t]  # [b, H, ds]
 
-            # d_state may differ from d_k/d_v -> pad/truncate to ds.
+            # d_state may differ from d_k/d_v -> pad/truncate to ds. The key
+            # and value conversions are independent (d_k, d_v, d_state are
+            # freely configurable): deriving the value conversion from the dk
+            # relation left v_state mis-sized whenever dk == ds but dv != ds,
+            # or dk > ds but dv < ds (reference carries the same latent defect
+            # and crashes on those geometries; fixed here by owner-approved
+            # deviation, bitwise-identical on every reference-runnable config).
             if dk < ds:
                 k_state = F.pad(kt, (0, ds - dk))
-                v_state = F.pad(vt, (0, ds - dv))
             elif dk > ds:
                 k_state = kt[..., :ds]
-                v_state = vt[..., :ds]
             else:
                 k_state = kt
+            if dv < ds:
+                v_state = F.pad(vt, (0, ds - dv))
+            elif dv > ds:
+                v_state = vt[..., :ds]
+            else:
                 v_state = vt
             # DeltaNet standard: normalize k to unit norm so the state update
             # operator (I - beta k k^T) is a contraction (float32 norm for
@@ -1157,8 +1166,10 @@ class System3HostHashTable(MultiHeadHashTable):
     production DeepSeek-V4.1 ``HostEngramTable`` recipe (owner-approved
     deviation from the reference preview's dense device table).
 
-    The weight is CPU-resident: ``_apply`` keeps it off device transforms,
-    FSDP excludes it via ``ignored_params`` (the table shards itself over EP
+    The weight is CPU-resident in real builds; the meta capture build keeps
+    it on the ambient meta device (the host-offload flag carries the
+    residency fact, ``_apply`` keeps real builds off device transforms), FSDP
+    excludes it via ``ignored_params`` (the table shards itself over EP
     instead) and the sparse-gradient lifecycle follows the shared
     ``uses_host_offload`` protocol that the HostSparse optimizer container
     and the gradient clipper drive. Meta capture replaces ``_lookup_rows``
@@ -1184,17 +1195,22 @@ class System3HostHashTable(MultiHeadHashTable):
         self._replica_group = None
         self._replica_size = 1
         super().__init__(config)
-        # The reference allocates on the ambient default device; the host
-        # table owns its weight on CPU instead (``init_states`` seeds it via
-        # ``_init_self_parameters``).
+        # The reference allocates on the ambient default device. Real builds
+        # keep the table on CPU (production Engram residency); the meta
+        # capture build follows the ambient meta device so the estimator's
+        # counted-device snapshot sees the weight and reports its host
+        # budget through the ``_engram_host_offload`` flag (the
+        # DeepSeek-V4.1 table follows the same recipe).
+        ambient = torch.get_default_device()
+        host_device = ambient if ambient.type == "meta" else torch.device("cpu")
         weight = self._parameters.pop("weight")
         assert isinstance(weight, torch.nn.Parameter)
         weight = nn.Parameter(
             torch.empty(
                 weight.shape,
                 dtype=weight.dtype,
-                device="cpu",
-                pin_memory=self.pin_memory,
+                device=host_device,
+                pin_memory=self.pin_memory if host_device.type == "cpu" else False,
             ),
             requires_grad=weight.requires_grad,
         )
@@ -1219,14 +1235,11 @@ class System3HostHashTable(MultiHeadHashTable):
         try:
             result = super()._apply(fn, recurse=recurse)
         finally:
-            if weight.is_meta:
-                materialized = torch.empty(
-                    weight.shape,
-                    dtype=weight.dtype,
-                    device="cpu",
-                    pin_memory=self.pin_memory,
-                )
-                weight = nn.Parameter(materialized, requires_grad=weight.requires_grad)
+            # The table weight was created outside this transform's scope;
+            # real builds must keep it CPU-resident, so re-register the
+            # original parameter untouched. (Meta capture builds never route
+            # through ``_apply``: the weight is born on the ambient meta
+            # device in ``__init__``.)
             self.register_parameter("weight", weight)
             self._mark_host_weight()
         return result

@@ -7,9 +7,9 @@
 
 DP/FSDP/HSDP and EP follow the shared decoder recipe: native AC policy first,
 then ``apply_fsdp_to_decoder`` (routed experts land on the expert FSDP mesh
-when EP > 1). Both the default DTensor backend and the ``spmd_types``
-sharding-config backend are supported, mirroring the multi-head-moe
-parallelizer.
+when EP > 1). The ``spmd_types`` sharding-config backend is the only supported
+backend -- the shared decoder seam removed ``full_dtensor``'s input path
+stack-wide, and the entry rejects it (and any other backend) fail-fast.
 
 TP and CP fail fast: the ISA/GDN2 head axes and the mHC branch mixing would
 need head-sharded layouts, and the compressed KV grid, GDN2 state and Engram
@@ -69,8 +69,15 @@ def parallelize_system3(
     dump_folder: str,
 ):
     """Apply AC, compile and data/expert parallelism to the model."""
-    if parallelism.spmd_backend == "full_dtensor":
-        raise NotImplementedError("full_dtensor is not supported for system3.")
+    # ``spmd_types`` is the only supported backend: the shared decoder seam
+    # removed full_dtensor's input path stack-wide, and any other value has
+    # no implementation behind it (the previously kept default-DTensor mesh
+    # branch was unreachable dead code).
+    if parallelism.spmd_backend != "spmd_types":
+        raise NotImplementedError(
+            "system3 supports the spmd_types backend only, got "
+            f"{parallelism.spmd_backend!r} (full_dtensor's input path was removed stack-wide)"
+        )
 
     model_compile_enabled = compile_config.enable and "model" in compile_config.components
 
@@ -80,10 +87,9 @@ def parallelize_system3(
             "GDN2 state and Engram hash span the full sequence"
         )
 
-    if parallelism.spmd_backend == "spmd_types" or parallel_dims.tp_enabled or parallel_dims.ep_enabled:
-        # Module protocol: wires the EP mesh on the latent token dispatcher via
-        # LatentRoutedExperts.parallelize; dense modules carry no sharding configs.
-        model.parallelize(parallel_dims)
+    # Module protocol: wires the EP mesh on the latent token dispatcher via
+    # LatentRoutedExperts.parallelize; dense modules carry no sharding configs.
+    model.parallelize(parallel_dims)
 
     if ac_config is not None:
         ac_policy = ac_config.build(dump_folder=dump_folder)
@@ -96,18 +102,8 @@ def parallelize_system3(
             parallel_dims=parallel_dims,
         )
 
-    if parallelism.spmd_backend == "spmd_types":
-        dp_mesh, dp_mesh_dims = resolve_fsdp_mesh(parallel_dims)
-        edp_mesh, edp_mesh_dims = resolve_sparse_fsdp_mesh(parallel_dims)
-    else:
-        dp_mesh_names = ["dp_replicate", "fsdp"] if parallel_dims.dp_replicate_enabled else ["fsdp"]
-        dp_mesh = parallel_dims.get_mesh(dp_mesh_names)
-        dp_mesh_dims = None
-        edp_mesh = None
-        edp_mesh_dims = None
-        if parallel_dims.ep_enabled:
-            edp_mesh_names = ["dp_replicate", "efsdp"] if parallel_dims.dp_replicate_enabled else ["efsdp"]
-            edp_mesh = parallel_dims.get_optional_mesh(edp_mesh_names)
+    dp_mesh, dp_mesh_dims = resolve_fsdp_mesh(parallel_dims)
+    edp_mesh, edp_mesh_dims = resolve_sparse_fsdp_mesh(parallel_dims)
 
     ignored_params = _shard_system3_engram_tables(
         model,

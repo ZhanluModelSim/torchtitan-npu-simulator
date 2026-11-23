@@ -53,7 +53,7 @@ def _gradient_manifest(model):
                     f"Host-offload table {name} produced no pending sparse gradient; the dense "
                     "gradient-contract exemption requires captured sparse work"
                 )
-            exemptions.append(name)
+            exemptions.append(name + getattr(parameter, "_engram_checkpoint_suffix", ""))
             continue
         gradient = parameter.grad
         if gradient is None:
@@ -143,7 +143,10 @@ def _sparse_optimizer_validation(optimizers, model):
             raise RuntimeError(
                 f"Host-offload table {name} did not consume its pending sparse gradient in the optimizer step"
             )
-        validation[name] = record
+        # Same checkpoint-shard naming convention the SparseAdam groups use
+        # (``_engram_checkpoint_suffix``), so the evidence set reconciles
+        # against the dense gradient exemptions at EP degree > 1.
+        validation[name + getattr(parameter, "_engram_checkpoint_suffix", "")] = record
     return validation
 
 
