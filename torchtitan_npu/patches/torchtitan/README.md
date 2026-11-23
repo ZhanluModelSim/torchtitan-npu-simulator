@@ -6,6 +6,7 @@
 - https://github.com/pytorch/torchtitan/pull/4734
 - https://github.com/pytorch/torchtitan/pull/4708
 - https://github.com/pytorch/torchtitan/pull/4763
+- https://github.com/pytorch/torchtitan/pull/6290
 - https://github.com/pytorch/pytorch/pull/201621
 -->
 
@@ -41,6 +42,7 @@ grep -L -E "Pending upstream PR: https://github.com/pytorch/(torchtitan|pytorch)
 | [#4708](https://github.com/pytorch/torchtitan/pull/4708) | 修复 functionalize_recompute_mutations_pass 和 EpOverlap 的冲突 |
 | [#4763](https://github.com/pytorch/torchtitan/pull/4763) | 向 GraphTrainer graph pass 提供运行时上下文，用于 auto-overlap 调度时整图 profiling |
 | [#201621](https://github.com/pytorch/pytorch/pull/201621) | 为本地 FileSystemReader 增加可选 mmap 加载，对应 `distributed/checkpoint/filesystem` |
+| [#6290](https://github.com/pytorch/torchtitan/pull/6290) | 将 `--print-config` 与 `debug.print_config` 配置输出压缩为无损扁平折叠 JSON，对应 `config/format.py`、`config/loader.py` 和 `trainer.py` |
 
 当前依赖固定为 `requirements.txt` 中的 commit。已由该基线提供的 AuxLoss、EMA、DistMuon NPU storage 检查和 EP ready-node 去重不再保留本地 backport；随上游 EP chunk pass 删除的旧 chunk 补丁一并退役。
 
