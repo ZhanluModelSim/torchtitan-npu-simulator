@@ -306,6 +306,110 @@ def test_multi_head_moe_head_parallel_config_tolerates_dense_only_model():
     model.update_from_config(config=trainer)
 
 
+def _head_parallel_two_rank_worker(rank: int, rendezvous: str, queue) -> None:
+    """Forked gloo worker: uneven token shards fail fast, even shards dispatch (PR #23 review)."""
+    import dataclasses
+    import traceback
+    from datetime import timedelta
+
+    import torch
+    import torch.distributed as dist
+    from torch.distributed.device_mesh import init_device_mesh
+
+    from torchtitan_npu.models.multi_head_moe.head_parallel import HeadParallelMultiHeadMoE
+
+    dist.init_process_group(
+        "gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=2, timeout=timedelta(seconds=30)
+    )
+    try:
+        torch.set_num_threads(1)
+        mesh = init_device_mesh("cpu", (2,), mesh_dim_names=("ep",))
+        base_cfg = _moe_layer_module_config(bias=False)
+        with torch.random.fork_rng():
+            torch.manual_seed(313)
+            module = HeadParallelMultiHeadMoE.Config(
+                **{field.name: getattr(base_cfg, field.name) for field in dataclasses.fields(base_cfg) if field.init}
+            ).build()
+        # GroupedExperts ships uninitialized ``torch.empty`` weights; give
+        # every parameter a deterministic finite init.
+        for parameter in module.parameters():
+            torch.nn.init.normal_(parameter, std=0.1)
+        # Mirror the production EP expert placement: the grouped experts ship
+        # Shard(0) on the expert axis, so rank r holds experts
+        # [r * E/ep, (r+1) * E/ep) and the HP forward routes only the owned
+        # heads' local expert pool (head_local * experts_per_head).
+        experts = module.routed_experts.inner_experts
+        for name in ("w1_EFD", "w2_EDF", "w3_EFD"):
+            parameter = getattr(experts, name)
+            setattr(
+                experts,
+                name,
+                torch.nn.Parameter(parameter.detach().chunk(2, dim=0)[rank].clone()),
+            )
+        module._ep_mesh_override = mesh
+
+        # Uneven token shards must raise before any collective: the static
+        # all-to-alls size every transfer block from the local shard, so a
+        # mismatch would error or hang inside the exchange instead of ever
+        # reaching the reassembly view.
+        tokens = 5 if rank == 0 else 3
+        try:
+            module(torch.randn(1, tokens, base_cfg.proj_in.in_features))
+        except ValueError as error:
+            assert "token shards" in str(error), str(error)
+        else:
+            raise AssertionError("uneven token shards must raise ValueError")
+
+        # Even shards pass the cached validation and run the real gloo
+        # head-ownership all-to-alls end to end.
+        out = module(torch.randn(1, 4, base_cfg.proj_in.in_features))
+        assert tuple(out.shape) == (1, 4, base_cfg.proj_out.out_features)
+        queue.put(("ok", rank, ""))
+    except BaseException:
+        queue.put(("error", rank, traceback.format_exc()))
+    finally:
+        dist.destroy_process_group()
+
+
+def test_multi_head_moe_head_parallel_two_rank_token_shard_validation(tmp_path):
+    """Two-rank gloo: uneven ep token shards fail fast before the collectives (PR #23 review).
+
+    Meta capture has no live peers to ask, so the precondition's enforcement
+    is exercised over a real two-rank process group instead: the first
+    forward with uneven per-rank token counts raises ``ValueError`` on both
+    ranks before any all-to-all, and an even shard set dispatches for real.
+    """
+    import multiprocessing
+
+    from torchtitan_npu.models.multi_head_moe.head_parallel import (
+        HeadParallelMultiHeadMoE,  # noqa: F401 — loaded before the fork so workers inherit it
+    )
+
+    context = multiprocessing.get_context("fork")
+    queue = context.Queue()
+    workers = [
+        context.Process(target=_head_parallel_two_rank_worker, args=(rank, str(tmp_path / "rendezvous"), queue))
+        for rank in range(2)
+    ]
+    try:
+        for worker in workers:
+            worker.start()
+        results = [queue.get(timeout=90) for _ in workers]
+        for worker in workers:
+            worker.join(timeout=15)
+            assert worker.exitcode == 0
+        failures = [text for status, _, text in sorted(results, key=lambda item: item[1]) if status == "error"]
+        if failures:
+            raise AssertionError("two-rank worker failed:\n" + "\n".join(failures))
+    finally:
+        for worker in workers:
+            if worker.is_alive():
+                worker.terminate()
+            if worker.pid is not None:
+                worker.join(timeout=5)
+        queue.close()
+
+
 def test_multi_head_moe_rejects_tensor_parallel_at_config_level():
     with pytest.raises(NotImplementedError, match="tensor parallelism"):
         simulate(

@@ -37,11 +37,17 @@ data path changes. The collectives mirror ``AllToAllTokenDispatcher``:
 group — the only collective backend this variant uses (no ``spmd_types``
 ``all_to_all`` fallback).
 
-Limitations: token shards must be even across the ep group (the dispatch
-output reassembly ``view`` fails fast otherwise) and ``moe_heads`` must be
-divisible by ``expert_parallel_degree`` (validated in
-``update_from_config``). Both bounds make the transfer shapes static, which
-matches the official design and keeps capture geometry predictable.
+Limitations: every rank of the ep group must hold the same token count for
+the step. The static all-to-alls size every transfer block from the local
+shard, so uneven token shards break the collectives themselves (mismatched
+sizes error or hang long before the reassembly ``view`` could check) — this
+is a caller precondition the forward cannot enforce locally, so the first
+real forward validates the ep-group token counts once per mesh (cached;
+re-validated only when the local token count changes) and raises on
+disagreement. ``moe_heads`` must be divisible by ``expert_parallel_degree``
+(validated in ``update_from_config``). Both bounds make the transfer shapes
+static, which matches the official design and keeps capture geometry
+predictable.
 
 Opt-in only: ``MultiHeadMoEModel.Config.head_parallel`` (set by the
 ``debugmodel-head-parallel`` flavor) swaps this variant in during
@@ -50,8 +56,10 @@ byte-for-byte.
 """
 
 import dataclasses
+import weakref
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch.distributed._functional_collectives import all_to_all_single
 from torch.distributed.tensor import DeviceMesh, DTensor
@@ -85,6 +93,43 @@ def head_combine(y_TSH: torch.Tensor, ep_mesh: DeviceMesh, t_local: int) -> torc
     return out.view(ep, t_local, h_local, hs).permute(1, 0, 2, 3).reshape(t_local, -1, hs)
 
 
+# Token counts already validated per ep mesh (mesh -> last validated count),
+# keyed weakly so meshes of discarded model instances do not leak. Shared by
+# every HeadParallelMultiHeadMoE layer of a model: the first layer to reach a
+# new token count pays the validation collective, the rest reuse its result.
+_VALIDATED_EP_TOKENS: weakref.WeakKeyDictionary[DeviceMesh, int] = weakref.WeakKeyDictionary()
+
+
+def _validate_ep_token_shards(ep_mesh: DeviceMesh, tokens: int, device: torch.device) -> None:
+    """Reliable fail-fast for the even-token-shard precondition (PR #23 review).
+
+    The static all-to-alls size each transfer block from the local shard, so
+    uneven ``T_local`` across the ep group breaks the collectives themselves
+    (mismatched sizes error or hang) before ``head_dispatch``'s reassembly
+    ``view`` could check anything. The first real forward therefore gathers
+    the per-rank token counts over the ep group and raises when they
+    disagree. Meta capture has no live peers to ask (its transfer shapes are
+    config-derived) and is skipped. The validated count is cached per mesh
+    and re-validated only when the local token count changes, so the model's
+    MoE layers share one collective per distinct shape.
+    """
+    if device.type == "meta" or _VALIDATED_EP_TOKENS.get(ep_mesh) == tokens:
+        return
+    group = ep_mesh.get_group()
+    assert group is not None
+    counts = [torch.zeros(1, dtype=torch.int64, device=device) for _ in range(ep_mesh.size())]
+    dist.all_gather(counts, torch.tensor([tokens], dtype=torch.int64, device=device), group=group)
+    peer_counts = sorted({int(count.item()) for count in counts})
+    if len(peer_counts) > 1:
+        raise ValueError(
+            f"head parallel requires equal token shards across the ep group: this rank holds "
+            f"{tokens} tokens while the group holds {peer_counts}; the static all-to-alls "
+            f"cannot transfer uneven shards (they error or hang on mismatched sizes), so "
+            f"shard the tokens evenly across the ep group (e.g. drop_last)"
+        )
+    _VALIDATED_EP_TOKENS[ep_mesh] = tokens
+
+
 def _local(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.to_local() if isinstance(tensor, DTensor) else tensor
 
@@ -102,6 +147,12 @@ class HeadParallelMultiHeadMoE(MultiHeadMoE):
     (the R + runtime slice arrangement described in the module docstring), so
     the id formula is shared with EP mode and only the local sizes differ.
     """
+
+    # Last token count this instance saw validated (None until the first
+    # ep>1 forward); the mesh-keyed module-level cache dedupes the validation
+    # collective across the model's MoE layers, this flag keeps steady-state
+    # forwards on a cheap integer comparison.
+    _validated_ep_tokens: int | None = None
 
     @dataclasses.dataclass(kw_only=True, slots=True)
     class Config(MultiHeadMoE.Config):
@@ -171,6 +222,12 @@ class HeadParallelMultiHeadMoE(MultiHeadMoE):
         else:
             ep = ep_mesh.size()
             assert ep_mesh is not None
+            if self._validated_ep_tokens != tokens:
+                # The collectives below cannot recover from uneven token
+                # shards; validate the ep-group counts before the first
+                # all-to-all with each distinct token count (PR #23 review).
+                _validate_ep_token_shards(ep_mesh, tokens, x_TSH.device)
+                self._validated_ep_tokens = tokens
             head_local = heads // ep
             rank = ep_mesh.get_local_rank()
             router = router[rank * head_local : (rank + 1) * head_local]
