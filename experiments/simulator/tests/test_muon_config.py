@@ -11,7 +11,7 @@ from dataclasses import asdict
 import pytest
 from torchtitan_simulator.cli import main
 from torchtitan_simulator.config import SimulationConfig, prepare_config
-from torchtitan_simulator.model_overrides import ModelOverrides
+from torchtitan_simulator.model_overrides import ModelOverrides, MoEOverrides
 
 
 @pytest.mark.parametrize("steps", [None, 3], ids=["recipe-default", "explicit-iterations"])
@@ -139,3 +139,39 @@ def test_native_muon_factory_rejects_replica_dedup(monkeypatch):
 def test_unsupported_optimizer_requests_fail_explicitly(options, message):
     with pytest.raises(ValueError, match=message):
         prepare_config(SimulationConfig(**options))
+
+
+@pytest.mark.parametrize(
+    "replicate_degree, shard_degree",
+    [(1, -1), (2, 4)],
+    ids=["fsdp", "hsdp"],
+)
+def test_muon_ep1_rejects_dp_mesh_size_above_expert_count(replicate_degree, shard_degree):
+    # The debug recipe has 4 routed experts. Both configurations use an 8-rank DP mesh.
+    with pytest.raises(ValueError, match=r"does not support Shard\(1\) expert storage.*size 8 exceeds num_experts 4"):
+        prepare_config(
+            SimulationConfig(
+                optimizer_name="Muon",
+                world_size=8,
+                data_parallel_replicate_degree=replicate_degree,
+                data_parallel_shard_degree=shard_degree,
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"optimizer_name": "Muon", "world_size": 4},
+        {
+            "optimizer_name": "Muon",
+            "world_size": 8,
+            "model_overrides": ModelOverrides(moe_args=MoEOverrides(num_experts=8)),
+        },
+        {"optimizer_name": "Muon", "world_size": 8, "expert_parallel_degree": 2},
+        {"world_size": 8},
+    ],
+    ids=["fsdp-equals-experts", "experts-above-fsdp", "ep2", "adamw-unaffected"],
+)
+def test_muon_ep1_gate_allows_supported_layouts(options):
+    prepare_config(SimulationConfig(**options))

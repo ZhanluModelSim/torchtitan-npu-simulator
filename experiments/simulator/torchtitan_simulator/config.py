@@ -199,6 +199,29 @@ def _optimizer_selection(simulation: SimulationConfig, trainer: Any) -> str:
     return simulation.optimizer_name or ("Muon" if has_muon else getattr(optimizer, "name", "AdamW"))
 
 
+def _validate_muon_ep1_expert_shard(simulation: SimulationConfig, trainer: Any) -> None:
+    """Reject EP=1 Muon layouts whose expert storage would be Shard(1).
+
+    The NPU FSDP extension switches routed experts to ``Shard(1)`` once the
+    FSDP DP mesh size exceeds the expert count. Muon then needs an unsupported
+    ``Shard(1) -> Shard(0)`` storage-to-compute redistribution, so fail before
+    any model, mesh or optimizer state is built. EP=1 layouts whose storage is
+    already on dim 0 stay supported, as does any EP>1 configuration.
+    """
+    if simulation.expert_parallel_degree != 1:
+        return
+    # With TP=CP=PP=1, the full DP mesh (replicate × shard) spans the world.
+    dp_mesh_size = simulation.world_size
+    num_experts = trainer.model_spec.model.layers[0].moe.num_experts
+    if dp_mesh_size > num_experts:
+        raise ValueError(
+            "Muon with EP=1 does not support Shard(1) expert storage: DP mesh size "
+            f"{dp_mesh_size} exceeds num_experts {num_experts}. Use a larger expert count, a "
+            "smaller DP mesh, EP>1, or AdamW; EP=1 layouts with storage already "
+            "on dim 0 remain supported."
+        )
+
+
 def _prepare_optimizer(simulation: SimulationConfig, trainer: Any, *, materialize: bool = True) -> None:
     """Materialize the model-owned Muon policy after geometry and overrides."""
     selected = _optimizer_selection(simulation, trainer)
@@ -213,6 +236,7 @@ def _prepare_optimizer(simulation: SimulationConfig, trainer: Any, *, materializ
         raise ValueError("Muon simulation requires a DeepSeek-V4 recipe with a native Muon profile")
     if simulation.tensor_parallel_degree != 1 or simulation.context_parallel_degree != 1:
         raise ValueError("Muon simulation currently requires TP=1 and CP=1")
+    _validate_muon_ep1_expert_shard(simulation, trainer)
     if simulation.enable_quantized_training:
         raise ValueError("Muon simulation with quantized training is not supported")
     if getattr(optimizer, "muon_enable_hsdp_replica_dedup", False):
