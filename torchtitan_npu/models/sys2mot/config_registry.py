@@ -137,6 +137,10 @@ class _Geometry:
         """Reference ``Config.validate`` verbatim."""
         if len(self.compress_ratios) != self.layers or not 0 < self.encoder_layers < self.layers:
             raise ValueError("Invalid CED layer schedule")
+        if any(not 0 <= i < self.layers for i in (*self.kv_sources, *self.index_sources)):
+            raise ValueError("KV and index sources must be valid layer indices")
+        if not 0 <= self.candidate_source < self.layers:
+            raise ValueError("candidate_source must be a valid layer index")
         if self.encoder_layers not in self.kv_sources:
             raise ValueError("First decoder layer must project its global KV from final encoder states")
         if self.heads % self.o_groups or self.rope_dim % 2 or self.rope_dim > min(self.head_dim, self.index_dim):
@@ -192,7 +196,7 @@ class _GeometryMid(_Geometry):
     window: int = 128
     compress_ratios: tuple[int, ...] = (0, 0) + (2,) * 2 + (1,) * 4
     kv_sources: tuple[int, ...] = (2, 4)
-    index_sources: tuple[int, ...] = (2, 4, 6, 8)
+    index_sources: tuple[int, ...] = (2, 4, 6, 7)
     index_heads: int = 32
     index_dim: int = 128
     index_topk: int = 512

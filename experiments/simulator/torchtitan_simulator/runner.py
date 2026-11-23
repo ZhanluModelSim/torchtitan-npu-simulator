@@ -344,6 +344,23 @@ def _simulate(simulation, timings: HostTimings):
             )
             inputs = {"tokens": tokens.to("meta"), **to_meta_metadata(kwargs)}
             labels = labels.to("meta")
+            # Offline distillation consumes the teacher's precomputed outputs as
+            # explicit loss inputs. The runner supplies deterministic stand-ins
+            # shaped to the student side; building them HERE keeps the
+            # synthesis outside the captured graph, so the step matches a real
+            # offline training step (KD/hidden math on loaded tensors only).
+            teacher_loss_inputs: dict[str, torch.Tensor] = {}
+            if getattr(config.loss, "distill_offline", False):
+                ramp = torch.arange(seq_len, dtype=torch.float32) * 0.01
+                teacher_loss_inputs["teacher_logits"] = (
+                    (0.3 + ramp)
+                    .view(1, seq_len, 1)
+                    .expand(batch_size, seq_len, config.model_spec.model.vocab_size)
+                    .to("meta")
+                )
+                teacher_loss_inputs["teacher_hidden"] = (
+                    (0.7 + ramp).view(1, seq_len, 1).expand(batch_size, seq_len, config.model_spec.model.dim).to("meta")
+                )
             gradient_manifest = {}
             dense_gradient_exemptions = set()
             from torchtitan.distributed.utils import clip_grad_norm_, get_spmd_context
@@ -356,7 +373,13 @@ def _simulate(simulation, timings: HostTimings):
                 with train_context():
                     with timings.measure(f"{execution}.forward"), compute_block("F"):
                         predictions = model(**input_dict)
-                        loss, _ = loss_fn(predictions, labels, global_valid_tokens, positions=input_dict["positions"])
+                        loss, _ = loss_fn(
+                            predictions,
+                            labels,
+                            global_valid_tokens,
+                            positions=input_dict["positions"],
+                            **teacher_loss_inputs,
+                        )
                     with timings.measure(f"{execution}.backward"), compute_block("B"):
                         loss.backward()
                 manifest, exemptions = _gradient_manifest(model)

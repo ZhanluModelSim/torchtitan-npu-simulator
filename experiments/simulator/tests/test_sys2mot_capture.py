@@ -202,3 +202,16 @@ def test_sys2mot_preset_rejects_mtp_modules():
 
     with pytest.raises(ValueError, match="no MTP modules"):
         sys2mot_debugmodel_multimodal(num_mtp_layers=1)
+
+
+def test_sys2mot_mid_geometry_sources_in_range():
+    """Mid layer schedules must land on real layers (PR #25 review: index 8 >= layers 8)."""
+    from torchtitan_npu.models.sys2mot.config_registry import _GeometryMid
+
+    geometry = _GeometryMid()
+    geometry.validate()
+    assert geometry.layers == 8
+    assert len(geometry.index_sources) == 4
+    assert all(
+        0 <= i < geometry.layers for i in (*geometry.kv_sources, *geometry.index_sources, geometry.candidate_source)
+    )

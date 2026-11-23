@@ -32,7 +32,6 @@ shifted-target mask, a constant-factor difference in loss scale only).
 """
 
 from dataclasses import dataclass
-from math import prod
 
 import torch
 import torch.nn.functional as F
@@ -42,16 +41,43 @@ from torchtitan.config import CompileConfig
 from .model import synthetic_action_batch
 
 
-def _synthetic_span(shape: torch.Size, phase: float, device) -> torch.Tensor:
-    """Deterministic stand-in for an offline-precomputed teacher tensor.
+def _offline_teacher_terms(
+    logits: torch.Tensor,
+    span: torch.Tensor,
+    teacher_logits: torch.Tensor | None,
+    teacher_hidden: torch.Tensor | None,
+    text_mask: torch.Tensor,
+    temperature: float,
+) -> torch.Tensor:
+    """Reference ``Distiller`` formulas on offline-precomputed teacher outputs.
 
-    Same input-synthesis pattern as ``synthetic_action_batch``: the Meta
-    capture has no RNG, so a fixed arithmetic recipe fills the span. Structure
-    only — the real training step loads the teacher outputs from the
-    precomputation pass.
+    The real offline training step loads the teacher's logits and text-span
+    hidden from the precomputation pass; the runner hands the same tensors to
+    the loss as explicit inputs (deterministic stand-ins during the Meta
+    capture, outside the captured graph). Shapes are validated against the
+    student side before use, and both terms normalize over the capture text
+    mask exactly like the reference.
     """
-    lin = torch.arange(prod(shape), device=device, dtype=torch.float32)
-    return ((lin * phase) % 1.0).reshape(tuple(shape)) - 0.5
+    if teacher_logits is None or teacher_hidden is None:
+        raise ValueError("distill_offline requires teacher_logits and teacher_hidden loss inputs")
+    if tuple(teacher_logits.shape) != tuple(logits.shape):
+        raise ValueError(f"teacher_logits shape {tuple(teacher_logits.shape)} != student logits {tuple(logits.shape)}")
+    if tuple(teacher_hidden.shape) != tuple(span.shape):
+        raise ValueError(
+            f"teacher_hidden shape {tuple(teacher_hidden.shape)} != student hidden span {tuple(span.shape)}"
+        )
+    s = logits.float()
+    t = teacher_logits.detach().float()
+    kl = F.kl_div(
+        (s / temperature).log_softmax(-1),
+        (t / temperature).softmax(-1),
+        reduction="none",
+    ).sum(-1)
+    kd = (kl * text_mask).sum() / text_mask.sum().clamp_min(1) * temperature**2
+    sh = F.normalize(span.float(), dim=-1)
+    th = F.normalize(teacher_hidden.detach().float(), dim=-1)
+    hidden = ((sh - th).square().sum(-1) * text_mask).sum() / text_mask.sum().clamp_min(1)
+    return 0.5 * kd + 0.1 * hidden
 
 
 class Sys2MotJointLoss(BaseLoss):
@@ -155,44 +181,32 @@ class Sys2MotJointLoss(BaseLoss):
         self,
         pred: dict[str, torch.Tensor],
         logits: torch.Tensor,
+        teacher_logits: torch.Tensor | None,
+        teacher_hidden: torch.Tensor | None,
     ) -> torch.Tensor:
-        """Reference ``Distiller`` formulas on offline-precomputed teacher outputs.
+        """Reference ``Distiller`` formulas on runner-provided teacher outputs.
 
-        The real offline training step loads the teacher's logits and text-span
-        hidden from the precomputation pass and runs exactly this compute; the
-        capture stands in for the loaded tensors with deterministic synthetic
-        spans shaped to the student's (same input-synthesis pattern as the
-        flow targets). Only the student side carries gradients, and both terms
-        normalize over the all-valid capture text mask like the reference.
+        The offline training step's teacher logits and text-span hidden are
+        explicit loss inputs (the capture's runner supplies deterministic
+        stand-ins shaped to the student side); only the student side carries
+        gradients, and both terms normalize over the all-valid capture text
+        mask like the reference.
         """
-        device = logits.device
-        # Teacher logits keep a scale that exercises the softmax non-degenerately.
-        t_logits = _synthetic_span(logits.shape, 0.3, device) * 2.0
         span = pred["hidden"][:, self.text_offset :]
-        t_hidden = _synthetic_span(span.shape, 0.7, device)
-        text_mask = torch.ones(logits.shape[:2], device=device, dtype=torch.bool)
-        temperature = self.kd_temperature
-        s = logits.float()
-        t = t_logits.float()
-        kl = F.kl_div(
-            (s / temperature).log_softmax(-1),
-            (t / temperature).softmax(-1),
-            reduction="none",
-        ).sum(-1)
-        kd = (kl * text_mask).sum() / text_mask.sum().clamp_min(1) * temperature**2
-        sh = F.normalize(span.float(), dim=-1)
-        th = F.normalize(t_hidden.float(), dim=-1)
-        hidden = ((sh - th).square().sum(-1) * text_mask).sum() / text_mask.sum().clamp_min(1)
-        return 0.5 * kd + 0.1 * hidden
+        text_mask = torch.ones(logits.shape[:2], device=logits.device, dtype=torch.bool)
+        return _offline_teacher_terms(logits, span, teacher_logits, teacher_hidden, text_mask, self.kd_temperature)
 
     def __call__(
         self,
         pred: dict[str, torch.Tensor],
         labels: torch.Tensor,
         global_valid_tokens: torch.Tensor | None = None,
+        *,
+        teacher_logits: torch.Tensor | None = None,
+        teacher_hidden: torch.Tensor | None = None,
         **kwargs,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        del kwargs  # synthetic rows carry no extra loss inputs
+        del kwargs  # positions and other metadata carry no loss semantics
         velocity, indexer_aux = pred["velocity"], pred["indexer_aux"]
         _, actions, noise, _ = synthetic_action_batch(velocity.shape[0], self.action_dim, self.horizon, velocity.device)
         flow = F.mse_loss(velocity.float(), (noise - actions).float())
@@ -214,5 +228,5 @@ class Sys2MotJointLoss(BaseLoss):
         if self.distill:
             loss = loss + self._distill_terms(pred, logits)
         if self.distill_offline:
-            loss = loss + self._offline_distill_terms(pred, logits)
+            loss = loss + self._offline_distill_terms(pred, logits, teacher_logits, teacher_hidden)
         return loss, {}
