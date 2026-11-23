@@ -20,16 +20,22 @@ Layout facts this relies on (verified against torchtitan 0.3.0
 an ep group holds a different ``dp_shard`` token shard, which is exactly the
 token-distributed input the official head dispatch requires. The expert
 weights keep the default expert-parallel slicing (``Shard(0)`` on the expert
-axis, ``E_total/ep`` experts per rank); ``proj_in``/``proj_out`` weights
-become ep-replicated and ``router`` becomes ``Shard(0)`` on the ep axis.
-Those placement declarations live in ``sharding.py`` (the ``head_parallel``
-branch).
+axis, ``E_total/ep`` experts per rank); ``proj_in``/``proj_out`` weights and
+the ``router`` stay ep-replicated — ``sharding.py`` wires the same replicated
+placements for both flavors and has no ``head_parallel`` branch. The router
+therefore deviates from the official head-parallel design (``Shard(0)`` on
+the ep axis): this port declares it replicated (FSDP requires R on the
+data-parallel storage axes, and the ep axis overlaps ``dp_shard`` in the
+torchtitan mesh) and slices the owned-head range by ep rank at runtime inside
+``forward`` — a deliberate **R + runtime slice** arrangement, not a
+``Shard(0)`` placement.
 
 The class reuses the layer's built submodules (``proj_in`` / ``router`` /
 ``routed_experts`` / ``proj_out`` / ``shared_experts``); only the forward
 data path changes. The collectives mirror ``AllToAllTokenDispatcher``:
 ``functional_collectives.all_to_all_single`` with the ep ``DeviceMesh`` as
-group, or ``spmd_types`` ``all_to_all`` when that backend is active.
+group — the only collective backend this variant uses (no ``spmd_types``
+``all_to_all`` fallback).
 
 Limitations: token shards must be even across the ep group (the dispatch
 output reassembly ``view`` fails fast otherwise) and ``moe_heads`` must be
@@ -83,12 +89,18 @@ def _local(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.to_local() if isinstance(tensor, DTensor) else tensor
 
 
+def _local_or_none(tensor: torch.Tensor | None) -> torch.Tensor | None:
+    """None-safe ``_local`` for the optional ``Linear`` bias."""
+    return None if tensor is None else _local(tensor)
+
+
 class HeadParallelMultiHeadMoE(MultiHeadMoE):
     """Head-parallel rewrite of :class:`MultiHeadMoE.forward`.
 
-    The reference geometry is unchanged; owned-head ids are derived from the
-    local router shard (``Shard(0)`` on the ep axis), so the id formula is
-    shared with EP mode and only the local sizes differ.
+    The reference geometry is unchanged; owned-head ids come from the
+    replicated router parameter sliced to the ep rank's head range at runtime
+    (the R + runtime slice arrangement described in the module docstring), so
+    the id formula is shared with EP mode and only the local sizes differ.
     """
 
     @dataclasses.dataclass(kw_only=True, slots=True)
@@ -140,7 +152,9 @@ class HeadParallelMultiHeadMoE(MultiHeadMoE):
         x_TD = _local(x_BLD).reshape(tokens, D)
         w_in = _local(self.proj_in.weight)
         heads = w_in.shape[0] // self.head_hidden
-        x_TSH = F.linear(x_TD, w_in).view(tokens, heads, self.head_hidden)
+        # _local_or_none passes the optional Linear bias through untouched, so
+        # bias=True configurations stay equivalent to the default module call.
+        x_TSH = F.linear(x_TD, w_in, _local_or_none(self.proj_in.bias)).view(tokens, heads, self.head_hidden)
 
         # The gate router stays a replicated parameter (FSDP requires R on
         # the data-parallel storage axes, and the ep axis overlaps dp_shard
@@ -202,6 +216,6 @@ class HeadParallelMultiHeadMoE(MultiHeadMoE):
             moe_out_TSH = head_combine(moe_out_TSH, ep_mesh, tokens)
 
         w_out = _local(self.proj_out.weight)
-        moe_out_TD = F.linear(moe_out_TSH.reshape(tokens, -1), w_out)
+        moe_out_TD = F.linear(moe_out_TSH.reshape(tokens, -1), w_out, _local_or_none(self.proj_out.bias))
         out_TD = moe_out_TD + shared_out
         return out_TD.view(B, L, D)

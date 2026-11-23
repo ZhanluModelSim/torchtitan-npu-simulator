@@ -82,8 +82,11 @@ def set_multi_head_moe_sharding_config(config: "MultiHeadMoEModel.Config", *, en
 
 
 def _set_moe_layer_sharding(moe_cfg, *, enable_ep: bool) -> None:
-    moe_cfg.proj_in.sharding_config = _replicated_param_sharding("weight")
-    moe_cfg.proj_out.sharding_config = _replicated_param_sharding("weight")
+    # proj_in/proj_out are replicated in both flavors (the head-parallel path
+    # re-projects locally); the optional Linear bias is declared too so
+    # bias=True configurations distribute instead of failing state placement.
+    moe_cfg.proj_in.sharding_config = _replicated_param_sharding("weight", "bias")
+    moe_cfg.proj_out.sharding_config = _replicated_param_sharding("weight", "bias")
 
     (
         shared_config,

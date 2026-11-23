@@ -614,12 +614,18 @@ class MultiHeadMoEModel(Decoder):
 
             expert_parallel = parallelism.expert_parallel_degree
             if self.head_parallel and expert_parallel > 1:
-                moe_heads = next(layer.moe.moe_heads for layer in self.layers if layer.moe is not None)
-                if moe_heads % expert_parallel != 0:
-                    raise ValueError(
-                        f"head parallel requires expert_parallel_degree ({expert_parallel}) "
-                        f"to divide moe_heads ({moe_heads})"
-                    )
+                # Per-layer fail-fast: layers may carry different MoE
+                # geometries, and a later indivisible layer would otherwise
+                # only surface as a shape error at the first collective.
+                for layer_id, layer_cfg in enumerate(self.layers):
+                    if layer_cfg.moe is None:
+                        continue
+                    moe_heads = layer_cfg.moe.moe_heads
+                    if moe_heads % expert_parallel != 0:
+                        raise ValueError(
+                            f"head parallel requires expert_parallel_degree ({expert_parallel}) "
+                            f"to divide moe_heads ({moe_heads}) on MoE layer {layer_id}"
+                        )
             set_multi_head_moe_sharding_config(self, enable_ep=expert_parallel > 1)
             if self.head_parallel:
                 import dataclasses
