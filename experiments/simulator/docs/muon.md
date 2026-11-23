@@ -19,7 +19,7 @@ Python 入口为 `simulate(SimulationConfig(optimizer_name="Muon", world_size=8,
 
 当前支持 DSV4、TP=CP=PP=1 下的单卡、DP shard、HSDP、EP 及合法组合。小模型回归包含非零 logical rank、MTP、full AC 和激活卸载。Kimi、Muon 量化训练、HSDP replica dedup、原生 swap/virtual optimizer override 均明确拒绝。优化器状态卸载可用独立开关启用，采用下述整段聚合近似。
 
-Muon 在 EP=1 时若需要将实际参数存储 `Shard(1)` 转为 compute layout 的 `Shard(0)`，在模型并行化之后、构建优化器之前抛出 `ValueError`。报错包含参数 FQN、全局 shape、mesh 轴与大小，并建议使用 AdamW 或受支持的 EP/FSDP 配置；不实现该布局转换。检查依据实际 DTensor placement、原生参数分组和 compute layout，不按卡数一概拒绝。debug 模型有 4 个专家，EP=1、FSDP=2/4 仍通过，FSDP=8/16 提前拒绝；将专家数改为 8 后，EP=1、FSDP=8 的 `Shard(0)` 路径也通过。AdamW 和 EP>1 不受该规则影响。
+EP=1 时，FSDP 根据 DP mesh 选择专家权重的存储布局。分片轴大小为 1 时，每个副本都持有完整的专家矩阵。对于沿单个分片轴按行存储（`Shard(1)`）的三维专家权重，DistMuon 在同一分片组内通过 All-to-All 将数据重组为按专家分配的完整矩阵（`Shard(0)`），计算后再将更新方向送回原存储分片。HSDP 的复制轴保留。DistMuon 根据实际 DTensor 布局确定能否重分片。
 
 设置 `memory_offload_optimizer_states=True` 或添加 `--simulation.memory-offload-optimizer-states` 可启用整段 H2D／D2H 卸载近似。共同入口覆盖整个混合 optimizer step，包括 momentum 准备、原生 all-to-all、矩阵计算和 AdamW fallback；不包含梯度裁剪与 scheduler。两方向传输与原生工作 DAG 并行，出口共同等待，内部预取与缓冲复用依赖保持。该窗口不能只包围最终参数 `add_`。
 

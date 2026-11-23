@@ -19,7 +19,7 @@
 | MXFP8 | 显式 `enable_quantized_training` 和原生 `all_mxfp8` recipe；需要配套 TorchAO-NPU，不能从 preset 名称推断；保留实际 code/scale 与原生参数选择 | [test_s4_mxfp8.py](../tests/test_s4_mxfp8.py)、[test_kimi_quantization.py](../tests/test_kimi_quantization.py) |
 | AC 与 selective save-set | none/full/selective；选择项以 `selective_ac.py` 为准；未命中实际 comm cache 时 warning，不伪造命中 | [test_s3_native_lifetimes.py](../tests/test_s3_native_lifetimes.py)、[test_s4_mxfp8.py](../tests/test_s4_mxfp8.py) |
 | GBS／GA 与稳态捕获 | 默认先按 GA 预热一轮，再捕获单 microbatch F/B 与一次 O；scheduler 不参与预热；GA 时间展开由下游处理 | [test_warmup.py](../tests/test_warmup.py)、[结构预热](steady-state-capture.md) |
-| Muon 混合优化器 | DSV4，TP=CP=PP=1；原生 DistMuon＋AdamW、DP/HSDP/EP、矩阵计算和双向 all-to-all；EP=1 的 Shard(1)→Shard(0) 转换提前拒绝，合法 Shard(0) 路径保留；不执行真实 peer 计划哈希比较；拒绝量化、replica dedup、native swap/virtual；支持整段聚合状态卸载 | [Muon 捕获](muon.md)、[捕获测试](../tests/test_muon_capture.py)、[预取依赖测试](../tests/test_muon_dependencies.py) |
+| Muon 混合优化器 | DSV4，TP=CP=PP=1；原生 DistMuon＋AdamW、DP/HSDP/EP、矩阵计算和双向 all-to-all；EP=1 支持三维专家权重在单个分片轴上的 Shard(1)→Shard(0) 转换；不执行真实 peer 计划哈希比较；拒绝量化、replica dedup、native swap/virtual；支持整段聚合状态卸载 | [Muon 捕获](muon.md)、[捕获测试](../tests/test_muon_capture.py)、[预取依赖测试](../tests/test_muon_dependencies.py) |
 
 ## 并行、捕获与交付
 
