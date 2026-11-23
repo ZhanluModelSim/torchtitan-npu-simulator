@@ -323,7 +323,7 @@ def _isa_sparse_attention_meta(q, k, v, indices, bias, mask, scale, clamp_val, c
     devices = {t.device for t in (q, k, v, indices, bias, *(() if mask is None else (mask,)))}
     if len(devices) != 1:
         raise ValueError("ISA attention operands must share placement")
-    out = torch.empty_like(q)
+    out = torch.empty((q.shape[0], q.shape[1], q.shape[2], v.shape[-1]), dtype=q.dtype, device=q.device)
     lse = torch.empty((q.shape[0], q.shape[2], s), dtype=torch.float32, device=q.device)
     return out, lse
 
@@ -348,8 +348,10 @@ def isa_sparse_attention_grad(
 @isa_sparse_attention_grad.register_fake
 def _isa_sparse_attention_grad_meta(q, k, v, indices, bias, out, lse, dy, scale, clamp_val, compress_ratio):
     _isa_attention_geometry(q, k, v, indices, bias)
-    if out.shape != q.shape or out.dtype != q.dtype or dy.shape != q.shape or dy.dtype != q.dtype:
-        raise ValueError("ISA attention saved output and gradient must match the query")
+    # The output geometry follows the value width (qk/value head dims may differ).
+    expected_out = (q.shape[0], q.shape[1], q.shape[2], v.shape[-1])
+    if out.shape != expected_out or out.dtype != q.dtype or dy.shape != expected_out or dy.dtype != q.dtype:
+        raise ValueError("ISA attention saved output and gradient must match the value geometry")
     if lse.dtype != torch.float32 or lse.shape != (q.shape[0], q.shape[2], q.shape[1]):
         raise ValueError("ISA attention saved LSE must be B/H/S float32")
     devices = {t.device for t in (q, k, v, indices, bias, out, lse, dy)}

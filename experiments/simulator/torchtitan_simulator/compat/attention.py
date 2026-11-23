@@ -149,29 +149,76 @@ def install_meta_fusion_attention_autograd(scope):
 _NPU_FA_META_LIBRARY: torch.library.Library | None = None
 
 
-def _npu_fusion_attention_meta(query, key, value, head_num, input_layout, pse=None, padding_mask=None,
-                               atten_mask=None, scale=1.0, keep_prob=1.0, pre_tockens=0, next_tockens=0,
-                               inner_precise=0, prefix=None, actual_seq_qlen=None, actual_seq_kvlen=None,
-                               sparse_mode=0, gen_mask_parallel=True, sync=False, softmax_layout="",
-                               sink=None, dropout_mask=None, seed=0, offset=0):
+def _npu_fusion_attention_meta(
+    query,
+    key,
+    value,
+    head_num,
+    input_layout,
+    pse=None,
+    padding_mask=None,
+    atten_mask=None,
+    scale=1.0,
+    keep_prob=1.0,
+    pre_tockens=0,
+    next_tockens=0,
+    inner_precise=0,
+    prefix=None,
+    actual_seq_qlen=None,
+    actual_seq_kvlen=None,
+    sparse_mode=0,
+    gen_mask_parallel=True,
+    sync=False,
+    softmax_layout="",
+    sink=None,
+    dropout_mask=None,
+    seed=0,
+    offset=0,
+):
     batch, seq, heads, dim = query.shape
     out = torch.empty(batch, seq, heads, dim, dtype=query.dtype, device="meta")
     lse = torch.empty(batch, 1, heads, seq, dtype=torch.float32, device="meta")
     return out, lse, torch.empty(0, device="meta"), torch.empty(0, device="meta"), 0, 0, 0
 
 
-def _npu_fusion_attention_grad_meta(query, key, value, dy, head_num, input_layout, *,
-                                    pse=None, padding_mask=None, atten_mask=None, softmax_max=None,
-                                    softmax_sum=None, softmax_in=None, attention_in=None, scale_value=1.0,
-                                    keep_prob=1.0, pre_tockens=0, next_tockens=0, inner_precise=0,
-                                    seed=0, offset=0, numels=0, prefix=None, actual_seq_qlen=None,
-                                    actual_seq_kvlen=None, sparse_mode=0, gen_mask_parallel=True, sync=False,
-                                    softmax_layout="", sink=None):
-    shape = query.shape
+def _npu_fusion_attention_grad_meta(
+    query,
+    key,
+    value,
+    dy,
+    head_num,
+    input_layout,
+    *,
+    pse=None,
+    padding_mask=None,
+    atten_mask=None,
+    softmax_max=None,
+    softmax_sum=None,
+    softmax_in=None,
+    attention_in=None,
+    scale_value=1.0,
+    keep_prob=1.0,
+    pre_tockens=0,
+    next_tockens=0,
+    inner_precise=0,
+    seed=0,
+    offset=0,
+    numels=0,
+    prefix=None,
+    actual_seq_qlen=None,
+    actual_seq_kvlen=None,
+    sparse_mode=0,
+    gen_mask_parallel=True,
+    sync=False,
+    softmax_layout="",
+    sink=None,
+):
+    # Gradients mirror each operand's own geometry (GQA/MQA and differing KV
+    # widths included); equal-shape MHA calls are unchanged.
     return (
-        torch.empty(shape, dtype=query.dtype, device="meta"),
-        torch.empty(shape, dtype=query.dtype, device="meta"),
-        torch.empty(shape, dtype=query.dtype, device="meta"),
+        torch.empty(query.shape, dtype=query.dtype, device="meta"),
+        torch.empty(key.shape, dtype=key.dtype, device="meta"),
+        torch.empty(value.shape, dtype=value.dtype, device="meta"),
         torch.empty(0, device="meta"),
         torch.empty(0, device="meta"),
     )
@@ -230,7 +277,7 @@ def install_npu_fusion_attention_autograd(scope):
                 if output.requires_grad
                 else (None, None, None)
             )
-        except Exception:  # noqa: BLE001 - the vendor kernel may touch the device manager
+        except Exception:  # the vendor kernel may touch the device manager
             output, gradients = None, (None, None, None)
     if all(gradient is not None for gradient in gradients):
         return "native"

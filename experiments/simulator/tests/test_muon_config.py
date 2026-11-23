@@ -139,3 +139,12 @@ def test_native_muon_factory_rejects_replica_dedup(monkeypatch):
 def test_unsupported_optimizer_requests_fail_explicitly(options, message):
     with pytest.raises(ValueError, match=message):
         prepare_config(SimulationConfig(**options))
+
+
+def test_adamw_with_muon_ns_steps_rejected_at_prepare_not_validate():
+    """The public muon_ns_steps guard lives in _prepare_optimizer (final
+    selection); validate() must not unconditionally reject it."""
+    SimulationConfig(optimizer_name="Muon", muon_ns_steps=3).validate()
+    SimulationConfig(optimizer_name="AdamW", muon_ns_steps=3).validate()
+    with pytest.raises(ValueError, match="muon_ns_steps"):
+        prepare_config(SimulationConfig(optimizer_name="AdamW", muon_ns_steps=3))

@@ -633,7 +633,7 @@ class AlternatingAttention(Module):
 
     def forward(self, hidden_states, kv_bufs=None, attention_mask=None):
         if not self.is_isa:
-            return self.gdn2(hidden_states, attention_mask)  # pyrefly: ignore [missing-attribute]
+            return self.gdn2(hidden_states, attention_mask=attention_mask)  # pyrefly: ignore [missing-attribute]
 
         b, s, _ = hidden_states.shape
         buf = None if kv_bufs is None else kv_bufs[self.kv_group]

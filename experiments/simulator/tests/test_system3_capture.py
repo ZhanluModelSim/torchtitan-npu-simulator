@@ -12,6 +12,8 @@ from torchtitan_simulator.config import SimulationConfig
 from torchtitan_simulator.runner import simulate
 from torchtitan_simulator.validation import validate_workload
 
+from torchtitan_npu.models.system3.model import GDN2Attention
+
 # Debug-model geometry (torchtitan_npu.models.system3.config_registry, the
 # reference smoke_test config): hidden=128, vocab=512, 12 physical blocks
 # looped twice, [ISA, GDN2 x 3] units, 4 experts top-2 + 1 shared in a
@@ -269,3 +271,114 @@ def test_system3_preset_rejects_mtp_modules():
 
     with pytest.raises(ValueError, match="no MTP modules"):
         system3_debugmodel_text(num_mtp_layers=1)
+
+
+# ---------------------------------------------------------------------------
+# Review regressions (PR #24): mask propagation, virtual-op value geometry
+# and the shared fusion-attention fake contracts.
+# ---------------------------------------------------------------------------
+
+
+def _built_debugmodel():
+    from torchtitan_npu.models.system3.config_registry import system3_configs
+
+    return system3_configs["debugmodel_text"]().build()
+
+
+def test_gdn2_block_call_forwards_padding_mask():
+    """GDN2 layers own the block's attention slot directly; the uniform block
+    call must land the mask in GDN2Attention.attention_mask (not kv_bufs)."""
+    import torch
+
+    model = _built_debugmodel()
+    block = next(mod for name, mod in model.named_modules() if name.endswith("layers.2"))
+    gdn2 = block.attention
+    assert isinstance(gdn2, GDN2Attention)
+
+    captured = {}
+    original = gdn2.forward
+
+    def spy(hidden_states, kv_bufs=None, attention_mask=None):
+        captured["kv_bufs"] = kv_bufs
+        captured["attention_mask"] = attention_mask
+        return original(hidden_states, kv_bufs=kv_bufs, attention_mask=attention_mask)
+
+    gdn2.forward = spy
+    mask = torch.ones(2, 16, dtype=torch.bool)
+    block(torch.zeros(2, 16, 128), None, None, mask)
+    assert captured["attention_mask"] is mask
+    assert captured["kv_bufs"] is None
+
+
+def test_gdn2_delta_rule_scan_gates_state_writes_by_padding_mask():
+    """Leading padding must not write the delta-rule state: with the mask,
+    valid-position reads equal the outputs of the truncated sequence; without
+    it, the garbage writes pollute the state and the reads drift."""
+    import torch
+
+    model = _built_debugmodel()
+    gdn2 = next(mod for name, mod in model.named_modules() if name.endswith("layers.1.attention"))
+
+    torch.manual_seed(3)
+    b, s, lead = 1, 16, 4
+    hidden = torch.randn(b, s, 128)
+    mask = torch.ones(b, s, dtype=torch.bool)
+    mask[:, :lead] = False
+
+    def scan(sequence_length, sequence_mask):
+        h = hidden[:, s - sequence_length :]
+        q = gdn2.q_proj(h).view(b, sequence_length, gdn2.H, gdn2.d_k)
+        k = gdn2.k_proj(h).view(b, sequence_length, gdn2.H, gdn2.d_k)
+        v = gdn2.v_proj(h).view(b, sequence_length, gdn2.H, gdn2.d_v)
+        alpha = torch.sigmoid(gdn2.alpha_gate(h).view(b, sequence_length, gdn2.H, gdn2.d_k))
+        beta = gdn2.beta_gate(h).view(b, sequence_length, 2, gdn2.H, gdn2.d_state)
+        da = torch.sigmoid(gdn2.da_norm(gdn2.da_proj(h)).view(b, sequence_length, gdn2.H, gdn2.d_a).mean(dim=-1))
+        return gdn2._delta_rule_scan(q, k, v, alpha, beta[:, :, 0], beta[:, :, 1], da, sequence_mask)
+
+    truncated = scan(s - lead, None)
+    masked = scan(s, mask)
+    unmasked = scan(s, None)
+
+    assert torch.equal(masked[:, lead:], truncated)
+    assert not torch.equal(unmasked[:, lead:], truncated)
+
+
+def test_isa_sparse_attention_meta_output_follows_value_width():
+    """The selected-key attention boundary declares value_head_dim outputs;
+    the fake must allocate (b, s, heads, v_width), not the query width."""
+    import torch
+    from torchtitan_simulator.compat.system3_fusions import _isa_sparse_attention_meta
+
+    b, s, heads, qk, value = 1, 8, 2, 8, 16
+    q = torch.empty(b, s, heads, qk, dtype=torch.bfloat16, device="meta")
+    k = torch.empty(b, s // 2, heads, qk, dtype=torch.bfloat16, device="meta")
+    v = torch.empty(b, s // 2, heads, value, dtype=torch.bfloat16, device="meta")
+    indices = torch.zeros(b, s, 4, dtype=torch.int64, device="meta")
+    bias = torch.zeros(b, s, 4, dtype=torch.bfloat16, device="meta")
+
+    out, lse = _isa_sparse_attention_meta(q, k, v, indices, bias, None, 0.25, 50.0, 2)
+    assert out.shape == (b, s, heads, value)
+    assert lse.shape == (b, heads, s)
+
+
+def test_fusion_attention_grad_meta_follows_operand_geometry():
+    """The shared BSND fusion-attention backward fake must mirror each
+    operand's own shape (GQA heads / differing widths), not the query shape."""
+    import torch
+    from torchtitan_simulator.compat.attention import (
+        _npu_fusion_attention_grad_meta,
+        _npu_fusion_attention_meta,
+    )
+
+    q = torch.empty(1, 8, 4, 16, dtype=torch.bfloat16, device="meta")
+    k = torch.empty(1, 8, 2, 16, dtype=torch.bfloat16, device="meta")
+    v = torch.empty(1, 8, 2, 32, dtype=torch.bfloat16, device="meta")
+    dy = torch.empty(1, 8, 4, 16, dtype=torch.bfloat16, device="meta")
+
+    out = _npu_fusion_attention_meta(q, k, v, 4, "BSND")[0]
+    assert out.shape == q.shape
+
+    dq, dk, dv = _npu_fusion_attention_grad_meta(q, k, v, dy, 4, "BSND")[:3]
+    assert dq.shape == q.shape
+    assert dk.shape == k.shape
+    assert dv.shape == v.shape
