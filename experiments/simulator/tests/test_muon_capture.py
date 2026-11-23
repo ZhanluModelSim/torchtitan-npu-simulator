@@ -132,7 +132,7 @@ def test_ep1_split_expert_matrix_is_rejected_before_optimizer_construction(monke
     monkeypatch.setattr(OptimizersContainer, "__init__", unexpected_optimizer_construction)
     with pytest.raises(ValueError, match=r"Muon with EP=1 does not support Shard\(1\) expert storage") as error:
         simulate(SimulationConfig(optimizer_name="Muon", world_size=world_size))
-    assert f"FSDP shard degree {world_size} exceeds num_experts 4" in str(error.value)
+    assert f"DP mesh size {world_size} exceeds num_experts 4" in str(error.value)
 
 
 def test_ep1_layout_guard_uses_actual_geometry_and_preserves_adamw():

@@ -203,27 +203,21 @@ def _validate_muon_ep1_expert_shard(simulation: SimulationConfig, trainer: Any) 
     """Reject EP=1 Muon layouts whose expert storage would be Shard(1).
 
     The NPU FSDP extension switches routed experts to ``Shard(1)`` once the
-    FSDP shard degree exceeds the expert count. Muon then needs an unsupported
+    FSDP DP mesh size exceeds the expert count. Muon then needs an unsupported
     ``Shard(1) -> Shard(0)`` storage-to-compute redistribution, so fail before
     any model, mesh or optimizer state is built. EP=1 layouts whose storage is
     already on dim 0 stay supported, as does any EP>1 configuration.
     """
     if simulation.expert_parallel_degree != 1:
         return
-    fixed = (
-        simulation.data_parallel_replicate_degree
-        * simulation.tensor_parallel_degree
-        * simulation.context_parallel_degree
-    )
-    shard = simulation.data_parallel_shard_degree
-    if shard == -1:
-        shard = simulation.world_size // fixed
+    # With TP=CP=PP=1, the full DP mesh (replicate × shard) spans the world.
+    dp_mesh_size = simulation.world_size
     num_experts = trainer.model_spec.model.layers[0].moe.num_experts
-    if shard > num_experts:
+    if dp_mesh_size > num_experts:
         raise ValueError(
-            "Muon with EP=1 does not support Shard(1) expert storage: FSDP shard degree "
-            f"{shard} exceeds num_experts {num_experts}. Use a larger expert count, a "
-            "smaller DP shard degree, EP>1, or AdamW; EP=1 layouts with storage already "
+            "Muon with EP=1 does not support Shard(1) expert storage: DP mesh size "
+            f"{dp_mesh_size} exceeds num_experts {num_experts}. Use a larger expert count, a "
+            "smaller DP mesh, EP>1, or AdamW; EP=1 layouts with storage already "
             "on dim 0 remain supported."
         )
 

@@ -141,10 +141,22 @@ def test_unsupported_optimizer_requests_fail_explicitly(options, message):
         prepare_config(SimulationConfig(**options))
 
 
-def test_muon_ep1_rejects_fsdp_shard_degree_above_expert_count():
-    # debugmodel has 4 routed experts; EP=1/FSDP=8 would store them as Shard(1).
-    with pytest.raises(ValueError, match="does not support Shard\\(1\\) expert storage"):
-        prepare_config(SimulationConfig(optimizer_name="Muon", world_size=8))
+@pytest.mark.parametrize(
+    "replicate_degree, shard_degree",
+    [(1, -1), (2, 4)],
+    ids=["fsdp", "hsdp"],
+)
+def test_muon_ep1_rejects_dp_mesh_size_above_expert_count(replicate_degree, shard_degree):
+    # The debug recipe has 4 routed experts. Both configurations use an 8-rank DP mesh.
+    with pytest.raises(ValueError, match=r"does not support Shard\(1\) expert storage.*size 8 exceeds num_experts 4"):
+        prepare_config(
+            SimulationConfig(
+                optimizer_name="Muon",
+                world_size=8,
+                data_parallel_replicate_degree=replicate_degree,
+                data_parallel_shard_degree=shard_degree,
+            )
+        )
 
 
 @pytest.mark.parametrize(
