@@ -229,3 +229,15 @@ def test_sys2mot_student30b_full_geometry_validates():
     assert all(
         0 <= i < geometry.layers for i in (*geometry.kv_sources, *geometry.index_sources, geometry.candidate_source)
     )
+
+
+def test_sys2mot_student300b_full_geometry_validates():
+    """The 300b flavor is a pure expert/memory delta over student30b (reference replace pattern)."""
+    from torchtitan_npu.models.sys2mot.config_registry import _GeometryStudent30b, _GeometryStudent300b
+
+    geometry = _GeometryStudent300b()
+    geometry.validate()
+    assert geometry.experts == 224 and geometry.expert_dim == 2048
+    assert geometry.engram_buckets == 668673
+    for field in ("layers", "kv_sources", "index_sources", "compress_ratios", "engram_layers"):
+        assert getattr(geometry, field) == getattr(_GeometryStudent30b(), field)

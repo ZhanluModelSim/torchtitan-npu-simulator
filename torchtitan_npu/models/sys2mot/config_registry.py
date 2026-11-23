@@ -270,10 +270,24 @@ class _GeometryStudent30b(_Geometry):
     action_mlp: int = 4096
 
 
+@dataclass(frozen=True)
+class _GeometryStudent300b(_GeometryStudent30b):
+    """The reference ``student300b`` production flavor: the same 40-layer
+    schedule with the 300b expert and memory flavor (224 routed experts,
+    expert_dim 2048, Engram buckets calibrated to 668,673 by the reference's
+    meta probe). Pure geometry delta over ``student30b`` — same structural
+    paths, same layer count."""
+
+    experts: int = 224
+    expert_dim: int = 2048
+    engram_buckets: int = 668673
+
+
 sys2mot_configs = {
     "debugmodel_multimodal": lambda: _make_model_config(g=_Geometry()),
     "mid_multimodal": lambda: _make_model_config(g=_GeometryMid()),
     "student30b_multimodal": lambda: _make_model_config(g=_GeometryStudent30b()),
+    "student300b_multimodal": lambda: _make_model_config(g=_GeometryStudent300b()),
 }
 
 
@@ -623,9 +637,14 @@ def sys2mot_student30b_multimodal(*, num_mtp_layers: int = 0) -> Trainer.Config:
     return _sys2mot_trainer_config("student30b_multimodal", num_mtp_layers=num_mtp_layers, seq_len=200)
 
 
+def sys2mot_student300b_multimodal(*, num_mtp_layers: int = 0) -> Trainer.Config:
+    return _sys2mot_trainer_config("student300b_multimodal", num_mtp_layers=num_mtp_layers, seq_len=200)
+
+
 __all__ = [
     "model_registry",
     "sys2mot_debugmodel_multimodal",
     "sys2mot_mid_multimodal",
     "sys2mot_student30b_multimodal",
+    "sys2mot_student300b_multimodal",
 ]
