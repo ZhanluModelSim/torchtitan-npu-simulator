@@ -234,13 +234,6 @@ def _simulate(simulation, timings: HostTimings):
                     # own budget; device-byte reconciliation excludes them.
                     "residency": "host" if getattr(parameter, "_engram_host_offload", False) else "device",
                 }
-            from torchtitan_simulator.compat.muon import validate_muon_layouts
-
-            validate_muon_layouts(
-                config.optimizer,
-                logical_named_parameters(model),
-                expert_parallel_degree=simulation.expert_parallel_degree,
-            )
             runtime.capabilities.update(
                 install_balanced_dispatch(
                     runtime.patches,

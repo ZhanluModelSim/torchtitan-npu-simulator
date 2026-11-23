@@ -122,20 +122,39 @@ def test_muon_meta_adaptation_restores_after_exception():
     )
 
 
-@pytest.mark.parametrize("world_size", [8, 16])
-def test_ep1_split_expert_matrix_is_rejected_before_optimizer_construction(monkeypatch, world_size):
-    from torchtitan.components.optimizer import OptimizersContainer
+@pytest.mark.parametrize(
+    "replicate_degree, shard_degree, expected_rows",
+    [(8, 1, 256), (1, 8, 32), (2, 4, 64), (1, 16, 16)],
+    ids=["pure-replication", "fsdp", "hsdp", "fsdp16"],
+)
+def test_ep1_muon_captures_expert_updates_with_native_storage(replicate_degree, shard_degree, expected_rows):
+    workload = simulate(
+        SimulationConfig(
+            optimizer_name="Muon",
+            muon_ns_steps=2,
+            world_size=replicate_degree * shard_degree,
+            data_parallel_replicate_degree=replicate_degree,
+            data_parallel_shard_degree=shard_degree,
+        )
+    )
+    assert validate_workload(workload)["graph_acyclic"]
+    expert = "layers.0.moe.routed_experts.inner_experts.w1_EFD"
+    layout = workload.iteration.schedule.annotations["parameter_layouts"][expert]
+    assert layout["original_shape"] == (4, 256, 256)
+    assert layout["local_shape"] == (4, expected_rows, 256)
 
-    def unexpected_optimizer_construction(*args, **kwargs):
-        pytest.fail("Unsupported Muon layout must be rejected before constructing the native optimizer")
+    nodes = workload.step_templates["s0_OPTIMIZER"].nodes.values()
+    assert any(
+        node.annotations.get("optimizer_algorithm") == "DistMuon"
+        and expert in node.annotations.get("optimizer_updated_parameter_names", ())
+        for node in nodes
+    )
+    counts = Counter(node.annotations["raw_op_type"] for node in nodes)
+    assert counts["aten.bmm.default"] > 0
+    assert (counts["c10d.alltoall_base_.default"] > 0) == (shard_degree > 1)
 
-    monkeypatch.setattr(OptimizersContainer, "__init__", unexpected_optimizer_construction)
-    with pytest.raises(ValueError, match=r"Muon with EP=1 does not support Shard\(1\) expert storage") as error:
-        simulate(SimulationConfig(optimizer_name="Muon", world_size=world_size))
-    assert f"DP mesh size {world_size} exceeds num_experts 4" in str(error.value)
 
-
-def test_ep1_layout_guard_uses_actual_geometry_and_preserves_adamw():
+def test_ep1_expert_storage_follows_expert_count_and_optimizer():
     from torchtitan_simulator.model_overrides import ModelOverrides, MoEOverrides
 
     # Eight experts keep whole matrices on eight FSDP shards; world size alone

@@ -451,11 +451,29 @@ def _resolve_storage_to_compute_transition(
             mesh_axis_size=param.device_mesh.size(redistribution_storage_mesh_axis),
         )
         target_sharding = normalized_target_sharding_by_storage_mesh_axis[redistribution_storage_mesh_axis]
+        # Without EP, ordinary FSDP can still store expert matrices as row
+        # shards. The same region planner can redistribute them to whole
+        # experts; no cross-axis shard-order lowering is needed in this case.
+        uses_supported_single_axis_shard_redistribution = (
+            param.ndim == 3
+            and compute_view is None
+            and global_compute_shape == param.shape
+            and type(source_sharding) is Shard
+            and source_sharding.dim == 1
+            and type(target_sharding) is Shard
+            and target_sharding.dim == 0
+            and all(
+                param.device_mesh.size(axis) == 1 or type(placement) is Replicate
+                for axis, placement in enumerate(param.placements)
+                if axis != redistribution_storage_mesh_axis
+            )
+        )
         if (
             type(source_sharding) is not Replicate
             and type(target_sharding) is not BlockShard
             and source_sharding != target_sharding
             and not uses_supported_orthogonal_shard_redistribution
+            and not uses_supported_single_axis_shard_redistribution
         ):
             axis_name = mesh_axis_names[redistribution_storage_mesh_axis]
             raise NotImplementedError(

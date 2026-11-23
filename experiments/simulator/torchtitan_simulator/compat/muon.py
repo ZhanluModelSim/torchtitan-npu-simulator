@@ -5,50 +5,12 @@
 
 """Scoped Meta admission for native DistMuon, without replacing its execution."""
 
-import re
-from collections.abc import Iterable
 from functools import wraps
-from typing import Any
 
 import torch
-from torch.distributed.tensor import DTensor, Shard
+from torch.distributed.tensor import DTensor
 
 from torchtitan_simulator.capture.optimizer import capture_parameter_update
-
-
-def validate_muon_layouts(
-    optimizer: Any, named_parameters: Iterable[tuple[str, torch.Tensor]], *, expert_parallel_degree: int
-) -> None:
-    """Reject the unsupported EP=1 transition before building any optimizer state."""
-    if expert_parallel_degree != 1:
-        return
-    layouts = optimizer.optimizer_factory_kwargs_by_name.get("DistMuon", {}).get("compute_sharding_by_fqn", {})
-    if not layouts:
-        return
-    for name, parameter in named_parameters:
-        if not parameter.requires_grad or not isinstance(parameter, DTensor):
-            continue
-        owner = next((group for group in optimizer.param_groups if re.search(group.pattern, name)), None)
-        if owner is None or owner.optimizer_name != "DistMuon" or name not in layouts:
-            continue
-        mesh = parameter.device_mesh
-        assert mesh.mesh_dim_names is not None
-        for index, (axis, source) in enumerate(zip(mesh.mesh_dim_names, parameter.placements, strict=True)):
-            target = layouts[name].shardings_by_mesh_axis.get(axis)
-            if (
-                mesh.size(index) > 1
-                and isinstance(source, Shard)
-                and source.dim == 1
-                and type(target) is Shard
-                and target.dim == 0
-            ):
-                raise ValueError(
-                    f"Muon with EP=1 does not support Shard(1) -> Shard(0): parameter {name!r}, "
-                    f"shape={tuple(parameter.shape)}, mesh axis={axis!r}, size={mesh.size(index)}. "
-                    "The native FSDP storage layout splits each expert matrix, but Muon requires "
-                    "complete matrices sharded along the expert axis. Use AdamW or a supported "
-                    "EP/FSDP configuration; EP=1 layouts already using Shard(0) remain supported."
-                )
 
 
 def install_meta_muon(scope) -> dict[str, str]:
