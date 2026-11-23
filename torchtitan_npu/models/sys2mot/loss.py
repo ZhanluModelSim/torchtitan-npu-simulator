@@ -66,6 +66,8 @@ def _offline_teacher_terms(
         raise ValueError(
             f"teacher_hidden shape {tuple(teacher_hidden.shape)} != student hidden span {tuple(span.shape)}"
         )
+    if tuple(text_mask.shape) != tuple(logits.shape[:2]) or text_mask.dtype != torch.bool:
+        raise ValueError(f"text_mask must be bool {tuple(logits.shape[:2])}, got {tuple(text_mask.shape)}")
     s = logits.float()
     t = teacher_logits.detach().float()
     kl = F.kl_div(
@@ -188,12 +190,18 @@ class Sys2MotJointLoss(BaseLoss):
 
         The offline training step's teacher logits and text-span hidden are
         explicit loss inputs (the capture's runner supplies deterministic
-        stand-ins shaped to the student side); only the student side carries
-        gradients, and both terms normalize over the all-valid capture text
-        mask like the reference.
+        stand-ins shaped to the student side); the text mask comes from the
+        model output so padding/invalid text positions are excluded from the
+        KL and hidden terms and from their denominators, matching the
+        reference semantics. Only the student side carries gradients.
         """
+        text_mask = pred.get("distill_text_mask")
+        if text_mask is None:
+            raise ValueError(
+                "distill_offline requires the model's distill_text_mask output; a silent "
+                "all-valid mask would mis-normalize real offline batches with padding"
+            )
         span = pred["hidden"][:, self.text_offset :]
-        text_mask = torch.ones(logits.shape[:2], device=logits.device, dtype=torch.bool)
         return _offline_teacher_terms(logits, span, teacher_logits, teacher_hidden, text_mask, self.kd_temperature)
 
     def __call__(

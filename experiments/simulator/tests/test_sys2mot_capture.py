@@ -241,3 +241,121 @@ def test_sys2mot_student300b_full_geometry_validates():
     assert geometry.engram_buckets == 668673
     for field in ("layers", "kv_sources", "index_sources", "compress_ratios", "engram_layers"):
         assert getattr(geometry, field) == getattr(_GeometryStudent30b(), field)
+
+
+def test_sys2mot_offline_distill_terms_normalize_over_text_mask():
+    """Offline KD/hidden exclude invalid text positions and their denominators."""
+    import torch
+    import torch.nn.functional as F
+
+    from torchtitan_npu.models.sys2mot.loss import _offline_teacher_terms
+
+    logits = torch.randn(2, 6, 8, dtype=torch.float32)
+    span = torch.randn(2, 6, 5, dtype=torch.float32)
+    teacher_logits = torch.randn(2, 6, 8, dtype=torch.float32)
+    teacher_hidden = torch.randn(2, 6, 5, dtype=torch.float32)
+    mask = torch.ones(2, 6, dtype=torch.bool)
+    mask[0, 5] = False
+    mask[1, 3] = False
+
+    loss = _offline_teacher_terms(logits, span, teacher_logits, teacher_hidden, mask, 2.0)
+
+    temperature = 2.0
+    kl = F.kl_div(
+        (logits.float() / temperature).log_softmax(-1),
+        (teacher_logits.float() / temperature).softmax(-1),
+        reduction="none",
+    ).sum(-1)
+    expected_kd = (kl * mask).sum() / mask.sum().clamp_min(1) * temperature**2
+    expected_hidden = (
+        (F.normalize(span.float(), dim=-1) - F.normalize(teacher_hidden.float(), dim=-1)).square().sum(-1) * mask
+    ).sum() / mask.sum().clamp_min(1)
+    assert torch.isclose(loss, 0.5 * expected_kd + 0.1 * expected_hidden)
+    # Invalid positions genuinely change the normalization: the same tensors
+    # under an all-valid mask produce a different value.
+    all_valid = _offline_teacher_terms(logits, span, teacher_logits, teacher_hidden, torch.ones_like(mask), 2.0)
+    assert not torch.isclose(loss, all_valid)
+    with pytest.raises(ValueError, match="text_mask"):
+        _offline_teacher_terms(logits, span, teacher_logits, teacher_hidden, mask[0], 2.0)
+
+
+def test_sys2mot_offline_loss_requires_model_text_mask_output():
+    """The offline loss refuses to synthesize an all-valid mask silently."""
+    from types import SimpleNamespace
+
+    import torch
+
+    from torchtitan_npu.models.sys2mot.loss import Sys2MotJointLoss
+
+    config = SimpleNamespace(
+        text_offset=4,
+        action_dim=2,
+        horizon=4,
+        ce_weight=0.1,
+        indexer_weight=0.01,
+        distill=False,
+        distill_offline=True,
+    )
+    loss = Sys2MotJointLoss(config)
+    logits = torch.randn(1, 6, 8, dtype=torch.float32)
+    pred = {"hidden": torch.randn(1, 10, 4, dtype=torch.float32)}
+    with pytest.raises(ValueError, match="distill_text_mask"):
+        loss._offline_distill_terms(pred, logits, torch.randn(1, 6, 8), torch.randn(1, 6, 4))
+
+
+def test_sys2mot_step_rejects_non_tensor_extra_loss_inputs():
+    import torch
+    from torchtitan_simulator.step import run_simulation_step
+
+    with pytest.raises(TypeError, match="extra loss input"):
+        run_simulation_step(
+            model_parts=[],
+            parallel_dims=None,
+            forward_backward_step=lambda **_: None,
+            input_dict={},
+            labels=torch.zeros(1, dtype=torch.int64),
+            extra_loss_inputs={"teacher_logits": "not-a-tensor"},
+            optimizer_step=lambda: None,
+            lr_scheduler_step=lambda: None,
+            local_batch_size=1,
+            seq_len=1,
+        )
+
+
+def test_sys2mot_offline_teacher_inputs_registered_as_initial_memory():
+    """Teacher logits/hidden join initial memory with full contiguous storage.
+
+    The offline step's teacher outputs predate the first op: the estimator
+    must see their step-start residency (bytes and lifecycle), not infer an
+    external-input lifecycle at their first KD consumption.
+    """
+    from torchtitan_npu.models.sys2mot.config_registry import _Geometry
+
+    geometry = _Geometry()
+    teacher_shapes = {(1, 100, geometry.vocab_size), (1, 100, geometry.width)}
+    workload = simulate(SimulationConfig(config="sys2mot_debugmodel_multimodal", seq_len=100))
+    plan = workload.iteration.schedule.annotations["memory_plan"]
+    teacher_refs = [r for r in plan.initial_tensors if r.shape in teacher_shapes and r.dtype == "float32"]
+    assert {r.shape for r in teacher_refs} == teacher_shapes
+    assert sum(r.num_bytes for r in teacher_refs) == 100 * (geometry.vocab_size + geometry.width) * 4
+    # Full contiguous storages: a stride-0 expand view would carry a tiny
+    # underlying storage and under-report the loaded input bytes.
+    assert all(r.storage_bytes == r.num_bytes for r in teacher_refs)
+    teacher_ref_ids = {r.tensor_id for r in teacher_refs}
+    teacher_lifetimes = [
+        lt
+        for lt in plan.tensor_lifetimes
+        if lt.kind == "external_input"
+        and lt.shape in teacher_shapes
+        and lt.dtype == "float32"
+        and int(lt.tensor_id.split(":", 1)[1]) in teacher_ref_ids
+    ]
+    assert len(teacher_lifetimes) == 2
+    for lifetime in teacher_lifetimes:
+        # Resident from before the first op (not born at the first KD op).
+        assert lifetime.birth_seq < 0
+        assert lifetime.resident_num_bytes == lifetime.num_bytes
+        # Consumed by the KD/hidden math like any loaded offline input, and
+        # resident through that consumption.
+        assert lifetime.consumer_ops and lifetime.consumer_seqs
+        assert lifetime.death_seq >= max(lifetime.consumer_seqs)

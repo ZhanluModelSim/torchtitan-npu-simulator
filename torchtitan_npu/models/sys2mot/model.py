@@ -86,11 +86,10 @@ from torchtitan.distributed.spmd_types import maybe_set_sparse_mesh
 from torchtitan.models.common.decoder import Decoder
 from torchtitan.models.common.decoder_sharding import dense_param_placement
 from torchtitan.models.common.embedding import Embedding
-from torchtitan.protocols.module import ModuleList
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.nn_modules import Conv2d
 from torchtitan.models.common.token_dispatcher import LocalTokenDispatcher
-from torchtitan.protocols.module import Module
+from torchtitan.protocols.module import Module, ModuleList
 from torchtitan.protocols.sharding import ShardingConfig
 
 __all__ = [
@@ -1515,12 +1514,14 @@ class Sys2MotModel(Decoder):
                 "hidden": features["hidden"],
                 "indexer_aux": features["indexer_aux"],
                 "encoder_hidden": encoder_hidden,
+                "distill_text_mask": text_mask,
             }
         return {
             "velocity": velocity,
             "logits": self.lm_head(features["hidden"][:, visual_tokens:]),
             "indexer_aux": features["indexer_aux"],
             "encoder_hidden": encoder_hidden,
+            "distill_text_mask": text_mask,
         }
 
     # ------------------------------------------------------------------

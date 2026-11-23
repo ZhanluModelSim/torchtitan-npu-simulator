@@ -349,17 +349,16 @@ def _simulate(simulation, timings: HostTimings):
             # shaped to the student side; building them HERE keeps the
             # synthesis outside the captured graph, so the step matches a real
             # offline training step (KD/hidden math on loaded tensors only).
+            # Full contiguous Meta storages -- NOT stride-0 expand views: the
+            # step registers these as initial-memory inputs, and a stride-0
+            # view's underlying storage would misreport the loaded input bytes.
             teacher_loss_inputs: dict[str, torch.Tensor] = {}
             if getattr(config.loss, "distill_offline", False):
-                ramp = torch.arange(seq_len, dtype=torch.float32) * 0.01
-                teacher_loss_inputs["teacher_logits"] = (
-                    (0.3 + ramp)
-                    .view(1, seq_len, 1)
-                    .expand(batch_size, seq_len, config.model_spec.model.vocab_size)
-                    .to("meta")
+                teacher_loss_inputs["teacher_logits"] = torch.zeros(
+                    (batch_size, seq_len, config.model_spec.model.vocab_size), dtype=torch.float32, device="meta"
                 )
-                teacher_loss_inputs["teacher_hidden"] = (
-                    (0.7 + ramp).view(1, seq_len, 1).expand(batch_size, seq_len, config.model_spec.model.dim).to("meta")
+                teacher_loss_inputs["teacher_hidden"] = torch.zeros(
+                    (batch_size, seq_len, config.model_spec.model.dim), dtype=torch.float32, device="meta"
                 )
             gradient_manifest = {}
             dense_gradient_exemptions = set()
@@ -460,6 +459,7 @@ def _simulate(simulation, timings: HostTimings):
                     forward_backward_step=forward_backward,
                     input_dict=inputs,
                     labels=labels,
+                    extra_loss_inputs=teacher_loss_inputs or None,
                     optimizer_step=optimizers.step,
                     optimizer_zero_grad=optimizers.zero_grad,
                     lr_scheduler_step=scheduler.step,
