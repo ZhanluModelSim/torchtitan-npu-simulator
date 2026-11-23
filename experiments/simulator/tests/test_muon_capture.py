@@ -124,15 +124,15 @@ def test_muon_meta_adaptation_restores_after_exception():
 
 @pytest.mark.parametrize(
     "replicate_degree, shard_degree, expected_rows",
-    [(8, 1, 256), (1, 8, 32), (2, 4, 64)],
-    ids=["pure-replication", "fsdp", "hsdp"],
+    [(8, 1, 256), (1, 8, 32), (2, 4, 64), (1, 16, 16)],
+    ids=["pure-replication", "fsdp", "hsdp", "fsdp16"],
 )
 def test_ep1_muon_captures_expert_updates_with_native_storage(replicate_degree, shard_degree, expected_rows):
     workload = simulate(
         SimulationConfig(
             optimizer_name="Muon",
             muon_ns_steps=2,
-            world_size=8,
+            world_size=replicate_degree * shard_degree,
             data_parallel_replicate_degree=replicate_degree,
             data_parallel_shard_degree=shard_degree,
         )
