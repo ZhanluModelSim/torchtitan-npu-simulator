@@ -71,8 +71,15 @@ def _snapshot_parameters(
     parameter_storage_dtype: str | None = None,
     *,
     counted_device_type: str = "",
-) -> tuple[list[TensorLifetime], set[int], list[MissingParameterGradient], list[ParameterTensorMetadata]]:
+) -> tuple[
+    list[TensorLifetime],
+    set[int],
+    list[MissingParameterGradient],
+    list[ParameterTensorMetadata],
+    list[TensorLifetime],
+]:
     lifetimes: list[TensorLifetime] = []
+    host_lifetimes: list[TensorLifetime] = []
     seen_params: set[int] = set()
     param_ids: set[int] = set()
     missing_gradients: list[MissingParameterGradient] = []
@@ -86,6 +93,10 @@ def _snapshot_parameters(
             tensor = _to_local_tensor(param)
             if tensor is None or (counted_device_type and tensor.device.type != counted_device_type):
                 continue
+            # Host-resident parameters (for example the DeepSeek-V4.1 Engram
+            # CPU tables) report their own budget and never inflate the
+            # counted device bytes, mirroring production residency.
+            host_resident = bool(getattr(param, "_engram_host_offload", False))
             tid = id(tensor)
             param_ids.add(tid)
             dtype = dtype_to_str(tensor.dtype)
@@ -94,29 +105,28 @@ def _snapshot_parameters(
             modeled_num_bytes = (
                 tensor_volume_bytes(shape, parameter_storage_dtype) if parameter_storage_dtype is not None else None
             )
-            lifetimes.append(
-                TensorLifetime(
-                    tensor_id=f"param:{part_idx}:{name}",
-                    kind="parameter_shard",
-                    num_bytes=num_bytes,
-                    birth_seq=-1,
-                    death_seq=-1,
-                    producer_op=-1,
-                    producer_raw_op="model_parameter",
-                    producer_phase="init",
-                    shape=shape,
-                    dtype=dtype,
-                    modeled_num_bytes=modeled_num_bytes,
-                    modeled_dtype=parameter_storage_dtype or "",
-                    residency_policy=(
-                        "dtype_override"
-                        if parameter_storage_dtype is not None and parameter_storage_dtype != dtype
-                        else "resident"
-                    ),
-                    reason="persistent_param",
-                    storage_key=str(tensor.untyped_storage()._cdata),
-                )
+            lifetime = TensorLifetime(
+                tensor_id=f"param:{part_idx}:{name}",
+                kind="host_parameter" if host_resident else "parameter_shard",
+                num_bytes=num_bytes,
+                birth_seq=-1,
+                death_seq=-1,
+                producer_op=-1,
+                producer_raw_op="model_parameter",
+                producer_phase="init",
+                shape=shape,
+                dtype=dtype,
+                modeled_num_bytes=modeled_num_bytes,
+                modeled_dtype=parameter_storage_dtype or "",
+                residency_policy=(
+                    "dtype_override"
+                    if parameter_storage_dtype is not None and parameter_storage_dtype != dtype
+                    else "resident"
+                ),
+                reason="host_offload_param" if host_resident else "persistent_param",
+                storage_key=str(tensor.untyped_storage()._cdata),
             )
+            (host_lifetimes if host_resident else lifetimes).append(lifetime)
             parameter_tensors.append(
                 ParameterTensorMetadata(
                     name=f"{part_idx}:{name}",
@@ -127,6 +137,11 @@ def _snapshot_parameters(
                 )
             )
             if param.requires_grad and getattr(param, "grad", None) is None:
+                if host_resident:
+                    # Host-offload sparse tables are exempt from the dense
+                    # gradient contract; their gradients reach the sparse
+                    # optimizer, never ``param.grad``.
+                    continue
                 missing_gradients.append(
                     MissingParameterGradient(
                         name=f"{part_idx}:{name}",
@@ -135,7 +150,7 @@ def _snapshot_parameters(
                         dtype=dtype,
                     )
                 )
-    return lifetimes, param_ids, missing_gradients, parameter_tensors
+    return lifetimes, param_ids, missing_gradients, parameter_tensors, host_lifetimes
 
 
 def _is_persistent_storage_alias(ref: TensorRef, persistent_storage_keys: set[str]) -> bool:
@@ -400,6 +415,7 @@ def estimate_static_memory(
     initial_tensors: Iterable[TensorRef] | None = None,
     optimizer_state_tensors: Iterable[TensorRef] | None = None,
     optimizer_workspace_tensors: Iterable[TensorRef] | None = None,
+    host_optimizer_state_refs: Iterable[TensorRef] | None = None,
     counted_device_type: str = "",
     parameter_storage_dtype: str | None = None,
     offload_ac_saved_tensors: bool = False,
@@ -407,11 +423,23 @@ def estimate_static_memory(
     events = sorted(raw_events, key=lambda event: event.seq_idx)
     parameter_storage_dtype = normalize_supported_dtype(parameter_storage_dtype) if parameter_storage_dtype else None
     model_parts = list(model_parts or [])
-    param_lifetimes, param_ids, missing_parameter_gradients, parameter_tensors = _snapshot_parameters(
-        model_parts,
-        parameter_storage_dtype,
-        counted_device_type=counted_device_type,
+    param_lifetimes, param_ids, missing_parameter_gradients, parameter_tensors, host_param_lifetimes = (
+        _snapshot_parameters(
+            model_parts,
+            parameter_storage_dtype,
+            counted_device_type=counted_device_type,
+        )
     )
+    # Host-resident optimizer state (SparseAdam moments of the host-offload
+    # tables) reports its own budget; its storages are excluded from every
+    # counted device inventory below, mirroring production CPU residency.
+    host_state_storage_keys = {
+        ref.storage_key.partition(":")[0] for ref in (host_optimizer_state_refs or ()) if ref.storage_key
+    }
+    host_state_bytes_by_key: dict[str, int] = {}
+    for ref in (host_optimizer_state_refs or ()):
+        if ref.storage_key and ref.storage_key not in host_state_bytes_by_key:
+            host_state_bytes_by_key[ref.storage_key] = ref.storage_bytes or ref.num_bytes
     parameter_storage_keys = {parameter.storage_key for parameter in parameter_tensors}
     buffer_lifetimes, buffer_ids, persistent_storage_keys = _snapshot_model_buffers(
         model_parts,
@@ -452,7 +480,12 @@ def estimate_static_memory(
         if counted_device_type and ref.device.split(":")[0] != counted_device_type:
             continue
         root = storage_root(ref)
-        if root in param_ids or root in buffer_ids or _is_persistent_storage_alias(ref, persistent_storage_keys):
+        if (
+            root in param_ids
+            or root in buffer_ids
+            or _is_persistent_storage_alias(ref, persistent_storage_keys)
+            or ref.storage_key.partition(":")[0] in host_state_storage_keys
+        ):
             continue
         if root in lifetimes_by_tensor_id:
             continue
@@ -480,6 +513,7 @@ def estimate_static_memory(
                 root_tensor_id in param_ids
                 or root_tensor_id in buffer_ids
                 or root_tensor_id in parameter_materialization_ids
+                or ref.storage_key.partition(":")[0] in host_state_storage_keys
             ):
                 continue
             lifetime = lifetimes_by_tensor_id.get(root_tensor_id)
@@ -504,6 +538,7 @@ def estimate_static_memory(
                 or root_tensor_id in buffer_ids
                 or root_tensor_id in parameter_materialization_ids
                 or _is_persistent_storage_alias(ref, persistent_storage_keys)
+                or ref.storage_key.partition(":")[0] in host_state_storage_keys
             ):
                 parameter_materialization_ids.add(root_tensor_id)
                 continue
@@ -653,6 +688,10 @@ def estimate_static_memory(
         offload_ac_saved_tensors=offload_ac_saved_tensors,
         persistent_param_bytes=sum(item.resident_num_bytes for item in param_lifetimes),
         persistent_buffer_bytes=sum(item.resident_num_bytes for item in buffer_lifetimes),
+        # Host-resident weights keep their original precision bytes: the
+        # storage-dtype projection estimates device residency only, while
+        # production keeps the CPU tables at their real dtype (PR #19 review).
+        host_param_bytes=sum(item.num_bytes for item in host_param_lifetimes),
         peak_active_bytes=peak_event.active_bytes_after if peak_event else 0,
         model_active_bytes_peak=_model_peak_active_bytes(timeline, events),
         forward_peak_active_bytes=phase_peaks["forward"],
@@ -682,6 +721,7 @@ def estimate_static_memory(
         steady_peaks = _phase_peak_active_bytes(steady_timeline, events)
         plan.optimizer_state_bytes = sum(lifetime.resident_num_bytes for lifetime in states)
         plan.optimizer_state_storage_count = len(states)
+        plan.host_optimizer_state_bytes = sum(host_state_bytes_by_key.values())
         plan.steady_state_peak_active_bytes = max((event.active_bytes_after for event in steady_timeline), default=0)
         plan.steady_state_forward_peak_active_bytes = steady_peaks["forward"]
         plan.steady_state_backward_peak_active_bytes = steady_peaks["backward"]

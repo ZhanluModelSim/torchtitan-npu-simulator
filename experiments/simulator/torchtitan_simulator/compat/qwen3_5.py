@@ -43,8 +43,56 @@ _FLEX_INPUTS = (
     ("q_BNLH", TensorMeaning("query", ("batch", "head", "q_len", "head_dim"))),
     ("k_BNLH", TensorMeaning("key", ("batch", "head", "kv_len", "head_dim"))),
     ("v_BNLH", TensorMeaning("value", ("batch", "head", "kv_len", "head_dim"))),
+    # The causal BlockMask payload enters the fusion boundary as dependency
+    # inputs with declared semantics, so the recorded node keeps the block
+    # structure (counts and indices per query block, full-block documentary
+    # counts included) instead of dropping it.
+    ("kv_num_blocks", TensorMeaning("key_block_count_mask", ("batch", "head", "query_block"), optional=True)),
+    (
+        "kv_indices",
+        TensorMeaning("key_block_index_mask", ("batch", "head", "query_block", "selected_key_block"), optional=True),
+    ),
+    ("q_num_blocks", TensorMeaning("query_block_count_mask", ("batch", "head", "query_block"), optional=True)),
+    (
+        "q_indices",
+        TensorMeaning("query_block_index_mask", ("batch", "head", "query_block", "selected_key_block"), optional=True),
+    ),
+    (
+        "full_kv_num_blocks",
+        TensorMeaning("full_key_block_count_mask", ("batch", "head", "query_block"), optional=True),
+    ),
+    (
+        "full_kv_indices",
+        TensorMeaning(
+            "full_key_block_index_mask", ("batch", "head", "query_block", "selected_key_block"), optional=True
+        ),
+    ),
+    (
+        "full_q_num_blocks",
+        TensorMeaning("full_query_block_count_mask", ("batch", "head", "query_block"), optional=True),
+    ),
+    (
+        "full_q_indices",
+        TensorMeaning(
+            "full_query_block_index_mask", ("batch", "head", "query_block", "selected_key_block"), optional=True
+        ),
+    ),
 )
 _FLEX_OUTPUT = TensorMeaning("attention_output", ("batch", "head", "q_len", "head_dim"))
+
+# BlockMask tensor fields captured by the flex fusion boundary. Every other
+# tensor field (varlen seq_lengths, dq_* gradient layouts) is rejected
+# explicitly instead of being silently dropped.
+_FLEX_BLOCKMASK_FIELDS = (
+    "kv_num_blocks",
+    "kv_indices",
+    "q_num_blocks",
+    "q_indices",
+    "full_kv_num_blocks",
+    "full_kv_indices",
+    "full_q_num_blocks",
+    "full_q_indices",
+)
 
 
 def _register_fusion_semantics(
@@ -139,18 +187,40 @@ def flex_attention(
     v_BNLH: torch.Tensor,
     scale: float,
     enable_gqa: bool,
+    kv_num_blocks: torch.Tensor | None,
+    kv_indices: torch.Tensor | None,
+    q_num_blocks: torch.Tensor | None,
+    q_indices: torch.Tensor | None,
+    full_kv_num_blocks: torch.Tensor | None,
+    full_kv_indices: torch.Tensor | None,
+    full_q_num_blocks: torch.Tensor | None,
+    full_q_indices: torch.Tensor | None,
 ) -> torch.Tensor:
     """Virtual boundary of one compiled FlexAttention computation.
 
-    The mask/block structure and kernel options do not change the operator
-    stream, so the fusion is recorded with the query/key/value tensors and
-    the two scalar hyperparameters only.
+    The query/key/value tensors, the two scalar hyperparameters and the causal
+    BlockMask payload (block counts and indices, full-block documentary counts
+    included) are recorded; kernel options do not change the operator stream.
     """
     raise RuntimeError("Qwen3.5 virtual flex attention is available only for Meta simulation")
 
 
 @flex_attention.register_fake
-def _flex_meta(q_BNLH, k_BNLH, v_BNLH, scale, enable_gqa):
+def _flex_meta(
+    q_BNLH,
+    k_BNLH,
+    v_BNLH,
+    scale,
+    enable_gqa,
+    kv_num_blocks,
+    kv_indices,
+    q_num_blocks,
+    q_indices,
+    full_kv_num_blocks,
+    full_kv_indices,
+    full_q_num_blocks,
+    full_q_indices,
+):
     return torch.empty_like(q_BNLH)
 
 
@@ -159,30 +229,55 @@ def flex_attention_grad(
     q_BNLH: torch.Tensor,
     k_BNLH: torch.Tensor,
     v_BNLH: torch.Tensor,
-    dy_BNLH: torch.Tensor,
     scale: float,
     enable_gqa: bool,
+    kv_num_blocks: torch.Tensor | None,
+    kv_indices: torch.Tensor | None,
+    q_num_blocks: torch.Tensor | None,
+    q_indices: torch.Tensor | None,
+    full_kv_num_blocks: torch.Tensor | None,
+    full_kv_indices: torch.Tensor | None,
+    full_q_num_blocks: torch.Tensor | None,
+    full_q_indices: torch.Tensor | None,
+    dy_BNLH: torch.Tensor,
 ) -> list[torch.Tensor]:
     """Virtual backward of one compiled FlexAttention computation."""
     raise RuntimeError("Qwen3.5 virtual flex attention backward is available only for Meta simulation")
 
 
 @flex_attention_grad.register_fake
-def _flex_grad_meta(q_BNLH, k_BNLH, v_BNLH, dy_BNLH, scale, enable_gqa):
+def _flex_grad_meta(
+    q_BNLH,
+    k_BNLH,
+    v_BNLH,
+    scale,
+    enable_gqa,
+    kv_num_blocks,
+    kv_indices,
+    q_num_blocks,
+    q_indices,
+    full_kv_num_blocks,
+    full_kv_indices,
+    full_q_num_blocks,
+    full_q_indices,
+    dy_BNLH,
+):
     return [torch.empty_like(t) for t in (q_BNLH, k_BNLH, v_BNLH)]
 
 
 def _flex_setup(ctx, inputs, output):
-    # The bridge passes scale/enable_gqa positionally, so they land in inputs.
-    ctx.save_for_backward(*inputs[:3])
+    # The bridge passes scale/enable_gqa and the block-mask payload
+    # positionally, so they land in inputs.
+    ctx.save_for_backward(inputs[0], inputs[1], inputs[2], *inputs[5:])
     ctx.scale = inputs[3]
     ctx.enable_gqa = inputs[4]
 
 
 def _flex_backward(ctx, dy):
-    q, k, v = ctx.saved_tensors
-    dq, dk, dv = flex_attention_grad(q, k, v, dy, ctx.scale, ctx.enable_gqa)
-    return dq, dk, dv, None, None
+    q, k, v, *mask_payload = ctx.saved_tensors
+    dq, dk, dv = flex_attention_grad(q, k, v, ctx.scale, ctx.enable_gqa, *mask_payload, dy)
+    # scale/enable_gqa and the integer mask payload are non-differentiable.
+    return dq, dk, dv, None, None, *(None for _ in mask_payload)
 
 
 flex_attention.register_autograd(_flex_backward, setup_context=_flex_setup)
@@ -208,12 +303,58 @@ _register_fusion_semantics(
 )
 
 
-def _flex_bridge(q_BNLH, k_BNLH, v_BNLH, **kwargs):
-    from torchtitan_npu.extensions.torchtitan.eager_flex import _make_aux_output
+def _blockmask_payload(block_mask):
+    """Lift the captured BlockMask fields into the fusion boundary.
 
+    The block-structure tensors (counts and indices, full-block documentary
+    counts included) become explicit dependency inputs; every other BlockMask
+    tensor field (varlen ``seq_lengths``, ``dq_*`` gradient layouts) is
+    rejected instead of being silently dropped from the captured graph.
+    """
+    from torchtitan_simulator.metadata import _BLOCKMASK_TENSOR_FIELDS
+
+    payload = []
+    for name in _FLEX_BLOCKMASK_FIELDS:
+        value = getattr(block_mask, name, None)
+        if value is not None and not isinstance(value, torch.Tensor):
+            raise NotImplementedError(f"Qwen3.5 flex fusion received non-tensor BlockMask field {name!r}")
+        payload.append(value)
+    for name in _BLOCKMASK_TENSOR_FIELDS:
+        if name in _FLEX_BLOCKMASK_FIELDS:
+            continue
+        if isinstance(getattr(block_mask, name, None), torch.Tensor):
+            raise NotImplementedError(
+                f"Qwen3.5 simulator flex fusion does not capture the BlockMask field {name!r}"
+            )
+    return tuple(payload)
+
+
+def _flex_bridge(q_BNLH, k_BNLH, v_BNLH, **kwargs):
+    from torchtitan_npu.extensions.torchtitan.eager_flex import _make_aux_output, _requests_auxiliary_outputs
+
+    if kwargs["score_mod"] is not None:
+        raise NotImplementedError(
+            "Qwen3.5 simulator flex fusion captures mask_mod BlockMask structures only; "
+            "score_mod programs are outside the declared boundary"
+        )
+    if _requests_auxiliary_outputs(kwargs["return_aux"]):
+        raise NotImplementedError(
+            "Qwen3.5 simulator flex fusion does not capture FlexAttention auxiliary outputs"
+        )
+    block_mask = kwargs["block_mask"]
+    mask_payload = (None,) * len(_FLEX_BLOCKMASK_FIELDS)
+    if block_mask is not None:
+        mask_payload = _blockmask_payload(block_mask)
     # out_transform is None on the Qwen3.5 capture path, so the aux payload
     # is never consumed; return the empty aux to keep the (out, aux) contract.
-    out = flex_attention(q_BNLH, k_BNLH, v_BNLH, kwargs["scale"], kwargs["enable_gqa"])
+    out = flex_attention(
+        q_BNLH,
+        k_BNLH,
+        v_BNLH,
+        kwargs["scale"],
+        kwargs["enable_gqa"],
+        *mask_payload,
+    )
     return out, _make_aux_output()
 
 

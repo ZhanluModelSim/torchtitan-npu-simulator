@@ -25,6 +25,8 @@ class MemorySummary(TypedDict):
     steady_state_optimizer_active_bytes_peak: int | None
     persistent_param_bytes: int
     optimizer_state_bytes: int | None
+    host_param_bytes: int
+    host_optimizer_state_bytes: int | None
     activation_offload_by_layer: list[LayerOffloadTransfer]
 
 
@@ -218,6 +220,8 @@ class MemoryPlan:
     offload_optimizer_states: bool = False
     persistent_param_bytes: int = 0
     persistent_buffer_bytes: int = 0
+    host_param_bytes: int = 0
+    host_optimizer_state_bytes: int | None = None
     peak_active_bytes: int = 0
     model_active_bytes_peak: int = 0
     forward_peak_active_bytes: int = 0
@@ -268,6 +272,8 @@ class MemoryPlan:
             "steady_state_optimizer_active_bytes_peak": self.steady_state_optimizer_peak_active_bytes,
             "persistent_param_bytes": self.persistent_param_bytes,
             "optimizer_state_bytes": self.optimizer_state_bytes,
+            "host_param_bytes": self.host_param_bytes,
+            "host_optimizer_state_bytes": self.host_optimizer_state_bytes,
             "activation_offload_by_layer": self._activation_offload_by_layer(),
         }
 

@@ -20,7 +20,7 @@
 | vision tower | VL 训练参与，text-only 配方 detach | preset 的 `_parallelize_text_capture` 按 `qwen35_27b_long_text_sft` 同款方式置 None；文本捕获图不含 vision 算子 |
 | 输入路径 | runner 过渡契约 `build_attention_masks` | `compat/qwen3_5.py` 适配器：调上游 `Qwen35Model.get_attention_masks` 构造混合栈 per-consumer mask dict，注入 text-only `special_tokens`；CP 显式拒绝（NotImplementedError） |
 
-两个虚拟融合按工作流 §4 完成注册顺序：`custom_op` schema → `register_fake` → `register_autograd(setup_context)` → `register_tensor_semantics`（GDN 为 B/S/H/D 边界布局，flex 为 B/H/S/D；GDN `reset` 为可选 B/S bool 掩码——固定长度路径由 cu_seqlens 物化成真实张量，直接调用可为 None，语义按 optional 声明）。真实设备调用显式 RuntimeError。语义表见[自定义语义](custom-tensor-semantics.md)。
+两个虚拟融合按工作流 §4 完成注册顺序：`custom_op` schema → `register_fake` → `register_autograd(setup_context)` → `register_tensor_semantics`（GDN 为 B/S/H/D 边界布局，flex 为 B/H/S/D；GDN `reset` 为可选 B/S bool 掩码——固定长度路径由 cu_seqlens 物化成真实张量，直接调用可为 None，语义按 optional 声明；flex 边界额外收纳 causal BlockMask 的 8 个块结构张量（kv/q counts/indices 与 full_* documentary 计数）为 optional 依赖输入，`score_mod` 程序、aux 输出请求及 varlen `seq_lengths`/`dq_*` 字段显式拒绝）。真实设备调用显式 RuntimeError。语义表见[自定义语义](custom-tensor-semantics.md)。
 
 支撑性修改：`metadata.py` 对 torch 2.14 非 dataclass 的 `BlockMask` 按字段名单独 lift 张量字段；`runner.py` 模型注记 `num_layers` 对无 `n_layers` 字段的 Config 取 `len(layers)`（Kimi 的 property 与列表长度一致，DSV4 走原路径）；`compat/routing.py` 稠密模型无 router 时返回 `ep_token_exchange: none_no_routers` 注记而非报错。
 

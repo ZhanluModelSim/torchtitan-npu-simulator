@@ -199,12 +199,17 @@ def run_simulation_step(
     from torchtitan_simulator.capture.comm_events import (
         default_collective_context,
     )
-    from torchtitan_simulator.capture.optimizer import optimizer_state_values, optimizer_workspace_values
+    from torchtitan_simulator.capture.optimizer import (
+        optimizer_state_values,
+        optimizer_workspace_values,
+        split_optimizer_state_residency,
+    )
     from torchtitan_simulator.capture.saved_tensors import (
         AutogradSavedTensorCapture,
     )
 
     optimizer_state_tensors = None
+    optimizer_host_state_tensors = None
     optimizer_workspace_tensors = None
     get_optional_mesh = getattr(parallel_dims, "get_optional_mesh", None)
     tp_mesh = get_optional_mesh("tp") if callable(get_optional_mesh) else None
@@ -220,8 +225,11 @@ def run_simulation_step(
         saved_tensor_context,
     ):
         workspace = optimizer_workspace_values(optimizer_step) if enable_memory_tracking else []
+        initial_states = optimizer_state_values(optimizer_step)
+        if initial_states is not None:
+            initial_states, _host_initial_states = split_optimizer_state_residency(initial_states)
         capture.record_initial_memory_tensors(
-            (input_dict, labels, global_valid_tokens, optimizer_state_values(optimizer_step), workspace)
+            (input_dict, labels, global_valid_tokens, initial_states, workspace)
         )
         if enable_memory_tracking:
             optimizer_workspace_tensors = capture.memory_tensor_refs(workspace, name_prefix="optimizer_workspace")
@@ -267,7 +275,12 @@ def run_simulation_step(
         lr_scheduler_step()
         states = optimizer_state_values(optimizer_step)
         if enable_memory_tracking and states is not None:
-            optimizer_state_tensors = capture.memory_tensor_refs(states, name_prefix="optimizer_state")
+            device_states, host_states = split_optimizer_state_residency(states)
+            optimizer_state_tensors = capture.memory_tensor_refs(device_states, name_prefix="optimizer_state")
+            if any(host_states):
+                optimizer_host_state_tensors = capture.memory_tensor_refs(
+                    host_states, name_prefix="optimizer_host_state"
+                )
         t3 = time.perf_counter()
         timings["optimizer"] = t3 - t2
 
@@ -364,6 +377,7 @@ def run_simulation_step(
             initial_tensors=capture.initial_memory_tensors(),
             optimizer_state_tensors=optimizer_state_tensors,
             optimizer_workspace_tensors=optimizer_workspace_tensors,
+            host_optimizer_state_refs=optimizer_host_state_tensors,
             counted_device_type=memory_device_type,
             parameter_storage_dtype=memory_parameter_storage_dtype or None,
             offload_ac_saved_tensors=memory_offload_ac_saved_tensors,

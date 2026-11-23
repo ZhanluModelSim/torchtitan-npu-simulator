@@ -46,6 +46,9 @@ class SimulationConfig:
     memory_parameter_storage_dtype: str = ""
     memory_offload_ac_saved_tensors: bool = False
     memory_offload_optimizer_states: bool = False
+    # Opt-in virtual SLA2 branch fusions for multi_head_moe capture. Default
+    # off: the model runs the reference's own eager operators.
+    enable_sla2_fusion: bool = False
     local_batch_size: int | None = None
     global_batch_size: int | None = None
     enable_quantized_training: bool = False
@@ -64,6 +67,8 @@ class SimulationConfig:
         # an early reject here would also reject legal Muon configurations.
         if type(self.memory_offload_optimizer_states) is not bool:
             raise ValueError("memory_offload_optimizer_states must be boolean")
+        if type(self.enable_sla2_fusion) is not bool:
+            raise ValueError("enable_sla2_fusion must be boolean")
         preset, separator, precision = self.config.rpartition("_baseline_")
         if (
             separator
@@ -180,6 +185,14 @@ _QWEN3_5_OVERRIDES = [
     "torchtitan_npu.override.qwen3_5.gated_delta.npu",
 ]
 
+# SLA2 uses the fused interleave RoPE like the DSV4 families; the rms_norm and
+# ASC MoE dispatcher entries reuse the shared common overrides. The SLA2 branch
+# fusions are installed by runtime.configure_model, not through override.imports.
+_MULTI_HEAD_MOE_OVERRIDES = [
+    *_COMMON_OVERRIDES,
+    "torchtitan_npu.override.common.rope.asc_complex",
+]
+
 # The production A3 text recipe (examples/deepseek_v4_1) enables rms_norm, the
 # ASC MoE dispatcher and the V4.1 MHC post-processing override; the CLI rope
 # default (asc_complex) applies after the ops list and wins over
@@ -246,6 +259,10 @@ PRESET_FACTORIES = {
     "system3_full_text": "torchtitan_npu.models.system3.config_registry.system3_full_text",
     "system3_full_multimodal": "torchtitan_npu.models.system3.config_registry.system3_full_multimodal",
     "system3_unit_text": "torchtitan_npu.models.system3.config_registry.system3_unit_text",
+    "qwen3_5_debugmodel": "torchtitan_simulator.presets.qwen3_5_debugmodel",
+    "qwen3_5_debugmodel_moe": "torchtitan_simulator.presets.qwen3_5_debugmodel_moe",
+    "deepseek_v4_1_debugmodel_text": "torchtitan_simulator.presets.deepseek_v4_1_debugmodel_text",
+    "multi_head_moe_debugmodel": "torchtitan_simulator.presets.multi_head_moe_debugmodel",
 }
 
 
@@ -280,6 +297,19 @@ def prepare_config(simulation: SimulationConfig) -> PreparedConfig:
         raise ValueError("Kimi K3.1 capture currently supports unquantized training only")
     if trainer.model_spec.name not in {"deepseek_v4", "kimi_k3", "kimi_k3_1", "qwen3", "system3"}:
         raise ValueError("Supported model families are deepseek_v4, kimi_k3, kimi_k3_1, qwen3 and system3")
+    if trainer.model_spec.name not in {
+        "deepseek_v4",
+        "deepseek_v4_1",
+        "kimi_k3",
+        "kimi_k3_1",
+        "qwen3",
+        "qwen3_5",
+        "multi_head_moe",
+    }:
+        raise ValueError(
+            "Supported model families are deepseek_v4, deepseek_v4_1, kimi_k3, "
+            "kimi_k3_1, qwen3, qwen3_5 and multi_head_moe"
+        )
     adaptations = []
     if simulation.model_overrides is not None:
         adaptations.append("typed geometry overrides rebuilt the complete native model configuration tree")
@@ -325,6 +355,12 @@ def prepare_config(simulation: SimulationConfig) -> PreparedConfig:
                 "kimi_k3_1": _COMMON_OVERRIDES,
                 "qwen3": _QWEN3_OVERRIDES,
                 "system3": _SYSTEM3_OVERRIDES,
+                "deepseek_v4_1": _DSV4_1_OVERRIDES,
+                "kimi_k3": _COMMON_OVERRIDES,
+                "kimi_k3_1": _COMMON_OVERRIDES,
+                "qwen3": _QWEN3_OVERRIDES,
+                "qwen3_5": _QWEN3_5_OVERRIDES,
+                "multi_head_moe": _MULTI_HEAD_MOE_OVERRIDES,
             }[trainer.model_spec.name]
         )
         if simulation.override_imports is None

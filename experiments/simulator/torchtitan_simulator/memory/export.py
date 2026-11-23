@@ -478,5 +478,7 @@ def print_memory_budget(plan: MemoryPlan) -> None:
         ("优化器阶段峰值", summary["steady_state_optimizer_active_bytes_peak"]),
         ("权重大小", summary["persistent_param_bytes"]),
         ("优化器状态大小", summary["optimizer_state_bytes"]),
+        ("host 权重大小", summary["host_param_bytes"]),
+        ("host 优化器状态大小", summary["host_optimizer_state_bytes"]),
     ):
         print(f"  {label}: {value / 2**30:.3f}" if value is not None else f"  {label}: 不可用")
