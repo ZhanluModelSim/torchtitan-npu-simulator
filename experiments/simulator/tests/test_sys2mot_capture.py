@@ -215,3 +215,17 @@ def test_sys2mot_mid_geometry_sources_in_range():
     assert all(
         0 <= i < geometry.layers for i in (*geometry.kv_sources, *geometry.index_sources, geometry.candidate_source)
     )
+
+
+def test_sys2mot_student30b_full_geometry_validates():
+    """The full-geometry prediction flavor mirrors the reference student30b flavor."""
+    from torchtitan_npu.models.sys2mot.config_registry import _GeometryStudent30b
+
+    geometry = _GeometryStudent30b()
+    geometry.validate()
+    assert geometry.layers == 40
+    assert geometry.experts == 24 and geometry.expert_dim == 1408
+    assert len(geometry.index_sources) == 8
+    assert all(
+        0 <= i < geometry.layers for i in (*geometry.kv_sources, *geometry.index_sources, geometry.candidate_source)
+    )

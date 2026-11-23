@@ -219,9 +219,61 @@ class _GeometryMid(_Geometry):
     action_mlp: int = 4096
 
 
+@dataclass(frozen=True)
+class _GeometryStudent30b(_Geometry):
+    """The reference ``student30b`` production flavor, verbatim: the shared
+    student300b dimensions and 40-layer CED schedule (ratio-2 spine over the
+    20 encoder layers, ratio-1 decoder tail, KV sources at 2/8/14/20, eight
+    indexers, Engram at layers 1/14) with the 30b expert and memory flavor
+    (24 routed experts top-6, expert_dim 1408, 32,771 engram buckets). The
+    full-geometry prediction flavor: the mid taste remaps every structural
+    path onto 8 layers, this one restores the published layer count so the
+    simulator can run the complete end-to-end model once the mid-scale
+    real-machine comparison has validated the structure."""
+
+    vocab_size: int = 129280
+    width: int = 5120
+    layers: int = 40
+    encoder_layers: int = 20
+    heads: int = 64
+    head_dim: int = 512
+    rope_dim: int = 64
+    q_rank: int = 1280
+    o_rank: int = 1024
+    o_groups: int = 8
+    experts: int = 24
+    topk: int = 6
+    expert_dim: int = 1408
+    window: int = 128
+    compress_ratios: tuple[int, ...] = (0, 0) + (2,) * 18 + (1,) * 20
+    kv_sources: tuple[int, ...] = (2, 8, 14, 20)
+    index_sources: tuple[int, ...] = (2, 8, 14, 20, 24, 28, 32, 36)
+    index_heads: int = 32
+    index_dim: int = 128
+    index_topk: int = 512
+    candidate_source: int = 20
+    candidate_blocks: int = 2048
+    candidate_block_size: int = 8
+    engram_layers: tuple[int, ...] = (1, 14)
+    engram_buckets: int = 32771
+    engram_heads: int = 8
+    engram_dim: int = 256
+    vision_width: int = 1024
+    vision_layers: int = 32
+    vision_heads: int = 16
+    vision_mlp: int = 2816
+    image_size: int = 546
+    action_width: int = 1024
+    action_layers: int = 40
+    action_q_rank: int = 256
+    action_o_rank: int = 128
+    action_mlp: int = 4096
+
+
 sys2mot_configs = {
     "debugmodel_multimodal": lambda: _make_model_config(g=_Geometry()),
     "mid_multimodal": lambda: _make_model_config(g=_GeometryMid()),
+    "student30b_multimodal": lambda: _make_model_config(g=_GeometryStudent30b()),
 }
 
 
@@ -509,9 +561,10 @@ def _sys2mot_trainer_config(flavor: str, *, num_mtp_layers: int = 0, seq_len: in
     # The captured joint loss: flow MSE + 0.5*logits-KD + 0.1*hidden-MSE +
     # 0.1*text CE + 0.01*indexer aux. Current capture form: distillation is
     # OFFLINE — the training step never runs the teacher; its logits and
-    # hidden arrive as inputs (stand-in synthetic spans feed the KD/hidden
-    # terms so the graph carries the real offline compute). The archived
-    # in-loop sharded form lives at tag sys2mot-distill-sharded.
+    # hidden arrive as runner-provided loss inputs (deterministic stand-ins
+    # built outside the captured graph, so the step carries the real offline
+    # compute). The archived in-loop sharded form lives at tag
+    # sys2mot-distill-sharded.
     loss = Sys2MotJointLoss.Config(
         text_offset=3 * model_config.image_tokens,
         action_dim=model_config.action.action_dim,
@@ -566,8 +619,13 @@ def sys2mot_mid_multimodal(*, num_mtp_layers: int = 0) -> Trainer.Config:
     return _sys2mot_trainer_config("mid_multimodal", num_mtp_layers=num_mtp_layers, seq_len=200)
 
 
+def sys2mot_student30b_multimodal(*, num_mtp_layers: int = 0) -> Trainer.Config:
+    return _sys2mot_trainer_config("student30b_multimodal", num_mtp_layers=num_mtp_layers, seq_len=200)
+
+
 __all__ = [
     "model_registry",
     "sys2mot_debugmodel_multimodal",
     "sys2mot_mid_multimodal",
+    "sys2mot_student30b_multimodal",
 ]
