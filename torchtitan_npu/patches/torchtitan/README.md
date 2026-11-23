@@ -6,7 +6,9 @@
 - https://github.com/pytorch/torchtitan/pull/4734
 - https://github.com/pytorch/torchtitan/pull/4708
 - https://github.com/pytorch/torchtitan/pull/4763
+- https://github.com/pytorch/torchtitan/pull/6180
 - https://github.com/pytorch/torchtitan/pull/6290
+- https://github.com/pytorch/torchtitan/pull/6315
 - https://github.com/pytorch/pytorch/pull/201621
 -->
 
@@ -23,7 +25,7 @@
   # Pending upstream PR: https://github.com/pytorch/pytorch/pull/NNNN
   ```
 
-- 模块 docstring 需说明补丁内容，并以 "Remove this module after the TorchTitan dependency includes the PR." 结尾。
+- 模块 docstring 需说明补丁内容，并以 "Remove this module after the TorchTitan dependency includes the PR."（涉及多个 PR 时可用 "PRs."）结尾。
 - 对原模块/类做属性替换的 monkey patch 必须封装在 `def apply() -> None:` 中并在文件末尾调用（`apply()`），补丁逻辑内使用完整模块路径（`import torchtitan.models.common.moe` 后以 `torchtitan.models.common.moe.X = ...` 赋值），不使用短导入别名。纯定义被模型目录引用的 backport 类（如 `BatchedLinear`、`BaseMaskHandler`、`SingleComplexRoPE`）不需要 `apply()`。
 
 校验（除 `__init__.py` 等包胶水文件外，每个补丁文件都应命中）：
@@ -42,7 +44,9 @@ grep -L -E "Pending upstream PR: https://github.com/pytorch/(torchtitan|pytorch)
 | [#4708](https://github.com/pytorch/torchtitan/pull/4708) | 修复 functionalize_recompute_mutations_pass 和 EpOverlap 的冲突 |
 | [#4763](https://github.com/pytorch/torchtitan/pull/4763) | 向 GraphTrainer graph pass 提供运行时上下文，用于 auto-overlap 调度时整图 profiling |
 | [#201621](https://github.com/pytorch/pytorch/pull/201621) | 为本地 FileSystemReader 增加可选 mmap 加载，对应 `distributed/checkpoint/filesystem` |
+| [#6180](https://github.com/pytorch/torchtitan/pull/6180) | 回移 override 成功日志分组，对应 `config/override.py` |
 | [#6290](https://github.com/pytorch/torchtitan/pull/6290) | 将 `--print-config` 与 `debug.print_config` 配置输出压缩为无损扁平折叠 JSON，对应 `config/format.py`、`config/loader.py` 和 `trainer.py` |
+| [#6315](https://github.com/pytorch/torchtitan/pull/6315) | 对分组 override 日志中的索引 FQN 做 `{start..end}` 无损范围折叠，对应 `config/format.py` 和 `config/override.py` |
 
 当前依赖固定为 `requirements.txt` 中的 commit。已由该基线提供的 AuxLoss、EMA、DistMuon NPU storage 检查和 EP ready-node 去重不再保留本地 backport；随上游 EP chunk pass 删除的旧 chunk 补丁一并退役。
 

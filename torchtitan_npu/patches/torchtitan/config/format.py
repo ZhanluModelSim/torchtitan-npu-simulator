@@ -4,13 +4,15 @@
 # LICENSE file in the root directory of this source tree.
 
 # Pending upstream PR: https://github.com/pytorch/torchtitan/pull/6290
+# Pending upstream PR: https://github.com/pytorch/torchtitan/pull/6315
 
 """Compact, lossless display formatting for TorchTitan configuration trees.
 
-Backports the flat JSON path-folding formatter from upstream PR #6290 so
-``--print-config`` and ``debug.print_config`` stay readable on large models
-without dropping any per-layer field values. Remove this module after the
-TorchTitan dependency includes the PR.
+Backports the flat JSON path-folding formatter from upstream PR #6290 and the
+indexed FQN range helper ``fold_indexed_paths`` from PR #6315 so
+``--print-config``, ``debug.print_config``, and grouped override logs stay
+readable on large models without dropping any per-layer field values. Remove
+this module after the TorchTitan dependency includes the PRs.
 """
 
 from __future__ import annotations
@@ -19,9 +21,12 @@ import json
 import re
 from collections import defaultdict
 from dataclasses import fields, is_dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from torchtitan.config.configurable import Configurable
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
 
 _HEX_ADDR_RE = re.compile(r" at 0x[0-9a-fA-F]+>")
 
@@ -181,6 +186,11 @@ def _fold_indexed_dict(mapping: dict[str, Any]) -> dict[str, Any]:
         if not merged:
             break
     return {".".join(segs): val for segs, val, _ in items}
+
+
+def fold_indexed_paths(paths: Iterable[str]) -> list[str]:
+    """Fold unique dotted paths that differ only in numeric index segments."""
+    return list(_fold_indexed_dict(dict.fromkeys(paths)).keys())
 
 
 def format_config(config: Configurable.Config) -> str:

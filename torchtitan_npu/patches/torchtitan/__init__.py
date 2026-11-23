@@ -71,5 +71,5 @@ def _patch_optional_qwen_short_conv() -> None:
 
 _patch_optional_qwen_short_conv()
 from .models import deepseek_v4  # noqa: F401
-from .config import loader  # noqa: F401
+from .config import loader, override  # noqa: F401
 from . import trainer  # noqa: F401

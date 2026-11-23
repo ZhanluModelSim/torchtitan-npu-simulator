@@ -22,7 +22,7 @@ from torchtitan.config.configurable import Configurable
 
 import torchtitan_npu  # noqa: F401
 from torchtitan_npu.extensions.torchtitan.trainer import TrainerEx
-from torchtitan_npu.patches.torchtitan.config.format import format_config
+from torchtitan_npu.patches.torchtitan.config.format import fold_indexed_paths, format_config
 from torchtitan_npu_recipes.tests.models.deepseek_v4 import deepseek_v4_debugmodel
 
 pytestmark = pytest.mark.cpu
@@ -242,3 +242,31 @@ def test_package_import_patches_trainer_maybe_log_and_keeps_full_saved_json(tmp_
     saved = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
     assert isinstance(saved["model"]["layers"], list)
     assert len(saved["model"]["layers"]) == len(layers)
+
+
+def test_fold_indexed_paths_folds_contiguous_and_gapped_ranges() -> None:
+    assert fold_indexed_paths([]) == []
+    assert fold_indexed_paths(["model.layers.0.norm"]) == ["model.layers.0.norm"]
+    assert fold_indexed_paths(
+        [
+            "child",
+            "children.0",
+            "children.1",
+            "children.2",
+            "children.4",
+            "children.5",
+            "children.1",
+        ]
+    ) == ["child", "children.{0..2,4,5}"]
+    assert fold_indexed_paths(
+        [
+            "model.layers.0.attention_norm",
+            "model.layers.1.attention_norm",
+            "model.layers.00.attention_norm",
+            "model.layers.01.attention_norm",
+        ]
+    ) == [
+        "model.layers.{0,1}.attention_norm",
+        "model.layers.00.attention_norm",
+        "model.layers.01.attention_norm",
+    ]
