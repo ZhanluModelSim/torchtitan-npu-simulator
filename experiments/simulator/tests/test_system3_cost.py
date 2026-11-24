@@ -7,6 +7,11 @@ grouped GEMM, convolution through operator-performance-models), the declared
 equivalent-op fallbacks, and the residual ``cost_unknown`` population (view/
 stream/profiler control nodes carry no arithmetic and stay unknown, matching
 the established workspace convention).
+
+Coverage boundary (PR #24 review): the encoder FA backward nodes stay
+``cost_unknown`` until the operator-performance-models family contract
+accepts the native BSND softmax stats layout, so the workload's cost report
+does NOT claim full attention-backward cost coverage.
 """
 
 from collections import Counter

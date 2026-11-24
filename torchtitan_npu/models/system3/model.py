@@ -385,13 +385,24 @@ class IndexedSparseAttention(Module):
 
         attn_scores = torch.einsum("bshd,bskhd->bhsk", q_full, k_sel) * self.scale
         attn_scores = attn_scores + topk_scores.unsqueeze(1)
+        # Deviation from the reference (owner-approved, PR #24 review): the
+        # reference clamps after the padding fill (``stable_softmax`` receives
+        # dtype-minimum scores and the clamp raises masked keys back to the
+        # clamp value), so masked keys keep exp(-clamp - LSE) weight and fully
+        # padded rows attend uniformly. Clamp first, then mask with -inf:
+        # masked keys contribute exactly zero and a row without a single valid
+        # key yields zero attention weights instead of a uniform average.
+        attn_scores = attn_scores.clamp(-self.softmax_clamp, self.softmax_clamp)
         if attention_mask is not None:
-            # Padding keys (compressed grid) get the dtype minimum so they do
-            # not participate in the softmax.
             k_valid = attention_mask.bool()[:, :: self.compress_ratio]  # [b, cl]
             k_pad = ~k_valid[bidx, flat.view(b, s, actual_topk)]  # [b, s, k]
-            attn_scores = attn_scores.masked_fill(k_pad.unsqueeze(1), torch.finfo(attn_scores.dtype).min)
-        attn_probs = stable_softmax(attn_scores, dim=-1, clamp_val=self.softmax_clamp)
+            attn_scores = attn_scores.masked_fill(k_pad.unsqueeze(1), float("-inf"))
+            attn_probs = stable_softmax(attn_scores, dim=-1)
+            # Softmax over an all-masked row is NaN; zero it explicitly.
+            row_has_valid = (~k_pad).any(dim=-1)  # [b, s]
+            attn_probs = torch.where(row_has_valid[:, None, :, None], attn_probs, torch.zeros_like(attn_probs))
+        else:
+            attn_probs = stable_softmax(attn_scores, dim=-1)
         return torch.einsum("bhsk,bskhd->bshd", attn_probs, v_sel)
 
 

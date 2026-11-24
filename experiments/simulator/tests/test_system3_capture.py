@@ -395,6 +395,54 @@ def test_isa_sparse_attention_meta_output_follows_value_width():
     assert lse.shape == (b, heads, s)
 
 
+def test_isa_sparse_attention_mask_excludes_padded_keys_before_clamp():
+    """Eager selected-key attention (PR #24 review): the clamp runs before
+    the padding fill, so masked keys contribute exactly zero weight and a
+    row without a single valid key produces zeros instead of a uniform
+    average (the reference clamps after the fill, which revives masked
+    keys at the clamp value; owner-approved deviation)."""
+    import torch
+
+    from torchtitan_npu.models.system3.model import IndexedSparseAttention
+
+    isa = IndexedSparseAttention(IndexedSparseAttention.Config(head_dim=8, softmax_clamp=50.0, compress_ratio=2))
+    b, s, nh, hd, cl, topk = 2, 8, 2, 8, 4, 4
+    torch.manual_seed(7)
+    q = torch.randn(b, s, nh, hd)
+    k = torch.randn(b, cl, nh, hd)
+    v = torch.randn(b, cl, nh, hd)
+    indices = torch.arange(cl).repeat(b, s, 1).reshape(b, s, cl)  # every query selects every grid key
+    bias = torch.zeros(b, s, cl)
+    # Batch 0 fully valid; batch 1 has every compressed-grid key padded.
+    mask = torch.tensor([[True] * s, [False] * s])
+
+    out = isa(q, k, v, indices, bias, mask)
+    # Fully padded rows attend to nothing: zeros, not a uniform average.
+    assert torch.isfinite(out).all()
+    assert torch.count_nonzero(out[1]) == 0
+
+    # A masked key's value must not leak: perturbing the padded key of a
+    # partially padded row leaves the output bit-identical. Tokens 6/7 pad
+    # grid key 3.
+    mask_partial = torch.tensor([[True, True, True, True, True, True, False, False]])
+    k_perturbed = k.clone()
+    k_perturbed[0, 3] *= 97.0
+    v_perturbed = v.clone()
+    v_perturbed[0, 3] = torch.randn(nh, hd) * 100.0
+    base = isa(q[:1], k[:1], v[:1], indices[:1], bias[:1], mask_partial)
+    perturbed = isa(q[:1], k_perturbed[:1], v_perturbed[:1], indices[:1], bias[:1], mask_partial)
+    assert torch.equal(base, perturbed)
+
+    # The clamp saturates: scores far beyond +-softmax_clamp stop mattering.
+    q_hot = q.clone()
+    q_hot[0, 0, 0, :] = 1e6
+    q_hotter = q.clone()
+    q_hotter[0, 0, 0, :] = 1e9
+    hot = isa(q_hot, k, v, indices, bias, None)
+    hotter = isa(q_hotter, k, v, indices, bias, None)
+    assert torch.allclose(hot[0, 0], hotter[0, 0])
+
+
 def test_fusion_attention_meta_follows_native_contracts():
     """The shared BSND fusion-attention fakes follow the native contracts:
     FP32 (B, N, S, 8) softmax statistics, GQA-operand backward geometry, and
