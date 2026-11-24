@@ -27,8 +27,9 @@ _SUPPORTED = {
     "c10d._reduce_scatter_base_.default",
     "c10d.allreduce_.default",
     "_c10d_functional.all_to_all_single.default",
+    "c10d.alltoall_.default",
 }
-_A2A = "_c10d_functional.all_to_all_single.default"
+_A2A = {"_c10d_functional.all_to_all_single.default", "c10d.alltoall_.default"}
 _PROOF_METADATA_KEY = "torchtitan_simulator.collective_facts.v1"
 _exchange_facts: ContextVar[dict[str, Any] | None] = ContextVar("simulator_collective_facts", default=None)
 
@@ -102,16 +103,21 @@ def collective_fact_scope(facts: dict[str, Any]) -> Iterator[None]:
         _exchange_facts.reset(token)
 
 
-def retain_backward_facts(result: torch.Tensor, facts: dict[str, Any]) -> None:
+def retain_backward_facts(result: torch.Tensor, facts: dict[str, Any], *, source: torch.Tensor | None = None) -> None:
     """Keep evidence on the exact native autograd node without patching it."""
     pending = [result.grad_fn]
     seen = set()
+    boundary = None if source is None else source.grad_fn
     while pending:
         node = pending.pop()
-        if node is None or node in seen:
+        if node is None or node is boundary or node in seen:
             continue
         seen.add(node)
-        if node.name() == "GeneratedBackwardFor__c10d_functional_all_to_all_single_defaultBackward":
+        if node.name() == "GeneratedBackwardFor__c10d_functional_all_to_all_single_defaultBackward" or (
+            source is not None
+            and getattr(getattr(node, "_forward_cls", None), "__module__", "") == "spmd_types._collectives"
+            and node.name() == "_AllToAllUnevenBackward"
+        ):
             node.metadata[_PROOF_METADATA_KEY] = deepcopy(facts)
             return
         # wait_tensor / wrapping nodes can sit above the real collective node.
@@ -186,7 +192,7 @@ def native_collective_facts(func, args, kwargs, operands, result) -> dict[str, A
         "source": "native_collective_contract_v1",
         "tensor_contract": {
             "dense": dense,
-            "uniform_across_ranks": primitive != _A2A,
+            "uniform_across_ranks": primitive not in _A2A,
             "source": "native_collective_contract_v1",
         },
         "buffer_relation": _buffer_relation(primitive, operands.inputs, outputs, group, capture_rank),
@@ -218,9 +224,12 @@ def native_collective_facts(func, args, kwargs, operands, result) -> dict[str, A
         }
         if operation is None:
             missing.append("reduction.operation")
-    if primitive == _A2A:
+    if primitive in _A2A:
         exchange = _active_exchange_facts()
         if exchange is None:
+            if primitive == "c10d.alltoall_.default":
+                # A rank-local list establishes neither remote chunks nor their buffer relation.
+                return None
             missing.append("a2a_full_group_split_facts")
         else:
             uniform = exchange.pop("uniform_across_ranks", False)

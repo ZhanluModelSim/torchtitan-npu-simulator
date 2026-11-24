@@ -283,6 +283,11 @@ def _simulate(simulation, timings: HostTimings):
             if cp_mesh is not None:
                 from torch.distributed.device_mesh import DeviceMesh
 
+                if config.model_spec.name == "deepseek_v4":
+                    from torchtitan_simulator.compat.cp_exchange import observe_deepseek_v4_cp_exchange
+
+                    observe_deepseek_v4_cp_exchange(runtime.patches)
+
                 # Plan construction is pure host math. Retain the same group,
                 # coordinates and native CP planner while keeping its scalar
                 # geometry readable before transferring metadata to Meta.

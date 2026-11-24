@@ -56,7 +56,13 @@ def to_meta_metadata(value):
     memo = {}
 
     def lift(item, *, field_name=""):
-        if field_name in {"send_splits_tensor", "recv_splits_tensor"}:
+        # CP exchange plans keep host split lists and their CPU tensor counterparts.
+        # Retaining the lists also retains their binding to the native global routing plan.
+        if field_name in {"send_splits_tensor", "recv_splits_tensor"} or (
+            field_name in {"send_splits", "recv_splits"}
+            and isinstance(item, list)
+            and all(type(n) is int for n in item)
+        ):
             return item
         if id(item) in memo:
             return memo[id(item)]
