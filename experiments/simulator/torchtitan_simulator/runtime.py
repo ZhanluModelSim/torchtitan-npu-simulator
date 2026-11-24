@@ -49,6 +49,15 @@ class RuntimeSession:
 
             install_kimi_dsa_virtual_fusions(self.patches)
             self.capabilities["kimi_dsa_virtual_fusions"] = "selected-key Meta/autograd; explicit saved output/LSE"
+        if prepared.trainer.model_spec.name == "system3":
+            from torchtitan_simulator.compat.system3_engram import install_system3_engram_meta_support
+            from torchtitan_simulator.compat.system3_fusions import install_system3_virtual_fusions
+
+            install_system3_virtual_fusions(self.patches)
+            self.capabilities["system3_virtual_fusions"] = (
+                "swiglu_clamp, gdn2_chunked, isa_indexer and isa_sparse_attention dispatcher Meta/autograd boundaries"
+            )
+            self.capabilities["system3_engram_host_table"] = install_system3_engram_meta_support(self.patches)
         if prepared.trainer.model_spec.name == "qwen3_5":
             from torchtitan_simulator.compat.qwen3_5 import install_qwen3_5_meta_support
 
@@ -89,6 +98,12 @@ class RuntimeSession:
             from torchtitan_simulator.compat.permute import install_meta_permute_autograd
 
             self.capabilities["token_permute_meta_autograd"] = install_meta_permute_autograd(self.patches)
+        if "torchtitan_npu.override.common.fusion_attention.asc" in imports:
+            from torchtitan_simulator.compat.attention import install_npu_fusion_attention_autograd
+
+            self.capabilities["npu_fusion_attention_meta_autograd"] = install_npu_fusion_attention_autograd(
+                self.patches
+            )
         if "torchtitan_npu.override.common.varlen_attention.asc" in imports:
             from torchtitan_simulator.compat.attention import install_meta_fusion_attention_autograd
 

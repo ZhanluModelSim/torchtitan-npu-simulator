@@ -53,6 +53,8 @@ class SimulationConfig:
     global_batch_size: int | None = None
     enable_quantized_training: bool = False
     quantization_recipe: Literal["all_mxfp8"] = "all_mxfp8"
+    optimizer_name: Literal["AdamW", "Muon"] | None = None
+    muon_ns_steps: int | None = None
     model_overrides: ModelOverrides | None = None
 
     def validate(self):
@@ -60,6 +62,9 @@ class SimulationConfig:
             raise ValueError("optimizer_name must be AdamW or Muon")
         if self.muon_ns_steps is not None and (type(self.muon_ns_steps) is not int or self.muon_ns_steps < 1):
             raise ValueError("muon_ns_steps must be a positive integer")
+        # muon_ns_steps applicability is validated in _prepare_optimizer against
+        # the final optimizer selection (optimizer_name or a native Muon recipe);
+        # an early reject here would also reject legal Muon configurations.
         if type(self.memory_offload_optimizer_states) is not bool:
             raise ValueError("memory_offload_optimizer_states must be boolean")
         if type(self.enable_sla2_fusion) is not bool:
@@ -146,6 +151,15 @@ class PreparedConfig:
 _COMMON_OVERRIDES = [
     "torchtitan_npu.override.common.rms_norm.asc",
     "torchtitan_npu.override.common.token_dispatcher.asc",
+]
+
+_SYSTEM3_OVERRIDES = [
+    # common.rms_norm.asc gates the simulator npu_rms_norm Meta bridge; the
+    # recipe itself has no targets because system3 ships its own norm class.
+    "torchtitan_npu.override.common.rms_norm.asc",
+    "torchtitan_npu.override.system3.rms_norm.asc",
+    "torchtitan_npu.override.common.token_dispatcher.asc",
+    "torchtitan_npu.override.common.fusion_attention.asc",
 ]
 
 _QWEN3_OVERRIDES = [
@@ -240,6 +254,11 @@ PRESET_FACTORIES = {
     "deepseek_v4_pro_20t": "torchtitan_simulator.presets.deepseek_v4_pro_20t",
     "qwen3_32b_smoketest": "torchtitan_npu.models.qwen3.config_registry.qwen3_32b_smoketest",
     "qwen3_32b": "torchtitan_npu.models.qwen3.config_registry.qwen3_32b",
+    "system3_debugmodel_text": "torchtitan_npu.models.system3.config_registry.system3_debugmodel_text",
+    "system3_debugmodel_multimodal": "torchtitan_npu.models.system3.config_registry.system3_debugmodel_multimodal",
+    "system3_full_text": "torchtitan_npu.models.system3.config_registry.system3_full_text",
+    "system3_full_multimodal": "torchtitan_npu.models.system3.config_registry.system3_full_multimodal",
+    "system3_unit_text": "torchtitan_npu.models.system3.config_registry.system3_unit_text",
     "qwen3_5_debugmodel": "torchtitan_simulator.presets.qwen3_5_debugmodel",
     "qwen3_5_debugmodel_moe": "torchtitan_simulator.presets.qwen3_5_debugmodel_moe",
     "deepseek_v4_1_debugmodel_text": "torchtitan_simulator.presets.deepseek_v4_1_debugmodel_text",
@@ -285,10 +304,11 @@ def prepare_config(simulation: SimulationConfig) -> PreparedConfig:
         "qwen3",
         "qwen3_5",
         "multi_head_moe",
+        "system3",
     }:
         raise ValueError(
             "Supported model families are deepseek_v4, deepseek_v4_1, kimi_k3, "
-            "kimi_k3_1, qwen3, qwen3_5 and multi_head_moe"
+            "kimi_k3_1, qwen3, qwen3_5, multi_head_moe and system3"
         )
     adaptations = []
     if simulation.model_overrides is not None:
@@ -334,9 +354,10 @@ def prepare_config(simulation: SimulationConfig) -> PreparedConfig:
                 "deepseek_v4_1": _DSV4_1_OVERRIDES,
                 "kimi_k3": _COMMON_OVERRIDES,
                 "kimi_k3_1": _COMMON_OVERRIDES,
+                "multi_head_moe": _MULTI_HEAD_MOE_OVERRIDES,
                 "qwen3": _QWEN3_OVERRIDES,
                 "qwen3_5": _QWEN3_5_OVERRIDES,
-                "multi_head_moe": _MULTI_HEAD_MOE_OVERRIDES,
+                "system3": _SYSTEM3_OVERRIDES,
             }[trainer.model_spec.name]
         )
         if simulation.override_imports is None

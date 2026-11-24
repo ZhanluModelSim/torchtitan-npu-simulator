@@ -1,6 +1,6 @@
 # TorchTitan simulator
 
-独立训练负载发生器：在 Meta 上复用原生模型、并行化、loss 和 optimizer，返回算子图、通信与控制依赖，以及静态显存预算。当前接入 DeepSeek-V4、DeepSeek-V4.1、Kimi K3／K3.1、Qwen3-32B（dense）、Qwen3.5 和 Multi-Head-MoE（SLA2）；性能预测、硬件配置及 DES 归下游平台。本包仅在显式调用时激活，不修改上游安装源码，生产主包不依赖 simulator。
+独立训练负载发生器：在 Meta 上复用原生模型、并行化、loss 和 optimizer，返回算子图、通信与控制依赖，以及静态显存预算。当前接入 DeepSeek-V4、DeepSeek-V4.1、Kimi K3／K3.1、Qwen3-32B（dense）、Qwen3.5、Multi-Head-MoE（SLA2）与 system3；性能预测、硬件配置及 DES 归下游平台。本包仅在显式调用时激活，不修改上游安装源码，生产主包不依赖 simulator。
 
 ## 从哪里开始
 

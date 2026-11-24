@@ -41,10 +41,11 @@
 | `torchtitan_npu.npu_moe_token_permute.default`、`npu_moe_token_permute_backward.default` | tokens 为 token × feature；indices 的公开包装契约支持 token 向量或 token × topk；输出为 routed rows |
 | `torchtitan_npu.npu_moe_token_unpermute.default`、`npu_moe_token_unpermute_grad_unweighted.default` | probs 存在时按 token/topk 合并；probs 为 None 时只恢复 routed rows，空 probs 仍属于前者；feature 也可为标量尺度展开后的大小 1 |
 | `qwen3_5_sim.flex_attention.default`、`flex_attention_grad.default` | 上游 torchtitan attention 布局 B/H/S/D；GQA 下 k/v 的 head 轴大小小于 q，轴语义不变；scale 与 enable_gqa 为标量参数，不属于张量语义；causal BlockMask 的 8 个块结构张量（kv/q 的 counts/indices 及 full_* documentary 计数）以 optional 依赖输入进入边界并声明 mask 语义，varlen `seq_lengths` 与 `dq_*` 字段显式拒绝 |
+| `system3_sim.swiglu_clamp(.backward)`、`gdn2_chunked(.backward)`、`isa_indexer(.grad)`、`isa_sparse_attention(.grad)`、`sparse_adam_update` | 声明位于 [`compat/system3_fusions.py`](../torchtitan_simulator/compat/system3_fusions.py) 与 [`compat/system3_engram.py`](../torchtitan_simulator/compat/system3_engram.py)；GDN2/ISA 沿用参考的 B/S/H(D) 状态与选择边界，ISA 注意力输出附 FP32 logsumexp，SparseAdam 更新声明 host 表权重与稀疏梯度行/值结构 |
 
 Kimi 反向节点同时声明保存输入角色、`output_gradient` 和输出梯度角色。原生 ATen、CANN、HCCL 算子不因注册本功能而新增语义轴；原生参数名绑定照常保留。控制节点及 offload payload 使用已有专属事实，不给它们猜测模型轴。
 
-本表覆盖当前 simulator 路径的九个 Kimi 虚拟融合、五个主包 MoE 包装 overload 与四个 Qwen3.5 虚拟融合 overload，不宣称其他未接入的 Triton、TileLang 或 DeepEP 自定义路径均已覆盖。
+本表覆盖当前 simulator 路径的九个 Kimi 虚拟融合、五个主包 MoE 包装 overload、四个 Qwen3.5 虚拟融合 overload 与九个 system3 虚拟边界（SwiGLU clamp、GDN2 chunked 前后向、ISA indexer/attention 及其梯度、Engram SparseAdam 更新），不宣称其他未接入的 Triton、TileLang 或 DeepEP 自定义路径均已覆盖。
 
 ## 维护位置与验证
 
