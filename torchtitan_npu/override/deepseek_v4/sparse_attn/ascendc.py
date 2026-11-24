@@ -63,7 +63,6 @@ from torchtitan_npu.override.deepseek_v4.metadata import (
     AicpuMetadata,
     AscLightningIndexerMetadata,
     AscSparseAttentionMetadata,
-    CompactSelectorFrameProof,
     lightning_indexer_options,
 )
 from torchtitan_npu.override.deepseek_v4.metadata import (
@@ -194,68 +193,10 @@ def _sparse_attention_records(
     return smla_metadata, smla_grad_metadata
 
 
-def _compact_selector_frame_proof(
-    q: KernelFrame,
-    key_frame: KernelFrame,
-    positions_q: torch.Tensor,
-    key_tokens: int,
-) -> CompactSelectorFrameProof | None:
-    """Validate once at the eager metadata boundary, never inside a layer graph.
-
-    The single scalar read combines compactness, monotonicity and canonical
-    endpoints. Noncompact frames remain available to backends that support
-    seqused; they simply receive no compact-only Pro proof.
-    """
-    q_cu, q_used = q.cu_seqlens, q.seqused
-    k_cu, k_used = key_frame.cu_seqlens, key_frame.seqused
-    if (
-        q_cu.ndim != 1
-        or k_cu.ndim != 1
-        or q_used.ndim != 1
-        or k_used.ndim != 1
-        or q_cu.numel() < 2
-        or q_cu.shape != k_cu.shape
-        or q_used.numel() != q_cu.numel() - 1
-        or k_used.numel() != k_cu.numel() - 1
-    ):
-        return None
-    q_lengths, k_lengths = torch.diff(q_cu), torch.diff(k_cu)
-    valid = (
-        (q_cu[0] == 0)
-        & (k_cu[0] == 0)
-        & (q_cu[-1] == positions_q.numel())
-        & (k_cu[-1] == key_tokens)
-        & (q_lengths >= 0).all()
-        & (k_lengths >= 0).all()
-        & (q_used == q_lengths).all()
-        & (k_used == k_lengths).all()
-    )
-    if not bool(valid):
-        return None
-    tensors = [q_cu, q_used, k_cu, k_used, positions_q]
-    try:
-        versions = tuple(tensor._version for tensor in tensors)
-    except RuntimeError:
-        # Inference tensors do not track versions. Do not change another
-        # backend's usable frames merely because Pro cannot certify them.
-        return None
-    return CompactSelectorFrameProof(
-        q_cu=q_cu,
-        q_seqused=q_used,
-        k_cu=k_cu,
-        k_seqused=k_used,
-        positions_q=positions_q,
-        selector_k_gather=None,
-        key_tokens=key_tokens,
-        versions=versions,
-    )
-
-
 def build_aicpu_metadata(
     metadata: DeepSeekV4Metadata,
     *,
     geometry: AicpuGeometry,
-    positions_q: torch.Tensor | None = None,
     include_selector: bool = True,
 ) -> AscV4Metadata:
     """The AscendC record tier over one geometry's frames (upstream #4897).
@@ -264,11 +205,6 @@ def build_aicpu_metadata(
     returns the same entry with this geometry's records attached.  Because a record describes the
     frames it was computed for, a re-cut entry -- the CP transform's rank-local chunks -- runs
     this again rather than reusing records of the frame they came from.
-
-    ``positions_q`` is the query axis this build describes -- the row's positions at build time,
-    this rank's after the CP transform re-cuts it.  Only the compact-only selector's proof needs
-    it; without one the entry simply carries no proof and that backend refuses, which is why it is
-    optional rather than read off the entry (the entry no longer stores the row's positions).
     """
     ratio = metadata.ratio
     q = metadata.q
@@ -295,20 +231,6 @@ def build_aicpu_metadata(
         sparse_attn=AscSparseAttentionMetadata(fwd=smla_metadata, bwd=smla_grad_metadata),
         lightning_indexer=AscLightningIndexerMetadata(fwd=li_record, bwd=slig_metadata),
     )
-    # The compact-only Pro selector certifies the exact tensors it reads, so it needs the query
-    # axis this build describes.  The entry no longer carries the row's positions -- the frames
-    # and the plan say everything else -- so the caller hands them in: the row's at build time,
-    # this rank's when the CP transform rebuilds the entry.
-    compact_proof = None
-    if (
-        include_selector
-        and positions_q is not None
-        and cmp_k is not None
-        and ratio == LI_CMP_RATIO
-        and geometry.index_num_heads == 64
-        and geometry.index_head_dim == 128
-    ):
-        compact_proof = _compact_selector_frame_proof(q, cmp_k, positions_q, int(cmp_k.cu_seqlens[-1]))
     result = AscV4Metadata(
         ratio=ratio,
         q=q,
@@ -320,7 +242,6 @@ def build_aicpu_metadata(
         cp=metadata.cp,
         aicpu_metadata=record,
         a3_workaround=workaround,
-        compact_selector_frame_proof=compact_proof,
     )
     _mark_dynamic(result)
     return result
@@ -615,9 +536,7 @@ class AscCompressedSparseInnerAttention(CompressedSparseInnerAttention):
             with spmd.no_typecheck():
                 cu = torch.unique_consecutive(documents.cu_seq_q)
             row = build_v4_metadata(positions, self.compress_ratio, cu_seq_q=cu, build_slots=False)
-            fused = build_aicpu_metadata(
-                row, geometry=self.geometry, positions_q=positions, include_selector=self.aux_loss is None
-            )
+            fused = build_aicpu_metadata(row, geometry=self.geometry, include_selector=self.aux_loss is None)
             return replace(fused, documents=documents)
 
     def __init__(self, config: Config) -> None:
@@ -710,4 +629,4 @@ class AscV4ContextParallelSparseAttention(CPInnerAttention, AscCompressedSparseI
             }
         if not isinstance(attention_metadata, AscV4Metadata):
             raise TypeError("V4 context parallel attention requires AscV4Metadata")
-        return AscV4Metadata.prepare_cp_metadata(attention_metadata, permutation=permutation)
+        return type(attention_metadata).prepare_cp_metadata(attention_metadata, permutation=permutation)

@@ -61,7 +61,6 @@ __all__ = [
     "DeepSeekV4Metadata",
     "KernelFrame",
     "build_v4_metadata",
-    "chunk_query_positions",
     "doc_chunk_entry",
 ]
 
@@ -316,20 +315,6 @@ def build_v4_metadata(
         batch_size=1,
         slots=slots,
     )
-
-
-def chunk_query_positions(cu_seq_q: torch.Tensor, cp_rank: int) -> torch.Tensor:
-    """The document-relative positions of one rank's chunk queries (``[C]``).
-
-    Chunk ``r`` of a document starts at ``r * length / cp_size``, so its queries carry that offset
-    plus ``0 .. chunk - 1``.  Device arithmetic over the rank-local query frame alone: the CP
-    transform has the boundaries, not the row's positions, and the caller that needs them (the
-    compact-only selector's proof) only ever asks about this rank's own axis.
-    """
-    lengths = torch.diff(cu_seq_q)
-    starts = torch.repeat_interleave(cu_seq_q[:-1], lengths)
-    offsets = torch.repeat_interleave(cp_rank * lengths, lengths)
-    return torch.arange(starts.numel(), device=cu_seq_q.device) - starts + offsets
 
 
 def doc_chunk_entry(

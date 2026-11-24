@@ -18,9 +18,10 @@ the LIG implementation in ``ops/pypto_pro/sparse_lightning_indexer_kl_loss_grad/
 and ``ops/pypto_pro/LICENSE``.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 
 import torch
+from torch.utils._pytree import SUPPORTED_NODES, register_dataclass
 
 from torchtitan_npu.models.deepseek_v4.compressor import InnerIndexer
 from torchtitan_npu.ops.pypto_pro.li_lig_wrapper import (
@@ -30,35 +31,93 @@ from torchtitan_npu.ops.pypto_pro.li_lig_wrapper import (
 from torchtitan_npu.override.a3_workaround import A3KeyWorkaround
 from torchtitan_npu.override.deepseek_v4.metadata import (
     AscV4Metadata,
-    CompactSelectorFrameProof,
     lightning_indexer_options,
 )
 
 
-def _pro_options(metadata: AscV4Metadata, ratio: int) -> dict:
-    key_frame = metadata.cmp_k
-    assert key_frame is not None, "the selector needs the entry's compressed frame"
-    proof = metadata.compact_selector_frame_proof
-    if not isinstance(proof, CompactSelectorFrameProof):
-        raise ValueError(
-            "PyPTO-Pro requires compact frames validated by the eager metadata builder with tracked tensor versions; "
-            "manual, noncompact or inference-mode metadata must be rebuilt outside inference_mode"
-        )
+@dataclass(kw_only=True, slots=True)
+class _ProMetadata(AscV4Metadata):
+    """The packed frames checked before the layer graph and the versions used at kernel launch."""
+
+    frame_tensors: tuple[torch.Tensor, ...]
+    frame_versions: tuple[int, ...]
+    key_tokens: int
+
+    @staticmethod
+    def prepare_cp_metadata(attention_metadata, *, permutation):
+        local = AscV4Metadata.prepare_cp_metadata(attention_metadata, permutation=permutation)
+        return _validate_compact_frames(local)
+
+
+if _ProMetadata not in SUPPORTED_NODES:
+    register_dataclass(_ProMetadata, serialized_type_name=f"{_ProMetadata.__module__}.{_ProMetadata.__name__}")
+
+
+def _frame_tensors(metadata: AscV4Metadata) -> tuple[torch.Tensor, ...]:
+    key = metadata.cmp_k
+    if key is None:
+        raise ValueError("PyPTO-Pro requires a compressed key frame")
+    return metadata.q.cu_seqlens, metadata.q.seqused, key.cu_seqlens, key.seqused, metadata.position_k
+
+
+def _validate_compact_frames(metadata: AscV4Metadata) -> _ProMetadata:
+    """LI and LIG read packed boundaries and cannot limit a frame to its seqused prefix."""
+    if not isinstance(metadata, AscV4Metadata):
+        raise TypeError("PyPTO-Pro requires metadata from sparse_attn.asc")
+    geometry = metadata.aicpu_metadata.geometry
+    if (geometry.index_num_heads, geometry.index_head_dim) != (64, 128):
+        raise ValueError("PyPTO-Pro LI/LIG training requires 64 indexer heads of width 128")
+    tensors = _frame_tensors(metadata)
+    q_cu, q_used, k_cu, k_used, positions = tensors
     if (
-        proof.q_cu is not metadata.q.cu_seqlens
-        or proof.q_seqused is not metadata.q.seqused
-        or proof.k_cu is not key_frame.cu_seqlens
-        or proof.k_seqused is not key_frame.seqused
+        q_cu.ndim != 1
+        or q_cu.numel() < 2
+        or k_cu.shape != q_cu.shape
+        or q_used.shape != (q_cu.numel() - 1,)
+        or k_used.shape != q_used.shape
     ):
-        raise ValueError("PyPTO-Pro compact-frame proof is stale; rebuild metadata after replacing frame tensors")
-    options = lightning_indexer_options(ratio=ratio, q=metadata.q, cmp_k=key_frame)
-    # This Pro kernel pair reads compact boundaries, not seqused. The eager
-    # builder verified that contract for these tensors. Real opaque callbacks
-    # also reject in-place changes using host version counters, without a
-    # device-value read in this graph.
+        raise ValueError("PyPTO-Pro compact frames require one length per document")
+    q_lengths, k_lengths = torch.diff(q_cu), torch.diff(k_cu)
+    compact = (
+        (q_cu[0] == 0)
+        & (k_cu[0] == 0)
+        & (q_cu[-1] == positions.numel())
+        & (q_lengths >= 0).all()
+        & (k_lengths >= 0).all()
+        & (q_used == q_lengths).all()
+        & (k_used == k_lengths).all()
+    )
+    # Read the extent and check all conditions in one device synchronization.
+    key_tokens = int(torch.where(compact, k_cu[-1], -1))
+    if key_tokens < 0:
+        raise ValueError("PyPTO-Pro requires compact query and key frames covering the packed operands")
+    try:
+        versions = tuple(tensor._version for tensor in tensors)
+    except RuntimeError as error:
+        raise ValueError(
+            "PyPTO-Pro frame tensors need tracked versions; build metadata outside inference_mode"
+        ) from error
+    return _ProMetadata(
+        **{field.name: getattr(metadata, field.name) for field in fields(AscV4Metadata)},
+        frame_tensors=tensors,
+        frame_versions=versions,
+        key_tokens=key_tokens,
+    )
+
+
+def _pro_options(metadata: _ProMetadata, ratio: int) -> dict:
+    if any(
+        checked is not current
+        for checked, current in zip(metadata.frame_tensors, _frame_tensors(metadata), strict=True)
+    ):
+        raise ValueError("PyPTO-Pro frame tensors were replaced; rebuild metadata before launching LI/LIG")
+    key = metadata.cmp_k
+    assert key is not None
+    options = lightning_indexer_options(ratio=ratio, q=metadata.q, cmp_k=key)
+    # The real opaque callbacks also reject in-place changes using host version counters.
     del options["seqused_q"], options["seqused_k"]
-    options["guard_tensors"] = proof.tensors()
-    options["guard_versions"] = list(proof.versions)
+    options["guard_tensors"] = list(metadata.frame_tensors)
+    options["guard_versions"] = list(metadata.frame_versions)
     return options
 
 
@@ -75,20 +134,13 @@ class _PyPTOProIndexerTND(torch.autograd.Function):
         ratio,
         attention_metadata,
     ):
-        if not isinstance(attention_metadata, AscV4Metadata):
-            raise TypeError("the fused selector needs AscV4Metadata")
+        if not isinstance(attention_metadata, _ProMetadata):
+            raise TypeError("PyPTO-Pro requires the compact metadata prepared by its indexer config")
         li_metadata = attention_metadata.aicpu_metadata.lightning_indexer.fwd
         if li_metadata is None:
             raise ValueError("the fused selector needs the entry's forward record")
-        proof = attention_metadata.compact_selector_frame_proof
-        if proof is None:
-            raise ValueError(
-                "PyPTO-Pro requires compact frames validated by the eager metadata builder "
-                "with tracked tensor versions; "
-                "manual, noncompact or inference-mode metadata must be rebuilt outside inference_mode"
-            )
-        torch._check(idx_q.shape[0] == proof.positions_q.numel())
-        torch._check(idx_k.shape[0] == proof.key_tokens)
+        torch._check(idx_q.shape[0] == attention_metadata.position_k.numel())
+        torch._check(idx_k.shape[0] == attention_metadata.key_tokens)
         topk_indices = lightning_indexer_indices(
             idx_q,
             idx_k,
@@ -139,7 +191,9 @@ class PyPTOProInnerIndexer(InnerIndexer):
 
     @dataclass(kw_only=True, slots=True)
     class Config(InnerIndexer.Config):
-        pass
+        @staticmethod
+        def prepare_attention_metadata(metadata: AscV4Metadata) -> _ProMetadata:
+            return _validate_compact_frames(metadata)
 
     def forward(self, idx_q, idx_k, idx_w, *, attention_metadata):
         if not isinstance(attention_metadata, AscV4Metadata):

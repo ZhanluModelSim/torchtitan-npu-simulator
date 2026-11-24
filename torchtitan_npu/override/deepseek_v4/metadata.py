@@ -137,31 +137,6 @@ class AicpuMetadata:
     lightning_indexer: AscLightningIndexerMetadata
 
 
-@dataclass(frozen=True, kw_only=True, slots=True, eq=False)
-class CompactSelectorFrameProof:
-    """Eager validation bound to the exact compact selector frame tensors.
-
-    Tensor references are pytree leaves, not hidden host context: a frame
-    replacement must not inherit a proof for different boundaries or prefixes.
-    Versions are checked by the real opaque Pro callbacks, outside tracing.
-    """
-
-    q_cu: torch.Tensor
-    q_seqused: torch.Tensor
-    k_cu: torch.Tensor
-    k_seqused: torch.Tensor
-    positions_q: torch.Tensor
-    selector_k_gather: torch.Tensor | None
-    key_tokens: int
-    versions: tuple[int, ...]
-
-    def tensors(self) -> list[torch.Tensor]:
-        tensors = [self.q_cu, self.q_seqused, self.k_cu, self.k_seqused, self.positions_q]
-        if self.selector_k_gather is not None:
-            tensors.append(self.selector_k_gather)
-        return tensors
-
-
 @dataclass(kw_only=True, slots=True)
 class AscV4Metadata(DeepSeekV4Metadata):
     """The fused entry: the model row and frames, plus this geometry's AscendC records.
@@ -172,9 +147,7 @@ class AscV4Metadata(DeepSeekV4Metadata):
     - ``aicpu_metadata``: the operator outputs computed for exactly these frames at the eager
       boundary and rebuilt per rank under context parallelism;
     - ``a3_workaround``: arch22's compaction of the two key streams, because every fused kernel
-      right-aligns its mask at the end of the key frame it is given;
-    - ``compact_selector_frame_proof``: the eager certificate the compact-only Pro selector
-      requires, bound to the exact frame tensors it reads.
+      right-aligns its mask at the end of the key frame it is given.
 
     Consumers read the fields directly (``cmp_k.seqused``, ``aicpu_metadata.sparse_attn.bwd``);
     one model runs one selection width, so there is nothing to look up.
@@ -190,9 +163,6 @@ class AscV4Metadata(DeepSeekV4Metadata):
     Built once per microbatch beside the records, so the forward, the backward and the selector read
     one frame and one gather each instead of re-deriving them per layer.
     """
-
-    compact_selector_frame_proof: CompactSelectorFrameProof | None = None
-    """Eager proof for the compact-only Pro selector; absent for unverified frames."""
 
     @staticmethod
     def prepare_cp_metadata(  # pyrefly: ignore [bad-override]
@@ -212,7 +182,6 @@ class AscV4Metadata(DeepSeekV4Metadata):
         del permutation
         # Lazy: the builder imports this module's classes, so the two cannot import each other
         # eagerly; the hook runs at the eager metadata boundary, never inside a graph.
-        from torchtitan_npu.models.deepseek_v4.metadata import chunk_query_positions
         from torchtitan_npu.override.deepseek_v4.sparse_attn.ascendc import build_aicpu_metadata
         from torchtitan_npu.patches.torchtitan.models.common.attention_metadata import cp_shard_context
 
@@ -232,11 +201,7 @@ class AscV4Metadata(DeepSeekV4Metadata):
             cp_rank=context.cp_mesh.get_local_rank(),
             slab_len=row_len // context.cp_mesh.size(),
         )
-        return build_aicpu_metadata(
-            local,
-            geometry=attention_metadata.aicpu_metadata.geometry,
-            positions_q=chunk_query_positions(local.q.cu_seqlens, context.cp_mesh.get_local_rank()),
-        )
+        return build_aicpu_metadata(local, geometry=attention_metadata.aicpu_metadata.geometry)
 
 
 if AscSparseAttentionMetadata not in SUPPORTED_NODES:
@@ -256,12 +221,6 @@ if AicpuGeometry not in SUPPORTED_NODES:
 
 if AicpuMetadata not in SUPPORTED_NODES:
     register_dataclass(AicpuMetadata, serialized_type_name=f"{AicpuMetadata.__module__}.{AicpuMetadata.__name__}")
-
-if CompactSelectorFrameProof not in SUPPORTED_NODES:
-    register_dataclass(
-        CompactSelectorFrameProof,
-        serialized_type_name=f"{CompactSelectorFrameProof.__module__}.{CompactSelectorFrameProof.__name__}",
-    )
 
 if AscV4Metadata not in SUPPORTED_NODES:
     register_dataclass(AscV4Metadata, serialized_type_name=f"{AscV4Metadata.__module__}.{AscV4Metadata.__name__}")
