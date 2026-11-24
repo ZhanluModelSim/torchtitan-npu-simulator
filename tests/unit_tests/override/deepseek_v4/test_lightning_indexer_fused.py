@@ -72,15 +72,18 @@ def _kernel_indices() -> torch.Tensor:
     )
 
 
-def test_the_selection_is_sorted_before_it_is_saved(monkeypatch):
-    """``-1`` lands at the tail and the saved order is the emitted order."""
+def test_kernel_scores_and_backward_teacher_keep_the_same_slots(monkeypatch):
+    """The same permutation moves logits and indices, including padding, before backward."""
     md = _metadata()
     captured = {}
+    kernel_scores = torch.arange(_TOKENS * _TOPK, dtype=torch.float32).reshape(_TOKENS, 1, _TOPK)
+    kernel_scores.masked_fill_(_kernel_indices() < 0, -torch.inf)
 
     def fake_li(q, k, w, topk, *, metadata, return_value, **options):
         captured["metadata"] = metadata
         captured["options"] = options
-        return _kernel_indices(), None
+        assert return_value == 1
+        return _kernel_indices(), kernel_scores
 
     def fake_slig(*, q, k, w, sparse_indices, attn_softmax_l1_norm, metadata, **options):
         captured["indices"] = sparse_indices
@@ -105,25 +108,18 @@ def test_the_selection_is_sorted_before_it_is_saved(monkeypatch):
 
     assert picks.shape == (_TOKENS, _TOPK) and picks.dtype == torch.int32
     assert scores.shape == picks.shape and scores.dtype == torch.float32
-    assert torch.equal(
-        picks,
-        _kernel_indices().sort(dim=-1, descending=True).values.reshape(_TOKENS, _TOPK),
-    )
-    for row in picks:
-        first_pad = (row < 0).nonzero()
-        if first_pad.numel():
-            assert (row[first_pad[0] :] < 0).all()
+    expected, order = _kernel_indices().sort(dim=-1, descending=True)
+    torch.testing.assert_close(picks, expected.squeeze(1), rtol=0, atol=0)
+    torch.testing.assert_close(scores, kernel_scores.gather(-1, order).squeeze(1), rtol=0, atol=0)
 
     # The forward metadata is the entry's own record; the options are the frame contract.
     assert captured["metadata"] is md.aicpu_metadata.lightning_indexer.fwd
     # The options are the entry's own frame -- the one its keys were compacted onto.
     assert captured["options"] == lightning_indexer_options(ratio=md.ratio, q=md.q, cmp_k=md.cmp_k)
 
-    # The value of the carrier is never read: overwrite it with NaN and still drive the edge.
     teacher = torch.zeros_like(scores)
     teacher[..., 0] = 0.1
     teacher[..., 1] = 0.3
-    scores.data.fill_(float("nan"))
     scores.backward(teacher)
 
     # The saved indices are exactly what SMLAG would have been handed, and the teacher reaches
@@ -147,7 +143,7 @@ def test_the_carrier_is_a_function_output(monkeypatch):
     monkeypatch.setattr(
         torch.ops.cann_ops_transformer,
         "lightning_indexer",
-        lambda *a, **k: (_kernel_indices(), None),
+        lambda *a, **k: (_kernel_indices(), torch.zeros((_TOKENS, 1, _TOPK))),
         raising=False,
     )
     idx_q = torch.zeros(_TOKENS, _HEADS, _HEAD_DIM, requires_grad=True)

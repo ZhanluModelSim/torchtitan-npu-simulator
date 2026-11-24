@@ -127,7 +127,7 @@ class _LightningIndexerTND(torch.autograd.Function):
         options = entry_options(ratio, attention_metadata)
         # The precomputed metadata is read instead of re-running the AI_CPU operator per layer.
         li_metadata = attention_metadata.aicpu_metadata.lightning_indexer.fwd
-        topk_indices, _ = torch.ops.cann_ops_transformer.lightning_indexer(
+        topk_indices, topk_scores = torch.ops.cann_ops_transformer.lightning_indexer(
             idx_q,
             idx_k,
             idx_w,
@@ -136,34 +136,9 @@ class _LightningIndexerTND(torch.autograd.Function):
             return_value=1,
             **options,
         )
-
-        # The kernel's own order is unspecified, so the selection is sorted into position
-        # order here -- inside the Function, before anything is saved.  That placement is
-        # the whole point: the teacher arrives on ``topk_scores``' *gradient*, positioned
-        # per slot by whatever selection SMLA was handed, and SLIKG consumes it next to
-        # ``topk_indices``.  Sorting after ``apply`` returns would leave the saved indices
-        # in kernel order while the teacher is in sorted order, and SLIKG would pair each
-        # slot's mass with a different key.  Sorting here keeps the two in step by
-        # construction, and the kernel layout stays in one place.
-        #
-        # Descending gives both properties with one sort: the valid entries come out in
-        # descending position order and ``-1``, being the smallest index, lands behind
-        # every one of them.  (The reference sorts ascending instead; neither the kernel
-        # schema nor the operator docs fix a direction.)
-        topk_indices = topk_indices.sort(dim=-1, descending=True).values
-        # The carrier for the teacher edge, fabricated rather than taken from the kernel's
-        # second output.  The gradient this Function's backward receives on it *is* the
-        # teacher -- ``attn_softmax_l1_norm`` there feeds SLIKG -- so it has to be an output
-        # of this Function that the engine differentiates through, and returning it from
-        # here is what supplies that ``grad_fn``.  A tensor built by the caller after
-        # ``apply`` returns cannot have it and leaves the indexer untrained.
-        #
-        # Nothing reads its value: SMLAG replaces it wholesale and the attention's core
-        # accepts and ignores it.  Shape, dtype and the edge are the whole contract, which
-        # is why the kernel's own scores are dropped rather than permuted across to here.
-        # The shape is the selection's own, ``[T, 1, K]`` -- SLIKG requires the teacher to
-        # match ``sparse_indices`` exactly.
-        topk_scores = topk_indices.new_empty(topk_indices.shape, dtype=torch.float32, requires_grad=True)
+        # Preserve SMLA's accumulation order and align the logits with the saved SLIKG slots.
+        topk_indices, order = topk_indices.sort(dim=-1, descending=True)
+        topk_scores = topk_scores.gather(-1, order)
         ctx.save_for_backward(idx_q, idx_k, idx_w, topk_indices, num_global_queries)
         ctx.topk, ctx.ratio = topk, ratio
         # The metadata is a dataclass, so ``save_for_backward`` cannot take it; it is a
@@ -260,10 +235,6 @@ class AscInnerIndexer(InnerIndexer):
             attention_metadata,
             self.num_global_queries,
         )
-        # Two layout translations and nothing else: ``_LightningIndexerTND`` already
-        # emitted the selection sorted, in the kernels' ``[T, 1, K]`` layout, and the model
-        # contract is ``[1, L, K]``.  Sorting at this level instead would desynchronise the
-        # saved indices from the teacher (see the Function).
         topk_indices_BLK = topk_indices.reshape(-1, topk)
         topk_scores_BLK = topk_scores.reshape(-1, topk)
         return topk_indices_BLK, topk_scores_BLK, None

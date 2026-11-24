@@ -6,8 +6,8 @@
 """The DeepSeek-V4 selector's BF16 port: InnerIndexer fused with SLIKG.
 
 The forward runs the CANN ``lightning_indexer`` selection and returns the document-local
-indices plus a ``topk_scores`` carrier.  Nothing reads the carrier's value: it exists so
-autograd has an output to carry the teacher that SMLAG's backward produces
+indices and their matching FP32 logits.  The gradient of the logits carries the teacher
+that SMLAG's backward produces
 (``sparse_flash_mla_grad``'s ``cmp_softmax_l1_norm``).  This Function's backward consumes
 that edge with ``sparse_lightning_indexer_kl_loss_grad`` and emits ``dq/dk/dw``.
 
@@ -16,7 +16,7 @@ the selector's two records (``lightning_indexer`` and SLIKG) live beside the att
 because the teacher edge crosses both kernels' backwards.
 
 This module owns the whole AscendC selector -- the autograd bridge, the input preparation,
-the canonical sort, the teacher carrier and the backward -- so its kernel pair is stated once,
+the kernel-scored selection and its backward -- so its kernel pair is stated once,
 here.  The PyPTO port is a separate implementation of the same contract in
 ``lightning_indexer.pypto``; the two do not share code, so each can follow its runtime's
 calling conventions without a common abstraction between them.
@@ -66,7 +66,7 @@ class _LightningIndexerTND(torch.autograd.Function):
         # is what the keys below are compacted onto, and what its records were built from.
         assert attention_metadata.cmp_k is not None, "the selector needs the entry's pool"
         options = lightning_indexer_options(ratio=ratio, q=attention_metadata.q, cmp_k=attention_metadata.cmp_k)
-        topk_indices, _ = torch.ops.cann_ops_transformer.lightning_indexer(
+        topk_indices, topk_scores = torch.ops.cann_ops_transformer.lightning_indexer(
             idx_q,
             idx_k,
             idx_w,
@@ -75,21 +75,9 @@ class _LightningIndexerTND(torch.autograd.Function):
             return_value=1,
             **options,
         )
-        # The kernel's own order is unspecified, so the selection is canonicalised here --
-        # inside the Function, before anything is saved.  That placement is the whole point:
-        # the teacher arrives on ``topk_scores``' gradient, positioned per slot by whichever
-        # selection SMLAG was handed, and SLIKG consumes it next to ``topk_indices``.  Sorting
-        # after ``apply`` would leave the saved indices in kernel order while the teacher is
-        # sorted, pairing each slot's mass with a different key.
-        #
-        # Descending gives both properties with one sort: the valid entries keep position
-        # order and ``-1`` (the smallest index) lands behind every one of them.
-        topk_indices = topk_indices.sort(dim=-1, descending=True).values
-        # The teacher carrier: shape, dtype and the autograd edge are the whole contract.
-        # SMLAG replaces the value wholesale; SMLA accepts and ignores it.  Building it here,
-        # as a Function output, is what supplies the ``grad_fn``; a tensor made by the caller
-        # after ``apply`` returns would leave the indexer untrained.
-        topk_scores = topk_indices.new_empty(topk_indices.shape, dtype=torch.float32, requires_grad=True)
+        # Preserve SMLA's accumulation order and align the logits with the saved SLIKG slots.
+        topk_indices, order = topk_indices.sort(dim=-1, descending=True)
+        topk_scores = topk_scores.gather(-1, order)
         ctx.save_for_backward(idx_q, idx_k, idx_w, topk_indices)
         ctx.ratio = ratio
         # The metadata is a dataclass, so ``save_for_backward`` cannot take it; it is a context

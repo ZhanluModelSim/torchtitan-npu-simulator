@@ -296,9 +296,6 @@ def test_fused_selection_matches_the_reference_selector(monkeypatch):
     # so it is never widened.  The reference selector's int64 is a ``torch.topk`` artefact,
     # and ``gather_attn`` takes either dtype, so nothing is cast on that side.
     assert fi.dtype == torch.int32
-    # The fused carrier is a fabricated FP32 buffer of the selection's shape.  Its
-    # *contents* are meaningless by construction -- the teacher rides its gradient, not
-    # its values -- so only shape, dtype and the graph edge are asserted here.
     assert fs.dtype == torch.float32
     assert es.dtype == fs.dtype == torch.float32
     assert fs.shape == fi.shape
@@ -549,25 +546,14 @@ def test_both_kernels_receive_the_layout_their_contract_requires(monkeypatch):
     assert seen["slig_indices"] == seen["slig_teacher"] == (seq_len, 1, topk)
 
 
-def test_the_selection_is_sorted_with_padding_last(monkeypatch):
-    """The model contract is one position order with the padding at the tail.
-
-    The kernel's own order is unspecified, so the port re-sorts.  The direction is ours --
-    neither the kernel schema nor the operator docs fix one, and the reference happens to
-    sort ascending -- and is descending, because keying the sort on ``-index`` pushes
-    ``-1`` behind every valid entry for free.
-
-    The fake is made to emit a deliberately unsorted order, because a fake that
-    pre-sorts cannot see whether the port sorts at all.
-
-    Both the indices and the scores must move together: the scores are the carrier whose
-    gradient is the teacher, and the teacher is per slot.
-    """
-    real_fake = _fake_lightning_indexer
+def test_canonical_order_keeps_scores_paired_with_their_indices(monkeypatch):
+    captured = {}
 
     def unsorted_fake(*args, **kw):
-        indices, values = real_fake(*args, **kw)
-        return indices.flip(-1).contiguous(), values.flip(-1).contiguous()
+        indices, values = _fake_lightning_indexer(*args, **kw)
+        captured["indices"] = indices.flip(-1).contiguous()
+        captured["scores"] = values.flip(-1).contiguous()
+        return captured["indices"], captured["scores"]
 
     monkeypatch.setattr(torch.ops.cann_ops_transformer, "lightning_indexer", unsorted_fake)
     model = _tiny_model(monkeypatch, fused=True)
@@ -583,23 +569,10 @@ def test_the_selection_is_sorted_with_padding_last(monkeypatch):
     w = torch.randn(128, selector.num_index_heads, requires_grad=True)
     indices, scores, _ = selector.forward(q, k, w, metadata, candidates_BL1C=None)
 
-    checked = 0
-    for t in range(indices.shape[0]):
-        row = indices[t]
-        valid = row[row >= 0]
-        if valid.numel() < 2:
-            continue
-        # Descending positions, and no valid entry after the first padding.
-        assert torch.all(valid[1:] < valid[:-1]), (t, valid[:8].tolist())
-        first_pad = int((row < 0).nonzero()[0]) if bool((row < 0).any()) else row.numel()
-        assert torch.all(row[first_pad:] < 0), t
-        checked += 1
-    assert checked > 0, "the batch must contain rows with a real selection"
-    # The carrier is a fabricated buffer of the selection's shape, produced by the
-    # autograd Function so that the teacher's gradient has a path back to the indexer.
-    # Its values are read by neither side, so nothing is asserted about them.
-    assert scores.shape == indices.shape
-    assert scores.requires_grad
+    expected, order = captured["indices"].sort(dim=-1, descending=True)
+    torch.testing.assert_close(indices, expected.squeeze(1), rtol=0, atol=0)
+    torch.testing.assert_close(scores, captured["scores"].gather(-1, order).squeeze(1), rtol=0, atol=0)
+    assert scores.requires_grad and scores.grad_fn is not None
 
 
 def test_lightning_indexer_asc_stack_applies_without_claim_conflicts(monkeypatch):
