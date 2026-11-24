@@ -144,7 +144,7 @@ def _v41_attention():
             index_topk=512,
             num_index_heads=32,
             index_head_dim=128,
-            selector=SimpleNamespace(candidate_topk_blocks=2048, candidate_block_size=8),
+            inner_indexer=SimpleNamespace(candidate_topk_blocks=2048, candidate_block_size=8),
         ),
     )
 
@@ -276,11 +276,10 @@ def test_family_configs_are_split_and_registered(converter_module):
         "sparse_attention",
     )
 
-    # The lightning_indexer suffix differs per family; sparse_attention is V4.1-only.
-    assert (
-        converter_module._DSV4_CONFIG_FILTERS["lightning_indexer"]
-        is not converter_module._DSV41_CONFIG_FILTERS["lightning_indexer"]
-    )
+    for filters in (converter_module._DSV4_CONFIG_FILTERS, converter_module._DSV41_CONFIG_FILTERS):
+        matches_indexer = filters["lightning_indexer"]
+        assert matches_indexer(_v41_attention().indexer.inner_indexer, "layers.0.attention.indexer.inner_indexer")
+        assert not matches_indexer(_v41_attention().indexer, "layers.0.attention.indexer")
     assert "sparse_attention" not in converter_module._DSV4_CONFIG_FILTERS
     assert "sparse_attention" in converter_module._DSV41_CONFIG_FILTERS
 
@@ -332,9 +331,9 @@ def test_recipe_converters_reject_unknown_model_type(converter_module):
     [("deepseek_v4", "v4"), ("deepseek_v4_1", "v41")],
 )
 def test_apply_quantization_converter_passes_model_type(converter_module, monkeypatch, model_name, expected_model_type):
-    from torchtitan_npu.config.configs import QuantizationExtensionConfig
-
     from torchtitan.config.parallelism import ParallelismConfig
+
+    from torchtitan_npu.config.configs import QuantizationExtensionConfig
 
     registry = importlib.import_module(f"torchtitan_npu.models.{model_name}")
     model_config = (
@@ -481,7 +480,7 @@ def test_v41_teacher_pair_survives_each_supported_switch_combination(
 
     from torchtitan_npu.config.configs import QuantizationExtensionConfig
     from torchtitan_npu.models.deepseek_v4_1 import model_registry
-    from torchtitan_npu.models.deepseek_v4_1.indexer import Selector
+    from torchtitan_npu.models.deepseek_v4_1.indexer import InnerIndexer
 
     converted = converter_module.apply_quantization_converter(
         model_registry("deepseek_v4_1_debugmodel"),
@@ -504,7 +503,7 @@ def test_v41_teacher_pair_survives_each_supported_switch_combination(
     )
 
     for layer in converted.layers:
-        selector = layer.attention.indexer.selector
+        selector = layer.attention.indexer.inner_indexer
         inner_attention = layer.attention.inner_attention
         selector_quant = getattr(selector, "_torchao_npu_config", None)
         attention_quant = getattr(inner_attention, "_torchao_npu_config", None)
@@ -514,9 +513,8 @@ def test_v41_teacher_pair_survives_each_supported_switch_combination(
         if inner_attention.compress_ratio > 0:
             # The trainer discovers instances, not configs, to assign the step denominator.
             selector_module = selector.build()
-            assert isinstance(selector_module, Selector)
+            assert isinstance(selector_module, InnerIndexer)
             assert selector_module.num_global_queries is None
-
 
 
 @pytest.mark.parametrize("li_quantization", ["mxfp8", "fp8", "hif8"])
@@ -591,8 +589,9 @@ def test_converted_v41_compressor_quantizes_post_rope_and_preserves_gradients(co
         torch.testing.assert_close(parameter.grad, reference_parameter.grad, rtol=0, atol=0)
 
 
-def test_v4_quantized_indexer_adapter_preserves_backward_record_and_frames(converter_module):
-    from torchao_npu.quantized_modules.deepseek_v4.attention_metadata import QuantV4Metadata
+def test_v4_quantized_indexer_adapter_preserves_backward_record_and_frames(converter_module, monkeypatch):
+    from torchao_npu.quantized_modules.deepseek_v4.attention_metadata import attach_selector_record
+    from torchtitan.models.common.attention import create_varlen_metadata_for_document
 
     from torchtitan_npu.models.deepseek_v4.metadata import build_v4_metadata
     from torchtitan_npu.override.deepseek_v4.metadata import (
@@ -600,14 +599,17 @@ def test_v4_quantized_indexer_adapter_preserves_backward_record_and_frames(conve
         AicpuMetadata,
         AscLightningIndexerMetadata,
         AscSparseAttentionMetadata,
+        AscV4Metadata,
     )
 
     positions = torch.arange(8)
+    documents = create_varlen_metadata_for_document(positions, max_num_documents=3, max_context_length=8)
     row = build_v4_metadata(positions, ratio=4, build_slots=False)
     forward_record = torch.tensor([7], dtype=torch.int32)
     backward_record = torch.tensor([9], dtype=torch.int32)
-    metadata = QuantV4Metadata(
+    base_metadata = AscV4Metadata(
         ratio=row.ratio,
+        documents=documents,
         position_k=row.position_k,
         q=row.q,
         swa_k=row.swa_k,
@@ -617,9 +619,18 @@ def test_v4_quantized_indexer_adapter_preserves_backward_record_and_frames(conve
                 num_heads=2, head_dim=8, window_size=8, index_topk=4, index_num_heads=2, index_head_dim=4
             ),
             sparse_attn=AscSparseAttentionMetadata(),
-            lightning_indexer=AscLightningIndexerMetadata(fwd=forward_record, bwd=backward_record),
+            lightning_indexer=AscLightningIndexerMetadata(bwd=backward_record),
         ),
     )
+    monkeypatch.setattr(
+        torch.ops.cann_ops_transformer,
+        "quant_lightning_indexer_metadata",
+        lambda *a, **kw: forward_record,
+        raising=False,
+    )
+    metadata = attach_selector_record(base_metadata, geometry=base_metadata.aicpu_metadata.geometry, quant_mode=0)
+    assert metadata.documents is documents
+    torch.testing.assert_close(metadata.cu_seq_q, torch.tensor([0, 8, 8, 8], dtype=torch.int32))
     query = torch.zeros(8, 2, 4, dtype=torch.bfloat16)
     key = torch.zeros(2, 4, dtype=torch.bfloat16)
     weights = torch.zeros(8, 2, dtype=torch.bfloat16)

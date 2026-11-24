@@ -18,19 +18,19 @@ DeepSeek-V4 配方通过 `config.override.imports` 显式选择算子，不读�
 模型张量 [B, S, ...]
         │
         ├─ positions
-        │      └─ DeepSeekV4Metadata（attention backend 的 config 每 microbatch 构建一次公共契约；
-        │         AscendC 记录由 AscCompressedSparseInnerAttention.Config 一并注入）
+        │      └─ 文档边界。融合后端按压缩比构建 AscV4Metadata
         │
         ├─ Compressor：扁平 ratio 折叠 + softmax gate → 池化键流；CP 下由 CarryExchange 提供 carry
         │     负责「前一块 carry + prepend + 压缩 + 裁掉多出块」，输出本地压缩 chunk，由内核边界 all-gather 成整行
         │
-        ├─ 默认内核（CompressedSparseInnerAttention）
-        │     gather_attn(q, swa_k, cmp_k, topk_indices) + sink；选择由 LightningIndexer 给出
+        ├─ CSA 的 indexer.inner_indexer → (topk_indices, topk_scores)
+        │
+        ├─ 参考 inner_attention（CompressedSparseAttention）
+        │     按 topk_indices 调用 gather_attn，配置辅助损失时读取 topk_scores
         │
         └─ AscendC 融合内核（AscCompressedSparseInnerAttention）
              q/swa_k flatten → [T, N, D] / [T, 1, D]
              cmp_k 整行 / 本地 chunk（CP 由 S(1) -> R 声明式 all-gather）→ TND
-             LI（独立 override：fwd lightning_indexer / bwd SLIKG）
              SMLA / SMLAG（SMLAG 反向把 teacher 写到 topk_scores 梯度）
              output [T, N, D] → [B, S, N, D]
 ```
@@ -49,7 +49,10 @@ TND 只存在于 NPU 融合内核的局部计算中，不会成为模型公共�
 
 ## 压缩布局：DeepSeekV4Metadata
 
-[`metadata.py`](../../torchtitan_npu/models/deepseek_v4/metadata.py) 定义公共注意力契约 `DeepSeekV4Metadata`（V4.1 形状：一个类、一组字段，CP / 非 CP 只有数值不同）。每个 microbatch 由 attention backend 自己的 config 构建一次（upstream PR #4897 的接缝）：`CompressedSparseInnerAttention.Config.build_attention_metadata` 从 `positions` 用 `build_v4_metadata` 生成这个几何的行与折叠网格；融合路径的 `AscCompressedSparseInnerAttention.Config` 在其上按 `AicpuGeometry` 生成 AscendC 记录（LI record 也由它在同一入口构建）。参考契约的 `prepare_cp_metadata` 直接拒绝 CP；融合路径的 hook 调 `doc_chunk_entry`（`models/common/restore.chunk_plan` 推导静态 doc-chunk 计划），把 entry 换成本 rank 的 `q` / `swa_k` / `cmp_k` frame 与 `cp` 计划，再按这些 frame 重建记录。CP 下输入布局在 `DeepSeekV4Model.preprocess_inputs` 里**每 batch 一次**搬到 doc-chunk，本层的 KV 侧再用 entry 的 `cp.restore` 恢复回 slab。`Decoder` 每个 microbatch 为每个几何构建一次，供所有同几何 DSA 层共享：
+参考配方沿用 TorchTitan 的文档边界。融合配方的 `AscCompressedSparseInnerAttention.Config`
+根据 `positions` 和 padding mask 构建 `AscV4Metadata`。其中 `documents` 保留投影需要的完整边界，
+`q`、`swa_k`、`cmp_k` 是供 CANN 内核使用的 frame。相同压缩比的层共享每个 microbatch 的这份记录。
+文档布局和 frame 定义见 [metadata.py](../../torchtitan_npu/models/deepseek_v4/metadata.py)。
 
 - `ratio`：这个 entry 的压缩比（1、4、128 之一）；每个 consumer 都按它寻址。
 - `q` / `swa_k` / `cmp_k`：V4.1 形态的三个 frame（`cu_seqlens` / `seqused` / `residual`）。CP 下 `q` 是本 rank 的文档 chunk，`swa_k` / `cmp_k` 是整行，`seqused` 是本 rank 的 reach；非 CP 下三者都退化为边界差。没有 `cu_seq_q` / `cu_seq_k` 别名：用哪个 frame 就读哪个网格——行网格 `swa_k.cu_seqlens`、查询网格 `q.cu_seqlens`、压缩网格 `cmp_k.cu_seqlens`，`ratio == 1` 的 key 网格就是 `swa_k.cu_seqlens`。
@@ -120,26 +123,27 @@ cmp_k.residual  = [0, 0]        # 对齐后恒 0；CP frame 的 residual 按 cp*
 CP 的 `cmp_k.residual = reach % ratio`；文档按 `cp × ratio` 对齐后 `reach` 是 ratio 的整数倍，因此 residual 恒 0，内核不会遇到半块前缀。
 
 - `r=1`：不生成压缩 KV，仅执行原始 KV 的滑窗注意力。该几何没有压缩 frame（`cmp_k is None`），key 网格就是行网格 `swa_k.cu_seqlens`；融合 entry 仍生成对应的 `aicpu_metadata` 记录，融合算子使用 `has_cmp_kv=False`。
-- `r=4`（CSA）：启用重叠压缩和 LightningIndexer；前驱块必须属于同一文档（`overlap_valid`）。
-- `r=128`（HCA）：生成连续压缩 KV，不执行 LightningIndexer TopK。
+- `r=4`（CSA）：启用重叠压缩，由 `indexer.inner_indexer` 选择文档内的 TopK；前驱块必须属于同一文档（`overlap_valid`）。
+- `r=128`（HCA）：生成连续压缩 KV，使用因果可见的压缩槽。
 
 ## 参考路径（默认内核）
 
-模型目录默认内核是 `CompressedSparseInnerAttention`：它读公共 metadata 的 frame（查询帧 `q` 的偏移、压缩帧 `cmp_k` 的偏移），用 Attention Gym 的 `gather_attn` 在 `cat([swa_k, cmp_k 容器])` 上做滑窗 + sink，并按 ratio 取选择——`r=4` 走 `LightningIndexer` 给出的逐文档 TopK，`r=128` 直接取本查询本自然段内因果可达的全部压缩槽。选择与 `gather_attn` 都按“文档内”下标寻址（见 `models/common/document_intervals.py`），因此不再需要文档感知的 BlockMask，也不再需要额外的 metadata 扩展来预计算参考 tier。
+CSA 层的 `Indexer` 投影出索引查询、键和权重，交给 `inner_indexer` 返回文档内的
+`(topk_indices, topk_scores)`。`attention.inner_attention` 使用这些索引，调用上游
+`CompressedSparseAttention` 同款 `gather_attn` 计算注意力。SWA 和 HCA 沿用各自的上游参考实现。
 
-默认内核就是唯一的参考路径，不再有独立的 golden override：`test_dsv4.py` 以形状/有限值和 pool 梯度的可复现性守护它，融合内核与它做容差对照。
-
-参考组合不训练 indexer：`r=4` 层的 `LightningIndexer` 返回 `(topk_indices, topk_scores)`，`topk_scores` 是可导的 student logits，但参考核心不产生 KL loss；它的 KL 蒸馏目标由融合组合的 `sparse_attn.asc` + `lightning_indexer.asc`（SMLAG → SLIKG）承担。因此用参考组合与融合组合对比 `loss` / `grad_norm` 时，indexer 相关参数在参考组合下没有梯度属于预期；`test_dsv4.py` 与 `dsv4_golden_*` 用例只校验注意力数值，不覆盖 indexer 的训练目标。
-
-因此参考组合目前只能用 AdamW：`DistMuon` 在 step 前要求每个配置的参数都有梯度，会以 `missing gradients: layers.<n>.attention.indexer.*` 报错（`USE_GOLDEN=1` 搭配示例里的 Muon 参数即属此情况）。
+参考训练配方可以给 CSA 的 `inner_attention.aux_loss` 配置上游 `SparseIndexerLoss`。
+此时 `inner_indexer` 同时返回可导的 student logits，辅助损失为 indexer 提供梯度。
+参考 Muon 配方已启用这一配置。默认参考配方关闭辅助损失，TopK 索引本身只参与选槽。
+参见 [Muon 配方](muon_optimizer.md)。
 
 ## AscendC 融合路径
 
-[`sparse_attn/ascendc.py`](../../torchtitan_npu/override/deepseek_v4/sparse_attn/ascendc.py) 中的 `AscCompressedSparseInnerAttention` 执行以下步骤：
+[`sparse_attn/ascendc.py`](../../torchtitan_npu/override/deepseek_v4/sparse_attn/ascendc.py) 中的 `AscCompressedSparseInnerAttention` 与 `indexer.inner_indexer` 按以下顺序协作。
 
 1. 校验模型输入是 `AscV4Metadata`，读这一层的 `q` / `swa_k` / `cmp_k` frame。
 2. query 转 TND；swa_k / cmp_k 是整行（CP 下由 wrapper 的 `S(1) -> R` 声明式 all-gather 得到），直接转 TND。
-3. selector 的独立 override（`lightning_indexer.asc`）调用 `lightning_indexer` 生成序列内局部 TopK，返回 `topk_indices` 与 `topk_scores`（前者文档局部、降序、`-1` 落尾；后者是 teacher 的 carrier）。
+3. `indexer.inner_indexer` 的独立 override（`lightning_indexer.asc`）调用 `lightning_indexer` 生成序列内局部 TopK，返回 `topk_indices` 与 `topk_scores`（前者文档局部、降序、`-1` 落尾；后者是 teacher 的 carrier）。
 4. 调用 SparseFlashMLA；`_SparseFlashMLATND` 只做 SMLA 前向与 SMLAG 反向（使用 `asc.sparse_attn.bwd`）。SMLAG 反向把 raw marginal `p` 写到 `topk_scores` 的梯度上，`-1` 槽位清零，并乘一次 `softmax_scale`；`lightning_indexer.asc` 的 `_LightningIndexerTND.backward` 再除以本 microbatch 的 query 行数，用 `sparse_lightning_indexer_kl_loss_grad` 训练 indexer。`sparse_attn.asc` 与 `lightning_indexer.asc` 必须成对启用。
 
 `cann_ops_transformer` 包负责内核的算子注册（schema、meta/fake 实现），本仓只在融合路径内做前反向桥接，不再自建 `torch.library` 封装。

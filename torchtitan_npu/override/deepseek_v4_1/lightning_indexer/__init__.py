@@ -19,18 +19,18 @@ from typing import TYPE_CHECKING
 
 from torchtitan.config import derive, override
 
-from torchtitan_npu.models.deepseek_v4_1.indexer import Selector
+from torchtitan_npu.models.deepseek_v4_1.indexer import InnerIndexer
 
 if TYPE_CHECKING:
-    from .ascendc import AscSelector
+    from .ascendc import AscInnerIndexer
 
 
 @override(
-    target=Selector.Config,
+    target=InnerIndexer.Config,
     exact=True,
     description="BF16 LightningIndexer selection fused with its SLIKG backward in one autograd.Function",
 )
-def asc(cfg: Selector.Config) -> "AscSelector.Config":
-    from .ascendc import AscSelector
+def asc(cfg: InnerIndexer.Config) -> "AscInnerIndexer.Config":
+    from .ascendc import AscInnerIndexer
 
-    return derive(cfg, AscSelector.Config)
+    return derive(cfg, AscInnerIndexer.Config)

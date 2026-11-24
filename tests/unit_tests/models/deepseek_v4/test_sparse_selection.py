@@ -124,7 +124,7 @@ def test_lightning_indexer_returns_the_selection_and_its_scores(dsv4):
     metadata = _metadata(dsv4)
     seqlen = int(_CU[-1])
     idx_q, idx_k, idx_w = (tensor.clone().requires_grad_(True) for tensor in _inputs(seqlen))
-    module = dsv4.compressor.LightningIndexer(dsv4.compressor.LightningIndexer.Config(index_topk=2))
+    module = dsv4.compressor.InnerIndexer(dsv4.compressor.InnerIndexer.Config(index_topk=2))
 
     picks, scores = module(idx_q, idx_k, idx_w, attention_metadata=metadata)
 
@@ -157,7 +157,7 @@ def test_lightning_indexer_returns_the_selection_and_its_scores(dsv4):
 def test_lightning_indexer_refuses_a_geometry_without_a_compressed_pool(dsv4):
     positions = torch.cat([torch.arange(end - start) for start, end in pairwise(_CU.tolist())])
     metadata = dsv4.metadata.build_v4_metadata(positions, 1)
-    module = dsv4.compressor.LightningIndexer(dsv4.compressor.LightningIndexer.Config(index_topk=2))
+    module = dsv4.compressor.InnerIndexer(dsv4.compressor.InnerIndexer.Config(index_topk=2))
     idx_q, idx_k, idx_w = _inputs(int(_CU[-1]))
     with pytest.raises(ValueError, match="compressed"):
         module(idx_q, idx_k, idx_w, attention_metadata=metadata)

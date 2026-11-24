@@ -15,7 +15,7 @@ from torchtitan_npu.config import (
     OptimizerConfig,
 )
 from torchtitan_npu.extensions.torchtitan.trainer import TrainerEx, TrainingEngineEx
-from torchtitan_npu.models.deepseek_v4_1.indexer import Selector
+from torchtitan_npu.models.deepseek_v4_1.indexer import InnerIndexer
 from torchtitan_npu.models.deepseek_v4_1.model import DeepSeekV41Model
 from torchtitan_npu.models.deepseek_v4_1.optimizer import EngramTableOptimizerConfig
 
@@ -24,25 +24,25 @@ class DeepSeekV41TrainingEngine(TrainingEngineEx):
     """Set the LI objective denominator before model preprocessing shards inputs."""
 
     @cached_property
-    def _li_selectors(self) -> list[Selector]:
+    def _inner_indexers(self) -> list[InnerIndexer]:
         # Resolve after model initialization has applied overrides and wrappers.
         return [
             module
             for part in self.model_parts
             for module in part.modules()
-            if isinstance(module, Selector) and type(module) is not Selector
+            if isinstance(module, InnerIndexer) and type(module) is not InnerIndexer
         ]
 
     def forward_backward(self, *, microbatch_groups, global_loss_token_counts, global_routing_token_counts):
-        if self._li_selectors:
+        if self._inner_indexers:
             num_queries = sum(
                 microbatch.as_input_dict()["input"].numel() for group in microbatch_groups for microbatch in group
             )
             denominator = torch.tensor(num_queries, device=self.device, dtype=torch.float32)
             if self.parallelism_context.dp_enabled:
                 denominator = dist_utils.dist_sum_tensor(denominator, self.parallelism_context.get_mesh("dp"))
-            for selector in self._li_selectors:
-                selector.num_global_queries = denominator
+            for inner_indexer in self._inner_indexers:
+                inner_indexer.num_global_queries = denominator
         return super().forward_backward(
             microbatch_groups=microbatch_groups,
             global_loss_token_counts=global_loss_token_counts,

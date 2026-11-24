@@ -3,23 +3,20 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Upstream attention references and the optional NPU geometry backend."""
+"""DeepSeek V4 attention projections and sparse attention cores."""
 
 __all__ = [
     "Attention",
     "CompressedSparseAttention",
     "CompressedSparseInnerAttention",
     "DSV4InnerAttention",
-    "DeepSeekV4Attention",
     "HeavilyCompressedAttention",
-    "NPUAttention",
-    "NPUCompressedSparseInnerAttention",
     "SlidingWindowAttention",
     "UnitScaleRMSNorm",
 ]
 
 from dataclasses import dataclass, field
-from typing import Any, cast
+from typing import Any
 
 import spmd_types as spmd
 import torch
@@ -27,27 +24,18 @@ import torch_remat as remat
 from attn_gym.sparse import AuxRequest, GatherAttnAux, gather_attn
 from torchtitan.distributed.parallelism_context import MeshAxisName
 from torchtitan.distributed.spmd_types import spmd_dense_sp_enabled, spmd_mesh_group
-from torchtitan.models.common.attention import Attention as BaseAttention
 from torchtitan.models.common.attention import InnerAttention
-from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.lora import _LoRALinearMixin
 from torchtitan.models.common.nn_modules import RMSNorm
-from torchtitan.models.common.rope import RoPE
+from torchtitan.models.deepseek_v4 import attention as v4_attention
 from torchtitan.models.deepseek_v4.attention import (
-    CompressedSparseAttention,
     DSV4InnerAttention,
     HeavilyCompressedAttention,
     SlidingWindowAttention,
     _assert_spmd_attention_type,
     _packed_cu_seqlens,
 )
-from torchtitan.models.deepseek_v4.attention import (
-    DeepSeekV4Attention as UpstreamDeepSeekV4Attention,
-)
 
-from torchtitan_npu.patches.torchtitan.models.common.linear import BatchedLinear
-
-from .compressor import Compressor, Indexer, LightningIndexer
 from .metadata import DeepSeekV4Metadata, build_v4_metadata
 
 
@@ -73,19 +61,56 @@ class UnitScaleRMSNorm(RMSNorm):
         return x * torch.rsqrt(x.square().mean(-1, keepdim=True) + self.eps)
 
 
-class DeepSeekV4Attention(UpstreamDeepSeekV4Attention):
-    """Upstream V4 attention with an overridable, parameter-free Q head norm.
-
-    The forward follows TorchTitan v0.4.0. Keep it in sync until upstream
-    exposes this normalization as a configurable child module.
-    """
+class CompressedSparseAttention(DSV4InnerAttention):
+    """Gather the document-local slots chosen by the layer's indexer."""
 
     @dataclass(kw_only=True, slots=True)
-    class Config(UpstreamDeepSeekV4Attention.Config):
+    class Config(DSV4InnerAttention.Config):
+        pass
+
+    def forward(  # pyrefly: ignore [bad-param-name-override]
+        self,
+        q,
+        swa_k,
+        cmp_k,
+        topk_indices,
+        topk_scores,
+        attn_sink,
+        *,
+        attention_metadata=None,
+        aux_loss_denominator=None,
+        padding_mask_T=None,
+    ):
+        return self._gather_attn(
+            q,
+            swa_k,
+            cmp_k,
+            topk_indices,
+            attn_sink,
+            _packed_cu_seqlens(attention_metadata),
+            topk_scores_TK=topk_scores,
+            aux_loss_denominator=aux_loss_denominator,
+            padding_mask_T=padding_mask_T,
+        )
+
+
+class Attention(v4_attention.DeepSeekV4Attention):
+    """V4 projections with a configurable Q head norm and separate selection and attention cores."""
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(v4_attention.DeepSeekV4Attention.Config):
         q_head_norm: RMSNorm.Config
 
     def __init__(self, config: Config):
         super().__init__(config)
+        self.attention_metadata_key = getattr(
+            config.inner_attention, "attention_metadata_key", type(self.inner_attention)
+        )
+        if config.indexer is not None:
+            inner_indexer = self.indexer.inner_indexer
+            inner_indexer.return_scores = config.inner_attention.aux_loss is not None
+            if inner_indexer.requires_teacher and inner_indexer.return_scores:
+                raise ValueError("Fused LI has its own indexer objective; set aux_loss=None.")
         self.q_head_norm = config.q_head_norm.build()
 
     def project_output_groups(self, grouped):
@@ -154,9 +179,15 @@ class DeepSeekV4Attention(UpstreamDeepSeekV4Attention):
         kv = torch.cat([kv_nope, kv_rope.squeeze(1)], dim=-1)
 
         cu_seqlens = _packed_cu_seqlens(attention_metadata)
-        cmp_k = idx_q = idx_k = idx_w = None
+        cmp_k = topk_indices = topk_scores = None
         if self.compress_ratio > 1 and hasattr(self, "indexer"):
-            idx_q, idx_k, idx_w = self.indexer(x.detach(), qr.detach(), positions=positions, cu_seqlens=cu_seqlens)
+            topk_indices, topk_scores = self.indexer(
+                x.detach(),
+                qr.detach(),
+                positions=positions,
+                cu_seqlens=cu_seqlens,
+                attention_metadata=attention_metadata,
+            )
         if self.compress_ratio == 4:
             cmp_k = self.compressor(x, positions=positions, cu_seqlens=cu_seqlens)
         elif self.compress_ratio > 1:
@@ -167,11 +198,10 @@ class DeepSeekV4Attention(UpstreamDeepSeekV4Attention):
             o = self.inner_attention(
                 q,
                 kv,
-                cmp_k,
-                idx_q,
-                idx_k,
-                idx_w,
-                attn_sink_param,
+                cmp_k=cmp_k,
+                topk_indices=topk_indices,
+                topk_scores=topk_scores,
+                attn_sink=attn_sink_param,
                 attention_metadata=attention_metadata,
                 aux_loss_denominator=aux_loss_denominator,
                 padding_mask_T=padding_mask,
@@ -180,8 +210,8 @@ class DeepSeekV4Attention(UpstreamDeepSeekV4Attention):
             o = self.inner_attention(
                 q,
                 kv,
-                cmp_k,
-                attn_sink_param,
+                cmp_k=cmp_k,
+                attn_sink=attn_sink_param,
                 attention_metadata=attention_metadata,
             )
         else:
@@ -208,7 +238,7 @@ class DeepSeekV4Attention(UpstreamDeepSeekV4Attention):
         return self.wo_b(projected)
 
 
-class NPUCompressedSparseInnerAttention(InnerAttention):
+class CompressedSparseInnerAttention(InnerAttention):
     """Optional NPU sparse-attention backend for DeepSeek-V4.
 
     The core is Attention Gym's ``gather_attn`` over the packed offsets the metadata already
@@ -225,8 +255,7 @@ class NPUCompressedSparseInnerAttention(InnerAttention):
 
     - it does **not** chunk the query axis: the operator materialises intermediates that grow
       with the sequence length, the window/selection width and the head dimension, so it is a
-      debugging and numerics reference; the ``sparse_attn.asc_legacy`` /
-      ``sparse_attn.pypto`` legacy ports replace this class and own their CP metadata;
+      debugging and numerics reference. The fused backend consumes the same document-local indices and scores.
     - it carries no indexer loss of its own: the LI objective is a property of a fused port (its
       SMLAG backward hands the fused selector its teacher), so a recipe that runs this core
       trains no gradient for the indexer's compressor.
@@ -359,186 +388,3 @@ class NPUCompressedSparseInnerAttention(InnerAttention):
         output, gathered = result
         assert isinstance(gathered, GatherAttnAux) and gathered.lse is not None
         return output.squeeze(0).transpose(0, 1), gathered.lse.squeeze(0)
-
-
-class NPUAttention(BaseAttention):
-    """Geometry/carry adapter used by the explicitly selected NPU backend.
-
-    The upstream reference uses :class:`DeepSeekV4Attention`. This adapter
-    retains the NPU backend's bare sink, grouped projection and metadata
-    contract; its reference core deliberately has no indexer auxiliary loss.
-    """
-
-    @dataclass(kw_only=True, slots=True)
-    class Config(BaseAttention.Config):
-        n_heads: int
-        rope: RoPE.Config
-        head_dim: int
-        rope_head_dim: int
-        q_lora_rank: int
-        n_groups: int
-        compress_ratio: int
-        norm_eps: float
-
-        # Declare submodule configs as fields so sharding can be assigned before
-        # the modules are built.
-        wq_a: Linear.Config
-        q_norm: RMSNorm.Config
-        q_head_norm: RMSNorm.Config
-        wq_b: Linear.Config
-        wkv: Linear.Config
-        kv_norm: RMSNorm.Config
-        wo_a: BatchedLinear.Config
-        wo_b: Linear.Config
-
-        # Built only for ``compress_ratio > 1`` layers (``indexer``/``lightning_indexer``
-        # only for ratio-4 CSA layers); the registry passes ``None`` otherwise.
-        compressor: Compressor.Config | None
-        indexer: Indexer.Config | None
-        lightning_indexer: LightningIndexer.Config | None
-        # The legacy sparse core replaced by ``sparse_attn.asc_legacy``. It is the
-        # layer's only metadata backend and the CP boundary for its KV streams; the annotation
-        # stays the base type because a port's config is a replacement of this node.
-        inner_attention: InnerAttention.Config
-
-    def __init__(self, config: Config):
-        super().__init__()
-        cfg = config
-        self.n_heads = cfg.n_heads
-        self.head_dim = cfg.head_dim
-        self.rope_head_dim = cfg.rope_head_dim
-        self.n_groups = cfg.n_groups
-        self.compress_ratio = cfg.compress_ratio
-        self.norm_eps = cfg.norm_eps
-        self.rope = cfg.rope.build()
-
-        # The CP mesh this layer restores its key side on, wired by ``parallelize``; ``None`` at
-        # one degree, where the metadata carries no plan and nothing moves.
-        self.cp_group = None
-
-        self.wq_a = cfg.wq_a.build()
-        self.q_norm = cfg.q_norm.build()
-        self.q_head_norm = cfg.q_head_norm.build()
-        self.wq_b = cfg.wq_b.build()
-        self.wkv = cfg.wkv.build()
-        self.kv_norm = cfg.kv_norm.build()
-        self.wo_a = cfg.wo_a.build()
-        self.wo_b = cfg.wo_b.build()
-        # Bare head-wise sink parameter (fp32), matching the inference
-        # reference and the kernels' ``[N1]`` sink contract.
-        self.attn_sink = torch.nn.Parameter(torch.empty(cfg.n_heads, dtype=torch.float32))
-
-        self.compressor = cfg.compressor.build() if cfg.compressor is not None else None
-        self.indexer = cfg.indexer.build() if cfg.indexer is not None else None
-        self.lightning_indexer = cfg.lightning_indexer.build() if cfg.lightning_indexer is not None else None
-        self.attention_metadata_key = cast(
-            "CompressedSparseInnerAttention.Config", cfg.inner_attention
-        ).attention_metadata_key
-        self.inner_attention = cfg.inner_attention.build()
-
-    def _parallelize(self, parallelism_context) -> None:
-        """Take the CP mesh the layer's key stream is restored on, then recurse.
-
-        The compressor and its carry exchange take the same mesh through their own
-        ``parallelize`` (the framework recurses into every child module), so nothing here wraps
-        them: their module paths, sharding and checkpoint entries stay as they are.
-        """
-        self.cp_group = parallelism_context.get_optional_mesh("cp")
-        super()._parallelize(parallelism_context)
-
-    def forward(self, x, attention_metadata, positions, *, aux_loss_denominator=None, padding_mask=None):
-        """The unified attention forward (CP and non-CP).
-
-        The input layout already put these rows on **chunk ``r`` of every document**, so the
-        query side projects them as they arrive and never moves.  The key side projects, rotates
-        and pools the same rows -- every step is per token, so it commutes with the layout -- and
-        each consumer restores what it reads on its own: the compressor its pooling window, the
-        core this rank's swa window, whose sharding then gathers the whole row at its boundary.
-        """
-        # Upstream V4 blocks pass these objective inputs to every attention
-        # backend. The existing NPU reference has no carrier-injected indexer
-        # loss, and its metadata already carries the structural padding mask.
-        del aux_loss_denominator, padding_mask
-        num_tokens = x.size(0)
-        metadata = attention_metadata
-
-        qr = self.q_norm(self.wq_a(x))
-        q = self.wq_b(qr)
-        q = q.view(num_tokens, -1, self.head_dim)
-        q = self.q_head_norm(q)
-        # RoPE owns the [nope | rope] split: it receives the full-width
-        # tensor and rotates only the trailing rope_head_dim channels.  The
-        # positions are the ones the input layout carried with these rows.
-        q = self.rope(q, positions=positions)
-
-        # The key stream's own positions are the entry's: the input's at one degree, this rank's
-        # window under CP.  The queries rotate at the positions the input carried.
-        position_k = metadata.position_k
-
-        # The swa projection + RoPE run on the rows the layout produced: RoPE is per token, so it
-        # commutes with the movement.  The restore then hands the core this rank's window, whose
-        # sharding gathers the rows to the whole row at the core's own boundary.
-        swa_k = self.kv_norm(self.wkv(x))
-        swa_k = self.rope(swa_k.unsqueeze(1), positions=positions).squeeze(1)
-        swa_k = metadata.key_stream(swa_k, group=self.cp_group)
-
-        cmp_k = None
-        idx_q = idx_k = idx_w = None
-
-        if self.compress_ratio > 1 and self.indexer is not None:
-            # The selector's queries and weights ride the doc-chunk rows with the attention's;
-            # its compressor restores and carries for the keys it pools.
-            idx_q, idx_k, idx_w = self.indexer(
-                x.detach(),
-                qr.detach(),
-                positions=positions,
-                attention_metadata=metadata,
-            )
-        if self.compress_ratio > 1:
-            assert self.compressor is not None, "compress_ratio > 1 requires the compressor submodule."
-            # The compressor owns the restore and the ratio-4 carry: it pools the window this rank
-            # holds and hands back the row's blocks, so the layer never sees either step.
-            cmp_k = self.compressor(
-                x,
-                position_k,
-                cu_seqlens=metadata.swa_k.cu_seqlens,
-                attention_metadata=metadata,
-            )
-
-        # Every selector returns indices and scores: the reference exposes student logits,
-        # while the AscendC, PyPTO and quantized backends expose the teacher-gradient carrier.
-        topk_indices = topk_scores = None
-        if self.lightning_indexer is not None:
-            topk_indices, topk_scores = self.lightning_indexer(idx_q, idx_k, idx_w, attention_metadata=metadata)
-
-        # Inner-attention positional contract: sink + swa_k always; the compressed pool and
-        # the selector's ``(topk_indices, topk_scores)`` pair only on a pooled layer.
-        o = self.inner_attention(
-            q,
-            swa_k,
-            self.attn_sink,
-            cmp_k=cmp_k,
-            topk_indices=topk_indices,
-            topk_scores=topk_scores,
-            attention_metadata=metadata,
-        )
-
-        o = self.rope(o, positions=positions, inverse=True)
-
-        # ``wo_a`` is a BatchedLinear over the head groups; group the heads
-        # before the per-group matmul.
-        n_local_groups = self.n_groups // (self.n_heads // o.shape[1])
-        o = o.view(num_tokens, n_local_groups, -1)
-        o = self.wo_a(o)
-        o = o.reshape(num_tokens, -1)
-        o = self.wo_b(o)
-        # The projection is per token, so ``wo_b``'s output stays in the frame the input
-        # arrived in: the residual and every other consumer are token-wise, and the loss is
-        # taken against labels the same layout moved.
-        return o
-
-
-# Compatibility names for the existing NPU override registrations. New model
-# references use the upstream classes exported above.
-Attention = NPUAttention
-CompressedSparseInnerAttention = NPUCompressedSparseInnerAttention

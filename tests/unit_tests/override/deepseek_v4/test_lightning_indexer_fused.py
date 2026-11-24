@@ -3,7 +3,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""The fused V4 LightningIndexer: canonical order, teacher edge, SLIKG dispatch.
+"""The fused V4 InnerIndexer: canonical order, teacher edge, SLIKG dispatch.
 
 The NPU kernels are replaced by eager stand-ins with their exact contract (document-local
 indices, ``-1`` padding, the teacher arriving on ``topk_scores``' gradient), so these cases
@@ -16,7 +16,7 @@ import pytest
 import torch
 
 from torchtitan_npu.override.deepseek_v4.lightning_indexer.ascendc import (
-    AscLightningIndexer,
+    AscInnerIndexer,
 )
 from torchtitan_npu.override.deepseek_v4.metadata import lightning_indexer_options
 from torchtitan_npu.override.deepseek_v4.sparse_attn.ascendc import (
@@ -52,7 +52,7 @@ def _metadata():
 
 
 def _indexer():
-    return AscLightningIndexer(AscLightningIndexer.Config(index_topk=_INDEX_TOP_K))
+    return AscInnerIndexer(AscInnerIndexer.Config(index_topk=_INDEX_TOP_K))
 
 
 def _kernel_indices() -> torch.Tensor:
@@ -162,19 +162,19 @@ def test_the_override_entry_replaces_the_base_selector():
     """The registry-facing ``asc`` entry derives the fused selector config."""
     from torchtitan_npu.override.deepseek_v4.lightning_indexer import asc
 
-    fused = asc(AscLightningIndexer.Config(index_topk=_INDEX_TOP_K))
-    assert isinstance(fused, AscLightningIndexer.Config)
+    fused = asc(AscInnerIndexer.Config(index_topk=_INDEX_TOP_K))
+    assert isinstance(fused, AscInnerIndexer.Config)
     assert fused.index_topk == _INDEX_TOP_K
 
 
 def test_the_pypto_entry_selects_the_pypto_selector():
     """The PyPTO port is standalone: it implements the selector contract itself."""
-    from torchtitan_npu.models.deepseek_v4.compressor import LightningIndexer
+    from torchtitan_npu.models.deepseek_v4.compressor import InnerIndexer
     from torchtitan_npu.override.deepseek_v4.lightning_indexer import pypto
-    from torchtitan_npu.override.deepseek_v4.lightning_indexer.pypto import PyPTOLightningIndexer
+    from torchtitan_npu.override.deepseek_v4.lightning_indexer.pypto import PyPTOInnerIndexer
 
-    fused = pypto(AscLightningIndexer.Config(index_topk=_INDEX_TOP_K))
-    assert isinstance(fused, PyPTOLightningIndexer.Config)
+    fused = pypto(AscInnerIndexer.Config(index_topk=_INDEX_TOP_K))
+    assert isinstance(fused, PyPTOInnerIndexer.Config)
     # The two ports share the base selector's model contract, not each other's bridge.
-    assert issubclass(PyPTOLightningIndexer, LightningIndexer)
-    assert not issubclass(PyPTOLightningIndexer, AscLightningIndexer)
+    assert issubclass(PyPTOInnerIndexer, InnerIndexer)
+    assert not issubclass(PyPTOInnerIndexer, AscInnerIndexer)

@@ -53,13 +53,10 @@ def test_debugmodel_uses_cann_profiler_extension():
 
 
 def test_every_layer_uses_the_native_core_contract_the_overrides_target():
-    from torchtitan.models.deepseek_v4.attention import (
-        CompressedSparseAttention,
-        HeavilyCompressedAttention,
-        SlidingWindowAttention,
-    )
+    from torchtitan.models.deepseek_v4.attention import HeavilyCompressedAttention, SlidingWindowAttention
 
     from torchtitan_npu.models.deepseek_v4 import build_model_config
+    from torchtitan_npu.models.deepseek_v4.attention import CompressedSparseAttention
 
     model_config = build_model_config("debugmodel", parallelism=ParallelismConfig())
     cores = [layer.attention.inner_attention for layer in model_config.layers]

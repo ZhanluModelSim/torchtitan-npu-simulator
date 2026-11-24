@@ -13,7 +13,7 @@ come back: it would accumulate a metric nobody feeds.
 
 import pytest
 
-from torchtitan_npu.override.deepseek_v4.lightning_indexer.ascendc import AscLightningIndexer
+from torchtitan_npu.override.deepseek_v4.lightning_indexer.ascendc import AscInnerIndexer
 from torchtitan_npu.override.deepseek_v4.sparse_attn.ascendc import (
     AscCompressedSparseInnerAttention,
 )
@@ -41,6 +41,6 @@ def test_the_fused_attention_has_no_indexer_loss_accumulator():
 
 
 def test_the_selector_has_no_loss_accumulator_either():
-    selector = AscLightningIndexer(AscLightningIndexer.Config(index_topk=4))
+    selector = AscInnerIndexer(AscInnerIndexer.Config(index_topk=4))
     assert "_indexer_loss_acc" not in selector._buffers
     assert not hasattr(selector, "_indexer_loss_acc")

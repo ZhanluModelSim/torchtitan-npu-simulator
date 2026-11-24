@@ -20,7 +20,7 @@ from torchtitan_npu.models.deepseek_v4_1.attention import (
     CompressedSparseInnerAttention2 as DeepSeekV41CompressedSparseInnerAttention2,
 )
 from torchtitan_npu.models.deepseek_v4_1.compressor import Compressor as DeepSeekV41Compressor
-from torchtitan_npu.models.deepseek_v4_1.indexer import Selector as DeepSeekV41Selector
+from torchtitan_npu.models.deepseek_v4_1.indexer import InnerIndexer as DeepSeekV41InnerIndexer
 from torchtitan_npu.patches.torchtitan.models.common.linear import BatchedLinear
 
 from ..filters import _match_fqn_suffix, any_config_filter
@@ -50,7 +50,7 @@ class V41FilterKeys:
 V41_FILTER_SPECS: dict[str, FilterSpec] = {
     V41FilterKeys.DENSE: {"suffixes": _DENSE},
     V41FilterKeys.ROUTED_EXPERT: {"suffixes": _ROUTED},
-    V41FilterKeys.LIGHTNING_INDEXER: {"suffixes": (".attention.indexer.selector",)},
+    V41FilterKeys.LIGHTNING_INDEXER: {"suffixes": (".attention.indexer.inner_indexer",)},
     V41FilterKeys.SPARSE_ATTENTION: {"suffixes": (".attention.inner_attention",)},
 }
 
@@ -69,7 +69,7 @@ UNIFIED_NPU_QUANTIZED_MODULES = (
     GroupedLinear.Config,
     DeepSeekV41CompressedSparseInnerAttention2.Config,
     DeepSeekV41Compressor.Config,
-    DeepSeekV41Selector.Config,
+    DeepSeekV41InnerIndexer.Config,
 )
 
 DEEPSEEK_V41_RECIPE_MATRIX = {

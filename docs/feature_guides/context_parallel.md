@@ -179,7 +179,7 @@ Attention.forward（每层）
     └─ indexer：idx_q / idx_w 在 chunk 行上投影；idx_k 由它自己的压缩器产出
   wo_a / wo_b 输出留在 doc-chunk 行（不 unpermute）
 
-inner_attention / lightning_indexer 的 ShardingConfig
+inner_attention / indexer.inner_indexer 的 ShardingConfig
   swa_k, cmp_k（核心）与 idx_k（selector）: cp S(0) -> R（内核边界 all-gather 整行）
   q, idx_q, idx_w:      保持本 rank 的 chunk（attention 直接调用这两个模块）
 ```
@@ -312,7 +312,7 @@ Sparse core / selector（sharding 声明）
 ```
 
 V4.1 的参考 metadata（`DeepSeekV41Metadata`）只带整行边界与 `position_k`（degree=1 时等于输入的
-`positions`）；CP 的 frame 与记录由融合 entry 重建，消费者（`AscV41SparseAttention`、`AscSelector`）
+`positions`）；CP 的 frame 与记录由融合 entry 重建，消费者（`AscV41SparseAttention`、`AscInnerIndexer`）
 直接读 `attention_metadata.q` / `.swa_k` / `.cmp_k` 与 `aicpu_metadata`。
 
 ### 5.2 rank-local frame 重建
@@ -363,7 +363,7 @@ layer 在本地 slab 上做 `ratio` 折叠（ratio==1 是普通投影），因�
 
 ### 5.4 indexer teacher 的归一化
 
-V4.1 的 selector 在反向把 teacher 除以 `Selector.num_global_queries`：本 step 全部 accumulation
+V4.1 的 selector 在反向把 teacher 除以 `InnerIndexer.num_global_queries`：本 step 全部 accumulation
 microbatch 的 query token 数（在 CP 切分之前统计，DP 维再求和）。V4 的融合 selector 反向则除以
 `metadata.swa_k.cu_seqlens[-1]`（整行 token 数，即所有 rank 的 chunk 之和），两者是同一个量的两种
 来源，都是为了避免 CP/DP 下参数梯度被 rank-local 分母放大。

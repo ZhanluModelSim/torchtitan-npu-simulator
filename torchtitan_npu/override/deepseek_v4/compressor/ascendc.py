@@ -18,7 +18,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
-from torchtitan.models.deepseek_v4.compressor import Compressor as UpstreamCompressor
+from torchtitan.models.deepseek_v4 import compressor as v4_compressor
 
 from torchtitan_npu.models.deepseek_v4.compressor import Compressor, CompressorImplementation
 from torchtitan_npu.ops.ascendc.compressor import load_compressor
@@ -95,7 +95,7 @@ class AscCompressor(CompressorImplementation):
         return compressor.rope(pooled.unsqueeze(1), positions=positions.reshape(-1)[::ratio]).squeeze(1).unsqueeze(0)
 
 
-class AscNativeCompressor(UpstreamCompressor):
+class AscNativeCompressor(v4_compressor.Compressor):
     """Fuse complete packed groups while retaining the upstream compressor layout.
 
     CANN emits partial groups, whereas upstream packs only complete groups and
@@ -105,7 +105,7 @@ class AscNativeCompressor(UpstreamCompressor):
     """
 
     @dataclass(kw_only=True, slots=True)
-    class Config(UpstreamCompressor.Config):
+    class Config(v4_compressor.Compressor.Config):
         fused_pooling: bool = True
 
     def __init__(self, config: Config):

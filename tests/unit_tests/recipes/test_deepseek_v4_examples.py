@@ -156,7 +156,7 @@ def test_full_model_recipes_load_master_training_defaults(name):
     )
     assert config.override.imports[1:5] == [
         "torchtitan_npu.override.deepseek_v4.lightning_indexer.asc",
-        ("torchtitan_npu.override.deepseek_v4.sparse_attn.asc", {"selector_backend": "asc"}),
+        "torchtitan_npu.override.deepseek_v4.sparse_attn.asc",
         "torchtitan_npu.override.deepseek_v4.mhc.asc_hc_pre",
         "torchtitan_npu.override.deepseek_v4.mhc.asc_hc_post",
     ]

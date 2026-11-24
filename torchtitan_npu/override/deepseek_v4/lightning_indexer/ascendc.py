@@ -3,7 +3,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""The DeepSeek-V4 selector's BF16 port: LightningIndexer fused with SLIKG.
+"""The DeepSeek-V4 selector's BF16 port: InnerIndexer fused with SLIKG.
 
 The forward runs the CANN ``lightning_indexer`` selection and returns the document-local
 indices plus a ``topk_scores`` carrier.  Nothing reads the carrier's value: it exists so
@@ -26,7 +26,7 @@ from dataclasses import dataclass
 
 import torch
 
-from torchtitan_npu.models.deepseek_v4.compressor import LightningIndexer
+from torchtitan_npu.models.deepseek_v4.compressor import InnerIndexer
 from torchtitan_npu.override import _IS_A5
 from torchtitan_npu.override.a3_workaround import A3KeyWorkaround
 from torchtitan_npu.override.deepseek_v4.metadata import (
@@ -36,7 +36,7 @@ from torchtitan_npu.override.deepseek_v4.metadata import (
 
 
 class _LightningIndexerTND(torch.autograd.Function):
-    """LightningIndexer forward fused with its SLIKG backward, over the CANN kernel pair.
+    """InnerIndexer forward fused with its SLIKG backward, over the CANN kernel pair.
 
     The kernels address the packed TND row: ``idx_q`` is ``[T, Hi, Di]``, ``idx_k`` is
     ``[Tk, 1, Di]`` and ``idx_w`` is ``[T, Hi]`` float32.  Indices are document-local with
@@ -132,7 +132,7 @@ class _LightningIndexerTND(torch.autograd.Function):
         return dq.to(idx_q.dtype), dk.to(idx_k.dtype), dw.to(idx_w.dtype), None, None, None
 
 
-class AscLightningIndexer(LightningIndexer):
+class AscInnerIndexer(InnerIndexer):
     """The fused BF16 LI/SLIKG selector for the V4 indexer layers.
 
     It emits the kernel's own document-local ``topk_indices`` in ``[B, L, K]`` layout.  The
@@ -140,15 +140,17 @@ class AscLightningIndexer(LightningIndexer):
     ``-1`` marks an unused slot.  ``topk_scores`` is the teacher carrier described above.
     """
 
+    requires_teacher = True
+
     @dataclass(kw_only=True, slots=True)
-    class Config(LightningIndexer.Config):
+    class Config(InnerIndexer.Config):
         pass
 
     def forward(self, idx_q, idx_k, idx_w, *, attention_metadata):
         # Single source, as for the fused core: the selector reads the records the fused
         # attention's builder attached, so any other entry is refused here.
         if not isinstance(attention_metadata, AscV4Metadata):
-            raise TypeError("AscLightningIndexer requires the entry the fused attention built.")
+            raise TypeError("AscInnerIndexer requires the entry the fused attention built.")
         topk_indices, topk_scores = _LightningIndexerTND.apply(
             idx_q,
             # The keys enter the Function already compacted (arch22): the gather is

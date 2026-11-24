@@ -44,7 +44,7 @@ overlap, one set of ``cu_seqlens``.
 from dataclasses import dataclass, replace
 
 import torch
-from torchtitan.models.common.attention import create_varlen_metadata_for_document
+from torchtitan.models.common.attention import VarlenAttentionMetadata, create_varlen_metadata_for_document
 
 from torchtitan_npu.models.common.alignment import require_document_alignment
 from torchtitan_npu.models.common.document_intervals import document_intervals
@@ -119,6 +119,13 @@ class DeepSeekV4Metadata:
     are ``slab_positions(...)`` -- the restored window's -- which is why a consumer never derives
     them and never learns that the stream moved.
     """
+
+    documents: VarlenAttentionMetadata | None = None
+    """TorchTitan offsets used by the projections, including reserved empty documents."""
+
+    @property
+    def cu_seq_q(self) -> torch.Tensor:
+        return self.q.cu_seqlens if self.documents is None else self.documents.cu_seq_q
 
     cp_layout = DOC_CHUNK_LAYOUT
     """The layout these frames describe (``--parallelism.context-parallel-load-balancer``).

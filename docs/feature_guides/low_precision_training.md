@@ -130,7 +130,7 @@ QLI/QSLI 的 metadata（一条 QLI schedule、一条 QSLI schedule 以及 QSLI �
 
 `li-quantization=mxfp4` 同时启用这两种实现，由模型层的角色和候选池配置自动选择，无需分别指定。两者输出的索引交给 sparse attention 计算注意力；训练反向均使用 BF16 SLIKG 消费教师信号，QLI/QSLI 本身不替代 sparse attention。
 
-V4.1 的 indexer 训练目标通过 sparse attention 反向提供 teacher（教师信号），再由 selector 的 SLIKG 反向消费。目标侧可以通过 `enable-sparse-attention-quantization` 单独量化；选分侧则不能单独量化，因为量化 selector 启动的是量化 attention 建的 schedule（单独开启 `li-quantization` 会被 converter 拒绝）：
+V4.1 的 `attention.inner_attention` 在反向通过 `topk_scores` 的梯度提供 teacher（教师信号），由 `attention.indexer.inner_indexer` 的 SLIKG 反向消费。目标侧可以通过 `enable-sparse-attention-quantization` 单独量化；选分侧则不能单独量化，因为量化 selector 启动的是量化 attention 建的 schedule（单独开启 `li-quantization` 会被 converter 拒绝）：
 
 - `--extension.quantization.li-quantization mxfp4`：将 BF16 LI selector 替换为 MXFP4 QLI/QSLI，SLIKG 反向保持 BF16；必须与下一条同开。
 - `--extension.quantization.enable-sparse-attention-quantization`：同时替换 KV source Compressor 和 sparse attention；sparse attention 反向继续提供 indexer teacher。该开关本身也决定 entry 由哪个 backend 建——开着就是量化 attention 自建，关着就是 `sparse_attn.asc` 那份。

@@ -8,17 +8,13 @@
 import math
 from dataclasses import dataclass, field
 
+import spmd_types as spmd
 import torch
 import torch.nn as nn
 from attn_gym.sparse import lightning_indexer
 from torchtitan.config import Configurable
 from torchtitan.models.base.module import Module
-from torchtitan.models.deepseek_v4.compressor import (
-    Compressor as UpstreamCompressor,
-)
-from torchtitan.models.deepseek_v4.compressor import (
-    Indexer as UpstreamIndexer,
-)
+from torchtitan.models.deepseek_v4 import compressor as v4_compressor
 from torchtitan.models.deepseek_v4.compressor import (
     _hadamard,  # noqa: F401 -- preserve the existing helper import path
 )
@@ -48,7 +44,7 @@ class CompressorImplementation(Configurable):
         return compressor._forward(x, positions, cu_seqlens)
 
 
-class NPUCompressor(UpstreamCompressor):
+class Compressor(v4_compressor.Compressor):
     """NPU document-packed key compression with geometry and carry handling.
 
     The compressor sees one local token stream, that stream's own document-relative positions and
@@ -66,7 +62,7 @@ class NPUCompressor(UpstreamCompressor):
     """
 
     @dataclass(kw_only=True, slots=True)
-    class Config(UpstreamCompressor.Config):
+    class Config(v4_compressor.Compressor.Config):
         # The ratio-4 overlap's cross-rank block.  The compressor owns it, so the modules that
         # call this one never learn that the overlap continues on another rank.
         carry_exchange: CarryExchange.Config
@@ -220,54 +216,20 @@ class NPUCompressor(UpstreamCompressor):
         return self.rope(kv.squeeze(0).unsqueeze(1), positions=positions.reshape(-1)[::ratio]).squeeze(1).unsqueeze(0)
 
 
-class NPUIndexer(UpstreamIndexer):
-    """Upstream indexer projections with NPU RoPE and key-stream metadata."""
+class Indexer(v4_compressor.Indexer):
+    """Project indexer inputs and select the slots consumed by sparse attention."""
 
     @dataclass(kw_only=True, slots=True)
-    class Config(UpstreamIndexer.Config):
-        compressor: NPUCompressor.Config  # pyrefly: ignore [bad-override]
+    class Config(v4_compressor.Indexer.Config):
+        inner_indexer: "InnerIndexer.Config"
+
+    def __init__(self, config: Config):
+        super().__init__(config)
+        self.inner_indexer = config.inner_indexer.build()
 
     def forward(self, x, qr, *, positions, cu_seqlens=None, attention_metadata=None):
-        """Project raw indexer queries, keys, and per-head weights.
-
-        ``x`` is the frame the layout produced (this rank's chunks under CP) and ``qr`` its
-        latent, so ``idx_q`` / ``idx_w`` derive from the same rows the queries do and rotate at
-        the positions the input layout carried with them.  The keys are the pooled row's, and the
-        compressor restores and carries for them exactly as it does for the attention's own
-        compressed stream.
-
-        Returns:
-            idx_q: Indexer queries ``[T, num_index_heads, index_head_dim]``
-                with RoPE applied and Hadamard-rotated.
-            idx_k: Indexer compressed keys in the container grid
-                ``[num_blocks, index_head_dim]``, Hadamard-rotated.
-            idx_w: Per-head indexer weights ``[T, num_index_heads]``
-                (the local rows).
-        """
-        assert attention_metadata is not None
-        num_tokens = qr.size(0)
-        idx_q = self.wq_b(qr)
-        idx_q = idx_q.view(num_tokens, self.num_index_heads, self.head_dim)
-        idx_q = self.rope(idx_q, positions=positions)
-        idx_q = self._rotate_activation(idx_q)
-        # The compressor restores this rank's window and, for a ratio-4 geometry, prepends the
-        # predecessor's block before pooling; the keys that come back are the row's blocks.  The
-        # keys' own positions are the entry's, and the row's grid says which blocks they belong to.
-        idx_k = self.compressor(
-            x,
-            attention_metadata.position_k,
-            cu_seqlens=attention_metadata.swa_k.cu_seqlens,
-            attention_metadata=attention_metadata,
-        )
-        idx_k = self._rotate_activation(idx_k)
-        idx_w = self.weights_proj(x) * (self.softmax_scale * self.num_index_heads**-0.5)
-        return idx_q, idx_k, idx_w
-
-
-# Compatibility names remain tied to the optional NPU backend. The default
-# reference model uses UpstreamCompressor/UpstreamIndexer directly.
-Compressor = NPUCompressor
-Indexer = NPUIndexer
+        idx_q, idx_k, idx_w = super().forward(x, qr, positions=positions, cu_seqlens=cu_seqlens)
+        return self.inner_indexer(idx_q, idx_k, idx_w, attention_metadata=attention_metadata)
 
 
 def select_compressed_slots(
@@ -322,7 +284,7 @@ def student_logits_at_picks(
     the model's own score scale (``select_compressed_slots`` cancels the operator's internal
     division; this pass never divides).
 
-    This is the pass ``LightningIndexer`` returns beside the selection, and the fused
+    This is the pass ``InnerIndexer`` returns beside the selection, and the fused
     selector's backward consumes the same quantity: at the picks, the student logits are the
     only differentiable edge of the selection.
     """
@@ -333,7 +295,9 @@ def student_logits_at_picks(
     return weighted_THK.sum(dim=1).masked_fill(topk_indices < 0, -torch.inf)
 
 
-class LightningIndexer(Module):
+class InnerIndexer(Module):
+    requires_teacher = False
+
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
         index_topk: int
@@ -341,27 +305,30 @@ class LightningIndexer(Module):
     def __init__(self, config: Config):
         super().__init__()
         self.index_topk = config.index_topk
+        self.return_scores = True
 
     def forward(self, idx_q, idx_k, idx_w, *, attention_metadata):
         """Select the compressed slots and score them differentiably.
 
-        Returns ``(topk_indices, topk_scores)``:
-
-        - ``topk_indices`` ``[B, L, K]`` document-local with ``-1`` for an unused slot.  The
-          reference path keeps the selection operator's order: ``gather_attn`` sums the
-          selected rows in that order, and re-sorting here would perturb the reference
-          numerics (the checked-in golden is exact).  The fused selector canonicalises to
-          descending order inside its Function, because there the saved indices must pair
-          slot-for-slot with the teacher;
-        - ``topk_scores`` ``[B, L, K]``: the student logits at those picks, differentiable in
-          ``idx_q``/``idx_k``/``idx_w`` and ``-inf`` on every ``-1`` slot.  This is the value
-          contract the reference path exposes; the fused override returns an unread carrier
-          on the same edge because its teacher arrives on the gradient.
+        Returns document-local indices and the corresponding student logits. Native CSA can
+        skip the logits when its auxiliary objective is disabled.
         """
-        # The selector runs on a layer of its own ratio and reads that layer's entry; a
-        # geometry without a compressed pool is the only shape it refuses.
+        # Native TorchTitan metadata includes the longest document for the CSA top-k bound.
+        documents = getattr(attention_metadata, "documents", attention_metadata)
+        if documents is not None or attention_metadata is None:
+            with spmd.no_typecheck():
+                return v4_compressor.Indexer.select(
+                    idx_q,
+                    idx_k,
+                    idx_w,
+                    max_seqlen=idx_q.size(0) if documents is None else documents.max_k,
+                    ratio=4,
+                    topk=self.index_topk,
+                    cu_seqlens=None if documents is None else documents.cu_seq_q,
+                    return_scores=self.training and self.return_scores,
+                )
         if attention_metadata.ratio <= 1:
-            raise ValueError("LightningIndexer requires a compressed geometry (ratio > 1).")
+            raise ValueError("InnerIndexer requires a compressed geometry (ratio > 1).")
         cu_seqlens = attention_metadata.q.cu_seqlens
         cmp_frame = attention_metadata.cmp_k
         if cmp_frame is None:

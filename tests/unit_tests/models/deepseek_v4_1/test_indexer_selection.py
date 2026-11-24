@@ -17,7 +17,7 @@ import pytest
 import torch
 
 from torchtitan_npu.models.deepseek_v4_1.attention import CompressedSparseInnerAttention2
-from torchtitan_npu.models.deepseek_v4_1.indexer import FULL, REINDEX, Selector
+from torchtitan_npu.models.deepseek_v4_1.indexer import FULL, REINDEX, InnerIndexer
 
 # Three documents of 4, 8 and 2 tokens; at ratio 2 they pool 2, 4 and 1 entries.
 BOUNDS = [0, 4, 12, 14]
@@ -64,8 +64,8 @@ def _masks():
 
 
 def _selector():
-    return Selector(
-        Selector.Config(
+    return InnerIndexer(
+        InnerIndexer.Config(
             mode=FULL,
             compress_ratio=2,
             num_index_heads=HEADS,
@@ -146,8 +146,8 @@ def test_reindex_preserves_frozen_selection_semantics(candidate_count, packed):
     metadata = CompressedSparseInnerAttention2.Config(
         window_size=8, softmax_scale=0.5, compress_ratio=1
     ).build_attention_metadata(positions)
-    selector = Selector(
-        Selector.Config(
+    selector = InnerIndexer(
+        InnerIndexer.Config(
             mode=REINDEX,
             compress_ratio=1,
             num_index_heads=2,

@@ -8,6 +8,7 @@ import pytest
 import torch
 from torchtitan.components.loss import CrossEntropyLoss
 from torchtitan.models.deepseek_v3.mtp import MTPDecoder
+from torchtitan.models.deepseek_v4.attention import HeavilyCompressedAttention, SlidingWindowAttention
 from torchtitan.models.deepseek_v4.mtp import MTPBlock
 
 from tests.unit_tests.models.mtp_test_utils import (
@@ -19,6 +20,8 @@ from tests.unit_tests.models.mtp_test_utils import (
     preprocess_v04,
 )
 from torchtitan_npu.models.common.linear import SharedLinear
+from torchtitan_npu.models.deepseek_v4.attention import Attention, CompressedSparseAttention
+from torchtitan_npu.models.deepseek_v4.compressor import InnerIndexer
 from torchtitan_npu.models.deepseek_v4.flavors import _make_dsv4_config
 from torchtitan_npu.models.deepseek_v4.mtp import MTPChunkedLossWrapper
 from torchtitan_npu.models.deepseek_v4.state_dict_adapter import (
@@ -89,14 +92,6 @@ def test_deepseek_v4_mtp_metadata_includes_uncompressed_plan():
     # are one map key each, and each entry carries only its own ratio's plan.
     entries = extra_kwargs["attention_metadata"]
 
-    # Native upstream cores key the map by backend class; the ratio is the one
-    # that backend owns in this debug stack.
-    from torchtitan.models.deepseek_v4.attention import (
-        CompressedSparseAttention,
-        HeavilyCompressedAttention,
-        SlidingWindowAttention,
-    )
-
     ratio_by_backend = {
         SlidingWindowAttention: 1,
         CompressedSparseAttention: 4,
@@ -106,6 +101,12 @@ def test_deepseek_v4_mtp_metadata_includes_uncompressed_plan():
     assert {ratio_by_backend[key] for key in entries} == {1, 4, 128}
     output = model(inputs, **extra_kwargs)
     assert isinstance(output, tuple) and len(output) == 2
+    main_attention = model.layers["2"].attention
+    mtp_attention = model.mtp_layers[0].attention
+    assert isinstance(main_attention.indexer.inner_indexer, InnerIndexer)
+    assert isinstance(main_attention.inner_attention, CompressedSparseAttention)
+    assert isinstance(mtp_attention, Attention) and isinstance(mtp_attention.inner_attention, SlidingWindowAttention)
+    assert getattr(mtp_attention, "indexer", None) is None
     assert type(model.mtp_layers[0]) is MTPBlock
     assert type(model).preprocess_inputs is MTPDecoder.preprocess_inputs
 

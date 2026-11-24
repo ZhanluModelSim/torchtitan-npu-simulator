@@ -213,7 +213,8 @@ def deepseek_v4_flash_43layers_16experts_eager_bf16(
     _eager_observability(config)
     config.override.imports = [
         "torchtitan_npu.override.common.rms_norm.asc",
-        ("torchtitan_npu.override.deepseek_v4.sparse_attn.asc", {"selector_backend": "asc"}),
+        "torchtitan_npu.override.deepseek_v4.lightning_indexer.asc",
+        "torchtitan_npu.override.deepseek_v4.sparse_attn.asc",
         "torchtitan_npu.override.deepseek_v4.mhc.asc_hc_pre",
         "torchtitan_npu.override.deepseek_v4.mhc.asc_hc_post",
         "torchtitan_npu.override.common.optimizer.swap_optimizer",
@@ -244,7 +245,8 @@ def deepseek_v4_flash_43layers_16experts_eager_fp8(
     # Fused overrides for this variant without swap_optimizer.
     config.override.imports = [
         "torchtitan_npu.override.common.rms_norm.asc",
-        ("torchtitan_npu.override.deepseek_v4.sparse_attn.asc", {"selector_backend": "asc"}),
+        "torchtitan_npu.override.deepseek_v4.lightning_indexer.asc",
+        "torchtitan_npu.override.deepseek_v4.sparse_attn.asc",
         "torchtitan_npu.override.deepseek_v4.mhc.asc_hc_pre",
         "torchtitan_npu.override.deepseek_v4.mhc.asc_hc_post",
         "torchtitan_npu.override.common.rope.asc_complex",
@@ -304,9 +306,10 @@ def deepseek_v4_flash_1p_2k(
     config.override.imports = [
         "torchtitan_npu.override.common.rms_norm.asc",
         "torchtitan_npu.override.common.rope.asc_complex",
+        "torchtitan_npu.override.deepseek_v4.lightning_indexer.asc",
         (
             "torchtitan_npu.override.deepseek_v4.sparse_attn.asc",
-            {"selector_backend": "asc", "num_heads": 16, "index_num_heads": 8},
+            {"num_heads": 16, "index_num_heads": 8},
         ),
         "torchtitan_npu.override.deepseek_v4.mhc.asc_hc_pre",
         "torchtitan_npu.override.deepseek_v4.mhc.asc_hc_post",

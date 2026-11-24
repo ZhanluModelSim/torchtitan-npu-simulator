@@ -9,13 +9,13 @@ import torch
 from torchtitan.components.data import TokenizedTrainingMicrobatch
 
 from torchtitan_npu.models.deepseek_v4_1 import trainer as v41_trainer
-from torchtitan_npu.models.deepseek_v4_1.indexer import FULL, Selector
+from torchtitan_npu.models.deepseek_v4_1.indexer import FULL, InnerIndexer
 from torchtitan_npu.override.deepseek_v4_1.lightning_indexer import asc
 
 
 def test_step_denominator_counts_queries_across_accumulation_and_data_ranks(monkeypatch):
-    config = Selector.Config(mode=FULL, compress_ratio=2, num_index_heads=2, index_head_dim=4, index_topk=4)
-    selector, reference = asc(config).build(), Selector(config)
+    config = InnerIndexer.Config(mode=FULL, compress_ratio=2, num_index_heads=2, index_head_dim=4, index_topk=4)
+    selector, reference = asc(config).build(), InnerIndexer(config)
 
     engine = object.__new__(v41_trainer.DeepSeekV41TrainingEngine)
     engine.model_parts = [torch.nn.ModuleList([selector, reference])]

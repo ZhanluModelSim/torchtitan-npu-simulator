@@ -128,9 +128,11 @@ def attach_selector_record(
     )
     return QuantV4Metadata(
         ratio=metadata.ratio,
+        documents=metadata.documents,
         position_k=metadata.position_k,
         q=metadata.q,
         swa_k=metadata.swa_k,
         cmp_k=metadata.cmp_k,
         aicpu_metadata=asc,
+        a3_workaround=metadata.a3_workaround,
     )

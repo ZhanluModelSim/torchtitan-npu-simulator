@@ -189,7 +189,7 @@ def test_candidate_pool_roles_are_declared_per_indexer_layer() -> None:
 
     for layer_id, layer in enumerate(config.layers):
         indexer = layer.attention.indexer
-        selector = indexer.selector
+        selector = indexer.inner_indexer
         if layer_id == V41_CANDIDATE_SOURCE_LAYER:
             # The Full Mode source is the only layer that builds the pool.
             assert indexer.mode is FULL

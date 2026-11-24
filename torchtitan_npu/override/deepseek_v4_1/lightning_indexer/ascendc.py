@@ -15,7 +15,7 @@ from dataclasses import dataclass
 import torch
 
 from torchtitan_npu.models.common.metadata import KernelFrame
-from torchtitan_npu.models.deepseek_v4_1.indexer import Selector
+from torchtitan_npu.models.deepseek_v4_1.indexer import InnerIndexer
 from torchtitan_npu.override import _IS_A5
 from torchtitan_npu.override.a3_workaround import A3KeyWorkaround
 from torchtitan_npu.override.deepseek_v4_1.metadata import (
@@ -188,7 +188,7 @@ class _LightningIndexerTND(torch.autograd.Function):
             return (None,) * 7
         idx_q, idx_k, idx_w, topk_indices, num_global_queries = ctx.saved_tensors
         if num_global_queries is None:
-            raise RuntimeError("Set Selector.num_global_queries before training the indexer")
+            raise RuntimeError("Set InnerIndexer.num_global_queries before training the indexer")
         # SMLAG injects raw teacher weights outside the main loss's normalization.
         # Scaling p scales SLIKG's Z * softmax(I) - p by the same factor.
         attn_softmax_l1_norm = attn_softmax_l1_norm / num_global_queries
@@ -219,7 +219,7 @@ class _LightningIndexerTND(torch.autograd.Function):
         )
 
 
-class AscSelector(Selector):
+class AscInnerIndexer(InnerIndexer):
     """The fused BF16 LI/SLIKG selector for the V4.1 indexer layers.
 
     It emits the kernel's own document-local ``topk_indices``.  The fused attention
@@ -233,7 +233,7 @@ class AscSelector(Selector):
     """
 
     @dataclass(kw_only=True, slots=True)
-    class Config(Selector.Config):
+    class Config(InnerIndexer.Config):
         pass
 
     def forward(

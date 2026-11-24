@@ -143,7 +143,7 @@ def test_qli_source_sorts_selection_publishes_pool_and_runs_slikg(
     # A later microbatch must not change the denominator saved with this graph.
     selector.num_global_queries = torch.tensor(64.0)
     if query_count is None:
-        with pytest.raises(RuntimeError, match=r"Set Selector\.num_global_queries"):
+        with pytest.raises(RuntimeError, match=r"Set InnerIndexer\.num_global_queries"):
             scores.backward(torch.full_like(scores, 8.0))
         assert "slikg" not in seen
         return

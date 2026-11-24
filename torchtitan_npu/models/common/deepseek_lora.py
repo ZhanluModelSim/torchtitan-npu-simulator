@@ -96,11 +96,11 @@ class DeepSeekLoRATransform(LoRATransform):
 
     def transform(self, model):
         frozen_indexers = {}
-        original_ropes = {}
+        parameterless_configs = {}
         freeze = LoRATransform(target_modules=[])
         for fqn, cfg, _, attr in model.traverse(Module.Config, recurse=True):
-            if type(cfg) is ComplexRoPE.Config:
-                original_ropes[fqn] = cfg
+            if type(cfg) is ComplexRoPE.Config or attr == "inner_indexer":
+                parameterless_configs[fqn] = cfg
             if attr == "indexer":
                 frozen_indexers[fqn] = freeze.transform(copy.deepcopy(cfg))
         transformed = super(DeepSeekLoRATransform, self).transform(model)
@@ -121,10 +121,10 @@ class DeepSeekLoRATransform(LoRATransform):
             if fqn in frozen_indexers:
                 assert parent is not None and isinstance(attr, str)
                 setattr(parent, attr, frozen_indexers[fqn])
-        # Base RoPE has only buffers; retain its concrete config for exact overrides.
-        for fqn, _, parent, attr in transformed.traverse(ComplexRoPE.Config):
-            if fqn in original_ropes and isinstance(attr, str):
-                setattr(parent, attr, original_ropes[fqn])
+        # RoPE and selection have no trainable parameters. Preserve their exact override targets.
+        for fqn, _, parent, attr in transformed.traverse(Module.Config, recurse=True):
+            if fqn in parameterless_configs and isinstance(attr, str):
+                setattr(parent, attr, parameterless_configs[fqn])
         return transformed
 
 

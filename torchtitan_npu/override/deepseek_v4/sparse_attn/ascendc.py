@@ -38,8 +38,9 @@ check.
 """
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
+import spmd_types as spmd
 import torch
 from cann_ops_transformer import (
     lightning_indexer_metadata,
@@ -47,7 +48,9 @@ from cann_ops_transformer import (
     sparse_flash_mla_metadata,
     sparse_lightning_indexer_kl_loss_grad_metadata,
 )
+from torchtitan.models.common.attention import create_varlen_metadata_for_document
 from torchtitan.models.common.attention.cp_attention import CPInnerAttention
+from torchtitan.models.deepseek_v4.compressor import SparseIndexerLoss
 
 from torchtitan_npu.models.common.metadata import KernelFrame
 from torchtitan_npu.models.deepseek_v4.attention import CompressedSparseInnerAttention
@@ -574,6 +577,8 @@ class AscCompressedSparseInnerAttention(CompressedSparseInnerAttention):
         index_head_dim: int
         """The selector geometry its record and SLIKG backward are sized with."""
 
+        aux_loss: SparseIndexerLoss.Config | None = None
+
         @property
         def geometry(self) -> AicpuGeometry:
             """The numbers the AI_CPU operators are called with, read off this layer's config."""
@@ -599,13 +604,21 @@ class AscCompressedSparseInnerAttention(CompressedSparseInnerAttention):
             The model-dir plain row plus the record tier: this geometry's four ``*_metadata``
             kernel outputs, computed here once per microbatch for every layer of the geometry.
             """
-            del padding_mask, max_num_documents, max_context_length
             from torchtitan_npu.models.deepseek_v4.metadata import build_v4_metadata
 
-            # The fused core never reads ``slots``: its HCA branch runs full-causal on the
-            # compressed pool, so the reference-only S x (S / ratio) selection is skipped here.
-            metadata = build_v4_metadata(positions, self.compress_ratio, build_slots=False)
-            return build_aicpu_metadata(metadata, geometry=self.geometry, positions_q=positions)
+            documents = create_varlen_metadata_for_document(
+                positions,
+                padding_mask=padding_mask,
+                max_num_documents=max_num_documents,
+                max_context_length=max_context_length,
+            )
+            with spmd.no_typecheck():
+                cu = torch.unique_consecutive(documents.cu_seq_q)
+            row = build_v4_metadata(positions, self.compress_ratio, cu_seq_q=cu, build_slots=False)
+            fused = build_aicpu_metadata(
+                row, geometry=self.geometry, positions_q=positions, include_selector=self.aux_loss is None
+            )
+            return replace(fused, documents=documents)
 
     def __init__(self, config: Config) -> None:
         super().__init__(config)
@@ -613,6 +626,14 @@ class AscCompressedSparseInnerAttention(CompressedSparseInnerAttention):
         self.head_dim = config.head_dim
         self.index_num_heads = config.index_num_heads
         self.index_head_dim = config.index_head_dim
+        self.aux_loss = config.aux_loss.build() if config.aux_loss is not None else None
+
+    def _parallelize(self, parallelism_context):
+        if parallelism_context.get_optional_mesh("tp") is not None:
+            raise NotImplementedError("DeepSeek-V4 SMLA requires TP=1.")
+        if parallelism_context.get_optional_mesh("cp") is not None and not isinstance(self, CPInnerAttention):
+            raise NotImplementedError("DeepSeek-V4 SMLA requires a CPInnerAttention backend for CP>1.")
+        super()._parallelize(parallelism_context)
 
     def forward(  # pyrefly: ignore [bad-override]
         self,
@@ -624,19 +645,42 @@ class AscCompressedSparseInnerAttention(CompressedSparseInnerAttention):
         topk_indices=None,
         topk_scores=None,
         attention_metadata: AscV4Metadata,
+        aux_loss_denominator=None,
+        padding_mask_T=None,
     ) -> torch.Tensor:
-        output, _lse = run_sparse_flash_mla(
-            q,
-            swa_k,
-            attn_sink,
-            attention_metadata=attention_metadata,
-            softmax_scale=self.softmax_scale,
-            compress_ratio=self.compress_ratio,
-            window_size=self.window_size,
-            cmp_k=cmp_k,
-            topk_indices=topk_indices,
-            teacher_carrier=topk_scores if self.training else None,
-        )
+        indices = topk_indices
+        if indices is not None and indices.size(-1) < self.index_topk:
+            indices = torch.nn.functional.pad(indices, (0, self.index_topk - indices.size(-1)), value=-1)
+        with spmd.no_typecheck():
+            output, lse = run_sparse_flash_mla(
+                q,
+                swa_k,
+                attn_sink,
+                attention_metadata=attention_metadata,
+                softmax_scale=self.softmax_scale,
+                compress_ratio=self.compress_ratio,
+                window_size=self.window_size,
+                cmp_k=cmp_k,
+                topk_indices=indices,
+                teacher_carrier=topk_scores if self.training and self.aux_loss is None else None,
+            )
+            if self.training and self.aux_loss is not None:
+                assert cmp_k is not None and topk_indices is not None and topk_scores is not None
+                if aux_loss_denominator is None:
+                    raise RuntimeError("SparseIndexerLoss requires aux_loss_denominator.")
+                output = self.aux_loss(
+                    q.detach(),
+                    cmp_k.detach(),
+                    topk_indices,
+                    topk_scores,
+                    lse.squeeze(0).detach(),
+                    attention_metadata.cu_seq_q,
+                    carrier=output,
+                    denominator=aux_loss_denominator,
+                    padding_mask_T=padding_mask_T,
+                )
+        if spmd.is_type_checking():
+            spmd.assert_type(output, spmd.get_local_type(q), spmd.get_partition_spec(q))
         return output
 
 

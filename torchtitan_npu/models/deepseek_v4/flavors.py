@@ -41,8 +41,8 @@ from torchtitan.models.deepseek_v4.sharding import hc_head_sharding_config
 
 from torchtitan_npu.models.common.activation import LimitedSwiGLU
 
-from .attention import DeepSeekV4Attention as Attention
-from .attention import UnitScaleRMSNorm
+from .attention import Attention, CompressedSparseAttention, UnitScaleRMSNorm
+from .compressor import Indexer, InnerIndexer
 from .model import (
     DeepSeekV4Model,
     DeepSeekV4TransformerBlock,
@@ -112,6 +112,12 @@ def _build_dsv4_layers(*, enable_sp: bool, enable_ep: bool, **kwargs):
                 eps=layer.attention.norm_eps,
             ),
         )
+        if layer.attention.indexer is not None:
+            core = layer.attention.inner_attention
+            layer.attention.indexer = derive(
+                layer.attention.indexer, Indexer.Config, inner_indexer=InnerIndexer.Config(index_topk=core.index_topk)
+            )
+            layer.attention.inner_attention = derive(core, CompressedSparseAttention.Config)
         layer.attention.inner_attention.aux_loss = None
         feed_forward = cast("MoE.Config", layer.feed_forward)
         experts = feed_forward.routed_experts

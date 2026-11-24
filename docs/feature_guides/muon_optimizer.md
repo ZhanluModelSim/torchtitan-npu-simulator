@@ -40,8 +40,8 @@ def muon_training():
 本例使用参考 attention，默认通过 `_enable_indexer_aux_loss()` 为 indexer 配置上游已有的
 `SparseIndexerLoss`，系数为 `1e-3`，使参与 Muon 更新的 indexer 参数获得梯度。
 V4 的参考 Muon 示例和 checkpoint IT 沿用此配置，不需要冻结 indexer。
-使用融合 attention 的 `selector_backend="asc"` 时，其已有独立的 indexer 训练目标，
-应保留 `aux_loss=None`，不要叠加上述辅助损失。
+同时启用 `lightning_indexer.asc` 和 `sparse_attn.asc` 的配方通过 `topk_scores` 的梯度训练 indexer，
+使用 `aux_loss=None`。
 
 启动时选择该工厂。NovaSwap 通过显式 override 启用：
 

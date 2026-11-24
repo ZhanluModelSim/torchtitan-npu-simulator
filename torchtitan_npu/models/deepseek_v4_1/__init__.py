@@ -33,7 +33,7 @@ from .indexer import (
     REINDEX,
     REUSE,
     HierarchicalIndexer,
-    Selector,
+    InnerIndexer,
 )
 from .mhc import HcPost, HcPre
 from .model import DeepSeekV41Model, DeepSeekV41MultimodalModel, DeepSeekV41TransformerBlock
@@ -259,7 +259,7 @@ def _make_indexer_config(
     pool_block_size = candidate_block_size if wants_pool else -1
     return HierarchicalIndexer.Config(
         mode=mode,
-        selector=Selector.Config(
+        inner_indexer=InnerIndexer.Config(
             mode=mode,
             compress_ratio=compress_ratio,
             num_index_heads=num_index_heads,

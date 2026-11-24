@@ -4,7 +4,7 @@
 # LICENSE file in the root directory of this source tree.
 
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, cast
 
 import spmd_types as spmd
@@ -287,7 +287,7 @@ class GraphTrainerDeepSeekV4Model(DeepSeekV4Model):
         max_num_documents: int | None = None,
         max_context_length: int | None = None,
     ):
-        from torchtitan_npu.override.deepseek_v4.sparse_attn.native import NativeAscV4Metadata
+        from .metadata import DeepSeekV4Metadata
 
         metadata = super()._get_attention_metadata(
             positions,
@@ -297,8 +297,18 @@ class GraphTrainerDeepSeekV4Model(DeepSeekV4Model):
         )
         if max_num_documents is None:
             for backend, value in metadata.items():
-                if isinstance(value, NativeAscV4Metadata) and value.ratio > 1:
-                    metadata[backend] = value.with_fixed_native_offsets(positions.numel())
+                if isinstance(value, DeepSeekV4Metadata) and value.documents is not None and value.ratio > 1:
+                    # Fix the projection offsets for graph replay. Kernel frames keep only nonempty documents.
+                    cu = value.documents.cu_seq_q
+                    with spmd.local():
+                        pad = positions.numel() // value.ratio + 1 - cu.numel()
+                        torch._check(pad >= 0, lambda: "Document offsets exceed the compressed row capacity")
+                        padded = torch.nn.functional.pad(cu, (0, pad), value=positions.numel())
+                        if spmd.is_type_checking():
+                            spmd.assert_type(padded, spmd.get_local_type(cu), spmd.get_partition_spec(cu))
+                    metadata[backend] = replace(
+                        value, documents=value.documents._replace(cu_seq_q=padded, cu_seq_k=padded)
+                    )
         return metadata
 
     def init_states(

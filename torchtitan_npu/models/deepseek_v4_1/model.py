@@ -31,7 +31,7 @@ norm.
 
 Packed documents are described by :class:`DeepSeekV41Metadata`: one frame per addressed
 tensor, whose packed boundaries are the only varlen metadata there is.  Both consumers read
-those frames and nothing else -- the torch-native core and selector address the row with
+those frames and nothing else -- the torch-native core and inner_indexer address the row with
 them, and the fused ports grid the same ones -- so a document never needs a second
 description.
 """
@@ -414,16 +414,16 @@ class DeepSeekV41Model(GeometryAttentionMetadataMixin, Decoder):
                     indexer = attention.indexer
                     if indexer.mode is not IndexerMode.REUSE:
                         indexer_seq_len = compressed_seq_len
-                        # The pool's geometry lives on the selector -- the one node that
+                        # The pool's geometry lives on the inner_indexer -- the one node that
                         # builds or searches it -- so the estimate is read off the same
                         # config the layers read it from and cannot drift from it.  The
                         # positivity test is the kernels' own, matching the module's
-                        # ``Selector.has_candidate_pool``.
-                        selector = indexer.selector
-                        if indexer.mode is IndexerMode.REINDEX and selector.candidate_topk_blocks > 0:
+                        # ``InnerIndexer.has_candidate_pool``.
+                        inner_indexer = indexer.inner_indexer
+                        if indexer.mode is IndexerMode.REINDEX and inner_indexer.candidate_topk_blocks > 0:
                             # MFU counts the model's bounded candidate search, not
                             # wider eager-reference scoring that is masked afterwards.
-                            candidate_seq_len = selector.candidate_topk_blocks * selector.candidate_block_size
+                            candidate_seq_len = inner_indexer.candidate_topk_blocks * inner_indexer.candidate_block_size
                             indexer_seq_len = min(indexer_seq_len, candidate_seq_len)
 
                         num_flops_per_token += 6 * indexer.num_index_heads * indexer.index_head_dim * indexer_seq_len

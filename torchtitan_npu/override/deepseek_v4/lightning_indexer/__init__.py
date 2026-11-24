@@ -3,7 +3,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""DeepSeek-V4 LightningIndexer override: selection fused with its SLIKG backward.
+"""DeepSeek-V4 InnerIndexer override: selection fused with its SLIKG backward.
 
 The selector and the sparse attention are separate targets, exactly as in the V4.1 stack:
 this entry emits ``topk_indices`` (and the teacher carrier ``topk_scores``) and consumes the
@@ -17,42 +17,42 @@ from typing import TYPE_CHECKING
 
 from torchtitan.config import derive, override
 
-from torchtitan_npu.models.deepseek_v4.compressor import LightningIndexer
+from torchtitan_npu.models.deepseek_v4.compressor import InnerIndexer
 
 if TYPE_CHECKING:
-    from .ascendc import AscLightningIndexer
-    from .pypto import PyPTOLightningIndexer
-    from .pypto_pro import PyPTOProLightningIndexer
+    from .ascendc import AscInnerIndexer
+    from .pypto import PyPTOInnerIndexer
+    from .pypto_pro import PyPTOProInnerIndexer
 
 
 @override(
-    target=LightningIndexer.Config,
+    target=InnerIndexer.Config,
     exact=True,
-    description="BF16 LightningIndexer selection fused with its SLIKG backward in one autograd.Function",
+    description="BF16 InnerIndexer selection fused with its SLIKG backward in one autograd.Function",
 )
-def asc(cfg: LightningIndexer.Config) -> "AscLightningIndexer.Config":
-    from .ascendc import AscLightningIndexer
+def asc(cfg: InnerIndexer.Config) -> "AscInnerIndexer.Config":
+    from .ascendc import AscInnerIndexer
 
-    return derive(cfg, AscLightningIndexer.Config)
+    return derive(cfg, AscInnerIndexer.Config)
 
 
 @override(
-    target=LightningIndexer.Config,
+    target=InnerIndexer.Config,
     exact=True,
-    description="PyPTO LightningIndexer selection fused with its SLIKG backward in one autograd.Function",
+    description="PyPTO InnerIndexer selection fused with its SLIKG backward in one autograd.Function",
 )
-def pypto(cfg: LightningIndexer.Config) -> "PyPTOLightningIndexer.Config":
-    from .pypto import PyPTOLightningIndexer
+def pypto(cfg: InnerIndexer.Config) -> "PyPTOInnerIndexer.Config":
+    from .pypto import PyPTOInnerIndexer
 
-    return derive(cfg, PyPTOLightningIndexer.Config)
+    return derive(cfg, PyPTOInnerIndexer.Config)
 
 
 @override(
-    target=LightningIndexer.Config,
+    target=InnerIndexer.Config,
     exact=True,
-    description="PyPTO-Pro LightningIndexer selection fused with its SLIKG backward in one autograd.Function",
+    description="PyPTO-Pro InnerIndexer selection fused with its SLIKG backward in one autograd.Function",
 )
-def pypto_pro(cfg: LightningIndexer.Config) -> "PyPTOProLightningIndexer.Config":
-    from .pypto_pro import PyPTOProLightningIndexer
+def pypto_pro(cfg: InnerIndexer.Config) -> "PyPTOProInnerIndexer.Config":
+    from .pypto_pro import PyPTOProInnerIndexer
 
-    return derive(cfg, PyPTOProLightningIndexer.Config)
+    return derive(cfg, PyPTOProInnerIndexer.Config)

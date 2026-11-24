@@ -14,6 +14,7 @@ from torch.fx.experimental.proxy_tensor import make_fx
 from torchtitan.config import OverrideConfig, apply_overrides
 from torchtitan.models.deepseek_v4.compressor import Compressor
 
+from torchtitan_npu.models.deepseek_v4.compressor import InnerIndexer
 from torchtitan_npu.models.deepseek_v4.flavors import _make_dsv4_config as _make_v4_config
 from torchtitan_npu.override.common.rms_norm import AscRMSNorm
 from torchtitan_npu.override.common.rope import AscComplexRoPE
@@ -69,7 +70,7 @@ def test_native_compressor_override_preserves_state_layout_and_composes_children
         assert node.rope.dim == node.rope_head_dim
         assert getattr(node.rope, "split", 0) == 0
     assert isinstance(config.layers[0].attention.compressor, Compressor.Config)
-    assert type(config.layers[0].attention.indexer).__module__.startswith("torchtitan.models.deepseek_v4")
+    assert type(config.layers[0].attention.indexer.inner_indexer) is InnerIndexer.Config
     with torch.random.fork_rng(devices=[]):
         reference = original.build()
         module = config.layers[0].attention.compressor.build()

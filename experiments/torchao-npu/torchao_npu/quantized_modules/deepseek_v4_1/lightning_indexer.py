@@ -206,7 +206,7 @@ class _QuantV41LightningIndexerTND(torch.autograd.Function):
 
         idx_q, idx_k, idx_w, topk_indices, num_global_queries = ctx.saved_tensors
         if num_global_queries is None:
-            raise RuntimeError("Set Selector.num_global_queries before training the indexer")
+            raise RuntimeError("Set InnerIndexer.num_global_queries before training the indexer")
         # Match the BF16 path: the trainer counts queries across the full step and DP mesh.
         attn_softmax_l1_norm = attn_softmax_l1_norm / num_global_queries
         # The backward rides the same entry, so it launches no AI_CPU operator either, and the
@@ -236,9 +236,9 @@ class _QuantV41LightningIndexerTND(torch.autograd.Function):
 
 
 class QuantV41LightningIndexer(torch.nn.Module):
-    """Forward behavior installed on a DeepSeek-V4.1 ``Selector`` instance."""
+    """Forward behavior installed on a DeepSeek-V4.1 ``InnerIndexer`` instance."""
 
-    # The module-swap handler binds this forward to a Selector instance. Declare the
+    # The module-swap handler binds this forward to a InnerIndexer instance. Declare the
     # host-owned fields here so static analysis does not fall back to nn.Module's
     # dynamic attribute type (Module | Tensor).
     index_topk: int

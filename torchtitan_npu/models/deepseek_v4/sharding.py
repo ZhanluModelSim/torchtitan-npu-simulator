@@ -3,6 +3,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from dataclasses import replace
 from typing import TYPE_CHECKING, cast
 
 import spmd_types as spmd
@@ -101,11 +102,11 @@ def set_compressed_sparse_attention_sharding(attention_cfg) -> None:
         out_dst_shardings=q,
     )
 
-    lightning_indexer = getattr(attention_cfg, "lightning_indexer", None)
-    if lightning_indexer is not None:
+    inner_indexer = attention_cfg.indexer.inner_indexer if attention_cfg.indexer is not None else None
+    if inner_indexer is not None:
         # The selector scores the whole row's index keys against this rank's chunks: the query
         # side stays replicated, the keys get the same ``S(0) -> R`` gather as the KV streams.
-        lightning_indexer.sharding_config = ShardingConfig(
+        inner_indexer.sharding_config = ShardingConfig(
             in_src_shardings={
                 "idx_q": replicated_activation,
                 "idx_k": replicated_activation,
@@ -349,8 +350,24 @@ def _set_deepseek_v4_mtp_sharding(
 def set_upstream_deepseek_v4_sharding_config(config, *, enable_sp: bool, enable_ep: bool) -> None:
     """Update expert ownership on an already annotated upstream V4 config tree."""
     from torchtitan.models.common.moe.sharding import routed_expert_linear_sharding_config
+    from torchtitan.models.deepseek_v4.sharding import dsa_inner_attention_sharding_config
 
     for layer in (*config.layers, *(config.mtp_layers or ())):
+        if layer.attention.indexer is not None:
+            core = layer.attention.inner_attention
+            layout = dense_activation_placement(tp=spmd.R, cp=spmd.S(0))
+            original = dsa_inner_attention_sharding_config(compress_ratio=4)
+            assert original.in_src_shardings is not None
+            core_inputs = dict(original.in_src_shardings)
+            index_inputs = {name: core_inputs.pop(name) for name in ("idx_q", "idx_k", "idx_w")}
+            core_inputs.update(topk_indices=layout, topk_scores=layout)
+            core.sharding_config = replace(original, in_src_shardings=core_inputs, in_dst_shardings=dict(core_inputs))
+            layer.attention.indexer.inner_indexer.sharding_config = ShardingConfig(
+                in_src_shardings=index_inputs,
+                in_dst_shardings=dict(index_inputs),
+                out_src_shardings=(layout, layout),
+                local_spmd=True,
+            )
         q_head_layout = attention_activation_placement()
         layer.attention.q_head_norm.sharding_config = ShardingConfig(
             state_shardings={"weight": _dense_param_rep},

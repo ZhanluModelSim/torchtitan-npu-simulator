@@ -305,7 +305,7 @@ def deepseek_v4_flash_cpt_4k_a3() -> TrainerEx.Config:
     config.override.imports = [
         "torchtitan_npu.override.common.rms_norm.asc",
         "torchtitan_npu.override.deepseek_v4.lightning_indexer.asc",
-        ("torchtitan_npu.override.deepseek_v4.sparse_attn.asc", {"selector_backend": "asc"}),
+        "torchtitan_npu.override.deepseek_v4.sparse_attn.asc",
         "torchtitan_npu.override.deepseek_v4.mhc.asc_hc_pre",
         "torchtitan_npu.override.deepseek_v4.mhc.asc_hc_post",
         "torchtitan_npu.override.common.optimizer.swap_optimizer",
@@ -355,7 +355,7 @@ def deepseek_v4_flash_cpt_4k_a5() -> TrainerEx.Config:
     config.override.imports = [
         "torchtitan_npu.override.deepseek_v4.common.rms_norm",
         "torchtitan_npu.override.deepseek_v4.lightning_indexer.asc",
-        ("torchtitan_npu.override.deepseek_v4.sparse_attn.asc", {"selector_backend": "asc"}),
+        "torchtitan_npu.override.deepseek_v4.sparse_attn.asc",
         "torchtitan_npu.override.deepseek_v4.mhc.asc_hc_pre",
         "torchtitan_npu.override.deepseek_v4.mhc.asc_hc_post",
         "torchtitan_npu.override.deepseek_v4.common.rope",

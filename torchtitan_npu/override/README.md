@@ -102,8 +102,7 @@ torchtitan_npu/override/
 │   ├── moe_router.py
 │   └── sparse_attn/
 │       ├── __init__.py
-│       ├── ascendc.py
-│       └── native.py
+│       └── ascendc.py
 └── qwen3_5/
     ├── fla.py
     ├── gated_delta.py
@@ -325,11 +324,10 @@ extension `CheckpointManager`（`torchtitan_npu/extensions/torchtitan/components
 | `common.rms_norm` | `RMSNorm.Config`（`fqns` 限定 compressor 子树之外的 norm 节点） | `AscRMSNorm.Config` | 对 DeepSeek-V4 各 norm 节点统一启用 `common.rms_norm.asc` 的融合实现 |
 | `common.rope` | `ComplexRoPE.Config`（精确匹配，`fqns` 限定 attention / indexer rope） | `AscComplexRoPE.Config` | 对 DeepSeek-V4 的 rope 节点统一启用 `common.rope.asc_complex` |
 | `chat_dataloader.sft` | `GrainDataLoader.Config`（`fqns=["dataloader"]`，精确匹配） | `GrainDataLoader.Config` | 使用结构化 DeepSeek-V4 chat 数据做 SFT（`thinking_mode` / `drop_thinking` / `add_default_bos_token` / `reasoning_effort` 可配）；要求 CPT 文本数据 recipe 打底 |
-| `sparse_attn.asc` | `DSV4InnerAttention.Config` | `AscSlidingWindowAttention.Config` / `AscHeavilyCompressedAttention.Config` / `AscCompressedSparseAttention.Config` | 在原生 TorchTitan DeepSeek-V4 attention（TP=CP=1）内部按子注意力类型使用 SMLA；`selector_backend` 选择 `native`/`asc`，`asc` 选择器自带 indexer 目标，要求 `aux_loss=None` |
-| `sparse_attn.asc_legacy` | `CompressedSparseInnerAttention.Config`（精确匹配） | `AscCompressedSparseInnerAttention.Config` | 遗留几何 backend 的 `cann_ops_transformer` TND SparseFlashMLA 与融合 SMLAG 反向；记录几何由本入口的参数声明 |
-| `lightning_indexer.asc` | `LightningIndexer.Config`（精确匹配） | `AscLightningIndexer.Config` | 融合 LI 选分与 SLIKG 反向；消费 `topk_scores` 上的 teacher |
-| `lightning_indexer.pypto` | `LightningIndexer.Config`（精确匹配） | `PyPTOLightningIndexer.Config` | PyPTO 实现的 LI 选分与 SLIKG 反向；需额外安装与当前 CANN 匹配的 `pypto` runtime |
-| `lightning_indexer.pypto_pro` | `LightningIndexer.Config`（精确匹配） | `PyPTOProLightningIndexer.Config` | PyPTO-Pro 实现的 LI 选分与 SLIKG 反向；同样需 `pypto` runtime |
+| `sparse_attn.asc` | `DSV4InnerAttention.Config` | `AscCompressedSparseInnerAttention.Config` | SWA、CSA 和 HCA 的 SMLA 前向与 SMLAG 反向。CSA 使用外层传入的 TopK |
+| `lightning_indexer.asc` | `InnerIndexer.Config`（精确匹配） | `AscInnerIndexer.Config` | CANN LI 选分与 SLIKG 反向，通过 `topk_scores.grad` 接收 teacher |
+| `lightning_indexer.pypto` | `InnerIndexer.Config`（精确匹配） | `PyPTOInnerIndexer.Config` | PyPTO 的 LI 与 SLIKG，需要与 CANN 匹配的 `pypto` runtime |
+| `lightning_indexer.pypto_pro` | `InnerIndexer.Config`（精确匹配） | `PyPTOProInnerIndexer.Config` | PyPTO-Pro 的 LI 与 SLIKG，同样需要 `pypto` runtime |
 | `compressor.asc` | `Compressor.Config`（精确匹配） | `AscNativeCompressor.Config` | 按 upstream 组件契约使用 CANN 压缩；`fused_norm` / `fused_rope` / `fused_pooling` 可分别关闭 |
 | `compressor.legacy_asc` | `CompressorImplementation.Config`（精确匹配） | `AscCompressor.Config` | 遗留 NPU 几何 backend 的 CANN compressor |
 | `mhc.asc_hc_pre` | `HcPre.Config` | `AscHcPre.Config` | 使用 `torch_npu.npu_mhc_pre` + `torch_npu.npu_mhc_sinkhorn` |
@@ -356,29 +354,15 @@ recipe 都不需要重复它。`window_size` 与 `index_topk` 不在这里：它
 字段，由模型声明一次，port 读取即可。teacher 的强度固定：SMLAG 反向把 raw marginal `p`
 写到 `topk_scores` 的梯度上（`-1` 槽位清零，并乘一次 `softmax_scale`），没有关闭开关。
 
-`sparse_attn.asc` 与 `lightning_indexer.asc` / `lightning_indexer.pypto` 是两组独立的配置节点，
-训练 indexer 时必须成对启用（CANN 侧配 CANN，PyPTO 侧配 PyPTO）：前者产出 teacher，
-后者在 `_LightningIndexerTND.backward` 用 `sparse_lightning_indexer_kl_loss_grad` 消费这条边。
+CSA 层的 `attention.indexer` 计算查询、压缩键和权重，交给 `indexer.inner_indexer` 选择文档内的槽位。
+`attention.inner_attention` 接收返回的 `(topk_indices, topk_scores)`。要使用融合蒸馏目标，配方同时启用
+`sparse_attn.asc` 和一个 `lightning_indexer` override，并设置 `aux_loss=None`。SMLAG 反向通过
+`topk_scores` 的梯度传递 teacher，SLIKG 用它计算 indexer 的参数梯度。
 
-metadata 不再是独立入口：每个 microbatch、每个几何一份 entry，由被替换配置自己的
-`build_attention_metadata` 直接构建（upstream PR #4897 的 backend-owned 接缝）。
-默认 `sparse_attn.asc` 的构建器是 `AscNativeInnerAttentionConfig.build_attention_metadata`
-（`sparse_attn/native.py`，native SMLA 适配器当前要求 CP=1）；legacy 几何路径
-`sparse_attn.asc_legacy` 的构建器是 `AscCompressedSparseInnerAttention.Config.build_attention_metadata`
-（`sparse_attn/ascendc.py`）。两者都在模型目录的 `build_v4_metadata` 给出的整行
-document 边界、按 ratio 折好的池网格与三个 kernel frame（`q`/`swa_k`/`cmp_k`）之上
-补算子记录。map key 是 `(端口类, compress_ratio)`，每层只读自己 ratio 的
-entry，因此没有跨几何查找、也没有 `plan_for` 之类的守卫。LI record 属于 selector：BF16 的
-由 port 在同一入口按 `AicpuGeometry` 构建；量化的 selector 是**另一个 backend**
-（`torchao_npu.quantized_modules.deepseek_v4.QuantizedV4SparseAttention`），它替换融合核的
-config、用 `quant_lightning_indexer_metadata` 构建自己的 entry，并拒绝 CP 重切（其记录契约
-不属于本 port）。`override/` 与 `models/` 都不知道量化存在。CP 下由
-`AscV4Metadata.prepare_cp_metadata` 用 `doc_chunk_entry` 按 rank-local 行重建 plan，再用
-`build_aicpu_metadata` 在其上重填记录（upstream PR #4617，`asc_legacy` 路径）；native
-路径的 `NativeAscV4Metadata.prepare_cp_metadata` 直接拒绝 CP；参考契约的 hook 同样拒绝 CP。
-compressor 的状态表由**融合 attention 的 metadata 构建器**在 eager 边界写进 plan（表宽随 batch 的
-文档走，不能在建图时构），因此选 `sparse_attn.asc` 就带上了它，不再有独立的 compressor 状态表入口。非融合的 attention backend（参考核）不建表，压缩器在 forward 里按当前 batch 自行构表（eager 下逐
-batch 正确；只有「参考 attention + 融合 compressor + 图训练」这一组合目前没有 recipe 使用）。
+融合 attention 的 `AscCompressedSparseInnerAttention.Config.build_attention_metadata` 按压缩比构建
+每个 microbatch 的文档边界和核记录。投影读取文档偏移，CANN 核读取去掉空段后的
+`q`、`swa_k`、`cmp_k` frame。量化配方用 `QuantizedV4SparseAttention` 构建对应的量化选分记录。
+
 MHC 的 `asc_hc_pre` / `asc_hc_post` 与 `triton_hc_pre` / `triton_hc_post` / `triton_hc_head` / `tilelang_hc_head` 是可选入口（`deepseek_v4/__init__.py`
 默认只导入 `compressor`、`lightning_indexer` 与 `sparse_attn`），需要时显式加入
 `override.imports`。`triton_hc_head` 与 `tilelang_hc_head` 声明同一 `HcHead.Config` 节点，两者互斥，只能启用其一；二者均可与 `asc_hc_pre` / `asc_hc_post` 共存。
@@ -400,7 +384,8 @@ DeepSeek-V4 的 tests 配方在 Python 中显式启用融合组合，不通过 `
 ```text
 torchtitan_npu.override.common.rms_norm.asc
 torchtitan_npu.override.common.rope.asc_complex
-torchtitan_npu.override.deepseek_v4.sparse_attn.asc   # selector_backend="asc"
+torchtitan_npu.override.deepseek_v4.sparse_attn.asc
+torchtitan_npu.override.deepseek_v4.lightning_indexer.asc
 torchtitan_npu.override.deepseek_v4.mhc.asc_hc_pre
 torchtitan_npu.override.deepseek_v4.mhc.asc_hc_post
 torchtitan_npu.override.common.token_dispatcher.asc
@@ -423,15 +408,12 @@ torchtitan_npu.override.common.rope.workaround
 （Attention Gym 的 `gather_attn`，逐文档 FP32），不再有独立的 attention 数值基线
 入口。
 
-DeepSeek-V4 当前采用单行 packed container，要求 `local_batch_size == 1`；增加每步
-token 数时应调整 `seq_len`。参考 recipe（模型目录默认内核）使用公共的
-`DeepSeekV4Metadata`（每个几何一份：整行边界、该 ratio 的池网格、三个 kernel frame 与查询
-位置），当前仅支持无 context parallel 的连续文档布局。AscendC 路径的 entry（`AscV4Metadata`）
-在它之上只加按 kernel 分组的预计算记录。
+DeepSeek-V4 当前采用单行 packed container，要求 `local_batch_size == 1`。参考配方的
+投影和选分共用上游提供的文档边界。融合配方通过 `AscV4Metadata` 将文档边界和核记录传给同一层。
 
 TND 数据约定见 [DeepSeek-V4 TND 适配](../../docs/feature_guides/deepseek_v4_tnd.md)。
 
-PyPTO selector（`torchtitan_npu.override.deepseek_v4.lightning_indexer.pypto`）是同一契约的
+PyPTO `inner_indexer`（`torchtitan_npu.override.deepseek_v4.lightning_indexer.pypto`）是同一契约的
 独立实现：输入准备、排序、teacher 边与反向都在它自己的模块里，只使用 PyPTO 的 LI/SLIKG 两个
 kernel；使用它需要额外安装与当前 CANN 匹配的 `pypto` runtime，安装方法参见
 [PyPTO 安装文档](https://gitcode.com/cann/pypto/blob/master/docs/zh/install/build_and_install.md)，
@@ -444,7 +426,7 @@ kernel；使用它需要额外安装与当前 CANN 匹配的 `pypto` runtime，�
 | 入口 | Target | Replacement | 说明 |
 | --- | --- | --- | --- |
 | `sparse_attn.asc` | `CompressedSparseInnerAttention2.Config`（精确匹配） | `AscV41SparseAttention.Config` | AscendC attention 前后向；`topk_scores` 作为教师边。该 config 按**自己的 `compress_ratio`** 预计算 attention 与 indexer 的 metadata（每个几何每 microbatch 一次，全层共享同一份 entry），因此没有单独的 metadata 入口；kernel geometry 是该 config 自己的必需字段，由 override 参数一次写入，默认值为 V4.1-Flash 形状。本入口不声明任何量化：量化 selector 的 metadata 属于量化后的 attention backend，它替换本节点并自建 entry（见下文），本入口在那条路径上不生效 |
-| `lightning_indexer.asc` | `Selector.Config`（精确匹配） | `AscSelector.Config` | 融合 LI 选分与 SLIKG 反向；它的两条 AI_CPU metadata 由 `sparse_attn.asc` 的几何一并预计算，随同一份 map entry 下发 |
+| `lightning_indexer.asc` | `InnerIndexer.Config`（精确匹配） | `AscInnerIndexer.Config` | 融合 LI 选分与 SLIKG 反向；它的两条 AI_CPU metadata 由 `sparse_attn.asc` 的几何一并预计算，随同一份 map entry 下发 |
 | `mhc.asc_sinkhorn` | `HcPre.Config`（精确匹配） | `AscV41HcPre.Config` | 仅融合 Sinkhorn，保留调用方的 pre mix |
 | `mhc.asc_hc_post` | `HcPost.Config`（精确匹配） | `AscV41HcPost.Config` | `cann_ops_transformer.ops.mhc_post` |
 | `tilelang.tilelang_hc_pre` | `HcPre.Config`（精确匹配） | `TilelangV41HcPre.Config` | 单趟 mHC pre，由 TileKernels Split/Apply 与 `torch_npu.npu_mhc_sinkhorn` 完成 |

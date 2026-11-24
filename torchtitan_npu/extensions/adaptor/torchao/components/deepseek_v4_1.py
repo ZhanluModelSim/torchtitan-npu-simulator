@@ -295,7 +295,10 @@ def _v41_attention_numbers(model_config) -> dict[str, int]:
     # silently preferred.  A missing field is an error, not a default: ``-1`` here would size the
     # metadata for no pool while the launches still pass one.
     pools = {
-        (layer.attention.indexer.selector.candidate_topk_blocks, layer.attention.indexer.selector.candidate_block_size)
+        (
+            layer.attention.indexer.inner_indexer.candidate_topk_blocks,
+            layer.attention.indexer.inner_indexer.candidate_block_size,
+        )
         for layer in layers
     }
     positive = {(blocks, size) for blocks, size in pools if blocks > 0}

@@ -22,10 +22,10 @@ _RECIPES = [
 ]
 
 
-def _selectors(config, family):
-    if family == "deepseek_v4":
-        return [layer.attention.lightning_indexer for layer in config.model.layers if layer.attention.lightning_indexer]
-    return [layer.attention.indexer.selector for layer in config.model.layers]
+def _inner_indexers(config):
+    return [
+        layer.attention.indexer.inner_indexer for layer in config.model.layers if layer.attention.indexer is not None
+    ]
 
 
 @pytest.mark.parametrize("family,original,recipe,owner_name,alignment", _RECIPES)
@@ -69,7 +69,7 @@ def test_typed_cp_recipe_passes_native_cli_validation_and_retains_fused_owner(
     config.override.imports.append(f"torchtitan_npu.override.{family}.sparse_attn.asc")
     apply_overrides(config.override, config)
     cores = [layer.attention.inner_attention for layer in config.model.layers]
-    selector = _selectors(config, family)[0]
+    selector = _inner_indexers(config)[0]
     selector_owner = selector._owner
     assert selector_owner.__module__.startswith(f"torchtitan_npu.override.{family}.lightning_indexer")
     assert config.parallelism.context_parallel_degree == cp
@@ -82,7 +82,7 @@ def test_typed_cp_recipe_passes_native_cli_validation_and_retains_fused_owner(
     config.__post_init__()
     apply_overrides(config.override, config)
     assert all(layer.attention.inner_attention._owner is owner for layer in config.model.layers)
-    selector = _selectors(config, family)[0]
+    selector = _inner_indexers(config)[0]
     assert selector._owner is selector_owner
     config.parallelism.context_parallel_degree = 1
     with pytest.raises(ValueError, match=r"CPInnerAttention.*degree is 1"):

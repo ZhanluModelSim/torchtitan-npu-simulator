@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from torchtitan.models.common.linear import GroupedLinear, Linear
 
-from torchtitan_npu.models.deepseek_v4.compressor import LightningIndexer as DeepSeekV4LightningIndexer
+from torchtitan_npu.models.deepseek_v4.compressor import InnerIndexer as DeepSeekV4InnerIndexer
 from torchtitan_npu.patches.torchtitan.models.common.linear import BatchedLinear
 
 from ..filters import any_config_filter
@@ -31,7 +31,7 @@ UNIFIED_NPU_QUANTIZED_MODULES = (
     Linear.Config,
     BatchedLinear.Config,
     GroupedLinear.Config,
-    DeepSeekV4LightningIndexer.Config,
+    DeepSeekV4InnerIndexer.Config,
 )
 
 _DENSE = (
@@ -59,7 +59,7 @@ class V4FilterKeys:
 V4_FILTER_SPECS: dict[str, FilterSpec] = {
     V4FilterKeys.DENSE: {"suffixes": _DENSE},
     V4FilterKeys.ROUTED_EXPERT: {"suffixes": _ROUTED},
-    V4FilterKeys.LIGHTNING_INDEXER: {"suffixes": (".attention.lightning_indexer",)},
+    V4FilterKeys.LIGHTNING_INDEXER: {"suffixes": (".attention.indexer.inner_indexer",)},
 }
 
 V4_PREQUANTIZE_DEFAULT_FQNS: dict[str, tuple[str, ...]] = {

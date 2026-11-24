@@ -22,7 +22,7 @@ from dataclasses import dataclass
 
 import torch
 
-from torchtitan_npu.models.deepseek_v4.compressor import LightningIndexer
+from torchtitan_npu.models.deepseek_v4.compressor import InnerIndexer
 from torchtitan_npu.ops.pypto_pro.li_lig_wrapper import (
     lightning_indexer_indices,
     sparse_lightning_indexer_kl_loss_grad,
@@ -132,16 +132,18 @@ class _PyPTOProIndexerTND(torch.autograd.Function):
         return dq.to(idx_q.dtype), dk.to(idx_k.dtype), dw.to(idx_w.dtype), None, None, None
 
 
-class PyPTOProLightningIndexer(LightningIndexer):
+class PyPTOProInnerIndexer(InnerIndexer):
     """Standalone selector over compile-safe, lazily loaded PyPTO-Pro kernels."""
 
+    requires_teacher = True
+
     @dataclass(kw_only=True, slots=True)
-    class Config(LightningIndexer.Config):
+    class Config(InnerIndexer.Config):
         pass
 
     def forward(self, idx_q, idx_k, idx_w, *, attention_metadata):
         if not isinstance(attention_metadata, AscV4Metadata):
-            raise TypeError("PyPTOProLightningIndexer requires the entry the fused attention built.")
+            raise TypeError("PyPTOProInnerIndexer requires the entry the fused attention built.")
         topk_indices, topk_scores = _PyPTOProIndexerTND.apply(
             idx_q,
             # index_select stays outside the Function so dk scatters back to

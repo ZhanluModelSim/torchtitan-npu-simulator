@@ -49,15 +49,7 @@ _V4_LI_LAYOUT = "TND"
 _V4_LI_MASK_MODE = 3
 _V4_LI_CMP_RATIO = 4
 
-# The V4 inner attention, at both places the stack carries it: the decoder builds the metadata
-# map from `attention.inner_attention`, while `Attention` reads its key and builds the module from
-# `attention.inner_attention`.  The quantized backend replaces the
-# whole node, so both copies have to become its config -- otherwise the map is keyed by the
-# quantized class while every layer asks for the fused one and reads no metadata at all.
-_v4_inner_attention_filter = match_config_fqn_suffix(
-    ".attention.inner_attention",
-    ".attention.inner_attention",
-)
+_v4_inner_attention_filter = match_config_fqn_suffix(".attention.inner_attention")
 
 _DYNAMIC_NORM_CLASS_CACHE: dict[type[Module], type[Module]] = {}
 

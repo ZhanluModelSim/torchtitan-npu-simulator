@@ -28,7 +28,7 @@ a reference to a loss.
 
 The whole computation is single-pass: no query chunking, which is a kernel-side concern
 and not something the reference implementation should carry.  A kernel-backed variant
-replaces :class:`Selector`'s forward: the per-head weights and the relaxed score, the
+replaces :class:`InnerIndexer`'s forward: the per-head weights and the relaxed score, the
 visibility and candidate masking, and the top-k selection are what the NPU
 ``lightning_indexer`` forward and ``sparse_lightning_indexer_kl_loss_grad`` backward
 implement.
@@ -156,7 +156,7 @@ def _student_logits(
     return logits_BLHiK.sum(dim=1).masked_fill(local_BLK < 0, -torch.inf)
 
 
-class Selector(Module):
+class InnerIndexer(Module):
     """The selection node: scores every visible compressed entry and picks the top-k.
 
     The pool is scored row-wide -- one axis over the packed documents -- while the picks are
@@ -370,7 +370,7 @@ class HierarchicalIndexer(Module):
     training/inference consistency and per-query cost device, not a learned component.
 
     Which layer plays which part is the selector's business, not the indexer's: the pool
-    capacity and the block size both live on ``Selector.Config``, and this adapter only
+    capacity and the block size both live on ``InnerIndexer.Config``, and this adapter only
     carries the candidate tensor between layers.
 
     The indexer is trained by distillation alone, so its graph starts at its own
@@ -391,7 +391,7 @@ class HierarchicalIndexer(Module):
         wq_b: Linear.Config | None = None
         weights_proj: Linear.Config | None = None
         # Present on Full Mode layers, which project their own keys:
-        selector: Selector.Config
+        inner_indexer: InnerIndexer.Config
         wk: Linear.Config | None = None
         k_norm: RMSNorm.Config | None = None
 
@@ -402,7 +402,7 @@ class HierarchicalIndexer(Module):
         self.num_index_heads = config.num_index_heads
         self.index_head_dim = config.index_head_dim
         self.index_topk = config.index_topk
-        self.selector = config.selector.build()
+        self.inner_indexer = config.inner_indexer.build()
         if self.mode is REUSE:
             return
         if config.rope is None or config.wq_b is None or config.weights_proj is None:
@@ -496,7 +496,7 @@ class HierarchicalIndexer(Module):
         # per-head scores are averaged rather than summed.
         weights = self.weights_proj(x) * (self.index_head_dim**-0.5 * self.num_index_heads**-0.5)
 
-        topk_indices, topk_scores, candidates = self.selector(
+        topk_indices, topk_scores, candidates = self.inner_indexer(
             idx_q,
             idx_k,
             weights,
