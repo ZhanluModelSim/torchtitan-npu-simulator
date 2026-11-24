@@ -32,9 +32,8 @@ it -- one group per pair of kernels, one field per direction::
     Under context parallelism its ``prepare_cp_metadata`` rebuilds the frames, records and proof
     for this rank.
 
-The compressor has no frames here: the ratio-4 overlap's carry is applied outside the compressor
-(``models/common/carry_exchange.CarryExchange``), which builds the augmented
-boundaries and the kernel's state table at the call site and passes them as arguments.  The
+The compressor has no frames here: the ratio-4 overlap's carry is owned by the
+context-parallel module replacement, not by the eager compressor.  The
 quantized selector is another backend: it owns an entry of its own (a subclass of this one) and
 rebuilds the selector group with its own contract.  Nothing here knows about quantization.
 """

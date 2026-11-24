@@ -8,12 +8,10 @@ frame 的 `seqused = reach` 把可见范围限制在本 rank 的 chunk 之前。
 `torchtitan_npu/models/common/metadata.py` 的 `KernelFrame`，也共用同一份输入布局：
 `torchtitan_npu/models/common/restore.py` 的静态 doc-chunk 布局由 **CP 切分本身**施加——`cp_shard`
 在切之前按 `doc_chunk_permutation` 重排整行，所以每个 rank 拿到的输入就是本 rank 的 chunk，不需要
-任何集合通信；每层只在需要"本 rank 窗口"的消费方内部做恢复（压缩器池化前、核心取 swa 键前，
-同一个 `key_stream`），layer 里不再有 `x_k`。要说明次数：不池化层是一次（swa 键）；池化层是两次
-（swa 键 + 主压缩器的 `x`）；池化且带 indexer 的几何是三次，因为 indexer 自己的压缩器对同一份 `x`
-再恢复一次——这是「key 侧自己管移动」的代价，各压缩器不必知道别的模块已经恢复过它。ratio-4
-重叠的 carry 由 `torchtitan_npu/models/common/carry_exchange.py` 的 `CarryExchange` 在调用点处理，
-两栈的压缩器本身都不感知 CP。
+任何集合通信；每层只在需要"本 rank 窗口"的消费方内部做恢复（V4.1 压缩器池化前、核心取 swa 键前，
+同一个 `key_stream`），layer 里不再有 `x_k`。V4 的 ratio-4 重叠 carry 曾由本地 `Compressor` 内部
+的 restore 与 `torchtitan_npu/models/common/carry_exchange.py` 的 `CarryExchange` 实现；这些脚手架
+已随 0.4.0 清理删除，V4 CP 压缩器等 CP 重做后再补；V4.1 压缩器本身 CP-agnostic。
 
 本文是 V4 与 V4.1 的合并指南（原 V4 CP 指南的内容已并入）。
 
@@ -26,7 +24,7 @@ frame 的 `seqused = reach` 把可见范围限制在本 rank 的 chunk 之前。
 
 ```text
 rank r 的输入（doc-chunk）：   每篇文档的第 r 个 chunk，文档顺序（cp_shard 的置换结果）
-key 侧 slab：              [r·C, (r+1)·C)，由消费方按需从上面的 chunk 行恢复（压缩器内部、核心之前的 swa 键）
+key 侧 slab：              [r·C, (r+1)·C)，由消费方按需从上面的 chunk 行恢复（核心之前的 swa 键；V4.1 压缩器池化前也恢复）
 查询帧 q：                 每篇文档的第 r 个 chunk（输入布局已放好，查询不移动）
 滑窗 KV 帧 swa_k：         整行；seqused = reach_d = (r+1)·Q_d
 压缩 KV 帧 cmp_k：         整行按 ratio 折叠；seqused = reach_d // ratio，residual = reach_d % ratio
@@ -86,8 +84,7 @@ list 接收 split，这是框架的签名；它们由 plan 推导，而 plan **�
 `require_document_alignment` 在 entry 与 `chunk_index` 各读一次（V4.1 另有一次 `int(chunk.sum())` 的
 一致性校验）。
 
-每层内的路径上没有 D2H：ratio-4 的 carry ring 用 host rank 直接构造两条 split（`_ring_split`，每层
-0 次同步），`document_starts`、`slab_positions` 与 carry 的边界裁剪都是 device 算术。arch22 的 key
+每层内的路径上没有 D2H：`document_starts`、`slab_positions` 都是 device 算术。arch22 的 key
 压实每个 microbatch 同步一次（`nonzero` 的行数是 device 值，见 §4.2）。
 
 ### 1.3 frame 与 metadata
@@ -150,8 +147,8 @@ V4.1 的 CP 配方是 `torchtitan_npu_recipes.models.deepseek_v4_1.deepseek_v4_1
 | 维度 | DeepSeek-V4 | DeepSeek-V4.1 |
 | --- | --- | --- |
 | 输入布局 | 同一份：`cp_shard` 的 doc-chunk 置换，tokens / labels / positions / MTP 深度一次到位 | 同左 |
-| 压缩器与 CP | ratio-4 重叠块需要前驱 rank 的 carry：`CarryExchange`（与压缩器同级的模块）做交换/prepend，调用点压缩后再裁剪 | 压缩器 CP-agnostic：文档按 `cp × ratio` 对齐后，本 rank 的 slab 起点就是组边界，本地池化即可；无 carry |
-| 压缩流取得方式 | 本地流（含 carry）池化后，内核边界 `S(0) -> R` gather 成整行 | 本地 slab 池化后同样在核心边界 `S(0) -> R` gather |
+| 压缩器与 CP | ratio-4 重叠 carry 的旧脚手架（本地 `Compressor` + `CarryExchange`）已随 0.4.0 清理删除；V4 CP 压缩器待 CP 重做 | 压缩器 CP-agnostic：文档按 `cp × ratio` 对齐后，本 rank 的 slab 起点就是组边界，本地池化即可 |
+| 压缩流取得方式 | 本地流池化后，内核边界 `S(0) -> R` gather 成整行 | 本地 slab 池化后同样在核心边界 `S(0) -> R` gather |
 | 内核锚定 | arch35 读 `seqused_q` / `seqused_ori_kv` / `seqused_cmp_kv`，窗口与压缩因果上限直接锚在 reach 上；arch22 的内核不读 key 侧 `seqused`、把 mask 右对齐到 frame 末尾，因此非末尾 rank 的两路 key 流要压成 rank-local 前缀 | arch22 同样对 key 前缀做整理；arch35 读取 `seqused` |
 | rank-local key 压缩（仅 arch22） | `A3KeyWorkaround`（`override/a3_workaround.py`）：`swa_k_gather` / `cmp_k_gather` 两个可微 `index_select`，由 `build_aicpu_metadata` 在 `if not _IS_A5:` 里加在 `AscV4Metadata` 上 | 同样使用 `A3KeyWorkaround` |
 | frame 归属 | 模型 metadata（`DeepSeekV4Metadata`，含 `cp: CPDeepSeekMetadata(restore)`） | 融合 entry（`AscV41Metadata`） |
@@ -160,6 +157,9 @@ V4.1 的 CP 配方是 `torchtitan_npu_recipes.models.deepseek_v4_1.deepseek_v4_1
 | 量化 metadata | `QuantV4Metadata` 拒绝 | `_V41QuantAttentionMetadata` 拒绝 |
 
 ## 4. DeepSeek-V4
+
+> **0.4.0 现状：** V4 的 CP 配方（`deepseek_v4_flash_cp`）当前是 `NotImplementedError`（deferred）；
+> 本章保留历史实现说明，压缩器侧的 restore/carry 脚手架已随本轮 0.4.0 清理删除，CP 重做后再补。
 
 ### 4.1 数据流
 
@@ -172,10 +172,10 @@ DeepSeekV4Model.preprocess_inputs 只额外准备 MTP 深度，并让它们走�
 
 Attention.forward（每层）
   x（doc-chunk 行）
-    ├─ wq_a / q_norm / wq_b / q_head_norm / rope(positions)   [查询不移动]
+    ├─ wq_a / q_norm / wq_b / q_b_norm / rope(positions)   [查询不移动]
     ├─ swa：wkv / kv_norm / rope(positions)（chunk 行）      [CP=S(0)]
     │    └─ key_stream（RestorePlan.apply）-> 本 rank slab，供核心边界 gather
-    ├─ compressor(x)（见 4.3：内部 restore + ratio-4 carry）  [CP=S(0)]
+    ├─ compressor(x)（见 4.3：上游实现；CP 的 restore/carry 随 CP 重做）  [CP=S(0)]
     └─ indexer：idx_q / idx_w 在 chunk 行上投影；idx_k 由它自己的压缩器产出
   wo_a / wo_b 输出留在 doc-chunk 行（不 unpermute）
 
@@ -191,9 +191,9 @@ positions 一次到位；`DeepSeekV4Model.preprocess_inputs` 只把 MTP 的每�
 没有 CP（或 `cp_size == 1`）时整段跳过，batch 原样进入前向。
 
 `Attention.forward` 收到的是 doc-chunk 行，查询侧直接投影、在随行搬来的 `positions` 上做 RoPE。key
-侧同样在这批行上投影、旋转、池化——每一步都是逐 token 的，因此与移动可交换——需要"本 rank 窗口"的
-消费方各自恢复：压缩器在池化前恢复（`attention_metadata.key_stream`，degree=1 即恒等），核心在取
-swa 键前恢复（同一函数，窄张量）。layers 里没有 `x_k`：移动只发生在拥有它的模块内部。输出仍留在
+侧同样在这批行上投影、旋转、池化——每一步都是逐 token 的，因此与移动可交换——核心在取 swa 键前
+恢复本 rank 的窗口（`attention_metadata.key_stream`，degree=1 即恒等）。V4 压缩器的 restore/carry
+已删除，等 CP 重做后由新实现负责。layers 里没有 `x_k`：移动只发生在拥有它的模块内部。输出仍留在
 doc-chunk 行：`wo_b` 是逐 token 投影，残差、MoE 与 loss 都按同一布局计算，loss 的 labels 也是同一份
 plan 搬过的。
 
@@ -241,55 +241,24 @@ function`）。
 跑 CP 的作业会因此变慢，日志里只有一条 warning；评估性能时按「arch22 + CP>1 不编译」这一条来读，
 不要把 CP=1 的编译吞吐当成同一份配方在两个 degree 上的预期。
 
-### 4.3 压缩器：restore / carry / prepend / trim
+### 4.3 压缩器与 CP（待重做）
 
-压缩器拿到的是**布局原样产出的流**（degree=1 是整行，CP 下是本 rank 的 chunk 行）、key 流自己的
-`positions`（entry 的 `position_k`）以及**整行**的 `cu_seqlens`。池化本身仍是扁平的 `ratio` 折叠，
-重叠的左半块在每个 segment 起点被 mask（score `-inf`、kv `0`）；CP 的两件额外工作在模块内部完成：
+V4 当前默认压缩器是上游 `torchtitan.models.deepseek_v4.compressor.Compressor`：池化是扁平的
+`ratio` 折叠，重叠的左半块在每个 segment 起点被 mask（score `-inf`、kv `0`），文档边界由传入的
+整行 `cu_seqlens` 保证不跨文档。参考实现与融合实现共用同一接口
+`compressor(x, positions, cu_seqlens=...)`；输入 `x` 为 folded-token `[T, D]`，positions 为 `[T]`，
+每篇文档的 token 数必须按压缩比对齐，输出 `[T / ratio, D]`。CP 的 KV all-gather 仍由 `sharding.py`
+在融合内核边界声明式完成。
 
-- **restore**：`attention_metadata.key_stream(x)`（degree=1 即恒等），把 chunk 行换回本 rank 的
-  slab，使池化的块网格与整行一致；
-- **carry**：ratio-4 的前驱块由 `CarryExchange`
-  （`torchtitan_npu/models/common/carry_exchange.py`）交换、prepend、池化后由压缩器自己裁掉。
-
-调用方只交 `x` 与 `position_k`，看不到这两步。CP 的 KV all-gather 仍由 `sharding.py` 在融合内核
-边界声明式完成。
-
-ratio-4 的**重叠前驱**由 `CarryExchange` 处理：
-
-1. 每篇文档长度按 `cp × ratio` 对齐，slab 边界落在压缩网格上；但 ratio-4 的块首池化需要前一块的行。
-2. rank `r > 0` 把本 rank 最后 `ratio` 个 token 通过一次 `all_to_all_single` 发给 rank `r+1`，
-   同时接收 rank `r-1` 的。**位置不参与交换**：它是前驱 slab 末块的位置，由整行边界直接算出
-   （`slab_positions`），而且 carry 块一定会被裁掉、overlap 读的是 RoPE 之前的投影态，数值上惰性。
-3. 把收到的 block prepend 到本地 slab 前面；`CarryExchange` 用「整行边界裁剪到增强窗口
-   `[slab_start-ratio, slab_end)` 再 rebase」构造增强 `cu_seqlens`：若 slab 起点在某文档内部，
-   窗口里没有落在接缝上的边界，carry 自然与该文档的第一段合并；若起点正好是文档边界，整行边界
-   被保留，carry 是前一篇文档的独立 segment。两种情况都只靠「mask 每个 segment 起点」这一条规则，
-   carry 自己的输出块会被裁掉，因此不需要特判。
-4. 用增强后的 `cu_seqlens` 调压缩器（融合实现 `coff=2`），输出比本地块多一块；丢掉第一块
-   （carry block），保留本地 slab 的 `C/ratio` 块。
-5. RoPE 使用 `positions[..., ::ratio]`（保留块的文档内位置）。
-6. `CarryExchange` 只产出增强流（`CarryStream`：`x` / `positions` / `cu_seqlens` / `trim`）；
-   融合实现的 `_state_inputs` 在内部按增强流的形状符号构造全 0 的 kernel tiling 表
-   （`state_block_table` 不在模型层接口上）。ratio=128 无重叠，不做 carry。
-
-rank 0 只发送、不接收；最后一个 rank 只接收、不发送；其余 rank 两者都做。所有 rank 都进入同两次
-集合通信（空 split 也参与），避免死锁。
-
-调用点在每个 degree 都传 `metadata.swa_k.cu_seqlens`（整行边界）；`cp = 1` 时 `CarryExchange`
-直接返回同一份流，压缩器拿到的是整行边界。参考实现与融合实现共用同一接口
-`compressor(x, positions, *, cu_seqlens=None)`（`cu_seqlens` 是 keyword-only：带 sharding
-config 的模块走框架的位置参数契约，位置参数个数必须与签名一致）。
-输入 `x` 为 folded-token 形状 `[T, D]`，positions 为 `[T]`，每篇文档的 token 数必须按
-压缩比对齐。内部压缩实现使用单行容器，输出再恢复为 `[T / ratio, D]`；文档边界防止 ratio-4
-的重叠跨文档。
+原 V4 本地 `Compressor` 里的 CP 部分——`attention_metadata.key_stream` 的 restore、ratio-4 的
+`CarryExchange` 交换/prepend/trim、`coff=2` 的增强 `cu_seqlens`——已随 0.4.0 清理删除；
+`deepseek_v4_flash_cp` 当前是 `NotImplementedError`（deferred），CP 压缩器等 CP 重做后再补。
 
 ### 4.4 参考路径
 
 `DeepSeekV4Metadata.prepare_cp_metadata` 明确拒绝 CP：参考内核（Attention Gym 的 `gather_attn`）
-只有一条连续文档流的契约。参考**压缩器**本身支持 CP（carry 在 `CarryExchange` 里，与压缩器
-实现无关），所以 debug model（参考压缩器 + 融合注意力）也能跑 CP。V4 的数值验收在融合路径的
-CP=1/CP=2 之间做。
+只有一条连续文档流的契约。原 debug model（参考压缩器 + 融合注意力）能跑 CP 所依赖的 carry 脚手架
+已删除，V4 的 CP 数值验收等 CP 重做后再在融合路径的 CP=1/CP=2 之间做。
 
 ## 5. DeepSeek-V4.1
 
@@ -301,7 +270,7 @@ Attention.forward
     ├─ q 投影 / q_norm / rope(positions)
     ├─ swa_k 投影 + rope(positions)（chunk 行）             [CP=S(0)]
     │    └─ key_stream（RestorePlan.apply）-> 本 rank slab，供核心边界 gather
-    ├─ compressor(x, position_k)：内部 restore，source 层池化，无 carry   [CP=S(0)]
+    ├─ compressor(x, position_k)：内部 restore，source 层池化   [CP=S(0)]
     └─ indexer：idx_q / weights 在 chunk 行上投影，idx_k 由压缩器的 slab latent 投影
   输出留在 chunk 行：rope(positions, inverse) -> wo_a -> wo_b
 
@@ -351,7 +320,7 @@ V4.1 的 `Compressor`（`torchtitan_npu/models/deepseek_v4_1/compressor.py`）�
 layer 在本地 slab 上做 `ratio` 折叠（ratio==1 是普通投影），因为文档已按 `cp × ratio` 对齐，
 本 rank 的 slab 起点就是组边界，`C/ratio` 是整数块。压缩输出（`[C/ratio, D]`）在 sparse core
 的边界被声明式 `cp: S(0) -> R` gather 成整行；`cmp_k.seqused = reach // ratio` 让内核只读本 rank
-之前的块。ratio-4 那种跨 slab 的 carry 在 V4.1 不存在，因此没有 `CarryExchange`。
+之前的块。ratio-4 那种跨 slab 的 carry 在 V4.1 不存在。
 
 `torchtitan_npu/models/deepseek_v4_1/sharding.py` 声明 CP 的输入/输出放置：
 
@@ -397,17 +366,16 @@ Engram 不在这一列。它的 token history 要的是每行**在本文档内**
 | `torchtitan_npu/models/common/alignment.py` | `require_document_alignment` / `require_per_doc_alignment`：文档长度与 `per_doc_alignment` 的严格对齐检查 |
 | `torchtitan_npu/models/deepseek_v4/model.py` | `DeepSeekV4Model.preprocess_inputs`：MTP 深度与 batch 走同一次 `cp_shard`（布局由 seam 施加，模型不再搬 batch） |
 | `torchtitan_npu/models/deepseek_v4/metadata.py` | `DeepSeekV4Metadata(ratio, q, swa_k, cmp_k, slots, cp)` / `CPDeepSeekMetadata` / `build_v4_metadata` / `doc_chunk_entry` |
-| `torchtitan_npu/models/deepseek_v4/attention.py` | 查询与 key 都在 doc-chunk 行上投影；swa 键在核心前用 `key_stream` 恢复、压缩器内部恢复+carry、selector + 内层核心直调（无 wrapper）、输出不 unpermute；参考内核读 `q` / `cmp_k` frame 与预计算的 HCA 选择 |
-| `torchtitan_npu/models/common/carry_exchange.py` | `CarryExchange` / `CarryStream`：ratio-4 carry 的 ring（只换 tokens；位置由 `slab_positions` 算出）、增强 `cu_seqlens` 与 `trim`；cp=1 为 no-op |
-| `torchtitan_npu/models/deepseek_v4/compressor.py` | 压缩器（CP/非 CP 同一实例）：`forward` 用 `attention_metadata.key_stream` 恢复窗口、ratio-4 时内部 carry 并裁掉自己那块；`Indexer` 复用它，`idx_q` 在 chunk 行、`idx_k` 是行内的池化块 |
+| `torchtitan_npu/models/deepseek_v4/attention.py` | 查询与 key 都在 doc-chunk 行上投影；swa 键在核心前用 `key_stream` 恢复、selector + 内层核心直调（无 wrapper）、输出不 unpermute；参考内核读 `q` / `cmp_k` frame 与预计算的 HCA 选择 |
+| `torchtitan_npu/models/deepseek_v4/compressor.py` | `Indexer` / `InnerIndexer` / `select_compressed_slots` / `student_logits_at_picks`：selector 的参考实现与选择辅助；主压缩器是上游 `Compressor` |
 | `torchtitan_npu/models/deepseek_v4/sharding.py` | `swa_k` / `cmp_k` / `idx_k` 的 `cp: S(0) -> R` 声明 |
 | `torchtitan_npu/override/deepseek_v4/metadata.py` | `AicpuMetadata` / `AscV4Metadata`（`aicpu_metadata` + `a3_workaround`）/ `prepare_cp_metadata`（`doc_chunk_entry` + `build_aicpu_metadata`） |
 | `torchtitan_npu/override/deepseek_v4/sparse_attn/ascendc.py` | `build_aicpu_metadata`（按 entry 的 frame 重建记录，arch22 上建 key 压缩）、SMLA/SMLAG 的 frame 参数 |
 | `torchtitan_npu/override/deepseek_v4/lightning_indexer/ascendc.py` | 准备 V4 的 selector frame 与 arch22 的压缩池，将整行 token 数 `swa_k.cu_seqlens[-1]` 传给 SLIKG 作为分母 |
 | `torchtitan_npu/override/deepseek_v4/lightning_indexer/pypto.py` | PyPTO 版 selector：独立实现同一契约（输入准备、排序、teacher 边），只替换 LI/SLIKG kernel 对 |
-| `torchtitan_npu/override/deepseek_v4/compressor/ascendc.py` | CANN 融合压缩器（无 carry、无 CP 分支；`_state_inputs` 按 stream 形状内部构造零 tiling 表） |
+| `torchtitan_npu/override/deepseek_v4/compressor/ascendc.py` | CANN 融合压缩器（无 CP 分支；`_state_inputs` 按 stream 形状内部构造零 tiling 表） |
 | `torchtitan_npu/models/deepseek_v4_1/attention.py` | V4.1 查询保持 doc-chunk 布局，key 消费方按需恢复 slab |
-| `torchtitan_npu/models/deepseek_v4_1/compressor.py` | V4.1 本地池化压缩器（CP-agnostic，无 carry） |
+| `torchtitan_npu/models/deepseek_v4_1/compressor.py` | V4.1 本地池化压缩器（CP-agnostic） |
 | `torchtitan_npu/models/deepseek_v4_1/sharding.py` | V4.1 sparse core / selector 的 `S(0) -> R` 声明 |
 | `torchtitan_npu/models/deepseek_v4_1/model.py` | `DeepSeekV41Metadata` 与 `build_v41_frames`（整行边界与三帧）；`prepare_cp_metadata` 拒绝 CP；`preprocess_inputs` 按行构造 Engram 的 token history；并行入口仅接受 TP=CP=PP=1 |
 | `torchtitan_npu/override/deepseek_v4_1/sparse_attn/ascendc.py` | `AscV41Metadata` / `shard_asc_v41_metadata` / `build_fused_metadata` |

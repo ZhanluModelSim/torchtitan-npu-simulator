@@ -148,13 +148,14 @@ def _build_metadata(dsv4):
 
 def build_compressor(dsv4, ratio):
     coff = 2 if ratio == 4 else 1
-    comp = dsv4.compressor.Compressor(
-        dsv4.compressor.Compressor.Config(
+    from torchtitan.models.deepseek_v4 import compressor as reference_compressor
+
+    comp = reference_compressor.Compressor(
+        reference_compressor.Compressor.Config(
             rope=BuildCfg(lambda: IdentityRoPE()),
             head_dim=HD,
             rope_head_dim=RD,
             compress_ratio=ratio,
-            carry_exchange=dsv4.compressor.CarryExchange.Config(ratio=ratio),
             wkv=BuildCfg(lambda: make_linear(DIM, coff * HD)),
             wgate=BuildCfg(lambda: make_linear(DIM, coff * HD)),
             norm=BuildCfg(lambda: RMS(HD)),

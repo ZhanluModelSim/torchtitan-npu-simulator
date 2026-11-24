@@ -20,7 +20,7 @@ from torchtitan.models.common import ComplexRoPE, RMSNorm
         "*.attention_norm",
         "*.ffn_norm",
         "*.q_norm",
-        "*.q_head_norm",
+        "*.q_b_norm",
         "*.kv_norm",
         "*.enorm",
         "*.hnorm",

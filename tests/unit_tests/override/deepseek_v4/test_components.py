@@ -14,7 +14,7 @@ from torchtitan_npu.models.deepseek_v4.attention import Attention
 from torchtitan_npu.models.deepseek_v4.compressor import Indexer, InnerIndexer
 from torchtitan_npu.override.common.rms_norm import AscRMSNorm
 from torchtitan_npu.override.common.rope import AscComplexRoPE
-from torchtitan_npu.override.deepseek_v4.compressor.ascendc import AscNativeCompressor
+from torchtitan_npu.override.deepseek_v4.compressor.ascendc import AscCompressor
 from torchtitan_npu.override.deepseek_v4.sparse_attn.ascendc import AscCompressedSparseInnerAttention
 from torchtitan_npu_recipes.tests.models.deepseek_v4 import deepseek_v4_flash_43layers_16experts_eager_bf16
 
@@ -39,11 +39,11 @@ def test_component_overrides_keep_native_outer_modules_and_checkpoint_schema():
     assert all(type(node) is Attention.Config for node in attentions)
     assert all(isinstance(node.inner_attention, AscCompressedSparseInnerAttention.Config) for node in attentions)
     assert all(type(node.inner_indexer) is InnerIndexer.Config for node in indexers)
-    assert all(type(node) is AscNativeCompressor.Config for _, node, _, _ in config.model.traverse(Compressor.Config))
+    assert all(type(node) is AscCompressor.Config for _, node, _, _ in config.model.traverse(Compressor.Config))
     assert all(type(node) is AscRMSNorm.Config for _, node, _, _ in config.model.traverse(RMSNorm.Config))
     assert all(type(node) is AscComplexRoPE.Config for _, node, _, _ in config.model.traverse(ComplexRoPE.Config))
-    assert all(type(node.q_head_norm) is AscRMSNorm.Config for node in attentions)
-    assert all(not node.q_head_norm.elementwise_affine for node in attentions)
+    assert all(type(node.q_b_norm) is AscRMSNorm.Config for node in attentions)
+    assert all(not node.q_b_norm.elementwise_affine for node in attentions)
     with torch.device("meta"):
         before = original.build().state_dict()
         after = config.model.build().state_dict()
@@ -53,7 +53,7 @@ def test_component_overrides_keep_native_outer_modules_and_checkpoint_schema():
 
 
 def test_query_norm_preserves_reference_bf16_rounding_and_gradients():
-    config = deepseek_v4_flash_43layers_16experts_eager_bf16().model.layers[0].attention.q_head_norm
+    config = deepseek_v4_flash_43layers_16experts_eager_bf16().model.layers[0].attention.q_b_norm
     norm = config.build()
     generator = torch.Generator().manual_seed(42)
     reference = torch.randn(7, 16, 512, generator=generator, dtype=torch.bfloat16, requires_grad=True)

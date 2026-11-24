@@ -5,12 +5,10 @@
 
 """CANN compressor using the operator's native autograd implementation.
 
-The fused kernel compresses one local stream, addressed by that stream's own ``cu_seqlens``: the
-ratio-4 overlap's carry is not its business (``CarryExchange`` prepends the
-predecessor block, passes the augmented boundaries and trims the extra output block), so this
-module has no process group and no CP branch.  The kernel's zero tiling table is an operator
-input built here, from the stream's own shape symbols, never from a host maximum that a traced
-graph would bake in; the model-level compressor interface does not know it exists.
+The fused kernel compresses one local stream, addressed by that stream's own ``cu_seqlens``.
+The kernel's zero tiling table is an operator input built here, from the stream's own shape
+symbols, never from a host maximum that a traced graph would bake in; the model-level compressor
+interface does not know it exists.
 """
 
 from __future__ import annotations
@@ -20,7 +18,6 @@ from dataclasses import dataclass
 import torch
 from torchtitan.models.deepseek_v4 import compressor as v4_compressor
 
-from torchtitan_npu.models.deepseek_v4.compressor import Compressor, CompressorImplementation
 from torchtitan_npu.ops.ascendc.compressor import load_compressor
 
 
@@ -49,53 +46,7 @@ def _state_inputs(
     return state_block_table, state_cache, cu_seqlens, seqused
 
 
-class AscCompressor(CompressorImplementation):
-    @dataclass(kw_only=True, slots=True)
-    class Config(CompressorImplementation.Config):
-        pass
-
-    def __init__(self, config: Config) -> None:
-        super().__init__(config)
-        self._compressor_fn = load_compressor()
-
-    def forward(
-        self,
-        compressor: Compressor,
-        x: torch.Tensor,
-        positions: torch.Tensor,
-        *,
-        cu_seqlens: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        ratio = compressor.compress_ratio
-        if cu_seqlens is None:
-            raise ValueError("the CANN compressor requires the local stream's cu_seqlens")
-        state_block_table, state_cache, cu_seqlens, seqused = _state_inputs(
-            cu_seqlens,
-            x,
-            ratio=ratio,
-            head_dim=compressor.head_dim,
-        )
-        pooled = self._compressor_fn(
-            x.reshape(-1, x.shape[-1]).contiguous(),
-            compressor.wkv.weight,
-            compressor.wgate.weight,
-            state_cache,
-            # CANN also allocates saved softmax/KV outputs with APE's dtype.
-            compressor.ape.float(),
-            cmp_ratio=ratio,
-            state_block_table=state_block_table,
-            cu_seqlens=cu_seqlens,
-            seqused=seqused,
-            coff=1 + int(compressor.overlap),
-            cache_mode=1,
-        )
-        # The kernel may allocate capacity beyond this stream's blocks; the kept blocks are
-        # this stream's own count, expressed with its shape symbol rather than a host value.
-        pooled = compressor.norm(pooled[: x.shape[1] // ratio].to(x.dtype))
-        return compressor.rope(pooled.unsqueeze(1), positions=positions.reshape(-1)[::ratio]).squeeze(1).unsqueeze(0)
-
-
-class AscNativeCompressor(v4_compressor.Compressor):
+class AscCompressor(v4_compressor.Compressor):
     """Fuse complete packed groups while retaining the upstream compressor layout.
 
     CANN emits partial groups, whereas upstream packs only complete groups and

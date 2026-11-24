@@ -174,7 +174,7 @@ def test_apply_overrides_folds_layer_fqns_on_deepseek_v4_debugmodel(
     unitscale_msg = next(m for m in grouped_msgs if "UnitScaleRMSNorm.Config -> _TaggedRMSNorm.Config" in m)
     assert f"model.layers.{layer_range}.attention_norm" in rmsnorm_msg
     assert "model.layers.0.attention_norm" not in rmsnorm_msg
-    assert f"model.layers.{layer_range}.attention.q_head_norm" in unitscale_msg
+    assert f"model.layers.{layer_range}.attention.q_b_norm" in unitscale_msg
 
 
 def test_apply_rebinds_preloaded_caller_modules(monkeypatch) -> None:

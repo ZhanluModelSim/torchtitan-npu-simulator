@@ -86,7 +86,7 @@ def _register(core, trace, *, transformers: bool) -> trace_hooks.TraceHookRegist
             ("q_a_proj", "q_a_proj", "wq_a"),
             ("q_a_norm", "q_a_norm", "q_norm"),
             ("q_b_proj", "q_b_proj", "wq_b"),
-            ("q_b_norm", "q_b_norm", "q_head_norm"),
+            ("q_b_norm", "q_b_norm", "q_b_norm"),
             ("kv_proj", "kv_proj", "wkv"),
             ("kv_norm", "kv_norm", "kv_norm"),
             ("o_b_proj", "o_b_proj", "wo_b"),

@@ -328,8 +328,7 @@ extension `CheckpointManager`（`torchtitan_npu/extensions/torchtitan/components
 | `lightning_indexer.asc` | `InnerIndexer.Config`（精确匹配） | `AscInnerIndexer.Config` | CANN LI 选分与 SLIKG 反向，通过 `topk_scores.grad` 接收 teacher |
 | `lightning_indexer.pypto` | `InnerIndexer.Config`（精确匹配） | `PyPTOInnerIndexer.Config` | PyPTO 的 LI 与 SLIKG，需要与 CANN 匹配的 `pypto` runtime |
 | `lightning_indexer.pypto_pro` | `InnerIndexer.Config`（精确匹配） | `PyPTOProInnerIndexer.Config` | PyPTO-Pro 的 LI 与 SLIKG，依赖 `pypto_pro` runtime；预处理时按几何校验 query/key 的累计边界与有效长度，每个文档均须紧凑 |
-| `compressor.asc` | `Compressor.Config`（精确匹配） | `AscNativeCompressor.Config` | 按 upstream 组件契约使用 CANN 压缩；`fused_norm` / `fused_rope` / `fused_pooling` 可分别关闭 |
-| `compressor.legacy_asc` | `CompressorImplementation.Config`（精确匹配） | `AscCompressor.Config` | 遗留 NPU 几何 backend 的 CANN compressor |
+| `compressor.asc` | `Compressor.Config`（精确匹配） | `AscCompressor.Config` | 按 upstream 组件契约使用 CANN 压缩；`fused_norm` / `fused_rope` / `fused_pooling` 可分别关闭 |
 | `mhc.asc_hc_pre` | `HcPre.Config` | `AscHcPre.Config` | 使用 `torch_npu.npu_mhc_pre` + `torch_npu.npu_mhc_sinkhorn` |
 | `mhc.tilelang_hc_pre` | `HcPre.Config` | `TilelangHcPre.Config` | 使用外部 TileKernels Split/Apply 与 `torch_npu.npu_mhc_sinkhorn` |
 | `mhc.asc_hc_post` | `HcPost.Config` | `AscHcPost.Config` | 使用 `cann_ops_transformer.ops.mhc_post` |

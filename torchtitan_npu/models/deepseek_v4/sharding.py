@@ -147,7 +147,7 @@ def set_deepseek_v4_attention_sharding(attention_cfg, *, enable_sp):
     at.q_norm.sharding_config = _replicate_weight
     at.wq_b.sharding_config = colwise_config(input_layout=dense_activation_placement(tp=spmd.R, cp=spmd.S(0)))
     q_head_layout = attention_activation_placement()
-    at.q_head_norm.sharding_config = ShardingConfig(
+    at.q_b_norm.sharding_config = ShardingConfig(
         state_shardings={"weight": _dense_param_rep},
         in_src_shardings={"x": q_head_layout},
         in_dst_shardings={"x": q_head_layout},
@@ -369,7 +369,7 @@ def set_upstream_deepseek_v4_sharding_config(config, *, enable_sp: bool, enable_
                 local_spmd=True,
             )
         q_head_layout = attention_activation_placement()
-        layer.attention.q_head_norm.sharding_config = ShardingConfig(
+        layer.attention.q_b_norm.sharding_config = ShardingConfig(
             state_shardings={"weight": _dense_param_rep},
             in_src_shardings={"x": q_head_layout},
             in_dst_shardings={"x": q_head_layout},

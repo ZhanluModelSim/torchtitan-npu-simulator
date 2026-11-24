@@ -34,11 +34,10 @@ the per-layer query movement and the output un-permutation.  There are no ``cu_s
 ``cu_seq_k`` aliases: read the grid from the frame that addresses it (row grid =
 ``swa_k.cu_seqlens``, query grid = ``q.cu_seqlens``, compressed grid = ``cmp_k.cu_seqlens``).
 
-Nothing here describes the compressor's *internal* stream: under the ratio-4 overlap the carry
-block a rank prepends lives in ``models/common/carry_exchange.CarryExchange``, which builds the
-augmented boundaries at the call site and hands them to the compressor as an argument.  A
-compressor is therefore CP-agnostic: it sees one local stream, one set of positions and, for the
-overlap, one set of ``cu_seqlens``.
+Nothing here describes the compressor's *internal* stream: the ratio-4 carry belongs to the
+context-parallel module replacement, not to the eager compressor.  At one degree a compressor
+stays CP-agnostic: it sees one local stream, one set of positions and, for the overlap, one set
+of ``cu_seqlens``.
 """
 
 from dataclasses import dataclass, replace

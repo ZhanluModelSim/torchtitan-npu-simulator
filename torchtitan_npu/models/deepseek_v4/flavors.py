@@ -106,7 +106,7 @@ def _build_dsv4_layers(*, enable_sp: bool, enable_ep: bool, **kwargs):
         layer.attention = derive(
             layer.attention,
             Attention.Config,
-            q_head_norm=UnitScaleRMSNorm.Config(
+            q_b_norm=UnitScaleRMSNorm.Config(
                 normalized_shape=layer.attention.head_dim,
                 eps=layer.attention.norm_eps,
             ),

@@ -99,7 +99,7 @@ class Attention(v4_attention.DeepSeekV4Attention):
 
     @dataclass(kw_only=True, slots=True)
     class Config(v4_attention.DeepSeekV4Attention.Config):
-        q_head_norm: RMSNorm.Config
+        q_b_norm: RMSNorm.Config
 
     def __init__(self, config: Config):
         super().__init__(config)
@@ -113,7 +113,7 @@ class Attention(v4_attention.DeepSeekV4Attention):
             elif inner_indexer.requires_teacher and inner_indexer.return_scores:
                 raise ValueError("Fused indexer training requires a sparse attention backend that emits its teacher.")
         self.attention_metadata_key = getattr(backend, "attention_metadata_key", type(self.inner_attention))
-        self.q_head_norm = config.q_head_norm.build()
+        self.q_b_norm = config.q_b_norm.build()
 
     def project_output_groups(self, grouped):
         """Project each head group with its own base and LoRA B weights."""
@@ -171,7 +171,7 @@ class Attention(v4_attention.DeepSeekV4Attention):
             _assert_spmd_attention_type(q, tp=spmd.S(1))
         # The rescale reads the wq_b projection output with bare ops.
         remat.recompute_needs_tensor(q)
-        q = self.q_head_norm(q)
+        q = self.q_b_norm(q)
         q_nope, q_rope = torch.split(q, [self.head_dim - rd, rd], dim=-1)
 
         kv = self.wkv(x)

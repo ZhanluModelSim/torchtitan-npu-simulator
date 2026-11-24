@@ -64,7 +64,7 @@ def test_native_compressor_override_preserves_state_layout_and_composes_children
     selected = [node for _, node, _, _ in config.traverse(Compressor.Config)]
     assert len(selected) == 3  # attention C4, its indexer, and HCA
     for node in selected:
-        assert type(node) is ascendc.AscNativeCompressor.Config
+        assert type(node) is ascendc.AscCompressor.Config
         assert type(node.norm) is AscRMSNorm.Config
         assert type(node.rope) is AscComplexRoPE.Config
         assert node.rope.dim == node.rope_head_dim

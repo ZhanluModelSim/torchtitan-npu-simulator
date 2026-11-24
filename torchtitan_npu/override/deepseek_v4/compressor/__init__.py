@@ -7,12 +7,10 @@ from torchtitan.config import derive, override
 from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.models.deepseek_v4.compressor import Compressor
 
-from torchtitan_npu.models.deepseek_v4.compressor import CompressorImplementation
-
 if TYPE_CHECKING:
     from torchtitan.models.base.module import Module
 
-    from .ascendc import AscCompressor, AscNativeCompressor
+    from .ascendc import AscCompressor
 
 
 def _fuse_compressor_norm(norm: "Module.Config") -> "Module.Config":
@@ -42,8 +40,8 @@ def asc(
     fused_norm: bool = True,
     fused_rope: bool = True,
     fused_pooling: bool = True,
-) -> "AscNativeCompressor.Config":
-    from .ascendc import AscNativeCompressor
+) -> "AscCompressor.Config":
+    from .ascendc import AscCompressor
 
     norm, rope = cfg.norm, cfg.rope
     if rope.dim != cfg.rope_head_dim or getattr(rope, "split", 0):
@@ -58,15 +56,4 @@ def asc(
         if not isinstance(rope, ComplexRoPE.Config):
             raise ValueError("The fused compressor RoPE requires ComplexRoPE")
         rope = asc_complex(rope)
-    return derive(cfg, AscNativeCompressor.Config, norm=norm, rope=rope, fused_pooling=fused_pooling)
-
-
-@override(
-    target=CompressorImplementation.Config,
-    exact=True,
-    description="Use the CANN compressor in the legacy NPU geometry backend",
-)
-def legacy_asc(cfg: CompressorImplementation.Config) -> "AscCompressor.Config":
-    from .ascendc import AscCompressor
-
-    return derive(cfg, AscCompressor.Config)
+    return derive(cfg, AscCompressor.Config, norm=norm, rope=rope, fused_pooling=fused_pooling)

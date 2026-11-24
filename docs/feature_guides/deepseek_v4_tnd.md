@@ -20,8 +20,8 @@ DeepSeek-V4 配方通过 `config.override.imports` 显式选择算子，不读�
         ├─ positions
         │      └─ 文档边界。融合后端按压缩比构建 AscV4Metadata
         │
-        ├─ Compressor：扁平 ratio 折叠 + softmax gate → 池化键流；CP 下由 CarryExchange 提供 carry
-        │     负责「前一块 carry + prepend + 压缩 + 裁掉多出块」，输出本地压缩 chunk，由内核边界 all-gather 成整行
+        ├─ Compressor：扁平 ratio 折叠 + softmax gate → 池化键流（上游 `Compressor`）
+        │     按整行文档边界池化、不跨文档；CP 下由内核边界 all-gather 成整行（CP 当前 deferred）
         │
         ├─ CSA 的 indexer.inner_indexer → (topk_indices, topk_scores)
         │
@@ -65,7 +65,7 @@ TND 只存在于 NPU 融合内核的局部计算中，不会成为模型公共�
 
 压缩器没有自己的 metadata 字段：输入为 `[B, L, D]`，每行 token 数必须是 `ratio` 的整数倍。公共入口把整批展平成一条 `[1, B * L, D]` 打包流，完成压缩和 RoPE 后还原为 `[B, L // ratio, D]`。每行 positions 从 0 开始，`create_varlen_metadata_for_document` 据此把行首加入整批 `cu_seq_q`，使 ratio-4 的重叠不会跨行借 token。
 
-CP 的重叠 carry 在 `models/common/carry_exchange.CarryExchange` 里，调用点用它拿到增强流（`CarryStream`：`x` / `positions` / `cu_seqlens` / `trim`），把增强流以 keyword 参数 `cu_seqlens` 传给同一个压缩器实例（`compressor(x, positions, *, cu_seqlens=None)`），最后按 `trim` 裁掉 carry 输出块；融合实现的 `_state_inputs` 在内部按流的形状符号构造 kernel 的零 tiling 表。`varlen` / `plan` / `CompressedBlockLayout` / `CompressorFrames` / `window` 字段都已删除。
+V4 的 CP 当前尚未支持（见「当前边界」）。原 ratio-4 重叠 carry 的脚手架——`models/common/carry_exchange.py` 的 `CarryExchange` / `CarryStream`，以及本地 `Compressor` 内部的 restore + carry——已随 0.4.0 清理删除，CP 重做后按新契约补充。
 
 一个 batch 里可以打包多条序列，所以 `B` 与序列条数无关。例如：
 
