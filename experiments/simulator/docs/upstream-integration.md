@@ -62,6 +62,7 @@ workload = main([
 | `memory_parameter_storage_dtype` | `--simulation.memory-parameter-storage-dtype` | 仅投影常驻本地参数 shard 字节 |
 | `memory_offload_ac_saved_tensors` | `--simulation.memory-offload-ac-saved-tensors` | 激活卸载执行图及静态预算 |
 | `memory_offload_optimizer_states` | `--simulation.memory-offload-optimizer-states` | AdamW／DSV4 Muon 独立状态卸载；整段并行近似及工作缓冲口径见[优化器卸载](optimizer-offload.md) |
+| `enable_sla2_fusion` | `--simulation.enable-sla2-fusion` | multi_head_moe 的 SLA2 虚拟融合开关，默认关（模型跑参考实现的 eager 算子）；仅影响 multi_head_moe 捕获 |
 | `output_dir`／`output_formats` | `--simulation.output-dir`／`--simulation.output-formats mem` | 可选显存导出位置／格式 |
 | `model_overrides` | `--model-overrides.*` | 类型化 DSV4 几何覆盖，重建完整配置树 |
 | `override_imports` | 无对应通用 CLI | Python 显式替换默认 override 列表；并非追加，慎用空列表 |
