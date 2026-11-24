@@ -14,7 +14,7 @@ class GeometryAttentionMetadataMixin:
 
     def _get_attention_metadata(self, positions, *, padding_mask=None, max_num_documents=None, max_context_length=None):
         metadata = {}
-        for layer in (*self.config.layers, *getattr(self.config, "mtp_layers", ())):
+        for layer in (*self.config.layers, *(getattr(self.config, "mtp_layers", None) or ())):
             config = layer.attention.inner_attention
             key = getattr(config, "attention_metadata_key", config._owner)
             if key not in metadata:

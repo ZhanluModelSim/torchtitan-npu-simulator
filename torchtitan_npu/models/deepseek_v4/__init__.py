@@ -7,8 +7,6 @@ from .flavors import (
     MODEL_FLAVORS,
     Attention,
     DeepSeekV4Model,
-    DeepSeekV4MTPDecoder,
-    DeepSeekV4MTPTransformerBlock,
     DeepSeekV4TransformerBlock,
     HcPost,
     HcPre,
@@ -22,8 +20,6 @@ DeepSeekV4Model.state_dict_adapter_cls = DeepSeekV4StateDictAdapter
 __all__ = [
     "MODEL_FLAVORS",
     "Attention",
-    "DeepSeekV4MTPDecoder",
-    "DeepSeekV4MTPTransformerBlock",
     "DeepSeekV4Model",
     "DeepSeekV4TransformerBlock",
     "HcPost",

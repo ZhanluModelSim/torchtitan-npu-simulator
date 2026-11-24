@@ -46,7 +46,6 @@ collect_ignore = [
     # Pre-0.4 CLI tests; the Python-recipe loader is covered by test_config_loader.py.
     "config/test_configs.py",
     "models/common/test_deepseek_cp_config.py",
-    "models/test_mtp_cp_chunk_loss.py",
     # CP metadata rebuild tests wait for the v0.4 context-parallel transform.
     "override/deepseek_v4_1/test_asc_metadata_reuse.py",
     # The stage-denominator AuxLoss patch was replaced by v0.4.0's inject(denominator=...).

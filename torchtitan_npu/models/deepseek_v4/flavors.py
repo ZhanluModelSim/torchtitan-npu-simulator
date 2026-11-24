@@ -7,8 +7,6 @@
 __all__ = [
     "MODEL_FLAVORS",
     "Attention",
-    "DeepSeekV4MTPDecoder",
-    "DeepSeekV4MTPTransformerBlock",
     "DeepSeekV4Model",
     "DeepSeekV4TransformerBlock",
     "HcPost",
@@ -50,8 +48,6 @@ from .model import (
     DeepSeekV4TransformerBlock,
 )
 from .mtp import (
-    DeepSeekV4MTPDecoder,
-    DeepSeekV4MTPTransformerBlock,
     MTPLoss,
 )
 
@@ -147,9 +143,7 @@ def _build_mtp_layers(
         norm_eps=norm_eps,
         hc_eps=hc_eps,
     )
-    from torchtitan.config import derive
-
-    return [derive(layer, DeepSeekV4MTPTransformerBlock.Config) for layer in layers]
+    return layers
 
 
 def _make_dsv4_config(

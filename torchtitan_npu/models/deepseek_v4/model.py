@@ -3,16 +3,25 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
+import spmd_types as spmd
 import torch
 from torch import nn
+from torchtitan.config import derive
 from torchtitan.models.base.module import Module
 from torchtitan.models.common.flops import get_nparams_and_active_nparams
+from torchtitan.models.common.linear import Linear
+from torchtitan.models.deepseek_v3.mtp import MTPDecoder
+from torchtitan.models.deepseek_v4.model import DeepSeekV4Model as TorchTitanV4Model
 from torchtitan.models.deepseek_v4.model import DeepSeekV4TransformerBlock as DeepSeekV4TransformerBlock
 
-from .mtp import DeepSeekV4MTPDecoder
+from torchtitan_npu.models.common.attention_metadata import AttentionMetadataMap, GeometryAttentionMetadataMixin
+from torchtitan_npu.models.common.linear import SharedLinear
+
+from .mtp import _mtp_head_context
 
 if TYPE_CHECKING:
     from torchtitan.config import TrainingConfig
@@ -20,13 +29,17 @@ if TYPE_CHECKING:
     from torchtitan.distributed.parallelism_context import ParallelismContext
 
     from .compressor import Indexer
-    from .mtp import DeepSeekV4MTPTransformerBlock
 
 
-# Decoder block arithmetic is owned by upstream TorchTitan.
+def _require_attention_metadata(metadata: AttentionMetadataMap, layer: Any) -> Any:
+    key = getattr(layer.attention, "attention_metadata_key", type(layer.attention.inner_attention))
+    entry = metadata.get(key)
+    if entry is None:
+        raise ValueError(f"no attention metadata was built for {key!r}")
+    return entry
 
 
-class DeepSeekV4Model(DeepSeekV4MTPDecoder):
+class DeepSeekV4Model(GeometryAttentionMetadataMixin, TorchTitanV4Model):
     supports_pipeline_parallel = False
 
     def parallelize(self, **kwargs):
@@ -77,7 +90,8 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
         )
 
     @dataclass(kw_only=True, slots=True)
-    class Config(DeepSeekV4MTPDecoder.Config):
+    class Config(TorchTitanV4Model.Config):
+        mtp_isolate_gradients: bool = False
         vocab_size: int
         compress_ratios: tuple[int, ...]
         n_layers: int
@@ -112,17 +126,21 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
                 num_flops_per_token += (
                     6
                     * (self.hc_mult - 1)
-                    * sum(
-                        param.numel()
-                        for mtp_layer in model_mtp_layers
-                        for param in cast("DeepSeekV4MTPTransformerBlock", mtp_layer).h_proj.parameters()
-                    )
+                    * sum(param.numel() for mtp_layer in model_mtp_layers for param in mtp_layer.h_proj.parameters())
                 )
 
             return nparams, num_flops_per_token
 
     def __init__(self, config: Config):
+        if config.mtp_isolate_gradients:
+            if not config.mtp_layers or type(config.lm_head) is not Linear.Config:
+                raise ValueError("MTP gradient isolation requires MTP layers and an unmodified Linear LM head.")
+            config = derive(config, type(config), lm_head=derive(config.lm_head, SharedLinear.Config))
         super().__init__(config)
+        self.mtp_isolate_gradients = config.mtp_isolate_gradients
+        if not config.mtp_layers:
+            self.mtp_layers = None  # pyrefly: ignore [bad-assignment]
+
         mtp_layers = cast("nn.ModuleList | None", self.mtp_layers)
         for layer in (*self.layers.values(), *(mtp_layers if mtp_layers is not None else ())):
             # The training router policy also covers adapter/quantization children.
@@ -137,6 +155,110 @@ class DeepSeekV4Model(DeepSeekV4MTPDecoder):
                 setattr(attention, "_preserve_dtype_params", ("attn_sink",))  # noqa: B010
             else:
                 setattr(sink, "_preserve_dtype_params", ("weight",))  # noqa: B010
+
+    # Prepare aligned tokens, labels and validity masks with the upstream producer.
+    preprocess_inputs = MTPDecoder.preprocess_inputs
+
+    def forward(  # pyrefly: ignore [bad-override]
+        self,
+        tokens: torch.Tensor | tuple[torch.Tensor, ...],
+        positions: torch.Tensor | None = None,
+        *,
+        attention_metadata: AttentionMetadataMap,
+        mtp_input_valid_masks: tuple[torch.Tensor, ...] | None = None,
+        padding_mask: torch.Tensor | None = None,
+        aux_loss_denominators: torch.Tensor | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
+        if self.mtp_layers is not None:
+            if not isinstance(tokens, tuple) or len(tokens) != len(self.mtp_layers) + 1:
+                raise ValueError("MTP requires one token tensor per objective.")
+            if mtp_input_valid_masks is None or len(mtp_input_valid_masks) != len(self.mtp_layers):
+                raise ValueError("MTP requires one validity mask per depth.")
+            main_tokens = tokens[0]
+        else:
+            if not isinstance(tokens, torch.Tensor):
+                raise ValueError("Decoder without MTP requires one token tensor.")
+            main_tokens = tokens
+        if aux_loss_denominators is not None and aux_loss_denominators.numel() != (
+            1 + (0 if self.mtp_layers is None else len(self.mtp_layers))
+        ):
+            raise ValueError("Expected one routing denominator per objective.")
+
+        input_ids = main_tokens.detach().long()
+        hidden = self.tok_embeddings(main_tokens) if self.tok_embeddings is not None else main_tokens
+        hidden = hidden.unsqueeze(1).repeat(1, self.hc_mult, 1)
+        with spmd.no_typecheck():
+            main_aux_loss_denominator = None if aux_loss_denominators is None else aux_loss_denominators[0]
+        for layer in self.layers.values():
+            hidden = layer(
+                hidden,
+                input_ids,
+                _require_attention_metadata(attention_metadata, layer),
+                positions,
+                padding_mask=padding_mask,
+                aux_loss_denominator=main_aux_loss_denominator,
+            )
+        main_hidden = self.hc_head(hidden)
+        main_hidden = self.norm(main_hidden) if self.norm is not None else main_hidden
+
+        if self.mtp_layers is None:
+            if self._skip_lm_head or self.lm_head is None:
+                return main_hidden
+            return self.lm_head(main_hidden)
+        if self.tok_embeddings is None:
+            raise ValueError("DeepSeek-V4 MTP forward requires token embeddings.")
+
+        outputs = [
+            main_hidden,
+            *self._forward_mtp_layers(
+                hidden,
+                cast("tuple[torch.Tensor, ...]", tokens),
+                cast("tuple[torch.Tensor, ...]", mtp_input_valid_masks),
+                attention_metadata=attention_metadata,
+                positions=positions,
+                padding_mask=padding_mask,
+                aux_loss_denominators=aux_loss_denominators,
+            ),
+        ]
+        if not self._skip_lm_head and self.lm_head is not None:
+            outputs[0] = self.lm_head(outputs[0])
+            with _mtp_head_context(self.lm_head, isolate_gradients=self.mtp_isolate_gradients):
+                outputs[1:] = [self.lm_head(item) for item in outputs[1:]]
+        return tuple(outputs)
+
+    def _forward_mtp_layers(
+        self,
+        prev_hc_hidden: torch.Tensor,
+        tokens: tuple[torch.Tensor, ...],
+        mtp_input_valid_masks: tuple[torch.Tensor, ...],
+        *,
+        attention_metadata: AttentionMetadataMap,
+        positions: torch.Tensor | None = None,
+        padding_mask: torch.Tensor | None = None,
+        aux_loss_denominators: torch.Tensor | None = None,
+    ) -> list[torch.Tensor]:
+        mtp_outputs = []
+        prev_hc_hidden = prev_hc_hidden.detach() if self.mtp_isolate_gradients else prev_hc_hidden
+        for depth, layer in enumerate(self.mtp_layers, 1):
+            mtp_tokens = tokens[depth]
+            with torch.no_grad() if self.mtp_isolate_gradients else nullcontext():
+                mtp_embed = self.tok_embeddings(mtp_tokens)
+            # The upstream block runs the configured NPU components. Select its
+            # geometry metadata here before passing the native block arguments.
+            with spmd.no_typecheck():
+                aux_loss_denominator = None if aux_loss_denominators is None else aux_loss_denominators[depth]
+            prev_hc_hidden, prediction_hidden = layer(
+                mtp_embed,
+                prev_hc_hidden,
+                mtp_tokens.detach().long(),
+                mtp_input_valid_masks[depth - 1],
+                _require_attention_metadata(attention_metadata, layer),
+                positions,
+                padding_mask=padding_mask,
+                aux_loss_denominator=aux_loss_denominator,
+            )
+            mtp_outputs.append(prediction_hidden)
+        return mtp_outputs
 
 
 class GraphTrainerDeepSeekV4Model(DeepSeekV4Model):

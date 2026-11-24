@@ -97,7 +97,7 @@ def preprocess_v04(model, tokens, labels, positions):
         parallelism_context=SimpleNamespace(cp_enabled=False, spmd_dense_mesh=lambda: mesh),
         parallelism=SimpleNamespace(),
         global_routing_token_counts=torch.tensor(
-            [sum(max(length - depth, 0) for length in lengths) for depth in range(len(model.mtp_layers) + 1)]
+            [sum(max(length - depth, 0) for length in lengths) for depth in range(len(model.mtp_layers or ()) + 1)]
         ),
     )
     assert not loss_kwargs

@@ -322,12 +322,6 @@ def _set_deepseek_v4_mtp_sharding(
         )
 
         block_sharding = mtp_layer_cfg.sharding_config or ShardingConfig()
-        # v0.4.0's MTP block forward takes the ids as ``mtp_input_ids``; upstream's
-        # sharding table still spells the pinned ``_T`` name.
-        for field in ("in_src_shardings", "in_dst_shardings"):
-            mapping = getattr(block_sharding, field)
-            if mapping and "mtp_input_ids_T" in mapping:
-                mapping["mtp_input_ids"] = mapping.pop("mtp_input_ids_T")
         if enable_sp:
             if block_sharding.in_src_shardings is None:
                 block_sharding.in_src_shardings = {}

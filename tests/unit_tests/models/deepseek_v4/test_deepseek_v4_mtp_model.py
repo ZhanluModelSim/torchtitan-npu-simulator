@@ -6,7 +6,9 @@
 
 import pytest
 import torch
-from torchtitan.components.loss import ChunkedLossWrapper, CrossEntropyLoss
+from torchtitan.components.loss import CrossEntropyLoss
+from torchtitan.models.deepseek_v3.mtp import MTPDecoder
+from torchtitan.models.deepseek_v4.mtp import MTPBlock
 
 from tests.unit_tests.models.mtp_test_utils import (
     PACKED_POSITIONS,
@@ -22,7 +24,6 @@ from torchtitan_npu.models.deepseek_v4.mtp import MTPChunkedLossWrapper
 from torchtitan_npu.models.deepseek_v4.state_dict_adapter import (
     DeepSeekV4StateDictAdapter,
 )
-from torchtitan_npu_recipes.tests.models.deepseek_v4 import deepseek_v4_debugmodel
 
 
 def _build_model_config(
@@ -105,20 +106,35 @@ def test_deepseek_v4_mtp_metadata_includes_uncompressed_plan():
     assert {ratio_by_backend[key] for key in entries} == {1, 4, 128}
     output = model(inputs, **extra_kwargs)
     assert isinstance(output, tuple) and len(output) == 2
+    assert type(model.mtp_layers[0]) is MTPBlock
+    assert type(model).preprocess_inputs is MTPDecoder.preprocess_inputs
 
 
-def test_deepseek_v4_mtp_model_supports_chunked_loss():
-    model = build_cpu_model(_build_model_config())
+@pytest.mark.parametrize("num_mtp_layers", [1, 2], ids=["one-depth", "two-depths"])
+def test_deepseek_v4_mtp_model_supports_chunked_loss(num_mtp_layers):
+    model = build_cpu_model(_build_model_config(num_mtp_layers=num_mtp_layers))
     tokens = torch.arange(SEQ_LEN) % VOCAB_SIZE
     positions = PACKED_POSITIONS.clone()
     labels = (tokens + 1) % VOCAB_SIZE
     tokens, labels, extra_kwargs = preprocess_v04(model, tokens, labels, positions)
     assert "mtp_batch" not in extra_kwargs
     object.__setattr__(model, "_skip_lm_head", True)
-    output = model(tokens, **extra_kwargs)
+    hc_transitions = []
 
-    assert isinstance(output, tuple) and len(output) == 2
-    assert output[0].shape[0] == SEQ_LEN
+    def record_hc_transition(module, args, result):
+        hc_transitions.append((args[1], result[0]))
+
+    handles = [layer.register_forward_hook(record_hc_transition) for layer in model.mtp_layers]
+    try:
+        output = model(tokens, **extra_kwargs)
+    finally:
+        for handle in handles:
+            handle.remove()
+    for depth in range(1, num_mtp_layers):
+        assert hc_transitions[depth][0] is hc_transitions[depth - 1][1]
+
+    assert isinstance(output, tuple) and len(output) == num_mtp_layers + 1
+    assert all(item.shape[0] == SEQ_LEN for item in output)
 
     loss_fn = MTPChunkedLossWrapper(
         MTPChunkedLossWrapper.Config(
@@ -127,20 +143,20 @@ def test_deepseek_v4_mtp_model_supports_chunked_loss():
         )
     )
     loss_fn.set_lm_head(model.lm_head)
-    expected_loss = torch.nn.functional.cross_entropy(
-        model.lm_head(output[0]).float(), labels[0], reduction="sum"
-    ) / SEQ_LEN + 0.3 * torch.nn.functional.cross_entropy(
-        model.lm_head(output[1]).float(), labels[1], reduction="sum"
-    ) / (SEQ_LEN - 2)
-    loss, _ = loss_fn(
-        output,
-        labels,
-        torch.tensor([SEQ_LEN, SEQ_LEN - 2]),
+    counts = torch.tensor([SEQ_LEN - 2 * depth for depth in range(num_mtp_layers + 1)])
+    expected_loss = sum(
+        (1.0 if depth == 0 else 0.3 / num_mtp_layers)
+        * torch.nn.functional.cross_entropy(model.lm_head(hidden).float(), target, reduction="sum")
+        / count
+        for depth, (hidden, target, count) in enumerate(zip(output, labels, counts, strict=True))
     )
+    loss, _ = loss_fn(output, labels, counts)
     torch.testing.assert_close(loss, expected_loss)
 
     loss.backward()
-    assert any(parameter.grad is not None for parameter in model.mtp_layers.parameters())
+    for layer in model.mtp_layers:
+        assert layer.e_proj.weight.grad is not None
+        assert layer.e_proj.weight.grad.count_nonzero()
 
 
 def test_deepseek_v4_mtp_gradient_isolation_detaches_shared_parameters():
@@ -160,17 +176,6 @@ def test_deepseek_v4_mtp_gradient_isolation_detaches_shared_parameters():
         if not name.startswith("mtp_layers."):
             assert parameter.grad is None or not parameter.grad.count_nonzero(), name
     assert model.mtp_layers[0].e_proj.weight.grad is not None
-
-
-@pytest.fixture
-def single_threaded_cpu():
-    # Keep scatter/reduction scheduling fixed for bitwise gradient comparison.
-    previous = torch.get_num_threads()
-    torch.set_num_threads(1)
-    try:
-        yield
-    finally:
-        torch.set_num_threads(previous)
 
 
 def test_deepseek_v4_mtp_state_dict_round_trip():
@@ -233,111 +238,57 @@ def test_deepseek_v4_mtp_state_dict_rejects_invalid_depth(method_name, key):
         getattr(adapter, method_name)({key: torch.ones(1)})
 
 
-@pytest.mark.skip(reason="v0.4 moved the MTP preprocess seam out of model.py; migrate with the CP test")
-def test_preprocess_inputs_builds_the_mtp_batch_on_the_global_row(monkeypatch):
-    """The MTP depths' rolled tokens are built before the CP shard, then cut with it.
-
-    A shift across a shard boundary is not a shift, so the batch must be built
-    from the whole row and the same ``cp_shard`` cut applied afterwards.  The
-    shard here really slices rank 1's half of a two-rank run, so the test pins
-    the alignment, not only the call order.
-    """
-    from types import SimpleNamespace
-
-    from torchtitan_npu.models.deepseek_v4 import model as model_mod
-
-    model = build_cpu_model(_build_model_config())
+def test_deepseek_v4_without_mtp_returns_main_logits():
+    config = _build_model_config(num_mtp_layers=0)
+    config.mtp_layers = None
+    model = build_cpu_model(config)
     tokens = torch.arange(SEQ_LEN) % VOCAB_SIZE
-    labels = (tokens + 1) % VOCAB_SIZE
-    positions = PACKED_POSITIONS.clone()
+    inputs, labels, kwargs = preprocess_v04(model, tokens, (tokens + 1) % VOCAB_SIZE, PACKED_POSITIONS.clone())
+    output = model(inputs, **kwargs)
+    assert model.mtp_layers is None
+    assert isinstance(output, torch.Tensor)
+    assert output.shape == (SEQ_LEN, VOCAB_SIZE)
+    torch.nn.functional.cross_entropy(output.float(), labels).backward()
+    assert model.lm_head.weight.grad is not None
 
-    real_prepare = model_mod.prepare_mtp_batch
-    built = []
 
-    def record_prepare(inputs, prepared_labels, prepared_positions, num_layers):
-        batch = real_prepare(inputs, prepared_labels, prepared_positions, num_layers)
-        built.append((inputs, prepared_labels, prepared_positions, batch))
-        return batch
-
-    shard_calls = []
-    rank, cp_size = 1, 2
-    shard_len = SEQ_LEN // cp_size
-
-    def fake_cp_shard(mesh, tensors, masks=None, load_balancer_type=None, input_seq_dim=1, *, positions=None):
-        shard_calls.append((tuple(tensors), positions, load_balancer_type))
-        cut = tuple(tensor.narrow(input_seq_dim, rank * shard_len, shard_len) for tensor in tensors)
-        return cut, masks
-
-    monkeypatch.setattr(model_mod, "prepare_mtp_batch", record_prepare)
-    monkeypatch.setattr(model_mod, "cp_shard", fake_cp_shard)
-
-    # The base seam is exercised in its own tests; here the model's own
-    # responsibility is the MTP batch: built on the global row, then cut by the
-    # same shard, handed the same row so the balancer derives the same layout.
-    from torchtitan.models.common.decoder import Decoder
-
-    from torchtitan_npu.models.deepseek_v4.metadata import build_v4_metadata, doc_chunk_entry
-
-    base_calls = []
-    row_entry = build_v4_metadata(positions, 1)
-    local_entry = doc_chunk_entry(row_entry, cp_size=cp_size, cp_rank=rank, slab_len=shard_len)
-
-    def fake_base(self, input_dict, *, parallel_dims, parallelism, **kwargs):
-        del parallel_dims, parallelism, kwargs
-        base_calls.append((input_dict["input"].shape, input_dict["labels"].shape))
-        cut, _ = model_mod.cp_shard(
-            mesh,
-            (input_dict["input"], input_dict["labels"], input_dict["positions"]),
-            None,
-            None,
-            0,
-            positions=input_dict["positions"],
+def test_deepseek_v4_isolated_chunked_loss_preserves_main_gradients():
+    config = _build_model_config(num_mtp_layers=2)
+    config.mtp_isolate_gradients = True
+    model = build_cpu_model(config)
+    model._skip_lm_head = True
+    tokens = torch.arange(SEQ_LEN) % VOCAB_SIZE
+    inputs, labels, kwargs = preprocess_v04(model, tokens, (tokens + 1) % VOCAB_SIZE, PACKED_POSITIONS.clone())
+    output = model(inputs, **kwargs)
+    counts = torch.tensor([SEQ_LEN, SEQ_LEN - 2, SEQ_LEN - 4])
+    # Save the main-only gradients, then compare after all objectives backpropagate.
+    main_loss = (
+        torch.nn.functional.cross_entropy(model.lm_head(output[0]).float(), labels[0], reduction="sum") / counts[0]
+    )
+    main_loss.backward(retain_graph=True)
+    expected_grads = {
+        name: param.grad.clone()
+        for name, param in model.named_parameters()
+        if not name.startswith("mtp_layers.") and param.grad is not None
+    }
+    model.zero_grad(set_to_none=True)
+    loss_fn = MTPChunkedLossWrapper(
+        MTPChunkedLossWrapper.Config(
+            num_chunks=2,
+            mtp_isolate_gradients=True,
+            loss_fn=CrossEntropyLoss.Config(global_vocab_size=VOCAB_SIZE),
         )
-        return cut[0], cut[1], {"positions": cut[2], "attention_metadata": {("debug", 1): local_entry}}
-
-    monkeypatch.setattr(Decoder, "preprocess_inputs", fake_base)
-    mesh = SimpleNamespace(size=lambda *_: cp_size, get_local_rank=lambda: rank, device_type="cpu")
-    parallel_dims = SimpleNamespace(cp_enabled=True, get_mesh=lambda name: mesh)
-    parallelism = SimpleNamespace(
-        spmd_backend="partial_dtensor",
-        context_parallel_load_balancer=None,
-        context_parallel_ptrr_mask_key=None,
     )
-    inputs, out_labels, extra_kwargs = model.preprocess_inputs(
-        {"input": tokens, "labels": labels, "positions": positions},
-        parallel_dims=parallel_dims,
-        parallelism=parallelism,
-    )
-
-    # The batch was built from the global row, once.
-    assert len(built) == 1
-    global_inputs, global_labels, global_positions, batch = built[0]
-    assert global_inputs.shape == tokens.shape
-    assert torch.equal(global_labels, labels)
-    assert torch.equal(global_positions, positions)
-
-    # Two cuts, both fed the full row: the base inputs, then the MTP batch.
-    assert base_calls == [(tokens.shape, labels.shape)]
-    assert len(shard_calls) == 2
-    for got, expected in zip(shard_calls[0][0], (tokens, labels, positions), strict=True):
-        assert torch.equal(got, expected)
-    for got, expected in zip(shard_calls[1][0], batch, strict=True):
-        assert torch.equal(got, expected)
-    # The row reaches both calls, so the layout cannot be derived from anything else.
-    for _, handed_positions, _ in shard_calls:
-        assert torch.equal(handed_positions, positions)
-    # The MTP cut is handed the layout the run resolves to, not the raw (unset) flag: an
-    # unset flag means "this stack's layout", and passing it through would cut the depths
-    # contiguously while the inputs are permuted.
-    assert shard_calls[1][2] == "doc_chunk", shard_calls[1][2]
-
-    # What the forward reads is the shard's answer, not the global row.
-    slab = slice(rank * shard_len, (rank + 1) * shard_len)
-    assert torch.equal(inputs, tokens[slab]) and torch.equal(out_labels, labels[slab])
-    assert torch.equal(extra_kwargs["positions"], positions[slab])
-    # The mask is the global row's own (a shift across a shard boundary is not a shift): the
-    # local copy is exactly its slab, so the row's last token still has no successor.
-    local_batch = extra_kwargs["mtp_batch"]
-    assert torch.equal(local_batch.input_valid_mask, batch.input_valid_mask[slab])
-    assert not bool(local_batch.input_valid_mask[-1].all())
-    assert extra_kwargs["attention_metadata"][("debug", 1)] is local_entry
+    loss_fn.set_lm_head(model.lm_head)
+    loss, _ = loss_fn(output, labels, counts)
+    loss.backward()
+    for name, param in model.named_parameters():
+        if name.startswith("mtp_layers."):
+            continue
+        if name in expected_grads:
+            torch.testing.assert_close(param.grad, expected_grads[name], rtol=1e-5, atol=1e-6)
+        else:
+            assert param.grad is None or not param.grad.count_nonzero(), name
+    for layer in model.mtp_layers:
+        assert layer.e_proj.weight.grad is not None
+        assert layer.e_proj.weight.grad.count_nonzero()

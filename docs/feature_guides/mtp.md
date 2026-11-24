@@ -24,20 +24,20 @@
 - packed sequence 根据 `positions` 屏蔽跨文档边界的位置；
 - 无效位置不参与 MTP loss，也不会把无效的上一深度 hidden state 传入当前深度。
 
-模型返回主预测和各 MTP 深度组成的列表。使用普通 `MTPLoss` 时列表元素是 logits；使用默认的分块损失时列表元素是 LM head 之前的 hidden state：
+模型返回主预测和各 MTP 深度组成的 tuple。使用普通 `MTPLoss` 时元素是 logits；使用默认的分块损失时元素是 LM head 之前的 hidden state：
 
 ```text
 outputs[0]     主 NTP 任务的 logits 或 hidden state
 outputs[k]     第 k 个 MTP 深度的 logits 或 hidden state
 ```
 
-`MTPLoss` 接收该列表以及 `positions`，在 loss 内部按相同规则移动 labels，因而不需要模型额外返回有效位置掩码。设 MTP 深度数为 `K`，总损失为：
+上游 `MTPDecoder.preprocess_inputs` 生成对齐的 token、label tuple 和各深度有效位置掩码；模型与 `MTPLoss` 分别接收这些预处理结果。设 MTP 深度数为 `K`，总损失为：
 
 ```text
 L = L_main + mtp_scale / K * sum(L_mtp,k)
 ```
 
-主损失和各层 MTP 损失均采用 token-sum 交叉熵，最后统一按照全局有效 token 数进行归一化。`mtp_scale` 用于控制辅助预测任务对总梯度的贡献。
+主损失和各层 MTP 损失均采用 token-sum 交叉熵，分别按照各目标的 step-global 有效 label 数进行归一化。`mtp_scale` 用于控制辅助预测任务对总梯度的贡献。
 
 ### 1.2 DeepSeek-V4 MTP
 
@@ -55,17 +55,9 @@ DeepSeek-V4 MTP 保留 mHC 多流状态，但其 attention 使用非压缩形式
 
 ### 1.3 DeepSeek-V4 Context Parallel
 
-MTP 的 future-token shift 不能在 CP rank-local 序列上执行：局部移动会在 rank 边界读到不属于本 rank 的 token。V4 的 CP 布局由切分施加（`--parallelism.context-parallel-load-balancer doc_chunk`，见[Context Parallel](context_parallel.md)），实现因此保持在 `cp_shard` 之前对完整序列统一生成：
+当前 eager 模型仅支持 `TP=CP=PP=1`，`DeepSeekV4Model.parallelize` 会拒绝 CP 配置。
 
-- 每个 MTP 深度的 future token；
-- packed sequence 感知的有效位置 mask；
-- 每个 MTP 深度的监督 label。
-
-这些张量在 `preprocess_inputs` 中先于基座切分、在全局行上构建；随后 `super().preprocess_inputs()` 完成 `inputs`/`labels`/`positions` 的切分，MTP 三个张量再用**同一把连续切片**单独 `cp_shard`（本地切片，无通信），保证 token、label 和 mask 与 `inputs` 在每个 rank 上严格同位。
-
-该流程只接入 DeepSeek-V4：继续复用已有压缩 metadata 和 CP plan 构造；MTP 张量的切分是独立的一次 `cp_shard` 调用，与 `inputs`/`labels`/`positions` 的切分使用同一把连续切片。DeepSeek-V3 保留社区 MTP 的原有限制，`context_parallel_degree > 1` 时在配置更新阶段报错；DeepSeek-V3 已有的非 MTP CP 路径不变。
-
-该处理与 Megatron-LM MTP 在 CP 边界交换 future token/label 的数学目标一致；区别是 TorchTitan 的模型 metadata hook 位于 CP 切分之前，因此可直接在全局序列上生成，再按和输入相同的连续切法单独切分，无需额外点对点通信。
+MTP 的 future-token shift 需在全局序列上执行，以避免把 rank 边界误当成文档边界。复用的上游 `MTPDecoder.preprocess_inputs` 先生成各深度 token、label 和有效位置掩码，再统一调用基座的 `_cp_shard` 和 SPMD 标注；本地不再单独构造或切分 MTP batch。这一预处理机制不表示当前 NPU eager 模型已支持 CP。
 
 ### 1.4 Chunked loss
 
@@ -102,20 +94,19 @@ TorchTitan-NPU 只补充社区当前尚未提供的组合能力：
 
 | 对象 | 职责 |
 |---|---|
-| `prepare_mtp_batch` | 为 DeepSeek-V4 在 CP 之前生成各深度 token、mask 和 label |
 | `MTPChunkedLossWrapper` | 为 DeepSeek-V4 将原生 chunked loss 扩展到主预测和各 MTP 预测 |
 
-DeepSeek-V4 复用 `roll_mtp_sequence` 和社区多预测列表接口，只实现 mHC 多流状态、CP 和 chunk loss 所需的专用 decoder 与 block。只有 DeepSeek-V4 的专用 decoder 配置放开 MTP 与 CP 的组合；没有修改社区 `MTPDecoder` 或 `MTPLoss`。
+DeepSeek-V4 复用上游 `torchtitan.models.deepseek_v4.mtp.MTPBlock` 与 `MTPDecoder.preprocess_inputs`，由 `DeepSeekV4Model.forward` 完成 mHC 多流状态处理、per-layer geometry metadata 选择和 chunk loss 接入。
 
 ### 2.2 DeepSeek-V4 目录
 
 | 文件 | MTP 相关职责 |
 |---|---|
-| `deepseek_v4/__init__.py` | 根据模型规格构造非压缩、mHC-aware 的 MTP blocks |
+| `deepseek_v4/flavors.py` | 根据模型规格构造非压缩、mHC-aware 的 MTP blocks |
 | `deepseek_v4/model.py` | 保留主干多流 state，并组织主预测和 MTP 预测 |
-| `deepseek_v4/mtp.py` | 实现 DeepSeek-V4 mHC MTP block、CP batch 和 chunk loss |
+| `deepseek_v4/mtp.py` | 提供 MTP chunk loss 和 LM head 梯度隔离；MTP block 复用上游 `torchtitan.models.deepseek_v4.mtp.MTPBlock` |
 | `torchtitan_npu_recipes/tests/models/deepseek_v4.py` | 按 `num_mtp_layers` 构造 MTP 模型并选择对应 loss |
-| `deepseek_v4/parallelize.py` | 让 MTP blocks 复用现有 DSV4 并行流程 |
+| 上游 `DeepSeekV4Model._apply_fsdp` | 经 `apply_fsdp_to_mtp_decoder` 包装主干和 MTP layers；本地 `parallelize.py` 仅用于 GraphTrainer |
 | `deepseek_v4/sharding.py` | 增加 MTP fusion、mHC head 和有效掩码布局 |
 | `deepseek_v4/state_dict_adapter.py` | 转换本地 `mtp_layers` 与 HF `mtp.<depth>` 参数 |
 
@@ -123,17 +114,17 @@ DeepSeek-V4 复用 `roll_mtp_sequence` 和社区多预测列表接口，只实�
 
 DeepSeek-V4 在 `config.mtp_layers` 为空列表时关闭 MTP，运行时 `model.mtp_layers` 为 `None`。关闭时 forward 返回普通 logits，MTP 并行和 sharding 增量逻辑不会执行。
 
-MTP 开启后，参数归属于独立的 `model.mtp_layers`。社区 DeepSeek-V3 并行入口负责让这些 blocks 沿用主干相同的 TP/SP、EP、activation checkpoint、compile和 FSDP 处理顺序；DeepSeek-V4 的专用 decoder 与 sharding 遵循相同约定。
+MTP 开启后，参数归属于独立的 `model.mtp_layers`。社区 DeepSeek-V3 并行入口负责让这些 blocks 沿用主干相同的 TP/SP、EP、activation checkpoint、compile和 FSDP 处理顺序；DeepSeek-V4 的 sharding 与 MTP 调用处遵循相同约定。
 
-DeepSeek-V4 使用`list[hidden] + MTPChunkedLossWrapper`；wrapper 是标准 `ChunkedLossWrapper` 子类，因此 `Trainer` 原有的 LM head 注入和 `_skip_lm_head` 流程无需修改。
+DeepSeek-V4 使用 `tuple[hidden, ...] + MTPChunkedLossWrapper`；wrapper 是标准 `ChunkedLossWrapper` 子类，因此 `Trainer` 原有的 LM head 注入和 `_skip_lm_head` 流程无需修改。
 
 当前并行限制如下：
 
 - DeepSeek-V3 MTP 暂不支持 Context Parallel（CP）和
 Pipeline Parallel（PP），启用时必须保持 `context_parallel_degree=1` 和 `pipeline_parallel_degree=1`。
-- DeepSeek-V4 MTP 支持 CP，但暂不支持 PP；启用时必须保持 `pipeline_parallel_degree=1`。
+- DeepSeek-V4 eager 模型仅支持 `tensor_parallel_degree=context_parallel_degree=pipeline_parallel_degree=1`，MTP 遵循相同限制。
 
-不支持的并行组合会在模型配置更新阶段直接报错。
+DeepSeek-V4 不支持的并行组合会在 `model.parallelize` 阶段直接报错。
 
 ## 3. 使能方式
 
