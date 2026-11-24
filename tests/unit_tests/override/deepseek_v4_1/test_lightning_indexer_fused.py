@@ -419,24 +419,8 @@ def test_teacher_uses_global_query_count(monkeypatch, num_global_queries):
 
 
 def test_the_teacher_carrier_is_on_the_operands_device(monkeypatch):
-    """The carrier must not land on the default device.
-
-    A Function's edges are its Tensor arguments, and the engine checks each returned
-    gradient's device against its input's.  The teacher is emitted by
-    ``sparse_flash_mla_grad`` wherever its operands live, so a carrier built on the
-    default device fails backward on the NPU with
-
-        Function _SparseMLABackward returned an invalid gradient at index 5 -
-        expected device cpu but got npu:0
-
-    (index 5 = the carrier, once the non-Tensor arguments are dropped from the edge
-    list).  ``meta`` stands in for "not the default device" here, since the CPU harness
-    has no second device to hand.
-    """
-    from torchtitan_npu.override.deepseek_v4_1.lightning_indexer import ascendc as li
-
+    """Meta represents an operand device distinct from the default CPU."""
     device = torch.device("meta")
-    seen = {}
 
     def fake_kernel(q, k, w, topk, **kwargs):
         total = q.shape[0]
@@ -453,19 +437,9 @@ def test_the_teacher_carrier_is_on_the_operands_device(monkeypatch):
     monkeypatch.setattr(torch.ops.cann_ops_transformer, "lightning_indexer_metadata", fake_metadata)
     monkeypatch.setattr(torch.ops.cann_ops_transformer, "sparse_lightning_indexer_kl_loss_grad_metadata", fake_metadata)
 
-    original = li._LightningIndexerTND.forward
-
-    def capture(ctx, *args):
-        out = original(ctx, *args)
-        seen["indices"] = out[0].device
-        seen["carrier"] = out[1].device
-        return out
-
-    monkeypatch.setattr(li._LightningIndexerTND, "forward", staticmethod(capture))
-
     selector = _tiny_model(monkeypatch, fused=True).layers["2"].attention.indexer.inner_indexer
     heads, head_dim = selector.num_index_heads, selector.index_head_dim
-    selector.forward(
+    indices, scores, _ = selector(
         torch.zeros(8, heads, head_dim, dtype=torch.bfloat16, device=device),
         torch.zeros(4, head_dim, dtype=torch.bfloat16, device=device),
         torch.zeros(8, heads, dtype=torch.float32, device=device),
@@ -473,77 +447,8 @@ def test_the_teacher_carrier_is_on_the_operands_device(monkeypatch):
         candidates_BL1C=None,
     )
 
-    assert seen["indices"] == device, seen["indices"]
-    assert seen["carrier"] == device, (
-        f"the carrier must share the selection's device, got {seen['carrier']} against {seen['indices']}"
-    )
-
-
-def test_both_kernels_receive_the_layout_their_contract_requires(monkeypatch):
-    """The two boundaries where layout has to be translated, and the one where it must not.
-
-    ``layout_q="TND"`` means a ``[T, N2, K]`` selection at SMLA, while the model carries it
-    as ``[B, L, 1, K]``.  SLIKG is stricter: its tiling requires ``attn_softmax_l1_norm`` to
-    match ``sparse_indices`` exactly.  Both are silent in the CPU fakes -- they accept any
-    shape -- so this pins them here, since a wrong rank only surfaces on device.
-    """
-    from torchtitan_npu.override.deepseek_v4_1.sparse_attn import ascendc as sa
-
-    seen = {}
-    real_apply = sa._SparseMLA.apply
-
-    def spy_apply(q, swa_k, cmp_k, topk_indices, sinks, masks, scale, ratio, window, tscore, wants):
-        seen["smla_indices"] = tuple(topk_indices.shape)
-        seen["smla_carrier"] = None if tscore is None else tuple(tscore.shape)
-        return real_apply(q, swa_k, cmp_k, topk_indices, sinks, masks, scale, ratio, window, tscore, wants)
-
-    def fake_slig(q, k, w, sparse_indices, attn_softmax_l1_norm, **kw):
-        seen["slig_indices"] = tuple(sparse_indices.shape)
-        seen["slig_teacher"] = tuple(attn_softmax_l1_norm.shape)
-        return (
-            torch.zeros_like(q),
-            torch.zeros_like(k),
-            torch.zeros_like(w).float(),
-            torch.zeros_like(attn_softmax_l1_norm),
-        )
-
-    monkeypatch.setattr(sa._SparseMLA, "apply", staticmethod(spy_apply))
-    monkeypatch.setattr(torch.ops.cann_ops_transformer, "sparse_lightning_indexer_kl_loss_grad", fake_slig)
-    monkeypatch.setattr(torch.ops.cann_ops_transformer, "sparse_flash_mla_metadata", _fake_li_metadata)
-    monkeypatch.setattr(torch.ops.cann_ops_transformer, "sparse_flash_mla_grad_metadata", _fake_slig_metadata)
-    monkeypatch.setattr(
-        torch.ops.cann_ops_transformer,
-        "sparse_flash_mla",
-        lambda q, **kw: (q.clone(), q.new_zeros(1, q.shape[0], q.shape[1])),
-    )
-
-    def fake_smlag(q, grad, *args, **kw):
-        indices = kw["cmp_sparse_indices"]
-        teacher = (indices >= 0).float() * 0.01 if indices is not None else None
-        shared = kw["cmp_kv"]
-        return (
-            grad,
-            torch.zeros_like(kw["ori_kv"]),
-            torch.zeros_like(shared) if shared is not None else None,
-            torch.zeros_like(kw["sinks"]),
-            None,
-            teacher,
-        )
-
-    monkeypatch.setattr(torch.ops.cann_ops_transformer, "sparse_flash_mla_grad", fake_smlag)
-    model = _tiny_model(monkeypatch, fused=True)
-    for parameter in model.parameters():
-        parameter.data = parameter.data.to(torch.bfloat16)
-    with torch.autocast("cpu", dtype=torch.bfloat16):
-        _run_forward_backward(model)
-
-    seq_len = _TOKENS.numel()
-    topk = model.layers["2"].attention.indexer.index_topk
-    # Model-facing ``[B, L, 1, K]`` becomes the kernel's ``[T, N2, K]`` at both SMLA inputs.
-    assert seen["smla_indices"] == seen["smla_carrier"] == (seq_len, 1, topk)
-    # And SLIKG gets the teacher in exactly the selection's shape -- that equality is what
-    # its tiling checks.
-    assert seen["slig_indices"] == seen["slig_teacher"] == (seq_len, 1, topk)
+    assert indices.device == device
+    assert scores.device == device
 
 
 def test_canonical_order_keeps_scores_paired_with_their_indices(monkeypatch):

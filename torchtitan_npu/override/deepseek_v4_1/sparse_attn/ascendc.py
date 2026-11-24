@@ -24,6 +24,7 @@ from torchtitan_npu.models.deepseek_v4_1.attention import CompressedSparseInnerA
 from torchtitan_npu.models.deepseek_v4_1.model import DeepSeekV41Metadata
 from torchtitan_npu.override import _IS_A5
 from torchtitan_npu.override.a3_workaround import A3KeyWorkaround
+from torchtitan_npu.override.deepseek_v4.sparse_attn.ascendc import AscSparseMLAMixin
 from torchtitan_npu.override.deepseek_v4_1.lightning_indexer.ascendc import (
     build_indexer_metadata,
 )
@@ -376,127 +377,7 @@ def entry_options(metadata: AscV41Metadata, *, ratio: int, window_size: int) -> 
     )
 
 
-class _SparseMLA(torch.autograd.Function):
-    """SMLAG with its teacher by-product, in the TND layout of one packed row.
-
-    The row is the batch, so every tensor arrives with a leading 1 that the kernels do not
-    take: ``squeeze(0)`` on the way in and ``reshape_as(q)`` on the way out is the whole
-    translation.  A ratio-1 ``cmp_k`` is the full-resolution second stream; a ratio-2 one
-    is the pooled container, wider than ``swa_k`` and addressed by ``topk_indices``.
-
-    ``topk_scores`` is carried as an input only so the incoming gradient on it is the
-    teacher edge; it is never read.
-    """
-
-    @staticmethod
-    def forward(  # pyrefly: ignore [bad-override]
-        ctx,
-        q,
-        swa_k,
-        cmp_k,
-        topk_indices,
-        sinks,
-        attention_metadata,
-        softmax_scale,
-        ratio,
-        window_size,
-        topk_scores,
-        wants_teacher,
-    ):
-        options = entry_options(attention_metadata, ratio=ratio, window_size=window_size)
-        # The precomputed metadata is read instead of re-running the AI_CPU operator per layer.
-        smla_metadata = attention_metadata.aicpu_metadata.sparse_attn.fwd
-        output, lse = torch.ops.cann_ops_transformer.sparse_flash_mla(
-            q,
-            ori_kv=swa_k,
-            cmp_kv=cmp_k,
-            cmp_sparse_indices=topk_indices,
-            ori_block_table=None,
-            cmp_block_table=None,
-            sinks=sinks,
-            metadata=smla_metadata,
-            softmax_scale=softmax_scale,
-            return_softmax_lse=True,
-            **options,
-        )
-        ctx.save_for_backward(
-            q,
-            swa_k,
-            cmp_k,
-            topk_indices,
-            sinks,
-            output,
-            lse,
-        )
-        ctx.softmax_scale, ctx.ratio, ctx.window_size = softmax_scale, ratio, window_size
-        ctx.wants_teacher = wants_teacher
-        # The metadata is a dataclass, so ``save_for_backward`` cannot take it; it is a
-        # context attribute instead.  That is not extra retention: it holds the same
-        # boundary tensors the graph already keeps for the backward, and the node --
-        # and with it this reference -- is released when that backward has run.
-        ctx.attention_metadata = attention_metadata
-        # The teacher consumes the LSE as a detached constant.
-        ctx.mark_non_differentiable(lse)
-        return output, lse
-
-    @staticmethod
-    def backward(ctx, grad_output, grad_lse):  # pyrefly: ignore [bad-override]
-        del grad_lse  # the LSE is a teacher signal, never a loss input
-        # Nothing but the operand tensors is saved.  The options and the geometry are read
-        # back off ``ctx.attention_metadata`` and the saved operands -- the same source the
-        # forward used, which is what keeps the two kernel calls from drifting apart --
-        # and the gradient metadata is built from them here.
-        q, swa_k, cmp_k, topk_indices, sinks, output, lse = ctx.saved_tensors
-        # ``topk_scores`` is absent on purpose: this Function takes it only so that an
-        # incoming gradient on it exists, and the autograd engine routes that gradient here
-        # for being an input.  Nothing is ever read off it -- the teacher comes back from
-        # SMLAG below, in the carrier's own layout.
-        options = entry_options(ctx.attention_metadata, ratio=ctx.ratio, window_size=ctx.window_size)
-        # The gradient metadata rides the forward's schedule, so the backward skips its AI_CPU
-        # call too.
-        smla_grad_metadata = ctx.attention_metadata.aicpu_metadata.sparse_attn.bwd
-        dq, dswa_k, dcmp_k, dsinks, _, cmp_softmax_l1_norm = torch.ops.cann_ops_transformer.sparse_flash_mla_grad(
-            q,
-            grad_output.contiguous(),
-            output,
-            lse,
-            ori_kv=swa_k,
-            cmp_kv=cmp_k,
-            ori_sparse_indices=None,
-            cmp_sparse_indices=topk_indices,
-            sinks=sinks,
-            metadata=smla_grad_metadata,
-            ori_topk_length=None,
-            cmp_topk_length=None,
-            softmax_scale=ctx.softmax_scale,
-            **options,
-        )
-
-        # One gradient per forward input, in order: (q, swa_k, cmp_k, topk_indices,
-        # sinks, attention_metadata, softmax_scale, ratio, window_size, topk_scores,
-        # wants_teacher).  PyTorch silently ignores extra trailing entries, so a count
-        # mismatch here would not raise -- it would quietly starve a later input, which is
-        # why the list is spelled out rather than padded.
-        return (
-            dq,
-            dswa_k,
-            dcmp_k if cmp_k is not None else None,
-            None,
-            dsinks,
-            None,
-            None,
-            None,
-            None,
-            # Plain teacher, no loss scaling: SMLAG emits the raw marginal ``p`` and SLIKG
-            # applies ``dI = Z * Y - p`` itself, so ``p`` is exactly the edge SLIKG must
-            # receive.
-            # Zeroing is an workaround for SMLAG kernel, SLIKG demands invalid positions be zeroed.
-            cmp_softmax_l1_norm.masked_fill(topk_indices < 0, 0.0) if ctx.wants_teacher else None,
-            None,
-        )
-
-
-class AscV41SparseAttention(CompressedSparseInnerAttention2):
+class AscV41SparseAttention(AscSparseMLAMixin, CompressedSparseInnerAttention2):
     """The A5 TND kernel behind the reference forward contract.
 
     It is the port that carries the indexer's teacher: ``topk_scores`` is not a loss
@@ -575,7 +456,7 @@ class AscV41SparseAttention(CompressedSparseInnerAttention2):
             )
             return build_fused_metadata(row, ratio=self.compress_ratio, geometry=self.geometry)
 
-    def forward(
+    def forward(  # pyrefly: ignore [bad-override]
         self,
         q,
         swa_k,
@@ -591,49 +472,17 @@ class AscV41SparseAttention(CompressedSparseInnerAttention2):
     ):
         if (cmp_k is None) != (topk_indices is None):
             raise ValueError("cmp_k and topk_indices must be provided together")
-        # The teacher is a training-only by-product carried out on ``topk_scores``'
-        # gradient into the indexer's SLIKG backward.  In eval there is no indexer
-        # gradient to feed and the extra ``p`` would be dead output.
         wants_teacher = self.training and cmp_k is not None
-        if not _IS_A5:
-            # Both KV streams arrive as the gathered whole row, and this rank may read only its
-            # per-document reach: arch22 is handed that reach as the frame, so each row is compacted
-            # onto it here.  Both gathers are differentiable, so the kernels' gradients scatter back
-            # onto the gathered rows; on the rank whose reach is every document in full they are the
-            # identity and no row is copied.
-            workaround = attention_metadata.a3_workaround
-            assert workaround is not None, "an arch22 entry states the key workaround"
-            if workaround.swa_k_gather is not None:
-                swa_k = swa_k.index_select(0, workaround.swa_k_gather)
-            if cmp_k is not None and workaround.cmp_k_gather is not None:
-                cmp_k = cmp_k.index_select(0, workaround.cmp_k_gather)
-        # Shapes, dtypes and the ratio's KV pairing are the kernels' own contract, checked
-        # at the operator boundary rather than restated here.
-        # The selection arrives document-local from the selector, which chose it with the
-        # same kernel: the two share one coordinate system, and ``-1`` is how both spell an
-        # unused slot.  Order is left exactly as it came -- the selector already put it in
-        # position order, and the teacher's slot positions follow that order, so permuting
-        # it here would move each slot's mass onto a different key.
-        #
-        # Layout, on the other hand, has to be translated: the model carries the selection
-        # as ``[B, L, 1, K]`` while a TND kernel wants ``[T, N2, K]``.  The carrier
-        # (``topk_scores``) needs no such translation -- it is already ``[T, 1, K]``, which
-        # is both what SLIKG requires next to ``sparse_indices`` and what SMLA's teacher
-        # gradient arrives on.
-        output, _lse = _SparseMLA.apply(
+        output, _lse = super().forward(
             q,
-            swa_k.unsqueeze(1),
-            None if cmp_k is None else cmp_k.unsqueeze(1),
-            None if topk_indices is None else topk_indices.reshape(-1, 1, topk_indices.shape[-1]),
-            attn_sink.float(),
-            attention_metadata,
-            self.softmax_scale,
-            self.compress_ratio,
-            self.window_size,
-            # The carrier is translated exactly like the selection above: SLIKG needs it
-            # as ``[T, 1, K]``, matching the ``sparse_indices`` it is paired with there.
-            (None if (topk_scores is None or not wants_teacher) else topk_scores.reshape(-1, 1, topk_scores.shape[-1])),
-            wants_teacher,
+            swa_k,
+            attn_sink,
+            cmp_k=cmp_k,
+            topk_indices=topk_indices,
+            topk_scores=topk_scores if wants_teacher else None,
+            attention_metadata=attention_metadata,
+            options=entry_options(attention_metadata, ratio=self.compress_ratio, window_size=self.window_size),
+            compact_keys=not _IS_A5,
         )
         return output.reshape_as(q)
 

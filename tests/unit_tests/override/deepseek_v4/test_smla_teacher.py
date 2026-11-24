@@ -7,7 +7,7 @@
 
 The sparse core no longer trains the indexer itself.  SMLAG's by-product -- the marginal
 mass ``p`` over the selected slots -- is written on ``topk_scores``' gradient, with every
-``-1`` slot zeroed and ``softmax_scale`` applied exactly once.  These cases pin that edge,
+``-1`` slot zeroed. These cases pin that edge,
 including the layers that must not emit one.
 """
 
@@ -98,8 +98,7 @@ def test_the_teacher_reaches_the_carrier_with_padding_zeroed(monkeypatch):
     expected[0] = torch.tensor([0.1, 0.3, 0.0])
     expected[1] = torch.tensor([0.1, 0.0, 0.0])
     expected[3] = torch.tensor([0.1, 0.3, 0.4])
-    # ``softmax_scale`` is the emitter's one scaling.
-    torch.testing.assert_close(scores.grad, expected * 0.5, rtol=0, atol=0)
+    torch.testing.assert_close(scores.grad, expected, rtol=0, atol=0)
     assert (scores.grad[indices < 0] == 0).all()
 
 

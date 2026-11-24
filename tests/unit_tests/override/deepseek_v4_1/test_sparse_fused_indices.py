@@ -49,11 +49,11 @@ def test_kernel_receives_document_local_indices(monkeypatch, v41_metadata, ratio
 
     calls = []
 
-    def kernel(q, original, shared, selection, *args):
-        calls.append(selection)
+    def kernel(q, *, cmp_sparse_indices, **kwargs):
+        calls.append(cmp_sparse_indices)
         return torch.zeros_like(q), torch.zeros((1, q.shape[0], q.shape[1]))
 
-    monkeypatch.setattr(ascendc._SparseMLA, "apply", kernel)
+    monkeypatch.setattr(torch.ops.cann_ops_transformer, "sparse_flash_mla", kernel)
     attention = ascendc.AscV41SparseAttention.Config(
         window_size=2,
         softmax_scale=0.5,
@@ -90,88 +90,3 @@ def test_kernel_receives_document_local_indices(monkeypatch, v41_metadata, ratio
     torch.testing.assert_close(calls[0], indices.reshape(-1, 1, indices.shape[-1]), rtol=0, atol=0)
     # ... and never rewrites the caller's tensor in place.
     torch.testing.assert_close(indices, topk_before, rtol=0, atol=0)
-
-
-@pytest.mark.parametrize("with_shared", [False, True], ids=["window", "shared-kv"])
-def test_backward_routes_kernel_gradients_and_ignores_the_lse_gradient(monkeypatch, v41_metadata, with_shared):
-    q = torch.ones(4, 2, 4, requires_grad=True)
-    original = torch.ones(4, 1, 4, requires_grad=True)
-    shared = torch.ones(2, 1, 4, requires_grad=True) if with_shared else None
-    sink = torch.ones(2, requires_grad=True)
-    indices = torch.zeros(4, 1, 2, dtype=torch.int32) if with_shared else None
-    cu = torch.tensor([0, 4], dtype=torch.int32)
-    cmp_cu = torch.tensor([0, 2], dtype=torch.int32) if with_shared else None
-    remainder = torch.zeros(1, dtype=torch.int32) if with_shared else None
-    meta, lse = torch.tensor([7]), torch.zeros(4, 2)
-    forward_args = {}
-    monkeypatch.setattr(torch.ops.cann_ops_transformer, "sparse_flash_mla_metadata", lambda *a, **kw: meta)
-    monkeypatch.setattr(torch.ops.cann_ops_transformer, "sparse_flash_mla_grad_metadata", lambda *a, **kw: meta)
-
-    def forward(q, **kwargs):
-        forward_args.update(kwargs)
-        return q.clone(), lse
-
-    def backward(q_in, grad, output, saved_lse, **kwargs):
-        assert q_in is q and saved_lse is lse
-        torch.testing.assert_close(grad, torch.ones_like(q))
-        for name in (
-            "ori_kv",
-            "cmp_kv",
-            "cmp_sparse_indices",
-            "sinks",
-            "metadata",
-            "cu_seqlens_q",
-            "cu_seqlens_ori_kv",
-            "cu_seqlens_cmp_kv",
-            "cmp_residual_kv",
-        ):
-            assert kwargs[name] is forward_args[name]
-        assert kwargs["softmax_scale"] == 0.5
-        assert kwargs["cmp_ratio"] == (2 if with_shared else 1)
-        assert kwargs["ori_win_left"] == 1
-        return (
-            torch.full_like(q, 2),
-            torch.full_like(original, 3),
-            torch.full_like(shared, 5) if with_shared else None,
-            torch.full_like(sink, 7),
-            None,
-            None,
-        )
-
-    monkeypatch.setattr(torch.ops.cann_ops_transformer, "sparse_flash_mla", forward)
-    monkeypatch.setattr(torch.ops.cann_ops_transformer, "sparse_flash_mla_grad", backward)
-    # The boundary triples are no longer arguments: they come out of the metadata.
-    out, returned_lse = ascendc._SparseMLA.apply(
-        q,
-        original,
-        shared,
-        indices,
-        sink,
-        # The entry this layer reads: the geometry the ``apply`` signature is driven with below
-        # (two heads of width four, a window of two, and a two-wide selection).
-        v41_metadata(
-            [0, 4],
-            ratio=2 if with_shared else 0,
-            geometry=AicpuGeometry(
-                window_size=2,
-                num_heads=2,
-                head_dim=4,
-                index_topk=2,
-                index_num_heads=2,
-                index_head_dim=4,
-            ),
-        ),
-        0.5,
-        2 if with_shared else 0,
-        2,
-        None,  # topk_scores: no teacher carrier in this test
-        False,  # wants_teacher
-    )
-    # The LSE passes through as a detached teacher signal.
-    assert returned_lse is lse
-    assert not returned_lse.requires_grad
-    out.sum().backward()
-    for value, expected in ((q, 2), (original, 3), (sink, 7)):
-        torch.testing.assert_close(value.grad, torch.full_like(value, expected))
-    if with_shared:
-        torch.testing.assert_close(shared.grad, torch.full_like(shared, 5))

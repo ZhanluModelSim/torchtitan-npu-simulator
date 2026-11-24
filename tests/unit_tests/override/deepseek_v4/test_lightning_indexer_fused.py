@@ -123,11 +123,11 @@ def test_kernel_scores_and_backward_teacher_keep_the_same_slots(monkeypatch):
     scores.backward(teacher)
 
     # The saved indices are exactly what SMLAG would have been handed, and the teacher reaches
-    # SLIKG divided by the query-row count (the emitter already applied the recipe scaling).
+    # SLIKG divided by the two compressed keys in this fixture.
     assert torch.equal(captured["indices"], picks.reshape(-1, 1, _TOPK))
     assert captured["metadata_bwd"] is md.aicpu_metadata.lightning_indexer.bwd
     assert captured["options_bwd"] == captured["options"]
-    expected_teacher = teacher.reshape(-1, 1, _TOPK) / _TOKENS
+    expected_teacher = teacher.reshape(-1, 1, _TOPK) / (_TOKENS // 4)
     torch.testing.assert_close(captured["teacher"], expected_teacher, rtol=0, atol=0)
 
     # The kernel's gradients land on the projections the indexer owns.

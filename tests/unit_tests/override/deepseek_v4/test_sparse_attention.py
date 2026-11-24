@@ -134,21 +134,10 @@ def test_explicit_cp_attention_accepts_the_cp_mesh():
     cp_attention.build()._parallelize(SimpleNamespace(get_optional_mesh={"cp": object()}.get))
 
 
-def _dense_kernel_oracle(
-    q,
-    swa_k,
-    attn_sink,
-    *,
-    attention_metadata,
-    softmax_scale,
-    compress_ratio,
-    window_size,
-    cmp_k=None,
-    topk_indices=None,
-    teacher_carrier=None,
-):
-    """Enumerate each query's window/selected keys; stand in only for CANN."""
-    assert teacher_carrier is None
+def _dense_kernel_oracle(self, q, swa_k, attn_sink, *, attention_metadata, cmp_k, topk_indices, topk_scores, **_):
+    """Enumerate each query's window and selected keys as an independent reference."""
+    assert topk_scores is None
+    window_size, compress_ratio = self.window_size, self.compress_ratio
     offsets = attention_metadata.documents.cu_seq_q.tolist()
     compressed_start = 0
     outputs, lses = [], []
@@ -163,7 +152,7 @@ def _dense_kernel_oracle(
                     chosen = chosen[chosen >= 0].long()
                 keys.append(cmp_k[compressed_start + chosen])
             values = torch.cat(keys)
-            logits = q[token] @ values.T * softmax_scale
+            logits = q[token] @ values.T * self.softmax_scale
             logits = torch.cat((logits, attn_sink[:, None]), dim=-1)
             probabilities = logits.softmax(-1)[:, :-1]
             outputs.append(probabilities @ values)
@@ -186,7 +175,7 @@ def test_reserved_empty_segments_are_removed_only_from_kernel_frames(monkeypatch
     torch.testing.assert_close(metadata.swa_k.cu_seqlens, torch.tensor([0, 16], dtype=torch.int32))
     torch.testing.assert_close(metadata.cmp_k.cu_seqlens, torch.tensor([0, 4], dtype=torch.int32))
     assert metadata.documents.max_k == reference_metadata.max_k == 16
-    monkeypatch.setattr(ascendc, "run_sparse_flash_mla", _dense_kernel_oracle)
+    monkeypatch.setattr(ascendc.AscSparseMLAMixin, "forward", _dense_kernel_oracle)
     generator = torch.Generator().manual_seed(43)
     arguments = (
         torch.randn(16, 2, 8, generator=generator),
@@ -280,7 +269,7 @@ def test_attention_forward_and_gradients_match_upstream_with_dense_kernel(monkey
         )
     _select(config)
     selected_config = config.layers[layer_index].attention
-    monkeypatch.setattr(ascendc, "run_sparse_flash_mla", _dense_kernel_oracle)
+    monkeypatch.setattr(ascendc.AscSparseMLAMixin, "forward", _dense_kernel_oracle)
     generator = torch.Generator().manual_seed(71)
     with torch.random.fork_rng(devices=[]):
         torch.manual_seed(19)

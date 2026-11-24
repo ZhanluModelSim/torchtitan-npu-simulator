@@ -144,7 +144,7 @@ CSA 层的 `Indexer` 投影出索引查询、键和权重，交给 `inner_indexe
 1. 校验模型输入是 `AscV4Metadata`，读这一层的 `q` / `swa_k` / `cmp_k` frame。
 2. query 转 TND；swa_k / cmp_k 是整行（CP 下由 wrapper 的 `S(1) -> R` 声明式 all-gather 得到），直接转 TND。
 3. `indexer.inner_indexer` 的独立 override（`lightning_indexer.asc`）调用 `lightning_indexer` 生成序列内局部 TopK，返回 `topk_indices` 与 `topk_scores`。索引按文档内位置降序排列，真实分数按同一组槽位重排。索引是文档内位置，`-1` 表示无效槽，分数的梯度传递 teacher。
-4. 调用 SparseFlashMLA；`_SparseFlashMLATND` 只做 SMLA 前向与 SMLAG 反向（使用 `asc.sparse_attn.bwd`）。SMLAG 反向把 raw marginal `p` 写到 `topk_scores` 的梯度上，`-1` 槽位清零，并乘一次 `softmax_scale`；`lightning_indexer.asc` 的 `_LightningIndexerTND.backward` 再除以本 microbatch 的 query 行数，用 `sparse_lightning_indexer_kl_loss_grad` 训练 indexer。`sparse_attn.asc` 与 `lightning_indexer.asc` 必须成对启用。
+4. `AscSparseMLAMixin.forward` 调用 SMLA，并在反向调用 SMLAG。SMLAG 返回的 teacher 在 `-1` 槽位清零，再通过 `topk_scores` 的梯度传给 indexer。V4 的 BF16 indexer 按压缩键序列长度 `idx_k.shape[0]` 归一化 teacher，由 SLIKG 计算 indexer 梯度。训练融合 indexer 时需要同时启用 `sparse_attn.asc` 和 `lightning_indexer.asc`。[BF16 attention 实现](../../torchtitan_npu/override/deepseek_v4/sparse_attn/ascendc.py) · [BF16 indexer 实现](../../torchtitan_npu/override/deepseek_v4/lightning_indexer/ascendc.py)
 
 `cann_ops_transformer` 包负责内核的算子注册（schema、meta/fake 实现），本仓只在融合路径内做前反向桥接，不再自建 `torch.library` 封装。
 

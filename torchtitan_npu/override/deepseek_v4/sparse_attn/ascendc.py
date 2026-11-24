@@ -279,199 +279,100 @@ def _mark_dynamic(metadata: AscV4Metadata) -> None:
         setattr(tensor, "_dynamo_unbacked_indices", {0})  # noqa: B010
 
 
-class _SparseFlashMLATND(torch.autograd.Function):
-    """Bridge SparseFlashMLA forward with SMLAG backward and its teacher by-product.
-
-    The ``cann_ops_transformer`` kernels carry no native autograd registration, so the manual
-    Function runs SMLA forward and SMLAG backward.  It does **not** train the indexer: SMLAG's
-    backward emits the raw teacher on ``topk_scores``' gradient and the selector's own
-    ``_LightningIndexerTND`` backward consumes that edge with SLIKG.  ``topk_scores`` is an
-    input here only so an incoming gradient on it exists and is routed to the emitter.
-
-    The kernels are addressed by this geometry's frames, not by a plan: the query frame is this
-    rank's chunks and the two KV frames are the row's; on arch22 the options state their reach as
-    the frame instead, and the wrapper has already compacted the rows onto it.
-    """
-
+class _SparseMLA(torch.autograd.Function):
     @staticmethod
     def forward(  # pyrefly: ignore [bad-override]
-        ctx,
-        q,
-        swa_k,
-        cmp_k,
-        topk_indices,
-        sinks,
-        attention_metadata,
-        softmax_scale,
-        ratio,
-        window_size,
-        topk_scores,
+        ctx, q, swa_k, cmp_k, indices, sinks, attention_metadata, options, softmax_scale, topk_scores
     ):
-        metadata = attention_metadata
-        if not isinstance(metadata, AscV4Metadata):
-            raise TypeError("the fused core needs AscV4Metadata")
-        asc = metadata.aicpu_metadata
-        has_compressed = metadata.cmp_k is not None
-        options = _sparse_attention_options(
-            q=metadata.q,
-            swa_k=metadata.swa_k,
-            cmp_k=metadata.cmp_k,
-            ratio=ratio,
-            window_size=window_size,
-        )
-        result, softmax_lse = torch.ops.cann_ops_transformer.sparse_flash_mla(
+        output, lse = torch.ops.cann_ops_transformer.sparse_flash_mla(
             q,
             ori_kv=swa_k,
-            cmp_kv=cmp_k if has_compressed else None,
-            cmp_sparse_indices=(topk_indices if has_compressed else None),
+            cmp_kv=cmp_k,
+            cmp_sparse_indices=indices,
             ori_block_table=None,
             cmp_block_table=None,
             sinks=sinks,
-            metadata=asc.sparse_attn.fwd,
+            metadata=attention_metadata.aicpu_metadata.sparse_attn.fwd,
             softmax_scale=softmax_scale,
             return_softmax_lse=True,
             **options,
         )
-        ctx.save_for_backward(
-            q,
-            swa_k,
-            cmp_k,
-            topk_indices,
-            sinks,
-            result,
-            softmax_lse,
-        )
+        ctx.save_for_backward(q, swa_k, cmp_k, indices, sinks, output, lse)
+        ctx.attention_metadata = attention_metadata
+        ctx.options = options
         ctx.softmax_scale = softmax_scale
-        ctx.ratio = ratio
-        ctx.window_size = window_size
-        # The carrier is an input only while training; its position in the backward's
-        # per-input list must still be answered with ``None`` when it was not threaded.
         ctx.has_carrier = topk_scores is not None
-        # A dataclass cannot go through ``save_for_backward``; it is a context attribute
-        # instead, holding the same frames the graph already keeps for the backward.
-        ctx.attention_metadata = metadata
-        # The LSE is a teacher signal, never a loss input.
-        ctx.mark_non_differentiable(softmax_lse)
-        return result, softmax_lse
+        ctx.mark_non_differentiable(lse)
+        return output, lse
 
     @staticmethod
     def backward(ctx, grad_output, grad_lse):  # pyrefly: ignore [bad-override]
-        del grad_lse
-        (
-            q,
-            swa_k,
-            cmp_k,
-            topk_indices,
-            sinks,
-            result,
-            softmax_lse,
-        ) = ctx.saved_tensors
-        metadata = ctx.attention_metadata
-        has_compressed = metadata.cmp_k is not None
-        options = _sparse_attention_options(
-            q=metadata.q,
-            swa_k=metadata.swa_k,
-            cmp_k=metadata.cmp_k,
-            ratio=ctx.ratio,
-            window_size=ctx.window_size,
-        )
-        (
-            dquery,
-            dori_kv,
-            dcmp_kv,
-            dsinks,
-            _,
-            cmp_softmax_l1,
-        ) = torch.ops.cann_ops_transformer.sparse_flash_mla_grad(
+        q, swa_k, cmp_k, indices, sinks, output, lse = ctx.saved_tensors
+        dq, dswa_k, dcmp_k, dsinks, _, mass = torch.ops.cann_ops_transformer.sparse_flash_mla_grad(
             q,
             grad_output.contiguous(),
-            result,
-            softmax_lse,
+            output,
+            lse,
             ori_kv=swa_k,
-            cmp_kv=cmp_k if has_compressed else None,
+            cmp_kv=cmp_k,
             ori_sparse_indices=None,
-            cmp_sparse_indices=(topk_indices if has_compressed else None),
+            cmp_sparse_indices=indices,
+            ori_topk_length=None,
+            cmp_topk_length=None,
             sinks=sinks,
-            metadata=metadata.aicpu_metadata.sparse_attn.bwd,
+            metadata=ctx.attention_metadata.aicpu_metadata.sparse_attn.bwd,
             softmax_scale=ctx.softmax_scale,
-            **options,
+            **ctx.options,
         )
-        if not has_compressed:
-            dcmp_kv = None
-
-        # The teacher edge: SMLAG's raw marginal mass, with every ``-1`` slot zeroed (the
-        # kernel may write junk there, and SLIKG sums every slot into ``p_reduce``), scaled by
-        # ``softmax_scale`` exactly once here; the selector's backward only divides by the
-        # microbatch's query-row count.  Only a layer that threads a carrier has an edge to
-        # emit on: an HCA layer's compressed branch has no selector, and an eval forward
-        # passes no carrier.
         teacher = None
-        if ctx.has_carrier and cmp_softmax_l1 is not None:
-            teacher = cmp_softmax_l1.masked_fill(topk_indices < 0, 0.0) * ctx.softmax_scale
-
-        # One gradient per forward input, in order: (q, swa_k, cmp_k, topk_indices, sinks,
-        # attention_metadata, softmax_scale, ratio, window_size, topk_scores).
-        return (
-            dquery,
-            dori_kv,
-            dcmp_kv,
-            None,  # topk_indices
-            dsinks,
-            None,  # attention_metadata
-            None,  # softmax_scale
-            None,  # ratio
-            None,  # window_size
-            teacher,  # topk_scores
-        )
+        if ctx.has_carrier:
+            if mass is None:
+                raise RuntimeError("SparseFlashMLA backward returned no teacher mass for the indexer.")
+            assert indices is not None, "The indexer teacher requires selected compressed indices."
+            # SMLAG may write nonzero mass into -1 slots; SLIKG sums all slots.
+            teacher = mass.masked_fill(indices < 0, 0.0)
+        return dq, dswa_k, dcmp_k if cmp_k is not None else None, None, dsinks, None, None, None, teacher
 
 
-def run_sparse_flash_mla(
-    q,
-    swa_k,
-    attn_sink,
-    *,
-    attention_metadata: AscV4Metadata,
-    softmax_scale: float,
-    compress_ratio: int,
-    window_size: int,
-    cmp_k=None,
-    topk_indices=None,
-    teacher_carrier=None,
-):
-    """Run the existing SMLA bridge and expose its detached TND LSE."""
-    if not isinstance(attention_metadata, AscV4Metadata):
-        raise TypeError("SMLA requires the AscV4Metadata its config built.")
-    if compress_ratio == 4 and (cmp_k is None or topk_indices is None):
-        raise ValueError("ratio-4 SMLA requires cmp_k and topk_indices together.")
-    metadata = attention_metadata
-    if not _IS_A5:
-        workaround = metadata.a3_workaround
-        assert workaround is not None, "an arch22 entry states the key workaround"
-        if workaround.swa_k_gather is not None:
-            swa_k = swa_k.index_select(0, workaround.swa_k_gather)
-        if cmp_k is not None and workaround.cmp_k_gather is not None:
-            cmp_k = cmp_k.index_select(0, workaround.cmp_k_gather)
-    swa_k = swa_k.unsqueeze(1).contiguous()
-    if cmp_k is not None:
-        cmp_k = cmp_k.unsqueeze(1).contiguous()
-    indices_tnd = None if topk_indices is None else topk_indices.reshape(-1, 1, topk_indices.shape[-1])
-    carrier_tnd = None if teacher_carrier is None else teacher_carrier.reshape(-1, 1, teacher_carrier.shape[-1])
-    output, lse = _SparseFlashMLATND.apply(
+class AscSparseMLAMixin:
+    """Translate packed TND operands and run the shared SMLA/SMLAG pair."""
+
+    softmax_scale: float
+
+    def forward(
+        self,
         q,
         swa_k,
+        attn_sink,
+        *,
         cmp_k,
-        indices_tnd,
-        attn_sink.float(),
-        metadata,
-        softmax_scale,
-        compress_ratio,
-        window_size,
-        carrier_tnd,
-    )
-    return output.reshape(q.shape[0], *output.shape[1:]), lse
+        topk_indices,
+        topk_scores,
+        attention_metadata,
+        options,
+        compact_keys,
+    ):
+        if compact_keys:
+            workaround = attention_metadata.a3_workaround
+            assert workaround is not None, "an arch22 entry states the key workaround"
+            if workaround.swa_k_gather is not None:
+                swa_k = swa_k.index_select(0, workaround.swa_k_gather)
+            if cmp_k is not None and workaround.cmp_k_gather is not None:
+                cmp_k = cmp_k.index_select(0, workaround.cmp_k_gather)
+        return _SparseMLA.apply(
+            q,
+            swa_k.unsqueeze(1).contiguous(),
+            None if cmp_k is None else cmp_k.unsqueeze(1).contiguous(),
+            None if topk_indices is None else topk_indices.reshape(-1, 1, topk_indices.shape[-1]),
+            attn_sink.float(),
+            attention_metadata,
+            options,
+            self.softmax_scale,
+            None if topk_scores is None else topk_scores.reshape(-1, 1, topk_scores.shape[-1]),
+        )
 
 
-class AscCompressedSparseInnerAttention(CompressedSparseInnerAttention):
+class AscCompressedSparseInnerAttention(AscSparseMLAMixin, CompressedSparseInnerAttention):
     """Run SMLA/SMLAG in a local TND layout, consuming the selector's selection.
 
     The core reads this geometry's
@@ -571,18 +472,31 @@ class AscCompressedSparseInnerAttention(CompressedSparseInnerAttention):
         if indices is not None and indices.size(-1) < self.index_topk:
             indices = torch.nn.functional.pad(indices, (0, self.index_topk - indices.size(-1)), value=-1)
         with spmd.no_typecheck():
-            output, lse = run_sparse_flash_mla(
+            if not isinstance(attention_metadata, AscV4Metadata):
+                raise TypeError("SMLA requires the AscV4Metadata its config built.")
+            if self.compress_ratio == 4 and (cmp_k is None or indices is None):
+                raise ValueError("ratio-4 SMLA requires cmp_k and topk_indices together.")
+            options = _sparse_attention_options(
+                q=attention_metadata.q,
+                swa_k=attention_metadata.swa_k,
+                cmp_k=attention_metadata.cmp_k,
+                ratio=self.compress_ratio,
+                window_size=self.window_size,
+            )
+            has_pool = attention_metadata.cmp_k is not None
+            carrier = topk_scores if self.training and self.aux_loss is None else None
+            output, lse = super().forward(
                 q,
                 swa_k,
                 attn_sink,
+                cmp_k=cmp_k if has_pool else None,
+                topk_indices=indices if has_pool else None,
+                topk_scores=carrier,
                 attention_metadata=attention_metadata,
-                softmax_scale=self.softmax_scale,
-                compress_ratio=self.compress_ratio,
-                window_size=self.window_size,
-                cmp_k=cmp_k,
-                topk_indices=indices,
-                teacher_carrier=topk_scores if self.training and self.aux_loss is None else None,
+                options=options,
+                compact_keys=not _IS_A5,
             )
+            output = output.reshape(q.shape[0], *output.shape[1:])
             if self.training and self.aux_loss is not None:
                 assert cmp_k is not None and topk_indices is not None and topk_scores is not None
                 if aux_loss_denominator is None:

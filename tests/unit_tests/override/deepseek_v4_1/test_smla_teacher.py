@@ -10,6 +10,7 @@ from tests.unit_tests.models.mtp_test_utils import build_cpu_model
 from torchtitan_npu.override.deepseek_v4_1.sparse_attn import ascendc
 
 
+@pytest.mark.parametrize("returns_teacher", [True, False], ids=["teacher", "missing-teacher"])
 @pytest.mark.parametrize(
     "checkpointed",
     [
@@ -26,7 +27,7 @@ from torchtitan_npu.override.deepseek_v4_1.sparse_attn import ascendc
         ),
     ],
 )
-def test_smla_carries_the_raw_teacher_to_slikg(monkeypatch, v41_metadata, checkpointed):
+def test_smla_carries_the_raw_teacher_to_slikg(monkeypatch, v41_metadata, checkpointed, returns_teacher):
     """SMLAG's by-product reaches ``topk_scores``' gradient unchanged.
 
     The teacher is the only thing that trains the indexer, and it travels on
@@ -70,7 +71,7 @@ def test_smla_carries_the_raw_teacher_to_slikg(monkeypatch, v41_metadata, checkp
             torch.zeros_like(kwargs["cmp_kv"]),
             torch.zeros_like(kwargs["sinks"]),
             None,
-            p,
+            p if returns_teacher else None,
         )
 
     monkeypatch.setattr(torch.ops.cann_ops_transformer, "sparse_flash_mla_grad", backward)
@@ -119,7 +120,12 @@ def test_smla_carries_the_raw_teacher_to_slikg(monkeypatch, v41_metadata, checkp
     # edge.  Both outputs are zeroed before the backward, so the scores see only the
     # teacher edge -- and it is delivered once per consumer's backward, not per forward.
     out2 = consume(q, scores)
-    ((out.sum() + out2.sum()) * 0).backward()
+    loss = (out.sum() + out2.sum()) * 0
+    if not returns_teacher:
+        with pytest.raises(RuntimeError, match="returned no teacher mass"):
+            loss.backward()
+        return
+    loss.backward()
 
     valid = (indices >= 0).reshape(4, 3)
     grad = scores.grad.reshape(4, 3)
@@ -148,20 +154,15 @@ def test_smla_carries_the_raw_teacher_to_slikg(monkeypatch, v41_metadata, checkp
     ],
 )
 def test_attention_without_a_teacher_edge(monkeypatch, v41_metadata, ratio, training, with_pool):
-    """No carrier reaches the kernel unless this layer is training with a compressed pool.
+    def forward(q, **kwargs):
+        return q.clone(), torch.zeros(1, 4, 1)
 
-    A compressed layer always receives its pool -- the port pairs ``cmp_k`` with
-    ``topk_indices`` -- so "no pool" only arises for a window-only layer; the other axis
-    is ``training``, which suppresses the teacher because there is no indexer gradient to
-    feed.
-    """
-    captured = []
+    def backward(q, grad, *args, cmp_sparse_indices, **kwargs):
+        mass = torch.ones_like(cmp_sparse_indices, dtype=torch.float32) if cmp_sparse_indices is not None else None
+        return grad, None, None, None, None, mass
 
-    def kernel(*args):
-        captured.append(args)
-        return args[0].clone(), torch.zeros(1, 4, 1)
-
-    monkeypatch.setattr(ascendc._SparseMLA, "apply", kernel)
+    monkeypatch.setattr(torch.ops.cann_ops_transformer, "sparse_flash_mla", forward)
+    monkeypatch.setattr(torch.ops.cann_ops_transformer, "sparse_flash_mla_grad", backward)
     config = ascendc.AscV41SparseAttention.Config(
         window_size=2,
         softmax_scale=0.5,
@@ -174,7 +175,8 @@ def test_attention_without_a_teacher_edge(monkeypatch, v41_metadata, ratio, trai
     )
     attention = build_cpu_model(config)
     attention.train(training)
-    q = torch.zeros(4, 1, 4, dtype=torch.bfloat16)
+    q = torch.zeros(4, 1, 4, dtype=torch.bfloat16, requires_grad=True)
+    scores = torch.ones(1, 4, 1, requires_grad=True)
     # The port pairs the pool and its selection: one without the other is a contract
     # violation, so the no-pool case carries neither.
     indices = torch.zeros(1, 4, 1, dtype=torch.long) if with_pool else None
@@ -186,12 +188,9 @@ def test_attention_without_a_teacher_edge(monkeypatch, v41_metadata, ratio, trai
         v41_metadata([0, 4], port=config),
         cmp_k=shared,
         topk_indices=indices,
-        topk_scores=torch.ones(1, 4, 1, requires_grad=True),
+        topk_scores=scores,
     )
     torch.testing.assert_close(out, q)
-    # The apply args are (q, swa_k, cmp_k, topk_indices, sinks, attention_metadata,
-    # softmax_scale, ratio, window_size, topk_scores, wants_teacher): the teacher travels
-    # as the carrier's gradient, so no carrier means this layer carries none.  The boundary
-    # tensors are no longer arguments -- they are read off the mask at position 5.
-    assert captured[0][9] is None
-    assert captured[0][10] is False
+    out.sum().backward()
+    torch.testing.assert_close(q.grad, torch.ones_like(q))
+    assert scores.grad is None

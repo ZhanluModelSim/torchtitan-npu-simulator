@@ -155,7 +155,7 @@ V4.1 的 CP 配方是 `torchtitan_npu_recipes.models.deepseek_v4_1.deepseek_v4_1
 | 内核锚定 | arch35 读 `seqused_q` / `seqused_ori_kv` / `seqused_cmp_kv`，窗口与压缩因果上限直接锚在 reach 上；arch22 的内核不读 key 侧 `seqused`、把 mask 右对齐到 frame 末尾，因此非末尾 rank 的两路 key 流要压成 rank-local 前缀 | arch22 同样对 key 前缀做整理；arch35 读取 `seqused` |
 | rank-local key 压缩（仅 arch22） | `A3KeyWorkaround`（`override/a3_workaround.py`）：`swa_k_gather` / `cmp_k_gather` 两个可微 `index_select`，由 `build_aicpu_metadata` 在 `if not _IS_A5:` 里加在 `AscV4Metadata` 上 | 同样使用 `A3KeyWorkaround` |
 | frame 归属 | 模型 metadata（`DeepSeekV4Metadata`，含 `cp: CPDeepSeekMetadata(restore)`） | 融合 entry（`AscV41Metadata`） |
-| indexer teacher 归一化 | `_LightningIndexerTND.backward` 除以整行 token 数 `swa_k.cu_seqlens[-1]` | `num_global_queries`（本 step 全部 query 数，按 DP 求和） |
+| indexer teacher 归一化 | BF16 selector 除以压缩键序列长度 `idx_k.shape[0]` | `num_global_queries`（本 step 全部 query 数，按 DP 求和） |
 | 参考 metadata | `DeepSeekV4Metadata.prepare_cp_metadata` 拒绝 | `DeepSeekV41Metadata.prepare_cp_metadata` 拒绝 |
 | 量化 metadata | `QuantV4Metadata` 拒绝 | `_V41QuantAttentionMetadata` 拒绝 |
 
@@ -364,9 +364,9 @@ layer 在本地 slab 上做 `ratio` 折叠（ratio==1 是普通投影），因�
 ### 5.4 indexer teacher 的归一化
 
 V4.1 的 selector 在反向把 teacher 除以 `InnerIndexer.num_global_queries`：本 step 全部 accumulation
-microbatch 的 query token 数（在 CP 切分之前统计，DP 维再求和）。V4 的融合 selector 反向则除以
-`metadata.swa_k.cu_seqlens[-1]`（整行 token 数，即所有 rank 的 chunk 之和），两者是同一个量的两种
-来源，都是为了避免 CP/DP 下参数梯度被 rank-local 分母放大。
+microbatch 的 query token 数（在 CP 切分之前统计，DP 维再求和）。V4 的 BF16 selector 使用
+`idx_k.shape[0]`，即 arch22 压紧前的整行压缩键长度。V4 的 PyPTO 和 PyPTO-Pro selector
+使用 `metadata.swa_k.cu_seqlens[-1]`，即整行 query token 数。
 
 ### 5.5 拒绝 CP 的路径
 
@@ -403,7 +403,7 @@ Engram 不在这一列。它的 token history 要的是每行**在本文档内**
 | `torchtitan_npu/models/deepseek_v4/sharding.py` | `swa_k` / `cmp_k` / `idx_k` 的 `cp: S(0) -> R` 声明 |
 | `torchtitan_npu/override/deepseek_v4/metadata.py` | `AicpuMetadata` / `AscV4Metadata`（`aicpu_metadata` + `a3_workaround`）/ `prepare_cp_metadata`（`doc_chunk_entry` + `build_aicpu_metadata`） |
 | `torchtitan_npu/override/deepseek_v4/sparse_attn/ascendc.py` | `build_aicpu_metadata`（按 entry 的 frame 重建记录，arch22 上建 key 压缩）、SMLA/SMLAG 的 frame 参数 |
-| `torchtitan_npu/override/deepseek_v4/lightning_indexer/ascendc.py` | LI 前向 / SLIKG 反向（选择器自己的 frame、arch22 的压缩池、teacher 边，分母为 `swa_k.cu_seqlens[-1]`） |
+| `torchtitan_npu/override/deepseek_v4/lightning_indexer/ascendc.py` | 准备 V4 的 selector frame 与 arch22 的压缩池，将整行 token 数 `swa_k.cu_seqlens[-1]` 传给 SLIKG 作为分母 |
 | `torchtitan_npu/override/deepseek_v4/lightning_indexer/pypto.py` | PyPTO 版 selector：独立实现同一契约（输入准备、排序、teacher 边），只替换 LI/SLIKG kernel 对 |
 | `torchtitan_npu/override/deepseek_v4/compressor/ascendc.py` | CANN 融合压缩器（无 carry、无 CP 分支；`_state_inputs` 按 stream 形状内部构造零 tiling 表） |
 | `torchtitan_npu/models/deepseek_v4_1/attention.py` | V4.1 查询保持 doc-chunk 布局，key 消费方按需恢复 slab |

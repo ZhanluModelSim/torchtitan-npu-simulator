@@ -18,6 +18,7 @@ from torchtitan_npu.models.common.metadata import KernelFrame
 from torchtitan_npu.models.deepseek_v4_1.indexer import InnerIndexer
 from torchtitan_npu.override import _IS_A5
 from torchtitan_npu.override.a3_workaround import A3KeyWorkaround
+from torchtitan_npu.override.deepseek_v4.lightning_indexer.ascendc import AscIndexerMixin
 from torchtitan_npu.override.deepseek_v4_1.metadata import (
     AicpuGeometry,
     AscLightningIndexerMetadata,
@@ -100,108 +101,11 @@ def entry_options(ratio: int, metadata) -> dict:
     return kernel_options(ratio=ratio, q=metadata.q, cmp_k=metadata.cmp_k)
 
 
-class _LightningIndexerTND(torch.autograd.Function):
-    """The BF16 LightningIndexer forward fused with the SLIKG backward.
-
-    The kernels' contract: ``q``/``k`` are BF16 with a single key head and
-    ``index_head_dim`` 128, ``w`` is float32 ``[T, Hi]``, and indices are
-    document-local with ``-1`` padding. SLIKG requires ``topk`` to be 512 or
-    an integer multiple of 1024.
-    """
-
-    @staticmethod
-    def forward(  # pyrefly: ignore [bad-override]
-        ctx,
-        idx_q,
-        idx_k,
-        idx_w,
-        topk,
-        ratio,
-        attention_metadata,
-        num_global_queries,
-    ):
-        # These arrive with the batch axis already squeezed off by the caller: an
-        # autograd.Function's backward must return one gradient per input *in the shape it
-        # was handed*, so the kernels' ``[T, H, D]`` layout has to be established outside
-        # this node rather than inside it.
-        options = entry_options(ratio, attention_metadata)
-        # The precomputed metadata is read instead of re-running the AI_CPU operator per layer.
-        li_metadata = attention_metadata.aicpu_metadata.lightning_indexer.fwd
-        topk_indices, topk_scores = torch.ops.cann_ops_transformer.lightning_indexer(
-            idx_q,
-            idx_k,
-            idx_w,
-            topk,
-            metadata=li_metadata,
-            return_value=1,
-            **options,
-        )
-        # Preserve SMLA's accumulation order and align the logits with the saved SLIKG slots.
-        topk_indices, order = topk_indices.sort(dim=-1, descending=True)
-        topk_scores = topk_scores.gather(-1, order)
-        ctx.save_for_backward(idx_q, idx_k, idx_w, topk_indices, num_global_queries)
-        ctx.topk, ctx.ratio = topk, ratio
-        # The metadata is a dataclass, so ``save_for_backward`` cannot take it; it is a
-        # context attribute instead.  That is not extra retention: it holds the same
-        # boundary tensors the graph already keeps for the backward, and the node -- and
-        # with it this reference -- is released when that backward has run.
-        ctx.attention_metadata = attention_metadata
-        return topk_indices, topk_scores
-
-    @staticmethod
-    def backward(ctx, grad_indices, attn_softmax_l1_norm):  # pyrefly: ignore [bad-override]
-        # The indices are integer selections: never tracked, always None.  The
-        # scores' gradient is the teacher the SLIKG kernel expects, because SLIKG
-        # applies ``dI = Z * Y - p`` itself.  SMLAG's backward is what puts the raw
-        # ``p`` on this edge; nothing else may, and a signed value here would be read
-        # as the teacher and negate the indexer's gradient.
-        del grad_indices
-        if attn_softmax_l1_norm is None:
-            # No teacher reached this edge, so no operand has a gradient either.  The count
-            # is the same one the labelled tail below enumerates: one entry per forward
-            # input, in the same order.
-            return (None,) * 7
-        idx_q, idx_k, idx_w, topk_indices, num_global_queries = ctx.saved_tensors
-        if num_global_queries is None:
-            raise RuntimeError("Set InnerIndexer.num_global_queries before training the indexer")
-        # SMLAG injects raw teacher weights outside the main loss's normalization.
-        # Scaling p scales SLIKG's Z * softmax(I) - p by the same factor.
-        attn_softmax_l1_norm = attn_softmax_l1_norm / num_global_queries
-        options = entry_options(ctx.ratio, ctx.attention_metadata)
-        # Rides the same entry as the forward, so the backward skips its AI_CPU call too.
-        slig_metadata = ctx.attention_metadata.aicpu_metadata.lightning_indexer.bwd
-        dq, dk, dw, _ = torch.ops.cann_ops_transformer.sparse_lightning_indexer_kl_loss_grad(
-            q=idx_q,
-            k=idx_k,
-            w=idx_w,
-            sparse_indices=topk_indices,
-            attn_softmax_l1_norm=attn_softmax_l1_norm,
-            metadata=slig_metadata,
-            **options,
-        )
-        # ``idx_w`` arrives float32 (the kernel contract); the cast back to the
-        # projection dtype happens in the eager graph outside the Function.
-        #
-        # One gradient per forward input: q, k, w, topk, ratio, masks, query count.
-        return (
-            dq,
-            dk,
-            dw,
-            None,  # topk
-            None,  # ratio
-            None,  # attention_metadata
-            None,  # num_global_queries
-        )
-
-
-class AscInnerIndexer(InnerIndexer):
+class AscInnerIndexer(AscIndexerMixin, InnerIndexer):
     """The fused BF16 LI/SLIKG selector for the V4.1 indexer layers.
 
-    It emits the kernel's own document-local ``topk_indices``.  The fused attention
-    consumes that same coordinate system, so neither side translates: the selection
-    crosses the model boundary exactly as the kernels selected it, and only ``-1`` marks an
-    unused slot.  The reference selector emits that numbering too, so it is the model's
-    contract rather than this pair's.
+    The shared LI bridge returns document-local indices and their corresponding FP32
+    scores in descending index order. Trailing ``-1`` entries mark unused slots.
 
     It is the consumer half of the teacher pair: ``sparse_attn.asc`` emits the teacher on
     ``topk_scores``' gradient and this backward is what reads it, so training requires both overrides.
@@ -211,7 +115,7 @@ class AscInnerIndexer(InnerIndexer):
     class Config(InnerIndexer.Config):
         pass
 
-    def forward(
+    def forward(  # pyrefly: ignore [bad-override, bad-param-name-override]
         self,
         idx_q_BLHiDi: torch.Tensor,
         idx_k_BNDi: torch.Tensor,
@@ -220,21 +124,13 @@ class AscInnerIndexer(InnerIndexer):
         *,
         candidates_BL1C: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
-        topk = self.index_topk
-        topk_indices, topk_scores = _LightningIndexerTND.apply(
-            # The batch axis is the packed row, so it is squeezed rather than indexed: every
-            # kernel in this path addresses one row.
+        indices, scores = super().forward(
             idx_q_BLHiDi,
-            # The keys enter the Function already compacted (arch22): the gather is
-            # differentiable, so the teacher's gradient scatters back onto the gathered row and
-            # the wrapper's ``S(1) -> R`` reduce-scatter then lands it on the compressor.
-            A3KeyWorkaround.indexer_keys(idx_k_BNDi, attention_metadata, a5=_IS_A5).unsqueeze(1),
-            weights_BLHi.float(),
-            topk,
-            self.compress_ratio,
-            attention_metadata,
-            self.num_global_queries,
+            A3KeyWorkaround.indexer_keys(idx_k_BNDi, attention_metadata, a5=_IS_A5),
+            weights_BLHi,
+            attention_metadata=attention_metadata,
+            options=entry_options(self.compress_ratio, attention_metadata),
+            denominator=self.num_global_queries,
         )
-        topk_indices_BLK = topk_indices.reshape(-1, topk)
-        topk_scores_BLK = topk_scores.reshape(-1, topk)
-        return topk_indices_BLK, topk_scores_BLK, None
+        # BF16 selection does not produce a quantized candidate pool.
+        return indices, scores, None
