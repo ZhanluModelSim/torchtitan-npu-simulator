@@ -12,6 +12,7 @@ from torchtitan_npu.extensions.torchtitan.tools.profiler import CANNProfiler
 from torchtitan_npu.extensions.torchtitan.trainer import TrainerEx
 from torchtitan_npu.models.deepseek_v4_1 import _flash_engram_geometry
 from torchtitan_npu_recipes.models import deepseek_v4_1 as models
+from torchtitan_npu_recipes.models.deepseek_v4_1 import _A5_PREQUANTIZE_FQNS
 
 
 def _debug(*, a5: bool, sft: bool = False, qat: bool = False) -> TrainerEx.Config:
@@ -50,7 +51,7 @@ def _debug(*, a5: bool, sft: bool = False, qat: bool = False) -> TrainerEx.Confi
     config.extension.quantization.recipe = "all_block_fp8"
     if a5:
         config.extension.quantization.enable_fsdp_prequantize = True
-        config.extension.quantization.fsdp_prequantize_fqns = list(models._A5_PREQUANTIZE_FQNS)
+        config.extension.quantization.fsdp_prequantize_fqns = list(_A5_PREQUANTIZE_FQNS)
     if qat:
         config.extension.quantization.enable_mxfp4_qat = True
         config.extension.quantization.li_quantization = "mxfp4"
@@ -97,5 +98,5 @@ def deepseek_v4_1_mini_1p_cpt_a5() -> TrainerEx.Config:
     config.extension.quantization.enable_quantized_training = True
     config.extension.quantization.recipe = "all_block_fp8"
     config.extension.quantization.enable_fsdp_prequantize = True
-    config.extension.quantization.fsdp_prequantize_fqns = list(models._A5_PREQUANTIZE_FQNS)
+    config.extension.quantization.fsdp_prequantize_fqns = list(_A5_PREQUANTIZE_FQNS)
     return config

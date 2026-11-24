@@ -46,6 +46,21 @@ _DENSE = (
 )
 _ROUTED = (".feed_forward.routed_experts.w13", ".feed_forward.routed_experts.w2")
 
+# Default FSDP pre-quantize whitelist: the dense projections above minus the
+# stacked gate/up weight.  Pre-quantizing turns one all-gather payload into
+# ``qdata`` plus two scale grids, which FSDP2 only reassembles for dim-0 shards;
+# ``w13`` is a stacked ``[2, F, D]`` Linear sharded on dim 1, so a larger dense
+# mesh crashes.  ``w13`` keeps quantization, gathered in high precision.
+_PREQUANTIZABLE_DENSE = (
+    ".attention.wq_a",
+    ".attention.wq_b",
+    ".attention.wkv",
+    ".attention.wo_a",
+    ".attention.wo_b",
+    ".attention.indexer.wq_b",
+    ".feed_forward.shared_experts.w2",
+)
+
 
 class V4FilterKeys:
     """Canonical DeepSeek-V4 filter names (avoid hand-written string keys)."""
@@ -63,7 +78,7 @@ V4_FILTER_SPECS: dict[str, FilterSpec] = {
 }
 
 V4_PREQUANTIZE_DEFAULT_FQNS: dict[str, tuple[str, ...]] = {
-    V4FilterKeys.DENSE: _DENSE,
+    V4FilterKeys.DENSE: _PREQUANTIZABLE_DENSE,
     V4FilterKeys.ROUTED_EXPERT: _ROUTED,
 }
 

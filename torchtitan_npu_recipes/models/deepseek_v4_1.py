@@ -55,15 +55,34 @@ if TYPE_CHECKING:
     from torchtitan_npu.models.deepseek_v4_1.vision.language_encoder import ReasoningEffort, ThinkingMode
 
 
+# Same 8-rank set as ``deepseek_v4`` minus ``.attention.wq_a``: its 1280 rows
+# are 160 rows per rank at ``dp_shard=8``, off the 64-row block grid.  The
+# 128-rank full recipe uses ``_A5_PREQUANTIZE_FQNS_FULL`` instead.
 _A5_PREQUANTIZE_FQNS = [
-    ".attention.wq_a",
     ".attention.wq_b",
     ".attention.wkv",
     ".attention.wo_a",
     ".attention.wo_b",
     ".attention.indexer.wq_b",
-    ".feed_forward.shared_experts.w13",
     ".feed_forward.shared_experts.w2",
+]
+
+# Not in the full list: rows per rank at ``dp_shard=128``, none of them on the
+# 64-row block grid:
+#   .attention.wkv                     512 ->  4
+#   .attention.wq_a                   1280 -> 10
+#   .attention.wo_b                   5120 -> 40
+#   .feed_forward.shared_experts.w2   5120 -> 40
+#   .attention.indexer.wq_b           4096 -> 32
+# Kept: ``.attention.wq_b`` 32768 -> 256 and ``.attention.wo_a`` 8192 -> 64.
+# Routed experts stay whitelisted: FSDP keeps them on the expert axis (``w13``
+# ``[E, 2, F, D]``, ``w2`` ``[E, dim, F]``) while the expert-axis shard size
+# ``edp_shard * ep`` (= ``dp_shard * cp * tp``) stays within ``num_experts``, so
+# ``F``/``dim`` are never split.  ``ep == dp_shard`` leaves ``edp_shard`` 1: a
+# structural no-op that only engages once ``ep < dp_shard``.
+_A5_PREQUANTIZE_FQNS_FULL = [
+    ".attention.wq_b",
+    ".attention.wo_a",
     ".feed_forward.routed_experts.w13",
     ".feed_forward.routed_experts.w2",
 ]
@@ -953,7 +972,7 @@ def _sft(
     return config
 
 
-def _full(*, a5: bool, sft: bool = False, lora: bool = False) -> TrainerEx.Config:
+def _full(*, a5: bool, sft: bool = False, lora: bool = False, qat: bool = False) -> TrainerEx.Config:
     _reject_legacy_overrides()
     parallelism = _topology(
         local_processes=8 if a5 else 16,
@@ -991,12 +1010,18 @@ def _full(*, a5: bool, sft: bool = False, lora: bool = False) -> TrainerEx.Confi
     config.checkpointer.initial_load_path = os.environ.get("CKPT_INIT_LOAD_PATH", "/path/to/init_load_ckpt")
     config.checkpointer.initial_load_in_hf = True
     config.checkpointer.load_only = not lora
-    config.override.imports = _overrides(a5=a5, debug=False, swap=not lora)
+    config.override.imports = _overrides(a5=a5, debug=False, swap=not lora, qat=qat)
     config.extension.quantization.enable_quantized_training = a5
     config.extension.quantization.recipe = "all_block_fp8"
     if a5:
         config.extension.quantization.enable_fsdp_prequantize = True
-        config.extension.quantization.fsdp_prequantize_fqns = list(_A5_PREQUANTIZE_FQNS)
+        config.extension.quantization.fsdp_prequantize_fqns = list(_A5_PREQUANTIZE_FQNS_FULL)
+    if qat:
+        if not a5:
+            raise ValueError("MXFP4 QAT requires the A5 quantized recipe")
+        config.extension.quantization.enable_mxfp4_qat = True
+        config.extension.quantization.li_quantization = "mxfp4"
+        config.extension.quantization.enable_sparse_attention_quantization = True
     return config
 
 
@@ -1006,6 +1031,10 @@ def deepseek_v4_1_flash_cpt_4k_a3() -> TrainerEx.Config:
 
 def deepseek_v4_1_flash_cpt_4k_a5() -> TrainerEx.Config:
     return _full(a5=True)
+
+
+def deepseek_v4_1_flash_qat_4k_a5() -> TrainerEx.Config:
+    return _full(a5=True, qat=True)
 
 
 def deepseek_v4_1_flash_lora_4k_a3() -> TrainerEx.Config:

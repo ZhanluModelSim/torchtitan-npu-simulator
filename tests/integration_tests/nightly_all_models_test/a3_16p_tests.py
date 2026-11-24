@@ -38,7 +38,7 @@ def build_test_list() -> list[OverrideDefinitions]:
             "CKPT_INIT_LOAD_PATH": "/mnt/share/dsv4_ckpt_8rank",
             "MASTER_PORT": "6316",
             "HCCL_IF_BASE_PORT": "30160",
-            "CONFIG": "deepseek_v4_flash_43layers_16experts_eager_fp8",
+            "CONFIG": "deepseek_v4_flash_43layers_16experts_eager_bf16",
             "OPTIMIZER_OVERRIDES": "",
             # On some installed torch_npu builds the default Triton backend
             # registers aten.erfc twice at import-time (even in Eager runs).

@@ -46,6 +46,43 @@ from torchtitan_npu.models.deepseek_v4 import build_model_config
 from torchtitan_npu.models.deepseek_v4.chat_processor import DeepSeekV4ChatProcessor
 from torchtitan_npu.models.deepseek_v4.model import DeepSeekV4Model
 
+# Pre-quantize whitelist for the 8-rank eager sample: dim-0 projections whose
+# local shard keeps a multiple of 64 rows at ``dp_shard=8``.  ``.attention.wkv``
+# is 512 rows, so 16-way sharding would trip the wrapper's axis=-2 block guard.
+# ``.attention.wq_a`` (``q_lora_rank`` 1024 rows -> 128 per rank) is V4-only;
+# V4.1's 1280 rows are 160 per rank and stay out.  The 128-rank full recipe uses
+# ``_A5_PREQUANTIZE_FQNS_FULL`` instead.
+_A5_PREQUANTIZE_FQNS = [
+    ".attention.wq_a",
+    ".attention.wq_b",
+    ".attention.wkv",
+    ".attention.wo_a",
+    ".attention.wo_b",
+    ".attention.indexer.wq_b",
+    ".feed_forward.shared_experts.w2",
+]
+
+# 8-rank entries that leave the full list: rows per rank at ``dp_shard=128``,
+# none of them on the 64-row block grid:
+#   .attention.wkv                     512 ->  4
+#   .attention.wq_a                   1024 ->  8
+#   .attention.wo_b                   4096 -> 32
+#   .feed_forward.shared_experts.w2   4096 -> 32
+# Kept: ``.attention.wq_b`` 32768 -> 256, ``.attention.wo_a`` 8192 -> 64,
+# ``.attention.indexer.wq_b`` 8192 -> 64.
+# Routed experts stay whitelisted: FSDP keeps them on the expert axis (``w13``
+# ``[E, 2, F, D]``, ``w2`` ``[E, dim, F]``) while the expert-axis shard size
+# ``edp_shard * ep`` (= ``dp_shard * cp * tp``) stays within ``num_experts``, so
+# ``F``/``dim`` are never split.  ``ep == dp_shard`` leaves ``edp_shard`` 1: a
+# structural no-op that only engages once ``ep < dp_shard``.
+_A5_PREQUANTIZE_FQNS_FULL = [
+    ".attention.wq_b",
+    ".attention.wo_a",
+    ".attention.indexer.wq_b",
+    ".feed_forward.routed_experts.w13",
+    ".feed_forward.routed_experts.w2",
+]
+
 
 def _enable_indexer_aux_loss(model: DeepSeekV4Model.Config) -> None:
     """Train the reference selector through its existing distillation loss."""
@@ -339,13 +376,7 @@ def deepseek_v4_flash_cpt_4k_a5() -> TrainerEx.Config:
     quantization.enable_quantized_training = True
     quantization.recipe = "all_block_fp8"
     quantization.enable_fsdp_prequantize = True
-    quantization.fsdp_prequantize_fqns = [
-        ".attention.wq_b",
-        ".attention.wo_a",
-        ".attention.indexer.wq_b",
-        ".feed_forward.routed_experts.w13",
-        ".feed_forward.routed_experts.w2",
-    ]
+    quantization.fsdp_prequantize_fqns = list(_A5_PREQUANTIZE_FQNS_FULL)
     quantization.li_quantization = "fp8"
     quantization.kv_norm_quantization = KVNormQuantizationConfig(
         format="mxfp8",

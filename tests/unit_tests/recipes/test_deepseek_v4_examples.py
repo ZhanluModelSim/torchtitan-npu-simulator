@@ -47,6 +47,7 @@ def _load(name, *, recipe_module=None):
         "deepseek_v4_debugmodel",
         "deepseek_v4_flash_43layers_16experts_eager_bf16",
         "deepseek_v4_flash_43layers_16experts_eager_fp8",
+        "deepseek_v4_flash_43layers_16experts_eager_fp8_qat",
         "deepseek_v4_flash_1p_2k",
     }:
         return ConfigLoader().load(["--module", "torchtitan_npu_recipes.tests.models.deepseek_v4", "--config", name])
@@ -62,8 +63,51 @@ def test_reduced_dsv4_recipe_surface_contains_only_verified_entries():
         "deepseek_v4_debugmodel",
         "deepseek_v4_flash_43layers_16experts_eager_bf16",
         "deepseek_v4_flash_43layers_16experts_eager_fp8",
+        "deepseek_v4_flash_43layers_16experts_eager_fp8_qat",
         "deepseek_v4_flash_1p_2k",
     }
+
+
+def test_eager_fp8_recipe_pins_quantization_and_prequantize_whitelist():
+    """The 8P eager FP8 sample carries the quantized-training knobs and its pre-quantize whitelist."""
+    config = _load("deepseek_v4_flash_43layers_16experts_eager_fp8")
+
+    quantization = config.extension.quantization
+    assert quantization.enable_quantized_training
+    assert quantization.recipe == "all_block_fp8"
+    assert quantization.enable_fsdp_prequantize
+    assert quantization.fsdp_prequantize_fqns == [
+        ".attention.wq_a",
+        ".attention.wq_b",
+        ".attention.wkv",
+        ".attention.wo_a",
+        ".attention.wo_b",
+        ".attention.indexer.wq_b",
+        ".feed_forward.shared_experts.w2",
+    ]
+    assert quantization.li_quantization == "fp8"
+    assert quantization.kv_norm_quantization.format == "mxfp8"
+    assert quantization.kv_norm_quantization.fqns == [
+        ".attention.kv_norm",
+        ".attention.compressor.norm",
+        ".attention.compressor_128.norm",
+    ]
+    assert quantization.kv_norm_quantization.block_size == 64
+    assert config.parallelism.expert_parallel_degree == 8
+    assert config.parallelism.data_parallel_shard_degree == 8
+
+
+def test_eager_fp8_qat_recipe_only_adds_mxfp4_qat():
+    """The QAT variant keeps the 8P FP8 policy, flips on MXFP4 QAT and moves LI to MXFP4."""
+    config = _load("deepseek_v4_flash_43layers_16experts_eager_fp8_qat")
+
+    quantization = config.extension.quantization
+    assert quantization.enable_mxfp4_qat
+    assert quantization.li_quantization == "mxfp4"
+    assert quantization.recipe == "all_block_fp8"
+    assert quantization.enable_fsdp_prequantize
+    assert ".attention.wq_a" in quantization.fsdp_prequantize_fqns
+    assert config.parallelism.data_parallel_shard_degree == 8
 
 
 def test_full_a5_recipe_keeps_explicit_resources_and_prequantization_contract(monkeypatch):

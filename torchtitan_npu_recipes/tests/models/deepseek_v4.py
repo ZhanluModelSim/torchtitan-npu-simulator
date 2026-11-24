@@ -26,13 +26,14 @@ from torchtitan_npu.config import (
     OptimizerConfig,
     TrainingConfig,
 )
+from torchtitan_npu.config.configs import KVNormQuantizationConfig
 from torchtitan_npu.extensions.torchtitan.tools.profiler import CANNProfiler
 from torchtitan_npu.extensions.torchtitan.trainer import TrainerEx
 from torchtitan_npu.models.common.alignment import AlignedTextProcessor, compression_alignment
 from torchtitan_npu.models.deepseek_v4 import build_model_config
 from torchtitan_npu.models.deepseek_v4.model import DeepSeekV4Model
 from torchtitan_npu.models.deepseek_v4.mtp import MTPChunkedLossWrapper
-from torchtitan_npu_recipes.models.deepseek_v4 import _dsv4_optimizer_config
+from torchtitan_npu_recipes.models.deepseek_v4 import _A5_PREQUANTIZE_FQNS, _dsv4_optimizer_config
 
 
 def _trainer_config(
@@ -256,24 +257,37 @@ def deepseek_v4_flash_43layers_16experts_eager_fp8(
     quantization = config.extension.quantization
     quantization.enable_quantized_training = True
     quantization.recipe = "all_block_fp8"
-    # [TODO] varification required
-    # quantization.enable_fsdp_prequantize = True
-    # quantization.fsdp_prequantize_fqns = [
-    #     ".attention.wq_a",
-    #     ".attention.wq_b",
-    #     ".attention.wkv",
-    #     ".attention.wo_a",
-    #     ".attention.wo_b",
-    #     ".attention.indexer.wq_b",
-    #     ".feed_forward.shared_experts.w13",
-    #     ".feed_forward.shared_experts.w2",
-    # ]
-    # quantization.li_quantization = "fp8"
-    # quantization.kv_norm_quantization = KVNormQuantizationConfig(
-    #     format="mxfp8",
-    #     fqns=[".attention.kv_norm", ".attention.compressor.norm"],
-    #     block_size=64,
-    # )
+    quantization.enable_fsdp_prequantize = True
+    quantization.fsdp_prequantize_fqns = list(_A5_PREQUANTIZE_FQNS)
+    quantization.li_quantization = "fp8"
+    quantization.kv_norm_quantization = KVNormQuantizationConfig(
+        format="mxfp8",
+        fqns=[".attention.kv_norm", ".attention.compressor.norm", ".attention.compressor_128.norm"],
+        block_size=64,
+    )
+    return config
+
+
+def deepseek_v4_flash_43layers_16experts_eager_fp8_qat(
+    *,
+    num_mtp_layers: int = 0,
+    parallelism: ParallelismConfig | None = None,
+    seq_len: int = 4096,
+    hf_assets_path: str | None = None,
+    data_files: str = "tests/assets/c4_test/data.json",
+    per_doc_alignment: int | None = None,
+) -> TrainerEx.Config:
+    """Build 8-rank Flash eager block-FP8 with MXFP4 QAT on A5."""
+    config = deepseek_v4_flash_43layers_16experts_eager_fp8(
+        num_mtp_layers=num_mtp_layers,
+        parallelism=parallelism,
+        seq_len=seq_len,
+        hf_assets_path=hf_assets_path,
+        data_files=data_files,
+        per_doc_alignment=per_doc_alignment,
+    )
+    config.extension.quantization.enable_mxfp4_qat = True
+    config.extension.quantization.li_quantization = "mxfp4"
     return config
 
 

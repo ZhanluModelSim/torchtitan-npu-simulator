@@ -26,7 +26,7 @@ from torchtitan_npu.patches.torchtitan.models.common.linear import BatchedLinear
 from ..filters import _match_fqn_suffix, any_config_filter
 from ..param_swaps import _hif8_param_swap, block_fp8_param_swap, mxfp8_param_swap
 from ..recipes import FilterSpec, ParamSwapSpec
-from .deepseek_v4 import _DENSE, _ROUTED, _routed_expert_block_fp8
+from .deepseek_v4 import _DENSE, _PREQUANTIZABLE_DENSE, _ROUTED, _routed_expert_block_fp8
 
 
 def _is_v41_kv_source(config, fqn: str) -> bool:
@@ -57,7 +57,7 @@ V41_FILTER_SPECS: dict[str, FilterSpec] = {
 V41_EXTRA_FILTERS = {V41FilterKeys.COMPRESSOR: _is_v41_kv_source}
 
 V41_PREQUANTIZE_DEFAULT_FQNS: dict[str, tuple[str, ...]] = {
-    V41FilterKeys.DENSE: _DENSE,
+    V41FilterKeys.DENSE: _PREQUANTIZABLE_DENSE,
     V41FilterKeys.ROUTED_EXPERT: _ROUTED,
 }
 

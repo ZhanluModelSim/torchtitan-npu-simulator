@@ -70,11 +70,11 @@ DeepSeek-V4 的 KV Cache 量化训练针对 attention 的 nope 部分进行 MXFP
 
 ```bash
 --extension.quantization.kv-norm-quantization.format mxfp8 \
---extension.quantization.kv-norm-quantization.fqns .attention.kv_norm,.attention.compressor.norm \
+--extension.quantization.kv-norm-quantization.fqns .attention.kv_norm,.attention.compressor.norm,.attention.compressor_128.norm \
 --extension.quantization.kv-norm-quantization.block-size 64
 ```
 
-三个参数分别指定量化格式、需要替换的配置树节点后缀和 MX block size。`fqns` 中的两个节点分别对应 attention 的 `kv_norm` 与 compressor 的 `norm`，这些节点是量化插入位置。配置字段默认不启用（`format=None`，节点列表为空）；启用时需同时打开 `enable-quantized-training`。当前唯一支持的格式是 `mxfp8`，block size 由消费该配置的 MX 量化实现校验。
+三个参数分别指定量化格式、需要替换的配置树节点后缀和 MX block size。`fqns` 中的节点分别对应 attention 的 `kv_norm`、ratio 4 层 compressor 的 `norm` 与 ratio 128 层 `compressor_128` 的 `norm`，这些节点是量化插入位置。配置字段默认不启用（`format=None`，节点列表为空）；启用时需同时打开 `enable-quantized-training`。当前唯一支持的格式是 `mxfp8`，block size 由消费该配置的 MX 量化实现校验。
 
 该路径使用 8 bit E4M3 的 MXFP8 数据和 8 bit E8M0 scale；默认脚本把 block size 设为 64，因此每 64 个 nope 通道共享一个 scale。量化结果随后反量化回原始高精度 dtype 参与训练，梯度通过 fake quant 的 STE 传递。
 
@@ -192,12 +192,12 @@ FSDP 的参数通信和梯度通信是两个阶段：参数在模块计算前通
 --extension.quantization.enable-fsdp-prequantize
 ```
 
-哪些权重保留预量化由 `--extension.quantization.fsdp-prequantize-fqns` 白名单控制：未设置时使用 recipe 默认白名单（全部 Block FP8 投影），显式空表与开关同开在配置校验时报 `ValueError`。白名单命中后，退出路径分为两类，行为刻意不同：
+哪些权重保留预量化由 `--extension.quantization.fsdp-prequantize-fqns` 白名单控制：未设置时使用 recipe 默认白名单（按 dim 0 分片的 Block FP8 投影），显式空表与开关同开在配置校验时报 `ValueError`。默认白名单不含 stacked gate/up（`shared_experts.w13`）：该权重被 FSDP 按 dim 1 分片，而非 dim 0 分片的多分量 payload 无法还原，开启即报错；它仍在 unshard 之后量化，计算精度不变。白名单命中后，退出路径分为两类，行为刻意不同：
 
 - **结构性 no-op（回退，不报错）**：没有 FSDP 分片（mesh size 1，如 EFSDP=1 的 MoE）、本地存储未分配（反向重建阶段）或本地形状即全局形状时，回退为高精度通信加运行时量化。这是并行拓扑决定的正常路径，不是错误。
-- **对齐失败（报错，不回退）**：分片后的量化维（axis=-2）须为 64 的倍数、最后一维须为 32 的倍数，不满足时抛 `ValueError` 立即终止，报错信息给出本地/全局分片形状与 mesh size，并提示从 `fsdp-prequantize-fqns` 移除该权重或调整并行度。按专家轴分片（Shard(0)）的 3D 专家权重本地量化维完整，不受 64 对齐约束。静默回退会让训练行为偏离配置，因此对齐失败是硬错误。
+- **对齐失败（报错，不回退）**：分片后的量化维（axis=-2）须为 64 的倍数、最后一维须为 32 的倍数，不满足时抛 `ValueError` 立即终止，报错信息给出本地/全局分片形状与 mesh size，并提示从 `fsdp-prequantize-fqns` 移除该权重或调整并行度。按专家轴分片（Shard(0)）的专家权重（`w2` 为 `[E, dim, F]`、stacked `w13` 为 `[E, 2, F, D]`）本地量化维完整，不受 64 对齐约束；只有 `edp_shard * ep`（等于 `dp_shard * cp * tp`）大于 `num_experts` 时 FSDP 才改为切矩阵行维，此时与 dense stacked 权重同样无法还原。静默回退会让训练行为偏离配置，因此对齐失败是硬错误。
 
-典型示例：默认白名单包含 `.attention.wkv`（dim0=512）。`dp_shard=8` 时每卡分片 64 行，满足对齐、正常预量化；`dp_shard=16` 时每卡 32 行，启动即报错，需把 `.attention.wkv` 从 `fsdp-prequantize-fqns` 中排除（列出默认白名单的其余模式）。更高并行度会成批触发：如 `dp_shard=128` 时要求 dim0 为 8192 的倍数，均分切分的 `wq_a`/`wkv`/`wo_b`/shared experts（dim0 为 512–4096）全部违规，仅按 head/group 块切分的 `wq_b`/`wo_a`/`indexer.wq_b` 与按专家轴切分的 routed experts 仍可预量化。
+典型示例：默认白名单包含 `.attention.wkv`（dim0=512）。`dp_shard=8` 时每卡分片 64 行，满足对齐、正常预量化；`dp_shard=16` 时每卡 32 行，启动即报错，需把 `.attention.wkv` 从 `fsdp-prequantize-fqns` 中排除（列出默认白名单的其余模式）。更高并行度会成批触发：如 `dp_shard=128` 时要求 dim0 为 8192 的倍数，均分切分的 `wq_a`/`wkv`/`wo_b` 与 shared experts 的 `w2`（dim0 为 512–4096）全部违规；dim0 较大的 `wq_b`（32768）与 `wo_a`（8192）仍满足，`indexer.wq_b` 取决于模型宽度（V4 为 8192 满足，V4.1 为 4096、每卡 32 行不满足），按专家轴分片（dim 0）的 routed experts 不受该对齐约束。
 
 ### MoE 专家低精度通信
 
@@ -238,9 +238,9 @@ attention 等 dense 权重仍使用 FP8。专家在 `[E, N, K]` 布局下沿 K �
 | `dst-type-max` | `0.0` | 用于 MXFP4 量化的目标类型最大值，可取值 0.0, 6.0-12.0 |
 | `enable-fsdp-prequantize` | `False` | 启用 FSDP 参数 all-gather 前预量化 |
 | `fsdp-prequantize-dtype` | `fp8` | Routed experts 的预量化通信格式；`mxfp4` 要求专家启用 MXFP4 QAT。`all_block_fp8` 下 attention 等 dense 权重仍使用 FP8 通信，启用范围由白名单决定 |
-| `fsdp-prequantize-fqns` | `None` | 预量化权重 FQN 后缀白名单，多个模式写在同一参数内并以英文逗号分隔（如 `.attention.wq_b,.attention.wo_a`）；`None` 用 recipe 默认白名单（全部 Block FP8 投影），显式空表与开关同开报 `ValueError`，命中但对齐失败的权重启动即报错 |
+| `fsdp-prequantize-fqns` | `None` | 预量化权重 FQN 后缀白名单，多个模式写在同一参数内并以英文逗号分隔（如 `.attention.wq_b,.attention.wo_a`）；`None` 用 recipe 默认白名单（按 dim 0 分片、不含 stacked gate/up 的 Block FP8 投影），显式空表与开关同开报 `ValueError`，命中但对齐失败的权重启动即报错 |
 | `kv-norm-quantization.format` | 未设置 | V4 nope KV Cache 量化格式，目前为 `mxfp8`（8 bit E4M3） |
-| `kv-norm-quantization.fqns` | 空列表 | V4 的量化插入位置，脚本使用 `.attention.kv_norm,.attention.compressor.norm` |
+| `kv-norm-quantization.fqns` | 空列表 | V4 的量化插入位置，脚本使用 `.attention.kv_norm,.attention.compressor.norm,.attention.compressor_128.norm` |
 | `kv-norm-quantization.block-size` | `32` | V4 KV Cache MXFP8 的 block size；A5 脚本使用 `64` |
 
 布尔开关可通过对应的 `no-` 形式显式关闭，例如 `--extension.quantization.no-enable-mxfp4-qat`、`--extension.quantization.no-enable-fsdp-prequantize`。使用 `--extension.quantization.no-enable-quantized-training` 可关闭量化训练总开关。

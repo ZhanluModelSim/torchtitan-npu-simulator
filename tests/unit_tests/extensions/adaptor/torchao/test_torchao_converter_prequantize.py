@@ -53,9 +53,16 @@ def _collect_flags(model_config) -> dict[str, bool]:
     return flags
 
 
+# Stacked gate/up weight: FSDP shards it on dim 1, where the multi-component
+# Block MX payload cannot be reassembled, so the recipe default whitelist keeps
+# it on the high-precision gather. It is still Block FP8 quantized after
+# unshard, which is why it shows up in ``_collect_flags`` at all.
+_STACKED_GATE_UP = ".feed_forward.shared_experts.w13"
+
+
 @pytest.mark.parametrize("family", ["v4", "v41"])
-def test_default_whitelist_keeps_prequantize_on_all_dense_projections(family):
-    """fsdp_prequantize_fqns=None resolves to the recipe default whitelist."""
+def test_default_whitelist_excludes_stacked_gate_up(family):
+    """fsdp_prequantize_fqns=None keeps every dim-0 projection and drops the stacked w13."""
     spec = (
         build_model_config("debugmodel", num_mtp_layers=0, parallelism=ParallelismConfig())
         if family == "v4"
@@ -67,10 +74,11 @@ def test_default_whitelist_keeps_prequantize_on_all_dense_projections(family):
 
     flags = _collect_flags(converted)
     assert flags, "debugmodel must expose quantized Linear nodes"
-    shared_gate_up_suffix = ".feed_forward.shared_experts.w13"
-    shared_gate_up = {fqn for fqn, _, _, _ in spec.traverse(Linear.Config) if fqn.endswith(shared_gate_up_suffix)}
-    assert shared_gate_up and shared_gate_up <= flags.keys()
-    assert all(flags.values()), f"default whitelist must enable every dense weight: {flags}"
+    stacked = {fqn: flag for fqn, flag in flags.items() if fqn.endswith(_STACKED_GATE_UP)}
+    assert stacked, f"{family} must expose the stacked gate/up weight"
+    assert not any(stacked.values()), f"stacked gate/up must keep the high-precision gather: {stacked}"
+    kept = {fqn: flag for fqn, flag in flags.items() if fqn not in stacked}
+    assert kept and all(kept.values()), f"default whitelist must enable every dim-0 projection: {kept}"
 
 
 def test_full_a5_graphtrainer_quantizes_shared_and_routed_experts():
@@ -154,14 +162,15 @@ def test_master_switch_off_leaves_policy_inert():
     assert flags and not any(flags.values()), "disabled master switch must keep every weight off pre-quantize"
 
 
-def test_default_whitelist_covers_every_quantized_projection():
+def test_default_whitelist_covers_every_prequantizable_projection():
     """The default whitelist must stay in sync with the recipe's quantized set.
 
     Every quantized Linear the converter produces on the real debugmodel tree
-    matches a default entry, so a renamed or removed projection surfaces here
-    (or as a zero-match error) instead of silently dropping pre-quantize
-    coverage. Matching the config tree — not a literal copy of the constant —
-    is what keeps the whitelist and the recipe in sync.
+    matches a default entry -- except the stacked gate/up weight, which cannot
+    pre-quantize -- so a renamed or removed projection surfaces here (or as a
+    zero-match error) instead of silently dropping pre-quantize coverage.
+    Matching the config tree, not a literal copy of the constant, is what keeps
+    the whitelist and the recipe in sync.
     """
     spec = build_model_config("debugmodel", num_mtp_layers=0, parallelism=ParallelismConfig())
     quantization = _quantization_config(enable_fsdp_prequantize=True)
@@ -172,6 +181,8 @@ def test_default_whitelist_covers_every_quantized_projection():
     flags = _collect_flags(converted)
     assert flags, "debugmodel must expose quantized Linear nodes"
     for fqn in flags:
+        if fqn.endswith(_STACKED_GATE_UP):
+            continue
         assert any(_match_fqn_suffix(fqn, pattern) for pattern in all_patterns), (
             f"quantized weight {fqn!r} matches no default whitelist entry; update the model's prequantize_default_fqns"
         )
@@ -185,13 +196,15 @@ def test_mxfp4_communication_keeps_dense_fp8_and_experts_mxfp4():
         fsdp_prequantize_dtype="mxfp4",
     )
     converted = apply_quantization_converter(spec, config, model_compile_enabled=False)
-    dense_weights = [
-        node._torchao_npu_config.weight_config
-        for _, node, _, _ in converted.traverse(Linear.Config)
+    dense = [
+        (fqn, node._torchao_npu_config.weight_config)
+        for fqn, node, _, _ in converted.traverse(Linear.Config)
         if getattr(node, "_torchao_npu_config", None) is not None
     ]
-    assert dense_weights
-    for weight in dense_weights:
+    assert dense
+    prequantized_dense = [(fqn, weight) for fqn, weight in dense if not fqn.endswith(_STACKED_GATE_UP)]
+    assert prequantized_dense
+    for _, weight in prequantized_dense:
         assert weight.fsdp_prequantize
         assert weight.fsdp_prequantize_dtype == "fp8"
         assert weight.mxfp4_fake_quantize_config is None

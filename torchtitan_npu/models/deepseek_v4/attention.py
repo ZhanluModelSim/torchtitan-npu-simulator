@@ -120,7 +120,11 @@ class Attention(v4_attention.DeepSeekV4Attention):
             weight = self.wo_a.weight.view(num_groups, self.o_lora_rank, -1)
             if spmd.is_type_checking():
                 spmd.assert_type(weight, {"dp": spmd.R, "cp": spmd.R, "tp": spmd.S(0)})
-        output = torch.einsum("tgd,grd->tgr", grouped, weight)
+        # ``bmm`` rather than ``einsum``: a Block MX weight is only intercepted by
+        # mm / bmm / linear / grouped_mm, so ``einsum`` lowers to unsqueeze+mul on
+        # the raw weight and, once FSDP pre-quantizes the shard, dies on
+        # ``BlockMXTensor``'s unimplemented ``aten.unsqueeze``.
+        output = torch.bmm(grouped.transpose(0, 1), weight.transpose(1, 2)).transpose(0, 1)
         projection = self.wo_a
         if isinstance(projection, _LoRALinearMixin):
             hidden = projection.lora_a(grouped)
