@@ -103,14 +103,16 @@ class Attention(v4_attention.DeepSeekV4Attention):
 
     def __init__(self, config: Config):
         super().__init__(config)
-        self.attention_metadata_key = getattr(
-            config.inner_attention, "attention_metadata_key", type(self.inner_attention)
-        )
+        backend = config.inner_attention
         if config.indexer is not None:
             inner_indexer = self.indexer.inner_indexer
-            inner_indexer.return_scores = config.inner_attention.aux_loss is not None
-            if inner_indexer.requires_teacher and inner_indexer.return_scores:
-                raise ValueError("Fused LI has its own indexer objective; set aux_loss=None.")
+            inner_indexer.return_scores = backend.aux_loss is not None
+            if hasattr(backend, "uses_fused_indexer"):
+                backend.uses_fused_indexer = inner_indexer.requires_teacher  # pyrefly: ignore [missing-attribute]
+                self.inner_attention.uses_fused_indexer = inner_indexer.requires_teacher
+            elif inner_indexer.requires_teacher and inner_indexer.return_scores:
+                raise ValueError("Fused indexer training requires a sparse attention backend that emits its teacher.")
+        self.attention_metadata_key = getattr(backend, "attention_metadata_key", type(self.inner_attention))
         self.q_head_norm = config.q_head_norm.build()
 
     def project_output_groups(self, grouped):
@@ -260,9 +262,8 @@ class CompressedSparseInnerAttention(InnerAttention):
     - it does **not** chunk the query axis: the operator materialises intermediates that grow
       with the sequence length, the window/selection width and the head dimension, so it is a
       debugging and numerics reference. The fused backend consumes the same document-local indices and scores.
-    - it carries no indexer loss of its own: the LI objective is a property of a fused port (its
-      SMLAG backward hands the fused selector its teacher), so a recipe that runs this core
-      trains no gradient for the indexer's compressor.
+    - the reference recipe uses ``CompressedSparseAttention`` for CSA and scores distillation
+      from its forward LSE. The fused subclass obtains the corresponding teacher from SMLAG.
     """
 
     @dataclass(kw_only=True, slots=True)
@@ -280,7 +281,7 @@ class CompressedSparseInnerAttention(InnerAttention):
         model consumes it, and a fused core takes its own from the kernel."""
 
         @property
-        def attention_metadata_key(self):
+        def attention_metadata_key(self) -> tuple:
             """This layer's own entry: the core's class plus its compression ratio.
 
             One entry per geometry is what lets the builder derive exactly the grid this layer

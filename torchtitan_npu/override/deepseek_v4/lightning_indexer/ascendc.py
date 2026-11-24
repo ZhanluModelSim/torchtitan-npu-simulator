@@ -20,7 +20,7 @@ from torchtitan_npu.override.deepseek_v4.metadata import (
 
 class _LightningIndexerTND(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q, k, w, topk, attention_metadata, options, denominator):  # pyrefly: ignore [bad-override]
+    def forward(ctx, q, k, w, topk, attention_metadata, options):  # pyrefly: ignore [bad-override]
         indices, scores = torch.ops.cann_ops_transformer.lightning_indexer(
             q, k, w, topk, metadata=attention_metadata.aicpu_metadata.lightning_indexer.fwd, return_value=1, **options
         )
@@ -31,17 +31,15 @@ class _LightningIndexerTND(torch.autograd.Function):
         ctx.save_for_backward(q, k, w, indices)
         ctx.attention_metadata = attention_metadata
         ctx.options = options
-        ctx.denominator = denominator
+        ctx.set_materialize_grads(False)
         ctx.mark_non_differentiable(indices)
         return indices, scores
 
     @staticmethod
     def backward(ctx, grad_indices, teacher):  # pyrefly: ignore [bad-override]
         if teacher is None:
-            return (None,) * 7
+            return (None,) * 6
         q, k, w, indices = ctx.saved_tensors
-        if ctx.denominator is None:
-            raise RuntimeError("Set InnerIndexer.num_global_queries before training the indexer")
         metadata = ctx.attention_metadata.aicpu_metadata.lightning_indexer.bwd
         if metadata is None:
             raise ValueError("the fused selector needs the entry's backward metadata")
@@ -50,11 +48,11 @@ class _LightningIndexerTND(torch.autograd.Function):
             k=k,
             w=w,
             sparse_indices=indices,
-            attn_softmax_l1_norm=teacher / ctx.denominator,
+            attn_softmax_l1_norm=teacher,
             metadata=metadata,
             **ctx.options,
         )
-        return dq.to(q.dtype), dk.to(k.dtype), dw.to(w.dtype), None, None, None, None
+        return dq.to(q.dtype), dk.to(k.dtype), dw.to(w.dtype), None, None, None
 
 
 class AscIndexerMixin:
@@ -62,9 +60,9 @@ class AscIndexerMixin:
 
     index_topk: int
 
-    def forward(self, idx_q, idx_k, idx_w, *, attention_metadata, options, denominator):
+    def forward(self, idx_q, idx_k, idx_w, *, attention_metadata, options):
         indices, scores = _LightningIndexerTND.apply(
-            idx_q, idx_k.unsqueeze(1), idx_w.float(), self.index_topk, attention_metadata, options, denominator
+            idx_q, idx_k.unsqueeze(1), idx_w.float(), self.index_topk, attention_metadata, options
         )
         return indices.squeeze(1), scores.squeeze(1)
 
@@ -93,5 +91,4 @@ class AscInnerIndexer(AscIndexerMixin, InnerIndexer):
             idx_w,
             attention_metadata=attention_metadata,
             options=options,
-            denominator=idx_k.shape[0],
         )

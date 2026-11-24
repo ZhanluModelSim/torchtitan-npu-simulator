@@ -155,7 +155,7 @@ V4.1 的 CP 配方是 `torchtitan_npu_recipes.models.deepseek_v4_1.deepseek_v4_1
 | 内核锚定 | arch35 读 `seqused_q` / `seqused_ori_kv` / `seqused_cmp_kv`，窗口与压缩因果上限直接锚在 reach 上；arch22 的内核不读 key 侧 `seqused`、把 mask 右对齐到 frame 末尾，因此非末尾 rank 的两路 key 流要压成 rank-local 前缀 | arch22 同样对 key 前缀做整理；arch35 读取 `seqused` |
 | rank-local key 压缩（仅 arch22） | `A3KeyWorkaround`（`override/a3_workaround.py`）：`swa_k_gather` / `cmp_k_gather` 两个可微 `index_select`，由 `build_aicpu_metadata` 在 `if not _IS_A5:` 里加在 `AscV4Metadata` 上 | 同样使用 `A3KeyWorkaround` |
 | frame 归属 | 模型 metadata（`DeepSeekV4Metadata`，含 `cp: CPDeepSeekMetadata(restore)`） | 融合 entry（`AscV41Metadata`） |
-| indexer teacher 归一化 | BF16 selector 除以压缩键序列长度 `idx_k.shape[0]` | `num_global_queries`（本 step 全部 query 数，按 DP 求和） |
+| indexer teacher 归一化 | SMLAG backward 使用 forward 传入的全局有效 routing token 数 | 同 V4 |
 | 参考 metadata | `DeepSeekV4Metadata.prepare_cp_metadata` 拒绝 | `DeepSeekV41Metadata.prepare_cp_metadata` 拒绝 |
 | 量化 metadata | `QuantV4Metadata` 拒绝 | `_V41QuantAttentionMetadata` 拒绝 |
 
@@ -363,10 +363,10 @@ layer 在本地 slab 上做 `ratio` 折叠（ratio==1 是普通投影），因�
 
 ### 5.4 indexer teacher 的归一化
 
-V4.1 的 selector 在反向把 teacher 除以 `InnerIndexer.num_global_queries`：本 step 全部 accumulation
-microbatch 的 query token 数（在 CP 切分之前统计，DP 维再求和）。V4 的 BF16 selector 使用
-`idx_k.shape[0]`，即 arch22 压紧前的整行压缩键长度。V4 的 PyPTO 和 PyPTO-Pro selector
-使用 `metadata.swa_k.cu_seqlens[-1]`，即整行 query token 数。
+V4 和 V4.1 的 attention forward 接收 `aux_loss_denominator`。它来自 trainer 汇总的本 step 全部
+microbatch 的有效 routing token 数，跨 DP 归约，并在 CP 切分前确定。SMLAG backward 用这一分母累计
+`SparseIndexerLoss` 的质量加权 KL，并按 `coeff / denominator` 缩放 teacher。SLIKG 直接消费该梯度，
+因此不同压缩比、各 rank 及同一步的各 microbatch 共用一个归一化口径。
 
 ### 5.5 拒绝 CP 的路径
 

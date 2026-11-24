@@ -40,7 +40,7 @@ class _QuantLightningIndexerTND(torch.autograd.Function):
     @staticmethod
     def forward(ctx, query, key, weights, inputs, config):  # pyrefly: ignore [bad-override]
         ctx.set_materialize_grads(False)
-        indices, _ = quant_lightning_indexer(
+        indices, scores = quant_lightning_indexer(
             query,
             key,
             weights,
@@ -57,9 +57,8 @@ class _QuantLightningIndexerTND(torch.autograd.Function):
             cmp_residual_k=inputs.cmp_residual_k,
             metadata=inputs.metadata,
         )
-        # The saved slots must match the order SMLAG uses for its teacher.
-        indices = indices.sort(dim=-1, descending=True).values
-        scores = indices.new_empty(indices.shape, dtype=torch.float32, requires_grad=True)
+        indices, order = indices.sort(dim=-1, descending=True)
+        scores = scores.gather(-1, order).float().masked_fill(indices < 0, -torch.inf)
         ctx.save_for_backward(query, key, weights, indices)
         ctx.inputs = inputs
         ctx.config = config
@@ -75,9 +74,6 @@ class _QuantLightningIndexerTND(torch.autograd.Function):
         inputs, config = ctx.inputs, ctx.config
         if inputs.backward_metadata is None:
             raise RuntimeError("Quantized LI training requires the SLIKG backward record")
-        # SMLAG already masked padding and applied softmax_scale. Match the BF16
-        # selector's normalization by the whole microbatch's query-token count.
-        teacher = teacher / inputs.cu_seqlens_q[-1].to(torch.float32)
         dq, dk, dw, _ = torch.ops.cann_ops_transformer.sparse_lightning_indexer_kl_loss_grad(
             q=query,
             k=key,

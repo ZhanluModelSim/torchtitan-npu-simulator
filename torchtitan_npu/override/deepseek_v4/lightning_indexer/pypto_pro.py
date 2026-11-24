@@ -141,7 +141,7 @@ class _PyPTOProIndexerTND(torch.autograd.Function):
             raise ValueError("the fused selector needs the entry's forward record")
         torch._check(idx_q.shape[0] == attention_metadata.position_k.numel())
         torch._check(idx_k.shape[0] == attention_metadata.key_tokens)
-        topk_indices = lightning_indexer_indices(
+        topk_indices, topk_scores = lightning_indexer_indices(
             idx_q,
             idx_k,
             idx_w,
@@ -151,8 +151,9 @@ class _PyPTOProIndexerTND(torch.autograd.Function):
         )
         # Sort before saving: SMLAG emits the teacher in the returned slot order.
         # Descending puts -1 padding after valid document-local positions.
-        topk_indices = topk_indices.sort(dim=-1, descending=True).values
-        topk_scores = topk_indices.new_empty(topk_indices.shape, dtype=torch.float32, requires_grad=True)
+        topk_indices, order = topk_indices.sort(dim=-1, descending=True)
+        topk_scores = topk_scores.gather(-1, order).float().masked_fill(topk_indices < 0, -torch.inf)
+        ctx.set_materialize_grads(False)
         ctx.save_for_backward(idx_q, idx_k, idx_w, topk_indices)
         ctx.ratio = ratio
         ctx.attention_metadata = attention_metadata
@@ -162,22 +163,19 @@ class _PyPTOProIndexerTND(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_indices, attn_softmax_l1_norm):  # pyrefly: ignore [bad-override]
         del grad_indices
+        if attn_softmax_l1_norm is None:
+            return (None,) * 6
         idx_q, idx_k, idx_w, topk_indices = ctx.saved_tensors
         metadata = ctx.attention_metadata
         slig_metadata = metadata.aicpu_metadata.lightning_indexer.bwd
         if slig_metadata is None:
             raise ValueError("the fused selector needs the entry's backward record")
-        # SMLAG already applies softmax_scale. Normalize by the whole row, not
-        # the CP slab. Pro's Z * student - teacher formula is linear in teacher,
-        # so neither teacher renormalization nor another gradient scale belongs here.
-        query_rows = metadata.cu_seq_q[-1].to(torch.float32)
-        teacher = attn_softmax_l1_norm / query_rows
         dq, dk, dw, _ = sparse_lightning_indexer_kl_loss_grad(
             q=idx_q,
             k=idx_k,
             w=idx_w,
             sparse_indices=topk_indices,
-            attn_softmax_l1_norm=teacher,
+            attn_softmax_l1_norm=attn_softmax_l1_norm,
             metadata=slig_metadata,
             **_pro_options(metadata, ctx.ratio),
         )

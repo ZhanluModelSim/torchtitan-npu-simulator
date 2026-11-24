@@ -63,7 +63,6 @@ def _selector(*, mode="full", candidate_topk_blocks=_POOL):
     selector.candidate_block_size = _BLOCK_SIZE if candidate_topk_blocks > 0 else -1
     selector.mode = mode
     selector.has_candidate_pool = candidate_topk_blocks > 0
-    selector.num_global_queries = torch.tensor(16.0)
     return selector
 
 
@@ -91,17 +90,9 @@ def _assert_tnd_kernel_inputs(args):
     assert args[0].ndim == args[1].ndim == 3
 
 
-@pytest.mark.parametrize(
-    "query_count, expected_teacher",
-    [(8.0, 1.0), (32.0, 0.25), (None, None)],
-    ids=["two-rows", "eight-rows", "missing-count"],
-)
-def test_qli_source_sorts_selection_publishes_pool_and_runs_slikg(
-    monkeypatch, bypass_mxfp4_pack, query_count, expected_teacher
-):
+def test_qli_source_aligns_selected_scores_publishes_pool_and_runs_slikg(monkeypatch, bypass_mxfp4_pack):
     q, k, w = _inputs()
     selector = _selector()
-    selector.num_global_queries = None if query_count is None else torch.tensor(query_count)
     metadata = _metadata()
     metadata.q.seqused = torch.tensor([2], dtype=torch.int32)
     metadata.cmp_k.seqused = torch.tensor([1], dtype=torch.int32)
@@ -115,7 +106,7 @@ def test_qli_source_sorts_selection_publishes_pool_and_runs_slikg(
     def qli(*args, **kwargs):
         seen["qli"] = (args, kwargs)
         _assert_tnd_kernel_inputs(args)
-        return unsorted, torch.empty(0), candidate_blocks, torch.empty(0)
+        return unsorted, torch.tensor([4.0, 9.0, 8.0, -2.0]).expand_as(unsorted), candidate_blocks, torch.empty(0)
 
     def slikg(**kwargs):
         seen["slikg"] = kwargs
@@ -140,17 +131,11 @@ def test_qli_source_sorts_selection_publishes_pool_and_runs_slikg(
     )
 
     indices, scores, candidate = selector(q, k, w, metadata, candidates_BL1C=None)
-    # A later microbatch must not change the denominator saved with this graph.
-    selector.num_global_queries = torch.tensor(64.0)
-    if query_count is None:
-        with pytest.raises(RuntimeError, match=r"Set InnerIndexer\.num_global_queries"):
-            scores.backward(torch.full_like(scores, 8.0))
-        assert "slikg" not in seen
-        return
     scores.backward(torch.full_like(scores, 8.0))
 
     indexer = metadata.aicpu_metadata.lightning_indexer
-    assert torch.equal(indices[0], torch.tensor([3, 2, 1, -1], dtype=torch.int32))
+    torch.testing.assert_close(indices[0], torch.tensor([3, 2, 1, -1], dtype=torch.int32))
+    torch.testing.assert_close(scores[0], torch.tensor([4.0, -2.0, 8.0, -torch.inf]))
     assert scores.shape == indices.shape and scores.requires_grad
     assert torch.equal(candidate, candidate_blocks.unsqueeze(0))
     # The pool source launches the schedule that was sized by the capacity, with the same capacity:
@@ -158,11 +143,11 @@ def test_qli_source_sorts_selection_publishes_pool_and_runs_slikg(
     assert seen["qli"][1]["metadata"] is indexer.fwd
     assert seen["qli"][1]["candidate_topk_blocks"] == _POOL
     assert seen["qli"][1]["candidate_block_size"] == _BLOCK_SIZE
-    assert seen["qli"][1]["return_value"] is False
+    assert seen["qli"][1]["return_value"] is True
     # The backward reads the BF16 metadata off the same entry, so the teacher edge costs no launch.
     assert seen["slikg"]["metadata"] is indexer.bwd
     assert torch.equal(seen["slikg"]["sparse_indices"], indices.reshape(4, 1, 4))
-    assert torch.equal(seen["slikg"]["attn_softmax_l1_norm"], torch.full((4, 1, 4), expected_teacher))
+    assert torch.equal(seen["slikg"]["attn_softmax_l1_norm"], torch.full((4, 1, 4), 8.0))
     for options in (seen["qli"][1], seen["slikg"]):
         torch.testing.assert_close(options["seqused_q"], torch.tensor([2], dtype=torch.int32))
         torch.testing.assert_close(options["seqused_k"], torch.tensor([1], dtype=torch.int32))
@@ -185,7 +170,7 @@ def test_qsli_searcher_searches_the_precomputed_pool_and_passes_it_through(monke
     def qsli(*args, **kwargs):
         seen["qsli"] = (args, kwargs)
         _assert_tnd_kernel_inputs(args)
-        return topk_indices, torch.empty(0)
+        return topk_indices, torch.ones_like(topk_indices, dtype=torch.float32)
 
     monkeypatch.setattr(
         torch.ops.cann_ops_transformer,
@@ -216,12 +201,13 @@ def test_qli_without_candidate_pool_runs_the_pool_free_schedule(monkeypatch, byp
     metadata = _metadata(pool=-1, block_size=-1)
     candidate_blocks = torch.zeros((4, 1, 1), dtype=torch.int32)
     topk_indices = torch.arange(4, dtype=torch.int32).repeat(4, 1).unsqueeze(1)
+    topk_scores = torch.ones_like(topk_indices, dtype=torch.float32)
     seen = {}
 
     def qli(*args, **kwargs):
         seen["qli"] = (args, kwargs)
         _assert_tnd_kernel_inputs(args)
-        return topk_indices, torch.empty(0), candidate_blocks, torch.ones_like(candidate_blocks)
+        return topk_indices, topk_scores, candidate_blocks, torch.ones_like(candidate_blocks)
 
     monkeypatch.setattr(
         torch.ops.cann_ops_transformer,
@@ -254,11 +240,12 @@ def test_a_pool_free_layer_inside_a_pool_geometry_scores_every_entry(monkeypatch
     metadata = _metadata(pool=_POOL, block_size=_BLOCK_SIZE)
     candidate_blocks = torch.zeros((4, 1, 1), dtype=torch.int32)
     topk_indices = torch.arange(4, dtype=torch.int32).repeat(4, 1).unsqueeze(1)
+    topk_scores = torch.ones_like(topk_indices, dtype=torch.float32)
     seen = {}
 
     def qli(*args, **kwargs):
         seen["qli"] = (args, kwargs)
-        return topk_indices, torch.empty(0), candidate_blocks, torch.ones_like(candidate_blocks)
+        return topk_indices, topk_scores, candidate_blocks, torch.ones_like(candidate_blocks)
 
     monkeypatch.setattr(
         torch.ops.cann_ops_transformer,
@@ -318,6 +305,7 @@ def test_module_swap_installs_and_restores_the_v41_selector_forward(monkeypatch)
             return "original", args, kwargs
 
     host = SelectorHost()
+    host.requires_teacher = False
     original_forward = host.forward
     captured = {}
 
@@ -330,11 +318,13 @@ def test_module_swap_installs_and_restores_the_v41_selector_forward(monkeypatch)
     operands = tuple(object() for _ in range(4))
     candidate = object()
 
+    assert host.requires_teacher
     assert host(*operands, candidates_BL1C=candidate) == "quantized"
     assert captured == {"self": host, "args": operands, "candidate": candidate}
 
     _quant_v41_lightning_indexer_transform(host, DeepSeekV41QuantLightningIndexerConfig(step=QATStep.CONVERT))
     result = host(*operands, candidates_BL1C=candidate)
 
+    assert not host.requires_teacher
     assert result[0] == "original"
     assert host._torchao_npu_original_forward == original_forward

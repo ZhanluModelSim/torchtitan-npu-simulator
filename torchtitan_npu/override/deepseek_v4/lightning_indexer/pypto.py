@@ -62,7 +62,7 @@ def _pypto_sparse_lightning_indexer_kl_loss_grad(*, q: torch.Tensor, **kwargs: A
 
 
 class _PyPTOIndexerTND(torch.autograd.Function):
-    """InnerIndexer forward fused with its SLIKG backward, over the PyPTO kernel pair."""
+    """LightningIndexer forward fused with its SLIKG backward, over the PyPTO kernel pair."""
 
     @staticmethod
     def forward(  # pyrefly: ignore [bad-override]
@@ -83,7 +83,7 @@ class _PyPTOIndexerTND(torch.autograd.Function):
         # is what the keys below are compacted onto, and what its records were built from.
         assert attention_metadata.cmp_k is not None, "the selector needs the entry's pool"
         options = lightning_indexer_options(ratio=ratio, q=attention_metadata.q, cmp_k=attention_metadata.cmp_k)
-        topk_indices, _ = _pypto_lightning_indexer(
+        topk_indices, topk_scores = _pypto_lightning_indexer(
             idx_q,
             idx_k,
             idx_w,
@@ -92,12 +92,9 @@ class _PyPTOIndexerTND(torch.autograd.Function):
             return_value=1,
             **options,
         )
-        # Canonicalise inside the Function: the teacher arrives on ``topk_scores``' gradient,
-        # positioned per slot by whichever selection SMLAG was handed, and SLIKG consumes it
-        # next to these saved indices -- sorting after ``apply`` would desynchronise the two.
-        # Descending keeps position order for the valid entries and puts ``-1`` last.
-        topk_indices = topk_indices.sort(dim=-1, descending=True).values
-        topk_scores = topk_indices.new_empty(topk_indices.shape, dtype=torch.float32, requires_grad=True)
+        topk_indices, order = topk_indices.sort(dim=-1, descending=True)
+        topk_scores = topk_scores.gather(-1, order).float().masked_fill(topk_indices < 0, -torch.inf)
+        ctx.set_materialize_grads(False)
         ctx.save_for_backward(idx_q, idx_k, idx_w, topk_indices)
         ctx.ratio = ratio
         ctx.attention_metadata = attention_metadata
@@ -107,17 +104,14 @@ class _PyPTOIndexerTND(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_indices, attn_softmax_l1_norm):  # pyrefly: ignore [bad-override]
         del grad_indices
+        if attn_softmax_l1_norm is None:
+            return (None,) * 6
         idx_q, idx_k, idx_w, topk_indices = ctx.saved_tensors
         metadata = ctx.attention_metadata
         slig_metadata = metadata.aicpu_metadata.lightning_indexer.bwd
         if slig_metadata is None:
             raise ValueError("the fused selector needs the entry's backward record")
-        # The emitter already applied ``softmax_scale``; divide by the **row's** query-token
-        # count (the CE loss's denominator), never by this rank's slab -- under CP the
-        # parameter gradients are summed across the CP axis, so a local denominator would
-        # scale every indexer gradient by the CP degree.
-        query_rows = metadata.swa_k.cu_seqlens[-1].to(torch.float32)
-        attn_softmax_l1_norm = attn_softmax_l1_norm / query_rows
+        # The attention loss already applied coeff / step denominator.
         assert metadata.cmp_k is not None, "the selector needs the entry's pool"
         options = lightning_indexer_options(ratio=ctx.ratio, q=metadata.q, cmp_k=metadata.cmp_k)
         dq, dk, dw, _ = _pypto_sparse_lightning_indexer_kl_loss_grad(

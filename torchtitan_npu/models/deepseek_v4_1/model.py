@@ -262,6 +262,8 @@ class DeepSeekV41TransformerBlock(TransformerBlock):
             topk_indices=topk_indices,
             topk_scores=topk_scores,
             candidates=candidates,
+            aux_loss_denominator=aux_loss_denominator,
+            padding_mask_T=padding_mask,
         )
         remat.recompute_needs_tensor(x)
         x = self.hc_post(x, residual, post, comb)
@@ -438,6 +440,24 @@ class DeepSeekV41Model(GeometryAttentionMetadataMixin, Decoder):
             (max(layer.engram.table.ngram_orders) - 1 for layer in cfg.layers if layer.engram is not None),
             default=0,
         )
+
+        # A Reuse objective trains the last selection. Reindex selections train the
+        # keys from the last Full layer. Resolve those consumers before FSDP wraps
+        # blocks, so unused outputs cannot materialize zero parameter gradients.
+        scores_need_grad = keys_need_grad = False
+        for layer in reversed(tuple(self.layers.values())):
+            attention = cast("Attention", layer.attention)
+            indexer = getattr(attention, "indexer", None)
+            if indexer is None:
+                continue
+            scores_need_grad |= attention.compress_ratio > 0 and attention.inner_attention.aux_loss is not None
+            if indexer.mode is not IndexerMode.REUSE:
+                indexer.scores_need_grad = scores_need_grad
+                keys_need_grad |= scores_need_grad
+                scores_need_grad = False
+            if indexer.mode is IndexerMode.FULL:
+                indexer.keys_need_grad = keys_need_grad
+                keys_need_grad = False
 
     def preprocess_inputs(
         self,
@@ -766,6 +786,7 @@ class DeepSeekV41MultimodalModel(DeepSeekV41Model):
         token_types: torch.Tensor | None = None,
         input_embeds: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
+        aux_loss_denominators: torch.Tensor | None = None,
     ):
         """The text forward plus the modality inputs the vision tower consumes.
 
@@ -792,4 +813,5 @@ class DeepSeekV41MultimodalModel(DeepSeekV41Model):
             input_embeds=embeds,
             image_mask=image_mask,
             padding_mask=padding_mask,
+            aux_loss_denominators=aux_loss_denominators,
         )

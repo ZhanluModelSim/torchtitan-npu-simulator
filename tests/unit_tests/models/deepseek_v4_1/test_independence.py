@@ -55,16 +55,16 @@ def _run_isolated(code):
     assert result.returncode == 0, f"subprocess failed:\n{result.stdout}\n{result.stderr}"
 
 
-def test_v41_builds_and_runs_without_v4():
+def test_v41_builds_and_runs_without_v4_override():
     _run_isolated(r"""
 import sys
 
 class Blocker:
-    blocked = ("torchtitan_npu.models.deepseek_v4", "torchtitan_npu.override.deepseek_v4")
+    blocked = "torchtitan_npu.override.deepseek_v4"
 
     def find_spec(self, name, path=None, target=None):
-        if any(name == b or name.startswith(b + ".") for b in self.blocked):
-            raise ImportError(f"independence blocker: {name}")
+        if name == self.blocked or name.startswith(self.blocked + "."):
+            raise ImportError(f"V4 override must not be imported by the V4.1 reference model: {name}")
         return None
 
 sys.meta_path.insert(0, Blocker())
@@ -87,8 +87,8 @@ from torchtitan_npu_recipes.models.deepseek_v4_1 import deepseek_v4_1_debugmodel
 adapter = DeepSeekV41StateDictAdapter(cfg, None)
 recipe = deepseek_v4_1_debugmodel_text()
 assert recipe.model.layers
-assert not any(name == blocked or name.startswith(blocked + ".")
-               for name in sys.modules for blocked in Blocker.blocked)
+assert not any(name == Blocker.blocked or name.startswith(Blocker.blocked + ".")
+               for name in sys.modules)
 from tests.unit_tests.models.deepseek_v4_1.preprocess_utils import preprocess
 from tests.unit_tests.models.mtp_test_utils import build_cpu_model
 from tests.unit_tests.models.spmd_test_utils import single_rank_spmd_context

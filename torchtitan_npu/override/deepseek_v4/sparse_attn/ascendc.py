@@ -54,6 +54,7 @@ from torchtitan.models.deepseek_v4.compressor import SparseIndexerLoss
 
 from torchtitan_npu.models.common.metadata import KernelFrame
 from torchtitan_npu.models.deepseek_v4.attention import CompressedSparseInnerAttention
+from torchtitan_npu.models.deepseek_v4.indexer_loss import scale_fused_teacher
 from torchtitan_npu.models.deepseek_v4.metadata import DeepSeekV4Metadata
 from torchtitan_npu.override import _IS_A5
 from torchtitan_npu.override.a3_workaround import A3KeyWorkaround
@@ -282,7 +283,19 @@ def _mark_dynamic(metadata: AscV4Metadata) -> None:
 class _SparseMLA(torch.autograd.Function):
     @staticmethod
     def forward(  # pyrefly: ignore [bad-override]
-        ctx, q, swa_k, cmp_k, indices, sinks, attention_metadata, options, softmax_scale, topk_scores
+        ctx,
+        q,
+        swa_k,
+        cmp_k,
+        indices,
+        sinks,
+        attention_metadata,
+        options,
+        softmax_scale,
+        topk_scores,
+        aux_loss,
+        denominator,
+        padding_mask_T,
     ):
         output, lse = torch.ops.cann_ops_transformer.sparse_flash_mla(
             q,
@@ -297,17 +310,17 @@ class _SparseMLA(torch.autograd.Function):
             return_softmax_lse=True,
             **options,
         )
-        ctx.save_for_backward(q, swa_k, cmp_k, indices, sinks, output, lse)
+        ctx.save_for_backward(q, swa_k, cmp_k, indices, sinks, output, lse, topk_scores, denominator, padding_mask_T)
         ctx.attention_metadata = attention_metadata
         ctx.options = options
         ctx.softmax_scale = softmax_scale
-        ctx.has_carrier = topk_scores is not None
+        ctx.aux_loss = aux_loss
         ctx.mark_non_differentiable(lse)
         return output, lse
 
     @staticmethod
     def backward(ctx, grad_output, grad_lse):  # pyrefly: ignore [bad-override]
-        q, swa_k, cmp_k, indices, sinks, output, lse = ctx.saved_tensors
+        q, swa_k, cmp_k, indices, sinks, output, lse, scores, denominator, padding_mask_T = ctx.saved_tensors
         dq, dswa_k, dcmp_k, dsinks, _, mass = torch.ops.cann_ops_transformer.sparse_flash_mla_grad(
             q,
             grad_output.contiguous(),
@@ -325,19 +338,36 @@ class _SparseMLA(torch.autograd.Function):
             **ctx.options,
         )
         teacher = None
-        if ctx.has_carrier:
+        if ctx.aux_loss is not None:
             if mass is None:
                 raise RuntimeError("SparseFlashMLA backward returned no teacher mass for the indexer.")
-            assert indices is not None, "The indexer teacher requires selected compressed indices."
-            # SMLAG may write nonzero mass into -1 slots; SLIKG sums all slots.
-            teacher = mass.masked_fill(indices < 0, 0.0)
-        return dq, dswa_k, dcmp_k if cmp_k is not None else None, None, dsinks, None, None, None, teacher
+            with spmd.no_typecheck():
+                teacher = scale_fused_teacher(
+                    ctx.aux_loss, mass, scores, indices, denominator=denominator, padding_mask_T=padding_mask_T
+                )
+        return (
+            dq,
+            dswa_k,
+            dcmp_k if cmp_k is not None else None,
+            None,
+            dsinks,
+            None,
+            None,
+            None,
+            teacher,
+            None,
+            None,
+            None,
+        )
 
 
 class AscSparseMLAMixin:
     """Translate packed TND operands and run the shared SMLA/SMLAG pair."""
 
+    training: bool
     softmax_scale: float
+    aux_loss: SparseIndexerLoss | None
+    uses_fused_indexer = True
 
     def forward(
         self,
@@ -351,7 +381,16 @@ class AscSparseMLAMixin:
         attention_metadata,
         options,
         compact_keys,
+        denominator,
+        padding_mask_T,
     ):
+        aux_loss = self.aux_loss if self.training and self.uses_fused_indexer else None
+        scores = None
+        if aux_loss is not None:
+            if denominator is None:
+                raise RuntimeError("SparseIndexerLoss requires aux_loss_denominator.")
+            assert topk_scores is not None and topk_indices is not None
+            scores = topk_scores.reshape(-1, 1, topk_scores.shape[-1])
         if compact_keys:
             workaround = attention_metadata.a3_workaround
             assert workaround is not None, "an arch22 entry states the key workaround"
@@ -368,7 +407,10 @@ class AscSparseMLAMixin:
             attention_metadata,
             options,
             self.softmax_scale,
-            None if topk_scores is None else topk_scores.reshape(-1, 1, topk_scores.shape[-1]),
+            scores,
+            aux_loss,
+            denominator,
+            padding_mask_T,
         )
 
 
@@ -400,6 +442,11 @@ class AscCompressedSparseInnerAttention(AscSparseMLAMixin, CompressedSparseInner
         """The selector geometry its record and SLIKG backward are sized with."""
 
         aux_loss: SparseIndexerLoss.Config | None = None
+        uses_fused_indexer: bool = True
+
+        @property
+        def attention_metadata_key(self):
+            return (type(self), self.compress_ratio, self.uses_fused_indexer)
 
         @property
         def geometry(self) -> AicpuGeometry:
@@ -437,7 +484,7 @@ class AscCompressedSparseInnerAttention(AscSparseMLAMixin, CompressedSparseInner
             with spmd.no_typecheck():
                 cu = torch.unique_consecutive(documents.cu_seq_q)
             row = build_v4_metadata(positions, self.compress_ratio, cu_seq_q=cu, build_slots=False)
-            fused = build_aicpu_metadata(row, geometry=self.geometry, include_selector=self.aux_loss is None)
+            fused = build_aicpu_metadata(row, geometry=self.geometry, include_selector=self.uses_fused_indexer)
             return replace(fused, documents=documents)
 
     def __init__(self, config: Config) -> None:
@@ -447,6 +494,7 @@ class AscCompressedSparseInnerAttention(AscSparseMLAMixin, CompressedSparseInner
         self.index_num_heads = config.index_num_heads
         self.index_head_dim = config.index_head_dim
         self.aux_loss = config.aux_loss.build() if config.aux_loss is not None else None
+        self.uses_fused_indexer = config.uses_fused_indexer
 
     def _parallelize(self, parallelism_context):
         if parallelism_context.get_optional_mesh("tp") is not None:
@@ -484,20 +532,21 @@ class AscCompressedSparseInnerAttention(AscSparseMLAMixin, CompressedSparseInner
                 window_size=self.window_size,
             )
             has_pool = attention_metadata.cmp_k is not None
-            carrier = topk_scores if self.training and self.aux_loss is None else None
             output, lse = super().forward(
                 q,
                 swa_k,
                 attn_sink,
                 cmp_k=cmp_k if has_pool else None,
                 topk_indices=indices if has_pool else None,
-                topk_scores=carrier,
+                topk_scores=topk_scores if self.uses_fused_indexer else None,
                 attention_metadata=attention_metadata,
                 options=options,
                 compact_keys=not _IS_A5,
+                denominator=aux_loss_denominator,
+                padding_mask_T=padding_mask_T,
             )
             output = output.reshape(q.shape[0], *output.shape[1:])
-            if self.training and self.aux_loss is not None:
+            if self.training and self.aux_loss is not None and not self.uses_fused_indexer:
                 assert cmp_k is not None and topk_indices is not None and topk_scores is not None
                 if aux_loss_denominator is None:
                     raise RuntimeError("SparseIndexerLoss requires aux_loss_denominator.")

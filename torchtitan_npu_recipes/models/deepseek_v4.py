@@ -90,7 +90,9 @@ def _enable_indexer_aux_loss(model: DeepSeekV4Model.Config) -> None:
         if layer.attention.indexer is not None:
             inner = layer.attention.inner_attention
             inner.aux_loss = SparseIndexerLoss.Config(
-                coeff=1e-3,
+                coeff=1.0,
+                reduce_mesh="loss",
+                mass_weighted=True,
                 softmax_scale=inner.softmax_scale,
                 num_heads=layer.attention.n_heads,
                 compress_ratio=inner.compress_ratio,

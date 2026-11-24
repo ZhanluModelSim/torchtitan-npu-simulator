@@ -469,22 +469,41 @@ class AscV41SparseAttention(AscSparseMLAMixin, CompressedSparseInnerAttention2):
         cmp_k=None,
         topk_indices=None,
         topk_scores=None,
+        aux_loss_denominator=None,
+        padding_mask_T=None,
     ):
         if (cmp_k is None) != (topk_indices is None):
             raise ValueError("cmp_k and topk_indices must be provided together")
-        wants_teacher = self.training and cmp_k is not None
-        output, _lse = super().forward(
+        output, lse = super().forward(
             q,
             swa_k,
             attn_sink,
             cmp_k=cmp_k,
             topk_indices=topk_indices,
-            topk_scores=topk_scores if wants_teacher else None,
+            topk_scores=topk_scores,
             attention_metadata=attention_metadata,
             options=entry_options(attention_metadata, ratio=self.compress_ratio, window_size=self.window_size),
             compact_keys=not _IS_A5,
+            denominator=aux_loss_denominator,
+            padding_mask_T=padding_mask_T,
         )
-        return output.reshape_as(q)
+        output = output.reshape_as(q)
+        if self.training and self.aux_loss is not None and not self.uses_fused_indexer:
+            if aux_loss_denominator is None:
+                raise RuntimeError("SparseIndexerLoss requires aux_loss_denominator.")
+            assert cmp_k is not None and topk_indices is not None and topk_scores is not None
+            output = self.aux_loss(
+                q.detach(),
+                cmp_k.detach(),
+                topk_indices,
+                topk_scores,
+                lse.squeeze(0).detach(),
+                attention_metadata.cu_seq_q,
+                carrier=output,
+                denominator=aux_loss_denominator,
+                padding_mask_T=padding_mask_T,
+            )
+        return output
 
 
 class AscV41ContextParallelSparseAttention(CPInnerAttention, AscV41SparseAttention):

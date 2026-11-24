@@ -31,6 +31,8 @@ def _quantized_forward(
     cmp_k=None,
     topk_indices=None,
     topk_scores=None,
+    aux_loss_denominator=None,
+    padding_mask_T=None,
     **kwargs,
 ):
     from torchao_npu.quantized_modules.deepseek_v4_1.sparse_attention import QuantV41SparseAttention
@@ -48,6 +50,8 @@ def _quantized_forward(
         cmp_k=cmp_k,
         topk_indices=topk_indices,
         topk_scores=topk_scores,
+        aux_loss_denominator=aux_loss_denominator,
+        padding_mask_T=padding_mask_T,
     )
 
 

@@ -3,16 +3,13 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""V4 SMLAG carries the raw teacher to the selector's SLIKG backward.
+"""SMLAG teacher scaling by the configured coefficient and step token count."""
 
-The sparse core no longer trains the indexer itself.  SMLAG's by-product -- the marginal
-mass ``p`` over the selected slots -- is written on ``topk_scores``' gradient, with every
-``-1`` slot zeroed. These cases pin that edge,
-including the layers that must not emit one.
-"""
+from unittest.mock import Mock
 
 import pytest
 import torch
+from torchtitan.models.deepseek_v4.compressor import SparseIndexerLoss
 
 from torchtitan_npu.override.deepseek_v4.sparse_attn import ascendc
 
@@ -29,6 +26,11 @@ def _config(*, ratio=4):
         head_dim=4,
         index_num_heads=1,
         index_head_dim=4,
+        aux_loss=SparseIndexerLoss.Config(
+            coeff=0.7, mass_weighted=True, reduce_mesh="loss", softmax_scale=0.5, num_heads=1
+        )
+        if ratio == 4
+        else None,
     )
 
 
@@ -75,11 +77,14 @@ def _patch_smla(monkeypatch, *, junk=7.0):
 
 def test_the_teacher_reaches_the_carrier_with_padding_zeroed(monkeypatch):
     _patch_smla(monkeypatch)
+    scale_teacher = Mock(wraps=ascendc.scale_fused_teacher)
+    monkeypatch.setattr(ascendc, "scale_fused_teacher", scale_teacher)
     config = _config()
     attention = _attention(config)
     metadata = _metadata(config, torch.arange(4))
     indices = torch.tensor([[[0, 1, -1], [0, -1, -1], [-1, -1, -1], [0, 1, 2]]], dtype=torch.int64).squeeze(0)
-    scores = torch.zeros(4, 3, requires_grad=True)
+    scores = torch.arange(12, dtype=torch.float32).reshape(4, 3).requires_grad_()
+    padding = torch.tensor([False, True, False, False])
     q = torch.zeros(4, 1, 4, dtype=torch.bfloat16)
 
     out = attention(
@@ -90,15 +95,26 @@ def test_the_teacher_reaches_the_carrier_with_padding_zeroed(monkeypatch):
         topk_indices=indices,
         topk_scores=scores,
         attention_metadata=metadata,
+        aux_loss_denominator=torch.tensor(8.0),
+        padding_mask_T=padding,
     )
-    out.sum().backward()
+    (out.sum() * 0).backward()
 
+    scale_teacher.assert_called_once()
+    loss, raw_mass, saved_scores, saved_indices = scale_teacher.call_args.args
+    assert loss is attention.aux_loss
+    torch.testing.assert_close(saved_scores.reshape_as(scores), scores)
+    torch.testing.assert_close(saved_indices.reshape_as(indices), indices)
+    torch.testing.assert_close(scale_teacher.call_args.kwargs["padding_mask_T"], padding)
+    torch.testing.assert_close(scale_teacher.call_args.kwargs["denominator"], torch.tensor(8.0))
+    # The hardware writes a residual even on invalid indices. The helper receives it unchanged.
+    torch.testing.assert_close(raw_mass.reshape_as(indices)[2], torch.full((3,), 7.0))
     assert scores.grad is not None
     expected = torch.zeros(4, 3)
     expected[0] = torch.tensor([0.1, 0.3, 0.0])
-    expected[1] = torch.tensor([0.1, 0.0, 0.0])
     expected[3] = torch.tensor([0.1, 0.3, 0.4])
-    torch.testing.assert_close(scores.grad, expected, rtol=0, atol=0)
+    # The auxiliary coefficient and the global denominator scale the raw mass once.
+    torch.testing.assert_close(scores.grad, expected * (0.7 / 8), rtol=0, atol=0)
     assert (scores.grad[indices < 0] == 0).all()
 
 
@@ -126,8 +142,9 @@ def test_layers_that_must_not_emit_a_teacher(monkeypatch, mode):
         topk_indices=indices,
         topk_scores=scores,
         attention_metadata=metadata,
+        aux_loss_denominator=torch.tensor(8.0),
     )
-    out.sum().backward()
+    (out.sum() * 0).backward()
 
     if scores is not None:
         # Eval has no indexer gradient to feed, so the carrier is not threaded through and

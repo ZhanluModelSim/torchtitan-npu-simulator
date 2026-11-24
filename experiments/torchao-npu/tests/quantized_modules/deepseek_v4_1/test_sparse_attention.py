@@ -15,6 +15,15 @@ from torchao_npu.configs.module_swap_configs.deepseek_v4_1.quant_sparse_attentio
 from torchao_npu.quantized_modules.deepseek_v4_1 import lightning_indexer, sparse_attention
 
 
+def _scale_fused_teacher(aux_loss, teacher, scores, indices, *, denominator, padding_mask_T=None):
+    assert scores.shape == indices.shape == teacher.shape
+    return teacher.masked_fill(indices < 0, 0.0) * aux_loss / denominator.clamp_min(1)
+
+
+def _training_attention(**geometry):
+    return sparse_attention.QuantV41SparseAttention(**geometry, aux_loss=1.0, scale_fused_teacher=_scale_fused_teacher)
+
+
 def _indexer_metadata():
     """The selector's group on the entry: the sparse attention core never reads it."""
     return SimpleNamespace(
@@ -58,7 +67,7 @@ def _metadata(*, tokens=4, compressed_tokens=2, ratio=2, quant=False):
 
 
 def _fake_mla_apply(captured):
-    def apply(q, swa_k, cmp_k, indices, sinks, attention_metadata, scale, ratio, window, scores, wants_teacher):
+    def apply(q, swa_k, cmp_k, indices, sinks, attention_metadata, scale, ratio, window, scores, aux_loss, *_):
         captured.update(
             q=q,
             swa_k=swa_k,
@@ -70,7 +79,7 @@ def _fake_mla_apply(captured):
             ratio=ratio,
             window=window,
             scores=scores,
-            wants_teacher=wants_teacher,
+            wants_teacher=aux_loss is not None,
         )
         lse = torch.zeros((1, q.shape[0], q.shape[1]), dtype=q.dtype, device=q.device)
         return q, lse
@@ -167,7 +176,10 @@ def test_sparse_mla_quantizes_only_swa_and_preserves_main_kv_in_both_passes(
         ratio,
         2,
         scores,
-        with_shared,
+        1.0 if with_shared else None,
+        _scale_fused_teacher,
+        torch.tensor(1.0),
+        None,
     )
 
     assert returned_lse is lse
@@ -243,11 +255,7 @@ def test_forward_ratio_one_uses_full_resolution_shared_kv_without_residual(monke
         cu_seq_q=torch.tensor([0, 4], device=device, dtype=torch.int32),
         doc_ids_BL=torch.zeros(4, device=device, dtype=torch.int32),
     )
-    module = sparse_attention.QuantV41SparseAttention(
-        window_size=3,
-        softmax_scale=0.125,
-        compress_ratio=1,
-    )
+    module = _training_attention(window_size=3, softmax_scale=0.125, compress_ratio=1)
     topk_scores = torch.empty((1, 4, 2), device=device, dtype=torch.float32, requires_grad=True)
 
     output = module(
@@ -258,6 +266,7 @@ def test_forward_ratio_one_uses_full_resolution_shared_kv_without_residual(monke
         cmp_k=cmp_k,
         topk_indices=torch.zeros((1, 4, 2), device=device, dtype=torch.int64),
         topk_scores=topk_scores,
+        aux_loss_denominator=torch.tensor(1.0),
     )
 
     assert output.shape == q.shape
@@ -284,11 +293,7 @@ def test_forward_ratio_two_passes_the_selection_through_in_tnd_layout(monkeypatc
         device=device,
         dtype=torch.int64,
     )
-    module = sparse_attention.QuantV41SparseAttention(
-        window_size=5,
-        softmax_scale=0.25,
-        compress_ratio=2,
-    )
+    module = _training_attention(window_size=5, softmax_scale=0.25, compress_ratio=2)
     topk_scores = torch.empty((1, 4, 2), device=device, dtype=torch.float32, requires_grad=True)
 
     output = module(
@@ -299,6 +304,7 @@ def test_forward_ratio_two_passes_the_selection_through_in_tnd_layout(monkeypatc
         cmp_k=cmp_k,
         topk_indices=topk_indices,
         topk_scores=topk_scores,
+        aux_loss_denominator=torch.tensor(1.0),
     )
 
     assert output.shape == q.shape
@@ -315,7 +321,7 @@ def test_forward_ratio_two_passes_the_selection_through_in_tnd_layout(monkeypatc
 def test_forward_eval_keeps_sparse_quantization_without_teacher_carrier(monkeypatch):
     captured = {}
     monkeypatch.setattr(sparse_attention._SparseMLA, "apply", _fake_mla_apply(captured))
-    module = sparse_attention.QuantV41SparseAttention(window_size=3, softmax_scale=0.125, compress_ratio=1)
+    module = _training_attention(window_size=3, softmax_scale=0.125, compress_ratio=1)
     module.eval()
     q = torch.zeros((1, 4, 2, 4), dtype=torch.bfloat16)
     cmp_k = torch.zeros((1, 4, 4), dtype=torch.bfloat16)
@@ -327,6 +333,7 @@ def test_forward_eval_keeps_sparse_quantization_without_teacher_carrier(monkeypa
         _metadata(tokens=4, compressed_tokens=4),
         cmp_k=cmp_k,
         topk_indices=torch.zeros((1, 4, 2), dtype=torch.int32),
+        aux_loss_denominator=torch.tensor(1.0),
     )
 
     assert output.shape == q.shape
@@ -335,7 +342,7 @@ def test_forward_eval_keeps_sparse_quantization_without_teacher_carrier(monkeypa
 
 
 def test_forward_training_requires_teacher_carrier_for_compressed_kv():
-    module = sparse_attention.QuantV41SparseAttention(window_size=3, softmax_scale=0.125, compress_ratio=1)
+    module = _training_attention(window_size=3, softmax_scale=0.125, compress_ratio=1)
 
     with pytest.raises(ValueError, match="requires topk_scores"):
         module(
@@ -345,6 +352,7 @@ def test_forward_training_requires_teacher_carrier_for_compressed_kv():
             _metadata(tokens=4, compressed_tokens=4),
             cmp_k=torch.zeros((1, 4, 4), dtype=torch.bfloat16),
             topk_indices=torch.zeros((1, 4, 2), dtype=torch.int32),
+            aux_loss_denominator=torch.tensor(1.0),
         )
 
 
@@ -366,10 +374,17 @@ def test_module_swap_forwards_teacher_carrier_and_restores_original(monkeypatch)
     operands = tuple(object() for _ in range(4))
     cmp_k, indices, scores = object(), object(), object()
 
-    assert host(*operands, cmp_k=cmp_k, topk_indices=indices, topk_scores=scores, ignored=True) == "quantized"
+    inputs = {
+        "cmp_k": cmp_k,
+        "topk_indices": indices,
+        "topk_scores": scores,
+        "aux_loss_denominator": object(),
+        "padding_mask_T": object(),
+    }
+    assert host(*operands, **inputs, ignored=True) == "quantized"
     assert captured["self"] is host
     assert captured["args"] == operands
-    assert captured["kwargs"] == {"cmp_k": cmp_k, "topk_indices": indices, "topk_scores": scores}
+    assert captured["kwargs"] == inputs
 
     _quant_v41_sparse_attention_transform(host, DeepSeekV41QuantSparseAttentionConfig(step=QATStep.CONVERT))
     result = host(*operands, topk_scores=scores)
@@ -393,7 +408,12 @@ def test_quantized_sparse_teacher_reaches_quantized_lightning_indexer_slikg(monk
         torch.ops.cann_ops_transformer,
         "ds41",
         SimpleNamespace(
-            quant_lightning_indexer=lambda *args, **kwargs: (selected, torch.empty(0), torch.empty(0), torch.empty(0)),
+            quant_lightning_indexer=lambda *args, **kwargs: (
+                selected,
+                torch.ones_like(selected, dtype=torch.float32),
+                torch.empty(0),
+                torch.empty(0),
+            ),
         ),
         raising=False,
     )
@@ -436,7 +456,6 @@ def test_quantized_sparse_teacher_reaches_quantized_lightning_indexer_slikg(monk
         attention_metadata,
         False,
         None,
-        torch.tensor(16.0),
         # This layer runs no candidate pool: a pool-free selector is the QLI branch.
         -1,
         -1,
@@ -452,7 +471,10 @@ def test_quantized_sparse_teacher_reaches_quantized_lightning_indexer_slikg(monk
         2,
         3,
         scores,
-        True,
+        1.0,
+        _scale_fused_teacher,
+        torch.tensor(16.0),
+        None,
     )
 
     output.sum().backward()

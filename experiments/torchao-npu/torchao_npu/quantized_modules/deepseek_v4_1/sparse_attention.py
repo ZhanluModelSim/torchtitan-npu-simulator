@@ -62,9 +62,8 @@ class _SparseMLA(torch.autograd.Function):
     the same operand the forward used.  The quantized tensor's gradient is the gradient
     the originals would have received, which is the identity STE.
 
-    ``topk_scores`` is an autograd carrier only: forward never reads its value, while
-    backward publishes SMLAG's compressed-attention marginal as its gradient for the
-    LightningIndexer SLIKG backward to consume.
+    Backward uses the selected student logits and SMLAG's marginal to record the
+    auxiliary KL and pass the scaled teacher to LightningIndexer.
     """
 
     @staticmethod
@@ -80,7 +79,10 @@ class _SparseMLA(torch.autograd.Function):
         ratio,
         window_size,
         topk_scores,
-        wants_teacher,
+        aux_loss,
+        scale_fused_teacher,
+        aux_loss_denominator,
+        padding_mask_T,
     ):
         options = _kernel_options(attention_metadata, ratio, window_size)
         # The metadata this backend built for these frames, not a per-layer AI_CPU launch: the
@@ -114,9 +116,13 @@ class _SparseMLA(torch.autograd.Function):
             sinks,
             output,
             lse,
+            topk_scores,
+            aux_loss_denominator,
+            padding_mask_T,
         )
+        ctx.aux_loss = aux_loss
+        ctx.scale_fused_teacher = scale_fused_teacher
         ctx.softmax_scale, ctx.ratio, ctx.window_size = softmax_scale, ratio, window_size
-        ctx.wants_teacher = wants_teacher
         # The metadata is a dataclass, so ``save_for_backward`` cannot take it; it is a
         # context attribute instead.  That is not extra retention: it holds the same
         # boundary tensors the graph already keeps for the backward, and the node -- and
@@ -131,7 +137,7 @@ class _SparseMLA(torch.autograd.Function):
         del grad_lse  # the LSE is a teacher signal, never a loss input
         # Nothing but the operand tensors is saved, and ``swa_k`` here is the quantized
         # one -- the backward has to differentiate the same graph the forward built.
-        q, swa_k, cmp_k, topk_indices, sinks, output, lse = ctx.saved_tensors
+        q, swa_k, cmp_k, topk_indices, sinks, output, lse, scores, denominator, padding_mask_T = ctx.saved_tensors
         options = _kernel_options(ctx.attention_metadata, ctx.ratio, ctx.window_size)
         # The gradient side rides the same entry, so the backward launches nothing either.
         smla_grad_metadata = ctx.attention_metadata.aicpu_metadata.sparse_attn.bwd
@@ -151,10 +157,16 @@ class _SparseMLA(torch.autograd.Function):
             softmax_scale=ctx.softmax_scale,
             **options,
         )
-        # One gradient per forward input, in order: (q, swa_k, cmp_k, topk_indices,
-        # sinks, attention_metadata, softmax_scale, ratio, window_size, topk_scores,
-        # wants_teacher). PyTorch silently ignores extra trailing entries, so spell out
-        # every slot to keep the teacher on the carrier input.
+        teacher = None
+        if ctx.aux_loss is not None:
+            teacher = ctx.scale_fused_teacher(
+                ctx.aux_loss,
+                cmp_softmax_l1_norm,
+                scores,
+                topk_indices,
+                denominator=denominator,
+                padding_mask_T=padding_mask_T,
+            )
         return (
             dq,
             dswa_k,
@@ -165,23 +177,32 @@ class _SparseMLA(torch.autograd.Function):
             None,
             None,
             None,
-            (cmp_softmax_l1_norm.masked_fill(topk_indices < 0, 0.0) if ctx.wants_teacher else None),
+            teacher,
+            None,
+            None,
+            None,
             None,
         )
 
 
 class QuantV41SparseAttention(torch.nn.Module):
-    """Sparse computation installed at the host's ``_compute_attention`` seam.
+    """Sparse attention installed by the host's module-swap handler.
 
     The host supplies window_size, softmax_scale and compress_ratio when the
     module-swap handler binds this forward method to it.
     """
 
-    def __init__(self, *, window_size: int, softmax_scale: float, compress_ratio: int):
+    uses_fused_indexer = True
+
+    def __init__(
+        self, *, window_size: int, softmax_scale: float, compress_ratio: int, aux_loss=None, scale_fused_teacher=None
+    ):
         super().__init__()
         self.window_size = window_size
         self.softmax_scale = softmax_scale
         self.compress_ratio = compress_ratio
+        self.aux_loss = aux_loss
+        self.scale_fused_teacher = scale_fused_teacher
 
     def forward(
         self,
@@ -193,28 +214,30 @@ class QuantV41SparseAttention(torch.nn.Module):
         cmp_k=None,
         topk_indices=None,
         topk_scores=None,
+        aux_loss_denominator=None,
+        padding_mask_T=None,
     ):
         if (cmp_k is None) != (topk_indices is None):
             raise ValueError("cmp_k and topk_indices must be provided together")
-        wants_teacher = self.training and cmp_k is not None
+        aux_loss = self.aux_loss if self.training and cmp_k is not None else None
+        fused_loss = aux_loss if self.uses_fused_indexer else None
+        if aux_loss is not None and aux_loss_denominator is None:
+            raise RuntimeError("Indexer loss requires aux_loss_denominator.")
+        if aux_loss is not None and topk_scores is None:
+            raise ValueError("QuantV41SparseAttention requires topk_scores for its indexer loss")
         teacher_scores = None
-        if wants_teacher:
-            if topk_scores is None:
-                raise ValueError("QuantV41SparseAttention requires topk_scores to publish the LightningIndexer teacher")
+        if fused_loss is not None:
+            if self.scale_fused_teacher is None:
+                raise RuntimeError("Quantized sparse attention requires the host's fused teacher adapter.")
+            assert topk_scores is not None
             teacher_scores = topk_scores.reshape(-1, 1, topk_scores.shape[-1])
+        q_tnd = q.reshape(-1, *q.shape[-2:])
+        cmp_sd = None if cmp_k is None else cmp_k.reshape(-1, cmp_k.shape[-1])
 
-        # The selection arrives document-local from the fused selector, which chose it
-        # with the same kernel: the two share one coordinate system, and ``-1`` is how
-        # both spell an unused slot.  Order is left exactly as it came -- the selector
-        # already put it in position order, and the teacher's slot positions follow that
-        # order.  Only the layout is translated: the model carries ``[B, L, 1, K]`` while
-        # a TND kernel wants ``[T, N2, K]``.
-        # The port returns the attention output alone: the teacher's LSE never leaves
-        # SMLAG, which publishes the marginal on ``topk_scores``' gradient instead.
-        output, _lse = _SparseMLA.apply(
-            q.squeeze(0),
-            swa_k.squeeze(0).unsqueeze(1),
-            None if cmp_k is None else cmp_k.squeeze(0).unsqueeze(1),
+        output, lse = _SparseMLA.apply(
+            q_tnd,
+            swa_k.reshape(-1, 1, swa_k.shape[-1]),
+            None if cmp_sd is None else cmp_sd.unsqueeze(1),
             None if topk_indices is None else topk_indices.reshape(-1, 1, topk_indices.shape[-1]),
             attn_sink.float(),
             attention_metadata,
@@ -222,6 +245,22 @@ class QuantV41SparseAttention(torch.nn.Module):
             self.compress_ratio,
             self.window_size,
             teacher_scores,
-            wants_teacher,
+            fused_loss,
+            self.scale_fused_teacher if fused_loss is not None else None,
+            aux_loss_denominator,
+            padding_mask_T,
         )
+        if aux_loss is not None and not self.uses_fused_indexer:
+            assert cmp_sd is not None and topk_indices is not None and topk_scores is not None
+            output = aux_loss(
+                q_tnd.detach(),
+                cmp_sd.detach(),
+                topk_indices.reshape(q_tnd.shape[0], -1),
+                topk_scores.reshape(q_tnd.shape[0], -1),
+                lse.reshape(q_tnd.shape[:2]).detach(),
+                attention_metadata.cu_seq_q,
+                carrier=output,
+                denominator=aux_loss_denominator,
+                padding_mask_T=padding_mask_T,
+            )
         return output.reshape_as(q)

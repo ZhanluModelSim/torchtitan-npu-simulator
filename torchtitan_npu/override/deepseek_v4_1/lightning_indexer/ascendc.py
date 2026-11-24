@@ -111,6 +111,8 @@ class AscInnerIndexer(AscIndexerMixin, InnerIndexer):
     ``topk_scores``' gradient and this backward is what reads it, so training requires both overrides.
     """
 
+    requires_teacher = True
+
     @dataclass(kw_only=True, slots=True)
     class Config(InnerIndexer.Config):
         pass
@@ -130,7 +132,6 @@ class AscInnerIndexer(AscIndexerMixin, InnerIndexer):
             weights_BLHi,
             attention_metadata=attention_metadata,
             options=entry_options(self.compress_ratio, attention_metadata),
-            denominator=self.num_global_queries,
         )
         # BF16 selection does not produce a quantized candidate pool.
         return indices, scores, None

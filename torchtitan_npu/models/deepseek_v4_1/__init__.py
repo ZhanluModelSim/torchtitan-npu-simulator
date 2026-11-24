@@ -23,6 +23,7 @@ from torchtitan.models.common.config_utils import (
     make_router_config,
 )
 from torchtitan.models.common.param_init import depth_scaled_std
+from torchtitan.models.deepseek_v4.compressor import SparseIndexerLoss
 
 from torchtitan_npu.patches.torchtitan.models.common.linear import BatchedLinear
 
@@ -394,6 +395,16 @@ def _make_v41_attn_config(
         window_size=window_size,
         softmax_scale=softmax_scale,
         compress_ratio=compress_ratio,
+        aux_loss=SparseIndexerLoss.Config(
+            coeff=1.0,
+            reduce_mesh="loss",
+            mass_weighted=True,
+            softmax_scale=softmax_scale,
+            num_heads=n_heads,
+            compress_ratio=compress_ratio,
+        )
+        if compress_ratio > 0
+        else None,
     )
     return Attention.Config(
         n_heads=n_heads,

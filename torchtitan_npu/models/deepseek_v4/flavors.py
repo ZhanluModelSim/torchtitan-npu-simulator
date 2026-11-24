@@ -100,7 +100,6 @@ def _build_dsv4_layers(*, enable_sp: bool, enable_ep: bool, **kwargs):
     """Construct upstream V4 blocks with the NPU flavor dimensions."""
     kwargs.pop("moe_comm_backend", None)
     layers = _upstream_build_v4_layers(**kwargs, enable_sp=enable_sp, enable_ep=enable_ep)
-    # The reference recipes have no indexer distillation objective.
     from torchtitan.config import derive
 
     for layer in layers:
@@ -117,8 +116,12 @@ def _build_dsv4_layers(*, enable_sp: bool, enable_ep: bool, **kwargs):
             layer.attention.indexer = derive(
                 layer.attention.indexer, Indexer.Config, inner_indexer=InnerIndexer.Config(index_topk=core.index_topk)
             )
-            layer.attention.inner_attention = derive(core, CompressedSparseAttention.Config)
-        layer.attention.inner_attention.aux_loss = None
+            assert core.aux_loss is not None
+            layer.attention.inner_attention = derive(
+                core,
+                CompressedSparseAttention.Config,
+                aux_loss=dataclasses.replace(core.aux_loss, coeff=1.0, mass_weighted=True),
+            )
         feed_forward = cast("MoE.Config", layer.feed_forward)
         experts = feed_forward.routed_experts
         experts.activation_fn = LimitedSwiGLU.Config(swiglu_limit=_SWIGLU_LIMIT)

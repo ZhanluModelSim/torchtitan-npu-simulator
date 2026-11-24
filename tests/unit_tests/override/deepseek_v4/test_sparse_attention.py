@@ -197,8 +197,9 @@ def test_reserved_empty_segments_are_removed_only_from_kernel_frames(monkeypatch
         topk_indices=indices,
         topk_scores=scores,
         attention_metadata=metadata,
+        aux_loss_denominator=torch.tensor(16),
     )
-    expected = original.build()(*arguments, attention_metadata=reference_metadata)
+    expected = original.build()(*arguments, attention_metadata=reference_metadata, aux_loss_denominator=torch.tensor(16))
 
     torch.testing.assert_close(actual, expected, rtol=3e-5, atol=3e-6)
 
@@ -259,8 +260,10 @@ def test_attention_forward_and_gradients_match_upstream_with_dense_kernel(monkey
     config = _model_config()
     if auxiliary:
         config.layers[1].attention.inner_attention.aux_loss = SparseIndexerLoss.Config(
-            coeff=0.17, softmax_scale=8**-0.5, num_heads=2
+            coeff=0.17, softmax_scale=8**-0.5, num_heads=2, mass_weighted=True
         )
+    else:
+        config.layers[1].attention.inner_attention.aux_loss = None
     original = copy.deepcopy(config.layers[layer_index].attention)
     if original.indexer is not None:
         original.indexer = derive(original.indexer, reference_compressor.Indexer.Config)

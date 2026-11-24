@@ -78,6 +78,10 @@ def test_commit_timeout_exits_instead_of_discarding_and_continuing():
 
 @pytest.mark.parametrize("commit_authorized", [False, True])
 def test_completed_rejected_step_clears_transient_auxiliary_state(monkeypatch, commit_authorized):
+    from torchtitan.models.common.aux_loss import AuxLoss
+
+    # This engine has no model parts. Ignore losses registered by earlier model builds.
+    monkeypatch.setattr(AuxLoss, "_group_counts", {})
     engine = object.__new__(FaultTolerantTrainingEngineEx)
     engine.num_completed_steps = 14
     engine.optim = Mock()

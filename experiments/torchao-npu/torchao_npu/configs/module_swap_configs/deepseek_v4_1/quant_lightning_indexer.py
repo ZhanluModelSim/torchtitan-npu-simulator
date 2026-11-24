@@ -46,9 +46,13 @@ def _quantized_forward(
 def _quant_v41_lightning_indexer_transform(module, config: DeepSeekV41QuantLightningIndexerConfig):
     if not hasattr(module, "_torchao_npu_original_forward"):
         module._torchao_npu_original_forward = module.forward
+        if hasattr(module, "requires_teacher"):
+            module._torchao_npu_original_requires_teacher = module.requires_teacher
     if config.step == QATStep.PREPARE:
         module._torchao_npu_module_swap_config = config
         module.forward = MethodType(_quantized_forward, module)
     else:
         module.forward = module._torchao_npu_original_forward
+    if hasattr(module, "_torchao_npu_original_requires_teacher"):
+        module.requires_teacher = config.step == QATStep.PREPARE or module._torchao_npu_original_requires_teacher
     return module

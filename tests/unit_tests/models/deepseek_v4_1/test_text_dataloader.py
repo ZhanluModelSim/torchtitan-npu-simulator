@@ -144,7 +144,7 @@ def test_dp_shards_partition_the_aligned_stream(tokenizer):
         loader.close()
 
 
-def test_the_seam_builds_the_metadata_and_forwards_nothing_extra(monkeypatch):
+def test_packed_preprocessing_provides_frames_and_global_auxiliary_denominator(monkeypatch):
     """The attention backend turns packed positions into the packed frames.
 
     The builder consumes ``positions`` and returns the metadata the layers read; it must not
@@ -155,8 +155,8 @@ def test_the_seam_builds_the_metadata_and_forwards_nothing_extra(monkeypatch):
     model, _ = tiny_v41_model(monkeypatch)
     _, _, extra = preprocess(model, positions, positions, positions)
 
-    # The seam's own keys and nothing else: no ``valid_tokens``, no second mask object.
-    assert set(extra) == {"positions", "attention_metadata"}
+    assert set(extra) == {"positions", "attention_metadata", "aux_loss_denominators"}
+    torch.testing.assert_close(extra["aux_loss_denominators"], torch.tensor([positions.numel()]))
     metadata = extra["attention_metadata"]
     # One entry per ``(backend config, compression ratio)``: the entry *is* one geometry, and
     # ``cu_seq_k`` is that geometry's own grid, so a stack that pools at three ratios carries

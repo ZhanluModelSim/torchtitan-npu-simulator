@@ -167,6 +167,8 @@ class InnerIndexer(Module):
     whole indexer -- the indexer's projections, norms and rope stay where they are.
     """
 
+    requires_teacher = False
+
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
         mode: IndexerMode
@@ -184,7 +186,6 @@ class InnerIndexer(Module):
 
     def __init__(self, config: Config):
         super().__init__()
-        self.num_global_queries: torch.Tensor | None = None
         self.mode = config.mode
         self.compress_ratio = config.compress_ratio
         self.num_index_heads = config.num_index_heads
@@ -403,6 +404,7 @@ class HierarchicalIndexer(Module):
         self.index_head_dim = config.index_head_dim
         self.index_topk = config.index_topk
         self.inner_indexer = config.inner_indexer.build()
+        self.keys_need_grad = self.scores_need_grad = True
         if self.mode is REUSE:
             return
         if config.rope is None or config.wq_b is None or config.weights_proj is None:
@@ -481,6 +483,8 @@ class HierarchicalIndexer(Module):
             idx_k = self.rope(
                 idx_k.unsqueeze(1), positions=attention_metadata.position_k[:: self.compress_ratio]
             ).squeeze(1)
+            if not self.keys_need_grad:
+                idx_k = idx_k.detach()
         else:
             assert idx_k is not None, (
                 "A Reindex Mode indexer rescores the shared index keys, which no preceding Full Mode layer produced."
@@ -503,4 +507,6 @@ class HierarchicalIndexer(Module):
             attention_metadata,
             candidates_BL1C=candidates,
         )
+        if not self.scores_need_grad and topk_scores is not None:
+            topk_scores = topk_scores.detach()
         return idx_k, topk_indices, topk_scores, candidates

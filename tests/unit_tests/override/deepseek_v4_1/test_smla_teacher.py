@@ -5,6 +5,7 @@
 
 import pytest
 import torch
+from torchtitan.models.deepseek_v4.compressor import SparseIndexerLoss
 
 from tests.unit_tests.models.mtp_test_utils import build_cpu_model
 from torchtitan_npu.override.deepseek_v4_1.sparse_attn import ascendc
@@ -79,6 +80,9 @@ def test_smla_carries_the_raw_teacher_to_slikg(monkeypatch, v41_metadata, checkp
         window_size=2,
         softmax_scale=0.5,
         compress_ratio=1,
+        aux_loss=SparseIndexerLoss.Config(
+            coeff=0.7, mass_weighted=True, reduce_mesh="loss", softmax_scale=0.5, num_heads=1, compress_ratio=1
+        ),
         num_heads=1,
         head_dim=4,
         index_topk=3,
@@ -108,6 +112,7 @@ def test_smla_carries_the_raw_teacher_to_slikg(monkeypatch, v41_metadata, checkp
             cmp_k=q.squeeze(1),
             topk_indices=indices,
             topk_scores=scores,
+            aux_loss_denominator=torch.tensor(8.0),
         )
 
     if checkpointed:
@@ -142,7 +147,7 @@ def test_smla_carries_the_raw_teacher_to_slikg(monkeypatch, v41_metadata, checkp
     assert torch.equal(grad[3], torch.zeros(3))
     assert (grad[:3][valid[:3]] != 0).all()
     # Each consumer's backward delivers the mass again, hence the doubling.
-    assert torch.equal(grad[0], torch.tensor([0.0, mass[1] * 2, mass[2] * 2]))
+    torch.testing.assert_close(grad[0], torch.tensor([0.0, mass[1], mass[2]]) * (2 * 0.7 / 8))
 
 
 @pytest.mark.parametrize(

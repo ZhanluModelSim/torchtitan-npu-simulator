@@ -24,11 +24,8 @@ numbering -- the indexer emits it document-local, which is also what the fused k
 read -- so nothing is translated here.  ``positions`` is a per-forward argument, not
 metadata, and only drives RoPE.
 
-The indexer's teacher belongs to a port, not to this core.  It is the operator's per-head
-log-sum-exp of the full softmax (window, selected compressed entries and sink), turned
-into the raw marginal mass ``p`` and emitted on ``topk_scores``' gradient, which the
-indexer's SLIKG backward consumes to train the indexer.  A query row with no reachable
-compressed entry contributes nothing.  Nothing in this file holds a loss.
+A configured mass-weighted SparseIndexerLoss trains the selected logits using the
+full-softmax LSE. Fused attention obtains the corresponding teacher from SMLAG.
 
 The projections use the rope module with the site's un-rotated prefix width.
 The reference forward owns Attention Gym attention; fused ports replace the complete
@@ -39,14 +36,16 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
-from attn_gym.sparse import gather_attn
+from attn_gym.sparse import AuxRequest, GatherAttnAux, gather_attn
 from torch import nn
 from torchtitan.models.common.attention import Attention as BaseAttention
 from torchtitan.models.common.attention import InnerAttention, create_varlen_metadata_for_document
 from torchtitan.models.common.linear import Linear
 from torchtitan.models.common.nn_modules import RMSNorm
 from torchtitan.models.common.rope import RoPE
+from torchtitan.models.deepseek_v4.compressor import SparseIndexerLoss
 
+from torchtitan_npu.models.deepseek_v4.indexer_loss import scale_fused_teacher
 from torchtitan_npu.patches.torchtitan.models.common.linear import BatchedLinear
 
 from .compressor import Compressor
@@ -65,9 +64,11 @@ class CompressedSparseInnerAttention2(InnerAttention):
     sparse pool is addressed on -- a fused port also needs it to translate the metadata's
     document boundaries into its kernel layout -- so it is never guessed from shapes.
 
-    A port that can produce the indexer's teacher replaces this forward wholesale and
-    emits it on ``topk_scores``' gradient; this core has no kernel to make one.
+    The reference uses its full-softmax LSE to distill a configured indexer loss.
+    Fused ports publish the same teacher from SMLAG on the selector's gradient edge.
     """
+
+    scale_fused_teacher = staticmethod(scale_fused_teacher)
 
     @dataclass(kw_only=True, slots=True)
     class Config(InnerAttention.Config):
@@ -77,6 +78,7 @@ class CompressedSparseInnerAttention2(InnerAttention):
         # Carried explicitly rather than guessed from shapes, and the one piece of *this*
         # layer's geometry at which the row's boundaries are read.
         compress_ratio: int
+        aux_loss: SparseIndexerLoss.Config | None = None
 
         @property
         def attention_metadata_key(self):
@@ -125,6 +127,7 @@ class CompressedSparseInnerAttention2(InnerAttention):
         self.window_size = config.window_size
         self.softmax_scale = config.softmax_scale
         self.compress_ratio = config.compress_ratio
+        self.aux_loss = config.aux_loss.build() if config.aux_loss is not None else None
 
     def forward(
         self,
@@ -136,6 +139,8 @@ class CompressedSparseInnerAttention2(InnerAttention):
         cmp_k: torch.Tensor | None = None,
         topk_indices: torch.Tensor | None = None,
         topk_scores: torch.Tensor | None = None,
+        aux_loss_denominator: torch.Tensor | None = None,
+        padding_mask_T: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Args:
             q: Queries of shape ``[T, H, Dk]``.
@@ -148,16 +153,13 @@ class CompressedSparseInnerAttention2(InnerAttention):
             topk_indices: Selected compressed entries ``[B, L, K]``, ``-1`` for unused
                 slots.  The indexer emits them document-local, which is the numbering the
                 operator reads, so they are passed through untouched.
-            topk_scores: Accepted for the forward contract and unused here; it exists so
-                a port that produces the indexer's teacher has somewhere to carry it.
+            topk_scores: Student logits at the selection; invalid slots are ``-inf``.
 
         Returns:
             Attention output of shape ``[T, H, Dk]``.
 
-        This core is the plain reference: it computes attention and nothing else.  The
-        indexer's distillation objective is not here -- it needs this operator's softmax
-        denominator, and a port that can produce it emits the teacher on ``topk_scores``'
-        gradient instead of returning it.
+        A configured aux_loss uses this call's full-softmax LSE, with the explicit
+        step denominator supplied by the block. Only student scores receive its gradient.
         """
         if (cmp_k is None) != (topk_indices is None):
             raise ValueError("cmp_k and topk_indices must be provided together.")
@@ -184,6 +186,9 @@ class CompressedSparseInnerAttention2(InnerAttention):
         # entry folded its ratio there, so the core and the fused port read one set of boundaries.
         cu_seqlens_k = attention_metadata.cu_seq_k
 
+        aux_loss = self.aux_loss if self.training else None
+        if aux_loss is not None and aux_loss_denominator is None:
+            raise RuntimeError("Indexer loss requires aux_loss_denominator.")
         # Attention Gym owns a batched API; the model stream remains folded.
         result = gather_attn(
             q.transpose(0, 1).unsqueeze(0),
@@ -198,9 +203,26 @@ class CompressedSparseInnerAttention2(InnerAttention):
             # TODO: run the fused kernels once they validate this path; ``impl`` is the
             # pinned attn-gym 0.0.16 argument, ``"reference"`` its eager PyTorch path.
             impl="reference",
+            return_aux=AuxRequest(lse=True) if aux_loss is not None else None,
         )
-        assert isinstance(result, torch.Tensor)
-        return result.squeeze(0).transpose(0, 1)
+        if aux_loss is None:
+            assert isinstance(result, torch.Tensor)
+            return result.squeeze(0).transpose(0, 1)
+        assert isinstance(result, tuple)
+        output, gathered = result
+        assert isinstance(gathered, GatherAttnAux) and gathered.lse is not None
+        assert topk_scores is not None and topk_indices is not None and cmp_k is not None
+        return aux_loss(
+            q.detach(),
+            cmp_k.detach(),
+            topk_indices,
+            topk_scores,
+            gathered.lse.squeeze(0).transpose(0, 1).detach(),
+            cu_seqlens,
+            carrier=output.squeeze(0).transpose(0, 1),
+            denominator=aux_loss_denominator,
+            padding_mask_T=padding_mask_T,
+        )
 
 
 class Attention(BaseAttention):
@@ -253,6 +275,11 @@ class Attention(BaseAttention):
         self.indexer = cfg.indexer.build()
         self.attention_metadata_key = cfg.inner_attention.attention_metadata_key
         self.inner_attention = cfg.inner_attention.build()
+        requires_teacher = self.indexer.inner_indexer.requires_teacher
+        if hasattr(self.inner_attention, "uses_fused_indexer"):
+            self.inner_attention.uses_fused_indexer = requires_teacher
+        elif requires_teacher and cfg.inner_attention.aux_loss is not None:
+            raise ValueError("Fused indexer training requires a sparse attention backend that emits its teacher.")
         # The CP mesh this layer restores its key side on, wired by ``parallelize``; ``None`` at
         # one degree, where the metadata carries no plan and nothing moves.
         self.cp_group = None
@@ -272,6 +299,8 @@ class Attention(BaseAttention):
         idx_k: torch.Tensor | None = None,
         topk_indices: torch.Tensor | None = None,
         topk_scores: torch.Tensor | None = None,
+        aux_loss_denominator: torch.Tensor | None = None,
+        padding_mask_T: torch.Tensor | None = None,
         candidates: torch.Tensor | None = None,
     ) -> tuple[
         torch.Tensor,
@@ -329,6 +358,8 @@ class Attention(BaseAttention):
             cmp_k=cmp_k if uses_cmp else None,
             topk_indices=topk_indices if uses_cmp else None,
             topk_scores=topk_scores if uses_cmp else None,
+            aux_loss_denominator=aux_loss_denominator,
+            padding_mask_T=padding_mask_T,
         )
         # Rotate back and project while the rows are still this rank's chunks: every step here is
         # per token, so it commutes with the movement, and ``wo_b``'s output is an order of

@@ -89,7 +89,7 @@ Routed expert 在 `w2` 投影前乘 router score，并回到 BF16；将乘法延
 
 示例：[DeepSeek-V4 小算子基线与被测实现训练指标对齐方法](../../scripts/numerical_alignment/README.md#数值近似对比)，通过 runner 的 `USE_GOLDEN` 比较参考实现（模型默认 attention）和融合实现的 `loss`、`grad_norm`。
 
-参考 attention 的 Top-K 选择本身不给 indexer 提供梯度。V4 参考 Muon recipe 已配置现有 `SparseIndexerLoss`，使 indexer 保持可训练，详见 [Muon 指南](../feature_guides/muon_optimizer.md)。未配置辅助损失的 reference 与融合 selector 的训练目标不同，不能直接把二者的 indexer 梯度或 `grad_norm` 当作同目标对照。对比前应核对两侧的辅助损失配置、系数及参与更新的参数；不能仅由 `USE_GOLDEN` 开关推断训练目标一致。
+V4 和 V4.1 的参考与融合路径都使用 `SparseIndexerLoss` 的质量加权 KL。比较 indexer 梯度或 `grad_norm` 时，固定辅助损失的系数、全局有效 routing token 分母和参与更新的参数，并核对两侧实际选中的槽位。参考路径从前向 LSE 构造 teacher，融合路径在 SMLAG backward 取得 teacher。
 
 训练对比默认使用 `seq_len=4096`；其他长度通过 `--seq-len` 统一指定。
 

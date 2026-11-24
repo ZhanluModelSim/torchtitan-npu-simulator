@@ -101,7 +101,7 @@ def _quantized_forward(
     candidate_topk_blocks: int,
     candidate_block_size: int,
     **options,
-) -> tuple[torch.Tensor, torch.Tensor | None]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """Run QLI for a producer/pool-free layer or QSLI for a searcher."""
     _validate_role(candidate_topk_blocks=candidate_topk_blocks, is_source=is_source, candidate=candidate)
     if candidate is not None and (candidate.ndim != 4 or candidate.shape[0] != 1 or candidate.shape[2] != 1):
@@ -112,27 +112,29 @@ def _quantized_forward(
     if candidate is None:
         # One QLI schedule serves both QLI roles: the candidate writer's width is a launch argument
         # (this layer's own config states it), not part of the metadata, so nothing is chosen here.
-        topk_indices, _, candidate_block_indices, _ = torch.ops.cann_ops_transformer.ds41.quant_lightning_indexer(
-            idx_q_mxfp4,
-            idx_k_mxfp4,
-            idx_w,
-            idx_q_scale,
-            idx_k_scale,
-            topk,
-            QUANT_MODE,
-            metadata=schedules.fwd,
-            return_value=False,
-            candidate_topk_blocks=candidate_topk_blocks,
-            candidate_block_size=candidate_block_size,
-            **options,
+        topk_indices, topk_scores, candidate_block_indices, _ = (
+            torch.ops.cann_ops_transformer.ds41.quant_lightning_indexer(
+                idx_q_mxfp4,
+                idx_k_mxfp4,
+                idx_w,
+                idx_q_scale,
+                idx_k_scale,
+                topk,
+                QUANT_MODE,
+                metadata=schedules.fwd,
+                return_value=True,
+                candidate_topk_blocks=candidate_topk_blocks,
+                candidate_block_size=candidate_block_size,
+                **options,
+            )
         )
-        return topk_indices, candidate_block_indices.unsqueeze(0) if is_source else None
+        return topk_indices, topk_scores, candidate_block_indices.unsqueeze(0) if is_source else None
 
     # The count and the schedule are one object: the search is bound by exactly the prefix QLI
     # published, derived from the lengths rather than read back off the candidate table.  The
     # table travels as ``[B, L, 1, C]`` between layers and a kernel wants ``[T, 1, C]``, so the
     # batch axis is squeezed here rather than at the caller.
-    topk_indices, _ = torch.ops.cann_ops_transformer.ds41.quant_sparse_lightning_indexer(
+    topk_indices, topk_scores = torch.ops.cann_ops_transformer.ds41.quant_sparse_lightning_indexer(
         idx_q_mxfp4,
         idx_k_mxfp4,
         idx_w,
@@ -144,10 +146,10 @@ def _quantized_forward(
         candidate_block_size,
         descale_k=idx_k_scale,
         metadata=schedules.fwd_sparse,
-        return_value=False,
+        return_value=True,
         **options,
     )
-    return topk_indices, candidate
+    return topk_indices, topk_scores, candidate
 
 
 class _QuantV41LightningIndexerTND(torch.autograd.Function):
@@ -164,13 +166,12 @@ class _QuantV41LightningIndexerTND(torch.autograd.Function):
         attention_metadata,
         is_source,
         candidate,
-        num_global_queries,
         candidate_topk_blocks,
         candidate_block_size,
     ):
         # The options and the schedules both come off the same entry, so a launch and the metadata
         # it is handed describe one frame set.
-        topk_indices, candidate_out = _quantized_forward(
+        topk_indices, topk_scores, candidate_out = _quantized_forward(
             idx_q,
             idx_k,
             idx_w,
@@ -182,10 +183,11 @@ class _QuantV41LightningIndexerTND(torch.autograd.Function):
             candidate_block_size=candidate_block_size,
             **kernel_options(ratio=ratio, q=attention_metadata.q, cmp_k=attention_metadata.cmp_k),
         )
-        topk_indices = topk_indices.sort(dim=-1, descending=True).values
-        topk_scores = topk_indices.new_empty(topk_indices.shape, dtype=torch.float32, requires_grad=True)
-
-        ctx.save_for_backward(idx_q, idx_k, idx_w, topk_indices, num_global_queries)
+        topk_indices, order = topk_indices.sort(dim=-1, descending=True)
+        topk_scores = topk_scores.gather(-1, order).float().masked_fill(topk_indices < 0, -torch.inf)
+        ctx.set_materialize_grads(False)
+        ctx.mark_non_differentiable(topk_indices)
+        ctx.save_for_backward(idx_q, idx_k, idx_w, topk_indices)
         ctx.topk = topk
         ctx.ratio = ratio
         # A dataclass, so ``save_for_backward`` cannot take it; the node holds the boundary
@@ -202,13 +204,9 @@ class _QuantV41LightningIndexerTND(torch.autograd.Function):
     ):
         del grad_indices, grad_candidate
         if attn_softmax_l1_norm is None:
-            return (None,) * 11
+            return (None,) * 10
 
-        idx_q, idx_k, idx_w, topk_indices, num_global_queries = ctx.saved_tensors
-        if num_global_queries is None:
-            raise RuntimeError("Set InnerIndexer.num_global_queries before training the indexer")
-        # Match the BF16 path: the trainer counts queries across the full step and DP mesh.
-        attn_softmax_l1_norm = attn_softmax_l1_norm / num_global_queries
+        idx_q, idx_k, idx_w, topk_indices = ctx.saved_tensors
         # The backward rides the same entry, so it launches no AI_CPU operator either, and the
         # SLIKG metadata is the one the BF16 selector would read: the teacher edge is BF16 in both.
         dq, dk, dw, _ = torch.ops.cann_ops_transformer.sparse_lightning_indexer_kl_loss_grad(
@@ -229,7 +227,6 @@ class _QuantV41LightningIndexerTND(torch.autograd.Function):
             None,  # attention_metadata
             None,  # is_source
             None,  # candidate
-            None,  # num_global_queries
             None,  # candidate_topk_blocks
             None,  # candidate_block_size
         )
@@ -238,7 +235,7 @@ class _QuantV41LightningIndexerTND(torch.autograd.Function):
 class QuantV41LightningIndexer(torch.nn.Module):
     """Forward behavior installed on a DeepSeek-V4.1 ``InnerIndexer`` instance."""
 
-    # The module-swap handler binds this forward to a InnerIndexer instance. Declare the
+    # The module-swap handler binds this forward to an InnerIndexer instance. Declare the
     # host-owned fields here so static analysis does not fall back to nn.Module's
     # dynamic attribute type (Module | Tensor).
     index_topk: int
@@ -247,7 +244,6 @@ class QuantV41LightningIndexer(torch.nn.Module):
     candidate_block_size: int
     has_candidate_pool: bool
     mode: str
-    num_global_queries: torch.Tensor | None
 
     def forward(
         self,
@@ -271,7 +267,6 @@ class QuantV41LightningIndexer(torch.nn.Module):
             attention_metadata,
             is_source,
             candidates_BL1C,
-            self.num_global_queries,
             # The width this layer runs with: the sentinel outside the pool, the capacity on the
             # source -- exactly what its own selector config states.
             self.candidate_topk_blocks,

@@ -186,6 +186,8 @@ class QuantV41SparseAttention(DeepSeekV41CompressedSparseInnerAttention2):
     class the same name and is swapped in by ``quantize_`` below.
     """
 
+    uses_fused_indexer = False
+
     @dataclass(kw_only=True, slots=True)
     class Config(DeepSeekV41CompressedSparseInnerAttention2.Config):
         """The reference attention plus the numbers this backend's metadata is sized with."""

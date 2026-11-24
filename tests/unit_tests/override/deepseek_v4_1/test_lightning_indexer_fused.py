@@ -258,15 +258,13 @@ def _tiny_model(monkeypatch, *, fused: bool):
             )
     with torch.random.fork_rng(devices=[]):
         model = build_cpu_model(config)
-    for module in model.modules():
-        if isinstance(module, AscInnerIndexer):
-            module.num_global_queries = torch.tensor(float(_TOKENS.numel()))
     return model
 
 
-def _run_forward_backward(model):
-    _, _, kwargs = preprocess(model, _TOKENS, _TOKENS, _POSITIONS)
-    output = model(_TOKENS, **kwargs)
+def _run_forward_backward(model, *, denominator=None):
+    counts = None if denominator is None else torch.tensor([float(denominator)])
+    inputs, _, kwargs = preprocess(model, _TOKENS, _TOKENS, _POSITIONS, global_routing_token_counts=counts)
+    output = model(inputs, **kwargs)
     output.sum().backward()
     return output
 
@@ -326,8 +324,8 @@ def test_fused_selection_matches_the_reference_selector(monkeypatch):
         assert fused_t == eager_t, t
 
 
-@pytest.mark.parametrize("num_global_queries", [128, 512], ids=["one-row", "four-rows"])
-def test_teacher_uses_global_query_count(monkeypatch, num_global_queries):
+@pytest.mark.parametrize("global_valid_tokens", [128, 512], ids=["one-row", "four-rows"])
+def test_teacher_uses_global_valid_tokens(monkeypatch, global_valid_tokens):
     """All compression ratios share the step denominator; invalid candidates stay zero."""
     seen = {"calls": 0, "teacher": [], "padding": [], "tokens": [], "emitters": 0}
     constant = 1024.0
@@ -370,13 +368,10 @@ def test_teacher_uses_global_query_count(monkeypatch, num_global_queries):
 
     monkeypatch.setattr(torch.ops.cann_ops_transformer, "sparse_flash_mla_grad", fake_smlag)
     model = _tiny_model(monkeypatch, fused=True)
-    for module in model.modules():
-        if isinstance(module, AscInnerIndexer):
-            module.num_global_queries = torch.tensor(float(num_global_queries))
     for parameter in model.parameters():
         parameter.data = parameter.data.to(torch.bfloat16)
     with torch.autocast("cpu", dtype=torch.bfloat16):
-        _run_forward_backward(model)
+        _run_forward_backward(model, denominator=global_valid_tokens)
 
     assert seen["calls"], "SLIKG must be reached for the indexer to train"
     registry = importlib.import_module("torchtitan_npu.models.deepseek_v4_1")
@@ -387,10 +382,11 @@ def test_teacher_uses_global_query_count(monkeypatch, num_global_queries):
     assert seen["calls"] == len(sources), (seen["calls"], sources)
     assert len(set(seen["tokens"])) == 1, set(seen["tokens"])
 
+    scaled_mass = constant / global_valid_tokens
     for teacher, padding in zip(seen["teacher"], seen["padding"], strict=True):
         tokens = seen["tokens"][0]
         assert tokens == _TOKENS.numel(), (tokens, _TOKENS.numel())
-        assert constant > num_global_queries
+        assert constant > global_valid_tokens
         # The ``-1`` slots are SMLAG's junk zeroed out on the way here; the unpadded ones
         # are what the division acts on.
         torch.testing.assert_close(
@@ -401,20 +397,18 @@ def test_teacher_uses_global_query_count(monkeypatch, num_global_queries):
         )
         value = teacher.masked_select(~padding).max().item()
         # Shared index sources accumulate one normalized teacher per contributing layer.
-        contributors = value * num_global_queries / constant
+        contributors = value / scaled_mass
         assert abs(contributors - round(contributors)) < 1e-6, (
-            f"teacher is not a multiple of constant/num_global_queries ({constant}/{num_global_queries}): {value}"
+            f"teacher is not a multiple of constant/global_valid_tokens ({constant}/{global_valid_tokens}): {value}"
         )
         # No source can carry more contributions than there are layers emitting a teacher, and the
         # split across sources is the layer table's business -- a per-call count of SLIKG calls, or
         # a sum over them, would only encode today's topology (some layers feed two sources).
         assert 1 <= round(contributors) <= seen["emitters"], (
             f"the teacher implies {round(contributors)} contributors but only {seen['emitters']} "
-            f"layers emitted one, so the seqlen division ({tokens}) is missing"
+            f"layers emitted one with a global denominator of {global_valid_tokens}"
         )
-        expected = torch.full_like(teacher, constant * round(contributors) / num_global_queries).masked_fill(
-            padding, 0.0
-        )
+        expected = torch.full_like(teacher, scaled_mass * round(contributors)).masked_fill(padding, 0.0)
         torch.testing.assert_close(teacher, expected)
 
 
@@ -618,37 +612,3 @@ def test_the_teacher_sources_are_the_index_source_layers():
     # The debug flavor the seqlen test builds shares this topology, so the frame it measures
     # has this many teacher-carrying layers.
     assert len(sources) == 8
-
-
-def test_global_query_scaling_matches_explicit_distillation_gradient(monkeypatch):
-    selector = _tiny_model(monkeypatch, fused=True).layers["2"].attention.indexer.inner_indexer
-    generator = torch.Generator().manual_seed(42)
-    q = torch.rand(8, selector.num_index_heads, selector.index_head_dim, generator=generator, requires_grad=True)
-    k = torch.rand(4, selector.index_head_dim, generator=generator, requires_grad=True)
-    w = torch.rand(8, selector.num_index_heads, generator=generator, requires_grad=True)
-    selector.num_global_queries = torch.tensor(32.0)
-    indices, scores, _ = selector(q, k, w, _metadata([0, 8], ratio=2), candidates_BL1C=None)
-    teacher = (indices >= 0).float() * 0.25
-    # A later forward's denominator must not change this graph's backward.
-    selector.num_global_queries = torch.tensor(64.0)
-    scores.backward(teacher)
-
-    qr, kr, wr = [x.detach().clone().requires_grad_() for x in (q, k, w)]
-    selected = kr[indices.clamp_min(0)]
-    logits = (torch.einsum("lhd,lkd->lhk", qr, selected).relu() * wr.unsqueeze(-1)).sum(dim=1)
-    logits = logits.masked_fill(indices < 0, -1e9)
-    loss = -(teacher * logits.log_softmax(dim=-1)).sum() / 32
-    expected = torch.autograd.grad(loss, (qr, kr, wr))
-    for actual, reference in zip((q.grad, k.grad, w.grad), expected, strict=True):
-        torch.testing.assert_close(actual, reference, atol=1e-6, rtol=1e-5)
-
-
-def test_indexer_backward_requires_global_query_count(monkeypatch):
-    selector = _tiny_model(monkeypatch, fused=True).layers["2"].attention.indexer.inner_indexer
-    selector.num_global_queries = None
-    q = torch.ones(8, selector.num_index_heads, selector.index_head_dim, requires_grad=True)
-    k = torch.ones(4, selector.index_head_dim, requires_grad=True)
-    w = torch.ones(8, selector.num_index_heads, requires_grad=True)
-    _, scores, _ = selector(q, k, w, _metadata([0, 8], ratio=2), candidates_BL1C=None)
-    with pytest.raises(RuntimeError, match=r"Set InnerIndexer\.num_global_queries"):
-        scores.backward(torch.ones_like(scores))

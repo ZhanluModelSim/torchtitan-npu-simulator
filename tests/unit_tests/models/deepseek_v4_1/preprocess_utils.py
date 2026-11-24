@@ -72,7 +72,9 @@ def tiny_v41_model(monkeypatch, *, configure=None):
     return model, config
 
 
-def preprocess(model, tokens, labels, positions, *, parallel_dims=None, parallelism=None, **batch):
+def preprocess(
+    model, tokens, labels, positions, *, parallel_dims=None, parallelism=None, global_routing_token_counts=None, **batch
+):
     """Run the model's own input preprocessing and return its forward arguments.
 
     The metadata is the seam's product: the model no longer builds one object for every
@@ -82,10 +84,14 @@ def preprocess(model, tokens, labels, positions, *, parallel_dims=None, parallel
     ``batch`` carries the dataloader's other keys (the modality tensors, say) straight into
     ``input_dict``, exactly as the trainer hands them over.
     """
+    if global_routing_token_counts is None:
+        padding = batch.get("padding_mask")
+        global_routing_token_counts = torch.tensor([tokens.numel()]) if padding is None else (~padding).sum().reshape(1)
     inputs, labels, extra_kwargs, _ = model.preprocess_inputs(
         {"input": tokens, "labels": labels, "positions": positions, **batch},
         parallelism_context=_NO_CP_DIMS if parallel_dims is None else parallel_dims,
         parallelism=_NO_SPMD if parallelism is None else parallelism,
+        global_routing_token_counts=global_routing_token_counts,
     )
     assert "attention_metadata" in extra_kwargs, "expected the attention backends to build the metadata map"
     return inputs, labels, extra_kwargs

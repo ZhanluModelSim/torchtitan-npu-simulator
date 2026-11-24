@@ -107,5 +107,5 @@ def quant_lightning_indexer(
         layout_k=layout_k,
         mask_mode=mask_mode,
         cmp_ratio=cmp_ratio,
-        return_value=0,
+        return_value=1,
     )

@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from torchao.quantization.qat import QATStep
 from torchao.quantization.quant_api import quantize_
 from torchao_npu.configs.module_swap_configs.deepseek_v4.quant_lightning_indexer import (
     DeepSeekV4QuantLightningIndexerConfig,
@@ -53,7 +54,7 @@ def test_module_swap_routes_teacher_to_indexer_inputs(monkeypatch, batch):
         seen["forward"] = kwargs
         seen["operands"] = q, k, w
         indices = torch.tensor([0, -1, 1, -1], dtype=torch.int32).repeat(batch * tokens, 1).unsqueeze(1)
-        return indices, None
+        return indices, torch.tensor([[-3.0, 6.0, 9.0, 12.0]]).expand_as(indices)
 
     def slikg(**kwargs):
         seen["backward"] = kwargs
@@ -67,17 +68,20 @@ def test_module_swap_routes_teacher_to_indexer_inputs(monkeypatch, batch):
     monkeypatch.setattr(lightning_indexer, "quant_lightning_indexer", quant_li)
     monkeypatch.setattr(torch.ops.cann_ops_transformer, "sparse_lightning_indexer_kl_loss_grad", slikg, raising=False)
     selector = torch.nn.Identity()
+    selector.requires_teacher = False
     config = DeepSeekV4QuantLightningIndexerConfig(input_adapter=input_adapter)
 
     quantize_(selector, config, filter_fn=lambda module, fqn: module is selector)
     indices, scores = selector(query, key, weights, attention_metadata=metadata)
 
+    assert selector.requires_teacher
     assert selector.forward.__func__ is lightning_indexer.quantized_lightning_indexer_forward
     assert indices.shape == (batch * tokens, topk) and indices.dtype == torch.int32
     assert not indices.requires_grad
     assert scores.shape == indices.shape and scores.dtype == torch.float32
     assert scores.grad_fn is not None
     torch.testing.assert_close(indices[0], torch.tensor([1, 0, -1, -1], dtype=torch.int32))
+    torch.testing.assert_close(scores[0], torch.tensor([9.0, -3.0, -torch.inf, -torch.inf]))
     assert seen["forward"]["metadata"] is forward_record
     assert seen["forward"]["quant_mode"] == 5
     assert seen["forward"]["topk"] == topk
@@ -86,15 +90,14 @@ def test_module_swap_routes_teacher_to_indexer_inputs(monkeypatch, batch):
     ):
         assert operands.shape == expected_shape
 
-    # The real attention emits teacher mass with padding zeroed and softmax_scale applied.
+    # Attention already masked padding and scaled the teacher by the objective coefficient and denominator.
     teacher = torch.tensor([8.0, 4.0, 0.0, 0.0]).expand(batch * tokens, topk)
-    scores.data.fill_(float("nan"))
     scores.backward(teacher)
 
     backward = seen["backward"]
     assert backward["metadata"] is backward_record
     torch.testing.assert_close(backward["sparse_indices"], indices.reshape(batch * tokens, 1, topk))
-    expected_teacher = torch.tensor([1.0 / batch, 0.5 / batch, 0.0, 0.0]).expand(batch * tokens, 1, topk)
+    expected_teacher = teacher.reshape(batch * tokens, 1, topk)
     torch.testing.assert_close(backward["attn_softmax_l1_norm"], expected_teacher, rtol=0, atol=0)
     for name, expected in [
         ("cu_seqlens_q", cu_q),
@@ -109,6 +112,10 @@ def test_module_swap_routes_teacher_to_indexer_inputs(monkeypatch, batch):
     torch.testing.assert_close(query.grad, torch.full_like(query, 2), rtol=0, atol=0)
     torch.testing.assert_close(key.grad, torch.full_like(key, 3), rtol=0, atol=0)
     torch.testing.assert_close(weights.grad, torch.full_like(weights, 4), rtol=0, atol=0)
+    quantize_(
+        selector, DeepSeekV4QuantLightningIndexerConfig(step=QATStep.CONVERT), filter_fn=lambda m, fqn: m is selector
+    )
+    assert not selector.requires_teacher
 
 
 def test_module_swap_rejects_missing_teacher_gradient(monkeypatch):
@@ -131,7 +138,7 @@ def test_module_swap_rejects_missing_teacher_gradient(monkeypatch):
         )
 
     def quant_li(q, *args, **kwargs):
-        return torch.zeros(q.size(0), 1, 1, dtype=torch.int32), None
+        return torch.zeros(q.size(0), 1, 1, dtype=torch.int32), torch.ones(q.size(0), 1, 1)
 
     def slikg(**kwargs):
         pytest.fail("SLIKG must not run without a teacher gradient")
