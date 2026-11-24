@@ -19,6 +19,7 @@ def main(argv=None):
     parser.add_argument("--config", default="deepseek_v4_smoketest")
     parser.add_argument("--optimizer.name", dest="optimizer_name", choices=["AdamW", "Muon"])
     parser.add_argument("--optimizer.muon-ns-steps", dest="muon_ns_steps", type=int)
+    parser.add_argument("--optimizer.muon-bucket-count", dest="muon_bucket_count", type=int)
     parser.add_argument("--simulation.world-size", dest="world_size", type=int, default=1)
     parser.add_argument("--simulation.logical-rank", dest="logical_rank", type=int, default=0)
     parser.add_argument(

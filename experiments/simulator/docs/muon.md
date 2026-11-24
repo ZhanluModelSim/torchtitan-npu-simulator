@@ -17,6 +17,23 @@ TORCH_DEVICE_BACKEND_AUTOLOAD=0 python -m torchtitan_simulator \
 Python 入口为 `simulate(SimulationConfig(optimizer_name="Muon", world_size=8, expert_parallel_degree=2))`。
 `--optimizer.muon-ns-steps`／`muon_ns_steps` 可覆盖 Newton–Schulz 迭代次数，必须为正整数；不指定时保留原生 recipe 值，当前 DSV4 为 10。其余超参继续来自原生配置工厂。显式 AdamW 不重建原生分组；自定义工厂若已 materialize Muon，不能只改名称伪装成 AdamW。
 
+需要对比分桶时，在 SimPlatform 的 `task.toml` 中指定桶数：
+
+```toml
+[training]
+config = "deepseek_v4_smoketest"
+optimizer_name = "Muon"
+muon_bucket_count = 2
+world_size = 8
+data_parallel_shard_degree = 8
+expert_parallel_degree = 1
+seq_len = 128
+```
+
+`muon_bucket_count` 必须是正整数。Simulator 在优化器初始化时按实际传输组和 DistMuon 权重生成对应数量的非空桶。每个传输组至少需要一个桶，桶数上限是当前优化器实例的 DistMuon 权重数；不满足时会报告实际边界。原生 Muon 根据这些桶分配计算卡，AdamW fallback 沿用常规规则。
+
+省略桶数时使用预设自带的分桶规则。Simulator CLI 对应参数为 `--optimizer.muon-bucket-count`。
+
 当前支持 DSV4、TP=CP=PP=1 下的单卡、DP shard、HSDP、EP 及合法组合。小模型回归包含非零 logical rank、MTP、full AC 和激活卸载。Kimi、Muon 量化训练、HSDP replica dedup、原生 swap/virtual optimizer override 均明确拒绝。优化器状态卸载可用独立开关启用，采用下述整段聚合近似。
 
 EP=1 时，FSDP 根据 DP mesh 选择专家权重的存储布局。分片轴大小为 1 时，每个副本都持有完整的专家矩阵。对于沿单个分片轴按行存储（`Shard(1)`）的三维专家权重，DistMuon 在同一分片组内通过 All-to-All 将数据重组为按专家分配的完整矩阵（`Shard(0)`），计算后再将更新方向送回原存储分片。HSDP 的复制轴保留。DistMuon 根据实际 DTensor 布局确定能否重分片。

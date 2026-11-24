@@ -54,10 +54,13 @@ def test_cli_muon_options_reach_native_config(monkeypatch):
 
     # Isolate the expensive capture; config selection and materialization remain real.
     monkeypatch.setattr(runner, "simulate", prepare_config)
-    prepared = main(["--optimizer.name", "Muon", "--optimizer.muon-ns-steps", "7"])
+    prepared = main(
+        ["--optimizer.name", "Muon", "--optimizer.muon-ns-steps", "7", "--optimizer.muon-bucket-count", "3"]
+    )
 
     assert prepared.trainer.optimizer.param_groups[0].optimizer_name == "DistMuon"
     assert prepared.trainer.optimizer.param_groups[0].optimizer_kwargs["ns_steps"] == 7
+    assert prepared.simulation.muon_bucket_count == 3
 
 
 def test_native_muon_factory_keeps_selection_and_applies_simulator_limits(monkeypatch):
@@ -119,6 +122,8 @@ def test_native_muon_factory_rejects_replica_dedup(monkeypatch):
         ({"optimizer_name": "Muon", "enable_quantized_training": True}, "quantized training"),
         ({"muon_ns_steps": 3}, "requires optimizer_name=Muon"),
         ({"optimizer_name": "Muon", "muon_ns_steps": 0}, "positive integer"),
+        ({"muon_bucket_count": 2}, "muon_bucket_count requires optimizer_name=Muon"),
+        ({"optimizer_name": "Muon", "muon_bucket_count": 0}, "muon_bucket_count must be a positive integer"),
         (
             {
                 "optimizer_name": "Muon",
@@ -133,6 +138,8 @@ def test_native_muon_factory_rejects_replica_dedup(monkeypatch):
         "quantized",
         "unused-muon-option",
         "invalid-iterations",
+        "unused-bucket-count",
+        "invalid-bucket-count",
         "native-swap",
     ],
 )

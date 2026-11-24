@@ -53,18 +53,20 @@ class SimulationConfig:
     global_batch_size: int | None = None
     enable_quantized_training: bool = False
     quantization_recipe: Literal["all_mxfp8"] = "all_mxfp8"
-    optimizer_name: Literal["AdamW", "Muon"] | None = None
-    muon_ns_steps: int | None = None
     model_overrides: ModelOverrides | None = None
+    muon_bucket_count: int | None = None
 
     def validate(self):
         if self.optimizer_name not in {None, "AdamW", "Muon"}:
             raise ValueError("optimizer_name must be AdamW or Muon")
         if self.muon_ns_steps is not None and (type(self.muon_ns_steps) is not int or self.muon_ns_steps < 1):
             raise ValueError("muon_ns_steps must be a positive integer")
-        # muon_ns_steps applicability is validated in _prepare_optimizer against
-        # the final optimizer selection (optimizer_name or a native Muon recipe);
-        # an early reject here would also reject legal Muon configurations.
+        if self.muon_bucket_count is not None and (
+            type(self.muon_bucket_count) is not int or self.muon_bucket_count < 1
+        ):
+            raise ValueError("muon_bucket_count must be a positive integer")
+        # Muon option applicability is validated in _prepare_optimizer against
+        # the final optimizer selection (optimizer_name or a native Muon recipe).
         if type(self.memory_offload_optimizer_states) is not bool:
             raise ValueError("memory_offload_optimizer_states must be boolean")
         if type(self.enable_sla2_fusion) is not bool:
@@ -218,8 +220,9 @@ def _prepare_optimizer(simulation: SimulationConfig, trainer: Any, *, materializ
     selected = _optimizer_selection(simulation, trainer)
     optimizer = trainer.optimizer
     if selected != "Muon":
-        if simulation.muon_ns_steps is not None:
-            raise ValueError("muon_ns_steps requires optimizer_name=Muon or a native Muon recipe")
+        for field in ("muon_ns_steps", "muon_bucket_count"):
+            if getattr(simulation, field) is not None:
+                raise ValueError(f"{field} requires optimizer_name=Muon or a native Muon recipe")
         if materialize and simulation.optimizer_name is not None and hasattr(optimizer, "name"):
             optimizer.name = simulation.optimizer_name
         return

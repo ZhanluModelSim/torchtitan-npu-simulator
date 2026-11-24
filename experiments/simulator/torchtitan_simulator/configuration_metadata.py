@@ -36,7 +36,7 @@ _GROUPS = {
         "memory_offload_ac_saved_tensors",
         "memory_offload_optimizer_states",
     ),
-    "execution": ("optimizer_name", "muon_ns_steps"),
+    "execution": ("optimizer_name", "muon_ns_steps", "muon_bucket_count"),
 }
 
 
