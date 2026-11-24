@@ -51,6 +51,12 @@ def main(argv=None):
         "--simulation.memory-offload-optimizer-states", dest="memory_offload_optimizer_states", action="store_true"
     )
     parser.add_argument(
+        "--simulation.enable-sla2-fusion",
+        dest="enable_sla2_fusion",
+        action="store_true",
+        help="Opt-in the multi_head_moe SLA2 virtual fusions; the default runs the reference eager operators",
+    )
+    parser.add_argument(
         "--activation-checkpoint.mode",
         dest="activation_checkpoint_mode",
         choices=["none", "full", "selective"],

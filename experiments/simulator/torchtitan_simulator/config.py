@@ -244,6 +244,7 @@ PRESET_FACTORIES = {
     "qwen3_5_debugmodel_moe": "torchtitan_simulator.presets.qwen3_5_debugmodel_moe",
     "deepseek_v4_1_debugmodel_text": "torchtitan_simulator.presets.deepseek_v4_1_debugmodel_text",
     "multi_head_moe_debugmodel": "torchtitan_simulator.presets.multi_head_moe_debugmodel",
+    "multi_head_moe_debugmodel_head_parallel": "torchtitan_simulator.presets.multi_head_moe_debugmodel_head_parallel",
 }
 
 

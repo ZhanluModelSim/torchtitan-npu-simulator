@@ -599,6 +599,8 @@ class MultiHeadMoEModel(Decoder):
 
     @dataclass(kw_only=True, slots=True)
     class Config(Decoder.Config):
+        head_parallel: bool = False
+
         def update_from_config(self, *, config, **kwargs) -> None:
             Decoder.Config.update_from_config(self, config=config, **kwargs)
             parallelism = config.parallelism
@@ -610,8 +612,36 @@ class MultiHeadMoEModel(Decoder):
                 )
             from .sharding import set_multi_head_moe_sharding_config
 
-            set_multi_head_moe_sharding_config(self, enable_ep=parallelism.expert_parallel_degree > 1)
-            if parallelism.expert_parallel_degree > 1:
+            expert_parallel = parallelism.expert_parallel_degree
+            if self.head_parallel and expert_parallel > 1:
+                # Per-layer fail-fast: layers may carry different MoE
+                # geometries, and a later indivisible layer would otherwise
+                # only surface as a shape error at the first collective.
+                for layer_id, layer_cfg in enumerate(self.layers):
+                    if layer_cfg.moe is None:
+                        continue
+                    moe_heads = layer_cfg.moe.moe_heads
+                    if moe_heads % expert_parallel != 0:
+                        raise ValueError(
+                            f"head parallel requires expert_parallel_degree ({expert_parallel}) "
+                            f"to divide moe_heads ({moe_heads}) on MoE layer {layer_id}"
+                        )
+            set_multi_head_moe_sharding_config(self, enable_ep=expert_parallel > 1)
+            if self.head_parallel:
+                import dataclasses
+
+                from .head_parallel import HeadParallelMultiHeadMoE
+
+                for layer_cfg in self.layers:
+                    if layer_cfg.moe is not None and type(layer_cfg.moe) is not HeadParallelMultiHeadMoE.Config:
+                        layer_cfg.moe = HeadParallelMultiHeadMoE.Config(
+                            **{
+                                field.name: getattr(layer_cfg.moe, field.name)
+                                for field in dataclasses.fields(layer_cfg.moe)
+                                if field.init
+                            }
+                        )
+            elif expert_parallel > 1:
                 from torchtitan.models.common.token_dispatcher import AllToAllTokenDispatcher
 
                 for layer_cfg in self.layers:

@@ -135,6 +135,299 @@ def test_multi_head_moe_ep2_dispatches_all_to_all_and_reaches_iteration():
     assert len(gradients) == _TOTAL_PARAM_TENSORS
 
 
+def test_multi_head_moe_head_parallel_dispatches_static_all_to_all():
+    workload = simulate(
+        SimulationConfig(
+            config="multi_head_moe_debugmodel_head_parallel",
+            seq_len=16,
+            world_size=2,
+            logical_rank=0,
+            expert_parallel_degree=2,
+        )
+    )
+    result = validate_workload(workload)
+    assert result["graph_acyclic"] and result["peak_storage_unique"]
+    nodes = [n for template in workload.step_templates.values() for n in template.nodes.values()]
+    counts = Counter(n.annotations["raw_op_type"] for n in nodes)
+    # 4 MoE layers x (head dispatch + head combine) forward plus their
+    # backward: static shapes, so no token-count exchange precedes the data
+    # all-to-alls (EP mode pays one extra count exchange per direction).
+    assert counts["_c10d_functional.all_to_all_single.default"] == 16
+    comm = [n for n in nodes if n.op_type in ("all_to_all", "reduce_scatter")]
+    assert len(comm) == 16 + 11
+    gradients = workload.iteration.schedule.annotations["gradient_validation"]
+    assert len(gradients) == _TOTAL_PARAM_TENSORS
+
+
+def _moe_layer_module_config(bias: bool):
+    """Standalone small MultiHeadMoE geometry for flavor-level checks."""
+    from torchtitan.models.common.feed_forward import FeedForward
+    from torchtitan.models.common.linear import Linear
+    from torchtitan.models.common.moe import GroupedExperts, LocalTokenDispatcher, RoutedExperts
+
+    from torchtitan_npu.models.multi_head_moe.model import MultiHeadGate, MultiHeadMoE
+
+    def lin(in_features: int, out_features: int) -> Linear.Config:
+        return Linear.Config(in_features=in_features, out_features=out_features, bias=bias)
+
+    return MultiHeadMoE.Config(
+        moe_heads=4,
+        head_hidden=16,
+        proj_in=lin(32, 64),
+        proj_out=lin(64, 32),
+        router=MultiHeadGate.Config(moe_heads=4, head_hidden=16, experts_per_head=8, k_per_head=2),
+        routed_experts=RoutedExperts.Config(
+            inner_experts=GroupedExperts.Config(dim=16, hidden_dim=32, num_experts=32),
+            token_dispatcher=LocalTokenDispatcher.Config(num_experts=32, top_k=2),
+        ),
+        shared_experts=FeedForward.Config(w1=lin(32, 64), w2=lin(64, 32), w3=lin(32, 64)),
+    )
+
+
+def test_multi_head_moe_head_parallel_keeps_linear_bias_and_gradients():
+    """bias=True must stay equivalent to the default module-call path (PR #23 review).
+
+    The head-parallel forward re-projects through bare ``F.linear``; the
+    optional Linear bias has to ride along (outputs match the default flavor
+    and both projection biases receive gradients).
+    """
+    import dataclasses
+
+    import torch
+
+    from torchtitan_npu.models.multi_head_moe.head_parallel import HeadParallelMultiHeadMoE
+
+    base_cfg = _moe_layer_module_config(bias=True)
+    torch.manual_seed(0)
+    base = base_cfg.build()
+    hp_cfg = HeadParallelMultiHeadMoE.Config(
+        **{field.name: getattr(base_cfg, field.name) for field in dataclasses.fields(base_cfg) if field.init}
+    )
+    hp = hp_cfg.build()
+    # GroupedExperts ships uninitialized ``torch.empty`` weights; give every
+    # parameter a deterministic finite init so the comparison is stable.
+    for parameter in base.parameters():
+        torch.nn.init.normal_(parameter, std=0.1)
+    hp.load_state_dict(base.state_dict())
+    x_BLD = torch.randn(2, 5, base_cfg.proj_in.in_features)
+    out_base = base(x_BLD)
+    out_hp = hp(x_BLD)
+    torch.testing.assert_close(out_hp, out_base)
+    out_base.sum().backward()
+    out_hp.sum().backward()
+    torch.testing.assert_close(hp.proj_in.bias.grad, base.proj_in.bias.grad)
+    torch.testing.assert_close(hp.proj_out.bias.grad, base.proj_out.bias.grad)
+
+
+def _biased_head_parallel_preset(*, num_mtp_layers: int = 0):
+    """Debug head-parallel preset with bias=True on both MoE projections.
+
+    ``Linear.Config`` allows ``bias=True`` while every registered preset
+    keeps it off, so the bias flavor rides on the simulator's documented
+    ``module.factory`` escape hatch instead of a new production preset.
+    """
+    if num_mtp_layers:
+        raise ValueError("multi_head_moe has no MTP modules; num_mtp_layers must be 0")
+    from torchtitan_simulator.presets import multi_head_moe_debugmodel_head_parallel
+
+    trainer = multi_head_moe_debugmodel_head_parallel()
+    for layer in trainer.model_spec.model.layers:
+        if layer.moe is not None:
+            layer.moe.proj_in.bias = True
+            layer.moe.proj_out.bias = True
+    return trainer
+
+
+def test_multi_head_moe_head_parallel_bias_capture_reaches_iteration():
+    """End-to-end: a bias=True HP preset builds, captures and grads the biases (PR #23 review)."""
+    workload = simulate(
+        SimulationConfig(
+            config=f"{__name__}._biased_head_parallel_preset",
+            seq_len=16,
+            world_size=2,
+            logical_rank=0,
+            expert_parallel_degree=2,
+        )
+    )
+    result = validate_workload(workload)
+    assert result["graph_acyclic"] and result["peak_storage_unique"]
+    nodes = [n for template in workload.step_templates.values() for n in template.nodes.values()]
+    counts = Counter(n.annotations["raw_op_type"] for n in nodes)
+    # The static all-to-all geometry is unchanged by the bias.
+    assert counts["_c10d_functional.all_to_all_single.default"] == 16
+    # The projections now run with bias: F.linear materializes addmm instead
+    # of mm for the head-parallel proj_in/proj_out (4 MoE layers x 2 projections).
+    assert counts["aten.addmm.default"] == 8
+    gradients = workload.iteration.schedule.annotations["gradient_validation"]
+    # 4 MoE layers x 2 projection biases join the gradient set.
+    assert len(gradients) == _TOTAL_PARAM_TENSORS + 8
+
+
+def test_multi_head_moe_head_parallel_rejects_indivisible_moe_heads_on_later_layer():
+    """Divisibility must fail fast on every MoE layer, not only the first (PR #23 review)."""
+    from torchtitan_simulator.presets import multi_head_moe_debugmodel_head_parallel
+
+    trainer = multi_head_moe_debugmodel_head_parallel()
+    trainer.parallelism.expert_parallel_degree = 4
+    model = trainer.model_spec.model
+    # Front-2/back-2 dense split: MoE layers are 2-5. Layer 2 keeps the
+    # divisible geometry (4 % 4 == 0); layer 3 switches to a self-consistent
+    # 6-head geometry that 4 does not divide.
+    later = model.layers[3].moe
+    assert later is not None
+    later.moe_heads = 6
+    later.proj_in.out_features = 6 * later.head_hidden
+    later.proj_out.in_features = 6 * later.head_hidden
+    later.router.moe_heads = 6
+    later.routed_experts.inner_experts.num_experts = 6 * later.router.experts_per_head
+    with pytest.raises(ValueError, match="MoE layer 3"):
+        model.update_from_config(config=trainer)
+
+
+def test_multi_head_moe_head_parallel_config_tolerates_dense_only_model():
+    """A model without MoE layers must not crash the check with StopIteration (PR #23 review)."""
+    from torchtitan.models.common.feed_forward import FeedForward
+    from torchtitan.models.common.linear import Linear
+    from torchtitan_simulator.presets import multi_head_moe_debugmodel_head_parallel
+
+    trainer = multi_head_moe_debugmodel_head_parallel()
+    trainer.parallelism.expert_parallel_degree = 2
+    model = trainer.model_spec.model
+    for layer in model.layers:
+        if layer.moe is not None:
+            dim = layer.attention.to_q.in_features
+            layer.moe = None
+            layer.feed_forward = FeedForward.Config(
+                w1=Linear.Config(in_features=dim, out_features=128, bias=False),
+                w2=Linear.Config(in_features=128, out_features=dim, bias=False),
+                w3=Linear.Config(in_features=dim, out_features=128, bias=False),
+            )
+    # Must complete (no StopIteration from the divisibility check).
+    model.update_from_config(config=trainer)
+
+
+def _head_parallel_two_rank_worker(rank: int, rendezvous: str, queue) -> None:
+    """Forked gloo worker: uneven token shards fail fast, even shards dispatch (PR #23 review)."""
+    import dataclasses
+    import traceback
+    from datetime import timedelta
+
+    import torch
+    import torch.distributed as dist
+    from torch.distributed.device_mesh import init_device_mesh
+
+    from torchtitan_npu.models.multi_head_moe.head_parallel import HeadParallelMultiHeadMoE
+
+    dist.init_process_group(
+        "gloo", init_method=f"file://{rendezvous}", rank=rank, world_size=2, timeout=timedelta(seconds=30)
+    )
+    try:
+        torch.set_num_threads(1)
+        mesh = init_device_mesh("cpu", (2,), mesh_dim_names=("ep",))
+        base_cfg = _moe_layer_module_config(bias=False)
+        with torch.random.fork_rng():
+            torch.manual_seed(313)
+            module = HeadParallelMultiHeadMoE.Config(
+                **{field.name: getattr(base_cfg, field.name) for field in dataclasses.fields(base_cfg) if field.init}
+            ).build()
+        # GroupedExperts ships uninitialized ``torch.empty`` weights; give
+        # every parameter a deterministic finite init.
+        for parameter in module.parameters():
+            torch.nn.init.normal_(parameter, std=0.1)
+        # Mirror the production EP expert placement: the grouped experts ship
+        # Shard(0) on the expert axis, so rank r holds experts
+        # [r * E/ep, (r+1) * E/ep) and the HP forward routes only the owned
+        # heads' local expert pool (head_local * experts_per_head).
+        experts = module.routed_experts.inner_experts
+        for name in ("w1_EFD", "w2_EDF", "w3_EFD"):
+            parameter = getattr(experts, name)
+            setattr(
+                experts,
+                name,
+                torch.nn.Parameter(parameter.detach().chunk(2, dim=0)[rank].clone()),
+            )
+        module._ep_mesh_override = mesh
+
+        # Uneven token shards must raise before any collective: the static
+        # all-to-alls size every transfer block from the local shard, so a
+        # mismatch would error or hang inside the exchange instead of ever
+        # reaching the reassembly view.
+        tokens = 5 if rank == 0 else 3
+        try:
+            module(torch.randn(1, tokens, base_cfg.proj_in.in_features))
+        except ValueError as error:
+            assert "token shards" in str(error), str(error)
+        else:
+            raise AssertionError("uneven token shards must raise ValueError")
+
+        # Regression sequence for the validation-cache skew (PR #23 review
+        # round 3): even shards dispatch for real, then ONE rank's token
+        # count changes. The validation is uncached, so both ranks enter the
+        # same all-gather on the second call and both raise; a skip keyed on
+        # the unchanged local count would send rank 1 straight to the data
+        # all-to-all and skew the group into a hang.
+        out = module(torch.randn(1, 4, base_cfg.proj_in.in_features))
+        assert tuple(out.shape) == (1, 4, base_cfg.proj_out.out_features)
+
+        tokens = 5 if rank == 0 else 4
+        try:
+            module(torch.randn(1, tokens, base_cfg.proj_in.in_features))
+        except ValueError as error:
+            assert "token shards" in str(error), str(error)
+        else:
+            raise AssertionError("uneven token shards after an even forward must raise ValueError")
+
+        # Back to even shards: repeated forwards keep dispatching for real.
+        out = module(torch.randn(1, 4, base_cfg.proj_in.in_features))
+        assert tuple(out.shape) == (1, 4, base_cfg.proj_out.out_features)
+        queue.put(("ok", rank, ""))
+    except BaseException:
+        queue.put(("error", rank, traceback.format_exc()))
+    finally:
+        dist.destroy_process_group()
+
+
+def test_multi_head_moe_head_parallel_two_rank_token_shard_validation(tmp_path):
+    """Two-rank gloo: uneven ep token shards fail fast before the collectives (PR #23 review).
+
+    Meta capture has no live peers to ask, so the precondition's enforcement
+    is exercised over a real two-rank process group instead: uneven per-rank
+    token counts raise ``ValueError`` on both ranks before any all-to-all
+    (both on the first forward and again after one rank's count changes from
+    an even baseline — the uncached validation keeps both ranks in the same
+    collective), and an even shard set dispatches for real, repeatedly.
+    """
+    import multiprocessing
+
+    from torchtitan_npu.models.multi_head_moe.head_parallel import (
+        HeadParallelMultiHeadMoE,  # noqa: F401 — loaded before the fork so workers inherit it
+    )
+
+    context = multiprocessing.get_context("fork")
+    queue = context.Queue()
+    workers = [
+        context.Process(target=_head_parallel_two_rank_worker, args=(rank, str(tmp_path / "rendezvous"), queue))
+        for rank in range(2)
+    ]
+    try:
+        for worker in workers:
+            worker.start()
+        results = [queue.get(timeout=90) for _ in workers]
+        for worker in workers:
+            worker.join(timeout=15)
+            assert worker.exitcode == 0
+        failures = [text for status, _, text in sorted(results, key=lambda item: item[1]) if status == "error"]
+        if failures:
+            raise AssertionError("two-rank worker failed:\n" + "\n".join(failures))
+    finally:
+        for worker in workers:
+            if worker.is_alive():
+                worker.terminate()
+            if worker.pid is not None:
+                worker.join(timeout=5)
+        queue.close()
+
+
 def test_multi_head_moe_rejects_tensor_parallel_at_config_level():
     with pytest.raises(NotImplementedError, match="tensor parallelism"):
         simulate(

@@ -63,6 +63,21 @@ def multi_head_moe_debugmodel(*, num_mtp_layers: int = 0):
     return _factory()
 
 
+def multi_head_moe_debugmodel_head_parallel(*, num_mtp_layers: int = 0):
+    """Head-parallel variant of the SLA2 + Multi-Head-MoE debug trainer.
+
+    Same debug geometry; the MoE layers swap to ``HeadParallelMultiHeadMoE``
+    (static head-ownership all-to-alls instead of token-choice dispatch).
+    """
+    if num_mtp_layers:
+        raise ValueError("multi_head_moe has no MTP modules; num_mtp_layers must be 0")
+    from torchtitan_npu.models.multi_head_moe.config_registry import (
+        multi_head_moe_debugmodel_head_parallel as _factory,
+    )
+
+    return _factory()
+
+
 def _deepseek_v4_1_trainer_config(factory_name: str, *, num_mtp_layers: int = 0):
     """Build a native DeepSeek-V4.1 TrainerEx.Config through the main package.
 
