@@ -22,10 +22,9 @@ if TYPE_CHECKING:
     from torchtitan.distributed.flex_shard.dist_muon import _ParameterComputeLayout
 
 
-def _bucket_configs_for_count(layouts: Sequence[_ParameterComputeLayout], count: int) -> tuple[BucketConfig, ...]:
-    if count > len(layouts):
-        raise ValueError(f"muon_bucket_count={count} exceeds the {len(layouts)} DistMuon parameters")
-
+def _bucket_configs_for_count(
+    layouts: Sequence[_ParameterComputeLayout], count: int | None
+) -> tuple[BucketConfig, ...]:
     groups: dict[tuple[str, tuple[int, ...]], list[str]] = {}
     local: list[str] = []
     for layout in layouts:
@@ -40,6 +39,10 @@ def _bucket_configs_for_count(layouts: Sequence[_ParameterComputeLayout], count:
         key = (axis_name, tuple(mesh[axis_name].mesh.tolist()))
         groups.setdefault(key, []).append(layout.fqn)
 
+    if count is None:
+        count = max(1, len(groups))
+    if count > len(layouts):
+        raise ValueError(f"muon_bucket_count={count} exceeds the {len(layouts)} DistMuon parameters")
     if count < len(groups):
         raise ValueError(f"muon_bucket_count={count} is too small for {len(groups)} distinct transport groups")
     if count == 1:
@@ -72,6 +75,7 @@ def install_meta_muon(scope, *, bucket_count: int | None = None) -> dict[str, st
     original_storage = DistMuon._validate_parameter_storage
     original_plan = DistMuon._validate_plan_across_ranks
     original_update = DistMuon._apply_update
+    original_bind = dist_muon._bind_bucket_configs
 
     def meta_parameters(optimizer):
         parameters = [parameter for group in optimizer.param_groups for parameter in group["params"]]
@@ -99,17 +103,15 @@ def install_meta_muon(scope, *, bucket_count: int | None = None) -> dict[str, st
         with capture_parameter_update(compute_layout.param, compute_layout.fqn):
             return original_update(optimizer, compute_layout, direction)
 
+    @wraps(original_bind)
+    def bind_bucket_configs(configs, layouts, **kwargs):
+        configs = _bucket_configs_for_count(layouts, bucket_count)
+        return original_bind(configs, layouts, **kwargs)
+
     scope.replace(DistMuon, "_validate_parameter_storage", validate_storage)
     scope.replace(DistMuon, "_validate_plan_across_ranks", validate_plan)
     scope.replace(DistMuon, "_apply_update", apply_update)
-    if bucket_count is not None:
-        original_bind = dist_muon._bind_bucket_configs
-
-        def bind_bucket_configs(configs, layouts, **kwargs):
-            configs = _bucket_configs_for_count(layouts, bucket_count)
-            return original_bind(configs, layouts, **kwargs)
-
-        scope.replace(dist_muon, "_bind_bucket_configs", bind_bucket_configs)
+    scope.replace(dist_muon, "_bind_bucket_configs", bind_bucket_configs)
     return {
         "muon_execution": "native DistMuon compute, redistribution, streams and events on Meta",
         "muon_peer_plan_validation": "not_performed_single_logical_rank; native local plan checks retained",

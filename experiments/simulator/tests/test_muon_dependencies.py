@@ -86,6 +86,7 @@ def test_native_muon_alltoall_prefetch_keeps_overlap_and_buffer_reuse_dependenci
     workload = simulate(
         SimulationConfig(
             optimizer_name="Muon",
+            muon_bucket_count=9,
             world_size=8,
             expert_parallel_degree=2,
             seq_len=128,
@@ -110,7 +111,7 @@ def test_native_muon_alltoall_prefetch_keeps_overlap_and_buffer_reuse_dependenci
 
     matmuls = {"aten.mm.default", "aten.addmm.default", "aten.bmm.default", "aten.baddbmm.default"}
     bucket_nodes = []
-    # Four decoder dense buckets, four experts buckets, and the mHC head.
+    # Use nine buckets to exercise prefetch and slot reuse across several buckets.
     # With EFSDP=4 and EP=2 each expert matrix is row-sharded and needs redistribution.
     assert len(observations) == 9
     assert sum("inner_experts" in name for item in observations for name in item["redistributed"]) == 12

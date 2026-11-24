@@ -11,8 +11,14 @@ from torchtitan_simulator.runner import simulate
 
 @pytest.mark.parametrize(
     "ep, count, expected",
-    [(1, 1, ("all",)), (1, 3, ("bucket_1", "bucket_2", "bucket_3")), (2, 2, ("bucket_1", "bucket_2"))],
-    ids=["single", "three", "two-transport-groups"],
+    [
+        (1, None, ("all",)),
+        (2, None, ("bucket_1", "bucket_2")),
+        (1, 1, ("all",)),
+        (1, 3, ("bucket_1", "bucket_2", "bucket_3")),
+        (2, 2, ("bucket_1", "bucket_2")),
+    ],
+    ids=["default-single", "default-two-transport-groups", "explicit-single", "explicit-three", "explicit-two"],
 )
 def test_configured_muon_count_builds_nonempty_native_plans(monkeypatch, ep, count, expected):
     original = DistMuon._initialize_plan
@@ -21,7 +27,7 @@ def test_configured_muon_count_builds_nonempty_native_plans(monkeypatch, ep, cou
     def initialize_plan(optimizer, layouts):
         original(optimizer, layouts)
         observed.append(tuple(spec.name for spec in optimizer._specs))
-        assert len(optimizer._bucket_plans) == count
+        assert len(optimizer._bucket_plans) == len(expected)
 
     monkeypatch.setattr(DistMuon, "_initialize_plan", initialize_plan)
     simulate(

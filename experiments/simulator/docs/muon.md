@@ -32,7 +32,7 @@ seq_len = 128
 
 `muon_bucket_count` 必须是正整数。Simulator 在优化器初始化时按实际传输组和 DistMuon 权重生成对应数量的非空桶。每个传输组至少需要一个桶，桶数上限是当前优化器实例的 DistMuon 权重数；不满足时会报告实际边界。原生 Muon 根据这些桶分配计算卡，AdamW fallback 沿用常规规则。
 
-省略桶数时使用预设自带的分桶规则。Simulator CLI 对应参数为 `--optimizer.muon-bucket-count`。
+省略桶数时，模拟器使用当前布局所需的最少桶数。只有一个传输组或全部权重可就地计算时，所有 DistMuon 权重放入一个桶。存在多个独立传输组时，每组使用一个桶。Simulator CLI 对应参数为 `--optimizer.muon-bucket-count`。
 
 当前支持 DSV4、TP=CP=PP=1 下的单卡、DP shard、HSDP、EP 及合法组合。小模型回归包含非零 logical rank、MTP、full AC 和激活卸载。Kimi、Muon 量化训练、HSDP replica dedup、原生 swap/virtual optimizer override 均明确拒绝。优化器状态卸载可用独立开关启用，采用下述整段聚合近似。
 
@@ -71,7 +71,7 @@ Python 提交顺序不等于跨流执行依赖。下一 bucket 的 inbound all-t
 
 每次 logical-world 会话将显式 Meta 的 `torch.get_device_module` 查询绑定到本轮设备模块，其他设备沿用原查询，退出后恢复。PyTorch 缓存旧 Meta handle 会导致后续会话的原生流上下文与捕获器看到的上下文不同，错误地把通信归入计算流。该适配避免跨会话缓存造成的虚假串行；依赖测试先执行一个真实 Muon 会话，再检查下一会话的重叠关系。
 
-`tests/test_muon_dependencies.py` 对最终交付图验证必要等待、双向不可达的独立工作及 buffer 复用保护。DSV4 debug、world=8、EP=2、rank=0 的测试覆盖 9 个重分布 bucket 和 18 次原生 all-to-all；这些数量是该配置的预期，不是全模型常数。通信保留有序 ranks、split sizes、shape/dtype、流及正式前驱。
+`tests/test_muon_dependencies.py` 对最终交付图验证必要等待、双向不可达的独立工作及 buffer 复用保护。DSV4 debug、world=8、EP=2、rank=0 的测试显式指定 9 个重分布 bucket，覆盖 18 次原生 all-to-all。通信保留有序 ranks、split sizes、shape/dtype、流及正式前驱。
 
 ## 验证入口与边界
 

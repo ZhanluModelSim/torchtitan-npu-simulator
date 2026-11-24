@@ -65,7 +65,11 @@ def _field(path: list[str], annotation: str, default: object, group: str) -> dic
         "kind": kind,
         "default": default,
         "choices": choices,
-        "help": "Inherited from the native preset when absent.",
+        "help": (
+            "When absent, use the minimum number of buckets allowed by the transport groups."
+            if path == ["muon_bucket_count"]
+            else "Inherited from the native preset when absent."
+        ),
     }
 
 

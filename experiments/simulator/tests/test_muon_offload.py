@@ -19,7 +19,7 @@ def _nodes(workload):
     "world, ep, workspace_sizes",
     [
         (1, 1, [4_194_304]),
-        (8, 2, [1_096_704, 2_621_440, 524_288, 2_097_152, 393_216, 786_432, 131_072, 262_144]),
+        (8, 2, [131_072, 262_144, 524_288, 1_572_864, 2_097_152, 3_145_728, 3_553_280, 9_830_400]),
     ],
     ids=["local-scratch", "redistributed-double-buffer"],
 )
@@ -113,5 +113,5 @@ def test_muon_aggregate_offload_retains_workspace_and_native_dependencies(monkey
         for node in source.values()
         if node.op_type == "all_to_all" and node.annotations.get("comp_type") == "OPTIMIZER"
     ]
-    assert len(alltoalls) == (0 if world == 1 else 18)
+    assert len(alltoalls) == (0 if world == 1 else 4)
     assert all(node.op_id in window for node in alltoalls)
