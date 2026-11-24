@@ -1,5 +1,8 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
 # Source: https://gitcode.com/ascend-nova/novaswap
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
 
 """Global swap API keyed by globally unique tensor names."""
 
@@ -11,13 +14,21 @@ import torch
 # Remove when: this backend is moved to a shared upstream swap package.
 from .swap_engine import SwapEngine
 from .swap_ir import ActionManager, SwapAction
-from .swap_registry import SwapRegistry
+from .swap_registry import SwapGroupRegistration, SwapRegistry
 
 metainfo = {}
 
 
 def register_tensor(tensor: torch.Tensor | Sequence[torch.Tensor], tensor_name: str) -> None:
     SwapRegistry.register_tensor(tensor, tensor_name)
+
+
+def register_group(
+    tensors: Sequence[torch.Tensor],
+    tensor_name: str,
+) -> SwapGroupRegistration:
+    """Register a packed multi-tensor payload and return its byte layout."""
+    return SwapRegistry.register_group(tuple(tensors), tensor_name)
 
 
 def pop_tensor_by_name(tensor_name: str):
@@ -60,6 +71,21 @@ def get_hook_registry():
 
 def execute(tensor_name: str, action_type: str) -> None:
     SwapEngine.execute(SwapAction(tensor_name, "", action_type))
+
+
+def restore(tensor_name: str) -> None:
+    """Submit an idempotent restore of a previously offloaded payload."""
+    execute(tensor_name, "H2D")
+
+
+def wait_device_if_needed(tensor_name: str) -> None:
+    """Make a restored payload visible to the current stream exactly once."""
+    execute(tensor_name, "WAIT_DEVICE")
+
+
+def offload(tensor_name: str) -> None:
+    """Submit D2H for one payload."""
+    execute(tensor_name, "D2H")
 
 
 def submit(tensor_name: str, action_type: str, hook_name: str) -> None:

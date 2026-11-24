@@ -1,5 +1,8 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
 # Source: https://gitcode.com/ascend-nova/novaswap
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
 
 import queue
 import threading
@@ -14,8 +17,10 @@ from .storage.pinned_cpu_memory_pool import PinnedCpuStorage
 # Remove when: this backend is moved to a shared upstream swap package.
 from .swap_ir import ActionManager
 from .swap_primitive import (
+    SwapGroupHandle,
     SwapHandle,
     d2h,
+    d2h_group,
     h2d,
     validate_tensor_for_swap,
 )
@@ -231,7 +236,8 @@ class SwapEngine:
             if previous_handles is not None:
                 if not all(handle.transfer == "H2D" and handle.device_waited for handle in previous_handles):
                     raise AssertionError(f"D2H requires a WAIT_DEVICE-completed H2D handle for {tensor_name!r}")
-                if len(previous_handles) != len(entry.storage_tensors):
+                expected_handle_count = 1 if entry.group_registration is not None else len(entry.storage_tensors)
+                if len(previous_handles) != expected_handle_count:
                     raise AssertionError(f"Swap handle group size changed for {tensor_name!r}")
 
             tensors = entry.storage_tensors
@@ -241,20 +247,32 @@ class SwapEngine:
                 validate_tensor_for_swap(tensor)
             _reject_duplicate_storage(detached_tensors, tensor_name)
 
-            handles = []
+            submitted_handles: list[SwapHandle] = []
             try:
-                for tensor in detached_tensors:
-                    # Persistent state uses a fresh destination. WAIT_DEVICE is
-                    # device-side only and does not make the old H2D source safe
-                    # for immediate host-side reuse.
-                    handles.append(d2h(tensor, cls._offload_stream, owner=tensor_name))
+                registration = entry.group_registration
+                if registration is not None:
+                    submitted_handles.append(
+                        d2h_group(
+                            detached_tensors,
+                            tuple(member.byte_offset for member in registration.members),
+                            registration.total_bytes,
+                            cls._offload_stream,
+                            owner=tensor_name,
+                        )
+                    )
+                else:
+                    for tensor in detached_tensors:
+                        # Persistent state uses a fresh destination. WAIT_DEVICE is
+                        # device-side only and does not make the old H2D source safe
+                        # for immediate host-side reuse.
+                        submitted_handles.append(d2h(tensor, cls._offload_stream, owner=tensor_name))
             except Exception:
-                for handle in handles:
+                for handle in submitted_handles:
                     _wait(handle)
                     _release_cpu(handle)
                 raise
 
-            group_handles = tuple(handles)
+            group_handles = tuple(submitted_handles)
             if previous_handles is not None:
                 for handle in previous_handles:
                     release_worker.enqueue(tensor_name, handle, "cpu")
@@ -440,6 +458,10 @@ def _release_cpu(handle: SwapHandle) -> None:
 
 
 def _release_npu(handle: SwapHandle) -> None:
+    if isinstance(handle, SwapGroupHandle):
+        for tensor in handle.tensors_npu:
+            tensor.untyped_storage().resize_(0)
+        return
     if handle.tensor_npu is not None:
         handle.tensor_npu.untyped_storage().resize_(0)
 

@@ -41,6 +41,8 @@ logger = logging.getLogger(__name__)
 
 _ADAMW_SWAP_BUCKET_TIMES = 16
 _ADAMW_SWAP_RESIDENT_TARGET_BUCKETS = 3
+_MUON_SWAP_GROUP_MAX_BYTES = 512 * 1024 * 1024
+_MUON_SWAP_RESIDENT_GROUPS = 2
 
 
 class _CheckpointMetadata(TypedDict):
@@ -805,6 +807,270 @@ def cpu_offload(
     return derive(cfg, CpuOffloadOptimizersContainer.Config)
 
 
+@dataclass(frozen=True, slots=True)
+class _MuonSwapPlanKey:
+    kind: str
+    unredistributed_fqns: tuple[str, ...]
+    redistributed_fqns: tuple[str, ...]
+
+
+@dataclass(slots=True)
+class _MuonSwapGroup:
+    name: str
+    kind: str
+    plan_key: _MuonSwapPlanKey
+    layouts: tuple[Any, ...]
+    state_nbytes: int = 0
+    registered_layout_ids: frozenset[int] = frozenset()
+    first_consumer_layout_id: int | None = None
+    last_consumer_layout_id: int | None = None
+    registered: bool = False
+
+
+class _MuonSwapAdapter:
+    """Own Muon momentum in bounded groups without changing FlexShard plans."""
+
+    def __init__(
+        self, optimizer: DistMuon, model_part: int, locations: dict[tuple[torch.Tensor, str], tuple[str, int]]
+    ):
+        self.optimizer = optimizer
+        self.locations = locations
+        self.ordered_plans = tuple(getattr(optimizer, "_bucket_plans", ()))
+        self.groups: dict[_MuonSwapPlanKey, tuple[_MuonSwapGroup, ...]] = {}
+        self.owner: dict[int, _MuonSwapGroup] = {}
+        self.payloads: list[_MuonSwapGroup] = []
+        self.payload_index: dict[int, int] = {}
+        self._resident_groups: deque[_MuonSwapGroup] = deque()
+        self._resident_group_ids: set[int] = set()
+        self._resident_bytes = 0
+        for index, plan in enumerate(self.ordered_plans):
+            key = self.key(plan)
+            if key in self.groups:
+                raise RuntimeError(f"duplicate Muon swap plan key: {key!r}")
+            redistributed = getattr(plan, "redistributed_items", None)
+            kinds = (
+                (("local", tuple(plan.items)),)
+                if redistributed is None
+                else (
+                    ("redistributed", tuple(redistributed)),
+                    ("unredistributed", tuple(plan.unredistributed_items)),
+                )
+            )
+            groups: list[_MuonSwapGroup] = []
+            for kind, layouts in kinds:
+                if not layouts:
+                    continue
+                for group_index, group_layouts in enumerate(self._split_group_layouts(layouts)):
+                    group = _MuonSwapGroup(
+                        f"muon.{model_part}.plan.{index}.{kind}.{group_index}",
+                        kind,
+                        key,
+                        group_layouts,
+                    )
+                    groups.append(group)
+                    self.payloads.append(group)
+                    for layout in group_layouts:
+                        if id(layout) in self.owner:
+                            raise RuntimeError(f"Muon layout {layout.fqn!r} belongs to multiple swap payloads")
+                        self.owner[id(layout)] = group
+            self.groups[key] = tuple(groups)
+        self.payload_index = {id(group): index for index, group in enumerate(self.payloads)}
+
+    @staticmethod
+    def key(plan: Any) -> _MuonSwapPlanKey:
+        redistributed = getattr(plan, "redistributed_items", None)
+        if redistributed is None:
+            return _MuonSwapPlanKey("local", tuple(layout.fqn for layout in plan.items), ())
+        return _MuonSwapPlanKey(
+            "redistribution",
+            tuple(layout.fqn for layout in plan.unredistributed_items),
+            tuple(layout.fqn for layout in redistributed),
+        )
+
+    def _local(self, layout: Any) -> torch.Tensor | None:
+        state = self.optimizer.state.get(layout.param)
+        if state is None or "momentum_buffer" not in state:
+            return None
+        local = _local_tensor(state["momentum_buffer"])
+        return local if local.numel() else torch.empty(0, device=local.device, dtype=local.dtype)
+
+    def _layout_size(self, layout: Any) -> tuple[int, int]:
+        local = self._local(layout)
+        if local is None:
+            # DistMuon creates momentum with zeros_like(grad); use the parameter before gradients exist.
+            grad = layout.param.grad
+            local = _local_tensor(grad if grad is not None else layout.param)
+        return local.numel() * local.element_size(), local.element_size()
+
+    def _split_group_layouts(self, layouts: tuple[Any, ...]) -> Iterator[tuple[Any, ...]]:
+        current: list[Any] = []
+        current_bytes = 0
+        for layout in layouts:
+            layout_bytes, alignment = self._layout_size(layout)
+            padding = -current_bytes % alignment if layout_bytes else 0
+            if current and current_bytes + padding + layout_bytes > _MUON_SWAP_GROUP_MAX_BYTES:
+                yield tuple(current)
+                current = []
+                current_bytes = 0
+                padding = 0
+            if layout_bytes > _MUON_SWAP_GROUP_MAX_BYTES:
+                yield (layout,)
+            else:
+                current.append(layout)
+                current_bytes += padding + layout_bytes
+        if current:
+            yield tuple(current)
+
+    def finalize_registration(self, *, require_complete: bool) -> None:
+        for plan_groups in self.groups.values():
+            for group in plan_groups:
+                if group.registered:
+                    continue
+                members = tuple((layout, self._local(layout)) for layout in group.layouts)
+                missing = [layout.fqn for layout, local in members if local is None]
+                if missing:
+                    if require_complete:
+                        raise RuntimeError(f"Muon group {group.name!r} is missing momentum state for {missing!r}")
+                    continue
+                nonempty = tuple((layout, local) for layout, local in members if local is not None and local.numel())
+                if not nonempty:
+                    group.registered = True
+                    continue
+                registration = swap_api.register_group(tuple(local for _, local in nonempty), group.name)
+                member_ids = frozenset(id(layout) for layout, _ in nonempty)
+                group.registered_layout_ids = member_ids
+                group.first_consumer_layout_id = id(nonempty[0][0])
+                group.last_consumer_layout_id = id(nonempty[-1][0])
+                group.state_nbytes = registration.total_bytes
+                for (layout, _), member in zip(nonempty, registration.members, strict=True):
+                    self.locations[(layout.param, "momentum_buffer")] = (group.name, member.byte_offset)
+                swap_api.offload(group.name)
+                group.registered = True
+
+    def materialize_current(
+        self,
+        plan: Any,
+        materialize: Callable[[Any], None],
+    ) -> None:
+        """Create one plan's missing state without retaining all groups on NPU."""
+        for group in self.groups.get(self.key(plan), ()):
+            for layout in group.layouts:
+                if self._local(layout) is None:
+                    materialize(layout)
+            self.finalize_registration(require_complete=False)
+            if group.registered_layout_ids:
+                self._wait_for_checkpoint_release(group.name)
+
+    def materialize_group(self, layout: Any, materialize: Callable[[Any], None]) -> None:
+        """Create the complete owning group before its first local use."""
+        group = self.owner.get(id(layout))
+        if group is None:
+            materialize(layout)
+            return
+        for candidate in group.layouts:
+            if self._local(candidate) is None:
+                materialize(candidate)
+        self.finalize_registration(require_complete=False)
+        if group.registered_layout_ids:
+            self._wait_for_checkpoint_release(group.name)
+
+    def _wait_for_checkpoint_release(self, tensor_name: str) -> None:
+        """Retire one checkpoint payload before materializing the next one."""
+        if swap_api.get_handle_phase(tensor_name) != "D2H":
+            swap_api.offload(tensor_name)
+        swap_api.wait_for_device_release(tensor_name)
+
+    def materialize_all_for_checkpoint(self, materialize: Callable[[Any], None]) -> None:
+        """Create DCP targets group-by-group without whole-optimizer residency."""
+        for plan in self.ordered_plans:
+            plan_groups = self.groups.get(self.key(plan), ())
+            for group in plan_groups:
+                for layout in group.layouts:
+                    if self._local(layout) is None:
+                        materialize(layout)
+                self.finalize_registration(require_complete=False)
+                if group.registered_layout_ids:
+                    self._wait_for_checkpoint_release(group.name)
+
+        self.finalize_registration(require_complete=True)
+
+    def group_for(self, layout: Any) -> _MuonSwapGroup | None:
+        group = self.owner.get(id(layout))
+        return group if group is not None and id(layout) in group.registered_layout_ids else None
+
+    @property
+    def _resident_budget(self) -> int:
+        # Conservatively reserve both state and equally sized H2D staging for each resident group.
+        return 2 * _MUON_SWAP_RESIDENT_GROUPS * _MUON_SWAP_GROUP_MAX_BYTES
+
+    def _reserve(self, group: _MuonSwapGroup) -> None:
+        if id(group) in self._resident_group_ids:
+            return
+        required_bytes = 2 * group.state_nbytes
+        budget = max(self._resident_budget, required_bytes)
+        while self._resident_groups and self._resident_bytes + required_bytes > budget:
+            oldest = self._resident_groups[0]
+            assert swap_api.get_handle_phase(oldest.name) == "D2H", "Cannot evict a live Muon group"
+            swap_api.wait_for_device_release(oldest.name)
+            self._resident_groups.popleft()
+            self._resident_group_ids.remove(id(oldest))
+            self._resident_bytes -= 2 * oldest.state_nbytes
+        self._resident_groups.append(group)
+        self._resident_group_ids.add(id(group))
+        self._resident_bytes += required_bytes
+
+    def restore(self, group: _MuonSwapGroup) -> None:
+        self.finalize_registration(require_complete=False)
+        if not group.registered_layout_ids:
+            return
+        if swap_api.get_handle_phase(group.name) == "D2H":
+            self._reserve(group)
+            swap_api.restore(group.name)
+
+    def first_consumed_group(self, plan: Any) -> _MuonSwapGroup | None:
+        self.finalize_registration(require_complete=False)
+        for group in self.groups.get(self.key(plan), ()):
+            if group.registered_layout_ids:
+                return group
+        return None
+
+    def prefetch_first_consumed_group(self, plan: Any) -> None:
+        group = self.first_consumed_group(plan)
+        if group is not None:
+            self.restore(group)
+
+    def prefetch_first_plan(self) -> None:
+        if self.ordered_plans:
+            self.prefetch_first_consumed_group(self.ordered_plans[0])
+
+    def next_consumed_group(self, group: _MuonSwapGroup) -> _MuonSwapGroup | None:
+        self.finalize_registration(require_complete=False)
+        start = self.payload_index[id(group)] + 1
+        for candidate in self.payloads[start:]:
+            if candidate.registered_layout_ids:
+                return candidate
+        return None
+
+    def prefetch_successor(self, group: _MuonSwapGroup) -> None:
+        successor = self.next_consumed_group(group)
+        if successor is not None:
+            # Load oversized singletons on demand instead of overlapping their residency.
+            if max(group.state_nbytes, successor.state_nbytes) > _MUON_SWAP_GROUP_MAX_BYTES:
+                return
+            self.restore(successor)
+
+    def wait_for(self, layout: Any) -> _MuonSwapGroup | None:
+        group = self.group_for(layout)
+        if group is not None:
+            self.restore(group)
+            swap_api.wait_device_if_needed(group.name)
+        return group
+
+    def finish_prepare(self, group: _MuonSwapGroup, layout: Any) -> None:
+        if id(layout) == group.last_consumer_layout_id:
+            swap_api.offload(group.name)
+
+
 class OptimizerStateSwapContainer(OptimizersContainer):
     supports_async_with_pinned_mem = False
 
@@ -847,15 +1113,59 @@ class OptimizerStateSwapContainer(OptimizersContainer):
         setattr(optimizer, "_torchtitan_npu_checkpoint_locations", checkpoint_locations)  # noqa: B010
         original_momentum = optimizer._momentum
         original_prepare_local = optimizer._prepare_local
+        original_preflight_step = getattr(optimizer, "_preflight_step", None)
         runtime = optimizer._redistribution_runtime
         original_enqueue_storage_to_compute = runtime._enqueue_storage_to_compute
+        adapter = _MuonSwapAdapter(optimizer, model_part, checkpoint_locations)
+        setattr(optimizer, "_torchtitan_npu_muon_swap_adapter", adapter)  # noqa: B010
         deferred_d2h_names: list[str] | None = None
+        bootstrap_active = original_preflight_step is not None and not optimizer._first_step_validated
+        bootstrap_complete = False
+
+        def has_all_momentum() -> bool:
+            return all(
+                "momentum_buffer" in optimizer.state[layout.param] for layout in optimizer._parameter_compute_layouts
+            )
+
+        def finish_bootstrap_if_complete() -> None:
+            nonlocal bootstrap_complete
+            if not bootstrap_active or bootstrap_complete or not has_all_momentum():
+                return
+            adapter.finalize_registration(require_complete=True)
+            optimizer._first_step_validated = True
+            bootstrap_complete = True
+
+        def preflight_step(optimizer_self) -> None:
+            nonlocal bootstrap_active
+            preflight = original_preflight_step
+            assert preflight is not None
+            if not bootstrap_active:
+                preflight()
+            elif has_all_momentum():
+                adapter.finalize_registration(require_complete=True)
+                bootstrap_active = False
+                preflight()
+            else:
+
+                def validate_only_momentum(_optimizer_self, _compute_layout, _grad):
+                    return None
+
+                materializing_momentum = optimizer_self._momentum
+                optimizer_self._momentum = MethodType(validate_only_momentum, optimizer_self)
+                try:
+                    preflight()
+                finally:
+                    optimizer_self._momentum = materializing_momentum
+                optimizer_self._first_step_validated = False
+            adapter.prefetch_first_plan()
 
         def momentum(optimizer_self, compute_layout, grad):
             state = optimizer_self.state[compute_layout.param]
             created = "momentum_buffer" not in state
             result = original_momentum(compute_layout, grad)
             if not created:
+                return result
+            if id(compute_layout) in adapter.owner:
                 return result
             local = _local_tensor(result)
             if local.numel() == 0:
@@ -879,14 +1189,7 @@ class OptimizerStateSwapContainer(OptimizersContainer):
                 return
             name = make_swap_state_name("optimizer_state", model_part, compute_layout.fqn, "momentum_buffer")
             if swap_api.get_handle_phase(name) != "H2D":
-                swap_api.execute(name, "H2D")
-
-        def prefetch_plan(plan) -> None:
-            """Submit a plan's H2D work before FlexShard enters its transfer stream."""
-            redistributed = getattr(plan, "redistributed_items", None)
-            items = plan.items if redistributed is None else (*redistributed, *plan.unredistributed_items)
-            for compute_layout in items:
-                submit_h2d(compute_layout)
+                swap_api.restore(name)
 
         def enqueue_storage_to_compute(plan, slot, context, *, prepare):
             """Align swap prefetch/offload with one FlexShard redistribution bucket."""
@@ -894,7 +1197,17 @@ class OptimizerStateSwapContainer(OptimizersContainer):
             if deferred_d2h_names is not None:
                 raise RuntimeError("Nested FlexShard storage-to-compute enqueue is unsupported")
 
-            prefetch_plan(plan)
+            if bootstrap_active:
+
+                def materialize(layout) -> None:
+                    grad = layout.param.grad
+                    if grad is None:
+                        raise RuntimeError(f"DistMuon requires gradient before materializing {layout.fqn!r}")
+                    optimizer._momentum(layout, grad)
+
+                adapter.materialize_current(plan, materialize)
+                finish_bootstrap_if_complete()
+            adapter.prefetch_first_consumed_group(plan)
             deferred_d2h_names = []
             try:
                 work = original_enqueue_storage_to_compute(
@@ -910,28 +1223,49 @@ class OptimizerStateSwapContainer(OptimizersContainer):
             completed_d2h_names = deferred_d2h_names
             deferred_d2h_names = None
 
-            with torch_npu.npu.stream(context.transfer_stream):
-                for name in completed_d2h_names:
-                    swap_api.execute(name, "D2H")
+            if completed_d2h_names:
+                with torch_npu.npu.stream(context.transfer_stream):
+                    for name in completed_d2h_names:
+                        swap_api.execute(name, "D2H")
             return work
 
         def prepare_local(optimizer_self, compute_layout, out) -> None:
             name = make_swap_state_name("optimizer_state", model_part, compute_layout.fqn, "momentum_buffer")
-            momentum = optimizer_self.state[compute_layout.param]["momentum_buffer"]
+            state = optimizer_self.state[compute_layout.param]
+            if "momentum_buffer" not in state:
+
+                def materialize(layout) -> None:
+                    grad = layout.param.grad
+                    if grad is None:
+                        raise RuntimeError(f"DistMuon requires gradient before materializing {layout.fqn!r}")
+                    optimizer_self._momentum(layout, grad)
+
+                adapter.materialize_group(compute_layout, materialize)
+                finish_bootstrap_if_complete()
+                state = optimizer_self.state[compute_layout.param]
+            momentum = state["momentum_buffer"]
             local = momentum.to_local() if isinstance(momentum, DTensor) else momentum
             if local.numel() == 0:
                 original_prepare_local(compute_layout, out)
                 return
-            submit_h2d(compute_layout)
-            swap_api.execute(name, "WAIT_DEVICE")
+            group = adapter.wait_for(compute_layout)
+            if group is None:
+                submit_h2d(compute_layout)
+                swap_api.wait_device_if_needed(name)
+            elif id(compute_layout) == group.first_consumer_layout_id:
+                adapter.prefetch_successor(group)
             original_prepare_local(compute_layout, out)
 
-            if deferred_d2h_names is None:
+            if group is not None:
+                adapter.finish_prepare(group, compute_layout)
+            elif deferred_d2h_names is None:
                 swap_api.execute(name, "D2H")
             else:
                 deferred_d2h_names.append(name)
 
         optimizer._momentum = MethodType(momentum, optimizer)
+        if original_preflight_step is not None:
+            optimizer._preflight_step = MethodType(preflight_step, optimizer)
         optimizer._prepare_local = MethodType(prepare_local, optimizer)
         runtime._enqueue_storage_to_compute = enqueue_storage_to_compute
 
@@ -1069,6 +1403,23 @@ def _uses_novaswap(optimizer: torch.optim.Optimizer) -> bool:
 
 
 def _ensure_all_optim_state(optimizer: torch.optim.Optimizer) -> None:
+    swap = getattr(optimizer, "_torchtitan_npu_muon_swap_adapter", None)
+    if (
+        isinstance(optimizer, DistMuon)
+        and not hasattr(optimizer, "_replica_dedup_all_layouts")
+        and isinstance(swap, _MuonSwapAdapter)
+    ):
+        materialize_momentum = optimizer._momentum
+
+        def materialize(layout: Any) -> None:
+            # Unlike init_optim_state(), keep only one plan's synthetic
+            # gradient live. The adapter retires its NPU state before it
+            # moves on to the next plan.
+            materialize_momentum(layout, cast("DTensor", torch.zeros_like(layout.param)))
+
+        swap.materialize_all_for_checkpoint(materialize)
+        return
+
     if isinstance(optimizer, DistMuon) and hasattr(optimizer, "_replica_dedup_all_layouts"):
         # Initialize only this replica's owned momentum without a full step.
         for compute_layout in optimizer._parameter_compute_layouts:
@@ -1076,10 +1427,12 @@ def _ensure_all_optim_state(optimizer: torch.optim.Optimizer) -> None:
             if "momentum_buffer" not in state:
                 grad = cast("DTensor", torch.zeros_like(compute_layout.param))
                 optimizer._momentum(compute_layout, grad)
+        if isinstance(swap, _MuonSwapAdapter):
+            swap.finalize_registration(require_complete=True)
         return
-    swap = getattr(optimizer, "_torchtitan_npu_swap_adapter", None)
-    if isinstance(swap, _NovaSwapAdamW):
-        swap.ensure_all_state()
+    adamw_swap = getattr(optimizer, "_torchtitan_npu_swap_adapter", None)
+    if isinstance(adamw_swap, _NovaSwapAdamW):
+        adamw_swap.ensure_all_state()
     else:
         init_optim_state(optimizer)
 

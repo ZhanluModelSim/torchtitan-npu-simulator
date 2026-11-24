@@ -1,5 +1,8 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
 # Source: https://gitcode.com/ascend-nova/novaswap
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
 
 import logging
 from dataclasses import dataclass
@@ -26,6 +29,14 @@ class SwapHandle:
     owner: str | None = None
     transfer: str = "D2H"
     device_waited: bool = False
+
+
+@dataclass
+class SwapGroupHandle(SwapHandle):
+    """One packed CPU allocation backing multiple independent NPU tensors."""
+
+    tensors_npu: tuple[torch.Tensor, ...] = ()
+    offsets: tuple[int, ...] = ()
 
 
 def _logical_nbytes(tensor: torch.Tensor) -> int:
@@ -57,6 +68,78 @@ def _logical_storage(tensor: torch.Tensor):
 
 def _copy_logical_storage(source: torch.Tensor, destination: torch.Tensor) -> None:
     _logical_storage(destination).copy_(_logical_storage(source), non_blocking=True)
+
+
+def d2h_group(
+    tensors: tuple[torch.Tensor, ...],
+    offsets: tuple[int, ...],
+    total_bytes: int,
+    stream: torch_npu.npu.Stream,
+    *,
+    owner: str | None = None,
+) -> SwapGroupHandle:
+    """Offload a tensor group through one packed pinned-CPU allocation."""
+    for tensor in tensors:
+        validate_tensor_for_swap(tensor)
+    tensor_cpu = PinnedCpuStorage.allocate(total_bytes, owner=owner)
+    try:
+        current_event = torch_npu.npu.Event()
+        current_event.record()
+        with torch.no_grad(), torch_npu.npu.stream(stream):
+            stream.wait_event(current_event)
+            for tensor, offset in zip(tensors, offsets, strict=True):
+                _copy_logical_storage(tensor, tensor_cpu.narrow(0, offset, _logical_nbytes(tensor)))
+            swap_event = torch_npu.npu.Event()
+            swap_event.record()
+    except Exception:
+        stream.synchronize()
+        PinnedCpuStorage.free(tensor_cpu, owner=owner)
+        raise
+    return SwapGroupHandle(
+        tensor_cpu=tensor_cpu,
+        swap_event=swap_event,
+        use_storage_copy=True,
+        owner=owner,
+        transfer="D2H",
+        tensors_npu=tensors,
+        offsets=offsets,
+    )
+
+
+def _h2d_group(handle: SwapGroupHandle, stream: torch_npu.npu.Stream) -> SwapGroupHandle:
+    tensor_cpu = handle.tensor_cpu
+    if tensor_cpu is None:
+        raise RuntimeError("H2D requires a packed CPU buffer")
+    try:
+        with torch.no_grad(), torch_npu.npu.stream(stream):
+            if handle.swap_event is not None:
+                stream.wait_event(handle.swap_event)
+            staging_npu = torch.empty(tensor_cpu.numel(), dtype=torch.uint8, device=handle.tensors_npu[0].device)
+            _copy_logical_storage(tensor_cpu, staging_npu)
+            for tensor, offset in zip(handle.tensors_npu, handle.offsets, strict=True):
+                num_bytes = _logical_nbytes(tensor)
+                if tensor.untyped_storage().size() != num_bytes:
+                    tensor.untyped_storage().resize_(num_bytes)
+                _copy_logical_storage(staging_npu.narrow(0, offset, num_bytes), tensor)
+            # Keep queued copies safe without retaining staging until the next offload.
+            staging_npu.record_stream(stream)
+            del staging_npu
+            swap_event = torch_npu.npu.Event()
+            swap_event.record()
+    except Exception:
+        stream.synchronize()
+        raise
+    result = SwapGroupHandle(
+        tensor_cpu=tensor_cpu,
+        swap_event=swap_event,
+        use_storage_copy=True,
+        owner=handle.owner,
+        transfer="H2D",
+        tensors_npu=handle.tensors_npu,
+        offsets=handle.offsets,
+    )
+    handle.tensor_cpu = None
+    return result
 
 
 def d2h(
@@ -100,6 +183,8 @@ def d2h(
 
 def h2d(handle: SwapHandle, stream: torch_npu.npu.Stream) -> SwapHandle:
     """Asynchronously copy pinned CPU storage back to the original NPU tensor."""
+    if isinstance(handle, SwapGroupHandle):
+        return _h2d_group(handle, stream)
     tensor_npu = handle.tensor_npu
     tensor_cpu = handle.tensor_cpu
     if tensor_npu is None or tensor_cpu is None:

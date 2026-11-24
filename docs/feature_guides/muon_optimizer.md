@@ -4,7 +4,7 @@ DeepSeek-V4/V4.1 使用 TorchTitan 的 DistMuon/FlexShard 更新指定矩阵，�
 
 ## 配置与启动
 
-完整训练配置位于 `torchtitan_npu_recipes`。TorchTitan 0.4.0 使用 Python recipe，不再接受 `--optim.optimizer.name` 等通用字段 CLI。模型实现目录的 `config_registry.py` 只保留模型 registry 导出。
+完整训练配置位于 `torchtitan_npu_recipes`。TorchTitan 0.4.0 使用 Python recipe，不再接受 `--optim.optimizer.name` 等通用字段 CLI。
 
 在自定义 Python recipe 中选择优化器，例如 `my_recipes.py`：
 
@@ -15,8 +15,8 @@ from torchtitan_npu.extensions.torchtitan.components.optimizer.muon import DistM
 from torchtitan_npu_recipes.models.deepseek_v4 import (
     _dsv4_muon_profile,
     _enable_indexer_aux_loss,
-    deepseek_v4_debugmodel,
 )
+from torchtitan_npu_recipes.tests.models.deepseek_v4 import deepseek_v4_debugmodel
 
 
 def muon_training():
@@ -64,9 +64,11 @@ V4.1 Host Engram 的表权重使用 SparseAdam，投影等 NPU 参数继续按�
 
 ## NovaSwap 与 checkpoint
 
-Muon 动量仍按单个 Tensor 注册和搬运。FlexShard 准备重分布 bucket 时提前提交 H2D，消费前等待数据，完成 prepare 和 inbound 通信提交后执行 D2H。无需重分布的参数保持单 Tensor 路径。
+Muon 的 `momentum_buffer` 按 FlexShard plan 的消费顺序组织为 group，需要重分布和无需重分布的状态分别分组。多个 Tensor 打包到连续 pinned CPU buffer，通过 byte offset 定位，普通 group 上限为 512 MiB。超过上限的单个本地动量独立成组，后续普通 group 仍按 512 MiB 切分。超大组与相邻组之间不预取，改为消费时按需加载。驻留预算仅在需要时扩大到容纳单个超大组的动量与 H2D staging，随后恢复普通预算，设备仍须具备容纳该 Tensor 及临时存储的空间。
 
-首次创建动量后注册 NovaSwap，checkpoint 初始化沿用现有 optimizer state 初始化流程，不改变上游 Newton–Schulz 与参数更新公式。
+消费前执行 group H2D 并等待数据。组内最后一个非空成员完成 `_prepare_local()` 的动量更新并写入计算输入后，立即提交该组 D2H，再执行后续 FlexShard 重分布、Newton–Schulz 正交化及参数更新。D2H 逐 Tensor 写入同一组的 pinned CPU buffer，H2D 整块搬至 NPU staging 后再逐 Tensor 拷回原动量存储。
+
+首次创建动量后注册 NovaSwap，不改变 FlexShard plan、Newton–Schulz 与参数更新公式。HSDP replica dedup 下只处理当前 replica 拥有的状态，checkpoint 初始化沿用现有 optimizer state 初始化流程。
 
 AdamW 仍使用独立的 flat-state bucket。checkpoint 使用共享 CPU storage 的 view 和全局 shard metadata，保持原有 key 及 optimizer Tensor identity。未注册 NovaSwap 的优化器继续使用普通 checkpoint 路径。
 

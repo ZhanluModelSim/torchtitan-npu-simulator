@@ -1,9 +1,32 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
 # Source: https://gitcode.com/ascend-nova/novaswap
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
 
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
+
+import torch
+
+
+@dataclass(frozen=True, slots=True)
+class SwapGroupMember:
+    """A tensor's authoritative byte range in a packed group payload."""
+
+    tensor: torch.Tensor
+    byte_offset: int
+    num_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
+class SwapGroupRegistration:
+    """The logical ownership and packed layout of a swap group."""
+
+    name: str
+    members: tuple[SwapGroupMember, ...]
+    total_bytes: int
 
 
 @dataclass(frozen=True)
@@ -12,6 +35,7 @@ class SwapTensorEntry:
 
     payload: Any
     storage_tensors: tuple[Any, ...]
+    group_registration: SwapGroupRegistration | None = None
 
 
 def _detach_payload(value: Any) -> Any:
@@ -50,7 +74,12 @@ class SwapRegistry:
     # Tensor APIs
 
     @classmethod
-    def _register_payload(cls, payload: Any, tensor_name: str) -> None:
+    def _register_payload(
+        cls,
+        payload: Any,
+        tensor_name: str,
+        group_registration: SwapGroupRegistration | None = None,
+    ) -> None:
         detached_payload = _detach_payload(payload)
         storage_tensors = tuple(_flatten_storage_tensors(detached_payload))
         if not storage_tensors:
@@ -60,6 +89,7 @@ class SwapRegistry:
         cls.tensor_registry[tensor_name] = SwapTensorEntry(
             payload=detached_payload,
             storage_tensors=storage_tensors,
+            group_registration=group_registration,
         )
 
     @classmethod
@@ -69,6 +99,37 @@ class SwapRegistry:
             cls._register_payload(tuple(tensor), tensor_name)
             return
         cls._register_payload(tensor, tensor_name)
+
+    @classmethod
+    def register_group(
+        cls,
+        tensors: tuple[torch.Tensor, ...],
+        tensor_name: str,
+    ) -> SwapGroupRegistration:
+        """Register compact tensors as one packed transport payload."""
+        if not tensors:
+            raise ValueError("Swap group must contain at least one tensor")
+        members = []
+        total_bytes = 0
+        seen_storages = set()
+        for tensor in tensors:
+            if not isinstance(tensor, torch.Tensor):
+                raise ValueError("Swap group members must be tensors")
+            num_bytes = tensor.numel() * tensor.element_size()
+            storage = tensor.untyped_storage()
+            if not (tensor.is_contiguous() and tensor.storage_offset() == 0 and storage.size() == num_bytes):
+                raise ValueError("Swap group members must be contiguous tensors with compact storage")
+            storage_key = (str(tensor.device), storage.data_ptr(), storage.size())
+            if storage_key in seen_storages:
+                raise ValueError("Swap group members must not share storage")
+            seen_storages.add(storage_key)
+            alignment = tensor.element_size()
+            total_bytes = (total_bytes + alignment - 1) // alignment * alignment
+            members.append(SwapGroupMember(tensor, total_bytes, num_bytes))
+            total_bytes += num_bytes
+        registration = SwapGroupRegistration(tensor_name, tuple(members), total_bytes)
+        cls._register_payload(tensors, tensor_name, registration)
+        return registration
 
     @classmethod
     def get_entry_by_name(cls, tensor_name: str):
