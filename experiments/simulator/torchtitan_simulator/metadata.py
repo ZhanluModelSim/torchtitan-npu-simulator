@@ -52,17 +52,13 @@ def iter_metadata_tensors(value):
     yield from visit(value)
 
 
-def to_meta_metadata(value):
-    memo = {}
+def to_meta_metadata(value, *, host_splits=()):
+    # Seed before the walk: an alias can occur before the plan or under an
+    # unrelated key. Only the planner knows which lists carry route identity.
+    memo = {id(split): split for split in host_splits}
 
     def lift(item, *, field_name=""):
-        # CP exchange plans keep host split lists and their CPU tensor counterparts.
-        # Retaining the lists also retains their binding to the native global routing plan.
-        if field_name in {"send_splits_tensor", "recv_splits_tensor"} or (
-            field_name in {"send_splits", "recv_splits"}
-            and isinstance(item, list)
-            and all(type(n) is int for n in item)
-        ):
+        if field_name in {"send_splits_tensor", "recv_splits_tensor"}:
             return item
         if id(item) in memo:
             return memo[id(item)]

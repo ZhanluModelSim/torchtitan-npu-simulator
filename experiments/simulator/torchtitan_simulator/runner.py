@@ -280,13 +280,14 @@ def _simulate(simulation, timings: HostTimings):
             valid_tokens = int((labels != -100).sum().item())
             positions = torch.arange(seq_len).expand(batch_size, -1).contiguous()
             cp_mesh = dims.get_optional_mesh("cp")
+            host_splits = []
             if cp_mesh is not None:
                 from torch.distributed.device_mesh import DeviceMesh
 
                 if config.model_spec.name == "deepseek_v4":
                     from torchtitan_simulator.compat.cp_exchange import observe_deepseek_v4_cp_exchange
 
-                    observe_deepseek_v4_cp_exchange(runtime.patches)
+                    host_splits = observe_deepseek_v4_cp_exchange(runtime.patches)
 
                 # Plan construction is pure host math. Retain the same group,
                 # coordinates and native CP planner while keeping its scalar
@@ -301,7 +302,7 @@ def _simulate(simulation, timings: HostTimings):
                 cp_mesh=cp_mesh,
                 load_balancer_type=config.parallelism.context_parallel_load_balancer,
             )
-            inputs = {"tokens": tokens.to("meta"), **to_meta_metadata(kwargs)}
+            inputs = {"tokens": tokens.to("meta"), **to_meta_metadata(kwargs, host_splits=host_splits)}
             labels = labels.to("meta")
             gradient_manifest = {}
             dense_gradient_exemptions = set()

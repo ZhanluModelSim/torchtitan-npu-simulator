@@ -74,7 +74,9 @@ EP 适配在所有 router 的 force-load-balance 已核验、且入口明确交�
 
 缺实际组、归约或完整 split 通过 `unresolved_fields` 明示；Muon 等其他 A2A 来源未交付全组矩阵或证明时同样保留缺失，下游必须拒绝完整通信预测。结构预热、FSDP 通信视图、卸载计划与静态显存口径不因新增事实改变。实现见 [collective_facts.py](../torchtitan_simulator/capture/collective_facts.py)，native FakeProcessGroup／Meta 回归入口见 [test_collective_facts.py](../tests/capture/test_collective_facts.py)；这些测试不证明设备数值或通信性能。
 
-DeepSeek V4 的 CP 窗口和压缩块交换从模型的全局路由计划保留每个参与者的发送、接收行数，来源标识为 `deepseek_v4_cp_routing_geometry_v1`。捕获把计划与实际进程组和原生列表参数绑定，保留按 peer 排列的每个输入和输出缓冲区，包括零行分块。反向使用实际 autograd 节点保存的对应计划，交换收发方向。仅有本 rank 张量列表的其他调用保留原始张量和组，省略全组事实。非对称收发的三 rank 回归见 [test_cp_exchange_facts.py](../tests/capture/test_cp_exchange_facts.py)。
+DeepSeek V4 的 CP 窗口和压缩块交换从模型的全局路由计划保留每个参与者的发送、接收行数，来源标识为 `deepseek_v4_cp_routing_geometry_v1`。Meta 转换保留路由计划生成的收发列表及其别名。捕获把这些列表与实际进程组绑定，保留按 peer 排列的每个输入和输出缓冲区，包括零行分块。仅有本 rank 张量列表的其他调用保留原始张量和组，省略全组事实。
+
+反向使用实际 autograd 节点保存的对应计划，交换收发方向。如果可微的 CP 交换已有前向路由证据，但捕获器找不到对应的反向节点，本次模拟首次遇到该情况时会记录警告，列出观察到的节点和安装的软件包版本。该交换的反向全组路由保持缺失。非对称收发和反向节点变更的回归见 [test_cp_exchange_facts.py](../tests/capture/test_cp_exchange_facts.py)。
 
 ## 4. 阶段与图引用
 

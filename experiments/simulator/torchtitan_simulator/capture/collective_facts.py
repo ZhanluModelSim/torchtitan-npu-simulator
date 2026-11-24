@@ -103,26 +103,37 @@ def collective_fact_scope(facts: dict[str, Any]) -> Iterator[None]:
         _exchange_facts.reset(token)
 
 
-def retain_backward_facts(result: torch.Tensor, facts: dict[str, Any], *, source: torch.Tensor | None = None) -> None:
-    """Keep evidence on the exact native autograd node without patching it."""
+def retain_backward_facts(
+    result: torch.Tensor, facts: dict[str, Any], *, source: torch.Tensor | None = None
+) -> tuple[str, ...] | None:
+    """Attach evidence to the native node, or return observed node names for diagnosis."""
     pending = [result.grad_fn]
-    seen = set()
+    seen = {}
     boundary = None if source is None else source.grad_fn
     while pending:
         node = pending.pop()
         if node is None or node is boundary or node in seen:
             continue
-        seen.add(node)
+        seen[node] = None
         if node.name() == "GeneratedBackwardFor__c10d_functional_all_to_all_single_defaultBackward" or (
             source is not None
             and getattr(getattr(node, "_forward_cls", None), "__module__", "") == "spmd_types._collectives"
             and node.name() == "_AllToAllUnevenBackward"
         ):
             node.metadata[_PROOF_METADATA_KEY] = deepcopy(facts)
-            return
+            return None
         # wait_tensor / wrapping nodes can sit above the real collective node.
         # Stop at the first native collective; do not attach to an older input.
         pending.extend(function for function, _index in node.next_functions if function is not None)
+    names = []
+    for node in seen:
+        owner = getattr(node, "_forward_cls", None) or type(node)
+        name = f"{owner.__module__}.{node.name()}"
+        if name not in names:
+            names.append(name)
+        if len(names) == 8:
+            break
+    return tuple(names)
 
 
 def _active_exchange_facts() -> dict[str, Any] | None:
