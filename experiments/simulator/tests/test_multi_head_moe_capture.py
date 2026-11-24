@@ -360,8 +360,24 @@ def _head_parallel_two_rank_worker(rank: int, rendezvous: str, queue) -> None:
         else:
             raise AssertionError("uneven token shards must raise ValueError")
 
-        # Even shards pass the cached validation and run the real gloo
-        # head-ownership all-to-alls end to end.
+        # Regression sequence for the validation-cache skew (PR #23 review
+        # round 3): even shards dispatch for real, then ONE rank's token
+        # count changes. The validation is uncached, so both ranks enter the
+        # same all-gather on the second call and both raise; a skip keyed on
+        # the unchanged local count would send rank 1 straight to the data
+        # all-to-all and skew the group into a hang.
+        out = module(torch.randn(1, 4, base_cfg.proj_in.in_features))
+        assert tuple(out.shape) == (1, 4, base_cfg.proj_out.out_features)
+
+        tokens = 5 if rank == 0 else 4
+        try:
+            module(torch.randn(1, tokens, base_cfg.proj_in.in_features))
+        except ValueError as error:
+            assert "token shards" in str(error), str(error)
+        else:
+            raise AssertionError("uneven token shards after an even forward must raise ValueError")
+
+        # Back to even shards: repeated forwards keep dispatching for real.
         out = module(torch.randn(1, 4, base_cfg.proj_in.in_features))
         assert tuple(out.shape) == (1, 4, base_cfg.proj_out.out_features)
         queue.put(("ok", rank, ""))
@@ -375,9 +391,11 @@ def test_multi_head_moe_head_parallel_two_rank_token_shard_validation(tmp_path):
     """Two-rank gloo: uneven ep token shards fail fast before the collectives (PR #23 review).
 
     Meta capture has no live peers to ask, so the precondition's enforcement
-    is exercised over a real two-rank process group instead: the first
-    forward with uneven per-rank token counts raises ``ValueError`` on both
-    ranks before any all-to-all, and an even shard set dispatches for real.
+    is exercised over a real two-rank process group instead: uneven per-rank
+    token counts raise ``ValueError`` on both ranks before any all-to-all
+    (both on the first forward and again after one rank's count changes from
+    an even baseline — the uncached validation keeps both ranks in the same
+    collective), and an even shard set dispatches for real, repeatedly.
     """
     import multiprocessing
 
