@@ -9,9 +9,10 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
+import torch.optim._functional
 import torch_npu
 from torch import Tensor
 
@@ -68,7 +69,6 @@ class CpuOffloadAdamW(torch.optim.AdamW):
     ) -> None:
         unsupported = {
             "foreach": bool(foreach),
-            "fused": bool(fused),
             "amsgrad": amsgrad,
             "capturable": capturable,
             "differentiable": differentiable,
@@ -76,13 +76,38 @@ class CpuOffloadAdamW(torch.optim.AdamW):
         if option := next((name for name, enabled in unsupported.items() if enabled), None):
             raise ValueError(f"CPU-offloaded AdamW does not support {option}")
 
+        # Normalize per-group fused overrides before the base optimizer adds
+        # its defaults. The CPU bookkeeping optimizer must not retain a group
+        # level fused flag: the NPU update path is selected once for all groups.
+        param_items = (params,) if isinstance(params, dict) else params
+        normalized_params: list[Any] = []
+        group_fused: list[bool] = []
+        for item in param_items:
+            if isinstance(item, dict):
+                group = cast("dict[str, Any]", dict(item))
+                if "fused" in group:
+                    group_fused.append(bool(group.pop("fused")))
+                normalized_params.append(group)
+            else:
+                normalized_params.append(item)
+        requested_fused = None if fused is None else bool(fused)
+        if len(set(group_fused)) > 1:
+            raise ValueError("CPU-offloaded AdamW requires one fused choice across parameter groups")
+        if requested_fused is not None and any(value != requested_fused for value in group_fused):
+            raise ValueError("CPU-offloaded AdamW fused argument conflicts with a parameter group")
+        # The base optimizer tracks CPU tensors; fused updates use NPU work tensors.
+        self._npu_fused = requested_fused if requested_fused is not None else (group_fused[0] if group_fused else False)
         self._staging = staging
         self._clip_channel = clip_channel
         self._offload_states = offload_states
         self._compute_device = staging.device  # pyrefly: ignore [read-only]
         self._work_buffers: dict[tuple[int, int, torch.dtype], Tensor] = {}
+        # Fused AdamW increments its singleton state-step tensor in place.
+        # Keep one device scalar per parameter so the CPU checkpoint scalar is
+        # copied only when the parameter first enters the NPU update path.
+        self._step_work_buffers: dict[int, tuple[Tensor, Tensor]] = {}
         super().__init__(
-            params,
+            normalized_params,
             lr=lr,
             betas=betas,
             eps=eps,
@@ -130,6 +155,28 @@ class CpuOffloadAdamW(torch.optim.AdamW):
         if not self._offload_states:
             moment = moment.to(self._compute_device)
         return moment
+
+    def _step_work_buffer(self, parameter: Tensor, state: dict[str, Tensor]) -> Tensor:
+        """Return the persistent NPU step scalar for one parameter.
+
+        The CPU ``step`` tensor remains canonical for checkpointing. The
+        fused functional optimizer increments this device scalar in place, so
+        only the first use after construction or checkpoint loading performs a
+        CPU-to-NPU copy.
+        """
+        key = id(parameter)
+        cached = self._step_work_buffers.get(key)
+        if cached is None or cached[0] is not parameter:
+            step_work = state["step"].to(self._compute_device, copy=True)
+            self._step_work_buffers[key] = (parameter, step_work)
+            return step_work
+        return cached[1]
+
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        # The loaded CPU step values may differ from the device scalars used by
+        # fused AdamW, so force lazy reinitialization on the next step.
+        self._step_work_buffers.clear()
+        super().load_state_dict(state_dict)
 
     def step(self, closure: Callable[[], float] | None = None) -> float | None:
         loss = None
@@ -183,30 +230,51 @@ class CpuOffloadAdamW(torch.optim.AdamW):
                 handle.wait_on(compute_stream)
 
             with torch_npu.npu.stream(compute_stream):
-                # Standard AdamW update with public ops only, mirroring
-                # torch.optim._functional._single_tensor_adamw for the
-                # supported option subset (no foreach/fused/amsgrad/
-                # capturable/differentiable; complex tensors are rejected
-                # earlier; maximize is honored).
+                # Preserve the configured NPU update kernel. Canonical
+                # tensors and the checkpoint step remain on the host when
+                # optimizer state offload is enabled.
                 gradient = -work.gradient if entry.group["maximize"] else work.gradient
                 lr = entry.group["lr"]
                 beta1, beta2 = entry.group["betas"]
                 weight_decay = entry.group["weight_decay"]
                 eps = entry.group["eps"]
 
-                entry.state["step"] += 1
-                step = int(entry.state["step"].item())
-                bias_correction1 = 1 - beta1**step
-                bias_correction2 = 1 - beta2**step
-                step_size = lr / bias_correction1
-                bias_correction2_sqrt = math.sqrt(bias_correction2)
+                if self._npu_fused:
+                    step_work = self._step_work_buffer(entry.parameter, entry.state)
+                    torch.optim._functional.adamw(
+                        [work.parameter],
+                        [gradient],
+                        [work.exp_avg],
+                        [work.exp_avg_sq],
+                        [],
+                        [step_work],
+                        foreach=False,
+                        fused=True,
+                        capturable=False,
+                        differentiable=False,
+                        amsgrad=False,
+                        beta1=beta1,
+                        beta2=beta2,
+                        lr=lr,
+                        weight_decay=weight_decay,
+                        eps=eps,
+                        maximize=False,
+                    )
+                    entry.state["step"] += 1
+                else:
+                    entry.state["step"] += 1
+                    step = int(entry.state["step"].item())
+                    bias_correction1 = 1 - beta1**step
+                    bias_correction2 = 1 - beta2**step
+                    step_size = lr / bias_correction1
+                    bias_correction2_sqrt = math.sqrt(bias_correction2)
 
-                if weight_decay != 0:
-                    work.parameter.mul_(1 - lr * weight_decay)
-                work.exp_avg.lerp_(gradient, 1 - beta1)
-                work.exp_avg_sq.mul_(beta2).addcmul_(gradient, gradient, value=1 - beta2)
-                denom = (work.exp_avg_sq.sqrt() / bias_correction2_sqrt).add_(eps)
-                work.parameter.addcdiv_(work.exp_avg, denom, value=-step_size)
+                    if weight_decay != 0:
+                        work.parameter.mul_(1 - lr * weight_decay)
+                    work.exp_avg.lerp_(gradient, 1 - beta1)
+                    work.exp_avg_sq.mul_(beta2).addcmul_(gradient, gradient, value=1 - beta2)
+                    denom = (work.exp_avg_sq.sqrt() / bias_correction2_sqrt).add_(eps)
+                    work.parameter.addcdiv_(work.exp_avg, denom, value=-step_size)
             if work.gradient.device.type == "npu":
                 work.gradient.record_stream(compute_stream)
             self._staging.submit_d2h(

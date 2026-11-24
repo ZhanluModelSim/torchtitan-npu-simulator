@@ -332,6 +332,17 @@ def _is_copy_only_result(group: Any) -> bool:
     )
 
 
+def _wait_all_gather_streams_on_event(group: Any, event: Any) -> None:
+    """Wait for all-gather streams across Torch 2.14/2.15 APIs."""
+    waiter = getattr(group, "wait_all_gather_streams_on_event", None)
+    if waiter is None:
+        waiter = getattr(group, "_wait_all_gather_streams_on_event", None)
+    if waiter is not None:
+        waiter(event)
+        return
+    group.comm_ctx.wait_all_gather_streams_on_event(event)
+
+
 def _unshard_already_satisfied(group: Any) -> bool:
     """Mirror upstream ``unshard``'s early returns before its main body."""
     if group._all_gather_result is not None:  # already called, pending wait
@@ -357,7 +368,7 @@ def _patched_unshard(self: Any, async_op: bool = False) -> None:
     if self._reshard_after_forward_event is not None:
         # Resharded parameter data is allocated in the default stream and
         # used in the all-gather streams
-        self._wait_all_gather_streams_on_event(self._reshard_after_forward_event)
+        _wait_all_gather_streams_on_event(self, self._reshard_after_forward_event)
         self._reshard_after_forward_event = None
     with record_function(self._with_fqn("FSDP::all_gather_copy_in")):
         copy_in_stream, gather_stream = self.comm_ctx.get_all_gather_streams(async_op, self._training_state)
@@ -378,7 +389,7 @@ def _wait_for_copy_only_unshard(group: Any) -> None:
     if group._training_state == TrainingState.FORWARD and (  # implicit prefetch
         prev_all_gather_state := group.comm_ctx.all_gather_state
     ):
-        group._wait_all_gather_streams_on_event(prev_all_gather_state.event)
+        _wait_all_gather_streams_on_event(group, prev_all_gather_state.event)
         group.comm_ctx.all_gather_state = None  # free the all-gather result
     with record_function(group._with_fqn("FSDP::all_gather_copy_out")):
         foreach_all_gather_copy_out(
@@ -394,7 +405,7 @@ def _wait_for_copy_only_unshard(group: Any) -> None:
     all_gather_copy_out_event.record()
     # Upstream only defers the free for multi-rank all-gathers; copy-only
     # groups are single-rank, so always wait on the copy-out event.
-    group._wait_all_gather_streams_on_event(all_gather_copy_out_event)
+    _wait_all_gather_streams_on_event(group, all_gather_copy_out_event)
     group._all_gather_result = None
 
 
@@ -437,6 +448,7 @@ def _cpu_offload_foreach_reduce(
     partial_reduce_output: Tensor | None,  # only used for HSDP
     all_reduce_hook: Any,
     force_sum_reduction_for_comms: bool = False,
+    prepare_reduce_scatter_inputs: Any = None,
 ) -> tuple[
     Tensor,
     Any,
@@ -481,18 +493,20 @@ def _cpu_offload_foreach_reduce(
     if len({grad.dtype for grad in unsharded_grads}) > 1:
         unsharded_grads = [grad.to(reduce_dtype) if grad.dtype != reduce_dtype else grad for grad in unsharded_grads]
 
-    if world_size > 1:
-        for i, (fsdp_param, unsharded_grad) in enumerate(zip(fsdp_params, unsharded_grads, strict=False)):
-            if (shard_dim := fsdp_param.fsdp_placement.dim) == 0:
-                continue
-            if unsharded_grad.size(shard_dim) % world_size != 0:
-                raise AssertionError(
-                    f"Shard({shard_dim}) requires even sharding: {unsharded_grad.size()=} {world_size=}"
-                )
-            chunks = torch.chunk(unsharded_grad, world_size, dim=shard_dim)
-            unsharded_grads[i] = torch.cat(chunks, dim=0)
-
-    padded_unsharded_sizes = tuple(_get_dim0_padded_size(grad.size(), world_size) for grad in unsharded_grads)
+    if prepare_reduce_scatter_inputs is not None:
+        padded_unsharded_sizes = prepare_reduce_scatter_inputs(fsdp_params, unsharded_grads, world_size)
+    else:
+        if world_size > 1:
+            for i, (fsdp_param, unsharded_grad) in enumerate(zip(fsdp_params, unsharded_grads, strict=False)):
+                if (shard_dim := fsdp_param.fsdp_placement.dim) == 0:
+                    continue
+                if unsharded_grad.size(shard_dim) % world_size != 0:
+                    raise AssertionError(
+                        f"Shard({shard_dim}) requires even sharding: {unsharded_grad.size()=} {world_size=}"
+                    )
+                chunks = torch.chunk(unsharded_grad, world_size, dim=shard_dim)
+                unsharded_grads[i] = torch.cat(chunks, dim=0)
+        padded_unsharded_sizes = tuple(_get_dim0_padded_size(grad.size(), world_size) for grad in unsharded_grads)
     reduce_scatter_input_numel = sum(s.numel() for s in padded_unsharded_sizes)
     reduce_scatter_output_numel = reduce_scatter_input_numel // world_size
     reduce_scatter_input = reduce_scatter_comm.allocate(
@@ -580,19 +594,39 @@ def _cpu_offload_foreach_reduce(
 
     with device_handle.stream(post_reduce_stream):
         _div_if_needed(reduce_output, postdivide_factor)
-        # Rebinds to a new orig_dtype tensor when reduce_dtype != orig_dtype
-        reduce_output = _to_dtype_if_needed(reduce_output, orig_dtype)
-        # View out and accumulate sharded gradients
-        flat_grad_offset = 0  # [0, reduce_scatter_output_numel - 1]
-        for padded_unsharded_size, fsdp_param in zip(padded_unsharded_sizes, fsdp_params, strict=False):
-            # Assume even sharding for Shard(i), i > 0; otherwise would require
-            # copy-out for contiguous strides
-            new_sharded_grad = torch.as_strided(
+        if orig_dtype is None and hasattr(_collectives, "_cast_and_view_sharded_grads"):
+            # Torch 2.15 removed ``orig_dtype`` and applies each parameter's
+            # sharded_grad_dtype after the common reduce-dtype collective.
+            record_grad_output_stream = getattr(_collectives, "record_grad_output_stream", None)
+            if record_grad_output_stream is not None:
+                record_grad_output_stream(reduce_output, current_stream)
+            else:
+                # Older builds lack the backend-specific lifetime hook.
+                reduce_output.record_stream(current_stream)
+            sharded_grads = _collectives._cast_and_view_sharded_grads(
                 reduce_output,
-                size=fsdp_param.sharded_size,
-                stride=fsdp_param.contiguous_sharded_stride,
-                storage_offset=flat_grad_offset,
+                fsdp_params,
+                padded_unsharded_sizes,
+                world_size,
+                current_stream,
             )
+        else:
+            # Legacy FSDP exposes one orig_dtype for the whole reduction.
+            reduce_output = _to_dtype_if_needed(reduce_output, orig_dtype)
+            sharded_grads = []
+            flat_grad_offset = 0
+            for fsdp_param, padded_unsharded_size in zip(fsdp_params, padded_unsharded_sizes, strict=True):
+                sharded_grads.append(
+                    torch.as_strided(
+                        reduce_output,
+                        size=fsdp_param.sharded_size,
+                        stride=fsdp_param.contiguous_sharded_stride,
+                        storage_offset=flat_grad_offset,
+                    )
+                )
+                flat_grad_offset += padded_unsharded_size.numel() // world_size
+        # View out and accumulate sharded gradients.
+        for fsdp_param, new_sharded_grad in zip(fsdp_params, sharded_grads, strict=True):
             to_accumulate_grad = fsdp_param.sharded_param.grad is not None
             # In-backward CPU consumers of the grad must observe completed
             # transfers, hence the synchronous mode below.
@@ -644,8 +678,6 @@ def _cpu_offload_foreach_reduce(
                 fsdp_param.sharded_param.grad = fsdp_param.to_sharded_dtensor(new_sharded_grad)
             for hook in (getattr(fsdp_param.sharded_param, "_post_accumulate_grad_hooks", {}) or {}).values():
                 hook(fsdp_param.sharded_param)
-            padded_sharded_numel = padded_unsharded_size.numel() // world_size
-            flat_grad_offset += padded_sharded_numel
         post_reduce_event = post_reduce_stream.record_event()
     return (
         reduce_scatter_input,
@@ -661,24 +693,56 @@ def _cpu_offload_foreach_reduce(
 def _patched_foreach_reduce(*args: Any, **kwargs: Any) -> Any:
     """Wrap ``foreach_reduce`` to accumulate CPU-canonical grads on the NPU.
 
-    ``args[0]`` is ``fsdp_params`` and ``args[7]`` is ``device`` (the
-    upstream positional signature); keyword calls are forwarded verbatim.
+    Resolve arguments using the installed PyTorch signature, preserving
+    legacy calls and adapting the Torch 2.15 reduce-scatter callback.
     """
     fsdp_params = args[0] if args else kwargs["fsdp_params"]
-    device = args[7] if len(args) > 7 else kwargs["device"]
-    if _uses_cpu_canonical_grads(fsdp_params, device):
+    reduce_params = _FOREACH_REDUCE_PARAMS
+    # Torch 2.15 removed the legacy ``orig_dtype`` positional argument and
+    # added the keyword-only reduce-scatter input preparation callback.
+    device_index = _FOREACH_REDUCE_DEVICE_INDEX
+    if device_index is None:
+        raise RuntimeError("Unsupported FSDP foreach_reduce signature: missing device")
+    device = args[device_index] if len(args) > device_index else kwargs["device"]
+    if not _uses_cpu_canonical_grads(fsdp_params, device):
+        return _ORIGINAL_FOREACH_REDUCE(*args, **kwargs)
+    if "orig_dtype" in reduce_params:
         return _cpu_offload_foreach_reduce(*args, **kwargs)
-    return _ORIGINAL_FOREACH_REDUCE(*args, **kwargs)
+
+    bound = _FOREACH_REDUCE_SIGNATURE.bind(*args, **kwargs)
+    bound.apply_defaults()
+    values = bound.arguments
+    return _cpu_offload_foreach_reduce(
+        fsdp_params=values["fsdp_params"],
+        unsharded_grads=values["unsharded_grads"],
+        reduce_scatter_group=values["reduce_scatter_group"],
+        reduce_scatter_stream=values["reduce_scatter_stream"],
+        reduce_scatter_comm=values["reduce_scatter_comm"],
+        orig_dtype=None,
+        reduce_dtype=values["reduce_dtype"],
+        device=values["device"],
+        gradient_divide_factor=values["gradient_divide_factor"],
+        all_reduce_group=values["all_reduce_group"],
+        all_reduce_stream=values["all_reduce_stream"],
+        all_reduce_grads=values["all_reduce_grads"],
+        partial_reduce_output=values["partial_reduce_output"],
+        all_reduce_hook=values["all_reduce_hook"],
+        force_sum_reduction_for_comms=values["force_sum_reduction_for_comms"],
+        prepare_reduce_scatter_inputs=values["prepare_reduce_scatter_inputs"],
+    )
 
 
 # Installation
 # ---------------------------------------------------------------------------
 
 _ORIGINAL_FOREACH_REDUCE: Any = _collectives.foreach_reduce
+_FOREACH_REDUCE_SIGNATURE = signature(_ORIGINAL_FOREACH_REDUCE)
+_FOREACH_REDUCE_PARAMS = tuple(_FOREACH_REDUCE_SIGNATURE.parameters)
+_FOREACH_REDUCE_DEVICE_INDEX = _FOREACH_REDUCE_PARAMS.index("device") if "device" in _FOREACH_REDUCE_PARAMS else None
 _ORIGINAL_UNSHARD: Any = _param_group.FSDPParamGroup.unshard
 _ORIGINAL_WAIT_FOR_UNSHARD: Any = _param_group.FSDPParamGroup.wait_for_unshard
 
-_EXPECTED_FOREACH_REDUCE_PARAMS = (
+_EXPECTED_FOREACH_REDUCE_PARAMS_LEGACY = (
     "fsdp_params",
     "unsharded_grads",
     "reduce_scatter_group",
@@ -697,11 +761,33 @@ _EXPECTED_FOREACH_REDUCE_PARAMS = (
 )
 
 
+_EXPECTED_FOREACH_REDUCE_PARAMS = (
+    "fsdp_params",
+    "unsharded_grads",
+    "reduce_scatter_group",
+    "reduce_scatter_stream",
+    "reduce_scatter_comm",
+    "reduce_dtype",
+    "device",
+    "gradient_divide_factor",
+    "all_reduce_group",
+    "all_reduce_stream",
+    "all_reduce_grads",
+    "partial_reduce_output",
+    "all_reduce_hook",
+    "force_sum_reduction_for_comms",
+    "prepare_reduce_scatter_inputs",
+)
+
+
 # Validates against PyTorch _fsdp_collectives/_fsdp_param_group signatures (BSD 3-Clause).
 def _validate_upstream_signatures() -> None:
     """Fail loudly on PyTorch releases the wrappers were not built against."""
-    foreach_reduce_params = tuple(signature(_ORIGINAL_FOREACH_REDUCE).parameters)
-    if foreach_reduce_params != _EXPECTED_FOREACH_REDUCE_PARAMS:
+    foreach_reduce_params = _FOREACH_REDUCE_PARAMS
+    if foreach_reduce_params not in (
+        _EXPECTED_FOREACH_REDUCE_PARAMS_LEGACY,
+        _EXPECTED_FOREACH_REDUCE_PARAMS,
+    ):
         raise RuntimeError(
             "Unsupported PyTorch FSDP foreach_reduce signature "
             f"{foreach_reduce_params}; CPU-canonical NPU gradient accumulation "

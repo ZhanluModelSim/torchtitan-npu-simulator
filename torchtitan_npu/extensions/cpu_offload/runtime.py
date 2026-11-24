@@ -82,6 +82,11 @@ class GradientClipChannel:
     def has_consumer(self) -> bool:
         return self._consumers > 0
 
+    @property
+    def preserve_coefficient_dtype(self) -> bool:
+        """Whether clip coefficients must stay in FP32 for HostSparse."""
+        return self._preserve_coefficient_dtype
+
     # -- clip side (publisher) ----------------------------------------------
 
     def publish(

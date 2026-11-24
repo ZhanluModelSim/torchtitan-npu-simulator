@@ -45,13 +45,6 @@ class _NormGroup:
     value: torch.Tensor
 
 
-@dataclass(slots=True)
-class _CachedNormItem:
-    npu_gradient: torch.Tensor
-    group: _NormGroup
-    handles: tuple[TransferHandle, ...]
-
-
 class _NormPipeline:
     """Streams and bounded buffers shared by CPU-gradient clipping steps."""
 
@@ -222,17 +215,15 @@ def _submit_gradient(
 def _cached_batches(
     parameter_gradients: list[tuple[torch.Tensor, DTensor]],
     pipeline: _NormPipeline,
-    groups: dict[tuple[int, tuple[int, ...]], _NormGroup],
-    norm_type: float,
     cache_entries: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
-) -> Iterator[list[_CachedNormItem]]:
-    batch: list[_CachedNormItem] = []
+) -> Iterator[list[TransferHandle]]:
+    batch: list[TransferHandle] = []
     batch_bytes = 0
     batch_dtype: torch.dtype | None = None
     chunk_bytes = _CHUNK_BYTES
-    infinite = math.isinf(norm_type)
 
     for parameter, gradient in parameter_gradients:
+        _norm_group_key(gradient)  # Validate placements even for an empty local shard.
         cpu_gradient = clip_state.local_tensor(gradient).detach()
         transfer_source = cpu_gradient if cpu_gradient.is_contiguous() else cpu_gradient.contiguous()
         npu_gradient = torch.empty(
@@ -249,45 +240,12 @@ def _cached_batches(
             yield batch
             batch = []
             batch_bytes = 0
-        group = _get_norm_group(groups, gradient, pipeline.device, infinite=infinite)
-        batch.append(
-            _CachedNormItem(
-                npu_gradient,
-                group,
-                _submit_gradient(pipeline, transfer_source, npu_gradient),
-            )
-        )
+        batch.extend(_submit_gradient(pipeline, transfer_source, npu_gradient))
         batch_bytes += size_bytes
         batch_dtype = cpu_gradient.dtype
 
     if batch:
         yield batch
-
-
-def _accumulate_cached_batch(
-    batch: list[_CachedNormItem],
-    norm_type: float,
-    stream,
-) -> None:
-    for item in batch:
-        for handle in item.handles:
-            handle.wait_on(stream)
-
-    with torch_npu.npu.stream(stream):
-        norms = torch._foreach_norm(
-            [item.npu_gradient for item in batch],
-            norm_type,
-        )
-        by_group: dict[int, tuple[_NormGroup, list[torch.Tensor]]] = {}
-        for item, norm in zip(batch, norms, strict=True):
-            _, values = by_group.setdefault(id(item.group), (item.group, []))
-            values.append(norm.float())
-        for group, values in by_group.values():
-            stacked = torch.stack(values)
-            if math.isinf(norm_type):
-                group.value.copy_(torch.maximum(group.value, stacked.amax()))
-            else:
-                group.value.add_(stacked.pow(norm_type).sum())
 
 
 @torch.no_grad()
@@ -296,36 +254,57 @@ def _cached_local_norm(
     device: torch.device,
     norm_type: float,
     pp_mesh,
+    *,
+    foreach: bool | None = None,
 ) -> tuple[
     torch.Tensor,
     Any,
     list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
 ]:
     pipeline = _pipeline(device)
-    groups: dict[tuple[int, tuple[int, ...]], _NormGroup] = {}
     cache_entries: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
-    pending: list[_CachedNormItem] | None = None
+    caller = torch_npu.npu.current_stream(device)
+    for batch in _cached_batches(parameter_gradients, pipeline, cache_entries):
+        for handle in batch:
+            handle.wait_on(caller)
 
-    for batch in _cached_batches(
-        parameter_gradients,
-        pipeline,
-        groups,
-        norm_type,
-        cache_entries,
-    ):
-        if pending is not None:
-            _accumulate_cached_batch(pending, norm_type, pipeline.compute_stream)
-        pending = batch
-    if pending is not None:
-        _accumulate_cached_batch(pending, norm_type, pipeline.compute_stream)
-
-    total, ready = _finish_norm(
-        groups,
-        device,
-        norm_type,
-        pp_mesh,
-        pipeline.compute_stream,
-    )
+    # Reuse upstream DTensor norm reductions, including their rounding order.
+    # Staging and the optimizer handoff still share the same NPU gradients.
+    gradients_by_mesh: dict[Any, list[DTensor]] = {}
+    for (_, gradient), (_, _, working) in zip(parameter_gradients, cache_entries, strict=True):
+        # Match upstream clipping by keeping the cached norm in the gradient's
+        # original dtype. HostSparse raises only the final scalar coefficient
+        # to FP32 below, so this path does not allocate an FP32 gradient copy.
+        staged = DTensor.from_local(
+            working,
+            gradient.device_mesh,
+            gradient.placements,
+            run_check=False,
+            shape=gradient.shape,
+            stride=gradient.stride(),
+        )
+        gradients_by_mesh.setdefault(gradient.device_mesh, []).append(staged)
+    norms = []
+    for gradients in gradients_by_mesh.values():
+        norm = torch.nn.utils.get_total_norm(gradients, norm_type, False, foreach)
+        if isinstance(norm, DTensor):
+            norm = norm.full_tensor()
+        norms.append(norm)
+    if len(norms) == 1:
+        total = norms[0]
+    elif math.isinf(norm_type):
+        total = torch.stack(norms).amax()
+    else:
+        total = sum(norm**norm_type for norm in norms) ** (1.0 / norm_type)
+    if pp_mesh is not None and dist.is_initialized():
+        if math.isinf(norm_type):
+            dist.all_reduce(total, op=dist.ReduceOp.MAX, group=pp_mesh.get_group())
+        else:
+            total **= norm_type
+            dist.all_reduce(total, op=dist.ReduceOp.SUM, group=pp_mesh.get_group())
+            total **= 1.0 / norm_type
+    ready = torch_npu.npu.Event()
+    ready.record(caller)
     return total, ready, cache_entries
 
 
@@ -468,6 +447,7 @@ def clip_grad_norm_(
             device,
             norm_type,
             pp_mesh,
+            foreach=foreach,
         )
     else:
         total_norm, norm_ready = _bounded_local_norm(
@@ -485,9 +465,13 @@ def clip_grad_norm_(
     # consume it on this same stream, so stream FIFO ordering makes the value
     # visible without cross-stream event plumbing. The recorded event still
     # protects any consumer that runs on a different stream.
-    coefficient = (torch.as_tensor(float(max_norm), dtype=torch.float32, device=device) / (total_norm + 1e-6)).clamp(
-        max=1.0
-    )
+    coefficient_norm = total_norm
+    if channel is not None and channel.preserve_coefficient_dtype:
+        # HostSparse computes its dense correction denominator from the same
+        # norm value in FP32. Convert this scalar only after the norm reduction
+        # so ordinary BF16 clipping keeps upstream rounding and memory use.
+        coefficient_norm = total_norm.float()
+    coefficient = (float(max_norm) / (coefficient_norm + 1e-6)).clamp(max=1.0)
     coefficient_ready = torch_npu.npu.Event()
     coefficient_ready.record(caller_stream)
 

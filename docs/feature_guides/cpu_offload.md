@@ -50,7 +50,7 @@ CPU Offload 是一套"CPU 常驻 + NPU 计算"的显存优化方案：
 ```
 --training.enable-cpu-offload
 ├── parallelize_fn → CPUOffloadPolicy → FSDPParam.offload_to_cpu = True
-│   ├── forward: unshard 时 CPU pinned 参数 → NPU（多 rank: 上游内建 / 单 rank: 本仓预取补丁）
+│   ├── forward: unshard 时 CPU pinned 参数 → NPU（多 rank 使用上游路径，单 rank 走本仓 copy-only 预取补丁）
 │   └── backward: foreach_reduce → 梯度 reduce-scatter → D2H 落 CPU pinned
 │                                    → 第二个 microbatch 起在 NPU 分块累加（本仓补丁）
 │
@@ -111,6 +111,9 @@ Chunk 大小（64 MiB）为内部调优常量，非用户配置。
 ## 限制
 
 - 优化器固定支持 `CpuOffloadAdamW` 和 `CpuOffloadDistributedMuon`（Muon）
-- 不支持 `amsgrad`、`fused`、`capturable`、`differentiable`、`foreach`、复数张量
+- AdamW 通过配置中的 `fused` 选择更新实现：`True` 在 NPU 工作张量上调用 fused AdamW，`False` 或 `None` 使用非融合更新。两种实现之间不保证逐位一致。
+- AdamW 的 fused 选择适用于 moments CPU 常驻和 NPU 常驻两种状态驻留方式；参数和梯度仍以 CPU 张量为准。CPU 常驻状态每步搬运，NPU 常驻状态原地更新。CPU 参数组日志中的 `fused=False` 用于父类状态管理，实际 NPU 更新由 `_npu_fused` 控制。
+- 已验证范围：PyTorch 2.15.0+cpu / torch_npu 2.15.0.dev20261105 环境下，FP32 参数、梯度和 moments，fused 开关与两种状态驻留方式的固定输入优化器比较，共 72 次参数和 moments 比较逐位一致；该记录不代表所有并行或 checkpoint 组合均已验证。
+- AdamW 不支持 `amsgrad`、`capturable`、`differentiable`、`foreach=True` 和复数张量
 - 梯度 clip 仅支持 L2 和 inf 范数
 - DistMuon 需要 DTensor 参数 + FlexShard compute layout 配置

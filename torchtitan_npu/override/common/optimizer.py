@@ -530,11 +530,10 @@ def virtual(
 
 
 def _build_cpu_offload_adamw(params, **kwargs: Any) -> CpuOffloadAdamW:
-    """Adapt master optimizer implementation flags to the CPU-offload kernel."""
-    # The master container always adds ``fused``/``foreach`` according to
-    # ``optimizer.implementation``.  CPU-offload uses a staged functional
-    # update and therefore owns those implementation choices internally.
-    kwargs.pop("fused", None)
+    """Preserve the selected NPU AdamW kernel with CPU canonical storage."""
+    # Canonical CPU parameter groups use non-fused storage bookkeeping;
+    # the selected fused kernel runs on the staged NPU work tensors.
+    npu_fused = kwargs.pop("fused", None)
     kwargs.pop("foreach", None)
     params = (params,) if isinstance(params, dict) else params
     normalized_params = [
@@ -543,7 +542,7 @@ def _build_cpu_offload_adamw(params, **kwargs: Any) -> CpuOffloadAdamW:
         else group
         for group in params
     ]
-    return CpuOffloadAdamW(normalized_params, **kwargs)
+    return CpuOffloadAdamW(normalized_params, fused=npu_fused, **kwargs)
 
 
 @dataclass(kw_only=True, slots=True)
@@ -570,6 +569,7 @@ class _CpuOffloadOptimizerConfig(BaseOptimizer.Config):
                 betas=config.betas,
                 eps=config.eps,
                 weight_decay=config.weight_decay,
+                fused=config.fused,
                 **runtime,
             )
         if isinstance(config, ConfigurableDistMuon.Config):
