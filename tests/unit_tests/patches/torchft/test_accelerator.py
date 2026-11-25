@@ -69,7 +69,7 @@ common_args = [
 config = ConfigLoader().load(common_args)
 assert isinstance(config, TrainerEx.Config)
 assert not any(name == 'torchft' or name.startswith('torchft.') for name in sys.modules)
-from torchtitan_npu_recipes.tests.ci.deepseek_v4 import deepseek_v4_flash_torchft
+from torchtitan_npu_recipes.torchft.deepseek_v4 import deepseek_v4_flash_torchft
 try:
     deepseek_v4_flash_torchft()
 except ModuleNotFoundError as error:

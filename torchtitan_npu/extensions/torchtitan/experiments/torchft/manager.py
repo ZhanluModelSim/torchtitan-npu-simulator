@@ -5,6 +5,7 @@
 """Adapt upstream healing callbacks to CPU transport and live NPU shards."""
 
 import copy
+from contextlib import nullcontext
 from datetime import timedelta
 from threading import Event
 from typing import TYPE_CHECKING, Any, cast
@@ -18,6 +19,7 @@ from torchft.manager import Manager
 if TYPE_CHECKING:
     from torchft.process_group import ProcessGroup
 
+    from torchtitan_npu.extensions.torchtitan.experiments.torchft.optimizer_recovery import OptimizerRecovery
     from torchtitan_npu.extensions.torchtitan.experiments.torchft.process_group import ProcessGroupHCCLEx
 
 
@@ -33,13 +35,25 @@ def _snapshot_to_cpu(state):
     return tree_unflatten(copied, spec)
 
 
+def _align_dict_keys(saved, live):
+    """Match plain state dicts by key, leaving all other structure checks to TreeSpec."""
+    if type(saved) is dict and type(live) is dict and saved.keys() == live.keys():
+        return {key: _align_dict_keys(saved[key], value) for key, value in live.items()}
+    if type(saved) is type(live) and type(saved) in (list, tuple) and len(saved) == len(live):
+        return type(saved)(_align_dict_keys(a, b) for a, b in zip(saved, live, strict=True))
+    return saved
+
+
 @torch.no_grad()
 def _restore_tensor_leaves(snapshot, live_state):
     """Copy local shards into existing tensors while preserving DTensor placement."""
     saved_leaves, saved_spec = tree_flatten(snapshot)
     live_leaves, live_spec = tree_flatten(live_state)
     if saved_spec != live_spec:
-        raise ValueError("TorchFT recovery state structure does not match the current model")
+        # DCP and peer healing can enumerate the same optimizer FQNs in different orders.
+        saved_leaves, saved_spec = tree_flatten(_align_dict_keys(snapshot, live_state))
+        if saved_spec != live_spec:
+            raise ValueError("TorchFT recovery state structure does not match the current model")
     # Validate every leaf before changing any live state.
     for saved, live in zip(saved_leaves, live_leaves, strict=True):
         if isinstance(saved, torch.Tensor) != isinstance(live, torch.Tensor):
@@ -75,12 +89,16 @@ class ManagerEx(Manager):
     _recovery_event: Any
     _quorum_id: int
     _group_world_size: int
+    _coordinate_load: bool = False
+    optimizer_recovery: "OptimizerRecovery | None" = None
     _checkpoint_transport: Any
     _quorum_timeout: timedelta
 
     if TYPE_CHECKING:
         # TorchFT is optional in the base CI environment, so its inherited
         # members are not visible to the type checker there.
+        errored = Manager.errored
+
         def start_quorum(
             self,
             allow_heal: bool = True,
@@ -113,11 +131,14 @@ class ManagerEx(Manager):
         self._snapshot_error = None
         self._snapshot_requested.clear()
         self._snapshot_ready.clear()
-        if self._initial_quorum_barrier_pending:
-            if self._group_world_size > 1:
-                dist.barrier()
+        if self._initial_quorum_barrier_pending and self._group_world_size > 1:
+            dist.barrier()
+        self._coordinate_load = True
+        try:
+            self.start_quorum()
+        finally:
+            self._coordinate_load = False
             self._initial_quorum_barrier_pending = False
-        self.start_quorum()
 
     def wait_quorum(self):
         assert self._quorum_future is not None
@@ -129,7 +150,51 @@ class ManagerEx(Manager):
                     self._snapshot_error = error
                 finally:
                     self._snapshot_ready.set()
-        return super().wait_quorum()
+        if not self._coordinate_load:
+            return super().wait_quorum()
+        self._coordinate_load = False
+        try:
+            super().wait_quorum()
+        except Exception as error:
+            self._coordinate_healing(error)
+        else:
+            self._coordinate_healing(None)
+
+    def _replica_flags(self, *local: bool) -> list[int]:
+        if self._group_world_size == 1:
+            return list(map(int, local))
+        flags = torch.tensor(local, dtype=torch.int32, device=torch.accelerator.current_accelerator())
+        dist.all_reduce(flags, op=dist.ReduceOp.MAX)
+        return flags.tolist()
+
+    def _coordinate_healing(self, future_error: Exception | None) -> None:
+        error = future_error or self.errored()
+        # Configure-only errors after startup still follow the ordinary failed commit vote.
+        receiving, failed, fatal = self._replica_flags(
+            self._healing,
+            error is not None,
+            future_error is not None or (error is not None and self._snapshot_requested.is_set()),
+        )
+        if fatal or (failed and (receiving or self._initial_quorum_barrier_pending)):
+            raise RuntimeError("TorchFT quorum failed on a replica-local rank") from error
+        if not receiving:
+            return
+
+        load_error = None
+        try:
+            if self._healing:
+                with (
+                    self.optimizer_recovery.defer_validation() if self.optimizer_recovery is not None else nullcontext()
+                ):
+                    self._apply_pending_state_dict()
+        except Exception as exc:
+            load_error = exc
+        if self._replica_flags(load_error is not None)[0]:
+            raise RuntimeError("TorchFT state load failed on a replica-local rank") from load_error
+        if self.optimizer_recovery is not None:
+            self.optimizer_recovery.validate()
+        # The synchronous start_quorum caller must not apply the state a second time.
+        self._healing = False
 
     def should_commit(self, timeout=None):
         try:

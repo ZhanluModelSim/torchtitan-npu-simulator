@@ -7,7 +7,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 from torchtitan.components.data import (
@@ -40,11 +40,122 @@ from torchtitan_npu.extensions.torchtitan.components.checkpoint import Checkpoin
 from torchtitan_npu.extensions.torchtitan.components.optimizer.muon import DistMuon
 from torchtitan_npu.extensions.torchtitan.tools.profiler import CANNProfiler
 from torchtitan_npu.extensions.torchtitan.trainer import TrainerEx
-from torchtitan_npu.models.common.alignment import AlignedTextProcessor
+from torchtitan_npu.models.common.alignment import AlignedTextProcessor, compression_alignment
 from torchtitan_npu.models.common.muon import make_expert_layout, make_owned_layout, with_lora_compute_layouts
 from torchtitan_npu.models.deepseek_v4 import build_model_config
 from torchtitan_npu.models.deepseek_v4.chat_processor import DeepSeekV4ChatProcessor
 from torchtitan_npu.models.deepseek_v4.model import DeepSeekV4Model
+from torchtitan_npu.models.deepseek_v4.mtp import MTPChunkedLossWrapper
+
+if TYPE_CHECKING:
+    from torchtitan.config.transform import ModelConfigConverter
+
+
+def _trainer_config(
+    model: DeepSeekV4Model.Config,
+    *,
+    parallelism: ParallelismConfig,
+    num_mtp_layers: int = 0,
+    hf_assets_path: str | None = None,
+    data_files: str = "tests/assets/c4_test/data.json",
+    per_doc_alignment: int | None = None,
+) -> TrainerEx.Config:
+    """Assemble the shared text-training components around an explicit model."""
+    model.local_compile_regions = []
+    if num_mtp_layers > 0:
+        loss = MTPChunkedLossWrapper.Config(
+            mtp_scale=0.3,
+            loss_fn=CrossEntropyLoss.Config(
+                global_vocab_size=decoder_vocab_size(model),
+            ),
+        )
+    else:
+        loss = ChunkedLossWrapper.Config(
+            loss_fn=CrossEntropyLoss.Config(
+                global_vocab_size=decoder_vocab_size(model),
+            ),
+        )
+    config = TrainerEx.Config(
+        hf_assets_path=hf_assets_path or "tests/assets/tokenizer",
+        loss=loss,
+        profiler=CANNProfiler.Config(
+            enable_profiling=False,
+            profile_freq=10,
+            profiler_active=10,
+            profiler_warmup=0,
+        ),
+        metrics=MetricsProcessor.Config(log_freq=1),
+        model=model,
+        dataloader=GrainDataLoader.Config(
+            num_mtp_layers=num_mtp_layers,
+            dataset=ConcatThenSplitPackingConfig(
+                dataset=SingleDatasetConfig(
+                    source=HuggingFaceRandomAccessSource.Config(
+                        path="json", split="train", load_dataset_kwargs={"data_files": data_files}
+                    ),
+                    processor=AlignedTextProcessor.Config(
+                        per_doc_alignment=compression_alignment(model.compress_ratios)
+                        if per_doc_alignment is None
+                        else per_doc_alignment
+                    ),
+                    post_filters=(lambda sample: sample is not None,),
+                ),
+            ),
+        ),
+        optim=OptimConfig(
+            optimizer=_dsv4_optimizer_config(model, lr=1e-5),
+            lr_scheduler=LRSchedulersContainer.Config(
+                warmup_steps=20,
+                decay_ratio=0.8,
+                decay_type="cosine",
+                min_lr_factor=0.01,
+            ),
+        ),
+        training=TrainingConfig(
+            disable_cuda_graphs=True,
+            num_tokens_per_microbatch_per_dp_rank=model.max_context_length,
+            num_tokens_per_train_step=-1,
+            max_context_length=model.max_context_length,
+            steps=100,
+        ),
+        parallelism=parallelism,
+        activation_remat=None,
+        compile=None,
+        checkpointer=None,
+    )
+    config.override.imports = ["torchtitan_npu.override.common.rope.workaround"]
+    return config
+
+
+def _flash_config(
+    flavor: str,
+    *,
+    parallelism: ParallelismConfig,
+    seq_len: int = 4096,
+    num_mtp_layers: int = 0,
+    num_layers: int | None = None,
+    hf_assets_path: str | None = None,
+    data_files: str = "tests/assets/c4_test/data.json",
+    per_doc_alignment: int | None = None,
+    converters: list[ModelConfigConverter.Config] | None = None,
+) -> TrainerEx.Config:
+    model = build_model_config(
+        flavor, parallelism=parallelism, seq_len=seq_len, num_mtp_layers=num_mtp_layers, converters=converters
+    )
+    if num_layers is not None:
+        # Muon derives its layout and buckets from the final main and MTP layers.
+        model.layers = model.layers[:num_layers]
+        model.n_layers = len(model.layers)
+        model.compress_ratios = model.compress_ratios[:num_layers]
+    return _trainer_config(
+        model,
+        parallelism=parallelism,
+        num_mtp_layers=num_mtp_layers,
+        hf_assets_path=hf_assets_path,
+        data_files=data_files,
+        per_doc_alignment=per_doc_alignment,
+    )
+
 
 # Pre-quantize whitelist for the 8-rank eager sample: dim-0 projections whose
 # local shard keeps a multiple of 64 rows at ``dp_shard=8``.  ``.attention.wkv``

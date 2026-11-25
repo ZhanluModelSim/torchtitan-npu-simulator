@@ -55,7 +55,7 @@ def build_torchtitan_config(model_flavor: str, *, seq_len: int = 4096):
         from torchtitan.config.parallelism import ParallelismConfig
 
         from torchtitan_npu.models.deepseek_v4 import build_model_config
-        from torchtitan_npu_recipes.tests.models.deepseek_v4 import _trainer_config
+        from torchtitan_npu_recipes.models.deepseek_v4 import _trainer_config
 
         parallelism = ParallelismConfig(expert_parallel_degree=1, fsdp_reshard_after_forward="always")
         model = build_model_config(model_flavor, parallelism=parallelism, seq_len=seq_len, num_mtp_layers=0)

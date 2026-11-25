@@ -13,6 +13,8 @@ from typing import TYPE_CHECKING
 from torchtitan.components.optim import OptimizersContainer
 from torchtitan.experiments.torchft.optimizer import TorchFTOptim, TorchFTOptimizersContainer
 
+from .optimizer_recovery import OptimizerRecovery
+
 if TYPE_CHECKING:
     from torchtitan_npu.extensions.torchtitan.experiments.torchft.manager import ManagerEx
 
@@ -28,6 +30,7 @@ class TorchFTOptimizersContainerEx(TorchFTOptimizersContainer):
         super().configure_fault_tolerance(ft_manager)
         self.hccl_recovery = ft_manager.process_group.recovery
         self._transaction_manager = ft_manager.manager
+        self._transaction_manager.optimizer_recovery = OptimizerRecovery(self.optimizers)
 
     def zero_grad(self, set_to_none: bool = True) -> None:  # pyrefly: ignore [bad-override]
         self.hccl_recovery.begin_attempt()

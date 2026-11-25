@@ -21,22 +21,28 @@ from torchtitan_npu.extensions.torchtitan.experiments.torchft.recovery.hccl impo
 
 
 def test_cpu_snapshot_survives_optimizer_counter_and_nested_metadata_updates():
-    state = {"step": torch.tensor(2.0), "groups": [{"lr": 0.1}]}
+    state = {"step": torch.tensor(2.0), "groups": [{"lr": 0.1, "eps": 0.001}]}
     snapshot = _snapshot_to_cpu(state)
     state["step"].add_(1)
     state["groups"][0]["lr"] = 0.01
+    state["step"] = state.pop("step")
+    state["groups"][0]["lr"] = state["groups"][0].pop("lr")
     restored = _restore_tensor_leaves(snapshot, state)
     restored["step"].add_(1)
 
     assert snapshot["step"].item() == 2
-    assert snapshot["groups"] == [{"lr": 0.1}]
+    assert snapshot["groups"] == [{"lr": 0.1, "eps": 0.001}]
     assert restored["step"].item() == 3
-    assert restored["groups"] == [{"lr": 0.1}]
+    assert restored["groups"] == [{"lr": 0.1, "eps": 0.001}]
 
 
 def test_recovery_rejects_mismatched_tensor_shape_before_loading():
     with pytest.raises(ValueError, match="shape or dtype"):
         _restore_tensor_leaves({"weight": torch.ones(2)}, {"weight": torch.zeros(3)})
+    with pytest.raises(ValueError, match="structure"):
+        _restore_tensor_leaves({"old": 1, "keep": 2}, {"keep": 2, "new": 1})
+    with pytest.raises(ValueError, match="structure"):
+        _restore_tensor_leaves({"items": [1, 2]}, {"items": (1, 2)})
 
 
 def test_reset_failed_iteration_clears_cached_fsdp_gradients(monkeypatch):

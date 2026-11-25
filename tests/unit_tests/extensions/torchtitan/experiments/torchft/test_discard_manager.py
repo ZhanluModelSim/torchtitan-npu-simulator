@@ -61,6 +61,36 @@ def test_initial_barrier_runs_only_once_across_local_quorum_reset(monkeypatch):
     assert events == ["replica barrier", "quorum", "quorum"]
 
 
+def test_mixed_healing_validates_without_reloading_the_donor(monkeypatch):
+    manager = object.__new__(ManagerEx)
+    manager._group_world_size = 4
+    manager._initial_quorum_barrier_pending = False
+    manager._healing = False
+    manager._snapshot_requested = Event()
+    manager.optimizer_recovery = Mock()
+    manager._export_snapshot = Mock()
+    manager._apply_pending_state_dict = Mock()
+    monkeypatch.setattr(manager, "errored", lambda: None)
+    monkeypatch.setattr(torch.accelerator, "current_accelerator", lambda: torch.device("cpu"))
+
+    def reduce(flags, op):
+        assert op == torch.distributed.ReduceOp.MAX
+        if flags.numel() == 3:
+            flags[0] = 1  # A sibling is receiving; this donor must only join validation.
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", reduce)
+    manager._coordinate_healing(None)
+    manager.optimizer_recovery.validate.assert_called_once_with()
+    manager._export_snapshot.assert_not_called()
+    manager._apply_pending_state_dict.assert_not_called()
+
+    error = TimeoutError("quorum RPC timed out")
+    with pytest.raises(RuntimeError, match="quorum failed") as raised:
+        manager._coordinate_healing(error)
+    assert raised.value.__cause__ is error
+    manager.optimizer_recovery.validate.assert_called_once_with()
+
+
 def test_failed_configure_retries_quorum_when_no_process_group_exists():
     manager = SimpleNamespace(
         _initial_quorum_barrier_pending=False,

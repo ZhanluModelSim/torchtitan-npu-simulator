@@ -6,7 +6,9 @@ import subprocess
 import sys
 
 
-def test_ft_trainer_config_and_npu_lifecycle():
+def test_ft_trainer_config_and_npu_lifecycle(monkeypatch):
+    monkeypatch.delenv("TORCHFT_REPLICA_ID", raising=False)
+    monkeypatch.delenv("TORCHFT_MIN_REPLICA_SIZE", raising=False)
     program = """
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -18,8 +20,10 @@ from torchtitan.experiments.torchft.optimizer import TorchFTOptim
 from torchtitan_npu.extensions.torchtitan.experiments import torchft as activation
 from torchtitan_npu.extensions.torchtitan.experiments.torchft import trainer as module
 from torchtitan_npu.extensions.torchtitan import trainer as npu_trainer
+from torchtitan_npu_recipes.models.deepseek_v4 import _enable_indexer_aux_loss
 from torchtitan_npu_recipes.tests.ci.deepseek_v4 import deepseek_v4_flash
-from torchtitan_npu_recipes.tests.ci.deepseek_v4 import deepseek_v4_flash_8p_torchft
+from torchtitan_npu_recipes.tests.torchft.deepseek_v4 import deepseek_v4_flash_8p_torchft
+from torchtitan_npu_recipes.torchft.deepseek_v4 import _torchft_flash_config
 from torchtitan_npu.extensions.torchtitan.experiments.torchft.optimizer import TorchFTOptimEx
 
 engine_class = upstream.FaultTolerantTrainingEngine
@@ -32,7 +36,7 @@ assert issubclass(module.FaultTolerantTrainingEngineEx, engine_class)
 
 def make_config():
     return ConfigLoader().load([
-        '--module', 'torchtitan_npu_recipes.tests.ci.deepseek_v4',
+        '--module', 'torchtitan_npu_recipes.tests.torchft.deepseek_v4',
         '--config', 'deepseek_v4_flash_8p_torchft',
     ])
 
@@ -41,8 +45,18 @@ assert isinstance(config, module.FaultTolerantTrainerEx.Config)
 assert config.fault_tolerance.group_size == 2
 assert config.fault_tolerance.min_replica_size == 2
 assert config.fault_tolerance.replica_id == 0
+with patch.dict('os.environ', TORCHFT_REPLICA_ID='1', TORCHFT_MIN_REPLICA_SIZE='1'):
+    replacement_config = make_config()
+    assert replacement_config.fault_tolerance.replica_id == replacement_config.fault_tolerance.min_replica_size == 1
+    assert replacement_config.fault_tolerance.group_size == 2
 assert config.checkpointer.enable_ft_dataloader_checkpoints
 assert config.model.n_layers == 4
+aux_loss = config.model.layers[2].attention.inner_attention.aux_loss
+assert aux_loss is not None and aux_loss.coeff > 0
+muon = config.optim.optimizer.optimizers[0]
+for names in (muon.compute_sharding_by_fqn, [bucket.name for bucket in muon.bucket_configs]):
+    assert {int(name.split('.')[1]) for name in names if name.startswith('layers.')} == set(range(4))
+    assert {int(name.split('.')[1]) for name in names if name.startswith('mtp_layers.')} == {0}
 assert config.parallelism.expert_parallel_degree == 4
 assert config.parallelism.data_parallel_shard_degree == 4
 assert config.training.max_context_length == config.model.max_context_length == 256
@@ -54,7 +68,7 @@ assert not config.extension.quantization.enable_quantized_training
 assert config.override.imports == ["torchtitan_npu.override.common.rope.workaround"]
 
 full_config = ConfigLoader().load([
-    '--module', 'torchtitan_npu_recipes.tests.ci.deepseek_v4',
+    '--module', 'torchtitan_npu_recipes.torchft.deepseek_v4',
     '--config', 'deepseek_v4_flash_torchft',
 ])
 assert isinstance(full_config, module.FaultTolerantTrainerEx.Config)
@@ -64,6 +78,15 @@ assert full_config.parallelism.data_parallel_shard_degree == 64
 assert full_config.parallelism.expert_parallel_degree == 64
 assert full_config.checkpointer.enable_ft_dataloader_checkpoints
 base_config = deepseek_v4_flash()
+_enable_indexer_aux_loss(base_config.model)
+assert aux_loss == base_config.model.layers[2].attention.inner_attention.aux_loss
+with patch.object(base_config, 'checkpointer', type(config.checkpointer)(folder='custom-ckpt')):
+    converted = _torchft_flash_config(
+        base_config, expert_parallel_degree=base_config.parallelism.expert_parallel_degree,
+        data_parallel_shard_degree=base_config.parallelism.data_parallel_shard_degree,
+    )
+    assert converted.checkpointer.folder == 'custom-ckpt'
+    assert converted.checkpointer.enable_ft_dataloader_checkpoints
 assert full_config.optim.optimizer.optimizers == base_config.optim.optimizer.optimizers
 assert full_config.optim.gradient_clipper == base_config.optim.gradient_clipper
 assert full_config.optim.enable_cuda_graph == base_config.optim.enable_cuda_graph
@@ -71,7 +94,7 @@ assert isinstance(full_config.optim, TorchFTOptimEx.Config)
 module.FaultTolerantTrainerEx._validate_supported_config(full_config)
 
 small_expert_config = ConfigLoader().load([
-    '--module', 'torchtitan_npu_recipes.tests.ci.deepseek_v4',
+    '--module', 'torchtitan_npu_recipes.tests.torchft.deepseek_v4',
     '--config', 'deepseek_v4_flash_43layers_16experts_torchft',
 ])
 assert isinstance(small_expert_config, module.FaultTolerantTrainerEx.Config)
