@@ -20,6 +20,15 @@ from torchtitan_simulator import runner
 from torchtitan_simulator.compat import meta_initialization as initialization
 from torchtitan_simulator.config import SimulationConfig
 
+try:
+    from spmd_types import MeshAxis
+    from torch.distributed._mesh_layout import _FlatLayout
+except ImportError:
+    MeshAxis = _FlatLayout = None
+
+has_axis_cache = MeshAxis is not None and _FlatLayout is not None
+requires_axis_cache = pytest.mark.skipif(not has_axis_cache, reason="requires MeshAxis and _FlatLayout")
+
 
 def _metadata(tensor):
     return tensor.shape, tensor.stride(), tensor.storage_offset(), tensor.dtype, tensor.device
@@ -63,6 +72,47 @@ def test_meta_submesh_keeps_its_snapshot_after_rank_tensor_changes(fake_world):
         child = root["tp"]
     assert root._flatten_rank_map == (2, 0, 3, 1)
     assert child._flatten_rank_map == (2, 0, 1, 3)
+
+
+@requires_axis_cache
+def test_axis_subset_cache_reuses_equal_layouts_and_resets_after_failure(monkeypatch):
+    native = MeshAxis.__le__
+    calls = []
+
+    def observed(left, right):
+        calls.append((left, right))
+        return native(left, right)
+
+    monkeypatch.setattr(MeshAxis, "__le__", observed)
+    even = MeshAxis.of(2, 2)  # {0, 2}
+    dense = MeshAxis.of(3, 1)  # {0, 1, 2}
+    far = MeshAxis.of(2, 3)  # {0, 3}
+    with pytest.raises(RuntimeError, match="scope failure"), initialization.meta_initialization():
+        assert even <= dense
+        assert MeshAxis.of(2, 2) <= MeshAxis.of(3, 1)
+        assert not dense <= even
+        assert not far <= dense
+        assert not MeshAxis.of(2, 3) <= dense
+        assert calls == [(even, dense), (dense, even), (far, dense)]
+        raise RuntimeError("scope failure")
+    assert MeshAxis.__le__ is observed
+    with initialization.meta_initialization():
+        assert even <= dense
+    assert calls[-1] == (even, dense) and len(calls) == 4
+    assert MeshAxis.__le__ is observed
+
+
+@requires_axis_cache
+def test_axis_subset_cache_preserves_native_dispatch_for_other_types():
+    class UnhashableAxis(MeshAxis):
+        __hash__ = None
+
+    axis = MeshAxis.of(4, 1)
+    child = UnhashableAxis(MeshAxis.of(2, 1).layout)
+    with initialization.meta_initialization():
+        assert child <= axis
+        assert axis.__le__(child) is False
+        assert axis.__le__([]) is NotImplemented
 
 
 @pytest.mark.parametrize(
@@ -206,12 +256,15 @@ def test_repeated_scopes_release_rebound_functions_and_restore_after_failures():
     assert all(ref() is None for ref in refs)
 
 
-def test_simulate_reports_rank_map_sharing_during_fsdp_initialization(caplog):
+def test_simulate_reuses_rank_maps_and_axis_subsets_during_fsdp_initialization(caplog):
     config = SimulationConfig(world_size=8, logical_rank=7, data_parallel_replicate_degree=2, seq_len=128)
     with caplog.at_level(logging.INFO, logger=initialization.__name__):
         runner.simulate(config)
     (count,) = re.findall(r"Meta FSDP initialization shared_rank_maps=(\d+)", caplog.text)
     assert int(count) > 0
+    if has_axis_cache:
+        ((hits, misses),) = re.findall(r"Meta FSDP axis subset cache hits=(\d+) misses=(\d+)", caplog.text)
+        assert int(hits) > 0 and int(misses) > 0
 
 
 @pytest.mark.parametrize("algorithm", ["Muon", "AdamW"])
