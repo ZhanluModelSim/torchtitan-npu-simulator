@@ -64,6 +64,8 @@ def test_meta_linear_adamw_step_builds_graphs_and_local_parameter_memory(capsys)
         "优化器阶段峰值",
         "权重大小",
         "优化器状态大小",
+        "host 权重大小",
+        "host 优化器状态大小",
     ]
 
 
