@@ -10,6 +10,7 @@ import sys
 from datetime import timedelta
 from itertools import product
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 import torch.distributed as dist
@@ -17,9 +18,37 @@ import torch.distributed.checkpoint as dcp
 from torch.distributed.checkpoint import HuggingFaceStorageReader, HuggingFaceStorageWriter
 from torch.distributed.checkpoint._consolidate_hf_safetensors import consolidate_safetensors_files_on_every_rank
 
+from torchtitan_npu.extensions.torchtitan.components.checkpoint import CheckpointManager
 from torchtitan_npu.models.deepseek_v4_1 import model_registry
 from torchtitan_npu.models.deepseek_v4_1.engram.checkpoint import checkpoint_shard
 from torchtitan_npu.models.deepseek_v4_1.state_dict_adapter import DeepSeekV41StateDictAdapter
+
+
+def _last_step_manager(
+    save_root: Path,
+    *,
+    adapter: DeepSeekV41StateDictAdapter,
+    cached_state: dict,
+    to_hf: bool,
+) -> CheckpointManager:
+    def get_state_dict():
+        return cached_state
+
+    def checkpoint_id(step: int) -> str:
+        return str(save_root / f"step-{step}")
+
+    manager = object.__new__(CheckpointManager)
+    manager.folder = str(save_root)
+    manager.states = {"model": SimpleNamespace(state_dict=get_state_dict)}
+    manager.sd_adapter = adapter
+    manager.last_save_model_only = True
+    manager.last_save_in_hf = to_hf
+    manager.export_dtype = torch.bfloat16
+    manager._metadata_pg = None
+    manager.pg = None
+    manager.verify_hash_manifest = False
+    manager._create_checkpoint_id = checkpoint_id
+    return manager
 
 
 def main():
@@ -58,33 +87,46 @@ def main():
             key = "layers.1.engram.table.weight"
             adapter = DeepSeekV41StateDictAdapter(config, str(assets) if mapped else None)
             native = {key: weight[offset : offset + rows].clone(), "layers.1.engram.gate.q_weight": gate}
-            # Attach checkpoint metadata to the final typed view.
-            native = {name: value.to(torch.bfloat16) for name, value in native.items()}
-            native[key] = checkpoint_shard(native[key], offset=offset, logical_rows=48)
             native_path = root / f"native_{layout}_{mapped}"
-            dcp.save(native, checkpoint_id=str(native_path))
+            path = root / f"{layout}_{'mapped' if mapped else 'unmapped'}"
+            if layout == "efsdp_ep" and mapped:
+                native_fp32 = checkpoint_shard(native[key], offset=offset, logical_rows=48)
+                cached_state = {key: native_fp32, "layers.1.engram.gate.q_weight": gate.clone()}
+                for to_hf, save_root in ((False, native_path), (True, path)):
+                    manager = _last_step_manager(save_root, adapter=adapter, cached_state=cached_state, to_hf=to_hf)
+                    manager._save_last_step(2)
+                    dist.barrier()
+                assert cached_state[key] is native_fp32
+                assert native_fp32.dtype == torch.float32
+                assert native_fp32.global_shape == (48, 32)
+                native_path = native_path / "step-2"
+                path = path / "step-2"
+            else:
+                # Attach checkpoint metadata to the final typed view.
+                native = {name: value.to(torch.bfloat16) for name, value in native.items()}
+                native[key] = checkpoint_shard(native[key], offset=offset, logical_rows=48)
+                dcp.save(native, checkpoint_id=str(native_path))
+                hf = adapter.to_hf(native)
+                assert type(hf["layers.1.engram.embed.weight"]) is torch.Tensor
+                mapping = adapter.fqn_to_index_mapping
+                dcp.save(
+                    hf,
+                    storage_writer=HuggingFaceStorageWriter(
+                        str(path / "sharded" if mapping else path),
+                        save_distributed=True,
+                        fqn_to_index_mapping=mapping,
+                        enable_consolidation=not mapping,
+                    ),
+                )
+                if mapping:
+                    consolidate_safetensors_files_on_every_rank(
+                        input_dir=str(path / "sharded"),
+                        output_dir=str(path),
+                        fqn_to_index_mapping=mapping,
+                    )
             full_native = {key: torch.empty_like(weight, dtype=torch.bfloat16)}
             dcp.load(full_native, checkpoint_id=str(native_path))
             torch.testing.assert_close(full_native[key], weight.bfloat16(), rtol=0, atol=0)
-            hf = adapter.to_hf(native)
-            assert type(hf["layers.1.engram.embed.weight"]) is torch.Tensor
-            path = root / f"{layout}_{'mapped' if mapped else 'unmapped'}"
-            mapping = adapter.fqn_to_index_mapping
-            dcp.save(
-                hf,
-                storage_writer=HuggingFaceStorageWriter(
-                    str(path / "sharded" if mapping else path),
-                    save_distributed=True,
-                    fqn_to_index_mapping=mapping,
-                    enable_consolidation=not mapping,
-                ),
-            )
-            if mapping:
-                consolidate_safetensors_files_on_every_rank(
-                    input_dir=str(path / "sharded"),
-                    output_dir=str(path),
-                    fqn_to_index_mapping=mapping,
-                )
             restored = {
                 "layers.1.engram.embed.weight": torch.empty(41, 32, dtype=torch.bfloat16),
                 "layers.1.engram.q_weight": torch.empty_like(gate, dtype=torch.bfloat16),
@@ -95,10 +137,11 @@ def main():
             target = adapter.to_hf(
                 {key: checkpoint_shard(torch.full((rows, 32), -1.0), offset=offset, logical_rows=48)}
             )
+            valid = max(0, min(rows, 41 - offset))
+            assert target["layers.1.engram.embed.weight"].local_sizes == ((valid, 32),)
             dcp.load(target, storage_reader=HuggingFaceStorageReader(str(path)))
             loaded = adapter.from_hf(target)
             assert set(loaded) == {key}
-            valid = max(0, min(rows, 41 - offset))
             expected = weight[offset : offset + valid].bfloat16().float()
             torch.testing.assert_close(loaded[key][:valid], expected, rtol=0, atol=0)
             assert torch.count_nonzero(loaded[key][valid:]) == 0

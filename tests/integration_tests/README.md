@@ -51,7 +51,7 @@ python -m tests.integration_tests.run_tests \
 * **`deepseek_v4_1_quantized`**：DeepSeek-V4.1 Block-FP8 LoRA 专项验证，需支持的设备和运行时；
 * **`deepseek_v4_1_golden`**：DeepSeek-V4.1 golden 用例，30 步参考 Loss 逐值比对；同时纳入默认 `models` suite；
 * **`deepseek_v4_1_fused`**：DeepSeek-V4.1 多模态打包/融合与 Muon 冒烟，需 vision fixture，单独运行；
-* **`deepseek_v4_1_engram_hf`**：Engram MXFP8 与 DCP/HF 回环测试的旧入口，尚未迁移，见[迁移状态](#engram-hf-专项验证迁移状态)。
+* **`deepseek_v4_1_engram_hf`**：DeepSeek-V4.1 四卡 Engram DCP/HF 导出加载与三步训练回环验证，见[Engram HF 专项验证](#engram-hf-专项验证)。
 
 本轮 Router / MoE 重构的 NPU golden 验收范围为 `TP=1 / CP=1 / PP=1`、两卡 `FSDP2 / EP2`。保留的 Gloo TP2 CPU 测试只验证通用布局与计数合同，不表示 NPU TP2 支持。当前 NPU runtime 对非 gather 维度分片的 DTensor 存在 gather backward 全局形状未局部化及输入形状缓存键遗漏问题；其修复与 NPU TP2 复现测试已拆出，本轮不包含该修复。
 
@@ -142,7 +142,8 @@ python -m tests.integration_tests.run_tests ./test_reports/v41-reference-mm \
     --ngpu 2
   ```
 
-* **Engram HF 专项验证**：旧入口尚未完成 0.4.0 迁移，不能作为当前可执行示例，详见[迁移状态](#engram-hf-专项验证迁移状态)。
+* **Engram HF 专项验证 (`deepseek_v4_1_engram_hf`)**：
+  通过 `tests/integration_tests/engram_hf.py` Python recipe 与 `run_engram_hf.sh` 在四卡上验证 EP4/FSDP4 与 EP2×EFSDP2 两种 Engram 分片布局的原生 DCP / HF safetensors 导出、重载和三步训练对齐，详见[Engram HF 专项验证](#engram-hf-专项验证)。
 
 #### 3. 4die 并发调度（`GPUPool`）、实际耗时汇总与通信端口防冲突
 当执行包含多个用例的套件时，`run_tests` 默认复用 TorchTitan 的 `GPUPool` 机制并发执行测试，自动按卡号切分：
@@ -353,8 +354,26 @@ gh workflow run a3_16p_lite_actions.yml -R torchtitan-npu/torchtitan-npu --ref m
 
 ---
 
-## Engram HF 专项验证迁移状态
+## Engram HF 专项验证
 
-`deepseek_v4_1_engram_hf` 仍保留注册，但 `run_engram_hf.sh` 使用旧字段 CLI 和旧 override 环境变量，不能直接用于当前 ConfigLoader。该入口不能以「suite 存在」视为验证通过，也不能仅替换参数名称后执行。
+`deepseek_v4_1_engram_hf` 已迁移到 TorchTitan 0.4.0 Python recipe（`tests/integration_tests/engram_hf.py`、`tests/integration_tests/run_engram_hf.sh`），覆盖四卡 `ep4`（EP4/FSDP4）与 `ep2_efsdp2`（EP2×EFSDP2 联合分片）两种 Engram 布局：
 
-原用例设计覆盖四卡 EP4/FSDP4 与 EP2×EFSDP2：保存原生 DCP 和 FP32 HF 权重，检查 Engram 参数、MXFP8 缓存及加载后的训练指标。迁移需同步 Python recipe、checkpoint 调用接口和结果采集；完成运行验证后再恢复使用命令。当前 Muon / AdamW NovaSwap 续训使用上文已迁移的 `deepseek_v4_checkpoint` suite。
+- **默认路径（`ENGRAM_HF_BACKEND=host`，`ENGRAM_HF_EXPORT_DTYPE=bfloat16`）**：使用 `HostEngramTable` 与仓内 `tests/assets/deepseek_v3` tokenizer、`tests/assets/c4_test/data.json`，不依赖 `cann_ops_transformer`。每组布局执行 `source`（2 步训练并导出配对 `step-2-native` DCP 与 `step-2` HF safetensors）→ `native`（3 步）→ `hf`（3 步），校对导出 HF safetensors 的 dtype / 全局逻辑 shape / 数值、四卡重载后的 Engram 参数一致性，以及 `native` 与 `hf` 未截断 TensorBoard `loss_metrics/global_avg_loss`、`grad_norm` 的逐值等价。
+- **可选 MXFP8 路径（`ENGRAM_HF_BACKEND=mxfp8`）**：启用 `torchtitan_npu.override.deepseek_v4_1.engram.host_offload_mxfp8` 并额外校验 `_quantized_storage` / `_quantized_scale` 缓存重建；需运行环境已安装 `cann_ops_transformer`。
+- **可选 FP32 导出（`ENGRAM_HF_EXPORT_DTYPE=float32`）**：验证无精度截断的 FP32 模型权重导出与回环。
+
+```bash
+# 通过统一 runner 运行四卡 Engram HF 套件（默认 Host + bfloat16 导出）
+python -m tests.integration_tests.run_tests ./test_reports/engram-hf \
+  --test_suite deepseek_v4_1_engram_hf --ngpu 4 --no-parallel
+
+# 或单独运行单组布局（ENGRAM_HF_JOINT_SHARDING=0 表示 ep4，1 表示 ep2_efsdp2）
+ENGRAM_HF_JOINT_SHARDING=1 bash tests/integration_tests/run_engram_hf.sh \
+  --output-dir ./test_reports/engram-hf-ep2-efsdp2
+
+# 在安装 cann_ops_transformer 的环境中启用 MXFP8 缓存验证
+ENGRAM_HF_BACKEND=mxfp8 python -m tests.integration_tests.run_tests ./test_reports/engram-hf-mxfp8 \
+  --test_suite deepseek_v4_1_engram_hf --ngpu 4 --no-parallel
+```
+
+当前 Muon / AdamW NovaSwap 续训使用上文已迁移的 `deepseek_v4_checkpoint` suite。

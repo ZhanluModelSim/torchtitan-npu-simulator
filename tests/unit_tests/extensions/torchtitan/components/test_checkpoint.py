@@ -291,3 +291,63 @@ def test_checkpoint_manager_delegates_async_and_hf_paths(async_mode, to_hf):
         enable_garbage_collection=False,
         to_hf=to_hf,
     )
+
+
+@pytest.mark.parametrize("to_hf", [False, True], ids=["dcp", "hf"])
+def test_last_step_dtype_conversion_preserves_row_shards(to_hf):
+    manager = object.__new__(product_checkpoint.CheckpointManager)
+    weight = torch.arange(12, dtype=torch.float32).reshape(4, 3)
+    counter = torch.tensor(3, dtype=torch.int64)
+    metadata = {
+        "global_shape": (8, 3),
+        "global_offsets": ((4, 0),),
+        "local_offsets": ((0, 0),),
+        "local_sizes": ((4, 3),),
+    }
+    for name, value in metadata.items():
+        setattr(weight, name, value)
+    cached_state = {"table": weight, "counter": counter}
+
+    def get_state_dict():
+        return cached_state
+
+    def checkpoint_id(step):
+        return f"step-{step}"
+
+    manager.states = {"model": types.SimpleNamespace(state_dict=get_state_dict)}
+    manager.last_save_model_only = True
+    manager.last_save_in_hf = to_hf
+    manager.export_dtype = torch.bfloat16
+    manager._create_checkpoint_id = checkpoint_id
+    manager.dcp_save = MagicMock()
+
+    manager._save_last_step(5)
+
+    saved_state = manager.dcp_save.call_args.args[0]
+    assert saved_state is not cached_state
+    assert cached_state["table"] is weight
+    saved = saved_state["table"]
+    assert saved.dtype == torch.bfloat16
+    assert saved is not weight
+    torch.testing.assert_close(saved, weight.to(torch.bfloat16), rtol=0, atol=0)
+    for name, expected in metadata.items():
+        assert getattr(saved, name) == expected
+    assert saved_state["counter"] is counter
+    assert weight.dtype == torch.float32
+    assert manager.dcp_save.call_args.kwargs == {
+        "checkpoint_id": "step-5",
+        "async_mode": _AsyncMode.DISABLED,
+        "enable_garbage_collection": True,
+        "to_hf": to_hf,
+    }
+
+
+def test_last_step_full_checkpoint_delegates_to_upstream():
+    manager = object.__new__(product_checkpoint.CheckpointManager)
+    manager.last_save_model_only = False
+    manager.last_save_in_hf = False
+
+    with patch.object(_CheckpointManager, "_save_last_step") as base_save_last_step:
+        manager._save_last_step(5)
+
+    base_save_last_step.assert_called_once_with(5)

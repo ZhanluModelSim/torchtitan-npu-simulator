@@ -5,6 +5,7 @@
 
 """Checkpoint manager extension with NPU-aware save and hash verification."""
 
+import logging
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 from typing import Any
@@ -29,6 +30,12 @@ from torchtitan_npu.extensions.components.validation import (
     verify_checkpoint_manifest,
     write_checkpoint_manifest,
 )
+
+logger = logging.getLogger(__name__)
+
+# Standard PyTorch ``torch.distributed.checkpoint.CheckpointableTensor`` protocol
+# attributes that declare local-to-global shard layout on plain ``torch.Tensor`` objects.
+_CHECKPOINTABLE_TENSOR_ATTRS = ("global_shape", "global_offsets", "local_offsets", "local_sizes")
 
 
 @dataclass(kw_only=True, slots=True)
@@ -88,6 +95,31 @@ class CheckpointManager(_CheckpointManager):
         finally:
             if group is not None and dist.is_initialized():
                 dist.destroy_process_group(group)
+
+    @torch.no_grad()
+    def _save_last_step(self, curr_step: int) -> None:
+        if not self.last_save_model_only:
+            return super()._save_last_step(curr_step)
+
+        # TorchTitan 0.4.0 drops PyTorch CheckpointableTensor attributes during dtype conversion.
+        # Recheck this model-only branch when upgrading the upstream checkpointer.
+        states = dict(self.states[MODEL].state_dict())
+        for key, value in states.items():
+            if not isinstance(value, torch.Tensor) or not value.is_floating_point() or value.dtype == self.export_dtype:
+                continue
+            converted = value.to(self.export_dtype)
+            for name in _CHECKPOINTABLE_TENSOR_ATTRS:
+                if hasattr(value, name):
+                    setattr(converted, name, getattr(value, name))
+            states[key] = converted
+        logger.info("Saving a model only checkpoint in %s at last step, step %s.", self.export_dtype, curr_step)
+        self.dcp_save(
+            states,
+            checkpoint_id=self._create_checkpoint_id(curr_step),
+            async_mode=AsyncMode.DISABLED,
+            enable_garbage_collection=True,
+            to_hf=self.last_save_in_hf,
+        )
 
     @torch.no_grad()
     def dcp_save(
