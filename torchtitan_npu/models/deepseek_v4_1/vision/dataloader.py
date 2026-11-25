@@ -134,7 +134,9 @@ class _GrainV41Collator(Collator):
             positions=inputs.pop("positions"),
             padding_mask=padding_mask,
             loss_token_counts=(labels != -100).sum(),
-            routing_token_counts=(~padding_mask).sum(),
+            # Upstream keeps routing counts one-dimensional (one entry per routing objective);
+            # ``aux_loss_denominators[0]`` in the model indexes that vector.
+            routing_token_counts=(~padding_mask).sum().reshape(1),
             model_kwargs=inputs,
         )
 

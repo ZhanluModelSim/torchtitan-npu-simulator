@@ -215,3 +215,12 @@ def test_packed_vision_batch_reaches_folded_attention_metadata(tokenizer, single
         metadata = kwargs["attention_metadata"][attention.attention_metadata_key]
         torch.testing.assert_close(metadata.cu_seq_q, boundaries, rtol=0, atol=0)
         torch.testing.assert_close(metadata.cu_seq_k, boundaries // max(attention.compress_ratio, 1), rtol=0, atol=0)
+
+
+def test_collator_emits_one_routing_objective(tokenizer):
+    # Upstream's collator keeps ``routing_token_counts`` one-dimensional even when the loss
+    # counts collapse to a scalar; the model indexes ``aux_loss_denominators[0]``.
+    microbatch = next(iter(_loader(tokenizer)))
+    assert microbatch.loss_token_counts.ndim == 0
+    assert microbatch.routing_token_counts.shape == (1,)
+    assert int(microbatch.routing_token_counts[0]) == int((~microbatch.padding_mask).sum())

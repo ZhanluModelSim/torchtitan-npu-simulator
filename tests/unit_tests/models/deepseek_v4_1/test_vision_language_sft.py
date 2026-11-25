@@ -42,6 +42,8 @@ def _unpack(microbatch):
     inputs = microbatch.as_input_dict()
     labels = inputs.pop("labels")
     inputs["loss_token_count"] = int(microbatch.loss_token_counts)
+    # Same contract as the caption loader: routing counts stay a one-entry vector.
+    assert microbatch.routing_token_counts.shape == (1,)
     return inputs, labels
 
 
