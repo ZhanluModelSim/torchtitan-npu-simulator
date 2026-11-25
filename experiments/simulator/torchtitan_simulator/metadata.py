@@ -52,8 +52,10 @@ def iter_metadata_tensors(value):
     yield from visit(value)
 
 
-def to_meta_metadata(value):
-    memo = {}
+def to_meta_metadata(value, *, host_splits=()):
+    # Seed before the walk: an alias can occur before the plan or under an
+    # unrelated key. Only the planner knows which lists carry route identity.
+    memo = {id(split): split for split in host_splits}
 
     def lift(item, *, field_name=""):
         if field_name in {"send_splits_tensor", "recv_splits_tensor"}:
