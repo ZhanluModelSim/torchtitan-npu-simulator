@@ -13,13 +13,21 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.distributed.fsdp._fully_shard._fsdp_param as fsdp_param
-from spmd_types import MeshAxis
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import Shard
 from torch.testing._internal.distributed.fake_pg import FakeStore
 from torchtitan_simulator import runner
 from torchtitan_simulator.compat import meta_initialization as initialization
 from torchtitan_simulator.config import SimulationConfig
+
+try:
+    from spmd_types import MeshAxis
+    from torch.distributed._mesh_layout import _FlatLayout
+except ImportError:
+    MeshAxis = _FlatLayout = None
+
+has_axis_cache = MeshAxis is not None and _FlatLayout is not None
+requires_axis_cache = pytest.mark.skipif(not has_axis_cache, reason="requires MeshAxis and _FlatLayout")
 
 
 def _metadata(tensor):
@@ -66,6 +74,7 @@ def test_meta_submesh_keeps_its_snapshot_after_rank_tensor_changes(fake_world):
     assert child._flatten_rank_map == (2, 0, 1, 3)
 
 
+@requires_axis_cache
 def test_axis_subset_cache_reuses_equal_layouts_and_resets_after_failure(monkeypatch):
     native = MeshAxis.__le__
     calls = []
@@ -93,6 +102,7 @@ def test_axis_subset_cache_reuses_equal_layouts_and_resets_after_failure(monkeyp
     assert MeshAxis.__le__ is observed
 
 
+@requires_axis_cache
 def test_axis_subset_cache_preserves_native_dispatch_for_other_types():
     class UnhashableAxis(MeshAxis):
         __hash__ = None
@@ -252,8 +262,9 @@ def test_simulate_reuses_rank_maps_and_axis_subsets_during_fsdp_initialization(c
         runner.simulate(config)
     (count,) = re.findall(r"Meta FSDP initialization shared_rank_maps=(\d+)", caplog.text)
     assert int(count) > 0
-    ((hits, misses),) = re.findall(r"Meta FSDP axis subset cache hits=(\d+) misses=(\d+)", caplog.text)
-    assert int(hits) > 0 and int(misses) > 0
+    if has_axis_cache:
+        ((hits, misses),) = re.findall(r"Meta FSDP axis subset cache hits=(\d+) misses=(\d+)", caplog.text)
+        assert int(hits) > 0 and int(misses) > 0
 
 
 @pytest.mark.parametrize("algorithm", ["Muon", "AdamW"])
