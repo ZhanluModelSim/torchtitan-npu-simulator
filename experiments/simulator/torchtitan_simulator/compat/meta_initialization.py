@@ -1,21 +1,18 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
-"""Avoid unused empty Meta chunks inside audited FSDP initialization methods.
-
-The upstream helper and its public list contract remain untouched. Only private
-function namespaces of the two initialization consumers use the local sequence;
-no parameter, chunk, or function replacement survives the parallelize scope.
-"""
+"""Limit host allocations while FSDP initializes the Meta model and its meshes."""
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
-from functools import partial
+from functools import partial, wraps
 from types import CellType, FunctionType
 from typing import overload
 
 import torch
+from torch.distributed.device_mesh import DeviceMesh
 
 from torchtitan_simulator.compat.patches import PatchScope
 
@@ -95,13 +92,36 @@ def _rebind_initializer(method: FunctionType) -> FunctionType:
 
 @contextmanager
 def meta_initialization() -> Iterator[None]:
-    """Limit Meta chunk optimization to native FSDP initialization consumers."""
+    """Scope Meta chunk and rank-map sharing to native parallelization."""
     import torch.distributed.fsdp._fully_shard._fsdp_param as fsdp_param
 
+    native_mesh_init = DeviceMesh.__init__
+    shared_rank_maps = 0
+
+    @wraps(native_mesh_init)
+    def initialize_mesh(self: DeviceMesh, *args, **kwargs) -> None:
+        nonlocal shared_rank_maps
+        native_mesh_init(self, *args, **kwargs)
+        if self.device_type != "meta":
+            return
+        # PyTorch materializes a world-sized tuple for hashing each submesh.
+        # Reuse the root snapshot only when its backing tensor and ordered values match.
+        root = getattr(self, "_root_mesh", None)
+        rank_map = getattr(self, "_rank_map", None)
+        if rank_map is None or rank_map is not getattr(root, "_rank_map", None):
+            return
+        ranks = getattr(self, "_flatten_rank_map", None)
+        root_ranks = getattr(root, "_flatten_rank_map", None)
+        if type(ranks) is tuple and type(root_ranks) is tuple and ranks is not root_ranks and ranks == root_ranks:
+            self._flatten_rank_map = root_ranks
+            shared_rank_maps += 1
+
     with PatchScope() as patches:
+        patches.replace(DeviceMesh, "__init__", initialize_mesh)
         for name in ("_init_sharded_param", "_init_sharded_post_forward_param_metadata"):
             method = getattr(fsdp_param.FSDPParam, name)
             if not isinstance(method, FunctionType):
                 continue
             patches.replace(fsdp_param.FSDPParam, name, _rebind_initializer(method))
         yield
+    logging.getLogger(__name__).info("Meta FSDP initialization shared_rank_maps=%d", shared_rank_maps)
