@@ -7,6 +7,7 @@
 
 import importlib
 import logging
+import re
 import sys
 from dataclasses import dataclass
 from types import ModuleType, SimpleNamespace
@@ -647,3 +648,78 @@ def test_v4_quantized_indexer_adapter_preserves_backward_record_and_frames(conve
     assert inputs.cu_seqlens_q is row.q.cu_seqlens
     assert inputs.cu_seqlens_k is row.cmp_k.cu_seqlens
     assert inputs.cmp_residual_k is row.cmp_k.residual
+
+
+def test_apply_quantization_converter_groups_converter_logs_across_layers(converter_module, caplog):
+    from torchtitan.config.parallelism import ParallelismConfig
+
+    from torchtitan_npu.config.configs import KVNormQuantizationConfig, QuantizationExtensionConfig
+    from torchtitan_npu.models.deepseek_v4 import build_model_config
+
+    model_config = build_model_config("debugmodel", num_mtp_layers=0, parallelism=ParallelismConfig())
+    assert len(model_config.layers) == 4
+
+    with caplog.at_level(logging.DEBUG):
+        converter_module.apply_quantization_converter(
+            model_config,
+            QuantizationExtensionConfig(
+                enable_quantized_training=True,
+                recipe="all_mxfp8",
+                kv_norm_quantization=KVNormQuantizationConfig(
+                    format="mxfp8",
+                    block_size=64,
+                    fqns=[".attention.kv_norm", ".attention.compressor.norm"],
+                ),
+            ),
+            model_compile_enabled=False,
+        )
+
+    info_records = [
+        record
+        for record in caplog.records
+        if record.levelno == logging.INFO and record.getMessage().startswith("[Converter] ")
+    ]
+    debug_messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.DEBUG and record.getMessage().startswith("[Converter] ")
+    ]
+    info_messages = [record.getMessage() for record in info_records]
+
+    assert info_messages
+    assert all(" matched=" in msg and " fqns=[" in msg for msg in info_messages)
+    assert len(info_messages) < len(debug_messages)
+    assert sum(int(m.group(1)) for msg in info_messages if (m := re.search(r"matched=(\d+)", msg))) == len(
+        debug_messages
+    )
+    assert any(
+        record.name == "torchtitan_npu.extensions.adaptor.torchao.recipes"
+        and "NpuQuantizeConverter:" in record.getMessage()
+        and "model.layers.{0..3}.attention.wq_a" in record.getMessage()
+        for record in info_records
+    )
+    assert any(
+        record.name == "torchtitan_npu.extensions.adaptor.torchao.components.deepseek_v4"
+        and "KVNormFakeQuantConverter:" in record.getMessage()
+        and "matched=5" in record.getMessage()
+        and "fqns=['model.layers.{0..3}.attention.kv_norm', 'model.layers.2.attention.compressor.norm']"
+        in record.getMessage()
+        for record in info_records
+    )
+    assert any("model.layers.0.attention.wq_a " in msg for msg in debug_messages)
+
+
+def test_quantization_converter_empty_match_emits_no_converter_logs(converter_module, caplog):
+    source = converter_module.Linear.Config(in_features=4, out_features=4)
+    converter = converter_module.NpuQuantizeConverter.Config(
+        base_config=converter_module.mxfp8_param_swap(),
+        filter_fn=lambda _cfg, _fqn: False,
+        require_match=False,
+        unified_npu_quant_modules=converter_module.UNIFIED_NPU_QUANTIZED_MODULES,
+    ).build()
+
+    with caplog.at_level(logging.DEBUG):
+        converted = converter.convert(source)
+
+    assert converted is source
+    assert not [record for record in caplog.records if record.getMessage().startswith("[Converter] ")]

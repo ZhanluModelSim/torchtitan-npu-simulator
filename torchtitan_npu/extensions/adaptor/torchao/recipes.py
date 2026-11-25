@@ -26,6 +26,7 @@ from torchtitan.config import derive
 from torchtitan.config.transform.quantization import QuantizationConverter
 
 from .filters import ConfigFilterFn, _match_fqn_suffix, _replace_config
+from .logging_utils import GroupedConverterLogger
 from .param_swaps import _is_prequantizing_block_mx, _param_swap_without_prequantize
 
 logger = logging.getLogger(__name__)
@@ -200,7 +201,13 @@ class NpuQuantizeConverter(QuantizationConverter):
         self.config = config
         self.matched_prequantize_fqns: set[str] = set()
 
-    def _apply_prequantize_policy(self, base_config: AOBaseConfig, fqn: str) -> AOBaseConfig:
+    def _apply_prequantize_policy(
+        self,
+        base_config: AOBaseConfig,
+        fqn: str,
+        *,
+        policy_logger: GroupedConverterLogger,
+    ) -> AOBaseConfig:
         if self.config.prequantize_fqns is None:
             return base_config
         weight_config = getattr(base_config, "weight_config", None)
@@ -209,13 +216,17 @@ class NpuQuantizeConverter(QuantizationConverter):
 
         patterns = self.config.prequantize_fqns
         matched = [pattern for pattern in patterns if _match_fqn_suffix(fqn, pattern)]
-        if not matched:
-            logger.info("[Converter] %s: fsdp_prequantize=disabled (not in whitelist)", fqn)
-            return _param_swap_without_prequantize(base_config)
+        if matched:
+            self.matched_prequantize_fqns.update(matched)
+            policy_logger.record(
+                "fsdp_prequantize=enabled",
+                fqn,
+                debug_detail=f"fsdp_prequantize=enabled (whitelist {matched[0]})",
+            )
+            return base_config
 
-        logger.info("[Converter] %s: fsdp_prequantize=enabled (whitelist %s)", fqn, matched[0])
-        self.matched_prequantize_fqns.update(matched)
-        return base_config
+        policy_logger.record("fsdp_prequantize=disabled (not in whitelist)", fqn)
+        return _param_swap_without_prequantize(base_config)
 
     def convert(self, model_config):
         converted = 0
@@ -239,6 +250,8 @@ class NpuQuantizeConverter(QuantizationConverter):
                     seen_fqns.add(match[0])
         filtered = 0
         idempotent_skipped = 0
+        replacement_logger = GroupedConverterLogger(self)
+        prequantize_logger = GroupedConverterLogger(self)
         for fqn, config, parent, attr in matches:
             if self.config.filter_fn is not None and not self.config.filter_fn(config, fqn):
                 filtered += 1
@@ -266,7 +279,9 @@ class NpuQuantizeConverter(QuantizationConverter):
                 if quantized_cls is None:
                     quantized_cls = _get_npu_quantized_module_cls(parent_cls)
                 assert hasattr(quantized_cls, "Config"), f"{quantized_cls} missing Config attribute"
-                node_base_config = self._apply_prequantize_policy(self.config.base_config, fqn)
+                node_base_config = self._apply_prequantize_policy(
+                    self.config.base_config, fqn, policy_logger=prequantize_logger
+                )
                 replacement = derive(
                     config,
                     quantized_cls.Config,
@@ -275,17 +290,12 @@ class NpuQuantizeConverter(QuantizationConverter):
                 replacement_name = f"{quantized_cls.__qualname__}.Config"
             model_config = _replace_config(model_config, parent, attr, replacement)
             converted += 1
-            logger.info(
-                "[Converter] %s.%s: model.%s %s -> %s",
-                type(self).__module__,
-                type(self).__qualname__,
-                fqn,
-                type(config).__qualname__,
-                replacement_name,
-            )
+            replacement_logger.record(f"{type(config).__qualname__} -> {replacement_name}", f"model.{fqn}")
 
         if converted == 0 and self.config.require_match:
             raise ValueError("NpuQuantizeConverter did not match any config nodes")
+        replacement_logger.flush()
+        prequantize_logger.flush()
         logger.info(
             "Converted %d config node(s) for torchao-npu%s",
             converted,

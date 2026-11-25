@@ -12,6 +12,9 @@ instead of being silently ignored. Shard-alignment validation is a runtime
 concern (the wrapper tensor's fail-fast guard), not a config-stage one.
 """
 
+import logging
+import re
+
 import pytest
 from torchtitan.config.parallelism import ParallelismConfig
 
@@ -24,6 +27,7 @@ from torchtitan.config.parallelism import ParallelismConfig
 pytest.importorskip("torchao")
 pytest.importorskip("torchao_npu")
 
+from torchtitan.models.base.module import Module
 from torchtitan.models.common.linear import GroupedLinear, Linear
 
 from torchtitan_npu.config.configs import QuantizationExtensionConfig
@@ -234,3 +238,47 @@ def test_mxfp4_communication_config_reaches_only_selected_experts():
         assert weight.fsdp_prequantize_dtype == "mxfp4"
         assert weight.mxfp4_fake_quantize_config is not None
     assert not any(_collect_flags(converted).values())
+
+
+def test_prequantize_policy_groups_enabled_and_disabled_logs(caplog):
+    spec = build_model_config("debugmodel", num_mtp_layers=0, parallelism=ParallelismConfig())
+    quantization = _quantization_config(
+        enable_fsdp_prequantize=True,
+        fsdp_prequantize_fqns=[".attention.wq_a", ".attention.wq_b"],
+    )
+
+    with caplog.at_level(logging.DEBUG):
+        converted = apply_quantization_converter(spec, quantization, model_compile_enabled=False)
+
+    all_flags = {
+        fqn: node._torchao_npu_config.weight_config.fsdp_prequantize
+        for fqn, node, _, _ in converted.traverse(Module.Config, recurse=True)
+        if getattr(getattr(node, "_torchao_npu_config", None), "weight_config", None) is not None
+        and hasattr(node._torchao_npu_config.weight_config, "fsdp_prequantize")
+    }
+    enabled_count = sum(1 for enabled in all_flags.values() if enabled)
+    disabled_count = sum(1 for enabled in all_flags.values() if not enabled)
+    info_policy = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.INFO and "fsdp_prequantize=" in record.getMessage()
+    ]
+    debug_policy = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.DEBUG and "fsdp_prequantize=" in record.getMessage()
+    ]
+
+    enabled_lines = [msg for msg in info_policy if "fsdp_prequantize=enabled matched=" in msg]
+    disabled_lines = [msg for msg in info_policy if "fsdp_prequantize=disabled (not in whitelist)" in msg]
+    assert len(enabled_lines) == 1
+    assert f"matched={enabled_count}" in enabled_lines[0]
+    assert "layers.{0..3}.attention.wq_a" in enabled_lines[0]
+    assert "layers.{0..3}.attention.wq_b" in enabled_lines[0]
+    # One disabled summary per pre-quantizing converter scope (dense + routed experts).
+    assert len(disabled_lines) == 2
+    disabled_matched = sum(int(match.group(1)) for msg in disabled_lines if (match := re.search(r"matched=(\d+)", msg)))
+    assert disabled_matched == disabled_count
+    assert len(debug_policy) == len(all_flags)
+    assert any("fsdp_prequantize=enabled (whitelist .attention.wq_a)" in msg for msg in debug_policy)
+    assert any("fsdp_prequantize=enabled (whitelist .attention.wq_b)" in msg for msg in debug_policy)
