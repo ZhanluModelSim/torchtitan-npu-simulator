@@ -1,6 +1,8 @@
 """Scoped Meta initialization preserves native FSDP consumers and session state."""
 
 import gc
+import logging
+import re
 import weakref
 from contextlib import nullcontext
 from dataclasses import asdict
@@ -202,6 +204,14 @@ def test_repeated_scopes_release_rebound_functions_and_restore_after_failures():
         ) == originals
     gc.collect()
     assert all(ref() is None for ref in refs)
+
+
+def test_simulate_reports_rank_map_sharing_during_fsdp_initialization(caplog):
+    config = SimulationConfig(world_size=8, logical_rank=7, data_parallel_replicate_degree=2, seq_len=128)
+    with caplog.at_level(logging.INFO, logger=initialization.__name__):
+        runner.simulate(config)
+    (count,) = re.findall(r"Meta FSDP initialization shared_rank_maps=(\d+)", caplog.text)
+    assert int(count) > 0
 
 
 @pytest.mark.parametrize("algorithm", ["Muon", "AdamW"])

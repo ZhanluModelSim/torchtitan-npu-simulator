@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from functools import partial, wraps
@@ -95,9 +96,11 @@ def meta_initialization() -> Iterator[None]:
     import torch.distributed.fsdp._fully_shard._fsdp_param as fsdp_param
 
     native_mesh_init = DeviceMesh.__init__
+    shared_rank_maps = 0
 
     @wraps(native_mesh_init)
     def initialize_mesh(self: DeviceMesh, *args, **kwargs) -> None:
+        nonlocal shared_rank_maps
         native_mesh_init(self, *args, **kwargs)
         if self.device_type != "meta":
             return
@@ -109,8 +112,9 @@ def meta_initialization() -> Iterator[None]:
             return
         ranks = getattr(self, "_flatten_rank_map", None)
         root_ranks = getattr(root, "_flatten_rank_map", None)
-        if type(ranks) is tuple and type(root_ranks) is tuple and ranks == root_ranks:
+        if type(ranks) is tuple and type(root_ranks) is tuple and ranks is not root_ranks and ranks == root_ranks:
             self._flatten_rank_map = root_ranks
+            shared_rank_maps += 1
 
     with PatchScope() as patches:
         patches.replace(DeviceMesh, "__init__", initialize_mesh)
@@ -120,3 +124,4 @@ def meta_initialization() -> Iterator[None]:
                 continue
             patches.replace(fsdp_param.FSDPParam, name, _rebind_initializer(method))
         yield
+    logging.getLogger(__name__).info("Meta FSDP initialization shared_rank_maps=%d", shared_rank_maps)
