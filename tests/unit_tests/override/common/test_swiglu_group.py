@@ -27,7 +27,7 @@ _DISPATCHERS = {
 }
 _RECIPES = [
     ("torchtitan_npu_recipes.tests.models.deepseek_v4", "deepseek_v4_debugmodel"),
-    ("torchtitan_npu_recipes.models.deepseek_v4_1", "deepseek_v4_1_debugmodel_text"),
+    ("torchtitan_npu_recipes.tests.models.deepseek_v4_1", "deepseek_v4_1_debugmodel_multimodal"),
 ]
 
 

@@ -12,15 +12,18 @@ import torch
 import torch.distributed as dist
 import torch.distributed.checkpoint as dcp
 from torchtitan.components.checkpointer.utils import canonical_fqn
+from torchtitan.components.optim import AdamW
 from torchtitan.config import derive
 from torchtitan.config.parallelism import ParallelismConfig
 
 from tests.integration_tests.lora_config import LoRATrainer, _cpu_tensor
+from torchtitan_npu.config import OptimizerConfig
 from torchtitan_npu.models.deepseek_v4.lora import is_lora_parameter
+from torchtitan_npu.models.deepseek_v4_1.checkpoint import DeepSeekV41LoRACheckpointManager
 from torchtitan_npu.models.deepseek_v4_1.engram.host import HostEngramTable
 from torchtitan_npu.models.deepseek_v4_1.trainer import DeepSeekV41Trainer
 from torchtitan_npu.models.deepseek_v4_1.vision.data import build_image_token_layout
-from torchtitan_npu_recipes.models.deepseek_v4_1 import _make_lora_trainer_config, deepseek_v4_1_debugmodel_lora
+from torchtitan_npu_recipes.tests.models.deepseek_v4_1 import _apply_lora, _make_trainer_config
 
 logger = logging.getLogger(__name__)
 
@@ -97,8 +100,10 @@ class V41LoRATrainer(LoRATrainer, DeepSeekV41Trainer):
 
 
 def deepseek_v4_1_lora_training():
-    config = deepseek_v4_1_debugmodel_lora()
-    config.checkpointer.periodic_save_adapter_only = False
+    config = _make_trainer_config("deepseek_v4_1_debugmodel_text")
+    config.optim.optimizer = OptimizerConfig(optimizers=[AdamW.Config(pattern=r".*", lr=1e-5, eps=1e-6)])
+    config = _apply_lora(config)
+    config.checkpointer = DeepSeekV41LoRACheckpointManager.Config(periodic_save_adapter_only=False)
     return derive(config, V41LoRATrainer.Config)
 
 
@@ -118,7 +123,8 @@ def deepseek_v4_1_lora_adapter_only_training():
 
 
 def _lora_adamw_recipe(*, resume: bool):
-    config = deepseek_v4_1_debugmodel_lora(
+    config = _make_trainer_config(
+        "deepseek_v4_1_debugmodel_text",
         parallelism=ParallelismConfig(
             data_parallel_shard_degree=2,
             expert_parallel_degree=2,
@@ -127,9 +133,11 @@ def _lora_adamw_recipe(*, resume: bool):
         seq_len=128,
         hf_assets_path="tests/assets/deepseek_v3",
     )
+    config.optim.optimizer = OptimizerConfig(optimizers=[AdamW.Config(pattern=r".*", lr=1e-5, eps=1e-6)])
+    config = _apply_lora(config)
+    config.checkpointer = DeepSeekV41LoRACheckpointManager.Config(periodic_save_adapter_only=resume)
     config = derive(config, V41LoRATrainer.Config)
     config.check_resume_state = resume
-    config.checkpointer.periodic_save_adapter_only = resume
     if resume:
         config.checkpointer.interval = 2
     config.checkpointer.keep_latest_k = 0
@@ -201,8 +209,10 @@ class V41MultimodalLoRATrainer(V41LoRATrainer):
 
 
 def deepseek_v4_1_lora_multimodal_training():
-    config = _make_lora_trainer_config("deepseek_v4_1_debugmodel")
+    config = _make_trainer_config("deepseek_v4_1_debugmodel")
+    config.optim.optimizer = OptimizerConfig(optimizers=[AdamW.Config(pattern=r".*", lr=1e-5, eps=1e-6)])
+    config = _apply_lora(config)
     # C4 supplies text/labels; the trainer adds a deterministic image-protocol fixture.
-    config.dataloader = deepseek_v4_1_debugmodel_lora().dataloader
-    config.checkpoint.periodic_save_adapter_only = False
+    config.dataloader = _make_trainer_config("deepseek_v4_1_debugmodel_text").dataloader
+    config.checkpointer = DeepSeekV41LoRACheckpointManager.Config(periodic_save_adapter_only=False)
     return derive(config, V41MultimodalLoRATrainer.Config)

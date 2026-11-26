@@ -24,18 +24,18 @@ from torchtitan_npu.models.deepseek_v4_1.model import (
 
 @pytest.fixture(scope="module")
 def registry():
-    return importlib.import_module("torchtitan_npu.models.deepseek_v4_1")
+    return importlib.import_module("torchtitan_npu.models.deepseek_v4_1.flavors")
 
 
 @pytest.fixture(scope="module")
 def recipes():
-    return importlib.import_module("torchtitan_npu_recipes.models.deepseek_v4_1")
+    return importlib.import_module("torchtitan_npu_recipes.tests.models.deepseek_v4_1")
 
 
 def _flavors(registry):
     return {
-        "text": registry.model_registry("deepseek_v4_1_debugmodel_text"),
-        "multimodal": registry.model_registry("deepseek_v4_1_debugmodel"),
+        "text": registry.build_model_config("deepseek_v4_1_debugmodel_text"),
+        "multimodal": registry.build_model_config("deepseek_v4_1_debugmodel"),
     }
 
 
@@ -56,7 +56,7 @@ def test_only_the_multimodal_half_carries_vision_parameters(registry):
 
 def test_multimodal_rejects_context_parallel(registry, recipes):
     parallelism = ParallelismConfig(context_parallel_degree=2)
-    config = registry.model_registry("deepseek_v4_1_debugmodel", parallelism=parallelism, seq_len=512)
+    config = registry.build_model_config("deepseek_v4_1_debugmodel", parallelism=parallelism, seq_len=512)
     with torch.device("meta"):
         model = config.build()
     with pytest.raises(NotImplementedError, match="TP=CP=PP=1"):
@@ -64,8 +64,8 @@ def test_multimodal_rejects_context_parallel(registry, recipes):
 
 
 def test_text_recipe_builds_the_text_stack_and_loader(recipes):
-    """The recipe pairs the text model with the text loader and its alignment."""
-    trainer = recipes.deepseek_v4_1_debugmodel_text()
+    """The text flavor constructor pairs the text model with the text loader and its alignment."""
+    trainer = recipes._make_trainer_config("deepseek_v4_1_debugmodel_text")
     assert isinstance(trainer.model, DeepSeekV41Model.Config)
     assert not isinstance(trainer.model, DeepSeekV41MultimodalModel.Config)
     assert type(trainer.dataloader).__name__ == "Config"
@@ -90,18 +90,24 @@ def test_text_recipe_builds_the_text_stack_and_loader(recipes):
 )
 def test_every_registered_flavor_declares_its_modality(registry, flavor, multimodal):
     """A flavor name and the class it builds cannot drift apart silently."""
-    assert flavor in registry.deepseek_v4_1_configs, sorted(registry.deepseek_v4_1_configs)
-    config = registry.deepseek_v4_1_configs[flavor]()
+    assert flavor in registry.MODEL_FLAVORS, sorted(registry.MODEL_FLAVORS)
+    config = registry.MODEL_FLAVORS[flavor]()
     assert isinstance(config, DeepSeekV41MultimodalModel.Config) is multimodal, flavor
     assert ("_text" in flavor) is not multimodal, flavor
 
 
+_FLASH_FLAVORS = {
+    (16, "multimodal"): "deepseek_v4_1_flash_40layers_16experts_vision",
+    (16, "text"): "deepseek_v4_1_flash_40layers_16experts_text",
+    (24, "multimodal"): "deepseek_v4_1_flash_40layers_24experts_multimodal",
+    (24, "text"): "deepseek_v4_1_flash_40layers_24experts_text",
+}
+
+
 @pytest.mark.parametrize("num_experts", [16, 24], ids=["16experts", "24experts"])
 @pytest.mark.parametrize("modality", ["multimodal", "text"])
-def test_flash_recipe_sets_expert_count_in_every_layer(recipes, num_experts, modality):
-    recipe = getattr(recipes, f"deepseek_v4_1_flash_40layers_{num_experts}experts_{modality}")
-
-    config = recipe().model
+def test_flash_recipe_sets_expert_count_in_every_layer(registry, num_experts, modality):
+    config = registry.MODEL_FLAVORS[_FLASH_FLAVORS[num_experts, modality]]()
 
     assert len(config.layers) == 40
     assert isinstance(config, DeepSeekV41MultimodalModel.Config) is (modality == "multimodal")
@@ -161,7 +167,11 @@ def parallelize_deps(monkeypatch):
 
 
 def _parallelize(par, parallel_dims, recipes, model, *, vision: bool):
-    trainer = recipes.deepseek_v4_1_debugmodel_multimodal() if vision else recipes.deepseek_v4_1_debugmodel_text()
+    trainer = (
+        recipes.deepseek_v4_1_debugmodel_multimodal()
+        if vision
+        else recipes._make_trainer_config("deepseek_v4_1_debugmodel_text")
+    )
     # The dispatch under test is backend-independent; the recipe's spmd_types path routes
     # through the sharding validation and the model's own parallelize instead, so this
     # takes the plain FSDP backend.
@@ -186,7 +196,7 @@ def test_parallelize_never_asks_the_text_stack_for_the_hooks(registry, recipes, 
     """
     par, parallel_dims = parallelize_deps
     model = _RecordedHooks()
-    trainer = recipes.deepseek_v4_1_debugmodel_text()
+    trainer = recipes._make_trainer_config("deepseek_v4_1_debugmodel_text")
     par.apply_deepseek_v4_1_fsdp(
         model,
         parallelism_context=parallel_dims,
@@ -199,7 +209,7 @@ def test_parallelize_never_asks_the_text_stack_for_the_hooks(registry, recipes, 
 def test_parallelize_asks_the_multimodal_stack_for_both_hooks(registry, recipes, parallelize_deps):
     """The multimodal branch reaches both hooks, which is the only reason they exist."""
     par, parallel_dims = parallelize_deps
-    model = build_cpu_model(registry.model_registry("deepseek_v4_1_debugmodel"))
+    model = build_cpu_model(registry.build_model_config("deepseek_v4_1_debugmodel"))
     calls: list[str] = []
     # The hooks are this class's own methods; recording them here keeps the assertion
     # about dispatch, while ``test_multimodal_ac_hook_wraps_every_vision_block`` covers
@@ -216,7 +226,7 @@ def test_multimodal_ac_hook_wraps_every_vision_block(registry):
     The policy's own walk covers decoder layers; a vision block lives outside that list,
     so it is wrapped here or not at all.
     """
-    config = registry.model_registry("deepseek_v4_1_debugmodel")
+    config = registry.build_model_config("deepseek_v4_1_debugmodel")
     model = build_cpu_model(config)
     wrapped: list[str] = []
 

@@ -6,12 +6,12 @@
 import pytest
 import torch
 
-from torchtitan_npu.models.deepseek_v4_1 import (
+from torchtitan_npu.models.deepseek_v4_1.flavors import (
     V41_CANDIDATE_SOURCE_LAYER,
     V41_FULL_COMPRESS_RATIOS,
     V41_FULL_INDEX_SOURCE_LAYERS,
     V41_KV_SOURCE_LAYERS,
-    model_registry,
+    build_model_config,
 )
 from torchtitan_npu.models.deepseek_v4_1.attention import Attention
 from torchtitan_npu.models.deepseek_v4_1.indexer import (
@@ -124,7 +124,7 @@ def test_student_logits_rescore_a_document_local_selection() -> None:
 
 
 def test_v41_config_uses_specialized_attention_with_explicit_ownership() -> None:
-    config = model_registry("deepseek_v4_1_debugmodel")
+    config = build_model_config("deepseek_v4_1_debugmodel")
 
     assert not hasattr(config, "hc_head")
     assert config.kv_source_layers == V41_KV_SOURCE_LAYERS
@@ -182,7 +182,7 @@ def test_candidate_pool_roles_are_declared_per_indexer_layer() -> None:
     layers.  A layer outside the hierarchy spells the pool off with the kernels' negative
     sentinel rather than a local zero.
     """
-    config = model_registry("deepseek_v4_1_debugmodel")
+    config = build_model_config("deepseek_v4_1_debugmodel")
     # The frozen debug recipe: one pool built at layer 20, consumed by every later
     # index source, over blocks of 8 slots.
     pool_consumers = {24, 28, 32, 36}
@@ -241,7 +241,7 @@ def test_candidate_pool_roles_are_declared_per_indexer_layer() -> None:
 )
 def test_invalid_reuse_topology_is_rejected(overrides, match, monkeypatch) -> None:
     """A consumer derives its plan from its own ratio, so a mismatched source fails at build."""
-    import torchtitan_npu.models.deepseek_v4_1 as registry
+    import torchtitan_npu.models.deepseek_v4_1.flavors as registry
 
     make_config = registry._make_v41_config
 
@@ -250,4 +250,4 @@ def test_invalid_reuse_topology_is_rejected(overrides, match, monkeypatch) -> No
 
     monkeypatch.setattr(registry, "_make_v41_config", invalid_config)
     with pytest.raises(ValueError, match=match):
-        registry.model_registry("deepseek_v4_1_debugmodel_text")
+        registry.build_model_config("deepseek_v4_1_debugmodel_text")

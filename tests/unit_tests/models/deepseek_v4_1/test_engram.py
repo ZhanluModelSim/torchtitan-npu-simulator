@@ -19,14 +19,14 @@ from tests.unit_tests.models.deepseek_v4_1.preprocess_utils import cp_parallel_d
 from torchtitan_npu.config import OptimizerConfig
 from torchtitan_npu.models.deepseek_v4_1 import (
     EngramArgs,
-    model_registry,
+    build_model_config,
 )
 from torchtitan_npu.models.deepseek_v4_1.engram.config import _make_engram_configs
 from torchtitan_npu.models.deepseek_v4_1.optimizer import EngramTableOptimizerConfig
 from torchtitan_npu.models.deepseek_v4_1.state_dict_adapter import (
     DeepSeekV41StateDictAdapter,
 )
-from torchtitan_npu_recipes.models.deepseek_v4_1 import deepseek_v4_1_debugmodel_multimodal
+from torchtitan_npu_recipes.tests.models.deepseek_v4_1 import deepseek_v4_1_debugmodel_multimodal
 
 pytestmark = pytest.mark.cpu
 
@@ -289,7 +289,7 @@ def test_zero_dot_gate_uses_positive_clamped_sqrt():
 
 
 def test_debug_flavor_enables_engram_and_selects_sparse_adam():
-    spec = model_registry("deepseek_v4_1_debugmodel")
+    spec = build_model_config("deepseek_v4_1_debugmodel")
     enabled_layers = [idx for idx, layer in enumerate(spec.layers) if layer.engram is not None]
     assert enabled_layers == [1, 14]
 
@@ -304,7 +304,7 @@ def test_debug_flavor_enables_engram_and_selects_sparse_adam():
 
 def test_released_v41_geometry_builds_published_logical_tables():
     """Official row totals exercise prime allocation across both complete layers."""
-    full = model_registry("deepseek_v4_1_flash_40layers_24experts_multimodal")
+    full = build_model_config("deepseek_v4_1_flash_text")
     layers = [(i, layer.engram) for i, layer in enumerate(full.layers) if layer.engram is not None]
     # Source: deepseek-ai/DeepSeek-V4.1-Flash, revision 2bc89ac, text_config.
     assert [i for i, _ in layers] == [1, 14]
@@ -340,9 +340,9 @@ def test_image_tokens_reset_hash_history_and_receive_no_residual_gradient():
 @pytest.mark.parametrize("optimizer", ["AdamW", "Muon"])
 def test_explicit_disable_preserves_selected_optimizer(optimizer):
     from torchtitan_npu.extensions.torchtitan.components.optimizer.muon import DistMuon as NpuDistMuon
-    from torchtitan_npu_recipes.models.deepseek_v4_1 import _v41_muon_profile, deepseek_v4_1_debugmodel_text
+    from torchtitan_npu_recipes.tests.models.deepseek_v4_1 import _make_trainer_config, _v41_muon_profile
 
-    trainer = deepseek_v4_1_debugmodel_text()
+    trainer = _make_trainer_config("deepseek_v4_1_debugmodel_text")
     if optimizer == "Muon":
         profile = _v41_muon_profile(trainer.model)
         trainer.optim.optimizer.optimizers = [
@@ -372,9 +372,9 @@ def test_model_config_accepts_parameterized_engram_override(fused_attention):
     from torchtitan.config.override import apply_overrides
 
     from torchtitan_npu.override.deepseek_v4_1.engram.mxfp8 import MXFP8HostOffloadEngramTable
-    from torchtitan_npu_recipes.models.deepseek_v4_1 import deepseek_v4_1_debugmodel_text
+    from torchtitan_npu_recipes.tests.models.deepseek_v4_1 import _make_trainer_config
 
-    config = deepseek_v4_1_debugmodel_text()
+    config = _make_trainer_config("deepseek_v4_1_debugmodel_text")
     config.hf_assets_path = "tests/assets/deepseek_v3"
     config.training.num_tokens_per_microbatch_per_dp_rank = 512
     config.override.imports = [

@@ -48,9 +48,12 @@ def kernel_options(*, ratio: int, q: KernelFrame, cmp_k: KernelFrame):
         # no-op there rather than a second code path.
         seqused_q=q.seqused,
         seqused_k=cmp_k.seqused,
-        # A3's kernels take the zero-filled empty group; A5 rejects a value at ratio 1.
+        # The CANN LightningIndexerV2 contract requires this operand to be omitted when
+        # compression is disabled (ratio 1), on both A3 and A5.
         cmp_residual_k=(
-            cmp_k.residual
+            None
+            if ratio == 1
+            else cmp_k.residual
             if cmp_k.residual is not None or _IS_A5
             else torch.zeros(cmp_k.seqused.shape, dtype=torch.int32, device=cmp_k.seqused.device)
         ),

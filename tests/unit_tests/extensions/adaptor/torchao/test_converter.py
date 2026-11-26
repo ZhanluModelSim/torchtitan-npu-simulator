@@ -234,7 +234,7 @@ def test_model_type_uses_real_config_owner(converter_module, family):
     config = (
         registry.build_model_config("debugmodel", parallelism=ParallelismConfig())
         if family == "deepseek_v4"
-        else registry.model_registry("deepseek_v4_1_debugmodel")
+        else registry.build_model_config("deepseek_v4_1_debugmodel")
     )
     expected = converter_module.ModelType.V4 if family == "deepseek_v4" else converter_module.ModelType.V4_1
 
@@ -340,7 +340,7 @@ def test_apply_quantization_converter_passes_model_type(converter_module, monkey
     model_config = (
         registry.build_model_config("debugmodel", parallelism=ParallelismConfig())
         if model_name == "deepseek_v4"
-        else registry.model_registry("deepseek_v4_1_debugmodel")
+        else registry.build_model_config("deepseek_v4_1_debugmodel")
     )
     quantization_config = QuantizationExtensionConfig(enable_quantized_training=True, recipe="mix")
     calls = []
@@ -409,9 +409,9 @@ def test_v41_recipe_couples_source_compressor_and_sparse_attention(converter_mod
     from torchao_npu.configs import DeepSeekV41QuantCompressorConfig, DeepSeekV41QuantSparseAttentionConfig
 
     from torchtitan_npu.config.configs import QuantizationExtensionConfig
-    from torchtitan_npu.models.deepseek_v4_1 import model_registry
+    from torchtitan_npu.models.deepseek_v4_1 import build_model_config
 
-    spec = model_registry("deepseek_v4_1_debugmodel")
+    spec = build_model_config("deepseek_v4_1_debugmodel")
     converted = converter_module.apply_quantization_converter(
         spec,
         QuantizationExtensionConfig(
@@ -480,11 +480,11 @@ def test_v41_teacher_pair_survives_each_supported_switch_combination(
     from torchtitan.config.override import OverrideConfig, apply_overrides
 
     from torchtitan_npu.config.configs import QuantizationExtensionConfig
-    from torchtitan_npu.models.deepseek_v4_1 import model_registry
+    from torchtitan_npu.models.deepseek_v4_1 import build_model_config
     from torchtitan_npu.models.deepseek_v4_1.indexer import InnerIndexer
 
     converted = converter_module.apply_quantization_converter(
-        model_registry("deepseek_v4_1_debugmodel"),
+        build_model_config("deepseek_v4_1_debugmodel"),
         QuantizationExtensionConfig(
             enable_quantized_training=True,
             enable_sparse_attention_quantization=sparse_enabled,
@@ -535,13 +535,13 @@ def test_v41_recipe_rejects_non_mxfp4_lightning_indexer(converter_module, li_qua
 @pytest.mark.parametrize("ratio", [1, 2], ids=["full-resolution", "compressed"])
 def test_converted_v41_compressor_quantizes_post_rope_and_preserves_gradients(converter_module, monkeypatch, ratio):
     from torchtitan_npu.config.configs import QuantizationExtensionConfig
-    from torchtitan_npu.models.deepseek_v4_1 import model_registry
+    from torchtitan_npu.models.deepseek_v4_1 import build_model_config
 
     # The CPU oracle replaces the custom kernel below; no NPU extension is loaded.
     monkeypatch.setitem(sys.modules, "custom_ops", ModuleType("custom_ops"))
-    reference_spec = model_registry("deepseek_v4_1_debugmodel")
+    reference_spec = build_model_config("deepseek_v4_1_debugmodel")
     converted = converter_module.apply_quantization_converter(
-        model_registry("deepseek_v4_1_debugmodel"),
+        build_model_config("deepseek_v4_1_debugmodel"),
         QuantizationExtensionConfig(
             enable_quantized_training=True,
             enable_sparse_attention_quantization=True,

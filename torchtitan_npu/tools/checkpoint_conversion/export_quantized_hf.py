@@ -816,7 +816,7 @@ def _build_model_and_adapter(model_name: str, model_flavor: str, hf_assets_path:
     # upstream.
     module_name = model_name if "." in model_name else f"torchtitan.models.{model_name}"
     model_module = importlib.import_module(module_name)
-    if module_name == "torchtitan_npu.models.deepseek_v4":
+    if module_name in ("torchtitan_npu.models.deepseek_v4", "torchtitan_npu.models.deepseek_v4_1"):
         from torchtitan.config.parallelism import ParallelismConfig
 
         model_config = model_module.build_model_config(model_flavor, parallelism=ParallelismConfig())

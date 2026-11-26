@@ -6,22 +6,32 @@ import torch
 from torchtitan.components.optim import AdamW
 from torchtitan.models.base.module import Module
 
+from torchtitan_npu.config import OptimizerConfig
 from torchtitan_npu.models.deepseek_v4.lora import is_lora_parameter
 from torchtitan_npu.models.deepseek_v4_1.checkpoint import DeepSeekV41LoRACheckpointManager
 from torchtitan_npu.models.deepseek_v4_1.model import DeepSeekV41MultimodalModel
 from torchtitan_npu.models.deepseek_v4_1.state_dict_adapter import DeepSeekV41StateDictAdapter
-from torchtitan_npu_recipes.models.deepseek_v4_1 import (
-    deepseek_v4_1_debugmodel_lora,
-    deepseek_v4_1_flash_lora,
-    deepseek_v4_1_flash_text_lora,
+from torchtitan_npu_recipes.tests.models.deepseek_v4_1 import (
+    _apply_lora,
+    _make_trainer_config,
+    deepseek_v4_1_flash_40layers_24experts_multimodal_lora,
+    deepseek_v4_1_flash_40layers_16experts_text_lora,
 )
+
+
+def _debugmodel_text_lora():
+    config = _make_trainer_config("deepseek_v4_1_debugmodel_text")
+    config.optim.optimizer = OptimizerConfig(optimizers=[AdamW.Config(pattern=r".*", lr=1e-5, eps=1e-6)])
+    config = _apply_lora(config)
+    config.checkpointer = DeepSeekV41LoRACheckpointManager.Config()
+    return config
 
 
 @pytest.mark.parametrize(
     "factory,vision",
     [
-        (deepseek_v4_1_flash_lora, True),
-        (deepseek_v4_1_flash_text_lora, False),
+        (deepseek_v4_1_flash_40layers_24experts_multimodal_lora, True),
+        (deepseek_v4_1_flash_40layers_16experts_text_lora, False),
     ],
     ids=["multimodal", "text"],
 )
@@ -40,7 +50,7 @@ def test_lora_recipe_preserves_vision_and_uses_standard_adamw_and_peft(factory, 
 
 
 def test_lora_model_meta_build_freezes_engram_vision_and_base():
-    config = deepseek_v4_1_debugmodel_lora()
+    config = _debugmodel_text_lora()
     with torch.device("meta"):
         model = config.model.build()
     assert any("engram.table.weight" in name for name, _ in model.named_parameters())

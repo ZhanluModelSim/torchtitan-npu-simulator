@@ -52,12 +52,16 @@ def cpu_storage_world(monkeypatch):
 def test_model_parallelize_places_expert_weights_on_dense_or_sparse_storage(
     cpu_storage_world, family, recipe, ep, full_ac
 ):
-    package = "torchtitan_npu_recipes.tests.models" if family == "deepseek_v4" else "torchtitan_npu_recipes.models"
+    package = "torchtitan_npu_recipes.tests.models"
     registry = importlib.import_module(f"{package}.{family}")
-    config = getattr(registry, recipe)(
+    kwargs = dict(
         parallelism=ParallelismConfig(data_parallel_shard_degree=2, expert_parallel_degree=ep),
         hf_assets_path="/tmp",
     )
+    if family == "deepseek_v4_1":
+        config = registry._make_trainer_config(recipe, **kwargs)
+    else:
+        config = getattr(registry, recipe)(**kwargs)
     # One real block is sufficient to exercise the model's sharding policy and
     # native recursive state distribution, without allocating model weights.
     config.model.layers = config.model.layers[:1]
@@ -107,12 +111,13 @@ def test_model_parallelize_places_expert_weights_on_dense_or_sparse_storage(
 
 
 @pytest.mark.parametrize("full_ac", [False, True], ids=["no-ac", "full-ac"])
-def test_multimodal_parallelize_shards_all_vision_parameters(cpu_storage_world, full_ac):
-    from torchtitan_npu_recipes.models.deepseek_v4_1 import deepseek_v4_1_debugmodel_multimodal
+def test_multimodal_parallelize_shards_all_vision_parameters(cpu_storage_world, full_ac, monkeypatch):
+    from torchtitan_npu_recipes.tests.models.deepseek_v4_1 import _make_trainer_config
 
-    config = deepseek_v4_1_debugmodel_multimodal(
+    monkeypatch.setenv("HF_ASSETS_PATH", "/tmp")
+    config = _make_trainer_config(
+        "deepseek_v4_1_debugmodel",
         parallelism=ParallelismConfig(data_parallel_shard_degree=2, expert_parallel_degree=1),
-        hf_assets_path="/tmp",
     )
     config.model.layers = config.model.layers[:1]
     config.model.n_layers = 1

@@ -18,6 +18,7 @@ from PIL import Image
 from torchtitan.components.data import GrainDataLoader
 from torchtitan.components.tokenizer import HuggingFaceTokenizer
 
+from torchtitan_npu.models.deepseek_v4_1 import build_model_config
 from torchtitan_npu.models.deepseek_v4_1.vision import language_dataset as dataset_module
 from torchtitan_npu.models.deepseek_v4_1.vision.data import ImagePatchProcessor
 from torchtitan_npu.models.deepseek_v4_1.vision.language_dataset import (
@@ -28,10 +29,10 @@ from torchtitan_npu.models.deepseek_v4_1.vision.language_dataset import (
 )
 from torchtitan_npu.models.deepseek_v4_1.vision.language_encoder import DeepSeekV41VisionLanguageEncoder
 from torchtitan_npu.override.deepseek_v4_1.vision_language_dataloader import sft as sft_override
-from torchtitan_npu_recipes.models.deepseek_v4_1 import (
+from torchtitan_npu_recipes.tests.models.deepseek_v4_1 import (
+    _vision_sft_dataloader_config,
     deepseek_v4_1_debugmodel_multimodal,
     deepseek_v4_1_debugmodel_multimodal_sft,
-    deepseek_v4_1_vision_sft,
 )
 
 pytestmark = pytest.mark.cpu
@@ -356,7 +357,7 @@ def test_single_context_budget_and_shifted_batch_contract(tmp_path, tokenizer):
     with pytest.raises(ValueError, match="num_tokens_per_microbatch == max_context_length"):
         _loader(dataset_path, tokenizer, batch_size=2)
 
-    recipe = deepseek_v4_1_vision_sft(dataset_path=str(dataset_path), flavor="deepseek_v4_1_debugmodel")
+    recipe = deepseek_v4_1_debugmodel_multimodal_sft(dataset_path=str(dataset_path))
     assert isinstance(recipe.dataloader, GrainDataLoader.Config)
     assert isinstance(recipe.dataloader.collator, _SFTCollator.Config)
     assert isinstance(recipe.dataloader.dataset.processor, _GrainSFTProcessor.Config)
@@ -373,6 +374,8 @@ def test_single_context_budget_and_shifted_batch_contract(tmp_path, tokenizer):
     raw = json.loads(dataset_path.read_text())
     expected_inputs, expected_labels = _processor(dataset_path, tokenizer)._sample(raw)
     assert batch.routing_token_counts.shape == (1,)
+    assert batch.loss_token_counts.ndim == 0
+    torch.testing.assert_close(batch.loss_token_counts, (batch.labels != -100).sum())
     torch.testing.assert_close(batch.routing_token_counts[0], (~batch.padding_mask).sum())
     assert inputs["input"].shape == labels.shape == (512,)
     assert type(inputs["loss_token_count"]) is int
@@ -382,7 +385,7 @@ def test_single_context_budget_and_shifted_batch_contract(tmp_path, tokenizer):
         torch.testing.assert_close(inputs[key], value, rtol=0, atol=0)
 
 
-def test_registry_entry_reads_the_sft_environment(tmp_path, monkeypatch):
+def test_registry_entry_uses_explicit_sft_options(tmp_path):
     dataset_path = tmp_path / "registry.jsonl"
     dataset_path.write_text(
         json.dumps(
@@ -396,9 +399,9 @@ def test_registry_entry_reads_the_sft_environment(tmp_path, monkeypatch):
         + "\n",
         encoding="utf-8",
     )
-    monkeypatch.setenv("DSV41_SFT_DATASET", str(dataset_path))
-    monkeypatch.setenv("DSV41_SFT_THINKING_MODE", "thinking")
-    recipe = deepseek_v4_1_debugmodel_multimodal_sft()
+    recipe = deepseek_v4_1_debugmodel_multimodal_sft(
+        dataset_path=str(dataset_path), thinking_mode="thinking"
+    )
     assert isinstance(recipe.dataloader, GrainDataLoader.Config)
     assert isinstance(recipe.dataloader.collator, _SFTCollator.Config)
     processor = recipe.dataloader.dataset.processor
@@ -407,52 +410,15 @@ def test_registry_entry_reads_the_sft_environment(tmp_path, monkeypatch):
     assert not hasattr(recipe.dataloader.dataset, "num_packing_bins")
 
 
-def test_sft_recipe_rejects_text_only_flavors(tmp_path):
+def test_sft_recipe_rejects_text_only_flavors():
+    model = build_model_config("deepseek_v4_1_debugmodel_text", seq_len=512)
     with pytest.raises(ValueError, match="multimodal flavor"):
-        deepseek_v4_1_vision_sft(dataset_path=str(tmp_path / "unused.jsonl"), flavor="deepseek_v4_1_debugmodel_text")
+        _vision_sft_dataloader_config(model)
 
 
-def test_sft_recipe_requires_a_dataset(monkeypatch):
-    monkeypatch.delenv("DSV41_SFT_DATASET", raising=False)
-    monkeypatch.delenv("DATASET_PATH", raising=False)
-    with pytest.raises(ValueError, match="DSV41_SFT_DATASET"):
-        deepseek_v4_1_vision_sft()
-
-
-def test_python_recipe_controls_sft_loader_policy(tmp_path, monkeypatch):
-    from torchtitan.config import ConfigLoader
-
-    dataset_path = tmp_path / "cli.jsonl"
-    dataset_path.write_text(
-        json.dumps(
-            {
-                "messages": [
-                    {"role": "user", "content": "Question"},
-                    {"role": "assistant", "content": "Answer"},
-                ]
-            }
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    monkeypatch.setenv("DSV41_SFT_DATASET", str(dataset_path))
-    (tmp_path / "local_vision_sft_recipe.py").write_text(
-        """from torchtitan_npu_recipes.models.deepseek_v4_1 import deepseek_v4_1_debugmodel_multimodal_sft
-
-def recipe():
-    config = deepseek_v4_1_debugmodel_multimodal_sft()
-    config.dataloader.seed = 137
-    return config
-""",
-        encoding="utf-8",
-    )
-    monkeypatch.syspath_prepend(str(tmp_path))
-    config = ConfigLoader().load(["--module", "local_vision_sft_recipe", "--config", "recipe"])
-    assert isinstance(config.dataloader, GrainDataLoader.Config)
-    assert isinstance(config.dataloader.collator, _SFTCollator.Config)
-    assert isinstance(config.dataloader.dataset.processor, _GrainSFTProcessor.Config)
-    assert config.dataloader.seed == 137
-    assert config.dataloader.dataset.processor.dataset_path == str(dataset_path.resolve())
+def test_sft_recipe_uses_the_python_default_dataset():
+    recipe = deepseek_v4_1_debugmodel_multimodal_sft()
+    assert recipe.dataloader.dataset.processor.dataset_path == "/path/to/train.jsonl"
 
 
 @pytest.mark.parametrize("num_images", (0, 2), ids=("text-dummy", "interleaved-images"))

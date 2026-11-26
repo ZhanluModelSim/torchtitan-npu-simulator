@@ -21,7 +21,8 @@ from torchtitan.components.tokenizer import HuggingFaceTokenizer
 
 from torchtitan_npu.models.deepseek_v4_1.vision.data import IMAGE_END, IMAGE_START, ImagePatchProcessor
 from torchtitan_npu.models.deepseek_v4_1.vision.dataloader import _process_mm_sample, caption_dataloader_config
-from torchtitan_npu_recipes.models.deepseek_v4_1 import deepseek_v4_1_debugmodel_multimodal
+from torchtitan_npu.models.common.alignment import compression_alignment
+from torchtitan_npu_recipes.tests.models.deepseek_v4_1 import deepseek_v4_1_debugmodel_multimodal
 
 ASSETS = Path(__file__).resolve().parents[3] / "assets"
 
@@ -194,11 +195,15 @@ def test_recipe_passes_the_model_alignment_to_the_loader():
     """The recipes derive the loader's per-document alignment from the model spec
     (the LCM of its compression ratios), so a packed document never straddles a
     pooled group."""
-    from torchtitan_npu_recipes.models import deepseek_v4_1 as cr
+    from torchtitan_npu_recipes.tests.models import deepseek_v4_1 as test_recipes
 
-    trainer = cr.deepseek_v4_1_debugmodel_multimodal()
+    trainer = test_recipes.deepseek_v4_1_debugmodel_multimodal()
     assert isinstance(trainer.dataloader, GrainDataLoader.Config)
-    assert trainer.dataloader.dataset.processor.per_doc_alignment == cr._per_doc_alignment(trainer.model) == 2
+    assert (
+        trainer.dataloader.dataset.processor.per_doc_alignment
+        == compression_alignment(trainer.model.compress_ratios)
+        == 2
+    )
 
 
 def test_empty_caption_is_filtered_before_packing(tokenizer):
@@ -232,8 +237,7 @@ def test_packed_vision_batch_reaches_folded_attention_metadata(tokenizer, single
 
 
 def test_collator_emits_one_routing_objective(tokenizer):
-    # Upstream's collator keeps ``routing_token_counts`` one-dimensional even when the loss
-    # counts collapse to a scalar; the model indexes ``aux_loss_denominators[0]``.
+    # The trainer aggregates one count per objective.
     microbatch = next(iter(_loader(tokenizer)))
     assert microbatch.loss_token_counts.ndim == 0
     assert microbatch.routing_token_counts.shape == (1,)

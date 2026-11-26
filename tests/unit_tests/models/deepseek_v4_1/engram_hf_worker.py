@@ -19,7 +19,7 @@ from torch.distributed.checkpoint import HuggingFaceStorageReader, HuggingFaceSt
 from torch.distributed.checkpoint._consolidate_hf_safetensors import consolidate_safetensors_files_on_every_rank
 
 from torchtitan_npu.extensions.torchtitan.components.checkpoint import CheckpointManager
-from torchtitan_npu.models.deepseek_v4_1 import model_registry
+from torchtitan_npu.models.deepseek_v4_1 import build_model_config
 from torchtitan_npu.models.deepseek_v4_1.engram.checkpoint import checkpoint_shard
 from torchtitan_npu.models.deepseek_v4_1.state_dict_adapter import DeepSeekV41StateDictAdapter
 
@@ -55,7 +55,7 @@ def main():
     dist.init_process_group("gloo", timeout=timedelta(seconds=60))
     try:
         rank = dist.get_rank()
-        config = model_registry("deepseek_v4_1_debugmodel_text")
+        config = build_model_config("deepseek_v4_1_debugmodel_text")
         table = config.layers[1].engram.table
         table.head_vocab_sizes = (2, 3, 5, 7, 11, 13)
         table.num_embeddings = 48

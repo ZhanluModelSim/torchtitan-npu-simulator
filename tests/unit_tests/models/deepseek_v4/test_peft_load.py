@@ -4,6 +4,7 @@
 """Current checkpoints through real managers, adapters, DCP and Stateful consumers."""
 
 import copy
+import dataclasses
 import json
 from contextlib import closing
 from dataclasses import dataclass
@@ -40,7 +41,7 @@ def _model_config(monkeypatch, family):
     if family == "v4":
         config = _build_model_config(num_layers=2, num_experts=2)
     else:
-        from torchtitan_npu.models import deepseek_v4_1 as registry
+        from torchtitan_npu.models.deepseek_v4_1 import flavors as registry
 
         make = registry._make_v41_config
 
@@ -75,7 +76,15 @@ def _model_config(monkeypatch, family):
             return make(**kwargs)
 
         monkeypatch.setattr(registry, "_make_v41_config", tiny)
-        config = registry.model_registry("deepseek_v4_1_stripped")
+        # The debug Engram geometry addresses layer 14; this two-layer crop must not
+        # attach a table it cannot hold. Keep one in-crop layer so the config still
+        # exercises Engram, then strip it below.
+        monkeypatch.setattr(
+            registry,
+            "_ENGRAM_DEBUG_GEOMETRY",
+            dataclasses.replace(registry._ENGRAM_DEBUG_GEOMETRY, layer_ids=(1,)),
+        )
+        config = registry.build_model_config("deepseek_v4_1_debugmodel_text")
         for layer in config.layers:
             layer.engram = None
     return deepseek_v4_lora_transform(rank=8, alpha=16).transform(config)

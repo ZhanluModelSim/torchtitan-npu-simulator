@@ -14,14 +14,14 @@ from torchtitan.distributed import fsdp as upstream_fsdp
 from torchtitan_npu.extensions.torchtitan.distributed import fsdp as npu_fsdp
 from torchtitan_npu.models.deepseek_v4_1 import parallelize
 from torchtitan_npu.models.deepseek_v4_1.engram.host import HostEngramTable
-from torchtitan_npu_recipes.models.deepseek_v4_1 import deepseek_v4_1_debugmodel_text
+from torchtitan_npu_recipes.tests.models.deepseek_v4_1 import _make_trainer_config
 
 
 @pytest.mark.parametrize("engram_enabled", (False, True), ids=("decoder", "host-engram"))
 def test_recipe_fp32_parameters_reach_every_shard_with_checkpoint_wrapping(
     monkeypatch, single_rank_spmd, engram_enabled
 ):
-    config = deepseek_v4_1_debugmodel_text()
+    config = _make_trainer_config("deepseek_v4_1_debugmodel_text")
     if not engram_enabled:
         config = derive(config, type(config), engram_enabled=False)
     config.hf_assets_path = "tests/assets/deepseek_v3"

@@ -17,10 +17,10 @@ from torchtitan.distributed.parallelism_context import MeshAxisName
 from torchtitan_npu.config import OptimizerConfig
 from torchtitan_npu.extensions.torchtitan.components.optimizer.muon import DistMuon as NpuDistMuon
 from torchtitan_npu.models.deepseek_v4 import build_model_config
-from torchtitan_npu.models.deepseek_v4_1 import model_registry as v41_registry
+from torchtitan_npu.models.deepseek_v4_1 import build_model_config as v41_registry
 from torchtitan_npu.models.deepseek_v4_1.optimizer import EngramTableOptimizerConfig
 from torchtitan_npu_recipes.models.deepseek_v4 import _dsv4_muon_profile
-from torchtitan_npu_recipes.models.deepseek_v4_1 import _v41_muon_profile
+from torchtitan_npu_recipes.tests.models.deepseek_v4_1 import _v41_muon_profile
 
 
 @pytest.mark.parametrize("version", ["v4", "v41"])

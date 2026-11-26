@@ -9,7 +9,7 @@
 
 SFT 沿用 DeepSeek 官方示例的做法，直接调用对应版本 Python 编码器的 `encode_messages()`。官方编码器生成对话文本、特殊标记和 V4.1 的媒体信息，训练侧在编码结果上定位 assistant 片段并生成监督标签。[V4 官方推理示例](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/60d8d70770c6776ff598c94bb586a859a38244f1/inference/generate.py#L125) · [V4.1 官方编码示例](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017/blob/08c8657f02291e11b6f6b63e0e16014f8e748518/encoding/README.md)
 
-从官方 FP8/FP4 权重开始时，先转换为 BF16 safetensors。将配方中 `checkpointer.initial_load_in_hf` 设为 `True`，`initial_load_path` 指向转换后的目录。V4.1 Flash 的 CPT 配方用 `HF_ASSETS_PATH` 指向 DeepSeek 官方发布模型资产目录，用 `CKPT_INIT_LOAD_PATH` 指定 BF16 权重。[V4 转换脚本](../../scripts/checkpoint_conversion/dequant_save_hf_dsv4.py) · [V4.1 转换脚本](https://gitcode.com/cann/cann-recipes-train/blob/78a47e5e3459601ee8e21fd64c1f8ac68e2bbd17/llm_pretrain/deepseek_v4_1/utils/convert_bf16.py)
+从官方 FP8/FP4 权重开始时，先转换为 BF16 safetensors。将配方中 `checkpointer.initial_load_in_hf` 设为 `True`，`initial_load_path` 指向转换后的目录。V4.1 Flash 的 CPT 配方用 `HF_ASSETS_PATH` 指向 DeepSeek 官方发布模型资产目录，在 Python 配方中设置 `config.checkpointer.initial_load_path` 指定 BF16 权重。[V4 转换脚本](../../scripts/checkpoint_conversion/dequant_save_hf_dsv4.py) · [V4.1 转换脚本](https://gitcode.com/cann/cann-recipes-train/blob/78a47e5e3459601ee8e21fd64c1f8ac68e2bbd17/llm_pretrain/deepseek_v4_1/utils/convert_bf16.py)
 
 ## 2. 准备数据
 
@@ -32,7 +32,7 @@ V4 使用第一种文本样式。工具对话沿用 DeepSeek 官方编码器的�
 - `ENV_ARGS` 放原命令中的环境变量赋值，例如 `NGPU=8`、`ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7`。通过 `env "${ENV_ARGS[@]}"` 在启动脚本前设置。
 - `CPT_ARGS` 放原命令中写在 `bash scripts/run_train.sh` 后面的参数，例如 `--output-dir /path/to/sft-run`。通过 `"${CPT_ARGS[@]}"` 按原顺序传入，然后追加 SFT override。
 
-下面以仓库现有的 V4 eager 配方和 V4.1 图文调试配方为例，说明如何复用 CPT 配方启动 SFT。将官方 tokenizer 和编码文件放在配方的 `hf_assets_path` 下，V4 示例使用 `/path/to/DeepSeekV4_tokenizer`，V4.1 示例使用 `tests/assets/tokenizer`。
+下面以仓库现有的 V4 eager 配方和 V4.1 图文调试配方为例，说明如何复用 CPT 配方启动 SFT。将官方 tokenizer 和编码文件放在配方的 `hf_assets_path` 下，V4 示例使用 `/path/to/DeepSeekV4_tokenizer`，V4.1 示例通过 `HF_ASSETS_PATH` 指定资产目录。
 
 ```bash
 ENV_ARGS=("NGPU=${NGPU:-}")
@@ -48,8 +48,9 @@ env "${ENV_ARGS[@]}" \
 
 # V4.1
 env "${ENV_ARGS[@]}" \
-  MODULE=torchtitan_npu_recipes.models.deepseek_v4_1 \
-  CONFIG=deepseek_v4_1_debugmodel_multimodal DATASET=cc12m-test \
+  HF_ASSETS_PATH=/path/to/deepseek-v4.1-assets \
+  MODULE=torchtitan_npu_recipes.tests.models.deepseek_v4_1 \
+  CONFIG=deepseek_v4_1_debugmodel_multimodal \
   DATASET_PATH=/path/to/docci_sft.jsonl bash scripts/run_train.sh \
   "${CPT_ARGS[@]}" \
   --override torchtitan_npu.override.deepseek_v4_1.vision_language_dataloader.sft

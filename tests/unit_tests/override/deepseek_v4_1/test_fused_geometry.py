@@ -23,7 +23,7 @@ from dataclasses import fields
 
 import pytest
 
-from torchtitan_npu_recipes.models import deepseek_v4_1 as config_registry
+from torchtitan_npu_recipes.tests.models import deepseek_v4_1 as config_registry
 from torchtitan_npu.models.deepseek_v4_1.attention import CompressedSparseInnerAttention2
 from torchtitan_npu.override.deepseek_v4_1.metadata import AicpuGeometry
 from torchtitan_npu.override.deepseek_v4_1.sparse_attn import asc
@@ -80,9 +80,10 @@ def _model_numbers(config) -> tuple[int, ...]:
 
 
 def _registered(name: str):
-    """A published config, or a skip where this environment cannot build its vision tower."""
+    """A published flavor's trainer config, or a skip where this environment cannot build it."""
     try:
-        return getattr(config_registry, name)()
+        factory = getattr(config_registry, name, None)
+        return factory() if factory is not None else config_registry._make_trainer_config(name)
     except RuntimeError as error:  # pragma: no cover - the vision tower needs torchvision
         if "torchvision" in str(error):
             pytest.skip("this environment cannot build the vision tower (torchvision mismatch)")

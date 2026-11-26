@@ -3,12 +3,6 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-import os
-import sys
-from pathlib import Path
-from types import ModuleType
-from unittest.mock import patch
-
 import pytest
 from torchtitan.config import ConfigLoader
 from torchtitan.config.override import OverrideConfig, apply_overrides
@@ -23,6 +17,8 @@ from torchtitan_npu.override.common.rope import (
     WorkaroundComplexRoPE,
 )
 from torchtitan_npu.override.common.swiglu_group import AscSwiGLU
+from torchtitan_npu.override.common.token_dispatcher import AscDeepEPTokenDispatcher
+from torchtitan_npu.override.deepseek_v4_1.lightning_indexer.ascendc import AscInnerIndexer
 from torchtitan_npu.override.deepseek_v4_1.mhc import AscV41HcPre
 from torchtitan_npu.override.deepseek_v4_1.sparse_attn.ascendc import AscV41SparseAttention
 
@@ -30,47 +26,27 @@ from torchtitan_npu.override.deepseek_v4_1.sparse_attn.ascendc import AscV41Spar
 @pytest.fixture
 def recipe_config():
     """Load the selected recipe without entering torchrun or reserving NPUs."""
-    root = Path(__file__).resolve().parents[4]
 
-    def parse(hardware="a3", *, golden=False):
-        legacy = ("CLI_OVERRIDES", "OPTIMIZER_OVERRIDES", "DATALOADER_OVERRIDES", "MHC_POST_OVERRIDE")
-        base_env = {key: value for key, value in os.environ.items() if key not in legacy}
-        env = base_env | {
-            "USE_GOLDEN": str(int(golden)),
-            "NGPU": "8",
-            "HF_ASSETS_PATH": str(root / "tests/assets/deepseek_v3"),
-        }
+    def parse(name="deepseek_v4_1_flash_40layers_16experts_text"):
         args = [
             "--module",
             "torchtitan_npu_recipes.tests.models.deepseek_v4_1",
             "--config",
-            f"deepseek_v4_1_flash_8p_cpt_4k_{hardware}",
+            name,
         ]
-        with patch.dict(os.environ, env, clear=True):
-            return ConfigLoader().load(args)
+        return ConfigLoader().load(args)
 
     return parse
 
 
-@pytest.mark.parametrize(
-    "golden,rope_type,vision_type",
-    [
-        (True, WorkaroundComplexRoPE, HalfRotation),
-        (False, AscComplexRoPE, AscHalfRotation),
-    ],
-    ids=["reference", "a3"],
-)
-def test_recipe_selects_shared_rope_for_text_compressor_indexer_and_vision(
-    recipe_config, golden, rope_type, vision_type
-):
-    trainer = recipe_config(golden=golden)
+def test_recipe_selects_shared_rope_for_text_compressor_and_indexer(recipe_config):
+    trainer = recipe_config()
     overrides = trainer.override
     cfg = trainer.model
     apply_overrides(overrides, cfg)
-    assert type(cfg.layers[0].attention.rope) is rope_type.Config
-    assert type(cfg.layers[2].attention.compressor.rope) is rope_type.Config
-    assert type(cfg.layers[2].attention.indexer.rope) is rope_type.Config
-    assert type(cfg.vision_encoder.rotary) is vision_type.Config
+    assert type(cfg.layers[0].attention.rope) is AscComplexRoPE.Config
+    assert type(cfg.layers[2].attention.compressor.rope) is AscComplexRoPE.Config
+    assert type(cfg.layers[2].attention.indexer.rope) is AscComplexRoPE.Config
 
 
 def test_a3_text_rope_override_preserves_the_split_site_contract(recipe_config):
@@ -107,54 +83,39 @@ def test_rope_entries_are_mutually_exclusive(recipe_config):
 
 
 def test_a5_recipe_selects_the_full_fused_stack(recipe_config, monkeypatch):
-    """The A5 recipe's override list replaces every fused target."""
-    # Check real override selection without loading the native CANN registration.
-    monkeypatch.setitem(sys.modules, "cann_ops_nn.ops", ModuleType("cann_ops_nn.ops"))
-    trainer = recipe_config("a5")
-    cfg = trainer.model
-    apply_overrides(trainer.override, cfg)
+    """Apply the shipped A5 eager overrides without loading CANN SwiGLU kernels."""
+    monkeypatch.setattr("torchtitan_npu.override.common.swiglu_group._ensure_cann_ops_loaded", lambda: None)
+    trainer = recipe_config("deepseek_v4_1_flash_40layers_24experts_multimodal_block_fp8")
+    assert trainer.extension.quantization.enable_quantized_training
+    assert trainer.extension.quantization.recipe == "all_block_fp8"
+    assert trainer.training.num_tokens_per_train_step == 64 * trainer.training.max_context_length
 
-    # Text rope: asc_partial replaces the A3 asc_complex choice; vision keeps
-    # the half-rotation layout from the A3 base list.
-    for rope_cfg in (
-        cfg.layers[0].attention.rope,
-        cfg.layers[2].attention.compressor.rope,
-        cfg.layers[2].attention.indexer.rope,
-    ):
-        assert type(rope_cfg) is AscPartialComplexRoPE.Config
-    assert type(cfg.vision_encoder.rotary) is AscHalfRotation.Config
-
-    # SwiGLUGroup: routed grouped experts plus the FQN-limited shared experts.
-    moe = cfg.layers[0].feed_forward
-    assert type(moe.routed_experts.activation_fn) is AscSwiGLU.Config
-    assert type(moe.shared_experts.activation_fn) is AscSwiGLU.Config
-
-    inner = cfg.layers[2].attention.inner_attention
-    assert type(inner) is AscV41SparseAttention.Config
-    assert issubclass(AscV41SparseAttention, CompressedSparseInnerAttention2)
-    assert inner.compress_ratio == cfg.layers[2].attention.compress_ratio
-
-    # field preservation through derive() is covered by test_mhc_adapters;
-    # here the recipe must actually select the fused targets
-    for layer in cfg.layers[:6]:
-        assert type(layer.hc_attn_pre) is AscV41HcPre.Config
-        assert issubclass(AscV41HcPre, HcPre)
+    model = trainer.model
+    apply_overrides(trainer.override, trainer)
+    layer = model.layers[0]
+    attention = model.layers[2].attention
+    for rope in (layer.attention.rope, attention.compressor.rope, attention.indexer.rope):
+        assert type(rope) is AscPartialComplexRoPE.Config
+    assert type(model.vision_encoder.rotary) is AscHalfRotation.Config
+    assert type(layer.feed_forward.routed_experts.activation_fn) is AscSwiGLU.Config
+    assert type(layer.feed_forward.shared_experts.activation_fn) is AscSwiGLU.Config
+    assert type(layer.feed_forward.routed_experts.token_dispatcher) is AscDeepEPTokenDispatcher.Config
+    assert type(attention.inner_attention) is AscV41SparseAttention.Config
+    assert attention.inner_attention.compress_ratio == attention.compress_ratio
+    assert type(attention.indexer.inner_indexer) is AscInnerIndexer.Config
+    assert type(layer.hc_attn_pre) is AscV41HcPre.Config
 
 
-def test_a5_golden_launches_no_fused_defaults(recipe_config):
-    """USE_GOLDEN=1 in the A5 recipe injects none of the fused entries."""
-    trainer = recipe_config("a5", golden=True)
-    imports = [entry if isinstance(entry, str) else entry[0] for entry in trainer.override.imports]
-    assert [i for i in imports if ".asc" in i or "swiglu" in i] == []
-
-    cfg = trainer.model
-    apply_overrides(trainer.override, cfg)
-    assert type(cfg.layers[0].attention.rope) is WorkaroundComplexRoPE.Config
-    assert type(cfg.layers[2].attention.compressor.rope) is WorkaroundComplexRoPE.Config
-    assert type(cfg.layers[2].attention.indexer.rope) is WorkaroundComplexRoPE.Config
-    assert type(cfg.vision_encoder.rotary) is HalfRotation.Config
-    # The experts keep whatever reference config the builders produced; the
-    # point here is that no SwiGLUGroup replacement was applied.
-    assert type(cfg.layers[0].feed_forward.shared_experts.activation_fn) is not AscSwiGLU.Config
-    assert type(cfg.layers[0].feed_forward.routed_experts.activation_fn) is not AscSwiGLU.Config
-    assert type(cfg.layers[2].attention.inner_attention) is CompressedSparseInnerAttention2.Config
+def test_reference_recipe_keeps_the_unfused_multimodal_stack(recipe_config):
+    trainer = recipe_config("deepseek_v4_1_debugmodel_multimodal")
+    model = trainer.model
+    apply_overrides(trainer.override, trainer)
+    layer = model.layers[0]
+    attention = model.layers[2].attention
+    for rope in (layer.attention.rope, attention.compressor.rope, attention.indexer.rope):
+        assert type(rope) is WorkaroundComplexRoPE.Config
+    assert type(model.vision_encoder.rotary) is HalfRotation.Config
+    assert type(layer.feed_forward.routed_experts.activation_fn) is not AscSwiGLU.Config
+    assert type(layer.feed_forward.shared_experts.activation_fn) is not AscSwiGLU.Config
+    assert type(attention.inner_attention) is CompressedSparseInnerAttention2.Config
+    assert type(layer.hc_attn_pre) is HcPre.Config

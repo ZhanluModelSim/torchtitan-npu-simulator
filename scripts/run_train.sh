@@ -17,6 +17,8 @@ cd "${SCRIPT_DIR}/.."
 export NGPU="${NGPU:-8}"
 export MODULE="${MODULE:-torchtitan_npu_recipes.tests.models.deepseek_v4}"
 export CONFIG="${CONFIG:-deepseek_v4_flash_43layers_16experts_eager_bf16}"
+# export HF_ASSETS_PATH="${HF_ASSETS_PATH:-/path/to/model-tokenizer}"
+
 TRAIN_FILE="${TRAIN_FILE:-torchtitan_npu.train}"
 COMM_BACKEND=${COMM_BACKEND:-}
 if [[ -n "${COMM_BACKEND}" && "${COMM_BACKEND}" != fake ]]; then

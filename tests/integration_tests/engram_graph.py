@@ -13,15 +13,16 @@ from unittest.mock import patch
 import torch
 from torchtitan.config.parallelism import ParallelismConfig
 
-from torchtitan_npu.models.deepseek_v4_1 import _flash_engram_geometry
+from torchtitan_npu.models.deepseek_v4_1.flavors import _ENGRAM_V41_FLASH_GEOMETRY
+from torchtitan_npu.models.deepseek_v4_1.model import DeepSeekV41Model
 from torchtitan_npu_recipes.graph_trainer.deepseek_v4_1 import _make_graph_trainer_config
-from torchtitan_npu_recipes.models.deepseek_v4_1 import _overrides, _set_context, _set_muon, _set_schedule
+from torchtitan_npu_recipes.tests.models.deepseek_v4_1 import _flash_overrides, _v41_optimizer_config
 
 
 def _recipe(*, ep_overlap, auto_overlap):
     # Identity token mapping matches the committed miniature tokenizer fixture.
     geometry = replace(
-        _flash_engram_geometry(),
+        _ENGRAM_V41_FLASH_GEOMETRY,
         vocab_size_per_ngram=(1024, 1024, 1024),
         require_token_id_map=False,
         compressed_vocab_size=None,
@@ -40,10 +41,11 @@ def _recipe(*, ep_overlap, auto_overlap):
     config.dataloader.dataset.dataset.source.load_dataset_kwargs["data_files"] = "tests/assets/c4_test/data.json"
     config.compile.ep_overlap.enabled = ep_overlap
     config.compile.pass_pipeline = "mutation-functionalization" + ("+npu_auto_overlap" if auto_overlap else "")
-    _set_context(config, sequence_length=seq_len, token_budget=-1, steps=3)
-    _set_muon(config)
-    _set_schedule(config)
-    config.override.imports = _overrides(a5=False, debug=True)
+    config.training.steps = 3
+    config.optim.lr_scheduler.warmup_steps = 2
+    assert isinstance(config.model, DeepSeekV41Model.Config)
+    config.optim.optimizer = _v41_optimizer_config(config.model)
+    config.override.imports = _flash_overrides(a5=False, fused_attention=True)
     config.checkpointer = None
     config.debug.seed = config.dataloader.seed = 42
     config.debug.deterministic = True

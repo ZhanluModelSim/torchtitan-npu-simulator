@@ -11,7 +11,7 @@ from types import SimpleNamespace
 import torch
 from torchtitan.models.base.module import Module
 
-from torchtitan_npu.models.deepseek_v4_1 import model_registry
+from torchtitan_npu.models.deepseek_v4_1 import build_model_config
 
 
 class _BoundaryInnerAttentionConfig:
@@ -60,7 +60,7 @@ class MoEBoundaryStub(Module):
 
 
 def build_mhc_boundary_model(*, dim=4, vocab_size=11):
-    config = model_registry("deepseek_v4_1_debugmodel_text")
+    config = build_model_config("deepseek_v4_1_debugmodel_text")
     config.dim = config.tok_embeddings.embedding_dim = config.lm_head.in_features = dim
     config.vocab_size = config.tok_embeddings.num_embeddings = config.lm_head.out_features = vocab_size
     config.norm.normalized_shape = dim

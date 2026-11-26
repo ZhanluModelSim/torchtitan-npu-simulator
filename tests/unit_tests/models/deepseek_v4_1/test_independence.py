@@ -70,7 +70,7 @@ class Blocker:
 sys.meta_path.insert(0, Blocker())
 import importlib
 import torch
-registry = importlib.import_module("torchtitan_npu.models.deepseek_v4_1")
+registry = importlib.import_module("torchtitan_npu.models.deepseek_v4_1.flavors")
 make_config = registry._make_v41_config
 def tiny_config(**kwargs):
     kwargs.update(dim=8, n_heads=2, head_dim=8, rope_head_dim=4,
@@ -79,13 +79,13 @@ def tiny_config(**kwargs):
     return make_config(**kwargs)
 registry._make_v41_config = tiny_config
 
-cfg = registry.model_registry("deepseek_v4_1_debugmodel")
+cfg = registry.build_model_config("deepseek_v4_1_debugmodel")
 cfg.vocab_size = cfg.tok_embeddings.num_embeddings = cfg.lm_head.out_features = 64
 from torchtitan_npu.models.deepseek_v4_1.state_dict_adapter import DeepSeekV41StateDictAdapter
-from torchtitan_npu_recipes.models.deepseek_v4_1 import deepseek_v4_1_debugmodel_text
+from torchtitan_npu_recipes.tests.models.deepseek_v4_1 import _make_trainer_config
 
 adapter = DeepSeekV41StateDictAdapter(cfg, None)
-recipe = deepseek_v4_1_debugmodel_text()
+recipe = _make_trainer_config("deepseek_v4_1_debugmodel_text")
 assert recipe.model.layers
 assert not any(name == Blocker.blocked or name.startswith(Blocker.blocked + ".")
                for name in sys.modules)
@@ -131,7 +131,7 @@ def config_contract():
 
 before, config_before = identities(), config_contract()
 v41 = importlib.import_module("torchtitan_npu.models.deepseek_v4_1")
-v41.model_registry("deepseek_v4_1_debugmodel")
+v41.build_model_config("deepseek_v4_1_debugmodel")
 assert identities() == before
 assert config_contract() == config_before
 """)

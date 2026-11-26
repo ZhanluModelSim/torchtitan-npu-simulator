@@ -8,7 +8,6 @@
 from pathlib import Path
 
 import pytest
-from torchtitan.components.optim import DistMuon
 from torchtitan.config.loader import ConfigLoader
 
 import torchtitan_npu  # noqa: F401
@@ -16,7 +15,6 @@ from torchtitan_npu.models.deepseek_v4_1.optimizer import EngramTableOptimizerCo
 
 _MODULE = "torchtitan_npu_recipes.models.deepseek_v4_1"
 _GRAPH_MODULE = "torchtitan_npu_recipes.tests.graph_trainer.deepseek_v4_1"
-_DEBUG_MODULE = "torchtitan_npu_recipes.tests.models.deepseek_v4_1"
 
 
 @pytest.fixture
@@ -47,76 +45,64 @@ def example_environment(monkeypatch):
 
 
 @pytest.mark.cpu
-def test_mini_recipe_resolves_training_budget_and_quantized_policy(example_environment, tmp_path):
-    example_environment.setenv("STEPS", "7")
-    assets = tmp_path / "assets with spaces"
-    assets.mkdir()
-    example_environment.setenv("HF_ASSETS_PATH", str(assets))
+def test_python_recipe_controls_sft_loader_policy(tmp_path, monkeypatch):
+    from torchtitan.components.data import GrainDataLoader
 
-    config = ConfigLoader().load(["--module", _DEBUG_MODULE, "--config", "deepseek_v4_1_mini_1p_cpt_a5"])
+    from torchtitan_npu.models.deepseek_v4_1.vision.language_dataset import _GrainSFTProcessor, _SFTCollator
 
-    assert config.hf_assets_path == str(assets)
-    assert config.model.max_context_length == config.training.max_context_length == 2048
-    assert config.training.num_tokens_per_microbatch_per_dp_rank == 2048
-    assert config.training.num_tokens_per_train_step == 2048
-    assert config.training.steps == 7
-    assert config.parallelism.data_parallel_shard_degree == 1
-    assert config.parallelism.expert_parallel_degree == 1
-    assert config.extension.quantization.enable_quantized_training
-    assert config.extension.quantization.recipe == "all_block_fp8"
-    assert config.compile is None
-    assert "torchtitan_npu.override.deepseek_v4_1.sparse_attn.asc" in config.override.imports
-    assert "torchtitan_npu.override.deepseek_v4_1.lightning_indexer.asc" in config.override.imports
+    dataset_path = tmp_path / "train.jsonl"
+    (tmp_path / "local_vision_sft_recipe.py").write_text(
+        f"""from torchtitan_npu_recipes.tests.models.deepseek_v4_1 import deepseek_v4_1_debugmodel_multimodal_sft
 
-
-@pytest.mark.cpu
-@pytest.mark.parametrize("custom_topology", [False, True], ids=["released-cp128", "two-rank-cp2"])
-def test_long_context_recipe_rejects_cp_until_its_lifecycle_is_migrated(example_environment, custom_topology):
-    if custom_topology:
-        example_environment.setenv("NGPU", "2")
-        example_environment.setenv("NNODES", "1")
-        example_environment.setenv("EP", "2")
-        example_environment.setenv("CP", "2")
-
-    with pytest.raises(NotImplementedError, match=r"context parallelism requires the v0\.4 CP lifecycle migration"):
-        ConfigLoader().load(["--module", _MODULE, "--config", "deepseek_v4_1_flash_cpt_1m_a5"])
+def recipe():
+    config = deepseek_v4_1_debugmodel_multimodal_sft(dataset_path={str(dataset_path)!r})
+    config.dataloader.seed = 137
+    return config
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    config = ConfigLoader().load(["--module", "local_vision_sft_recipe", "--config", "recipe"])
+    assert isinstance(config.dataloader, GrainDataLoader.Config)
+    assert isinstance(config.dataloader.collator, _SFTCollator.Config)
+    assert isinstance(config.dataloader.dataset.processor, _GrainSFTProcessor.Config)
+    assert config.dataloader.seed == 137
+    assert config.dataloader.dataset.processor.dataset_path == str(dataset_path.resolve())
 
 
 @pytest.mark.cpu
-def test_long_context_recipe_preserves_text_input_and_optimizer_at_cp1(example_environment, tmp_path):
-    data = tmp_path / "packed text.jsonl"
-    data.write_text('{"text": "An independent text document."}\n', encoding="utf-8")
-    example_environment.setenv("DATASET_PATH", str(data))
-    for name in ("NGPU", "NNODES", "EP", "CP"):
-        example_environment.setenv(name, "1")
+def test_a5_eight_rank_multimodal_qat_recipe(example_environment):
+    config = ConfigLoader().load(
+        [
+            "--module",
+            "torchtitan_npu_recipes.tests.models.deepseek_v4_1",
+            "--config",
+            "deepseek_v4_1_flash_40layers_24experts_multimodal_qat",
+        ]
+    )
+
+    quantization = config.extension.quantization
+    assert quantization.enable_quantized_training
+    assert quantization.recipe == "all_block_fp8"
+    assert quantization.enable_fsdp_prequantize
+    assert quantization.enable_mxfp4_qat
+    assert quantization.li_quantization == "mxfp4"
+    assert quantization.enable_sparse_attention_quantization
+    assert config.parallelism.data_parallel_shard_degree == config.parallelism.expert_parallel_degree == 8
+    assert config.training.num_tokens_per_train_step == 64 * config.training.max_context_length
+    assert "torchtitan_npu.override.common.token_dispatcher.asc_deepep" in config.override.imports
+    assert "torchtitan_npu.override.deepseek_v4_1.mhc.asc_sinkhorn" not in config.override.imports
+
+
+@pytest.mark.cpu
+def test_long_context_recipe_rejects_cp_until_its_lifecycle_is_migrated():
+    from torchtitan_npu.models.deepseek_v4_1.parallelize import validate_deepseek_v4_1_parallelism
 
     config = ConfigLoader().load(["--module", _MODULE, "--config", "deepseek_v4_1_flash_cpt_1m_a5"])
-
-    assert config.model.max_context_length == config.training.max_context_length == 1048576
-    assert config.training.num_tokens_per_microbatch_per_dp_rank == 1048576
-    assert config.training.num_tokens_per_train_step == 1048576
-    assert config.parallelism.context_parallel_degree == 1
-    assert config.parallelism.expert_parallel_degree == 1
-    assert config.parallelism.data_parallel_shard_degree == 1
-    assert config.parallelism.data_parallel_replicate_degree == 1
-    assert config.dataloader.dataset.dataset.source.load_dataset_kwargs["data_files"] == str(data)
-    assert config.dataloader.dataset.dataset.processor.per_doc_alignment == 256
+    assert config.parallelism.context_parallel_degree == 128
     assert not config.engram_enabled
-    assert all(layer.engram is None for layer in config.model.layers)
-    assert isinstance(config.optim.optimizer.optimizers[0], DistMuon.Config)
-    assert config.optim.optimizer.optimizers[0].ns_steps == 10
-    assert not any(isinstance(group, EngramTableOptimizerConfig) for group in config.optim.optimizer.optimizers)
-    assert config.compile is None
-    # Layout declarations are complete before Trainer applies the requested overrides.
-    assert config.model.layers[0].feed_forward.routed_experts.w13.sharding_config is not None
-
-
-@pytest.mark.cpu
-def test_legacy_override_text_requires_an_explicit_recipe(example_environment):
-    example_environment.setenv("CLI_OVERRIDES", "torchtitan_npu.override.common.rope.workaround")
-
-    with pytest.raises(ValueError, match=r"CLI_OVERRIDES.*Python recipe"):
-        ConfigLoader().load(["--module", _DEBUG_MODULE, "--config", "deepseek_v4_1_mini_1p_cpt_a5"])
+    with pytest.raises(NotImplementedError, match=r"TP=CP=PP=1"):
+        validate_deepseek_v4_1_parallelism(config.model, training=config.training, parallelism=config.parallelism)
 
 
 @pytest.mark.cpu

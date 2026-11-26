@@ -219,7 +219,7 @@ GOLDEN_OVERRIDES = (
 # tests/assets/deepseek_v3 mini tokenizer, the same one the DeepSeek-V4 golden
 # cases use.
 GOLDEN_ENV = {
-    "MODULE": "torchtitan_npu_recipes.models.deepseek_v4_1",
+    "MODULE": "tests.integration_tests.v41_recipe_config",
     "CONFIG": "deepseek_v4_1_debugmodel_text",
 }
 
@@ -301,11 +301,8 @@ def build_deepseek_v4_1_fused_test_list() -> list[OverrideDefinitions]:
             test_name="dsv41_multimodal_muon_2p",
             ngpu=ngpu,
             env_vars={
-                "MODULE": "torchtitan_npu_recipes.models.deepseek_v4_1",
+                "MODULE": "tests.integration_tests.v41_recipe_config",
                 "CONFIG": "deepseek_v4_1_debugmodel_multimodal",
-                "DATASET": "cc12m-test",
-                "DATASET_PATH": "tests/assets/cc12m_test",
-                "PACKING_BUFFER_SIZE": "4",
             },
             use_golden=False,
             check_loss=False,
@@ -334,11 +331,8 @@ def build_deepseek_v4_1_reference_multimodal_test_list() -> list[OverrideDefinit
         test_name="dsv41_multimodal_cpt_reference_ep2_fsdp2",
         test_descr="V4.1 CPT reference attention with Host Engram, FullAC and virtual AdamW",
         env_vars={
-            "MODULE": "torchtitan_npu_recipes.models.deepseek_v4_1",
+            "MODULE": "tests.integration_tests.v41_recipe_config",
             "CONFIG": "deepseek_v4_1_debugmodel_multimodal",
-            "DATASET": "cc12m-test",
-            "DATASET_PATH": "tests/assets/cc12m_test",
-            "PACKING_BUFFER_SIZE": "4",
         },
         override_args=[args], expected_steps=((1, 2, 3),), ngpu=2,
         use_golden=True, check_loss=False, timeout=1800,
@@ -353,11 +347,7 @@ def build_deepseek_v4_1_reference_multimodal_test_list() -> list[OverrideDefinit
     }.get(arg, arg) for arg in args)
     # The SFT recipe builds its own loader with no packing stage, so the CPT
     # dataset and packing environment does not apply to it.
-    sft_env = {
-        key: value
-        for key, value in cpt.env_vars.items()
-        if key not in ("DATASET", "DATASET_PATH", "PACKING_BUFFER_SIZE")
-    }
+    sft_env = dict(cpt.env_vars)
     return [cpt, replace(
         cpt, test_name="dsv41_multimodal_sft_reference_ep2_fsdp2",
         test_descr="V4.1 official-encoding SFT with Host Engram, FullAC and virtual AdamW",
@@ -365,6 +355,7 @@ def build_deepseek_v4_1_reference_multimodal_test_list() -> list[OverrideDefinit
         env_vars={
             **sft_env,
             "CONFIG": "deepseek_v4_1_debugmodel_multimodal_sft",
-            "DSV41_SFT_DATASET": fixture,
+            "DSV41_SFT_FIXTURE_PATH": fixture,
+            "HF_ASSETS_PATH": tokenizer,
         },
     )]

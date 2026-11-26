@@ -21,7 +21,7 @@ from torch.utils.checkpoint import DefaultDeviceType
 
 from tests.unit_tests.models.deepseek_v4_1.preprocess_utils import layer_metadata, preprocess
 from tests.unit_tests.models.mtp_test_utils import build_cpu_model
-from torchtitan_npu.models.deepseek_v4_1 import (
+from torchtitan_npu.models.deepseek_v4_1.flavors import (
     V41_CANDIDATE_SOURCE_LAYER,
     V41_FULL_INDEX_SOURCE_LAYERS,
     V41_KV_SOURCE_LAYERS,
@@ -38,7 +38,7 @@ _CMP_K, _IDX_K, _TOPK, _TOPK_SCORES, _CANDIDATES = 2, 3, 4, 5, 6
 def _tiny_debug_model(monkeypatch):
     """The registered debug flavor at CPU-sized widths, entered through the registry."""
     monkeypatch.setattr(DefaultDeviceType, "_default_device_type", "cpu")
-    registry = importlib.import_module("torchtitan_npu.models.deepseek_v4_1")
+    registry = importlib.import_module("torchtitan_npu.models.deepseek_v4_1.flavors")
     make_config = registry._make_v41_config
 
     def tiny_config(**kwargs):
@@ -63,7 +63,7 @@ def _tiny_debug_model(monkeypatch):
     from torchtitan.models.common import decoder as decoder_module
 
     monkeypatch.setattr(decoder_module, "annotate_input_spmd_types", lambda _ctx, batch, _layouts: batch)
-    config = registry.model_registry("deepseek_v4_1_debugmodel_text")
+    config = registry.build_model_config("deepseek_v4_1_debugmodel_text")
     config.vocab_size = config.tok_embeddings.num_embeddings = config.lm_head.out_features = 64
     for layer in config.layers:
         layer.engram = None

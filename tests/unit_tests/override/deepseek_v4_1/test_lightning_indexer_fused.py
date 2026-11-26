@@ -29,7 +29,9 @@ from torchtitan.config import derive
 
 from tests.unit_tests.models.deepseek_v4_1.preprocess_utils import layer_metadata, preprocess
 from tests.unit_tests.models.mtp_test_utils import build_cpu_model
+from torchtitan_npu.models.common.metadata import KernelFrame
 from torchtitan_npu.models.deepseek_v4_1.attention import CompressedSparseInnerAttention2
+from torchtitan_npu.override.deepseek_v4_1.lightning_indexer import ascendc as selector_ascendc
 from torchtitan_npu.override.deepseek_v4_1.lightning_indexer.ascendc import (
     AscInnerIndexer,
 )
@@ -71,6 +73,24 @@ def _metadata(bounds: list[int], *, ratio: int = 2, geometry: AicpuGeometry | No
         ratio=ratio,
         geometry=_TINY_LAYER_GEOMETRY if geometry is None else geometry,
     )
+
+
+@pytest.mark.parametrize("is_a5", [False, True], ids=["a3", "a5"])
+def test_ratio_one_kernel_options_omit_compressed_residual(monkeypatch, is_a5):
+    monkeypatch.setattr(selector_ascendc, "_IS_A5", is_a5)
+    frame = KernelFrame(
+        cu_seqlens=torch.tensor([0, 8, 24], dtype=torch.int32),
+        seqused=torch.tensor([8, 16], dtype=torch.int32),
+    )
+    # A3's compacted key frame can carry a zero residual even at ratio 1.
+    cmp_k = KernelFrame(
+        cu_seqlens=frame.cu_seqlens,
+        seqused=frame.seqused,
+        residual=None if is_a5 else torch.zeros_like(frame.seqused),
+    )
+    options = selector_ascendc.kernel_options(ratio=1, q=frame, cmp_k=cmp_k)
+    assert options["cmp_ratio"] == 1
+    assert options["cmp_residual_k"] is None
 
 
 def _fake_li_metadata(*args, **kwargs):
@@ -215,7 +235,7 @@ def _fake_kernels(monkeypatch):
 def _tiny_model(monkeypatch, *, fused: bool):
     """The registered debug flavor at CPU-sized widths, optionally with the LI override."""
     monkeypatch.setattr(DefaultDeviceType, "_default_device_type", "cpu")
-    registry = importlib.import_module("torchtitan_npu.models.deepseek_v4_1")
+    registry = importlib.import_module("torchtitan_npu.models.deepseek_v4_1.flavors")
     make_config = registry._make_v41_config
 
     def tiny_config(**kwargs):
@@ -237,7 +257,7 @@ def _tiny_model(monkeypatch, *, fused: bool):
         return make_config(**kwargs)
 
     monkeypatch.setattr(registry, "_make_v41_config", tiny_config)
-    config = registry.model_registry("deepseek_v4_1_debugmodel")
+    config = registry.build_model_config("deepseek_v4_1_debugmodel")
     config.vocab_size = config.tok_embeddings.num_embeddings = config.lm_head.out_features = 64
     if fused:
         # ``fused`` means the fused stack, not one of its halves: the teacher edge only
@@ -374,7 +394,7 @@ def test_teacher_uses_global_valid_tokens(monkeypatch, global_valid_tokens):
         _run_forward_backward(model, denominator=global_valid_tokens)
 
     assert seen["calls"], "SLIKG must be reached for the indexer to train"
-    registry = importlib.import_module("torchtitan_npu.models.deepseek_v4_1")
+    registry = importlib.import_module("torchtitan_npu.models.deepseek_v4_1.flavors")
     # One SLIKG call per index source: the override trains each source's selection, and the
     # debug flavor shares the flash topology's tables, so the count comes from there and not
     # from a number read back out of this run.
@@ -489,8 +509,8 @@ def test_lightning_indexer_asc_stack_applies_without_claim_conflicts(monkeypatch
     from torchtitan_npu.override.common.rope import AscComplexRoPE
 
     monkeypatch.setattr(DefaultDeviceType, "_default_device_type", "cpu")
-    registry = importlib.import_module("torchtitan_npu.models.deepseek_v4_1")
-    model = registry.model_registry("deepseek_v4_1_debugmodel")
+    registry = importlib.import_module("torchtitan_npu.models.deepseek_v4_1.flavors")
+    model = registry.build_model_config("deepseek_v4_1_debugmodel")
 
     apply_overrides(
         OverrideConfig(
@@ -556,10 +576,10 @@ def test_both_fused_ports_build_the_kernel_stack(monkeypatch):
     from torchtitan_npu.override.deepseek_v4_1.sparse_attn.ascendc import AscV41SparseAttention
 
     monkeypatch.setattr(DefaultDeviceType, "_default_device_type", "cpu")
-    registry = importlib.import_module("torchtitan_npu.models.deepseek_v4_1")
+    registry = importlib.import_module("torchtitan_npu.models.deepseek_v4_1.flavors")
 
     def config(*, fused_selector: bool, fused_core: bool):
-        cfg = registry.model_registry("deepseek_v4_1_debugmodel")
+        cfg = registry.build_model_config("deepseek_v4_1_debugmodel")
         for layer in cfg.layers:
             # The pair only exists where there is a compressed stream.
             if layer.attention.inner_attention.compress_ratio == 0:
@@ -585,8 +605,8 @@ def test_both_ports_requested_build_matching_teacher_components():
 
     from torchtitan_npu.override.deepseek_v4_1.sparse_attn.ascendc import AscV41SparseAttention
 
-    recipes = importlib.import_module("torchtitan_npu_recipes.models.deepseek_v4_1")
-    job = recipes.deepseek_v4_1_debugmodel_text()
+    recipes = importlib.import_module("torchtitan_npu_recipes.tests.models.deepseek_v4_1")
+    job = recipes._make_trainer_config("deepseek_v4_1_debugmodel_text")
     job.override = OverrideConfig(
         imports=[
             "torchtitan_npu.override.deepseek_v4_1.sparse_attn.asc",
@@ -606,7 +626,7 @@ def test_the_teacher_sources_are_the_index_source_layers():
     It is the whole reason that test can name an expected teacher value instead of reading
     one back out of the run, so it is checked here rather than only inside a forward.
     """
-    registry = importlib.import_module("torchtitan_npu.models.deepseek_v4_1")
+    registry = importlib.import_module("torchtitan_npu.models.deepseek_v4_1.flavors")
     sources = _teacher_sources(registry.V41_FULL_INDEX_SOURCE_LAYERS)
     assert sources == (2, 8, 14, 20, 24, 28, 32, 36)
     # The debug flavor the seqlen test builds shares this topology, so the frame it measures

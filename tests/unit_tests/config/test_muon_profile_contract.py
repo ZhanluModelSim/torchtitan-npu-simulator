@@ -16,14 +16,14 @@ from torchtitan.config.loader import ConfigLoader
 from torchtitan_npu.config import OptimizerConfig
 from torchtitan_npu.extensions.torchtitan.components.optimizer.muon import DistMuon
 from torchtitan_npu_recipes.models.deepseek_v4 import _dsv4_muon_profile
-from torchtitan_npu_recipes.models.deepseek_v4_1 import _v41_muon_profile
+from torchtitan_npu_recipes.tests.models.deepseek_v4_1 import _v41_muon_profile
 
 
 @pytest.mark.parametrize(
     ("module", "recipe"),
     [
         ("torchtitan_npu_recipes.tests.models.deepseek_v4", "deepseek_v4_debugmodel"),
-        ("torchtitan_npu_recipes.models.deepseek_v4_1", "deepseek_v4_1_debugmodel_text"),
+        ("torchtitan_npu_recipes.tests.models.deepseek_v4_1", "deepseek_v4_1_debugmodel_multimodal"),
     ],
 )
 @pytest.mark.parametrize("dedup", [False, True])

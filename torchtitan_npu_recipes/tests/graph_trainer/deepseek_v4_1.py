@@ -8,34 +8,40 @@
 import os
 from dataclasses import replace
 
+from torchtitan.config.parallelism import ParallelismConfig
+
 from torchtitan_npu.extensions.torchtitan.tools.profiler import CANNProfiler
-from torchtitan_npu.models.deepseek_v4_1 import _flash_engram_geometry
-from torchtitan_npu_recipes.models import deepseek_v4_1 as models
+from torchtitan_npu.models.deepseek_v4_1.flavors import _ENGRAM_8P_FLASH_GEOMETRY
+from torchtitan_npu_recipes.tests.models.deepseek_v4_1 import _flash_overrides
 
 
 def _graph_example(*, a5: bool = False, multimodal: bool = False):
     from torchtitan_npu_recipes.graph_trainer.deepseek_v4_1 import _make_graph_trainer_config
 
-    models._reject_legacy_overrides()
     flavor = None
     if a5:
         flavor = "deepseek_v4_1_flash_40layers_24experts_" + ("multimodal" if multimodal else "text")
-    geometry = _flash_engram_geometry()
+    geometry = _ENGRAM_8P_FLASH_GEOMETRY
     table_rows = int(os.environ.get("TORCHTITAN_ENGRAM_TABLE_ROWS", "100000"))
     config = _make_graph_trainer_config(
         multimodal=multimodal,
         flavor=flavor,
         engram=replace(geometry, vocab_size_per_ngram=(table_rows,) * len(geometry.vocab_size_per_ngram)),
-        parallelism=models._topology(local_processes=8, nodes=1, shard_degree=8, expert_degree=8),
+        parallelism=ParallelismConfig(
+            data_parallel_shard_degree=8,
+            data_parallel_replicate_degree=1,
+            expert_parallel_degree=8,
+            fsdp_reshard_after_forward="always",
+            enable_sequence_parallel=True,
+        ),
         seq_len=4096,
         hf_assets_path=os.environ.get("HF_ASSETS_PATH", "/path/to/DeepSeekV41_tokenizer"),
     )
-    models._set_context(config, sequence_length=4096, token_budget=-1, steps=40)
-    models._set_muon(config)
-    models._set_schedule(config)
+    config.training.steps = 40
+    config.optim.lr_scheduler.warmup_steps = 2
     # This hardware recipe selects a complete implementation set, replacing
     # the public recipe's reference RoPE rather than enabling both backends.
-    config.override.imports = models._overrides(a5=a5, debug=True)
+    config.override.imports = _flash_overrides(a5=a5, fused_attention=True)
     if multimodal:
         config.override.imports.append("torchtitan_npu.override.deepseek_v4_1.vision.asc_unmasked_sdpa")
     config.debug.print_config = True

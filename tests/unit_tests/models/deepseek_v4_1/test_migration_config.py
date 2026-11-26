@@ -7,15 +7,18 @@ import pytest
 import torch
 
 from torchtitan_npu.models.deepseek_v4_1.model import DeepSeekV41MultimodalModel
-from torchtitan_npu_recipes.models.deepseek_v4_1 import (
+from torchtitan_npu_recipes.tests.models.deepseek_v4_1 import (
+    _make_trainer_config,
     deepseek_v4_1_debugmodel_multimodal,
-    deepseek_v4_1_debugmodel_text,
 )
 
 
 @pytest.mark.parametrize(
     "factory,expected_multimodal",
-    ((deepseek_v4_1_debugmodel_text, False), (deepseek_v4_1_debugmodel_multimodal, True)),
+    (
+        (lambda: _make_trainer_config("deepseek_v4_1_debugmodel_text"), False),
+        (deepseek_v4_1_debugmodel_multimodal, True),
+    ),
     ids=("text", "multimodal"),
 )
 def test_debug_recipe_builds_with_token_budget_and_selective_fp32_parameters(factory, expected_multimodal):

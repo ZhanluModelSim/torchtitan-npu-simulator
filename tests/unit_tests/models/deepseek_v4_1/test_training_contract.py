@@ -26,7 +26,7 @@ def test_full_ac_preserves_image_routing(monkeypatch, with_engram):
 
     monkeypatch.setattr(decoder_module, "annotate_input_spmd_types", lambda _ctx, batch, _layouts: batch)
     monkeypatch.setattr(spmd_types_module, "annotate_input_spmd_types", lambda _ctx, batch, _layouts: batch)
-    registry = importlib.import_module("torchtitan_npu.models.deepseek_v4_1")
+    registry = importlib.import_module("torchtitan_npu.models.deepseek_v4_1.flavors")
     make_config = registry._make_v41_config
 
     def tiny_config(**kwargs):
@@ -48,7 +48,7 @@ def test_full_ac_preserves_image_routing(monkeypatch, with_engram):
         return make_config(**kwargs)
 
     monkeypatch.setattr(registry, "_make_v41_config", tiny_config)
-    config = registry.model_registry("deepseek_v4_1_debugmodel")
+    config = registry.build_model_config("deepseek_v4_1_debugmodel")
     if not with_engram:
         for layer in config.layers:
             layer.engram = None

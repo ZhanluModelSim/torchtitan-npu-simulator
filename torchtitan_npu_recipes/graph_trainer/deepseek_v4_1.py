@@ -25,7 +25,7 @@ from torchtitan_npu.models.deepseek_v4_1.model import (
 from torchtitan_npu.models.deepseek_v4_1.trainer import DeepSeekV41GraphTrainer
 from torchtitan_npu.patches.torchtitan.experiments.graph_trainer import functionalize_recompute_mutations
 from torchtitan_npu.patches.torchtitan.experiments.graph_trainer.chunked_loss import CoalescedChunkedLoss
-from torchtitan_npu_recipes.models.deepseek_v4_1 import _make_trainer_config
+from torchtitan_npu_recipes.tests.models.deepseek_v4_1 import _make_trainer_config
 
 
 def _make_graph_trainer_config(

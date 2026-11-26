@@ -17,7 +17,7 @@ import torch
 from torchtitan.config import OverrideConfig
 from torchtitan.config.override import apply_overrides
 
-from torchtitan_npu.models.deepseek_v4_1 import model_registry
+from torchtitan_npu.models.deepseek_v4_1 import build_model_config
 from torchtitan_npu.models.deepseek_v4_1.mhc import HcPost, HcPre
 
 MHC_POST_OVERRIDE = "torchtitan_npu.override.deepseek_v4_1.mhc.asc_hc_post"
@@ -33,8 +33,8 @@ def isolated_rng():
 
 class TestMHcAdapters:
     def test_override_selects_and_preserves_config(self):
-        cfg = model_registry("deepseek_v4_1_debugmodel")
-        reference = model_registry("deepseek_v4_1_debugmodel")
+        cfg = build_model_config("deepseek_v4_1_debugmodel")
+        reference = build_model_config("deepseek_v4_1_debugmodel")
         apply_overrides(
             OverrideConfig(imports=[MHC_POST_OVERRIDE, MHC_SINKHORN_OVERRIDE]),
             cfg,

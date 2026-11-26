@@ -11,12 +11,12 @@ import pytest
 import torch
 from torch.nn.utils.rnn import pad_sequence
 
-from torchtitan_npu.models.deepseek_v4_1 import model_registry
+from torchtitan_npu.models.deepseek_v4_1 import build_model_config
 from torchtitan_npu.models.deepseek_v4_1.vision.data import TEXT, build_image_token_layout
 
 
 def _multimodal_model():
-    config = model_registry("deepseek_v4_1_debugmodel").model
+    config = build_model_config("deepseek_v4_1_debugmodel").model
     config.dim = config.tok_embeddings.embedding_dim = config.lm_head.in_features = 8
     config.vocab_size = config.tok_embeddings.num_embeddings = config.lm_head.out_features = 64
     config.norm.normalized_shape = 8

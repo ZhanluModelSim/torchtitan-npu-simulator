@@ -16,15 +16,16 @@ MODULE=torchtitan_npu_recipes.tests.models.deepseek_v4 CONFIG=deepseek_v4_flash_
 
 需要缩短试运行步数或更换优化器时，直接修改对应 recipe；也可编写 Python 配置函数，通过 `MODULE`、`CONFIG` 指定，见[配置组合指南](../developer_guides/python_recipes.md)。
 
-DeepSeek-V4.1 的文本调试配置可以通过以下命令查看：
+查看 DeepSeek-V4.1 的多模态调试配置时，将 `HF_ASSETS_PATH` 指向实际的模型资产目录。
 
 ```bash
-MODULE=torchtitan_npu_recipes.models.deepseek_v4_1 \
-CONFIG=deepseek_v4_1_debugmodel_text NGPU=1 \
+HF_ASSETS_PATH=/path/to/deepseek-v4.1-tokenizer \
+MODULE=torchtitan_npu_recipes.tests.models.deepseek_v4_1 \
+CONFIG=deepseek_v4_1_debugmodel_multimodal NGPU=1 \
   bash scripts/run_train.sh --print-config
 ```
 
-去掉 `--print-config` 即可启动训练。该配置默认训练 10000 步；需要减少步数时，在自定义配置函数中设置 `config.training.steps`。
+去掉 `--print-config` 即可启动训练。
 
 CANN 的 `set_env.sh` 不在默认位置时，显式指定环境脚本路径：
 

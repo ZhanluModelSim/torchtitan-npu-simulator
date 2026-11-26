@@ -19,7 +19,7 @@ from torchtitan.distributed.flex_shard.dist_muon import _resolve_storage_to_comp
 from torchtitan_npu.config import OptimizerConfig
 from torchtitan_npu.extensions.torchtitan.components.optimizer.muon import DistMuon
 from torchtitan_npu_recipes.models.deepseek_v4 import _dsv4_muon_profile
-from torchtitan_npu_recipes.models.deepseek_v4_1 import _v41_muon_profile
+from torchtitan_npu_recipes.tests.models.deepseek_v4_1 import _v41_muon_profile
 
 
 @pytest.fixture
@@ -38,7 +38,7 @@ def sparse_storage_mesh():
     "module,recipe,profile_factory",
     [
         ("torchtitan_npu_recipes.tests.models.deepseek_v4", "deepseek_v4_debugmodel", _dsv4_muon_profile),
-        ("torchtitan_npu_recipes.models.deepseek_v4_1", "deepseek_v4_1_debugmodel_text", _v41_muon_profile),
+        ("torchtitan_npu_recipes.tests.models.deepseek_v4_1", "deepseek_v4_1_debugmodel_multimodal", _v41_muon_profile),
     ],
     ids=["v4", "v4.1"],
 )

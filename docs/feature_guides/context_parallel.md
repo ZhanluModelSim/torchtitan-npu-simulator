@@ -114,8 +114,8 @@ DeepSeek-V4 的 Grain 配置将文档对齐值放在 dataset 的 `AlignedTextPro
 启用 CP 时，需在 recipe 中将该值设为 `128 × CP` 的倍数。
 
 V4.1 的 CP 配方是 `torchtitan_npu_recipes.models.deepseek_v4_1.deepseek_v4_1_flash_cpt_1m_a5`：配方默认
-`CP=128`、`EP=128`、`--dataloader.per_doc_alignment 256`，启动时按 `EP` 校验拓扑（`WORLD_SIZE`
-与 `384` 都要能被 `EP` 整除）；`CP` / `EP` 可用同名环境变量覆盖。
+`CP=128`、`EP=128` 和 `per_doc_alignment=256`，启动时按固定 recipe 拓扑校验并行度。需要改变
+并行度时，直接修改该 Python recipe 中的 `ParallelismConfig`。
 
 - `--parallelism.context-parallel-degree > 1` 启用 CP；必须配合
   `--parallelism.spmd-backend spmd_types`（声明式 `S(0) -> R` all-gather 的前提）。切分与 metadata
@@ -352,9 +352,6 @@ Engram 不在这一列。它的 token history 要的是每行**在本文档内**
 按行那一支直接取 `token_history[:, distance - 1]` 这一片，**不**先分配一个填满 pad 的缓冲再整片写回：
 整片写回读起来像一次拷贝，但在分片的派发下写进了错的那一片（A5 单卡 cp=2 实测里 rank 0 有 970/1024
 行拿到了 rank 1 的 token，step 1 的 `loss` 从 11.94468 变到 11.94288，而两个 degree 各自仍是可复现的）。
-`deepseek_v4_1_stripped` 现在挂 Engram（`_stripped` 结尾走 `_attach_engram`，只挂一层
-`layer_ids=(1,)`），所以这条取数约束由单卡对拍与 910 的用例共同覆盖。
-
 ## 6. 组件
 
 | 文件 | 职责 |
@@ -446,24 +443,6 @@ CP 的验收分三层，越往下越严格：
   实现选择差异），不随 step 放大。
 - `--compile.enable` 在 CP=1 下照旧编译（开启后 step 1 的数值应与 eager 一致）；CP>1 下跳过编译并
   告警，跑 eager（§4.2）。
-
-### 7.4 Engram 的取数方式
-
-挂 Engram 的 `deepseek_v4_1_debugmodel_text` 过不了融合内核（`SparseFlashMla` 要求 q head dim 为
-512、RoPE 表 512），所以这一路用 `deepseek_v4_1_stripped`：released 几何 + debug 的 Engram 表（只挂
-一层，`layer_ids=(1,)`）。它同时是两个 degree 的精度基线，可按第 2 节使用 `NGPU=2`、`CP=2` 和融合算子。
-
-拼好之后的判据与其它用例相同，两条都实测过（A5 单卡，level 3，同一份镜像权重）：
-
-- **整模型**：CP=1 与 CP=2 的 logits 逐位相同（`0/10485760`），step 1 的 `loss` / `grad_norm` 两侧
-  都是 `11.94468` / `18.9753`；各自重跑一次也逐位复现。
-- **单模块**：把 Engram 模块单独拿出来，用整行前向的结果当基准，再按各 rank 的行 + 按行 history 跑
-  一遍，输出同样逐位相同——文档长度不等、`cp=4`、`history` 2/3 都成立。换成"连续一个窗口"的 history
-  就不逐位，这正是 §5.5 那条按行 history 存在的理由。
-
-镜像权重、`set_deterministic_level(3)` 两侧同开这两条对 Engram 一样成立；Engram 的表是
-`LocalTensor`（没有 `device_mesh`），脚手架在 `_piece` 里要把它当作未切分处理，否则 CP=2 加载镜像
-时会崩在取 `device_mesh` 上。
 
 ## 8. 相关文档
 

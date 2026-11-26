@@ -10,10 +10,10 @@ import pytest
 import torch
 
 from tests.unit_tests.models.common.text_data_utils import IntegerTextTokenizer, aligned_text_config
-from torchtitan_npu.models.deepseek_v4_1 import model_registry
-from torchtitan_npu_recipes.models.deepseek_v4_1 import (
+from torchtitan_npu.models.deepseek_v4_1 import build_model_config
+from torchtitan_npu_recipes.tests.models.deepseek_v4_1 import (
+    _make_trainer_config,
     deepseek_v4_1_debugmodel_multimodal,
-    deepseek_v4_1_debugmodel_text,
 )
 
 
@@ -75,7 +75,7 @@ def test_long_document_continuation_uses_context_boundaries(tmp_path):
     finally:
         loader.close()
 
-    config = model_registry("deepseek_v4_1_debugmodel_text")
+    config = build_model_config("deepseek_v4_1_debugmodel_text")
     attention = config.layers[2].attention.inner_attention
     metadata = attention.build_attention_metadata(inputs["positions"])
 
@@ -93,7 +93,7 @@ def test_text_recipe_preprocess_builds_folded_metadata_map(tmp_path, token_budge
     monkeypatch.setattr(decoder_patch, "annotate_input_spmd_types", lambda _context, batch, _shardings: batch)
     dataset = tmp_path / "data.json"
     dataset.write_text('{"text":"3 4"}\n{"text":"5 6"}\n{"text":"7"}\n')
-    recipe = deepseek_v4_1_debugmodel_text()
+    recipe = _make_trainer_config("deepseek_v4_1_debugmodel_text")
     recipe.dataloader = replace(
         recipe.dataloader, dataset=aligned_text_config(dataset).dataset, repeat=False, shuffle=False
     )

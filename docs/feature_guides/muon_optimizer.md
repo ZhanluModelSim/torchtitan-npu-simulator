@@ -56,7 +56,7 @@ MODULE=my_recipes CONFIG=muon_training NGPU=2 bash scripts/run_train.sh \
 
 ## 参数分组与 FlexShard
 
-参数匹配、compute layout 和 bucket 配置由 recipe 定义：V4 位于 `torchtitan_npu_recipes/models/deepseek_v4.py`，V4.1 位于 `torchtitan_npu_recipes/models/deepseek_v4_1.py`。配置辅助函数根据模型结构生成默认规则，不改变优化器实现。
+参数匹配、compute layout 和 bucket 配置由 recipe 定义：V4 位于 `torchtitan_npu_recipes/models/deepseek_v4.py`，V4.1 位于 `torchtitan_npu_recipes/tests/models/deepseek_v4_1.py`。配置辅助函数根据模型结构生成默认规则，不改变优化器实现。
 
 FlexShard 按 `Owned`、`BlockShard` 或专家维分片，把参数的 storage layout 转成 Muon 需要的计算布局。当前上游要求 Muon 的 `ComputeLayout.compute_dtype=torch.bfloat16`。这只规定 Newton–Schulz 的计算精度，不等于把持久动量统一改为 BF16。
 

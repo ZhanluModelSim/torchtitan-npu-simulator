@@ -9,8 +9,8 @@ import pytest
 import torch
 
 from tests.unit_tests.models.mtp_test_utils import build_cpu_model
-from torchtitan_npu.models.deepseek_v4_1 import _LINEAR_INIT, _make_v41_moe_config
-from torchtitan_npu_recipes.models.deepseek_v4_1 import deepseek_v4_1_debugmodel_multimodal
+from torchtitan_npu.models.deepseek_v4_1.flavors import _LINEAR_INIT, _make_v41_moe_config
+from torchtitan_npu_recipes.tests.models.deepseek_v4_1 import deepseek_v4_1_debugmodel_multimodal
 
 
 def test_plain_weights_use_routed_experts_and_track_empty_experts():
@@ -135,7 +135,7 @@ def test_model_config_rejects_a_ratio_table_shorter_than_the_stack():
 def test_vision_bias_follows_the_factory_switch():
     """``vision_enabled`` is the MoE factory's parameter, and it is the only thing that
     decides whether the router builds a ``bias_vl`` parameter at all."""
-    from torchtitan_npu.models.deepseek_v4_1 import _make_v41_moe_config
+    from torchtitan_npu.models.deepseek_v4_1.flavors import _make_v41_moe_config
 
     def build(vision_enabled: bool):
         config = _make_v41_moe_config(

@@ -13,13 +13,19 @@ from torchtitan_npu.config import OptimizerConfig
 from torchtitan_npu.extensions.torchtitan.components.optimizer.muon import DistMuon
 from torchtitan_npu.models.deepseek_v4.lora import is_lora_parameter
 from torchtitan_npu_recipes.models.deepseek_v4 import _dsv4_muon_profile
-from torchtitan_npu_recipes.models.deepseek_v4_1 import _v41_muon_profile, deepseek_v4_1_flash_text_lora
 from torchtitan_npu_recipes.tests.ci.deepseek_v4 import deepseek_v4_flash_lora
+from torchtitan_npu_recipes.tests.models.deepseek_v4_1 import (
+    _v41_muon_profile,
+    deepseek_v4_1_flash_40layers_16experts_text_lora,
+)
 
 
 @pytest.mark.parametrize(
     "factory,profile_factory",
-    [(deepseek_v4_flash_lora, _dsv4_muon_profile), (deepseek_v4_1_flash_text_lora, _v41_muon_profile)],
+    [
+        (deepseek_v4_flash_lora, _dsv4_muon_profile),
+        (deepseek_v4_1_flash_40layers_16experts_text_lora, _v41_muon_profile),
+    ],
     ids=["v4", "v4.1"],
 )
 def test_actual_lora_recipe_muon_groups_cover_adapters_with_layouts_and_unique_buckets(factory, profile_factory):

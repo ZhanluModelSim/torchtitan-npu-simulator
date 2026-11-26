@@ -9,7 +9,7 @@ from torchtitan.config import OverrideConfig
 from torchtitan.config.override import apply_overrides
 from torchtitan.models.common.nn_modules import RMSNorm
 
-from torchtitan_npu.models.deepseek_v4_1 import model_registry
+from torchtitan_npu.models.deepseek_v4_1 import build_model_config
 from torchtitan_npu.models.deepseek_v4_1.vision import DeepSeekV41VisionEncoder
 from torchtitan_npu.override.common.rms_norm import AscRMSNorm
 
@@ -30,7 +30,7 @@ def test_override_reaches_vision_and_preserves_parameter_names():
 
 
 def test_model_config_uses_common_rms_norm():
-    cfg = model_registry("deepseek_v4_1_debugmodel")
+    cfg = build_model_config("deepseek_v4_1_debugmodel")
     assert type(cfg.layers[0].attention.q_norm) is RMSNorm.Config
     assert type(cfg.layers[2].attention.compressor.norm) is RMSNorm.Config
     assert type(cfg.layers[2].attention.indexer.k_norm) is RMSNorm.Config

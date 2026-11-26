@@ -117,24 +117,17 @@ def test_one_degree_passes_the_boundary_differences(bounds, ratio):
 
 @pytest.mark.parametrize("is_a5", [False, True], ids=["a3", "a5"])
 def test_a_ratio_one_frame_keeps_the_targets_residual_spelling(monkeypatch, is_a5):
-    """A ratio-1 frame has no trailing group; the spelling differs by target.
-
-    A3's kernels take zeros for it; A5's LightningIndexerV2/SMLA reject a value there
-    (EZ0037), so the frame's ``None`` passes through.  A ratio-2 frame carries its own
-    tensor on both targets.
-    """
+    """The selector omits the ratio-1 residual; the sparse core uses its target's convention."""
     monkeypatch.setattr(core_ascendc, "_IS_A5", is_a5)
     monkeypatch.setattr(selector_ascendc, "_IS_A5", is_a5)
     metadata = _masks([0, 8, 24], ratio=1)
 
-    for options, name in (
-        (_core_options(metadata, 1), "cmp_residual_kv"),
-        (_selector_options(metadata, 1), "cmp_residual_k"),
-    ):
-        if is_a5:
-            assert options[name] is None
-        else:
-            assert torch.equal(options[name], torch.zeros(2, dtype=torch.int32))
+    assert _selector_options(metadata, 1)["cmp_residual_k"] is None
+    core_residual = _core_options(metadata, 1)["cmp_residual_kv"]
+    if is_a5:
+        assert core_residual is None
+    else:
+        torch.testing.assert_close(core_residual, torch.zeros(2, dtype=torch.int32))
 
     pooled = _masks([0, 8, 24], ratio=2)
     assert _core_options(pooled, 2)["cmp_residual_kv"] is pooled.cmp_k.residual

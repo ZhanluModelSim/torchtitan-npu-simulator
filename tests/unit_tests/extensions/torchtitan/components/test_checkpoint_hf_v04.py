@@ -58,7 +58,7 @@ def _model_config(monkeypatch, family):
 
         return registry.build_model_config("debugmodel", seq_len=16, num_mtp_layers=1, parallelism=ParallelismConfig())
 
-    import torchtitan_npu.models.deepseek_v4_1 as registry
+    import torchtitan_npu.models.deepseek_v4_1.flavors as registry
 
     make = registry._make_v41_config
 
@@ -105,7 +105,7 @@ def _model_config(monkeypatch, family):
             require_token_id_map=False,
         ),
     )
-    return registry.model_registry("deepseek_v4_1_debugmodel_text")
+    return registry.build_model_config("deepseek_v4_1_debugmodel_text")
 
 
 def _build_model(config, seed):

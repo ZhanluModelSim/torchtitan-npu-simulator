@@ -29,7 +29,7 @@ from torchtitan_npu.config import OptimConfig
 from torchtitan_npu.extensions.torchtitan.components.checkpoint import CheckpointManager
 from torchtitan_npu.extensions.torchtitan.components.optimizer.optimizer import HostSparseOptimizersContainer
 from torchtitan_npu.models.deepseek_v4_1.optimizer import EngramTableOptimizerConfig
-from torchtitan_npu_recipes.models.deepseek_v4_1 import deepseek_v4_1_debugmodel_text
+from torchtitan_npu_recipes.tests.models.deepseek_v4_1 import _make_trainer_config
 
 if TYPE_CHECKING:
     from torchtitan.components.checkpointer import AsyncMode
@@ -190,7 +190,8 @@ def engram_hf() -> TrainerEx.Config:
 
     ep = 2 if joint else 4
     hf_assets_path = os.environ.get("HF_ASSETS_PATH") or "tests/assets/deepseek_v3"
-    config = deepseek_v4_1_debugmodel_text(
+    config = _make_trainer_config(
+        "deepseek_v4_1_debugmodel_text",
         parallelism=ParallelismConfig(
             data_parallel_replicate_degree=1,
             data_parallel_shard_degree=4,

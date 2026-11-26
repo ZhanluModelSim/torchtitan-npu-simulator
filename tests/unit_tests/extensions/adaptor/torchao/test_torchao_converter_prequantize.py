@@ -38,7 +38,7 @@ from torchtitan_npu.extensions.adaptor.torchao.converter import (
     apply_quantization_converter,
 )
 from torchtitan_npu.models.deepseek_v4 import build_model_config
-from torchtitan_npu.models.deepseek_v4_1 import model_registry as v41_model_registry
+from torchtitan_npu.models.deepseek_v4_1 import build_model_config as v41_build_model_config
 from torchtitan_npu_recipes.models.deepseek_v4 import deepseek_v4_flash_cpt_4k_a5
 
 
@@ -70,7 +70,7 @@ def test_default_whitelist_excludes_stacked_gate_up(family):
     spec = (
         build_model_config("debugmodel", num_mtp_layers=0, parallelism=ParallelismConfig())
         if family == "v4"
-        else v41_model_registry("deepseek_v4_1_stripped")
+        else v41_build_model_config("deepseek_v4_1_debugmodel_text")
     )
     quantization = _quantization_config(enable_fsdp_prequantize=True)
 

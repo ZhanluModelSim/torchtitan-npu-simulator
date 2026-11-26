@@ -5,13 +5,15 @@ import pytest
 import spmd_types as spmd
 import torch
 import torch.nn.functional as F
+from torchtitan.components.optim import AdamW
 from torchtitan.models.base.sharding import ShardingConfig
 from torchtitan.models.common.decoder_sharding import dense_param_placement
 from torchtitan.models.common.linear import GroupedLinear
 
 from tests.unit_tests.models.deepseek_v4.lora_test_utils import _lora_model_config
+from torchtitan_npu.config import OptimizerConfig
 from torchtitan_npu.models.common.deepseek_lora import BatchedLinearLoRA
-from torchtitan_npu_recipes.models.deepseek_v4_1 import deepseek_v4_1_debugmodel_lora
+from torchtitan_npu_recipes.tests.models.deepseek_v4_1 import _apply_lora, _make_trainer_config
 
 
 @pytest.fixture(autouse=True)
@@ -76,7 +78,12 @@ def test_native_wo_a_grouped_output_uses_both_lora_factors():
 )
 @pytest.mark.parametrize("replicated", [False, True], ids=["unsharded", "replicated"])
 def test_standard_lora_projection_output_and_gradients_match_independent_formula(model, kind, replicated, monkeypatch):
-    config = deepseek_v4_1_debugmodel_lora().model if model == "dsv4_1" else _lora_model_config()
+    if model == "dsv4_1":
+        lora_config = _make_trainer_config("deepseek_v4_1_debugmodel_text")
+        lora_config.optim.optimizer = OptimizerConfig(optimizers=[AdamW.Config(pattern=r".*", lr=1e-5, eps=1e-6)])
+        config = _apply_lora(lora_config).model
+    else:
+        config = _lora_model_config()
     if kind == "dense":
         projection = config.layers[0].attention.wq_a
     elif kind == "batched":
