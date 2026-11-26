@@ -19,6 +19,18 @@ from torchtitan.models.common.vision_encoder_sharding import (
 from torchtitan_npu.models.common.rope import HalfRotation
 
 
+class UnmaskedVisionSDPA(Module):
+    @dataclass(kw_only=True, slots=True)
+    class Config(Module.Config):
+        pass
+
+    def __init__(self, config: Config):
+        super().__init__()
+
+    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        return F.scaled_dot_product_attention(q, k, v)
+
+
 class ImageMarkerEmbeddings(Module):
     """Learned embeddings for the three non-feature image protocol tokens."""
 
@@ -33,20 +45,23 @@ class ImageMarkerEmbeddings(Module):
         self.image_end = torch.nn.Parameter(torch.empty(config.dim))
 
     def forward(self, hidden, token_types):
-        output = hidden.clone()
-        output[token_types == 0] = self.image_start.to(output.dtype)
-        output[token_types == 2] = self.image_newline.to(output.dtype)
-        output[token_types == 3] = self.image_end.to(output.dtype)
-        return output
+        for token_type, embedding in ((0, self.image_start), (2, self.image_newline), (3, self.image_end)):
+            hidden = torch.where(token_types.unsqueeze(-1) == token_type, embedding.to(hidden.dtype), hidden)
+        return hidden
 
 
-def _vision_rope(n_h: int, n_w: int, rope_dim: int, theta: float, device):
+def _vision_rope_from_positions(hpos, wpos, rope_dim: int, theta: float):
+    device = hpos.device
     inv_freq = 1.0 / (theta ** (torch.arange(0, rope_dim, 2, dtype=torch.float32, device=device) / rope_dim))
-    hpos = torch.arange(n_h, device=device).unsqueeze(1).expand(n_h, n_w)
-    wpos = torch.arange(n_w, device=device).unsqueeze(0).expand(n_h, n_w)
     freqs = torch.stack([hpos, wpos], dim=-1).reshape(-1, 2, 1).float() * inv_freq
     freqs = freqs.flatten(1)
     return freqs.cos().view(1, -1, 1, rope_dim), freqs.sin().view(1, -1, 1, rope_dim)
+
+
+def _vision_rope(n_h: int, n_w: int, rope_dim: int, theta: float, device):
+    hpos = torch.arange(n_h, device=device).unsqueeze(1).expand(n_h, n_w)
+    wpos = torch.arange(n_w, device=device).unsqueeze(0).expand(n_h, n_w)
+    return _vision_rope_from_positions(hpos, wpos, rope_dim, theta)
 
 
 def _vision_rope_batch(grids: torch.Tensor, max_tokens: int, rope_dim: int, theta: float, device):
@@ -88,9 +103,10 @@ class VisionAttention(Module):
 
         rotary: HalfRotation.Config = field(default_factory=HalfRotation.Config)
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, *, unmasked_sdpa: UnmaskedVisionSDPA.Config | None = None):
         super().__init__()
         self.rotary = config.rotary.build()
+        self.unmasked_sdpa = (unmasked_sdpa or UnmaskedVisionSDPA.Config()).build()
         if config.dim % config.num_heads != 0:
             raise ValueError("vision dim must be divisible by vision heads")
         self.num_heads = config.num_heads
@@ -121,11 +137,10 @@ class VisionAttention(Module):
             q = self.rotary(q, cos, sin)
             k = self.rotary(k, cos, sin)
             # Keep the batch dimension so SDPA can select a fused attention backend.
-            out = F.scaled_dot_product_attention(
+            out = self.unmasked_sdpa(
                 q.transpose(0, 1).unsqueeze(0),
                 k.transpose(0, 1).unsqueeze(0),
                 v.transpose(0, 1).unsqueeze(0),
-                dropout_p=0.0,
             )
             return self.wo(out.squeeze(0).transpose(0, 1).reshape(p, dim))
 
@@ -185,7 +200,7 @@ class VisionBlock(Module):
 
         rotary: HalfRotation.Config = field(default_factory=HalfRotation.Config)
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, *, unmasked_sdpa: UnmaskedVisionSDPA.Config | None = None):
         super().__init__()
         self.norm1 = replace(
             config.norm,
@@ -193,7 +208,9 @@ class VisionBlock(Module):
             eps=config.norm_eps,
             sharding_config=invariant_norm_sharding_config(),
         ).build()
-        self.attn = self.attention_type.Config(dim=config.dim, num_heads=config.num_heads, rotary=config.rotary).build()
+        self.attn = self.attention_type.Config(dim=config.dim, num_heads=config.num_heads, rotary=config.rotary).build(
+            unmasked_sdpa=unmasked_sdpa
+        )
         self.norm2 = replace(
             config.norm,
             normalized_shape=config.dim,
@@ -231,8 +248,15 @@ class ImageAligner(Module):
             sharding_config=vision_invariant_linear_sharding_config(),
         ).build()
 
-    def forward(self, x, grids):
+    def forward(self, x, grids, *, patch_indices=None):
         ratio = self.downsample_ratio
+        if patch_indices is not None:
+            # Match unfold's channel-major order and zero padding at grid edges.
+            patches = x.index_select(0, patch_indices.clamp_min(0).flatten())
+            patches = patches.view(*patch_indices.shape, x.shape[-1])
+            patches = patches.masked_fill(patch_indices.unsqueeze(-1) < 0, 0)
+            features = patches.transpose(1, 2).flatten(1)
+            return self.w2(F.gelu(self.w1(features)))
         if x.shape[0] == 1:
             height, width = (int(value) for value in grids[0].tolist())
             sample = x[0, : height * width].view(height, width, -1).permute(2, 0, 1)
@@ -277,6 +301,7 @@ class DeepSeekV41VisionEncoder(Module):
         text_dim: int = 4096
         downsample_ratio: int = 3
         norm_eps: float = 1e-6
+        unmasked_sdpa: UnmaskedVisionSDPA.Config = field(default_factory=UnmaskedVisionSDPA.Config)
         norm: RMSNorm.Config = field(default_factory=lambda: RMSNorm.Config(normalized_shape=1))
 
         rotary: HalfRotation.Config = field(default_factory=HalfRotation.Config)
@@ -296,7 +321,7 @@ class DeepSeekV41VisionEncoder(Module):
                     norm_eps=config.norm_eps,
                     norm=config.norm,
                     rotary=config.rotary,
-                ).build()
+                ).build(unmasked_sdpa=config.unmasked_sdpa)
                 for _ in range(config.num_layers)
             ]
         )
@@ -312,7 +337,20 @@ class DeepSeekV41VisionEncoder(Module):
             downsample_ratio=config.downsample_ratio,
         ).build()
 
-    def forward(self, patches: torch.Tensor, grids: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, patches: torch.Tensor, grids: torch.Tensor, *, patch_indices: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        if patch_indices is not None:
+            x = self.patch_embed(patches.squeeze(0))
+            position = torch.arange(x.shape[0], device=x.device)
+            width = grids[0, 1]
+            rope_dim = self.dim // self.num_heads // 2
+            cos, sin = _vision_rope_from_positions(position // width, position % width, rope_dim, self.rope_theta)
+            valid = torch.ones_like(position, dtype=torch.bool)
+            for block in self.blocks:
+                x = block(x, cos.squeeze(0), sin.squeeze(0), valid)
+            return self.aligner(self.norm(x), grids, patch_indices=patch_indices)
+
         if patches.shape[0] == 1:
             height, width = (int(value) for value in grids[0].tolist())
             patch_count = height * width

@@ -44,7 +44,11 @@ from typing import TYPE_CHECKING, cast
 import torch
 import torch_remat as remat
 from torch import nn
+from torch._dynamo.decorators import mark_unbacked
+from torch.utils._pytree import register_dataclass
+from torchtitan.experiments.graph_trainer.model import GraphTrainerModel
 from torchtitan.models.common.decoder import Decoder, TransformerBlock
+from torchtitan.models.common.linear import Linear
 
 from torchtitan_npu.models.common.attention_metadata import GeometryAttentionMetadataMixin
 from torchtitan_npu.models.common.metadata import KernelFrame
@@ -158,6 +162,9 @@ class DeepSeekV41Metadata:
             "override.deepseek_v4_1.lightning_indexer.asc) to run with "
             "--parallelism.context-parallel-degree."
         )
+
+
+register_dataclass(DeepSeekV41Metadata, serialized_type_name=f"{DeepSeekV41Metadata.__module__}.DeepSeekV41Metadata")
 
 
 def build_v41_frames(
@@ -316,19 +323,11 @@ class DeepSeekV41Model(GeometryAttentionMetadataMixin, Decoder):
     supports_pipeline_parallel = False
 
     def parallelize(self, **kwargs):
-        from torchtitan_npu.models.common.moe import validate_dispatcher_capacity
+        from .parallelize import validate_deepseek_v4_1_parallelism
 
-        parallelism = kwargs["parallelism"]
-        if (
-            parallelism.tensor_parallel_degree != 1
-            or parallelism.context_parallel_degree != 1
-            or parallelism.pipeline_parallel_degree != 1
-        ):
-            raise NotImplementedError("DeepSeek V4.1 currently supports TP=CP=PP=1 only")
-        for layer in self.config.layers:
-            if layer.engram is not None and layer.engram.table.num_embeddings % parallelism.expert_parallel_degree:
-                raise ValueError("Engram physical table size must be divisible by EP degree")
-        validate_dispatcher_capacity(self.config, training=kwargs["training"], parallelism=parallelism)
+        validate_deepseek_v4_1_parallelism(
+            self.config, training=kwargs.get("training"), parallelism=kwargs["parallelism"]
+        )
         return super().parallelize(**kwargs)
 
     @classmethod
@@ -716,6 +715,7 @@ class DeepSeekV41MultimodalModel(DeepSeekV41Model):
         image_grid: torch.Tensor | None = None,
         image_feature_indices: torch.Tensor | None = None,
         token_types: torch.Tensor | None = None,
+        image_patch_indices: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Return ``(embeddings, image_mask)`` for one forward.
 
@@ -738,6 +738,7 @@ class DeepSeekV41MultimodalModel(DeepSeekV41Model):
             image_grid=image_grid,
             image_feature_indices=image_feature_indices,
             token_types=token_types,
+            image_patch_indices=image_patch_indices,
         ), image_mask
 
     def _scatter_visual_features(
@@ -748,6 +749,7 @@ class DeepSeekV41MultimodalModel(DeepSeekV41Model):
         image_grid: torch.Tensor,
         image_feature_indices: torch.Tensor,
         token_types: torch.Tensor | None,
+        image_patch_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run the tower and write its features into the token embeddings."""
         from .vision.data import scatter_image_features
@@ -757,9 +759,12 @@ class DeepSeekV41MultimodalModel(DeepSeekV41Model):
         if image_grid.ndim == 3:
             image_grid = image_grid.flatten(0, 1)
         hidden = self.tok_embeddings(tokens)
-        visual = self.vision_encoder(pixel_values, image_grid)
         if token_types is not None:
             hidden = self.image_marker_embeddings(hidden, token_types)
+        visual = self.vision_encoder(pixel_values, image_grid, patch_indices=image_patch_indices)
+        if image_patch_indices is not None:
+            features = visual.index_select(0, image_feature_indices.clamp_min(0)).to(hidden.dtype)
+            return torch.where(image_feature_indices.unsqueeze(-1) >= 0, features, hidden)
         ratio = self.vision_encoder.aligner.downsample_ratio
         counts = ((image_grid[:, 0].to(torch.long) + ratio - 1) // ratio) * (
             (image_grid[:, 1].to(torch.long) + ratio - 1) // ratio
@@ -787,6 +792,7 @@ class DeepSeekV41MultimodalModel(DeepSeekV41Model):
         input_embeds: torch.Tensor | None = None,
         padding_mask: torch.Tensor | None = None,
         aux_loss_denominators: torch.Tensor | None = None,
+        image_patch_indices: torch.Tensor | None = None,
     ):
         """The text forward plus the modality inputs the vision tower consumes.
 
@@ -805,6 +811,7 @@ class DeepSeekV41MultimodalModel(DeepSeekV41Model):
                 image_grid=image_grid,
                 image_feature_indices=image_feature_indices,
                 token_types=token_types,
+                image_patch_indices=image_patch_indices,
             )
         return super().forward(
             tokens,
@@ -815,3 +822,84 @@ class DeepSeekV41MultimodalModel(DeepSeekV41Model):
             padding_mask=padding_mask,
             aux_loss_denominators=aux_loss_denominators,
         )
+
+
+class _GraphTrainerDeepSeekV41Model(GraphTrainerModel):
+    def parallelize(self, **kwargs):
+        from .parallelize import parallelize_graph_trainer_deepseek_v4_1
+
+        with kwargs["parallelism_context"].activate_spmd():
+            return parallelize_graph_trainer_deepseek_v4_1(self, **kwargs)
+
+
+class GraphTrainerDeepSeekV41Model(_GraphTrainerDeepSeekV41Model, DeepSeekV41Model):
+    @dataclass(kw_only=True, slots=True)
+    class Config(DeepSeekV41Model.Config):
+        pass
+
+
+class GraphTrainerDeepSeekV41MultimodalModel(_GraphTrainerDeepSeekV41Model, DeepSeekV41MultimodalModel):
+    @dataclass(kw_only=True, slots=True)
+    class Config(DeepSeekV41MultimodalModel.Config):
+        pass
+
+    def __init__(self, config: Config):
+        super().__init__(config)
+        # Vision creates Linear configs during construction, outside the config
+        # traversal that disables in-place WGRAD accumulation for GraphTrainer.
+        for module in self.vision_encoder.modules():
+            if isinstance(module, Linear):
+                module.inplace_wgrad_accum = False
+        for layer in self.layers.values():
+            router = cast("DeepSeekV41TransformerBlock", layer).feed_forward.router
+            bias = getattr(router, "bias_vl", None)
+            if bias is not None:
+                # The bias only affects discrete expert selection, so eager
+                # never computes a gradient for it either.
+                bias.requires_grad_(False)
+
+    def preprocess_inputs(self, input_dict, *, parallelism_context, **kwargs):
+        inputs, labels, model_kwargs, loss_kwargs = super().preprocess_inputs(
+            input_dict, parallelism_context=parallelism_context, **kwargs
+        )
+        from torchtitan.distributed.spmd_types import annotate_input_spmd_types
+        from torchtitan.models.common.vision_encoder_sharding import multimodal_input_sharding
+
+        patches = model_kwargs.get("pixel_values")
+        grids = model_kwargs.get("image_grid")
+        if patches is None or grids is None or grids.shape != (1, 2) or patches.ndim != 3 or patches.shape[0] != 1:
+            raise ValueError("DeepSeek V4.1 GraphTrainer requires one image per microbatch")
+        if grids.dtype not in (torch.int32, torch.int64):
+            raise ValueError("Image grid height and width must be integers")
+
+        height, width = grids[0].tolist()
+        if height <= 0 or width <= 0:
+            raise ValueError("Image grid height and width must be positive")
+        if patches.shape[1] != height * width:
+            raise ValueError("Image patch count must equal image grid height * width; padded patches are not supported")
+        ratio = self.vision_encoder.aligner.downsample_ratio
+        feature_count = ((height + ratio - 1) // ratio) * ((width + ratio - 1) // ratio)
+        feature_indices = model_kwargs.get("image_feature_indices")
+        if not isinstance(inputs, torch.Tensor) or feature_indices is None or feature_indices.shape != inputs.shape:
+            raise ValueError("image_feature_indices must have the same shape as the input tokens")
+        if feature_indices.dtype not in (torch.int32, torch.int64):
+            raise ValueError("image_feature_indices must contain integer indices")
+        if ((feature_indices < -1) | (feature_indices >= feature_count)).any().item():
+            raise ValueError(f"image_feature_indices must be -1 or in [0, {feature_count})")
+        offsets = torch.arange(ratio, device=patches.device)
+        rows = torch.arange(0, height, ratio, device=patches.device)[:, None] + offsets
+        cols = torch.arange(0, width, ratio, device=patches.device)[:, None] + offsets
+        rows, cols = rows[:, None, :, None], cols[None, :, None, :]
+        indices = (rows * width + cols).masked_fill((rows >= height) | (cols >= width), -1)
+        indices = indices.reshape(-1, ratio * ratio)
+        annotate_input_spmd_types(
+            parallelism_context,
+            {"image_patch_indices": indices},
+            {"image_patch_indices": multimodal_input_sharding()["pixel_values"]},
+        )
+        # The memory-policy pass queries activation sizes before retracing.
+        # Unbacked dimensions keep those queries from fixing the first image size.
+        mark_unbacked(patches, 1)
+        mark_unbacked(indices, 0)
+        model_kwargs["image_patch_indices"] = indices
+        return inputs, labels, model_kwargs, loss_kwargs

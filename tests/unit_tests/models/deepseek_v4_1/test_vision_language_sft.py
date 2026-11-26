@@ -366,11 +366,14 @@ def test_single_context_budget_and_shifted_batch_contract(tmp_path, tokenizer):
         tokenizer=tokenizer, dp_rank=0, dp_world_size=1, max_context_length=512, num_tokens_per_microbatch=512
     )
     try:
-        inputs, labels = _unpack(next(iter(loader)))
+        batch = next(iter(loader))
+        inputs, labels = _unpack(batch)
     finally:
         loader.close()
     raw = json.loads(dataset_path.read_text())
     expected_inputs, expected_labels = _processor(dataset_path, tokenizer)._sample(raw)
+    assert batch.routing_token_counts.shape == (1,)
+    torch.testing.assert_close(batch.routing_token_counts[0], (~batch.padding_mask).sum())
     assert inputs["input"].shape == labels.shape == (512,)
     assert type(inputs["loss_token_count"]) is int
     assert inputs["loss_token_count"] == (expected_labels != -100).sum()

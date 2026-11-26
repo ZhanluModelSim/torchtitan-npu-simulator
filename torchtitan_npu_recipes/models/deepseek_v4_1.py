@@ -100,8 +100,8 @@ def _v41_muon_profile(model: DeepSeekV41Model.Config) -> MuonOptimizerProfile:
     does not change the parameter policy the verified stacks ran with.
     """
     model_config = model
-    # The target upstream names the dense parameter storage axis dp_shard.
-    dense_dp_axes = (MeshAxisName.DP_SHARD.value,)
+    # SimpleFSDP names the dense parameter storage axis fsdp.
+    dense_dp_axes = (MeshAxisName.DP_SHARD.value, "fsdp")
     owned = make_owned_layout(dense_dp_axes)
     owned_attention_projections = {"wq_a": owned, "wkv": owned, "wo_b": owned}
     attention_projections = (*owned_attention_projections, "wq_b", "wo_a")
@@ -259,6 +259,7 @@ def _make_trainer_config(
     num_tokens_per_microbatch: int | None = None,
     num_max_tokens_per_rank: int | None = None,
     engram: EngramArgs | None = None,
+    engram_enabled: bool = True,
 ) -> TrainerEx.Config:
     from torchtitan_npu.models.common.moe import dispatcher_capacity
 
@@ -294,6 +295,9 @@ def _make_trainer_config(
         ),
         local_compile_regions=[],
     )
+    if not engram_enabled:
+        for layer in model.layers:
+            layer.engram = None
     if dataloader_factory is not None:
         dataloader = dataloader_factory(model)
     elif isinstance(model, DeepSeekV41MultimodalModel.Config):
@@ -314,6 +318,7 @@ def _make_trainer_config(
         )
 
     return DeepSeekV41Trainer.Config(
+        engram_enabled=engram_enabled,
         hf_assets_path=hf_assets_path,
         training=TrainingConfig(
             disable_cuda_graphs=True,

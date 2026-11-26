@@ -101,15 +101,18 @@ def test_muon_groups_match_real_parameters_layouts_and_buckets(version):
     q_shard = layouts["layers.0.attention.wq_b.weight"].shardings_by_mesh_axis[dp]
     assert isinstance(q_shard, BlockShard) and q_shard.dim == 0
     assert q_shard.block_sizes == (config.layers[0].attention.head_dim,)
+    graph_q_shard = layouts["layers.0.attention.wq_b.weight"].shardings_by_mesh_axis["fsdp"]
+    assert isinstance(graph_q_shard, BlockShard) and graph_q_shard.dim == 0
+    assert graph_q_shard.block_sizes == (config.layers[0].attention.head_dim,)
     out_shard = layouts["layers.0.attention.wo_a.weight"].shardings_by_mesh_axis[dp]
     assert isinstance(out_shard, BlockShard) and out_shard.block_sizes == (
         config.layers[0].attention.o_lora_rank if version == "v4" else config.layers[0].attention.wo_a.out_features,
     )
     for name in ("layers.0.feed_forward.router.gate.weight", "layers.0.attention.wq_a.weight"):
         assert isinstance(layouts[name].shardings_by_mesh_axis[dp], Owned)
+        assert isinstance(layouts[name].shardings_by_mesh_axis["fsdp"], Owned)
     expert = layouts["layers.0.feed_forward.routed_experts.w13.weight"]
-    expected_expert_axes = {dp, MeshAxisName.EDP_SHARD.value, MeshAxisName.EP.value}
-    if version == "v4":
-        expected_expert_axes.add("fsdp")  # GraphTrainer SimpleFSDP flattens the dense DP mesh.
+    # Both models support GraphTrainer's flattened SimpleFSDP mesh.
+    expected_expert_axes = {dp, "fsdp", MeshAxisName.EDP_SHARD.value, MeshAxisName.EP.value}
     assert set(expert.shardings_by_mesh_axis) == expected_expert_axes
     assert all(isinstance(shard, Shard) and shard.dim == 0 for shard in expert.shardings_by_mesh_axis.values())

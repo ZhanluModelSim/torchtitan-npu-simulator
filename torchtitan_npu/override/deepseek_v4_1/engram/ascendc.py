@@ -61,6 +61,9 @@ class HostOffloadEngramTable(HostEngramTable):
         num_max_tokens_per_rank: int
         pin_memory: bool = True
 
+    def validate_graph_training(self) -> None:
+        raise NotImplementedError("GraphTrainer supports Torch Host Engram lookup; ElasticBuffer is not supported.")
+
     def __init__(self, config: Config):
         super().__init__(config)
         if config.num_max_tokens_per_rank <= 0:
@@ -237,12 +240,16 @@ class HostOffloadEngramTable(HostEngramTable):
         with record_function("engram::sparse_accum"):
             self.accumulate_sparse_gradient(unique_local_entry, grad_unique)
 
-    def _distributed_lookup(self, row_ids_N: torch.Tensor) -> torch.Tensor:
+    def _distributed_lookup(
+        self, row_ids: torch.Tensor, *, gradient_anchor: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        if gradient_anchor is not None:
+            raise NotImplementedError("GraphTrainer supports Torch Host Engram lookup; ElasticBuffer is not supported.")
         if torch.compiler.is_compiling():
-            return compiled_lookup(self, row_ids_N)
-        flat_ids = row_ids_N.reshape(-1)
+            return compiled_lookup(self, row_ids)
+        flat_ids = row_ids.reshape(-1)
         return _EngramFetchSparseOffload.apply(self.weight, flat_ids, self, self._grad_keepalive).view(
-            *row_ids_N.shape, self.embedding_dim
+            *row_ids.shape, self.embedding_dim
         )
 
 

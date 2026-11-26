@@ -10,14 +10,28 @@
 """V4.1 FSDP assembly, Host Engram exclusion and model compile policy."""
 
 from fnmatch import fnmatchcase
-from functools import partial
+from functools import partial, wraps
 
 import torch
+from torch.distributed.tensor import DTensor
+from torch.fx.traceback import annotate_fn
 from torchtitan.config import (
     TORCH_DTYPE_MAP,
     TrainingConfig,
 )
 from torchtitan.distributed.fsdp import apply_fsdp_to_decoder, resolve_fsdp_mesh, resolve_sparse_fsdp_mesh
+from torchtitan.experiments.graph_trainer.common_utils import (
+    annotate_graph_trainer_model,
+    apply_simple_fsdp,
+    matches_module_fqn_pattern,
+)
+from torchtitan.experiments.graph_trainer.compile import apply_compile as apply_graph_trainer_compile
+from torchtitan.experiments.graph_trainer.configs import MOE_BLOCK_FQN, validate_ep_overlap_config
+from torchtitan.experiments.graph_trainer.simple_fsdp import (
+    MixedPrecisionPolicy,
+    ReplicateComputation,
+    _register_parametrization,
+)
 
 from torchtitan_npu.config import ModelCompileConfig
 from torchtitan_npu.models.common.compile_policy import configure_model_compile
@@ -25,6 +39,144 @@ from torchtitan_npu.models.common.fsdp import make_param_dtype_override_fn
 
 from .engram.host import HostEngramTable
 from .model import DeepSeekV41MultimodalModel
+
+
+def validate_deepseek_v4_1_parallelism(config, *, training: TrainingConfig | None, parallelism):
+    from torchtitan_npu.models.common.moe import validate_dispatcher_capacity
+
+    if (
+        parallelism.tensor_parallel_degree != 1
+        or parallelism.context_parallel_degree != 1
+        or parallelism.pipeline_parallel_degree != 1
+    ):
+        raise NotImplementedError("DeepSeek V4.1 currently supports TP=CP=PP=1 only")
+    for layer in config.layers:
+        if layer.engram is not None and layer.engram.table.num_embeddings % parallelism.expert_parallel_degree:
+            raise ValueError("Engram physical table size must be divisible by EP degree")
+    if training is None:
+        raise ValueError("DeepSeek V4.1 parallelization requires a training configuration")
+    validate_dispatcher_capacity(config, training=training, parallelism=parallelism)
+
+
+def _make_fp32_parametrization(param_fqn, dp_mesh, placements, mode, policy, _param_name: str) -> torch.nn.Module:
+    return ReplicateComputation(
+        param_fqn=param_fqn,
+        device_mesh=dp_mesh,
+        param_sharding=placements,
+        mode=mode,
+        mp_policy=policy,
+        non_dp_mesh_types={},
+    )
+
+
+def _preserve_simple_fsdp_fp32_parameters(model, *, parallelism_context, training):
+    """Replace only the selected unshard policies, retaining the existing shards.
+
+    SimpleFSDP currently exposes one policy for the whole model. Its parameter
+    descriptors can be reinstalled without redistributing or reading a weight.
+    The V4.1 FP32 parameters are dense (neither TP nor EP sharded).
+    """
+    policy = MixedPrecisionPolicy(
+        param_dtype=torch.float32, reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce]
+    )
+    for fqn, module in list(model.named_modules()):
+        for name, parameter in module._parameters.items():
+            param_fqn = f"{fqn}.{name}" if fqn else name
+            if not any(fnmatchcase(param_fqn, pattern) for pattern in model.config.fp32_param_patterns):
+                continue
+            assert isinstance(parameter, DTensor)
+            mesh = parameter.device_mesh
+            mesh_names = mesh.mesh_dim_names
+            assert mesh_names is not None
+            dp_names = tuple(axis for axis in mesh_names if axis in {"fsdp", "dp_replicate"})
+            assert dp_names and all(mesh[axis].size() == 1 for axis in mesh_names if axis not in dp_names)
+            dp_mesh = mesh[dp_names]
+            placements = tuple(
+                placement for axis, placement in zip(mesh_names, parameter.placements, strict=True) if axis in dp_names
+            )
+            mode = (
+                "hybrid_shard"
+                if dp_mesh.ndim == 2
+                else ("replicate" if parallelism_context.dp_replicate_enabled else "fully_shard")
+            )
+            _register_parametrization(
+                module,
+                [name],
+                partial(_make_fp32_parametrization, param_fqn, dp_mesh, placements, mode, policy),
+            )
+
+
+def _chunk_v41_moe_forward(forward, fqn: str):
+    region = {"chunked_region_fqn": fqn}
+    split = annotate_fn({**region, "chunked_region_role": "split_boundary"})(torch.split)
+    bodies = tuple(
+        annotate_fn({**region, "chunked_region_role": "body", "chunk_id": chunk_id})(forward) for chunk_id in (0, 1)
+    )
+    cat = annotate_fn({**region, "chunked_region_role": "materialization"})(torch.cat)
+
+    @wraps(forward)
+    def chunked_forward(x, *, image_mask=None, padding_mask_T=None, aux_loss_denominator=None):
+        num_tokens = x.shape[0]
+        torch._check(num_tokens % 2 == 0, lambda: f"EP overlap requires an even token count in {fqn}")
+        sizes = [num_tokens // 2] * 2
+        hidden_chunks = split(x, sizes, dim=0)
+        image_chunks = (None, None) if image_mask is None else split(image_mask, sizes, dim=0)
+        padding_chunks = (None, None) if padding_mask_T is None else split(padding_mask_T, sizes, dim=0)
+        return cat(
+            [
+                body(
+                    hidden.contiguous(),
+                    image_mask=None if image is None else image.contiguous(),
+                    padding_mask_T=None if padding is None else padding.contiguous(),
+                    aux_loss_denominator=aux_loss_denominator,
+                )
+                for body, hidden, image, padding in zip(
+                    bodies, hidden_chunks, image_chunks, padding_chunks, strict=True
+                )
+            ],
+            dim=0,
+        )
+
+    return chunked_forward
+
+
+def parallelize_graph_trainer_deepseek_v4_1(
+    model, *, parallelism_context, training, parallelism, compile_config, activation_remat, dump_folder
+):
+    validate_deepseek_v4_1_parallelism(model.config, training=training, parallelism=parallelism)
+    for module in model.modules():
+        if isinstance(module, HostEngramTable):
+            module.validate_graph_training()
+    if training.num_tokens_per_microbatch_per_dp_rank % parallelism_context.seq_len_divisor:
+        raise ValueError("The token budget must be divisible by the sequence sharding degree")
+    enabled = compile_config.ep_overlap.enabled
+    module_fqn = None
+    if enabled:
+        _, module_fqn = validate_ep_overlap_config(compile_config.ep_overlap)
+        if module_fqn != MOE_BLOCK_FQN:
+            raise ValueError(f"DeepSeek V4.1 EP overlap requires module_fqn={MOE_BLOCK_FQN!r}")
+
+    annotate_graph_trainer_model(model)
+    model._parallelize(parallelism_context)
+    edp_mesh, edp_mesh_dims = resolve_sparse_fsdp_mesh(parallelism_context)
+    if not parallelism_context.ep_enabled:
+        edp_mesh, edp_mesh_dims = resolve_fsdp_mesh(parallelism_context)
+    _shard_engram_tables(model, edp_mesh=edp_mesh, edp_mesh_dims=edp_mesh_dims, training=training)
+    # SimpleFSDP has no ignored-parameter API. Hide only the host storage
+    # during parametrization; restore the original CPU parameters for the
+    # optimizer, checkpointing and runtime lookup.
+    host_weights = [(mod, mod._parameters.pop("weight")) for mod in model.modules() if isinstance(mod, HostEngramTable)]
+    try:
+        model = apply_simple_fsdp(model, parallelism_context=parallelism_context, training=training)
+        _preserve_simple_fsdp_fp32_parameters(model, parallelism_context=parallelism_context, training=training)
+    finally:
+        for module, weight in host_weights:
+            module.register_parameter("weight", weight)
+    # V4.1 adds a per-token image mask to the upstream MoE forward contract.
+    for fqn, module in model.named_modules():
+        if module_fqn is not None and matches_module_fqn_pattern(module_fqn, fqn):
+            module.forward = _chunk_v41_moe_forward(module.forward, fqn)
+    return apply_graph_trainer_compile(model, compile_config=compile_config, parallelism_context=parallelism_context)
 
 
 def _shard_engram_tables(

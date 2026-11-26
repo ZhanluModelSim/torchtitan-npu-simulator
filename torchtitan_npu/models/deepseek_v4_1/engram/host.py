@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import logging
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import cast
 
@@ -71,6 +72,7 @@ class HostEngramTable(EngramTable):
         self._grad_keepalive = torch.zeros((), requires_grad=True)
         self._replica_group: dist.ProcessGroup | None = None
         self._replica_size = 1
+        self.graph_training = False
         # Opaque custom-op handles may not be created inside a compiled
         # region, so materialize one per table up front and reuse it. On torch
         # builds without the opaque-object API the legacy lookup runs instead.
@@ -87,7 +89,7 @@ class HostEngramTable(EngramTable):
         # warns that returning a view can lose its pre-backward hook if a
         # caller later performs an in-place op, so end the view chain at this
         # module boundary.
-        with torch.set_grad_enabled(torch.is_grad_enabled() and self.weight.requires_grad):
+        with torch.set_grad_enabled(torch.is_grad_enabled() and (self.weight.requires_grad or self.graph_training)):
             return super().forward(input_ids_T, positions_T, **kwargs).clone()
 
     def _mark_host_weight(self) -> None:
@@ -401,21 +403,53 @@ class HostEngramTable(EngramTable):
             self._pending_sparse_grad.shape,
         ).coalesce()
 
-    def _distributed_lookup(self, row_ids_N: torch.Tensor) -> torch.Tensor:
+    def validate_graph_training(self) -> None:
+        if not _HAS_OPAQUE_OBJECT_API:
+            raise RuntimeError("GraphTrainer Host Engram requires the torch opaque-object custom-op API.")
+
+    def enable_graph_training(self) -> None:
+        """Use an explicit gate anchor after the sparse optimizer owns the table.
+
+        The CPU weight is updated by SparseAdam using pending sparse gradients;
+        it must not be a dense gradient target of the joint graph.
+        """
+        if self.graph_training:
+            return
+        self.validate_graph_training()
+        self.graph_training = self.weight.requires_grad
+        self.weight.requires_grad_(False)
+
+    @contextmanager
+    def graph_trainer_calibration_context(self):
+        """Discard candidate-run sparse gradients without altering training state."""
+        pending = self._pending_sparse_grad
+        try:
+            yield
+        finally:
+            self._pending_sparse_grad = pending
+
+    def _distributed_lookup(
+        self, row_ids: torch.Tensor, *, gradient_anchor: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        if self.graph_training:
+            if gradient_anchor is None:
+                raise ValueError("GraphTrainer Host Engram requires a differentiable gate anchor.")
+            if torch.is_grad_enabled() and not gradient_anchor.requires_grad:
+                raise ValueError("GraphTrainer Host Engram requires a trainable gate scale or hidden-state input.")
         if not _HAS_OPAQUE_OBJECT_API:
             # Torch builds without the opaque-object API keep the legacy
             # autograd lookup: eager training only.
             if torch.compiler.is_compiling():
                 raise RuntimeError("Torch Host Engram lookup currently supports eager training only.")
-            return HostEngramLookup.apply(self.weight, row_ids_N, self, self._grad_keepalive)
+            return HostEngramLookup.apply(self.weight, row_ids, self, self._grad_keepalive)
         # The host lookup runs behind a custom-op boundary so torch.compile
         # fullgraph treats it as an opaque node instead of tracing the
         # data-dependent all_to_all / CPU row access. The same op serves the
         # eager path, so numerics are identical in both modes.
         return _host_engram_lookup(
             self.weight,
-            row_ids_N,
-            self._grad_keepalive,
+            row_ids,
+            gradient_anchor if self.graph_training else self._grad_keepalive,
             self._ep_size > 1,
             self._host_lookup_handle,
         )[0]

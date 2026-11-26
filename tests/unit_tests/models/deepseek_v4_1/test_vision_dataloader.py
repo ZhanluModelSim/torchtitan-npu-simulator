@@ -29,7 +29,7 @@ ASSETS = Path(__file__).resolve().parents[3] / "assets"
 def _unpack(microbatch):
     inputs = microbatch.as_input_dict()
     labels = inputs.pop("labels")
-    inputs["num_valid_tokens"] = microbatch.num_valid_tokens
+    inputs["num_valid_tokens"] = int(microbatch.loss_token_counts.item())
     return inputs, labels
 
 
@@ -59,6 +59,20 @@ def _captions(loader):
         return [tuple(labels[labels != -100].tolist()) for _, labels in map(_unpack, loader)]
     finally:
         loader.close()
+
+
+@pytest.mark.parametrize("packing", [0, 4], ids=["single-image", "packed"])
+def test_routing_counts_preserve_the_routing_depth_axis(tokenizer, packing):
+    loader = _loader(tokenizer, packing=packing)
+    try:
+        batch = next(iter(loader))
+    finally:
+        loader.close()
+    assert batch.routing_token_counts.shape == (1,)
+    assert batch.routing_token_counts.dtype == torch.int64
+    torch.testing.assert_close(batch.routing_token_counts[0], (~batch.padding_mask).sum())
+    assert batch.loss_token_counts.ndim == 0
+    torch.testing.assert_close(batch.loss_token_counts, (batch.labels != -100).sum())
 
 
 def test_packed_images_supervision_and_positions(tokenizer):
@@ -202,7 +216,7 @@ def test_packed_vision_batch_reaches_folded_attention_metadata(tokenizer, single
         loader.close()
     valid = batch.pop("num_valid_tokens")
     dimensions = single_rank_spmd
-    tokens, targets, kwargs = model.preprocess_inputs(
+    tokens, targets, kwargs, _ = model.preprocess_inputs(
         {**batch, "labels": labels}, parallelism_context=dimensions, parallelism=recipe.parallelism
     )
     assert tokens.ndim == targets.ndim == 1

@@ -186,7 +186,10 @@ def _virtual_optimizer_dcp_shard_worker(rank, rendezvous, checkpoint_dir):
         assert snapshot.global_shape == (4, 3)
         assert snapshot.global_offsets == ((rank * 2, 0),)
         torch.testing.assert_close(snapshot, local + 1, rtol=0, atol=0)
-        dcp.save({"optimizer": optimizer}, checkpoint_id=checkpoint_dir)
+        # These are CPU shards. Do not select the accelerator copy-ahead
+        # loader when the host running this CPU test also has NPUs.
+        writer = dcp.FileSystemWriter(checkpoint_dir, per_thread_copy_ahead=0)
+        dcp.save({"optimizer": optimizer}, storage_writer=writer)
         state["exp_avg"].to_local().zero_()
         state["exp_avg_sq"].to_local().zero_()
         dcp.load({"optimizer": optimizer}, checkpoint_id=checkpoint_dir)

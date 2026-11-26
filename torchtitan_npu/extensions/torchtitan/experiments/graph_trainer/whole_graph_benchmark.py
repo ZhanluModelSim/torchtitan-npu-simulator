@@ -11,7 +11,7 @@ import json
 import logging
 from bisect import bisect_left, bisect_right
 from collections import defaultdict
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, replace
 from itertools import pairwise
 from typing import TYPE_CHECKING, Any, cast
@@ -88,7 +88,12 @@ def _preserve_model_state(model) -> Iterator[None]:
         _BufferState(name, buffer, buffer._version, buffer.detach().clone()) for name, buffer in model.named_buffers()
     )
     try:
-        yield
+        with ExitStack() as stack:
+            for module in model.modules():
+                context = getattr(module, "graph_trainer_calibration_context", None)
+                if context is not None:
+                    stack.enter_context(context())
+            yield
     finally:
         mutated_parameters = [
             name for name, parameter, version, _, _ in parameter_states if parameter._version != version

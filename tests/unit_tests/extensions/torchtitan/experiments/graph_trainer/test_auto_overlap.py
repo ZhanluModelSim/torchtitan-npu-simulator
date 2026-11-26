@@ -8,7 +8,6 @@ import pytest
 import torch
 from torchtitan.experiments.graph_trainer.registry import PASS_PIPELINE_REGISTRY
 
-import torchtitan_npu.extensions.torchtitan.experiments.graph_trainer as graph_trainer_extension
 from torchtitan_npu.extensions.torchtitan.experiments.graph_trainer import auto_overlap as graph_trainer_auto_overlap
 from torchtitan_npu.extensions.torchtitan.experiments.graph_trainer.utils import node_id
 
@@ -39,30 +38,36 @@ def test_auto_overlap_pipeline_is_registered():
 
 
 @pytest.mark.parametrize(
-    ("pipeline", "expected_calls"),
+    ("pipeline", "installs_runner"),
     [
-        ("default", 0),
-        ("npu_auto_overlap", 1),
-        ("mutation-functionalization+npu_auto_overlap", 1),
+        ("default", False),
+        ("npu_auto_overlap", True),
+        ("mutation-functionalization+npu_auto_overlap", True),
     ],
 )
+@pytest.mark.parametrize("model_owned", [False, True], ids=["generic", "dsv41"])
 def test_runtime_context_patch_is_enabled_only_for_runtime_auto_overlap(
     monkeypatch,
     pipeline,
-    expected_calls,
+    installs_runner,
+    model_owned,
 ):
-    from torchtitan_npu.patches.torchtitan.experiments.graph_trainer import (
-        graph_trainer_runtime_context,
-    )
+    from torchtitan.experiments.graph_trainer import graph_builder
 
-    apply = Mock()
-    monkeypatch.setattr(graph_trainer_runtime_context, "apply", apply)
-    config = _config()
-    config.compile.pass_pipeline = pipeline
+    original = graph_builder._build_fwd_bwd_graphs
+    monkeypatch.setattr(graph_builder, "_build_fwd_bwd_graphs", original)
+    from torchtitan_npu.extensions.torchtitan.experiments.graph_trainer import GraphTrainerEx
+    from torchtitan_npu.extensions.torchtitan.trainer import TrainerEx
+    from torchtitan_npu.models.deepseek_v4_1.trainer import DeepSeekV41GraphTrainer
 
-    graph_trainer_extension._apply_auto_overlap_runtime_context_patch(config)
+    monkeypatch.setattr(TrainerEx, "__init__", lambda self, config: None)
+    trainer_cls = DeepSeekV41GraphTrainer if model_owned else GraphTrainerEx
+    trainer_cls(SimpleNamespace(compile=SimpleNamespace(pass_pipeline=pipeline)))
 
-    assert apply.call_count == expected_calls
+    builder = graph_builder._build_fwd_bwd_graphs
+    assert (builder is not original) == installs_runner
+    if installs_runner:
+        assert builder.__wrapped__ is original
 
 
 def test_npu_auto_overlap_runs_after_eager_chunk_metadata():

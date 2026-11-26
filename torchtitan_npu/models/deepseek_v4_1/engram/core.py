@@ -282,7 +282,9 @@ class EngramTable(Module):
             table_idx = end
         return torch.cat(hashes, dim=-1)
 
-    def _distributed_lookup(self, row_ids_N: torch.Tensor) -> torch.Tensor:
+    def _distributed_lookup(
+        self, row_ids: torch.Tensor, *, gradient_anchor: torch.Tensor | None = None
+    ) -> torch.Tensor:
         raise NotImplementedError("Engram table subclasses must implement lookup and gradient accumulation.")
 
     def forward(
@@ -292,6 +294,7 @@ class EngramTable(Module):
         *,
         image_mask: torch.Tensor | None = None,
         token_history: torch.Tensor | None = None,
+        gradient_anchor: torch.Tensor | None = None,
     ) -> torch.Tensor:
         row_ids_TH = self.hash(
             input_ids_T,
@@ -300,7 +303,10 @@ class EngramTable(Module):
             token_history=token_history,
         )
         T, H = row_ids_TH.shape
-        rows = self._distributed_lookup(row_ids_TH.reshape(-1))
+        if gradient_anchor is None:
+            rows = self._distributed_lookup(row_ids_TH.reshape(-1))
+        else:
+            rows = self._distributed_lookup(row_ids_TH.reshape(-1), gradient_anchor=gradient_anchor)
         return rows.view(T, H * self.embedding_dim)
 
 
@@ -384,11 +390,22 @@ class Engram(Module):
         # preventing the fetched memory from promoting the model's mixed-
         # precision activation stream (and all following fused operators) to
         # FP32.  Autograd casts the gradient back to the table output dtype.
+        lookup_kwargs = {}
+        if getattr(self.table, "graph_training", False):
+            # The explicit joint backward differentiates model parameters, not
+            # the eager keepalive tensor. Reuse the activation to avoid another
+            # SimpleFSDP unshard of the gate scale; frozen inputs need that scale
+            # as a fallback to keep the sparse backward live.
+            anchor = hidden_states_TMD
+            if not anchor.requires_grad:
+                anchor = _local_tensor(self.gate.q_weight)
+            lookup_kwargs["gradient_anchor"] = anchor.reshape(-1)[0].float()
         memory_TE = self.table(
             input_ids_T,
             positions_T,
             image_mask=image_mask,
             token_history=token_history,
+            **lookup_kwargs,
         ).to(dtype=hidden_states_TMD.dtype)
         residual = self.gate(hidden_states_TMD, memory_TE)
         if image_mask is not None:

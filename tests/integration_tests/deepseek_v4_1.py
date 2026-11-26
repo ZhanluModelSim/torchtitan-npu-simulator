@@ -117,7 +117,29 @@ def build_deepseek_v4_1_test_list() -> list[OverrideDefinitions]:
         override_args=[tuple("activation-checkpoint:none" if arg == "activation-checkpoint:full" else arg
                              for arg in engram_2p_args)],
     )
-    return [text, multimodal, no_engram, engram_1p, engram_2p_noac, engram_2p]
+    return [
+        text,
+        multimodal,
+        no_engram,
+        engram_1p,
+        engram_2p_noac,
+        engram_2p,
+    ]
+
+
+def build_deepseek_v4_1_graph_engram_test_list() -> list[OverrideDefinitions]:
+    # Base and Auto Overlap exercise distinct graph builders/runners.
+    return [OverrideDefinitions(
+        test_name=f"dsv41_host_engram_{mode}_fsdp8_ep8",
+        test_descr=f"V4.1 {mode} joint graph with Host SparseAdam and EP row ownership",
+        env_vars={
+            "MODULE": "tests.integration_tests.engram_graph", "CONFIG": mode,
+            "TRAIN_FILE": "tests.integration_tests.engram_graph",
+            "HCCL_DETERMINISTIC": "true", "CLOSE_MATMUL_K_SHIFT": "1", "PYTHONHASHSEED": "42",
+        },
+        override_args=[()], expected_steps=((1, 2, 3),), ngpu=8,
+        use_golden=False, check_loss=False, python_config=True, timeout=1800,
+    ) for mode in ("basic", "auto")]
 
 
 def build_deepseek_v4_1_checkpoint_test_list(

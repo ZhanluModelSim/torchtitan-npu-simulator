@@ -13,7 +13,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 from torch.utils.checkpoint import DefaultDeviceType, checkpoint
-from torchtitan.components.optim import AdamW
 from torchtitan.config import Configurable, OverrideConfig, TrainingConfig, apply_overrides
 
 from torchtitan_npu.extensions.torchtitan.components.optimizer.optimizer import (
@@ -25,6 +24,37 @@ from torchtitan_npu.models.deepseek_v4_1.parallelize import _shard_engram_tables
 from torchtitan_npu.override.deepseek_v4_1.engram import ascendc, mxfp8
 
 pytestmark = pytest.mark.cpu
+
+
+def test_graph_parallelize_rejects_elastic_buffer_before_initializing_communication():
+    from torchtitan_npu.models.deepseek_v4_1.parallelize import parallelize_graph_trainer_deepseek_v4_1
+    from torchtitan_npu_recipes.graph_trainer.deepseek_v4_1 import (
+        graph_trainer_deepseek_v4_1_flash_40layers_16experts_text,
+    )
+
+    recipe = graph_trainer_deepseek_v4_1_flash_40layers_16experts_text(hf_assets_path="tests/assets/deepseek_v3")
+    table_config = recipe.model.layers[1].engram.table
+    from torchtitan.config import derive
+
+    recipe.model.layers[1].engram.table = derive(
+        table_config, ascendc.HostOffloadEngramTable.Config, num_max_tokens_per_rank=16, pin_memory=True
+    )
+    with torch.device("meta"):
+        model = recipe.model.build()
+    table = model.layers["1"].engram.table
+    with pytest.raises(NotImplementedError, match="ElasticBuffer is not supported"):
+        parallelize_graph_trainer_deepseek_v4_1(
+            model,
+            parallelism_context=None,
+            training=recipe.training,
+            parallelism=recipe.parallelism,
+            compile_config=recipe.compile,
+            activation_remat=recipe.activation_remat,
+            dump_folder="unused",
+        )
+    assert table._elastic_buffer is None and table.lookup_mesh is None
+    with pytest.raises(NotImplementedError, match="ElasticBuffer is not supported"):
+        table.enable_graph_training()
 
 
 class _Root(Configurable):

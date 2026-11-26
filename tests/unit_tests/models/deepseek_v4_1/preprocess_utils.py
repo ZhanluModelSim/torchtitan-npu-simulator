@@ -31,7 +31,7 @@ _NO_SPMD = SimpleNamespace(
 )
 
 
-def tiny_v41_model(monkeypatch, *, configure=None):
+def tiny_v41_model(monkeypatch, *, configure=None, flavor="deepseek_v4_1_debugmodel_text"):
     """The registered debug flavor at CPU-sized widths, entered through the registry.
 
     ``configure`` runs on the config tree before the build, which is where a test swaps
@@ -63,7 +63,7 @@ def tiny_v41_model(monkeypatch, *, configure=None):
     from torchtitan.models.common import decoder as decoder_module
 
     monkeypatch.setattr(decoder_module, "annotate_input_spmd_types", lambda _ctx, batch, _layouts: batch)
-    config = registry.model_registry("deepseek_v4_1_debugmodel_text")
+    config = registry.model_registry(flavor)
     config.vocab_size = config.tok_embeddings.num_embeddings = config.lm_head.out_features = 64
     if configure is not None:
         configure(config)
