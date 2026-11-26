@@ -1,6 +1,6 @@
 # torch.compile 与 AscendC AutoFuse 特性
 
-> **启动接口说明：** 本文保留旧字段 CLI 的配置示例，不能直接追加到 TorchTitan 0.4.0 启动命令。当前训练参数在 Python recipe 中设置，见 [Python 配置指南](../developer_guides/python_recipes.md)。下文历史命令及支持记录不代表当前依赖下的对应组合已经完成验证。
+TorchTitan 0.4.0 通过 Python recipe 选择局部编译区域。训练参数的配置方式见 [Python 配置指南](../developer_guides/python_recipes.md)。
 
 本文说明 `torchtitan-npu` 如何复用 PyTorch `torch.compile` 与 TorchInductor，并通过
 `torch_npu` 内置的 AscendC Codegen 接入 CANN AutoFuse。文档面向训练配置维护者、模型适配开发者和
@@ -8,6 +8,23 @@
 
 本文说明 `torchtitan-npu` 通过 TorchTitan 训练入口使用这些能力的方式。GraphTrainer 的整步图捕获和图级
 通信优化属于独立编译体系，参见[DeepSeek-V4 GraphTrainer 编译路径适配](./deepseek_v4_graph_trainer.md)。
+
+## 原生 DeepSeek-V4 局部编译
+
+TorchTitan 0.4.0 的原生 V4 配方通过 `model.local_compile_regions` 选择 `@local_compile` 边界，训练循环保持 eager。
+以下配方使用 8 张 A5 卡运行 43 层、16 路由专家的 DeepSeek-V4 Flash，采用 BF16、Full AC 和仓库的测试数据，
+共训练 5 步。配方选择 `loss`、`fp32_to_bf16_split` 和 `rope` 区域。
+
+```bash
+NGPU=8 MODULE=torchtitan_npu_recipes.tests.models.deepseek_v4 \
+  CONFIG=deepseek_v4_flash_43layers_16experts_local_compile_bf16_a5 \
+  TORCH_DEVICE_BACKEND_AUTOLOAD=0 TORCHINDUCTOR_NPU_BACKEND=ascendc \
+  bash scripts/run_train.sh --output-dir ./outputs/a5-bf16-fullac
+```
+
+- 空列表使用 eager；`["loss"]` 仅编译 loss。实际捕获取决于模型调用的组件。
+- 配方通过现有 override 选择 NPU 算子。GraphTrainer 的整步编译使用其独立配置。
+- A3 可复用 `deepseek_v4_flash_43layers_16experts_eager_bf16`，选择相同的局部编译区域。
 
 ## 1. 特性背景
 
@@ -17,7 +34,7 @@ Host 下发和中间 Tensor 读写。`torch.compile` 使用 TorchDynamo 捕获�
 
 `torchtitan-npu` 不重新实现 PyTorch 编译器，而是在 NPU 接入层完成以下工作：
 
-- 复用 TorchTitan 配置选择需要编译的训练组件；
+- 通过 `model.local_compile_regions` 选择上游注册的编译区域；
 - 选择 `torch_npu` 内置的 AscendC Inductor 后端；
 - 在包导入阶段安装当前软件栈需要的 NPU 兼容 patch。
 
@@ -25,7 +42,7 @@ Host 下发和中间 Tensor 读写。`torch.compile` 使用 TorchDynamo 捕获�
 
 | 机制 | 阶段 | 作用 |
 | --- | --- | --- |
-| TorchTitan compile 配置 | 训练组件构建与并行化 | 选择模型或 loss 是否进入 `torch.compile` |
+| TorchTitan 局部编译 | 模型并行化与训练 | 绑定已选择的 `@local_compile` 函数，并在调用时捕获计算 |
 | AscendC AutoFuse | Inductor lowering 与 Codegen | 自动融合受支持的 Inductor 子图并生成 AscendC Kernel |
 | override 与 custom op | 模型构建或明确算子边界 | 替换完整组件，或封装已有 CANN/Triton/PyPTO 算子 |
 
@@ -34,91 +51,28 @@ Host 下发和中间 Tensor 读写。`torch.compile` 使用 TorchDynamo 捕获�
 
 ## 2. 用户使用场景与对外接口
 
-### 2.1 启用 AscendC AutoFuse
-
-使用 TorchTitan 原生 CLI 配置编译：
-
-```bash
-TORCHINDUCTOR_NPU_BACKEND=ascendc \
-bash scripts/run_train.sh \
-  --compile.enable \
-  --compile.components model \
-  --compile.backend inductor \
-  <训练参数>
-```
-
-编译选项和训练步数在 Python recipe 中设置；当前编译训练仍受 0.4.0 trainer 限制。多机启动方式如下，`NODE_IPS` 的顺序保持一致：
-
-```bash
-source /usr/local/Ascend/cann/set_env.sh
-export TORCHINDUCTOR_NPU_BACKEND=ascendc
-
-NODE_IPS=192.168.1.10,192.168.1.11 \
-NGPU=16 \
-MODULE=torchtitan_npu_recipes.models.deepseek_v4 \
-CONFIG=deepseek_v4_flash_cpt_4k_a3 bash scripts/run_train_multinodes.sh
-```
-
-多机入口为 `scripts/run_train_multinodes.sh`；同一节点上的 `torchrun` 子进程会继承启动 shell
-的环境变量。如果脚本无法自动识别本机地址，设置对应的 `LOCAL_HOST`。
-
-### 2.2 使用 `aot_eager` 检查编译兼容性
-
-```bash
-bash scripts/run_train.sh \
-  --compile.enable \
-  --compile.components model \
-  --compile.backend aot_eager \
-  <训练参数>
-```
-
-`aot_eager` 可检查 Dynamo、AOTAutograd、FakeTensor 和训练反向是否可用，但不会把完整模型交给 AscendC
-AutoFuse。DeepSeek-V4 Flash A3/A5 示例默认使用 `inductor`；可在命令末尾追加
-`--compile.backend aot_eager` 检查编译兼容性。
-
-含 FlexAttention 的模型在 `aot_eager` 下可能由上游 regional Inductor 单独编译 FlexAttention 区域。
-这仍不等同于完整 TransformerBlock 使用 `inductor` 编译。
-
-### 2.3 配置和环境变量
-
-本仓直接复用上游 `torchtitan.config.CompileConfig`：
-
-| 字段 | 当前默认值 | 作用 |
-| --- | --- | --- |
-| `enable` | `False` | 是否启用编译 |
-| `components` | `["model", "loss"]` | 选择标准训练路径中的编译组件 |
-| `backend` | `"inductor"` | 传给 `torch.compile` 的 Dynamo backend |
-| `enable_async_tensor_parallel` | `False` | 是否启用 Inductor Async TP |
-
-当前固定的上游基线实际消费 `model` 和 `loss`。配置中写入其他名称，不代表对应组件已经编译。
-通用启动脚本直接透传 CLI，不自动启用编译。Flash 示例通过 CLI 默认启用 `model` 编译；
-需要同时编译 loss 时，追加 `--compile.components model loss`；关闭编译使用 `--compile.no-enable`。
-仅设置 `--compile.backend` 不会自动启用编译，通用入口还需传入 `--compile.enable`。
-
-仓库相关环境变量如下：
+通过 `MODULE` 和 `CONFIG` 选择 Python recipe，参见[原生 DeepSeek-V4 局部编译](#原生-deepseek-v4-局部编译)。
+查看 launcher 选中的配置时可追加 `--print-config`。
 
 | 环境变量 | 作用 |
 | --- | --- |
-| `TORCHINDUCTOR_NPU_BACKEND` | 选择 Inductor 内部的 NPU Codegen |
-| `ASCEND_SET_ENV_PATH` | 指定 CANN `set_env.sh`，未设置时按标准安装路径查找 |
+| `TORCHINDUCTOR_NPU_BACKEND` | 选择 Inductor 的 NPU Codegen，示例使用 `ascendc` |
+| `ASCEND_SET_ENV_PATH` | 指定 CANN 的 `set_env.sh`，未设置时按标准安装路径查找 |
 
 ## 3. 特殊背景及限制
 
-### 3.1 存在两级 backend，且必须在导入前确定
+### 3.1 PyTorch 编译后端与 NPU Codegen
 
-`compile.backend=inductor` 选择 PyTorch Dynamo backend；`TORCHINDUCTOR_NPU_BACKEND=ascendc` 选择
-Inductor 内部的 NPU Codegen。两者不能互相替代：
+局部编译的 PyTorch backend 由 `@local_compile` 的编译参数或 PyTorch 默认值决定。本页示例使用默认的
+Inductor。`TORCHINDUCTOR_NPU_BACKEND=ascendc` 在 Inductor 内选择 NPU Codegen。
 
 ```text
 torch.compile backend: inductor
               └── NPU Codegen backend: ascendc
 ```
 
-`torch_npu._inductor` 在导入阶段完成后端注册。环境变量必须在 `import torch` 之前设置；同一进程中先导入框架、
-再修改环境变量，不能可靠切换已经初始化的 Codegen。
-
-`scripts/run_train.sh` 在启动 Python 前默认设置 AscendC。当前 `scripts/run_train_multinodes.sh` 不补充该默认值，
-多机任务必须在所有节点启动前显式导出同一变量，并确保所有 rank 使用相同 backend。
+`scripts/run_train.sh` 和 `scripts/run_train_multinodes.sh` 都在启动 Python 前默认设置 AscendC。需要指定
+其他 Codegen 时，在启动前设置环境变量，并确保所有 rank 使用相同设置。
 
 ### 3.2 当前主线使用 `torch_npu` 内置后端
 
@@ -129,24 +83,18 @@ torch.compile backend: inductor
 `torchtitan` 必须按照[软件安装](../user-guides/installation.md)与 [`requirements.txt`](../../requirements.txt)
 配套使用，不能只升级其中一个组件后继续复用旧缓存。
 
-### 3.3 标准模型按 Block 编译，并要求完整成图
+### 3.3 局部编译区域要求完整成图
 
-上游 `torchtitan.distributed.compile.apply_compile` 对每个 TransformerBlock 使用
-`compile(..., fullgraph=True)`，而不是默认编译整个 Trainer。Block 内无法被 Dynamo 捕获的 Python 行为会直接
-触发编译错误，不会静默拆成多个 Dynamo 图。
+上游 `torchtitan.distributed.local_compile` 对选定的 `@local_compile` 函数使用
+`torch.compile(..., fullgraph=True)`。函数首次调用时发生图捕获，区域内的 Dynamo graph break 会导致编译错误。
 
 Inductor 对已经捕获图内不支持的节点仍可使用 fallback/extern kernel。Dynamo graph break 和 Inductor
 fallback 发生在不同阶段，排障时需要区分。
 
-标准编译路径还会启用 `skip_fwd_side_effects_in_bwd_under_checkpoint`。Activation Checkpointing 在反向重算
-forward 时，不会重新执行依赖 Python mutation 的副作用。因此，影响正确性的 cache 或状态更新不能只依赖
-重算阶段的 Python 副作用；新增状态时应同时审计 eager、AC 重算和 compiled forward。
-
 ### 3.4 动态 shape、fallback 和 custom op 均有边界
 
-上游会打开 `capture_scalar_outputs`，用于 token-choice MoE 等数据相关形状；但动态 shape 仍受 Dynamo guard、
-数据相关控制流、layout、stride、view、indirect indexing、SoC 和 dtype 支持范围限制。单一静态 shape 编译通过，
-不能证明变长序列、packed layout 或不同路由 token 数都能复用同一个融合 Kernel。
+动态 shape 受 Dynamo guard、数据相关控制流、layout、stride、view、indirect indexing、SoC 和 dtype
+支持范围限制。变长序列、packed layout 或不同路由 token 数能否复用同一个融合 kernel，需要分别验证。
 
 训练 custom op 至少需要准确的 dispatcher schema、Fake/Meta 和 Autograd，并保持真实 mutation、alias、shape、
 dtype、device 与 layout 语义。`torch.fx.wrap` 只阻止 Python wrapper 被展开，不会自动提供这些契约。
@@ -159,23 +107,21 @@ AscendC backend 可以保留不满足 lowering 条件的 fallback 节点。因�
 `torch.compile` 使用惰性编译。第一次执行可能包含 Dynamo 捕获、AOTAutograd、Inductor 调度、AutoFuse
 Codegen、C++ wrapper 和 AscendC Kernel 编译，不能用于稳态性能结论。
 
-AscendC 融合 Kernel 默认缓存到 `/tmp/.npu_kernels_<user>`，也可通过
-`TORCHINDUCTOR_NPU_EXT_CACHE_DIR` 指定。缓存目录依赖文件锁，不能放到无法保证锁语义的跨 OS 共享目录。
-切换软件版本、SoC、backend、模型图、shape 关键配置或 custom op 后，应使用隔离缓存或定向失效相关
-产物；不建议每次训练前无条件清空整个 `/tmp`。
+AscendC 融合 kernel 缓存在 Inductor 缓存目录的 `ascendc/` 子目录。`TORCHINDUCTOR_CACHE_DIR` 可指定缓存根目录。
+缓存目录依赖文件锁，应使用支持文件锁的文件系统。切换软件版本、SoC、backend、模型图、关键 shape 或 custom op
+后，应使用隔离缓存或定向失效相关产物。
 
 下列调试选项会改变编译或执行行为，不能直接用于正式性能结论：
 
 | 选项 | 影响 |
 | --- | --- |
 | `TORCHINDUCTOR_FORCE_DISABLE_CACHES=1` | 强制重新编译，增加启动时间 |
-| `TORCHINDUCTOR_NPU_EXT_LAYOUT_CHECK=1` | 增加运行时 layout 检查 |
+| `TORCHINDUCTOR_ASCENDC_DEBUG=+layoutcheck` | 增加运行时 layout 检查 |
 | `ASCEND_LAUNCH_BLOCKING=1` | 改为同步下发，破坏异步执行 |
-| `TORCHINDUCTOR_NPU_EXT_DEBUG` | 可能改变 fallback 和融合结构 |
-| `TORCHINDUCTOR_NPU_EXT_AUTOTUNE_TOPN` | 增加 PGO 搜索和首次编译成本 |
+| `TORCHINDUCTOR_ASCENDC_DEBUG` | 根据所选选项改变 fallback、lowering 或融合结构 |
+| `TORCHINDUCTOR_ASCENDC_AUTOTUNE_TOPN` | 控制自动调优的候选 tiling 数量 |
 
-PGO 首次执行会自行采集 Kernel 性能，不能与外部 profiling 嵌套。需要评估性能时，应先完成编译并保留缓存，
-再在后续运行中开启 profiler。调试变量的具体取值随配套 `torch_npu` 演进，应以对应版本手册为准。
+启用自动调优时，先完成编译和调优，再采集用于稳态分析的 profile。调试变量的具体取值以配套 `torch_npu` 为准。
 
 ## 4. 整体架构
 
@@ -191,8 +137,8 @@ flowchart TB
     end
 
     subgraph TORCHTITAN[TorchTitan 训练层]
-        CONFIG[CompileConfig]
-        MODEL[TransformerBlock / loss]
+        CONFIG[model.local_compile_regions]
+        REGION["@local_compile 函数"]
     end
 
     subgraph PYTORCH[PyTorch 编译层]
@@ -212,7 +158,7 @@ flowchart TB
     USER --> LAUNCH --> ENTRY
     ENTRY --> PATCH
     ENTRY --> EXT
-    ENTRY --> CONFIG --> MODEL --> DYNAMO
+    ENTRY --> CONFIG --> REGION --> DYNAMO
     DYNAMO --> AOT --> INDUCTOR --> BACKEND
     BACKEND -->|满足 lowering 条件| AUTOFUSE --> CACHE --> KERNEL
     BACKEND -->|不满足条件| FALLBACK
@@ -235,26 +181,23 @@ flowchart TB
 patches → config → extensions → ops
 ```
 
-`compile` 已迁入 `extensions/compile/`，不再是顶层自动导入阶段。该顺序是运行时契约。NPU patch 必须在模型构建和首次编译前生效。新增初始化逻辑不能随意调整此顺序。
-`extensions/compile/dynamo_config.py` 随该阶段无条件设置 Dynamo 的 `use_recursive_dict_tags_for_guards`：guard 管理器在构建 guard 树时标记 tag safe root，之后每次调用命中 tag 即跳过该子树下的完整 guard 检查，从而缩短 guard 求值耗时。该设置只改变 guard 的检查路径，不改变捕获内容与特化行为，也没有关闭开关；`specialize_float` 保持 torch 默认值，避免编译区域内逐步变化的 Python float 每步触发重编译。
+NPU patch 在模型构建和首次编译前生效。初始化 extensions 时，`extensions/compile/dynamo_config.py` 设置
+Dynamo 的 `use_recursive_dict_tags_for_guards`，加快已匹配子树的 guard 检查。`specialize_float` 保持 PyTorch 默认值。
 
-### 5.2 模型和 loss 编译
+### 5.2 绑定和调用编译区域
 
-标准 DeepSeek/Qwen 模型路径通常遵循：
+原生 DeepSeek-V4 的执行顺序如下。
 
 ```text
 模型构建与 override
-    → TP/EP 等模型内并行变换
-    → Activation Checkpointing
-    → 逐 TransformerBlock torch.compile
-    → FSDP/数据并行包装
+    → BaseModel.parallelize 绑定局部编译区域
+    → 模型内并行变换、Activation Checkpointing、FSDP
+    → 训练中首次调用选定的函数时捕获图
 ```
 
-具体顺序由模型 `parallelize_fn` 决定，新增模型时需要审计实际调用点。GraphTrainer 会采用不同的图捕获和
-SimpleFSDP 顺序，不适用上述标准路径。
-
-loss 由上游 `BaseLoss._maybe_compile` 独立检查 `components`，并使用同一个 `compile.backend`。模型编译与 loss
-编译互不隐含。
+`apply_local_compile()` 按进程绑定实现。训练中的 loss 函数和模型辅助函数使用同一注册机制，由各自的区域名
+独立启用。普通 `TrainerEx` 要求 `config.compile` 为 `None`，区域选择通过
+`config.model.local_compile_regions` 完成。GraphTrainer 使用独立的整步编译配置。
 
 ### 5.3 AscendC AutoFuse 与 fallback
 
@@ -279,37 +222,34 @@ loss 由上游 `BaseLoss._maybe_compile` 独立检查 `components`，并使用�
 
 | 组件 | 交互约束 |
 | --- | --- |
-| override | compile 捕获 override 后的真实 `forward`；replacement 必须满足 Fake/Meta、Autograd 和布局语义 |
-| 量化训练 | `TrainerEx` 在模型构建前执行编译感知的量化配置转换；量化不会自动启用 compile |
-| TP/EP/FSDP | 并行化顺序决定编译边界；标准 CompileConfig 不等于 GraphTrainer 的图内通信调度 |
-| Async TP | 要求 compile 已启用、`components` 包含 `model` 且存在 TP mesh |
+| override | 首次图捕获使用训练中实际调用的实现。区域内的替换算子需要满足 Fake/Meta、Autograd 和布局语义 |
+| 量化训练 | `TrainerEx` 在模型构建前应用量化配置转换。局部编译区域单独选择 |
+| 并行与重算 | 原生 DeepSeek-V4 要求 TP、CP、PP 均为 1。示例使用 EP8、FSDP8 和 Full AC |
 | 多机训练 | 所有节点必须使用相同软件版本和 Codegen backend |
 
 ## 6. 验证、支持边界与关键文件索引
 
-### 6.1 验证 AutoFuse 是否生效
+### 6.1 验证局部编译和 AutoFuse
 
-不能仅以「训练成功」判断融合生效。建议按以下顺序验证：
+1. 追加 `--print-config`，确认 `model.local_compile_regions` 与计划启用的区域一致。
+2. 使用真实训练输入调用目标区域。排查图捕获时，在启动前设置
+   `TORCH_LOGS=aot_graphs,graph_breaks,recompiles` 检查图、graph break 和重编译。
+3. 使用 `TORCH_COMPILE_DEBUG=1` 检查 Inductor 编译产物及 lowering 和 fallback 日志。通过 profiling 确认
+   实际执行的 `autofused_*` device kernel。
+4. 使用相同 checkpoint、输入、并行配置和随机性比较 eager 与编译运行的 loss 和梯度范数。
+5. 关闭额外调试开关，在预热完成后测量稳态性能。
 
-1. 确认日志出现 `Compiling each TransformerBlock with torch.compile` 或 loss 编译日志；
-2. 使用 `TORCH_COMPILE_DEBUG=1` 检查 lowered/fallback summary 和编译产物；
-3. 用真实输入验证正向、反向、输出和梯度；
-4. 通过 profiling 确认真实 `autofused_*` device Kernel 及原生小算子变化；
-5. 使用相同 checkpoint、输入、并行配置和随机性比较 loss 与 grad norm；
-6. 关闭额外调试开关，在 warmup 后的稳定 step 测量性能。
-
-融合可能改变中间结果物化位置和浮点运算分组。数值验收应区分 bit-wise 一致、容差一致和收敛一致，不能只用
-训练是否出现 NaN 作为标准。
+配置输出只能确认区域已经选中。编译和融合分别以实际调用产生的图和运行时采集到的融合 kernel 为依据。
+融合可能改变中间结果物化位置和浮点运算分组，数值验收应区分 bit-wise 一致、容差一致和收敛一致。
 
 ### 6.2 当前支持边界
 
 | 能力 | 激活方式 | 当前状态与边界 |
 | --- | --- | --- |
-| 标准模型编译 | `components` 包含 `model` | 上游按 Block 使用 `fullgraph=True`；具体 shape 受后端覆盖约束 |
-| loss 编译 | `components` 包含 `loss` | 独立于模型编译；收益取决于 loss 图规模和 fallback |
-| AscendC AutoFuse | `backend=inductor` 且 NPU backend 为 `ascendc` | 实际融合范围由 `torch_npu`、CANN、SoC、dtype、shape 和 layout 决定 |
-| `aot_eager` 检查 | `backend=aot_eager` | 可验证成图和正反向，不证明 AutoFuse 性能 |
-| GraphTrainer | 选择 `graph_trainer_*` 配置 | 独立特性，不属于本文标准 CompileConfig 路径 |
+| 原生局部编译 | `model.local_compile_regions` 选择已注册的名称 | 空列表使用 eager。选择 `loss` 编译已注册的 loss 函数。选择 `rope` 或 `fp32_to_bf16_split` 后，在实际调用对应函数时捕获图 |
+| AscendC AutoFuse | 使用 Inductor 并设置 `TORCHINDUCTOR_NPU_BACKEND=ascendc` | 融合范围由 `torch_npu`、CANN、SoC、dtype、shape 和 layout 决定 |
+| `aot_eager` 诊断 | PyTorch 调试程序在绑定区域前设置 `torch.compiler.set_default_backend("aot_eager")` | 区域列表只选择函数。该诊断仅用于排查 Dynamo 和 AOTAutograd 的图捕获与正反向执行 |
+| GraphTrainer | 选择对应的 `graph_trainer_*` 配方 | 使用独立的整步捕获和编译配置 |
 
 源码存在某条路径不表示全部设备和并行组合均已验证。发布验证应记录模型、SoC、dtype、序列布局、并行策略和
 完整软件版本。
@@ -319,13 +259,13 @@ loss 由上游 `BaseLoss._maybe_compile` 独立检查 `components`，并使用�
 | 归属 | 文件或模块 | 作用 |
 | --- | --- | --- |
 | 本仓 | `scripts/run_train.sh` | 单机启动与 AscendC 默认 Codegen |
-| 本仓 | `scripts/run_train_multinodes.sh` | 多机启动和 compile 参数；NPU backend 需在各节点显式统一 |
+| 本仓 | `scripts/run_train_multinodes.sh` | 多机启动与 AscendC 默认 Codegen |
 | 本仓 | `torchtitan_npu/train.py` | 复用上游训练入口并触发插件初始化 |
 | 本仓 | `torchtitan_npu/__init__.py` | 固定 patches、config、extensions 和 ops 的加载顺序 |
 | 本仓 | `torchtitan_npu/patches/torch_npu/device_copy.py` | NPU 异步 D2H 和 `device_put` 兼容 |
 | 本仓 | `torchtitan_npu/patches/torch_npu/inductor_runtime_estimation.py` | NPU runtime estimation 和 standalone compile 兼容 |
-| 本仓 | `torchtitan_npu/extensions/torchtitan/trainer.py` | 编译感知的 NPU Trainer 与量化转换 |
-| 上游/外部依赖 | `torchtitan.config.CompileConfig`、`torchtitan.distributed.compile` | 标准 compile 配置、Block 编译、Async TP 和 regional Inductor |
+| 本仓 | `torchtitan_npu/extensions/torchtitan/trainer.py` | NPU Trainer、量化转换与原生训练的 `config.compile` 校验 |
+| 上游 TorchTitan | `torchtitan.distributed.local_compile`、`torchtitan.models.base.model.BaseModel.parallelize` | 注册并绑定函数级编译区域 |
 | 外部依赖 | `torch_npu._inductor.ascendc` 与 CANN AutoFuse | NPU lowering、融合调度、tiling、Kernel 生成和编译 |
 
 ### 6.4 相关文档

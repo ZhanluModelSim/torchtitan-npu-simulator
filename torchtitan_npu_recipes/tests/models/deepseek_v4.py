@@ -198,6 +198,24 @@ def deepseek_v4_flash_43layers_16experts_eager_fp8_qat(
     return config
 
 
+def deepseek_v4_flash_43layers_16experts_local_compile_bf16_a5(
+    *,
+    hf_assets_path: str = "tests/assets/deepseek_v3",
+    data_files: str = "tests/assets/c4_test/data.json",
+) -> TrainerEx.Config:
+    """Build a five-step 8-rank A5 Flash example with BF16, Full AC and local compilation."""
+    config = deepseek_v4_flash_43layers_16experts_eager_bf16(
+        hf_assets_path=hf_assets_path,
+        data_files=data_files,
+    )
+    config.override.imports.remove("torchtitan_npu.override.common.optimizer.swap_optimizer")
+    config.training.num_tokens_per_microbatch_per_dp_rank = 2 * config.training.max_context_length
+    config.training.steps = 5
+    config.debug.seed = 42
+    config.model.local_compile_regions = ["loss", "fp32_to_bf16_split", "rope"]
+    return config
+
+
 def deepseek_v4_flash_1p_2k(
     *,
     hf_assets_path: str = "/path/to/DeepSeekV4_tokenizer",

@@ -64,6 +64,7 @@ def test_reduced_dsv4_recipe_surface_contains_only_verified_entries():
         "deepseek_v4_flash_43layers_16experts_eager_bf16",
         "deepseek_v4_flash_43layers_16experts_eager_fp8",
         "deepseek_v4_flash_43layers_16experts_eager_fp8_qat",
+        "deepseek_v4_flash_43layers_16experts_local_compile_bf16_a5",
         "deepseek_v4_flash_1p_2k",
     }
 
@@ -190,7 +191,8 @@ def test_full_model_recipes_load_master_training_defaults(name):
     assert (muon.lr, muon.momentum, muon.ns_steps) == (1e-5, 0.95, 10)
     assert (adamw.lr, adamw.betas, adamw.eps) == (1e-5, (0.9, 0.95), 1e-8)
     assert adamw.weight_decay == 0.1
-    assert config.compile.model.backend == "inductor"
+    assert config.compile is None
+    assert config.model.local_compile_regions == []
     assert config.comm.init_timeout_seconds == 7200
     assert config.comm.train_timeout_seconds == 600
     assert config.override.imports[0] == (

@@ -18,11 +18,7 @@ from torchtitan.components.data import (
 from torchtitan.components.optim import AdamW
 from torchtitan.config.parallelism import ParallelismConfig
 
-from torchtitan_npu.config import (
-    CompileConfig,
-    ModelCompileConfig,
-    OptimizerConfig,
-)
+from torchtitan_npu.config import OptimizerConfig
 from torchtitan_npu.extensions.torchtitan.components.checkpoint import CheckpointManager
 from torchtitan_npu.models.common.alignment import compression_alignment
 from torchtitan_npu.models.deepseek_v4 import build_model_config
@@ -208,83 +204,14 @@ def deepseek_v4_flash_cpt(
     seq_len: int = 4096,
     hf_assets_path: str | None = None,
 ) -> TrainerEx.Config:
-    """Launch recipe with explicit compilation and checkpoint policy."""
+    """Build the Flash pretraining recipe with a load-only checkpoint."""
     config = deepseek_v4_flash(
         parallelism=parallelism,
         seq_len=seq_len,
         hf_assets_path=hf_assets_path,
         per_doc_alignment=int(os.environ.get("DSV4_PER_DOC_ALIGNMENT", 128)),
     )
-    config.compile = CompileConfig(components=[], model=ModelCompileConfig())
     config.checkpointer = CheckpointManager.Config(load_only=True)
-    return config
-
-
-def deepseek_v4_flash_43layers_16experts_compiled(
-    *,
-    parallelism: ParallelismConfig | None = None,
-    seq_len: int = 4096,
-    hf_assets_path: str | None = None,
-) -> TrainerEx.Config:
-    """Launch recipe with explicit compilation and checkpoint policy."""
-    config = _flash_config(
-        "deepseek_v4_flash_43layers_16experts",
-        parallelism=parallelism or ParallelismConfig(expert_parallel_degree=1, fsdp_reshard_after_forward="always"),
-        seq_len=seq_len,
-        hf_assets_path=hf_assets_path,
-        per_doc_alignment=int(os.environ.get("DSV4_PER_DOC_ALIGNMENT", 128)),
-    )
-    config.compile = CompileConfig(components=[], model=ModelCompileConfig())
-    return config
-
-
-def deepseek_v4_flash_sft_compiled(
-    *,
-    parallelism: ParallelismConfig | None = None,
-    seq_len: int = 4096,
-    hf_assets_path: str | None = None,
-) -> TrainerEx.Config:
-    """Launch recipe with explicit compilation and checkpoint policy."""
-    config = deepseek_v4_flash_sft(
-        parallelism=parallelism,
-        seq_len=seq_len,
-        hf_assets_path=hf_assets_path,
-    )
-    config.compile = CompileConfig(components=[], model=ModelCompileConfig())
-    config.checkpointer = CheckpointManager.Config(load_only=True)
-    return config
-
-
-def deepseek_v4_flash_43layers_16experts_sft_compiled(
-    *,
-    parallelism: ParallelismConfig | None = None,
-    seq_len: int = 4096,
-    hf_assets_path: str | None = None,
-) -> TrainerEx.Config:
-    """Launch recipe with explicit compilation and checkpoint policy."""
-    config = deepseek_v4_flash_43layers_16experts_sft(
-        parallelism=parallelism,
-        seq_len=seq_len,
-        hf_assets_path=hf_assets_path,
-    )
-    config.compile = CompileConfig(components=[], model=ModelCompileConfig())
-    config.checkpointer = CheckpointManager.Config(load_only=True)
-    return config
-
-
-def deepseek_v4_flash_lora_compiled(
-    *,
-    parallelism: ParallelismConfig | None = None,
-    seq_len: int = 4096,
-    hf_assets_path: str | None = None,
-) -> TrainerEx.Config:
-    """Launch recipe with explicit compilation and checkpoint policy."""
-    config = deepseek_v4_flash_lora(
-        parallelism=parallelism,
-        seq_len=seq_len,
-        hf_assets_path=hf_assets_path,
-    )
-    config.compile = CompileConfig(components=[], model=ModelCompileConfig())
     return config
 
 

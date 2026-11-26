@@ -28,8 +28,6 @@ from torchtitan.models.deepseek_v4.compressor import SparseIndexerLoss
 from torchtitan.observability.metrics import MetricsProcessor
 
 from torchtitan_npu.config import (
-    CompileConfig,
-    ModelCompileConfig,
     MuonOptimizerProfile,
     OptimConfig,
     OptimizerConfig,
@@ -444,7 +442,6 @@ def deepseek_v4_flash_cpt_4k_a3() -> TrainerEx.Config:
             save_traces_folder="profiling_path",
         ),
     )
-    config.compile = CompileConfig(components=[], model=ModelCompileConfig(backend="inductor"))
     config.debug.print_config = True
     config.profiler.extension.enable_online_parse = False
     config.profiler.extension.profiler_start = 6
@@ -552,10 +549,7 @@ def deepseek_v4_flash_lora_4k_a3() -> TrainerEx.Config:
     from torchtitan_npu.models.deepseek_v4.peft import DeepSeekV4PEFTCheckpointManager
 
     config = deepseek_v4_flash_cpt_4k_a3()
-    compile_config = config.compile
-    config.compile = None
     config = apply_transforms(config, [deepseek_v4_lora_transform(rank=16, alpha=32)])
-    config.compile = compile_config
     assert isinstance(config.model, DeepSeekV4Model.Config)
     config.optim.optimizer = _dsv4_optimizer_config(config.model, lr=1e-5)
     config.checkpointer = DeepSeekV4PEFTCheckpointManager.Config(

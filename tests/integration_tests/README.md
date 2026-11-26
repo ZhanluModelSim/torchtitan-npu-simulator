@@ -267,11 +267,11 @@ Nightly 用例统一存放于：
 例如先在 `my_recipes.py` 定义工厂：
 
 ```python
-from torchtitan_npu_recipes.examples.deepseek_v4 import deepseek_v4_flash_8p_cpt_4k_a3_eager
+from torchtitan_npu_recipes.tests.models.deepseek_v4 import deepseek_v4_flash_43layers_16experts_eager_bf16
 
 
 def nightly_five_steps():
-    config = deepseek_v4_flash_8p_cpt_4k_a3_eager()
+    config = deepseek_v4_flash_43layers_16experts_eager_bf16()
     config.training.steps = 5
     config.metrics.enable_tensorboard = True
     config.metrics.log_freq = 1
@@ -295,7 +295,7 @@ def build_test_list():
             python_config=True,
             check_loss=False,
             override_args=[()],
-            train_script="examples/deepseek_v4/debug/deepseek_v4_flash_8p_cpt_4k_a3.sh",
+            train_script="scripts/run_train.sh",
             env_vars={"MODULE": "my_recipes", "CONFIG": "nightly_five_steps"},
             expected_steps=(tuple(range(1, 6)),),
         ),
