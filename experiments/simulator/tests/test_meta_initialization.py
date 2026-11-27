@@ -1,6 +1,8 @@
 """Scoped Meta initialization preserves native FSDP consumers and session state."""
 
 import gc
+import logging
+import re
 import weakref
 from contextlib import nullcontext
 from dataclasses import asdict
@@ -9,15 +11,108 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.distributed as dist
 import torch.distributed.fsdp._fully_shard._fsdp_param as fsdp_param
+from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import Shard
+from torch.testing._internal.distributed.fake_pg import FakeStore
 from torchtitan_simulator import runner
 from torchtitan_simulator.compat import meta_initialization as initialization
 from torchtitan_simulator.config import SimulationConfig
 
+try:
+    from spmd_types import MeshAxis
+    from torch.distributed._mesh_layout import _FlatLayout
+except ImportError:
+    MeshAxis = _FlatLayout = None
+
+has_axis_cache = MeshAxis is not None and _FlatLayout is not None
+requires_axis_cache = pytest.mark.skipif(not has_axis_cache, reason="requires MeshAxis and _FlatLayout")
+
 
 def _metadata(tensor):
     return tensor.shape, tensor.stride(), tensor.storage_offset(), tensor.dtype, tensor.device
+
+
+@pytest.fixture
+def fake_world():
+    dist.init_process_group("fake", store=FakeStore(), rank=0, world_size=4)
+    try:
+        yield
+    finally:
+        dist.destroy_process_group()
+
+
+def test_meta_submeshes_share_their_own_ordered_root_ranks(fake_world):
+    layout = [[2, 0], [3, 1]]
+    root = DeviceMesh("meta", layout, mesh_dim_names=("dp", "tp"))
+    cpu = DeviceMesh("cpu", layout, mesh_dim_names=("dp", "tp"))
+    native = root["tp"]
+    with initialization.meta_initialization():
+        child = root["tp"]
+        sibling = root["dp"]
+        other = DeviceMesh("meta", mesh=[[0, 2], [3, 1]], mesh_dim_names=("dp", "tp"))
+        reordered = other["tp"]
+        assert child is not native and child is not sibling
+        assert child._flatten_rank_map is sibling._flatten_rank_map is root._flatten_rank_map
+        assert reordered._flatten_rank_map is other._flatten_rank_map
+        assert child != reordered and child != sibling
+        assert child == native and hash(child) == hash(native)
+        assert child.mesh.tolist() == [2, 0]
+        assert child.get_coordinate() == (1,)
+        assert child.get_group() is native.get_group()
+        assert cpu["tp"]._flatten_rank_map is not cpu._flatten_rank_map
+
+
+def test_meta_submesh_keeps_its_snapshot_after_rank_tensor_changes(fake_world):
+    ranks = torch.tensor([[2, 0], [3, 1]], dtype=torch.int)
+    root = DeviceMesh("meta", ranks, mesh_dim_names=("dp", "tp"))
+    ranks[1] = torch.tensor([1, 3])
+    with initialization.meta_initialization():
+        child = root["tp"]
+    assert root._flatten_rank_map == (2, 0, 3, 1)
+    assert child._flatten_rank_map == (2, 0, 1, 3)
+
+
+@requires_axis_cache
+def test_axis_subset_cache_reuses_equal_layouts_and_resets_after_failure(monkeypatch):
+    native = MeshAxis.__le__
+    calls = []
+
+    def observed(left, right):
+        calls.append((left, right))
+        return native(left, right)
+
+    monkeypatch.setattr(MeshAxis, "__le__", observed)
+    even = MeshAxis.of(2, 2)  # {0, 2}
+    dense = MeshAxis.of(3, 1)  # {0, 1, 2}
+    far = MeshAxis.of(2, 3)  # {0, 3}
+    with pytest.raises(RuntimeError, match="scope failure"), initialization.meta_initialization():
+        assert even <= dense
+        assert MeshAxis.of(2, 2) <= MeshAxis.of(3, 1)
+        assert not dense <= even
+        assert not far <= dense
+        assert not MeshAxis.of(2, 3) <= dense
+        assert calls == [(even, dense), (dense, even), (far, dense)]
+        raise RuntimeError("scope failure")
+    assert MeshAxis.__le__ is observed
+    with initialization.meta_initialization():
+        assert even <= dense
+    assert calls[-1] == (even, dense) and len(calls) == 4
+    assert MeshAxis.__le__ is observed
+
+
+@requires_axis_cache
+def test_axis_subset_cache_preserves_native_dispatch_for_other_types():
+    class UnhashableAxis(MeshAxis):
+        __hash__ = None
+
+    axis = MeshAxis.of(4, 1)
+    child = UnhashableAxis(MeshAxis.of(2, 1).layout)
+    with initialization.meta_initialization():
+        assert child <= axis
+        assert axis.__le__(child) is False
+        assert axis.__le__([]) is NotImplemented
 
 
 @pytest.mark.parametrize(
@@ -138,6 +233,7 @@ def test_rebinding_executes_preserved_wrapper_and_no_grad_with_private_helper(mo
 
 
 def test_repeated_scopes_release_rebound_functions_and_restore_after_failures():
+    mesh_init = DeviceMesh.__init__
     originals = tuple(
         getattr(fsdp_param.FSDPParam, name)
         for name in ("_init_sharded_param", "_init_sharded_post_forward_param_metadata")
@@ -151,12 +247,24 @@ def test_repeated_scopes_release_rebound_functions_and_restore_after_failures():
                     raise ValueError("scope failure")
         except ValueError:
             pass
+        assert DeviceMesh.__init__ is mesh_init
         assert (
             fsdp_param.FSDPParam._init_sharded_param,
             fsdp_param.FSDPParam._init_sharded_post_forward_param_metadata,
         ) == originals
     gc.collect()
     assert all(ref() is None for ref in refs)
+
+
+def test_simulate_reuses_rank_maps_and_axis_subsets_during_fsdp_initialization(caplog):
+    config = SimulationConfig(world_size=8, logical_rank=7, data_parallel_replicate_degree=2, seq_len=128)
+    with caplog.at_level(logging.INFO, logger=initialization.__name__):
+        runner.simulate(config)
+    (count,) = re.findall(r"Meta FSDP initialization shared_rank_maps=(\d+)", caplog.text)
+    assert int(count) > 0
+    if has_axis_cache:
+        ((hits, misses),) = re.findall(r"Meta FSDP axis subset cache hits=(\d+) misses=(\d+)", caplog.text)
+        assert int(hits) > 0 and int(misses) > 0
 
 
 @pytest.mark.parametrize("algorithm", ["Muon", "AdamW"])

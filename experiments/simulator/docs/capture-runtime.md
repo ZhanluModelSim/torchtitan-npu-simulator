@@ -64,7 +64,7 @@ FSDP wrapper 可能延迟安装或刷新。正式观察器在结构预热后安�
 
 ### 通信语义事实 v2
 
-`attrs["collective_facts"]` 为下游通信模型交付独立的语义事实，不计算流量或耗时。首期只覆盖 `c10d._allgather_base_.default`、`c10d._reduce_scatter_base_.default`、`c10d.allreduce_.default` 与 `_c10d_functional.all_to_all_single.default`，不按公共算子名套用其他 overload 的参数角色。
+`attrs["collective_facts"]` 向下游通信模型交付语义事实。捕获按原生 overload 识别 `c10d._allgather_base_.default`、`c10d._reduce_scatter_base_.default`、`c10d.allreduce_.default`、`_c10d_functional.all_to_all_single.default` 和 DeepSeek V4 CP 下的 `c10d.alltoall_.default`。
 
 事实包含 `schema_version=2`、精确 primitive、实际 global capture rank、有序组、实际 dense／contiguous 检查、原语的跨 rank 等形保证和逻辑缓冲关系。归约从仍可解释的原生枚举或 TorchBind `op()` 读取，按安装版本的具名枚举映射到 `reduction.operation`，与通用参数绑定并存；不能从 opaque 文本或 FSDP 场景推断 SUM。多 rank 的 AG 本地 alias 不能证明全组 alias，缺全组保证时保守交付 `distinct`；只有单 rank 可凭完整本地 storage／offset 证据交付 `same_region`。原地 AR 由原语契约确定。
 
@@ -73,6 +73,10 @@ Meta 运行时在 `torch.distributed.reduce_scatter_single` 调用边界读取�
 EP 适配在所有 router 的 force-load-balance 已核验、且入口明确交付同 geometry 的 synthetic SPMD 来源时，生成版本化 `torchtitan_balanced_ep_v1` 证明，区分 dispatch／combine；count exchange 交付完整 equal 行矩阵。不从本 rank 的一行 split 或均匀 shape 推断全组矩阵。原生 A2A autograd 节点 metadata 保存对应证明，反向捕获读取实际节点，转置矩阵并交换全组 input／output shape，不替换原生求梯度函数。
 
 缺实际组、归约或完整 split 通过 `unresolved_fields` 明示；Muon 等其他 A2A 来源未交付全组矩阵或证明时同样保留缺失，下游必须拒绝完整通信预测。结构预热、FSDP 通信视图、卸载计划与静态显存口径不因新增事实改变。实现见 [collective_facts.py](../torchtitan_simulator/capture/collective_facts.py)，native FakeProcessGroup／Meta 回归入口见 [test_collective_facts.py](../tests/capture/test_collective_facts.py)；这些测试不证明设备数值或通信性能。
+
+DeepSeek V4 的 CP 窗口和压缩块交换从模型的全局路由计划保留每个参与者的发送、接收行数，来源标识为 `deepseek_v4_cp_routing_geometry_v1`。Meta 转换保留路由计划生成的收发列表及其别名。捕获把这些列表与实际进程组绑定，保留按 peer 排列的每个输入和输出缓冲区，包括零行分块。仅有本 rank 张量列表的其他调用保留原始张量和组，省略全组事实。
+
+反向使用实际 autograd 节点保存的对应计划，交换收发方向。如果可微的 CP 交换已有前向路由证据，但捕获器找不到对应的反向节点，本次模拟首次遇到该情况时会记录警告，列出观察到的节点和安装的软件包版本。该交换的反向全组路由保持缺失。非对称收发和反向节点变更的回归见 [test_cp_exchange_facts.py](../tests/capture/test_cp_exchange_facts.py)。
 
 ## 4. 阶段与图引用
 
